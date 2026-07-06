@@ -1,0 +1,103 @@
+global:
+  environment: ""
+  deploymentId: ""
+
+nameOverride: ""
+fullnameOverride: ""
+
+imagePullSecrets: []
+
+podSecurityContext: {}
+
+securityContext: {}
+
+source:
+  enabled: false
+  name: ""
+  fullnameOverride: ""
+  component: source
+  engine: oracle
+  replicas: 1
+  containerName: ogg-oracle
+
+  image:
+    repository: ""
+    tag: ""
+    pullPolicy: IfNotPresent
+
+  ogg:
+    deploymentName: ""
+    domain: ""
+    secureDeployment: false
+
+  admin:
+    existingSecret: ""
+    usernameKey: OGG_ADMIN
+    passwordKey: OGG_ADMIN_PWD
+
+  certificate:
+    existingSecret: ""
+    mountPath: /etc/nginx/cert
+    defaultMode: 0444
+    items: []
+
+  initPermissions:
+    enabled: true
+    mode: "0777"
+
+  serviceAccount:
+    create: true
+    name: ""
+    annotations: {}
+
+  service:
+    type: ClusterIP
+    ports:
+      https: 8443
+      dist: 9013
+      metrics: 9015
+
+  storage:
+    u02:
+      type: emptyDir
+      existingClaim: ""
+    u03:
+      type: emptyDir
+
+  readinessProbe:
+    initialDelaySeconds: 120
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 12
+
+  livenessProbe:
+    initialDelaySeconds: 180
+    periodSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 6
+
+  resources: {}
+
+  extraEnv: []
+  extraVolumeMounts: []
+  extraVolumes: []
+  extraContainers: []
+
+target:
+  enabled: false
+
+ingress:
+  enabled: false
+
+configJob:
+  enabled: false
+
+monitoring:
+  labels:
+    enabled: true
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}

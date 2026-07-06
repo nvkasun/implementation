@@ -1,0 +1,529 @@
+name: New Goldengate EKS app deployment
+
+run-name: "Cloud Factory - GoldenGate Helm build and deploy | ${{ inputs.deployment_id }} | ran by ${{ github.actor }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Deployment environment"
+        required: true
+        type: choice
+        default: dev
+        options:
+          - dev
+
+      deployment_id:
+        description: "Unique GoldenGate deployment ID, example: payments-ora-to-pg-001"
+        required: true
+        type: string
+        default: payments-ora-to-pg-001
+
+      deploy:
+        description: "Deploy to EKS after publishing Helm chart"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+
+  # ECR / runner account where Helm OCI chart will be pushed.
+  ECR_ACCOUNT_ID: "229410149234"
+  ECR_REGISTRY: 229410149234.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com
+
+  # Role used by GitHub Actions / CodeBuild runner.
+  ROLE_ARN: ${{ vars.GOLDENGATE_AWS_ROLE_ARN }}
+
+  # Target EKS cluster details.
+  EKS_ACCOUNT_ID: ${{ vars.ACCOUNT_ID_DEV }}
+  EKS_CLUSTER_NAME: ${{ vars.AWS_CLUSTER_NAME }}
+  EKS_CLUSTER_ARN: ${{ vars.AWS_CLUSTER_ARN }}
+
+  # Optional. Add this repo variable later only if cross-account EKS auth fails.
+  EKS_DEPLOY_ROLE_ARN: ${{ vars.EKS_DEPLOY_ROLE_ARN }}
+
+  HELM_OCI_NAMESPACE: helm
+  CHART_NAME: goldengate
+  HELM_CHART_PATH: helm/goldengate
+  ENVS_ROOT: envs
+
+concurrency:
+  group: goldengate-helm-deploy-${{ github.ref }}-${{ inputs.environment }}-${{ inputs.deployment_id }}
+  cancel-in-progress: false
+
+jobs:
+  build_publish_and_deploy:
+    name: Build, publish, and deploy GoldenGate Helm chart
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.ROLE_ARN }}
+
+      - name: Install Helm and kubectl if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking/installing Helm..."
+
+          if ! command -v helm >/dev/null 2>&1; then
+            HELM_VERSION="v3.15.4"
+
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64)
+                HELM_ARCH="amd64"
+                ;;
+              aarch64|arm64)
+                HELM_ARCH="arm64"
+                ;;
+              *)
+                echo "Unsupported architecture for Helm: $ARCH"
+                exit 1
+                ;;
+            esac
+
+            curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-${HELM_ARCH}.tar.gz" -o /tmp/helm.tar.gz
+            tar -zxvf /tmp/helm.tar.gz -C /tmp
+            sudo mv "/tmp/linux-${HELM_ARCH}/helm" /usr/local/bin/helm
+            sudo chmod +x /usr/local/bin/helm
+          fi
+
+          helm version --short
+
+          echo "Checking/installing kubectl..."
+
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KUBECTL_VERSION="v1.35.0"
+
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64)
+                KUBECTL_ARCH="amd64"
+                ;;
+              aarch64|arm64)
+                KUBECTL_ARCH="arm64"
+                ;;
+              *)
+                echo "Unsupported architecture for kubectl: $ARCH"
+                exit 1
+                ;;
+            esac
+
+            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+            sudo chmod +x /usr/local/bin/kubectl
+          fi
+
+          kubectl version --client=true
+
+      - name: Verify runner tools and AWS identity
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking AWS identity..."
+          aws sts get-caller-identity
+
+          echo "Checking required tools..."
+          aws --version
+          helm version --short
+          kubectl version --client=true
+
+          echo "Repository variable summary:"
+          echo "AWS_REGION=${AWS_REGION}"
+          echo "ECR_ACCOUNT_ID=${ECR_ACCOUNT_ID}"
+          echo "ECR_REGISTRY=${ECR_REGISTRY}"
+          echo "EKS_ACCOUNT_ID=${EKS_ACCOUNT_ID}"
+          echo "EKS_CLUSTER_NAME=${EKS_CLUSTER_NAME}"
+          echo "EKS_CLUSTER_ARN=${EKS_CLUSTER_ARN}"
+
+      - name: Prepare deployment variables
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ENVIRONMENT="${{ inputs.environment }}"
+          DEPLOYMENT_ID="${{ inputs.deployment_id }}"
+
+          if [[ ! "$DEPLOYMENT_ID" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
+            echo "Invalid deployment_id: $DEPLOYMENT_ID"
+            echo "Use lowercase letters, numbers, and hyphens only."
+            echo "Example: payments-ora-to-pg-001"
+            exit 1
+          fi
+
+          NAMESPACE="gg-${ENVIRONMENT}-${DEPLOYMENT_ID}"
+          RELEASE_NAME="ogg-${DEPLOYMENT_ID}"
+          VALUES_FILE="${ENVS_ROOT}/${ENVIRONMENT}/${DEPLOYMENT_ID}/values.yaml"
+
+          if [ ${#NAMESPACE} -gt 63 ]; then
+            echo "Namespace is too long: $NAMESPACE"
+            echo "Kubernetes namespace names must be 63 characters or less."
+            echo "Please shorten deployment_id."
+            exit 1
+          fi
+
+          if [ ${#RELEASE_NAME} -gt 53 ]; then
+            echo "Helm release name is too long: $RELEASE_NAME"
+            echo "Please shorten deployment_id because resource names add suffixes."
+            exit 1
+          fi
+
+          CHART_VERSION="0.1.${{ github.run_number }}"
+          HELM_ECR_REPOSITORY="${HELM_OCI_NAMESPACE}/${CHART_NAME}"
+          HELM_PUSH_URL="oci://${ECR_REGISTRY}/${HELM_OCI_NAMESPACE}"
+          HELM_CHART_REF="oci://${ECR_REGISTRY}/${HELM_ECR_REPOSITORY}"
+
+          echo "ENVIRONMENT=${ENVIRONMENT}" >> "$GITHUB_ENV"
+          echo "DEPLOYMENT_ID=${DEPLOYMENT_ID}" >> "$GITHUB_ENV"
+          echo "NAMESPACE=${NAMESPACE}" >> "$GITHUB_ENV"
+          echo "RELEASE_NAME=${RELEASE_NAME}" >> "$GITHUB_ENV"
+          echo "VALUES_FILE=${VALUES_FILE}" >> "$GITHUB_ENV"
+          echo "CHART_VERSION=${CHART_VERSION}" >> "$GITHUB_ENV"
+          echo "HELM_ECR_REPOSITORY=${HELM_ECR_REPOSITORY}" >> "$GITHUB_ENV"
+          echo "HELM_PUSH_URL=${HELM_PUSH_URL}" >> "$GITHUB_ENV"
+          echo "HELM_CHART_REF=${HELM_CHART_REF}" >> "$GITHUB_ENV"
+
+          echo "environment=${ENVIRONMENT}" >> "$GITHUB_OUTPUT"
+          echo "deployment_id=${DEPLOYMENT_ID}" >> "$GITHUB_OUTPUT"
+          echo "namespace=${NAMESPACE}" >> "$GITHUB_OUTPUT"
+          echo "release_name=${RELEASE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "values_file=${VALUES_FILE}" >> "$GITHUB_OUTPUT"
+          echo "chart_version=${CHART_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "helm_chart_ref=${HELM_CHART_REF}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate required files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "$HELM_CHART_PATH/Chart.yaml" ]; then
+            echo "Missing Helm Chart.yaml: $HELM_CHART_PATH/Chart.yaml"
+            exit 1
+          fi
+
+          if [ ! -f "$HELM_CHART_PATH/values.yaml" ]; then
+            echo "Missing Helm values.yaml: $HELM_CHART_PATH/values.yaml"
+            exit 1
+          fi
+
+          if [ ! -f "$VALUES_FILE" ]; then
+            echo "Missing deployment values file: $VALUES_FILE"
+            echo "Create: envs/${ENVIRONMENT}/${DEPLOYMENT_ID}/values.yaml"
+            exit 1
+          fi
+
+          echo "Required files are present."
+          echo "Helm chart path: $HELM_CHART_PATH"
+          echo "Deployment values: $VALUES_FILE"
+
+      - name: Login Helm to Amazon ECR
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | helm registry login --username AWS --password-stdin "$ECR_REGISTRY"
+
+      - name: Ensure Helm ECR repository exists
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if aws ecr describe-repositories \
+            --region "$AWS_REGION" \
+            --repository-names "$HELM_ECR_REPOSITORY" >/dev/null 2>&1; then
+            echo "ECR repository already exists: $HELM_ECR_REPOSITORY"
+          else
+            echo "Creating ECR repository: $HELM_ECR_REPOSITORY"
+
+            aws ecr create-repository \
+              --region "$AWS_REGION" \
+              --repository-name "$HELM_ECR_REPOSITORY" \
+              --tags Key=ApplicationName,Value=CloudFactory Key=DataClassification,Value=General Key=BusinessCriticality,Value=Low Key=BusinessUnit,Value=TechnologyPlatform Key=CostCenter,Value=219 \
+              --image-scanning-configuration scanOnPush=true \
+              --image-tag-mutability MUTABLE >/dev/null
+
+            echo "Created ECR repository: $HELM_ECR_REPOSITORY"
+          fi
+
+      - name: Build Helm dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          helm dependency build "$HELM_CHART_PATH" || true
+
+      - name: Helm lint deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          helm lint "$HELM_CHART_PATH" \
+            --values "$VALUES_FILE" \
+            --set global.environment="$ENVIRONMENT" \
+            --set global.deploymentId="$DEPLOYMENT_ID"
+
+      - name: Render manifest for validation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p rendered
+
+          helm template "$RELEASE_NAME" "$HELM_CHART_PATH" \
+            --namespace "$NAMESPACE" \
+            --values "$VALUES_FILE" \
+            --set global.environment="$ENVIRONMENT" \
+            --set global.deploymentId="$DEPLOYMENT_ID" \
+            > "rendered/${RELEASE_NAME}.yaml"
+
+          echo "Rendered manifest: rendered/${RELEASE_NAME}.yaml"
+
+      - name: Package Helm chart
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p packaged
+
+          helm package "$HELM_CHART_PATH" \
+            --version "$CHART_VERSION" \
+            --app-version "$CHART_VERSION" \
+            --destination packaged
+
+          ls -lrt packaged
+
+      - name: Push Helm chart to ECR as OCI artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          helm push "packaged/${CHART_NAME}-${CHART_VERSION}.tgz" "$HELM_PUSH_URL"
+
+          echo "Published Helm chart:"
+          echo "$HELM_CHART_REF:$CHART_VERSION"
+
+      - name: Verify Helm chart can be pulled from ECR
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p pulled
+
+          helm pull "$HELM_CHART_REF" \
+            --version "$CHART_VERSION" \
+            --destination pulled
+
+          ls -lrt pulled
+
+      - name: Connect to EKS cluster
+        if: ${{ inputs.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Target EKS cluster name: ${EKS_CLUSTER_NAME}"
+          echo "Target EKS cluster ARN: ${EKS_CLUSTER_ARN}"
+          echo "Target EKS account ID: ${EKS_ACCOUNT_ID}"
+          echo "Current AWS identity:"
+          aws sts get-caller-identity
+
+          echo "Connecting to EKS using cross-account EKS deploy role:"
+          echo "${EKS_DEPLOY_ROLE_ARN}"
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}" \
+            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
+            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
+
+          echo "Current kube context:"
+          kubectl config current-context
+
+          echo "Verifying namespace-scoped access only..."
+          echo "Target namespace: ${NAMESPACE}"
+
+          kubectl get pods -n "${NAMESPACE}" || {
+            echo "Unable to access namespace ${NAMESPACE}."
+            echo "Make sure namespace exists and EKS access policy allows namespace pattern gg-dev-*."
+            exit 1
+          }
+
+      - name: Create namespace if missing
+        if: ${{ inputs.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Creating namespace if missing: ${NAMESPACE}"
+
+          if kubectl get namespace "${NAMESPACE}" >/dev/null 2>&1; then
+            echo "Namespace already exists: ${NAMESPACE}"
+            echo "Skipping namespace label update because current role cannot patch namespaces."
+          else
+            kubectl create namespace "${NAMESPACE}"
+            echo "Namespace created: ${NAMESPACE}"
+          fi
+
+          kubectl get namespace "${NAMESPACE}" --show-labels
+
+      - name: Copy GoldenGate secrets from base namespace
+        if: ${{ inputs.deploy }}
+        shell: bash
+        env:
+          SOURCE_SECRET_NAMESPACE: ogg
+        run: |
+          set -euo pipefail
+
+          echo "Copying GoldenGate secrets from ${SOURCE_SECRET_NAMESPACE} to ${NAMESPACE}"
+
+          copy_secret() {
+            local SECRET_NAME="$1"
+
+            echo "Copying secret: ${SECRET_NAME}"
+
+            kubectl get secret "${SECRET_NAME}" -n "${SOURCE_SECRET_NAMESPACE}" -o json \
+              | python3 -c 'import json,sys; target_namespace=sys.argv[1]; secret=json.load(sys.stdin); metadata=secret.get("metadata",{}); metadata["namespace"]=target_namespace; [metadata.pop(k,None) for k in ["uid","resourceVersion","generation","creationTimestamp","managedFields","selfLink"]]; annotations=metadata.get("annotations",{}); annotations.pop("kubectl.kubernetes.io/last-applied-configuration",None); metadata["annotations"]=annotations if annotations else metadata.pop("annotations", None); secret["metadata"]=metadata; print(json.dumps(secret))' "${NAMESPACE}" \
+              | kubectl apply -f -
+          }
+
+          copy_secret "ogg-oracle-admin"
+          copy_secret "ogg-oracle-nginx-cert"
+
+          echo "Secrets copied successfully."
+
+          kubectl get secret ogg-oracle-admin -n "${NAMESPACE}"
+          kubectl get secret ogg-oracle-nginx-cert -n "${NAMESPACE}"
+
+      - name: Deploy GoldenGate Helm release to EKS
+        if: ${{ inputs.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Deploying Helm release..."
+          echo "Release: $RELEASE_NAME"
+          echo "Namespace: $NAMESPACE"
+          echo "Chart: $HELM_CHART_REF"
+          echo "Chart version: $CHART_VERSION"
+          echo "Values: $VALUES_FILE"
+
+          helm upgrade --install "$RELEASE_NAME" "$HELM_CHART_REF" \
+            --version "$CHART_VERSION" \
+            --namespace "$NAMESPACE" \
+            --values "$VALUES_FILE" \
+            --set global.environment="$ENVIRONMENT" \
+            --set global.deploymentId="$DEPLOYMENT_ID" \
+            --wait \
+            --timeout 20m
+
+      - name: Verify deployment
+        if: ${{ inputs.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Helm status:"
+          helm status "$RELEASE_NAME" -n "$NAMESPACE"
+
+          echo "Kubernetes resources:"
+          kubectl get all -n "$NAMESPACE"
+
+          echo "PVCs:"
+          kubectl get pvc -n "$NAMESPACE" || true
+
+          echo "Secrets:"
+          kubectl get secrets -n "$NAMESPACE" || true
+
+          echo "Ingress:"
+          kubectl get ingress -n "$NAMESPACE" || true
+
+      - name: Upload rendered manifests and chart package
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: goldengate-helm-artifacts-${{ inputs.environment }}-${{ inputs.deployment_id }}
+          path: |
+            rendered/
+            packaged/
+            pulled/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Workflow summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## GoldenGate EKS Helm Build and Deploy Summary"
+            echo ""
+            echo "### Deployment details"
+            echo ""
+            echo "- Environment: \`${ENVIRONMENT}\`"
+            echo "- Deployment ID: \`${DEPLOYMENT_ID}\`"
+            echo "- Namespace: \`${NAMESPACE}\`"
+            echo "- Helm release: \`${RELEASE_NAME}\`"
+            echo "- Values file: \`${VALUES_FILE}\`"
+            echo "- Deploy enabled: \`${{ inputs.deploy }}\`"
+            echo ""
+            echo "### AWS / EKS details"
+            echo ""
+            echo "- AWS region: \`${AWS_REGION}\`"
+            echo "- ECR registry: \`${ECR_REGISTRY}\`"
+            echo "- EKS account ID: \`${EKS_ACCOUNT_ID}\`"
+            echo "- EKS cluster name: \`${EKS_CLUSTER_NAME}\`"
+            echo "- EKS cluster ARN: \`${EKS_CLUSTER_ARN}\`"
+            echo ""
+            echo "### Published Helm OCI chart"
+            echo ""
+            echo "- Chart ref: \`${HELM_CHART_REF}\`"
+            echo "- Chart version: \`${CHART_VERSION}\`"
+            echo ""
+            echo "### Manual Helm registry login"
+            echo ""
+            echo "\`\`\`bash"
+            echo "aws ecr get-login-password --region ${AWS_REGION} | \\"
+            echo "  helm registry login --username AWS --password-stdin ${ECR_REGISTRY}"
+            echo "\`\`\`"
+            echo ""
+            echo "### Manual deployment command"
+            echo ""
+            echo "\`\`\`bash"
+            echo "helm upgrade --install ${RELEASE_NAME} \\"
+            echo "  ${HELM_CHART_REF} \\"
+            echo "  --version ${CHART_VERSION} \\"
+            echo "  --namespace ${NAMESPACE} \\"
+            echo "  --values ${VALUES_FILE} \\"
+            echo "  --set global.environment=${ENVIRONMENT} \\"
+            echo "  --set global.deploymentId=${DEPLOYMENT_ID} \\"
+            echo "  --wait \\"
+            echo "  --timeout 20m"
+            echo "\`\`\`"
+            echo ""
+            echo "### Validation commands"
+            echo ""
+            echo "\`\`\`bash"
+            echo "kubectl get all -n ${NAMESPACE}"
+            echo "kubectl get pvc -n ${NAMESPACE}"
+            echo "kubectl get ingress -n ${NAMESPACE}"
+            echo "helm status ${RELEASE_NAME} -n ${NAMESPACE}"
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"

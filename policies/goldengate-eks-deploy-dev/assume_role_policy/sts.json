@@ -1,0 +1,13 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowGoldenGateRunnerRoleToAssume",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::229410149234:role/RunnerRole-goldengate-eks-app_dev"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}

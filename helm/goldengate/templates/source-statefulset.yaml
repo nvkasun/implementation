@@ -1,0 +1,208 @@
+{{- if .Values.source.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "goldengate.sourceName" . }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "goldengate.labels" . | nindent 4 }}
+    app.kubernetes.io/component: source
+    app.kubernetes.io/engine: {{ .Values.source.engine | quote }}
+spec:
+  serviceName: {{ include "goldengate.sourceHeadlessName" . }}
+  replicas: {{ .Values.source.replicas | default 1 }}
+  selector:
+    matchLabels:
+      {{- include "goldengate.sourceSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "goldengate.labels" . | nindent 8 }}
+        {{- include "goldengate.sourceSelectorLabels" . | nindent 8 }}
+        app.kubernetes.io/engine: {{ .Values.source.engine | quote }}
+    spec:
+      serviceAccountName: {{ include "goldengate.sourceServiceAccountName" . }}
+
+{{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+{{- end }}
+
+{{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+{{- end }}
+
+{{- if .Values.source.initPermissions.enabled }}
+      initContainers:
+        - name: prepare-u02-permissions
+          image: "{{ required "source.image.repository is required when source.enabled=true" .Values.source.image.repository }}:{{ required "source.image.tag is required when source.enabled=true" .Values.source.image.tag }}"
+          imagePullPolicy: {{ .Values.source.image.pullPolicy | default "IfNotPresent" }}
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+
+              echo "Preparing writable GoldenGate runtime directories..."
+
+              mkdir -p /u02/oggf
+              rm -rf /u02/oggf/certificate
+              mkdir -p /u02/oggf/certificate
+              mkdir -p /u03
+
+              echo "Applying temporary test permissions..."
+              chown -R 0:0 /u02 /u03 || true
+              chmod -R {{ .Values.source.initPermissions.mode | default "0777" }} /u02 /u03
+
+              echo "Testing write access..."
+              touch /u02/oggf/certificate/write-test.txt
+              echo "ok" > /u02/oggf/certificate/write-test.txt
+              rm -f /u02/oggf/certificate/write-test.txt
+
+              echo "Directory permissions after update:"
+              ls -ld /u02
+              ls -ld /u02/oggf
+              ls -ld /u02/oggf/certificate
+              ls -ld /u03
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+          volumeMounts:
+            - name: u02
+              mountPath: /u02
+            - name: u03
+              mountPath: /u03
+{{- end }}
+
+      containers:
+        - name: {{ .Values.source.containerName | default "ogg-oracle" }}
+          image: "{{ required "source.image.repository is required when source.enabled=true" .Values.source.image.repository }}:{{ required "source.image.tag is required when source.enabled=true" .Values.source.image.tag }}"
+          imagePullPolicy: {{ .Values.source.image.pullPolicy | default "IfNotPresent" }}
+
+{{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+{{- end }}
+
+          env:
+            - name: OGG_ADMIN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "source.admin.existingSecret is required when source.enabled=true" .Values.source.admin.existingSecret }}
+                  key: {{ .Values.source.admin.usernameKey | default "OGG_ADMIN" }}
+
+            - name: OGG_ADMIN_PWD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "source.admin.existingSecret is required when source.enabled=true" .Values.source.admin.existingSecret }}
+                  key: {{ .Values.source.admin.passwordKey | default "OGG_ADMIN_PWD" }}
+
+            - name: OGG_DEPLOYMENT
+              value: {{ required "source.ogg.deploymentName is required when source.enabled=true" .Values.source.ogg.deploymentName | quote }}
+
+            - name: OGG_DOMAIN
+              value: {{ required "source.ogg.domain is required when source.enabled=true" .Values.source.ogg.domain | quote }}
+
+            - name: OGG_SECURE_DEPLOYMENT
+              value: {{ .Values.source.ogg.secureDeployment | default false | quote }}
+
+{{- with .Values.source.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+{{- end }}
+
+          ports:
+            - name: https
+              containerPort: {{ .Values.source.service.ports.https }}
+              protocol: TCP
+            - name: dist
+              containerPort: {{ .Values.source.service.ports.dist }}
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.source.service.ports.metrics }}
+              protocol: TCP
+
+          volumeMounts:
+            - name: u02
+              mountPath: /u02
+
+            - name: u03
+              mountPath: /u03
+
+{{- if .Values.source.certificate.existingSecret }}
+            - name: ogg-nginx-cert
+              mountPath: {{ .Values.source.certificate.mountPath | quote }}
+              readOnly: true
+{{- end }}
+
+{{- with .Values.source.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+{{- end }}
+
+          readinessProbe:
+            tcpSocket:
+              port: https
+            initialDelaySeconds: {{ .Values.source.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.source.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.source.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.source.readinessProbe.failureThreshold }}
+
+          livenessProbe:
+            tcpSocket:
+              port: https
+            initialDelaySeconds: {{ .Values.source.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.source.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.source.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.source.livenessProbe.failureThreshold }}
+
+{{- with .Values.source.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+{{- end }}
+
+{{- with .Values.source.extraContainers }}
+        {{- toYaml . | nindent 8 }}
+{{- end }}
+
+      volumes:
+        - name: u02
+{{- if and (eq .Values.source.storage.u02.type "existingClaim") .Values.source.storage.u02.existingClaim }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.source.storage.u02.existingClaim }}
+{{- else }}
+          emptyDir: {}
+{{- end }}
+
+        - name: u03
+          emptyDir: {}
+
+{{- if .Values.source.certificate.existingSecret }}
+        - name: ogg-nginx-cert
+          secret:
+            secretName: {{ .Values.source.certificate.existingSecret }}
+            defaultMode: {{ .Values.source.certificate.defaultMode | default 0444 }}
+{{- if .Values.source.certificate.items }}
+            items:
+              {{- toYaml .Values.source.certificate.items | nindent 14 }}
+{{- end }}
+{{- end }}
+
+{{- with .Values.source.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+{{- end }}
+
+{{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+{{- end }}
+
+{{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+{{- end }}
+
+{{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+{{- end }}
+{{- end }}

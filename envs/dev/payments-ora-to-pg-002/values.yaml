@@ -1,0 +1,100 @@
+global:
+  environment: dev
+  deploymentId: payments-ora-to-pg-002
+
+source:
+  enabled: true
+  name: ogg-oracle
+  component: source
+  engine: oracle
+  replicas: 1
+  containerName: ogg-oracle
+
+  image:
+    repository: 229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle
+    tag: "23.26.2.0.1"
+    pullPolicy: IfNotPresent
+
+  ogg:
+    deploymentName: OracleSource
+    domain: ogg-oracle.gg-dev-payments-ora-to-pg-001.svc.cluster.local
+    secureDeployment: false
+
+  admin:
+    existingSecret: ogg-oracle-admin
+    usernameKey: OGG_ADMIN
+    passwordKey: OGG_ADMIN_PWD
+
+  certificate:
+    existingSecret: ogg-oracle-nginx-cert
+    mountPath: /etc/nginx/cert
+    defaultMode: 0444
+    items: []
+
+  initPermissions:
+    enabled: true
+    mode: "0777"
+
+  serviceAccount:
+    create: true
+    name: ogg-oracle-sa
+    annotations: {}
+
+  service:
+    type: ClusterIP
+    ports:
+      https: 8443
+      dist: 9013
+      metrics: 9015
+
+  storage:
+    u02:
+      type: emptyDir
+      existingClaim: ""
+    u03:
+      type: emptyDir
+
+  readinessProbe:
+    initialDelaySeconds: 180
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 20
+
+  livenessProbe:
+    initialDelaySeconds: 240
+    periodSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 8
+
+  resources: {}
+
+  extraEnv: []
+  extraVolumeMounts: []
+  extraVolumes: []
+  extraContainers: []
+
+target:
+  enabled: false
+
+ingress:
+  enabled: false
+
+configJob:
+  enabled: false
+
+monitoring:
+  labels:
+    enabled: true
+
+podSecurityContext: {}
+
+securityContext:
+  runAsUser: 0
+  runAsGroup: 0
+  allowPrivilegeEscalation: false
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}

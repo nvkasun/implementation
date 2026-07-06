@@ -1,0 +1,39 @@
+name: Goldengate secret deployment
+run-name: "Deploy ${{ github.event.inputs.environment }} on ${{ github.event.inputs.region }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        type: choice
+        required: true
+        options:
+          - dev
+
+      region:
+        description: "AWS Region"
+        type: choice
+        required: true
+        options:
+          - eu-west-1
+
+      terraform_version:
+        required: false
+        type: string
+        default: "1.7.2"
+
+permissions:
+  id-token: write    # This is required for requesting the JWT
+  contents: read     # This is required for actions/checkout
+  packages: write    # Allow github.token to write packages
+  pull-requests: read
+
+jobs:
+  apply:
+    uses: AbuDhabiCommercialBank/adcb-reusable-workflows/.github/workflows/aws-terraform-apply.yaml@main
+    secrets: inherit
+    with:
+      environment: ${{ github.event.inputs.environment }}
+      region: ${{ github.event.inputs.region }}
+      terraform_version: ${{ github.event.inputs.terraform_version }}
