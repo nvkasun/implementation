@@ -1,0 +1,40 @@
+Hi Team,
+
+We tested the AWS Secrets Store CSI Provider integration for the GoldenGate workload using IRSA.
+
+The AWS provider pods and Secrets Store CSI driver pods are running, and the GoldenGate test service account successfully received the IRSA environment variables:
+
+AWS_ROLE_ARN
+AWS_WEB_IDENTITY_TOKEN_FILE
+
+However, the initial CSI mount failed with the following error:
+
+CSI token error: serviceAccount.tokens not provided - ensure tokenRequests is configured in CSIDriver
+
+We checked the CSIDriver object and confirmed that spec.tokenRequests was not configured:
+
+kubectl get csidriver secrets-store.csi.k8s.io -o jsonpath='{.spec.tokenRequests}{"\n"}'
+
+To validate the fix, we temporarily patched the CSIDriver using:
+
+kubectl patch csidriver secrets-store.csi.k8s.io \
+  --type='merge' \
+  -p '{"spec":{"tokenRequests":[{"audience":"sts.amazonaws.com"},{"audience":"pods.eks.amazonaws.com"}]}}'
+
+After recreating the test pod, the CSI mount worked successfully. The pod mounted the Secrets Manager secret as expected:
+
+/mnt/secrets-store/certificate.json
+
+The test pod became Running 1/1 and confirmed the mounted secret file size.
+
+Could you please update the Secrets Store CSI Driver Helm chart values permanently with the following configuration?
+
+tokenRequests:
+  - audience: sts.amazonaws.com
+  - audience: pods.eks.amazonaws.com
+
+Since the current CSIDriver is Helm-managed, the manual kubectl patch may be overwritten during the next Helm upgrade.
+
+Please let me know once this is applied, and I will retest the GoldenGate CSI secret mount from the application namespace.
+
+Thanks.

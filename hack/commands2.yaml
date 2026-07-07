@@ -1,0 +1,101 @@
+Step 1 — Confirm current CSIDriver config
+
+Run this:
+
+kubectl get csidriver secrets-store.csi.k8s.io -o yaml
+
+Most likely you will not see this section:
+
+spec:
+  tokenRequests:
+    - audience: sts.amazonaws.com
+    - audience: pods.eks.amazonaws.com
+
+Also run:
+
+kubectl get csidriver secrets-store.csi.k8s.io \
+  -o jsonpath='{.spec.tokenRequests}{"\n"}'
+
+If it returns empty, that is exactly the issue.
+
+Step 2 — Quick temporary patch to prove the fix
+
+Since this is a cluster-level CSI driver setting, ideally CloudOps should do it. But for quick testing, if you have permission, run:
+
+kubectl patch csidriver secrets-store.csi.k8s.io \
+  --type='merge' \
+  -p '{"spec":{"tokenRequests":[{"audience":"sts.amazonaws.com"},{"audience":"pods.eks.amazonaws.com"}]}}'
+
+Then confirm:
+
+kubectl get csidriver secrets-store.csi.k8s.io -o yaml | grep -A5 tokenRequests
+
+Expected:
+
+tokenRequests:
+- audience: sts.amazonaws.com
+- audience: pods.eks.amazonaws.com
+
+AWS provider docs show this exact tokenRequests configuration when the CSI driver is installed separately from the AWS provider.
+
+Step 3 — Recreate the test pod
+
+After patching, delete and recreate the pod:
+
+kubectl delete pod csi-secret-test -n gg-dev-csi-test --ignore-not-found
+
+Then apply the same test pod YAML again, or run your previous cat <<EOF | kubectl apply -f - command again.
+
+Then check:
+
+kubectl get pod csi-secret-test -n gg-dev-csi-test
+kubectl describe pod csi-secret-test -n gg-dev-csi-test
+kubectl logs csi-secret-test -n gg-dev-csi-test
+
+Expected success:
+
+Checking mounted secret files...
+certificate.json
+Secret file size:
+<number> /mnt/secrets-store/certificate.json
+Step 4 — Permanent CloudOps fix
+
+The patch may be overwritten later if CSI driver is Helm-managed. Permanent fix should be done in the CSI driver Helm release.
+
+Ask CloudOps to run something like this, but they need to confirm their actual Helm release name:
+
+helm list -n kube-system | grep -i secret
+
+Then upgrade the Secrets Store CSI driver with token requests:
+
+helm upgrade <CSI_DRIVER_RELEASE_NAME> secrets-store-csi-driver/secrets-store-csi-driver \
+  -n kube-system \
+  --reuse-values \
+  --set tokenRequests[0].audience="sts.amazonaws.com" \
+  --set tokenRequests[1].audience="pods.eks.amazonaws.com"
+
+Send CloudOps this message:
+
+The AWS Secrets Store CSI Provider is installed, and the pod receives the IRSA environment variables correctly. However, the CSI mount fails with:
+
+CSI token error: serviceAccount.tokens not provided - ensure tokenRequests is configured in CSIDriver
+
+Please update the Secrets Store CSI Driver CSIDriver object to include:
+
+spec:
+  tokenRequests:
+    - audience: sts.amazonaws.com
+    - audience: pods.eks.amazonaws.com
+
+This is required when the Secrets Store CSI driver is installed separately from the AWS provider.
+Important note broo
+
+After this fix, you may hit the next possible issue:
+
+AccessDeniedException
+
+If that happens, the CSI token issue is fixed, but then we need to check:
+
+1. Secret ARN matches IAM policy
+2. KMS key policy for adcb-sm-key allows GoldenGateSecretsReadRole-dev
+3. Secret resource policy, if any
