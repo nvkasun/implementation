@@ -1,0 +1,30 @@
+helm status ogg-payments-ora-to-pg-003 -n gg-dev-payments-ora-to-pg-003
+helm uninstall ogg-payments-ora-to-pg-003 -n gg-dev-payments-ora-to-pg-003 --wait --timeout 10m
+
+Then check what remains:
+
+kubectl get all -n gg-dev-payments-ora-to-pg-003
+kubectl get secretproviderclass -n gg-dev-payments-ora-to-pg-003
+kubectl get secretproviderclasspodstatus -n gg-dev-payments-ora-to-pg-003
+kubectl get secrets -n gg-dev-payments-ora-to-pg-003
+
+Then delete the namespace:
+
+kubectl delete namespace gg-dev-payments-ora-to-pg-003
+
+Wait until namespace is fully removed:
+
+kubectl wait --for=delete namespace/gg-dev-payments-ora-to-pg-003 --timeout=10m
+
+Final verification:
+
+kubectl get namespace gg-dev-payments-ora-to-pg-003
+
+Expected final output:
+
+Error from server (NotFound): namespaces "gg-dev-payments-ora-to-pg-003" not found
+
+If Helm uninstall says release not found, just continue with namespace delete:
+
+helm uninstall ogg-payments-ora-to-pg-003 -n gg-dev-payments-ora-to-pg-003 --ignore-not-found
+kubectl delete namespace gg-dev-payments-ora-to-pg-003 --ignore-not-found
