@@ -357,15 +357,18 @@ jobs:
 
           echo "Current kube context:"
           kubectl config current-context
+          kubectl version --client=true
 
-          echo "Verifying namespace-scoped access only..."
-          echo "Target namespace: ${NAMESPACE}"
+          echo "Verifying EKS access without requiring the target namespace to exist yet..."
 
-          kubectl get pods -n "${NAMESPACE}" || {
-            echo "Unable to access namespace ${NAMESPACE}."
-            echo "Make sure namespace exists and EKS access policy allows namespace pattern gg-dev-*."
-            exit 1
-          }
+          echo "Checking permission to create namespaces..."
+          kubectl auth can-i create namespace
+
+          echo "Checking permission to read CSIDriver..."
+          kubectl auth can-i get csidrivers.storage.k8s.io
+
+          echo "Checking permission to read SecretProviderClass..."
+          kubectl auth can-i get secretproviderclasses.secrets-store.csi.x-k8s.io --all-namespaces || true
 
       - name: Create namespace if missing
         if: ${{ inputs.deploy }}
@@ -373,45 +376,76 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Creating namespace if missing: ${NAMESPACE}"
+          echo "Ensuring namespace exists: ${NAMESPACE}"
 
-          if kubectl get namespace "${NAMESPACE}" >/dev/null 2>&1; then
-            echo "Namespace already exists: ${NAMESPACE}"
-            echo "Skipping namespace label update because current role cannot patch namespaces."
-          else
-            kubectl create namespace "${NAMESPACE}"
-            echo "Namespace created: ${NAMESPACE}"
-          fi
+          kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
+
+          echo "Labeling namespace: ${NAMESPACE}"
+
+          kubectl label namespace "${NAMESPACE}" \
+            app.kubernetes.io/name=goldengate \
+            app.kubernetes.io/managed-by=github-actions \
+            goldengate.adcb/environment="${ENVIRONMENT}" \
+            goldengate.adcb/deployment-id="${DEPLOYMENT_ID}" \
+            --overwrite
 
           kubectl get namespace "${NAMESPACE}" --show-labels
 
-      - name: Copy GoldenGate secrets from base namespace
-        if: ${{ inputs.deploy && false }}
+      - name: Validate Secrets Store CSI configuration
+        if: ${{ inputs.deploy }}
         shell: bash
-        env:
-          SOURCE_SECRET_NAMESPACE: ogg
         run: |
           set -euo pipefail
 
-          echo "Copying GoldenGate secrets from ${SOURCE_SECRET_NAMESPACE} to ${NAMESPACE}"
+          echo "Checking Secrets Store CSI Driver prerequisites..."
 
-          copy_secret() {
-            local SECRET_NAME="$1"
-
-            echo "Copying secret: ${SECRET_NAME}"
-
-            kubectl get secret "${SECRET_NAME}" -n "${SOURCE_SECRET_NAMESPACE}" -o json \
-              | python3 -c 'import json,sys; target_namespace=sys.argv[1]; secret=json.load(sys.stdin); metadata=secret.get("metadata",{}); metadata["namespace"]=target_namespace; [metadata.pop(k,None) for k in ["uid","resourceVersion","generation","creationTimestamp","managedFields","selfLink"]]; annotations=metadata.get("annotations",{}); annotations.pop("kubectl.kubernetes.io/last-applied-configuration",None); metadata["annotations"]=annotations if annotations else metadata.pop("annotations", None); secret["metadata"]=metadata; print(json.dumps(secret))' "${NAMESPACE}" \
-              | kubectl apply -f -
+          echo "Checking CSIDriver secrets-store.csi.k8s.io exists..."
+          kubectl get csidriver secrets-store.csi.k8s.io >/dev/null || {
+            echo "CSIDriver secrets-store.csi.k8s.io not found. Secrets Store CSI Driver is not installed on this cluster."
+            exit 1
           }
 
-          copy_secret "ogg-oracle-admin"
-          copy_secret "ogg-oracle-nginx-cert"
+          echo "Checking SecretProviderClass CRD exists..."
+          kubectl get crd secretproviderclasses.secrets-store.csi.x-k8s.io >/dev/null || {
+            echo "CRD secretproviderclasses.secrets-store.csi.x-k8s.io not found."
+            exit 1
+          }
 
-          echo "Secrets copied successfully."
+          echo "Checking CSIDriver tokenRequests audiences..."
+          TOKEN_REQUESTS="$(kubectl get csidriver secrets-store.csi.k8s.io -o jsonpath='{.spec.tokenRequests}')"
 
-          kubectl get secret ogg-oracle-admin -n "${NAMESPACE}"
-          kubectl get secret ogg-oracle-nginx-cert -n "${NAMESPACE}"
+          echo "${TOKEN_REQUESTS}" | grep -q "sts.amazonaws.com" || {
+            echo "CSIDriver secrets-store.csi.k8s.io is missing tokenRequests audience sts.amazonaws.com."
+            echo "Current tokenRequests: ${TOKEN_REQUESTS}"
+            exit 1
+          }
+
+          echo "${TOKEN_REQUESTS}" | grep -q "pods.eks.amazonaws.com" || {
+            echo "CSIDriver secrets-store.csi.k8s.io is missing tokenRequests audience pods.eks.amazonaws.com."
+            echo "Current tokenRequests: ${TOKEN_REQUESTS}"
+            exit 1
+          }
+
+          echo "tokenRequests OK: ${TOKEN_REQUESTS}"
+
+          echo "Checking Secrets Store CSI Driver Helm release for syncSecret.enabled..."
+          if helm status secrets-store-csi-driver -n kube-system >/dev/null 2>&1; then
+            SYNC_SECRET_VALUES="$(helm get values secrets-store-csi-driver -n kube-system -a | grep -A3 -i syncSecret || true)"
+
+            echo "${SYNC_SECRET_VALUES}"
+
+            echo "${SYNC_SECRET_VALUES}" | grep -qi "enabled: true" || {
+              echo "syncSecret.enabled=true not found in Helm release secrets-store-csi-driver."
+              echo "GoldenGate admin credentials require CSI secretObjects to sync AWS Secrets Manager data into Kubernetes Secret ogg-oracle-admin."
+              exit 1
+            }
+
+            echo "syncSecret.enabled=true confirmed."
+          else
+            echo "Helm release secrets-store-csi-driver not found in kube-system. Skipping syncSecret check (driver may be managed outside Helm)."
+          fi
+
+          echo "Secrets Store CSI Driver prerequisites validated."
 
       - name: Deploy GoldenGate Helm release to EKS
         if: ${{ inputs.deploy }}
@@ -433,6 +467,8 @@ jobs:
             --set global.environment="$ENVIRONMENT" \
             --set global.deploymentId="$DEPLOYMENT_ID" \
             --wait \
+            --atomic \
+            --cleanup-on-fail \
             --timeout 20m
 
       - name: Verify deployment
@@ -447,11 +483,21 @@ jobs:
           echo "Kubernetes resources:"
           kubectl get all -n "$NAMESPACE"
 
+          echo "Service account:"
+          kubectl get sa ogg-oracle-sa -n "$NAMESPACE" -o yaml
+
+          echo "SecretProviderClass resources:"
+          kubectl get secretproviderclass -n "$NAMESPACE"
+
+          echo "SecretProviderClass pod status:"
+          kubectl get secretproviderclasspodstatus -n "$NAMESPACE" || true
+
+          echo "CSI-synced admin secret:"
+          kubectl get secret ogg-oracle-admin -n "$NAMESPACE"
+          kubectl describe secret ogg-oracle-admin -n "$NAMESPACE"
+
           echo "PVCs:"
           kubectl get pvc -n "$NAMESPACE" || true
-
-          echo "Secrets:"
-          kubectl get secrets -n "$NAMESPACE" || true
 
           echo "Ingress:"
           kubectl get ingress -n "$NAMESPACE" || true
@@ -515,6 +561,8 @@ jobs:
             echo "  --set global.environment=${ENVIRONMENT} \\"
             echo "  --set global.deploymentId=${DEPLOYMENT_ID} \\"
             echo "  --wait \\"
+            echo "  --atomic \\"
+            echo "  --cleanup-on-fail \\"
             echo "  --timeout 20m"
             echo "\`\`\`"
             echo ""
@@ -526,4 +574,17 @@ jobs:
             echo "kubectl get ingress -n ${NAMESPACE}"
             echo "helm status ${RELEASE_NAME} -n ${NAMESPACE}"
             echo "\`\`\`"
+            echo ""
+            echo "### Secrets Store CSI validation commands"
+            echo ""
+            echo "\`\`\`bash"
+            echo "kubectl get secretproviderclass -n ${NAMESPACE}"
+            echo "kubectl get secretproviderclasspodstatus -n ${NAMESPACE}"
+            echo "kubectl get secret ogg-oracle-admin -n ${NAMESPACE}"
+            echo "kubectl describe secret ogg-oracle-admin -n ${NAMESPACE}"
+            echo "kubectl get sa ogg-oracle-sa -n ${NAMESPACE} -o yaml"
+            echo "\`\`\`"
+            echo ""
+            echo "Secrets are sourced exclusively from AWS Secrets Manager via the Secrets Store CSI Driver."
+            echo "No secrets are manually created or copied between namespaces."
           } >> "$GITHUB_STEP_SUMMARY"

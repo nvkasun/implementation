@@ -25,11 +25,40 @@ source:
     usernameKey: OGG_ADMIN
     passwordKey: OGG_ADMIN_PWD
 
-  certificate:
-    existingSecret: ogg-oracle-nginx-cert
-    mountPath: /etc/nginx/cert
-    defaultMode: 0444
-    items: []
+  csi:
+    enabled: true
+    region: eu-west-1
+    serviceAccountRoleArn: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev
+
+    admin:
+      # NOTE: dev/goldengate/admin-secret is a shared POC secret reused across all
+      # payments-ora-to-pg-* deployments. Production should move to one admin
+      # secret per deployment, e.g. dev/goldengate/payments-ora-to-pg-001/admin.
+      enabled: true
+      providerClassName: ogg-oracle-admin
+      secretName: ogg-oracle-admin
+      objectName: dev/goldengate/admin-secret
+      objectType: secretsmanager
+      mountPath: /mnt/secrets-store/admin
+      jmesPath:
+        - path: OGG_ADMIN
+          objectAlias: OGG_ADMIN
+        - path: OGG_ADMIN_PWD
+          objectAlias: OGG_ADMIN_PWD
+
+    certificate:
+      enabled: true
+      providerClassName: ogg-oracle-certificate
+      objectName: dev/goldengate/certificate
+      objectType: secretsmanager
+      mountPath: /etc/nginx/cert
+      jmesPath:
+        - path: caKeyPem
+          objectAlias: ogg.key
+        - path: caCertPem
+          objectAlias: ogg.pem
+        - path: caChainPem
+          objectAlias: ca-chain.pem
 
   initPermissions:
     enabled: true

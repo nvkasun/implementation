@@ -35,12 +35,6 @@ source:
     usernameKey: OGG_ADMIN
     passwordKey: OGG_ADMIN_PWD
 
-  certificate:
-    existingSecret: ""
-    mountPath: /etc/nginx/cert
-    defaultMode: 0444
-    items: []
-
   csi:
     enabled: false
     region: eu-west-1

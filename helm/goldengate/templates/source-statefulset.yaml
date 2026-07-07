@@ -1,4 +1,7 @@
 {{- if .Values.source.enabled }}
+{{- if not (and .Values.source.csi.enabled .Values.source.csi.certificate.enabled) }}
+{{- fail "source.csi.enabled and source.csi.certificate.enabled must both be true: the plain Kubernetes Secret certificate fallback has been removed, the certificate must be mounted via AWS Secrets Manager through the Secrets Store CSI Driver." }}
+{{- end }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -141,15 +144,9 @@ spec:
               readOnly: true
 {{- end }}
 
-{{- if and .Values.source.csi.enabled .Values.source.csi.certificate.enabled }}
             - name: ogg-nginx-cert-csi
               mountPath: {{ .Values.source.csi.certificate.mountPath | quote }}
               readOnly: true
-{{- else if .Values.source.certificate.existingSecret }}
-            - name: ogg-nginx-cert
-              mountPath: {{ .Values.source.certificate.mountPath | quote }}
-              readOnly: true
-{{- end }}
 
 {{- with .Values.source.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
@@ -201,23 +198,12 @@ spec:
               secretProviderClass: {{ .Values.source.csi.admin.providerClassName | quote }}
 {{- end }}
 
-{{- if and .Values.source.csi.enabled .Values.source.csi.certificate.enabled }}
         - name: ogg-nginx-cert-csi
           csi:
             driver: secrets-store.csi.k8s.io
             readOnly: true
             volumeAttributes:
               secretProviderClass: {{ .Values.source.csi.certificate.providerClassName | quote }}
-{{- else if .Values.source.certificate.existingSecret }}
-        - name: ogg-nginx-cert
-          secret:
-            secretName: {{ .Values.source.certificate.existingSecret }}
-            defaultMode: {{ .Values.source.certificate.defaultMode | default 0444 }}
-{{- if .Values.source.certificate.items }}
-            items:
-              {{- toYaml .Values.source.certificate.items | nindent 14 }}
-{{- end }}
-{{- end }}
 
 {{- with .Values.source.extraVolumes }}
         {{- toYaml . | nindent 8 }}
