@@ -386,7 +386,7 @@ jobs:
           kubectl get namespace "${NAMESPACE}" --show-labels
 
       - name: Copy GoldenGate secrets from base namespace
-        if: ${{ inputs.deploy }}
+        if: ${{ inputs.deploy && false }}
         shell: bash
         env:
           SOURCE_SECRET_NAMESPACE: ogg

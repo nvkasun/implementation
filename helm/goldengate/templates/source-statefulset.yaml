@@ -73,6 +73,12 @@ spec:
               mountPath: /u02
             - name: u03
               mountPath: /u03
+
+{{- if and .Values.source.csi.enabled .Values.source.csi.admin.enabled }}
+            - name: ogg-admin-csi
+              mountPath: {{ .Values.source.csi.admin.mountPath | quote }}
+              readOnly: true
+{{- end }}
 {{- end }}
 
       containers:
@@ -129,7 +135,17 @@ spec:
             - name: u03
               mountPath: /u03
 
-{{- if .Values.source.certificate.existingSecret }}
+{{- if and .Values.source.csi.enabled .Values.source.csi.admin.enabled }}
+            - name: ogg-admin-csi
+              mountPath: {{ .Values.source.csi.admin.mountPath | quote }}
+              readOnly: true
+{{- end }}
+
+{{- if and .Values.source.csi.enabled .Values.source.csi.certificate.enabled }}
+            - name: ogg-nginx-cert-csi
+              mountPath: {{ .Values.source.csi.certificate.mountPath | quote }}
+              readOnly: true
+{{- else if .Values.source.certificate.existingSecret }}
             - name: ogg-nginx-cert
               mountPath: {{ .Values.source.certificate.mountPath | quote }}
               readOnly: true
@@ -176,7 +192,23 @@ spec:
         - name: u03
           emptyDir: {}
 
-{{- if .Values.source.certificate.existingSecret }}
+{{- if and .Values.source.csi.enabled .Values.source.csi.admin.enabled }}
+        - name: ogg-admin-csi
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: {{ .Values.source.csi.admin.providerClassName | quote }}
+{{- end }}
+
+{{- if and .Values.source.csi.enabled .Values.source.csi.certificate.enabled }}
+        - name: ogg-nginx-cert-csi
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: {{ .Values.source.csi.certificate.providerClassName | quote }}
+{{- else if .Values.source.certificate.existingSecret }}
         - name: ogg-nginx-cert
           secret:
             secretName: {{ .Values.source.certificate.existingSecret }}
