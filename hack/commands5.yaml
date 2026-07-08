@@ -1,3 +1,5 @@
+Yes broo, that is perfect. Use your private ECR tools-curl:8.8.0 image. Since it is in your private ECR, the cluster should be able to pull it like the GoldenGate images.
+
 Use this full command:
 
 NS=gg-dev-payments-ora-to-pg-003
