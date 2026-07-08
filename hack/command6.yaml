@@ -1,0 +1,5 @@
+aws acm describe-certificate \
+  --region eu-west-1 \
+  --certificate-arn arn:aws:acm:eu-west-1:668311715351:certificate/0a2ab950-8d20-456c-b43f-a3987f7d1841 \
+  --query 'Certificate.SubjectAlternativeNames' \
+  --output table
