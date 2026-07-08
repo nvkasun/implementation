@@ -35,6 +35,14 @@ metadata:
 {{- if .Values.ingress.alb.groupOrder }}
     alb.ingress.kubernetes.io/group.order: {{ .Values.ingress.alb.groupOrder | quote }}
 {{- end }}
+{{- if .Values.ingress.alb.listenPorts }}
+    # listen-ports tells the controller which listener(s) this Ingress's
+    # rules attach to. It is required even in shared mode: the resident
+    # Ingress owns the listener/certificate, but each joining Ingress must
+    # still declare its own rules' listener or they are never attached to
+    # HTTPS 443 and requests fall through to the ALB default 404 action.
+    alb.ingress.kubernetes.io/listen-ports: {{ .Values.ingress.alb.listenPorts | quote }}
+{{- end }}
 {{- if eq .Values.ingress.mode "standalone" }}
     # ALB-level/exclusive annotations. Only emitted in standalone mode: an
     # Ingress joining an existing (resident) ALB group must NOT repeat
@@ -44,9 +52,6 @@ metadata:
     alb.ingress.kubernetes.io/target-type: {{ .Values.ingress.alb.targetType | quote }}
 {{- if .Values.ingress.alb.certificateArn }}
     alb.ingress.kubernetes.io/certificate-arn: {{ .Values.ingress.alb.certificateArn | quote }}
-{{- end }}
-{{- if .Values.ingress.alb.listenPorts }}
-    alb.ingress.kubernetes.io/listen-ports: {{ .Values.ingress.alb.listenPorts | quote }}
 {{- end }}
 {{- if .Values.ingress.alb.sslPolicy }}
     alb.ingress.kubernetes.io/ssl-policy: {{ .Values.ingress.alb.sslPolicy | quote }}

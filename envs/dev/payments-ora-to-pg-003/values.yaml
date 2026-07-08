@@ -215,6 +215,7 @@ ingress:
     groupName: gg-poc-dev-alb
     groupOrder: "110"
     backendProtocol: HTTPS
+    listenPorts: '[{"HTTPS":443}]'
     healthcheckProtocol: HTTPS
     healthcheckPort: traffic-port
     healthcheckPath: /

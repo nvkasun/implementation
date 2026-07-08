@@ -218,6 +218,7 @@ ingress:
     # payments-ora-to-pg-003 uses "110" -- this deployment reserves "112".
     groupOrder: "112"
     backendProtocol: HTTPS
+    listenPorts: '[{"HTTPS":443}]'
     healthcheckProtocol: HTTPS
     healthcheckPort: traffic-port
     healthcheckPath: /
