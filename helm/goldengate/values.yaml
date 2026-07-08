@@ -209,6 +209,32 @@ target:
 
 ingress:
   enabled: false
+  className: alb
+
+  hosts:
+    source: ""
+    target: ""
+
+  alb:
+    scheme: internal
+    targetType: ip
+    groupName: ""
+    groupOrder: ""
+    certificateArn: ""
+    backendProtocol: HTTPS
+    listenPorts: '[{"HTTP":80},{"HTTPS":443}]'
+    sslRedirect: "443"
+    healthcheckProtocol: HTTPS
+    healthcheckPort: traffic-port
+    healthcheckPath: /
+    successCodes: "200-499"
+    sslPolicy: ""
+    subnets: ""
+    securityGroups: ""
+    inboundCidrs: ""
+    loadBalancerAttributes: ""
+
+  annotations: {}
 
 configJob:
   enabled: false

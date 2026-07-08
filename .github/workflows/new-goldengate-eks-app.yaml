@@ -531,6 +531,29 @@ jobs:
             echo "Target workload not enabled for this deployment. Skipping target verification."
           fi
 
+          echo "Checking whether Ingress is enabled for this deployment..."
+          INGRESS_ENABLED="false"
+          if grep -qE "^kind: Ingress$" "rendered/${RELEASE_NAME}.yaml"; then
+            INGRESS_ENABLED="true"
+          fi
+          echo "Ingress enabled: ${INGRESS_ENABLED}"
+
+          if [ "${INGRESS_ENABLED}" = "true" ]; then
+            echo "Ingress resources:"
+            kubectl get ingress -n "$NAMESPACE"
+
+            echo "Ingress details:"
+            kubectl describe ingress -n "$NAMESPACE"
+
+            echo "Ingress (wide):"
+            kubectl get ingress -n "$NAMESPACE" -o wide
+
+            echo "ALB hostname(s):"
+            kubectl get ingress -n "$NAMESPACE" -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.loadBalancer.ingress[*].hostname}{"\n"}{end}'
+          else
+            echo "Ingress not enabled for this deployment. Skipping Ingress verification."
+          fi
+
       - name: Upload rendered manifests and chart package
         if: always()
         uses: actions/upload-artifact@v4
@@ -616,4 +639,21 @@ jobs:
             echo ""
             echo "Secrets are sourced exclusively from AWS Secrets Manager via the Secrets Store CSI Driver."
             echo "No secrets are manually created or copied between namespaces."
+            echo ""
+            if grep -qE "^kind: Ingress$" "rendered/${RELEASE_NAME}.yaml" 2>/dev/null; then
+              echo "### Ingress / ALB"
+              echo ""
+              echo "\`\`\`bash"
+              echo "kubectl get ingress -n ${NAMESPACE}"
+              echo "kubectl describe ingress -n ${NAMESPACE}"
+              echo "kubectl get ingress -n ${NAMESPACE} -o jsonpath='{range .items[*]}{.metadata.name}{\" \"}{.status.loadBalancer.ingress[*].hostname}{\"\\n\"}{end}'"
+              echo "\`\`\`"
+              echo ""
+              echo "Route53 handoff:"
+              echo ""
+              echo "Network team should create wildcard private Route53 record:"
+              echo "\`*.gg-dev.<private-zone>\` -> \`<internal ALB DNS name>\`"
+              echo ""
+              echo "This workflow does not create Route53 records."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"

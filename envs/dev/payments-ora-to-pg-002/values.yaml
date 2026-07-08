@@ -204,6 +204,35 @@ target:
 
 ingress:
   enabled: false
+  className: alb
+
+  hosts:
+    source: ogg-oracle-payments-ora-to-pg-002.gg-dev.local
+    target: ogg-postgresql-payments-ora-to-pg-002.gg-dev.local
+
+  alb:
+    scheme: internal
+    targetType: ip
+    groupName: gg-poc-dev-alb
+    # NOTE: group.order must be unique per deployment within the shared ALB
+    # group gg-poc-dev-alb. The resident health-check rule uses "100" and
+    # payments-ora-to-pg-003 uses "110" -- this deployment reserves "112".
+    groupOrder: "112"
+    certificateArn: arn:aws:acm:eu-west-1:668311715351:certificate/0a2ab950-8d20-456c-b43f-a3987f7d1841
+    backendProtocol: HTTPS
+    listenPorts: '[{"HTTP":80},{"HTTPS":443}]'
+    sslRedirect: "443"
+    healthcheckProtocol: HTTPS
+    healthcheckPort: traffic-port
+    healthcheckPath: /
+    successCodes: "200-499"
+    sslPolicy: ELBSecurityPolicy-TLS13-1-2-Res-2021-06
+    subnets: subnet-0377588c29d3c464b,subnet-033d77835dd8d2158,subnet-09c987ba566b5dff5
+    securityGroups: ""
+    inboundCidrs: ""
+    loadBalancerAttributes: ""
+
+  annotations: {}
 
 configJob:
   enabled: false
