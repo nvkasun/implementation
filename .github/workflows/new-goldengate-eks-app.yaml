@@ -483,16 +483,16 @@ jobs:
           echo "Kubernetes resources:"
           kubectl get all -n "$NAMESPACE"
 
-          echo "Service account:"
+          echo "Source: service account"
           kubectl get sa ogg-oracle-sa -n "$NAMESPACE" -o yaml
 
-          echo "SecretProviderClass resources:"
+          echo "Source: SecretProviderClass resources"
           kubectl get secretproviderclass -n "$NAMESPACE"
 
-          echo "SecretProviderClass pod status:"
+          echo "Source: SecretProviderClass pod status"
           kubectl get secretproviderclasspodstatus -n "$NAMESPACE" || true
 
-          echo "CSI-synced admin secret:"
+          echo "Source: CSI-synced admin secret"
           kubectl get secret ogg-oracle-admin -n "$NAMESPACE"
           kubectl describe secret ogg-oracle-admin -n "$NAMESPACE"
 
@@ -501,6 +501,35 @@ jobs:
 
           echo "Ingress:"
           kubectl get ingress -n "$NAMESPACE" || true
+
+          echo "Checking whether the target (PostgreSQL) workload is enabled for this deployment..."
+          TARGET_ENABLED="false"
+          if grep -q "app.kubernetes.io/component: target" "rendered/${RELEASE_NAME}.yaml"; then
+            TARGET_ENABLED="true"
+          fi
+          echo "Target enabled: ${TARGET_ENABLED}"
+
+          if [ "${TARGET_ENABLED}" = "true" ]; then
+            echo "Target: StatefulSet"
+            kubectl get statefulset ogg-postgresql -n "$NAMESPACE"
+
+            echo "Target: services"
+            kubectl get svc ogg-postgresql -n "$NAMESPACE"
+            kubectl get svc ogg-postgresql-headless -n "$NAMESPACE"
+
+            echo "Target: pods"
+            kubectl get pod -l app.kubernetes.io/component=target -n "$NAMESPACE"
+
+            echo "Target: SecretProviderClass resources"
+            kubectl get secretproviderclass ogg-postgresql-admin -n "$NAMESPACE"
+            kubectl get secretproviderclass ogg-postgresql-certificate -n "$NAMESPACE"
+
+            echo "Target: CSI-synced admin secret"
+            kubectl get secret ogg-postgresql-admin -n "$NAMESPACE"
+            kubectl describe secret ogg-postgresql-admin -n "$NAMESPACE"
+          else
+            echo "Target workload not enabled for this deployment. Skipping target verification."
+          fi
 
       - name: Upload rendered manifests and chart package
         if: always()

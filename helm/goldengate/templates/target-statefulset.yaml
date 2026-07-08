@@ -1,0 +1,234 @@
+{{- if .Values.target.enabled }}
+{{- if not .Values.target.csi.enabled }}
+{{- fail "target.csi.enabled must be true when target.enabled=true: target credentials and certificate are CSI-only." }}
+{{- end }}
+{{- if not .Values.target.csi.admin.enabled }}
+{{- fail "target.csi.admin.enabled must be true when target.enabled=true." }}
+{{- end }}
+{{- if not .Values.target.csi.certificate.enabled }}
+{{- fail "target.csi.certificate.enabled must be true when target.enabled=true." }}
+{{- end }}
+{{- if not .Values.target.admin.existingSecret }}
+{{- fail "target.admin.existingSecret is required when target.enabled=true." }}
+{{- end }}
+{{- if not .Values.target.csi.admin.objectName }}
+{{- fail "target.csi.admin.objectName is required when target.enabled=true." }}
+{{- end }}
+{{- if not .Values.target.csi.certificate.objectName }}
+{{- fail "target.csi.certificate.objectName is required when target.enabled=true." }}
+{{- end }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "goldengate.targetName" . }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "goldengate.labels" . | nindent 4 }}
+    app.kubernetes.io/component: target
+    app.kubernetes.io/engine: {{ .Values.target.engine | quote }}
+spec:
+  serviceName: {{ include "goldengate.targetHeadlessName" . }}
+  replicas: {{ .Values.target.replicas | default 1 }}
+  selector:
+    matchLabels:
+      {{- include "goldengate.targetSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "goldengate.labels" . | nindent 8 }}
+        {{- include "goldengate.targetSelectorLabels" . | nindent 8 }}
+        app.kubernetes.io/engine: {{ .Values.target.engine | quote }}
+    spec:
+      serviceAccountName: {{ include "goldengate.targetServiceAccountName" . }}
+
+{{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+{{- end }}
+
+{{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+{{- end }}
+
+{{- if .Values.target.initPermissions.enabled }}
+      initContainers:
+        - name: prepare-u02-permissions
+          image: "{{ required "target.image.repository is required when target.enabled=true" .Values.target.image.repository }}:{{ required "target.image.tag is required when target.enabled=true" .Values.target.image.tag }}"
+          imagePullPolicy: {{ .Values.target.image.pullPolicy | default "IfNotPresent" }}
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+
+              echo "Preparing writable GoldenGate runtime directories..."
+
+              mkdir -p /u02/oggf
+              rm -rf /u02/oggf/certificate
+              mkdir -p /u02/oggf/certificate
+              mkdir -p /u03
+
+              echo "Applying temporary test permissions..."
+              chown -R 0:0 /u02 /u03 || true
+              chmod -R {{ .Values.target.initPermissions.mode | default "0777" }} /u02 /u03
+
+              echo "Testing write access..."
+              touch /u02/oggf/certificate/write-test.txt
+              echo "ok" > /u02/oggf/certificate/write-test.txt
+              rm -f /u02/oggf/certificate/write-test.txt
+
+              echo "Directory permissions after update:"
+              ls -ld /u02
+              ls -ld /u02/oggf
+              ls -ld /u02/oggf/certificate
+              ls -ld /u03
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+          volumeMounts:
+            - name: u02
+              mountPath: /u02
+            - name: u03
+              mountPath: /u03
+            - name: ogg-admin-csi
+              mountPath: {{ .Values.target.csi.admin.mountPath | quote }}
+              readOnly: true
+{{- end }}
+
+      containers:
+        - name: {{ .Values.target.containerName | default "ogg-postgresql" }}
+          image: "{{ required "target.image.repository is required when target.enabled=true" .Values.target.image.repository }}:{{ required "target.image.tag is required when target.enabled=true" .Values.target.image.tag }}"
+          imagePullPolicy: {{ .Values.target.image.pullPolicy | default "IfNotPresent" }}
+
+{{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+{{- end }}
+
+          env:
+            - name: OGG_ADMIN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "target.admin.existingSecret is required when target.enabled=true" .Values.target.admin.existingSecret }}
+                  key: {{ .Values.target.admin.usernameKey | default "OGG_ADMIN" }}
+
+            - name: OGG_ADMIN_PWD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "target.admin.existingSecret is required when target.enabled=true" .Values.target.admin.existingSecret }}
+                  key: {{ .Values.target.admin.passwordKey | default "OGG_ADMIN_PWD" }}
+
+            - name: OGG_DEPLOYMENT
+              value: {{ required "target.ogg.deploymentName is required when target.enabled=true" .Values.target.ogg.deploymentName | quote }}
+
+            - name: OGG_DOMAIN
+              value: {{ required "target.ogg.domain is required when target.enabled=true" .Values.target.ogg.domain | quote }}
+
+            - name: OGG_SECURE_DEPLOYMENT
+              value: {{ .Values.target.ogg.secureDeployment | default false | quote }}
+
+{{- with .Values.target.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+{{- end }}
+
+          ports:
+            - name: https
+              containerPort: {{ .Values.target.service.ports.https }}
+              protocol: TCP
+            - name: receiver
+              containerPort: {{ .Values.target.service.ports.receiver }}
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.target.service.ports.metrics }}
+              protocol: TCP
+
+          volumeMounts:
+            - name: u02
+              mountPath: /u02
+
+            - name: u03
+              mountPath: /u03
+
+            - name: ogg-admin-csi
+              mountPath: {{ .Values.target.csi.admin.mountPath | quote }}
+              readOnly: true
+
+            - name: ogg-nginx-cert-csi
+              mountPath: {{ .Values.target.csi.certificate.mountPath | quote }}
+              readOnly: true
+
+{{- with .Values.target.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+{{- end }}
+
+          readinessProbe:
+            tcpSocket:
+              port: https
+            initialDelaySeconds: {{ .Values.target.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.target.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.target.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.target.readinessProbe.failureThreshold }}
+
+          livenessProbe:
+            tcpSocket:
+              port: https
+            initialDelaySeconds: {{ .Values.target.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.target.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.target.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.target.livenessProbe.failureThreshold }}
+
+{{- with .Values.target.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+{{- end }}
+
+{{- with .Values.target.extraContainers }}
+        {{- toYaml . | nindent 8 }}
+{{- end }}
+
+      volumes:
+        - name: u02
+{{- if and (eq .Values.target.storage.u02.type "existingClaim") .Values.target.storage.u02.existingClaim }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.target.storage.u02.existingClaim }}
+{{- else }}
+          emptyDir: {}
+{{- end }}
+
+        - name: u03
+          emptyDir: {}
+
+        - name: ogg-admin-csi
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: {{ .Values.target.csi.admin.providerClassName | quote }}
+
+        - name: ogg-nginx-cert-csi
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: {{ .Values.target.csi.certificate.providerClassName | quote }}
+
+{{- with .Values.target.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+{{- end }}
+
+{{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+{{- end }}
+
+{{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+{{- end }}
+
+{{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+{{- end }}
+{{- end }}

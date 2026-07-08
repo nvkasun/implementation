@@ -111,6 +111,101 @@ source:
 
 target:
   enabled: false
+  name: ""
+  fullnameOverride: ""
+  component: target
+  engine: postgresql
+  replicas: 1
+  containerName: ogg-postgresql
+
+  image:
+    repository: ""
+    tag: ""
+    pullPolicy: IfNotPresent
+
+  ogg:
+    deploymentName: ""
+    domain: ""
+    secureDeployment: false
+
+  admin:
+    existingSecret: ""
+    usernameKey: OGG_ADMIN
+    passwordKey: OGG_ADMIN_PWD
+
+  csi:
+    enabled: false
+    region: eu-west-1
+    serviceAccountRoleArn: ""
+
+    admin:
+      enabled: false
+      providerClassName: ogg-postgresql-admin
+      secretName: ogg-postgresql-admin
+      objectName: ""
+      objectType: secretsmanager
+      mountPath: /mnt/secrets-store/admin
+      jmesPath:
+        - path: OGG_ADMIN
+          objectAlias: OGG_ADMIN
+        - path: OGG_ADMIN_PWD
+          objectAlias: OGG_ADMIN_PWD
+
+    certificate:
+      enabled: false
+      providerClassName: ogg-postgresql-certificate
+      objectName: ""
+      objectType: secretsmanager
+      mountPath: /etc/nginx/cert
+      jmesPath:
+        - path: caKeyPem
+          objectAlias: ogg.key
+        - path: caCertPem
+          objectAlias: ogg.pem
+        - path: caChainPem
+          objectAlias: ca-chain.pem
+
+  initPermissions:
+    enabled: true
+    mode: "0777"
+
+  serviceAccount:
+    create: false
+    name: ogg-oracle-sa
+    annotations: {}
+
+  service:
+    type: ClusterIP
+    ports:
+      https: 8443
+      receiver: 9014
+      metrics: 9015
+
+  storage:
+    u02:
+      type: emptyDir
+      existingClaim: ""
+    u03:
+      type: emptyDir
+
+  readinessProbe:
+    initialDelaySeconds: 180
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 20
+
+  livenessProbe:
+    initialDelaySeconds: 240
+    periodSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 8
+
+  resources: {}
+
+  extraEnv: []
+  extraVolumeMounts: []
+  extraVolumes: []
+  extraContainers: []
 
 ingress:
   enabled: false

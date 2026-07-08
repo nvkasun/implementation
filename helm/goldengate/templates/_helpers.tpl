@@ -47,3 +47,31 @@ app.kubernetes.io/name: {{ include "goldengate.sourceName" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/component: source
 {{- end }}
+
+{{- define "goldengate.targetName" -}}
+{{- if .Values.target.fullnameOverride }}
+{{- .Values.target.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- else if .Values.target.name }}
+{{- .Values.target.name | trunc 63 | trimSuffix "-" -}}
+{{- else }}
+{{- printf "%s-target" (include "goldengate.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end }}
+{{- end }}
+
+{{- define "goldengate.targetHeadlessName" -}}
+{{- printf "%s-headless" (include "goldengate.targetName" .) | trunc 63 | trimSuffix "-" -}}
+{{- end }}
+
+{{- define "goldengate.targetServiceAccountName" -}}
+{{- if .Values.target.serviceAccount.create }}
+{{- default (printf "%s-sa" (include "goldengate.targetName" .)) .Values.target.serviceAccount.name | trunc 63 | trimSuffix "-" -}}
+{{- else }}
+{{- default "default" .Values.target.serviceAccount.name -}}
+{{- end }}
+{{- end }}
+
+{{- define "goldengate.targetSelectorLabels" -}}
+app.kubernetes.io/name: {{ include "goldengate.targetName" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: target
+{{- end }}

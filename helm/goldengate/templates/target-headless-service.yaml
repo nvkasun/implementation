@@ -1,0 +1,28 @@
+{{- if .Values.target.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "goldengate.targetHeadlessName" . }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "goldengate.labels" . | nindent 4 }}
+    app.kubernetes.io/component: target
+    app.kubernetes.io/engine: {{ .Values.target.engine | quote }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "goldengate.targetSelectorLabels" . | nindent 4 }}
+  ports:
+    - name: https
+      port: {{ .Values.target.service.ports.https }}
+      targetPort: https
+      protocol: TCP
+    - name: receiver
+      port: {{ .Values.target.service.ports.receiver }}
+      targetPort: receiver
+      protocol: TCP
+    - name: metrics
+      port: {{ .Values.target.service.ports.metrics }}
+      targetPort: metrics
+      protocol: TCP
+{{- end }}

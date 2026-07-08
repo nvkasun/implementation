@@ -104,6 +104,103 @@ source:
 
 target:
   enabled: false
+  name: ogg-postgresql
+  component: target
+  engine: postgresql
+  replicas: 1
+  containerName: ogg-postgresql
+
+  image:
+    repository: 229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-postgresql
+    tag: "23.26.2.0.1"
+    pullPolicy: IfNotPresent
+
+  ogg:
+    deploymentName: PostgresqlTarget
+    domain: ogg-postgresql.gg-dev-payments-ora-to-pg-002.svc.cluster.local
+    secureDeployment: false
+
+  admin:
+    existingSecret: ogg-postgresql-admin
+    usernameKey: OGG_ADMIN
+    passwordKey: OGG_ADMIN_PWD
+
+  csi:
+    enabled: true
+    region: eu-west-1
+    serviceAccountRoleArn: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev
+
+    admin:
+      # NOTE: dev/goldengate/admin-secret-target is a shared POC secret reused across
+      # all payments-ora-to-pg-* target deployments. Production should move to one
+      # admin secret per deployment, e.g. dev/goldengate/payments-ora-to-pg-002/target-admin.
+      enabled: true
+      providerClassName: ogg-postgresql-admin
+      secretName: ogg-postgresql-admin
+      objectName: dev/goldengate/admin-secret-target
+      objectType: secretsmanager
+      mountPath: /mnt/secrets-store/admin
+      jmesPath:
+        - path: OGG_ADMIN
+          objectAlias: OGG_ADMIN
+        - path: OGG_ADMIN_PWD
+          objectAlias: OGG_ADMIN_PWD
+
+    certificate:
+      enabled: true
+      providerClassName: ogg-postgresql-certificate
+      objectName: dev/goldengate/certificate
+      objectType: secretsmanager
+      mountPath: /etc/nginx/cert
+      jmesPath:
+        - path: caKeyPem
+          objectAlias: ogg.key
+        - path: caCertPem
+          objectAlias: ogg.pem
+        - path: caChainPem
+          objectAlias: ca-chain.pem
+
+  initPermissions:
+    enabled: true
+    mode: "0777"
+
+  serviceAccount:
+    create: false
+    name: ogg-oracle-sa
+    annotations: {}
+
+  service:
+    type: ClusterIP
+    ports:
+      https: 8443
+      receiver: 9014
+      metrics: 9015
+
+  storage:
+    u02:
+      type: emptyDir
+      existingClaim: ""
+    u03:
+      type: emptyDir
+
+  readinessProbe:
+    initialDelaySeconds: 180
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 20
+
+  livenessProbe:
+    initialDelaySeconds: 240
+    periodSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 8
+
+  resources: {}
+
+  extraEnv: []
+  extraVolumeMounts: []
+  extraVolumes: []
+  extraContainers: []
 
 ingress:
   enabled: false
