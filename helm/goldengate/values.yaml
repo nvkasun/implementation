@@ -209,6 +209,11 @@ target:
 
 ingress:
   enabled: false
+  # mode: shared  -> join an existing (resident) ALB group; emit only
+  #                   application/group-level annotations.
+  # mode: standalone -> this Ingress owns its own ALB; emit full ALB
+  #                      annotations (scheme, subnets, certificateArn, ...).
+  mode: shared
   className: alb
 
   hosts:
