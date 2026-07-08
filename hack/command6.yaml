@@ -1,5 +1,64 @@
-aws acm describe-certificate \
-  --region eu-west-1 \
-  --certificate-arn arn:aws:acm:eu-west-1:668311715351:certificate/0a2ab950-8d20-456c-b43f-a3987f7d1841 \
-  --query 'Certificate.SubjectAlternativeNames' \
-  --output table
+If they shared a .crt, .cer, or .pem file
+
+Go to the folder where the certificate file is saved and run:
+
+ls -la
+
+Then run this, replacing the filename:
+
+openssl x509 -in certificate.crt -noout -subject -issuer -dates -ext subjectAltName
+
+Example:
+
+openssl x509 -in goldengate-dev.crt -noout -subject -issuer -dates -ext subjectAltName
+
+If that works, you should see something like:
+
+X509v3 Subject Alternative Name:
+    DNS:goldengate-dev.adcbmis.local, DNS:*.goldengate-dev.adcbmis.local
+
+Share only that SAN section with me.
+
+If the file is .cer and the above command fails
+
+Try DER format:
+
+openssl x509 -inform DER -in certificate.cer -noout -subject -issuer -dates -ext subjectAltName
+If they shared the certificate as text
+
+If it looks like this:
+
+-----BEGIN CERTIFICATE-----
+...
+-----END CERTIFICATE-----
+
+Create a file:
+
+vi goldengate-dev.crt
+
+Paste the certificate content, save it, then run:
+
+openssl x509 -in goldengate-dev.crt -noout -subject -issuer -dates -ext subjectAltName
+If they shared a .pfx / .p12 file
+
+That may contain private key also, so be careful. Do not share the file here.
+
+Run:
+
+openssl pkcs12 -in certificate.pfx -nokeys -clcerts -out extracted-cert.crt
+
+Then check SAN:
+
+openssl x509 -in extracted-cert.crt -noout -subject -issuer -dates -ext subjectAltName
+What I need from you
+
+Share only this output:
+
+openssl x509 -in <your-cert-file> -noout -subject -issuer -dates -ext subjectAltName
+
+Especially this part:
+
+X509v3 Subject Alternative Name:
+    DNS:...
+
+Then I can tell you the exact final hostname pattern we should use in Helm and what DNS wildcard we need to ask from the network team.
