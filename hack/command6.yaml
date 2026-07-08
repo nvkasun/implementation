@@ -1,64 +1,24 @@
-If they shared a .crt, .cer, or .pem file
+Hi Team,
 
-Go to the folder where the certificate file is saved and run:
+We have validated the internal ALB and Kubernetes Ingress routing for the GoldenGate EKS POC. Both source and target GoldenGate services are reachable through the internal ALB using host-based routing.
 
-ls -la
+Current internal ALB DNS:
+internal-k8s-ggpocdevalb-53c8cf7cb4-847733536.eu-west-1.elb.amazonaws.com
 
-Then run this, replacing the filename:
+We checked the certificate currently attached to the ALB, and the Subject Alternative Name appears to include only:
 
-openssl x509 -in certificate.crt -noout -subject -issuer -dates -ext subjectAltName
+DNS Name=goldengate-dev.adcbmis.local
 
-Example:
+For the GoldenGate deployment model, each deployment will expose separate source and target admin endpoints using host-based routing, for example:
 
-openssl x509 -in goldengate-dev.crt -noout -subject -issuer -dates -ext subjectAltName
+ogg-oracle-payments-ora-to-pg-003.goldengate-dev.adcbmis.local
+ogg-postgresql-payments-ora-to-pg-003.goldengate-dev.adcbmis.local
 
-If that works, you should see something like:
+Could you please update or issue the ACM certificate to include the wildcard SAN below?
 
-X509v3 Subject Alternative Name:
-    DNS:goldengate-dev.adcbmis.local, DNS:*.goldengate-dev.adcbmis.local
+*.goldengate-dev.adcbmis.local
 
-Share only that SAN section with me.
+Once the wildcard certificate is available and attached to the existing internal ALB, we will update the Helm Ingress hostnames accordingly and request the private Route53 wildcard DNS record.
 
-If the file is .cer and the above command fails
-
-Try DER format:
-
-openssl x509 -inform DER -in certificate.cer -noout -subject -issuer -dates -ext subjectAltName
-If they shared the certificate as text
-
-If it looks like this:
-
------BEGIN CERTIFICATE-----
-...
------END CERTIFICATE-----
-
-Create a file:
-
-vi goldengate-dev.crt
-
-Paste the certificate content, save it, then run:
-
-openssl x509 -in goldengate-dev.crt -noout -subject -issuer -dates -ext subjectAltName
-If they shared a .pfx / .p12 file
-
-That may contain private key also, so be careful. Do not share the file here.
-
-Run:
-
-openssl pkcs12 -in certificate.pfx -nokeys -clcerts -out extracted-cert.crt
-
-Then check SAN:
-
-openssl x509 -in extracted-cert.crt -noout -subject -issuer -dates -ext subjectAltName
-What I need from you
-
-Share only this output:
-
-openssl x509 -in <your-cert-file> -noout -subject -issuer -dates -ext subjectAltName
-
-Especially this part:
-
-X509v3 Subject Alternative Name:
-    DNS:...
-
-Then I can tell you the exact final hostname pattern we should use in Helm and what DNS wildcard we need to ask from the network team.
+Kind regards,
+Kasun
