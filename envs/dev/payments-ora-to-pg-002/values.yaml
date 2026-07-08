@@ -219,6 +219,7 @@ ingress:
     groupOrder: "112"
     backendProtocol: HTTPS
     listenPorts: '[{"HTTPS":443}]'
+    certificateArn: arn:aws:acm:eu-west-1:668311715351:certificate/0a2ab950-8d20-456c-b43f-a3987f7d1841
     healthcheckProtocol: HTTPS
     healthcheckPort: traffic-port
     healthcheckPath: /
