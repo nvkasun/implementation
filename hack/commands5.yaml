@@ -1,73 +1,64 @@
-Yes broo, that is perfect. Use your private ECR tools-curl:8.8.0 image. Since it is in your private ECR, the cluster should be able to pull it like the GoldenGate images.
-
-Use this full command:
-
-NS=gg-dev-payments-ora-to-pg-003
-IMAGE="229410149234.dkr.ecr.eu-west-1.amazonaws.com/tools-curl:8.8.0"
-
+Run this from the EC2 terminal
 ALB_DNS="internal-k8s-ggpocdevalb-53c8cf7cb4-847733536.eu-west-1.elb.amazonaws.com"
 
 SOURCE_HOST="ogg-oracle-payments-ora-to-pg-003.gg-dev.local"
 TARGET_HOST="ogg-postgresql-payments-ora-to-pg-003.gg-dev.local"
 
-kubectl run alb-curl-test -n $NS --rm -i --restart=Never \
-  --image=$IMAGE \
-  --image-pull-policy=IfNotPresent \
-  --command -- sh -c "
-    echo 'Testing source GoldenGate through ALB...'
-    curl -kvI --connect-to ${SOURCE_HOST}:443:${ALB_DNS}:443 https://${SOURCE_HOST}/ || true
+First check ALB DNS resolves:
 
-    echo ''
-    echo 'Testing target GoldenGate through ALB...'
-    curl -kvI --connect-to ${TARGET_HOST}:443:${ALB_DNS}:443 https://${TARGET_HOST}/ || true
-  "
+nslookup $ALB_DNS
 
-Acceptable result is any HTTP response like:
+Then test source GoldenGate through ALB:
+
+curl -kvI --connect-to ${SOURCE_HOST}:443:${ALB_DNS}:443 https://${SOURCE_HOST}/
+
+Then test target GoldenGate through ALB:
+
+curl -kvI --connect-to ${TARGET_HOST}:443:${ALB_DNS}:443 https://${TARGET_HOST}/
+
+Acceptable responses:
 
 HTTP/1.1 200
 HTTP/1.1 302
 HTTP/1.1 401
 HTTP/1.1 403
 
-That means:
+Any of those means this path is working:
 
-Pod → internal ALB → host rule → GoldenGate service → GoldenGate pod
+EC2 → Internal ALB → Ingress host rule → service → GoldenGate pod
+Test HTTP redirect also
+curl -vI --connect-to ${SOURCE_HOST}:80:${ALB_DNS}:80 http://${SOURCE_HOST}/
+curl -vI --connect-to ${TARGET_HOST}:80:${ALB_DNS}:80 http://${TARGET_HOST}/
 
-is working.
-
-Also test HTTP to HTTPS redirect:
-
-NS=gg-dev-payments-ora-to-pg-003
-IMAGE="229410149234.dkr.ecr.eu-west-1.amazonaws.com/tools-curl:8.8.0"
-
-ALB_DNS="internal-k8s-ggpocdevalb-53c8cf7cb4-847733536.eu-west-1.elb.amazonaws.com"
-
-SOURCE_HOST="ogg-oracle-payments-ora-to-pg-003.gg-dev.local"
-TARGET_HOST="ogg-postgresql-payments-ora-to-pg-003.gg-dev.local"
-
-kubectl run alb-curl-http-test -n $NS --rm -i --restart=Never \
-  --image=$IMAGE \
-  --image-pull-policy=IfNotPresent \
-  --command -- sh -c "
-    echo 'Testing source HTTP redirect...'
-    curl -vI --connect-to ${SOURCE_HOST}:80:${ALB_DNS}:80 http://${SOURCE_HOST}/ || true
-
-    echo ''
-    echo 'Testing target HTTP redirect...'
-    curl -vI --connect-to ${TARGET_HOST}:80:${ALB_DNS}:80 http://${TARGET_HOST}/ || true
-  "
-
-Expected redirect:
+Expected:
 
 HTTP/1.1 301
 HTTP/1.1 302
 Location: https://...
+Important note
 
-If the pod still cannot pull the image, run this to confirm the exact repo/tag:
+Do not test like this:
 
-aws ecr describe-images \
-  --region eu-west-1 \
-  --repository-name tools-curl \
-  --image-ids imageTag=8.8.0
+curl -k https://internal-k8s-ggpocdevalb-53c8cf7cb4-847733536.eu-west-1.elb.amazonaws.com
 
-But yes broo, using the private tools-curl:8.8.0 image is the correct solution here.
+That may not hit the correct host rule, because ALB routing depends on the hostname:
+
+ogg-oracle-payments-ora-to-pg-003.gg-dev.local
+ogg-postgresql-payments-ora-to-pg-003.gg-dev.local
+
+So use --connect-to.
+
+If it times out
+
+That means network/security group issue:
+
+EC2 security group / subnet route / ALB security group does not allow EC2 → ALB 443
+If you get 404
+
+That usually means ALB is reachable, but host rule did not match. Then we check hostname spelling.
+
+If you get 502/503
+
+That means ALB reached the listener, but backend target/service health has an issue.
+
+Run the two curl --connect-to commands from EC2 and share the output broo.
