@@ -49,13 +49,20 @@ metadata:
     # (e.g. temporary/local hostnames) with "no certificate found for host".
     alb.ingress.kubernetes.io/certificate-arn: {{ .Values.ingress.alb.certificateArn | quote }}
 {{- end }}
+{{- if .Values.ingress.alb.targetType }}
+    # target-type is a per-TargetGroup setting, not an ALB-level setting: it
+    # is required in shared mode too. Our backend Services are ClusterIP, so
+    # without target-type=ip the controller defaults to instance mode, which
+    # requires NodePort/LoadBalancer Services and fails with "TargetGroup
+    # port is empty" against a ClusterIP Service.
+    alb.ingress.kubernetes.io/target-type: {{ .Values.ingress.alb.targetType | quote }}
+{{- end }}
 {{- if eq .Values.ingress.mode "standalone" }}
     # ALB-level/exclusive annotations. Only emitted in standalone mode: an
     # Ingress joining an existing (resident) ALB group must NOT repeat
     # these, or the AWS Load Balancer Controller fails model reconciliation
     # with a conflicting-attribute error against the group's owning Ingress.
     alb.ingress.kubernetes.io/scheme: {{ .Values.ingress.alb.scheme | quote }}
-    alb.ingress.kubernetes.io/target-type: {{ .Values.ingress.alb.targetType | quote }}
 {{- if .Values.ingress.alb.sslPolicy }}
     alb.ingress.kubernetes.io/ssl-policy: {{ .Values.ingress.alb.sslPolicy | quote }}
 {{- end }}
