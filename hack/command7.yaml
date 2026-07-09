@@ -1,130 +1,131 @@
-Yes broo, we can get most details from the existing certificate. For the new CSR, the important details are:
+Yes broo, Git Bash with OpenSSL is enough. Do this from the folder where those files are saved.
 
-Subject / CN details from old certificate
-Key type/size
-New required SAN list
+1. Open Git Bash in that folder
 
-Issuer, expiry date, serial number, etc. are not part of the CSR. The CA/change team will set those when they issue the new certificate.
+Right-click inside the folder and choose Git Bash Here.
 
-1. First extract details from existing cert
+Then run:
 
-Use the .pem certificate file:
+ls -la
 
-openssl x509 -in "goldengate-dev.adcbmis.local.pem" -noout -subject -issuer -dates -ext subjectAltName
+You should see the real file names/extensions. Most likely:
 
-Based on what we already saw, the subject is likely:
-
-C  = AE
-ST = Abu Dhabi
-L  = Abu Dhabi
-O  = ADCB
-OU = IT
-CN = goldengate-dev.adcbmis.local
-
-Current SAN is only:
-
-DNS:goldengate-dev.adcbmis.local
-
-New SAN should be:
-
-DNS:goldengate-dev.adcbmis.local
-DNS:*.goldengate-dev.adcbmis.local
-2. Check if the existing key matches the certificate
-
-Broo, this file:
-
-ca-key.pem
-
-looks like a private key. Do not share it with anyone in email/chat.
-
-To check whether that key matches the certificate, run:
-
-openssl x509 -in "goldengate-dev.adcbmis.local.pem" -noout -modulus | openssl md5
-openssl rsa -in "ca-key.pem" -noout -modulus | openssl md5
-
-If both MD5 values are the same, then ca-key.pem is the matching private key for that certificate.
-
-If it asks for passphrase, enter the key password if you have one.
-
-3. Create CSR using existing key
-
-If the key matches and your team is okay to reuse the same private key, create this config file:
-
-cat > goldengate-dev-wildcard.cnf <<'EOF'
-[ req ]
-default_bits       = 2048
-prompt             = no
-default_md         = sha256
-distinguished_name = dn
-req_extensions     = req_ext
-
-[ dn ]
-C  = AE
-ST = Abu Dhabi
-L  = Abu Dhabi
-O  = ADCB
-OU = IT
-CN = goldengate-dev.adcbmis.local
-
-[ req_ext ]
-subjectAltName = @alt_names
-
-[ alt_names ]
-DNS.1 = goldengate-dev.adcbmis.local
-DNS.2 = *.goldengate-dev.adcbmis.local
-EOF
-
-Then generate CSR:
-
-openssl req -new \
-  -key "ca-key.pem" \
-  -out "goldengate-dev-wildcard.csr" \
-  -config "goldengate-dev-wildcard.cnf"
-
-Verify CSR:
-
-openssl req -in "goldengate-dev-wildcard.csr" -noout -subject -text | grep -A5 "Subject Alternative Name"
-
-Expected:
-
-DNS:goldengate-dev.adcbmis.local, DNS:*.goldengate-dev.adcbmis.local
-4. What to share with network/change team
-
-Send only this file:
-
+goldengate-dev.adcbmis.local.cer
+goldengate-dev.adcbmis.local.p7b
+goldengate-dev.key
 goldengate-dev-wildcard.csr
 
-Do not send:
+For ACM, we do not need the CSR now.
 
-ca-key.pem
+2. Set file names
 
-In the email/message, mention:
+Update these names based on your ls -la output:
 
-Required SANs:
+CERT_FILE="goldengate-dev.adcbmis.local.cer"
+P7B_FILE="goldengate-dev.adcbmis.local.p7b"
+KEY_FILE="goldengate-dev.key"
+
+mkdir -p acm-import
+3. Convert server certificate to PEM
+
+Run:
+
+openssl x509 -in "$CERT_FILE" -out acm-import/server-cert.pem -outform PEM || \
+openssl x509 -inform DER -in "$CERT_FILE" -out acm-import/server-cert.pem -outform PEM
+
+Verify wildcard SAN:
+
+openssl x509 -in acm-import/server-cert.pem -noout -subject -issuer -dates -ext subjectAltName
+
+You must see:
+
 DNS:goldengate-dev.adcbmis.local
 DNS:*.goldengate-dev.adcbmis.local
-5. If they prefer a new private key
 
-Then generate a new key and CSR like this:
+This file goes to AWS field:
 
-openssl genrsa -out "goldengate-dev-wildcard.key" 2048
+Certificate body
+4. Prepare private key for ACM
 
-openssl req -new \
-  -key "goldengate-dev-wildcard.key" \
-  -out "goldengate-dev-wildcard.csr" \
-  -config "goldengate-dev-wildcard.cnf"
+Run:
 
-In that case, keep this private key securely:
+openssl pkey -in "$KEY_FILE" -out acm-import/private-key.pem
 
-goldengate-dev-wildcard.key
+If it asks for a password, enter the key password. This creates a PEM private key format accepted by ACM.
 
-The issued certificate will only work with that new key.
+This file goes to AWS field:
 
-Recommended for you now
+Certificate private key
 
-Since you already have the previous key/cert bundle, first try the matching check:
+Do not share this file with anyone.
 
-openssl x509 -in "goldengate-dev.adcbmis.local.pem" -noout -modulus | openssl md5
-openssl rsa -in "ca-key.pem" -noout -modulus | openssl md5
+5. Verify certificate and key match
 
-If both values match, generate the CSR using the existing key. Then share only the .csr file with Salma/change team.
+Run both commands:
+
+openssl x509 -in acm-import/server-cert.pem -pubkey -noout | openssl pkey -pubin -outform DER | openssl dgst -sha256
+openssl pkey -in acm-import/private-key.pem -pubout -outform DER | openssl dgst -sha256
+
+Both SHA256 values must be the same. If they are different, stop broo — wrong key/certificate pair.
+
+6. Extract certificate chain from PKCS#7 file
+
+Run:
+
+openssl pkcs7 -print_certs -in "$P7B_FILE" -out acm-import/all-certs-from-p7b.pem || \
+openssl pkcs7 -inform DER -print_certs -in "$P7B_FILE" -out acm-import/all-certs-from-p7b.pem
+
+Now split the certificates:
+
+awk 'BEGIN{n=0; file=""} /-----BEGIN CERTIFICATE-----/{n++; file=sprintf("acm-import/cert-%02d.pem",n)} file!=""{print > file} /-----END CERTIFICATE-----/{file=""}' acm-import/all-certs-from-p7b.pem
+
+List what each cert is:
+
+for f in acm-import/cert-*.pem; do
+  echo "===== $f ====="
+  openssl x509 -in "$f" -noout -subject -issuer
+done
+
+You will see one certificate with subject like:
+
+CN=goldengate-dev.adcbmis.local
+
+That is the server certificate. Do not include that in the chain.
+
+The remaining certificates are usually:
+
+Intermediate CA certificate
+Root CA certificate
+
+Create the chain with intermediate first, root second. Example only:
+
+cat acm-import/cert-02.pem acm-import/cert-03.pem > acm-import/certificate-chain.pem
+
+This file goes to AWS field:
+
+Certificate chain
+7. Paste into ACM
+
+In AWS ACM reimport screen:
+
+Certificate body        = content of acm-import/server-cert.pem
+Certificate private key = content of acm-import/private-key.pem
+Certificate chain       = content of acm-import/certificate-chain.pem
+
+To copy each one easily from Git Bash:
+
+cat acm-import/server-cert.pem | clip
+
+Paste into Certificate body.
+
+cat acm-import/private-key.pem | clip
+
+Paste into Certificate private key.
+
+cat acm-import/certificate-chain.pem | clip
+
+Paste into Certificate chain.
+
+Then click Reimport certificate.
+
+Broo, before clicking reimport, the most important checks are: SAN has wildcard, and cert/key SHA256 values match.
