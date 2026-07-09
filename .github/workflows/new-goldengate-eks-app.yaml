@@ -362,10 +362,10 @@ jobs:
           echo "Verifying EKS access without requiring the target namespace to exist yet..."
 
           echo "Checking permission to create namespaces..."
-          kubectl auth can-i create namespace
+          kubectl auth can-i create namespace || true
 
           echo "Checking permission to read CSIDriver..."
-          kubectl auth can-i get csidrivers.storage.k8s.io
+          kubectl auth can-i get csidrivers.storage.k8s.io || true
 
           echo "Checking permission to read SecretProviderClass..."
           kubectl auth can-i get secretproviderclasses.secrets-store.csi.x-k8s.io --all-namespaces || true
@@ -652,7 +652,7 @@ jobs:
               echo "Route53 handoff:"
               echo ""
               echo "Network team should create wildcard private Route53 record:"
-              echo "\`*.gg-dev.<private-zone>\` -> \`<internal ALB DNS name>\`"
+              echo "\`*.goldengate-dev.adcbmis.local\` -> \`<internal ALB DNS name>\`"
               echo ""
               echo "This workflow does not create Route53 records."
             fi

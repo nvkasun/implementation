@@ -31,13 +31,13 @@ source:
     serviceAccountRoleArn: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev
 
     admin:
-      # NOTE: dev/goldengate/admin-secret is a shared POC secret reused across all
+      # NOTE: dev/goldengate/source/admin is a shared POC secret reused across all
       # payments-ora-to-pg-* deployments. Production should move to one admin
-      # secret per deployment, e.g. dev/goldengate/payments-ora-to-pg-002/admin.
+      # secret per deployment, e.g. dev/goldengate/source/payments-ora-to-pg-002/admin.
       enabled: true
       providerClassName: ogg-oracle-admin
       secretName: ogg-oracle-admin
-      objectName: dev/goldengate/admin-secret
+      objectName: dev/goldengate/source/admin
       objectType: secretsmanager
       mountPath: /mnt/secrets-store/admin
       jmesPath:
@@ -49,15 +49,15 @@ source:
     certificate:
       enabled: true
       providerClassName: ogg-oracle-certificate
-      objectName: dev/goldengate/certificate
+      objectName: dev/goldengate/tls-certificate
       objectType: secretsmanager
       mountPath: /etc/nginx/cert
       jmesPath:
-        - path: caKeyPem
+        - path: '"ogg.key"'
           objectAlias: ogg.key
-        - path: caCertPem
+        - path: '"ogg.pem"'
           objectAlias: ogg.pem
-        - path: caChainPem
+        - path: '"ca-chain.pem"'
           objectAlias: ca-chain.pem
 
   initPermissions:
@@ -131,13 +131,13 @@ target:
     serviceAccountRoleArn: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev
 
     admin:
-      # NOTE: dev/goldengate/admin-secret-target is a shared POC secret reused across
+      # NOTE: dev/goldengate/target/admin is a shared POC secret reused across
       # all payments-ora-to-pg-* target deployments. Production should move to one
-      # admin secret per deployment, e.g. dev/goldengate/payments-ora-to-pg-002/target-admin.
+      # admin secret per deployment, e.g. dev/goldengate/target/payments-ora-to-pg-002/admin.
       enabled: true
       providerClassName: ogg-postgresql-admin
       secretName: ogg-postgresql-admin
-      objectName: dev/goldengate/admin-secret-target
+      objectName: dev/goldengate/target/admin
       objectType: secretsmanager
       mountPath: /mnt/secrets-store/admin
       jmesPath:
@@ -149,15 +149,15 @@ target:
     certificate:
       enabled: true
       providerClassName: ogg-postgresql-certificate
-      objectName: dev/goldengate/certificate
+      objectName: dev/goldengate/tls-certificate
       objectType: secretsmanager
       mountPath: /etc/nginx/cert
       jmesPath:
-        - path: caKeyPem
+        - path: '"ogg.key"'
           objectAlias: ogg.key
-        - path: caCertPem
+        - path: '"ogg.pem"'
           objectAlias: ogg.pem
-        - path: caChainPem
+        - path: '"ca-chain.pem"'
           objectAlias: ca-chain.pem
 
   initPermissions:
@@ -208,8 +208,8 @@ ingress:
   className: alb
 
   hosts:
-    source: ogg-oracle-payments-ora-to-pg-002.gg-dev.local
-    target: ogg-postgresql-payments-ora-to-pg-002.gg-dev.local
+    source: ogg-oracle-payments-ora-to-pg-002.goldengate-dev.adcbmis.local
+    target: ogg-postgresql-payments-ora-to-pg-002.goldengate-dev.adcbmis.local
 
   alb:
     groupName: gg-poc-dev-alb

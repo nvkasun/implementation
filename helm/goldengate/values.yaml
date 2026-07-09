@@ -60,11 +60,11 @@ source:
       objectType: secretsmanager
       mountPath: /etc/nginx/cert
       jmesPath:
-        - path: caKeyPem
+        - path: '"ogg.key"'
           objectAlias: ogg.key
-        - path: caCertPem
+        - path: '"ogg.pem"'
           objectAlias: ogg.pem
-        - path: caChainPem
+        - path: '"ca-chain.pem"'
           objectAlias: ca-chain.pem
 
   initPermissions:
@@ -158,11 +158,11 @@ target:
       objectType: secretsmanager
       mountPath: /etc/nginx/cert
       jmesPath:
-        - path: caKeyPem
+        - path: '"ogg.key"'
           objectAlias: ogg.key
-        - path: caCertPem
+        - path: '"ogg.pem"'
           objectAlias: ogg.pem
-        - path: caChainPem
+        - path: '"ca-chain.pem"'
           objectAlias: ca-chain.pem
 
   initPermissions:
@@ -221,6 +221,14 @@ ingress:
     target: ""
 
   alb:
+    # These are library defaults only -- ingress.enabled is false by default,
+    # so nothing renders out of the box. If a deployment sets
+    # ingress.enabled=true and this alb.listenPorts (or an override) contains
+    # "HTTPS", ingress.alb.certificateArn MUST also be provided, or the chart
+    # fails to render. Environment values files (envs/<env>/<deployment>/values.yaml)
+    # are expected to fully override this alb block with real, deployment-specific
+    # ALB settings (group name/order, certificate ARN, listen ports, etc.) --
+    # these library defaults are not meant to be deployed as-is.
     scheme: internal
     targetType: ip
     groupName: ""
