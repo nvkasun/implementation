@@ -1,131 +1,98 @@
-Yes broo, Git Bash with OpenSSL is enough. Do this from the folder where those files are saved.
+Now start clean and run only these commands.
 
-1. Open Git Bash in that folder
-
-Right-click inside the folder and choose Git Bash Here.
-
-Then run:
-
-ls -la
-
-You should see the real file names/extensions. Most likely:
-
-goldengate-dev.adcbmis.local.cer
-goldengate-dev.adcbmis.local.p7b
-goldengate-dev.key
-goldengate-dev-wildcard.csr
-
-For ACM, we do not need the CSR now.
-
-2. Set file names
-
-Update these names based on your ls -la output:
-
+Step 1 — Go to your certificate folder
+cd "/h/Kasun/Jira-Task/3.Goldengate/Lates-cert-whildcard"
+Step 2 — Clean and recreate ACM import folder
+rm -rf acm-import
+mkdir -p acm-import
+Step 3 — Set file names
 CERT_FILE="goldengate-dev.adcbmis.local.cer"
 P7B_FILE="goldengate-dev.adcbmis.local.p7b"
 KEY_FILE="goldengate-dev.key"
+Step 4 — Convert server certificate to PEM
+openssl x509 -in "$CERT_FILE" -out acm-import/server-cert.pem -outform PEM
 
-mkdir -p acm-import
-3. Convert server certificate to PEM
-
-Run:
-
-openssl x509 -in "$CERT_FILE" -out acm-import/server-cert.pem -outform PEM || \
-openssl x509 -inform DER -in "$CERT_FILE" -out acm-import/server-cert.pem -outform PEM
-
-Verify wildcard SAN:
+Verify SAN:
 
 openssl x509 -in acm-import/server-cert.pem -noout -subject -issuer -dates -ext subjectAltName
 
-You must see:
+You should see:
 
 DNS:goldengate-dev.adcbmis.local
 DNS:*.goldengate-dev.adcbmis.local
-
-This file goes to AWS field:
-
-Certificate body
-4. Prepare private key for ACM
-
-Run:
-
+Step 5 — Prepare private key for ACM
 openssl pkey -in "$KEY_FILE" -out acm-import/private-key.pem
-
-If it asks for a password, enter the key password. This creates a PEM private key format accepted by ACM.
-
-This file goes to AWS field:
-
-Certificate private key
-
-Do not share this file with anyone.
-
-5. Verify certificate and key match
-
-Run both commands:
-
+Step 6 — Verify certificate and key match
 openssl x509 -in acm-import/server-cert.pem -pubkey -noout | openssl pkey -pubin -outform DER | openssl dgst -sha256
 openssl pkey -in acm-import/private-key.pem -pubout -outform DER | openssl dgst -sha256
 
-Both SHA256 values must be the same. If they are different, stop broo — wrong key/certificate pair.
+Both SHA256 values must be same.
 
-6. Extract certificate chain from PKCS#7 file
+In your previous output, they already matched, so this part is good. ✅
 
-Run:
+Step 7 — Extract certificates from .p7b
 
-openssl pkcs7 -print_certs -in "$P7B_FILE" -out acm-import/all-certs-from-p7b.pem || \
-openssl pkcs7 -inform DER -print_certs -in "$P7B_FILE" -out acm-import/all-certs-from-p7b.pem
+This is the correct command for your .p7b file:
 
-Now split the certificates:
-
+openssl pkcs7 -inform DER -in "$P7B_FILE" -print_certs -out acm-import/all-certs-from-p7b.pem
+Step 8 — Split extracted certificates
 awk 'BEGIN{n=0; file=""} /-----BEGIN CERTIFICATE-----/{n++; file=sprintf("acm-import/cert-%02d.pem",n)} file!=""{print > file} /-----END CERTIFICATE-----/{file=""}' acm-import/all-certs-from-p7b.pem
-
-List what each cert is:
-
+Step 9 — Confirm certificate order
 for f in acm-import/cert-*.pem; do
   echo "===== $f ====="
   openssl x509 -in "$f" -noout -subject -issuer
 done
 
-You will see one certificate with subject like:
+Based on your output, it should be:
 
-CN=goldengate-dev.adcbmis.local
+cert-01.pem = CN=goldengate-dev.adcbmis.local
+cert-02.pem = CN=ADCB SUBCA01
+cert-03.pem = CN=ADCB ROOTCA
+Step 10 — Create certificate chain for AWS ACM
 
-That is the server certificate. Do not include that in the chain.
-
-The remaining certificates are usually:
-
-Intermediate CA certificate
-Root CA certificate
-
-Create the chain with intermediate first, root second. Example only:
+Use intermediate first, then root:
 
 cat acm-import/cert-02.pem acm-import/cert-03.pem > acm-import/certificate-chain.pem
 
-This file goes to AWS field:
+Verify:
 
-Certificate chain
-7. Paste into ACM
-
-In AWS ACM reimport screen:
-
-Certificate body        = content of acm-import/server-cert.pem
-Certificate private key = content of acm-import/private-key.pem
-Certificate chain       = content of acm-import/certificate-chain.pem
-
-To copy each one easily from Git Bash:
-
+openssl x509 -in acm-import/cert-02.pem -noout -subject -issuer
+openssl x509 -in acm-import/cert-03.pem -noout -subject -issuer
+Step 11 — Copy/paste into AWS ACM
+Certificate body
 cat acm-import/server-cert.pem | clip
 
-Paste into Certificate body.
+Paste into AWS field:
 
+Certificate body
+Certificate private key
 cat acm-import/private-key.pem | clip
 
-Paste into Certificate private key.
+Paste into AWS field:
 
+Certificate private key
+Certificate chain
 cat acm-import/certificate-chain.pem | clip
 
-Paste into Certificate chain.
+Paste into AWS field:
 
-Then click Reimport certificate.
+Certificate chain
 
-Broo, before clicking reimport, the most important checks are: SAN has wildcard, and cert/key SHA256 values match.
+Then click:
+
+Reimport certificate
+Important final check
+
+Do not paste this file anywhere in ACM:
+
+goldengate-dev-wildcard.csr
+
+CSR is finished now. AWS needs only:
+
+server-cert.pem
+private-key.pem
+certificate-chain.pem
+
+Broo, your correct chain is definitely:
+
+cat acm-import/cert-02.pem acm-import/cert-03.pem > acm-import/certificate-chain.pem
