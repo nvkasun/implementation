@@ -89,3 +89,37 @@ It will look like this, but with full PEM content:
   "ogg.pem": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n",
   "ca-chain.pem": "-----BEGIN CERTIFICATE-----\nADCB SUBCA01...\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nADCB ROOTCA...\n-----END CERTIFICATE-----\n"
 }
+
+
+................................................
+
+Now clean the chain file first:
+
+awk '
+/-----BEGIN CERTIFICATE-----/{p=1}
+p{print}
+/-----END CERTIFICATE-----/{p=0}
+' acm-import/certificate-chain.pem > acm-import/ca-chain-clean.pem
+
+Then generate Secrets Manager JSON:
+
+python - <<'EOF'
+import json
+from pathlib import Path
+
+data = {
+    "ogg.key": Path("acm-import/private-key.pem").read_text(),
+    "ogg.pem": Path("acm-import/server-cert.pem").read_text(),
+    "ca-chain.pem": Path("acm-import/ca-chain-clean.pem").read_text()
+}
+
+Path("acm-import/goldengate-tls-certificate-secret.json").write_text(
+    json.dumps(data, indent=2)
+)
+
+print("Created: acm-import/goldengate-tls-certificate-secret.json")
+EOF
+
+Now open this file:
+
+notepad acm-import/goldengate-tls-certificate-secret.json
