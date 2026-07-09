@@ -1,0 +1,31 @@
+Hi Salma,
+
+Hope you are doing well.
+
+I’m Kasun from the Cloud DB team. Around three weeks ago, Ganesh Shivali from our DB team requested an SSL certificate for our GoldenGate deployment project, and the certificate was created successfully.
+
+However, during the implementation and validation of the GoldenGate deployment architecture, we identified that the current certificate only includes a single DNS name:
+
+goldengate-dev.adcbmis.local
+
+The issue is that our GoldenGate EKS deployment model uses host-based routing per deployment, and each deployment will have separate source and target admin endpoints. For example:
+
+ogg-oracle-payments-ora-to-pg-003.goldengate-dev.adcbmis.local
+ogg-postgresql-payments-ora-to-pg-003.goldengate-dev.adcbmis.local
+
+To support this architecture properly, we need the certificate to include a wildcard SAN such as:
+
+*.goldengate-dev.adcbmis.local
+
+Without the wildcard SAN, we would need to request new DNS/certificate updates repeatedly for every new GoldenGate deployment, which will not be scalable and will also require repeated changes in the centralized Route53/private DNS setup.
+
+Could you please support us by creating/updating the SSL certificate with the wildcard SAN below?
+
+*.goldengate-dev.adcbmis.local
+
+This will allow all GoldenGate deployment-specific source and target hostnames to be covered under the same certificate.
+
+Please let me know if you need any further details from our side.
+
+Kind regards,
+Kasun
