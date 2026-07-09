@@ -123,3 +123,48 @@ EOF
 Now open this file:
 
 notepad acm-import/goldengate-tls-certificate-secret.json
+-----------------------------------------------------------------------------
+Run this from your cert folder
+cd "/h/Kasun/Jira-Task/3.Goldengate/Lates-cert-whildcard"
+
+Then run this:
+
+python - <<'EOF'
+import json
+import re
+from pathlib import Path
+
+def read_clean(path):
+    text = Path(path).read_text()
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = "\n".join(line.rstrip() for line in text.splitlines())
+    return text.strip() + "\n"
+
+def clean_cert_chain(path):
+    text = read_clean(path)
+    blocks = re.findall(
+        r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+        text,
+        flags=re.S
+    )
+    if not blocks:
+        raise Exception(f"No certificate blocks found in {path}")
+    return "\n".join(block.strip() for block in blocks) + "\n"
+
+data = {
+    "ogg.key": read_clean("acm-import/private-key.pem"),
+    "ogg.pem": clean_cert_chain("acm-import/server-cert.pem"),
+    "ca-chain.pem": clean_cert_chain("acm-import/certificate-chain.pem")
+}
+
+Path("acm-import/goldengate-tls-certificate-secret-clean.json").write_text(
+    json.dumps(data, indent=2)
+)
+
+print("Created: acm-import/goldengate-tls-certificate-secret-clean.json")
+print("Keys:", ", ".join(data.keys()))
+EOF
+
+Open the file:
+
+notepad acm-import/goldengate-tls-certificate-secret-clean.json
