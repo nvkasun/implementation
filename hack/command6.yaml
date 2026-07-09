@@ -1,24 +1,81 @@
-Hi Team,
+So use the DER command only, not the normal PEM command.
 
-We have validated the internal ALB and Kubernetes Ingress routing for the GoldenGate EKS POC. Both source and target GoldenGate services are reachable through the internal ALB using host-based routing.
+Run this exactly:
 
-Current internal ALB DNS:
-internal-k8s-ggpocdevalb-53c8cf7cb4-847733536.eu-west-1.elb.amazonaws.com
+openssl pkcs7 -inform DER -in "$P7B_FILE" -print_certs -out acm-import/all-certs-from-p7b.pem
 
-We checked the certificate currently attached to the ALB, and the Subject Alternative Name appears to include only:
+Then confirm it created the file:
 
-DNS Name=goldengate-dev.adcbmis.local
+ls -la acm-import/all-certs-from-p7b.pem
+head -20 acm-import/all-certs-from-p7b.pem
 
-For the GoldenGate deployment model, each deployment will expose separate source and target admin endpoints using host-based routing, for example:
+You should see:
 
-ogg-oracle-payments-ora-to-pg-003.goldengate-dev.adcbmis.local
-ogg-postgresql-payments-ora-to-pg-003.goldengate-dev.adcbmis.local
+-----BEGIN CERTIFICATE-----
+...
+-----END CERTIFICATE-----
+If that command still fails
 
-Could you please update or issue the ACM certificate to include the wildcard SAN below?
+Try this alternative:
 
-*.goldengate-dev.adcbmis.local
+openssl cms -inform DER -in "$P7B_FILE" -cmsout -print > acm-import/p7b-debug.txt
 
-Once the wildcard certificate is available and attached to the existing internal ALB, we will update the Helm Ingress hostnames accordingly and request the private Route53 wildcard DNS record.
+Then try:
 
-Kind regards,
-Kasun
+openssl cms -inform DER -in "$P7B_FILE" -verify -noverify -certsout acm-import/all-certs-from-p7b.pem -out /dev/null
+After extraction, split the certificates
+awk 'BEGIN{n=0; file=""} /-----BEGIN CERTIFICATE-----/{n++; file=sprintf("acm-import/cert-%02d.pem",n)} file!=""{print > file} /-----END CERTIFICATE-----/{file=""}' acm-import/all-certs-from-p7b.pem
+
+Now inspect them:
+
+for f in acm-import/cert-*.pem; do
+  echo "===== $f ====="
+  openssl x509 -in "$f" -noout -subject -issuer
+done
+
+You will see something like:
+
+cert-01.pem = goldengate-dev.adcbmis.local       ← server cert, do NOT use in chain
+cert-02.pem = ADCB SUBCA01                       ← intermediate CA, use in chain
+cert-03.pem = ADCB Root CA / AdcbMis local        ← root CA, use in chain if available
+Create the ACM certificate chain
+
+Use only CA certs, not the GoldenGate server certificate.
+
+Example, if cert-02.pem is intermediate and cert-03.pem is root:
+
+cat acm-import/cert-02.pem acm-import/cert-03.pem > acm-import/certificate-chain.pem
+
+If the .p7b only contains one CA certificate after the server cert, then use only that:
+
+cat acm-import/cert-02.pem > acm-import/certificate-chain.pem
+Final ACM paste mapping
+
+You already confirmed these two are good:
+
+Certificate body:
+acm-import/server-cert.pem
+
+Certificate private key:
+acm-import/private-key.pem
+
+Now the final one will be:
+
+Certificate chain:
+acm-import/certificate-chain.pem
+
+To copy each one from Git Bash:
+
+cat acm-import/server-cert.pem | clip
+
+Paste into Certificate body.
+
+cat acm-import/private-key.pem | clip
+
+Paste into Certificate private key.
+
+cat acm-import/certificate-chain.pem | clip
+
+Paste into Certificate chain.
+
+Then click Reimport certificate.
