@@ -1,31 +1,130 @@
-Hi Salma,
+Yes broo, we can get most details from the existing certificate. For the new CSR, the important details are:
 
-Hope you are doing well.
+Subject / CN details from old certificate
+Key type/size
+New required SAN list
 
-I’m Kasun from the Cloud DB team. Around three weeks ago, Ganesh Shivali from our DB team requested an SSL certificate for our GoldenGate deployment project, and the certificate was created successfully.
+Issuer, expiry date, serial number, etc. are not part of the CSR. The CA/change team will set those when they issue the new certificate.
 
-However, during the implementation and validation of the GoldenGate deployment architecture, we identified that the current certificate only includes a single DNS name:
+1. First extract details from existing cert
 
-goldengate-dev.adcbmis.local
+Use the .pem certificate file:
 
-The issue is that our GoldenGate EKS deployment model uses host-based routing per deployment, and each deployment will have separate source and target admin endpoints. For example:
+openssl x509 -in "goldengate-dev.adcbmis.local.pem" -noout -subject -issuer -dates -ext subjectAltName
 
-ogg-oracle-payments-ora-to-pg-003.goldengate-dev.adcbmis.local
-ogg-postgresql-payments-ora-to-pg-003.goldengate-dev.adcbmis.local
+Based on what we already saw, the subject is likely:
 
-To support this architecture properly, we need the certificate to include a wildcard SAN such as:
+C  = AE
+ST = Abu Dhabi
+L  = Abu Dhabi
+O  = ADCB
+OU = IT
+CN = goldengate-dev.adcbmis.local
 
-*.goldengate-dev.adcbmis.local
+Current SAN is only:
 
-Without the wildcard SAN, we would need to request new DNS/certificate updates repeatedly for every new GoldenGate deployment, which will not be scalable and will also require repeated changes in the centralized Route53/private DNS setup.
+DNS:goldengate-dev.adcbmis.local
 
-Could you please support us by creating/updating the SSL certificate with the wildcard SAN below?
+New SAN should be:
 
-*.goldengate-dev.adcbmis.local
+DNS:goldengate-dev.adcbmis.local
+DNS:*.goldengate-dev.adcbmis.local
+2. Check if the existing key matches the certificate
 
-This will allow all GoldenGate deployment-specific source and target hostnames to be covered under the same certificate.
+Broo, this file:
 
-Please let me know if you need any further details from our side.
+ca-key.pem
 
-Kind regards,
-Kasun
+looks like a private key. Do not share it with anyone in email/chat.
+
+To check whether that key matches the certificate, run:
+
+openssl x509 -in "goldengate-dev.adcbmis.local.pem" -noout -modulus | openssl md5
+openssl rsa -in "ca-key.pem" -noout -modulus | openssl md5
+
+If both MD5 values are the same, then ca-key.pem is the matching private key for that certificate.
+
+If it asks for passphrase, enter the key password if you have one.
+
+3. Create CSR using existing key
+
+If the key matches and your team is okay to reuse the same private key, create this config file:
+
+cat > goldengate-dev-wildcard.cnf <<'EOF'
+[ req ]
+default_bits       = 2048
+prompt             = no
+default_md         = sha256
+distinguished_name = dn
+req_extensions     = req_ext
+
+[ dn ]
+C  = AE
+ST = Abu Dhabi
+L  = Abu Dhabi
+O  = ADCB
+OU = IT
+CN = goldengate-dev.adcbmis.local
+
+[ req_ext ]
+subjectAltName = @alt_names
+
+[ alt_names ]
+DNS.1 = goldengate-dev.adcbmis.local
+DNS.2 = *.goldengate-dev.adcbmis.local
+EOF
+
+Then generate CSR:
+
+openssl req -new \
+  -key "ca-key.pem" \
+  -out "goldengate-dev-wildcard.csr" \
+  -config "goldengate-dev-wildcard.cnf"
+
+Verify CSR:
+
+openssl req -in "goldengate-dev-wildcard.csr" -noout -subject -text | grep -A5 "Subject Alternative Name"
+
+Expected:
+
+DNS:goldengate-dev.adcbmis.local, DNS:*.goldengate-dev.adcbmis.local
+4. What to share with network/change team
+
+Send only this file:
+
+goldengate-dev-wildcard.csr
+
+Do not send:
+
+ca-key.pem
+
+In the email/message, mention:
+
+Required SANs:
+DNS:goldengate-dev.adcbmis.local
+DNS:*.goldengate-dev.adcbmis.local
+5. If they prefer a new private key
+
+Then generate a new key and CSR like this:
+
+openssl genrsa -out "goldengate-dev-wildcard.key" 2048
+
+openssl req -new \
+  -key "goldengate-dev-wildcard.key" \
+  -out "goldengate-dev-wildcard.csr" \
+  -config "goldengate-dev-wildcard.cnf"
+
+In that case, keep this private key securely:
+
+goldengate-dev-wildcard.key
+
+The issued certificate will only work with that new key.
+
+Recommended for you now
+
+Since you already have the previous key/cert bundle, first try the matching check:
+
+openssl x509 -in "goldengate-dev.adcbmis.local.pem" -noout -modulus | openssl md5
+openssl rsa -in "ca-key.pem" -noout -modulus | openssl md5
+
+If both values match, generate the CSR using the existing key. Then share only the .csr file with Salma/change team.
