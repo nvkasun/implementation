@@ -25,3 +25,67 @@ Expected backend response:
 HTTP/2 302
 server: nginx
 location: /services/v2/content/index.html
+
+
+------------------------------
+Then run:
+
+python - <<'PY'
+import json
+from pathlib import Path
+
+secret = {
+    "ogg.key": Path("acm-import/private-key.pem").read_text(),
+    "ogg.pem": Path("acm-import/server-cert.pem").read_text(),
+    "ca-chain.pem": Path("acm-import/certificate-chain.pem").read_text()
+}
+
+Path("goldengate-tls-certificate-secret.json").write_text(
+    json.dumps(secret, indent=2)
+)
+
+print("Created: goldengate-tls-certificate-secret.json")
+PY
+
+This will create:
+
+goldengate-tls-certificate-secret.json
+2. Check the JSON keys only
+
+Do not print the full private key in screenshots. Just check the keys:
+
+python - <<'PY'
+import json
+with open("goldengate-tls-certificate-secret.json") as f:
+    data = json.load(f)
+print(data.keys())
+PY
+
+Expected:
+
+dict_keys(['ogg.key', 'ogg.pem', 'ca-chain.pem'])
+3. Create or update AWS Secrets Manager secret
+
+If the secret already exists:
+
+aws secretsmanager put-secret-value \
+  --region eu-west-1 \
+  --secret-id "dev/goldengate/tls-certificate" \
+  --secret-string file://goldengate-tls-certificate-secret.json
+
+If the secret does not exist yet:
+
+aws secretsmanager create-secret \
+  --region eu-west-1 \
+  --name "dev/goldengate/tls-certificate" \
+  --description "GoldenGate wildcard TLS certificate for dev EKS deployments" \
+  --secret-string file://goldengate-tls-certificate-secret.json
+Final JSON structure
+
+It will look like this, but with full PEM content:
+
+{
+  "ogg.key": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n",
+  "ogg.pem": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n",
+  "ca-chain.pem": "-----BEGIN CERTIFICATE-----\nADCB SUBCA01...\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nADCB ROOTCA...\n-----END CERTIFICATE-----\n"
+}
