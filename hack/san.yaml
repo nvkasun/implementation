@@ -1,0 +1,27 @@
+After CloudOps updates it, validate like this
+
+From EC2/Git Bash/Linux shell:
+
+ALB_DNS="internal-k8s-ggpocdevalb-53c8cf7cb4-847733536.eu-west-1.elb.amazonaws.com"
+
+echo | openssl s_client \
+  -connect ${ALB_DNS}:443 \
+  -servername goldengate-dev.adcbmis.local 2>/dev/null \
+  | openssl x509 -noout -subject -issuer -dates -ext subjectAltName
+
+Expected SAN:
+
+DNS:goldengate-dev.adcbmis.local
+DNS:*.goldengate-dev.adcbmis.local
+
+Then test one of our future final hostnames:
+
+SOURCE_HOST="ogg-oracle-payments-ora-to-pg-003.goldengate-dev.adcbmis.local"
+
+curl -kvI --connect-to ${SOURCE_HOST}:443:${ALB_DNS}:443 https://${SOURCE_HOST}/
+
+Expected backend response:
+
+HTTP/2 302
+server: nginx
+location: /services/v2/content/index.html
