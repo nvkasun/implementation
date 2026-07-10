@@ -1,37 +1,60 @@
-GoldenGate EKS POC Update
-What we have completed so far
-Reviewed the current GoldenGate deployment architecture and aligned the EKS implementation with the expected source/target pod model.
-Deployed the GoldenGate source and target pods for the current POC deployment.
-Confirmed both source and target pods are running successfully in EKS.
-Configured the internal ALB and Ingress routing for GoldenGate access.
+Completed so far
+Set up the Helm chart structure for GoldenGate deployment on EKS.
+Added source and target GoldenGate deployment support in the Helm chart.
+Created environment-specific Helm values for multiple deployments.
+Set up the GitHub Actions CI/CD workflow to package and deploy the Helm chart automatically into the EKS cluster.
+Validated that the pipeline can connect to the private EKS cluster and deploy the GoldenGate workload.
+Deployed the current POC deployment with both source and target GoldenGate pods.
+Confirmed that the GoldenGate source and target pods are running successfully in EKS.
+Configured Kubernetes services for the source and target GoldenGate endpoints.
+Configured internal ALB Ingress routing for GoldenGate admin/UI access.
 Validated that traffic is reaching the GoldenGate backend services through the internal ALB.
-Identified an issue with the existing SSL certificate, where it only supported one DNS name and did not support wildcard hostnames.
-Requested and received a new wildcard SSL certificate to support deployment-based hostnames.
-Prepared the certificate files required for ACM update and shared them with CloudOps.
-Created new Secrets Manager entries using a cleaner naming structure:
+Worked with CloudOps to resolve the required CSI driver support.
+Confirmed Secrets Store CSI Driver support is enabled in the cluster.
+Updated the deployment so the pods no longer depend on manually copied Kubernetes secrets.
+GoldenGate pods now read required secrets directly from AWS Secrets Manager through the CSI driver.
+Created and updated the new Secrets Manager structure with cleaner names:
 dev/goldengate/source/admin
 dev/goldengate/target/admin
 dev/goldengate/tls-certificate
-Updated the Helm values and templates to use the new secret names.
-Updated the planned GoldenGate hostnames to use the new wildcard certificate domain.
-Reviewed and fixed a few Helm/GitHub Actions issues before the next deployment.
+Updated Helm values and templates to use the new secret names.
+Updated the TLS certificate mapping to use the new certificate secret keys:
+ogg.key
+ogg.pem
+ca-chain.pem
+Identified that the previous SSL certificate did not support wildcard hostnames.
+Requested and received the new wildcard SSL certificate for the GoldenGate dev domain.
+Prepared the certificate body, private key, and certificate chain required for ACM update.
+Shared the updated certificate details with CloudOps to reimport into the existing ACM certificate.
+Updated the final planned GoldenGate hostnames to use the wildcard certificate domain:
+ogg-oracle-payments-ora-to-pg-003.goldengate-dev.adcbmis.local
+ogg-postgresql-payments-ora-to-pg-003.goldengate-dev.adcbmis.local
+Reviewed and fixed Helm/GitHub Actions issues before the next deployment.
 Rendered and validated the Helm manifests to confirm the new secret names, certificate mappings, and hostnames are correctly reflected.
+Resolved the EFS CSI driver support dependency with CloudOps/CEOP side, so persistent storage support can be aligned for the next phase when required.
 Current status
-The GoldenGate EKS deployment is ready from the application/Helm side.
-The new wildcard certificate has been prepared and shared with CloudOps.
-Waiting for CloudOps to update the existing ACM certificate.
-Once the ACM update is completed, we can redeploy and validate the final access flow.
+Helm chart and CI/CD deployment flow are ready.
+Source and target GoldenGate pods are already deployable through the GitHub Actions workflow.
+Secrets Manager integration through CSI driver is now aligned with the new secret naming structure.
+Internal ALB routing was already validated successfully.
+New wildcard SSL certificate is prepared and shared with CloudOps.
+Waiting for CloudOps to update/reimport the certificate in ACM.
 Remaining items
-CloudOps to update/reimport the new wildcard certificate in ACM.
+CloudOps to complete ACM certificate update with the new wildcard certificate.
 Validate that the internal ALB is serving the updated wildcard certificate.
-Run the updated GitHub Actions deployment.
-Validate that the new Secrets Manager entries are correctly mounted into the pods.
-Confirm source and target GoldenGate endpoints are reachable using the final hostnames.
+Run the updated GitHub Actions deployment again.
+Validate that pods are mounting the new Secrets Manager secrets correctly through CSI.
+Validate source and target GoldenGate endpoints using the final hostnames.
 Request the Network/Route53 team to create the wildcard private DNS record:
 *.goldengate-dev.adcbmis.local
 → internal ALB DNS name
 After DNS is created, validate browser access from the internal network.
-Then continue with the actual GoldenGate replication configuration, including Extract, Distribution, Receiver, and Replicat setup.
+Continue with GoldenGate replication configuration:
+Extract
+Distribution path
+Receiver
+Replicat
+Trail validation
 Notes
-The Terraform secret changes need to be handled carefully because the new secrets were created manually. We should not run Terraform apply directly until the state/import approach is confirmed.
-If CloudOps updates the existing ACM certificate, the ALB certificate ARN should remain the same. If they create a new ACM certificate instead, we will need to update the Helm Ingress annotation with the new ARN.
+Terraform changes for the new secret names need to be handled carefully because the new secrets were created manually. We should not run Terraform apply directly until the state/import approach is confirmed.
+If CloudOps reimports the new certificate into the existing ACM certificate, the ALB certificate ARN should remain unchanged. If they create a new ACM certificate instead, we will need to update the Helm Ingress certificate ARN.
