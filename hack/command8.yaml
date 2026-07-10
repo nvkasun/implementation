@@ -1,0 +1,48 @@
+Before running deployment
+
+Wait until CloudOps confirms this:
+
+Existing ACM certificate ARN has been reimported with wildcard SAN:
+goldengate-dev.adcbmis.local
+*.goldengate-dev.adcbmis.local
+
+Then validate from EC2:
+
+ALB_DNS="internal-k8s-ggpocdevalb-53c8cf7cb4-847733536.eu-west-1.elb.amazonaws.com"
+
+echo | openssl s_client \
+  -connect ${ALB_DNS}:443 \
+  -servername goldengate-dev.adcbmis.local 2>/dev/null \
+  | openssl x509 -noout -subject -issuer -dates -ext subjectAltName
+
+Expected:
+
+DNS:goldengate-dev.adcbmis.local
+DNS:*.goldengate-dev.adcbmis.local
+Then run the GitHub Actions deployment
+
+After deployment, validate:
+
+NS=gg-dev-payments-ora-to-pg-003
+
+kubectl get pods -n $NS
+kubectl get secretproviderclass -n $NS
+kubectl get secretproviderclasspodstatus -n $NS
+kubectl get secrets -n $NS | grep -E "ogg-oracle-admin|ogg-postgresql-admin"
+kubectl describe ingress -n $NS
+
+Then test through the ALB:
+
+ALB_DNS="internal-k8s-ggpocdevalb-53c8cf7cb4-847733536.eu-west-1.elb.amazonaws.com"
+
+SOURCE_HOST="ogg-oracle-payments-ora-to-pg-003.goldengate-dev.adcbmis.local"
+TARGET_HOST="ogg-postgresql-payments-ora-to-pg-003.goldengate-dev.adcbmis.local"
+
+curl -kvI --connect-to ${SOURCE_HOST}:443:${ALB_DNS}:443 https://${SOURCE_HOST}/
+curl -kvI --connect-to ${TARGET_HOST}:443:${ALB_DNS}:443 https://${TARGET_HOST}/
+
+Expected:
+
+HTTP/2 302
+server: nginx
+location: /services/v2/content/index.html
