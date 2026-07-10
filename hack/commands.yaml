@@ -58,3 +58,27 @@ Trail validation
 Notes
 Terraform changes for the new secret names need to be handled carefully because the new secrets were created manually. We should not run Terraform apply directly until the state/import approach is confirmed.
 If CloudOps reimports the new certificate into the existing ACM certificate, the ALB certificate ARN should remain unchanged. If they create a new ACM certificate instead, we will need to update the Helm Ingress certificate ARN.
+
+
+
+
+
+
+
+
+
+
+
+
+
+--------------
+
+Helm chart structure has been updated to support source and target GoldenGate pods per deployment.
+GitHub Actions CI/CD flow is now configured to deploy the Helm chart automatically into the private EKS cluster.
+Source and target GoldenGate pods were deployed and validated successfully.
+Internal ALB/Ingress routing was configured and tested; traffic is reaching the GoldenGate backend services.
+Worked with CloudOps/CEOP to resolve CSI driver dependencies, including Secrets Store CSI support and EFS CSI support.
+Updated the secret handling model so pods now read secrets directly from AWS Secrets Manager through CSI, instead of relying on manually copied Kubernetes secrets.
+Cleaned up the Secrets Manager naming structure and updated Helm values/templates accordingly.
+Identified the SSL certificate limitation, requested the new wildcard certificate, prepared the ACM import files, and shared them with CloudOps.
+Updated the planned hostnames to use the wildcard domain under goldengate-dev.adcbmis.local.
