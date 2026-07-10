@@ -1,93 +1,37 @@
-1. Set variables
-
-Use this exactly:
-
-NS=gg-dev-csi-test
-SA=ogg-oracle-sa
-ROLE_ARN="arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev"
-SECRET_ARN="arn:aws:secretsmanager:eu-west-1:668311715351:secret:dev/goldengate/certificate-k3ChjX"
-2. Create / annotate service account
-kubectl create serviceaccount ${SA} -n ${NS} \
-  --dry-run=client -o yaml | kubectl apply -f -
-
-kubectl annotate serviceaccount ${SA} -n ${NS} \
-  eks.amazonaws.com/role-arn="${ROLE_ARN}" \
-  --overwrite
-
-kubectl get sa ${SA} -n ${NS} -o yaml
-
-Confirm this appears:
-
-eks.amazonaws.com/role-arn: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev
-3. Create SecretProviderClass
-cat <<EOF | kubectl apply -f -
-apiVersion: secrets-store.csi.x-k8s.io/v1
-kind: SecretProviderClass
-metadata:
-  name: aws-goldengate-certificate-test
-  namespace: ${NS}
-spec:
-  provider: aws
-  parameters:
-    region: eu-west-1
-    objects: |
-      - objectName: "${SECRET_ARN}"
-        objectType: "secretsmanager"
-        objectAlias: "certificate.json"
-EOF
-4. Create test pod
-
-This will not print the secret value, only filename and file size.
-
-cat <<EOF | kubectl apply -f -
-apiVersion: v1
-kind: Pod
-metadata:
-  name: csi-secret-test
-  namespace: ${NS}
-spec:
-  serviceAccountName: ${SA}
-  restartPolicy: Never
-  containers:
-    - name: test
-      image: public.ecr.aws/docker/library/busybox:1.36
-      command:
-        - sh
-        - -c
-        - |
-          echo "Checking mounted secret files..."
-          ls -la /mnt/secrets-store
-
-          echo "Secret file size:"
-          wc -c /mnt/secrets-store/certificate.json
-
-          echo "Keeping pod alive for inspection..."
-          sleep 3600
-      volumeMounts:
-        - name: secrets-store-inline
-          mountPath: /mnt/secrets-store
-          readOnly: true
-  volumes:
-    - name: secrets-store-inline
-      csi:
-        driver: secrets-store.csi.k8s.io
-        readOnly: true
-        volumeAttributes:
-          secretProviderClass: aws-goldengate-certificate-test
-EOF
-5. Check result
-kubectl get pod csi-secret-test -n ${NS}
-kubectl describe pod csi-secret-test -n ${NS}
-kubectl logs csi-secret-test -n ${NS}
-
-Expected log:
-
-Checking mounted secret files...
-certificate.json
-Secret file size:
-<number> /mnt/secrets-store/certificate.json
-
-Also check CSI status:
-
-kubectl get secretproviderclasspodstatus -n ${NS}
-kubectl describe secretproviderclasspodstatus -n ${NS}
+GoldenGate EKS POC Update
+What we have completed so far
+Reviewed the current GoldenGate deployment architecture and aligned the EKS implementation with the expected source/target pod model.
+Deployed the GoldenGate source and target pods for the current POC deployment.
+Confirmed both source and target pods are running successfully in EKS.
+Configured the internal ALB and Ingress routing for GoldenGate access.
+Validated that traffic is reaching the GoldenGate backend services through the internal ALB.
+Identified an issue with the existing SSL certificate, where it only supported one DNS name and did not support wildcard hostnames.
+Requested and received a new wildcard SSL certificate to support deployment-based hostnames.
+Prepared the certificate files required for ACM update and shared them with CloudOps.
+Created new Secrets Manager entries using a cleaner naming structure:
+dev/goldengate/source/admin
+dev/goldengate/target/admin
+dev/goldengate/tls-certificate
+Updated the Helm values and templates to use the new secret names.
+Updated the planned GoldenGate hostnames to use the new wildcard certificate domain.
+Reviewed and fixed a few Helm/GitHub Actions issues before the next deployment.
+Rendered and validated the Helm manifests to confirm the new secret names, certificate mappings, and hostnames are correctly reflected.
+Current status
+The GoldenGate EKS deployment is ready from the application/Helm side.
+The new wildcard certificate has been prepared and shared with CloudOps.
+Waiting for CloudOps to update the existing ACM certificate.
+Once the ACM update is completed, we can redeploy and validate the final access flow.
+Remaining items
+CloudOps to update/reimport the new wildcard certificate in ACM.
+Validate that the internal ALB is serving the updated wildcard certificate.
+Run the updated GitHub Actions deployment.
+Validate that the new Secrets Manager entries are correctly mounted into the pods.
+Confirm source and target GoldenGate endpoints are reachable using the final hostnames.
+Request the Network/Route53 team to create the wildcard private DNS record:
+*.goldengate-dev.adcbmis.local
+→ internal ALB DNS name
+After DNS is created, validate browser access from the internal network.
+Then continue with the actual GoldenGate replication configuration, including Extract, Distribution, Receiver, and Replicat setup.
+Notes
+The Terraform secret changes need to be handled carefully because the new secrets were created manually. We should not run Terraform apply directly until the state/import approach is confirmed.
+If CloudOps updates the existing ACM certificate, the ALB certificate ARN should remain the same. If they create a new ACM certificate instead, we will need to update the Helm Ingress annotation with the new ARN.
