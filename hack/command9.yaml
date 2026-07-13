@@ -1,0 +1,39 @@
+Hi Ganesh,
+
+Hope you are doing well.
+
+We are currently working on the GoldenGate EKS POC deployment and have completed the application-side setup for source and target GoldenGate pods, Helm-based deployment, Secrets Manager integration through CSI driver, and internal ALB/Ingress routing.
+
+The GoldenGate endpoints are exposed through the existing internal EKS ALB using host-based routing. We have also obtained the updated wildcard SSL certificate for the GoldenGate dev domain.
+
+Could you please support us with the required network/DNS configuration to establish access to the GoldenGate deployment?
+
+We need the following support:
+
+Private Route53 DNS record
+
+Please create or support creating the wildcard DNS record below:
+
+*.goldengate-dev.adcbmis.local
+→ internal-k8s-ggpocdevalb-53c8cf7cb4-847733536.eu-west-1.elb.amazonaws.com
+
+This will allow each GoldenGate deployment to use deployment-specific hostnames, for example:
+
+ogg-oracle-payments-ora-to-pg-003.goldengate-dev.adcbmis.local
+ogg-postgresql-payments-ora-to-pg-003.goldengate-dev.adcbmis.local
+Firewall / network access
+
+Please also confirm or enable required firewall/network access from the approved internal user network or VDI/jump host network to the internal ALB on HTTPS port 443.
+
+Destination:
+internal-k8s-ggpocdevalb-53c8cf7cb4-847733536.eu-west-1.elb.amazonaws.com
+
+Port:
+443 / HTTPS
+
+We can share the EKS ALB details, certificate information, target hostnames, or any additional information required from our side.
+
+Once the DNS and firewall access are enabled, we will validate browser/API access to the GoldenGate Admin endpoints through the internal network.
+
+Kind regards,
+Kasun
