@@ -1,0 +1,477 @@
+name: Argo CD EKS deployment
+
+run-name: "Cloud Factory - Argo CD Helm build and deploy | ${{ inputs.environment }} | ran by ${{ github.actor }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Deployment environment"
+        required: true
+        type: choice
+        default: dev
+        options:
+          - dev
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+
+  # ECR / runner account where Helm OCI chart and runtime images live.
+  ECR_ACCOUNT_ID: "229410149234"
+  ECR_REGISTRY: 229410149234.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com
+
+  # Role used by GitHub Actions / CodeBuild runner. Reuses the same runner
+  # role/pattern as the GoldenGate deployment workflow -- it already has
+  # the ECR push/pull and EKS access this workflow needs, and this avoids
+  # provisioning a second dedicated IAM role for Argo CD.
+  ROLE_ARN: ${{ vars.GOLDENGATE_AWS_ROLE_ARN }}
+
+  # Target EKS cluster details (same private dev/test cluster as GoldenGate).
+  EKS_ACCOUNT_ID: ${{ vars.ACCOUNT_ID_DEV }}
+  EKS_CLUSTER_NAME: ${{ vars.AWS_CLUSTER_NAME }}
+  EKS_CLUSTER_ARN: ${{ vars.AWS_CLUSTER_ARN }}
+
+  # Optional. Add this repo variable later only if cross-account EKS auth fails.
+  EKS_DEPLOY_ROLE_ARN: ${{ vars.EKS_DEPLOY_ROLE_ARN }}
+
+  HELM_OCI_NAMESPACE: helm
+  CHART_NAME: argocd
+  HELM_CHART_PATH: helm/argocd
+  ENVS_ROOT: envs
+
+  ARGOCD_NAMESPACE: argocd
+  ARGOCD_RELEASE_NAME: argocd
+
+concurrency:
+  group: argocd-helm-deploy-${{ github.ref }}-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  build_publish_and_deploy:
+    name: Build, publish, and deploy Argo CD Helm chart
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.ROLE_ARN }}
+
+      - name: Login to private ECR
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Logging in to private ECR: ${ECR_REGISTRY}"
+
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | helm registry login --username AWS --password-stdin "$ECR_REGISTRY"
+
+      - name: Install Helm and kubectl if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking/installing Helm..."
+
+          if ! command -v helm >/dev/null 2>&1; then
+            HELM_VERSION="v3.15.4"
+
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64)
+                HELM_ARCH="amd64"
+                ;;
+              aarch64|arm64)
+                HELM_ARCH="arm64"
+                ;;
+              *)
+                echo "Unsupported architecture for Helm: $ARCH"
+                exit 1
+                ;;
+            esac
+
+            curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-${HELM_ARCH}.tar.gz" -o /tmp/helm.tar.gz
+            tar -zxvf /tmp/helm.tar.gz -C /tmp
+            sudo mv "/tmp/linux-${HELM_ARCH}/helm" /usr/local/bin/helm
+            sudo chmod +x /usr/local/bin/helm
+          fi
+
+          helm version --short
+
+          echo "Checking/installing kubectl..."
+
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KUBECTL_VERSION="v1.35.0"
+
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64)
+                KUBECTL_ARCH="amd64"
+                ;;
+              aarch64|arm64)
+                KUBECTL_ARCH="arm64"
+                ;;
+              *)
+                echo "Unsupported architecture for kubectl: $ARCH"
+                exit 1
+                ;;
+            esac
+
+            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+            sudo chmod +x /usr/local/bin/kubectl
+          fi
+
+          kubectl version --client=true
+
+      - name: Validate vendored Argo CD chart dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VENDORED_CHART="${HELM_CHART_PATH}/charts/argo-cd"
+
+          echo "Checking vendored dependency: ${VENDORED_CHART}"
+
+          if [ ! -f "${VENDORED_CHART}/Chart.yaml" ]; then
+            echo "Missing vendored Argo CD chart: ${VENDORED_CHART}/Chart.yaml"
+            echo "This workflow only deploys from the local, file:// vendored"
+            echo "dependency under ${VENDORED_CHART} -- it never fetches the"
+            echo "argo-cd chart from a public Helm repository at build time."
+            echo "Vendor the upstream chart into that path before re-running."
+            exit 1
+          fi
+
+          VENDORED_VERSION="$(grep -E '^version:' "${VENDORED_CHART}/Chart.yaml" | awk '{print $2}')"
+          echo "Vendored argo-cd chart version: ${VENDORED_VERSION}"
+
+          echo "Confirming Chart.yaml declares a local file:// dependency..."
+          grep -q 'repository: "file://charts/argo-cd"' "${HELM_CHART_PATH}/Chart.yaml" || {
+            echo "${HELM_CHART_PATH}/Chart.yaml does not declare a file://charts/argo-cd dependency."
+            exit 1
+          }
+
+          echo "Vendored dependency present and correctly declared."
+
+      - name: Validate required files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ENVIRONMENT="${{ inputs.environment }}"
+          VALUES_FILE="${ENVS_ROOT}/${ENVIRONMENT}/argocd/values.yaml"
+
+          echo "ENVIRONMENT=${ENVIRONMENT}" >> "$GITHUB_ENV"
+          echo "VALUES_FILE=${VALUES_FILE}" >> "$GITHUB_ENV"
+
+          if [ ! -f "$HELM_CHART_PATH/Chart.yaml" ]; then
+            echo "Missing Helm Chart.yaml: $HELM_CHART_PATH/Chart.yaml"
+            exit 1
+          fi
+
+          if [ ! -f "$HELM_CHART_PATH/values.yaml" ]; then
+            echo "Missing Helm values.yaml: $HELM_CHART_PATH/values.yaml"
+            exit 1
+          fi
+
+          if [ ! -f "$VALUES_FILE" ]; then
+            echo "Missing environment values file: $VALUES_FILE"
+            echo "Create: envs/${ENVIRONMENT}/argocd/values.yaml"
+            exit 1
+          fi
+
+          echo "Required files are present."
+          echo "Helm chart path: $HELM_CHART_PATH"
+          echo "Environment values: $VALUES_FILE"
+
+      - name: Helm lint Argo CD chart
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          helm lint "$HELM_CHART_PATH" \
+            --values "$VALUES_FILE"
+
+      - name: Render Argo CD manifests for validation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p rendered
+
+          helm template "$ARGOCD_RELEASE_NAME" "$HELM_CHART_PATH" \
+            --namespace "$ARGOCD_NAMESPACE" \
+            --values "$VALUES_FILE" \
+            > "rendered/${ARGOCD_RELEASE_NAME}.yaml"
+
+          echo "Rendered manifest: rendered/${ARGOCD_RELEASE_NAME}.yaml"
+
+      - name: Extract and validate rendered image references
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RENDERED="rendered/${ARGOCD_RELEASE_NAME}.yaml"
+
+          echo "Extracting rendered image references..."
+
+          IMAGES="$(grep -E '^\s*image:\s*\S' "$RENDERED" | sed -E 's/^\s*image:\s*//' | tr -d "\"'" | sort -u)"
+
+          if [ -z "$IMAGES" ]; then
+            echo "No image references found in rendered manifest. This is unexpected -- failing."
+            exit 1
+          fi
+
+          echo "Rendered image references:"
+          echo "$IMAGES"
+
+          echo ""
+          echo "Checking for public container registries..."
+
+          PUBLIC_REGISTRIES='quay\.io|ghcr\.io|docker\.io|public\.ecr\.aws|registry\.k8s\.io|gcr\.io|k8s\.gcr\.io'
+
+          if echo "$IMAGES" | grep -Ei "$PUBLIC_REGISTRIES" >/dev/null; then
+            echo "One or more rendered images reference a public registry:"
+            echo "$IMAGES" | grep -Ei "$PUBLIC_REGISTRIES"
+            echo ""
+            echo "This EKS cluster has no public internet access. Every runtime"
+            echo "image must be mirrored to private ECR and referenced from there."
+            exit 1
+          fi
+
+          echo "OK: no public registry references found."
+
+          echo ""
+          echo "Checking for unresolved placeholder values..."
+
+          if echo "$IMAGES" | grep -E '<[A-Z_][A-Z0-9_]*>' >/dev/null; then
+            echo "One or more rendered images still contain an unresolved placeholder:"
+            echo "$IMAGES" | grep -E '<[A-Z_][A-Z0-9_]*>'
+            echo ""
+            echo "Replace the placeholder tag(s) above in envs/${ENVIRONMENT}/argocd/values.yaml"
+            echo "with a real, approved image tag that has been mirrored to private ECR,"
+            echo "then re-run this workflow."
+            exit 1
+          fi
+
+          echo "OK: no placeholder values found."
+
+      - name: Package Argo CD Helm chart
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p packaged
+
+          helm package "$HELM_CHART_PATH" \
+            --destination packaged
+
+          ls -lrt packaged
+
+      - name: Ensure Helm ECR repository exists
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          HELM_ECR_REPOSITORY="${HELM_OCI_NAMESPACE}/${CHART_NAME}"
+          echo "HELM_ECR_REPOSITORY=${HELM_ECR_REPOSITORY}" >> "$GITHUB_ENV"
+
+          echo "Checking/creating ECR repository: ${HELM_OCI_NAMESPACE}/${CHART_NAME}"
+
+          aws ecr describe-repositories \
+            --region "$AWS_REGION" \
+            --repository-names "${HELM_OCI_NAMESPACE}/${CHART_NAME}" >/dev/null 2>&1 || \
+          aws ecr create-repository \
+            --region "$AWS_REGION" \
+            --repository-name "${HELM_OCI_NAMESPACE}/${CHART_NAME}" \
+            --image-scanning-configuration scanOnPush=true
+
+      - name: Push Argo CD Helm chart to ECR as OCI artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CHART_VERSION="$(grep -E '^version:' "$HELM_CHART_PATH/Chart.yaml" | awk '{print $2}')"
+          HELM_PUSH_URL="oci://${ECR_REGISTRY}/${HELM_OCI_NAMESPACE}"
+          HELM_CHART_REF="oci://${ECR_REGISTRY}/${HELM_ECR_REPOSITORY}"
+
+          echo "CHART_VERSION=${CHART_VERSION}" >> "$GITHUB_ENV"
+          echo "HELM_CHART_REF=${HELM_CHART_REF}" >> "$GITHUB_ENV"
+
+          helm push "packaged/${CHART_NAME}-${CHART_VERSION}.tgz" "$HELM_PUSH_URL"
+
+          echo "Published Helm chart:"
+          echo "${HELM_CHART_REF}:${CHART_VERSION}"
+
+      - name: Connect to EKS cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Target EKS cluster name: ${EKS_CLUSTER_NAME}"
+          echo "Target EKS cluster ARN: ${EKS_CLUSTER_ARN}"
+          echo "Target EKS account ID: ${EKS_ACCOUNT_ID}"
+          echo "Current AWS identity:"
+          aws sts get-caller-identity
+
+          echo "Connecting to EKS using cross-account EKS deploy role:"
+          echo "${EKS_DEPLOY_ROLE_ARN}"
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}" \
+            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
+            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
+
+          echo "Current kube context:"
+          kubectl config current-context
+          kubectl version --client=true
+
+          echo "Verifying EKS access without requiring the target namespace to exist yet..."
+
+          echo "Checking permission to create namespaces..."
+          kubectl auth can-i create namespace || true
+
+          echo "Checking permission to read CustomResourceDefinitions..."
+          kubectl auth can-i get customresourcedefinitions.apiextensions.k8s.io || true
+
+      - name: Create argocd namespace if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Ensuring namespace exists: ${ARGOCD_NAMESPACE}"
+
+          kubectl create namespace "${ARGOCD_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
+
+          echo "Labeling namespace: ${ARGOCD_NAMESPACE}"
+
+          kubectl label namespace "${ARGOCD_NAMESPACE}" \
+            app.kubernetes.io/name=argocd \
+            app.kubernetes.io/managed-by=github-actions \
+            goldengate.adcb/environment="${ENVIRONMENT}" \
+            --overwrite
+
+          kubectl get namespace "${ARGOCD_NAMESPACE}" --show-labels
+
+      - name: Deploy Argo CD Helm release to EKS
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Deploying Helm release..."
+          echo "Release: ${ARGOCD_RELEASE_NAME}"
+          echo "Namespace: ${ARGOCD_NAMESPACE}"
+          echo "Chart: ${HELM_CHART_REF}"
+          echo "Chart version: ${CHART_VERSION}"
+          echo "Values: ${VALUES_FILE}"
+
+          helm upgrade --install "$ARGOCD_RELEASE_NAME" "$HELM_CHART_REF" \
+            --version "$CHART_VERSION" \
+            --namespace "$ARGOCD_NAMESPACE" \
+            --values "$VALUES_FILE" \
+            --wait \
+            --atomic \
+            --cleanup-on-fail \
+            --timeout 15m
+
+      - name: Wait for Argo CD pods to become ready
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Waiting for Argo CD pods to become Ready..."
+
+          kubectl wait pod \
+            -l app.kubernetes.io/part-of=argocd \
+            -n "${ARGOCD_NAMESPACE}" \
+            --for=condition=Ready \
+            --timeout=600s || {
+              echo "Not all Argo CD pods reached Ready in time. Inspect pod status below."
+            }
+
+      - name: Verify Argo CD deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Pods:"
+          kubectl get pods -n "${ARGOCD_NAMESPACE}"
+
+          echo ""
+          echo "Services:"
+          kubectl get svc -n "${ARGOCD_NAMESPACE}"
+
+          echo ""
+          echo "Deployments:"
+          kubectl get deploy -n "${ARGOCD_NAMESPACE}"
+
+          echo ""
+          echo "StatefulSets:"
+          kubectl get statefulset -n "${ARGOCD_NAMESPACE}"
+
+          echo ""
+          echo "Argo CD CRDs:"
+          kubectl get crd | grep argoproj || true
+
+      - name: Upload rendered manifests and chart package
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: argocd-helm-artifacts-${{ inputs.environment }}
+          path: |
+            rendered/
+            packaged/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Workflow summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Argo CD EKS Helm Build and Deploy Summary"
+            echo ""
+            echo "### Deployment details"
+            echo ""
+            echo "- Environment: \`${ENVIRONMENT}\`"
+            echo "- Namespace: \`${ARGOCD_NAMESPACE}\`"
+            echo "- Helm release: \`${ARGOCD_RELEASE_NAME}\`"
+            echo "- Values file: \`${VALUES_FILE}\`"
+            echo ""
+            echo "### Published Helm OCI chart"
+            echo ""
+            echo "- Chart ref: \`${HELM_CHART_REF:-not published}\`"
+            echo "- Chart version: \`${CHART_VERSION:-unknown}\`"
+            echo ""
+            echo "### Validation commands"
+            echo ""
+            echo "\`\`\`bash"
+            echo "kubectl get pods -n ${ARGOCD_NAMESPACE}"
+            echo "kubectl get svc -n ${ARGOCD_NAMESPACE}"
+            echo "kubectl get deploy -n ${ARGOCD_NAMESPACE}"
+            echo "kubectl get statefulset -n ${ARGOCD_NAMESPACE}"
+            echo "kubectl get crd | grep argoproj"
+            echo "\`\`\`"
+            echo ""
+            echo "### Not configured yet"
+            echo ""
+            echo "This workflow only installs the Argo CD platform itself. It does NOT:"
+            echo "- Configure any Git repository credentials (HTTPS/PAT or SSH) for Argo CD."
+            echo "- Create any Argo CD Application or ApplicationSet resources (including for GoldenGate)."
+            echo "- Expose Argo CD outside the cluster (server Service stays ClusterIP)."
+            echo ""
+            echo "Those are handled in a follow-up change."
+          } >> "$GITHUB_STEP_SUMMARY"

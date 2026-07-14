@@ -1,0 +1,21 @@
+# Base values for the argocd wrapper chart.
+#
+# This file intentionally carries no environment-specific settings (image
+# registries, replica counts, RBAC policy, etc). All of that belongs in
+# envs/<environment>/argocd/values.yaml and is passed in via --values at
+# lint/template/deploy time -- the same pattern already used for the
+# GoldenGate chart (helm/goldengate + envs/dev/payments-ora-to-pg-*/values.yaml).
+#
+# Values for the vendored upstream chart must be namespaced under the
+# `argo-cd:` key below, matching the dependency name declared in Chart.yaml:
+#
+#   argo-cd:
+#     global:
+#       image:
+#         repository: <private-ecr-repo>
+#         tag: <tag>
+#
+# See helm/argocd/charts/argo-cd/values.yaml for the full set of
+# upstream-supported keys and their defaults.
+
+argo-cd: {}

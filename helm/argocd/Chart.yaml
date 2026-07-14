@@ -1,0 +1,15 @@
+apiVersion: v2
+name: argocd
+description: >-
+  Wrapper Helm chart for installing Argo CD into the private EKS dev/test
+  cluster. Vendors the official upstream argo-cd Helm chart as a local
+  file:// dependency so no public chart repository access is required at
+  deploy time.
+type: application
+version: 1.0.0
+appVersion: "v3.2.12"
+
+dependencies:
+  - name: argo-cd
+    version: "9.3.7"
+    repository: "file://charts/argo-cd"

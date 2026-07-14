@@ -1,0 +1,74 @@
+# Argo CD -- dev/test environment values
+#
+# Non-HA, single-replica install for the private EKS dev/test cluster.
+# This cluster has no public internet access, so every runtime image
+# referenced here must resolve to private ECR. The argocd-eks-deployment.yaml
+# workflow enforces this by rendering the chart and scanning every image
+# reference for public registries (quay.io, ghcr.io, docker.io,
+# public.ecr.aws, registry.k8s.io, gcr.io, k8s.gcr.io) and for unresolved
+# placeholder values before it will push/deploy anything.
+#
+# No Argo CD Applications, repo credentials, or SSO/OIDC secrets are
+# configured here. This file only stands up the Argo CD platform itself.
+
+argo-cd:
+  global:
+    image:
+      repository: 229410149234.dkr.ecr.eu-west-1.amazonaws.com/aws-cloud-factory-infra-argocd
+      tag: v3.2.12
+      imagePullPolicy: IfNotPresent
+
+  crds:
+    install: true
+    keep: true
+
+  createClusterRoles: true
+
+  controller:
+    replicas: 1
+
+  server:
+    replicas: 1
+    service:
+      type: ClusterIP
+
+  repoServer:
+    replicas: 1
+
+  applicationSet:
+    replicas: 1
+
+  notifications:
+    enabled: true
+
+  # Dex (SSO/OIDC) stays disabled for now. The upstream chart's default Dex
+  # image is ghcr.io/dexidp/dex -- a public registry this cluster cannot
+  # reach. Before enabling Dex:
+  #   1. Mirror the required Dex image to private ECR.
+  #   2. Point dex.image.repository/tag at that private ECR image here.
+  #   3. Only then set dex.enabled to true.
+  dex:
+    enabled: false
+
+  # HA Redis (Sentinel-based, via the bundled redis-ha subchart) is not
+  # needed for a single-replica dev/test install.
+  redis-ha:
+    enabled: false
+
+  redis:
+    enabled: true
+    image:
+      repository: 229410149234.dkr.ecr.eu-west-1.amazonaws.com/aws-cloud-factory-infra-redis-alpine
+      tag: "8.2.3-alpine"
+    # The bundled Redis metrics exporter defaults to the public image
+    # ghcr.io/oliver006/redis_exporter. Leave it disabled until/unless that
+    # image is also mirrored to private ECR.
+    metrics:
+      enabled: false
+
+  configs:
+    cm:
+      admin.enabled: true
+      timeout.reconciliation: 180s
+    rbac:
+      policy.default: "role:readonly"
