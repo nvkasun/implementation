@@ -1,0 +1,24 @@
+Please create an on-prem DNS wildcard CNAME record with the final FQDN below:
+
+*.goldengate-dev.adcbmis.local
+
+Target / Value:
+internal-k8s-ggpocdevalb-53c8cf7cb4-847733536.eu-west-1.elb.amazonaws.com
+
+TTL:
+300 seconds
+
+Important:
+Please ensure the final DNS record FQDN is exactly:
+
+*.goldengate-dev.adcbmis.local
+
+If the DNS zone is goldengate-dev.adcbmis.local, create the record name as:
+
+*
+
+If the DNS zone is adcbmis.local, create the record name as:
+
+*.goldengate-dev
+
+The wildcard `*` should be used only in the record name, not in the target/value.
