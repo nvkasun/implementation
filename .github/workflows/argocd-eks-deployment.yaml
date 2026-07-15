@@ -68,16 +68,6 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           role-to-assume: ${{ env.ROLE_ARN }}
 
-      - name: Login to private ECR
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "Logging in to private ECR: ${ECR_REGISTRY}"
-
-          aws ecr get-login-password --region "$AWS_REGION" \
-            | helm registry login --username AWS --password-stdin "$ECR_REGISTRY"
-
       - name: Install Helm and kubectl if missing
         shell: bash
         run: |
@@ -136,6 +126,55 @@ jobs:
 
           kubectl version --client=true
 
+      - name: Verify runner tools and AWS identity
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking AWS identity..."
+          aws sts get-caller-identity
+
+          echo "Checking required tools..."
+          aws --version
+          helm version --short
+          kubectl version --client=true
+
+          echo "Repository variable summary:"
+          echo "AWS_REGION=${AWS_REGION}"
+          echo "ECR_ACCOUNT_ID=${ECR_ACCOUNT_ID}"
+          echo "ECR_REGISTRY=${ECR_REGISTRY}"
+          echo "EKS_ACCOUNT_ID=${EKS_ACCOUNT_ID}"
+          echo "EKS_CLUSTER_NAME=${EKS_CLUSTER_NAME}"
+          echo "EKS_CLUSTER_ARN=${EKS_CLUSTER_ARN}"
+
+      - name: Prepare Argo CD deployment variables
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ENVIRONMENT="${{ inputs.environment }}"
+          VALUES_FILE="${ENVS_ROOT}/${ENVIRONMENT}/argocd/values.yaml"
+          CHART_VERSION="0.1.${{ github.run_number }}"
+          HELM_ECR_REPOSITORY="${HELM_OCI_NAMESPACE}/${CHART_NAME}"
+          HELM_PUSH_URL="oci://${ECR_REGISTRY}/${HELM_OCI_NAMESPACE}"
+          HELM_CHART_REF="oci://${ECR_REGISTRY}/${HELM_ECR_REPOSITORY}"
+
+          echo "ENVIRONMENT=${ENVIRONMENT}" >> "$GITHUB_ENV"
+          echo "VALUES_FILE=${VALUES_FILE}" >> "$GITHUB_ENV"
+          echo "CHART_VERSION=${CHART_VERSION}" >> "$GITHUB_ENV"
+          echo "HELM_ECR_REPOSITORY=${HELM_ECR_REPOSITORY}" >> "$GITHUB_ENV"
+          echo "HELM_PUSH_URL=${HELM_PUSH_URL}" >> "$GITHUB_ENV"
+          echo "HELM_CHART_REF=${HELM_CHART_REF}" >> "$GITHUB_ENV"
+
+          echo "Prepared Argo CD deployment variables:"
+          echo "ENVIRONMENT=${ENVIRONMENT}"
+          echo "VALUES_FILE=${VALUES_FILE}"
+          echo "CHART_VERSION=${CHART_VERSION}"
+          echo "HELM_ECR_REPOSITORY=${HELM_ECR_REPOSITORY}"
+          echo "HELM_PUSH_URL=${HELM_PUSH_URL}"
+          echo "HELM_CHART_REF=${HELM_CHART_REF}"
+
       - name: Validate vendored Argo CD chart dependency
         shell: bash
         run: |
@@ -170,12 +209,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          ENVIRONMENT="${{ inputs.environment }}"
-          VALUES_FILE="${ENVS_ROOT}/${ENVIRONMENT}/argocd/values.yaml"
-
-          echo "ENVIRONMENT=${ENVIRONMENT}" >> "$GITHUB_ENV"
-          echo "VALUES_FILE=${VALUES_FILE}" >> "$GITHUB_ENV"
-
           if [ ! -f "$HELM_CHART_PATH/Chart.yaml" ]; then
             echo "Missing Helm Chart.yaml: $HELM_CHART_PATH/Chart.yaml"
             exit 1
@@ -195,6 +228,38 @@ jobs:
           echo "Required files are present."
           echo "Helm chart path: $HELM_CHART_PATH"
           echo "Environment values: $VALUES_FILE"
+
+      - name: Login Helm to Amazon ECR
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | helm registry login --username AWS --password-stdin "$ECR_REGISTRY"
+
+      - name: Ensure Helm ECR repository exists
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking/creating ECR repository: ${HELM_ECR_REPOSITORY}"
+
+          aws ecr describe-repositories \
+            --region "$AWS_REGION" \
+            --repository-names "$HELM_ECR_REPOSITORY" >/dev/null 2>&1 || \
+          aws ecr create-repository \
+            --region "$AWS_REGION" \
+            --repository-name "$HELM_ECR_REPOSITORY" \
+            --tags Key=ApplicationName,Value=CloudFactory Key=DataClassification,Value=General Key=BusinessCriticality,Value=Low Key=BusinessUnit,Value=TechnologyPlatform Key=CostCenter,Value=219 \
+            --image-scanning-configuration scanOnPush=true \
+            --image-tag-mutability MUTABLE
+
+      - name: Build Helm dependencies if required
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          helm dependency build "$HELM_CHART_PATH" || true
 
       - name: Helm lint Argo CD chart
         shell: bash
@@ -276,44 +341,34 @@ jobs:
           mkdir -p packaged
 
           helm package "$HELM_CHART_PATH" \
+            --version "$CHART_VERSION" \
+            --app-version "$CHART_VERSION" \
             --destination packaged
 
           ls -lrt packaged
-
-      - name: Ensure Helm ECR repository exists
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          HELM_ECR_REPOSITORY="${HELM_OCI_NAMESPACE}/${CHART_NAME}"
-          echo "HELM_ECR_REPOSITORY=${HELM_ECR_REPOSITORY}" >> "$GITHUB_ENV"
-
-          echo "Checking/creating ECR repository: ${HELM_OCI_NAMESPACE}/${CHART_NAME}"
-
-          aws ecr describe-repositories \
-            --region "$AWS_REGION" \
-            --repository-names "${HELM_OCI_NAMESPACE}/${CHART_NAME}" >/dev/null 2>&1 || \
-          aws ecr create-repository \
-            --region "$AWS_REGION" \
-            --repository-name "${HELM_OCI_NAMESPACE}/${CHART_NAME}" \
-            --image-scanning-configuration scanOnPush=true
 
       - name: Push Argo CD Helm chart to ECR as OCI artifact
         shell: bash
         run: |
           set -euo pipefail
 
-          CHART_VERSION="$(grep -E '^version:' "$HELM_CHART_PATH/Chart.yaml" | awk '{print $2}')"
-          HELM_PUSH_URL="oci://${ECR_REGISTRY}/${HELM_OCI_NAMESPACE}"
-          HELM_CHART_REF="oci://${ECR_REGISTRY}/${HELM_ECR_REPOSITORY}"
-
-          echo "CHART_VERSION=${CHART_VERSION}" >> "$GITHUB_ENV"
-          echo "HELM_CHART_REF=${HELM_CHART_REF}" >> "$GITHUB_ENV"
-
           helm push "packaged/${CHART_NAME}-${CHART_VERSION}.tgz" "$HELM_PUSH_URL"
 
           echo "Published Helm chart:"
           echo "${HELM_CHART_REF}:${CHART_VERSION}"
+
+      - name: Verify Helm chart can be pulled from ECR
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p pulled
+
+          helm pull "$HELM_CHART_REF" \
+            --version "$CHART_VERSION" \
+            --destination pulled
+
+          ls -lrt pulled
 
       - name: Connect to EKS cluster
         shell: bash
@@ -434,6 +489,7 @@ jobs:
           path: |
             rendered/
             packaged/
+            pulled/
           if-no-files-found: warn
           retention-days: 7
 
