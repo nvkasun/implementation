@@ -15,7 +15,7 @@ argo-cd:
   global:
     image:
       repository: 229410149234.dkr.ecr.eu-west-1.amazonaws.com/aws-cloud-factory-infra-argocd
-      tag: v3.2.12
+      tag: "3.2.12"
       imagePullPolicy: IfNotPresent
 
   crds:
@@ -59,7 +59,7 @@ argo-cd:
     enabled: true
     image:
       repository: 229410149234.dkr.ecr.eu-west-1.amazonaws.com/aws-cloud-factory-infra-redis-alpine
-      tag: "8.2.3-alpine"
+      tag: "8.2.3"
     # The bundled Redis metrics exporter defaults to the public image
     # ghcr.io/oliver006/redis_exporter. Leave it disabled until/unless that
     # image is also mirrored to private ECR.
