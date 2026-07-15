@@ -1,84 +1,17 @@
-Completed so far
-Set up the Helm chart structure for GoldenGate deployment on EKS.
-Added source and target GoldenGate deployment support in the Helm chart.
-Created environment-specific Helm values for multiple deployments.
-Set up the GitHub Actions CI/CD workflow to package and deploy the Helm chart automatically into the EKS cluster.
-Validated that the pipeline can connect to the private EKS cluster and deploy the GoldenGate workload.
-Deployed the current POC deployment with both source and target GoldenGate pods.
-Confirmed that the GoldenGate source and target pods are running successfully in EKS.
-Configured Kubernetes services for the source and target GoldenGate endpoints.
-Configured internal ALB Ingress routing for GoldenGate admin/UI access.
-Validated that traffic is reaching the GoldenGate backend services through the internal ALB.
-Worked with CloudOps to resolve the required CSI driver support.
-Confirmed Secrets Store CSI Driver support is enabled in the cluster.
-Updated the deployment so the pods no longer depend on manually copied Kubernetes secrets.
-GoldenGate pods now read required secrets directly from AWS Secrets Manager through the CSI driver.
-Created and updated the new Secrets Manager structure with cleaner names:
-dev/goldengate/source/admin
-dev/goldengate/target/admin
-dev/goldengate/tls-certificate
-Updated Helm values and templates to use the new secret names.
-Updated the TLS certificate mapping to use the new certificate secret keys:
-ogg.key
-ogg.pem
-ca-chain.pem
-Identified that the previous SSL certificate did not support wildcard hostnames.
-Requested and received the new wildcard SSL certificate for the GoldenGate dev domain.
-Prepared the certificate body, private key, and certificate chain required for ACM update.
-Shared the updated certificate details with CloudOps to reimport into the existing ACM certificate.
-Updated the final planned GoldenGate hostnames to use the wildcard certificate domain:
-ogg-oracle-payments-ora-to-pg-003.goldengate-dev.adcbmis.local
-ogg-postgresql-payments-ora-to-pg-003.goldengate-dev.adcbmis.local
-Reviewed and fixed Helm/GitHub Actions issues before the next deployment.
-Rendered and validated the Helm manifests to confirm the new secret names, certificate mappings, and hostnames are correctly reflected.
-Resolved the EFS CSI driver support dependency with CloudOps/CEOP side, so persistent storage support can be aligned for the next phase when required.
-Current status
-Helm chart and CI/CD deployment flow are ready.
-Source and target GoldenGate pods are already deployable through the GitHub Actions workflow.
-Secrets Manager integration through CSI driver is now aligned with the new secret naming structure.
-Internal ALB routing was already validated successfully.
-New wildcard SSL certificate is prepared and shared with CloudOps.
-Waiting for CloudOps to update/reimport the certificate in ACM.
-Remaining items
-CloudOps to complete ACM certificate update with the new wildcard certificate.
-Validate that the internal ALB is serving the updated wildcard certificate.
-Run the updated GitHub Actions deployment again.
-Validate that pods are mounting the new Secrets Manager secrets correctly through CSI.
-Validate source and target GoldenGate endpoints using the final hostnames.
-Request the Network/Route53 team to create the wildcard private DNS record:
-*.goldengate-dev.adcbmis.local
-→ internal ALB DNS name
-After DNS is created, validate browser access from the internal network.
-Continue with GoldenGate replication configuration:
-Extract
-Distribution path
-Receiver
-Replicat
-Trail validation
-Notes
-Terraform changes for the new secret names need to be handled carefully because the new secrets were created manually. We should not run Terraform apply directly until the state/import approach is confirmed.
-If CloudOps reimports the new certificate into the existing ACM certificate, the ALB certificate ARN should remain unchanged. If they create a new ACM certificate instead, we will need to update the Helm Ingress certificate ARN.
+Hi Maria,
 
+Thank you for your support on this.
 
+The EFS CSI driver / access point issue has now been resolved. A special thanks to Surya for checking and resolving the issue, and also thank you to Lakshmi and Himanshu for supporting and helping to escalate this on priority.
 
+After the fix, we were able to proceed with the GoldenGate EKS deployment validation successfully. I have attached the relevant screenshots for reference.
 
+Attached screenshots:
+1. EFS CSI driver / related pods status
+2. EFS access point / storage validation
+3. GoldenGate deployment pod status after the fix
 
+Thanks again for the quick support and coordination.
 
-
-
-
-
-
-
-
---------------
-
-Helm chart structure has been updated to support source and target GoldenGate pods per deployment.
-GitHub Actions CI/CD flow is now configured to deploy the Helm chart automatically into the private EKS cluster.
-Source and target GoldenGate pods were deployed and validated successfully.
-Internal ALB/Ingress routing was configured and tested; traffic is reaching the GoldenGate backend services.
-Worked with CloudOps/CEOP to resolve CSI driver dependencies, including Secrets Store CSI support and EFS CSI support.
-Updated the secret handling model so pods now read secrets directly from AWS Secrets Manager through CSI, instead of relying on manually copied Kubernetes secrets.
-Cleaned up the Secrets Manager naming structure and updated Helm values/templates accordingly.
-Identified the SSL certificate limitation, requested the new wildcard certificate, prepared the ACM import files, and shared them with CloudOps.
-Updated the planned hostnames to use the wildcard domain under goldengate-dev.adcbmis.local.
+Kind regards,
+Kasun
