@@ -1,0 +1,216 @@
+name: Cloud Factory - Image Sync Pipeline
+run-name: 'Cloud Factory - Image Sync Pipeline ran by ${{ github.actor }}'
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_url:
+        description: 'Source container image reference to pull (example: public.ecr.aws/lambda/python:3.11.2026.06.15.10-x86_64)'
+        required: true
+        type: string
+      target_image:
+        description: 'Target ECR repository/image name (example: lambda/python)'
+        required: true
+        type: string
+      target_tag:
+        description: 'Target ECR tag (example: 3.11.2026.06.15.10-x86_64)'
+        required: true
+        default: latest
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: eu-west-1
+  ACCOUNT_ID: 229410149234
+  ROLE_ARN: arn:aws:iam::229410149234:role/adcb-modelmonitoring-sit-codep-rDeployCodeBuildRole-KMCFNIKqpuUL
+  ECR_REGISTRY: 229410149234.dkr.ecr.eu-west-1.amazonaws.com
+
+  # EKS workload account that needs runtime image pull access.
+  EKS_PULL_ACCOUNT_ID: 668311715351
+
+jobs:
+  sync_image_to_ecr:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.ROLE_ARN }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Validate inputs and normalize values
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SOURCE_URL='${{ github.event.inputs.source_url }}'
+          TARGET_IMAGE='${{ github.event.inputs.target_image }}'
+          TARGET_TAG='${{ github.event.inputs.target_tag }}'
+
+          # Remove accidental protocol prefixes if supplied.
+          SOURCE_URL="${SOURCE_URL#https://}"
+          SOURCE_URL="${SOURCE_URL#http://}"
+
+          if [[ -z "$SOURCE_URL" || "$SOURCE_URL" != */* ]]; then
+            echo "source_url must be a valid container image reference, for example public.ecr.aws/lambda/python:3.11.2026.06.15.10-x86_64"
+            exit 1
+          fi
+
+          # ECR repository names must be lowercase and can include '/'.
+          TARGET_IMAGE_NORMALIZED="$(echo "$TARGET_IMAGE" | tr '[:upper:]' '[:lower:]')"
+
+          if [[ -z "$TARGET_IMAGE_NORMALIZED" ]]; then
+            echo "target_image cannot be empty"
+            exit 1
+          fi
+
+          if [[ -z "$TARGET_TAG" ]]; then
+            echo "target_tag cannot be empty"
+            exit 1
+          fi
+
+          DESTINATION_IMAGE="${ECR_REGISTRY}/${TARGET_IMAGE_NORMALIZED}:${TARGET_TAG}"
+
+          echo "source_url=$SOURCE_URL" >> "$GITHUB_OUTPUT"
+          echo "target_image=$TARGET_IMAGE_NORMALIZED" >> "$GITHUB_OUTPUT"
+          echo "target_tag=$TARGET_TAG" >> "$GITHUB_OUTPUT"
+          echo "destination_image=$DESTINATION_IMAGE" >> "$GITHUB_OUTPUT"
+
+          echo "SOURCE_URL=$SOURCE_URL"
+          echo "TARGET_IMAGE=$TARGET_IMAGE_NORMALIZED"
+          echo "TARGET_TAG=$TARGET_TAG"
+          echo "DESTINATION_IMAGE=$DESTINATION_IMAGE"
+
+      - name: Ensure ECR repository exists
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REPOSITORY='${{ steps.prep.outputs.target_image }}'
+
+          if aws ecr describe-repositories --region "$AWS_REGION" --repository-names "$REPOSITORY" >/dev/null 2>&1; then
+            echo "ECR repository already exists: $REPOSITORY"
+          else
+            echo "Creating ECR repository: $REPOSITORY"
+            aws ecr create-repository \
+              --region "$AWS_REGION" \
+              --repository-name "$REPOSITORY" \
+              --tags Key=ApplicationName,Value=CloudFactory Key=DataClassification,Value=General Key=BusinessCriticality,Value=Low Key=BusinessUnit,Value=TechnologyPlatform Key=CostCenter,Value=219 \
+              --image-scanning-configuration scanOnPush=true \
+              --image-tag-mutability MUTABLE >/dev/null
+          fi
+
+      - name: Apply EKS pull policy to ECR repository
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REPOSITORY='${{ steps.prep.outputs.target_image }}'
+          EKS_PULL_PRINCIPAL="arn:aws:iam::${EKS_PULL_ACCOUNT_ID}:root"
+          POLICY_SID="AllowEksDevAccountPull"
+
+          echo "Applying ECR pull policy to repository: $REPOSITORY"
+          echo "Allowing EKS pull principal: $EKS_PULL_PRINCIPAL"
+
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "jq not found. Installing jq..."
+            sudo apt-get update
+            sudo apt-get install -y jq
+          fi
+
+          EXISTING_POLICY="$(aws ecr get-repository-policy \
+            --region "$AWS_REGION" \
+            --repository-name "$REPOSITORY" \
+            --query 'policyText' \
+            --output text 2>/dev/null || true)"
+
+          if [[ -z "$EXISTING_POLICY" || "$EXISTING_POLICY" == "None" ]]; then
+            EXISTING_POLICY='{"Version":"2012-10-17","Statement":[]}'
+          fi
+
+          echo "$EXISTING_POLICY" | jq \
+            --arg sid "$POLICY_SID" \
+            --arg principal "$EKS_PULL_PRINCIPAL" \
+            '
+            .Statement = (
+              if (.Statement | type) == "array" then
+                .Statement
+              elif .Statement == null then
+                []
+              else
+                [.Statement]
+              end
+            )
+            |
+            .Statement = (
+              .Statement
+              | map(select(.Sid != $sid))
+              + [
+                {
+                  "Sid": $sid,
+                  "Effect": "Allow",
+                  "Principal": {
+                    "AWS": $principal
+                  },
+                  "Action": [
+                    "ecr:BatchCheckLayerAvailability",
+                    "ecr:BatchGetImage",
+                    "ecr:GetDownloadUrlForLayer"
+                  ]
+                }
+              ]
+            )
+            ' > /tmp/ecr-repository-policy.json
+
+          echo "Final ECR repository policy:"
+          cat /tmp/ecr-repository-policy.json
+
+          aws ecr set-repository-policy \
+            --region "$AWS_REGION" \
+            --repository-name "$REPOSITORY" \
+            --policy-text file:///tmp/ecr-repository-policy.json >/dev/null
+
+          echo "ECR repository pull policy applied successfully."
+
+      - name: Pull source image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull '${{ steps.prep.outputs.source_url }}'
+
+      - name: Tag image for target ECR
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker tag '${{ steps.prep.outputs.source_url }}' '${{ steps.prep.outputs.destination_image }}'
+
+      - name: Push image to target ECR
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker push '${{ steps.prep.outputs.destination_image }}'
+
+      - name: Workflow summary
+        shell: bash
+        run: |
+          {
+            echo "## Image Sync Summary"
+            echo ""
+            echo "- Source URL: ${{ steps.prep.outputs.source_url }}"
+            echo "- Target image: ${{ steps.prep.outputs.target_image }}"
+            echo "- Target tag: ${{ steps.prep.outputs.target_tag }}"
+            echo "- Target ECR URI: ${{ steps.prep.outputs.destination_image }}"
+            echo "- EKS pull account allowed: ${EKS_PULL_ACCOUNT_ID}"
+          } >> "$GITHUB_STEP_SUMMARY"
