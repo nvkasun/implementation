@@ -447,15 +447,20 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Waiting for Argo CD pods to become Ready..."
+          echo "Waiting for Argo CD workload rollouts to complete..."
 
-          kubectl wait pod \
-            -l app.kubernetes.io/part-of=argocd \
-            -n "${ARGOCD_NAMESPACE}" \
-            --for=condition=Ready \
-            --timeout=600s || {
-              echo "Not all Argo CD pods reached Ready in time. Inspect pod status below."
-            }
+          kubectl rollout status deployment/argocd-server -n "$ARGOCD_NAMESPACE" --timeout=10m
+          kubectl rollout status deployment/argocd-repo-server -n "$ARGOCD_NAMESPACE" --timeout=10m
+          kubectl rollout status deployment/argocd-redis -n "$ARGOCD_NAMESPACE" --timeout=10m
+          kubectl rollout status deployment/argocd-applicationset-controller -n "$ARGOCD_NAMESPACE" --timeout=10m
+          kubectl rollout status deployment/argocd-notifications-controller -n "$ARGOCD_NAMESPACE" --timeout=10m
+          kubectl rollout status statefulset/argocd-application-controller -n "$ARGOCD_NAMESPACE" --timeout=10m
+
+          echo "Pods:"
+          kubectl get pods -n "$ARGOCD_NAMESPACE"
+
+          echo "Services:"
+          kubectl get svc -n "$ARGOCD_NAMESPACE"
 
       - name: Verify Argo CD deployment
         shell: bash
