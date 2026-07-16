@@ -68,6 +68,8 @@ jobs:
     outputs:
       has_changes: ${{ steps.detect.outputs.has_changes }}
       deployment_matrix: ${{ steps.detect.outputs.deployment_matrix }}
+      has_deletions: ${{ steps.detect.outputs.has_deletions }}
+      deletion_matrix: ${{ steps.detect.outputs.deletion_matrix }}
 
     steps:
       - name: Checkout repository
@@ -96,6 +98,8 @@ jobs:
 
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
             echo "deployment_matrix=${MATRIX_JSON}" >> "$GITHUB_OUTPUT"
+            echo "has_deletions=false" >> "$GITHUB_OUTPUT"
+            echo "deletion_matrix=[]" >> "$GITHUB_OUTPUT"
 
             echo "Matrix: ${MATRIX_JSON}"
             exit 0
@@ -168,8 +172,56 @@ jobs:
 
           echo "Matrix: ${MATRIX_ITEMS}"
 
+          echo ""
+          echo "Detecting deleted deployment folders under envs/dev/..."
+
+          NAME_STATUS="$(git diff --name-status "$BEFORE_SHA" "$AFTER_SHA" -- 'envs/dev/**' 'helm/goldengate/**' || true)"
+
+          echo "Name-status diff under envs/dev/ and helm/goldengate/:"
+          echo "${NAME_STATUS:-<none>}"
+
+          # A path is a deletion candidate when it was removed (D) or is the
+          # old side of a rename (R). Only envs/dev/<id>/ paths matter here;
+          # helm/goldengate/** changes never produce a deployment deletion.
+          DELETION_CANDIDATE_IDS="$(echo "$NAME_STATUS" \
+            | awk '$1 ~ /^D/ { print $2 } $1 ~ /^R/ { print $2 }' \
+            | grep -E '^envs/dev/[^/]+/' \
+            | grep -v '^envs/dev/argocd/' \
+            | sed -E 's#^envs/dev/([^/]+)/.*#\1#' \
+            | sort -u || true)"
+
+          DELETION_IDS=""
+          for CANDIDATE_ID in $DELETION_CANDIDATE_IDS; do
+            if [ ! -f "envs/dev/${CANDIDATE_ID}/values.yaml" ]; then
+              echo "Detected deleted deployment: ${CANDIDATE_ID}"
+              DELETION_IDS="${DELETION_IDS} ${CANDIDATE_ID}"
+            else
+              echo "Not a deletion: envs/dev/${CANDIDATE_ID}/values.yaml still exists at HEAD."
+            fi
+          done
+
+          DELETION_ITEMS="[]"
+          for DEPLOYMENT_ID in $DELETION_IDS; do
+            DELETION_ITEMS="$(echo "$DELETION_ITEMS" | jq -c \
+              --arg deployment_id "$DEPLOYMENT_ID" \
+              '. + [{environment: "dev", deployment_id: $deployment_id}]')"
+          done
+
+          DELETION_COUNT="$(echo "$DELETION_ITEMS" | jq 'length')"
+
+          if [ "$DELETION_COUNT" -eq 0 ]; then
+            echo "No deleted deployment folders detected."
+            echo "has_deletions=false" >> "$GITHUB_OUTPUT"
+            echo "deletion_matrix=[]" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_deletions=true" >> "$GITHUB_OUTPUT"
+            echo "deletion_matrix=${DELETION_ITEMS}" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "Deletion matrix: ${DELETION_ITEMS}"
+
   build_publish_and_deploy:
-    name: Build, publish, and deploy GoldenGate Helm chart
+    name: Build, publish, and deploy GoldenGate Helm chart via Argo CD
 
     needs: detect_changed_deployments
     if: needs.detect_changed_deployments.outputs.has_changes == 'true'
@@ -292,12 +344,16 @@ jobs:
             exit 1
           fi
 
-          NAMESPACE="gg-${ENVIRONMENT}-${DEPLOYMENT_ID}"
+          TARGET_NAMESPACE="gg-${ENVIRONMENT}-${DEPLOYMENT_ID}"
           RELEASE_NAME="ogg-${DEPLOYMENT_ID}"
           VALUES_FILE="${ENVS_ROOT}/${ENVIRONMENT}/${DEPLOYMENT_ID}/values.yaml"
+          TEMP_CHART_PATH="work/charts/${DEPLOYMENT_ID}/goldengate"
 
-          if [ ${#NAMESPACE} -gt 63 ]; then
-            echo "Namespace is too long: $NAMESPACE"
+          ARGOCD_NAMESPACE="argocd"
+          ARGOCD_APP_NAME="goldengate-${DEPLOYMENT_ID}"
+
+          if [ ${#TARGET_NAMESPACE} -gt 63 ]; then
+            echo "Namespace is too long: $TARGET_NAMESPACE"
             echo "Kubernetes namespace names must be 63 characters or less."
             echo "Please shorten deployment_id."
             exit 1
@@ -309,16 +365,22 @@ jobs:
             exit 1
           fi
 
-          CHART_VERSION="0.1.${{ github.run_number }}"
+          # Unique per deployment: matrix jobs for different deployment_ids
+          # share the same run_number, so the shared suffix alone would
+          # collide when they package different deployment-specific values.
+          CHART_VERSION="0.1.${{ github.run_number }}-${DEPLOYMENT_ID}"
           HELM_ECR_REPOSITORY="${HELM_OCI_NAMESPACE}/${CHART_NAME}"
           HELM_PUSH_URL="oci://${ECR_REGISTRY}/${HELM_OCI_NAMESPACE}"
           HELM_CHART_REF="oci://${ECR_REGISTRY}/${HELM_ECR_REPOSITORY}"
 
           echo "ENVIRONMENT=${ENVIRONMENT}" >> "$GITHUB_ENV"
           echo "DEPLOYMENT_ID=${DEPLOYMENT_ID}" >> "$GITHUB_ENV"
-          echo "NAMESPACE=${NAMESPACE}" >> "$GITHUB_ENV"
+          echo "TARGET_NAMESPACE=${TARGET_NAMESPACE}" >> "$GITHUB_ENV"
           echo "RELEASE_NAME=${RELEASE_NAME}" >> "$GITHUB_ENV"
           echo "VALUES_FILE=${VALUES_FILE}" >> "$GITHUB_ENV"
+          echo "TEMP_CHART_PATH=${TEMP_CHART_PATH}" >> "$GITHUB_ENV"
+          echo "ARGOCD_NAMESPACE=${ARGOCD_NAMESPACE}" >> "$GITHUB_ENV"
+          echo "ARGOCD_APP_NAME=${ARGOCD_APP_NAME}" >> "$GITHUB_ENV"
           echo "CHART_VERSION=${CHART_VERSION}" >> "$GITHUB_ENV"
           echo "HELM_ECR_REPOSITORY=${HELM_ECR_REPOSITORY}" >> "$GITHUB_ENV"
           echo "HELM_PUSH_URL=${HELM_PUSH_URL}" >> "$GITHUB_ENV"
@@ -326,11 +388,12 @@ jobs:
 
           echo "environment=${ENVIRONMENT}" >> "$GITHUB_OUTPUT"
           echo "deployment_id=${DEPLOYMENT_ID}" >> "$GITHUB_OUTPUT"
-          echo "namespace=${NAMESPACE}" >> "$GITHUB_OUTPUT"
+          echo "target_namespace=${TARGET_NAMESPACE}" >> "$GITHUB_OUTPUT"
           echo "release_name=${RELEASE_NAME}" >> "$GITHUB_OUTPUT"
           echo "values_file=${VALUES_FILE}" >> "$GITHUB_OUTPUT"
           echo "chart_version=${CHART_VERSION}" >> "$GITHUB_OUTPUT"
           echo "helm_chart_ref=${HELM_CHART_REF}" >> "$GITHUB_OUTPUT"
+          echo "argocd_app_name=${ARGOCD_APP_NAME}" >> "$GITHUB_OUTPUT"
 
       - name: Validate required files
         shell: bash
@@ -412,7 +475,7 @@ jobs:
           mkdir -p rendered
 
           helm template "$RELEASE_NAME" "$HELM_CHART_PATH" \
-            --namespace "$NAMESPACE" \
+            --namespace "$TARGET_NAMESPACE" \
             --values "$VALUES_FILE" \
             --set global.environment="$ENVIRONMENT" \
             --set global.deploymentId="$DEPLOYMENT_ID" \
@@ -420,14 +483,26 @@ jobs:
 
           echo "Rendered manifest: rendered/${RELEASE_NAME}.yaml"
 
-      - name: Package Helm chart
+      - name: Package deployment-specific Helm chart
         shell: bash
         run: |
           set -euo pipefail
 
           mkdir -p packaged
+          rm -rf "$TEMP_CHART_PATH"
+          mkdir -p "$TEMP_CHART_PATH"
 
-          helm package "$HELM_CHART_PATH" \
+          # Argo CD (running inside the private EKS cluster) cannot reach
+          # this GitHub repo's envs/dev/<id>/values.yaml path directly, so
+          # the deployment values file is baked into a deployment-specific,
+          # self-contained copy of the chart before packaging.
+          echo "Copying base chart from $HELM_CHART_PATH into $TEMP_CHART_PATH..."
+          cp -a "$HELM_CHART_PATH/." "$TEMP_CHART_PATH/"
+
+          echo "Copying deployment values file $VALUES_FILE into $TEMP_CHART_PATH/values-deployment.yaml..."
+          cp "$VALUES_FILE" "$TEMP_CHART_PATH/values-deployment.yaml"
+
+          helm package "$TEMP_CHART_PATH" \
             --version "$CHART_VERSION" \
             --app-version "$CHART_VERSION" \
             --destination packaged
@@ -482,10 +557,7 @@ jobs:
           kubectl config current-context
           kubectl version --client=true
 
-          echo "Verifying EKS access without requiring the target namespace to exist yet..."
-
-          echo "Checking permission to create namespaces..."
-          kubectl auth can-i create namespace || true
+          echo "Verifying EKS access..."
 
           echo "Checking permission to read CSIDriver..."
           kubectl auth can-i get csidrivers.storage.k8s.io || true
@@ -493,26 +565,8 @@ jobs:
           echo "Checking permission to read SecretProviderClass..."
           kubectl auth can-i get secretproviderclasses.secrets-store.csi.x-k8s.io --all-namespaces || true
 
-      - name: Create namespace if missing
-        if: ${{ matrix.deploy }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "Ensuring namespace exists: ${NAMESPACE}"
-
-          kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
-
-          echo "Labeling namespace: ${NAMESPACE}"
-
-          kubectl label namespace "${NAMESPACE}" \
-            app.kubernetes.io/name=goldengate \
-            app.kubernetes.io/managed-by=github-actions \
-            goldengate.adcb/environment="${ENVIRONMENT}" \
-            goldengate.adcb/deployment-id="${DEPLOYMENT_ID}" \
-            --overwrite
-
-          kubectl get namespace "${NAMESPACE}" --show-labels
+          echo "Checking permission to manage Argo CD Applications..."
+          kubectl auth can-i create applications.argoproj.io -n "${ARGOCD_NAMESPACE}" || true
 
       - name: Validate Secrets Store CSI configuration
         if: ${{ matrix.deploy }}
@@ -570,112 +624,192 @@ jobs:
 
           echo "Secrets Store CSI Driver prerequisites validated."
 
-      - name: Deploy GoldenGate Helm release to EKS
+      - name: Ensure Argo CD Application CRD exists
         if: ${{ matrix.deploy }}
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Deploying Helm release..."
-          echo "Release: $RELEASE_NAME"
-          echo "Namespace: $NAMESPACE"
-          echo "Chart: $HELM_CHART_REF"
-          echo "Chart version: $CHART_VERSION"
-          echo "Values: $VALUES_FILE"
+          echo "Checking Argo CD Application CRD..."
 
-          helm upgrade --install "$RELEASE_NAME" "$HELM_CHART_REF" \
-            --version "$CHART_VERSION" \
-            --namespace "$NAMESPACE" \
-            --values "$VALUES_FILE" \
-            --set global.environment="$ENVIRONMENT" \
-            --set global.deploymentId="$DEPLOYMENT_ID" \
-            --wait \
-            --atomic \
-            --cleanup-on-fail \
-            --timeout 20m
+          kubectl get crd applications.argoproj.io >/dev/null || {
+            echo "CRD applications.argoproj.io not found."
+            echo "Argo CD must be installed on this cluster before GoldenGate can be deployed through it."
+            echo "Run the argocd-eks-deployment.yaml workflow first."
+            exit 1
+          }
 
-      - name: Verify deployment
+          echo "Argo CD Application CRD is present."
+
+      - name: Ensure Argo CD ECR OCI repository credentials exist
         if: ${{ matrix.deploy }}
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Helm status:"
-          helm status "$RELEASE_NAME" -n "$NAMESPACE"
+          echo "Refreshing Argo CD repository credentials Secret for the GoldenGate OCI Helm repo..."
 
-          echo "Kubernetes resources:"
-          kubectl get all -n "$NAMESPACE"
+          ECR_PASSWORD="$(aws ecr get-login-password --region "$AWS_REGION")"
 
-          echo "Source: service account"
-          kubectl get sa ogg-oracle-sa -n "$NAMESPACE" -o yaml
+          cat <<EOF | kubectl apply -f - >/dev/null
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: argocd-ecr-goldengate-oci
+            namespace: ${ARGOCD_NAMESPACE}
+            labels:
+              argocd.argoproj.io/secret-type: repository
+          stringData:
+            type: helm
+            enableOCI: "true"
+            url: ${ECR_REGISTRY}/${HELM_OCI_NAMESPACE}/${CHART_NAME}
+            username: AWS
+            password: "${ECR_PASSWORD}"
+          EOF
 
-          echo "Source: SecretProviderClass resources"
-          kubectl get secretproviderclass -n "$NAMESPACE"
+          unset ECR_PASSWORD
 
-          echo "Source: SecretProviderClass pod status"
-          kubectl get secretproviderclasspodstatus -n "$NAMESPACE" || true
+          echo "Argo CD repository credentials Secret applied: argocd-ecr-goldengate-oci"
 
-          echo "Source: CSI-synced admin secret"
-          kubectl get secret ogg-oracle-admin -n "$NAMESPACE"
-          kubectl describe secret ogg-oracle-admin -n "$NAMESPACE"
+      - name: Create or update Argo CD Application
+        if: ${{ matrix.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          echo "PVCs:"
-          kubectl get pvc -n "$NAMESPACE" || true
+          echo "Applying Argo CD Application: ${ARGOCD_APP_NAME}"
 
+          cat <<EOF | kubectl apply -f -
+          apiVersion: argoproj.io/v1alpha1
+          kind: Application
+          metadata:
+            name: ${ARGOCD_APP_NAME}
+            namespace: ${ARGOCD_NAMESPACE}
+            finalizers:
+              - resources-finalizer.argocd.argoproj.io
+            labels:
+              app.kubernetes.io/name: goldengate
+              app.kubernetes.io/managed-by: argocd
+              goldengate.adcb/environment: ${ENVIRONMENT}
+              goldengate.adcb/deployment-id: ${DEPLOYMENT_ID}
+          spec:
+            project: default
+            source:
+              repoURL: ${HELM_CHART_REF}
+              targetRevision: ${CHART_VERSION}
+              path: .
+              helm:
+                releaseName: ${RELEASE_NAME}
+                valueFiles:
+                  - values-deployment.yaml
+                parameters:
+                  - name: global.environment
+                    value: ${ENVIRONMENT}
+                  - name: global.deploymentId
+                    value: ${DEPLOYMENT_ID}
+            destination:
+              server: https://kubernetes.default.svc
+              namespace: ${TARGET_NAMESPACE}
+            syncPolicy:
+              automated:
+                prune: true
+                selfHeal: true
+              syncOptions:
+                - CreateNamespace=true
+              managedNamespaceMetadata:
+                labels:
+                  app.kubernetes.io/name: goldengate
+                  app.kubernetes.io/managed-by: argocd
+                  goldengate.adcb/environment: ${ENVIRONMENT}
+                  goldengate.adcb/deployment-id: ${DEPLOYMENT_ID}
+            revisionHistoryLimit: 10
+          EOF
+
+          echo "Forcing Argo CD refresh for ${ARGOCD_APP_NAME}..."
+
+          kubectl annotate application "${ARGOCD_APP_NAME}" \
+            -n "${ARGOCD_NAMESPACE}" \
+            argocd.argoproj.io/refresh=hard \
+            --overwrite
+
+      - name: Wait for Argo CD sync and health
+        if: ${{ matrix.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Waiting for Argo CD Application ${ARGOCD_APP_NAME} to become Synced and Healthy..."
+
+          TIMEOUT_SECONDS=1200
+          INTERVAL_SECONDS=30
+          ELAPSED=0
+
+          while true; do
+            if kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" >/dev/null 2>&1; then
+              SYNC_STATUS="$(kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" -o jsonpath='{.status.sync.status}' 2>/dev/null || echo "Unknown")"
+              HEALTH_STATUS="$(kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" -o jsonpath='{.status.health.status}' 2>/dev/null || echo "Unknown")"
+              OPERATION_PHASE="$(kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" -o jsonpath='{.status.operationState.phase}' 2>/dev/null || echo "")"
+
+              echo "[$(date -u +%H:%M:%S)] sync=${SYNC_STATUS} health=${HEALTH_STATUS} operation=${OPERATION_PHASE:-none} (elapsed ${ELAPSED}s / ${TIMEOUT_SECONDS}s)"
+
+              if [ "${HEALTH_STATUS}" = "Degraded" ]; then
+                echo "Argo CD Application ${ARGOCD_APP_NAME} is Degraded."
+                kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" -o wide
+                exit 1
+              fi
+
+              if [ "${OPERATION_PHASE}" = "Failed" ] || [ "${OPERATION_PHASE}" = "Error" ]; then
+                echo "Argo CD sync operation for ${ARGOCD_APP_NAME} ${OPERATION_PHASE}."
+                kubectl describe application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}"
+                exit 1
+              fi
+
+              if [ "${SYNC_STATUS}" = "Synced" ] && [ "${HEALTH_STATUS}" = "Healthy" ]; then
+                echo "Argo CD Application ${ARGOCD_APP_NAME} is Synced and Healthy."
+                break
+              fi
+            else
+              echo "[$(date -u +%H:%M:%S)] Argo CD Application ${ARGOCD_APP_NAME} not found yet (elapsed ${ELAPSED}s / ${TIMEOUT_SECONDS}s)."
+            fi
+
+            if [ "${ELAPSED}" -ge "${TIMEOUT_SECONDS}" ]; then
+              echo "Timed out after ${TIMEOUT_SECONDS}s waiting for ${ARGOCD_APP_NAME} to become Synced and Healthy."
+              kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" -o wide || true
+              kubectl describe application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" || true
+              exit 1
+            fi
+
+            sleep "${INTERVAL_SECONDS}"
+            ELAPSED=$((ELAPSED + INTERVAL_SECONDS))
+          done
+
+          echo "Final Argo CD Application status:"
+          kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" -o wide
+
+      - name: Verify Argo CD deployment
+        if: ${{ matrix.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Argo CD Application:"
+          kubectl get application "$ARGOCD_APP_NAME" -n "$ARGOCD_NAMESPACE" -o wide
+
+          echo ""
+          echo "Argo CD Application details:"
+          kubectl describe application "$ARGOCD_APP_NAME" -n "$ARGOCD_NAMESPACE"
+
+          echo ""
+          echo "Kubernetes resources in target namespace:"
+          kubectl get all -n "$TARGET_NAMESPACE" || true
+
+          echo ""
           echo "Ingress:"
-          kubectl get ingress -n "$NAMESPACE" || true
+          kubectl get ingress -n "$TARGET_NAMESPACE" || true
 
-          echo "Checking whether the target (PostgreSQL) workload is enabled for this deployment..."
-          TARGET_ENABLED="false"
-          if grep -q "app.kubernetes.io/component: target" "rendered/${RELEASE_NAME}.yaml"; then
-            TARGET_ENABLED="true"
-          fi
-          echo "Target enabled: ${TARGET_ENABLED}"
-
-          if [ "${TARGET_ENABLED}" = "true" ]; then
-            echo "Target: StatefulSet"
-            kubectl get statefulset ogg-postgresql -n "$NAMESPACE"
-
-            echo "Target: services"
-            kubectl get svc ogg-postgresql -n "$NAMESPACE"
-            kubectl get svc ogg-postgresql-headless -n "$NAMESPACE"
-
-            echo "Target: pods"
-            kubectl get pod -l app.kubernetes.io/component=target -n "$NAMESPACE"
-
-            echo "Target: SecretProviderClass resources"
-            kubectl get secretproviderclass ogg-postgresql-admin -n "$NAMESPACE"
-            kubectl get secretproviderclass ogg-postgresql-certificate -n "$NAMESPACE"
-
-            echo "Target: CSI-synced admin secret"
-            kubectl get secret ogg-postgresql-admin -n "$NAMESPACE"
-            kubectl describe secret ogg-postgresql-admin -n "$NAMESPACE"
-          else
-            echo "Target workload not enabled for this deployment. Skipping target verification."
-          fi
-
-          echo "Checking whether Ingress is enabled for this deployment..."
-          INGRESS_ENABLED="false"
-          if grep -qE "^kind: Ingress$" "rendered/${RELEASE_NAME}.yaml"; then
-            INGRESS_ENABLED="true"
-          fi
-          echo "Ingress enabled: ${INGRESS_ENABLED}"
-
-          if [ "${INGRESS_ENABLED}" = "true" ]; then
-            echo "Ingress resources:"
-            kubectl get ingress -n "$NAMESPACE"
-
-            echo "Ingress details:"
-            kubectl describe ingress -n "$NAMESPACE"
-
-            echo "Ingress (wide):"
-            kubectl get ingress -n "$NAMESPACE" -o wide
-
-            echo "ALB hostname(s):"
-            kubectl get ingress -n "$NAMESPACE" -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.loadBalancer.ingress[*].hostname}{"\n"}{end}'
-          else
-            echo "Ingress not enabled for this deployment. Skipping Ingress verification."
-          fi
+          echo ""
+          echo "PVCs:"
+          kubectl get pvc -n "$TARGET_NAMESPACE" || true
 
       - name: Upload rendered manifests and chart package
         if: always()
@@ -694,14 +828,15 @@ jobs:
         shell: bash
         run: |
           {
-            echo "## GoldenGate EKS Helm Build and Deploy Summary"
+            echo "## GoldenGate EKS Argo CD-based Deploy Summary"
             echo ""
             echo "### Deployment details"
             echo ""
             echo "- Environment: \`${ENVIRONMENT}\`"
             echo "- Deployment ID: \`${DEPLOYMENT_ID}\`"
-            echo "- Namespace: \`${NAMESPACE}\`"
-            echo "- Helm release: \`${RELEASE_NAME}\`"
+            echo "- Target namespace: \`${TARGET_NAMESPACE}\`"
+            echo "- Argo CD Application: \`${ARGOCD_APP_NAME}\` (namespace: \`${ARGOCD_NAMESPACE}\`)"
+            echo "- Helm releaseName (used by Argo CD): \`${RELEASE_NAME}\`"
             echo "- Values file: \`${VALUES_FILE}\`"
             echo "- Deploy enabled: \`${{ matrix.deploy }}\`"
             echo ""
@@ -717,66 +852,181 @@ jobs:
             echo ""
             echo "- Chart ref: \`${HELM_CHART_REF}\`"
             echo "- Chart version: \`${CHART_VERSION}\`"
+            echo "- ECR OCI repo: \`${HELM_ECR_REPOSITORY}\`"
             echo ""
-            echo "### Manual Helm registry login"
+            echo "### Ownership"
             echo ""
-            echo "\`\`\`bash"
-            echo "aws ecr get-login-password --region ${AWS_REGION} | \\"
-            echo "  helm registry login --username AWS --password-stdin ${ECR_REGISTRY}"
-            echo "\`\`\`"
-            echo ""
-            echo "### Manual deployment command"
-            echo ""
-            echo "\`\`\`bash"
-            echo "helm upgrade --install ${RELEASE_NAME} \\"
-            echo "  ${HELM_CHART_REF} \\"
-            echo "  --version ${CHART_VERSION} \\"
-            echo "  --namespace ${NAMESPACE} \\"
-            echo "  --values ${VALUES_FILE} \\"
-            echo "  --set global.environment=${ENVIRONMENT} \\"
-            echo "  --set global.deploymentId=${DEPLOYMENT_ID} \\"
-            echo "  --wait \\"
-            echo "  --atomic \\"
-            echo "  --cleanup-on-fail \\"
-            echo "  --timeout 20m"
-            echo "\`\`\`"
+            echo "Argo CD owns create/update/delete of this GoldenGate deployment's Kubernetes"
+            echo "resources. GitHub Actions only packages/publishes the Helm OCI chart and"
+            echo "creates/updates the Argo CD Application resource -- it does not run"
+            echo "\`helm upgrade --install\` or \`helm uninstall\` against the cluster."
             echo ""
             echo "### Validation commands"
             echo ""
             echo "\`\`\`bash"
-            echo "kubectl get all -n ${NAMESPACE}"
-            echo "kubectl get pvc -n ${NAMESPACE}"
-            echo "kubectl get ingress -n ${NAMESPACE}"
-            echo "helm status ${RELEASE_NAME} -n ${NAMESPACE}"
+            echo "kubectl get application ${ARGOCD_APP_NAME} -n ${ARGOCD_NAMESPACE} -o wide"
+            echo "kubectl describe application ${ARGOCD_APP_NAME} -n ${ARGOCD_NAMESPACE}"
+            echo "kubectl get all -n ${TARGET_NAMESPACE}"
+            echo "kubectl get pvc -n ${TARGET_NAMESPACE}"
+            echo "kubectl get ingress -n ${TARGET_NAMESPACE}"
             echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  delete_removed_argocd_applications:
+    name: Delete removed GoldenGate Argo CD Applications
+
+    needs: detect_changed_deployments
+    if: github.event_name == 'push' && needs.detect_changed_deployments.outputs.has_deletions == 'true'
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.detect_changed_deployments.outputs.deletion_matrix) }}
+
+    concurrency:
+      group: goldengate-argocd-delete-${{ github.ref }}-${{ matrix.environment }}-${{ matrix.deployment_id }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.ROLE_ARN }}
+
+      - name: Install kubectl if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking/installing kubectl..."
+
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KUBECTL_VERSION="v1.35.0"
+
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64)
+                KUBECTL_ARCH="amd64"
+                ;;
+              aarch64|arm64)
+                KUBECTL_ARCH="arm64"
+                ;;
+              *)
+                echo "Unsupported architecture for kubectl: $ARCH"
+                exit 1
+                ;;
+            esac
+
+            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+            sudo chmod +x /usr/local/bin/kubectl
+          fi
+
+          kubectl version --client=true
+
+      - name: Verify AWS identity and kubectl
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking AWS identity..."
+          aws sts get-caller-identity
+
+          echo "Checking kubectl..."
+          kubectl version --client=true
+
+      - name: Prepare deletion variables
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ENVIRONMENT="${{ matrix.environment }}"
+          DEPLOYMENT_ID="${{ matrix.deployment_id }}"
+
+          if [[ ! "$DEPLOYMENT_ID" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
+            echo "Invalid deployment_id: $DEPLOYMENT_ID"
+            echo "Use lowercase letters, numbers, and hyphens only."
+            exit 1
+          fi
+
+          ARGOCD_NAMESPACE="argocd"
+          ARGOCD_APP_NAME="goldengate-${DEPLOYMENT_ID}"
+          TARGET_NAMESPACE="gg-${ENVIRONMENT}-${DEPLOYMENT_ID}"
+
+          echo "ENVIRONMENT=${ENVIRONMENT}" >> "$GITHUB_ENV"
+          echo "DEPLOYMENT_ID=${DEPLOYMENT_ID}" >> "$GITHUB_ENV"
+          echo "ARGOCD_NAMESPACE=${ARGOCD_NAMESPACE}" >> "$GITHUB_ENV"
+          echo "ARGOCD_APP_NAME=${ARGOCD_APP_NAME}" >> "$GITHUB_ENV"
+          echo "TARGET_NAMESPACE=${TARGET_NAMESPACE}" >> "$GITHUB_ENV"
+
+          echo "Deletion target:"
+          echo "Environment: ${ENVIRONMENT}"
+          echo "Deployment ID: ${DEPLOYMENT_ID}"
+          echo "Argo CD Application: ${ARGOCD_APP_NAME}"
+          echo "Target namespace: ${TARGET_NAMESPACE}"
+
+      - name: Connect to EKS cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Connecting to EKS using cross-account EKS deploy role:"
+          echo "${EKS_DEPLOY_ROLE_ARN}"
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}" \
+            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
+            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
+
+          echo "Current kube context:"
+          kubectl config current-context
+
+      - name: Delete Argo CD Application
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if kubectl get application "$ARGOCD_APP_NAME" -n "$ARGOCD_NAMESPACE" >/dev/null 2>&1; then
+            echo "Argo CD Application ${ARGOCD_APP_NAME} found. Deleting..."
+
+            kubectl patch application "$ARGOCD_APP_NAME" \
+              -n "$ARGOCD_NAMESPACE" \
+              --type merge \
+              -p '{"metadata":{"finalizers":["resources-finalizer.argocd.argoproj.io"]}}'
+
+            kubectl delete application "$ARGOCD_APP_NAME" \
+              -n "$ARGOCD_NAMESPACE" \
+              --wait=true \
+              --timeout=10m
+
+            echo "Argo CD Application ${ARGOCD_APP_NAME} deleted."
+            echo "Argo CD will cascade-delete its managed resources in ${TARGET_NAMESPACE}."
+          else
+            echo "Argo CD Application ${ARGOCD_APP_NAME} not found in namespace ${ARGOCD_NAMESPACE}. Nothing to delete."
+          fi
+
+      - name: Workflow summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## GoldenGate Argo CD Application Deletion Summary"
             echo ""
-            echo "### Secrets Store CSI validation commands"
+            echo "- Environment: \`${ENVIRONMENT}\`"
+            echo "- Deployment ID: \`${DEPLOYMENT_ID}\`"
+            echo "- Argo CD Application: \`${ARGOCD_APP_NAME}\` (namespace: \`${ARGOCD_NAMESPACE}\`)"
+            echo "- Target namespace: \`${TARGET_NAMESPACE}\`"
+            echo "- Delete requested: \`true\`"
             echo ""
-            echo "\`\`\`bash"
-            echo "kubectl get secretproviderclass -n ${NAMESPACE}"
-            echo "kubectl get secretproviderclasspodstatus -n ${NAMESPACE}"
-            echo "kubectl get secret ogg-oracle-admin -n ${NAMESPACE}"
-            echo "kubectl describe secret ogg-oracle-admin -n ${NAMESPACE}"
-            echo "kubectl get sa ogg-oracle-sa -n ${NAMESPACE} -o yaml"
-            echo "\`\`\`"
-            echo ""
-            echo "Secrets are sourced exclusively from AWS Secrets Manager via the Secrets Store CSI Driver."
-            echo "No secrets are manually created or copied between namespaces."
-            echo ""
-            if grep -qE "^kind: Ingress$" "rendered/${RELEASE_NAME}.yaml" 2>/dev/null; then
-              echo "### Ingress / ALB"
-              echo ""
-              echo "\`\`\`bash"
-              echo "kubectl get ingress -n ${NAMESPACE}"
-              echo "kubectl describe ingress -n ${NAMESPACE}"
-              echo "kubectl get ingress -n ${NAMESPACE} -o jsonpath='{range .items[*]}{.metadata.name}{\" \"}{.status.loadBalancer.ingress[*].hostname}{\"\\n\"}{end}'"
-              echo "\`\`\`"
-              echo ""
-              echo "Route53 handoff:"
-              echo ""
-              echo "Network team should create wildcard private Route53 record:"
-              echo "\`*.goldengate-dev.adcbmis.local\` -> \`<internal ALB DNS name>\`"
-              echo ""
-              echo "This workflow does not create Route53 records."
-            fi
+            echo "Argo CD cascade deletion is used: deleting the Application (with the"
+            echo "resources-finalizer) removes it from Argo CD and prunes every Kubernetes"
+            echo "resource it manages, including the target namespace since it was created"
+            echo "via CreateNamespace=true."
           } >> "$GITHUB_STEP_SUMMARY"
