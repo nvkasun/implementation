@@ -30,6 +30,7 @@ on:
       - main
     paths:
       - 'envs/dev/**'
+      - 'helm/goldengate/**'
 
 permissions:
   id-token: write
@@ -100,7 +101,7 @@ jobs:
             exit 0
           fi
 
-          echo "Push trigger. Detecting changed deployment folders under envs/dev/..."
+          echo "Push trigger. Detecting changed deployment folders under envs/dev/ and helm/goldengate/..."
 
           BEFORE_SHA="${{ github.event.before }}"
           AFTER_SHA="${{ github.sha }}"
@@ -111,20 +112,41 @@ jobs:
             BEFORE_SHA="$EMPTY_TREE_SHA"
           fi
 
-          CHANGED_FILES="$(git diff --name-only "$BEFORE_SHA" "$AFTER_SHA" -- 'envs/dev/**' || true)"
+          CHANGED_FILES="$(git diff --name-only "$BEFORE_SHA" "$AFTER_SHA" -- 'envs/dev/**' 'helm/goldengate/**' || true)"
 
-          echo "Changed files under envs/dev/:"
+          echo "Changed files under envs/dev/ and helm/goldengate/:"
           echo "${CHANGED_FILES:-<none>}"
 
-          DEPLOYMENT_IDS="$(echo "$CHANGED_FILES" \
-            | grep -E '^envs/dev/[^/]+/' \
-            | sed -E 's#^envs/dev/([^/]+)/.*#\1#' \
-            | sort -u || true)"
+          CHART_CHANGED="false"
+          if echo "$CHANGED_FILES" | grep -q '^helm/goldengate/'; then
+            CHART_CHANGED="true"
+          fi
+
+          echo "Chart changed: ${CHART_CHANGED}"
+
+          # envs/dev/argocd/ holds Argo CD's own values file, deployed by the
+          # separate argocd-eks-deployment.yaml workflow. It is never a
+          # GoldenGate deployment and must be excluded here.
+          if [ "$CHART_CHANGED" = "true" ]; then
+            echo "Shared GoldenGate Helm chart changed. Selecting all active dev deployments."
+
+            DEPLOYMENT_IDS="$(find envs/dev -mindepth 2 -maxdepth 2 -name values.yaml -not -path 'envs/dev/argocd/*' \
+              | sed -E 's#^envs/dev/([^/]+)/values\.yaml$#\1#' \
+              | sort -u || true)"
+          else
+            echo "Only envs/dev/ changed. Selecting changed deployment folders."
+
+            DEPLOYMENT_IDS="$(echo "$CHANGED_FILES" \
+              | grep -E '^envs/dev/[^/]+/' \
+              | grep -v '^envs/dev/argocd/' \
+              | sed -E 's#^envs/dev/([^/]+)/.*#\1#' \
+              | sort -u || true)"
+          fi
 
           MATRIX_ITEMS="[]"
           for DEPLOYMENT_ID in $DEPLOYMENT_IDS; do
             if [ -f "envs/dev/${DEPLOYMENT_ID}/values.yaml" ]; then
-              echo "Detected changed deployment: ${DEPLOYMENT_ID}"
+              echo "Detected deployment: ${DEPLOYMENT_ID}"
               MATRIX_ITEMS="$(echo "$MATRIX_ITEMS" | jq -c \
                 --arg deployment_id "$DEPLOYMENT_ID" \
                 '. + [{environment: "dev", deployment_id: $deployment_id, deploy: true}]')"
@@ -136,7 +158,7 @@ jobs:
           MATRIX_COUNT="$(echo "$MATRIX_ITEMS" | jq 'length')"
 
           if [ "$MATRIX_COUNT" -eq 0 ]; then
-            echo "No changed deployment folders with a values.yaml were found. Nothing to deploy."
+            echo "No valid deployment folders with a values.yaml were found. Nothing to deploy."
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
             echo "deployment_matrix=[]" >> "$GITHUB_OUTPUT"
           else
