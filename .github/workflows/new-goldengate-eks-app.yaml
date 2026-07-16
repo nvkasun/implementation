@@ -1,6 +1,6 @@
 name: New Goldengate EKS app deployment
 
-run-name: "Cloud Factory - GoldenGate Helm build and deploy | ${{ inputs.deployment_id }} | ran by ${{ github.actor }}"
+run-name: "Cloud Factory - GoldenGate Helm build and deploy | ${{ github.event_name == 'workflow_dispatch' && inputs.deployment_id || format('auto: envs/dev changes on {0}', github.sha) }} | ran by ${{ github.actor }}"
 
 on:
   workflow_dispatch:
@@ -24,6 +24,12 @@ on:
         required: true
         type: boolean
         default: true
+
+  push:
+    branches:
+      - main
+    paths:
+      - 'envs/dev/**'
 
 permissions:
   id-token: write
@@ -52,17 +58,112 @@ env:
   HELM_CHART_PATH: helm/goldengate
   ENVS_ROOT: envs
 
-concurrency:
-  group: goldengate-helm-deploy-${{ github.ref }}-${{ inputs.environment }}-${{ inputs.deployment_id }}
-  cancel-in-progress: false
-
 jobs:
-  build_publish_and_deploy:
-    name: Build, publish, and deploy GoldenGate Helm chart
+  detect_changed_deployments:
+    name: Detect changed GoldenGate deployments
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
-    environment: ${{ inputs.environment }}
+    outputs:
+      has_changes: ${{ steps.detect.outputs.has_changes }}
+      deployment_matrix: ${{ steps.detect.outputs.deployment_matrix }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed deployments
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ENVIRONMENT="${{ inputs.environment }}"
+            DEPLOYMENT_ID="${{ inputs.deployment_id }}"
+            DEPLOY="${{ inputs.deploy }}"
+
+            echo "Manual workflow_dispatch trigger. Building single-item matrix."
+
+            MATRIX_JSON="$(jq -nc \
+              --arg environment "$ENVIRONMENT" \
+              --arg deployment_id "$DEPLOYMENT_ID" \
+              --argjson deploy "$DEPLOY" \
+              '[{environment: $environment, deployment_id: $deployment_id, deploy: $deploy}]')"
+
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "deployment_matrix=${MATRIX_JSON}" >> "$GITHUB_OUTPUT"
+
+            echo "Matrix: ${MATRIX_JSON}"
+            exit 0
+          fi
+
+          echo "Push trigger. Detecting changed deployment folders under envs/dev/..."
+
+          BEFORE_SHA="${{ github.event.before }}"
+          AFTER_SHA="${{ github.sha }}"
+          EMPTY_TREE_SHA="4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+          if [ -z "$BEFORE_SHA" ] || [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "No usable previous commit (new branch or first push). Diffing against the empty tree."
+            BEFORE_SHA="$EMPTY_TREE_SHA"
+          fi
+
+          CHANGED_FILES="$(git diff --name-only "$BEFORE_SHA" "$AFTER_SHA" -- 'envs/dev/**' || true)"
+
+          echo "Changed files under envs/dev/:"
+          echo "${CHANGED_FILES:-<none>}"
+
+          DEPLOYMENT_IDS="$(echo "$CHANGED_FILES" \
+            | grep -E '^envs/dev/[^/]+/' \
+            | sed -E 's#^envs/dev/([^/]+)/.*#\1#' \
+            | sort -u || true)"
+
+          MATRIX_ITEMS="[]"
+          for DEPLOYMENT_ID in $DEPLOYMENT_IDS; do
+            if [ -f "envs/dev/${DEPLOYMENT_ID}/values.yaml" ]; then
+              echo "Detected changed deployment: ${DEPLOYMENT_ID}"
+              MATRIX_ITEMS="$(echo "$MATRIX_ITEMS" | jq -c \
+                --arg deployment_id "$DEPLOYMENT_ID" \
+                '. + [{environment: "dev", deployment_id: $deployment_id, deploy: true}]')"
+            else
+              echo "Skipping ${DEPLOYMENT_ID}: no envs/dev/${DEPLOYMENT_ID}/values.yaml found."
+            fi
+          done
+
+          MATRIX_COUNT="$(echo "$MATRIX_ITEMS" | jq 'length')"
+
+          if [ "$MATRIX_COUNT" -eq 0 ]; then
+            echo "No changed deployment folders with a values.yaml were found. Nothing to deploy."
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "deployment_matrix=[]" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "deployment_matrix=${MATRIX_ITEMS}" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "Matrix: ${MATRIX_ITEMS}"
+
+  build_publish_and_deploy:
+    name: Build, publish, and deploy GoldenGate Helm chart
+
+    needs: detect_changed_deployments
+    if: needs.detect_changed_deployments.outputs.has_changes == 'true'
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    environment: ${{ matrix.environment }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.detect_changed_deployments.outputs.deployment_matrix) }}
+
+    concurrency:
+      group: goldengate-helm-deploy-${{ github.ref }}-${{ matrix.environment }}-${{ matrix.deployment_id }}
+      cancel-in-progress: false
 
     steps:
       - name: Checkout repository
@@ -159,8 +260,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          ENVIRONMENT="${{ inputs.environment }}"
-          DEPLOYMENT_ID="${{ inputs.deployment_id }}"
+          ENVIRONMENT="${{ matrix.environment }}"
+          DEPLOYMENT_ID="${{ matrix.deployment_id }}"
 
           if [[ ! "$DEPLOYMENT_ID" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
             echo "Invalid deployment_id: $DEPLOYMENT_ID"
@@ -335,7 +436,7 @@ jobs:
           ls -lrt pulled
 
       - name: Connect to EKS cluster
-        if: ${{ inputs.deploy }}
+        if: ${{ matrix.deploy }}
         shell: bash
         run: |
           set -euo pipefail
@@ -371,7 +472,7 @@ jobs:
           kubectl auth can-i get secretproviderclasses.secrets-store.csi.x-k8s.io --all-namespaces || true
 
       - name: Create namespace if missing
-        if: ${{ inputs.deploy }}
+        if: ${{ matrix.deploy }}
         shell: bash
         run: |
           set -euo pipefail
@@ -392,7 +493,7 @@ jobs:
           kubectl get namespace "${NAMESPACE}" --show-labels
 
       - name: Validate Secrets Store CSI configuration
-        if: ${{ inputs.deploy }}
+        if: ${{ matrix.deploy }}
         shell: bash
         run: |
           set -euo pipefail
@@ -448,7 +549,7 @@ jobs:
           echo "Secrets Store CSI Driver prerequisites validated."
 
       - name: Deploy GoldenGate Helm release to EKS
-        if: ${{ inputs.deploy }}
+        if: ${{ matrix.deploy }}
         shell: bash
         run: |
           set -euo pipefail
@@ -472,7 +573,7 @@ jobs:
             --timeout 20m
 
       - name: Verify deployment
-        if: ${{ inputs.deploy }}
+        if: ${{ matrix.deploy }}
         shell: bash
         run: |
           set -euo pipefail
@@ -558,7 +659,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: goldengate-helm-artifacts-${{ inputs.environment }}-${{ inputs.deployment_id }}
+          name: goldengate-helm-artifacts-${{ matrix.environment }}-${{ matrix.deployment_id }}
           path: |
             rendered/
             packaged/
@@ -580,7 +681,7 @@ jobs:
             echo "- Namespace: \`${NAMESPACE}\`"
             echo "- Helm release: \`${RELEASE_NAME}\`"
             echo "- Values file: \`${VALUES_FILE}\`"
-            echo "- Deploy enabled: \`${{ inputs.deploy }}\`"
+            echo "- Deploy enabled: \`${{ matrix.deploy }}\`"
             echo ""
             echo "### AWS / EKS details"
             echo ""
