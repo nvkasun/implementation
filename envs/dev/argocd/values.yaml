@@ -72,3 +72,20 @@ argo-cd:
       timeout.reconciliation: 180s
     rbac:
       policy.default: "role:readonly"
+
+# In-cluster CronJob that keeps the argocd-ecr-goldengate-oci repository
+# Secret refreshed with a live ECR token, via IRSA -- the long-term
+# replacement for GitHub Actions injecting a short-lived ECR password.
+ecrTokenSync:
+  enabled: true
+  schedule: "0 */6 * * *"
+  serviceAccountName: argocd-ecr-token-sync
+  roleArn: arn:aws:iam::668311715351:role/GoldenGateArgocdECRRead-dev
+  awsRegion: eu-west-1
+  ecrRegistry: 229410149234.dkr.ecr.eu-west-1.amazonaws.com
+  helmOciRepository: helm/goldengate
+  argocdRepositorySecretName: argocd-ecr-goldengate-oci
+  image:
+    repository: 229410149234.dkr.ecr.eu-west-1.amazonaws.com/aws-cloud-factory-infra-aws-kubectl
+    tag: "2.34.58"
+    pullPolicy: IfNotPresent

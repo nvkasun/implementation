@@ -1,0 +1,47 @@
+{{- if .Values.ecrTokenSync.enabled }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Values.ecrTokenSync.serviceAccountName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: argocd-ecr-token-sync
+    app.kubernetes.io/part-of: argocd
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+rules:
+  # Kubernetes RBAC cannot scope the "create" verb by resourceNames -- the
+  # object doesn't exist yet at authorization time -- so it must be granted
+  # unscoped on secrets in this namespace. get/update/patch (what "kubectl
+  # apply" needs once the Secret already exists) are scoped to exactly the
+  # one Secret this CronJob is allowed to touch.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs:
+      - create
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - {{ .Values.ecrTokenSync.argocdRepositorySecretName }}
+    verbs:
+      - get
+      - update
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Values.ecrTokenSync.serviceAccountName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: argocd-ecr-token-sync
+    app.kubernetes.io/part-of: argocd
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Values.ecrTokenSync.serviceAccountName }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.ecrTokenSync.serviceAccountName }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

@@ -19,3 +19,10 @@
 # upstream-supported keys and their defaults.
 
 argo-cd: {}
+
+# Disabled by default here (this is a structural toggle, not an
+# environment-specific value). Environments that need the in-cluster Argo CD
+# ECR OCI token-refresh CronJob turn it on and supply the role ARN,
+# registry, and image details in their own values.yaml overlay.
+ecrTokenSync:
+  enabled: false

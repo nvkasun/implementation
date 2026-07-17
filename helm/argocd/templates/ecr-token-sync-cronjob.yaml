@@ -1,0 +1,83 @@
+{{- if .Values.ecrTokenSync.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ .Values.ecrTokenSync.serviceAccountName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: argocd-ecr-token-sync
+    app.kubernetes.io/part-of: argocd
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  schedule: {{ .Values.ecrTokenSync.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 300
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: argocd-ecr-token-sync
+            app.kubernetes.io/part-of: argocd
+        spec:
+          serviceAccountName: {{ .Values.ecrTokenSync.serviceAccountName }}
+          restartPolicy: OnFailure
+          containers:
+            - name: ecr-token-sync
+              image: "{{ .Values.ecrTokenSync.image.repository }}:{{ .Values.ecrTokenSync.image.tag }}"
+              imagePullPolicy: {{ .Values.ecrTokenSync.image.pullPolicy }}
+              # allowPrivilegeEscalation/capabilities are always safe to force.
+              # readOnlyRootFilesystem/runAsNonRoot are intentionally not set
+              # here: the aws-cloud-factory-infra-aws-kubectl image's default
+              # user and writable paths (aws/kubectl config caches) aren't
+              # verified, and forcing either could break the CronJob.
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                    - ALL
+              env:
+                - name: AWS_REGION
+                  value: {{ .Values.ecrTokenSync.awsRegion | quote }}
+                - name: ECR_REGISTRY
+                  value: {{ .Values.ecrTokenSync.ecrRegistry | quote }}
+                - name: HELM_OCI_REPOSITORY
+                  value: {{ .Values.ecrTokenSync.helmOciRepository | quote }}
+                - name: ARGOCD_REPOSITORY_SECRET_NAME
+                  value: {{ .Values.ecrTokenSync.argocdRepositorySecretName | quote }}
+                - name: POD_NAMESPACE
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.namespace
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  set -euo pipefail
+
+                  echo "Refreshing Argo CD OCI repository Secret ${ARGOCD_REPOSITORY_SECRET_NAME} in namespace ${POD_NAMESPACE}..."
+
+                  ECR_PASSWORD="$(aws ecr get-login-password --region "$AWS_REGION")"
+
+                  cat <<EOF | kubectl apply -f -
+                  apiVersion: v1
+                  kind: Secret
+                  metadata:
+                    name: ${ARGOCD_REPOSITORY_SECRET_NAME}
+                    namespace: ${POD_NAMESPACE}
+                    labels:
+                      argocd.argoproj.io/secret-type: repository
+                  stringData:
+                    type: oci
+                    url: oci://${ECR_REGISTRY}/${HELM_OCI_REPOSITORY}
+                    username: AWS
+                    password: ${ECR_PASSWORD}
+                  EOF
+
+                  unset ECR_PASSWORD
+
+                  echo "Argo CD OCI repository Secret ${ARGOCD_REPOSITORY_SECRET_NAME} refreshed successfully."
+{{- end }}
