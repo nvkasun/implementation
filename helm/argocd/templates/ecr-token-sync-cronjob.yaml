@@ -15,8 +15,12 @@ spec:
   failedJobsHistoryLimit: 3
   jobTemplate:
     spec:
-      backoffLimit: 2
+      backoffLimit: 1
       activeDeadlineSeconds: 300
+      # restartPolicy: Never (not OnFailure) so a failed attempt produces
+      # its own Pod that stays around (subject to the history limits above)
+      # instead of the Job controller restarting/deleting a single Pod in
+      # place -- that's what makes `kubectl logs` on a failed run possible.
       template:
         metadata:
           labels:
@@ -24,7 +28,7 @@ spec:
             app.kubernetes.io/part-of: argocd
         spec:
           serviceAccountName: {{ .Values.ecrTokenSync.serviceAccountName }}
-          restartPolicy: OnFailure
+          restartPolicy: Never
           containers:
             - name: ecr-token-sync
               image: "{{ .Values.ecrTokenSync.image.repository }}:{{ .Values.ecrTokenSync.image.tag }}"
@@ -58,11 +62,33 @@ spec:
                 - |
                   set -euo pipefail
 
-                  echo "Refreshing Argo CD OCI repository Secret ${ARGOCD_REPOSITORY_SECRET_NAME} in namespace ${POD_NAMESPACE}..."
+                  echo "Refreshing Argo CD ECR OCI repository credential..."
+                  echo "Target Secret: ${ARGOCD_REPOSITORY_SECRET_NAME}"
+                  echo "Namespace: ${POD_NAMESPACE}"
+                  echo "Repository URL: oci://${ECR_REGISTRY}/${HELM_OCI_REPOSITORY}"
+
+                  echo "AWS caller identity:"
+                  aws sts get-caller-identity
+
+                  echo "Kubernetes RBAC diagnostics:"
+                  kubectl auth can-i get secret "${ARGOCD_REPOSITORY_SECRET_NAME}" -n "${POD_NAMESPACE}" || true
+                  kubectl auth can-i create secret -n "${POD_NAMESPACE}" || true
+                  kubectl auth can-i update secret "${ARGOCD_REPOSITORY_SECRET_NAME}" -n "${POD_NAMESPACE}" || true
+                  kubectl auth can-i patch secret "${ARGOCD_REPOSITORY_SECRET_NAME}" -n "${POD_NAMESPACE}" || true
 
                   ECR_PASSWORD="$(aws ecr get-login-password --region "$AWS_REGION")"
 
-                  cat <<EOF | kubectl apply -f -
+                  # kubectl apply reads the heredoc directly on its own stdin
+                  # here -- no "cat | kubectl apply" pipe. That older pipe
+                  # form runs kubectl and cat as two processes tied together
+                  # by set -o pipefail; if kubectl finishes and closes its
+                  # end of the pipe while cat is still writing, cat gets
+                  # SIGPIPE, exits non-zero, and pipefail fails the whole
+                  # pipeline -- even though kubectl already applied the
+                  # Secret successfully. Redirecting the heredoc straight
+                  # into kubectl's stdin removes that second process and
+                  # the race entirely.
+                  kubectl apply -f - <<EOF
                   apiVersion: v1
                   kind: Secret
                   metadata:
@@ -79,5 +105,8 @@ spec:
 
                   unset ECR_PASSWORD
 
-                  echo "Argo CD OCI repository Secret ${ARGOCD_REPOSITORY_SECRET_NAME} refreshed successfully."
+                  kubectl get secret "${ARGOCD_REPOSITORY_SECRET_NAME}" -n "${POD_NAMESPACE}" \
+                    -o jsonpath='{.metadata.name}{" refreshed with "}{.metadata.labels.argocd\.argoproj\.io/secret-type}{" label\n"}'
+
+                  echo "Argo CD ECR OCI repository credential refreshed successfully."
 {{- end }}
