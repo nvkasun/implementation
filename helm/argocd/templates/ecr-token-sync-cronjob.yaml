@@ -56,16 +56,40 @@ spec:
                   valueFrom:
                     fieldRef:
                       fieldPath: metadata.namespace
+                # No securityContext.runAsNonRoot is set on this container (see
+                # the comment above), so the AWS CLI defaults to $HOME=/root
+                # and tries to write ~/.aws -- a path this container can't
+                # write to. Point it at /tmp instead, which is always
+                # writable regardless of which user the image runs as.
+                - name: HOME
+                  value: /tmp
+                - name: AWS_CONFIG_FILE
+                  value: /tmp/.aws/config
+                - name: AWS_SHARED_CREDENTIALS_FILE
+                  value: /tmp/.aws/credentials
+                - name: AWS_EC2_METADATA_DISABLED
+                  value: "true"
+                - name: XDG_CACHE_HOME
+                  value: /tmp/.cache
               command:
                 - /bin/bash
                 - -c
                 - |
                   set -euo pipefail
 
+                  mkdir -p /tmp/.aws /tmp/.cache
+
                   echo "Refreshing Argo CD ECR OCI repository credential..."
                   echo "Target Secret: ${ARGOCD_REPOSITORY_SECRET_NAME}"
                   echo "Namespace: ${POD_NAMESPACE}"
                   echo "Repository URL: oci://${ECR_REGISTRY}/${HELM_OCI_REPOSITORY}"
+
+                  echo "Runtime user:"
+                  id
+
+                  echo "HOME=${HOME}"
+                  echo "AWS_CONFIG_FILE=${AWS_CONFIG_FILE}"
+                  echo "AWS_SHARED_CREDENTIALS_FILE=${AWS_SHARED_CREDENTIALS_FILE}"
 
                   echo "AWS caller identity:"
                   aws sts get-caller-identity
