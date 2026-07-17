@@ -1,4 +1,4 @@
-{{- if .Values.ecrTokenSync.enabled }}
+{{- if and .Values.ecrTokenSync .Values.ecrTokenSync.enabled }}
 apiVersion: batch/v1
 kind: CronJob
 metadata:

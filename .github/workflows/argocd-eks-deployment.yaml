@@ -283,6 +283,26 @@ jobs:
 
           echo "Rendered manifest: rendered/${ARGOCD_RELEASE_NAME}.yaml"
 
+      - name: Validate ECR token sync resources are rendered
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RENDERED="rendered/${ARGOCD_RELEASE_NAME}.yaml"
+
+          echo "Checking rendered manifest for ECR token sync resources: ${RENDERED}"
+
+          # Fails the workflow before package/push/deploy if the CronJob,
+          # its ServiceAccount/RBAC, IRSA annotation, or the pinned image
+          # are missing from the rendered chart -- catches a regression or
+          # a values misconfiguration before it ever reaches the cluster.
+          grep -q "kind: CronJob" "$RENDERED"
+          grep -q "name: argocd-ecr-token-sync" "$RENDERED"
+          grep -q "eks.amazonaws.com/role-arn" "$RENDERED"
+          grep -q "aws-cloud-factory-infra-aws-kubectl:2.34.58" "$RENDERED"
+
+          echo "OK: ServiceAccount/Role/RoleBinding/CronJob for ECR token sync are all present in the rendered manifest."
+
       - name: Extract and validate rendered image references
         shell: bash
         run: |
@@ -485,6 +505,25 @@ jobs:
           echo ""
           echo "Argo CD CRDs:"
           kubectl get crd | grep argoproj || true
+
+          echo ""
+          echo "ECR token sync resources:"
+          # No "|| true" here on purpose: with set -e, a missing resource
+          # aborts this step and fails the job instead of silently passing
+          # -- Argo CD's ECR OCI credentials won't stay refreshed without
+          # all four of these existing.
+          kubectl get serviceaccount argocd-ecr-token-sync -n "${ARGOCD_NAMESPACE}"
+          kubectl get role argocd-ecr-token-sync -n "${ARGOCD_NAMESPACE}"
+          kubectl get rolebinding argocd-ecr-token-sync -n "${ARGOCD_NAMESPACE}"
+          kubectl get cronjob argocd-ecr-token-sync -n "${ARGOCD_NAMESPACE}"
+
+          echo ""
+          echo "Helm values (ecrTokenSync section) for release ${ARGOCD_RELEASE_NAME}:"
+          helm get values "${ARGOCD_RELEASE_NAME}" -n "${ARGOCD_NAMESPACE}" -a | grep -A40 ecrTokenSync || true
+
+          echo ""
+          echo "Helm manifest (ECR token sync resources) for release ${ARGOCD_RELEASE_NAME}:"
+          helm get manifest "${ARGOCD_RELEASE_NAME}" -n "${ARGOCD_NAMESPACE}" | grep -n "argocd-ecr-token-sync" -A10 -B10 || true
 
       - name: Upload rendered manifests and chart package
         if: always()
