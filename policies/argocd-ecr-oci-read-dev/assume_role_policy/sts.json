@@ -1,0 +1,21 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowArgocdEcrTokenSyncToAssumeRoleWithIRSA",
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::668311715351:oidc-provider/oidc.eks.eu-west-1.amazonaws.com/id/407C4385FF87947926730569F1E564FB"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "oidc.eks.eu-west-1.amazonaws.com/id/407C4385FF87947926730569F1E564FB:aud": "sts.amazonaws.com"
+        },
+        "StringLike": {
+          "oidc.eks.eu-west-1.amazonaws.com/id/407C4385FF87947926730569F1E564FB:sub": "system:serviceaccount:argocd:argocd-ecr-token-sync"
+        }
+      }
+    }
+  ]
+}

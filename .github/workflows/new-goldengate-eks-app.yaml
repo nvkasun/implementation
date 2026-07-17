@@ -450,6 +450,67 @@ jobs:
             echo "Created ECR repository: $HELM_ECR_REPOSITORY"
           fi
 
+      - name: Ensure Helm ECR repository policy allows Argo CD pull
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Runs every time (repo newly created or already existing) so the
+          # in-cluster Argo CD ECR OCI IRSA role always has pull access,
+          # without clobbering any other statements already on this repo.
+          ARGOCD_ECR_ROLE_ARN="arn:aws:iam::668311715351:role/ArgocdEcrOciReadRole-dev"
+          ARGOCD_ECR_STATEMENT_SID="AllowArgocdEksRolePullGoldengateHelmChart"
+
+          echo "Fetching existing ECR repository policy for ${HELM_ECR_REPOSITORY}..."
+
+          EXISTING_POLICY="$(aws ecr get-repository-policy \
+            --region "$AWS_REGION" \
+            --repository-name "$HELM_ECR_REPOSITORY" \
+            --query policyText \
+            --output text 2>/tmp/ecr-get-policy-error.txt)" || {
+              if grep -q "RepositoryPolicyNotFoundException" /tmp/ecr-get-policy-error.txt; then
+                echo "No existing repository policy found. Starting from an empty policy."
+                EXISTING_POLICY='{"Version":"2012-10-17","Statement":[]}'
+              else
+                echo "Failed to read the existing ECR repository policy:"
+                cat /tmp/ecr-get-policy-error.txt
+                echo ""
+                echo "The workflow role must have ecr:GetRepositoryPolicy and ecr:SetRepositoryPolicy"
+                echo "on this repository. Grant those permissions and re-run."
+                exit 1
+              fi
+            }
+
+          echo "Merging in Sid ${ARGOCD_ECR_STATEMENT_SID} (existing statements are preserved)..."
+
+          echo "$EXISTING_POLICY" | jq \
+            --arg sid "$ARGOCD_ECR_STATEMENT_SID" \
+            --arg roleArn "$ARGOCD_ECR_ROLE_ARN" \
+            '
+            .Statement = ([.Statement[] | select(.Sid != $sid)]
+              + [{
+                  Sid: $sid,
+                  Effect: "Allow",
+                  Principal: { AWS: $roleArn },
+                  Action: [
+                    "ecr:BatchCheckLayerAvailability",
+                    "ecr:BatchGetImage",
+                    "ecr:GetDownloadUrlForLayer",
+                    "ecr:DescribeImages",
+                    "ecr:DescribeRepositories"
+                  ]
+                }])
+            ' > /tmp/ecr-repository-policy.json
+
+          echo "Applying merged ECR repository policy to ${HELM_ECR_REPOSITORY}..."
+
+          aws ecr set-repository-policy \
+            --region "$AWS_REGION" \
+            --repository-name "$HELM_ECR_REPOSITORY" \
+            --policy-text file:///tmp/ecr-repository-policy.json >/dev/null
+
+          echo "ECR repository policy on ${HELM_ECR_REPOSITORY} now allows pull from ${ARGOCD_ECR_ROLE_ARN}."
+
       - name: Build Helm dependencies
         shell: bash
         run: |
@@ -641,13 +702,22 @@ jobs:
 
           echo "Argo CD Application CRD is present."
 
-      - name: Ensure Argo CD ECR OCI repository credentials exist
-        if: ${{ matrix.deploy }}
+      - name: (Emergency fallback only) Refresh temporary Argo CD ECR OCI password
+        # Not the long-term auth path. Long-term, Argo CD's ECR OCI repository
+        # credentials are refreshed in-cluster by the argocd-ecr-token-sync
+        # component via IRSA role ArgocdEcrOciReadRole-dev (see
+        # policies/argocd-ecr-oci-read-dev/ and the ECR repository policy
+        # step above). This step only runs if explicitly enabled via the
+        # ENABLE_TEMP_ARGOCD_ECR_PASSWORD_INJECTION repository variable, for
+        # emergency use before that component is deployed.
+        if: ${{ matrix.deploy && vars.ENABLE_TEMP_ARGOCD_ECR_PASSWORD_INJECTION == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Refreshing Argo CD repository credentials Secret for the GoldenGate OCI Helm repo..."
+          echo "EMERGENCY FALLBACK: injecting a short-lived ECR password into Argo CD."
+          echo "This is not the long-term auth path -- disable ENABLE_TEMP_ARGOCD_ECR_PASSWORD_INJECTION"
+          echo "once the in-cluster argocd-ecr-token-sync (IRSA role ArgocdEcrOciReadRole-dev) is live."
 
           ECR_PASSWORD="$(aws ecr get-login-password --region "$AWS_REGION")"
 
@@ -854,12 +924,26 @@ jobs:
             echo "- Chart version: \`${CHART_VERSION}\`"
             echo "- ECR OCI repo: \`${HELM_ECR_REPOSITORY}\`"
             echo ""
+            echo "### ECR repository policy prerequisites"
+            echo ""
+            echo "The \"Ensure Helm ECR repository policy allows Argo CD pull\" step requires the"
+            echo "GitHub Actions workflow role (\`${ROLE_ARN}\`) to have \`ecr:GetRepositoryPolicy\`"
+            echo "and \`ecr:SetRepositoryPolicy\` on \`${HELM_ECR_REPOSITORY}\`. If that step failed"
+            echo "above with an access-denied error, grant those two actions to the role before"
+            echo "re-running."
+            echo ""
             echo "### Ownership"
             echo ""
             echo "Argo CD owns create/update/delete of this GoldenGate deployment's Kubernetes"
             echo "resources. GitHub Actions only packages/publishes the Helm OCI chart and"
             echo "creates/updates the Argo CD Application resource -- it does not run"
             echo "\`helm upgrade --install\` or \`helm uninstall\` against the cluster."
+            echo ""
+            echo "Argo CD ECR OCI repository credentials are expected to be maintained by the"
+            echo "in-cluster token refresh component using IRSA role ArgocdEcrOciReadRole-dev."
+            echo "GitHub Actions ensures the helm/goldengate ECR repository policy grants that"
+            echo "role pull access on every run, but is not the long-term source of Argo CD's"
+            echo "ECR credentials."
             echo ""
             echo "### Validation commands"
             echo ""
