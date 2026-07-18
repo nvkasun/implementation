@@ -299,7 +299,7 @@ jobs:
           grep -q "kind: CronJob" "$RENDERED"
           grep -q "name: argocd-ecr-token-sync" "$RENDERED"
           grep -q "eks.amazonaws.com/role-arn" "$RENDERED"
-          grep -q "aws-cloud-factory-infra-aws-kubectl:2.34.58" "$RENDERED"
+          grep -q "aws-cloud-factory-infra-aws-kubectl:1.33.13" "$RENDERED"
 
           echo "OK: ServiceAccount/Role/RoleBinding/CronJob for ECR token sync are all present in the rendered manifest."
 

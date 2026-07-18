@@ -87,5 +87,7 @@ ecrTokenSync:
   argocdRepositorySecretName: argocd-ecr-goldengate-oci
   image:
     repository: 229410149234.dkr.ecr.eu-west-1.amazonaws.com/aws-cloud-factory-infra-aws-kubectl
-    tag: "2.34.58"
-    pullPolicy: IfNotPresent
+    tag: "1.33.13"
+    # Always (not IfNotPresent): this tag was just re-mirrored/replaced in
+    # ECR, so nodes must not reuse a stale cached image under the same tag.
+    pullPolicy: Always
