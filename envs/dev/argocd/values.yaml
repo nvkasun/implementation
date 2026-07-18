@@ -99,6 +99,10 @@ ecrTokenSync:
 # HTTPS on 443 with this ACM certificate, so a joining Ingress must declare
 # the same listener and certificate rather than relying on per-Ingress
 # host-based ACM discovery (see helm/goldengate/templates/ingress.yaml).
+# certificateArn is the current valid ACM certificate, confirmed via AWS ACM
+# -- the previous ARN (...0a2ab950-8d20-456c-b43f-a3987f7d1841) no longer
+# resolves and caused CertificateNotFound when the ALB Controller tried to
+# attach this Ingress.
 argocdServerIngress:
   enabled: true
   ingressClassName: alb
@@ -110,7 +114,7 @@ argocdServerIngress:
   targetType: ip
   backendProtocol: HTTPS
   listenPorts: '[{"HTTPS":443}]'
-  certificateArn: arn:aws:acm:eu-west-1:668311715351:certificate/0a2ab950-8d20-456c-b43f-a3987f7d1841
+  certificateArn: arn:aws:acm:eu-west-1:668311715351:certificate/9e53e28e-3243-47fc-85a1-50f9a94acde7
   healthcheckProtocol: HTTPS
   healthcheckPath: /healthz
   healthcheckPort: traffic-port
