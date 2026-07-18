@@ -54,6 +54,12 @@ env:
   # Optional. Add this repo variable later only if cross-account EKS auth fails.
   EKS_DEPLOY_ROLE_ARN: ${{ vars.EKS_DEPLOY_ROLE_ARN }}
 
+  # IRSA role the in-cluster argocd-ecr-token-sync CronJob assumes to pull
+  # the GoldenGate Helm OCI chart. The helm/goldengate ECR repository policy
+  # must grant this exact role pull access -- see the "Ensure Helm ECR
+  # repository policy allows Argo CD pull" step below.
+  ARGOCD_ECR_READ_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateArgocdECRRead-dev
+
   HELM_OCI_NAMESPACE: helm
   CHART_NAME: goldengate
   HELM_CHART_PATH: helm/goldengate
@@ -458,7 +464,6 @@ jobs:
           # Runs every time (repo newly created or already existing) so the
           # in-cluster Argo CD ECR OCI IRSA role always has pull access,
           # without clobbering any other statements already on this repo.
-          ARGOCD_ECR_ROLE_ARN="arn:aws:iam::668311715351:role/ArgocdEcrOciReadRole-dev"
           ARGOCD_ECR_STATEMENT_SID="AllowArgocdEksRolePullGoldengateHelmChart"
 
           echo "Fetching existing ECR repository policy for ${HELM_ECR_REPOSITORY}..."
@@ -485,7 +490,7 @@ jobs:
 
           echo "$EXISTING_POLICY" | jq \
             --arg sid "$ARGOCD_ECR_STATEMENT_SID" \
-            --arg roleArn "$ARGOCD_ECR_ROLE_ARN" \
+            --arg roleArn "$ARGOCD_ECR_READ_ROLE_ARN" \
             '
             .Statement = ([.Statement[] | select(.Sid != $sid)]
               + [{
@@ -509,7 +514,7 @@ jobs:
             --repository-name "$HELM_ECR_REPOSITORY" \
             --policy-text file:///tmp/ecr-repository-policy.json >/dev/null
 
-          echo "ECR repository policy on ${HELM_ECR_REPOSITORY} now allows pull from ${ARGOCD_ECR_ROLE_ARN}."
+          echo "ECR repository policy on ${HELM_ECR_REPOSITORY} now allows pull from ${ARGOCD_ECR_READ_ROLE_ARN}."
 
       - name: Build Helm dependencies
         shell: bash
@@ -705,7 +710,7 @@ jobs:
       - name: (Emergency fallback only) Refresh temporary Argo CD ECR OCI password
         # Not the long-term auth path. Long-term, Argo CD's ECR OCI repository
         # credentials are refreshed in-cluster by the argocd-ecr-token-sync
-        # component via IRSA role ArgocdEcrOciReadRole-dev (see
+        # component via IRSA role GoldenGateArgocdECRRead-dev (see
         # policies/argocd-ecr-oci-read-dev/ and the ECR repository policy
         # step above). This step only runs if explicitly enabled via the
         # ENABLE_TEMP_ARGOCD_ECR_PASSWORD_INJECTION repository variable, for
@@ -717,7 +722,7 @@ jobs:
 
           echo "EMERGENCY FALLBACK: injecting a short-lived ECR password into Argo CD."
           echo "This is not the long-term auth path -- disable ENABLE_TEMP_ARGOCD_ECR_PASSWORD_INJECTION"
-          echo "once the in-cluster argocd-ecr-token-sync (IRSA role ArgocdEcrOciReadRole-dev) is live."
+          echo "once the in-cluster argocd-ecr-token-sync (IRSA role GoldenGateArgocdECRRead-dev) is live."
 
           ECR_PASSWORD="$(aws ecr get-login-password --region "$AWS_REGION")"
 
@@ -940,7 +945,7 @@ jobs:
             echo "\`helm upgrade --install\` or \`helm uninstall\` against the cluster."
             echo ""
             echo "Argo CD ECR OCI repository credentials are expected to be maintained by the"
-            echo "in-cluster token refresh component using IRSA role ArgocdEcrOciReadRole-dev."
+            echo "in-cluster token refresh component using IRSA role GoldenGateArgocdECRRead-dev."
             echo "GitHub Actions ensures the helm/goldengate ECR repository policy grants that"
             echo "role pull access on every run, but is not the long-term source of Argo CD's"
             echo "ECR credentials."
