@@ -1,4 +1,4 @@
-name: New Goldengate EKS app deployment
+name: Goldengate EKS app deployment
 
 run-name: "Cloud Factory - GoldenGate Helm build and deploy | ${{ github.event_name == 'workflow_dispatch' && inputs.deployment_id || format('auto: envs/dev changes on {0}', github.sha) }} | ran by ${{ github.actor }}"
 
