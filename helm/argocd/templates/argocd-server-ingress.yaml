@@ -1,0 +1,68 @@
+{{- if and .Values.argocdServerIngress .Values.argocdServerIngress.enabled }}
+{{- if and (contains "HTTPS" (.Values.argocdServerIngress.listenPorts | default "")) (not .Values.argocdServerIngress.certificateArn) }}
+{{- fail "argocdServerIngress.certificateArn is required when the HTTPS listener is enabled (argocdServerIngress.listenPorts contains HTTPS). Even in shared mode, the ALB Controller resolves the certificate per-Ingress via host-based discovery unless certificate-arn is set explicitly." }}
+{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: argocd-server-ingress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: argocd-server
+    app.kubernetes.io/part-of: argocd
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+  annotations:
+    # This Ingress joins the existing shared GoldenGate ALB group -- only
+    # per-Ingress/TargetGroup annotations are set here (backend/health-check,
+    # group membership, listener, certificate, target-type). ALB-level
+    # annotations (scheme, subnets, load-balancer-name, security-groups,
+    # inbound-cidrs, ssl-policy, load-balancer-attributes) are intentionally
+    # omitted: the resident Ingress already owns those, and repeating them
+    # here would make the AWS Load Balancer Controller fail model
+    # reconciliation with a conflicting-attribute error.
+    alb.ingress.kubernetes.io/backend-protocol: {{ .Values.argocdServerIngress.backendProtocol | quote }}
+    alb.ingress.kubernetes.io/healthcheck-protocol: {{ .Values.argocdServerIngress.healthcheckProtocol | quote }}
+    alb.ingress.kubernetes.io/healthcheck-port: {{ .Values.argocdServerIngress.healthcheckPort | quote }}
+    alb.ingress.kubernetes.io/healthcheck-path: {{ .Values.argocdServerIngress.healthcheckPath | quote }}
+{{- if .Values.argocdServerIngress.groupName }}
+    alb.ingress.kubernetes.io/group.name: {{ .Values.argocdServerIngress.groupName | quote }}
+{{- end }}
+{{- if .Values.argocdServerIngress.groupOrder }}
+    alb.ingress.kubernetes.io/group.order: {{ .Values.argocdServerIngress.groupOrder | quote }}
+{{- end }}
+{{- if .Values.argocdServerIngress.listenPorts }}
+    # listen-ports tells the controller which listener(s) this Ingress's
+    # rules attach to. Required even in shared mode: the resident Ingress
+    # owns the listener/certificate, but each joining Ingress must still
+    # declare its own rules' listener or they are never attached to it and
+    # requests fall through to the ALB default 404 action.
+    alb.ingress.kubernetes.io/listen-ports: {{ .Values.argocdServerIngress.listenPorts | quote }}
+{{- end }}
+{{- if .Values.argocdServerIngress.certificateArn }}
+    # certificate-arn is required whenever this Ingress declares an HTTPS
+    # listener (listen-ports contains HTTPS), even in shared mode: without
+    # it the controller falls back to per-Ingress host-based ACM discovery,
+    # which fails for hosts that don't match a discoverable certificate.
+    alb.ingress.kubernetes.io/certificate-arn: {{ .Values.argocdServerIngress.certificateArn | quote }}
+{{- end }}
+{{- if .Values.argocdServerIngress.targetType }}
+    # target-type is a per-TargetGroup setting, not an ALB-level setting: it
+    # is required in shared mode too. The argocd-server Service is
+    # ClusterIP, so without target-type=ip the controller defaults to
+    # instance mode, which requires NodePort/LoadBalancer Services.
+    alb.ingress.kubernetes.io/target-type: {{ .Values.argocdServerIngress.targetType | quote }}
+{{- end }}
+spec:
+  ingressClassName: {{ .Values.argocdServerIngress.ingressClassName | default "alb" }}
+  rules:
+    - host: {{ .Values.argocdServerIngress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ .Values.argocdServerIngress.serviceName | default "argocd-server" }}
+                port:
+                  number: {{ .Values.argocdServerIngress.servicePort | default 443 }}
+{{- end }}

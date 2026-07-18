@@ -525,6 +525,29 @@ jobs:
           echo "Helm manifest (ECR token sync resources) for release ${ARGOCD_RELEASE_NAME}:"
           helm get manifest "${ARGOCD_RELEASE_NAME}" -n "${ARGOCD_NAMESPACE}" | grep -n "argocd-ecr-token-sync" -A10 -B10 || true
 
+          echo ""
+          ARGOCD_INGRESS_ENABLED="false"
+          if grep -A1 '^argocdServerIngress:' "$VALUES_FILE" | grep -q 'enabled: true'; then
+            ARGOCD_INGRESS_ENABLED="true"
+          fi
+
+          if [ "$ARGOCD_INGRESS_ENABLED" = "true" ]; then
+            echo "argocdServerIngress.enabled is true in ${VALUES_FILE}. Verifying the Argo CD server Ingress..."
+            echo ""
+            echo "Ingress:"
+            kubectl get ingress argocd-server-ingress -n "${ARGOCD_NAMESPACE}"
+
+            echo ""
+            echo "Ingress details:"
+            kubectl describe ingress argocd-server-ingress -n "${ARGOCD_NAMESPACE}"
+
+            echo ""
+            echo "Ingress (wide):"
+            kubectl get ingress argocd-server-ingress -n "${ARGOCD_NAMESPACE}" -o wide
+          else
+            echo "argocdServerIngress.enabled is not true in ${VALUES_FILE}. Skipping Argo CD server Ingress verification."
+          fi
+
       - name: Upload rendered manifests and chart package
         if: always()
         uses: actions/upload-artifact@v4

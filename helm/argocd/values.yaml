@@ -26,3 +26,10 @@ argo-cd: {}
 # registry, and image details in their own values.yaml overlay.
 ecrTokenSync:
   enabled: false
+
+# Disabled by default here (this is a structural toggle, not an
+# environment-specific value). Environments that need to expose the Argo CD
+# UI through the shared internal ALB turn this on and supply the hostname,
+# ALB group, and certificate details in their own values.yaml overlay.
+argocdServerIngress:
+  enabled: false

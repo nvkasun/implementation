@@ -91,3 +91,26 @@ ecrTokenSync:
     # Always (not IfNotPresent): this tag was just re-mirrored/replaced in
     # ECR, so nodes must not reuse a stale cached image under the same tag.
     pullPolicy: Always
+
+# Exposes the Argo CD UI through the same shared internal ALB and wildcard
+# DNS (*.goldengate-dev.adcbmis.local) as GoldenGate's own ingress
+# (envs/dev/payments-ora-to-pg-*/values.yaml). listenPorts/certificateArn
+# match that working ingress exactly: the resident ALB already terminates
+# HTTPS on 443 with this ACM certificate, so a joining Ingress must declare
+# the same listener and certificate rather than relying on per-Ingress
+# host-based ACM discovery (see helm/goldengate/templates/ingress.yaml).
+argocdServerIngress:
+  enabled: true
+  ingressClassName: alb
+  host: argocd.goldengate-dev.adcbmis.local
+  serviceName: argocd-server
+  servicePort: 443
+  groupName: gg-poc-dev-alb
+  groupOrder: "50"
+  targetType: ip
+  backendProtocol: HTTPS
+  listenPorts: '[{"HTTPS":443}]'
+  certificateArn: arn:aws:acm:eu-west-1:668311715351:certificate/0a2ab950-8d20-456c-b43f-a3987f7d1841
+  healthcheckProtocol: HTTPS
+  healthcheckPath: /healthz
+  healthcheckPort: traffic-port
