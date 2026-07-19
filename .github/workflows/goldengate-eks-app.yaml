@@ -771,7 +771,7 @@ jobs:
 
           echo "persistence.enabled=true and provider=efs in ${VALUES_FILE}. Checking rendered manifest: ${RENDERED}"
 
-          EFS_FILESYSTEM_ID="$(grep -E '^\s*fileSystemId:' "$VALUES_FILE" | head -1 | sed -E 's/^\s*fileSystemId:\s*//' | tr -d '"'"'"'' | xargs)"
+          EFS_FILESYSTEM_ID="$(grep -E '^\s*fileSystemId:' "$VALUES_FILE" | head -1 | sed -E 's/^\s*fileSystemId:\s*//' | tr -d '"'"'"'\r' | xargs)"
 
           if [ -z "$EFS_FILESYSTEM_ID" ]; then
             echo "persistence.efs.fileSystemId not found in ${VALUES_FILE}. Cannot validate the rendered StorageClass."
@@ -779,8 +779,30 @@ jobs:
           fi
 
           STORAGE_CLASS_NAME="gg-efs-${ENVIRONMENT}-${DEPLOYMENT_ID}"
-          SOURCE_PVC_NAME="gg-${ENVIRONMENT}-${DEPLOYMENT_ID}-source-u02"
-          TARGET_PVC_NAME="gg-${ENVIRONMENT}-${DEPLOYMENT_ID}-target-u02"
+
+          # PVC claim names and the EFS basePath are read from the values
+          # file rather than re-derived from ENVIRONMENT/DEPLOYMENT_ID: EFS
+          # enforces a 100-character access point path limit (basePath +
+          # PVC name + a unique suffix), so deployments intentionally set
+          # short, explicit claimName/basePath overrides instead of using
+          # the long environment-deploymentId-based generated defaults.
+          SOURCE_BLOCK="$(awk '/^source:/{flag=1} flag{print} /^[a-zA-Z]/{if(flag && !/^source:/) exit}' "$VALUES_FILE")"
+          TARGET_BLOCK="$(awk '/^target:/{flag=1} flag{print} /^[a-zA-Z]/{if(flag && !/^target:/) exit}' "$VALUES_FILE")"
+
+          SOURCE_PVC_NAME="$(echo "$SOURCE_BLOCK" | grep -E '^\s*claimName:' | head -1 | sed -E 's/^\s*claimName:\s*//' | tr -d '"'"'"'\r' | xargs)"
+          TARGET_PVC_NAME="$(echo "$TARGET_BLOCK" | grep -E '^\s*claimName:' | head -1 | sed -E 's/^\s*claimName:\s*//' | tr -d '"'"'"'\r' | xargs)"
+
+          if [ -z "$SOURCE_PVC_NAME" ] || [ -z "$TARGET_PVC_NAME" ]; then
+            echo "source.storage.u02.claimName or target.storage.u02.claimName not found in ${VALUES_FILE}. Cannot validate the rendered PVCs."
+            exit 1
+          fi
+
+          EFS_BASE_PATH="$(grep -E '^\s*basePath:' "$VALUES_FILE" | head -1 | sed -E 's/^\s*basePath:\s*//' | tr -d '"'"'"'\r' | xargs)"
+
+          if [ -z "$EFS_BASE_PATH" ]; then
+            echo "persistence.efs.storageClass.basePath not found in ${VALUES_FILE}. Cannot validate the rendered StorageClass."
+            exit 1
+          fi
 
           echo "Checking StorageClass ${STORAGE_CLASS_NAME}..."
           grep -q "kind: StorageClass" "$RENDERED"
@@ -788,13 +810,17 @@ jobs:
           grep -q "provisioner: efs.csi.aws.com" "$RENDERED"
           grep -q "provisioningMode: efs-ap" "$RENDERED"
           grep -q "fileSystemId: \"${EFS_FILESYSTEM_ID}\"" "$RENDERED"
+          grep -q "basePath: \"${EFS_BASE_PATH}\"" "$RENDERED"
+          grep -q 'subPathPattern: "\${.PVC.name}"' "$RENDERED"
+          grep -q 'ensureUniqueDirectory: "true"' "$RENDERED"
+          grep -q "reclaimPolicy: Retain" "$RENDERED"
 
           echo "Checking PersistentVolumeClaims ${SOURCE_PVC_NAME} / ${TARGET_PVC_NAME}..."
           grep -q "kind: PersistentVolumeClaim" "$RENDERED"
           grep -q "name: ${SOURCE_PVC_NAME}" "$RENDERED"
           grep -q "name: ${TARGET_PVC_NAME}" "$RENDERED"
 
-          echo "Checking StatefulSet volumes (u02 must use persistentVolumeClaim, u03 must stay emptyDir)..."
+          echo "Checking StatefulSet volumes (u02 must use persistentVolumeClaim with the expected claimName, u03 must stay emptyDir)..."
 
           # Isolate each StatefulSet's own rendered document so the u02/u03
           # check is unambiguous -- a plain grep across the whole manifest
@@ -804,9 +830,11 @@ jobs:
           TARGET_STS="$(awk '/^# Source: .*target-statefulset\.yaml$/{flag=1} flag{print} /^---$/{if(flag) exit}' "$RENDERED")"
 
           echo "$SOURCE_STS" | grep -A1 "^        - name: u02" | grep -q "persistentVolumeClaim:"
+          echo "$SOURCE_STS" | grep -q "claimName: ${SOURCE_PVC_NAME}"
           echo "$SOURCE_STS" | grep -A1 "^        - name: u03" | grep -q "emptyDir: {}"
 
           echo "$TARGET_STS" | grep -A1 "^        - name: u02" | grep -q "persistentVolumeClaim:"
+          echo "$TARGET_STS" | grep -q "claimName: ${TARGET_PVC_NAME}"
           echo "$TARGET_STS" | grep -A1 "^        - name: u03" | grep -q "emptyDir: {}"
 
           echo "OK: EFS StorageClass, source/target PVCs, and StatefulSet u02/u03 volumes all match the expected persistence configuration."

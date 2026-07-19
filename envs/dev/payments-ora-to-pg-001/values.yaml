@@ -77,12 +77,17 @@ source:
       metrics: 9015
 
   # Phase 1: /u02 is EFS-backed (persistent trails/checkpoints/config/logs).
-  # /u03 stays emptyDir for now.
+  # /u03 stays emptyDir for now. claimName is intentionally short: EFS CSI
+  # appends a unique suffix to the access point path built from basePath +
+  # this PVC name, and EFS enforces a 100-character path limit. The PVC is
+  # namespaced (gg-dev-payments-ora-to-pg-001), so a short name is safe --
+  # the deployment identity is already carried by the namespace and by
+  # persistence.efs.storageClass.basePath below, not by the PVC name.
   storage:
     u02:
       type: efs
       existingClaim: ""
-      claimName: gg-dev-payments-ora-to-pg-001-source-u02
+      claimName: src-u02
       size: 20Gi
       accessModes:
         - ReadWriteMany
@@ -183,12 +188,14 @@ target:
       metrics: 9015
 
   # Phase 1: /u02 is EFS-backed (persistent trails/checkpoints/config/logs).
-  # /u03 stays emptyDir for now.
+  # /u03 stays emptyDir for now. claimName is intentionally short (see the
+  # matching comment under source.storage.u02) to stay under EFS's
+  # 100-character access point path limit.
   storage:
     u02:
       type: efs
       existingClaim: ""
-      claimName: gg-dev-payments-ora-to-pg-001-target-u02
+      claimName: tgt-u02
       size: 20Gi
       accessModes:
         - ReadWriteMany
@@ -260,6 +267,12 @@ affinity: {}
 # EFS filesystem gg-poc-dev-efs already exists outside Helm -- only its ID is
 # consumed here. EFS CSI dynamic provisioning creates per-PVC access points
 # under basePath (see helm/goldengate/templates/efs-storageclass.yaml).
+# basePath is short (/payments-ora-to-pg-001, not /goldengate/dev/...): EFS
+# CSI appends a unique suffix to basePath + PVC name to build the access
+# point root path, and EFS enforces a 100-character path limit -- the
+# deployment is still uniquely identified by this basePath (and by the
+# gg-dev-payments-ora-to-pg-001 namespace the PVCs live in), so the extra
+# /goldengate/dev/ prefix was redundant, not identity-bearing.
 # reclaimPolicy: Retain is intentional: GoldenGate storage holds trail/
 # checkpoint/recovery state, so deleting this deployment (Application +
 # namespace) must not automatically destroy EFS data/access points. EFS
@@ -275,7 +288,7 @@ persistence:
       reclaimPolicy: Retain
       volumeBindingMode: Immediate
       directoryPerms: "0777"
-      basePath: /goldengate/dev/payments-ora-to-pg-001
+      basePath: /payments-ora-to-pg-001
       subPathPattern: "${.PVC.name}"
       ensureUniqueDirectory: "true"
       mountOptions:

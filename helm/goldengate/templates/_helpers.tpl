@@ -84,11 +84,22 @@ app.kubernetes.io/component: target
 {{- end }}
 {{- end }}
 
+{{- /*
+EFS enforces a 100-character path limit on the access point root path,
+which EFS CSI builds from storageClass.basePath + "/" + PVC name +
+"-" + a unique suffix (ensureUniqueDirectory). basePath and the PVC name
+are the only two segments the chart controls, so both default to short
+forms: the deployment is still uniquely identified by basePath (scoped
+per deploymentId) and, for the PVC name, by the namespace the PVC lives
+in -- PVC names are namespaced, so "src-u02"/"tgt-u02" is safe and does
+not collide across deployments/namespaces.
+*/ -}}
+
 {{- define "goldengate.efsBasePath" -}}
 {{- if .Values.persistence.efs.storageClass.basePath }}
 {{- .Values.persistence.efs.storageClass.basePath -}}
 {{- else }}
-{{- printf "/goldengate/%s/%s" .Values.global.environment .Values.global.deploymentId -}}
+{{- printf "/%s" .Values.global.deploymentId -}}
 {{- end }}
 {{- end }}
 
@@ -96,7 +107,7 @@ app.kubernetes.io/component: target
 {{- if .Values.source.storage.u02.claimName }}
 {{- .Values.source.storage.u02.claimName | trunc 63 | trimSuffix "-" -}}
 {{- else }}
-{{- printf "gg-%s-%s-source-u02" .Values.global.environment .Values.global.deploymentId | trunc 63 | trimSuffix "-" -}}
+{{- "src-u02" -}}
 {{- end }}
 {{- end }}
 
@@ -104,6 +115,6 @@ app.kubernetes.io/component: target
 {{- if .Values.target.storage.u02.claimName }}
 {{- .Values.target.storage.u02.claimName | trunc 63 | trimSuffix "-" -}}
 {{- else }}
-{{- printf "gg-%s-%s-target-u02" .Values.global.environment .Values.global.deploymentId | trunc 63 | trimSuffix "-" -}}
+{{- "tgt-u02" -}}
 {{- end }}
 {{- end }}
