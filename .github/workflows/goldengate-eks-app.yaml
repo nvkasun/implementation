@@ -549,6 +549,26 @@ jobs:
 
           echo "Rendered manifest: rendered/${RELEASE_NAME}.yaml"
 
+      - name: Validate GoldenGate namespace is rendered
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RENDERED="rendered/${RELEASE_NAME}.yaml"
+
+          echo "Checking rendered manifest for the GoldenGate Namespace: ${RENDERED}"
+
+          # Fails before package/push/deploy if helm/goldengate/templates/namespace.yaml
+          # is missing, misconfigured, or the ownership labels don't match this
+          # deployment -- the namespace is now an Argo CD-managed resource, so it
+          # must render correctly for cleanup to work on deletion.
+          grep -q "kind: Namespace" "$RENDERED"
+          grep -q "name: ${TARGET_NAMESPACE}" "$RENDERED"
+          grep -q "goldengate.adcb/deployment-id: \"${DEPLOYMENT_ID}\"" "$RENDERED"
+          grep -q "goldengate.adcb/environment: \"${ENVIRONMENT}\"" "$RENDERED"
+
+          echo "OK: Namespace ${TARGET_NAMESPACE} is present in the rendered manifest with the expected ownership labels."
+
       - name: Package deployment-specific Helm chart
         shell: bash
         run: |
@@ -1101,6 +1121,44 @@ jobs:
             echo "Argo CD Application ${ARGOCD_APP_NAME} not found in namespace ${ARGOCD_NAMESPACE}. Nothing to delete."
           fi
 
+      - name: Clean up remaining GoldenGate namespace if still present
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # CreateNamespace=true only guarantees the namespace exists for
+          # sync -- it is not a guaranteed cleanup mechanism on Application
+          # deletion. This is a guarded fallback: it only deletes the
+          # namespace when it still exists AND carries exactly the
+          # ownership labels this deployment would have set, so it can
+          # never touch a namespace it doesn't unambiguously own.
+          if kubectl get namespace "$TARGET_NAMESPACE" >/dev/null 2>&1; then
+            echo "Namespace ${TARGET_NAMESPACE} still exists after Argo CD Application deletion. Verifying ownership labels before cleanup..."
+
+            APP_NAME_LABEL="$(kubectl get namespace "$TARGET_NAMESPACE" -o jsonpath='{.metadata.labels.app\.kubernetes\.io/name}' 2>/dev/null || true)"
+            MANAGED_BY_LABEL="$(kubectl get namespace "$TARGET_NAMESPACE" -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}' 2>/dev/null || true)"
+            ENV_LABEL="$(kubectl get namespace "$TARGET_NAMESPACE" -o jsonpath='{.metadata.labels.goldengate\.adcb/environment}' 2>/dev/null || true)"
+            DEPLOYMENT_LABEL="$(kubectl get namespace "$TARGET_NAMESPACE" -o jsonpath='{.metadata.labels.goldengate\.adcb/deployment-id}' 2>/dev/null || true)"
+
+            if [ "$APP_NAME_LABEL" = "goldengate" ] &&
+               [ "$MANAGED_BY_LABEL" = "argocd" ] &&
+               [ "$ENV_LABEL" = "$ENVIRONMENT" ] &&
+               [ "$DEPLOYMENT_LABEL" = "$DEPLOYMENT_ID" ]; then
+              echo "Namespace labels match expected GoldenGate ownership. Deleting namespace ${TARGET_NAMESPACE}..."
+              kubectl delete namespace "$TARGET_NAMESPACE" --wait=true --timeout=10m
+            else
+              echo "Namespace ${TARGET_NAMESPACE} still exists but ownership labels do not match expected values."
+              echo "app.kubernetes.io/name=${APP_NAME_LABEL}"
+              echo "app.kubernetes.io/managed-by=${MANAGED_BY_LABEL}"
+              echo "goldengate.adcb/environment=${ENV_LABEL}"
+              echo "goldengate.adcb/deployment-id=${DEPLOYMENT_LABEL}"
+              echo "Refusing to delete namespace automatically."
+              exit 1
+            fi
+          else
+            echo "Namespace ${TARGET_NAMESPACE} already removed."
+          fi
+
       - name: Workflow summary
         if: always()
         shell: bash
@@ -1114,8 +1172,7 @@ jobs:
             echo "- Target namespace: \`${TARGET_NAMESPACE}\`"
             echo "- Delete requested: \`true\`"
             echo ""
-            echo "Argo CD cascade deletion is used: deleting the Application (with the"
-            echo "resources-finalizer) removes it from Argo CD and prunes every Kubernetes"
-            echo "resource it manages, including the target namespace since it was created"
-            echo "via CreateNamespace=true."
+            echo "Argo CD cascade deletion removes the Application-managed resources. The"
+            echo "workflow also performs a guarded namespace cleanup only when the remaining"
+            echo "namespace has the expected GoldenGate ownership labels."
           } >> "$GITHUB_STEP_SUMMARY"
