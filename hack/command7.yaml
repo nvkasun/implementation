@@ -1,98 +1,26 @@
-Now start clean and run only these commands.
+Hi Paleri,
 
-Step 1 — Go to your certificate folder
-cd "/h/Kasun/Jira-Task/3.Goldengate/Lates-cert-whildcard"
-Step 2 — Clean and recreate ACM import folder
-rm -rf acm-import
-mkdir -p acm-import
-Step 3 — Set file names
-CERT_FILE="goldengate-dev.adcbmis.local.cer"
-P7B_FILE="goldengate-dev.adcbmis.local.p7b"
-KEY_FILE="goldengate-dev.key"
-Step 4 — Convert server certificate to PEM
-openssl x509 -in "$CERT_FILE" -out acm-import/server-cert.pem -outform PEM
+I have completed the GoldenGate DNS configuration as well. You can access the Argo CD console using the below URL:
 
-Verify SAN:
+https://argocd.goldengate-dev.adcbmis.local
 
-openssl x509 -in acm-import/server-cert.pem -noout -subject -issuer -dates -ext subjectAltName
+The CI/CD implementation is also completed. Whenever we make any changes to the main branch, the GitHub Actions workflow will automatically detect the changes, build the Helm OCI package, and push it to Amazon ECR. Argo CD will then continuously monitor the latest version and deploy the changes to the EKS cluster.
 
-You should see:
+Below are the URLs for the current Oracle-to-PostgreSQL GoldenGate deployment:
 
-DNS:goldengate-dev.adcbmis.local
-DNS:*.goldengate-dev.adcbmis.local
-Step 5 — Prepare private key for ACM
-openssl pkey -in "$KEY_FILE" -out acm-import/private-key.pem
-Step 6 — Verify certificate and key match
-openssl x509 -in acm-import/server-cert.pem -pubkey -noout | openssl pkey -pubin -outform DER | openssl dgst -sha256
-openssl pkey -in acm-import/private-key.pem -pubout -outform DER | openssl dgst -sha256
+Oracle GoldenGate Source Portal
+https://ogg-oracle-payments-ora-to-pg-001.goldengate-dev.adcbmis.local
 
-Both SHA256 values must be same.
+PostgreSQL GoldenGate Target Portal
+https://ogg-postgresql-payments-ora-to-pg-001.goldengate-dev.adcbmis.local
 
-In your previous output, they already matched, so this part is good. ✅
+The next development phase will focus on the GoldenGate runtime configuration, including:
 
-Step 7 — Extract certificates from .p7b
-
-This is the correct command for your .p7b file:
-
-openssl pkcs7 -inform DER -in "$P7B_FILE" -print_certs -out acm-import/all-certs-from-p7b.pem
-Step 8 — Split extracted certificates
-awk 'BEGIN{n=0; file=""} /-----BEGIN CERTIFICATE-----/{n++; file=sprintf("acm-import/cert-%02d.pem",n)} file!=""{print > file} /-----END CERTIFICATE-----/{file=""}' acm-import/all-certs-from-p7b.pem
-Step 9 — Confirm certificate order
-for f in acm-import/cert-*.pem; do
-  echo "===== $f ====="
-  openssl x509 -in "$f" -noout -subject -issuer
-done
-
-Based on your output, it should be:
-
-cert-01.pem = CN=goldengate-dev.adcbmis.local
-cert-02.pem = CN=ADCB SUBCA01
-cert-03.pem = CN=ADCB ROOTCA
-Step 10 — Create certificate chain for AWS ACM
-
-Use intermediate first, then root:
-
-cat acm-import/cert-02.pem acm-import/cert-03.pem > acm-import/certificate-chain.pem
-
-Verify:
-
-openssl x509 -in acm-import/cert-02.pem -noout -subject -issuer
-openssl x509 -in acm-import/cert-03.pem -noout -subject -issuer
-Step 11 — Copy/paste into AWS ACM
-Certificate body
-cat acm-import/server-cert.pem | clip
-
-Paste into AWS field:
-
-Certificate body
-Certificate private key
-cat acm-import/private-key.pem | clip
-
-Paste into AWS field:
-
-Certificate private key
-Certificate chain
-cat acm-import/certificate-chain.pem | clip
-
-Paste into AWS field:
-
-Certificate chain
-
-Then click:
-
-Reimport certificate
-Important final check
-
-Do not paste this file anywhere in ACM:
-
-goldengate-dev-wildcard.csr
-
-CSR is finished now. AWS needs only:
-
-server-cert.pem
-private-key.pem
-certificate-chain.pem
-
-Broo, your correct chain is definitely:
-
-cat acm-import/cert-02.pem acm-import/cert-03.pem > acm-import/certificate-chain.pem
+Oracle source and PostgreSQL target database connectivity
+GoldenGate database credential configuration
+Extract and local trail creation
+Distribution path configuration
+Receiver and remote trail validation
+Replicat configuration
+End-to-end Oracle-to-PostgreSQL replication testing
+Recovery, monitoring, and rollback validation
