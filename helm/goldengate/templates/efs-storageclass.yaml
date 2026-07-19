@@ -1,0 +1,28 @@
+{{- if and .Values.persistence.enabled (eq .Values.persistence.provider "efs") .Values.persistence.efs.storageClass.create (or (eq .Values.source.storage.u02.type "efs") (eq .Values.target.storage.u02.type "efs")) }}
+{{- if not .Values.persistence.efs.fileSystemId }}
+{{- fail "persistence.efs.fileSystemId is required when persistence.enabled=true and persistence.provider=efs. The EFS filesystem must already exist -- this chart only consumes its ID, it never creates the filesystem." }}
+{{- end }}
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ include "goldengate.efsStorageClassName" . }}
+  labels:
+    app.kubernetes.io/name: goldengate
+    app.kubernetes.io/managed-by: argocd
+    goldengate.adcb/environment: {{ .Values.global.environment | quote }}
+    goldengate.adcb/deployment-id: {{ .Values.global.deploymentId | quote }}
+provisioner: efs.csi.aws.com
+parameters:
+  provisioningMode: efs-ap
+  fileSystemId: {{ .Values.persistence.efs.fileSystemId | quote }}
+  directoryPerms: {{ .Values.persistence.efs.storageClass.directoryPerms | default "0777" | quote }}
+  basePath: {{ include "goldengate.efsBasePath" . | quote }}
+  subPathPattern: {{ .Values.persistence.efs.storageClass.subPathPattern | default "${.PVC.name}" | quote }}
+  ensureUniqueDirectory: {{ .Values.persistence.efs.storageClass.ensureUniqueDirectory | default "true" | quote }}
+reclaimPolicy: {{ .Values.persistence.efs.storageClass.reclaimPolicy | default "Retain" }}
+volumeBindingMode: {{ .Values.persistence.efs.storageClass.volumeBindingMode | default "Immediate" }}
+{{- with .Values.persistence.efs.storageClass.mountOptions }}
+mountOptions:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end }}

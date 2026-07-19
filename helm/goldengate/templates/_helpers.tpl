@@ -75,3 +75,35 @@ app.kubernetes.io/name: {{ include "goldengate.targetName" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/component: target
 {{- end }}
+
+{{- define "goldengate.efsStorageClassName" -}}
+{{- if .Values.persistence.efs.storageClass.name }}
+{{- .Values.persistence.efs.storageClass.name | trunc 63 | trimSuffix "-" -}}
+{{- else }}
+{{- printf "gg-efs-%s-%s" .Values.global.environment .Values.global.deploymentId | trunc 63 | trimSuffix "-" -}}
+{{- end }}
+{{- end }}
+
+{{- define "goldengate.efsBasePath" -}}
+{{- if .Values.persistence.efs.storageClass.basePath }}
+{{- .Values.persistence.efs.storageClass.basePath -}}
+{{- else }}
+{{- printf "/goldengate/%s/%s" .Values.global.environment .Values.global.deploymentId -}}
+{{- end }}
+{{- end }}
+
+{{- define "goldengate.sourceU02PVCName" -}}
+{{- if .Values.source.storage.u02.claimName }}
+{{- .Values.source.storage.u02.claimName | trunc 63 | trimSuffix "-" -}}
+{{- else }}
+{{- printf "gg-%s-%s-source-u02" .Values.global.environment .Values.global.deploymentId | trunc 63 | trimSuffix "-" -}}
+{{- end }}
+{{- end }}
+
+{{- define "goldengate.targetU02PVCName" -}}
+{{- if .Values.target.storage.u02.claimName }}
+{{- .Values.target.storage.u02.claimName | trunc 63 | trimSuffix "-" -}}
+{{- else }}
+{{- printf "gg-%s-%s-target-u02" .Values.global.environment .Values.global.deploymentId | trunc 63 | trimSuffix "-" -}}
+{{- end }}
+{{- end }}

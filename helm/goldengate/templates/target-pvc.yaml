@@ -1,0 +1,20 @@
+{{- if and .Values.target.enabled .Values.persistence.enabled (eq .Values.persistence.provider "efs") (eq .Values.target.storage.u02.type "efs") (not .Values.target.storage.u02.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "goldengate.targetU02PVCName" . }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    app.kubernetes.io/name: goldengate
+    app.kubernetes.io/managed-by: argocd
+    app.kubernetes.io/component: target
+    goldengate.adcb/environment: {{ .Values.global.environment | quote }}
+    goldengate.adcb/deployment-id: {{ .Values.global.deploymentId | quote }}
+spec:
+  accessModes:
+    {{- toYaml .Values.target.storage.u02.accessModes | nindent 4 }}
+  storageClassName: {{ include "goldengate.efsStorageClassName" . }}
+  resources:
+    requests:
+      storage: {{ .Values.target.storage.u02.size }}
+{{- end }}

@@ -1,6 +1,6 @@
 global:
   environment: dev
-  deploymentId: payments-ora-to-pg-003
+  deploymentId: payments-ora-to-pg-001
 
 source:
   enabled: true
@@ -17,7 +17,7 @@ source:
 
   ogg:
     deploymentName: OracleSource
-    domain: ogg-oracle.gg-dev-payments-ora-to-pg-003.svc.cluster.local
+    domain: ogg-oracle.gg-dev-payments-ora-to-pg-001.svc.cluster.local
     secureDeployment: false
 
   admin:
@@ -33,7 +33,7 @@ source:
     admin:
       # NOTE: dev/goldengate/source/admin is a shared POC secret reused across all
       # payments-ora-to-pg-* deployments. Production should move to one admin
-      # secret per deployment, e.g. dev/goldengate/source/payments-ora-to-pg-003/admin.
+      # secret per deployment, e.g. dev/goldengate/source/payments-ora-to-pg-001/admin.
       enabled: true
       providerClassName: ogg-oracle-admin
       secretName: ogg-oracle-admin
@@ -76,10 +76,16 @@ source:
       dist: 9013
       metrics: 9015
 
+  # Phase 1: /u02 is EFS-backed (persistent trails/checkpoints/config/logs).
+  # /u03 stays emptyDir for now.
   storage:
     u02:
-      type: emptyDir
+      type: efs
       existingClaim: ""
+      claimName: gg-dev-payments-ora-to-pg-001-source-u02
+      size: 20Gi
+      accessModes:
+        - ReadWriteMany
     u03:
       type: emptyDir
 
@@ -117,7 +123,7 @@ target:
 
   ogg:
     deploymentName: PostgresqlTarget
-    domain: ogg-postgresql.gg-dev-payments-ora-to-pg-003.svc.cluster.local
+    domain: ogg-postgresql.gg-dev-payments-ora-to-pg-001.svc.cluster.local
     secureDeployment: false
 
   admin:
@@ -133,7 +139,7 @@ target:
     admin:
       # NOTE: dev/goldengate/target/admin is a shared POC secret reused across
       # all payments-ora-to-pg-* target deployments. Production should move to one
-      # admin secret per deployment, e.g. dev/goldengate/target/payments-ora-to-pg-003/admin.
+      # admin secret per deployment, e.g. dev/goldengate/target/payments-ora-to-pg-001/admin.
       enabled: true
       providerClassName: ogg-postgresql-admin
       secretName: ogg-postgresql-admin
@@ -176,10 +182,16 @@ target:
       receiver: 9014
       metrics: 9015
 
+  # Phase 1: /u02 is EFS-backed (persistent trails/checkpoints/config/logs).
+  # /u03 stays emptyDir for now.
   storage:
     u02:
-      type: emptyDir
+      type: efs
       existingClaim: ""
+      claimName: gg-dev-payments-ora-to-pg-001-target-u02
+      size: 20Gi
+      accessModes:
+        - ReadWriteMany
     u03:
       type: emptyDir
 
@@ -208,8 +220,8 @@ ingress:
   className: alb
 
   hosts:
-    source: ogg-oracle-payments-ora-to-pg-003.goldengate-dev.adcbmis.local
-    target: ogg-postgresql-payments-ora-to-pg-003.goldengate-dev.adcbmis.local
+    source: ogg-oracle-payments-ora-to-pg-001.goldengate-dev.adcbmis.local
+    target: ogg-postgresql-payments-ora-to-pg-001.goldengate-dev.adcbmis.local
 
   alb:
     groupName: gg-poc-dev-alb
@@ -244,3 +256,27 @@ nodeSelector: {}
 tolerations: []
 
 affinity: {}
+
+# EFS filesystem gg-poc-dev-efs already exists outside Helm -- only its ID is
+# consumed here. EFS CSI dynamic provisioning creates per-PVC access points
+# under basePath (see helm/goldengate/templates/efs-storageclass.yaml).
+# reclaimPolicy: Retain is intentional: GoldenGate storage holds trail/
+# checkpoint/recovery state, so deleting this deployment (Application +
+# namespace) must not automatically destroy EFS data/access points. EFS
+# cleanup remains a separate, deliberate operation outside this workflow.
+persistence:
+  enabled: true
+  provider: efs
+  efs:
+    fileSystemId: fs-05cadf3570f23cd39
+    storageClass:
+      create: true
+      name: gg-efs-dev-payments-ora-to-pg-001
+      reclaimPolicy: Retain
+      volumeBindingMode: Immediate
+      directoryPerms: "0777"
+      basePath: /goldengate/dev/payments-ora-to-pg-001
+      subPathPattern: "${.PVC.name}"
+      ensureUniqueDirectory: "true"
+      mountOptions:
+        - tls

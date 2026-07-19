@@ -751,6 +751,66 @@ jobs:
 
           echo "OK: Namespace ${TARGET_NAMESPACE} is present in the rendered manifest with the expected ownership labels."
 
+      - name: Validate EFS persistence resources are rendered
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RENDERED="rendered/${RELEASE_NAME}.yaml"
+
+          PERSISTENCE_EFS_ENABLED="false"
+          if grep -A2 '^persistence:' "$VALUES_FILE" | grep -q 'enabled: true' \
+            && grep -A2 '^persistence:' "$VALUES_FILE" | grep -q 'provider: efs'; then
+            PERSISTENCE_EFS_ENABLED="true"
+          fi
+
+          if [ "$PERSISTENCE_EFS_ENABLED" != "true" ]; then
+            echo "persistence.enabled/provider=efs not set in ${VALUES_FILE}. Skipping EFS persistence render checks."
+            exit 0
+          fi
+
+          echo "persistence.enabled=true and provider=efs in ${VALUES_FILE}. Checking rendered manifest: ${RENDERED}"
+
+          EFS_FILESYSTEM_ID="$(grep -E '^\s*fileSystemId:' "$VALUES_FILE" | head -1 | sed -E 's/^\s*fileSystemId:\s*//' | tr -d '"'"'"'' | xargs)"
+
+          if [ -z "$EFS_FILESYSTEM_ID" ]; then
+            echo "persistence.efs.fileSystemId not found in ${VALUES_FILE}. Cannot validate the rendered StorageClass."
+            exit 1
+          fi
+
+          STORAGE_CLASS_NAME="gg-efs-${ENVIRONMENT}-${DEPLOYMENT_ID}"
+          SOURCE_PVC_NAME="gg-${ENVIRONMENT}-${DEPLOYMENT_ID}-source-u02"
+          TARGET_PVC_NAME="gg-${ENVIRONMENT}-${DEPLOYMENT_ID}-target-u02"
+
+          echo "Checking StorageClass ${STORAGE_CLASS_NAME}..."
+          grep -q "kind: StorageClass" "$RENDERED"
+          grep -q "name: ${STORAGE_CLASS_NAME}" "$RENDERED"
+          grep -q "provisioner: efs.csi.aws.com" "$RENDERED"
+          grep -q "provisioningMode: efs-ap" "$RENDERED"
+          grep -q "fileSystemId: \"${EFS_FILESYSTEM_ID}\"" "$RENDERED"
+
+          echo "Checking PersistentVolumeClaims ${SOURCE_PVC_NAME} / ${TARGET_PVC_NAME}..."
+          grep -q "kind: PersistentVolumeClaim" "$RENDERED"
+          grep -q "name: ${SOURCE_PVC_NAME}" "$RENDERED"
+          grep -q "name: ${TARGET_PVC_NAME}" "$RENDERED"
+
+          echo "Checking StatefulSet volumes (u02 must use persistentVolumeClaim, u03 must stay emptyDir)..."
+
+          # Isolate each StatefulSet's own rendered document so the u02/u03
+          # check is unambiguous -- a plain grep across the whole manifest
+          # can't tell the source StatefulSet's volumes apart from the
+          # target StatefulSet's.
+          SOURCE_STS="$(awk '/^# Source: .*source-statefulset\.yaml$/{flag=1} flag{print} /^---$/{if(flag) exit}' "$RENDERED")"
+          TARGET_STS="$(awk '/^# Source: .*target-statefulset\.yaml$/{flag=1} flag{print} /^---$/{if(flag) exit}' "$RENDERED")"
+
+          echo "$SOURCE_STS" | grep -A1 "^        - name: u02" | grep -q "persistentVolumeClaim:"
+          echo "$SOURCE_STS" | grep -A1 "^        - name: u03" | grep -q "emptyDir: {}"
+
+          echo "$TARGET_STS" | grep -A1 "^        - name: u02" | grep -q "persistentVolumeClaim:"
+          echo "$TARGET_STS" | grep -A1 "^        - name: u03" | grep -q "emptyDir: {}"
+
+          echo "OK: EFS StorageClass, source/target PVCs, and StatefulSet u02/u03 volumes all match the expected persistence configuration."
+
       - name: Package deployment-specific Helm chart
         shell: bash
         run: |
@@ -1087,6 +1147,21 @@ jobs:
           echo ""
           echo "PVCs:"
           kubectl get pvc -n "$TARGET_NAMESPACE" || true
+
+          echo ""
+          echo "EFS StorageClass for this deployment:"
+          # Not fatal: grep exits non-zero if no line matches, but that's a
+          # meaningful "not found" signal here, not a script failure.
+          kubectl get storageclass | grep "gg-efs-${ENVIRONMENT}-${DEPLOYMENT_ID}" || true
+
+          echo ""
+          echo "PersistentVolumes (cluster-scoped; PV output may not show namespace"
+          echo "depending on -o format, so this is informational, not filtered):"
+          kubectl get pv || true
+
+          echo ""
+          echo "PVC details:"
+          kubectl describe pvc -n "$TARGET_NAMESPACE" || true
 
       - name: Upload rendered manifests and chart package
         if: always()

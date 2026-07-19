@@ -194,11 +194,24 @@ spec:
 
       volumes:
         - name: u02
-{{- if and (eq .Values.source.storage.u02.type "existingClaim") .Values.source.storage.u02.existingClaim }}
+{{- if eq .Values.source.storage.u02.type "efs" }}
+{{- if .Values.source.storage.u02.existingClaim }}
           persistentVolumeClaim:
             claimName: {{ .Values.source.storage.u02.existingClaim }}
 {{- else }}
+          persistentVolumeClaim:
+            claimName: {{ include "goldengate.sourceU02PVCName" . }}
+{{- end }}
+{{- else if eq .Values.source.storage.u02.type "existingClaim" }}
+{{- if not .Values.source.storage.u02.existingClaim }}
+{{- fail "source.storage.u02.existingClaim is required when source.storage.u02.type=existingClaim." }}
+{{- end }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.source.storage.u02.existingClaim }}
+{{- else if eq .Values.source.storage.u02.type "emptyDir" }}
           emptyDir: {}
+{{- else }}
+{{- fail (printf "source.storage.u02.type must be one of emptyDir, existingClaim, efs -- got %q" .Values.source.storage.u02.type) }}
 {{- end }}
 
         - name: u03

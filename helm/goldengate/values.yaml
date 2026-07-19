@@ -5,6 +5,29 @@ global:
 nameOverride: ""
 fullnameOverride: ""
 
+# Phase 1 EFS-backed persistence for /u02 (trails, checkpoints, parameter
+# files, config, recovery artifacts). Disabled by default so the chart
+# remains safe (emptyDir) unless a deployment opts in. The EFS filesystem
+# itself is provisioned outside this chart -- only its ID is consumed here
+# (see persistence.efs.fileSystemId), and the StorageClass uses EFS CSI
+# dynamic provisioning to create per-PVC access points under basePath.
+persistence:
+  enabled: false
+  provider: efs
+  efs:
+    fileSystemId: ""
+    storageClass:
+      create: false
+      name: ""
+      reclaimPolicy: Retain
+      volumeBindingMode: Immediate
+      directoryPerms: "0777"
+      basePath: ""
+      subPathPattern: "${.PVC.name}"
+      ensureUniqueDirectory: "true"
+      mountOptions:
+        - tls
+
 imagePullSecrets: []
 
 podSecurityContext: {}
@@ -83,10 +106,15 @@ source:
       dist: 9013
       metrics: 9015
 
+  # Supported storage.u02.type values: emptyDir, existingClaim, efs.
   storage:
     u02:
       type: emptyDir
       existingClaim: ""
+      claimName: ""
+      size: 20Gi
+      accessModes:
+        - ReadWriteMany
     u03:
       type: emptyDir
 
@@ -181,10 +209,15 @@ target:
       receiver: 9014
       metrics: 9015
 
+  # Supported storage.u02.type values: emptyDir, existingClaim, efs.
   storage:
     u02:
       type: emptyDir
       existingClaim: ""
+      claimName: ""
+      size: 20Gi
+      accessModes:
+        - ReadWriteMany
     u03:
       type: emptyDir
 
