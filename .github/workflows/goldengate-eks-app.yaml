@@ -89,12 +89,156 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Returns 0 (active) or 1 (inactive) on stdout as a one-line
+          # reason, for a given envs/dev/<id>/values.yaml path. A deployment
+          # is inactive if: the file is missing, empty, comment-only, parses
+          # to null/empty YAML, or explicitly disables itself via
+          # enabled: false, deployment.enabled: false, or
+          # lifecycle.state: absent. Prefers PyYAML (safe, full parse) and
+          # falls back to conservative text patterns only if PyYAML isn't
+          # installed on the runner -- never installs anything.
+          is_active_deployment_values_file() {
+            local values_file="$1"
+
+            if [ ! -f "$values_file" ]; then
+              echo "missing values.yaml"
+              return 1
+            fi
+
+            if [ ! -s "$values_file" ]; then
+              echo "empty values.yaml"
+              return 1
+            fi
+
+            if command -v python3 >/dev/null 2>&1; then
+              python3 - "$values_file" <<'PYEOF'
+          import re
+          import sys
+
+          path = sys.argv[1]
+
+          with open(path, "r") as f:
+              raw = f.read()
+
+          non_comment_lines = [
+              line for line in raw.splitlines()
+              if line.strip() and not line.strip().startswith("#")
+          ]
+          if not non_comment_lines:
+              print("empty/comment-only values.yaml")
+              sys.exit(1)
+
+          try:
+              import yaml
+          except ImportError:
+              # Conservative fallback without PyYAML: only recognizes the three
+              # documented disable-flag shapes, not arbitrary YAML nesting.
+              if re.search(r'(?m)^\s*enabled\s*:\s*false\s*$', raw):
+                  print("enabled=false (text fallback, PyYAML unavailable)")
+                  sys.exit(1)
+              if re.search(r'(?ms)^deployment\s*:\s*\n(?:[ \t]+\S.*\n?)*?[ \t]+enabled\s*:\s*false\s*$', raw):
+                  print("deployment.enabled=false (text fallback, PyYAML unavailable)")
+                  sys.exit(1)
+              if re.search(r'(?ms)^lifecycle\s*:\s*\n(?:[ \t]+\S.*\n?)*?[ \t]+state\s*:\s*["\']?absent["\']?\s*$', raw):
+                  print("lifecycle.state=absent (text fallback, PyYAML unavailable)")
+                  sys.exit(1)
+              print("active (text fallback, PyYAML unavailable)")
+              sys.exit(0)
+
+          try:
+              data = yaml.safe_load(raw)
+          except yaml.YAMLError as exc:
+              print(f"unparsable YAML: {exc}")
+              sys.exit(1)
+
+          if not data:
+              print("empty/null parsed YAML")
+              sys.exit(1)
+
+          if not isinstance(data, dict):
+              print("parsed YAML is not a mapping")
+              sys.exit(1)
+
+          if data.get("enabled") is False:
+              print("enabled=false")
+              sys.exit(1)
+
+          deployment = data.get("deployment")
+          if isinstance(deployment, dict) and deployment.get("enabled") is False:
+              print("deployment.enabled=false")
+              sys.exit(1)
+
+          lifecycle = data.get("lifecycle")
+          if isinstance(lifecycle, dict) and lifecycle.get("state") == "absent":
+              print("lifecycle.state=absent")
+              sys.exit(1)
+
+          print("active")
+          sys.exit(0)
+          PYEOF
+              return $?
+            fi
+
+            echo "python3 not available on this runner, using conservative bash fallback"
+
+            local non_comment
+            non_comment="$(grep -vE '^[[:space:]]*(#.*)?$' "$values_file" || true)"
+            if [ -z "$non_comment" ]; then
+              echo "empty/comment-only values.yaml (bash fallback)"
+              return 1
+            fi
+
+            if grep -Eq '^enabled[[:space:]]*:[[:space:]]*false[[:space:]]*$' "$values_file"; then
+              echo "enabled=false (bash fallback)"
+              return 1
+            fi
+
+            if awk '
+              /^deployment:[[:space:]]*$/ { in_block=1; next }
+              in_block && /^[[:space:]]+enabled:[[:space:]]*false[[:space:]]*$/ { found=1; exit }
+              in_block && /^[^[:space:]]/ { in_block=0 }
+              END { exit !found }
+            ' "$values_file"; then
+              echo "deployment.enabled=false (bash fallback)"
+              return 1
+            fi
+
+            if awk '
+              /^lifecycle:[[:space:]]*$/ { in_block=1; next }
+              in_block && /^[[:space:]]+state:[[:space:]]*"?absent"?[[:space:]]*$/ { found=1; exit }
+              in_block && /^[^[:space:]]/ { in_block=0 }
+              END { exit !found }
+            ' "$values_file"; then
+              echo "lifecycle.state=absent (bash fallback)"
+              return 1
+            fi
+
+            echo "active (bash fallback, python3 unavailable)"
+            return 0
+          }
+
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             ENVIRONMENT="${{ inputs.environment }}"
             DEPLOYMENT_ID="${{ inputs.deployment_id }}"
             DEPLOY="${{ inputs.deploy }}"
+            VALUES_FILE="envs/${ENVIRONMENT}/${DEPLOYMENT_ID}/values.yaml"
 
-            echo "Manual workflow_dispatch trigger. Building single-item matrix."
+            echo "Manual workflow_dispatch trigger for deployment_id=${DEPLOYMENT_ID}, environment=${ENVIRONMENT}."
+            echo "Validating deployment values file: ${VALUES_FILE}"
+
+            set +e
+            REASON="$(is_active_deployment_values_file "$VALUES_FILE")"
+            STATUS=$?
+            set -e
+
+            if [ "$STATUS" -ne 0 ]; then
+              echo "Deployment values file check failed: ${REASON}"
+              echo ""
+              echo "Deployment values file is missing or inactive. Use Git deletion/disable flow for cleanup, or restore active values before manual deploy."
+              exit 1
+            fi
+
+            echo "Deployment values file is active (${REASON}). Building single-item matrix."
 
             MATRIX_JSON="$(jq -nc \
               --arg environment "$ENVIRONMENT" \
@@ -134,52 +278,51 @@ jobs:
 
           echo "Chart changed: ${CHART_CHANGED}"
 
+          DEPLOYMENT_MATRIX_ITEMS="[]"
+          DELETION_MATRIX_ITEMS="[]"
+          ACTIVE_LOG=""
+          INACTIVE_LOG=""
+
           # envs/dev/argocd/ holds Argo CD's own values file, deployed by the
           # separate argocd-eks-deployment.yaml workflow. It is never a
           # GoldenGate deployment and must be excluded here.
           if [ "$CHART_CHANGED" = "true" ]; then
             echo "Shared GoldenGate Helm chart changed. Selecting all active dev deployments."
 
-            DEPLOYMENT_IDS="$(find envs/dev -mindepth 2 -maxdepth 2 -name values.yaml -not -path 'envs/dev/argocd/*' \
+            DEPLOYMENT_CANDIDATE_IDS="$(find envs/dev -mindepth 2 -maxdepth 2 -name values.yaml -not -path 'envs/dev/argocd/*' \
               | sed -E 's#^envs/dev/([^/]+)/values\.yaml$#\1#' \
               | sort -u || true)"
           else
             echo "Only envs/dev/ changed. Selecting changed deployment folders."
 
-            DEPLOYMENT_IDS="$(echo "$CHANGED_FILES" \
+            DEPLOYMENT_CANDIDATE_IDS="$(echo "$CHANGED_FILES" \
               | grep -E '^envs/dev/[^/]+/' \
               | grep -v '^envs/dev/argocd/' \
               | sed -E 's#^envs/dev/([^/]+)/.*#\1#' \
               | sort -u || true)"
           fi
 
-          MATRIX_ITEMS="[]"
-          for DEPLOYMENT_ID in $DEPLOYMENT_IDS; do
-            if [ -f "envs/dev/${DEPLOYMENT_ID}/values.yaml" ]; then
-              echo "Detected deployment: ${DEPLOYMENT_ID}"
-              MATRIX_ITEMS="$(echo "$MATRIX_ITEMS" | jq -c \
+          for DEPLOYMENT_ID in $DEPLOYMENT_CANDIDATE_IDS; do
+            VALUES_FILE="envs/dev/${DEPLOYMENT_ID}/values.yaml"
+
+            set +e
+            REASON="$(is_active_deployment_values_file "$VALUES_FILE")"
+            STATUS=$?
+            set -e
+
+            if [ "$STATUS" -eq 0 ]; then
+              echo "Active: ${DEPLOYMENT_ID} (${REASON})"
+              ACTIVE_LOG="${ACTIVE_LOG}  - ${DEPLOYMENT_ID} (${REASON})\n"
+              DEPLOYMENT_MATRIX_ITEMS="$(echo "$DEPLOYMENT_MATRIX_ITEMS" | jq -c \
                 --arg deployment_id "$DEPLOYMENT_ID" \
                 '. + [{environment: "dev", deployment_id: $deployment_id, deploy: true}]')"
             else
-              echo "Skipping ${DEPLOYMENT_ID}: no envs/dev/${DEPLOYMENT_ID}/values.yaml found."
+              echo "Not active: ${DEPLOYMENT_ID} (${REASON}) -- skipping build/update for this candidate."
             fi
           done
 
-          MATRIX_COUNT="$(echo "$MATRIX_ITEMS" | jq 'length')"
-
-          if [ "$MATRIX_COUNT" -eq 0 ]; then
-            echo "No valid deployment folders with a values.yaml were found. Nothing to deploy."
-            echo "has_changes=false" >> "$GITHUB_OUTPUT"
-            echo "deployment_matrix=[]" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_changes=true" >> "$GITHUB_OUTPUT"
-            echo "deployment_matrix=${MATRIX_ITEMS}" >> "$GITHUB_OUTPUT"
-          fi
-
-          echo "Matrix: ${MATRIX_ITEMS}"
-
           echo ""
-          echo "Detecting deleted deployment folders under envs/dev/..."
+          echo "Detecting deleted or newly-inactive deployment folders under envs/dev/..."
 
           NAME_STATUS="$(git diff --name-status "$BEFORE_SHA" "$AFTER_SHA" -- 'envs/dev/**' 'helm/goldengate/**' || true)"
 
@@ -189,42 +332,81 @@ jobs:
           # A path is a deletion candidate when it was removed (D) or is the
           # old side of a rename (R). Only envs/dev/<id>/ paths matter here;
           # helm/goldengate/** changes never produce a deployment deletion.
-          DELETION_CANDIDATE_IDS="$(echo "$NAME_STATUS" \
+          REMOVED_PATH_IDS="$(echo "$NAME_STATUS" \
             | awk '$1 ~ /^D/ { print $2 } $1 ~ /^R/ { print $2 }' \
             | grep -E '^envs/dev/[^/]+/' \
             | grep -v '^envs/dev/argocd/' \
             | sed -E 's#^envs/dev/([^/]+)/.*#\1#' \
             | sort -u || true)"
 
-          DELETION_IDS=""
+          # Deployments whose values.yaml itself changed (added/modified) in
+          # this push must be re-checked too: the file can still exist but
+          # have just become comment-only/empty/disabled.
+          CHANGED_VALUES_IDS="$(echo "$CHANGED_FILES" \
+            | grep -E '^envs/dev/[^/]+/values\.yaml$' \
+            | grep -v '^envs/dev/argocd/' \
+            | sed -E 's#^envs/dev/([^/]+)/values\.yaml$#\1#' \
+            | sort -u || true)"
+
+          DELETION_CANDIDATE_IDS="$(printf '%s\n%s\n' "$REMOVED_PATH_IDS" "$CHANGED_VALUES_IDS" | sed '/^$/d' | sort -u || true)"
+
           for CANDIDATE_ID in $DELETION_CANDIDATE_IDS; do
-            if [ ! -f "envs/dev/${CANDIDATE_ID}/values.yaml" ]; then
-              echo "Detected deleted deployment: ${CANDIDATE_ID}"
-              DELETION_IDS="${DELETION_IDS} ${CANDIDATE_ID}"
+            VALUES_FILE="envs/dev/${CANDIDATE_ID}/values.yaml"
+
+            set +e
+            REASON="$(is_active_deployment_values_file "$VALUES_FILE")"
+            STATUS=$?
+            set -e
+
+            if [ "$STATUS" -ne 0 ]; then
+              echo "Inactive/deleted: ${CANDIDATE_ID} (${REASON})"
+              INACTIVE_LOG="${INACTIVE_LOG}  - ${CANDIDATE_ID} (${REASON})\n"
+              DELETION_MATRIX_ITEMS="$(echo "$DELETION_MATRIX_ITEMS" | jq -c \
+                --arg deployment_id "$CANDIDATE_ID" \
+                '. + [{environment: "dev", deployment_id: $deployment_id}]')"
             else
-              echo "Not a deletion: envs/dev/${CANDIDATE_ID}/values.yaml still exists at HEAD."
+              echo "Still active: ${CANDIDATE_ID} (${REASON}) -- not a deletion."
             fi
           done
 
-          DELETION_ITEMS="[]"
-          for DEPLOYMENT_ID in $DELETION_IDS; do
-            DELETION_ITEMS="$(echo "$DELETION_ITEMS" | jq -c \
-              --arg deployment_id "$DEPLOYMENT_ID" \
-              '. + [{environment: "dev", deployment_id: $deployment_id}]')"
-          done
+          # Deletion wins: drop any ID from the deployment matrix that also
+          # ended up in the deletion matrix (e.g. a deployment that changed
+          # to inactive content in the same push helm/goldengate/** changed).
+          DEPLOYMENT_MATRIX_ITEMS="$(echo "$DEPLOYMENT_MATRIX_ITEMS" | jq -c \
+            --argjson deletions "$DELETION_MATRIX_ITEMS" \
+            '[ .[] | select(.deployment_id as $id | ($deletions | map(.deployment_id) | index($id)) == null) ]')"
 
-          DELETION_COUNT="$(echo "$DELETION_ITEMS" | jq 'length')"
+          echo ""
+          echo "Active deployment IDs selected for build/update:"
+          echo -e "${ACTIVE_LOG:-  <none>}"
+
+          echo "Inactive/deleted deployment IDs selected for deletion:"
+          echo -e "${INACTIVE_LOG:-  <none>}"
+
+          MATRIX_COUNT="$(echo "$DEPLOYMENT_MATRIX_ITEMS" | jq 'length')"
+
+          if [ "$MATRIX_COUNT" -eq 0 ]; then
+            echo "No active deployment folders selected for build/update."
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "deployment_matrix=[]" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "deployment_matrix=${DEPLOYMENT_MATRIX_ITEMS}" >> "$GITHUB_OUTPUT"
+          fi
+
+          DELETION_COUNT="$(echo "$DELETION_MATRIX_ITEMS" | jq 'length')"
 
           if [ "$DELETION_COUNT" -eq 0 ]; then
-            echo "No deleted deployment folders detected."
+            echo "No inactive/deleted deployment folders detected."
             echo "has_deletions=false" >> "$GITHUB_OUTPUT"
             echo "deletion_matrix=[]" >> "$GITHUB_OUTPUT"
           else
             echo "has_deletions=true" >> "$GITHUB_OUTPUT"
-            echo "deletion_matrix=${DELETION_ITEMS}" >> "$GITHUB_OUTPUT"
+            echo "deletion_matrix=${DELETION_MATRIX_ITEMS}" >> "$GITHUB_OUTPUT"
           fi
 
-          echo "Deletion matrix: ${DELETION_ITEMS}"
+          echo "Deployment matrix: ${DEPLOYMENT_MATRIX_ITEMS}"
+          echo "Deletion matrix: ${DELETION_MATRIX_ITEMS}"
 
   build_publish_and_deploy:
     name: Build, publish, and deploy GoldenGate Helm chart via Argo CD
@@ -969,6 +1151,12 @@ jobs:
             echo "GitHub Actions ensures the helm/goldengate ECR repository policy grants that"
             echo "role pull access on every run, but is not the long-term source of Argo CD's"
             echo "ECR credentials."
+            echo ""
+            echo "A deployment can be removed either by deleting its folder/values.yaml or by"
+            echo "making values.yaml inactive using comment-only/empty content or an explicit"
+            echo "disable flag. Inactive values files are treated as deployment removals. A"
+            echo "values.yaml is inactive when it is missing, empty/comment-only, enabled=false,"
+            echo "deployment.enabled=false, or lifecycle.state=absent."
             echo ""
             echo "### Validation commands"
             echo ""
