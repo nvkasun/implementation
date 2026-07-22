@@ -53,3 +53,22 @@ module "goldengate_monitor_read_role_dev" {
   data_classification  = "General"
   env                  = "dev"
 }
+
+
+module "goldengate_argocd_ecr_read_role_dev" {
+  source = "git::https://github.com/AbuDhabiCommercialBank/aws-tf-module-iam-role.git?ref=v2.0.0"
+
+  name          = "GoldenGateArgocdECRRead-dev"
+  description   = "IRSA role used by the Argo CD ECR token sync CronJob to refresh private GoldenGate Helm OCI repository credentials"
+  policy_folder = "argocd-ecr-oci-read-dev"
+
+  managed_policy_arns = []
+
+  map_migrated         = "comm5TZY31HX9S"
+  business_criticality = "Low"
+  application_name     = "CloudFactory"
+  cost_center          = "219"
+  business_unit        = "TechnologyPlatform"
+  data_classification  = "General"
+  env                  = "dev"
+}
