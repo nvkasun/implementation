@@ -19,6 +19,30 @@
         "kms:Decrypt"
       ],
       "Resource": "*"
+    },
+    {
+      "Sid": "AllowWriteGoldenGateMonitoringState",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:DescribeTable"
+      ],
+      "Resource": "arn:aws:dynamodb:eu-west-1:668311715351:table/gg-eks-pipeline"
+    },
+    {
+      "Sid": "AllowPublishGoldenGateMonitoringMetrics",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:PutMetricData"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "cloudwatch:namespace": "GoldenGate/Pipelines"
+        }
+      }
     }
   ]
 }

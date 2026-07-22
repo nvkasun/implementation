@@ -34,3 +34,22 @@ module "goldengate_secrets_read_role_dev" {
   data_classification  = "General"
   env                  = "dev"
 }
+
+
+module "goldengate_monitor_read_role_dev" {
+  source = "git::https://github.com/AbuDhabiCommercialBank/aws-tf-module-iam-role.git?ref=v2.0.0"
+
+  name          = "GoldenGateMonitorReadRole-dev"
+  description   = "Read-only IRSA role for the shared GoldenGate monitoring portal to query GoldenGate deployment state from DynamoDB"
+  policy_folder = "goldengate-monitor-read-dev"
+
+  managed_policy_arns = []
+
+  map_migrated         = "comm5TZY31HX9S"
+  business_criticality = "Low"
+  application_name     = "CloudFactory"
+  cost_center          = "219"
+  business_unit        = "TechnologyPlatform"
+  data_classification  = "General"
+  env                  = "dev"
+}
