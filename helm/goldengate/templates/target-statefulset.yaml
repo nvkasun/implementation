@@ -187,6 +187,10 @@ spec:
         {{- toYaml . | nindent 8 }}
 {{- end }}
 
+{{- if .Values.monitoring.observer.enabled }}
+        {{- include "goldengate.observerContainer" (dict "root" $ "component" "target") | nindent 8 }}
+{{- end }}
+
       volumes:
         - name: u02
 {{- if eq .Values.target.storage.u02.type "efs" }}

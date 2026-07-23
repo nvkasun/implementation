@@ -251,6 +251,15 @@ monitoring:
   labels:
     enabled: true
 
+  # Observer image repository/tag are intentionally NOT set here -- the
+  # GoldenGate GitHub Actions workflow injects the content-addressed
+  # repository/tag at Helm lint/render/Argo CD time via
+  # --set-string monitoring.observer.image.repository/tag (and the matching
+  # Argo CD Application Helm parameters), so this file never needs updating
+  # when the observer image changes.
+  observer:
+    enabled: true
+
 podSecurityContext: {}
 
 securityContext:
