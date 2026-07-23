@@ -1280,10 +1280,9 @@ jobs:
 
           # The rendered manifest is authoritative: no Python/PyYAML is used
           # here. A component's StatefulSet either rendered or it didn't
-          # (component disabled), and it either contains goldengate-observer
-          # or it doesn't (observer disabled) -- both are derived directly
-          # from the manifest text, so this never silently no-ops when
-          # PyYAML happens to be missing on the runner.
+          # (component disabled) -- derived directly from the manifest text,
+          # so this never silently no-ops when PyYAML happens to be missing
+          # on the runner.
           SOURCE_STS="$(awk '/^# Source: .*source-statefulset\.yaml$/{flag=1} flag{print} /^---$/{if(flag) exit}' "$RENDERED")"
           TARGET_STS="$(awk '/^# Source: .*target-statefulset\.yaml$/{flag=1} flag{print} /^---$/{if(flag) exit}' "$RENDERED")"
 
@@ -1293,13 +1292,60 @@ jobs:
           TARGET_ENABLED="false"
           [ -n "$TARGET_STS" ] && TARGET_ENABLED="true"
 
-          # Isolate just the goldengate-observer container's own YAML block:
-          # from its "- name: goldengate-observer" line up to (not including)
-          # the next sibling container ("        - name:") or the pod-level
-          # "volumes:" section -- both are 6/8-space-indented, so this never
-          # bleeds into the main container or the Pod's volumes: list (which
-          # legitimately references ogg-admin-csi/ogg-nginx-cert-csi for the
-          # main container and would otherwise cause false-positive matches).
+          echo "SOURCE_ENABLED=${SOURCE_ENABLED}" >> "$GITHUB_ENV"
+          echo "TARGET_ENABLED=${TARGET_ENABLED}" >> "$GITHUB_ENV"
+
+          if [ "$SOURCE_ENABLED" != "true" ] && [ "$TARGET_ENABLED" != "true" ]; then
+            echo "FAIL: neither source nor target is enabled for this deployment -- there is no rendered StatefulSet to carry the goldengate.adcb/observer-enabled annotation, so the effective observer expectation cannot be verified."
+            exit 1
+          fi
+
+          # OBSERVER_EXPECTED comes from the rendered goldengate.adcb/observer-enabled
+          # pod-template annotation (set directly from .Values.monitoring.observer.enabled
+          # in both source-statefulset.yaml and target-statefulset.yaml), NOT from
+          # whether an observer container happens to be present. This is what catches a
+          # chart defect that silently omits the sidecar despite the flag being true --
+          # the previous container-presence-only check would have reported
+          # OBSERVER_ENABLED=false and skipped validation in exactly that case.
+          extract_observer_annotation() {
+            grep -o 'goldengate\.adcb/observer-enabled: "[a-z]*"' | head -1 | sed -E 's/.*: "([a-z]*)"/\1/'
+          }
+
+          SOURCE_OBSERVER_ANNOTATION=""
+          [ "$SOURCE_ENABLED" = "true" ] && SOURCE_OBSERVER_ANNOTATION="$(echo "$SOURCE_STS" | extract_observer_annotation)"
+
+          TARGET_OBSERVER_ANNOTATION=""
+          [ "$TARGET_ENABLED" = "true" ] && TARGET_OBSERVER_ANNOTATION="$(echo "$TARGET_STS" | extract_observer_annotation)"
+
+          OBSERVER_EXPECTED=""
+          if [ -n "$SOURCE_OBSERVER_ANNOTATION" ]; then
+            OBSERVER_EXPECTED="$SOURCE_OBSERVER_ANNOTATION"
+          fi
+          if [ -n "$TARGET_OBSERVER_ANNOTATION" ]; then
+            if [ -n "$OBSERVER_EXPECTED" ] && [ "$OBSERVER_EXPECTED" != "$TARGET_OBSERVER_ANNOTATION" ]; then
+              echo "FAIL: inconsistent goldengate.adcb/observer-enabled annotation -- source=${SOURCE_OBSERVER_ANNOTATION}, target=${TARGET_OBSERVER_ANNOTATION}. Both derive from the same monitoring.observer.enabled value and must agree."
+              exit 1
+            fi
+            OBSERVER_EXPECTED="$TARGET_OBSERVER_ANNOTATION"
+          fi
+
+          if [ -z "$OBSERVER_EXPECTED" ]; then
+            echo "FAIL: could not find the goldengate.adcb/observer-enabled annotation on any rendered, enabled StatefulSet."
+            exit 1
+          fi
+
+          echo "OBSERVER_EXPECTED=${OBSERVER_EXPECTED}" >> "$GITHUB_ENV"
+          echo "Effective observer expectation (from rendered goldengate.adcb/observer-enabled annotation): ${OBSERVER_EXPECTED}"
+
+          # Actual observer-container presence is derived independently of
+          # OBSERVER_EXPECTED, by isolating just the goldengate-observer
+          # container's own YAML block: from its "- name: goldengate-observer"
+          # line up to (not including) the next sibling container
+          # ("        - name:") or the pod-level "volumes:" section -- both
+          # are 6/8-space-indented, so this never bleeds into the main
+          # container or the Pod's volumes: list (which legitimately
+          # references ogg-admin-csi/ogg-nginx-cert-csi for the main
+          # container and would otherwise cause false-positive matches).
           extract_observer_block() {
             awk '
               capture && /^        - name:/ && $0 !~ /goldengate-observer/ { exit }
@@ -1310,51 +1356,47 @@ jobs:
           }
 
           SOURCE_OBSERVER_BLOCK=""
-          SOURCE_OBSERVER_ENABLED="false"
+          SOURCE_OBSERVER_PRESENT="false"
           if [ "$SOURCE_ENABLED" = "true" ]; then
             SOURCE_OBSERVER_BLOCK="$(echo "$SOURCE_STS" | extract_observer_block)"
-            [ -n "$SOURCE_OBSERVER_BLOCK" ] && SOURCE_OBSERVER_ENABLED="true"
+            [ -n "$SOURCE_OBSERVER_BLOCK" ] && SOURCE_OBSERVER_PRESENT="true"
           fi
 
           TARGET_OBSERVER_BLOCK=""
-          TARGET_OBSERVER_ENABLED="false"
+          TARGET_OBSERVER_PRESENT="false"
           if [ "$TARGET_ENABLED" = "true" ]; then
             TARGET_OBSERVER_BLOCK="$(echo "$TARGET_STS" | extract_observer_block)"
-            [ -n "$TARGET_OBSERVER_BLOCK" ] && TARGET_OBSERVER_ENABLED="true"
+            [ -n "$TARGET_OBSERVER_BLOCK" ] && TARGET_OBSERVER_PRESENT="true"
           fi
 
-          OBSERVER_ENABLED="false"
-          if [ "$SOURCE_OBSERVER_ENABLED" = "true" ] || [ "$TARGET_OBSERVER_ENABLED" = "true" ]; then
-            OBSERVER_ENABLED="true"
-          fi
+          echo "SOURCE_OBSERVER_ENABLED=${SOURCE_OBSERVER_PRESENT}" >> "$GITHUB_ENV"
+          echo "TARGET_OBSERVER_ENABLED=${TARGET_OBSERVER_PRESENT}" >> "$GITHUB_ENV"
 
-          echo "SOURCE_ENABLED=${SOURCE_ENABLED}" >> "$GITHUB_ENV"
-          echo "TARGET_ENABLED=${TARGET_ENABLED}" >> "$GITHUB_ENV"
-          echo "SOURCE_OBSERVER_ENABLED=${SOURCE_OBSERVER_ENABLED}" >> "$GITHUB_ENV"
-          echo "TARGET_OBSERVER_ENABLED=${TARGET_OBSERVER_ENABLED}" >> "$GITHUB_ENV"
-          echo "OBSERVER_ENABLED=${OBSERVER_ENABLED}" >> "$GITHUB_ENV"
+          echo "Source StatefulSet rendered: ${SOURCE_ENABLED} (observer container present: ${SOURCE_OBSERVER_PRESENT})"
+          echo "Target StatefulSet rendered: ${TARGET_ENABLED} (observer container present: ${TARGET_OBSERVER_PRESENT})"
 
-          echo "Source StatefulSet rendered: ${SOURCE_ENABLED} (observer present: ${SOURCE_OBSERVER_ENABLED})"
-          echo "Target StatefulSet rendered: ${TARGET_ENABLED} (observer present: ${TARGET_OBSERVER_ENABLED})"
+          # Downstream steps (e.g. runtime verification) key off OBSERVER_ENABLED
+          # as the effective expectation, not container presence.
+          echo "OBSERVER_ENABLED=${OBSERVER_EXPECTED}" >> "$GITHUB_ENV"
 
-          if [ "$OBSERVER_ENABLED" != "true" ]; then
-            echo "goldengate-observer is not present in any rendered StatefulSet. Skipping observer render checks."
+          if [ "$OBSERVER_EXPECTED" = "false" ]; then
+            if [ "$SOURCE_OBSERVER_PRESENT" = "true" ] || [ "$TARGET_OBSERVER_PRESENT" = "true" ]; then
+              echo "FAIL: goldengate.adcb/observer-enabled=false, but a goldengate-observer container was rendered anyway."
+              exit 1
+            fi
+            echo "goldengate.adcb/observer-enabled=false and no observer container rendered anywhere, as expected. Skipping observer render checks and runtime verification."
             exit 0
           fi
 
-          echo "goldengate-observer is present in at least one rendered StatefulSet. Validating..."
+          echo "goldengate.adcb/observer-enabled=true. Validating rendered observer containers..."
 
-          # monitoring.observer.enabled is one global flag: if it's on, every
-          # *enabled* component's StatefulSet must render the sidecar. Seeing
-          # it on one enabled component but missing on another enabled one is
-          # a real bug, not a valid partial-enablement state.
-          if [ "$SOURCE_ENABLED" = "true" ] && [ "$SOURCE_OBSERVER_ENABLED" != "true" ]; then
-            echo "FAIL: source is enabled and goldengate-observer is enabled overall, but no goldengate-observer container was found in the rendered source StatefulSet."
+          if [ "$SOURCE_ENABLED" = "true" ] && [ "$SOURCE_OBSERVER_PRESENT" != "true" ]; then
+            echo "FAIL: source is enabled and goldengate.adcb/observer-enabled=true, but no goldengate-observer container was found in the rendered source StatefulSet."
             exit 1
           fi
 
-          if [ "$TARGET_ENABLED" = "true" ] && [ "$TARGET_OBSERVER_ENABLED" != "true" ]; then
-            echo "FAIL: target is enabled and goldengate-observer is enabled overall, but no goldengate-observer container was found in the rendered target StatefulSet."
+          if [ "$TARGET_ENABLED" = "true" ] && [ "$TARGET_OBSERVER_PRESENT" != "true" ]; then
+            echo "FAIL: target is enabled and goldengate.adcb/observer-enabled=true, but no goldengate-observer container was found in the rendered target StatefulSet."
             exit 1
           fi
 
@@ -1924,7 +1966,12 @@ jobs:
               echo "$logs" | grep -q '"event": "dynamodb_update_succeeded"' && have_dynamo=true || true
               echo "$logs" | grep -q '"event": "cloudwatch_publish_succeeded"' && have_cw=true || true
 
-              if [ "$have_started" = "true" ] && [ "$have_completed" = "true" ] && [ "$have_dynamo" = "true" ] && [ "$have_cw" = "true" ]; then
+              # observer_started is informational only (see below) and is
+              # deliberately not part of this break condition -- an existing,
+              # already-healthy pod that this deployment didn't restart has
+              # no reason to log it again inside the --since=10m window, and
+              # that must never make this loop wait out the full timeout.
+              if [ "$have_completed" = "true" ] && [ "$have_dynamo" = "true" ] && [ "$have_cw" = "true" ]; then
                 break
               fi
 
@@ -1932,15 +1979,19 @@ jobs:
               elapsed=$((elapsed + POLL_INTERVAL_SECONDS))
             done
 
-            echo "observer_started seen: ${have_started}"
+            # Informational evidence only: observer_started only logs once,
+            # at process start. A pod that was already Running and healthy
+            # before this workflow run (no pod-template diff, no restart)
+            # legitimately never re-logs it inside the recent window --
+            # that alone must not fail runtime verification.
+            if [ "$have_started" = "true" ]; then
+              echo "INFO: observer_started seen in the recent log window (informational only)."
+            else
+              echo "INFO: observer_started not seen in the recent log window -- expected for an existing pod this run did not restart. Not treated as a failure."
+            fi
             echo "observation_completed seen: ${have_completed}"
             echo "dynamodb_update_succeeded seen: ${have_dynamo}"
             echo "cloudwatch_publish_succeeded seen: ${have_cw}"
-
-            if [ "$have_started" != "true" ]; then
-              echo "FAIL: observer_started never logged within ${MAX_WAIT_SECONDS}s."
-              exit 1
-            fi
 
             if [ "$have_completed" != "true" ]; then
               echo "FAIL: observation_completed never logged within ${MAX_WAIT_SECONDS}s (the observation loop never finished a cycle)."

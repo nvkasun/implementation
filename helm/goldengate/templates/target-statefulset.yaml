@@ -38,6 +38,8 @@ spec:
         {{- include "goldengate.labels" . | nindent 8 }}
         {{- include "goldengate.targetSelectorLabels" . | nindent 8 }}
         app.kubernetes.io/engine: {{ .Values.target.engine | quote }}
+      annotations:
+        goldengate.adcb/observer-enabled: {{ .Values.monitoring.observer.enabled | quote }}
     spec:
       serviceAccountName: {{ include "goldengate.targetServiceAccountName" . }}
 
