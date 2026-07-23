@@ -405,6 +405,29 @@ class HealthServerTests(unittest.TestCase):
         self.assertEqual(body["status"], "starting")
         self.assertIsNone(body["lastCycleAt"])
 
+    def test_startup_hang_eventually_reports_stale_not_starting_forever(self):
+        # Regression test for the fixed startup-ordering bug: if something
+        # hangs after mark_started() but before the first mark_progress()
+        # (e.g. slow/blocked AWS client construction), /healthz must not
+        # stay "starting"/200 indefinitely -- it must eventually flip to
+        # "stale"/503 once the stale threshold elapses.
+        clock = FakeClock()
+        state = observer.HealthState("test-version", stale_threshold_seconds=60, clock=clock)
+        state.mark_started()
+
+        # Still within the grace window: starting.
+        clock.advance(10)
+        body, status_code = state.snapshot()
+        self.assertEqual(status_code, 200)
+        self.assertEqual(body["status"], "starting")
+
+        # No mark_progress() ever happens (simulating a startup hang) --
+        # past the threshold, this must become stale, not stay starting.
+        clock.advance(120)
+        body, status_code = state.snapshot()
+        self.assertEqual(status_code, 503)
+        self.assertEqual(body["status"], "stale")
+
     def test_compute_stale_threshold_has_a_floor(self):
         config = make_config(CHECK_INTERVAL_SECONDS="1", CONNECT_TIMEOUT_SECONDS="1")
         threshold = observer.compute_stale_threshold_seconds(config)

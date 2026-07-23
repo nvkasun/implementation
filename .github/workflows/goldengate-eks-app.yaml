@@ -1275,38 +1275,23 @@ jobs:
 
           RENDERED="rendered/${RELEASE_NAME}.yaml"
 
-          OBSERVER_ENABLED="false"
-          if command -v python3 >/dev/null 2>&1; then
-            if python3 -c "
-          import sys
-          import yaml
-
-          with open('${VALUES_FILE}') as f:
-              data = yaml.safe_load(f) or {}
-
-          observer = ((data.get('monitoring') or {}).get('observer') or {})
-          sys.exit(0 if observer.get('enabled') is True else 1)
-          " 2>/dev/null; then
-              OBSERVER_ENABLED="true"
-            fi
-          elif grep -A1 '^  observer:' "$VALUES_FILE" | grep -q 'enabled: true'; then
-            OBSERVER_ENABLED="true"
-          fi
-
-          echo "OBSERVER_ENABLED=${OBSERVER_ENABLED}" >> "$GITHUB_ENV"
-
-          if [ "$OBSERVER_ENABLED" != "true" ]; then
-            echo "monitoring.observer.enabled is not true in ${VALUES_FILE}. Skipping observer render checks."
-            exit 0
-          fi
-
-          echo "monitoring.observer.enabled=true in ${VALUES_FILE}. Checking rendered manifest: ${RENDERED}"
-
           SOURCE_PIPELINE="gg-${DEPLOYMENT_ID}-source"
           TARGET_PIPELINE="gg-${DEPLOYMENT_ID}-target"
 
+          # The rendered manifest is authoritative: no Python/PyYAML is used
+          # here. A component's StatefulSet either rendered or it didn't
+          # (component disabled), and it either contains goldengate-observer
+          # or it doesn't (observer disabled) -- both are derived directly
+          # from the manifest text, so this never silently no-ops when
+          # PyYAML happens to be missing on the runner.
           SOURCE_STS="$(awk '/^# Source: .*source-statefulset\.yaml$/{flag=1} flag{print} /^---$/{if(flag) exit}' "$RENDERED")"
           TARGET_STS="$(awk '/^# Source: .*target-statefulset\.yaml$/{flag=1} flag{print} /^---$/{if(flag) exit}' "$RENDERED")"
+
+          SOURCE_ENABLED="false"
+          [ -n "$SOURCE_STS" ] && SOURCE_ENABLED="true"
+
+          TARGET_ENABLED="false"
+          [ -n "$TARGET_STS" ] && TARGET_ENABLED="true"
 
           # Isolate just the goldengate-observer container's own YAML block:
           # from its "- name: goldengate-observer" line up to (not including)
@@ -1324,43 +1309,126 @@ jobs:
             '
           }
 
+          SOURCE_OBSERVER_BLOCK=""
+          SOURCE_OBSERVER_ENABLED="false"
+          if [ "$SOURCE_ENABLED" = "true" ]; then
+            SOURCE_OBSERVER_BLOCK="$(echo "$SOURCE_STS" | extract_observer_block)"
+            [ -n "$SOURCE_OBSERVER_BLOCK" ] && SOURCE_OBSERVER_ENABLED="true"
+          fi
+
+          TARGET_OBSERVER_BLOCK=""
+          TARGET_OBSERVER_ENABLED="false"
+          if [ "$TARGET_ENABLED" = "true" ]; then
+            TARGET_OBSERVER_BLOCK="$(echo "$TARGET_STS" | extract_observer_block)"
+            [ -n "$TARGET_OBSERVER_BLOCK" ] && TARGET_OBSERVER_ENABLED="true"
+          fi
+
+          OBSERVER_ENABLED="false"
+          if [ "$SOURCE_OBSERVER_ENABLED" = "true" ] || [ "$TARGET_OBSERVER_ENABLED" = "true" ]; then
+            OBSERVER_ENABLED="true"
+          fi
+
+          echo "SOURCE_ENABLED=${SOURCE_ENABLED}" >> "$GITHUB_ENV"
+          echo "TARGET_ENABLED=${TARGET_ENABLED}" >> "$GITHUB_ENV"
+          echo "SOURCE_OBSERVER_ENABLED=${SOURCE_OBSERVER_ENABLED}" >> "$GITHUB_ENV"
+          echo "TARGET_OBSERVER_ENABLED=${TARGET_OBSERVER_ENABLED}" >> "$GITHUB_ENV"
+          echo "OBSERVER_ENABLED=${OBSERVER_ENABLED}" >> "$GITHUB_ENV"
+
+          echo "Source StatefulSet rendered: ${SOURCE_ENABLED} (observer present: ${SOURCE_OBSERVER_ENABLED})"
+          echo "Target StatefulSet rendered: ${TARGET_ENABLED} (observer present: ${TARGET_OBSERVER_ENABLED})"
+
+          if [ "$OBSERVER_ENABLED" != "true" ]; then
+            echo "goldengate-observer is not present in any rendered StatefulSet. Skipping observer render checks."
+            exit 0
+          fi
+
+          echo "goldengate-observer is present in at least one rendered StatefulSet. Validating..."
+
+          # monitoring.observer.enabled is one global flag: if it's on, every
+          # *enabled* component's StatefulSet must render the sidecar. Seeing
+          # it on one enabled component but missing on another enabled one is
+          # a real bug, not a valid partial-enablement state.
+          if [ "$SOURCE_ENABLED" = "true" ] && [ "$SOURCE_OBSERVER_ENABLED" != "true" ]; then
+            echo "FAIL: source is enabled and goldengate-observer is enabled overall, but no goldengate-observer container was found in the rendered source StatefulSet."
+            exit 1
+          fi
+
+          if [ "$TARGET_ENABLED" = "true" ] && [ "$TARGET_OBSERVER_ENABLED" != "true" ]; then
+            echo "FAIL: target is enabled and goldengate-observer is enabled overall, but no goldengate-observer container was found in the rendered target StatefulSet."
+            exit 1
+          fi
+
+          # Main container names are configurable (source.containerName /
+          # target.containerName); derive them from the deployment values
+          # file with the same plain-text awk/grep technique already used
+          # above in this workflow (see the EFS persistence validation step)
+          # rather than assuming ogg-oracle/ogg-postgresql always apply.
+          SOURCE_VALUES_BLOCK="$(awk '/^source:/{flag=1} flag{print} /^[a-zA-Z]/{if(flag && !/^source:/) exit}' "$VALUES_FILE")"
+          TARGET_VALUES_BLOCK="$(awk '/^target:/{flag=1} flag{print} /^[a-zA-Z]/{if(flag && !/^target:/) exit}' "$VALUES_FILE")"
+
+          SOURCE_MAIN_CONTAINER="$(echo "$SOURCE_VALUES_BLOCK" | grep -E '^\s*containerName:' | head -1 | sed -E 's/^\s*containerName:\s*//' | tr -d '"'"'"'\r' | xargs)"
+          SOURCE_MAIN_CONTAINER="${SOURCE_MAIN_CONTAINER:-ogg-oracle}"
+
+          TARGET_MAIN_CONTAINER="$(echo "$TARGET_VALUES_BLOCK" | grep -E '^\s*containerName:' | head -1 | sed -E 's/^\s*containerName:\s*//' | tr -d '"'"'"'\r' | xargs)"
+          TARGET_MAIN_CONTAINER="${TARGET_MAIN_CONTAINER:-ogg-postgresql}"
+
+          echo "SOURCE_MAIN_CONTAINER=${SOURCE_MAIN_CONTAINER}" >> "$GITHUB_ENV"
+          echo "TARGET_MAIN_CONTAINER=${TARGET_MAIN_CONTAINER}" >> "$GITHUB_ENV"
+
           for LABEL in SOURCE TARGET; do
             if [ "$LABEL" = "SOURCE" ]; then
-              STS="$SOURCE_STS"; COMPONENT="source"; PIPELINE="$SOURCE_PIPELINE"; MAIN_CONTAINER="ogg-oracle"
+              ENABLED="$SOURCE_ENABLED"; STS="$SOURCE_STS"; OBSERVER_BLOCK="$SOURCE_OBSERVER_BLOCK"
+              COMPONENT="source"; PIPELINE="$SOURCE_PIPELINE"; MAIN_CONTAINER="$SOURCE_MAIN_CONTAINER"
             else
-              STS="$TARGET_STS"; COMPONENT="target"; PIPELINE="$TARGET_PIPELINE"; MAIN_CONTAINER="ogg-postgresql"
+              ENABLED="$TARGET_ENABLED"; STS="$TARGET_STS"; OBSERVER_BLOCK="$TARGET_OBSERVER_BLOCK"
+              COMPONENT="target"; PIPELINE="$TARGET_PIPELINE"; MAIN_CONTAINER="$TARGET_MAIN_CONTAINER"
+            fi
+
+            if [ "$ENABLED" != "true" ]; then
+              echo "${LABEL} is not enabled for this deployment (no StatefulSet rendered). Skipping observer checks for ${LABEL}."
+              continue
             fi
 
             echo "Checking ${LABEL} StatefulSet observer container..."
 
-            OBSERVER_BLOCK="$(echo "$STS" | extract_observer_block)"
-
-            if [ -z "$OBSERVER_BLOCK" ]; then
-              echo "goldengate-observer container not found in the rendered ${LABEL} StatefulSet."
+            OBSERVER_COUNT="$(echo "$STS" | grep -c "^        - name: goldengate-observer" || true)"
+            if [ "$OBSERVER_COUNT" -ne 1 ]; then
+              echo "FAIL: expected exactly one goldengate-observer container in the rendered ${LABEL} StatefulSet, found ${OBSERVER_COUNT}."
               exit 1
             fi
 
             echo "$OBSERVER_BLOCK" | grep -q "image: \"${OBSERVER_IMAGE_URI}\""
             echo "$OBSERVER_BLOCK" | grep -q "value: \"${COMPONENT}\""
             echo "$OBSERVER_BLOCK" | grep -q "value: \"${PIPELINE}\""
-            echo "$OBSERVER_BLOCK" | grep -A2 "name: u02" | grep -q "mountPath: /u02"
+
+            # Compare the volume mount against the configured U02_PATH taken
+            # from the container's own rendered env (not a hardcoded /u02),
+            # so this check still means something if u02Path is overridden.
+            CONFIGURED_U02_PATH="$(echo "$OBSERVER_BLOCK" | awk '/name: U02_PATH/{getline; print; exit}' | sed -E 's/^\s*value:\s*//' | tr -d '"'"'"'\r' | xargs)"
+            if [ -z "$CONFIGURED_U02_PATH" ]; then
+              echo "FAIL: could not determine U02_PATH from the rendered ${LABEL} goldengate-observer container env."
+              exit 1
+            fi
+            echo "$OBSERVER_BLOCK" | grep -A2 "name: u02" | grep -q "mountPath: ${CONFIGURED_U02_PATH}"
             echo "$OBSERVER_BLOCK" | grep -A2 "name: u02" | grep -q "readOnly: true"
             echo "$OBSERVER_BLOCK" | grep -q "path: /healthz"
 
             if echo "$OBSERVER_BLOCK" | grep -q "readinessProbe:"; then
-              echo "Unexpected readinessProbe found on the ${LABEL} goldengate-observer container."
+              echo "FAIL: unexpected readinessProbe found on the ${LABEL} goldengate-observer container."
               exit 1
             fi
 
             if echo "$OBSERVER_BLOCK" | grep -q "ogg-admin-csi\|ogg-nginx-cert-csi\|secretKeyRef\|envFrom"; then
-              echo "Unexpected secret/CSI mount found on the ${LABEL} goldengate-observer container."
+              echo "FAIL: unexpected secret/CSI mount found on the ${LABEL} goldengate-observer container."
               exit 1
             fi
 
             echo "$STS" | grep -q "name: ${MAIN_CONTAINER}"
+
+            echo "OK: ${LABEL} goldengate-observer container validated (u02Path=${CONFIGURED_U02_PATH})."
           done
 
-          echo "OK: goldengate-observer is rendered correctly for both source and target, with no secret mounts and no readiness probe."
+          echo "OK: goldengate-observer render validation passed for all enabled components."
 
       - name: Package deployment-specific Helm chart
         shell: bash
@@ -1730,12 +1798,17 @@ jobs:
           echo "CLOUDWATCH_VERIFICATION_STATUS=not_run" >> "$GITHUB_ENV"
 
           if [ "${OBSERVER_ENABLED:-false}" != "true" ]; then
-            echo "monitoring.observer.enabled is not true for this deployment. Skipping observer runtime verification."
+            echo "goldengate-observer is not enabled for this deployment. Skipping observer runtime verification."
             echo "SOURCE_OBSERVER_STATUS=skipped" >> "$GITHUB_ENV"
             echo "TARGET_OBSERVER_STATUS=skipped" >> "$GITHUB_ENV"
             echo "DYNAMODB_VERIFICATION_STATUS=skipped" >> "$GITHUB_ENV"
             echo "CLOUDWATCH_VERIFICATION_STATUS=skipped" >> "$GITHUB_ENV"
             exit 0
+          fi
+
+          if [ "${SOURCE_ENABLED:-false}" != "true" ] && [ "${TARGET_ENABLED:-false}" != "true" ]; then
+            echo "FAIL: observer runtime verification was requested (OBSERVER_ENABLED=true) but neither source nor target is enabled for this deployment -- nothing to verify."
+            exit 1
           fi
 
           # Bounded waits only -- this step never blocks indefinitely, and it
@@ -1819,9 +1892,17 @@ jobs:
               exit 1
             fi
 
-            echo "Checking /healthz inside the observer container..."
+            echo "Checking /healthz inside the observer container (using its own HEALTH_LISTEN_PORT, 8080 as fallback default only)..."
             if ! kubectl exec "$pod" -n "$TARGET_NAMESPACE" -c goldengate-observer -- \
-              python3 -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).status == 200 else 1)"; then
+              python3 -c "
+          import os
+          import sys
+          import urllib.request
+
+          port = os.environ.get('HEALTH_LISTEN_PORT', '8080')
+          url = 'http://127.0.0.1:%s/healthz' % port
+          sys.exit(0 if urllib.request.urlopen(url, timeout=3).status == 200 else 1)
+          "; then
               echo "FAIL: goldengate-observer /healthz did not respond with HTTP 200 inside pod ${pod}."
               exit 1
             fi
@@ -1927,17 +2008,30 @@ jobs:
             echo "OK: ${component} observer verified (DynamoDB record present and CloudWatch publish succeeded)."
           }
 
-          verify_component "source" "ogg-oracle"
-          echo "SOURCE_OBSERVER_STATUS=passed" >> "$GITHUB_ENV"
+          if [ "${SOURCE_ENABLED:-false}" = "true" ]; then
+            verify_component "source" "${SOURCE_MAIN_CONTAINER:-ogg-oracle}"
+            echo "SOURCE_OBSERVER_STATUS=passed" >> "$GITHUB_ENV"
+          else
+            echo "Source is not enabled for this deployment. Not waiting for a source pod."
+            echo "SOURCE_OBSERVER_STATUS=skipped_disabled" >> "$GITHUB_ENV"
+          fi
 
-          verify_component "target" "ogg-postgresql"
-          echo "TARGET_OBSERVER_STATUS=passed" >> "$GITHUB_ENV"
+          if [ "${TARGET_ENABLED:-false}" = "true" ]; then
+            verify_component "target" "${TARGET_MAIN_CONTAINER:-ogg-postgresql}"
+            echo "TARGET_OBSERVER_STATUS=passed" >> "$GITHUB_ENV"
+          else
+            echo "Target is not enabled for this deployment. Not waiting for a target pod."
+            echo "TARGET_OBSERVER_STATUS=skipped_disabled" >> "$GITHUB_ENV"
+          fi
 
+          # Reached only if every enabled component's verify_component call
+          # above succeeded (verify_component exits 1 immediately on any
+          # failure, which stops this script before these lines run).
           echo "DYNAMODB_VERIFICATION_STATUS=passed" >> "$GITHUB_ENV"
           echo "CLOUDWATCH_VERIFICATION_STATUS=passed" >> "$GITHUB_ENV"
 
           echo ""
-          echo "OK: both source and target observers passed runtime verification."
+          echo "OK: all enabled GoldenGate observers passed runtime verification."
           echo ""
           echo "Independent CloudWatch console verification (requires a read-capable identity;"
           echo "the observer role intentionally has PutMetricData only, not CloudWatch read):"

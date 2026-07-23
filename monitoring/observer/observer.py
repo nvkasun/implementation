@@ -625,8 +625,17 @@ def main():
         }))
         sys.exit(1)
 
+    # Ordering matters: HealthState is created and marked started, and the
+    # health server is listening, *before* AWS clients are constructed. If
+    # client construction (or anything else during startup) were to hang,
+    # /healthz must eventually report "stale" rather than staying stuck at
+    # "starting"/200 forever -- that can only happen if the stale-threshold
+    # clock (started by mark_started()) is already running before the
+    # hang-prone work begins.
     stale_threshold_seconds = compute_stale_threshold_seconds(config)
     state = HealthState(config.observer_version, stale_threshold_seconds)
+    state.mark_started()
+
     stop_event = threading.Event()
 
     def _handle_signal(signum, _frame):
@@ -636,11 +645,11 @@ def main():
     signal.signal(signal.SIGINT, _handle_signal)
 
     health_server = start_health_server(config, state)
+
     table = create_dynamodb_table(config)
     cw_client = create_cloudwatch_client(config)
 
     log_event("INFO", "observer_started", config=config)
-    state.mark_started()
 
     while not stop_event.is_set():
         try:

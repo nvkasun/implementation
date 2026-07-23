@@ -69,7 +69,7 @@ container spec is defined exactly once. Call as:
       protocol: TCP
   volumeMounts:
     - name: u02
-      mountPath: /u02
+      mountPath: {{ $observer.u02Path | quote }}
       readOnly: true
   livenessProbe:
     httpGet:
