@@ -92,6 +92,16 @@ def _get_int(env, name, default):
         raise ConfigError(f"{name} must be an integer, got {raw!r}") from None
 
 
+def _validate_port(name, value):
+    if not (1 <= value <= 65535):
+        raise ConfigError(f"{name} must be between 1 and 65535, got {value}")
+
+
+def _validate_positive(name, value):
+    if value <= 0:
+        raise ConfigError(f"{name} must be a positive integer, got {value}")
+
+
 def load_config(env) -> ObserverConfig:
     missing = sorted(name for name in REQUIRED_ENV_VARS if not env.get(name))
     if missing:
@@ -108,6 +118,22 @@ def load_config(env) -> ObserverConfig:
     def opt(name):
         return env.get(name, DEFAULTS[name])
 
+    admin_port = _get_int(env, "ADMIN_PORT", DEFAULTS["ADMIN_PORT"])
+    metrics_port = _get_int(env, "METRICS_PORT", DEFAULTS["METRICS_PORT"])
+    health_listen_port = _get_int(env, "HEALTH_LISTEN_PORT", DEFAULTS["HEALTH_LISTEN_PORT"])
+    check_interval_seconds = _get_int(
+        env, "CHECK_INTERVAL_SECONDS", DEFAULTS["CHECK_INTERVAL_SECONDS"]
+    )
+    connect_timeout_seconds = _get_int(
+        env, "CONNECT_TIMEOUT_SECONDS", DEFAULTS["CONNECT_TIMEOUT_SECONDS"]
+    )
+
+    _validate_port("ADMIN_PORT", admin_port)
+    _validate_port("METRICS_PORT", metrics_port)
+    _validate_port("HEALTH_LISTEN_PORT", health_listen_port)
+    _validate_positive("CHECK_INTERVAL_SECONDS", check_interval_seconds)
+    _validate_positive("CONNECT_TIMEOUT_SECONDS", connect_timeout_seconds)
+
     return ObserverConfig(
         aws_region=env["AWS_REGION"],
         dynamodb_table=env["DYNAMODB_TABLE"],
@@ -118,20 +144,14 @@ def load_config(env) -> ObserverConfig:
         pod_name=env["POD_NAME"],
         pod_namespace=env["POD_NAMESPACE"],
         admin_host=opt("ADMIN_HOST"),
-        admin_port=_get_int(env, "ADMIN_PORT", DEFAULTS["ADMIN_PORT"]),
+        admin_port=admin_port,
         metrics_host=opt("METRICS_HOST"),
-        metrics_port=_get_int(env, "METRICS_PORT", DEFAULTS["METRICS_PORT"]),
+        metrics_port=metrics_port,
         u02_path=opt("U02_PATH"),
-        check_interval_seconds=_get_int(
-            env, "CHECK_INTERVAL_SECONDS", DEFAULTS["CHECK_INTERVAL_SECONDS"]
-        ),
-        connect_timeout_seconds=_get_int(
-            env, "CONNECT_TIMEOUT_SECONDS", DEFAULTS["CONNECT_TIMEOUT_SECONDS"]
-        ),
+        check_interval_seconds=check_interval_seconds,
+        connect_timeout_seconds=connect_timeout_seconds,
         health_listen_host=opt("HEALTH_LISTEN_HOST"),
-        health_listen_port=_get_int(
-            env, "HEALTH_LISTEN_PORT", DEFAULTS["HEALTH_LISTEN_PORT"]
-        ),
+        health_listen_port=health_listen_port,
         cloudwatch_namespace=opt("CLOUDWATCH_NAMESPACE"),
         observer_version=opt("OBSERVER_VERSION"),
     )
@@ -284,22 +304,49 @@ def build_dynamodb_item(
     if u02_stats is not None:
         item["u02TotalBytes"] = u02_stats["totalBytes"]
         item["u02FreeBytes"] = u02_stats["freeBytes"]
-        item["u02UsedPercent"] = u02_stats["usedPercent"]
+        if u02_stats.get("usedPercent") is not None:
+            item["u02UsedPercent"] = u02_stats["usedPercent"]
     return item
 
 
-def update_dynamodb_state(table, item):
+# Attributes that build_dynamodb_item() may have previously set on this
+# record and that must be explicitly REMOVEd once they are no longer valid --
+# otherwise a SET-only UpdateItem leaves stale /u02 numbers behind forever
+# once storage becomes unavailable (or usedPercent becomes uncomputable).
+U02_STAT_ATTRIBUTES = ("u02TotalBytes", "u02FreeBytes", "u02UsedPercent")
+
+
+def build_dynamodb_remove_attributes(u02_stats):
+    """Attribute names that must be REMOVEd because they are no longer valid."""
+    if u02_stats is None:
+        return list(U02_STAT_ATTRIBUTES)
+    if u02_stats.get("usedPercent") is None:
+        return ["u02UsedPercent"]
+    return []
+
+
+def update_dynamodb_state(table, item, remove_attributes=None):
     """Persist exactly one STATE#_deployment record. UpdateItem only."""
     key = {"pipeline": item["pipeline"], "recordType": item["recordType"]}
     attrs = {k: v for k, v in item.items() if k not in ("pipeline", "recordType")}
 
+    # An attribute can never appear in both SET and REMOVE in one expression.
+    remove_attributes = [a for a in (remove_attributes or []) if a not in attrs]
+
     names = {f"#{k}": k for k in attrs}
     values = {f":{k}": v for k, v in attrs.items()}
-    expression = "SET " + ", ".join(f"#{k} = :{k}" for k in attrs)
+
+    clauses = []
+    if attrs:
+        clauses.append("SET " + ", ".join(f"#{k} = :{k}" for k in attrs))
+    if remove_attributes:
+        for name in remove_attributes:
+            names[f"#{name}"] = name
+        clauses.append("REMOVE " + ", ".join(f"#{name}" for name in remove_attributes))
 
     table.update_item(
         Key=key,
-        UpdateExpression=expression,
+        UpdateExpression=" ".join(clauses),
         ExpressionAttributeNames=names,
         ExpressionAttributeValues=values,
     )
@@ -378,28 +425,91 @@ def publish_cloudwatch_metrics(cw_client, config: ObserverConfig, metric_data):
 # ---------------------------------------------------------------------------
 
 
+# Floor for the stale threshold: even with a very short CHECK_INTERVAL_SECONDS
+# and CONNECT_TIMEOUT_SECONDS, /healthz must never flip to "stale" (and cause
+# a liveness restart) over ordinary transient AWS latency.
+MIN_STALE_THRESHOLD_SECONDS = 120
+
+
+def compute_stale_threshold_seconds(config: "ObserverConfig") -> int:
+    """Conservative upper bound on one legitimate observation cycle.
+
+    A cycle's bounded work is two TCP checks (each up to
+    connect_timeout_seconds) plus two AWS calls (DynamoDB UpdateItem,
+    CloudWatch PutMetricData), each allowed up to 2 attempts (see
+    _boto_config) at up to (connect + read) timeout per attempt. Multiplying
+    connect_timeout_seconds by 10 comfortably covers that worst case; adding
+    check_interval_seconds covers the idle wait between cycles. Flooring at
+    MIN_STALE_THRESHOLD_SECONDS keeps short intervals from causing flapping.
+    """
+    bounded_call_budget = 10 * config.connect_timeout_seconds
+    return max(
+        MIN_STALE_THRESHOLD_SECONDS,
+        config.check_interval_seconds + bounded_call_budget,
+    )
+
+
 class HealthState:
-    def __init__(self, observer_version: str):
+    """Tracks observation-loop progress only -- never GoldenGate/AWS health.
+
+    Progress is measured on a monotonic clock so it is immune to wall-clock
+    jumps; lastCycleAt in the JSON response is still wall-clock (epoch
+    seconds) for human/operator readability.
+    """
+
+    def __init__(self, observer_version: str, stale_threshold_seconds: int, clock=time.monotonic):
         self._lock = threading.Lock()
         self._observer_version = observer_version
-        self._started = False
+        self._stale_threshold_seconds = stale_threshold_seconds
+        self._clock = clock
+        self._started_at = None
+        self._last_progress_at = None
         self._last_cycle_at = None
 
     def mark_started(self):
         with self._lock:
-            self._started = True
+            now = self._clock()
+            self._started_at = now
+            self._last_progress_at = now
 
-    def mark_cycle(self, timestamp):
+    def mark_progress(self, wall_clock_timestamp):
+        """Called once per loop iteration, regardless of cycle outcome."""
         with self._lock:
-            self._last_cycle_at = timestamp
+            self._last_progress_at = self._clock()
+            self._last_cycle_at = wall_clock_timestamp
 
     def snapshot(self):
+        """Return (body_dict, http_status_code)."""
         with self._lock:
-            return {
-                "status": "ok" if self._started else "starting",
-                "observerVersion": self._observer_version,
-                "lastCycleAt": self._last_cycle_at,
-            }
+            if self._started_at is None:
+                return (
+                    {"status": "starting", "observerVersion": self._observer_version, "lastCycleAt": None},
+                    200,
+                )
+
+            now = self._clock()
+            since_start = now - self._started_at
+            since_progress = now - self._last_progress_at
+
+            # Startup grace period: no cycle has completed yet and we are
+            # still inside the stale-threshold window since process start --
+            # this is normal startup, not a stalled loop.
+            if self._last_cycle_at is None and since_start < self._stale_threshold_seconds:
+                return (
+                    {"status": "starting", "observerVersion": self._observer_version, "lastCycleAt": None},
+                    200,
+                )
+
+            if since_progress > self._stale_threshold_seconds:
+                return (
+                    {"status": "stale", "observerVersion": self._observer_version, "lastCycleAt": self._last_cycle_at},
+                    503,
+                )
+
+            return (
+                {"status": "ok", "observerVersion": self._observer_version, "lastCycleAt": self._last_cycle_at},
+                200,
+            )
 
 
 def _make_health_handler(state: HealthState):
@@ -410,8 +520,9 @@ def _make_health_handler(state: HealthState):
                 self.end_headers()
                 return
 
-            payload = json.dumps(state.snapshot()).encode("utf-8")
-            self.send_response(200)
+            body, status_code = state.snapshot()
+            payload = json.dumps(body).encode("utf-8")
+            self.send_response(status_code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
@@ -464,9 +575,10 @@ def run_cycle(
         error_summary=error_summary,
         recorded_at=now,
     )
+    remove_attributes = build_dynamodb_remove_attributes(u02_stats)
 
     try:
-        update_dynamodb_state(table, item)
+        update_dynamodb_state(table, item, remove_attributes)
         log_event(
             "INFO", "dynamodb_update_succeeded", config=config, status=status,
             message=f"pipeline={config.pipeline} recordType={STATE_RECORD_TYPE}",
@@ -513,7 +625,8 @@ def main():
         }))
         sys.exit(1)
 
-    state = HealthState(config.observer_version)
+    stale_threshold_seconds = compute_stale_threshold_seconds(config)
+    state = HealthState(config.observer_version, stale_threshold_seconds)
     stop_event = threading.Event()
 
     def _handle_signal(signum, _frame):
@@ -531,10 +644,16 @@ def main():
 
     while not stop_event.is_set():
         try:
-            status = run_cycle(config, table, cw_client)
-            state.mark_cycle(time.time())
+            run_cycle(config, table, cw_client)
         except Exception as exc:  # noqa: BLE001 -- the loop itself must never die
             log_event("ERROR", "observation_completed", config=config, message=sanitize_error(exc))
+        finally:
+            # Marked whether the cycle succeeded or hit a handled exception:
+            # this reflects "the loop is still progressing", independent of
+            # GoldenGate/AWS health. A genuine hang (no bounded call ever
+            # returning) never reaches this line, which is exactly what lets
+            # /healthz detect it as stale.
+            state.mark_progress(time.time())
         stop_event.wait(config.check_interval_seconds)
 
     log_event("INFO", "observer_stopping", config=config)

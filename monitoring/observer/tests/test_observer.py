@@ -146,6 +146,81 @@ class DynamoDbItemTests(unittest.TestCase):
             kwargs["Key"], {"pipeline": item["pipeline"], "recordType": item["recordType"]}
         )
         self.assertNotIn("pipeline", kwargs["ExpressionAttributeValues"].values())
+        self.assertNotIn("REMOVE", kwargs["UpdateExpression"])
+
+    def test_build_dynamodb_remove_attributes_when_u02_unavailable(self):
+        self.assertEqual(
+            sorted(observer.build_dynamodb_remove_attributes(None)),
+            sorted(["u02TotalBytes", "u02FreeBytes", "u02UsedPercent"]),
+        )
+
+    def test_build_dynamodb_remove_attributes_when_used_percent_missing(self):
+        stats = {"totalBytes": 100, "freeBytes": 100, "usedPercent": None}
+        self.assertEqual(observer.build_dynamodb_remove_attributes(stats), ["u02UsedPercent"])
+
+    def test_build_dynamodb_remove_attributes_when_fully_available(self):
+        stats = {"totalBytes": 100, "freeBytes": 50, "usedPercent": Decimal("50.00")}
+        self.assertEqual(observer.build_dynamodb_remove_attributes(stats), [])
+
+    def test_update_item_removes_stale_u02_attributes_when_unavailable(self):
+        table = mock.Mock()
+        config = make_config()
+        item = observer.build_dynamodb_item(
+            config=config, status="DEGRADED", admin_ok=True, metrics_ok=True,
+            u02_stats=None, error_summary="u02_unavailable", recorded_at=1700000000,
+        )
+        remove_attrs = observer.build_dynamodb_remove_attributes(None)
+
+        observer.update_dynamodb_state(table, item, remove_attrs)
+
+        _, kwargs = table.update_item.call_args
+        self.assertIn("REMOVE", kwargs["UpdateExpression"])
+        removed_names = set(kwargs["ExpressionAttributeNames"].values())
+        for attr in ("u02TotalBytes", "u02FreeBytes", "u02UsedPercent"):
+            self.assertIn(attr, removed_names)
+            # A stale attribute can never also be set in the same request --
+            # that's what would let old values survive.
+            self.assertNotIn(attr, kwargs["ExpressionAttributeValues"].values())
+        table.scan.assert_not_called()
+        table.delete_item.assert_not_called()
+        table.batch_writer.assert_not_called()
+        table.put_item.assert_not_called()
+
+    def test_update_item_removes_only_used_percent_when_total_free_present(self):
+        table = mock.Mock()
+        config = make_config()
+        stats = {"totalBytes": 500, "freeBytes": 500, "usedPercent": None}
+        item = observer.build_dynamodb_item(
+            config=config, status="DEGRADED", admin_ok=True, metrics_ok=True,
+            u02_stats=stats, error_summary=None, recorded_at=1700000000,
+        )
+        remove_attrs = observer.build_dynamodb_remove_attributes(stats)
+
+        observer.update_dynamodb_state(table, item, remove_attrs)
+
+        _, kwargs = table.update_item.call_args
+        self.assertIn("REMOVE", kwargs["UpdateExpression"])
+        self.assertIn("u02UsedPercent", kwargs["ExpressionAttributeNames"].values())
+        # total/free must remain in SET, not REMOVE.
+        self.assertIn(500, kwargs["ExpressionAttributeValues"].values())
+        self.assertIn("u02TotalBytes", item)
+        self.assertIn("u02FreeBytes", item)
+        self.assertNotIn("u02UsedPercent", item)
+
+    def test_update_item_no_remove_clause_when_stats_fully_available(self):
+        table = mock.Mock()
+        config = make_config()
+        stats = {"totalBytes": 500, "freeBytes": 250, "usedPercent": Decimal("50.00")}
+        item = observer.build_dynamodb_item(
+            config=config, status="HEALTHY", admin_ok=True, metrics_ok=True,
+            u02_stats=stats, error_summary=None, recorded_at=1700000000,
+        )
+        remove_attrs = observer.build_dynamodb_remove_attributes(stats)
+
+        observer.update_dynamodb_state(table, item, remove_attrs)
+
+        _, kwargs = table.update_item.call_args
+        self.assertNotIn("REMOVE", kwargs["UpdateExpression"])
 
 
 class CloudWatchMetricTests(unittest.TestCase):
@@ -250,26 +325,98 @@ class ErrorSanitizationTests(unittest.TestCase):
         self.assertIsNone(observer.build_error_summary(True, True, {"totalBytes": 1}))
 
 
+class FakeClock:
+    """Deterministic, manually-advanced stand-in for time.monotonic."""
+
+    def __init__(self, start=0.0):
+        self._now = start
+
+    def advance(self, seconds):
+        self._now += seconds
+
+    def __call__(self):
+        return self._now
+
+
 class HealthServerTests(unittest.TestCase):
-    def test_healthz_stays_healthy_despite_external_failures(self):
-        state = observer.HealthState("test-version")
+    def test_healthy_recent_loop(self):
+        clock = FakeClock()
+        state = observer.HealthState("test-version", stale_threshold_seconds=60, clock=clock)
         state.mark_started()
-        snapshot = state.snapshot()
-        self.assertEqual(snapshot["status"], "ok")
-        self.assertEqual(snapshot["observerVersion"], "test-version")
+        state.mark_progress(1700000000.0)
 
-        # Marking a cycle even with a DOWN/degraded GoldenGate status must
-        # not change /healthz's own status field.
-        state.mark_cycle(1700000000.0)
-        snapshot = state.snapshot()
-        self.assertEqual(snapshot["status"], "ok")
-        self.assertEqual(snapshot["lastCycleAt"], 1700000000.0)
+        clock.advance(5)
+        body, status_code = state.snapshot()
 
-    def test_starting_state_before_first_mark(self):
-        state = observer.HealthState("test-version")
-        snapshot = state.snapshot()
-        self.assertEqual(snapshot["status"], "starting")
-        self.assertIsNone(snapshot["lastCycleAt"])
+        self.assertEqual(status_code, 200)
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["observerVersion"], "test-version")
+        self.assertEqual(body["lastCycleAt"], 1700000000.0)
+        # Only these three keys -- no configuration or credentials exposed.
+        self.assertEqual(set(body.keys()), {"status", "observerVersion", "lastCycleAt"})
+
+    def test_external_monitoring_failures_do_not_cause_staleness(self):
+        # A DOWN/DEGRADED GoldenGate status, or DynamoDB/CloudWatch failures,
+        # never reach HealthState at all -- mark_progress is called every
+        # loop iteration regardless of run_cycle's internal outcome. This
+        # test documents that /healthz only cares about progress, not status.
+        clock = FakeClock()
+        state = observer.HealthState("test-version", stale_threshold_seconds=60, clock=clock)
+        state.mark_started()
+
+        for i in range(5):
+            clock.advance(10)
+            state.mark_progress(1700000000.0 + i)
+            body, status_code = state.snapshot()
+            self.assertEqual(status_code, 200)
+            self.assertEqual(body["status"], "ok")
+
+    def test_stale_loop_returns_503(self):
+        clock = FakeClock()
+        state = observer.HealthState("test-version", stale_threshold_seconds=60, clock=clock)
+        state.mark_started()
+        state.mark_progress(1700000000.0)
+
+        # Loop stops progressing -- simulate a deadlock by advancing well
+        # past the threshold without another mark_progress call.
+        clock.advance(120)
+        body, status_code = state.snapshot()
+
+        self.assertEqual(status_code, 503)
+        self.assertEqual(body["status"], "stale")
+        self.assertEqual(body["lastCycleAt"], 1700000000.0)
+
+    def test_startup_behavior_before_first_cycle(self):
+        clock = FakeClock()
+        state = observer.HealthState("test-version", stale_threshold_seconds=60, clock=clock)
+
+        # Before mark_started(): "starting", HTTP 200.
+        body, status_code = state.snapshot()
+        self.assertEqual(status_code, 200)
+        self.assertEqual(body["status"], "starting")
+        self.assertIsNone(body["lastCycleAt"])
+
+        # After mark_started() but before the first mark_progress(), still
+        # within the threshold window -- still "starting", not "stale".
+        state.mark_started()
+        clock.advance(5)
+        body, status_code = state.snapshot()
+        self.assertEqual(status_code, 200)
+        self.assertEqual(body["status"], "starting")
+        self.assertIsNone(body["lastCycleAt"])
+
+    def test_compute_stale_threshold_has_a_floor(self):
+        config = make_config(CHECK_INTERVAL_SECONDS="1", CONNECT_TIMEOUT_SECONDS="1")
+        threshold = observer.compute_stale_threshold_seconds(config)
+        self.assertGreaterEqual(threshold, observer.MIN_STALE_THRESHOLD_SECONDS)
+
+    def test_compute_stale_threshold_scales_with_config(self):
+        small = make_config(CHECK_INTERVAL_SECONDS="30", CONNECT_TIMEOUT_SECONDS="3")
+        large = make_config(CHECK_INTERVAL_SECONDS="30", CONNECT_TIMEOUT_SECONDS="30")
+        self.assertGreater(
+            observer.compute_stale_threshold_seconds(large),
+            observer.compute_stale_threshold_seconds(small),
+        )
 
 
 class ConfigValidationTests(unittest.TestCase):
@@ -300,6 +447,43 @@ class ConfigValidationTests(unittest.TestCase):
         self.assertEqual(config.u02_path, "/u02")
         self.assertEqual(config.check_interval_seconds, 30)
         self.assertEqual(config.cloudwatch_namespace, "GoldenGate/Pipelines")
+
+    def test_admin_port_out_of_range_raises_config_error(self):
+        with self.assertRaises(observer.ConfigError):
+            make_config(ADMIN_PORT="0")
+        with self.assertRaises(observer.ConfigError):
+            make_config(ADMIN_PORT="65536")
+        with self.assertRaises(observer.ConfigError):
+            make_config(ADMIN_PORT="-1")
+
+    def test_metrics_port_out_of_range_raises_config_error(self):
+        with self.assertRaises(observer.ConfigError):
+            make_config(METRICS_PORT="0")
+        with self.assertRaises(observer.ConfigError):
+            make_config(METRICS_PORT="70000")
+
+    def test_health_listen_port_out_of_range_raises_config_error(self):
+        with self.assertRaises(observer.ConfigError):
+            make_config(HEALTH_LISTEN_PORT="0")
+        with self.assertRaises(observer.ConfigError):
+            make_config(HEALTH_LISTEN_PORT="99999")
+
+    def test_check_interval_seconds_must_be_positive(self):
+        with self.assertRaises(observer.ConfigError):
+            make_config(CHECK_INTERVAL_SECONDS="0")
+        with self.assertRaises(observer.ConfigError):
+            make_config(CHECK_INTERVAL_SECONDS="-5")
+
+    def test_connect_timeout_seconds_must_be_positive(self):
+        with self.assertRaises(observer.ConfigError):
+            make_config(CONNECT_TIMEOUT_SECONDS="0")
+        with self.assertRaises(observer.ConfigError):
+            make_config(CONNECT_TIMEOUT_SECONDS="-1")
+
+    def test_valid_boundary_ports_are_accepted(self):
+        config = make_config(ADMIN_PORT="1", METRICS_PORT="65535", HEALTH_LISTEN_PORT="8080")
+        self.assertEqual(config.admin_port, 1)
+        self.assertEqual(config.metrics_port, 65535)
 
 
 class GracefulStopTests(unittest.TestCase):

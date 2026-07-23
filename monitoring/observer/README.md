@@ -32,8 +32,12 @@ The observer must never affect GoldenGate. It never:
 If DynamoDB, CloudWatch, IRSA, or the GoldenGate ports are unavailable, the
 observer logs the failure and retries on the next cycle. A single failed
 external call never crashes the observation loop, and `/healthz` stays
-healthy as long as the observer process itself is alive and looping --
-it is not tied to GoldenGate's or AWS's availability.
+healthy as long as the observation loop itself keeps progressing -- it is
+not tied to GoldenGate's or AWS's availability. `/healthz` only turns
+unhealthy (HTTP 503, `status: "stale"`) when the loop itself has stopped
+making progress (see "Self-health endpoint" below) -- a DOWN/DEGRADED
+GoldenGate status, or a failed DynamoDB/CloudWatch call, never causes that
+on their own.
 
 ## Required environment variables
 
@@ -85,6 +89,13 @@ Persisted attributes: `deploymentId`, `component`, `engine`, `podName`,
 epoch seconds), `observerVersion`, `errorSummary` (concise, sanitized, no
 stack traces or credentials). No `ttl` attribute is ever set on this record.
 
+`/u02` becoming unavailable is not just "not updated" -- the single
+`UpdateItem` call carries an explicit `REMOVE` clause for `u02TotalBytes`,
+`u02FreeBytes`, and `u02UsedPercent` whenever storage stats can't be read,
+so no stale filesystem numbers are ever left behind from a previous cycle.
+If total/free are available but a usable percentage can't be computed, only
+`u02UsedPercent` is removed; `u02TotalBytes`/`u02FreeBytes` are kept.
+
 ## CloudWatch metrics
 
 Namespace: `GoldenGate/Pipelines`. Dimensions: `Pipeline`, `Component`,
@@ -96,6 +107,31 @@ Namespace: `GoldenGate/Pipelines`. Dimensions: `Pipeline`, `Component`,
 - `MetricsEndpointHealthy` (Count)
 - `U02Mounted` (Count)
 - `U02UsedPercent` (Percent, omitted when filesystem stats are unavailable)
+
+## Self-health endpoint (`/healthz`)
+
+`GET /healthz` reports observation-loop progress, not GoldenGate/AWS health.
+Every loop iteration (whether the cycle's internal DynamoDB/CloudWatch calls
+succeeded or failed) marks a progress timestamp on a monotonic clock. A
+stale threshold is computed from `CHECK_INTERVAL_SECONDS` and
+`CONNECT_TIMEOUT_SECONDS` (with a floor of 120 seconds) -- generous enough
+to cover a full cycle's bounded TCP/AWS calls without ever flagging a
+normal, slow-but-completing cycle as stale.
+
+- `status: "starting"`, HTTP 200 -- before the process has started or during
+  the initial startup grace period (before the first completed cycle, still
+  inside the stale-threshold window). Compatible with the Helm chart's
+  `monitoring.observer.health.initialDelaySeconds`.
+- `status: "ok"`, HTTP 200 -- the loop is progressing normally, regardless of
+  whether GoldenGate is HEALTHY, DEGRADED, or DOWN, or whether the last
+  DynamoDB/CloudWatch call succeeded.
+- `status: "stale"`, HTTP 503 -- the loop has stopped progressing (e.g. a
+  genuine hang bypassing the bounded TCP/AWS timeouts) for longer than the
+  stale threshold. This is the only condition that can affect the
+  container's liveness probe.
+
+The JSON body is always exactly `{"status", "observerVersion", "lastCycleAt"}`
+-- no configuration or credentials are ever exposed through this endpoint.
 
 ## Local unit tests
 
@@ -172,3 +208,12 @@ image is built once per observer-content Git tree SHA by
 independent of the per-deployment Helm/Argo CD matrix -- a Helm-only or
 deployment-values-only change reuses the existing image and never
 triggers a rebuild.
+
+The workflow injects `monitoring.observer.image.repository` as the **full**
+ECR registry/repository URI (e.g.
+`229410149234.dkr.ecr.eu-west-1.amazonaws.com/goldengate-observer`), not
+just the short repository name -- the Helm template only concatenates
+`repository:tag`, so the short name alone would render an incomplete,
+unpullable image reference. The short name (`goldengate-observer`) is used
+only for AWS CLI operations (`describe-repositories`, `create-repository`,
+`describe-images`, repository-policy management) inside the workflow.

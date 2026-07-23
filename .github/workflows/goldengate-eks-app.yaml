@@ -239,12 +239,21 @@ jobs:
 
           OBSERVER_TREE_SHA="$(git rev-parse "HEAD:${OBSERVER_SOURCE_PATH}")"
           OBSERVER_IMAGE_TAG="obs-${OBSERVER_TREE_SHA:0:12}"
-          OBSERVER_IMAGE_REPOSITORY="${OBSERVER_ECR_REPOSITORY}"
-          OBSERVER_IMAGE_URI="${ECR_REGISTRY}/${OBSERVER_ECR_REPOSITORY}:${OBSERVER_IMAGE_TAG}"
+
+          # OBSERVER_ECR_REPOSITORY (short name, e.g. "goldengate-observer")
+          # stays reserved for AWS CLI operations against ECR. Docker, Helm
+          # (monitoring.observer.image.repository), and the Argo CD Helm
+          # parameter all need the FULL registry/repository URI -- without
+          # it, the Helm template renders an incomplete image reference
+          # (e.g. "goldengate-observer:obs-xxxx" instead of
+          # "229410149234.dkr.ecr.eu-west-1.amazonaws.com/goldengate-observer:obs-xxxx").
+          OBSERVER_IMAGE_REPOSITORY="${ECR_REGISTRY}/${OBSERVER_ECR_REPOSITORY}"
+          OBSERVER_IMAGE_URI="${OBSERVER_IMAGE_REPOSITORY}:${OBSERVER_IMAGE_TAG}"
 
           echo "Observer tree SHA (monitoring/observer): ${OBSERVER_TREE_SHA}"
           echo "Observer image tag: ${OBSERVER_IMAGE_TAG}"
-          echo "Observer image repository: ${OBSERVER_IMAGE_REPOSITORY}"
+          echo "Observer ECR repository (short name, for AWS CLI): ${OBSERVER_ECR_REPOSITORY}"
+          echo "Observer image repository (full URI, for Docker/Helm/Argo CD): ${OBSERVER_IMAGE_REPOSITORY}"
           echo "Observer image URI: ${OBSERVER_IMAGE_URI}"
 
           echo "observer_tree_sha=${OBSERVER_TREE_SHA}" >> "$GITHUB_OUTPUT"
@@ -483,7 +492,7 @@ jobs:
     environment: dev
 
     outputs:
-      image_repository: ${{ env.OBSERVER_ECR_REPOSITORY }}
+      image_repository: ${{ needs.detect_changed_deployments.outputs.observer_image_repository }}
       image_tag: ${{ needs.detect_changed_deployments.outputs.observer_image_tag }}
       image_uri: ${{ needs.detect_changed_deployments.outputs.observer_image_uri }}
       image_existed: ${{ steps.image_check.outputs.image_existed }}
@@ -514,47 +523,42 @@ jobs:
 
           echo "Confirmed: running in the ECR/build account (${ECR_ACCOUNT_ID})."
 
-      - name: Verify Docker is available
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if ! command -v docker >/dev/null 2>&1; then
-            echo "docker is not installed on this runner. This workflow does not install Docker automatically."
-            exit 1
-          fi
-
-          docker --version
-
       - name: Prepare observer image variables
         id: prep
         shell: bash
         run: |
           set -euo pipefail
 
+          OBSERVER_IMAGE_REPOSITORY="${{ needs.detect_changed_deployments.outputs.observer_image_repository }}"
           OBSERVER_IMAGE_TAG="${{ needs.detect_changed_deployments.outputs.observer_image_tag }}"
           OBSERVER_IMAGE_URI="${{ needs.detect_changed_deployments.outputs.observer_image_uri }}"
           OBSERVER_TREE_SHA="${{ needs.detect_changed_deployments.outputs.observer_tree_sha }}"
           OBSERVER_CHANGED="${{ needs.detect_changed_deployments.outputs.observer_changed }}"
 
+          # OBSERVER_IMAGE_REPOSITORY must be the full registry/repository URI
+          # (no tag) -- this is what Helm/Argo CD receive as
+          # monitoring.observer.image.repository. OBSERVER_ECR_REPOSITORY
+          # (the short name, e.g. "goldengate-observer") stays reserved for
+          # AWS CLI operations (describe-repositories, create-repository,
+          # describe-images, get/set-repository-policy) below.
+          if [[ "$OBSERVER_IMAGE_REPOSITORY" != "${ECR_REGISTRY}/"* ]]; then
+            echo "OBSERVER_IMAGE_REPOSITORY does not start with \"${ECR_REGISTRY}/\": ${OBSERVER_IMAGE_REPOSITORY}"
+            echo "This must be the full ECR registry/repository URI, not the short repository name, or Helm/Argo CD will render an incomplete image reference."
+            exit 1
+          fi
+
+          echo "OBSERVER_IMAGE_REPOSITORY=${OBSERVER_IMAGE_REPOSITORY}" >> "$GITHUB_ENV"
           echo "OBSERVER_IMAGE_TAG=${OBSERVER_IMAGE_TAG}" >> "$GITHUB_ENV"
           echo "OBSERVER_IMAGE_URI=${OBSERVER_IMAGE_URI}" >> "$GITHUB_ENV"
           echo "OBSERVER_TREE_SHA=${OBSERVER_TREE_SHA}" >> "$GITHUB_ENV"
           echo "OBSERVER_CHANGED=${OBSERVER_CHANGED}" >> "$GITHUB_ENV"
 
-          echo "Observer repository: ${OBSERVER_ECR_REPOSITORY}"
+          echo "Observer ECR repository (short name, for AWS CLI): ${OBSERVER_ECR_REPOSITORY}"
+          echo "Observer image repository (full URI, for Docker/Helm/Argo CD): ${OBSERVER_IMAGE_REPOSITORY}"
           echo "Observer tree SHA: ${OBSERVER_TREE_SHA}"
           echo "Observer image tag: ${OBSERVER_IMAGE_TAG}"
           echo "Observer image URI: ${OBSERVER_IMAGE_URI}"
           echo "Observer source changed this trigger: ${OBSERVER_CHANGED}"
-
-      - name: Login to Amazon ECR
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          aws ecr get-login-password --region "$AWS_REGION" \
-            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
       - name: Ensure observer ECR repository exists
         shell: bash
@@ -698,7 +702,43 @@ jobs:
 
           python3 -m unittest discover -s "${OBSERVER_SOURCE_PATH}/tests" -p "test_*.py" -v
 
-      - name: Build and push observer image
+      # Everything below this point only runs when the content-addressed
+      # image is actually missing from ECR (IMAGE_EXISTED != 'true'). A
+      # reused image executes no Docker command at all -- not even a version
+      # or daemon check -- so a Helm-only or deployment-values-only run never
+      # depends on Docker being present/functional on the runner.
+
+      - name: Verify Docker binary and daemon are functional
+        if: env.IMAGE_EXISTED != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "docker is not installed on this runner. This workflow does not install Docker automatically."
+            exit 1
+          fi
+
+          docker --version
+
+          if ! docker info >/dev/null 2>&1; then
+            echo "The docker CLI is present but the daemon is not reachable (docker info failed)."
+            echo "This can happen when Docker is on PATH but the daemon/socket is not actually running or connected."
+            exit 1
+          fi
+
+          echo "Docker binary and daemon are both functional."
+
+      - name: Login to Amazon ECR
+        if: env.IMAGE_EXISTED != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+      - name: Build observer image
         if: env.IMAGE_EXISTED != 'true'
         shell: bash
         run: |
@@ -713,6 +753,12 @@ jobs:
             --build-arg "OCI_VERSION=${OBSERVER_IMAGE_TAG}" \
             -t "$OBSERVER_IMAGE_URI" \
             "$OBSERVER_SOURCE_PATH"
+
+      - name: Push observer image
+        if: env.IMAGE_EXISTED != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
 
           echo "Pushing ${OBSERVER_IMAGE_URI}..."
           docker push "$OBSERVER_IMAGE_URI"
@@ -945,11 +991,20 @@ jobs:
           OBSERVER_IMAGE_TAG="${{ needs.ensure_observer_image.outputs.image_tag }}"
           OBSERVER_IMAGE_URI="${{ needs.ensure_observer_image.outputs.image_uri }}"
 
+          # Defense-in-depth at the exact point Helm consumes this value:
+          # monitoring.observer.image.repository must be the full ECR
+          # registry/repository URI, never the short repository name alone.
+          if [[ "$OBSERVER_IMAGE_REPOSITORY" != "${ECR_REGISTRY}/"* ]]; then
+            echo "OBSERVER_IMAGE_REPOSITORY does not start with \"${ECR_REGISTRY}/\": ${OBSERVER_IMAGE_REPOSITORY}"
+            echo "Refusing to pass an incomplete image repository to Helm/Argo CD."
+            exit 1
+          fi
+
           echo "OBSERVER_IMAGE_REPOSITORY=${OBSERVER_IMAGE_REPOSITORY}" >> "$GITHUB_ENV"
           echo "OBSERVER_IMAGE_TAG=${OBSERVER_IMAGE_TAG}" >> "$GITHUB_ENV"
           echo "OBSERVER_IMAGE_URI=${OBSERVER_IMAGE_URI}" >> "$GITHUB_ENV"
 
-          echo "Observer image repository: ${OBSERVER_IMAGE_REPOSITORY}"
+          echo "Observer image repository (full URI): ${OBSERVER_IMAGE_REPOSITORY}"
           echo "Observer image tag: ${OBSERVER_IMAGE_TAG}"
           echo "Observer image URI: ${OBSERVER_IMAGE_URI}"
 
@@ -1742,6 +1797,15 @@ jobs:
             fi
             echo "Observer container: Running."
 
+            local observer_image
+            observer_image="$(kubectl get pod "$pod" -n "$TARGET_NAMESPACE" \
+              -o jsonpath="{.spec.containers[?(@.name=='goldengate-observer')].image}")"
+            if [ "$observer_image" != "$OBSERVER_IMAGE_URI" ]; then
+              echo "FAIL: goldengate-observer container in pod ${pod} is running image \"${observer_image}\", expected \"${OBSERVER_IMAGE_URI}\"."
+              exit 1
+            fi
+            echo "Observer image matches expected: ${observer_image}"
+
             local restarts_before restarts_after
             restarts_before="$(kubectl get pod "$pod" -n "$TARGET_NAMESPACE" \
               -o jsonpath="{.status.containerStatuses[?(@.name=='goldengate-observer')].restartCount}")"
@@ -1794,6 +1858,11 @@ jobs:
 
             if [ "$have_started" != "true" ]; then
               echo "FAIL: observer_started never logged within ${MAX_WAIT_SECONDS}s."
+              exit 1
+            fi
+
+            if [ "$have_completed" != "true" ]; then
+              echo "FAIL: observation_completed never logged within ${MAX_WAIT_SECONDS}s (the observation loop never finished a cycle)."
               exit 1
             fi
 
