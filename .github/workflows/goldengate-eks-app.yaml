@@ -484,7 +484,15 @@ jobs:
     needs: detect_changed_deployments
     if: needs.detect_changed_deployments.outputs.has_changes == 'true'
 
-    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+    # ubuntu-latest (not the private CodeBuild runner used by the other jobs
+    # in this workflow) -- the CodeBuild runner has no reachable Docker
+    # daemon/socket (docker --version succeeds, docker info fails), so it
+    # cannot build/push images. ubuntu-latest is the established
+    # Docker-capable runner pattern already used by
+    # push_docker_images_to_ECR.yaml. This job never touches the private
+    # EKS cluster or the CodeBuild-only platform tooling, so it doesn't need
+    # that runner.
+    runs-on: ubuntu-latest
 
     # Runs once per workflow (not once per deployment matrix item) so the
     # observer image is built at most once per observer-content tree SHA,
