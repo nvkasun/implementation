@@ -1425,6 +1425,21 @@ jobs:
           echo "SOURCE_MAIN_CONTAINER=${SOURCE_MAIN_CONTAINER}" >> "$GITHUB_ENV"
           echo "TARGET_MAIN_CONTAINER=${TARGET_MAIN_CONTAINER}" >> "$GITHUB_ENV"
 
+          # Extracts the "value:" belonging to a named "- name: <NAME>" env
+          # entry from an observer container block (piped/here-string'd in
+          # via stdin), normalizing surrounding YAML quotes/CR/whitespace.
+          # Matching on the env var NAME (anchored at end-of-line) avoids the
+          # false-positive risk of a generic `grep 'value: "target"'`, which
+          # could match an unrelated env value that happens to equal
+          # "target". Prints nothing (empty string) when the name isn't found.
+          extract_env_value() {
+            local name="$1"
+            awk -v n="$name" '$0 ~ ("name: " n "$") { getline; print; exit }' \
+              | sed -E 's/^[[:space:]]*value:[[:space:]]*//' \
+              | tr -d '"\r' \
+              | xargs
+          }
+
           for LABEL in SOURCE TARGET; do
             if [ "$LABEL" = "SOURCE" ]; then
               ENABLED="$SOURCE_ENABLED"; STS="$SOURCE_STS"; OBSERVER_BLOCK="$SOURCE_OBSERVER_BLOCK"
@@ -1447,18 +1462,66 @@ jobs:
               exit 1
             fi
 
-            echo "$OBSERVER_BLOCK" | grep -q "image: \"${OBSERVER_IMAGE_URI}\""
-            echo "$OBSERVER_BLOCK" | grep -q "value: \"${COMPONENT}\""
-            echo "$OBSERVER_BLOCK" | grep -q "value: \"${PIPELINE}\""
+            # --- observer image -------------------------------------------------
+            RENDERED_OBSERVER_IMAGE="$(
+              grep -E '^[[:space:]]*image:' <<< "$OBSERVER_BLOCK" |
+                head -1 |
+                sed -E 's/^[[:space:]]*image:[[:space:]]*//' |
+                tr -d '"\r' |
+                xargs
+            )"
 
+            if [ -z "$RENDERED_OBSERVER_IMAGE" ]; then
+              echo "FAIL: ${LABEL} goldengate-observer container has no rendered image."
+              exit 1
+            fi
+
+            if [ "$RENDERED_OBSERVER_IMAGE" != "$OBSERVER_IMAGE_URI" ]; then
+              echo "FAIL: ${LABEL} observer image mismatch."
+              echo "Expected image: ${OBSERVER_IMAGE_URI}"
+              echo "Rendered image: ${RENDERED_OBSERVER_IMAGE}"
+              exit 1
+            fi
+            echo "OK: ${LABEL} observer image validated."
+
+            # --- COMPONENT env value ---------------------------------------------
+            RENDERED_COMPONENT="$(extract_env_value "COMPONENT" <<< "$OBSERVER_BLOCK")"
+            if [ -z "$RENDERED_COMPONENT" ]; then
+              echo "FAIL: ${LABEL} goldengate-observer container has no rendered COMPONENT environment value."
+              exit 1
+            fi
+            if [ "$RENDERED_COMPONENT" != "$COMPONENT" ]; then
+              echo "FAIL: ${LABEL} observer COMPONENT mismatch."
+              echo "Expected COMPONENT: ${COMPONENT}"
+              echo "Rendered COMPONENT: ${RENDERED_COMPONENT}"
+              exit 1
+            fi
+            echo "OK: ${LABEL} observer COMPONENT validated."
+
+            # --- PIPELINE env value -----------------------------------------------
+            RENDERED_PIPELINE="$(extract_env_value "PIPELINE" <<< "$OBSERVER_BLOCK")"
+            if [ -z "$RENDERED_PIPELINE" ]; then
+              echo "FAIL: ${LABEL} goldengate-observer container has no rendered PIPELINE environment value."
+              exit 1
+            fi
+            if [ "$RENDERED_PIPELINE" != "$PIPELINE" ]; then
+              echo "FAIL: ${LABEL} observer PIPELINE mismatch."
+              echo "Expected PIPELINE: ${PIPELINE}"
+              echo "Rendered PIPELINE: ${RENDERED_PIPELINE}"
+              exit 1
+            fi
+            echo "OK: ${LABEL} observer PIPELINE validated."
+
+            # --- u02 mount: path + readOnly ---------------------------------------
             # Compare the volume mount against the configured U02_PATH taken
             # from the container's own rendered env (not a hardcoded /u02),
             # so this check still means something if u02Path is overridden.
-            CONFIGURED_U02_PATH="$(echo "$OBSERVER_BLOCK" | awk '/name: U02_PATH/{getline; print; exit}' | sed -E 's/^\s*value:\s*//' | tr -d '"'"'"'\r' | xargs)"
+            CONFIGURED_U02_PATH="$(extract_env_value "U02_PATH" <<< "$OBSERVER_BLOCK")"
             if [ -z "$CONFIGURED_U02_PATH" ]; then
               echo "FAIL: could not determine U02_PATH from the rendered ${LABEL} goldengate-observer container env."
               exit 1
             fi
+
             # Compare normalized values rather than a literal grep: the
             # rendered mountPath is quoted (_observer.tpl uses
             # {{ $observer.u02Path | quote }}, e.g. mountPath: "/u02"), while
@@ -1466,14 +1529,12 @@ jobs:
             # literal `grep -q "mountPath: ${CONFIGURED_U02_PATH}"` can never
             # match the quoted rendered line and always fails here.
             U02_MOUNT_BLOCK="$(
-              echo "$OBSERVER_BLOCK" |
-                grep -A2 "name: u02" |
+              grep -A2 "name: u02" <<< "$OBSERVER_BLOCK" |
                 head -3
             )"
 
             RENDERED_U02_MOUNT_PATH="$(
-              echo "$U02_MOUNT_BLOCK" |
-                grep -E '^[[:space:]]*mountPath:' |
+              grep -E '^[[:space:]]*mountPath:' <<< "$U02_MOUNT_BLOCK" |
                 head -1 |
                 sed -E 's/^[[:space:]]*mountPath:[[:space:]]*//' |
                 tr -d '"\r' |
@@ -1492,22 +1553,38 @@ jobs:
               exit 1
             fi
 
-            echo "$OBSERVER_BLOCK" | grep -A2 "name: u02" | grep -q "readOnly: true"
-            echo "$OBSERVER_BLOCK" | grep -q "path: /healthz"
+            if ! grep -Fq -- "readOnly: true" <<< "$U02_MOUNT_BLOCK"; then
+              echo "FAIL: ${LABEL} observer u02 volumeMount is not readOnly=true."
+              exit 1
+            fi
+            echo "OK: ${LABEL} observer u02 mount validated (u02Path=${CONFIGURED_U02_PATH})."
 
-            if echo "$OBSERVER_BLOCK" | grep -q "readinessProbe:"; then
+            # --- liveness probe ----------------------------------------------------
+            if ! grep -Fq -- "path: /healthz" <<< "$OBSERVER_BLOCK"; then
+              echo "FAIL: ${LABEL} observer liveness probe does not use /healthz."
+              exit 1
+            fi
+            echo "OK: ${LABEL} observer liveness probe validated."
+
+            if grep -Fq -- "readinessProbe:" <<< "$OBSERVER_BLOCK"; then
               echo "FAIL: unexpected readinessProbe found on the ${LABEL} goldengate-observer container."
               exit 1
             fi
 
-            if echo "$OBSERVER_BLOCK" | grep -q "ogg-admin-csi\|ogg-nginx-cert-csi\|secretKeyRef\|envFrom"; then
+            if grep -Eq -- 'ogg-admin-csi|ogg-nginx-cert-csi|secretKeyRef|envFrom' <<< "$OBSERVER_BLOCK"; then
               echo "FAIL: unexpected secret/CSI mount found on the ${LABEL} goldengate-observer container."
               exit 1
             fi
 
-            echo "$STS" | grep -q "name: ${MAIN_CONTAINER}"
+            # --- main GoldenGate container -----------------------------------------
+            if ! grep -Fq -- "- name: ${MAIN_CONTAINER}" <<< "$STS"; then
+              echo "FAIL: ${LABEL} StatefulSet does not contain the expected main container."
+              echo "Expected main container: ${MAIN_CONTAINER}"
+              exit 1
+            fi
+            echo "OK: ${LABEL} main container validated."
 
-            echo "OK: ${LABEL} goldengate-observer container validated (u02Path=${CONFIGURED_U02_PATH})."
+            echo "OK: ${LABEL} goldengate-observer container fully validated (u02Path=${CONFIGURED_U02_PATH})."
           done
 
           echo "OK: goldengate-observer render validation passed for all enabled components."
