@@ -1459,7 +1459,39 @@ jobs:
               echo "FAIL: could not determine U02_PATH from the rendered ${LABEL} goldengate-observer container env."
               exit 1
             fi
-            echo "$OBSERVER_BLOCK" | grep -A2 "name: u02" | grep -q "mountPath: ${CONFIGURED_U02_PATH}"
+            # Compare normalized values rather than a literal grep: the
+            # rendered mountPath is quoted (_observer.tpl uses
+            # {{ $observer.u02Path | quote }}, e.g. mountPath: "/u02"), while
+            # CONFIGURED_U02_PATH above is already unquoted (e.g. /u02) -- a
+            # literal `grep -q "mountPath: ${CONFIGURED_U02_PATH}"` can never
+            # match the quoted rendered line and always fails here.
+            U02_MOUNT_BLOCK="$(
+              echo "$OBSERVER_BLOCK" |
+                grep -A2 "name: u02" |
+                head -3
+            )"
+
+            RENDERED_U02_MOUNT_PATH="$(
+              echo "$U02_MOUNT_BLOCK" |
+                grep -E '^[[:space:]]*mountPath:' |
+                head -1 |
+                sed -E 's/^[[:space:]]*mountPath:[[:space:]]*//' |
+                tr -d '"\r' |
+                xargs
+            )"
+
+            if [ -z "$RENDERED_U02_MOUNT_PATH" ]; then
+              echo "FAIL: could not find the u02 mountPath in the rendered ${LABEL} observer container."
+              exit 1
+            fi
+
+            if [ "$RENDERED_U02_MOUNT_PATH" != "$CONFIGURED_U02_PATH" ]; then
+              echo "FAIL: ${LABEL} observer u02 mountPath mismatch."
+              echo "Expected from U02_PATH: ${CONFIGURED_U02_PATH}"
+              echo "Rendered mountPath:     ${RENDERED_U02_MOUNT_PATH}"
+              exit 1
+            fi
+
             echo "$OBSERVER_BLOCK" | grep -A2 "name: u02" | grep -q "readOnly: true"
             echo "$OBSERVER_BLOCK" | grep -q "path: /healthz"
 
