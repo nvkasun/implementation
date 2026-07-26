@@ -21,7 +21,9 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     resourceNames:
-      - {{ .Values.ecrTokenSync.argocdRepositorySecretName }}
+{{- range .Values.ecrTokenSync.repositories }}
+      - {{ .argocdRepositorySecretName }}
+{{- end }}
     verbs:
       - get
       - update

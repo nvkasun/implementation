@@ -1,0 +1,48 @@
+global:
+  environment: dev
+
+namespace:
+  create: true
+  name: goldengate-monitoring
+
+# Image repository/tag are intentionally NOT set here -- the dedicated
+# GoldenGate monitor GitHub Actions workflow injects the content-addressed
+# repository/tag at Helm lint/render/Argo CD time via
+# --set-string image.repository/tag (and the matching Argo CD Application
+# Helm parameters), so this file never needs updating when the monitor
+# image changes.
+
+aws:
+  region: eu-west-1
+
+dynamodb:
+  tableName: gg-eks-pipeline
+
+pipelines:
+  - gg-payments-ora-to-pg-001-source
+  - gg-payments-ora-to-pg-001-target
+
+staleAfterSeconds: 120
+refreshSeconds: 30
+
+serviceAccount:
+  create: true
+  name: gg-monitor
+  roleArn: arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev
+
+ingress:
+  enabled: true
+  mode: shared
+  className: alb
+  host: monitor.goldengate-dev.adcbmis.local
+  alb:
+    groupName: gg-poc-dev-alb
+    groupOrder: "120"
+    targetType: ip
+    backendProtocol: HTTP
+    listenPorts: '[{"HTTPS":443}]'
+    certificateArn: arn:aws:acm:eu-west-1:668311715351:certificate/9e53e28e-3243-47fc-85a1-50f9a94acde7
+    healthcheckProtocol: HTTP
+    healthcheckPort: traffic-port
+    healthcheckPath: /healthz
+    successCodes: "200"

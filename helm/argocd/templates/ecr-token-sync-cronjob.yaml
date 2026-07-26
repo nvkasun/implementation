@@ -1,4 +1,18 @@
 {{- if and .Values.ecrTokenSync .Values.ecrTokenSync.enabled }}
+{{- if not .Values.ecrTokenSync.repositories }}
+{{- fail "ecrTokenSync.repositories must contain at least one repository when ecrTokenSync.enabled=true." }}
+{{- end }}
+{{- range $i, $repo := .Values.ecrTokenSync.repositories }}
+{{- if not $repo.name }}
+{{- fail (printf "ecrTokenSync.repositories[%d].name is required." $i) }}
+{{- end }}
+{{- if not $repo.helmOciRepository }}
+{{- fail (printf "ecrTokenSync.repositories[%d].helmOciRepository is required (repository name: %s)." $i $repo.name) }}
+{{- end }}
+{{- if not $repo.argocdRepositorySecretName }}
+{{- fail (printf "ecrTokenSync.repositories[%d].argocdRepositorySecretName is required (repository name: %s)." $i $repo.name) }}
+{{- end }}
+{{- end }}
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -48,10 +62,6 @@ spec:
                   value: {{ .Values.ecrTokenSync.awsRegion | quote }}
                 - name: ECR_REGISTRY
                   value: {{ .Values.ecrTokenSync.ecrRegistry | quote }}
-                - name: HELM_OCI_REPOSITORY
-                  value: {{ .Values.ecrTokenSync.helmOciRepository | quote }}
-                - name: ARGOCD_REPOSITORY_SECRET_NAME
-                  value: {{ .Values.ecrTokenSync.argocdRepositorySecretName | quote }}
                 - name: POD_NAMESPACE
                   valueFrom:
                     fieldRef:
@@ -79,10 +89,26 @@ spec:
 
                   mkdir -p /tmp/.aws /tmp/.cache
 
-                  echo "Refreshing Argo CD ECR OCI repository credential..."
-                  echo "Target Secret: ${ARGOCD_REPOSITORY_SECRET_NAME}"
+                  # Repository list baked in at Helm render time from
+                  # ecrTokenSync.repositories -- one Argo CD repository
+                  # Secret is refreshed per entry, all from a single ECR
+                  # authorization password fetched once below.
+                  REPO_HELM_OCI=(
+{{- range .Values.ecrTokenSync.repositories }}
+                    {{ printf "%q" .helmOciRepository }}
+{{- end }}
+                  )
+                  REPO_SECRET_NAME=(
+{{- range .Values.ecrTokenSync.repositories }}
+                    {{ printf "%q" .argocdRepositorySecretName }}
+{{- end }}
+                  )
+
+                  echo "Refreshing Argo CD ECR OCI repository credentials for ${#REPO_HELM_OCI[@]} repositories..."
+                  for i in "${!REPO_HELM_OCI[@]}"; do
+                    echo "  - oci://${ECR_REGISTRY}/${REPO_HELM_OCI[$i]} -> Secret ${REPO_SECRET_NAME[$i]}"
+                  done
                   echo "Namespace: ${POD_NAMESPACE}"
-                  echo "Repository URL: oci://${ECR_REGISTRY}/${HELM_OCI_REPOSITORY}"
 
                   echo "Runtime user:"
                   id
@@ -95,28 +121,42 @@ spec:
                   aws sts get-caller-identity
 
                   echo "Kubernetes RBAC diagnostics:"
-                  kubectl auth can-i get secret "${ARGOCD_REPOSITORY_SECRET_NAME}" -n "${POD_NAMESPACE}" || true
                   kubectl auth can-i create secret -n "${POD_NAMESPACE}" || true
-                  kubectl auth can-i update secret "${ARGOCD_REPOSITORY_SECRET_NAME}" -n "${POD_NAMESPACE}" || true
-                  kubectl auth can-i patch secret "${ARGOCD_REPOSITORY_SECRET_NAME}" -n "${POD_NAMESPACE}" || true
+                  for i in "${!REPO_SECRET_NAME[@]}"; do
+                    SECRET_NAME="${REPO_SECRET_NAME[$i]}"
+                    kubectl auth can-i get secret "${SECRET_NAME}" -n "${POD_NAMESPACE}" || true
+                    kubectl auth can-i update secret "${SECRET_NAME}" -n "${POD_NAMESPACE}" || true
+                    kubectl auth can-i patch secret "${SECRET_NAME}" -n "${POD_NAMESPACE}" || true
+                  done
 
+                  # One ECR authorization password per CronJob execution,
+                  # shared by every configured repository below -- the
+                  # password is registry-scoped (not repository-scoped), and
+                  # every configured OCI repository lives in the same ECR
+                  # registry/region.
                   ECR_PASSWORD="$(aws ecr get-login-password --region "$AWS_REGION")"
 
-                  # kubectl apply reads the heredoc directly on its own stdin
-                  # here -- no "cat | kubectl apply" pipe. That older pipe
-                  # form runs kubectl and cat as two processes tied together
-                  # by set -o pipefail; if kubectl finishes and closes its
-                  # end of the pipe while cat is still writing, cat gets
-                  # SIGPIPE, exits non-zero, and pipefail fails the whole
-                  # pipeline -- even though kubectl already applied the
-                  # Secret successfully. Redirecting the heredoc straight
-                  # into kubectl's stdin removes that second process and
-                  # the race entirely.
-                  kubectl apply -f - <<EOF
+                  for i in "${!REPO_HELM_OCI[@]}"; do
+                    HELM_OCI_REPOSITORY="${REPO_HELM_OCI[$i]}"
+                    SECRET_NAME="${REPO_SECRET_NAME[$i]}"
+
+                    echo "Refreshing Secret ${SECRET_NAME} for oci://${ECR_REGISTRY}/${HELM_OCI_REPOSITORY}..."
+
+                    # kubectl apply reads the heredoc directly on its own stdin
+                    # here -- no "cat | kubectl apply" pipe. That older pipe
+                    # form runs kubectl and cat as two processes tied together
+                    # by set -o pipefail; if kubectl finishes and closes its
+                    # end of the pipe while cat is still writing, cat gets
+                    # SIGPIPE, exits non-zero, and pipefail fails the whole
+                    # pipeline -- even though kubectl already applied the
+                    # Secret successfully. Redirecting the heredoc straight
+                    # into kubectl's stdin removes that second process and
+                    # the race entirely.
+                    kubectl apply -f - <<EOF
                   apiVersion: v1
                   kind: Secret
                   metadata:
-                    name: ${ARGOCD_REPOSITORY_SECRET_NAME}
+                    name: ${SECRET_NAME}
                     namespace: ${POD_NAMESPACE}
                     labels:
                       argocd.argoproj.io/secret-type: repository
@@ -127,10 +167,11 @@ spec:
                     password: ${ECR_PASSWORD}
                   EOF
 
+                    kubectl get secret "${SECRET_NAME}" -n "${POD_NAMESPACE}" \
+                      -o jsonpath='{.metadata.name}{" refreshed with "}{.metadata.labels.argocd\.argoproj\.io/secret-type}{" label\n"}'
+                  done
+
                   unset ECR_PASSWORD
 
-                  kubectl get secret "${ARGOCD_REPOSITORY_SECRET_NAME}" -n "${POD_NAMESPACE}" \
-                    -o jsonpath='{.metadata.name}{" refreshed with "}{.metadata.labels.argocd\.argoproj\.io/secret-type}{" label\n"}'
-
-                  echo "Argo CD ECR OCI repository credential refreshed successfully."
+                  echo "All ${#REPO_HELM_OCI[@]} Argo CD ECR OCI repository credentials refreshed successfully."
 {{- end }}

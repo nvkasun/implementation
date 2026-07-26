@@ -1,0 +1,105 @@
+global:
+  environment: ""
+
+image:
+  repository: ""
+  tag: ""
+  pullPolicy: IfNotPresent
+
+namespace:
+  create: true
+  name: goldengate-monitoring
+
+replicaCount: 1
+
+aws:
+  region: eu-west-1
+
+dynamodb:
+  tableName: gg-eks-pipeline
+
+# Explicitly configured pipeline keys only -- the portal never Scans or
+# discovers deployments dynamically. Populated per-environment (see
+# envs/dev/goldengate-monitor/values.yaml).
+pipelines: []
+
+staleAfterSeconds: 120
+refreshSeconds: 30
+
+serviceAccount:
+  create: true
+  name: gg-monitor
+  # Required (see templates/serviceaccount.yaml `required` guard) whenever
+  # serviceAccount.create=true -- IRSA needs the role ARN to annotate the
+  # ServiceAccount with.
+  roleArn: ""
+
+service:
+  type: ClusterIP
+  port: 8080
+
+ingress:
+  enabled: false
+  # mode: shared  -> join an existing (resident) ALB group; emit only
+  #                   application/group-level annotations.
+  # mode: standalone -> this Ingress owns its own ALB; emit full ALB
+  #                      annotations (scheme, subnets, certificateArn, ...).
+  mode: shared
+  className: alb
+  host: ""
+
+  alb:
+    groupName: ""
+    groupOrder: ""
+    targetType: ip
+    # The portal serves plain HTTP on :8080 -- do not set HTTPS here. The
+    # shared ALB terminates HTTPS externally and forwards HTTP to the pod.
+    backendProtocol: HTTP
+    listenPorts: '[{"HTTPS":443}]'
+    certificateArn: ""
+    healthcheckProtocol: HTTP
+    healthcheckPort: traffic-port
+    healthcheckPath: /healthz
+    successCodes: "200"
+    # Standalone-mode-only fields (ALB-exclusive; never emitted in shared
+    # mode -- see templates/ingress.yaml).
+    scheme: internal
+    sslPolicy: ""
+    sslRedirect: ""
+    subnets: ""
+    securityGroups: ""
+    inboundCidrs: ""
+    loadBalancerAttributes: ""
+
+  annotations: {}
+
+resources:
+  requests:
+    cpu: 25m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 256Mi
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+  seccompProfile:
+    type: RuntimeDefault
+
+networkPolicy:
+  # Kept disabled by default: a restrictive egress policy must not be
+  # enabled by guessing VPC endpoint CIDRs, DNS requirements, or ALB traffic
+  # source behavior. The template exists so it can be turned on later once
+  # those are confirmed for this cluster.
+  enabled: false
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

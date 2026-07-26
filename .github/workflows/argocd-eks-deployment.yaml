@@ -298,10 +298,36 @@ jobs:
           # a values misconfiguration before it ever reaches the cluster.
           grep -q "kind: CronJob" "$RENDERED"
           grep -q "name: argocd-ecr-token-sync" "$RENDERED"
-          grep -q "eks.amazonaws.com/role-arn" "$RENDERED"
+          grep -q "eks.amazonaws.com/role-arn: arn:aws:iam::668311715351:role/GoldenGateArgocdECRRead-dev" "$RENDERED"
           grep -q "aws-cloud-factory-infra-aws-kubectl:1.33.13" "$RENDERED"
 
-          echo "OK: ServiceAccount/Role/RoleBinding/CronJob for ECR token sync are all present in the rendered manifest."
+          echo "Checking multi-repository token sync (both GoldenGate and GoldenGate monitor OCI repositories)..."
+
+          # Both Helm OCI repository names must be baked into the rendered
+          # CronJob's bash arrays.
+          grep -q 'helm/goldengate"' "$RENDERED"
+          grep -q 'helm/goldengate-monitor"' "$RENDERED"
+
+          # Both Argo CD repository Secret names must be baked in too.
+          grep -q "argocd-ecr-goldengate-oci" "$RENDERED"
+          grep -q "argocd-ecr-goldengate-monitor-oci" "$RENDERED"
+
+          echo "Checking RBAC resourceNames includes both repository Secrets..."
+          RBAC_BLOCK="$(awk '/^kind: Role$/{flag=1} flag{print} /^---$/{if(flag) exit}' "$RENDERED")"
+          if [ -z "$RBAC_BLOCK" ]; then
+            echo "FAIL: could not isolate the rendered Role block for ECR token sync."
+            exit 1
+          fi
+          if ! grep -Fq -- "argocd-ecr-goldengate-oci" <<< "$RBAC_BLOCK"; then
+            echo "FAIL: Role resourceNames is missing argocd-ecr-goldengate-oci."
+            exit 1
+          fi
+          if ! grep -Fq -- "argocd-ecr-goldengate-monitor-oci" <<< "$RBAC_BLOCK"; then
+            echo "FAIL: Role resourceNames is missing argocd-ecr-goldengate-monitor-oci."
+            exit 1
+          fi
+
+          echo "OK: ServiceAccount/Role/RoleBinding/CronJob for ECR token sync are all present in the rendered manifest, covering both repositories, using the existing GoldenGateArgocdECRRead-dev IRSA role. (The next step's public-registry scan covers every rendered image reference, including this CronJob's -- no new public image is introduced here.)"
 
       - name: Extract and validate rendered image references
         shell: bash
@@ -547,6 +573,104 @@ jobs:
           else
             echo "argocdServerIngress.enabled is not true in ${VALUES_FILE}. Skipping Argo CD server Ingress verification."
           fi
+
+      - name: Run immediate bounded ECR token-sync validation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Rather than waiting up to six hours for the CronJob's own
+          # schedule, trigger one bounded, disposable Job run right now from
+          # the existing CronJob spec, so this workflow proves the
+          # multi-repository token sync actually works before it finishes.
+          # No short-lived ECR password is ever injected from GitHub Actions
+          # here -- this Job runs the exact same in-cluster IRSA-based
+          # script the CronJob already uses.
+          JOB_NAME="ecr-token-sync-verify-${{ github.run_id }}"
+          # Kubernetes Job names must be <=63 chars, lowercase alphanumeric/hyphen.
+          JOB_NAME="$(echo "$JOB_NAME" | tr '[:upper:]' '[:lower:]' | cut -c1-63 | sed -E 's/-+$//')"
+
+          echo "Creating one-off Job ${JOB_NAME} from cronjob/argocd-ecr-token-sync in namespace ${ARGOCD_NAMESPACE}..."
+          kubectl create job "$JOB_NAME" \
+            --from=cronjob/argocd-ecr-token-sync \
+            -n "$ARGOCD_NAMESPACE"
+
+          echo "Waiting (bounded) for Job ${JOB_NAME} to finish..."
+          TIMEOUT_SECONDS=180
+          INTERVAL_SECONDS=10
+          ELAPSED=0
+          JOB_RESULT=""
+
+          while [ "$ELAPSED" -lt "$TIMEOUT_SECONDS" ]; do
+            SUCCEEDED="$(kubectl get job "$JOB_NAME" -n "$ARGOCD_NAMESPACE" -o jsonpath='{.status.succeeded}' 2>/dev/null || true)"
+            FAILED="$(kubectl get job "$JOB_NAME" -n "$ARGOCD_NAMESPACE" -o jsonpath='{.status.failed}' 2>/dev/null || true)"
+
+            if [ "${SUCCEEDED:-0}" -ge 1 ] 2>/dev/null; then
+              JOB_RESULT="succeeded"
+              break
+            fi
+            if [ "${FAILED:-0}" -ge 1 ] 2>/dev/null; then
+              JOB_RESULT="failed"
+              break
+            fi
+
+            echo "[$(date -u +%H:%M:%S)] Job ${JOB_NAME} still running (elapsed ${ELAPSED}s / ${TIMEOUT_SECONDS}s)..."
+            sleep "$INTERVAL_SECONDS"
+            ELAPSED=$((ELAPSED + INTERVAL_SECONDS))
+          done
+
+          if [ "$JOB_RESULT" != "succeeded" ]; then
+            echo "FAIL: Job ${JOB_NAME} did not succeed within ${TIMEOUT_SECONDS}s (result: ${JOB_RESULT:-timeout})."
+            echo "Job status (evidence retained -- the failed Job/Pod is deliberately NOT deleted):"
+            kubectl get job "$JOB_NAME" -n "$ARGOCD_NAMESPACE" -o wide || true
+            kubectl describe job "$JOB_NAME" -n "$ARGOCD_NAMESPACE" || true
+            echo "Job logs:"
+            kubectl logs "job/${JOB_NAME}" -n "$ARGOCD_NAMESPACE" --all-containers=true || true
+            exit 1
+          fi
+
+          echo "Job ${JOB_NAME} completed successfully. Logs:"
+          kubectl logs "job/${JOB_NAME}" -n "$ARGOCD_NAMESPACE" --all-containers=true || true
+
+          echo "Verifying both Argo CD repository Secrets exist with the expected label and URL..."
+
+          verify_repo_secret() {
+            local secret_name="$1"
+            local expected_repo="$2"
+
+            if ! kubectl get secret "$secret_name" -n "$ARGOCD_NAMESPACE" >/dev/null 2>&1; then
+              echo "FAIL: Secret ${secret_name} does not exist in namespace ${ARGOCD_NAMESPACE}."
+              exit 1
+            fi
+
+            local secret_type_label
+            secret_type_label="$(kubectl get secret "$secret_name" -n "$ARGOCD_NAMESPACE" \
+              -o jsonpath='{.metadata.labels.argocd\.argoproj\.io/secret-type}')"
+            if [ "$secret_type_label" != "repository" ]; then
+              echo "FAIL: Secret ${secret_name} is missing the argocd.argoproj.io/secret-type=repository label (got: ${secret_type_label:-<none>})."
+              exit 1
+            fi
+
+            local actual_url
+            actual_url="$(kubectl get secret "$secret_name" -n "$ARGOCD_NAMESPACE" \
+              -o jsonpath='{.data.url}' | base64 --decode)"
+            local expected_url="oci://${ECR_REGISTRY}/${expected_repo}"
+            if [ "$actual_url" != "$expected_url" ]; then
+              echo "FAIL: Secret ${secret_name} url mismatch. Expected ${expected_url}, got ${actual_url}."
+              exit 1
+            fi
+
+            # Password is intentionally never read or printed here.
+            echo "OK: Secret ${secret_name} exists, labeled repository, url=${actual_url}."
+          }
+
+          verify_repo_secret "argocd-ecr-goldengate-oci" "helm/goldengate"
+          verify_repo_secret "argocd-ecr-goldengate-monitor-oci" "helm/goldengate-monitor"
+
+          echo "Deleting one-off validation Job ${JOB_NAME} (validation succeeded)..."
+          kubectl delete job "$JOB_NAME" -n "$ARGOCD_NAMESPACE" --wait=true --timeout=60s
+
+          echo "OK: immediate bounded ECR token-sync validation passed for both repositories."
 
       - name: Upload rendered manifests and chart package
         if: always()

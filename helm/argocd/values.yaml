@@ -23,9 +23,13 @@ argo-cd: {}
 # Disabled by default here (this is a structural toggle, not an
 # environment-specific value). Environments that need the in-cluster Argo CD
 # ECR OCI token-refresh CronJob turn it on and supply the role ARN,
-# registry, and image details in their own values.yaml overlay.
+# registry, repository list, and image details in their own values.yaml
+# overlay. repositories defaults to empty here -- it is only required
+# (and validated as non-empty) once enabled=true, see
+# templates/ecr-token-sync-cronjob.yaml.
 ecrTokenSync:
   enabled: false
+  repositories: []
 
 # Disabled by default here (this is a structural toggle, not an
 # environment-specific value). Environments that need to expose the Argo CD

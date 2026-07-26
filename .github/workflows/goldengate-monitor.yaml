@@ -1,0 +1,1082 @@
+name: Goldengate monitor deployment
+
+run-name: "Cloud Factory - GoldenGate monitor build and deploy | ${{ github.event_name == 'workflow_dispatch' && format('manual dispatch (deploy={0})', inputs.deploy) || format('auto: monitor changes on {0}', github.sha) }} | ran by ${{ github.actor }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Deployment environment"
+        required: true
+        type: choice
+        default: dev
+        options:
+          - dev
+
+      deploy:
+        description: "Deploy to EKS after publishing the Helm chart"
+        required: true
+        type: boolean
+        default: true
+
+  push:
+    branches:
+      - main
+    paths:
+      - 'monitoring/monitor/**'
+      - 'helm/goldengate-monitor/**'
+      - 'envs/dev/goldengate-monitor/**'
+      - '.github/workflows/goldengate-monitor.yaml'
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+
+  # ECR / runner account where the monitor image and Helm OCI chart are pushed.
+  ECR_ACCOUNT_ID: "229410149234"
+  ECR_REGISTRY: 229410149234.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com
+
+  # Role used by GitHub Actions / CodeBuild runner.
+  ROLE_ARN: ${{ vars.GOLDENGATE_AWS_ROLE_ARN }}
+
+  # Target EKS cluster details.
+  EKS_ACCOUNT_ID: ${{ vars.ACCOUNT_ID_DEV }}
+  EKS_CLUSTER_NAME: ${{ vars.AWS_CLUSTER_NAME }}
+  EKS_CLUSTER_ARN: ${{ vars.AWS_CLUSTER_ARN }}
+  EKS_DEPLOY_ROLE_ARN: ${{ vars.EKS_DEPLOY_ROLE_ARN }}
+
+  # IRSA role the in-cluster argocd-ecr-token-sync CronJob assumes to pull
+  # the goldengate-monitor Helm OCI chart. The helm/goldengate-monitor ECR
+  # repository policy must grant this exact role pull access -- see the
+  # "Ensure Helm ECR repository policy allows Argo CD pull" step below. This
+  # role, its trust policy, and its ServiceAccount are unchanged by this
+  # workflow -- see envs/dev/policies/argocd-ecr-oci-read-dev/.
+  ARGOCD_ECR_READ_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateArgocdECRRead-dev
+
+  MONITOR_SOURCE_PATH: monitoring/monitor
+  MONITOR_ECR_REPOSITORY: goldengate-monitor
+
+  HELM_OCI_NAMESPACE: helm
+  CHART_NAME: goldengate-monitor
+  HELM_CHART_PATH: helm/goldengate-monitor
+  ENVS_ROOT: envs
+  ENVIRONMENT: dev
+  VALUES_FILE: envs/dev/goldengate-monitor/values.yaml
+
+  TARGET_NAMESPACE: goldengate-monitoring
+  RELEASE_NAME: gg-monitor
+  ARGOCD_NAMESPACE: argocd
+  ARGOCD_APP_NAME: goldengate-monitor
+  ARGOCD_MONITOR_SECRET_NAME: argocd-ecr-goldengate-monitor-oci
+
+concurrency:
+  group: goldengate-monitor-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Image job: ubuntu-latest only, because the CodeBuild runner used by
+  # every other job/workflow in this repository has no reachable Docker
+  # daemon/socket. This job never touches the private EKS cluster.
+  # ---------------------------------------------------------------------
+  ensure_monitor_image:
+    name: Ensure GoldenGate monitor image exists in ECR
+
+    runs-on: ubuntu-latest
+
+    environment: dev
+
+    outputs:
+      image_repository: ${{ steps.prep.outputs.image_repository }}
+      image_tag: ${{ steps.prep.outputs.image_tag }}
+      image_uri: ${{ steps.prep.outputs.image_uri }}
+      image_existed: ${{ steps.image_check.outputs.image_existed }}
+      image_digest: ${{ steps.resolve_digest.outputs.image_digest }}
+      monitor_tree_sha: ${{ steps.prep.outputs.monitor_tree_sha }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.ROLE_ARN }}
+
+      - name: Verify AWS caller account
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CALLER_ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
+          echo "Caller account: ${CALLER_ACCOUNT}"
+
+          if [ "$CALLER_ACCOUNT" != "$ECR_ACCOUNT_ID" ]; then
+            echo "Unexpected AWS caller account. Expected ${ECR_ACCOUNT_ID} (ECR/build account), got ${CALLER_ACCOUNT}."
+            exit 1
+          fi
+
+          echo "Confirmed: running in the ECR/build account (${ECR_ACCOUNT_ID})."
+
+      - name: Prepare monitor image variables
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Content-addressed tag: calculated from the Git tree SHA of
+          # monitoring/monitor alone (never the overall commit SHA), so a
+          # Helm-only or values-only change never produces a new tag, and
+          # the existing image is reused.
+          MONITOR_TREE_SHA="$(git rev-parse "HEAD:${MONITOR_SOURCE_PATH}")"
+          MONITOR_IMAGE_TAG="mon-${MONITOR_TREE_SHA:0:12}"
+
+          # MONITOR_ECR_REPOSITORY (short name) stays reserved for AWS CLI
+          # operations. Docker, Helm (image.repository), and the Argo CD
+          # Helm parameter all need the FULL registry/repository URI.
+          MONITOR_IMAGE_REPOSITORY="${ECR_REGISTRY}/${MONITOR_ECR_REPOSITORY}"
+          MONITOR_IMAGE_URI="${MONITOR_IMAGE_REPOSITORY}:${MONITOR_IMAGE_TAG}"
+
+          if [[ "$MONITOR_IMAGE_REPOSITORY" != "${ECR_REGISTRY}/"* ]]; then
+            echo "MONITOR_IMAGE_REPOSITORY does not start with \"${ECR_REGISTRY}/\": ${MONITOR_IMAGE_REPOSITORY}"
+            exit 1
+          fi
+
+          echo "Monitor tree SHA (monitoring/monitor): ${MONITOR_TREE_SHA}"
+          echo "Monitor image tag: ${MONITOR_IMAGE_TAG}"
+          echo "Monitor ECR repository (short name, for AWS CLI): ${MONITOR_ECR_REPOSITORY}"
+          echo "Monitor image repository (full URI): ${MONITOR_IMAGE_REPOSITORY}"
+          echo "Monitor image URI: ${MONITOR_IMAGE_URI}"
+
+          echo "MONITOR_TREE_SHA=${MONITOR_TREE_SHA}" >> "$GITHUB_ENV"
+          echo "MONITOR_IMAGE_TAG=${MONITOR_IMAGE_TAG}" >> "$GITHUB_ENV"
+          echo "MONITOR_IMAGE_REPOSITORY=${MONITOR_IMAGE_REPOSITORY}" >> "$GITHUB_ENV"
+          echo "MONITOR_IMAGE_URI=${MONITOR_IMAGE_URI}" >> "$GITHUB_ENV"
+
+          echo "monitor_tree_sha=${MONITOR_TREE_SHA}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${MONITOR_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "image_repository=${MONITOR_IMAGE_REPOSITORY}" >> "$GITHUB_OUTPUT"
+          echo "image_uri=${MONITOR_IMAGE_URI}" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure monitor ECR repository exists
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if aws ecr describe-repositories \
+            --region "$AWS_REGION" \
+            --repository-names "$MONITOR_ECR_REPOSITORY" >/dev/null 2>&1; then
+            echo "ECR repository already exists: ${MONITOR_ECR_REPOSITORY}. Not changing its tag mutability."
+          else
+            echo "Creating ECR repository: ${MONITOR_ECR_REPOSITORY}"
+
+            aws ecr create-repository \
+              --region "$AWS_REGION" \
+              --repository-name "$MONITOR_ECR_REPOSITORY" \
+              --tags Key=ApplicationName,Value=CloudFactory Key=DataClassification,Value=General Key=BusinessCriticality,Value=Low Key=BusinessUnit,Value=TechnologyPlatform Key=CostCenter,Value=219 \
+              --image-scanning-configuration scanOnPush=true \
+              --image-tag-mutability IMMUTABLE >/dev/null
+
+            echo "Created ECR repository: ${MONITOR_ECR_REPOSITORY} (IMMUTABLE tags, scanOnPush=true)"
+          fi
+
+      - name: Ensure monitor ECR repository policy allows EKS workload account pull
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MONITOR_EKS_PULL_SID="AllowEksDevAccountPullGoldengateMonitor"
+
+          echo "Fetching existing ECR repository policy for ${MONITOR_ECR_REPOSITORY}..."
+
+          EXISTING_POLICY="$(aws ecr get-repository-policy \
+            --region "$AWS_REGION" \
+            --repository-name "$MONITOR_ECR_REPOSITORY" \
+            --query policyText \
+            --output text 2>/tmp/monitor-ecr-get-policy-error.txt)" || {
+              if grep -q "RepositoryPolicyNotFoundException" /tmp/monitor-ecr-get-policy-error.txt; then
+                echo "No existing repository policy found. Starting from an empty policy."
+                EXISTING_POLICY='{"Version":"2012-10-17","Statement":[]}'
+              else
+                echo "Failed to read the existing ECR repository policy:"
+                cat /tmp/monitor-ecr-get-policy-error.txt
+                echo ""
+                echo "The workflow role (${ROLE_ARN}) must have ecr:GetRepositoryPolicy and"
+                echo "ecr:SetRepositoryPolicy on ${MONITOR_ECR_REPOSITORY}. Grant those and re-run."
+                exit 1
+              fi
+            }
+
+          echo "Merging in Sid ${MONITOR_EKS_PULL_SID} (existing statements are preserved)..."
+
+          echo "$EXISTING_POLICY" | jq \
+            --arg sid "$MONITOR_EKS_PULL_SID" \
+            '
+            .Statement = ([.Statement[] | select(.Sid != $sid)]
+              + [{
+                  Sid: $sid,
+                  Effect: "Allow",
+                  Principal: { AWS: "arn:aws:iam::668311715351:root" },
+                  Action: [
+                    "ecr:BatchCheckLayerAvailability",
+                    "ecr:BatchGetImage",
+                    "ecr:GetDownloadUrlForLayer"
+                  ]
+                }])
+            ' > /tmp/monitor-ecr-repository-policy.json
+
+          aws ecr set-repository-policy \
+            --region "$AWS_REGION" \
+            --repository-name "$MONITOR_ECR_REPOSITORY" \
+            --policy-text file:///tmp/monitor-ecr-repository-policy.json >/dev/null
+
+          echo "ECR repository policy on ${MONITOR_ECR_REPOSITORY} now allows pull from account 668311715351 (EKS workload account)."
+
+      - name: Check whether the monitor image already exists
+        id: image_check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking for existing image: ${MONITOR_ECR_REPOSITORY}:${MONITOR_IMAGE_TAG}"
+
+          if aws ecr describe-images \
+            --region "$AWS_REGION" \
+            --repository-name "$MONITOR_ECR_REPOSITORY" \
+            --image-ids "imageTag=${MONITOR_IMAGE_TAG}" >/tmp/monitor-describe-images.json 2>/tmp/monitor-describe-images-error.txt; then
+            echo "Image already exists in ECR. Reusing it -- no build or push will occur."
+            echo "image_existed=true" >> "$GITHUB_OUTPUT"
+            echo "IMAGE_EXISTED=true" >> "$GITHUB_ENV"
+          else
+            if grep -q "ImageNotFoundException" /tmp/monitor-describe-images-error.txt; then
+              echo "Image not found in ECR. It will be built and pushed."
+              echo "image_existed=false" >> "$GITHUB_OUTPUT"
+              echo "IMAGE_EXISTED=false" >> "$GITHUB_ENV"
+            else
+              echo "Failed to check for the existing monitor image:"
+              cat /tmp/monitor-describe-images-error.txt
+              echo ""
+              echo "The workflow role (${ROLE_ARN}) must have ecr:DescribeImages on ${MONITOR_ECR_REPOSITORY}."
+              exit 1
+            fi
+          fi
+
+      - name: Validate monitor Python syntax
+        if: env.IMAGE_EXISTED != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 -m py_compile "${MONITOR_SOURCE_PATH}/monitor.py"
+          python3 -m compileall -q "${MONITOR_SOURCE_PATH}"
+
+      - name: Run monitor unit tests
+        if: env.IMAGE_EXISTED != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 -m unittest discover -s "${MONITOR_SOURCE_PATH}/tests" -p "test_*.py" -v
+
+      # Everything below only runs when the content-addressed image is
+      # actually missing from ECR. A reused image executes no Docker
+      # command at all -- not even a version or daemon check.
+      - name: Verify Docker binary and daemon are functional
+        if: env.IMAGE_EXISTED != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "docker is not installed on this runner. This workflow does not install Docker automatically."
+            exit 1
+          fi
+
+          docker --version
+
+          if ! docker info >/dev/null 2>&1; then
+            echo "The docker CLI is present but the daemon is not reachable (docker info failed)."
+            exit 1
+          fi
+
+          echo "Docker binary and daemon are both functional."
+
+      - name: Login to Amazon ECR
+        if: env.IMAGE_EXISTED != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+      - name: Build monitor image
+        if: env.IMAGE_EXISTED != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Building ${MONITOR_IMAGE_URI} from ${MONITOR_SOURCE_PATH}..."
+
+          docker build \
+            --build-arg "OCI_SOURCE=${{ github.server_url }}/${{ github.repository }}" \
+            --build-arg "OCI_TITLE=goldengate-monitor" \
+            --build-arg "OCI_DESCRIPTION=Read-only shared GoldenGate monitoring portal" \
+            --build-arg "OCI_VERSION=${MONITOR_IMAGE_TAG}" \
+            -t "$MONITOR_IMAGE_URI" \
+            "$MONITOR_SOURCE_PATH"
+
+      - name: Push monitor image
+        if: env.IMAGE_EXISTED != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Pushing ${MONITOR_IMAGE_URI}..."
+          docker push "$MONITOR_IMAGE_URI"
+
+      - name: Resolve monitor image digest
+        id: resolve_digest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE_DIGEST="$(aws ecr describe-images \
+            --region "$AWS_REGION" \
+            --repository-name "$MONITOR_ECR_REPOSITORY" \
+            --image-ids "imageTag=${MONITOR_IMAGE_TAG}" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text)"
+
+          echo "Monitor image digest: ${IMAGE_DIGEST}"
+          echo "image_digest=${IMAGE_DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Confirm immutable tag is present in ECR
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws ecr describe-images \
+            --region "$AWS_REGION" \
+            --repository-name "$MONITOR_ECR_REPOSITORY" \
+            --image-ids "imageTag=${MONITOR_IMAGE_TAG}" >/dev/null
+
+          echo "Confirmed: ${MONITOR_ECR_REPOSITORY}:${MONITOR_IMAGE_TAG} is present in ECR."
+
+      - name: Monitor image summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Monitor image"
+            echo ""
+            echo "- Monitor tree SHA: \`${MONITOR_TREE_SHA:-unknown}\`"
+            echo "- Monitor image tag: \`${MONITOR_IMAGE_TAG:-unknown}\`"
+            echo "- Monitor image URI: \`${MONITOR_IMAGE_URI:-unknown}\`"
+            echo "- Image already existed in ECR: \`${IMAGE_EXISTED:-unknown}\`"
+            echo ""
+            echo "Built once here, on ubuntu-latest, never on the CodeBuild runner."
+            echo "Helm-only and environment-values-only changes reuse this same image."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------
+  # Deployment job: private-platform CodeBuild runner, same pattern as
+  # every other Helm/Argo CD deployment job in this repository. Never
+  # runs Docker.
+  # ---------------------------------------------------------------------
+  build_publish_and_deploy:
+    name: Build, publish, and deploy the GoldenGate monitor via Argo CD
+
+    needs: ensure_monitor_image
+    if: needs.ensure_monitor_image.result == 'success'
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    environment: dev
+
+    concurrency:
+      group: goldengate-monitor-helm-deploy-${{ github.ref }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.ROLE_ARN }}
+
+      - name: Install Helm and kubectl if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! command -v helm >/dev/null 2>&1; then
+            HELM_VERSION="v3.15.4"
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64) HELM_ARCH="amd64" ;;
+              aarch64|arm64) HELM_ARCH="arm64" ;;
+              *) echo "Unsupported architecture for Helm: $ARCH"; exit 1 ;;
+            esac
+            curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-${HELM_ARCH}.tar.gz" -o /tmp/helm.tar.gz
+            tar -zxvf /tmp/helm.tar.gz -C /tmp
+            sudo mv "/tmp/linux-${HELM_ARCH}/helm" /usr/local/bin/helm
+            sudo chmod +x /usr/local/bin/helm
+          fi
+          helm version --short
+
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KUBECTL_VERSION="v1.35.0"
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64) KUBECTL_ARCH="amd64" ;;
+              aarch64|arm64) KUBECTL_ARCH="arm64" ;;
+              *) echo "Unsupported architecture for kubectl: $ARCH"; exit 1 ;;
+            esac
+            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+            sudo chmod +x /usr/local/bin/kubectl
+          fi
+          kubectl version --client=true
+
+      - name: Verify runner tools and AWS identity
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws sts get-caller-identity
+          aws --version
+          helm version --short
+          kubectl version --client=true
+
+      - name: Prepare monitor deployment variables
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MONITOR_IMAGE_REPOSITORY="${{ needs.ensure_monitor_image.outputs.image_repository }}"
+          MONITOR_IMAGE_TAG="${{ needs.ensure_monitor_image.outputs.image_tag }}"
+          MONITOR_IMAGE_URI="${{ needs.ensure_monitor_image.outputs.image_uri }}"
+
+          if [[ "$MONITOR_IMAGE_REPOSITORY" != "${ECR_REGISTRY}/"* ]]; then
+            echo "MONITOR_IMAGE_REPOSITORY does not start with \"${ECR_REGISTRY}/\": ${MONITOR_IMAGE_REPOSITORY}"
+            echo "Refusing to pass an incomplete image repository to Helm/Argo CD."
+            exit 1
+          fi
+
+          CHART_VERSION="0.1.${{ github.run_number }}"
+          TEMP_CHART_PATH="work/charts/goldengate-monitor"
+          HELM_ECR_REPOSITORY="${HELM_OCI_NAMESPACE}/${CHART_NAME}"
+          HELM_PUSH_URL="oci://${ECR_REGISTRY}/${HELM_OCI_NAMESPACE}"
+          HELM_CHART_REF="oci://${ECR_REGISTRY}/${HELM_ECR_REPOSITORY}"
+
+          echo "MONITOR_IMAGE_REPOSITORY=${MONITOR_IMAGE_REPOSITORY}" >> "$GITHUB_ENV"
+          echo "MONITOR_IMAGE_TAG=${MONITOR_IMAGE_TAG}" >> "$GITHUB_ENV"
+          echo "MONITOR_IMAGE_URI=${MONITOR_IMAGE_URI}" >> "$GITHUB_ENV"
+          echo "CHART_VERSION=${CHART_VERSION}" >> "$GITHUB_ENV"
+          echo "TEMP_CHART_PATH=${TEMP_CHART_PATH}" >> "$GITHUB_ENV"
+          echo "HELM_ECR_REPOSITORY=${HELM_ECR_REPOSITORY}" >> "$GITHUB_ENV"
+          echo "HELM_PUSH_URL=${HELM_PUSH_URL}" >> "$GITHUB_ENV"
+          echo "HELM_CHART_REF=${HELM_CHART_REF}" >> "$GITHUB_ENV"
+
+          echo "Monitor image URI: ${MONITOR_IMAGE_URI}"
+          echo "Chart version: ${CHART_VERSION}"
+          echo "Helm chart ref: ${HELM_CHART_REF}"
+
+      - name: Validate required files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for f in "$HELM_CHART_PATH/Chart.yaml" "$HELM_CHART_PATH/values.yaml" "$VALUES_FILE"; do
+            if [ ! -f "$f" ]; then
+              echo "Missing required file: $f"
+              exit 1
+            fi
+          done
+          echo "Required files are present."
+
+      - name: Login Helm to Amazon ECR
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | helm registry login --username AWS --password-stdin "$ECR_REGISTRY"
+
+      - name: Ensure Helm ECR repository exists
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if aws ecr describe-repositories \
+            --region "$AWS_REGION" \
+            --repository-names "$HELM_ECR_REPOSITORY" >/dev/null 2>&1; then
+            echo "ECR repository already exists: $HELM_ECR_REPOSITORY"
+          else
+            echo "Creating ECR repository: $HELM_ECR_REPOSITORY"
+
+            aws ecr create-repository \
+              --region "$AWS_REGION" \
+              --repository-name "$HELM_ECR_REPOSITORY" \
+              --tags Key=ApplicationName,Value=CloudFactory Key=DataClassification,Value=General Key=BusinessCriticality,Value=Low Key=BusinessUnit,Value=TechnologyPlatform Key=CostCenter,Value=219 \
+              --image-scanning-configuration scanOnPush=true \
+              --image-tag-mutability MUTABLE >/dev/null
+
+            echo "Created ECR repository: $HELM_ECR_REPOSITORY"
+          fi
+
+      - name: Ensure Helm ECR repository policy allows Argo CD pull
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ARGOCD_ECR_STATEMENT_SID="AllowArgocdEksRolePullGoldengateMonitorHelmChart"
+
+          EXISTING_POLICY="$(aws ecr get-repository-policy \
+            --region "$AWS_REGION" \
+            --repository-name "$HELM_ECR_REPOSITORY" \
+            --query policyText \
+            --output text 2>/tmp/monitor-helm-ecr-get-policy-error.txt)" || {
+              if grep -q "RepositoryPolicyNotFoundException" /tmp/monitor-helm-ecr-get-policy-error.txt; then
+                echo "No existing repository policy found. Starting from an empty policy."
+                EXISTING_POLICY='{"Version":"2012-10-17","Statement":[]}'
+              else
+                echo "Failed to read the existing ECR repository policy:"
+                cat /tmp/monitor-helm-ecr-get-policy-error.txt
+                exit 1
+              fi
+            }
+
+          echo "Merging in Sid ${ARGOCD_ECR_STATEMENT_SID} (existing statements are preserved)..."
+
+          echo "$EXISTING_POLICY" | jq \
+            --arg sid "$ARGOCD_ECR_STATEMENT_SID" \
+            --arg roleArn "$ARGOCD_ECR_READ_ROLE_ARN" \
+            '
+            .Statement = ([.Statement[] | select(.Sid != $sid)]
+              + [{
+                  Sid: $sid,
+                  Effect: "Allow",
+                  Principal: { AWS: $roleArn },
+                  Action: [
+                    "ecr:BatchCheckLayerAvailability",
+                    "ecr:BatchGetImage",
+                    "ecr:GetDownloadUrlForLayer",
+                    "ecr:DescribeImages",
+                    "ecr:DescribeRepositories"
+                  ]
+                }])
+            ' > /tmp/monitor-helm-ecr-repository-policy.json
+
+          aws ecr set-repository-policy \
+            --region "$AWS_REGION" \
+            --repository-name "$HELM_ECR_REPOSITORY" \
+            --policy-text file:///tmp/monitor-helm-ecr-repository-policy.json >/dev/null
+
+          echo "ECR repository policy on ${HELM_ECR_REPOSITORY} now allows pull from ${ARGOCD_ECR_READ_ROLE_ARN}."
+
+      - name: Helm lint monitor chart
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          helm lint "$HELM_CHART_PATH" \
+            --values "$VALUES_FILE" \
+            --set-string image.repository="$MONITOR_IMAGE_REPOSITORY" \
+            --set-string image.tag="$MONITOR_IMAGE_TAG"
+
+      - name: Render monitor manifest for validation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p rendered
+
+          helm template "$RELEASE_NAME" "$HELM_CHART_PATH" \
+            --namespace "$TARGET_NAMESPACE" \
+            --values "$VALUES_FILE" \
+            --set-string image.repository="$MONITOR_IMAGE_REPOSITORY" \
+            --set-string image.tag="$MONITOR_IMAGE_TAG" \
+            > "rendered/${RELEASE_NAME}.yaml"
+
+          echo "Rendered manifest: rendered/${RELEASE_NAME}.yaml"
+
+      - name: Validate rendered monitor manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RENDERED="rendered/${RELEASE_NAME}.yaml"
+
+          echo "Validating Namespace..."
+          grep -q "kind: Namespace" "$RENDERED"
+          grep -q "name: ${TARGET_NAMESPACE}" "$RENDERED"
+
+          echo "Validating ServiceAccount and exact IRSA role ARN..."
+          grep -q "kind: ServiceAccount" "$RENDERED"
+          grep -q "name: gg-monitor" "$RENDERED"
+          grep -q "eks.amazonaws.com/role-arn: arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev" "$RENDERED"
+
+          echo "Validating Deployment uses the full image URI..."
+          grep -q "kind: Deployment" "$RENDERED"
+          grep -q "image: \"${MONITOR_IMAGE_URI}\"" "$RENDERED"
+
+          echo "Validating no Secret/CSI/PVC/hostPath is rendered..."
+          if grep -qE '^kind: Secret$' "$RENDERED"; then
+            echo "FAIL: a Secret was rendered -- the monitor must not use Kubernetes Secrets."
+            exit 1
+          fi
+          if grep -q "secretKeyRef" "$RENDERED"; then
+            echo "FAIL: secretKeyRef found in rendered manifest."
+            exit 1
+          fi
+          if grep -q "envFrom" "$RENDERED"; then
+            echo "FAIL: envFrom found in rendered manifest."
+            exit 1
+          fi
+          if grep -q "persistentVolumeClaim" "$RENDERED"; then
+            echo "FAIL: persistentVolumeClaim found in rendered manifest."
+            exit 1
+          fi
+          if grep -q "hostPath" "$RENDERED"; then
+            echo "FAIL: hostPath found in rendered manifest."
+            exit 1
+          fi
+          if grep -q "secrets-store.csi" "$RENDERED"; then
+            echo "FAIL: a GoldenGate CSI secret volume was rendered."
+            exit 1
+          fi
+
+          echo "Validating Service is ClusterIP on 8080..."
+          grep -q "kind: Service" "$RENDERED"
+          grep -q "type: ClusterIP" "$RENDERED"
+          grep -q "port: 8080" "$RENDERED"
+
+          echo "Validating ingress backend/health protocols are HTTP..."
+          grep -q 'alb.ingress.kubernetes.io/backend-protocol: "HTTP"' "$RENDERED"
+          grep -q 'alb.ingress.kubernetes.io/healthcheck-protocol: "HTTP"' "$RENDERED"
+          grep -q 'alb.ingress.kubernetes.io/target-type: "ip"' "$RENDERED"
+
+          echo "Validating ingress host and certificate ARN..."
+          grep -q "host: monitor.goldengate-dev.adcbmis.local" "$RENDERED"
+          grep -q "alb.ingress.kubernetes.io/certificate-arn:" "$RENDERED"
+
+          echo "Validating both configured pipeline keys are rendered..."
+          grep -q "gg-payments-ora-to-pg-001-source" "$RENDERED"
+          grep -q "gg-payments-ora-to-pg-001-target" "$RENDERED"
+
+          echo "Validating securityContext requirements..."
+          grep -q "runAsNonRoot: true" "$RENDERED"
+          grep -q "runAsUser: 10001" "$RENDERED"
+          grep -q "readOnlyRootFilesystem: true" "$RENDERED"
+          grep -q "allowPrivilegeEscalation: false" "$RENDERED"
+          if grep -q "privileged: true" "$RENDERED"; then
+            echo "FAIL: privileged: true found in rendered manifest."
+            exit 1
+          fi
+
+          echo "Validating /healthz and /readyz probes..."
+          DEPLOYMENT_BLOCK="$(awk '/^kind: Deployment$/{flag=1} flag{print} /^---$/{if(flag) exit}' "$RENDERED")"
+          if ! grep -Fq -- "path: /healthz" <<< "$DEPLOYMENT_BLOCK"; then
+            echo "FAIL: /healthz probe not found on the Deployment."
+            exit 1
+          fi
+          if ! grep -Fq -- "path: /readyz" <<< "$DEPLOYMENT_BLOCK"; then
+            echo "FAIL: /readyz probe not found on the Deployment."
+            exit 1
+          fi
+
+          echo "OK: rendered monitor manifest passed all checks."
+
+      - name: Package deployment-specific Helm chart
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p packaged
+          rm -rf "$TEMP_CHART_PATH"
+          mkdir -p "$TEMP_CHART_PATH"
+
+          cp -a "$HELM_CHART_PATH/." "$TEMP_CHART_PATH/"
+          cp "$VALUES_FILE" "$TEMP_CHART_PATH/values-deployment.yaml"
+
+          helm package "$TEMP_CHART_PATH" \
+            --version "$CHART_VERSION" \
+            --app-version "$CHART_VERSION" \
+            --destination packaged
+
+          ls -lrt packaged
+
+      - name: Push monitor Helm chart to ECR as OCI artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          helm push "packaged/${CHART_NAME}-${CHART_VERSION}.tgz" "$HELM_PUSH_URL"
+
+          echo "Published Helm chart:"
+          echo "${HELM_CHART_REF}:${CHART_VERSION}"
+
+      - name: Verify monitor Helm chart can be pulled from ECR
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p pulled
+
+          helm pull "$HELM_CHART_REF" \
+            --version "$CHART_VERSION" \
+            --destination pulled
+
+          ls -lrt pulled
+
+      - name: Connect to EKS cluster
+        if: ${{ inputs.deploy != false }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws sts get-caller-identity
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}" \
+            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
+            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
+
+          kubectl config current-context
+          kubectl version --client=true
+
+      - name: Ensure Argo CD Application CRD exists
+        if: ${{ inputs.deploy != false }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl get crd applications.argoproj.io >/dev/null || {
+            echo "CRD applications.argoproj.io not found."
+            echo "Argo CD must be installed on this cluster before the monitor can be deployed through it."
+            echo "Run the argocd-eks-deployment.yaml workflow first."
+            exit 1
+          }
+
+          echo "Argo CD Application CRD is present."
+
+      - name: Confirm the monitor Argo CD repository Secret exists
+        if: ${{ inputs.deploy != false }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # This is the required prerequisite check: the monitor workflow
+          # must fail clearly here (not inject a credential) if steps 1-2 of
+          # the documented deployment order have not run yet.
+          if ! kubectl get secret "$ARGOCD_MONITOR_SECRET_NAME" -n "$ARGOCD_NAMESPACE" >/dev/null 2>&1; then
+            echo "PREREQUISITE NOT MET: Secret ${ARGOCD_MONITOR_SECRET_NAME} does not exist in namespace ${ARGOCD_NAMESPACE}."
+            echo ""
+            echo "Required order before running this workflow:"
+            echo "  1. Run the IAM/Secrets Terraform workflow (applies the extended Argo CD ECR read policy)."
+            echo "  2. Run the argocd-eks-deployment.yaml workflow (deploys multi-repository token sync and creates this Secret)."
+            echo "  3. Re-run this workflow."
+            echo ""
+            echo "Refusing to inject a short-lived credential as a workaround -- the in-cluster IRSA token sync is the only long-term credential mechanism."
+            exit 1
+          fi
+
+          ACTUAL_URL="$(kubectl get secret "$ARGOCD_MONITOR_SECRET_NAME" -n "$ARGOCD_NAMESPACE" -o jsonpath='{.data.url}' | base64 --decode)"
+          EXPECTED_URL="oci://${ECR_REGISTRY}/${HELM_OCI_NAMESPACE}/${CHART_NAME}"
+          if [ "$ACTUAL_URL" != "$EXPECTED_URL" ]; then
+            echo "FAIL: Secret ${ARGOCD_MONITOR_SECRET_NAME} url mismatch. Expected ${EXPECTED_URL}, got ${ACTUAL_URL}."
+            exit 1
+          fi
+
+          echo "OK: ${ARGOCD_MONITOR_SECRET_NAME} exists and points to ${EXPECTED_URL}."
+
+      - name: Create or update Argo CD Application
+        if: ${{ inputs.deploy != false }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Applying Argo CD Application: ${ARGOCD_APP_NAME}"
+
+          cat <<EOF | kubectl apply -f -
+          apiVersion: argoproj.io/v1alpha1
+          kind: Application
+          metadata:
+            name: ${ARGOCD_APP_NAME}
+            namespace: ${ARGOCD_NAMESPACE}
+            finalizers:
+              - resources-finalizer.argocd.argoproj.io
+            labels:
+              app.kubernetes.io/name: gg-monitor
+              app.kubernetes.io/managed-by: argocd
+          spec:
+            project: default
+            source:
+              repoURL: ${HELM_CHART_REF}
+              targetRevision: ${CHART_VERSION}
+              path: .
+              helm:
+                releaseName: ${RELEASE_NAME}
+                valueFiles:
+                  - values-deployment.yaml
+                parameters:
+                  - name: image.repository
+                    value: ${MONITOR_IMAGE_REPOSITORY}
+                  - name: image.tag
+                    value: ${MONITOR_IMAGE_TAG}
+            destination:
+              server: https://kubernetes.default.svc
+              namespace: ${TARGET_NAMESPACE}
+            syncPolicy:
+              automated:
+                prune: true
+                selfHeal: true
+              syncOptions:
+                - CreateNamespace=true
+              managedNamespaceMetadata:
+                labels:
+                  app.kubernetes.io/name: gg-monitor
+                  app.kubernetes.io/managed-by: argocd
+            revisionHistoryLimit: 10
+          EOF
+
+          kubectl annotate application "${ARGOCD_APP_NAME}" \
+            -n "${ARGOCD_NAMESPACE}" \
+            argocd.argoproj.io/refresh=hard \
+            --overwrite
+
+      - name: Wait for Argo CD sync and health
+        if: ${{ inputs.deploy != false }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TIMEOUT_SECONDS=600
+          INTERVAL_SECONDS=15
+          ELAPSED=0
+
+          while true; do
+            if kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" >/dev/null 2>&1; then
+              SYNC_STATUS="$(kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" -o jsonpath='{.status.sync.status}' 2>/dev/null || echo "Unknown")"
+              HEALTH_STATUS="$(kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" -o jsonpath='{.status.health.status}' 2>/dev/null || echo "Unknown")"
+
+              echo "[$(date -u +%H:%M:%S)] sync=${SYNC_STATUS} health=${HEALTH_STATUS} (elapsed ${ELAPSED}s / ${TIMEOUT_SECONDS}s)"
+
+              if [ "${HEALTH_STATUS}" = "Degraded" ]; then
+                echo "Argo CD Application ${ARGOCD_APP_NAME} is Degraded."
+                kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" -o wide
+                exit 1
+              fi
+
+              if [ "${SYNC_STATUS}" = "Synced" ] && [ "${HEALTH_STATUS}" = "Healthy" ]; then
+                echo "Argo CD Application ${ARGOCD_APP_NAME} is Synced and Healthy."
+                break
+              fi
+            else
+              echo "[$(date -u +%H:%M:%S)] Argo CD Application ${ARGOCD_APP_NAME} not found yet (elapsed ${ELAPSED}s / ${TIMEOUT_SECONDS}s)."
+            fi
+
+            if [ "${ELAPSED}" -ge "${TIMEOUT_SECONDS}" ]; then
+              echo "Timed out after ${TIMEOUT_SECONDS}s waiting for ${ARGOCD_APP_NAME} to become Synced and Healthy."
+              kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" -o wide || true
+              kubectl describe application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" || true
+              exit 1
+            fi
+
+            sleep "${INTERVAL_SECONDS}"
+            ELAPSED=$((ELAPSED + INTERVAL_SECONDS))
+          done
+
+      - name: Verify GoldenGate monitor runtime state
+        if: ${{ inputs.deploy != false }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Namespace:"
+          kubectl get namespace "$TARGET_NAMESPACE"
+
+          echo "ServiceAccount and IRSA annotation:"
+          kubectl get serviceaccount gg-monitor -n "$TARGET_NAMESPACE"
+          ROLE_ANNOTATION="$(kubectl get serviceaccount gg-monitor -n "$TARGET_NAMESPACE" -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}')"
+          if [ "$ROLE_ANNOTATION" != "arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev" ]; then
+            echo "FAIL: unexpected IRSA role annotation on ServiceAccount gg-monitor: ${ROLE_ANNOTATION}"
+            exit 1
+          fi
+          echo "OK: IRSA role annotation matches GoldenGateMonitorReadRole-dev."
+
+          echo "Deployment availability:"
+          kubectl rollout status deployment/gg-monitor -n "$TARGET_NAMESPACE" --timeout=5m
+
+          READY_REPLICAS="$(kubectl get deployment gg-monitor -n "$TARGET_NAMESPACE" -o jsonpath='{.status.readyReplicas}')"
+          if [ "${READY_REPLICAS:-0}" -lt 1 ]; then
+            echo "FAIL: gg-monitor has ${READY_REPLICAS:-0} ready replicas, expected at least 1."
+            exit 1
+          fi
+          echo "OK: gg-monitor has ${READY_REPLICAS} ready replica(s)."
+
+          POD_NAME="$(kubectl get pods -n "$TARGET_NAMESPACE" -l app.kubernetes.io/name=gg-monitor -o jsonpath='{.items[0].metadata.name}')"
+          if [ -z "$POD_NAME" ]; then
+            echo "FAIL: no gg-monitor pod found in ${TARGET_NAMESPACE}."
+            exit 1
+          fi
+          echo "Pod: ${POD_NAME}"
+
+          POD_IMAGE="$(kubectl get pod "$POD_NAME" -n "$TARGET_NAMESPACE" -o jsonpath='{.spec.containers[0].image}')"
+          if [ "$POD_IMAGE" != "$MONITOR_IMAGE_URI" ]; then
+            echo "FAIL: pod ${POD_NAME} is running image \"${POD_IMAGE}\", expected \"${MONITOR_IMAGE_URI}\"."
+            exit 1
+          fi
+          echo "OK: pod image matches expected: ${POD_IMAGE}"
+
+          RUN_AS_USER="$(kubectl get pod "$POD_NAME" -n "$TARGET_NAMESPACE" -o jsonpath='{.spec.securityContext.runAsUser}')"
+          if [ "$RUN_AS_USER" = "0" ] || [ -z "$RUN_AS_USER" ]; then
+            echo "FAIL: pod ${POD_NAME} securityContext.runAsUser is not a confirmed non-root value: ${RUN_AS_USER:-<empty>}"
+            exit 1
+          fi
+          echo "OK: pod runs as non-root (runAsUser=${RUN_AS_USER})."
+
+          RESTART_COUNT_BEFORE="$(kubectl get pod "$POD_NAME" -n "$TARGET_NAMESPACE" -o jsonpath='{.status.containerStatuses[0].restartCount}')"
+          sleep 15
+          RESTART_COUNT_AFTER="$(kubectl get pod "$POD_NAME" -n "$TARGET_NAMESPACE" -o jsonpath='{.status.containerStatuses[0].restartCount}')"
+          if [ "${RESTART_COUNT_AFTER:-0}" -gt "${RESTART_COUNT_BEFORE:-0}" ]; then
+            echo "FAIL: gg-monitor restart count increased during verification (continuously crashing)."
+            exit 1
+          fi
+          echo "OK: restart count stable (${RESTART_COUNT_BEFORE} -> ${RESTART_COUNT_AFTER})."
+
+          echo "Service:"
+          SERVICE_TYPE="$(kubectl get service gg-monitor -n "$TARGET_NAMESPACE" -o jsonpath='{.spec.type}')"
+          if [ "$SERVICE_TYPE" != "ClusterIP" ]; then
+            echo "FAIL: Service gg-monitor is type ${SERVICE_TYPE}, expected ClusterIP."
+            exit 1
+          fi
+          echo "OK: Service gg-monitor is ClusterIP."
+
+          echo "Ingress:"
+          INGRESS_HOST="$(kubectl get ingress gg-monitor -n "$TARGET_NAMESPACE" -o jsonpath='{.spec.rules[0].host}')"
+          if [ "$INGRESS_HOST" != "monitor.goldengate-dev.adcbmis.local" ]; then
+            echo "FAIL: Ingress host is ${INGRESS_HOST}, expected monitor.goldengate-dev.adcbmis.local."
+            exit 1
+          fi
+          echo "OK: Ingress host matches expected."
+
+          echo "Checking /healthz inside the pod..."
+          if ! kubectl exec "$POD_NAME" -n "$TARGET_NAMESPACE" -- \
+            python3 -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).status == 200 else 1)"; then
+            echo "FAIL: /healthz did not respond with HTTP 200 inside pod ${POD_NAME}."
+            exit 1
+          fi
+          echo "OK: /healthz responded with HTTP 200."
+
+          echo "Checking /readyz inside the pod..."
+          if ! kubectl exec "$POD_NAME" -n "$TARGET_NAMESPACE" -- \
+            python3 -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=5).status == 200 else 1)"; then
+            echo "FAIL: /readyz did not respond with HTTP 200 inside pod ${POD_NAME} (observer role cannot access DynamoDB, or DynamoDB is unavailable)."
+            exit 1
+          fi
+          echo "OK: /readyz responded with HTTP 200 (the read-only role can reach DynamoDB)."
+
+          echo "Checking /api/status inside the pod..."
+          API_STATUS_BODY="$(kubectl exec "$POD_NAME" -n "$TARGET_NAMESPACE" -- \
+            python3 -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8080/api/status', timeout=5).read().decode('utf-8'))")"
+
+          echo "$API_STATUS_BODY" | python3 -c "import json,sys; json.loads(sys.stdin.read())" || {
+            echo "FAIL: /api/status did not return valid JSON."
+            exit 1
+          }
+
+          if ! grep -Fq -- "gg-payments-ora-to-pg-001-source" <<< "$API_STATUS_BODY"; then
+            echo "FAIL: /api/status is missing the source pipeline."
+            exit 1
+          fi
+          if ! grep -Fq -- "gg-payments-ora-to-pg-001-target" <<< "$API_STATUS_BODY"; then
+            echo "FAIL: /api/status is missing the target pipeline."
+            exit 1
+          fi
+          if ! grep -Fq -- "payments-ora-to-pg-001" <<< "$API_STATUS_BODY"; then
+            echo "FAIL: /api/status is missing deploymentId payments-ora-to-pg-001."
+            exit 1
+          fi
+          if ! grep -Fq -- '"component": "source"' <<< "$API_STATUS_BODY"; then
+            echo "FAIL: /api/status is missing component=source."
+            exit 1
+          fi
+          if ! grep -Fq -- '"component": "target"' <<< "$API_STATUS_BODY"; then
+            echo "FAIL: /api/status is missing component=target."
+            exit 1
+          fi
+
+          # Any observed GoldenGate status (HEALTHY/DEGRADED/DOWN/STALE/MISSING)
+          # is a valid operational state and never fails this step -- only
+          # the portal's own inability to run/authenticate/serve does.
+          echo "OK: /api/status is valid JSON and contains both configured pipelines."
+
+          echo "Checking observer/portal logs for forbidden patterns..."
+          POD_LOGS="$(kubectl logs "$POD_NAME" -n "$TARGET_NAMESPACE" --since=10m 2>/dev/null || true)"
+
+          if grep -qi "AccessDeniedException" <<< "$POD_LOGS"; then
+            echo "FAIL: AccessDeniedException found in gg-monitor logs."
+            exit 1
+          fi
+          if grep -qi "you must specify a region" <<< "$POD_LOGS"; then
+            echo "FAIL: a missing-AWS-region error was found in gg-monitor logs."
+            exit 1
+          fi
+
+          echo "OK: no AccessDeniedException or missing-region error found in recent logs."
+          echo "OK: the portal only ever issues GetItem/DescribeTable (see monitor.py) -- no Scan or write call exists in the application code to appear in logs."
+
+      - name: Upload rendered manifests and chart package
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: goldengate-monitor-helm-artifacts
+          path: |
+            rendered/
+            packaged/
+            pulled/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Workflow summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## GoldenGate monitor deploy summary"
+            echo ""
+            echo "- Monitor image URI: \`${MONITOR_IMAGE_URI:-unknown}\`"
+            echo "- Chart version: \`${CHART_VERSION:-unknown}\`"
+            echo "- Chart ref: \`${HELM_CHART_REF:-unknown}\`"
+            echo "- Target namespace: \`${TARGET_NAMESPACE}\`"
+            echo "- Argo CD Application: \`${ARGOCD_APP_NAME}\` (namespace: \`${ARGOCD_NAMESPACE}\`)"
+            echo "- Deploy enabled: \`${{ inputs.deploy }}\`"
+            echo ""
+            echo "### Ownership"
+            echo ""
+            echo "Argo CD owns create/update/delete of the monitor's Kubernetes resources."
+            echo "GitHub Actions only packages/publishes the Helm OCI chart and"
+            echo "creates/updates the Argo CD Application resource -- it never runs"
+            echo "\`kubectl apply\` against the monitor Deployment/Service/Ingress directly."
+            echo ""
+            echo "### Required deployment order"
+            echo ""
+            echo "1. IAM/Secrets Terraform workflow (extended Argo CD ECR read policy)."
+            echo "2. argocd-eks-deployment.yaml (multi-repository token sync, both repository Secrets)."
+            echo "3. This workflow."
+            echo "4. Verify the portal and DynamoDB records."
+          } >> "$GITHUB_STEP_SUMMARY"

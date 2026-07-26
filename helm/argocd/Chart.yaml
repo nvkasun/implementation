@@ -6,7 +6,7 @@ description: >-
   file:// dependency so no public chart repository access is required at
   deploy time.
 type: application
-version: 1.0.0
+version: 1.0.1
 appVersion: "v3.2.12"
 
 dependencies:
