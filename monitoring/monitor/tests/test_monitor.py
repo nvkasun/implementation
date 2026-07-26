@@ -810,23 +810,54 @@ SERVICEACCOUNT_TEMPLATE_PATH = os.path.join(
 )
 
 
+def _extract_manifest_validation_helpers(monitor_text):
+    """The shared select_document()/normalize_value() bash function
+    definitions from the "Validate rendered monitor manifest" step --
+    required by every resource-specific slice extracted below, since those
+    slices call the functions rather than reimplementing the logic inline."""
+    full_step = _extract_run_block(monitor_text, "Validate rendered monitor manifest")
+    start = full_step.index("select_document() {")
+    end = full_step.index('echo "Validating Namespace')
+    return full_step[start:end]
+
+
 def _extract_serviceaccount_validation_snippet(monitor_text):
     """The ServiceAccount/IRSA validation portion of the "Validate rendered
     monitor manifest" step, extracted verbatim from the real workflow."""
     full_step = _extract_run_block(monitor_text, "Validate rendered monitor manifest")
     start = full_step.index('echo "Validating ServiceAccount')
     end = full_step.index('echo "Validating Deployment uses')
-    return full_step[start:end]
+    return _extract_manifest_validation_helpers(monitor_text) + full_step[start:end]
 
 
-def _run_serviceaccount_snippet(monitor_text, rendered_yaml):
-    snippet = _extract_serviceaccount_validation_snippet(monitor_text)
+def _extract_ingress_validation_snippet(monitor_text):
+    """The Ingress host/certificate/protocol validation portion of the
+    "Validate rendered monitor manifest" step, extracted verbatim from the
+    real workflow."""
+    full_step = _extract_run_block(monitor_text, "Validate rendered monitor manifest")
+    start = full_step.index('echo "Validating Ingress exists')
+    end = full_step.index('echo "Validating both configured pipeline keys')
+    return _extract_manifest_validation_helpers(monitor_text) + full_step[start:end]
+
+
+def _run_snippet(snippet, rendered_yaml, extra_env=None):
     with tempfile.TemporaryDirectory() as tmpdir:
         rendered_path = os.path.join(tmpdir, "rendered.yaml")
         with open(rendered_path, "w") as f:
             f.write(rendered_yaml)
-        script = f'set -euo pipefail\nRENDERED="{rendered_path}"\n' + snippet
+        env_lines = f'RENDERED="{rendered_path}"\n'
+        for name, value in (extra_env or {}).items():
+            env_lines += f'{name}="{value}"\n'
+        script = "set -euo pipefail\n" + env_lines + snippet
         return subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+
+
+def _run_serviceaccount_snippet(monitor_text, rendered_yaml):
+    return _run_snippet(_extract_serviceaccount_validation_snippet(monitor_text), rendered_yaml)
+
+
+def _run_ingress_snippet(monitor_text, rendered_yaml):
+    return _run_snippet(_extract_ingress_validation_snippet(monitor_text), rendered_yaml)
 
 
 class ServiceAccountIrsaValidationTests(unittest.TestCase):
@@ -952,6 +983,224 @@ metadata:
   name: argocd-ecr-token-sync
   namespace: argocd
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gg-monitor
+  namespace: goldengate-monitoring
+  annotations:
+    eks.amazonaws.com/role-arn: "arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev"
+"""
+        proc = _run_serviceaccount_snippet(self.monitor_text, rendered)
+        self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+        self.assertIn("OK: ServiceAccount gg-monitor uses the expected IRSA role ARN.", proc.stdout)
+
+
+INGRESS_TEMPLATE_PATH = os.path.join(
+    REPO_ROOT, "helm", "goldengate-monitor", "templates", "ingress.yaml"
+)
+
+_GOOD_INGRESS_RENDERED = """---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: gg-monitor
+  namespace: goldengate-monitoring
+  annotations:
+    alb.ingress.kubernetes.io/backend-protocol: "HTTP"
+    alb.ingress.kubernetes.io/healthcheck-protocol: "HTTP"
+    alb.ingress.kubernetes.io/target-type: "ip"
+    alb.ingress.kubernetes.io/certificate-arn: "arn:aws:acm:eu-west-1:668311715351:certificate/9e53e28e-3243-47fc-85a1-50f9a94acde7"
+spec:
+  rules:
+    - host: "monitor.goldengate-dev.adcbmis.local"
+"""
+
+
+class IngressValidationTests(unittest.TestCase):
+    """Regression coverage for the quote-sensitive Ingress host grep (the
+    same class of bug already fixed for the ServiceAccount role-arn
+    annotation) plus the strengthened certificate-ARN and protocol
+    annotation checks, all scoped to the exact gg-monitor Ingress document."""
+
+    EXPECTED_HOST = "monitor.goldengate-dev.adcbmis.local"
+    EXPECTED_CERT_ARN = "arn:aws:acm:eu-west-1:668311715351:certificate/9e53e28e-3243-47fc-85a1-50f9a94acde7"
+
+    @classmethod
+    def setUpClass(cls):
+        if not os.path.isfile(MONITOR_WORKFLOW_PATH):
+            raise unittest.SkipTest("workflow file not found relative to the repository root")
+        with open(MONITOR_WORKFLOW_PATH) as f:
+            cls.monitor_text = f.read()
+
+    def test_old_unquoted_host_grep_is_gone(self):
+        self.assertNotIn(
+            'grep -q "host: monitor.goldengate-dev.adcbmis.local"',
+            self.monitor_text,
+        )
+
+    def test_quoted_host_passes(self):
+        proc = _run_ingress_snippet(self.monitor_text, _GOOD_INGRESS_RENDERED)
+        self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+        self.assertIn("OK: Ingress gg-monitor uses the expected hostname.", proc.stdout)
+
+    def test_unquoted_host_also_passes(self):
+        rendered = _GOOD_INGRESS_RENDERED.replace(
+            '- host: "monitor.goldengate-dev.adcbmis.local"',
+            "- host: monitor.goldengate-dev.adcbmis.local",
+        )
+        proc = _run_ingress_snippet(self.monitor_text, rendered)
+        self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+        self.assertIn("OK: Ingress gg-monitor uses the expected hostname.", proc.stdout)
+
+    def test_wrong_host_fails_with_expected_and_actual(self):
+        rendered = _GOOD_INGRESS_RENDERED.replace(
+            '- host: "monitor.goldengate-dev.adcbmis.local"',
+            '- host: "wrong.example.com"',
+        )
+        proc = _run_ingress_snippet(self.monitor_text, rendered)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("FAIL: gg-monitor Ingress host mismatch.", proc.stdout)
+        self.assertIn(f"Expected: {self.EXPECTED_HOST}", proc.stdout)
+        self.assertIn("Actual:   wrong.example.com", proc.stdout)
+
+    def test_missing_host_fails_descriptively(self):
+        rendered = """---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: gg-monitor
+  namespace: goldengate-monitoring
+  annotations:
+    alb.ingress.kubernetes.io/backend-protocol: "HTTP"
+    alb.ingress.kubernetes.io/healthcheck-protocol: "HTTP"
+    alb.ingress.kubernetes.io/target-type: "ip"
+    alb.ingress.kubernetes.io/certificate-arn: "arn:aws:acm:eu-west-1:668311715351:certificate/9e53e28e-3243-47fc-85a1-50f9a94acde7"
+spec:
+  rules: []
+"""
+        proc = _run_ingress_snippet(self.monitor_text, rendered)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("FAIL: host is missing from rendered Ingress gg-monitor.", proc.stdout)
+
+    def test_unrelated_ingress_before_gg_monitor_is_not_selected(self):
+        rendered = """---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: some-other-ingress
+  namespace: default
+spec:
+  rules:
+    - host: "decoy.example.com"
+""" + _GOOD_INGRESS_RENDERED
+        proc = _run_ingress_snippet(self.monitor_text, rendered)
+        self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+        self.assertIn("OK: Ingress gg-monitor uses the expected hostname.", proc.stdout)
+
+    def test_quoted_certificate_arn_passes(self):
+        proc = _run_ingress_snippet(self.monitor_text, _GOOD_INGRESS_RENDERED)
+        self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+        self.assertIn("OK: Ingress gg-monitor uses the expected ACM certificate ARN.", proc.stdout)
+
+    def test_wrong_certificate_arn_fails_with_expected_and_actual(self):
+        rendered = _GOOD_INGRESS_RENDERED.replace(
+            'certificate-arn: "arn:aws:acm:eu-west-1:668311715351:certificate/9e53e28e-3243-47fc-85a1-50f9a94acde7"',
+            'certificate-arn: "arn:aws:acm:eu-west-1:668311715351:certificate/WRONG"',
+        )
+        proc = _run_ingress_snippet(self.monitor_text, rendered)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("FAIL: gg-monitor Ingress certificate ARN mismatch.", proc.stdout)
+        self.assertIn(f"Expected: {self.EXPECTED_CERT_ARN}", proc.stdout)
+        self.assertIn(
+            "Actual:   arn:aws:acm:eu-west-1:668311715351:certificate/WRONG", proc.stdout
+        )
+
+    def test_missing_certificate_annotation_fails_descriptively(self):
+        rendered = _GOOD_INGRESS_RENDERED.replace(
+            '    alb.ingress.kubernetes.io/certificate-arn: '
+            '"arn:aws:acm:eu-west-1:668311715351:certificate/9e53e28e-3243-47fc-85a1-50f9a94acde7"\n',
+            "",
+        )
+        proc = _run_ingress_snippet(self.monitor_text, rendered)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn(
+            "FAIL: certificate ARN annotation is missing from Ingress gg-monitor.", proc.stdout
+        )
+
+    def test_http_backend_protocol_passes_quoted_and_unquoted(self):
+        proc = _run_ingress_snippet(self.monitor_text, _GOOD_INGRESS_RENDERED)
+        self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+
+        unquoted = _GOOD_INGRESS_RENDERED.replace(
+            'backend-protocol: "HTTP"', "backend-protocol: HTTP"
+        )
+        proc = _run_ingress_snippet(self.monitor_text, unquoted)
+        self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+
+    def test_https_backend_protocol_fails(self):
+        rendered = _GOOD_INGRESS_RENDERED.replace(
+            'backend-protocol: "HTTP"', 'backend-protocol: "HTTPS"'
+        )
+        proc = _run_ingress_snippet(self.monitor_text, rendered)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("FAIL: gg-monitor Ingress backend protocol mismatch.", proc.stdout)
+        self.assertIn("Expected: HTTP", proc.stdout)
+        self.assertIn("Actual:   HTTPS", proc.stdout)
+
+    def test_http_healthcheck_protocol_passes(self):
+        proc = _run_ingress_snippet(self.monitor_text, _GOOD_INGRESS_RENDERED)
+        self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+        self.assertIn(
+            "OK: Ingress gg-monitor uses HTTP backend/health-check protocols and target-type=ip.",
+            proc.stdout,
+        )
+
+    def test_target_type_ip_passes(self):
+        proc = _run_ingress_snippet(self.monitor_text, _GOOD_INGRESS_RENDERED)
+        self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+
+        wrong_target_type = _GOOD_INGRESS_RENDERED.replace(
+            'target-type: "ip"', 'target-type: "instance"'
+        )
+        proc = _run_ingress_snippet(self.monitor_text, wrong_target_type)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("FAIL: gg-monitor Ingress target type mismatch.", proc.stdout)
+        self.assertIn("Expected: ip", proc.stdout)
+        self.assertIn("Actual:   instance", proc.stdout)
+
+    def test_ingress_template_still_uses_quote_filter_on_host(self):
+        with open(INGRESS_TEMPLATE_PATH) as f:
+            template_text = f.read()
+        self.assertIn(".Values.ingress.host | quote", template_text)
+
+    def test_no_bare_positive_grep_remains_in_manifest_validation(self):
+        """Every remaining assertion in the full "Validate rendered monitor
+        manifest" run block must be an explicit conditional -- no bare
+        `grep -q ... "$RENDERED"`/`"$SOME_BLOCK"` left unguarded that would
+        silently exit the step under set -euo pipefail on a mismatch."""
+        full_step = _extract_run_block(self.monitor_text, "Validate rendered monitor manifest")
+        for line in full_step.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            # A bare assertion is a line that IS a grep invocation (not
+            # inside an if/while condition or a command substitution) with
+            # no leading "if "/"! "/"elif " guard and no trailing "|| true"
+            # escape hatch used for controlled lookups.
+            if re.match(r'^grep\s', stripped) and "$(" not in stripped:
+                self.fail(f"bare unguarded grep assertion found: {stripped!r}")
+
+    def test_no_echo_pipe_grep_in_ingress_validation(self):
+        snippet = _extract_ingress_validation_snippet(self.monitor_text)
+        self.assertNotRegex(snippet, r'echo\s+"\$[A-Za-z_]+"\s*\|\s*grep')
+
+    def test_existing_serviceaccount_tests_still_pass(self):
+        """Sanity check that the ServiceAccount slice extraction/execution
+        still works after the shared select_document/normalize_value
+        functions were factored out -- full coverage lives in
+        ServiceAccountIrsaValidationTests."""
+        rendered = """---
 apiVersion: v1
 kind: ServiceAccount
 metadata:

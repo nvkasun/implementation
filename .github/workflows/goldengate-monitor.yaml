@@ -619,33 +619,68 @@ jobs:
 
           RENDERED="rendered/${RELEASE_NAME}.yaml"
 
+          # Reusable, dependency-free (no yq/jq/PyYAML) exact-document
+          # selector: splits the multi-document rendered manifest on "---"
+          # and returns the one document whose kind and metadata.name match
+          # exactly. This is required, not cosmetic: a whole-manifest grep
+          # for "kind: Service" is a substring match that is also silently
+          # satisfied by "kind: ServiceAccount" -- exact per-document
+          # selection is the only way to validate one resource without risk
+          # of being fooled by an unrelated one, regardless of render order.
+          select_document() {
+            local rendered_file="$1"
+            local expected_kind="$2"
+            local expected_name="$3"
+            local split_dir
+            split_dir="$(mktemp -d)"
+            awk -v outdir="$split_dir" '
+              BEGIN { docnum = 0; fname = outdir "/doc-0.yaml" }
+              /^---$/ { docnum++; fname = outdir "/doc-" docnum ".yaml"; next }
+              { print > fname }
+            ' "$rendered_file"
+
+            local found=""
+            local doc
+            for doc in "$split_dir"/doc-*.yaml; do
+              if grep -q "^kind: ${expected_kind}\$" "$doc" && grep -q "^  name: ${expected_name}\$" "$doc"; then
+                found="$(cat "$doc")"
+                break
+              fi
+            done
+            rm -rf "$split_dir"
+            printf '%s' "$found"
+          }
+
+          # Normalizes a raw "key:<tail>" string into a bare value: strips a
+          # trailing CR, leading/trailing whitespace (also drops the "- "
+          # YAML list-item marker when present, since it is never left
+          # attached once the leading "key:" substring has been cut away),
+          # then one matching layer of surrounding single or double YAML
+          # quotes -- so every comparison below passes whether Helm's
+          # `| quote` filter rendered the value quoted or not.
+          normalize_value() {
+            local value="$1"
+            value="${value//$'\r'/}"
+            read -r value <<< "$value"
+            if [[ "$value" == \"*\" && "$value" == *\" ]]; then
+              value="${value#\"}"
+              value="${value%\"}"
+            elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
+              value="${value#\'}"
+              value="${value%\'}"
+            fi
+            printf '%s' "$value"
+          }
+
           echo "Validating Namespace..."
-          grep -q "kind: Namespace" "$RENDERED"
-          grep -q "name: ${TARGET_NAMESPACE}" "$RENDERED"
+          NAMESPACE_BLOCK="$(select_document "$RENDERED" "Namespace" "${TARGET_NAMESPACE}")"
+          if [ -z "$NAMESPACE_BLOCK" ]; then
+            echo "FAIL: rendered Namespace ${TARGET_NAMESPACE} was not found."
+            exit 1
+          fi
 
           echo "Validating ServiceAccount and exact IRSA role ARN..."
-
-          # Deterministic document selection: Helm's `| quote` filter means
-          # this annotation always renders double-quoted, but a bare literal
-          # grep must not depend on that -- and a whole-manifest grep for
-          # "kind: ServiceAccount" would silently match an unrelated
-          # ServiceAccount if one is ever rendered before/after this one.
-          SA_SPLIT_DIR="$(mktemp -d)"
-          awk -v outdir="$SA_SPLIT_DIR" '
-            BEGIN { docnum = 0; fname = outdir "/doc-0.yaml" }
-            /^---$/ { docnum++; fname = outdir "/doc-" docnum ".yaml"; next }
-            { print > fname }
-          ' "$RENDERED"
-
-          SERVICEACCOUNT_BLOCK=""
-          for SA_DOC in "$SA_SPLIT_DIR"/doc-*.yaml; do
-            if grep -q '^kind: ServiceAccount$' "$SA_DOC" && grep -q '^  name: gg-monitor$' "$SA_DOC"; then
-              SERVICEACCOUNT_BLOCK="$(cat "$SA_DOC")"
-              break
-            fi
-          done
-          rm -rf "$SA_SPLIT_DIR"
-
+          SERVICEACCOUNT_BLOCK="$(select_document "$RENDERED" "ServiceAccount" "gg-monitor")"
           if [ -z "$SERVICEACCOUNT_BLOCK" ]; then
             echo "FAIL: rendered ServiceAccount gg-monitor was not found."
             exit 1
@@ -666,22 +701,7 @@ jobs:
             exit 1
           fi
 
-          # Normalize the annotation value: strip the key, a trailing CR (if
-          # any), leading/trailing whitespace, then one layer of surrounding
-          # quotes -- so this comparison passes whether Helm rendered the
-          # value quoted (its actual, `| quote`-driven behavior) or
-          # unquoted (never assumed).
-          SA_ROLE_ARN_ACTUAL="${SA_ROLE_ARN_LINE#*role-arn:}"
-          SA_ROLE_ARN_ACTUAL="${SA_ROLE_ARN_ACTUAL//$'\r'/}"
-          read -r SA_ROLE_ARN_ACTUAL <<< "$SA_ROLE_ARN_ACTUAL"
-          if [[ "$SA_ROLE_ARN_ACTUAL" == \"*\" && "$SA_ROLE_ARN_ACTUAL" == *\" ]]; then
-            SA_ROLE_ARN_ACTUAL="${SA_ROLE_ARN_ACTUAL#\"}"
-            SA_ROLE_ARN_ACTUAL="${SA_ROLE_ARN_ACTUAL%\"}"
-          elif [[ "$SA_ROLE_ARN_ACTUAL" == \'*\' && "$SA_ROLE_ARN_ACTUAL" == *\' ]]; then
-            SA_ROLE_ARN_ACTUAL="${SA_ROLE_ARN_ACTUAL#\'}"
-            SA_ROLE_ARN_ACTUAL="${SA_ROLE_ARN_ACTUAL%\'}"
-          fi
-
+          SA_ROLE_ARN_ACTUAL="$(normalize_value "${SA_ROLE_ARN_LINE#*role-arn:}")"
           SA_ROLE_ARN_EXPECTED="arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev"
 
           if [ "$SA_ROLE_ARN_ACTUAL" != "$SA_ROLE_ARN_EXPECTED" ]; then
@@ -694,8 +714,16 @@ jobs:
           echo "OK: ServiceAccount gg-monitor uses the expected IRSA role ARN."
 
           echo "Validating Deployment uses the full image URI..."
-          grep -q "kind: Deployment" "$RENDERED"
-          grep -q "image: \"${MONITOR_IMAGE_URI}\"" "$RENDERED"
+          DEPLOYMENT_BLOCK="$(select_document "$RENDERED" "Deployment" "gg-monitor")"
+          if [ -z "$DEPLOYMENT_BLOCK" ]; then
+            echo "FAIL: rendered Deployment gg-monitor was not found."
+            exit 1
+          fi
+          if ! grep -Fq -- "image: \"${MONITOR_IMAGE_URI}\"" <<< "$DEPLOYMENT_BLOCK"; then
+            echo "FAIL: Deployment gg-monitor does not use the expected image URI."
+            echo "Expected: ${MONITOR_IMAGE_URI}"
+            exit 1
+          fi
 
           echo "Validating no Secret/CSI/PVC/hostPath is rendered..."
           if grep -qE '^kind: Secret$' "$RENDERED"; then
@@ -724,35 +752,139 @@ jobs:
           fi
 
           echo "Validating Service is ClusterIP on 8080..."
-          grep -q "kind: Service" "$RENDERED"
-          grep -q "type: ClusterIP" "$RENDERED"
-          grep -q "port: 8080" "$RENDERED"
+          SERVICE_BLOCK="$(select_document "$RENDERED" "Service" "gg-monitor")"
+          if [ -z "$SERVICE_BLOCK" ]; then
+            echo "FAIL: rendered Service gg-monitor was not found."
+            exit 1
+          fi
+          if ! grep -Fq -- "type: ClusterIP" <<< "$SERVICE_BLOCK"; then
+            echo "FAIL: Service gg-monitor is not type ClusterIP."
+            exit 1
+          fi
+          if ! grep -Fq -- "port: 8080" <<< "$SERVICE_BLOCK"; then
+            echo "FAIL: Service gg-monitor is not exposing port 8080."
+            exit 1
+          fi
 
-          echo "Validating ingress backend/health protocols are HTTP..."
-          grep -q 'alb.ingress.kubernetes.io/backend-protocol: "HTTP"' "$RENDERED"
-          grep -q 'alb.ingress.kubernetes.io/healthcheck-protocol: "HTTP"' "$RENDERED"
-          grep -q 'alb.ingress.kubernetes.io/target-type: "ip"' "$RENDERED"
+          echo "Validating Ingress exists, and its host/certificate/protocol annotations..."
+          INGRESS_BLOCK="$(select_document "$RENDERED" "Ingress" "gg-monitor")"
+          if [ -z "$INGRESS_BLOCK" ]; then
+            echo "FAIL: rendered Ingress gg-monitor was not found."
+            exit 1
+          fi
+          if ! grep -Fq -- "kind: Ingress" <<< "$INGRESS_BLOCK"; then
+            echo "FAIL: extracted document is not kind: Ingress."
+            exit 1
+          fi
+          if ! grep -Fq -- "  name: gg-monitor" <<< "$INGRESS_BLOCK"; then
+            echo "FAIL: extracted Ingress's metadata.name is not gg-monitor."
+            exit 1
+          fi
 
-          echo "Validating ingress host and certificate ARN..."
-          grep -q "host: monitor.goldengate-dev.adcbmis.local" "$RENDERED"
-          grep -q "alb.ingress.kubernetes.io/certificate-arn:" "$RENDERED"
+          INGRESS_HOST_LINE="$(grep -m1 -F -- "- host:" <<< "$INGRESS_BLOCK" || true)"
+          if [ -z "$INGRESS_HOST_LINE" ]; then
+            echo "FAIL: host is missing from rendered Ingress gg-monitor."
+            exit 1
+          fi
+          INGRESS_HOST_ACTUAL="$(normalize_value "${INGRESS_HOST_LINE#*host:}")"
+          INGRESS_HOST_EXPECTED="monitor.goldengate-dev.adcbmis.local"
+          if [ "$INGRESS_HOST_ACTUAL" != "$INGRESS_HOST_EXPECTED" ]; then
+            echo "FAIL: gg-monitor Ingress host mismatch."
+            echo "Expected: ${INGRESS_HOST_EXPECTED}"
+            echo "Actual:   ${INGRESS_HOST_ACTUAL}"
+            exit 1
+          fi
+          echo "OK: Ingress gg-monitor uses the expected hostname."
+
+          INGRESS_CERT_LINE="$(grep -m1 -- "alb.ingress.kubernetes.io/certificate-arn:" <<< "$INGRESS_BLOCK" || true)"
+          if [ -z "$INGRESS_CERT_LINE" ]; then
+            echo "FAIL: certificate ARN annotation is missing from Ingress gg-monitor."
+            exit 1
+          fi
+          INGRESS_CERT_ACTUAL="$(normalize_value "${INGRESS_CERT_LINE#*certificate-arn:}")"
+          INGRESS_CERT_EXPECTED="arn:aws:acm:eu-west-1:668311715351:certificate/9e53e28e-3243-47fc-85a1-50f9a94acde7"
+          if [ "$INGRESS_CERT_ACTUAL" != "$INGRESS_CERT_EXPECTED" ]; then
+            echo "FAIL: gg-monitor Ingress certificate ARN mismatch."
+            echo "Expected: ${INGRESS_CERT_EXPECTED}"
+            echo "Actual:   ${INGRESS_CERT_ACTUAL}"
+            exit 1
+          fi
+          echo "OK: Ingress gg-monitor uses the expected ACM certificate ARN."
+
+          INGRESS_BACKEND_PROTOCOL_LINE="$(grep -m1 -- "alb.ingress.kubernetes.io/backend-protocol:" <<< "$INGRESS_BLOCK" || true)"
+          if [ -z "$INGRESS_BACKEND_PROTOCOL_LINE" ]; then
+            echo "FAIL: backend-protocol annotation is missing from Ingress gg-monitor."
+            exit 1
+          fi
+          INGRESS_BACKEND_PROTOCOL_ACTUAL="$(normalize_value "${INGRESS_BACKEND_PROTOCOL_LINE#*backend-protocol:}")"
+          if [ "$INGRESS_BACKEND_PROTOCOL_ACTUAL" != "HTTP" ]; then
+            echo "FAIL: gg-monitor Ingress backend protocol mismatch."
+            echo "Expected: HTTP"
+            echo "Actual:   ${INGRESS_BACKEND_PROTOCOL_ACTUAL}"
+            exit 1
+          fi
+
+          INGRESS_HEALTHCHECK_PROTOCOL_LINE="$(grep -m1 -- "alb.ingress.kubernetes.io/healthcheck-protocol:" <<< "$INGRESS_BLOCK" || true)"
+          if [ -z "$INGRESS_HEALTHCHECK_PROTOCOL_LINE" ]; then
+            echo "FAIL: healthcheck-protocol annotation is missing from Ingress gg-monitor."
+            exit 1
+          fi
+          INGRESS_HEALTHCHECK_PROTOCOL_ACTUAL="$(normalize_value "${INGRESS_HEALTHCHECK_PROTOCOL_LINE#*healthcheck-protocol:}")"
+          if [ "$INGRESS_HEALTHCHECK_PROTOCOL_ACTUAL" != "HTTP" ]; then
+            echo "FAIL: gg-monitor Ingress health-check protocol mismatch."
+            echo "Expected: HTTP"
+            echo "Actual:   ${INGRESS_HEALTHCHECK_PROTOCOL_ACTUAL}"
+            exit 1
+          fi
+
+          INGRESS_TARGET_TYPE_LINE="$(grep -m1 -- "alb.ingress.kubernetes.io/target-type:" <<< "$INGRESS_BLOCK" || true)"
+          if [ -z "$INGRESS_TARGET_TYPE_LINE" ]; then
+            echo "FAIL: target-type annotation is missing from Ingress gg-monitor."
+            exit 1
+          fi
+          INGRESS_TARGET_TYPE_ACTUAL="$(normalize_value "${INGRESS_TARGET_TYPE_LINE#*target-type:}")"
+          if [ "$INGRESS_TARGET_TYPE_ACTUAL" != "ip" ]; then
+            echo "FAIL: gg-monitor Ingress target type mismatch."
+            echo "Expected: ip"
+            echo "Actual:   ${INGRESS_TARGET_TYPE_ACTUAL}"
+            exit 1
+          fi
+
+          echo "OK: Ingress gg-monitor uses HTTP backend/health-check protocols and target-type=ip."
 
           echo "Validating both configured pipeline keys are rendered..."
-          grep -q "gg-payments-ora-to-pg-001-source" "$RENDERED"
-          grep -q "gg-payments-ora-to-pg-001-target" "$RENDERED"
+          if ! grep -q "gg-payments-ora-to-pg-001-source" "$RENDERED"; then
+            echo "FAIL: configured pipeline gg-payments-ora-to-pg-001-source was not found in the rendered manifest."
+            exit 1
+          fi
+          if ! grep -q "gg-payments-ora-to-pg-001-target" "$RENDERED"; then
+            echo "FAIL: configured pipeline gg-payments-ora-to-pg-001-target was not found in the rendered manifest."
+            exit 1
+          fi
 
-          echo "Validating securityContext requirements..."
-          grep -q "runAsNonRoot: true" "$RENDERED"
-          grep -q "runAsUser: 10001" "$RENDERED"
-          grep -q "readOnlyRootFilesystem: true" "$RENDERED"
-          grep -q "allowPrivilegeEscalation: false" "$RENDERED"
-          if grep -q "privileged: true" "$RENDERED"; then
-            echo "FAIL: privileged: true found in rendered manifest."
+          echo "Validating pod/container securityContext requirements..."
+          if ! grep -Fq -- "runAsNonRoot: true" <<< "$DEPLOYMENT_BLOCK"; then
+            echo "FAIL: runAsNonRoot: true was not found on the Deployment."
+            exit 1
+          fi
+          if ! grep -Fq -- "runAsUser: 10001" <<< "$DEPLOYMENT_BLOCK"; then
+            echo "FAIL: runAsUser: 10001 was not found on the Deployment."
+            exit 1
+          fi
+          if ! grep -Fq -- "readOnlyRootFilesystem: true" <<< "$DEPLOYMENT_BLOCK"; then
+            echo "FAIL: readOnlyRootFilesystem: true was not found on the Deployment."
+            exit 1
+          fi
+          if ! grep -Fq -- "allowPrivilegeEscalation: false" <<< "$DEPLOYMENT_BLOCK"; then
+            echo "FAIL: allowPrivilegeEscalation: false was not found on the Deployment."
+            exit 1
+          fi
+          if grep -Fq -- "privileged: true" <<< "$DEPLOYMENT_BLOCK"; then
+            echo "FAIL: privileged: true found on the Deployment."
             exit 1
           fi
 
           echo "Validating /healthz and /readyz probes..."
-          DEPLOYMENT_BLOCK="$(awk '/^kind: Deployment$/{flag=1} flag{print} /^---$/{if(flag) exit}' "$RENDERED")"
           if ! grep -Fq -- "path: /healthz" <<< "$DEPLOYMENT_BLOCK"; then
             echo "FAIL: /healthz probe not found on the Deployment."
             exit 1
