@@ -805,5 +805,165 @@ rules:
         self.assertIn("argocd-ecr-goldengate-monitor-oci", proc.stdout)
 
 
+SERVICEACCOUNT_TEMPLATE_PATH = os.path.join(
+    REPO_ROOT, "helm", "goldengate-monitor", "templates", "serviceaccount.yaml"
+)
+
+
+def _extract_serviceaccount_validation_snippet(monitor_text):
+    """The ServiceAccount/IRSA validation portion of the "Validate rendered
+    monitor manifest" step, extracted verbatim from the real workflow."""
+    full_step = _extract_run_block(monitor_text, "Validate rendered monitor manifest")
+    start = full_step.index('echo "Validating ServiceAccount')
+    end = full_step.index('echo "Validating Deployment uses')
+    return full_step[start:end]
+
+
+def _run_serviceaccount_snippet(monitor_text, rendered_yaml):
+    snippet = _extract_serviceaccount_validation_snippet(monitor_text)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        rendered_path = os.path.join(tmpdir, "rendered.yaml")
+        with open(rendered_path, "w") as f:
+            f.write(rendered_yaml)
+        script = f'set -euo pipefail\nRENDERED="{rendered_path}"\n' + snippet
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+
+
+class ServiceAccountIrsaValidationTests(unittest.TestCase):
+    """Regression coverage for the quote-sensitive ServiceAccount role-arn
+    grep that silently passed the workflow step under set -euo pipefail
+    while never actually matching the (correctly quoted) rendered value."""
+
+    EXPECTED_ARN = "arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev"
+
+    @classmethod
+    def setUpClass(cls):
+        if not os.path.isfile(MONITOR_WORKFLOW_PATH):
+            raise unittest.SkipTest("workflow file not found relative to the repository root")
+        with open(MONITOR_WORKFLOW_PATH) as f:
+            cls.monitor_text = f.read()
+
+    def test_old_unquoted_role_arn_grep_is_gone(self):
+        self.assertNotIn(
+            'grep -q "eks.amazonaws.com/role-arn: arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev"',
+            self.monitor_text,
+        )
+
+    def test_no_echo_pipe_grep_in_serviceaccount_validation(self):
+        snippet = _extract_serviceaccount_validation_snippet(self.monitor_text)
+        self.assertNotIn('echo "$SERVICEACCOUNT_BLOCK" | grep', snippet)
+        self.assertNotRegex(snippet, r'echo\s+"\$[A-Za-z_]+"\s*\|\s*grep')
+
+    def test_serviceaccount_template_still_uses_quote_filter(self):
+        with open(SERVICEACCOUNT_TEMPLATE_PATH) as f:
+            template_text = f.read()
+        self.assertIn(".Values.serviceAccount.roleArn | quote", template_text)
+
+    def test_quoted_arn_passes(self):
+        rendered = """---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gg-monitor
+  namespace: goldengate-monitoring
+  annotations:
+    eks.amazonaws.com/role-arn: "arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev"
+"""
+        proc = _run_serviceaccount_snippet(self.monitor_text, rendered)
+        self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+        self.assertIn("OK: ServiceAccount gg-monitor uses the expected IRSA role ARN.", proc.stdout)
+
+    def test_unquoted_arn_also_passes(self):
+        rendered = """---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gg-monitor
+  namespace: goldengate-monitoring
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev
+"""
+        proc = _run_serviceaccount_snippet(self.monitor_text, rendered)
+        self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+        self.assertIn("OK: ServiceAccount gg-monitor uses the expected IRSA role ARN.", proc.stdout)
+
+    def test_wrong_arn_fails_with_expected_and_actual(self):
+        rendered = """---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gg-monitor
+  namespace: goldengate-monitoring
+  annotations:
+    eks.amazonaws.com/role-arn: "arn:aws:iam::999999999999:role/WrongRole"
+"""
+        proc = _run_serviceaccount_snippet(self.monitor_text, rendered)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("FAIL: gg-monitor IRSA role ARN mismatch.", proc.stdout)
+        self.assertIn(f"Expected: {self.EXPECTED_ARN}", proc.stdout)
+        self.assertIn("Actual:   arn:aws:iam::999999999999:role/WrongRole", proc.stdout)
+
+    def test_missing_annotation_fails_with_descriptive_message(self):
+        rendered = """---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gg-monitor
+  namespace: goldengate-monitoring
+  annotations:
+    some-other-annotation: "value"
+"""
+        proc = _run_serviceaccount_snippet(self.monitor_text, rendered)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn(
+            "FAIL: eks.amazonaws.com/role-arn annotation is missing from ServiceAccount gg-monitor.",
+            proc.stdout,
+        )
+
+    def test_serviceaccount_not_found_fails_with_descriptive_message(self):
+        rendered = """---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: some-other-sa
+  namespace: default
+"""
+        proc = _run_serviceaccount_snippet(self.monitor_text, rendered)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("FAIL: rendered ServiceAccount gg-monitor was not found.", proc.stdout)
+
+    def test_unrelated_serviceaccount_before_gg_monitor_is_not_selected(self):
+        """An unrelated ServiceAccount (even one with a similarly-prefixed
+        name and a deliberately wrong ARN) rendered before gg-monitor must
+        never be mistaken for it -- the real gg-monitor document, appearing
+        second, must still be the one validated."""
+        rendered = """---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gg-monitor-old
+  namespace: goldengate-monitoring
+  annotations:
+    eks.amazonaws.com/role-arn: "arn:aws:iam::111111111111:role/DecoyRole"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: argocd-ecr-token-sync
+  namespace: argocd
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gg-monitor
+  namespace: goldengate-monitoring
+  annotations:
+    eks.amazonaws.com/role-arn: "arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev"
+"""
+        proc = _run_serviceaccount_snippet(self.monitor_text, rendered)
+        self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+        self.assertIn("OK: ServiceAccount gg-monitor uses the expected IRSA role ARN.", proc.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

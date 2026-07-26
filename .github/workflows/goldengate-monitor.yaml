@@ -624,9 +624,74 @@ jobs:
           grep -q "name: ${TARGET_NAMESPACE}" "$RENDERED"
 
           echo "Validating ServiceAccount and exact IRSA role ARN..."
-          grep -q "kind: ServiceAccount" "$RENDERED"
-          grep -q "name: gg-monitor" "$RENDERED"
-          grep -q "eks.amazonaws.com/role-arn: arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev" "$RENDERED"
+
+          # Deterministic document selection: Helm's `| quote` filter means
+          # this annotation always renders double-quoted, but a bare literal
+          # grep must not depend on that -- and a whole-manifest grep for
+          # "kind: ServiceAccount" would silently match an unrelated
+          # ServiceAccount if one is ever rendered before/after this one.
+          SA_SPLIT_DIR="$(mktemp -d)"
+          awk -v outdir="$SA_SPLIT_DIR" '
+            BEGIN { docnum = 0; fname = outdir "/doc-0.yaml" }
+            /^---$/ { docnum++; fname = outdir "/doc-" docnum ".yaml"; next }
+            { print > fname }
+          ' "$RENDERED"
+
+          SERVICEACCOUNT_BLOCK=""
+          for SA_DOC in "$SA_SPLIT_DIR"/doc-*.yaml; do
+            if grep -q '^kind: ServiceAccount$' "$SA_DOC" && grep -q '^  name: gg-monitor$' "$SA_DOC"; then
+              SERVICEACCOUNT_BLOCK="$(cat "$SA_DOC")"
+              break
+            fi
+          done
+          rm -rf "$SA_SPLIT_DIR"
+
+          if [ -z "$SERVICEACCOUNT_BLOCK" ]; then
+            echo "FAIL: rendered ServiceAccount gg-monitor was not found."
+            exit 1
+          fi
+
+          if ! grep -Fq -- "kind: ServiceAccount" <<< "$SERVICEACCOUNT_BLOCK"; then
+            echo "FAIL: extracted document is not kind: ServiceAccount."
+            exit 1
+          fi
+          if ! grep -Fq -- "  name: gg-monitor" <<< "$SERVICEACCOUNT_BLOCK"; then
+            echo "FAIL: extracted ServiceAccount's metadata.name is not gg-monitor."
+            exit 1
+          fi
+
+          SA_ROLE_ARN_LINE="$(grep -m1 -- "eks.amazonaws.com/role-arn:" <<< "$SERVICEACCOUNT_BLOCK" || true)"
+          if [ -z "$SA_ROLE_ARN_LINE" ]; then
+            echo "FAIL: eks.amazonaws.com/role-arn annotation is missing from ServiceAccount gg-monitor."
+            exit 1
+          fi
+
+          # Normalize the annotation value: strip the key, a trailing CR (if
+          # any), leading/trailing whitespace, then one layer of surrounding
+          # quotes -- so this comparison passes whether Helm rendered the
+          # value quoted (its actual, `| quote`-driven behavior) or
+          # unquoted (never assumed).
+          SA_ROLE_ARN_ACTUAL="${SA_ROLE_ARN_LINE#*role-arn:}"
+          SA_ROLE_ARN_ACTUAL="${SA_ROLE_ARN_ACTUAL//$'\r'/}"
+          read -r SA_ROLE_ARN_ACTUAL <<< "$SA_ROLE_ARN_ACTUAL"
+          if [[ "$SA_ROLE_ARN_ACTUAL" == \"*\" && "$SA_ROLE_ARN_ACTUAL" == *\" ]]; then
+            SA_ROLE_ARN_ACTUAL="${SA_ROLE_ARN_ACTUAL#\"}"
+            SA_ROLE_ARN_ACTUAL="${SA_ROLE_ARN_ACTUAL%\"}"
+          elif [[ "$SA_ROLE_ARN_ACTUAL" == \'*\' && "$SA_ROLE_ARN_ACTUAL" == *\' ]]; then
+            SA_ROLE_ARN_ACTUAL="${SA_ROLE_ARN_ACTUAL#\'}"
+            SA_ROLE_ARN_ACTUAL="${SA_ROLE_ARN_ACTUAL%\'}"
+          fi
+
+          SA_ROLE_ARN_EXPECTED="arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev"
+
+          if [ "$SA_ROLE_ARN_ACTUAL" != "$SA_ROLE_ARN_EXPECTED" ]; then
+            echo "FAIL: gg-monitor IRSA role ARN mismatch."
+            echo "Expected: ${SA_ROLE_ARN_EXPECTED}"
+            echo "Actual:   ${SA_ROLE_ARN_ACTUAL}"
+            exit 1
+          fi
+
+          echo "OK: ServiceAccount gg-monitor uses the expected IRSA role ARN."
 
           echo "Validating Deployment uses the full image URI..."
           grep -q "kind: Deployment" "$RENDERED"
