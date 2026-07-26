@@ -1,1 +1,1 @@
-test
+kubectl exec -n goldengate-monitoring deployment/gg-monitor -- python3 -c 'import boto3,os;r=boto3.client("dynamodb",region_name=os.environ["AWS_REGION"]).describe_table(TableName=os.environ["DYNAMODB_TABLE"]);print(r["Table"].get("SSEDescription",{}).get("KMSMasterKeyArn","NO_KMS_KEY_ARN"))'
