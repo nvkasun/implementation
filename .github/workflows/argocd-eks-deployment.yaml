@@ -312,10 +312,38 @@ jobs:
           grep -q "argocd-ecr-goldengate-oci" "$RENDERED"
           grep -q "argocd-ecr-goldengate-monitor-oci" "$RENDERED"
 
-          echo "Checking RBAC resourceNames includes both repository Secrets..."
-          RBAC_BLOCK="$(awk '/^kind: Role$/{flag=1} flag{print} /^---$/{if(flag) exit}' "$RENDERED")"
+          echo "Checking RBAC resourceNames includes both repository Secrets, using the exact argocd-ecr-token-sync Role (not merely the first rendered Role -- the Argo CD wrapper chart renders many Role/ClusterRole objects for its own components)..."
+
+          RBAC_SPLIT_DIR="$(mktemp -d)"
+          awk -v outdir="$RBAC_SPLIT_DIR" '
+            BEGIN { docnum = 0; fname = outdir "/doc-0.yaml" }
+            /^---$/ { docnum++; fname = outdir "/doc-" docnum ".yaml"; next }
+            { print > fname }
+          ' "$RENDERED"
+
+          RBAC_BLOCK=""
+          for RBAC_DOC in "$RBAC_SPLIT_DIR"/doc-*.yaml; do
+            if grep -q '^kind: Role$' "$RBAC_DOC" && grep -q '^  name: argocd-ecr-token-sync$' "$RBAC_DOC"; then
+              RBAC_BLOCK="$(cat "$RBAC_DOC")"
+              break
+            fi
+          done
+          rm -rf "$RBAC_SPLIT_DIR"
+
           if [ -z "$RBAC_BLOCK" ]; then
-            echo "FAIL: could not isolate the rendered Role block for ECR token sync."
+            echo "FAIL: no rendered document has both kind: Role and metadata.name: argocd-ecr-token-sync."
+            echo "Selecting the first rendered Role is unsafe -- it may belong to an unrelated Argo CD component instead of argocd-ecr-token-sync."
+            exit 1
+          fi
+
+          echo "Explicitly verifying the extracted document..."
+
+          if ! grep -Fq -- "kind: Role" <<< "$RBAC_BLOCK"; then
+            echo "FAIL: extracted document is not kind: Role."
+            exit 1
+          fi
+          if ! grep -Fq -- "  name: argocd-ecr-token-sync" <<< "$RBAC_BLOCK"; then
+            echo "FAIL: extracted Role's metadata.name is not argocd-ecr-token-sync."
             exit 1
           fi
           if ! grep -Fq -- "argocd-ecr-goldengate-oci" <<< "$RBAC_BLOCK"; then
@@ -324,6 +352,22 @@ jobs:
           fi
           if ! grep -Fq -- "argocd-ecr-goldengate-monitor-oci" <<< "$RBAC_BLOCK"; then
             echo "FAIL: Role resourceNames is missing argocd-ecr-goldengate-monitor-oci."
+            exit 1
+          fi
+          if ! grep -Fq -- "- get" <<< "$RBAC_BLOCK"; then
+            echo "FAIL: Role does not grant the get verb."
+            exit 1
+          fi
+          if ! grep -Fq -- "- update" <<< "$RBAC_BLOCK"; then
+            echo "FAIL: Role does not grant the update verb."
+            exit 1
+          fi
+          if ! grep -Fq -- "- patch" <<< "$RBAC_BLOCK"; then
+            echo "FAIL: Role does not grant the patch verb."
+            exit 1
+          fi
+          if grep -Eq -- '^[[:space:]]*-[[:space:]]*(delete|list|watch)[[:space:]]*$' <<< "$RBAC_BLOCK"; then
+            echo "FAIL: Role grants a forbidden verb (delete, list, or watch)."
             exit 1
           fi
 
@@ -586,7 +630,11 @@ jobs:
           # No short-lived ECR password is ever injected from GitHub Actions
           # here -- this Job runs the exact same in-cluster IRSA-based
           # script the CronJob already uses.
-          JOB_NAME="ecr-token-sync-verify-${{ github.run_id }}"
+          # run_attempt (not just run_id) is required: a GitHub Actions rerun
+          # reuses the same run_id but increments run_attempt, and failed
+          # validation Jobs are deliberately retained as evidence -- so a
+          # rerun must not collide with a still-retained failed Job's name.
+          JOB_NAME="ecr-token-sync-verify-${{ github.run_id }}-${{ github.run_attempt }}"
           # Kubernetes Job names must be <=63 chars, lowercase alphanumeric/hyphen.
           JOB_NAME="$(echo "$JOB_NAME" | tr '[:upper:]' '[:lower:]' | cut -c1-63 | sed -E 's/-+$//')"
 

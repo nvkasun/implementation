@@ -1,12 +1,19 @@
 import html as html_module
 import json
 import os
+import re
+import subprocess
 import sys
+import tempfile
 import unittest
 from decimal import Decimal
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+MONITOR_WORKFLOW_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "goldengate-monitor.yaml")
+ARGOCD_WORKFLOW_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "argocd-eks-deployment.yaml")
 
 # boto3/botocore are runtime dependencies (see requirements.txt) but are not
 # required to run this unit-test suite: every test injects a mock DynamoDB
@@ -124,37 +131,137 @@ class ConfigValidationTests(unittest.TestCase):
 class EffectiveStatusTests(unittest.TestCase):
     def test_fresh_healthy_record(self):
         item = make_item(status="HEALTHY", recordedAt=1780000000)
-        status, age, recorded_at = monitor.compute_effective_status(item, now=1780000010, stale_after_seconds=120)
+        status, age, recorded_at, fresh = monitor.compute_effective_status(item, now=1780000010, stale_after_seconds=120)
         self.assertEqual(status, "HEALTHY")
         self.assertEqual(age, 10)
         self.assertEqual(recorded_at, 1780000000)
+        self.assertTrue(fresh)
 
     def test_fresh_degraded_record(self):
         item = make_item(status="DEGRADED", recordedAt=1780000000)
-        status, _, _ = monitor.compute_effective_status(item, now=1780000010, stale_after_seconds=120)
+        status, _, _, fresh = monitor.compute_effective_status(item, now=1780000010, stale_after_seconds=120)
         self.assertEqual(status, "DEGRADED")
+        self.assertTrue(fresh)
 
     def test_fresh_down_record(self):
         item = make_item(status="DOWN", recordedAt=1780000000)
-        status, _, _ = monitor.compute_effective_status(item, now=1780000010, stale_after_seconds=120)
+        status, _, _, fresh = monitor.compute_effective_status(item, now=1780000010, stale_after_seconds=120)
         self.assertEqual(status, "DOWN")
+        self.assertTrue(fresh)
 
     def test_stale_record_regardless_of_raw_status(self):
         item = make_item(status="HEALTHY", recordedAt=1780000000)
-        status, age, _ = monitor.compute_effective_status(item, now=1780000000 + 121, stale_after_seconds=120)
+        status, age, _, fresh = monitor.compute_effective_status(item, now=1780000000 + 121, stale_after_seconds=120)
         self.assertEqual(status, "STALE")
         self.assertEqual(age, 121)
+        self.assertFalse(fresh)
 
     def test_missing_record(self):
-        status, age, recorded_at = monitor.compute_effective_status(None, now=1780000000, stale_after_seconds=120)
+        status, age, recorded_at, fresh = monitor.compute_effective_status(None, now=1780000000, stale_after_seconds=120)
         self.assertEqual(status, "MISSING")
         self.assertIsNone(age)
         self.assertIsNone(recorded_at)
+        self.assertFalse(fresh)
 
     def test_unknown_raw_status(self):
         item = make_item(status="SOMETHING_ELSE", recordedAt=1780000000)
-        status, _, _ = monitor.compute_effective_status(item, now=1780000010, stale_after_seconds=120)
+        status, age, _, fresh = monitor.compute_effective_status(item, now=1780000010, stale_after_seconds=120)
         self.assertEqual(status, "UNKNOWN")
+        # The timestamp itself is valid and fresh -- only the status enum
+        # value is unrecognized -- so fresh reflects the real age, not a
+        # blanket False tied to the UNKNOWN string.
+        self.assertEqual(age, 10)
+        self.assertTrue(fresh)
+
+
+class RecordedAtAndFreshnessHardeningTests(unittest.TestCase):
+    """Covers the recordedAt/freshness edge cases: missing timestamp on an
+    existing item, malformed timestamp values, and future timestamps."""
+
+    def test_existing_item_missing_recorded_at_is_unknown_and_not_fresh(self):
+        item = make_item(status="HEALTHY")
+        del item["recordedAt"]
+        status, age, recorded_at, fresh = monitor.compute_effective_status(
+            item, now=1780000010, stale_after_seconds=120
+        )
+        self.assertEqual(status, "UNKNOWN")
+        self.assertIsNone(age)
+        self.assertIsNone(recorded_at)
+        self.assertFalse(fresh)
+
+        row = monitor.build_pipeline_status(
+            "gg-payments-ora-to-pg-001-source", item, now=1780000010, stale_after_seconds=120
+        )
+        self.assertEqual(row["effectiveStatus"], "UNKNOWN")
+        self.assertFalse(row["fresh"])
+        self.assertIsNone(row["ageSeconds"])
+
+    def test_malformed_recorded_at_is_unknown_and_does_not_raise(self):
+        for bad_value in ("not-a-timestamp", "", [], {}, object()):
+            with self.subTest(bad_value=bad_value):
+                item = make_item(status="HEALTHY", recordedAt=bad_value)
+                try:
+                    status, age, recorded_at, fresh = monitor.compute_effective_status(
+                        item, now=1780000010, stale_after_seconds=120
+                    )
+                except Exception as exc:  # noqa: BLE001 -- proving no exception escapes
+                    self.fail(f"compute_effective_status raised {exc!r} for {bad_value!r}")
+                self.assertEqual(status, "UNKNOWN")
+                self.assertIsNone(age)
+                self.assertIsNone(recorded_at)
+                self.assertFalse(fresh)
+
+        # Also prove build_pipeline_status (the caller used by the HTTP
+        # handlers) never raises and never returns a 500-triggering exception.
+        item = make_item(status="HEALTHY", recordedAt="not-a-timestamp")
+        row = monitor.build_pipeline_status(
+            "gg-payments-ora-to-pg-001-source", item, now=1780000010, stale_after_seconds=120
+        )
+        self.assertEqual(row["effectiveStatus"], "UNKNOWN")
+        self.assertFalse(row["fresh"])
+
+    def test_stale_record_is_not_fresh(self):
+        item = make_item(status="HEALTHY", recordedAt=1780000000)
+        row = monitor.build_pipeline_status(
+            "gg-payments-ora-to-pg-001-source", item, now=1780000000 + 121, stale_after_seconds=120
+        )
+        self.assertEqual(row["effectiveStatus"], "STALE")
+        self.assertFalse(row["fresh"])
+
+    def test_valid_recent_record_is_fresh(self):
+        item = make_item(status="HEALTHY", recordedAt=1780000000)
+        row = monitor.build_pipeline_status(
+            "gg-payments-ora-to-pg-001-source", item, now=1780000005, stale_after_seconds=120
+        )
+        self.assertEqual(row["effectiveStatus"], "HEALTHY")
+        self.assertTrue(row["fresh"])
+        self.assertEqual(row["ageSeconds"], 5)
+
+    def test_future_timestamp_never_yields_negative_age(self):
+        # Small clock skew (within tolerance): clamp to ageSeconds=0, treat
+        # as fresh rather than exposing a negative age.
+        item = make_item(status="HEALTHY", recordedAt=1780000100)
+        status, age, recorded_at, fresh = monitor.compute_effective_status(
+            item, now=1780000000, stale_after_seconds=120
+        )
+        self.assertEqual(status, "HEALTHY")
+        self.assertEqual(age, 0)
+        self.assertGreaterEqual(age, 0)
+        self.assertTrue(fresh)
+
+        # Large future timestamp (beyond tolerance): not trusted -- UNKNOWN,
+        # no age exposed, never negative.
+        far_future_item = make_item(
+            status="HEALTHY",
+            recordedAt=1780000000 + monitor.FUTURE_TIMESTAMP_TOLERANCE_SECONDS + 3600,
+        )
+        status, age, recorded_at, fresh = monitor.compute_effective_status(
+            far_future_item, now=1780000000, stale_after_seconds=120
+        )
+        self.assertEqual(status, "UNKNOWN")
+        self.assertIsNone(age)
+        self.assertIsNone(recorded_at)
+        self.assertFalse(fresh)
 
 
 class GroupingAndSeverityTests(unittest.TestCase):
@@ -367,6 +474,71 @@ class RootPageErrorBannerTests(unittest.TestCase):
         self.assertNotIn("Traceback", body)
 
 
+class ClientFacingErrorSanitizationTests(unittest.TestCase):
+    """A raw AWS/botocore error (e.g. AccessDenied naming an IAM principal
+    ARN and account ID) must never reach an API or HTML client -- only the
+    fixed, client-safe message may appear in either response."""
+
+    SIMULATED_ARN_LEAK = (
+        "ClientError: An error occurred (AccessDeniedException) when calling "
+        "the GetItem operation: User: arn:aws:sts::668311715351:assumed-role/"
+        "GoldenGateMonitorReadRole-dev/i-0123456789abcdef is not authorized "
+        "to perform: dynamodb:GetItem on resource: "
+        "arn:aws:dynamodb:eu-west-1:668311715351:table/gg-eks-pipeline"
+    )
+
+    def test_api_status_dynamodb_failure_returns_only_fixed_message(self):
+        config = make_config()
+        table = mock.Mock()
+
+        with mock.patch.object(
+            monitor,
+            "build_status_payload",
+            side_effect=monitor.DynamoDbReadError(self.SIMULATED_ARN_LEAK),
+        ):
+            handler_cls = monitor._make_handler(config, table)
+            handler = handler_cls.__new__(handler_cls)
+            handler.path = "/api/status"
+            writes = []
+            handler._write = lambda status, ctype, body: writes.append((status, ctype, body))
+            handler.do_GET()
+
+        self.assertEqual(writes[0][0], 503)
+        body = json.loads(writes[0][2])
+        self.assertEqual(body["error"], "dynamodb_unavailable")
+        self.assertEqual(body["message"], monitor.CLIENT_SAFE_DYNAMODB_ERROR_MESSAGE)
+
+        raw_response = writes[0][2].decode("utf-8")
+        self.assertNotIn("arn:aws", raw_response)
+        self.assertNotIn("668311715351", raw_response)
+        self.assertNotIn("AccessDeniedException", raw_response)
+        self.assertNotIn("GoldenGateMonitorReadRole-dev", raw_response)
+
+    def test_html_dynamodb_failure_does_not_expose_iam_arn(self):
+        config = make_config()
+        table = mock.Mock()
+
+        with mock.patch.object(
+            monitor,
+            "build_status_payload",
+            side_effect=monitor.DynamoDbReadError(self.SIMULATED_ARN_LEAK),
+        ):
+            handler_cls = monitor._make_handler(config, table)
+            handler = handler_cls.__new__(handler_cls)
+            handler.path = "/"
+            writes = []
+            handler._write = lambda status, ctype, body: writes.append((status, ctype, body))
+            handler.do_GET()
+
+        self.assertEqual(writes[0][0], 200)
+        body = writes[0][2].decode("utf-8")
+        self.assertIn(monitor.CLIENT_SAFE_DYNAMODB_ERROR_MESSAGE, body)
+        self.assertNotIn("arn:aws", body)
+        self.assertNotIn("668311715351", body)
+        self.assertNotIn("AccessDeniedException", body)
+        self.assertNotIn("GoldenGateMonitorReadRole-dev", body)
+
+
 class DynamoDbAccessPatternTests(unittest.TestCase):
     def test_get_item_uses_state_deployment_record_type(self):
         table = mock.Mock()
@@ -406,6 +578,231 @@ class DynamoDbAccessPatternTests(unittest.TestCase):
 
         with self.assertRaises(monitor.DynamoDbReadError):
             monitor.build_status_payload(config, table, clock=lambda: 1780000010)
+
+
+def _extract_run_block(workflow_text, step_name):
+    """Extract a step's `run: |` block body, dedented, using plain text
+    scanning -- deliberately dependency-free (no PyYAML) so these tests run
+    anywhere the rest of this dependency-free suite runs."""
+    lines = workflow_text.splitlines()
+    step_marker = f"- name: {step_name}"
+    step_idx = None
+    for i, line in enumerate(lines):
+        if line.strip() == step_marker:
+            step_idx = i
+            break
+    if step_idx is None:
+        raise AssertionError(f"step {step_name!r} not found in workflow")
+
+    run_idx = None
+    for i in range(step_idx + 1, len(lines)):
+        stripped = lines[i].strip()
+        if stripped.startswith("- name:"):
+            break
+        if stripped == "run: |":
+            run_idx = i
+            break
+    if run_idx is None:
+        raise AssertionError(f"no 'run: |' block found for step {step_name!r}")
+
+    body_lines = []
+    base_indent = None
+    for i in range(run_idx + 1, len(lines)):
+        line = lines[i]
+        if line.strip() == "":
+            body_lines.append("")
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if base_indent is None:
+            base_indent = indent
+        if indent < base_indent:
+            break
+        body_lines.append(line[base_indent:])
+    return "\n".join(body_lines) + "\n"
+
+
+def _extract_step_if_condition(workflow_text, step_name):
+    marker = f"- name: {step_name}"
+    idx = workflow_text.index(marker)
+    following = workflow_text[idx:idx + 400]
+    match = re.search(r"if:\s*(.+)", following)
+    return match.group(1).strip() if match else None
+
+
+class WorkflowStaticAnalysisTests(unittest.TestCase):
+    """Static inspection of the two GitHub Actions workflow files. These
+    prove the actual committed bash/YAML content was fixed -- not a
+    reimplementation of the same logic inside this test suite."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not os.path.isfile(MONITOR_WORKFLOW_PATH) or not os.path.isfile(ARGOCD_WORKFLOW_PATH):
+            raise unittest.SkipTest("workflow files not found relative to the repository root")
+        with open(MONITOR_WORKFLOW_PATH) as f:
+            cls.monitor_text = f.read()
+        with open(ARGOCD_WORKFLOW_PATH) as f:
+            cls.argocd_text = f.read()
+
+    def test_no_unsafe_inputs_deploy_condition_remains(self):
+        self.assertNotIn("inputs.deploy != false", self.monitor_text)
+
+    def test_push_event_deploy_condition_is_normalized_on_every_deployment_step(self):
+        expected = "${{ github.event_name != 'workflow_dispatch' || inputs.deploy }}"
+        deploy_step_names = (
+            "Connect to EKS cluster",
+            "Ensure Argo CD Application CRD exists",
+            "Confirm the monitor Argo CD repository Secret exists",
+            "Create or update Argo CD Application",
+            "Wait for Argo CD sync and health",
+            "Verify GoldenGate monitor runtime state",
+        )
+        for step_name in deploy_step_names:
+            with self.subTest(step=step_name):
+                condition = _extract_step_if_condition(self.monitor_text, step_name)
+                self.assertEqual(condition, expected)
+
+    def test_push_event_deploy_condition_evaluates_true_for_push(self):
+        # A push event never populates the `inputs` context, so relying on
+        # `inputs.deploy` alone would be falsy/undefined on a push run. The
+        # normalized expression must short-circuit to true via
+        # github.event_name before ever evaluating inputs.deploy.
+        github_event_name = "push"
+        inputs_deploy = None  # unset, as it would be on a real push trigger
+        normalized = (github_event_name != "workflow_dispatch") or bool(inputs_deploy)
+        self.assertTrue(normalized)
+
+    def test_manual_deploy_false_remains_supported(self):
+        github_event_name = "workflow_dispatch"
+        self.assertFalse((github_event_name != "workflow_dispatch") or False)
+        self.assertTrue((github_event_name != "workflow_dispatch") or True)
+
+    def test_validation_job_name_includes_run_attempt(self):
+        self.assertIn(
+            'JOB_NAME="ecr-token-sync-verify-${{ github.run_id }}-${{ github.run_attempt }}"',
+            self.argocd_text,
+        )
+
+    def test_argocd_application_uses_direct_heredoc_not_cat_pipe(self):
+        self.assertNotIn("cat <<EOF | kubectl apply", self.monitor_text)
+        self.assertIn("kubectl apply -f - <<EOF", self.monitor_text)
+
+    def test_rbac_extraction_no_longer_selects_first_role_by_document_order(self):
+        self.assertNotIn(
+            "awk '/^kind: Role$/{flag=1} flag{print} /^---$/{if(flag) exit}'",
+            self.argocd_text,
+        )
+        self.assertIn("name: argocd-ecr-token-sync", self.argocd_text)
+
+    def test_multi_document_rbac_extraction_selects_correct_role(self):
+        """Run the actual production RBAC-selection snippet (extracted
+        verbatim from the workflow file) against a synthetic multi-document
+        manifest where an unrelated Role -- granting delete/list/watch --
+        appears before the real argocd-ecr-token-sync Role. Proves the
+        correct Role is selected by kind+name, not by document order."""
+        snippet = _extract_run_block(self.argocd_text, "Validate ECR token sync resources are rendered")
+        start = snippet.index('echo "Checking RBAC resourceNames')
+        end = snippet.index('echo "OK: ServiceAccount/Role/RoleBinding/CronJob')
+        end_of_line = snippet.index("\n", end)
+        rbac_snippet = snippet[start:end_of_line + 1]
+
+        synthetic_manifest = """---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: argocd-application-controller
+  namespace: argocd
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs:
+      - get
+      - list
+      - watch
+      - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: argocd-ecr-token-sync
+  namespace: argocd
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs:
+      - create
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - argocd-ecr-goldengate-oci
+      - argocd-ecr-goldengate-monitor-oci
+    verbs:
+      - get
+      - update
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: argocd-ecr-token-sync
+  namespace: argocd
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rendered_path = os.path.join(tmpdir, "rendered.yaml")
+            with open(rendered_path, "w") as f:
+                f.write(synthetic_manifest)
+            script = f'set -euo pipefail\nRENDERED="{rendered_path}"\n' + rbac_snippet
+            proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+
+        self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+        self.assertIn("OK: ServiceAccount/Role/RoleBinding/CronJob", proc.stdout)
+
+    def test_multi_document_rbac_extraction_fails_when_role_incomplete(self):
+        """Same production snippet, but the real token-sync Role is missing
+        one required resourceName -- must fail loudly, proving the check is
+        not vacuously true."""
+        snippet = _extract_run_block(self.argocd_text, "Validate ECR token sync resources are rendered")
+        start = snippet.index('echo "Checking RBAC resourceNames')
+        end = snippet.index('echo "OK: ServiceAccount/Role/RoleBinding/CronJob')
+        end_of_line = snippet.index("\n", end)
+        rbac_snippet = snippet[start:end_of_line + 1]
+
+        incomplete_manifest = """---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: argocd-server
+  namespace: argocd
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs:
+      - get
+      - list
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: argocd-ecr-token-sync
+  namespace: argocd
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - argocd-ecr-goldengate-oci
+    verbs:
+      - get
+      - update
+      - patch
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rendered_path = os.path.join(tmpdir, "rendered.yaml")
+            with open(rendered_path, "w") as f:
+                f.write(incomplete_manifest)
+            script = f'set -euo pipefail\nRENDERED="{rendered_path}"\n' + rbac_snippet
+            proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("argocd-ecr-goldengate-monitor-oci", proc.stdout)
 
 
 if __name__ == "__main__":

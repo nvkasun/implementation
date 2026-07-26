@@ -40,6 +40,18 @@ DEFAULTS = {
 
 ALLOWED_OBSERVED_STATUSES = ("HEALTHY", "DEGRADED", "DOWN")
 
+# A recordedAt more than this far in the future is not trusted as a real
+# observation (clock skew beyond this is treated as a malformed timestamp).
+# A smaller future skew is clamped to ageSeconds=0 rather than exposed as
+# negative.
+FUTURE_TIMESTAMP_TOLERANCE_SECONDS = 300
+
+# Fixed, client-safe message for any DynamoDB failure. The real botocore/AWS
+# error (which may contain an IAM principal ARN, account ID, table ARN, or
+# request ID) is only ever logged server-side via sanitize_error() -- it must
+# never reach an API or HTML client.
+CLIENT_SAFE_DYNAMODB_ERROR_MESSAGE = "Monitoring data is temporarily unavailable."
+
 # Effective status precedence used to pick a deployment's overall status:
 # earlier entries are more severe.
 SEVERITY_ORDER = ("DOWN", "MISSING", "STALE", "DEGRADED", "UNKNOWN", "HEALTHY")
@@ -213,26 +225,52 @@ def derive_deployment_and_component(pipeline: str):
     return pipeline, "unknown"
 
 
+def _parse_recorded_at(raw):
+    """Best-effort epoch-seconds int from a raw DynamoDB attribute.
+
+    Returns None for a missing or malformed value instead of raising --
+    a corrupt recordedAt must degrade to UNKNOWN, never an HTTP 500.
+    """
+    if raw is None:
+        return None
+    try:
+        return int(decimal_to_jsonsafe(raw))
+    except (TypeError, ValueError):
+        return None
+
+
 def compute_effective_status(item, now, stale_after_seconds):
-    """Returns (effectiveStatus, ageSeconds, recordedAt)."""
+    """Returns (effectiveStatus, ageSeconds, recordedAt, fresh).
+
+    fresh is derived strictly from timestamp availability and actual age --
+    never merely from the effectiveStatus string -- so an UNKNOWN caused by a
+    missing/malformed recordedAt is never reported as fresh.
+    """
     if item is None:
-        return "MISSING", None, None
+        return "MISSING", None, None, False
 
-    recorded_at_raw = item.get("recordedAt")
-    if recorded_at_raw is None:
-        return "UNKNOWN", None, None
+    recorded_at = _parse_recorded_at(item.get("recordedAt"))
+    if recorded_at is None:
+        return "UNKNOWN", None, None, False
 
-    recorded_at = int(decimal_to_jsonsafe(recorded_at_raw))
-    age_seconds = int(now - recorded_at)
+    age_seconds = now - recorded_at
+    if age_seconds < 0:
+        if age_seconds < -FUTURE_TIMESTAMP_TOLERANCE_SECONDS:
+            # Too far in the future to trust as a real observation.
+            return "UNKNOWN", None, None, False
+        age_seconds = 0  # small clock skew -- never expose a negative age
 
-    if age_seconds > stale_after_seconds:
-        return "STALE", age_seconds, recorded_at
+    age_seconds = int(age_seconds)
+    fresh = age_seconds <= stale_after_seconds
+
+    if not fresh:
+        return "STALE", age_seconds, recorded_at, False
 
     raw_status = item.get("status")
     if raw_status not in ALLOWED_OBSERVED_STATUSES:
-        return "UNKNOWN", age_seconds, recorded_at
+        return "UNKNOWN", age_seconds, recorded_at, fresh
 
-    return raw_status, age_seconds, recorded_at
+    return raw_status, age_seconds, recorded_at, fresh
 
 
 def build_pipeline_status(pipeline: str, item, now, stale_after_seconds):
@@ -243,10 +281,9 @@ def build_pipeline_status(pipeline: str, item, now, stale_after_seconds):
     what else the record may contain.
     """
     fallback_deployment_id, fallback_component = derive_deployment_and_component(pipeline)
-    effective_status, age_seconds, recorded_at = compute_effective_status(
+    effective_status, age_seconds, recorded_at, fresh = compute_effective_status(
         item, now, stale_after_seconds
     )
-    fresh = effective_status not in ("MISSING", "STALE")
 
     if item is None:
         return {
@@ -256,9 +293,9 @@ def build_pipeline_status(pipeline: str, item, now, stale_after_seconds):
             "engine": None,
             "observedStatus": None,
             "effectiveStatus": effective_status,
-            "fresh": False,
-            "ageSeconds": None,
-            "recordedAt": None,
+            "fresh": fresh,
+            "ageSeconds": age_seconds,
+            "recordedAt": recorded_at,
             "adminEndpointHealthy": None,
             "metricsEndpointHealthy": None,
             "u02Mounted": None,
@@ -523,9 +560,16 @@ def _make_handler(config: MonitorConfig, table):
         def _handle_api_status(self):
             try:
                 payload = build_status_payload(config, table)
-            except DynamoDbReadError as exc:
+            except DynamoDbReadError:
+                # The real AWS/botocore error (possibly containing an IAM
+                # principal ARN, account ID, table ARN, or request ID) was
+                # already logged server-side by build_status_payload. Only
+                # the fixed, client-safe message is ever returned here.
                 body = json.dumps(
-                    {"error": "dynamodb_unavailable", "message": str(exc)}
+                    {
+                        "error": "dynamodb_unavailable",
+                        "message": CLIENT_SAFE_DYNAMODB_ERROR_MESSAGE,
+                    }
                 ).encode("utf-8")
                 self._write(503, "application/json", body)
                 return
@@ -536,13 +580,13 @@ def _make_handler(config: MonitorConfig, table):
             try:
                 payload = build_status_payload(config, table)
                 error_message = None
-            except DynamoDbReadError as exc:
+            except DynamoDbReadError:
                 payload = {
                     "generatedAt": int(time.time()),
                     "staleAfterSeconds": config.stale_after_seconds,
                     "deployments": [],
                 }
-                error_message = str(exc)
+                error_message = CLIENT_SAFE_DYNAMODB_ERROR_MESSAGE
             body = render_html(payload, config, error_message=error_message).encode("utf-8")
             self._write(200, "text/html; charset=utf-8", body)
 
