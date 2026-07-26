@@ -80,6 +80,29 @@ spec:
               echo "ok" > /u02/oggf/certificate/write-test.txt
               rm -f /u02/oggf/certificate/write-test.txt
 
+              # ServiceManager.pid records the OS process id of the GoldenGate
+              # Service Manager from a previous pod lifecycle. /u02 is
+              # persistent EFS storage, so this file can survive pod deletion
+              # and recreation even though the process it names is gone -- a
+              # new pod must never trust a PID left behind by an earlier pod
+              # lifecycle. A stale PID here makes Service Manager refuse to
+              # start ("already running") against a PID that no longer
+              # exists, which cascades into the Administration Server,
+              # Performance Metrics Server, and Distribution/Receiver managed
+              # processes never starting either.
+              SERVICE_MANAGER_PID_FILE="/u02/ServiceManager/var/run/ServiceManager.pid"
+
+              if [ -e "$SERVICE_MANAGER_PID_FILE" ] || [ -L "$SERVICE_MANAGER_PID_FILE" ]; then
+                STALE_PID="$(cat "$SERVICE_MANAGER_PID_FILE" 2>/dev/null || true)"
+                echo "Removing stale GoldenGate Service Manager PID file from persistent /u02 (recorded pid: ${STALE_PID:-unknown})..."
+                rm -f -- "$SERVICE_MANAGER_PID_FILE"
+              fi
+
+              if [ -e "$SERVICE_MANAGER_PID_FILE" ] || [ -L "$SERVICE_MANAGER_PID_FILE" ]; then
+                echo "ERROR: Failed to remove stale GoldenGate Service Manager PID file: $SERVICE_MANAGER_PID_FILE"
+                exit 1
+              fi
+
               echo "Directory permissions after update:"
               ls -ld /u02
               ls -ld /u02/oggf
