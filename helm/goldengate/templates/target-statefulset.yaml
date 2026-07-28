@@ -1,4 +1,4 @@
-{{- if .Values.target.enabled }}
+{{- if and (eq (default "legacyPair" .Values.deploymentModel) "legacyPair") .Values.target.enabled }}
 {{- if not .Values.target.csi.enabled }}
 {{- fail "target.csi.enabled must be true when target.enabled=true: target credentials and certificate are CSI-only." }}
 {{- end }}

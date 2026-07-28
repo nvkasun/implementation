@@ -1,0 +1,16 @@
+{{- if and (eq (default "legacyPair" .Values.deploymentModel) "singleRuntime") .Values.runtime.enabled .Values.persistence.enabled (eq .Values.persistence.provider "efs") (eq .Values.runtime.storage.u02.type "efs") (not .Values.runtime.storage.u02.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "goldengate.runtimeU02PVCName" . }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "goldengate.runtimeLabels" . | nindent 4 }}
+spec:
+  accessModes:
+    {{- toYaml .Values.runtime.storage.u02.accessModes | nindent 4 }}
+  storageClassName: {{ include "goldengate.efsStorageClassName" . }}
+  resources:
+    requests:
+      storage: {{ .Values.runtime.storage.u02.size }}
+{{- end }}

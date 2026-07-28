@@ -1,4 +1,4 @@
-{{- if .Values.source.enabled }}
+{{- if and (eq (default "legacyPair" .Values.deploymentModel) "legacyPair") .Values.source.enabled }}
 {{- if not .Values.source.csi.enabled }}
 {{- fail "source.csi.enabled must be true when source.enabled=true: the plain Kubernetes Secret certificate fallback has been removed, source credentials and certificate are CSI-only." }}
 {{- end }}

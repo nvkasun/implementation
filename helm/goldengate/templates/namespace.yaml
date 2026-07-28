@@ -1,3 +1,4 @@
+{{- if eq (default "legacyPair" .Values.deploymentModel) "legacyPair" }}
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -10,3 +11,4 @@ metadata:
   annotations:
     argocd.argoproj.io/sync-wave: "-10"
     argocd.argoproj.io/sync-options: PruneLast=true
+{{- end }}

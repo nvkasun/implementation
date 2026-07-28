@@ -1,12 +1,9 @@
-{{- if and (eq (default "legacyPair" .Values.deploymentModel) "legacyPair") .Values.ingress.enabled }}
+{{- if and (eq (default "legacyPair" .Values.deploymentModel) "singleRuntime") .Values.runtime.enabled .Values.ingress.enabled }}
 {{- if not (or (eq .Values.ingress.mode "shared") (eq .Values.ingress.mode "standalone")) }}
 {{- fail (printf "ingress.mode must be either \"shared\" or \"standalone\", got %q" .Values.ingress.mode) }}
 {{- end }}
-{{- if and .Values.source.enabled (not .Values.ingress.hosts.source) }}
-{{- fail "ingress.hosts.source is required when ingress.enabled=true and source.enabled=true" }}
-{{- end }}
-{{- if and .Values.target.enabled (not .Values.ingress.hosts.target) }}
-{{- fail "ingress.hosts.target is required when ingress.enabled=true and target.enabled=true" }}
+{{- if not .Values.ingress.host }}
+{{- fail "ingress.host is required when ingress.enabled=true and deploymentModel=singleRuntime." }}
 {{- end }}
 {{- if and (contains "HTTPS" .Values.ingress.alb.listenPorts) (not .Values.ingress.alb.certificateArn) }}
 {{- fail "ingress.alb.certificateArn is required when the HTTPS listener is enabled (ingress.alb.listenPorts contains HTTPS). Even in shared mode, the ALB Controller resolves the certificate per-Ingress via host-based discovery unless certificate-arn is set explicitly." }}
@@ -14,14 +11,14 @@
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: {{ include "goldengate.fullname" . }}-ingress
+  name: {{ include "goldengate.runtimeIngressName" . }}
   namespace: {{ .Release.Namespace | quote }}
   labels:
-    {{- include "goldengate.labels" . | nindent 4 }}
+    {{- include "goldengate.runtimeLabels" . | nindent 4 }}
   annotations:
     # Application/group-level annotations. Safe to set regardless of mode:
-    # every Ingress in an ALB group must agree on these, and GoldenGate
-    # only ever runs its own backend/health-check settings here.
+    # every Ingress in an ALB group must agree on these, and GoldenGate only
+    # ever runs its own backend/health-check settings here.
     alb.ingress.kubernetes.io/backend-protocol: {{ .Values.ingress.alb.backendProtocol | quote }}
     alb.ingress.kubernetes.io/healthcheck-protocol: {{ .Values.ingress.alb.healthcheckProtocol | quote }}
     alb.ingress.kubernetes.io/healthcheck-port: {{ .Values.ingress.alb.healthcheckPort | quote }}
@@ -51,7 +48,7 @@ metadata:
 {{- end }}
 {{- if .Values.ingress.alb.targetType }}
     # target-type is a per-TargetGroup setting, not an ALB-level setting: it
-    # is required in shared mode too. Our backend Services are ClusterIP, so
+    # is required in shared mode too. Our backend Service is ClusterIP, so
     # without target-type=ip the controller defaults to instance mode, which
     # requires NodePort/LoadBalancer Services and fails with "TargetGroup
     # port is empty" against a ClusterIP Service.
@@ -88,28 +85,14 @@ metadata:
 spec:
   ingressClassName: {{ .Values.ingress.className | default "alb" }}
   rules:
-{{- if and .Values.source.enabled .Values.ingress.hosts.source }}
-    - host: {{ .Values.ingress.hosts.source | quote }}
+    - host: {{ .Values.ingress.host | quote }}
       http:
         paths:
           - path: /
             pathType: Prefix
             backend:
               service:
-                name: {{ include "goldengate.sourceName" . }}
+                name: {{ include "goldengate.runtimeName" . }}
                 port:
                   name: https
-{{- end }}
-{{- if and .Values.target.enabled .Values.ingress.hosts.target }}
-    - host: {{ .Values.ingress.hosts.target | quote }}
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: {{ include "goldengate.targetName" . }}
-                port:
-                  name: https
-{{- end }}
 {{- end }}

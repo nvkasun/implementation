@@ -2,6 +2,25 @@ global:
   environment: ""
   deploymentId: ""
 
+# Phase 1 backward-compatible deployment model switch.
+#
+# legacyPair (default): the existing one-Helm-release-per-logical-pipeline
+# model -- one source + one target StatefulSet, a deployment-specific
+# Namespace, and the two-host Ingress. Fully preserved; this is what every
+# currently active envs/dev/<deployment>/values.yaml file uses today.
+#
+# singleRuntime: one GoldenGate runtime StatefulSet per Helm release/Argo CD
+# Application, deployed into a shared per-environment namespace
+# (goldengate-${environment}) that this chart never creates or owns. See the
+# runtime: block below. Source and target become two independent
+# singleRuntime releases instead of one legacyPair release.
+#
+# Every legacy template is gated on
+# `eq (default "legacyPair" .Values.deploymentModel) "legacyPair"` so an old
+# values file with no deploymentModel key at all keeps rendering exactly as
+# before.
+deploymentModel: legacyPair
+
 nameOverride: ""
 fullnameOverride: ""
 
@@ -240,6 +259,106 @@ target:
   extraVolumes: []
   extraContainers: []
 
+# Phase 1 generic single-runtime GoldenGate deployment (deploymentModel:
+# singleRuntime only -- ignored entirely in legacyPair mode). Exactly one
+# GoldenGate main container per pod: no runtime.extraContainers key exists
+# here on purpose -- the approved single-runtime pod has no observer
+# sidecar, no manager utility-sidecar, and no Fluent Bit sidecar.
+runtime:
+  enabled: false
+
+  name: ""
+  fullnameOverride: ""
+
+  deploymentType: ""
+  businessDomain: ""
+  containerName: ""
+
+  replicas: 1
+
+  image:
+    repository: ""
+    tag: ""
+    pullPolicy: IfNotPresent
+
+  ogg:
+    deploymentName: ""
+    domain: ""
+    secureDeployment: false
+
+  admin:
+    existingSecret: ""
+    usernameKey: OGG_ADMIN
+    passwordKey: OGG_ADMIN_PWD
+
+  csi:
+    enabled: false
+    region: eu-west-1
+    serviceAccountRoleArn: ""
+
+    admin:
+      enabled: false
+      providerClassName: ""
+      secretName: ""
+      objectName: ""
+      objectType: secretsmanager
+      mountPath: /mnt/secrets-store/admin
+      jmesPath: []
+
+    certificate:
+      enabled: false
+      providerClassName: ""
+      objectName: ""
+      objectType: secretsmanager
+      mountPath: /etc/nginx/cert
+      jmesPath: []
+
+  initPermissions:
+    enabled: true
+    mode: "0777"
+
+  serviceAccount:
+    create: false
+    name: ""
+    annotations: {}
+
+  service:
+    type: ClusterIP
+    ports:
+      https: 8443
+      dist: null
+      receiver: null
+      metrics: 9015
+
+  storage:
+    u02:
+      type: emptyDir
+      existingClaim: ""
+      claimName: ""
+      size: 20Gi
+      accessModes:
+        - ReadWriteMany
+    u03:
+      type: emptyDir
+
+  readinessProbe:
+    initialDelaySeconds: 180
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 20
+
+  livenessProbe:
+    initialDelaySeconds: 240
+    periodSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 8
+
+  resources: {}
+
+  extraEnv: []
+  extraVolumeMounts: []
+  extraVolumes: []
+
 ingress:
   enabled: false
   # mode: shared  -> join an existing (resident) ALB group; emit only
@@ -249,9 +368,13 @@ ingress:
   mode: shared
   className: alb
 
+  # legacyPair only.
   hosts:
     source: ""
     target: ""
+
+  # singleRuntime only.
+  host: ""
 
   alb:
     # These are library defaults only -- ingress.enabled is false by default,

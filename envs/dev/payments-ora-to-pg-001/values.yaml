@@ -2,6 +2,11 @@ global:
   environment: dev
   deploymentId: payments-ora-to-pg-001
 
+# Phase 1: explicit, unchanged behavior -- this is the existing live
+# one-Helm-release-per-logical-pipeline model. See helm/goldengate/values.yaml
+# for the deploymentModel contract.
+deploymentModel: legacyPair
+
 source:
   enabled: true
   name: ogg-oracle

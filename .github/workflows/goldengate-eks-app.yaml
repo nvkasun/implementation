@@ -392,6 +392,68 @@ jobs:
           done
 
           echo ""
+          # Resolves deploymentModel for a deletion candidate from the BASE
+          # revision (the last commit where the file still existed), not the
+          # working tree -- a deleted file no longer exists there at all.
+          # The deletion job needs this to know whether it may ever clean up
+          # a deployment-specific namespace (legacyPair) or must never touch
+          # the shared namespace (singleRuntime). Same PyYAML-preferred,
+          # conservative-text-fallback approach used elsewhere in this
+          # workflow; any failure (file absent at that ref, unparsable,
+          # unrecognized value) defaults to legacyPair.
+          resolve_deployment_model_from_git() {
+            local ref="$1"
+            local path="$2"
+            local tmp_file
+            tmp_file="$(mktemp)"
+
+            if ! git show "${ref}:${path}" > "$tmp_file" 2>/dev/null || [ ! -s "$tmp_file" ]; then
+              rm -f "$tmp_file"
+              echo "legacyPair"
+              return 0
+            fi
+
+            local model
+            if command -v python3 >/dev/null 2>&1; then
+              model="$(python3 - "$tmp_file" <<'PYEOF'
+          import sys
+
+          path = sys.argv[1]
+
+          try:
+              import yaml
+          except ImportError:
+              import re
+              with open(path) as f:
+                  raw = f.read()
+              m = re.search(r'(?m)^deploymentModel\s*:\s*(\S+)\s*$', raw)
+              model = m.group(1).strip("\"'") if m else "legacyPair"
+              print(model if model in ("legacyPair", "singleRuntime") else "legacyPair")
+              sys.exit(0)
+
+          with open(path) as f:
+              data = yaml.safe_load(f)
+
+          model = "legacyPair"
+          if isinstance(data, dict):
+              raw_model = data.get("deploymentModel")
+              if raw_model in ("legacyPair", "singleRuntime"):
+                  model = raw_model
+
+          print(model)
+          PYEOF
+          )"
+            else
+              model="$(grep -E '^deploymentModel:' "$tmp_file" | head -1 | sed -E 's/^deploymentModel:[[:space:]]*//' | tr -d '"'"'"'\r' | xargs || true)"
+              if [ "$model" != "singleRuntime" ]; then
+                model="legacyPair"
+              fi
+            fi
+
+            rm -f "$tmp_file"
+            echo "$model"
+          }
+
           echo "Detecting deleted or newly-inactive deployment folders under envs/dev/..."
 
           NAME_STATUS="$(git diff --name-status "$BEFORE_SHA" "$AFTER_SHA" -- 'envs/dev/**' 'helm/goldengate/**' || true)"
@@ -431,9 +493,14 @@ jobs:
             if [ "$STATUS" -ne 0 ]; then
               echo "Inactive/deleted: ${CANDIDATE_ID} (${REASON})"
               INACTIVE_LOG="${INACTIVE_LOG}  - ${CANDIDATE_ID} (${REASON})\n"
+
+              CANDIDATE_DEPLOYMENT_MODEL="$(resolve_deployment_model_from_git "$BEFORE_SHA" "$VALUES_FILE")"
+              echo "  deploymentModel at base revision (${BEFORE_SHA}): ${CANDIDATE_DEPLOYMENT_MODEL}"
+
               DELETION_MATRIX_ITEMS="$(echo "$DELETION_MATRIX_ITEMS" | jq -c \
                 --arg deployment_id "$CANDIDATE_ID" \
-                '. + [{environment: "dev", deployment_id: $deployment_id}]')"
+                --arg deployment_model "$CANDIDATE_DEPLOYMENT_MODEL" \
+                '. + [{environment: "dev", deployment_id: $deployment_id, deployment_model: $deployment_model}]')"
             else
               echo "Still active: ${CANDIDATE_ID} (${REASON}) -- not a deletion."
             fi
@@ -942,13 +1009,88 @@ jobs:
             exit 1
           fi
 
-          TARGET_NAMESPACE="gg-${ENVIRONMENT}-${DEPLOYMENT_ID}"
-          RELEASE_NAME="ogg-${DEPLOYMENT_ID}"
           VALUES_FILE="${ENVS_ROOT}/${ENVIRONMENT}/${DEPLOYMENT_ID}/values.yaml"
+
+          # deploymentModel is resolved from the deployment values file itself,
+          # robustly: prefers PyYAML (full parse), falls back to a conservative
+          # text pattern only if PyYAML isn't installed on the runner, and
+          # defaults any missing/unrecognized value to legacyPair -- an old
+          # values file with no deploymentModel key at all keeps behaving
+          # exactly as before.
+          resolve_deployment_model() {
+            local values_file="$1"
+
+            if [ ! -f "$values_file" ]; then
+              echo "legacyPair"
+              return 0
+            fi
+
+            if command -v python3 >/dev/null 2>&1; then
+              python3 - "$values_file" <<'PYEOF'
+          import sys
+
+          path = sys.argv[1]
+
+          try:
+              import yaml
+          except ImportError:
+              import re
+              with open(path) as f:
+                  raw = f.read()
+              m = re.search(r'(?m)^deploymentModel\s*:\s*(\S+)\s*$', raw)
+              model = m.group(1).strip("\"'") if m else "legacyPair"
+              print(model if model in ("legacyPair", "singleRuntime") else "legacyPair")
+              sys.exit(0)
+
+          with open(path) as f:
+              data = yaml.safe_load(f)
+
+          model = "legacyPair"
+          if isinstance(data, dict):
+              raw_model = data.get("deploymentModel")
+              if raw_model in ("legacyPair", "singleRuntime"):
+                  model = raw_model
+
+          print(model)
+          PYEOF
+              return $?
+            fi
+
+            echo "python3 not available on this runner, using conservative bash fallback" >&2
+            local raw
+            raw="$(grep -E '^deploymentModel:' "$values_file" | head -1 | sed -E 's/^deploymentModel:[[:space:]]*//' | tr -d '"'"'"'\r' | xargs || true)"
+            if [ "$raw" = "singleRuntime" ]; then
+              echo "singleRuntime"
+            else
+              echo "legacyPair"
+            fi
+          }
+
+          DEPLOYMENT_MODEL="$(resolve_deployment_model "$VALUES_FILE")"
+          echo "Resolved deploymentModel: ${DEPLOYMENT_MODEL} (from ${VALUES_FILE})"
+
+          if [ "$DEPLOYMENT_MODEL" = "legacyPair" ]; then
+            TARGET_NAMESPACE="gg-${ENVIRONMENT}-${DEPLOYMENT_ID}"
+            RELEASE_NAME="ogg-${DEPLOYMENT_ID}"
+            ARGOCD_APP_NAME="goldengate-${DEPLOYMENT_ID}"
+          elif [ "$DEPLOYMENT_MODEL" = "singleRuntime" ]; then
+            TARGET_NAMESPACE="goldengate-${ENVIRONMENT}"
+            RELEASE_NAME="${DEPLOYMENT_ID}"
+            # Remove the leading "gg-" only for the Argo CD Application name
+            # suffix, e.g. gg-oracle-payments-01 -> goldengate-dev-oracle-payments-01.
+            APP_SUFFIX="${DEPLOYMENT_ID#gg-}"
+            ARGOCD_APP_NAME="goldengate-${ENVIRONMENT}-${APP_SUFFIX}"
+          else
+            echo "Unknown deploymentModel: ${DEPLOYMENT_MODEL} (must be legacyPair or singleRuntime)"
+            exit 1
+          fi
+
           TEMP_CHART_PATH="work/charts/${DEPLOYMENT_ID}/goldengate"
 
           ARGOCD_NAMESPACE="argocd"
-          ARGOCD_APP_NAME="goldengate-${DEPLOYMENT_ID}"
+
+          echo "DEPLOYMENT_MODEL=${DEPLOYMENT_MODEL}" >> "$GITHUB_ENV"
+          echo "deployment_model=${DEPLOYMENT_MODEL}" >> "$GITHUB_OUTPUT"
 
           if [ ${#TARGET_NAMESPACE} -gt 63 ]; then
             echo "Namespace is too long: $TARGET_NAMESPACE"
@@ -1143,12 +1285,23 @@ jobs:
         run: |
           set -euo pipefail
 
-          helm lint "$HELM_CHART_PATH" \
-            --values "$VALUES_FILE" \
-            --set global.environment="$ENVIRONMENT" \
-            --set global.deploymentId="$DEPLOYMENT_ID" \
-            --set-string monitoring.observer.image.repository="$OBSERVER_IMAGE_REPOSITORY" \
-            --set-string monitoring.observer.image.tag="$OBSERVER_IMAGE_TAG"
+          # singleRuntime never requires or injects observer image parameters
+          # -- the generic runtime chart resources never reference
+          # monitoring.observer at all (no observer sidecar in the approved
+          # single-runtime pod).
+          if [ "$DEPLOYMENT_MODEL" = "singleRuntime" ]; then
+            helm lint "$HELM_CHART_PATH" \
+              --values "$VALUES_FILE" \
+              --set global.environment="$ENVIRONMENT" \
+              --set global.deploymentId="$DEPLOYMENT_ID"
+          else
+            helm lint "$HELM_CHART_PATH" \
+              --values "$VALUES_FILE" \
+              --set global.environment="$ENVIRONMENT" \
+              --set global.deploymentId="$DEPLOYMENT_ID" \
+              --set-string monitoring.observer.image.repository="$OBSERVER_IMAGE_REPOSITORY" \
+              --set-string monitoring.observer.image.tag="$OBSERVER_IMAGE_TAG"
+          fi
 
       - name: Render manifest for validation
         shell: bash
@@ -1157,14 +1310,23 @@ jobs:
 
           mkdir -p rendered
 
-          helm template "$RELEASE_NAME" "$HELM_CHART_PATH" \
-            --namespace "$TARGET_NAMESPACE" \
-            --values "$VALUES_FILE" \
-            --set global.environment="$ENVIRONMENT" \
-            --set global.deploymentId="$DEPLOYMENT_ID" \
-            --set-string monitoring.observer.image.repository="$OBSERVER_IMAGE_REPOSITORY" \
-            --set-string monitoring.observer.image.tag="$OBSERVER_IMAGE_TAG" \
-            > "rendered/${RELEASE_NAME}.yaml"
+          if [ "$DEPLOYMENT_MODEL" = "singleRuntime" ]; then
+            helm template "$RELEASE_NAME" "$HELM_CHART_PATH" \
+              --namespace "$TARGET_NAMESPACE" \
+              --values "$VALUES_FILE" \
+              --set global.environment="$ENVIRONMENT" \
+              --set global.deploymentId="$DEPLOYMENT_ID" \
+              > "rendered/${RELEASE_NAME}.yaml"
+          else
+            helm template "$RELEASE_NAME" "$HELM_CHART_PATH" \
+              --namespace "$TARGET_NAMESPACE" \
+              --values "$VALUES_FILE" \
+              --set global.environment="$ENVIRONMENT" \
+              --set global.deploymentId="$DEPLOYMENT_ID" \
+              --set-string monitoring.observer.image.repository="$OBSERVER_IMAGE_REPOSITORY" \
+              --set-string monitoring.observer.image.tag="$OBSERVER_IMAGE_TAG" \
+              > "rendered/${RELEASE_NAME}.yaml"
+          fi
 
           echo "Rendered manifest: rendered/${RELEASE_NAME}.yaml"
 
@@ -1175,18 +1337,33 @@ jobs:
 
           RENDERED="rendered/${RELEASE_NAME}.yaml"
 
-          echo "Checking rendered manifest for the GoldenGate Namespace: ${RENDERED}"
+          if [ "$DEPLOYMENT_MODEL" = "singleRuntime" ]; then
+            echo "deploymentModel=singleRuntime: checking that NO Namespace document is rendered from this release: ${RENDERED}"
 
-          # Fails before package/push/deploy if helm/goldengate/templates/namespace.yaml
-          # is missing, misconfigured, or the ownership labels don't match this
-          # deployment -- the namespace is now an Argo CD-managed resource, so it
-          # must render correctly for cleanup to work on deletion.
-          grep -q "kind: Namespace" "$RENDERED"
-          grep -q "name: ${TARGET_NAMESPACE}" "$RENDERED"
-          grep -q "goldengate.adcb/deployment-id: \"${DEPLOYMENT_ID}\"" "$RENDERED"
-          grep -q "goldengate.adcb/environment: \"${ENVIRONMENT}\"" "$RENDERED"
+            # A single-runtime release must never render a Namespace -- it
+            # deploys into the shared goldengate-<environment> namespace,
+            # which this release does not create or own (see
+            # helm/goldengate/templates/namespace.yaml, gated to legacyPair only).
+            if grep -qE '^kind: Namespace$' "$RENDERED"; then
+              echo "FAIL: a Namespace document was rendered for a singleRuntime release. This must never happen -- singleRuntime releases must not create or own the shared namespace."
+              exit 1
+            fi
 
-          echo "OK: Namespace ${TARGET_NAMESPACE} is present in the rendered manifest with the expected ownership labels."
+            echo "OK: no Namespace document rendered, as expected for deploymentModel=singleRuntime."
+          else
+            echo "Checking rendered manifest for the GoldenGate Namespace: ${RENDERED}"
+
+            # Fails before package/push/deploy if helm/goldengate/templates/namespace.yaml
+            # is missing, misconfigured, or the ownership labels don't match this
+            # deployment -- the namespace is now an Argo CD-managed resource, so it
+            # must render correctly for cleanup to work on deletion.
+            grep -q "kind: Namespace" "$RENDERED"
+            grep -q "name: ${TARGET_NAMESPACE}" "$RENDERED"
+            grep -q "goldengate.adcb/deployment-id: \"${DEPLOYMENT_ID}\"" "$RENDERED"
+            grep -q "goldengate.adcb/environment: \"${ENVIRONMENT}\"" "$RENDERED"
+
+            echo "OK: Namespace ${TARGET_NAMESPACE} is present in the rendered manifest with the expected ownership labels."
+          fi
 
       - name: Validate EFS persistence resources are rendered
         shell: bash
@@ -1215,25 +1392,6 @@ jobs:
             exit 1
           fi
 
-          STORAGE_CLASS_NAME="gg-efs-${ENVIRONMENT}-${DEPLOYMENT_ID}"
-
-          # PVC claim names and the EFS basePath are read from the values
-          # file rather than re-derived from ENVIRONMENT/DEPLOYMENT_ID: EFS
-          # enforces a 100-character access point path limit (basePath +
-          # PVC name + a unique suffix), so deployments intentionally set
-          # short, explicit claimName/basePath overrides instead of using
-          # the long environment-deploymentId-based generated defaults.
-          SOURCE_BLOCK="$(awk '/^source:/{flag=1} flag{print} /^[a-zA-Z]/{if(flag && !/^source:/) exit}' "$VALUES_FILE")"
-          TARGET_BLOCK="$(awk '/^target:/{flag=1} flag{print} /^[a-zA-Z]/{if(flag && !/^target:/) exit}' "$VALUES_FILE")"
-
-          SOURCE_PVC_NAME="$(echo "$SOURCE_BLOCK" | grep -E '^\s*claimName:' | head -1 | sed -E 's/^\s*claimName:\s*//' | tr -d '"'"'"'\r' | xargs)"
-          TARGET_PVC_NAME="$(echo "$TARGET_BLOCK" | grep -E '^\s*claimName:' | head -1 | sed -E 's/^\s*claimName:\s*//' | tr -d '"'"'"'\r' | xargs)"
-
-          if [ -z "$SOURCE_PVC_NAME" ] || [ -z "$TARGET_PVC_NAME" ]; then
-            echo "source.storage.u02.claimName or target.storage.u02.claimName not found in ${VALUES_FILE}. Cannot validate the rendered PVCs."
-            exit 1
-          fi
-
           EFS_BASE_PATH="$(grep -E '^\s*basePath:' "$VALUES_FILE" | head -1 | sed -E 's/^\s*basePath:\s*//' | tr -d '"'"'"'\r' | xargs)"
 
           if [ -z "$EFS_BASE_PATH" ]; then
@@ -1241,40 +1399,93 @@ jobs:
             exit 1
           fi
 
-          echo "Checking StorageClass ${STORAGE_CLASS_NAME}..."
-          grep -q "kind: StorageClass" "$RENDERED"
-          grep -q "name: ${STORAGE_CLASS_NAME}" "$RENDERED"
-          grep -q "provisioner: efs.csi.aws.com" "$RENDERED"
-          grep -q "provisioningMode: efs-ap" "$RENDERED"
-          grep -q "fileSystemId: \"${EFS_FILESYSTEM_ID}\"" "$RENDERED"
-          grep -q "basePath: \"${EFS_BASE_PATH}\"" "$RENDERED"
-          grep -q 'subPathPattern: "\${.PVC.name}"' "$RENDERED"
-          grep -q 'ensureUniqueDirectory: "true"' "$RENDERED"
-          grep -q "reclaimPolicy: Retain" "$RENDERED"
+          STORAGE_CLASS_NAME="gg-efs-${ENVIRONMENT}-${DEPLOYMENT_ID}"
 
-          echo "Checking PersistentVolumeClaims ${SOURCE_PVC_NAME} / ${TARGET_PVC_NAME}..."
-          grep -q "kind: PersistentVolumeClaim" "$RENDERED"
-          grep -q "name: ${SOURCE_PVC_NAME}" "$RENDERED"
-          grep -q "name: ${TARGET_PVC_NAME}" "$RENDERED"
+          if [ "$DEPLOYMENT_MODEL" = "singleRuntime" ]; then
+            # The candidate values contract deliberately leaves
+            # runtime.storage.u02.claimName empty so the chart generates it
+            # from the canonical runtime name (<runtime-name>-u02) -- and
+            # envs/dev/<deployment_id>/ is itself named after the canonical
+            # runtime name, so DEPLOYMENT_ID and the runtime name are the
+            # same string here.
+            RUNTIME_PVC_NAME="${DEPLOYMENT_ID}-u02"
 
-          echo "Checking StatefulSet volumes (u02 must use persistentVolumeClaim with the expected claimName, u03 must stay emptyDir)..."
+            echo "Checking StorageClass ${STORAGE_CLASS_NAME}..."
+            grep -q "kind: StorageClass" "$RENDERED"
+            grep -q "name: ${STORAGE_CLASS_NAME}" "$RENDERED"
+            grep -q "provisioner: efs.csi.aws.com" "$RENDERED"
+            grep -q "provisioningMode: efs-ap" "$RENDERED"
+            grep -q "fileSystemId: \"${EFS_FILESYSTEM_ID}\"" "$RENDERED"
+            grep -q "basePath: \"${EFS_BASE_PATH}\"" "$RENDERED"
+            grep -q 'subPathPattern: "\${.PVC.name}"' "$RENDERED"
+            grep -q 'ensureUniqueDirectory: "true"' "$RENDERED"
+            grep -q "reclaimPolicy: Retain" "$RENDERED"
 
-          # Isolate each StatefulSet's own rendered document so the u02/u03
-          # check is unambiguous -- a plain grep across the whole manifest
-          # can't tell the source StatefulSet's volumes apart from the
-          # target StatefulSet's.
-          SOURCE_STS="$(awk '/^# Source: .*source-statefulset\.yaml$/{flag=1} flag{print} /^---$/{if(flag) exit}' "$RENDERED")"
-          TARGET_STS="$(awk '/^# Source: .*target-statefulset\.yaml$/{flag=1} flag{print} /^---$/{if(flag) exit}' "$RENDERED")"
+            echo "Checking PersistentVolumeClaim ${RUNTIME_PVC_NAME}..."
+            grep -q "kind: PersistentVolumeClaim" "$RENDERED"
+            grep -q "name: ${RUNTIME_PVC_NAME}" "$RENDERED"
 
-          echo "$SOURCE_STS" | grep -A1 "^        - name: u02" | grep -q "persistentVolumeClaim:"
-          echo "$SOURCE_STS" | grep -q "claimName: ${SOURCE_PVC_NAME}"
-          echo "$SOURCE_STS" | grep -A1 "^        - name: u03" | grep -q "emptyDir: {}"
+            echo "Checking StatefulSet volumes (u02 must use persistentVolumeClaim with the expected claimName, u03 must stay emptyDir)..."
+            RUNTIME_STS="$(awk '/^# Source: .*runtime-statefulset\.yaml$/{flag=1} flag{print} /^---$/{if(flag) exit}' "$RENDERED")"
 
-          echo "$TARGET_STS" | grep -A1 "^        - name: u02" | grep -q "persistentVolumeClaim:"
-          echo "$TARGET_STS" | grep -q "claimName: ${TARGET_PVC_NAME}"
-          echo "$TARGET_STS" | grep -A1 "^        - name: u03" | grep -q "emptyDir: {}"
+            echo "$RUNTIME_STS" | grep -A1 "^        - name: u02" | grep -q "persistentVolumeClaim:"
+            echo "$RUNTIME_STS" | grep -q "claimName: ${RUNTIME_PVC_NAME}"
+            echo "$RUNTIME_STS" | grep -A1 "^        - name: u03" | grep -q "emptyDir: {}"
 
-          echo "OK: EFS StorageClass, source/target PVCs, and StatefulSet u02/u03 volumes all match the expected persistence configuration."
+            echo "OK: EFS StorageClass, runtime PVC, and StatefulSet u02/u03 volumes all match the expected persistence configuration."
+          else
+            # PVC claim names are read from the values file rather than
+            # re-derived from ENVIRONMENT/DEPLOYMENT_ID: EFS enforces a
+            # 100-character access point path limit (basePath + PVC name +
+            # a unique suffix), so deployments intentionally set short,
+            # explicit claimName overrides instead of using the long
+            # environment-deploymentId-based generated defaults.
+            SOURCE_BLOCK="$(awk '/^source:/{flag=1} flag{print} /^[a-zA-Z]/{if(flag && !/^source:/) exit}' "$VALUES_FILE")"
+            TARGET_BLOCK="$(awk '/^target:/{flag=1} flag{print} /^[a-zA-Z]/{if(flag && !/^target:/) exit}' "$VALUES_FILE")"
+
+            SOURCE_PVC_NAME="$(echo "$SOURCE_BLOCK" | grep -E '^\s*claimName:' | head -1 | sed -E 's/^\s*claimName:\s*//' | tr -d '"'"'"'\r' | xargs)"
+            TARGET_PVC_NAME="$(echo "$TARGET_BLOCK" | grep -E '^\s*claimName:' | head -1 | sed -E 's/^\s*claimName:\s*//' | tr -d '"'"'"'\r' | xargs)"
+
+            if [ -z "$SOURCE_PVC_NAME" ] || [ -z "$TARGET_PVC_NAME" ]; then
+              echo "source.storage.u02.claimName or target.storage.u02.claimName not found in ${VALUES_FILE}. Cannot validate the rendered PVCs."
+              exit 1
+            fi
+
+            echo "Checking StorageClass ${STORAGE_CLASS_NAME}..."
+            grep -q "kind: StorageClass" "$RENDERED"
+            grep -q "name: ${STORAGE_CLASS_NAME}" "$RENDERED"
+            grep -q "provisioner: efs.csi.aws.com" "$RENDERED"
+            grep -q "provisioningMode: efs-ap" "$RENDERED"
+            grep -q "fileSystemId: \"${EFS_FILESYSTEM_ID}\"" "$RENDERED"
+            grep -q "basePath: \"${EFS_BASE_PATH}\"" "$RENDERED"
+            grep -q 'subPathPattern: "\${.PVC.name}"' "$RENDERED"
+            grep -q 'ensureUniqueDirectory: "true"' "$RENDERED"
+            grep -q "reclaimPolicy: Retain" "$RENDERED"
+
+            echo "Checking PersistentVolumeClaims ${SOURCE_PVC_NAME} / ${TARGET_PVC_NAME}..."
+            grep -q "kind: PersistentVolumeClaim" "$RENDERED"
+            grep -q "name: ${SOURCE_PVC_NAME}" "$RENDERED"
+            grep -q "name: ${TARGET_PVC_NAME}" "$RENDERED"
+
+            echo "Checking StatefulSet volumes (u02 must use persistentVolumeClaim with the expected claimName, u03 must stay emptyDir)..."
+
+            # Isolate each StatefulSet's own rendered document so the u02/u03
+            # check is unambiguous -- a plain grep across the whole manifest
+            # can't tell the source StatefulSet's volumes apart from the
+            # target StatefulSet's.
+            SOURCE_STS="$(awk '/^# Source: .*source-statefulset\.yaml$/{flag=1} flag{print} /^---$/{if(flag) exit}' "$RENDERED")"
+            TARGET_STS="$(awk '/^# Source: .*target-statefulset\.yaml$/{flag=1} flag{print} /^---$/{if(flag) exit}' "$RENDERED")"
+
+            echo "$SOURCE_STS" | grep -A1 "^        - name: u02" | grep -q "persistentVolumeClaim:"
+            echo "$SOURCE_STS" | grep -q "claimName: ${SOURCE_PVC_NAME}"
+            echo "$SOURCE_STS" | grep -A1 "^        - name: u03" | grep -q "emptyDir: {}"
+
+            echo "$TARGET_STS" | grep -A1 "^        - name: u02" | grep -q "persistentVolumeClaim:"
+            echo "$TARGET_STS" | grep -q "claimName: ${TARGET_PVC_NAME}"
+            echo "$TARGET_STS" | grep -A1 "^        - name: u03" | grep -q "emptyDir: {}"
+
+            echo "OK: EFS StorageClass, source/target PVCs, and StatefulSet u02/u03 volumes all match the expected persistence configuration."
+          fi
 
       - name: Validate observer sidecar is rendered correctly
         shell: bash
@@ -1282,6 +1493,132 @@ jobs:
           set -euo pipefail
 
           RENDERED="rendered/${RELEASE_NAME}.yaml"
+
+          if [ "$DEPLOYMENT_MODEL" = "singleRuntime" ]; then
+            echo "deploymentModel=singleRuntime: validating the generic runtime resource contract instead of the legacy source/target observer contract."
+
+            echo "Checking for exactly one StatefulSet..."
+            STATEFULSET_COUNT="$(grep -c '^kind: StatefulSet$' "$RENDERED" || true)"
+            if [ "$STATEFULSET_COUNT" -ne 1 ]; then
+              echo "FAIL: expected exactly one StatefulSet, found ${STATEFULSET_COUNT}."
+              exit 1
+            fi
+
+            RUNTIME_STS="$(awk '/^# Source: .*runtime-statefulset\.yaml$/{flag=1} flag{print} /^---$/{if(flag) exit}' "$RENDERED")"
+            if [ -z "$RUNTIME_STS" ]; then
+              echo "FAIL: could not isolate the rendered runtime-statefulset.yaml document."
+              exit 1
+            fi
+
+            echo "Checking exactly one regular application container..."
+            RUNTIME_MAIN_CONTAINER="$(grep -E '^\s*containerName:' "$VALUES_FILE" | head -1 | sed -E 's/^\s*containerName:\s*//' | tr -d '"'"'"'\r' | xargs)"
+            if [ -z "$RUNTIME_MAIN_CONTAINER" ]; then
+              echo "FAIL: runtime.containerName not found in ${VALUES_FILE}."
+              exit 1
+            fi
+
+            CONTAINER_NAMES="$(echo "$RUNTIME_STS" | grep -E '^        - name:' | sed -E 's/^        - name:\s*//' | tr -d '"'"'"'\r')"
+            echo "Rendered application containers: ${CONTAINER_NAMES}"
+
+            APP_CONTAINER_COUNT="$(echo "$CONTAINER_NAMES" | grep -vc '^\s*$' || true)"
+            if [ "$APP_CONTAINER_COUNT" -ne 1 ]; then
+              echo "FAIL: expected exactly one regular application container in the runtime StatefulSet, found ${APP_CONTAINER_COUNT}: ${CONTAINER_NAMES}"
+              exit 1
+            fi
+
+            if ! grep -Fxq "$RUNTIME_MAIN_CONTAINER" <<< "$CONTAINER_NAMES"; then
+              echo "FAIL: expected main container name ${RUNTIME_MAIN_CONTAINER} not found. Rendered: ${CONTAINER_NAMES}"
+              exit 1
+            fi
+            echo "OK: exactly one application container (${RUNTIME_MAIN_CONTAINER})."
+
+            echo "Checking no forbidden sidecars are present..."
+            if grep -Fq -- "goldengate-observer" <<< "$RUNTIME_STS"; then
+              echo "FAIL: a goldengate-observer container/reference was found in the singleRuntime StatefulSet. The approved single-runtime pod has no observer sidecar."
+              exit 1
+            fi
+            if grep -Eiq -- 'utility-sidecar|fluent-bit|fluentbit' <<< "$RUNTIME_STS"; then
+              echo "FAIL: a manager utility-sidecar or Fluent Bit reference was found in the singleRuntime StatefulSet. The approved single-runtime pod has neither."
+              exit 1
+            fi
+            echo "OK: no observer/utility-sidecar/Fluent Bit container present."
+
+            echo "Checking Service resources (one ClusterIP, one headless)..."
+            SERVICE_COUNT="$(grep -c '^kind: Service$' "$RENDERED" || true)"
+            if [ "$SERVICE_COUNT" -ne 2 ]; then
+              echo "FAIL: expected exactly 2 Service documents (one ClusterIP, one headless), found ${SERVICE_COUNT}."
+              exit 1
+            fi
+            if ! grep -q "type: ClusterIP" "$RENDERED"; then
+              echo "FAIL: expected ClusterIP Service not found."
+              exit 1
+            fi
+            if ! grep -q "clusterIP: None" "$RENDERED"; then
+              echo "FAIL: expected headless Service (clusterIP: None) not found."
+              exit 1
+            fi
+            echo "OK: exactly one ClusterIP Service and one headless Service."
+
+            echo "Checking Ingress (if enabled, exactly one host)..."
+            INGRESS_ENABLED="false"
+            if grep -A1 '^ingress:' "$VALUES_FILE" | grep -q 'enabled: true'; then
+              INGRESS_ENABLED="true"
+            fi
+            if [ "$INGRESS_ENABLED" = "true" ]; then
+              INGRESS_COUNT="$(grep -c '^kind: Ingress$' "$RENDERED" || true)"
+              if [ "$INGRESS_COUNT" -ne 1 ]; then
+                echo "FAIL: expected exactly one rendered Ingress, found ${INGRESS_COUNT}."
+                exit 1
+              fi
+              INGRESS_BLOCK="$(awk '/^kind: Ingress$/{flag=1} flag{print} /^---$/{if(flag) exit}' "$RENDERED")"
+              HOST_COUNT="$(echo "$INGRESS_BLOCK" | grep -cE '^\s*- host:' || true)"
+              if [ "$HOST_COUNT" -ne 1 ]; then
+                echo "FAIL: expected exactly one Ingress host rule, found ${HOST_COUNT}."
+                exit 1
+              fi
+              echo "OK: exactly one Ingress with one host."
+            else
+              echo "ingress.enabled is not true in ${VALUES_FILE}. Skipping Ingress checks."
+            fi
+
+            echo "Checking runtime-qualified resource names are unique to ${DEPLOYMENT_ID} and namespaced resources use the shared namespace ${TARGET_NAMESPACE}..."
+            for RESOURCE_NAME in "${DEPLOYMENT_ID}" "${DEPLOYMENT_ID}-headless"; do
+              if ! grep -q "name: ${RESOURCE_NAME}" "$RENDERED"; then
+                echo "FAIL: expected resource named ${RESOURCE_NAME} not found in the rendered manifest."
+                exit 1
+              fi
+            done
+
+            if grep -q '^kind: SecretProviderClass$' "$RENDERED"; then
+              echo "Checking rendered SecretProviderClass names are runtime-qualified..."
+              SPC_NAMES="$(awk '/^kind: SecretProviderClass$/{flag=1} flag && /^  name:/{print; flag=0}' "$RENDERED" | sed -E 's/^\s*name:\s*//' | tr -d '"'"'"'\r')"
+              echo "Rendered SecretProviderClass names: ${SPC_NAMES}"
+              mapfile -t SPC_NAME_ARRAY <<< "$SPC_NAMES"
+              for SPC_NAME in "${SPC_NAME_ARRAY[@]}"; do
+                [ -z "$SPC_NAME" ] && continue
+                case "$SPC_NAME" in
+                  "${DEPLOYMENT_ID}"-*) ;;
+                  *)
+                    echo "FAIL: SecretProviderClass name ${SPC_NAME} is not qualified by the runtime name ${DEPLOYMENT_ID}."
+                    exit 1
+                    ;;
+                esac
+              done
+            fi
+
+            NAMESPACE_LINE_COUNT="$(grep -c "namespace: \"${TARGET_NAMESPACE}\"" "$RENDERED" || true)"
+            if [ "$NAMESPACE_LINE_COUNT" -lt 1 ]; then
+              echo "FAIL: no namespaced resource references the expected shared namespace ${TARGET_NAMESPACE}."
+              exit 1
+            fi
+            echo "OK: namespaced resources reference the shared namespace ${TARGET_NAMESPACE}."
+
+            echo "OK: singleRuntime rendered manifest passed all generic runtime contract checks."
+            echo "SOURCE_ENABLED=false" >> "$GITHUB_ENV"
+            echo "TARGET_ENABLED=false" >> "$GITHUB_ENV"
+            echo "OBSERVER_ENABLED=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
 
           SOURCE_PIPELINE="gg-${DEPLOYMENT_ID}-source"
           TARGET_PIPELINE="gg-${DEPLOYMENT_ID}-target"
@@ -1792,9 +2129,55 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Applying Argo CD Application: ${ARGOCD_APP_NAME}"
+          echo "Applying Argo CD Application: ${ARGOCD_APP_NAME} (deploymentModel=${DEPLOYMENT_MODEL})"
 
-          cat <<EOF | kubectl apply -f -
+          if [ "$DEPLOYMENT_MODEL" = "singleRuntime" ]; then
+            # singleRuntime deploys into the shared goldengate-<environment>
+            # namespace, which this Application does not create or own:
+            # no CreateNamespace=true, no managedNamespaceMetadata. That
+            # namespace is provisioned and owned by a separate, later
+            # platform/bootstrap step. No observer Helm parameters either --
+            # the generic runtime chart resources never reference
+            # monitoring.observer.
+            cat <<EOF | kubectl apply -f -
+          apiVersion: argoproj.io/v1alpha1
+          kind: Application
+          metadata:
+            name: ${ARGOCD_APP_NAME}
+            namespace: ${ARGOCD_NAMESPACE}
+            finalizers:
+              - resources-finalizer.argocd.argoproj.io
+            labels:
+              app.kubernetes.io/name: goldengate
+              app.kubernetes.io/managed-by: argocd
+              goldengate.adcb/environment: ${ENVIRONMENT}
+              goldengate.adcb/deployment-id: ${DEPLOYMENT_ID}
+          spec:
+            project: default
+            source:
+              repoURL: ${HELM_CHART_REF}
+              targetRevision: ${CHART_VERSION}
+              path: .
+              helm:
+                releaseName: ${RELEASE_NAME}
+                valueFiles:
+                  - values-deployment.yaml
+                parameters:
+                  - name: global.environment
+                    value: ${ENVIRONMENT}
+                  - name: global.deploymentId
+                    value: ${DEPLOYMENT_ID}
+            destination:
+              server: https://kubernetes.default.svc
+              namespace: ${TARGET_NAMESPACE}
+            syncPolicy:
+              automated:
+                prune: true
+                selfHeal: true
+            revisionHistoryLimit: 10
+          EOF
+          else
+            cat <<EOF | kubectl apply -f -
           apiVersion: argoproj.io/v1alpha1
           kind: Application
           metadata:
@@ -1843,6 +2226,7 @@ jobs:
                   goldengate.adcb/deployment-id: ${DEPLOYMENT_ID}
             revisionHistoryLimit: 10
           EOF
+          fi
 
           echo "Forcing Argo CD refresh for ${ARGOCD_APP_NAME}..."
 
@@ -1955,6 +2339,24 @@ jobs:
           echo "TARGET_OBSERVER_STATUS=not_run" >> "$GITHUB_ENV"
           echo "DYNAMODB_VERIFICATION_STATUS=not_run" >> "$GITHUB_ENV"
           echo "CLOUDWATCH_VERIFICATION_STATUS=not_run" >> "$GITHUB_ENV"
+
+          if [ "$DEPLOYMENT_MODEL" = "singleRuntime" ]; then
+            # Deliberately isolated from the legacy source/target
+            # goldengate-observer runtime verification below -- singleRuntime
+            # releases never render an observer container (see "Validate
+            # observer sidecar is rendered correctly" above, which already
+            # sets OBSERVER_ENABLED=false for this model). This branch exists
+            # so a future singleRuntime-specific runtime verification (shared
+            # gg-monitor REST/PMS polling, per the approved architecture) has
+            # a clearly separate place to live, without being tangled into or
+            # gated by the legacy observer's env vars/logic.
+            echo "deploymentModel=singleRuntime: no per-pod observer runtime verification applies. Shared runtime verification is a later phase (shared gg-monitor)."
+            echo "SOURCE_OBSERVER_STATUS=skipped_single_runtime" >> "$GITHUB_ENV"
+            echo "TARGET_OBSERVER_STATUS=skipped_single_runtime" >> "$GITHUB_ENV"
+            echo "DYNAMODB_VERIFICATION_STATUS=skipped_single_runtime" >> "$GITHUB_ENV"
+            echo "CLOUDWATCH_VERIFICATION_STATUS=skipped_single_runtime" >> "$GITHUB_ENV"
+            exit 0
+          fi
 
           if [ "${OBSERVER_ENABLED:-false}" != "true" ]; then
             echo "goldengate-observer is not enabled for this deployment. Skipping observer runtime verification."
@@ -2393,6 +2795,7 @@ jobs:
 
           ENVIRONMENT="${{ matrix.environment }}"
           DEPLOYMENT_ID="${{ matrix.deployment_id }}"
+          DEPLOYMENT_MODEL="${{ matrix.deployment_model }}"
 
           if [[ ! "$DEPLOYMENT_ID" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
             echo "Invalid deployment_id: $DEPLOYMENT_ID"
@@ -2400,12 +2803,30 @@ jobs:
             exit 1
           fi
 
+          # deployment_model comes from detect_changed_deployments, which
+          # already defaults a missing/unrecognized value at the base
+          # revision to legacyPair -- but re-normalize defensively here too,
+          # since this value directly controls namespace deletion safety
+          # below.
+          if [ "$DEPLOYMENT_MODEL" != "legacyPair" ] && [ "$DEPLOYMENT_MODEL" != "singleRuntime" ]; then
+            echo "Unrecognized deployment_model '${DEPLOYMENT_MODEL}' from the deletion matrix -- defaulting to legacyPair."
+            DEPLOYMENT_MODEL="legacyPair"
+          fi
+
           ARGOCD_NAMESPACE="argocd"
-          ARGOCD_APP_NAME="goldengate-${DEPLOYMENT_ID}"
-          TARGET_NAMESPACE="gg-${ENVIRONMENT}-${DEPLOYMENT_ID}"
+
+          if [ "$DEPLOYMENT_MODEL" = "singleRuntime" ]; then
+            TARGET_NAMESPACE="goldengate-${ENVIRONMENT}"
+            APP_SUFFIX="${DEPLOYMENT_ID#gg-}"
+            ARGOCD_APP_NAME="goldengate-${ENVIRONMENT}-${APP_SUFFIX}"
+          else
+            TARGET_NAMESPACE="gg-${ENVIRONMENT}-${DEPLOYMENT_ID}"
+            ARGOCD_APP_NAME="goldengate-${DEPLOYMENT_ID}"
+          fi
 
           echo "ENVIRONMENT=${ENVIRONMENT}" >> "$GITHUB_ENV"
           echo "DEPLOYMENT_ID=${DEPLOYMENT_ID}" >> "$GITHUB_ENV"
+          echo "DEPLOYMENT_MODEL=${DEPLOYMENT_MODEL}" >> "$GITHUB_ENV"
           echo "ARGOCD_NAMESPACE=${ARGOCD_NAMESPACE}" >> "$GITHUB_ENV"
           echo "ARGOCD_APP_NAME=${ARGOCD_APP_NAME}" >> "$GITHUB_ENV"
           echo "TARGET_NAMESPACE=${TARGET_NAMESPACE}" >> "$GITHUB_ENV"
@@ -2413,6 +2834,7 @@ jobs:
           echo "Deletion target:"
           echo "Environment: ${ENVIRONMENT}"
           echo "Deployment ID: ${DEPLOYMENT_ID}"
+          echo "Deployment model: ${DEPLOYMENT_MODEL}"
           echo "Argo CD Application: ${ARGOCD_APP_NAME}"
           echo "Target namespace: ${TARGET_NAMESPACE}"
 
@@ -2461,6 +2883,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          # HARD FAIL-SAFE (unconditional, checked before anything else,
+          # regardless of deployment_model or namespace labels): a
+          # singleRuntime release's TARGET_NAMESPACE is always the shared
+          # goldengate-<environment> namespace. That namespace is never
+          # created or owned by any individual runtime release/Application,
+          # so it must never be deleted from here -- even if it happened to
+          # carry matching-looking ownership labels. This check is
+          # deliberately independent of DEPLOYMENT_MODEL: it triggers on the
+          # namespace *value* itself, so it still protects the shared
+          # namespace even if deployment_model were ever wrong/missing.
+          if [ "$TARGET_NAMESPACE" = "goldengate-${ENVIRONMENT}" ]; then
+            echo "Refusing to delete namespace ${TARGET_NAMESPACE}: this is the shared goldengate-${ENVIRONMENT} namespace, never owned by an individual deployment/Application. Namespace deletion is unconditionally skipped for singleRuntime deployments."
+            exit 0
+          fi
 
           # CreateNamespace=true only guarantees the namespace exists for
           # sync -- it is not a guaranteed cleanup mechanism on Application

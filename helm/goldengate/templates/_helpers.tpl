@@ -118,3 +118,92 @@ not collide across deployments/namespaces.
 {{- "tgt-u02" -}}
 {{- end }}
 {{- end }}
+
+{{- /*
+Phase 1 single-runtime helpers (deploymentModel: singleRuntime). Kept
+entirely separate from the source/target helpers above -- legacyPair
+rendering never calls any of these.
+*/ -}}
+
+{{- define "goldengate.deploymentModel" -}}
+{{- default "legacyPair" .Values.deploymentModel -}}
+{{- end }}
+
+{{- define "goldengate.isLegacyPair" -}}
+{{- eq (include "goldengate.deploymentModel" .) "legacyPair" -}}
+{{- end }}
+
+{{- define "goldengate.isSingleRuntime" -}}
+{{- eq (include "goldengate.deploymentModel" .) "singleRuntime" -}}
+{{- end }}
+
+{{- define "goldengate.runtimeName" -}}
+{{- if .Values.runtime.fullnameOverride }}
+{{- .Values.runtime.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- else if .Values.runtime.name }}
+{{- .Values.runtime.name | trunc 63 | trimSuffix "-" -}}
+{{- else }}
+{{- fail "runtime.name (or runtime.fullnameOverride) is required when deploymentModel=singleRuntime." }}
+{{- end }}
+{{- end }}
+
+{{- define "goldengate.runtimeHeadlessName" -}}
+{{- printf "%s-headless" (include "goldengate.runtimeName" .) | trunc 63 | trimSuffix "-" -}}
+{{- end }}
+
+{{- define "goldengate.runtimeServiceAccountName" -}}
+{{- if .Values.runtime.serviceAccount.create }}
+{{- default (printf "%s-sa" (include "goldengate.runtimeName" .)) .Values.runtime.serviceAccount.name | trunc 63 | trimSuffix "-" -}}
+{{- else }}
+{{- default "default" .Values.runtime.serviceAccount.name -}}
+{{- end }}
+{{- end }}
+
+{{- define "goldengate.runtimeU02PVCName" -}}
+{{- if .Values.runtime.storage.u02.claimName }}
+{{- .Values.runtime.storage.u02.claimName | trunc 63 | trimSuffix "-" -}}
+{{- else }}
+{{- printf "%s-u02" (include "goldengate.runtimeName" .) | trunc 63 | trimSuffix "-" -}}
+{{- end }}
+{{- end }}
+
+{{- define "goldengate.runtimeAdminProviderClassName" -}}
+{{- default (printf "%s-admin" (include "goldengate.runtimeName" .)) .Values.runtime.csi.admin.providerClassName | trunc 63 | trimSuffix "-" -}}
+{{- end }}
+
+{{- define "goldengate.runtimeAdminSecretName" -}}
+{{- default (printf "%s-admin" (include "goldengate.runtimeName" .)) .Values.runtime.csi.admin.secretName | trunc 63 | trimSuffix "-" -}}
+{{- end }}
+
+{{- define "goldengate.runtimeCertificateProviderClassName" -}}
+{{- default (printf "%s-certificate" (include "goldengate.runtimeName" .)) .Values.runtime.csi.certificate.providerClassName | trunc 63 | trimSuffix "-" -}}
+{{- end }}
+
+{{- define "goldengate.runtimeIngressName" -}}
+{{- printf "%s-ingress" (include "goldengate.runtimeName" .) | trunc 63 | trimSuffix "-" -}}
+{{- end }}
+
+{{- /*
+Selector labels are intentionally minimal and stable: name + Helm release
+instance is already unique per singleRuntime release, and StatefulSet/Service
+selectors must never change across template edits (Kubernetes selectors are
+immutable on existing StatefulSets). Deliberately no "source"/"target"/
+component value here -- a single-runtime pod is neither.
+*/ -}}
+{{- define "goldengate.runtimeSelectorLabels" -}}
+app.kubernetes.io/name: {{ include "goldengate.runtimeName" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+
+{{- define "goldengate.runtimeLabels" -}}
+app.kubernetes.io/name: goldengate
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: runtime
+app.kubernetes.io/part-of: goldengate
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+app.kubernetes.io/engine: {{ .Values.runtime.deploymentType | quote }}
+goldengate.adcb/environment: {{ .Values.global.environment | quote }}
+goldengate.adcb/deployment-name: {{ include "goldengate.runtimeName" . | quote }}
+goldengate.adcb/deployment-type: {{ .Values.runtime.deploymentType | quote }}
+goldengate.adcb/business-domain: {{ .Values.runtime.businessDomain | quote }}
+{{- end }}

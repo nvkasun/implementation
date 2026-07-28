@@ -1,0 +1,271 @@
+{{- if and (eq (default "legacyPair" .Values.deploymentModel) "singleRuntime") .Values.runtime.enabled }}
+{{- if not .Values.runtime.admin.existingSecret }}
+{{- fail "runtime.admin.existingSecret is required when deploymentModel=singleRuntime and runtime.enabled=true." }}
+{{- end }}
+{{- if and .Values.runtime.csi.enabled .Values.runtime.csi.admin.enabled (not .Values.runtime.csi.admin.objectName) }}
+{{- fail "runtime.csi.admin.objectName is required when runtime.csi.admin.enabled=true." }}
+{{- end }}
+{{- if and .Values.runtime.csi.enabled .Values.runtime.csi.certificate.enabled (not .Values.runtime.csi.certificate.objectName) }}
+{{- fail "runtime.csi.certificate.objectName is required when runtime.csi.certificate.enabled=true." }}
+{{- end }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "goldengate.runtimeName" . }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "goldengate.runtimeLabels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "goldengate.runtimeHeadlessName" . }}
+  replicas: {{ .Values.runtime.replicas | default 1 }}
+  selector:
+    matchLabels:
+      {{- include "goldengate.runtimeSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "goldengate.runtimeLabels" . | nindent 8 }}
+        {{- include "goldengate.runtimeSelectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "goldengate.runtimeServiceAccountName" . }}
+
+{{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+{{- end }}
+
+{{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+{{- end }}
+
+{{- if .Values.runtime.initPermissions.enabled }}
+      initContainers:
+        - name: prepare-u02-permissions
+          image: "{{ required "runtime.image.repository is required when deploymentModel=singleRuntime and runtime.enabled=true" .Values.runtime.image.repository }}:{{ required "runtime.image.tag is required when deploymentModel=singleRuntime and runtime.enabled=true" .Values.runtime.image.tag }}"
+          imagePullPolicy: {{ .Values.runtime.image.pullPolicy | default "IfNotPresent" }}
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+
+              echo "Preparing writable GoldenGate runtime directories..."
+
+              mkdir -p /u02/oggf
+              rm -rf /u02/oggf/certificate
+              mkdir -p /u02/oggf/certificate
+              mkdir -p /u03
+
+              echo "Applying temporary test permissions..."
+              chown -R 0:0 /u02 /u03 || true
+              chmod -R {{ .Values.runtime.initPermissions.mode | default "0777" }} /u02 /u03
+
+              echo "Testing write access..."
+              touch /u02/oggf/certificate/write-test.txt
+              echo "ok" > /u02/oggf/certificate/write-test.txt
+              rm -f /u02/oggf/certificate/write-test.txt
+
+              # ServiceManager.pid records the OS process id of the GoldenGate
+              # Service Manager from a previous pod lifecycle. /u02 is
+              # persistent EFS storage, so this file can survive pod deletion
+              # and recreation even though the process it names is gone -- a
+              # new pod must never trust a PID left behind by an earlier pod
+              # lifecycle. A stale PID here makes Service Manager refuse to
+              # start ("already running") against a PID that no longer
+              # exists, which cascades into the Administration Server,
+              # Performance Metrics Server, and Distribution/Receiver managed
+              # processes never starting either.
+              SERVICE_MANAGER_PID_FILE="/u02/ServiceManager/var/run/ServiceManager.pid"
+
+              if [ -e "$SERVICE_MANAGER_PID_FILE" ] || [ -L "$SERVICE_MANAGER_PID_FILE" ]; then
+                STALE_PID="$(cat "$SERVICE_MANAGER_PID_FILE" 2>/dev/null || true)"
+                echo "Removing stale GoldenGate Service Manager PID file from persistent /u02 (recorded pid: ${STALE_PID:-unknown})..."
+                rm -f -- "$SERVICE_MANAGER_PID_FILE"
+              fi
+
+              if [ -e "$SERVICE_MANAGER_PID_FILE" ] || [ -L "$SERVICE_MANAGER_PID_FILE" ]; then
+                echo "ERROR: Failed to remove stale GoldenGate Service Manager PID file: $SERVICE_MANAGER_PID_FILE"
+                exit 1
+              fi
+
+              echo "Directory permissions after update:"
+              ls -ld /u02
+              ls -ld /u02/oggf
+              ls -ld /u02/oggf/certificate
+              ls -ld /u03
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+          volumeMounts:
+            - name: u02
+              mountPath: /u02
+            - name: u03
+              mountPath: /u03
+{{- if and .Values.runtime.csi.enabled .Values.runtime.csi.admin.enabled }}
+            - name: ogg-admin-csi
+              mountPath: {{ .Values.runtime.csi.admin.mountPath | quote }}
+              readOnly: true
+{{- end }}
+{{- end }}
+
+      containers:
+        - name: {{ required "runtime.containerName is required when deploymentModel=singleRuntime and runtime.enabled=true" .Values.runtime.containerName }}
+          image: "{{ required "runtime.image.repository is required when deploymentModel=singleRuntime and runtime.enabled=true" .Values.runtime.image.repository }}:{{ required "runtime.image.tag is required when deploymentModel=singleRuntime and runtime.enabled=true" .Values.runtime.image.tag }}"
+          imagePullPolicy: {{ .Values.runtime.image.pullPolicy | default "IfNotPresent" }}
+
+{{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+{{- end }}
+
+          env:
+            - name: OGG_ADMIN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.runtime.admin.existingSecret }}
+                  key: {{ .Values.runtime.admin.usernameKey | default "OGG_ADMIN" }}
+
+            - name: OGG_ADMIN_PWD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.runtime.admin.existingSecret }}
+                  key: {{ .Values.runtime.admin.passwordKey | default "OGG_ADMIN_PWD" }}
+
+            - name: OGG_DEPLOYMENT
+              value: {{ required "runtime.ogg.deploymentName is required when deploymentModel=singleRuntime and runtime.enabled=true" .Values.runtime.ogg.deploymentName | quote }}
+
+            - name: OGG_DOMAIN
+              value: {{ required "runtime.ogg.domain is required when deploymentModel=singleRuntime and runtime.enabled=true" .Values.runtime.ogg.domain | quote }}
+
+            - name: OGG_SECURE_DEPLOYMENT
+              value: {{ .Values.runtime.ogg.secureDeployment | default false | quote }}
+
+{{- with .Values.runtime.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+{{- end }}
+
+          ports:
+            - name: https
+              containerPort: {{ .Values.runtime.service.ports.https }}
+              protocol: TCP
+{{- if .Values.runtime.service.ports.dist }}
+            - name: dist
+              containerPort: {{ .Values.runtime.service.ports.dist }}
+              protocol: TCP
+{{- end }}
+{{- if .Values.runtime.service.ports.receiver }}
+            - name: receiver
+              containerPort: {{ .Values.runtime.service.ports.receiver }}
+              protocol: TCP
+{{- end }}
+            - name: metrics
+              containerPort: {{ .Values.runtime.service.ports.metrics }}
+              protocol: TCP
+
+          volumeMounts:
+            - name: u02
+              mountPath: /u02
+
+            - name: u03
+              mountPath: /u03
+
+{{- if and .Values.runtime.csi.enabled .Values.runtime.csi.admin.enabled }}
+            - name: ogg-admin-csi
+              mountPath: {{ .Values.runtime.csi.admin.mountPath | quote }}
+              readOnly: true
+{{- end }}
+
+{{- if and .Values.runtime.csi.enabled .Values.runtime.csi.certificate.enabled }}
+            - name: ogg-nginx-cert-csi
+              mountPath: {{ .Values.runtime.csi.certificate.mountPath | quote }}
+              readOnly: true
+{{- end }}
+
+{{- with .Values.runtime.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+{{- end }}
+
+          readinessProbe:
+            tcpSocket:
+              port: https
+            initialDelaySeconds: {{ .Values.runtime.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.runtime.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.runtime.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.runtime.readinessProbe.failureThreshold }}
+
+          livenessProbe:
+            tcpSocket:
+              port: https
+            initialDelaySeconds: {{ .Values.runtime.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.runtime.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.runtime.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.runtime.livenessProbe.failureThreshold }}
+
+{{- with .Values.runtime.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+{{- end }}
+
+      volumes:
+        - name: u02
+{{- if eq .Values.runtime.storage.u02.type "efs" }}
+{{- if .Values.runtime.storage.u02.existingClaim }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.runtime.storage.u02.existingClaim }}
+{{- else }}
+          persistentVolumeClaim:
+            claimName: {{ include "goldengate.runtimeU02PVCName" . }}
+{{- end }}
+{{- else if eq .Values.runtime.storage.u02.type "existingClaim" }}
+{{- if not .Values.runtime.storage.u02.existingClaim }}
+{{- fail "runtime.storage.u02.existingClaim is required when runtime.storage.u02.type=existingClaim." }}
+{{- end }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.runtime.storage.u02.existingClaim }}
+{{- else if eq .Values.runtime.storage.u02.type "emptyDir" }}
+          emptyDir: {}
+{{- else }}
+{{- fail (printf "runtime.storage.u02.type must be one of emptyDir, existingClaim, efs -- got %q" .Values.runtime.storage.u02.type) }}
+{{- end }}
+
+        - name: u03
+          emptyDir: {}
+
+{{- if and .Values.runtime.csi.enabled .Values.runtime.csi.admin.enabled }}
+        - name: ogg-admin-csi
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: {{ include "goldengate.runtimeAdminProviderClassName" . | quote }}
+{{- end }}
+
+{{- if and .Values.runtime.csi.enabled .Values.runtime.csi.certificate.enabled }}
+        - name: ogg-nginx-cert-csi
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: {{ include "goldengate.runtimeCertificateProviderClassName" . | quote }}
+{{- end }}
+
+{{- with .Values.runtime.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+{{- end }}
+
+{{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+{{- end }}
+
+{{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+{{- end }}
+
+{{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+{{- end }}
+{{- end }}

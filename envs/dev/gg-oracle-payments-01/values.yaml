@@ -1,0 +1,195 @@
+# Phase 1 single-runtime candidate: Oracle GoldenGate runtime.
+#
+# INACTIVE by design (deployment.enabled=false below). The existing
+# goldengate-eks-app.yaml deployment-detection logic already treats
+# deployment.enabled=false as inactive and excludes this folder from the
+# deployment matrix -- this file is not deployed by any workflow run in
+# Phase 1. It is not deployable at all yet regardless of this flag: the
+# shared goldengate-dev namespace and the shared gg-oracle-sa/gg-postgresql-sa
+# ServiceAccounts (with their IRSA role annotations) do not exist yet and are
+# provisioned by a later, separate platform/bootstrap step, outside this
+# Phase 1 chart/repository-model task.
+deployment:
+  enabled: false
+
+global:
+  environment: dev
+  deploymentId: gg-oracle-payments-01
+
+deploymentModel: singleRuntime
+
+runtime:
+  enabled: true
+
+  name: gg-oracle-payments-01
+
+  deploymentType: oracle
+  businessDomain: payments
+  containerName: ogg-oracle
+
+  replicas: 1
+
+  image:
+    repository: 229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle
+    tag: "23.26.2.0.1"
+    pullPolicy: IfNotPresent
+
+  ogg:
+    deploymentName: gg-oracle-payments-01
+    domain: gg-oracle-payments-01.goldengate-dev.svc.cluster.local
+    secureDeployment: false
+
+  admin:
+    existingSecret: gg-oracle-payments-01-admin
+    usernameKey: OGG_ADMIN
+    passwordKey: OGG_ADMIN_PWD
+
+  csi:
+    enabled: true
+    region: eu-west-1
+    serviceAccountRoleArn: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev
+
+    admin:
+      enabled: true
+      # providerClassName/secretName left empty so the chart generates them
+      # from the canonical runtime name (gg-oracle-payments-01-admin) --
+      # see helm/goldengate/templates/_helpers.tpl.
+      providerClassName: ""
+      secretName: ""
+      # TEMPORARY: this is the existing shared POC Secrets Manager object
+      # path, reused unchanged from the current live payments-ora-to-pg-001
+      # deployment. It is not deployment-specific. A later phase should move
+      # this to a path scoped to gg-oracle-payments-01 specifically.
+      objectName: dev/goldengate/source/admin
+      objectType: secretsmanager
+      mountPath: /mnt/secrets-store/admin
+      jmesPath:
+        - path: OGG_ADMIN
+          objectAlias: OGG_ADMIN
+        - path: OGG_ADMIN_PWD
+          objectAlias: OGG_ADMIN_PWD
+
+    certificate:
+      enabled: true
+      providerClassName: ""
+      # TEMPORARY: shared POC TLS certificate object path, same as the
+      # existing live deployment. Not deployment-specific yet.
+      objectName: dev/goldengate/tls-certificate
+      objectType: secretsmanager
+      mountPath: /etc/nginx/cert
+      jmesPath:
+        - path: '"ogg.key"'
+          objectAlias: ogg.key
+        - path: '"ogg.pem"'
+          objectAlias: ogg.pem
+        - path: '"ca-chain.pem"'
+          objectAlias: ca-chain.pem
+
+  initPermissions:
+    enabled: true
+    mode: "0777"
+
+  # gg-oracle-sa is a shared, engine-level identity, not owned by this
+  # single-runtime release -- must not be created here. Its creation and
+  # IRSA role annotation are provisioned by a later shared platform/bootstrap
+  # step, outside this Phase 1 task.
+  serviceAccount:
+    create: false
+    name: gg-oracle-sa
+    annotations: {}
+
+  service:
+    type: ClusterIP
+    ports:
+      https: 8443
+      dist: 9013
+      receiver: null
+      metrics: 9015
+
+  # Unique EFS path for this candidate -- intentionally NOT the current live
+  # source/target EFS basePath. The EFS filesystem itself (fs-05cadf3570f23cd39)
+  # is the same already-existing filesystem; only this candidate's own
+  # basePath/StorageClass/PVC are new and unique, so existing EFS content for
+  # payments-ora-to-pg-001 is never touched, migrated, or renamed.
+  storage:
+    u02:
+      type: efs
+      existingClaim: ""
+      claimName: ""
+      size: 20Gi
+      accessModes:
+        - ReadWriteMany
+    u03:
+      type: emptyDir
+
+  resources: {}
+
+  extraEnv: []
+  extraVolumeMounts: []
+  extraVolumes: []
+
+ingress:
+  enabled: true
+  mode: shared
+  className: alb
+
+  host: gg-oracle-payments-01.goldengate-dev.adcbmis.local
+
+  alb:
+    groupName: gg-poc-dev-alb
+    groupOrder: "110"
+    backendProtocol: HTTPS
+    listenPorts: '[{"HTTPS":443}]'
+    certificateArn: arn:aws:acm:eu-west-1:668311715351:certificate/9e53e28e-3243-47fc-85a1-50f9a94acde7
+    targetType: ip
+    healthcheckProtocol: HTTPS
+    healthcheckPort: traffic-port
+    healthcheckPath: /
+    successCodes: "200-499"
+
+  annotations: {}
+
+# No observer sidecar in the approved single-runtime pod (see
+# helm/goldengate/templates/runtime-statefulset.yaml -- it never references
+# monitoring.observer at all). Left explicit and disabled here only for
+# documentation clarity.
+monitoring:
+  labels:
+    enabled: true
+  observer:
+    enabled: false
+
+podSecurityContext: {}
+
+securityContext:
+  runAsUser: 0
+  runAsGroup: 0
+  allowPrivilegeEscalation: false
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+# Same existing EFS filesystem as the current live deployment -- only the
+# basePath/StorageClass/PVC names are unique to this candidate (see
+# runtime.storage above and the naming contract in this file's header
+# comment). reclaimPolicy: Retain for the same reason as the legacy
+# deployment: GoldenGate storage holds trail/checkpoint/recovery state.
+persistence:
+  enabled: true
+  provider: efs
+  efs:
+    fileSystemId: fs-05cadf3570f23cd39
+    storageClass:
+      create: true
+      name: gg-efs-dev-gg-oracle-payments-01
+      reclaimPolicy: Retain
+      volumeBindingMode: Immediate
+      directoryPerms: "0777"
+      basePath: /gg-oracle-payments-01
+      subPathPattern: "${.PVC.name}"
+      ensureUniqueDirectory: "true"
+      mountOptions:
+        - tls
