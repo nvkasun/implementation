@@ -572,13 +572,46 @@ jobs:
             sleep "${INTERVAL_SECONDS}"; ELAPSED=$((ELAPSED + INTERVAL_SECONDS))
           done
 
+      - name: Select the Running and Ready gg-monitor pod
+        if: ${{ inputs.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Never blindly use .items[0]: during/just after a rollout, a
+          # Terminating pod from the PREVIOUS ReplicaSet can still be listed
+          # by the label selector alongside the new one, and .items[0] has
+          # no defined ordering guarantee -- it could select either. This
+          # selects the single pod that is both phase=Running and reports a
+          # Ready=True condition. With replicaCount=1 (and the earlier "Wait
+          # for Argo CD sync and health" step having already confirmed
+          # rollout health), there must be exactly one such pod; anything
+          # else (zero, or more than one during an overlapping rollout) is a
+          # real problem, not something to guess past.
+          POD_NAME="$(kubectl get pods -n "$RUNTIME_NAMESPACE" -l app.kubernetes.io/name=gg-monitor -o json | python3 -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          ready = []
+          for pod in data.get("items", []):
+              status = pod.get("status", {}) or {}
+              if status.get("phase") != "Running":
+                  continue
+              conditions = status.get("conditions", []) or []
+              if any(c.get("type") == "Ready" and c.get("status") == "True" for c in conditions):
+                  ready.append(pod["metadata"]["name"])
+          if len(ready) != 1:
+              print(f"expected exactly 1 Running+Ready gg-monitor pod for replicaCount=1, found {len(ready)}: {ready}", file=sys.stderr)
+              sys.exit(1)
+          print(ready[0])
+          ')"
+          echo "Selected Running+Ready pod: ${POD_NAME}"
+          echo "POD_NAME=${POD_NAME}" >> "$GITHUB_ENV"
+
       - name: Verify gg-monitor runtime state (container count, IRSA, DynamoDB read-only)
         if: ${{ inputs.deploy }}
         shell: bash
         run: |
           set -euo pipefail
           echo "Pod container count (must be exactly 1 -- no sidecar):"
-          POD_NAME="$(kubectl get pods -n "$RUNTIME_NAMESPACE" -l app.kubernetes.io/name=gg-monitor -o jsonpath='{.items[0].metadata.name}')"
           CONTAINER_COUNT="$(kubectl get pod "$POD_NAME" -n "$RUNTIME_NAMESPACE" -o jsonpath='{.spec.containers[*].name}' | wc -w)"
           [ "$CONTAINER_COUNT" -eq 1 ] || { echo "FAIL: expected 1 container, found ${CONTAINER_COUNT}"; exit 1; }
 
@@ -602,7 +635,10 @@ jobs:
           # ServiceAccount -> IRSA -> gg-monitor-dev-role identity, and any
           # failure (AccessDenied, wrong identity, missing/malformed record)
           # fails this step for real -- no `|| true` anywhere below.
-          POD_NAME="$(kubectl get pods -n "$RUNTIME_NAMESPACE" -l app.kubernetes.io/name=gg-monitor -o jsonpath='{.items[0].metadata.name}')"
+          # POD_NAME comes from the "Select the Running and Ready gg-monitor
+          # pod" step above (not re-derived here) so this verification
+          # always targets the exact pod already proven Running+Ready --
+          # never a pod that could have changed identity between steps.
 
           cat > "${RUNNER_TEMP}/verify_gg_monitor_dynamodb.py" <<'PYEOF'
           import sys
@@ -616,10 +652,19 @@ jobs:
           PIPELINES = ["gg-oracle-payments-01", "gg-postgresql-payments-01"]
           TIMEOUT_SECONDS = 180
           POLL_INTERVAL_SECONDS = 5
+          # Matches checkIntervalSeconds=60 with a safe margin (3x) -- a
+          # STATE#_deployment record older than this means the monitor has
+          # stopped writing, even though the record itself still exists.
+          MAX_STATE_AGE_SECONDS = 180
 
           def fail(msg):
               print(f"FAIL: {msg}")
               sys.exit(1)
+
+          if len(sys.argv) < 2 or not sys.argv[1]:
+              fail("expected the current pod name as argv[1] (passed by the workflow step)")
+          EXPECTED_LEASE_HOLDER = sys.argv[1]
+          print(f"Expected LEASE holder (the pod already proven Running+Ready): {EXPECTED_LEASE_HOLDER}")
 
           sts = boto3.client("sts", region_name=REGION)
           try:
@@ -643,18 +688,59 @@ jobs:
               return resp.get("Item")
 
           required = [(p, rt) for p in PIPELINES for rt in ("LEASE", "STATE#_deployment")]
+
+          def diagnose(items, now):
+              """Returns a list of human-readable reasons this snapshot is
+              not yet acceptable -- empty list means every condition is met.
+              Used both to decide whether to keep polling and to produce a
+              clear final timeout message (never a generic 'still missing
+              some records' when the real problem is a stale/wrong holder)."""
+              problems = []
+              for p in PIPELINES:
+                  lease = items.get((p, "LEASE"))
+                  state = items.get((p, "STATE#_deployment"))
+                  if not lease:
+                      problems.append(f"{p}/LEASE missing")
+                      continue
+                  if not state:
+                      problems.append(f"{p}/STATE#_deployment missing")
+                      continue
+                  holder = lease.get("holder")
+                  if holder != EXPECTED_LEASE_HOLDER:
+                      # This is the case a stale lease from a Terminating pod
+                      # of the PREVIOUS ReplicaSet would hit: the record
+                      # exists and may even look well-formed, but it is not
+                      # owned by the pod this workflow run actually deployed.
+                      problems.append(
+                          f"{p}/LEASE holder={holder!r} does not match the current "
+                          f"Running+Ready pod {EXPECTED_LEASE_HOLDER!r} (stale/wrong holder)"
+                      )
+                  try:
+                      recorded_at = int(state.get("recordedAt"))
+                  except (TypeError, ValueError):
+                      problems.append(f"{p}/STATE#_deployment recordedAt is missing or not numeric")
+                  else:
+                      age = now - recorded_at
+                      if age > MAX_STATE_AGE_SECONDS:
+                          problems.append(
+                              f"{p}/STATE#_deployment recordedAt is {age}s old "
+                              f"(> {MAX_STATE_AGE_SECONDS}s max -- the monitor appears to have stopped writing)"
+                          )
+              return problems
+
           deadline = time.time() + TIMEOUT_SECONDS
           items = {}
+          problems = ["not yet checked"]
           while time.time() < deadline:
+              now = int(time.time())
               items = {(p, rt): get_item(p, rt) for p, rt in required}
-              if all(items.values()):
+              problems = diagnose(items, now)
+              if not problems:
                   break
-              missing = [f"{p}/{rt}" for (p, rt), v in items.items() if not v]
-              print(f"waiting for records to appear: {missing} (elapsed {int(time.time() - (deadline - TIMEOUT_SECONDS))}s)")
+              print(f"waiting: {problems} (elapsed {int(time.time() - (deadline - TIMEOUT_SECONDS))}s)")
               time.sleep(POLL_INTERVAL_SECONDS)
           else:
-              missing = [f"{p}/{rt}" for (p, rt), v in items.items() if not v]
-              fail(f"timed out after {TIMEOUT_SECONDS}s waiting for records: {missing}")
+              fail(f"timed out after {TIMEOUT_SECONDS}s: {problems}")
 
           now = int(time.time())
           for pipeline in PIPELINES:
@@ -668,7 +754,8 @@ jobs:
                   if field not in state_item:
                       fail(f"{pipeline}/STATE#_deployment missing required field: {field}")
               print(f"OK: {pipeline}/STATE#_deployment has status={state_item['status']!r}, "
-                    f"recordedAt={state_item['recordedAt']}, deploymentType={state_item['deploymentType']!r}.")
+                    f"recordedAt={state_item['recordedAt']} (age {now - int(state_item['recordedAt'])}s, "
+                    f"<= {MAX_STATE_AGE_SECONDS}s), deploymentType={state_item['deploymentType']!r}.")
 
               lease_item = items[(pipeline, "LEASE")]
               for field in ("holder", "expiresAt", "ttl", "leaseToken"):
@@ -676,8 +763,10 @@ jobs:
                       fail(f"{pipeline}/LEASE missing required field: {field}")
               if int(lease_item["expiresAt"]) <= now:
                   fail(f"{pipeline}/LEASE expiresAt ({lease_item['expiresAt']}) is not in the future (now={now}) -- lease appears expired")
-              print(f"OK: {pipeline}/LEASE holder={lease_item['holder']!r}, expiresAt={lease_item['expiresAt']} (future), "
-                    f"ttl={lease_item['ttl']}, leaseToken present.")
+              if lease_item["holder"] != EXPECTED_LEASE_HOLDER:
+                  fail(f"{pipeline}/LEASE holder={lease_item['holder']!r} does not match expected holder {EXPECTED_LEASE_HOLDER!r}")
+              print(f"OK: {pipeline}/LEASE holder={lease_item['holder']!r} (matches current pod), "
+                    f"expiresAt={lease_item['expiresAt']} (future), ttl={lease_item['ttl']}, leaseToken present.")
 
               # Zero STATE#<process> records expected: current topology has no
               # configured Extract/Replicat/Distribution Path.
@@ -694,7 +783,7 @@ jobs:
           print("OK: all DynamoDB verifications passed.")
           PYEOF
 
-          kubectl exec -i "$POD_NAME" -n "$RUNTIME_NAMESPACE" -c gg-monitor -- python3 - < "${RUNNER_TEMP}/verify_gg_monitor_dynamodb.py"
+          kubectl exec -i "$POD_NAME" -n "$RUNTIME_NAMESPACE" -c gg-monitor -- python3 - "$POD_NAME" < "${RUNNER_TEMP}/verify_gg_monitor_dynamodb.py"
 
       - name: Upload rendered manifests and chart package
         if: always()

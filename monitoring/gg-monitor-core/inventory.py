@@ -18,7 +18,11 @@ enabled_deployments in the manager reference repository, inspected read-only):
     enabled_deployments() reads via list(json.load(fh)).
   - process-pipeline-map.json: {PROCESS_NAME_UPPER: {"pipeline_name": ...,
     "deployment": <bare-key-without-gg->}} -- exactly the shape
-    build_process_pipeline_map() reads. With the current empty topology
+    build_process_pipeline_map() reads. pipeline_name is the LOGICAL
+    topology pipelineId (e.g. "payments-ora-to-pg-001"), not the canonical
+    per-deployment DynamoDB partition key -- the manager keeps "which
+    pipeline" and "which deployment" as two separate concepts, and this
+    module follows that same contract. With the current empty topology
     process lists (no Extract/Replicat/Distribution Path configured yet),
     this is always {}.
 
@@ -113,20 +117,44 @@ def load_topologies(repo_root=None):
     """Parse every topologies/dev/*.yaml file. Returns {deploymentName: detail}
     for every deployment entry found in every topology document's
     deployments.* mapping (source/target/... -- topology key names are not
-    load-bearing, only each entry's own deploymentName is)."""
+    load-bearing, only each entry's own deploymentName is).
+
+    Each returned detail dict also carries its parent topology document's
+    top-level pipelineId (e.g. "payments-ora-to-pg-001") under the
+    "pipelineId" key -- this is the LOGICAL pipeline identity, distinct from
+    the per-deployment canonical DynamoDB partition key (gg-oracle-...). See
+    build_process_pipeline_map_json below for why this distinction matters.
+
+    A deploymentName appearing in more than one topology document is a
+    configuration error (a deployment cannot belong to two different logical
+    pipelines) and fails loudly rather than silently letting the
+    later-sorted file overwrite the earlier one.
+    """
     repo_root = repo_root or _repo_root()
     pattern = os.path.join(repo_root, TOPOLOGIES_GLOB_RELPATH)
     by_deployment_name = {}
+    seen_in_file = {}
     for path in sorted(glob.glob(pattern)):
         try:
             with open(path) as f:
                 doc = yaml.safe_load(f) or {}
         except OSError as e:
             raise InventoryError(f"could not read {path}: {e}") from e
+        pipeline_id = doc.get("pipelineId") or ""
         for _role, detail in (doc.get("deployments") or {}).items():
             if not isinstance(detail, dict) or "deploymentName" not in detail:
                 continue
-            by_deployment_name[detail["deploymentName"]] = detail
+            name = detail["deploymentName"]
+            if name in by_deployment_name:
+                raise InventoryError(
+                    f"deploymentName {name!r} appears in more than one topology "
+                    f"document: {seen_in_file[name]!r} and {path!r} -- each "
+                    "deployment must belong to exactly one topology's pipeline"
+                )
+            merged = dict(detail)
+            merged["pipelineId"] = pipeline_id
+            by_deployment_name[name] = merged
+            seen_in_file[name] = path
     return by_deployment_name
 
 
@@ -143,6 +171,12 @@ def load_runtimes(repo_root=None):
         "namespace": "goldengate-dev",
         "serviceName": "gg-oracle-payments-01",
         "topologyDeploymentType": "oracle",     # topology's own deploymentType, or None
+        "pipelineId": "payments-ora-to-pg-001", # LOGICAL pipeline identity from the
+                                                 # parent topology document -- distinct
+                                                 # from "pipeline" above (the canonical
+                                                 # per-deployment DynamoDB partition
+                                                 # key). "", not "pipeline", if no
+                                                 # matching topology entry was found.
         "endpoints": {...},                     # from topology, may be {}
         "secretReferences": {...},               # from topology, may be {}
         "processes": {...},                      # from topology, may be {}
@@ -170,6 +204,7 @@ def load_runtimes(repo_root=None):
             "namespace": detail.get("namespace", ""),
             "serviceName": detail.get("serviceName", ""),
             "topologyDeploymentType": detail.get("deploymentType"),
+            "pipelineId": detail.get("pipelineId", ""),
             "endpoints": detail.get("endpoints", {}),
             "secretReferences": detail.get("secretReferences", {}),
             "processes": detail.get("processes", {}),
@@ -217,6 +252,12 @@ def validate_enabled_runtimes(runtimes, admin_credential_types):
                 f"does not match inventory type {r['type']!r}"
             )
 
+        if not r["pipelineId"]:
+            problems.append(
+                f"{pipeline}: no topology pipelineId found -- every enabled runtime "
+                "must belong to a non-empty logical pipeline"
+            )
+
         if not r["namespace"]:
             problems.append(f"{pipeline}: topology namespace is empty")
         if not r["serviceName"]:
@@ -256,15 +297,22 @@ def build_process_pipeline_map_json(runtimes):
     Built from each runtime's topology processes (extracts/distributionPaths/
     replicats). With today's empty process lists this is always {} -- no
     placeholder Extract/Replicat/Distribution Path names are invented.
+
+    pipeline_name is the LOGICAL topology pipelineId (e.g.
+    "payments-ora-to-pg-001"), matching the manager's own concept of a
+    pipeline as distinct from a single deployment -- NOT the per-deployment
+    canonical DynamoDB partition key (e.g. "gg-oracle-payments-01"), which
+    would conflate two different identities the manager keeps separate.
     """
     out = {}
     for r in runtimes:
         bare_key = r["name"]
+        pipeline_id = r.get("pipelineId", "")
         processes = r.get("processes") or {}
         for _kind, names in processes.items():
             for proc_name in (names or []):
                 out[str(proc_name).upper()] = {
-                    "pipeline_name": r["pipeline"],
+                    "pipeline_name": pipeline_id,
                     "deployment": bare_key,
                 }
     return out

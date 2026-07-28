@@ -219,10 +219,18 @@ def lease_control_loop(mgr, state, stop_event, renew_interval=RENEW_INTERVAL):
     Mirrors the manager's utility-sidecar lease_loop in structure: renew if
     leader, else try to acquire; demote immediately (state.set_leader(False))
     the instant a renew/acquire call reports the lease is not (or no longer)
-    held. state.is_ready() flips true once this loop has successfully
-    exercised the lease API at least once (proves DynamoDB connectivity and
-    IAM permissions for the lease path) -- independent of who currently
-    holds the lease.
+    held.
+
+    state.is_ready() reflects CURRENT lease-API health, not a one-time latch:
+    any successful acquire/renew CALL -- whether it wins the lease (True) or
+    correctly reports a conflict because another valid holder already owns
+    it (False, but still a successful DynamoDB round-trip) -- sets ready
+    True. An EXCEPTION (DynamoDB unreachable, AccessDenied, etc.) sets both
+    leader and ready False immediately; the next successful call (after
+    DynamoDB recovers) restores ready True on its own, every iteration re-
+    entering this same try block fresh. This is what lets run_pipeline's
+    readiness loop continuously mirror real dependency health instead of
+    latching "ready" forever after the first success.
     """
     while not stop_event.is_set():
         try:
@@ -235,10 +243,14 @@ def lease_control_loop(mgr, state, stop_event, renew_interval=RENEW_INTERVAL):
                 if state.is_leader():
                     logger.warning("Lost lease for %s; demoting to standby immediately.", mgr.pipeline)
                 state.set_leader(False)
+            # Reached only when the DynamoDB call itself succeeded -- true
+            # regardless of which branch above ran (won the lease, or
+            # correctly lost/deferred to a valid existing holder).
             state.set_ready(True)
         except Exception:
-            logger.exception("lease control loop error for %s; treating as standby", mgr.pipeline)
+            logger.exception("lease control loop error for %s; treating as standby and not ready", mgr.pipeline)
             state.set_leader(False)
+            state.set_ready(False)
         stop_event.wait(renew_interval)
 
 
@@ -554,9 +566,28 @@ def check_static_prerequisites(runtime, table):
         return False, f"TLS context unavailable: {e}"
 
     try:
-        read_config(table, runtime["pipeline"])
+        config_item = read_config(table, runtime["pipeline"])
     except Exception as e:
         return False, f"DynamoDB CONFIG read failed: {e}"
+
+    # The canonical CONFIG item is Terraform-owned (envs/dev/dynamodb.tf) and
+    # must exist for every enabled runtime before this pipeline is ready --
+    # an empty/missing Item is a real configuration gap, not something to
+    # paper over with manager-style in-code defaults.
+    if not config_item:
+        return False, f"CONFIG item missing for pipeline {runtime['pipeline']!r}"
+
+    if "recordType" in config_item and config_item["recordType"] != "CONFIG":
+        return False, f"CONFIG item has unexpected recordType {config_item.get('recordType')!r}"
+
+    config_deployment_type = config_item.get("deploymentType")
+    if not config_deployment_type:
+        return False, f"CONFIG item for {runtime['pipeline']!r} is missing deploymentType"
+    if config_deployment_type != deployment_type:
+        return False, (
+            f"CONFIG deploymentType {config_deployment_type!r} does not match "
+            f"inventory runtime type {deployment_type!r} for {runtime['pipeline']!r}"
+        )
 
     return True, ""
 
@@ -780,10 +811,13 @@ def run_pipeline(runtime, stop_event, ready_state):
     lease_thread.start()
     poll_thread.start()
 
+    # Continuously mirror current lease-API health into ready_state for the
+    # life of this pipeline -- never latch True once and stop watching.
+    # GoldenGate Admin REST reachability plays no part here (see
+    # polling_loop/check_static_prerequisites): only lease-API health drives
+    # this pipeline's readiness after startup.
     while not stop_event.is_set():
-        if state.is_ready():
-            ready_state[pipeline] = True
-            break
+        ready_state[pipeline] = state.is_ready()
         stop_event.wait(1)
 
     lease_thread.join()

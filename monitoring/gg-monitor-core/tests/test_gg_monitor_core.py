@@ -16,6 +16,8 @@ import json
 import os
 import ssl
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -123,6 +125,7 @@ deployments:
     enabled: true
 """)
             self._write(root, "topologies/dev/x.yaml", """
+pipelineId: payments-ora-to-pg-001
 deployments:
   source:
     deploymentName: gg-oracle-payments-01
@@ -147,6 +150,67 @@ deployments:
             self.assertEqual(r["endpoints"]["admin"]["port"], 8443)
             self.assertEqual(r["secretReferences"]["admin"], "dev/goldengate/source/admin")
 
+    def test_pipeline_id_propagated_into_merged_runtime(self):
+        """Exact shape from the correction pass: pipeline is the canonical
+        DynamoDB key, name is the bare inventory name, pipelineId is the
+        LOGICAL topology pipeline identity -- three distinct fields."""
+        with tempfile.TemporaryDirectory() as root:
+            self._write(root, inv.DEPLOYMENTS_YAML_RELPATH, """
+deployments:
+  - name: oracle-payments-01
+    type: oracle
+    enabled: true
+""")
+            self._write(root, "topologies/dev/x.yaml", """
+pipelineId: payments-ora-to-pg-001
+deployments:
+  source:
+    deploymentName: gg-oracle-payments-01
+    namespace: goldengate-dev
+    serviceName: gg-oracle-payments-01
+    endpoints: {}
+    secretReferences: {}
+    processes: {}
+""")
+            r = inv.load_runtimes(root)[0]
+            self.assertEqual(r["pipeline"], "gg-oracle-payments-01")
+            self.assertEqual(r["name"], "oracle-payments-01")
+            self.assertEqual(r["pipelineId"], "payments-ora-to-pg-001")
+
+    def test_missing_topology_yields_empty_pipeline_id(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._write(root, inv.DEPLOYMENTS_YAML_RELPATH, """
+deployments:
+  - name: orphan-01
+    type: oracle
+    enabled: false
+""")
+            r = inv.load_runtimes(root)[0]
+            self.assertEqual(r["pipelineId"], "")
+
+    def test_duplicate_deployment_name_across_topology_documents_fails_loudly(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._write(root, "topologies/dev/a.yaml", """
+pipelineId: pipeline-a
+deployments:
+  source:
+    deploymentName: gg-oracle-payments-01
+    namespace: goldengate-dev
+    serviceName: gg-oracle-payments-01
+""")
+            self._write(root, "topologies/dev/b.yaml", """
+pipelineId: pipeline-b
+deployments:
+  source:
+    deploymentName: gg-oracle-payments-01
+    namespace: goldengate-dev
+    serviceName: gg-oracle-payments-01
+""")
+            with self.assertRaises(inv.InventoryError) as ctx:
+                inv.load_topologies(root)
+            self.assertIn("gg-oracle-payments-01", str(ctx.exception))
+            self.assertIn("more than one topology", str(ctx.exception))
+
     def test_empty_process_mapping_on_real_repo_topology(self):
         """The actual repository's canonical sources today have zero
         configured Extracts/Replicats/Distribution Paths -- the derived
@@ -162,6 +226,7 @@ deployments:
         for r in runtimes:
             if r["pipeline"] in ("gg-oracle-payments-01", "gg-postgresql-payments-01"):
                 self.assertTrue(r["enabled"])
+                self.assertEqual(r["pipelineId"], "payments-ora-to-pg-001")
 
 
 class LeaseContractTests(unittest.TestCase):
@@ -695,6 +760,39 @@ deployments:
                 inv.validate_enabled_runtimes(runtimes, admin_credential_types={"oracle", "postgresql"})
             self.assertTrue(any("tlsServerName" in p for p in ctx.exception.problems))
 
+    def test_missing_pipeline_id_fails_startup(self):
+        """A topology document with an admin endpoint but no top-level
+        pipelineId (or an empty one) must fail startup for an enabled
+        runtime -- every enabled runtime must belong to a non-empty logical
+        pipeline."""
+        with tempfile.TemporaryDirectory() as root:
+            self._write(root, inv.DEPLOYMENTS_YAML_RELPATH, """
+deployments:
+  - name: oracle-payments-01
+    type: oracle
+    enabled: true
+""")
+            self._write(root, "topologies/dev/x.yaml", """
+deployments:
+  source:
+    deploymentName: gg-oracle-payments-01
+    namespace: goldengate-dev
+    serviceName: gg-oracle-payments-01
+    endpoints:
+      admin:
+        scheme: https
+        host: gg-oracle-payments-01.goldengate-dev.svc.cluster.local
+        tlsServerName: gg-oracle-payments-01.goldengate-dev.adcbmis.local
+        port: 8443
+    secretReferences:
+      admin: dev/goldengate/source/admin
+      tls: dev/goldengate/tls-certificate
+""")
+            runtimes = inv.load_runtimes(root)
+            with self.assertRaises(inv.StartupValidationError) as ctx:
+                inv.validate_enabled_runtimes(runtimes, admin_credential_types={"oracle", "postgresql"})
+            self.assertTrue(any("pipelineId" in p for p in ctx.exception.problems))
+
     def test_real_repo_enabled_runtimes_pass_startup_validation(self):
         """The actual current repository state must validate cleanly --
         this correction pass must not have broken the real deployment."""
@@ -742,6 +840,85 @@ deployments:
             os.unlink(user_path)
             os.unlink(pwd_path)
 
+    def _ready_credential_files(self):
+        with tempfile.NamedTemporaryFile("w", delete=False) as uf:
+            uf.write("oggadmin")
+            user_path = uf.name
+        with tempfile.NamedTemporaryFile("w", delete=False) as pf:
+            pf.write("secretpass")
+            pwd_path = pf.name
+        return user_path, pwd_path
+
+    def test_config_item_missing_no_item_key_not_ready(self):
+        """DynamoDB get_item returning no Item at all (real boto3 shape when
+        the key does not exist) must fail readiness, not be silently treated
+        as an acceptable empty CONFIG."""
+        runtime = {"pipeline": "gg-oracle-payments-01", "type": "oracle"}
+        table = MagicMock()
+        table.get_item.return_value = {}  # no "Item" key -- real boto3 shape
+        user_path, pwd_path = self._ready_credential_files()
+        old_user = core.ADMIN_USER_FILE["oracle"]
+        old_pwd = core.ADMIN_PASSWORD_FILE["oracle"]
+        old_ssl = core._SSL_CTX
+        core.ADMIN_USER_FILE["oracle"] = user_path
+        core.ADMIN_PASSWORD_FILE["oracle"] = pwd_path
+        core._SSL_CTX = MagicMock()  # bypass real TLS context build -- irrelevant to this check
+        try:
+            ok, reason = core.check_static_prerequisites(runtime, table)
+            self.assertFalse(ok)
+            self.assertIn("CONFIG", reason)
+        finally:
+            core.ADMIN_USER_FILE["oracle"] = old_user
+            core.ADMIN_PASSWORD_FILE["oracle"] = old_pwd
+            core._SSL_CTX = old_ssl
+            os.unlink(user_path)
+            os.unlink(pwd_path)
+
+    def test_correct_config_item_prerequisite_succeeds(self):
+        runtime = {"pipeline": "gg-oracle-payments-01", "type": "oracle"}
+        table = MagicMock()
+        table.get_item.return_value = {"Item": {"recordType": "CONFIG", "deploymentType": "oracle"}}
+        user_path, pwd_path = self._ready_credential_files()
+        old_user = core.ADMIN_USER_FILE["oracle"]
+        old_pwd = core.ADMIN_PASSWORD_FILE["oracle"]
+        old_ssl = core._SSL_CTX
+        core.ADMIN_USER_FILE["oracle"] = user_path
+        core.ADMIN_PASSWORD_FILE["oracle"] = pwd_path
+        core._SSL_CTX = MagicMock()
+        try:
+            ok, reason = core.check_static_prerequisites(runtime, table)
+            self.assertTrue(ok, reason)
+            self.assertEqual(reason, "")
+        finally:
+            core.ADMIN_USER_FILE["oracle"] = old_user
+            core.ADMIN_PASSWORD_FILE["oracle"] = old_pwd
+            core._SSL_CTX = old_ssl
+            os.unlink(user_path)
+            os.unlink(pwd_path)
+
+    def test_config_deployment_type_mismatch_not_ready(self):
+        runtime = {"pipeline": "gg-oracle-payments-01", "type": "oracle"}
+        table = MagicMock()
+        # CONFIG exists and is well-formed, but belongs to the wrong runtime type.
+        table.get_item.return_value = {"Item": {"recordType": "CONFIG", "deploymentType": "postgresql"}}
+        user_path, pwd_path = self._ready_credential_files()
+        old_user = core.ADMIN_USER_FILE["oracle"]
+        old_pwd = core.ADMIN_PASSWORD_FILE["oracle"]
+        old_ssl = core._SSL_CTX
+        core.ADMIN_USER_FILE["oracle"] = user_path
+        core.ADMIN_PASSWORD_FILE["oracle"] = pwd_path
+        core._SSL_CTX = MagicMock()
+        try:
+            ok, reason = core.check_static_prerequisites(runtime, table)
+            self.assertFalse(ok)
+            self.assertIn("deploymentType", reason)
+        finally:
+            core.ADMIN_USER_FILE["oracle"] = old_user
+            core.ADMIN_PASSWORD_FILE["oracle"] = old_pwd
+            core._SSL_CTX = old_ssl
+            os.unlink(user_path)
+            os.unlink(pwd_path)
+
     def test_6_runtime_api_down_writes_deployment_down_without_affecting_readiness(self):
         """Structural proof: check_static_prerequisites (the only readiness
         gate) never calls the GoldenGate Admin REST client, and
@@ -765,6 +942,105 @@ deployments:
         self.assertIn("state.is_ready()", src)
         lease_src = inspect.getsource(core.lease_control_loop)
         self.assertIn("state.set_ready(True)", lease_src)
+
+
+# ===========================================================================
+# Correction pass: dynamic lease-API readiness (fix 3). LeaseState.is_ready()
+# must reflect CURRENT lease-API health, not latch true forever after the
+# first success. These run lease_control_loop for real in a background
+# thread (short renew_interval, bounded polling deadlines) against a mocked
+# LeaseManager whose acquire()/renew() behavior is scripted per scenario --
+# this is threaded, timing-sensitive code, so a fake clock (used for
+# LeaseManager's own TTL math elsewhere) does not apply here; the loop's
+# actual cadence is what is under test.
+# ===========================================================================
+class DynamicLeaseReadinessTests(unittest.TestCase):
+    def _run_loop(self, mgr, state, stop_event, renew_interval=0.01):
+        t = threading.Thread(
+            target=core.lease_control_loop,
+            args=(mgr, state, stop_event),
+            kwargs={"renew_interval": renew_interval},
+            daemon=True,
+        )
+        t.start()
+        return t
+
+    def _wait_until(self, predicate, timeout=2.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.005)
+        return False
+
+    def test_lease_api_success_sets_ready(self):
+        mgr = MagicMock()
+        mgr.pipeline = "gg-oracle-payments-01"
+        mgr.acquire.return_value = True
+        state = core.LeaseState()
+        stop_event = threading.Event()
+        t = self._run_loop(mgr, state, stop_event)
+        try:
+            self.assertTrue(self._wait_until(state.is_ready), "successful acquire must set ready True")
+            self.assertTrue(state.is_leader())
+        finally:
+            stop_event.set()
+            t.join(timeout=2)
+
+    def test_conditional_acquire_conflict_is_ready_but_standby(self):
+        """acquire() returning False because another valid holder already
+        owns the lease is still a SUCCESSFUL DynamoDB round-trip -- it must
+        count toward readiness even though this instance remains standby."""
+        mgr = MagicMock()
+        mgr.pipeline = "gg-oracle-payments-01"
+        mgr.acquire.return_value = False
+        state = core.LeaseState()
+        stop_event = threading.Event()
+        t = self._run_loop(mgr, state, stop_event)
+        try:
+            self.assertTrue(self._wait_until(state.is_ready), "a valid conflict must still count as ready")
+            self.assertFalse(state.is_leader(), "must remain standby when another holder owns the lease")
+        finally:
+            stop_event.set()
+            t.join(timeout=2)
+
+    def test_dynamodb_exception_after_initial_success_then_recovery(self):
+        """acquire() succeeds once (leader+ready), the next call (renew(),
+        since this instance is now leader) raises -- readiness and
+        leadership must both drop immediately -- then a later successful
+        acquire() call must restore readiness on its own, with no special
+        recovery code path required."""
+        mgr = MagicMock()
+        mgr.pipeline = "gg-oracle-payments-01"
+        mgr.acquire.side_effect = [True, True]
+        mgr.renew.side_effect = [RuntimeError("DynamoDB unavailable")]
+        state = core.LeaseState()
+        stop_event = threading.Event()
+        t = self._run_loop(mgr, state, stop_event)
+        try:
+            self.assertTrue(self._wait_until(state.is_ready), "initial acquire must set ready True")
+            self.assertTrue(self._wait_until(lambda: mgr.renew.call_count >= 1),
+                             "loop must attempt a renew while leader")
+            self.assertTrue(self._wait_until(lambda: not state.is_ready()),
+                             "an exception from renew must clear readiness immediately")
+            self.assertFalse(state.is_leader(), "an exception must also clear leadership immediately")
+
+            self.assertTrue(self._wait_until(lambda: mgr.acquire.call_count >= 2),
+                             "loop must retry via acquire() once no longer leader")
+            self.assertTrue(self._wait_until(state.is_ready),
+                             "a later successful lease API call must restore readiness with no special-casing")
+            self.assertTrue(state.is_leader())
+        finally:
+            stop_event.set()
+            t.join(timeout=2)
+
+    def test_goldengate_admin_rest_failure_does_not_affect_lease_state_readiness(self):
+        """LeaseState (the sole source of ready_state) is only ever touched
+        by lease_control_loop -- polling_loop's GoldenGate Admin REST calls
+        have no code path that can set/clear readiness."""
+        import inspect
+        self.assertNotIn("state.set_ready", inspect.getsource(core.polling_loop))
+        self.assertNotIn("state.set_ready", inspect.getsource(core.check_static_prerequisites))
 
 
 # ===========================================================================
@@ -851,13 +1127,39 @@ class ProcessPipelineMapUsageTests(unittest.TestCase):
             "pipeline": "gg-oracle-payments-01",
             "name": "oracle-payments-01",
             "type": "oracle",
+            "pipelineId": "payments-ora-to-pg-001",
             "processes": {"extracts": ["EXTORA1"], "distributionPaths": [], "replicats": []},
         }
         pipe_map = inv.build_process_pipeline_map_json([runtime])
         self.assertEqual(
             pipe_map["EXTORA1"],
-            {"pipeline_name": "gg-oracle-payments-01", "deployment": "oracle-payments-01"},
+            {"pipeline_name": "payments-ora-to-pg-001", "deployment": "oracle-payments-01"},
         )
+
+    def test_pipeline_name_is_not_the_canonical_deployment_key(self):
+        # The canonical DynamoDB partition key (gg-oracle-payments-01) and the
+        # logical topology pipelineId (payments-ora-to-pg-001) are two
+        # different concepts the manager keeps separate -- pipeline_name must
+        # never be the former.
+        runtime = {
+            "pipeline": "gg-oracle-payments-01",
+            "name": "oracle-payments-01",
+            "type": "oracle",
+            "pipelineId": "payments-ora-to-pg-001",
+            "processes": {"extracts": ["EXTORA1"], "distributionPaths": [], "replicats": []},
+        }
+        pipe_map = inv.build_process_pipeline_map_json([runtime])
+        self.assertNotEqual(pipe_map["EXTORA1"]["pipeline_name"], runtime["pipeline"])
+
+    def test_missing_pipeline_id_yields_empty_pipeline_name_not_the_deployment_key(self):
+        runtime = {
+            "pipeline": "gg-oracle-payments-01",
+            "name": "oracle-payments-01",
+            "type": "oracle",
+            "processes": {"extracts": ["EXTORA1"], "distributionPaths": [], "replicats": []},
+        }
+        pipe_map = inv.build_process_pipeline_map_json([runtime])
+        self.assertEqual(pipe_map["EXTORA1"]["pipeline_name"], "")
 
     def test_polling_loop_consumes_real_map_not_hardcoded_empty_dict(self):
         import inspect
@@ -903,6 +1205,67 @@ class WorkflowCorrectionTests(unittest.TestCase):
     def test_dynamodb_verification_does_not_use_runner_aws_cli_directly(self):
         step_text = self._dynamodb_step_text()
         self.assertNotIn("aws dynamodb get-item", step_text)
+
+    def _select_pod_step_text(self):
+        content = self.WORKFLOW_PATH.read_text()
+        idx = content.index("Select the Running and Ready gg-monitor pod")
+        next_step = content.find("\n      - name:", idx)
+        return content[idx:next_step if next_step != -1 else idx + 4000]
+
+    def test_ready_pod_selection_does_not_blindly_use_items_zero(self):
+        step_text = self._select_pod_step_text()
+        # The step's own comment deliberately explains "Never blindly use
+        # .items[0]" as a negation -- strip comment lines so this checks
+        # real code, not the explanatory prose about the fix.
+        code_lines = [l for l in step_text.splitlines() if not l.strip().startswith("#")]
+        self.assertNotIn(".items[0]", "\n".join(code_lines))
+        self.assertIn("phase", step_text)
+        self.assertIn("Ready", step_text)
+
+    def test_ready_pod_selection_fails_when_not_exactly_one_ready_pod(self):
+        step_text = self._select_pod_step_text()
+        self.assertIn("len(ready) != 1", step_text)
+        self.assertIn("sys.exit(1)", step_text)
+
+    def test_pod_name_derived_once_and_reused_not_rederived(self):
+        """POD_NAME must be exported once by the selection step and reused
+        by both the runtime-state and DynamoDB verification steps -- never
+        re-derived independently (which could select a different pod if the
+        pod set changed between steps)."""
+        content = self.WORKFLOW_PATH.read_text()
+        # Only the dedicated selection step may compute POD_NAME via kubectl
+        # get pods; later steps must consume it from $GITHUB_ENV.
+        occurrences = content.count("kubectl get pods -n \"$RUNTIME_NAMESPACE\" -l app.kubernetes.io/name=gg-monitor")
+        self.assertEqual(occurrences, 1, "pod selection must happen in exactly one place")
+        dynamodb_step = self._dynamodb_step_text()
+        self.assertNotIn("kubectl get pods", dynamodb_step)
+        self.assertIn("$POD_NAME", dynamodb_step)
+
+    def test_lease_holder_equality_check_present(self):
+        step_text = self._dynamodb_step_text()
+        self.assertIn("EXPECTED_LEASE_HOLDER", step_text)
+        self.assertIn('lease_item["holder"] != EXPECTED_LEASE_HOLDER', step_text)
+        # The pod name is passed as an explicit script argument, not
+        # interpolated into the (deliberately literal/quoted) heredoc.
+        self.assertIn('python3 - "$POD_NAME"', step_text)
+
+    def test_recorded_at_freshness_check_present(self):
+        step_text = self._dynamodb_step_text()
+        self.assertIn("MAX_STATE_AGE_SECONDS = 180", step_text)
+        self.assertIn("recordedAt", step_text)
+        self.assertIn("age > MAX_STATE_AGE_SECONDS", step_text)
+
+    def test_wrong_or_stale_holder_and_stale_state_both_fail_the_poll(self):
+        """The polling wait condition (not just the final one-shot check)
+        must treat a wrong/stale holder and a stale recordedAt as failures
+        to keep waiting on -- functionally proven against a moto-mocked
+        harness during this correction pass (wrong holder times out with a
+        clear diagnostic; stale recordedAt times out with a clear
+        diagnostic; matching holder + fresh state succeeds)."""
+        step_text = self._dynamodb_step_text()
+        self.assertIn("def diagnose(items, now)", step_text)
+        self.assertIn("stale/wrong holder", step_text)
+        self.assertIn("the monitor appears to have stopped writing", step_text)
 
     def test_15_kubectl_pinned_to_1_33_not_1_35(self):
         content = self.WORKFLOW_PATH.read_text()

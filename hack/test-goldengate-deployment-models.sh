@@ -2533,6 +2533,127 @@ else
 fi
 
 echo ""
+echo ""
+echo "--------------------------------------------------------------------"
+echo "Phase 4 final correction pass: logical pipelineId, CONFIG-required"
+echo "readiness, dynamic lease-API readiness, and pod-lease-ownership"
+echo "verification in the workflow"
+echo "--------------------------------------------------------------------"
+
+echo "--- Fix 1: pipeline_name is the logical topology pipelineId, not the canonical deployment key ---"
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  if REPO_CONFIG_ROOT="$REPO_ROOT" python3 -c "
+import sys
+sys.path.insert(0, '${MONITOR_CORE_DIR}')
+import inventory as inv
+runtimes = inv.load_runtimes('${REPO_ROOT}')
+pm = inv.build_process_pipeline_map_json(runtimes)
+for r in runtimes:
+    if r['pipeline'] in ('gg-oracle-payments-01', 'gg-postgresql-payments-01'):
+        assert r['pipelineId'] == 'payments-ora-to-pg-001', f\"unexpected pipelineId for {r['pipeline']}: {r['pipelineId']!r}\"
+print('OK')
+" >"${WORKDIR}/pipelineid-check.log" 2>&1; then
+    pass "canonical runtimes carry pipelineId=payments-ora-to-pg-001, distinct from the canonical deployment key"
+  else
+    fail "pipelineId propagation check failed"
+    cat "${WORKDIR}/pipelineid-check.log"
+  fi
+else
+  skip "pipelineId propagation check -- python3 not available"
+fi
+
+if grep -qE '"pipeline_name":\s*r\["pipeline"\]' "${MONITOR_CORE_DIR}/inventory.py"; then
+  fail "build_process_pipeline_map_json still uses the canonical deployment key (r[\"pipeline\"]) as pipeline_name"
+else
+  pass "build_process_pipeline_map_json does not use the canonical deployment key as pipeline_name"
+fi
+if grep -q 'more than one topology' "${MONITOR_CORE_DIR}/inventory.py"; then
+  pass "load_topologies fails loudly on a deploymentName duplicated across topology documents (no silent overwrite)"
+else
+  fail "load_topologies no longer appears to guard against duplicate deploymentName across topology documents"
+fi
+
+echo "--- Fix 2: CONFIG item is required for readiness, no manager-default fallback ---"
+CHECK_PREREQ_BODY="$(sed -n '/^def check_static_prerequisites/,/^def /p' "${MONITOR_CORE_DIR}/gg_monitor_core.py" | sed '$d')"
+if echo "$CHECK_PREREQ_BODY" | grep -q 'CONFIG item missing' && echo "$CHECK_PREREQ_BODY" | grep -q 'deploymentType'; then
+  pass "check_static_prerequisites requires a non-empty CONFIG item and validates deploymentType"
+else
+  fail "check_static_prerequisites no longer appears to require CONFIG existence/deploymentType match"
+fi
+
+echo "--- Fix 3: LeaseState readiness reflects CURRENT lease-API health (not a one-time latch) ---"
+LEASE_LOOP_BODY2="$(sed -n '/^def lease_control_loop/,/^def /p' "${MONITOR_CORE_DIR}/gg_monitor_core.py" | sed '$d')"
+if echo "$LEASE_LOOP_BODY2" | grep -A4 'except Exception' | grep -q 'state.set_ready(False)'; then
+  pass "lease_control_loop's exception path clears readiness immediately (state.set_ready(False))"
+else
+  fail "lease_control_loop's exception path does not appear to clear readiness"
+fi
+RUN_PIPELINE_BODY="$(sed -n '/^def run_pipeline/,/^def /p' "${MONITOR_CORE_DIR}/gg_monitor_core.py" | sed '$d')"
+if echo "$RUN_PIPELINE_BODY" | grep -q 'ready_state\[pipeline\] = state.is_ready()'; then
+  pass "run_pipeline continuously mirrors state.is_ready() into ready_state (not a one-time latch-then-break)"
+else
+  fail "run_pipeline no longer appears to continuously mirror lease-API readiness into ready_state"
+fi
+
+echo "--- Fix 4: workflow verifies the new pod owns the lease, with fresh state ---"
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  if python3 -c "
+import yaml
+with open('${GG_MONITOR_WORKFLOW}') as f:
+    yaml.safe_load(f)
+print('OK')
+" >/dev/null 2>&1; then
+    pass "gg-monitor-core.yaml still parses as valid YAML after the pod-selection/lease-ownership changes"
+  else
+    fail "gg-monitor-core.yaml no longer parses as valid YAML"
+  fi
+fi
+SELECT_POD_STEP="$(sed -n '/name: Select the Running and Ready gg-monitor pod/,/^      - name:/p' "$GG_MONITOR_WORKFLOW")"
+SELECT_POD_CODE_ONLY="$(echo "$SELECT_POD_STEP" | grep -vE '^\s*#')"
+if echo "$SELECT_POD_CODE_ONLY" | grep -q '\.items\[0\]'; then
+  fail "gg-monitor-core.yaml pod selection still uses .items[0] in real code"
+else
+  pass "gg-monitor-core.yaml pod selection does not blindly use .items[0]"
+fi
+if echo "$SELECT_POD_STEP" | grep -q 'len(ready) != 1'; then
+  pass "gg-monitor-core.yaml fails unless exactly one Running+Ready gg-monitor pod is found"
+else
+  fail "gg-monitor-core.yaml pod selection does not enforce exactly one Ready pod"
+fi
+if grep -q 'POD_NAME=\${POD_NAME}" >> "\$GITHUB_ENV"' "$GG_MONITOR_WORKFLOW"; then
+  pass "selected POD_NAME is exported via \$GITHUB_ENV for reuse by later steps"
+else
+  fail "selected POD_NAME does not appear to be exported for reuse by later steps"
+fi
+if grep -q 'EXPECTED_LEASE_HOLDER' "$GG_MONITOR_WORKFLOW" && grep -q 'lease_item\["holder"\] != EXPECTED_LEASE_HOLDER' "$GG_MONITOR_WORKFLOW"; then
+  pass "in-pod verification asserts LEASE.holder equals the current Running+Ready pod's own name"
+else
+  fail "in-pod verification does not assert LEASE.holder equals the current pod's name"
+fi
+if grep -q 'MAX_STATE_AGE_SECONDS = 180' "$GG_MONITOR_WORKFLOW" && grep -q 'age > MAX_STATE_AGE_SECONDS' "$GG_MONITOR_WORKFLOW"; then
+  pass "in-pod verification requires STATE#_deployment.recordedAt freshness (<= 180s)"
+else
+  fail "in-pod verification does not appear to check STATE#_deployment.recordedAt freshness"
+fi
+if grep -q 'python3 - "\$POD_NAME" < "\${RUNNER_TEMP}/verify_gg_monitor_dynamodb.py"' "$GG_MONITOR_WORKFLOW"; then
+  pass "the selected pod name is passed into the in-pod verification script as an explicit argument"
+else
+  fail "the in-pod verification script invocation no longer passes POD_NAME as an argument"
+fi
+
+echo "--- Fix 5: KMS remains a documented, unimplemented deployment gate (no new statement added this pass) ---"
+if grep -q "KMS DEPLOYMENT GATE -- DO NOT DISMISS" envs/dev/iam.tf; then
+  pass "envs/dev/iam.tf still documents the KMS deployment gate"
+else
+  fail "envs/dev/iam.tf is missing the KMS deployment gate documentation"
+fi
+if grep -qE '"kms:' envs/dev/policies/gg-monitor-dev-role/policies/policies_1.json 2>/dev/null; then
+  fail "gg-monitor-dev-role policy already grants a kms: action -- must remain undismissed/unguessed until live CMK ARNs are confirmed"
+else
+  pass "gg-monitor-dev-role policy still grants no kms: actions (correctly gated pending live CMK confirmation)"
+fi
+
+echo ""
 echo "--- Legacy monitor, runtime charts, and candidates left untouched by Phase 4 ---"
 if command -v git >/dev/null 2>&1 && git -C "$REPO_ROOT" rev-parse HEAD >/dev/null 2>&1; then
   if git -C "$REPO_ROOT" diff --ignore-all-space --quiet HEAD -- \
