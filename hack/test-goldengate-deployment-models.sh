@@ -917,8 +917,14 @@ echo ""
 # ---------------------------------------------------------------------
 PLATFORM_CHART_PATH="helm/goldengate-platform"
 PLATFORM_VALUES="platform/dev/goldengate-platform/values.yaml"
-TEST_ORACLE_ROLE_ARN="arn:aws:iam::668311715351:role/gg-oracle-dev-runtime-role"
-TEST_POSTGRESQL_ROLE_ARN="arn:aws:iam::668311715351:role/gg-postgresql-dev-runtime-role"
+# TEMPORARY COMPATIBILITY BRIDGE: both shared ServiceAccounts currently use
+# the existing, proven GoldenGateSecretsReadRole-dev role (matching
+# .github/workflows/goldengate-platform.yaml's ORACLE_RUNTIME_ROLE_ARN /
+# POSTGRESQL_RUNTIME_ROLE_ARN), not the new gg-oracle-dev-runtime-role /
+# gg-postgresql-dev-runtime-role roles -- those still exist (Terraform
+# modules untouched) but are deliberately unused until separately proven.
+TEST_ORACLE_ROLE_ARN="arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev"
+TEST_POSTGRESQL_ROLE_ARN="arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev"
 PLATFORM_RENDERED="${WORKDIR}/platform.yaml"
 
 if [ "$HELM_AVAILABLE" = "true" ]; then
@@ -970,6 +976,42 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
     else
       fail "platform chart is missing one or both expected IRSA role-arn annotations"
     fi
+
+    echo "--- Compatibility bridge: both ServiceAccounts individually use GoldenGateSecretsReadRole-dev ---"
+    PLATFORM_SPLIT_DIR="$(mktemp -d)"
+    awk -v outdir="$PLATFORM_SPLIT_DIR" '
+      BEGIN { docnum = 0; fname = outdir "/doc-0.yaml" }
+      /^---$/ { docnum++; fname = outdir "/doc-" docnum ".yaml"; next }
+      { print > fname }
+    ' "$PLATFORM_RENDERED"
+
+    assert_sa_uses_bridge_role() {
+      local sa_name="$1"
+      local block=""
+      local doc
+      for doc in "$PLATFORM_SPLIT_DIR"/doc-*.yaml; do
+        if grep -q '^kind: ServiceAccount$' "$doc" && grep -q "^  name: ${sa_name}\$" "$doc"; then
+          block="$(cat "$doc")"
+          break
+        fi
+      done
+      if [ -z "$block" ]; then
+        fail "could not find rendered ServiceAccount ${sa_name} for bridge-role check"
+        return
+      fi
+      if grep -Fq -- "eks.amazonaws.com/role-arn: \"arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev\"" <<< "$block"; then
+        pass "ServiceAccount ${sa_name} individually annotated with GoldenGateSecretsReadRole-dev"
+      else
+        fail "ServiceAccount ${sa_name} is not annotated with the expected bridge role GoldenGateSecretsReadRole-dev"
+      fi
+      if grep -Fq -- "gg-oracle-dev-runtime-role" <<< "$block" || grep -Fq -- "gg-postgresql-dev-runtime-role" <<< "$block"; then
+        fail "ServiceAccount ${sa_name} unexpectedly references the new, unused runtime role"
+      fi
+    }
+
+    assert_sa_uses_bridge_role "gg-oracle-sa"
+    assert_sa_uses_bridge_role "gg-postgresql-sa"
+    rm -rf "$PLATFORM_SPLIT_DIR"
 
     FORBIDDEN_KIND_FOUND="false"
     for forbidden_kind in StatefulSet Deployment DaemonSet Service Ingress PersistentVolumeClaim SecretProviderClass; do
@@ -1111,6 +1153,106 @@ else
   skip "platform chart resource-inventory assertions -- helm not installed"
   skip "platform chart fail-closed roleArn assertions -- helm not installed"
   skip "runtime chart Namespace/ServiceAccount absence checks -- helm not installed"
+fi
+
+echo ""
+
+# ---------------------------------------------------------------------
+# Compatibility bridge: GoldenGateSecretsReadRole-dev trust policy now
+# also covers the shared platform ServiceAccounts, alongside (not instead
+# of) the legacy ogg-oracle-sa wildcard subject the live legacy pods still
+# depend on.
+# ---------------------------------------------------------------------
+echo "--- GoldenGateSecretsReadRole-dev trust policy: compatibility bridge ---"
+SECRETS_READ_TRUST_FILE="envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json"
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  if python3 -c "
+import json, sys
+
+with open('${SECRETS_READ_TRUST_FILE}') as f:
+    policy = json.load(f)
+
+stmt = policy['Statement'][0]
+cond = stmt['Condition']
+
+aud = cond['StringEquals']['oidc.eks.eu-west-1.amazonaws.com/id/407C4385FF87947926730569F1E564FB:aud']
+if aud != 'sts.amazonaws.com':
+    print(f'aud mismatch: {aud!r}')
+    sys.exit(1)
+
+sub = cond['StringLike']['oidc.eks.eu-west-1.amazonaws.com/id/407C4385FF87947926730569F1E564FB:sub']
+if not isinstance(sub, list):
+    print(f'sub is not an array: {sub!r}')
+    sys.exit(1)
+
+required = [
+    'system:serviceaccount:gg-dev-*:ogg-oracle-sa',
+    'system:serviceaccount:goldengate-dev:gg-oracle-sa',
+    'system:serviceaccount:goldengate-dev:gg-postgresql-sa',
+]
+missing = [r for r in required if r not in sub]
+if missing:
+    print(f'missing subject(s): {missing}')
+    sys.exit(1)
+
+if len(sub) != 3:
+    print(f'expected exactly 3 subjects, found {len(sub)}: {sub}')
+    sys.exit(1)
+
+principal = stmt['Principal']['Federated']
+if principal != 'arn:aws:iam::668311715351:oidc-provider/oidc.eks.eu-west-1.amazonaws.com/id/407C4385FF87947926730569F1E564FB':
+    print(f'unexpected Federated principal (OIDC provider changed): {principal!r}')
+    sys.exit(1)
+
+print('aud=sts.amazonaws.com, OIDC provider unchanged, all 3 subjects present (legacy + 2 new), no extras')
+" >"${WORKDIR}/secrets-read-trust-check.log" 2>&1; then
+    pass "GoldenGateSecretsReadRole-dev trust policy: legacy ogg-oracle-sa subject preserved, both new goldengate-dev subjects added, aud/OIDC provider unchanged"
+  else
+    fail "GoldenGateSecretsReadRole-dev trust policy check failed"
+    cat "${WORKDIR}/secrets-read-trust-check.log"
+  fi
+else
+  skip "GoldenGateSecretsReadRole-dev trust policy check -- python3 not available"
+fi
+
+echo "--- Candidate values.yaml: secrets/certificate unchanged, no candidate enabled/disabled by this correction ---"
+# This correction (compatibility-bridge IAM/workflow changes only) must not
+# itself touch either candidate's values.yaml. gg-oracle-payments-01's
+# deployment.enabled is whatever the repository's committed state already
+# is (HEAD) -- this script does not assert a specific value for it, only
+# that this correction pass did not modify the file (verified via git diff
+# against HEAD, when git is available).
+if command -v git >/dev/null 2>&1 && git -C "$REPO_ROOT" rev-parse HEAD >/dev/null 2>&1; then
+  if git -C "$REPO_ROOT" diff --quiet HEAD -- "$ORACLE_VALUES" "$POSTGRESQL_VALUES"; then
+    pass "neither candidate's values.yaml was modified by this correction (0 diff vs HEAD)"
+  else
+    fail "a candidate values.yaml differs from HEAD -- this correction must not touch candidate enablement/config"
+  fi
+else
+  skip "candidate values.yaml unchanged-vs-HEAD check -- git not available"
+fi
+
+if grep -q '^deployment:$' "$POSTGRESQL_VALUES" && grep -A1 '^deployment:$' "$POSTGRESQL_VALUES" | grep -q 'enabled: false'; then
+  pass "PostgreSQL candidate (gg-postgresql-payments-01) remains deployment.enabled=false"
+else
+  fail "PostgreSQL candidate (gg-postgresql-payments-01) deployment.enabled is not false -- must not be enabled by this compatibility-bridge correction"
+fi
+
+if grep -q 'objectName: dev/goldengate/source/admin' "$ORACLE_VALUES"; then
+  pass "Oracle candidate still references dev/goldengate/source/admin (no new secret introduced)"
+else
+  fail "Oracle candidate no longer references dev/goldengate/source/admin"
+fi
+if grep -q 'objectName: dev/goldengate/target/admin' "$POSTGRESQL_VALUES"; then
+  pass "PostgreSQL candidate still references dev/goldengate/target/admin (no new secret introduced)"
+else
+  fail "PostgreSQL candidate no longer references dev/goldengate/target/admin"
+fi
+if grep -q 'objectName: dev/goldengate/tls-certificate' "$ORACLE_VALUES" && grep -q 'objectName: dev/goldengate/tls-certificate' "$POSTGRESQL_VALUES"; then
+  pass "both candidates still reference the shared dev/goldengate/tls-certificate object (no new certificate introduced)"
+else
+  fail "one or both candidates no longer reference dev/goldengate/tls-certificate"
 fi
 
 echo ""

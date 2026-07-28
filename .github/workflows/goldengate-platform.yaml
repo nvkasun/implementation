@@ -4,9 +4,10 @@ run-name: "Cloud Factory - GoldenGate platform bootstrap build and deploy | ${{ 
 
 # Manual-only (workflow_dispatch), deliberately with no push trigger. This
 # enforces the required deployment order:
-#   1. IAM Terraform apply (creates gg-oracle-dev-runtime-role /
-#      gg-postgresql-dev-runtime-role -- this workflow's roleArn inputs
-#      would be invalid before this runs).
+#   1. IAM Terraform apply (applies the extended trust policy on the
+#      existing, proven GoldenGateSecretsReadRole-dev role -- see
+#      envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json
+#      -- this workflow's roleArn inputs would be invalid before this runs).
 #   2. argocd-eks-deployment.yaml (provisions the
 #      argocd-ecr-goldengate-platform-oci repository Secret this workflow's
 #      "Confirm the platform Argo CD repository Secret exists" step
@@ -84,13 +85,25 @@ env:
   ORACLE_SA_NAME: gg-oracle-sa
   POSTGRESQL_SA_NAME: gg-postgresql-sa
 
-  # Deterministic IRSA role ARNs -- this repository has no Terraform
+  # TEMPORARY COMPATIBILITY BRIDGE: both shared platform ServiceAccounts use
+  # the existing, proven GoldenGateSecretsReadRole-dev role (the same role
+  # the legacy ogg-oracle-sa pods already use successfully to mount
+  # dev/goldengate/source|target/admin and dev/goldengate/tls-certificate),
+  # NOT the new gg-oracle-dev-runtime-role / gg-postgresql-dev-runtime-role
+  # roles. Those two new roles still exist (their Terraform modules in
+  # envs/dev/iam.tf are untouched) but are deliberately unused here until
+  # they are separately proven and this bridge is retired. See
+  # envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json
+  # for the extended trust (adds goldengate-dev:gg-oracle-sa and
+  # goldengate-dev:gg-postgresql-sa alongside the untouched legacy
+  # gg-dev-*:ogg-oracle-sa subject).
+  #
+  # Deterministic IRSA role ARN -- this repository has no Terraform
   # outputs.tf anywhere (every other role ARN referenced by these workflows,
-  # e.g. ARGOCD_ECR_READ_ROLE_ARN above, is also a literal predicted ARN),
-  # so envs/dev/iam.tf's gg_oracle_dev_runtime_role / gg_postgresql_dev_runtime_role
-  # module names below are predicted the same way: arn:aws:iam::<account>:role/<name>.
-  ORACLE_RUNTIME_ROLE_ARN: arn:aws:iam::668311715351:role/gg-oracle-dev-runtime-role
-  POSTGRESQL_RUNTIME_ROLE_ARN: arn:aws:iam::668311715351:role/gg-postgresql-dev-runtime-role
+  # e.g. ARGOCD_ECR_READ_ROLE_ARN above, is also a literal predicted ARN):
+  # arn:aws:iam::<account>:role/<name>.
+  ORACLE_RUNTIME_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev
+  POSTGRESQL_RUNTIME_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev
 
 concurrency:
   group: goldengate-platform-deploy-${{ github.ref }}
@@ -548,7 +561,7 @@ jobs:
             echo "PREREQUISITE NOT MET: Secret ${ARGOCD_PLATFORM_SECRET_NAME} does not exist in namespace ${ARGOCD_NAMESPACE}."
             echo ""
             echo "Required order before running this workflow:"
-            echo "  1. Run the IAM/Secrets Terraform workflow (applies the new runtime IRSA roles/policies)."
+            echo "  1. Run the IAM/Secrets Terraform workflow (applies the extended trust policy on GoldenGateSecretsReadRole-dev)."
             echo "  2. Re-run the argocd-eks-deployment.yaml workflow (picks up the new goldengate-platform"
             echo "     entry in envs/dev/argocd/values.yaml ecrTokenSync.repositories and provisions this Secret)."
             echo "  3. Re-run this workflow."
@@ -749,8 +762,10 @@ jobs:
             echo ""
             echo "### Required deployment order"
             echo ""
-            echo "1. IAM/Secrets Terraform workflow (creates gg-oracle-dev-runtime-role / gg-postgresql-dev-runtime-role)."
+            echo "1. IAM/Secrets Terraform workflow (applies the extended trust policy on the existing GoldenGateSecretsReadRole-dev role -- TEMPORARY COMPATIBILITY BRIDGE, see envs/dev/policies/goldengate-secrets-read-dev/)."
             echo "2. argocd-eks-deployment.yaml (provisions the argocd-ecr-goldengate-platform-oci repository Secret)."
             echo "3. This workflow."
             echo "4. Only then may a runtime candidate (gg-oracle-payments-01, gg-postgresql-payments-01) set deployment.enabled=true."
+            echo ""
+            echo "Note: gg-oracle-dev-runtime-role and gg-postgresql-dev-runtime-role still exist (Terraform modules untouched in envs/dev/iam.tf) but are NOT used by this release -- cleanup is a separately reviewed Terraform plan for later, after both new runtimes are stable on the compatibility bridge."
           } >> "$GITHUB_STEP_SUMMARY"
