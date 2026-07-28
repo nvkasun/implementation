@@ -1,0 +1,101 @@
+# Phase 3: environment topology-as-data document for the payments-ora-to-pg-001
+# logical pipeline.
+#
+# Deliberately NOT under envs/dev/: the GoldenGate runtime deployment
+# workflow scans envs/dev/* first-level folders as runtime deployment IDs --
+# this is topology metadata, not a deployment.
+#
+# Why this file exists, and what it does NOT replace:
+#   - DynamoDB CONFIG (envs/dev/dynamodb.tf) is a monitoring/alerting-policy
+#     record only, mirroring the manager reference schema exactly. It
+#     deliberately carries no endpoint, namespace, serviceName, or
+#     secret-reference fields -- inspection of the manager reference code
+#     (charts/gg-monitor/files/gg-monitor.py, charts/gg-deployment/files/
+#     utility-sidecar.py) confirmed CONFIG is never read for that data.
+#   - The manager's own equivalent of this file is a ConfigMap-mounted
+#     topology (CONFIG_MAP_DIR=/etc/gg-topology, process-pipeline-map.json /
+#     deployments.json) -- a structurally separate concept from DynamoDB
+#     CONFIG. This document is this repository's own topology-as-data
+#     artifact for the same purpose; it does not copy the manager's
+#     ConfigMap/sidecar deployment mechanism.
+#   - No credentials, secret values, private keys, or tokens appear here --
+#     only Secrets Manager object-name references, matching the same
+#     objectName values already used by the runtime Helm charts'
+#     SecretProviderClasses.
+#
+# recordType ownership (see envs/dev/dynamodb.tf for the authoritative
+# statement): Terraform owns CONFIG; the shared gg-monitor (not yet
+# deployed) owns LEASE, STATE#_deployment, and STATE#<process>. This
+# document has no bearing on that ownership -- it is not a DynamoDB item.
+
+pipelineId: payments-ora-to-pg-001
+environment: dev
+
+lifecycle:
+  enabled: true
+  state: runtime-ready
+
+deployments:
+  source:
+    deploymentName: gg-oracle-payments-01
+    deploymentType: oracle
+    namespace: goldengate-dev
+    serviceName: gg-oracle-payments-01
+
+    # Internal Kubernetes Service DNS only -- this is what shared-monitor
+    # polling must use. The external Ingress URL is not the primary
+    # internal polling endpoint and is intentionally not listed here.
+    endpoints:
+      admin:
+        scheme: https
+        host: gg-oracle-payments-01.goldengate-dev.svc.cluster.local
+        port: 8443
+      distribution:
+        scheme: https
+        host: gg-oracle-payments-01.goldengate-dev.svc.cluster.local
+        port: 9013
+      metrics:
+        scheme: https
+        host: gg-oracle-payments-01.goldengate-dev.svc.cluster.local
+        port: 9015
+
+    # Secrets Manager object-name references only -- never secret values.
+    secretReferences:
+      admin: dev/goldengate/source/admin
+      tls: dev/goldengate/tls-certificate
+
+    # No Extract, Replicat, or Distribution Path currently exists for this
+    # deployment. Left empty rather than populated with placeholder names.
+    processes:
+      extracts: []
+      distributionPaths: []
+      replicats: []
+
+  target:
+    deploymentName: gg-postgresql-payments-01
+    deploymentType: postgresql
+    namespace: goldengate-dev
+    serviceName: gg-postgresql-payments-01
+
+    endpoints:
+      admin:
+        scheme: https
+        host: gg-postgresql-payments-01.goldengate-dev.svc.cluster.local
+        port: 8443
+      receiver:
+        scheme: https
+        host: gg-postgresql-payments-01.goldengate-dev.svc.cluster.local
+        port: 9014
+      metrics:
+        scheme: https
+        host: gg-postgresql-payments-01.goldengate-dev.svc.cluster.local
+        port: 9015
+
+    secretReferences:
+      admin: dev/goldengate/target/admin
+      tls: dev/goldengate/tls-certificate
+
+    processes:
+      extracts: []
+      distributionPaths: []
+      replicats: []

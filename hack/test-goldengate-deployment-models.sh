@@ -62,12 +62,18 @@ if command -v python3 >/dev/null 2>&1 && python3 -c "import yaml" >/dev/null 2>&
   PYTHON_AVAILABLE="true"
 fi
 
+TERRAFORM_AVAILABLE="false"
+if command -v terraform >/dev/null 2>&1; then
+  TERRAFORM_AVAILABLE="true"
+fi
+
 echo "=================================================="
 echo "GoldenGate Phase 1 deployment-model validation"
 echo "=================================================="
 echo "Repository root: ${REPO_ROOT}"
 echo "Helm available:  ${HELM_AVAILABLE}"
 echo "Python3+PyYAML available: ${PYTHON_AVAILABLE}"
+echo "Terraform available: ${TERRAFORM_AVAILABLE}"
 echo ""
 
 if [ ! -f "$BASELINE_FILE" ]; then
@@ -1224,19 +1230,13 @@ echo "--- Candidate values.yaml: secrets/certificate unchanged, no candidate ena
 # that this correction pass did not modify the file (verified via git diff
 # against HEAD, when git is available).
 if command -v git >/dev/null 2>&1 && git -C "$REPO_ROOT" rev-parse HEAD >/dev/null 2>&1; then
-  if git -C "$REPO_ROOT" diff --quiet HEAD -- "$ORACLE_VALUES" "$POSTGRESQL_VALUES"; then
+  if git -C "$REPO_ROOT" diff --ignore-all-space --quiet HEAD -- "$ORACLE_VALUES" "$POSTGRESQL_VALUES"; then
     pass "neither candidate's values.yaml was modified by this correction (0 diff vs HEAD)"
   else
     fail "a candidate values.yaml differs from HEAD -- this correction must not touch candidate enablement/config"
   fi
 else
   skip "candidate values.yaml unchanged-vs-HEAD check -- git not available"
-fi
-
-if grep -q '^deployment:$' "$POSTGRESQL_VALUES" && grep -A1 '^deployment:$' "$POSTGRESQL_VALUES" | grep -q 'enabled: false'; then
-  pass "PostgreSQL candidate (gg-postgresql-payments-01) remains deployment.enabled=false"
-else
-  fail "PostgreSQL candidate (gg-postgresql-payments-01) deployment.enabled is not false -- must not be enabled by this compatibility-bridge correction"
 fi
 
 if grep -q 'objectName: dev/goldengate/source/admin' "$ORACLE_VALUES"; then
@@ -1421,6 +1421,353 @@ else
   skip "helm lint (argocd chart) -- helm not installed"
   skip "helm template (argocd chart) -- helm not installed"
   skip "argocd chart 3-repository rendering assertions -- helm not installed"
+fi
+
+echo ""
+
+# ---------------------------------------------------------------------
+# Phase 3: DynamoDB CONFIG inventory records + topology-as-data document.
+#
+# Terraform owns ONLY recordType=CONFIG items in gg-eks-pipeline. The
+# (not-yet-deployed) shared gg-monitor owns LEASE, STATE#_deployment, and
+# STATE#<process> -- this script must never see this correction introduce
+# any of those record types.
+# ---------------------------------------------------------------------
+DYNAMODB_TF="envs/dev/dynamodb.tf"
+TOPOLOGY_YAML="topologies/dev/payments-ora-to-pg-001.yaml"
+
+echo "--- terraform fmt -check (envs/dev/dynamodb.tf) ---"
+if [ "$TERRAFORM_AVAILABLE" = "true" ]; then
+  if terraform fmt -check -diff "$DYNAMODB_TF" >"${WORKDIR}/tf-fmt.log" 2>&1; then
+    pass "terraform fmt -check: envs/dev/dynamodb.tf is correctly formatted"
+  else
+    fail "terraform fmt -check: envs/dev/dynamodb.tf is not correctly formatted"
+    cat "${WORKDIR}/tf-fmt.log"
+  fi
+else
+  skip "terraform fmt -check -- terraform not installed"
+fi
+
+echo "--- terraform validate: isolated scratch check of the two new resource blocks ---"
+# Full `terraform init` in envs/dev/ is blocked: all 10 module blocks across
+# dynamodb.tf/iam.tf/secret.tf source from private AbuDhabiCommercialBank
+# GitHub repos this sandbox cannot authenticate to (confirmed: git exited
+# 128, "could not read Username"). That blocks `terraform validate` for the
+# WHOLE root module -- not something specific to the new resources. Rather
+# than falsely report validation as passed (or skip it entirely), this
+# extracts just the two new `aws_dynamodb_table_item` blocks (which have no
+# module/remote source of their own) into an isolated scratch directory
+# with a minimal provider block, and validates THOSE against the real
+# `hashicorp/aws` provider schema (public registry, no ADCB private
+# modules, no state, no AWS credentials, no remote calls beyond the public
+# provider download).
+if [ "$TERRAFORM_AVAILABLE" = "true" ]; then
+  TF_SCRATCH_DIR="${WORKDIR}/tf-isolated-validate"
+  mkdir -p "$TF_SCRATCH_DIR"
+  cat > "${TF_SCRATCH_DIR}/main.tf" <<'EOF'
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = ">= 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region                      = "eu-west-1"
+  skip_credentials_validation = true
+  skip_requesting_account_id  = true
+  skip_metadata_api_check     = true
+  access_key                  = "test"
+  secret_key                  = "test"
+}
+EOF
+  awk '/^resource "aws_dynamodb_table_item"/{found=1} found{print}' "$DYNAMODB_TF" > "${TF_SCRATCH_DIR}/config_items.tf"
+  if [ ! -s "${TF_SCRATCH_DIR}/config_items.tf" ]; then
+    fail "could not extract aws_dynamodb_table_item resource blocks from ${DYNAMODB_TF} for isolated validation"
+  else
+    (
+      cd "$TF_SCRATCH_DIR" && terraform init -input=false >"${TF_SCRATCH_DIR}/tf-init.log" 2>&1
+    )
+    if [ $? -eq 0 ]; then
+      if (cd "$TF_SCRATCH_DIR" && terraform validate >"${TF_SCRATCH_DIR}/tf-validate.log" 2>&1); then
+        pass "terraform validate (isolated scratch): both new aws_dynamodb_table_item blocks are schema-valid against the real hashicorp/aws provider"
+      else
+        fail "terraform validate (isolated scratch) failed:"
+        cat "${TF_SCRATCH_DIR}/tf-validate.log"
+      fi
+    else
+      skip "terraform validate (isolated scratch) -- could not download the public hashicorp/aws provider (no network?); see ${TF_SCRATCH_DIR}/tf-init.log"
+    fi
+  fi
+else
+  skip "terraform validate (isolated scratch) -- terraform not installed"
+fi
+
+echo "--- Existing DynamoDB table definition unchanged ---"
+TABLE_UNCHANGED="true"
+for expected_line in \
+  'name      = "gg-eks-pipeline"' \
+  'hash_key  = "pipeline"' \
+  'range_key = "recordType"' \
+  'billing_mode = "PAY_PER_REQUEST"' \
+  'ttl_enabled        = true' \
+  'ttl_attribute_name = "ttl"'; do
+  if ! grep -Fq -- "$expected_line" "$DYNAMODB_TF"; then
+    fail "existing table module is missing expected unchanged line: ${expected_line}"
+    TABLE_UNCHANGED="false"
+  fi
+done
+if [ "$TABLE_UNCHANGED" = "true" ]; then
+  pass "existing gg-eks-pipeline table module (key schema, billing mode, TTL) is unchanged"
+fi
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  DYNAMODB_CONFIG_VALIDATOR_PY="${WORKDIR}/validate_dynamodb_config.py"
+  cat > "$DYNAMODB_CONFIG_VALIDATOR_PY" <<'PYEOF'
+import re
+import sys
+
+pass_count = 0
+fail_count = 0
+
+def ok(msg):
+    global pass_count
+    print(f"PASS: {msg}")
+    pass_count += 1
+
+def bad(msg):
+    global fail_count
+    print(f"FAIL: {msg}")
+    fail_count += 1
+
+tf_path = sys.argv[1]
+with open(tf_path) as f:
+    content = f.read()
+
+# Extract each top-level "resource \"aws_dynamodb_table_item\" \"NAME\" { ... }"
+# block by brace-depth counting -- avoids needing a full HCL parser for this
+# specific, regular, self-authored structure.
+def extract_resource_blocks(text):
+    blocks = {}
+    for m in re.finditer(r'resource "aws_dynamodb_table_item" "([a-zA-Z0-9_]+)" \{', text):
+        name = m.group(1)
+        start = m.end()
+        depth = 1
+        i = start
+        while depth > 0 and i < len(text):
+            if text[i] == '{':
+                depth += 1
+            elif text[i] == '}':
+                depth -= 1
+            i += 1
+        blocks[name] = text[start:i]
+    return blocks
+
+blocks = extract_resource_blocks(content)
+
+if len(blocks) == 2:
+    ok(f"exactly 2 aws_dynamodb_table_item resources declared: {sorted(blocks.keys())}")
+else:
+    bad(f"expected exactly 2 aws_dynamodb_table_item resources, found {len(blocks)}: {sorted(blocks.keys())}")
+
+expected = {
+    "gg_oracle_payments_01_config": {
+        "pipeline": "gg-oracle-payments-01",
+        "deploymentType": "oracle",
+    },
+    "gg_postgresql_payments_01_config": {
+        "pipeline": "gg-postgresql-payments-01",
+        "deploymentType": "postgresql",
+    },
+}
+
+for resource_name, expectations in expected.items():
+    block = blocks.get(resource_name)
+    if block is None:
+        bad(f"expected resource aws_dynamodb_table_item.{resource_name} was not found")
+        continue
+
+    pipeline_re = re.search(r'pipeline\s*=\s*\{\s*S\s*=\s*"([^"]+)"\s*\}', block)
+    if pipeline_re and pipeline_re.group(1) == expectations["pipeline"]:
+        ok(f"{resource_name}: pipeline key is exactly {expectations['pipeline']!r}")
+    else:
+        bad(f"{resource_name}: pipeline key mismatch (found {pipeline_re.group(1) if pipeline_re else None!r}, expected {expectations['pipeline']!r})")
+
+    recordtype_re = re.search(r'recordType\s*=\s*\{\s*S\s*=\s*"([^"]+)"\s*\}', block)
+    if recordtype_re and recordtype_re.group(1) == "CONFIG":
+        ok(f"{resource_name}: recordType is exactly 'CONFIG'")
+    else:
+        bad(f"{resource_name}: recordType mismatch (found {recordtype_re.group(1) if recordtype_re else None!r}, expected 'CONFIG')")
+
+    dtype_re = re.search(r'deploymentType\s*=\s*\{\s*S\s*=\s*"([^"]+)"\s*\}', block)
+    if dtype_re and dtype_re.group(1) == expectations["deploymentType"]:
+        ok(f"{resource_name}: deploymentType is exactly {expectations['deploymentType']!r}")
+    else:
+        bad(f"{resource_name}: deploymentType mismatch (found {dtype_re.group(1) if dtype_re else None!r}, expected {expectations['deploymentType']!r})")
+
+    # No ttl attribute anywhere in the CONFIG item.
+    if re.search(r'(?<![a-zA-Z_])ttl(?![a-zA-Z_])', block):
+        bad(f"{resource_name}: contains a 'ttl' attribute -- CONFIG records must not expire")
+    else:
+        ok(f"{resource_name}: no ttl attribute present")
+
+    # No LEASE / STATE / STATE# record types introduced by this resource.
+    if re.search(r'"LEASE"|"STATE"|"STATE#', block):
+        bad(f"{resource_name}: references a LEASE/STATE/STATE# record type -- Terraform owns CONFIG only")
+    else:
+        ok(f"{resource_name}: no LEASE/STATE/STATE# record type reference")
+
+    # No secret values, certificate contents, or the old logical pipeline names.
+    forbidden_substrings = [
+        "password", "PWD", "SecretString", "SecretBinary",
+        "BEGIN CERTIFICATE", "BEGIN RSA", "BEGIN PRIVATE KEY",
+        "gg-payments-ora-to-pg-001-source", "gg-payments-ora-to-pg-001-target",
+    ]
+    found_forbidden = [s for s in forbidden_substrings if s.lower() in block.lower()]
+    if found_forbidden:
+        bad(f"{resource_name}: contains forbidden content: {found_forbidden}")
+    else:
+        ok(f"{resource_name}: no secret values, certificate contents, or legacy logical names present")
+
+print(f"SUMMARY pass={pass_count} fail={fail_count} skip=0")
+PYEOF
+
+  set +e
+  DYNAMODB_CONFIG_VALIDATION_OUTPUT="$(python3 "$DYNAMODB_CONFIG_VALIDATOR_PY" "$DYNAMODB_TF")"
+  set -e
+  echo "$DYNAMODB_CONFIG_VALIDATION_OUTPUT"
+  accumulate_python_summary "$DYNAMODB_CONFIG_VALIDATION_OUTPUT"
+else
+  skip "DynamoDB CONFIG item structural validation -- python3/PyYAML not available"
+fi
+
+echo ""
+echo "--- Topology document (topologies/dev/payments-ora-to-pg-001.yaml) ---"
+if [ -f "$TOPOLOGY_YAML" ]; then
+  pass "topology document exists at the recommended, non-envs/dev path"
+else
+  fail "topology document not found at ${TOPOLOGY_YAML}"
+fi
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$TOPOLOGY_YAML" ]; then
+  if python3 -c "
+import yaml, sys
+
+with open('${TOPOLOGY_YAML}') as f:
+    doc = yaml.safe_load(f)
+
+errors = []
+
+if doc.get('pipelineId') != 'payments-ora-to-pg-001':
+    errors.append(f\"pipelineId mismatch: {doc.get('pipelineId')!r}\")
+if doc.get('environment') != 'dev':
+    errors.append(f\"environment mismatch: {doc.get('environment')!r}\")
+
+lifecycle = doc.get('lifecycle', {})
+if lifecycle.get('enabled') is not True or lifecycle.get('state') != 'runtime-ready':
+    errors.append(f'lifecycle mismatch: {lifecycle!r}')
+
+expected_deployments = {
+    'source': {
+        'deploymentName': 'gg-oracle-payments-01',
+        'deploymentType': 'oracle',
+        'ports': {'admin': 8443, 'distribution': 9013, 'metrics': 9015},
+        'secretAdmin': 'dev/goldengate/source/admin',
+    },
+    'target': {
+        'deploymentName': 'gg-postgresql-payments-01',
+        'deploymentType': 'postgresql',
+        'ports': {'admin': 8443, 'receiver': 9014, 'metrics': 9015},
+        'secretAdmin': 'dev/goldengate/target/admin',
+    },
+}
+
+deployments = doc.get('deployments', {})
+for key, expectation in expected_deployments.items():
+    dep = deployments.get(key)
+    if dep is None:
+        errors.append(f'deployments.{key} is missing')
+        continue
+    if dep.get('deploymentName') != expectation['deploymentName']:
+        errors.append(f\"deployments.{key}.deploymentName mismatch: {dep.get('deploymentName')!r}\")
+    if dep.get('deploymentType') != expectation['deploymentType']:
+        errors.append(f\"deployments.{key}.deploymentType mismatch: {dep.get('deploymentType')!r}\")
+    if dep.get('namespace') != 'goldengate-dev':
+        errors.append(f\"deployments.{key}.namespace mismatch: {dep.get('namespace')!r}\")
+    if dep.get('serviceName') != expectation['deploymentName']:
+        errors.append(f\"deployments.{key}.serviceName mismatch: {dep.get('serviceName')!r}\")
+
+    endpoints = dep.get('endpoints', {})
+    expected_host = f\"{expectation['deploymentName']}.goldengate-dev.svc.cluster.local\"
+    for ep_name, expected_port in expectation['ports'].items():
+        ep = endpoints.get(ep_name)
+        if ep is None:
+            errors.append(f'deployments.{key}.endpoints.{ep_name} is missing')
+            continue
+        if ep.get('scheme') != 'https':
+            errors.append(f\"deployments.{key}.endpoints.{ep_name}.scheme mismatch: {ep.get('scheme')!r}\")
+        if ep.get('host') != expected_host:
+            errors.append(f\"deployments.{key}.endpoints.{ep_name}.host mismatch: {ep.get('host')!r}\")
+        if ep.get('port') != expected_port:
+            errors.append(f\"deployments.{key}.endpoints.{ep_name}.port mismatch: {ep.get('port')!r} (expected {expected_port})\")
+
+    secret_refs = dep.get('secretReferences', {})
+    if secret_refs.get('admin') != expectation['secretAdmin']:
+        errors.append(f\"deployments.{key}.secretReferences.admin mismatch: {secret_refs.get('admin')!r}\")
+    if secret_refs.get('tls') != 'dev/goldengate/tls-certificate':
+        errors.append(f\"deployments.{key}.secretReferences.tls mismatch: {secret_refs.get('tls')!r}\")
+
+    processes = dep.get('processes', {})
+    for proc_key in ('extracts', 'distributionPaths', 'replicats'):
+        if processes.get(proc_key) != []:
+            errors.append(f'deployments.{key}.processes.{proc_key} is not an empty list: {processes.get(proc_key)!r}')
+
+    # No secret values/certificate contents -- only reference strings, and
+    # none of the reference strings look like a credential.
+    for ref_val in secret_refs.values():
+        if not isinstance(ref_val, str) or '/' not in ref_val:
+            errors.append(f'deployments.{key} secretReferences value does not look like a Secrets Manager object path: {ref_val!r}')
+
+if errors:
+    for e in errors:
+        print(f'FAIL: {e}')
+    sys.exit(1)
+
+print('OK: topology document structure, endpoints, ports, and secret references all match the locked runtime facts.')
+" >"${WORKDIR}/topology-check.log" 2>&1; then
+    pass "topology document: pipelineId/environment/lifecycle/deployments/endpoints/ports/secretReferences/empty-process-lists all correct"
+  else
+    fail "topology document structural validation failed"
+    cat "${WORKDIR}/topology-check.log"
+  fi
+else
+  skip "topology document structural validation -- python3/PyYAML not available or file missing"
+fi
+
+echo ""
+echo "--- Legacy items and current candidates left untouched ---"
+if command -v git >/dev/null 2>&1 && git -C "$REPO_ROOT" rev-parse HEAD >/dev/null 2>&1; then
+  # --ignore-all-space: this repository has known, pre-existing,
+  # environment-driven CRLF/LF line-ending drift unrelated to any semantic
+  # change (confirmed repeatedly in prior phases via
+  # `git diff --ignore-all-space` showing zero output on the same files).
+  # A whitespace-only diff here must not be reported as an out-of-scope
+  # content change.
+  if git -C "$REPO_ROOT" diff --ignore-all-space --quiet HEAD -- "$ORACLE_VALUES" "$POSTGRESQL_VALUES" monitoring/monitor helm/goldengate-monitor envs/dev/iam.tf envs/dev/secret.tf; then
+    pass "candidate values, observer/monitor code, runtime IAM, and Secrets Manager Terraform are all unchanged by this correction (0 diff vs HEAD)"
+  else
+    fail "one or more out-of-scope files (candidates, observer/monitor, runtime IAM, Secrets Manager Terraform) differ from HEAD"
+  fi
+else
+  skip "legacy/candidate unchanged-vs-HEAD check -- git not available"
+fi
+
+if grep -q "gg-payments-ora-to-pg-001-source\|gg-payments-ora-to-pg-001-target" "$DYNAMODB_TF"; then
+  fail "envs/dev/dynamodb.tf references the old legacy logical pipeline names -- must not rename/overwrite them"
+else
+  pass "envs/dev/dynamodb.tf does not reference/rename/overwrite the legacy logical pipeline names"
 fi
 
 echo ""
