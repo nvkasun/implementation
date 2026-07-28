@@ -1,0 +1,38 @@
+# Central GoldenGate runtime deployment inventory.
+#
+# Source-of-truth answer to "which GoldenGate runtime deployments exist?" --
+# consumed by envs/dev/dynamodb.tf's generic aws_dynamodb_table_item.pipeline_config
+# resource (for_each over this file, mirroring the manager reference
+# implementation's terraform/platform/dynamodb.tf pattern: `for d in
+# yamldecode(file(...)).deployments : "gg-${d.name}" => d`).
+#
+# Deliberately NOT under envs/dev/: the GoldenGate runtime deployment workflow
+# scans envs/dev/* first-level folders as runtime deployment IDs -- this is
+# inventory metadata, not a deployment folder.
+#
+# name values must NOT include the gg- prefix -- the canonical runtime key is
+# derived exactly once, in Terraform, as gg-${d.name}. Prefixing name here
+# would produce gg-gg-<name>.
+#
+#   name: oracle-payments-01     -> canonical key gg-oracle-payments-01
+#   name: postgresql-payments-01 -> canonical key gg-postgresql-payments-01
+#
+# Each name must match its runtime folder (envs/dev/gg-<name>/values.yaml)
+# and that file's global.deploymentId / runtime.name (both gg-<name>). Each
+# type must match that runtime's deploymentType (see topologies/dev/
+# payments-ora-to-pg-001.yaml, which carries the full endpoint/namespace/
+# secret-reference detail this file does not).
+#
+# enabled here is informational/registration only -- matching the manager
+# pattern, Terraform does NOT filter on it. A CONFIG item is seeded for every
+# declared deployment regardless of enabled, so a future disabled entry (e.g.
+# a not-yet-live SQL Server candidate) still gets a CONFIG row waiting for it,
+# with no separate Terraform resource block required.
+deployments:
+  - name: oracle-payments-01
+    type: oracle
+    enabled: true
+
+  - name: postgresql-payments-01
+    type: postgresql
+    enabled: true

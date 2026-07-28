@@ -39,8 +39,21 @@ module "goldengate_pipeline_state" {
   env                  = "dev"
 }
 
-# Phase 3: manager-aligned canonical CONFIG inventory records for the two
-# live single-runtime GoldenGate deployments.
+# Phase 3 (refactored): manager-aligned canonical CONFIG inventory, seeded
+# generically from pipelines/deployments.yaml -- mirrors the manager
+# reference implementation's own pattern exactly:
+#
+#   terraform/platform/dynamodb.tf (manager repo, inspected read-only):
+#     for_each = {
+#       for d in yamldecode(file("${path.module}/../../pipelines/deployments.yaml")).deployments :
+#       "gg-${d.name}" => d.type
+#     }
+#
+# One central deployment inventory (pipelines/deployments.yaml), one shared
+# table (gg-eks-pipeline, unchanged below), one generic
+# aws_dynamodb_table_item resource with for_each -- never a per-runtime
+# resource block. A future declared deployment (enabled or not) needs only
+# a new pipelines/deployments.yaml entry, no Terraform code change.
 #
 # STATE OWNERSHIP SAFETY: Terraform owns ONLY recordType=CONFIG items in
 # this table. recordType=LEASE, recordType=STATE#_deployment, and
@@ -48,76 +61,90 @@ module "goldengate_pipeline_state" {
 # shared gg-monitor -- Terraform must never create, update, or delete any
 # item with those record types. This keeps writers disjoint by sort key, so
 # there is no write contention between Terraform and the future monitor.
+# RESOLVED STATE KEY CONTRACT for that future phase (the manager reference
+# code is internally inconsistent here: charts/gg-monitor/files/gg-monitor.py
+# reads a legacy singleton recordType="STATE", while the actual writer,
+# charts/gg-deployment/files/utility-sidecar.py, only ever writes
+# recordType="STATE#_deployment" / "STATE#<process>" -- our canonical
+# contract is the STATE#-prefixed form; the bare "STATE" singleton is not
+# used and must not be created or read).
 #
 # Schema mirrors the manager reference implementation's own CONFIG item
-# exactly (field names, types, and default values) -- see
+# field names, types, and (mostly) default values -- see
 # terraform/platform/dynamodb.tf and charts/gg-monitor/files/gg-monitor.py /
-# charts/gg-deployment/files/utility-sidecar.py in the manager reference
-# repository (inspected read-only; not copied or modified). CONFIG in that
-# schema is a monitoring/alerting-policy record only -- it deliberately
-# carries no endpoint, namespace, serviceName, or secret-reference fields
-# (those live in topologies/dev/payments-ora-to-pg-001.yaml instead, mirroring
-# the manager's own separation between DynamoDB CONFIG and its
-# ConfigMap-mounted topology data).
+# charts/gg-deployment/files/utility-sidecar.py / gg_health.py in the manager
+# reference repository (inspected read-only; not copied or modified). CONFIG
+# in that schema is a monitoring/alerting-policy record only -- it
+# deliberately carries no endpoint, namespace, serviceName, or
+# secret-reference fields (those live in
+# topologies/dev/payments-ora-to-pg-001.yaml instead, mirroring the
+# manager's own separation between DynamoDB CONFIG and its ConfigMap-mounted
+# topology data).
 #
-# ignore_changes = [item]: matches the manager pattern -- Terraform seeds
-# each CONFIG item once; DynamoDB console/future tooling is the live source
-# of truth for operator-tuned values after that, so Terraform never fights
-# an operator's later edit.
+# CONFIRMED MANAGER DEFECT (field name): the manager's own Terraform seed
+# writes `dispatchStallChecks` inside `defaults`, but every reader
+# (gg_health.py DEFAULTS["defaults"]["distpathStallChecks"] and
+# utility-sidecar.py's `rule["distpathStallChecks"]`) expects
+# `distpathStallChecks`. We use the corrected `distpathStallChecks` name,
+# never the seed's typo.
+#
+# PASSIVE-SAFE DEVIATION (intentional, approved architecture): our runtime
+# pods have no manager utility sidecar, and the future shared gg-monitor
+# must be passive (no restart/start/fence/failover). alertsEnabled=false,
+# credSyncEnabled=false, autoStartEnabled=false, autoRestartMaxRetries=0,
+# defaults.failoverEnabled=false, and defaults.alertEachAbend=false all
+# deviate from the manager's own seed defaults (which assume its active
+# sidecar) for exactly this reason. metricsEnabled and every timing/
+# threshold field (tz, checkIntervalSeconds, startupGraceSeconds,
+# trailRetentionHours, defaults.lagMode/lagThresholdSeconds/
+# maxConsecutiveAbends/abendRecheckSeconds/distpathStallChecks) stay
+# manager-compatible.
+#
+# ignore_changes = [item]: matches the manager pattern -- Terraform creates
+# the initial CONFIG item once; operators or future management workflows may
+# tune existing CONFIG values afterward (DynamoDB console / future tooling
+# is the live source of truth from then on), so Terraform never resets them
+# on a later apply. A new pipelines/deployments.yaml entry still creates a
+# new CONFIG item normally (for_each diff), whether or not it is enabled.
 #
 # No ttl attribute: CONFIG records must not expire (only the table's TTL
 # *feature* stays enabled at the table level, for LEASE/STATE items the
 # monitor will own -- individual CONFIG items simply omit the ttl attribute
 # entirely, which is sufficient for DynamoDB TTL to never act on them).
-resource "aws_dynamodb_table_item" "gg_oracle_payments_01_config" {
-  table_name = "gg-eks-pipeline"
-  hash_key   = "pipeline"
-  range_key  = "recordType"
-
-  item = jsonencode({
-    pipeline       = { S = "gg-oracle-payments-01" }
-    recordType     = { S = "CONFIG" }
-    deploymentType = { S = "oracle" }
-
-    alertsEnabled            = { BOOL = false }
-    metricsEnabled           = { BOOL = true }
-    credSyncEnabled          = { BOOL = false }
-    tz                       = { S = "Asia/Dubai" }
-    checkIntervalSeconds     = { N = "60" }
-    startupGraceSeconds      = { N = "300" }
-    autoStartEnabled         = { BOOL = true }
-    autoRestartMaxRetries    = { N = "3" }
-    autoRestartWindowMinutes = { N = "30" }
-    trailRetentionHours      = { N = "48" }
-
-    defaults = { M = {
-      lagMode              = { S = "alert" }
-      lagThresholdSeconds  = { N = "300" }
-      maxConsecutiveAbends = { N = "3" }
-      abendRecheckSeconds  = { N = "120" }
-      alertEachAbend       = { BOOL = false }
-      failoverEnabled      = { BOOL = true }
-      dispatchStallChecks  = { N = "3" }
-    } }
-
-    quietHours = { M = {} }
-    overrides  = { M = {} }
-  })
-
-  lifecycle {
-    ignore_changes = [item]
-  }
+#
+# TERRAFORM STATE MIGRATION SAFETY: the two explicit resources this replaces
+# (aws_dynamodb_table_item.gg_oracle_payments_01_config and
+# .gg_postgresql_payments_01_config) were present in this file's prior
+# revision and may already exist in remote Terraform state. The moved
+# blocks below let an already-applied item move to its new for_each address
+# without a delete/recreate; if it was never applied, the moved block is a
+# harmless no-op and the for_each resource is simply created normally.
+moved {
+  from = aws_dynamodb_table_item.gg_oracle_payments_01_config
+  to   = aws_dynamodb_table_item.pipeline_config["gg-oracle-payments-01"]
 }
 
-resource "aws_dynamodb_table_item" "gg_postgresql_payments_01_config" {
+moved {
+  from = aws_dynamodb_table_item.gg_postgresql_payments_01_config
+  to   = aws_dynamodb_table_item.pipeline_config["gg-postgresql-payments-01"]
+}
+
+resource "aws_dynamodb_table_item" "pipeline_config" {
+  for_each = {
+    for d in yamldecode(
+      file("${path.module}/../../pipelines/deployments.yaml")
+    ).deployments :
+    "gg-${d.name}" => d
+  }
+
   table_name = "gg-eks-pipeline"
   hash_key   = "pipeline"
   range_key  = "recordType"
 
   item = jsonencode({
-    pipeline       = { S = "gg-postgresql-payments-01" }
+    pipeline       = { S = each.key }
     recordType     = { S = "CONFIG" }
-    deploymentType = { S = "postgresql" }
+    deploymentType = { S = each.value.type }
 
     alertsEnabled            = { BOOL = false }
     metricsEnabled           = { BOOL = true }
@@ -125,8 +152,8 @@ resource "aws_dynamodb_table_item" "gg_postgresql_payments_01_config" {
     tz                       = { S = "Asia/Dubai" }
     checkIntervalSeconds     = { N = "60" }
     startupGraceSeconds      = { N = "300" }
-    autoStartEnabled         = { BOOL = true }
-    autoRestartMaxRetries    = { N = "3" }
+    autoStartEnabled         = { BOOL = false }
+    autoRestartMaxRetries    = { N = "0" }
     autoRestartWindowMinutes = { N = "30" }
     trailRetentionHours      = { N = "48" }
 
@@ -136,8 +163,8 @@ resource "aws_dynamodb_table_item" "gg_postgresql_payments_01_config" {
       maxConsecutiveAbends = { N = "3" }
       abendRecheckSeconds  = { N = "120" }
       alertEachAbend       = { BOOL = false }
-      failoverEnabled      = { BOOL = true }
-      dispatchStallChecks  = { N = "3" }
+      failoverEnabled      = { BOOL = false }
+      distpathStallChecks  = { N = "3" }
     } }
 
     quietHours = { M = {} }

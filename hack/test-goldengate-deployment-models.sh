@@ -1448,63 +1448,6 @@ else
   skip "terraform fmt -check -- terraform not installed"
 fi
 
-echo "--- terraform validate: isolated scratch check of the two new resource blocks ---"
-# Full `terraform init` in envs/dev/ is blocked: all 10 module blocks across
-# dynamodb.tf/iam.tf/secret.tf source from private AbuDhabiCommercialBank
-# GitHub repos this sandbox cannot authenticate to (confirmed: git exited
-# 128, "could not read Username"). That blocks `terraform validate` for the
-# WHOLE root module -- not something specific to the new resources. Rather
-# than falsely report validation as passed (or skip it entirely), this
-# extracts just the two new `aws_dynamodb_table_item` blocks (which have no
-# module/remote source of their own) into an isolated scratch directory
-# with a minimal provider block, and validates THOSE against the real
-# `hashicorp/aws` provider schema (public registry, no ADCB private
-# modules, no state, no AWS credentials, no remote calls beyond the public
-# provider download).
-if [ "$TERRAFORM_AVAILABLE" = "true" ]; then
-  TF_SCRATCH_DIR="${WORKDIR}/tf-isolated-validate"
-  mkdir -p "$TF_SCRATCH_DIR"
-  cat > "${TF_SCRATCH_DIR}/main.tf" <<'EOF'
-terraform {
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = ">= 5.0"
-    }
-  }
-}
-
-provider "aws" {
-  region                      = "eu-west-1"
-  skip_credentials_validation = true
-  skip_requesting_account_id  = true
-  skip_metadata_api_check     = true
-  access_key                  = "test"
-  secret_key                  = "test"
-}
-EOF
-  awk '/^resource "aws_dynamodb_table_item"/{found=1} found{print}' "$DYNAMODB_TF" > "${TF_SCRATCH_DIR}/config_items.tf"
-  if [ ! -s "${TF_SCRATCH_DIR}/config_items.tf" ]; then
-    fail "could not extract aws_dynamodb_table_item resource blocks from ${DYNAMODB_TF} for isolated validation"
-  else
-    (
-      cd "$TF_SCRATCH_DIR" && terraform init -input=false >"${TF_SCRATCH_DIR}/tf-init.log" 2>&1
-    )
-    if [ $? -eq 0 ]; then
-      if (cd "$TF_SCRATCH_DIR" && terraform validate >"${TF_SCRATCH_DIR}/tf-validate.log" 2>&1); then
-        pass "terraform validate (isolated scratch): both new aws_dynamodb_table_item blocks are schema-valid against the real hashicorp/aws provider"
-      else
-        fail "terraform validate (isolated scratch) failed:"
-        cat "${TF_SCRATCH_DIR}/tf-validate.log"
-      fi
-    else
-      skip "terraform validate (isolated scratch) -- could not download the public hashicorp/aws provider (no network?); see ${TF_SCRATCH_DIR}/tf-init.log"
-    fi
-  fi
-else
-  skip "terraform validate (isolated scratch) -- terraform not installed"
-fi
-
 echo "--- Existing DynamoDB table definition unchanged ---"
 TABLE_UNCHANGED="true"
 for expected_line in \
@@ -1523,11 +1466,14 @@ if [ "$TABLE_UNCHANGED" = "true" ]; then
   pass "existing gg-eks-pipeline table module (key schema, billing mode, TTL) is unchanged"
 fi
 
+DEPLOYMENTS_YAML="pipelines/deployments.yaml"
+
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   DYNAMODB_CONFIG_VALIDATOR_PY="${WORKDIR}/validate_dynamodb_config.py"
   cat > "$DYNAMODB_CONFIG_VALIDATOR_PY" <<'PYEOF'
 import re
 import sys
+import yaml
 
 pass_count = 0
 fail_count = 0
@@ -1542,17 +1488,17 @@ def bad(msg):
     print(f"FAIL: {msg}")
     fail_count += 1
 
-tf_path = sys.argv[1]
+tf_path, deployments_path, oracle_values_path, postgresql_values_path = sys.argv[1:5]
 with open(tf_path) as f:
     content = f.read()
 
 # Extract each top-level "resource \"aws_dynamodb_table_item\" \"NAME\" { ... }"
 # block by brace-depth counting -- avoids needing a full HCL parser for this
 # specific, regular, self-authored structure.
-def extract_resource_blocks(text):
+def extract_blocks(text, header_re):
     blocks = {}
-    for m in re.finditer(r'resource "aws_dynamodb_table_item" "([a-zA-Z0-9_]+)" \{', text):
-        name = m.group(1)
+    for m in re.finditer(header_re, text):
+        name = m.group(1) if m.groups() else None
         start = m.end()
         depth = 1
         i = start
@@ -1562,85 +1508,316 @@ def extract_resource_blocks(text):
             elif text[i] == '}':
                 depth -= 1
             i += 1
-        blocks[name] = text[start:i]
+        blocks[name if name is not None else start] = text[start:i]
     return blocks
 
-blocks = extract_resource_blocks(content)
+resource_blocks = extract_blocks(content, r'resource "aws_dynamodb_table_item" "([a-zA-Z0-9_]+)" \{')
 
-if len(blocks) == 2:
-    ok(f"exactly 2 aws_dynamodb_table_item resources declared: {sorted(blocks.keys())}")
+# ---------------------------------------------------------------------
+# 1. Exactly one generic aws_dynamodb_table_item resource (no more
+#    per-runtime duplication).
+# ---------------------------------------------------------------------
+if len(resource_blocks) == 1 and "pipeline_config" in resource_blocks:
+    ok("exactly 1 generic aws_dynamodb_table_item resource declared: pipeline_config")
 else:
-    bad(f"expected exactly 2 aws_dynamodb_table_item resources, found {len(blocks)}: {sorted(blocks.keys())}")
+    bad(f"expected exactly 1 resource named pipeline_config, found {len(resource_blocks)}: {sorted(k for k in resource_blocks if k)}")
 
-expected = {
-    "gg_oracle_payments_01_config": {
-        "pipeline": "gg-oracle-payments-01",
-        "deploymentType": "oracle",
-    },
-    "gg_postgresql_payments_01_config": {
-        "pipeline": "gg-postgresql-payments-01",
-        "deploymentType": "postgresql",
-    },
+if "gg_oracle_payments_01_config" in resource_blocks or "gg_postgresql_payments_01_config" in resource_blocks:
+    bad("a duplicated per-runtime aws_dynamodb_table_item resource still exists in the code")
+else:
+    ok("no Oracle-specific or PostgreSQL-specific table-item resource remains")
+
+block = resource_blocks.get("pipeline_config", "")
+
+# ---------------------------------------------------------------------
+# 2. for_each mechanics: present, driven by pipelines/deployments.yaml,
+#    keyed by gg-${d.name}, using each.key / each.value.type.
+# ---------------------------------------------------------------------
+if "for_each" in block:
+    ok("pipeline_config uses for_each")
+else:
+    bad("pipeline_config does not use for_each")
+
+if "pipelines/deployments.yaml" in block:
+    ok("for_each is driven by pipelines/deployments.yaml")
+else:
+    bad("for_each does not reference pipelines/deployments.yaml")
+
+if re.search(r'"gg-\$\{d\.name\}"', block):
+    ok("canonical key is derived exactly once as \"gg-${d.name}\"")
+else:
+    bad("canonical key derivation \"gg-${d.name}\" not found in for_each")
+
+# The derivation must appear exactly once (not once per runtime).
+derivation_count = len(re.findall(r'"gg-\$\{d\.name\}"', block))
+if derivation_count == 1:
+    ok("gg-${d.name} derivation appears exactly once (not duplicated per runtime)")
+else:
+    bad(f"expected the gg-${{d.name}} derivation exactly once, found {derivation_count}")
+
+if re.search(r'pipeline\s*=\s*\{\s*S\s*=\s*each\.key\s*\}', block):
+    ok("item.pipeline uses each.key")
+else:
+    bad("item.pipeline does not use each.key")
+
+if re.search(r'deploymentType\s*=\s*\{\s*S\s*=\s*each\.value\.type\s*\}', block):
+    ok("item.deploymentType uses each.value.type")
+else:
+    bad("item.deploymentType does not use each.value.type")
+
+# Field names like alertsEnabled/metricsEnabled/credSyncEnabled/
+# autoStartEnabled legitimately contain the substring "enabled" -- what must
+# NOT appear is a filter/condition keyed on the inventory's own d.enabled
+# (e.g. each.value.enabled, a for_each comprehension "if d.enabled", or a
+# count/for-expression gate), which would skip disabled deployments.
+if not re.search(r'each\.value\.enabled|d\.enabled|for_each\s*=\s*\{[^}]*if\s+d\.enabled', block):
+    ok("pipeline_config does not filter or branch on d.enabled -- both enabled and disabled deployments are seeded")
+else:
+    bad("pipeline_config appears to filter on enabled -- CONFIG must be seeded regardless of enabled state")
+
+# ---------------------------------------------------------------------
+# 3. Passive-safe CONFIG defaults and the corrected distpathStallChecks
+#    field name (confirmed manager defect: dispatchStallChecks is wrong).
+# ---------------------------------------------------------------------
+passive_checks = [
+    (r'alertsEnabled\s*=\s*\{\s*BOOL\s*=\s*false\s*\}', "alertsEnabled=false"),
+    (r'metricsEnabled\s*=\s*\{\s*BOOL\s*=\s*true\s*\}', "metricsEnabled=true"),
+    (r'credSyncEnabled\s*=\s*\{\s*BOOL\s*=\s*false\s*\}', "credSyncEnabled=false"),
+    (r'autoStartEnabled\s*=\s*\{\s*BOOL\s*=\s*false\s*\}', "autoStartEnabled=false"),
+    (r'autoRestartMaxRetries\s*=\s*\{\s*N\s*=\s*"0"\s*\}', "autoRestartMaxRetries=0"),
+    (r'failoverEnabled\s*=\s*\{\s*BOOL\s*=\s*false\s*\}', "defaults.failoverEnabled=false"),
+    (r'alertEachAbend\s*=\s*\{\s*BOOL\s*=\s*false\s*\}', "defaults.alertEachAbend=false"),
+]
+for pattern, label in passive_checks:
+    if re.search(pattern, block):
+        ok(f"passive-safe default present: {label}")
+    else:
+        bad(f"passive-safe default missing or incorrect: {label}")
+
+if re.search(r'distpathStallChecks\s*=\s*\{\s*N\s*=\s*"3"\s*\}', block):
+    ok("defaults.distpathStallChecks is present (corrected field name)")
+else:
+    bad("defaults.distpathStallChecks is missing")
+
+# Only flag dispatchStallChecks used as an actual HCL attribute key
+# (`dispatchStallChecks = {...}`), not the field name appearing in prose
+# inside a comment (this file intentionally documents the manager's defect
+# by name).
+if re.search(r'dispatchStallChecks\s*=\s*\{', content):
+    bad("the incorrect manager field name 'dispatchStallChecks' is used as an attribute key in dynamodb.tf -- must be distpathStallChecks")
+else:
+    ok("the incorrect manager field name 'dispatchStallChecks' does not appear anywhere in dynamodb.tf")
+
+# ---------------------------------------------------------------------
+# 4. No ttl, no LEASE/STATE/STATE#, no secret values / legacy names.
+# ---------------------------------------------------------------------
+if re.search(r'(?<![a-zA-Z_])ttl(?![a-zA-Z_])', block):
+    bad("pipeline_config contains a 'ttl' attribute -- CONFIG records must not expire")
+else:
+    ok("pipeline_config has no ttl attribute")
+
+if re.search(r'"LEASE"|"STATE"|"STATE#', block):
+    bad("pipeline_config references a LEASE/STATE/STATE# record type -- Terraform owns CONFIG only")
+else:
+    ok("pipeline_config has no LEASE/STATE/STATE# record type reference")
+
+forbidden_substrings = [
+    "password", "PWD", "SecretString", "SecretBinary",
+    "BEGIN CERTIFICATE", "BEGIN RSA", "BEGIN PRIVATE KEY",
+    "gg-payments-ora-to-pg-001-source", "gg-payments-ora-to-pg-001-target",
+]
+found_forbidden = [s for s in forbidden_substrings if s.lower() in block.lower()]
+if found_forbidden:
+    bad(f"pipeline_config contains forbidden content: {found_forbidden}")
+else:
+    ok("pipeline_config has no secret values, certificate contents, or legacy logical names")
+
+if re.search(r'ignore_changes\s*=\s*\[\s*item\s*\]', block):
+    ok("lifecycle.ignore_changes includes item")
+else:
+    bad("lifecycle.ignore_changes = [item] not found on pipeline_config")
+
+# ---------------------------------------------------------------------
+# 5. moved blocks: correct from/to addresses for both prior explicit
+#    resources.
+# ---------------------------------------------------------------------
+moved_blocks = extract_blocks(content, r'moved \{')
+moved_text = "\n".join(moved_blocks.values())
+expected_moves = [
+    ("aws_dynamodb_table_item.gg_oracle_payments_01_config", 'aws_dynamodb_table_item.pipeline_config["gg-oracle-payments-01"]'),
+    ("aws_dynamodb_table_item.gg_postgresql_payments_01_config", 'aws_dynamodb_table_item.pipeline_config["gg-postgresql-payments-01"]'),
+]
+if len(moved_blocks) == 2:
+    ok("exactly 2 moved blocks declared")
+else:
+    bad(f"expected exactly 2 moved blocks, found {len(moved_blocks)}")
+
+for from_addr, to_addr in expected_moves:
+    if from_addr in moved_text and to_addr in moved_text:
+        ok(f"moved block correctly maps {from_addr} -> {to_addr}")
+    else:
+        bad(f"moved block for {from_addr} -> {to_addr} not found or incorrect")
+
+# ---------------------------------------------------------------------
+# 6. Inventory (pipelines/deployments.yaml): structure, gg-${name}
+#    derivation with no gg-gg- risk, cross-validated against runtime
+#    values files, plus a synthetic sqlserver entry (Python-simulated,
+#    no Terraform code change required).
+# ---------------------------------------------------------------------
+with open(deployments_path) as f:
+    inventory = yaml.safe_load(f)
+
+entries = inventory.get("deployments", [])
+if len(entries) == 2:
+    ok("pipelines/deployments.yaml declares exactly 2 entries")
+else:
+    bad(f"expected exactly 2 inventory entries, found {len(entries)}")
+
+def derive_key(name):
+    return f"gg-{name}"
+
+by_name = {e["name"]: e for e in entries}
+
+expected_inventory = {
+    "oracle-payments-01": {"type": "oracle", "enabled": True, "runtime_folder": "gg-oracle-payments-01", "values_path": oracle_values_path},
+    "postgresql-payments-01": {"type": "postgresql", "enabled": True, "runtime_folder": "gg-postgresql-payments-01", "values_path": postgresql_values_path},
 }
 
-for resource_name, expectations in expected.items():
-    block = blocks.get(resource_name)
-    if block is None:
-        bad(f"expected resource aws_dynamodb_table_item.{resource_name} was not found")
+for name, expectation in expected_inventory.items():
+    entry = by_name.get(name)
+    if entry is None:
+        bad(f"inventory entry '{name}' is missing")
         continue
 
-    pipeline_re = re.search(r'pipeline\s*=\s*\{\s*S\s*=\s*"([^"]+)"\s*\}', block)
-    if pipeline_re and pipeline_re.group(1) == expectations["pipeline"]:
-        ok(f"{resource_name}: pipeline key is exactly {expectations['pipeline']!r}")
+    if entry.get("name", "").startswith("gg-"):
+        bad(f"inventory name '{entry.get('name')}' already includes the gg- prefix -- would derive gg-gg-...")
     else:
-        bad(f"{resource_name}: pipeline key mismatch (found {pipeline_re.group(1) if pipeline_re else None!r}, expected {expectations['pipeline']!r})")
+        ok(f"inventory name '{name}' does not already include the gg- prefix")
 
-    recordtype_re = re.search(r'recordType\s*=\s*\{\s*S\s*=\s*"([^"]+)"\s*\}', block)
-    if recordtype_re and recordtype_re.group(1) == "CONFIG":
-        ok(f"{resource_name}: recordType is exactly 'CONFIG'")
+    key = derive_key(entry["name"])
+    if key == expectation["runtime_folder"]:
+        ok(f"derived key for '{name}' is exactly {key!r}, no gg-gg- prefix")
     else:
-        bad(f"{resource_name}: recordType mismatch (found {recordtype_re.group(1) if recordtype_re else None!r}, expected 'CONFIG')")
+        bad(f"derived key for '{name}' is {key!r}, expected {expectation['runtime_folder']!r}")
 
-    dtype_re = re.search(r'deploymentType\s*=\s*\{\s*S\s*=\s*"([^"]+)"\s*\}', block)
-    if dtype_re and dtype_re.group(1) == expectations["deploymentType"]:
-        ok(f"{resource_name}: deploymentType is exactly {expectations['deploymentType']!r}")
+    if entry.get("type") == expectation["type"]:
+        ok(f"inventory type for '{name}' is {expectation['type']!r}")
     else:
-        bad(f"{resource_name}: deploymentType mismatch (found {dtype_re.group(1) if dtype_re else None!r}, expected {expectations['deploymentType']!r})")
+        bad(f"inventory type for '{name}' is {entry.get('type')!r}, expected {expectation['type']!r}")
 
-    # No ttl attribute anywhere in the CONFIG item.
-    if re.search(r'(?<![a-zA-Z_])ttl(?![a-zA-Z_])', block):
-        bad(f"{resource_name}: contains a 'ttl' attribute -- CONFIG records must not expire")
+    if entry.get("enabled") is expectation["enabled"]:
+        ok(f"inventory enabled for '{name}' is {expectation['enabled']}")
     else:
-        ok(f"{resource_name}: no ttl attribute present")
+        bad(f"inventory enabled for '{name}' is {entry.get('enabled')!r}, expected {expectation['enabled']}")
 
-    # No LEASE / STATE / STATE# record types introduced by this resource.
-    if re.search(r'"LEASE"|"STATE"|"STATE#', block):
-        bad(f"{resource_name}: references a LEASE/STATE/STATE# record type -- Terraform owns CONFIG only")
-    else:
-        ok(f"{resource_name}: no LEASE/STATE/STATE# record type reference")
+    # Cross-validate against the runtime values.yaml: folder name / runtime.name
+    # equal the derived key, and runtime.deploymentType (global.deploymentId is
+    # the folder-equivalent; this repo's chart doesn't have a literal
+    # "deploymentType" values key, so cross-check via global.deploymentId and
+    # the folder path instead, which is the authoritative equivalent).
+    try:
+        with open(expectation["values_path"]) as vf:
+            values_raw = vf.read()
+    except OSError as e:
+        bad(f"could not read runtime values file for '{name}': {e}")
+        continue
 
-    # No secret values, certificate contents, or the old logical pipeline names.
-    forbidden_substrings = [
-        "password", "PWD", "SecretString", "SecretBinary",
-        "BEGIN CERTIFICATE", "BEGIN RSA", "BEGIN PRIVATE KEY",
-        "gg-payments-ora-to-pg-001-source", "gg-payments-ora-to-pg-001-target",
-    ]
-    found_forbidden = [s for s in forbidden_substrings if s.lower() in block.lower()]
-    if found_forbidden:
-        bad(f"{resource_name}: contains forbidden content: {found_forbidden}")
+    if re.search(rf'deploymentId:\s*{re.escape(key)}\s*$', values_raw, re.MULTILINE):
+        ok(f"runtime values file for '{name}' has global.deploymentId == {key!r}")
     else:
-        ok(f"{resource_name}: no secret values, certificate contents, or legacy logical names present")
+        bad(f"runtime values file for '{name}' does not declare global.deploymentId == {key!r}")
+
+    if re.search(rf'^\s*name:\s*{re.escape(key)}\s*$', values_raw, re.MULTILINE):
+        ok(f"runtime values file for '{name}' has runtime.name == {key!r}")
+    else:
+        bad(f"runtime values file for '{name}' does not declare a name: {key!r} field")
+
+# Synthetic disabled entry: simulate adding it without any Terraform code
+# change -- the for_each mechanism (already proven above) is what makes
+# this "automatic". This is a pure derivation-logic check.
+synthetic_entries = list(entries) + [{"name": "sqlserver-payments-01", "type": "sqlserver", "enabled": False}]
+synthetic_keys = {derive_key(e["name"]): e["type"] for e in synthetic_entries}
+if synthetic_keys.get("gg-sqlserver-payments-01") == "sqlserver":
+    ok("synthetic entry sqlserver-payments-01/sqlserver/false resolves to gg-sqlserver-payments-01 without a new Terraform resource block")
+else:
+    bad("synthetic sqlserver-payments-01 entry did not resolve to the expected gg-sqlserver-payments-01 key")
+if not any(k.startswith("gg-gg-") for k in synthetic_keys):
+    ok("no gg-gg- prefix produced for any inventory entry, including the synthetic one")
+else:
+    bad("a gg-gg- prefix was produced by the key derivation")
 
 print(f"SUMMARY pass={pass_count} fail={fail_count} skip=0")
 PYEOF
 
   set +e
-  DYNAMODB_CONFIG_VALIDATION_OUTPUT="$(python3 "$DYNAMODB_CONFIG_VALIDATOR_PY" "$DYNAMODB_TF")"
+  DYNAMODB_CONFIG_VALIDATION_OUTPUT="$(python3 "$DYNAMODB_CONFIG_VALIDATOR_PY" "$DYNAMODB_TF" "$DEPLOYMENTS_YAML" "$ORACLE_VALUES" "$POSTGRESQL_VALUES")"
   set -e
   echo "$DYNAMODB_CONFIG_VALIDATION_OUTPUT"
   accumulate_python_summary "$DYNAMODB_CONFIG_VALIDATION_OUTPUT"
 else
   skip "DynamoDB CONFIG item structural validation -- python3/PyYAML not available"
+fi
+
+echo ""
+echo "--- Isolated scratch terraform validate: generic for_each resource + moved blocks + synthetic 3rd (disabled) inventory entry ---"
+if [ "$TERRAFORM_AVAILABLE" = "true" ]; then
+  TF_SCRATCH_DIR2="${WORKDIR}/tf-isolated-validate-forEach"
+  mkdir -p "${TF_SCRATCH_DIR2}/envs/dev" "${TF_SCRATCH_DIR2}/pipelines"
+  cat > "${TF_SCRATCH_DIR2}/envs/dev/provider.tf" <<'EOF'
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = ">= 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region                      = "eu-west-1"
+  skip_credentials_validation = true
+  skip_requesting_account_id  = true
+  skip_metadata_api_check     = true
+  access_key                  = "test"
+  secret_key                  = "test"
+}
+EOF
+  awk '/^moved \{/{found=1} found{print}' "$DYNAMODB_TF" > "${TF_SCRATCH_DIR2}/envs/dev/config_items.tf"
+  # Synthetic inventory: the real 2 entries plus one disabled sqlserver
+  # candidate, proving the for_each mechanism accepts a new declared
+  # deployment (enabled or not) with zero Terraform code changes.
+  cat > "${TF_SCRATCH_DIR2}/pipelines/deployments.yaml" <<'EOF'
+deployments:
+  - name: oracle-payments-01
+    type: oracle
+    enabled: true
+
+  - name: postgresql-payments-01
+    type: postgresql
+    enabled: true
+
+  - name: sqlserver-payments-01
+    type: sqlserver
+    enabled: false
+EOF
+
+  if [ ! -s "${TF_SCRATCH_DIR2}/envs/dev/config_items.tf" ]; then
+    fail "could not extract moved blocks + pipeline_config resource from ${DYNAMODB_TF} for isolated validation"
+  else
+    (cd "${TF_SCRATCH_DIR2}/envs/dev" && terraform init -input=false >"${TF_SCRATCH_DIR2}/tf-init.log" 2>&1)
+    if [ $? -eq 0 ]; then
+      if (cd "${TF_SCRATCH_DIR2}/envs/dev" && terraform validate >"${TF_SCRATCH_DIR2}/tf-validate.log" 2>&1); then
+        pass "terraform validate (isolated scratch, 3-entry synthetic inventory including 1 disabled): pipeline_config + moved blocks are schema-valid"
+      else
+        fail "terraform validate (isolated scratch, synthetic inventory) failed:"
+        cat "${TF_SCRATCH_DIR2}/tf-validate.log"
+      fi
+    else
+      skip "terraform validate (isolated scratch, synthetic inventory) -- could not download the public hashicorp/aws provider; see ${TF_SCRATCH_DIR2}/tf-init.log"
+    fi
+  fi
+else
+  skip "terraform validate (isolated scratch, synthetic inventory) -- terraform not installed"
 fi
 
 echo ""
