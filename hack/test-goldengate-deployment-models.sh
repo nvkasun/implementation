@@ -907,6 +907,198 @@ else
 fi
 
 echo ""
+
+# ---------------------------------------------------------------------
+# Phase 2A/2B: helm/goldengate-platform -- shared namespaces and shared
+# engine-level runtime ServiceAccounts (IRSA). This chart is the single
+# designated owner of these 4 objects; individual GoldenGate runtime
+# releases (helm/goldengate, deploymentModel=singleRuntime) must never
+# create or own them.
+# ---------------------------------------------------------------------
+PLATFORM_CHART_PATH="helm/goldengate-platform"
+PLATFORM_VALUES="platform/dev/goldengate-platform/values.yaml"
+TEST_ORACLE_ROLE_ARN="arn:aws:iam::668311715351:role/gg-oracle-dev-runtime-role"
+TEST_POSTGRESQL_ROLE_ARN="arn:aws:iam::668311715351:role/gg-postgresql-dev-runtime-role"
+PLATFORM_RENDERED="${WORKDIR}/platform.yaml"
+
+if [ "$HELM_AVAILABLE" = "true" ]; then
+  echo "--- Platform bootstrap chart (helm/goldengate-platform) ---"
+
+  if helm lint "$PLATFORM_CHART_PATH" \
+      --values "$PLATFORM_VALUES" \
+      --set serviceAccounts.oracle.roleArn="$TEST_ORACLE_ROLE_ARN" \
+      --set serviceAccounts.postgresql.roleArn="$TEST_POSTGRESQL_ROLE_ARN" \
+      >"${WORKDIR}/platform-lint.log" 2>&1; then
+    pass "helm lint (platform chart)"
+  else
+    fail "helm lint (platform chart)"
+    cat "${WORKDIR}/platform-lint.log"
+  fi
+
+  if helm template goldengate-dev-platform "$PLATFORM_CHART_PATH" \
+      --values "$PLATFORM_VALUES" \
+      --set serviceAccounts.oracle.roleArn="$TEST_ORACLE_ROLE_ARN" \
+      --set serviceAccounts.postgresql.roleArn="$TEST_POSTGRESQL_ROLE_ARN" \
+      > "$PLATFORM_RENDERED" 2>"${WORKDIR}/platform-template.log"; then
+    pass "helm template (platform chart)"
+  else
+    fail "helm template (platform chart)"
+    cat "${WORKDIR}/platform-template.log"
+  fi
+
+  if [ -s "$PLATFORM_RENDERED" ]; then
+    NAMESPACE_COUNT="$(grep -c '^kind: Namespace$' "$PLATFORM_RENDERED" || true)"
+    if [ "$NAMESPACE_COUNT" -eq 2 ] \
+        && grep -q '^  name: goldengate-dev$' "$PLATFORM_RENDERED" \
+        && grep -q '^  name: goldengate-monitoring-dev$' "$PLATFORM_RENDERED"; then
+      pass "platform chart renders exactly 2 Namespace documents (goldengate-dev, goldengate-monitoring-dev)"
+    else
+      fail "platform chart Namespace count/names: expected 2 (goldengate-dev, goldengate-monitoring-dev), found ${NAMESPACE_COUNT}"
+    fi
+
+    SERVICEACCOUNT_COUNT="$(grep -c '^kind: ServiceAccount$' "$PLATFORM_RENDERED" || true)"
+    if [ "$SERVICEACCOUNT_COUNT" -eq 2 ] \
+        && grep -q '^  name: gg-oracle-sa$' "$PLATFORM_RENDERED" \
+        && grep -q '^  name: gg-postgresql-sa$' "$PLATFORM_RENDERED"; then
+      pass "platform chart renders exactly 2 ServiceAccount documents (gg-oracle-sa, gg-postgresql-sa)"
+    else
+      fail "platform chart ServiceAccount count/names: expected 2 (gg-oracle-sa, gg-postgresql-sa), found ${SERVICEACCOUNT_COUNT}"
+    fi
+
+    if grep -Fq -- "${TEST_ORACLE_ROLE_ARN}" "$PLATFORM_RENDERED" && grep -Fq -- "${TEST_POSTGRESQL_ROLE_ARN}" "$PLATFORM_RENDERED"; then
+      pass "platform chart annotates both ServiceAccounts with eks.amazonaws.com/role-arn"
+    else
+      fail "platform chart is missing one or both expected IRSA role-arn annotations"
+    fi
+
+    FORBIDDEN_KIND_FOUND="false"
+    for forbidden_kind in StatefulSet Deployment DaemonSet Service Ingress PersistentVolumeClaim SecretProviderClass; do
+      if grep -qE "^kind: ${forbidden_kind}\$" "$PLATFORM_RENDERED"; then
+        fail "platform chart rendered a forbidden kind: ${forbidden_kind}"
+        FORBIDDEN_KIND_FOUND="true"
+      fi
+    done
+    if [ "$FORBIDDEN_KIND_FOUND" = "false" ]; then
+      pass "platform chart renders no StatefulSet/Deployment/DaemonSet/Service/Ingress/PersistentVolumeClaim/SecretProviderClass"
+    fi
+
+    if grep -Fq -- "goldengate.adcb/deployment-id" "$PLATFORM_RENDERED"; then
+      fail "platform chart's shared namespaces/ServiceAccounts carry a per-runtime ownership label (goldengate.adcb/deployment-id)"
+    else
+      pass "no per-runtime ownership label on shared namespaces/ServiceAccounts"
+    fi
+
+    if [ "$PYTHON_AVAILABLE" = "true" ]; then
+      if python3 -c "
+import yaml, sys
+
+class DuplicateKeyError(Exception):
+    pass
+
+class StrictSafeLoader(yaml.SafeLoader):
+    pass
+
+def _no_duplicates_constructor(loader, node, deep=False):
+    mapping = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise DuplicateKeyError(f'duplicate key: {key!r}')
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+StrictSafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _no_duplicates_constructor
+)
+
+with open('${PLATFORM_RENDERED}') as f:
+    docs = list(yaml.load_all(f, Loader=StrictSafeLoader))
+print(f'{len(docs)} documents parsed with no duplicate keys')
+" >"${WORKDIR}/platform-dupkey.log" 2>&1; then
+        pass "platform chart rendered manifest has no duplicate YAML keys"
+      else
+        fail "platform chart rendered manifest has a duplicate YAML key, or failed to parse"
+        cat "${WORKDIR}/platform-dupkey.log"
+      fi
+    else
+      skip "platform chart duplicate-key check -- python3/PyYAML not available"
+    fi
+  else
+    fail "platform chart rendered manifest is empty -- cannot run resource-inventory assertions"
+  fi
+
+  echo "--- Platform chart fails closed when roleArn is empty ---"
+
+  set +e
+  MISSING_ORACLE_ARN_OUTPUT="$(helm template goldengate-dev-platform "$PLATFORM_CHART_PATH" \
+      --values "$PLATFORM_VALUES" \
+      --set serviceAccounts.postgresql.roleArn="$TEST_POSTGRESQL_ROLE_ARN" 2>&1)"
+  MISSING_ORACLE_ARN_STATUS=$?
+  set -e
+
+  if [ "$MISSING_ORACLE_ARN_STATUS" -ne 0 ] && echo "$MISSING_ORACLE_ARN_OUTPUT" | grep -qF -- "serviceAccounts.oracle.roleArn is required"; then
+    pass "platform chart fails to render when serviceAccounts.oracle.roleArn is empty"
+  else
+    fail "platform chart did not fail as expected when serviceAccounts.oracle.roleArn is empty (exit=${MISSING_ORACLE_ARN_STATUS})"
+    echo "$MISSING_ORACLE_ARN_OUTPUT"
+  fi
+
+  set +e
+  MISSING_POSTGRESQL_ARN_OUTPUT="$(helm template goldengate-dev-platform "$PLATFORM_CHART_PATH" \
+      --values "$PLATFORM_VALUES" \
+      --set serviceAccounts.oracle.roleArn="$TEST_ORACLE_ROLE_ARN" 2>&1)"
+  MISSING_POSTGRESQL_ARN_STATUS=$?
+  set -e
+
+  if [ "$MISSING_POSTGRESQL_ARN_STATUS" -ne 0 ] && echo "$MISSING_POSTGRESQL_ARN_OUTPUT" | grep -qF -- "serviceAccounts.postgresql.roleArn is required"; then
+    pass "platform chart fails to render when serviceAccounts.postgresql.roleArn is empty"
+  else
+    fail "platform chart did not fail as expected when serviceAccounts.postgresql.roleArn is empty (exit=${MISSING_POSTGRESQL_ARN_STATUS})"
+    echo "$MISSING_POSTGRESQL_ARN_OUTPUT"
+  fi
+
+  echo "--- Runtime chart never creates the shared namespace or shared ServiceAccounts ---"
+
+  if [ -s "$ORACLE_RENDERED" ]; then
+    if grep -qE '^kind: Namespace$' "$ORACLE_RENDERED"; then
+      fail "runtime chart (Oracle candidate, singleRuntime) rendered a Namespace -- it must never own the shared namespace"
+    else
+      pass "runtime chart (Oracle candidate, singleRuntime) renders no Namespace"
+    fi
+
+    if grep -qE '^kind: ServiceAccount$' "$ORACLE_RENDERED"; then
+      fail "runtime chart (Oracle candidate, serviceAccount.create=false) rendered a ServiceAccount -- the shared identity must not be owned by this release"
+    else
+      pass "runtime chart (Oracle candidate, serviceAccount.create=false) renders no ServiceAccount"
+    fi
+  else
+    skip "runtime chart Namespace/ServiceAccount absence checks (Oracle) -- no rendered manifest available"
+  fi
+
+  if [ -s "$POSTGRESQL_RENDERED" ]; then
+    if grep -qE '^kind: Namespace$' "$POSTGRESQL_RENDERED"; then
+      fail "runtime chart (PostgreSQL candidate, singleRuntime) rendered a Namespace -- it must never own the shared namespace"
+    else
+      pass "runtime chart (PostgreSQL candidate, singleRuntime) renders no Namespace"
+    fi
+
+    if grep -qE '^kind: ServiceAccount$' "$POSTGRESQL_RENDERED"; then
+      fail "runtime chart (PostgreSQL candidate, serviceAccount.create=false) rendered a ServiceAccount -- the shared identity must not be owned by this release"
+    else
+      pass "runtime chart (PostgreSQL candidate, serviceAccount.create=false) renders no ServiceAccount"
+    fi
+  else
+    skip "runtime chart Namespace/ServiceAccount absence checks (PostgreSQL) -- no rendered manifest available"
+  fi
+else
+  skip "helm lint (platform chart) -- helm not installed"
+  skip "helm template (platform chart) -- helm not installed"
+  skip "platform chart resource-inventory assertions -- helm not installed"
+  skip "platform chart fail-closed roleArn assertions -- helm not installed"
+  skip "runtime chart Namespace/ServiceAccount absence checks -- helm not installed"
+fi
+
+echo ""
 echo "=================================================="
 echo "Summary: ${PASS_COUNT} passed, ${FAIL_COUNT} failed, ${SKIP_COUNT} skipped"
 echo "=================================================="

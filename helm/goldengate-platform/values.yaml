@@ -1,0 +1,37 @@
+# Shared GoldenGate platform bootstrap -- library defaults only. Everything
+# is inert (create: false / empty) by default; an environment values file
+# (e.g. platform/dev/goldengate-platform/values.yaml) opts in explicitly.
+#
+# This chart is the SINGLE designated owner of the shared namespaces and the
+# shared engine-level runtime ServiceAccounts. It must never be confused with
+# an individual GoldenGate runtime release (helm/goldengate,
+# deploymentModel=singleRuntime) -- those reference these ServiceAccounts by
+# name only (serviceAccount.create=false) and must never create or own them.
+
+environment: ""
+
+namespaces:
+  runtime:
+    create: false
+    name: ""
+  monitoring:
+    create: false
+    name: ""
+
+# Shared, engine-level IRSA identities. One ServiceAccount per GoldenGate
+# engine (not per runtime release, not per deployment) -- gg-oracle-payments-01
+# and any future additional Oracle single-runtime release would all use the
+# same serviceAccounts.oracle identity.
+serviceAccounts:
+  oracle:
+    create: false
+    name: ""
+    # Required (chart fails to render otherwise) whenever create=true --
+    # IRSA needs the role ARN to annotate the ServiceAccount with. Never
+    # hard-code an account-specific role ARN here; the environment values
+    # file / deploying workflow supplies it.
+    roleArn: ""
+  postgresql:
+    create: false
+    name: ""
+    roleArn: ""

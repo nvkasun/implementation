@@ -1,0 +1,14 @@
+{{- if .Values.namespaces.monitoring.create }}
+{{- if not .Values.namespaces.monitoring.name }}
+{{- fail "namespaces.monitoring.name is required when namespaces.monitoring.create=true." }}
+{{- end }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.namespaces.monitoring.name }}
+  labels:
+    {{- include "goldengate-platform.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+    argocd.argoproj.io/sync-options: PruneLast=true
+{{- end }}

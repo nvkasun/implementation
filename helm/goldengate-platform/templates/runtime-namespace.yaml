@@ -1,0 +1,14 @@
+{{- if .Values.namespaces.runtime.create }}
+{{- if not .Values.namespaces.runtime.name }}
+{{- fail "namespaces.runtime.name is required when namespaces.runtime.create=true." }}
+{{- end }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.namespaces.runtime.name }}
+  labels:
+    {{- include "goldengate-platform.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+    argocd.argoproj.io/sync-options: PruneLast=true
+{{- end }}

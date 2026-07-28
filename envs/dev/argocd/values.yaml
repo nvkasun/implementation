@@ -95,6 +95,10 @@ ecrTokenSync:
       helmOciRepository: helm/goldengate-monitor
       argocdRepositorySecretName: argocd-ecr-goldengate-monitor-oci
 
+    - name: goldengate-platform
+      helmOciRepository: helm/goldengate-platform
+      argocdRepositorySecretName: argocd-ecr-goldengate-platform-oci
+
   image:
     repository: 229410149234.dkr.ecr.eu-west-1.amazonaws.com/aws-cloud-factory-infra-aws-kubectl
     tag: "1.33.13"

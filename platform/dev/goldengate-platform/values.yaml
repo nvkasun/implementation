@@ -1,0 +1,28 @@
+# Shared GoldenGate platform bootstrap -- dev environment values.
+#
+# Deliberately NOT under envs/dev/<folder>: the GoldenGate runtime workflow
+# scans envs/dev/* folders as runtime deployment candidates, and this is not
+# a runtime -- it is the single owner of the shared namespaces and the
+# shared engine-level runtime ServiceAccounts (gg-oracle-sa, gg-postgresql-sa)
+# that the runtime candidates in envs/dev/gg-*-payments-01 reference by name
+# only. roleArn values below are intentionally empty; the workflow injects
+# or resolves the Terraform-created IRSA role ARNs at deploy time.
+environment: dev
+
+namespaces:
+  runtime:
+    create: true
+    name: goldengate-dev
+  monitoring:
+    create: true
+    name: goldengate-monitoring-dev
+
+serviceAccounts:
+  oracle:
+    create: true
+    name: gg-oracle-sa
+    roleArn: ""
+  postgresql:
+    create: true
+    name: gg-postgresql-sa
+    roleArn: ""

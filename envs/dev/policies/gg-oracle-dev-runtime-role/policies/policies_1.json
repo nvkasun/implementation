@@ -1,0 +1,36 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowReadGoldenGateOracleRuntimeSecrets",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:DescribeSecret"
+      ],
+      "Resource": [
+        "arn:aws:secretsmanager:eu-west-1:668311715351:secret:dev/goldengate/source/admin-*",
+        "arn:aws:secretsmanager:eu-west-1:668311715351:secret:dev/goldengate/tls-certificate-*"
+      ]
+    },
+    {
+      "Sid": "AllowDecryptGoldenGateOracleRuntimeSecretsKms",
+      "Effect": "Allow",
+      "Action": "kms:Decrypt",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "secretsmanager.eu-west-1.amazonaws.com",
+          "kms:CallerAccount": "668311715351",
+          "kms:RequestAlias": "alias/aws/secretsmanager"
+        },
+        "StringLike": {
+          "kms:EncryptionContext:SecretARN": [
+            "arn:aws:secretsmanager:eu-west-1:668311715351:secret:dev/goldengate/source/admin-*",
+            "arn:aws:secretsmanager:eu-west-1:668311715351:secret:dev/goldengate/tls-certificate-*"
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,726 @@
+name: Goldengate platform deployment
+
+run-name: "Cloud Factory - GoldenGate platform bootstrap build and deploy | ${{ github.event_name == 'workflow_dispatch' && format('manual dispatch (deploy={0})', inputs.deploy) || format('auto: platform changes on {0}', github.sha) }} | ran by ${{ github.actor }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Deployment environment"
+        required: true
+        type: choice
+        default: dev
+        options:
+          - dev
+
+      deploy:
+        description: "Deploy to EKS after publishing the Helm chart"
+        required: true
+        type: boolean
+        default: true
+
+  push:
+    branches:
+      - main
+    paths:
+      - 'helm/goldengate-platform/**'
+      - 'platform/dev/goldengate-platform/**'
+      - '.github/workflows/goldengate-platform.yaml'
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+
+  # ECR / runner account where the platform Helm OCI chart is pushed.
+  ECR_ACCOUNT_ID: "229410149234"
+  ECR_REGISTRY: 229410149234.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com
+
+  # Role used by GitHub Actions / CodeBuild runner.
+  ROLE_ARN: ${{ vars.GOLDENGATE_AWS_ROLE_ARN }}
+
+  # Target EKS cluster details.
+  EKS_ACCOUNT_ID: ${{ vars.ACCOUNT_ID_DEV }}
+  EKS_CLUSTER_NAME: ${{ vars.AWS_CLUSTER_NAME }}
+  EKS_CLUSTER_ARN: ${{ vars.AWS_CLUSTER_ARN }}
+  EKS_DEPLOY_ROLE_ARN: ${{ vars.EKS_DEPLOY_ROLE_ARN }}
+
+  # IRSA role the in-cluster argocd-ecr-token-sync CronJob assumes to pull
+  # the goldengate-platform Helm OCI chart. envs/dev/argocd/values.yaml
+  # ecrTokenSync.repositories carries a "goldengate-platform" entry
+  # (argocdRepositorySecretName: argocd-ecr-goldengate-platform-oci) so the
+  # existing, generic ecr-token-sync-cronjob.yaml template (helm/argocd)
+  # provisions and refreshes that Secret the same way it already does for
+  # the goldengate and goldengate-monitor repositories -- no chart template
+  # changes were required for that. This role, its trust policy, and its
+  # ServiceAccount are unchanged by this workflow -- see
+  # envs/dev/policies/argocd-ecr-oci-read-dev/.
+  ARGOCD_ECR_READ_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateArgocdECRRead-dev
+
+  HELM_OCI_NAMESPACE: helm
+  CHART_NAME: goldengate-platform
+  HELM_CHART_PATH: helm/goldengate-platform
+  ENVIRONMENT: dev
+  VALUES_FILE: platform/dev/goldengate-platform/values.yaml
+
+  RELEASE_NAME: goldengate-dev-platform
+  ARGOCD_NAMESPACE: argocd
+  ARGOCD_APP_NAME: goldengate-dev-platform
+  ARGOCD_PLATFORM_SECRET_NAME: argocd-ecr-goldengate-platform-oci
+
+  # Shared, engine-level runtime identities this chart is the single owner
+  # of. Never used by an individual GoldenGate runtime release.
+  RUNTIME_NAMESPACE: goldengate-dev
+  MONITORING_NAMESPACE: goldengate-monitoring-dev
+  ORACLE_SA_NAME: gg-oracle-sa
+  POSTGRESQL_SA_NAME: gg-postgresql-sa
+
+  # Deterministic IRSA role ARNs -- this repository has no Terraform
+  # outputs.tf anywhere (every other role ARN referenced by these workflows,
+  # e.g. ARGOCD_ECR_READ_ROLE_ARN above, is also a literal predicted ARN),
+  # so envs/dev/iam.tf's gg_oracle_dev_runtime_role / gg_postgresql_dev_runtime_role
+  # module names below are predicted the same way: arn:aws:iam::<account>:role/<name>.
+  ORACLE_RUNTIME_ROLE_ARN: arn:aws:iam::668311715351:role/gg-oracle-dev-runtime-role
+  POSTGRESQL_RUNTIME_ROLE_ARN: arn:aws:iam::668311715351:role/gg-postgresql-dev-runtime-role
+
+concurrency:
+  group: goldengate-platform-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Single job: this chart has no container image (Namespaces and
+  # ServiceAccounts only), so there is no separate image-build job like
+  # goldengate-monitor.yaml's ensure_monitor_image. Runs on the private
+  # CodeBuild runner, same as every other Helm/Argo CD deployment job in
+  # this repository.
+  # ---------------------------------------------------------------------
+  package_publish_and_deploy:
+    name: Build, publish, and deploy the GoldenGate platform bootstrap via Argo CD
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    environment: dev
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.ROLE_ARN }}
+
+      - name: Install Helm and kubectl if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! command -v helm >/dev/null 2>&1; then
+            HELM_VERSION="v3.15.4"
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64) HELM_ARCH="amd64" ;;
+              aarch64|arm64) HELM_ARCH="arm64" ;;
+              *) echo "Unsupported architecture for Helm: $ARCH"; exit 1 ;;
+            esac
+            curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-${HELM_ARCH}.tar.gz" -o /tmp/helm.tar.gz
+            tar -zxvf /tmp/helm.tar.gz -C /tmp
+            sudo mv "/tmp/linux-${HELM_ARCH}/helm" /usr/local/bin/helm
+            sudo chmod +x /usr/local/bin/helm
+          fi
+          helm version --short
+
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KUBECTL_VERSION="v1.35.0"
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64) KUBECTL_ARCH="amd64" ;;
+              aarch64|arm64) KUBECTL_ARCH="arm64" ;;
+              *) echo "Unsupported architecture for kubectl: $ARCH"; exit 1 ;;
+            esac
+            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+            sudo chmod +x /usr/local/bin/kubectl
+          fi
+          kubectl version --client=true
+
+      - name: Verify runner tools and AWS identity
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws sts get-caller-identity
+          aws --version
+          helm version --short
+          kubectl version --client=true
+
+      - name: Prepare platform deployment variables
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CHART_VERSION="0.1.${{ github.run_number }}"
+          TEMP_CHART_PATH="work/charts/goldengate-platform"
+          HELM_ECR_REPOSITORY="${HELM_OCI_NAMESPACE}/${CHART_NAME}"
+          HELM_PUSH_URL="oci://${ECR_REGISTRY}/${HELM_OCI_NAMESPACE}"
+          HELM_CHART_REF="oci://${ECR_REGISTRY}/${HELM_ECR_REPOSITORY}"
+
+          echo "CHART_VERSION=${CHART_VERSION}" >> "$GITHUB_ENV"
+          echo "TEMP_CHART_PATH=${TEMP_CHART_PATH}" >> "$GITHUB_ENV"
+          echo "HELM_ECR_REPOSITORY=${HELM_ECR_REPOSITORY}" >> "$GITHUB_ENV"
+          echo "HELM_PUSH_URL=${HELM_PUSH_URL}" >> "$GITHUB_ENV"
+          echo "HELM_CHART_REF=${HELM_CHART_REF}" >> "$GITHUB_ENV"
+
+          echo "Chart version: ${CHART_VERSION}"
+          echo "Helm chart ref: ${HELM_CHART_REF}"
+
+      - name: Validate required files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for f in "$HELM_CHART_PATH/Chart.yaml" "$HELM_CHART_PATH/values.yaml" "$VALUES_FILE"; do
+            if [ ! -f "$f" ]; then
+              echo "Missing required file: $f"
+              exit 1
+            fi
+          done
+          echo "Required files are present."
+
+      - name: Login Helm to Amazon ECR
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | helm registry login --username AWS --password-stdin "$ECR_REGISTRY"
+
+      - name: Ensure Helm ECR repository exists
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if aws ecr describe-repositories \
+            --region "$AWS_REGION" \
+            --repository-names "$HELM_ECR_REPOSITORY" >/dev/null 2>&1; then
+            echo "ECR repository already exists: $HELM_ECR_REPOSITORY"
+          else
+            echo "Creating ECR repository: $HELM_ECR_REPOSITORY"
+
+            aws ecr create-repository \
+              --region "$AWS_REGION" \
+              --repository-name "$HELM_ECR_REPOSITORY" \
+              --tags Key=ApplicationName,Value=CloudFactory Key=DataClassification,Value=General Key=BusinessCriticality,Value=Low Key=BusinessUnit,Value=TechnologyPlatform Key=CostCenter,Value=219 \
+              --image-scanning-configuration scanOnPush=true \
+              --image-tag-mutability MUTABLE >/dev/null
+
+            echo "Created ECR repository: $HELM_ECR_REPOSITORY"
+          fi
+
+      - name: Ensure Helm ECR repository policy allows Argo CD pull
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ARGOCD_ECR_STATEMENT_SID="AllowArgocdEksRolePullGoldengatePlatformHelmChart"
+
+          EXISTING_POLICY="$(aws ecr get-repository-policy \
+            --region "$AWS_REGION" \
+            --repository-name "$HELM_ECR_REPOSITORY" \
+            --query policyText \
+            --output text 2>/tmp/platform-helm-ecr-get-policy-error.txt)" || {
+              if grep -q "RepositoryPolicyNotFoundException" /tmp/platform-helm-ecr-get-policy-error.txt; then
+                echo "No existing repository policy found. Starting from an empty policy."
+                EXISTING_POLICY='{"Version":"2012-10-17","Statement":[]}'
+              else
+                echo "Failed to read the existing ECR repository policy:"
+                cat /tmp/platform-helm-ecr-get-policy-error.txt
+                exit 1
+              fi
+            }
+
+          echo "Merging in Sid ${ARGOCD_ECR_STATEMENT_SID} (existing statements are preserved)..."
+
+          echo "$EXISTING_POLICY" | jq \
+            --arg sid "$ARGOCD_ECR_STATEMENT_SID" \
+            --arg roleArn "$ARGOCD_ECR_READ_ROLE_ARN" \
+            '
+            .Statement = ([.Statement[] | select(.Sid != $sid)]
+              + [{
+                  Sid: $sid,
+                  Effect: "Allow",
+                  Principal: { AWS: $roleArn },
+                  Action: [
+                    "ecr:BatchCheckLayerAvailability",
+                    "ecr:BatchGetImage",
+                    "ecr:GetDownloadUrlForLayer",
+                    "ecr:DescribeImages",
+                    "ecr:DescribeRepositories"
+                  ]
+                }])
+            ' > /tmp/platform-helm-ecr-repository-policy.json
+
+          aws ecr set-repository-policy \
+            --region "$AWS_REGION" \
+            --repository-name "$HELM_ECR_REPOSITORY" \
+            --policy-text file:///tmp/platform-helm-ecr-repository-policy.json >/dev/null
+
+          echo "ECR repository policy on ${HELM_ECR_REPOSITORY} now allows pull from ${ARGOCD_ECR_READ_ROLE_ARN}."
+
+      - name: Helm lint platform chart
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          helm lint "$HELM_CHART_PATH" \
+            --values "$VALUES_FILE" \
+            --set-string serviceAccounts.oracle.roleArn="$ORACLE_RUNTIME_ROLE_ARN" \
+            --set-string serviceAccounts.postgresql.roleArn="$POSTGRESQL_RUNTIME_ROLE_ARN"
+
+      - name: Render platform manifest for validation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p rendered
+
+          helm template "$RELEASE_NAME" "$HELM_CHART_PATH" \
+            --values "$VALUES_FILE" \
+            --set-string serviceAccounts.oracle.roleArn="$ORACLE_RUNTIME_ROLE_ARN" \
+            --set-string serviceAccounts.postgresql.roleArn="$POSTGRESQL_RUNTIME_ROLE_ARN" \
+            > "rendered/${RELEASE_NAME}.yaml"
+
+          echo "Rendered manifest: rendered/${RELEASE_NAME}.yaml"
+
+      - name: Validate rendered platform manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RENDERED="rendered/${RELEASE_NAME}.yaml"
+
+          # Reusable, dependency-free (no yq/jq/PyYAML) exact-document
+          # selector, same pattern as goldengate-monitor.yaml: splits the
+          # multi-document rendered manifest on "---" and returns the one
+          # document whose kind and metadata.name match exactly.
+          select_document() {
+            local rendered_file="$1"
+            local expected_kind="$2"
+            local expected_name="$3"
+            local split_dir
+            split_dir="$(mktemp -d)"
+            awk -v outdir="$split_dir" '
+              BEGIN { docnum = 0; fname = outdir "/doc-0.yaml" }
+              /^---$/ { docnum++; fname = outdir "/doc-" docnum ".yaml"; next }
+              { print > fname }
+            ' "$rendered_file"
+
+            local found=""
+            local doc
+            for doc in "$split_dir"/doc-*.yaml; do
+              if grep -q "^kind: ${expected_kind}\$" "$doc" && grep -q "^  name: ${expected_name}\$" "$doc"; then
+                found="$(cat "$doc")"
+                break
+              fi
+            done
+            rm -rf "$split_dir"
+            printf '%s' "$found"
+          }
+
+          normalize_value() {
+            local value="$1"
+            value="${value//$'\r'/}"
+            read -r value <<< "$value"
+            if [[ "$value" == \"*\" && "$value" == *\" ]]; then
+              value="${value#\"}"
+              value="${value%\"}"
+            elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
+              value="${value#\'}"
+              value="${value%\'}"
+            fi
+            printf '%s' "$value"
+          }
+
+          echo "Validating exactly two Namespace documents..."
+          NAMESPACE_COUNT="$(grep -c '^kind: Namespace$' "$RENDERED")"
+          if [ "$NAMESPACE_COUNT" -ne 2 ]; then
+            echo "FAIL: expected exactly 2 rendered Namespace documents, found ${NAMESPACE_COUNT}."
+            exit 1
+          fi
+
+          RUNTIME_NS_BLOCK="$(select_document "$RENDERED" "Namespace" "${RUNTIME_NAMESPACE}")"
+          if [ -z "$RUNTIME_NS_BLOCK" ]; then
+            echo "FAIL: rendered Namespace ${RUNTIME_NAMESPACE} was not found."
+            exit 1
+          fi
+
+          MONITORING_NS_BLOCK="$(select_document "$RENDERED" "Namespace" "${MONITORING_NAMESPACE}")"
+          if [ -z "$MONITORING_NS_BLOCK" ]; then
+            echo "FAIL: rendered Namespace ${MONITORING_NAMESPACE} was not found."
+            exit 1
+          fi
+          echo "OK: exactly 2 Namespace documents, ${RUNTIME_NAMESPACE} and ${MONITORING_NAMESPACE}."
+
+          echo "Validating neither shared namespace carries a per-runtime ownership label..."
+          if grep -Fq -- "goldengate.adcb/deployment-id" <<< "$RUNTIME_NS_BLOCK"; then
+            echo "FAIL: Namespace ${RUNTIME_NAMESPACE} carries a per-runtime ownership label (goldengate.adcb/deployment-id)."
+            exit 1
+          fi
+          if grep -Fq -- "goldengate.adcb/deployment-id" <<< "$MONITORING_NS_BLOCK"; then
+            echo "FAIL: Namespace ${MONITORING_NAMESPACE} carries a per-runtime ownership label (goldengate.adcb/deployment-id)."
+            exit 1
+          fi
+          echo "OK: no per-runtime ownership label on either shared namespace."
+
+          echo "Validating exactly two ServiceAccount documents..."
+          SERVICEACCOUNT_COUNT="$(grep -c '^kind: ServiceAccount$' "$RENDERED")"
+          if [ "$SERVICEACCOUNT_COUNT" -ne 2 ]; then
+            echo "FAIL: expected exactly 2 rendered ServiceAccount documents, found ${SERVICEACCOUNT_COUNT}."
+            exit 1
+          fi
+
+          validate_runtime_sa() {
+            local sa_name="$1"
+            local expected_role_arn="$2"
+            local sa_block
+            sa_block="$(select_document "$RENDERED" "ServiceAccount" "${sa_name}")"
+            if [ -z "$sa_block" ]; then
+              echo "FAIL: rendered ServiceAccount ${sa_name} was not found."
+              exit 1
+            fi
+            if ! grep -Fq -- "namespace: \"${RUNTIME_NAMESPACE}\"" <<< "$sa_block"; then
+              echo "FAIL: ServiceAccount ${sa_name} is not in namespace ${RUNTIME_NAMESPACE}."
+              exit 1
+            fi
+
+            local role_arn_line
+            role_arn_line="$(grep -m1 -- "eks.amazonaws.com/role-arn:" <<< "$sa_block" || true)"
+            if [ -z "$role_arn_line" ]; then
+              echo "FAIL: eks.amazonaws.com/role-arn annotation is missing from ServiceAccount ${sa_name}."
+              exit 1
+            fi
+            local role_arn_actual
+            role_arn_actual="$(normalize_value "${role_arn_line#*role-arn:}")"
+            if [ "$role_arn_actual" != "$expected_role_arn" ]; then
+              echo "FAIL: ServiceAccount ${sa_name} IRSA role ARN mismatch."
+              echo "Expected: ${expected_role_arn}"
+              echo "Actual:   ${role_arn_actual}"
+              exit 1
+            fi
+            echo "OK: ServiceAccount ${sa_name} is in ${RUNTIME_NAMESPACE} with the expected IRSA role ARN."
+          }
+
+          validate_runtime_sa "$ORACLE_SA_NAME" "$ORACLE_RUNTIME_ROLE_ARN"
+          validate_runtime_sa "$POSTGRESQL_SA_NAME" "$POSTGRESQL_RUNTIME_ROLE_ARN"
+
+          echo "Validating no runtime/workload resources are rendered by this chart..."
+          for forbidden_kind in StatefulSet Deployment DaemonSet Service Ingress PersistentVolumeClaim SecretProviderClass; do
+            if grep -qE "^kind: ${forbidden_kind}\$" "$RENDERED"; then
+              echo "FAIL: a ${forbidden_kind} was rendered by the platform chart -- it must only create shared namespaces and shared runtime ServiceAccounts."
+              exit 1
+            fi
+          done
+          echo "OK: no StatefulSet/Deployment/DaemonSet/Service/Ingress/PersistentVolumeClaim/SecretProviderClass rendered."
+
+          echo "OK: rendered platform manifest passed all checks."
+
+      - name: Package platform Helm chart
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p packaged
+          rm -rf "$TEMP_CHART_PATH"
+          mkdir -p "$TEMP_CHART_PATH"
+
+          cp -a "$HELM_CHART_PATH/." "$TEMP_CHART_PATH/"
+          cp "$VALUES_FILE" "$TEMP_CHART_PATH/values-deployment.yaml"
+
+          helm package "$TEMP_CHART_PATH" \
+            --version "$CHART_VERSION" \
+            --app-version "$CHART_VERSION" \
+            --destination packaged
+
+          ls -lrt packaged
+
+      - name: Push platform Helm chart to ECR as OCI artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          helm push "packaged/${CHART_NAME}-${CHART_VERSION}.tgz" "$HELM_PUSH_URL"
+
+          echo "Published Helm chart:"
+          echo "${HELM_CHART_REF}:${CHART_VERSION}"
+
+      - name: Verify platform Helm chart can be pulled from ECR
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p pulled
+
+          helm pull "$HELM_CHART_REF" \
+            --version "$CHART_VERSION" \
+            --destination pulled
+
+          ls -lrt pulled
+
+      - name: Connect to EKS cluster
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws sts get-caller-identity
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}" \
+            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
+            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
+
+          kubectl config current-context
+          kubectl version --client=true
+
+      - name: Ensure Argo CD Application CRD exists
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl get crd applications.argoproj.io >/dev/null || {
+            echo "CRD applications.argoproj.io not found."
+            echo "Argo CD must be installed on this cluster before the platform bootstrap can be deployed through it."
+            echo "Run the argocd-eks-deployment.yaml workflow first."
+            exit 1
+          }
+
+          echo "Argo CD Application CRD is present."
+
+      - name: Confirm the platform Argo CD repository Secret exists
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Same required-order check as goldengate-monitor.yaml: this
+          # workflow must fail clearly here, not inject a credential, if
+          # argocd-eks-deployment.yaml has not yet been re-run since the
+          # goldengate-platform entry was added to
+          # envs/dev/argocd/values.yaml ecrTokenSync.repositories.
+          if ! kubectl get secret "$ARGOCD_PLATFORM_SECRET_NAME" -n "$ARGOCD_NAMESPACE" >/dev/null 2>&1; then
+            echo "PREREQUISITE NOT MET: Secret ${ARGOCD_PLATFORM_SECRET_NAME} does not exist in namespace ${ARGOCD_NAMESPACE}."
+            echo ""
+            echo "Required order before running this workflow:"
+            echo "  1. Run the IAM/Secrets Terraform workflow (applies the new runtime IRSA roles/policies)."
+            echo "  2. Re-run the argocd-eks-deployment.yaml workflow (picks up the new goldengate-platform"
+            echo "     entry in envs/dev/argocd/values.yaml ecrTokenSync.repositories and provisions this Secret)."
+            echo "  3. Re-run this workflow."
+            echo ""
+            echo "Refusing to inject a short-lived credential as a workaround -- the in-cluster IRSA token sync is the only long-term credential mechanism."
+            exit 1
+          fi
+
+          ACTUAL_URL="$(kubectl get secret "$ARGOCD_PLATFORM_SECRET_NAME" -n "$ARGOCD_NAMESPACE" -o jsonpath='{.data.url}' | base64 --decode)"
+          EXPECTED_URL="oci://${ECR_REGISTRY}/${HELM_OCI_NAMESPACE}/${CHART_NAME}"
+          if [ "$ACTUAL_URL" != "$EXPECTED_URL" ]; then
+            echo "FAIL: Secret ${ARGOCD_PLATFORM_SECRET_NAME} url mismatch. Expected ${EXPECTED_URL}, got ${ACTUAL_URL}."
+            exit 1
+          fi
+
+          echo "OK: ${ARGOCD_PLATFORM_SECRET_NAME} exists and points to ${EXPECTED_URL}."
+
+      - name: Create or update Argo CD Application
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Applying Argo CD Application: ${ARGOCD_APP_NAME}"
+
+          # This Application is the single designated owner of the shared
+          # namespaces, so (unlike every per-runtime goldengate-eks-app.yaml
+          # Application) it is allowed CreateNamespace=true and
+          # managedNamespaceMetadata. The chart's own runtime-namespace.yaml
+          # / monitoring-namespace.yaml templates already render both
+          # Namespace objects directly with the correct labels; Argo CD's
+          # managedNamespaceMetadata only ever applies to the single
+          # destination.namespace below (goldengate-dev) and is included
+          # here purely to match the established goldengate-monitor.yaml
+          # pattern, not because it is required for the second
+          # (cluster-scoped) Namespace object.
+          kubectl apply -f - <<EOF
+          apiVersion: argoproj.io/v1alpha1
+          kind: Application
+          metadata:
+            name: ${ARGOCD_APP_NAME}
+            namespace: ${ARGOCD_NAMESPACE}
+            finalizers:
+              - resources-finalizer.argocd.argoproj.io
+            labels:
+              app.kubernetes.io/name: goldengate-platform
+              app.kubernetes.io/managed-by: argocd
+          spec:
+            project: default
+            source:
+              repoURL: ${HELM_CHART_REF}
+              targetRevision: ${CHART_VERSION}
+              path: .
+              helm:
+                releaseName: ${RELEASE_NAME}
+                valueFiles:
+                  - values-deployment.yaml
+                parameters:
+                  - name: serviceAccounts.oracle.roleArn
+                    value: ${ORACLE_RUNTIME_ROLE_ARN}
+                  - name: serviceAccounts.postgresql.roleArn
+                    value: ${POSTGRESQL_RUNTIME_ROLE_ARN}
+            destination:
+              server: https://kubernetes.default.svc
+              namespace: ${RUNTIME_NAMESPACE}
+            syncPolicy:
+              automated:
+                prune: true
+                selfHeal: true
+              syncOptions:
+                - CreateNamespace=true
+              managedNamespaceMetadata:
+                labels:
+                  app.kubernetes.io/name: goldengate-platform
+                  app.kubernetes.io/managed-by: argocd
+            revisionHistoryLimit: 10
+          EOF
+
+          kubectl annotate application "${ARGOCD_APP_NAME}" \
+            -n "${ARGOCD_NAMESPACE}" \
+            argocd.argoproj.io/refresh=hard \
+            --overwrite
+
+      - name: Wait for Argo CD sync and health
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TIMEOUT_SECONDS=600
+          INTERVAL_SECONDS=15
+          ELAPSED=0
+
+          while true; do
+            if kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" >/dev/null 2>&1; then
+              SYNC_STATUS="$(kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" -o jsonpath='{.status.sync.status}' 2>/dev/null || echo "Unknown")"
+              HEALTH_STATUS="$(kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" -o jsonpath='{.status.health.status}' 2>/dev/null || echo "Unknown")"
+
+              echo "[$(date -u +%H:%M:%S)] sync=${SYNC_STATUS} health=${HEALTH_STATUS} (elapsed ${ELAPSED}s / ${TIMEOUT_SECONDS}s)"
+
+              if [ "${HEALTH_STATUS}" = "Degraded" ]; then
+                echo "Argo CD Application ${ARGOCD_APP_NAME} is Degraded."
+                kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" -o wide
+                exit 1
+              fi
+
+              if [ "${SYNC_STATUS}" = "Synced" ] && [ "${HEALTH_STATUS}" = "Healthy" ]; then
+                echo "Argo CD Application ${ARGOCD_APP_NAME} is Synced and Healthy."
+                break
+              fi
+            else
+              echo "[$(date -u +%H:%M:%S)] Argo CD Application ${ARGOCD_APP_NAME} not found yet (elapsed ${ELAPSED}s / ${TIMEOUT_SECONDS}s)."
+            fi
+
+            if [ "${ELAPSED}" -ge "${TIMEOUT_SECONDS}" ]; then
+              echo "Timed out after ${TIMEOUT_SECONDS}s waiting for ${ARGOCD_APP_NAME} to become Synced and Healthy."
+              kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" -o wide || true
+              kubectl describe application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" || true
+              exit 1
+            fi
+
+            sleep "${INTERVAL_SECONDS}"
+            ELAPSED=$((ELAPSED + INTERVAL_SECONDS))
+          done
+
+      - name: Verify GoldenGate platform runtime state
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Namespaces:"
+          kubectl get namespace "$RUNTIME_NAMESPACE"
+          kubectl get namespace "$MONITORING_NAMESPACE"
+
+          echo "ServiceAccounts and IRSA annotations:"
+          kubectl get serviceaccount "$ORACLE_SA_NAME" -n "$RUNTIME_NAMESPACE"
+          ORACLE_ROLE_ANNOTATION="$(kubectl get serviceaccount "$ORACLE_SA_NAME" -n "$RUNTIME_NAMESPACE" -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}')"
+          if [ "$ORACLE_ROLE_ANNOTATION" != "$ORACLE_RUNTIME_ROLE_ARN" ]; then
+            echo "FAIL: unexpected IRSA role annotation on ServiceAccount ${ORACLE_SA_NAME}: ${ORACLE_ROLE_ANNOTATION}"
+            exit 1
+          fi
+          echo "OK: ${ORACLE_SA_NAME} IRSA role annotation matches ${ORACLE_RUNTIME_ROLE_ARN}."
+
+          kubectl get serviceaccount "$POSTGRESQL_SA_NAME" -n "$RUNTIME_NAMESPACE"
+          POSTGRESQL_ROLE_ANNOTATION="$(kubectl get serviceaccount "$POSTGRESQL_SA_NAME" -n "$RUNTIME_NAMESPACE" -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}')"
+          if [ "$POSTGRESQL_ROLE_ANNOTATION" != "$POSTGRESQL_RUNTIME_ROLE_ARN" ]; then
+            echo "FAIL: unexpected IRSA role annotation on ServiceAccount ${POSTGRESQL_SA_NAME}: ${POSTGRESQL_ROLE_ANNOTATION}"
+            exit 1
+          fi
+          echo "OK: ${POSTGRESQL_SA_NAME} IRSA role annotation matches ${POSTGRESQL_RUNTIME_ROLE_ARN}."
+
+          echo "Confirming this Application owns no workload resources (namespaces/ServiceAccounts only)..."
+          WORKLOAD_COUNT=0
+          for kind in statefulset deployment daemonset; do
+            COUNT="$(kubectl get "$kind" -n "$RUNTIME_NAMESPACE" -l app.kubernetes.io/instance="$RELEASE_NAME" --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+            WORKLOAD_COUNT=$((WORKLOAD_COUNT + COUNT))
+          done
+          if [ "$WORKLOAD_COUNT" -ne 0 ]; then
+            echo "FAIL: found ${WORKLOAD_COUNT} workload resource(s) owned by ${RELEASE_NAME} -- the platform release must only own namespaces and ServiceAccounts."
+            exit 1
+          fi
+          echo "OK: no workload resources are owned by ${RELEASE_NAME}."
+
+      - name: Upload rendered manifests and chart package
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: goldengate-platform-helm-artifacts
+          path: |
+            rendered/
+            packaged/
+            pulled/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Workflow summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## GoldenGate platform deploy summary"
+            echo ""
+            echo "- Chart version: \`${CHART_VERSION:-unknown}\`"
+            echo "- Chart ref: \`${HELM_CHART_REF:-unknown}\`"
+            echo "- Runtime namespace: \`${RUNTIME_NAMESPACE}\`"
+            echo "- Monitoring namespace: \`${MONITORING_NAMESPACE}\`"
+            echo "- Argo CD Application: \`${ARGOCD_APP_NAME}\` (namespace: \`${ARGOCD_NAMESPACE}\`)"
+            echo "- Deploy enabled: \`${{ github.event_name != 'workflow_dispatch' || inputs.deploy }}\`"
+            echo ""
+            echo "### Ownership"
+            echo ""
+            echo "This is the single designated owner of Namespace/${RUNTIME_NAMESPACE},"
+            echo "Namespace/${MONITORING_NAMESPACE}, ServiceAccount/${ORACLE_SA_NAME}, and"
+            echo "ServiceAccount/${POSTGRESQL_SA_NAME}. Individual GoldenGate runtime"
+            echo "Applications (goldengate-eks-app.yaml) reference these ServiceAccounts by"
+            echo "name only (serviceAccount.create=false) and never own or delete them."
+            echo ""
+            echo "### Required deployment order"
+            echo ""
+            echo "1. IAM/Secrets Terraform workflow (creates gg-oracle-dev-runtime-role / gg-postgresql-dev-runtime-role)."
+            echo "2. argocd-eks-deployment.yaml (provisions the argocd-ecr-goldengate-platform-oci repository Secret)."
+            echo "3. This workflow."
+            echo "4. Only then may a runtime candidate (gg-oracle-payments-01, gg-postgresql-payments-01) set deployment.enabled=true."
+          } >> "$GITHUB_STEP_SUMMARY"
