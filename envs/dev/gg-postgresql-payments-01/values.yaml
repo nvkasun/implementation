@@ -10,7 +10,7 @@
 # provisioned by a later, separate platform/bootstrap step, outside this
 # Phase 1 chart/repository-model task.
 deployment:
-  enabled: false
+  enabled: true
 
 global:
   environment: dev
