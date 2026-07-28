@@ -12,25 +12,6 @@
         "arn:aws:secretsmanager:eu-west-1:668311715351:secret:dev/goldengate/target/admin-*",
         "arn:aws:secretsmanager:eu-west-1:668311715351:secret:dev/goldengate/tls-certificate-*"
       ]
-    },
-    {
-      "Sid": "AllowDecryptGoldenGatePostgresqlRuntimeSecretsKms",
-      "Effect": "Allow",
-      "Action": "kms:Decrypt",
-      "Resource": "*",
-      "Condition": {
-        "StringEquals": {
-          "kms:ViaService": "secretsmanager.eu-west-1.amazonaws.com",
-          "kms:CallerAccount": "668311715351",
-          "kms:RequestAlias": "alias/aws/secretsmanager"
-        },
-        "StringLike": {
-          "kms:EncryptionContext:SecretARN": [
-            "arn:aws:secretsmanager:eu-west-1:668311715351:secret:dev/goldengate/target/admin-*",
-            "arn:aws:secretsmanager:eu-west-1:668311715351:secret:dev/goldengate/tls-certificate-*"
-          ]
-        }
-      }
     }
   ]
 }

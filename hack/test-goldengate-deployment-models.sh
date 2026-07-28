@@ -988,6 +988,21 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
       pass "no per-runtime ownership label on shared namespaces/ServiceAccounts"
     fi
 
+    echo "--- Shared-resource deletion protection ---"
+    DELETION_PROTECTED_COUNT="$(grep -c -- 'argocd.argoproj.io/sync-options: Prune=false,Delete=false' "$PLATFORM_RENDERED" || true)"
+    if [ "$DELETION_PROTECTED_COUNT" -eq 4 ]; then
+      pass "all 4 shared objects (2 Namespaces, 2 ServiceAccounts) carry sync-options: Prune=false,Delete=false"
+    else
+      fail "expected 4 objects with sync-options: Prune=false,Delete=false, found ${DELETION_PROTECTED_COUNT}"
+    fi
+
+    PRUNELAST_ONLY_COUNT="$(grep -c -- 'argocd.argoproj.io/sync-options: PruneLast=true' "$PLATFORM_RENDERED" || true)"
+    if [ "$PRUNELAST_ONLY_COUNT" -eq 0 ]; then
+      pass "no shared object retains only sync-options: PruneLast=true"
+    else
+      fail "found ${PRUNELAST_ONLY_COUNT} shared object(s) still using only sync-options: PruneLast=true instead of Prune=false,Delete=false"
+    fi
+
     if [ "$PYTHON_AVAILABLE" = "true" ]; then
       if python3 -c "
 import yaml, sys
@@ -1096,6 +1111,174 @@ else
   skip "platform chart resource-inventory assertions -- helm not installed"
   skip "platform chart fail-closed roleArn assertions -- helm not installed"
   skip "runtime chart Namespace/ServiceAccount absence checks -- helm not installed"
+fi
+
+echo ""
+
+# ---------------------------------------------------------------------
+# Argo CD chart/workflow: three-repository ECR token-sync model
+# (helm/goldengate, helm/goldengate-monitor, helm/goldengate-platform).
+# ---------------------------------------------------------------------
+ARGOCD_CHART_PATH="helm/argocd"
+ARGOCD_VALUES="envs/dev/argocd/values.yaml"
+ARGOCD_ECR_POLICY_FILE="envs/dev/policies/argocd-ecr-oci-read-dev/policies/policies_1.json"
+
+echo "--- Argo CD ECR read IAM policy: exact platform repository ARN ---"
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  if python3 -c "
+import json, sys
+
+with open('${ARGOCD_ECR_POLICY_FILE}') as f:
+    policy = json.load(f)
+
+required_actions = {
+    'ecr:BatchCheckLayerAvailability',
+    'ecr:BatchGetImage',
+    'ecr:GetDownloadUrlForLayer',
+    'ecr:DescribeImages',
+    'ecr:DescribeRepositories',
+}
+expected_repos = {
+    'helm/goldengate': 'arn:aws:ecr:eu-west-1:229410149234:repository/helm/goldengate',
+    'helm/goldengate-monitor': 'arn:aws:ecr:eu-west-1:229410149234:repository/helm/goldengate-monitor',
+    'helm/goldengate-platform': 'arn:aws:ecr:eu-west-1:229410149234:repository/helm/goldengate-platform',
+}
+
+statements = policy.get('Statement', [])
+found_arns = set()
+for stmt in statements:
+    resource = stmt.get('Resource')
+    resources = resource if isinstance(resource, list) else [resource]
+    actions = stmt.get('Action')
+    actions = set(actions if isinstance(actions, list) else [actions])
+    for r in resources:
+        if r in expected_repos.values():
+            found_arns.add(r)
+            if not required_actions.issubset(actions):
+                missing = required_actions - actions
+                print(f'missing actions for {r}: {sorted(missing)}')
+                sys.exit(1)
+            if r == '*' or str(r).endswith('/*'):
+                print(f'wildcard resource used for {r}')
+                sys.exit(1)
+
+missing_repos = set(expected_repos.values()) - found_arns
+if missing_repos:
+    print(f'missing repository statement(s): {sorted(missing_repos)}')
+    sys.exit(1)
+
+print('all three repository ARNs present with required actions, no wildcards')
+" >"${WORKDIR}/argocd-ecr-policy-check.log" 2>&1; then
+    pass "Argo CD ECR read IAM policy grants exact ARN + required actions for all 3 repositories (goldengate, goldengate-monitor, goldengate-platform)"
+  else
+    fail "Argo CD ECR read IAM policy is missing or misconfigured for one or more of the 3 repositories"
+    cat "${WORKDIR}/argocd-ecr-policy-check.log"
+  fi
+else
+  skip "Argo CD ECR read IAM policy check -- python3 not available"
+fi
+
+echo "--- Argo CD chart (helm/argocd): 3-repository ECR token-sync rendering ---"
+ARGOCD_RENDERED="${WORKDIR}/argocd.yaml"
+
+if [ "$HELM_AVAILABLE" = "true" ]; then
+  helm dependency build "$ARGOCD_CHART_PATH" >"${WORKDIR}/argocd-dep-build.log" 2>&1 || true
+
+  if helm lint "$ARGOCD_CHART_PATH" --values "$ARGOCD_VALUES" >"${WORKDIR}/argocd-lint.log" 2>&1; then
+    pass "helm lint (argocd chart)"
+  else
+    fail "helm lint (argocd chart)"
+    cat "${WORKDIR}/argocd-lint.log"
+  fi
+
+  if helm template argocd "$ARGOCD_CHART_PATH" \
+      --namespace argocd \
+      --values "$ARGOCD_VALUES" \
+      > "$ARGOCD_RENDERED" 2>"${WORKDIR}/argocd-template.log"; then
+    pass "helm template (argocd chart)"
+  else
+    fail "helm template (argocd chart)"
+    cat "${WORKDIR}/argocd-template.log"
+  fi
+
+  if [ -s "$ARGOCD_RENDERED" ]; then
+    echo "Checking all 3 Helm OCI repository names are baked into the rendered CronJob..."
+    REPO_NAMES_OK="true"
+    for repo_marker in 'helm/goldengate"' 'helm/goldengate-monitor"' 'helm/goldengate-platform"'; do
+      if ! grep -q -- "$repo_marker" "$ARGOCD_RENDERED"; then
+        fail "argocd chart rendered manifest is missing repository marker: ${repo_marker}"
+        REPO_NAMES_OK="false"
+      fi
+    done
+    if [ "$REPO_NAMES_OK" = "true" ]; then
+      pass "argocd chart rendered CronJob bakes in all 3 Helm OCI repository names"
+    fi
+
+    echo "Checking all 3 Argo CD repository Secret names are baked into the rendered CronJob..."
+    SECRET_NAMES_OK="true"
+    for secret_name in argocd-ecr-goldengate-oci argocd-ecr-goldengate-monitor-oci argocd-ecr-goldengate-platform-oci; do
+      if ! grep -q -- "$secret_name" "$ARGOCD_RENDERED"; then
+        fail "argocd chart rendered manifest is missing repository Secret name: ${secret_name}"
+        SECRET_NAMES_OK="false"
+      fi
+    done
+    if [ "$SECRET_NAMES_OK" = "true" ]; then
+      pass "argocd chart rendered CronJob bakes in all 3 repository Secret names"
+    fi
+
+    echo "Extracting the exact argocd-ecr-token-sync Role and checking RBAC..."
+    RBAC_SPLIT_DIR="$(mktemp -d)"
+    awk -v outdir="$RBAC_SPLIT_DIR" '
+      BEGIN { docnum = 0; fname = outdir "/doc-0.yaml" }
+      /^---$/ { docnum++; fname = outdir "/doc-" docnum ".yaml"; next }
+      { print > fname }
+    ' "$ARGOCD_RENDERED"
+
+    RBAC_BLOCK=""
+    for RBAC_DOC in "$RBAC_SPLIT_DIR"/doc-*.yaml; do
+      if grep -q '^kind: Role$' "$RBAC_DOC" && grep -q '^  name: argocd-ecr-token-sync$' "$RBAC_DOC"; then
+        RBAC_BLOCK="$(cat "$RBAC_DOC")"
+        break
+      fi
+    done
+    rm -rf "$RBAC_SPLIT_DIR"
+
+    if [ -z "$RBAC_BLOCK" ]; then
+      fail "no rendered document has both kind: Role and metadata.name: argocd-ecr-token-sync"
+    else
+      RBAC_OK="true"
+      for secret_name in argocd-ecr-goldengate-oci argocd-ecr-goldengate-monitor-oci argocd-ecr-goldengate-platform-oci; do
+        if ! grep -Fq -- "$secret_name" <<< "$RBAC_BLOCK"; then
+          fail "argocd-ecr-token-sync Role resourceNames is missing ${secret_name}"
+          RBAC_OK="false"
+        fi
+      done
+      if [ "$RBAC_OK" = "true" ]; then
+        pass "argocd-ecr-token-sync Role resourceNames includes all 3 exact repository Secrets"
+      fi
+
+      VERBS_OK="true"
+      for required_verb in get update patch; do
+        if ! grep -Fq -- "- ${required_verb}" <<< "$RBAC_BLOCK"; then
+          fail "argocd-ecr-token-sync Role does not grant the ${required_verb} verb"
+          VERBS_OK="false"
+        fi
+      done
+      if grep -Eq -- '^[[:space:]]*-[[:space:]]*(delete|list|watch)[[:space:]]*$' <<< "$RBAC_BLOCK"; then
+        fail "argocd-ecr-token-sync Role grants a forbidden verb (delete, list, or watch)"
+        VERBS_OK="false"
+      fi
+      if [ "$VERBS_OK" = "true" ]; then
+        pass "argocd-ecr-token-sync Role grants exactly get/update/patch, no delete/list/watch"
+      fi
+    fi
+  else
+    fail "argocd chart rendered manifest is empty -- cannot run 3-repository assertions"
+  fi
+else
+  skip "helm lint (argocd chart) -- helm not installed"
+  skip "helm template (argocd chart) -- helm not installed"
+  skip "argocd chart 3-repository rendering assertions -- helm not installed"
 fi
 
 echo ""

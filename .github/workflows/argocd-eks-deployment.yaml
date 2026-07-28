@@ -229,6 +229,75 @@ jobs:
           echo "Helm chart path: $HELM_CHART_PATH"
           echo "Environment values: $VALUES_FILE"
 
+      - name: Validate Argo CD ECR read IAM policy covers all three Helm OCI repositories
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Static, repo-file-only check (no AWS calls): proves the
+          # GoldenGateArgocdECRRead-dev identity policy actually grants pull
+          # access to helm/goldengate-platform's exact repository ARN and
+          # the required actions, before this workflow ever provisions the
+          # in-cluster Secret that depends on it. This is deliberately
+          # narrower than a wildcard -- it must be an exact ARN match, one
+          # statement per repository.
+          POLICY_FILE="envs/dev/policies/argocd-ecr-oci-read-dev/policies/policies_1.json"
+
+          if [ ! -f "$POLICY_FILE" ]; then
+            echo "FAIL: missing IAM policy file: ${POLICY_FILE}"
+            exit 1
+          fi
+
+          python3 - "$POLICY_FILE" <<'PYEOF'
+          import json
+          import sys
+
+          policy_file = sys.argv[1]
+          with open(policy_file) as f:
+              policy = json.load(f)
+
+          required_actions = {
+              "ecr:BatchCheckLayerAvailability",
+              "ecr:BatchGetImage",
+              "ecr:GetDownloadUrlForLayer",
+              "ecr:DescribeImages",
+              "ecr:DescribeRepositories",
+          }
+          expected_repos = {
+              "helm/goldengate": "arn:aws:ecr:eu-west-1:229410149234:repository/helm/goldengate",
+              "helm/goldengate-monitor": "arn:aws:ecr:eu-west-1:229410149234:repository/helm/goldengate-monitor",
+              "helm/goldengate-platform": "arn:aws:ecr:eu-west-1:229410149234:repository/helm/goldengate-platform",
+          }
+
+          statements = policy.get("Statement", [])
+          found_arns = set()
+          for stmt in statements:
+              resource = stmt.get("Resource")
+              resources = resource if isinstance(resource, list) else [resource]
+              actions = stmt.get("Action")
+              actions = set(actions if isinstance(actions, list) else [actions])
+              for r in resources:
+                  if r in expected_repos.values():
+                      found_arns.add(r)
+                      if not required_actions.issubset(actions):
+                          missing = required_actions - actions
+                          print(f"FAIL: statement for {r} is missing actions: {sorted(missing)}")
+                          sys.exit(1)
+                      if r == "*" or r.endswith("/*"):
+                          print(f"FAIL: statement for {r} uses a wildcard resource -- must be an exact repository ARN.")
+                          sys.exit(1)
+
+          missing_repos = set(expected_repos.values()) - found_arns
+          if missing_repos:
+              print(f"FAIL: IAM policy is missing a statement for: {sorted(missing_repos)}")
+              sys.exit(1)
+
+          for repo, arn in expected_repos.items():
+              print(f"OK: {repo} -> {arn} present with required actions.")
+
+          print(f"OK: {policy_file} grants exactly the three expected repository ARNs, no wildcards.")
+          PYEOF
+
       - name: Login Helm to Amazon ECR
         shell: bash
         run: |
@@ -301,18 +370,20 @@ jobs:
           grep -q "eks.amazonaws.com/role-arn: arn:aws:iam::668311715351:role/GoldenGateArgocdECRRead-dev" "$RENDERED"
           grep -q "aws-cloud-factory-infra-aws-kubectl:1.33.13" "$RENDERED"
 
-          echo "Checking multi-repository token sync (both GoldenGate and GoldenGate monitor OCI repositories)..."
+          echo "Checking multi-repository token sync (all three GoldenGate Helm OCI repositories: goldengate, goldengate-monitor, goldengate-platform)..."
 
-          # Both Helm OCI repository names must be baked into the rendered
-          # CronJob's bash arrays.
+          # All three Helm OCI repository names must be baked into the
+          # rendered CronJob's bash arrays.
           grep -q 'helm/goldengate"' "$RENDERED"
           grep -q 'helm/goldengate-monitor"' "$RENDERED"
+          grep -q 'helm/goldengate-platform"' "$RENDERED"
 
-          # Both Argo CD repository Secret names must be baked in too.
+          # All three Argo CD repository Secret names must be baked in too.
           grep -q "argocd-ecr-goldengate-oci" "$RENDERED"
           grep -q "argocd-ecr-goldengate-monitor-oci" "$RENDERED"
+          grep -q "argocd-ecr-goldengate-platform-oci" "$RENDERED"
 
-          echo "Checking RBAC resourceNames includes both repository Secrets, using the exact argocd-ecr-token-sync Role (not merely the first rendered Role -- the Argo CD wrapper chart renders many Role/ClusterRole objects for its own components)..."
+          echo "Checking RBAC resourceNames includes all three repository Secrets, using the exact argocd-ecr-token-sync Role (not merely the first rendered Role -- the Argo CD wrapper chart renders many Role/ClusterRole objects for its own components)..."
 
           RBAC_SPLIT_DIR="$(mktemp -d)"
           awk -v outdir="$RBAC_SPLIT_DIR" '
@@ -354,6 +425,10 @@ jobs:
             echo "FAIL: Role resourceNames is missing argocd-ecr-goldengate-monitor-oci."
             exit 1
           fi
+          if ! grep -Fq -- "argocd-ecr-goldengate-platform-oci" <<< "$RBAC_BLOCK"; then
+            echo "FAIL: Role resourceNames is missing argocd-ecr-goldengate-platform-oci."
+            exit 1
+          fi
           if ! grep -Fq -- "- get" <<< "$RBAC_BLOCK"; then
             echo "FAIL: Role does not grant the get verb."
             exit 1
@@ -371,7 +446,7 @@ jobs:
             exit 1
           fi
 
-          echo "OK: ServiceAccount/Role/RoleBinding/CronJob for ECR token sync are all present in the rendered manifest, covering both repositories, using the existing GoldenGateArgocdECRRead-dev IRSA role. (The next step's public-registry scan covers every rendered image reference, including this CronJob's -- no new public image is introduced here.)"
+          echo "OK: ServiceAccount/Role/RoleBinding/CronJob for ECR token sync are all present in the rendered manifest, covering all three repositories, using the existing GoldenGateArgocdECRRead-dev IRSA role. (The next step's public-registry scan covers every rendered image reference, including this CronJob's -- no new public image is introduced here.)"
 
       - name: Extract and validate rendered image references
         shell: bash
@@ -680,7 +755,7 @@ jobs:
           echo "Job ${JOB_NAME} completed successfully. Logs:"
           kubectl logs "job/${JOB_NAME}" -n "$ARGOCD_NAMESPACE" --all-containers=true || true
 
-          echo "Verifying both Argo CD repository Secrets exist with the expected label and URL..."
+          echo "Verifying all three Argo CD repository Secrets exist with the expected label and URL..."
 
           verify_repo_secret() {
             local secret_name="$1"
@@ -714,11 +789,12 @@ jobs:
 
           verify_repo_secret "argocd-ecr-goldengate-oci" "helm/goldengate"
           verify_repo_secret "argocd-ecr-goldengate-monitor-oci" "helm/goldengate-monitor"
+          verify_repo_secret "argocd-ecr-goldengate-platform-oci" "helm/goldengate-platform"
 
           echo "Deleting one-off validation Job ${JOB_NAME} (validation succeeded)..."
           kubectl delete job "$JOB_NAME" -n "$ARGOCD_NAMESPACE" --wait=true --timeout=60s
 
-          echo "OK: immediate bounded ECR token-sync validation passed for both repositories."
+          echo "OK: immediate bounded ECR token-sync validation passed for all three repositories."
 
       - name: Upload rendered manifests and chart package
         if: always()

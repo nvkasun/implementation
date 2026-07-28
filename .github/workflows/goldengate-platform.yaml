@@ -2,6 +2,21 @@ name: Goldengate platform deployment
 
 run-name: "Cloud Factory - GoldenGate platform bootstrap build and deploy | ${{ github.event_name == 'workflow_dispatch' && format('manual dispatch (deploy={0})', inputs.deploy) || format('auto: platform changes on {0}', github.sha) }} | ran by ${{ github.actor }}"
 
+# Manual-only (workflow_dispatch), deliberately with no push trigger. This
+# enforces the required deployment order:
+#   1. IAM Terraform apply (creates gg-oracle-dev-runtime-role /
+#      gg-postgresql-dev-runtime-role -- this workflow's roleArn inputs
+#      would be invalid before this runs).
+#   2. argocd-eks-deployment.yaml (provisions the
+#      argocd-ecr-goldengate-platform-oci repository Secret this workflow's
+#      "Confirm the platform Argo CD repository Secret exists" step
+#      requires).
+#   3. This workflow.
+# A push trigger on helm/goldengate-platform/** or
+# platform/dev/goldengate-platform/** could fire before steps 1-2 complete
+# and fail (or worse, half-succeed) against a cluster/IAM state that isn't
+# ready yet. Do not re-add a push trigger or workflow_run chaining without
+# also solving that ordering problem.
 on:
   workflow_dispatch:
     inputs:
@@ -18,14 +33,6 @@ on:
         required: true
         type: boolean
         default: true
-
-  push:
-    branches:
-      - main
-    paths:
-      - 'helm/goldengate-platform/**'
-      - 'platform/dev/goldengate-platform/**'
-      - '.github/workflows/goldengate-platform.yaml'
 
 permissions:
   id-token: write
@@ -377,6 +384,27 @@ jobs:
           fi
           echo "OK: no per-runtime ownership label on either shared namespace."
 
+          # Shared objects must be protected from Argo CD prune/cascading
+          # deletion via Prune=false,Delete=false -- PruneLast=true alone
+          # only affects prune *ordering*, it does not make an object
+          # unprunable/undeletable.
+          assert_deletion_protected() {
+            local kind="$1"
+            local block="$2"
+            if ! grep -Fq -- "argocd.argoproj.io/sync-options: Prune=false,Delete=false" <<< "$block"; then
+              echo "FAIL: ${kind} is missing argocd.argoproj.io/sync-options: Prune=false,Delete=false."
+              exit 1
+            fi
+            if grep -Fq -- "argocd.argoproj.io/sync-options: PruneLast=true" <<< "$block"; then
+              echo "FAIL: ${kind} still carries sync-options: PruneLast=true instead of Prune=false,Delete=false."
+              exit 1
+            fi
+            echo "OK: ${kind} carries sync-options: Prune=false,Delete=false (not merely PruneLast=true)."
+          }
+
+          assert_deletion_protected "Namespace ${RUNTIME_NAMESPACE}" "$RUNTIME_NS_BLOCK"
+          assert_deletion_protected "Namespace ${MONITORING_NAMESPACE}" "$MONITORING_NS_BLOCK"
+
           echo "Validating exactly two ServiceAccount documents..."
           SERVICEACCOUNT_COUNT="$(grep -c '^kind: ServiceAccount$' "$RENDERED")"
           if [ "$SERVICEACCOUNT_COUNT" -ne 2 ]; then
@@ -413,6 +441,8 @@ jobs:
               exit 1
             fi
             echo "OK: ServiceAccount ${sa_name} is in ${RUNTIME_NAMESPACE} with the expected IRSA role ARN."
+
+            assert_deletion_protected "ServiceAccount ${sa_name}" "$sa_block"
           }
 
           validate_runtime_sa "$ORACLE_SA_NAME" "$ORACLE_RUNTIME_ROLE_ARN"
