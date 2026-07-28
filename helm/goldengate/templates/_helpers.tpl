@@ -185,19 +185,30 @@ rendering never calls any of these.
 
 {{- /*
 Selector labels are intentionally minimal and stable: name + Helm release
-instance is already unique per singleRuntime release, and StatefulSet/Service
-selectors must never change across template edits (Kubernetes selectors are
-immutable on existing StatefulSets). Deliberately no "source"/"target"/
-component value here -- a single-runtime pod is neither.
+instance is already unique per singleRuntime release (each singleRuntime
+release has its own unique Release.Name), and StatefulSet/Service selectors
+must never change across template edits (Kubernetes selectors are immutable
+on existing StatefulSets). app.kubernetes.io/name is the fixed literal
+"goldengate" here -- matching goldengate.runtimeLabels below exactly, so
+composing the two never produces a duplicate key with a conflicting value.
+Deliberately no "source"/"target"/component value here -- a single-runtime
+pod is neither.
 */ -}}
 {{- define "goldengate.runtimeSelectorLabels" -}}
-app.kubernetes.io/name: {{ include "goldengate.runtimeName" . }}
+app.kubernetes.io/name: goldengate
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
+{{- /*
+Composes goldengate.runtimeSelectorLabels exactly once (the idiomatic Helm
+"labels include selectorLabels" pattern) and adds the remaining descriptive
+labels. Never redeclare app.kubernetes.io/name or app.kubernetes.io/instance
+here -- callers that need the full label set must use this helper alone,
+never this helper plus goldengate.runtimeSelectorLabels together in the same
+mapping, or the two app.kubernetes.io/name keys would collide.
+*/ -}}
 {{- define "goldengate.runtimeLabels" -}}
-app.kubernetes.io/name: goldengate
-app.kubernetes.io/instance: {{ .Release.Name }}
+{{ include "goldengate.runtimeSelectorLabels" . }}
 app.kubernetes.io/component: runtime
 app.kubernetes.io/part-of: goldengate
 app.kubernetes.io/managed-by: {{ .Release.Service }}

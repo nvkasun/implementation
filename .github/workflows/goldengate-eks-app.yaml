@@ -1495,125 +1495,212 @@ jobs:
           RENDERED="rendered/${RELEASE_NAME}.yaml"
 
           if [ "$DEPLOYMENT_MODEL" = "singleRuntime" ]; then
-            echo "deploymentModel=singleRuntime: validating the generic runtime resource contract instead of the legacy source/target observer contract."
+            echo "deploymentModel=singleRuntime: validating the generic runtime resource contract with Python/PyYAML -- never indentation-based grep for Kubernetes object structure."
 
-            echo "Checking for exactly one StatefulSet..."
-            STATEFULSET_COUNT="$(grep -c '^kind: StatefulSet$' "$RENDERED" || true)"
-            if [ "$STATEFULSET_COUNT" -ne 1 ]; then
-              echo "FAIL: expected exactly one StatefulSet, found ${STATEFULSET_COUNT}."
+            if ! command -v python3 >/dev/null 2>&1; then
+              echo "FAIL: python3 is required to validate singleRuntime rendered manifests and is not available on this runner."
               exit 1
             fi
 
-            RUNTIME_STS="$(awk '/^# Source: .*runtime-statefulset\.yaml$/{flag=1} flag{print} /^---$/{if(flag) exit}' "$RENDERED")"
-            if [ -z "$RUNTIME_STS" ]; then
-              echo "FAIL: could not isolate the rendered runtime-statefulset.yaml document."
+            if ! python3 -c "import yaml" >/dev/null 2>&1; then
+              echo "FAIL: PyYAML is required to validate singleRuntime rendered manifests and is not available on this runner."
               exit 1
             fi
 
-            echo "Checking exactly one regular application container..."
-            RUNTIME_MAIN_CONTAINER="$(grep -E '^\s*containerName:' "$VALUES_FILE" | head -1 | sed -E 's/^\s*containerName:\s*//' | tr -d '"'"'"'\r' | xargs)"
-            if [ -z "$RUNTIME_MAIN_CONTAINER" ]; then
-              echo "FAIL: runtime.containerName not found in ${VALUES_FILE}."
-              exit 1
-            fi
+            python3 - "$RENDERED" "$VALUES_FILE" "$DEPLOYMENT_ID" "$TARGET_NAMESPACE" <<'PYEOF'
+          import sys
+          import yaml
 
-            CONTAINER_NAMES="$(echo "$RUNTIME_STS" | grep -E '^        - name:' | sed -E 's/^        - name:\s*//' | tr -d '"'"'"'\r')"
-            echo "Rendered application containers: ${CONTAINER_NAMES}"
 
-            APP_CONTAINER_COUNT="$(echo "$CONTAINER_NAMES" | grep -vc '^\s*$' || true)"
-            if [ "$APP_CONTAINER_COUNT" -ne 1 ]; then
-              echo "FAIL: expected exactly one regular application container in the runtime StatefulSet, found ${APP_CONTAINER_COUNT}: ${CONTAINER_NAMES}"
-              exit 1
-            fi
+          class DuplicateKeyError(Exception):
+              pass
 
-            if ! grep -Fxq "$RUNTIME_MAIN_CONTAINER" <<< "$CONTAINER_NAMES"; then
-              echo "FAIL: expected main container name ${RUNTIME_MAIN_CONTAINER} not found. Rendered: ${CONTAINER_NAMES}"
-              exit 1
-            fi
-            echo "OK: exactly one application container (${RUNTIME_MAIN_CONTAINER})."
 
-            echo "Checking no forbidden sidecars are present..."
-            if grep -Fq -- "goldengate-observer" <<< "$RUNTIME_STS"; then
-              echo "FAIL: a goldengate-observer container/reference was found in the singleRuntime StatefulSet. The approved single-runtime pod has no observer sidecar."
-              exit 1
-            fi
-            if grep -Eiq -- 'utility-sidecar|fluent-bit|fluentbit' <<< "$RUNTIME_STS"; then
-              echo "FAIL: a manager utility-sidecar or Fluent Bit reference was found in the singleRuntime StatefulSet. The approved single-runtime pod has neither."
-              exit 1
-            fi
-            echo "OK: no observer/utility-sidecar/Fluent Bit container present."
+          class StrictSafeLoader(yaml.SafeLoader):
+              pass
 
-            echo "Checking Service resources (one ClusterIP, one headless)..."
-            SERVICE_COUNT="$(grep -c '^kind: Service$' "$RENDERED" || true)"
-            if [ "$SERVICE_COUNT" -ne 2 ]; then
-              echo "FAIL: expected exactly 2 Service documents (one ClusterIP, one headless), found ${SERVICE_COUNT}."
-              exit 1
-            fi
-            if ! grep -q "type: ClusterIP" "$RENDERED"; then
-              echo "FAIL: expected ClusterIP Service not found."
-              exit 1
-            fi
-            if ! grep -q "clusterIP: None" "$RENDERED"; then
-              echo "FAIL: expected headless Service (clusterIP: None) not found."
-              exit 1
-            fi
-            echo "OK: exactly one ClusterIP Service and one headless Service."
 
-            echo "Checking Ingress (if enabled, exactly one host)..."
-            INGRESS_ENABLED="false"
-            if grep -A1 '^ingress:' "$VALUES_FILE" | grep -q 'enabled: true'; then
-              INGRESS_ENABLED="true"
-            fi
-            if [ "$INGRESS_ENABLED" = "true" ]; then
-              INGRESS_COUNT="$(grep -c '^kind: Ingress$' "$RENDERED" || true)"
-              if [ "$INGRESS_COUNT" -ne 1 ]; then
-                echo "FAIL: expected exactly one rendered Ingress, found ${INGRESS_COUNT}."
-                exit 1
-              fi
-              INGRESS_BLOCK="$(awk '/^kind: Ingress$/{flag=1} flag{print} /^---$/{if(flag) exit}' "$RENDERED")"
-              HOST_COUNT="$(echo "$INGRESS_BLOCK" | grep -cE '^\s*- host:' || true)"
-              if [ "$HOST_COUNT" -ne 1 ]; then
-                echo "FAIL: expected exactly one Ingress host rule, found ${HOST_COUNT}."
-                exit 1
-              fi
-              echo "OK: exactly one Ingress with one host."
-            else
-              echo "ingress.enabled is not true in ${VALUES_FILE}. Skipping Ingress checks."
-            fi
+          def _no_duplicates_constructor(loader, node, deep=False):
+              mapping = {}
+              for key_node, value_node in node.value:
+                  key = loader.construct_object(key_node, deep=deep)
+                  if key in mapping:
+                      raise DuplicateKeyError(
+                          f"duplicate mapping key {key!r} at line {key_node.start_mark.line + 1}"
+                      )
+                  value = loader.construct_object(value_node, deep=deep)
+                  mapping[key] = value
+              return mapping
 
-            echo "Checking runtime-qualified resource names are unique to ${DEPLOYMENT_ID} and namespaced resources use the shared namespace ${TARGET_NAMESPACE}..."
-            for RESOURCE_NAME in "${DEPLOYMENT_ID}" "${DEPLOYMENT_ID}-headless"; do
-              if ! grep -q "name: ${RESOURCE_NAME}" "$RENDERED"; then
-                echo "FAIL: expected resource named ${RESOURCE_NAME} not found in the rendered manifest."
-                exit 1
-              fi
-            done
 
-            if grep -q '^kind: SecretProviderClass$' "$RENDERED"; then
-              echo "Checking rendered SecretProviderClass names are runtime-qualified..."
-              SPC_NAMES="$(awk '/^kind: SecretProviderClass$/{flag=1} flag && /^  name:/{print; flag=0}' "$RENDERED" | sed -E 's/^\s*name:\s*//' | tr -d '"'"'"'\r')"
-              echo "Rendered SecretProviderClass names: ${SPC_NAMES}"
-              mapfile -t SPC_NAME_ARRAY <<< "$SPC_NAMES"
-              for SPC_NAME in "${SPC_NAME_ARRAY[@]}"; do
-                [ -z "$SPC_NAME" ] && continue
-                case "$SPC_NAME" in
-                  "${DEPLOYMENT_ID}"-*) ;;
-                  *)
-                    echo "FAIL: SecretProviderClass name ${SPC_NAME} is not qualified by the runtime name ${DEPLOYMENT_ID}."
-                    exit 1
-                    ;;
-                esac
-              done
-            fi
+          StrictSafeLoader.add_constructor(
+              yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _no_duplicates_constructor
+          )
 
-            NAMESPACE_LINE_COUNT="$(grep -c "namespace: \"${TARGET_NAMESPACE}\"" "$RENDERED" || true)"
-            if [ "$NAMESPACE_LINE_COUNT" -lt 1 ]; then
-              echo "FAIL: no namespaced resource references the expected shared namespace ${TARGET_NAMESPACE}."
-              exit 1
-            fi
-            echo "OK: namespaced resources reference the shared namespace ${TARGET_NAMESPACE}."
+          FORBIDDEN_CONTAINER_SUBSTRINGS = (
+              "goldengate-observer",
+              "utility-sidecar",
+              "fluent-bit",
+              "fluentbit",
+          )
 
-            echo "OK: singleRuntime rendered manifest passed all generic runtime contract checks."
+          rendered_path, values_path, deployment_id, target_namespace = sys.argv[1:5]
+
+          with open(rendered_path) as f:
+              raw = f.read()
+
+          try:
+              documents = [d for d in yaml.load_all(raw, Loader=StrictSafeLoader) if d]
+          except DuplicateKeyError as exc:
+              print(f"FAIL: duplicate YAML mapping key in rendered manifest: {exc}")
+              sys.exit(1)
+          except yaml.YAMLError as exc:
+              print(f"FAIL: rendered manifest is not valid YAML: {exc}")
+              sys.exit(1)
+
+          print(f"OK: rendered manifest parsed as {len(documents)} document(s) with no duplicate mapping keys.")
+
+          with open(values_path) as f:
+              values = yaml.safe_load(f) or {}
+
+          runtime_values = values.get("runtime") or {}
+          expected_container_name = runtime_values.get("containerName")
+          if not expected_container_name:
+              print(f"FAIL: runtime.containerName not found in {values_path}.")
+              sys.exit(1)
+
+          # --- exactly one StatefulSet, exactly one regular container --------------
+          statefulsets = [d for d in documents if d.get("kind") == "StatefulSet"]
+          if len(statefulsets) != 1:
+              print(f"FAIL: expected exactly one StatefulSet, found {len(statefulsets)}.")
+              sys.exit(1)
+
+          sts = statefulsets[0]
+          pod_spec = (sts.get("spec") or {}).get("template", {}).get("spec", {}) or {}
+
+          containers = pod_spec.get("containers") or []
+          if len(containers) != 1:
+              names = [c.get("name") for c in containers]
+              print(
+                  "FAIL: expected exactly one regular application container in "
+                  f"spec.template.spec.containers, found {len(containers)}: {names}"
+              )
+              sys.exit(1)
+
+          main_container = containers[0]
+          main_container_name = main_container.get("name")
+          if main_container_name != expected_container_name:
+              print(
+                  f"FAIL: expected main container name {expected_container_name!r}, "
+                  f"found {main_container_name!r}."
+              )
+              sys.exit(1)
+          print(
+              "OK: exactly one regular application container "
+              f"(spec.template.spec.containers), name={main_container_name!r}."
+          )
+
+          name_lower = (main_container_name or "").lower()
+          image_lower = (main_container.get("image") or "").lower()
+          for substring in FORBIDDEN_CONTAINER_SUBSTRINGS:
+              if substring in name_lower or substring in image_lower:
+                  print(
+                      "FAIL: the regular container unexpectedly references "
+                      f"{substring!r} (name={main_container_name!r}, image={main_container.get('image')!r})."
+                  )
+                  sys.exit(1)
+          print("OK: no observer/utility-sidecar/Fluent Bit reference in the regular container.")
+
+          # --- initContainers: only the expected stale-PID/permissions init --------
+          init_containers = pod_spec.get("initContainers") or []
+          init_names = [c.get("name") for c in init_containers]
+          allowed_init_names = {"prepare-u02-permissions"}
+          unexpected_init = [n for n in init_names if n not in allowed_init_names]
+          if unexpected_init:
+              print(
+                  f"FAIL: unexpected initContainers found: {unexpected_init}. "
+                  "Only prepare-u02-permissions is permitted."
+              )
+              sys.exit(1)
+          print(f"OK: initContainers are limited to the expected set: {init_names}")
+
+          # --- Services: exactly one ClusterIP, one headless -----------------------
+          services = [d for d in documents if d.get("kind") == "Service"]
+          if len(services) != 2:
+              print(f"FAIL: expected exactly 2 Service documents (one ClusterIP, one headless), found {len(services)}.")
+              sys.exit(1)
+
+          service_types = [(s.get("spec") or {}).get("type") for s in services]
+          cluster_ips = [(s.get("spec") or {}).get("clusterIP") for s in services]
+          if "ClusterIP" not in service_types:
+              print(f"FAIL: expected ClusterIP Service not found. Types: {service_types}")
+              sys.exit(1)
+          if "None" not in cluster_ips:
+              print(f"FAIL: expected headless Service (clusterIP: None) not found. clusterIPs: {cluster_ips}")
+              sys.exit(1)
+          print("OK: exactly one ClusterIP Service and one headless Service.")
+
+          # --- Ingress: exactly one, with exactly one host, when enabled -----------
+          ingress_enabled = bool((values.get("ingress") or {}).get("enabled"))
+          ingresses = [d for d in documents if d.get("kind") == "Ingress"]
+          if ingress_enabled:
+              if len(ingresses) != 1:
+                  print(f"FAIL: expected exactly one rendered Ingress, found {len(ingresses)}.")
+                  sys.exit(1)
+              rules = (ingresses[0].get("spec") or {}).get("rules") or []
+              if len(rules) != 1:
+                  print(f"FAIL: expected exactly one Ingress host rule, found {len(rules)}.")
+                  sys.exit(1)
+              print("OK: exactly one Ingress with one host.")
+          else:
+              print("ingress.enabled is not true. Skipping Ingress checks.")
+
+          # --- runtime-qualified resource names + shared namespace -----------------
+          expected_names = {deployment_id, f"{deployment_id}-headless"}
+          found_names = {
+              (doc.get("metadata") or {}).get("name")
+              for doc in documents
+              if (doc.get("metadata") or {}).get("name") in expected_names
+          }
+          missing_names = expected_names - found_names
+          if missing_names:
+              print(f"FAIL: expected resource name(s) not found in the rendered manifest: {sorted(missing_names)}")
+              sys.exit(1)
+
+          spcs = [d for d in documents if d.get("kind") == "SecretProviderClass"]
+          for spc in spcs:
+              name = (spc.get("metadata") or {}).get("name", "")
+              if not name.startswith(f"{deployment_id}-"):
+                  print(f"FAIL: SecretProviderClass name {name!r} is not qualified by the runtime name {deployment_id!r}.")
+                  sys.exit(1)
+          if spcs:
+              print(f"OK: {len(spcs)} SecretProviderClass name(s) are runtime-qualified.")
+
+          namespaced_kinds = {
+              "StatefulSet", "Service", "PersistentVolumeClaim",
+              "SecretProviderClass", "ServiceAccount", "Ingress",
+          }
+          namespace_found = False
+          for doc in documents:
+              if doc.get("kind") not in namespaced_kinds:
+                  continue
+              ns = (doc.get("metadata") or {}).get("namespace")
+              if ns == target_namespace:
+                  namespace_found = True
+              elif ns is not None:
+                  print(
+                      f"FAIL: {doc.get('kind')} {(doc.get('metadata') or {}).get('name')} uses "
+                      f"unexpected namespace {ns!r}, expected {target_namespace!r}."
+                  )
+                  sys.exit(1)
+          if not namespace_found:
+              print(f"FAIL: no namespaced resource references the expected shared namespace {target_namespace!r}.")
+              sys.exit(1)
+          print(f"OK: namespaced resources reference the shared namespace {target_namespace!r}.")
+
+          print("OK: singleRuntime rendered manifest passed all generic runtime contract checks (Python/PyYAML, duplicate-key-safe).")
+          PYEOF
+
             echo "SOURCE_ENABLED=false" >> "$GITHUB_ENV"
             echo "TARGET_ENABLED=false" >> "$GITHUB_ENV"
             echo "OBSERVER_ENABLED=false" >> "$GITHUB_ENV"

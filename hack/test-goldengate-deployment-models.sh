@@ -9,6 +9,11 @@ set -euo pipefail
 # reported as passing) -- everything that does not need helm (static
 # workflow assertions) still runs.
 #
+# Resource-contract assertions are Python/PyYAML-based, using a
+# duplicate-mapping-key-rejecting loader and reading actual Kubernetes
+# object structure (spec.template.spec.containers, etc.) -- never
+# indentation-based grep against raw YAML text.
+#
 # Does not deploy, does not touch the cluster, does not require AWS
 # credentials, does not install anything.
 #
@@ -16,10 +21,12 @@ set -euo pipefail
 #   hack/test-goldengate-deployment-models.sh
 #
 # To also compare against a pre-change baseline (recommended before/after
-# any helm/goldengate/** change), first capture one:
-#   helm template ogg-payments-ora-to-pg-001 helm/goldengate \
+# any helm/goldengate/** change), render one from the original pre-Phase-1
+# repository revision/archive first, e.g.:
+#   git worktree add /tmp/goldengate-pre-phase1 <pre-phase-1-commit>
+#   helm template ogg-payments-ora-to-pg-001 /tmp/goldengate-pre-phase1/helm/goldengate \
 #     --namespace gg-dev-payments-ora-to-pg-001 \
-#     -f envs/dev/payments-ora-to-pg-001/values.yaml \
+#     -f /tmp/goldengate-pre-phase1/envs/dev/payments-ora-to-pg-001/values.yaml \
 #     --set-string monitoring.observer.image.repository=example.invalid/goldengate-observer \
 #     --set-string monitoring.observer.image.tag=obs-test \
 #     > /tmp/goldengate-legacy-before.yaml
@@ -50,11 +57,17 @@ if command -v helm >/dev/null 2>&1; then
   HELM_AVAILABLE="true"
 fi
 
+PYTHON_AVAILABLE="false"
+if command -v python3 >/dev/null 2>&1 && python3 -c "import yaml" >/dev/null 2>&1; then
+  PYTHON_AVAILABLE="true"
+fi
+
 echo "=================================================="
 echo "GoldenGate Phase 1 deployment-model validation"
 echo "=================================================="
 echo "Repository root: ${REPO_ROOT}"
 echo "Helm available:  ${HELM_AVAILABLE}"
+echo "Python3+PyYAML available: ${PYTHON_AVAILABLE}"
 echo ""
 
 if [ ! -f "$BASELINE_FILE" ]; then
@@ -62,6 +75,315 @@ if [ ! -f "$BASELINE_FILE" ]; then
   echo "Capture one BEFORE making chart changes with the command in this script's header comment."
   echo ""
 fi
+
+# ---------------------------------------------------------------------
+# Write the Python validators once (flush-left heredocs -- this is a plain
+# bash script, not a YAML block scalar, so there is no automatic dedent
+# step; heredoc bodies/terminators here are intentionally unindented).
+# ---------------------------------------------------------------------
+DUPLICATE_KEY_CHECK_PY="${WORKDIR}/duplicate_key_check.py"
+cat > "$DUPLICATE_KEY_CHECK_PY" <<'PYEOF'
+import sys
+import yaml
+
+
+class DuplicateKeyError(Exception):
+    pass
+
+
+class StrictSafeLoader(yaml.SafeLoader):
+    pass
+
+
+def _no_duplicates_constructor(loader, node, deep=False):
+    mapping = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise DuplicateKeyError(
+                f"duplicate mapping key {key!r} at line {key_node.start_mark.line + 1}"
+            )
+        value = loader.construct_object(value_node, deep=deep)
+        mapping[key] = value
+    return mapping
+
+
+StrictSafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _no_duplicates_constructor
+)
+
+with open(sys.argv[1]) as f:
+    raw = f.read()
+
+try:
+    documents = [d for d in yaml.load_all(raw, Loader=StrictSafeLoader) if d]
+except DuplicateKeyError as exc:
+    print(f"duplicate mapping key: {exc}")
+    sys.exit(1)
+except yaml.YAMLError as exc:
+    print(f"not valid YAML: {exc}")
+    sys.exit(1)
+
+print(f"{len(documents)} document(s), no duplicate mapping keys")
+PYEOF
+
+CANDIDATE_VALIDATOR_PY="${WORKDIR}/validate_candidate.py"
+cat > "$CANDIDATE_VALIDATOR_PY" <<'PYEOF'
+import sys
+import yaml
+
+
+class DuplicateKeyError(Exception):
+    pass
+
+
+class StrictSafeLoader(yaml.SafeLoader):
+    pass
+
+
+def _no_duplicates_constructor(loader, node, deep=False):
+    mapping = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise DuplicateKeyError(
+                f"duplicate mapping key {key!r} at line {key_node.start_mark.line + 1}"
+            )
+        value = loader.construct_object(value_node, deep=deep)
+        mapping[key] = value
+    return mapping
+
+
+StrictSafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _no_duplicates_constructor
+)
+
+FORBIDDEN_CONTAINER_SUBSTRINGS = (
+    "goldengate-observer",
+    "utility-sidecar",
+    "fluent-bit",
+    "fluentbit",
+)
+
+rendered_path, values_path, deployment_id, target_namespace, label = sys.argv[1:6]
+
+pass_count = 0
+fail_count = 0
+skip_count = 0
+
+
+def ok(msg):
+    global pass_count
+    print(f"PASS: [{label}] {msg}")
+    pass_count += 1
+
+
+def bad(msg):
+    global fail_count
+    print(f"FAIL: [{label}] {msg}")
+    fail_count += 1
+
+
+def skipped(msg):
+    global skip_count
+    print(f"SKIP: [{label}] {msg}")
+    skip_count += 1
+
+
+def finish():
+    print(f"SUMMARY pass={pass_count} fail={fail_count} skip={skip_count}")
+    sys.exit(1 if fail_count else 0)
+
+
+with open(values_path) as f:
+    values = yaml.safe_load(f) or {}
+
+runtime_values = values.get("runtime") or {}
+expected_container_name = runtime_values.get("containerName")
+expected_sa_name = (runtime_values.get("serviceAccount") or {}).get("name")
+expected_ports = (runtime_values.get("service") or {}).get("ports") or {}
+expected_claim_name = ((runtime_values.get("storage") or {}).get("u02") or {}).get("claimName")
+expected_pvc_name = expected_claim_name or f"{deployment_id}-u02"
+
+persistence = values.get("persistence") or {}
+expected_storage_class = ((persistence.get("efs") or {}).get("storageClass") or {}).get("name")
+
+ingress_values = values.get("ingress") or {}
+expected_host = ingress_values.get("host")
+
+try:
+    with open(rendered_path) as f:
+        raw = f.read()
+except FileNotFoundError:
+    skipped(f"resource contract validation -- rendered manifest not found: {rendered_path}")
+    finish()
+
+if not raw.strip():
+    skipped("resource contract validation -- rendered manifest is empty")
+    finish()
+
+try:
+    documents = [d for d in yaml.load_all(raw, Loader=StrictSafeLoader) if d]
+except DuplicateKeyError as exc:
+    bad(f"duplicate YAML mapping key in rendered manifest: {exc}")
+    finish()
+except yaml.YAMLError as exc:
+    bad(f"rendered manifest is not valid YAML: {exc}")
+    finish()
+
+ok(f"rendered manifest parsed as {len(documents)} document(s) with no duplicate mapping keys")
+
+# --- StatefulSet / containers ---------------------------------------------
+statefulsets = [d for d in documents if d.get("kind") == "StatefulSet"]
+if len(statefulsets) == 1:
+    ok("exactly one StatefulSet")
+else:
+    bad(f"expected exactly one StatefulSet, found {len(statefulsets)}")
+
+sts = statefulsets[0] if statefulsets else {}
+pod_spec = ((sts.get("spec") or {}).get("template") or {}).get("spec") or {}
+containers = pod_spec.get("containers") or []
+
+if len(containers) == 1:
+    ok("exactly one regular application container (spec.template.spec.containers)")
+else:
+    bad(
+        "expected exactly one regular container in spec.template.spec.containers, "
+        f"found {len(containers)}: {[c.get('name') for c in containers]}"
+    )
+
+main_container = containers[0] if containers else {}
+main_name = main_container.get("name")
+if containers:
+    if main_name == expected_container_name:
+        ok(f"expected main container name ({expected_container_name})")
+    else:
+        bad(f"expected main container name {expected_container_name!r}, found {main_name!r}")
+
+name_lower = (main_name or "").lower()
+image_lower = (main_container.get("image") or "").lower()
+any_forbidden = any(s in name_lower or s in image_lower for s in FORBIDDEN_CONTAINER_SUBSTRINGS)
+if containers:
+    if not any_forbidden:
+        ok("no observer/utility-sidecar/Fluent Bit reference in the regular container")
+    else:
+        bad("the regular container unexpectedly references a forbidden sidecar name/image")
+
+init_containers = pod_spec.get("initContainers") or []
+init_names = [c.get("name") for c in init_containers]
+if init_names == ["prepare-u02-permissions"]:
+    ok("initContainers limited to the expected prepare-u02-permissions")
+else:
+    bad(f"expected initContainers == ['prepare-u02-permissions'], found {init_names}")
+
+init_command_text = " ".join(" ".join(c.get("command") or []) for c in init_containers)
+if "ServiceManager.pid" in init_command_text:
+    ok("stale PID cleanup logic (ServiceManager.pid) present")
+else:
+    bad("ServiceManager.pid stale-PID cleanup logic not found in initContainers")
+
+# --- runtime name / namespace ----------------------------------------------
+sts_name = (sts.get("metadata") or {}).get("name")
+if sts_name == deployment_id:
+    ok(f"runtime name {deployment_id}")
+else:
+    bad(f"expected StatefulSet name {deployment_id!r}, found {sts_name!r}")
+
+sts_namespace = (sts.get("metadata") or {}).get("namespace")
+if sts_namespace == target_namespace:
+    ok(f"namespace {target_namespace}")
+else:
+    bad(f"expected namespace {target_namespace!r}, found {sts_namespace!r}")
+
+# --- ServiceAccount ----------------------------------------------------------
+sa_name = pod_spec.get("serviceAccountName")
+if sa_name == expected_sa_name:
+    ok(f"ServiceAccount {expected_sa_name}")
+else:
+    bad(f"expected serviceAccountName {expected_sa_name!r}, found {sa_name!r}")
+
+# --- ports -------------------------------------------------------------------
+rendered_port_names = {p.get("name") for p in (main_container.get("ports") or [])}
+for port_name in ("dist", "receiver"):
+    expect_present = bool(expected_ports.get(port_name))
+    is_present = port_name in rendered_port_names
+    if expect_present == is_present:
+        ok(f"{port_name} port present" if expect_present else f"{port_name} port absent")
+    else:
+        bad(
+            f"{port_name} port presence mismatch: expected_present={expect_present}, "
+            f"rendered_present={is_present}"
+        )
+
+if "metrics" in rendered_port_names:
+    ok("metrics port present")
+else:
+    bad("metrics port not found")
+
+# --- Namespace document (must not exist) -------------------------------------
+if not any(d.get("kind") == "Namespace" for d in documents):
+    ok("no Namespace document")
+else:
+    bad("unexpected Namespace document rendered")
+
+# --- Ingress -------------------------------------------------------------------
+ingresses = [d for d in documents if d.get("kind") == "Ingress"]
+if ingress_values.get("enabled"):
+    if len(ingresses) == 1:
+        rules = (ingresses[0].get("spec") or {}).get("rules") or []
+        if len(rules) == 1:
+            actual_host = rules[0].get("host")
+            if actual_host == expected_host:
+                ok(f"one expected hostname ({expected_host})")
+            else:
+                bad(f"expected Ingress host {expected_host!r}, found {actual_host!r}")
+        else:
+            bad(f"expected exactly one Ingress rule, found {len(rules)}")
+    else:
+        bad(f"expected exactly one Ingress document, found {len(ingresses)}")
+else:
+    skipped("Ingress hostname check -- ingress.enabled is not true")
+
+# --- StorageClass / PVC -------------------------------------------------------
+storageclasses = [d for d in documents if d.get("kind") == "StorageClass"]
+if expected_storage_class:
+    sc_names = {(d.get("metadata") or {}).get("name") for d in storageclasses}
+    if expected_storage_class in sc_names:
+        ok(f"unique StorageClass name ({expected_storage_class})")
+    else:
+        bad(f"expected StorageClass {expected_storage_class!r} not found. Rendered: {sc_names}")
+else:
+    skipped("StorageClass name check -- persistence.efs.storageClass.name not set in values")
+
+pvcs = [d for d in documents if d.get("kind") == "PersistentVolumeClaim"]
+pvc_names = {(d.get("metadata") or {}).get("name") for d in pvcs}
+if expected_pvc_name in pvc_names:
+    ok(f"unique PVC name ({expected_pvc_name})")
+else:
+    bad(f"expected PVC {expected_pvc_name!r} not found. Rendered: {pvc_names}")
+
+finish()
+PYEOF
+
+# Adds a Python validator's "SUMMARY pass=P fail=F skip=S" line to the
+# script-level counters. All of the validator's own PASS/FAIL/SKIP lines
+# were already printed to stdout by the validator itself.
+accumulate_python_summary() {
+  local output="$1"
+  local summary
+  summary="$(echo "$output" | grep '^SUMMARY ' | tail -1)"
+  if [ -z "$summary" ]; then
+    fail "candidate validator produced no SUMMARY line -- treating as a failure"
+    return
+  fi
+  local p f s
+  p="$(echo "$summary" | sed -E 's/.*pass=([0-9]+).*/\1/')"
+  f="$(echo "$summary" | sed -E 's/.*fail=([0-9]+).*/\1/')"
+  s="$(echo "$summary" | sed -E 's/.*skip=([0-9]+).*/\1/')"
+  PASS_COUNT=$((PASS_COUNT + p))
+  FAIL_COUNT=$((FAIL_COUNT + f))
+  SKIP_COUNT=$((SKIP_COUNT + s))
+}
 
 # ---------------------------------------------------------------------
 # 1/2/3: legacyPair -- lint, render, compare against the captured baseline
@@ -96,7 +418,9 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
     # Strip the one intentionally-volatile, harmless line (the Helm chart
     # version label) before comparing -- everything else (resources, names,
     # selectors, ports, volumes, probes, init logic, observer integration,
-    # ingress behavior) must be byte-for-byte identical.
+    # ingress behavior) must be byte-for-byte identical. Use the original
+    # pre-Phase-1 revision/archive to produce ${BASELINE_FILE} -- see this
+    # script's header comment for the exact capture command.
     sed -E '/helm\.sh\/chart:/d' "$BASELINE_FILE" > "${WORKDIR}/baseline-stripped.yaml"
     sed -E '/helm\.sh\/chart:/d' "$LEGACY_RENDERED" > "${WORKDIR}/after-stripped.yaml"
 
@@ -109,10 +433,21 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
   else
     skip "legacy baseline comparison (baseline file missing or render failed)"
   fi
+
+  if [ -s "$LEGACY_RENDERED" ] && [ "$PYTHON_AVAILABLE" = "true" ]; then
+    if python3 "$DUPLICATE_KEY_CHECK_PY" "$LEGACY_RENDERED"; then
+      pass "legacy rendered manifest has no duplicate YAML mapping keys"
+    else
+      fail "legacy rendered manifest contains a duplicate YAML mapping key or is not valid YAML"
+    fi
+  else
+    skip "legacy duplicate-key check (rendered manifest unavailable or PyYAML missing)"
+  fi
 else
   skip "helm lint (legacy) -- helm not installed"
   skip "helm template (legacy) -- helm not installed"
   skip "legacy baseline comparison -- helm not installed"
+  skip "legacy duplicate-key check -- helm not installed"
 fi
 
 echo ""
@@ -180,85 +515,31 @@ fi
 echo ""
 
 # ---------------------------------------------------------------------
-# 8: resource contract assertions
+# 8: resource contract assertions (Python/PyYAML, duplicate-key-safe,
+# reads actual Kubernetes object structure -- never indentation grep)
 # ---------------------------------------------------------------------
-assert_contains() {
-  local file="$1" pattern="$2" description="$3"
-  if [ ! -s "$file" ]; then
-    skip "$description -- rendered manifest not available"
-    return
-  fi
-  if grep -qF -- "$pattern" "$file"; then
-    pass "$description"
-  else
-    fail "$description (pattern not found: ${pattern})"
-  fi
-}
-
-assert_count() {
-  local file="$1" pattern="$2" expected="$3" description="$4"
-  if [ ! -s "$file" ]; then
-    skip "$description -- rendered manifest not available"
-    return
-  fi
-  local actual
-  actual="$(grep -cE -- "$pattern" "$file" || true)"
-  if [ "$actual" -eq "$expected" ]; then
-    pass "$description (found ${actual})"
-  else
-    fail "$description (expected ${expected}, found ${actual})"
-  fi
-}
-
-assert_absent() {
-  local file="$1" pattern="$2" description="$3"
-  if [ ! -s "$file" ]; then
-    skip "$description -- rendered manifest not available"
-    return
-  fi
-  if grep -qF -- "$pattern" "$file"; then
-    fail "$description (unexpectedly found: ${pattern})"
-  else
-    pass "$description"
-  fi
-}
-
 echo "--- Oracle candidate resource contract ---"
-assert_count    "$ORACLE_RENDERED" '^kind: StatefulSet$'          1 "exactly one StatefulSet"
-assert_contains "$ORACLE_RENDERED" "- name: ogg-oracle"             "expected main container name (ogg-oracle)"
-assert_absent   "$ORACLE_RENDERED" "goldengate-observer"            "no observer container"
-assert_absent   "$ORACLE_RENDERED" "utility-sidecar"                "no manager utility-sidecar"
-assert_absent   "$ORACLE_RENDERED" "fluent-bit"                     "no Fluent Bit sidecar"
-assert_contains "$ORACLE_RENDERED" "name: gg-oracle-payments-01"    "runtime name gg-oracle-payments-01"
-assert_contains "$ORACLE_RENDERED" 'namespace: "goldengate-dev"'    "namespace goldengate-dev"
-assert_contains "$ORACLE_RENDERED" "serviceAccountName: gg-oracle-sa" "ServiceAccount gg-oracle-sa"
-assert_contains "$ORACLE_RENDERED" "containerPort: 9013"            "dist port 9013 present"
-assert_absent   "$ORACLE_RENDERED" "name: receiver"                 "receiver port absent"
-assert_contains "$ORACLE_RENDERED" "containerPort: 9015"            "metrics port 9015 present"
-assert_count    "$ORACLE_RENDERED" '^\s*- host:'                  1 "one expected hostname"
-assert_absent   "$ORACLE_RENDERED" "kind: Namespace"                "no Namespace document"
-assert_contains "$ORACLE_RENDERED" "ServiceManager.pid"             "stale PID cleanup present"
-assert_contains "$ORACLE_RENDERED" "gg-efs-dev-gg-oracle-payments-01" "unique StorageClass name"
-assert_contains "$ORACLE_RENDERED" "gg-oracle-payments-01-u02"      "unique PVC name"
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  set +e
+  ORACLE_VALIDATION_OUTPUT="$(python3 "$CANDIDATE_VALIDATOR_PY" "$ORACLE_RENDERED" "$ORACLE_VALUES" gg-oracle-payments-01 goldengate-dev Oracle)"
+  set -e
+  echo "$ORACLE_VALIDATION_OUTPUT"
+  accumulate_python_summary "$ORACLE_VALIDATION_OUTPUT"
+else
+  skip "Oracle resource contract validation -- python3/PyYAML not available"
+fi
 
 echo ""
 echo "--- PostgreSQL candidate resource contract ---"
-assert_count    "$POSTGRESQL_RENDERED" '^kind: StatefulSet$'        1 "exactly one StatefulSet"
-assert_contains "$POSTGRESQL_RENDERED" "- name: ogg-postgresql"       "expected main container name (ogg-postgresql)"
-assert_absent   "$POSTGRESQL_RENDERED" "goldengate-observer"          "no observer container"
-assert_absent   "$POSTGRESQL_RENDERED" "utility-sidecar"              "no manager utility-sidecar"
-assert_absent   "$POSTGRESQL_RENDERED" "fluent-bit"                   "no Fluent Bit sidecar"
-assert_contains "$POSTGRESQL_RENDERED" "name: gg-postgresql-payments-01" "runtime name gg-postgresql-payments-01"
-assert_contains "$POSTGRESQL_RENDERED" 'namespace: "goldengate-dev"'  "namespace goldengate-dev"
-assert_contains "$POSTGRESQL_RENDERED" "serviceAccountName: gg-postgresql-sa" "ServiceAccount gg-postgresql-sa"
-assert_contains "$POSTGRESQL_RENDERED" "containerPort: 9014"          "receiver port 9014 present"
-assert_absent   "$POSTGRESQL_RENDERED" "name: dist"                   "dist port absent"
-assert_contains "$POSTGRESQL_RENDERED" "containerPort: 9015"          "metrics port 9015 present"
-assert_count    "$POSTGRESQL_RENDERED" '^\s*- host:'                1 "one expected hostname"
-assert_absent   "$POSTGRESQL_RENDERED" "kind: Namespace"              "no Namespace document"
-assert_contains "$POSTGRESQL_RENDERED" "ServiceManager.pid"           "stale PID cleanup present"
-assert_contains "$POSTGRESQL_RENDERED" "gg-efs-dev-gg-postgresql-payments-01" "unique StorageClass name"
-assert_contains "$POSTGRESQL_RENDERED" "gg-postgresql-payments-01-u02" "unique PVC name"
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  set +e
+  POSTGRESQL_VALIDATION_OUTPUT="$(python3 "$CANDIDATE_VALIDATOR_PY" "$POSTGRESQL_RENDERED" "$POSTGRESQL_VALUES" gg-postgresql-payments-01 goldengate-dev PostgreSQL)"
+  set -e
+  echo "$POSTGRESQL_VALIDATION_OUTPUT"
+  accumulate_python_summary "$POSTGRESQL_VALIDATION_OUTPUT"
+else
+  skip "PostgreSQL resource contract validation -- python3/PyYAML not available"
+fi
 
 echo ""
 
@@ -283,6 +564,18 @@ if [ -f "$WORKFLOW_FILE" ]; then
     pass "workflow resolves deploymentModel from the base git revision for deletions"
   else
     fail "workflow does not resolve deploymentModel from the base git revision for deletions"
+  fi
+
+  if grep -qF 'StrictSafeLoader' "$WORKFLOW_FILE"; then
+    pass "workflow rendered-manifest validation rejects duplicate YAML mapping keys"
+  else
+    fail "workflow rendered-manifest validation does not reject duplicate YAML mapping keys"
+  fi
+
+  if grep -qF 'spec.template.spec.containers' "$WORKFLOW_FILE"; then
+    pass "workflow reads containers from spec.template.spec.containers, not indentation grep"
+  else
+    fail "workflow does not read containers from spec.template.spec.containers"
   fi
 else
   skip "static workflow assertions -- ${WORKFLOW_FILE} not found"

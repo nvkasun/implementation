@@ -25,7 +25,6 @@ spec:
     metadata:
       labels:
         {{- include "goldengate.runtimeLabels" . | nindent 8 }}
-        {{- include "goldengate.runtimeSelectorLabels" . | nindent 8 }}
     spec:
       serviceAccountName: {{ include "goldengate.runtimeServiceAccountName" . }}
 
