@@ -119,6 +119,35 @@ module "goldengate_pipeline_state" {
 # blocks below let an already-applied item move to its new for_each address
 # without a delete/recreate; if it was never applied, the moved block is a
 # harmless no-op and the for_each resource is simply created normally.
+#
+# OPERATIONAL RULE -- read the plan before applying, every time this file
+# changes:
+#
+#   Scenario A (plan shows CREATE for both pipeline_config[...] addresses):
+#     the old explicit resources were never applied. The new records receive
+#     the corrected passive CONFIG payload directly. Proceed after normal
+#     review -- no special handling needed.
+#
+#   Scenario B (plan shows only MOVE for both addresses, no attribute diff):
+#     the old explicit resources already exist in remote state.
+#     lifecycle.ignore_changes = [item] means Terraform will NOT show or
+#     apply any difference between the old remote payload and this file's
+#     corrected passive payload -- a MOVE-only plan does not by itself prove
+#     the live item already matches. Before applying:
+#       1. Read both current DynamoDB CONFIG items (read-only
+#          get-item/describe -- never write).
+#       2. If they still contain the previous active payload
+#          (autoStartEnabled=true, autoRestartMaxRetries=3,
+#          autoRestartWindowMinutes=30, defaults.failoverEnabled=true) or the
+#          misspelled dispatchStallChecks field, perform a controlled
+#          one-time reconciliation: temporarily remove ignore_changes for
+#          that migration apply, verify the resulting payload matches this
+#          file exactly, then restore ignore_changes in a subsequent,
+#          separately reviewed commit.
+#       3. Do not remove ignore_changes from this steady-state file itself
+#          unless that one-time migration has been confirmed necessary --
+#          this local correction pass does not perform or assume that
+#          migration; it only documents the rule for whoever applies next.
 moved {
   from = aws_dynamodb_table_item.gg_oracle_payments_01_config
   to   = aws_dynamodb_table_item.pipeline_config["gg-oracle-payments-01"]
@@ -130,11 +159,32 @@ moved {
 }
 
 resource "aws_dynamodb_table_item" "pipeline_config" {
+  # Table creation ordering: module.goldengate_pipeline_state (above) sources
+  # from a private AbuDhabiCommercialBank GitHub repo this environment cannot
+  # reach (no network credentials to that host), so its exact output names
+  # (e.g. a hypothetical .name/.hash_key/.range_key) cannot be verified --
+  # no local documentation, cached module metadata, or existing
+  # module.X.Y-output usage exists anywhere in this repository either. Per
+  # "do not guess module output names," table_name/hash_key/range_key below
+  # stay the existing literal strings (matching this repo's established
+  # convention of hardcoding names/ARNs rather than referencing unverified
+  # module outputs), and this explicit depends_on takes over the ordering
+  # guarantee a verified module-output reference would otherwise have
+  # provided implicitly -- so a fresh environment cannot attempt CONFIG item
+  # creation before the shared table exists.
+  depends_on = [
+    module.goldengate_pipeline_state
+  ]
+
+  # Exact manager for_each value pattern (terraform/platform/dynamodb.tf in
+  # the manager reference repo): the map value is d.type itself (a bare
+  # string), not the whole d object -- each.value below is therefore already
+  # the deploymentType string.
   for_each = {
     for d in yamldecode(
       file("${path.module}/../../pipelines/deployments.yaml")
     ).deployments :
-    "gg-${d.name}" => d
+    "gg-${d.name}" => d.type
   }
 
   table_name = "gg-eks-pipeline"
@@ -144,7 +194,7 @@ resource "aws_dynamodb_table_item" "pipeline_config" {
   item = jsonencode({
     pipeline       = { S = each.key }
     recordType     = { S = "CONFIG" }
-    deploymentType = { S = each.value.type }
+    deploymentType = { S = each.value }
 
     alertsEnabled            = { BOOL = false }
     metricsEnabled           = { BOOL = true }
@@ -154,7 +204,7 @@ resource "aws_dynamodb_table_item" "pipeline_config" {
     startupGraceSeconds      = { N = "300" }
     autoStartEnabled         = { BOOL = false }
     autoRestartMaxRetries    = { N = "0" }
-    autoRestartWindowMinutes = { N = "30" }
+    autoRestartWindowMinutes = { N = "0" }
     trailRetentionHours      = { N = "48" }
 
     defaults = { M = {

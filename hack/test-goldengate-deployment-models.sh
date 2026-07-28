@@ -1543,10 +1543,13 @@ if "pipelines/deployments.yaml" in block:
 else:
     bad("for_each does not reference pipelines/deployments.yaml")
 
-if re.search(r'"gg-\$\{d\.name\}"', block):
-    ok("canonical key is derived exactly once as \"gg-${d.name}\"")
+# Exact manager pattern (terraform/platform/dynamodb.tf): the for_each map
+# value is d.type itself (a bare string), i.e. "gg-${d.name}" => d.type --
+# not "=> d" (the whole object).
+if re.search(r'"gg-\$\{d\.name\}"\s*=>\s*d\.type', block):
+    ok('for_each is exactly "gg-${d.name}" => d.type (exact manager pattern)')
 else:
-    bad("canonical key derivation \"gg-${d.name}\" not found in for_each")
+    bad('for_each is not exactly "gg-${d.name}" => d.type')
 
 # The derivation must appear exactly once (not once per runtime).
 derivation_count = len(re.findall(r'"gg-\$\{d\.name\}"', block))
@@ -1560,10 +1563,30 @@ if re.search(r'pipeline\s*=\s*\{\s*S\s*=\s*each\.key\s*\}', block):
 else:
     bad("item.pipeline does not use each.key")
 
-if re.search(r'deploymentType\s*=\s*\{\s*S\s*=\s*each\.value\.type\s*\}', block):
-    ok("item.deploymentType uses each.value.type")
+# each.value IS the deploymentType string now (for_each maps to d.type, not
+# to the whole d object) -- deploymentType must use bare each.value, and
+# each.value.type must NOT appear anywhere in the resource.
+if re.search(r'deploymentType\s*=\s*\{\s*S\s*=\s*each\.value\s*\}', block):
+    ok("item.deploymentType uses each.value")
 else:
-    bad("item.deploymentType does not use each.value.type")
+    bad("item.deploymentType does not use each.value")
+
+if "each.value.type" in block:
+    bad("each.value.type still appears in pipeline_config -- for_each now maps to d.type directly, so each.value IS the type")
+else:
+    ok("no each.value.type remains in pipeline_config")
+
+# Table creation ordering: either a verified module output reference (none
+# exist anywhere in this repo, and the module source is an unreachable
+# private repo, so this branch is not expected to be used yet) or an
+# explicit depends_on on the table module.
+has_module_output_dep = bool(re.search(r'module\.goldengate_pipeline_state\.\w+', block))
+has_explicit_depends_on = bool(re.search(r'depends_on\s*=\s*\[\s*module\.goldengate_pipeline_state\s*\]', block))
+if has_module_output_dep or has_explicit_depends_on:
+    kind = "verified module output reference" if has_module_output_dep else "explicit depends_on = [module.goldengate_pipeline_state]"
+    ok(f"pipeline_config has a verified table-creation dependency ({kind})")
+else:
+    bad("pipeline_config has neither a module output reference nor an explicit depends_on on module.goldengate_pipeline_state")
 
 # Field names like alertsEnabled/metricsEnabled/credSyncEnabled/
 # autoStartEnabled legitimately contain the substring "enabled" -- what must
@@ -1585,6 +1608,7 @@ passive_checks = [
     (r'credSyncEnabled\s*=\s*\{\s*BOOL\s*=\s*false\s*\}', "credSyncEnabled=false"),
     (r'autoStartEnabled\s*=\s*\{\s*BOOL\s*=\s*false\s*\}', "autoStartEnabled=false"),
     (r'autoRestartMaxRetries\s*=\s*\{\s*N\s*=\s*"0"\s*\}', "autoRestartMaxRetries=0"),
+    (r'autoRestartWindowMinutes\s*=\s*\{\s*N\s*=\s*"0"\s*\}', "autoRestartWindowMinutes=0"),
     (r'failoverEnabled\s*=\s*\{\s*BOOL\s*=\s*false\s*\}', "defaults.failoverEnabled=false"),
     (r'alertEachAbend\s*=\s*\{\s*BOOL\s*=\s*false\s*\}', "defaults.alertEachAbend=false"),
 ]
@@ -1762,7 +1786,7 @@ echo ""
 echo "--- Isolated scratch terraform validate: generic for_each resource + moved blocks + synthetic 3rd (disabled) inventory entry ---"
 if [ "$TERRAFORM_AVAILABLE" = "true" ]; then
   TF_SCRATCH_DIR2="${WORKDIR}/tf-isolated-validate-forEach"
-  mkdir -p "${TF_SCRATCH_DIR2}/envs/dev" "${TF_SCRATCH_DIR2}/pipelines"
+  mkdir -p "${TF_SCRATCH_DIR2}/envs/dev" "${TF_SCRATCH_DIR2}/pipelines" "${TF_SCRATCH_DIR2}/envs/dev/dummy_pipeline_state"
   cat > "${TF_SCRATCH_DIR2}/envs/dev/provider.tf" <<'EOF'
 terraform {
   required_providers {
@@ -1780,6 +1804,20 @@ provider "aws" {
   skip_metadata_api_check     = true
   access_key                  = "test"
   secret_key                  = "test"
+}
+EOF
+  # pipeline_config's depends_on references module.goldengate_pipeline_state
+  # by address, not by output -- the real module's source is an unreachable
+  # private repo, so this local stub (a trivial same-tree module with no
+  # resources) exists purely to let the address resolve for isolated
+  # validation. It does not attempt to reproduce the real module's content.
+  cat > "${TF_SCRATCH_DIR2}/envs/dev/dummy_pipeline_state/main.tf" <<'EOF'
+# Intentionally empty -- stands in only for the module address, not its
+# real (unreachable, private) content.
+EOF
+  cat > "${TF_SCRATCH_DIR2}/envs/dev/table_stub.tf" <<'EOF'
+module "goldengate_pipeline_state" {
+  source = "./dummy_pipeline_state"
 }
 EOF
   awk '/^moved \{/{found=1} found{print}' "$DYNAMODB_TF" > "${TF_SCRATCH_DIR2}/envs/dev/config_items.tf"

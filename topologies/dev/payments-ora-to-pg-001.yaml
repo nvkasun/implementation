@@ -17,7 +17,16 @@
 #     deployments.json) -- a structurally separate concept from DynamoDB
 #     CONFIG. This document is this repository's own topology-as-data
 #     artifact for the same purpose; it does not copy the manager's
-#     ConfigMap/sidecar deployment mechanism.
+#     ConfigMap/sidecar deployment mechanism, and it is NOT already in the
+#     exact manager deployments.json / process-pipeline-map.json format --
+#     any future generation/mounting of manager-compatible ConfigMap data
+#     from this file is Phase 4 (shared-monitor) work, not implemented here.
+#   - This is our source topology for the future shared gg-monitor's
+#     REST/PMS polling: the endpoints below are what that (not-yet-built,
+#     passive-only) monitor will poll. In Phase 4, this file and
+#     pipelines/deployments.yaml together are expected to drive/generate the
+#     shared monitor's topology and inventory data -- that generation step
+#     does not exist yet and is out of scope for this phase.
 #   - No credentials, secret values, private keys, or tokens appear here --
 #     only Secrets Manager object-name references, matching the same
 #     objectName values already used by the runtime Helm charts'
