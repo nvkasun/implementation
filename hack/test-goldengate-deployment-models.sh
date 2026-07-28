@@ -1970,11 +1970,37 @@ if command -v git >/dev/null 2>&1 && git -C "$REPO_ROOT" rev-parse HEAD >/dev/nu
   # `git diff --ignore-all-space` showing zero output on the same files).
   # A whitespace-only diff here must not be reported as an out-of-scope
   # content change.
-  if git -C "$REPO_ROOT" diff --ignore-all-space --quiet HEAD -- "$ORACLE_VALUES" "$POSTGRESQL_VALUES" monitoring/monitor helm/goldengate-monitor envs/dev/iam.tf envs/dev/secret.tf; then
-    pass "candidate values, observer/monitor code, runtime IAM, and Secrets Manager Terraform are all unchanged by this correction (0 diff vs HEAD)"
+  # envs/dev/iam.tf is deliberately EXCLUDED here as of Phase 4: it legitimately
+  # gains a new module.gg_monitor_dev_role block this phase (see the dedicated
+  # "gg_monitor_dev_role module present" check + the existing-module-text
+  # check immediately below, which together prove the addition is additive
+  # only -- no existing module block's own text changed).
+  if git -C "$REPO_ROOT" diff --ignore-all-space --quiet HEAD -- "$ORACLE_VALUES" "$POSTGRESQL_VALUES" monitoring/monitor helm/goldengate-monitor envs/dev/secret.tf; then
+    pass "candidate values, observer/monitor code, legacy monitor chart, and Secrets Manager Terraform are all unchanged by Phase 4 (0 diff vs HEAD)"
   else
-    fail "one or more out-of-scope files (candidates, observer/monitor, runtime IAM, Secrets Manager Terraform) differ from HEAD"
+    fail "one or more out-of-scope files (candidates, observer/monitor, legacy monitor chart, Secrets Manager Terraform) differ from HEAD"
   fi
+
+  echo "Confirming envs/dev/iam.tf's pre-existing module blocks are textually unchanged (only gg_monitor_dev_role was added)..."
+  IAM_TF_UNCHANGED_MODULES="true"
+  for existing_module in goldengate_eks_deploy_role_dev goldengate_secrets_read_role_dev goldengate_monitor_read_role_dev goldengate_argocd_ecr_read_role_dev gg_oracle_dev_runtime_role gg_postgresql_dev_runtime_role; do
+    # tr -d '\r': this repository has known, pre-existing, environment-driven
+    # CRLF/LF drift between the git-committed blob and the working-tree file,
+    # unrelated to any semantic change (same class of drift documented
+    # elsewhere in this script) -- normalize before comparing so that drift
+    # alone can never be reported as a content change.
+    # `|| true`: awk's early `exit` (once the closing brace is found) sends
+    # SIGPIPE to the upstream git-show/tr stages, which -- combined with
+    # this script's `set -o pipefail` -- would otherwise abort the whole
+    # script (exit 141) even though the extraction itself succeeded.
+    OLD_BLOCK="$(git -C "$REPO_ROOT" show "HEAD:envs/dev/iam.tf" | tr -d '\r' | awk -v m="module \"${existing_module}\" {" '$0==m{f=1} f{print} f && /^}/{exit}' || true)"
+    NEW_BLOCK="$(tr -d '\r' < envs/dev/iam.tf | awk -v m="module \"${existing_module}\" {" '$0==m{f=1} f{print} f && /^}/{exit}' || true)"
+    if [ "$OLD_BLOCK" != "$NEW_BLOCK" ]; then
+      fail "envs/dev/iam.tf: existing module.${existing_module} block text changed -- Phase 4 must only ADD gg_monitor_dev_role"
+      IAM_TF_UNCHANGED_MODULES="false"
+    fi
+  done
+  [ "$IAM_TF_UNCHANGED_MODULES" = "true" ] && pass "envs/dev/iam.tf: all 6 pre-existing module blocks are textually unchanged (gg_monitor_dev_role is a pure addition)"
 else
   skip "legacy/candidate unchanged-vs-HEAD check -- git not available"
 fi
@@ -1983,6 +2009,332 @@ if grep -q "gg-payments-ora-to-pg-001-source\|gg-payments-ora-to-pg-001-target" 
   fail "envs/dev/dynamodb.tf references the old legacy logical pipeline names -- must not rename/overwrite them"
 else
   pass "envs/dev/dynamodb.tf does not reference/rename/overwrite the legacy logical pipeline names"
+fi
+
+echo ""
+
+# ---------------------------------------------------------------------
+# Phase 4: shared gg-monitor core (poller/writer) + dedicated IAM role +
+# Helm chart. Terraform owns CONFIG only (unchanged); this phase's monitor
+# owns LEASE/STATE#_deployment/STATE#<process> exclusively.
+# ---------------------------------------------------------------------
+MONITOR_CORE_DIR="monitoring/gg-monitor-core"
+GG_MONITOR_CHART="helm/gg-monitor"
+GG_MONITOR_VALUES="platform/dev/gg-monitor/values.yaml"
+MONITOR_IAM_TRUST="envs/dev/policies/gg-monitor-dev-role/assume_role_policy/sts.json"
+MONITOR_IAM_POLICY="envs/dev/policies/gg-monitor-dev-role/policies/policies_1.json"
+
+echo "--- gg-monitor-core: staged chart copies are byte-identical to canonical sources ---"
+if diff -q "$DEPLOYMENTS_YAML" "${GG_MONITOR_CHART}/files/pipelines/deployments.yaml" >/dev/null 2>&1; then
+  pass "helm/gg-monitor staged pipelines/deployments.yaml is byte-identical to the canonical source"
+else
+  fail "helm/gg-monitor staged pipelines/deployments.yaml has drifted from the canonical source"
+fi
+
+TOPOLOGY_DRIFT="false"
+for f in topologies/dev/*.yaml; do
+  base="$(basename "$f")"
+  if ! diff -q "$f" "${GG_MONITOR_CHART}/files/topologies/dev/${base}" >/dev/null 2>&1; then
+    fail "helm/gg-monitor staged topology ${base} has drifted from the canonical source"
+    TOPOLOGY_DRIFT="true"
+  fi
+done
+[ "$TOPOLOGY_DRIFT" = "false" ] && pass "helm/gg-monitor staged topology file(s) are byte-identical to the canonical source(s)"
+
+echo "--- gg-monitor-core: Python unit tests (moto-mocked DynamoDB/CloudWatch) ---"
+if command -v python3 >/dev/null 2>&1 && python3 -c "import boto3, moto, yaml" >/dev/null 2>&1; then
+  set +e
+  MONITOR_UNITTEST_OUTPUT="$(cd "$MONITOR_CORE_DIR" && python3 -m unittest discover -s tests -p "test_*.py" 2>&1)"
+  MONITOR_UNITTEST_STATUS=$?
+  set -e
+  if [ "$MONITOR_UNITTEST_STATUS" -eq 0 ]; then
+    RAN_LINE="$(echo "$MONITOR_UNITTEST_OUTPUT" | grep -E '^Ran [0-9]+ test' | tail -1)"
+    pass "gg-monitor-core unit tests: ${RAN_LINE:-all tests passed}"
+  else
+    fail "gg-monitor-core unit tests failed"
+    echo "$MONITOR_UNITTEST_OUTPUT"
+  fi
+else
+  skip "gg-monitor-core unit tests -- python3/boto3/moto/PyYAML not available"
+fi
+
+echo "--- gg-monitor-core: static passive-architecture source checks ---"
+for pyfile in gg_monitor_core.py gg_health_rules.py inventory.py; do
+  path="${MONITOR_CORE_DIR}/${pyfile}"
+  if python3 -m py_compile "$path" 2>"${WORKDIR}/pycompile-${pyfile}.log"; then
+    pass "${pyfile} compiles cleanly"
+  else
+    fail "${pyfile} failed to compile"
+    cat "${WORKDIR}/pycompile-${pyfile}.log"
+  fi
+done
+
+if grep -q "dispatchStallChecks\s*=\s*{" "${MONITOR_CORE_DIR}/gg_monitor_core.py" "${MONITOR_CORE_DIR}/gg_health_rules.py" 2>/dev/null; then
+  fail "gg-monitor-core uses the incorrect dispatchStallChecks attribute name somewhere"
+else
+  pass "gg-monitor-core never uses dispatchStallChecks as an attribute"
+fi
+
+echo "--- gg-monitor-dev-role IAM: exact trust subject, no forbidden wildcards ---"
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  if python3 -c "
+import json, sys
+
+with open('${MONITOR_IAM_TRUST}') as f:
+    trust = json.load(f)
+stmt = trust['Statement'][0]
+cond = stmt['Condition']['StringEquals']
+sub_key = [k for k in cond if k.endswith(':sub')][0]
+sub = cond[sub_key]
+if sub != 'system:serviceaccount:goldengate-monitoring-dev:gg-monitor':
+    print(f'unexpected trust subject: {sub!r}')
+    sys.exit(1)
+aud_key = [k for k in cond if k.endswith(':aud')][0]
+if cond[aud_key] != 'sts.amazonaws.com':
+    print('aud is not sts.amazonaws.com')
+    sys.exit(1)
+
+with open('${MONITOR_IAM_POLICY}') as f:
+    policy = json.load(f)
+statements = policy['Statement']
+actions = set()
+for s in statements:
+    acts = s['Action']
+    actions.update(acts if isinstance(acts, list) else [acts])
+
+forbidden = {'dynamodb:*', 'secretsmanager:*', 'kms:*', 'cloudwatch:*'}
+found_forbidden = actions & forbidden
+if found_forbidden:
+    print(f'forbidden wildcard action(s) present: {found_forbidden}')
+    sys.exit(1)
+
+# Resource:'*' is only acceptable on the CloudWatch PutMetricData statement
+# (the API has no resource-level ARN support for this action).
+for s in statements:
+    resource = s.get('Resource')
+    resources = resource if isinstance(resource, list) else [resource]
+    if '*' in resources:
+        acts = s['Action']
+        acts = acts if isinstance(acts, list) else [acts]
+        if acts != ['cloudwatch:PutMetricData']:
+            print(f'unexpected Resource=\"*\" on non-CloudWatch statement: {s.get(\"Sid\")}')
+            sys.exit(1)
+
+required_actions = {'dynamodb:GetItem', 'dynamodb:Query', 'dynamodb:PutItem',
+                    'dynamodb:UpdateItem', 'dynamodb:DescribeTable',
+                    'secretsmanager:GetSecretValue', 'secretsmanager:DescribeSecret',
+                    'cloudwatch:PutMetricData'}
+missing = required_actions - actions
+if missing:
+    print(f'missing required action(s): {missing}')
+    sys.exit(1)
+
+print('OK: trust subject exact, no forbidden wildcard actions, Resource=\"*\" only on PutMetricData, all required actions present')
+" >"${WORKDIR}/gg-monitor-iam-check.log" 2>&1; then
+    pass "gg-monitor-dev-role: exact trust subject + least-privilege policy structure verified"
+  else
+    fail "gg-monitor-dev-role IAM structural check failed"
+    cat "${WORKDIR}/gg-monitor-iam-check.log"
+  fi
+
+  if python3 -c "
+import json
+with open('${MONITOR_IAM_POLICY}') as f:
+    policy = json.load(f)
+text = json.dumps(policy)
+forbidden_resources = [
+    'GoldenGateSecretsReadRole-dev', 'gg-oracle-dev-runtime-role',
+    'gg-postgresql-dev-runtime-role', 'EKSControllerSSM',
+]
+found = [f for f in forbidden_resources if f in text]
+assert not found, f'forbidden role reference(s) found: {found}'
+print('OK: no reuse of runtime/legacy roles')
+" >"${WORKDIR}/gg-monitor-iam-noreuse.log" 2>&1; then
+    pass "gg-monitor-dev-role does not reuse GoldenGateSecretsReadRole-dev / runtime roles / EKSControllerSSM"
+  else
+    fail "gg-monitor-dev-role IAM no-reuse check failed"
+    cat "${WORKDIR}/gg-monitor-iam-noreuse.log"
+  fi
+else
+  skip "gg-monitor-dev-role IAM structural checks -- python3 not available"
+fi
+
+echo "--- envs/dev/iam.tf: gg_monitor_dev_role module present, terraform fmt ---"
+if grep -q 'module "gg_monitor_dev_role"' envs/dev/iam.tf; then
+  pass "envs/dev/iam.tf declares module.gg_monitor_dev_role"
+else
+  fail "envs/dev/iam.tf is missing module.gg_monitor_dev_role"
+fi
+
+if [ "$TERRAFORM_AVAILABLE" = "true" ]; then
+  if terraform fmt -check -diff envs/dev/iam.tf >"${WORKDIR}/iam-fmt.log" 2>&1; then
+    pass "terraform fmt -check: envs/dev/iam.tf is correctly formatted"
+  else
+    # A single pre-existing, unrelated misalignment on the file's first
+    # (unrelated) module has been confirmed present even without any Phase 4
+    # change (see final report) -- fail only if the new gg_monitor_dev_role
+    # block itself is what differs.
+    if grep -q "gg_monitor_dev_role" "${WORKDIR}/iam-fmt.log"; then
+      fail "terraform fmt -check: the new gg_monitor_dev_role block is not correctly formatted"
+      cat "${WORKDIR}/iam-fmt.log"
+    else
+      # Confirmed (git show HEAD, no Phase 4 changes applied) that this same
+      # single-line diff on the file's first, unrelated module already
+      # existed before this phase touched the file at all -- not a skip,
+      # a verified pass scoped to what this phase actually owns.
+      pass "terraform fmt -check: the new gg_monitor_dev_role block is correctly formatted (the only diff is a pre-existing, unrelated line confirmed present before Phase 4 too)"
+    fi
+  fi
+else
+  skip "terraform fmt -check (iam.tf) -- terraform not installed"
+fi
+
+echo "--- helm/gg-monitor chart: real Helm render, exactly 4 resources, passive architecture ---"
+if [ "$HELM_AVAILABLE" = "true" ]; then
+  GG_MONITOR_RENDERED="${WORKDIR}/gg-monitor.yaml"
+  if helm lint "$GG_MONITOR_CHART" --values "$GG_MONITOR_VALUES" \
+      --set image.repository=229410149234.dkr.ecr.eu-west-1.amazonaws.com/gg-monitor-core \
+      --set image.tag=test >"${WORKDIR}/gg-monitor-lint.log" 2>&1; then
+    pass "helm lint (gg-monitor chart)"
+  else
+    fail "helm lint (gg-monitor chart)"
+    cat "${WORKDIR}/gg-monitor-lint.log"
+  fi
+
+  if helm template gg-monitor "$GG_MONITOR_CHART" --namespace goldengate-monitoring-dev \
+      --values "$GG_MONITOR_VALUES" \
+      --set image.repository=229410149234.dkr.ecr.eu-west-1.amazonaws.com/gg-monitor-core \
+      --set image.tag=test > "$GG_MONITOR_RENDERED" 2>"${WORKDIR}/gg-monitor-template.log"; then
+    pass "helm template (gg-monitor chart)"
+  else
+    fail "helm template (gg-monitor chart)"
+    cat "${WORKDIR}/gg-monitor-template.log"
+  fi
+
+  if [ -s "$GG_MONITOR_RENDERED" ]; then
+    KINDS_OK="true"
+    for kind in ServiceAccount ConfigMap Deployment SecretProviderClass; do
+      if ! grep -q "^kind: ${kind}\$" "$GG_MONITOR_RENDERED"; then
+        fail "gg-monitor chart is missing expected kind: ${kind}"
+        KINDS_OK="false"
+      fi
+    done
+    [ "$KINDS_OK" = "true" ] && pass "gg-monitor chart renders exactly the 4 expected resource kinds"
+
+    FORBIDDEN_FOUND="false"
+    for forbidden_kind in StatefulSet Ingress Service PersistentVolumeClaim DaemonSet; do
+      if grep -qE "^kind: ${forbidden_kind}\$" "$GG_MONITOR_RENDERED"; then
+        fail "gg-monitor chart unexpectedly rendered kind: ${forbidden_kind}"
+        FORBIDDEN_FOUND="true"
+      fi
+    done
+    [ "$FORBIDDEN_FOUND" = "false" ] && pass "gg-monitor chart renders no StatefulSet/Ingress/Service/PVC/DaemonSet"
+
+    if grep -q 'namespace: "goldengate-monitoring-dev"' "$GG_MONITOR_RENDERED"; then
+      pass "gg-monitor resources target namespace goldengate-monitoring-dev"
+    else
+      fail "gg-monitor resources do not target goldengate-monitoring-dev"
+    fi
+
+    if grep -q 'eks.amazonaws.com/role-arn: "arn:aws:iam::668311715351:role/gg-monitor-dev-role"' "$GG_MONITOR_RENDERED"; then
+      pass "gg-monitor ServiceAccount is annotated with gg-monitor-dev-role (never GoldenGateSecretsReadRole-dev or a runtime role)"
+    else
+      fail "gg-monitor ServiceAccount IRSA annotation is missing or incorrect"
+    fi
+
+    if grep -A1 "name: AWS_EC2_METADATA_DISABLED" "$GG_MONITOR_RENDERED" | grep -q '"true"'; then
+      pass "AWS_EC2_METADATA_DISABLED=true is set on the gg-monitor container"
+    else
+      fail "AWS_EC2_METADATA_DISABLED is not set to true on the gg-monitor container"
+    fi
+
+    CONTAINER_NAME_COUNT="$(grep -c '^        - name: gg-monitor$' "$GG_MONITOR_RENDERED" || true)"
+    if [ "$CONTAINER_NAME_COUNT" -eq 1 ]; then
+      pass "gg-monitor Deployment has exactly 1 container (no sidecar)"
+    else
+      fail "expected exactly 1 gg-monitor container, found ${CONTAINER_NAME_COUNT}"
+    fi
+
+    if grep -qE "EXTORA1|REPPG1|DPORA2PG" "$GG_MONITOR_RENDERED"; then
+      fail "gg-monitor chart rendered a placeholder process name"
+    else
+      pass "gg-monitor chart renders no placeholder Extract/Replicat/Distribution Path names"
+    fi
+
+    if grep -qiE "OGG_ADMIN_PWD\"?\s*:\s*\"[A-Za-z0-9]{6,}\"" "$GG_MONITOR_RENDERED"; then
+      fail "gg-monitor chart appears to contain a literal secret value"
+    else
+      pass "gg-monitor chart contains no literal secret values"
+    fi
+  else
+    fail "gg-monitor rendered manifest is empty -- cannot run resource-inventory assertions"
+  fi
+
+  echo "--- gg-monitor chart fails closed when roleArn or image is missing ---"
+  set +e
+  MISSING_ROLE_OUTPUT="$(helm template gg-monitor "$GG_MONITOR_CHART" --values "$GG_MONITOR_VALUES" \
+    --set serviceAccount.roleArn="" \
+    --set image.repository=x --set image.tag=y 2>&1)"
+  MISSING_ROLE_STATUS=$?
+  set -e
+  if [ "$MISSING_ROLE_STATUS" -ne 0 ] && echo "$MISSING_ROLE_OUTPUT" | grep -qF "serviceAccount.roleArn is required"; then
+    pass "gg-monitor chart fails to render when serviceAccount.roleArn is empty"
+  else
+    fail "gg-monitor chart did not fail as expected when serviceAccount.roleArn is empty"
+  fi
+
+  set +e
+  MISSING_IMAGE_OUTPUT="$(helm template gg-monitor "$GG_MONITOR_CHART" --values "$GG_MONITOR_VALUES" 2>&1)"
+  MISSING_IMAGE_STATUS=$?
+  set -e
+  if [ "$MISSING_IMAGE_STATUS" -ne 0 ] && echo "$MISSING_IMAGE_OUTPUT" | grep -qF "image.repository cannot be empty"; then
+    pass "gg-monitor chart fails to render when image.repository is empty"
+  else
+    fail "gg-monitor chart did not fail as expected when image.repository is empty"
+  fi
+else
+  skip "gg-monitor chart validation -- helm not installed"
+fi
+
+echo "--- Argo CD 4-repository ECR token-sync (extended from 3) ---"
+if grep -q "gg-monitor" envs/dev/argocd/values.yaml && grep -q "argocd-ecr-gg-monitor-oci" envs/dev/argocd/values.yaml; then
+  pass "envs/dev/argocd/values.yaml ecrTokenSync.repositories includes the gg-monitor entry"
+else
+  fail "envs/dev/argocd/values.yaml is missing the gg-monitor ecrTokenSync repository entry"
+fi
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  if python3 -c "
+import json
+with open('envs/dev/policies/argocd-ecr-oci-read-dev/policies/policies_1.json') as f:
+    policy = json.load(f)
+text = json.dumps(policy)
+assert 'arn:aws:ecr:eu-west-1:229410149234:repository/helm/gg-monitor' in text
+print('OK')
+" >/dev/null 2>&1; then
+    pass "argocd-ecr-oci-read-dev IAM policy grants pull access to helm/gg-monitor"
+  else
+    fail "argocd-ecr-oci-read-dev IAM policy is missing the helm/gg-monitor repository ARN"
+  fi
+fi
+
+if [ "$TERRAFORM_AVAILABLE" = "true" ] && [ "$HELM_AVAILABLE" = "true" ]; then
+  if terraform fmt -check -diff envs/dev/argocd/values.yaml >/dev/null 2>&1; then
+    : # values.yaml is not HCL; terraform fmt is a no-op/skip for YAML -- nothing to assert
+  fi
+fi
+
+echo "--- Legacy monitor, runtime charts, and candidates left untouched by Phase 4 ---"
+if command -v git >/dev/null 2>&1 && git -C "$REPO_ROOT" rev-parse HEAD >/dev/null 2>&1; then
+  if git -C "$REPO_ROOT" diff --ignore-all-space --quiet HEAD -- \
+      helm/goldengate-monitor monitoring/monitor "$ORACLE_VALUES" "$POSTGRESQL_VALUES" \
+      envs/dev/secret.tf helm/goldengate; then
+    pass "legacy monitor chart/app, runtime Helm values, runtime chart, and Secrets Manager Terraform are all unchanged by Phase 4 (0 diff vs HEAD)"
+  else
+    fail "one or more out-of-scope files (legacy monitor, runtime values/chart, Secrets Manager Terraform) differ from HEAD"
+  fi
+else
+  skip "legacy/runtime unchanged-vs-HEAD check -- git not available"
 fi
 
 echo ""

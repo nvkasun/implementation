@@ -1,0 +1,47 @@
+# gg-monitor -- dev environment values (Phase 4).
+#
+# Deliberately NOT under envs/dev/: the GoldenGate runtime deployment
+# workflow scans envs/dev/* first-level folders as runtime deployment IDs --
+# this is the shared monitor, not a runtime.
+environment: dev
+
+image:
+  repository: ""  # set by the deploying workflow (ECR repository URI)
+  tag: ""          # set by the deploying workflow (content-addressed tag)
+
+namespace:
+  name: goldengate-monitoring-dev
+
+replicaCount: 1
+
+aws:
+  region: eu-west-1
+
+dynamodb:
+  tableName: gg-eks-pipeline
+
+serviceAccount:
+  create: true
+  name: gg-monitor
+  # Deterministic IRSA role ARN (this repository has no Terraform
+  # outputs.tf anywhere -- every other role ARN referenced by these
+  # workflows is also a literal predicted ARN): arn:aws:iam::<account>:role/<name>.
+  roleArn: arn:aws:iam::668311715351:role/gg-monitor-dev-role
+
+secrets:
+  region: eu-west-1
+  oracle:
+    admin:
+      objectName: dev/goldengate/source/admin
+      objectType: secretsmanager
+      usernameKey: OGG_ADMIN
+      passwordKey: OGG_ADMIN_PWD
+  postgresql:
+    admin:
+      objectName: dev/goldengate/target/admin
+      objectType: secretsmanager
+      usernameKey: OGG_ADMIN
+      passwordKey: OGG_ADMIN_PWD
+  tls:
+    objectName: dev/goldengate/tls-certificate
+    objectType: secretsmanager

@@ -119,3 +119,49 @@ module "gg_postgresql_dev_runtime_role" {
   data_classification  = "General"
   env                  = "dev"
 }
+
+
+# Phase 4: dedicated IRSA role for the shared gg-monitor Deployment
+# (goldengate-monitoring-dev/gg-monitor). Modeled on the manager reference
+# implementation's "sm_pod" per-pod Service Manager role (terraform/platform/
+# iam.tf in the manager reference repository, inspected read-only, not
+# modified) -- NOT the manager's own narrower "gg_monitor" role, which is
+# read-only and never polls/writes because that responsibility lives entirely
+# in the manager's per-pod utility-sidecar. Our shared monitor takes over
+# exactly that writer/poller role externally (no utility sidecar in runtime
+# pods), so it needs the sm_pod-equivalent write permissions instead.
+#
+# Trust is scoped to exactly system:serviceaccount:goldengate-monitoring-dev:gg-monitor
+# -- never GoldenGateSecretsReadRole-dev, gg-oracle-dev-runtime-role,
+# gg-postgresql-dev-runtime-role, or EKSControllerSSM-gg-poc-dev-eu.
+#
+# Deliberately OMITTED pending live verification (do not guess, matching the
+# precedent set for the runtime roles): kms:Decrypt for either DynamoDB or
+# Secrets Manager. envs/dev/dynamodb.tf's table module sets
+# custom_kms_key_arn = null (no customer-managed key configured there), and
+# no Secrets Manager KmsKeyId has been verified for the 3 secrets below (see
+# the prior KMS verification task) -- this sandbox has no AWS CLI/credentials
+# to confirm either. If a customer-managed key is later confirmed for either,
+# add a scoped kms:Decrypt statement then; do not add one on a guess now.
+#
+# cloudwatch:PutMetricData uses Resource="*" because the CloudWatch API does
+# not support resource-level ARNs for this action (same exception the
+# manager's own sm_pod policy documents) -- scoped instead via the
+# cloudwatch:namespace condition to GoldenGate/Pipelines only.
+module "gg_monitor_dev_role" {
+  source = "git::https://github.com/AbuDhabiCommercialBank/aws-tf-module-iam-role.git?ref=v2.0.0"
+
+  name          = "gg-monitor-dev-role"
+  description   = "IRSA role for the shared gg-monitor Deployment: read/write gg-eks-pipeline (CONFIG read, LEASE/STATE write), read runtime admin + TLS secrets, publish GoldenGate/Pipelines CloudWatch metrics"
+  policy_folder = "gg-monitor-dev-role"
+
+  managed_policy_arns = []
+
+  map_migrated         = "comm5TZY31HX9S"
+  business_criticality = "Low"
+  application_name     = "CloudFactory"
+  cost_center          = "219"
+  business_unit        = "TechnologyPlatform"
+  data_classification  = "General"
+  env                  = "dev"
+}
