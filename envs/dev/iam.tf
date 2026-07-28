@@ -135,19 +135,59 @@ module "gg_postgresql_dev_runtime_role" {
 # -- never GoldenGateSecretsReadRole-dev, gg-oracle-dev-runtime-role,
 # gg-postgresql-dev-runtime-role, or EKSControllerSSM-gg-poc-dev-eu.
 #
-# Deliberately OMITTED pending live verification (do not guess, matching the
-# precedent set for the runtime roles): kms:Decrypt for either DynamoDB or
-# Secrets Manager. envs/dev/dynamodb.tf's table module sets
-# custom_kms_key_arn = null (no customer-managed key configured there), and
-# no Secrets Manager KmsKeyId has been verified for the 3 secrets below (see
-# the prior KMS verification task) -- this sandbox has no AWS CLI/credentials
-# to confirm either. If a customer-managed key is later confirmed for either,
-# add a scoped kms:Decrypt statement then; do not add one on a guess now.
+# =====================================================================
+# KMS DEPLOYMENT GATE -- DO NOT DISMISS. gg-monitor-dev-role is NOT safe to
+# apply/use until the items below are verified and this comment is updated.
+# =====================================================================
+# The manager reference implementation's own "sm_pod" role (this role's
+# structural template) DOES include kms:Decrypt, and this repository's own
+# already-successful, already-working runtime roles (GoldenGateSecretsReadRole-dev
+# and friends) also grant kms:Decrypt. That precedent is real and is NOT being
+# dismissed here -- it means this role is very likely MISSING a required
+# permission right now, not that KMS access is unnecessary.
+#
+# kms:Decrypt is deliberately OMITTED below (not guessed, matching the
+# precedent already set for the two runtime roles in this same file) because
+# the exact encryption configuration has not been verified live for any of:
+#   - DynamoDB table gg-eks-pipeline (envs/dev/dynamodb.tf's table module
+#     sets custom_kms_key_arn = null, i.e. no customer-managed key configured
+#     THERE, but the module's own internal default SSE type -- AWS owned key,
+#     AWS managed key, or a CMK -- has not been confirmed live)
+#   - dev/goldengate/source/admin
+#   - dev/goldengate/target/admin
+#   - dev/goldengate/tls-certificate
+# This sandbox has no AWS CLI/credentials to run the verification commands
+# (aws dynamodb describe-table / aws secretsmanager describe-secret
+# --query KmsKeyId) -- guessing a key ARN or alias here would repeat the
+# exact mistake already reverted once in this repository's IAM history.
+#
+# BEFORE this role can be safely deployed:
+#   1. Run, read-only, against each of the 4 resources above:
+#        aws dynamodb describe-table --table-name gg-eks-pipeline \
+#          --query 'Table.SSEDescription'
+#        aws secretsmanager describe-secret --secret-id <name> --query KmsKeyId
+#   2. If every result shows an AWS-owned/no-CMK default: no kms:Decrypt
+#      statement is required at all; update this comment to say so and
+#      close this gate.
+#   3. If any result is a customer-managed key ARN: add a least-privilege
+#      kms:Decrypt statement scoped to that EXACT key ARN, with
+#      kms:ViaService (dynamodb.eu-west-1.amazonaws.com or
+#      secretsmanager.eu-west-1.amazonaws.com as applicable),
+#      kms:CallerAccount = 668311715351, and the same encryption-context
+#      condition pattern already proven elsewhere in this repository
+#      (see envs/dev/policies/goldengate-monitor-read-dev/policies/policies_1.json
+#      for the DynamoDB kms:ViaService pattern). Also confirm the CMK's own
+#      key policy permits gg-monitor-dev-role (or account-level IAM
+#      delegation) to call kms:Decrypt -- an IAM statement alone is not
+#      sufficient if the key policy does not also allow it.
+#   4. Do not apply this Terraform module against real AWS until step 2 or 3
+#      has been completed for all 4 resources.
 #
 # cloudwatch:PutMetricData uses Resource="*" because the CloudWatch API does
 # not support resource-level ARNs for this action (same exception the
 # manager's own sm_pod policy documents) -- scoped instead via the
-# cloudwatch:namespace condition to GoldenGate/Pipelines only.
+# cloudwatch:namespace condition to GoldenGate/Pipelines only. This is not
+# part of the KMS gate above; PutMetricData needs no KMS permission.
 module "gg_monitor_dev_role" {
   source = "git::https://github.com/AbuDhabiCommercialBank/aws-tf-module-iam-role.git?ref=v2.0.0"
 

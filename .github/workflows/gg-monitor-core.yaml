@@ -196,8 +196,11 @@ jobs:
             fi
           fi
 
+      # Deliberately UNGATED (no IMAGE_EXISTED check): image reuse must never
+      # suppress source/configuration validation -- these run on every
+      # execution of this workflow regardless of whether the
+      # content-addressed image tag already exists in ECR.
       - name: Validate monitor Python syntax
-        if: env.IMAGE_EXISTED != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -205,7 +208,6 @@ jobs:
           python3 -m compileall -q "${MONITOR_SOURCE_PATH}"
 
       - name: Run monitor unit tests
-        if: env.IMAGE_EXISTED != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -285,7 +287,11 @@ jobs:
           fi
           helm version --short
           if ! command -v kubectl >/dev/null 2>&1; then
-            KUBECTL_VERSION="v1.35.0"
+            # Pinned to 1.33.x (latest stable patch per
+            # https://dl.k8s.io/release/stable-1.33.txt) to match the EKS
+            # 1.33 cluster this workflow targets -- do not bump to 1.35.x,
+            # which is a newer minor than the cluster's control plane.
+            KUBECTL_VERSION="v1.33.13"
             ARCH="$(uname -m)"; case "$ARCH" in x86_64) KUBECTL_ARCH="amd64" ;; aarch64|arm64) KUBECTL_ARCH="arm64" ;; *) exit 1 ;; esac
             curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /tmp/kubectl
             sudo mv /tmp/kubectl /usr/local/bin/kubectl
@@ -583,14 +589,112 @@ jobs:
           echo "Deployment rollout:"
           kubectl rollout status deployment/gg-monitor -n "$RUNTIME_NAMESPACE" --timeout=5m
 
-          echo "Read-only DynamoDB verification (LEASE/STATE for both canonical runtimes -- no write, describe/get only):"
-          for pipeline in gg-oracle-payments-01 gg-postgresql-payments-01; do
-            echo "-- ${pipeline} --"
-            aws dynamodb get-item --region "$AWS_REGION" --table-name gg-eks-pipeline \
-              --key "{\"pipeline\":{\"S\":\"${pipeline}\"},\"recordType\":{\"S\":\"LEASE\"}}" || true
-            aws dynamodb get-item --region "$AWS_REGION" --table-name gg-eks-pipeline \
-              --key "{\"pipeline\":{\"S\":\"${pipeline}\"},\"recordType\":{\"S\":\"STATE#_deployment\"}}" || true
-          done
+      - name: Verify DynamoDB records from inside the gg-monitor pod (in-pod IRSA identity, no runner credentials, no `|| true`)
+        if: ${{ inputs.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # This verification deliberately does NOT use the CodeBuild
+          # runner's own AWS credentials (that would prove nothing about
+          # gg-monitor's own IRSA identity, and silently masked AccessDenied
+          # via `|| true`). It runs INSIDE the gg-monitor container via
+          # `kubectl exec`, so every AWS call goes through the pod's actual
+          # ServiceAccount -> IRSA -> gg-monitor-dev-role identity, and any
+          # failure (AccessDenied, wrong identity, missing/malformed record)
+          # fails this step for real -- no `|| true` anywhere below.
+          POD_NAME="$(kubectl get pods -n "$RUNTIME_NAMESPACE" -l app.kubernetes.io/name=gg-monitor -o jsonpath='{.items[0].metadata.name}')"
+
+          cat > "${RUNNER_TEMP}/verify_gg_monitor_dynamodb.py" <<'PYEOF'
+          import sys
+          import time
+
+          import boto3
+
+          EXPECTED_ROLE_FRAGMENT = "assumed-role/gg-monitor-dev-role/"
+          TABLE_NAME = "gg-eks-pipeline"
+          REGION = "eu-west-1"
+          PIPELINES = ["gg-oracle-payments-01", "gg-postgresql-payments-01"]
+          TIMEOUT_SECONDS = 180
+          POLL_INTERVAL_SECONDS = 5
+
+          def fail(msg):
+              print(f"FAIL: {msg}")
+              sys.exit(1)
+
+          sts = boto3.client("sts", region_name=REGION)
+          try:
+              identity = sts.get_caller_identity()
+          except Exception as e:
+              fail(f"sts.get_caller_identity() failed (AccessDenied or connectivity issue): {e}")
+
+          arn = identity.get("Arn", "")
+          print(f"Caller identity ARN: {arn}")
+          if EXPECTED_ROLE_FRAGMENT not in arn:
+              fail(f"unexpected caller identity -- expected ARN to contain {EXPECTED_ROLE_FRAGMENT!r}, got {arn!r}")
+          print("OK: caller identity is the expected gg-monitor-dev-role assumed role.")
+
+          table = boto3.resource("dynamodb", region_name=REGION).Table(TABLE_NAME)
+
+          def get_item(pipeline, record_type):
+              try:
+                  resp = table.get_item(Key={"pipeline": pipeline, "recordType": record_type})
+              except Exception as e:
+                  fail(f"get_item({pipeline!r}, {record_type!r}) failed: {e}")
+              return resp.get("Item")
+
+          required = [(p, rt) for p in PIPELINES for rt in ("LEASE", "STATE#_deployment")]
+          deadline = time.time() + TIMEOUT_SECONDS
+          items = {}
+          while time.time() < deadline:
+              items = {(p, rt): get_item(p, rt) for p, rt in required}
+              if all(items.values()):
+                  break
+              missing = [f"{p}/{rt}" for (p, rt), v in items.items() if not v]
+              print(f"waiting for records to appear: {missing} (elapsed {int(time.time() - (deadline - TIMEOUT_SECONDS))}s)")
+              time.sleep(POLL_INTERVAL_SECONDS)
+          else:
+              missing = [f"{p}/{rt}" for (p, rt), v in items.items() if not v]
+              fail(f"timed out after {TIMEOUT_SECONDS}s waiting for records: {missing}")
+
+          now = int(time.time())
+          for pipeline in PIPELINES:
+              config_item = get_item(pipeline, "CONFIG")
+              if not config_item:
+                  fail(f"{pipeline}: CONFIG record is missing (must remain present -- Terraform-owned, never touched by the monitor)")
+              print(f"OK: {pipeline}/CONFIG present.")
+
+              state_item = items[(pipeline, "STATE#_deployment")]
+              for field in ("status", "recordedAt", "deploymentType"):
+                  if field not in state_item:
+                      fail(f"{pipeline}/STATE#_deployment missing required field: {field}")
+              print(f"OK: {pipeline}/STATE#_deployment has status={state_item['status']!r}, "
+                    f"recordedAt={state_item['recordedAt']}, deploymentType={state_item['deploymentType']!r}.")
+
+              lease_item = items[(pipeline, "LEASE")]
+              for field in ("holder", "expiresAt", "ttl", "leaseToken"):
+                  if field not in lease_item:
+                      fail(f"{pipeline}/LEASE missing required field: {field}")
+              if int(lease_item["expiresAt"]) <= now:
+                  fail(f"{pipeline}/LEASE expiresAt ({lease_item['expiresAt']}) is not in the future (now={now}) -- lease appears expired")
+              print(f"OK: {pipeline}/LEASE holder={lease_item['holder']!r}, expiresAt={lease_item['expiresAt']} (future), "
+                    f"ttl={lease_item['ttl']}, leaseToken present.")
+
+              # Zero STATE#<process> records expected: current topology has no
+              # configured Extract/Replicat/Distribution Path.
+              resp = table.query(
+                  KeyConditionExpression="pipeline = :p AND begins_with(recordType, :prefix)",
+                  ExpressionAttributeValues={":p": pipeline, ":prefix": "STATE#"},
+              )
+              process_records = [it for it in resp.get("Items", []) if it["recordType"] != "STATE#_deployment"]
+              if process_records:
+                  names = [it["recordType"] for it in process_records]
+                  fail(f"{pipeline}: unexpected STATE#<process> record(s) found (topology has no configured processes): {names}")
+              print(f"OK: {pipeline} has zero STATE#<process> records, as expected for the current empty topology.")
+
+          print("OK: all DynamoDB verifications passed.")
+          PYEOF
+
+          kubectl exec -i "$POD_NAME" -n "$RUNTIME_NAMESPACE" -c gg-monitor -- python3 - < "${RUNNER_TEMP}/verify_gg_monitor_dynamodb.py"
 
       - name: Upload rendered manifests and chart package
         if: always()

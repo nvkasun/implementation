@@ -4,8 +4,10 @@ ConfigMap -- these are STAGED COPIES under this chart's files/ directory, not
 a second hand-authored runtime list. Helm can only read files inside its own
 chart directory (.Files.Get has no access to paths outside the chart), so
 the deploying workflow re-stages (re-copies) these files from the repository
-root immediately before packaging on every run -- see the "Stage canonical
-inventory/topology files" step in .github/workflows/goldengate-platform.yaml.
+root immediately before packaging on every run -- see the "Re-stage canonical
+inventory/topology files into the chart" step in
+.github/workflows/gg-monitor-core.yaml (NOT goldengate-platform.yaml, which
+does not touch this chart at all).
 hack/test-goldengate-deployment-models.sh independently asserts the staged
 copies are byte-identical to the real canonical sources, so this can never
 silently drift into an actual second list.

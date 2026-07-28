@@ -3,9 +3,9 @@
 
 Takes over the manager reference implementation's per-pod utility-sidecar
 writer responsibilities (LEASE ownership, STATE#_deployment / STATE#<process>
-writes, REST/PMS polling, CloudWatch metric publication) as ONE shared,
-external Deployment -- because our approved architecture has no utility
-sidecar inside GoldenGate runtime pods (see
+writes, GoldenGate Admin REST polling, CloudWatch metric publication) as ONE
+shared, external Deployment -- because our approved architecture has no
+utility sidecar inside GoldenGate runtime pods (see
 charts/gg-deployment/files/utility-sidecar.py in the manager reference
 repository, inspected read-only, never modified or copied into runtime pods).
 
@@ -20,13 +20,22 @@ Passive by construction: this file contains no code path that starts,
 restarts, stops, or fences a GoldenGate process, calls a Kubernetes mutation
 API, or pushes credentials into GoldenGate. See gg_health_rules.py for what
 was deliberately left out and why.
+
+Terminology: this module polls the GoldenGate Admin REST API (port 8443)
+only -- exactly what the manager utility-sidecar polls. It does NOT poll the
+separate PMS/metrics endpoint (port 9015); that endpoint is listed in
+topology for a later, explicitly implemented phase and is unused here. Do
+not describe this module as "REST/PMS polling".
 """
 from __future__ import annotations
 
+import functools
+import http.client
 import json
 import logging
 import os
 import secrets as _secrets
+import socket
 import ssl
 import sys
 import threading
@@ -41,9 +50,11 @@ from botocore.exceptions import ClientError
 
 import gg_health_rules as gh
 from inventory import (
+    StartupValidationError,
     build_deployments_json,
     build_process_pipeline_map_json,
     load_runtimes,
+    validate_enabled_runtimes,
 )
 
 logging.basicConfig(
@@ -57,6 +68,10 @@ logger = logging.getLogger("gg-monitor-core")
 LEASE_TTL = int(os.environ.get("LEASE_TTL", "30"))
 RENEW_INTERVAL = int(os.environ.get("RENEW_INTERVAL", "5"))
 GRACE = 60  # ttl ATTRIBUTE = expiresAt + GRACE (DynamoDB TTL janitor for abandoned leases)
+# How finely the polling loop's sleep is chopped up so it notices a lease
+# demotion promptly instead of sleeping out the full checkIntervalSeconds
+# (default 60s) window regardless of leadership.
+POLL_SLEEP_GRANULARITY = min(RENEW_INTERVAL, 5)
 
 AWS_REGION = os.environ.get("AWS_REGION", "eu-west-1")
 DDB_TABLE = os.environ.get("DDB_TABLE", "gg-eks-pipeline")
@@ -166,21 +181,76 @@ class LeaseManager:
             raise
 
 
+class LeaseState:
+    """Thread-safe leader/readiness state shared between one pipeline's
+    dedicated lease-control loop and its polling loop (fix 1: these are two
+    independent loops/threads per pipeline, not one loop reusing the
+    60-second poll interval for lease renewal too)."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._is_leader = False
+        self._ready = False
+
+    def set_leader(self, value):
+        with self._lock:
+            self._is_leader = value
+
+    def is_leader(self):
+        with self._lock:
+            return self._is_leader
+
+    def set_ready(self, value=True):
+        with self._lock:
+            self._ready = value
+
+    def is_ready(self):
+        with self._lock:
+            return self._ready
+
+
+def lease_control_loop(mgr, state, stop_event, renew_interval=RENEW_INTERVAL):
+    """Dedicated lease acquire/renew loop -- runs on its OWN cadence
+    (renew_interval, default 5s), completely independent of
+    CONFIG.checkIntervalSeconds (default 60s). This is the fix for the
+    deployment blocker: previously lease renewal only happened once per
+    60-second poll tick, so a 30-second-TTL lease always expired mid-sleep.
+
+    Mirrors the manager's utility-sidecar lease_loop in structure: renew if
+    leader, else try to acquire; demote immediately (state.set_leader(False))
+    the instant a renew/acquire call reports the lease is not (or no longer)
+    held. state.is_ready() flips true once this loop has successfully
+    exercised the lease API at least once (proves DynamoDB connectivity and
+    IAM permissions for the lease path) -- independent of who currently
+    holds the lease.
+    """
+    while not stop_event.is_set():
+        try:
+            ok = mgr.renew() if state.is_leader() else mgr.acquire()
+            if ok:
+                if not state.is_leader():
+                    logger.info("Acquired lease for %s; this instance is leader.", mgr.pipeline)
+                state.set_leader(True)
+            else:
+                if state.is_leader():
+                    logger.warning("Lost lease for %s; demoting to standby immediately.", mgr.pipeline)
+                state.set_leader(False)
+            state.set_ready(True)
+        except Exception:
+            logger.exception("lease control loop error for %s; treating as standby", mgr.pipeline)
+            state.set_leader(False)
+        stop_event.wait(renew_interval)
+
+
 # ---------------------------------------------------------------------
-# TLS. Real network calls (not the sidecar's loopback case): TLS
-# verification is always ON. The chain is verified against the shared
-# GoldenGate TLS object's CA (dev/goldengate/tls-certificate, ca-chain.pem).
-# check_hostname is disabled for the same class of reason the manager's own
-# _pms_ssl_context() documents for its loopback call -- but for a genuinely
-# different, equally honest reason here: the certificate's CN/SAN is the
-# external Ingress hostname (*.goldengate-dev.adcbmis.local), not the
-# internal Kubernetes Service DNS name we connect to
-# (gg-<name>.goldengate-dev.svc.cluster.local). The chain (and therefore the
-# certificate's authenticity) is still fully verified; only the hostname
-# comparison is skipped, and only because the two names are legitimately
-# different by design, not because verification was disabled outright. This
-# is never a verify=false / CERT_NONE fallback -- if the CA file is missing,
-# building the context raises instead of silently downgrading to unverified.
+# TLS. Real network calls (not the sidecar's loopback case): full server
+# identity verification is always ON -- check_hostname=True,
+# verify_mode=CERT_REQUIRED, never CERT_NONE. The connect address (internal
+# Kubernetes Service DNS) and the TLS server-identity-check name
+# (tlsServerName, matching the shared wildcard certificate's SAN pattern)
+# are DIFFERENT strings by design -- see _SNIHTTPSConnection below, which
+# is the mechanism that lets urllib connect to one host while verifying
+# against another (plain urllib/http.client conflate the two).
 # ---------------------------------------------------------------------
 _SSL_CTX = None
 
@@ -196,7 +266,10 @@ def _build_ssl_context(ca_file=CA_FILE):
         )
     ctx = ssl.create_default_context()
     ctx.load_verify_locations(ca_file)
-    ctx.check_hostname = False  # CN is the external Ingress host, not internal Service DNS
+    # Explicit, not merely relying on create_default_context()'s own
+    # defaults, so a future refactor can never silently weaken this:
+    ctx.check_hostname = True
+    ctx.verify_mode = ssl.CERT_REQUIRED
     _SSL_CTX = ctx
     return ctx
 
@@ -214,12 +287,42 @@ def _read_secret_file(path):
         return ""
 
 
-def _basic_opener(user, pwd, base, ssl_ctx):
-    mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
-    mgr.add_password(None, base, user, pwd)
-    handler = urllib.request.HTTPBasicAuthHandler(mgr)
-    https_handler = urllib.request.HTTPSHandler(context=ssl_ctx)
-    return urllib.request.build_opener(handler, https_handler)
+class _SNIHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPSConnection that connects to self.host (the internal Kubernetes
+    Service DNS name, parsed from the request URL as usual) but sends SNI
+    and verifies the server certificate against a SEPARATE tls_server_name
+    -- required because the shared wildcard certificate's SAN matches the
+    external Ingress hostname pattern, not *.svc.cluster.local. Never falls
+    back to an unverified connection: wrap_socket always runs through the
+    caller-supplied context, which is always check_hostname=True +
+    CERT_REQUIRED (see _build_ssl_context)."""
+
+    def __init__(self, *args, tls_server_name=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._tls_server_name = tls_server_name
+
+    def connect(self):
+        sock = socket.create_connection((self.host, self.port), self.timeout)
+        server_hostname = self._tls_server_name or self.host
+        self.sock = self._context.wrap_socket(sock, server_hostname=server_hostname)
+
+
+def _basic_opener(user, pwd, base, ssl_ctx, tls_server_name):
+    """Build a urllib OpenerDirector that performs HTTP Basic auth and TLS
+    verification against tls_server_name (SNI + hostname check), while the
+    TCP connection itself goes to the host embedded in `base` (internal
+    Service DNS)."""
+    pwd_mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+    pwd_mgr.add_password(None, base, user, pwd)
+    auth_handler = urllib.request.HTTPBasicAuthHandler(pwd_mgr)
+
+    conn_factory = functools.partial(_SNIHTTPSConnection, tls_server_name=tls_server_name)
+
+    class _SNIHTTPSHandler(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            return self.do_open(conn_factory, req, context=ssl_ctx)
+
+    return urllib.request.build_opener(auth_handler, _SNIHTTPSHandler())
 
 
 def _http_json(url, opener, timeout=5):
@@ -238,10 +341,12 @@ def _http_status(url, opener, timeout=5):
 
 
 # ---------------------------------------------------------------------
-# REST/PMS polling (ported verbatim from the manager's utility-sidecar
-# fetch_gg_processes -- same endpoints, same parsing, same tolerant
-# per-process error handling). base = the runtime's internal Kubernetes
-# Service DNS admin endpoint, never the external Ingress URL.
+# GoldenGate Admin REST polling (ported verbatim from the manager's
+# utility-sidecar fetch_gg_processes -- same endpoints, same parsing, same
+# tolerant per-process error handling). Port 8443 (Admin REST) only -- the
+# separate PMS/metrics endpoint (port 9015) is not polled by this module.
+# base = the runtime's internal Kubernetes Service DNS admin endpoint, never
+# the external Ingress URL.
 # ---------------------------------------------------------------------
 def fetch_gg_processes(base, opener):
     _http_json(f"{base}/services/v2/deployments", opener)  # liveness probe
@@ -411,42 +516,97 @@ def read_config(table, pipeline):
 
 
 # ---------------------------------------------------------------------
-# Per-pipeline poll/lease/write tick loop. One thread per ENABLED runtime
-# (mirrors the manager's per-deployment sidecar isolation -- one pipeline's
-# slowness/failure never blocks another -- consolidated into this single
-# shared process because we have no per-pod sidecar). Each thread gets its
-# own boto3 Table resource: boto3 Table objects are not thread-safe across
-# concurrent update_item calls (same lesson as the manager's utility-sidecar
-# main(), which gives health_thread its own resource for the same reason).
+# Runtime readiness prerequisites (fix 2). Distinct from STARTUP validation
+# (inventory.validate_enabled_runtimes, which is fatal/hard-fails the whole
+# process before it ever starts serving): these are per-pipeline checks
+# that must succeed at least once before this pipeline is reported Ready,
+# but a transient failure here just keeps retrying -- it never crashes the
+# process. Deliberately does NOT include "GoldenGate Admin REST reachable":
+# the runtime API being down must not make the monitor pod unready.
+#
+# Deliberately does NOT call mgr.acquire()/mgr.renew() here: an early test
+# acquire would set holder/leaseToken in DynamoDB using this function's own
+# call, but leave LeaseState.is_leader() at its initial False -- the real
+# lease_control_loop's first acquire() attempt would then be rejected by its
+# own already-in-place condition (holder already set, expiresAt still in the
+# future), silently delaying real leadership by up to LEASE_TTL for no
+# reason. The lease API path is instead exercised (and read as ready) by
+# lease_control_loop itself -- see LeaseState.is_ready(), set there after its
+# own first successful acquire/renew call -- so there is exactly one place
+# that ever calls the lease API for a given pipeline+table pair at a time.
 # ---------------------------------------------------------------------
-def pipeline_thread(runtime, stop_event, ready_state):
+def check_static_prerequisites(runtime, table):
+    """Returns (ok: bool, reason: str). reason is empty when ok=True."""
+    deployment_type = runtime["type"]
+
+    user_file = ADMIN_USER_FILE.get(deployment_type)
+    pwd_file = ADMIN_PASSWORD_FILE.get(deployment_type)
+    if not user_file or not pwd_file:
+        return False, f"no credential-file mapping for type {deployment_type!r}"
+    if not _read_secret_file(user_file):
+        return False, f"credential file empty or unreadable: {user_file}"
+    if not _read_secret_file(pwd_file):
+        return False, f"credential file empty or unreadable: {pwd_file}"
+
+    try:
+        _build_ssl_context()
+    except RuntimeError as e:
+        return False, f"TLS context unavailable: {e}"
+
+    try:
+        read_config(table, runtime["pipeline"])
+    except Exception as e:
+        return False, f"DynamoDB CONFIG read failed: {e}"
+
+    return True, ""
+
+
+# ---------------------------------------------------------------------
+# Per-pipeline poll/write tick loop (fix 1: lease renewal now lives in its
+# own lease_control_loop above, on its own RENEW_INTERVAL cadence -- this
+# loop only polls/writes, gated on state.is_leader(), and sleeps in short
+# increments so it notices a lease demotion promptly instead of riding out
+# the full checkIntervalSeconds window regardless of leadership).
+# ---------------------------------------------------------------------
+def polling_loop(runtime, table, mgr, state, stop_event):
     pipeline = runtime["pipeline"]
     deployment_type = runtime["type"]
-    table = boto3.resource("dynamodb", region_name=AWS_REGION).Table(DDB_TABLE)
-    cw = boto3.client("cloudwatch", region_name=AWS_REGION)
-    mgr = LeaseManager(table, pipeline, MONITOR_INSTANCE)
-    is_leader = {"value": False}
     started = now_epoch()
     last_dep_status = None
     distpath_mem = {}
 
-    endpoints = runtime.get("endpoints") or {}
-    admin_ep = endpoints.get("admin") or {}
-    base = None
-    if admin_ep.get("host") and admin_ep.get("port"):
-        base = f"{admin_ep.get('scheme', 'https')}://{admin_ep['host']}:{admin_ep['port']}"
+    admin_ep = (runtime.get("endpoints") or {}).get("admin") or {}
+    base = f"{admin_ep.get('scheme', 'https')}://{admin_ep['host']}:{admin_ep['port']}"
+    tls_server_name = admin_ep.get("tlsServerName")
 
-    admin_user_file = ADMIN_USER_FILE.get(deployment_type)
-    admin_password_file = ADMIN_PASSWORD_FILE.get(deployment_type)
+    process_pipeline_map = build_process_pipeline_map_json([runtime])
 
     def _guarded_write(proc, snap, counters=None):
         ok = write_process_state(table, mgr, pipeline, deployment_type, proc, snap,
-                                 lambda: is_leader["value"], counters=counters)
+                                 state.is_leader, counters=counters)
         if not ok:
             logger.warning("tick fenced off for %s/%s; aborting tick", pipeline, proc)
             raise _FencedOff()
 
-    logger.info("pipeline thread started for %s (type=%s, base=%s)", pipeline, deployment_type, base)
+    def _sleep_watching_leadership(total_seconds):
+        """Sleeps up to total_seconds in POLL_SLEEP_GRANULARITY-sized steps,
+        waking early if stop_event fires OR leadership changes -- so a lease
+        loss/gain is noticed within one granularity step (default 5s)
+        instead of riding out the full checkIntervalSeconds window (default
+        60s) regardless of leadership. This is in addition to, not instead
+        of, write-time fencing (write_process_state/_guarded_write already
+        refuse to write the instant leadership is lost, mid-tick or not)."""
+        leader_at_start = state.is_leader()
+        remaining = total_seconds
+        while remaining > 0 and not stop_event.is_set():
+            if state.is_leader() != leader_at_start:
+                break
+            step = min(POLL_SLEEP_GRANULARITY, remaining)
+            stop_event.wait(step)
+            remaining -= step
+
+    logger.info("polling loop started for %s (type=%s, base=%s, tlsServerName=%s)",
+               pipeline, deployment_type, base, tls_server_name)
 
     while not stop_event.is_set():
         interval = gh.DEFAULTS["checkIntervalSeconds"]
@@ -454,39 +614,17 @@ def pipeline_thread(runtime, stop_event, ready_state):
             cfg = gh.resolve_config(read_config(table, pipeline))
             interval = cfg["checkIntervalSeconds"]
 
-            ok = mgr.renew() if is_leader["value"] else mgr.acquire()
-            if ok:
-                if not is_leader["value"]:
-                    logger.info("Acquired lease for %s; this instance is leader.", pipeline)
-                is_leader["value"] = True
-            else:
-                if is_leader["value"]:
-                    logger.warning("Lost lease for %s; demoting to standby.", pipeline)
-                is_leader["value"] = False
-
-            ready_state[pipeline] = True
-
-            if not is_leader["value"] or base is None:
-                stop_event.wait(interval)
+            if not state.is_leader():
+                _sleep_watching_leadership(interval)
                 continue
 
             flags = {"lag": 0, "abend": 0, "down": 0}
             extra_md = []
 
-            if not admin_user_file or not admin_password_file:
-                logger.error("no admin credential files configured for deployment type %r", deployment_type)
-                stop_event.wait(interval)
-                continue
-
-            user = _read_secret_file(admin_user_file) or "oggadmin"
-            pwd = _read_secret_file(admin_password_file)
-            try:
-                ssl_ctx = _build_ssl_context()
-            except RuntimeError:
-                logger.exception("TLS context unavailable; skipping this tick")
-                stop_event.wait(interval)
-                continue
-            opener = _basic_opener(user, pwd, base, ssl_ctx)
+            user = _read_secret_file(ADMIN_USER_FILE[deployment_type]) or "oggadmin"
+            pwd = _read_secret_file(ADMIN_PASSWORD_FILE[deployment_type])
+            ssl_ctx = _build_ssl_context()
+            opener = _basic_opener(user, pwd, base, ssl_ctx, tls_server_name)
 
             try:
                 procs = fetch_gg_processes(base, opener)
@@ -501,13 +639,12 @@ def pipeline_thread(runtime, stop_event, ready_state):
                     dep_snap["lastTransitionAt"] = now_epoch()
                 _guarded_write("_deployment", dep_snap)
                 last_dep_status = status
-                logger.warning("GG API unreachable for %s (%s): %s", pipeline, status, e)
-                _emit(cw, pipeline, deployment_type, flags)
-                stop_event.wait(interval)
+                logger.warning("GoldenGate Admin REST unreachable for %s (%s): %s", pipeline, status, e)
+                _emit(_cloudwatch_client(), pipeline, deployment_type, flags)
+                _sleep_watching_leadership(interval)
                 continue
 
             source_active = any(p["type"] == "extract" and p["status"] == "RUNNING" for p in procs)
-            pipe_map = {}  # process-pipeline routing: empty topology today, see inventory.py
 
             for p in procs:
                 name, ptype, status = p["process"], p["type"], p["status"]
@@ -541,7 +678,10 @@ def pipeline_thread(runtime, stop_event, ready_state):
                 snap = {"processType": ptype, "status": status,
                         "lagSeconds": int(p["lagSeconds"]), "recordedAt": now_epoch(),
                         "resolvedThreshold": thr, "resolvedMode": mode,
-                        "pipelineName": pipe_map.get(name.upper(), ""),
+                        # Resolved from the real process-pipeline map (fix 4):
+                        # empty string only when no mapping exists for this
+                        # process name -- never a hardcoded {} lookup.
+                        "pipelineName": process_pipeline_map.get(name.upper(), {}).get("pipeline_name", ""),
                         "errorMsg": str(p.get("error", "")),
                         "performanceMetrics": p.get("metrics") or {}}
                 if str(prev.get("status")) != status:
@@ -556,16 +696,13 @@ def pipeline_thread(runtime, stop_event, ready_state):
             critical = gh.CRITICAL_SERVICES_BY_TYPE.get(deployment_type, [])
             if critical:
                 svc_up = probe_critical_services(base, opener, critical)
-                cs_state = (read_process_state(table, pipeline, "_deployment").get("criticalServices") or {})
-                cs_new = {}
+                cs_new = {svc: {"reachable": bool(up)} for svc, up in svc_up.items()}
                 for svc, up in svc_up.items():
-                    cs_new[svc] = {"reachable": bool(up)}
                     extra_md.append({"MetricName": "CriticalServiceDown",
                                      "Dimensions": [{"Name": "Deployment", "Value": pipeline},
                                                     {"Name": "DeploymentType", "Value": deployment_type},
                                                     {"Name": "Service", "Value": svc}],
                                      "Value": 0.0 if up else 1.0, "Unit": "Count"})
-                _ = cs_state  # no healing decision derived from prior state; observation only
             else:
                 cs_new = {}
 
@@ -578,13 +715,79 @@ def pipeline_thread(runtime, stop_event, ready_state):
             last_dep_status = "UP"
 
             extra_md += build_metric_data(pipeline, deployment_type, procs)
-            _emit(cw, pipeline, deployment_type, flags, extra_md)
+            _emit(_cloudwatch_client(), pipeline, deployment_type, flags, extra_md)
 
         except _FencedOff:
             pass
         except Exception:
             logger.exception("tick failed for %s; continuing next interval", pipeline)
-        stop_event.wait(interval)
+        _sleep_watching_leadership(interval)
+
+
+_CW_CLIENT = None
+_CW_LOCK = threading.Lock()
+
+
+def _cloudwatch_client():
+    global _CW_CLIENT
+    with _CW_LOCK:
+        if _CW_CLIENT is None:
+            _CW_CLIENT = boto3.client("cloudwatch", region_name=AWS_REGION)
+        return _CW_CLIENT
+
+
+# ---------------------------------------------------------------------
+# Per-pipeline supervisor: sets up dedicated DynamoDB Table/LeaseManager
+# pairs for the lease-control loop and the polling loop (boto3 Table
+# objects are not thread-safe across concurrent update_item calls -- same
+# lesson as the manager's utility-sidecar main(), which gives health_thread
+# its own resource for the same reason), waits for runtime prerequisites
+# (fix 2) before flipping readiness, then runs both loops as daemon threads.
+# ---------------------------------------------------------------------
+def run_pipeline(runtime, stop_event, ready_state):
+    pipeline = runtime["pipeline"]
+
+    lease_table = boto3.resource("dynamodb", region_name=AWS_REGION).Table(DDB_TABLE)
+    health_table = boto3.resource("dynamodb", region_name=AWS_REGION).Table(DDB_TABLE)
+
+    lease_mgr = LeaseManager(lease_table, pipeline, MONITOR_INSTANCE)
+    health_mgr = LeaseManager(health_table, pipeline, MONITOR_INSTANCE)
+    health_mgr.token = lease_mgr.token  # same lease identity -- fence semantics preserved
+
+    state = LeaseState()
+
+    # Phase 1: static prerequisites (credentials, TLS, CONFIG read) -- no
+    # lease API calls here (see check_static_prerequisites for why).
+    prereq_interval = RENEW_INTERVAL
+    while not stop_event.is_set():
+        ok, reason = check_static_prerequisites(runtime, lease_table)
+        if ok:
+            break
+        logger.warning("pipeline %s not ready yet: %s (retrying in %ss)", pipeline, reason, prereq_interval)
+        stop_event.wait(prereq_interval)
+
+    if stop_event.is_set():
+        return
+
+    # Phase 2: start the two independent loops. lease_control_loop's own
+    # first successful acquire/renew call is what proves the lease API path
+    # works -- reflected below via state.is_ready(), the single source of
+    # truth for "has the lease API been successfully exercised".
+    lease_thread = threading.Thread(
+        target=lease_control_loop, args=(lease_mgr, state, stop_event), daemon=True)
+    poll_thread = threading.Thread(
+        target=polling_loop, args=(runtime, health_table, health_mgr, state, stop_event), daemon=True)
+    lease_thread.start()
+    poll_thread.start()
+
+    while not stop_event.is_set():
+        if state.is_ready():
+            ready_state[pipeline] = True
+            break
+        stop_event.wait(1)
+
+    lease_thread.join()
+    poll_thread.join()
 
 
 # ---------------------------------------------------------------------
@@ -629,6 +832,19 @@ def start_http_server(ready_state, expected_pipelines):
 
 def main():
     runtimes = load_runtimes()
+
+    # Fatal startup validation (fix 2): an enabled runtime missing required
+    # topology/endpoint/secret-reference/type configuration must fail
+    # startup clearly, not silently continue with an unusable pipeline.
+    # sys.exit here is a normal process-entrypoint exit on bad configuration
+    # -- not a healing/mutation action (see gg_health_rules.py for what
+    # active-healing exits were removed; this is not one of them).
+    try:
+        validate_enabled_runtimes(runtimes, admin_credential_types=set(ADMIN_USER_FILE))
+    except StartupValidationError as e:
+        logger.error("startup validation failed: %s", e)
+        sys.exit(1)
+
     enabled = [r for r in runtimes if r["enabled"]]
     logger.info("loaded %d runtime(s), %d enabled: %s", len(runtimes), len(enabled),
                [r["pipeline"] for r in enabled])
@@ -643,7 +859,7 @@ def main():
 
     threads = []
     for runtime in enabled:
-        t = threading.Thread(target=pipeline_thread, args=(runtime, stop_event, ready_state), daemon=True)
+        t = threading.Thread(target=run_pipeline, args=(runtime, stop_event, ready_state), daemon=True)
         t.start()
         threads.append(t)
 

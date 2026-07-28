@@ -2324,6 +2324,215 @@ if [ "$TERRAFORM_AVAILABLE" = "true" ] && [ "$HELM_AVAILABLE" = "true" ]; then
   fi
 fi
 
+echo ""
+echo "--------------------------------------------------------------------"
+echo "Phase 4 correction pass: lease renewal, readiness, TLS SNI, process"
+echo "map, in-pod DynamoDB verification, KMS gate, and repo cleanup"
+echo "--------------------------------------------------------------------"
+
+echo "--- Fix 1: lease renewal is decoupled from the poll interval ---"
+if grep -qE "^def lease_control_loop\(mgr, state, stop_event, renew_interval=RENEW_INTERVAL\)" "${MONITOR_CORE_DIR}/gg_monitor_core.py"; then
+  pass "lease_control_loop is an independent function keyed on RENEW_INTERVAL, not the poll interval"
+else
+  fail "lease_control_loop no longer has the expected RENEW_INTERVAL-driven signature"
+fi
+if grep -qE "^def polling_loop\(runtime, table, mgr, state, stop_event\)" "${MONITOR_CORE_DIR}/gg_monitor_core.py"; then
+  pass "polling_loop is a separate function from lease_control_loop (independent threads)"
+else
+  fail "polling_loop no longer has the expected independent-thread signature"
+fi
+# code_only(): strips docstrings (via AST) and #-comment lines so these
+# static checks only see real executable code, not explanatory comments/
+# docstrings that legitimately mention a forbidden term while negating it
+# (e.g. "never CERT_NONE", "no || true", "NOT goldengate-platform.yaml").
+code_only() {
+  python3 -c "
+import ast, sys
+src = sys.stdin.read()
+try:
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)):
+            if (node.body and isinstance(node.body[0], ast.Expr) and
+                    isinstance(node.body[0].value, ast.Constant) and
+                    isinstance(node.body[0].value.value, str)):
+                node.body[0].value.value = ''
+    print(ast.unparse(tree))
+except SyntaxError:
+    print('\n'.join(l for l in src.splitlines() if not l.strip().startswith('#')))
+"
+}
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  LEASE_LOOP_BODY="$(sed -n '/^def lease_control_loop/,/^def /p' "${MONITOR_CORE_DIR}/gg_monitor_core.py" | sed '$d')"
+  if echo "$LEASE_LOOP_BODY" | code_only | grep -q "checkIntervalSeconds"; then
+    fail "lease_control_loop's executable body appears to reference checkIntervalSeconds (would re-couple lease renewal to the poll cadence)"
+  else
+    pass "lease_control_loop's cadence is not gated on checkIntervalSeconds (verified in detail by LeaseTimelineTests in the unit suite)"
+  fi
+else
+  skip "lease_control_loop checkIntervalSeconds-body check -- python3 not available"
+fi
+
+echo "--- Fix 2: readiness cannot become true before prerequisites succeed ---"
+if grep -qE "def check_static_prerequisites\(runtime, table\)" "${MONITOR_CORE_DIR}/gg_monitor_core.py" && \
+   grep -qE "def run_pipeline\(runtime, stop_event, ready_state\)" "${MONITOR_CORE_DIR}/gg_monitor_core.py"; then
+  pass "run_pipeline exposes a distinct static-prerequisite phase ahead of setting ready_state"
+else
+  fail "expected check_static_prerequisites / run_pipeline functions not found as expected"
+fi
+if grep -qE "def validate_enabled_runtimes\(runtimes, admin_credential_types\)" "${MONITOR_CORE_DIR}/inventory.py" && \
+   grep -qE "class StartupValidationError" "${MONITOR_CORE_DIR}/inventory.py"; then
+  pass "inventory.py enforces enabled-runtime startup validation (StartupValidationError)"
+else
+  fail "inventory.py is missing validate_enabled_runtimes / StartupValidationError"
+fi
+
+echo "--- Fix 3: TLS server identity -- tlsServerName present, no CERT_NONE / check_hostname=False ---"
+TLS_SNI_MISSING="false"
+for f in topologies/dev/*.yaml; do
+  if ! grep -q "tlsServerName:" "$f"; then
+    fail "${f} is missing tlsServerName on one or more admin endpoints"
+    TLS_SNI_MISSING="true"
+  fi
+done
+[ "$TLS_SNI_MISSING" = "false" ] && pass "every canonical topology file declares tlsServerName for its admin endpoint(s)"
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  if code_only < "${MONITOR_CORE_DIR}/gg_monitor_core.py" | grep -qE "CERT_NONE|check_hostname\s*=\s*False"; then
+    fail "gg_monitor_core.py's real code (comments/docstrings excluded) contains a literal CERT_NONE or check_hostname=False"
+  else
+    pass "gg_monitor_core.py's real code contains no literal CERT_NONE / check_hostname=False anywhere (only explanatory comments may mention it)"
+  fi
+else
+  skip "CERT_NONE/check_hostname=False code-only check -- python3 not available"
+fi
+if grep -qE "class _SNIHTTPSConnection" "${MONITOR_CORE_DIR}/gg_monitor_core.py"; then
+  pass "a dedicated SNI-aware HTTPS transport (_SNIHTTPSConnection) exists to separate connect-host from TLS server-name"
+else
+  fail "expected _SNIHTTPSConnection transport abstraction not found"
+fi
+
+echo "--- Fix 4: real process-pipeline map is consumed (no hardcoded {}) ---"
+if grep -qE '^\s*pipe_map\s*=\s*\{\}\s*$' "${MONITOR_CORE_DIR}/gg_monitor_core.py"; then
+  fail "gg_monitor_core.py still hardcodes an empty pipe_map = {}"
+else
+  pass "gg_monitor_core.py does not hardcode an empty process-pipeline map"
+fi
+if grep -qE "build_process_pipeline_map_json\(\[runtime\]\)" "${MONITOR_CORE_DIR}/gg_monitor_core.py"; then
+  pass "polling_loop resolves the process-pipeline map from inventory.build_process_pipeline_map_json"
+else
+  fail "polling_loop does not call build_process_pipeline_map_json as expected"
+fi
+
+echo "--- Fix 5: workflow DynamoDB verification runs inside the monitor pod, no || true ---"
+GG_MONITOR_WORKFLOW=".github/workflows/gg-monitor-core.yaml"
+if grep -qE "kubectl exec -i \"\\\$POD_NAME\" -n \"\\\$RUNTIME_NAMESPACE\" -c gg-monitor -- python3" "$GG_MONITOR_WORKFLOW"; then
+  pass "DynamoDB verification is executed via kubectl exec inside the gg-monitor container"
+else
+  fail "workflow no longer execs the DynamoDB verification script inside the gg-monitor pod"
+fi
+if grep -qE "assumed-role/gg-monitor-dev-role/" "$GG_MONITOR_WORKFLOW"; then
+  pass "in-pod verification asserts the STS caller identity is assumed-role/gg-monitor-dev-role/*"
+else
+  fail "workflow no longer asserts the in-pod IRSA identity"
+fi
+if grep -qE "aws dynamodb get-item" "$GG_MONITOR_WORKFLOW"; then
+  fail "workflow still issues aws dynamodb get-item directly from the runner (should run inside the pod only)"
+else
+  pass "workflow issues no direct runner-side aws dynamodb get-item calls"
+fi
+# Strip '- name: ...' step-title lines and '#'-comment lines before
+# checking: the step title and its comments deliberately say "no || true"
+# to document the fix, which is not itself an occurrence of '|| true'.
+WORKFLOW_CODE_ONLY="$(grep -vE '^\s*#' "$GG_MONITOR_WORKFLOW" | grep -vE '^\s*-?\s*name:')"
+if echo "$WORKFLOW_CODE_ONLY" | grep -qE '\|\|\s*true'; then
+  fail "workflow still contains a '|| true' that could mask a verification failure"
+else
+  pass "workflow contains no '|| true' anywhere (outside of step names/comments documenting the fix)"
+fi
+
+echo "--- Fix 6: KMS remains a documented, unimplemented deployment gate ---"
+if grep -q "KMS DEPLOYMENT GATE -- DO NOT DISMISS" envs/dev/iam.tf; then
+  pass "envs/dev/iam.tf documents the KMS deployment gate for gg-monitor-dev-role"
+else
+  fail "envs/dev/iam.tf is missing the KMS deployment gate documentation"
+fi
+if grep -qE '"kms:' envs/dev/policies/gg-monitor-dev-role/policies/policies_1.json 2>/dev/null; then
+  fail "gg-monitor-dev-role policy already grants a kms: action -- this must remain undismissed/unguessed until live CMK ARNs are confirmed"
+else
+  pass "gg-monitor-dev-role policy grants no kms: actions yet (correctly gated pending live CMK confirmation)"
+fi
+
+echo "--- Fix 7: README/topology terminology says Admin REST, not REST/PMS ---"
+if grep -qi "REST/PMS" "${MONITOR_CORE_DIR}/README.md"; then
+  fail "README.md still uses the incorrect 'REST/PMS' terminology"
+else
+  pass "README.md does not claim 'REST/PMS polling'"
+fi
+if grep -q "GoldenGate Admin REST" "${MONITOR_CORE_DIR}/README.md"; then
+  pass "README.md correctly describes GoldenGate Admin REST polling"
+else
+  fail "README.md does not describe Admin REST polling as expected"
+fi
+
+echo "--- Fix 8: repo cleanup -- gitignore/dockerignore, configmap comment, kubectl pin, unconditional tests ---"
+if [ -f "${MONITOR_CORE_DIR}/.gitignore" ] && grep -q "__pycache__" "${MONITOR_CORE_DIR}/.gitignore"; then
+  pass "monitoring/gg-monitor-core/.gitignore exists and covers __pycache__"
+else
+  fail "monitoring/gg-monitor-core/.gitignore is missing or does not cover __pycache__"
+fi
+if [ -f "${MONITOR_CORE_DIR}/.dockerignore" ] && grep -q "__pycache__" "${MONITOR_CORE_DIR}/.dockerignore"; then
+  pass "monitoring/gg-monitor-core/.dockerignore exists and covers __pycache__"
+else
+  fail "monitoring/gg-monitor-core/.dockerignore is missing or does not cover __pycache__"
+fi
+if command -v git >/dev/null 2>&1 && git -C "$REPO_ROOT" rev-parse HEAD >/dev/null 2>&1; then
+  TRACKED_PYCACHE="$(git -C "$REPO_ROOT" ls-files -- "${MONITOR_CORE_DIR}" | grep -E '__pycache__|\.pyc$|\.pyo$' || true)"
+  if [ -z "$TRACKED_PYCACHE" ]; then
+    pass "no __pycache__/*.pyc files remain tracked in git under monitoring/gg-monitor-core"
+  else
+    fail "the following generated files are still tracked in git: ${TRACKED_PYCACHE}"
+  fi
+else
+  skip "tracked-pycache check -- git not available"
+fi
+# Check for the specific WRONG CLAIM, not the bare filename -- the comment
+# now legitimately mentions goldengate-platform.yaml once, in a deliberate
+# negation ("NOT goldengate-platform.yaml, which does not touch this chart
+# at all") clarifying the correction, which is not itself the defect.
+if grep -q "step in .github/workflows/goldengate-platform.yaml" "helm/gg-monitor/templates/configmap.yaml"; then
+  fail "helm/gg-monitor/templates/configmap.yaml still claims staging happens in goldengate-platform.yaml"
+else
+  pass "helm/gg-monitor/templates/configmap.yaml no longer claims staging happens in goldengate-platform.yaml"
+fi
+if grep -q "gg-monitor-core.yaml" "helm/gg-monitor/templates/configmap.yaml"; then
+  pass "helm/gg-monitor/templates/configmap.yaml correctly references gg-monitor-core.yaml as the staging workflow"
+else
+  fail "helm/gg-monitor/templates/configmap.yaml does not reference the correct staging workflow"
+fi
+if grep -q 'KUBECTL_VERSION="v1.33' "$GG_MONITOR_WORKFLOW"; then
+  pass "gg-monitor-core.yaml pins kubectl to a v1.33.x release (matches the EKS 1.33 cluster)"
+else
+  fail "gg-monitor-core.yaml does not pin kubectl to v1.33.x"
+fi
+if grep -q 'KUBECTL_VERSION="v1.35' "$GG_MONITOR_WORKFLOW"; then
+  fail "gg-monitor-core.yaml still pins kubectl to v1.35.0"
+else
+  pass "gg-monitor-core.yaml does not pin kubectl to v1.35.0"
+fi
+if sed -n '/name: Validate monitor Python syntax/,/^      - name:/p' "$GG_MONITOR_WORKFLOW" | grep -q "if: env.IMAGE_EXISTED"; then
+  fail "Validate monitor Python syntax step is still gated on IMAGE_EXISTED"
+else
+  pass "Validate monitor Python syntax step runs unconditionally (not gated on image reuse)"
+fi
+if sed -n '/name: Run monitor unit tests/,/^      - name:/p' "$GG_MONITOR_WORKFLOW" | grep -q "if: env.IMAGE_EXISTED"; then
+  fail "Run monitor unit tests step is still gated on IMAGE_EXISTED"
+else
+  pass "Run monitor unit tests step runs unconditionally (not gated on image reuse)"
+fi
+
+echo ""
 echo "--- Legacy monitor, runtime charts, and candidates left untouched by Phase 4 ---"
 if command -v git >/dev/null 2>&1 && git -C "$REPO_ROOT" rev-parse HEAD >/dev/null 2>&1; then
   if git -C "$REPO_ROOT" diff --ignore-all-space --quiet HEAD -- \
