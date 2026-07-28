@@ -4,7 +4,7 @@
 # consumed by envs/dev/dynamodb.tf's generic aws_dynamodb_table_item.pipeline_config
 # resource (for_each over this file, mirroring the manager reference
 # implementation's terraform/platform/dynamodb.tf pattern: `for d in
-# yamldecode(file(...)).deployments : "gg-${d.name}" => d`).
+# yamldecode(file(...)).deployments : "gg-${d.name}" => d.type`).
 #
 # Deliberately NOT under envs/dev/: the GoldenGate runtime deployment workflow
 # scans envs/dev/* first-level folders as runtime deployment IDs -- this is

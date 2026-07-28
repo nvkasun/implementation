@@ -1630,7 +1630,7 @@ else:
 if re.search(r'dispatchStallChecks\s*=\s*\{', content):
     bad("the incorrect manager field name 'dispatchStallChecks' is used as an attribute key in dynamodb.tf -- must be distpathStallChecks")
 else:
-    ok("the incorrect manager field name 'dispatchStallChecks' does not appear anywhere in dynamodb.tf")
+    ok("dispatchStallChecks is not used as a DynamoDB CONFIG attribute (distpathStallChecks is the configured attribute; dispatchStallChecks may still appear in comments documenting the manager defect)")
 
 # ---------------------------------------------------------------------
 # 4. No ttl, no LEASE/STATE/STATE#, no secret values / legacy names.
