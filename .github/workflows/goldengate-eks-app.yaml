@@ -1611,18 +1611,56 @@ jobs:
                   sys.exit(1)
           print("OK: no observer/utility-sidecar/Fluent Bit reference in the regular container.")
 
-          # --- initContainers: only the expected stale-PID/permissions init --------
+          # --- initContainers: exactly one prepare-u02-permissions, with the
+          # stale ServiceManager.pid safeguard intact. An empty initContainers
+          # list must fail here, not pass vacuously -- the mandatory
+          # permissions/stale-PID init container is required, not optional.
           init_containers = pod_spec.get("initContainers") or []
           init_names = [c.get("name") for c in init_containers]
-          allowed_init_names = {"prepare-u02-permissions"}
-          unexpected_init = [n for n in init_names if n not in allowed_init_names]
-          if unexpected_init:
+
+          if init_names != ["prepare-u02-permissions"]:
               print(
-                  f"FAIL: unexpected initContainers found: {unexpected_init}. "
-                  "Only prepare-u02-permissions is permitted."
+                  "FAIL: expected exactly one init container named "
+                  "'prepare-u02-permissions', found: "
+                  f"{init_names}"
               )
               sys.exit(1)
-          print(f"OK: initContainers are limited to the expected set: {init_names}")
+
+          init_container = init_containers[0]
+
+          def _init_script_text(container):
+              # command/args entries are ordinarily strings, but tolerate a
+              # non-string entry (e.g. a Helm-rendered number) rather than
+              # crashing on it -- only string entries can ever contain the
+              # shell script text we are looking for.
+              parts = []
+              for item in list(container.get("command") or []) + list(container.get("args") or []):
+                  if isinstance(item, str):
+                      parts.append(item)
+              return "\n".join(parts)
+
+          init_script_text = _init_script_text(init_container)
+
+          if "ServiceManager.pid" not in init_script_text:
+              print(
+                  "FAIL: the prepare-u02-permissions init container does not reference "
+                  "ServiceManager.pid -- the stale GoldenGate Service Manager PID "
+                  "safeguard is missing."
+              )
+              sys.exit(1)
+
+          if 'rm -f -- "$SERVICE_MANAGER_PID_FILE"' not in init_script_text:
+              print(
+                  "FAIL: the prepare-u02-permissions init container does not contain "
+                  "the expected stale-PID removal command "
+                  '(rm -f -- "$SERVICE_MANAGER_PID_FILE").'
+              )
+              sys.exit(1)
+
+          print(
+              "OK: required prepare-u02-permissions init container and stale "
+              "ServiceManager.pid cleanup are present."
+          )
 
           # --- Services: exactly one ClusterIP, one headless -----------------------
           services = [d for d in documents if d.get("kind") == "Service"]

@@ -269,18 +269,33 @@ if containers:
     else:
         bad("the regular container unexpectedly references a forbidden sidecar name/image")
 
+# An empty initContainers list must fail here, not pass vacuously -- the
+# mandatory permissions/stale-PID init container is required, not optional.
 init_containers = pod_spec.get("initContainers") or []
 init_names = [c.get("name") for c in init_containers]
 if init_names == ["prepare-u02-permissions"]:
     ok("initContainers limited to the expected prepare-u02-permissions")
+
+    init_container = init_containers[0]
+    init_script_parts = []
+    for item in list(init_container.get("command") or []) + list(init_container.get("args") or []):
+        if isinstance(item, str):
+            init_script_parts.append(item)
+    init_script_text = "\n".join(init_script_parts)
+
+    if "ServiceManager.pid" in init_script_text:
+        ok("stale PID cleanup logic (ServiceManager.pid) present")
+    else:
+        bad("ServiceManager.pid stale-PID cleanup logic not found in the init container's command/args")
+
+    if 'rm -f -- "$SERVICE_MANAGER_PID_FILE"' in init_script_text:
+        ok("stale PID removal command present (rm -f -- \"$SERVICE_MANAGER_PID_FILE\")")
+    else:
+        bad("stale PID removal command not found (expected: rm -f -- \"$SERVICE_MANAGER_PID_FILE\")")
 else:
     bad(f"expected initContainers == ['prepare-u02-permissions'], found {init_names}")
-
-init_command_text = " ".join(" ".join(c.get("command") or []) for c in init_containers)
-if "ServiceManager.pid" in init_command_text:
-    ok("stale PID cleanup logic (ServiceManager.pid) present")
-else:
-    bad("ServiceManager.pid stale-PID cleanup logic not found in initContainers")
+    skipped("stale PID cleanup logic check -- init container contract not satisfied")
+    skipped("stale PID removal command check -- init container contract not satisfied")
 
 # --- runtime name / namespace ----------------------------------------------
 sts_name = (sts.get("metadata") or {}).get("name")
@@ -577,8 +592,198 @@ if [ -f "$WORKFLOW_FILE" ]; then
   else
     fail "workflow does not read containers from spec.template.spec.containers"
   fi
+
+  if grep -qF "expected exactly one init container named" "$WORKFLOW_FILE"; then
+    pass "workflow rejects an empty/wrong initContainers list instead of passing vacuously"
+  else
+    fail "workflow does not reject an empty/wrong initContainers list"
+  fi
 else
   skip "static workflow assertions -- ${WORKFLOW_FILE} not found"
+fi
+
+echo ""
+
+# ---------------------------------------------------------------------
+# 10: init-container / stale-PID synthetic contract tests (no helm
+# required) -- proves the local Python/PyYAML validator enforces exactly
+# one prepare-u02-permissions init container with the ServiceManager.pid
+# safeguard intact, and never passes vacuously on an empty initContainers
+# list.
+# ---------------------------------------------------------------------
+echo "--- Init-container / stale-PID synthetic contract tests ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  SYNTH_DIR="${WORKDIR}/synthetic"
+  mkdir -p "$SYNTH_DIR"
+
+  cat > "${SYNTH_DIR}/values.yaml" <<'EOF'
+runtime:
+  containerName: ogg-oracle
+ingress:
+  enabled: false
+EOF
+
+  # 1. No initContainers at all.
+  cat > "${SYNTH_DIR}/no_init.yaml" <<'EOF'
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: gg-oracle-payments-01
+  namespace: "goldengate-dev"
+spec:
+  template:
+    spec:
+      containers:
+        - name: ogg-oracle
+          image: "example/ogg-oracle:1.0"
+EOF
+
+  # 2. Wrong init-container name.
+  cat > "${SYNTH_DIR}/wrong_name.yaml" <<'EOF'
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: gg-oracle-payments-01
+  namespace: "goldengate-dev"
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: prepare-permissions-wrong
+          command: ["sh", "-c", "echo hi"]
+      containers:
+        - name: ogg-oracle
+          image: "example/ogg-oracle:1.0"
+EOF
+
+  # 3. Expected name, but missing ServiceManager.pid logic entirely.
+  cat > "${SYNTH_DIR}/missing_pid_logic.yaml" <<'EOF'
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: gg-oracle-payments-01
+  namespace: "goldengate-dev"
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: prepare-u02-permissions
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              mkdir -p /u02/oggf
+              chmod -R 0777 /u02 /u03
+      containers:
+        - name: ogg-oracle
+          image: "example/ogg-oracle:1.0"
+EOF
+
+  # 4. Expected name with a ServiceManager.pid check but no removal command.
+  cat > "${SYNTH_DIR}/missing_removal.yaml" <<'EOF'
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: gg-oracle-payments-01
+  namespace: "goldengate-dev"
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: prepare-u02-permissions
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              SERVICE_MANAGER_PID_FILE="/u02/ServiceManager/var/run/ServiceManager.pid"
+              if [ -e "$SERVICE_MANAGER_PID_FILE" ]; then
+                echo "found stale pid file, but not removing it"
+              fi
+      containers:
+        - name: ogg-oracle
+          image: "example/ogg-oracle:1.0"
+EOF
+
+  # 5. Correct: expected init container with full stale-PID cleanup logic.
+  cat > "${SYNTH_DIR}/correct.yaml" <<'EOF'
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: gg-oracle-payments-01
+  namespace: "goldengate-dev"
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: prepare-u02-permissions
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              SERVICE_MANAGER_PID_FILE="/u02/ServiceManager/var/run/ServiceManager.pid"
+              if [ -e "$SERVICE_MANAGER_PID_FILE" ] || [ -L "$SERVICE_MANAGER_PID_FILE" ]; then
+                rm -f -- "$SERVICE_MANAGER_PID_FILE"
+              fi
+      containers:
+        - name: ogg-oracle
+          image: "example/ogg-oracle:1.0"
+EOF
+
+  run_synthetic_case() {
+    local case_name="$1" rendered_file="$2" expect_nonzero="$3" expected_substring="$4"
+
+    set +e
+    local output
+    output="$(python3 "$CANDIDATE_VALIDATOR_PY" "$rendered_file" "${SYNTH_DIR}/values.yaml" gg-oracle-payments-01 goldengate-dev "synthetic:${case_name}")"
+    local status=$?
+    set -e
+
+    local substring_found="false"
+    if echo "$output" | grep -qF -- "$expected_substring"; then
+      substring_found="true"
+    fi
+
+    if [ "$expect_nonzero" = "true" ]; then
+      if [ "$status" -ne 0 ] && [ "$substring_found" = "true" ]; then
+        pass "synthetic[${case_name}]: exits nonzero with expected message"
+      else
+        fail "synthetic[${case_name}]: expected nonzero exit with message ${expected_substring@Q}, got exit=${status}, message_found=${substring_found}"
+        echo "$output"
+      fi
+    else
+      if [ "$substring_found" = "true" ]; then
+        pass "synthetic[${case_name}]: init-container/stale-PID checks pass as expected"
+      else
+        fail "synthetic[${case_name}]: expected message ${expected_substring@Q} not found"
+        echo "$output"
+      fi
+    fi
+  }
+
+  run_synthetic_case "no_initContainers" "${SYNTH_DIR}/no_init.yaml" true \
+    "expected initContainers == ['prepare-u02-permissions'], found []"
+
+  run_synthetic_case "wrong_name" "${SYNTH_DIR}/wrong_name.yaml" true \
+    "expected initContainers == ['prepare-u02-permissions'], found ['prepare-permissions-wrong']"
+
+  run_synthetic_case "missing_pid_logic" "${SYNTH_DIR}/missing_pid_logic.yaml" true \
+    "ServiceManager.pid stale-PID cleanup logic not found"
+
+  run_synthetic_case "missing_removal_command" "${SYNTH_DIR}/missing_removal.yaml" true \
+    "stale PID removal command not found"
+
+  # The "correct" synthetic manifest is deliberately minimal (StatefulSet
+  # only, no Service/Ingress/etc.), so the overall candidate validator still
+  # exits nonzero overall -- only the init-container/stale-PID assertions
+  # specifically are required to pass here.
+  run_synthetic_case "correct_init_container" "${SYNTH_DIR}/correct.yaml" false \
+    "PASS: [synthetic:correct_init_container] stale PID removal command present"
+else
+  skip "init-container/stale-PID synthetic contract tests -- python3/PyYAML not available"
 fi
 
 echo ""
