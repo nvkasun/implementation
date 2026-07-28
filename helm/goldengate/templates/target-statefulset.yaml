@@ -35,8 +35,22 @@ spec:
   template:
     metadata:
       labels:
-        {{- include "goldengate.labels" . | nindent 8 }}
+        # goldengate.targetSelectorLabels (not goldengate.labels) is composed
+        # first and alone here on purpose: goldengate.labels' app.kubernetes.io/name
+        # is the chart name ("goldengate"), which conflicts with
+        # goldengate.targetSelectorLabels' app.kubernetes.io/name (the target
+        # name, e.g. "ogg-postgresql") -- the same key with two different
+        # values in one mapping is a duplicate-key defect. The pod template's
+        # labels must remain a superset of spec.selector.matchLabels above
+        # (which uses goldengate.targetSelectorLabels alone), so the
+        # non-conflicting fields from goldengate.labels are listed out
+        # individually instead of re-including the whole helper.
         {{- include "goldengate.targetSelectorLabels" . | nindent 8 }}
+        app.kubernetes.io/managed-by: {{ .Release.Service }}
+        helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
+        app.kubernetes.io/part-of: goldengate
+        goldengate.adcb/environment: {{ .Values.global.environment | quote }}
+        goldengate.adcb/deployment-id: {{ .Values.global.deploymentId | quote }}
         app.kubernetes.io/engine: {{ .Values.target.engine | quote }}
       annotations:
         goldengate.adcb/observer-enabled: {{ .Values.monitoring.observer.enabled | quote }}
