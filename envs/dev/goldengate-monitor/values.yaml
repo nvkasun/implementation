@@ -18,9 +18,11 @@ aws:
 dynamodb:
   tableName: gg-eks-pipeline
 
-pipelines:
-  - gg-payments-ora-to-pg-001-source
-  - gg-payments-ora-to-pg-001-target
+# canonicalConfig.root / legacyFallback.enabled use the library chart's
+# defaults (helm/goldengate-monitor/values.yaml) -- no environment override
+# required. The portal derives its logical-pipeline/role grouping from the
+# canonical inventory ConfigMap (templates/configmap.yaml), not a
+# hand-configured pipeline list.
 
 staleAfterSeconds: 120
 refreshSeconds: 30

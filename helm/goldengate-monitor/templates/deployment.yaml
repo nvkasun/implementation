@@ -4,8 +4,8 @@
 {{- if not .Values.image.tag }}
 {{- fail "image.tag cannot be empty." }}
 {{- end }}
-{{- if not .Values.pipelines }}
-{{- fail "pipelines cannot be empty -- the portal only reads explicitly configured pipeline keys." }}
+{{- if not .Values.canonicalConfig.root }}
+{{- fail "canonicalConfig.root cannot be empty -- the portal reads its canonical runtime/topology inventory from this mounted path." }}
 {{- end }}
 {{- if not .Values.aws.region }}
 {{- fail "aws.region cannot be empty." }}
@@ -34,6 +34,8 @@ spec:
     metadata:
       labels:
         {{- include "goldengate-monitor.labels" . | nindent 8 }}
+      annotations:
+        checksum/canonical-config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
     spec:
       serviceAccountName: {{ include "goldengate-monitor.serviceAccountName" . }}
       # IRSA requires the projected ServiceAccount token to be mounted.
@@ -69,8 +71,10 @@ spec:
               value: "true"
             - name: DYNAMODB_TABLE
               value: {{ .Values.dynamodb.tableName | quote }}
-            - name: PIPELINES
-              value: {{ join "," .Values.pipelines | quote }}
+            - name: REPO_CONFIG_ROOT
+              value: {{ .Values.canonicalConfig.root | quote }}
+            - name: LEGACY_FALLBACK_ENABLED
+              value: {{ .Values.legacyFallback.enabled | default false | quote }}
             - name: PORT
               value: {{ .Values.service.port | quote }}
             - name: STALE_AFTER_SECONDS
@@ -94,6 +98,9 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            - name: canonical-config
+              mountPath: {{ .Values.canonicalConfig.root }}
+              readOnly: true
           startupProbe:
             httpGet:
               path: /healthz
@@ -126,6 +133,16 @@ spec:
         # /tmp, which must be writable.
         - name: tmp
           emptyDir: {}
+        - name: canonical-config
+          configMap:
+            name: goldengate-monitor-canonical-config
+            items:
+              - key: deployments.yaml
+                path: pipelines/deployments.yaml
+{{- range $path, $_ := .Files.Glob "files/topologies/dev/*.yaml" }}
+              - key: {{ base $path }}
+                path: topologies/dev/{{ base $path }}
+{{- end }}
 {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

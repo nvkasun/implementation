@@ -1989,10 +1989,15 @@ if command -v git >/dev/null 2>&1 && git -C "$REPO_ROOT" rev-parse HEAD >/dev/nu
   # "gg_monitor_dev_role module present" check + the existing-module-text
   # check immediately below, which together prove the addition is additive
   # only -- no existing module block's own text changed).
-  if git -C "$REPO_ROOT" diff --ignore-all-space --quiet HEAD -- "$ORACLE_VALUES" "$POSTGRESQL_VALUES" monitoring/monitor helm/goldengate-monitor envs/dev/secret.tf; then
-    pass "candidate values, observer/monitor code, legacy monitor chart, and Secrets Manager Terraform are all unchanged by Phase 4 (0 diff vs HEAD)"
+  # monitoring/monitor and helm/goldengate-monitor are deliberately EXCLUDED
+  # here as of the monitoring-integration correction pass: that pass's own
+  # explicit purpose is to migrate the existing portal onto canonical data
+  # and add its canonical-config ConfigMap -- see the dedicated
+  # "existing portal migrated to canonical data" checks below instead.
+  if git -C "$REPO_ROOT" diff --ignore-all-space --quiet HEAD -- "$ORACLE_VALUES" "$POSTGRESQL_VALUES" envs/dev/secret.tf; then
+    pass "candidate values and Secrets Manager Terraform are unchanged by Phase 4 / the monitoring-integration correction pass (0 diff vs HEAD)"
   else
-    fail "one or more out-of-scope files (candidates, observer/monitor, legacy monitor chart, Secrets Manager Terraform) differ from HEAD"
+    fail "one or more out-of-scope files (candidates, Secrets Manager Terraform) differ from HEAD"
   fi
 
   echo "Confirming envs/dev/iam.tf's pre-existing module blocks are textually unchanged (only gg_monitor_dev_role was added)..."
@@ -3093,62 +3098,100 @@ else
   pass "no environment values file sets cloudwatch.publishEnabled: true"
 fi
 
+MONITOR_DIR="monitoring/monitor"
+
+echo "--- Collector/portal separation: gg-monitor-core has NO portal code (monitoring-integration correction pass) ---"
+GG_MONITOR_CORE_CODE_ONLY="$(code_only < "${MONITOR_CORE_DIR}/gg_monitor_core.py")"
+if echo "$GG_MONITOR_CORE_CODE_ONLY" | grep -qE "collect_portal_status|render_portal_html|portal_table_factory|def read_lease|def query_process_states"; then
+  fail "gg_monitor_core.py still contains removed portal code"
+else
+  pass "gg_monitor_core.py contains no portal code (collector/writer only)"
+fi
+if grep -q '"/api/status"' "${MONITOR_CORE_DIR}/gg_monitor_core.py" || grep -q 'self.path == "/"' "${MONITOR_CORE_DIR}/gg_monitor_core.py"; then
+  fail "gg_monitor_core.py's HTTP handler still wires up a portal route (/ or /api/status)"
+else
+  pass "gg_monitor_core.py's HTTP handler only exposes /healthz and /readyz"
+fi
+
+echo "--- Existing portal migrated to canonical data (monitoring/monitor/monitor.py) ---"
+if grep -q '"PIPELINES"' "${MONITOR_DIR}/monitor.py" || grep -q "def derive_deployment_and_component" "${MONITOR_DIR}/monitor.py"; then
+  fail "monitor.py still depends on the old PIPELINES env var / derive_deployment_and_component"
+else
+  pass "monitor.py no longer depends on the old PIPELINES env var or old observer-key derivation"
+fi
+if grep -q "def get_config_item" "${MONITOR_DIR}/monitor.py" && \
+   grep -q "def get_lease_item" "${MONITOR_DIR}/monitor.py" && \
+   grep -q "def get_deployment_state_item" "${MONITOR_DIR}/monitor.py" && \
+   grep -q "def query_process_state_items" "${MONITOR_DIR}/monitor.py"; then
+  pass "monitor.py reads canonical CONFIG (GetItem), LEASE (GetItem), STATE#_deployment (GetItem), and STATE# (Query)"
+else
+  fail "monitor.py is missing one or more canonical DynamoDB read functions"
+fi
+MONITOR_CODE_ONLY="$(code_only < "${MONITOR_DIR}/monitor.py")"
+if echo "$MONITOR_CODE_ONLY" | grep -qE "\.scan\(|\.put_item\(|\.update_item\(|\.delete_item\(|\.batch_writer\("; then
+  fail "monitor.py appears to call a DynamoDB Scan or write operation"
+else
+  pass "monitor.py calls no DynamoDB Scan or write operation (GetItem/Query only)"
+fi
+
 echo "--- Portal DynamoDB thread safety: factory, not a pre-built Table ---"
-if grep -q "portal_table_factory" "${MONITOR_CORE_DIR}/gg_monitor_core.py" && ! grep -qE '^\s*portal_table\s*=' "${MONITOR_CORE_DIR}/gg_monitor_core.py"; then
-  pass "portal uses a table FACTORY (portal_table_factory), never a bare pre-built portal_table object"
+if grep -q "create_dynamodb_table_factory" "${MONITOR_DIR}/monitor.py" && ! grep -qE '^\s*table\s*=\s*create_dynamodb_table' "${MONITOR_DIR}/monitor.py"; then
+  pass "portal uses a table FACTORY (create_dynamodb_table_factory), never a bare pre-built Table object"
 else
   fail "portal does not appear to use a factory pattern for its DynamoDB table"
 fi
 
 echo "--- Portal error sanitization: no raw errorMsg exposed ---"
-COLLECT_STATUS_BODY="$(sed -n '/^def collect_portal_status/,/^def render_portal_html/p' "${MONITOR_CORE_DIR}/gg_monitor_core.py" | sed '$d' | code_only)"
-if echo "$COLLECT_STATUS_BODY" | grep -qE '"errorMsg":\s*str\(row\.get\("errorMsg"'; then
-  fail "collect_portal_status still exposes raw errorMsg in its output"
+if echo "$MONITOR_CODE_ONLY" | grep -qE '"errorMsg":\s*row\.get\("errorMsg"'; then
+  fail "monitor.py still exposes raw errorMsg in its output"
 else
-  pass "collect_portal_status does not expose raw errorMsg in its output"
+  pass "monitor.py does not expose raw errorMsg in its output"
 fi
-if grep -q "def _classify_process_status_code" "${MONITOR_CORE_DIR}/gg_monitor_core.py" && \
-   grep -q '"hasError"' "${MONITOR_CORE_DIR}/gg_monitor_core.py" && \
-   grep -q '"statusCode"' "${MONITOR_CORE_DIR}/gg_monitor_core.py" && \
-   grep -q '"statusMessage"' "${MONITOR_CORE_DIR}/gg_monitor_core.py"; then
-  pass "collect_portal_status exposes the sanitized hasError/statusCode/statusMessage triple"
+if grep -q "def _classify_process_status_code" "${MONITOR_DIR}/monitor.py" && \
+   grep -q '"hasError"' "${MONITOR_DIR}/monitor.py" && \
+   grep -q '"statusCode"' "${MONITOR_DIR}/monitor.py" && \
+   grep -q '"statusMessage"' "${MONITOR_DIR}/monitor.py"; then
+  pass "monitor.py exposes the sanitized hasError/statusCode/statusMessage triple"
 else
   fail "sanitized error fields (hasError/statusCode/statusMessage) not found"
 fi
 
-echo "--- Shared monitoring web portal ---"
-if grep -q "def collect_portal_status" "${MONITOR_CORE_DIR}/gg_monitor_core.py" && \
-   grep -q "def render_portal_html" "${MONITOR_CORE_DIR}/gg_monitor_core.py"; then
-  pass "gg_monitor_core.py implements collect_portal_status / render_portal_html"
+echo "--- Shared monitoring web portal (canonical, logical-pipeline grouped) ---"
+if grep -q "def build_status_payload" "${MONITOR_DIR}/monitor.py" && \
+   grep -q "def render_html" "${MONITOR_DIR}/monitor.py"; then
+  pass "monitor.py implements build_status_payload / render_html"
 else
-  fail "gg_monitor_core.py is missing the portal collection/rendering functions"
+  fail "monitor.py is missing the portal collection/rendering functions"
 fi
-if grep -q '"/api/status"' "${MONITOR_CORE_DIR}/gg_monitor_core.py" && grep -q 'self.path == "/"' "${MONITOR_CORE_DIR}/gg_monitor_core.py"; then
+if grep -q '"/api/status"' "${MONITOR_DIR}/monitor.py" && grep -q 'self.path == "/"' "${MONITOR_DIR}/monitor.py"; then
   pass "portal routes / and /api/status are wired into the HTTP handler"
 else
   fail "portal routes are not wired into the HTTP handler"
 fi
-PORTAL_RENDER_SRC="$(sed -n '/^def render_portal_html/,/^def /p' "${MONITOR_CORE_DIR}/gg_monitor_core.py" | sed '$d')"
-PORTAL_RENDER_CODE_ONLY="$(echo "$PORTAL_RENDER_SRC" | code_only)"
-if echo "$PORTAL_RENDER_CODE_ONLY" | grep -qi "cloudwatch"; then
-  fail "portal HTML rendering references CloudWatch -- no CloudWatch charts are permitted this phase"
+if echo "$MONITOR_CODE_ONLY" | grep -qi "cloudwatch"; then
+  fail "portal references CloudWatch -- no CloudWatch charts are permitted this phase"
 else
-  pass "portal HTML rendering contains no CloudWatch reference (only its own explanatory docstring may mention the exclusion)"
+  pass "portal contains no CloudWatch reference"
 fi
-if echo "$PORTAL_RENDER_SRC" | grep -q "/mnt/secrets-store\|credentialUserFile\|credentialPasswordFile\|adminSecretObject"; then
-  fail "portal HTML rendering references credential paths or secret object names"
+if echo "$MONITOR_CODE_ONLY" | grep -q "/mnt/secrets-store\|credentialUserFile\|credentialPasswordFile\|adminSecretObject"; then
+  fail "portal references credential paths or secret object names"
 else
-  pass "portal HTML rendering never references credential paths or secret object names"
+  pass "portal never references credential paths or secret object names"
 fi
-if grep -q "def build_logical_pipelines" "${MONITOR_CORE_DIR}/inventory.py"; then
-  pass "inventory.py exposes build_logical_pipelines for the portal's source/target relationship view"
+if grep -q "def build_logical_pipelines" "${MONITOR_DIR}/inventory.py"; then
+  pass "monitor's own inventory.py exposes build_logical_pipelines for the portal's source/target relationship view"
 else
-  fail "inventory.py is missing build_logical_pipelines"
+  fail "monitor's own inventory.py is missing build_logical_pipelines"
 fi
-if grep -q "monitoring/monitor/monitor.py" "${MONITOR_CORE_DIR}/README.md" 2>/dev/null || grep -qi "does not replace or modify" "${MONITOR_CORE_DIR}/README.md"; then
-  pass "README documents that the pre-existing monitoring/monitor portal is left unmodified"
+if grep -q "def load_runtimes" "${MONITOR_CORE_DIR}/inventory.py" && grep -q "def load_runtimes" "${MONITOR_DIR}/inventory.py"; then
+  pass "both gg-monitor-core and the portal have their own canonical inventory loader (portal-local, not a cross-import)"
 else
-  fail "README does not document the relationship to the pre-existing legacy portal"
+  fail "one of the two inventory loaders is missing load_runtimes"
+fi
+if grep -q "legacyFallback\|legacy_fallback_enabled\|LEGACY_FALLBACK_ENABLED" "${MONITOR_DIR}/monitor.py"; then
+  pass "monitor.py implements the temporary legacy-observer fallback"
+else
+  fail "monitor.py is missing the legacy-observer fallback"
 fi
 
 echo "--- IAM: no access to new tables, no gg-alerter role, DynamoDB scoped exactly ---"
@@ -3194,15 +3237,35 @@ else
   skip "gg-monitor-core unit tests (post local-completion pass) -- python3/boto3/moto/PyYAML not available"
 fi
 
-echo ""
-echo "--- Legacy monitor, runtime charts, and candidates left untouched by Phase 4 ---"
-if command -v git >/dev/null 2>&1 && git -C "$REPO_ROOT" rev-parse HEAD >/dev/null 2>&1; then
-  if git -C "$REPO_ROOT" diff --ignore-all-space --quiet HEAD -- \
-      helm/goldengate-monitor monitoring/monitor "$ORACLE_VALUES" "$POSTGRESQL_VALUES" \
-      envs/dev/secret.tf helm/goldengate; then
-    pass "legacy monitor chart/app, runtime Helm values, runtime chart, and Secrets Manager Terraform are all unchanged by Phase 4 (0 diff vs HEAD)"
+echo "--- Existing portal (monitoring/monitor) unit test suite ---"
+if command -v python3 >/dev/null 2>&1 && python3 -c "import boto3, yaml" >/dev/null 2>&1; then
+  set +e
+  MONITOR_PORTAL_UNITTEST_OUTPUT="$(cd "$MONITOR_DIR" && python3 -m unittest discover -s tests -p "test_*.py" 2>&1)"
+  MONITOR_PORTAL_UNITTEST_STATUS=$?
+  set -e
+  if [ "$MONITOR_PORTAL_UNITTEST_STATUS" -eq 0 ]; then
+    RAN_LINE_PORTAL="$(echo "$MONITOR_PORTAL_UNITTEST_OUTPUT" | grep -E '^Ran [0-9]+ test' | tail -1)"
+    pass "monitoring/monitor unit tests (monitoring-integration correction pass): ${RAN_LINE_PORTAL:-all tests passed}"
   else
-    fail "one or more out-of-scope files (legacy monitor, runtime values/chart, Secrets Manager Terraform) differ from HEAD"
+    fail "monitoring/monitor unit tests failed"
+    echo "$MONITOR_PORTAL_UNITTEST_OUTPUT"
+  fi
+else
+  skip "monitoring/monitor unit tests -- python3/boto3/PyYAML not available"
+fi
+
+echo ""
+echo "--- Runtime charts and candidates left untouched by the monitoring-integration correction pass ---"
+if command -v git >/dev/null 2>&1 && git -C "$REPO_ROOT" rev-parse HEAD >/dev/null 2>&1; then
+  # helm/goldengate-monitor and monitoring/monitor are deliberately EXCLUDED
+  # here (see the identical exclusion note above) -- this pass's own purpose
+  # is to migrate them onto canonical data.
+  if git -C "$REPO_ROOT" diff --ignore-all-space --quiet HEAD -- \
+      "$ORACLE_VALUES" "$POSTGRESQL_VALUES" \
+      envs/dev/secret.tf helm/goldengate; then
+    pass "runtime Helm values, runtime chart, and Secrets Manager Terraform are all unchanged by the monitoring-integration correction pass (0 diff vs HEAD)"
+  else
+    fail "one or more out-of-scope files (runtime values/chart, Secrets Manager Terraform) differ from HEAD"
   fi
 else
   skip "legacy/runtime unchanged-vs-HEAD check -- git not available"

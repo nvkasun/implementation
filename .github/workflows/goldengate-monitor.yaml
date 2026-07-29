@@ -27,6 +27,8 @@ on:
       - 'helm/goldengate-monitor/**'
       - 'envs/dev/goldengate-monitor/**'
       - '.github/workflows/goldengate-monitor.yaml'
+      - 'pipelines/deployments.yaml'
+      - 'topologies/dev/**'
 
 permissions:
   id-token: write
@@ -506,6 +508,42 @@ jobs:
           done
           echo "Required files are present."
 
+      - name: Re-stage canonical inventory/topology files into the chart
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Helm can only read files inside its own chart directory
+          # (.Files.Get has no access to paths outside the chart) -- these
+          # are byte-identical STAGED COPIES of the single canonical
+          # source, never a second hand-authored list. Re-staged on every
+          # run (delete-then-copy, never a merge) so the chart can never
+          # silently deploy a stale copy left over from a previous run.
+
+          echo "Deleting stale staged canonical files..."
+          rm -rf "$HELM_CHART_PATH/files/pipelines" "$HELM_CHART_PATH/files/topologies"
+          mkdir -p "$HELM_CHART_PATH/files/pipelines" "$HELM_CHART_PATH/files/topologies/dev"
+
+          echo "Copying repository canonical files into the chart..."
+          cp pipelines/deployments.yaml "$HELM_CHART_PATH/files/pipelines/deployments.yaml"
+
+          shopt -s nullglob
+          TOPOLOGY_FILES=(topologies/dev/*.yaml)
+          shopt -u nullglob
+          if [ "${#TOPOLOGY_FILES[@]}" -eq 0 ]; then
+            echo "FAIL: no topology documents found under topologies/dev/ -- refusing to stage/package an empty topology."
+            exit 1
+          fi
+          cp topologies/dev/*.yaml "$HELM_CHART_PATH/files/topologies/dev/"
+
+          echo "Verifying staged copies are byte-identical to the canonical sources..."
+          diff -q pipelines/deployments.yaml "$HELM_CHART_PATH/files/pipelines/deployments.yaml"
+          for f in "${TOPOLOGY_FILES[@]}"; do
+            diff -q "$f" "$HELM_CHART_PATH/files/topologies/dev/$(basename "$f")"
+          done
+
+          echo "OK: ${#TOPOLOGY_FILES[@]} topology document(s) staged, all byte-identical to the canonical sources."
+
       - name: Login Helm to Amazon ECR
         shell: bash
         run: |
@@ -852,15 +890,29 @@ jobs:
 
           echo "OK: Ingress gg-monitor uses HTTP backend/health-check protocols and target-type=ip."
 
-          echo "Validating both configured pipeline keys are rendered..."
-          if ! grep -q "gg-payments-ora-to-pg-001-source" "$RENDERED"; then
-            echo "FAIL: configured pipeline gg-payments-ora-to-pg-001-source was not found in the rendered manifest."
+          echo "Validating the canonical inventory ConfigMap is rendered and mounted..."
+          CONFIGMAP_BLOCK="$(select_document "$RENDERED" "ConfigMap" "goldengate-monitor-canonical-config")"
+          if [ -z "$CONFIGMAP_BLOCK" ]; then
+            echo "FAIL: rendered ConfigMap goldengate-monitor-canonical-config was not found."
             exit 1
           fi
-          if ! grep -q "gg-payments-ora-to-pg-001-target" "$RENDERED"; then
-            echo "FAIL: configured pipeline gg-payments-ora-to-pg-001-target was not found in the rendered manifest."
+          if ! grep -q "oracle-payments-01" <<< "$CONFIGMAP_BLOCK"; then
+            echo "FAIL: canonical ConfigMap is missing the oracle-payments-01 deployment inventory entry."
             exit 1
           fi
+          if ! grep -q "postgresql-payments-01" <<< "$CONFIGMAP_BLOCK"; then
+            echo "FAIL: canonical ConfigMap is missing the postgresql-payments-01 deployment inventory entry."
+            exit 1
+          fi
+          if ! grep -q "payments-ora-to-pg-001" <<< "$CONFIGMAP_BLOCK"; then
+            echo "FAIL: canonical ConfigMap is missing the payments-ora-to-pg-001 topology document."
+            exit 1
+          fi
+          if ! grep -Fq -- "mountPath: /etc/gg-canonical" <<< "$DEPLOYMENT_BLOCK"; then
+            echo "FAIL: Deployment gg-monitor does not mount the canonical config at /etc/gg-canonical."
+            exit 1
+          fi
+          echo "OK: canonical inventory ConfigMap is rendered, populated, and mounted."
 
           echo "Validating pod/container securityContext requirements..."
           if ! grep -Fq -- "runAsNonRoot: true" <<< "$DEPLOYMENT_BLOCK"; then
@@ -1196,31 +1248,32 @@ jobs:
             exit 1
           }
 
-          if ! grep -Fq -- "gg-payments-ora-to-pg-001-source" <<< "$API_STATUS_BODY"; then
-            echo "FAIL: /api/status is missing the source pipeline."
-            exit 1
-          fi
-          if ! grep -Fq -- "gg-payments-ora-to-pg-001-target" <<< "$API_STATUS_BODY"; then
-            echo "FAIL: /api/status is missing the target pipeline."
-            exit 1
-          fi
           if ! grep -Fq -- "payments-ora-to-pg-001" <<< "$API_STATUS_BODY"; then
-            echo "FAIL: /api/status is missing deploymentId payments-ora-to-pg-001."
+            echo "FAIL: /api/status is missing logical pipelineId payments-ora-to-pg-001."
             exit 1
           fi
-          if ! grep -Fq -- '"component": "source"' <<< "$API_STATUS_BODY"; then
-            echo "FAIL: /api/status is missing component=source."
+          if ! grep -Fq -- "gg-oracle-payments-01" <<< "$API_STATUS_BODY"; then
+            echo "FAIL: /api/status is missing the canonical source deploymentName gg-oracle-payments-01."
             exit 1
           fi
-          if ! grep -Fq -- '"component": "target"' <<< "$API_STATUS_BODY"; then
-            echo "FAIL: /api/status is missing component=target."
+          if ! grep -Fq -- "gg-postgresql-payments-01" <<< "$API_STATUS_BODY"; then
+            echo "FAIL: /api/status is missing the canonical target deploymentName gg-postgresql-payments-01."
+            exit 1
+          fi
+          if ! grep -Fq -- '"role": "source"' <<< "$API_STATUS_BODY"; then
+            echo "FAIL: /api/status is missing role=source."
+            exit 1
+          fi
+          if ! grep -Fq -- '"role": "target"' <<< "$API_STATUS_BODY"; then
+            echo "FAIL: /api/status is missing role=target."
             exit 1
           fi
 
-          # Any observed GoldenGate status (HEALTHY/DEGRADED/DOWN/STALE/MISSING)
-          # is a valid operational state and never fails this step -- only
-          # the portal's own inability to run/authenticate/serve does.
-          echo "OK: /api/status is valid JSON and contains both configured pipelines."
+          # Any observed effective status (UP/STARTING/DOWN/STALE/MISSING/
+          # UNKNOWN) is a valid operational state and never fails this step
+          # -- only the portal's own inability to run/authenticate/serve
+          # does.
+          echo "OK: /api/status is valid JSON and contains both canonical runtimes under their logical pipeline."
 
           echo "Checking observer/portal logs for forbidden patterns..."
           POD_LOGS="$(kubectl logs "$POD_NAME" -n "$TARGET_NAMESPACE" --since=10m 2>/dev/null || true)"
@@ -1235,7 +1288,7 @@ jobs:
           fi
 
           echo "OK: no AccessDeniedException or missing-region error found in recent logs."
-          echo "OK: the portal only ever issues GetItem/DescribeTable (see monitor.py) -- no Scan or write call exists in the application code to appear in logs."
+          echo "OK: the portal only ever issues GetItem/Query/DescribeTable (see monitor.py) -- no Scan or write call exists in the application code to appear in logs."
 
       - name: Upload rendered manifests and chart package
         if: always()

@@ -31,7 +31,7 @@ WORKDIR ${APP_HOME}
 COPY requirements.txt ./
 RUN pip install --no-cache-dir --no-compile -r requirements.txt
 
-COPY monitor.py ./
+COPY monitor.py inventory.py ./
 
 USER ${APP_UID}:${APP_GID}
 

@@ -18,10 +18,23 @@ aws:
 dynamodb:
   tableName: gg-eks-pipeline
 
-# Explicitly configured pipeline keys only -- the portal never Scans or
-# discovers deployments dynamically. Populated per-environment (see
-# envs/dev/goldengate-monitor/values.yaml).
-pipelines: []
+# Canonical inventory/topology (pipelines/deployments.yaml,
+# topologies/dev/*.yaml), staged read-only under this chart's files/
+# directory and mounted into the pod at this path -- see templates/
+# configmap.yaml. The portal derives its own logical-pipeline/role
+# grouping from these files; it never Scans or hand-configures a pipeline
+# list.
+canonicalConfig:
+  root: /etc/gg-canonical
+
+# Temporary, controlled fallback (correction pass) to the OLD observer's
+# STATE#_deployment records for a role whose canonical record does not
+# exist yet -- see monitor.py's read_runtime_view. Canonical data always
+# takes precedence the instant it exists. Remove this fallback later by
+# setting legacyFallback.enabled=false once every canonical STATE#_deployment
+# record is confirmed present.
+legacyFallback:
+  enabled: true
 
 staleAfterSeconds: 120
 refreshSeconds: 30
