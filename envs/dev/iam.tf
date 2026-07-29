@@ -140,13 +140,13 @@ module "gg_postgresql_dev_runtime_role" {
 # apply/use until the items below are verified and this comment is updated.
 # =====================================================================
 # The manager reference implementation's own "sm_pod" role (this role's
-# structural template) DOES include kms:Decrypt, and this repository's own
+# structural template) DOES include kms:Decrypt/kms:DescribeKey, and this repository's own
 # already-successful, already-working runtime roles (GoldenGateSecretsReadRole-dev
-# and friends) also grant kms:Decrypt. That precedent is real and is NOT being
+# and friends) also grant kms:Decrypt/kms:DescribeKey. That precedent is real and is NOT being
 # dismissed here -- it means this role is very likely MISSING a required
 # permission right now, not that KMS access is unnecessary.
 #
-# kms:Decrypt is deliberately OMITTED below (not guessed, matching the
+# kms:Decrypt/kms:DescribeKey is deliberately OMITTED below (not guessed, matching the
 # precedent already set for the two runtime roles in this same file) because
 # the exact encryption configuration has not been verified live for any of:
 #   - DynamoDB table gg-eks-pipeline (envs/dev/dynamodb.tf's table module
@@ -166,11 +166,11 @@ module "gg_postgresql_dev_runtime_role" {
 #        aws dynamodb describe-table --table-name gg-eks-pipeline \
 #          --query 'Table.SSEDescription'
 #        aws secretsmanager describe-secret --secret-id <name> --query KmsKeyId
-#   2. If every result shows an AWS-owned/no-CMK default: no kms:Decrypt
+#   2. If every result shows an AWS-owned/no-CMK default: no kms:Decrypt/kms:DescribeKey
 #      statement is required at all; update this comment to say so and
 #      close this gate.
 #   3. If any result is a customer-managed key ARN: add a least-privilege
-#      kms:Decrypt statement scoped to that EXACT key ARN, with
+#      kms:Decrypt/kms:DescribeKey statement scoped to that EXACT key ARN, with
 #      kms:ViaService (dynamodb.eu-west-1.amazonaws.com or
 #      secretsmanager.eu-west-1.amazonaws.com as applicable),
 #      kms:CallerAccount = 668311715351, and the same encryption-context
@@ -178,7 +178,7 @@ module "gg_postgresql_dev_runtime_role" {
 #      (see envs/dev/policies/goldengate-monitor-read-dev/policies/policies_1.json
 #      for the DynamoDB kms:ViaService pattern). Also confirm the CMK's own
 #      key policy permits gg-monitor-dev-role (or account-level IAM
-#      delegation) to call kms:Decrypt -- an IAM statement alone is not
+#      delegation) to call kms:Decrypt/kms:DescribeKey -- an IAM statement alone is not
 #      sufficient if the key policy does not also allow it.
 #   4. Do not apply this Terraform module against real AWS until step 2 or 3
 #      has been completed for all 4 resources.

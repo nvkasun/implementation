@@ -40,22 +40,22 @@ serviceAccount:
 # templates/runtime-secretproviderclass.yaml). Secret VALUES are never
 # stored here or anywhere in Git -- only object-name references, mounted at
 # runtime as files.
+#
+# Manager-alignment correction (fix 1): admin secret OBJECT NAMES are no
+# longer configured per engine type here -- they are DEPLOYMENT-level and
+# generated from canonical pipelines/deployments.yaml + topologies/dev/*.yaml
+# (see templates/secretproviderclass.yaml). The only knobs that remain here
+# are the shared facts true of every admin secret regardless of which
+# deployment it belongs to: the CSI provider region, the secret's internal
+# JSON key names (every GoldenGate admin secret in this system uses the
+# same OGG_ADMIN/OGG_ADMIN_PWD keys), and the TLS object's type default.
 secrets:
   region: eu-west-1
-  oracle:
-    admin:
-      objectName: dev/goldengate/source/admin
-      objectType: secretsmanager
-      usernameKey: OGG_ADMIN
-      passwordKey: OGG_ADMIN_PWD
-  postgresql:
-    admin:
-      objectName: dev/goldengate/target/admin
-      objectType: secretsmanager
-      usernameKey: OGG_ADMIN
-      passwordKey: OGG_ADMIN_PWD
+  admin:
+    objectType: secretsmanager
+    usernameKey: OGG_ADMIN
+    passwordKey: OGG_ADMIN_PWD
   tls:
-    objectName: dev/goldengate/tls-certificate
     objectType: secretsmanager
 
 service:

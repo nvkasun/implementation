@@ -150,10 +150,10 @@ deployments:
             self.assertEqual(r["endpoints"]["admin"]["port"], 8443)
             self.assertEqual(r["secretReferences"]["admin"], "dev/goldengate/source/admin")
 
-    def test_pipeline_id_propagated_into_merged_runtime(self):
-        """Exact shape from the correction pass: pipeline is the canonical
-        DynamoDB key, name is the bare inventory name, pipelineId is the
-        LOGICAL topology pipeline identity -- three distinct fields."""
+    def test_runtime_shape_has_no_pipeline_id_field(self):
+        """Manager-alignment correction (fix 2): pipelineId is NOT a runtime
+        field -- a deployment does not belong to a single logical pipeline.
+        pipeline (canonical key) and name (bare name) remain distinct."""
         with tempfile.TemporaryDirectory() as root:
             self._write(root, inv.DEPLOYMENTS_YAML_RELPATH, """
 deployments:
@@ -175,48 +175,109 @@ deployments:
             r = inv.load_runtimes(root)[0]
             self.assertEqual(r["pipeline"], "gg-oracle-payments-01")
             self.assertEqual(r["name"], "oracle-payments-01")
-            self.assertEqual(r["pipelineId"], "payments-ora-to-pg-001")
+            self.assertNotIn("pipelineId", r)
+            self.assertNotIn("processes", r)
 
-    def test_missing_topology_yields_empty_pipeline_id(self):
+    def test_1_same_deployment_in_two_topology_documents_with_identical_details(self):
+        """A deployment may appear in more than one topology document as
+        long as every immutable connection fact matches -- not rejected as
+        a duplicate."""
         with tempfile.TemporaryDirectory() as root:
             self._write(root, inv.DEPLOYMENTS_YAML_RELPATH, """
 deployments:
-  - name: orphan-01
+  - name: oracle-core-01
     type: oracle
-    enabled: false
+    enabled: true
 """)
-            r = inv.load_runtimes(root)[0]
-            self.assertEqual(r["pipelineId"], "")
+            common = """
+    deploymentName: gg-oracle-core-01
+    deploymentType: oracle
+    namespace: goldengate-dev
+    serviceName: gg-oracle-core-01
+    endpoints:
+      admin:
+        scheme: https
+        host: gg-oracle-core-01.goldengate-dev.svc.cluster.local
+        tlsServerName: gg-oracle-core-01.goldengate-dev.adcbmis.local
+        port: 8443
+    secretReferences:
+      admin: dev/goldengate/oracle-core-01/admin
+      tls: dev/goldengate/tls-certificate
+"""
+            self._write(root, "topologies/dev/payments.yaml", f"""
+pipelineId: payments-pipeline
+deployments:
+  source:
+{common}
+    processes:
+      extracts: [PAYEXT]
+      distributionPaths: []
+      replicats: []
+""")
+            self._write(root, "topologies/dev/loans.yaml", f"""
+pipelineId: loans-pipeline
+deployments:
+  source:
+{common}
+    processes:
+      extracts: [LOAEXT]
+      distributionPaths: []
+      replicats: []
+""")
+            runtimes = inv.load_runtimes(root)
+            self.assertEqual(len(runtimes), 1)
+            r = runtimes[0]
+            self.assertEqual(r["namespace"], "goldengate-dev")
 
-    def test_duplicate_deployment_name_across_topology_documents_fails_loudly(self):
+    def test_5_conflicting_runtime_details_across_topologies_fails_clearly(self):
         with tempfile.TemporaryDirectory() as root:
             self._write(root, "topologies/dev/a.yaml", """
 pipelineId: pipeline-a
 deployments:
   source:
     deploymentName: gg-oracle-payments-01
+    deploymentType: oracle
     namespace: goldengate-dev
     serviceName: gg-oracle-payments-01
+    endpoints:
+      admin:
+        scheme: https
+        host: gg-oracle-payments-01.goldengate-dev.svc.cluster.local
+        tlsServerName: gg-oracle-payments-01.goldengate-dev.adcbmis.local
+        port: 8443
+    secretReferences:
+      admin: dev/goldengate/source/admin
+      tls: dev/goldengate/tls-certificate
 """)
             self._write(root, "topologies/dev/b.yaml", """
 pipelineId: pipeline-b
 deployments:
   source:
     deploymentName: gg-oracle-payments-01
-    namespace: goldengate-dev
+    deploymentType: oracle
+    namespace: goldengate-dev-DIFFERENT
     serviceName: gg-oracle-payments-01
+    endpoints:
+      admin:
+        scheme: https
+        host: gg-oracle-payments-01.goldengate-dev.svc.cluster.local
+        tlsServerName: gg-oracle-payments-01.goldengate-dev.adcbmis.local
+        port: 8443
+    secretReferences:
+      admin: dev/goldengate/source/admin
+      tls: dev/goldengate/tls-certificate
 """)
             with self.assertRaises(inv.InventoryError) as ctx:
                 inv.load_topologies(root)
             self.assertIn("gg-oracle-payments-01", str(ctx.exception))
-            self.assertIn("more than one topology", str(ctx.exception))
+            self.assertIn("CONFLICTING", str(ctx.exception))
 
     def test_empty_process_mapping_on_real_repo_topology(self):
         """The actual repository's canonical sources today have zero
         configured Extracts/Replicats/Distribution Paths -- the derived
         process-pipeline-map.json equivalent must be empty, not a guess."""
         runtimes = inv.load_runtimes(str(REPO_ROOT))
-        self.assertEqual(inv.build_process_pipeline_map_json(runtimes), {})
+        self.assertEqual(inv.build_process_pipeline_map_json(runtimes, str(REPO_ROOT)), {})
 
     def test_real_repo_canonical_runtimes_present(self):
         runtimes = inv.load_runtimes(str(REPO_ROOT))
@@ -226,7 +287,6 @@ deployments:
         for r in runtimes:
             if r["pipeline"] in ("gg-oracle-payments-01", "gg-postgresql-payments-01"):
                 self.assertTrue(r["enabled"])
-                self.assertEqual(r["pipelineId"], "payments-ora-to-pg-001")
 
 
 class LeaseContractTests(unittest.TestCase):
@@ -678,7 +738,7 @@ deployments:
 """)
             runtimes = inv.load_runtimes(root)
             with self.assertRaises(inv.StartupValidationError) as ctx:
-                inv.validate_enabled_runtimes(runtimes, admin_credential_types={"oracle", "postgresql"})
+                inv.validate_enabled_runtimes(runtimes)
             self.assertTrue(any("no matching topology entry" in p for p in ctx.exception.problems))
 
     def test_duplicate_deployment_name_fails_startup(self):
@@ -716,7 +776,7 @@ deployments:
 """)
             runtimes = inv.load_runtimes(root)
             with self.assertRaises(inv.StartupValidationError) as ctx:
-                inv.validate_enabled_runtimes(runtimes, admin_credential_types={"oracle", "postgresql"})
+                inv.validate_enabled_runtimes(runtimes)
             self.assertTrue(any("admin endpoint" in p for p in ctx.exception.problems))
 
     def test_unsupported_runtime_type_fails_startup(self):
@@ -729,7 +789,7 @@ deployments:
 """)
             runtimes = inv.load_runtimes(root)
             with self.assertRaises(inv.StartupValidationError) as ctx:
-                inv.validate_enabled_runtimes(runtimes, admin_credential_types={"oracle", "postgresql"})
+                inv.validate_enabled_runtimes(runtimes)
             self.assertTrue(any("unsupported deployment type" in p for p in ctx.exception.problems))
 
     def test_missing_tls_server_name_fails_startup(self):
@@ -757,88 +817,14 @@ deployments:
 """)
             runtimes = inv.load_runtimes(root)
             with self.assertRaises(inv.StartupValidationError) as ctx:
-                inv.validate_enabled_runtimes(runtimes, admin_credential_types={"oracle", "postgresql"})
+                inv.validate_enabled_runtimes(runtimes)
             self.assertTrue(any("tlsServerName" in p for p in ctx.exception.problems))
-
-    def test_missing_pipeline_id_fails_startup(self):
-        """A topology document with an admin endpoint but no top-level
-        pipelineId (or an empty one) must fail startup for an enabled
-        runtime -- every enabled runtime must belong to a non-empty logical
-        pipeline."""
-        with tempfile.TemporaryDirectory() as root:
-            self._write(root, inv.DEPLOYMENTS_YAML_RELPATH, """
-deployments:
-  - name: oracle-payments-01
-    type: oracle
-    enabled: true
-""")
-            self._write(root, "topologies/dev/x.yaml", """
-deployments:
-  source:
-    deploymentName: gg-oracle-payments-01
-    namespace: goldengate-dev
-    serviceName: gg-oracle-payments-01
-    endpoints:
-      admin:
-        scheme: https
-        host: gg-oracle-payments-01.goldengate-dev.svc.cluster.local
-        tlsServerName: gg-oracle-payments-01.goldengate-dev.adcbmis.local
-        port: 8443
-    secretReferences:
-      admin: dev/goldengate/source/admin
-      tls: dev/goldengate/tls-certificate
-""")
-            runtimes = inv.load_runtimes(root)
-            with self.assertRaises(inv.StartupValidationError) as ctx:
-                inv.validate_enabled_runtimes(runtimes, admin_credential_types={"oracle", "postgresql"})
-            self.assertTrue(any("pipelineId" in p for p in ctx.exception.problems))
 
     def test_real_repo_enabled_runtimes_pass_startup_validation(self):
         """The actual current repository state must validate cleanly --
         this correction pass must not have broken the real deployment."""
         runtimes = inv.load_runtimes(str(REPO_ROOT))
-        inv.validate_enabled_runtimes(runtimes, admin_credential_types=set(core.ADMIN_USER_FILE))
-
-    def test_5_missing_credential_file_not_ready(self):
-        runtime = {"pipeline": "gg-oracle-payments-01", "type": "oracle"}
-        table = MagicMock()
-        table.get_item.return_value = {"Item": {}}
-        old_user_file = core.ADMIN_USER_FILE["oracle"]
-        core.ADMIN_USER_FILE["oracle"] = "/nonexistent/path/should/not/exist"
-        try:
-            ok, reason = core.check_static_prerequisites(runtime, table)
-            self.assertFalse(ok)
-            self.assertIn("credential file", reason)
-        finally:
-            core.ADMIN_USER_FILE["oracle"] = old_user_file
-
-    def test_5_tls_context_unavailable_not_ready(self):
-        runtime = {"pipeline": "gg-oracle-payments-01", "type": "oracle"}
-        table = MagicMock()
-        with tempfile.NamedTemporaryFile("w", delete=False) as uf:
-            uf.write("oggadmin")
-            user_path = uf.name
-        with tempfile.NamedTemporaryFile("w", delete=False) as pf:
-            pf.write("secretpass")
-            pwd_path = pf.name
-        old_user = core.ADMIN_USER_FILE["oracle"]
-        old_pwd = core.ADMIN_PASSWORD_FILE["oracle"]
-        old_ca = core.CA_FILE
-        core.ADMIN_USER_FILE["oracle"] = user_path
-        core.ADMIN_PASSWORD_FILE["oracle"] = pwd_path
-        core._SSL_CTX = None
-        core.CA_FILE = "/nonexistent/ca.pem"
-        try:
-            ok, reason = core.check_static_prerequisites(runtime, table)
-            self.assertFalse(ok)
-            self.assertIn("TLS context", reason)
-        finally:
-            core.ADMIN_USER_FILE["oracle"] = old_user
-            core.ADMIN_PASSWORD_FILE["oracle"] = old_pwd
-            core.CA_FILE = old_ca
-            core._SSL_CTX = None
-            os.unlink(user_path)
-            os.unlink(pwd_path)
+        inv.validate_enabled_runtimes(runtimes)
 
     def _ready_credential_files(self):
         with tempfile.NamedTemporaryFile("w", delete=False) as uf:
@@ -849,72 +835,95 @@ deployments:
             pwd_path = pf.name
         return user_path, pwd_path
 
+    def test_5_missing_credential_file_not_ready(self):
+        runtime = {
+            "pipeline": "gg-oracle-payments-01", "type": "oracle",
+            "credentialUserFile": "/nonexistent/path/should/not/exist",
+            "credentialPasswordFile": "/nonexistent/path/should/not/exist2",
+        }
+        table = MagicMock()
+        table.get_item.return_value = {"Item": {}}
+        ok, reason = core.check_static_prerequisites(runtime, table)
+        self.assertFalse(ok)
+        self.assertIn("credential file", reason)
+
+    def test_5_tls_context_unavailable_not_ready(self):
+        user_path, pwd_path = self._ready_credential_files()
+        runtime = {
+            "pipeline": "gg-oracle-payments-01", "type": "oracle",
+            "credentialUserFile": user_path, "credentialPasswordFile": pwd_path,
+        }
+        table = MagicMock()
+        old_ca = core.CA_FILE
+        core._SSL_CTX = None
+        core.CA_FILE = "/nonexistent/ca.pem"
+        try:
+            ok, reason = core.check_static_prerequisites(runtime, table)
+            self.assertFalse(ok)
+            self.assertIn("TLS context", reason)
+        finally:
+            core.CA_FILE = old_ca
+            core._SSL_CTX = None
+            os.unlink(user_path)
+            os.unlink(pwd_path)
+
     def test_config_item_missing_no_item_key_not_ready(self):
         """DynamoDB get_item returning no Item at all (real boto3 shape when
         the key does not exist) must fail readiness, not be silently treated
         as an acceptable empty CONFIG."""
-        runtime = {"pipeline": "gg-oracle-payments-01", "type": "oracle"}
+        user_path, pwd_path = self._ready_credential_files()
+        runtime = {
+            "pipeline": "gg-oracle-payments-01", "type": "oracle",
+            "credentialUserFile": user_path, "credentialPasswordFile": pwd_path,
+        }
         table = MagicMock()
         table.get_item.return_value = {}  # no "Item" key -- real boto3 shape
-        user_path, pwd_path = self._ready_credential_files()
-        old_user = core.ADMIN_USER_FILE["oracle"]
-        old_pwd = core.ADMIN_PASSWORD_FILE["oracle"]
         old_ssl = core._SSL_CTX
-        core.ADMIN_USER_FILE["oracle"] = user_path
-        core.ADMIN_PASSWORD_FILE["oracle"] = pwd_path
         core._SSL_CTX = MagicMock()  # bypass real TLS context build -- irrelevant to this check
         try:
             ok, reason = core.check_static_prerequisites(runtime, table)
             self.assertFalse(ok)
             self.assertIn("CONFIG", reason)
         finally:
-            core.ADMIN_USER_FILE["oracle"] = old_user
-            core.ADMIN_PASSWORD_FILE["oracle"] = old_pwd
             core._SSL_CTX = old_ssl
             os.unlink(user_path)
             os.unlink(pwd_path)
 
     def test_correct_config_item_prerequisite_succeeds(self):
-        runtime = {"pipeline": "gg-oracle-payments-01", "type": "oracle"}
+        user_path, pwd_path = self._ready_credential_files()
+        runtime = {
+            "pipeline": "gg-oracle-payments-01", "type": "oracle",
+            "credentialUserFile": user_path, "credentialPasswordFile": pwd_path,
+        }
         table = MagicMock()
         table.get_item.return_value = {"Item": {"recordType": "CONFIG", "deploymentType": "oracle"}}
-        user_path, pwd_path = self._ready_credential_files()
-        old_user = core.ADMIN_USER_FILE["oracle"]
-        old_pwd = core.ADMIN_PASSWORD_FILE["oracle"]
         old_ssl = core._SSL_CTX
-        core.ADMIN_USER_FILE["oracle"] = user_path
-        core.ADMIN_PASSWORD_FILE["oracle"] = pwd_path
         core._SSL_CTX = MagicMock()
         try:
             ok, reason = core.check_static_prerequisites(runtime, table)
             self.assertTrue(ok, reason)
             self.assertEqual(reason, "")
         finally:
-            core.ADMIN_USER_FILE["oracle"] = old_user
-            core.ADMIN_PASSWORD_FILE["oracle"] = old_pwd
             core._SSL_CTX = old_ssl
             os.unlink(user_path)
             os.unlink(pwd_path)
 
     def test_config_deployment_type_mismatch_not_ready(self):
-        runtime = {"pipeline": "gg-oracle-payments-01", "type": "oracle"}
+        user_path, pwd_path = self._ready_credential_files()
+        runtime = {
+            "pipeline": "gg-oracle-payments-01", "type": "oracle",
+            "credentialUserFile": user_path, "credentialPasswordFile": pwd_path,
+        }
         table = MagicMock()
         # CONFIG exists and is well-formed, but belongs to the wrong runtime type.
         table.get_item.return_value = {"Item": {"recordType": "CONFIG", "deploymentType": "postgresql"}}
-        user_path, pwd_path = self._ready_credential_files()
-        old_user = core.ADMIN_USER_FILE["oracle"]
-        old_pwd = core.ADMIN_PASSWORD_FILE["oracle"]
         old_ssl = core._SSL_CTX
-        core.ADMIN_USER_FILE["oracle"] = user_path
-        core.ADMIN_PASSWORD_FILE["oracle"] = pwd_path
         core._SSL_CTX = MagicMock()
         try:
             ok, reason = core.check_static_prerequisites(runtime, table)
             self.assertFalse(ok)
             self.assertIn("deploymentType", reason)
         finally:
-            core.ADMIN_USER_FILE["oracle"] = old_user
-            core.ADMIN_PASSWORD_FILE["oracle"] = old_pwd
             core._SSL_CTX = old_ssl
             os.unlink(user_path)
             os.unlink(pwd_path)
@@ -1122,51 +1131,448 @@ class TLSServerIdentityTests(unittest.TestCase):
 # Correction pass: real process-pipeline map, not a hardcoded {} (fix 4).
 # ===========================================================================
 class ProcessPipelineMapUsageTests(unittest.TestCase):
+    def _write(self, root, relpath, content):
+        path = os.path.join(root, relpath)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(content)
+
+    def _one_deployment_inventory(self, root):
+        self._write(root, inv.DEPLOYMENTS_YAML_RELPATH, """
+deployments:
+  - name: oracle-payments-01
+    type: oracle
+    enabled: true
+""")
+
     def test_9_synthetic_extract_resolves_pipeline_name_from_topology(self):
-        runtime = {
-            "pipeline": "gg-oracle-payments-01",
-            "name": "oracle-payments-01",
-            "type": "oracle",
-            "pipelineId": "payments-ora-to-pg-001",
-            "processes": {"extracts": ["EXTORA1"], "distributionPaths": [], "replicats": []},
-        }
-        pipe_map = inv.build_process_pipeline_map_json([runtime])
-        self.assertEqual(
-            pipe_map["EXTORA1"],
-            {"pipeline_name": "payments-ora-to-pg-001", "deployment": "oracle-payments-01"},
-        )
+        with tempfile.TemporaryDirectory() as root:
+            self._one_deployment_inventory(root)
+            self._write(root, "topologies/dev/x.yaml", """
+pipelineId: payments-ora-to-pg-001
+deployments:
+  source:
+    deploymentName: gg-oracle-payments-01
+    namespace: goldengate-dev
+    serviceName: gg-oracle-payments-01
+    processes:
+      extracts: [EXTORA1]
+      distributionPaths: []
+      replicats: []
+""")
+            runtimes = inv.load_runtimes(root)
+            pipe_map = inv.build_process_pipeline_map_json(runtimes, root)
+            self.assertEqual(
+                pipe_map["EXTORA1"],
+                {"pipeline_name": "payments-ora-to-pg-001", "deployment": "oracle-payments-01"},
+            )
 
     def test_pipeline_name_is_not_the_canonical_deployment_key(self):
         # The canonical DynamoDB partition key (gg-oracle-payments-01) and the
         # logical topology pipelineId (payments-ora-to-pg-001) are two
         # different concepts the manager keeps separate -- pipeline_name must
         # never be the former.
-        runtime = {
-            "pipeline": "gg-oracle-payments-01",
-            "name": "oracle-payments-01",
-            "type": "oracle",
-            "pipelineId": "payments-ora-to-pg-001",
-            "processes": {"extracts": ["EXTORA1"], "distributionPaths": [], "replicats": []},
-        }
-        pipe_map = inv.build_process_pipeline_map_json([runtime])
-        self.assertNotEqual(pipe_map["EXTORA1"]["pipeline_name"], runtime["pipeline"])
+        with tempfile.TemporaryDirectory() as root:
+            self._one_deployment_inventory(root)
+            self._write(root, "topologies/dev/x.yaml", """
+pipelineId: payments-ora-to-pg-001
+deployments:
+  source:
+    deploymentName: gg-oracle-payments-01
+    namespace: goldengate-dev
+    serviceName: gg-oracle-payments-01
+    processes:
+      extracts: [EXTORA1]
+      distributionPaths: []
+      replicats: []
+""")
+            runtimes = inv.load_runtimes(root)
+            pipe_map = inv.build_process_pipeline_map_json(runtimes, root)
+            self.assertNotEqual(pipe_map["EXTORA1"]["pipeline_name"], "gg-oracle-payments-01")
 
-    def test_missing_pipeline_id_yields_empty_pipeline_name_not_the_deployment_key(self):
-        runtime = {
-            "pipeline": "gg-oracle-payments-01",
-            "name": "oracle-payments-01",
-            "type": "oracle",
-            "processes": {"extracts": ["EXTORA1"], "distributionPaths": [], "replicats": []},
-        }
-        pipe_map = inv.build_process_pipeline_map_json([runtime])
-        self.assertEqual(pipe_map["EXTORA1"]["pipeline_name"], "")
+    def test_process_mapping_without_pipeline_id_fails_clearly(self):
+        """A topology document that declares process mappings but has no
+        top-level pipelineId must fail loudly (pipelineId is a
+        process-topology requirement, not a deployment-health-polling one)."""
+        with tempfile.TemporaryDirectory() as root:
+            self._one_deployment_inventory(root)
+            self._write(root, "topologies/dev/x.yaml", """
+deployments:
+  source:
+    deploymentName: gg-oracle-payments-01
+    namespace: goldengate-dev
+    serviceName: gg-oracle-payments-01
+    processes:
+      extracts: [EXTORA1]
+      distributionPaths: []
+      replicats: []
+""")
+            runtimes = inv.load_runtimes(root)
+            with self.assertRaises(inv.InventoryError) as ctx:
+                inv.build_process_pipeline_map_json(runtimes, root)
+            self.assertIn("pipelineId", str(ctx.exception))
 
-    def test_polling_loop_consumes_real_map_not_hardcoded_empty_dict(self):
+    def test_deployment_level_polling_needs_no_pipeline_id(self):
+        """A topology document with zero process mappings needs no
+        pipelineId at all -- deployment-level health polling has no process
+        concept (this is the current real-repo state)."""
+        with tempfile.TemporaryDirectory() as root:
+            self._one_deployment_inventory(root)
+            self._write(root, "topologies/dev/x.yaml", """
+deployments:
+  source:
+    deploymentName: gg-oracle-payments-01
+    namespace: goldengate-dev
+    serviceName: gg-oracle-payments-01
+    processes:
+      extracts: []
+      distributionPaths: []
+      replicats: []
+""")
+            runtimes = inv.load_runtimes(root)
+            self.assertEqual(inv.build_process_pipeline_map_json(runtimes, root), {})
+
+    def test_2_and_3_two_topologies_map_different_processes_same_deployment(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._write(root, inv.DEPLOYMENTS_YAML_RELPATH, """
+deployments:
+  - name: oracle-core-01
+    type: oracle
+    enabled: true
+""")
+            common = """
+    deploymentName: gg-oracle-core-01
+    namespace: goldengate-dev
+    serviceName: gg-oracle-core-01
+"""
+            self._write(root, "topologies/dev/payments.yaml", f"""
+pipelineId: payments-pipeline
+deployments:
+  source:
+{common}
+    processes:
+      extracts: [PAYEXT]
+      distributionPaths: []
+      replicats: []
+""")
+            self._write(root, "topologies/dev/loans.yaml", f"""
+pipelineId: loans-pipeline
+deployments:
+  source:
+{common}
+    processes:
+      extracts: [LOAEXT]
+      distributionPaths: []
+      replicats: []
+""")
+            runtimes = inv.load_runtimes(root)
+            pipe_map = inv.build_process_pipeline_map_json(runtimes, root)
+            self.assertEqual(pipe_map["PAYEXT"], {"pipeline_name": "payments-pipeline", "deployment": "oracle-core-01"})
+            self.assertEqual(pipe_map["LOAEXT"], {"pipeline_name": "loans-pipeline", "deployment": "oracle-core-01"})
+            # concept 4: same deployment name, different pipeline_name
+            self.assertEqual(pipe_map["PAYEXT"]["deployment"], pipe_map["LOAEXT"]["deployment"])
+            self.assertNotEqual(pipe_map["PAYEXT"]["pipeline_name"], pipe_map["LOAEXT"]["pipeline_name"])
+
+    def test_6_conflicting_process_mapping_for_same_deployment_process_fails_clearly(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._write(root, inv.DEPLOYMENTS_YAML_RELPATH, """
+deployments:
+  - name: oracle-core-01
+    type: oracle
+    enabled: true
+""")
+            common = """
+    deploymentName: gg-oracle-core-01
+    namespace: goldengate-dev
+    serviceName: gg-oracle-core-01
+"""
+            self._write(root, "topologies/dev/a.yaml", f"""
+pipelineId: pipeline-a
+deployments:
+  source:
+{common}
+    processes:
+      extracts: [PAYEXT]
+      distributionPaths: []
+      replicats: []
+""")
+            self._write(root, "topologies/dev/b.yaml", f"""
+pipelineId: pipeline-b
+deployments:
+  source:
+{common}
+    processes:
+      extracts: [PAYEXT]
+      distributionPaths: []
+      replicats: []
+""")
+            runtimes = inv.load_runtimes(root)
+            with self.assertRaises(inv.InventoryError) as ctx:
+                inv.build_process_pipeline_map_json(runtimes, root)
+            self.assertIn("PAYEXT", str(ctx.exception))
+            self.assertIn("conflicting", str(ctx.exception))
+
+    def test_7_empty_current_process_lists_still_generate_empty_map(self):
+        runtimes = inv.load_runtimes(str(REPO_ROOT))
+        self.assertEqual(inv.build_process_pipeline_map_json(runtimes, str(REPO_ROOT)), {})
+
+    def test_polling_loop_filters_the_global_map_by_its_own_deployment(self):
+        """polling_loop no longer computes its own process map from a
+        per-runtime 'processes' field -- it receives the GLOBAL map (built
+        once in main()) and filters it locally to its own deployment,
+        mirroring the manager's own read-once/filter-per-deployment split."""
         import inspect
         src = inspect.getsource(core.polling_loop)
-        self.assertIn("build_process_pipeline_map_json", src)
         self.assertNotIn("pipe_map = {}", src)
-        self.assertIn('process_pipeline_map.get(name.upper()', src)
+        self.assertIn('meta.get("deployment") == bare_key', src)
+        main_src = inspect.getsource(core.main)
+        self.assertIn("build_process_pipeline_map_json(runtimes)", main_src)
+
+
+# ===========================================================================
+# Manager-alignment correction: deployment-level credentials (fix 1).
+# Credential identity is per-DEPLOYMENT (secretReferences.admin), never per
+# engine TYPE -- these tests prove two same-engine deployments stay fully
+# independent and that no engine-keyed credential dictionary remains.
+# ===========================================================================
+class DeploymentLevelCredentialTests(unittest.TestCase):
+    def _write(self, root, relpath, content):
+        path = os.path.join(root, relpath)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(content)
+
+    def _two_oracle_one_postgresql(self, root):
+        self._write(root, inv.DEPLOYMENTS_YAML_RELPATH, """
+deployments:
+  - name: oracle-payments-01
+    type: oracle
+    enabled: true
+  - name: oracle-payments-02
+    type: oracle
+    enabled: true
+  - name: postgresql-payments-01
+    type: postgresql
+    enabled: true
+""")
+        self._write(root, "topologies/dev/x.yaml", """
+deployments:
+  a:
+    deploymentName: gg-oracle-payments-01
+    namespace: goldengate-dev
+    serviceName: gg-oracle-payments-01
+    secretReferences:
+      admin: dev/goldengate/oracle-payments-01/admin
+      tls: dev/goldengate/tls-certificate
+  b:
+    deploymentName: gg-oracle-payments-02
+    namespace: goldengate-dev
+    serviceName: gg-oracle-payments-02
+    secretReferences:
+      admin: dev/goldengate/oracle-payments-02/admin
+      tls: dev/goldengate/tls-certificate
+  c:
+    deploymentName: gg-postgresql-payments-01
+    namespace: goldengate-dev
+    serviceName: gg-postgresql-payments-01
+    secretReferences:
+      admin: dev/goldengate/target/admin
+      tls: dev/goldengate/tls-certificate
+""")
+
+    def test_1_two_oracle_runtimes_use_two_different_admin_secret_objects(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._two_oracle_one_postgresql(root)
+            runtimes = {r["pipeline"]: r for r in inv.load_runtimes(root)}
+            self.assertEqual(runtimes["gg-oracle-payments-01"]["adminSecretObject"], "dev/goldengate/oracle-payments-01/admin")
+            self.assertEqual(runtimes["gg-oracle-payments-02"]["adminSecretObject"], "dev/goldengate/oracle-payments-02/admin")
+            self.assertNotEqual(
+                runtimes["gg-oracle-payments-01"]["adminSecretObject"],
+                runtimes["gg-oracle-payments-02"]["adminSecretObject"],
+            )
+
+    def test_2_their_username_password_file_paths_are_distinct(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._two_oracle_one_postgresql(root)
+            runtimes = {r["pipeline"]: r for r in inv.load_runtimes(root)}
+            r1, r2 = runtimes["gg-oracle-payments-01"], runtimes["gg-oracle-payments-02"]
+            self.assertNotEqual(r1["credentialUserFile"], r2["credentialUserFile"])
+            self.assertNotEqual(r1["credentialPasswordFile"], r2["credentialPasswordFile"])
+            self.assertIn("gg-oracle-payments-01", r1["credentialUserFile"])
+            self.assertIn("gg-oracle-payments-02", r2["credentialUserFile"])
+
+    def test_3_first_oracle_runtime_never_receives_second_oracle_runtime_credentials(self):
+        """Functional proof, not just distinct paths: check_static_prerequisites
+        reads EXACTLY the file named on the runtime it was called with, never
+        falling back to a shared/engine-keyed lookup."""
+        with tempfile.TemporaryDirectory() as root:
+            self._two_oracle_one_postgresql(root)
+            runtimes = {r["pipeline"]: r for r in inv.load_runtimes(root)}
+            with tempfile.NamedTemporaryFile("w", delete=False) as f1u:
+                f1u.write("user-one")
+                path1u = f1u.name
+            with tempfile.NamedTemporaryFile("w", delete=False) as f1p:
+                f1p.write("pass-one")
+                path1p = f1p.name
+            with tempfile.NamedTemporaryFile("w", delete=False) as f2u:
+                f2u.write("user-two")
+                path2u = f2u.name
+            with tempfile.NamedTemporaryFile("w", delete=False) as f2p:
+                f2p.write("pass-two")
+                path2p = f2p.name
+            try:
+                r1 = dict(runtimes["gg-oracle-payments-01"], credentialUserFile=path1u, credentialPasswordFile=path1p)
+                r2 = dict(runtimes["gg-oracle-payments-02"], credentialUserFile=path2u, credentialPasswordFile=path2p)
+                # Reading r1's own files must yield r1's own credentials, never r2's.
+                self.assertEqual(core._read_secret_file(r1["credentialUserFile"]), "user-one")
+                self.assertEqual(core._read_secret_file(r1["credentialPasswordFile"]), "pass-one")
+                self.assertNotEqual(core._read_secret_file(r1["credentialUserFile"]), core._read_secret_file(r2["credentialUserFile"]))
+                self.assertNotEqual(core._read_secret_file(r1["credentialPasswordFile"]), core._read_secret_file(r2["credentialPasswordFile"]))
+            finally:
+                for p in (path1u, path1p, path2u, path2p):
+                    os.unlink(p)
+
+    def test_4_postgresql_runtime_remains_independently_mapped(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._two_oracle_one_postgresql(root)
+            runtimes = {r["pipeline"]: r for r in inv.load_runtimes(root)}
+            pg = runtimes["gg-postgresql-payments-01"]
+            oracle1 = runtimes["gg-oracle-payments-01"]
+            self.assertEqual(pg["adminSecretObject"], "dev/goldengate/target/admin")
+            self.assertNotEqual(pg["adminSecretObject"], oracle1["adminSecretObject"])
+            self.assertNotEqual(pg["credentialUserFile"], oracle1["credentialUserFile"])
+
+    def test_5_no_literal_secret_value_in_inventory_configmap_or_values(self):
+        runtimes = inv.load_runtimes(str(REPO_ROOT))
+        for r in runtimes:
+            # adminSecretObject is a Secrets Manager OBJECT NAME/reference,
+            # never a value -- and credential*File are FILE PATHS, not
+            # contents. Neither should ever look like a real password.
+            self.assertNotIn(" ", r["adminSecretObject"] or "")
+        rendered_configmap = (REPO_ROOT / "helm" / "gg-monitor" / "templates" / "configmap.yaml").read_text()
+        self.assertNotIn("OGG_ADMIN_PWD=", rendered_configmap)
+        values_text = (REPO_ROOT / "helm" / "gg-monitor" / "values.yaml").read_text()
+        self.assertNotIn("passwordKey: \"", values_text)  # no literal password baked into a key value
+
+    def test_6_no_engine_level_credential_dictionary_remains(self):
+        core_src = code_only((REPO_ROOT / "monitoring" / "gg-monitor-core" / "gg_monitor_core.py").read_text())
+        for forbidden in ("ADMIN_USER_FILE", "ADMIN_PASSWORD_FILE", "ORACLE_ADMIN_USER_FILE",
+                          "ORACLE_ADMIN_PASSWORD_FILE", "POSTGRESQL_ADMIN_USER_FILE", "POSTGRESQL_ADMIN_PASSWORD_FILE"):
+            self.assertNotIn(forbidden, core_src)
+        chart_values = (REPO_ROOT / "helm" / "gg-monitor" / "values.yaml").read_text()
+        self.assertNotIn("oracle:", chart_values)
+        self.assertNotIn("postgresql:", chart_values)
+        spc_src = (REPO_ROOT / "helm" / "gg-monitor" / "templates" / "secretproviderclass.yaml").read_text()
+        # The template's own explanatory comment legitimately mentions
+        # "Oracle/PostgreSQL" in prose while explaining the correction --
+        # what must never appear is a literal Values reference to a
+        # per-engine sub-block.
+        self.assertNotIn(".Values.secrets.oracle", spc_src)
+        self.assertNotIn(".Values.secrets.postgresql", spc_src)
+
+    def test_real_repo_two_current_deployments_have_distinct_credentials(self):
+        runtimes = {r["pipeline"]: r for r in inv.load_runtimes(str(REPO_ROOT))}
+        oracle = runtimes["gg-oracle-payments-01"]
+        pg = runtimes["gg-postgresql-payments-01"]
+        self.assertNotEqual(oracle["adminSecretObject"], pg["adminSecretObject"])
+        self.assertNotEqual(oracle["credentialUserFile"], pg["credentialUserFile"])
+        self.assertNotEqual(oracle["credentialPasswordFile"], pg["credentialPasswordFile"])
+
+
+# ===========================================================================
+# Manager-alignment correction: IAM secret coverage validation (fix 5).
+# A future runtime whose secret lives outside the currently allowed ARN set
+# must fail validation before deployment, not later with FailedMount.
+# ===========================================================================
+class SecretArnCoverageTests(unittest.TestCase):
+    ALLOWED = [
+        "arn:aws:secretsmanager:eu-west-1:668311715351:secret:dev/goldengate/source/admin-*",
+        "arn:aws:secretsmanager:eu-west-1:668311715351:secret:dev/goldengate/target/admin-*",
+        "arn:aws:secretsmanager:eu-west-1:668311715351:secret:dev/goldengate/tls-certificate-*",
+    ]
+
+    def _runtime(self, pipeline, admin_secret, tls_secret="dev/goldengate/tls-certificate"):
+        return {
+            "pipeline": pipeline, "enabled": True,
+            "adminSecretObject": admin_secret,
+            "secretReferences": {"admin": admin_secret, "tls": tls_secret},
+        }
+
+    def test_covered_secrets_pass(self):
+        runtimes = [self._runtime("gg-oracle-payments-01", "dev/goldengate/source/admin")]
+        inv.validate_secret_arn_coverage(runtimes, self.ALLOWED)  # must not raise
+
+    def test_uncovered_admin_secret_fails_before_deployment(self):
+        runtimes = [self._runtime("gg-oracle-payments-02", "dev/goldengate/oracle-payments-02/admin")]
+        with self.assertRaises(inv.StartupValidationError) as ctx:
+            inv.validate_secret_arn_coverage(runtimes, self.ALLOWED)
+        self.assertTrue(any("oracle-payments-02/admin" in p for p in ctx.exception.problems))
+        self.assertTrue(any("FailedMount" in p for p in ctx.exception.problems))
+
+    def test_uncovered_tls_secret_fails(self):
+        runtimes = [self._runtime("gg-oracle-payments-01", "dev/goldengate/source/admin",
+                                  tls_secret="dev/goldengate/different-tls-certificate")]
+        with self.assertRaises(inv.StartupValidationError) as ctx:
+            inv.validate_secret_arn_coverage(runtimes, self.ALLOWED)
+        self.assertTrue(any("tls secret" in p for p in ctx.exception.problems))
+
+    def test_disabled_runtime_not_checked(self):
+        runtimes = [dict(self._runtime("gg-disabled-01", "dev/goldengate/not-covered/admin"), enabled=False)]
+        inv.validate_secret_arn_coverage(runtimes, self.ALLOWED)  # must not raise
+
+    def test_does_not_falsely_match_a_prefix_of_a_different_secret_name(self):
+        """dev/goldengate/source/admin-extra must NOT be considered covered
+        by the dev/goldengate/source/admin-* pattern -- that pattern's
+        trailing "-*" is Secrets Manager's own random-suffix wildcard for
+        THIS secret's real ARN, not a free-form prefix match."""
+        runtimes = [self._runtime("gg-oracle-payments-01", "dev/goldengate/source/admin-extra")]
+        with self.assertRaises(inv.StartupValidationError):
+            inv.validate_secret_arn_coverage(runtimes, self.ALLOWED)
+
+    def test_real_repo_current_runtimes_are_covered_by_the_real_iam_policy(self):
+        """The actual current deployment must validate cleanly against the
+        actual current gg-monitor-dev-role policy -- this correction pass
+        must not have broken it, and proves the check is meaningful against
+        real data, not just synthetic fixtures."""
+        import json
+        runtimes = inv.load_runtimes(str(REPO_ROOT))
+        policy_path = REPO_ROOT / "envs" / "dev" / "policies" / "gg-monitor-dev-role" / "policies" / "policies_1.json"
+        policy = json.loads(policy_path.read_text())
+        allowed = []
+        for stmt in policy["Statement"]:
+            actions = stmt["Action"] if isinstance(stmt["Action"], list) else [stmt["Action"]]
+            if "secretsmanager:GetSecretValue" in actions:
+                resources = stmt["Resource"] if isinstance(stmt["Resource"], list) else [stmt["Resource"]]
+                allowed.extend(resources)
+        inv.validate_secret_arn_coverage(runtimes, allowed)  # must not raise
+
+    def test_future_runtime_outside_allowed_arns_fails_against_real_policy(self):
+        import json
+        runtimes = inv.load_runtimes(str(REPO_ROOT)) + [
+            self._runtime("gg-oracle-payments-02", "dev/goldengate/oracle-payments-02/admin")
+        ]
+        policy_path = REPO_ROOT / "envs" / "dev" / "policies" / "gg-monitor-dev-role" / "policies" / "policies_1.json"
+        policy = json.loads(policy_path.read_text())
+        allowed = []
+        for stmt in policy["Statement"]:
+            actions = stmt["Action"] if isinstance(stmt["Action"], list) else [stmt["Action"]]
+            if "secretsmanager:GetSecretValue" in actions:
+                resources = stmt["Resource"] if isinstance(stmt["Resource"], list) else [stmt["Resource"]]
+                allowed.extend(resources)
+        with self.assertRaises(inv.StartupValidationError) as ctx:
+            inv.validate_secret_arn_coverage(runtimes, allowed)
+        self.assertTrue(any("oracle-payments-02" in p for p in ctx.exception.problems))
+
+    def test_iam_policy_not_broadened_to_wildcard_secretsmanager(self):
+        import json
+        policy_path = REPO_ROOT / "envs" / "dev" / "policies" / "gg-monitor-dev-role" / "policies" / "policies_1.json"
+        policy = json.loads(policy_path.read_text())
+        for stmt in policy["Statement"]:
+            actions = stmt["Action"] if isinstance(stmt["Action"], list) else [stmt["Action"]]
+            if any(a.startswith("secretsmanager:") for a in actions):
+                self.assertNotIn("secretsmanager:*", actions)
+                resources = stmt["Resource"] if isinstance(stmt["Resource"], list) else [stmt["Resource"]]
+                self.assertNotIn("*", resources)
 
 
 # ===========================================================================
@@ -1206,6 +1612,26 @@ class WorkflowCorrectionTests(unittest.TestCase):
         step_text = self._dynamodb_step_text()
         self.assertNotIn("aws dynamodb get-item", step_text)
 
+    def test_no_hardcoded_runtime_name_in_dynamodb_verification_step(self):
+        """Manager-alignment correction (fix 3): PIPELINES must be DERIVED
+        from the in-pod canonical inventory (inventory.load_runtimes /
+        build_deployments_json), never a literal list of today's runtime
+        names -- future enabled runtimes must be covered automatically,
+        with no workflow code change."""
+        step_text = self._dynamodb_step_text()
+        for hardcoded in ("gg-oracle-payments-01", "gg-postgresql-payments-01"):
+            self.assertNotIn(hardcoded, step_text)
+        self.assertIn("import inventory", step_text)
+        self.assertIn("inventory.load_runtimes()", step_text)
+        self.assertIn("inventory.build_deployments_json(RUNTIMES)", step_text)
+        self.assertNotIn('PIPELINES = ["gg-', step_text)
+
+    def test_process_state_check_is_data_driven_not_permanently_zero(self):
+        step_text = self._dynamodb_step_text()
+        self.assertIn("inventory.build_process_pipeline_map_json(RUNTIMES)", step_text)
+        self.assertIn("EXPECTED_PROCESSES_BY_PIPELINE", step_text)
+        self.assertIn("actual_process_names != expected_process_names", step_text)
+
     def _select_pod_step_text(self):
         content = self.WORKFLOW_PATH.read_text()
         idx = content.index("Select the Running and Ready gg-monitor pod")
@@ -1226,6 +1652,53 @@ class WorkflowCorrectionTests(unittest.TestCase):
         step_text = self._select_pod_step_text()
         self.assertIn("len(ready) != 1", step_text)
         self.assertIn("sys.exit(1)", step_text)
+
+    def test_ready_pod_selection_rejects_pods_with_deletion_timestamp(self):
+        step_text = self._select_pod_step_text()
+        self.assertIn("deletionTimestamp", step_text)
+
+    def _extract_inline_python(self, marker_start, marker_end):
+        content = self.WORKFLOW_PATH.read_text()
+        start = content.index(marker_start) + len(marker_start)
+        end = content.index(marker_end, start)
+        script = content[start:end]
+        lines = script.split("\n")
+        indents = [len(l) - len(l.lstrip()) for l in lines if l.strip()]
+        min_indent = min(indents) if indents else 0
+        return "\n".join(l[min_indent:] if len(l) >= min_indent else l for l in lines)
+
+    def test_6_terminating_ready_old_pod_plus_running_ready_new_pod_selects_new(self):
+        """Functional proof (subprocess, real stdin/stdout, not just source
+        inspection): a Terminating pod that still briefly reports Ready=True
+        must be skipped in favor of the new Running+Ready pod with no
+        deletionTimestamp -- proves the valid-rolling-overlap case fix 6
+        exists to handle."""
+        import subprocess
+        script = self._extract_inline_python("python3 -c '", "')\"")
+        old_pod = {
+            "metadata": {"name": "gg-monitor-old-abc123", "deletionTimestamp": "2026-07-29T08:00:00Z"},
+            "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}]},
+        }
+        new_pod = {
+            "metadata": {"name": "gg-monitor-new-xyz789"},
+            "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}]},
+        }
+        stdin_json = json.dumps({"items": [old_pod, new_pod]})
+        result = subprocess.run([sys.executable, "-c", script], input=stdin_json,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "gg-monitor-new-xyz789")
+
+    def test_rollout_status_step_appears_before_pod_selection_step(self):
+        content = self.WORKFLOW_PATH.read_text()
+        rollout_idx = content.index("name: Wait for gg-monitor Deployment rollout status")
+        select_idx = content.index("name: Select the Running and Ready gg-monitor pod")
+        self.assertLess(rollout_idx, select_idx,
+                        "rollout status must be awaited BEFORE pod selection, not after")
+        # And it must not ALSO still run again inside the later runtime-state
+        # step (moved, not duplicated).
+        runtime_state_step = content[select_idx:content.index("\n      - name:", select_idx + 1)]
+        self.assertNotIn("kubectl rollout status", runtime_state_step)
 
     def test_pod_name_derived_once_and_reused_not_rederived(self):
         """POD_NAME must be exported once by the selection step and reused
@@ -1294,6 +1767,103 @@ class WorkflowCorrectionTests(unittest.TestCase):
         content = self.WORKFLOW_PATH.read_text()
         for forbidden in ("put_item(", "update_item(", "aws dynamodb put-item", "aws dynamodb update-item"):
             self.assertNotIn(forbidden, content, f"the workflow must never write to DynamoDB directly: found {forbidden!r}")
+
+
+# ===========================================================================
+# Manager-alignment correction: image supply-chain (fix 4). Private-ECR,
+# digest-pinned base image required; no Docker Hub; no public runtime pip
+# installation. Deliberately NOT deployable until an operator supplies an
+# approved MONITOR_BASE_IMAGE -- these tests prove the gate is real (fails
+# closed), not that a working image exists yet.
+# ===========================================================================
+class ImageSupplyChainTests(unittest.TestCase):
+    DOCKERFILE_PATH = REPO_ROOT / "monitoring" / "gg-monitor-core" / "Dockerfile"
+    WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "gg-monitor-core.yaml"
+    CHART_DIR = REPO_ROOT / "helm" / "gg-monitor"
+
+    def test_no_default_public_base_image(self):
+        content = code_only(self.DOCKERFILE_PATH.read_text())
+        self.assertNotIn("ARG BASE_IMAGE=", content, "BASE_IMAGE must have no default -- required, not optional")
+        self.assertIn("ARG BASE_IMAGE\n", content)
+
+    def test_no_from_python_anywhere(self):
+        content = code_only(self.DOCKERFILE_PATH.read_text())
+        self.assertNotIn("FROM python:", content)
+        self.assertNotIn("python:3.12-slim", content)
+
+    def test_no_public_pip_install_in_dockerfile(self):
+        content = code_only(self.DOCKERFILE_PATH.read_text())
+        # The governance-gate error message legitimately mentions "pip
+        # install" in prose (explaining what it refuses to silently do) --
+        # what must never appear is the ACTUAL command invocation.
+        self.assertNotIn("RUN pip install", content)
+        self.assertNotIn("RUN pip3 install", content)
+        for line in content.splitlines():
+            stripped = line.strip()
+            self.assertFalse(stripped.startswith("pip install"), f"found pip install command: {line!r}")
+
+    def test_dockerfile_fails_closed_when_dependency_missing(self):
+        content = self.DOCKERFILE_PATH.read_text()
+        self.assertIn("MONITOR BASE IMAGE GOVERNANCE GATE", content)
+        self.assertIn("find_spec", content)
+        self.assertIn("sys.exit(", content)
+
+    def test_workflow_refuses_to_build_without_approved_base_image(self):
+        content = self.WORKFLOW_PATH.read_text()
+        self.assertIn('MONITOR_BASE_IMAGE: ""', content)
+        self.assertIn("Enforce monitor base image governance gate", content)
+        gate_idx = content.index("Enforce monitor base image governance gate")
+        build_idx = content.index("name: Build monitor image")
+        self.assertLess(gate_idx, build_idx, "the gate must run BEFORE the build step")
+        gate_text = content[gate_idx:content.index("\n      - name:", gate_idx + 1)]
+        self.assertIn('if [ -z "${MONITOR_BASE_IMAGE}" ]', gate_text)
+        self.assertIn("exit 1", gate_text)
+
+    def test_workflow_requires_digest_pinned_base_image(self):
+        content = self.WORKFLOW_PATH.read_text()
+        self.assertIn("@sha256:", content)
+        gate_idx = content.index("Enforce monitor base image governance gate")
+        gate_text = content[gate_idx:content.index("\n      - name:", gate_idx + 1)]
+        self.assertIn("not digest-pinned", gate_text)
+
+    def test_workflow_rejects_docker_hub_base_image(self):
+        content = self.WORKFLOW_PATH.read_text()
+        gate_idx = content.index("Enforce monitor base image governance gate")
+        gate_text = content[gate_idx:content.index("\n      - name:", gate_idx + 1)]
+        self.assertIn("docker.io", gate_text)
+        self.assertIn("Docker Hub", gate_text)
+
+    def test_docker_build_passes_base_image_build_arg(self):
+        content = self.WORKFLOW_PATH.read_text()
+        build_idx = content.index("name: Build monitor image")
+        build_text = content[build_idx:content.index("\n      - name:", build_idx + 1)]
+        self.assertIn('--build-arg "BASE_IMAGE=${MONITOR_BASE_IMAGE}"', build_text)
+
+    def test_no_public_ecr_aws_in_deployable_chart(self):
+        for path in self.CHART_DIR.rglob("*"):
+            if path.is_file() and path.suffix in (".yaml", ".yml", ".tpl"):
+                self.assertNotIn("public.ecr.aws", code_only(path.read_text()), f"found in {path}")
+
+    def test_generated_json_artifacts_step_present_and_touches_no_secrets(self):
+        content = self.WORKFLOW_PATH.read_text()
+        self.assertIn("Generate manager-compatible JSON artifacts", content)
+        self.assertIn("deployments.json", content)
+        self.assertIn("runtime-config.json", content)
+        self.assertIn("process-pipeline-map.json", content)
+        gen_idx = content.index("Generate manager-compatible JSON artifacts")
+        gen_text = content[gen_idx:content.index("\n      - name:", gen_idx + 1)]
+        self.assertNotIn("GetSecretValue", gen_text)
+        self.assertNotIn("secretsmanager", gen_text)
+
+    def test_runtime_config_json_has_no_secret_object_name(self):
+        """runtime-config.json is documented as carrying credential FILE
+        PATHS, never the raw Secrets Manager object name/ARN -- proves
+        build_runtime_config_json's actual output shape matches that claim."""
+        runtimes = inv.load_runtimes(str(REPO_ROOT))
+        config = inv.build_runtime_config_json(runtimes)
+        for entry in config:
+            self.assertNotIn("adminSecretObject", entry)
+            self.assertNotIn("secretReferences", entry)
 
 
 # ===========================================================================

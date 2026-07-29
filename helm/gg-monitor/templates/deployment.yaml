@@ -74,14 +74,13 @@ spec:
                   fieldPath: metadata.name
             - name: TZ
               value: "Asia/Dubai"
-            - name: ORACLE_ADMIN_USER_FILE
-              value: "/mnt/secrets-store/oracle-ogg-admin"
-            - name: ORACLE_ADMIN_PASSWORD_FILE
-              value: "/mnt/secrets-store/oracle-ogg-admin-pwd"
-            - name: POSTGRESQL_ADMIN_USER_FILE
-              value: "/mnt/secrets-store/postgresql-ogg-admin"
-            - name: POSTGRESQL_ADMIN_PASSWORD_FILE
-              value: "/mnt/secrets-store/postgresql-ogg-admin-pwd"
+            # No per-engine ORACLE_ADMIN_*/POSTGRESQL_ADMIN_* env vars here
+            # (fix 1): gg_monitor_core.py computes each deployment's own
+            # credential file paths itself from canonical runtime data
+            # (inventory.py's "<pipeline>-admin-user"/"-admin-password"
+            # alias convention), the same convention this chart's
+            # secretproviderclass.yaml uses to generate the CSI aliases --
+            # both sides agree without either referencing the other.
             - name: CA_FILE
               value: "/mnt/secrets-store/ca-chain-pem"
             - name: AWS_CONFIG_FILE

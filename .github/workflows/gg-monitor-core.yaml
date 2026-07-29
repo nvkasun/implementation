@@ -53,6 +53,17 @@ env:
 
   MONITOR_SOURCE_PATH: monitoring/gg-monitor-core
   MONITOR_ECR_REPOSITORY: gg-monitor-core
+  # MONITOR BASE IMAGE GOVERNANCE GATE -- DO NOT DISMISS, DO NOT GUESS A
+  # VALUE. Deliberately empty: no approved private-ECR, digest-pinned base
+  # image has been confirmed for gg-monitor-core yet (manager-alignment
+  # correction, fix 4 -- matches the manager's own private-ECR/digest-
+  # pinned/boto3-baked-in supply-chain pattern, never Docker Hub, never
+  # public runtime pip installation). The "Enforce monitor base image
+  # governance gate" step below refuses to run `docker build` at all while
+  # this is empty -- see monitoring/gg-monitor-core/Dockerfile's own
+  # governance gate comment for exactly what must be supplied
+  # (repository@sha256:<digest>) before this image becomes deployable.
+  MONITOR_BASE_IMAGE: ""
 
   HELM_OCI_NAMESPACE: helm
   CHART_NAME: gg-monitor
@@ -214,6 +225,53 @@ jobs:
           python3 -m pip install --quiet -r "${MONITOR_SOURCE_PATH}/requirements.txt" boto3 moto[dynamodb]
           python3 -m unittest discover -s "${MONITOR_SOURCE_PATH}/tests" -p "test_*.py" -v
 
+      - name: Generate manager-compatible JSON artifacts (deployments.json, runtime-config.json, process-pipeline-map.json)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Packaging-time generation (fix 4), using the RUNNER's own
+          # tooling (PyYAML already installed above) against the same
+          # canonical YAML the container mounts at runtime -- these are
+          # audit/documentation artifacts uploaded alongside the image build,
+          # not (yet) a replacement for the running container's own
+          # ConfigMap-mounted-YAML load path (see monitoring/gg-monitor-core/
+          # README.md for what remains a follow-up: fully migrating the
+          # running container to read only these pre-generated files via the
+          # standard-library json module would remove the runtime PyYAML
+          # dependency, but also removes the ability to pick up a topology
+          # change via a ConfigMap update alone, without an image rebuild --
+          # that tradeoff needs its own explicit decision, not a default).
+          mkdir -p "${RUNNER_TEMP}/generated"
+          REPO_CONFIG_ROOT="${GITHUB_WORKSPACE}" python3 -c "
+          import json
+          import sys
+          sys.path.insert(0, '${MONITOR_SOURCE_PATH}')
+          import inventory
+
+          runtimes = inventory.load_runtimes()
+          deployments = inventory.build_deployments_json(runtimes)
+          runtime_config = inventory.build_runtime_config_json(runtimes)
+          process_map = inventory.build_process_pipeline_map_json(runtimes)
+
+          for name, data in (
+              ('deployments.json', deployments),
+              ('runtime-config.json', runtime_config),
+              ('process-pipeline-map.json', process_map),
+          ):
+              path = '${RUNNER_TEMP}/generated/' + name
+              with open(path, 'w') as f:
+                  json.dump(data, f, indent=2, sort_keys=True)
+              print(f'wrote {path}:')
+              print(json.dumps(data, indent=2, sort_keys=True))
+          "
+
+      - name: Upload generated manager-compatible JSON artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gg-monitor-core-generated-json
+          path: ${{ runner.temp }}/generated/
+          if-no-files-found: error
+
       - name: Verify Docker binary and daemon are functional
         if: env.IMAGE_EXISTED != 'true'
         shell: bash
@@ -221,6 +279,40 @@ jobs:
           set -euo pipefail
           command -v docker >/dev/null 2>&1 || { echo "docker not installed"; exit 1; }
           docker info >/dev/null 2>&1 || { echo "docker daemon not reachable"; exit 1; }
+
+      - name: Enforce monitor base image governance gate
+        if: env.IMAGE_EXISTED != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Deliberately runs even though nothing has failed yet -- this is
+          # the gate itself, not a diagnostic. Fails BEFORE any ECR login or
+          # docker build is attempted, so a missing approval can never be
+          # bypassed by a build that happens to still succeed against
+          # whatever base Docker resolves on its own.
+          if [ -z "${MONITOR_BASE_IMAGE}" ]; then
+            echo "FAIL: MONITOR BASE IMAGE GOVERNANCE GATE -- no approved private-ECR,"
+            echo "digest-pinned base image has been configured (MONITOR_BASE_IMAGE is empty)."
+            echo "This build refuses to fall back to a public Docker Hub image or guess an"
+            echo "internal ECR mirror alias. Supply repository@sha256:<digest> in"
+            echo "MONITOR_BASE_IMAGE (.github/workflows/gg-monitor-core.yaml env:) once an"
+            echo "operator has confirmed the approved mirror -- see"
+            echo "monitoring/gg-monitor-core/Dockerfile's governance gate comment."
+            exit 1
+          fi
+          if [[ "${MONITOR_BASE_IMAGE}" != *"@sha256:"* ]]; then
+            echo "FAIL: MONITOR_BASE_IMAGE (${MONITOR_BASE_IMAGE}) is not digest-pinned"
+            echo "(expected repository@sha256:<digest>) -- a mutable tag reference is not"
+            echo "an acceptable approved base per the governance gate."
+            exit 1
+          fi
+          case "${MONITOR_BASE_IMAGE}" in
+            docker.io/*|*.docker.io/*)
+              echo "FAIL: MONITOR_BASE_IMAGE resolves to Docker Hub (${MONITOR_BASE_IMAGE}) -- not permitted."
+              exit 1
+              ;;
+          esac
+          echo "OK: MONITOR_BASE_IMAGE is digest-pinned and not Docker Hub: ${MONITOR_BASE_IMAGE}"
 
       - name: Login to Amazon ECR
         if: env.IMAGE_EXISTED != 'true'
@@ -235,6 +327,7 @@ jobs:
         run: |
           set -euo pipefail
           docker build \
+            --build-arg "BASE_IMAGE=${MONITOR_BASE_IMAGE}" \
             --build-arg "OCI_SOURCE=${{ github.server_url }}/${{ github.repository }}" \
             --build-arg "OCI_TITLE=gg-monitor-core" \
             --build-arg "OCI_DESCRIPTION=Shared, passive GoldenGate runtime poller/writer" \
@@ -572,6 +665,22 @@ jobs:
             sleep "${INTERVAL_SECONDS}"; ELAPSED=$((ELAPSED + INTERVAL_SECONDS))
           done
 
+      - name: Wait for gg-monitor Deployment rollout status
+        if: ${{ inputs.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Correct rollout order (manager-alignment correction, fix 6):
+          # rollout status is awaited BEFORE pod selection, not after --
+          # otherwise pod selection can run during a valid rolling overlap
+          # where the OLD pod is still Ready and the NEW pod isn't yet,
+          # spuriously selecting the wrong one (or racing rollout status
+          # entirely). kubectl rollout status blocks until the Deployment
+          # itself reports the rollout complete (new ReplicaSet fully
+          # available, old one scaled to zero), so by the time pod selection
+          # runs next there is no ambiguity left to race.
+          kubectl rollout status deployment/gg-monitor -n "$RUNTIME_NAMESPACE" --timeout=5m
+
       - name: Select the Running and Ready gg-monitor pod
         if: ${{ inputs.deploy }}
         shell: bash
@@ -581,23 +690,28 @@ jobs:
           # Terminating pod from the PREVIOUS ReplicaSet can still be listed
           # by the label selector alongside the new one, and .items[0] has
           # no defined ordering guarantee -- it could select either. This
-          # selects the single pod that is both phase=Running and reports a
-          # Ready=True condition. With replicaCount=1 (and the earlier "Wait
-          # for Argo CD sync and health" step having already confirmed
-          # rollout health), there must be exactly one such pod; anything
-          # else (zero, or more than one during an overlapping rollout) is a
-          # real problem, not something to guess past.
+          # selects the single pod that is phase=Running, reports a
+          # Ready=True condition, AND has no deletionTimestamp (a
+          # Terminating pod can briefly still show Ready=True while shutting
+          # down -- deletionTimestamp is what actually distinguishes it from
+          # the new pod). With replicaCount=1, and rollout status already
+          # awaited above, there must be exactly one such pod; anything else
+          # (zero, or more than one) is a real problem, not something to
+          # guess past.
           POD_NAME="$(kubectl get pods -n "$RUNTIME_NAMESPACE" -l app.kubernetes.io/name=gg-monitor -o json | python3 -c '
           import json, sys
           data = json.load(sys.stdin)
           ready = []
           for pod in data.get("items", []):
+              metadata = pod.get("metadata", {}) or {}
+              if metadata.get("deletionTimestamp"):
+                  continue
               status = pod.get("status", {}) or {}
               if status.get("phase") != "Running":
                   continue
               conditions = status.get("conditions", []) or []
               if any(c.get("type") == "Ready" and c.get("status") == "True" for c in conditions):
-                  ready.append(pod["metadata"]["name"])
+                  ready.append(metadata["name"])
           if len(ready) != 1:
               print(f"expected exactly 1 Running+Ready gg-monitor pod for replicaCount=1, found {len(ready)}: {ready}", file=sys.stderr)
               sys.exit(1)
@@ -606,7 +720,7 @@ jobs:
           echo "Selected Running+Ready pod: ${POD_NAME}"
           echo "POD_NAME=${POD_NAME}" >> "$GITHUB_ENV"
 
-      - name: Verify gg-monitor runtime state (container count, IRSA, DynamoDB read-only)
+      - name: Verify gg-monitor runtime state (container count, IRSA)
         if: ${{ inputs.deploy }}
         shell: bash
         run: |
@@ -618,9 +732,6 @@ jobs:
           echo "ServiceAccount IRSA annotation:"
           ROLE_ANNOTATION="$(kubectl get serviceaccount gg-monitor -n "$RUNTIME_NAMESPACE" -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}')"
           [ "$ROLE_ANNOTATION" = "$MONITOR_ROLE_ARN" ] || { echo "FAIL: unexpected IRSA role: ${ROLE_ANNOTATION}"; exit 1; }
-
-          echo "Deployment rollout:"
-          kubectl rollout status deployment/gg-monitor -n "$RUNTIME_NAMESPACE" --timeout=5m
 
       - name: Verify DynamoDB records from inside the gg-monitor pod (in-pod IRSA identity, no runner credentials, no `|| true`)
         if: ${{ inputs.deploy }}
@@ -646,10 +757,40 @@ jobs:
 
           import boto3
 
+          # No hardcoded pipeline list (manager-alignment correction, fix 3):
+          # this script runs INSIDE the gg-monitor container (via kubectl
+          # exec), whose own CWD (/app, the image WORKDIR) already has
+          # inventory.py on sys.path -- the exact same canonical-loading
+          # code the running monitor itself uses. Importing it here (rather
+          # than re-deriving the list independently) guarantees this
+          # verification automatically covers every future enabled runtime
+          # with zero workflow code changes, and can never drift from what
+          # the monitor actually believes its own inventory is.
+          import inventory
+
           EXPECTED_ROLE_FRAGMENT = "assumed-role/gg-monitor-dev-role/"
           TABLE_NAME = "gg-eks-pipeline"
           REGION = "eu-west-1"
-          PIPELINES = ["gg-oracle-payments-01", "gg-postgresql-payments-01"]
+          RUNTIMES = inventory.load_runtimes()
+          PIPELINES = inventory.build_deployments_json(RUNTIMES)
+          if not PIPELINES:
+              print("FAIL: no enabled pipelines found in the canonical inventory mounted in this pod")
+              sys.exit(1)
+          print(f"Enabled pipelines discovered from the in-pod canonical inventory: {PIPELINES}")
+          BARE_NAME_BY_PIPELINE = {r["pipeline"]: r["name"] for r in RUNTIMES}
+          # Data-driven expected process-state set (fix 3): NOT a permanently
+          # hardcoded zero-process assumption. Today's topology has no
+          # configured Extract/Replicat/Distribution Path, so every
+          # pipeline's expected set is genuinely empty -- but if process
+          # mappings are added later, this automatically expects exactly
+          # those STATE#<process> records instead of failing on their
+          # presence.
+          PROCESS_PIPELINE_MAP = inventory.build_process_pipeline_map_json(RUNTIMES)
+          EXPECTED_PROCESSES_BY_PIPELINE = {p: set() for p in PIPELINES}
+          for proc_name, meta in PROCESS_PIPELINE_MAP.items():
+              for p in PIPELINES:
+                  if BARE_NAME_BY_PIPELINE.get(p) == meta.get("deployment"):
+                      EXPECTED_PROCESSES_BY_PIPELINE[p].add(str(proc_name).upper())
           TIMEOUT_SECONDS = 180
           POLL_INTERVAL_SECONDS = 5
           # Matches checkIntervalSeconds=60 with a safe margin (3x) -- a
@@ -768,17 +909,24 @@ jobs:
               print(f"OK: {pipeline}/LEASE holder={lease_item['holder']!r} (matches current pod), "
                     f"expiresAt={lease_item['expiresAt']} (future), ttl={lease_item['ttl']}, leaseToken present.")
 
-              # Zero STATE#<process> records expected: current topology has no
-              # configured Extract/Replicat/Distribution Path.
+              # Data-driven process-state check (fix 3): compare against
+              # EXPECTED_PROCESSES_BY_PIPELINE (derived from the in-pod
+              # canonical inventory), not a permanently hardcoded zero
+              # assumption -- today that expected set is empty for every
+              # pipeline, so the effect is identical, but a future process
+              # mapping is verified for PRESENCE instead of failing the
+              # step for existing.
               resp = table.query(
                   KeyConditionExpression="pipeline = :p AND begins_with(recordType, :prefix)",
                   ExpressionAttributeValues={":p": pipeline, ":prefix": "STATE#"},
               )
               process_records = [it for it in resp.get("Items", []) if it["recordType"] != "STATE#_deployment"]
-              if process_records:
-                  names = [it["recordType"] for it in process_records]
-                  fail(f"{pipeline}: unexpected STATE#<process> record(s) found (topology has no configured processes): {names}")
-              print(f"OK: {pipeline} has zero STATE#<process> records, as expected for the current empty topology.")
+              actual_process_names = {it["recordType"][len("STATE#"):].upper() for it in process_records}
+              expected_process_names = EXPECTED_PROCESSES_BY_PIPELINE.get(pipeline, set())
+              if actual_process_names != expected_process_names:
+                  fail(f"{pipeline}: STATE#<process> records {sorted(actual_process_names)} "
+                       f"do not match expected {sorted(expected_process_names)} (from the in-pod canonical inventory)")
+              print(f"OK: {pipeline} has exactly the expected STATE#<process> records: {sorted(expected_process_names) or '(none)'}.")
 
           print("OK: all DynamoDB verifications passed.")
           PYEOF

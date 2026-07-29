@@ -64,3 +64,63 @@ mutation API call, and no credential-sync-into-GoldenGate path.
   read succeeds, lease API path succeeds) -- never GoldenGate Admin REST
   reachability. An unreachable runtime is recorded as `DEPLOYMENT_DOWN`
   while the monitor pod itself stays Ready.
+- Credential identity is DEPLOYMENT-level, matching the manager's own
+  `credentialsSecretId` concept (`charts/gg-deployment/values.yaml` /
+  `templates/statefulset.yaml`, inspected read-only): the manager gives
+  every GoldenGate deployment ONE required Secrets Manager identity string
+  (`<prefix>/deployments/<name>/credentials`), injected as `SECRET_ID` into
+  a `fetch-secrets.py` init container that writes it to a shared file. This
+  module preserves that same "one credential identity per deployment, never
+  per engine type" concept while using this repository's own approved CSI
+  `SecretProviderClass` delivery mechanism instead of an init container --
+  each runtime carries its own `adminSecretObject`
+  (`secretReferences.admin`) and derived `credentialUserFile` /
+  `credentialPasswordFile` paths (`inventory._credential_alias_paths`,
+  `"<pipeline>-admin-user"` / `"<pipeline>-admin-password"`), and
+  `helm/gg-monitor/templates/secretproviderclass.yaml` generates the CSI
+  object list from the same canonical topology data using the identical
+  alias convention, so both sides always agree without cross-referencing
+  each other. There is no `ADMIN_USER_FILE`/`ADMIN_PASSWORD_FILE` dict keyed
+  by engine type anywhere in this module -- a second Oracle deployment with
+  a different secret needs only its own topology entry, never a Python or
+  chart change.
+- Process routing is process-level, not deployment-level (manager
+  alignment): the same deployment can appear in more than one topology
+  document with different process mappings under different logical
+  `pipelineId`s, mirroring the manager's own `{PROCESS: {pipeline_name,
+  deployment}}` contract (`utility-sidecar.py build_process_pipeline_map`)
+  exactly -- a deployment does not "belong to" one pipeline, only a process
+  does. `inventory.build_process_pipeline_map_json` is built once across all
+  enabled runtimes in `main()` and filtered locally per deployment inside
+  `polling_loop`, the same read-once/filter-per-deployment split the
+  manager itself uses.
+
+## Supply chain / packaging (fix 4, manager-alignment correction)
+
+- **MONITOR BASE IMAGE GOVERNANCE GATE**: `Dockerfile`'s `ARG BASE_IMAGE`
+  has no default (previously `python:3.12-slim`, a public Docker Hub
+  image) and the packaging workflow refuses to run `docker build` at all
+  until an operator supplies an approved, digest-pinned, private-ECR
+  reference (`repository@sha256:<digest>`) in `MONITOR_BASE_IMAGE`
+  (`.github/workflows/gg-monitor-core.yaml` `env:`, currently deliberately
+  empty). This image is **not deployable** until that gate is closed --
+  matching the manager reference's own private-ECR/digest-pinned/
+  boto3-baked-in supply-chain pattern (`charts/gg-deployment/values.yaml`,
+  inspected read-only).
+- No `pip install` from public PyPI: `requirements.txt` documents what the
+  approved base image (or a future approved internal package repository --
+  no URL guessed here) must already provide; the Dockerfile fails the
+  build closed if any required module is missing from `BASE_IMAGE`.
+- **Partially migrated, not complete**: the workflow's new "Generate
+  manager-compatible JSON artifacts" step produces `deployments.json`,
+  `runtime-config.json` (an approved shared-monitor extension --
+  per-deployment canonical key/type/namespace/admin connect detail/
+  credential file paths, no secret values), and `process-pipeline-map.json`
+  at packaging time from the same canonical YAML, uploaded as build
+  artifacts for audit. The **running container still loads its
+  configuration from the ConfigMap-mounted YAML via PyYAML at startup**,
+  not from these generated files -- fully migrating the runtime read path
+  to stdlib `json` only would also remove the ability to pick up a
+  topology change via a ConfigMap update alone, without an image rebuild,
+  which is a real tradeoff needing its own explicit decision rather than a
+  default made in this pass.

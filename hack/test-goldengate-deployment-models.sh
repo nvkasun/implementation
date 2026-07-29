@@ -2336,7 +2336,7 @@ if grep -qE "^def lease_control_loop\(mgr, state, stop_event, renew_interval=REN
 else
   fail "lease_control_loop no longer has the expected RENEW_INTERVAL-driven signature"
 fi
-if grep -qE "^def polling_loop\(runtime, table, mgr, state, stop_event\)" "${MONITOR_CORE_DIR}/gg_monitor_core.py"; then
+if grep -qE "^def polling_loop\(runtime, table, mgr, state, stop_event, full_process_pipeline_map=None\)" "${MONITOR_CORE_DIR}/gg_monitor_core.py"; then
   pass "polling_loop is a separate function from lease_control_loop (independent threads)"
 else
   fail "polling_loop no longer has the expected independent-thread signature"
@@ -2376,12 +2376,12 @@ fi
 
 echo "--- Fix 2: readiness cannot become true before prerequisites succeed ---"
 if grep -qE "def check_static_prerequisites\(runtime, table\)" "${MONITOR_CORE_DIR}/gg_monitor_core.py" && \
-   grep -qE "def run_pipeline\(runtime, stop_event, ready_state\)" "${MONITOR_CORE_DIR}/gg_monitor_core.py"; then
+   grep -qE "def run_pipeline\(runtime, stop_event, ready_state, full_process_pipeline_map=None\)" "${MONITOR_CORE_DIR}/gg_monitor_core.py"; then
   pass "run_pipeline exposes a distinct static-prerequisite phase ahead of setting ready_state"
 else
   fail "expected check_static_prerequisites / run_pipeline functions not found as expected"
 fi
-if grep -qE "def validate_enabled_runtimes\(runtimes, admin_credential_types\)" "${MONITOR_CORE_DIR}/inventory.py" && \
+if grep -qE "def validate_enabled_runtimes\(runtimes\)" "${MONITOR_CORE_DIR}/inventory.py" && \
    grep -qE "class StartupValidationError" "${MONITOR_CORE_DIR}/inventory.py"; then
   pass "inventory.py enforces enabled-runtime startup validation (StartupValidationError)"
 else
@@ -2419,10 +2419,10 @@ if grep -qE '^\s*pipe_map\s*=\s*\{\}\s*$' "${MONITOR_CORE_DIR}/gg_monitor_core.p
 else
   pass "gg_monitor_core.py does not hardcode an empty process-pipeline map"
 fi
-if grep -qE "build_process_pipeline_map_json\(\[runtime\]\)" "${MONITOR_CORE_DIR}/gg_monitor_core.py"; then
-  pass "polling_loop resolves the process-pipeline map from inventory.build_process_pipeline_map_json"
+if grep -qE "build_process_pipeline_map_json\(runtimes\)" "${MONITOR_CORE_DIR}/gg_monitor_core.py"; then
+  pass "main() resolves the GLOBAL process-pipeline map from inventory.build_process_pipeline_map_json once (manager-alignment correction: filtered locally per deployment inside polling_loop, not recomputed per-pipeline)"
 else
-  fail "polling_loop does not call build_process_pipeline_map_json as expected"
+  fail "main() does not call build_process_pipeline_map_json as expected"
 fi
 
 echo "--- Fix 5: workflow DynamoDB verification runs inside the monitor pod, no || true ---"
@@ -2540,22 +2540,23 @@ echo "readiness, dynamic lease-API readiness, and pod-lease-ownership"
 echo "verification in the workflow"
 echo "--------------------------------------------------------------------"
 
-echo "--- Fix 1: pipeline_name is the logical topology pipelineId, not the canonical deployment key ---"
+echo "--- Fix 1 (manager-alignment): pipelineId is process-level, NOT stored on the runtime ---"
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   if REPO_CONFIG_ROOT="$REPO_ROOT" python3 -c "
 import sys
 sys.path.insert(0, '${MONITOR_CORE_DIR}')
 import inventory as inv
 runtimes = inv.load_runtimes('${REPO_ROOT}')
-pm = inv.build_process_pipeline_map_json(runtimes)
+pm = inv.build_process_pipeline_map_json(runtimes, '${REPO_ROOT}')
 for r in runtimes:
-    if r['pipeline'] in ('gg-oracle-payments-01', 'gg-postgresql-payments-01'):
-        assert r['pipelineId'] == 'payments-ora-to-pg-001', f\"unexpected pipelineId for {r['pipeline']}: {r['pipelineId']!r}\"
+    assert 'pipelineId' not in r, f\"pipelineId must not be a runtime field, found on {r['pipeline']}\"
+    assert 'processes' not in r, f\"processes must not be a runtime field, found on {r['pipeline']}\"
+assert pm == {}, f\"current empty topology process lists must still yield {{}}, got {pm!r}\"
 print('OK')
 " >"${WORKDIR}/pipelineid-check.log" 2>&1; then
-    pass "canonical runtimes carry pipelineId=payments-ora-to-pg-001, distinct from the canonical deployment key"
+    pass "pipelineId/processes are NOT runtime fields (concept C: process topology is separate from concept B: connection detail)"
   else
-    fail "pipelineId propagation check failed"
+    fail "manager-alignment pipelineId/processes field-removal check failed"
     cat "${WORKDIR}/pipelineid-check.log"
   fi
 else
@@ -2567,10 +2568,15 @@ if grep -qE '"pipeline_name":\s*r\["pipeline"\]' "${MONITOR_CORE_DIR}/inventory.
 else
   pass "build_process_pipeline_map_json does not use the canonical deployment key as pipeline_name"
 fi
-if grep -q 'more than one topology' "${MONITOR_CORE_DIR}/inventory.py"; then
-  pass "load_topologies fails loudly on a deploymentName duplicated across topology documents (no silent overwrite)"
+if grep -q 'CONFLICTING connection details' "${MONITOR_CORE_DIR}/inventory.py"; then
+  pass "load_topologies allows a deploymentName in multiple topology documents (fails only on a genuine connection-detail CONFLICT, not mere repetition)"
 else
-  fail "load_topologies no longer appears to guard against duplicate deploymentName across topology documents"
+  fail "load_topologies no longer appears to guard against conflicting connection details across topology documents"
+fi
+if grep -q '"a deployment must belong to exactly one topology' "${MONITOR_CORE_DIR}/inventory.py"; then
+  fail "inventory.py still enforces the removed 'one topology pipeline per deployment' rule"
+else
+  pass "inventory.py no longer enforces 'a deployment must belong to exactly one topology pipeline'"
 fi
 
 echo "--- Fix 2: CONFIG item is required for readiness, no manager-default fallback ---"
@@ -2651,6 +2657,232 @@ if grep -qE '"kms:' envs/dev/policies/gg-monitor-dev-role/policies/policies_1.js
   fail "gg-monitor-dev-role policy already grants a kms: action -- must remain undismissed/unguessed until live CMK ARNs are confirmed"
 else
   pass "gg-monitor-dev-role policy still grants no kms: actions (correctly gated pending live CMK confirmation)"
+fi
+
+echo ""
+echo ""
+echo "--------------------------------------------------------------------"
+echo "Manager-alignment correction: deployment-level credentials, process-"
+echo "level pipeline model, dynamic workflow inventory, image supply chain,"
+echo "IAM secret coverage, and rollout order"
+echo "--------------------------------------------------------------------"
+
+echo "--- Fix 1: deployment-level credentials -- no engine-keyed dict, generated SecretProviderClass ---"
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  CORE_CODE_ONLY="$(code_only < "${MONITOR_CORE_DIR}/gg_monitor_core.py")"
+  FOUND_FORBIDDEN="false"
+  for forbidden in "ADMIN_USER_FILE" "ADMIN_PASSWORD_FILE" "ORACLE_ADMIN_USER_FILE" "ORACLE_ADMIN_PASSWORD_FILE" "POSTGRESQL_ADMIN_USER_FILE" "POSTGRESQL_ADMIN_PASSWORD_FILE"; do
+    if echo "$CORE_CODE_ONLY" | grep -q "$forbidden"; then
+      fail "gg_monitor_core.py still references engine-keyed credential dict/env var: ${forbidden}"
+      FOUND_FORBIDDEN="true"
+    fi
+  done
+  [ "$FOUND_FORBIDDEN" = "false" ] && pass "gg_monitor_core.py has no engine-keyed credential dictionary or env var remaining"
+
+  if REPO_CONFIG_ROOT="$REPO_ROOT" python3 -c "
+import sys
+sys.path.insert(0, '${MONITOR_CORE_DIR}')
+import inventory as inv
+runtimes = {r['pipeline']: r for r in inv.load_runtimes('${REPO_ROOT}')}
+oracle = runtimes['gg-oracle-payments-01']
+pg = runtimes['gg-postgresql-payments-01']
+assert oracle['adminSecretObject'] and pg['adminSecretObject'], 'adminSecretObject missing'
+assert oracle['adminSecretObject'] != pg['adminSecretObject']
+assert oracle['credentialUserFile'] != pg['credentialUserFile']
+assert oracle['credentialUserFile'] == f\"/mnt/secrets-store/{oracle['pipeline']}-admin-user\"
+print('OK')
+" >"${WORKDIR}/cred-check.log" 2>&1; then
+    pass "real repo: gg-oracle-payments-01 and gg-postgresql-payments-01 have distinct, deployment-level credential identities"
+  else
+    fail "deployment-level credential derivation check failed against the real repo"
+    cat "${WORKDIR}/cred-check.log"
+  fi
+else
+  skip "deployment-level credential checks -- python3 not available"
+fi
+
+if grep -q "secrets.oracle" helm/gg-monitor/values.yaml || grep -q "secrets.postgresql" helm/gg-monitor/values.yaml; then
+  fail "helm/gg-monitor/values.yaml still has a per-engine secrets.oracle/secrets.postgresql block"
+else
+  pass "helm/gg-monitor/values.yaml has no per-engine secrets.oracle/secrets.postgresql block"
+fi
+
+if [ "$HELM_AVAILABLE" = "true" ]; then
+  SPC_RENDERED="${WORKDIR}/gg-monitor-spc.yaml"
+  if helm template gg-monitor "$GG_MONITOR_CHART" --namespace goldengate-monitoring-dev \
+      --values "$GG_MONITOR_VALUES" \
+      --set image.repository=229410149234.dkr.ecr.eu-west-1.amazonaws.com/gg-monitor-core \
+      --set image.tag=test --show-only templates/secretproviderclass.yaml > "$SPC_RENDERED" 2>"${WORKDIR}/gg-monitor-spc.log"; then
+    if grep -q 'objectAlias: "gg-oracle-payments-01-admin-user"' "$SPC_RENDERED" && \
+       grep -q 'objectAlias: "gg-postgresql-payments-01-admin-user"' "$SPC_RENDERED" && \
+       ! grep -qE 'objectAlias: "oracle-ogg-admin"|objectAlias: "postgresql-ogg-admin"' "$SPC_RENDERED"; then
+      pass "SecretProviderClass is generated from canonical data with per-pipeline deterministic aliases (not the old per-engine oracle-ogg-admin/postgresql-ogg-admin aliases)"
+    else
+      fail "SecretProviderClass rendered output does not have the expected per-pipeline aliases"
+      cat "$SPC_RENDERED"
+    fi
+  else
+    fail "helm template --show-only templates/secretproviderclass.yaml failed"
+    cat "${WORKDIR}/gg-monitor-spc.log"
+  fi
+
+  DEPLOY_RENDERED="${WORKDIR}/gg-monitor-deploy.yaml"
+  helm template gg-monitor "$GG_MONITOR_CHART" --namespace goldengate-monitoring-dev \
+    --values "$GG_MONITOR_VALUES" \
+    --set image.repository=229410149234.dkr.ecr.eu-west-1.amazonaws.com/gg-monitor-core \
+    --set image.tag=test --show-only templates/deployment.yaml > "$DEPLOY_RENDERED" 2>/dev/null || true
+  if grep -qE "ORACLE_ADMIN_USER_FILE|POSTGRESQL_ADMIN_USER_FILE" "$DEPLOY_RENDERED"; then
+    fail "rendered gg-monitor Deployment still sets a per-engine credential env var"
+  else
+    pass "rendered gg-monitor Deployment sets no per-engine credential env var"
+  fi
+else
+  skip "SecretProviderClass/Deployment render checks -- helm not installed"
+fi
+
+echo "--- Fix 2 (manager-alignment): process-level model helper (build_runtime_config_json) ---"
+if grep -q "def build_runtime_config_json" "${MONITOR_CORE_DIR}/inventory.py"; then
+  pass "inventory.py exposes build_runtime_config_json (approved shared-monitor JSON extension, fix 4)"
+else
+  fail "inventory.py is missing build_runtime_config_json"
+fi
+
+echo "--- Fix 3: no hardcoded runtime pipeline names remain in the DynamoDB verification step ---"
+DYNAMODB_STEP_TEXT="$(sed -n '/name: Verify DynamoDB records from inside the gg-monitor pod/,/^      - name:/p' "$GG_MONITOR_WORKFLOW")"
+FOUND_HARDCODE="false"
+for hardcoded in "gg-oracle-payments-01" "gg-postgresql-payments-01"; do
+  if echo "$DYNAMODB_STEP_TEXT" | grep -q "\"${hardcoded}\""; then
+    fail "DynamoDB verification step still hardcodes runtime name: ${hardcoded}"
+    FOUND_HARDCODE="true"
+  fi
+done
+[ "$FOUND_HARDCODE" = "false" ] && pass "DynamoDB verification step contains no hardcoded runtime pipeline name literal"
+if echo "$DYNAMODB_STEP_TEXT" | grep -q "import inventory" && echo "$DYNAMODB_STEP_TEXT" | grep -q "inventory.build_deployments_json(RUNTIMES)"; then
+  pass "PIPELINES is derived dynamically via the in-pod inventory module, not hardcoded"
+else
+  fail "DynamoDB verification step no longer dynamically derives PIPELINES from in-pod inventory"
+fi
+
+echo "--- Fix 4: monitor base image governance gate (private ECR, digest-pinned, no public pip) ---"
+if grep -q "^ARG BASE_IMAGE\$" "${MONITOR_CORE_DIR}/Dockerfile" && ! grep -qE "^ARG BASE_IMAGE=" "${MONITOR_CORE_DIR}/Dockerfile"; then
+  pass "Dockerfile's ARG BASE_IMAGE has no default (required, fails closed)"
+else
+  fail "Dockerfile's ARG BASE_IMAGE still has a default value"
+fi
+DOCKERFILE_CODE_ONLY="$(grep -vE '^\s*#' "${MONITOR_CORE_DIR}/Dockerfile")"
+if echo "$DOCKERFILE_CODE_ONLY" | grep -qE "^FROM python:|python:3\.12-slim"; then
+  fail "Dockerfile still references a public python: base image"
+else
+  pass "Dockerfile does not reference a public python: base image"
+fi
+if grep -qE "^\s*RUN pip3? install" "${MONITOR_CORE_DIR}/Dockerfile"; then
+  fail "Dockerfile still runs pip install (would default to public PyPI)"
+else
+  pass "Dockerfile runs no pip install command"
+fi
+if grep -q "MONITOR BASE IMAGE GOVERNANCE GATE" "${MONITOR_CORE_DIR}/Dockerfile" && grep -q "MONITOR BASE IMAGE GOVERNANCE GATE" "$GG_MONITOR_WORKFLOW"; then
+  pass "MONITOR BASE IMAGE GOVERNANCE GATE is documented in both the Dockerfile and the workflow"
+else
+  fail "MONITOR BASE IMAGE GOVERNANCE GATE documentation is missing from the Dockerfile and/or the workflow"
+fi
+if grep -q 'MONITOR_BASE_IMAGE: ""' "$GG_MONITOR_WORKFLOW"; then
+  pass "MONITOR_BASE_IMAGE remains deliberately unset (deployment gate, not guessed)"
+else
+  fail "MONITOR_BASE_IMAGE no longer appears to be an empty, unresolved gate"
+fi
+if grep -q "name: Enforce monitor base image governance gate" "$GG_MONITOR_WORKFLOW"; then
+  pass "workflow has a dedicated governance-gate enforcement step before the build"
+else
+  fail "workflow is missing the governance-gate enforcement step"
+fi
+if grep -q "name: Generate manager-compatible JSON artifacts" "$GG_MONITOR_WORKFLOW"; then
+  pass "workflow generates manager-compatible deployments.json/runtime-config.json/process-pipeline-map.json at packaging time"
+else
+  fail "workflow is missing the manager-compatible JSON artifact generation step"
+fi
+
+echo "--- Fix 5: IAM secret coverage validation ---"
+if grep -q "def validate_secret_arn_coverage" "${MONITOR_CORE_DIR}/inventory.py"; then
+  pass "inventory.py exposes validate_secret_arn_coverage"
+else
+  fail "inventory.py is missing validate_secret_arn_coverage"
+fi
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  if REPO_CONFIG_ROOT="$REPO_ROOT" python3 -c "
+import json, sys
+sys.path.insert(0, '${MONITOR_CORE_DIR}')
+import inventory as inv
+runtimes = inv.load_runtimes('${REPO_ROOT}')
+policy = json.load(open('${MONITOR_IAM_POLICY}'))
+allowed = []
+for stmt in policy['Statement']:
+    actions = stmt['Action'] if isinstance(stmt['Action'], list) else [stmt['Action']]
+    if 'secretsmanager:GetSecretValue' in actions:
+        res = stmt['Resource'] if isinstance(stmt['Resource'], list) else [stmt['Resource']]
+        allowed.extend(res)
+inv.validate_secret_arn_coverage(runtimes, allowed)
+print('OK')
+" >"${WORKDIR}/secret-coverage.log" 2>&1; then
+    pass "every enabled runtime's admin/TLS secret reference is covered by gg-monitor-dev-role's real IAM policy"
+  else
+    fail "IAM secret coverage validation failed against the real policy"
+    cat "${WORKDIR}/secret-coverage.log"
+  fi
+else
+  skip "IAM secret coverage validation -- python3 not available"
+fi
+if grep -qE '"secretsmanager:\*"' envs/dev/policies/gg-monitor-dev-role/policies/policies_1.json; then
+  fail "gg-monitor-dev-role policy has been broadened to secretsmanager:*"
+else
+  pass "gg-monitor-dev-role policy is not broadened to secretsmanager:*"
+fi
+
+echo "--- Fix 6: workflow rollout order -- rollout status BEFORE pod selection ---"
+ROLLOUT_IDX="$(grep -n "name: Wait for gg-monitor Deployment rollout status" "$GG_MONITOR_WORKFLOW" | head -1 | cut -d: -f1)"
+SELECT_IDX="$(grep -n "name: Select the Running and Ready gg-monitor pod" "$GG_MONITOR_WORKFLOW" | head -1 | cut -d: -f1)"
+if [ -n "$ROLLOUT_IDX" ] && [ -n "$SELECT_IDX" ] && [ "$ROLLOUT_IDX" -lt "$SELECT_IDX" ]; then
+  pass "rollout status is awaited before pod selection (correct order)"
+else
+  fail "rollout status does not appear before pod selection in the workflow"
+fi
+if grep -q "deletionTimestamp" "$GG_MONITOR_WORKFLOW"; then
+  pass "pod selection rejects pods with a deletionTimestamp (Terminating old-ReplicaSet pod)"
+else
+  fail "pod selection does not check deletionTimestamp"
+fi
+
+echo "--- Fix 7: KMS remains a documented, unresolved deployment gate (kms:Decrypt + kms:DescribeKey when live values arrive) ---"
+if grep -q "KMS DEPLOYMENT GATE -- DO NOT DISMISS" envs/dev/iam.tf; then
+  pass "envs/dev/iam.tf still documents the KMS deployment gate"
+else
+  fail "envs/dev/iam.tf is missing the KMS deployment gate documentation"
+fi
+if grep -q "kms:Decrypt/kms:DescribeKey" envs/dev/iam.tf; then
+  pass "KMS gate documents both kms:Decrypt and kms:DescribeKey for when live values are confirmed"
+else
+  fail "KMS gate does not document kms:DescribeKey alongside kms:Decrypt"
+fi
+if grep -qE '"kms:' envs/dev/policies/gg-monitor-dev-role/policies/policies_1.json 2>/dev/null; then
+  fail "gg-monitor-dev-role policy already grants a kms: action -- must remain undismissed/unguessed until live CMK ARNs are confirmed"
+else
+  pass "gg-monitor-dev-role policy still grants no kms: actions (correctly gated pending live CMK confirmation)"
+fi
+
+echo "--- Full monitor unit test suite re-run after manager-alignment correction ---"
+if command -v python3 >/dev/null 2>&1 && python3 -c "import boto3, moto, yaml" >/dev/null 2>&1; then
+  set +e
+  MONITOR_UNITTEST_OUTPUT2="$(cd "$MONITOR_CORE_DIR" && python3 -m unittest discover -s tests -p "test_*.py" 2>&1)"
+  MONITOR_UNITTEST_STATUS2=$?
+  set -e
+  if [ "$MONITOR_UNITTEST_STATUS2" -eq 0 ]; then
+    RAN_LINE2="$(echo "$MONITOR_UNITTEST_OUTPUT2" | grep -E '^Ran [0-9]+ test' | tail -1)"
+    pass "gg-monitor-core unit tests (post manager-alignment correction): ${RAN_LINE2:-all tests passed}"
+  else
+    fail "gg-monitor-core unit tests failed after manager-alignment correction"
+    echo "$MONITOR_UNITTEST_OUTPUT2"
+  fi
+else
+  skip "gg-monitor-core unit tests (post correction) -- python3/boto3/moto/PyYAML not available"
 fi
 
 echo ""

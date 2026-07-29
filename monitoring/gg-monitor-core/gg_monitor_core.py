@@ -78,20 +78,18 @@ DDB_TABLE = os.environ.get("DDB_TABLE", "gg-eks-pipeline")
 MONITOR_INSTANCE = os.environ.get("POD_NAME", "gg-monitor")
 HTTP_PORT = int(os.environ.get("PORT", "8080"))
 
-# Per-runtime-type admin credential file (mounted by the Secrets Store CSI
-# Driver, same jmesPath-derived file-per-alias pattern already proven by the
-# Oracle/PostgreSQL runtime SecretProviderClasses -- see
-# helm/gg-monitor/templates/secretproviderclass.yaml). Re-read every tick so
-# a rotated secret is picked up without a pod restart, exactly like the
-# manager's _read_admin_password().
-ADMIN_USER_FILE = {
-    "oracle": os.environ.get("ORACLE_ADMIN_USER_FILE", "/mnt/secrets-store/oracle-ogg-admin"),
-    "postgresql": os.environ.get("POSTGRESQL_ADMIN_USER_FILE", "/mnt/secrets-store/postgresql-ogg-admin"),
-}
-ADMIN_PASSWORD_FILE = {
-    "oracle": os.environ.get("ORACLE_ADMIN_PASSWORD_FILE", "/mnt/secrets-store/oracle-ogg-admin-pwd"),
-    "postgresql": os.environ.get("POSTGRESQL_ADMIN_PASSWORD_FILE", "/mnt/secrets-store/postgresql-ogg-admin-pwd"),
-}
+# Admin credentials are DEPLOYMENT-level, not engine-type-level (manager-
+# alignment correction, fix 1): each runtime dict carries its own
+# credentialUserFile/credentialPasswordFile (inventory.load_runtimes,
+# derived from that deployment's own secretReferences.admin), mounted by the
+# Secrets Store CSI Driver (see helm/gg-monitor/templates/
+# secretproviderclass.yaml, generated from the same canonical data -- no
+# hardcoded per-engine dict on either side). Re-read every tick so a
+# rotated secret is picked up without a pod restart, exactly like the
+# manager's _read_admin_password(). There is deliberately no
+# ADMIN_USER_FILE/ADMIN_PASSWORD_FILE dict here anymore: a second Oracle
+# deployment with a different secret needs no Python change, just its own
+# topology entry.
 CA_FILE = os.environ.get("CA_FILE", "/mnt/secrets-store/ca-chain-pem")
 
 CLOUDWATCH_NAMESPACE = "GoldenGate/Pipelines"
@@ -551,10 +549,13 @@ def check_static_prerequisites(runtime, table):
     """Returns (ok: bool, reason: str). reason is empty when ok=True."""
     deployment_type = runtime["type"]
 
-    user_file = ADMIN_USER_FILE.get(deployment_type)
-    pwd_file = ADMIN_PASSWORD_FILE.get(deployment_type)
+    # Deployment-level credential identity (fix 1) -- runtime["type"] plays
+    # no part in selecting WHICH credential files to check; each runtime
+    # carries its own paths, derived from its own secretReferences.admin.
+    user_file = runtime.get("credentialUserFile")
+    pwd_file = runtime.get("credentialPasswordFile")
     if not user_file or not pwd_file:
-        return False, f"no credential-file mapping for type {deployment_type!r}"
+        return False, f"no credential file paths on runtime {runtime.get('pipeline')!r}"
     if not _read_secret_file(user_file):
         return False, f"credential file empty or unreadable: {user_file}"
     if not _read_secret_file(pwd_file):
@@ -599,7 +600,17 @@ def check_static_prerequisites(runtime, table):
 # increments so it notices a lease demotion promptly instead of riding out
 # the full checkIntervalSeconds window regardless of leadership).
 # ---------------------------------------------------------------------
-def polling_loop(runtime, table, mgr, state, stop_event):
+def polling_loop(runtime, table, mgr, state, stop_event, full_process_pipeline_map=None):
+    """full_process_pipeline_map: the GLOBAL process-pipeline-map (built
+    ONCE in main() across all enabled runtimes -- see
+    inventory.build_process_pipeline_map_json), filtered HERE to just this
+    deployment's own entries. Mirrors the manager's own two-stage pattern
+    exactly (utility-sidecar.py: the map is read/built once, then
+    build_process_pipeline_map(process_map, bare_key) filters it locally per
+    deployment) -- process routing is process-topology data (concept C),
+    not something this loop derives from its own runtime dict alone, since
+    the same deployment's processes can be declared across multiple
+    topology documents under different logical pipelines."""
     pipeline = runtime["pipeline"]
     deployment_type = runtime["type"]
     started = now_epoch()
@@ -610,7 +621,11 @@ def polling_loop(runtime, table, mgr, state, stop_event):
     base = f"{admin_ep.get('scheme', 'https')}://{admin_ep['host']}:{admin_ep['port']}"
     tls_server_name = admin_ep.get("tlsServerName")
 
-    process_pipeline_map = build_process_pipeline_map_json([runtime])
+    bare_key = runtime["name"]
+    process_pipeline_map = {
+        proc: meta for proc, meta in (full_process_pipeline_map or {}).items()
+        if meta.get("deployment") == bare_key
+    }
 
     def _guarded_write(proc, snap, counters=None):
         ok = write_process_state(table, mgr, pipeline, deployment_type, proc, snap,
@@ -652,8 +667,8 @@ def polling_loop(runtime, table, mgr, state, stop_event):
             flags = {"lag": 0, "abend": 0, "down": 0}
             extra_md = []
 
-            user = _read_secret_file(ADMIN_USER_FILE[deployment_type]) or "oggadmin"
-            pwd = _read_secret_file(ADMIN_PASSWORD_FILE[deployment_type])
+            user = _read_secret_file(runtime["credentialUserFile"]) or "oggadmin"
+            pwd = _read_secret_file(runtime["credentialPasswordFile"])
             ssl_ctx = _build_ssl_context()
             opener = _basic_opener(user, pwd, base, ssl_ctx, tls_server_name)
 
@@ -775,7 +790,7 @@ def _cloudwatch_client():
 # its own resource for the same reason), waits for runtime prerequisites
 # (fix 2) before flipping readiness, then runs both loops as daemon threads.
 # ---------------------------------------------------------------------
-def run_pipeline(runtime, stop_event, ready_state):
+def run_pipeline(runtime, stop_event, ready_state, full_process_pipeline_map=None):
     pipeline = runtime["pipeline"]
 
     lease_table = boto3.resource("dynamodb", region_name=AWS_REGION).Table(DDB_TABLE)
@@ -807,7 +822,9 @@ def run_pipeline(runtime, stop_event, ready_state):
     lease_thread = threading.Thread(
         target=lease_control_loop, args=(lease_mgr, state, stop_event), daemon=True)
     poll_thread = threading.Thread(
-        target=polling_loop, args=(runtime, health_table, health_mgr, state, stop_event), daemon=True)
+        target=polling_loop,
+        args=(runtime, health_table, health_mgr, state, stop_event, full_process_pipeline_map),
+        daemon=True)
     lease_thread.start()
     poll_thread.start()
 
@@ -874,7 +891,7 @@ def main():
     # -- not a healing/mutation action (see gg_health_rules.py for what
     # active-healing exits were removed; this is not one of them).
     try:
-        validate_enabled_runtimes(runtimes, admin_credential_types=set(ADMIN_USER_FILE))
+        validate_enabled_runtimes(runtimes)
     except StartupValidationError as e:
         logger.error("startup validation failed: %s", e)
         sys.exit(1)
@@ -883,8 +900,12 @@ def main():
     logger.info("loaded %d runtime(s), %d enabled: %s", len(runtimes), len(enabled),
                [r["pipeline"] for r in enabled])
     logger.info("manager-compatible deployments.json equivalent: %s", build_deployments_json(runtimes))
-    logger.info("manager-compatible process-pipeline-map.json equivalent: %s",
-               build_process_pipeline_map_json(runtimes))
+    # Built ONCE across all enabled runtimes (concept C: process topology is
+    # not a per-runtime field) and handed to every pipeline's own thread,
+    # which filters it locally to its own deployment -- mirrors the
+    # manager's own read-once/filter-per-deployment split exactly.
+    full_process_pipeline_map = build_process_pipeline_map_json(runtimes)
+    logger.info("manager-compatible process-pipeline-map.json equivalent: %s", full_process_pipeline_map)
 
     stop_event = threading.Event()
     ready_state = {}
@@ -893,7 +914,10 @@ def main():
 
     threads = []
     for runtime in enabled:
-        t = threading.Thread(target=run_pipeline, args=(runtime, stop_event, ready_state), daemon=True)
+        t = threading.Thread(
+            target=run_pipeline,
+            args=(runtime, stop_event, ready_state, full_process_pipeline_map),
+            daemon=True)
         t.start()
         threads.append(t)
 
