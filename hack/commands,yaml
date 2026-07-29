@@ -1,0 +1,96 @@
+Validation to perform now
+1. Check the new runtime pods
+kubectl get pods -n goldengate-dev -o wide
+
+Expected:
+
+gg-oracle-payments-01-0       Running
+gg-postgresql-payments-01-0   Running
+
+Check container count:
+
+kubectl get pods -n goldengate-dev \
+  -o custom-columns='POD:.metadata.name,CONTAINERS:.spec.containers[*].name,INIT:.spec.initContainers[*].name'
+
+The final runtime pods should have:
+
+One GoldenGate main container.
+Credential init container where required.
+No observer sidecar in the new runtime pods.
+No utility sidecar.
+No Fluent Bit sidecar.
+
+The legacy combined deployment may still have observers during migration.
+
+2. Verify both GoldenGate endpoints
+
+Open both new GoldenGate URLs and confirm their portals load:
+
+Oracle runtime URL
+PostgreSQL runtime URL
+
+Also verify their Services:
+
+kubectl get service,ingress -n goldengate-dev
+3. Check the shared monitor readiness
+curl -i https://monitor.goldengate-dev.adcbmis.local/healthz
+curl -i https://monitor.goldengate-dev.adcbmis.local/readyz
+
+Expected:
+
+/healthz → HTTP 200
+/readyz  → HTTP 200
+4. Check the status API
+curl -s https://monitor.goldengate-dev.adcbmis.local/api/status
+
+Confirm the response contains:
+
+payments-ora-to-pg-001
+gg-oracle-payments-01
+gg-postgresql-payments-01
+canonical-monitor
+5. Check monitor logs
+kubectl logs \
+  -n goldengate-monitoring \
+  deployment/gg-monitor \
+  --tail=300
+
+Look for successful polling and state writing.
+
+There should be no:
+
+AccessDenied
+credential unavailable
+TLS trust bundle unavailable
+DynamoDB CONFIG unavailable
+certificate verify failed
+connection refused
+timeout
+Traceback
+6. Verify the DynamoDB records
+
+Oracle:
+
+aws dynamodb query \
+  --table-name gg-eks-pipeline \
+  --region eu-west-1 \
+  --key-condition-expression "pipeline = :p" \
+  --expression-attribute-values '{
+    ":p":{"S":"gg-oracle-payments-01"}
+  }' \
+  --projection-expression "recordType,deploymentType,#s,recordedAt,holder,expiresAt" \
+  --expression-attribute-names '{"#s":"status"}'
+
+PostgreSQL:
+
+aws dynamodb query \
+  --table-name gg-eks-pipeline \
+  --region eu-west-1 \
+  --key-condition-expression "pipeline = :p" \
+  --expression-attribute-values '{
+    ":p":{"S":"gg-postgresql-payments-01"}
+  }' \
+  --projection-expression "recordType,deploymentType,#s,recordedAt,holder,expiresAt" \
+  --expression-attribute-names '{"#s":"status"}'
+
+Expected in each partition:
