@@ -2777,37 +2777,79 @@ else
   fail "DynamoDB verification step no longer dynamically derives PIPELINES from in-pod inventory"
 fi
 
-echo "--- Fix 4: monitor base image governance gate (private ECR, digest-pinned, no public pip) ---"
-if grep -q "^ARG BASE_IMAGE\$" "${MONITOR_CORE_DIR}/Dockerfile" && ! grep -qE "^ARG BASE_IMAGE=" "${MONITOR_CORE_DIR}/Dockerfile"; then
-  pass "Dockerfile's ARG BASE_IMAGE has no default (required, fails closed)"
+echo "--- Fix 4 (correction pass): gg-monitor-core reuses the proven public-base + pinned-pip build pattern ---"
+DOCKERFILE_CODE_ONLY="$(code_only < "${MONITOR_CORE_DIR}/Dockerfile")"
+GG_MONITOR_WORKFLOW_CODE_ONLY="$(code_only < "$GG_MONITOR_WORKFLOW")"
+if echo "$DOCKERFILE_CODE_ONLY" | grep -qE "^ARG BASE_IMAGE=python:3\.12-slim\$"; then
+  pass "Dockerfile's ARG BASE_IMAGE defaults to python:3.12-slim (proven pattern, matches monitoring/monitor/Dockerfile)"
 else
-  fail "Dockerfile's ARG BASE_IMAGE still has a default value"
+  fail "Dockerfile's ARG BASE_IMAGE no longer defaults to python:3.12-slim"
 fi
-DOCKERFILE_CODE_ONLY="$(grep -vE '^\s*#' "${MONITOR_CORE_DIR}/Dockerfile")"
-if echo "$DOCKERFILE_CODE_ONLY" | grep -qE "^FROM python:|python:3\.12-slim"; then
-  fail "Dockerfile still references a public python: base image"
+if echo "$DOCKERFILE_CODE_ONLY" | grep -qE "^COPY requirements\.txt " && echo "$DOCKERFILE_CODE_ONLY" | grep -q -- "-r requirements.txt"; then
+  pass "Dockerfile installs pinned dependencies from requirements.txt during the build"
 else
-  pass "Dockerfile does not reference a public python: base image"
+  fail "Dockerfile no longer installs from requirements.txt"
 fi
-if grep -qE "^\s*RUN pip3? install" "${MONITOR_CORE_DIR}/Dockerfile"; then
-  fail "Dockerfile still runs pip install (would default to public PyPI)"
+if echo "$DOCKERFILE_CODE_ONLY" | grep -q "import boto3, botocore, yaml, jmespath, dateutil, s3transfer, six, urllib3"; then
+  pass "Dockerfile import-verifies every required module after pip install"
 else
-  pass "Dockerfile runs no pip install command"
+  fail "Dockerfile is missing the post-install import-verification step"
 fi
-if grep -q "MONITOR BASE IMAGE GOVERNANCE GATE" "${MONITOR_CORE_DIR}/Dockerfile" && grep -q "MONITOR BASE IMAGE GOVERNANCE GATE" "$GG_MONITOR_WORKFLOW"; then
-  pass "MONITOR BASE IMAGE GOVERNANCE GATE is documented in both the Dockerfile and the workflow"
+if echo "$DOCKERFILE_CODE_ONLY" | grep -qE 'APP_UID=10001' && echo "$DOCKERFILE_CODE_ONLY" | grep -qE 'USER \$\{APP_UID\}:\$\{APP_GID\}'; then
+  pass "Dockerfile still runs as non-root 10001:10001"
 else
-  fail "MONITOR BASE IMAGE GOVERNANCE GATE documentation is missing from the Dockerfile and/or the workflow"
+  fail "Dockerfile no longer runs as non-root 10001:10001"
 fi
-if grep -q 'MONITOR_BASE_IMAGE: ""' "$GG_MONITOR_WORKFLOW"; then
-  pass "MONITOR_BASE_IMAGE remains deliberately unset (deployment gate, not guessed)"
+if echo "$DOCKERFILE_CODE_ONLY" | grep -qF 'ENTRYPOINT ["python3", "gg_monitor_core.py"]'; then
+  pass "Dockerfile still has the correct ENTRYPOINT"
 else
-  fail "MONITOR_BASE_IMAGE no longer appears to be an empty, unresolved gate"
+  fail "Dockerfile no longer has the correct ENTRYPOINT"
 fi
-if grep -q "name: Enforce monitor base image governance gate" "$GG_MONITOR_WORKFLOW"; then
-  pass "workflow has a dedicated governance-gate enforcement step before the build"
+if echo "$DOCKERFILE_CODE_ONLY" | grep -q "MONITOR BASE IMAGE GOVERNANCE GATE"; then
+  fail "Dockerfile still contains the removed MONITOR BASE IMAGE GOVERNANCE GATE"
 else
-  fail "workflow is missing the governance-gate enforcement step"
+  pass "Dockerfile no longer contains the removed MONITOR BASE IMAGE GOVERNANCE GATE"
+fi
+if echo "$GG_MONITOR_WORKFLOW_CODE_ONLY" | grep -q "MONITOR_BASE_IMAGE"; then
+  fail "workflow still references the removed MONITOR_BASE_IMAGE variable"
+else
+  pass "workflow no longer references MONITOR_BASE_IMAGE"
+fi
+if echo "$GG_MONITOR_WORKFLOW_CODE_ONLY" | grep -q "name: Enforce monitor base image governance gate"; then
+  fail "workflow still has the removed governance-gate enforcement step"
+else
+  pass "workflow no longer has the governance-gate enforcement step"
+fi
+BUILD_MONITOR_IMAGE_STEP="$(sed -n '/name: Build monitor image/,/^      - name:/p' "$GG_MONITOR_WORKFLOW" | sed '$d')"
+if echo "$BUILD_MONITOR_IMAGE_STEP" | grep -q "BASE_IMAGE="; then
+  fail "workflow's docker build still passes an explicit BASE_IMAGE build-arg"
+else
+  pass "workflow's docker build no longer passes an explicit BASE_IMAGE build-arg (Dockerfile default is used)"
+fi
+if echo "$BUILD_MONITOR_IMAGE_STEP" | grep -q "docker build"; then
+  pass "workflow still builds the monitor image with docker build"
+else
+  fail "workflow is missing the docker build invocation"
+fi
+if grep -q "MONITOR_ECR_REPOSITORY: gg-monitor-core" "$GG_MONITOR_WORKFLOW" && grep -q "229410149234" "$GG_MONITOR_WORKFLOW"; then
+  pass "workflow still targets the private gg-monitor-core ECR repository"
+else
+  fail "workflow no longer targets the private gg-monitor-core ECR repository"
+fi
+if grep -q "scanOnPush=true" "$GG_MONITOR_WORKFLOW" && grep -q "IMMUTABLE" "$GG_MONITOR_WORKFLOW"; then
+  pass "workflow still creates the ECR repository with scan-on-push and immutable tags"
+else
+  fail "workflow no longer enforces scan-on-push / immutable tags on the ECR repository"
+fi
+if grep -q "MONITOR_TREE_SHA" "$GG_MONITOR_WORKFLOW" && grep -q "mon-core-" "$GG_MONITOR_WORKFLOW"; then
+  pass "workflow still derives a content-addressed image tag from the source tree SHA"
+else
+  fail "workflow no longer derives a content-addressed image tag"
+fi
+if grep -q "runs-on: ubuntu-latest" "$GG_MONITOR_WORKFLOW"; then
+  pass "workflow still runs the build job on ubuntu-latest"
+else
+  fail "workflow no longer runs the build job on ubuntu-latest"
 fi
 if grep -q "name: Generate manager-compatible JSON artifacts" "$GG_MONITOR_WORKFLOW"; then
   pass "workflow generates manager-compatible deployments.json/runtime-config.json/process-pipeline-map.json at packaging time"

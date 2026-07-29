@@ -159,22 +159,37 @@ factory level or inside a query) shows the same fixed, client-safe message
   `polling_loop`, the same read-once/filter-per-deployment split the
   manager itself uses.
 
-## Supply chain / packaging (fix 4, manager-alignment correction)
+## Supply chain / packaging (correction pass: proven build pattern reused)
 
-- **MONITOR BASE IMAGE GOVERNANCE GATE**: `Dockerfile`'s `ARG BASE_IMAGE`
-  has no default (previously `python:3.12-slim`, a public Docker Hub
-  image) and the packaging workflow refuses to run `docker build` at all
-  until an operator supplies an approved, digest-pinned, private-ECR
-  reference (`repository@sha256:<digest>`) in `MONITOR_BASE_IMAGE`
-  (`.github/workflows/gg-monitor-core.yaml` `env:`, currently deliberately
-  empty). This image is **not deployable** until that gate is closed --
-  matching the manager reference's own private-ECR/digest-pinned/
-  boto3-baked-in supply-chain pattern (`charts/gg-deployment/values.yaml`,
-  inspected read-only).
-- No `pip install` from public PyPI: `requirements.txt` documents what the
-  approved base image (or a future approved internal package repository --
-  no URL guessed here) must already provide; the Dockerfile fails the
-  build closed if any required module is missing from `BASE_IMAGE`.
+`gg-monitor-core` follows the same Docker build and delivery pattern already
+proven by the previous successful GoldenGate monitor implementation
+(`monitoring/monitor/Dockerfile`, `.github/workflows/goldengate-monitor.yaml`
+-- inspected read-only; application code, DynamoDB schema, and observer
+architecture were **not** copied, only the container build/delivery
+pattern):
+
+- `Dockerfile`'s `ARG BASE_IMAGE` defaults to the public `python:3.12-slim`
+  image, used only as the GitHub-hosted runner's own Docker build input.
+  Pinned dependencies (exact `==` versions in `requirements.txt`) are
+  installed with `pip install --no-cache-dir --no-compile -r
+  requirements.txt` during the build, followed by an explicit
+  `python3 -c "import boto3, botocore, yaml, jmespath, dateutil,
+  s3transfer, six, urllib3"` verification step that fails the build closed
+  if any expected module did not actually install. `MONITOR_BASE_IMAGE` is
+  **no longer required** -- it has been fully removed from both the
+  Dockerfile and `.github/workflows/gg-monitor-core.yaml`; the workflow no
+  longer passes a `BASE_IMAGE` build-arg at all, and there is no
+  "governance gate" step to satisfy.
+- The completed application image is still pushed only to the private ECR
+  repository, `229410149234.dkr.ecr.eu-west-1.amazonaws.com/gg-monitor-core`
+  -- the public base image is never the final deployed artifact's registry.
+  Immutable ECR tags and `scanOnPush=true` are unchanged; the image tag
+  remains content-addressed (`mon-core-<git-tree-sha:12>`), so a rebuild of
+  unchanged source reuses the existing image rather than pushing a
+  duplicate.
+- Runs as non-root `10001:10001` (unchanged); `ENTRYPOINT ["python3",
+  "gg_monitor_core.py"]`; port `8080` exposed; the same `/healthz`-based
+  `HEALTHCHECK` as before.
 - **Partially migrated, not complete**: the workflow's new "Generate
   manager-compatible JSON artifacts" step produces `deployments.json`,
   `runtime-config.json` (an approved shared-monitor extension --
@@ -188,3 +203,14 @@ factory level or inside a query) shows the same fixed, client-safe message
   topology change via a ConfigMap update alone, without an image rebuild,
   which is a real tradeoff needing its own explicit decision rather than a
   default made in this pass.
+
+**Current phase and status**: DynamoDB (`gg-eks-pipeline`, `gg-alerts`,
+`gg-metrics-history`) and shared-monitor (collector + portal) validation
+remain the current phase's focus -- this correction pass only changes how
+the image is *built*, not what it does at runtime. CloudWatch stays
+disabled by default (see above); Fluent Bit remains untouched and out of
+scope. **This application has not been deployed** -- all validation in this
+repository is local (unit tests, `helm lint`/`helm template`, static
+Dockerfile/workflow review, and a local `docker build` where Docker is
+available); no image has been pushed to ECR and no Helm release has been
+installed from this pass.

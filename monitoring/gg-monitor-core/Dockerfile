@@ -1,48 +1,24 @@
 # syntax=docker/dockerfile:1
 #
-# =====================================================================
-# MONITOR BASE IMAGE GOVERNANCE GATE -- DO NOT DISMISS.
-# =====================================================================
-# BASE_IMAGE has NO default and MUST be supplied by the packaging workflow
-# as an approved, private-ECR, digest-pinned reference
-# (repository@sha256:<digest>) -- matching the manager reference
-# repository's own supply-chain pattern (private ECR mirror, digest
-# pinning, boto3 baked in, no public runtime pip installation; see
-# charts/gg-deployment/values.yaml image/sidecarImage blocks and
-# templates/statefulset.yaml, inspected read-only, F:\claude\
-# goldengate-managers-code, never modified or copied).
-#
-# This image is NOT deployable until an operator confirms and supplies:
-#   1. An approved private ECR mirror of a Python base image that already
-#      bundles this module's runtime dependencies (requirements.txt --
-#      boto3/botocore/PyYAML/jmespath/python-dateutil/s3transfer/six/
-#      urllib3), OR
-#   2. An approved internal Python package repository URL, so a future
-#      revision of this Dockerfile can install requirements.txt from THAT
-#      source instead.
-# Neither has been supplied yet. Guessing a public.ecr.aws mirror alias, a
-# Docker Hub tag (e.g. the previous default python:3.12-slim), or an
-# internal package repository URL here would repeat exactly the "do not
-# invent an internal URL" mistake this gate exists to prevent.
-#
-# Enforcement (fails closed, does not silently fall back to a public
-# source):
-#   - `docker build` with no --build-arg BASE_IMAGE fails immediately below
-#     (empty FROM reference).
-#   - .github/workflows/gg-monitor-core.yaml's own governance-gate check
-#     refuses to even invoke `docker build` without an approved value
-#     configured.
-#   - The dependency-presence RUN check further down fails the build
-#     closed if BASE_IMAGE does not already provide every required
-#     runtime dependency -- this Dockerfile never runs `pip install`
-#     against a public index.
-# =====================================================================
-ARG BASE_IMAGE
+# Build pattern (correction pass): reuses the same proven Docker build
+# approach as the previous successful GoldenGate monitor implementation
+# (monitoring/monitor/Dockerfile, .github/workflows/goldengate-monitor.yaml
+# -- inspected read-only, application code/schema/architecture NOT copied)
+# -- a public python:3.12-slim default base, pinned pip install from
+# requirements.txt during the GitHub-hosted Docker build, non-root
+# 10001:10001, and a private-ECR-pushed, content-addressed, immutable
+# application image tag. The application image itself is still pushed only
+# to the private ECR repository
+# (229410149234.dkr.ecr.eu-west-1.amazonaws.com/gg-monitor-core) -- the
+# public base is used only as the GitHub-hosted runner's OWN build input,
+# never the final deployed artifact's registry.
+
+ARG BASE_IMAGE=python:3.12-slim
 FROM ${BASE_IMAGE}
 
 ARG OCI_SOURCE=""
 ARG OCI_TITLE="gg-monitor-core"
-ARG OCI_DESCRIPTION="Shared, passive GoldenGate runtime poller/writer (LEASE/STATE/CloudWatch)"
+ARG OCI_DESCRIPTION="Shared, passive GoldenGate runtime poller and portal"
 ARG OCI_VERSION="development"
 
 LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
@@ -51,25 +27,34 @@ LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
       org.opencontainers.image.version="${OCI_VERSION}"
 
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
 ARG APP_UID=10001
 ARG APP_GID=10001
 ARG APP_HOME=/app
 
 RUN groupadd --system --gid "${APP_GID}" monitor \
-    && useradd --system --uid "${APP_UID}" --gid "${APP_GID}" \
-       --home-dir "${APP_HOME}" --no-create-home --shell /usr/sbin/nologin monitor \
+    && useradd --system \
+       --uid "${APP_UID}" \
+       --gid "${APP_GID}" \
+       --home-dir "${APP_HOME}" \
+       --no-create-home \
+       --shell /usr/sbin/nologin \
+       monitor \
     && mkdir -p "${APP_HOME}" \
     && chown "${APP_UID}:${APP_GID}" "${APP_HOME}"
 
 WORKDIR ${APP_HOME}
 
-# requirements.txt is retained as documentation of exactly what BASE_IMAGE
-# (or a future approved internal package repository) must already provide
-# -- it is NOT pip-installed here. No public PyPI installation (fix 4).
 COPY requirements.txt ./
-RUN python3 -c "import importlib.util as u, sys; missing=[m for m in ('boto3','botocore','yaml','jmespath','dateutil','s3transfer','six','urllib3') if u.find_spec(m) is None]; sys.exit(0) if not missing else sys.exit('MONITOR BASE IMAGE GOVERNANCE GATE: BASE_IMAGE is missing required runtime dependencies %r -- this build refuses to silently pip install from public PyPI; see the governance gate comment at the top of this Dockerfile.' % missing)"
+
+RUN python3 -m pip install \
+      --no-cache-dir \
+      --no-compile \
+      -r requirements.txt \
+    && python3 -c "import boto3, botocore, yaml, jmespath, dateutil, s3transfer, six, urllib3; print('gg-monitor-core dependencies verified')"
 
 COPY gg_monitor_core.py gg_health_rules.py inventory.py ./
 

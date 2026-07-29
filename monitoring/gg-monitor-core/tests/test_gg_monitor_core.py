@@ -2403,74 +2403,111 @@ class WorkflowCorrectionTests(unittest.TestCase):
 
 
 # ===========================================================================
-# Manager-alignment correction: image supply-chain (fix 4). Private-ECR,
-# digest-pinned base image required; no Docker Hub; no public runtime pip
-# installation. Deliberately NOT deployable until an operator supplies an
-# approved MONITOR_BASE_IMAGE -- these tests prove the gate is real (fails
-# closed), not that a working image exists yet.
+# Image supply-chain (container build correction pass): gg-monitor-core
+# follows the same proven Docker build pattern as the previous successful
+# monitor implementation -- public python:3.12-slim default base (used
+# only as the build input), pinned pip install, private-ECR-pushed
+# content-addressed immutable application image. The earlier
+# MONITOR_BASE_IMAGE governance gate is fully removed.
 # ===========================================================================
 class ImageSupplyChainTests(unittest.TestCase):
+    """Correction pass: gg-monitor-core now follows the same proven Docker
+    build pattern as the previous successful monitor implementation
+    (monitoring/monitor/Dockerfile, .github/workflows/goldengate-monitor.yaml
+    -- inspected read-only, application code/schema/architecture NOT
+    copied): a public python:3.12-slim default base (used only as the
+    GitHub-hosted runner's own build input), pinned pip install from
+    requirements.txt, and a private-ECR-pushed, content-addressed,
+    immutable application image. The MONITOR_BASE_IMAGE
+    governance-gate/digest-pin requirement from an earlier pass is fully
+    removed."""
     DOCKERFILE_PATH = REPO_ROOT / "monitoring" / "gg-monitor-core" / "Dockerfile"
     WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "gg-monitor-core.yaml"
     CHART_DIR = REPO_ROOT / "helm" / "gg-monitor"
+    REQUIRED_MODULES = ("boto3", "botocore", "yaml", "jmespath", "dateutil", "s3transfer", "six", "urllib3")
 
-    def test_no_default_public_base_image(self):
+    def test_default_base_image_is_python_3_12_slim(self):
         content = code_only(self.DOCKERFILE_PATH.read_text())
-        self.assertNotIn("ARG BASE_IMAGE=", content, "BASE_IMAGE must have no default -- required, not optional")
-        self.assertIn("ARG BASE_IMAGE\n", content)
+        self.assertIn("ARG BASE_IMAGE=python:3.12-slim", content)
 
-    def test_no_from_python_anywhere(self):
+    def test_pip_installs_from_requirements_txt(self):
         content = code_only(self.DOCKERFILE_PATH.read_text())
-        self.assertNotIn("FROM python:", content)
-        self.assertNotIn("python:3.12-slim", content)
+        self.assertIn("COPY requirements.txt", content)
+        self.assertIn("pip install", content)
+        self.assertIn("-r requirements.txt", content)
 
-    def test_no_public_pip_install_in_dockerfile(self):
-        content = code_only(self.DOCKERFILE_PATH.read_text())
-        # The governance-gate error message legitimately mentions "pip
-        # install" in prose (explaining what it refuses to silently do) --
-        # what must never appear is the ACTUAL command invocation.
-        self.assertNotIn("RUN pip install", content)
-        self.assertNotIn("RUN pip3 install", content)
-        for line in content.splitlines():
-            stripped = line.strip()
-            self.assertFalse(stripped.startswith("pip install"), f"found pip install command: {line!r}")
-
-    def test_dockerfile_fails_closed_when_dependency_missing(self):
+    def test_all_required_modules_import_verified_in_dockerfile(self):
         content = self.DOCKERFILE_PATH.read_text()
-        self.assertIn("MONITOR BASE IMAGE GOVERNANCE GATE", content)
-        self.assertIn("find_spec", content)
-        self.assertIn("sys.exit(", content)
+        for module in self.REQUIRED_MODULES:
+            self.assertIn(module, content, f"{module} must be import-verified during the build")
+        self.assertIn("import boto3, botocore, yaml, jmespath, dateutil, s3transfer, six, urllib3", content)
 
-    def test_workflow_refuses_to_build_without_approved_base_image(self):
-        content = self.WORKFLOW_PATH.read_text()
-        self.assertIn('MONITOR_BASE_IMAGE: ""', content)
-        self.assertIn("Enforce monitor base image governance gate", content)
-        gate_idx = content.index("Enforce monitor base image governance gate")
-        build_idx = content.index("name: Build monitor image")
-        self.assertLess(gate_idx, build_idx, "the gate must run BEFORE the build step")
-        gate_text = content[gate_idx:content.index("\n      - name:", gate_idx + 1)]
-        self.assertIn('if [ -z "${MONITOR_BASE_IMAGE}" ]', gate_text)
-        self.assertIn("exit 1", gate_text)
+    def test_runs_as_non_root_10001(self):
+        content = code_only(self.DOCKERFILE_PATH.read_text())
+        self.assertIn('APP_UID=10001', content)
+        self.assertIn('APP_GID=10001', content)
+        self.assertIn('USER ${APP_UID}:${APP_GID}', content)
 
-    def test_workflow_requires_digest_pinned_base_image(self):
-        content = self.WORKFLOW_PATH.read_text()
-        self.assertIn("@sha256:", content)
-        gate_idx = content.index("Enforce monitor base image governance gate")
-        gate_text = content[gate_idx:content.index("\n      - name:", gate_idx + 1)]
-        self.assertIn("not digest-pinned", gate_text)
+    def test_correct_entrypoint(self):
+        content = code_only(self.DOCKERFILE_PATH.read_text())
+        self.assertIn('ENTRYPOINT ["python3", "gg_monitor_core.py"]', content)
 
-    def test_workflow_rejects_docker_hub_base_image(self):
-        content = self.WORKFLOW_PATH.read_text()
-        gate_idx = content.index("Enforce monitor base image governance gate")
-        gate_text = content[gate_idx:content.index("\n      - name:", gate_idx + 1)]
-        self.assertIn("docker.io", gate_text)
-        self.assertIn("Docker Hub", gate_text)
+    def test_no_monitor_base_image_governance_gate_remains(self):
+        """MONITOR_BASE_IMAGE and its governance-gate step must be
+        completely removed -- both from the Dockerfile and the workflow."""
+        dockerfile_content = self.DOCKERFILE_PATH.read_text()
+        self.assertNotIn("MONITOR BASE IMAGE GOVERNANCE GATE", dockerfile_content)
+        workflow_content = self.WORKFLOW_PATH.read_text()
+        self.assertNotIn("MONITOR_BASE_IMAGE", workflow_content)
+        self.assertNotIn("Enforce monitor base image governance gate", workflow_content)
+        self.assertNotIn("repository@sha256", workflow_content)
 
-    def test_docker_build_passes_base_image_build_arg(self):
+    def test_workflow_does_not_pass_base_image_build_arg(self):
         content = self.WORKFLOW_PATH.read_text()
         build_idx = content.index("name: Build monitor image")
         build_text = content[build_idx:content.index("\n      - name:", build_idx + 1)]
-        self.assertIn('--build-arg "BASE_IMAGE=${MONITOR_BASE_IMAGE}"', build_text)
+        self.assertNotIn("BASE_IMAGE=", build_text)
+        self.assertIn("docker build", build_text)
+
+    def test_workflow_retains_current_ecr_repository(self):
+        content = self.WORKFLOW_PATH.read_text()
+        self.assertIn("MONITOR_ECR_REPOSITORY: gg-monitor-core", content)
+        self.assertIn("229410149234", content)
+
+    def test_workflow_retains_immutable_tags_and_scan_on_push(self):
+        content = self.WORKFLOW_PATH.read_text()
+        self.assertIn("scanOnPush=true", content)
+        self.assertIn("IMMUTABLE", content)
+
+    def test_workflow_retains_content_addressed_tag(self):
+        content = self.WORKFLOW_PATH.read_text()
+        self.assertIn("MONITOR_TREE_SHA", content)
+        self.assertIn("mon-core-", content)
+
+    def test_workflow_retains_ubuntu_latest_build_job(self):
+        content = self.WORKFLOW_PATH.read_text()
+        self.assertIn("runs-on: ubuntu-latest", content)
+
+    def test_workflow_retains_manual_dispatch_no_auto_push_trigger(self):
+        content = self.WORKFLOW_PATH.read_text()
+        self.assertIn("workflow_dispatch:", content)
+
+    def test_cloudwatch_kill_switch_default_unaffected_by_build_change(self):
+        """This build-focused correction pass must not have disturbed the
+        hard CloudWatch kill switch established in an earlier pass."""
+        self.assertFalse(core.CLOUDWATCH_PUBLISH_ENABLED)
+        chart_values = (self.CHART_DIR / "values.yaml").read_text()
+        self.assertIn("publishEnabled: false", chart_values)
+
+    def test_canonical_runtime_identities_unchanged_by_build_correction(self):
+        """This is a container-build-only correction pass -- canonical
+        runtime identities and their enabled state must be byte-identical
+        to before it."""
+        runtimes = {r["pipeline"]: r for r in inv.load_runtimes(str(REPO_ROOT))}
+        self.assertIn("gg-oracle-payments-01", runtimes)
+        self.assertIn("gg-postgresql-payments-01", runtimes)
+        self.assertTrue(runtimes["gg-oracle-payments-01"]["enabled"])
+        self.assertTrue(runtimes["gg-postgresql-payments-01"]["enabled"])
 
     def test_no_public_ecr_aws_in_deployable_chart(self):
         for path in self.CHART_DIR.rglob("*"):

@@ -1,8 +1,9 @@
-# Governance gate (fix 4, manager-alignment correction): this file is NOT
-# pip-installed by the Dockerfile against public PyPI. It documents exactly
-# what the approved private-ECR BASE_IMAGE (or a future approved internal
-# package repository) must already provide -- see the MONITOR BASE IMAGE
-# GOVERNANCE GATE comment in Dockerfile.
+# Pinned runtime dependencies, installed during the Docker build (see
+# Dockerfile) -- same pinned-requirements.txt pattern already proven by the
+# previous successful monitor implementation (monitoring/monitor/requirements.txt).
+# Every version here is exact (==), never a floor/range, so the image is
+# reproducible. PyYAML is required by this module (topology/inventory
+# parsing) but was not part of the previous monitor's own requirements.
 boto3==1.34.144
 botocore==1.34.144
 PyYAML==6.0.1

@@ -53,17 +53,11 @@ env:
 
   MONITOR_SOURCE_PATH: monitoring/gg-monitor-core
   MONITOR_ECR_REPOSITORY: gg-monitor-core
-  # MONITOR BASE IMAGE GOVERNANCE GATE -- DO NOT DISMISS, DO NOT GUESS A
-  # VALUE. Deliberately empty: no approved private-ECR, digest-pinned base
-  # image has been confirmed for gg-monitor-core yet (manager-alignment
-  # correction, fix 4 -- matches the manager's own private-ECR/digest-
-  # pinned/boto3-baked-in supply-chain pattern, never Docker Hub, never
-  # public runtime pip installation). The "Enforce monitor base image
-  # governance gate" step below refuses to run `docker build` at all while
-  # this is empty -- see monitoring/gg-monitor-core/Dockerfile's own
-  # governance gate comment for exactly what must be supplied
-  # (repository@sha256:<digest>) before this image becomes deployable.
-  MONITOR_BASE_IMAGE: ""
+  # Docker build pattern (correction pass): reuses the same proven approach
+  # as goldengate-monitor.yaml -- Dockerfile's own ARG BASE_IMAGE=python:3.12-slim
+  # default is used as-is; no BASE_IMAGE build-arg is passed here. The
+  # resulting application image is still pushed only to the private ECR
+  # repository below, never to a public registry.
 
   HELM_OCI_NAMESPACE: helm
   CHART_NAME: gg-monitor
@@ -280,40 +274,6 @@ jobs:
           command -v docker >/dev/null 2>&1 || { echo "docker not installed"; exit 1; }
           docker info >/dev/null 2>&1 || { echo "docker daemon not reachable"; exit 1; }
 
-      - name: Enforce monitor base image governance gate
-        if: env.IMAGE_EXISTED != 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Deliberately runs even though nothing has failed yet -- this is
-          # the gate itself, not a diagnostic. Fails BEFORE any ECR login or
-          # docker build is attempted, so a missing approval can never be
-          # bypassed by a build that happens to still succeed against
-          # whatever base Docker resolves on its own.
-          if [ -z "${MONITOR_BASE_IMAGE}" ]; then
-            echo "FAIL: MONITOR BASE IMAGE GOVERNANCE GATE -- no approved private-ECR,"
-            echo "digest-pinned base image has been configured (MONITOR_BASE_IMAGE is empty)."
-            echo "This build refuses to fall back to a public Docker Hub image or guess an"
-            echo "internal ECR mirror alias. Supply repository@sha256:<digest> in"
-            echo "MONITOR_BASE_IMAGE (.github/workflows/gg-monitor-core.yaml env:) once an"
-            echo "operator has confirmed the approved mirror -- see"
-            echo "monitoring/gg-monitor-core/Dockerfile's governance gate comment."
-            exit 1
-          fi
-          if [[ "${MONITOR_BASE_IMAGE}" != *"@sha256:"* ]]; then
-            echo "FAIL: MONITOR_BASE_IMAGE (${MONITOR_BASE_IMAGE}) is not digest-pinned"
-            echo "(expected repository@sha256:<digest>) -- a mutable tag reference is not"
-            echo "an acceptable approved base per the governance gate."
-            exit 1
-          fi
-          case "${MONITOR_BASE_IMAGE}" in
-            docker.io/*|*.docker.io/*)
-              echo "FAIL: MONITOR_BASE_IMAGE resolves to Docker Hub (${MONITOR_BASE_IMAGE}) -- not permitted."
-              exit 1
-              ;;
-          esac
-          echo "OK: MONITOR_BASE_IMAGE is digest-pinned and not Docker Hub: ${MONITOR_BASE_IMAGE}"
-
       - name: Login to Amazon ECR
         if: env.IMAGE_EXISTED != 'true'
         shell: bash
@@ -327,10 +287,9 @@ jobs:
         run: |
           set -euo pipefail
           docker build \
-            --build-arg "BASE_IMAGE=${MONITOR_BASE_IMAGE}" \
             --build-arg "OCI_SOURCE=${{ github.server_url }}/${{ github.repository }}" \
             --build-arg "OCI_TITLE=gg-monitor-core" \
-            --build-arg "OCI_DESCRIPTION=Shared, passive GoldenGate runtime poller/writer" \
+            --build-arg "OCI_DESCRIPTION=Shared, passive GoldenGate runtime poller and portal" \
             --build-arg "OCI_VERSION=${MONITOR_IMAGE_TAG}" \
             -t "$MONITOR_IMAGE_URI" \
             "$MONITOR_SOURCE_PATH"
