@@ -89,16 +89,25 @@ module "goldengate_pipeline_state" {
 # never the seed's typo.
 #
 # PASSIVE-SAFE DEVIATION (intentional, approved architecture): our runtime
-# pods have no manager utility sidecar, and the future shared gg-monitor
-# must be passive (no restart/start/fence/failover). alertsEnabled=false,
+# pods have no manager utility sidecar, and the shared gg-monitor must be
+# passive (no restart/start/fence/failover). alertsEnabled=false,
 # credSyncEnabled=false, autoStartEnabled=false, autoRestartMaxRetries=0,
 # defaults.failoverEnabled=false, and defaults.alertEachAbend=false all
 # deviate from the manager's own seed defaults (which assume its active
-# sidecar) for exactly this reason. metricsEnabled and every timing/
-# threshold field (tz, checkIntervalSeconds, startupGraceSeconds,
-# trailRetentionHours, defaults.lagMode/lagThresholdSeconds/
-# maxConsecutiveAbends/abendRecheckSeconds/distpathStallChecks) stay
-# manager-compatible.
+# sidecar) for exactly this reason.
+#
+# metricsEnabled=false is ALSO an intentional deviation from the manager's
+# own seed (true): in this repository metricsEnabled is what gates the
+# shared monitor's CloudWatch publication (gg_health_rules.resolve_config /
+# gg_monitor_core._emit) -- CloudWatch, alarms, SNS, and Fluent Bit are all
+# explicitly out of scope until a separate, later validated phase (see
+# monitoring/gg-monitor-core/README.md). This does not touch DynamoDB
+# LEASE/STATE#* writing at all -- only CloudWatch's PutMetricData path.
+#
+# Every timing/threshold field (tz, checkIntervalSeconds,
+# startupGraceSeconds, trailRetentionHours, defaults.lagMode/
+# lagThresholdSeconds/maxConsecutiveAbends/abendRecheckSeconds/
+# distpathStallChecks) stays manager-compatible.
 #
 # ignore_changes = [item]: matches the manager pattern -- Terraform creates
 # the initial CONFIG item once; operators or future management workflows may
@@ -197,7 +206,7 @@ resource "aws_dynamodb_table_item" "pipeline_config" {
     deploymentType = { S = each.value }
 
     alertsEnabled            = { BOOL = false }
-    metricsEnabled           = { BOOL = true }
+    metricsEnabled           = { BOOL = false }
     credSyncEnabled          = { BOOL = false }
     tz                       = { S = "Asia/Dubai" }
     checkIntervalSeconds     = { N = "60" }
@@ -225,3 +234,140 @@ resource "aws_dynamodb_table_item" "pipeline_config" {
     ignore_changes = [item]
   }
 }
+
+# =====================================================================
+# Manager-aligned DynamoDB tables: gg-alerts, gg-metrics-history.
+# =====================================================================
+# Mirrors the manager reference implementation's own schema exactly (see
+# terraform/platform/dynamodb.tf resources "alerts" / "alerts_global" /
+# "metrics_history", inspected read-only, never modified or copied) --
+# only the physical CREATION of these tables (plus the required disabled
+# GLOBAL seed row for gg-alerts) is done here. NO alerter application, NO
+# alerter IAM role, and NO write access from gg-monitor-dev-role are added
+# in this task -- see envs/dev/iam.tf for the explicit statement that the
+# shared monitor does not need write access to either table this phase.
+#
+# Same corporate module already proven for gg-eks-pipeline above is reused
+# here (module.goldengate_pipeline_state) for consistency with this
+# repository's own established Terraform pattern -- not the manager's raw
+# aws_dynamodb_table resource syntax, which this repository does not use
+# anywhere. custom_kms_key_arn = null preserves the exact same
+# locally-verifiable encryption pattern as gg-eks-pipeline: no
+# customer-managed KMS key is introduced by this table, matching this
+# task's explicit KMS scope boundary.
+# =====================================================================
+
+module "goldengate_alerts" {
+  source = "git::https://github.com/AbuDhabiCommercialBank/aws-tf-module-dynamodb.git?ref=v1.2.0"
+
+  name     = "gg-alerts"
+  hash_key = "alert_id"
+  # No range_key: the manager's own alerts table is single-key
+  # (alert_id only) -- confirmed in terraform/platform/dynamodb.tf, not
+  # guessed.
+
+  attributes = [
+    {
+      name = "alert_id"
+      type = "S"
+    }
+  ]
+
+  billing_mode = "PAY_PER_REQUEST"
+  safety_mode  = "on_demand"
+
+  ttl_enabled        = false
+  ttl_attribute_name = null
+
+  global_secondary_indexes = []
+  local_secondary_indexes  = []
+
+  autoscaling_enabled = false
+
+  custom_kms_key_arn = null
+
+  map_migrated         = "comm5TZY31HX9S"
+  business_criticality = "Low"
+  application_name     = "CloudFactory"
+  cost_center          = "219"
+  business_unit        = "TechnologyPlatform"
+  business_unit_owner  = "ganesh.harikrishnan"
+  data_classification  = "General"
+  env                  = "dev"
+}
+
+# Seed exactly one record: alert_id=GLOBAL, enabled=false, both list fields
+# empty. Nothing routes anywhere until an operator deliberately enables this
+# in the DynamoDB console -- matches the manager's own alerts_global seed
+# (distribution_list/maintenance_windows both empty lists, enabled=false).
+# ignore_changes = [item]: identical manager-compatible ownership pattern
+# already used for pipeline_config above -- Terraform seeds ONCE; an
+# operator's later routing changes via the console are never reset by a
+# subsequent apply. No email address, SNS endpoint, or webhook is
+# configured anywhere in this repository.
+resource "aws_dynamodb_table_item" "alerts_global" {
+  depends_on = [
+    module.goldengate_alerts
+  ]
+
+  table_name = "gg-alerts"
+  hash_key   = "alert_id"
+
+  item = jsonencode({
+    alert_id            = { S = "GLOBAL" }
+    enabled             = { BOOL = false }
+    distribution_list   = { L = [] }
+    maintenance_windows = { L = [] }
+  })
+
+  lifecycle {
+    ignore_changes = [item]
+  }
+}
+
+module "goldengate_metrics_history" {
+  source = "git::https://github.com/AbuDhabiCommercialBank/aws-tf-module-dynamodb.git?ref=v1.2.0"
+
+  name      = "gg-metrics-history"
+  hash_key  = "deployment_name"
+  range_key = "timestamp"
+
+  attributes = [
+    {
+      name = "deployment_name"
+      type = "S"
+    },
+    {
+      name = "timestamp"
+      type = "N"
+    }
+  ]
+
+  billing_mode = "PAY_PER_REQUEST"
+  safety_mode  = "on_demand"
+
+  ttl_enabled        = true
+  ttl_attribute_name = "ttl"
+
+  global_secondary_indexes = []
+  local_secondary_indexes  = []
+
+  autoscaling_enabled = false
+
+  custom_kms_key_arn = null
+
+  map_migrated         = "comm5TZY31HX9S"
+  business_criticality = "Low"
+  application_name     = "CloudFactory"
+  cost_center          = "219"
+  business_unit        = "TechnologyPlatform"
+  business_unit_owner  = "ganesh.harikrishnan"
+  data_classification  = "General"
+  env                  = "dev"
+}
+
+# No seed records here (deliberately -- "no static data records", matching
+# the manager's own comment "No seed (runtime-only)"). Approximately
+# 100-day retention will be implemented by a future history writer via the
+# ttl attribute; this table is empty until that writer exists. No
+# gg-alerter application is created or deployed by this task.

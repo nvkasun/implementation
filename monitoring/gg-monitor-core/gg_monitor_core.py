@@ -30,6 +30,7 @@ not describe this module as "REST/PMS polling".
 from __future__ import annotations
 
 import functools
+import html
 import http.client
 import json
 import logging
@@ -52,6 +53,7 @@ import gg_health_rules as gh
 from inventory import (
     StartupValidationError,
     build_deployments_json,
+    build_logical_pipelines,
     build_process_pipeline_map_json,
     load_runtimes,
     validate_enabled_runtimes,
@@ -444,6 +446,16 @@ def build_metric_data(deployment, deployment_type, parsed):
 def _emit(cw, deployment, deployment_type, flags, extra_md=None):
     """Publish per-deployment aggregate flags + raw per-process metrics.
 
+    CloudWatch is OPTIONAL and DISABLED by default this phase: every call
+    site in polling_loop gates this function behind cfg["metricsEnabled"]
+    (CONFIG-driven, defaults False -- see gg_health_rules.DEFAULTS) and only
+    constructs a CloudWatch client at all when enabled. This function itself
+    still tolerates cw=None defensively (see `if cw and md` below), but that
+    is a second layer, not the primary gate -- the primary gate is that
+    _cloudwatch_client() is never even called when metrics are disabled, so
+    this component has no CloudWatch dependency (network, permission, or
+    otherwise) in its current default deployment stage.
+
     Deliberately EXCLUDES HeartbeatAgeSeconds: that metric is derived from a
     sidecar-local heartbeat file inside the GoldenGate pod (see the
     manager's lease_loop/_write_heartbeat) -- a remote, external poller has
@@ -523,6 +535,24 @@ def read_process_state(table, pipeline, process):
 def read_config(table, pipeline):
     resp = table.get_item(Key={"pipeline": pipeline, "recordType": "CONFIG"})
     return resp.get("Item", {})
+
+
+def read_lease(table, pipeline):
+    resp = table.get_item(Key={"pipeline": pipeline, "recordType": "LEASE"})
+    return resp.get("Item", {})
+
+
+def query_process_states(table, pipeline):
+    """All STATE#<process> rows for one deployment, EXCLUDING the
+    STATE#_deployment pseudo-row (read separately via read_process_state)
+    -- read-only portal helper, mirrors the manager's own gg-monitor.py
+    query_process_states() shape but keyed on our canonical STATE#-prefixed
+    contract (never the manager's legacy singleton STATE)."""
+    resp = table.query(
+        KeyConditionExpression="pipeline = :p AND begins_with(recordType, :prefix)",
+        ExpressionAttributeValues={":p": pipeline, ":prefix": "STATE#"},
+    )
+    return [it for it in resp.get("Items", []) if it["recordType"] != "STATE#_deployment"]
 
 
 # ---------------------------------------------------------------------
@@ -686,7 +716,8 @@ def polling_loop(runtime, table, mgr, state, stop_event, full_process_pipeline_m
                 _guarded_write("_deployment", dep_snap)
                 last_dep_status = status
                 logger.warning("GoldenGate Admin REST unreachable for %s (%s): %s", pipeline, status, e)
-                _emit(_cloudwatch_client(), pipeline, deployment_type, flags)
+                if cfg["metricsEnabled"]:
+                    _emit(_cloudwatch_client(), pipeline, deployment_type, flags)
                 _sleep_watching_leadership(interval)
                 continue
 
@@ -760,8 +791,9 @@ def polling_loop(runtime, table, mgr, state, stop_event, full_process_pipeline_m
             _guarded_write("_deployment", dep_snap)
             last_dep_status = "UP"
 
-            extra_md += build_metric_data(pipeline, deployment_type, procs)
-            _emit(_cloudwatch_client(), pipeline, deployment_type, flags, extra_md)
+            if cfg["metricsEnabled"]:
+                extra_md += build_metric_data(pipeline, deployment_type, procs)
+                _emit(_cloudwatch_client(), pipeline, deployment_type, flags, extra_md)
 
         except _FencedOff:
             pass
@@ -842,18 +874,219 @@ def run_pipeline(runtime, stop_event, ready_state, full_process_pipeline_map=Non
 
 
 # ---------------------------------------------------------------------
-# HTTP health endpoints (k8s probes only -- no status API/portal here; the
-# existing read-only gg-monitor portal, helm/goldengate-monitor, continues
-# to serve that role unchanged).
+# Shared monitoring web portal (section 16/19): read-only. Uses only
+# GetItem/Query against gg-eks-pipeline -- never Scans, never writes, never
+# calls GoldenGate or any Kubernetes API. This is a SEPARATE responsibility
+# from the collector loops above (which own the only writer path); the
+# portal reads whatever the current lease holder -- possibly a different
+# replica -- last wrote, so any replica can serve accurate portal data
+# (multi-replica safe by construction: read-only work needs no lease).
+#
+# This does NOT replace or modify the pre-existing, separately deployed
+# monitoring/monitor/monitor.py + helm/goldengate-monitor portal (left
+# untouched, still serves its own existing role from STATE#_deployment
+# only) -- this is the NEW shared gg-monitor's OWN portal, in the same
+# process as the collector, showing the fuller canonical-runtime +
+# process-level + lease view this component owns.
+#
+# Never renders: credential file paths, adminSecretObject/secret
+# references, CloudWatch charts, or raw AWS/botocore exception text (a
+# fixed, client-safe message is shown instead; the real error is logged
+# server-side only -- same pattern as monitor.py's
+# CLIENT_SAFE_DYNAMODB_ERROR_MESSAGE).
 # ---------------------------------------------------------------------
-def _make_handler(ready_state, expected_pipelines):
+PORTAL_STALE_SECONDS = 180  # 3x default checkIntervalSeconds (60s)
+PORTAL_CLIENT_SAFE_ERROR = "Monitoring data is temporarily unavailable."
+
+
+def _age_seconds(recorded_at, now):
+    if not recorded_at:
+        return None
+    try:
+        age = now - int(recorded_at)
+    except (TypeError, ValueError):
+        return None
+    return max(age, 0)
+
+
+def _is_stale(recorded_at, now, threshold=PORTAL_STALE_SECONDS):
+    age = _age_seconds(recorded_at, now)
+    return age is None or age > threshold
+
+
+def collect_portal_status(table, runtimes, now=None):
+    """Assemble the full read-only portal snapshot for every runtime in
+    `runtimes` (canonical inventory, NOT filtered to enabled-only -- a
+    disabled runtime still shows, clearly, as such). No secret values, no
+    credential file paths, no CloudWatch data anywhere in the result."""
+    now = now if now is not None else now_epoch()
+    out_runtimes = []
+    for r in runtimes:
+        pipeline = r["pipeline"]
+        entry = {
+            "pipeline": pipeline,
+            "name": r["name"],
+            "type": r["type"],
+            "enabled": r["enabled"],
+            "deployment": None,
+            "lease": None,
+            "processes": [],
+            "error": None,
+        }
+        if not r["enabled"]:
+            out_runtimes.append(entry)
+            continue
+        try:
+            dep_row = read_process_state(table, pipeline, "_deployment")
+            lease_row = read_lease(table, pipeline)
+            proc_rows = query_process_states(table, pipeline)
+        except Exception as e:
+            logger.warning("portal: DynamoDB read failed for %s: %s", pipeline, e)
+            entry["error"] = PORTAL_CLIENT_SAFE_ERROR
+            out_runtimes.append(entry)
+            continue
+
+        if dep_row:
+            recorded_at = dep_row.get("recordedAt")
+            entry["deployment"] = {
+                "status": str(dep_row.get("status", "UNKNOWN")),
+                "recordedAt": recorded_at,
+                "ageSeconds": _age_seconds(recorded_at, now),
+                "stale": _is_stale(recorded_at, now),
+                "lastTransitionAt": dep_row.get("lastTransitionAt"),
+                "criticalServices": dep_row.get("criticalServices") or {},
+            }
+        if lease_row:
+            expires_at = lease_row.get("expiresAt")
+            fresh = False
+            try:
+                fresh = int(expires_at) > now
+            except (TypeError, ValueError):
+                fresh = False
+            entry["lease"] = {
+                "holder": str(lease_row.get("holder", "")),
+                "expiresAt": expires_at,
+                "fresh": fresh,
+            }
+        for row in sorted(proc_rows, key=lambda r: r["recordType"]):
+            recorded_at = row.get("recordedAt")
+            entry["processes"].append({
+                "process": row["recordType"].split("#", 1)[1],
+                "processType": str(row.get("processType", "?")),
+                "status": str(row.get("status", "UNKNOWN")),
+                "lagSeconds": row.get("lagSeconds"),
+                "resolvedThreshold": row.get("resolvedThreshold"),
+                "resolvedMode": row.get("resolvedMode"),
+                "pipelineName": row.get("pipelineName", ""),
+                "recordedAt": recorded_at,
+                "ageSeconds": _age_seconds(recorded_at, now),
+                "stale": _is_stale(recorded_at, now),
+                "consecutiveAbends": row.get("consecutiveAbends", 0),
+                "errorMsg": str(row.get("errorMsg", "")),
+            })
+        out_runtimes.append(entry)
+    return {
+        "generatedAt": now,
+        "logicalPipelines": build_logical_pipelines(),
+        "runtimes": out_runtimes,
+    }
+
+
+_PORTAL_CSS = """
+<style>
+body { font-family: monospace; margin: 1em; }
+table { border-collapse: collapse; width: 100%; margin-bottom: 0.5em; }
+th, td { border: 1px solid #888; padding: 4px 8px; text-align: left; }
+th { background: #ddd; }
+tr.stale td { color: #a00; font-style: italic; }
+.pipeline-header { margin-top: 1.5em; }
+.status.UP, .status.RUNNING { color: #060; font-weight: bold; }
+.status.DOWN, .status.DEPLOYMENT_DOWN, .status.ABENDED { color: #c00; font-weight: bold; }
+.status.STARTING, .status.STOPPED { color: #a60; font-weight: bold; }
+.status.UNKNOWN { color: #555; font-weight: bold; }
+.status.disabled { color: #888; }
+.meta { font-size: 0.85em; color: #555; }
+.error { color: #c00; }
+</style>
+"""
+
+
+def render_portal_html(status):
+    """Read-only HTML rendering of collect_portal_status()'s output. No
+    CloudWatch charts (out of scope this phase). Every dynamic value is
+    HTML-escaped."""
+    esc = html.escape
+
+    logical_html = ""
+    for lp in status["logicalPipelines"]:
+        roles_str = ", ".join(f"{esc(role)}: {esc(dep)}" for role, dep in sorted(lp["roles"].items()))
+        logical_html += f'<p><strong>Logical pipeline:</strong> {esc(lp["pipelineId"])} &mdash; {roles_str}</p>'
+
+    sections = []
+    for r in status["runtimes"]:
+        sec = f'<div class="pipeline-header"><h2>{esc(r["pipeline"])}</h2>'
+        sec += f'<div class="meta">type={esc(r["type"])} | name={esc(r["name"])}</div>'
+        if not r["enabled"]:
+            sec += '<p class="status disabled">DISABLED</p></div>'
+            sections.append(sec)
+            continue
+        if r["error"]:
+            sec += f'<p class="error">{esc(r["error"])}</p></div>'
+            sections.append(sec)
+            continue
+        dep = r["deployment"]
+        if dep:
+            stale_pfx = "[STALE] " if dep["stale"] else ""
+            sec += (f'<p><span class="status {esc(dep["status"])}">{esc(stale_pfx + dep["status"])}</span>'
+                    f' &mdash; <span class="meta">recorded {esc(str(dep["ageSeconds"]))}s ago</span></p>')
+        else:
+            sec += '<p class="status UNKNOWN">NO STATE RECORD</p>'
+        lease = r["lease"]
+        if lease:
+            fresh_str = "valid" if lease["fresh"] else "EXPIRED"
+            sec += f'<div class="meta">lease holder={esc(lease["holder"] or "none")} ({esc(fresh_str)})</div>'
+        else:
+            sec += '<div class="meta">lease: none</div>'
+
+        if r["processes"]:
+            rows = ""
+            for p in r["processes"]:
+                cls = ' class="stale"' if p["stale"] else ""
+                stale_pfx = "[STALE] " if p["stale"] else ""
+                lag = p["lagSeconds"] if p["lagSeconds"] is not None else "?"
+                rows += (f"<tr{cls}><td>{esc(stale_pfx + p['process'])}</td><td>{esc(p['processType'])}</td>"
+                        f'<td><span class="status {esc(p["status"])}">{esc(p["status"])}</span></td>'
+                        f"<td>{esc(str(lag))}s (thr {esc(str(p['resolvedThreshold']))}, {esc(str(p['resolvedMode']))})</td>"
+                        f"<td>{esc(str(p['ageSeconds']))}s ago</td>"
+                        f"<td>{esc(str(p['consecutiveAbends']))}</td></tr>")
+            sec += ("<table><tr><th>Process</th><th>Type</th><th>Status</th>"
+                    "<th>Lag / Threshold (mode)</th><th>Recorded</th><th>Abends</th></tr>"
+                    + rows + "</table>")
+        else:
+            sec += "<p><em>No process STATE records (topology has no configured processes).</em></p>"
+        sec += "</div>"
+        sections.append(sec)
+
+    body = logical_html + "\n".join(sections)
+    return (f"<html><head><title>gg-monitor</title>{_PORTAL_CSS}</head>"
+            f"<body><h1>GoldenGate pipelines</h1>{body}</body></html>")
+
+
+# ---------------------------------------------------------------------
+# HTTP endpoints: k8s health/readiness probes + the shared monitoring
+# portal (/ and /api/status). portal_table is a SEPARATE, read-only boto3
+# Table resource from the per-pipeline lease/health Table objects the
+# collector loops own -- portal requests run on the HTTP server's own
+# thread(s), never sharing a Table object with a writer thread.
+# ---------------------------------------------------------------------
+def _make_handler(ready_state, expected_pipelines, portal_table=None, portal_runtimes=None):
     class Handler(BaseHTTPRequestHandler):
         server_version = "gg-monitor-core"
 
-        def _write(self, code, body):
+        def _write(self, code, body, content_type="application/json"):
             body_bytes = body.encode("utf-8")
             self.send_response(code)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body_bytes)))
             self.end_headers()
             self.wfile.write(body_bytes)
@@ -864,6 +1097,18 @@ def _make_handler(ready_state, expected_pipelines):
             elif self.path == "/readyz":
                 ready = all(ready_state.get(p) for p in expected_pipelines)
                 self._write(200 if ready else 503, json.dumps({"status": "ready" if ready else "not_ready"}))
+            elif self.path == "/api/status":
+                if portal_table is None:
+                    self._write(503, json.dumps({"error": "portal not initialized"}))
+                    return
+                status = collect_portal_status(portal_table, portal_runtimes or [])
+                self._write(200, json.dumps(status, default=str))
+            elif self.path == "/":
+                if portal_table is None:
+                    self._write(503, "portal not initialized", content_type="text/plain")
+                    return
+                status = collect_portal_status(portal_table, portal_runtimes or [])
+                self._write(200, render_portal_html(status), content_type="text/html")
             else:
                 self._write(404, json.dumps({"error": "not found"}))
 
@@ -873,8 +1118,8 @@ def _make_handler(ready_state, expected_pipelines):
     return Handler
 
 
-def start_http_server(ready_state, expected_pipelines):
-    handler_cls = _make_handler(ready_state, expected_pipelines)
+def start_http_server(ready_state, expected_pipelines, portal_table=None, portal_runtimes=None):
+    handler_cls = _make_handler(ready_state, expected_pipelines, portal_table, portal_runtimes)
     server = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), handler_cls)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -910,7 +1155,12 @@ def main():
     stop_event = threading.Event()
     ready_state = {}
 
-    server = start_http_server(ready_state, [r["pipeline"] for r in enabled])
+    # Dedicated, read-only Table for the portal -- never shared with a
+    # collector loop's own lease/health Table objects (boto3 Table objects
+    # are not safe for concurrent use across threads; the portal serves its
+    # own HTTP request threads).
+    portal_table = boto3.resource("dynamodb", region_name=AWS_REGION).Table(DDB_TABLE)
+    server = start_http_server(ready_state, [r["pipeline"] for r in enabled], portal_table, runtimes)
 
     threads = []
     for runtime in enabled:

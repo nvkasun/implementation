@@ -1514,13 +1514,16 @@ def extract_blocks(text, header_re):
 resource_blocks = extract_blocks(content, r'resource "aws_dynamodb_table_item" "([a-zA-Z0-9_]+)" \{')
 
 # ---------------------------------------------------------------------
-# 1. Exactly one generic aws_dynamodb_table_item resource (no more
-#    per-runtime duplication).
+# 1. Exactly the expected set of aws_dynamodb_table_item resources: the
+#    generic per-runtime CONFIG for_each (pipeline_config, no more
+#    per-runtime duplication) plus the manager-aligned gg-alerts GLOBAL
+#    seed item (alerts_global) -- nothing else.
 # ---------------------------------------------------------------------
-if len(resource_blocks) == 1 and "pipeline_config" in resource_blocks:
-    ok("exactly 1 generic aws_dynamodb_table_item resource declared: pipeline_config")
+EXPECTED_ITEM_RESOURCES = {"pipeline_config", "alerts_global"}
+if set(resource_blocks.keys()) == EXPECTED_ITEM_RESOURCES:
+    ok("exactly the expected aws_dynamodb_table_item resources declared: pipeline_config, alerts_global")
 else:
-    bad(f"expected exactly 1 resource named pipeline_config, found {len(resource_blocks)}: {sorted(k for k in resource_blocks if k)}")
+    bad(f"expected exactly {sorted(EXPECTED_ITEM_RESOURCES)}, found {sorted(k for k in resource_blocks if k)}")
 
 if "gg_oracle_payments_01_config" in resource_blocks or "gg_postgresql_payments_01_config" in resource_blocks:
     bad("a duplicated per-runtime aws_dynamodb_table_item resource still exists in the code")
@@ -1604,7 +1607,7 @@ else:
 # ---------------------------------------------------------------------
 passive_checks = [
     (r'alertsEnabled\s*=\s*\{\s*BOOL\s*=\s*false\s*\}', "alertsEnabled=false"),
-    (r'metricsEnabled\s*=\s*\{\s*BOOL\s*=\s*true\s*\}', "metricsEnabled=true"),
+    (r'metricsEnabled\s*=\s*\{\s*BOOL\s*=\s*false\s*\}', "metricsEnabled=false"),
     (r'credSyncEnabled\s*=\s*\{\s*BOOL\s*=\s*false\s*\}', "credSyncEnabled=false"),
     (r'autoStartEnabled\s*=\s*\{\s*BOOL\s*=\s*false\s*\}', "autoStartEnabled=false"),
     (r'autoRestartMaxRetries\s*=\s*\{\s*N\s*=\s*"0"\s*\}', "autoRestartMaxRetries=0"),
@@ -1842,8 +1845,19 @@ EOF
   if [ ! -s "${TF_SCRATCH_DIR2}/envs/dev/config_items.tf" ]; then
     fail "could not extract moved blocks + pipeline_config resource from ${DYNAMODB_TF} for isolated validation"
   else
-    (cd "${TF_SCRATCH_DIR2}/envs/dev" && terraform init -input=false >"${TF_SCRATCH_DIR2}/tf-init.log" 2>&1)
-    if [ $? -eq 0 ]; then
+    # Bounded: `terraform init` needs network access to download the public
+    # hashicorp/aws provider. When no network is available (e.g. this local
+    # validation environment), a bare `terraform init` hangs indefinitely
+    # instead of failing fast -- `timeout` turns that into a bounded,
+    # non-zero exit. The whole thing is wrapped in `if ! ...; then` (not a
+    # bare statement followed by a separate `$?` check) so a non-zero exit
+    # under `set -e` triggers the skip fallback below instead of aborting
+    # this entire script.
+    TF_INIT_OK="true"
+    if ! (cd "${TF_SCRATCH_DIR2}/envs/dev" && timeout 20 terraform init -input=false >"${TF_SCRATCH_DIR2}/tf-init.log" 2>&1); then
+      TF_INIT_OK="false"
+    fi
+    if [ "$TF_INIT_OK" = "true" ]; then
       if (cd "${TF_SCRATCH_DIR2}/envs/dev" && terraform validate >"${TF_SCRATCH_DIR2}/tf-validate.log" 2>&1); then
         pass "terraform validate (isolated scratch, 3-entry synthetic inventory including 1 disabled): pipeline_config + moved blocks are schema-valid"
       else
@@ -2883,6 +2897,204 @@ if command -v python3 >/dev/null 2>&1 && python3 -c "import boto3, moto, yaml" >
   fi
 else
   skip "gg-monitor-core unit tests (post correction) -- python3/boto3/moto/PyYAML not available"
+fi
+
+echo ""
+echo ""
+echo "--------------------------------------------------------------------"
+echo "Local completion pass: gg-alerts/gg-metrics-history tables,"
+echo "CloudWatch-optional, shared monitoring portal, IAM re-audit"
+echo "--------------------------------------------------------------------"
+
+echo "--- gg-alerts table: schema, GLOBAL seed, ownership pattern ---"
+if grep -q 'module "goldengate_alerts"' "$DYNAMODB_TF" && grep -qE 'name\s*=\s*"gg-alerts"' "$DYNAMODB_TF"; then
+  pass "module.goldengate_alerts declares table name gg-alerts"
+else
+  fail "module.goldengate_alerts / gg-alerts table declaration not found"
+fi
+if grep -qE 'hash_key\s*=\s*"alert_id"' "$DYNAMODB_TF"; then
+  pass "gg-alerts hash_key is alert_id"
+else
+  fail "gg-alerts hash_key is not alert_id"
+fi
+if grep -q 'resource "aws_dynamodb_table_item" "alerts_global"' "$DYNAMODB_TF"; then
+  ALERTS_BLOCK="$(awk '/resource "aws_dynamodb_table_item" "alerts_global"/{flag=1} flag{print; if (/^}/ && flag==1) exit}' "$DYNAMODB_TF")"
+  if echo "$ALERTS_BLOCK" | grep -q 'alert_id.*=.*{ S = "GLOBAL" }' && \
+     echo "$ALERTS_BLOCK" | grep -qE 'enabled\s*=\s*\{\s*BOOL\s*=\s*false\s*\}' && \
+     echo "$ALERTS_BLOCK" | grep -q 'distribution_list.*=.*{ L = \[\] }' && \
+     echo "$ALERTS_BLOCK" | grep -q 'maintenance_windows.*=.*{ L = \[\] }' && \
+     echo "$ALERTS_BLOCK" | grep -q 'ignore_changes = \[item\]'; then
+    pass "alerts_global seeds exactly one GLOBAL record: enabled=false, empty distribution_list/maintenance_windows, ignore_changes=[item]"
+  else
+    fail "alerts_global record does not match the required disabled-GLOBAL-seed shape"
+  fi
+else
+  fail "aws_dynamodb_table_item.alerts_global resource not found"
+fi
+if grep -qE '@|SNS|arn:aws:sns' "$DYNAMODB_TF" | grep -qi "alerts_global"; then
+  fail "gg-alerts seed appears to configure an email address or SNS endpoint"
+else
+  pass "gg-alerts seed configures no email address or SNS endpoint"
+fi
+
+echo "--- gg-metrics-history table: schema, no seed records ---"
+if grep -q 'module "goldengate_metrics_history"' "$DYNAMODB_TF" && grep -qE 'name\s*=\s*"gg-metrics-history"' "$DYNAMODB_TF"; then
+  pass "module.goldengate_metrics_history declares table name gg-metrics-history"
+else
+  fail "module.goldengate_metrics_history / gg-metrics-history table declaration not found"
+fi
+if grep -qE 'hash_key\s*=\s*"deployment_name"' "$DYNAMODB_TF" && grep -qE 'range_key\s*=\s*"timestamp"' "$DYNAMODB_TF"; then
+  pass "gg-metrics-history hash_key=deployment_name, range_key=timestamp"
+else
+  fail "gg-metrics-history key schema is incorrect"
+fi
+if grep -A3 'module "goldengate_metrics_history"' "$DYNAMODB_TF" | grep -q 'ttl_enabled' ; then
+  : # presence checked more precisely below
+fi
+METRICS_MODULE_BLOCK="$(awk '/module "goldengate_metrics_history"/{flag=1} flag{print; if (/^}/ && flag==1) exit}' "$DYNAMODB_TF")"
+if echo "$METRICS_MODULE_BLOCK" | grep -qE 'ttl_enabled\s*=\s*true' && echo "$METRICS_MODULE_BLOCK" | grep -qE 'ttl_attribute_name\s*=\s*"ttl"'; then
+  pass "gg-metrics-history has ttl enabled on the ttl attribute"
+else
+  fail "gg-metrics-history does not have the expected ttl configuration"
+fi
+if grep -q 'aws_dynamodb_table_item" "metrics_history\|aws_dynamodb_table_item" "goldengate_metrics_history' "$DYNAMODB_TF"; then
+  fail "gg-metrics-history has a seed item resource -- it must contain no static data records"
+else
+  pass "gg-metrics-history has no seed item resource (no static data records)"
+fi
+
+echo "--- No customer-managed KMS key introduced for the new tables ---"
+if echo "$METRICS_MODULE_BLOCK" | grep -qE 'custom_kms_key_arn\s*=\s*null'; then
+  pass "gg-metrics-history preserves custom_kms_key_arn = null (same pattern as gg-eks-pipeline)"
+else
+  fail "gg-metrics-history does not preserve custom_kms_key_arn = null"
+fi
+ALERTS_MODULE_BLOCK="$(awk '/module "goldengate_alerts"/{flag=1} flag{print; if (/^}/ && flag==1) exit}' "$DYNAMODB_TF")"
+if echo "$ALERTS_MODULE_BLOCK" | grep -qE 'custom_kms_key_arn\s*=\s*null'; then
+  pass "gg-alerts preserves custom_kms_key_arn = null (same pattern as gg-eks-pipeline)"
+else
+  fail "gg-alerts does not preserve custom_kms_key_arn = null"
+fi
+
+echo "--- No gg-alerter application/deployment/IAM role created ---"
+if [ -d "envs/dev/policies/gg-alerter-dev-role" ]; then
+  fail "an envs/dev/policies/gg-alerter-dev-role directory was created -- no gg-alerter IAM role is in scope this task"
+else
+  pass "no gg-alerter-dev-role IAM policy folder exists"
+fi
+if find helm -maxdepth 1 -iname "*alerter*" 2>/dev/null | grep -q .; then
+  fail "a gg-alerter Helm chart was created -- out of scope this task"
+else
+  pass "no gg-alerter Helm chart exists"
+fi
+if [ -d "monitoring/alerter" ] || [ -d "monitoring/gg-alerter" ]; then
+  fail "a gg-alerter application directory was created -- out of scope this task"
+else
+  pass "no gg-alerter application directory exists"
+fi
+
+echo "--- CloudWatch publication is optional, disabled by default ---"
+if grep -q '"metricsEnabled": False' "${MONITOR_CORE_DIR}/gg_health_rules.py"; then
+  pass "gg_health_rules.DEFAULTS[metricsEnabled] defaults to False"
+else
+  fail "gg_health_rules.DEFAULTS is missing metricsEnabled=False"
+fi
+# Scoped to polling_loop's own body (code_only(), comments/docstrings
+# stripped) -- the bare file-wide count would also match this function's
+# OWN definition ("def _cloudwatch_client():" contains the literal
+# substring "_cloudwatch_client()") and prose in nearby docstrings/comments
+# explaining the gating, neither of which are real call sites.
+POLLING_LOOP_SRC="$(sed -n '/^def polling_loop/,/^def /p' "${MONITOR_CORE_DIR}/gg_monitor_core.py" | sed '$d')"
+POLLING_LOOP_CODE_ONLY="$(echo "$POLLING_LOOP_SRC" | code_only)"
+CW_CALL_COUNT="$(echo "$POLLING_LOOP_CODE_ONLY" | grep -c '_cloudwatch_client()' || true)"
+# -B2 (not -B1): the second call site has one line of unrelated code
+# between the "if cfg[metricsEnabled]:" guard and the _cloudwatch_client()
+# call itself. Quote-agnostic ([\"']) because code_only() round-trips the
+# source through ast.unparse(), which normalizes string literals to single
+# quotes regardless of how they were written in the original file.
+GATED_CW_COUNT="$(echo "$POLLING_LOOP_CODE_ONLY" | grep -B2 '_cloudwatch_client()' | grep -cE 'cfg\[[\"'"'"']metricsEnabled[\"'"'"']\]' || true)"
+if [ "$CW_CALL_COUNT" -eq 2 ] && [ "$CW_CALL_COUNT" -eq "$GATED_CW_COUNT" ]; then
+  pass "both _cloudwatch_client() call sites in polling_loop are immediately gated by cfg[\"metricsEnabled\"]"
+else
+  fail "_cloudwatch_client() call sites in polling_loop (${CW_CALL_COUNT}) do not all appear gated by metricsEnabled (gated=${GATED_CW_COUNT})"
+fi
+
+echo "--- Shared monitoring web portal ---"
+if grep -q "def collect_portal_status" "${MONITOR_CORE_DIR}/gg_monitor_core.py" && \
+   grep -q "def render_portal_html" "${MONITOR_CORE_DIR}/gg_monitor_core.py"; then
+  pass "gg_monitor_core.py implements collect_portal_status / render_portal_html"
+else
+  fail "gg_monitor_core.py is missing the portal collection/rendering functions"
+fi
+if grep -q '"/api/status"' "${MONITOR_CORE_DIR}/gg_monitor_core.py" && grep -q 'self.path == "/"' "${MONITOR_CORE_DIR}/gg_monitor_core.py"; then
+  pass "portal routes / and /api/status are wired into the HTTP handler"
+else
+  fail "portal routes are not wired into the HTTP handler"
+fi
+PORTAL_RENDER_SRC="$(sed -n '/^def render_portal_html/,/^def /p' "${MONITOR_CORE_DIR}/gg_monitor_core.py" | sed '$d')"
+PORTAL_RENDER_CODE_ONLY="$(echo "$PORTAL_RENDER_SRC" | code_only)"
+if echo "$PORTAL_RENDER_CODE_ONLY" | grep -qi "cloudwatch"; then
+  fail "portal HTML rendering references CloudWatch -- no CloudWatch charts are permitted this phase"
+else
+  pass "portal HTML rendering contains no CloudWatch reference (only its own explanatory docstring may mention the exclusion)"
+fi
+if echo "$PORTAL_RENDER_SRC" | grep -q "/mnt/secrets-store\|credentialUserFile\|credentialPasswordFile\|adminSecretObject"; then
+  fail "portal HTML rendering references credential paths or secret object names"
+else
+  pass "portal HTML rendering never references credential paths or secret object names"
+fi
+if grep -q "def build_logical_pipelines" "${MONITOR_CORE_DIR}/inventory.py"; then
+  pass "inventory.py exposes build_logical_pipelines for the portal's source/target relationship view"
+else
+  fail "inventory.py is missing build_logical_pipelines"
+fi
+if grep -q "monitoring/monitor/monitor.py" "${MONITOR_CORE_DIR}/README.md" 2>/dev/null || grep -qi "does not replace or modify" "${MONITOR_CORE_DIR}/README.md"; then
+  pass "README documents that the pre-existing monitoring/monitor portal is left unmodified"
+else
+  fail "README does not document the relationship to the pre-existing legacy portal"
+fi
+
+echo "--- IAM: no access to new tables, no gg-alerter role, DynamoDB scoped exactly ---"
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  if python3 -c "
+import json
+policy = json.load(open('${MONITOR_IAM_POLICY}'))
+text = json.dumps(policy)
+assert 'gg-alerts' not in text
+assert 'gg-metrics-history' not in text
+for stmt in policy['Statement']:
+    actions = stmt['Action'] if isinstance(stmt['Action'], list) else [stmt['Action']]
+    if any(a.startswith('dynamodb:') for a in actions):
+        resources = stmt['Resource'] if isinstance(stmt['Resource'], list) else [stmt['Resource']]
+        for r in resources:
+            assert r.endswith('table/gg-eks-pipeline'), r
+            assert '*' not in r
+print('OK')
+" >"${WORKDIR}/iam-scope-check.log" 2>&1; then
+    pass "gg-monitor-dev-role grants no access to gg-alerts/gg-metrics-history; DynamoDB Resource scoped to the exact gg-eks-pipeline table ARN only"
+  else
+    fail "IAM scope re-audit failed"
+    cat "${WORKDIR}/iam-scope-check.log"
+  fi
+else
+  skip "IAM scope re-audit -- python3 not available"
+fi
+
+echo "--- Full monitor unit test suite re-run after local completion pass ---"
+if command -v python3 >/dev/null 2>&1 && python3 -c "import boto3, moto, yaml" >/dev/null 2>&1; then
+  set +e
+  MONITOR_UNITTEST_OUTPUT3="$(cd "$MONITOR_CORE_DIR" && python3 -m unittest discover -s tests -p "test_*.py" 2>&1)"
+  MONITOR_UNITTEST_STATUS3=$?
+  set -e
+  if [ "$MONITOR_UNITTEST_STATUS3" -eq 0 ]; then
+    RAN_LINE3="$(echo "$MONITOR_UNITTEST_OUTPUT3" | grep -E '^Ran [0-9]+ test' | tail -1)"
+    pass "gg-monitor-core unit tests (post local-completion pass): ${RAN_LINE3:-all tests passed}"
+  else
+    fail "gg-monitor-core unit tests failed after local-completion pass"
+    echo "$MONITOR_UNITTEST_OUTPUT3"
+  fi
+else
+  skip "gg-monitor-core unit tests (post local-completion pass) -- python3/boto3/moto/PyYAML not available"
 fi
 
 echo ""

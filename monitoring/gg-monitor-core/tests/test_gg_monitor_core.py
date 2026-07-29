@@ -398,6 +398,166 @@ class DeploymentStateShapeTests(unittest.TestCase):
         self.assertNotIn("Item", singleton)
 
 
+# ===========================================================================
+# Shared monitoring web portal (section 16/19): read-only. Multi-replica
+# safe by construction (no lease/write involvement); never renders
+# credentials, secret references, or CloudWatch data.
+# ===========================================================================
+class PortalTests(unittest.TestCase):
+    def _table(self):
+        client = boto3.client("dynamodb", region_name="eu-west-1")
+        client.create_table(
+            TableName="gg-eks-pipeline",
+            KeySchema=[{"AttributeName": "pipeline", "KeyType": "HASH"},
+                      {"AttributeName": "recordType", "KeyType": "RANGE"}],
+            AttributeDefinitions=[{"AttributeName": "pipeline", "AttributeType": "S"},
+                                  {"AttributeName": "recordType", "AttributeType": "S"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        return boto3.resource("dynamodb", region_name="eu-west-1").Table("gg-eks-pipeline")
+
+    def _runtimes(self):
+        return [
+            {"pipeline": "gg-oracle-payments-01", "name": "oracle-payments-01", "type": "oracle", "enabled": True},
+            {"pipeline": "gg-postgresql-payments-01", "name": "postgresql-payments-01", "type": "postgresql", "enabled": True},
+            {"pipeline": "gg-disabled-01", "name": "disabled-01", "type": "oracle", "enabled": False},
+        ]
+
+    @mock_aws
+    def test_disabled_runtime_shown_without_any_dynamodb_read(self):
+        table = self._table()
+        status = core.collect_portal_status(table, [self._runtimes()[2]], now=1000)
+        r = status["runtimes"][0]
+        self.assertFalse(r["enabled"])
+        self.assertIsNone(r["deployment"])
+        self.assertIsNone(r["error"])
+
+    @mock_aws
+    def test_healthy_runtime_full_shape(self):
+        table = self._table()
+        now = 100000
+        table.put_item(Item={"pipeline": "gg-oracle-payments-01", "recordType": "STATE#_deployment",
+                             "status": "UP", "recordedAt": now - 5, "deploymentType": "oracle"})
+        table.put_item(Item={"pipeline": "gg-oracle-payments-01", "recordType": "LEASE",
+                             "holder": "gg-monitor-0", "expiresAt": now + 30, "ttl": now + 90, "leaseToken": "tok"})
+        table.put_item(Item={"pipeline": "gg-oracle-payments-01", "recordType": "STATE#EXTORA1",
+                             "status": "RUNNING", "processType": "extract", "recordedAt": now - 3,
+                             "lagSeconds": 4, "resolvedThreshold": 300, "resolvedMode": "alert",
+                             "pipelineName": "payments-ora-to-pg-001", "consecutiveAbends": 0})
+        status = core.collect_portal_status(table, [self._runtimes()[0]], now=now)
+        r = status["runtimes"][0]
+        self.assertEqual(r["deployment"]["status"], "UP")
+        self.assertFalse(r["deployment"]["stale"])
+        self.assertEqual(r["lease"]["holder"], "gg-monitor-0")
+        self.assertTrue(r["lease"]["fresh"])
+        self.assertEqual(len(r["processes"]), 1)
+        self.assertEqual(r["processes"][0]["process"], "EXTORA1")
+        self.assertEqual(r["processes"][0]["lagSeconds"], 4)
+        self.assertFalse(r["processes"][0]["stale"])
+
+    @mock_aws
+    def test_stale_deployment_and_process_flagged(self):
+        table = self._table()
+        now = 100000
+        table.put_item(Item={"pipeline": "gg-oracle-payments-01", "recordType": "STATE#_deployment",
+                             "status": "UP", "recordedAt": now - 999, "deploymentType": "oracle"})
+        status = core.collect_portal_status(table, [self._runtimes()[0]], now=now)
+        self.assertTrue(status["runtimes"][0]["deployment"]["stale"])
+
+    @mock_aws
+    def test_expired_lease_shown_as_not_fresh(self):
+        table = self._table()
+        now = 100000
+        table.put_item(Item={"pipeline": "gg-oracle-payments-01", "recordType": "LEASE",
+                             "holder": "gg-monitor-0", "expiresAt": now - 100, "ttl": now, "leaseToken": "tok"})
+        status = core.collect_portal_status(table, [self._runtimes()[0]], now=now)
+        self.assertFalse(status["runtimes"][0]["lease"]["fresh"])
+
+    def test_dynamodb_failure_shows_client_safe_message_not_raw_exception(self):
+        table = MagicMock()
+        table.get_item.side_effect = Exception("AccessDeniedException: user arn:aws:iam::668311715351:role/x is not authorized")
+        status = core.collect_portal_status(table, [self._runtimes()[0]], now=1000)
+        r = status["runtimes"][0]
+        self.assertEqual(r["error"], core.PORTAL_CLIENT_SAFE_ERROR)
+        self.assertNotIn("AccessDenied", r["error"])
+        self.assertNotIn("arn:aws:iam", r["error"])
+
+    @mock_aws
+    def test_no_process_state_missing_deployment_state_shown_as_none_not_crash(self):
+        table = self._table()
+        status = core.collect_portal_status(table, [self._runtimes()[0]], now=1000)
+        r = status["runtimes"][0]
+        self.assertIsNone(r["deployment"])
+        self.assertIsNone(r["lease"])
+        self.assertEqual(r["processes"], [])
+        self.assertIsNone(r["error"])
+
+    def test_portal_status_includes_logical_pipeline_grouping(self):
+        table = MagicMock()
+        table.get_item.return_value = {}
+        table.query.return_value = {"Items": []}
+        status = core.collect_portal_status(table, [], now=1000)
+        self.assertIn("logicalPipelines", status)
+
+    def test_real_repo_logical_pipelines_show_source_and_target_roles(self):
+        pipelines = inv.build_logical_pipelines(str(REPO_ROOT))
+        self.assertEqual(len(pipelines), 1)
+        self.assertEqual(pipelines[0]["pipelineId"], "payments-ora-to-pg-001")
+        self.assertEqual(pipelines[0]["roles"]["source"], "gg-oracle-payments-01")
+        self.assertEqual(pipelines[0]["roles"]["target"], "gg-postgresql-payments-01")
+
+    def test_html_render_never_contains_credential_paths_or_secret_refs(self):
+        status = {
+            "generatedAt": 1000,
+            "logicalPipelines": [{"pipelineId": "payments-ora-to-pg-001", "roles": {"source": "gg-oracle-payments-01"}}],
+            "runtimes": [{
+                "pipeline": "gg-oracle-payments-01", "name": "oracle-payments-01", "type": "oracle",
+                "enabled": True, "error": None,
+                "deployment": {"status": "UP", "recordedAt": 999, "ageSeconds": 1, "stale": False,
+                              "lastTransitionAt": None, "criticalServices": {}},
+                "lease": {"holder": "gg-monitor-0", "expiresAt": 1030, "fresh": True},
+                "processes": [],
+            }],
+        }
+        rendered = core.render_portal_html(status)
+        self.assertNotIn("/mnt/secrets-store", rendered)
+        self.assertNotIn("dev/goldengate", rendered)
+        self.assertNotIn("cloudwatch", rendered.lower())
+        self.assertNotIn("CloudWatch", rendered)
+
+    def test_html_render_escapes_values(self):
+        status = {
+            "generatedAt": 1000, "logicalPipelines": [],
+            "runtimes": [{
+                "pipeline": "<script>alert(1)</script>", "name": "x", "type": "oracle",
+                "enabled": True, "error": None, "deployment": None, "lease": None, "processes": [],
+            }],
+        }
+        rendered = core.render_portal_html(status)
+        self.assertNotIn("<script>alert(1)</script>", rendered)
+        self.assertIn("&lt;script&gt;", rendered)
+
+    def test_portal_read_path_never_calls_lease_or_leader_apis(self):
+        """Multi-replica safety by construction: the portal is read-only and
+        needs no lease -- collect_portal_status must never touch acquire/
+        renew/is_leader."""
+        import inspect
+        src = code_only(inspect.getsource(core.collect_portal_status))
+        for forbidden in ("acquire(", "renew(", "is_leader("):
+            self.assertNotIn(forbidden, src)
+
+    def test_routes_wired_return_expected_content_types(self):
+        import inspect
+        ready_state = {"gg-oracle-payments-01": True}
+        handler_cls = core._make_handler(ready_state, ["gg-oracle-payments-01"], portal_table=None, portal_runtimes=None)
+        # Structural: portal routes exist and degrade gracefully (503) when
+        # portal_table is None, rather than crashing the HTTP server.
+        src = inspect.getsource(handler_cls)
+        self.assertIn('"/api/status"', src)
+        self.assertIn('self.path == "/"', src)
+        self.assertIn("portal not initialized", src)
+
+
 class MetricDimensionTests(unittest.TestCase):
     def test_extract_lag_metric_dimensions(self):
         procs = [{"process": "EXTORA1", "type": "extract", "lagSeconds": 12.0, "abended": False}]
@@ -570,8 +730,13 @@ class HealthRuleEvaluationTests(unittest.TestCase):
     def test_resolve_config_defaults_are_passive_safe(self):
         cfg = gh.resolve_config({})
         self.assertFalse(cfg["alertsEnabled"])
+        self.assertFalse(cfg["metricsEnabled"])
         self.assertFalse(cfg["defaults"]["failoverEnabled"])
         self.assertEqual(cfg["defaults"]["distpathStallChecks"], 3)
+
+    def test_metrics_enabled_is_read_from_raw_config_when_present(self):
+        self.assertTrue(gh.resolve_config({"metricsEnabled": True})["metricsEnabled"])
+        self.assertFalse(gh.resolve_config({"metricsEnabled": False})["metricsEnabled"])
 
     def test_abend_step_computes_failover_flag_without_acting(self):
         rule = dict(gh.DEFAULTS["defaults"])
@@ -590,6 +755,51 @@ class HealthRuleEvaluationTests(unittest.TestCase):
         self.assertTrue(gh.classify_service_up(401))
         self.assertFalse(gh.classify_service_up(502))
         self.assertFalse(gh.classify_service_up(None))
+
+
+# ===========================================================================
+# CloudWatch is optional and disabled by default (section 20/6 freeze):
+# PutMetricData, alarms, dashboards, Logs, SNS, Fluent Bit, CloudWatch
+# Agent, and Container Insights all remain out of scope. The monitor must
+# start, become ready, and write LEASE/STATE with zero CloudWatch IAM
+# permission when metricsEnabled=false (the default).
+# ===========================================================================
+class CloudWatchOptionalTests(unittest.TestCase):
+    def test_cloudwatch_client_only_constructed_when_metrics_enabled(self):
+        import inspect
+        src = inspect.getsource(core.polling_loop)
+        lines = src.splitlines()
+        call_sites = [i for i, l in enumerate(lines) if "_cloudwatch_client()" in l]
+        self.assertEqual(len(call_sites), 2, "expected exactly 2 _cloudwatch_client() call sites in polling_loop")
+        for i in call_sites:
+            preceding = "\n".join(lines[max(0, i - 2):i])
+            self.assertIn('if cfg["metricsEnabled"]:', preceding,
+                         f"_cloudwatch_client() call at line {i} is not immediately gated by metricsEnabled")
+
+    def test_default_config_has_cloudwatch_disabled(self):
+        cfg = gh.resolve_config({})
+        self.assertFalse(cfg["metricsEnabled"])
+
+    def test_monitor_startup_and_readiness_path_never_touches_cloudwatch(self):
+        """check_static_prerequisites and run_pipeline (the startup/
+        readiness path) must have zero CloudWatch dependency -- the monitor
+        must be able to become Ready with no cloudwatch:* IAM permission at
+        all when metricsEnabled=false."""
+        import inspect
+        self.assertNotIn("cloudwatch", inspect.getsource(core.check_static_prerequisites).lower())
+        self.assertNotIn("cloudwatch", inspect.getsource(core.run_pipeline).lower())
+
+    def test_emit_never_called_unguarded_elsewhere_in_module(self):
+        """_emit( is only ever called from the two metricsEnabled-gated
+        sites inside polling_loop -- no other code path in the module
+        publishes CloudWatch metrics."""
+        import inspect
+        full_src = code_only(inspect.getsource(core))
+        occurrences = full_src.count("_emit(_cloudwatch_client()")
+        self.assertEqual(occurrences, 2)
+        polling_src = inspect.getsource(core.polling_loop)
+        self.assertEqual(polling_src.count("_emit(_cloudwatch_client()"), 2,
+                         "both _emit(...) call sites must live inside polling_loop, not scattered elsewhere")
 
 
 # ===========================================================================
@@ -1484,6 +1694,59 @@ deployments:
 # A future runtime whose secret lives outside the currently allowed ARN set
 # must fail validation before deployment, not later with FailedMount.
 # ===========================================================================
+class MonitorIamScopeTests(unittest.TestCase):
+    """Section 15 audit: the shared monitor's IAM policy must not grant
+    access to gg-alerts/gg-metrics-history (not needed this phase, no
+    gg-alerter IAM role created), and CloudWatch access remains staged but
+    not broadened."""
+    POLICY_PATH = REPO_ROOT / "envs" / "dev" / "policies" / "gg-monitor-dev-role" / "policies" / "policies_1.json"
+    IAM_TF_PATH = REPO_ROOT / "envs" / "dev" / "iam.tf"
+
+    def test_no_access_to_alerts_or_metrics_history_tables(self):
+        import json
+        policy = json.loads(self.POLICY_PATH.read_text())
+        text = json.dumps(policy)
+        self.assertNotIn("gg-alerts", text)
+        self.assertNotIn("gg-metrics-history", text)
+
+    def test_no_gg_alerter_iam_role_created(self):
+        self.assertFalse((REPO_ROOT / "envs" / "dev" / "policies" / "gg-alerter-dev-role").exists())
+        iam_tf_code = code_only(self.IAM_TF_PATH.read_text())
+        self.assertNotIn("gg_alerter", iam_tf_code.lower())
+        self.assertNotIn('module "gg-alerter', iam_tf_code.lower())
+
+    def test_cloudwatch_permission_documented_as_not_required(self):
+        content = self.IAM_TF_PATH.read_text()
+        self.assertIn("CLOUDWATCH IS NOT REQUIRED FOR THE CURRENT PHASE", content)
+
+    def test_cloudwatch_statement_not_broadened(self):
+        import json
+        policy = json.loads(self.POLICY_PATH.read_text())
+        for stmt in policy["Statement"]:
+            actions = stmt["Action"] if isinstance(stmt["Action"], list) else [stmt["Action"]]
+            if any(a.startswith("cloudwatch:") for a in actions):
+                self.assertEqual(actions, ["cloudwatch:PutMetricData"])
+                self.assertIn("Condition", stmt)
+
+    def test_dynamodb_resource_scoped_to_exact_table_not_wildcard(self):
+        import json
+        policy = json.loads(self.POLICY_PATH.read_text())
+        for stmt in policy["Statement"]:
+            actions = stmt["Action"] if isinstance(stmt["Action"], list) else [stmt["Action"]]
+            if any(a.startswith("dynamodb:") for a in actions):
+                resources = stmt["Resource"] if isinstance(stmt["Resource"], list) else [stmt["Resource"]]
+                for res in resources:
+                    self.assertNotIn("*", res)
+                    self.assertTrue(res.endswith("table/gg-eks-pipeline"))
+
+    def test_no_dynamodb_delete_or_create_table_actions(self):
+        import json
+        policy = json.loads(self.POLICY_PATH.read_text())
+        text = json.dumps(policy)
+        for forbidden in ("dynamodb:DeleteTable", "dynamodb:CreateTable", "dynamodb:Scan", "dynamodb:BatchWriteItem"):
+            self.assertNotIn(forbidden, text)
+
+
 class SecretArnCoverageTests(unittest.TestCase):
     ALLOWED = [
         "arn:aws:secretsmanager:eu-west-1:668311715351:secret:dev/goldengate/source/admin-*",

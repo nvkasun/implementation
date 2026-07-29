@@ -1,20 +1,28 @@
 # gg-monitor-core
 
-Shared, passive GoldenGate runtime poller/writer for Phase 4.
+Shared, passive GoldenGate runtime poller/writer/portal for Phase 4.
 
 Reads the canonical runtime inventory from `pipelines/deployments.yaml` and
 `topologies/dev/*.yaml` (mounted read-only from the repository, no second
 hardcoded runtime list anywhere in this application), polls each enabled
 runtime's GoldenGate Admin REST API (port 8443 only -- the separate
 PMS/metrics endpoint on port 9015 is retained in topology for a later,
-explicitly implemented phase and is not polled by this module) over its
-internal Kubernetes Service DNS, evaluates health using manager-compatible
-rules (`gg_health_rules.py`, ported from the manager reference
-implementation's `gg_health.py` with every active-healing code path
-removed), and writes `LEASE` / `STATE#_deployment` / `STATE#<process>`
-records plus CloudWatch metrics under `GoldenGate/Pipelines` -- exactly the
-record shapes and metric names/dimensions the manager reference
-implementation's per-pod utility-sidecar produces.
+explicitly implemented phase and is not polled by this module, since no
+verified PMS API contract exists in the manager reference code or supplied
+documents) over its internal Kubernetes Service DNS, evaluates health using
+manager-compatible rules (`gg_health_rules.py`, ported from the manager
+reference implementation's `gg_health.py` with every active-healing code
+path removed), and writes `LEASE` / `STATE#_deployment` / `STATE#<process>`
+records -- exactly the record shapes the manager reference implementation's
+per-pod utility-sidecar produces. It also serves a read-only status portal
+(`/`, `/api/status`) over the same records, alongside `/healthz`/`/readyz`.
+
+CloudWatch metric publication under `GoldenGate/Pipelines` is OPTIONAL,
+gated on `CONFIG.metricsEnabled` (defaults **false** this phase -- CloudWatch
+alarms, dashboards, Logs, SNS, Fluent Bit, CloudWatch Agent, and Container
+Insights are all out of scope until a separate, later validated phase). The
+monitor starts, becomes Ready, polls, and writes LEASE/STATE with zero
+CloudWatch IAM permission required in this configuration.
 
 This process is passive by construction: it contains no code path that
 starts, restarts, stops, or fences a GoldenGate process, no Kubernetes
@@ -25,17 +33,38 @@ mutation API call, and no credential-sync-into-GoldenGate path.
 - `gg_monitor_core.py` -- main application: dedicated lease-control loop
   (RENEW_INTERVAL cadence) independent of the polling loop
   (checkIntervalSeconds cadence), GoldenGate Admin REST polling, STATE
-  writes, CloudWatch metrics, `/healthz` + `/readyz`.
+  writes, optional CloudWatch metrics (metricsEnabled-gated), the read-only
+  portal (`/`, `/api/status`), and `/healthz` + `/readyz`.
 - `gg_health_rules.py` -- pure health-evaluation logic (no I/O), ported from
   the manager reference implementation, healing paths removed.
 - `inventory.py` -- loads the canonical inventory/topology, validates every
   enabled runtime's required configuration at startup, and derives
-  manager-compatible `deployments.json` / `process-pipeline-map.json`
-  equivalents at runtime.
+  manager-compatible `deployments.json` / `process-pipeline-map.json` /
+  `runtime-config.json` equivalents plus the logical-pipeline
+  (source/target) grouping the portal renders.
 - `tests/` -- focused unit tests (inventory parsing, canonical key
   derivation, lease timeline/renewal, readiness semantics, TLS
   connect-host/tlsServerName separation, Admin REST response parsing,
-  credential redaction, passive behavior).
+  credential redaction, passive behavior, portal rendering/error handling,
+  CloudWatch-optional behavior).
+
+## Portal
+
+`/` renders an HTML status page and `/api/status` the equivalent JSON: for
+every canonical runtime, its deployment health (status/staleness), LEASE
+holder and freshness, and per-process STATE (name/type/status/lag/age/abend
+count) -- plus the logical topology relationship (e.g. "Logical pipeline:
+payments-ora-to-pg-001 -- source: gg-oracle-payments-01, target:
+gg-postgresql-payments-01"), which is presented explicitly as a
+relationship between two runtimes, never as if it were a GoldenGate runtime
+identity itself. Read-only (GetItem/Query only, never Scan, never writes);
+any replica can serve accurate portal data regardless of which replica
+currently holds a given runtime's LEASE. Never renders credential file
+paths, Secrets Manager object references, or CloudWatch data; a DynamoDB
+read failure shows a fixed, client-safe message (the real error is logged
+server-side only). This does not replace or modify the separately deployed
+`monitoring/monitor/monitor.py` + `helm/goldengate-monitor` portal, left
+unchanged.
 
 ## Manager reference divergences (see code comments for full detail)
 

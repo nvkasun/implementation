@@ -25,6 +25,13 @@ CONFIG schema (envs/dev/dynamodb.tf) exactly -- not the manager's own
 (active-sidecar-oriented) DEFAULTS dict, which also carries
 serviceHealEnabled/maxHealAttempts/serviceDownChecks/criticalServices
 (healing-only fields never present in our CONFIG schema at all).
+
+metricsEnabled defaults to False here (the manager's own seed defaults it
+True) -- an intentional, documented deviation: in this repository
+metricsEnabled is what gates CloudWatch publication (out of scope this
+phase: PutMetricData, alarms, dashboards, Logs, SNS, Fluent Bit, CloudWatch
+Agent, Container Insights). It has no effect on DynamoDB LEASE/STATE#*
+writing, which is unconditional.
 """
 from __future__ import annotations
 
@@ -36,6 +43,13 @@ logger = logging.getLogger("gg-health-rules")
 
 DEFAULTS = {
     "alertsEnabled": False,
+    # CloudWatch publication is OPTIONAL and DISABLED by default this phase
+    # (out of scope: PutMetricData, alarms, dashboards, Logs, SNS, Fluent
+    # Bit, CloudWatch Agent, Container Insights -- see
+    # monitoring/gg-monitor-core/README.md). gg_monitor_core._emit() is
+    # gated on this field; the monitor must start and run correctly with
+    # metricsEnabled=false and no CloudWatch permission at all.
+    "metricsEnabled": False,
     "tz": "Asia/Dubai",
     "checkIntervalSeconds": 60,
     "startupGraceSeconds": 300,
@@ -100,6 +114,7 @@ def resolve_config(raw):
     raw = raw if isinstance(raw, dict) else {}
     cfg = {
         "alertsEnabled": _to_bool(raw.get("alertsEnabled"), DEFAULTS["alertsEnabled"]),
+        "metricsEnabled": _to_bool(raw.get("metricsEnabled"), DEFAULTS["metricsEnabled"]),
         "tz": raw.get("tz") if isinstance(raw.get("tz"), str) else DEFAULTS["tz"],
         "checkIntervalSeconds": _to_int(raw.get("checkIntervalSeconds"), DEFAULTS["checkIntervalSeconds"]),
         "startupGraceSeconds": _to_int(raw.get("startupGraceSeconds"), DEFAULTS["startupGraceSeconds"]),

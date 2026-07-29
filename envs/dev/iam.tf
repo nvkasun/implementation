@@ -188,6 +188,35 @@ module "gg_postgresql_dev_runtime_role" {
 # manager's own sm_pod policy documents) -- scoped instead via the
 # cloudwatch:namespace condition to GoldenGate/Pipelines only. This is not
 # part of the KMS gate above; PutMetricData needs no KMS permission.
+#
+# CLOUDWATCH IS NOT REQUIRED FOR THE CURRENT PHASE. CONFIG.metricsEnabled
+# defaults to false (envs/dev/dynamodb.tf) and gg_monitor_core.py gates
+# every cloudwatch:PutMetricData call behind it -- the monitor starts,
+# becomes Ready, polls, and writes LEASE/STATE with zero use of this
+# statement in the current default configuration. It remains staged (not
+# broadened) for a later, separately validated CloudWatch phase rather than
+# removed and re-added, matching "prefer feature-gating over requiring" for
+# an already-least-privilege-scoped statement.
+#
+# IAM POLICY BOUNDARY (documented, not silently assumed): the
+# PipelineCoordinationDDB statement's Resource is scoped to the exact
+# gg-eks-pipeline table ARN only (never table/*, never account-wide) and
+# grants no dynamodb:DeleteTable/CreateTable/Scan/BatchWriteItem. It CANNOT,
+# however, be further scoped by IAM alone to (a) reject writes to
+# recordType=CONFIG while allowing recordType=LEASE/STATE# in the same
+# table (DynamoDB IAM has no condition key over an item's own attribute
+# VALUES for PutItem/UpdateItem), or (b) restrict to only the two canonical
+# runtime partition keys via dynamodb:LeadingKeys (a real, viable
+# tightening for a future pass, but NOT added here: it cannot be verified
+# against live AWS in this sandbox, and an unverified DynamoDB IAM
+# condition risks silently breaking the already-deployed collector with no
+# way to test the change first). Both boundaries are therefore enforced as
+# a CODE-LEVEL contract only today: gg_monitor_core.py never constructs a
+# CONFIG item, and validate_secret_arn_coverage-style verification exists
+# for secrets but not yet for DynamoDB partitions. This role is granted NO
+# access to gg-alerts or gg-metrics-history (neither table ARN appears
+# anywhere in this policy) -- the monitor does not need write access to
+# either during this phase, and no gg-alerter IAM role is created here.
 module "gg_monitor_dev_role" {
   source = "git::https://github.com/AbuDhabiCommercialBank/aws-tf-module-iam-role.git?ref=v2.0.0"
 

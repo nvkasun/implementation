@@ -522,3 +522,31 @@ def build_runtime_config_json(runtimes):
             "credentialPasswordFile": r["credentialPasswordFile"],
         })
     return out
+
+
+def build_logical_pipelines(repo_root=None):
+    """Logical topology relationships for the portal (section 19): a
+    logical pipeline (e.g. "payments-ora-to-pg-001") is a relationship
+    between canonical GoldenGate runtime deployments, NOT a GoldenGate
+    runtime identity in its own right -- the portal must never present it
+    as if it were one deployment.
+
+    Returns a list of {"pipelineId": str, "roles": {role: canonical_key}},
+    one entry per DISTINCT pipelineId found across every topology document
+    (a pipelineId may appear on more than one document -- e.g. once per
+    process mapping added later -- entries are merged by pipelineId, role
+    dicts combined). Only documents that declare a non-empty pipelineId
+    contribute; a document used purely for connection detail with no
+    pipelineId is not a logical pipeline relationship and is skipped here.
+    """
+    by_id = {}
+    for _path, doc in load_topology_documents(repo_root):
+        pipeline_id = doc.get("pipelineId") or ""
+        if not pipeline_id:
+            continue
+        roles = by_id.setdefault(pipeline_id, {})
+        for role, detail in (doc.get("deployments") or {}).items():
+            if not isinstance(detail, dict) or "deploymentName" not in detail:
+                continue
+            roles[role] = detail["deploymentName"]
+    return [{"pipelineId": pid, "roles": roles} for pid, roles in sorted(by_id.items())]
