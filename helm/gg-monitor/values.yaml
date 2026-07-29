@@ -25,6 +25,17 @@ aws:
 dynamodb:
   tableName: gg-eks-pipeline
 
+# Hard application-level CloudWatch kill switch (correction pass),
+# independent of CONFIG.metricsEnabled -- required because Terraform's
+# lifecycle.ignore_changes on the CONFIG item means an already-applied
+# CONFIG can carry metricsEnabled=true forever; CloudWatch publication
+# requires BOTH this AND CONFIG.metricsEnabled=true (see
+# gg_monitor_core.cloudwatch_enabled_for). Defaults to false and is NOT
+# enabled in any environment values file -- CloudWatch remains out of
+# scope until a separate, later approved phase.
+cloudwatch:
+  publishEnabled: false
+
 # IRSA. Required (see templates/serviceaccount.yaml `required` guard)
 # whenever serviceAccount.create=true -- trust is scoped to exactly
 # system:serviceaccount:goldengate-monitoring-dev:gg-monitor (see

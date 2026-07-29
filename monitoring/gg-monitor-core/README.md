@@ -17,12 +17,24 @@ records -- exactly the record shapes the manager reference implementation's
 per-pod utility-sidecar produces. It also serves a read-only status portal
 (`/`, `/api/status`) over the same records, alongside `/healthz`/`/readyz`.
 
-CloudWatch metric publication under `GoldenGate/Pipelines` is OPTIONAL,
-gated on `CONFIG.metricsEnabled` (defaults **false** this phase -- CloudWatch
-alarms, dashboards, Logs, SNS, Fluent Bit, CloudWatch Agent, and Container
-Insights are all out of scope until a separate, later validated phase). The
-monitor starts, becomes Ready, polls, and writes LEASE/STATE with zero
-CloudWatch IAM permission required in this configuration.
+CloudWatch metric publication under `GoldenGate/Pipelines` is OPTIONAL and
+requires **both** of two independent gates (correction pass -- a hard
+application-level kill switch, `CLOUDWATCH_PUBLISH_ENABLED`, was added on
+top of the existing `CONFIG.metricsEnabled` field): `CLOUDWATCH_PUBLISH_ENABLED`
+(env var on the Deployment, default **`false`**, accepts only
+`true`/`1`/`yes` case-insensitively -- anything else, including missing or
+malformed, is `false`) **and** `CONFIG.metricsEnabled` (defaults **false**
+this phase). See `gg_monitor_core.cloudwatch_enabled_for()`. The env var
+exists specifically because the CONFIG item is Terraform-owned with
+`lifecycle.ignore_changes = [item]` (`envs/dev/dynamodb.tf`) -- an
+already-applied CONFIG item can carry `metricsEnabled=true` forever, and
+`CONFIG.metricsEnabled=true` alone can never turn CloudWatch on while
+`CLOUDWATCH_PUBLISH_ENABLED` stays false. CloudWatch alarms, dashboards,
+Logs, SNS, Fluent Bit, CloudWatch Agent, and Container Insights are all out
+of scope until a separate, later validated phase; `CLOUDWATCH_PUBLISH_ENABLED`
+is not set to `true` in any environment values file. The monitor starts,
+becomes Ready, polls, writes LEASE/STATE, and serves the portal with zero
+CloudWatch IAM permission required, regardless of either gate's value.
 
 This process is passive by construction: it contains no code path that
 starts, restarts, stops, or fences a GoldenGate process, no Kubernetes
@@ -59,12 +71,35 @@ gg-postgresql-payments-01"), which is presented explicitly as a
 relationship between two runtimes, never as if it were a GoldenGate runtime
 identity itself. Read-only (GetItem/Query only, never Scan, never writes);
 any replica can serve accurate portal data regardless of which replica
-currently holds a given runtime's LEASE. Never renders credential file
-paths, Secrets Manager object references, or CloudWatch data; a DynamoDB
-read failure shows a fixed, client-safe message (the real error is logged
-server-side only). This does not replace or modify the separately deployed
-`monitoring/monitor/monitor.py` + `helm/goldengate-monitor` portal, left
-unchanged.
+currently holds a given runtime's LEASE. This does not replace or modify
+the separately deployed `monitoring/monitor/monitor.py` +
+`helm/goldengate-monitor` portal, left unchanged. No Kubernetes `Service`
+or `Ingress` was added for this portal this pass -- it remains reachable
+only via in-cluster access or a future controlled port-forward; external
+URL exposure is a later infrastructure decision, out of scope here.
+
+**Thread safety (correction pass):** `ThreadingHTTPServer` hands each
+request its own thread. The portal never shares one boto3 Table/Resource
+object across those threads -- `_make_handler`/`start_http_server` accept a
+`portal_table_factory` **callable**, not a pre-built object; each request
+that actually needs DynamoDB access (`/` and `/api/status` only --
+`/healthz`/`/readyz` never touch it) calls the factory itself to obtain its
+own, independent Table object, used only within that one request and then
+discarded.
+
+**Error sanitization (correction pass):** raw `STATE#<process>.errorMsg`
+(potentially database hostnames, service URLs, schema names, internal
+paths, secret references, driver/TLS detail) is never exposed to `/api/status`
+or portal HTML. It is replaced with a sanitized triple: `hasError`
+(bool), `statusCode` (a fixed, closed enum -- `NONE`, `POLL_FAILED`,
+`AUTH_FAILED`, `TLS_FAILED`, `ENDPOINT_UNAVAILABLE`, `STALE`,
+`PROCESS_ABENDED`, `UNKNOWN`), and `statusMessage` (a fixed, generic
+message per code). The raw text is still written to DynamoDB by
+`write_process_state` (internal, for a future alerter) -- only the
+portal's own output is sanitized. Never renders credential file paths or
+Secrets Manager object references either; a DynamoDB read failure (at the
+factory level or inside a query) shows the same fixed, client-safe message
+(the real error is logged server-side only, never returned to the caller).
 
 ## Manager reference divergences (see code comments for full detail)
 

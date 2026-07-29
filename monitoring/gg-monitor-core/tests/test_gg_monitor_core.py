@@ -549,13 +549,274 @@ class PortalTests(unittest.TestCase):
     def test_routes_wired_return_expected_content_types(self):
         import inspect
         ready_state = {"gg-oracle-payments-01": True}
-        handler_cls = core._make_handler(ready_state, ["gg-oracle-payments-01"], portal_table=None, portal_runtimes=None)
+        handler_cls = core._make_handler(ready_state, ["gg-oracle-payments-01"], portal_table_factory=None, portal_runtimes=None)
         # Structural: portal routes exist and degrade gracefully (503) when
-        # portal_table is None, rather than crashing the HTTP server.
+        # portal_table_factory is None, rather than crashing the HTTP server.
         src = inspect.getsource(handler_cls)
         self.assertIn('"/api/status"', src)
         self.assertIn('self.path == "/"', src)
         self.assertIn("portal not initialized", src)
+
+
+# ===========================================================================
+# Portal DynamoDB thread safety (correction pass): ThreadingHTTPServer hands
+# each request its own thread -- a single shared boto3 Table/Resource
+# object used across all of them would be a mutable object accessed
+# concurrently from multiple threads. portal_table_factory is a callable,
+# not a pre-built object: each request obtains its OWN Table instance.
+# ===========================================================================
+class PortalThreadSafetyTests(unittest.TestCase):
+    def _runtime(self):
+        return {"pipeline": "gg-oracle-payments-01", "name": "oracle-payments-01",
+               "type": "oracle", "enabled": True}
+
+    def test_handler_uses_a_factory_not_a_prebuilt_object(self):
+        """_make_handler's portal parameter must be a CALLABLE (factory),
+        never accept a pre-built Table object directly -- proves the API
+        shape itself forces per-request construction."""
+        import inspect
+        sig = inspect.signature(core._make_handler)
+        self.assertIn("portal_table_factory", sig.parameters)
+        self.assertNotIn("portal_table", sig.parameters)
+
+    def test_factory_is_called_fresh_for_each_of_several_sequential_requests(self):
+        """Simulates several sequential (representative of concurrent, since
+        ThreadingHTTPServer just runs do_GET once per request/thread)
+        requests -- the factory must be invoked once per request, each
+        time returning a genuinely independent object, never memoized or
+        reused across requests."""
+        created = []
+
+        def factory():
+            t = MagicMock(name=f"table-{len(created)}")
+            t.get_item.return_value = {}
+            t.query.return_value = {"Items": []}
+            created.append(t)
+            return t
+
+        ready_state = {"gg-oracle-payments-01": True}
+        handler_cls = core._make_handler(ready_state, ["gg-oracle-payments-01"], factory, [self._runtime()])
+        handler = handler_cls.__new__(handler_cls)  # bypass BaseHTTPRequestHandler.__init__ (no real socket)
+
+        for _ in range(3):
+            status, error = handler._portal_status()
+            self.assertIsNone(error)
+
+        self.assertEqual(len(created), 3, "the factory must be called once per request")
+        self.assertEqual(len(set(id(t) for t in created)), 3, "each request must get a distinct table object")
+
+    def test_no_shared_mutable_table_object_across_handler_instances(self):
+        """Two independently-constructed Handler classes from the SAME
+        factory must never be handed the identical pre-resolved object --
+        there must be no closed-over Table instance at all, only the
+        factory callable itself."""
+        import inspect
+        src = inspect.getsource(core._make_handler)
+        self.assertNotIn("portal_table =", src.replace("portal_table_factory", ""))
+
+    def test_factory_failure_returns_safe_response_not_raw_exception(self):
+        def failing_factory():
+            raise RuntimeError("AccessDeniedException: arn:aws:iam::668311715351:role/x is not authorized")
+
+        ready_state = {"gg-oracle-payments-01": True}
+        handler_cls = core._make_handler(ready_state, ["gg-oracle-payments-01"], failing_factory, [self._runtime()])
+        handler = handler_cls.__new__(handler_cls)
+        status, error = handler._portal_status()
+        self.assertIsNone(status)
+        self.assertEqual(error, core.PORTAL_CLIENT_SAFE_ERROR)
+        self.assertNotIn("AccessDenied", error)
+        self.assertNotIn("arn:aws:iam", error)
+
+    def test_dynamodb_read_failure_inside_collect_status_also_stays_safe(self):
+        """Complements the factory-level failure test: a factory that
+        succeeds but whose resulting table object fails on GetItem/Query
+        must still produce a safe, 200-with-per-runtime-error response
+        (collect_portal_status's own existing per-runtime handling), not
+        raise up through _portal_status."""
+        def factory():
+            t = MagicMock()
+            t.get_item.side_effect = RuntimeError("AccessDeniedException: secret internal detail")
+            t.query.side_effect = RuntimeError("AccessDeniedException: secret internal detail")
+            return t
+
+        ready_state = {"gg-oracle-payments-01": True}
+        handler_cls = core._make_handler(ready_state, ["gg-oracle-payments-01"], factory, [self._runtime()])
+        handler = handler_cls.__new__(handler_cls)
+        status, error = handler._portal_status()
+        self.assertIsNone(error)
+        self.assertEqual(status["runtimes"][0]["error"], core.PORTAL_CLIENT_SAFE_ERROR)
+        rendered = json.dumps(status, default=str)
+        self.assertNotIn("AccessDenied", rendered)
+        self.assertNotIn("secret internal detail", rendered)
+
+    def test_avoids_dynamodb_connection_for_routes_that_do_not_need_it(self):
+        """/healthz and /readyz must never invoke the portal table factory
+        at all."""
+        import inspect
+        src = inspect.getsource(core._make_handler)
+        healthz_block = src[src.index('"/healthz"'):src.index('"/readyz"')]
+        readyz_block = src[src.index('"/readyz"'):src.index('"/api/status"')]
+        for block in (healthz_block, readyz_block):
+            self.assertNotIn("portal_table_factory()", block)
+
+    def test_collectors_lease_writer_unaffected_by_portal_factory_change(self):
+        """run_pipeline (the collector's own supervisor) still creates its
+        OWN dedicated lease/health Table objects, entirely independent of
+        the portal's factory mechanism -- proves this fix did not touch
+        writer-path table construction."""
+        import inspect
+        src = inspect.getsource(core.run_pipeline)
+        self.assertIn("lease_table = boto3.resource", src)
+        self.assertIn("health_table = boto3.resource", src)
+        self.assertNotIn("portal_table_factory", src)
+
+    @mock_aws
+    def test_lease_acquisition_still_works_end_to_end_after_portal_fix(self):
+        """Sanity: the collector's LEASE contract (acquire/renew semantics)
+        is completely unaffected by the portal thread-safety change."""
+        client = boto3.client("dynamodb", region_name="eu-west-1")
+        client.create_table(
+            TableName="gg-eks-pipeline",
+            KeySchema=[{"AttributeName": "pipeline", "KeyType": "HASH"},
+                      {"AttributeName": "recordType", "KeyType": "RANGE"}],
+            AttributeDefinitions=[{"AttributeName": "pipeline", "AttributeType": "S"},
+                                  {"AttributeName": "recordType", "AttributeType": "S"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        table = boto3.resource("dynamodb", region_name="eu-west-1").Table("gg-eks-pipeline")
+        mgr = core.LeaseManager(table, "gg-oracle-payments-01", "gg-monitor-0", ttl=30)
+        self.assertTrue(mgr.acquire())
+        self.assertTrue(mgr.renew())
+
+
+# ===========================================================================
+# Portal error sanitization (correction pass): raw STATE#<process>.errorMsg
+# (potentially hostnames/URLs/schema names/internal paths/secret
+# references) must never reach /api/status, portal HTML, health, or
+# readiness responses -- only hasError/statusCode/statusMessage (a fixed,
+# closed enum + generic message).
+# ===========================================================================
+class PortalErrorSanitizationTests(unittest.TestCase):
+    SENSITIVE_STRINGS = (
+        "password=super-secret-test-value",
+        "db-internal.example.local",
+        "arn:aws:secretsmanager:test",
+        "Authorization: Basic abc123",
+    )
+
+    def _table(self):
+        client = boto3.client("dynamodb", region_name="eu-west-1")
+        client.create_table(
+            TableName="gg-eks-pipeline",
+            KeySchema=[{"AttributeName": "pipeline", "KeyType": "HASH"},
+                      {"AttributeName": "recordType", "KeyType": "RANGE"}],
+            AttributeDefinitions=[{"AttributeName": "pipeline", "AttributeType": "S"},
+                                  {"AttributeName": "recordType", "AttributeType": "S"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        return boto3.resource("dynamodb", region_name="eu-west-1").Table("gg-eks-pipeline")
+
+    def _seed_with_sensitive_error(self, table, now):
+        # All synthetic sensitive strings embedded into ONE combined
+        # errorMsg, not one row per string -- proves none of them leak
+        # regardless of position/combination.
+        combined_error = " | ".join(self.SENSITIVE_STRINGS)
+        table.put_item(Item={"pipeline": "gg-oracle-payments-01", "recordType": "STATE#_deployment",
+                             "status": "UP", "recordedAt": now, "deploymentType": "oracle"})
+        table.put_item(Item={"pipeline": "gg-oracle-payments-01", "recordType": "LEASE",
+                             "holder": "gg-monitor-0", "expiresAt": now + 30, "ttl": now + 90, "leaseToken": "tok"})
+        table.put_item(Item={"pipeline": "gg-oracle-payments-01", "recordType": "STATE#EXTORA1",
+                             "status": "ABENDED", "processType": "extract", "recordedAt": now,
+                             "errorMsg": combined_error, "resolvedThreshold": 300, "resolvedMode": "alert"})
+
+    @mock_aws
+    def test_sensitive_strings_absent_from_api_status_json(self):
+        table = self._table()
+        now = 100000
+        self._seed_with_sensitive_error(table, now)
+        runtime = {"pipeline": "gg-oracle-payments-01", "name": "oracle-payments-01", "type": "oracle", "enabled": True}
+        status = core.collect_portal_status(table, [runtime], now=now)
+        rendered = json.dumps(status, default=str)
+        for sensitive in self.SENSITIVE_STRINGS:
+            self.assertNotIn(sensitive, rendered, f"{sensitive!r} leaked into /api/status JSON")
+
+    @mock_aws
+    def test_sensitive_strings_absent_from_portal_html(self):
+        table = self._table()
+        now = 100000
+        self._seed_with_sensitive_error(table, now)
+        runtime = {"pipeline": "gg-oracle-payments-01", "name": "oracle-payments-01", "type": "oracle", "enabled": True}
+        status = core.collect_portal_status(table, [runtime], now=now)
+        rendered = core.render_portal_html(status)
+        for sensitive in self.SENSITIVE_STRINGS:
+            self.assertNotIn(sensitive, rendered, f"{sensitive!r} leaked into portal HTML")
+
+    def test_sensitive_strings_absent_from_health_response(self):
+        body = json.dumps({"status": "ok"})
+        for sensitive in self.SENSITIVE_STRINGS:
+            self.assertNotIn(sensitive, body)
+
+    def test_sensitive_strings_absent_from_readiness_response(self):
+        body = json.dumps({"status": "not_ready"})
+        for sensitive in self.SENSITIVE_STRINGS:
+            self.assertNotIn(sensitive, body)
+
+    def test_raw_error_msg_field_name_absent_from_process_output(self):
+        """The public process dict must not carry an 'errorMsg' key at all
+        -- only the sanitized triple."""
+        table = MagicMock()
+        table.get_item.return_value = {}
+        table.query.return_value = {"Items": [{
+            "recordType": "STATE#EXTORA1", "status": "ABENDED", "processType": "extract",
+            "recordedAt": 1000, "errorMsg": "db-internal.example.local password=x",
+        }]}
+        runtime = {"pipeline": "gg-oracle-payments-01", "name": "oracle-payments-01", "type": "oracle", "enabled": True}
+        status = core.collect_portal_status(table, [runtime], now=1000)
+        proc = status["runtimes"][0]["processes"][0]
+        self.assertNotIn("errorMsg", proc)
+        self.assertIn("hasError", proc)
+        self.assertIn("statusCode", proc)
+        self.assertIn("statusMessage", proc)
+
+    def test_status_code_is_from_the_closed_enum(self):
+        allowed = {"NONE", "POLL_FAILED", "AUTH_FAILED", "TLS_FAILED",
+                  "ENDPOINT_UNAVAILABLE", "STALE", "PROCESS_ABENDED", "UNKNOWN"}
+        for status, error_msg, stale in (
+            ("RUNNING", "", False),
+            ("RUNNING", "connection timeout to db-internal.example.local", False),
+            ("RUNNING", "401 Unauthorized: Authorization: Basic abc123", False),
+            ("RUNNING", "SSL handshake failed, certificate invalid", False),
+            ("ABENDED", "", False),
+            ("RUNNING", "", True),
+            ("RUNNING", "something unclassifiable happened", False),
+        ):
+            code = core._classify_process_status_code(status, error_msg, stale)
+            self.assertIn(code, allowed)
+
+    def test_classification_never_returns_the_raw_text(self):
+        for sensitive in self.SENSITIVE_STRINGS:
+            code = core._classify_process_status_code("ABENDED", sensitive, False)
+            message = core._STATUS_CODE_MESSAGES[code]
+            self.assertNotIn(sensitive, code)
+            self.assertNotIn(sensitive, message)
+
+    def test_has_error_false_when_no_error_and_not_stale_and_not_abended(self):
+        has_error, code, _ = core._sanitized_process_error("RUNNING", "", False)
+        self.assertFalse(has_error)
+        self.assertEqual(code, "NONE")
+
+    def test_has_error_true_when_abended(self):
+        has_error, code, _ = core._sanitized_process_error("ABENDED", "", False)
+        self.assertTrue(has_error)
+        self.assertEqual(code, "PROCESS_ABENDED")
+
+    def test_internal_dynamodb_write_path_still_stores_raw_errormsg(self):
+        """Sanitization is a PORTAL-output-only concern -- the internal
+        STATE#<process> write path (write_process_state) must be
+        unaffected, since a future alerter needs the real diagnostic."""
+        import inspect
+        src = inspect.getsource(core.write_process_state)
+        self.assertIn("errorMsg", src)
 
 
 class MetricDimensionTests(unittest.TestCase):
@@ -773,8 +1034,8 @@ class CloudWatchOptionalTests(unittest.TestCase):
         self.assertEqual(len(call_sites), 2, "expected exactly 2 _cloudwatch_client() call sites in polling_loop")
         for i in call_sites:
             preceding = "\n".join(lines[max(0, i - 2):i])
-            self.assertIn('if cfg["metricsEnabled"]:', preceding,
-                         f"_cloudwatch_client() call at line {i} is not immediately gated by metricsEnabled")
+            self.assertIn("if cloudwatch_enabled_for(cfg):", preceding,
+                         f"_cloudwatch_client() call at line {i} is not immediately gated by cloudwatch_enabled_for(cfg)")
 
     def test_default_config_has_cloudwatch_disabled(self):
         cfg = gh.resolve_config({})
@@ -800,6 +1061,115 @@ class CloudWatchOptionalTests(unittest.TestCase):
         polling_src = inspect.getsource(core.polling_loop)
         self.assertEqual(polling_src.count("_emit(_cloudwatch_client()"), 2,
                          "both _emit(...) call sites must live inside polling_loop, not scattered elsewhere")
+
+
+# ===========================================================================
+# Hard CloudWatch kill switch (correction pass): CLOUDWATCH_PUBLISH_ENABLED
+# is a SEPARATE, application-level env var gate, independent of
+# CONFIG.metricsEnabled -- required because Terraform's
+# lifecycle.ignore_changes on the CONFIG item means an already-applied
+# CONFIG can carry metricsEnabled=true forever. Effective rule:
+# cloudwatch_enabled_for(cfg) = CLOUDWATCH_PUBLISH_ENABLED AND
+# cfg["metricsEnabled"]. Never calls real AWS.
+# ===========================================================================
+class CloudWatchKillSwitchTests(unittest.TestCase):
+    def setUp(self):
+        self._old_env_gate = core.CLOUDWATCH_PUBLISH_ENABLED
+        self._old_cw_client = core._CW_CLIENT
+
+    def tearDown(self):
+        core.CLOUDWATCH_PUBLISH_ENABLED = self._old_env_gate
+        core._CW_CLIENT = self._old_cw_client
+
+    def test_env_false_config_true_yields_disabled(self):
+        core.CLOUDWATCH_PUBLISH_ENABLED = False
+        self.assertFalse(core.cloudwatch_enabled_for({"metricsEnabled": True}))
+
+    def test_env_true_config_false_yields_disabled(self):
+        core.CLOUDWATCH_PUBLISH_ENABLED = True
+        self.assertFalse(core.cloudwatch_enabled_for({"metricsEnabled": False}))
+
+    def test_env_false_config_false_yields_disabled(self):
+        core.CLOUDWATCH_PUBLISH_ENABLED = False
+        self.assertFalse(core.cloudwatch_enabled_for({"metricsEnabled": False}))
+
+    def test_env_true_config_true_yields_enabled(self):
+        core.CLOUDWATCH_PUBLISH_ENABLED = True
+        self.assertTrue(core.cloudwatch_enabled_for({"metricsEnabled": True}))
+
+    def test_missing_environment_variable_defaults_disabled(self):
+        # Simulates os.environ.get("CLOUDWATCH_PUBLISH_ENABLED") when the
+        # variable is entirely unset (returns None).
+        self.assertFalse(core._parse_strict_bool_env(None))
+
+    def test_malformed_environment_values_default_disabled(self):
+        for bad in ("", "banana", "TRUE!", "2", "enabled", "on", "false ", "no", "null", "None"):
+            self.assertFalse(core._parse_strict_bool_env(bad), f"{bad!r} must not parse as true")
+
+    def test_only_explicit_true_values_accepted_case_insensitively(self):
+        for good in ("true", "True", "TRUE", "1", "yes", "YES", "Yes", "  true  ", "  YES  "):
+            self.assertTrue(core._parse_strict_bool_env(good), f"{good!r} must parse as true")
+
+    def test_no_boto3_cloudwatch_client_constructed_when_disabled(self):
+        """Dynamic proof (not just source inspection): with the effective
+        gate false, _cloudwatch_client() (and therefore boto3.client(
+        'cloudwatch', ...)) must never actually be invoked."""
+        core._CW_CLIENT = None
+        core.CLOUDWATCH_PUBLISH_ENABLED = False
+        with mock.patch("boto3.client") as mock_client:
+            cfg = {"metricsEnabled": True}
+            if core.cloudwatch_enabled_for(cfg):
+                core._cloudwatch_client()
+            mock_client.assert_not_called()
+
+    def test_boto3_cloudwatch_client_path_may_execute_when_both_enabled(self):
+        core._CW_CLIENT = None
+        core.CLOUDWATCH_PUBLISH_ENABLED = True
+        with mock.patch("boto3.client") as mock_client:
+            mock_client.return_value = MagicMock()
+            cfg = {"metricsEnabled": True}
+            if core.cloudwatch_enabled_for(cfg):
+                core._cloudwatch_client()
+            mock_client.assert_called_once_with("cloudwatch", region_name=core.AWS_REGION)
+
+    def test_readiness_does_not_require_cloudwatch(self):
+        """check_static_prerequisites (the sole readiness gate) never
+        references CloudWatch or the new env var -- readiness is achievable
+        with CLOUDWATCH_PUBLISH_ENABLED unset/false and no cloudwatch:* IAM
+        permission at all."""
+        import inspect
+        src = inspect.getsource(core.check_static_prerequisites).lower()
+        self.assertNotIn("cloudwatch", src)
+        self.assertNotIn("cloudwatch_publish_enabled", src)
+
+    def test_portal_operation_does_not_require_cloudwatch(self):
+        """The portal's own collection/rendering path has no CloudWatch
+        reference and works normally regardless of the kill switch."""
+        core.CLOUDWATCH_PUBLISH_ENABLED = False
+        table = MagicMock()
+        table.get_item.return_value = {}
+        table.query.return_value = {"Items": []}
+        runtime = {"pipeline": "gg-oracle-payments-01", "name": "oracle-payments-01",
+                  "type": "oracle", "enabled": True}
+        status = core.collect_portal_status(table, [runtime], now=1000)
+        self.assertIsNone(status["runtimes"][0]["error"])
+        import inspect
+        src = inspect.getsource(core.collect_portal_status)
+        # This function's own docstring legitimately says "no cloudwatch
+        # data anywhere in the result" -- strip it (same split('"""')
+        # idiom used elsewhere in this file) so this checks the executable
+        # body only, not that explanatory prose.
+        body = src.split('"""', 2)[-1] if src.count('"""') >= 2 else src
+        self.assertNotIn("cloudwatch", body.lower())
+
+    def test_startup_never_fails_due_to_cloudwatch_kill_switch_state(self):
+        """No code path in main()/run_pipeline raises or exits based on
+        CLOUDWATCH_PUBLISH_ENABLED -- the monitor must start identically
+        whether it is true or false."""
+        import inspect
+        main_src = inspect.getsource(core.main).lower()
+        self.assertNotIn("cloudwatch_publish_enabled", main_src)
+        self.assertNotIn("cloudwatch", main_src)
 
 
 # ===========================================================================

@@ -97,6 +97,42 @@ CA_FILE = os.environ.get("CA_FILE", "/mnt/secrets-store/ca-chain-pem")
 CLOUDWATCH_NAMESPACE = "GoldenGate/Pipelines"
 
 
+def _parse_strict_bool_env(raw):
+    """Accepts only a small, explicit set of case-insensitive true values
+    (true/1/yes); everything else -- missing, empty, malformed, or any
+    other string -- is False. No exception path: this must never be able
+    to crash startup over a typo in an environment variable."""
+    if raw is None:
+        return False
+    return str(raw).strip().lower() in ("true", "1", "yes")
+
+
+# Hard application-level CloudWatch kill switch, independent of
+# CONFIG.metricsEnabled (correction pass). CONFIG is Terraform-owned and
+# protected by lifecycle.ignore_changes -- an already-applied CONFIG item
+# can carry metricsEnabled=true that Terraform will never overwrite on a
+# later apply. CLOUDWATCH_PUBLISH_ENABLED is a SEPARATE, code-level gate
+# that CONFIG cannot override: publishing requires BOTH this environment
+# variable AND CONFIG.metricsEnabled to be true (see the AND in
+# polling_loop below) -- either one alone is not sufficient. Defaults to
+# disabled, matching the current CloudWatch-freeze deployment stage;
+# nothing about startup, readiness, or the DynamoDB collector/portal
+# depends on this value.
+CLOUDWATCH_PUBLISH_ENABLED = _parse_strict_bool_env(os.environ.get("CLOUDWATCH_PUBLISH_ENABLED"))
+
+
+def cloudwatch_enabled_for(cfg):
+    """Effective CloudWatch enablement: application_environment_gate AND
+    config_metrics_enabled. Both must be true; if either is absent, false,
+    invalid, or unreadable, this returns False. `cfg` is expected to be the
+    dict returned by gg_health_rules.resolve_config(), whose own
+    metricsEnabled coercion (_to_bool) already degrades any non-boolean
+    CONFIG value to its own default (False) -- so a malformed CONFIG item
+    can never accidentally evaluate to True here either."""
+    config_metrics_enabled = bool(cfg.get("metricsEnabled", False))
+    return CLOUDWATCH_PUBLISH_ENABLED and config_metrics_enabled
+
+
 def now_epoch():
     return int(time.time())
 
@@ -447,13 +483,20 @@ def _emit(cw, deployment, deployment_type, flags, extra_md=None):
     """Publish per-deployment aggregate flags + raw per-process metrics.
 
     CloudWatch is OPTIONAL and DISABLED by default this phase: every call
-    site in polling_loop gates this function behind cfg["metricsEnabled"]
-    (CONFIG-driven, defaults False -- see gg_health_rules.DEFAULTS) and only
-    constructs a CloudWatch client at all when enabled. This function itself
-    still tolerates cw=None defensively (see `if cw and md` below), but that
-    is a second layer, not the primary gate -- the primary gate is that
-    _cloudwatch_client() is never even called when metrics are disabled, so
-    this component has no CloudWatch dependency (network, permission, or
+    site in polling_loop gates this function behind
+    cloudwatch_enabled_for(cfg) -- BOTH CLOUDWATCH_PUBLISH_ENABLED (hard
+    application-level env var kill switch, defaults False) AND
+    CONFIG.metricsEnabled (CONFIG-driven, defaults False -- see
+    gg_health_rules.DEFAULTS) must be true, and only then is a CloudWatch
+    client constructed at all. The env var exists specifically because
+    Terraform's lifecycle.ignore_changes on the CONFIG item means an
+    already-applied CONFIG can carry metricsEnabled=true that Terraform
+    will never correct -- CONFIG alone can no longer turn CloudWatch on.
+    This function itself still tolerates cw=None defensively (see
+    `if cw and md` below), but that is a second layer, not the primary gate
+    -- the primary gate is that _cloudwatch_client() is never even called
+    when either condition is false, so this component has no CloudWatch
+    dependency (network, permission, or
     otherwise) in its current default deployment stage.
 
     Deliberately EXCLUDES HeartbeatAgeSeconds: that metric is derived from a
@@ -716,7 +759,7 @@ def polling_loop(runtime, table, mgr, state, stop_event, full_process_pipeline_m
                 _guarded_write("_deployment", dep_snap)
                 last_dep_status = status
                 logger.warning("GoldenGate Admin REST unreachable for %s (%s): %s", pipeline, status, e)
-                if cfg["metricsEnabled"]:
+                if cloudwatch_enabled_for(cfg):
                     _emit(_cloudwatch_client(), pipeline, deployment_type, flags)
                 _sleep_watching_leadership(interval)
                 continue
@@ -791,7 +834,7 @@ def polling_loop(runtime, table, mgr, state, stop_event, full_process_pipeline_m
             _guarded_write("_deployment", dep_snap)
             last_dep_status = "UP"
 
-            if cfg["metricsEnabled"]:
+            if cloudwatch_enabled_for(cfg):
                 extra_md += build_metric_data(pipeline, deployment_type, procs)
                 _emit(_cloudwatch_client(), pipeline, deployment_type, flags, extra_md)
 
@@ -893,7 +936,15 @@ def run_pipeline(runtime, stop_event, ready_state, full_process_pipeline_map=Non
 # references, CloudWatch charts, or raw AWS/botocore exception text (a
 # fixed, client-safe message is shown instead; the real error is logged
 # server-side only -- same pattern as monitor.py's
-# CLIENT_SAFE_DYNAMODB_ERROR_MESSAGE).
+# CLIENT_SAFE_DYNAMODB_ERROR_MESSAGE). Also never renders raw
+# STATE#<process>.errorMsg (correction pass): that field's raw text is
+# whatever the GoldenGate Admin REST client last saw -- potentially
+# hostnames, service URLs, database/schema names, internal paths, secret
+# references, driver/TLS detail -- and is replaced in the portal's output
+# with a closed-enum statusCode + fixed statusMessage (see
+# _classify_process_status_code / _sanitized_process_error below). The raw
+# text remains in DynamoDB (write_process_state, internal, for a future
+# alerter) -- only the PORTAL's own output is sanitized.
 # ---------------------------------------------------------------------
 PORTAL_STALE_SECONDS = 180  # 3x default checkIntervalSeconds (60s)
 PORTAL_CLIENT_SAFE_ERROR = "Monitoring data is temporarily unavailable."
@@ -912,6 +963,61 @@ def _age_seconds(recorded_at, now):
 def _is_stale(recorded_at, now, threshold=PORTAL_STALE_SECONDS):
     age = _age_seconds(recorded_at, now)
     return age is None or age > threshold
+
+
+# ---------------------------------------------------------------------
+# Portal error sanitization (correction pass). STATE#<process>.errorMsg is
+# the RAW text of whatever the GoldenGate Admin REST client last saw --
+# potentially database hostnames, service URLs, database/schema names,
+# internal paths, secret references, driver/TLS detail. That raw text is
+# fine to WRITE to DynamoDB (write_process_state, internal, for a future
+# alerter to read) but must NEVER reach an /api/status or HTML client --
+# only a fixed statusCode from this small, closed enum plus a fixed,
+# generic statusMessage. The classification reads the raw text privately,
+# server-side, only to pick a bucket; the raw text itself is never part of
+# the output.
+# ---------------------------------------------------------------------
+_STATUS_CODE_MESSAGES = {
+    "NONE": "No error.",
+    "POLL_FAILED": "The last poll of this process reported an error.",
+    "AUTH_FAILED": "Authentication to the GoldenGate Admin REST API failed.",
+    "TLS_FAILED": "A TLS/certificate error occurred while contacting the GoldenGate Admin REST API.",
+    "ENDPOINT_UNAVAILABLE": "The GoldenGate Admin REST API was unreachable.",
+    "STALE": "Monitoring data for this process is stale.",
+    "PROCESS_ABENDED": "This process has abended.",
+    "UNKNOWN": "An unspecified error occurred.",
+}
+
+
+def _classify_process_status_code(status, error_msg, stale):
+    """Maps (status, raw error text, staleness) to one fixed, closed
+    statusCode -- never the raw text itself. Staleness is checked first: an
+    operator's most important caveat is "this data may not reflect current
+    reality," which can be true regardless of what the last recorded error
+    (if any) happened to be."""
+    if stale:
+        return "STALE"
+    if status == "ABENDED":
+        return "PROCESS_ABENDED"
+    if not error_msg:
+        return "NONE"
+    lowered = str(error_msg).lower()
+    if any(k in lowered for k in ("unauthorized", "401", "403", "forbidden", "auth")):
+        return "AUTH_FAILED"
+    if any(k in lowered for k in ("ssl", "tls", "certificate", "handshake")):
+        return "TLS_FAILED"
+    if any(k in lowered for k in ("timeout", "timed out", "refused", "unreachable", "no route", "connection")):
+        return "ENDPOINT_UNAVAILABLE"
+    return "POLL_FAILED"
+
+
+def _sanitized_process_error(status, error_msg, stale):
+    """Returns (hasError, statusCode, statusMessage) -- the only
+    error-related fields the portal is permitted to expose. error_msg
+    itself is read here and nowhere else in the return value."""
+    code = _classify_process_status_code(status, error_msg, stale)
+    has_error = code not in ("NONE",)
+    return has_error, code, _STATUS_CODE_MESSAGES[code]
 
 
 def collect_portal_status(table, runtimes, now=None):
@@ -970,19 +1076,29 @@ def collect_portal_status(table, runtimes, now=None):
             }
         for row in sorted(proc_rows, key=lambda r: r["recordType"]):
             recorded_at = row.get("recordedAt")
+            proc_status = str(row.get("status", "UNKNOWN"))
+            proc_stale = _is_stale(recorded_at, now)
+            has_error, status_code, status_message = _sanitized_process_error(
+                proc_status, row.get("errorMsg", ""), proc_stale)
             entry["processes"].append({
                 "process": row["recordType"].split("#", 1)[1],
                 "processType": str(row.get("processType", "?")),
-                "status": str(row.get("status", "UNKNOWN")),
+                "status": proc_status,
                 "lagSeconds": row.get("lagSeconds"),
                 "resolvedThreshold": row.get("resolvedThreshold"),
                 "resolvedMode": row.get("resolvedMode"),
                 "pipelineName": row.get("pipelineName", ""),
                 "recordedAt": recorded_at,
                 "ageSeconds": _age_seconds(recorded_at, now),
-                "stale": _is_stale(recorded_at, now),
+                "stale": proc_stale,
                 "consecutiveAbends": row.get("consecutiveAbends", 0),
-                "errorMsg": str(row.get("errorMsg", "")),
+                # Sanitized (correction pass): the raw DynamoDB errorMsg
+                # (potentially hostnames/URLs/schema names/internal paths/
+                # secret references) is NEVER included here -- only a fixed
+                # statusCode from a closed enum and a fixed generic message.
+                "hasError": has_error,
+                "statusCode": status_code,
+                "statusMessage": status_message,
             })
         out_runtimes.append(entry)
     return {
@@ -1054,13 +1170,18 @@ def render_portal_html(status):
                 cls = ' class="stale"' if p["stale"] else ""
                 stale_pfx = "[STALE] " if p["stale"] else ""
                 lag = p["lagSeconds"] if p["lagSeconds"] is not None else "?"
+                # Sanitized fields only (statusCode/statusMessage) -- never
+                # the raw DynamoDB errorMsg, which is not part of this dict
+                # at all (see collect_portal_status / _sanitized_process_error).
+                error_cell = esc(p["statusMessage"]) if p["hasError"] else ""
                 rows += (f"<tr{cls}><td>{esc(stale_pfx + p['process'])}</td><td>{esc(p['processType'])}</td>"
                         f'<td><span class="status {esc(p["status"])}">{esc(p["status"])}</span></td>'
                         f"<td>{esc(str(lag))}s (thr {esc(str(p['resolvedThreshold']))}, {esc(str(p['resolvedMode']))})</td>"
                         f"<td>{esc(str(p['ageSeconds']))}s ago</td>"
-                        f"<td>{esc(str(p['consecutiveAbends']))}</td></tr>")
+                        f"<td>{esc(str(p['consecutiveAbends']))}</td>"
+                        f"<td>{error_cell}</td></tr>")
             sec += ("<table><tr><th>Process</th><th>Type</th><th>Status</th>"
-                    "<th>Lag / Threshold (mode)</th><th>Recorded</th><th>Abends</th></tr>"
+                    "<th>Lag / Threshold (mode)</th><th>Recorded</th><th>Abends</th><th>Error</th></tr>"
                     + rows + "</table>")
         else:
             sec += "<p><em>No process STATE records (topology has no configured processes).</em></p>"
@@ -1074,12 +1195,21 @@ def render_portal_html(status):
 
 # ---------------------------------------------------------------------
 # HTTP endpoints: k8s health/readiness probes + the shared monitoring
-# portal (/ and /api/status). portal_table is a SEPARATE, read-only boto3
-# Table resource from the per-pipeline lease/health Table objects the
-# collector loops own -- portal requests run on the HTTP server's own
-# thread(s), never sharing a Table object with a writer thread.
+# portal (/ and /api/status).
+#
+# Thread safety (correction pass): ThreadingHTTPServer hands each request
+# its own thread, so a single shared boto3 Table/Resource object used
+# across all of them would be a mutable object accessed concurrently from
+# multiple threads -- the same class of hazard already avoided for the
+# collector's own lease/health Table objects (see run_pipeline). The fix:
+# portal_table_factory is a zero-argument CALLABLE, not a pre-built Table
+# object -- each request that actually needs DynamoDB access (/ and
+# /api/status only; /healthz and /readyz never touch it) calls the factory
+# itself to obtain its OWN, independent Table object, used only within
+# that single request/thread and then discarded. No mutable resource is
+# ever shared across threads.
 # ---------------------------------------------------------------------
-def _make_handler(ready_state, expected_pipelines, portal_table=None, portal_runtimes=None):
+def _make_handler(ready_state, expected_pipelines, portal_table_factory=None, portal_runtimes=None):
     class Handler(BaseHTTPRequestHandler):
         server_version = "gg-monitor-core"
 
@@ -1091,6 +1221,21 @@ def _make_handler(ready_state, expected_pipelines, portal_table=None, portal_run
             self.end_headers()
             self.wfile.write(body_bytes)
 
+        def _portal_status(self):
+            """Obtains a Table object FRESH from the factory for this
+            request only (never shared across threads/requests), and
+            tolerates the factory call itself failing (e.g. a transient
+            boto3/client construction error) the same client-safe way
+            collect_portal_status already tolerates a DynamoDB read
+            failure -- never an unhandled exception, never raw AWS
+            exception text reaching the caller."""
+            try:
+                table = portal_table_factory()
+                return collect_portal_status(table, portal_runtimes or []), None
+            except Exception as e:
+                logger.warning("portal: could not obtain a DynamoDB table for this request: %s", e)
+                return None, PORTAL_CLIENT_SAFE_ERROR
+
         def do_GET(self):  # noqa: N802
             if self.path == "/healthz":
                 self._write(200, json.dumps({"status": "ok"}))
@@ -1098,16 +1243,22 @@ def _make_handler(ready_state, expected_pipelines, portal_table=None, portal_run
                 ready = all(ready_state.get(p) for p in expected_pipelines)
                 self._write(200 if ready else 503, json.dumps({"status": "ready" if ready else "not_ready"}))
             elif self.path == "/api/status":
-                if portal_table is None:
+                if portal_table_factory is None:
                     self._write(503, json.dumps({"error": "portal not initialized"}))
                     return
-                status = collect_portal_status(portal_table, portal_runtimes or [])
+                status, error = self._portal_status()
+                if error:
+                    self._write(503, json.dumps({"error": error}))
+                    return
                 self._write(200, json.dumps(status, default=str))
             elif self.path == "/":
-                if portal_table is None:
+                if portal_table_factory is None:
                     self._write(503, "portal not initialized", content_type="text/plain")
                     return
-                status = collect_portal_status(portal_table, portal_runtimes or [])
+                status, error = self._portal_status()
+                if error:
+                    self._write(503, error, content_type="text/plain")
+                    return
                 self._write(200, render_portal_html(status), content_type="text/html")
             else:
                 self._write(404, json.dumps({"error": "not found"}))
@@ -1118,8 +1269,8 @@ def _make_handler(ready_state, expected_pipelines, portal_table=None, portal_run
     return Handler
 
 
-def start_http_server(ready_state, expected_pipelines, portal_table=None, portal_runtimes=None):
-    handler_cls = _make_handler(ready_state, expected_pipelines, portal_table, portal_runtimes)
+def start_http_server(ready_state, expected_pipelines, portal_table_factory=None, portal_runtimes=None):
+    handler_cls = _make_handler(ready_state, expected_pipelines, portal_table_factory, portal_runtimes)
     server = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), handler_cls)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -1155,12 +1306,15 @@ def main():
     stop_event = threading.Event()
     ready_state = {}
 
-    # Dedicated, read-only Table for the portal -- never shared with a
-    # collector loop's own lease/health Table objects (boto3 Table objects
-    # are not safe for concurrent use across threads; the portal serves its
-    # own HTTP request threads).
-    portal_table = boto3.resource("dynamodb", region_name=AWS_REGION).Table(DDB_TABLE)
-    server = start_http_server(ready_state, [r["pipeline"] for r in enabled], portal_table, runtimes)
+    # Factory, not a pre-built Table (correction pass): each portal request
+    # thread calls this itself to get its OWN independent Table object --
+    # never a single shared boto3 Resource/Table object read concurrently
+    # across ThreadingHTTPServer's per-request threads, and never shared
+    # with a collector loop's own lease/health Table objects either.
+    def _new_portal_table():
+        return boto3.resource("dynamodb", region_name=AWS_REGION).Table(DDB_TABLE)
+
+    server = start_http_server(ready_state, [r["pipeline"] for r in enabled], _new_portal_table, runtimes)
 
     threads = []
     for runtime in enabled:

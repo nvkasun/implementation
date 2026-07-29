@@ -183,6 +183,35 @@ module "gg_postgresql_dev_runtime_role" {
 #   4. Do not apply this Terraform module against real AWS until step 2 or 3
 #      has been completed for all 4 resources.
 #
+# =====================================================================
+# KMS OPERATOR VERIFICATION REQUIREMENT (correction pass -- restates the
+# above as an explicit pre-deployment checklist item, unchanged in
+# substance). Before deploying the shared monitor IAM changes, an
+# AWS-enabled operator must verify the live gg-eks-pipeline encryption
+# configuration. The operator must compare:
+#   - DynamoDB SSEDescription.KMSMasterKeyArn
+#   - the existing IAM policy KMS resource, where present
+# Possible outcomes:
+#   1. AWS-owned/default DynamoDB encryption: no additional application
+#      KMS permission should normally be required.
+#   2. AWS-managed DynamoDB key: confirm whether any explicit
+#      monitor-role KMS permission is required.
+#   3. Customer-managed KMS key: confirm the monitor role and key policy
+#      permit the required DynamoDB access.
+# Do not decide which outcome applies without live AWS evidence -- this
+# local pass does not and cannot make that determination.
+# Read-only command for the final manual checklist (documented here, NOT
+# run in this local environment):
+#   aws dynamodb describe-table \
+#     --table-name gg-eks-pipeline \
+#     --region eu-west-1 \
+#     --query 'Table.{TableName:TableName,SSE:SSEDescription}'
+# This is a documentation-only restatement -- no KMS key, alias, key
+# policy, grant, or DynamoDB encryption setting is added, removed, or
+# modified by this correction pass, and no KMS ARN is guessed anywhere in
+# this file.
+# =====================================================================
+#
 # cloudwatch:PutMetricData uses Resource="*" because the CloudWatch API does
 # not support resource-level ARNs for this action (same exception the
 # manager's own sm_pod policy documents) -- scoped instead via the
@@ -193,7 +222,30 @@ module "gg_postgresql_dev_runtime_role" {
 # defaults to false (envs/dev/dynamodb.tf) and gg_monitor_core.py gates
 # every cloudwatch:PutMetricData call behind it -- the monitor starts,
 # becomes Ready, polls, and writes LEASE/STATE with zero use of this
-# statement in the current default configuration. It remains staged (not
+# statement in the current default configuration.
+#
+# HARD APPLICATION-LEVEL KILL SWITCH (correction pass): CONFIG.metricsEnabled
+# alone is not a sufficient CloudWatch gate, because this table's CONFIG
+# item is protected by lifecycle.ignore_changes = [item] (see
+# envs/dev/dynamodb.tf) -- an already-applied CONFIG item can carry
+# metricsEnabled=true forever, and Terraform will never correct it on a
+# later apply. CLOUDWATCH_PUBLISH_ENABLED (env var on the gg-monitor
+# Deployment, helm/gg-monitor, default "false", not set to true in any
+# environment values file) is a SEPARATE, code-level gate CONFIG cannot
+# override: gg_monitor_core.cloudwatch_enabled_for() requires BOTH
+# CLOUDWATCH_PUBLISH_ENABLED=true AND CONFIG.metricsEnabled=true before any
+# cloudwatch:PutMetricData call is even attempted. An already-applied
+# CONFIG item with metricsEnabled=true therefore CANNOT by itself activate
+# CloudWatch while CLOUDWATCH_PUBLISH_ENABLED remains false. The one-time
+# CONFIG reconciliation described earlier in this file (Scenario B) is
+# still required for DATA CONSISTENCY (so the live CONFIG item accurately
+# reflects this repository's intended defaults), but is no longer the sole
+# thing standing between an old CONFIG item and live CloudWatch calls.
+# CloudWatch must not be enabled (CLOUDWATCH_PUBLISH_ENABLED=true) until a
+# later, separately approved phase -- this correction pass does not enable
+# it anywhere.
+#
+# It remains staged (not
 # broadened) for a later, separately validated CloudWatch phase rather than
 # removed and re-added, matching "prefer feature-gating over requiring" for
 # an already-least-privilege-scoped statement.

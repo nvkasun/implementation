@@ -74,6 +74,13 @@ spec:
                   fieldPath: metadata.name
             - name: TZ
               value: "Asia/Dubai"
+            # Hard CloudWatch kill switch (correction pass): defaults false
+            # (.Values.cloudwatch.publishEnabled), independent of and not
+            # overridable by CONFIG.metricsEnabled -- see
+            # gg_monitor_core.cloudwatch_enabled_for. Never set to true in
+            # any environment values file this pass.
+            - name: CLOUDWATCH_PUBLISH_ENABLED
+              value: {{ .Values.cloudwatch.publishEnabled | default false | quote }}
             # No per-engine ORACLE_ADMIN_*/POSTGRESQL_ADMIN_* env vars here
             # (fix 1): gg_monitor_core.py computes each deployment's own
             # credential file paths itself from canonical runtime data

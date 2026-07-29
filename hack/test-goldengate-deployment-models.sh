@@ -3008,15 +3008,70 @@ POLLING_LOOP_SRC="$(sed -n '/^def polling_loop/,/^def /p' "${MONITOR_CORE_DIR}/g
 POLLING_LOOP_CODE_ONLY="$(echo "$POLLING_LOOP_SRC" | code_only)"
 CW_CALL_COUNT="$(echo "$POLLING_LOOP_CODE_ONLY" | grep -c '_cloudwatch_client()' || true)"
 # -B2 (not -B1): the second call site has one line of unrelated code
-# between the "if cfg[metricsEnabled]:" guard and the _cloudwatch_client()
-# call itself. Quote-agnostic ([\"']) because code_only() round-trips the
-# source through ast.unparse(), which normalizes string literals to single
-# quotes regardless of how they were written in the original file.
-GATED_CW_COUNT="$(echo "$POLLING_LOOP_CODE_ONLY" | grep -B2 '_cloudwatch_client()' | grep -cE 'cfg\[[\"'"'"']metricsEnabled[\"'"'"']\]' || true)"
+# between the "if cloudwatch_enabled_for(cfg):" guard and the
+# _cloudwatch_client() call itself. Correction pass: the gate is now the
+# two-condition helper cloudwatch_enabled_for(cfg) (CLOUDWATCH_PUBLISH_ENABLED
+# hard kill switch AND cfg["metricsEnabled"]), not a bare CONFIG check.
+GATED_CW_COUNT="$(echo "$POLLING_LOOP_CODE_ONLY" | grep -B2 '_cloudwatch_client()' | grep -c 'cloudwatch_enabled_for(cfg)' || true)"
 if [ "$CW_CALL_COUNT" -eq 2 ] && [ "$CW_CALL_COUNT" -eq "$GATED_CW_COUNT" ]; then
-  pass "both _cloudwatch_client() call sites in polling_loop are immediately gated by cfg[\"metricsEnabled\"]"
+  pass "both _cloudwatch_client() call sites in polling_loop are immediately gated by cloudwatch_enabled_for(cfg)"
 else
-  fail "_cloudwatch_client() call sites in polling_loop (${CW_CALL_COUNT}) do not all appear gated by metricsEnabled (gated=${GATED_CW_COUNT})"
+  fail "_cloudwatch_client() call sites in polling_loop (${CW_CALL_COUNT}) do not all appear gated by cloudwatch_enabled_for(cfg) (gated=${GATED_CW_COUNT})"
+fi
+
+echo "--- Hard CloudWatch kill switch: CLOUDWATCH_PUBLISH_ENABLED ---"
+if grep -q 'CLOUDWATCH_PUBLISH_ENABLED = _parse_strict_bool_env' "${MONITOR_CORE_DIR}/gg_monitor_core.py"; then
+  pass "CLOUDWATCH_PUBLISH_ENABLED is parsed via _parse_strict_bool_env (strict true-value parsing)"
+else
+  fail "CLOUDWATCH_PUBLISH_ENABLED env var parsing not found"
+fi
+if grep -q 'def cloudwatch_enabled_for(cfg)' "${MONITOR_CORE_DIR}/gg_monitor_core.py"; then
+  CW_HELPER_BODY="$(sed -n '/^def cloudwatch_enabled_for/,/^def /p' "${MONITOR_CORE_DIR}/gg_monitor_core.py" | sed '$d' | code_only)"
+  if echo "$CW_HELPER_BODY" | grep -q 'CLOUDWATCH_PUBLISH_ENABLED and config_metrics_enabled'; then
+    pass "cloudwatch_enabled_for(cfg) requires BOTH CLOUDWATCH_PUBLISH_ENABLED AND CONFIG.metricsEnabled (AND, not OR)"
+  else
+    fail "cloudwatch_enabled_for(cfg) does not appear to AND both conditions"
+  fi
+else
+  fail "cloudwatch_enabled_for(cfg) helper not found"
+fi
+if grep -q 'cloudwatch:\s*$' helm/gg-monitor/values.yaml && grep -A1 'cloudwatch:' helm/gg-monitor/values.yaml | grep -qE 'publishEnabled:\s*false'; then
+  pass "helm/gg-monitor/values.yaml defaults cloudwatch.publishEnabled to false"
+else
+  fail "helm/gg-monitor/values.yaml does not default cloudwatch.publishEnabled to false"
+fi
+if grep -q "CLOUDWATCH_PUBLISH_ENABLED" helm/gg-monitor/templates/deployment.yaml; then
+  pass "CLOUDWATCH_PUBLISH_ENABLED is wired into the gg-monitor Deployment env"
+else
+  fail "CLOUDWATCH_PUBLISH_ENABLED is not wired into the gg-monitor Deployment"
+fi
+if grep -qE '^\s*publishEnabled:\s*true' platform/dev/gg-monitor/values.yaml 2>/dev/null; then
+  fail "platform/dev/gg-monitor/values.yaml (an environment values file) sets publishEnabled: true -- must not be enabled anywhere this pass"
+else
+  pass "no environment values file sets cloudwatch.publishEnabled: true"
+fi
+
+echo "--- Portal DynamoDB thread safety: factory, not a pre-built Table ---"
+if grep -q "portal_table_factory" "${MONITOR_CORE_DIR}/gg_monitor_core.py" && ! grep -qE '^\s*portal_table\s*=' "${MONITOR_CORE_DIR}/gg_monitor_core.py"; then
+  pass "portal uses a table FACTORY (portal_table_factory), never a bare pre-built portal_table object"
+else
+  fail "portal does not appear to use a factory pattern for its DynamoDB table"
+fi
+
+echo "--- Portal error sanitization: no raw errorMsg exposed ---"
+COLLECT_STATUS_BODY="$(sed -n '/^def collect_portal_status/,/^def render_portal_html/p' "${MONITOR_CORE_DIR}/gg_monitor_core.py" | sed '$d' | code_only)"
+if echo "$COLLECT_STATUS_BODY" | grep -qE '"errorMsg":\s*str\(row\.get\("errorMsg"'; then
+  fail "collect_portal_status still exposes raw errorMsg in its output"
+else
+  pass "collect_portal_status does not expose raw errorMsg in its output"
+fi
+if grep -q "def _classify_process_status_code" "${MONITOR_CORE_DIR}/gg_monitor_core.py" && \
+   grep -q '"hasError"' "${MONITOR_CORE_DIR}/gg_monitor_core.py" && \
+   grep -q '"statusCode"' "${MONITOR_CORE_DIR}/gg_monitor_core.py" && \
+   grep -q '"statusMessage"' "${MONITOR_CORE_DIR}/gg_monitor_core.py"; then
+  pass "collect_portal_status exposes the sanitized hasError/statusCode/statusMessage triple"
+else
+  fail "sanitized error fields (hasError/statusCode/statusMessage) not found"
 fi
 
 echo "--- Shared monitoring web portal ---"
