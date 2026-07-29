@@ -30,7 +30,7 @@ refreshSeconds: 30
 serviceAccount:
   create: true
   name: gg-monitor
-  roleArn: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev
+  roleArn: arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev
 
 ingress:
   enabled: true

@@ -1,0 +1,4 @@
+# Test-only dependencies -- never installed into the container image.
+# Pinned for reproducibility on any runner (verified compatible with
+# requirements.txt's boto3==1.34.144/botocore==1.34.144).
+moto[dynamodb]==5.0.28

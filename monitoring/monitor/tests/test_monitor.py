@@ -2,6 +2,7 @@ import html as html_module
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -568,6 +569,77 @@ def _extract_step_if_condition(workflow_text, step_name):
     return match.group(1).strip() if match else None
 
 
+MONITOR_CHART_PATH = os.path.join(REPO_ROOT, "helm", "goldengate-monitor")
+
+
+class SecretProviderClassRenderTests(unittest.TestCase):
+    """Renders the real helm/goldengate-monitor chart (with the canonical
+    config staged exactly as the workflow stages it) and asserts the
+    generated SecretProviderClass and CSI volume wiring -- not a
+    reimplementation of the template logic inside this test suite."""
+
+    @classmethod
+    def setUpClass(cls):
+        if shutil.which("helm") is None:
+            raise unittest.SkipTest("helm not available")
+        cls.tmpdir = tempfile.mkdtemp()
+        staged_chart = os.path.join(cls.tmpdir, "goldengate-monitor")
+        shutil.copytree(MONITOR_CHART_PATH, staged_chart)
+        os.makedirs(os.path.join(staged_chart, "files"), exist_ok=True)
+        shutil.copy(DEPLOYMENTS_FILE_PATH, os.path.join(staged_chart, "files", "goldengate-deployments.yaml"))
+
+        proc = subprocess.run(
+            ["helm", "template", "gg-monitor", staged_chart,
+             "--namespace", "goldengate-monitoring",
+             "-f", os.path.join(REPO_ROOT, "envs", "dev", "goldengate-monitor", "values.yaml"),
+             "--set", "image.repository=example.invalid/goldengate-monitor",
+             "--set", "image.tag=test",
+             "--set", "serviceAccount.roleArn=arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev"],
+            capture_output=True, text=True, cwd=REPO_ROOT,
+        )
+        if proc.returncode != 0:
+            raise AssertionError(f"helm template failed: {proc.stdout}\n{proc.stderr}")
+        cls.rendered = proc.stdout
+
+    def test_exactly_one_secretproviderclass(self):
+        self.assertEqual(self.rendered.count("kind: SecretProviderClass"), 1)
+
+    def test_admin_aliases_present_for_every_enabled_deployment(self):
+        doc = cfgmod.load_deployments(os.path.join(REPO_ROOT, "envs", "dev"))
+        for d in doc["deployments"]:
+            if not d["enabled"]:
+                continue
+            self.assertIn(f"{d['name']}-admin-user", self.rendered)
+            self.assertIn(f"{d['name']}-admin-password", self.rendered)
+            self.assertIn(d["adminSecret"], self.rendered)
+
+    def test_ca_chain_alias_present(self):
+        self.assertIn("ca-chain-pem", self.rendered)
+        doc = cfgmod.load_deployments(os.path.join(REPO_ROOT, "envs", "dev"))
+        self.assertIn(doc["tlsSecret"], self.rendered)
+
+    def test_exactly_one_csi_volume_mounted_read_only_at_secrets_store(self):
+        self.assertEqual(self.rendered.count("driver: secrets-store.csi.k8s.io"), 1)
+        self.assertEqual(self.rendered.count("mountPath: /mnt/secrets-store"), 1)
+        self.assertIn("readOnly: true", self.rendered)
+
+    def test_no_kubernetes_secret_or_secret_object_materialized(self):
+        self.assertNotIn("kind: Secret\n", self.rendered)
+        self.assertNotIn("secretObjects", self.rendered)
+        self.assertNotIn("secretKeyRef", self.rendered)
+        self.assertNotIn("envFrom", self.rendered)
+
+    def test_pod_name_and_cloudwatch_kill_switch_rendered(self):
+        self.assertIn("name: POD_NAME", self.rendered)
+        self.assertIn("fieldPath: metadata.name", self.rendered)
+        self.assertIn('name: CLOUDWATCH_PUBLISH_ENABLED\n              value: "false"', self.rendered)
+
+    def test_exactly_one_of_each_core_resource(self):
+        for kind in ("Deployment", "Service", "Ingress", "ServiceAccount", "ConfigMap"):
+            with self.subTest(kind=kind):
+                self.assertEqual(self.rendered.count(f"kind: {kind}\n"), 1)
+
+
 class WorkflowStaticAnalysisTests(unittest.TestCase):
     """Static inspection of the two GitHub Actions workflow files. These
     prove the actual committed bash/YAML content was fixed -- not a
@@ -805,7 +877,7 @@ class ServiceAccountIrsaValidationTests(unittest.TestCase):
     grep that silently passed the workflow step under set -euo pipefail
     while never actually matching the (correctly quoted) rendered value."""
 
-    EXPECTED_ARN = "arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev"
+    EXPECTED_ARN = "arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev"
 
     @classmethod
     def setUpClass(cls):
@@ -816,7 +888,7 @@ class ServiceAccountIrsaValidationTests(unittest.TestCase):
 
     def test_old_unquoted_role_arn_grep_is_gone(self):
         self.assertNotIn(
-            'grep -q "eks.amazonaws.com/role-arn: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev"',
+            'grep -q "eks.amazonaws.com/role-arn: arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev"',
             self.monitor_text,
         )
 
@@ -838,7 +910,7 @@ metadata:
   name: gg-monitor
   namespace: goldengate-monitoring
   annotations:
-    eks.amazonaws.com/role-arn: "arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev"
+    eks.amazonaws.com/role-arn: "arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev"
 """
         proc = _run_serviceaccount_snippet(self.monitor_text, rendered)
         self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
@@ -852,7 +924,7 @@ metadata:
   name: gg-monitor
   namespace: goldengate-monitoring
   annotations:
-    eks.amazonaws.com/role-arn: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev
+    eks.amazonaws.com/role-arn: arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev
 """
         proc = _run_serviceaccount_snippet(self.monitor_text, rendered)
         self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
@@ -929,7 +1001,7 @@ metadata:
   name: gg-monitor
   namespace: goldengate-monitoring
   annotations:
-    eks.amazonaws.com/role-arn: "arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev"
+    eks.amazonaws.com/role-arn: "arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev"
 """
         proc = _run_serviceaccount_snippet(self.monitor_text, rendered)
         self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
@@ -1147,7 +1219,7 @@ metadata:
   name: gg-monitor
   namespace: goldengate-monitoring
   annotations:
-    eks.amazonaws.com/role-arn: "arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev"
+    eks.amazonaws.com/role-arn: "arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev"
 """
         proc = _run_serviceaccount_snippet(self.monitor_text, rendered)
         self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)

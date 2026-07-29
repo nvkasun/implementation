@@ -83,6 +83,14 @@ spec:
               value: {{ .Values.refreshSeconds | quote }}
             - name: MONITOR_VERSION
               value: {{ .Values.image.tag | quote }}
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # Hard kill switch: publishing also requires CONFIG.metricsEnabled
+            # (see health_rules.py) -- either alone is not sufficient.
+            - name: CLOUDWATCH_PUBLISH_ENABLED
+              value: {{ .Values.cloudwatch.publishEnabled | quote }}
             - name: AWS_CONFIG_FILE
               value: /tmp/.aws/config
             - name: AWS_SHARED_CREDENTIALS_FILE
@@ -100,6 +108,9 @@ spec:
               mountPath: /tmp
             - name: canonical-config
               mountPath: {{ .Values.canonicalConfig.root }}
+              readOnly: true
+            - name: secrets-store
+              mountPath: /mnt/secrets-store
               readOnly: true
           startupProbe:
             httpGet:
@@ -139,6 +150,12 @@ spec:
             items:
               - key: goldengate-deployments.yaml
                 path: goldengate-deployments.yaml
+        - name: secrets-store
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: {{ include "goldengate-monitor.secretProviderClassName" . | quote }}
 {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

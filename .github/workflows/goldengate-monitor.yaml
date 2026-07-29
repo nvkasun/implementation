@@ -268,6 +268,16 @@ jobs:
             fi
           fi
 
+      - name: Install monitor runtime and test dependencies
+        if: env.IMAGE_EXISTED != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install --disable-pip-version-check \
+            -r "${MONITOR_SOURCE_PATH}/requirements.txt" \
+            -r "${MONITOR_SOURCE_PATH}/requirements-test.txt"
+
       - name: Validate monitor Python syntax
         if: env.IMAGE_EXISTED != 'true'
         shell: bash
@@ -724,7 +734,7 @@ jobs:
           fi
 
           SA_ROLE_ARN_ACTUAL="$(normalize_value "${SA_ROLE_ARN_LINE#*role-arn:}")"
-          SA_ROLE_ARN_EXPECTED="arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev"
+          SA_ROLE_ARN_EXPECTED="arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev"
 
           if [ "$SA_ROLE_ARN_ACTUAL" != "$SA_ROLE_ARN_EXPECTED" ]; then
             echo "FAIL: gg-monitor IRSA role ARN mismatch."
@@ -747,9 +757,9 @@ jobs:
             exit 1
           fi
 
-          echo "Validating no Secret/CSI/PVC/hostPath is rendered..."
+          echo "Validating no Kubernetes Secret/PVC/hostPath is rendered, and credentials arrive only via CSI..."
           if grep -qE '^kind: Secret$' "$RENDERED"; then
-            echo "FAIL: a Secret was rendered -- the monitor must not use Kubernetes Secrets."
+            echo "FAIL: a Kubernetes Secret was rendered -- credentials must arrive only via Secrets Store CSI."
             exit 1
           fi
           if grep -q "secretKeyRef" "$RENDERED"; then
@@ -760,6 +770,10 @@ jobs:
             echo "FAIL: envFrom found in rendered manifest."
             exit 1
           fi
+          if grep -q "secretObjects" "$RENDERED"; then
+            echo "FAIL: secretObjects found -- the monitor SecretProviderClass must not materialize a Kubernetes Secret."
+            exit 1
+          fi
           if grep -q "persistentVolumeClaim" "$RENDERED"; then
             echo "FAIL: persistentVolumeClaim found in rendered manifest."
             exit 1
@@ -768,8 +782,65 @@ jobs:
             echo "FAIL: hostPath found in rendered manifest."
             exit 1
           fi
-          if grep -q "secrets-store.csi" "$RENDERED"; then
-            echo "FAIL: a GoldenGate CSI secret volume was rendered."
+
+          echo "Validating exactly one SecretProviderClass and one read-only CSI volume mounted at /mnt/secrets-store..."
+          SPC_COUNT="$(grep -c '^kind: SecretProviderClass$' "$RENDERED" || true)"
+          if [ "$SPC_COUNT" -ne 1 ]; then
+            echo "FAIL: expected exactly 1 SecretProviderClass, found ${SPC_COUNT}."
+            exit 1
+          fi
+          SPC_BLOCK="$(select_document "$RENDERED" "SecretProviderClass" "gg-monitor-secrets")"
+          if [ -z "$SPC_BLOCK" ]; then
+            echo "FAIL: rendered SecretProviderClass gg-monitor-secrets was not found."
+            exit 1
+          fi
+          if ! grep -Fq -- "driver: secrets-store.csi.k8s.io" <<< "$DEPLOYMENT_BLOCK"; then
+            echo "FAIL: Deployment gg-monitor does not mount the Secrets Store CSI driver."
+            exit 1
+          fi
+          CSI_VOLUME_COUNT="$(grep -c "driver: secrets-store.csi.k8s.io" <<< "$DEPLOYMENT_BLOCK" || true)"
+          if [ "$CSI_VOLUME_COUNT" -ne 1 ]; then
+            echo "FAIL: expected exactly 1 CSI secret volume, found ${CSI_VOLUME_COUNT}."
+            exit 1
+          fi
+          SECRETS_STORE_VOLUME_BLOCK="$(awk '/- name: secrets-store$/{flag=1} flag{print} flag && /secretProviderClass:/{exit}' <<< "$DEPLOYMENT_BLOCK")"
+          if ! grep -Fq -- "readOnly: true" <<< "$SECRETS_STORE_VOLUME_BLOCK"; then
+            echo "FAIL: the CSI secret volume mount is not readOnly: true."
+            exit 1
+          fi
+          MOUNTPATH_COUNT="$(grep -c "mountPath: /mnt/secrets-store" <<< "$DEPLOYMENT_BLOCK" || true)"
+          if [ "$MOUNTPATH_COUNT" -ne 1 ]; then
+            echo "FAIL: expected exactly 1 volume mounted at /mnt/secrets-store, found ${MOUNTPATH_COUNT}."
+            exit 1
+          fi
+          echo "OK: exactly 1 SecretProviderClass and 1 read-only CSI volume mounted at /mnt/secrets-store."
+
+          echo "Validating one username/password alias per enabled canonical deployment, plus ca-chain-pem..."
+          while IFS= read -r name; do
+            [ -z "$name" ] && continue
+            if ! grep -Fq -- "${name}-admin-user" <<< "$SPC_BLOCK"; then
+              echo "FAIL: SecretProviderClass is missing the ${name}-admin-user alias."
+              exit 1
+            fi
+            if ! grep -Fq -- "${name}-admin-password" <<< "$SPC_BLOCK"; then
+              echo "FAIL: SecretProviderClass is missing the ${name}-admin-password alias."
+              exit 1
+            fi
+          done < <(awk '
+            /^\s*-\s*name:/ { if (name != "" && enabled == "true") print name; name=$0; sub(/^\s*-\s*name:\s*/, "", name); gsub(/["\x27\r]/, "", name); enabled="" }
+            /^\s*enabled:\s*true/ { enabled="true" }
+            /^\s*enabled:\s*false/ { enabled="false" }
+            END { if (name != "" && enabled == "true") print name }
+          ' envs/dev/goldengate-deployments.yaml)
+          if ! grep -Fq -- "ca-chain-pem" <<< "$SPC_BLOCK"; then
+            echo "FAIL: SecretProviderClass is missing the ca-chain-pem alias."
+            exit 1
+          fi
+          echo "OK: credential aliases present for every enabled deployment, plus ca-chain-pem."
+
+          echo "Validating no plaintext secret value is rendered..."
+          if grep -qiE 'password"?\s*[:=]\s*"[^"$]' "$RENDERED"; then
+            echo "FAIL: a literal password-like value was found in the rendered manifest."
             exit 1
           fi
 
@@ -1146,11 +1217,11 @@ jobs:
           echo "ServiceAccount and IRSA annotation:"
           kubectl get serviceaccount gg-monitor -n "$TARGET_NAMESPACE"
           ROLE_ANNOTATION="$(kubectl get serviceaccount gg-monitor -n "$TARGET_NAMESPACE" -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}')"
-          if [ "$ROLE_ANNOTATION" != "arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev" ]; then
+          if [ "$ROLE_ANNOTATION" != "arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev" ]; then
             echo "FAIL: unexpected IRSA role annotation on ServiceAccount gg-monitor: ${ROLE_ANNOTATION}"
             exit 1
           fi
-          echo "OK: IRSA role annotation matches GoldenGateSecretsReadRole-dev."
+          echo "OK: IRSA role annotation matches GoldenGateMonitorReadRole-dev."
 
           echo "Deployment availability:"
           kubectl rollout status deployment/gg-monitor -n "$TARGET_NAMESPACE" --timeout=5m

@@ -34,6 +34,11 @@ legacyFallback:
 staleAfterSeconds: 120
 refreshSeconds: 30
 
+# Hard kill switch, independent of CONFIG.metricsEnabled. Publishing
+# requires BOTH to be true (see health_rules.py). Never true here.
+cloudwatch:
+  publishEnabled: false
+
 serviceAccount:
   create: true
   name: gg-monitor

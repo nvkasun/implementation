@@ -169,6 +169,7 @@ def load_deployments(repo_root=None):
         "runtimeNamespace": runtime_namespace,
         "monitoringNamespace": doc["monitoringNamespace"],
         "dnsDomain": dns_domain,
+        "tlsSecret": doc.get("tlsSecret", ""),
         "deployments": deployments,
     }
 

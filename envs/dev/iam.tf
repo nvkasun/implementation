@@ -17,17 +17,41 @@ module "goldengate_eks_deploy_role_dev" {
 }
 
 
-# Single shared IAM role for every GoldenGate pod (runtime and shared
-# monitor). Trust subjects: gg-oracle-sa, gg-postgresql-sa, gg-monitor
-# (see policy_folder/assume_role_policy). Grants Secrets Manager read, KMS
-# decrypt, and the DynamoDB/CloudWatch access the shared monitor needs to
-# read CONFIG and own LEASE/STATE#.
+# IRSA role for GoldenGate runtime pods (gg-oracle-sa, gg-postgresql-sa)
+# plus the legacy observer's ServiceAccount subject while that observer is
+# still operational. The shared monitor uses its OWN role
+# (goldengate_monitor_read_role_dev below), not this one.
+#
+# The DynamoDB/CloudWatch actions in this role's policy exist only because
+# the legacy observer sidecar still needs them -- remove them from this
+# role after observer cutover (runtime pods themselves need neither).
 module "goldengate_secrets_read_role_dev" {
   source = "git::https://github.com/AbuDhabiCommercialBank/aws-tf-module-iam-role.git?ref=v2.0.0"
 
   name          = "GoldenGateSecretsReadRole-dev"
-  description   = "Shared IRSA role for GoldenGate runtime pods and the shared monitor: read Secrets Manager objects, read/write gg-eks-pipeline, publish GoldenGate/Pipelines metrics"
+  description   = "IRSA role for GoldenGate runtime pods and the legacy observer: read Secrets Manager objects, read/write gg-eks-pipeline, publish GoldenGate/Pipelines metrics"
   policy_folder = "goldengate-secrets-read-dev"
+
+  managed_policy_arns = []
+
+  map_migrated         = "comm5TZY31HX9S"
+  business_criticality = "Low"
+  application_name     = "CloudFactory"
+  cost_center          = "219"
+  business_unit        = "TechnologyPlatform"
+  data_classification  = "General"
+  env                  = "dev"
+}
+
+
+# IRSA role for the shared monitor (collector + portal). Trust: exactly
+# system:serviceaccount:goldengate-monitoring:gg-monitor.
+module "goldengate_monitor_read_role_dev" {
+  source = "git::https://github.com/AbuDhabiCommercialBank/aws-tf-module-iam-role.git?ref=v2.0.0"
+
+  name          = "GoldenGateMonitorReadRole-dev"
+  description   = "IRSA role for the shared GoldenGate monitor (collector + portal): read Secrets Manager objects, read/write gg-eks-pipeline, publish GoldenGate/Pipelines metrics"
+  policy_folder = "goldengate-monitor-read-dev"
 
   managed_policy_arns = []
 

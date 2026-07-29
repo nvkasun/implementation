@@ -1,6 +1,6 @@
 apiVersion: v2
 name: goldengate-monitor
-description: Shared read-only GoldenGate monitoring portal for AWS EKS
+description: Shared GoldenGate collector and monitoring portal for AWS EKS
 type: application
 version: 0.1.0
 appVersion: "1.0.0"

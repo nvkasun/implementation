@@ -1,10 +1,12 @@
 """monitor.py: the one shared GoldenGate monitoring application.
 
-Runs the passive collector (LEASE ownership, STATE#_deployment /
-STATE#<process> writes, GoldenGate Admin REST polling -- see collector.py)
-and the read-only monitoring portal (CONFIG/LEASE/STATE# reads, HTML/JSON
-UI, /healthz, /readyz) in one process. Never writes CONFIG, never Scans,
-never calls GoldenGate or the Kubernetes API.
+Runs the passive collector (calls GoldenGate Admin REST, owns LEASE, writes
+STATE#_deployment/STATE#<process> -- see collector.py) and the portal
+(CONFIG/LEASE/STATE# reads only, HTML/JSON UI, /healthz, /readyz) in one
+process. This module is not read-only as a whole -- only the portal's own
+data-reading functions are. CONFIG stays Terraform-owned: neither the
+collector nor the portal ever writes it. Never Scans. Never calls the
+Kubernetes API.
 """
 import html
 import json

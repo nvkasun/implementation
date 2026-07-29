@@ -1,0 +1,63 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowReadGoldenGateMonitorSecrets",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:DescribeSecret"
+      ],
+      "Resource": [
+        "arn:aws:secretsmanager:eu-west-1:668311715351:secret:dev/goldengate/*"
+      ]
+    },
+    {
+      "Sid": "AllowDecryptGoldenGateMonitorSecretsKms",
+      "Effect": "Allow",
+      "Action": [
+        "kms:Decrypt"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowReadWriteGoldenGateMonitoringState",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:GetItem",
+        "dynamodb:Query",
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:DescribeTable"
+      ],
+      "Resource": "arn:aws:dynamodb:eu-west-1:668311715351:table/gg-eks-pipeline"
+    },
+    {
+      "Sid": "AllowDecryptGoldenGateMonitoringTable",
+      "Effect": "Allow",
+      "Action": "kms:Decrypt",
+      "Resource": "arn:aws:kms:eu-west-1:668311715351:key/b4220b12-5b1f-4379-a721-c56b09e0048e",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "dynamodb.eu-west-1.amazonaws.com",
+          "kms:CallerAccount": "668311715351",
+          "kms:EncryptionContext:aws:dynamodb:tableName": "gg-eks-pipeline",
+          "kms:EncryptionContext:aws:dynamodb:subscriberId": "668311715351"
+        }
+      }
+    },
+    {
+      "Sid": "AllowPublishGoldenGateMonitoringMetrics",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:PutMetricData"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "cloudwatch:namespace": "GoldenGate/Pipelines"
+        }
+      }
+    }
+  ]
+}
