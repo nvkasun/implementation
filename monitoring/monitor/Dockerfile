@@ -5,7 +5,7 @@ FROM ${BASE_IMAGE}
 
 ARG OCI_SOURCE=""
 ARG OCI_TITLE="goldengate-monitor"
-ARG OCI_DESCRIPTION="Read-only shared GoldenGate monitoring portal"
+ARG OCI_DESCRIPTION="Shared GoldenGate collector and monitoring portal"
 ARG OCI_VERSION="development"
 
 LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
@@ -31,7 +31,7 @@ WORKDIR ${APP_HOME}
 COPY requirements.txt ./
 RUN pip install --no-cache-dir --no-compile -r requirements.txt
 
-COPY monitor.py inventory.py ./
+COPY monitor.py collector.py health_rules.py config.py ./
 
 USER ${APP_UID}:${APP_GID}
 

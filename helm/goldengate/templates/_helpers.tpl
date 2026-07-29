@@ -79,6 +79,8 @@ app.kubernetes.io/component: target
 {{- define "goldengate.efsStorageClassName" -}}
 {{- if .Values.persistence.efs.storageClass.name }}
 {{- .Values.persistence.efs.storageClass.name | trunc 63 | trimSuffix "-" -}}
+{{- else if eq (include "goldengate.deploymentModel" .) "singleRuntime" }}
+{{- printf "gg-efs-%s-%s" .Values.global.environment (include "goldengate.runtimeName" .) | trunc 63 | trimSuffix "-" -}}
 {{- else }}
 {{- printf "gg-efs-%s-%s" .Values.global.environment .Values.global.deploymentId | trunc 63 | trimSuffix "-" -}}
 {{- end }}
@@ -98,6 +100,8 @@ not collide across deployments/namespaces.
 {{- define "goldengate.efsBasePath" -}}
 {{- if .Values.persistence.efs.storageClass.basePath }}
 {{- .Values.persistence.efs.storageClass.basePath -}}
+{{- else if eq (include "goldengate.deploymentModel" .) "singleRuntime" }}
+{{- printf "/%s" (include "goldengate.runtimeName" .) -}}
 {{- else }}
 {{- printf "/%s" .Values.global.deploymentId -}}
 {{- end }}
@@ -120,9 +124,9 @@ not collide across deployments/namespaces.
 {{- end }}
 
 {{- /*
-Phase 1 single-runtime helpers (deploymentModel: singleRuntime). Kept
-entirely separate from the source/target helpers above -- legacyPair
-rendering never calls any of these.
+Single-runtime helpers (deploymentModel: singleRuntime). Kept entirely
+separate from the source/target helpers above -- legacyPair rendering
+never calls any of these.
 */ -}}
 
 {{- define "goldengate.deploymentModel" -}}
@@ -137,13 +141,27 @@ rendering never calls any of these.
 {{- eq (include "goldengate.deploymentModel" .) "singleRuntime" -}}
 {{- end }}
 
+{{- /*
+The runtime folder basename / Helm release name IS the runtime identity
+(envs/dev/<name>/values.yaml, Release.Name=<name>). Every singleRuntime
+resource name/label/env var derives from this one helper -- runtime.name
+is only an escape hatch, never required.
+*/ -}}
 {{- define "goldengate.runtimeName" -}}
 {{- if .Values.runtime.fullnameOverride }}
 {{- .Values.runtime.fullnameOverride | trunc 63 | trimSuffix "-" -}}
 {{- else if .Values.runtime.name }}
 {{- .Values.runtime.name | trunc 63 | trimSuffix "-" -}}
 {{- else }}
-{{- fail "runtime.name (or runtime.fullnameOverride) is required when deploymentModel=singleRuntime." }}
+{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- end }}
+{{- end }}
+
+{{- define "goldengate.runtimeIngressHost" -}}
+{{- if .Values.ingress.host }}
+{{- .Values.ingress.host -}}
+{{- else }}
+{{- printf "%s.%s" (include "goldengate.runtimeName" .) .Values.ingress.hostDomain -}}
 {{- end }}
 {{- end }}
 

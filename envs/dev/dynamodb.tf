@@ -39,124 +39,12 @@ module "goldengate_pipeline_state" {
   env                  = "dev"
 }
 
-# Phase 3 (refactored): manager-aligned canonical CONFIG inventory, seeded
-# generically from pipelines/deployments.yaml -- mirrors the manager
-# reference implementation's own pattern exactly:
-#
-#   terraform/platform/dynamodb.tf (manager repo, inspected read-only):
-#     for_each = {
-#       for d in yamldecode(file("${path.module}/../../pipelines/deployments.yaml")).deployments :
-#       "gg-${d.name}" => d.type
-#     }
-#
-# One central deployment inventory (pipelines/deployments.yaml), one shared
-# table (gg-eks-pipeline, unchanged below), one generic
-# aws_dynamodb_table_item resource with for_each -- never a per-runtime
-# resource block. A future declared deployment (enabled or not) needs only
-# a new pipelines/deployments.yaml entry, no Terraform code change.
-#
-# STATE OWNERSHIP SAFETY: Terraform owns ONLY recordType=CONFIG items in
-# this table. recordType=LEASE, recordType=STATE#_deployment, and
-# recordType=STATE#<process> are owned exclusively by the (not-yet-deployed)
-# shared gg-monitor -- Terraform must never create, update, or delete any
-# item with those record types. This keeps writers disjoint by sort key, so
-# there is no write contention between Terraform and the future monitor.
-# RESOLVED STATE KEY CONTRACT for that future phase (the manager reference
-# code is internally inconsistent here: charts/gg-monitor/files/gg-monitor.py
-# reads a legacy singleton recordType="STATE", while the actual writer,
-# charts/gg-deployment/files/utility-sidecar.py, only ever writes
-# recordType="STATE#_deployment" / "STATE#<process>" -- our canonical
-# contract is the STATE#-prefixed form; the bare "STATE" singleton is not
-# used and must not be created or read).
-#
-# Schema mirrors the manager reference implementation's own CONFIG item
-# field names, types, and (mostly) default values -- see
-# terraform/platform/dynamodb.tf and charts/gg-monitor/files/gg-monitor.py /
-# charts/gg-deployment/files/utility-sidecar.py / gg_health.py in the manager
-# reference repository (inspected read-only; not copied or modified). CONFIG
-# in that schema is a monitoring/alerting-policy record only -- it
-# deliberately carries no endpoint, namespace, serviceName, or
-# secret-reference fields (those live in
-# topologies/dev/payments-ora-to-pg-001.yaml instead, mirroring the
-# manager's own separation between DynamoDB CONFIG and its ConfigMap-mounted
-# topology data).
-#
-# CONFIRMED MANAGER DEFECT (field name): the manager's own Terraform seed
-# writes `dispatchStallChecks` inside `defaults`, but every reader
-# (gg_health.py DEFAULTS["defaults"]["distpathStallChecks"] and
-# utility-sidecar.py's `rule["distpathStallChecks"]`) expects
-# `distpathStallChecks`. We use the corrected `distpathStallChecks` name,
-# never the seed's typo.
-#
-# PASSIVE-SAFE DEVIATION (intentional, approved architecture): our runtime
-# pods have no manager utility sidecar, and the shared gg-monitor must be
-# passive (no restart/start/fence/failover). alertsEnabled=false,
-# credSyncEnabled=false, autoStartEnabled=false, autoRestartMaxRetries=0,
-# defaults.failoverEnabled=false, and defaults.alertEachAbend=false all
-# deviate from the manager's own seed defaults (which assume its active
-# sidecar) for exactly this reason.
-#
-# metricsEnabled=false is ALSO an intentional deviation from the manager's
-# own seed (true): in this repository metricsEnabled is what gates the
-# shared monitor's CloudWatch publication (gg_health_rules.resolve_config /
-# gg_monitor_core._emit) -- CloudWatch, alarms, SNS, and Fluent Bit are all
-# explicitly out of scope until a separate, later validated phase (see
-# monitoring/gg-monitor-core/README.md). This does not touch DynamoDB
-# LEASE/STATE#* writing at all -- only CloudWatch's PutMetricData path.
-#
-# Every timing/threshold field (tz, checkIntervalSeconds,
-# startupGraceSeconds, trailRetentionHours, defaults.lagMode/
-# lagThresholdSeconds/maxConsecutiveAbends/abendRecheckSeconds/
-# distpathStallChecks) stays manager-compatible.
-#
-# ignore_changes = [item]: matches the manager pattern -- Terraform creates
-# the initial CONFIG item once; operators or future management workflows may
-# tune existing CONFIG values afterward (DynamoDB console / future tooling
-# is the live source of truth from then on), so Terraform never resets them
-# on a later apply. A new pipelines/deployments.yaml entry still creates a
-# new CONFIG item normally (for_each diff), whether or not it is enabled.
-#
-# No ttl attribute: CONFIG records must not expire (only the table's TTL
-# *feature* stays enabled at the table level, for LEASE/STATE items the
-# monitor will own -- individual CONFIG items simply omit the ttl attribute
-# entirely, which is sufficient for DynamoDB TTL to never act on them).
-#
-# TERRAFORM STATE MIGRATION SAFETY: the two explicit resources this replaces
-# (aws_dynamodb_table_item.gg_oracle_payments_01_config and
-# .gg_postgresql_payments_01_config) were present in this file's prior
-# revision and may already exist in remote Terraform state. The moved
-# blocks below let an already-applied item move to its new for_each address
-# without a delete/recreate; if it was never applied, the moved block is a
-# harmless no-op and the for_each resource is simply created normally.
-#
-# OPERATIONAL RULE -- read the plan before applying, every time this file
-# changes:
-#
-#   Scenario A (plan shows CREATE for both pipeline_config[...] addresses):
-#     the old explicit resources were never applied. The new records receive
-#     the corrected passive CONFIG payload directly. Proceed after normal
-#     review -- no special handling needed.
-#
-#   Scenario B (plan shows only MOVE for both addresses, no attribute diff):
-#     the old explicit resources already exist in remote state.
-#     lifecycle.ignore_changes = [item] means Terraform will NOT show or
-#     apply any difference between the old remote payload and this file's
-#     corrected passive payload -- a MOVE-only plan does not by itself prove
-#     the live item already matches. Before applying:
-#       1. Read both current DynamoDB CONFIG items (read-only
-#          get-item/describe -- never write).
-#       2. If they still contain the previous active payload
-#          (autoStartEnabled=true, autoRestartMaxRetries=3,
-#          autoRestartWindowMinutes=30, defaults.failoverEnabled=true) or the
-#          misspelled dispatchStallChecks field, perform a controlled
-#          one-time reconciliation: temporarily remove ignore_changes for
-#          that migration apply, verify the resulting payload matches this
-#          file exactly, then restore ignore_changes in a subsequent,
-#          separately reviewed commit.
-#       3. Do not remove ignore_changes from this steady-state file itself
-#          unless that one-time migration has been confirmed necessary --
-#          this local correction pass does not perform or assume that
-#          migration; it only documents the rule for whoever applies next.
+# CONFIG is Terraform-owned; the shared monitor owns LEASE/STATE#_deployment/
+# STATE#<process> and never writes CONFIG. Seeded generically from
+# goldengate-deployments.yaml -- deployment.name is used directly as the
+# partition key, no prefix added. ignore_changes = [item]: Terraform seeds
+# CONFIG once; later tuning is done outside Terraform and must not be reset
+# on a subsequent apply.
 moved {
   from = aws_dynamodb_table_item.gg_oracle_payments_01_config
   to   = aws_dynamodb_table_item.pipeline_config["gg-oracle-payments-01"]
@@ -168,32 +56,15 @@ moved {
 }
 
 resource "aws_dynamodb_table_item" "pipeline_config" {
-  # Table creation ordering: module.goldengate_pipeline_state (above) sources
-  # from a private AbuDhabiCommercialBank GitHub repo this environment cannot
-  # reach (no network credentials to that host), so its exact output names
-  # (e.g. a hypothetical .name/.hash_key/.range_key) cannot be verified --
-  # no local documentation, cached module metadata, or existing
-  # module.X.Y-output usage exists anywhere in this repository either. Per
-  # "do not guess module output names," table_name/hash_key/range_key below
-  # stay the existing literal strings (matching this repo's established
-  # convention of hardcoding names/ARNs rather than referencing unverified
-  # module outputs), and this explicit depends_on takes over the ordering
-  # guarantee a verified module-output reference would otherwise have
-  # provided implicitly -- so a fresh environment cannot attempt CONFIG item
-  # creation before the shared table exists.
   depends_on = [
     module.goldengate_pipeline_state
   ]
 
-  # Exact manager for_each value pattern (terraform/platform/dynamodb.tf in
-  # the manager reference repo): the map value is d.type itself (a bare
-  # string), not the whole d object -- each.value below is therefore already
-  # the deploymentType string.
   for_each = {
     for d in yamldecode(
-      file("${path.module}/../../pipelines/deployments.yaml")
+      file("${path.module}/goldengate-deployments.yaml")
     ).deployments :
-    "gg-${d.name}" => d.type
+    d.name => d.type
   }
 
   table_name = "gg-eks-pipeline"
@@ -235,36 +106,11 @@ resource "aws_dynamodb_table_item" "pipeline_config" {
   }
 }
 
-# =====================================================================
-# Manager-aligned DynamoDB tables: gg-alerts, gg-metrics-history.
-# =====================================================================
-# Mirrors the manager reference implementation's own schema exactly (see
-# terraform/platform/dynamodb.tf resources "alerts" / "alerts_global" /
-# "metrics_history", inspected read-only, never modified or copied) --
-# only the physical CREATION of these tables (plus the required disabled
-# GLOBAL seed row for gg-alerts) is done here. NO alerter application, NO
-# alerter IAM role, and NO write access from gg-monitor-dev-role are added
-# in this task -- see envs/dev/iam.tf for the explicit statement that the
-# shared monitor does not need write access to either table this phase.
-#
-# Same corporate module already proven for gg-eks-pipeline above is reused
-# here (module.goldengate_pipeline_state) for consistency with this
-# repository's own established Terraform pattern -- not the manager's raw
-# aws_dynamodb_table resource syntax, which this repository does not use
-# anywhere. custom_kms_key_arn = null preserves the exact same
-# locally-verifiable encryption pattern as gg-eks-pipeline: no
-# customer-managed KMS key is introduced by this table, matching this
-# task's explicit KMS scope boundary.
-# =====================================================================
-
 module "goldengate_alerts" {
   source = "git::https://github.com/AbuDhabiCommercialBank/aws-tf-module-dynamodb.git?ref=v1.2.0"
 
   name     = "gg-alerts"
   hash_key = "alert_id"
-  # No range_key: the manager's own alerts table is single-key
-  # (alert_id only) -- confirmed in terraform/platform/dynamodb.tf, not
-  # guessed.
 
   attributes = [
     {
@@ -296,15 +142,9 @@ module "goldengate_alerts" {
   env                  = "dev"
 }
 
-# Seed exactly one record: alert_id=GLOBAL, enabled=false, both list fields
-# empty. Nothing routes anywhere until an operator deliberately enables this
-# in the DynamoDB console -- matches the manager's own alerts_global seed
-# (distribution_list/maintenance_windows both empty lists, enabled=false).
-# ignore_changes = [item]: identical manager-compatible ownership pattern
-# already used for pipeline_config above -- Terraform seeds ONCE; an
-# operator's later routing changes via the console are never reset by a
-# subsequent apply. No email address, SNS endpoint, or webhook is
-# configured anywhere in this repository.
+# GLOBAL is the routing-policy singleton for gg-alerter (not yet
+# implemented) -- disabled/empty until an operator configures it via the
+# DynamoDB console. ignore_changes = [item]: Terraform seeds once only.
 resource "aws_dynamodb_table_item" "alerts_global" {
   depends_on = [
     module.goldengate_alerts
@@ -366,8 +206,5 @@ module "goldengate_metrics_history" {
   env                  = "dev"
 }
 
-# No seed records here (deliberately -- "no static data records", matching
-# the manager's own comment "No seed (runtime-only)"). Approximately
-# 100-day retention will be implemented by a future history writer via the
-# ttl attribute; this table is empty until that writer exists. No
-# gg-alerter application is created or deployed by this task.
+# No seed items -- populated only by a future gg-alerter/metrics-history
+# writer (not implemented yet).

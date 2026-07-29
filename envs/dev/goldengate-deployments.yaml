@@ -1,0 +1,31 @@
+# Canonical GoldenGate deployment/topology source for dev. Consumed by
+# envs/dev/dynamodb.tf (CONFIG seed), monitoring/monitor (collector +
+# portal), the goldengate-monitor Helm ConfigMap, workflow validation, and
+# tests. This is the single source -- no other file repeats this data.
+#
+# Internal service host, TLS server name, and default ports are DERIVED,
+# never stored here:
+#   service host:  <name>.<runtimeNamespace>.svc.cluster.local
+#   TLS server name: <name>.<dnsDomain>
+#   admin port: 8443 unless overridden per deployment
+#   metrics port: 9015 unless overridden per deployment
+
+environment: dev
+runtimeNamespace: goldengate-dev
+monitoringNamespace: goldengate-monitoring
+dnsDomain: goldengate-dev.adcbmis.local
+
+deployments:
+  - name: gg-oracle-payments-01
+    type: oracle
+    pipeline: payments-ora-to-pg-001
+    role: source
+    enabled: true
+    adminSecret: dev/goldengate/source/admin
+
+  - name: gg-postgresql-payments-01
+    type: postgresql
+    pipeline: payments-ora-to-pg-001
+    role: target
+    enabled: true
+    adminSecret: dev/goldengate/target/admin

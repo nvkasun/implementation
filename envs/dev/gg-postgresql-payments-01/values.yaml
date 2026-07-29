@@ -1,27 +1,17 @@
-# Phase 1 single-runtime candidate: PostgreSQL GoldenGate runtime.
-#
-# INACTIVE by design (deployment.enabled=false below). The existing
-# goldengate-eks-app.yaml deployment-detection logic already treats
-# deployment.enabled=false as inactive and excludes this folder from the
-# deployment matrix -- this file is not deployed by any workflow run in
-# Phase 1. It is not deployable at all yet regardless of this flag: the
-# shared goldengate-dev namespace and the shared gg-oracle-sa/gg-postgresql-sa
-# ServiceAccounts (with their IRSA role annotations) do not exist yet and are
-# provisioned by a later, separate platform/bootstrap step, outside this
-# Phase 1 chart/repository-model task.
+# PostgreSQL GoldenGate runtime, single-runtime deployment model.
+# Runtime identity (name, OGG_DEPLOYMENT, Service/Secret/StorageClass/
+# Ingress names) derives from Release.Name (this folder's basename) --
+# see helm/goldengate/templates/_helpers.tpl.
 deployment:
   enabled: true
 
 global:
   environment: dev
-  deploymentId: gg-postgresql-payments-01
 
 deploymentModel: singleRuntime
 
 runtime:
   enabled: true
-
-  name: gg-postgresql-payments-01
 
   deploymentType: postgresql
   businessDomain: payments
@@ -34,16 +24,6 @@ runtime:
     tag: "23.26.2.0.1"
     pullPolicy: IfNotPresent
 
-  ogg:
-    deploymentName: gg-postgresql-payments-01
-    domain: gg-postgresql-payments-01.goldengate-dev.svc.cluster.local
-    secureDeployment: false
-
-  admin:
-    existingSecret: gg-postgresql-payments-01-admin
-    usernameKey: OGG_ADMIN
-    passwordKey: OGG_ADMIN_PWD
-
   csi:
     enabled: true
     region: eu-west-1
@@ -51,15 +31,9 @@ runtime:
 
     admin:
       enabled: true
-      # providerClassName/secretName left empty so the chart generates them
-      # from the canonical runtime name (gg-postgresql-payments-01-admin) --
-      # see helm/goldengate/templates/_helpers.tpl.
-      providerClassName: ""
-      secretName: ""
-      # TEMPORARY: this is the existing shared POC Secrets Manager object
-      # path, reused unchanged from the current live payments-ora-to-pg-001
-      # deployment. It is not deployment-specific. A later phase should move
-      # this to a path scoped to gg-postgresql-payments-01 specifically.
+      # TEMPORARY: shared POC Secrets Manager object, reused across
+      # payments-ora-to-pg-* deployments. A later phase should scope this
+      # per deployment.
       objectName: dev/goldengate/target/admin
       objectType: secretsmanager
       mountPath: /mnt/secrets-store/admin
@@ -71,9 +45,7 @@ runtime:
 
     certificate:
       enabled: true
-      providerClassName: ""
-      # TEMPORARY: shared POC TLS certificate object path, same as the
-      # existing live deployment. Not deployment-specific yet.
+      # TEMPORARY: shared POC TLS certificate object, not deployment-specific.
       objectName: dev/goldengate/tls-certificate
       objectType: secretsmanager
       mountPath: /etc/nginx/cert
@@ -89,10 +61,8 @@ runtime:
     enabled: true
     mode: "0777"
 
-  # gg-postgresql-sa is a shared, engine-level identity, not owned by this
-  # single-runtime release -- must not be created here. Its creation and
-  # IRSA role annotation are provisioned by a later shared platform/bootstrap
-  # step, outside this Phase 1 task.
+  # gg-postgresql-sa is a shared, engine-level identity owned by
+  # helm/goldengate-platform -- never created here.
   serviceAccount:
     create: false
     name: gg-postgresql-sa
@@ -106,11 +76,6 @@ runtime:
       receiver: 9014
       metrics: 9015
 
-  # Unique EFS path for this candidate -- intentionally NOT the current live
-  # source/target EFS basePath. The EFS filesystem itself (fs-05cadf3570f23cd39)
-  # is the same already-existing filesystem; only this candidate's own
-  # basePath/StorageClass/PVC are new and unique, so existing EFS content for
-  # payments-ora-to-pg-001 is never touched, migrated, or renamed.
   storage:
     u02:
       type: efs
@@ -133,7 +98,7 @@ ingress:
   mode: shared
   className: alb
 
-  host: gg-postgresql-payments-01.goldengate-dev.adcbmis.local
+  hostDomain: goldengate-dev.adcbmis.local
 
   alb:
     groupName: gg-poc-dev-alb
@@ -149,10 +114,6 @@ ingress:
 
   annotations: {}
 
-# No observer sidecar in the approved single-runtime pod (see
-# helm/goldengate/templates/runtime-statefulset.yaml -- it never references
-# monitoring.observer at all). Left explicit and disabled here only for
-# documentation clarity.
 monitoring:
   labels:
     enabled: true
@@ -172,11 +133,8 @@ tolerations: []
 
 affinity: {}
 
-# Same existing EFS filesystem as the current live deployment -- only the
-# basePath/StorageClass/PVC names are unique to this candidate (see
-# runtime.storage above and the naming contract in this file's header
-# comment). reclaimPolicy: Retain for the same reason as the legacy
-# deployment: GoldenGate storage holds trail/checkpoint/recovery state.
+# reclaimPolicy: Retain -- GoldenGate storage holds trail/checkpoint/
+# recovery state and must survive PVC deletion.
 persistence:
   enabled: true
   provider: efs
@@ -184,11 +142,9 @@ persistence:
     fileSystemId: fs-05cadf3570f23cd39
     storageClass:
       create: true
-      name: gg-efs-dev-gg-postgresql-payments-01
       reclaimPolicy: Retain
       volumeBindingMode: Immediate
       directoryPerms: "0777"
-      basePath: /gg-postgresql-payments-01
       subPathPattern: "${.PVC.name}"
       ensureUniqueDirectory: "true"
       mountOptions:

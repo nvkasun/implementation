@@ -14,9 +14,6 @@ namespaces:
   runtime:
     create: false
     name: ""
-  monitoring:
-    create: false
-    name: ""
 
 # Shared, engine-level IRSA identities. One ServiceAccount per GoldenGate
 # engine (not per runtime release, not per deployment) -- gg-oracle-payments-01

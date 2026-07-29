@@ -1,7 +1,4 @@
 {{- if and (eq (default "legacyPair" .Values.deploymentModel) "singleRuntime") .Values.runtime.enabled }}
-{{- if not .Values.runtime.admin.existingSecret }}
-{{- fail "runtime.admin.existingSecret is required when deploymentModel=singleRuntime and runtime.enabled=true." }}
-{{- end }}
 {{- if and .Values.runtime.csi.enabled .Values.runtime.csi.admin.enabled (not .Values.runtime.csi.admin.objectName) }}
 {{- fail "runtime.csi.admin.objectName is required when runtime.csi.admin.enabled=true." }}
 {{- end }}
@@ -65,16 +62,11 @@ spec:
               echo "ok" > /u02/oggf/certificate/write-test.txt
               rm -f /u02/oggf/certificate/write-test.txt
 
-              # ServiceManager.pid records the OS process id of the GoldenGate
-              # Service Manager from a previous pod lifecycle. /u02 is
-              # persistent EFS storage, so this file can survive pod deletion
-              # and recreation even though the process it names is gone -- a
-              # new pod must never trust a PID left behind by an earlier pod
-              # lifecycle. A stale PID here makes Service Manager refuse to
-              # start ("already running") against a PID that no longer
-              # exists, which cascades into the Administration Server,
-              # Performance Metrics Server, and Distribution/Receiver managed
-              # processes never starting either.
+              # ServiceManager.pid survives on persistent EFS across pod
+              # restarts even though the process it names is gone. A stale
+              # PID makes Service Manager refuse to start ("already
+              # running"), which cascades into every managed process never
+              # starting -- must be removed on every pod start.
               SERVICE_MANAGER_PID_FILE="/u02/ServiceManager/var/run/ServiceManager.pid"
 
               if [ -e "$SERVICE_MANAGER_PID_FILE" ] || [ -L "$SERVICE_MANAGER_PID_FILE" ]; then
@@ -122,20 +114,20 @@ spec:
             - name: OGG_ADMIN
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.runtime.admin.existingSecret }}
+                  name: {{ include "goldengate.runtimeAdminSecretName" . }}
                   key: {{ .Values.runtime.admin.usernameKey | default "OGG_ADMIN" }}
 
             - name: OGG_ADMIN_PWD
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.runtime.admin.existingSecret }}
+                  name: {{ include "goldengate.runtimeAdminSecretName" . }}
                   key: {{ .Values.runtime.admin.passwordKey | default "OGG_ADMIN_PWD" }}
 
             - name: OGG_DEPLOYMENT
-              value: {{ required "runtime.ogg.deploymentName is required when deploymentModel=singleRuntime and runtime.enabled=true" .Values.runtime.ogg.deploymentName | quote }}
+              value: {{ include "goldengate.runtimeName" . | quote }}
 
             - name: OGG_DOMAIN
-              value: {{ required "runtime.ogg.domain is required when deploymentModel=singleRuntime and runtime.enabled=true" .Values.runtime.ogg.domain | quote }}
+              value: {{ printf "%s.%s.svc.cluster.local" (include "goldengate.runtimeName" .) .Release.Namespace | quote }}
 
             - name: OGG_SECURE_DEPLOYMENT
               value: {{ .Values.runtime.ogg.secureDeployment | default false | quote }}

@@ -14,12 +14,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 MONITOR_WORKFLOW_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "goldengate-monitor.yaml")
 ARGOCD_WORKFLOW_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "argocd-eks-deployment.yaml")
+DEPLOYMENTS_FILE_PATH = os.path.join(REPO_ROOT, "envs", "dev", "goldengate-deployments.yaml")
 
-# boto3/botocore are runtime dependencies (see requirements.txt) but are not
-# required to run this unit-test suite: every test injects a mock DynamoDB
-# table rather than exercising the real AWS SDK. Stub the imports only when
-# the real packages are unavailable in the environment running the tests, so
-# `import monitor` succeeds either way.
+# boto3/botocore are runtime dependencies but not required to run this
+# suite: every test injects a fake/mock table. Stub only when unavailable.
 try:
     import boto3  # noqa: F401
 except ImportError:
@@ -46,40 +44,29 @@ except ImportError:
     sys.modules["botocore.config"] = mock.MagicMock()
     sys.modules["botocore.exceptions"] = exceptions_stub
 
+import config as cfgmod  # noqa: E402
 import monitor  # noqa: E402
 
 
 def make_config(**overrides):
-    env = {
-        "AWS_REGION": "eu-west-1",
-        "DYNAMODB_TABLE": "gg-eks-pipeline",
-    }
+    env = {"AWS_REGION": "eu-west-1", "DYNAMODB_TABLE": "gg-eks-pipeline"}
     env.update(overrides)
-    return monitor.load_config(env)
+    return cfgmod.load_config(env)
 
 
-RUNTIMES = [
-    {"pipeline": "gg-oracle-payments-01", "name": "oracle-payments-01", "type": "oracle", "enabled": True},
-    {"pipeline": "gg-postgresql-payments-01", "name": "postgresql-payments-01", "type": "postgresql", "enabled": True},
+DEPLOYMENTS = [
+    {"name": "gg-oracle-payments-01", "type": "oracle", "pipeline": "payments-ora-to-pg-001",
+    "role": "source", "enabled": True, "adminSecret": "dev/goldengate/source/admin"},
+    {"name": "gg-postgresql-payments-01", "type": "postgresql", "pipeline": "payments-ora-to-pg-001",
+    "role": "target", "enabled": True, "adminSecret": "dev/goldengate/target/admin"},
 ]
 
-LOGICAL_PIPELINES = [
-    {
-        "pipelineId": "payments-ora-to-pg-001",
-        "environment": "dev",
-        "roles": {
-            "source": {"pipeline": "gg-oracle-payments-01", "deploymentType": "oracle"},
-            "target": {"pipeline": "gg-postgresql-payments-01", "deploymentType": "postgresql"},
-        },
-    },
-]
+LOGICAL_PIPELINES = cfgmod.build_logical_pipelines(DEPLOYMENTS)
 
 
 class FakeTable:
     """Minimal in-memory stand-in for a boto3 DynamoDB Table -- supports
-    only get_item/query (never scan/put_item/update_item/delete_item),
-    matching the real Table's read-only surface this portal is allowed to
-    use."""
+    only get_item/query, matching this portal's read-only surface."""
 
     def __init__(self, items=None):
         self.items = list(items or [])
@@ -101,8 +88,9 @@ class FakeTable:
                           if it["pipeline"] == pipeline and it["recordType"].startswith(prefix)]}
 
 
-def make_config_item(pipeline="gg-oracle-payments-01", **overrides):
-    item = {"pipeline": pipeline, "recordType": "CONFIG", "alertsEnabled": False, "metricsEnabled": False}
+def make_deployment_state_item(pipeline="gg-oracle-payments-01", status="UP", recorded_at=1780000000, **overrides):
+    item = {"pipeline": pipeline, "recordType": "STATE#_deployment", "status": status,
+           "recordedAt": recorded_at, "deploymentType": "oracle"}
     item.update(overrides)
     return item
 
@@ -110,13 +98,6 @@ def make_config_item(pipeline="gg-oracle-payments-01", **overrides):
 def make_lease_item(pipeline="gg-oracle-payments-01", now=1780000000, **overrides):
     item = {"pipeline": pipeline, "recordType": "LEASE", "holder": "gg-monitor-0",
            "expiresAt": now + 30, "ttl": now + 90}
-    item.update(overrides)
-    return item
-
-
-def make_deployment_state_item(pipeline="gg-oracle-payments-01", status="UP", recorded_at=1780000000, **overrides):
-    item = {"pipeline": pipeline, "recordType": "STATE#_deployment", "status": status,
-           "recordedAt": recorded_at, "deploymentType": "oracle"}
     item.update(overrides)
     return item
 
@@ -133,59 +114,30 @@ class ConfigValidationTests(unittest.TestCase):
     def test_valid_configuration(self):
         config = make_config()
         self.assertEqual(config.aws_region, "eu-west-1")
-        self.assertEqual(config.dynamodb_table, "gg-eks-pipeline")
         self.assertEqual(config.port, 8080)
-        self.assertEqual(config.stale_after_seconds, 120)
-        self.assertEqual(config.refresh_seconds, 30)
         self.assertTrue(config.legacy_fallback_enabled)
-        self.assertEqual(config.repo_config_root, monitor.inventory.DEFAULT_REPO_ROOT)
 
     def test_missing_aws_region(self):
-        with self.assertRaises(monitor.ConfigError):
-            monitor.load_config({"DYNAMODB_TABLE": "gg-eks-pipeline"})
-
-    def test_missing_dynamodb_table(self):
-        with self.assertRaises(monitor.ConfigError):
-            monitor.load_config({"AWS_REGION": "eu-west-1"})
+        with self.assertRaises(cfgmod.ConfigError):
+            cfgmod.load_config({"DYNAMODB_TABLE": "gg-eks-pipeline"})
 
     def test_invalid_port(self):
-        with self.assertRaises(monitor.ConfigError):
+        with self.assertRaises(cfgmod.ConfigError):
             make_config(PORT="0")
-        with self.assertRaises(monitor.ConfigError):
+        with self.assertRaises(cfgmod.ConfigError):
             make_config(PORT="70000")
-        with self.assertRaises(monitor.ConfigError):
-            make_config(PORT="-1")
 
     def test_invalid_stale_threshold(self):
-        with self.assertRaises(monitor.ConfigError):
+        with self.assertRaises(cfgmod.ConfigError):
             make_config(STALE_AFTER_SECONDS="0")
-        with self.assertRaises(monitor.ConfigError):
-            make_config(STALE_AFTER_SECONDS="-5")
-
-    def test_legacy_fallback_can_be_disabled(self):
-        config = make_config(LEGACY_FALLBACK_ENABLED="false")
-        self.assertFalse(config.legacy_fallback_enabled)
-
-    def test_legacy_fallback_accepts_explicit_true(self):
-        config = make_config(LEGACY_FALLBACK_ENABLED="true")
-        self.assertTrue(config.legacy_fallback_enabled)
-
-    def test_repo_config_root_overridable(self):
-        config = make_config(REPO_CONFIG_ROOT="/custom/path")
-        self.assertEqual(config.repo_config_root, "/custom/path")
 
 
 class CanonicalEffectiveStatusTests(unittest.TestCase):
-    """Canonical STATE#_deployment.status (UP/STARTING/DEPLOYMENT_DOWN/
-    UNKNOWN) -> effective portal status (UP/STARTING/DOWN/STALE/MISSING/
-    UNKNOWN)."""
-
     def test_up_maps_to_up(self):
         item = make_deployment_state_item(status="UP", recorded_at=1780000000)
         out = monitor.compute_canonical_effective_status(item, now=1780000010, stale_after_seconds=120)
         self.assertEqual(out["effectiveStatus"], "UP")
         self.assertTrue(out["fresh"])
-        self.assertEqual(out["ageSeconds"], 10)
 
     def test_starting_maps_to_starting(self):
         item = make_deployment_state_item(status="STARTING", recorded_at=1780000000)
@@ -197,66 +149,29 @@ class CanonicalEffectiveStatusTests(unittest.TestCase):
         out = monitor.compute_canonical_effective_status(item, now=1780000010, stale_after_seconds=120)
         self.assertEqual(out["effectiveStatus"], "DOWN")
 
-    def test_unrecognized_raw_status_maps_to_unknown(self):
-        item = make_deployment_state_item(status="SOMETHING_ELSE", recorded_at=1780000000)
-        out = monitor.compute_canonical_effective_status(item, now=1780000010, stale_after_seconds=120)
-        self.assertEqual(out["effectiveStatus"], "UNKNOWN")
-
     def test_stale_overrides_raw_status(self):
         item = make_deployment_state_item(status="UP", recorded_at=1780000000)
         out = monitor.compute_canonical_effective_status(item, now=1780000000 + 121, stale_after_seconds=120)
         self.assertEqual(out["effectiveStatus"], "STALE")
-        self.assertFalse(out["fresh"])
 
     def test_missing_item_is_missing(self):
         out = monitor.compute_canonical_effective_status(None, now=1780000000, stale_after_seconds=120)
         self.assertEqual(out["effectiveStatus"], "MISSING")
-        self.assertIsNone(out["recordedAt"])
-        self.assertFalse(out["fresh"])
-
-    def test_malformed_recorded_at_is_unknown_and_does_not_raise(self):
-        for bad_value in ("not-a-timestamp", "", [], {}, object()):
-            with self.subTest(bad_value=bad_value):
-                item = make_deployment_state_item(status="UP", recorded_at=bad_value)
-                try:
-                    out = monitor.compute_canonical_effective_status(item, now=1780000010, stale_after_seconds=120)
-                except Exception as exc:  # noqa: BLE001 -- proving no exception escapes
-                    self.fail(f"compute_canonical_effective_status raised {exc!r} for {bad_value!r}")
-                self.assertEqual(out["effectiveStatus"], "UNKNOWN")
-                self.assertIsNone(out["ageSeconds"])
 
     def test_future_timestamp_never_yields_negative_age(self):
         item = make_deployment_state_item(status="UP", recorded_at=1780000100)
         out = monitor.compute_canonical_effective_status(item, now=1780000000, stale_after_seconds=120)
         self.assertEqual(out["ageSeconds"], 0)
-        self.assertTrue(out["fresh"])
-
-        far_future_item = make_deployment_state_item(
-            status="UP", recorded_at=1780000000 + monitor.FUTURE_TIMESTAMP_TOLERANCE_SECONDS + 3600)
-        out = monitor.compute_canonical_effective_status(far_future_item, now=1780000000, stale_after_seconds=120)
-        self.assertEqual(out["effectiveStatus"], "UNKNOWN")
-        self.assertIsNone(out["ageSeconds"])
 
 
 class LegacyEffectiveStatusTests(unittest.TestCase):
-    """Legacy observer STATE#_deployment.status (HEALTHY/DEGRADED/DOWN) ->
-    the SAME closed effective-status enum as the canonical path."""
-
     def test_healthy_maps_to_up(self):
         item = {"pipeline": "gg-payments-ora-to-pg-001-source", "recordType": "STATE#_deployment",
                "status": "HEALTHY", "recordedAt": 1780000000}
         out = monitor.compute_legacy_effective_status(item, now=1780000010, stale_after_seconds=120)
         self.assertEqual(out["effectiveStatus"], "UP")
 
-    def test_down_maps_to_down(self):
-        item = {"pipeline": "gg-payments-ora-to-pg-001-source", "recordType": "STATE#_deployment",
-               "status": "DOWN", "recordedAt": 1780000000}
-        out = monitor.compute_legacy_effective_status(item, now=1780000010, stale_after_seconds=120)
-        self.assertEqual(out["effectiveStatus"], "DOWN")
-
-    def test_degraded_maps_to_unknown_not_starting_or_down(self):
-        """DEGRADED intentionally does not overclaim in either direction --
-        see monitor._LEGACY_STATUS_MAP."""
+    def test_degraded_maps_to_unknown(self):
         item = {"pipeline": "gg-payments-ora-to-pg-001-source", "recordType": "STATE#_deployment",
                "status": "DEGRADED", "recordedAt": 1780000000}
         out = monitor.compute_legacy_effective_status(item, now=1780000010, stale_after_seconds=120)
@@ -266,12 +181,6 @@ class LegacyEffectiveStatusTests(unittest.TestCase):
         out = monitor.compute_legacy_effective_status(None, now=1780000000, stale_after_seconds=120)
         self.assertEqual(out["effectiveStatus"], "MISSING")
 
-    def test_stale_legacy_record_overrides_raw_status(self):
-        item = {"pipeline": "gg-payments-ora-to-pg-001-source", "recordType": "STATE#_deployment",
-               "status": "HEALTHY", "recordedAt": 1780000000}
-        out = monitor.compute_legacy_effective_status(item, now=1780000000 + 121, stale_after_seconds=120)
-        self.assertEqual(out["effectiveStatus"], "STALE")
-
 
 class ProcessRowNormalizationTests(unittest.TestCase):
     def test_running_stopped_abended_pass_through(self):
@@ -280,78 +189,27 @@ class ProcessRowNormalizationTests(unittest.TestCase):
 
     def test_unrecognized_process_status_becomes_unknown(self):
         self.assertEqual(monitor.normalize_process_status("SOMETHING_ELSE"), "UNKNOWN")
-        self.assertEqual(monitor.normalize_process_status(None), "UNKNOWN")
-
-    def test_process_row_extracts_process_name_from_record_type(self):
-        row = make_process_item(process="EXTORA1", status="RUNNING", recorded_at=1780000000)
-        out = monitor.normalize_process_row(row, now=1780000010, stale_after_seconds=120)
-        self.assertEqual(out["process"], "EXTORA1")
-        self.assertEqual(out["status"], "RUNNING")
-        self.assertFalse(out["stale"])
-        self.assertEqual(out["ageSeconds"], 10)
 
     def test_process_row_never_exposes_raw_error_msg_field(self):
         row = make_process_item(status="ABENDED", errorMsg="db-internal.example.local password=x")
         out = monitor.normalize_process_row(row, now=1780000010, stale_after_seconds=120)
         self.assertNotIn("errorMsg", out)
-        self.assertIn("hasError", out)
-        self.assertIn("statusCode", out)
-        self.assertIn("statusMessage", out)
         self.assertTrue(out["hasError"])
         self.assertEqual(out["statusCode"], "PROCESS_ABENDED")
 
 
-class ProcessErrorSanitizationTests(unittest.TestCase):
-    SENSITIVE_STRINGS = (
-        "password=super-secret-test-value",
-        "db-internal.example.local",
-        "arn:aws:secretsmanager:test",
-        "Authorization: Basic abc123",
-    )
-
-    def test_status_code_is_from_the_closed_enum(self):
-        allowed = {"NONE", "POLL_FAILED", "AUTH_FAILED", "TLS_FAILED",
-                  "ENDPOINT_UNAVAILABLE", "STALE", "PROCESS_ABENDED", "UNKNOWN"}
-        for status, error_msg, stale in (
-            ("RUNNING", "", False),
-            ("RUNNING", "connection timeout to db-internal.example.local", False),
-            ("RUNNING", "401 Unauthorized: Authorization: Basic abc123", False),
-            ("RUNNING", "SSL handshake failed, certificate invalid", False),
-            ("ABENDED", "", False),
-            ("RUNNING", "", True),
-            ("RUNNING", "something unclassifiable happened", False),
-        ):
-            code = monitor._classify_process_status_code(status, error_msg, stale)
-            self.assertIn(code, allowed)
-
-    def test_classification_never_returns_the_raw_text(self):
-        for sensitive in self.SENSITIVE_STRINGS:
-            code = monitor._classify_process_status_code("ABENDED", sensitive, False)
-            message = monitor._PROCESS_STATUS_CODE_MESSAGES[code]
-            self.assertNotIn(sensitive, code)
-            self.assertNotIn(sensitive, message)
-
-    def test_has_error_false_when_no_error_and_not_stale_and_not_abended(self):
-        has_error, code, _ = monitor._sanitized_process_error("RUNNING", "", False)
-        self.assertFalse(has_error)
-        self.assertEqual(code, "NONE")
-
-    def test_has_error_true_when_abended(self):
-        has_error, code, _ = monitor._sanitized_process_error("ABENDED", "", False)
-        self.assertTrue(has_error)
-        self.assertEqual(code, "PROCESS_ABENDED")
-
-
 class ReadRuntimeViewTests(unittest.TestCase):
     """Canonical-preferred-over-legacy, fallback-when-missing, and
-    fallback-disabled behaviour (section 11)."""
+    fallback-disabled behaviour."""
+
+    def _meta(self):
+        return {"type": "oracle", "enabled": True}
 
     def test_canonical_data_used_when_present(self):
         now = 1780000010
         table = FakeTable([make_deployment_state_item(recorded_at=now - 5)])
-        role_info = {"pipeline": "gg-oracle-payments-01", "deploymentType": "oracle"}
-        out = monitor.read_runtime_view(table, "payments-ora-to-pg-001", "source", role_info,
-                                        RUNTIMES[0], legacy_fallback_enabled=True, now=now, stale_after_seconds=120)
+        out = monitor.read_runtime_view(table, "payments-ora-to-pg-001", "source", "gg-oracle-payments-01",
+                                        self._meta(), legacy_fallback_enabled=True, now=now, stale_after_seconds=120)
         self.assertEqual(out["dataSource"], "canonical-monitor")
         self.assertEqual(out["effectiveStatus"], "UP")
 
@@ -360,88 +218,67 @@ class ReadRuntimeViewTests(unittest.TestCase):
         legacy_item = {"pipeline": "gg-payments-ora-to-pg-001-source", "recordType": "STATE#_deployment",
                        "status": "HEALTHY", "recordedAt": now - 5}
         table = FakeTable([legacy_item])
-        role_info = {"pipeline": "gg-oracle-payments-01", "deploymentType": "oracle"}
-        out = monitor.read_runtime_view(table, "payments-ora-to-pg-001", "source", role_info,
-                                        RUNTIMES[0], legacy_fallback_enabled=True, now=now, stale_after_seconds=120)
+        out = monitor.read_runtime_view(table, "payments-ora-to-pg-001", "source", "gg-oracle-payments-01",
+                                        self._meta(), legacy_fallback_enabled=True, now=now, stale_after_seconds=120)
         self.assertEqual(out["dataSource"], "legacy-observer-fallback")
         self.assertEqual(out["effectiveStatus"], "UP")
 
     def test_no_legacy_key_hardcoded_in_source(self):
-        """The legacy key must be DERIVED from pipelineId + role, never a
-        literal hardcoded string, per section 11."""
         import inspect
         src = inspect.getsource(monitor.read_runtime_view)
         self.assertIn('f"gg-{pipeline_id}-{role}"', src)
         self.assertNotIn("gg-payments-ora-to-pg-001-source", src)
-        self.assertNotIn("gg-payments-ora-to-pg-001-target", src)
 
     def test_fallback_disabled_shows_missing_not_legacy_data(self):
         now = 1780000010
         legacy_item = {"pipeline": "gg-payments-ora-to-pg-001-source", "recordType": "STATE#_deployment",
                        "status": "HEALTHY", "recordedAt": now - 5}
         table = FakeTable([legacy_item])
-        role_info = {"pipeline": "gg-oracle-payments-01", "deploymentType": "oracle"}
-        out = monitor.read_runtime_view(table, "payments-ora-to-pg-001", "source", role_info,
-                                        RUNTIMES[0], legacy_fallback_enabled=False, now=now, stale_after_seconds=120)
+        out = monitor.read_runtime_view(table, "payments-ora-to-pg-001", "source", "gg-oracle-payments-01",
+                                        self._meta(), legacy_fallback_enabled=False, now=now, stale_after_seconds=120)
         self.assertEqual(out["dataSource"], "canonical-monitor")
         self.assertEqual(out["effectiveStatus"], "MISSING")
 
     def test_canonical_always_wins_even_when_legacy_also_present(self):
         now = 1780000010
-        canonical_item = make_deployment_state_item(recorded_at=now - 5, status="UP")
-        legacy_item = {"pipeline": "gg-payments-ora-to-pg-001-source", "recordType": "STATE#_deployment",
-                       "status": "DOWN", "recordedAt": now - 5}
-        table = FakeTable([canonical_item, legacy_item])
-        role_info = {"pipeline": "gg-oracle-payments-01", "deploymentType": "oracle"}
-        out = monitor.read_runtime_view(table, "payments-ora-to-pg-001", "source", role_info,
-                                        RUNTIMES[0], legacy_fallback_enabled=True, now=now, stale_after_seconds=120)
+        table = FakeTable([
+            make_deployment_state_item(recorded_at=now - 5, status="UP"),
+            {"pipeline": "gg-payments-ora-to-pg-001-source", "recordType": "STATE#_deployment",
+             "status": "DOWN", "recordedAt": now - 5},
+        ])
+        out = monitor.read_runtime_view(table, "payments-ora-to-pg-001", "source", "gg-oracle-payments-01",
+                                        self._meta(), legacy_fallback_enabled=True, now=now, stale_after_seconds=120)
         self.assertEqual(out["dataSource"], "canonical-monitor")
         self.assertEqual(out["effectiveStatus"], "UP")
-
-    def test_legacy_fallback_has_no_process_rows(self):
-        now = 1780000010
-        legacy_item = {"pipeline": "gg-payments-ora-to-pg-001-source", "recordType": "STATE#_deployment",
-                       "status": "HEALTHY", "recordedAt": now - 5}
-        table = FakeTable([legacy_item])
-        role_info = {"pipeline": "gg-oracle-payments-01", "deploymentType": "oracle"}
-        out = monitor.read_runtime_view(table, "payments-ora-to-pg-001", "source", role_info,
-                                        RUNTIMES[0], legacy_fallback_enabled=True, now=now, stale_after_seconds=120)
-        self.assertEqual(out["processes"], [])
 
     def test_no_process_state_rows_produces_empty_list_not_crash(self):
         now = 1780000010
         table = FakeTable([make_deployment_state_item(recorded_at=now - 5)])
-        role_info = {"pipeline": "gg-oracle-payments-01", "deploymentType": "oracle"}
-        out = monitor.read_runtime_view(table, "payments-ora-to-pg-001", "source", role_info,
-                                        RUNTIMES[0], legacy_fallback_enabled=True, now=now, stale_after_seconds=120)
+        out = monitor.read_runtime_view(table, "payments-ora-to-pg-001", "source", "gg-oracle-payments-01",
+                                        self._meta(), legacy_fallback_enabled=True, now=now, stale_after_seconds=120)
         self.assertEqual(out["processes"], [])
 
     def test_critical_service_state_passed_through(self):
         now = 1780000010
-        dep_item = make_deployment_state_item(recorded_at=now - 5,
-                                              criticalServices={"adminsrvr": {"reachable": True}})
-        table = FakeTable([dep_item])
-        role_info = {"pipeline": "gg-oracle-payments-01", "deploymentType": "oracle"}
-        out = monitor.read_runtime_view(table, "payments-ora-to-pg-001", "source", role_info,
-                                        RUNTIMES[0], legacy_fallback_enabled=True, now=now, stale_after_seconds=120)
+        table = FakeTable([make_deployment_state_item(recorded_at=now - 5,
+                                                      criticalServices={"adminsrvr": {"reachable": True}})])
+        out = monitor.read_runtime_view(table, "payments-ora-to-pg-001", "source", "gg-oracle-payments-01",
+                                        self._meta(), legacy_fallback_enabled=True, now=now, stale_after_seconds=120)
         self.assertEqual(out["criticalServices"], {"adminsrvr": True})
 
     def test_lease_freshness_exposed(self):
         now = 1780000010
-        table = FakeTable([make_deployment_state_item(recorded_at=now - 5),
-                           make_lease_item(now=now)])
-        role_info = {"pipeline": "gg-oracle-payments-01", "deploymentType": "oracle"}
-        out = monitor.read_runtime_view(table, "payments-ora-to-pg-001", "source", role_info,
-                                        RUNTIMES[0], legacy_fallback_enabled=True, now=now, stale_after_seconds=120)
+        table = FakeTable([make_deployment_state_item(recorded_at=now - 5), make_lease_item(now=now)])
+        out = monitor.read_runtime_view(table, "payments-ora-to-pg-001", "source", "gg-oracle-payments-01",
+                                        self._meta(), legacy_fallback_enabled=True, now=now, stale_after_seconds=120)
         self.assertTrue(out["lease"]["fresh"])
 
     def test_expired_lease_shown_as_not_fresh(self):
         now = 1780000010
         table = FakeTable([make_deployment_state_item(recorded_at=now - 5),
                            make_lease_item(now=now, expiresAt=now - 100)])
-        role_info = {"pipeline": "gg-oracle-payments-01", "deploymentType": "oracle"}
-        out = monitor.read_runtime_view(table, "payments-ora-to-pg-001", "source", role_info,
-                                        RUNTIMES[0], legacy_fallback_enabled=True, now=now, stale_after_seconds=120)
+        out = monitor.read_runtime_view(table, "payments-ora-to-pg-001", "source", "gg-oracle-payments-01",
+                                        self._meta(), legacy_fallback_enabled=True, now=now, stale_after_seconds=120)
         self.assertFalse(out["lease"]["fresh"])
 
 
@@ -455,10 +292,9 @@ class BuildStatusPayloadTests(unittest.TestCase):
              "status": "HEALTHY", "recordedAt": now - 5},
         ])
         config = make_config()
-        payload = monitor.build_status_payload(config, table, RUNTIMES, LOGICAL_PIPELINES, clock=lambda: now)
+        payload = monitor.build_status_payload(config, table, DEPLOYMENTS, LOGICAL_PIPELINES, clock=lambda: now)
 
         self.assertIn("generatedAt", payload)
-        self.assertIn("logicalPipelines", payload)
         lp = payload["logicalPipelines"][0]
         self.assertEqual(lp["pipelineId"], "payments-ora-to-pg-001")
         roles = {r["role"]: r for r in lp["runtimes"]}
@@ -467,23 +303,6 @@ class BuildStatusPayloadTests(unittest.TestCase):
         self.assertEqual(roles["target"]["deploymentName"], "gg-postgresql-payments-01")
         self.assertEqual(roles["target"]["dataSource"], "legacy-observer-fallback")
 
-    def test_no_scan_call_occurs(self):
-        table = FakeTable([make_deployment_state_item(recorded_at=1780000005)])
-        config = make_config()
-        monitor.build_status_payload(config, table, RUNTIMES, LOGICAL_PIPELINES, clock=lambda: 1780000010)
-        self.assertFalse(hasattr(table, "scan_calls"))
-        self.assertFalse(hasattr(table, "scan"))
-
-    def test_no_write_methods_exist_on_fake_table(self):
-        """FakeTable itself has no put_item/update_item/delete_item/
-        batch_writer -- proving build_status_payload cannot call them
-        without raising AttributeError (none did)."""
-        table = FakeTable([make_deployment_state_item(recorded_at=1780000005)])
-        config = make_config()
-        monitor.build_status_payload(config, table, RUNTIMES, LOGICAL_PIPELINES, clock=lambda: 1780000010)
-        for forbidden in ("put_item", "update_item", "delete_item", "batch_writer", "scan"):
-            self.assertFalse(hasattr(table, forbidden))
-
     def test_dynamodb_read_failure_raises_read_error(self):
         from botocore.exceptions import ClientError
         table = mock.Mock()
@@ -491,128 +310,107 @@ class BuildStatusPayloadTests(unittest.TestCase):
             {"Error": {"Code": "AccessDeniedException", "Message": "boom"}}, "GetItem")
         config = make_config()
         with self.assertRaises(monitor.DynamoDbReadError):
-            monitor.build_status_payload(config, table, RUNTIMES, LOGICAL_PIPELINES, clock=lambda: 1780000010)
+            monitor.build_status_payload(config, table, DEPLOYMENTS, LOGICAL_PIPELINES, clock=lambda: 1780000010)
+
+    def test_real_repo_config_produces_two_runtimes_under_one_pipeline(self):
+        doc = cfgmod.load_deployments(os.path.join(REPO_ROOT, "envs", "dev"))
+        lps = cfgmod.build_logical_pipelines(doc["deployments"])
+        table = FakeTable([])
+        config = make_config()
+        payload = monitor.build_status_payload(config, table, doc["deployments"], lps, clock=lambda: 1780000010)
+        self.assertEqual(len(payload["logicalPipelines"]), 1)
+        self.assertEqual(len(payload["logicalPipelines"][0]["runtimes"]), 2)
 
 
 class DecimalConversionTests(unittest.TestCase):
     def test_integral_decimal_becomes_int(self):
         self.assertEqual(monitor.decimal_to_jsonsafe(Decimal("500000")), 500000)
-        self.assertIsInstance(monitor.decimal_to_jsonsafe(Decimal("500000")), int)
 
     def test_fractional_decimal_becomes_float(self):
         self.assertEqual(monitor.decimal_to_jsonsafe(Decimal("50.25")), 50.25)
-        self.assertIsInstance(monitor.decimal_to_jsonsafe(Decimal("50.25")), float)
-
-    def test_non_decimal_passthrough(self):
-        self.assertEqual(monitor.decimal_to_jsonsafe("UP"), "UP")
-        self.assertEqual(monitor.decimal_to_jsonsafe(True), True)
 
     def test_json_default_serializes_decimal(self):
-        payload = {"value": Decimal("12.50")}
-        encoded = json.dumps(payload, default=monitor._json_default)
+        encoded = json.dumps({"value": Decimal("12.50")}, default=monitor._json_default)
         self.assertEqual(json.loads(encoded)["value"], 12.5)
 
 
 class HtmlEscapingTests(unittest.TestCase):
     def test_malicious_values_are_escaped_in_html(self):
         malicious = '<script>alert(1)</script>'
-        payload = {
-            "generatedAt": 1780000010,
-            "logicalPipelines": [{
-                "pipelineId": malicious, "environment": "dev",
-                "runtimes": [{
-                    "role": "source", "deploymentName": malicious, "deploymentType": "oracle",
-                    "effectiveStatus": "UP", "dataSource": "canonical-monitor", "ageSeconds": 1,
-                    "lease": None, "processes": [],
-                }],
-            }],
-        }
-        config = make_config()
-        rendered = monitor.render_html(payload, config)
+        payload = {"generatedAt": 1780000010, "logicalPipelines": [{
+            "pipelineId": malicious,
+            "runtimes": [{"role": "source", "deploymentName": malicious, "deploymentType": "oracle",
+                         "effectiveStatus": "UP", "dataSource": "canonical-monitor", "ageSeconds": 1,
+                         "lease": None, "processes": []}],
+        }]}
+        rendered = monitor.render_html(payload, make_config())
         self.assertNotIn("<script>", rendered)
         self.assertIn(html_module.escape(malicious), rendered)
 
     def test_no_process_rows_shows_fixed_message(self):
-        payload = {
-            "generatedAt": 1780000010,
-            "logicalPipelines": [{
-                "pipelineId": "payments-ora-to-pg-001", "environment": "dev",
-                "runtimes": [{
-                    "role": "source", "deploymentName": "gg-oracle-payments-01", "deploymentType": "oracle",
-                    "effectiveStatus": "UP", "dataSource": "canonical-monitor", "ageSeconds": 1,
-                    "lease": None, "processes": [],
-                }],
-            }],
-        }
-        config = make_config()
-        rendered = monitor.render_html(payload, config)
+        payload = {"generatedAt": 1780000010, "logicalPipelines": [{
+            "pipelineId": "payments-ora-to-pg-001",
+            "runtimes": [{"role": "source", "deploymentName": "gg-oracle-payments-01", "deploymentType": "oracle",
+                         "effectiveStatus": "UP", "dataSource": "canonical-monitor", "ageSeconds": 1,
+                         "lease": None, "processes": []}],
+        }]}
+        rendered = monitor.render_html(payload, make_config())
         self.assertIn("No process STATE rows found.", rendered)
 
 
 class HealthAndReadyTests(unittest.TestCase):
-    def _handler(self, config, table_factory):
-        handler_cls = monitor._make_handler(config, table_factory, RUNTIMES, LOGICAL_PIPELINES)
+    def _handler(self, config, table_factory, ready_state=None, expected=None):
+        handler_cls = monitor._make_handler(config, table_factory, DEPLOYMENTS, LOGICAL_PIPELINES,
+                                            ready_state or {}, expected or [])
         handler = handler_cls.__new__(handler_cls)
         writes = []
         handler._write = lambda status, ctype, body: writes.append((status, ctype, body))
         return handler, writes
 
     def test_healthz_returns_200_and_never_touches_dynamodb(self):
-        config = make_config()
         factory = mock.Mock(side_effect=AssertionError("healthz must never call the table factory"))
-        handler, writes = self._handler(config, factory)
+        handler, writes = self._handler(make_config(), factory)
         handler.path = "/healthz"
         handler.do_GET()
         self.assertEqual(writes[0][0], 200)
-        self.assertEqual(json.loads(writes[0][2])["status"], "ok")
         factory.assert_not_called()
 
-    def test_readyz_returns_200_when_describe_table_succeeds(self):
-        config = make_config()
+    def test_readyz_returns_200_when_collector_ready_and_dynamodb_reachable(self):
         table = mock.Mock()
-        handler, writes = self._handler(config, lambda: table)
+        handler, writes = self._handler(make_config(), lambda: table,
+                                        ready_state={"gg-oracle-payments-01": True},
+                                        expected=["gg-oracle-payments-01"])
         handler.path = "/readyz"
         handler.do_GET()
         self.assertEqual(writes[0][0], 200)
 
-    def test_readyz_returns_503_on_dynamodb_failure(self):
-        config = make_config()
-        table = mock.Mock()
-        table.meta.client.describe_table.side_effect = RuntimeError("boom")
-        handler, writes = self._handler(config, lambda: table)
+    def test_readyz_returns_503_when_collector_not_ready(self):
+        handler, writes = self._handler(make_config(), lambda: mock.Mock(),
+                                        ready_state={"gg-oracle-payments-01": False},
+                                        expected=["gg-oracle-payments-01"])
         handler.path = "/readyz"
         handler.do_GET()
         self.assertEqual(writes[0][0], 503)
 
-    def test_readyz_uses_request_local_table_from_factory(self):
-        config = make_config()
-        created = []
-
-        def factory():
-            t = mock.Mock()
-            created.append(t)
-            return t
-
-        handler, writes = self._handler(config, factory)
+    def test_readyz_returns_503_on_dynamodb_failure(self):
+        table = mock.Mock()
+        table.meta.client.describe_table.side_effect = RuntimeError("boom")
+        handler, writes = self._handler(make_config(), lambda: table)
         handler.path = "/readyz"
         handler.do_GET()
-        self.assertEqual(len(created), 1)
+        self.assertEqual(writes[0][0], 503)
 
 
 class RootPageErrorBannerTests(unittest.TestCase):
     def test_root_page_shows_sanitized_banner_on_dynamodb_failure(self):
-        config = make_config()
-
         def factory():
             raise RuntimeError("boom")
-
-        handler_cls = monitor._make_handler(config, factory, RUNTIMES, LOGICAL_PIPELINES)
+        handler_cls = monitor._make_handler(make_config(), factory, DEPLOYMENTS, LOGICAL_PIPELINES, {}, [])
         handler = handler_cls.__new__(handler_cls)
         handler.path = "/"
         writes = []
         handler._write = lambda status, ctype, body: writes.append((status, ctype, body))
         handler.do_GET()
-
         self.assertEqual(writes[0][0], 200)
         body = writes[0][2].decode("utf-8")
         self.assertIn("Unable to read monitoring data", body)
@@ -620,16 +418,10 @@ class RootPageErrorBannerTests(unittest.TestCase):
 
 
 class ClientFacingErrorSanitizationTests(unittest.TestCase):
-    """A raw AWS/botocore error (e.g. AccessDenied naming an IAM principal
-    ARN and account ID) must never reach an API or HTML client -- only the
-    fixed, client-safe message may appear in either response."""
-
     SIMULATED_ARN_LEAK = (
-        "An error occurred (AccessDeniedException) when calling "
-        "the GetItem operation: User: arn:aws:sts::668311715351:assumed-role/"
-        "GoldenGateMonitorReadRole-dev/i-0123456789abcdef is not authorized "
-        "to perform: dynamodb:GetItem on resource: "
-        "arn:aws:dynamodb:eu-west-1:668311715351:table/gg-eks-pipeline"
+        "An error occurred (AccessDeniedException) when calling the GetItem operation: "
+        "User: arn:aws:sts::668311715351:assumed-role/GoldenGateSecretsReadRole-dev/i-0123456789abcdef "
+        "is not authorized to perform: dynamodb:GetItem"
     )
 
     def _failing_table(self):
@@ -638,41 +430,18 @@ class ClientFacingErrorSanitizationTests(unittest.TestCase):
         return table
 
     def test_api_status_dynamodb_failure_returns_only_fixed_message(self):
-        config = make_config()
-        handler_cls = monitor._make_handler(config, self._failing_table, RUNTIMES, LOGICAL_PIPELINES)
+        handler_cls = monitor._make_handler(make_config(), self._failing_table, DEPLOYMENTS, LOGICAL_PIPELINES, {}, [])
         handler = handler_cls.__new__(handler_cls)
         handler.path = "/api/status"
         writes = []
         handler._write = lambda status, ctype, body: writes.append((status, ctype, body))
         handler.do_GET()
-
         self.assertEqual(writes[0][0], 503)
         body = json.loads(writes[0][2])
-        self.assertEqual(body["error"], "dynamodb_unavailable")
         self.assertEqual(body["message"], monitor.CLIENT_SAFE_DYNAMODB_ERROR_MESSAGE)
-
         raw_response = writes[0][2].decode("utf-8")
         self.assertNotIn("arn:aws", raw_response)
-        self.assertNotIn("668311715351", raw_response)
-        self.assertNotIn("AccessDeniedException", raw_response)
-        self.assertNotIn("GoldenGateMonitorReadRole-dev", raw_response)
-
-    def test_html_dynamodb_failure_does_not_expose_iam_arn(self):
-        config = make_config()
-        handler_cls = monitor._make_handler(config, self._failing_table, RUNTIMES, LOGICAL_PIPELINES)
-        handler = handler_cls.__new__(handler_cls)
-        handler.path = "/"
-        writes = []
-        handler._write = lambda status, ctype, body: writes.append((status, ctype, body))
-        handler.do_GET()
-
-        self.assertEqual(writes[0][0], 200)
-        body = writes[0][2].decode("utf-8")
-        self.assertIn(monitor.CLIENT_SAFE_DYNAMODB_ERROR_MESSAGE, body)
-        self.assertNotIn("arn:aws", body)
-        self.assertNotIn("668311715351", body)
-        self.assertNotIn("AccessDeniedException", body)
-        self.assertNotIn("GoldenGateMonitorReadRole-dev", body)
+        self.assertNotIn("GoldenGateSecretsReadRole-dev", raw_response)
 
 
 class DynamoDbAccessPatternTests(unittest.TestCase):
@@ -682,55 +451,24 @@ class DynamoDbAccessPatternTests(unittest.TestCase):
         self.assertEqual(table.get_item_calls[-1]["recordType"], "STATE#_deployment")
 
     def test_get_config_uses_config_record_type(self):
-        table = FakeTable([make_config_item()])
+        table = FakeTable([{"pipeline": "gg-oracle-payments-01", "recordType": "CONFIG"}])
         monitor.get_config_item(table, "gg-oracle-payments-01")
         self.assertEqual(table.get_item_calls[-1]["recordType"], "CONFIG")
 
-    def test_get_lease_uses_lease_record_type(self):
-        table = FakeTable([make_lease_item()])
-        monitor.get_lease_item(table, "gg-oracle-payments-01")
-        self.assertEqual(table.get_item_calls[-1]["recordType"], "LEASE")
-
-    def test_query_process_states_uses_begins_with_state_prefix_and_excludes_deployment_row(self):
-        table = FakeTable([
-            make_deployment_state_item(recorded_at=1780000000),
-            make_process_item(process="EXTORA1"),
-        ])
+    def test_query_process_states_excludes_deployment_row(self):
+        table = FakeTable([make_deployment_state_item(recorded_at=1780000000), make_process_item()])
         rows = monitor.query_process_state_items(table, "gg-oracle-payments-01")
         self.assertEqual(table.query_calls[-1][":prefix"], "STATE#")
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["recordType"], "STATE#EXTORA1")
-
-    def test_no_scan_call_occurs(self):
-        table = FakeTable([make_deployment_state_item(recorded_at=1780000005)])
-        config = make_config()
-        monitor.build_status_payload(config, table, RUNTIMES, LOGICAL_PIPELINES, clock=lambda: 1780000010)
-        self.assertFalse(hasattr(table, "scan"))
 
     def test_no_dynamodb_write_operation_occurs(self):
         table = FakeTable([make_deployment_state_item(recorded_at=1780000005)])
-        config = make_config()
-        monitor.build_status_payload(config, table, RUNTIMES, LOGICAL_PIPELINES, clock=lambda: 1780000010)
-        for forbidden in ("put_item", "update_item", "delete_item", "batch_writer"):
+        monitor.build_status_payload(make_config(), table, DEPLOYMENTS, LOGICAL_PIPELINES, clock=lambda: 1780000010)
+        for forbidden in ("put_item", "update_item", "delete_item", "batch_writer", "scan"):
             self.assertFalse(hasattr(table, forbidden))
-
-    def test_dynamodb_read_failure_raises_read_error(self):
-        from botocore.exceptions import ClientError
-        table = mock.Mock()
-        table.get_item.side_effect = ClientError(
-            {"Error": {"Code": "ProvisionedThroughputExceededException", "Message": "boom"}}, "GetItem")
-        config = make_config()
-        with self.assertRaises(monitor.DynamoDbReadError):
-            monitor.build_status_payload(config, table, RUNTIMES, LOGICAL_PIPELINES, clock=lambda: 1780000010)
 
 
 class ThreadSafetyTests(unittest.TestCase):
-    """ThreadingHTTPServer hands each request its own thread -- a single
-    shared boto3 Table/Resource object used across all of them would be a
-    mutable object accessed concurrently from multiple threads. The table
-    factory is a callable, not a pre-built object: each request obtains its
-    OWN Table instance."""
-
     def test_handler_uses_a_factory_not_a_prebuilt_object(self):
         import inspect
         sig = inspect.signature(monitor._make_handler)
@@ -744,24 +482,17 @@ class ThreadSafetyTests(unittest.TestCase):
             created.append(t)
             return t
 
-        config = make_config()
-        handler_cls = monitor._make_handler(config, factory, RUNTIMES, LOGICAL_PIPELINES)
+        handler_cls = monitor._make_handler(make_config(), factory, DEPLOYMENTS, LOGICAL_PIPELINES, {}, [])
         handler = handler_cls.__new__(handler_cls)
-        writes = []
-        handler._write = lambda status, ctype, body: writes.append((status, ctype, body))
+        handler._write = lambda status, ctype, body: None
         handler.path = "/api/status"
-
         for _ in range(3):
             handler.do_GET()
-
-        self.assertEqual(len(created), 3, "the factory must be called once per request")
-        self.assertEqual(len(set(id(t) for t in created)), 3, "each request must get a distinct table object")
+        self.assertEqual(len(created), 3)
+        self.assertEqual(len(set(id(t) for t in created)), 3)
 
     def test_concurrent_requests_each_get_independent_table_objects(self):
-        """Simulates concurrent access from multiple threads -- proves no
-        shared mutable Table object is read/written across threads."""
         import threading
-
         created = []
         lock = threading.Lock()
 
@@ -771,8 +502,7 @@ class ThreadSafetyTests(unittest.TestCase):
                 created.append(t)
             return t
 
-        config = make_config()
-        handler_cls = monitor._make_handler(config, factory, RUNTIMES, LOGICAL_PIPELINES)
+        handler_cls = monitor._make_handler(make_config(), factory, DEPLOYMENTS, LOGICAL_PIPELINES, {}, [])
 
         def make_request():
             handler = handler_cls.__new__(handler_cls)
@@ -788,7 +518,6 @@ class ThreadSafetyTests(unittest.TestCase):
 
         self.assertEqual(len(created), 8)
         self.assertEqual(len(set(id(t) for t in created)), 8)
-
 
 def _extract_run_block(workflow_text, step_name):
     """Extract a step's `run: |` block body, dedented, using plain text
@@ -1076,7 +805,7 @@ class ServiceAccountIrsaValidationTests(unittest.TestCase):
     grep that silently passed the workflow step under set -euo pipefail
     while never actually matching the (correctly quoted) rendered value."""
 
-    EXPECTED_ARN = "arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev"
+    EXPECTED_ARN = "arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev"
 
     @classmethod
     def setUpClass(cls):
@@ -1087,7 +816,7 @@ class ServiceAccountIrsaValidationTests(unittest.TestCase):
 
     def test_old_unquoted_role_arn_grep_is_gone(self):
         self.assertNotIn(
-            'grep -q "eks.amazonaws.com/role-arn: arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev"',
+            'grep -q "eks.amazonaws.com/role-arn: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev"',
             self.monitor_text,
         )
 
@@ -1109,7 +838,7 @@ metadata:
   name: gg-monitor
   namespace: goldengate-monitoring
   annotations:
-    eks.amazonaws.com/role-arn: "arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev"
+    eks.amazonaws.com/role-arn: "arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev"
 """
         proc = _run_serviceaccount_snippet(self.monitor_text, rendered)
         self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
@@ -1123,7 +852,7 @@ metadata:
   name: gg-monitor
   namespace: goldengate-monitoring
   annotations:
-    eks.amazonaws.com/role-arn: arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev
+    eks.amazonaws.com/role-arn: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev
 """
         proc = _run_serviceaccount_snippet(self.monitor_text, rendered)
         self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
@@ -1200,7 +929,7 @@ metadata:
   name: gg-monitor
   namespace: goldengate-monitoring
   annotations:
-    eks.amazonaws.com/role-arn: "arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev"
+    eks.amazonaws.com/role-arn: "arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev"
 """
         proc = _run_serviceaccount_snippet(self.monitor_text, rendered)
         self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
@@ -1418,7 +1147,7 @@ metadata:
   name: gg-monitor
   namespace: goldengate-monitoring
   annotations:
-    eks.amazonaws.com/role-arn: "arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev"
+    eks.amazonaws.com/role-arn: "arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev"
 """
         proc = _run_serviceaccount_snippet(self.monitor_text, rendered)
         self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)

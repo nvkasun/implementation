@@ -137,12 +137,8 @@ spec:
           configMap:
             name: goldengate-monitor-canonical-config
             items:
-              - key: deployments.yaml
-                path: pipelines/deployments.yaml
-{{- range $path, $_ := .Files.Glob "files/topologies/dev/*.yaml" }}
-              - key: {{ base $path }}
-                path: topologies/dev/{{ base $path }}
-{{- end }}
+              - key: goldengate-deployments.yaml
+                path: goldengate-deployments.yaml
 {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

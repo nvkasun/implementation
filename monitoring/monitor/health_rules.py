@@ -1,37 +1,10 @@
-"""gg_health_rules: pure health-EVALUATION logic ported from the manager
-reference implementation's charts/gg-deployment/files/gg_health.py
-(inspected read-only, not modified, not imported directly).
+"""health_rules.py: pure health-evaluation logic (CONFIG resolution,
+per-process rule resolution, quiet-hours, abend counters, distpath stall
+detection, lag-breach classification, service-up classification).
 
-Ported: CONFIG resolution/defaults, per-process rule resolution, quiet-hours
-window resolution, abend counters, distpath stall detection, lag-breach
-classification, and HTTP-status service-up classification -- all pure
-functions over plain dicts, exactly as in the manager original.
-
-Deliberately NOT ported (confirmed manager active-healing execution paths,
-excluded per the approved passive-monitor architecture):
-  - heal_decision() and the whole serviceHealEnabled/maxHealAttempts/
-    serviceDownChecks circuit-breaker state machine.
-  - Any code path that would act on abend_step()'s "failover" flag (this
-    module still COMPUTES it, for STATE-record/metric fidelity with the
-    manager schema, but gg_monitor_core.py never triggers any restart/exit
-    from it -- see that module's comments).
-  - dispatchStallChecks: never used: the manager's OWN gg_health.py already
-    uses the correct distpathStallChecks name (the typo is confined to the
-    manager's Terraform seed, terraform/platform/dynamodb.tf, corrected in
-    our own envs/dev/dynamodb.tf in Phase 3) -- ported as-is, correct name.
-
-CONFIG DEFAULTS here mirror our own manager-aligned, passive-safe seeded
-CONFIG schema (envs/dev/dynamodb.tf) exactly -- not the manager's own
-(active-sidecar-oriented) DEFAULTS dict, which also carries
-serviceHealEnabled/maxHealAttempts/serviceDownChecks/criticalServices
-(healing-only fields never present in our CONFIG schema at all).
-
-metricsEnabled defaults to False here (the manager's own seed defaults it
-True) -- an intentional, documented deviation: in this repository
-metricsEnabled is what gates CloudWatch publication (out of scope this
-phase: PutMetricData, alarms, dashboards, Logs, SNS, Fluent Bit, CloudWatch
-Agent, Container Insights). It has no effect on DynamoDB LEASE/STATE#*
-writing, which is unconditional.
+Passive only: this module computes an abend "failover" flag for schema
+fidelity but nothing in this application ever acts on it -- no restart,
+fence, or Kubernetes API call exists anywhere in this codebase.
 """
 from __future__ import annotations
 
@@ -43,12 +16,7 @@ logger = logging.getLogger("gg-health-rules")
 
 DEFAULTS = {
     "alertsEnabled": False,
-    # CloudWatch publication is OPTIONAL and DISABLED by default this phase
-    # (out of scope: PutMetricData, alarms, dashboards, Logs, SNS, Fluent
-    # Bit, CloudWatch Agent, Container Insights -- see
-    # monitoring/gg-monitor-core/README.md). gg_monitor_core._emit() is
-    # gated on this field; the monitor must start and run correctly with
-    # metricsEnabled=false and no CloudWatch permission at all.
+    # CloudWatch publication stays optional/disabled until a later phase.
     "metricsEnabled": False,
     "tz": "Asia/Dubai",
     "checkIntervalSeconds": 60,
@@ -66,13 +34,8 @@ DEFAULTS = {
 
 _RULE_KEYS = tuple(DEFAULTS["defaults"].keys())
 
-# Not CONFIG-derived (our CONFIG schema deliberately excludes healing-adjacent
-# fields -- see Phase 3). The manager reads this list from
-# CONFIG.criticalServices to gate its self-heal circuit breaker; we probe the
-# same services purely for observational CriticalServiceDown metrics/state,
-# per deployment TYPE (matches each runtime's actual configured ports -- see
-# topologies/dev/payments-ora-to-pg-001.yaml: Oracle has no receiver port,
-# PostgreSQL has no distribution port).
+# Probed per deployment type purely for observational
+# CriticalServiceDown metrics/state -- never gates any healing action.
 CRITICAL_SERVICES_BY_TYPE = {
     "oracle": ["adminsrvr", "distsrvr"],
     "postgresql": ["adminsrvr", "recvsrvr"],
@@ -178,12 +141,8 @@ def lag_rule_now(cfg, process, now=None):
 
 
 def abend_step(status, state, now, rule, alerts_enabled):
-    """One tick of the per-process abend counter machine.
-
-    Still computes act["failover"] for schema fidelity with the manager's
-    STATE fields, but gg_monitor_core.py never acts on it -- passive
-    architecture, no restart/exit path exists anywhere in this application.
-    """
+    """One tick of the per-process abend counter machine. Still computes
+    act["failover"] for schema fidelity -- never acted on anywhere."""
     st = {
         "consecutiveAbends": _to_int(state.get("consecutiveAbends"), 0),
         "lastAbendAt": _to_int(state.get("lastAbendAt"), 0),

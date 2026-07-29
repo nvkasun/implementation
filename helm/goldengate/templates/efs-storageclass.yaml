@@ -10,7 +10,11 @@ metadata:
     app.kubernetes.io/name: goldengate
     app.kubernetes.io/managed-by: argocd
     goldengate.adcb/environment: {{ .Values.global.environment | quote }}
+{{- if eq (include "goldengate.deploymentModel" .) "singleRuntime" }}
+    goldengate.adcb/deployment-id: {{ include "goldengate.runtimeName" . | quote }}
+{{- else }}
     goldengate.adcb/deployment-id: {{ .Values.global.deploymentId | quote }}
+{{- end }}
 provisioner: efs.csi.aws.com
 parameters:
   provisioningMode: efs-ap

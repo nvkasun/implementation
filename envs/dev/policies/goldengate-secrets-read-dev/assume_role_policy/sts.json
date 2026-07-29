@@ -16,7 +16,8 @@
           "oidc.eks.eu-west-1.amazonaws.com/id/407C4385FF87947926730569F1E564FB:sub": [
             "system:serviceaccount:gg-dev-*:ogg-oracle-sa",
             "system:serviceaccount:goldengate-dev:gg-oracle-sa",
-            "system:serviceaccount:goldengate-dev:gg-postgresql-sa"
+            "system:serviceaccount:goldengate-dev:gg-postgresql-sa",
+            "system:serviceaccount:goldengate-monitoring:gg-monitor"
           ]
         }
       }

@@ -27,8 +27,7 @@ on:
       - 'helm/goldengate-monitor/**'
       - 'envs/dev/goldengate-monitor/**'
       - '.github/workflows/goldengate-monitor.yaml'
-      - 'pipelines/deployments.yaml'
-      - 'topologies/dev/**'
+      - 'envs/dev/goldengate-deployments.yaml'
 
 permissions:
   id-token: write
@@ -508,41 +507,26 @@ jobs:
           done
           echo "Required files are present."
 
-      - name: Re-stage canonical inventory/topology files into the chart
+      - name: Prepare temporary chart directory with the canonical config staged
         shell: bash
         run: |
           set -euo pipefail
 
-          # Helm can only read files inside its own chart directory
-          # (.Files.Get has no access to paths outside the chart) -- these
-          # are byte-identical STAGED COPIES of the single canonical
-          # source, never a second hand-authored list. Re-staged on every
-          # run (delete-then-copy, never a merge) so the chart can never
-          # silently deploy a stale copy left over from a previous run.
+          # The base repository chart stays free of generated copies: this
+          # workflow copies the whole chart into a workflow-local temp
+          # directory (git-ignored, never committed) and stages the single
+          # canonical source file there, byte-identical, before any Helm
+          # lint/render/package. Every later step uses TEMP_CHART_PATH, not
+          # HELM_CHART_PATH.
+          rm -rf "$TEMP_CHART_PATH"
+          mkdir -p "$TEMP_CHART_PATH"
+          cp -a "$HELM_CHART_PATH/." "$TEMP_CHART_PATH/"
 
-          echo "Deleting stale staged canonical files..."
-          rm -rf "$HELM_CHART_PATH/files/pipelines" "$HELM_CHART_PATH/files/topologies"
-          mkdir -p "$HELM_CHART_PATH/files/pipelines" "$HELM_CHART_PATH/files/topologies/dev"
+          mkdir -p "$TEMP_CHART_PATH/files"
+          cp envs/dev/goldengate-deployments.yaml "$TEMP_CHART_PATH/files/goldengate-deployments.yaml"
+          diff -q envs/dev/goldengate-deployments.yaml "$TEMP_CHART_PATH/files/goldengate-deployments.yaml"
 
-          echo "Copying repository canonical files into the chart..."
-          cp pipelines/deployments.yaml "$HELM_CHART_PATH/files/pipelines/deployments.yaml"
-
-          shopt -s nullglob
-          TOPOLOGY_FILES=(topologies/dev/*.yaml)
-          shopt -u nullglob
-          if [ "${#TOPOLOGY_FILES[@]}" -eq 0 ]; then
-            echo "FAIL: no topology documents found under topologies/dev/ -- refusing to stage/package an empty topology."
-            exit 1
-          fi
-          cp topologies/dev/*.yaml "$HELM_CHART_PATH/files/topologies/dev/"
-
-          echo "Verifying staged copies are byte-identical to the canonical sources..."
-          diff -q pipelines/deployments.yaml "$HELM_CHART_PATH/files/pipelines/deployments.yaml"
-          for f in "${TOPOLOGY_FILES[@]}"; do
-            diff -q "$f" "$HELM_CHART_PATH/files/topologies/dev/$(basename "$f")"
-          done
-
-          echo "OK: ${#TOPOLOGY_FILES[@]} topology document(s) staged, all byte-identical to the canonical sources."
+          echo "OK: canonical config staged into ${TEMP_CHART_PATH}, byte-identical to the source."
 
       - name: Login Helm to Amazon ECR
         shell: bash
@@ -629,7 +613,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          helm lint "$HELM_CHART_PATH" \
+          helm lint "$TEMP_CHART_PATH" \
             --values "$VALUES_FILE" \
             --set-string image.repository="$MONITOR_IMAGE_REPOSITORY" \
             --set-string image.tag="$MONITOR_IMAGE_TAG"
@@ -641,7 +625,7 @@ jobs:
 
           mkdir -p rendered
 
-          helm template "$RELEASE_NAME" "$HELM_CHART_PATH" \
+          helm template "$RELEASE_NAME" "$TEMP_CHART_PATH" \
             --namespace "$TARGET_NAMESPACE" \
             --values "$VALUES_FILE" \
             --set-string image.repository="$MONITOR_IMAGE_REPOSITORY" \
@@ -740,7 +724,7 @@ jobs:
           fi
 
           SA_ROLE_ARN_ACTUAL="$(normalize_value "${SA_ROLE_ARN_LINE#*role-arn:}")"
-          SA_ROLE_ARN_EXPECTED="arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev"
+          SA_ROLE_ARN_EXPECTED="arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev"
 
           if [ "$SA_ROLE_ARN_ACTUAL" != "$SA_ROLE_ARN_EXPECTED" ]; then
             echo "FAIL: gg-monitor IRSA role ARN mismatch."
@@ -896,18 +880,20 @@ jobs:
             echo "FAIL: rendered ConfigMap goldengate-monitor-canonical-config was not found."
             exit 1
           fi
-          if ! grep -q "oracle-payments-01" <<< "$CONFIGMAP_BLOCK"; then
-            echo "FAIL: canonical ConfigMap is missing the oracle-payments-01 deployment inventory entry."
-            exit 1
-          fi
-          if ! grep -q "postgresql-payments-01" <<< "$CONFIGMAP_BLOCK"; then
-            echo "FAIL: canonical ConfigMap is missing the postgresql-payments-01 deployment inventory entry."
-            exit 1
-          fi
-          if ! grep -q "payments-ora-to-pg-001" <<< "$CONFIGMAP_BLOCK"; then
-            echo "FAIL: canonical ConfigMap is missing the payments-ora-to-pg-001 topology document."
-            exit 1
-          fi
+          # Expected deployment/pipeline names are read from the canonical
+          # source file itself -- never hardcoded here -- so this check
+          # adapts automatically as deployments are added/renamed.
+          # Dependency-free (no yq/jq/PyYAML): "name:"/"pipeline:" are
+          # simple scalar keys in this file's fixed schema.
+          EXPECTED_NAMES="$(grep -E '^\s*-?\s*(name|pipeline):' envs/dev/goldengate-deployments.yaml \
+            | sed -E 's/^\s*-?\s*(name|pipeline):\s*//' | tr -d '"'"'"'\r' | sort -u)"
+          while IFS= read -r expected; do
+            [ -z "$expected" ] && continue
+            if ! grep -Fq -- "$expected" <<< "$CONFIGMAP_BLOCK"; then
+              echo "FAIL: canonical ConfigMap is missing expected entry: ${expected}"
+              exit 1
+            fi
+          done <<< "$EXPECTED_NAMES"
           if ! grep -Fq -- "mountPath: /etc/gg-canonical" <<< "$DEPLOYMENT_BLOCK"; then
             echo "FAIL: Deployment gg-monitor does not mount the canonical config at /etc/gg-canonical."
             exit 1
@@ -953,11 +939,10 @@ jobs:
         run: |
           set -euo pipefail
 
+          # TEMP_CHART_PATH was already prepared (chart copy + staged
+          # canonical config) by the earlier step -- reused here, not
+          # rebuilt, so the packaged chart matches what was linted/rendered.
           mkdir -p packaged
-          rm -rf "$TEMP_CHART_PATH"
-          mkdir -p "$TEMP_CHART_PATH"
-
-          cp -a "$HELM_CHART_PATH/." "$TEMP_CHART_PATH/"
           cp "$VALUES_FILE" "$TEMP_CHART_PATH/values-deployment.yaml"
 
           helm package "$TEMP_CHART_PATH" \
@@ -1161,11 +1146,11 @@ jobs:
           echo "ServiceAccount and IRSA annotation:"
           kubectl get serviceaccount gg-monitor -n "$TARGET_NAMESPACE"
           ROLE_ANNOTATION="$(kubectl get serviceaccount gg-monitor -n "$TARGET_NAMESPACE" -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}')"
-          if [ "$ROLE_ANNOTATION" != "arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev" ]; then
+          if [ "$ROLE_ANNOTATION" != "arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev" ]; then
             echo "FAIL: unexpected IRSA role annotation on ServiceAccount gg-monitor: ${ROLE_ANNOTATION}"
             exit 1
           fi
-          echo "OK: IRSA role annotation matches GoldenGateMonitorReadRole-dev."
+          echo "OK: IRSA role annotation matches GoldenGateSecretsReadRole-dev."
 
           echo "Deployment availability:"
           kubectl rollout status deployment/gg-monitor -n "$TARGET_NAMESPACE" --timeout=5m
@@ -1248,18 +1233,18 @@ jobs:
             exit 1
           }
 
-          if ! grep -Fq -- "payments-ora-to-pg-001" <<< "$API_STATUS_BODY"; then
-            echo "FAIL: /api/status is missing logical pipelineId payments-ora-to-pg-001."
-            exit 1
-          fi
-          if ! grep -Fq -- "gg-oracle-payments-01" <<< "$API_STATUS_BODY"; then
-            echo "FAIL: /api/status is missing the canonical source deploymentName gg-oracle-payments-01."
-            exit 1
-          fi
-          if ! grep -Fq -- "gg-postgresql-payments-01" <<< "$API_STATUS_BODY"; then
-            echo "FAIL: /api/status is missing the canonical target deploymentName gg-postgresql-payments-01."
-            exit 1
-          fi
+          # Expected names come from the canonical source file itself --
+          # never hardcoded here -- so this check adapts automatically as
+          # deployments are added/renamed.
+          EXPECTED_NAMES="$(grep -E '^\s*-?\s*(name|pipeline):' envs/dev/goldengate-deployments.yaml \
+            | sed -E 's/^\s*-?\s*(name|pipeline):\s*//' | tr -d '"'"'"'\r' | sort -u)"
+          while IFS= read -r expected; do
+            [ -z "$expected" ] && continue
+            if ! grep -Fq -- "$expected" <<< "$API_STATUS_BODY"; then
+              echo "FAIL: /api/status is missing expected entry: ${expected}"
+              exit 1
+            fi
+          done <<< "$EXPECTED_NAMES"
           if ! grep -Fq -- '"role": "source"' <<< "$API_STATUS_BODY"; then
             echo "FAIL: /api/status is missing role=source."
             exit 1
@@ -1273,7 +1258,7 @@ jobs:
           # UNKNOWN) is a valid operational state and never fails this step
           # -- only the portal's own inability to run/authenticate/serve
           # does.
-          echo "OK: /api/status is valid JSON and contains both canonical runtimes under their logical pipeline."
+          echo "OK: /api/status is valid JSON and contains all canonical deployments/pipelines."
 
           echo "Checking observer/portal logs for forbidden patterns..."
           POD_LOGS="$(kubectl logs "$POD_NAME" -n "$TARGET_NAMESPACE" --since=10m 2>/dev/null || true)"

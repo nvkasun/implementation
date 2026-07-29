@@ -1,16 +1,9 @@
 {{- /*
-Mirrors pipelines/deployments.yaml and topologies/dev/*.yaml verbatim into a
-ConfigMap -- these are STAGED COPIES under this chart's files/ directory, not
-a second hand-authored runtime list. Helm can only read files inside its own
-chart directory (.Files.Get has no access to paths outside the chart), so
-the deploying workflow re-stages (re-copies) these files from the repository
-root immediately before packaging on every run -- see the "Re-stage canonical
-inventory/topology files into the chart" step in
-.github/workflows/goldengate-monitor.yaml.
-hack/test-goldengate-deployment-models.sh independently asserts the staged
-copies are byte-identical to the real canonical sources, so this can never
-silently drift into an actual second list. Same pattern already proven by
-helm/gg-monitor/templates/configmap.yaml.
+Mirrors envs/dev/goldengate-deployments.yaml verbatim into a ConfigMap --
+this is a STAGED COPY under this chart's files/ directory, not a
+hand-authored second list. The base repository chart never carries this
+staged copy: the deploying workflow (.github/workflows/goldengate-monitor.yaml)
+stages it into a temporary chart directory immediately before packaging.
 */ -}}
 apiVersion: v1
 kind: ConfigMap
@@ -20,9 +13,5 @@ metadata:
   labels:
     {{- include "goldengate-monitor.labels" . | nindent 4 }}
 data:
-  deployments.yaml: |
-{{ .Files.Get "files/pipelines/deployments.yaml" | indent 4 }}
-{{- range $path, $_ := .Files.Glob "files/topologies/dev/*.yaml" }}
-  {{ base $path }}: |
-{{ $.Files.Get $path | indent 4 }}
-{{- end }}
+  goldengate-deployments.yaml: |
+{{ .Files.Get "files/goldengate-deployments.yaml" | indent 4 }}

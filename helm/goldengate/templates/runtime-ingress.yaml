@@ -2,8 +2,8 @@
 {{- if not (or (eq .Values.ingress.mode "shared") (eq .Values.ingress.mode "standalone")) }}
 {{- fail (printf "ingress.mode must be either \"shared\" or \"standalone\", got %q" .Values.ingress.mode) }}
 {{- end }}
-{{- if not .Values.ingress.host }}
-{{- fail "ingress.host is required when ingress.enabled=true and deploymentModel=singleRuntime." }}
+{{- if and (not .Values.ingress.host) (not .Values.ingress.hostDomain) }}
+{{- fail "ingress.host or ingress.hostDomain is required when ingress.enabled=true and deploymentModel=singleRuntime." }}
 {{- end }}
 {{- if and (contains "HTTPS" .Values.ingress.alb.listenPorts) (not .Values.ingress.alb.certificateArn) }}
 {{- fail "ingress.alb.certificateArn is required when the HTTPS listener is enabled (ingress.alb.listenPorts contains HTTPS). Even in shared mode, the ALB Controller resolves the certificate per-Ingress via host-based discovery unless certificate-arn is set explicitly." }}
@@ -85,7 +85,7 @@ metadata:
 spec:
   ingressClassName: {{ .Values.ingress.className | default "alb" }}
   rules:
-    - host: {{ .Values.ingress.host | quote }}
+    - host: {{ include "goldengate.runtimeIngressHost" . | quote }}
       http:
         paths:
           - path: /

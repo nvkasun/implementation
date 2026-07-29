@@ -13,9 +13,6 @@ namespaces:
   runtime:
     create: true
     name: goldengate-dev
-  monitoring:
-    create: true
-    name: goldengate-monitoring-dev
 
 serviceAccounts:
   oracle:

@@ -81,18 +81,11 @@ env:
   # Shared, engine-level runtime identities this chart is the single owner
   # of. Never used by an individual GoldenGate runtime release.
   RUNTIME_NAMESPACE: goldengate-dev
-  MONITORING_NAMESPACE: goldengate-monitoring-dev
   ORACLE_SA_NAME: gg-oracle-sa
   POSTGRESQL_SA_NAME: gg-postgresql-sa
 
-  # TEMPORARY COMPATIBILITY BRIDGE: both shared platform ServiceAccounts use
-  # the existing, proven GoldenGateSecretsReadRole-dev role (the same role
-  # the legacy ogg-oracle-sa pods already use successfully to mount
-  # dev/goldengate/source|target/admin and dev/goldengate/tls-certificate),
-  # NOT the new gg-oracle-dev-runtime-role / gg-postgresql-dev-runtime-role
-  # roles. Those two new roles still exist (their Terraform modules in
-  # envs/dev/iam.tf are untouched) but are deliberately unused here until
-  # they are separately proven and this bridge is retired. See
+  # Both ServiceAccounts use the shared GoldenGateSecretsReadRole-dev role
+  # (also used by the shared monitor). See
   # envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json
   # for the extended trust (adds goldengate-dev:gg-oracle-sa and
   # goldengate-dev:gg-postgresql-sa alongside the untouched legacy
@@ -366,10 +359,10 @@ jobs:
             printf '%s' "$value"
           }
 
-          echo "Validating exactly two Namespace documents..."
+          echo "Validating exactly one Namespace document..."
           NAMESPACE_COUNT="$(grep -c '^kind: Namespace$' "$RENDERED")"
-          if [ "$NAMESPACE_COUNT" -ne 2 ]; then
-            echo "FAIL: expected exactly 2 rendered Namespace documents, found ${NAMESPACE_COUNT}."
+          if [ "$NAMESPACE_COUNT" -ne 1 ]; then
+            echo "FAIL: expected exactly 1 rendered Namespace document, found ${NAMESPACE_COUNT}."
             exit 1
           fi
 
@@ -378,24 +371,14 @@ jobs:
             echo "FAIL: rendered Namespace ${RUNTIME_NAMESPACE} was not found."
             exit 1
           fi
+          echo "OK: exactly 1 Namespace document, ${RUNTIME_NAMESPACE}."
 
-          MONITORING_NS_BLOCK="$(select_document "$RENDERED" "Namespace" "${MONITORING_NAMESPACE}")"
-          if [ -z "$MONITORING_NS_BLOCK" ]; then
-            echo "FAIL: rendered Namespace ${MONITORING_NAMESPACE} was not found."
-            exit 1
-          fi
-          echo "OK: exactly 2 Namespace documents, ${RUNTIME_NAMESPACE} and ${MONITORING_NAMESPACE}."
-
-          echo "Validating neither shared namespace carries a per-runtime ownership label..."
+          echo "Validating the shared namespace carries no per-runtime ownership label..."
           if grep -Fq -- "goldengate.adcb/deployment-id" <<< "$RUNTIME_NS_BLOCK"; then
             echo "FAIL: Namespace ${RUNTIME_NAMESPACE} carries a per-runtime ownership label (goldengate.adcb/deployment-id)."
             exit 1
           fi
-          if grep -Fq -- "goldengate.adcb/deployment-id" <<< "$MONITORING_NS_BLOCK"; then
-            echo "FAIL: Namespace ${MONITORING_NAMESPACE} carries a per-runtime ownership label (goldengate.adcb/deployment-id)."
-            exit 1
-          fi
-          echo "OK: no per-runtime ownership label on either shared namespace."
+          echo "OK: no per-runtime ownership label on the shared namespace."
 
           # Shared objects must be protected from Argo CD prune/cascading
           # deletion via Prune=false,Delete=false -- PruneLast=true alone
@@ -416,7 +399,6 @@ jobs:
           }
 
           assert_deletion_protected "Namespace ${RUNTIME_NAMESPACE}" "$RUNTIME_NS_BLOCK"
-          assert_deletion_protected "Namespace ${MONITORING_NAMESPACE}" "$MONITORING_NS_BLOCK"
 
           echo "Validating exactly two ServiceAccount documents..."
           SERVICEACCOUNT_COUNT="$(grep -c '^kind: ServiceAccount$' "$RENDERED")"
@@ -588,16 +570,9 @@ jobs:
           echo "Applying Argo CD Application: ${ARGOCD_APP_NAME}"
 
           # This Application is the single designated owner of the shared
-          # namespaces, so (unlike every per-runtime goldengate-eks-app.yaml
-          # Application) it is allowed CreateNamespace=true and
-          # managedNamespaceMetadata. The chart's own runtime-namespace.yaml
-          # / monitoring-namespace.yaml templates already render both
-          # Namespace objects directly with the correct labels; Argo CD's
-          # managedNamespaceMetadata only ever applies to the single
-          # destination.namespace below (goldengate-dev) and is included
-          # here purely to match the established goldengate-monitor.yaml
-          # pattern, not because it is required for the second
-          # (cluster-scoped) Namespace object.
+          # runtime namespace, so (unlike every per-runtime
+          # goldengate-eks-app.yaml Application) it is allowed
+          # CreateNamespace=true and managedNamespaceMetadata.
           kubectl apply -f - <<EOF
           apiVersion: argoproj.io/v1alpha1
           kind: Application
@@ -693,9 +668,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Namespaces:"
+          echo "Namespace:"
           kubectl get namespace "$RUNTIME_NAMESPACE"
-          kubectl get namespace "$MONITORING_NAMESPACE"
 
           echo "ServiceAccounts and IRSA annotations:"
           kubectl get serviceaccount "$ORACLE_SA_NAME" -n "$RUNTIME_NAMESPACE"
@@ -748,24 +722,21 @@ jobs:
             echo "- Chart version: \`${CHART_VERSION:-unknown}\`"
             echo "- Chart ref: \`${HELM_CHART_REF:-unknown}\`"
             echo "- Runtime namespace: \`${RUNTIME_NAMESPACE}\`"
-            echo "- Monitoring namespace: \`${MONITORING_NAMESPACE}\`"
             echo "- Argo CD Application: \`${ARGOCD_APP_NAME}\` (namespace: \`${ARGOCD_NAMESPACE}\`)"
             echo "- Deploy enabled: \`${{ github.event_name != 'workflow_dispatch' || inputs.deploy }}\`"
             echo ""
             echo "### Ownership"
             echo ""
             echo "This is the single designated owner of Namespace/${RUNTIME_NAMESPACE},"
-            echo "Namespace/${MONITORING_NAMESPACE}, ServiceAccount/${ORACLE_SA_NAME}, and"
+            echo "ServiceAccount/${ORACLE_SA_NAME}, and"
             echo "ServiceAccount/${POSTGRESQL_SA_NAME}. Individual GoldenGate runtime"
             echo "Applications (goldengate-eks-app.yaml) reference these ServiceAccounts by"
             echo "name only (serviceAccount.create=false) and never own or delete them."
             echo ""
             echo "### Required deployment order"
             echo ""
-            echo "1. IAM/Secrets Terraform workflow (applies the extended trust policy on the existing GoldenGateSecretsReadRole-dev role -- TEMPORARY COMPATIBILITY BRIDGE, see envs/dev/policies/goldengate-secrets-read-dev/)."
+            echo "1. IAM/Secrets Terraform workflow (applies the trust policy on GoldenGateSecretsReadRole-dev -- see envs/dev/policies/goldengate-secrets-read-dev/)."
             echo "2. argocd-eks-deployment.yaml (provisions the argocd-ecr-goldengate-platform-oci repository Secret)."
             echo "3. This workflow."
             echo "4. Only then may a runtime candidate (gg-oracle-payments-01, gg-postgresql-payments-01) set deployment.enabled=true."
-            echo ""
-            echo "Note: gg-oracle-dev-runtime-role and gg-postgresql-dev-runtime-role still exist (Terraform modules untouched in envs/dev/iam.tf) but are NOT used by this release -- cleanup is a separately reviewed Terraform plan for later, after both new runtimes are stable on the compatibility bridge."
           } >> "$GITHUB_STEP_SUMMARY"

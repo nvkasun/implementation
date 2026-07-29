@@ -2,34 +2,21 @@ global:
   environment: ""
   deploymentId: ""
 
-# Phase 1 backward-compatible deployment model switch.
-#
-# legacyPair (default): the existing one-Helm-release-per-logical-pipeline
-# model -- one source + one target StatefulSet, a deployment-specific
-# Namespace, and the two-host Ingress. Fully preserved; this is what every
-# currently active envs/dev/<deployment>/values.yaml file uses today.
-#
+# Deployment model switch.
+# legacyPair: one Helm release per logical pipeline (source + target
+# StatefulSet, its own Namespace, two-host Ingress).
 # singleRuntime: one GoldenGate runtime StatefulSet per Helm release/Argo CD
-# Application, deployed into a shared per-environment namespace
-# (goldengate-${environment}) that this chart never creates or owns. See the
-# runtime: block below. Source and target become two independent
-# singleRuntime releases instead of one legacyPair release.
-#
-# Every legacy template is gated on
-# `eq (default "legacyPair" .Values.deploymentModel) "legacyPair"` so an old
-# values file with no deploymentModel key at all keeps rendering exactly as
-# before.
+# Application, deployed into a shared per-environment namespace this chart
+# never creates or owns (see the runtime: block below).
 deploymentModel: legacyPair
 
 nameOverride: ""
 fullnameOverride: ""
 
-# Phase 1 EFS-backed persistence for /u02 (trails, checkpoints, parameter
-# files, config, recovery artifacts). Disabled by default so the chart
-# remains safe (emptyDir) unless a deployment opts in. The EFS filesystem
-# itself is provisioned outside this chart -- only its ID is consumed here
-# (see persistence.efs.fileSystemId), and the StorageClass uses EFS CSI
-# dynamic provisioning to create per-PVC access points under basePath.
+# EFS-backed persistence for /u02 (trails, checkpoints, config, recovery
+# artifacts). Disabled by default (emptyDir) unless a deployment opts in.
+# Only the EFS filesystem ID is consumed here; the filesystem itself is
+# provisioned outside this chart.
 persistence:
   enabled: false
   provider: efs
@@ -259,11 +246,10 @@ target:
   extraVolumes: []
   extraContainers: []
 
-# Phase 1 generic single-runtime GoldenGate deployment (deploymentModel:
-# singleRuntime only -- ignored entirely in legacyPair mode). Exactly one
-# GoldenGate main container per pod: no runtime.extraContainers key exists
-# here on purpose -- the approved single-runtime pod has no observer
-# sidecar, no manager utility-sidecar, and no Fluent Bit sidecar.
+# Generic single-runtime GoldenGate deployment (singleRuntime only --
+# ignored in legacyPair mode). Exactly one container per pod: no
+# runtime.extraContainers key exists -- no observer/utility/Fluent Bit
+# sidecar in this model.
 runtime:
   enabled: false
 
@@ -281,13 +267,12 @@ runtime:
     tag: ""
     pullPolicy: IfNotPresent
 
+  # OGG_DEPLOYMENT/OGG_DOMAIN and the admin Secret name are derived
+  # from the runtime name (Release.Name) -- see _helpers.tpl.
   ogg:
-    deploymentName: ""
-    domain: ""
     secureDeployment: false
 
   admin:
-    existingSecret: ""
     usernameKey: OGG_ADMIN
     passwordKey: OGG_ADMIN_PWD
 
@@ -373,8 +358,10 @@ ingress:
     source: ""
     target: ""
 
-  # singleRuntime only.
+  # singleRuntime only. host, if set, is used verbatim; otherwise it is
+  # derived as "<runtimeName>.<hostDomain>".
   host: ""
+  hostDomain: ""
 
   alb:
     # These are library defaults only -- ingress.enabled is false by default,
@@ -412,11 +399,8 @@ monitoring:
   labels:
     enabled: true
 
-  # Phase 1 GoldenGate monitoring observer sidecar. Disabled by default so
-  # existing deployments are unaffected; a deployment opts in by setting
-  # monitoring.observer.enabled=true and (via the GoldenGate GitHub Actions
-  # workflow) the content-addressed image repository/tag are injected at
-  # Helm lint/render/Argo CD time -- see helm/goldengate/templates/_observer.tpl.
+  # legacyPair-only observer sidecar. Disabled by default; a deployment
+  # opts in via monitoring.observer.enabled=true (see _observer.tpl).
   observer:
     enabled: false
 
