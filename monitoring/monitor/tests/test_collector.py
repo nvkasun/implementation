@@ -123,6 +123,129 @@ class CheckStaticPrerequisitesTests(unittest.TestCase):
         self.assertNotIn(".renew(", src)
 
 
+class PrerequisiteReasonSanitizationTests(unittest.TestCase):
+    """check_static_prerequisites reasons -- and the warning run_pipeline
+    logs from them on every retry -- must never carry a credential/CA path,
+    secret value, or raw AWS exception. The canonical deployment name may
+    appear."""
+
+    DEPLOYMENT = {"name": "gg-oracle-payments-01", "type": "oracle"}
+    SYNTHETIC_USER = "synthetic-test-oggadmin"
+    SYNTHETIC_PASSWORD = "synthetic-test-P@ssw0rd!"
+    FORBIDDEN_SUBSTRINGS = (
+        "/mnt/secrets-store", "-admin-user", "-admin-password", "ca-chain-pem",
+        SYNTHETIC_USER, SYNTHETIC_PASSWORD,
+        "AccessDeniedException", "arn:aws:iam", "arn:aws:sts", "Traceback",
+    )
+
+    def _assert_reason_clean(self, reason):
+        for forbidden in self.FORBIDDEN_SUBSTRINGS:
+            self.assertNotIn(forbidden, reason)
+
+    def test_missing_username_reason_is_generic(self):
+        table = MagicMock()
+        with tempfile.TemporaryDirectory() as tmp:
+            user_file = os.path.join(tmp, "does-not-exist-user")
+            pwd_file = os.path.join(tmp, "pwd")
+            with open(pwd_file, "w") as f:
+                f.write(self.SYNTHETIC_PASSWORD)
+            with mock.patch.object(core.cfgmod, "credential_paths", return_value=(user_file, pwd_file)):
+                ok, reason = core.check_static_prerequisites(self.DEPLOYMENT, table)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "admin username credential unavailable")
+        self._assert_reason_clean(reason)
+
+    def test_missing_password_reason_is_generic(self):
+        table = MagicMock()
+        with tempfile.TemporaryDirectory() as tmp:
+            user_file = os.path.join(tmp, "user")
+            pwd_file = os.path.join(tmp, "does-not-exist-pwd")
+            with open(user_file, "w") as f:
+                f.write(self.SYNTHETIC_USER)
+            with mock.patch.object(core.cfgmod, "credential_paths", return_value=(user_file, pwd_file)):
+                ok, reason = core.check_static_prerequisites(self.DEPLOYMENT, table)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "admin password credential unavailable")
+        self._assert_reason_clean(reason)
+
+    def test_missing_ca_reason_is_generic(self):
+        table = MagicMock()
+        with tempfile.TemporaryDirectory() as tmp:
+            user_file = os.path.join(tmp, "user")
+            pwd_file = os.path.join(tmp, "pwd")
+            with open(user_file, "w") as f:
+                f.write(self.SYNTHETIC_USER)
+            with open(pwd_file, "w") as f:
+                f.write(self.SYNTHETIC_PASSWORD)
+            with mock.patch.object(core.cfgmod, "credential_paths", return_value=(user_file, pwd_file)), \
+                 mock.patch.object(core, "_build_ssl_context",
+                                   side_effect=RuntimeError("CA_FILE '/mnt/secrets-store/ca-chain-pem' not found")):
+                ok, reason = core.check_static_prerequisites(self.DEPLOYMENT, table)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "TLS trust bundle unavailable")
+        self._assert_reason_clean(reason)
+
+    def test_dynamodb_config_exception_reason_is_generic(self):
+        table = MagicMock()
+        table.get_item.side_effect = RuntimeError(
+            "AccessDeniedException: User: arn:aws:sts::668311715351:assumed-role/"
+            "GoldenGateMonitorReadRole-dev/i-0123456789abcdef is not authorized")
+        with tempfile.TemporaryDirectory() as tmp:
+            user_file = os.path.join(tmp, "user")
+            pwd_file = os.path.join(tmp, "pwd")
+            with open(user_file, "w") as f:
+                f.write(self.SYNTHETIC_USER)
+            with open(pwd_file, "w") as f:
+                f.write(self.SYNTHETIC_PASSWORD)
+            with mock.patch.object(core.cfgmod, "credential_paths", return_value=(user_file, pwd_file)), \
+                 mock.patch.object(core, "_build_ssl_context", return_value=MagicMock()):
+                ok, reason = core.check_static_prerequisites(self.DEPLOYMENT, table)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "DynamoDB CONFIG unavailable")
+        self._assert_reason_clean(reason)
+
+    def test_run_pipeline_retry_warning_is_generic(self):
+        """The actual logger.warning(...) call in run_pipeline's retry loop
+        -- not just check_static_prerequisites's return value -- must stay
+        clean on every retry."""
+        stop_event = threading.Event()
+
+        fake_table = MagicMock()
+        fake_table.get_item.side_effect = RuntimeError(
+            "AccessDeniedException: arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev")
+
+        def fake_resource(*a, **k):
+            resource = MagicMock()
+            resource.Table.return_value = fake_table
+            return resource
+
+        real_check = core.check_static_prerequisites
+
+        def fake_check(dep, table):
+            stop_event.set()
+            return real_check(dep, table)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            user_file = os.path.join(tmp, "user")
+            pwd_file = os.path.join(tmp, "pwd")
+            with open(user_file, "w") as f:
+                f.write(self.SYNTHETIC_USER)
+            with open(pwd_file, "w") as f:
+                f.write(self.SYNTHETIC_PASSWORD)
+
+            with mock.patch.object(core.boto3, "resource", side_effect=fake_resource), \
+                 mock.patch.object(core, "check_static_prerequisites", side_effect=fake_check), \
+                 mock.patch.object(core.cfgmod, "credential_paths", return_value=(user_file, pwd_file)), \
+                 mock.patch.object(core, "_build_ssl_context", return_value=MagicMock()):
+                with self.assertLogs(core.logger, level="WARNING") as log_ctx:
+                    core.run_pipeline(self.DEPLOYMENT, stop_event, {}, "eu-west-1", "gg-eks-pipeline", "gg-monitor-0")
+
+        combined = "\n".join(log_ctx.output)
+        self.assertIn("gg-oracle-payments-01", combined)
+        self.assertIn("DynamoDB CONFIG unavailable", combined)
+        self._assert_reason_clean(combined)
+
+
 class CloudWatchGateTests(unittest.TestCase):
     def test_disabled_by_default(self):
         core.CLOUDWATCH_PUBLISH_ENABLED = False

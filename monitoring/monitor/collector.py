@@ -400,29 +400,38 @@ def check_static_prerequisites(deployment, table):
     """Returns (ok, reason). A transient failure here just keeps retrying;
     it never crashes the process. Deliberately excludes GoldenGate Admin
     REST reachability -- the runtime API being down must not make the
-    monitor pod unready."""
+    monitor pod unready.
+
+    reason is always a fixed, generic string (plus, where noted, the
+    canonical deployment name / expected-vs-actual type) -- never a
+    credential file path, CA path, secret value, or raw AWS exception. The
+    caller (run_pipeline) logs this reason on every retry, so it must stay
+    safe to log repeatedly."""
     pipeline = deployment["name"]
     user_file, pwd_file = cfgmod.credential_paths(pipeline)
     if not _read_secret_file(user_file):
-        return False, f"credential file empty or unreadable: {user_file}"
+        return False, "admin username credential unavailable"
     if not _read_secret_file(pwd_file):
-        return False, f"credential file empty or unreadable: {pwd_file}"
+        return False, "admin password credential unavailable"
 
     try:
         _build_ssl_context()
-    except RuntimeError as e:
-        return False, f"TLS context unavailable: {e}"
+    except RuntimeError:
+        return False, "TLS trust bundle unavailable"
 
     try:
         config_item = read_config(table, pipeline)
-    except Exception as e:
-        return False, f"DynamoDB CONFIG read failed: {e}"
+    except Exception:
+        return False, "DynamoDB CONFIG unavailable"
 
     if not config_item:
         return False, f"CONFIG item missing for {pipeline!r}"
     config_deployment_type = config_item.get("deploymentType")
     if config_deployment_type != deployment["type"]:
-        return False, f"CONFIG deploymentType {config_deployment_type!r} != {deployment['type']!r}"
+        return False, (
+            f"CONFIG deploymentType mismatch for {pipeline!r}: "
+            f"expected {deployment['type']!r}, got {config_deployment_type!r}"
+        )
 
     return True, ""
 

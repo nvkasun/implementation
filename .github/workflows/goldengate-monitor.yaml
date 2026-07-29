@@ -1,6 +1,6 @@
 name: Goldengate monitor deployment
 
-run-name: "Cloud Factory - GoldenGate monitor build and deploy | ${{ github.event_name == 'workflow_dispatch' && format('manual dispatch (deploy={0})', inputs.deploy) || format('auto: monitor changes on {0}', github.sha) }} | ran by ${{ github.actor }}"
+run-name: "Cloud Factory - GoldenGate monitor build and deploy | manual dispatch (deploy=${{ inputs.deploy }}) | ran by ${{ github.actor }}"
 
 
 # Manual dispatch only during the first controlled deployment -- pushing
@@ -1295,10 +1295,10 @@ jobs:
           echo "Checking /readyz inside the pod..."
           if ! kubectl exec "$POD_NAME" -n "$TARGET_NAMESPACE" -- \
             python3 -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=5).status == 200 else 1)"; then
-            echo "FAIL: /readyz did not respond with HTTP 200 inside pod ${POD_NAME} (observer role cannot access DynamoDB, or DynamoDB is unavailable)."
+            echo "FAIL: /readyz did not respond with HTTP 200 inside pod ${POD_NAME} (shared monitor role cannot access DynamoDB, or DynamoDB is unavailable)."
             exit 1
           fi
-          echo "OK: /readyz responded with HTTP 200 (the read-only role can reach DynamoDB)."
+          echo "OK: /readyz responded with HTTP 200 (the shared monitor role can reach DynamoDB)."
 
           echo "Checking /api/status inside the pod..."
           API_STATUS_BODY="$(kubectl exec "$POD_NAME" -n "$TARGET_NAMESPACE" -- \
@@ -1336,7 +1336,7 @@ jobs:
           # does.
           echo "OK: /api/status is valid JSON and contains all canonical deployments/pipelines."
 
-          echo "Checking observer/portal logs for forbidden patterns..."
+          echo "Checking collector and portal logs for forbidden patterns..."
           POD_LOGS="$(kubectl logs "$POD_NAME" -n "$TARGET_NAMESPACE" --since=10m 2>/dev/null || true)"
 
           if grep -qi "AccessDeniedException" <<< "$POD_LOGS"; then
@@ -1349,7 +1349,7 @@ jobs:
           fi
 
           echo "OK: no AccessDeniedException or missing-region error found in recent logs."
-          echo "OK: the portal only ever issues GetItem/Query/DescribeTable (see monitor.py) -- no Scan or write call exists in the application code to appear in logs."
+          echo "OK: the portal's own read functions only ever issue GetItem/Query/DescribeTable (see monitor.py); the collector intentionally writes LEASE and STATE# records (see collector.py) -- no Scan call exists anywhere in the application code."
 
       - name: Upload rendered manifests and chart package
         if: always()
