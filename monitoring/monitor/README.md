@@ -49,12 +49,12 @@ precedence once present.
 ## IRSA role
 
 `ServiceAccount` `gg-monitor` in namespace `goldengate-monitoring`,
-annotated with `GoldenGateSecretsReadRole-dev` (the same role used by the
-GoldenGate runtime ServiceAccounts), scoped to Secrets Manager read,
-`dynamodb:GetItem`/`Query`/`PutItem`/`UpdateItem`/`DescribeTable` on
-`gg-eks-pipeline`, and `cloudwatch:PutMetricData` restricted to
-`GoldenGate/Pipelines` (CloudWatch publishing stays disabled by
-configuration).
+annotated with `GoldenGateMonitorReadRole-dev` -- a separate role from the
+GoldenGate runtime ServiceAccounts, which use `GoldenGateSecretsReadRole-dev`.
+Scoped to Secrets Manager read, `dynamodb:GetItem`/`Query`/`PutItem`/
+`UpdateItem`/`DescribeTable` on `gg-eks-pipeline`, and
+`cloudwatch:PutMetricData` restricted to `GoldenGate/Pipelines` (CloudWatch
+publishing stays disabled by configuration).
 
 ## Local unit tests
 

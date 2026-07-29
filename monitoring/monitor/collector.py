@@ -125,12 +125,16 @@ class LeaseManager:
 
 class LeaseState:
     """Thread-safe leader/readiness state shared between one deployment's
-    lease-control loop and its polling loop (two independent threads)."""
+    lease-control loop and its polling loop (two independent threads).
+    credentials_ok is set by the polling loop itself when the admin
+    username/password file is missing or empty -- combined with is_ready()
+    (lease-API health) wherever overall readiness is reported."""
 
     def __init__(self):
         self._lock = threading.Lock()
         self._is_leader = False
         self._ready = False
+        self._credentials_ok = True
 
     def set_leader(self, value):
         with self._lock:
@@ -147,6 +151,14 @@ class LeaseState:
     def is_ready(self):
         with self._lock:
             return self._ready
+
+    def set_credentials_ok(self, value):
+        with self._lock:
+            self._credentials_ok = value
+
+    def credentials_ok(self):
+        with self._lock:
+            return self._credentials_ok
 
 
 def lease_control_loop(mgr, state, stop_event, renew_interval=RENEW_INTERVAL):
@@ -457,8 +469,19 @@ def polling_loop(deployment, table, mgr, state, stop_event):
             flags = {"lag": 0, "abend": 0, "down": 0}
             extra_md = []
 
-            user = _read_secret_file(user_file) or "oggadmin"
+            user = _read_secret_file(user_file)
             pwd = _read_secret_file(pwd_file)
+            if not user or not pwd:
+                # Fail closed: never guess a username, never attempt Basic
+                # auth, never poll GoldenGate, never write a deployment
+                # STATE this tick. Only the canonical deployment name is
+                # logged -- never a file path or secret value.
+                state.set_credentials_ok(False)
+                logger.warning("admin credentials unavailable for %s; skipping this tick", pipeline)
+                _sleep_watching_leadership(interval)
+                continue
+            state.set_credentials_ok(True)
+
             ssl_ctx = _build_ssl_context()
             opener = _basic_opener(user, pwd, base, ssl_ctx, tls_server_name)
 
@@ -602,7 +625,7 @@ def run_pipeline(deployment, stop_event, ready_state, aws_region, dynamodb_table
     poll_thread.start()
 
     while not stop_event.is_set():
-        ready_state[pipeline] = state.is_ready()
+        ready_state[pipeline] = state.is_ready() and state.credentials_ok()
         stop_event.wait(1)
 
     lease_thread.join()

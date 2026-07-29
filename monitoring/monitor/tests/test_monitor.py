@@ -10,6 +10,8 @@ import unittest
 from decimal import Decimal
 from unittest import mock
 
+import yaml
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
@@ -654,6 +656,50 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         with open(ARGOCD_WORKFLOW_PATH) as f:
             cls.argocd_text = f.read()
 
+    def test_workflow_has_workflow_dispatch_trigger(self):
+        doc = yaml.safe_load(self.monitor_text)
+        triggers = doc.get("on") or doc.get(True)
+        self.assertIn("workflow_dispatch", triggers)
+        inputs = triggers["workflow_dispatch"]["inputs"]
+        self.assertIn("environment", inputs)
+        self.assertIn("deploy", inputs)
+
+    def test_workflow_has_no_active_push_trigger(self):
+        doc = yaml.safe_load(self.monitor_text)
+        triggers = doc.get("on") or doc.get(True)
+        self.assertNotIn("push", triggers)
+        self.assertNotIn("pull_request", triggers)
+        self.assertNotIn("schedule", triggers)
+
+    def test_setup_python_step_pins_3_12_with_dependency_cache(self):
+        doc = yaml.safe_load(self.monitor_text)
+        steps = doc["jobs"]["ensure_monitor_image"]["steps"]
+        setup_steps = [s for s in steps if s.get("uses", "").startswith("actions/setup-python@")]
+        self.assertEqual(len(setup_steps), 1, "expected exactly one actions/setup-python step")
+        step = setup_steps[0]
+        self.assertEqual(step["uses"], "actions/setup-python@v5")
+        self.assertEqual(step["with"]["python-version"], "3.12")
+        self.assertEqual(step["with"]["cache"], "pip")
+        cache_paths = step["with"]["cache-dependency-path"]
+        self.assertIn("monitoring/monitor/requirements.txt", cache_paths)
+        self.assertIn("monitoring/monitor/requirements-test.txt", cache_paths)
+
+    def test_setup_python_runs_before_dependency_install_and_tests(self):
+        setup_idx = self.monitor_text.index("uses: actions/setup-python@v5")
+        install_idx = self.monitor_text.index("name: Install monitor runtime and test dependencies")
+        test_idx = self.monitor_text.index("name: Run monitor unit tests")
+        self.assertLess(setup_idx, install_idx)
+        self.assertLess(install_idx, test_idx)
+
+    def test_dockerfile_does_not_install_test_requirements(self):
+        with open(os.path.join(REPO_ROOT, "monitoring", "monitor", "Dockerfile")) as f:
+            dockerfile_text = f.read()
+        self.assertNotIn("requirements-test.txt", dockerfile_text)
+
+    def test_oci_description_reflects_collector_and_portal(self):
+        self.assertNotIn("Read-only shared GoldenGate monitoring portal", self.monitor_text)
+        self.assertIn("Shared GoldenGate monitoring collector and portal", self.monitor_text)
+
     def test_no_unsafe_inputs_deploy_condition_remains(self):
         self.assertNotIn("inputs.deploy != false", self.monitor_text)
 
@@ -870,6 +916,15 @@ def _run_serviceaccount_snippet(monitor_text, rendered_yaml):
 
 def _run_ingress_snippet(monitor_text, rendered_yaml):
     return _run_snippet(_extract_ingress_validation_snippet(monitor_text), rendered_yaml)
+
+
+class ReadmeRoleDocumentationTests(unittest.TestCase):
+    def test_readme_documents_monitor_role_correctly(self):
+        with open(os.path.join(REPO_ROOT, "monitoring", "monitor", "README.md")) as f:
+            readme_text = f.read()
+        self.assertIn("GoldenGateMonitorReadRole-dev", readme_text)
+        irsa_section = readme_text[readme_text.index("## IRSA role"):]
+        self.assertNotIn("annotated with `GoldenGateSecretsReadRole-dev`", irsa_section)
 
 
 class ServiceAccountIrsaValidationTests(unittest.TestCase):

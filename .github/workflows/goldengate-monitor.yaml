@@ -2,6 +2,11 @@ name: Goldengate monitor deployment
 
 run-name: "Cloud Factory - GoldenGate monitor build and deploy | ${{ github.event_name == 'workflow_dispatch' && format('manual dispatch (deploy={0})', inputs.deploy) || format('auto: monitor changes on {0}', github.sha) }} | ran by ${{ github.actor }}"
 
+
+# Manual dispatch only during the first controlled deployment -- pushing
+# this repository to main must not automatically deploy a new DynamoDB
+# writer before Terraform/IAM prerequisites are reviewed and applied. The
+# automatic push trigger is restored once the initial rollout is validated.
 on:
   workflow_dispatch:
     inputs:
@@ -18,16 +23,6 @@ on:
         required: true
         type: boolean
         default: true
-
-  push:
-    branches:
-      - main
-    paths:
-      - 'monitoring/monitor/**'
-      - 'helm/goldengate-monitor/**'
-      - 'envs/dev/goldengate-monitor/**'
-      - '.github/workflows/goldengate-monitor.yaml'
-      - 'envs/dev/goldengate-deployments.yaml'
 
 permissions:
   id-token: write
@@ -268,6 +263,16 @@ jobs:
             fi
           fi
 
+      - name: Set up Python
+        if: env.IMAGE_EXISTED != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            monitoring/monitor/requirements.txt
+            monitoring/monitor/requirements-test.txt
+
       - name: Install monitor runtime and test dependencies
         if: env.IMAGE_EXISTED != 'true'
         shell: bash
@@ -338,7 +343,7 @@ jobs:
           docker build \
             --build-arg "OCI_SOURCE=${{ github.server_url }}/${{ github.repository }}" \
             --build-arg "OCI_TITLE=goldengate-monitor" \
-            --build-arg "OCI_DESCRIPTION=Read-only shared GoldenGate monitoring portal" \
+            --build-arg "OCI_DESCRIPTION=Shared GoldenGate monitoring collector and portal" \
             --build-arg "OCI_VERSION=${MONITOR_IMAGE_TAG}" \
             -t "$MONITOR_IMAGE_URI" \
             "$MONITOR_SOURCE_PATH"
