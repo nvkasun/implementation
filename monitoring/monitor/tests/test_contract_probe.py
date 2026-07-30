@@ -823,6 +823,40 @@ class KeyOutputBoundingTests(unittest.TestCase):
         self.assertFalse(summary["responseKeysTruncated"])
 
 
+class ExplicitPathCollectionNameBoundTests(unittest.TestCase):
+    """A list-valued response.* field whose OWN name (not its item field
+    names) is longer than MAX_KEY_LENGTH must be omitted entirely -- never
+    inspected, never partially emitted -- with collectionsTruncated=true."""
+
+    def test_overlong_collection_name_omitted(self):
+        overlong = "c" * (probe.MAX_KEY_LENGTH + 1)
+        payload = {"response": {overlong: [{"a": "SECRET_VALUE"}], "short": [{"b": 2}]}}
+        summary = probe.summarize_json(payload)
+        self.assertNotIn(overlong, summary["collections"])
+        self.assertIn("short", summary["collections"])
+
+    def test_overlong_collection_name_sets_collections_truncated(self):
+        overlong = "d" * (probe.MAX_KEY_LENGTH + 1)
+        payload = {"response": {overlong: [{"a": 1}], "short": [{"b": 2}]}}
+        summary = probe.summarize_json(payload)
+        self.assertTrue(summary["collectionsTruncated"])
+
+    def test_overlong_collection_name_never_inspected(self):
+        overlong = "e" * (probe.MAX_KEY_LENGTH + 1)
+        payload = {"response": {overlong: [{"secretField": "SHOULD_NOT_APPEAR"}]}}
+        summary = probe.summarize_json(payload)
+        blob = json.dumps(summary)
+        self.assertNotIn("SHOULD_NOT_APPEAR", blob)
+        self.assertNotIn("secretField", blob)
+
+    def test_collection_name_exactly_at_limit_is_kept(self):
+        exact = "f" * probe.MAX_KEY_LENGTH
+        payload = {"response": {exact: [{"a": 1}]}}
+        summary = probe.summarize_json(payload)
+        self.assertIn(exact, summary["collections"])
+        self.assertFalse(summary["collectionsTruncated"])
+
+
 class MetricsPortSecurityTests(unittest.TestCase):
     """Direct metricsPort 9015 is confirmed plain HTTP in the live
     environment: the probe must never read credential files, build a
@@ -1227,6 +1261,152 @@ class FollowProcessesTests(unittest.TestCase):
         self.assertEqual(result["successCount"], 0)
         self.assertEqual(result["failureCount"], 2)
         self.assertEqual(result["errorCategoryCounts"]["ENDPOINT_UNAVAILABLE"], 2)
+
+    # -- Duplicate processName inventory handling -----------------------
+
+    def test_duplicate_process_names_cause_only_one_detail_request(self):
+        processes = [{"processName": "DUP1", "processId": 1},
+                    {"processName": "DUP1", "processId": 2},
+                    {"processName": "UNIQ1", "processId": 3}]
+        inventory = {"response": {"processes": processes}}
+        stub, calls = self._stub_fetch(inventory, {"response": {"a": 1}})
+        d = _deployment()
+        with mock.patch.object(probe, "_fetch_json", side_effect=stub):
+            result = probe.follow_processes(d, "process")
+        detail_calls = [c for c in calls if c[1] != probe.INVENTORY_PATH]
+        self.assertEqual(len(detail_calls), 2)  # DUP1 once, UNIQ1 once
+        self.assertEqual(result["attemptedCount"], 2)
+        self.assertEqual(result["successCount"], 2)
+
+    def test_inventory_item_count_retains_raw_length_with_duplicates(self):
+        processes = [{"processName": "DUP1"}, {"processName": "DUP1"}, {"processName": "DUP1"}]
+        inventory = {"response": {"processes": processes}}
+        stub, _ = self._stub_fetch(inventory, {"response": {"a": 1}})
+        d = _deployment()
+        with mock.patch.object(probe, "_fetch_json", side_effect=stub):
+            result = probe.follow_processes(d, "process")
+        self.assertEqual(result["inventoryItemCount"], 3)
+        self.assertEqual(result["attemptedCount"], 1)
+
+    def test_attempted_count_reflects_unique_followed_names(self):
+        processes = ([{"processName": "A"}, {"processName": "A"}, {"processName": "B"}]
+                    + [{"processName": "B"}] * 5 + [{"processName": "C"}])
+        inventory = {"response": {"processes": processes}}
+        stub, calls = self._stub_fetch(inventory, {"response": {"a": 1}})
+        d = _deployment()
+        with mock.patch.object(probe, "_fetch_json", side_effect=stub):
+            result = probe.follow_processes(d, "process")
+        self.assertEqual(result["attemptedCount"], 3)  # A, B, C -- unique only
+        detail_calls = [c for c in calls if c[1] != probe.INVENTORY_PATH]
+        self.assertEqual(len(detail_calls), 3)
+
+    def test_no_process_name_or_raw_value_in_output_with_duplicates(self):
+        processes = [{"processName": "SUPER_SECRET_DUP"}, {"processName": "SUPER_SECRET_DUP"}]
+        inventory = {"response": {"processes": processes}}
+        stub, _ = self._stub_fetch(inventory, {"response": {"lag": 12345}})
+        d = _deployment()
+        with mock.patch.object(probe, "_fetch_json", side_effect=stub):
+            result = probe.follow_processes(d, "process")
+        blob = json.dumps(result)
+        self.assertNotIn("SUPER_SECRET_DUP", blob)
+        self.assertNotIn("12345", blob)
+
+    # -- Final merged-collection bounds (the fixed defect) ---------------
+
+    def test_merged_collection_field_names_bounded_across_many_responses(self):
+        names = tuple(f"P{i}" for i in range(probe.MAX_FOLLOWED_PROCESSES))
+        inventory = self._inventory(names=names)
+
+        def side_effect(path):
+            idx = path.split("/")[4]
+            fields = {f"field_{idx}_{j}": "x" for j in range(probe.MAX_FIELD_NAMES_PER_COLLECTION)}
+            return (200, "application/json", {"response": {"items": [fields]}})
+
+        stub, _ = self._stub_fetch(inventory, detail_side_effect=side_effect)
+        d = _deployment()
+        with mock.patch.object(probe, "_fetch_json", side_effect=stub):
+            result = probe.follow_processes(d, "process")
+        coll = result["schema"]["collections"]["items"]
+        self.assertLessEqual(len(coll["fieldNames"]), probe.MAX_FIELD_NAMES_PER_COLLECTION)
+        self.assertTrue(coll["truncated"])
+        self.assertTrue(result["schema"]["truncated"])
+
+    def test_merged_collection_field_types_only_for_retained_names(self):
+        agg = {"topLevelKeys": set(), "fieldNames": set(), "fieldTypes": {}, "truncated": False,
+              "collections": {
+                  "items": {
+                      "fieldNames": {f"f{i}" for i in range(probe.MAX_FIELD_NAMES_PER_COLLECTION + 10)},
+                      "fieldTypes": {f"f{i}": {"string"} for i in range(probe.MAX_FIELD_NAMES_PER_COLLECTION + 10)},
+                      "truncated": False,
+                  }
+              }}
+        schema = probe._finalize_schema(agg)
+        coll = schema["collections"]["items"]
+        self.assertEqual(set(coll["fieldTypes"].keys()), set(coll["fieldNames"]))
+        self.assertLessEqual(len(coll["fieldNames"]), probe.MAX_FIELD_NAMES_PER_COLLECTION)
+
+    def test_merged_collection_truncated_when_field_names_exceed_limit(self):
+        agg = {"topLevelKeys": set(), "fieldNames": set(), "fieldTypes": {}, "truncated": False,
+              "collections": {
+                  "items": {
+                      "fieldNames": {f"f{i}" for i in range(probe.MAX_FIELD_NAMES_PER_COLLECTION + 1)},
+                      "fieldTypes": {},
+                      "truncated": False,
+                  }
+              }}
+        schema = probe._finalize_schema(agg)
+        self.assertTrue(schema["collections"]["items"]["truncated"])
+
+    def test_overall_schema_truncated_when_any_collection_truncated(self):
+        agg = {"topLevelKeys": set(), "fieldNames": set(), "fieldTypes": {}, "truncated": False,
+              "collections": {
+                  "items": {"fieldNames": {"a"}, "fieldTypes": {"a": {"number"}}, "truncated": True}
+              }}
+        schema = probe._finalize_schema(agg)
+        self.assertTrue(schema["truncated"])
+
+    def test_field_name_exactly_at_limit_kept_in_merged_collection(self):
+        exact = "g" * probe.MAX_KEY_LENGTH
+        agg = {"topLevelKeys": set(), "fieldNames": set(), "fieldTypes": {}, "truncated": False,
+              "collections": {
+                  "items": {"fieldNames": {exact}, "fieldTypes": {exact: {"string"}}, "truncated": False}
+              }}
+        schema = probe._finalize_schema(agg)
+        self.assertIn(exact, schema["collections"]["items"]["fieldNames"])
+        self.assertFalse(schema["collections"]["items"]["truncated"])
+
+    def test_overlong_merged_collection_name_omitted(self):
+        overlong = "h" * (probe.MAX_KEY_LENGTH + 1)
+        agg = {"topLevelKeys": set(), "fieldNames": set(), "fieldTypes": {}, "truncated": False,
+              "collections": {
+                  overlong: {"fieldNames": {"secretField"}, "fieldTypes": {"secretField": {"string"}},
+                            "truncated": False},
+                  "short": {"fieldNames": {"a"}, "fieldTypes": {"a": {"number"}}, "truncated": False},
+              }}
+        schema = probe._finalize_schema(agg)
+        self.assertNotIn(overlong, schema["collections"])
+        self.assertIn("short", schema["collections"])
+        blob = json.dumps(schema)
+        self.assertNotIn("secretField", blob)
+
+    def test_follow_processes_schema_truncated_for_omitted_collection_name(self):
+        overlong = "i" * (probe.MAX_KEY_LENGTH + 1)
+        agg = {"topLevelKeys": set(), "fieldNames": set(), "fieldTypes": {}, "truncated": False,
+              "collections": {
+                  overlong: {"fieldNames": {"a"}, "fieldTypes": {"a": {"number"}}, "truncated": False},
+              }}
+        schema = probe._finalize_schema(agg)
+        self.assertTrue(schema["truncated"])
+
+    def test_collection_name_exactly_at_limit_kept_in_finalize_schema(self):
+        exact = "j" * probe.MAX_KEY_LENGTH
+        agg = {"topLevelKeys": set(), "fieldNames": set(), "fieldTypes": {}, "truncated": False,
+              "collections": {
+                  exact: {"fieldNames": {"a"}, "fieldTypes": {"a": {"number"}}, "truncated": False},
+              }}
+        schema = probe._finalize_schema(agg)
+        self.assertIn(exact, schema["collections"])
+        self.assertFalse(schema["truncated"])
 
 
 def ProbeRequestErrorFactory(category, http_status=None):

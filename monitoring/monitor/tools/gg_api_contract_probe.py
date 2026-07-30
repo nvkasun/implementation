@@ -371,7 +371,13 @@ def summarize_json(payload, max_items=MAX_ITEMS_PER_COLLECTION,
     collections = {}
     collections_truncated = False
     if isinstance(response, dict):
-        list_valued_keys = sorted(str(k) for k in response.keys() if isinstance(response.get(k), list))
+        all_list_valued_keys = sorted(str(k) for k in response.keys() if isinstance(response.get(k), list))
+        # A collection name longer than max_key_length is omitted entirely
+        # (never partial) -- and its items are never inspected at all, since
+        # the filter runs before the summarization loop below.
+        list_valued_keys = [k for k in all_list_valued_keys if len(k) <= max_key_length]
+        if len(list_valued_keys) < len(all_list_valued_keys):
+            collections_truncated = True
         if len(list_valued_keys) > max_collection_keys:
             collections_truncated = True
         for key in list_valued_keys[:max_collection_keys]:
@@ -496,11 +502,13 @@ INVENTORY_PATH = "/services/v2/mpoints/processes"
 
 
 def _valid_inventory_process_names(payload):
-    """Returns (names, inventory_item_count): processName strings pulled
-    from response.processes -- never processId, never any other field.
-    Non-dict items and items with no valid (non-empty string) processName
-    are skipped. inventory_item_count is the TRUE response.processes list
-    length, unaffected by how many entries were valid."""
+    """Returns (names, inventory_item_count): unique processName strings
+    pulled from response.processes, in first-seen order -- never processId,
+    never any other field. Non-dict items, items with no valid (non-empty
+    string) processName, and repeat processName values (after the first)
+    are skipped -- a duplicate name must never cause a second detail
+    request. inventory_item_count is the TRUE response.processes list
+    length, unaffected by validity or dedup."""
     if not isinstance(payload, dict):
         return [], 0
     response = payload.get("response")
@@ -510,11 +518,13 @@ def _valid_inventory_process_names(payload):
     if not isinstance(processes, list):
         return [], 0
     names = []
+    seen = set()
     for item in processes:
         if not isinstance(item, dict):
             continue
         name = item.get("processName")
-        if isinstance(name, str) and name:
+        if isinstance(name, str) and name and name not in seen:
+            seen.add(name)
             names.append(name)
     return names, len(processes)
 
@@ -587,17 +597,38 @@ def _finalize_schema(agg):
     kept = set(field_names)
     field_types = {k: sorted(v) for k, v in agg["fieldTypes"].items() if k in kept}
 
-    collection_names = sorted(agg["collections"].keys())
+    all_collection_names = sorted(agg["collections"].keys())
+    # A merged collection NAME longer than MAX_KEY_LENGTH is omitted
+    # entirely (never partial) -- its data is never inspected/output at all,
+    # since the filter runs before the per-collection loop below.
+    collection_names = [n for n in all_collection_names if len(n) <= MAX_KEY_LENGTH]
+    if len(collection_names) < len(all_collection_names):
+        agg["truncated"] = True
     if len(collection_names) > MAX_COLLECTION_KEYS:
         agg["truncated"] = True
         collection_names = collection_names[:MAX_COLLECTION_KEYS]
     collections_out = {}
     for name in collection_names:
         data = agg["collections"][name]
+        # Re-apply the per-collection field-name bounds one final time:
+        # merging many responses' field names can otherwise still exceed
+        # MAX_FIELD_NAMES_PER_COLLECTION even though each individual
+        # response stayed within it.
+        all_field_names = sorted(data["fieldNames"])
+        length_ok_field_names = [f for f in all_field_names if len(f) <= MAX_KEY_LENGTH]
+        overlong_field_name_omitted = len(length_ok_field_names) < len(all_field_names)
+        final_field_names = length_ok_field_names[:MAX_FIELD_NAMES_PER_COLLECTION]
+        field_count_capped = len(length_ok_field_names) > MAX_FIELD_NAMES_PER_COLLECTION
+        kept = set(final_field_names)
+        final_field_types = {k: sorted(v) for k, v in data["fieldTypes"].items() if k in kept}
+        collection_truncated = bool(
+            data["truncated"] or overlong_field_name_omitted or field_count_capped)
+        if collection_truncated:
+            agg["truncated"] = True
         collections_out[name] = {
-            "fieldNames": sorted(data["fieldNames"]),
-            "fieldTypes": {k: sorted(v) for k, v in data["fieldTypes"].items()},
-            "truncated": data["truncated"],
+            "fieldNames": final_field_names,
+            "fieldTypes": final_field_types,
+            "truncated": collection_truncated,
         }
 
     return {
