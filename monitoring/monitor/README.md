@@ -64,6 +64,43 @@ exact same lease/fencing rules as every other write in this module).
 never converted into a rate/percentage in this phase. Production PMS
 collection never restarts, stops, or otherwise controls GoldenGate.
 
+**The `pms` attribute described above is this repository's own bounded
+`STATE#_deployment` PMS enrichment, derived from the live-confirmed
+contracts in Phase 4C1/4C1-correction -- it is not part of, and does not
+claim to reproduce, any manager-implementation deployment-level PMS
+schema.**
+
+A malformed or structurally-invalid response is never treated as healthy:
+an inventory response must be a dict whose `response.processes` is a list
+(a genuinely empty list is a valid `OK` result with zero counts; anything
+else about the shape being wrong -- missing/null/non-dict `response`, or a
+non-list `processes` -- is `INVALID_RESPONSE`). A `processPerformance` or
+`serviceHealth` detail response must be a dict containing at least one of
+its confirmed fields, or that individual detail call counts as failed, not
+successful. `status` reflects whether any individual detail GET actually
+succeeded this tick -- so a tick where every followed process got exactly
+one of its two details is `PARTIAL`, never `UNAVAILABLE`.
+
+Process names are bounded and validated before ever being followed: a
+`processName` must be a non-empty (after trimming), ≤128-character string
+with no ASCII control character and never literally `.`/`..`; an invalid
+name is skipped before any request, never appears as a `pms.processes` map
+key, and is never logged. Accepted names are preserved exactly. Every
+numeric PMS field is normalized through a hardened, non-raising helper that
+rejects booleans, `NaN`/infinite/negative values, and anything above a
+fixed, documented DynamoDB-safe bound (10¹⁵) -- including guarding against
+`OverflowError` from an oversized raw integer.
+
+Every `STATE#_deployment` write makes the PMS state unambiguous for the
+current tick only: when Admin REST itself is unreachable (PMS is not even
+attempted), and when PMS collection fails in a way this module did not
+anticipate, the write still carries a **current**, sanitized, empty PMS
+snapshot (`collectedAt` stamped to that tick) -- a prior successful tick's
+`pms` map is never left attached looking current. Any such unexpected PMS
+failure logs only a generic warning naming the canonical deployment --
+never the exception text, a traceback, a response body, a process name, a
+URL, a hostname, or a credential/CA path.
+
 ## CloudWatch metric contract
 
 `collector.build_metric_batch` is a pure function (no boto3 calls) that

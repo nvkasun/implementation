@@ -539,6 +539,30 @@ else
   fail "PMS enrichment / existing STATE# recordType pattern changed unexpectedly"
 fi
 
+# ---------------------------------------------------------------------
+# 14. Phase 4C1 correction: process-name/numeric bounds and stale-PMS
+#     overwrite semantics remain in place.
+# ---------------------------------------------------------------------
+echo ""
+echo "--- Production PMS collection: bounds and stale-state overwrite ---"
+if grep -q "MAX_PMS_PROCESS_NAME_LENGTH = 128" "${MONITOR_APP_DIR}/collector.py" 2>/dev/null; then
+  pass "collector.py bounds PMS process-name length"
+else
+  fail "collector.py no longer bounds PMS process-name length"
+fi
+
+if grep -q "PMS_MAX_SAFE_NUMBER = 10 \*\* 15" "${MONITOR_APP_DIR}/collector.py" 2>/dev/null; then
+  pass "collector.py bounds PMS numeric values to a fixed DynamoDB-safe range"
+else
+  fail "collector.py no longer bounds PMS numeric values to a fixed DynamoDB-safe range"
+fi
+
+if grep -q "_pms_unavailable_snapshot" "${MONITOR_APP_DIR}/collector.py" 2>/dev/null; then
+  pass "collector.py overwrites pms with a current sanitized snapshot on DOWN/unexpected-failure ticks"
+else
+  fail "collector.py stale-PMS overwrite helper is missing"
+fi
+
 echo ""
 echo "=================================================="
 echo "Summary: ${PASS_COUNT} passed, ${FAIL_COUNT} failed, ${SKIP_COUNT} skipped"

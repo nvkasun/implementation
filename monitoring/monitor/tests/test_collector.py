@@ -1,10 +1,12 @@
 import json
 import logging
 import os
+import ssl
 import sys
 import tempfile
 import threading
 import unittest
+import urllib.error
 from unittest import mock
 from unittest.mock import MagicMock
 
@@ -1138,8 +1140,8 @@ class PmsRequestSequenceTests(unittest.TestCase):
             {"processName": "OK1"},
         ]}}
         opener, calls = self._fake_opener(
-            inventory, {f"{self.BASE}/services/v2/mpoints/OK1/processPerformance": {"response": {}},
-                       f"{self.BASE}/services/v2/mpoints/OK1/serviceHealth": {"response": {}}})
+            inventory, {f"{self.BASE}/services/v2/mpoints/OK1/processPerformance": {"response": {"cpuTimeUs": 1}},
+                       f"{self.BASE}/services/v2/mpoints/OK1/serviceHealth": {"response": {"isHealthy": True}}})
         result = core.collect_pms(self.BASE, opener)
         self.assertEqual(result["inventoryCount"], 7)
         self.assertEqual(result["followedCount"], 1)
@@ -1147,9 +1149,9 @@ class PmsRequestSequenceTests(unittest.TestCase):
 
     def test_partial_per_process_failure_continues_remaining(self):
         inventory = self._inventory(["P1", "P2"])
-        detail = {f"{self.BASE}/services/v2/mpoints/P1/processPerformance": {"response": {}},
-                 f"{self.BASE}/services/v2/mpoints/P1/serviceHealth": {"response": {}},
-                 f"{self.BASE}/services/v2/mpoints/P2/serviceHealth": {"response": {}}}
+        detail = {f"{self.BASE}/services/v2/mpoints/P1/processPerformance": {"response": {"cpuTimeUs": 1}},
+                 f"{self.BASE}/services/v2/mpoints/P1/serviceHealth": {"response": {"isHealthy": True}},
+                 f"{self.BASE}/services/v2/mpoints/P2/serviceHealth": {"response": {"isHealthy": True}}}
         exceptions = {f"{self.BASE}/services/v2/mpoints/P2/processPerformance": RuntimeError("boom")}
         opener, calls = self._fake_opener(inventory, detail, detail_exceptions=exceptions)
         result = core.collect_pms(self.BASE, opener)
@@ -1223,6 +1225,321 @@ class PmsRequestSequenceTests(unittest.TestCase):
         self.assertNotIn("8443", blob)
 
 
+class PmsResponseShapeValidationTests(unittest.TestCase):
+    """Section 3/4 correction: a structurally invalid inventory or detail
+    response must never be silently accepted as healthy."""
+
+    BASE = "https://gg-test:8443"
+
+    def _opener(self, responses):
+        def _open(url, timeout=5):
+            m = MagicMock()
+            m.read.return_value = json.dumps(responses[url]).encode()
+            m.__enter__.return_value = m
+            m.__exit__.return_value = False
+            return m
+        o = MagicMock()
+        o.open.side_effect = _open
+        return o
+
+    def test_genuine_empty_inventory_list_is_ok(self):
+        o = self._opener({f"{self.BASE}{core.PMS_INVENTORY_PATH}": {"response": {"processes": []}}})
+        result = core.collect_pms(self.BASE, o)
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(result["inventoryCount"], 0)
+        self.assertEqual(result["followedCount"], 0)
+
+    def test_missing_response_is_invalid_response(self):
+        o = self._opener({f"{self.BASE}{core.PMS_INVENTORY_PATH}": {}})
+        result = core.collect_pms(self.BASE, o)
+        self.assertEqual(result["status"], "INVALID_RESPONSE")
+
+    def test_non_dict_response_is_invalid_response(self):
+        for bad in (None, {}, {"response": None}, {"response": "invalid"}, {"response": []}):
+            o = self._opener({f"{self.BASE}{core.PMS_INVENTORY_PATH}": bad})
+            result = core.collect_pms(self.BASE, o)
+            self.assertEqual(result["status"], "INVALID_RESPONSE", f"payload={bad!r}")
+
+    def test_non_list_processes_is_invalid_response(self):
+        for bad_processes in ({}, "invalid", 42, None):
+            o = self._opener({f"{self.BASE}{core.PMS_INVENTORY_PATH}": {"response": {"processes": bad_processes}}})
+            result = core.collect_pms(self.BASE, o)
+            self.assertEqual(result["status"], "INVALID_RESPONSE", f"processes={bad_processes!r}")
+
+    def test_top_level_list_is_invalid_response(self):
+        o = self._opener({f"{self.BASE}{core.PMS_INVENTORY_PATH}": [1, 2, 3]})
+        result = core.collect_pms(self.BASE, o)
+        self.assertEqual(result["status"], "INVALID_RESPONSE")
+
+    def test_invalid_inventory_never_raises_and_never_logs_payload(self):
+        o = self._opener({f"{self.BASE}{core.PMS_INVENTORY_PATH}": []})
+        try:
+            result = core.collect_pms(self.BASE, o)
+        except Exception as e:  # pragma: no cover
+            self.fail(f"collect_pms raised: {e!r}")
+        self.assertIsInstance(result, dict)
+
+    def _detail_shape_opener(self, inventory, perf_response, health_response):
+        responses = {
+            f"{self.BASE}{core.PMS_INVENTORY_PATH}": inventory,
+            f"{self.BASE}/services/v2/mpoints/P1/processPerformance": {"response": perf_response},
+            f"{self.BASE}/services/v2/mpoints/P1/serviceHealth": {"response": health_response},
+        }
+        return self._opener(responses)
+
+    def _single_process_inventory(self):
+        return {"response": {"processes": [{"processName": "P1"}]}}
+
+    def test_non_dict_process_performance_response_fails(self):
+        for bad in (None, "invalid", 42, [1, 2]):
+            o = self._detail_shape_opener(self._single_process_inventory(), bad, {"isHealthy": True})
+            result = core.collect_pms(self.BASE, o)
+            self.assertEqual(result["failureCount"], 1, f"perf={bad!r}")
+            self.assertEqual(result["processes"]["P1"]["performance"], {})
+
+    def test_empty_process_performance_response_fails(self):
+        o = self._detail_shape_opener(self._single_process_inventory(), {}, {"isHealthy": True})
+        result = core.collect_pms(self.BASE, o)
+        self.assertEqual(result["failureCount"], 1)
+        self.assertEqual(result["processes"]["P1"]["performance"], {})
+
+    def test_non_dict_service_health_response_fails(self):
+        for bad in (None, "invalid", 42, [1, 2]):
+            o = self._detail_shape_opener(self._single_process_inventory(), {"cpuTimeUs": 1}, bad)
+            result = core.collect_pms(self.BASE, o)
+            self.assertEqual(result["failureCount"], 1, f"health={bad!r}")
+            self.assertEqual(result["processes"]["P1"]["serviceHealth"], {})
+
+    def test_empty_service_health_response_fails(self):
+        o = self._detail_shape_opener(self._single_process_inventory(), {"cpuTimeUs": 1}, {})
+        result = core.collect_pms(self.BASE, o)
+        self.assertEqual(result["failureCount"], 1)
+        self.assertEqual(result["processes"]["P1"]["serviceHealth"], {})
+
+    def test_malformed_details_never_increment_full_success(self):
+        o = self._detail_shape_opener(self._single_process_inventory(), {}, {})
+        result = core.collect_pms(self.BASE, o)
+        self.assertEqual(result["successCount"], 0)
+        self.assertEqual(result["status"], "UNAVAILABLE")
+
+
+class PmsPartialUnavailableSemanticsTests(unittest.TestCase):
+    """Section 5 correction: status is derived from whether any individual
+    detail GET succeeded this tick -- not merely from whether some single
+    process got BOTH of its details."""
+
+    BASE = "https://gg-test:8443"
+
+    def _opener(self, inventory, detail_responses, detail_exceptions=None):
+        detail_exceptions = detail_exceptions or {}
+
+        def _open(url, timeout=5):
+            if url in detail_exceptions:
+                raise detail_exceptions[url]
+            body = inventory if url == f"{self.BASE}{core.PMS_INVENTORY_PATH}" else detail_responses[url]
+            m = MagicMock()
+            m.read.return_value = json.dumps(body).encode()
+            m.__enter__.return_value = m
+            m.__exit__.return_value = False
+            return m
+        o = MagicMock()
+        o.open.side_effect = _open
+        return o
+
+    def test_one_success_one_failure_produces_partial(self):
+        inventory = {"response": {"processes": [{"processName": "P1"}]}}
+        detail = {f"{self.BASE}/services/v2/mpoints/P1/processPerformance": {"response": {"cpuTimeUs": 1}}}
+        exceptions = {f"{self.BASE}/services/v2/mpoints/P1/serviceHealth": RuntimeError("boom")}
+        o = self._opener(inventory, detail, exceptions)
+        result = core.collect_pms(self.BASE, o)
+        self.assertEqual(result["status"], "PARTIAL")
+
+    def test_every_process_one_success_one_failure_remains_partial_not_unavailable(self):
+        inventory = {"response": {"processes": [{"processName": "P1"}, {"processName": "P2"}]}}
+        detail = {
+            f"{self.BASE}/services/v2/mpoints/P1/processPerformance": {"response": {"cpuTimeUs": 1}},
+            f"{self.BASE}/services/v2/mpoints/P2/serviceHealth": {"response": {"isHealthy": True}},
+        }
+        exceptions = {
+            f"{self.BASE}/services/v2/mpoints/P1/serviceHealth": RuntimeError("boom"),
+            f"{self.BASE}/services/v2/mpoints/P2/processPerformance": RuntimeError("boom"),
+        }
+        o = self._opener(inventory, detail, exceptions)
+        result = core.collect_pms(self.BASE, o)
+        # process-level successCount is 0 (neither process got BOTH details)
+        # -- but real usable data WAS collected, so this must be PARTIAL.
+        self.assertEqual(result["successCount"], 0)
+        self.assertEqual(result["status"], "PARTIAL")
+
+    def test_zero_successful_detail_requests_produces_unavailable(self):
+        inventory = {"response": {"processes": [{"processName": "P1"}, {"processName": "P2"}]}}
+        exceptions = {
+            f"{self.BASE}/services/v2/mpoints/P1/processPerformance": RuntimeError("boom"),
+            f"{self.BASE}/services/v2/mpoints/P1/serviceHealth": RuntimeError("boom"),
+            f"{self.BASE}/services/v2/mpoints/P2/processPerformance": RuntimeError("boom"),
+            f"{self.BASE}/services/v2/mpoints/P2/serviceHealth": RuntimeError("boom"),
+        }
+        o = self._opener(inventory, {}, exceptions)
+        result = core.collect_pms(self.BASE, o)
+        self.assertEqual(result["status"], "UNAVAILABLE")
+
+
+class PmsProcessNameBoundsTests(unittest.TestCase):
+    """Section 6 correction: process names are validated (length, control
+    characters, '.'/'..' ) before ever being followed, and are preserved
+    EXACTLY (never rewritten/truncated) when accepted."""
+
+    def test_name_longer_than_limit_skipped(self):
+        overlong = "P" * (core.MAX_PMS_PROCESS_NAME_LENGTH + 1)
+        self.assertIsNone(core._valid_pms_process_name(overlong))
+
+    def test_whitespace_only_name_skipped(self):
+        self.assertIsNone(core._valid_pms_process_name("   "))
+        self.assertIsNone(core._valid_pms_process_name("\t\n"))
+
+    def test_control_character_name_skipped(self):
+        self.assertIsNone(core._valid_pms_process_name("EXT\x00RACT"))
+        self.assertIsNone(core._valid_pms_process_name("EXT\x7fRACT"))
+
+    def test_dot_and_dotdot_names_skipped(self):
+        self.assertIsNone(core._valid_pms_process_name("."))
+        self.assertIsNone(core._valid_pms_process_name(".."))
+
+    def test_maximum_length_valid_name_accepted(self):
+        exact = "P" * core.MAX_PMS_PROCESS_NAME_LENGTH
+        self.assertEqual(core._valid_pms_process_name(exact), exact)
+
+    def test_accepted_name_never_rewritten(self):
+        name = "  EXTRACT_01  "  # has non-whitespace content -- must survive exactly
+        self.assertEqual(core._valid_pms_process_name(name), name)
+
+    def test_invalid_names_never_appear_as_processes_map_keys(self):
+        payload = {"response": {"processes": [
+            {"processName": "." }, {"processName": ".."},
+            {"processName": "P" * (core.MAX_PMS_PROCESS_NAME_LENGTH + 1)},
+            {"processName": "\x00BAD"}, {"processName": "   "},
+            {"processName": "GOOD1"},
+        ]}}
+        names, count = core._pms_valid_process_names(payload)
+        self.assertEqual(names, ["GOOD1"])
+        self.assertEqual(count, 6)
+
+    def test_duplicate_accepted_names_deduplicated_first_seen_order(self):
+        payload = {"response": {"processes": [
+            {"processName": "B"}, {"processName": "A"}, {"processName": "B"}, {"processName": "A"},
+        ]}}
+        names, count = core._pms_valid_process_names(payload)
+        self.assertEqual(names, ["B", "A"])
+        self.assertEqual(count, 4)
+
+
+class PmsSnapshotSizeBudgetTests(unittest.TestCase):
+    """Section 6 required proof: the maximum permitted bounded PMS snapshot
+    (20 processes, maximum-length names, all confirmed fields populated)
+    stays comfortably below DynamoDB's 400 KB item-size limit."""
+
+    def test_maximum_snapshot_stays_below_size_budget(self):
+        max_name = "P" * core.MAX_PMS_PROCESS_NAME_LENGTH
+        performance = {k: 123456789 for k in core._PMS_PERFORMANCE_NUMERIC_FIELDS}
+        service_health = {"isHealthy": True, "criticalResourcesHealthy": 5, "criticalResourcesUnhealthy": 0}
+        processes = {
+            f"{max_name}-{i:02d}": {"performance": dict(performance), "serviceHealth": dict(service_health),
+                                    "heartbeatAgeSeconds": 9999}
+            for i in range(core.MAX_FOLLOWED_PMS_PROCESSES)
+        }
+        snapshot = {
+            "status": "OK", "collectedAt": 1785000000,
+            "inventoryCount": core.MAX_FOLLOWED_PMS_PROCESSES, "followedCount": core.MAX_FOLLOWED_PMS_PROCESSES,
+            "successCount": core.MAX_FOLLOWED_PMS_PROCESSES, "failureCount": 0,
+            "heartbeatAgeSeconds": 9999, "processes": processes,
+        }
+        size_bytes = len(json.dumps(snapshot).encode("utf-8"))
+        # DynamoDB's per-item limit is 400 KB (409,600 bytes). "Comfortably
+        # below" -- assert well under 10% of that budget.
+        self.assertLess(size_bytes, 40_000, f"PMS snapshot is {size_bytes} bytes")
+
+
+class PmsNumericHardeningTests(unittest.TestCase):
+    """Section 7 correction: _normalize_pms_number must never raise,
+    including OverflowError from float(huge_int), and must reject anything
+    outside the documented DynamoDB-safe range."""
+
+    def test_huge_integer_becomes_zero(self):
+        self.assertEqual(core._normalize_pms_number(10 ** 400), 0)
+
+    def test_huge_numeric_string_becomes_zero(self):
+        self.assertEqual(core._normalize_pms_number("1" + "0" * 400), 0)
+
+    def test_scientific_notation_overflow_string_becomes_zero(self):
+        self.assertEqual(core._normalize_pms_number("1e1000"), 0)
+
+    def test_overflow_error_path_never_raises(self):
+        try:
+            result = core._normalize_pms_number(10 ** 5000)
+        except Exception as e:  # pragma: no cover
+            self.fail(f"_normalize_pms_number raised: {e!r}")
+        self.assertEqual(result, 0)
+
+    def test_exact_maximum_accepted_boundary(self):
+        self.assertEqual(core._normalize_pms_number(core.PMS_MAX_SAFE_NUMBER), core.PMS_MAX_SAFE_NUMBER)
+
+    def test_one_value_above_boundary_becomes_zero(self):
+        self.assertEqual(core._normalize_pms_number(core.PMS_MAX_SAFE_NUMBER + 1), 0)
+
+    def test_normal_cumulative_counter_preserved(self):
+        self.assertEqual(core._normalize_pms_number(123456789), 123456789)
+
+
+class PmsWrappedTlsClassificationTests(unittest.TestCase):
+    """Section 10 correction: TLS failures classify correctly regardless of
+    how deeply they are wrapped, without importing tools/."""
+
+    def test_direct_ssl_error(self):
+        self.assertEqual(core._classify_pms_error(ssl.SSLError("bad cert")), "TLS_FAILED")
+
+    def test_direct_ssl_cert_verification_error(self):
+        self.assertEqual(core._classify_pms_error(ssl.SSLCertVerificationError("x")), "TLS_FAILED")
+
+    def test_urlerror_wrapping_ssl_cert_verification_error(self):
+        wrapped = urllib.error.URLError(ssl.SSLCertVerificationError("x"))
+        self.assertEqual(core._classify_pms_error(wrapped), "TLS_FAILED")
+
+    def test_urlerror_wrapping_connection_refused_is_endpoint_unavailable(self):
+        wrapped = urllib.error.URLError(ConnectionRefusedError("refused"))
+        self.assertEqual(core._classify_pms_error(wrapped), "ENDPOINT_UNAVAILABLE")
+
+    def test_nested_cause_chain(self):
+        try:
+            try:
+                raise ssl.SSLCertVerificationError("cert bad")
+            except ssl.SSLCertVerificationError as inner:
+                raise RuntimeError("conn failed") from inner
+        except RuntimeError as outer:
+            self.assertEqual(core._classify_pms_error(outer), "TLS_FAILED")
+
+    def test_nested_context_chain_without_explicit_cause(self):
+        try:
+            try:
+                raise ssl.SSLError("bad handshake")
+            except ssl.SSLError:
+                raise urllib.error.URLError("generic failure")
+        except urllib.error.URLError as outer:
+            self.assertEqual(core._classify_pms_error(outer), "TLS_FAILED")
+
+    def test_cycle_protection_does_not_hang(self):
+        a = RuntimeError("a")
+        b = RuntimeError("b")
+        a.__cause__ = b
+        b.__cause__ = a
+        self.assertFalse(core._contains_pms_tls_error(a))
+
+    def test_classification_never_includes_exception_text(self):
+        exc = ssl.SSLCertVerificationError("[SSL: CERTIFICATE_VERIFY_FAILED] SECRET_HOST_DETAIL_xyz")
+        category = core._classify_pms_error(exc)
+        self.assertEqual(category, "TLS_FAILED")
+        self.assertNotIn("SECRET_HOST_DETAIL_xyz", category)
+
+
 class PmsPollingLoopIntegrationTests(unittest.TestCase):
     """Wires collect_pms into polling_loop's guarded STATE#_deployment
     write: PMS enrichment must respect the exact same lease/fencing rules
@@ -1239,7 +1556,7 @@ class PmsPollingLoopIntegrationTests(unittest.TestCase):
         "pipeline": "payments-ora-to-pg-001",
     }
 
-    def _run_tick(self, leader=True, fence_write=False, pms_side_effect=None):
+    def _run_tick(self, leader=True, fence_write=False, pms_side_effect=None, raise_on_fetch=False):
         stop_event = threading.Event()
 
         def fake_get_item(Key):
@@ -1269,6 +1586,11 @@ class PmsPollingLoopIntegrationTests(unittest.TestCase):
             return {"status": "OK", "collectedAt": 123, "inventoryCount": 1, "followedCount": 1,
                    "successCount": 1, "failureCount": 0, "heartbeatAgeSeconds": 5, "processes": {}}
 
+        def fake_fetch(*a, **k):
+            if raise_on_fetch:
+                raise RuntimeError("admin rest down")
+            return []
+
         with tempfile.TemporaryDirectory() as tmp:
             user_file = os.path.join(tmp, "user")
             pwd_file = os.path.join(tmp, "pwd")
@@ -1278,7 +1600,7 @@ class PmsPollingLoopIntegrationTests(unittest.TestCase):
                 f.write("synthetic-pass")
 
             with mock.patch.object(core.cfgmod, "credential_paths", return_value=(user_file, pwd_file)), \
-                 mock.patch.object(core, "fetch_gg_processes", return_value=[]), \
+                 mock.patch.object(core, "fetch_gg_processes", side_effect=fake_fetch), \
                  mock.patch.object(core, "_basic_opener", return_value=MagicMock()), \
                  mock.patch.object(core, "_build_ssl_context", return_value=MagicMock()), \
                  mock.patch.object(core, "probe_critical_services", return_value={}), \
@@ -1324,6 +1646,47 @@ class PmsPollingLoopIntegrationTests(unittest.TestCase):
         process_record_types = {c["Key"].get("recordType") for c in update_calls
                                 if c["Key"].get("recordType") != "STATE#_deployment"}
         self.assertEqual(process_record_types, set())
+
+    def test_admin_rest_down_write_overwrites_stale_pms_with_current_unavailable_state(self):
+        # collect_pms itself is never called when Admin REST is down (PMS
+        # depends on the same connectivity) -- but the write must still
+        # carry a CURRENT, sanitized pms snapshot, never leave a prior
+        # UP-tick's map silently attached/stale.
+        pms_calls, update_calls = self._run_tick(leader=True, fence_write=False, raise_on_fetch=True)
+        self.assertEqual(pms_calls, [])
+        deployment_writes = [c for c in update_calls if c["Key"].get("recordType") == "STATE#_deployment"]
+        self.assertEqual(len(deployment_writes), 1)
+        pms_value = deployment_writes[0]["ExpressionAttributeValues"][":pms"]
+        self.assertEqual(pms_value["status"], "ENDPOINT_UNAVAILABLE")
+        self.assertEqual(pms_value["processes"], {})
+        self.assertIsInstance(pms_value["collectedAt"], int)
+
+    def test_unexpected_collect_pms_failure_writes_current_sanitized_state(self):
+        def _raise():
+            raise RuntimeError("SECRET_INTERNAL_DETAIL_should_not_leak")
+
+        with self.assertLogs(core.logger, level="WARNING") as log_ctx:
+            pms_calls, update_calls = self._run_tick(leader=True, fence_write=False, pms_side_effect=_raise)
+
+        deployment_writes = [c for c in update_calls if c["Key"].get("recordType") == "STATE#_deployment"]
+        self.assertEqual(len(deployment_writes), 1)
+        pms_value = deployment_writes[0]["ExpressionAttributeValues"][":pms"]
+        self.assertIn(pms_value["status"], ("UNAVAILABLE", "INVALID_RESPONSE"))
+        self.assertEqual(pms_value["processes"], {})
+
+        combined_log = "\n".join(log_ctx.output)
+        self.assertIn("gg-oracle-payments-01", combined_log)
+        self.assertNotIn("SECRET_INTERNAL_DETAIL_should_not_leak", combined_log)
+        self.assertNotIn("Traceback", combined_log)
+        self.assertNotIn("RuntimeError", combined_log)
+
+    def test_cloudwatch_client_never_created_during_pms_failure_tick(self):
+        def _raise():
+            raise RuntimeError("boom")
+
+        with mock.patch("boto3.client") as mock_cw_client:
+            self._run_tick(leader=True, fence_write=False, pms_side_effect=_raise)
+            mock_cw_client.assert_not_called()
 
 
 if __name__ == "__main__":

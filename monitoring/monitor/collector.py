@@ -421,6 +421,20 @@ PMS_ERROR_CATEGORIES = (
 
 _PMS_CONTROL_CHARS = frozenset(chr(c) for c in list(range(0x00, 0x20)) + [0x7f])
 
+# Production PMS process-name bound: not a runtime tuning knob, a fixed
+# safety limit. A name longer than this is skipped entirely rather than
+# truncated -- see _valid_pms_process_name.
+MAX_PMS_PROCESS_NAME_LENGTH = 128
+
+# Comfortably within DynamoDB's Number precision (up to 38 digits) and far
+# beyond any plausible value for a PMS counter/byte-count field -- a fixed,
+# documented safety bound, not a real-world limit. A value outside
+# [0, PMS_MAX_SAFE_NUMBER] becomes 0 rather than ever being stored. Kept at
+# or below 2**53 (IEEE-754 double's exact-integer range) so the boundary
+# itself is never blurred by float rounding -- one quadrillion is already
+# far beyond any real cumulative counter/byte-count value.
+PMS_MAX_SAFE_NUMBER = 10 ** 15
+
 _PMS_INVENTORY_STRING_FIELDS = (
     "processName", "processType", "processMode", "processState",
     "startTime", "stateTime", "lastHeartbeat",
@@ -434,6 +448,8 @@ _PMS_PERFORMANCE_NUMERIC_FIELDS = (
     "ioOtherBytes", "ioOtherCount", "processStartTime", "processId",
 )
 
+_PMS_SERVICE_HEALTH_FIELDS = ("isHealthy", "criticalResourcesHealthy", "criticalResourcesUnhealthy")
+
 
 def _http_json_bounded(url, opener, timeout=5, max_bytes=PMS_MAX_RESPONSE_BYTES):
     """Like _http_json but the body is read to at most max_bytes+1 bytes --
@@ -446,17 +462,43 @@ def _http_json_bounded(url, opener, timeout=5, max_bytes=PMS_MAX_RESPONSE_BYTES)
     return json.loads(raw.decode())
 
 
+def _valid_pms_process_name(raw):
+    """A production-safe PMS process name: a string with at least one
+    non-whitespace character, no longer than MAX_PMS_PROCESS_NAME_LENGTH,
+    containing no ASCII control character, and never '.' or '..' (the only
+    values urllib.parse.quote(safe="") leaves unescaped that could act as a
+    traversal-equivalent path segment). Returns the name EXACTLY as given
+    when valid -- never rewritten, stripped, or truncated -- or None to
+    signal "skip this item" when invalid."""
+    if not isinstance(raw, str):
+        return None
+    if not raw.strip():
+        return None
+    if len(raw) > MAX_PMS_PROCESS_NAME_LENGTH:
+        return None
+    if any(c in _PMS_CONTROL_CHARS for c in raw):
+        return None
+    if raw in (".", ".."):
+        return None
+    return raw
+
+
 def _normalize_pms_number(raw):
     """A PMS number is never allowed to become an exception or a silently
-    wrong type: malformed, NaN, infinite, negative, or boolean input all
-    become 0 rather than propagating."""
+    wrong type: malformed, NaN, infinite, negative, boolean, or
+    out-of-DynamoDB-safe-range input all become 0 rather than propagating
+    or overflowing. Cumulative counters within the safe range are preserved
+    exactly -- never converted into a rate/percentage."""
     if isinstance(raw, bool):
         return 0
     try:
         value = float(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: e.g. float(10**400) on a huge raw int -- Python
+        # raises rather than returning inf for int->float, unlike the
+        # string-parsing path below.
         return 0
-    if not math.isfinite(value) or value < 0:
+    if not math.isfinite(value) or value < 0 or value > PMS_MAX_SAFE_NUMBER:
         return 0
     return int(value) if value == int(value) else value
 
@@ -528,12 +570,29 @@ def heartbeat_age_seconds(last_heartbeat, now=None):
     return 0 if age < 0 else int(age)
 
 
+def _valid_pms_inventory_shape(payload):
+    """True only when payload is a dict whose "response" is a dict whose
+    "processes" is a list -- the three required shape checks. An empty
+    processes list IS a valid shape (status OK, zero followed); anything
+    else about the shape being wrong (missing/null/non-dict response,
+    non-list processes, or a non-dict top level) is not, and must be
+    classified INVALID_RESPONSE rather than silently treated as empty."""
+    if not isinstance(payload, dict):
+        return False
+    response = payload.get("response")
+    if not isinstance(response, dict):
+        return False
+    return isinstance(response.get("processes"), list)
+
+
 def _pms_valid_process_names(payload):
-    """Returns (names, inventory_item_count): unique processName strings
-    from response.processes, first-seen order preserved -- never
-    processId, never any other field. Non-dict items, items with no valid
-    (non-empty string) processName, and repeat names are skipped.
-    inventory_item_count is the TRUE raw response.processes list length."""
+    """Returns (names, inventory_item_count): unique, production-safe
+    processName strings from response.processes, first-seen order
+    preserved -- never processId, never any other field. Only call this
+    after _valid_pms_inventory_shape confirms the shape. Non-dict items,
+    items with no valid processName (see _valid_pms_process_name), and
+    repeat names are skipped. inventory_item_count is the TRUE raw
+    response.processes list length, unaffected by validity or dedup."""
     if not isinstance(payload, dict):
         return [], 0
     response = payload.get("response")
@@ -546,24 +605,70 @@ def _pms_valid_process_names(payload):
     for item in processes:
         if not isinstance(item, dict):
             continue
-        name = item.get("processName")
-        if isinstance(name, str) and name and name not in seen:
+        name = _valid_pms_process_name(item.get("processName"))
+        if name is not None and name not in seen:
             seen.add(name)
             names.append(name)
     return names, len(processes)
 
 
 def _pms_detail_path(name, kind):
-    """Encodes name as exactly one URL path segment. '.'/'..' -- the only
-    values urllib.parse.quote(safe="") leaves unescaped by design -- and
-    control characters are rejected outright (returns None) rather than
-    ever being sent."""
-    if name in (".", ".."):
-        return None
-    if any(c in _PMS_CONTROL_CHARS for c in name):
+    """Encodes name as exactly one URL path segment. Returns None (skip)
+    for any name _valid_pms_process_name itself would reject -- defense in
+    depth, since callers already filter through that function first."""
+    if _valid_pms_process_name(name) is None:
         return None
     encoded = urllib.parse.quote(name, safe="")
     return f"/services/v2/mpoints/{encoded}/{kind}"
+
+
+def _valid_pms_performance_shape(response):
+    """A processPerformance response must be a dict containing at least
+    one of the confirmed numeric fields -- missing, null, scalar, list, or
+    empty all fail this check (counted as a failed detail request, never a
+    silent success with an empty performance map)."""
+    return isinstance(response, dict) and any(k in response for k in _PMS_PERFORMANCE_NUMERIC_FIELDS)
+
+
+def _valid_pms_service_health_shape(response):
+    """A serviceHealth response must be a dict containing at least one of
+    the confirmed fields -- see _valid_pms_performance_shape."""
+    return isinstance(response, dict) and any(k in response for k in _PMS_SERVICE_HEALTH_FIELDS)
+
+
+def _contains_pms_tls_error(exc, max_nodes=10):
+    """Bounded, cycle-safe search for an ssl.SSLError (ssl.SSLCertVerificationError
+    subclasses it) anywhere in exc's chain: the exception itself,
+    urllib.error.URLError.reason, and __cause__/__context__ at every node.
+    Mirrors (does not import -- collector.py must not depend on tools/) the
+    contract-probe tool's proven equivalent. Never inspects or returns the
+    raw exception text -- classification only."""
+    if exc is None:
+        return False
+    seen_ids = set()
+    stack = [exc]
+    checked = 0
+    while stack and checked < max_nodes:
+        current = stack.pop()
+        if current is None:
+            continue
+        cid = id(current)
+        if cid in seen_ids:
+            continue
+        seen_ids.add(cid)
+        checked += 1
+        if isinstance(current, ssl.SSLError):
+            return True
+        reason = getattr(current, "reason", None)
+        if isinstance(reason, BaseException):
+            stack.append(reason)
+        cause = getattr(current, "__cause__", None)
+        if isinstance(cause, BaseException):
+            stack.append(cause)
+        context = getattr(current, "__context__", None)
+        if isinstance(context, BaseException):
+            stack.append(context)
+    return False
 
 
 def _classify_pms_error(exc):
@@ -573,28 +678,47 @@ def _classify_pms_error(exc):
         if exc.code in (401, 403):
             return "AUTH_FAILED"
         return "ENDPOINT_UNAVAILABLE"
-    if isinstance(exc, ssl.SSLError):
+    if _contains_pms_tls_error(exc):
         return "TLS_FAILED"
     if isinstance(exc, ValueError):
         return "INVALID_RESPONSE"
     return "ENDPOINT_UNAVAILABLE"
 
 
+def _pms_unavailable_snapshot(status):
+    """A current, sanitized, empty PMS snapshot for a tick where PMS
+    collection did not run at all (Admin REST itself is unreachable) or
+    where collect_pms raised unexpectedly. collectedAt is always "now" for
+    THIS tick -- a stale snapshot from a prior successful tick must never
+    survive unattributed to a new one."""
+    return {
+        "status": status, "collectedAt": cfgmod.now_epoch(),
+        "inventoryCount": 0, "followedCount": 0, "successCount": 0, "failureCount": 0,
+        "heartbeatAgeSeconds": None, "processes": {},
+    }
+
+
 def collect_pms(base, opener, now=None):
     """One bounded PMS collection pass for this tick. Reuses the caller's
     already-authenticated, TLS-verified opener. GETs the confirmed process
     inventory once; follows up to MAX_FOLLOWED_PMS_PROCESSES unique,
-    deduplicated processName values with sequential, bounded
-    processPerformance + serviceHealth GETs only. Never raises -- always
-    returns a bounded, sanitized summary dict; the caller decides whether
-    to persist it. Never logs a raw exception, response body, or process
+    deduplicated, production-safe processName values with sequential,
+    bounded processPerformance + serviceHealth GETs only. Never raises --
+    always returns a bounded, sanitized summary dict; the caller decides
+    whether to persist it (this function performs no DynamoDB I/O and does
+    not know about lease/fencing -- it is a pure network/normalization
+    operation only). Never logs a raw exception, response body, or process
     name anywhere in this function.
 
-    An inventory failure yields a whole-tick UNAVAILABLE/classified status
-    with no followed processes. An individual process's detail failure
-    only affects that process (counted in failureCount) -- the remaining
-    processes are still attempted, and the overall status becomes PARTIAL
-    rather than aborting."""
+    A structurally invalid inventory response (not the three required
+    shape checks) is INVALID_RESPONSE -- distinct from a genuinely empty
+    processes list, which is a valid OK result. status is derived from
+    whether any individual detail GET actually succeeded this tick, not
+    merely from whether a process's BOTH details succeeded -- so a tick
+    where every process got exactly one of its two details is correctly
+    PARTIAL, never UNAVAILABLE. An individual detail failure (network error
+    or a malformed/empty response shape) only affects that one detail call
+    -- the remaining calls and processes are still attempted."""
     collected_at = cfgmod.now_epoch()
 
     try:
@@ -606,18 +730,25 @@ def collect_pms(base, opener, now=None):
             "heartbeatAgeSeconds": None, "processes": {},
         }
 
+    if not _valid_pms_inventory_shape(inventory_payload):
+        return {
+            "status": "INVALID_RESPONSE", "collectedAt": collected_at,
+            "inventoryCount": 0, "followedCount": 0, "successCount": 0, "failureCount": 0,
+            "heartbeatAgeSeconds": None, "processes": {},
+        }
+
     names, inventory_count = _pms_valid_process_names(inventory_payload)
     inventory_by_name = {}
-    response = inventory_payload.get("response") if isinstance(inventory_payload, dict) else None
-    if isinstance(response, dict) and isinstance(response.get("processes"), list):
-        for item in response["processes"]:
-            if isinstance(item, dict) and isinstance(item.get("processName"), str):
-                inventory_by_name.setdefault(item["processName"], item)
+    for item in inventory_payload["response"]["processes"]:
+        if isinstance(item, dict) and isinstance(item.get("processName"), str):
+            inventory_by_name.setdefault(item["processName"], item)
 
     followed = names[:MAX_FOLLOWED_PMS_PROCESSES]
     processes_out = {}
     success_count = 0
     failure_count = 0
+    detail_success_count = 0
+    detail_failure_count = 0
     ages = []
 
     for name in followed:
@@ -631,17 +762,28 @@ def collect_pms(base, opener, now=None):
             path = _pms_detail_path(name, kind)
             if path is None:
                 process_ok = False
+                detail_failure_count += 1
                 continue
             try:
                 detail_payload = _http_json_bounded(f"{base}{path}", opener)
             except Exception:
                 process_ok = False
+                detail_failure_count += 1
                 continue
             detail_response = detail_payload.get("response") if isinstance(detail_payload, dict) else None
             if kind == "processPerformance":
+                if not _valid_pms_performance_shape(detail_response):
+                    process_ok = False
+                    detail_failure_count += 1
+                    continue
                 perf = normalize_pms_performance(detail_response)
             else:
+                if not _valid_pms_service_health_shape(detail_response):
+                    process_ok = False
+                    detail_failure_count += 1
+                    continue
                 health = normalize_pms_service_health(detail_response)
+            detail_success_count += 1
 
         if process_ok:
             success_count += 1
@@ -652,12 +794,12 @@ def collect_pms(base, opener, now=None):
 
     followed_count = len(followed)
     if followed_count == 0:
-        # Inventory GET succeeded; there is simply nothing (valid) to
-        # follow this tick -- a valid, non-error result, not UNAVAILABLE.
+        # Inventory GET succeeded with a valid shape; there is simply
+        # nothing (valid) to follow this tick -- OK, not UNAVAILABLE.
         status = "OK"
-    elif success_count == 0:
-        status = "UNAVAILABLE"  # every followed process failed both details
-    elif failure_count > 0:
+    elif detail_success_count == 0:
+        status = "UNAVAILABLE"  # zero detail GETs succeeded this tick
+    elif detail_failure_count > 0:
         status = "PARTIAL"
     else:
         status = "OK"
@@ -901,6 +1043,12 @@ def polling_loop(deployment, table, mgr, state, stop_event):
                     flags["down"] = 1
                 transitioned = (status != last_dep_status)
                 dep_snap = {"processType": "deployment", "status": status, "recordedAt": cfgmod.now_epoch()}
+                # PMS depends on the same Admin REST connectivity that just
+                # failed, so it is not attempted -- but a prior successful
+                # tick's pms map must never be left attached looking current.
+                # Overwrite it with a sanitized, current-tick ENDPOINT_UNAVAILABLE
+                # snapshot every time, in the same guarded write.
+                dep_snap["pms"] = _pms_unavailable_snapshot("ENDPOINT_UNAVAILABLE")
                 if transitioned:
                     dep_snap["lastTransitionAt"] = cfgmod.now_epoch()
                 _guarded_write("_deployment", dep_snap)
@@ -970,19 +1118,20 @@ def polling_loop(deployment, table, mgr, state, stop_event):
             # and its result never influences the deployment's own UP status
             # above -- a PMS failure must not mark an otherwise-healthy
             # Admin REST deployment DOWN. Belt-and-suspenders try/except in
-            # case of an unexpected bug in this still-new code path.
+            # case of an unexpected bug in this still-new code path -- even
+            # then, a CURRENT sanitized snapshot is written, never a stale
+            # one left over from a prior successful tick, and never a raw
+            # exception/traceback in the log.
             try:
                 pms_result = collect_pms(base, opener)
             except Exception:
-                logger.exception("PMS collection failed unexpectedly for %s; continuing without PMS enrichment",
-                                 pipeline)
-                pms_result = None
+                logger.warning("PMS collection unavailable for %s; using sanitized current-tick state", pipeline)
+                pms_result = _pms_unavailable_snapshot("UNAVAILABLE")
 
             transitioned = ("UP" != last_dep_status)
             dep_snap = {"processType": "deployment", "status": "UP",
-                        "recordedAt": cfgmod.now_epoch(), "criticalServices": cs_new}
-            if pms_result is not None:
-                dep_snap["pms"] = pms_result
+                        "recordedAt": cfgmod.now_epoch(), "criticalServices": cs_new,
+                        "pms": pms_result}
             if transitioned:
                 dep_snap["lastTransitionAt"] = cfgmod.now_epoch()
             _guarded_write("_deployment", dep_snap)
