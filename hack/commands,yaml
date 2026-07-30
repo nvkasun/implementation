@@ -1,234 +1,130 @@
-. Confirm the latest monitor image
-kubectl get deployment gg-monitor \
-  -n goldengate-monitoring \
-  -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+1. Confirm the deployed probe contains the latest Phase 4B2A code
 
-Also check:
+Run:
 
-kubectl rollout status deployment/gg-monitor \
-  -n goldengate-monitoring \
-  --timeout=5m
-
-Expected:
-
-deployment "gg-monitor" successfully rolled out
-2. Confirm monitoring remains healthy
-curl -s https://monitor.goldengate-dev.adcbmis.local/healthz
-curl -s https://monitor.goldengate-dev.adcbmis.local/readyz
-curl -s https://monitor.goldengate-dev.adcbmis.local/api/status
-
-Expected:
-
-healthz: ok
-readyz: ready
-both runtimes: UP
-dataSource: canonical-monitor
-
-Confirm CloudWatch is still disabled:
-
-kubectl get deployment gg-monitor \
-  -n goldengate-monitoring \
-  -o jsonpath='{range .spec.template.spec.containers[0].env[?(@.name=="CLOUDWATCH_PUBLISH_ENABLED")]}{.name}={.value}{"\n"}{end}'
-
-Expected:
-
-CLOUDWATCH_PUBLISH_ENABLED=false
-3. Run the four updated secure probes
-Oracle PMS processes
 kubectl exec \
   -n goldengate-monitoring \
   deployment/gg-monitor \
-  -- python3 tools/gg_api_contract_probe.py \
-     --deployment gg-oracle-payments-01 \
-     --port admin \
-     --path /services/v2/mpoints/processes
-Oracle status changes
-kubectl exec \
-  -n goldengate-monitoring \
-  deployment/gg-monitor \
-  -- python3 tools/gg_api_contract_probe.py \
-     --deployment gg-oracle-payments-01 \
-     --port admin \
-     --path /services/v2/monitoring/statusChanges
-PostgreSQL PMS processes
-kubectl exec \
-  -n goldengate-monitoring \
-  deployment/gg-monitor \
-  -- python3 tools/gg_api_contract_probe.py \
-     --deployment gg-postgresql-payments-01 \
-     --port admin \
-     --path /services/v2/mpoints/processes
-PostgreSQL status changes
-kubectl exec \
-  -n goldengate-monitoring \
-  deployment/gg-monitor \
-  -- python3 tools/gg_api_contract_probe.py \
-     --deployment gg-postgresql-payments-01 \
-     --port admin \
-     --path /services/v2/monitoring/statusChanges
+  -- sh -c '
+    grep -nE \
+    "MAX_RESPONSE_BYTES|MAX_TOP_LEVEL_KEYS|MAX_RESPONSE_KEYS|MAX_KEY_LENGTH|collectionsTruncated|topLevelKeysTruncated|responseKeysTruncated" \
+    /app/tools/gg_api_contract_probe.py
+  '
 
-The updated output should now include something like:
+Expected to see all these names:
+
+MAX_RESPONSE_BYTES
+MAX_TOP_LEVEL_KEYS
+MAX_RESPONSE_KEYS
+MAX_KEY_LENGTH
+collectionsTruncated
+topLevelKeysTruncated
+responseKeysTruncated
+
+Also confirm the response read is bounded:
+
+kubectl exec \
+  -n goldengate-monitoring \
+  deployment/gg-monitor \
+  -- grep -n "read(MAX_RESPONSE_BYTES + 1)" \
+  /app/tools/gg_api_contract_probe.py
+2. Test the new collection summarizer inside the pod
+
+This uses only synthetic data and does not contact GoldenGate:
+
+kubectl exec -i \
+  -n goldengate-monitoring \
+  deployment/gg-monitor \
+  -- python3 - <<'PY'
+import importlib.util
+import json
+from pathlib import Path
+
+path = Path("/app/tools/gg_api_contract_probe.py")
+spec = importlib.util.spec_from_file_location("probe", path)
+probe = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(probe)
+
+payload = {
+    "response": {
+        "processes": [
+            {
+                "name": "SYNTHETIC_PROCESS_VALUE",
+                "lag": 10,
+                "details": {"hidden": "value"},
+            }
+        ],
+        "statusChange": [],
+    }
+}
+
+result = probe.summarize_json(payload)
+print(json.dumps(result, indent=2, sort_keys=True))
+PY
+
+Expected important section:
 
 "collections": {
   "processes": {
+    "fieldTypes": {
+      "details": [
+        "object"
+      ],
+      "lag": [
+        "number"
+      ],
+      "name": [
+        "string"
+      ]
+    },
+    "itemCount": 1,
+    "itemFieldNames": [
+      "details",
+      "lag",
+      "name"
+    ],
+    "truncated": false
+  },
+  "statusChange": {
+    "fieldTypes": {},
     "itemCount": 0,
     "itemFieldNames": [],
-    "fieldTypes": {},
     "truncated": false
   }
 },
 "collectionsTruncated": false
 
-and:
+The actual value:
 
-"collections": {
-  "statusChange": {
-    "itemCount": 0,
-    "itemFieldNames": [],
-    "fieldTypes": {},
-    "truncated": false
-  }
-}
+SYNTHETIC_PROCESS_VALUE
 
-Share those four outputs first.
+must not appear.
 
-4. Check discovery logs
-kubectl logs \
+3. Recheck discovery logs using the actual pod
+POD=$(kubectl get pods \
   -n goldengate-monitoring \
-  deployment/gg-monitor \
-  --since=5m |
-grep process_discovery_summary
+  -o jsonpath='{.items[0].metadata.name}')
 
-Currently we expect zeros:
-
-Oracle:
-extractCount=0
-distpathCount=0
-
-PostgreSQL:
-replicatCount=0
-
-That is correct because the new runtimes currently have no GoldenGate processes configured.
-
-5. The real next functional step
-
-To unlock Phase 4B2B, the GoldenGate team/DBA must configure a controlled test replication flow:
-
-Oracle runtime
-├── one Extract
-└── one Distribution Path
-
-PostgreSQL runtime
-└── one Replicat
-
-These must be created through the normal approved GoldenGate setup using real:
-
-Source and target database connectivity
-Database credentials
-Trail names and paths
-Checkpoint configuration
-Distribution/Receiver configuration
-Extract and Replicat parameters
-
-Do not invent or hardcode these details in the repository.
-
-6. After the processes are created
-
-Wait one or two monitor polling cycles and run:
+echo "$POD"
 
 kubectl logs \
   -n goldengate-monitoring \
-  deployment/gg-monitor \
-  --since=10m |
+  "$POD" \
+  --since=30m |
 grep process_discovery_summary
 
-Expected non-zero example:
-
-{
-  "deployment": "gg-oracle-payments-01",
-  "extractCount": 1,
-  "replicatCount": 0,
-  "distpathCount": 1,
-  "totalCount": 2
-}
-{
-  "deployment": "gg-postgresql-payments-01",
-  "extractCount": 0,
-  "replicatCount": 1,
-  "distpathCount": 0,
-  "totalCount": 1
-}
-
-Then check the portal. It should start displaying real process rows instead of:
-
-No process STATE rows found.
-7. Verify canonical process records in DynamoDB
-
-After the real processes are detected, the canonical partitions should contain:
+You should see entries for both:
 
 gg-oracle-payments-01
-├── CONFIG
-├── LEASE
-├── STATE#_deployment
-├── STATE#<extract-name>
-└── STATE#<distribution-path-name>
-
 gg-postgresql-payments-01
-├── CONFIG
-├── LEASE
-├── STATE#_deployment
-└── STATE#<replicat-name>
 
-Use the DynamoDB console because your SSM shell role does not have dynamodb:Query.
+with counts currently at zero.
 
-8. Capture the non-empty PMS contract
+4. Confirm the running image again
+kubectl get deployment gg-monitor \
+  -n goldengate-monitoring \
+  -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
 
-Rerun:
+You already showed:
 
-/services/v2/mpoints/processes
-/services/v2/monitoring/statusChanges
-
-The probe will return field names and types without showing process names or values.
-
-For example:
-
-"collections": {
-  "processes": {
-    "itemCount": 1,
-    "itemFieldNames": [
-      "fieldA",
-      "fieldB"
-    ],
-    "fieldTypes": {
-      "fieldA": ["string"],
-      "fieldB": ["number"]
-    },
-    "truncated": false
-  }
-}
-
-To obtain useful statusChange evidence, perform one approved controlled process transition:
-
-Start → Stop → Start
-
-on a test process, then rerun the status-change probe.
-
-Keep these unchanged
-CLOUDWATCH_PUBLISH_ENABLED=false
-legacyFallback=true
-old observer running
-old combined Argo CD application retained
-
-Do not enable CloudWatch, remove the observer, or start Fluent Bit yet.
-
-Exact next sequence
-1. Validate latest image and endpoints
-2. Run four updated PMS probes
-3. Share the four sanitized outputs
-4. Configure one Extract, one Distribution Path and one Replicat
-5. Confirm non-zero discovery counts
-6. Confirm STATE#<process> records and portal rows
-7. Capture non-empty PMS process structure
-8. Create one controlled status transition
-9. Capture non-empty statusChange structure
-10. Prepare Phase 4B2B production PMS parser
+goldengate-monitor:mon-8480cda7f54f
