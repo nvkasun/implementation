@@ -1,0 +1,97 @@
+Compact validation commands
+A. Rollout, image and CloudWatch switch
+kubectl rollout status deployment/gg-monitor \
+  -n goldengate-monitoring \
+  --timeout=5m && \
+kubectl get deployment gg-monitor \
+  -n goldengate-monitoring \
+  -o jsonpath='image={.spec.template.spec.containers[0].image}{"\n"}{range .spec.template.spec.containers[0].env[?(@.name=="CLOUDWATCH_PUBLISH_ENABLED")]}{.name}={.value}{"\n"}{end}'
+
+Expected:
+
+deployment "gg-monitor" successfully rolled out
+image=...goldengate-monitor:mon-<new-tag>
+CLOUDWATCH_PUBLISH_ENABLED=false
+B. Health and readiness
+kubectl exec \
+  -n goldengate-monitoring \
+  deployment/gg-monitor \
+  -- python3 - <<'PY'
+import urllib.request
+
+for path in ("/healthz", "/readyz"):
+    with urllib.request.urlopen(
+        f"http://127.0.0.1:8080{path}",
+        timeout=5,
+    ) as response:
+        print(path, response.status, response.read().decode())
+PY
+
+Expected:
+
+/healthz 200 {"status":"ok",...}
+/readyz 200 {"status":"ready"}
+C. Compact DynamoDB PMS result
+kubectl exec \
+  -n goldengate-monitoring \
+  deployment/gg-monitor \
+  -- python3 - <<'PY'
+import os
+import time
+import boto3
+
+table = boto3.resource(
+    "dynamodb",
+    region_name=os.environ["AWS_REGION"],
+).Table(os.environ["DYNAMODB_TABLE"])
+
+for deployment in (
+    "gg-oracle-payments-01",
+    "gg-postgresql-payments-01",
+):
+    item = table.get_item(
+        Key={
+            "pipeline": deployment,
+            "recordType": "STATE#_deployment",
+        },
+        ConsistentRead=True,
+    ).get("Item", {})
+
+    pms = item.get("pms", {})
+    collected = int(pms.get("collectedAt", 0) or 0)
+    age = int(time.time()) - collected if collected else -1
+
+    print(
+        f"{deployment} "
+        f"deployment={item.get('status')} "
+        f"pms={pms.get('status')} "
+        f"age={age}s "
+        f"inventory={pms.get('inventoryCount')} "
+        f"followed={pms.get('followedCount')} "
+        f"success={pms.get('successCount')} "
+        f"failure={pms.get('failureCount')} "
+        f"processes={len(pms.get('processes', {}))} "
+        f"heartbeatAge={pms.get('heartbeatAgeSeconds')}"
+    )
+PY
+
+Ideal expected output:
+
+gg-oracle-payments-01 deployment=UP pms=OK age=<120s inventory=4 followed=4 success=4 failure=0 processes=4 heartbeatAge=<number>
+gg-postgresql-payments-01 deployment=UP pms=OK age=<120s inventory=4 followed=4 success=4 failure=0 processes=4 heartbeatAge=<number>
+
+Interpretation:
+
+pms=OK: full collection succeeded.
+pms=PARTIAL: some PMS details succeeded and some failed.
+pms=UNAVAILABLE: none of the detail calls succeeded.
+deployment=UP with pms=PARTIAL/UNAVAILABLE: Admin REST deployment health remains healthy, which is the intended behavior.
+D. Error-only logs
+kubectl logs \
+  -n goldengate-monitoring \
+  deployment/gg-monitor \
+  --since=10m |
+grep -E 'PMS collection unavailable|tick failed|Traceback|ERROR' |
+tail -20 || true
+
+Expected when clean:
