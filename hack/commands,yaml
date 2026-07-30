@@ -1,65 +1,108 @@
-Immediate next step: compare TLS on ports 8443 and 9015
-
-First display the runtime Service ports:
-
-kubectl get svc \
-  -n goldengate-dev \
-  -o custom-columns='NAME:.metadata.name,PORTS:.spec.ports[*].port,TARGETPORTS:.spec.ports[*].targetPort'
-
-Confirm that both runtime Services expose 8443 and 9015.
-
-Then run this safe TLS diagnostic from the monitor pod. It prints only the verification result—no credentials or certificate body:
-
 kubectl exec -i \
   -n goldengate-monitoring \
   deployment/gg-monitor \
   -- python3 - <<'PY'
-import socket
-import ssl
+import http.client
+import json
 
-CA_FILE = "/mnt/secrets-store/ca-chain-pem"
-
-runtimes = [
+targets = [
     (
-        "oracle",
+        "gg-oracle-payments-01",
         "gg-oracle-payments-01.goldengate-dev.svc.cluster.local",
-        "gg-oracle-payments-01.goldengate-dev.adcbmis.local",
     ),
     (
-        "postgresql",
+        "gg-postgresql-payments-01",
         "gg-postgresql-payments-01.goldengate-dev.svc.cluster.local",
-        "gg-postgresql-payments-01.goldengate-dev.adcbmis.local",
     ),
 ]
 
-context = ssl.create_default_context(cafile=CA_FILE)
+paths = [
+    "/services/v2/mpoints/processes",
+    "/services/v2/monitoring/statusChanges",
+    "/services/v2/metrics",
+]
 
-for runtime, host, server_name in runtimes:
-    for port in (8443, 9015):
+for deployment, host in targets:
+    for path in paths:
+        result = {
+            "deployment": deployment,
+            "port": 9015,
+            "schemeTested": "http",
+            "path": path,
+        }
+
         try:
-            with socket.create_connection((host, port), timeout=5) as raw:
-                with context.wrap_socket(
-                    raw,
-                    server_hostname=server_name,
-                ) as tls:
-                    print(
-                        f"{runtime} port={port}: "
-                        f"TLS_OK protocol={tls.version()}"
-                    )
-        except ssl.SSLCertVerificationError as exc:
-            print(
-                f"{runtime} port={port}: "
-                f"TLS_VERIFY_FAILED "
-                f"code={exc.verify_code} "
-                f"reason={exc.verify_message}"
+            connection = http.client.HTTPConnection(
+                host,
+                9015,
+                timeout=5,
             )
+
+            connection.request(
+                "GET",
+                path,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "gg-pms-contract-check/1",
+                },
+            )
+
+            response = connection.getresponse()
+
+            result["httpStatus"] = response.status
+            result["contentType"] = (
+                response.getheader("Content-Type") or ""
+            ).split(";", 1)[0]
+
+            # Do not print or retain the response body.
+            response.read(1)
+            connection.close()
+
         except Exception as exc:
-            print(
-                f"{runtime} port={port}: "
-                f"{type(exc).__name__}"
-            )
+            result["errorType"] = type(exc).__name__
+
+        print(json.dumps(result, sort_keys=True))
 PY
 
-Replace the Service names only if the earlier kubectl get svc output shows different names.
+----------------
 
-How to interpret the result
+Optional listener inspection
+
+This does not expose credentials:
+
+kubectl exec \
+  -n goldengate-dev \
+  gg-oracle-payments-01-0 \
+  -- sh -c '
+    echo "Processes:";
+    ps -ef | grep -Ei "pms|metric" | grep -v grep || true;
+
+    echo "Listening ports:";
+    if command -v ss >/dev/null 2>&1; then
+      ss -lntup | grep -E ":8443|:9015" || true;
+    elif command -v netstat >/dev/null 2>&1; then
+      netstat -lntup 2>/dev/null | grep -E ":8443|:9015" || true;
+    else
+      echo "ss/netstat unavailable";
+    fi
+  '
+
+Repeat for PostgreSQL:
+
+kubectl exec \
+  -n goldengate-dev \
+  gg-postgresql-payments-01-0 \
+  -- sh -c '
+    echo "Processes:";
+    ps -ef | grep -Ei "pms|metric" | grep -v grep || true;
+
+    echo "Listening ports:";
+    if command -v ss >/dev/null 2>&1; then
+      ss -lntup | grep -E ":8443|:9015" || true;
+    elif command -v netstat >/dev/null 2>&1; then
+      netstat -lntup 2>/dev/null | grep -E ":8443|:9015" || true;
+    else
+      echo "ss/netstat unavailable";
+    fi
+  '
+Current status
