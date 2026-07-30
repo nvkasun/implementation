@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from decimal import Decimal
 from unittest import mock
@@ -469,6 +470,321 @@ class DynamoDbAccessPatternTests(unittest.TestCase):
         monitor.build_status_payload(make_config(), table, DEPLOYMENTS, LOGICAL_PIPELINES, clock=lambda: 1780000010)
         for forbidden in ("put_item", "update_item", "delete_item", "batch_writer", "scan"):
             self.assertFalse(hasattr(table, forbidden))
+
+
+class ProcessRowManagerFieldsTests(unittest.TestCase):
+    """Phase 4C2: manager-parity process fields the collector already
+    writes (resolvedThreshold/resolvedMode/consecutiveAbends) must be
+    surfaced by normalize_process_row with safe defaults when absent."""
+
+    def test_resolved_threshold_mode_and_abends_passed_through(self):
+        row = make_process_item(resolvedThreshold=300, resolvedMode="alert", consecutiveAbends=2)
+        out = monitor.normalize_process_row(row, now=1780000010, stale_after_seconds=120)
+        self.assertEqual(out["resolvedThreshold"], 300)
+        self.assertEqual(out["resolvedMode"], "alert")
+        self.assertEqual(out["consecutiveAbends"], 2)
+
+    def test_missing_resolved_threshold_and_mode_default_to_none(self):
+        row = make_process_item()
+        row.pop("resolvedThreshold", None)
+        row.pop("resolvedMode", None)
+        out = monitor.normalize_process_row(row, now=1780000010, stale_after_seconds=120)
+        self.assertIsNone(out["resolvedThreshold"])
+        self.assertIsNone(out["resolvedMode"])
+
+    def test_missing_consecutive_abends_defaults_to_zero(self):
+        row = make_process_item()
+        out = monitor.normalize_process_row(row, now=1780000010, stale_after_seconds=120)
+        self.assertEqual(out["consecutiveAbends"], 0)
+
+    def test_decimal_threshold_and_abends_become_json_safe(self):
+        row = make_process_item(resolvedThreshold=Decimal("300"), consecutiveAbends=Decimal("1"))
+        out = monitor.normalize_process_row(row, now=1780000010, stale_after_seconds=120)
+        self.assertEqual(out["resolvedThreshold"], 300)
+        self.assertNotIsInstance(out["resolvedThreshold"], Decimal)
+        self.assertEqual(out["consecutiveAbends"], 1)
+        self.assertNotIsInstance(out["consecutiveAbends"], Decimal)
+
+    def test_process_stale_marker_set_when_recorded_at_too_old(self):
+        row = make_process_item(recorded_at=1780000000)
+        out = monitor.normalize_process_row(row, now=1780000200, stale_after_seconds=120)
+        self.assertTrue(out["stale"])
+
+    def test_process_stale_marker_false_when_fresh(self):
+        row = make_process_item(recorded_at=1780000000)
+        out = monitor.normalize_process_row(row, now=1780000010, stale_after_seconds=120)
+        self.assertFalse(out["stale"])
+
+
+class PortalHtmlManagerParityTests(unittest.TestCase):
+    """Phase 4C2: every required HTML field is present, HTML-escaped, and
+    never leaks raw errorMsg/credentials/secrets/hostnames/ARNs."""
+
+    def _payload_with_full_runtime(self, **overrides):
+        runtime = {
+            "role": "source", "deploymentName": "gg-oracle-payments-01", "deploymentType": "oracle",
+            "effectiveStatus": "UP", "fresh": True, "dataSource": "canonical-monitor",
+            "alertsEnabled": True, "ageSeconds": 3, "recordedAt": 1780000007,
+            "lease": {"holder": "gg-monitor-0", "expiresAt": 1780000040, "fresh": True},
+            "criticalServices": {"adminsrvr": True, "distsrvr": False},
+            "processes": [{
+                "process": "EXTORA1", "processType": "extract", "status": "RUNNING", "stale": False,
+                "recordedAt": 1780000007, "ageSeconds": 3, "lagSeconds": 5,
+                "resolvedThreshold": 300, "resolvedMode": "alert", "consecutiveAbends": 0,
+                "hasError": False, "statusCode": "NONE", "statusMessage": "No error.",
+            }],
+        }
+        runtime.update(overrides)
+        return {"generatedAt": 1780000010, "logicalPipelines": [
+            {"pipelineId": "payments-ora-to-pg-001", "runtimes": [runtime]}]}
+
+    def test_deployment_name_shown(self):
+        rendered = monitor.render_html(self._payload_with_full_runtime(), make_config())
+        self.assertIn("gg-oracle-payments-01", rendered)
+
+    def test_deployment_status_shown(self):
+        rendered = monitor.render_html(self._payload_with_full_runtime(), make_config())
+        self.assertIn("UP", rendered)
+
+    def test_stale_deployment_clearly_marked(self):
+        rendered = monitor.render_html(self._payload_with_full_runtime(fresh=False), make_config())
+        self.assertIn("STALE", rendered)
+
+    def test_fresh_deployment_marked_fresh(self):
+        rendered = monitor.render_html(self._payload_with_full_runtime(fresh=True), make_config())
+        self.assertIn("Fresh", rendered)
+
+    def test_alerts_enabled_true_shown(self):
+        rendered = monitor.render_html(self._payload_with_full_runtime(alertsEnabled=True), make_config())
+        self.assertIn("true", rendered)
+
+    def test_alerts_enabled_false_shown(self):
+        rendered = monitor.render_html(self._payload_with_full_runtime(alertsEnabled=False), make_config())
+        self.assertIn("false", rendered)
+
+    def test_alerts_enabled_missing_shown_as_unknown(self):
+        rendered = monitor.render_html(self._payload_with_full_runtime(alertsEnabled=None), make_config())
+        self.assertIn("unknown", rendered)
+
+    def test_lease_holder_and_valid_state_shown(self):
+        rendered = monitor.render_html(self._payload_with_full_runtime(), make_config())
+        self.assertIn("gg-monitor-0", rendered)
+        self.assertIn("valid", rendered)
+
+    def test_lease_expired_state_shown(self):
+        payload = self._payload_with_full_runtime(
+            lease={"holder": "gg-monitor-0", "expiresAt": 1780000000, "fresh": False})
+        rendered = monitor.render_html(payload, make_config())
+        self.assertIn("EXPIRED", rendered)
+
+    def test_deployment_record_age_shown(self):
+        rendered = monitor.render_html(self._payload_with_full_runtime(ageSeconds=3), make_config())
+        self.assertIn("3s ago", rendered)
+
+    def test_critical_services_reachable_and_down_shown(self):
+        rendered = monitor.render_html(self._payload_with_full_runtime(), make_config())
+        self.assertIn("adminsrvr", rendered)
+        self.assertIn("reachable", rendered)
+        self.assertIn("distsrvr", rendered)
+        self.assertIn("down", rendered)
+
+    def test_no_critical_services_shows_placeholder(self):
+        rendered = monitor.render_html(self._payload_with_full_runtime(criticalServices={}), make_config())
+        self.assertIn("gg-oracle-payments-01", rendered)  # renders without crashing
+
+    def test_process_type_shown(self):
+        rendered = monitor.render_html(self._payload_with_full_runtime(), make_config())
+        self.assertIn("extract", rendered)
+
+    def test_process_lag_threshold_mode_shown(self):
+        rendered = monitor.render_html(self._payload_with_full_runtime(), make_config())
+        self.assertIn(">5<", rendered)
+        self.assertIn(">300<", rendered)
+        self.assertIn(">alert<", rendered)
+
+    def test_process_age_shown(self):
+        rendered = monitor.render_html(self._payload_with_full_runtime(), make_config())
+        self.assertIn(">3<", rendered)
+
+    def test_process_stale_indication_shown(self):
+        payload = self._payload_with_full_runtime()
+        payload["logicalPipelines"][0]["runtimes"][0]["processes"][0]["stale"] = True
+        rendered = monitor.render_html(payload, make_config())
+        self.assertIn("STALE", rendered)
+
+    def test_process_fresh_indication_shown(self):
+        rendered = monitor.render_html(self._payload_with_full_runtime(), make_config())
+        # the process row's own stale=False must render as a distinct Fresh badge
+        self.assertGreaterEqual(rendered.count("Fresh"), 1)
+
+    def test_consecutive_abends_shown(self):
+        payload = self._payload_with_full_runtime()
+        payload["logicalPipelines"][0]["runtimes"][0]["processes"][0]["consecutiveAbends"] = 4
+        rendered = monitor.render_html(payload, make_config())
+        self.assertIn(">4<", rendered)
+
+    def test_missing_resolved_threshold_and_mode_render_safely(self):
+        payload = self._payload_with_full_runtime()
+        payload["logicalPipelines"][0]["runtimes"][0]["processes"][0]["resolvedThreshold"] = None
+        payload["logicalPipelines"][0]["runtimes"][0]["processes"][0]["resolvedMode"] = None
+        try:
+            rendered = monitor.render_html(payload, make_config())
+        except Exception as e:  # pragma: no cover
+            self.fail(f"render_html raised on missing fields: {e!r}")
+        self.assertIn("gg-oracle-payments-01", rendered)
+
+    def test_malicious_process_name_is_escaped(self):
+        payload = self._payload_with_full_runtime()
+        payload["logicalPipelines"][0]["runtimes"][0]["processes"][0]["process"] = "<script>alert(2)</script>"
+        rendered = monitor.render_html(payload, make_config())
+        self.assertNotIn("<script>alert(2)</script>", rendered)
+        self.assertIn(html_module.escape("<script>alert(2)</script>"), rendered)
+
+    def test_malicious_critical_service_name_is_escaped(self):
+        payload = self._payload_with_full_runtime(criticalServices={"<img src=x onerror=alert(1)>": True})
+        rendered = monitor.render_html(payload, make_config())
+        self.assertNotIn("<img src=x onerror=alert(1)>", rendered)
+
+    def test_process_error_message_never_exposes_raw_error_msg(self):
+        payload = self._payload_with_full_runtime()
+        payload["logicalPipelines"][0]["runtimes"][0]["processes"][0].update(
+            hasError=True, statusCode="AUTH_FAILED",
+            statusMessage="Authentication to the GoldenGate Admin REST API failed.")
+        rendered = monitor.render_html(payload, make_config())
+        self.assertIn("Authentication to the GoldenGate Admin REST API failed.", rendered)
+        self.assertNotIn("password=", rendered)
+        self.assertNotIn("db-internal.example.local", rendered)
+
+
+class ApiProcessesTests(unittest.TestCase):
+    """Phase 4C2: GET /api/processes -- canonical STATE# only, GetItem/Query
+    only, no legacy-observer fallback, no writes, no secret/internal
+    leakage."""
+
+    def _handler(self, table_factory):
+        handler_cls = monitor._make_handler(make_config(), table_factory, DEPLOYMENTS, LOGICAL_PIPELINES, {}, [])
+        handler = handler_cls.__new__(handler_cls)
+        writes = []
+        handler._write = lambda status, ctype, body: writes.append((status, ctype, body))
+        return handler, writes
+
+    def test_success_returns_200_with_expected_schema(self):
+        # Goes through the real HTTP handler (build_processes_payload's
+        # default clock=time.time, not an injected one) -- fixture
+        # timestamps must be fresh relative to real wall-clock time.
+        now = int(time.time())
+        table = FakeTable([
+            make_deployment_state_item(recorded_at=now - 5,
+                                       criticalServices={"adminsrvr": {"reachable": True}}),
+            {"pipeline": "gg-oracle-payments-01", "recordType": "CONFIG", "alertsEnabled": True},
+            make_lease_item(now=now),
+            make_process_item(recorded_at=now - 3, resolvedThreshold=300, resolvedMode="alert",
+                              consecutiveAbends=1),
+        ])
+        handler, writes = self._handler(lambda: table)
+        handler.path = "/api/processes"
+        handler.do_GET()
+        self.assertEqual(writes[0][0], 200)
+        body = json.loads(writes[0][2])
+        self.assertIn("generatedAt", body)
+        dep = next(d for d in body["deployments"] if d["deploymentName"] == "gg-oracle-payments-01")
+        self.assertEqual(dep["effectiveStatus"], "UP")
+        self.assertIn("ageSeconds", dep)
+        self.assertTrue(dep["alertsEnabled"])
+        self.assertEqual(dep["lease"]["holder"], "gg-monitor-0")
+        self.assertEqual(dep["criticalServices"], {"adminsrvr": True})
+        proc = dep["processes"][0]
+        for key in ("process", "processType", "status", "lagSeconds", "resolvedThreshold",
+                    "resolvedMode", "recordedAt", "ageSeconds", "stale", "consecutiveAbends"):
+            self.assertIn(key, proc)
+        self.assertEqual(proc["resolvedThreshold"], 300)
+        self.assertEqual(proc["resolvedMode"], "alert")
+        self.assertEqual(proc["consecutiveAbends"], 1)
+
+    def test_dynamodb_failure_returns_sanitized_message_only(self):
+        table = mock.Mock()
+        table.get_item.side_effect = RuntimeError(
+            "arn:aws:sts::668311715351:assumed-role/GoldenGateSecretsReadRole-dev/i-0123456789abcdef")
+        handler, writes = self._handler(lambda: table)
+        handler.path = "/api/processes"
+        handler.do_GET()
+        self.assertEqual(writes[0][0], 503)
+        body = json.loads(writes[0][2])
+        self.assertEqual(body["message"], monitor.CLIENT_SAFE_DYNAMODB_ERROR_MESSAGE)
+        raw = writes[0][2].decode("utf-8")
+        self.assertNotIn("arn:aws", raw)
+        self.assertNotIn("GoldenGateSecretsReadRole-dev", raw)
+
+    def test_no_secret_or_internal_fields_in_response(self):
+        now = 1780000010
+        table = FakeTable([
+            make_deployment_state_item(recorded_at=now - 5),
+            make_process_item(recorded_at=now - 3, errorMsg="db-internal.example.local password=hunter2"),
+        ])
+        handler, writes = self._handler(lambda: table)
+        handler.path = "/api/processes"
+        handler.do_GET()
+        raw = writes[0][2].decode("utf-8")
+        for forbidden in ("errorMsg", "password", "hunter2", "db-internal.example.local",
+                          "adminSecret", "arn:aws", "/mnt/secrets-store", "ca-chain-pem"):
+            self.assertNotIn(forbidden, raw)
+
+    def test_uses_canonical_state_schema_only_no_legacy_fallback(self):
+        # a legacy-only record (no canonical STATE#_deployment) must show
+        # MISSING here -- /api/processes never falls back to the legacy
+        # observer's per-role key, unlike /api/status.
+        now = 1780000010
+        legacy_item = {"pipeline": "gg-payments-ora-to-pg-001-source", "recordType": "STATE#_deployment",
+                       "status": "HEALTHY", "recordedAt": now - 5}
+        table = FakeTable([legacy_item])
+        handler, writes = self._handler(lambda: table)
+        handler.path = "/api/processes"
+        handler.do_GET()
+        body = json.loads(writes[0][2])
+        dep = next(d for d in body["deployments"] if d["deploymentName"] == "gg-oracle-payments-01")
+        self.assertEqual(dep["effectiveStatus"], "MISSING")
+
+    def test_no_dynamodb_scan_used(self):
+        now = 1780000010
+        table = FakeTable([make_deployment_state_item(recorded_at=now - 5), make_process_item(recorded_at=now - 3)])
+        monitor.build_processes_payload(make_config(), table, DEPLOYMENTS, clock=lambda: now)
+        self.assertFalse(hasattr(table, "scan"))
+
+    def test_no_dynamodb_write_operation_occurs(self):
+        now = 1780000010
+        table = FakeTable([make_deployment_state_item(recorded_at=now - 5)])
+        monitor.build_processes_payload(make_config(), table, DEPLOYMENTS, clock=lambda: now)
+        for forbidden in ("put_item", "update_item", "delete_item", "batch_writer", "scan"):
+            self.assertFalse(hasattr(table, forbidden))
+
+    def test_empty_process_list_is_valid(self):
+        now = 1780000010
+        table = FakeTable([make_deployment_state_item(recorded_at=now - 5)])
+        handler, writes = self._handler(lambda: table)
+        handler.path = "/api/processes"
+        handler.do_GET()
+        self.assertEqual(writes[0][0], 200)
+        body = json.loads(writes[0][2])
+        dep = next(d for d in body["deployments"] if d["deploymentName"] == "gg-oracle-payments-01")
+        self.assertEqual(dep["processes"], [])
+
+    def test_legacy_observer_fallback_for_api_status_remains_unchanged(self):
+        # Confirms this phase did not alter /api/status's existing
+        # legacy-fallback behaviour (a separate, pre-existing endpoint).
+        # Goes through the real HTTP handler (real wall-clock time) -- the
+        # fixture must be fresh relative to it.
+        now = int(time.time())
+        legacy_item = {"pipeline": "gg-payments-ora-to-pg-001-source", "recordType": "STATE#_deployment",
+                       "status": "HEALTHY", "recordedAt": now - 5}
+        table = FakeTable([legacy_item])
+        handler, writes = self._handler(lambda: table)
+        handler.path = "/api/status"
+        handler.do_GET()
+        body = json.loads(writes[0][2])
+        lp = body["logicalPipelines"][0]
+        source = next(r for r in lp["runtimes"] if r["role"] == "source")
+        self.assertEqual(source["dataSource"], "legacy-observer-fallback")
+        self.assertEqual(source["effectiveStatus"], "UP")
 
 
 class ThreadSafetyTests(unittest.TestCase):

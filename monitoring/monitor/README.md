@@ -297,9 +297,27 @@ precedence once present.
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /` | HTML operator portal, grouped by logical pipeline |
-| `GET /api/status` | JSON status (see monitor.py's recommended schema) |
+| `GET /api/status` | JSON status (see monitor.py's recommended schema); canonical-first, legacy-observer-fallback-second, like the portal |
+| `GET /api/processes` | JSON deployment + process detail, **canonical `STATE#` records only** -- no legacy-observer fallback |
 | `GET /healthz` | Process liveness only -- never touches DynamoDB |
 | `GET /readyz` | Collector readiness + a bounded `DescribeTable` check |
+
+### Manager-compatible portal fields
+
+Both `/` (HTML) and `/api/processes` (JSON) surface the same manager-equivalent
+information, built entirely from records the collector already writes --
+`GetItem`/`Query` only, never `Scan`, never a write. Per deployment: canonical
+name, effective status, an explicit fresh/**STALE** indicator (distinct from
+status), `alertsEnabled`, lease holder + valid/expired state, `STATE#_deployment`
+record age, and each critical service's reachable/down state. Per process:
+name, `processType`, status, `lagSeconds`, `resolvedThreshold`, `resolvedMode`,
+record age, its own fresh/stale indicator, and `consecutiveAbends`. Raw
+`errorMsg`, credentials, secret/CA paths, internal hostnames, AWS ARNs, and
+exception text are never exposed -- only the existing closed `statusCode`/
+`statusMessage` vocabulary. All HTML output is escaped. `/api/processes` is
+deliberately canonical-only (no legacy-observer fallback, no legacy singleton
+`STATE` record, no PMS service-process rows) -- it is a new endpoint, not a
+replacement for `/api/status`'s existing migration-compatibility behavior.
 
 ## IRSA role
 

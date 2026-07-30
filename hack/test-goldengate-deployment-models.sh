@@ -583,6 +583,26 @@ else
   fail "collector.py no longer requires serviceHealth isHealthy to be a literal boolean"
 fi
 
+# ---------------------------------------------------------------------
+# 16. Phase 4C2: manager-compatible portal -- GET /api/processes exists,
+#     canonical STATE#-only (no Scan, no legacy fallback in that path).
+# ---------------------------------------------------------------------
+echo ""
+echo "--- Manager-compatible portal: /api/processes ---"
+if grep -q '"/api/processes"' "${MONITOR_APP_DIR}/monitor.py" 2>/dev/null \
+    && grep -q "def build_processes_payload" "${MONITOR_APP_DIR}/monitor.py" 2>/dev/null; then
+  pass "monitor.py exposes GET /api/processes backed by build_processes_payload"
+else
+  fail "monitor.py is missing the /api/processes endpoint"
+fi
+
+if grep -q "def read_deployment_processes_view" "${MONITOR_APP_DIR}/monitor.py" 2>/dev/null \
+    && ! grep -q "\.scan(" "${MONITOR_APP_DIR}/monitor.py" 2>/dev/null; then
+  pass "monitor.py's /api/processes view is canonical STATE#-only and never calls Scan"
+else
+  fail "monitor.py /api/processes canonical-view helper or no-Scan guarantee changed unexpectedly"
+fi
+
 echo ""
 echo "=================================================="
 echo "Summary: ${PASS_COUNT} passed, ${FAIL_COUNT} failed, ${SKIP_COUNT} skipped"

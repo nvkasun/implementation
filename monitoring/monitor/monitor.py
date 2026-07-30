@@ -68,6 +68,7 @@ STATUS_COLORS = {
     "UP": "#1a7f37", "STARTING": "#9a6700", "DOWN": "#cf222e",
     "STALE": "#9a6700", "MISSING": "#cf222e", "UNKNOWN": "#57606a",
     "RUNNING": "#1a7f37", "STOPPED": "#9a6700", "ABENDED": "#cf222e",
+    "FRESH": "#1a7f37", "REACHABLE": "#1a7f37", "DOWN_SVC": "#cf222e",
 }
 
 logger = logging.getLogger("goldengate.monitor")
@@ -199,6 +200,9 @@ def _sanitized_process_error(status, error_msg, stale):
 
 
 def normalize_process_row(row, now, stale_after_seconds):
+    """Manager-compatible process fields only, all safe types, missing
+    values defaulting sensibly (resolvedThreshold/resolvedMode -> None,
+    consecutiveAbends -> 0) -- never raises on a malformed/partial row."""
     recorded_at = _parse_epoch(row.get("recordedAt"))
     age, plausible = _freshness(recorded_at, now)
     stale = (not plausible) or age > stale_after_seconds
@@ -206,6 +210,9 @@ def normalize_process_row(row, now, stale_after_seconds):
     has_error, status_code, status_message = _sanitized_process_error(status, row.get("errorMsg", ""), stale)
     record_type = str(row.get("recordType", "STATE#?"))
     process_name = record_type.split("#", 1)[1] if "#" in record_type else record_type
+    resolved_threshold = row.get("resolvedThreshold")
+    resolved_mode = row.get("resolvedMode")
+    consecutive_abends = row.get("consecutiveAbends")
     return {
         "process": process_name,
         "processType": str(row.get("processType", "?")),
@@ -214,6 +221,9 @@ def normalize_process_row(row, now, stale_after_seconds):
         "recordedAt": recorded_at if plausible else None,
         "ageSeconds": age if plausible else None,
         "lagSeconds": decimal_to_jsonsafe(row.get("lagSeconds")) if row.get("lagSeconds") is not None else None,
+        "resolvedThreshold": decimal_to_jsonsafe(resolved_threshold) if resolved_threshold is not None else None,
+        "resolvedMode": str(resolved_mode) if resolved_mode is not None else None,
+        "consecutiveAbends": decimal_to_jsonsafe(consecutive_abends) if consecutive_abends is not None else 0,
         "hasError": has_error,
         "statusCode": status_code,
         "statusMessage": status_message,
@@ -323,6 +333,54 @@ def build_status_payload(config, table, deployments, logical_pipelines, clock=ti
     return {"generatedAt": now, "logicalPipelines": logical_out}
 
 
+def read_deployment_processes_view(table, deployment_meta, now, stale_after_seconds):
+    """Canonical STATE#-only view for one deployment -- no legacy-observer
+    fallback (that migration-compatibility concern belongs to
+    read_runtime_view/build_status_payload only). GetItem/Query only, never
+    Scan, never writes."""
+    deployment_name = deployment_meta["name"]
+    config_item = get_config_item(table, deployment_name)
+    lease_item = get_lease_item(table, deployment_name)
+    dep_item = get_deployment_state_item(table, deployment_name)
+
+    status_fields = compute_canonical_effective_status(dep_item, now, stale_after_seconds)
+    if dep_item is not None:
+        process_rows = query_process_state_items(table, deployment_name)
+        processes = [normalize_process_row(r, now, stale_after_seconds) for r in process_rows]
+        critical_services = dep_item.get("criticalServices") or {}
+    else:
+        processes = []
+        critical_services = {}
+
+    return {
+        "deploymentName": deployment_name,
+        "deploymentType": deployment_meta.get("type"),
+        "enabled": bool(deployment_meta.get("enabled", False)),
+        "alertsEnabled": bool(config_item.get("alertsEnabled")) if config_item else None,
+        "lease": lease_view(lease_item, now),
+        "criticalServices": {k: bool((v or {}).get("reachable")) for k, v in (critical_services or {}).items()},
+        "processes": processes,
+        **status_fields,
+    }
+
+
+def build_processes_payload(config, table, deployments, clock=time.time):
+    """/api/processes: canonical STATE# records only, one entry per
+    configured deployment (not grouped by logical pipeline -- this endpoint
+    is deployment/process-centric, not pipeline-pairing-centric). Never
+    writes DynamoDB, never Scans."""
+    now = int(clock())
+    try:
+        deployments_out = [read_deployment_processes_view(table, d, now, config.stale_after_seconds)
+                           for d in deployments]
+    except (BotoCoreError, ClientError) as exc:
+        summary = sanitize_error(exc)
+        log_event("ERROR", "dynamodb_read_failed", message=summary)
+        raise DynamoDbReadError(summary) from exc
+
+    return {"generatedAt": now, "deployments": deployments_out}
+
+
 def _json_default(value):
     if isinstance(value, Decimal):
         return decimal_to_jsonsafe(value)
@@ -338,6 +396,36 @@ def _status_badge(status):
     return (f'<span style="display:inline-block;padding:2px 10px;border-radius:4px;'
             f'background:{html.escape(color)};color:#ffffff;font-weight:600;font-size:0.85em;">'
             f"{html.escape(str(status))}</span>")
+
+
+def _fresh_badge(fresh):
+    label = "Fresh" if fresh else "STALE"
+    color = STATUS_COLORS["FRESH"] if fresh else STATUS_COLORS["STALE"]
+    return (f'<span style="display:inline-block;padding:2px 10px;border-radius:4px;'
+            f'background:{html.escape(color)};color:#ffffff;font-weight:600;font-size:0.85em;">'
+            f"{html.escape(label)}</span>")
+
+
+def _reachable_badge(reachable):
+    label = "reachable" if reachable else "down"
+    color = STATUS_COLORS["REACHABLE"] if reachable else STATUS_COLORS["DOWN_SVC"]
+    return (f'<span style="display:inline-block;padding:1px 8px;border-radius:4px;'
+            f'background:{html.escape(color)};color:#ffffff;font-size:0.8em;">'
+            f"{html.escape(label)}</span>")
+
+
+def _critical_services_html(critical_services):
+    if not critical_services:
+        return "-"
+    return " ".join(
+        f"{_esc(svc)} {_reachable_badge(bool(up))}"
+        for svc, up in sorted(critical_services.items()))
+
+
+def _alerts_enabled_text(alerts_enabled):
+    if alerts_enabled is None:
+        return "unknown"
+    return "true" if alerts_enabled else "false"
 
 
 def render_html(payload, config, error_message=None):
@@ -357,13 +445,21 @@ def render_html(payload, config, error_message=None):
                 proc_rows = "".join(
                     "<tr>"
                     f"<td>{_esc(p['process'])}</td>"
+                    f"<td>{_esc(p['processType'])}</td>"
                     f"<td>{_status_badge(p['status'])}</td>"
                     f"<td>{_esc(p['lagSeconds'])}</td>"
+                    f"<td>{_esc(p['resolvedThreshold'])}</td>"
+                    f"<td>{_esc(p['resolvedMode'])}</td>"
+                    f"<td>{_esc(p['ageSeconds'])}</td>"
+                    f"<td>{_fresh_badge(not p['stale'])}</td>"
+                    f"<td>{_esc(p['consecutiveAbends'])}</td>"
                     f"<td>{_esc(p['statusMessage']) if p['hasError'] else ''}</td>"
                     "</tr>"
                     for p in r["processes"])
                 proc_table = ('<table style="margin-top:4px;font-size:0.85em;">'
-                             "<thead><tr><th>Process</th><th>Status</th><th>Lag</th><th>Error</th></tr></thead>"
+                             "<thead><tr><th>Process</th><th>Type</th><th>Status</th><th>Lag</th>"
+                             "<th>Threshold</th><th>Mode</th><th>Age</th><th>Fresh</th>"
+                             "<th>Abends</th><th>Error</th></tr></thead>"
                              f"<tbody>{proc_rows}</tbody></table>")
             else:
                 proc_table = "<p><em>No process STATE rows found.</em></p>"
@@ -378,17 +474,21 @@ def render_html(payload, config, error_message=None):
                 f"<td>{_esc(r.get('deploymentName'))}</td>"
                 f"<td>{_esc(r.get('deploymentType'))}</td>"
                 f"<td>{_status_badge(r.get('effectiveStatus'))}</td>"
+                f"<td>{_fresh_badge(bool(r.get('fresh')))}</td>"
+                f"<td>{html.escape(_alerts_enabled_text(r.get('alertsEnabled')))}</td>"
                 f"<td>{_esc(r.get('dataSource'))}</td>"
                 f"<td>{html.escape(age_text)}</td>"
                 f"<td>{html.escape(lease_text)}</td>"
+                f"<td>{_critical_services_html(r.get('criticalServices'))}</td>"
                 f"<td>{proc_table}</td>"
                 "</tr>")
         sections.append(
             f'<h2 style="margin-top:24px;">{_esc(lp.get("pipelineId"))}</h2>'
             '<table style="border-collapse:collapse;width:100%;font-size:0.9em;">'
             '<thead><tr style="text-align:left;border-bottom:2px solid #d0d7de;">'
-            "<th>Role</th><th>Deployment</th><th>Type</th><th>Status</th>"
-            "<th>Source</th><th>Recorded</th><th>Lease</th><th>Processes</th>"
+            "<th>Role</th><th>Deployment</th><th>Type</th><th>Status</th><th>Fresh</th>"
+            "<th>Alerts</th><th>Source</th><th>Recorded</th><th>Lease</th>"
+            "<th>Critical Services</th><th>Processes</th>"
             "</tr></thead><tbody>" + "".join(rows) + "</tbody></table>")
 
     if not payload.get("logicalPipelines"):
@@ -451,6 +551,8 @@ def _make_handler(config, table_factory, deployments, logical_pipelines, ready_s
                     self._handle_readyz()
                 elif self.path == "/api/status":
                     self._handle_api_status()
+                elif self.path == "/api/processes":
+                    self._handle_api_processes()
                 elif self.path == "/":
                     self._handle_root()
                 else:
@@ -494,6 +596,24 @@ def _make_handler(config, table_factory, deployments, logical_pipelines, ready_s
 
         def _handle_api_status(self):
             payload, error_message = self._build_payload()
+            if error_message:
+                body = json.dumps({"error": "dynamodb_unavailable", "message": error_message}).encode("utf-8")
+                self._write(503, "application/json", body)
+                return
+            self._write(200, "application/json", json.dumps(payload, default=_json_default).encode("utf-8"))
+
+        def _build_processes_payload(self):
+            try:
+                table = table_factory()
+                return build_processes_payload(config, table, deployments), None
+            except DynamoDbReadError:
+                return None, CLIENT_SAFE_DYNAMODB_ERROR_MESSAGE
+            except Exception as exc:
+                log_event("ERROR", "table_factory_failed", message=sanitize_error(exc))
+                return None, CLIENT_SAFE_DYNAMODB_ERROR_MESSAGE
+
+        def _handle_api_processes(self):
+            payload, error_message = self._build_processes_payload()
             if error_message:
                 body = json.dumps({"error": "dynamodb_unavailable", "message": error_message}).encode("utf-8")
                 self._write(503, "application/json", body)
