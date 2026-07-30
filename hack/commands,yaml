@@ -1,130 +1,27 @@
-1. Confirm the deployed probe contains the latest Phase 4B2A code
-
-Run:
-
-kubectl exec \
-  -n goldengate-monitoring \
-  deployment/gg-monitor \
-  -- sh -c '
-    grep -nE \
-    "MAX_RESPONSE_BYTES|MAX_TOP_LEVEL_KEYS|MAX_RESPONSE_KEYS|MAX_KEY_LENGTH|collectionsTruncated|topLevelKeysTruncated|responseKeysTruncated" \
-    /app/tools/gg_api_contract_probe.py
-  '
-
-Expected to see all these names:
-
-MAX_RESPONSE_BYTES
-MAX_TOP_LEVEL_KEYS
-MAX_RESPONSE_KEYS
-MAX_KEY_LENGTH
-collectionsTruncated
-topLevelKeysTruncated
-responseKeysTruncated
-
-Also confirm the response read is bounded:
-
-kubectl exec \
-  -n goldengate-monitoring \
-  deployment/gg-monitor \
-  -- grep -n "read(MAX_RESPONSE_BYTES + 1)" \
-  /app/tools/gg_api_contract_probe.py
-2. Test the new collection summarizer inside the pod
-
-This uses only synthetic data and does not contact GoldenGate:
-
 kubectl exec -i \
   -n goldengate-monitoring \
   deployment/gg-monitor \
   -- python3 - <<'PY'
-import importlib.util
-import json
 from pathlib import Path
+import collector
 
-path = Path("/app/tools/gg_api_contract_probe.py")
-spec = importlib.util.spec_from_file_location("probe", path)
-probe = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(probe)
+probe = Path("/app/tools/gg_api_contract_probe.py").read_text(
+    encoding="utf-8"
+)
 
-payload = {
-    "response": {
-        "processes": [
-            {
-                "name": "SYNTHETIC_PROCESS_VALUE",
-                "lag": 10,
-                "details": {"hidden": "value"},
-            }
-        ],
-        "statusChange": [],
-    }
-}
+markers = [
+    "MAX_RESPONSE_BYTES",
+    "MAX_TOP_LEVEL_KEYS",
+    "MAX_RESPONSE_KEYS",
+    "MAX_KEY_LENGTH",
+    "collectionsTruncated",
+    "topLevelKeysTruncated",
+    "responseKeysTruncated",
+    "read(MAX_RESPONSE_BYTES + 1)",
+]
 
-result = probe.summarize_json(payload)
-print(json.dumps(result, indent=2, sort_keys=True))
+for marker in markers:
+    print(f"{marker}={marker in probe}")
+
+print(f"collector_logger={collector.logger.name}")
 PY
-
-Expected important section:
-
-"collections": {
-  "processes": {
-    "fieldTypes": {
-      "details": [
-        "object"
-      ],
-      "lag": [
-        "number"
-      ],
-      "name": [
-        "string"
-      ]
-    },
-    "itemCount": 1,
-    "itemFieldNames": [
-      "details",
-      "lag",
-      "name"
-    ],
-    "truncated": false
-  },
-  "statusChange": {
-    "fieldTypes": {},
-    "itemCount": 0,
-    "itemFieldNames": [],
-    "truncated": false
-  }
-},
-"collectionsTruncated": false
-
-The actual value:
-
-SYNTHETIC_PROCESS_VALUE
-
-must not appear.
-
-3. Recheck discovery logs using the actual pod
-POD=$(kubectl get pods \
-  -n goldengate-monitoring \
-  -o jsonpath='{.items[0].metadata.name}')
-
-echo "$POD"
-
-kubectl logs \
-  -n goldengate-monitoring \
-  "$POD" \
-  --since=30m |
-grep process_discovery_summary
-
-You should see entries for both:
-
-gg-oracle-payments-01
-gg-postgresql-payments-01
-
-with counts currently at zero.
-
-4. Confirm the running image again
-kubectl get deployment gg-monitor \
-  -n goldengate-monitoring \
-  -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
-
-You already showed:
-
-goldengate-monitor:mon-8480cda7f54f
