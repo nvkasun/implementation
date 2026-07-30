@@ -1,27 +1,123 @@
-kubectl exec -i \
+Next check — discovery logs
+
+Wait approximately one minute, then run:
+
+kubectl logs \
+  -n goldengate-monitoring \
+  deployment/gg-monitor \
+  --since=10m |
+grep process_discovery_summary
+
+Expected entries for both deployments:
+
+{
+  "event": "process_discovery_summary",
+  "deployment": "gg-oracle-payments-01",
+  "extractCount": 0,
+  "replicatCount": 0,
+  "distpathCount": 0,
+  "totalCount": 0
+}
+{
+  "event": "process_discovery_summary",
+  "deployment": "gg-postgresql-payments-01",
+  "extractCount": 0,
+  "replicatCount": 0,
+  "distpathCount": 0,
+  "totalCount": 0
+}
+
+Zero counts are currently correct because no GoldenGate processes have been created in the new runtimes.
+
+Run the four final secure probes
+Oracle PMS processes
+kubectl exec \
+  -n goldengate-monitoring \
+  deployment/gg-monitor \
+  -- python3 tools/gg_api_contract_probe.py \
+     --deployment gg-oracle-payments-01 \
+     --port admin \
+     --path /services/v2/mpoints/processes
+Oracle status changes
+kubectl exec \
+  -n goldengate-monitoring \
+  deployment/gg-monitor \
+  -- python3 tools/gg_api_contract_probe.py \
+     --deployment gg-oracle-payments-01 \
+     --port admin \
+     --path /services/v2/monitoring/statusChanges
+PostgreSQL PMS processes
+kubectl exec \
+  -n goldengate-monitoring \
+  deployment/gg-monitor \
+  -- python3 tools/gg_api_contract_probe.py \
+     --deployment gg-postgresql-payments-01 \
+     --port admin \
+     --path /services/v2/mpoints/processes
+PostgreSQL status changes
+kubectl exec \
+  -n goldengate-monitoring \
+  deployment/gg-monitor \
+  -- python3 tools/gg_api_contract_probe.py \
+     --deployment gg-postgresql-payments-01 \
+     --port admin \
+     --path /services/v2/monitoring/statusChanges
+
+The updated output should now contain:
+
+"collections": {
+  "processes": {
+    "itemCount": 0,
+    "itemFieldNames": [],
+    "fieldTypes": {},
+    "truncated": false
+  }
+},
+"collectionsTruncated": false,
+"topLevelKeysTruncated": false,
+"responseKeysTruncated": false
+
+For statusChanges, expect:
+
+"collections": {
+  "statusChange": {
+    "itemCount": 0,
+    "itemFieldNames": [],
+    "fieldTypes": {},
+    "truncated": false
+  }
+}
+Confirm normal monitoring is still healthy
+kubectl exec \
   -n goldengate-monitoring \
   deployment/gg-monitor \
   -- python3 - <<'PY'
-from pathlib import Path
-import collector
+import urllib.request
 
-probe = Path("/app/tools/gg_api_contract_probe.py").read_text(
-    encoding="utf-8"
-)
-
-markers = [
-    "MAX_RESPONSE_BYTES",
-    "MAX_TOP_LEVEL_KEYS",
-    "MAX_RESPONSE_KEYS",
-    "MAX_KEY_LENGTH",
-    "collectionsTruncated",
-    "topLevelKeysTruncated",
-    "responseKeysTruncated",
-    "read(MAX_RESPONSE_BYTES + 1)",
-]
-
-for marker in markers:
-    print(f"{marker}={marker in probe}")
-
-print(f"collector_logger={collector.logger.name}")
+for path in ("/healthz", "/readyz"):
+    with urllib.request.urlopen(
+        f"http://127.0.0.1:8080{path}",
+        timeout=5,
+    ) as response:
+        print(path, response.status, response.read().decode())
 PY
+
+Expected:
+
+/healthz 200 {"status":"ok", ...}
+/readyz 200 {"status":"ready"}
+
+Confirm CloudWatch remains disabled:
+
+kubectl get deployment gg-monitor \
+  -n goldengate-monitoring \
+  -o jsonpath='{range .spec.template.spec.containers[0].env[?(@.name=="CLOUDWATCH_PUBLISH_ENABLED")]}{.name}={.value}{"\n"}{end}'
+
+Expected:
+
+CLOUDWATCH_PUBLISH_ENABLED=false
+What happens after these checks
+
+Once the four probes show the new collections output, Phase 4B2A is fully validated.
+
+The next blocker is operational rather than another code change. The GoldenGate/DBA team must create a controlled test replication flow:
