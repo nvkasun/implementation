@@ -60,6 +60,11 @@ import config as cfgmod  # noqa: E402
 
 PROBE_TIMEOUT_SECONDS = 5
 
+# A response body larger than this is never parsed, sized, or echoed in any
+# form -- just a fixed, sanitized UNEXPECTED_RESPONSE. Not operator-tunable
+# (no CLI option raises or disables this).
+MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+
 ERROR_CATEGORIES = (
     "AUTH_FAILED", "TLS_FAILED", "NOT_FOUND", "ENDPOINT_UNAVAILABLE",
     "INVALID_JSON", "UNEXPECTED_RESPONSE", "UNKNOWN",
@@ -256,25 +261,50 @@ MAX_COLLECTION_KEYS = 20
 MAX_ITEMS_PER_COLLECTION = 50
 MAX_FIELD_NAMES_PER_COLLECTION = 100
 
+# Bounds on key-name OUTPUT (topLevelKeys/responseKeys arrays, and each
+# collection's own item field names). A key longer than MAX_KEY_LENGTH is
+# omitted entirely -- never emitted partial/truncated -- and the relevant
+# truncated flag is set.
+MAX_TOP_LEVEL_KEYS = 50
+MAX_RESPONSE_KEYS = 100
+MAX_KEY_LENGTH = 128
+
+
+def _bounded_sorted_keys(keys, max_count, max_key_length=MAX_KEY_LENGTH):
+    """Sorted, deterministic key list for direct output. A key longer than
+    max_key_length is dropped entirely (never emitted partial); the result
+    is then capped to max_count. Returns (keys, truncated) -- truncated is
+    True if anything was omitted for either reason."""
+    all_keys = sorted(str(k) for k in keys)
+    length_ok = [k for k in all_keys if len(k) <= max_key_length]
+    truncated = len(length_ok) < len(all_keys) or len(length_ok) > max_count
+    return length_ok[:max_count], truncated
+
 
 def _summarize_collection(items, max_items=MAX_ITEMS_PER_COLLECTION,
-                          max_field_names=MAX_FIELD_NAMES_PER_COLLECTION):
+                          max_field_names=MAX_FIELD_NAMES_PER_COLLECTION,
+                          max_key_length=MAX_KEY_LENGTH):
     """items is a confirmed list. Returns sanitized structural metadata only
     -- field NAMES and broad JSON TYPES, never a raw value. Non-dict members
     are skipped rather than raising. Nested objects/arrays are reported only
-    as "object"/"array" -- never recursed into."""
+    as "object"/"array" -- never recursed into. A field name longer than
+    max_key_length is omitted entirely (never emitted partial) and marks
+    this collection truncated; itemCount semantics are unaffected."""
     item_count = len(items)
     inspected = items[:max_items]
     field_types = {}
-    field_name_cap_hit = False
+    extra_truncation = False
     for item in inspected:
         if not isinstance(item, dict):
             continue
         for key, value in item.items():
             key = str(key)
+            if len(key) > max_key_length:
+                extra_truncation = True
+                continue
             if key not in field_types:
                 if len(field_types) >= max_field_names:
-                    field_name_cap_hit = True
+                    extra_truncation = True
                     continue
                 field_types[key] = set()
             field_types[key].add(_json_type_name(value))
@@ -282,13 +312,14 @@ def _summarize_collection(items, max_items=MAX_ITEMS_PER_COLLECTION,
         "itemCount": item_count,
         "itemFieldNames": sorted(field_types.keys()),
         "fieldTypes": {k: sorted(v) for k, v in field_types.items()},
-        "truncated": bool(item_count > len(inspected) or field_name_cap_hit),
+        "truncated": bool(item_count > len(inspected) or extra_truncation),
     }
 
 
 def summarize_json(payload, max_items=MAX_ITEMS_PER_COLLECTION,
                    max_collection_keys=MAX_COLLECTION_KEYS,
-                   max_field_names=MAX_FIELD_NAMES_PER_COLLECTION):
+                   max_field_names=MAX_FIELD_NAMES_PER_COLLECTION,
+                   max_key_length=MAX_KEY_LENGTH):
     """Sanitized structural metadata only -- collection field NAMES and
     broad JSON TYPES, never a raw value, process name, status value, ID,
     link, hostname, or nested raw payload. Returns None when payload is not
@@ -300,12 +331,22 @@ def summarize_json(payload, max_items=MAX_ITEMS_PER_COLLECTION,
     response fields are excluded. collectionsTruncated is True when there
     were more list-valued response fields than max_collection_keys (the
     excess collections are simply not inspected -- deterministically, by
-    sorted field name, so which are dropped is stable across runs)."""
+    sorted field name, so which are dropped is stable across runs).
+
+    topLevelKeys/responseKeys are each sorted, length- and count-bounded
+    (MAX_KEY_LENGTH/MAX_TOP_LEVEL_KEYS/MAX_RESPONSE_KEYS); the corresponding
+    *Truncated flag says so without ever emitting a partial key or any value
+    for an omitted key."""
     if not isinstance(payload, dict):
         return None
-    top_level_keys = sorted(str(k) for k in payload.keys())
+    top_level_keys, top_level_keys_truncated = _bounded_sorted_keys(
+        payload.keys(), MAX_TOP_LEVEL_KEYS, max_key_length=max_key_length)
     response = payload.get("response")
-    response_keys = sorted(str(k) for k in response.keys()) if isinstance(response, dict) else []
+    if isinstance(response, dict):
+        response_keys, response_keys_truncated = _bounded_sorted_keys(
+            response.keys(), MAX_RESPONSE_KEYS, max_key_length=max_key_length)
+    else:
+        response_keys, response_keys_truncated = [], False
 
     collections = {}
     collections_truncated = False
@@ -315,11 +356,14 @@ def summarize_json(payload, max_items=MAX_ITEMS_PER_COLLECTION,
             collections_truncated = True
         for key in list_valued_keys[:max_collection_keys]:
             collections[key] = _summarize_collection(
-                response[key], max_items=max_items, max_field_names=max_field_names)
+                response[key], max_items=max_items, max_field_names=max_field_names,
+                max_key_length=max_key_length)
 
     result = {
         "topLevelKeys": top_level_keys,
+        "topLevelKeysTruncated": top_level_keys_truncated,
         "responseKeys": response_keys,
+        "responseKeysTruncated": response_keys_truncated,
         "collections": collections,
         "collectionsTruncated": collections_truncated,
     }
@@ -375,11 +419,19 @@ def run_probe(deployment, port_type, path, timeout=PROBE_TIMEOUT_SECONDS):
         with opener.open(url, timeout=timeout) as resp:
             http_status = resp.status
             content_type = resp.headers.get("Content-Type")
-            raw_body = resp.read()
+            # Read at most one byte past the limit: if that many bytes come
+            # back, the true body is over the limit -- without reading it
+            # unboundedly first to find out.
+            raw_body = resp.read(MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as e:
         raise ProbeRequestError(_classify_request_error(e, e.code), http_status=e.code)
     except Exception as e:
         raise ProbeRequestError(_classify_request_error(e))
+
+    if len(raw_body) > MAX_RESPONSE_BYTES:
+        # Oversized: never parsed, never sized or echoed in the output --
+        # a fixed, sanitized closed category only.
+        raise ProbeRequestError("UNEXPECTED_RESPONSE", http_status=http_status)
 
     try:
         payload = json.loads(raw_body.decode("utf-8"))

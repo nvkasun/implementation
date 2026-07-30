@@ -648,6 +648,181 @@ class RunProbeTests(unittest.TestCase):
         self.assertNotIn("SECRET_INTERNAL_DETAIL_should_not_leak", str(ctx.exception))
 
 
+class ResponseSizeLimitTests(unittest.TestCase):
+    """The response body must be read bounded (MAX_RESPONSE_BYTES + 1, never
+    unbounded), and an oversized body must never be parsed, sized, or
+    echoed -- only a fixed, sanitized UNEXPECTED_RESPONSE."""
+
+    def _deployment_with_creds(self, tmp):
+        user_file = os.path.join(tmp, "user")
+        pwd_file = os.path.join(tmp, "pwd")
+        with open(user_file, "w") as f:
+            f.write(SYNTHETIC_USER)
+        with open(pwd_file, "w") as f:
+            f.write(SYNTHETIC_PASSWORD)
+        return user_file, pwd_file
+
+    def _run_with_body(self, body_bytes):
+        d = _deployment()
+        fake_resp = MagicMock()
+        fake_resp.status = 200
+        fake_resp.headers = {"Content-Type": "application/json"}
+        # Mirrors the real http.client behaviour that resp.read(n) returns
+        # at most n bytes -- exercises the exact bounded-read contract.
+        fake_resp.read.side_effect = lambda n=None: body_bytes[:n] if n is not None else body_bytes
+        fake_resp.__enter__.return_value = fake_resp
+        fake_resp.__exit__.return_value = False
+        fake_opener = MagicMock()
+        fake_opener.open.return_value = fake_resp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            user_file, pwd_file = self._deployment_with_creds(tmp)
+            with mock.patch.object(cfgmod, "credential_paths", return_value=(user_file, pwd_file)), \
+                 mock.patch.object(core, "_build_ssl_context", return_value=MagicMock()), \
+                 mock.patch.object(core, "_basic_opener", return_value=fake_opener):
+                return probe.run_probe(d, "admin", "/services/v2/mpoints/processes"), fake_resp
+
+    def test_read_called_with_max_response_bytes_plus_one(self):
+        body = json.dumps({"response": {"processes": []}}).encode()
+        _, fake_resp = self._run_with_body(body)
+        fake_resp.read.assert_called_once_with(probe.MAX_RESPONSE_BYTES + 1)
+
+    def test_body_exactly_at_limit_is_accepted(self):
+        # Pad a valid JSON document with whitespace so its exact byte length
+        # equals MAX_RESPONSE_BYTES while still parsing successfully.
+        base = {"response": {"processes": []}}
+        core_bytes = json.dumps(base).encode()
+        pad = b" " * (probe.MAX_RESPONSE_BYTES - len(core_bytes))
+        body = pad + core_bytes
+        self.assertEqual(len(body), probe.MAX_RESPONSE_BYTES)
+        result, _ = self._run_with_body(body)
+        self.assertIn("collections", result)
+
+    def test_body_above_limit_returns_unexpected_response(self):
+        oversized = b" " * (probe.MAX_RESPONSE_BYTES + 1)
+        with self.assertRaises(probe.ProbeRequestError) as ctx:
+            self._run_with_body(oversized)
+        self.assertEqual(ctx.exception.category, "UNEXPECTED_RESPONSE")
+
+    def test_no_response_body_fragment_in_error_output(self):
+        marker = b"SECRET_OVERSIZED_BODY_MARKER_xyz"
+        oversized = marker + b" " * probe.MAX_RESPONSE_BYTES
+        with self.assertRaises(probe.ProbeRequestError) as ctx:
+            self._run_with_body(oversized)
+        self.assertNotIn("SECRET_OVERSIZED_BODY_MARKER_xyz", str(ctx.exception))
+        self.assertNotIn(str(len(oversized)), str(ctx.exception))
+
+    def test_probe_still_performs_exactly_one_get(self):
+        body = json.dumps({"response": {"processes": []}}).encode()
+        d = _deployment()
+        fake_resp = MagicMock()
+        fake_resp.status = 200
+        fake_resp.headers = {"Content-Type": "application/json"}
+        fake_resp.read.return_value = body
+        fake_resp.__enter__.return_value = fake_resp
+        fake_resp.__exit__.return_value = False
+        fake_opener = MagicMock()
+        fake_opener.open.return_value = fake_resp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            user_file, pwd_file = self._deployment_with_creds(tmp)
+            with mock.patch.object(cfgmod, "credential_paths", return_value=(user_file, pwd_file)), \
+                 mock.patch.object(core, "_build_ssl_context", return_value=MagicMock()), \
+                 mock.patch.object(core, "_basic_opener", return_value=fake_opener):
+                probe.run_probe(d, "admin", "/services/v2/mpoints/processes")
+        self.assertEqual(fake_opener.open.call_count, 1)
+
+    def test_oversized_response_makes_no_dynamodb_or_cloudwatch_call(self):
+        with mock.patch("boto3.resource") as mock_resource, mock.patch("boto3.client") as mock_client:
+            oversized = b" " * (probe.MAX_RESPONSE_BYTES + 1)
+            with self.assertRaises(probe.ProbeRequestError):
+                self._run_with_body(oversized)
+            mock_resource.assert_not_called()
+            mock_client.assert_not_called()
+
+
+class KeyOutputBoundingTests(unittest.TestCase):
+    """topLevelKeys/responseKeys/collection field names are sorted,
+    length-bounded, and count-bounded -- an omitted key is never emitted
+    partial, and the *Truncated flags say when something was dropped."""
+
+    def test_excess_top_level_keys_capped_and_flagged(self):
+        payload = {f"k{i:04d}": i for i in range(probe.MAX_TOP_LEVEL_KEYS + 20)}
+        payload["response"] = {"processes": []}
+        summary = probe.summarize_json(payload)
+        self.assertEqual(len(summary["topLevelKeys"]), probe.MAX_TOP_LEVEL_KEYS)
+        self.assertTrue(summary["topLevelKeysTruncated"])
+        self.assertEqual(summary["topLevelKeys"], sorted(summary["topLevelKeys"]))
+
+    def test_excess_response_keys_capped_and_flagged(self):
+        payload = {"response": {f"k{i:04d}": i for i in range(probe.MAX_RESPONSE_KEYS + 20)}}
+        summary = probe.summarize_json(payload)
+        self.assertEqual(len(summary["responseKeys"]), probe.MAX_RESPONSE_KEYS)
+        self.assertTrue(summary["responseKeysTruncated"])
+
+    def test_no_truncation_flags_within_limits(self):
+        payload = {"a": 1, "response": {"processes": []}}
+        summary = probe.summarize_json(payload)
+        self.assertFalse(summary["topLevelKeysTruncated"])
+        self.assertFalse(summary["responseKeysTruncated"])
+
+    def test_overlong_top_level_key_omitted(self):
+        overlong = "x" * (probe.MAX_KEY_LENGTH + 1)
+        payload = {overlong: 1, "short": 2, "response": {"processes": []}}
+        summary = probe.summarize_json(payload)
+        self.assertNotIn(overlong, summary["topLevelKeys"])
+        self.assertIn("short", summary["topLevelKeys"])
+        self.assertTrue(summary["topLevelKeysTruncated"])
+        for k in summary["topLevelKeys"]:
+            self.assertLessEqual(len(k), probe.MAX_KEY_LENGTH)
+
+    def test_overlong_response_key_omitted(self):
+        overlong = "y" * (probe.MAX_KEY_LENGTH + 1)
+        payload = {"response": {overlong: 1, "short": 2}}
+        summary = probe.summarize_json(payload)
+        self.assertNotIn(overlong, summary["responseKeys"])
+        self.assertIn("short", summary["responseKeys"])
+        self.assertTrue(summary["responseKeysTruncated"])
+
+    def test_overlong_collection_field_name_omitted_and_truncated(self):
+        overlong = "z" * (probe.MAX_KEY_LENGTH + 1)
+        payload = {"response": {"processes": [{overlong: "val", "ok": 1}]}}
+        summary = probe.summarize_json(payload)
+        coll = summary["collections"]["processes"]
+        self.assertNotIn(overlong, coll["itemFieldNames"])
+        self.assertIn("ok", coll["itemFieldNames"])
+        self.assertTrue(coll["truncated"])
+        self.assertEqual(coll["itemCount"], 1)  # itemCount semantics unaffected
+
+    def test_no_partial_overlong_key_ever_emitted(self):
+        overlong = "SECRET_PREFIX_" + ("q" * probe.MAX_KEY_LENGTH)
+        payload = {"response": {"processes": [{overlong: "val"}]}}
+        blob = json.dumps(probe.summarize_json(payload))
+        self.assertNotIn("SECRET_PREFIX_", blob)  # not even a truncated prefix
+
+    def test_key_length_boundary_exactly_at_limit_is_kept(self):
+        exact = "w" * probe.MAX_KEY_LENGTH
+        payload = {exact: 1, "response": {"processes": []}}
+        summary = probe.summarize_json(payload)
+        self.assertIn(exact, summary["topLevelKeys"])
+        self.assertFalse(summary["topLevelKeysTruncated"])
+
+    def test_processes_status_change_items_behaviour_unchanged_alongside_new_bounds(self):
+        payload = {"response": {
+            "processes": [{"processName": "EXT1", "status": "RUNNING"}],
+            "statusChange": [{"id": 1, "change": "started"}],
+            "items": [{"name": "LEGACY1"}],
+        }}
+        summary = probe.summarize_json(payload)
+        self.assertEqual(summary["collections"]["processes"]["itemCount"], 1)
+        self.assertEqual(summary["collections"]["statusChange"]["itemCount"], 1)
+        self.assertEqual(summary["collections"]["items"]["itemCount"], 1)
+        self.assertEqual(summary["itemCount"], 1)  # legacy top-level mirror still from items
+        self.assertEqual(summary["itemFieldNames"], ["name"])
+        self.assertFalse(summary["topLevelKeysTruncated"])
+        self.assertFalse(summary["responseKeysTruncated"])
+
+
 class MetricsPortSecurityTests(unittest.TestCase):
     """Direct metricsPort 9015 is confirmed plain HTTP in the live
     environment: the probe must never read credential files, build a

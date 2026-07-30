@@ -127,6 +127,16 @@ items per collection, max field names per collection); `truncated` /
 is additionally mirrored into the legacy top-level `itemCount`/
 `itemFieldNames`/`fieldTypes` fields for backward compatibility only.
 
+**Bounded input, not operator-tunable:** the response body is read up to
+`MAX_RESPONSE_BYTES` (2 MiB) -- a larger body is never parsed, sized, or
+echoed, just a fixed `UNEXPECTED_RESPONSE`. `topLevelKeys`/`responseKeys`
+and every collection's field names are sorted, capped in count
+(`MAX_TOP_LEVEL_KEYS`/`MAX_RESPONSE_KEYS`/`MAX_FIELD_NAMES_PER_COLLECTION`),
+and any single key longer than `MAX_KEY_LENGTH` (128) is omitted entirely
+(never emitted partial); `topLevelKeysTruncated`/`responseKeysTruncated`/
+each collection's own `truncated` flag say so. No CLI option raises or
+disables any of these limits.
+
 ## Canonical configuration
 
 Single source: `envs/dev/goldengate-deployments.yaml`, mounted into the pod
