@@ -39,6 +39,26 @@ recommended example. The path remains generically accepted, like any other
 confirming it still 404s); its response is never used to inform STATE# or
 CloudWatch logic anywhere in this application, and no speculative PMS
 parser exists for it.
+
+--follow-processes: manual, structural-only per-process detail capture.
+Also invoked manually only, also never run during normal monitor startup,
+also never exposed through the portal. GETs the confirmed process
+inventory (/services/v2/mpoints/processes) once, then issues up to
+MAX_FOLLOWED_PROCESSES (20) SEQUENTIAL, bounded detail GETs -- one per
+process, always over authenticated HTTPS adminPort 8443 (--port admin is
+required; direct metricsPort 9015 is never used for this mode, since it is
+not an approved authenticated path). --detail selects a FIXED endpoint
+suffix only (process, processPerformance, threadPerformance, serviceHealth,
+heartbeat) -- never an arbitrary operator-supplied suffix. It never outputs
+a process name, process ID, or constructed detail URL -- only counts, HTTP
+status counts, closed error-category counts, and a merged structural schema
+(field names / broad JSON types / truncation flags). It does not write any
+monitoring state (no DynamoDB write), does not publish CloudWatch, and does
+not implement production PMS polling/parsing. Example:
+
+    python3 tools/gg_api_contract_probe.py \\
+        --deployment gg-oracle-payments-01 --port admin \\
+        --follow-processes --detail processPerformance
 """
 from __future__ import annotations
 
@@ -380,11 +400,13 @@ def summarize_json(payload, max_items=MAX_ITEMS_PER_COLLECTION,
     return result
 
 
-def run_probe(deployment, port_type, path, timeout=PROBE_TIMEOUT_SECONDS):
-    """Performs exactly one read-only GET. Returns a sanitized result dict on
-    success. Raises ProbeRequestError (with a closed category) on failure.
-    Never returns or logs a raw response body, raw exception text, header
-    value, or URL.
+def _fetch_json(deployment, port_type, path, timeout=PROBE_TIMEOUT_SECONDS):
+    """Performs exactly one read-only GET for path. Returns
+    (http_status, content_type, payload) on success. Raises
+    ProbeRequestError (a closed category) on any failure -- oversized body,
+    HTTP error, network/TLS error, or invalid JSON. Never returns or logs a
+    raw response body, raw exception text, header value, or URL. Shared by
+    both the explicit-path probe mode (run_probe) and --follow-processes.
 
     port_type="admin": HTTPS through adminPort 8443, authenticated with the
     same CSI-mounted credentials/CA chain/TLS-SNI the collector uses -- the
@@ -438,18 +460,229 @@ def run_probe(deployment, port_type, path, timeout=PROBE_TIMEOUT_SECONDS):
     except (ValueError, UnicodeDecodeError):
         raise ProbeRequestError("INVALID_JSON", http_status=http_status)
 
+    return http_status, content_type, payload
+
+
+def run_probe(deployment, port_type, path, timeout=PROBE_TIMEOUT_SECONDS):
+    """Performs exactly one read-only GET. Returns a sanitized result dict on
+    success. Raises ProbeRequestError (with a closed category) on failure.
+    Never returns or logs a raw response body, raw exception text, header
+    value, or URL."""
+    http_status, content_type, payload = _fetch_json(deployment, port_type, path, timeout=timeout)
+
     summary = summarize_json(payload)
     if summary is None:
         raise ProbeRequestError("UNEXPECTED_RESPONSE", http_status=http_status)
 
     return {
-        "deploymentName": pipeline,
+        "deploymentName": deployment["name"],
         "deploymentType": deployment["type"],
         "portType": port_type,
         "path": path,
         "httpStatus": http_status,
         "contentType": content_type,
         **summary,
+    }
+
+
+# --follow-processes: fixed detail-endpoint allowlist -- never an arbitrary
+# operator-supplied suffix.
+DETAIL_ENDPOINTS = ("process", "processPerformance", "threadPerformance", "serviceHealth", "heartbeat")
+
+# Never operator-tunable (no CLI option raises or disables this).
+MAX_FOLLOWED_PROCESSES = 20
+
+INVENTORY_PATH = "/services/v2/mpoints/processes"
+
+
+def _valid_inventory_process_names(payload):
+    """Returns (names, inventory_item_count): processName strings pulled
+    from response.processes -- never processId, never any other field.
+    Non-dict items and items with no valid (non-empty string) processName
+    are skipped. inventory_item_count is the TRUE response.processes list
+    length, unaffected by how many entries were valid."""
+    if not isinstance(payload, dict):
+        return [], 0
+    response = payload.get("response")
+    if not isinstance(response, dict):
+        return [], 0
+    processes = response.get("processes")
+    if not isinstance(processes, list):
+        return [], 0
+    names = []
+    for item in processes:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("processName")
+        if isinstance(name, str) and name:
+            names.append(name)
+    return names, len(processes)
+
+
+def _process_detail_path(name, detail):
+    """Encodes name as exactly one URL path segment and builds the fixed
+    detail path. urllib.parse.quote(name, safe="") turns any literal '/'
+    or '\\' in name into a percent-encoded byte -- it can never introduce a
+    new path segment -- but by design (RFC 3986 unreserved characters) it
+    leaves '.' and '..' themselves unescaped, so those two exact values are
+    rejected outright rather than ever being sent as a traversal-equivalent
+    segment. (validate_path's own percent-slash rejection is deliberately
+    NOT reused here: it exists to stop an operator smuggling extra segments
+    via --path, which is the opposite of this single, already-opaque,
+    intentionally-encoded segment.)"""
+    if name in (".", ".."):
+        raise ProbeValidationError("process name is unsafe to use as a path segment")
+    if _has_control_chars(name):
+        raise ProbeValidationError("process name contains control characters")
+    encoded = urllib.parse.quote(name, safe="")
+    return f"/services/v2/mpoints/{encoded}/{detail}"
+
+
+def _merge_detail_schema(payload, agg):
+    """Merges one successful detail response's structural schema into the
+    running aggregate (agg). payload is discarded by the caller immediately
+    after this call returns -- no response body is retained past schema
+    merging."""
+    top_keys, top_trunc = _bounded_sorted_keys(payload.keys(), MAX_TOP_LEVEL_KEYS)
+    agg["topLevelKeys"].update(top_keys)
+    if top_trunc:
+        agg["truncated"] = True
+
+    response_obj = payload.get("response")
+    if isinstance(response_obj, dict):
+        own = _summarize_collection([response_obj])
+        agg["fieldNames"].update(own["itemFieldNames"])
+        for fname, ftypes in own["fieldTypes"].items():
+            agg["fieldTypes"].setdefault(fname, set()).update(ftypes)
+        if own["truncated"]:
+            agg["truncated"] = True
+
+    summary = summarize_json(payload)
+    if summary is not None:
+        if summary.get("responseKeysTruncated") or summary.get("collectionsTruncated"):
+            agg["truncated"] = True
+        for cname, cdata in summary["collections"].items():
+            bucket = agg["collections"].setdefault(
+                cname, {"fieldNames": set(), "fieldTypes": {}, "truncated": False})
+            bucket["fieldNames"].update(cdata["itemFieldNames"])
+            for fname, ftypes in cdata["fieldTypes"].items():
+                bucket["fieldTypes"].setdefault(fname, set()).update(ftypes)
+            if cdata["truncated"]:
+                bucket["truncated"] = True
+
+
+def _finalize_schema(agg):
+    """Bounds the merged aggregate one final time (merging many responses
+    could otherwise still exceed the per-response limits) and renders it
+    into the sanitized output shape."""
+    top_keys = sorted(agg["topLevelKeys"])
+    if len(top_keys) > MAX_TOP_LEVEL_KEYS:
+        agg["truncated"] = True
+        top_keys = top_keys[:MAX_TOP_LEVEL_KEYS]
+
+    field_names = sorted(agg["fieldNames"])
+    if len(field_names) > MAX_FIELD_NAMES_PER_COLLECTION:
+        agg["truncated"] = True
+        field_names = field_names[:MAX_FIELD_NAMES_PER_COLLECTION]
+    kept = set(field_names)
+    field_types = {k: sorted(v) for k, v in agg["fieldTypes"].items() if k in kept}
+
+    collection_names = sorted(agg["collections"].keys())
+    if len(collection_names) > MAX_COLLECTION_KEYS:
+        agg["truncated"] = True
+        collection_names = collection_names[:MAX_COLLECTION_KEYS]
+    collections_out = {}
+    for name in collection_names:
+        data = agg["collections"][name]
+        collections_out[name] = {
+            "fieldNames": sorted(data["fieldNames"]),
+            "fieldTypes": {k: sorted(v) for k, v in data["fieldTypes"].items()},
+            "truncated": data["truncated"],
+        }
+
+    return {
+        "topLevelKeys": top_keys,
+        "collections": collections_out,
+        "fieldNames": field_names,
+        "fieldTypes": field_types,
+        "truncated": agg["truncated"],
+    }
+
+
+def follow_processes(deployment, detail, timeout=PROBE_TIMEOUT_SECONDS,
+                     max_followed=MAX_FOLLOWED_PROCESSES):
+    """--follow-processes mode: GETs the confirmed process inventory
+    (/services/v2/mpoints/processes, authenticated HTTPS adminPort 8443),
+    then issues up to max_followed SEQUENTIAL, bounded detail GETs -- one
+    per valid processName (never falling back to processId) -- merging
+    their structural schemas. One failed detail request never stops the
+    remaining ones. Never outputs a process name, process ID, or
+    constructed URL anywhere in the return value -- only counts, HTTP
+    status counts, closed error-category counts, and merged structural
+    schema (field names / broad JSON types / truncation flags).
+
+    Raises ProbeValidationError if detail is not in DETAIL_ENDPOINTS, or if
+    no valid process inventory item exists. Raises ProbeRequestError if the
+    inventory request itself fails. Otherwise always returns a result dict
+    -- even if every individual detail request failed -- so the operator
+    still sees the aggregate error-category counts; the caller (main)
+    decides the process exit code from successCount."""
+    if detail not in DETAIL_ENDPOINTS:
+        raise ProbeValidationError(f"unsupported --detail value: {detail!r}")
+
+    _inv_status, _inv_ct, inventory_payload = _fetch_json(deployment, "admin", INVENTORY_PATH, timeout=timeout)
+    names, inventory_item_count = _valid_inventory_process_names(inventory_payload)
+    attempted_names = names[:max_followed]
+    if not attempted_names:
+        raise ProbeValidationError("no valid process inventory items found")
+
+    http_status_counts = {}
+    error_category_counts = {}
+    success_count = 0
+    agg = {"topLevelKeys": set(), "fieldNames": set(), "fieldTypes": {}, "collections": {}, "truncated": False}
+
+    for name in attempted_names:
+        try:
+            detail_path = _process_detail_path(name, detail)
+        except ProbeValidationError:
+            error_category_counts["UNKNOWN"] = error_category_counts.get("UNKNOWN", 0) + 1
+            continue
+
+        try:
+            status, _ct, payload = _fetch_json(deployment, "admin", detail_path, timeout=timeout)
+        except ProbeRequestError as e:
+            category = e.category if e.category in ERROR_CATEGORIES else "UNKNOWN"
+            error_category_counts[category] = error_category_counts.get(category, 0) + 1
+            if e.http_status is not None:
+                key = str(e.http_status)
+                http_status_counts[key] = http_status_counts.get(key, 0) + 1
+            continue
+
+        http_status_counts[str(status)] = http_status_counts.get(str(status), 0) + 1
+        if not isinstance(payload, dict):
+            error_category_counts["UNEXPECTED_RESPONSE"] = error_category_counts.get("UNEXPECTED_RESPONSE", 0) + 1
+            continue
+
+        _merge_detail_schema(payload, agg)
+        success_count += 1
+        # payload/detail_path fall out of scope here -- never retained.
+
+    attempted_count = len(attempted_names)
+    failure_count = attempted_count - success_count
+
+    return {
+        "deploymentName": deployment["name"],
+        "deploymentType": deployment["type"],
+        "portType": "admin",
+        "sourcePath": INVENTORY_PATH,
+        "detail": detail,
+        "inventoryItemCount": inventory_item_count,
+        "attemptedCount": attempted_count,
+        "successCount": success_count,
+        "failureCount": failure_count,
+        "httpStatusCounts": http_status_counts,
+        "errorCategoryCounts": error_category_counts,
+        "schema": _finalize_schema(agg),
     }
 
 
@@ -463,8 +696,52 @@ def main(argv=None):
                              "/services/v2/monitoring/statusChanges). "
                              "metrics: plain HTTP, unauthenticated only (port 9015 is not "
                              "an approved authenticated path)")
-    parser.add_argument("--path", required=True, help="explicit /services/... path")
+    parser.add_argument("--path", help="explicit /services/... path (not used with --follow-processes)")
+    parser.add_argument("--follow-processes", action="store_true", dest="follow_processes",
+                        help="manual, structural-only mode: GET the confirmed process inventory "
+                             "(/services/v2/mpoints/processes) then capture per-process --detail "
+                             "structure over up to %d sequential, bounded GETs. Never outputs "
+                             "process names, IDs, or constructed URLs. Requires --port admin." % (
+                                 MAX_FOLLOWED_PROCESSES))
+    parser.add_argument("--detail", choices=DETAIL_ENDPOINTS,
+                        help="required with --follow-processes: fixed detail endpoint to capture")
     args = parser.parse_args(argv)
+
+    if args.follow_processes:
+        if args.path:
+            print(json.dumps({"error": "INVALID_ARGUMENT",
+                              "reason": "--path is not used with --follow-processes"}), file=sys.stderr)
+            return 2
+        if not args.detail:
+            print(json.dumps({"error": "INVALID_ARGUMENT",
+                              "reason": "--detail is required with --follow-processes"}), file=sys.stderr)
+            return 2
+        if args.port != "admin":
+            print(json.dumps({"error": "INVALID_ARGUMENT",
+                              "reason": "--follow-processes requires --port admin"}), file=sys.stderr)
+            return 2
+        try:
+            deployment = resolve_deployment(args.deployment)
+            result = follow_processes(deployment, args.detail)
+        except ProbeValidationError as e:
+            print(json.dumps({"error": "INVALID_ARGUMENT", "reason": str(e)}), file=sys.stderr)
+            return 2
+        except ProbeRequestError as e:
+            print(json.dumps({
+                "deploymentName": args.deployment,
+                "portType": "admin",
+                "sourcePath": INVENTORY_PATH,
+                "detail": args.detail,
+                "httpStatus": e.http_status,
+                "error": e.category,
+            }))
+            return 1
+        print(json.dumps(result, indent=2))
+        return 0 if result["successCount"] > 0 else 1
+
+    if not args.path:
+        print(json.dumps({"error": "INVALID_ARGUMENT", "reason": "--path is required"}), file=sys.stderr)
+        return 2
 
     try:
         path = validate_path(args.path)

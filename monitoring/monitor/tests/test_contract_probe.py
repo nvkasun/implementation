@@ -929,6 +929,355 @@ class NoSideEffectTests(unittest.TestCase):
         self.assertNotIn("method='POST'", src)
 
 
+class FollowProcessesTests(unittest.TestCase):
+    """--follow-processes: inventory GET + up to MAX_FOLLOWED_PROCESSES
+    sequential, bounded per-process detail GETs, merging structural schema.
+    Never outputs a process name, process ID, or constructed URL. Synthetic
+    data only."""
+
+    SYNTHETIC_NAMES = ("SYNTHETIC_EXTRACT_01", "SYNTHETIC_REPLICAT_01")
+
+    def _inventory(self, names=SYNTHETIC_NAMES, extra_items=()):
+        processes = [{"processName": n, "processId": i + 1000} for i, n in enumerate(names)]
+        processes.extend(extra_items)
+        return {"response": {"processes": processes}}
+
+    def _stub_fetch(self, inventory_payload, detail_payload=None, detail_side_effect=None,
+                    detail_status=200):
+        calls = []
+
+        def _stub(dep, port_type, path, timeout=5):
+            calls.append((port_type, path))
+            if path == probe.INVENTORY_PATH:
+                return 200, "application/json", inventory_payload
+            if detail_side_effect is not None:
+                outcome = detail_side_effect(path)
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return outcome
+            return detail_status, "application/json", detail_payload
+        return _stub, calls
+
+    def test_inventory_then_process_detail_requests(self):
+        stub, calls = self._stub_fetch(self._inventory(), {"response": {"a": 1}})
+        d = _deployment()
+        with mock.patch.object(probe, "_fetch_json", side_effect=stub):
+            result = probe.follow_processes(d, "process")
+        self.assertEqual(result["attemptedCount"], 2)
+        self.assertEqual(result["successCount"], 2)
+        self.assertEqual(calls[0], ("admin", probe.INVENTORY_PATH))
+        self.assertTrue(all(c[1].endswith("/process") for c in calls[1:]))
+
+    def test_each_detail_value_builds_correct_suffix(self):
+        for detail in probe.DETAIL_ENDPOINTS:
+            stub, calls = self._stub_fetch(self._inventory(names=("P1",)), {"response": {"a": 1}})
+            d = _deployment()
+            with mock.patch.object(probe, "_fetch_json", side_effect=stub):
+                result = probe.follow_processes(d, detail)
+            self.assertEqual(result["detail"], detail)
+            self.assertEqual(result["successCount"], 1)
+            self.assertTrue(calls[1][1].endswith(f"/{detail}"))
+
+    def test_fixed_detail_allowlist_enforced(self):
+        self.assertEqual(
+            set(probe.DETAIL_ENDPOINTS),
+            {"process", "processPerformance", "threadPerformance", "serviceHealth", "heartbeat"})
+
+    def test_invalid_detail_rejected(self):
+        d = _deployment()
+        with self.assertRaises(probe.ProbeValidationError):
+            probe.follow_processes(d, "notARealDetail")
+
+    def test_invalid_detail_rejected_before_any_request(self):
+        d = _deployment()
+        with mock.patch.object(probe, "_fetch_json") as mock_fetch:
+            with self.assertRaises(probe.ProbeValidationError):
+                probe.follow_processes(d, "arbitrarySuffix")
+        mock_fetch.assert_not_called()
+
+    def test_process_name_url_encoded_as_one_segment(self):
+        name = "PROC/WITH/SLASHES"
+        stub, calls = self._stub_fetch(self._inventory(names=(name,)), {"response": {"a": 1}})
+        d = _deployment()
+        with mock.patch.object(probe, "_fetch_json", side_effect=stub):
+            probe.follow_processes(d, "process")
+        detail_call_path = calls[1][1]
+        # exactly 5 segments: '', services, v2, mpoints, <encoded>, process --
+        # i.e. the encoded name is ONE segment, never introducing a new '/'.
+        segments = detail_call_path.split("/")
+        self.assertEqual(len(segments), 6)
+        self.assertNotIn("PROC/WITH/SLASHES", detail_call_path)
+
+    def test_traversal_process_name_rejected_not_followed(self):
+        stub, calls = self._stub_fetch(self._inventory(names=("..", "SAFE_NAME")), {"response": {"a": 1}})
+        d = _deployment()
+        with mock.patch.object(probe, "_fetch_json", side_effect=stub):
+            result = probe.follow_processes(d, "process")
+        self.assertEqual(result["attemptedCount"], 2)
+        self.assertEqual(result["successCount"], 1)
+        self.assertEqual(result["errorCategoryCounts"].get("UNKNOWN"), 1)
+        # only one real detail GET was ever issued (for the safe name)
+        detail_calls = [c for c in calls if c[1] != probe.INVENTORY_PATH]
+        self.assertEqual(len(detail_calls), 1)
+
+    def test_process_name_never_printed(self):
+        secret_name = "SUPER_SECRET_PROCESS_NAME_XYZ"
+        stub, _ = self._stub_fetch(self._inventory(names=(secret_name,)), {"response": {"a": 1}})
+        d = _deployment()
+        with mock.patch.object(probe, "_fetch_json", side_effect=stub):
+            result = probe.follow_processes(d, "process")
+        self.assertNotIn(secret_name, json.dumps(result))
+
+    def test_process_id_never_printed(self):
+        stub, _ = self._stub_fetch(self._inventory(), {"response": {"a": 1}})
+        d = _deployment()
+        with mock.patch.object(probe, "_fetch_json", side_effect=stub):
+            result = probe.follow_processes(d, "process")
+        blob = json.dumps(result)
+        self.assertNotIn("1000", blob)
+        self.assertNotIn("1001", blob)
+        self.assertNotIn("processId", blob)
+
+    def test_constructed_url_never_printed(self):
+        stub, _ = self._stub_fetch(self._inventory(), {"response": {"a": 1}})
+        d = _deployment()
+        with mock.patch.object(probe, "_fetch_json", side_effect=stub):
+            result = probe.follow_processes(d, "process")
+        blob = json.dumps(result)
+        self.assertNotIn("/services/v2/mpoints/SYNTHETIC", blob)
+        self.assertNotIn(d["adminHost"], blob)
+
+    def test_maximum_20_followed_items(self):
+        many_names = tuple(f"PROC{i}" for i in range(30))
+        stub, calls = self._stub_fetch(self._inventory(names=many_names), {"response": {"a": 1}})
+        d = _deployment()
+        with mock.patch.object(probe, "_fetch_json", side_effect=stub):
+            result = probe.follow_processes(d, "process")
+        self.assertEqual(result["inventoryItemCount"], 30)
+        self.assertEqual(result["attemptedCount"], 20)
+        detail_calls = [c for c in calls if c[1] != probe.INVENTORY_PATH]
+        self.assertEqual(len(detail_calls), 20)
+
+    def test_malformed_inventory_items_skipped(self):
+        extra = [None, "garbage", 42, [1, 2], {"noProcessNameHere": True}]
+        stub, _ = self._stub_fetch(self._inventory(names=("OK1",), extra_items=extra),
+                                   {"response": {"a": 1}})
+        d = _deployment()
+        with mock.patch.object(probe, "_fetch_json", side_effect=stub):
+            result = probe.follow_processes(d, "process")
+        self.assertEqual(result["inventoryItemCount"], 1 + len(extra))
+        self.assertEqual(result["attemptedCount"], 1)
+
+    def test_missing_process_name_skipped_never_falls_back_to_process_id(self):
+        extra = [{"processId": 9999, "processType": "extract"}]  # no processName at all
+        stub, calls = self._stub_fetch(self._inventory(names=(), extra_items=extra),
+                                       {"response": {"a": 1}})
+        d = _deployment()
+        with mock.patch.object(probe, "_fetch_json", side_effect=stub):
+            with self.assertRaises(probe.ProbeValidationError):
+                probe.follow_processes(d, "process")
+        detail_calls = [c for c in calls if c[1] != probe.INVENTORY_PATH]
+        self.assertEqual(detail_calls, [])
+
+    def test_one_failed_detail_does_not_stop_remaining(self):
+        names = ("P1", "P2", "P3")
+
+        def side_effect(path):
+            if path.endswith("/P2/process") or "P2" in path:
+                return ProbeRequestErrorFactory("ENDPOINT_UNAVAILABLE")
+            return (200, "application/json", {"response": {"a": 1}})
+
+        stub, calls = self._stub_fetch(self._inventory(names=names), detail_side_effect=side_effect)
+        d = _deployment()
+        with mock.patch.object(probe, "_fetch_json", side_effect=stub):
+            result = probe.follow_processes(d, "process")
+        self.assertEqual(result["attemptedCount"], 3)
+        self.assertEqual(result["successCount"], 2)
+        self.assertEqual(result["failureCount"], 1)
+        self.assertEqual(result["errorCategoryCounts"].get("ENDPOINT_UNAVAILABLE"), 1)
+
+    def test_aggregate_http_status_counts(self):
+        names = ("P1", "P2")
+
+        def side_effect(path):
+            if "P1" in path:
+                return (200, "application/json", {"response": {"a": 1}})
+            return ProbeRequestErrorFactory("NOT_FOUND", http_status=404)
+
+        stub, _ = self._stub_fetch(self._inventory(names=names), detail_side_effect=side_effect)
+        d = _deployment()
+        with mock.patch.object(probe, "_fetch_json", side_effect=stub):
+            result = probe.follow_processes(d, "process")
+        self.assertEqual(result["httpStatusCounts"], {"200": 1, "404": 1})
+
+    def test_aggregate_closed_error_category_counts_only(self):
+        names = ("P1", "P2", "P3")
+
+        def side_effect(path):
+            if "P1" in path:
+                return ProbeRequestErrorFactory("AUTH_FAILED", http_status=401)
+            if "P2" in path:
+                return ProbeRequestErrorFactory("TLS_FAILED")
+            return (200, "application/json", {"response": {"a": 1}})
+
+        stub, _ = self._stub_fetch(self._inventory(names=names), detail_side_effect=side_effect)
+        d = _deployment()
+        with mock.patch.object(probe, "_fetch_json", side_effect=stub):
+            result = probe.follow_processes(d, "process")
+        for category in result["errorCategoryCounts"]:
+            self.assertIn(category, probe.ERROR_CATEGORIES)
+        self.assertEqual(result["errorCategoryCounts"]["AUTH_FAILED"], 1)
+        self.assertEqual(result["errorCategoryCounts"]["TLS_FAILED"], 1)
+
+    def test_merged_field_names_and_broad_types(self):
+        names = ("P1", "P2")
+        payloads = {
+            "P1": {"response": {"lag": 5, "status": "RUNNING"}},
+            "P2": {"response": {"lag": 6, "extraField": True}},
+        }
+
+        def side_effect(path):
+            for n, payload in payloads.items():
+                if n in path:
+                    return (200, "application/json", payload)
+            raise AssertionError("unexpected path")
+
+        stub, _ = self._stub_fetch(self._inventory(names=names), detail_side_effect=side_effect)
+        d = _deployment()
+        with mock.patch.object(probe, "_fetch_json", side_effect=stub):
+            result = probe.follow_processes(d, "process")
+        self.assertEqual(sorted(result["schema"]["fieldNames"]), ["extraField", "lag", "status"])
+        self.assertEqual(result["schema"]["fieldTypes"]["lag"], ["number"])
+        self.assertEqual(result["schema"]["fieldTypes"]["status"], ["string"])
+        self.assertEqual(result["schema"]["fieldTypes"]["extraField"], ["boolean"])
+
+    def test_nested_object_and_array_values_not_exposed(self):
+        stub, _ = self._stub_fetch(
+            self._inventory(names=("P1",)),
+            {"response": {"config": {"secretKey": "SHOULD_NOT_LEAK"}, "history": ["A_SECRET", "B_SECRET"]}})
+        d = _deployment()
+        with mock.patch.object(probe, "_fetch_json", side_effect=stub):
+            result = probe.follow_processes(d, "process")
+        self.assertEqual(result["schema"]["fieldTypes"]["config"], ["object"])
+        self.assertEqual(result["schema"]["fieldTypes"]["history"], ["array"])
+        blob = json.dumps(result)
+        self.assertNotIn("SHOULD_NOT_LEAK", blob)
+        self.assertNotIn("A_SECRET", blob)
+        self.assertNotIn("B_SECRET", blob)
+
+    def test_oversized_detail_response_counted_as_failure_not_parsed(self):
+        names = ("P1",)
+
+        def side_effect(path):
+            return ProbeRequestErrorFactory("UNEXPECTED_RESPONSE", http_status=200)
+
+        stub, _ = self._stub_fetch(self._inventory(names=names), detail_side_effect=side_effect)
+        d = _deployment()
+        with mock.patch.object(probe, "_fetch_json", side_effect=stub):
+            result = probe.follow_processes(d, "process")
+        self.assertEqual(result["successCount"], 0)
+        self.assertEqual(result["errorCategoryCounts"].get("UNEXPECTED_RESPONSE"), 1)
+
+    def test_no_raw_values_credentials_or_hostnames_in_output(self):
+        stub, _ = self._stub_fetch(
+            self._inventory(names=("P1",)),
+            {"response": {"user": SYNTHETIC_USER, "pass": SYNTHETIC_PASSWORD,
+                         "host": "gg-oracle-payments-01.goldengate-dev.svc.cluster.local",
+                         "lag": 42}})
+        d = _deployment()
+        with mock.patch.object(probe, "_fetch_json", side_effect=stub):
+            result = probe.follow_processes(d, "process")
+        blob = json.dumps(result)
+        self.assertNotIn(SYNTHETIC_USER, blob)
+        self.assertNotIn(SYNTHETIC_PASSWORD, blob)
+        self.assertNotIn("svc.cluster.local", blob)
+        self.assertNotIn("42", blob)
+
+    def test_no_dynamodb_or_cloudwatch_call(self):
+        stub, _ = self._stub_fetch(self._inventory(names=("P1",)), {"response": {"a": 1}})
+        d = _deployment()
+        with mock.patch("boto3.resource") as mock_resource, mock.patch("boto3.client") as mock_client:
+            with mock.patch.object(probe, "_fetch_json", side_effect=stub):
+                probe.follow_processes(d, "process")
+            mock_resource.assert_not_called()
+            mock_client.assert_not_called()
+
+    def test_get_only_no_authenticated_call_over_9015(self):
+        # follow_processes always calls _fetch_json with port_type="admin"
+        stub, calls = self._stub_fetch(self._inventory(names=("P1",)), {"response": {"a": 1}})
+        d = _deployment()
+        with mock.patch.object(probe, "_fetch_json", side_effect=stub):
+            probe.follow_processes(d, "process")
+        self.assertTrue(all(port_type == "admin" for port_type, _ in calls))
+
+    def test_no_valid_process_items_raises(self):
+        stub, _ = self._stub_fetch(self._inventory(names=()), {"response": {"a": 1}})
+        d = _deployment()
+        with mock.patch.object(probe, "_fetch_json", side_effect=stub):
+            with self.assertRaises(probe.ProbeValidationError):
+                probe.follow_processes(d, "process")
+
+    def test_all_detail_requests_failing_still_returns_aggregate(self):
+        stub, _ = self._stub_fetch(
+            self._inventory(names=("P1", "P2")),
+            detail_side_effect=lambda path: ProbeRequestErrorFactory("ENDPOINT_UNAVAILABLE"))
+        d = _deployment()
+        with mock.patch.object(probe, "_fetch_json", side_effect=stub):
+            result = probe.follow_processes(d, "process")
+        self.assertEqual(result["successCount"], 0)
+        self.assertEqual(result["failureCount"], 2)
+        self.assertEqual(result["errorCategoryCounts"]["ENDPOINT_UNAVAILABLE"], 2)
+
+
+def ProbeRequestErrorFactory(category, http_status=None):
+    """Helper: builds the exception, for use as a detail_side_effect return
+    value that _stub_fetch raises."""
+    return probe.ProbeRequestError(category, http_status=http_status)
+
+
+class FollowProcessesCliTests(unittest.TestCase):
+    """CLI wiring for --follow-processes / --detail; the existing
+    explicit-path mode must remain fully unchanged."""
+
+    def _doc(self):
+        return {"environment": "dev", "runtimeNamespace": "goldengate-dev",
+               "monitoringNamespace": "goldengate-monitoring", "dnsDomain": "example-internal",
+               "deployments": [_deployment()]}
+
+    def test_detail_choices_enforced_by_argparse(self):
+        with self.assertRaises(SystemExit):
+            probe.main(["--deployment", "gg-oracle-payments-01", "--port", "admin",
+                       "--follow-processes", "--detail", "notARealDetail"])
+
+    def test_follow_processes_requires_detail(self):
+        rc = probe.main(["--deployment", "gg-oracle-payments-01", "--port", "admin",
+                         "--follow-processes"])
+        self.assertEqual(rc, 2)
+
+    def test_follow_processes_rejects_path(self):
+        rc = probe.main(["--deployment", "gg-oracle-payments-01", "--port", "admin",
+                         "--follow-processes", "--detail", "process", "--path", "/services/v2/extracts"])
+        self.assertEqual(rc, 2)
+
+    def test_follow_processes_requires_admin_port(self):
+        rc = probe.main(["--deployment", "gg-oracle-payments-01", "--port", "metrics",
+                         "--follow-processes", "--detail", "process"])
+        self.assertEqual(rc, 2)
+
+    def test_follow_processes_rejects_unknown_deployment(self):
+        with mock.patch.object(cfgmod, "load_deployments", return_value=self._doc()):
+            rc = probe.main(["--deployment", "gg-does-not-exist", "--port", "admin",
+                             "--follow-processes", "--detail", "process"])
+        self.assertEqual(rc, 2)
+
+    def test_explicit_path_mode_unchanged_without_follow_processes(self):
+        with mock.patch.object(probe, "resolve_deployment") as mock_resolve:
+            rc = probe.main(["--deployment", "gg-oracle-payments-01", "--port", "admin",
+                             "--path", "http://evil/services/v2/extracts"])
+        self.assertEqual(rc, 2)
+        mock_resolve.assert_not_called()
+
+
 class CliMainTests(unittest.TestCase):
     def test_main_rejects_unsafe_path_before_any_network_call(self):
         with mock.patch.object(probe, "resolve_deployment") as mock_resolve:

@@ -137,6 +137,50 @@ and any single key longer than `MAX_KEY_LENGTH` (128) is omitted entirely
 each collection's own `truncated` flag say so. No CLI option raises or
 disables any of these limits.
 
+### Per-process detail capture (`--follow-processes`)
+
+A second, still manual and structural-only mode: GET the confirmed process
+inventory (`/services/v2/mpoints/processes`) once, then issue up to 20
+sequential, bounded detail GETs -- one per process -- and merge their
+structural schemas. Always over authenticated HTTPS adminPort 8443
+(`--port admin` is required; direct metricsPort 9015 is never used for this
+mode). `--detail` selects one FIXED endpoint suffix only:
+
+```
+python3 tools/gg_api_contract_probe.py \
+  --deployment gg-oracle-payments-01 --port admin \
+  --follow-processes --detail process
+
+python3 tools/gg_api_contract_probe.py \
+  --deployment gg-oracle-payments-01 --port admin \
+  --follow-processes --detail processPerformance
+
+python3 tools/gg_api_contract_probe.py \
+  --deployment gg-oracle-payments-01 --port admin \
+  --follow-processes --detail threadPerformance
+
+python3 tools/gg_api_contract_probe.py \
+  --deployment gg-oracle-payments-01 --port admin \
+  --follow-processes --detail serviceHealth
+
+python3 tools/gg_api_contract_probe.py \
+  --deployment gg-oracle-payments-01 --port admin \
+  --follow-processes --detail heartbeat
+```
+
+The process name used to build each detail endpoint is URL-encoded as
+exactly one path segment and is **never** printed -- neither is the process
+ID, nor the constructed detail URL. Output is limited to counts
+(`inventoryItemCount`/`attemptedCount`/`successCount`/`failureCount`),
+`httpStatusCounts`, closed `errorCategoryCounts`
+(`AUTH_FAILED`/`TLS_FAILED`/`NOT_FOUND`/`ENDPOINT_UNAVAILABLE`/
+`INVALID_JSON`/`UNEXPECTED_RESPONSE`/`UNKNOWN`), and a merged `schema`
+(`topLevelKeys`/`collections`/`fieldNames`/`fieldTypes`/`truncated`) --
+never a raw response value. One failed detail request never stops the
+remaining ones. This mode does not write any monitoring state (no DynamoDB
+write) and does not publish CloudWatch; production PMS polling/parsing
+remains unimplemented.
+
 ## Canonical configuration
 
 Single source: `envs/dev/goldengate-deployments.yaml`, mounted into the pod

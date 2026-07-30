@@ -469,6 +469,36 @@ else
   fail "monitoring/observer is missing -- legacy observer must remain operational"
 fi
 
+# ---------------------------------------------------------------------
+# 12. Phase 4B2B: --follow-processes fixed detail allowlist exists and is
+#     never wired into automatic startup.
+# ---------------------------------------------------------------------
+echo ""
+echo "--- Contract-probe tool: --follow-processes fixed detail allowlist ---"
+if grep -q '"process", "processPerformance", "threadPerformance", "serviceHealth", "heartbeat"' "$PROBE_TOOL" 2>/dev/null; then
+  pass "gg_api_contract_probe.py defines the fixed --detail allowlist"
+else
+  fail "gg_api_contract_probe.py fixed --detail allowlist is missing or changed"
+fi
+
+if grep -q "MAX_FOLLOWED_PROCESSES = 20" "$PROBE_TOOL" 2>/dev/null; then
+  pass "gg_api_contract_probe.py caps --follow-processes at 20 items"
+else
+  fail "gg_api_contract_probe.py no longer caps --follow-processes at 20 items"
+fi
+
+FOLLOW_WIRED="false"
+for f in "${MONITOR_APP_DIR}/monitor.py" "${MONITOR_APP_DIR}/collector.py"; do
+  [ -f "$f" ] || continue
+  if grep -q "follow_processes\|follow-processes" "$f"; then
+    fail "$(basename "$f") references follow_processes -- must never auto-run"
+    FOLLOW_WIRED="true"
+  fi
+done
+if [ "$FOLLOW_WIRED" = "false" ]; then
+  pass "--follow-processes is never referenced by monitor.py/collector.py (manual-only)"
+fi
+
 echo ""
 echo "=================================================="
 echo "Summary: ${PASS_COUNT} passed, ${FAIL_COUNT} failed, ${SKIP_COUNT} skipped"
