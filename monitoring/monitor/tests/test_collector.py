@@ -765,5 +765,94 @@ class MetricPublicationIntegrationTests(unittest.TestCase):
         self.assertEqual(cw_calls, [])
 
 
+class LoggerHierarchyIntegrationTests(unittest.TestCase):
+    """Proves the actual running-container logging path: monitor.py
+    configures goldengate.monitor's level/handler; collector.py's logger
+    must be a child of it (goldengate.monitor.collector), carry no handler
+    of its own, and never duplicate a log line. Without this, INFO records
+    such as process_discovery_summary are silently dropped in production."""
+
+    @classmethod
+    def setUpClass(cls):
+        import monitor as monitor_module
+        cls.monitor_module = monitor_module
+
+    def test_collector_logger_is_child_of_goldengate_monitor(self):
+        self.assertEqual(core.logger.name, "goldengate.monitor.collector")
+        self.assertIsNotNone(core.logger.parent)
+        self.assertEqual(core.logger.parent.name, "goldengate.monitor")
+
+    def test_collector_logger_has_no_handlers_of_its_own(self):
+        # No new StreamHandler, no basicConfig -- only the parent's handler
+        # (installed by monitor.py) may ever fire.
+        self.assertEqual(core.logger.handlers, [])
+
+    def test_collector_inherits_configured_info_level(self):
+        self.assertEqual(core.logger.getEffectiveLevel(), logging.INFO)
+
+    def test_goldengate_monitor_carries_exactly_one_handler(self):
+        # Proves collector.py never adds a second handler to the shared
+        # parent logger (no duplicate-output path exists).
+        self.assertEqual(len(self.monitor_module.logger.handlers), 1)
+
+    def _capture_real_handler_output(self, fn):
+        """Swaps the actual configured StreamHandler's target stream (not
+        sys.stdout, which the handler captured a fixed reference to at
+        import time) so we observe exactly what the real handler chain
+        would write to container stdout."""
+        import io
+        handler = self.monitor_module._handler
+        buf = io.StringIO()
+        original_stream = handler.stream
+        handler.setStream(buf)
+        try:
+            fn()
+        finally:
+            handler.setStream(original_stream)
+        return buf.getvalue()
+
+    def test_discovery_summary_reaches_real_handler_exactly_once(self):
+        procs = [{"process": "E1", "type": "extract"},
+                {"process": "R1", "type": "replicat"},
+                {"process": "D1", "type": "distpath"}]
+        output = self._capture_real_handler_output(
+            lambda: core.log_discovery_summary("gg-oracle-payments-01", procs))
+        lines = [ln for ln in output.splitlines() if "process_discovery_summary" in ln]
+        self.assertEqual(len(lines), 1, f"expected exactly one summary line, got: {lines!r}")
+
+    def test_discovery_summary_is_valid_json_with_only_allowed_keys(self):
+        procs = [{"process": "E1", "type": "extract"}]
+        output = self._capture_real_handler_output(
+            lambda: core.log_discovery_summary("gg-oracle-payments-01", procs))
+        line = next(ln for ln in output.splitlines() if "process_discovery_summary" in ln)
+        record = json.loads(line)
+        self.assertEqual(record["event"], "process_discovery_summary")
+        self.assertEqual(
+            set(record.keys()),
+            {"event", "deployment", "extractCount", "replicatCount", "distpathCount", "totalCount"})
+        self.assertEqual(record["deployment"], "gg-oracle-payments-01")
+        self.assertEqual(record["extractCount"], 1)
+        self.assertEqual(record["replicatCount"], 0)
+        self.assertEqual(record["distpathCount"], 0)
+        self.assertEqual(record["totalCount"], 1)
+
+    def test_discovery_summary_no_process_names_or_payload_values(self):
+        procs = [{"process": "SUPER_SECRET_PROCESS_NAME", "type": "extract",
+                 "metrics": {"password": "should-never-appear"}, "error": "leaky detail"}]
+        output = self._capture_real_handler_output(
+            lambda: core.log_discovery_summary("gg-oracle-payments-01", procs))
+        self.assertNotIn("SUPER_SECRET_PROCESS_NAME", output)
+        self.assertNotIn("should-never-appear", output)
+        self.assertNotIn("leaky detail", output)
+
+    def test_no_duplicate_output_across_repeated_ticks(self):
+        procs = [{"process": "E1", "type": "extract"}]
+        output = self._capture_real_handler_output(
+            lambda: (core.log_discovery_summary("gg-oracle-payments-01", procs),
+                    core.log_discovery_summary("gg-oracle-payments-01", procs)))
+        lines = [ln for ln in output.splitlines() if "process_discovery_summary" in ln]
+        self.assertEqual(len(lines), 2)  # exactly one line per call, no duplication per call
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -25,7 +25,7 @@ from botocore.exceptions import ClientError
 import config as cfgmod
 import health_rules as gh
 
-logger = logging.getLogger("gg-monitor")
+logger = logging.getLogger("goldengate.monitor.collector")
 
 LEASE_TTL = int(os.environ.get("LEASE_TTL", "30"))
 RENEW_INTERVAL = int(os.environ.get("RENEW_INTERVAL", "5"))

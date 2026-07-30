@@ -28,10 +28,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import posixpath
 import socket
 import ssl
 import sys
 import urllib.error
+import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -61,9 +63,55 @@ class ProbeRequestError(Exception):
         super().__init__(category)
 
 
+_CONTROL_CHARS = frozenset(chr(c) for c in list(range(0x00, 0x20)) + [0x7f])
+
+
+def _has_control_chars(s):
+    return any(c in _CONTROL_CHARS for c in s)
+
+
+def _reject_unsafe_segments(s, context):
+    for segment in s.split("/"):
+        if segment in (".", ".."):
+            raise ProbeValidationError(f"path must not contain a {context} '.' or '..' segment")
+
+
+def _reject_unsafe_decoded_form(path, decoded):
+    """A decoded round that introduces a new backslash, control character,
+    slash (i.e. a percent-encoded '/'), or '.'/'..' segment is rejected --
+    percent-encoding must never be able to smuggle something the literal
+    path forbids."""
+    if "\\" in decoded or _has_control_chars(decoded):
+        raise ProbeValidationError("path must not contain a percent-encoded backslash/control character")
+    if decoded.count("/") != path.count("/"):
+        raise ProbeValidationError("path must not contain a percent-encoded slash")
+    _reject_unsafe_segments(decoded, "percent-encoded")
+
+
+def _reject_unsafe_percent_encoding(path, max_rounds=5):
+    """Bounded, iterative percent-decoding (guards against double-encoding
+    evasion, e.g. %252e%252e) using only urllib.parse.unquote. Stops as soon
+    as decoding stabilizes; raises if the safe-decode depth is exceeded."""
+    current = path
+    for _ in range(max_rounds):
+        try:
+            decoded = urllib.parse.unquote(current, errors="strict")
+        except UnicodeDecodeError:
+            raise ProbeValidationError("path contains malformed percent-encoding")
+        if decoded == current:
+            return
+        _reject_unsafe_decoded_form(path, decoded)
+        current = decoded
+    raise ProbeValidationError("path percent-encoding exceeds safe decode depth")
+
+
 def validate_path(path):
-    """Only a bare /services/... path -- never a URL, scheme, host, or
-    query string smuggled in through --path."""
+    """Only a bare, already-normalized /services/... path -- never a URL,
+    scheme, host, query string, fragment, backslash, control character, or
+    any literal/percent-encoded traversal smuggled in through --path. Uses
+    only stdlib URL/path parsing (urllib.parse.unquote, posixpath.normpath)
+    -- no broad allowlist, so any other legitimate /services/... endpoint
+    remains probeable."""
     if not isinstance(path, str) or not path:
         raise ProbeValidationError("path is required")
     if "://" in path:
@@ -74,6 +122,20 @@ def validate_path(path):
         raise ProbeValidationError("path must not contain a query string or fragment")
     if any(c.isspace() for c in path):
         raise ProbeValidationError("path must not contain whitespace")
+    if _has_control_chars(path):
+        raise ProbeValidationError("path must not contain control characters")
+    if "\\" in path:
+        raise ProbeValidationError("path must not contain a backslash")
+
+    _reject_unsafe_segments(path, "literal")
+    _reject_unsafe_percent_encoding(path)
+
+    # A canonical path is already normalized -- any difference (duplicate
+    # slashes, "." / ".." segments, a trailing slash, etc.) is rejected
+    # rather than silently resolved.
+    if posixpath.normpath(path) != path:
+        raise ProbeValidationError("path is not already normalized")
+
     if not path.startswith("/services/"):
         raise ProbeValidationError("path must start with /services/")
     return path
@@ -101,10 +163,43 @@ def _port_and_base(deployment, port_type):
     return f"https://{host}:{port}"
 
 
+def _contains_tls_error(exc, max_nodes=10):
+    """Bounded, cycle-safe search for an ssl.SSLError (ssl.SSLCertVerificationError
+    subclasses it) anywhere in exc's chain: the exception itself,
+    urllib.error.URLError.reason, and __cause__/__context__ at every node.
+    Never returns or logs the exception text -- classification only."""
+    if exc is None:
+        return False
+    seen_ids = set()
+    stack = [exc]
+    checked = 0
+    while stack and checked < max_nodes:
+        current = stack.pop()
+        if current is None:
+            continue
+        cid = id(current)
+        if cid in seen_ids:
+            continue
+        seen_ids.add(cid)
+        checked += 1
+        if isinstance(current, ssl.SSLError):
+            return True
+        reason = getattr(current, "reason", None)
+        if isinstance(reason, BaseException):
+            stack.append(reason)
+        cause = getattr(current, "__cause__", None)
+        if isinstance(cause, BaseException):
+            stack.append(cause)
+        context = getattr(current, "__context__", None)
+        if isinstance(context, BaseException):
+            stack.append(context)
+    return False
+
+
 def _classify_request_error(exc, http_status=None):
     if http_status in (401, 403):
         return "AUTH_FAILED"
-    if isinstance(exc, ssl.SSLError):
+    if _contains_tls_error(exc):
         return "TLS_FAILED"
     if http_status == 404:
         return "NOT_FOUND"

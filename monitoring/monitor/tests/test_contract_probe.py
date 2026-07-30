@@ -78,6 +78,67 @@ class PathValidationTests(unittest.TestCase):
         with self.assertRaises(probe.ProbeValidationError):
             probe.validate_path("/services/v2/ext racts")
 
+    def test_rejects_dot_dot_traversal(self):
+        with self.assertRaises(probe.ProbeValidationError):
+            probe.validate_path("/services/../admin")
+
+    def test_rejects_dot_segment(self):
+        with self.assertRaises(probe.ProbeValidationError):
+            probe.validate_path("/services/./v2/metrics")
+
+    def test_rejects_percent_encoded_dot_dot(self):
+        with self.assertRaises(probe.ProbeValidationError):
+            probe.validate_path("/services/%2e%2e/admin")
+
+    def test_rejects_percent_encoded_dot_dot_uppercase(self):
+        with self.assertRaises(probe.ProbeValidationError):
+            probe.validate_path("/services/%2E%2E/admin")
+
+    def test_rejects_percent_encoded_double_slash(self):
+        with self.assertRaises(probe.ProbeValidationError):
+            probe.validate_path("/services/%2F%2Fevil")
+
+    def test_rejects_percent_encoded_backslash(self):
+        with self.assertRaises(probe.ProbeValidationError):
+            probe.validate_path("/services/v2/%5cextracts")
+
+    def test_rejects_backslash_path_separator(self):
+        with self.assertRaises(probe.ProbeValidationError):
+            probe.validate_path("/services\\v2\\metrics")
+
+    def test_rejects_literal_control_character(self):
+        with self.assertRaises(probe.ProbeValidationError):
+            probe.validate_path("/services/v2/ex\x00tracts")
+
+    def test_rejects_percent_encoded_control_character(self):
+        with self.assertRaises(probe.ProbeValidationError):
+            probe.validate_path("/services/v2/%00extracts")
+
+    def test_rejects_double_percent_encoded_traversal(self):
+        # %252e%252e decodes once to "%2e%2e", then again to ".." -- bounded
+        # iterative decoding must still catch this.
+        with self.assertRaises(probe.ProbeValidationError):
+            probe.validate_path("/services/v2/%252e%252e/admin")
+
+    def test_rejects_malformed_percent_encoding(self):
+        # %ff is not valid standalone UTF-8 -- unquote(errors="strict") must
+        # raise, and validate_path must turn that into a rejection.
+        with self.assertRaises(probe.ProbeValidationError):
+            probe.validate_path("/services/v2/%ffextracts")
+
+    def test_rejects_non_normalized_trailing_slash(self):
+        with self.assertRaises(probe.ProbeValidationError):
+            probe.validate_path("/services/v2/extracts/")
+
+    def test_rejects_duplicate_slashes(self):
+        with self.assertRaises(probe.ProbeValidationError):
+            probe.validate_path("/services//v2/extracts")
+
+    def test_still_accepts_other_legitimate_services_paths(self):
+        # no broad allowlist: any other well-formed /services/... path
+        # remains probeable for future legitimate read-only endpoints.
+        self.assertEqual(probe.validate_path("/services/v2/deployments"), "/services/v2/deployments")
+
 
 class DeploymentResolutionTests(unittest.TestCase):
     def _with_doc(self, deployments):
@@ -140,6 +201,95 @@ class ErrorClassificationTests(unittest.TestCase):
 
     def test_unknown_fallback(self):
         self.assertEqual(probe._classify_request_error(ValueError("something else")), "UNKNOWN")
+
+
+class WrappedTlsClassificationTests(unittest.TestCase):
+    """A TLS failure must classify as TLS_FAILED regardless of how deep it is
+    wrapped -- direct, URLError.reason, or chained __cause__/__context__."""
+
+    def test_direct_ssl_error(self):
+        self.assertTrue(probe._contains_tls_error(ssl.SSLError("bad cert")))
+        self.assertEqual(probe._classify_request_error(ssl.SSLError("bad cert")), "TLS_FAILED")
+
+    def test_direct_ssl_cert_verification_error(self):
+        exc = ssl.SSLCertVerificationError("certificate verify failed")
+        self.assertTrue(probe._contains_tls_error(exc))
+        self.assertEqual(probe._classify_request_error(exc), "TLS_FAILED")
+
+    def test_urlerror_wrapping_ssl_cert_verification_error(self):
+        wrapped = urllib.error.URLError(ssl.SSLCertVerificationError("certificate verify failed"))
+        self.assertTrue(probe._contains_tls_error(wrapped))
+        self.assertEqual(probe._classify_request_error(wrapped), "TLS_FAILED")
+
+    def test_urlerror_wrapping_connection_refused_is_not_tls(self):
+        wrapped = urllib.error.URLError(ConnectionRefusedError("connection refused"))
+        self.assertFalse(probe._contains_tls_error(wrapped))
+        self.assertEqual(probe._classify_request_error(wrapped), "ENDPOINT_UNAVAILABLE")
+
+    def test_nested_cause_chain(self):
+        try:
+            try:
+                raise ssl.SSLCertVerificationError("certificate verify failed")
+            except ssl.SSLCertVerificationError as inner:
+                raise RuntimeError("connection failed") from inner
+        except RuntimeError as outer:
+            self.assertTrue(probe._contains_tls_error(outer))
+            self.assertEqual(probe._classify_request_error(outer), "TLS_FAILED")
+
+    def test_nested_context_chain_without_explicit_cause(self):
+        try:
+            try:
+                raise ssl.SSLError("bad handshake")
+            except ssl.SSLError:
+                raise urllib.error.URLError("generic failure")  # implicit __context__
+        except urllib.error.URLError as outer:
+            self.assertTrue(probe._contains_tls_error(outer))
+            self.assertEqual(probe._classify_request_error(outer), "TLS_FAILED")
+
+    def test_cycle_protection_does_not_hang(self):
+        a = RuntimeError("a")
+        b = RuntimeError("b")
+        a.__cause__ = b
+        b.__cause__ = a  # cycle
+        # must terminate promptly and simply report no TLS error found
+        self.assertFalse(probe._contains_tls_error(a))
+
+    def test_bounded_traversal_does_not_hang_on_long_chain(self):
+        root = ssl.SSLError("deep")
+        current = root
+        for i in range(50):
+            nxt = RuntimeError(f"wrapper-{i}")
+            nxt.__cause__ = current
+            current = nxt
+        # root TLS error is beyond max_nodes -- bounded traversal is allowed
+        # to miss it, but must not hang or crash.
+        result = probe._contains_tls_error(current)
+        self.assertIn(result, (True, False))
+
+    def test_no_raw_certificate_text_in_cli_output(self):
+        d = _deployment()
+        fake_opener = MagicMock()
+        fake_opener.open.side_effect = urllib.error.URLError(
+            ssl.SSLCertVerificationError(
+                "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+                "Hostname mismatch, CERTIFICATE_SECRET_DETAIL_xyz"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            user_file = os.path.join(tmp, "user")
+            pwd_file = os.path.join(tmp, "pwd")
+            with open(user_file, "w") as f:
+                f.write(SYNTHETIC_USER)
+            with open(pwd_file, "w") as f:
+                f.write(SYNTHETIC_PASSWORD)
+            with mock.patch.object(cfgmod, "credential_paths", return_value=(user_file, pwd_file)), \
+                 mock.patch.object(core, "_build_ssl_context", return_value=MagicMock()), \
+                 mock.patch.object(core, "_basic_opener", return_value=fake_opener):
+                with self.assertRaises(probe.ProbeRequestError) as ctx:
+                    probe.run_probe(d, "admin", "/services/v2/extracts")
+
+        self.assertEqual(ctx.exception.category, "TLS_FAILED")
+        self.assertNotIn("CERTIFICATE_SECRET_DETAIL_xyz", str(ctx.exception))
+        self.assertNotIn("Hostname mismatch", str(ctx.exception))
 
 
 class SummarizeJsonTests(unittest.TestCase):
