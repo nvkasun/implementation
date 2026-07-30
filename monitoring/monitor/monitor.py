@@ -264,35 +264,54 @@ def lease_view(lease_item, now):
     return {"holder": str(lease_item.get("holder", "")), "expiresAt": expires_at, "fresh": fresh}
 
 
+def normalize_critical_services(raw):
+    """Fail-closed critical-service normalization -- never raises regardless
+    of shape. Only {"<name>": {"reachable": <bool>}} entries are trusted;
+    any other per-service shape (bool, null, string, list, ...) or a
+    non-dict root safely becomes an empty/unreachable representation
+    instead of raising."""
+    if not isinstance(raw, dict):
+        return {}
+    normalized = {}
+    for name, value in raw.items():
+        reachable = bool(value.get("reachable")) if isinstance(value, dict) else False
+        normalized[str(name)] = reachable
+    return normalized
+
+
 def read_runtime_view(table, pipeline_id, role, deployment_name, deployment_meta,
                       legacy_fallback_enabled, now, stale_after_seconds):
     """Canonical-first, legacy-fallback-second: the canonical
     STATE#_deployment record always wins the instant it exists. Only when
     missing, and only when enabled, falls back to the legacy per-role key
-    "gg-<pipelineId>-<role>" (derived here, never hardcoded)."""
+    "gg-<pipelineId>-<role>" (derived here, never hardcoded). Canonical
+    STATE#<process> rows are queried independently of STATE#_deployment's
+    existence -- a partition can hold process rows even when the
+    deployment-status record itself is missing (eg a race during first-tick
+    startup), and those rows must still surface here regardless of which
+    status branch below is taken."""
     deployment_type = deployment_meta["type"]
 
     config_item = get_config_item(table, deployment_name)
     lease_item = get_lease_item(table, deployment_name)
     dep_item = get_deployment_state_item(table, deployment_name)
 
+    process_rows = query_process_state_items(table, deployment_name)
+    processes = [normalize_process_row(r, now, stale_after_seconds) for r in process_rows]
+
     if dep_item is not None:
         data_source = "canonical-monitor"
         status_fields = compute_canonical_effective_status(dep_item, now, stale_after_seconds)
-        process_rows = query_process_state_items(table, deployment_name)
-        processes = [normalize_process_row(r, now, stale_after_seconds) for r in process_rows]
-        critical_services = dep_item.get("criticalServices") or {}
+        critical_services = normalize_critical_services(dep_item.get("criticalServices"))
     elif legacy_fallback_enabled:
         legacy_pipeline = f"gg-{pipeline_id}-{role}"
         legacy_item = get_deployment_state_item(table, legacy_pipeline)
         data_source = "legacy-observer-fallback"
         status_fields = compute_legacy_effective_status(legacy_item, now, stale_after_seconds)
-        processes = []
         critical_services = {}
     else:
         data_source = "canonical-monitor"
         status_fields = {"effectiveStatus": "MISSING", "recordedAt": None, "ageSeconds": None, "fresh": False}
-        processes = []
         critical_services = {}
 
     return {
@@ -304,7 +323,7 @@ def read_runtime_view(table, pipeline_id, role, deployment_name, deployment_meta
         "alertsEnabled": bool(config_item.get("alertsEnabled")) if config_item else None,
         "metricsEnabled": bool(config_item.get("metricsEnabled")) if config_item else None,
         "lease": lease_view(lease_item, now),
-        "criticalServices": {k: bool((v or {}).get("reachable")) for k, v in (critical_services or {}).items()},
+        "criticalServices": critical_services,
         "processes": processes,
         **status_fields,
     }
@@ -337,20 +356,19 @@ def read_deployment_processes_view(table, deployment_meta, now, stale_after_seco
     """Canonical STATE#-only view for one deployment -- no legacy-observer
     fallback (that migration-compatibility concern belongs to
     read_runtime_view/build_status_payload only). GetItem/Query only, never
-    Scan, never writes."""
+    Scan, never writes. Canonical STATE#<process> rows are queried
+    independently of STATE#_deployment's existence, matching
+    read_runtime_view: a missing deployment-status record only means
+    effectiveStatus == MISSING, it does not imply an empty process list."""
     deployment_name = deployment_meta["name"]
     config_item = get_config_item(table, deployment_name)
     lease_item = get_lease_item(table, deployment_name)
     dep_item = get_deployment_state_item(table, deployment_name)
 
     status_fields = compute_canonical_effective_status(dep_item, now, stale_after_seconds)
-    if dep_item is not None:
-        process_rows = query_process_state_items(table, deployment_name)
-        processes = [normalize_process_row(r, now, stale_after_seconds) for r in process_rows]
-        critical_services = dep_item.get("criticalServices") or {}
-    else:
-        processes = []
-        critical_services = {}
+    process_rows = query_process_state_items(table, deployment_name)
+    processes = [normalize_process_row(r, now, stale_after_seconds) for r in process_rows]
+    critical_services = normalize_critical_services(dep_item.get("criticalServices")) if dep_item is not None else {}
 
     return {
         "deploymentName": deployment_name,
@@ -358,7 +376,7 @@ def read_deployment_processes_view(table, deployment_meta, now, stale_after_seco
         "enabled": bool(deployment_meta.get("enabled", False)),
         "alertsEnabled": bool(config_item.get("alertsEnabled")) if config_item else None,
         "lease": lease_view(lease_item, now),
-        "criticalServices": {k: bool((v or {}).get("reachable")) for k, v in (critical_services or {}).items()},
+        "criticalServices": critical_services,
         "processes": processes,
         **status_fields,
     }
@@ -428,6 +446,96 @@ def _alerts_enabled_text(alerts_enabled):
     return "true" if alerts_enabled else "false"
 
 
+def format_relative_age(seconds, missing_text="never"):
+    """Manager-contract relative-age text, reimplemented independently
+    against this codebase's None-based missing-value convention (the
+    manager reference uses a -1 sentinel, which is not reused here):
+    None -> missing_text; <60s -> "Ns ago"; <1h -> "Nm ago"; else -> "Nh ago"."""
+    if seconds is None:
+        return missing_text
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s ago"
+    if seconds < 3600:
+        return f"{seconds // 60}m ago"
+    return f"{seconds // 3600}h ago"
+
+
+def format_lag_threshold_mode(lag_seconds, threshold_seconds, mode):
+    """Manager-contract combined lag/threshold/mode cell text, reimplemented
+    independently (not copied) against this codebase's None-based
+    missing-value convention. Both missing -> "N/A"; a single missing value
+    renders as "?", never the literal "None"."""
+    if lag_seconds is None and threshold_seconds is None:
+        return "N/A"
+    lag_text = f"{lag_seconds}s" if lag_seconds is not None else "?"
+    threshold_text = f"thr {threshold_seconds}s" if threshold_seconds is not None else "thr ?"
+    mode_text = str(mode) if mode else "?"
+    return f"{lag_text} / {threshold_text} ({mode_text})"
+
+
+def _render_process_table(processes):
+    if not processes:
+        return "<p><em>No process STATE rows found.</em></p>"
+    rows = []
+    for p in processes:
+        stale = bool(p.get("stale"))
+        process_cell = _esc(p.get("process"))
+        if stale:
+            process_cell = f'<span style="font-weight:600;">[STALE]</span> {process_cell}'
+        lag_cell = html.escape(format_lag_threshold_mode(
+            p.get("lagSeconds"), p.get("resolvedThreshold"), p.get("resolvedMode")))
+        age_cell = html.escape(format_relative_age(p.get("ageSeconds")))
+        error_cell = _esc(p.get("statusMessage")) if p.get("hasError") else ""
+        row_open = ('<tr class="stale-row" style="color:#9a6700;font-style:italic;">'
+                   if stale else "<tr>")
+        rows.append(
+            f"{row_open}"
+            f"<td>{process_cell}</td>"
+            f"<td>{_esc(p.get('processType'))}</td>"
+            f"<td>{_status_badge(p.get('status'))}</td>"
+            f"<td>{lag_cell}</td>"
+            f"<td>{age_cell}</td>"
+            f"<td>{_esc(p.get('consecutiveAbends'))}</td>"
+            f"<td>{error_cell}</td>"
+            "</tr>")
+    return ('<table style="margin-top:6px;width:100%;font-size:0.85em;border-collapse:collapse;">'
+           "<thead><tr><th>Process</th><th>Type</th><th>Status</th>"
+           "<th>Lag / Threshold (mode)</th><th>Recorded</th><th>Abends</th><th>Error</th>"
+           "</tr></thead>"
+           f"<tbody>{''.join(rows)}</tbody></table>")
+
+
+def _render_deployment_card(r):
+    fresh = bool(r.get("fresh"))
+    age_text = html.escape(format_relative_age(r.get("ageSeconds"), missing_text="-"))
+
+    lease = r.get("lease")
+    if lease:
+        holder_text = _esc(lease.get("holder") or "none")
+        state_text = "valid" if lease.get("fresh") else "EXPIRED"
+        lease_html = f"lease={holder_text} ({state_text})"
+    else:
+        lease_html = "lease=none"
+
+    header = (
+        f'<div style="font-weight:600;font-size:1.05em;margin-top:4px;">{_esc(r.get("deploymentName"))}</div>'
+        f'<div style="margin-top:2px;">{_status_badge(r.get("effectiveStatus"))} {_fresh_badge(fresh)}</div>'
+        f'<div style="margin-top:2px;color:#57606a;">role={_esc(r.get("role"))} | '
+        f'type={_esc(r.get("deploymentType"))} | '
+        f'alertsEnabled={html.escape(_alerts_enabled_text(r.get("alertsEnabled")))}</div>'
+        f'<div style="margin-top:2px;color:#57606a;">source={_esc(r.get("dataSource"))} | '
+        f'{lease_html} | updated {age_text}</div>'
+        f'<div style="margin-top:2px;">services: {_critical_services_html(r.get("criticalServices"))}</div>')
+
+    process_table = _render_process_table(r.get("processes") or [])
+
+    return (
+        '<div style="border:1px solid #d0d7de;border-radius:6px;padding:8px 14px 12px;margin-top:12px;">'
+        f"{header}{process_table}"
+        "</div>")
+
+
 def render_html(payload, config, error_message=None):
     sections = []
     if error_message:
@@ -437,59 +545,9 @@ def render_html(payload, config, error_message=None):
             f"Unable to read monitoring data: {html.escape(error_message)}</div>")
 
     for lp in payload.get("logicalPipelines", []):
-        rows = []
-        for r in lp.get("runtimes", []):
-            age = r.get("ageSeconds")
-            age_text = f"{age}s ago" if age is not None else "-"
-            if r["processes"]:
-                proc_rows = "".join(
-                    "<tr>"
-                    f"<td>{_esc(p['process'])}</td>"
-                    f"<td>{_esc(p['processType'])}</td>"
-                    f"<td>{_status_badge(p['status'])}</td>"
-                    f"<td>{_esc(p['lagSeconds'])}</td>"
-                    f"<td>{_esc(p['resolvedThreshold'])}</td>"
-                    f"<td>{_esc(p['resolvedMode'])}</td>"
-                    f"<td>{_esc(p['ageSeconds'])}</td>"
-                    f"<td>{_fresh_badge(not p['stale'])}</td>"
-                    f"<td>{_esc(p['consecutiveAbends'])}</td>"
-                    f"<td>{_esc(p['statusMessage']) if p['hasError'] else ''}</td>"
-                    "</tr>"
-                    for p in r["processes"])
-                proc_table = ('<table style="margin-top:4px;font-size:0.85em;">'
-                             "<thead><tr><th>Process</th><th>Type</th><th>Status</th><th>Lag</th>"
-                             "<th>Threshold</th><th>Mode</th><th>Age</th><th>Fresh</th>"
-                             "<th>Abends</th><th>Error</th></tr></thead>"
-                             f"<tbody>{proc_rows}</tbody></table>")
-            else:
-                proc_table = "<p><em>No process STATE rows found.</em></p>"
-
-            lease = r.get("lease")
-            lease_text = (f"holder={_esc(lease['holder'] or 'none')} ({'valid' if lease['fresh'] else 'EXPIRED'})"
-                         if lease else "none")
-
-            rows.append(
-                "<tr>"
-                f"<td>{_esc(r.get('role'))}</td>"
-                f"<td>{_esc(r.get('deploymentName'))}</td>"
-                f"<td>{_esc(r.get('deploymentType'))}</td>"
-                f"<td>{_status_badge(r.get('effectiveStatus'))}</td>"
-                f"<td>{_fresh_badge(bool(r.get('fresh')))}</td>"
-                f"<td>{html.escape(_alerts_enabled_text(r.get('alertsEnabled')))}</td>"
-                f"<td>{_esc(r.get('dataSource'))}</td>"
-                f"<td>{html.escape(age_text)}</td>"
-                f"<td>{html.escape(lease_text)}</td>"
-                f"<td>{_critical_services_html(r.get('criticalServices'))}</td>"
-                f"<td>{proc_table}</td>"
-                "</tr>")
+        cards = "".join(_render_deployment_card(r) for r in lp.get("runtimes", []))
         sections.append(
-            f'<h2 style="margin-top:24px;">{_esc(lp.get("pipelineId"))}</h2>'
-            '<table style="border-collapse:collapse;width:100%;font-size:0.9em;">'
-            '<thead><tr style="text-align:left;border-bottom:2px solid #d0d7de;">'
-            "<th>Role</th><th>Deployment</th><th>Type</th><th>Status</th><th>Fresh</th>"
-            "<th>Alerts</th><th>Source</th><th>Recorded</th><th>Lease</th>"
-            "<th>Critical Services</th><th>Processes</th>"
-            "</tr></thead><tbody>" + "".join(rows) + "</tbody></table>")
+            f'<h2 style="margin-top:24px;">{_esc(lp.get("pipelineId"))}</h2>{cards}')
 
     if not payload.get("logicalPipelines"):
         sections.append("<p>No logical pipelines found in the canonical topology.</p>")
@@ -509,6 +567,7 @@ def render_html(payload, config, error_message=None):
   body {{ font-family: -apple-system, Segoe UI, Helvetica, Arial, sans-serif; margin: 24px; color: #1f2328; background: #ffffff; }}
   table {{ margin-top: 8px; }}
   th, td {{ padding: 6px 10px; border-bottom: 1px solid #eaeef2; vertical-align: top; }}
+  tr.stale-row td {{ color: #9a6700; font-style: italic; }}
   footer {{ margin-top: 32px; color: #57606a; font-size: 0.8em; }}
 </style>
 </head>

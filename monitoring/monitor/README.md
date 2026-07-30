@@ -310,14 +310,32 @@ information, built entirely from records the collector already writes --
 name, effective status, an explicit fresh/**STALE** indicator (distinct from
 status), `alertsEnabled`, lease holder + valid/expired state, `STATE#_deployment`
 record age, and each critical service's reachable/down state. Per process:
-name, `processType`, status, `lagSeconds`, `resolvedThreshold`, `resolvedMode`,
-record age, its own fresh/stale indicator, and `consecutiveAbends`. Raw
-`errorMsg`, credentials, secret/CA paths, internal hostnames, AWS ARNs, and
-exception text are never exposed -- only the existing closed `statusCode`/
-`statusMessage` vocabulary. All HTML output is escaped. `/api/processes` is
-deliberately canonical-only (no legacy-observer fallback, no legacy singleton
-`STATE` record, no PMS service-process rows) -- it is a new endpoint, not a
-replacement for `/api/status`'s existing migration-compatibility behavior.
+name, `processType`, status, a single manager-style combined lag/threshold/mode
+cell (e.g. `5s / thr 300s (alert)`, `N/A` when both are absent), record age
+(`Ns ago` / `Nm ago` / `Nh ago`), and `consecutiveAbends`. Raw `errorMsg`,
+credentials, secret/CA paths, internal hostnames, AWS ARNs, and exception text
+are never exposed -- only the existing closed `statusCode`/`statusMessage`
+vocabulary. All HTML output is escaped exactly once per value (including the
+lease holder). `/api/processes` is deliberately canonical-only (no
+legacy-observer fallback, no legacy singleton `STATE` record, no PMS
+service-process rows) -- it is a new endpoint, not a replacement for
+`/api/status`'s existing migration-compatibility behavior.
+
+The HTML portal (`/`) groups deployments by logical pipeline (`<h2>`) and
+renders each deployment as its own card/section beneath that heading --
+never a single wide table row with a process table nested inside its final
+cell. Each card's own process table lists only that deployment's processes; a
+stale process row is marked with both a visible `[STALE]` prefix and a
+dedicated CSS row class, so no separate per-process "fresh" column is needed.
+
+Canonical `STATE#<process>` rows are queried independently of whether
+`STATE#_deployment` exists: if the deployment-status record is missing (eg a
+race during first-tick startup), `effectiveStatus` resolves to `MISSING` (or
+falls back to the legacy observer's status when fallback is enabled), but any
+`STATE#<process>` rows already present under that deployment's canonical
+partition key are still returned and rendered. This holds for both `/`
+(`read_runtime_view`) and `/api/processes` (`read_deployment_processes_view`);
+neither path ever invents or mixes in legacy process rows.
 
 ## IRSA role
 

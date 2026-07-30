@@ -285,6 +285,46 @@ class ReadRuntimeViewTests(unittest.TestCase):
                                         self._meta(), legacy_fallback_enabled=True, now=now, stale_after_seconds=120)
         self.assertFalse(out["lease"]["fresh"])
 
+    def test_canonical_process_rows_shown_when_deployment_state_missing_and_fallback_disabled(self):
+        # STATE#_deployment absent (eg a race during first-tick startup)
+        # must not suppress independently-existing STATE#<process> rows.
+        now = 1780000010
+        table = FakeTable([make_process_item(recorded_at=now - 3)])
+        out = monitor.read_runtime_view(table, "payments-ora-to-pg-001", "source", "gg-oracle-payments-01",
+                                        self._meta(), legacy_fallback_enabled=False, now=now, stale_after_seconds=120)
+        self.assertEqual(out["effectiveStatus"], "MISSING")
+        self.assertEqual(len(out["processes"]), 1)
+        self.assertEqual(out["processes"][0]["process"], "EXTORA1")
+
+    def test_canonical_process_rows_shown_when_deployment_state_missing_and_legacy_fallback_enabled(self):
+        # The legacy-fallback branch still owns deployment-status
+        # resolution, but canonical process rows under the canonical
+        # partition key must still surface -- never invented legacy rows.
+        now = 1780000010
+        table = FakeTable([make_process_item(recorded_at=now - 3)])
+        out = monitor.read_runtime_view(table, "payments-ora-to-pg-001", "source", "gg-oracle-payments-01",
+                                        self._meta(), legacy_fallback_enabled=True, now=now, stale_after_seconds=120)
+        self.assertEqual(out["dataSource"], "legacy-observer-fallback")
+        self.assertEqual(out["effectiveStatus"], "MISSING")
+        self.assertEqual(len(out["processes"]), 1)
+        self.assertEqual(out["processes"][0]["process"], "EXTORA1")
+
+    def test_malformed_critical_services_root_does_not_crash(self):
+        now = 1780000010
+        table = FakeTable([make_deployment_state_item(recorded_at=now - 5, criticalServices="not-a-dict")])
+        out = monitor.read_runtime_view(table, "payments-ora-to-pg-001", "source", "gg-oracle-payments-01",
+                                        self._meta(), legacy_fallback_enabled=True, now=now, stale_after_seconds=120)
+        self.assertEqual(out["criticalServices"], {})
+
+    def test_malformed_critical_service_item_does_not_crash(self):
+        now = 1780000010
+        table = FakeTable([make_deployment_state_item(
+            recorded_at=now - 5,
+            criticalServices={"adminsrvr": True, "distsrvr": None, "metricsrvr": "unexpected"})])
+        out = monitor.read_runtime_view(table, "payments-ora-to-pg-001", "source", "gg-oracle-payments-01",
+                                        self._meta(), legacy_fallback_enabled=True, now=now, stale_after_seconds=120)
+        self.assertEqual(out["criticalServices"], {"adminsrvr": False, "distsrvr": False, "metricsrvr": False})
+
 
 class BuildStatusPayloadTests(unittest.TestCase):
     def test_end_to_end_shape_matches_recommended_schema(self):
@@ -516,6 +556,95 @@ class ProcessRowManagerFieldsTests(unittest.TestCase):
         self.assertFalse(out["stale"])
 
 
+class FormatRelativeAgeTests(unittest.TestCase):
+    """Phase 4C2 correction: manager-contract relative-age text, reimplemented
+    independently against this codebase's None-based missing-value
+    convention (not the manager's -1 sentinel)."""
+
+    def test_missing_returns_never_by_default(self):
+        self.assertEqual(monitor.format_relative_age(None), "never")
+
+    def test_missing_returns_caller_supplied_text(self):
+        self.assertEqual(monitor.format_relative_age(None, missing_text="-"), "-")
+
+    def test_seconds_tier(self):
+        self.assertEqual(monitor.format_relative_age(12), "12s ago")
+
+    def test_minutes_tier(self):
+        self.assertEqual(monitor.format_relative_age(4 * 60), "4m ago")
+
+    def test_hours_tier(self):
+        self.assertEqual(monitor.format_relative_age(2 * 3600), "2h ago")
+
+    def test_boundary_59_seconds_stays_in_seconds_tier(self):
+        self.assertEqual(monitor.format_relative_age(59), "59s ago")
+
+    def test_boundary_60_seconds_moves_to_minutes_tier(self):
+        self.assertEqual(monitor.format_relative_age(60), "1m ago")
+
+    def test_boundary_3599_seconds_stays_in_minutes_tier(self):
+        self.assertEqual(monitor.format_relative_age(3599), "59m ago")
+
+    def test_boundary_3600_seconds_moves_to_hours_tier(self):
+        self.assertEqual(monitor.format_relative_age(3600), "1h ago")
+
+
+class FormatLagThresholdModeTests(unittest.TestCase):
+    """Phase 4C2 correction: manager-contract combined lag/threshold/mode
+    cell text, reimplemented independently against this codebase's
+    None-based missing-value convention (not the manager's -1 sentinel)."""
+
+    def test_full_values_combined_matches_operator_facing_string(self):
+        self.assertEqual(monitor.format_lag_threshold_mode(5, 300, "alert"), "5s / thr 300s (alert)")
+
+    def test_both_missing_is_na(self):
+        self.assertEqual(monitor.format_lag_threshold_mode(None, None, None), "N/A")
+
+    def test_missing_lag_only_never_renders_literal_none(self):
+        result = monitor.format_lag_threshold_mode(None, 300, "alert")
+        self.assertNotIn("None", result)
+        self.assertIn("thr 300s", result)
+        self.assertIn("(alert)", result)
+
+    def test_missing_threshold_only_never_renders_literal_none(self):
+        result = monitor.format_lag_threshold_mode(5, None, "alert")
+        self.assertNotIn("None", result)
+        self.assertIn("5s", result)
+
+    def test_missing_mode_only_never_renders_literal_none(self):
+        result = monitor.format_lag_threshold_mode(5, 300, None)
+        self.assertNotIn("None", result)
+        self.assertIn("(?)", result)
+
+
+class CriticalServiceNormalizationTests(unittest.TestCase):
+    """Section 4: normalize_critical_services must never raise, regardless
+    of malformed shape, and must degrade unsafe entries to a fail-closed
+    (unreachable) representation."""
+
+    def test_well_formed_service_passes_through(self):
+        self.assertEqual(
+            monitor.normalize_critical_services({"adminsrvr": {"reachable": True}}),
+            {"adminsrvr": True})
+
+    def test_non_dict_root_never_raises_and_becomes_empty(self):
+        for bad_root in (None, "unexpected", 42, ["adminsrvr"], True):
+            with self.subTest(bad_root=bad_root):
+                self.assertEqual(monitor.normalize_critical_services(bad_root), {})
+
+    def test_boolean_service_value_never_raises(self):
+        self.assertEqual(monitor.normalize_critical_services({"adminsrvr": True}), {"adminsrvr": False})
+
+    def test_null_service_value_never_raises(self):
+        self.assertEqual(monitor.normalize_critical_services({"adminsrvr": None}), {"adminsrvr": False})
+
+    def test_string_service_value_never_raises(self):
+        self.assertEqual(monitor.normalize_critical_services({"adminsrvr": "unexpected"}), {"adminsrvr": False})
+
+    def test_missing_reachable_key_defaults_to_false(self):
+        self.assertEqual(monitor.normalize_critical_services({"adminsrvr": {}}), {"adminsrvr": False})
+
+
 class PortalHtmlManagerParityTests(unittest.TestCase):
     """Phase 4C2: every required HTML field is present, HTML-escaped, and
     never leaks raw errorMsg/credentials/secrets/hostnames/ARNs."""
@@ -598,13 +727,11 @@ class PortalHtmlManagerParityTests(unittest.TestCase):
 
     def test_process_lag_threshold_mode_shown(self):
         rendered = monitor.render_html(self._payload_with_full_runtime(), make_config())
-        self.assertIn(">5<", rendered)
-        self.assertIn(">300<", rendered)
-        self.assertIn(">alert<", rendered)
+        self.assertIn("5s / thr 300s (alert)", rendered)
 
     def test_process_age_shown(self):
         rendered = monitor.render_html(self._payload_with_full_runtime(), make_config())
-        self.assertIn(">3<", rendered)
+        self.assertIn("3s ago", rendered)
 
     def test_process_stale_indication_shown(self):
         payload = self._payload_with_full_runtime()
@@ -654,6 +781,48 @@ class PortalHtmlManagerParityTests(unittest.TestCase):
         self.assertIn("Authentication to the GoldenGate Admin REST API failed.", rendered)
         self.assertNotIn("password=", rendered)
         self.assertNotIn("db-internal.example.local", rendered)
+
+    def test_per_deployment_card_structure_not_a_wide_outer_table(self):
+        # Section 1 correction: no wide outer table with the process table
+        # nested inside its final <td>.
+        rendered = monitor.render_html(self._payload_with_full_runtime(), make_config())
+        self.assertNotIn("<th>Role</th>", rendered)
+        self.assertNotIn("<th>Critical Services</th><th>Processes</th>", rendered)
+        self.assertNotIn("<td><table", rendered)
+        self.assertNotIn("</table></td>", rendered)
+
+    def test_two_deployments_render_as_two_separate_cards(self):
+        payload = self._payload_with_full_runtime()
+        second = dict(payload["logicalPipelines"][0]["runtimes"][0])
+        second.update(deploymentName="gg-postgresql-payments-01", role="target")
+        payload["logicalPipelines"][0]["runtimes"].append(second)
+        rendered = monitor.render_html(payload, make_config())
+        self.assertEqual(rendered.count("gg-oracle-payments-01"), 1)
+        self.assertEqual(rendered.count("gg-postgresql-payments-01"), 1)
+        self.assertEqual(rendered.count('border-radius:6px;padding:8px 14px 12px'), 2)
+
+    def test_stale_process_row_has_class_and_visible_prefix(self):
+        payload = self._payload_with_full_runtime()
+        payload["logicalPipelines"][0]["runtimes"][0]["processes"][0]["stale"] = True
+        rendered = monitor.render_html(payload, make_config())
+        self.assertIn("stale-row", rendered)
+        self.assertIn("[STALE]", rendered)
+
+    def test_fresh_process_row_has_no_stale_marker(self):
+        rendered = monitor.render_html(self._payload_with_full_runtime(), make_config())
+        # the stylesheet's static tr.stale-row rule is always present;
+        # what must be absent is the class actually applied to a row.
+        self.assertNotIn('<tr class="stale-row"', rendered)
+        self.assertNotIn("[STALE]", rendered)
+
+    def test_lease_holder_escaped_exactly_once(self):
+        malicious_holder = '<script>&"\''
+        payload = self._payload_with_full_runtime(
+            lease={"holder": malicious_holder, "expiresAt": 1780000040, "fresh": True})
+        rendered = monitor.render_html(payload, make_config())
+        self.assertNotIn("<script>", rendered)
+        self.assertNotIn("&amp;amp;", rendered)
+        self.assertIn(html_module.escape(malicious_holder), rendered)
 
 
 class ApiProcessesTests(unittest.TestCase):
@@ -743,6 +912,21 @@ class ApiProcessesTests(unittest.TestCase):
         body = json.loads(writes[0][2])
         dep = next(d for d in body["deployments"] if d["deploymentName"] == "gg-oracle-payments-01")
         self.assertEqual(dep["effectiveStatus"], "MISSING")
+
+    def test_canonical_process_rows_returned_when_deployment_state_missing(self):
+        # Section 3 correction: STATE#_deployment missing must not suppress
+        # independently-existing STATE#<process> rows in this canonical-only
+        # endpoint either.
+        now = 1780000010
+        table = FakeTable([make_process_item(recorded_at=now - 3)])
+        handler, writes = self._handler(lambda: table)
+        handler.path = "/api/processes"
+        handler.do_GET()
+        body = json.loads(writes[0][2])
+        dep = next(d for d in body["deployments"] if d["deploymentName"] == "gg-oracle-payments-01")
+        self.assertEqual(dep["effectiveStatus"], "MISSING")
+        self.assertEqual(len(dep["processes"]), 1)
+        self.assertEqual(dep["processes"][0]["process"], "EXTORA1")
 
     def test_no_dynamodb_scan_used(self):
         now = 1780000010
