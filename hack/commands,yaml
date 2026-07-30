@@ -1,108 +1,34 @@
-kubectl exec -i \
+Oracle PMS process inventory through HTTPS
+kubectl exec \
   -n goldengate-monitoring \
   deployment/gg-monitor \
-  -- python3 - <<'PY'
-import http.client
-import json
-
-targets = [
-    (
-        "gg-oracle-payments-01",
-        "gg-oracle-payments-01.goldengate-dev.svc.cluster.local",
-    ),
-    (
-        "gg-postgresql-payments-01",
-        "gg-postgresql-payments-01.goldengate-dev.svc.cluster.local",
-    ),
-]
-
-paths = [
-    "/services/v2/mpoints/processes",
-    "/services/v2/monitoring/statusChanges",
-    "/services/v2/metrics",
-]
-
-for deployment, host in targets:
-    for path in paths:
-        result = {
-            "deployment": deployment,
-            "port": 9015,
-            "schemeTested": "http",
-            "path": path,
-        }
-
-        try:
-            connection = http.client.HTTPConnection(
-                host,
-                9015,
-                timeout=5,
-            )
-
-            connection.request(
-                "GET",
-                path,
-                headers={
-                    "Accept": "application/json",
-                    "User-Agent": "gg-pms-contract-check/1",
-                },
-            )
-
-            response = connection.getresponse()
-
-            result["httpStatus"] = response.status
-            result["contentType"] = (
-                response.getheader("Content-Type") or ""
-            ).split(";", 1)[0]
-
-            # Do not print or retain the response body.
-            response.read(1)
-            connection.close()
-
-        except Exception as exc:
-            result["errorType"] = type(exc).__name__
-
-        print(json.dumps(result, sort_keys=True))
-PY
-
-----------------
-
-Optional listener inspection
-
-This does not expose credentials:
-
+  -- python3 tools/gg_api_contract_probe.py \
+     --deployment gg-oracle-payments-01 \
+     --port admin \
+     --path /services/v2/mpoints/processes
+Oracle status changes through HTTPS
 kubectl exec \
-  -n goldengate-dev \
-  gg-oracle-payments-01-0 \
-  -- sh -c '
-    echo "Processes:";
-    ps -ef | grep -Ei "pms|metric" | grep -v grep || true;
-
-    echo "Listening ports:";
-    if command -v ss >/dev/null 2>&1; then
-      ss -lntup | grep -E ":8443|:9015" || true;
-    elif command -v netstat >/dev/null 2>&1; then
-      netstat -lntup 2>/dev/null | grep -E ":8443|:9015" || true;
-    else
-      echo "ss/netstat unavailable";
-    fi
-  '
-
-Repeat for PostgreSQL:
-
+  -n goldengate-monitoring \
+  deployment/gg-monitor \
+  -- python3 tools/gg_api_contract_probe.py \
+     --deployment gg-oracle-payments-01 \
+     --port admin \
+     --path /services/v2/monitoring/statusChanges
+PostgreSQL PMS process inventory through HTTPS
 kubectl exec \
-  -n goldengate-dev \
-  gg-postgresql-payments-01-0 \
-  -- sh -c '
-    echo "Processes:";
-    ps -ef | grep -Ei "pms|metric" | grep -v grep || true;
+  -n goldengate-monitoring \
+  deployment/gg-monitor \
+  -- python3 tools/gg_api_contract_probe.py \
+     --deployment gg-postgresql-payments-01 \
+     --port admin \
+     --path /services/v2/mpoints/processes
+PostgreSQL status changes through HTTPS
+kubectl exec \
+  -n goldengate-monitoring \
+  deployment/gg-monitor \
+  -- python3 tools/gg_api_contract_probe.py \
+     --deployment gg-postgresql-payments-01 \
+     --port admin \
+     --path /services/v2/monitoring/statusChanges
 
-    echo "Listening ports:";
-    if command -v ss >/dev/null 2>&1; then
-      ss -lntup | grep -E ":8443|:9015" || true;
-    elif command -v netstat >/dev/null 2>&1; then
-      netstat -lntup 2>/dev/null | grep -E ":8443|:9015" || true;
-    else
-      echo "ss/netstat unavailable";
-    fi
-  '
-Current status
+The probe’s --port admin option only selects the securely configured 8443 connection. It does not change the requested path.
