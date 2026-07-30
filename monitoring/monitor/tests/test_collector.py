@@ -1432,6 +1432,24 @@ class PmsProcessNameBoundsTests(unittest.TestCase):
         self.assertEqual(names, ["B", "A"])
         self.assertEqual(count, 4)
 
+    def test_unpaired_high_surrogate_rejected(self):
+        # \ud800 is a valid Python str character (json.loads tolerates a
+        # lone \uD800 escape) but cannot be UTF-8 encoded.
+        self.assertIsNone(core._valid_pms_process_name("\ud800"))
+        self.assertIsNone(core._valid_pms_process_name("EXTRACT_\ud800_01"))
+
+    def test_unpaired_low_surrogate_rejected(self):
+        self.assertIsNone(core._valid_pms_process_name("\udc00"))
+        self.assertIsNone(core._valid_pms_process_name("EXTRACT_\udfff_01"))
+
+    def test_normal_non_ascii_unicode_name_accepted_and_url_encoded(self):
+        name = "EXTRACT_Café_日本語"
+        self.assertEqual(core._valid_pms_process_name(name), name)
+        path = core._pms_detail_path(name, "processPerformance")
+        self.assertIsNotNone(path)
+        encoded_segment = path.split("/")[4]
+        self.assertEqual(urllib.parse.unquote(encoded_segment), name)
+
 
 class PmsSnapshotSizeBudgetTests(unittest.TestCase):
     """Section 6 required proof: the maximum permitted bounded PMS snapshot
@@ -1538,6 +1556,93 @@ class PmsWrappedTlsClassificationTests(unittest.TestCase):
         category = core._classify_pms_error(exc)
         self.assertEqual(category, "TLS_FAILED")
         self.assertNotIn("SECRET_HOST_DETAIL_xyz", category)
+
+
+class PmsSurrogateAndDefensiveBoundaryTests(unittest.TestCase):
+    """Reproduces and fixes the reported defect: a processName containing
+    an unpaired Unicode surrogate must never reach urllib.parse.quote (and
+    if it somehow did, must never let UnicodeEncodeError escape
+    collect_pms), and no unanticipated internal failure may ever escape
+    collect_pms as a whole."""
+
+    BASE = "https://gg-test:8443"
+
+    def _opener(self, inventory, detail_responses=None):
+        detail_responses = detail_responses or {}
+
+        def _open(url, timeout=5):
+            body = inventory if url == f"{self.BASE}{core.PMS_INVENTORY_PATH}" else detail_responses[url]
+            m = MagicMock()
+            m.read.return_value = json.dumps(body).encode()
+            m.__enter__.return_value = m
+            m.__exit__.return_value = False
+            return m
+        o = MagicMock()
+        o.open.side_effect = _open
+        return o
+
+    def test_surrogate_name_causes_zero_detail_requests_and_never_stored(self):
+        bad_name = "\ud800"
+        inventory = {"response": {"processes": [{"processName": bad_name}, {"processName": "GOOD1"}]}}
+        detail = {
+            f"{self.BASE}/services/v2/mpoints/GOOD1/processPerformance": {"response": {"cpuTimeUs": 1}},
+            f"{self.BASE}/services/v2/mpoints/GOOD1/serviceHealth": {"response": {"isHealthy": True}},
+        }
+        opener = self._opener(inventory, detail)
+        result = core.collect_pms(self.BASE, opener)
+        self.assertEqual(result["followedCount"], 1)
+        self.assertNotIn(bad_name, result["processes"])
+        self.assertIn("GOOD1", result["processes"])
+
+    def test_forced_unicode_encode_error_in_path_construction_cannot_escape(self):
+        opener = self._opener({"response": {"processes": [{"processName": "OK1"}]}})
+        with mock.patch.object(core.urllib.parse, "quote", side_effect=UnicodeEncodeError(
+                "utf-8", "x", 0, 1, "surrogates not allowed")):
+            try:
+                result = core.collect_pms(self.BASE, opener)
+            except Exception as e:  # pragma: no cover
+                self.fail(f"collect_pms raised: {e!r}")
+        self.assertIsInstance(result, dict)
+        # OK1 was still followed (a real, valid name) -- its path just
+        # couldn't be built this tick, so no data was collected for it, but
+        # it is not silently dropped from the map, and no exception escaped.
+        self.assertEqual(result["processes"]["OK1"], {
+            "performance": {}, "serviceHealth": {}, "heartbeatAgeSeconds": None})
+        self.assertEqual(result["failureCount"], 1)
+
+    def test_forced_unexpected_internal_exception_cannot_escape(self):
+        opener = self._opener({"response": {"processes": []}})
+        with mock.patch.object(core, "_collect_pms_impl", side_effect=RuntimeError("SECRET_INTERNAL_xyz")):
+            try:
+                result = core.collect_pms(self.BASE, opener)
+            except Exception as e:  # pragma: no cover
+                self.fail(f"collect_pms raised: {e!r}")
+        self.assertEqual(result["status"], "INVALID_RESPONSE")
+        self.assertEqual(result["processes"], {})
+        self.assertIsNone(result["heartbeatAgeSeconds"])
+        self.assertEqual(result["inventoryCount"], 0)
+        self.assertEqual(result["followedCount"], 0)
+
+    def test_defensive_result_contains_no_leaks(self):
+        opener = self._opener({"response": {"processes": []}})
+        with mock.patch.object(
+                core, "_collect_pms_impl",
+                side_effect=RuntimeError("SECRET_xyz https://internal-host:8443/services/v2/mpoints/PROC1 "
+                                         "user=admin ca=/mnt/secrets-store/ca-chain-pem")):
+            result = core.collect_pms(self.BASE, opener)
+        blob = json.dumps(result)
+        self.assertNotIn("SECRET_xyz", blob)
+        self.assertNotIn("internal-host", blob)
+        self.assertNotIn("PROC1", blob)
+        self.assertNotIn("admin", blob)
+        self.assertNotIn("secrets-store", blob)
+        self.assertNotIn("Traceback", blob)
+
+    def test_defensive_boundary_performs_no_logging(self):
+        opener = self._opener({"response": {"processes": []}})
+        with mock.patch.object(core, "_collect_pms_impl", side_effect=RuntimeError("boom")):
+            with self.assertNoLogs(core.logger):
+                core.collect_pms(self.BASE, opener)
 
 
 class PmsPollingLoopIntegrationTests(unittest.TestCase):

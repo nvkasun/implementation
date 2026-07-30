@@ -462,14 +462,25 @@ def _http_json_bounded(url, opener, timeout=5, max_bytes=PMS_MAX_RESPONSE_BYTES)
     return json.loads(raw.decode())
 
 
+def _has_surrogate_codepoint(s):
+    """True if s contains any lone Unicode surrogate code point (U+D800 -
+    U+DFFF). A JSON payload can legally decode into a Python str containing
+    these (json.loads tolerates \\uD800-\\uDFFF escapes that don't form a
+    valid surrogate pair), but such a str cannot be UTF-8 encoded --
+    urllib.parse.quote would raise UnicodeEncodeError on it."""
+    return any(0xD800 <= ord(c) <= 0xDFFF for c in s)
+
+
 def _valid_pms_process_name(raw):
     """A production-safe PMS process name: a string with at least one
     non-whitespace character, no longer than MAX_PMS_PROCESS_NAME_LENGTH,
-    containing no ASCII control character, and never '.' or '..' (the only
-    values urllib.parse.quote(safe="") leaves unescaped that could act as a
-    traversal-equivalent path segment). Returns the name EXACTLY as given
-    when valid -- never rewritten, stripped, or truncated -- or None to
-    signal "skip this item" when invalid."""
+    containing no ASCII control character or lone Unicode surrogate code
+    point (which cannot be UTF-8 encoded -- see _has_surrogate_codepoint),
+    and never '.' or '..' (the only values urllib.parse.quote(safe="")
+    leaves unescaped that could act as a traversal-equivalent path
+    segment). Returns the name EXACTLY as given when valid -- never
+    rewritten, stripped, or truncated -- or None to signal "skip this item"
+    when invalid."""
     if not isinstance(raw, str):
         return None
     if not raw.strip():
@@ -477,6 +488,8 @@ def _valid_pms_process_name(raw):
     if len(raw) > MAX_PMS_PROCESS_NAME_LENGTH:
         return None
     if any(c in _PMS_CONTROL_CHARS for c in raw):
+        return None
+    if _has_surrogate_codepoint(raw):
         return None
     if raw in (".", ".."):
         return None
@@ -615,10 +628,16 @@ def _pms_valid_process_names(payload):
 def _pms_detail_path(name, kind):
     """Encodes name as exactly one URL path segment. Returns None (skip)
     for any name _valid_pms_process_name itself would reject -- defense in
-    depth, since callers already filter through that function first."""
+    depth, since callers already filter through that function first. Also
+    catches UnicodeEncodeError from quote() itself as a second, independent
+    layer of defense -- quote() encodes to UTF-8 internally, which raises
+    for any string _valid_pms_process_name did not already catch."""
     if _valid_pms_process_name(name) is None:
         return None
-    encoded = urllib.parse.quote(name, safe="")
+    try:
+        encoded = urllib.parse.quote(name, safe="")
+    except UnicodeEncodeError:
+        return None
     return f"/services/v2/mpoints/{encoded}/{kind}"
 
 
@@ -698,17 +717,17 @@ def _pms_unavailable_snapshot(status):
     }
 
 
-def collect_pms(base, opener, now=None):
+def _collect_pms_impl(base, opener, now=None):
     """One bounded PMS collection pass for this tick. Reuses the caller's
     already-authenticated, TLS-verified opener. GETs the confirmed process
     inventory once; follows up to MAX_FOLLOWED_PMS_PROCESSES unique,
     deduplicated, production-safe processName values with sequential,
-    bounded processPerformance + serviceHealth GETs only. Never raises --
-    always returns a bounded, sanitized summary dict; the caller decides
-    whether to persist it (this function performs no DynamoDB I/O and does
-    not know about lease/fencing -- it is a pure network/normalization
-    operation only). Never logs a raw exception, response body, or process
-    name anywhere in this function.
+    bounded processPerformance + serviceHealth GETs only. Never logs a raw
+    exception, response body, or process name anywhere in this function.
+    Guards its own known failure modes (network errors, invalid shapes),
+    but see collect_pms() for the final catch-all boundary against any
+    unanticipated internal failure (e.g. an edge case in path construction
+    or normalization this function's own guards did not foresee).
 
     A structurally invalid inventory response (not the three required
     shape checks) is INVALID_RESPONSE -- distinct from a genuinely empty
@@ -811,6 +830,32 @@ def collect_pms(base, opener, now=None):
         "heartbeatAgeSeconds": max(ages) if ages else None,
         "processes": processes_out,
     }
+
+
+def collect_pms(base, opener, now=None):
+    """Public entry point: one bounded PMS collection pass for this tick.
+    The caller decides whether to persist the result (this function
+    performs no DynamoDB or CloudWatch I/O and does not know about
+    lease/fencing -- it is a pure network/normalization operation only).
+
+    This is a thin wrapper around _collect_pms_impl that adds a final,
+    unconditional defensive boundary: _collect_pms_impl already guards its
+    own known failure modes (network errors, invalid inventory/detail
+    shapes, unsafe process names), but an unanticipated internal failure
+    (e.g. a normalization or path-construction edge case neither of those
+    guards foresaw) must still never escape as an exception. On any such
+    failure this returns a current, bounded, sanitized snapshot
+    (status=INVALID_RESPONSE, zero counts, heartbeatAgeSeconds=None, empty
+    processes) with no logging and no raw exception/process-name/URL
+    exposure -- collect_pms as a whole must never raise."""
+    try:
+        return _collect_pms_impl(base, opener, now=now)
+    except Exception:
+        return {
+            "status": "INVALID_RESPONSE", "collectedAt": cfgmod.now_epoch(),
+            "inventoryCount": 0, "followedCount": 0, "successCount": 0, "failureCount": 0,
+            "heartbeatAgeSeconds": None, "processes": {},
+        }
 
 
 _LAG_METRIC_BY_PROCESS_TYPE = {"extract": "ExtractLagSeconds", "replicat": "ReplicatLagSeconds"}
