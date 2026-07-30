@@ -644,6 +644,54 @@ class CriticalServiceNormalizationTests(unittest.TestCase):
     def test_missing_reachable_key_defaults_to_false(self):
         self.assertEqual(monitor.normalize_critical_services({"adminsrvr": {}}), {"adminsrvr": False})
 
+    def test_literal_true_reachable_accepted(self):
+        self.assertEqual(
+            monitor.normalize_critical_services({"adminsrvr": {"reachable": True}}),
+            {"adminsrvr": True})
+
+    def test_literal_false_reachable_rejected(self):
+        self.assertEqual(
+            monitor.normalize_critical_services({"adminsrvr": {"reachable": False}}),
+            {"adminsrvr": False})
+
+    def test_string_true_reachable_rejected(self):
+        self.assertEqual(
+            monitor.normalize_critical_services({"adminsrvr": {"reachable": "true"}}),
+            {"adminsrvr": False})
+
+    def test_string_false_reachable_rejected(self):
+        self.assertEqual(
+            monitor.normalize_critical_services({"adminsrvr": {"reachable": "false"}}),
+            {"adminsrvr": False})
+
+    def test_integer_one_reachable_rejected(self):
+        self.assertEqual(
+            monitor.normalize_critical_services({"adminsrvr": {"reachable": 1}}),
+            {"adminsrvr": False})
+
+    def test_integer_zero_reachable_rejected(self):
+        self.assertEqual(
+            monitor.normalize_critical_services({"adminsrvr": {"reachable": 0}}),
+            {"adminsrvr": False})
+
+    def test_none_reachable_rejected(self):
+        self.assertEqual(
+            monitor.normalize_critical_services({"adminsrvr": {"reachable": None}}),
+            {"adminsrvr": False})
+
+    def test_nested_arbitrary_object_and_list_reachable_rejected(self):
+        self.assertEqual(
+            monitor.normalize_critical_services({"adminsrvr": {"reachable": {"nested": True}}}),
+            {"adminsrvr": False})
+        self.assertEqual(
+            monitor.normalize_critical_services({"adminsrvr": {"reachable": [True]}}),
+            {"adminsrvr": False})
+
+    def test_boolean_root_service_value_rejected(self):
+        # {"adminsrvr": True} -- the service value itself, not a
+        # {"reachable": ...} dict -- must fail closed, not be coerced.
+        self.assertEqual(monitor.normalize_critical_services({"adminsrvr": True}), {"adminsrvr": False})
+
 
 class PortalHtmlManagerParityTests(unittest.TestCase):
     """Phase 4C2: every required HTML field is present, HTML-escaped, and
@@ -716,6 +764,33 @@ class PortalHtmlManagerParityTests(unittest.TestCase):
         self.assertIn("reachable", rendered)
         self.assertIn("distsrvr", rendered)
         self.assertIn("down", rendered)
+
+    def test_malformed_critical_service_values_render_as_down_never_reachable(self):
+        # Defense in depth at the HTML layer: even if a non-True truthy
+        # value somehow reaches render_html directly (bypassing
+        # normalize_critical_services), only the literal Boolean True may
+        # render as "reachable".
+        payload = self._payload_with_full_runtime(criticalServices={
+            "svc-true": True, "svc-str-true": "true", "svc-str-false": "false",
+            "svc-one": 1, "svc-zero": 0, "svc-none": None, "svc-list": ["reachable"],
+        })
+        rendered = monitor.render_html(payload, make_config())
+        for name in ("svc-true", "svc-str-true", "svc-str-false", "svc-one",
+                    "svc-zero", "svc-none", "svc-list"):
+            self.assertIn(name, rendered)
+        # Exactly one genuinely-reachable service (svc-true, literal True);
+        # every malformed truthy/falsy value must render as down, never
+        # reachable.
+        self.assertEqual(rendered.count(">reachable<"), 1)
+        self.assertEqual(rendered.count(">down<"), 6)
+
+    def test_critical_service_no_raw_malformed_value_exposed_in_html(self):
+        payload = self._payload_with_full_runtime(criticalServices={
+            "adminsrvr": "unexpected-raw-value", "distsrvr": 1234567,
+        })
+        rendered = monitor.render_html(payload, make_config())
+        self.assertNotIn("unexpected-raw-value", rendered)
+        self.assertNotIn("1234567", rendered)
 
     def test_no_critical_services_shows_placeholder(self):
         rendered = monitor.render_html(self._payload_with_full_runtime(criticalServices={}), make_config())

@@ -266,15 +266,16 @@ def lease_view(lease_item, now):
 
 def normalize_critical_services(raw):
     """Fail-closed critical-service normalization -- never raises regardless
-    of shape. Only {"<name>": {"reachable": <bool>}} entries are trusted;
+    of shape. Only {"<name>": {"reachable": True}} entries are trusted; the
+    reachable field must be the literal Boolean True, not merely truthy --
+    values like "true", 1, or any other object fail closed to False, as does
     any other per-service shape (bool, null, string, list, ...) or a
-    non-dict root safely becomes an empty/unreachable representation
-    instead of raising."""
+    non-dict root."""
     if not isinstance(raw, dict):
         return {}
     normalized = {}
     for name, value in raw.items():
-        reachable = bool(value.get("reachable")) if isinstance(value, dict) else False
+        reachable = isinstance(value, dict) and value.get("reachable") is True
         normalized[str(name)] = reachable
     return normalized
 
@@ -436,7 +437,7 @@ def _critical_services_html(critical_services):
     if not critical_services:
         return "-"
     return " ".join(
-        f"{_esc(svc)} {_reachable_badge(bool(up))}"
+        f"{_esc(svc)} {_reachable_badge(up is True)}"
         for svc, up in sorted(critical_services.items()))
 
 
