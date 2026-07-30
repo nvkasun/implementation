@@ -1,210 +1,65 @@
-Then check:
+Immediate next step: compare TLS on ports 8443 and 9015
 
-kubectl rollout status deployment/gg-monitor \
-  -n goldengate-monitoring \
-  --timeout=5m
+First display the runtime Service ports:
 
-Expected:
+kubectl get svc \
+  -n goldengate-dev \
+  -o custom-columns='NAME:.metadata.name,PORTS:.spec.ports[*].port,TARGETPORTS:.spec.ports[*].targetPort'
 
-deployment "gg-monitor" successfully rolled out
+Confirm that both runtime Services expose 8443 and 9015.
 
-Check the pod:
+Then run this safe TLS diagnostic from the monitor pod. It prints only the verification result—no credentials or certificate body:
 
-kubectl get pods \
-  -n goldengate-monitoring \
-  -l app.kubernetes.io/name=goldengate-monitor \
-  -o wide
-
-Expected:
-
-Running
-Ready 1/1
-Step 3 — Confirm the new image is running
-kubectl get deployment gg-monitor \
-  -n goldengate-monitoring \
-  -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
-
-Record the image tag or digest and compare it with the workflow output.
-
-Step 4 — Confirm CloudWatch is still disabled
-kubectl get deployment gg-monitor \
-  -n goldengate-monitoring \
-  -o jsonpath='{range .spec.template.spec.containers[0].env[?(@.name=="CLOUDWATCH_PUBLISH_ENABLED")]}{.name}={.value}{"\n"}{end}'
-
-Expected:
-
-CLOUDWATCH_PUBLISH_ENABLED=false
-
-Do not change this yet.
-
-Live process-discovery validation
-
-Wait approximately one complete monitor polling interval, then run:
-
-kubectl logs \
+kubectl exec -i \
   -n goldengate-monitoring \
   deployment/gg-monitor \
-  --since=5m |
-grep process_discovery_summary
+  -- python3 - <<'PY'
+import socket
+import ssl
 
-You should now see JSON records similar to:
+CA_FILE = "/mnt/secrets-store/ca-chain-pem"
 
-{
-  "event": "process_discovery_summary",
-  "deployment": "gg-oracle-payments-01",
-  "extractCount": 0,
-  "replicatCount": 0,
-  "distpathCount": 0,
-  "totalCount": 0
-}
+runtimes = [
+    (
+        "oracle",
+        "gg-oracle-payments-01.goldengate-dev.svc.cluster.local",
+        "gg-oracle-payments-01.goldengate-dev.adcbmis.local",
+    ),
+    (
+        "postgresql",
+        "gg-postgresql-payments-01.goldengate-dev.svc.cluster.local",
+        "gg-postgresql-payments-01.goldengate-dev.adcbmis.local",
+    ),
+]
 
-and:
+context = ssl.create_default_context(cafile=CA_FILE)
 
-{
-  "event": "process_discovery_summary",
-  "deployment": "gg-postgresql-payments-01",
-  "extractCount": 0,
-  "replicatCount": 0,
-  "distpathCount": 0,
-  "totalCount": 0
-}
+for runtime, host, server_name in runtimes:
+    for port in (8443, 9015):
+        try:
+            with socket.create_connection((host, port), timeout=5) as raw:
+                with context.wrap_socket(
+                    raw,
+                    server_hostname=server_name,
+                ) as tls:
+                    print(
+                        f"{runtime} port={port}: "
+                        f"TLS_OK protocol={tls.version()}"
+                    )
+        except ssl.SSLCertVerificationError as exc:
+            print(
+                f"{runtime} port={port}: "
+                f"TLS_VERIFY_FAILED "
+                f"code={exc.verify_code} "
+                f"reason={exc.verify_message}"
+            )
+        except Exception as exc:
+            print(
+                f"{runtime} port={port}: "
+                f"{type(exc).__name__}"
+            )
+PY
 
-Zero is valid when real processes are not configured.
+Replace the Service names only if the earlier kubectl get svc output shows different names.
 
-Confirm there is one summary per deployment per successful polling tick—not duplicate lines.
-
-Admin REST probes
-
-Use the Deployment target so you do not need to retrieve the current pod name manually.
-
-Oracle extracts
-kubectl exec \
-  -n goldengate-monitoring \
-  deployment/gg-monitor \
-  -- python3 tools/gg_api_contract_probe.py \
-     --deployment gg-oracle-payments-01 \
-     --port admin \
-     --path /services/v2/extracts
-Oracle distribution paths
-kubectl exec \
-  -n goldengate-monitoring \
-  deployment/gg-monitor \
-  -- python3 tools/gg_api_contract_probe.py \
-     --deployment gg-oracle-payments-01 \
-     --port admin \
-     --path /services/v2/sources
-PostgreSQL replicats
-kubectl exec \
-  -n goldengate-monitoring \
-  deployment/gg-monitor \
-  -- python3 tools/gg_api_contract_probe.py \
-     --deployment gg-postgresql-payments-01 \
-     --port admin \
-     --path /services/v2/replicats
-
-For completeness, you can also probe all three Admin endpoints against both runtimes. The outputs contain only structure, not actual process names or field values.
-
-A successful response should resemble:
-
-{
-  "deploymentName": "gg-oracle-payments-01",
-  "deploymentType": "oracle",
-  "portType": "admin",
-  "path": "/services/v2/extracts",
-  "httpStatus": 200,
-  "contentType": "application/json",
-  "topLevelKeys": ["response"],
-  "responseKeys": ["items"],
-  "itemCount": 0,
-  "itemFieldNames": [],
-  "fieldTypes": {}
-}
-
-When itemCount is greater than zero, share the field names and types exactly as produced.
-
-Controlled PMS candidate probes
-
-These commands inspect the contract only. They do not activate production PMS collection.
-
-Oracle
-kubectl exec \
-  -n goldengate-monitoring \
-  deployment/gg-monitor \
-  -- python3 tools/gg_api_contract_probe.py \
-     --deployment gg-oracle-payments-01 \
-     --port metrics \
-     --path /services/v2/metrics
-PostgreSQL
-kubectl exec \
-  -n goldengate-monitoring \
-  deployment/gg-monitor \
-  -- python3 tools/gg_api_contract_probe.py \
-     --deployment gg-postgresql-payments-01 \
-     --port metrics \
-     --path /services/v2/metrics
-
-Possible results include:
-
-HTTP 200 with structural JSON metadata
-NOT_FOUND
-AUTH_FAILED
-TLS_FAILED
-ENDPOINT_UNAVAILABLE
-INVALID_JSON
-UNEXPECTED_RESPONSE
-
-Any of these is useful evidence. Do not try random endpoints yet.
-
-If the output gives itemCount: 0 and no field names, that does not necessarily mean PMS has no metrics. It may mean the real response uses a different nesting structure. Share the complete sanitized output, and we will decide whether the probe needs one safe structural-depth enhancement.
-
-Validate normal monitor behavior
-
-After deployment, confirm the existing endpoints still work:
-
-curl -s https://monitor.goldengate-dev.adcbmis.local/healthz
-curl -s https://monitor.goldengate-dev.adcbmis.local/readyz
-curl -s https://monitor.goldengate-dev.adcbmis.local/api/status
-
-Expected:
-
-healthz: ok
-readyz: ready
-both canonical runtimes present
-dataSource: canonical-monitor
-effectiveStatus: UP
-
-Check the portal and confirm both runtimes still appear under:
-
-payments-ora-to-pg-001
-
-If the new discovery finds real processes, you should also begin seeing:
-
-STATE#<actual-process-name>
-
-and process rows in the portal.
-
-Do not change yet
-
-Keep:
-
-cloudwatch:
-  publishEnabled: false
-
-legacyFallback:
-  enabled: true
-
-Keep the old observer and legacy combined application running.
-
-Do not enable CONFIG.metricsEnabled, do not remove the observer, and do not begin Fluent Bit or alarms.
-
-Exact next sequence
-1. Remove generated pycache/pyc files
-2. Commit the Phase 4B1 changes to VDR
-3. Run goldengate-monitor.yaml with deploy=false
-4. Run goldengate-monitor.yaml with deploy=true
-5. Verify rollout and CloudWatch=false
-6. Verify process_discovery_summary logs
-7. Run the three Admin REST probes
-8. Run the two PMS candidate probes
-9. Validate health/readiness/API/portal
-10. Share the sanitized probe outputs and discovery logs
+How to interpret the result
