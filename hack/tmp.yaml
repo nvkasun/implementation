@@ -1,19 +1,7 @@
-Compact validation commands
-A. Rollout, image and CloudWatch switch
-kubectl rollout status deployment/gg-monitor \
-  -n goldengate-monitoring \
-  --timeout=5m && \
-kubectl get deployment gg-monitor \
-  -n goldengate-monitoring \
-  -o jsonpath='image={.spec.template.spec.containers[0].image}{"\n"}{range .spec.template.spec.containers[0].env[?(@.name=="CLOUDWATCH_PUBLISH_ENABLED")]}{.name}={.value}{"\n"}{end}'
+Run only these two corrected commands.
 
-Expected:
-
-deployment "gg-monitor" successfully rolled out
-image=...goldengate-monitor:mon-<new-tag>
-CLOUDWATCH_PUBLISH_ENABLED=false
-B. Health and readiness
-kubectl exec \
+1. Health and readiness
+kubectl exec -i \
   -n goldengate-monitoring \
   deployment/gg-monitor \
   -- python3 - <<'PY'
@@ -26,13 +14,8 @@ for path in ("/healthz", "/readyz"):
     ) as response:
         print(path, response.status, response.read().decode())
 PY
-
-Expected:
-
-/healthz 200 {"status":"ok",...}
-/readyz 200 {"status":"ready"}
-C. Compact DynamoDB PMS result
-kubectl exec \
+2. PMS data in DynamoDB
+kubectl exec -i \
   -n goldengate-monitoring \
   deployment/gg-monitor \
   -- python3 - <<'PY'
@@ -74,24 +57,3 @@ for deployment in (
         f"heartbeatAge={pms.get('heartbeatAgeSeconds')}"
     )
 PY
-
-Ideal expected output:
-
-gg-oracle-payments-01 deployment=UP pms=OK age=<120s inventory=4 followed=4 success=4 failure=0 processes=4 heartbeatAge=<number>
-gg-postgresql-payments-01 deployment=UP pms=OK age=<120s inventory=4 followed=4 success=4 failure=0 processes=4 heartbeatAge=<number>
-
-Interpretation:
-
-pms=OK: full collection succeeded.
-pms=PARTIAL: some PMS details succeeded and some failed.
-pms=UNAVAILABLE: none of the detail calls succeeded.
-deployment=UP with pms=PARTIAL/UNAVAILABLE: Admin REST deployment health remains healthy, which is the intended behavior.
-D. Error-only logs
-kubectl logs \
-  -n goldengate-monitoring \
-  deployment/gg-monitor \
-  --since=10m |
-grep -E 'PMS collection unavailable|tick failed|Traceback|ERROR' |
-tail -20 || true
-
-Expected when clean:
