@@ -33,6 +33,7 @@ import secrets as _secrets
 import socket
 import ssl
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -409,6 +410,18 @@ PMS_INVENTORY_PATH = "/services/v2/mpoints/processes"
 PMS_DETAIL_KINDS = ("processPerformance", "serviceHealth")
 MAX_FOLLOWED_PMS_PROCESSES = 20
 
+# Fixed, non-operator-tunable total-time safety net: the theoretical worst
+# case is 1 inventory + (MAX_FOLLOWED_PMS_PROCESSES * len(PMS_DETAIL_KINDS))
+# detail requests. At the old default 5s-per-request timeout that is up to
+# 205s -- comfortably past the deployed 120s stale threshold, which could
+# make an otherwise-healthy deployment appear stale before
+# STATE#_deployment is even written. PMS_REQUEST_TIMEOUT_SECONDS caps each
+# individual request; PMS_COLLECTION_BUDGET_SECONDS caps the whole pass --
+# once the absolute deadline is reached, no further PMS request is issued
+# (no sleep, no retry) and whatever was already normalized is returned.
+PMS_REQUEST_TIMEOUT_SECONDS = 2
+PMS_COLLECTION_BUDGET_SECONDS = 30
+
 # Mirrors (does not import -- collector.py must not depend on tools/) the
 # contract-probe tool's proven bound: an oversized PMS response is never
 # parsed, sized, or logged.
@@ -650,9 +663,13 @@ def _valid_pms_performance_shape(response):
 
 
 def _valid_pms_service_health_shape(response):
-    """A serviceHealth response must be a dict containing at least one of
-    the confirmed fields -- see _valid_pms_performance_shape."""
-    return isinstance(response, dict) and any(k in response for k in _PMS_SERVICE_HEALTH_FIELDS)
+    """A serviceHealth response must be a dict whose isHealthy field is a
+    LITERAL boolean -- missing, null, or any non-bool isHealthy fails this
+    check (a failed detail request), rather than being silently normalized
+    into a false-but-successful {isHealthy: False, ...} result. This is
+    intentionally stricter than _valid_pms_performance_shape: isHealthy is
+    the one field this response type cannot be considered valid without."""
+    return isinstance(response, dict) and isinstance(response.get("isHealthy"), bool)
 
 
 def _contains_pms_tls_error(exc, max_nodes=10):
@@ -717,7 +734,8 @@ def _pms_unavailable_snapshot(status):
     }
 
 
-def _collect_pms_impl(base, opener, now=None):
+def _collect_pms_impl(base, opener, now=None, clock=time.monotonic,
+                      budget_seconds=PMS_COLLECTION_BUDGET_SECONDS):
     """One bounded PMS collection pass for this tick. Reuses the caller's
     already-authenticated, TLS-verified opener. GETs the confirmed process
     inventory once; follows up to MAX_FOLLOWED_PMS_PROCESSES unique,
@@ -737,11 +755,35 @@ def _collect_pms_impl(base, opener, now=None):
     where every process got exactly one of its two details is correctly
     PARTIAL, never UNAVAILABLE. An individual detail failure (network error
     or a malformed/empty response shape) only affects that one detail call
-    -- the remaining calls and processes are still attempted."""
+    -- the remaining calls and processes are still attempted.
+
+    Bounded total time: clock() (time.monotonic by default, injectable for
+    deterministic tests) is checked against an absolute deadline
+    (clock()-at-entry + budget_seconds) before every request, inventory or
+    detail. Each request's own timeout is min(PMS_REQUEST_TIMEOUT_SECONDS,
+    time remaining until the deadline). Once the deadline passes, no
+    further PMS request is issued at all (no sleep, no retry) -- whatever
+    was already normalized is preserved and returned; nothing already
+    collected is discarded."""
+    deadline = clock() + budget_seconds
     collected_at = cfgmod.now_epoch()
 
+    def _next_timeout():
+        remaining = deadline - clock()
+        if remaining <= 0:
+            return None  # budget exhausted -- caller must not issue this request
+        return min(PMS_REQUEST_TIMEOUT_SECONDS, remaining)
+
+    inv_timeout = _next_timeout()
+    if inv_timeout is None:
+        return {
+            "status": "UNAVAILABLE", "collectedAt": collected_at,
+            "inventoryCount": 0, "followedCount": 0, "successCount": 0, "failureCount": 0,
+            "heartbeatAgeSeconds": None, "processes": {},
+        }
+
     try:
-        inventory_payload = _http_json_bounded(f"{base}{PMS_INVENTORY_PATH}", opener)
+        inventory_payload = _http_json_bounded(f"{base}{PMS_INVENTORY_PATH}", opener, timeout=inv_timeout)
     except Exception as e:
         return {
             "status": _classify_pms_error(e), "collectedAt": collected_at,
@@ -771,20 +813,34 @@ def _collect_pms_impl(base, opener, now=None):
     ages = []
 
     for name in followed:
+        if _next_timeout() is None:
+            break  # budget exhausted -- stop issuing further PMS requests
+
         inv_norm = normalize_pms_inventory_item(inventory_by_name.get(name, {}))
         age = heartbeat_age_seconds(inv_norm.get("lastHeartbeat"), now=now)
         if age is not None:
             ages.append(age)
 
         perf, health, process_ok = {}, {}, True
+        budget_exhausted = False
         for kind in PMS_DETAIL_KINDS:
+            timeout = _next_timeout()
+            if timeout is None:
+                # Budget exhausted -- this detail was never even attempted,
+                # which is exactly as much a "did not collect this data"
+                # outcome as a network failure would have been; it must
+                # count the same way for PARTIAL/UNAVAILABLE purposes.
+                process_ok = False
+                detail_failure_count += 1
+                budget_exhausted = True
+                break  # stop issuing further PMS requests for this process and beyond
             path = _pms_detail_path(name, kind)
             if path is None:
                 process_ok = False
                 detail_failure_count += 1
                 continue
             try:
-                detail_payload = _http_json_bounded(f"{base}{path}", opener)
+                detail_payload = _http_json_bounded(f"{base}{path}", opener, timeout=timeout)
             except Exception:
                 process_ok = False
                 detail_failure_count += 1
@@ -811,6 +867,20 @@ def _collect_pms_impl(base, opener, now=None):
         processes_out[name] = {"performance": perf, "serviceHealth": health, "heartbeatAgeSeconds": age}
         # detail_payload/inv_norm fall out of scope here -- never retained.
 
+        if budget_exhausted:
+            break
+
+    # Any process in `followed` that never even got a turn (the outer-loop
+    # budget check tripped before it started) contributed zero detail
+    # attempts of its own -- account for those as failures too, so status
+    # reflects "most of the intended work never happened" rather than
+    # silently reporting OK/PARTIAL based only on the few requests that
+    # happened to complete before the deadline.
+    unattempted = len(followed) - len(processes_out)
+    if unattempted > 0:
+        detail_failure_count += unattempted * len(PMS_DETAIL_KINDS)
+        failure_count += unattempted
+
     followed_count = len(followed)
     if followed_count == 0:
         # Inventory GET succeeded with a valid shape; there is simply
@@ -832,24 +902,29 @@ def _collect_pms_impl(base, opener, now=None):
     }
 
 
-def collect_pms(base, opener, now=None):
-    """Public entry point: one bounded PMS collection pass for this tick.
-    The caller decides whether to persist the result (this function
-    performs no DynamoDB or CloudWatch I/O and does not know about
-    lease/fencing -- it is a pure network/normalization operation only).
+def collect_pms(base, opener, now=None, clock=time.monotonic,
+                budget_seconds=PMS_COLLECTION_BUDGET_SECONDS):
+    """Public entry point: one bounded PMS collection pass for this tick,
+    bounded in both request count (MAX_FOLLOWED_PMS_PROCESSES) and total
+    wall-clock time (budget_seconds, measured via clock() -- time.monotonic
+    by default, injectable for deterministic tests). The caller decides
+    whether to persist the result (this function performs no DynamoDB or
+    CloudWatch I/O and does not know about lease/fencing -- it is a pure
+    network/normalization operation only).
 
     This is a thin wrapper around _collect_pms_impl that adds a final,
     unconditional defensive boundary: _collect_pms_impl already guards its
     own known failure modes (network errors, invalid inventory/detail
-    shapes, unsafe process names), but an unanticipated internal failure
-    (e.g. a normalization or path-construction edge case neither of those
-    guards foresaw) must still never escape as an exception. On any such
-    failure this returns a current, bounded, sanitized snapshot
-    (status=INVALID_RESPONSE, zero counts, heartbeatAgeSeconds=None, empty
-    processes) with no logging and no raw exception/process-name/URL
-    exposure -- collect_pms as a whole must never raise."""
+    shapes, unsafe process names, budget exhaustion), but an unanticipated
+    internal failure (e.g. a normalization or path-construction edge case
+    neither of those guards foresaw) must still never escape as an
+    exception. On any such failure this returns a current, bounded,
+    sanitized snapshot (status=INVALID_RESPONSE, zero counts,
+    heartbeatAgeSeconds=None, empty processes) with no logging and no raw
+    exception/process-name/URL exposure -- collect_pms as a whole must
+    never raise."""
     try:
-        return _collect_pms_impl(base, opener, now=now)
+        return _collect_pms_impl(base, opener, now=now, clock=clock, budget_seconds=budget_seconds)
     except Exception:
         return {
             "status": "INVALID_RESPONSE", "collectedAt": cfgmod.now_epoch(),

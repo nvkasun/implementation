@@ -74,12 +74,30 @@ A malformed or structurally-invalid response is never treated as healthy:
 an inventory response must be a dict whose `response.processes` is a list
 (a genuinely empty list is a valid `OK` result with zero counts; anything
 else about the shape being wrong -- missing/null/non-dict `response`, or a
-non-list `processes` -- is `INVALID_RESPONSE`). A `processPerformance` or
-`serviceHealth` detail response must be a dict containing at least one of
-its confirmed fields, or that individual detail call counts as failed, not
-successful. `status` reflects whether any individual detail GET actually
-succeeded this tick -- so a tick where every followed process got exactly
-one of its two details is `PARTIAL`, never `UNAVAILABLE`.
+non-list `processes` -- is `INVALID_RESPONSE`). A `processPerformance`
+detail response must be a dict containing at least one confirmed numeric
+field; a `serviceHealth` detail response must be a dict whose `isHealthy`
+is a **literal boolean** -- either failure counts that individual detail
+call as failed, never successful, and a structurally invalid `serviceHealth`
+response is never silently normalized into a false-but-successful
+`{isHealthy: false, ...}` result. `status` reflects whether any individual
+detail GET actually succeeded this tick -- so a tick where every followed
+process got exactly one of its two details is `PARTIAL`, never
+`UNAVAILABLE`.
+
+**Total collection time budget:** each PMS request uses
+`min(PMS_REQUEST_TIMEOUT_SECONDS, remaining budget)` as its timeout, and
+the whole pass (inventory + every detail request) is bounded by a fixed,
+non-operator-tunable `PMS_COLLECTION_BUDGET_SECONDS` (30s) measured via an
+absolute `time.monotonic()` deadline -- the theoretical unbounded worst
+case (1 inventory + up to 40 detail requests at the old 5s-per-request
+default) was up to 205s, comfortably past the deployed 120s stale
+threshold, which could have made an otherwise-healthy deployment appear
+stale before `STATE#_deployment` was even written. Once the deadline
+passes, no further PMS request is issued (no sleep, no retry); whatever
+was already normalized is preserved, and `status` reflects it honestly
+(`PARTIAL` if some detail data was collected first, `UNAVAILABLE` if
+none was).
 
 Process names are bounded and validated before ever being followed: a
 `processName` must be a non-empty (after trimming), ≤128-character string

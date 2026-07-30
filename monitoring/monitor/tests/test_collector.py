@@ -1316,6 +1316,31 @@ class PmsResponseShapeValidationTests(unittest.TestCase):
         self.assertEqual(result["failureCount"], 1)
         self.assertEqual(result["processes"]["P1"]["serviceHealth"], {})
 
+    def test_service_health_missing_isHealthy_fails_even_with_other_fields(self):
+        # Under the tightened rule, isHealthy specifically must be a literal
+        # bool -- merely having criticalResourcesHealthy/Unhealthy present
+        # (the old, looser "any of 3 fields" rule) is no longer sufficient.
+        o = self._detail_shape_opener(
+            self._single_process_inventory(), {"cpuTimeUs": 1},
+            {"criticalResourcesHealthy": 3, "criticalResourcesUnhealthy": 0})
+        result = core.collect_pms(self.BASE, o)
+        self.assertEqual(result["failureCount"], 1)
+        self.assertEqual(result["processes"]["P1"]["serviceHealth"], {})
+
+    def test_service_health_non_boolean_isHealthy_fails(self):
+        for bad_is_healthy in ("true", 1, 0, None, [], {}):
+            o = self._detail_shape_opener(
+                self._single_process_inventory(), {"cpuTimeUs": 1}, {"isHealthy": bad_is_healthy})
+            result = core.collect_pms(self.BASE, o)
+            self.assertEqual(result["failureCount"], 1, f"isHealthy={bad_is_healthy!r}")
+            self.assertEqual(result["processes"]["P1"]["serviceHealth"], {})
+
+    def test_service_health_literal_boolean_isHealthy_succeeds(self):
+        o = self._detail_shape_opener(self._single_process_inventory(), {"cpuTimeUs": 1}, {"isHealthy": False})
+        result = core.collect_pms(self.BASE, o)
+        self.assertEqual(result["successCount"], 1)
+        self.assertEqual(result["processes"]["P1"]["serviceHealth"]["isHealthy"], False)
+
     def test_malformed_details_never_increment_full_success(self):
         o = self._detail_shape_opener(self._single_process_inventory(), {}, {})
         result = core.collect_pms(self.BASE, o)
@@ -1382,6 +1407,20 @@ class PmsPartialUnavailableSemanticsTests(unittest.TestCase):
         o = self._opener(inventory, {}, exceptions)
         result = core.collect_pms(self.BASE, o)
         self.assertEqual(result["status"], "UNAVAILABLE")
+
+    def test_all_detail_requests_succeed_produces_ok(self):
+        inventory = {"response": {"processes": [{"processName": "P1"}, {"processName": "P2"}]}}
+        detail = {
+            f"{self.BASE}/services/v2/mpoints/P1/processPerformance": {"response": {"cpuTimeUs": 1}},
+            f"{self.BASE}/services/v2/mpoints/P1/serviceHealth": {"response": {"isHealthy": True}},
+            f"{self.BASE}/services/v2/mpoints/P2/processPerformance": {"response": {"cpuTimeUs": 2}},
+            f"{self.BASE}/services/v2/mpoints/P2/serviceHealth": {"response": {"isHealthy": False}},
+        }
+        o = self._opener(inventory, detail)
+        result = core.collect_pms(self.BASE, o)
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(result["successCount"], 2)
+        self.assertEqual(result["failureCount"], 0)
 
 
 class PmsProcessNameBoundsTests(unittest.TestCase):
@@ -1506,6 +1545,112 @@ class PmsNumericHardeningTests(unittest.TestCase):
 
     def test_normal_cumulative_counter_preserved(self):
         self.assertEqual(core._normalize_pms_number(123456789), 123456789)
+
+    def test_10_pow_10000_returns_zero_without_raising(self):
+        try:
+            result = core._normalize_pms_number(10 ** 10000)
+        except Exception as e:  # pragma: no cover
+            self.fail(f"_normalize_pms_number raised: {e!r}")
+        self.assertEqual(result, 0)
+
+    def test_1e300_above_dynamodb_safe_bound_returns_zero(self):
+        self.assertEqual(core._normalize_pms_number(1e300), 0)
+
+    def test_bound_is_no_more_than_38_decimal_digits(self):
+        self.assertLessEqual(len(str(core.PMS_MAX_SAFE_NUMBER)), 38)
+
+
+class PmsCollectionBudgetTests(unittest.TestCase):
+    """Section 6: a fixed, non-operator-tunable total-time safety net so PMS
+    can never make a healthy deployment appear stale before
+    STATE#_deployment is written."""
+
+    BASE = "https://gg-test:8443"
+
+    def _opener(self, responses, record=None):
+        record = record if record is not None else []
+
+        def _open(url, timeout=5):
+            record.append((url, timeout))
+            m = MagicMock()
+            m.read.return_value = json.dumps(responses[url]).encode()
+            m.__enter__.return_value = m
+            m.__exit__.return_value = False
+            return m
+        o = MagicMock()
+        o.open.side_effect = _open
+        return o, record
+
+    def _all_ok_responses(self, names):
+        responses = {f"{self.BASE}{core.PMS_INVENTORY_PATH}":
+                    {"response": {"processes": [{"processName": n} for n in names]}}}
+        for n in names:
+            responses[f"{self.BASE}/services/v2/mpoints/{n}/processPerformance"] = {"response": {"cpuTimeUs": 1}}
+            responses[f"{self.BASE}/services/v2/mpoints/{n}/serviceHealth"] = {"response": {"isHealthy": True}}
+        return responses
+
+    def _stepping_clock(self, step=3.0, start=0.0):
+        state = {"t": start}
+
+        def _clock():
+            state["t"] += step
+            return state["t"]
+        return _clock
+
+    def test_budget_exhaustion_stops_further_requests(self):
+        names = [f"P{i}" for i in range(20)]
+        opener, calls = self._opener(self._all_ok_responses(names))
+        clock = self._stepping_clock(step=3.0)
+        result = core.collect_pms(self.BASE, opener, clock=clock, budget_seconds=10)
+        # far fewer than the theoretical max of 1 + 20*2 = 41 requests
+        self.assertLess(len(calls), 41)
+
+    def test_per_request_timeout_never_exceeds_remaining_budget(self):
+        names = ["P1", "P2", "P3"]
+        opener, calls = self._opener(self._all_ok_responses(names))
+        clock = self._stepping_clock(step=4.0)
+        core.collect_pms(self.BASE, opener, clock=clock, budget_seconds=10)
+        for _url, timeout in calls:
+            self.assertLessEqual(timeout, core.PMS_REQUEST_TIMEOUT_SECONDS)
+            self.assertGreater(timeout, 0)
+
+    def test_partial_results_survive_budget_exhaustion(self):
+        names = [f"P{i}" for i in range(20)]
+        opener, calls = self._opener(self._all_ok_responses(names))
+        clock = self._stepping_clock(step=3.0)
+        result = core.collect_pms(self.BASE, opener, clock=clock, budget_seconds=10)
+        # at least the inventory + one process's data was preserved
+        self.assertGreaterEqual(len(result["processes"]), 1)
+        self.assertEqual(result["status"], "PARTIAL")
+
+    def test_no_detail_success_before_exhaustion_produces_unavailable(self):
+        opener = MagicMock()
+        calls = {"n": 0}
+
+        def fake_clock():
+            calls["n"] += 1
+            return 0.0 if calls["n"] == 1 else 1000.0
+
+        result = core.collect_pms(self.BASE, opener, clock=fake_clock, budget_seconds=1)
+        self.assertEqual(result["status"], "UNAVAILABLE")
+        opener.open.assert_not_called()
+
+    def test_ample_budget_collects_everything_normally(self):
+        names = ["P1", "P2", "P3"]
+        opener, calls = self._opener(self._all_ok_responses(names))
+        result = core.collect_pms(self.BASE, opener, budget_seconds=30)
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(result["successCount"], 3)
+        detail_calls = [c for c in calls if c[0] != f"{self.BASE}{core.PMS_INVENTORY_PATH}"]
+        self.assertEqual(len(detail_calls), 6)
+
+    def test_budget_constants_are_fixed_and_conservative(self):
+        self.assertEqual(core.PMS_REQUEST_TIMEOUT_SECONDS, 2)
+        self.assertEqual(core.PMS_COLLECTION_BUDGET_SECONDS, 30)
+        # theoretical worst case must stay comfortably under the deployed
+        # 120s stale threshold once the budget (not the per-request
+        # timeout) is the binding constraint.
+        self.assertLess(core.PMS_COLLECTION_BUDGET_SECONDS, 120)
 
 
 class PmsWrappedTlsClassificationTests(unittest.TestCase):

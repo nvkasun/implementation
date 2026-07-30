@@ -563,6 +563,26 @@ else
   fail "collector.py stale-PMS overwrite helper is missing"
 fi
 
+# ---------------------------------------------------------------------
+# 15. Phase 4C1 pre-deployment correction: total PMS collection time
+#     budget stays fixed and comfortably under the deployed stale
+#     threshold; serviceHealth validation stays tightened.
+# ---------------------------------------------------------------------
+echo ""
+echo "--- Production PMS collection: total time budget ---"
+if grep -q "PMS_REQUEST_TIMEOUT_SECONDS = 2" "${MONITOR_APP_DIR}/collector.py" 2>/dev/null \
+    && grep -q "PMS_COLLECTION_BUDGET_SECONDS = 30" "${MONITOR_APP_DIR}/collector.py" 2>/dev/null; then
+  pass "collector.py bounds total PMS collection to a fixed 30s time budget"
+else
+  fail "collector.py PMS request/budget timeout constants changed unexpectedly"
+fi
+
+if grep -q 'isinstance(response.get("isHealthy"), bool)' "${MONITOR_APP_DIR}/collector.py" 2>/dev/null; then
+  pass "collector.py requires serviceHealth isHealthy to be a literal boolean"
+else
+  fail "collector.py no longer requires serviceHealth isHealthy to be a literal boolean"
+fi
+
 echo ""
 echo "=================================================="
 echo "Summary: ${PASS_COUNT} passed, ${FAIL_COUNT} failed, ${SKIP_COUNT} skipped"
