@@ -1,0 +1,59 @@
+Required validation commands
+
+After the workflow and Argo CD synchronization complete, run:
+
+kubectl rollout status deployment/gg-monitor \
+  -n goldengate-monitoring \
+  --timeout=5m
+
+Then:
+
+kubectl get deployment gg-monitor \
+  -n goldengate-monitoring \
+  -o jsonpath='image={.spec.template.spec.containers[0].image}{"\n"}'
+
+Run this single concise functional check:
+
+kubectl exec -i \
+  -n goldengate-monitoring \
+  deployment/gg-monitor \
+  -- python3 - <<'PY'
+import json
+import urllib.request
+
+def read(path):
+    with urllib.request.urlopen(
+        f"http://127.0.0.1:8080{path}",
+        timeout=10,
+    ) as response:
+        return response.status, response.read().decode("utf-8")
+
+for path in ("/healthz", "/readyz"):
+    status, body = read(path)
+    print(f"{path}: HTTP {status} {body}")
+
+_, html = read("/")
+print(
+    "portal:",
+    f"oracleCard={'gg-oracle-payments-01' in html}",
+    f"postgresqlCard={'gg-postgresql-payments-01' in html}",
+    f"alertsField={'alertsEnabled=' in html}",
+    f"servicesField={'services:' in html}",
+    f"nestedTable={('<td><table' in html or '</table></td>' in html)}",
+)
+
+_, body = read("/api/processes")
+payload = json.loads(body)
+
+for deployment in payload.get("deployments", []):
+    print(
+        deployment.get("deploymentName"),
+        f"status={deployment.get('effectiveStatus')}",
+        f"fresh={deployment.get('fresh')}",
+        f"alerts={deployment.get('alertsEnabled')}",
+        f"services={deployment.get('criticalServices')}",
+        f"processes={len(deployment.get('processes', []))}",
+    )
+PY
+
+Expected important results:
