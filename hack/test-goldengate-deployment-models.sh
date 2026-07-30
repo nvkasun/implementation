@@ -437,6 +437,32 @@ else
   fail "helm/goldengate-monitor default values.yaml no longer defaults CloudWatch publishing to false"
 fi
 
+# ---------------------------------------------------------------------
+# 11. Phase 4B2A: confirmed secure PMS route documented; 9015 stays
+#     unauthenticated-only; /services/v2/metrics not recommended as
+#     production PMS.
+# ---------------------------------------------------------------------
+echo ""
+echo "--- Contract-probe tool: confirmed secure PMS route frozen ---"
+if grep -q "/services/v2/mpoints/processes" "$PROBE_TOOL" 2>/dev/null \
+    && grep -q "/services/v2/monitoring/statusChanges" "$PROBE_TOOL" 2>/dev/null; then
+  pass "gg_api_contract_probe.py documents the confirmed secure PMS routes"
+else
+  fail "gg_api_contract_probe.py does not document the confirmed secure PMS routes"
+fi
+
+if grep -qi "confirmed invalid" "$PROBE_TOOL" 2>/dev/null; then
+  pass "gg_api_contract_probe.py marks /services/v2/metrics as confirmed invalid, not production PMS"
+else
+  fail "gg_api_contract_probe.py no longer marks /services/v2/metrics as confirmed invalid"
+fi
+
+if grep -q 'return f"http://{host}:{deployment\[.metricsPort.\]}"' "$PROBE_TOOL" 2>/dev/null; then
+  pass "metricsPort 9015 stays plain HTTP (never HTTPS) in the probe tool"
+else
+  fail "metricsPort scheme handling in the probe tool changed unexpectedly"
+fi
+
 if [ -d "monitoring/observer" ]; then
   pass "legacy observer (monitoring/observer) remains present"
 else

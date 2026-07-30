@@ -62,24 +62,70 @@ CloudWatch client is ever constructed in the current deployment.
 ## Contract-probe tool
 
 `tools/gg_api_contract_probe.py` is a manual, `kubectl exec`-only utility
-for inspecting the Admin/Metrics REST JSON *shape* before trusting it in
-production code -- it performs exactly one read-only GET (reusing the same
-CSI-mounted credentials, CA chain, and TLS/SNI verification as the
-collector) and prints sanitized STRUCTURAL metadata only (top-level keys,
-item count, field names, field JSON types) -- never a raw field value,
-process name, credential, or secret path. It never writes DynamoDB, never
-calls CloudWatch, and only accepts paths beginning with `/services/`.
+for inspecting REST JSON *shape* before trusting it in production code --
+it performs exactly one read-only GET and prints sanitized STRUCTURAL
+metadata only (top-level keys, per-collection item count, field names,
+field JSON types) -- never a raw field value, process name, status value,
+ID, credential, or secret path. It never writes DynamoDB, never calls
+CloudWatch, and only accepts paths beginning with `/services/`.
+
+### Confirmed secure PMS routes (live-environment verified)
+
+Always probed with `--port admin` (HTTPS through adminPort 8443,
+authenticated with the same CSI-mounted credentials/CA chain/TLS-SNI the
+collector itself uses). Both Oracle and PostgreSQL return HTTP 200:
+
+| Path | Response key |
+| --- | --- |
+| `/services/v2/mpoints/processes` | `response.processes` |
+| `/services/v2/monitoring/statusChanges` | `response.statusChange` |
 
 ```
 python3 tools/gg_api_contract_probe.py \
-  --deployment gg-oracle-payments-01 --port admin --path /services/v2/extracts
+  --deployment gg-oracle-payments-01 --port admin --path /services/v2/mpoints/processes
+
+python3 tools/gg_api_contract_probe.py \
+  --deployment gg-oracle-payments-01 --port admin --path /services/v2/monitoring/statusChanges
 ```
 
-`/services/v2/metrics` (the manager reference's PMS endpoint) is an
-**unconfirmed** probe candidate: the operator may pass it explicitly, but
-this tool never polls it automatically, and no production code path uses
-its response -- the real PMS JSON shape has not yet been confirmed against
-a running deployment.
+**Direct metricsPort 9015 is confirmed plain HTTP** in the current
+deployment and is **not** an approved authenticated collection path.
+`--port metrics` issues a plain, unauthenticated HTTP request only -- the
+mounted admin credentials are never read or attached for a metrics-port
+request, and there is no automatic HTTPS-to-HTTP fallback; the scheme is a
+fixed function of `--port`, chosen explicitly on each invocation.
+
+**`/services/v2/metrics` is confirmed invalid** in the live environment
+(HTTP 404) -- it is not the production PMS endpoint and must not be used as
+a recommended example. It remains generically accepted, like any other
+`/services/...` path, purely for ad hoc diagnostic compatibility (e.g.
+confirming it still 404s). No production code path uses its response, and
+no speculative PMS parser exists for it.
+
+### Sanitized collection summary
+
+Every list-valued field directly under `response.*` -- not just
+`response.items` -- becomes its own entry under `collections` in the
+output, e.g.:
+
+```json
+{
+  "collections": {
+    "processes": {"itemCount": 12, "itemFieldNames": ["...", "..."], "fieldTypes": {"...": ["string"]}, "truncated": false},
+    "statusChange": {"itemCount": 3, "itemFieldNames": ["...", "..."], "fieldTypes": {"...": ["string"]}, "truncated": false}
+  },
+  "collectionsTruncated": false
+}
+```
+
+Only field **names** and broad JSON **types** (`string`/`number`/`boolean`/
+`object`/`array`/`null`) are ever reported -- never a raw value, and nested
+objects/arrays are never recursed into (reported only as `"object"`/
+`"array"`). Inspection is bounded (max list-valued response fields, max
+items per collection, max field names per collection); `truncated` /
+`collectionsTruncated` say so without exposing anything. `response.items`
+is additionally mirrored into the legacy top-level `itemCount`/
+`itemFieldNames`/`fieldTypes` fields for backward compatibility only.
 
 ## Canonical configuration
 

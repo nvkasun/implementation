@@ -172,11 +172,22 @@ class PortSelectionTests(unittest.TestCase):
         self.assertTrue(base.endswith(":8443"))
         self.assertIn(d["adminHost"], base)
 
+    def test_admin_port_uses_https(self):
+        # the confirmed secure PMS route: HTTPS + authenticated.
+        d = _deployment()
+        self.assertTrue(probe._port_and_base(d, "admin").startswith("https://"))
+
     def test_metrics_port_selected(self):
         d = _deployment()
         base = probe._port_and_base(d, "metrics")
         self.assertTrue(base.endswith(":9015"))
         self.assertIn(d["adminHost"], base)
+
+    def test_metrics_port_uses_plain_http_not_https(self):
+        # live-confirmed: metricsPort 9015 is plain HTTP -- never HTTPS.
+        d = _deployment()
+        self.assertTrue(probe._port_and_base(d, "metrics").startswith("http://"))
+        self.assertFalse(probe._port_and_base(d, "metrics").startswith("https://"))
 
 
 class ErrorClassificationTests(unittest.TestCase):
@@ -326,6 +337,178 @@ class SummarizeJsonTests(unittest.TestCase):
         self.assertNotIn("EXT_PAYMENTS_CONFIDENTIAL", json.dumps(summary))
 
 
+class CollectionSummarizationTests(unittest.TestCase):
+    """Every list-valued response.* field -- not just response.items --
+    becomes its own sanitized entry in "collections"."""
+
+    def test_response_processes_empty_list(self):
+        payload = {"response": {"processes": []}}
+        summary = probe.summarize_json(payload)
+        self.assertEqual(summary["collections"]["processes"],
+                         {"itemCount": 0, "itemFieldNames": [], "fieldTypes": {}, "truncated": False})
+
+    def test_response_processes_with_synthetic_entries(self):
+        payload = {"response": {"processes": [
+            {"processName": "SYNTHETIC_EXTRACT_01", "processType": "extract", "lag": 5},
+            {"processName": "SYNTHETIC_REPLICAT_01", "processType": "replicat", "lag": 12},
+        ]}}
+        summary = probe.summarize_json(payload)
+        coll = summary["collections"]["processes"]
+        self.assertEqual(coll["itemCount"], 2)
+        self.assertEqual(coll["itemFieldNames"], ["lag", "processName", "processType"])
+        self.assertEqual(coll["fieldTypes"]["lag"], ["number"])
+        self.assertEqual(coll["fieldTypes"]["processName"], ["string"])
+        self.assertFalse(coll["truncated"])
+
+    def test_response_status_change_empty_list(self):
+        payload = {"response": {"statusChange": []}}
+        summary = probe.summarize_json(payload)
+        self.assertEqual(summary["collections"]["statusChange"]["itemCount"], 0)
+
+    def test_response_status_change_with_synthetic_entries(self):
+        payload = {"response": {"statusChange": [
+            {"id": 1, "change": "SYNTHETIC_STARTED", "timestamp": 1234567890},
+        ]}}
+        summary = probe.summarize_json(payload)
+        coll = summary["collections"]["statusChange"]
+        self.assertEqual(coll["itemCount"], 1)
+        self.assertEqual(coll["itemFieldNames"], ["change", "id", "timestamp"])
+        self.assertEqual(coll["fieldTypes"]["id"], ["number"])
+
+    def test_multiple_list_collections_in_one_response(self):
+        payload = {"response": {
+            "processes": [{"a": 1}],
+            "statusChange": [{"b": 2}],
+            "items": [{"c": 3}],
+        }}
+        summary = probe.summarize_json(payload)
+        self.assertEqual(set(summary["collections"].keys()), {"processes", "statusChange", "items"})
+        for name in ("processes", "statusChange", "items"):
+            self.assertEqual(summary["collections"][name]["itemCount"], 1)
+
+    def test_non_list_response_fields_excluded_from_collections(self):
+        payload = {"response": {
+            "processes": [{"a": 1}],
+            "summary": {"totalCount": 5},
+            "generatedAt": "2026-01-01T00:00:00Z",
+            "ok": True,
+        }}
+        summary = probe.summarize_json(payload)
+        self.assertEqual(set(summary["collections"].keys()), {"processes"})
+        self.assertIn("summary", summary["responseKeys"])
+        self.assertIn("generatedAt", summary["responseKeys"])
+
+    def test_malformed_list_members_skipped_but_counted(self):
+        payload = {"response": {"processes": [
+            {"name": "OK1"}, None, "garbage", 42, [1, 2], {"name": "OK2"},
+        ]}}
+        summary = probe.summarize_json(payload)
+        coll = summary["collections"]["processes"]
+        self.assertEqual(coll["itemCount"], 6)  # true list length, malformed members counted, not inspected
+        self.assertEqual(coll["itemFieldNames"], ["name"])
+
+    def test_sorted_field_names(self):
+        payload = {"response": {"processes": [{"zeta": 1, "alpha": 2, "mid": 3}]}}
+        summary = probe.summarize_json(payload)
+        self.assertEqual(summary["collections"]["processes"]["itemFieldNames"], ["alpha", "mid", "zeta"])
+
+    def test_normalized_field_types(self):
+        payload = {"response": {"processes": [{
+            "s": "text", "n": 5, "f": 1.5, "b": True, "o": {"x": 1}, "a": [1, 2], "z": None,
+        }]}}
+        summary = probe.summarize_json(payload)
+        types = summary["collections"]["processes"]["fieldTypes"]
+        self.assertEqual(types["s"], ["string"])
+        self.assertEqual(types["n"], ["number"])
+        self.assertEqual(types["f"], ["number"])
+        self.assertEqual(types["b"], ["boolean"])
+        self.assertEqual(types["o"], ["object"])
+        self.assertEqual(types["a"], ["array"])
+        self.assertEqual(types["z"], ["null"])
+
+    def test_no_actual_field_values_printed(self):
+        payload = {"response": {"processes": [{"lag": 999999, "count": 42}]}}
+        blob = json.dumps(probe.summarize_json(payload))
+        self.assertNotIn("999999", blob)
+        self.assertNotIn(": 42", blob)
+
+    def test_synthetic_process_names_absent(self):
+        payload = {"response": {"processes": [{"processName": "SYNTHETIC_TOP_SECRET_PROC"}]}}
+        blob = json.dumps(probe.summarize_json(payload))
+        self.assertNotIn("SYNTHETIC_TOP_SECRET_PROC", blob)
+
+    def test_synthetic_hostnames_absent(self):
+        payload = {"response": {"processes": [
+            {"host": "gg-oracle-payments-01.goldengate-dev.svc.cluster.local"}]}}
+        blob = json.dumps(probe.summarize_json(payload))
+        self.assertNotIn("svc.cluster.local", blob)
+
+    def test_synthetic_credentials_absent(self):
+        payload = {"response": {"processes": [
+            {"username": SYNTHETIC_USER, "password": SYNTHETIC_PASSWORD}]}}
+        blob = json.dumps(probe.summarize_json(payload))
+        self.assertNotIn(SYNTHETIC_USER, blob)
+        self.assertNotIn(SYNTHETIC_PASSWORD, blob)
+
+    def test_nested_objects_reported_only_as_object(self):
+        payload = {"response": {"processes": [
+            {"config": {"secretKey": "should-not-leak", "nested": {"deeper": 1}}}]}}
+        summary = probe.summarize_json(payload)
+        self.assertEqual(summary["collections"]["processes"]["fieldTypes"]["config"], ["object"])
+        blob = json.dumps(summary)
+        self.assertNotIn("should-not-leak", blob)
+        self.assertNotIn("secretKey", blob)
+
+    def test_nested_arrays_reported_only_as_array(self):
+        payload = {"response": {"processes": [{"history": ["SECRET_A", "SECRET_B", 3]}]}}
+        summary = probe.summarize_json(payload)
+        self.assertEqual(summary["collections"]["processes"]["fieldTypes"]["history"], ["array"])
+        blob = json.dumps(summary)
+        self.assertNotIn("SECRET_A", blob)
+        self.assertNotIn("SECRET_B", blob)
+
+    def test_item_inspection_limit_and_truncation_flag(self):
+        items = [{"a": i} for i in range(probe.MAX_ITEMS_PER_COLLECTION + 10)]
+        payload = {"response": {"processes": items}}
+        coll = probe.summarize_json(payload)["collections"]["processes"]
+        self.assertEqual(coll["itemCount"], probe.MAX_ITEMS_PER_COLLECTION + 10)
+        self.assertTrue(coll["truncated"])
+
+    def test_field_name_limit_and_truncation_flag(self):
+        wide_item = {f"field{i}": "x" for i in range(probe.MAX_FIELD_NAMES_PER_COLLECTION + 10)}
+        payload = {"response": {"processes": [wide_item]}}
+        coll = probe.summarize_json(payload)["collections"]["processes"]
+        self.assertEqual(len(coll["itemFieldNames"]), probe.MAX_FIELD_NAMES_PER_COLLECTION)
+        self.assertTrue(coll["truncated"])
+
+    def test_collection_key_limit_and_truncation_flag(self):
+        payload = {"response": {f"list{i}": [1, 2] for i in range(probe.MAX_COLLECTION_KEYS + 5)}}
+        summary = probe.summarize_json(payload)
+        self.assertEqual(len(summary["collections"]), probe.MAX_COLLECTION_KEYS)
+        self.assertTrue(summary["collectionsTruncated"])
+
+    def test_no_truncation_flag_when_within_limits(self):
+        payload = {"response": {"processes": [{"a": 1}]}}
+        summary = probe.summarize_json(payload)
+        self.assertFalse(summary["collections"]["processes"]["truncated"])
+        self.assertFalse(summary["collectionsTruncated"])
+
+    def test_existing_response_items_backward_compatibility(self):
+        payload = {"response": {"items": [{"name": "X"}]}}
+        summary = probe.summarize_json(payload)
+        self.assertIn("items", summary["collections"])
+        self.assertEqual(summary["itemCount"], 1)
+        self.assertEqual(summary["itemFieldNames"], ["name"])
+        self.assertEqual(summary["fieldTypes"], {"name": ["string"]})
+
+    def test_response_processes_never_mapped_into_legacy_items_fields(self):
+        payload = {"response": {"processes": [{"name": "X"}]}}
+        summary = probe.summarize_json(payload)
+        self.assertNotIn("itemCount", summary)
+        self.assertNotIn("itemFieldNames", summary)
+        self.assertNotIn("fieldTypes", summary)
+
+
 class RunProbeTests(unittest.TestCase):
     """run_probe exercised with a fully mocked HTTP layer -- never touches a
     real socket, DynamoDB, or CloudWatch."""
@@ -463,6 +646,83 @@ class RunProbeTests(unittest.TestCase):
                     probe.run_probe(d, "admin", "/services/v2/extracts")
         self.assertEqual(ctx.exception.category, "UNKNOWN")
         self.assertNotIn("SECRET_INTERNAL_DETAIL_should_not_leak", str(ctx.exception))
+
+
+class MetricsPortSecurityTests(unittest.TestCase):
+    """Direct metricsPort 9015 is confirmed plain HTTP in the live
+    environment: the probe must never read credential files, build a
+    Basic-Auth opener, or otherwise attach the mounted admin credentials to
+    a metrics-port request -- there is no HTTP credential-transport
+    fallback path in this tool at all."""
+
+    def test_metrics_port_never_reads_credential_files(self):
+        d = _deployment()
+        fake_resp = MagicMock()
+        fake_resp.status = 200
+        fake_resp.headers = {"Content-Type": "application/json"}
+        fake_resp.read.return_value = b'{"response": {"items": []}}'
+        fake_resp.__enter__.return_value = fake_resp
+        fake_resp.__exit__.return_value = False
+        fake_opener = MagicMock()
+        fake_opener.open.return_value = fake_resp
+
+        with mock.patch.object(cfgmod, "credential_paths") as mock_creds, \
+             mock.patch.object(core, "_read_secret_file") as mock_read_secret, \
+             mock.patch.object(core, "_build_ssl_context") as mock_ssl_ctx, \
+             mock.patch.object(core, "_basic_opener") as mock_basic_opener, \
+             mock.patch.object(probe.urllib.request, "build_opener", return_value=fake_opener):
+            probe.run_probe(d, "metrics", "/services/v2/metrics")
+
+        mock_creds.assert_not_called()
+        mock_read_secret.assert_not_called()
+        mock_ssl_ctx.assert_not_called()
+        mock_basic_opener.assert_not_called()
+
+    def test_metrics_port_opener_has_no_auth_handler(self):
+        # build_opener() with no arguments installs only the default
+        # handlers -- no HTTPBasicAuthHandler, so no Authorization header
+        # can ever be attached to a metrics-port request.
+        opener = __import__("urllib.request", fromlist=["build_opener"]).build_opener()
+        import urllib.request as _ur
+        self.assertFalse(any(isinstance(h, _ur.HTTPBasicAuthHandler) for h in opener.handlers))
+
+    def test_admin_port_still_requires_credentials(self):
+        d = _deployment()
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_user = os.path.join(tmp, "no-user")
+            missing_pwd = os.path.join(tmp, "no-pwd")
+            with mock.patch.object(cfgmod, "credential_paths", return_value=(missing_user, missing_pwd)):
+                with self.assertRaises(probe.ProbeValidationError):
+                    probe.run_probe(d, "admin", "/services/v2/mpoints/processes")
+
+
+class DocumentationClaimsTests(unittest.TestCase):
+    def test_recommended_pms_paths_documented_with_admin_port(self):
+        src = probe.__doc__
+        self.assertIn("/services/v2/mpoints/processes", src)
+        self.assertIn("/services/v2/monitoring/statusChanges", src)
+        self.assertIn("--port admin", src)
+
+    def test_metrics_path_not_documented_as_production_pms(self):
+        src = (probe.__doc__ or "").lower()
+        self.assertIn("/services/v2/metrics", src)
+        self.assertIn("confirmed invalid", src)
+        self.assertIn("not the production pms endpoint", src)
+
+    def test_direct_9015_documented_as_unapproved_authenticated_path(self):
+        src = (probe.__doc__ or "").lower()
+        self.assertIn("plain http", src)
+        self.assertIn("not an approved authenticated", src)
+
+    def test_readme_documents_confirmed_routes(self):
+        readme_path = os.path.join(os.path.dirname(__file__), "..", "README.md")
+        with open(readme_path) as f:
+            text = f.read()
+        self.assertIn("/services/v2/mpoints/processes", text)
+        self.assertIn("/services/v2/monitoring/statusChanges", text)
+        self.assertIn("--port admin", text)
+        self.assertIn("confirmed plain HTTP", text)
+        self.assertIn("confirmed invalid", text.lower())
 
 
 class NoSideEffectTests(unittest.TestCase):

@@ -7,21 +7,38 @@ path. Invoke manually, e.g.:
 
     kubectl exec -n goldengate-monitoring <pod> -- \\
         python3 tools/gg_api_contract_probe.py \\
-        --deployment gg-oracle-payments-01 --port admin --path /services/v2/extracts
+        --deployment gg-oracle-payments-01 --port admin \\
+        --path /services/v2/mpoints/processes
 
-It performs exactly one read-only HTTP GET using the same CSI-mounted admin
-credentials, CA chain, and TLS/SNI verification as the collector, and prints
-sanitized STRUCTURAL metadata only (top-level keys, item count, per-field
-names and JSON types) -- never a raw field value, process name, credential,
-secret ARN, path, hostname, stack trace, or full URL. It never writes
-DynamoDB, never publishes a CloudWatch metric, and never issues any request
-that could modify a GoldenGate deployment.
+It performs exactly one read-only GET and prints sanitized STRUCTURAL
+metadata only (top-level keys, per-collection item count, per-field names
+and JSON types) -- never a raw field value, process name, status value, ID,
+credential, secret ARN, path, hostname, stack trace, or full URL. It never
+writes DynamoDB, never publishes a CloudWatch metric, and never issues any
+request that could modify a GoldenGate deployment.
 
-/services/v2/metrics (the manager reference's PMS endpoint) is an
-UNCONFIRMED probe candidate -- the operator may pass it explicitly via
---path, but this tool never polls it automatically, and its response is
-never used to inform STATE# or CloudWatch logic anywhere in this
-application.
+CONFIRMED secure PMS routes (live-environment verified on both Oracle and
+PostgreSQL -- HTTP 200): always reached with --port admin (HTTPS through
+adminPort 8443, authenticated with the same CSI-mounted credentials, CA
+chain, and TLS/SNI verification the collector itself uses):
+
+    /services/v2/mpoints/processes         -> response.processes
+    /services/v2/monitoring/statusChanges  -> response.statusChange
+
+Direct metricsPort 9015 is CONFIRMED PLAIN HTTP in the current deployment
+and is NOT an approved authenticated collection path. --port metrics issues
+a plain, UNAUTHENTICATED HTTP request only -- the mounted admin credentials
+are never read, built into an opener, or transmitted for a metrics-port
+request. There is no automatic HTTPS<->HTTP fallback: the scheme is a fixed
+function of --port, chosen explicitly by the operator on each invocation.
+
+/services/v2/metrics is CONFIRMED INVALID in the live environment (HTTP
+404) -- it is NOT the production PMS endpoint and must never be used as a
+recommended example. The path remains generically accepted, like any other
+/services/... path, purely for ad hoc diagnostic compatibility (e.g.
+confirming it still 404s); its response is never used to inform STATE# or
+CloudWatch logic anywhere in this application, and no speculative PMS
+parser exists for it.
 """
 from __future__ import annotations
 
@@ -34,6 +51,7 @@ import ssl
 import sys
 import urllib.error
 import urllib.parse
+import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -155,12 +173,16 @@ def resolve_deployment(name, repo_config_root=None):
 
 
 def _port_and_base(deployment, port_type):
-    if port_type == "admin":
-        port = deployment["adminPort"]
-    else:
-        port = deployment["metricsPort"]
+    """admin -> HTTPS through adminPort 8443 (the confirmed, authenticated,
+    TLS-verified PMS route). metrics -> PLAIN HTTP through metricsPort 9015
+    (confirmed plain HTTP in the live environment) -- see run_probe, which
+    never attaches credentials to a metrics-port request. The scheme is a
+    fixed function of port_type, chosen explicitly by the operator; there is
+    no automatic HTTPS<->HTTP fallback."""
     host = deployment["adminHost"]  # same internal Service; port selects the listener
-    return f"https://{host}:{port}"
+    if port_type == "admin":
+        return f"https://{host}:{deployment['adminPort']}"
+    return f"http://{host}:{deployment['metricsPort']}"
 
 
 def _contains_tls_error(exc, max_nodes=10):
@@ -226,55 +248,126 @@ def _json_type_name(value):
     return "unknown"
 
 
-def summarize_json(payload, max_items=50):
-    """Sanitized structural metadata only -- field NAMES and JSON TYPES,
-    never a raw field value. Returns None when payload is not a top-level
-    JSON object (caller treats that as UNEXPECTED_RESPONSE)."""
+# Bounds on collection inspection -- a large/hostile PMS payload must never
+# be able to consume unbounded memory or produce unbounded output. itemCount
+# always reports the TRUE list length (never truncated); only per-item/
+# per-field-name inspection is capped, and a "truncated" flag says so.
+MAX_COLLECTION_KEYS = 20
+MAX_ITEMS_PER_COLLECTION = 50
+MAX_FIELD_NAMES_PER_COLLECTION = 100
+
+
+def _summarize_collection(items, max_items=MAX_ITEMS_PER_COLLECTION,
+                          max_field_names=MAX_FIELD_NAMES_PER_COLLECTION):
+    """items is a confirmed list. Returns sanitized structural metadata only
+    -- field NAMES and broad JSON TYPES, never a raw value. Non-dict members
+    are skipped rather than raising. Nested objects/arrays are reported only
+    as "object"/"array" -- never recursed into."""
+    item_count = len(items)
+    inspected = items[:max_items]
+    field_types = {}
+    field_name_cap_hit = False
+    for item in inspected:
+        if not isinstance(item, dict):
+            continue
+        for key, value in item.items():
+            key = str(key)
+            if key not in field_types:
+                if len(field_types) >= max_field_names:
+                    field_name_cap_hit = True
+                    continue
+                field_types[key] = set()
+            field_types[key].add(_json_type_name(value))
+    return {
+        "itemCount": item_count,
+        "itemFieldNames": sorted(field_types.keys()),
+        "fieldTypes": {k: sorted(v) for k, v in field_types.items()},
+        "truncated": bool(item_count > len(inspected) or field_name_cap_hit),
+    }
+
+
+def summarize_json(payload, max_items=MAX_ITEMS_PER_COLLECTION,
+                   max_collection_keys=MAX_COLLECTION_KEYS,
+                   max_field_names=MAX_FIELD_NAMES_PER_COLLECTION):
+    """Sanitized structural metadata only -- collection field NAMES and
+    broad JSON TYPES, never a raw value, process name, status value, ID,
+    link, hostname, or nested raw payload. Returns None when payload is not
+    a top-level JSON object (caller treats that as UNEXPECTED_RESPONSE).
+
+    Every list-valued field directly under response.* becomes its own entry
+    in "collections" -- not just response.items (e.g. response.processes,
+    response.statusChange, and any future list-valued field). Non-list
+    response fields are excluded. collectionsTruncated is True when there
+    were more list-valued response fields than max_collection_keys (the
+    excess collections are simply not inspected -- deterministically, by
+    sorted field name, so which are dropped is stable across runs)."""
     if not isinstance(payload, dict):
         return None
     top_level_keys = sorted(str(k) for k in payload.keys())
     response = payload.get("response")
     response_keys = sorted(str(k) for k in response.keys()) if isinstance(response, dict) else []
-    items = response.get("items") if isinstance(response, dict) else None
-    items = items if isinstance(items, list) else []
 
-    field_types = {}
-    for item in items[:max_items]:
-        if not isinstance(item, dict):
-            continue
-        for key, value in item.items():
-            field_types.setdefault(str(key), set()).add(_json_type_name(value))
+    collections = {}
+    collections_truncated = False
+    if isinstance(response, dict):
+        list_valued_keys = sorted(str(k) for k in response.keys() if isinstance(response.get(k), list))
+        if len(list_valued_keys) > max_collection_keys:
+            collections_truncated = True
+        for key in list_valued_keys[:max_collection_keys]:
+            collections[key] = _summarize_collection(
+                response[key], max_items=max_items, max_field_names=max_field_names)
 
-    return {
+    result = {
         "topLevelKeys": top_level_keys,
         "responseKeys": response_keys,
-        "itemCount": len(items),
-        "itemFieldNames": sorted(field_types.keys()),
-        "fieldTypes": {k: sorted(v) for k, v in field_types.items()},
+        "collections": collections,
+        "collectionsTruncated": collections_truncated,
     }
+
+    # Legacy flat fields, retained only for backward compatibility, and only
+    # when response.items itself exists -- never map a different collection
+    # (e.g. response.processes) into these.
+    if "items" in collections:
+        legacy = collections["items"]
+        result["itemCount"] = legacy["itemCount"]
+        result["itemFieldNames"] = legacy["itemFieldNames"]
+        result["fieldTypes"] = legacy["fieldTypes"]
+
+    return result
 
 
 def run_probe(deployment, port_type, path, timeout=PROBE_TIMEOUT_SECONDS):
     """Performs exactly one read-only GET. Returns a sanitized result dict on
     success. Raises ProbeRequestError (with a closed category) on failure.
     Never returns or logs a raw response body, raw exception text, header
-    value, or URL."""
+    value, or URL.
+
+    port_type="admin": HTTPS through adminPort 8443, authenticated with the
+    same CSI-mounted credentials/CA chain/TLS-SNI the collector uses -- the
+    confirmed secure PMS route.
+    port_type="metrics": plain HTTP through metricsPort 9015 (confirmed
+    plain HTTP in the live environment). Always unauthenticated -- the
+    mounted admin credentials are never read or attached to this request."""
     pipeline = deployment["name"]
-    user_file, pwd_file = cfgmod.credential_paths(pipeline)
-    user = collector._read_secret_file(user_file)
-    pwd = collector._read_secret_file(pwd_file)
-    if not user or not pwd:
-        raise ProbeValidationError("admin credentials unavailable")
-
-    try:
-        ssl_ctx = collector._build_ssl_context()
-    except RuntimeError:
-        raise ProbeValidationError("TLS trust bundle unavailable")
-
     base = _port_and_base(deployment, port_type)
-    tls_server_name = deployment["tlsServerName"]
-    opener = collector._basic_opener(user, pwd, base, ssl_ctx, tls_server_name)
     url = f"{base}{path}"
+
+    if port_type == "admin":
+        user_file, pwd_file = cfgmod.credential_paths(pipeline)
+        user = collector._read_secret_file(user_file)
+        pwd = collector._read_secret_file(pwd_file)
+        if not user or not pwd:
+            raise ProbeValidationError("admin credentials unavailable")
+        try:
+            ssl_ctx = collector._build_ssl_context()
+        except RuntimeError:
+            raise ProbeValidationError("TLS trust bundle unavailable")
+        tls_server_name = deployment["tlsServerName"]
+        opener = collector._basic_opener(user, pwd, base, ssl_ctx, tls_server_name)
+    else:
+        # Plain HTTP, unauthenticated -- never build an auth handler or read
+        # a credential file for a metrics-port request.
+        opener = urllib.request.build_opener()
 
     http_status = None
     content_type = None
@@ -312,7 +405,12 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Read-only GoldenGate Admin/Metrics REST contract probe (structural metadata only).")
     parser.add_argument("--deployment", required=True, help="canonical deployment name")
-    parser.add_argument("--port", required=True, choices=("admin", "metrics"))
+    parser.add_argument("--port", required=True, choices=("admin", "metrics"),
+                        help="admin: HTTPS+authenticated (confirmed secure PMS route, "
+                             "use this for /services/v2/mpoints/processes and "
+                             "/services/v2/monitoring/statusChanges). "
+                             "metrics: plain HTTP, unauthenticated only (port 9015 is not "
+                             "an approved authenticated path)")
     parser.add_argument("--path", required=True, help="explicit /services/... path")
     args = parser.parse_args(argv)
 
