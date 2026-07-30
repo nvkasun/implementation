@@ -1,0 +1,366 @@
+"""Synthetic-only tests for tools/gg_api_contract_probe.py: canonical
+deployment resolution, port selection, unsafe-path/deployment rejection,
+sanitized structural output, closed error-category classification, and
+proof that no DynamoDB write, CloudWatch call, or GoldenGate-modifying
+request is ever made. No real credentials or corporate hostnames are used
+anywhere in this file."""
+import json
+import os
+import ssl
+import sys
+import tempfile
+import unittest
+import urllib.error
+from unittest import mock
+from unittest.mock import MagicMock
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+
+import collector as core  # noqa: E402
+import config as cfgmod  # noqa: E402
+import gg_api_contract_probe as probe  # noqa: E402
+
+SYNTHETIC_HOST_SUFFIX = "svc.cluster.local"
+SYNTHETIC_USER = "synthetic-test-oggadmin"
+SYNTHETIC_PASSWORD = "synthetic-test-P@ssw0rd!"
+
+
+def _deployment(name="gg-oracle-payments-01", enabled=True, dtype="oracle"):
+    return {
+        "name": name,
+        "type": dtype,
+        "pipeline": "payments-ora-to-pg-001",
+        "role": "source",
+        "enabled": enabled,
+        "adminSecret": "some-secret-name",
+        "adminHost": f"{name}.goldengate-dev.{SYNTHETIC_HOST_SUFFIX}",
+        "adminPort": 8443,
+        "tlsServerName": f"{name}.goldengate-dev.example-internal",
+        "metricsPort": 9015,
+    }
+
+
+class PathValidationTests(unittest.TestCase):
+    def test_accepts_confirmed_paths(self):
+        for path in ("/services/v2/extracts", "/services/v2/replicats", "/services/v2/sources"):
+            self.assertEqual(probe.validate_path(path), path)
+
+    def test_accepts_explicit_unconfirmed_metrics_path(self):
+        # allowed when the operator passes it explicitly -- never a default.
+        self.assertEqual(probe.validate_path("/services/v2/metrics"), "/services/v2/metrics")
+
+    def test_rejects_url_with_scheme(self):
+        with self.assertRaises(probe.ProbeValidationError):
+            probe.validate_path("https://evil.example/services/v2/extracts")
+
+    def test_rejects_host_smuggled_via_double_slash(self):
+        with self.assertRaises(probe.ProbeValidationError):
+            probe.validate_path("//evil.example/services/v2/extracts")
+
+    def test_rejects_query_parameters(self):
+        with self.assertRaises(probe.ProbeValidationError):
+            probe.validate_path("/services/v2/extracts?x=1")
+
+    def test_rejects_fragment(self):
+        with self.assertRaises(probe.ProbeValidationError):
+            probe.validate_path("/services/v2/extracts#frag")
+
+    def test_rejects_non_services_path(self):
+        with self.assertRaises(probe.ProbeValidationError):
+            probe.validate_path("/etc/passwd")
+
+    def test_rejects_empty_path(self):
+        with self.assertRaises(probe.ProbeValidationError):
+            probe.validate_path("")
+
+    def test_rejects_whitespace(self):
+        with self.assertRaises(probe.ProbeValidationError):
+            probe.validate_path("/services/v2/ext racts")
+
+
+class DeploymentResolutionTests(unittest.TestCase):
+    def _with_doc(self, deployments):
+        return {"environment": "dev", "runtimeNamespace": "goldengate-dev",
+                "monitoringNamespace": "goldengate-monitoring", "dnsDomain": "example-internal",
+                "deployments": deployments}
+
+    def test_resolves_enabled_deployment(self):
+        doc = self._with_doc([_deployment()])
+        with mock.patch.object(cfgmod, "load_deployments", return_value=doc):
+            resolved = probe.resolve_deployment("gg-oracle-payments-01")
+        self.assertEqual(resolved["name"], "gg-oracle-payments-01")
+
+    def test_rejects_unknown_deployment(self):
+        doc = self._with_doc([_deployment()])
+        with mock.patch.object(cfgmod, "load_deployments", return_value=doc):
+            with self.assertRaises(probe.ProbeValidationError):
+                probe.resolve_deployment("gg-does-not-exist")
+
+    def test_rejects_disabled_deployment(self):
+        doc = self._with_doc([_deployment(enabled=False)])
+        with mock.patch.object(cfgmod, "load_deployments", return_value=doc):
+            with self.assertRaises(probe.ProbeValidationError):
+                probe.resolve_deployment("gg-oracle-payments-01")
+
+
+class PortSelectionTests(unittest.TestCase):
+    def test_admin_port_selected(self):
+        d = _deployment()
+        base = probe._port_and_base(d, "admin")
+        self.assertTrue(base.endswith(":8443"))
+        self.assertIn(d["adminHost"], base)
+
+    def test_metrics_port_selected(self):
+        d = _deployment()
+        base = probe._port_and_base(d, "metrics")
+        self.assertTrue(base.endswith(":9015"))
+        self.assertIn(d["adminHost"], base)
+
+
+class ErrorClassificationTests(unittest.TestCase):
+    def test_auth_failed_401(self):
+        self.assertEqual(probe._classify_request_error(Exception(), http_status=401), "AUTH_FAILED")
+
+    def test_auth_failed_403(self):
+        self.assertEqual(probe._classify_request_error(Exception(), http_status=403), "AUTH_FAILED")
+
+    def test_tls_failed(self):
+        self.assertEqual(probe._classify_request_error(ssl.SSLError("bad cert")), "TLS_FAILED")
+
+    def test_not_found_404(self):
+        self.assertEqual(probe._classify_request_error(Exception(), http_status=404), "NOT_FOUND")
+
+    def test_endpoint_unavailable_5xx(self):
+        self.assertEqual(probe._classify_request_error(Exception(), http_status=502), "ENDPOINT_UNAVAILABLE")
+
+    def test_endpoint_unavailable_connection_error(self):
+        self.assertEqual(
+            probe._classify_request_error(urllib.error.URLError("connection refused")), "ENDPOINT_UNAVAILABLE")
+
+    def test_unknown_fallback(self):
+        self.assertEqual(probe._classify_request_error(ValueError("something else")), "UNKNOWN")
+
+
+class SummarizeJsonTests(unittest.TestCase):
+    def test_successful_schema_extraction(self):
+        payload = {"response": {"items": [
+            {"name": "EXT1", "status": "RUNNING", "lag": 5},
+            {"name": "EXT2", "status": "ABENDED", "lag": "not-a-number"},
+        ]}}
+        summary = probe.summarize_json(payload)
+        self.assertEqual(summary["topLevelKeys"], ["response"])
+        self.assertEqual(summary["responseKeys"], ["items"])
+        self.assertEqual(summary["itemCount"], 2)
+        self.assertEqual(summary["itemFieldNames"], ["lag", "name", "status"])
+        self.assertEqual(summary["fieldTypes"]["lag"], ["number", "string"])
+        self.assertEqual(summary["fieldTypes"]["name"], ["string"])
+
+    def test_non_dict_payload_is_unexpected(self):
+        self.assertIsNone(probe.summarize_json([1, 2, 3]))
+        self.assertIsNone(probe.summarize_json("just a string"))
+        self.assertIsNone(probe.summarize_json(None))
+
+    def test_field_values_never_appear_in_summary(self):
+        payload = {"response": {"items": [
+            {"name": "SECRET_PROCESS_NAME_XYZ", "status": "RUNNING"}]}}
+        summary = probe.summarize_json(payload)
+        blob = json.dumps(summary)
+        self.assertNotIn("SECRET_PROCESS_NAME_XYZ", blob)
+        self.assertNotIn("RUNNING", blob)
+
+    def test_process_names_never_printed_field_names_only(self):
+        payload = {"response": {"items": [{"name": "EXT_PAYMENTS_CONFIDENTIAL"}]}}
+        summary = probe.summarize_json(payload)
+        self.assertIn("name", summary["itemFieldNames"])
+        self.assertNotIn("EXT_PAYMENTS_CONFIDENTIAL", json.dumps(summary))
+
+
+class RunProbeTests(unittest.TestCase):
+    """run_probe exercised with a fully mocked HTTP layer -- never touches a
+    real socket, DynamoDB, or CloudWatch."""
+
+    def _deployment_with_creds(self, tmp):
+        user_file = os.path.join(tmp, "user")
+        pwd_file = os.path.join(tmp, "pwd")
+        with open(user_file, "w") as f:
+            f.write(SYNTHETIC_USER)
+        with open(pwd_file, "w") as f:
+            f.write(SYNTHETIC_PASSWORD)
+        return user_file, pwd_file
+
+    def test_credentials_never_printed_on_missing_credentials(self):
+        d = _deployment()
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_user = os.path.join(tmp, "no-such-user")
+            missing_pwd = os.path.join(tmp, "no-such-pwd")
+            with mock.patch.object(cfgmod, "credential_paths", return_value=(missing_user, missing_pwd)):
+                with self.assertRaises(probe.ProbeValidationError) as ctx:
+                    probe.run_probe(d, "admin", "/services/v2/extracts")
+        self.assertNotIn(SYNTHETIC_USER, str(ctx.exception))
+        self.assertNotIn(SYNTHETIC_PASSWORD, str(ctx.exception))
+
+    def test_successful_probe_returns_sanitized_result_and_no_raw_body(self):
+        d = _deployment()
+        resp_body = json.dumps({"response": {"items": [
+            {"name": "TOP_SECRET_PROCESS", "status": "RUNNING", "lag": 3}]}}).encode()
+
+        fake_resp = MagicMock()
+        fake_resp.status = 200
+        fake_resp.headers = {"Content-Type": "application/json"}
+        fake_resp.read.return_value = resp_body
+        fake_resp.__enter__.return_value = fake_resp
+        fake_resp.__exit__.return_value = False
+
+        fake_opener = MagicMock()
+        fake_opener.open.return_value = fake_resp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            user_file, pwd_file = self._deployment_with_creds(tmp)
+            with mock.patch.object(cfgmod, "credential_paths", return_value=(user_file, pwd_file)), \
+                 mock.patch.object(core, "_build_ssl_context", return_value=MagicMock()), \
+                 mock.patch.object(core, "_basic_opener", return_value=fake_opener):
+                result = probe.run_probe(d, "admin", "/services/v2/extracts")
+
+        self.assertEqual(result["deploymentName"], "gg-oracle-payments-01")
+        self.assertEqual(result["deploymentType"], "oracle")
+        self.assertEqual(result["portType"], "admin")
+        self.assertEqual(result["httpStatus"], 200)
+        self.assertEqual(result["itemCount"], 1)
+        self.assertEqual(result["itemFieldNames"], ["lag", "name", "status"])
+        blob = json.dumps(result)
+        self.assertNotIn("TOP_SECRET_PROCESS", blob)
+        self.assertNotIn(SYNTHETIC_USER, blob)
+        self.assertNotIn(SYNTHETIC_PASSWORD, blob)
+
+    def test_auth_failure_classification_from_http_error(self):
+        d = _deployment()
+        fake_opener = MagicMock()
+        fake_opener.open.side_effect = urllib.error.HTTPError(
+            "https://internal/services/v2/extracts", 401, "Unauthorized", {}, None)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            user_file, pwd_file = self._deployment_with_creds(tmp)
+            with mock.patch.object(cfgmod, "credential_paths", return_value=(user_file, pwd_file)), \
+                 mock.patch.object(core, "_build_ssl_context", return_value=MagicMock()), \
+                 mock.patch.object(core, "_basic_opener", return_value=fake_opener):
+                with self.assertRaises(probe.ProbeRequestError) as ctx:
+                    probe.run_probe(d, "admin", "/services/v2/extracts")
+        self.assertEqual(ctx.exception.category, "AUTH_FAILED")
+        self.assertEqual(ctx.exception.http_status, 401)
+
+    def test_tls_failure_classification(self):
+        d = _deployment()
+        fake_opener = MagicMock()
+        fake_opener.open.side_effect = ssl.SSLError("certificate verify failed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            user_file, pwd_file = self._deployment_with_creds(tmp)
+            with mock.patch.object(cfgmod, "credential_paths", return_value=(user_file, pwd_file)), \
+                 mock.patch.object(core, "_build_ssl_context", return_value=MagicMock()), \
+                 mock.patch.object(core, "_basic_opener", return_value=fake_opener):
+                with self.assertRaises(probe.ProbeRequestError) as ctx:
+                    probe.run_probe(d, "admin", "/services/v2/extracts")
+        self.assertEqual(ctx.exception.category, "TLS_FAILED")
+
+    def test_404_classification(self):
+        d = _deployment()
+        fake_opener = MagicMock()
+        fake_opener.open.side_effect = urllib.error.HTTPError(
+            "https://internal/services/v2/extracts", 404, "Not Found", {}, None)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            user_file, pwd_file = self._deployment_with_creds(tmp)
+            with mock.patch.object(cfgmod, "credential_paths", return_value=(user_file, pwd_file)), \
+                 mock.patch.object(core, "_build_ssl_context", return_value=MagicMock()), \
+                 mock.patch.object(core, "_basic_opener", return_value=fake_opener):
+                with self.assertRaises(probe.ProbeRequestError) as ctx:
+                    probe.run_probe(d, "admin", "/services/v2/extracts")
+        self.assertEqual(ctx.exception.category, "NOT_FOUND")
+
+    def test_invalid_json_classification(self):
+        d = _deployment()
+        fake_resp = MagicMock()
+        fake_resp.status = 200
+        fake_resp.headers = {"Content-Type": "text/html"}
+        fake_resp.read.return_value = b"<html>not json</html>"
+        fake_resp.__enter__.return_value = fake_resp
+        fake_resp.__exit__.return_value = False
+
+        fake_opener = MagicMock()
+        fake_opener.open.return_value = fake_resp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            user_file, pwd_file = self._deployment_with_creds(tmp)
+            with mock.patch.object(cfgmod, "credential_paths", return_value=(user_file, pwd_file)), \
+                 mock.patch.object(core, "_build_ssl_context", return_value=MagicMock()), \
+                 mock.patch.object(core, "_basic_opener", return_value=fake_opener):
+                with self.assertRaises(probe.ProbeRequestError) as ctx:
+                    probe.run_probe(d, "admin", "/services/v2/extracts")
+        self.assertEqual(ctx.exception.category, "INVALID_JSON")
+
+    def test_raw_exception_never_printed(self):
+        d = _deployment()
+        fake_opener = MagicMock()
+        fake_opener.open.side_effect = RuntimeError("SECRET_INTERNAL_DETAIL_should_not_leak")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            user_file, pwd_file = self._deployment_with_creds(tmp)
+            with mock.patch.object(cfgmod, "credential_paths", return_value=(user_file, pwd_file)), \
+                 mock.patch.object(core, "_build_ssl_context", return_value=MagicMock()), \
+                 mock.patch.object(core, "_basic_opener", return_value=fake_opener):
+                with self.assertRaises(probe.ProbeRequestError) as ctx:
+                    probe.run_probe(d, "admin", "/services/v2/extracts")
+        self.assertEqual(ctx.exception.category, "UNKNOWN")
+        self.assertNotIn("SECRET_INTERNAL_DETAIL_should_not_leak", str(ctx.exception))
+
+
+class NoSideEffectTests(unittest.TestCase):
+    """The probe tool must never write DynamoDB, never call CloudWatch, and
+    never issue a request that could modify a GoldenGate deployment (GET
+    only, on the confirmed read-only Admin REST paths)."""
+
+    def test_module_never_imports_boto3_dynamodb_write_apis(self):
+        names = set()
+        for fn in (probe.run_probe, probe.resolve_deployment, probe.validate_path, probe.main):
+            names |= set(fn.__code__.co_names)
+        for forbidden in ("put_item", "update_item", "delete_item", "put_metric_data",
+                          "Table", "cloudwatch"):
+            self.assertNotIn(forbidden, names)
+
+    def test_module_has_no_dynamodb_or_cloudwatch_client_construction(self):
+        with open(probe.__file__) as f:
+            src = f.read()
+        self.assertNotIn("boto3.client", src)
+        self.assertNotIn("boto3.resource", src)
+
+    def test_only_http_get_is_used(self):
+        with open(probe.__file__) as f:
+            src = f.read()
+        # opener.open(...) is a GET by construction (no data= is ever passed,
+        # which would turn a urllib request into a POST).
+        self.assertNotIn("data=", src)
+        self.assertNotIn("method=\"POST\"", src)
+        self.assertNotIn("method='POST'", src)
+
+
+class CliMainTests(unittest.TestCase):
+    def test_main_rejects_unsafe_path_before_any_network_call(self):
+        with mock.patch.object(probe, "resolve_deployment") as mock_resolve:
+            rc = probe.main(["--deployment", "gg-oracle-payments-01", "--port", "admin",
+                             "--path", "http://evil/services/v2/extracts"])
+        self.assertEqual(rc, 2)
+        mock_resolve.assert_not_called()
+
+    def test_main_rejects_unknown_deployment(self):
+        doc = {"environment": "dev", "runtimeNamespace": "goldengate-dev",
+               "monitoringNamespace": "goldengate-monitoring", "dnsDomain": "example-internal",
+               "deployments": [_deployment()]}
+        with mock.patch.object(cfgmod, "load_deployments", return_value=doc):
+            rc = probe.main(["--deployment", "gg-does-not-exist", "--port", "admin",
+                             "--path", "/services/v2/extracts"])
+        self.assertEqual(rc, 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

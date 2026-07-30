@@ -32,6 +32,7 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir --no-compile -r requirements.txt
 
 COPY monitor.py collector.py health_rules.py config.py ./
+COPY tools/ ./tools/
 
 USER ${APP_UID}:${APP_GID}
 

@@ -394,6 +394,55 @@ else
   fail "found stray __pycache__/*.pyc: ${STRAY_PYCACHE} ${STRAY_PYC}"
 fi
 
+# ---------------------------------------------------------------------
+# 10. Phase 4B1: contract-probe tool packaged but never auto-run; CloudWatch
+#     stays physically disabled by default.
+# ---------------------------------------------------------------------
+echo ""
+echo "--- Contract-probe tool: packaged, never auto-run, CloudWatch stays disabled ---"
+PROBE_TOOL="${MONITOR_APP_DIR}/tools/gg_api_contract_probe.py"
+if [ -f "$PROBE_TOOL" ]; then
+  pass "gg_api_contract_probe.py exists under monitoring/monitor/tools/"
+else
+  fail "gg_api_contract_probe.py is missing"
+fi
+
+if grep -q "COPY tools/ ./tools/" "${MONITOR_APP_DIR}/Dockerfile" 2>/dev/null; then
+  pass "Dockerfile packages tools/ into the monitor image"
+else
+  fail "Dockerfile does not copy tools/ into the monitor image"
+fi
+
+if grep -q "^ENTRYPOINT \[\"python3\", \"monitor.py\"\]$" "${MONITOR_APP_DIR}/Dockerfile" 2>/dev/null; then
+  pass "Dockerfile entrypoint is unchanged (monitor.py only)"
+else
+  fail "Dockerfile entrypoint was changed"
+fi
+
+PROBE_WIRED="false"
+for f in "${MONITOR_APP_DIR}/monitor.py" "${MONITOR_APP_DIR}/collector.py"; do
+  [ -f "$f" ] || continue
+  if grep -q "gg_api_contract_probe" "$f"; then
+    fail "$(basename "$f") references gg_api_contract_probe -- must never auto-run"
+    PROBE_WIRED="true"
+  fi
+done
+if [ "$PROBE_WIRED" = "false" ]; then
+  pass "gg_api_contract_probe is never imported by monitor.py/collector.py (manual-only)"
+fi
+
+if grep -q "publishEnabled: false" "${MONITOR_CHART}/values.yaml" 2>/dev/null; then
+  pass "helm/goldengate-monitor default values.yaml keeps cloudwatch.publishEnabled: false"
+else
+  fail "helm/goldengate-monitor default values.yaml no longer defaults CloudWatch publishing to false"
+fi
+
+if [ -d "monitoring/observer" ]; then
+  pass "legacy observer (monitoring/observer) remains present"
+else
+  fail "monitoring/observer is missing -- legacy observer must remain operational"
+fi
+
 echo ""
 echo "=================================================="
 echo "Summary: ${PASS_COUNT} passed, ${FAIL_COUNT} failed, ${SKIP_COUNT} skipped"

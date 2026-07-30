@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import sys
@@ -393,6 +394,375 @@ class CredentialFailClosedTests(unittest.TestCase):
         src = inspect.getsource(core.polling_loop)
         self.assertNotIn("oggadmin", src)
         self.assertNotIn('or "oggadmin"', src)
+
+
+class ProcessDiscoveryTests(unittest.TestCase):
+    """fetch_gg_processes hardening: no STATE#unknown, no exception on
+    malformed data, no duplicate/synthetic process rows, exact real names
+    preserved, empty results always valid."""
+
+    BASE = "https://gg-test:8443"
+
+    def _fetch(self, responses):
+        def _stub(url, opener, timeout=5):
+            for suffix, payload in responses.items():
+                if url == self.BASE + suffix:
+                    return payload
+            raise AssertionError(f"unexpected URL requested in test: {url}")
+        with mock.patch.object(core, "_http_json", side_effect=_stub):
+            return core.fetch_gg_processes(self.BASE, opener=MagicMock())
+
+    def test_extracts_list_detail_normalization(self):
+        procs = self._fetch({
+            "/services/v2/deployments": {},
+            "/services/v2/extracts": {"response": {"items": [{"name": "EXT1"}]}},
+            "/services/v2/extracts/EXT1": {"response": {"status": "running", "lag": 12}},
+            "/services/v2/replicats": {"response": {"items": []}},
+            "/services/v2/sources": {"response": {"items": []}},
+        })
+        self.assertEqual(len(procs), 1)
+        p = procs[0]
+        self.assertEqual(p["process"], "EXT1")
+        self.assertEqual(p["type"], "extract")
+        self.assertEqual(p["status"], "RUNNING")
+        self.assertEqual(p["lagSeconds"], 12.0)
+        self.assertFalse(p["abended"])
+
+    def test_replicats_list_detail_normalization(self):
+        procs = self._fetch({
+            "/services/v2/deployments": {},
+            "/services/v2/extracts": {"response": {"items": []}},
+            "/services/v2/replicats": {"response": {"items": [{"name": "REP1"}]}},
+            "/services/v2/replicats/REP1": {"response": {"status": "ABENDED", "lagSeconds": 30}},
+            "/services/v2/sources": {"response": {"items": []}},
+        })
+        self.assertEqual(len(procs), 1)
+        p = procs[0]
+        self.assertEqual(p["process"], "REP1")
+        self.assertEqual(p["type"], "replicat")
+        self.assertEqual(p["status"], "ABENDED")
+        self.assertTrue(p["abended"])
+
+    def test_distpath_normalization(self):
+        procs = self._fetch({
+            "/services/v2/deployments": {},
+            "/services/v2/extracts": {"response": {"items": []}},
+            "/services/v2/replicats": {"response": {"items": []}},
+            "/services/v2/sources": {"response": {
+                "items": [{"name": "DP1", "status": "running", "bytesSent": 500}]}},
+        })
+        self.assertEqual(len(procs), 1)
+        p = procs[0]
+        self.assertEqual(p["process"], "DP1")
+        self.assertEqual(p["type"], "distpath")
+        self.assertEqual(p["status"], "RUNNING")
+        self.assertEqual(p["bytes"], 500)
+
+    def test_valid_process_names_preserved_exactly(self):
+        procs = self._fetch({
+            "/services/v2/deployments": {},
+            "/services/v2/extracts": {"response": {"items": [{"name": "EXT_ORA_PAYMENTS_01"}]}},
+            "/services/v2/extracts/EXT_ORA_PAYMENTS_01": {"response": {"status": "RUNNING"}},
+            "/services/v2/replicats": {"response": {"items": []}},
+            "/services/v2/sources": {"response": {"items": []}},
+        })
+        self.assertEqual(procs[0]["process"], "EXT_ORA_PAYMENTS_01")
+
+    def test_missing_process_name_is_skipped(self):
+        procs = self._fetch({
+            "/services/v2/deployments": {},
+            "/services/v2/extracts": {"response": {"items": [{"status": "RUNNING"}, {"name": ""}, {"name": None}]}},
+            "/services/v2/replicats": {"response": {"items": []}},
+            "/services/v2/sources": {"response": {"items": [{"status": "RUNNING"}]}},
+        })
+        self.assertEqual(procs, [])
+
+    def test_id_only_item_never_becomes_synthetic_unknown(self):
+        procs = self._fetch({
+            "/services/v2/deployments": {},
+            "/services/v2/extracts": {"response": {"items": [{"$id": 42, "status": "RUNNING"}]}},
+            "/services/v2/replicats": {"response": {"items": []}},
+            "/services/v2/sources": {"response": {"items": []}},
+        })
+        self.assertEqual(procs, [])
+        self.assertNotIn("unknown", [p["process"] for p in procs])
+
+    def test_malformed_list_items_do_not_crash_tick(self):
+        procs = self._fetch({
+            "/services/v2/deployments": {},
+            "/services/v2/extracts": {"response": {"items": [None, "garbage", 123, {"name": "EXT1"}]}},
+            "/services/v2/extracts/EXT1": {"response": {"status": "RUNNING"}},
+            "/services/v2/replicats": {"response": {"items": [{"name": "REP1"}]}},
+            "/services/v2/replicats/REP1": {"response": {"status": "RUNNING"}},
+            "/services/v2/sources": {"response": {"items": "not-a-list"}},
+        })
+        self.assertEqual(sorted(p["process"] for p in procs), ["EXT1", "REP1"])
+
+    def test_malformed_lag_becomes_safe_value(self):
+        procs = self._fetch({
+            "/services/v2/deployments": {},
+            "/services/v2/extracts": {"response": {"items": [{"name": "EXT1"}]}},
+            "/services/v2/extracts/EXT1": {"response": {"status": "RUNNING", "lag": "not-a-number"}},
+            "/services/v2/replicats": {"response": {"items": [{"name": "REP1"}]}},
+            "/services/v2/replicats/REP1": {"response": {"status": "RUNNING", "lagSeconds": -50}},
+            "/services/v2/sources": {"response": {"items": []}},
+        })
+        lags = {p["process"]: p["lagSeconds"] for p in procs}
+        self.assertEqual(lags["EXT1"], 0.0)
+        self.assertEqual(lags["REP1"], 0.0)
+
+    def test_empty_process_lists_are_valid(self):
+        procs = self._fetch({
+            "/services/v2/deployments": {},
+            "/services/v2/extracts": {"response": {"items": []}},
+            "/services/v2/replicats": {"response": {"items": []}},
+            "/services/v2/sources": {"response": {"items": []}},
+        })
+        self.assertEqual(procs, [])
+
+    def test_duplicate_process_items_deduplicated(self):
+        procs = self._fetch({
+            "/services/v2/deployments": {},
+            "/services/v2/extracts": {"response": {"items": [{"name": "EXT1"}, {"name": "EXT1"}]}},
+            "/services/v2/extracts/EXT1": {"response": {"status": "RUNNING"}},
+            "/services/v2/replicats": {"response": {"items": []}},
+            "/services/v2/sources": {"response": {"items": []}},
+        })
+        self.assertEqual(len(procs), 1)
+
+    def test_raw_response_payloads_not_logged(self):
+        def _stub(url, opener, timeout=5):
+            if url.endswith("/services/v2/deployments"):
+                return {}
+            raise RuntimeError("SECRET-MARKER-zzz raw body <html>should not appear</html>")
+        with mock.patch.object(core, "_http_json", side_effect=_stub):
+            with self.assertLogs(core.logger, level="WARNING") as log_ctx:
+                procs = core.fetch_gg_processes(self.BASE, opener=MagicMock())
+        self.assertEqual(procs, [])
+        combined = "\n".join(log_ctx.output)
+        self.assertNotIn("SECRET-MARKER-zzz", combined)
+        self.assertNotIn("<html>", combined)
+
+    def test_discovery_counts_and_summary_log(self):
+        procs = [
+            {"process": "E1", "type": "extract"},
+            {"process": "E2", "type": "extract"},
+            {"process": "R1", "type": "replicat"},
+            {"process": "D1", "type": "distpath"},
+        ]
+        self.assertEqual(core.discovery_counts(procs), {"extract": 2, "replicat": 1, "distpath": 1})
+        with self.assertLogs(core.logger, level="INFO") as log_ctx:
+            core.log_discovery_summary("gg-oracle-payments-01", procs)
+        combined = "\n".join(log_ctx.output)
+        self.assertIn('"event": "process_discovery_summary"', combined)
+        self.assertIn('"deployment": "gg-oracle-payments-01"', combined)
+        self.assertIn('"extractCount": 2', combined)
+        self.assertIn('"replicatCount": 1', combined)
+        self.assertIn('"distpathCount": 1', combined)
+        self.assertIn('"totalCount": 4', combined)
+
+    def test_zero_process_discovery_summary_is_valid(self):
+        with self.assertLogs(core.logger, level="INFO") as log_ctx:
+            core.log_discovery_summary("gg-oracle-payments-01", [])
+        combined = "\n".join(log_ctx.output)
+        self.assertIn('"totalCount": 0', combined)
+
+
+class BuildMetricBatchTests(unittest.TestCase):
+    """build_metric_batch: pure, no boto3, exact manager-compatible metric
+    names/dimensions/units."""
+
+    def test_namespace_constant(self):
+        self.assertEqual(core.CLOUDWATCH_NAMESPACE, "GoldenGate/Pipelines")
+
+    def test_deployment_dimensions_and_units(self):
+        md = core.build_metric_batch("gg-oracle-payments-01", "oracle", {"lag": 1, "abend": 1, "down": 1})
+        by_name = {m["MetricName"]: m for m in md}
+        for name in ("LagBreached", "AbendFailure", "DeploymentDown"):
+            self.assertEqual(by_name[name]["Dimensions"],
+                             [{"Name": "Deployment", "Value": "gg-oracle-payments-01"},
+                              {"Name": "DeploymentType", "Value": "oracle"}])
+            self.assertEqual(by_name[name]["Unit"], "Count")
+            self.assertEqual(by_name[name]["Value"], 1.0)
+
+    def test_heartbeat_only_when_ok(self):
+        md_off = core.build_metric_batch("gg-x", "oracle", {"lag": 0, "abend": 0, "down": 0}, heartbeat_ok=False)
+        self.assertNotIn("HeartbeatAgeSeconds", [m["MetricName"] for m in md_off])
+        md_on = core.build_metric_batch("gg-x", "oracle", {"lag": 0, "abend": 0, "down": 0}, heartbeat_ok=True)
+        hb = next(m for m in md_on if m["MetricName"] == "HeartbeatAgeSeconds")
+        self.assertEqual(hb["Value"], 0.0)
+        self.assertEqual(hb["Unit"], "Seconds")
+        self.assertEqual(hb["Dimensions"], [{"Name": "Deployment", "Value": "gg-x"},
+                                            {"Name": "DeploymentType", "Value": "oracle"}])
+
+    def test_critical_service_dimensions_and_values(self):
+        md = core.build_metric_batch("gg-x", "oracle", {"lag": 0, "abend": 0, "down": 0},
+                                     critical_service_status={"adminsrvr": True, "distsrvr": False})
+        entries = {m["Dimensions"][-1]["Value"]: m for m in md if m["MetricName"] == "CriticalServiceDown"}
+        self.assertEqual(entries["adminsrvr"]["Value"], 0.0)
+        self.assertEqual(entries["distsrvr"]["Value"], 1.0)
+        for m in entries.values():
+            self.assertEqual(m["Unit"], "Count")
+            self.assertEqual([d["Name"] for d in m["Dimensions"]], ["Deployment", "DeploymentType", "Service"])
+
+    def test_process_dimensions_extract_lag(self):
+        procs = [{"process": "EXT1", "type": "extract", "lagSeconds": 12.5, "abended": False}]
+        md = core.build_metric_batch("gg-x", "oracle", {"lag": 0, "abend": 0, "down": 0}, procs=procs)
+        lag_metric = next(m for m in md if m["MetricName"] == "ExtractLagSeconds")
+        self.assertEqual(lag_metric["Value"], 12.5)
+        self.assertEqual(lag_metric["Unit"], "Seconds")
+        self.assertEqual([d["Name"] for d in lag_metric["Dimensions"]], ["Deployment", "DeploymentType", "Process"])
+        self.assertEqual(lag_metric["Dimensions"][-1]["Value"], "EXT1")
+        abend_metric = next(m for m in md if m["MetricName"] == "AbendState")
+        self.assertEqual(abend_metric["Value"], 0.0)
+        self.assertEqual(abend_metric["Unit"], "Count")
+
+    def test_process_dimensions_replicat_lag(self):
+        procs = [{"process": "REP1", "type": "replicat", "lagSeconds": 3.0, "abended": True}]
+        md = core.build_metric_batch("gg-x", "oracle", {"lag": 0, "abend": 0, "down": 0}, procs=procs)
+        lag_metric = next(m for m in md if m["MetricName"] == "ReplicatLagSeconds")
+        self.assertEqual(lag_metric["Value"], 3.0)
+        abend_metric = next(m for m in md if m["MetricName"] == "AbendState")
+        self.assertEqual(abend_metric["Value"], 1.0)
+
+    def test_unknown_process_type_no_lag_metric_but_has_abendstate(self):
+        procs = [{"process": "DP1", "type": "distpath", "lagSeconds": 0.0, "abended": False}]
+        md = core.build_metric_batch("gg-x", "oracle", {"lag": 0, "abend": 0, "down": 0}, procs=procs)
+        names = [m["MetricName"] for m in md]
+        self.assertNotIn("ExtractLagSeconds", names)
+        self.assertNotIn("ReplicatLagSeconds", names)
+        self.assertIn("AbendState", names)
+
+    def test_abend_event_entries(self):
+        md_none = core.build_metric_batch("gg-x", "oracle", {"lag": 0, "abend": 0, "down": 0}, abend_events=[])
+        self.assertNotIn("AbendEvent", [m["MetricName"] for m in md_none])
+        md = core.build_metric_batch("gg-x", "oracle", {"lag": 0, "abend": 0, "down": 0}, abend_events=["EXT1"])
+        ev = next(m for m in md if m["MetricName"] == "AbendEvent")
+        self.assertEqual(ev["Value"], 1.0)
+        self.assertEqual(ev["Unit"], "Count")
+        self.assertEqual(ev["Dimensions"][-1], {"Name": "Process", "Value": "EXT1"})
+
+    def test_no_boto3_reference_in_build_function(self):
+        # co_names holds the actual names the function body loads/calls --
+        # unlike source text, it can't false-positive on the docstring.
+        names = core.build_metric_batch.__code__.co_names
+        self.assertNotIn("boto3", names)
+        self.assertNotIn("put_metric_data", names)
+
+
+class PublishMetricBatchTests(unittest.TestCase):
+    def test_batches_of_at_most_20(self):
+        metric_data = [{"MetricName": "AbendState",
+                        "Dimensions": [{"Name": "Process", "Value": f"P{i}"}],
+                        "Value": 0.0, "Unit": "Count"} for i in range(45)]
+        cw = MagicMock()
+        core.publish_metric_batch(cw, metric_data)
+        self.assertEqual(cw.put_metric_data.call_count, 3)
+        sizes = [len(c.kwargs["MetricData"]) for c in cw.put_metric_data.call_args_list]
+        self.assertEqual(sizes, [20, 20, 5])
+        for c in cw.put_metric_data.call_args_list:
+            self.assertEqual(c.kwargs["Namespace"], "GoldenGate/Pipelines")
+
+    def test_no_call_with_empty_batch(self):
+        cw = MagicMock()
+        core.publish_metric_batch(cw, [])
+        cw.put_metric_data.assert_not_called()
+
+
+class MetricPublicationIntegrationTests(unittest.TestCase):
+    """Wires build_metric_batch/publish_metric_batch into polling_loop:
+    heartbeat semantics must depend on an actual successful, fenced
+    STATE#_deployment write for this tick -- never on process status, never
+    published from a standby, never published when CloudWatch is disabled."""
+
+    DEPLOYMENT = {
+        "name": "gg-oracle-payments-01",
+        "type": "oracle",
+        "adminHost": "gg-oracle-payments-01.goldengate-dev.svc.cluster.local",
+        "adminPort": 8443,
+        "tlsServerName": "gg-oracle-payments-01.goldengate-dev.adcbmis.local",
+        "pipeline": "payments-ora-to-pg-001",
+    }
+
+    def _run_tick(self, leader=True, fence_write=False, cloudwatch_enabled=True, raise_on_fetch=False):
+        stop_event = threading.Event()
+
+        def fake_get_item(Key):
+            if Key.get("recordType") == "CONFIG":
+                stop_event.set()
+                return {"Item": {"deploymentType": "oracle", "checkIntervalSeconds": 0,
+                                 "alertsEnabled": False, "metricsEnabled": True}}
+            return {"Item": {}}
+
+        table = MagicMock()
+        table.get_item.side_effect = fake_get_item
+
+        mgr = MagicMock()
+        mgr.renew.return_value = not fence_write
+
+        state = core.LeaseState()
+        state.set_leader(leader)
+
+        publish_calls = []
+        cw_client_calls = []
+
+        def fake_fetch(*a, **k):
+            if raise_on_fetch:
+                raise RuntimeError("admin rest down")
+            return []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            user_file = os.path.join(tmp, "user")
+            pwd_file = os.path.join(tmp, "pwd")
+            with open(user_file, "w") as f:
+                f.write("synthetic-user")
+            with open(pwd_file, "w") as f:
+                f.write("synthetic-pass")
+
+            core.CLOUDWATCH_PUBLISH_ENABLED = cloudwatch_enabled
+            try:
+                with mock.patch.object(core.cfgmod, "credential_paths", return_value=(user_file, pwd_file)), \
+                     mock.patch.object(core, "fetch_gg_processes", side_effect=fake_fetch), \
+                     mock.patch.object(core, "_basic_opener", return_value=MagicMock()), \
+                     mock.patch.object(core, "_build_ssl_context", return_value=MagicMock()), \
+                     mock.patch.object(core, "probe_critical_services",
+                                       return_value={"adminsrvr": True, "distsrvr": True}), \
+                     mock.patch.object(core, "_cloudwatch_client",
+                                       side_effect=lambda: cw_client_calls.append(1) or MagicMock()), \
+                     mock.patch.object(core, "publish_metric_batch",
+                                       side_effect=lambda cw, md: publish_calls.append(md)):
+                    core.polling_loop(self.DEPLOYMENT, table, mgr, state, stop_event)
+            finally:
+                core.CLOUDWATCH_PUBLISH_ENABLED = False
+
+        return publish_calls, cw_client_calls
+
+    def test_heartbeat_emitted_after_successful_up_write(self):
+        publish_calls, cw_calls = self._run_tick(leader=True, fence_write=False, cloudwatch_enabled=True)
+        self.assertEqual(len(publish_calls), 1)
+        self.assertIn("HeartbeatAgeSeconds", [m["MetricName"] for m in publish_calls[0]])
+        self.assertEqual(len(cw_calls), 1)
+
+    def test_heartbeat_emitted_after_successful_deployment_down_write(self):
+        publish_calls, cw_calls = self._run_tick(
+            leader=True, fence_write=False, cloudwatch_enabled=True, raise_on_fetch=True)
+        self.assertEqual(len(publish_calls), 1)
+        self.assertIn("HeartbeatAgeSeconds", [m["MetricName"] for m in publish_calls[0]])
+
+    def test_standby_emits_no_heartbeat(self):
+        publish_calls, cw_calls = self._run_tick(leader=False, cloudwatch_enabled=True)
+        self.assertEqual(publish_calls, [])
+        self.assertEqual(cw_calls, [])
+
+    def test_failed_state_write_emits_no_heartbeat(self):
+        publish_calls, cw_calls = self._run_tick(leader=True, fence_write=True, cloudwatch_enabled=True)
+        self.assertEqual(publish_calls, [])
+        self.assertEqual(cw_calls, [])
+
+    def test_no_cloudwatch_client_while_disabled(self):
+        publish_calls, cw_calls = self._run_tick(leader=True, fence_write=False, cloudwatch_enabled=False)
+        self.assertEqual(publish_calls, [])
+        self.assertEqual(cw_calls, [])
 
 
 if __name__ == "__main__":

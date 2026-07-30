@@ -252,47 +252,116 @@ def _http_status(url, opener, timeout=5):
         return None
 
 
+_KNOWN_PROCESS_STATUSES = ("RUNNING", "STOPPED", "ABENDED")
+
+
+def _valid_process_name(raw):
+    """A real GoldenGate process name only -- never a synthetic fallback
+    (e.g. "unknown" or an internal $id). Returns None when the item carries
+    no usable name, so the caller can skip it entirely rather than ever
+    producing a STATE#unknown record."""
+    name = str(raw).strip() if raw is not None else ""
+    return name or None
+
+
+def _normalize_status(raw):
+    status = str(raw or "").upper()
+    return status if status in _KNOWN_PROCESS_STATUSES else "UNKNOWN"
+
+
+def _normalize_lag(raw):
+    """Never non-negative, never an exception -- a malformed/negative value
+    degrades to 0.0 rather than aborting the tick."""
+    try:
+        lag = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    return lag if lag > 0 else 0.0
+
+
 def fetch_gg_processes(base, opener):
-    """GoldenGate Admin REST polling (port 8443 only)."""
+    """GoldenGate Admin REST polling (port 8443 only). Tolerant of malformed
+    per-item data: an item with no valid process name is skipped rather than
+    recorded under a synthetic name, so STATE#unknown can never be produced.
+    Duplicate (type, name) pairs -- e.g. a repeated list entry -- keep only
+    the first occurrence. An empty process list is a valid result, never
+    treated as a deployment failure. Never logs a raw response body or raw
+    exception text -- only the endpoint kind and exception class."""
     _http_json(f"{base}/services/v2/deployments", opener)  # liveness probe
     procs = []
+    seen = set()
     for kind, ptype in (("extracts", "extract"), ("replicats", "replicat")):
         try:
             items = _http_json(f"{base}/services/v2/{kind}", opener).get("response", {}).get("items", [])
         except Exception as e:
-            logger.warning("listing %s failed: %s", kind, e)
+            logger.warning("listing %s failed: %s", kind, type(e).__name__)
+            items = []
+        if not isinstance(items, list):
             items = []
         for it in items:
-            name = str(it.get("name") or it.get("$id") or "unknown")
+            if not isinstance(it, dict):
+                continue
+            name = _valid_process_name(it.get("name"))
+            if name is None or (ptype, name) in seen:
+                continue
             detail = {}
             try:
-                detail = _http_json(f"{base}/services/v2/{kind}/{name}", opener).get("response", {})
+                raw_detail = _http_json(f"{base}/services/v2/{kind}/{name}", opener).get("response", {})
+                if isinstance(raw_detail, dict):
+                    detail = raw_detail
             except Exception as e:
-                logger.warning("detail %s/%s failed: %s", kind, name, e)
-            status = str(detail.get("status", it.get("status", "")) or "UNKNOWN").upper()
-            lag = detail.get("lag", detail.get("lagSeconds", 0)) or 0
-            try:
-                lag = float(lag)
-            except (TypeError, ValueError):
-                lag = 0.0
+                logger.warning("detail fetch failed for %s process: %s", ptype, type(e).__name__)
+            status = _normalize_status(detail.get("status", it.get("status")))
+            lag = _normalize_lag(detail.get("lag", detail.get("lagSeconds", it.get("lagSeconds", 0))))
             err = str(detail.get("lastError") or detail.get("error")
                       or detail.get("message") or "") if status == "ABENDED" else ""
+            seen.add((ptype, name))
             procs.append({"process": name, "type": ptype, "lagSeconds": lag,
                           "abended": status == "ABENDED", "status": status,
                           "metrics": detail or {}, "error": err})
     try:
         items = _http_json(f"{base}/services/v2/sources", opener).get("response", {}).get("items", [])
-        for it in items:
-            name = str(it.get("name") or "unknown")
-            status = str(it.get("status", "") or "UNKNOWN").upper()
-            bytes_now = next((it.get(k) for k in gh.BYTES_KEYS if it.get(k) is not None), None)
-            procs.append({"process": name, "type": "distpath", "lagSeconds": 0.0,
-                          "abended": status == "ABENDED", "status": status,
-                          "bytes": bytes_now, "metrics": it or {},
-                          "error": "" if status != "ABENDED" else str(it.get("lastError") or "")})
     except Exception as e:
-        logger.debug("dispatch sources scrape skipped: %s", e)
+        logger.debug("dispatch sources scrape skipped: %s", type(e).__name__)
+        items = []
+    if not isinstance(items, list):
+        items = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        name = _valid_process_name(it.get("name"))
+        if name is None or ("distpath", name) in seen:
+            continue
+        status = _normalize_status(it.get("status"))
+        bytes_now = next((it.get(k) for k in gh.BYTES_KEYS if it.get(k) is not None), None)
+        seen.add(("distpath", name))
+        procs.append({"process": name, "type": "distpath", "lagSeconds": 0.0,
+                      "abended": status == "ABENDED", "status": status,
+                      "bytes": bytes_now, "metrics": it or {},
+                      "error": "" if status != "ABENDED" else str(it.get("lastError") or "")})
     return procs
+
+
+def discovery_counts(procs):
+    counts = {"extract": 0, "replicat": 0, "distpath": 0}
+    for p in procs:
+        if p.get("type") in counts:
+            counts[p["type"]] += 1
+    return counts
+
+
+def log_discovery_summary(pipeline, procs):
+    """One structured, non-sensitive log line per deployment tick. Never
+    logs the process payload itself -- only per-type counts."""
+    counts = discovery_counts(procs)
+    logger.info(json.dumps({
+        "event": "process_discovery_summary",
+        "deployment": pipeline,
+        "extractCount": counts["extract"],
+        "replicatCount": counts["replicat"],
+        "distpathCount": counts["distpath"],
+        "totalCount": counts["extract"] + counts["replicat"] + counts["distpath"],
+    }))
 
 
 _SVC_PROBE_PATH = {"adminsrvr": "extracts", "distsrvr": "sources", "recvsrvr": "targets"}
@@ -309,38 +378,71 @@ def probe_critical_services(base, opener, critical):
     return out
 
 
-def build_metric_data(deployment, deployment_type, parsed):
-    lag_metric_by_type = {"extract": "ExtractLagSeconds", "replicat": "ReplicatLagSeconds"}
-    md = []
-    for p in parsed:
-        dims = [
-            {"Name": "Deployment", "Value": deployment},
-            {"Name": "DeploymentType", "Value": deployment_type},
-            {"Name": "Process", "Value": p["process"]},
-        ]
-        lag_metric = lag_metric_by_type.get(p["type"])
+_LAG_METRIC_BY_PROCESS_TYPE = {"extract": "ExtractLagSeconds", "replicat": "ReplicatLagSeconds"}
+
+
+def build_metric_batch(pipeline, deployment_type, flags, procs=None,
+                       critical_service_status=None, abend_events=None, heartbeat_ok=False):
+    """Pure builder for the full manager-compatible metric contract: ordinary
+    dicts only, no boto3 calls, no CloudWatch client -- safe to unit-test
+    while CLOUDWATCH_PUBLISH_ENABLED stays false.
+
+    flags: {"lag": 0/1, "abend": 0/1, "down": 0/1} deployment-level breach
+    flags for this tick.
+    procs: normalized process rows (process/type/lagSeconds/abended); unknown
+    process types receive AbendState only, never a lag metric.
+    critical_service_status: {serviceName: up_bool}.
+    abend_events: process names that just transitioned into a countable abend
+    event this tick (per the existing abend-rule cadence, not every tick).
+    heartbeat_ok: True only when the caller has already completed a
+    successful, fenced STATE#_deployment write for this tick -- see
+    run_pipeline/polling_loop for the shared-monitor heartbeat semantics.
+    """
+    procs = procs or []
+    critical_service_status = critical_service_status or {}
+    abend_events = abend_events or ()
+
+    dep_dims = [{"Name": "Deployment", "Value": pipeline}, {"Name": "DeploymentType", "Value": deployment_type}]
+    md = [{"MetricName": n, "Dimensions": dep_dims, "Value": float(v), "Unit": "Count"}
+          for n, v in (("LagBreached", flags.get("lag", 0)),
+                       ("AbendFailure", flags.get("abend", 0)),
+                       ("DeploymentDown", flags.get("down", 0)))]
+
+    if heartbeat_ok:
+        md.append({"MetricName": "HeartbeatAgeSeconds", "Dimensions": dep_dims, "Value": 0.0, "Unit": "Seconds"})
+
+    for svc, up in critical_service_status.items():
+        md.append({"MetricName": "CriticalServiceDown",
+                   "Dimensions": dep_dims + [{"Name": "Service", "Value": svc}],
+                   "Value": 0.0 if up else 1.0, "Unit": "Count"})
+
+    for p in procs:
+        proc_dims = dep_dims + [{"Name": "Process", "Value": p["process"]}]
+        lag_metric = _LAG_METRIC_BY_PROCESS_TYPE.get(p.get("type"))
         if lag_metric:
-            md.append({"MetricName": lag_metric, "Dimensions": dims, "Value": p["lagSeconds"], "Unit": "Seconds"})
-        md.append({"MetricName": "AbendState", "Dimensions": dims,
-                   "Value": 1.0 if p["abended"] else 0.0, "Unit": "Count"})
+            md.append({"MetricName": lag_metric, "Dimensions": proc_dims,
+                       "Value": float(p.get("lagSeconds", 0) or 0), "Unit": "Seconds"})
+        md.append({"MetricName": "AbendState", "Dimensions": proc_dims,
+                   "Value": 1.0 if p.get("abended") else 0.0, "Unit": "Count"})
+
+    for name in abend_events:
+        md.append({"MetricName": "AbendEvent",
+                   "Dimensions": dep_dims + [{"Name": "Process", "Value": name}],
+                   "Value": 1.0, "Unit": "Count"})
+
     return md
 
 
-def _emit(cw, deployment, deployment_type, flags, extra_md=None):
-    md = [{"MetricName": n,
-           "Dimensions": [{"Name": "Deployment", "Value": deployment},
-                          {"Name": "DeploymentType", "Value": deployment_type}],
-           "Value": float(v), "Unit": u}
-          for n, v, u in (("LagBreached", flags["lag"], "Count"),
-                          ("AbendFailure", flags["abend"], "Count"),
-                          ("DeploymentDown", flags["down"], "Count"))]
-    md += (extra_md or [])
-    if cw and md:
-        for i in range(0, len(md), 20):  # PutMetricData max 20/call
-            try:
-                cw.put_metric_data(Namespace=CLOUDWATCH_NAMESPACE, MetricData=md[i:i + 20])
-            except Exception:
-                logger.exception("CloudWatch put_metric_data failed; continuing")
+def publish_metric_batch(cw, metric_data):
+    """The only boto3-calling half of metric emission -- always called behind
+    cloudwatch_enabled_for(cfg), never while the hard switch is false."""
+    if not cw or not metric_data:
+        return
+    for i in range(0, len(metric_data), 20):  # PutMetricData max 20/call
+        try:
+            cw.put_metric_data(Namespace=CLOUDWATCH_NAMESPACE, MetricData=metric_data[i:i + 20])
+        except Exception:
+            logger.exception("CloudWatch put_metric_data failed; continuing")
 
 
 class _FencedOff(Exception):
@@ -476,7 +578,7 @@ def polling_loop(deployment, table, mgr, state, stop_event):
                 continue
 
             flags = {"lag": 0, "abend": 0, "down": 0}
-            extra_md = []
+            abend_event_names = []
 
             user = _read_secret_file(user_file)
             pwd = _read_secret_file(pwd_file)
@@ -508,11 +610,18 @@ def polling_loop(deployment, table, mgr, state, stop_event):
                 _guarded_write("_deployment", dep_snap)
                 last_dep_status = status
                 logger.warning("GoldenGate Admin REST unreachable for %s (%s): %s", pipeline, status, e)
+                # The _deployment write above just succeeded (it would have
+                # raised _FencedOff otherwise) -- the monitor itself is alive
+                # even though GoldenGate is unreachable, so the heartbeat
+                # still fires here (shared-monitor semantics; see
+                # build_metric_batch's heartbeat_ok docstring).
                 if cloudwatch_enabled_for(cfg):
-                    _emit(_cloudwatch_client(), pipeline, deployment_type, flags)
+                    metric_data = build_metric_batch(pipeline, deployment_type, flags, heartbeat_ok=True)
+                    publish_metric_batch(_cloudwatch_client(), metric_data)
                 _sleep_watching_leadership(interval)
                 continue
 
+            log_discovery_summary(pipeline, procs)
             source_active = any(p["type"] == "extract" and p["status"] == "RUNNING" for p in procs)
 
             for p in procs:
@@ -537,11 +646,7 @@ def polling_loop(deployment, table, mgr, state, stop_event):
                     flags["abend"] = 1
                 # act["failover"] is never acted on -- no restart/exit path exists.
                 if act["abend_event"]:
-                    extra_md.append({"MetricName": "AbendEvent",
-                                     "Dimensions": [{"Name": "Deployment", "Value": pipeline},
-                                                    {"Name": "DeploymentType", "Value": deployment_type},
-                                                    {"Name": "Process", "Value": name}],
-                                     "Value": 1.0, "Unit": "Count"})
+                    abend_event_names.append(name)
                 snap = {"processType": ptype, "status": status,
                         "lagSeconds": int(p["lagSeconds"]), "recordedAt": cfgmod.now_epoch(),
                         "resolvedThreshold": thr, "resolvedMode": mode,
@@ -561,13 +666,8 @@ def polling_loop(deployment, table, mgr, state, stop_event):
             if critical:
                 svc_up = probe_critical_services(base, opener, critical)
                 cs_new = {svc: {"reachable": bool(up)} for svc, up in svc_up.items()}
-                for svc, up in svc_up.items():
-                    extra_md.append({"MetricName": "CriticalServiceDown",
-                                     "Dimensions": [{"Name": "Deployment", "Value": pipeline},
-                                                    {"Name": "DeploymentType", "Value": deployment_type},
-                                                    {"Name": "Service", "Value": svc}],
-                                     "Value": 0.0 if up else 1.0, "Unit": "Count"})
             else:
+                svc_up = {}
                 cs_new = {}
 
             transitioned = ("UP" != last_dep_status)
@@ -578,9 +678,12 @@ def polling_loop(deployment, table, mgr, state, stop_event):
             _guarded_write("_deployment", dep_snap)
             last_dep_status = "UP"
 
+            # The _deployment write above just succeeded -- heartbeat fires.
             if cloudwatch_enabled_for(cfg):
-                extra_md += build_metric_data(pipeline, deployment_type, procs)
-                _emit(_cloudwatch_client(), pipeline, deployment_type, flags, extra_md)
+                metric_data = build_metric_batch(pipeline, deployment_type, flags, procs=procs,
+                                                 critical_service_status=svc_up,
+                                                 abend_events=abend_event_names, heartbeat_ok=True)
+                publish_metric_batch(_cloudwatch_client(), metric_data)
 
         except _FencedOff:
             pass
