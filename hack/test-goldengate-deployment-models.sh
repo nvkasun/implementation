@@ -499,6 +499,46 @@ if [ "$FOLLOW_WIRED" = "false" ]; then
   pass "--follow-processes is never referenced by monitor.py/collector.py (manual-only)"
 fi
 
+# ---------------------------------------------------------------------
+# 13. Phase 4C1: production PMS collection bounded, no new DynamoDB
+#     record type, forbidden endpoints never referenced by name.
+# ---------------------------------------------------------------------
+echo ""
+echo "--- Production PMS collection: bounded, no forbidden endpoints ---"
+if grep -q "MAX_FOLLOWED_PMS_PROCESSES = 20" "${MONITOR_APP_DIR}/collector.py" 2>/dev/null; then
+  pass "collector.py caps production PMS collection at 20 followed processes"
+else
+  fail "collector.py no longer caps production PMS collection at 20 followed processes"
+fi
+
+if grep -q 'PMS_DETAIL_KINDS = ("processPerformance", "serviceHealth")' "${MONITOR_APP_DIR}/collector.py" 2>/dev/null; then
+  pass "collector.py production PMS detail calls remain processPerformance + serviceHealth only"
+else
+  fail "collector.py production PMS detail-call set changed unexpectedly"
+fi
+
+PMS_FORBIDDEN_FOUND="false"
+# Skip the module docstring (lines 1..first closing triple-quote), which
+# legitimately documents these endpoints as NOT used -- only code after it
+# must never reference them.
+COLLECTOR_CODE_TAIL="$(awk '/^"""$/{n++; next} n>=1' "${MONITOR_APP_DIR}/collector.py" 2>/dev/null)"
+for pattern in '"/heartbeat"' '"/threadPerformance"' "statusChanges" "9015"; do
+  if grep -qF "$pattern" <<< "$COLLECTOR_CODE_TAIL"; then
+    fail "collector.py references forbidden PMS pattern outside its docstring: ${pattern}"
+    PMS_FORBIDDEN_FOUND="true"
+  fi
+done
+if [ "$PMS_FORBIDDEN_FOUND" = "false" ]; then
+  pass "collector.py never references /heartbeat, /threadPerformance, statusChanges, or port 9015 outside its docstring"
+fi
+
+if grep -q '"pms" in snapshot' "${MONITOR_APP_DIR}/collector.py" 2>/dev/null \
+    && grep -q 'f"STATE#{process}"' "${MONITOR_APP_DIR}/collector.py" 2>/dev/null; then
+  pass "PMS enrichment folds into the existing STATE# write -- no new recordType"
+else
+  fail "PMS enrichment / existing STATE# recordType pattern changed unexpectedly"
+fi
+
 echo ""
 echo "=================================================="
 echo "Summary: ${PASS_COUNT} passed, ${FAIL_COUNT} failed, ${SKIP_COUNT} skipped"

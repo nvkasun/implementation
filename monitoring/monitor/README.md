@@ -32,6 +32,38 @@ result. One structured, non-sensitive `process_discovery_summary` log line
 (deployment name + per-type counts only, never the raw payload) is emitted
 per deployment tick.
 
+## Production PMS collection
+
+Once per successful leader tick, `collector.collect_pms` reuses the same
+authenticated, TLS-verified HTTPS adminPort 8443 opener as the rest of
+Admin REST polling to GET the confirmed process inventory
+(`/services/v2/mpoints/processes`) exactly once, then follows up to 20
+unique, deduplicated `processName` values with sequential, bounded
+`processPerformance` + `serviceHealth` GETs -- the only two production
+detail calls. Heartbeat age is derived from `inventory.lastHeartbeat`
+(`heartbeat_age_seconds`, timezone-aware, future-clamped to 0); the
+`/heartbeat` endpoint returned HTTP 404 for every process in the validated
+live environment and is **never** called in production. `/threadPerformance`
+and `/process` are intentionally not polled (redundant with inventory /
+high-cardinality, deferred); `/services/v2/monitoring/statusChanges`,
+`/services/v2/metrics`, and direct authenticated HTTP port 9015 are never
+used by this path either.
+
+`collect_pms` never raises -- an inventory failure or every detail request
+failing degrades to a closed status (`OK`/`PARTIAL`/`UNAVAILABLE`/
+`AUTH_FAILED`/`TLS_FAILED`/`ENDPOINT_UNAVAILABLE`/`INVALID_RESPONSE`) and
+**never** marks an otherwise-healthy Admin REST deployment `DOWN`. The
+result is folded into the existing guarded/fenced `STATE#_deployment` write
+only, under the new `pms` attribute (bounded: per-process
+`performance`/`serviceHealth`/`heartbeatAgeSeconds`, capped at 20 entries,
+plus deployment-level counts and a `collectedAt` freshness marker) -- no
+new DynamoDB table, recordType, or per-PMS-process `STATE#` row is created,
+and a standby or fenced collector never issues a PMS request or write (the
+exact same lease/fencing rules as every other write in this module).
+`cpuTimeUs`/`kernelTimeUs`/`userTimeUs` are cumulative counters and are
+never converted into a rate/percentage in this phase. Production PMS
+collection never restarts, stops, or otherwise controls GoldenGate.
+
 ## CloudWatch metric contract
 
 `collector.build_metric_batch` is a pure function (no boto3 calls) that

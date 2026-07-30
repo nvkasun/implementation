@@ -854,5 +854,477 @@ class LoggerHierarchyIntegrationTests(unittest.TestCase):
         self.assertEqual(len(lines), 2)  # exactly one line per call, no duplication per call
 
 
+class PmsNormalizationTests(unittest.TestCase):
+    """Pure PMS normalization helpers: bounded, safe types only, never an
+    exception, never a silently-wrong type."""
+
+    def test_number_malformed_becomes_zero(self):
+        self.assertEqual(core._normalize_pms_number("not-a-number"), 0)
+        self.assertEqual(core._normalize_pms_number(None), 0)
+        self.assertEqual(core._normalize_pms_number([1, 2]), 0)
+
+    def test_number_nan_infinite_negative_become_zero(self):
+        self.assertEqual(core._normalize_pms_number(float("nan")), 0)
+        self.assertEqual(core._normalize_pms_number(float("inf")), 0)
+        self.assertEqual(core._normalize_pms_number(float("-inf")), 0)
+        self.assertEqual(core._normalize_pms_number(-5), 0)
+        self.assertEqual(core._normalize_pms_number(-0.5), 0)
+
+    def test_number_boolean_rejected_not_treated_as_numeric(self):
+        self.assertEqual(core._normalize_pms_number(True), 0)
+        self.assertEqual(core._normalize_pms_number(False), 0)
+
+    def test_number_valid_values_preserved(self):
+        self.assertEqual(core._normalize_pms_number(42), 42)
+        self.assertEqual(core._normalize_pms_number(3.5), 3.5)
+        self.assertEqual(core._normalize_pms_number(0), 0)
+
+    def test_inventory_normalization_unknown_fields_ignored(self):
+        raw = {"processName": "SYNTHETIC_PROC", "processType": "sm", "processMode": "RUNNING",
+              "processState": "UP", "processId": 42, "portNumber": 9011,
+              "startTime": "2026-01-01T00:00:00Z", "stateTime": "2026-01-01T00:00:00Z",
+              "lastHeartbeat": "2026-01-01T00:00:00Z", "firstMessage": 1, "lastMessage": 2,
+              "someRandomUnknownField": "should be ignored", "secretToken": "ignored-too"}
+        out = core.normalize_pms_inventory_item(raw)
+        self.assertNotIn("someRandomUnknownField", out)
+        self.assertNotIn("secretToken", out)
+        self.assertEqual(out["processName"], "SYNTHETIC_PROC")
+        self.assertEqual(out["processId"], 42)
+
+    def test_inventory_normalization_missing_fields_absent(self):
+        out = core.normalize_pms_inventory_item({"processName": "P1"})
+        self.assertEqual(out, {"processName": "P1"})
+
+    def test_inventory_normalization_non_dict_returns_empty(self):
+        self.assertEqual(core.normalize_pms_inventory_item(None), {})
+        self.assertEqual(core.normalize_pms_inventory_item("garbage"), {})
+        self.assertEqual(core.normalize_pms_inventory_item([1, 2]), {})
+
+    def test_performance_normalization_only_confirmed_numeric_fields(self):
+        raw = {"cpuTimeUs": 100, "kernelTimeUs": 50, "userTimeUs": 50,
+              "workingSetSize": 1000, "peakWorkingSetSize": 2000, "privateBytes": 500,
+              "threadCount": 10, "handleCount": 20, "pageFaults": 5,
+              "ioReadBytes": 1, "ioReadCount": 2, "ioWriteBytes": 3, "ioWriteCount": 4,
+              "ioOtherBytes": 5, "ioOtherCount": 6, "processStartTime": 12345, "processId": 7,
+              "unknownExtraField": "ignored"}
+        out = core.normalize_pms_performance(raw)
+        self.assertNotIn("unknownExtraField", out)
+        self.assertEqual(out["cpuTimeUs"], 100)
+        self.assertEqual(set(out.keys()), set(core._PMS_PERFORMANCE_NUMERIC_FIELDS))
+
+    def test_performance_normalization_cumulative_counters_preserved_as_is(self):
+        # cpuTimeUs/kernelTimeUs/userTimeUs must never be converted into a
+        # rate/percentage in this phase -- preserved exactly (post-safety-clamp).
+        raw = {"cpuTimeUs": 999999, "kernelTimeUs": 111111, "userTimeUs": 222222}
+        out = core.normalize_pms_performance(raw)
+        self.assertEqual(out["cpuTimeUs"], 999999)
+        self.assertEqual(out["kernelTimeUs"], 111111)
+        self.assertEqual(out["userTimeUs"], 222222)
+
+    def test_performance_normalization_malformed_values_safe(self):
+        raw = {"cpuTimeUs": "garbage", "workingSetSize": -5, "threadCount": True,
+              "handleCount": float("nan"), "pageFaults": float("inf")}
+        out = core.normalize_pms_performance(raw)
+        self.assertEqual(out["cpuTimeUs"], 0)
+        self.assertEqual(out["workingSetSize"], 0)
+        self.assertEqual(out["threadCount"], 0)
+        self.assertEqual(out["handleCount"], 0)
+        self.assertEqual(out["pageFaults"], 0)
+
+    def test_performance_normalization_non_dict_returns_empty(self):
+        self.assertEqual(core.normalize_pms_performance(None), {})
+        self.assertEqual(core.normalize_pms_performance([1, 2, 3]), {})
+
+    def test_service_health_normalization_valid(self):
+        out = core.normalize_pms_service_health(
+            {"isHealthy": True, "criticalResourcesHealthy": 3, "criticalResourcesUnhealthy": 1})
+        self.assertEqual(out, {"isHealthy": True, "criticalResourcesHealthy": 3, "criticalResourcesUnhealthy": 1})
+
+    def test_service_health_normalization_malformed_fields_safe_defaults(self):
+        out = core.normalize_pms_service_health(
+            {"isHealthy": "yes", "criticalResourcesHealthy": "garbage", "criticalResourcesUnhealthy": -1})
+        self.assertEqual(out["isHealthy"], False)  # non-boolean never silently accepted as healthy
+        self.assertEqual(out["criticalResourcesHealthy"], 0)
+        self.assertEqual(out["criticalResourcesUnhealthy"], 0)
+
+    def test_service_health_normalization_non_dict_returns_safe_defaults(self):
+        out = core.normalize_pms_service_health(None)
+        self.assertEqual(out, {"isHealthy": False, "criticalResourcesHealthy": 0, "criticalResourcesUnhealthy": 0})
+
+
+class HeartbeatAgeTests(unittest.TestCase):
+    """heartbeat_age_seconds: pure, timezone-aware, injectable clock."""
+
+    NOW = __import__("datetime").datetime(2026, 7, 30, 9, 0, 0, tzinfo=__import__("datetime").timezone.utc)
+
+    def test_valid_z_suffix_timestamp(self):
+        self.assertEqual(core.heartbeat_age_seconds("2026-07-30T08:59:00Z", now=self.NOW), 60)
+
+    def test_valid_offset_timestamp(self):
+        self.assertEqual(core.heartbeat_age_seconds("2026-07-30T12:59:00+04:00", now=self.NOW), 60)
+
+    def test_future_timestamp_clamped_to_zero(self):
+        self.assertEqual(core.heartbeat_age_seconds("2026-07-30T09:05:00Z", now=self.NOW), 0)
+
+    def test_missing_timestamp_returns_none(self):
+        self.assertIsNone(core.heartbeat_age_seconds(None, now=self.NOW))
+        self.assertIsNone(core.heartbeat_age_seconds("", now=self.NOW))
+
+    def test_malformed_timestamp_returns_none(self):
+        self.assertIsNone(core.heartbeat_age_seconds("not-a-timestamp", now=self.NOW))
+        self.assertIsNone(core.heartbeat_age_seconds("12345", now=self.NOW))
+
+    def test_naive_timestamp_without_timezone_returns_none(self):
+        # never assume local time -- an unqualified timestamp is unusable.
+        self.assertIsNone(core.heartbeat_age_seconds("2026-07-30T08:59:00", now=self.NOW))
+
+    def test_non_string_input_returns_none(self):
+        self.assertIsNone(core.heartbeat_age_seconds(12345, now=self.NOW))
+        self.assertIsNone(core.heartbeat_age_seconds(["2026-07-30T08:59:00Z"], now=self.NOW))
+
+    def test_default_now_is_real_utc_when_not_injected(self):
+        # sanity check that the pure helper still works without an injected
+        # clock (uses real current time) -- age should be a small
+        # non-negative number for a timestamp a few seconds ago.
+        import datetime as _dt
+        recent = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=5)).isoformat()
+        age = core.heartbeat_age_seconds(recent)
+        self.assertIsNotNone(age)
+        self.assertGreaterEqual(age, 0)
+
+
+class PmsRequestSequenceTests(unittest.TestCase):
+    """collect_pms(): the full bounded, sequential production PMS request
+    model, end to end against a mocked opener. Synthetic data only."""
+
+    BASE = "https://gg-test:8443"
+
+    def _fake_opener(self, inventory_payload, detail_payloads=None, detail_exceptions=None,
+                     record_calls=None):
+        detail_payloads = detail_payloads or {}
+        detail_exceptions = detail_exceptions or {}
+        record_calls = record_calls if record_calls is not None else []
+
+        def _open(url, timeout=5):
+            record_calls.append(url)
+            if url in detail_exceptions:
+                raise detail_exceptions[url]
+            if url == f"{self.BASE}{core.PMS_INVENTORY_PATH}":
+                body = json.dumps(inventory_payload).encode()
+            elif url in detail_payloads:
+                body = json.dumps(detail_payloads[url]).encode()
+            else:
+                raise AssertionError(f"unexpected PMS URL requested in test: {url}")
+            resp = MagicMock()
+            resp.read.return_value = body
+            resp.__enter__.return_value = resp
+            resp.__exit__.return_value = False
+            return resp
+
+        opener = MagicMock()
+        opener.open.side_effect = _open
+        return opener, record_calls
+
+    def _inventory(self, names):
+        return {"response": {"processes": [
+            {"processName": n, "processId": i, "lastHeartbeat": "2026-07-30T08:59:00Z"}
+            for i, n in enumerate(names)]}}
+
+    def test_one_inventory_request_per_call(self):
+        opener, calls = self._fake_opener(self._inventory(["P1"]),
+                                          {f"{self.BASE}/services/v2/mpoints/P1/processPerformance": {"response": {}},
+                                           f"{self.BASE}/services/v2/mpoints/P1/serviceHealth": {"response": {}}})
+        core.collect_pms(self.BASE, opener)
+        inventory_calls = [c for c in calls if c == f"{self.BASE}{core.PMS_INVENTORY_PATH}"]
+        self.assertEqual(len(inventory_calls), 1)
+
+    def test_unique_process_name_deduplication(self):
+        inventory = {"response": {"processes": [
+            {"processName": "DUP1"}, {"processName": "DUP1"}, {"processName": "UNIQ1"}]}}
+        detail = {f"{self.BASE}/services/v2/mpoints/DUP1/processPerformance": {"response": {}},
+                 f"{self.BASE}/services/v2/mpoints/DUP1/serviceHealth": {"response": {}},
+                 f"{self.BASE}/services/v2/mpoints/UNIQ1/processPerformance": {"response": {}},
+                 f"{self.BASE}/services/v2/mpoints/UNIQ1/serviceHealth": {"response": {}}}
+        opener, calls = self._fake_opener(inventory, detail)
+        result = core.collect_pms(self.BASE, opener)
+        self.assertEqual(result["followedCount"], 2)
+        detail_calls = [c for c in calls if "DUP1" in c or "UNIQ1" in c]
+        self.assertEqual(len(detail_calls), 4)  # 2 processes x 2 detail kinds, never more
+
+    def test_maximum_20_followed_processes(self):
+        names = [f"P{i}" for i in range(30)]
+        detail = {}
+        for n in names:
+            detail[f"{self.BASE}/services/v2/mpoints/{n}/processPerformance"] = {"response": {}}
+            detail[f"{self.BASE}/services/v2/mpoints/{n}/serviceHealth"] = {"response": {}}
+        opener, calls = self._fake_opener(self._inventory(names), detail)
+        result = core.collect_pms(self.BASE, opener)
+        self.assertEqual(result["inventoryCount"], 30)
+        self.assertEqual(result["followedCount"], 20)
+        detail_calls = [c for c in calls if c != f"{self.BASE}{core.PMS_INVENTORY_PATH}"]
+        self.assertEqual(len(detail_calls), 40)  # 20 processes x 2 kinds
+
+    def test_process_performance_and_service_health_paths_requested(self):
+        opener, calls = self._fake_opener(
+            self._inventory(["P1"]),
+            {f"{self.BASE}/services/v2/mpoints/P1/processPerformance": {"response": {"cpuTimeUs": 1}},
+             f"{self.BASE}/services/v2/mpoints/P1/serviceHealth": {"response": {"isHealthy": True}}})
+        core.collect_pms(self.BASE, opener)
+        self.assertIn(f"{self.BASE}/services/v2/mpoints/P1/processPerformance", calls)
+        self.assertIn(f"{self.BASE}/services/v2/mpoints/P1/serviceHealth", calls)
+
+    def test_process_name_url_encoded_as_one_segment(self):
+        name = "PROC/WITH/SLASHES"
+        opener, calls = self._fake_opener(
+            self._inventory([name]),
+            {f"{self.BASE}/services/v2/mpoints/PROC%2FWITH%2FSLASHES/processPerformance": {"response": {}},
+             f"{self.BASE}/services/v2/mpoints/PROC%2FWITH%2FSLASHES/serviceHealth": {"response": {}}})
+        core.collect_pms(self.BASE, opener)
+        detail_calls = [c for c in calls if c != f"{self.BASE}{core.PMS_INVENTORY_PATH}"]
+        for c in detail_calls:
+            segments = c[len(self.BASE):].split("/")
+            self.assertEqual(len(segments), 6)  # '', services, v2, mpoints, <encoded>, <kind>
+
+    def test_no_heartbeat_endpoint_requested(self):
+        opener, calls = self._fake_opener(
+            self._inventory(["P1"]),
+            {f"{self.BASE}/services/v2/mpoints/P1/processPerformance": {"response": {}},
+             f"{self.BASE}/services/v2/mpoints/P1/serviceHealth": {"response": {}}})
+        core.collect_pms(self.BASE, opener)
+        self.assertFalse(any("heartbeat" in c.lower() for c in calls))
+
+    def test_no_thread_performance_endpoint_requested(self):
+        opener, calls = self._fake_opener(
+            self._inventory(["P1"]),
+            {f"{self.BASE}/services/v2/mpoints/P1/processPerformance": {"response": {}},
+             f"{self.BASE}/services/v2/mpoints/P1/serviceHealth": {"response": {}}})
+        core.collect_pms(self.BASE, opener)
+        self.assertFalse(any("threadPerformance" in c for c in calls))
+
+    def test_no_redundant_process_detail_endpoint_requested(self):
+        opener, calls = self._fake_opener(
+            self._inventory(["P1"]),
+            {f"{self.BASE}/services/v2/mpoints/P1/processPerformance": {"response": {}},
+             f"{self.BASE}/services/v2/mpoints/P1/serviceHealth": {"response": {}}})
+        core.collect_pms(self.BASE, opener)
+        self.assertFalse(any(c.endswith("/P1/process") for c in calls))
+
+    def test_no_status_changes_or_metrics_endpoint_requested(self):
+        opener, calls = self._fake_opener(
+            self._inventory(["P1"]),
+            {f"{self.BASE}/services/v2/mpoints/P1/processPerformance": {"response": {}},
+             f"{self.BASE}/services/v2/mpoints/P1/serviceHealth": {"response": {}}})
+        core.collect_pms(self.BASE, opener)
+        self.assertFalse(any("statusChanges" in c or "v2/metrics" in c for c in calls))
+
+    def test_no_direct_port_9015_used(self):
+        # collect_pms only ever receives/uses the caller's base -- it never
+        # constructs an alternate metricsPort/9015 URL of its own.
+        with open(core.__file__) as f:
+            src = f.read()
+        collect_pms_src = src[src.index("def collect_pms"):]
+        collect_pms_src = collect_pms_src[:collect_pms_src.index("\n\n\n")]
+        self.assertNotIn("9015", collect_pms_src)
+        self.assertNotIn("metricsPort", collect_pms_src)
+
+    def test_get_only_no_data_argument(self):
+        with open(core.__file__) as f:
+            src = f.read()
+        self.assertNotIn("data=", src[src.index("_http_json_bounded"):src.index("def normalize_pms_inventory_item")])
+
+    def test_malformed_inventory_records_skipped(self):
+        inventory = {"response": {"processes": [
+            None, "garbage", 42, [1, 2], {"noProcessName": True}, {"processName": ""},
+            {"processName": "OK1"},
+        ]}}
+        opener, calls = self._fake_opener(
+            inventory, {f"{self.BASE}/services/v2/mpoints/OK1/processPerformance": {"response": {}},
+                       f"{self.BASE}/services/v2/mpoints/OK1/serviceHealth": {"response": {}}})
+        result = core.collect_pms(self.BASE, opener)
+        self.assertEqual(result["inventoryCount"], 7)
+        self.assertEqual(result["followedCount"], 1)
+        self.assertEqual(result["successCount"], 1)
+
+    def test_partial_per_process_failure_continues_remaining(self):
+        inventory = self._inventory(["P1", "P2"])
+        detail = {f"{self.BASE}/services/v2/mpoints/P1/processPerformance": {"response": {}},
+                 f"{self.BASE}/services/v2/mpoints/P1/serviceHealth": {"response": {}},
+                 f"{self.BASE}/services/v2/mpoints/P2/serviceHealth": {"response": {}}}
+        exceptions = {f"{self.BASE}/services/v2/mpoints/P2/processPerformance": RuntimeError("boom")}
+        opener, calls = self._fake_opener(inventory, detail, detail_exceptions=exceptions)
+        result = core.collect_pms(self.BASE, opener)
+        self.assertEqual(result["status"], "PARTIAL")
+        self.assertEqual(result["successCount"], 1)
+        self.assertEqual(result["failureCount"], 1)
+        # P2's serviceHealth was still attempted despite processPerformance failing
+        self.assertIn(f"{self.BASE}/services/v2/mpoints/P2/serviceHealth", calls)
+
+    def test_complete_pms_failure_all_details_fail(self):
+        inventory = self._inventory(["P1", "P2"])
+        exceptions = {
+            f"{self.BASE}/services/v2/mpoints/P1/processPerformance": RuntimeError("boom"),
+            f"{self.BASE}/services/v2/mpoints/P1/serviceHealth": RuntimeError("boom"),
+            f"{self.BASE}/services/v2/mpoints/P2/processPerformance": RuntimeError("boom"),
+            f"{self.BASE}/services/v2/mpoints/P2/serviceHealth": RuntimeError("boom"),
+        }
+        opener, calls = self._fake_opener(inventory, {}, detail_exceptions=exceptions)
+        result = core.collect_pms(self.BASE, opener)
+        self.assertEqual(result["status"], "UNAVAILABLE")
+        self.assertEqual(result["successCount"], 0)
+        self.assertEqual(result["failureCount"], 2)
+
+    def test_inventory_failure_yields_unavailable_status(self):
+        opener = MagicMock()
+        opener.open.side_effect = RuntimeError("connection refused")
+        result = core.collect_pms(self.BASE, opener)
+        self.assertIn(result["status"], core.PMS_ERROR_CATEGORIES)
+        self.assertEqual(result["followedCount"], 0)
+        self.assertEqual(result["inventoryCount"], 0)
+
+    def test_collect_pms_never_raises_on_total_failure(self):
+        opener = MagicMock()
+        opener.open.side_effect = RuntimeError("boom")
+        try:
+            result = core.collect_pms(self.BASE, opener)
+        except Exception as e:  # pragma: no cover -- must never happen
+            self.fail(f"collect_pms raised unexpectedly: {e!r}")
+        self.assertIsInstance(result, dict)
+
+    def test_empty_inventory_is_a_valid_ok_result(self):
+        opener, calls = self._fake_opener(self._inventory([]))
+        result = core.collect_pms(self.BASE, opener)
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(result["followedCount"], 0)
+
+    def test_collection_timestamp_reflects_current_tick(self):
+        opener, calls = self._fake_opener(self._inventory([]))
+        before = core.cfgmod.now_epoch()
+        result = core.collect_pms(self.BASE, opener)
+        after = core.cfgmod.now_epoch()
+        self.assertGreaterEqual(result["collectedAt"], before)
+        self.assertLessEqual(result["collectedAt"], after)
+
+    def test_no_raw_values_or_process_names_in_output_on_failure(self):
+        opener = MagicMock()
+        opener.open.side_effect = RuntimeError("SECRET_INTERNAL_DETAIL_xyz")
+        result = core.collect_pms(self.BASE, opener)
+        blob = json.dumps(result)
+        self.assertNotIn("SECRET_INTERNAL_DETAIL_xyz", blob)
+
+    def test_no_credential_or_hostname_leakage_in_output(self):
+        inventory = self._inventory(["P1"])
+        detail = {f"{self.BASE}/services/v2/mpoints/P1/processPerformance":
+                 {"response": {"cpuTimeUs": 1}},
+                 f"{self.BASE}/services/v2/mpoints/P1/serviceHealth": {"response": {"isHealthy": True}}}
+        opener, calls = self._fake_opener(inventory, detail)
+        result = core.collect_pms(self.BASE, opener)
+        blob = json.dumps(result)
+        self.assertNotIn("gg-test", blob)
+        self.assertNotIn("8443", blob)
+
+
+class PmsPollingLoopIntegrationTests(unittest.TestCase):
+    """Wires collect_pms into polling_loop's guarded STATE#_deployment
+    write: PMS enrichment must respect the exact same lease/fencing rules
+    as everything else -- standby never requests PMS, a fenced tick never
+    writes PMS state, and a PMS failure must never affect the deployment's
+    own UP/DOWN status."""
+
+    DEPLOYMENT = {
+        "name": "gg-oracle-payments-01",
+        "type": "oracle",
+        "adminHost": "gg-oracle-payments-01.goldengate-dev.svc.cluster.local",
+        "adminPort": 8443,
+        "tlsServerName": "gg-oracle-payments-01.goldengate-dev.adcbmis.local",
+        "pipeline": "payments-ora-to-pg-001",
+    }
+
+    def _run_tick(self, leader=True, fence_write=False, pms_side_effect=None):
+        stop_event = threading.Event()
+
+        def fake_get_item(Key):
+            if Key.get("recordType") == "CONFIG":
+                stop_event.set()
+                return {"Item": {"deploymentType": "oracle", "checkIntervalSeconds": 0,
+                                 "alertsEnabled": False, "metricsEnabled": False}}
+            return {"Item": {}}
+
+        table = MagicMock()
+        table.get_item.side_effect = fake_get_item
+        update_calls = []
+        table.update_item.side_effect = lambda **kw: update_calls.append(kw)
+
+        mgr = MagicMock()
+        mgr.renew.return_value = not fence_write
+
+        state = core.LeaseState()
+        state.set_leader(leader)
+
+        pms_calls = []
+
+        def fake_collect_pms(base, opener, **kw):
+            pms_calls.append(1)
+            if pms_side_effect is not None:
+                return pms_side_effect()
+            return {"status": "OK", "collectedAt": 123, "inventoryCount": 1, "followedCount": 1,
+                   "successCount": 1, "failureCount": 0, "heartbeatAgeSeconds": 5, "processes": {}}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            user_file = os.path.join(tmp, "user")
+            pwd_file = os.path.join(tmp, "pwd")
+            with open(user_file, "w") as f:
+                f.write("synthetic-user")
+            with open(pwd_file, "w") as f:
+                f.write("synthetic-pass")
+
+            with mock.patch.object(core.cfgmod, "credential_paths", return_value=(user_file, pwd_file)), \
+                 mock.patch.object(core, "fetch_gg_processes", return_value=[]), \
+                 mock.patch.object(core, "_basic_opener", return_value=MagicMock()), \
+                 mock.patch.object(core, "_build_ssl_context", return_value=MagicMock()), \
+                 mock.patch.object(core, "probe_critical_services", return_value={}), \
+                 mock.patch.object(core, "collect_pms", side_effect=fake_collect_pms):
+                core.polling_loop(self.DEPLOYMENT, table, mgr, state, stop_event)
+
+        return pms_calls, update_calls
+
+    def test_standby_performs_no_pms_requests(self):
+        pms_calls, update_calls = self._run_tick(leader=False)
+        self.assertEqual(pms_calls, [])
+
+    def test_fenced_collector_performs_no_pms_write(self):
+        pms_calls, update_calls = self._run_tick(leader=True, fence_write=True)
+        deployment_writes = [c for c in update_calls if c["Key"].get("recordType") == "STATE#_deployment"]
+        self.assertEqual(deployment_writes, [])
+
+    def test_pms_enrichment_in_guarded_deployment_write(self):
+        pms_calls, update_calls = self._run_tick(leader=True, fence_write=False)
+        self.assertEqual(len(pms_calls), 1)
+        deployment_writes = [c for c in update_calls if c["Key"].get("recordType") == "STATE#_deployment"]
+        self.assertEqual(len(deployment_writes), 1)
+        self.assertIn("pms=:pms", deployment_writes[0]["UpdateExpression"])
+
+    def test_no_new_dynamodb_recordtype_used(self):
+        pms_calls, update_calls = self._run_tick(leader=True, fence_write=False)
+        record_types = {c["Key"].get("recordType") for c in update_calls}
+        for rt in record_types:
+            self.assertTrue(rt == "STATE#_deployment" or str(rt).startswith("STATE#"))
+
+    def test_pms_failure_does_not_mark_deployment_down(self):
+        pms_calls, update_calls = self._run_tick(
+            leader=True, fence_write=False,
+            pms_side_effect=lambda: {"status": "UNAVAILABLE", "collectedAt": 1, "inventoryCount": 0,
+                                     "followedCount": 0, "successCount": 0, "failureCount": 0,
+                                     "heartbeatAgeSeconds": None, "processes": {}})
+        deployment_writes = [c for c in update_calls if c["Key"].get("recordType") == "STATE#_deployment"]
+        self.assertEqual(len(deployment_writes), 1)
+        self.assertEqual(deployment_writes[0]["ExpressionAttributeValues"][":st"], "UP")
+
+    def test_no_pms_service_process_state_rows_created(self):
+        pms_calls, update_calls = self._run_tick(leader=True, fence_write=False)
+        process_record_types = {c["Key"].get("recordType") for c in update_calls
+                                if c["Key"].get("recordType") != "STATE#_deployment"}
+        self.assertEqual(process_record_types, set())
+
+
 if __name__ == "__main__":
     unittest.main()

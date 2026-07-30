@@ -4,6 +4,22 @@ Owns LEASE acquisition/renewal and recordType=STATE#_deployment /
 STATE#<process> writes -- one lease per deployment, renewed on its own
 cadence independent of the poll interval. Never restarts, stops, or fences
 a GoldenGate process, and never calls a Kubernetes API.
+
+PMS collection (production, bounded): once per successful leader tick, the
+same authenticated/TLS-verified HTTPS adminPort 8443 opener used for the
+rest of Admin REST polling is reused to GET the confirmed process inventory
+(/services/v2/mpoints/processes) exactly once, then up to 20 unique,
+deduplicated processName values are followed with sequential, bounded
+processPerformance + serviceHealth GETs only. Heartbeat age is derived from
+inventory.lastHeartbeat -- the /heartbeat endpoint returned 404 in the
+validated live environment and is never called. /threadPerformance,
+/process, /services/v2/monitoring/statusChanges, /services/v2/metrics, and
+direct authenticated HTTP port 9015 are never used by this production path
+either. A PMS failure is recorded as its own bounded, sanitized status
+(collect_pms never raises) and never marks an otherwise-healthy Admin REST
+deployment DOWN. The result is folded into the existing guarded/fenced
+STATE#_deployment write only -- no new DynamoDB table, recordType, or
+per-PMS-process STATE# row is created.
 """
 from __future__ import annotations
 
@@ -11,13 +27,16 @@ import functools
 import http.client
 import json
 import logging
+import math
 import os
 import secrets as _secrets
 import socket
 import ssl
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 
 import boto3
 from botocore.exceptions import ClientError
@@ -378,6 +397,280 @@ def probe_critical_services(base, opener, critical):
     return out
 
 
+# ---------------------------------------------------------------------------
+# PMS collection (production, bounded) -- see module docstring for the full
+# request-model summary. Live-confirmed contract only: /heartbeat 404s in
+# the validated environment and is never called; /threadPerformance and
+# /process are intentionally not polled (redundant with inventory / high
+# cardinality, deferred).
+# ---------------------------------------------------------------------------
+
+PMS_INVENTORY_PATH = "/services/v2/mpoints/processes"
+PMS_DETAIL_KINDS = ("processPerformance", "serviceHealth")
+MAX_FOLLOWED_PMS_PROCESSES = 20
+
+# Mirrors (does not import -- collector.py must not depend on tools/) the
+# contract-probe tool's proven bound: an oversized PMS response is never
+# parsed, sized, or logged.
+PMS_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+
+PMS_ERROR_CATEGORIES = (
+    "OK", "PARTIAL", "UNAVAILABLE", "AUTH_FAILED", "TLS_FAILED",
+    "ENDPOINT_UNAVAILABLE", "INVALID_RESPONSE",
+)
+
+_PMS_CONTROL_CHARS = frozenset(chr(c) for c in list(range(0x00, 0x20)) + [0x7f])
+
+_PMS_INVENTORY_STRING_FIELDS = (
+    "processName", "processType", "processMode", "processState",
+    "startTime", "stateTime", "lastHeartbeat",
+)
+_PMS_INVENTORY_NUMERIC_FIELDS = ("processId", "portNumber", "firstMessage", "lastMessage")
+
+_PMS_PERFORMANCE_NUMERIC_FIELDS = (
+    "cpuTimeUs", "kernelTimeUs", "userTimeUs", "workingSetSize", "peakWorkingSetSize",
+    "privateBytes", "threadCount", "handleCount", "pageFaults",
+    "ioReadBytes", "ioReadCount", "ioWriteBytes", "ioWriteCount",
+    "ioOtherBytes", "ioOtherCount", "processStartTime", "processId",
+)
+
+
+def _http_json_bounded(url, opener, timeout=5, max_bytes=PMS_MAX_RESPONSE_BYTES):
+    """Like _http_json but the body is read to at most max_bytes+1 bytes --
+    an oversized response is never parsed. PMS-request-only; the existing
+    extract/replicat/distpath discovery path (_http_json) is unchanged."""
+    with opener.open(url, timeout=timeout) as resp:
+        raw = resp.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise ValueError("PMS response body exceeds the bounded limit")
+    return json.loads(raw.decode())
+
+
+def _normalize_pms_number(raw):
+    """A PMS number is never allowed to become an exception or a silently
+    wrong type: malformed, NaN, infinite, negative, or boolean input all
+    become 0 rather than propagating."""
+    if isinstance(raw, bool):
+        return 0
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0
+    if not math.isfinite(value) or value < 0:
+        return 0
+    return int(value) if value == int(value) else value
+
+
+def normalize_pms_inventory_item(raw):
+    """Bounded, pure: only the confirmed inventory fields, safe types only.
+    Unknown fields are ignored; missing fields are simply absent (never
+    invented)."""
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for key in _PMS_INVENTORY_STRING_FIELDS:
+        value = raw.get(key)
+        if isinstance(value, str):
+            out[key] = value
+    for key in _PMS_INVENTORY_NUMERIC_FIELDS:
+        if key in raw:
+            out[key] = _normalize_pms_number(raw[key])
+    return out
+
+
+def normalize_pms_performance(raw):
+    """Bounded, pure: only the confirmed numeric processPerformance fields.
+    cpuTimeUs/kernelTimeUs/userTimeUs are cumulative counters -- preserved
+    as-is here, never converted to a rate/percentage (that needs two
+    validated time samples and an approved manager contract, neither of
+    which exist yet)."""
+    if not isinstance(raw, dict):
+        return {}
+    return {key: _normalize_pms_number(raw[key])
+           for key in _PMS_PERFORMANCE_NUMERIC_FIELDS if key in raw}
+
+
+def normalize_pms_service_health(raw):
+    """Bounded, pure: {isHealthy, criticalResourcesHealthy,
+    criticalResourcesUnhealthy} with safe defaults. isHealthy fails closed
+    to False for anything that isn't literally a bool (never silently
+    accepts a truthy non-boolean as healthy)."""
+    if not isinstance(raw, dict):
+        return {"isHealthy": False, "criticalResourcesHealthy": 0, "criticalResourcesUnhealthy": 0}
+    is_healthy = raw.get("isHealthy")
+    return {
+        "isHealthy": is_healthy if isinstance(is_healthy, bool) else False,
+        "criticalResourcesHealthy": _normalize_pms_number(raw.get("criticalResourcesHealthy", 0)),
+        "criticalResourcesUnhealthy": _normalize_pms_number(raw.get("criticalResourcesUnhealthy", 0)),
+    }
+
+
+def heartbeat_age_seconds(last_heartbeat, now=None):
+    """Pure, timezone-aware. Returns a non-negative int age in seconds, or
+    None when last_heartbeat is missing/malformed -- never raises, never
+    logs the raw value. now is injectable (defaults to real current UTC
+    time) for deterministic tests. A naive (timezone-less) timestamp is
+    treated as unusable rather than assumed to be local or UTC. A future
+    timestamp clamps to age 0 rather than going negative."""
+    if not isinstance(last_heartbeat, str) or not last_heartbeat.strip():
+        return None
+    raw = last_heartbeat.strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    now = now if now is not None else datetime.now(timezone.utc)
+    age = (now - parsed).total_seconds()
+    return 0 if age < 0 else int(age)
+
+
+def _pms_valid_process_names(payload):
+    """Returns (names, inventory_item_count): unique processName strings
+    from response.processes, first-seen order preserved -- never
+    processId, never any other field. Non-dict items, items with no valid
+    (non-empty string) processName, and repeat names are skipped.
+    inventory_item_count is the TRUE raw response.processes list length."""
+    if not isinstance(payload, dict):
+        return [], 0
+    response = payload.get("response")
+    if not isinstance(response, dict):
+        return [], 0
+    processes = response.get("processes")
+    if not isinstance(processes, list):
+        return [], 0
+    names, seen = [], set()
+    for item in processes:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("processName")
+        if isinstance(name, str) and name and name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names, len(processes)
+
+
+def _pms_detail_path(name, kind):
+    """Encodes name as exactly one URL path segment. '.'/'..' -- the only
+    values urllib.parse.quote(safe="") leaves unescaped by design -- and
+    control characters are rejected outright (returns None) rather than
+    ever being sent."""
+    if name in (".", ".."):
+        return None
+    if any(c in _PMS_CONTROL_CHARS for c in name):
+        return None
+    encoded = urllib.parse.quote(name, safe="")
+    return f"/services/v2/mpoints/{encoded}/{kind}"
+
+
+def _classify_pms_error(exc):
+    """Bounded, closed classification for a PMS request failure. Never
+    inspects or returns the raw exception text."""
+    if isinstance(exc, urllib.error.HTTPError):
+        if exc.code in (401, 403):
+            return "AUTH_FAILED"
+        return "ENDPOINT_UNAVAILABLE"
+    if isinstance(exc, ssl.SSLError):
+        return "TLS_FAILED"
+    if isinstance(exc, ValueError):
+        return "INVALID_RESPONSE"
+    return "ENDPOINT_UNAVAILABLE"
+
+
+def collect_pms(base, opener, now=None):
+    """One bounded PMS collection pass for this tick. Reuses the caller's
+    already-authenticated, TLS-verified opener. GETs the confirmed process
+    inventory once; follows up to MAX_FOLLOWED_PMS_PROCESSES unique,
+    deduplicated processName values with sequential, bounded
+    processPerformance + serviceHealth GETs only. Never raises -- always
+    returns a bounded, sanitized summary dict; the caller decides whether
+    to persist it. Never logs a raw exception, response body, or process
+    name anywhere in this function.
+
+    An inventory failure yields a whole-tick UNAVAILABLE/classified status
+    with no followed processes. An individual process's detail failure
+    only affects that process (counted in failureCount) -- the remaining
+    processes are still attempted, and the overall status becomes PARTIAL
+    rather than aborting."""
+    collected_at = cfgmod.now_epoch()
+
+    try:
+        inventory_payload = _http_json_bounded(f"{base}{PMS_INVENTORY_PATH}", opener)
+    except Exception as e:
+        return {
+            "status": _classify_pms_error(e), "collectedAt": collected_at,
+            "inventoryCount": 0, "followedCount": 0, "successCount": 0, "failureCount": 0,
+            "heartbeatAgeSeconds": None, "processes": {},
+        }
+
+    names, inventory_count = _pms_valid_process_names(inventory_payload)
+    inventory_by_name = {}
+    response = inventory_payload.get("response") if isinstance(inventory_payload, dict) else None
+    if isinstance(response, dict) and isinstance(response.get("processes"), list):
+        for item in response["processes"]:
+            if isinstance(item, dict) and isinstance(item.get("processName"), str):
+                inventory_by_name.setdefault(item["processName"], item)
+
+    followed = names[:MAX_FOLLOWED_PMS_PROCESSES]
+    processes_out = {}
+    success_count = 0
+    failure_count = 0
+    ages = []
+
+    for name in followed:
+        inv_norm = normalize_pms_inventory_item(inventory_by_name.get(name, {}))
+        age = heartbeat_age_seconds(inv_norm.get("lastHeartbeat"), now=now)
+        if age is not None:
+            ages.append(age)
+
+        perf, health, process_ok = {}, {}, True
+        for kind in PMS_DETAIL_KINDS:
+            path = _pms_detail_path(name, kind)
+            if path is None:
+                process_ok = False
+                continue
+            try:
+                detail_payload = _http_json_bounded(f"{base}{path}", opener)
+            except Exception:
+                process_ok = False
+                continue
+            detail_response = detail_payload.get("response") if isinstance(detail_payload, dict) else None
+            if kind == "processPerformance":
+                perf = normalize_pms_performance(detail_response)
+            else:
+                health = normalize_pms_service_health(detail_response)
+
+        if process_ok:
+            success_count += 1
+        else:
+            failure_count += 1
+        processes_out[name] = {"performance": perf, "serviceHealth": health, "heartbeatAgeSeconds": age}
+        # detail_payload/inv_norm fall out of scope here -- never retained.
+
+    followed_count = len(followed)
+    if followed_count == 0:
+        # Inventory GET succeeded; there is simply nothing (valid) to
+        # follow this tick -- a valid, non-error result, not UNAVAILABLE.
+        status = "OK"
+    elif success_count == 0:
+        status = "UNAVAILABLE"  # every followed process failed both details
+    elif failure_count > 0:
+        status = "PARTIAL"
+    else:
+        status = "OK"
+
+    return {
+        "status": status, "collectedAt": collected_at,
+        "inventoryCount": inventory_count, "followedCount": followed_count,
+        "successCount": success_count, "failureCount": failure_count,
+        "heartbeatAgeSeconds": max(ages) if ages else None,
+        "processes": processes_out,
+    }
+
+
 _LAG_METRIC_BY_PROCESS_TYPE = {"extract": "ExtractLagSeconds", "replicat": "ReplicatLagSeconds"}
 
 
@@ -474,6 +767,9 @@ def write_process_state(table, mgr, pipeline, deployment_type, process, snapshot
     if "criticalServices" in snapshot:
         sets.append("criticalServices=:cs")
         vals[":cs"] = _ddb_safe(snapshot.get("criticalServices") or {})
+    if "pms" in snapshot:
+        sets.append("pms=:pms")
+        vals[":pms"] = _ddb_safe(snapshot.get("pms") or {})
     if counters is not None:
         for key in ("consecutiveAbends", "lastAbendAt", "nextRecheckAt"):
             sets.append(f"{key}=:{key}")
@@ -670,9 +966,23 @@ def polling_loop(deployment, table, mgr, state, stop_event):
                 svc_up = {}
                 cs_new = {}
 
+            # PMS is additional observability only: collect_pms never raises
+            # and its result never influences the deployment's own UP status
+            # above -- a PMS failure must not mark an otherwise-healthy
+            # Admin REST deployment DOWN. Belt-and-suspenders try/except in
+            # case of an unexpected bug in this still-new code path.
+            try:
+                pms_result = collect_pms(base, opener)
+            except Exception:
+                logger.exception("PMS collection failed unexpectedly for %s; continuing without PMS enrichment",
+                                 pipeline)
+                pms_result = None
+
             transitioned = ("UP" != last_dep_status)
             dep_snap = {"processType": "deployment", "status": "UP",
                         "recordedAt": cfgmod.now_epoch(), "criticalServices": cs_new}
+            if pms_result is not None:
+                dep_snap["pms"] = pms_result
             if transitioned:
                 dep_snap["lastTransitionAt"] = cfgmod.now_epoch()
             _guarded_write("_deployment", dep_snap)
