@@ -1,0 +1,114 @@
+Then validate:
+
+kubectl rollout status deployment/gg-monitor \
+  -n goldengate-monitoring \
+  --timeout=5m
+
+Confirm the new image:
+
+kubectl get deployment gg-monitor \
+  -n goldengate-monitoring \
+  -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+
+Confirm CloudWatch remains disabled:
+
+kubectl get deployment gg-monitor \
+  -n goldengate-monitoring \
+  -o jsonpath='{range .spec.template.spec.containers[0].env[?(@.name=="CLOUDWATCH_PUBLISH_ENABLED")]}{.name}={.value}{"\n"}{end}'
+
+Expected:
+
+CLOUDWATCH_PUBLISH_ENABLED=false
+Live PMS detail capture
+
+Run all five detail probes against both runtimes using this loop:
+
+for deployment in \
+  gg-oracle-payments-01 \
+  gg-postgresql-payments-01
+do
+  for detail in \
+    process \
+    processPerformance \
+    threadPerformance \
+    serviceHealth \
+    heartbeat
+  do
+    echo
+    echo "===== deployment=${deployment} detail=${detail} ====="
+
+    kubectl exec \
+      -n goldengate-monitoring \
+      deployment/gg-monitor \
+      -- python3 tools/gg_api_contract_probe.py \
+         --deployment "${deployment}" \
+         --port admin \
+         --follow-processes \
+         --detail "${detail}"
+  done
+done
+
+Each result should resemble:
+
+{
+  "deploymentName": "gg-oracle-payments-01",
+  "deploymentType": "oracle",
+  "portType": "admin",
+  "sourcePath": "/services/v2/mpoints/processes",
+  "detail": "processPerformance",
+  "inventoryItemCount": 4,
+  "attemptedCount": 4,
+  "successCount": 4,
+  "failureCount": 0,
+  "httpStatusCounts": {
+    "200": 4
+  },
+  "errorCategoryCounts": {},
+  "schema": {
+    "topLevelKeys": [],
+    "collections": {},
+    "fieldNames": [],
+    "fieldTypes": {},
+    "truncated": false
+  }
+}
+
+Some detail endpoints may not apply to every GoldenGate service process. Therefore, results such as these are still useful:
+
+successCount: 2
+failureCount: 2
+
+errorCategoryCounts:
+NOT_FOUND: 2
+
+The probe should continue after individual failures.
+
+Confirm normal monitoring remains healthy
+kubectl logs \
+  -n goldengate-monitoring \
+  deployment/gg-monitor \
+  --since=10m |
+grep process_discovery_summary
+
+And:
+
+kubectl exec \
+  -n goldengate-monitoring \
+  deployment/gg-monitor \
+  -- python3 - <<'PY'
+import urllib.request
+
+for path in ("/healthz", "/readyz"):
+    with urllib.request.urlopen(
+        f"http://127.0.0.1:8080{path}",
+        timeout=5,
+    ) as response:
+        print(path, response.status, response.read().decode())
+PY
+
+Keep unchanged:
+
+CLOUDWATCH_PUBLISH_ENABLED=false
+legacyFallback=true
+legacy observer running
+old combined application retained
