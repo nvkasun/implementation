@@ -912,15 +912,29 @@ BASE_IMAGE_STEP="$(awk '
   capture { print }
   capture && /- name: Prepare monitor image variables/ { exit }
 ' "$MONITOR_WORKFLOW")"
-# The value is only ever interpolated on the two SUCCESS-path lines (the
-# GITHUB_ENV write and the confirmation echo) -- never on any of the three
-# failure branches above them. Proven functionally (with a marker value)
-# by MonitorBaseImageValidationTests.test_failure_never_prints_the_raw_malformed_value.
+# The value is only ever interpolated on ONE line -- the GITHUB_ENV write
+# that hands it to later steps. The success confirmation is a generic
+# message (no value at all), and none of the three failure branches above
+# interpolate it either. Proven functionally (with a marker value) by
+# MonitorBaseImageValidationTests.test_failure_never_prints_the_raw_malformed_value
+# and .test_success_path_never_prints_the_full_raw_value_either.
 BASE_IMAGE_INTERPOLATIONS="$(grep -c '\${MONITOR_BASE_IMAGE}' <<< "$BASE_IMAGE_STEP" || true)"
-if [ "${BASE_IMAGE_INTERPOLATIONS:-0}" -eq 2 ]; then
-  pass "goldengate-monitor.yaml's base-image failure messages never interpolate the raw supplied value"
+if [ "${BASE_IMAGE_INTERPOLATIONS:-0}" -eq 1 ]; then
+  pass "goldengate-monitor.yaml's base-image validation never prints the raw supplied value (only the GITHUB_ENV handoff interpolates it)"
 else
-  fail "goldengate-monitor.yaml's base-image validation interpolates \${MONITOR_BASE_IMAGE} ${BASE_IMAGE_INTERPOLATIONS:-0} times -- expected exactly 2 (success-path only)"
+  fail "goldengate-monitor.yaml's base-image validation interpolates \${MONITOR_BASE_IMAGE} ${BASE_IMAGE_INTERPOLATIONS:-0} times -- expected exactly 1 (GITHUB_ENV handoff only)"
+fi
+
+if grep -q "MONITOR_BASE_IMAGE_INPUT: \${{ vars.MONITOR_BASE_IMAGE }}" "$MONITOR_WORKFLOW" 2>/dev/null; then
+  pass "goldengate-monitor.yaml passes the GitHub expression through step-level env (MONITOR_BASE_IMAGE_INPUT), never direct shell interpolation"
+else
+  fail "goldengate-monitor.yaml no longer passes vars.MONITOR_BASE_IMAGE through step-level env"
+fi
+
+if grep -qF -- '\${{ vars.MONITOR_BASE_IMAGE }}"' <<< "$BASE_IMAGE_STEP"; then
+  fail "goldengate-monitor.yaml's base-image validation run script still directly interpolates \${{ vars.MONITOR_BASE_IMAGE }}"
+else
+  pass "goldengate-monitor.yaml's base-image validation run script contains no direct \${{ vars.MONITOR_BASE_IMAGE }} interpolation"
 fi
 
 if grep -Fq -- '--build-arg "BASE_IMAGE=${MONITOR_BASE_IMAGE}"' "$MONITOR_WORKFLOW" 2>/dev/null; then
@@ -940,6 +954,47 @@ if [ "${TERMINATING_EXCLUSION_COUNT:-0}" -eq 2 ]; then
   pass "both Ready-pod jq filters (preflight and post-deployment verification) exclude terminating pods"
 else
   fail "expected exactly 2 Ready-pod jq filters excluding terminating pods, found ${TERMINATING_EXCLUSION_COUNT:-0}"
+fi
+
+# ---------------------------------------------------------------------
+# 22. Phase 4D2 workflow-security and manager critical-service correction:
+#     no direct GitHub-expression interpolation inside a run script, a
+#     fully-anchored ECR repository+digest grammar (not prefix+suffix
+#     only), and manager-compatible adminsrvr/distsrvr/recvsrvr coverage
+#     for every deployment.
+# ---------------------------------------------------------------------
+echo ""
+echo "--- Phase 4D2 correction: safe env passthrough, full ECR grammar, manager critical-service coverage ---"
+
+if grep -qF -- 'MONITOR_BASE_IMAGE="${{ vars.MONITOR_BASE_IMAGE }}"' "$MONITOR_WORKFLOW" 2>/dev/null; then
+  fail "goldengate-monitor.yaml still assigns \${{ vars.MONITOR_BASE_IMAGE }} directly inside a run script"
+else
+  pass "goldengate-monitor.yaml no longer assigns \${{ vars.MONITOR_BASE_IMAGE }} directly inside a run script"
+fi
+
+if grep -qE "MONITOR_BASE_IMAGE_PATTERN='\^\[a-z0-9\]\+" "$MONITOR_WORKFLOW" 2>/dev/null \
+    && grep -q 'MONITOR_BASE_IMAGE_REMAINDER' "$MONITOR_WORKFLOW" 2>/dev/null; then
+  pass "goldengate-monitor.yaml validates the full post-prefix remainder against an anchored repository+digest grammar (not prefix+suffix only)"
+else
+  fail "goldengate-monitor.yaml no longer validates the full ECR repository+digest grammar"
+fi
+
+if grep -q 'RECOGNIZED_CRITICAL_SERVICES = ("adminsrvr", "distsrvr", "recvsrvr")' "${MONITOR_APP_DIR}/health_rules.py" 2>/dev/null; then
+  pass "health_rules.py defines the manager-compatible three-service recognized set (adminsrvr/distsrvr/recvsrvr)"
+else
+  fail "health_rules.py is missing the manager-compatible three-service recognized set"
+fi
+
+if grep -q "CRITICAL_SERVICES_BY_TYPE" "${MONITOR_APP_DIR}/health_rules.py" "${MONITOR_APP_DIR}/collector.py" 2>/dev/null; then
+  fail "a per-type critical-service dict (CRITICAL_SERVICES_BY_TYPE) still exists -- Oracle/PostgreSQL must both default to the full three-service set"
+else
+  pass "no per-type critical-service dict remains -- every deployment defaults to the full three-service set"
+fi
+
+if grep -q "def resolve_critical_services" "${MONITOR_APP_DIR}/health_rules.py" 2>/dev/null; then
+  pass "health_rules.py defines a bounded, fail-safe resolve_critical_services helper for the optional CONFIG override"
+else
+  fail "health_rules.py is missing resolve_critical_services"
 fi
 
 echo ""

@@ -34,12 +34,31 @@ DEFAULTS = {
 
 _RULE_KEYS = tuple(DEFAULTS["defaults"].keys())
 
-# Probed per deployment type purely for observational
-# CriticalServiceDown metrics/state -- never gates any healing action.
-CRITICAL_SERVICES_BY_TYPE = {
-    "oracle": ["adminsrvr", "distsrvr"],
-    "postgresql": ["adminsrvr", "recvsrvr"],
-}
+# Manager-compatible functional contract (confirmed against the manager
+# reference for its default critical-service set only -- reimplemented
+# independently here, never copied): every deployment, regardless of type,
+# defaults to this fixed three-service set. Probed purely for observational
+# CriticalServiceDown metrics/state -- never gates any healing, restart, or
+# Kubernetes action.
+RECOGNIZED_CRITICAL_SERVICES = ("adminsrvr", "distsrvr", "recvsrvr")
+
+
+def resolve_critical_services(raw):
+    """Bounded, fail-safe resolution of an optional CONFIG.criticalServices
+    override. The override may only narrow the recognized set (deduplicated,
+    order-preserved) -- it can never introduce a name outside
+    RECOGNIZED_CRITICAL_SERVICES, so an unknown/malformed entry can never
+    become an arbitrary CloudWatch Service dimension. Any non-list value, an
+    empty list, or a list that resolves to no recognized names all fail
+    safely to the full three-service default."""
+    if isinstance(raw, list):
+        resolved = []
+        for item in raw:
+            if isinstance(item, str) and item in RECOGNIZED_CRITICAL_SERVICES and item not in resolved:
+                resolved.append(item)
+        if resolved:
+            return resolved
+    return list(RECOGNIZED_CRITICAL_SERVICES)
 
 
 def _to_int(val, fallback):
@@ -84,6 +103,7 @@ def resolve_config(raw):
         "defaults": dict(DEFAULTS["defaults"]),
         "quietHours": raw.get("quietHours") if isinstance(raw.get("quietHours"), dict) else {},
         "overrides": raw.get("overrides") if isinstance(raw.get("overrides"), dict) else {},
+        "criticalServices": resolve_critical_services(raw.get("criticalServices")),
     }
     incoming = raw.get("defaults") if isinstance(raw.get("defaults"), dict) else {}
     _coerce_rule_keys(cfg["defaults"], incoming)

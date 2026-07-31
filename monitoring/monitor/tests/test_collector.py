@@ -995,6 +995,211 @@ class MetricPublicationIntegrationTests(unittest.TestCase):
             self.assertNotIn(forbidden, failure_message)
 
 
+class CriticalServiceResolutionTests(unittest.TestCase):
+    """health_rules.resolve_critical_services: manager-compatible default
+    (adminsrvr/distsrvr/recvsrvr for every deployment, regardless of type)
+    with a bounded, fail-safe CONFIG.criticalServices override. Purely a
+    pure-function unit-test layer -- see CriticalServiceCoverageTests below
+    for the end-to-end polling_loop/build_metric_batch/STATE#_deployment
+    proof."""
+
+    def test_recognized_set_is_exactly_the_manager_default(self):
+        self.assertEqual(gh.RECOGNIZED_CRITICAL_SERVICES, ("adminsrvr", "distsrvr", "recvsrvr"))
+
+    def test_missing_override_defaults_to_all_three(self):
+        self.assertEqual(gh.resolve_critical_services(None), ["adminsrvr", "distsrvr", "recvsrvr"])
+
+    def test_valid_subset_override_is_honored(self):
+        self.assertEqual(gh.resolve_critical_services(["adminsrvr"]), ["adminsrvr"])
+
+    def test_full_override_in_different_order_is_honored_and_order_preserved(self):
+        self.assertEqual(
+            gh.resolve_critical_services(["recvsrvr", "adminsrvr"]), ["recvsrvr", "adminsrvr"])
+
+    def test_duplicate_entries_are_deduplicated_preserving_first_occurrence_order(self):
+        self.assertEqual(
+            gh.resolve_critical_services(["adminsrvr", "distsrvr", "adminsrvr"]),
+            ["adminsrvr", "distsrvr"])
+
+    def test_unknown_service_name_is_dropped_not_passed_through(self):
+        self.assertEqual(gh.resolve_critical_services(["adminsrvr", "not-a-real-service"]), ["adminsrvr"])
+
+    def test_all_unknown_names_fall_back_to_full_default(self):
+        self.assertEqual(
+            gh.resolve_critical_services(["not-a-real-service", "also-fake"]),
+            ["adminsrvr", "distsrvr", "recvsrvr"])
+
+    def test_empty_list_falls_back_to_full_default(self):
+        self.assertEqual(gh.resolve_critical_services([]), ["adminsrvr", "distsrvr", "recvsrvr"])
+
+    def test_non_list_values_fall_back_to_full_default(self):
+        for bad_value in ("adminsrvr", {"adminsrvr": True}, 123, True, object()):
+            with self.subTest(bad_value=bad_value):
+                self.assertEqual(gh.resolve_critical_services(bad_value), ["adminsrvr", "distsrvr", "recvsrvr"])
+
+    def test_resolve_config_populates_critical_services_with_default(self):
+        cfg = gh.resolve_config({})
+        self.assertEqual(cfg["criticalServices"], ["adminsrvr", "distsrvr", "recvsrvr"])
+
+    def test_resolve_config_honors_a_valid_critical_services_override(self):
+        cfg = gh.resolve_config({"criticalServices": ["distsrvr"]})
+        self.assertEqual(cfg["criticalServices"], ["distsrvr"])
+
+    def test_resolve_config_falls_back_safely_for_malformed_critical_services(self):
+        cfg = gh.resolve_config({"criticalServices": "adminsrvr"})
+        self.assertEqual(cfg["criticalServices"], ["adminsrvr", "distsrvr", "recvsrvr"])
+
+
+class CriticalServiceCoverageTests(unittest.TestCase):
+    """Phase 4D2 correction: manager-compatible critical-service coverage.
+    Every deployment -- Oracle and PostgreSQL alike -- defaults to probing
+    the full adminsrvr/distsrvr/recvsrvr set (the manager's own default
+    critical-service list, confirmed read-only against the manager
+    reference and reimplemented independently here, never copied), with an
+    optional bounded CONFIG.criticalServices override. Proven end-to-end
+    through polling_loop: probe_critical_services call, the published
+    CriticalServiceDown metrics, and the persisted STATE#_deployment write."""
+
+    _UNSET = object()
+
+    def _run_tick(self, deployment_type, critical_services_config=_UNSET, cloudwatch_enabled=True):
+        deployment = {
+            "name": f"gg-{deployment_type}-payments-01",
+            "type": deployment_type,
+            "adminHost": f"gg-{deployment_type}-payments-01.goldengate-dev.svc.cluster.local",
+            "adminPort": 8443,
+            "tlsServerName": f"gg-{deployment_type}-payments-01.goldengate-dev.adcbmis.local",
+            "pipeline": "payments-ora-to-pg-001",
+        }
+        stop_event = threading.Event()
+
+        config_item = {"deploymentType": deployment_type, "checkIntervalSeconds": 0,
+                       "alertsEnabled": False, "metricsEnabled": True}
+        if critical_services_config is not self._UNSET:
+            config_item["criticalServices"] = critical_services_config
+
+        def fake_get_item(Key):
+            if Key.get("recordType") == "CONFIG":
+                stop_event.set()
+                return {"Item": config_item}
+            return {"Item": {}}
+
+        table = MagicMock()
+        table.get_item.side_effect = fake_get_item
+
+        mgr = MagicMock()
+        mgr.renew.return_value = True
+
+        state = core.LeaseState()
+        state.set_leader(True)
+
+        publish_calls = []
+        probe_calls = []
+
+        def fake_probe(base, opener, critical):
+            probe_calls.append(list(critical))
+            return {svc: True for svc in critical}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            user_file = os.path.join(tmp, "user")
+            pwd_file = os.path.join(tmp, "pwd")
+            with open(user_file, "w") as f:
+                f.write("synthetic-user")
+            with open(pwd_file, "w") as f:
+                f.write("synthetic-pass")
+
+            core.CLOUDWATCH_PUBLISH_ENABLED = cloudwatch_enabled
+            try:
+                with mock.patch.object(core.cfgmod, "credential_paths", return_value=(user_file, pwd_file)), \
+                     mock.patch.object(core, "fetch_gg_processes", return_value=[]), \
+                     mock.patch.object(core, "_basic_opener", return_value=MagicMock()), \
+                     mock.patch.object(core, "_build_ssl_context", return_value=MagicMock()), \
+                     mock.patch.object(core, "probe_critical_services", side_effect=fake_probe), \
+                     mock.patch.object(core, "_cloudwatch_client", return_value=MagicMock()), \
+                     mock.patch.object(core, "publish_metric_batch",
+                                       side_effect=lambda cw, md, pipeline=None: publish_calls.append(md)):
+                    core.polling_loop(deployment, table, mgr, state, stop_event)
+            finally:
+                core.CLOUDWATCH_PUBLISH_ENABLED = False
+
+        return publish_calls, probe_calls, table
+
+    def _deployment_write_critical_services(self, table):
+        writes = [c for c in table.update_item.call_args_list
+                 if c.kwargs["Key"].get("recordType") == "STATE#_deployment"]
+        self.assertEqual(len(writes), 1)
+        return writes[0].kwargs["ExpressionAttributeValues"][":cs"]
+
+    def test_oracle_default_service_set_is_exactly_three(self):
+        _publish_calls, probe_calls, _table = self._run_tick("oracle")
+        self.assertEqual(probe_calls, [["adminsrvr", "distsrvr", "recvsrvr"]])
+
+    def test_postgresql_default_service_set_is_exactly_three(self):
+        _publish_calls, probe_calls, _table = self._run_tick("postgresql")
+        self.assertEqual(probe_calls, [["adminsrvr", "distsrvr", "recvsrvr"]])
+
+    def test_oracle_three_critical_service_down_metrics_produced(self):
+        publish_calls, _probe_calls, _table = self._run_tick("oracle")
+        names = [m["Dimensions"][-1]["Value"] for m in publish_calls[0] if m["MetricName"] == "CriticalServiceDown"]
+        self.assertEqual(sorted(names), ["adminsrvr", "distsrvr", "recvsrvr"])
+
+    def test_postgresql_three_critical_service_down_metrics_produced(self):
+        publish_calls, _probe_calls, _table = self._run_tick("postgresql")
+        names = [m["Dimensions"][-1]["Value"] for m in publish_calls[0] if m["MetricName"] == "CriticalServiceDown"]
+        self.assertEqual(sorted(names), ["adminsrvr", "distsrvr", "recvsrvr"])
+
+    def test_oracle_state_deployment_contains_all_three_service_entries(self):
+        _publish_calls, _probe_calls, table = self._run_tick("oracle")
+        cs = self._deployment_write_critical_services(table)
+        self.assertEqual(set(cs.keys()), {"adminsrvr", "distsrvr", "recvsrvr"})
+
+    def test_postgresql_state_deployment_contains_all_three_service_entries(self):
+        _publish_calls, _probe_calls, table = self._run_tick("postgresql")
+        cs = self._deployment_write_critical_services(table)
+        self.assertEqual(set(cs.keys()), {"adminsrvr", "distsrvr", "recvsrvr"})
+
+    def test_reachable_booleans_remain_literal_fail_closed(self):
+        _publish_calls, _probe_calls, table = self._run_tick("oracle")
+        cs = self._deployment_write_critical_services(table)
+        for entry in cs.values():
+            self.assertIs(entry["reachable"], True)
+
+    def test_valid_config_subset_override_is_honored(self):
+        _publish_calls, probe_calls, _table = self._run_tick("oracle", critical_services_config=["adminsrvr"])
+        self.assertEqual(probe_calls, [["adminsrvr"]])
+
+    def test_duplicate_override_names_are_deduplicated(self):
+        _publish_calls, probe_calls, _table = self._run_tick(
+            "oracle", critical_services_config=["adminsrvr", "distsrvr", "adminsrvr"])
+        self.assertEqual(probe_calls, [["adminsrvr", "distsrvr"]])
+
+    def test_unknown_service_name_in_override_is_dropped_never_probed(self):
+        _publish_calls, probe_calls, _table = self._run_tick(
+            "oracle", critical_services_config=["adminsrvr", "not-a-real-service"])
+        self.assertEqual(probe_calls, [["adminsrvr"]])
+
+    def test_malformed_override_falls_back_to_full_default(self):
+        for bad_override in ("adminsrvr", {"adminsrvr": True}, 123, None, []):
+            with self.subTest(bad_override=bad_override):
+                _publish_calls, probe_calls, _table = self._run_tick(
+                    "oracle", critical_services_config=bad_override)
+                self.assertEqual(probe_calls, [["adminsrvr", "distsrvr", "recvsrvr"]])
+
+    def test_unknown_override_never_creates_arbitrary_service_metric_dimension(self):
+        publish_calls, probe_calls, _table = self._run_tick(
+            "oracle", critical_services_config=["adminsrvr", "not-a-real-service"])
+        self.assertEqual(probe_calls, [["adminsrvr"]])  # unknown name never even probed
+        names = [m["Dimensions"][-1]["Value"] for m in publish_calls[0] if m["MetricName"] == "CriticalServiceDown"]
+        self.assertNotIn("not-a-real-service", names)
+        self.assertEqual(names, ["adminsrvr"])
+
+    def test_no_kubernetes_healing_restart_or_fencing_action_introduced(self):
+        import inspect
+        src = inspect.getsource(core.probe_critical_services)
+        for forbidden in ("kubernetes", "restart", "kubectl", "fence", "heal"):
+            self.assertNotIn(forbidden, src.lower())
+
+
 class LoggerHierarchyIntegrationTests(unittest.TestCase):
     """Proves the actual running-container logging path: monitor.py
     configures goldengate.monitor's level/handler; collector.py's logger

@@ -140,6 +140,24 @@ never emits it. If the shared monitor stops publishing entirely, a future
 CloudWatch alarm with `treat_missing_data=breaching` is the dead-man signal
 -- there is no local heartbeat file.
 
+**Critical-service coverage (manager-compatible):** the manager reference's
+functional default critical-service set is `adminsrvr`, `distsrvr`, and
+`recvsrvr` for every deployment (confirmed read-only against the manager
+source; not copied). Every deployment here -- Oracle and PostgreSQL alike --
+now probes and reports the full three-service set by default
+(`health_rules.RECOGNIZED_CRITICAL_SERVICES`), reimplemented independently
+of the manager's own probe/alerting code. An optional
+`CONFIG.criticalServices` override may *narrow* that set (a bounded list of
+recognized names only, deduplicated, order-preserved); any malformed,
+empty, non-list, or all-unrecognized override value fails safely back to
+the full three-service default -- an unrecognized name is silently dropped
+and can never become an arbitrary `CriticalServiceDown` `Service` dimension.
+`collector.probe_critical_services` still uses only the existing
+authenticated, TLS-verified Admin REST opener; critical-service state
+remains purely observational (`STATE#_deployment.criticalServices`, plus
+one `CriticalServiceDown` metric per resolved service) -- no Kubernetes
+API call, restart, healing, or fencing action exists anywhere in this path.
+
 `collector.publish_metrics_if_enabled` is the single protected publication
 boundary both polling_loop metric call sites (Admin-REST-down and normal-UP)
 go through -- the only code that constructs a CloudWatch client
@@ -200,19 +218,36 @@ are conditional on that.
 **Base image (no public default):** `monitoring/monitor/Dockerfile` declares
 `ARG BASE_IMAGE` with no value -- there is no Docker Hub fallback. The
 workflow's "Validate approved base image reference" step (which runs before
-the image-existence check and before any build) resolves `MONITOR_BASE_IMAGE`
-from the repository/environment variable `vars.MONITOR_BASE_IMAGE` (the same
-`vars.*` convention as `AWS_REGION`/`GOLDENGATE_AWS_ROLE_ARN`) and fails
-closed unless it is: non-empty, a private image inside the approved ECR
-registry (`${ECR_REGISTRY}`, never Docker Hub/ghcr.io/quay.io/any other
-registry), and digest-pinned (`@sha256:` followed by exactly 64 lowercase
-hex characters -- a tag-only reference is rejected). Example accepted shape
+the image-existence check and before any build) resolves the approved
+reference from the repository/environment variable `vars.MONITOR_BASE_IMAGE`
+(the same `vars.*` convention as `AWS_REGION`/`GOLDENGATE_AWS_ROLE_ARN`) --
+but the GitHub expression itself is passed only through step-level `env:`
+(`MONITOR_BASE_IMAGE_INPUT: ${{ vars.MONITOR_BASE_IMAGE }}`), never
+interpolated directly into the shell source; the script then does an
+ordinary `MONITOR_BASE_IMAGE="$MONITOR_BASE_IMAGE_INPUT"` assignment, which
+treats the value strictly as inert data regardless of its content (proven
+with `$()`/backtick/quote/newline/control-character/shell-metacharacter
+payloads and a harmless marker-file technique -- none ever execute).
+
+Validation fails closed unless the value is: non-empty; begins with the
+exact required prefix `${ECR_REGISTRY}/` (rejecting Docker Hub, ghcr.io,
+quay.io, and any other ECR registry/account); and -- after that prefix is
+removed -- the **entire remainder** matches a single fully-anchored
+repository-plus-digest grammar (not a prefix check plus a separate suffix
+check): one or more lowercase-alphanumeric path components, each internal
+separator limited to a single `.`/`_`/`-`, optional further `/`-separated
+components, always ending in exactly `@sha256:` followed by 64 lowercase
+hex characters. That one pattern alone rejects an empty repository,
+whitespace/control characters, `$()`/backticks/quotes/shell
+metacharacters, `../`/`./` path components, uppercase, a tag-only
+reference, and a short/uppercase/non-hex digest. Example accepted shape
 (not a real value): `229410149234.dkr.ecr.eu-west-1.amazonaws.com/<approved-base-repository>@sha256:<64 lowercase hex characters>`.
-On any failure, only a fixed explanatory message is printed -- the supplied
-value itself is never echoed. `--build-arg "BASE_IMAGE=${MONITOR_BASE_IMAGE}"`
-is the only way the value reaches `docker build`. If `vars.MONITOR_BASE_IMAGE`
-is not yet configured, the workflow fails before any image check/build --
-this is intentional; the approved reference is a prerequisite, not something
+On any failure -- and even on success -- only a fixed/generic message is
+printed; the supplied value is never echoed in full, on either path.
+`--build-arg "BASE_IMAGE=${MONITOR_BASE_IMAGE}"` is the only way the value
+reaches `docker build`. If `vars.MONITOR_BASE_IMAGE` is not yet configured,
+the workflow fails before any image check/build -- this is intentional;
+the approved reference is a prerequisite, not something
 this workflow invents.
 
 Before enabling (`enable_cloudwatch_publication=true`), the workflow runs a

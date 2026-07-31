@@ -1273,22 +1273,22 @@ def _extract_monitor_image_hash_script(workflow_text):
 def _extract_base_image_validation_script(workflow_text):
     """Pulls the exact, committed base-image validation snippet out of the
     real workflow file -- executed verbatim in tests, never reimplemented.
-    The one GitHub-Actions-only templating token in it (${{ vars.
-    MONITOR_BASE_IMAGE }}, which cannot be evaluated outside of Actions) is
-    substituted with a plain environment-variable reference; every line of
-    validation logic below that assignment is untouched."""
-    marker = 'MONITOR_BASE_IMAGE="${{ vars.MONITOR_BASE_IMAGE }}"'
-    start = workflow_text.index(marker)
-    end = workflow_text.index('echo "MONITOR_BASE_IMAGE: ${MONITOR_BASE_IMAGE}"', start)
+    No GitHub-Actions templating token remains inside this snippet at all
+    (it is only ever referenced in the step-level `env:` mapping, not in
+    the run script) -- so, unlike earlier phases, no textual substitution
+    is needed before this can be executed as ordinary bash."""
+    start = workflow_text.index('MONITOR_BASE_IMAGE="$MONITOR_BASE_IMAGE_INPUT"')
+    end = workflow_text.index("Confirmed: MONITOR_BASE_IMAGE is a digest-pinned", start)
     end = workflow_text.index("\n", end) + 1
-    script = workflow_text[start:end]
-    return script.replace(marker, 'MONITOR_BASE_IMAGE="${TEST_INPUT_MONITOR_BASE_IMAGE-}"')
+    return workflow_text[start:end]
 
 
 class MonitorBaseImageValidationTests(unittest.TestCase):
     """Phase 4D2 correction: fail-closed, digest-pinned private-ECR
     base-image gate -- proven by executing the actual committed validation
-    script (extracted from the workflow, not reimplemented)."""
+    script (extracted from the workflow, not reimplemented). The GitHub
+    expression is supplied only via step-level env (MONITOR_BASE_IMAGE_INPUT),
+    never interpolated into the shell source itself."""
 
     ECR_REGISTRY = "229410149234.dkr.ecr.eu-west-1.amazonaws.com"
     APPROVED_DIGEST_REF = f"{ECR_REGISTRY}/goldengate-monitor-base@sha256:{'a' * 64}"
@@ -1298,19 +1298,27 @@ class MonitorBaseImageValidationTests(unittest.TestCase):
         if shutil.which("bash") is None:
             raise unittest.SkipTest("bash not available")
         with open(MONITOR_WORKFLOW_PATH) as f:
-            cls.validation_script = _extract_base_image_validation_script(f.read())
+            cls.workflow_text = f.read()
+        cls.validation_script = _extract_base_image_validation_script(cls.workflow_text)
 
-    def _run(self, base_image_input):
+    def _run(self, base_image_input, extra_env=None):
         with tempfile.NamedTemporaryFile(mode="w", delete=False) as github_env_file:
             github_env_path = github_env_file.name
         try:
             script = f"set -euo pipefail\n{self.validation_script}"
             env = {**os.environ, "ECR_REGISTRY": self.ECR_REGISTRY,
-                  "TEST_INPUT_MONITOR_BASE_IMAGE": base_image_input,
+                  "MONITOR_BASE_IMAGE_INPUT": base_image_input,
                   "GITHUB_ENV": github_env_path}
+            env.update(extra_env or {})
             return subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
         finally:
             os.unlink(github_env_path)
+
+    def test_no_direct_github_expression_interpolation_remains_in_run_script(self):
+        self.assertNotIn("${{ vars.MONITOR_BASE_IMAGE }}", self.validation_script)
+        # The one legitimate occurrence must be in a step-level `env:` value,
+        # never inside a `run:` script body.
+        self.assertIn("MONITOR_BASE_IMAGE_INPUT: ${{ vars.MONITOR_BASE_IMAGE }}", self.workflow_text)
 
     def test_missing_base_image_fails(self):
         proc = self._run("")
@@ -1334,7 +1342,6 @@ class MonitorBaseImageValidationTests(unittest.TestCase):
     def test_tag_only_ecr_base_image_fails(self):
         proc = self._run(f"{self.ECR_REGISTRY}/goldengate-monitor-base:3.12-slim")
         self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("must be digest-pinned", proc.stdout)
 
     def test_uppercase_hex_digest_fails(self):
         proc = self._run(f"{self.ECR_REGISTRY}/goldengate-monitor-base@sha256:" + "A" * 64)
@@ -1342,6 +1349,42 @@ class MonitorBaseImageValidationTests(unittest.TestCase):
 
     def test_short_digest_fails(self):
         proc = self._run(f"{self.ECR_REGISTRY}/goldengate-monitor-base@sha256:" + "a" * 63)
+        self.assertNotEqual(proc.returncode, 0)
+
+    def test_empty_repository_fails(self):
+        proc = self._run(f"{self.ECR_REGISTRY}/@sha256:" + "a" * 64)
+        self.assertNotEqual(proc.returncode, 0)
+
+    def test_whitespace_in_repository_fails(self):
+        proc = self._run(f"{self.ECR_REGISTRY}/base image@sha256:" + "a" * 64)
+        self.assertNotEqual(proc.returncode, 0)
+
+    def test_control_character_in_repository_fails(self):
+        proc = self._run(f"{self.ECR_REGISTRY}/base\timage@sha256:" + "a" * 64)
+        self.assertNotEqual(proc.returncode, 0)
+
+    def test_dollar_paren_command_substitution_fails(self):
+        proc = self._run(f"{self.ECR_REGISTRY}/base$(whoami)@sha256:" + "a" * 64)
+        self.assertNotEqual(proc.returncode, 0)
+
+    def test_backtick_command_substitution_fails(self):
+        proc = self._run(f"{self.ECR_REGISTRY}/base`whoami`@sha256:" + "a" * 64)
+        self.assertNotEqual(proc.returncode, 0)
+
+    def test_embedded_double_quote_fails(self):
+        proc = self._run(f'{self.ECR_REGISTRY}/base"image@sha256:' + "a" * 64)
+        self.assertNotEqual(proc.returncode, 0)
+
+    def test_dot_dot_slash_path_component_fails(self):
+        proc = self._run(f"{self.ECR_REGISTRY}/../etc/passwd@sha256:" + "a" * 64)
+        self.assertNotEqual(proc.returncode, 0)
+
+    def test_dot_slash_path_component_fails(self):
+        proc = self._run(f"{self.ECR_REGISTRY}/./base@sha256:" + "a" * 64)
+        self.assertNotEqual(proc.returncode, 0)
+
+    def test_shell_metacharacter_semicolon_fails(self):
+        proc = self._run(f"{self.ECR_REGISTRY}/base;id@sha256:" + "a" * 64)
         self.assertNotEqual(proc.returncode, 0)
 
     def test_digest_pinned_approved_private_ecr_base_image_passes(self):
@@ -1356,6 +1399,72 @@ class MonitorBaseImageValidationTests(unittest.TestCase):
         self.assertNotIn(malformed, proc.stdout)
         self.assertNotIn(malformed, proc.stderr)
         self.assertNotIn("SECRET-MARKER", proc.stdout)
+
+    def test_success_path_never_prints_the_full_raw_value_either(self):
+        proc = self._run(self.APPROVED_DIGEST_REF)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn(self.APPROVED_DIGEST_REF, proc.stdout)
+        self.assertNotIn("a" * 64, proc.stdout)
+
+    def _run_with_marker_file(self, base_image_input):
+        """Proves the value is handled as inert data, never executed as a
+        command: a payload attempting $()/backtick/`;`-style command
+        injection is given a harmless, distinctive command
+        (`touch <marker>`) to run *if* it were ever evaluated as shell
+        code. The validation script must reject the malformed reference
+        (never digest-pinned/never matching the private registry) without
+        the marker file ever being created."""
+        with tempfile.TemporaryDirectory() as tmp:
+            marker_path = os.path.join(tmp, "command-executed.marker")
+            proc = self._run(base_image_input, extra_env={"MARKER_PATH": marker_path})
+            marker_created = os.path.exists(marker_path)
+        return proc, marker_created
+
+    def test_command_substitution_payload_never_executes(self):
+        proc, marker_created = self._run_with_marker_file(
+            f"{self.ECR_REGISTRY}/base$(touch \"$MARKER_PATH\")@sha256:" + "a" * 64)
+        self.assertFalse(marker_created, "$() payload executed a command instead of being treated as inert data")
+        self.assertNotEqual(proc.returncode, 0)
+
+    def test_backtick_payload_never_executes(self):
+        proc, marker_created = self._run_with_marker_file(
+            f'{self.ECR_REGISTRY}/base`touch "$MARKER_PATH"`@sha256:' + "a" * 64)
+        self.assertFalse(marker_created, "backtick payload executed a command instead of being treated as inert data")
+        self.assertNotEqual(proc.returncode, 0)
+
+    def test_embedded_double_quote_payload_never_executes(self):
+        proc, marker_created = self._run_with_marker_file(
+            f'{self.ECR_REGISTRY}/base" ; touch "$MARKER_PATH" ; echo "@sha256:' + "a" * 64)
+        self.assertFalse(marker_created, "embedded double-quote payload executed a command")
+        self.assertNotEqual(proc.returncode, 0)
+
+    def test_embedded_newline_payload_never_executes(self):
+        proc, marker_created = self._run_with_marker_file(
+            f'{self.ECR_REGISTRY}/base\ntouch "$MARKER_PATH"\n@sha256:' + "a" * 64)
+        self.assertFalse(marker_created, "embedded-newline payload executed a command")
+        self.assertNotEqual(proc.returncode, 0)
+
+    def test_embedded_control_character_payload_never_executes(self):
+        # \x00 (NUL) cannot be represented in a process environment variable
+        # at all (envp entries are NUL-terminated C strings) -- \x01/\x1b
+        # are real control characters that CAN appear in an env var value
+        # and must still be rejected, never executed.
+        proc, marker_created = self._run_with_marker_file(
+            f'{self.ECR_REGISTRY}/base\x01\x1b@sha256:' + "a" * 64)
+        self.assertFalse(marker_created, "embedded control-character payload executed a command")
+        self.assertNotEqual(proc.returncode, 0)
+
+    def test_whitespace_payload_never_executes(self):
+        proc, marker_created = self._run_with_marker_file(
+            f'{self.ECR_REGISTRY}/base && touch "$MARKER_PATH" @sha256:' + "a" * 64)
+        self.assertFalse(marker_created, "whitespace/shell-metacharacter payload executed a command")
+        self.assertNotEqual(proc.returncode, 0)
+
+    def test_shell_metacharacter_payload_never_executes(self):
+        proc, marker_created = self._run_with_marker_file(
+            f'{self.ECR_REGISTRY}/base; touch "$MARKER_PATH"; true@sha256:' + "a" * 64)
+        self.assertFalse(marker_created, "shell-metacharacter payload executed a command")
+        self.assertNotEqual(proc.returncode, 0)
 
 
 class MonitorImageHashTests(unittest.TestCase):

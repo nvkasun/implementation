@@ -1273,13 +1273,13 @@ def polling_loop(deployment, table, mgr, state, stop_event):
                 except Exception:
                     logger.exception("process %s evaluation failed; skipped", name)
 
-            critical = gh.CRITICAL_SERVICES_BY_TYPE.get(deployment_type, [])
-            if critical:
-                svc_up = probe_critical_services(base, opener, critical)
-                cs_new = {svc: {"reachable": bool(up)} for svc, up in svc_up.items()}
-            else:
-                svc_up = {}
-                cs_new = {}
+            # Manager-compatible: every deployment probes the full
+            # adminsrvr/distsrvr/recvsrvr set by default, regardless of
+            # type; cfg["criticalServices"] already resolved any (bounded,
+            # validated) CONFIG override -- see health_rules.resolve_critical_services.
+            critical = cfg["criticalServices"]
+            svc_up = probe_critical_services(base, opener, critical)
+            cs_new = {svc: {"reachable": bool(up)} for svc, up in svc_up.items()}
 
             # PMS is additional observability only: collect_pms never raises
             # and its result never influences the deployment's own UP status

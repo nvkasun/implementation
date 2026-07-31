@@ -127,6 +127,14 @@ jobs:
           echo "Confirmed: running in the ECR/build account (${ECR_ACCOUNT_ID})."
 
       - name: Validate approved base image reference
+        env:
+          # GitHub-expression content must never be interpolated directly
+          # into executable shell source (it would be inserted as literal
+          # script text before bash ever parses it). Passed through
+          # step-level env instead -- ordinary shell-variable expansion of
+          # $MONITOR_BASE_IMAGE_INPUT below treats it strictly as inert
+          # data, never as command text, regardless of its content.
+          MONITOR_BASE_IMAGE_INPUT: ${{ vars.MONITOR_BASE_IMAGE }}
         shell: bash
         run: |
           set -euo pipefail
@@ -138,10 +146,10 @@ jobs:
           # The approved reference is supplied externally as a repository/
           # environment variable, following this workflow's existing
           # vars.* convention (AWS_REGION, GOLDENGATE_AWS_ROLE_ARN, ...) --
-          # never hardcoded here. On any failure below, only a fixed
-          # explanatory message is printed -- the raw (possibly malformed)
-          # value itself is never echoed.
-          MONITOR_BASE_IMAGE="${{ vars.MONITOR_BASE_IMAGE }}"
+          # never hardcoded here. On any failure below, and even on
+          # success, only a fixed/generic message is printed -- the raw
+          # supplied value itself is never echoed.
+          MONITOR_BASE_IMAGE="$MONITOR_BASE_IMAGE_INPUT"
 
           if [ -z "$MONITOR_BASE_IMAGE" ]; then
             echo "MONITOR_BASE_IMAGE is not set."
@@ -151,21 +159,33 @@ jobs:
             exit 1
           fi
 
-          if [[ "$MONITOR_BASE_IMAGE" != "${ECR_REGISTRY}/"* ]]; then
+          MONITOR_BASE_IMAGE_REQUIRED_PREFIX="${ECR_REGISTRY}/"
+          if [[ "$MONITOR_BASE_IMAGE" != "${MONITOR_BASE_IMAGE_REQUIRED_PREFIX}"* ]]; then
             echo "MONITOR_BASE_IMAGE is not a private image in the approved ECR registry (${ECR_REGISTRY})."
-            echo "Public registries (Docker Hub, ghcr.io, quay.io, or any registry outside ${ECR_REGISTRY}) are never accepted."
+            echo "Public registries (Docker Hub, ghcr.io, quay.io) and any other ECR registry/account are never accepted."
             exit 1
           fi
 
-          if [[ ! "$MONITOR_BASE_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]]; then
-            echo "MONITOR_BASE_IMAGE must be digest-pinned: <repository>@sha256:<64 lowercase hex characters>."
-            echo "A tag-only reference (e.g. \":3.12-slim\") is not accepted -- mutable tags can change without this workflow's knowledge."
+          # The required registry prefix is retained, but everything AFTER
+          # it is validated as a single, fully-anchored grammar -- not just
+          # a prefix check plus a suffix check. Lowercase alphanumeric path
+          # component(s), each internal separator limited to a single '.',
+          # '_', or '-', optional further '/'-separated components, always
+          # ending in exactly "@sha256:" + 64 lowercase hex characters. This
+          # single pattern alone rejects: an empty repository; whitespace or
+          # control characters; $(), backticks, quotes, and shell
+          # metacharacters; "../" or "./" path components; uppercase;
+          # tag-only references; and a short/uppercase/non-hex digest.
+          MONITOR_BASE_IMAGE_REMAINDER="${MONITOR_BASE_IMAGE#"${MONITOR_BASE_IMAGE_REQUIRED_PREFIX}"}"
+          MONITOR_BASE_IMAGE_PATTERN='^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*@sha256:[0-9a-f]{64}$'
+          if [[ ! "$MONITOR_BASE_IMAGE_REMAINDER" =~ $MONITOR_BASE_IMAGE_PATTERN ]]; then
+            echo "MONITOR_BASE_IMAGE does not match the required <repository>@sha256:<64 lowercase hex characters> form."
+            echo "Expected shape: ${ECR_REGISTRY}/<approved-base-repository>@sha256:<64 lowercase hex characters>"
             exit 1
           fi
 
           echo "MONITOR_BASE_IMAGE=${MONITOR_BASE_IMAGE}" >> "$GITHUB_ENV"
           echo "Confirmed: MONITOR_BASE_IMAGE is a digest-pinned private ECR reference in the approved registry (${ECR_REGISTRY})."
-          echo "MONITOR_BASE_IMAGE: ${MONITOR_BASE_IMAGE}"
 
       - name: Prepare monitor image variables
         id: prep
