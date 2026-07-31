@@ -35,7 +35,8 @@ on:
         description: >-
           Private ECR repository name for the approved monitor Python base
           image (company-approved lowercase ECR naming convention, e.g.
-          goldengate/monitor-python-base). No tag/digest suffix.
+          aws-cloud-factory-monitor-base-image). No tag/digest suffix. Never
+          hardcoded in this workflow's AWS operations -- always this input.
         required: true
         type: string
 
@@ -229,8 +230,16 @@ jobs:
 
           # Quoted heredoc delimiter ('DOCKERFILE_EOF') -- the shell writing
           # this file must NEVER expand $SOURCE_BASE_IMAGE/${OCI_SOURCE}/
-          # ${OCI_VERSION}; those are Docker ARG references, resolved only
-          # by `docker build`, not by this script.
+          # ${OCI_VERSION}/${BUILD_INPUT_SHA256}; those are Docker ARG
+          # references, resolved only by `docker build`, not by this script.
+          #
+          # The build-input hash is stamped onto the image itself as label
+          # com.adcb.goldengate.monitor-base.build-input-sha256 -- since the
+          # visible ECR tag is now the fixed, human-readable "1" rather than
+          # a content-addressed value, this label is what actually proves
+          # (or disproves) that an image found under tag "1" was built from
+          # the currently expected inputs (see "Verify OCI labels and
+          # build-input hash" below).
           #
           # No apt-get/package installation here: those results would not
           # be covered by the source-image digest or the deterministic tag.
@@ -252,11 +261,13 @@ jobs:
 
           ARG OCI_SOURCE=""
           ARG OCI_VERSION="development"
+          ARG BUILD_INPUT_SHA256=""
 
           LABEL org.opencontainers.image.title="goldengate-monitor-python-base" \
                 org.opencontainers.image.description="Approved Python foundation for the shared GoldenGate monitor" \
                 org.opencontainers.image.source="${OCI_SOURCE}" \
-                org.opencontainers.image.version="${OCI_VERSION}"
+                org.opencontainers.image.version="${OCI_VERSION}" \
+                com.adcb.goldengate.monitor-base.build-input-sha256="${BUILD_INPUT_SHA256}"
 
           ENV PYTHONUNBUFFERED=1 \
               PYTHONDONTWRITEBYTECODE=1 \
@@ -272,7 +283,7 @@ jobs:
           echo "GENERATED_DOCKERFILE_PATH=${DOCKERFILE_PATH}" >> "$GITHUB_ENV"
           echo "OK: base Dockerfile generated at a runner-temporary path (never committed to the repository)."
 
-      - name: Compute the deterministic content-addressed tag
+      - name: Compute the build-input hash and fixed tag
         shell: bash
         run: |
           set -euo pipefail
@@ -282,13 +293,17 @@ jobs:
           # GITHUB_REPOSITORY are ordinary env vars every step already has.
           OCI_SOURCE_VALUE="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
 
-          # Deterministic: the same source image reference + the same
-          # generated Dockerfile bytes + the same fixed platform + the same
-          # repository source URL always produce the same tag. Changing
-          # any one of these actual inputs changes it. Nothing
-          # run-specific (github.run_id/run_attempt) participates -- those
-          # would make identical actual inputs produce a different tag/
-          # image metadata on every single run.
+          # BUILD_INPUT_SHA256 is still fully deterministic: the same
+          # pinned source_python_image + the same generated Dockerfile
+          # bytes + the same fixed platform + the same repository source
+          # URL always produce the same hash; changing any one of these
+          # actual inputs changes it. Nothing run-specific (github.run_id/
+          # run_attempt) participates. Unlike an earlier phase, this full
+          # hash is NOT used as the visible ECR tag -- it is stored
+          # separately and asserted as an image label (see "Generate the
+          # base Dockerfile" and "Verify OCI labels and build-input hash"
+          # below), so that the fixed, human-readable tag below can never
+          # silently refer to an image built from different inputs.
           TAG_INPUT_PATH="${RUNNER_TEMP}/goldengate-monitor-base.tag-input"
           {
             printf '%s\n' "$SOURCE_PYTHON_IMAGE"
@@ -297,19 +312,24 @@ jobs:
             printf '%s\n' "$OCI_SOURCE_VALUE"
           } > "$TAG_INPUT_PATH"
 
-          GENERATED_HASH="$(sha256sum "$TAG_INPUT_PATH" | awk '{print $1}')"
-          GENERATED_TAG="monitor-python-base-${GENERATED_HASH:0:12}"
+          BUILD_INPUT_SHA256="$(sha256sum "$TAG_INPUT_PATH" | awk '{print $1}')"
+
+          # Fixed, one-time, human-readable, immutable tag -- approved
+          # final naming. Never derived from the build-input hash.
+          GENERATED_TAG="1"
           DESTINATION_IMAGE="${ECR_REGISTRY}/${TARGET_REPOSITORY}:${GENERATED_TAG}"
 
           # Stable OCI version metadata: derived only from the already-
-          # deterministic GENERATED_TAG, never from run_id/run_attempt.
+          # fixed GENERATED_TAG, never from run_id/run_attempt.
           OCI_VERSION_VALUE="${GENERATED_TAG}"
 
+          echo "BUILD_INPUT_SHA256=${BUILD_INPUT_SHA256}" >> "$GITHUB_ENV"
           echo "OCI_SOURCE_VALUE=${OCI_SOURCE_VALUE}" >> "$GITHUB_ENV"
           echo "OCI_VERSION_VALUE=${OCI_VERSION_VALUE}" >> "$GITHUB_ENV"
           echo "GENERATED_TAG=${GENERATED_TAG}" >> "$GITHUB_ENV"
           echo "DESTINATION_IMAGE=${DESTINATION_IMAGE}" >> "$GITHUB_ENV"
-          echo "Generated tag: ${GENERATED_TAG}"
+          echo "Build-input hash: ${BUILD_INPUT_SHA256}"
+          echo "Fixed tag: ${GENERATED_TAG}"
           echo "Destination: ${DESTINATION_IMAGE}"
 
       - name: Ensure target ECR repository exists with the required settings
@@ -360,7 +380,7 @@ jobs:
           # requires EKS runtime pull access. No cross-account permission
           # is added here.
 
-      - name: Check whether the generated tag already exists
+      - name: Check whether the fixed tag already exists
         shell: bash
         run: |
           set -euo pipefail
@@ -369,11 +389,12 @@ jobs:
             --region "$AWS_REGION" \
             --repository-name "$TARGET_REPOSITORY" \
             --image-ids "imageTag=${GENERATED_TAG}" >/dev/null 2>"${RUNNER_TEMP}/describe-images-error.txt"; then
-            echo "Image already exists in ECR for this exact tag. Reusing it -- no rebuild or push will occur."
+            echo "Tag \"${GENERATED_TAG}\" already exists in ECR. Reusing it -- no rebuild or overwrite will occur."
+            echo "Its build-input-sha256 label will be verified against the currently calculated hash before this is trusted."
             echo "IMAGE_EXISTED=true" >> "$GITHUB_ENV"
           else
             if grep -q "ImageNotFoundException" "${RUNNER_TEMP}/describe-images-error.txt"; then
-              echo "Tag not found in ECR. It will be built and pushed."
+              echo "Tag \"${GENERATED_TAG}\" not found in ECR. It will be built and pushed."
               echo "IMAGE_EXISTED=false" >> "$GITHUB_ENV"
             else
               echo "Failed to check for the existing tag:"
@@ -401,6 +422,7 @@ jobs:
             --build-arg "SOURCE_BASE_IMAGE=${SOURCE_PYTHON_IMAGE}" \
             --build-arg "OCI_SOURCE=${OCI_SOURCE_VALUE}" \
             --build-arg "OCI_VERSION=${OCI_VERSION_VALUE}" \
+            --build-arg "BUILD_INPUT_SHA256=${BUILD_INPUT_SHA256}" \
             -t "$DESTINATION_IMAGE" \
             "$BUILD_CONTEXT"
 
@@ -413,17 +435,24 @@ jobs:
           echo "Pulling existing image ${DESTINATION_IMAGE} for platform ${TARGET_PLATFORM} (reused, never rebuilt or overwritten)..."
           docker pull --platform "$TARGET_PLATFORM" "$DESTINATION_IMAGE"
 
-      - name: Verify OCI labels
+      - name: Verify OCI labels and build-input hash
         shell: bash
         run: |
           set -euo pipefail
 
           # Runs unconditionally for both a freshly built image and a
           # reused ECR image -- the image is available locally either way
-          # (just built and tagged, or just pulled above).
+          # (just built and tagged, or just pulled above). Because the
+          # visible tag is now the fixed "1" rather than a content-
+          # addressed value, THIS check -- comparing the image's own
+          # build-input-sha256 label against the hash just calculated from
+          # the current inputs -- is what prevents tag "1" from silently
+          # referring to an image built from different inputs. Any
+          # mismatch (or missing label) fails the workflow closed.
           TITLE_LABEL="$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.title" }}' "$DESTINATION_IMAGE")"
           SOURCE_LABEL="$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.source" }}' "$DESTINATION_IMAGE")"
           VERSION_LABEL="$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$DESTINATION_IMAGE")"
+          BUILD_INPUT_SHA256_LABEL="$(docker inspect --format '{{ index .Config.Labels "com.adcb.goldengate.monitor-base.build-input-sha256" }}' "$DESTINATION_IMAGE")"
 
           if [ "$TITLE_LABEL" != "goldengate-monitor-python-base" ]; then
             echo "FAIL: org.opencontainers.image.title label is absent or does not match the expected value."
@@ -434,11 +463,16 @@ jobs:
             exit 1
           fi
           if [ -z "$VERSION_LABEL" ] || [ "$VERSION_LABEL" != "$OCI_VERSION_VALUE" ]; then
-            echo "FAIL: org.opencontainers.image.version label is absent or does not match the generated tag."
+            echo "FAIL: org.opencontainers.image.version label is absent or does not match the fixed tag."
+            exit 1
+          fi
+          if [ -z "$BUILD_INPUT_SHA256_LABEL" ] || [ "$BUILD_INPUT_SHA256_LABEL" != "$BUILD_INPUT_SHA256" ]; then
+            echo "FAIL: com.adcb.goldengate.monitor-base.build-input-sha256 label is absent or does not match the currently calculated build-input hash."
+            echo "This would mean tag \"${GENERATED_TAG}\" refers to an image built from different inputs than the ones just validated -- refusing to proceed."
             exit 1
           fi
 
-          echo "OK: OCI labels verified (title/source/version)."
+          echo "OK: OCI labels and build-input hash verified (title/source/version/build-input-sha256)."
 
       - name: Smoke-test the base image (new or reused)
         shell: bash
@@ -586,9 +620,18 @@ jobs:
             echo "## GoldenGate monitor base image -- one-time build"
             echo ""
             echo "- Source: \`${SOURCE_PYTHON_IMAGE:-unknown}\` (accepted as a digest-pinned official Python image)"
-            echo "- Target ECR repository: \`${TARGET_REPOSITORY:-unknown}\`"
-            echo "- Generated immutable tag: \`${GENERATED_TAG:-unknown}\`"
+            echo ""
+            echo "Repository:"
+            echo "\`${TARGET_REPOSITORY:-unknown}\`"
+            echo ""
+            echo "Tag:"
+            echo "\`${GENERATED_TAG:-unknown}\`"
+            echo ""
+            echo "Tagged image:"
+            echo "\`${DESTINATION_IMAGE:-unknown}\`"
+            echo ""
             echo "- Image reused (already existed): \`${IMAGE_EXISTED:-unknown}\`"
+            echo "- Build-input hash (image label, not the tag): \`${BUILD_INPUT_SHA256:-unknown}\`"
             echo "- Resolved ECR image digest: \`${IMAGE_DIGEST:-unknown}\`"
             echo "- Architecture: amd64"
             echo "- Python version: 3.12"
@@ -596,6 +639,7 @@ jobs:
             echo ""
             echo "### Final digest-pinned MONITOR_BASE_IMAGE value"
             echo ""
+            echo "MONITOR_BASE_IMAGE:"
             echo "\`\`\`"
             echo "${FINAL_BASE_IMAGE_REF:-unavailable}"
             echo "\`\`\`"
