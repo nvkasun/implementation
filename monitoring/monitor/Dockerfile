@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 # No public default: BASE_IMAGE must be explicitly supplied as a
 # digest-pinned, private-ECR reference by the caller (see
 # .github/workflows/goldengate-monitor.yaml's "Validate approved base image
