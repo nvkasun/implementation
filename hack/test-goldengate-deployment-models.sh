@@ -749,7 +749,7 @@ else
   fail "goldengate-monitor.yaml's CloudWatch preflight no longer uses GetItem-only reads"
 fi
 
-if grep -q "PREREQUISITE NOT MET: no running gg-monitor pod found" "$MONITOR_WORKFLOW" 2>/dev/null; then
+if grep -q "PREREQUISITE NOT MET: no Ready gg-monitor pod found" "$MONITOR_WORKFLOW" 2>/dev/null; then
   pass "goldengate-monitor.yaml documents the first-deployment prerequisite instead of bypassing the CONFIG check"
 else
   fail "goldengate-monitor.yaml is missing the first-deployment prerequisite failure message"
@@ -773,6 +773,96 @@ if grep -q "cloudwatch:ListMetrics" "$MONITOR_WORKFLOW" 2>/dev/null \
   fail "goldengate-monitor.yaml references a CloudWatch read IAM action -- none should ever be introduced for this phase"
 else
   pass "goldengate-monitor.yaml introduces no CloudWatch read IAM action (ListMetrics/GetMetricData)"
+fi
+
+# ---------------------------------------------------------------------
+# 20. Phase 4D2 pre-deployment correction: runtime-image hash scoped to
+#     Dockerfile inputs only, unit tests unconditional, POSIX-safe
+#     discovery, unique per-attempt Helm OCI revision, Ready-pod selection.
+# ---------------------------------------------------------------------
+echo ""
+echo "--- Phase 4D2 correction: image hash scope, POSIX awk, chart SemVer, Ready-pod selection ---"
+
+if grep -q 'git rev-parse "HEAD:\${MONITOR_SOURCE_PATH}"' "$MONITOR_WORKFLOW" 2>/dev/null; then
+  fail "goldengate-monitor.yaml still hashes the whole monitoring/monitor tree (would include README.md/tests/**)"
+else
+  pass "goldengate-monitor.yaml no longer hashes the whole monitoring/monitor tree"
+fi
+
+if grep -q "MONITOR_IMAGE_INPUT_PATHS=(" "$MONITOR_WORKFLOW" 2>/dev/null \
+    && grep -q "git ls-tree -r HEAD -- " "$MONITOR_WORKFLOW" 2>/dev/null \
+    && grep -q "git hash-object --stdin" "$MONITOR_WORKFLOW" 2>/dev/null; then
+  pass "goldengate-monitor.yaml computes a deterministic Git-based hash over exactly the Dockerfile-copied paths"
+else
+  fail "goldengate-monitor.yaml is missing the scoped Dockerfile-input hash computation"
+fi
+
+HASH_INPUT_ARRAY="$(awk '
+  /MONITOR_IMAGE_INPUT_PATHS=\($/ { capture=1; print; next }
+  capture { print }
+  capture && /^ *\)$/ { exit }
+' "$MONITOR_WORKFLOW")"
+if grep -q '"\${MONITOR_SOURCE_PATH}/tools"' <<< "$HASH_INPUT_ARRAY" \
+    && ! grep -q 'README.md' <<< "$HASH_INPUT_ARRAY" \
+    && ! grep -q 'requirements-test.txt' <<< "$HASH_INPUT_ARRAY" \
+    && ! grep -q '/tests' <<< "$HASH_INPUT_ARRAY"; then
+  pass "goldengate-monitor.yaml's hash inputs exclude README.md/requirements-test.txt/tests"
+else
+  fail "goldengate-monitor.yaml's hash inputs unexpectedly include a non-runtime path"
+fi
+
+UNIT_TEST_STEPS_UNCONDITIONAL="true"
+for step_name in "Set up Python" "Install monitor runtime and test dependencies" \
+                 "Validate monitor Python syntax" "Run monitor unit tests"; do
+  STEP_BLOCK="$(awk -v marker="- name: ${step_name}\$" '
+    $0 ~ marker { found=1; print; next }
+    found && /^      - name:/ { exit }
+    found { print }
+  ' "$MONITOR_WORKFLOW")"
+  if grep -q "if: env.IMAGE_EXISTED" <<< "$STEP_BLOCK"; then
+    fail "goldengate-monitor.yaml step \"${step_name}\" is still conditional on IMAGE_EXISTED"
+    UNIT_TEST_STEPS_UNCONDITIONAL="false"
+  fi
+done
+[ "$UNIT_TEST_STEPS_UNCONDITIONAL" = "true" ] && pass "Python setup/install/syntax-validation/unit-test steps run unconditionally (not gated on IMAGE_EXISTED)"
+
+DOCKER_STEPS_CONDITIONAL="true"
+for step_name in "Verify Docker binary and daemon are functional" "Login to Amazon ECR" \
+                 "Build monitor image" "Push monitor image"; do
+  STEP_BLOCK="$(awk -v marker="- name: ${step_name}\$" '
+    $0 ~ marker { found=1; print; next }
+    found && /^      - name:/ { exit }
+    found { print }
+  ' "$MONITOR_WORKFLOW")"
+  if ! grep -q "if: env.IMAGE_EXISTED != 'true'" <<< "$STEP_BLOCK"; then
+    fail "goldengate-monitor.yaml step \"${step_name}\" is no longer conditional on IMAGE_EXISTED"
+    DOCKER_STEPS_CONDITIONAL="false"
+  fi
+done
+[ "$DOCKER_STEPS_CONDITIONAL" = "true" ] && pass "Docker daemon-check/login/build/push steps remain conditional on IMAGE_EXISTED"
+
+if grep -q '\[\[:space:\]\]' "$MONITOR_WORKFLOW" 2>/dev/null; then
+  pass "goldengate-monitor.yaml's CloudWatch deployment-discovery awk uses POSIX [[:space:]], not GNU-only \\s"
+else
+  fail "goldengate-monitor.yaml's CloudWatch deployment-discovery awk does not use POSIX [[:space:]]"
+fi
+
+# Functional execution of the exact extracted awk script (proving it
+# returns precisely the two enabled canonical deployments, never
+# hardcoded) is covered by the Python suite -- see
+# WorkflowStaticAnalysisTests.test_deployment_discovery_awk_returns_exactly_both_enabled_deployments,
+# already run above in section 3 ("Python unit tests").
+
+if grep -q 'CHART_VERSION="0.\${{ github.run_number }}.\${{ github.run_attempt }}"' "$MONITOR_WORKFLOW" 2>/dev/null; then
+  pass "goldengate-monitor.yaml's chart version is a SemVer containing both run_number and run_attempt"
+else
+  fail "goldengate-monitor.yaml's chart version does not include run_attempt -- reruns would collide on a mutable Helm OCI repository"
+fi
+
+if grep -q '.items\[0\].metadata.name' "$MONITOR_WORKFLOW" 2>/dev/null; then
+  fail "goldengate-monitor.yaml still blindly selects .items[0] for pod discovery"
+else
+  pass "goldengate-monitor.yaml no longer blindly selects .items[0] -- pod selection filters on Running phase and container readiness"
 fi
 
 echo ""

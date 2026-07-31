@@ -1260,6 +1260,135 @@ class CloudWatchActivationHelmRenderTests(unittest.TestCase):
             self.assertNotIn(f"name: CLOUDWATCH_PUBLISH_ENABLED\n              {forbidden_value}", rendered)
 
 
+def _extract_monitor_image_hash_script(workflow_text):
+    """Pulls the exact, committed hash-computation snippet (from the array
+    of input paths through the MONITOR_IMAGE_TAG= assignment) out of the
+    real workflow file -- executed verbatim in tests, never reimplemented."""
+    start = workflow_text.index("MONITOR_IMAGE_INPUT_PATHS=(")
+    end = workflow_text.index('MONITOR_IMAGE_TAG="mon-', start)
+    end = workflow_text.index("\n", end) + 1
+    return workflow_text[start:end]
+
+
+class MonitorImageHashTests(unittest.TestCase):
+    """Phase 4D2 correction: the runtime-image content hash must depend
+    only on exactly the paths the Dockerfile COPYs -- never README.md,
+    requirements-test.txt, or tests/**. Proven by executing the actual
+    committed hash script (extracted from the workflow, not reimplemented)
+    against a throwaway git repository."""
+
+    @classmethod
+    def setUpClass(cls):
+        if shutil.which("git") is None:
+            raise unittest.SkipTest("git not available")
+        with open(MONITOR_WORKFLOW_PATH) as f:
+            cls.hash_script = _extract_monitor_image_hash_script(f.read())
+
+    def _compute_hash(self, repo_dir):
+        # hash_script already ends with a newline (it was sliced through the
+        # MONITOR_IMAGE_TAG= line), so the appended echo starts on its own
+        # line -- no extra ";" (which would be a stray empty statement).
+        script = f'set -euo pipefail\n{self.hash_script}echo "$MONITOR_TREE_SHA"'
+        proc = subprocess.run(
+            ["bash", "-c", script],
+            cwd=repo_dir, env={**os.environ, "MONITOR_SOURCE_PATH": "."},
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, f"hash script failed: {proc.stdout}\n{proc.stderr}")
+        return proc.stdout.strip()
+
+    def _init_repo(self, tmp):
+        for cmd in (["git", "init", "-q"],
+                   ["git", "config", "user.email", "test@example.invalid"],
+                   ["git", "config", "user.name", "test"]):
+            subprocess.run(cmd, cwd=tmp, check=True)
+        os.makedirs(os.path.join(tmp, "tools"), exist_ok=True)
+        os.makedirs(os.path.join(tmp, "tests"), exist_ok=True)
+        files = {
+            "Dockerfile": "FROM python:3.12-slim\n",
+            "requirements.txt": "boto3\n",
+            "requirements-test.txt": "pytest\n",
+            "monitor.py": "print('monitor')\n",
+            "collector.py": "print('collector')\n",
+            "config.py": "print('config')\n",
+            "health_rules.py": "print('health_rules')\n",
+            "tools/gg_api_contract_probe.py": "print('tool')\n",
+            "README.md": "# readme v1\n",
+            "tests/test_monitor.py": "# test v1\n",
+        }
+        for relpath, content in files.items():
+            with open(os.path.join(tmp, relpath), "w") as f:
+                f.write(content)
+        subprocess.run(["git", "add", "-A"], cwd=tmp, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "initial"], cwd=tmp, check=True)
+
+    def _commit(self, tmp, message):
+        subprocess.run(["git", "add", "-A"], cwd=tmp, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", message], cwd=tmp, check=True)
+
+    def test_readme_only_change_does_not_change_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_repo(tmp)
+            before = self._compute_hash(tmp)
+            with open(os.path.join(tmp, "README.md"), "w") as f:
+                f.write("# readme v2 -- substantially changed\n")
+            self._commit(tmp, "readme change")
+            after = self._compute_hash(tmp)
+        self.assertEqual(before, after)
+
+    def test_test_only_change_does_not_change_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_repo(tmp)
+            before = self._compute_hash(tmp)
+            with open(os.path.join(tmp, "tests", "test_monitor.py"), "w") as f:
+                f.write("# test v2 -- substantially changed\n")
+            with open(os.path.join(tmp, "requirements-test.txt"), "w") as f:
+                f.write("pytest==8\n")
+            self._commit(tmp, "test change")
+            after = self._compute_hash(tmp)
+        self.assertEqual(before, after)
+
+    def test_dockerfile_change_changes_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_repo(tmp)
+            before = self._compute_hash(tmp)
+            with open(os.path.join(tmp, "Dockerfile"), "w") as f:
+                f.write("FROM python:3.12-slim\nRUN true\n")
+            self._commit(tmp, "dockerfile change")
+            after = self._compute_hash(tmp)
+        self.assertNotEqual(before, after)
+
+    def test_requirements_change_changes_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_repo(tmp)
+            before = self._compute_hash(tmp)
+            with open(os.path.join(tmp, "requirements.txt"), "w") as f:
+                f.write("boto3==2\n")
+            self._commit(tmp, "requirements change")
+            after = self._compute_hash(tmp)
+        self.assertNotEqual(before, after)
+
+    def test_collector_change_changes_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_repo(tmp)
+            before = self._compute_hash(tmp)
+            with open(os.path.join(tmp, "collector.py"), "w") as f:
+                f.write("print('collector v2')\n")
+            self._commit(tmp, "collector change")
+            after = self._compute_hash(tmp)
+        self.assertNotEqual(before, after)
+
+    def test_tools_change_changes_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_repo(tmp)
+            before = self._compute_hash(tmp)
+            with open(os.path.join(tmp, "tools", "gg_api_contract_probe.py"), "w") as f:
+                f.write("print('tool v2')\n")
+            self._commit(tmp, "tools change")
+            after = self._compute_hash(tmp)
+        self.assertNotEqual(before, after)
+
+
 class WorkflowStaticAnalysisTests(unittest.TestCase):
     """Static inspection of the two GitHub Actions workflow files. These
     prove the actual committed bash/YAML content was fixed -- not a
@@ -1350,6 +1479,147 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         github_event_name = "workflow_dispatch"
         self.assertFalse((github_event_name != "workflow_dispatch") or False)
         self.assertTrue((github_event_name != "workflow_dispatch") or True)
+
+    def test_unit_tests_are_not_conditional_on_image_existed(self):
+        doc = yaml.safe_load(self.monitor_text)
+        steps = doc["jobs"]["ensure_monitor_image"]["steps"]
+        for step_name in ("Set up Python", "Install monitor runtime and test dependencies",
+                         "Validate monitor Python syntax", "Run monitor unit tests"):
+            with self.subTest(step=step_name):
+                step = next(s for s in steps if s.get("name") == step_name)
+                self.assertNotIn("if", step, f"{step_name} must run unconditionally, not gated on IMAGE_EXISTED")
+
+    def test_docker_build_and_push_remain_conditional_on_image_existed(self):
+        doc = yaml.safe_load(self.monitor_text)
+        steps = doc["jobs"]["ensure_monitor_image"]["steps"]
+        for step_name in ("Verify Docker binary and daemon are functional", "Login to Amazon ECR",
+                         "Build monitor image", "Push monitor image"):
+            with self.subTest(step=step_name):
+                step = next(s for s in steps if s.get("name") == step_name)
+                self.assertEqual(step.get("if"), "env.IMAGE_EXISTED != 'true'")
+
+    def test_unit_tests_step_precedes_docker_steps(self):
+        doc = yaml.safe_load(self.monitor_text)
+        steps = doc["jobs"]["ensure_monitor_image"]["steps"]
+        names = [s.get("name") for s in steps]
+        self.assertLess(names.index("Run monitor unit tests"), names.index("Verify Docker binary and daemon are functional"))
+
+    def test_deployment_discovery_awk_uses_posix_space_class_not_gnu_s(self):
+        # \s is a GNU/PCRE-only escape, not POSIX awk -- [[:space:]] is the
+        # portable bracket expression every POSIX-conforming awk supports.
+        preflight_idx = self.monitor_text.index("- name: CloudWatch publication preflight")
+        argocd_idx = self.monitor_text.index("- name: Create or update Argo CD Application")
+        preflight_step_text = self.monitor_text[preflight_idx:argocd_idx]
+        self.assertNotIn(r"\s", preflight_step_text)
+        self.assertIn("[[:space:]]", preflight_step_text)
+
+        verify_idx = self.monitor_text.index("- name: Verify GoldenGate monitor runtime state")
+        upload_idx = self.monitor_text.index("- name: Upload rendered manifests and chart package")
+        verify_step_text = self.monitor_text[verify_idx:upload_idx]
+        post_rollout_idx = verify_step_text.index("ENABLED_DEPLOYMENTS_POST")
+        post_rollout_awk_text = verify_step_text[post_rollout_idx:post_rollout_idx + 600]
+        self.assertNotIn(r"\s", post_rollout_awk_text)
+        self.assertIn("[[:space:]]", post_rollout_awk_text)
+
+    def test_deployment_discovery_awk_returns_exactly_both_enabled_deployments(self):
+        # Executes the actual committed awk snippet (extracted from the
+        # preflight step) under the system's real awk against the real
+        # canonical config -- not a reimplementation.
+        if shutil.which("awk") is None:
+            raise unittest.SkipTest("awk not available")
+        preflight_idx = self.monitor_text.index("mapfile -t ENABLED_DEPLOYMENTS < <(awk '")
+        script_start = self.monitor_text.index("'", preflight_idx) + 1
+        script_end = self.monitor_text.index("'", script_start)
+        awk_script = self.monitor_text[script_start:script_end]
+        proc = subprocess.run(["awk", awk_script, DEPLOYMENTS_FILE_PATH], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        names = [line for line in proc.stdout.splitlines() if line]
+        self.assertEqual(names, ["gg-oracle-payments-01", "gg-postgresql-payments-01"])
+
+    def test_deployment_discovery_never_hardcodes_names_in_production_logic(self):
+        preflight_idx = self.monitor_text.index("- name: CloudWatch publication preflight")
+        argocd_idx = self.monitor_text.index("- name: Create or update Argo CD Application")
+        preflight_step_text = self.monitor_text[preflight_idx:argocd_idx]
+        self.assertNotIn("gg-oracle-payments-01", preflight_step_text)
+        self.assertNotIn("gg-postgresql-payments-01", preflight_step_text)
+
+    def test_chart_version_is_semver_with_run_number_and_run_attempt(self):
+        self.assertIn(
+            'CHART_VERSION="0.${{ github.run_number }}.${{ github.run_attempt }}"',
+            self.monitor_text)
+        self.assertNotIn('CHART_VERSION="0.1.${{ github.run_number }}"', self.monitor_text)
+
+    def test_argocd_target_revision_uses_the_same_chart_version_variable(self):
+        self.assertIn("targetRevision: ${CHART_VERSION}", self.monitor_text)
+
+    def test_rerun_produces_a_distinct_chart_version(self):
+        # Pure simulation of the SemVer expression: same run_number, a
+        # different run_attempt (as on a workflow rerun) must never collide.
+        def render(run_number, run_attempt):
+            return f"0.{run_number}.{run_attempt}"
+        first_attempt = render(42, 1)
+        rerun_attempt = render(42, 2)
+        self.assertNotEqual(first_attempt, rerun_attempt)
+
+    def test_pod_selection_never_blindly_uses_items_zero(self):
+        self.assertNotIn(".items[0].metadata.name", self.monitor_text)
+
+    def test_pod_selection_requires_running_phase_and_ready_containers(self):
+        for marker_text in (
+            self.monitor_text[self.monitor_text.index("- name: CloudWatch publication preflight"):
+                              self.monitor_text.index("- name: Create or update Argo CD Application")],
+            self.monitor_text[self.monitor_text.index("- name: Verify GoldenGate monitor runtime state"):
+                              self.monitor_text.index("- name: Upload rendered manifests and chart package")],
+        ):
+            self.assertIn('.status.phase == "Running"', marker_text)
+            self.assertIn("all(.ready == true)", marker_text)
+
+    def test_pod_selection_never_prints_full_pod_object(self):
+        preflight_idx = self.monitor_text.index("- name: CloudWatch publication preflight")
+        argocd_idx = self.monitor_text.index("- name: Create or update Argo CD Application")
+        preflight_step_text = self.monitor_text[preflight_idx:argocd_idx]
+        self.assertNotIn("kubectl get pods -n \"$TARGET_NAMESPACE\" -l app.kubernetes.io/name=gg-monitor -o json 2>/dev/null | jq -r .items",
+                         preflight_step_text.replace("\n", " ").replace("            ", " "))
+        self.assertNotIn("echo \"$POD_NAME\" -o json", preflight_step_text)
+
+    def test_ready_pod_selection_jq_filter_selects_only_ready_pod(self):
+        if shutil.which("jq") is None:
+            raise unittest.SkipTest("jq not available")
+        preflight_idx = self.monitor_text.index("- name: CloudWatch publication preflight")
+        argocd_idx = self.monitor_text.index("- name: Create or update Argo CD Application")
+        preflight_step_text = self.monitor_text[preflight_idx:argocd_idx]
+        filter_start = preflight_step_text.index("jq -r '") + len("jq -r '")
+        filter_end = preflight_step_text.index("'", filter_start)
+        jq_filter = preflight_step_text[filter_start:filter_end]
+
+        mixed_pods = {"items": [
+            {"status": {"phase": "Pending", "containerStatuses": []},
+             "metadata": {"name": "gg-monitor-pending"}},
+            {"status": {"phase": "Running", "containerStatuses": [{"ready": False}]},
+             "metadata": {"name": "gg-monitor-notready"}},
+            {"status": {"phase": "Running", "containerStatuses": [{"ready": True}]},
+             "metadata": {"name": "gg-monitor-ready"}},
+        ]}
+        proc = subprocess.run(["jq", "-r", jq_filter], input=json.dumps(mixed_pods),
+                              capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "gg-monitor-ready")
+
+        no_ready_pods = {"items": [
+            {"status": {"phase": "Pending", "containerStatuses": []}, "metadata": {"name": "x"}},
+        ]}
+        proc = subprocess.run(["jq", "-r", jq_filter], input=json.dumps(no_ready_pods),
+                              capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+
+    def test_readme_does_not_claim_terraform_can_enable_metrics(self):
+        with open(os.path.join(REPO_ROOT, "monitoring", "monitor", "README.md")) as f:
+            readme_text = f.read()
+        self.assertIn("ignore_changes = [item]", readme_text)
+        self.assertIn("never mutates it", readme_text.lower())
+        self.assertIn("stays blocked in practice", readme_text.lower())
+        self.assertIn("never requires any", readme_text.lower())
 
     def test_enable_cloudwatch_publication_input_is_boolean_required_default_false(self):
         doc = yaml.safe_load(self.monitor_text)

@@ -176,12 +176,23 @@ The requested value is passed as an `image.tag`-style Argo CD Application
 Helm parameter (`cloudwatch.publishEnabled`), so it is owned by the same
 GitHub Actions -> Helm OCI artifact -> Argo CD chain as every other
 deployment-specific value -- never a `kubectl set env`/`kubectl patch`, an
-unmanaged ConfigMap, or a manual Argo CD Application edit. Every workflow run
-also packages a new chart version (`0.1.<run_number>`, already strictly
-increasing), so Argo CD always reconciles a fresh revision; the monitor image
-itself is rebuilt only when `monitoring/monitor`'s content actually changes
-(content-addressed tag), so a CloudWatch-only toggle never triggers an
-unnecessary image rebuild.
+unmanaged ConfigMap, or a manual Argo CD Application edit. Every workflow
+*attempt* packages its own chart version (`0.<run_number>.<run_attempt>`, a
+valid SemVer, unique even across a rerun of the same run) and pushes it to
+the (mutable) Helm OCI repository, so Argo CD's `targetRevision` always
+points at a distinct, freshly reconciled revision -- no same-tag chart
+overwrite is ever required, including on rollback. The monitor image itself
+is rebuilt only when a Docker runtime input actually changes -- a
+deterministic Git-based hash (mode/blob id/path via `git ls-tree`) over
+exactly `Dockerfile`, `requirements.txt`, `monitor.py`, `collector.py`,
+`config.py`, `health_rules.py`, and `tools/**` (precisely what the
+Dockerfile `COPY`s); `README.md`, `requirements-test.txt`, and `tests/**`
+are deliberately excluded, so a README-only or tests-only change can never
+change the image tag or trigger a rebuild. Python setup, dependency
+install, syntax validation, and the full unit-test suite still run on
+*every* workflow execution regardless of whether the image already exists
+-- only the Docker daemon check, ECR login, build, and push are conditional
+on that.
 
 Before enabling (`enable_cloudwatch_publication=true`), the workflow runs a
 fail-closed preflight: it finds the currently running `gg-monitor` pod and,
@@ -216,6 +227,27 @@ runtimes do not yet have replication-process STATE rows.
 `kubectl patch`, and no observer/portal/STATE# change is required or
 performed -- Argo CD simply reconciles `CLOUDWATCH_PUBLISH_ENABLED` back to
 `false`, and the same post-deployment verification confirms it.
+
+### `CONFIG.metricsEnabled` ownership -- this workflow never mutates it
+
+`envs/dev/dynamodb.tf` seeds each canonical deployment's `CONFIG` item
+**once**, with `metricsEnabled = false`, and carries
+`lifecycle { ignore_changes = [item] }` -- so Terraform's own `apply` never
+updates an already-existing `CONFIG` item afterwards, including
+`metricsEnabled`. There is therefore no "just re-apply Terraform with the
+value flipped" path: tuning an existing item is, by this table's own
+design, outside Terraform's reach once it has been seeded.
+
+Phase 4D2's preflight and post-rollout steps only ever **read**
+`CONFIG.metricsEnabled` (`GetItem`, never a write, never a `Scan`) to decide
+whether to proceed -- they never set it. Live CloudWatch activation
+therefore stays blocked in practice until a **separate, independently
+approved** controlled CONFIG-update mechanism sets `metricsEnabled` to the
+literal Boolean `true` for every enabled deployment; that mechanism does not
+exist yet and is explicitly out of scope for this phase. Deploying (or
+rolling back) `CLOUDWATCH_PUBLISH_ENABLED=false` never requires any
+`CONFIG` mutation at all -- the hard kill switch and the CONFIG gate are
+independent, and disabling only ever touches the Helm/Argo CD side.
 
 ### Operator-side CloudWatch validation (manual, out of band)
 

@@ -132,11 +132,29 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Content-addressed tag: calculated from the Git tree SHA of
-          # monitoring/monitor alone (never the overall commit SHA), so a
-          # Helm-only or values-only change never produces a new tag, and
-          # the existing image is reused.
-          MONITOR_TREE_SHA="$(git rev-parse "HEAD:${MONITOR_SOURCE_PATH}")"
+          # Content-addressed tag: a deterministic Git-based hash (mode,
+          # blob id, path -- via `git ls-tree`) over exactly the paths the
+          # Dockerfile actually COPYs into the runtime image, never the
+          # overall commit SHA and never the whole monitoring/monitor tree.
+          # README.md, requirements-test.txt, and tests/** are deliberately
+          # excluded: the Dockerfile never reads them, so a README-only or
+          # tests-only change must never produce a new tag/rebuild.
+          MONITOR_IMAGE_INPUT_PATHS=(
+            "${MONITOR_SOURCE_PATH}/Dockerfile"
+            "${MONITOR_SOURCE_PATH}/requirements.txt"
+            "${MONITOR_SOURCE_PATH}/monitor.py"
+            "${MONITOR_SOURCE_PATH}/collector.py"
+            "${MONITOR_SOURCE_PATH}/config.py"
+            "${MONITOR_SOURCE_PATH}/health_rules.py"
+            "${MONITOR_SOURCE_PATH}/tools"
+          )
+          MONITOR_LS_TREE="$(git ls-tree -r HEAD -- "${MONITOR_IMAGE_INPUT_PATHS[@]}")"
+          if [ -z "$MONITOR_LS_TREE" ]; then
+            echo "No tracked files found under the expected monitor image input paths -- refusing to compute an empty-input hash."
+            printf '%s\n' "${MONITOR_IMAGE_INPUT_PATHS[@]}"
+            exit 1
+          fi
+          MONITOR_TREE_SHA="$(echo "$MONITOR_LS_TREE" | LC_ALL=C sort | git hash-object --stdin)"
           MONITOR_IMAGE_TAG="mon-${MONITOR_TREE_SHA:0:12}"
 
           # MONITOR_ECR_REPOSITORY (short name) stays reserved for AWS CLI
@@ -150,7 +168,7 @@ jobs:
             exit 1
           fi
 
-          echo "Monitor tree SHA (monitoring/monitor): ${MONITOR_TREE_SHA}"
+          echo "Monitor runtime-input hash (Dockerfile/requirements.txt/monitor.py/collector.py/config.py/health_rules.py/tools): ${MONITOR_TREE_SHA}"
           echo "Monitor image tag: ${MONITOR_IMAGE_TAG}"
           echo "Monitor ECR repository (short name, for AWS CLI): ${MONITOR_ECR_REPOSITORY}"
           echo "Monitor image repository (full URI): ${MONITOR_IMAGE_REPOSITORY}"
@@ -269,8 +287,11 @@ jobs:
             fi
           fi
 
+      # Python setup, dependency install, syntax validation, and the full
+      # unit-test suite run on EVERY execution, regardless of IMAGE_EXISTED
+      # -- an existing/reused runtime image must never skip test coverage
+      # for the source that produced it.
       - name: Set up Python
-        if: env.IMAGE_EXISTED != 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -280,7 +301,6 @@ jobs:
             monitoring/monitor/requirements-test.txt
 
       - name: Install monitor runtime and test dependencies
-        if: env.IMAGE_EXISTED != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -290,7 +310,6 @@ jobs:
             -r "${MONITOR_SOURCE_PATH}/requirements-test.txt"
 
       - name: Validate monitor Python syntax
-        if: env.IMAGE_EXISTED != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -299,15 +318,14 @@ jobs:
           python3 -m compileall -q "${MONITOR_SOURCE_PATH}"
 
       - name: Run monitor unit tests
-        if: env.IMAGE_EXISTED != 'true'
         shell: bash
         run: |
           set -euo pipefail
 
           python3 -m unittest discover -s "${MONITOR_SOURCE_PATH}/tests" -p "test_*.py" -v
 
-      # Everything below only runs when the content-addressed image is
-      # actually missing from ECR. A reused image executes no Docker
+      # Everything below only runs when the content-addressed runtime image
+      # is actually missing from ECR. A reused image executes no Docker
       # command at all -- not even a version or daemon check.
       - name: Verify Docker binary and daemon are functional
         if: env.IMAGE_EXISTED != 'true'
@@ -496,7 +514,12 @@ jobs:
             exit 1
           fi
 
-          CHART_VERSION="0.1.${{ github.run_number }}"
+          # Valid SemVer containing both run_number and run_attempt: the
+          # Helm ECR repository is mutable, and a workflow RERUN keeps the
+          # same run_number but increments run_attempt, so run_number alone
+          # would silently overwrite/reuse an existing OCI chart tag on
+          # rerun. Every attempt of every run gets its own chart version.
+          CHART_VERSION="0.${{ github.run_number }}.${{ github.run_attempt }}"
           TEMP_CHART_PATH="work/charts/goldengate-monitor"
           HELM_ECR_REPOSITORY="${HELM_OCI_NAMESPACE}/${CHART_NAME}"
           HELM_PUSH_URL="oci://${ECR_REGISTRY}/${HELM_OCI_NAMESPACE}"
@@ -1162,11 +1185,18 @@ jobs:
           echo "enable_cloudwatch_publication=true requested -- verifying CONFIG.metricsEnabled is literal Boolean true for every enabled canonical deployment before the Argo CD Application is touched."
           echo "This never uses DynamoDB Scan, never broadens IAM, and never constructs a CloudWatch client -- it reuses the existing running monitor pod's own IRSA (GoldenGateMonitorReadRole-dev) via a bounded kubectl exec, one GetItem per enabled deployment."
 
-          POD_NAME="$(kubectl get pods -n "$TARGET_NAMESPACE" -l app.kubernetes.io/name=gg-monitor -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+          # A Ready pod only -- never a blind .items[0] (which could select a
+          # Pending/CrashLooping/Terminating pod). Only the pod name is ever
+          # captured; the full pod object is never printed.
+          POD_NAME="$(kubectl get pods -n "$TARGET_NAMESPACE" -l app.kubernetes.io/name=gg-monitor -o json 2>/dev/null \
+            | jq -r '[.items[] | select(.status.phase == "Running"
+                and ((.status.containerStatuses // []) | length > 0)
+                and ((.status.containerStatuses // []) | all(.ready == true)))]
+              | .[0].metadata.name // empty' 2>/dev/null || true)"
           if [ -z "$POD_NAME" ]; then
             echo ""
-            echo "PREREQUISITE NOT MET: no running gg-monitor pod found in namespace ${TARGET_NAMESPACE}."
-            echo "CONFIG.metricsEnabled cannot be verified without an authenticated read path, and this workflow never bypasses that check merely because the monitor does not exist yet."
+            echo "PREREQUISITE NOT MET: no Ready gg-monitor pod found in namespace ${TARGET_NAMESPACE}."
+            echo "CONFIG.metricsEnabled cannot be verified without an authenticated read path, and this workflow never bypasses that check merely because the monitor does not exist yet or is not Ready."
             echo ""
             echo "Prerequisite: first deploy the monitor with enable_cloudwatch_publication=false (the default), confirm it is Ready, then re-run this workflow with enable_cloudwatch_publication=true."
             exit 1
@@ -1176,9 +1206,9 @@ jobs:
           # Canonical enabled-deployment names, discovered the same way the
           # SecretProviderClass-alias check above does -- never hardcoded.
           mapfile -t ENABLED_DEPLOYMENTS < <(awk '
-            /^\s*-\s*name:/ { if (name != "" && enabled == "true") print name; name=$0; sub(/^\s*-\s*name:\s*/, "", name); gsub(/["\x27\r]/, "", name); enabled="" }
-            /^\s*enabled:\s*true/ { enabled="true" }
-            /^\s*enabled:\s*false/ { enabled="false" }
+            /^[[:space:]]*-[[:space:]]*name:/ { if (name != "" && enabled == "true") print name; name=$0; sub(/^[[:space:]]*-[[:space:]]*name:[[:space:]]*/, "", name); gsub(/["\x27\r]/, "", name); enabled="" }
+            /^[[:space:]]*enabled:[[:space:]]*true/ { enabled="true" }
+            /^[[:space:]]*enabled:[[:space:]]*false/ { enabled="false" }
             END { if (name != "" && enabled == "true") print name }
           ' envs/dev/goldengate-deployments.yaml)
 
@@ -1343,9 +1373,15 @@ jobs:
           fi
           echo "OK: gg-monitor has ${READY_REPLICAS} ready replica(s)."
 
-          POD_NAME="$(kubectl get pods -n "$TARGET_NAMESPACE" -l app.kubernetes.io/name=gg-monitor -o jsonpath='{.items[0].metadata.name}')"
+          # A Ready pod only -- never a blind .items[0]. Only the pod name is
+          # ever captured; the full pod object is never printed.
+          POD_NAME="$(kubectl get pods -n "$TARGET_NAMESPACE" -l app.kubernetes.io/name=gg-monitor -o json \
+            | jq -r '[.items[] | select(.status.phase == "Running"
+                and ((.status.containerStatuses // []) | length > 0)
+                and ((.status.containerStatuses // []) | all(.ready == true)))]
+              | .[0].metadata.name // empty')"
           if [ -z "$POD_NAME" ]; then
-            echo "FAIL: no gg-monitor pod found in ${TARGET_NAMESPACE}."
+            echo "FAIL: no Ready gg-monitor pod found in ${TARGET_NAMESPACE}."
             exit 1
           fi
           echo "Pod: ${POD_NAME}"
@@ -1471,9 +1507,9 @@ jobs:
 
             echo "Re-verifying CONFIG.metricsEnabled via the running (post-rollout) pod..."
             mapfile -t ENABLED_DEPLOYMENTS_POST < <(awk '
-              /^\s*-\s*name:/ { if (name != "" && enabled == "true") print name; name=$0; sub(/^\s*-\s*name:\s*/, "", name); gsub(/["\x27\r]/, "", name); enabled="" }
-              /^\s*enabled:\s*true/ { enabled="true" }
-              /^\s*enabled:\s*false/ { enabled="false" }
+              /^[[:space:]]*-[[:space:]]*name:/ { if (name != "" && enabled == "true") print name; name=$0; sub(/^[[:space:]]*-[[:space:]]*name:[[:space:]]*/, "", name); gsub(/["\x27\r]/, "", name); enabled="" }
+              /^[[:space:]]*enabled:[[:space:]]*true/ { enabled="true" }
+              /^[[:space:]]*enabled:[[:space:]]*false/ { enabled="false" }
               END { if (name != "" && enabled == "true") print name }
             ' envs/dev/goldengate-deployments.yaml)
             for name in "${ENABLED_DEPLOYMENTS_POST[@]}"; do
