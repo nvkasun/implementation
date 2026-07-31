@@ -260,6 +260,40 @@ class CloudWatchGateTests(unittest.TestCase):
         self.assertTrue(core.cloudwatch_enabled_for({"metricsEnabled": True}))
         core.CLOUDWATCH_PUBLISH_ENABLED = False
 
+    def test_metrics_enabled_must_be_literal_true(self):
+        core.CLOUDWATCH_PUBLISH_ENABLED = True
+        try:
+            for bad_value in ("true", "false", 1, 0, {"reachable": True}, [True], None):
+                with self.subTest(bad_value=bad_value):
+                    self.assertFalse(core.cloudwatch_enabled_for({"metricsEnabled": bad_value}))
+            self.assertFalse(core.cloudwatch_enabled_for({}))  # missing value
+            self.assertTrue(core.cloudwatch_enabled_for({"metricsEnabled": True}))
+        finally:
+            core.CLOUDWATCH_PUBLISH_ENABLED = False
+
+    def test_publish_enabled_env_gate_must_be_literal_true(self):
+        # Even if a caller (or a future refactor) assigned a non-Boolean
+        # truthy value to the module-level switch, the gate must not accept
+        # it via truthiness.
+        core.CLOUDWATCH_PUBLISH_ENABLED = "true"
+        try:
+            self.assertFalse(core.cloudwatch_enabled_for({"metricsEnabled": True}))
+        finally:
+            core.CLOUDWATCH_PUBLISH_ENABLED = False
+
+    def test_env_parser_accepts_only_trimmed_case_insensitive_true(self):
+        for accepted in ("true", "True", "TRUE", "  true  ", "TrUe"):
+            with self.subTest(accepted=accepted):
+                self.assertTrue(core._parse_strict_bool_env(accepted))
+
+    def test_env_parser_rejects_permissive_aliases_and_arbitrary_strings(self):
+        for rejected in ("1", "yes", "on", "false", "0", "no", "off", "enabled", "TRUE!", "", " "):
+            with self.subTest(rejected=rejected):
+                self.assertFalse(core._parse_strict_bool_env(rejected))
+
+    def test_env_parser_rejects_missing_value(self):
+        self.assertFalse(core._parse_strict_bool_env(None))
+
 
 class NoActiveHealingTests(unittest.TestCase):
     def test_no_kubernetes_client_import(self):
@@ -671,6 +705,79 @@ class PublishMetricBatchTests(unittest.TestCase):
         cw.put_metric_data.assert_not_called()
 
 
+class PublishMetricsIfEnabledTests(unittest.TestCase):
+    """Phase 4D1 correction: publish_metrics_if_enabled is the single
+    protected publication boundary -- it must construct no CloudWatch
+    client while either gate is false, and a client-construction failure
+    must never raise or reach a raw-exception log path."""
+
+    METRIC_DATA = [{"MetricName": "AbendState", "Dimensions": [], "Value": 0.0, "Unit": "Count"}]
+
+    def setUp(self):
+        core.CLOUDWATCH_PUBLISH_ENABLED = False
+
+    def tearDown(self):
+        core.CLOUDWATCH_PUBLISH_ENABLED = False
+
+    def test_no_client_constructed_when_publish_enabled_env_false(self):
+        core.CLOUDWATCH_PUBLISH_ENABLED = False
+        with mock.patch.object(core, "_cloudwatch_client") as client_fn, \
+             mock.patch.object(core, "publish_metric_batch") as publish_fn:
+            core.publish_metrics_if_enabled({"metricsEnabled": True}, "gg-x", self.METRIC_DATA)
+        client_fn.assert_not_called()
+        publish_fn.assert_not_called()
+
+    def test_no_client_constructed_when_metrics_enabled_false(self):
+        core.CLOUDWATCH_PUBLISH_ENABLED = True
+        with mock.patch.object(core, "_cloudwatch_client") as client_fn, \
+             mock.patch.object(core, "publish_metric_batch") as publish_fn:
+            core.publish_metrics_if_enabled({"metricsEnabled": False}, "gg-x", self.METRIC_DATA)
+        client_fn.assert_not_called()
+        publish_fn.assert_not_called()
+
+    def test_client_constructed_and_publish_called_when_both_gates_true(self):
+        core.CLOUDWATCH_PUBLISH_ENABLED = True
+        fake_cw = MagicMock()
+        with mock.patch.object(core, "_cloudwatch_client", return_value=fake_cw) as client_fn, \
+             mock.patch.object(core, "publish_metric_batch") as publish_fn:
+            core.publish_metrics_if_enabled({"metricsEnabled": True}, "gg-x", self.METRIC_DATA)
+        client_fn.assert_called_once()
+        publish_fn.assert_called_once_with(fake_cw, self.METRIC_DATA, pipeline="gg-x")
+
+    def test_client_construction_exception_never_escapes(self):
+        core.CLOUDWATCH_PUBLISH_ENABLED = True
+        with mock.patch.object(core, "_cloudwatch_client", side_effect=RuntimeError("boom")), \
+             mock.patch.object(core, "publish_metric_batch") as publish_fn:
+            core.publish_metrics_if_enabled({"metricsEnabled": True}, "gg-x", self.METRIC_DATA)  # must not raise
+        publish_fn.assert_not_called()
+
+    def test_client_construction_failure_log_has_only_safe_keys(self):
+        core.CLOUDWATCH_PUBLISH_ENABLED = True
+        with mock.patch.object(core, "_cloudwatch_client", side_effect=RuntimeError("boom")):
+            with self.assertLogs(core.logger, level="ERROR") as log_ctx:
+                core.publish_metrics_if_enabled({"metricsEnabled": True}, "gg-oracle-payments-01", self.METRIC_DATA)
+        record = json.loads(log_ctx.records[0].getMessage())
+        self.assertEqual(record["event"], "cloudwatch_client_creation_failed")
+        self.assertEqual(record["deployment"], "gg-oracle-payments-01")
+        self.assertEqual(record["errorCategory"], "RuntimeError")
+        self.assertEqual(set(record.keys()), {"event", "deployment", "errorCategory"})
+
+    def test_client_construction_failure_log_has_no_raw_exception_text(self):
+        core.CLOUDWATCH_PUBLISH_ENABLED = True
+        secret_message = (
+            "arn:aws:sts::668311715351:assumed-role/GoldenGateMonitorReadRole-dev/i-0123456789abcdef "
+            "AccessDenied for host gg-oracle-payments-01.goldengate-dev.svc.cluster.local "
+            "process EXTORA1 secret=/mnt/secrets-store/dev-goldengate-source-admin")
+        with mock.patch.object(core, "_cloudwatch_client", side_effect=RuntimeError(secret_message)):
+            with self.assertLogs(core.logger, level="ERROR") as log_ctx:
+                core.publish_metrics_if_enabled({"metricsEnabled": True}, "gg-oracle-payments-01", self.METRIC_DATA)
+        combined = "\n".join(log_ctx.output)
+        for forbidden in ("arn:aws", "GoldenGateMonitorReadRole-dev", "i-0123456789abcdef",
+                         "goldengate-dev.svc.cluster.local", "EXTORA1", "/mnt/secrets-store",
+                         "AccessDenied", "Traceback", "boom"):
+            self.assertNotIn(forbidden, combined)
+
+
 class PublishMetricBatchFailureLoggingTests(unittest.TestCase):
     """Phase 4D1 correction: a PutMetricData failure must never crash the
     caller and must be logged with only safe, closed fields -- never a raw
@@ -749,7 +856,8 @@ class MetricPublicationIntegrationTests(unittest.TestCase):
         "pipeline": "payments-ora-to-pg-001",
     }
 
-    def _run_tick(self, leader=True, fence_write=False, cloudwatch_enabled=True, raise_on_fetch=False):
+    def _run_tick(self, leader=True, fence_write=False, cloudwatch_enabled=True, raise_on_fetch=False,
+                 client_construction_fails=False):
         stop_event = threading.Event()
 
         def fake_get_item(Key):
@@ -776,6 +884,15 @@ class MetricPublicationIntegrationTests(unittest.TestCase):
                 raise RuntimeError("admin rest down")
             return []
 
+        def fake_cw_client():
+            cw_client_calls.append(1)
+            if client_construction_fails:
+                raise RuntimeError(
+                    "arn:aws:sts::668311715351:assumed-role/GoldenGateMonitorReadRole-dev/i-0123456789abcdef "
+                    "AccessDenied for host gg-oracle-payments-01.goldengate-dev.svc.cluster.local "
+                    "process EXTORA1 secret=/mnt/secrets-store/dev-goldengate-source-admin")
+            return MagicMock()
+
         with tempfile.TemporaryDirectory() as tmp:
             user_file = os.path.join(tmp, "user")
             pwd_file = os.path.join(tmp, "pwd")
@@ -792,42 +909,90 @@ class MetricPublicationIntegrationTests(unittest.TestCase):
                      mock.patch.object(core, "_build_ssl_context", return_value=MagicMock()), \
                      mock.patch.object(core, "probe_critical_services",
                                        return_value={"adminsrvr": True, "distsrvr": True}), \
-                     mock.patch.object(core, "_cloudwatch_client",
-                                       side_effect=lambda: cw_client_calls.append(1) or MagicMock()), \
+                     mock.patch.object(core, "_cloudwatch_client", side_effect=fake_cw_client), \
                      mock.patch.object(core, "publish_metric_batch",
                                        side_effect=lambda cw, md, pipeline=None: publish_calls.append(md)):
-                    core.polling_loop(self.DEPLOYMENT, table, mgr, state, stop_event)
+                    with self.assertLogs(core.logger, level="INFO") as log_ctx:
+                        core.polling_loop(self.DEPLOYMENT, table, mgr, state, stop_event)
             finally:
                 core.CLOUDWATCH_PUBLISH_ENABLED = False
 
-        return publish_calls, cw_client_calls
+        return publish_calls, cw_client_calls, table, log_ctx
 
     def test_heartbeat_emitted_after_successful_up_write(self):
-        publish_calls, cw_calls = self._run_tick(leader=True, fence_write=False, cloudwatch_enabled=True)
+        publish_calls, cw_calls, _table, _log = self._run_tick(
+            leader=True, fence_write=False, cloudwatch_enabled=True)
         self.assertEqual(len(publish_calls), 1)
         self.assertIn("HeartbeatAgeSeconds", [m["MetricName"] for m in publish_calls[0]])
         self.assertEqual(len(cw_calls), 1)
 
     def test_heartbeat_emitted_after_successful_deployment_down_write(self):
-        publish_calls, cw_calls = self._run_tick(
+        publish_calls, cw_calls, _table, _log = self._run_tick(
             leader=True, fence_write=False, cloudwatch_enabled=True, raise_on_fetch=True)
         self.assertEqual(len(publish_calls), 1)
         self.assertIn("HeartbeatAgeSeconds", [m["MetricName"] for m in publish_calls[0]])
 
     def test_standby_emits_no_heartbeat(self):
-        publish_calls, cw_calls = self._run_tick(leader=False, cloudwatch_enabled=True)
+        publish_calls, cw_calls, _table, _log = self._run_tick(leader=False, cloudwatch_enabled=True)
         self.assertEqual(publish_calls, [])
         self.assertEqual(cw_calls, [])
 
     def test_failed_state_write_emits_no_heartbeat(self):
-        publish_calls, cw_calls = self._run_tick(leader=True, fence_write=True, cloudwatch_enabled=True)
+        publish_calls, cw_calls, _table, _log = self._run_tick(
+            leader=True, fence_write=True, cloudwatch_enabled=True)
         self.assertEqual(publish_calls, [])
         self.assertEqual(cw_calls, [])
 
     def test_no_cloudwatch_client_while_disabled(self):
-        publish_calls, cw_calls = self._run_tick(leader=True, fence_write=False, cloudwatch_enabled=False)
+        publish_calls, cw_calls, _table, _log = self._run_tick(
+            leader=True, fence_write=False, cloudwatch_enabled=False)
         self.assertEqual(publish_calls, [])
         self.assertEqual(cw_calls, [])
+
+    def test_client_construction_failure_never_raises_and_publishes_nothing(self):
+        publish_calls, cw_calls, _table, _log = self._run_tick(
+            leader=True, fence_write=False, cloudwatch_enabled=True, client_construction_fails=True)
+        self.assertEqual(len(cw_calls), 1)
+        self.assertEqual(publish_calls, [])  # publish_metric_batch never reached
+
+    def test_client_construction_failure_leaves_state_deployment_write_successful(self):
+        publish_calls, cw_calls, table, _log = self._run_tick(
+            leader=True, fence_write=False, cloudwatch_enabled=True, client_construction_fails=True)
+        deployment_writes = [c for c in table.update_item.call_args_list
+                             if c.kwargs["Key"].get("recordType") == "STATE#_deployment"]
+        self.assertEqual(len(deployment_writes), 1)
+
+    def test_client_construction_failure_does_not_produce_outer_tick_failed_log(self):
+        _publish_calls, _cw_calls, _table, log_ctx = self._run_tick(
+            leader=True, fence_write=False, cloudwatch_enabled=True, client_construction_fails=True)
+        combined = "\n".join(log_ctx.output)
+        self.assertNotIn("tick failed for", combined)
+        self.assertNotIn("Traceback", combined)
+
+    def test_client_construction_failure_log_contains_only_documented_safe_keys(self):
+        _publish_calls, _cw_calls, _table, log_ctx = self._run_tick(
+            leader=True, fence_write=False, cloudwatch_enabled=True, client_construction_fails=True)
+        matches = [r for r in log_ctx.records if "cloudwatch_client_creation_failed" in r.getMessage()]
+        self.assertEqual(len(matches), 1)
+        record = json.loads(matches[0].getMessage())
+        self.assertEqual(record["event"], "cloudwatch_client_creation_failed")
+        self.assertEqual(record["deployment"], "gg-oracle-payments-01")
+        self.assertEqual(record["errorCategory"], "RuntimeError")
+        self.assertEqual(set(record.keys()), {"event", "deployment", "errorCategory"})
+
+    def test_client_construction_failure_log_contains_no_raw_internal_detail(self):
+        # Scoped to the cloudwatch_client_creation_failed record itself --
+        # unrelated startup INFO logging legitimately includes the
+        # deployment's own admin hostname and is not part of this check.
+        _publish_calls, _cw_calls, _table, log_ctx = self._run_tick(
+            leader=True, fence_write=False, cloudwatch_enabled=True, client_construction_fails=True)
+        matches = [r for r in log_ctx.records if "cloudwatch_client_creation_failed" in r.getMessage()]
+        self.assertEqual(len(matches), 1)
+        failure_message = matches[0].getMessage()
+        for forbidden in ("arn:aws", "GoldenGateMonitorReadRole-dev", "i-0123456789abcdef",
+                         "goldengate-dev.svc.cluster.local", "EXTORA1", "/mnt/secrets-store",
+                         "AccessDenied", "Traceback"):
+            self.assertNotIn(forbidden, failure_message)
 
 
 class LoggerHierarchyIntegrationTests(unittest.TestCase):

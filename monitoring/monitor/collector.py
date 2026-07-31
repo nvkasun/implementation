@@ -57,9 +57,12 @@ CLOUDWATCH_NAMESPACE = "GoldenGate/Pipelines"
 
 
 def _parse_strict_bool_env(raw):
+    """Only a trimmed, case-insensitive "true" parses to True. "1", "yes",
+    "on", "false", any other non-empty string, and a missing value all
+    parse to False -- no permissive truthy-string aliases."""
     if raw is None:
         return False
-    return str(raw).strip().lower() in ("true", "1", "yes")
+    return str(raw).strip().lower() == "true"
 
 
 # Hard CloudWatch kill switch, independent of CONFIG.metricsEnabled: CONFIG
@@ -70,7 +73,14 @@ CLOUDWATCH_PUBLISH_ENABLED = _parse_strict_bool_env(os.environ.get("CLOUDWATCH_P
 
 
 def cloudwatch_enabled_for(cfg):
-    return CLOUDWATCH_PUBLISH_ENABLED and bool(cfg.get("metricsEnabled", False))
+    """Fail-closed by identity, not truthiness: neither side of this gate
+    may be satisfied by "true"/"false" strings, 1/0, or any other
+    truthy/falsy non-Boolean value -- only the literal Boolean True on both
+    sides enables publication. Deliberately does not rely on
+    health_rules.resolve_config to have already normalized this field; the
+    gate itself must fail closed even if a malformed CONFIG item reaches it
+    directly."""
+    return CLOUDWATCH_PUBLISH_ENABLED is True and cfg.get("metricsEnabled") is True
 
 
 def _ddb_safe(v):
@@ -1012,6 +1022,32 @@ def publish_metric_batch(cw, metric_data, pipeline=None):
             }))
 
 
+def publish_metrics_if_enabled(cfg, pipeline, metric_data):
+    """The single protected publication boundary both polling_loop call
+    sites (Admin-REST-down and normal-UP) must go through. Re-checks the
+    strict double gate itself (fail closed even if a caller's own check
+    were ever removed), constructs no CloudWatch client while disabled, and
+    never lets a client-construction failure raise, log a raw
+    exception/traceback, or reach the outer per-tick exception handler --
+    it is caught here, logged with only closed/safe fields, and the
+    function returns. The already-written DynamoDB deployment status is
+    unaffected either way, and no retry is attempted, matching
+    publish_metric_batch's own one-attempt semantics for the PutMetricData
+    call that follows."""
+    if not cloudwatch_enabled_for(cfg):
+        return
+    try:
+        cw = _cloudwatch_client()
+    except Exception as exc:
+        logger.error(json.dumps({
+            "event": "cloudwatch_client_creation_failed",
+            "deployment": pipeline,
+            "errorCategory": type(exc).__name__,
+        }))
+        return
+    publish_metric_batch(cw, metric_data, pipeline=pipeline)
+
+
 class _FencedOff(Exception):
     pass
 
@@ -1191,9 +1227,8 @@ def polling_loop(deployment, table, mgr, state, stop_event):
                 # even though GoldenGate is unreachable, so the heartbeat
                 # still fires here (shared-monitor semantics; see
                 # build_metric_batch's heartbeat_ok docstring).
-                if cloudwatch_enabled_for(cfg):
-                    metric_data = build_metric_batch(pipeline, deployment_type, flags, heartbeat_ok=True)
-                    publish_metric_batch(_cloudwatch_client(), metric_data, pipeline=pipeline)
+                metric_data = build_metric_batch(pipeline, deployment_type, flags, heartbeat_ok=True)
+                publish_metrics_if_enabled(cfg, pipeline, metric_data)
                 _sleep_watching_leadership(interval)
                 continue
 
@@ -1270,11 +1305,10 @@ def polling_loop(deployment, table, mgr, state, stop_event):
             last_dep_status = "UP"
 
             # The _deployment write above just succeeded -- heartbeat fires.
-            if cloudwatch_enabled_for(cfg):
-                metric_data = build_metric_batch(pipeline, deployment_type, flags, procs=procs,
-                                                 critical_service_status=svc_up,
-                                                 abend_events=abend_event_names, heartbeat_ok=True)
-                publish_metric_batch(_cloudwatch_client(), metric_data, pipeline=pipeline)
+            metric_data = build_metric_batch(pipeline, deployment_type, flags, procs=procs,
+                                             critical_service_status=svc_up,
+                                             abend_events=abend_event_names, heartbeat_ok=True)
+            publish_metrics_if_enabled(cfg, pipeline, metric_data)
 
         except _FencedOff:
             pass

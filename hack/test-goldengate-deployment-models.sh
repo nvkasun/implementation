@@ -668,6 +668,45 @@ else
   pass "hack/comma.yaml removed"
 fi
 
+# ---------------------------------------------------------------------
+# 18. Phase 4D1 final correction: strict identity-based two-factor gate,
+#     and CloudWatch client construction moved behind a sanitized,
+#     non-raising protected publication boundary.
+# ---------------------------------------------------------------------
+echo ""
+echo "--- Phase 4D1 correction: strict gate and protected publication boundary ---"
+
+if grep -q 'return str(raw).strip().lower() == "true"' "$COLLECTOR_SRC" 2>/dev/null; then
+  pass "_parse_strict_bool_env accepts only a trimmed, case-insensitive \"true\""
+else
+  fail "_parse_strict_bool_env no longer uses exact-match \"true\" parsing"
+fi
+
+if grep -q 'CLOUDWATCH_PUBLISH_ENABLED is True and cfg.get("metricsEnabled") is True' "$COLLECTOR_SRC" 2>/dev/null; then
+  pass "cloudwatch_enabled_for uses literal Boolean identity checks on both sides of the gate"
+else
+  fail "cloudwatch_enabled_for no longer uses strict identity checks"
+fi
+
+if grep -q "def publish_metrics_if_enabled" "$COLLECTOR_SRC" 2>/dev/null; then
+  pass "collector.py defines the single protected publication boundary (publish_metrics_if_enabled)"
+else
+  fail "collector.py is missing publish_metrics_if_enabled"
+fi
+
+if grep -q '"event": "cloudwatch_client_creation_failed"' "$COLLECTOR_SRC" 2>/dev/null; then
+  pass "CloudWatch client-construction failure is logged as a sanitized structured event"
+else
+  fail "collector.py is missing the sanitized cloudwatch_client_creation_failed log event"
+fi
+
+DIRECT_CLIENT_CALLS="$(grep -c '_cloudwatch_client()' "$COLLECTOR_SRC" 2>/dev/null || true)"
+if [ "${DIRECT_CLIENT_CALLS:-0}" -eq 2 ]; then
+  pass "_cloudwatch_client() is only referenced in its definition and inside publish_metrics_if_enabled (both polling_loop call sites go through the boundary)"
+else
+  fail "_cloudwatch_client() is referenced ${DIRECT_CLIENT_CALLS:-0} times -- expected exactly 2 (definition + protected boundary)"
+fi
+
 echo ""
 echo "=================================================="
 echo "Summary: ${PASS_COUNT} passed, ${FAIL_COUNT} failed, ${SKIP_COUNT} skipped"

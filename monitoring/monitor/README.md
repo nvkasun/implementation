@@ -140,11 +140,23 @@ never emits it. If the shared monitor stops publishing entirely, a future
 CloudWatch alarm with `treat_missing_data=breaching` is the dead-man signal
 -- there is no local heartbeat file.
 
-`collector.publish_metric_batch` is the only half that calls boto3, and is
-only ever invoked behind `cloudwatch_enabled_for(cfg)`
-(`CLOUDWATCH_PUBLISH_ENABLED=true` **and** `CONFIG.metricsEnabled=true`).
-The deployed Helm default keeps `CLOUDWATCH_PUBLISH_ENABLED=false`, so no
-CloudWatch client is ever constructed in the current deployment.
+`collector.publish_metrics_if_enabled` is the single protected publication
+boundary both polling_loop metric call sites (Admin-REST-down and normal-UP)
+go through -- the only code that constructs a CloudWatch client
+(`_cloudwatch_client`) or calls `publish_metric_batch` (the only half that
+calls `put_metric_data`). It gates on `cloudwatch_enabled_for(cfg)`, which
+requires literal Boolean `True` on both sides by identity, not truthiness:
+`CLOUDWATCH_PUBLISH_ENABLED is True` (parsed from the env var by
+`_parse_strict_bool_env`, which itself accepts only a trimmed,
+case-insensitive `"true"` -- `"1"`, `"yes"`, `"on"`, `"false"`, and any other
+string all parse to `False`) **and** `cfg.get("metricsEnabled") is True`. A
+CloudWatch client-construction failure (e.g. an IAM/credential problem) is
+caught inside this boundary, logged as a sanitized `cloudwatch_client_creation_failed`
+event (`event`/`deployment`/`errorCategory` only -- never a raw exception,
+traceback, ARN, or hostname), and returns without raising or touching the
+DynamoDB deployment status already written that tick. The deployed Helm
+default keeps `CLOUDWATCH_PUBLISH_ENABLED=false`, so no CloudWatch client is
+ever constructed in the current deployment.
 
 ## Contract-probe tool
 
