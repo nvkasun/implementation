@@ -707,6 +707,74 @@ else
   fail "_cloudwatch_client() is referenced ${DIRECT_CLIENT_CALLS:-0} times -- expected exactly 2 (definition + protected boundary)"
 fi
 
+# ---------------------------------------------------------------------
+# 19. Phase 4D2: controlled DEV CloudWatch activation -- workflow_dispatch
+#     Boolean control, Argo CD ownership of the value, fail-closed CONFIG
+#     preflight (GetItem-only, no Scan, no new IAM), and post-deployment
+#     verification/rollback. Base Helm default stays disabled.
+# ---------------------------------------------------------------------
+echo ""
+echo "--- Phase 4D2: controlled CloudWatch DEV activation ---"
+
+if grep -q "publishEnabled: false" "${MONITOR_CHART}/values.yaml" 2>/dev/null; then
+  pass "helm/goldengate-monitor base chart default still keeps cloudwatch.publishEnabled: false"
+else
+  fail "helm/goldengate-monitor base chart no longer defaults cloudwatch.publishEnabled to false"
+fi
+
+if grep -q "cloudwatch" "envs/dev/goldengate-monitor/values.yaml" 2>/dev/null; then
+  fail "envs/dev/goldengate-monitor/values.yaml now overrides cloudwatch.publishEnabled -- activation must stay a per-run workflow input, not a persisted values override"
+else
+  pass "envs/dev/goldengate-monitor/values.yaml does not override cloudwatch.publishEnabled (base default governs unless a run explicitly requests otherwise)"
+fi
+
+if grep -q "enable_cloudwatch_publication:" "$MONITOR_WORKFLOW" 2>/dev/null \
+    && grep -A3 "enable_cloudwatch_publication:" "$MONITOR_WORKFLOW" | grep -q "type: boolean" \
+    && grep -A5 "enable_cloudwatch_publication:" "$MONITOR_WORKFLOW" | grep -q "default: false"; then
+  pass "goldengate-monitor.yaml defines enable_cloudwatch_publication as a required Boolean input defaulting to false"
+else
+  fail "goldengate-monitor.yaml is missing the expected enable_cloudwatch_publication Boolean workflow_dispatch input"
+fi
+
+if grep -q "name: CloudWatch publication preflight (CONFIG.metricsEnabled)" "$MONITOR_WORKFLOW" 2>/dev/null; then
+  pass "goldengate-monitor.yaml defines the CloudWatch publication preflight step"
+else
+  fail "goldengate-monitor.yaml is missing the CloudWatch publication preflight step"
+fi
+
+if grep -q "table.get_item(" "$MONITOR_WORKFLOW" 2>/dev/null \
+    && ! grep -qE '\.[Ss]can\(' "$MONITOR_WORKFLOW" 2>/dev/null; then
+  pass "goldengate-monitor.yaml's CloudWatch preflight uses GetItem only, never Scan"
+else
+  fail "goldengate-monitor.yaml's CloudWatch preflight no longer uses GetItem-only reads"
+fi
+
+if grep -q "PREREQUISITE NOT MET: no running gg-monitor pod found" "$MONITOR_WORKFLOW" 2>/dev/null; then
+  pass "goldengate-monitor.yaml documents the first-deployment prerequisite instead of bypassing the CONFIG check"
+else
+  fail "goldengate-monitor.yaml is missing the first-deployment prerequisite failure message"
+fi
+
+if grep -q -- "- name: cloudwatch.publishEnabled" "$MONITOR_WORKFLOW" 2>/dev/null \
+    && grep -q 'value: "\${CLOUDWATCH_PUBLISH_ENABLED_VALUE}"' "$MONITOR_WORKFLOW" 2>/dev/null; then
+  pass "goldengate-monitor.yaml persists the requested value through the Argo CD Application Helm parameters (same ownership path as image.repository/image.tag)"
+else
+  fail "goldengate-monitor.yaml no longer passes cloudwatch.publishEnabled through the Argo CD Application Helm parameters"
+fi
+
+if grep -q "cloudwatchPublishEnabled=" "$MONITOR_WORKFLOW" 2>/dev/null; then
+  pass "goldengate-monitor.yaml's runtime verification confirms the deployed CLOUDWATCH_PUBLISH_ENABLED value"
+else
+  fail "goldengate-monitor.yaml's runtime verification no longer confirms the deployed CLOUDWATCH_PUBLISH_ENABLED value"
+fi
+
+if grep -q "cloudwatch:ListMetrics" "$MONITOR_WORKFLOW" 2>/dev/null \
+    || grep -q "cloudwatch:GetMetricData" "$MONITOR_WORKFLOW" 2>/dev/null; then
+  fail "goldengate-monitor.yaml references a CloudWatch read IAM action -- none should ever be introduced for this phase"
+else
+  pass "goldengate-monitor.yaml introduces no CloudWatch read IAM action (ListMetrics/GetMetricData)"
+fi
+
 echo ""
 echo "=================================================="
 echo "Summary: ${PASS_COUNT} passed, ${FAIL_COUNT} failed, ${SKIP_COUNT} skipped"

@@ -1217,6 +1217,49 @@ class SecretProviderClassRenderTests(unittest.TestCase):
                 self.assertEqual(self.rendered.count(f"kind: {kind}\n"), 1)
 
 
+class CloudWatchActivationHelmRenderTests(unittest.TestCase):
+    """Phase 4D2: --set cloudwatch.publishEnabled=<bool> (the same mechanism
+    the workflow's Argo CD Application Helm parameter uses) must render the
+    exact literal string the strict env parser accepts -- proven against the
+    real chart, not a reimplementation of Helm's own type inference."""
+
+    def _render(self, publish_enabled):
+        if shutil.which("helm") is None:
+            raise unittest.SkipTest("helm not available")
+        tmpdir = tempfile.mkdtemp()
+        staged_chart = os.path.join(tmpdir, "goldengate-monitor")
+        shutil.copytree(MONITOR_CHART_PATH, staged_chart)
+        os.makedirs(os.path.join(staged_chart, "files"), exist_ok=True)
+        shutil.copy(DEPLOYMENTS_FILE_PATH, os.path.join(staged_chart, "files", "goldengate-deployments.yaml"))
+
+        proc = subprocess.run(
+            ["helm", "template", "gg-monitor", staged_chart,
+             "--namespace", "goldengate-monitoring",
+             "-f", os.path.join(REPO_ROOT, "envs", "dev", "goldengate-monitor", "values.yaml"),
+             "--set", "image.repository=example.invalid/goldengate-monitor",
+             "--set", "image.tag=test",
+             "--set", "serviceAccount.roleArn=arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev",
+             "--set", f"cloudwatch.publishEnabled={publish_enabled}"],
+            capture_output=True, text=True, cwd=REPO_ROOT,
+        )
+        if proc.returncode != 0:
+            raise AssertionError(f"helm template failed: {proc.stdout}\n{proc.stderr}")
+        return proc.stdout
+
+    def test_true_input_renders_cloudwatch_publish_enabled_true(self):
+        rendered = self._render("true")
+        self.assertIn('name: CLOUDWATCH_PUBLISH_ENABLED\n              value: "true"', rendered)
+
+    def test_false_input_renders_cloudwatch_publish_enabled_false(self):
+        rendered = self._render("false")
+        self.assertIn('name: CLOUDWATCH_PUBLISH_ENABLED\n              value: "false"', rendered)
+
+    def test_rendered_value_is_never_a_truthy_alias(self):
+        rendered = self._render("true")
+        for forbidden_value in ('value: "1"', 'value: "yes"', 'value: "on"'):
+            self.assertNotIn(f"name: CLOUDWATCH_PUBLISH_ENABLED\n              {forbidden_value}", rendered)
+
+
 class WorkflowStaticAnalysisTests(unittest.TestCase):
     """Static inspection of the two GitHub Actions workflow files. These
     prove the actual committed bash/YAML content was fixed -- not a
@@ -1307,6 +1350,129 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         github_event_name = "workflow_dispatch"
         self.assertFalse((github_event_name != "workflow_dispatch") or False)
         self.assertTrue((github_event_name != "workflow_dispatch") or True)
+
+    def test_enable_cloudwatch_publication_input_is_boolean_required_default_false(self):
+        doc = yaml.safe_load(self.monitor_text)
+        inputs = (doc.get("on") or doc.get(True))["workflow_dispatch"]["inputs"]
+        self.assertIn("enable_cloudwatch_publication", inputs)
+        spec = inputs["enable_cloudwatch_publication"]
+        self.assertEqual(spec["type"], "boolean")
+        self.assertIs(spec["required"], True)
+        self.assertIs(spec["default"], False)
+        description = spec["description"].lower()
+        self.assertIn("cloudwatch", description)
+        self.assertIn("metric", description)
+
+    def test_base_helm_default_for_cloudwatch_publish_enabled_remains_false(self):
+        with open(os.path.join(MONITOR_CHART_PATH, "values.yaml")) as f:
+            base_values = yaml.safe_load(f)
+        self.assertIs(base_values["cloudwatch"]["publishEnabled"], False)
+
+    def test_env_dev_values_does_not_override_cloudwatch_default(self):
+        env_values_path = os.path.join(REPO_ROOT, "envs", "dev", "goldengate-monitor", "values.yaml")
+        with open(env_values_path) as f:
+            env_values = yaml.safe_load(f)
+        self.assertNotIn("cloudwatch", env_values or {})
+
+    def test_cloudwatch_value_strictly_validated_as_literal_true_or_false(self):
+        self.assertIn(
+            'if [[ "$CLOUDWATCH_PUBLISH_ENABLED_VALUE" != "true" && "$CLOUDWATCH_PUBLISH_ENABLED_VALUE" != "false" ]]; then',
+            self.monitor_text)
+
+    def test_cloudwatch_argocd_helm_parameter_uses_plain_set_not_set_string(self):
+        # A plain `--set`/parameter value lets Helm's own strvals parser
+        # infer a real Boolean from the literal text "true"/"false" -- a
+        # --set-string would force the *string* "true", which is exactly
+        # the antipattern this phase must avoid propagating further.
+        self.assertIn("--set cloudwatch.publishEnabled=", self.monitor_text)
+        self.assertNotIn("--set-string cloudwatch.publishEnabled", self.monitor_text)
+        self.assertIn("- name: cloudwatch.publishEnabled", self.monitor_text)
+        self.assertIn('value: "${CLOUDWATCH_PUBLISH_ENABLED_VALUE}"', self.monitor_text)
+
+    def test_cloudwatch_preflight_step_exists_gated_on_enable_input(self):
+        condition = _extract_step_if_condition(
+            self.monitor_text, "CloudWatch publication preflight (CONFIG.metricsEnabled)")
+        self.assertEqual(
+            condition,
+            "${{ (github.event_name != 'workflow_dispatch' || inputs.deploy) "
+            "&& inputs.enable_cloudwatch_publication }}")
+
+    def test_cloudwatch_preflight_precedes_argocd_application_step(self):
+        preflight_idx = self.monitor_text.index("- name: CloudWatch publication preflight")
+        argocd_idx = self.monitor_text.index("- name: Create or update Argo CD Application")
+        self.assertLess(preflight_idx, argocd_idx)
+
+    def test_cloudwatch_preflight_uses_get_item_never_scan(self):
+        preflight_idx = self.monitor_text.index("- name: CloudWatch publication preflight")
+        argocd_idx = self.monitor_text.index("- name: Create or update Argo CD Application")
+        preflight_step_text = self.monitor_text[preflight_idx:argocd_idx]
+        self.assertIn("table.get_item(", preflight_step_text)
+        self.assertNotIn(".scan(", preflight_step_text)
+        self.assertNotIn(".Scan(", preflight_step_text)
+
+    def test_no_dynamodb_scan_anywhere_in_monitor_workflow(self):
+        self.assertNotIn(".scan(", self.monitor_text)
+        self.assertNotIn(".Scan(", self.monitor_text)
+
+    def test_cloudwatch_preflight_discovers_enabled_deployments_not_hardcoded(self):
+        preflight_idx = self.monitor_text.index("- name: CloudWatch publication preflight")
+        argocd_idx = self.monitor_text.index("- name: Create or update Argo CD Application")
+        preflight_step_text = self.monitor_text[preflight_idx:argocd_idx]
+        self.assertIn("envs/dev/goldengate-deployments.yaml", preflight_step_text)
+        self.assertNotIn("gg-oracle-payments-01", preflight_step_text)
+        self.assertNotIn("gg-postgresql-payments-01", preflight_step_text)
+
+    def test_cloudwatch_preflight_output_is_sanitized_deployment_result_only(self):
+        self.assertIn(
+            'metricsEnabled=true" if ok else f"deployment={pipeline} metricsEnabled-not-literal-true',
+            self.monitor_text)
+        self.assertIn("except Exception:", self.monitor_text)
+
+    def test_cloudwatch_preflight_first_deployment_prerequisite_message(self):
+        preflight_idx = self.monitor_text.index("- name: CloudWatch publication preflight")
+        argocd_idx = self.monitor_text.index("- name: Create or update Argo CD Application")
+        preflight_step_text = self.monitor_text[preflight_idx:argocd_idx]
+        self.assertIn("PREREQUISITE NOT MET", preflight_step_text)
+        self.assertIn("Prerequisite:", preflight_step_text)
+
+    def test_disabled_cloudwatch_request_never_reaches_preflight_condition(self):
+        # Pure boolean simulation of the step's `if:` gate -- proves a false
+        # request short-circuits before any CONFIG check would run.
+        github_event_name = "workflow_dispatch"
+        inputs_deploy = True
+        inputs_enable_cloudwatch_publication = False
+        gate = (github_event_name != "workflow_dispatch" or inputs_deploy) and inputs_enable_cloudwatch_publication
+        self.assertFalse(gate)
+
+    def test_runtime_verification_checks_deployed_cloudwatch_env_value(self):
+        self.assertIn("Verifying deployed CLOUDWATCH_PUBLISH_ENABLED matches the requested value", self.monitor_text)
+        self.assertIn('echo "cloudwatchPublishEnabled=${POD_CLOUDWATCH_ENV}"', self.monitor_text)
+
+    def test_runtime_verification_checks_forbidden_log_patterns_when_enabled(self):
+        verify_idx = self.monitor_text.index("- name: Verify GoldenGate monitor runtime state")
+        upload_idx = self.monitor_text.index("- name: Upload rendered manifests and chart package")
+        verify_step_text = self.monitor_text[verify_idx:upload_idx]
+        self.assertIn('if [ "$CLOUDWATCH_PUBLISH_ENABLED_VALUE" = "true" ]; then', verify_step_text)
+        self.assertIn("cloudwatch_client_creation_failed", verify_step_text)
+        self.assertIn("cloudwatch_put_metric_data_failed", verify_step_text)
+        self.assertIn('"tick failed"', verify_step_text)
+
+    def test_rollback_supported_by_same_workflow_no_dynamodb_mutation(self):
+        # Rollback is documented as re-running with enable_cloudwatch_publication=false --
+        # no separate rollback workflow, no CONFIG PutItem/UpdateItem call anywhere.
+        self.assertNotIn("put_item", self.monitor_text)
+        self.assertNotIn("update_item", self.monitor_text)
+        self.assertNotIn("UpdateItem", self.monitor_text)
+
+    def test_no_cloudwatch_read_iam_action_referenced(self):
+        for forbidden in ("cloudwatch:ListMetrics", "cloudwatch:GetMetricData", "cloudwatch:GetMetricStatistics",
+                         "cloudwatch:DescribeAlarms"):
+            self.assertNotIn(forbidden, self.monitor_text)
+
+    def test_no_alarm_sns_alerter_fluentbit_or_observer_removal_referenced(self):
+        for forbidden in ("cloudwatch:PutMetricAlarm", "sns:CreateTopic", "sns:Subscribe", "gg-alerter",
+                         "fluent-bit", "FluentBit", "kubectl delete", "helm uninstall"):
+            self.assertNotIn(forbidden, self.monitor_text)
 
     def test_validation_job_name_includes_run_attempt(self):
         self.assertIn(

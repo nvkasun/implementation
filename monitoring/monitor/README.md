@@ -158,6 +158,84 @@ DynamoDB deployment status already written that tick. The deployed Helm
 default keeps `CLOUDWATCH_PUBLISH_ENABLED=false`, so no CloudWatch client is
 ever constructed in the current deployment.
 
+### Controlled DEV activation (Phase 4D2)
+
+`cloudwatch.publishEnabled` (the chart value that renders
+`CLOUDWATCH_PUBLISH_ENABLED`) always defaults to `false` in
+`helm/goldengate-monitor/values.yaml`, and `envs/dev/goldengate-monitor/values.yaml`
+does not override it -- the base default is what deploys unless a specific
+run explicitly requests otherwise.
+
+Activation is controlled by a single workflow_dispatch Boolean input on
+`.github/workflows/goldengate-monitor.yaml`:
+
+- `enable_cloudwatch_publication` (`type: boolean`, `required: true`,
+  `default: false`).
+
+The requested value is passed as an `image.tag`-style Argo CD Application
+Helm parameter (`cloudwatch.publishEnabled`), so it is owned by the same
+GitHub Actions -> Helm OCI artifact -> Argo CD chain as every other
+deployment-specific value -- never a `kubectl set env`/`kubectl patch`, an
+unmanaged ConfigMap, or a manual Argo CD Application edit. Every workflow run
+also packages a new chart version (`0.1.<run_number>`, already strictly
+increasing), so Argo CD always reconciles a fresh revision; the monitor image
+itself is rebuilt only when `monitoring/monitor`'s content actually changes
+(content-addressed tag), so a CloudWatch-only toggle never triggers an
+unnecessary image rebuild.
+
+Before enabling (`enable_cloudwatch_publication=true`), the workflow runs a
+fail-closed preflight: it finds the currently running `gg-monitor` pod and,
+using that pod's own existing IRSA (`GoldenGateMonitorReadRole-dev` -- no new
+credential, no IAM change), performs one bounded `GetItem` per enabled
+canonical deployment (discovered from `envs/dev/goldengate-deployments.yaml`,
+never hardcoded; never a `Scan`) against that deployment's `CONFIG` record.
+Output is sanitized to exactly `deployment=<name> metricsEnabled=true` or
+`deployment=<name> metricsEnabled-not-literal-true` -- never a raw item,
+credential, ARN, hostname, or exception. If any enabled deployment is missing
+its `CONFIG` record or does not have `metricsEnabled` set to the literal
+Boolean `true`, the workflow fails before the Argo CD Application is ever
+touched. If no monitor pod exists yet (first deployment), the workflow fails
+with an explicit prerequisite message rather than bypassing the check --
+deploy the monitor first with publication disabled, confirm it is healthy,
+then re-run with activation requested. When `enable_cloudwatch_publication`
+is `false`, none of this runs -- no CONFIG check, no CloudWatch client.
+
+After Argo CD sync, the workflow's existing runtime-verification step is
+extended to confirm the deployed pod's `CLOUDWATCH_PUBLISH_ENABLED` env value
+matches exactly what was requested (`cloudwatchPublishEnabled=true` or
+`=false`), and -- only when enabled -- re-verifies `CONFIG.metricsEnabled`
+post-rollout and scans recent monitor logs for
+`cloudwatch_client_creation_failed`, `cloudwatch_put_metric_data_failed`, or
+`tick failed`. It never adds a CloudWatch read call: process-level metrics
+(`ExtractLagSeconds`/`ReplicatLagSeconds`/`AbendState`/`AbendEvent`) are not
+checked and their absence never fails this step, since the current GoldenGate
+runtimes do not yet have replication-process STATE rows.
+
+**Rollback** is the same workflow: re-run with
+`enable_cloudwatch_publication=false`. No CONFIG mutation, no direct
+`kubectl patch`, and no observer/portal/STATE# change is required or
+performed -- Argo CD simply reconciles `CLOUDWATCH_PUBLISH_ENABLED` back to
+`false`, and the same post-deployment verification confirms it.
+
+### Operator-side CloudWatch validation (manual, out of band)
+
+This workflow deliberately never reads CloudWatch itself -- the monitor's
+IRSA role (`GoldenGateMonitorReadRole-dev`) is not granted
+`cloudwatch:ListMetrics`/`GetMetricData`/any read permission, and none is
+added for this validation. After a controlled activation, an operator with
+their own already-authorized CloudWatch read access should confirm in the AWS
+Console (or via their own credentials), namespace `GoldenGate/Pipelines`:
+
+- Deployment dimensions present: `Deployment=gg-oracle-payments-01` /
+  `DeploymentType=oracle`, and `Deployment=gg-postgresql-payments-01` /
+  `DeploymentType=postgresql`.
+- Deployment-level metrics present: `LagBreached`, `AbendFailure`,
+  `DeploymentDown`, `HeartbeatAgeSeconds`.
+- Service metric present: `CriticalServiceDown`.
+- Expected current limitation: `ExtractLagSeconds`, `ReplicatLagSeconds`,
+  `AbendState`, and `AbendEvent` may be absent until real Extract/Replicat/
+  Distribution Path processes exist on these runtimes -- this is not a defect.
+
 ## Contract-probe tool
 
 `tools/gg_api_contract_probe.py` is a manual, `kubectl exec`-only utility

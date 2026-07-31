@@ -1,6 +1,6 @@
 name: Goldengate monitor deployment
 
-run-name: "Cloud Factory - GoldenGate monitor build and deploy | manual dispatch (deploy=${{ inputs.deploy }}) | ran by ${{ github.actor }}"
+run-name: "Cloud Factory - GoldenGate monitor build and deploy | manual dispatch (deploy=${{ inputs.deploy }}, cloudwatch=${{ inputs.enable_cloudwatch_publication }}) | ran by ${{ github.actor }}"
 
 
 # Manual dispatch only during the first controlled deployment -- pushing
@@ -23,6 +23,12 @@ on:
         required: true
         type: boolean
         default: true
+
+      enable_cloudwatch_publication:
+        description: "Enable GoldenGate custom metric publication (CloudWatch namespace GoldenGate/Pipelines) in DEV. Requires CONFIG.metricsEnabled=true (literal Boolean) for every enabled canonical deployment -- verified before the Argo CD Application is ever updated. Set false to roll back to disabled."
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   id-token: write
@@ -496,6 +502,19 @@ jobs:
           HELM_PUSH_URL="oci://${ECR_REGISTRY}/${HELM_OCI_NAMESPACE}"
           HELM_CHART_REF="oci://${ECR_REGISTRY}/${HELM_ECR_REPOSITORY}"
 
+          # Strict Boolean-only value for cloudwatch.publishEnabled ->
+          # CLOUDWATCH_PUBLISH_ENABLED. GitHub renders a workflow_dispatch
+          # `type: boolean` input as the literal string "true" or "false"
+          # here -- never "1"/"yes"/"on" -- but this is verified explicitly
+          # rather than trusted blindly, since this value ultimately gates a
+          # hard CloudWatch kill switch (see collector.py
+          # _parse_strict_bool_env, which itself only accepts "true").
+          CLOUDWATCH_PUBLISH_ENABLED_VALUE="${{ inputs.enable_cloudwatch_publication }}"
+          if [[ "$CLOUDWATCH_PUBLISH_ENABLED_VALUE" != "true" && "$CLOUDWATCH_PUBLISH_ENABLED_VALUE" != "false" ]]; then
+            echo "Unexpected enable_cloudwatch_publication value: \"${CLOUDWATCH_PUBLISH_ENABLED_VALUE}\" (expected literal true or false)."
+            exit 1
+          fi
+
           echo "MONITOR_IMAGE_REPOSITORY=${MONITOR_IMAGE_REPOSITORY}" >> "$GITHUB_ENV"
           echo "MONITOR_IMAGE_TAG=${MONITOR_IMAGE_TAG}" >> "$GITHUB_ENV"
           echo "MONITOR_IMAGE_URI=${MONITOR_IMAGE_URI}" >> "$GITHUB_ENV"
@@ -504,10 +523,12 @@ jobs:
           echo "HELM_ECR_REPOSITORY=${HELM_ECR_REPOSITORY}" >> "$GITHUB_ENV"
           echo "HELM_PUSH_URL=${HELM_PUSH_URL}" >> "$GITHUB_ENV"
           echo "HELM_CHART_REF=${HELM_CHART_REF}" >> "$GITHUB_ENV"
+          echo "CLOUDWATCH_PUBLISH_ENABLED_VALUE=${CLOUDWATCH_PUBLISH_ENABLED_VALUE}" >> "$GITHUB_ENV"
 
           echo "Monitor image URI: ${MONITOR_IMAGE_URI}"
           echo "Chart version: ${CHART_VERSION}"
           echo "Helm chart ref: ${HELM_CHART_REF}"
+          echo "CloudWatch publication requested (cloudwatch.publishEnabled): ${CLOUDWATCH_PUBLISH_ENABLED_VALUE}"
 
       - name: Validate required files
         shell: bash
@@ -631,7 +652,8 @@ jobs:
           helm lint "$TEMP_CHART_PATH" \
             --values "$VALUES_FILE" \
             --set-string image.repository="$MONITOR_IMAGE_REPOSITORY" \
-            --set-string image.tag="$MONITOR_IMAGE_TAG"
+            --set-string image.tag="$MONITOR_IMAGE_TAG" \
+            --set cloudwatch.publishEnabled="$CLOUDWATCH_PUBLISH_ENABLED_VALUE"
 
       - name: Render monitor manifest for validation
         shell: bash
@@ -645,6 +667,7 @@ jobs:
             --values "$VALUES_FILE" \
             --set-string image.repository="$MONITOR_IMAGE_REPOSITORY" \
             --set-string image.tag="$MONITOR_IMAGE_TAG" \
+            --set cloudwatch.publishEnabled="$CLOUDWATCH_PUBLISH_ENABLED_VALUE" \
             > "rendered/${RELEASE_NAME}.yaml"
 
           echo "Rendered manifest: rendered/${RELEASE_NAME}.yaml"
@@ -761,6 +784,23 @@ jobs:
             echo "Expected: ${MONITOR_IMAGE_URI}"
             exit 1
           fi
+
+          echo "Validating rendered CLOUDWATCH_PUBLISH_ENABLED matches the requested value exactly..."
+          CLOUDWATCH_ENV_LINE="$(grep -A1 -- "name: CLOUDWATCH_PUBLISH_ENABLED" <<< "$DEPLOYMENT_BLOCK" | tail -1 || true)"
+          if [ -z "$CLOUDWATCH_ENV_LINE" ]; then
+            echo "FAIL: CLOUDWATCH_PUBLISH_ENABLED env var not found in rendered Deployment."
+            exit 1
+          fi
+          CLOUDWATCH_ENV_ACTUAL="$(normalize_value "${CLOUDWATCH_ENV_LINE#*value:}")"
+          if [ "$CLOUDWATCH_ENV_ACTUAL" != "true" ] && [ "$CLOUDWATCH_ENV_ACTUAL" != "false" ]; then
+            echo "FAIL: rendered CLOUDWATCH_PUBLISH_ENABLED is not a proper Boolean string: \"${CLOUDWATCH_ENV_ACTUAL}\"."
+            exit 1
+          fi
+          if [ "$CLOUDWATCH_ENV_ACTUAL" != "$CLOUDWATCH_PUBLISH_ENABLED_VALUE" ]; then
+            echo "FAIL: rendered CLOUDWATCH_PUBLISH_ENABLED=\"${CLOUDWATCH_ENV_ACTUAL}\", expected \"${CLOUDWATCH_PUBLISH_ENABLED_VALUE}\"."
+            exit 1
+          fi
+          echo "OK: rendered CLOUDWATCH_PUBLISH_ENABLED=\"${CLOUDWATCH_ENV_ACTUAL}\" matches the requested value."
 
           echo "Validating no Kubernetes Secret/PVC/hostPath is rendered, and credentials arrive only via CSI..."
           if grep -qE '^kind: Secret$' "$RENDERED"; then
@@ -1113,6 +1153,69 @@ jobs:
 
           echo "OK: ${ARGOCD_MONITOR_SECRET_NAME} exists and points to ${EXPECTED_URL}."
 
+      - name: CloudWatch publication preflight (CONFIG.metricsEnabled)
+        if: ${{ (github.event_name != 'workflow_dispatch' || inputs.deploy) && inputs.enable_cloudwatch_publication }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "enable_cloudwatch_publication=true requested -- verifying CONFIG.metricsEnabled is literal Boolean true for every enabled canonical deployment before the Argo CD Application is touched."
+          echo "This never uses DynamoDB Scan, never broadens IAM, and never constructs a CloudWatch client -- it reuses the existing running monitor pod's own IRSA (GoldenGateMonitorReadRole-dev) via a bounded kubectl exec, one GetItem per enabled deployment."
+
+          POD_NAME="$(kubectl get pods -n "$TARGET_NAMESPACE" -l app.kubernetes.io/name=gg-monitor -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+          if [ -z "$POD_NAME" ]; then
+            echo ""
+            echo "PREREQUISITE NOT MET: no running gg-monitor pod found in namespace ${TARGET_NAMESPACE}."
+            echo "CONFIG.metricsEnabled cannot be verified without an authenticated read path, and this workflow never bypasses that check merely because the monitor does not exist yet."
+            echo ""
+            echo "Prerequisite: first deploy the monitor with enable_cloudwatch_publication=false (the default), confirm it is Ready, then re-run this workflow with enable_cloudwatch_publication=true."
+            exit 1
+          fi
+          echo "Using the existing monitor pod for this read-only preflight: ${POD_NAME}"
+
+          # Canonical enabled-deployment names, discovered the same way the
+          # SecretProviderClass-alias check above does -- never hardcoded.
+          mapfile -t ENABLED_DEPLOYMENTS < <(awk '
+            /^\s*-\s*name:/ { if (name != "" && enabled == "true") print name; name=$0; sub(/^\s*-\s*name:\s*/, "", name); gsub(/["\x27\r]/, "", name); enabled="" }
+            /^\s*enabled:\s*true/ { enabled="true" }
+            /^\s*enabled:\s*false/ { enabled="false" }
+            END { if (name != "" && enabled == "true") print name }
+          ' envs/dev/goldengate-deployments.yaml)
+
+          if [ "${#ENABLED_DEPLOYMENTS[@]}" -eq 0 ]; then
+            echo "FAIL: no enabled deployments discovered from envs/dev/goldengate-deployments.yaml."
+            exit 1
+          fi
+
+          PREFLIGHT_FAILED="false"
+          for name in "${ENABLED_DEPLOYMENTS[@]}"; do
+            RESULT="$(kubectl exec "$POD_NAME" -n "$TARGET_NAMESPACE" -- python3 -c '
+          import boto3, os, sys
+          pipeline = sys.argv[1]
+          try:
+              table = boto3.resource("dynamodb", region_name=os.environ.get("AWS_REGION", "eu-west-1")).Table(os.environ["DYNAMODB_TABLE"])
+              item = table.get_item(Key={"pipeline": pipeline, "recordType": "CONFIG"}).get("Item")
+              ok = isinstance(item, dict) and item.get("metricsEnabled") is True
+          except Exception:
+              ok = False
+          print(f"deployment={pipeline} metricsEnabled=true" if ok else f"deployment={pipeline} metricsEnabled-not-literal-true")
+          ' "$name" 2>/dev/null)" || RESULT="deployment=${name} metricsEnabled-not-literal-true"
+
+            echo "$RESULT"
+            if [ "$RESULT" != "deployment=${name} metricsEnabled=true" ]; then
+              PREFLIGHT_FAILED="true"
+            fi
+          done
+
+          if [ "$PREFLIGHT_FAILED" = "true" ]; then
+            echo ""
+            echo "FAIL: CloudWatch publication preflight failed -- at least one enabled canonical deployment does not have CONFIG.metricsEnabled set to the literal Boolean true."
+            echo "Refusing to update the Argo CD Application. No CloudWatch client will be constructed; publication stays disabled."
+            exit 1
+          fi
+
+          echo "OK: CONFIG.metricsEnabled is literal Boolean true for every enabled canonical deployment."
+
       - name: Create or update Argo CD Application
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.deploy }}
         shell: bash
@@ -1147,6 +1250,8 @@ jobs:
                     value: ${MONITOR_IMAGE_REPOSITORY}
                   - name: image.tag
                     value: ${MONITOR_IMAGE_TAG}
+                  - name: cloudwatch.publishEnabled
+                    value: "${CLOUDWATCH_PUBLISH_ENABLED_VALUE}"
             destination:
               server: https://kubernetes.default.svc
               namespace: ${TARGET_NAMESPACE}
@@ -1252,6 +1357,15 @@ jobs:
           fi
           echo "OK: pod image matches expected: ${POD_IMAGE}"
 
+          echo "Verifying deployed CLOUDWATCH_PUBLISH_ENABLED matches the requested value..."
+          POD_CLOUDWATCH_ENV="$(kubectl get pod "$POD_NAME" -n "$TARGET_NAMESPACE" \
+            -o jsonpath='{range .spec.containers[0].env[?(@.name=="CLOUDWATCH_PUBLISH_ENABLED")]}{.value}{end}')"
+          if [ "$POD_CLOUDWATCH_ENV" != "$CLOUDWATCH_PUBLISH_ENABLED_VALUE" ]; then
+            echo "FAIL: pod ${POD_NAME} CLOUDWATCH_PUBLISH_ENABLED=\"${POD_CLOUDWATCH_ENV}\", expected \"${CLOUDWATCH_PUBLISH_ENABLED_VALUE}\"."
+            exit 1
+          fi
+          echo "cloudwatchPublishEnabled=${POD_CLOUDWATCH_ENV}"
+
           RUN_AS_USER="$(kubectl get pod "$POD_NAME" -n "$TARGET_NAMESPACE" -o jsonpath='{.spec.securityContext.runAsUser}')"
           if [ "$RUN_AS_USER" = "0" ] || [ -z "$RUN_AS_USER" ]; then
             echo "FAIL: pod ${POD_NAME} securityContext.runAsUser is not a confirmed non-root value: ${RUN_AS_USER:-<empty>}"
@@ -1351,6 +1465,54 @@ jobs:
           echo "OK: no AccessDeniedException or missing-region error found in recent logs."
           echo "OK: the portal's own read functions only ever issue GetItem/Query/DescribeTable (see monitor.py); the collector intentionally writes LEASE and STATE# records (see collector.py) -- no Scan call exists anywhere in the application code."
 
+          if [ "$CLOUDWATCH_PUBLISH_ENABLED_VALUE" = "true" ]; then
+            echo ""
+            echo "CloudWatch publication is enabled -- verifying source-side/runtime safety only. This never adds a CloudWatch read call or IAM permission: no ListMetrics/GetMetricData is used anywhere."
+
+            echo "Re-verifying CONFIG.metricsEnabled via the running (post-rollout) pod..."
+            mapfile -t ENABLED_DEPLOYMENTS_POST < <(awk '
+              /^\s*-\s*name:/ { if (name != "" && enabled == "true") print name; name=$0; sub(/^\s*-\s*name:\s*/, "", name); gsub(/["\x27\r]/, "", name); enabled="" }
+              /^\s*enabled:\s*true/ { enabled="true" }
+              /^\s*enabled:\s*false/ { enabled="false" }
+              END { if (name != "" && enabled == "true") print name }
+            ' envs/dev/goldengate-deployments.yaml)
+            for name in "${ENABLED_DEPLOYMENTS_POST[@]}"; do
+              RESULT="$(kubectl exec "$POD_NAME" -n "$TARGET_NAMESPACE" -- python3 -c '
+          import boto3, os, sys
+          pipeline = sys.argv[1]
+          try:
+              table = boto3.resource("dynamodb", region_name=os.environ.get("AWS_REGION", "eu-west-1")).Table(os.environ["DYNAMODB_TABLE"])
+              item = table.get_item(Key={"pipeline": pipeline, "recordType": "CONFIG"}).get("Item")
+              ok = isinstance(item, dict) and item.get("metricsEnabled") is True
+          except Exception:
+              ok = False
+          print(f"deployment={pipeline} metricsEnabled=true" if ok else f"deployment={pipeline} metricsEnabled-not-literal-true")
+          ' "$name" 2>/dev/null)" || RESULT="deployment=${name} metricsEnabled-not-literal-true"
+              echo "$RESULT"
+              if [ "$RESULT" != "deployment=${name} metricsEnabled=true" ]; then
+                echo "FAIL: post-rollout CONFIG.metricsEnabled check failed for ${name}."
+                exit 1
+              fi
+            done
+            echo "OK: CONFIG.metricsEnabled remains literal Boolean true for every enabled deployment."
+
+            echo "Checking recent monitor logs for CloudWatch failure signatures..."
+            CLOUDWATCH_LOG_FAILURE="false"
+            for forbidden in "cloudwatch_client_creation_failed" "cloudwatch_put_metric_data_failed" "tick failed"; do
+              if grep -Fq -- "$forbidden" <<< "$POD_LOGS"; then
+                echo "FAIL: \"${forbidden}\" found in recent gg-monitor logs while CloudWatch publication is enabled."
+                CLOUDWATCH_LOG_FAILURE="true"
+              fi
+            done
+            if [ "$CLOUDWATCH_LOG_FAILURE" = "true" ]; then
+              exit 1
+            fi
+            echo "OK: no CloudWatch client-creation/PutMetricData failure or generic tick-failed signature found in recent logs."
+            echo "Note: process-level metrics (ExtractLagSeconds/ReplicatLagSeconds/AbendState/AbendEvent) may legitimately be absent until real replication-process STATE rows exist -- this is not checked here and does not fail this step."
+          else
+            echo "CloudWatch publication is disabled -- no CONFIG.metricsEnabled check or CloudWatch-failure log check is required."
+          fi
+
       - name: Upload rendered manifests and chart package
         if: always()
         uses: actions/upload-artifact@v4
@@ -1376,6 +1538,7 @@ jobs:
             echo "- Target namespace: \`${TARGET_NAMESPACE}\`"
             echo "- Argo CD Application: \`${ARGOCD_APP_NAME}\` (namespace: \`${ARGOCD_NAMESPACE}\`)"
             echo "- Deploy enabled: \`${{ github.event_name != 'workflow_dispatch' || inputs.deploy }}\`"
+            echo "- CloudWatch publication requested: \`${CLOUDWATCH_PUBLISH_ENABLED_VALUE:-unknown}\`"
             echo ""
             echo "### Ownership"
             echo ""
