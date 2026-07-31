@@ -865,6 +865,83 @@ else
   pass "goldengate-monitor.yaml no longer blindly selects .items[0] -- pod selection filters on Running phase and container readiness"
 fi
 
+# ---------------------------------------------------------------------
+# 21. Phase 4D2 supply-chain/pod-selection correction: .dockerignore
+#     participates in the runtime-image hash, the Dockerfile requires an
+#     explicitly supplied digest-pinned private base image (no public
+#     default), and Ready-pod selection excludes terminating pods.
+# ---------------------------------------------------------------------
+echo ""
+echo "--- Phase 4D2 correction: .dockerignore hash input, digest-pinned base image, non-terminating Ready pod ---"
+
+if grep -q '"\${MONITOR_SOURCE_PATH}/.dockerignore"' "$MONITOR_WORKFLOW" 2>/dev/null; then
+  pass "goldengate-monitor.yaml includes .dockerignore in the runtime-image hash inputs"
+else
+  fail "goldengate-monitor.yaml's runtime-image hash inputs no longer include .dockerignore"
+fi
+
+if [ -f "${MONITOR_APP_DIR}/.dockerignore" ]; then
+  pass "monitoring/monitor/.dockerignore exists (a hashed, tracked input)"
+else
+  fail "monitoring/monitor/.dockerignore is missing"
+fi
+
+if grep -q '^ARG BASE_IMAGE$' "${MONITOR_APP_DIR}/Dockerfile" 2>/dev/null \
+    && ! grep -q '^ARG BASE_IMAGE=' "${MONITOR_APP_DIR}/Dockerfile" 2>/dev/null \
+    && ! grep -q 'python:3.12-slim' "${MONITOR_APP_DIR}/Dockerfile" 2>/dev/null; then
+  pass "monitoring/monitor/Dockerfile requires an explicitly supplied BASE_IMAGE (no public default)"
+else
+  fail "monitoring/monitor/Dockerfile still has a public default base image"
+fi
+
+if grep -q "name: Validate approved base image reference" "$MONITOR_WORKFLOW" 2>/dev/null \
+    && grep -q "vars.MONITOR_BASE_IMAGE" "$MONITOR_WORKFLOW" 2>/dev/null; then
+  pass "goldengate-monitor.yaml validates an externally supplied MONITOR_BASE_IMAGE (vars.* convention, not hardcoded)"
+else
+  fail "goldengate-monitor.yaml is missing the base-image validation step"
+fi
+
+if grep -qE '@sha256:\[0-9a-f\]\{64\}\$' "$MONITOR_WORKFLOW" 2>/dev/null; then
+  pass "goldengate-monitor.yaml requires MONITOR_BASE_IMAGE to be digest-pinned (@sha256:<64 lowercase hex>)"
+else
+  fail "goldengate-monitor.yaml no longer enforces digest-pinning on MONITOR_BASE_IMAGE"
+fi
+
+BASE_IMAGE_STEP="$(awk '
+  /- name: Validate approved base image reference/ { capture=1 }
+  capture { print }
+  capture && /- name: Prepare monitor image variables/ { exit }
+' "$MONITOR_WORKFLOW")"
+# The value is only ever interpolated on the two SUCCESS-path lines (the
+# GITHUB_ENV write and the confirmation echo) -- never on any of the three
+# failure branches above them. Proven functionally (with a marker value)
+# by MonitorBaseImageValidationTests.test_failure_never_prints_the_raw_malformed_value.
+BASE_IMAGE_INTERPOLATIONS="$(grep -c '\${MONITOR_BASE_IMAGE}' <<< "$BASE_IMAGE_STEP" || true)"
+if [ "${BASE_IMAGE_INTERPOLATIONS:-0}" -eq 2 ]; then
+  pass "goldengate-monitor.yaml's base-image failure messages never interpolate the raw supplied value"
+else
+  fail "goldengate-monitor.yaml's base-image validation interpolates \${MONITOR_BASE_IMAGE} ${BASE_IMAGE_INTERPOLATIONS:-0} times -- expected exactly 2 (success-path only)"
+fi
+
+if grep -Fq -- '--build-arg "BASE_IMAGE=${MONITOR_BASE_IMAGE}"' "$MONITOR_WORKFLOW" 2>/dev/null; then
+  pass "goldengate-monitor.yaml passes the validated MONITOR_BASE_IMAGE into docker build via --build-arg"
+else
+  fail "goldengate-monitor.yaml no longer passes BASE_IMAGE into docker build"
+fi
+
+if grep -q 'echo "BASE_IMAGE \${MONITOR_BASE_IMAGE}"' "$MONITOR_WORKFLOW" 2>/dev/null; then
+  pass "goldengate-monitor.yaml folds the resolved base-image reference into the same runtime-input hash"
+else
+  fail "goldengate-monitor.yaml's hash no longer incorporates the resolved base-image reference"
+fi
+
+TERMINATING_EXCLUSION_COUNT="$(grep -c 'deletionTimestamp == null' "$MONITOR_WORKFLOW" 2>/dev/null || true)"
+if [ "${TERMINATING_EXCLUSION_COUNT:-0}" -eq 2 ]; then
+  pass "both Ready-pod jq filters (preflight and post-deployment verification) exclude terminating pods"
+else
+  fail "expected exactly 2 Ready-pod jq filters excluding terminating pods, found ${TERMINATING_EXCLUSION_COUNT:-0}"
+fi
+
 echo ""
 echo "=================================================="
 echo "Summary: ${PASS_COUNT} passed, ${FAIL_COUNT} failed, ${SKIP_COUNT} skipped"

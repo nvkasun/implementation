@@ -1,5 +1,9 @@
 # syntax=docker/dockerfile:1
-ARG BASE_IMAGE=python:3.12-slim
+# No public default: BASE_IMAGE must be explicitly supplied as a
+# digest-pinned, private-ECR reference by the caller (see
+# .github/workflows/goldengate-monitor.yaml's "Validate approved base image
+# reference" step). There is deliberately no Docker Hub fallback.
+ARG BASE_IMAGE
 
 FROM ${BASE_IMAGE}
 

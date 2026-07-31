@@ -1270,6 +1270,94 @@ def _extract_monitor_image_hash_script(workflow_text):
     return workflow_text[start:end]
 
 
+def _extract_base_image_validation_script(workflow_text):
+    """Pulls the exact, committed base-image validation snippet out of the
+    real workflow file -- executed verbatim in tests, never reimplemented.
+    The one GitHub-Actions-only templating token in it (${{ vars.
+    MONITOR_BASE_IMAGE }}, which cannot be evaluated outside of Actions) is
+    substituted with a plain environment-variable reference; every line of
+    validation logic below that assignment is untouched."""
+    marker = 'MONITOR_BASE_IMAGE="${{ vars.MONITOR_BASE_IMAGE }}"'
+    start = workflow_text.index(marker)
+    end = workflow_text.index('echo "MONITOR_BASE_IMAGE: ${MONITOR_BASE_IMAGE}"', start)
+    end = workflow_text.index("\n", end) + 1
+    script = workflow_text[start:end]
+    return script.replace(marker, 'MONITOR_BASE_IMAGE="${TEST_INPUT_MONITOR_BASE_IMAGE-}"')
+
+
+class MonitorBaseImageValidationTests(unittest.TestCase):
+    """Phase 4D2 correction: fail-closed, digest-pinned private-ECR
+    base-image gate -- proven by executing the actual committed validation
+    script (extracted from the workflow, not reimplemented)."""
+
+    ECR_REGISTRY = "229410149234.dkr.ecr.eu-west-1.amazonaws.com"
+    APPROVED_DIGEST_REF = f"{ECR_REGISTRY}/goldengate-monitor-base@sha256:{'a' * 64}"
+
+    @classmethod
+    def setUpClass(cls):
+        if shutil.which("bash") is None:
+            raise unittest.SkipTest("bash not available")
+        with open(MONITOR_WORKFLOW_PATH) as f:
+            cls.validation_script = _extract_base_image_validation_script(f.read())
+
+    def _run(self, base_image_input):
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as github_env_file:
+            github_env_path = github_env_file.name
+        try:
+            script = f"set -euo pipefail\n{self.validation_script}"
+            env = {**os.environ, "ECR_REGISTRY": self.ECR_REGISTRY,
+                  "TEST_INPUT_MONITOR_BASE_IMAGE": base_image_input,
+                  "GITHUB_ENV": github_env_path}
+            return subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
+        finally:
+            os.unlink(github_env_path)
+
+    def test_missing_base_image_fails(self):
+        proc = self._run("")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("MONITOR_BASE_IMAGE is not set", proc.stdout)
+
+    def test_public_docker_hub_base_image_fails(self):
+        proc = self._run("python:3.12-slim")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("not a private image in the approved ECR registry", proc.stdout)
+
+    def test_public_ghcr_base_image_fails(self):
+        proc = self._run("ghcr.io/example/python@sha256:" + "a" * 64)
+        self.assertNotEqual(proc.returncode, 0)
+
+    def test_other_account_ecr_base_image_fails(self):
+        # Same ECR *service*, different (unapproved) account/registry host.
+        proc = self._run("111111111111.dkr.ecr.eu-west-1.amazonaws.com/goldengate-monitor-base@sha256:" + "a" * 64)
+        self.assertNotEqual(proc.returncode, 0)
+
+    def test_tag_only_ecr_base_image_fails(self):
+        proc = self._run(f"{self.ECR_REGISTRY}/goldengate-monitor-base:3.12-slim")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("must be digest-pinned", proc.stdout)
+
+    def test_uppercase_hex_digest_fails(self):
+        proc = self._run(f"{self.ECR_REGISTRY}/goldengate-monitor-base@sha256:" + "A" * 64)
+        self.assertNotEqual(proc.returncode, 0)
+
+    def test_short_digest_fails(self):
+        proc = self._run(f"{self.ECR_REGISTRY}/goldengate-monitor-base@sha256:" + "a" * 63)
+        self.assertNotEqual(proc.returncode, 0)
+
+    def test_digest_pinned_approved_private_ecr_base_image_passes(self):
+        proc = self._run(self.APPROVED_DIGEST_REF)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("Confirmed: MONITOR_BASE_IMAGE is a digest-pinned private ECR reference", proc.stdout)
+
+    def test_failure_never_prints_the_raw_malformed_value(self):
+        malformed = "docker.io/library/python:3.12-slim-SECRET-MARKER-zzz"
+        proc = self._run(malformed)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn(malformed, proc.stdout)
+        self.assertNotIn(malformed, proc.stderr)
+        self.assertNotIn("SECRET-MARKER", proc.stdout)
+
+
 class MonitorImageHashTests(unittest.TestCase):
     """Phase 4D2 correction: the runtime-image content hash must depend
     only on exactly the paths the Dockerfile COPYs -- never README.md,
@@ -1284,14 +1372,23 @@ class MonitorImageHashTests(unittest.TestCase):
         with open(MONITOR_WORKFLOW_PATH) as f:
             cls.hash_script = _extract_monitor_image_hash_script(f.read())
 
-    def _compute_hash(self, repo_dir):
+    DEFAULT_BASE_IMAGE = (
+        "229410149234.dkr.ecr.eu-west-1.amazonaws.com/goldengate-monitor-base"
+        "@sha256:" + "a" * 64)
+    ALTERNATE_BASE_IMAGE = (
+        "229410149234.dkr.ecr.eu-west-1.amazonaws.com/goldengate-monitor-base"
+        "@sha256:" + "b" * 64)
+
+    def _compute_hash(self, repo_dir, base_image=None):
         # hash_script already ends with a newline (it was sliced through the
         # MONITOR_IMAGE_TAG= line), so the appended echo starts on its own
         # line -- no extra ";" (which would be a stray empty statement).
         script = f'set -euo pipefail\n{self.hash_script}echo "$MONITOR_TREE_SHA"'
         proc = subprocess.run(
             ["bash", "-c", script],
-            cwd=repo_dir, env={**os.environ, "MONITOR_SOURCE_PATH": "."},
+            cwd=repo_dir,
+            env={**os.environ, "MONITOR_SOURCE_PATH": ".",
+                "MONITOR_BASE_IMAGE": base_image or self.DEFAULT_BASE_IMAGE},
             capture_output=True, text=True,
         )
         self.assertEqual(proc.returncode, 0, f"hash script failed: {proc.stdout}\n{proc.stderr}")
@@ -1306,6 +1403,7 @@ class MonitorImageHashTests(unittest.TestCase):
         os.makedirs(os.path.join(tmp, "tests"), exist_ok=True)
         files = {
             "Dockerfile": "FROM python:3.12-slim\n",
+            ".dockerignore": "tests/\nREADME.md\n__pycache__/\n",
             "requirements.txt": "boto3\n",
             "requirements-test.txt": "pytest\n",
             "monitor.py": "print('monitor')\n",
@@ -1388,6 +1486,59 @@ class MonitorImageHashTests(unittest.TestCase):
             after = self._compute_hash(tmp)
         self.assertNotEqual(before, after)
 
+    def test_dockerignore_change_changes_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_repo(tmp)
+            before = self._compute_hash(tmp)
+            with open(os.path.join(tmp, ".dockerignore"), "w") as f:
+                f.write("tests/\nREADME.md\n__pycache__/\n*.log\n")
+            self._commit(tmp, "dockerignore change")
+            after = self._compute_hash(tmp)
+        self.assertNotEqual(before, after)
+
+    def test_readme_only_change_still_does_not_change_hash_with_dockerignore_present(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_repo(tmp)
+            before = self._compute_hash(tmp)
+            with open(os.path.join(tmp, "README.md"), "w") as f:
+                f.write("# readme v2 -- substantially changed, again\n")
+            self._commit(tmp, "readme change")
+            after = self._compute_hash(tmp)
+        self.assertEqual(before, after)
+
+    def test_test_only_change_still_does_not_change_hash_with_dockerignore_present(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_repo(tmp)
+            before = self._compute_hash(tmp)
+            with open(os.path.join(tmp, "tests", "test_monitor.py"), "w") as f:
+                f.write("# test v2 -- substantially changed, again\n")
+            self._commit(tmp, "test change")
+            after = self._compute_hash(tmp)
+        self.assertEqual(before, after)
+
+    def test_changing_only_base_image_digest_changes_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_repo(tmp)
+            before = self._compute_hash(tmp, base_image=self.DEFAULT_BASE_IMAGE)
+            after = self._compute_hash(tmp, base_image=self.ALTERNATE_BASE_IMAGE)
+        self.assertNotEqual(before, after)
+
+    def test_same_base_image_digest_and_same_files_preserves_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_repo(tmp)
+            first = self._compute_hash(tmp, base_image=self.DEFAULT_BASE_IMAGE)
+            second = self._compute_hash(tmp, base_image=self.DEFAULT_BASE_IMAGE)
+        self.assertEqual(first, second)
+
+    def test_missing_base_image_env_var_fails_the_hash_script(self):
+        script = f'set -euo pipefail\n{self.hash_script}echo "$MONITOR_TREE_SHA"'
+        env = {**os.environ, "MONITOR_SOURCE_PATH": "."}
+        env.pop("MONITOR_BASE_IMAGE", None)
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_repo(tmp)
+            proc = subprocess.run(["bash", "-c", script], cwd=tmp, env=env, capture_output=True, text=True)
+        self.assertNotEqual(proc.returncode, 0)
+
 
 class WorkflowStaticAnalysisTests(unittest.TestCase):
     """Static inspection of the two GitHub Actions workflow files. These
@@ -1442,6 +1593,41 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         with open(os.path.join(REPO_ROOT, "monitoring", "monitor", "Dockerfile")) as f:
             dockerfile_text = f.read()
         self.assertNotIn("requirements-test.txt", dockerfile_text)
+
+    def test_dockerfile_has_no_public_base_image_default(self):
+        with open(os.path.join(REPO_ROOT, "monitoring", "monitor", "Dockerfile")) as f:
+            dockerfile_text = f.read()
+        self.assertIn("ARG BASE_IMAGE\n", dockerfile_text)
+        self.assertNotIn("ARG BASE_IMAGE=", dockerfile_text)
+        self.assertNotIn("python:3.12-slim", dockerfile_text)
+        self.assertIn("FROM ${BASE_IMAGE}", dockerfile_text)
+
+    def test_docker_build_receives_base_image_build_arg(self):
+        self.assertIn('--build-arg "BASE_IMAGE=${MONITOR_BASE_IMAGE}"', self.monitor_text)
+
+    def test_base_image_validation_precedes_hash_computation(self):
+        validate_idx = self.monitor_text.index("- name: Validate approved base image reference")
+        prep_idx = self.monitor_text.index("- name: Prepare monitor image variables")
+        build_idx = self.monitor_text.index("- name: Build monitor image")
+        self.assertLess(validate_idx, prep_idx)
+        self.assertLess(prep_idx, build_idx)
+
+    def test_dockerignore_listed_as_hash_input_in_workflow(self):
+        self.assertIn('"${MONITOR_SOURCE_PATH}/.dockerignore"', self.monitor_text)
+
+    def test_readme_lists_dockerignore_as_runtime_image_input(self):
+        with open(os.path.join(REPO_ROOT, "monitoring", "monitor", "README.md")) as f:
+            readme_text = f.read()
+        self.assertIn(".dockerignore", readme_text)
+
+    def test_pod_selection_excludes_terminating_pods(self):
+        for marker_text in (
+            self.monitor_text[self.monitor_text.index("- name: CloudWatch publication preflight"):
+                              self.monitor_text.index("- name: Create or update Argo CD Application")],
+            self.monitor_text[self.monitor_text.index("- name: Verify GoldenGate monitor runtime state"):
+                              self.monitor_text.index("- name: Upload rendered manifests and chart package")],
+        ):
+            self.assertIn(".metadata.deletionTimestamp == null", marker_text)
 
     def test_oci_description_reflects_collector_and_portal(self):
         self.assertNotIn("Read-only shared GoldenGate monitoring portal", self.monitor_text)
@@ -1592,11 +1778,16 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         filter_end = preflight_step_text.index("'", filter_start)
         jq_filter = preflight_step_text[filter_start:filter_end]
 
+        # Pending, Running-but-NotReady, Running+Ready+terminating (has
+        # deletionTimestamp), and Running+Ready+non-terminating -- only the
+        # last one may ever be selected.
         mixed_pods = {"items": [
             {"status": {"phase": "Pending", "containerStatuses": []},
              "metadata": {"name": "gg-monitor-pending"}},
             {"status": {"phase": "Running", "containerStatuses": [{"ready": False}]},
              "metadata": {"name": "gg-monitor-notready"}},
+            {"status": {"phase": "Running", "containerStatuses": [{"ready": True}]},
+             "metadata": {"name": "gg-monitor-terminating", "deletionTimestamp": "2026-07-21T00:00:00Z"}},
             {"status": {"phase": "Running", "containerStatuses": [{"ready": True}]},
              "metadata": {"name": "gg-monitor-ready"}},
         ]}
@@ -1612,6 +1803,42 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
                               capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), "")
+
+        # A Ready pod that is ALSO terminating must never be selected, even
+        # when it is the only pod present.
+        only_terminating_pod = {"items": [
+            {"status": {"phase": "Running", "containerStatuses": [{"ready": True}]},
+             "metadata": {"name": "gg-monitor-only-terminating", "deletionTimestamp": "2026-07-21T00:00:00Z"}},
+        ]}
+        proc = subprocess.run(["jq", "-r", jq_filter], input=json.dumps(only_terminating_pod),
+                              capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+
+    def test_ready_pod_selection_jq_filter_used_by_post_deployment_verification_also_excludes_terminating(self):
+        if shutil.which("jq") is None:
+            raise unittest.SkipTest("jq not available")
+        verify_idx = self.monitor_text.index("- name: Verify GoldenGate monitor runtime state")
+        upload_idx = self.monitor_text.index("- name: Upload rendered manifests and chart package")
+        verify_step_text = self.monitor_text[verify_idx:upload_idx]
+        filter_start = verify_step_text.index("jq -r '") + len("jq -r '")
+        filter_end = verify_step_text.index("'", filter_start)
+        jq_filter = verify_step_text[filter_start:filter_end]
+
+        mixed_pods = {"items": [
+            {"status": {"phase": "Pending", "containerStatuses": []},
+             "metadata": {"name": "gg-monitor-pending"}},
+            {"status": {"phase": "Running", "containerStatuses": [{"ready": False}]},
+             "metadata": {"name": "gg-monitor-notready"}},
+            {"status": {"phase": "Running", "containerStatuses": [{"ready": True}]},
+             "metadata": {"name": "gg-monitor-terminating", "deletionTimestamp": "2026-07-21T00:00:00Z"}},
+            {"status": {"phase": "Running", "containerStatuses": [{"ready": True}]},
+             "metadata": {"name": "gg-monitor-ready"}},
+        ]}
+        proc = subprocess.run(["jq", "-r", jq_filter], input=json.dumps(mixed_pods),
+                              capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "gg-monitor-ready")
 
     def test_readme_does_not_claim_terraform_can_enable_metrics(self):
         with open(os.path.join(REPO_ROOT, "monitoring", "monitor", "README.md")) as f:

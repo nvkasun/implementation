@@ -184,15 +184,36 @@ points at a distinct, freshly reconciled revision -- no same-tag chart
 overwrite is ever required, including on rollback. The monitor image itself
 is rebuilt only when a Docker runtime input actually changes -- a
 deterministic Git-based hash (mode/blob id/path via `git ls-tree`) over
-exactly `Dockerfile`, `requirements.txt`, `monitor.py`, `collector.py`,
-`config.py`, `health_rules.py`, and `tools/**` (precisely what the
-Dockerfile `COPY`s); `README.md`, `requirements-test.txt`, and `tests/**`
-are deliberately excluded, so a README-only or tests-only change can never
-change the image tag or trigger a rebuild. Python setup, dependency
-install, syntax validation, and the full unit-test suite still run on
-*every* workflow execution regardless of whether the image already exists
--- only the Docker daemon check, ECR login, build, and push are conditional
-on that.
+exactly `Dockerfile`, `.dockerignore`, `requirements.txt`, `monitor.py`,
+`collector.py`, `config.py`, `health_rules.py`, and `tools/**` (precisely
+what shapes the Docker build context and what the Dockerfile `COPY`s),
+combined with the resolved, digest-pinned `MONITOR_BASE_IMAGE` reference
+(see below) in the same hash; `README.md`, `requirements-test.txt`, and
+`tests/**` are deliberately excluded, so a README-only or tests-only change
+can never change the image tag or trigger a rebuild, while a
+`.dockerignore` change or a base-image digest change always does. Python
+setup, dependency install, syntax validation, and the full unit-test suite
+still run on *every* workflow execution regardless of whether the image
+already exists -- only the Docker daemon check, ECR login, build, and push
+are conditional on that.
+
+**Base image (no public default):** `monitoring/monitor/Dockerfile` declares
+`ARG BASE_IMAGE` with no value -- there is no Docker Hub fallback. The
+workflow's "Validate approved base image reference" step (which runs before
+the image-existence check and before any build) resolves `MONITOR_BASE_IMAGE`
+from the repository/environment variable `vars.MONITOR_BASE_IMAGE` (the same
+`vars.*` convention as `AWS_REGION`/`GOLDENGATE_AWS_ROLE_ARN`) and fails
+closed unless it is: non-empty, a private image inside the approved ECR
+registry (`${ECR_REGISTRY}`, never Docker Hub/ghcr.io/quay.io/any other
+registry), and digest-pinned (`@sha256:` followed by exactly 64 lowercase
+hex characters -- a tag-only reference is rejected). Example accepted shape
+(not a real value): `229410149234.dkr.ecr.eu-west-1.amazonaws.com/<approved-base-repository>@sha256:<64 lowercase hex characters>`.
+On any failure, only a fixed explanatory message is printed -- the supplied
+value itself is never echoed. `--build-arg "BASE_IMAGE=${MONITOR_BASE_IMAGE}"`
+is the only way the value reaches `docker build`. If `vars.MONITOR_BASE_IMAGE`
+is not yet configured, the workflow fails before any image check/build --
+this is intentional; the approved reference is a prerequisite, not something
+this workflow invents.
 
 Before enabling (`enable_cloudwatch_publication=true`), the workflow runs a
 fail-closed preflight: it finds the currently running `gg-monitor` pod and,
@@ -210,6 +231,14 @@ with an explicit prerequisite message rather than bypassing the check --
 deploy the monitor first with publication disabled, confirm it is healthy,
 then re-run with activation requested. When `enable_cloudwatch_publication`
 is `false`, none of this runs -- no CONFIG check, no CloudWatch client.
+
+Both the CONFIG preflight and the post-deployment verification select the
+monitor pod with a jq filter requiring `status.phase == "Running"`, every
+container `ready == true`, **and** `metadata.deletionTimestamp == null` --
+never a blind `.items[0]`, and never a pod that is Ready but already
+terminating. Only the pod name is ever captured; the full pod object is
+never printed. If no such pod exists, the workflow fails closed with a
+sanitized prerequisite message.
 
 After Argo CD sync, the workflow's existing runtime-verification step is
 extended to confirm the deployed pod's `CLOUDWATCH_PUBLISH_ENABLED` env value
@@ -477,8 +506,14 @@ python3 -m unittest discover -s monitoring/monitor/tests -p "test_*.py" -v
 
 ## Docker build
 
+`BASE_IMAGE` has no Dockerfile default (no public/Docker Hub fallback) and
+must be supplied explicitly -- a digest-pinned, approved private ECR
+reference in real use (see "Base image (no public default)" above):
+
 ```
-docker build -t goldengate-monitor:local monitoring/monitor
+docker build \
+  --build-arg BASE_IMAGE=<approved-private-ecr-repository>@sha256:<64 lowercase hex characters> \
+  -t goldengate-monitor:local monitoring/monitor
 ```
 
 ## Helm chart
