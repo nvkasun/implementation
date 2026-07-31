@@ -1,0 +1,530 @@
+name: GoldenGate Monitor Base Image — One-Time Build
+
+run-name: "GoldenGate Monitor Base Image - one-time build | manual dispatch | ran by ${{ github.actor }}"
+
+# TEMPORARY, ONE-TIME WORKFLOW.
+#
+# Purpose: build and push the approved private, digest-pinned Python base
+# image the goldengate-monitor Dockerfile requires (BASE_IMAGE has no
+# public default -- see monitoring/monitor/Dockerfile and
+# .github/workflows/goldengate-monitor.yaml's "Validate approved base image
+# reference" step).
+#
+# This file is deleted from the repository only after:
+#   1. the private base image is built successfully;
+#   2. its ECR digest is verified;
+#   3. the resulting digest-pinned URI is configured as the DEV environment
+#      variable MONITOR_BASE_IMAGE;
+#   4. the normal goldengate-monitor workflow successfully validates that
+#      variable.
+#
+# workflow_dispatch-only. Never runs automatically. Never touches Argo CD,
+# Kubernetes, Terraform, or the monitor application source.
+on:
+  workflow_dispatch:
+    inputs:
+      source_python_image:
+        description: >-
+          Approved official Python image pinned by digest. Must use the
+          exact form docker.io/library/python@sha256:<64 lowercase hex
+          characters>. Tag-only references, other registries, and mutable
+          tags are all rejected.
+        required: true
+        type: string
+      target_repository:
+        description: >-
+          Private ECR repository name for the approved monitor Python base
+          image (company-approved lowercase ECR naming convention, e.g.
+          goldengate/monitor-python-base). No tag/digest suffix.
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  # Reused verbatim from .github/workflows/push_docker_images_to_ECR.yaml --
+  # this workflow is a one-time build/push utility in the same build/ECR
+  # account, not a deployment workflow, so it follows that file's
+  # connectivity convention rather than goldengate-monitor.yaml's.
+  AWS_REGION: eu-west-1
+  ECR_ACCOUNT_ID: "229410149234"
+  ECR_REGISTRY: 229410149234.dkr.ecr.eu-west-1.amazonaws.com
+  ROLE_ARN: arn:aws:iam::229410149234:role/adcb-modelmonitoring-sit-codep-rDeployCodeBuildRole-KMCFNIKqpuUL
+
+  # Fixed target platform for both the source pull and the derived build --
+  # never a build input, never left to the runner's own architecture.
+  TARGET_PLATFORM: linux/amd64
+
+jobs:
+  build_monitor_base_image:
+    name: Build and push the approved monitor Python base image
+
+    # ubuntu-latest only: this repository's CodeBuild runner has no
+    # reachable Docker daemon/socket (see goldengate-monitor.yaml).
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.ROLE_ARN }}
+
+      - name: Verify AWS caller account
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CALLER_ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
+          echo "Caller account: ${CALLER_ACCOUNT}"
+
+          if [ "$CALLER_ACCOUNT" != "$ECR_ACCOUNT_ID" ]; then
+            echo "Unexpected AWS caller account. Expected ${ECR_ACCOUNT_ID} (build/ECR account), got ${CALLER_ACCOUNT}."
+            exit 1
+          fi
+
+          echo "Confirmed: running in the build/ECR account (${ECR_ACCOUNT_ID})."
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Validate source Python image reference
+        env:
+          # GitHub-expression content must never be interpolated directly
+          # into executable shell source. Passed through step-level env
+          # instead -- the assignment below treats it strictly as inert
+          # data, never as command text, regardless of its content.
+          SOURCE_PYTHON_IMAGE_INPUT: ${{ inputs.source_python_image }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SOURCE_PYTHON_IMAGE="$SOURCE_PYTHON_IMAGE_INPUT"
+
+          if [ -z "$SOURCE_PYTHON_IMAGE" ]; then
+            echo "source_python_image is not set."
+            exit 1
+          fi
+
+          # One fully-anchored pattern for the ENTIRE value -- not a prefix
+          # check plus a suffix check. Accepts only the exact official,
+          # digest-pinned Docker Hub Python image reference. This alone
+          # rejects: a tag-only reference, a missing/short/uppercase/
+          # non-hex digest, any other Docker Hub repository, any other
+          # registry (GHCR, public ECR, ...), whitespace, control
+          # characters, quotes, backticks, $(), shell metacharacters, and
+          # any additional suffix.
+          SOURCE_PYTHON_IMAGE_PATTERN='^docker\.io/library/python@sha256:[0-9a-f]{64}$'
+          if [[ ! "$SOURCE_PYTHON_IMAGE" =~ $SOURCE_PYTHON_IMAGE_PATTERN ]]; then
+            echo "source_python_image does not match the required docker.io/library/python@sha256:<64 lowercase hex characters> form."
+            echo "Only the official, digest-pinned Docker Hub Python image is accepted -- never a tag-only reference or another registry."
+            exit 1
+          fi
+
+          echo "SOURCE_PYTHON_IMAGE=${SOURCE_PYTHON_IMAGE}" >> "$GITHUB_ENV"
+          echo "Confirmed: a pinned, official Docker Hub Python source image was accepted."
+
+      - name: Validate target ECR repository name
+        env:
+          TARGET_REPOSITORY_INPUT: ${{ inputs.target_repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TARGET_REPOSITORY="$TARGET_REPOSITORY_INPUT"
+
+          if [ -z "$TARGET_REPOSITORY" ]; then
+            echo "target_repository is not set."
+            exit 1
+          fi
+
+          # One fully-anchored ECR repository-name grammar for the ENTIRE
+          # value: lowercase alphanumeric path component(s), each internal
+          # separator limited to a single '.', '_', or '-', optional
+          # further '/'-separated components -- no leading/trailing slash,
+          # no empty component, no tag/digest syntax. This alone rejects an
+          # empty value, uppercase, whitespace, control characters, quotes,
+          # backticks, $(), shell metacharacters, "./"/"../" components,
+          # and any ":"/"@" tag-or-digest suffix.
+          TARGET_REPOSITORY_PATTERN='^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*$'
+          if [[ ! "$TARGET_REPOSITORY" =~ $TARGET_REPOSITORY_PATTERN ]]; then
+            echo "target_repository does not match the required lowercase ECR repository-name form."
+            echo "Expected shape: lowercase-component(s), optionally '/'-separated, no tag or digest suffix."
+            exit 1
+          fi
+
+          echo "TARGET_REPOSITORY=${TARGET_REPOSITORY}" >> "$GITHUB_ENV"
+          echo "Confirmed: a well-formed ECR repository name was accepted."
+
+      - name: Pull source Python image (digest-pinned)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Pulling ${SOURCE_PYTHON_IMAGE} for platform ${TARGET_PLATFORM}..."
+          docker pull --platform "$TARGET_PLATFORM" "$SOURCE_PYTHON_IMAGE"
+          echo "OK: source image pulled by digest (content-addressed; Docker verifies the digest itself)."
+
+      - name: Validate source runtime prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Bounded, read-only checks only -- never prints env vars,
+          # package indexes, credentials, or the full container config.
+          docker run --rm --platform "$TARGET_PLATFORM" "$SOURCE_PYTHON_IMAGE" sh -c '
+            set -eu
+            ARCH="$(uname -m)"
+            if [ "$ARCH" != "x86_64" ]; then
+              echo "Unexpected architecture: not amd64."
+              exit 1
+            fi
+            command -v python3 >/dev/null 2>&1 || { echo "python3 not found."; exit 1; }
+            PYVER="$(python3 -c "import sys; print(str(sys.version_info[0]) + \".\" + str(sys.version_info[1]))")"
+            if [ "$PYVER" != "3.12" ]; then
+              echo "Unexpected Python version (expected 3.12)."
+              exit 1
+            fi
+            command -v pip >/dev/null 2>&1 || { echo "pip not found."; exit 1; }
+            command -v apt-get >/dev/null 2>&1 || { echo "apt-get not found."; exit 1; }
+            if [ ! -f /etc/debian_version ]; then
+              echo "Not a Debian-compatible operating system."
+              exit 1
+            fi
+            echo "Source runtime prerequisites confirmed: amd64, Python 3.12, pip, apt-get, Debian-compatible."
+          '
+
+      - name: Generate the base Dockerfile
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DOCKERFILE_PATH="${RUNNER_TEMP}/goldengate-monitor-base.Dockerfile"
+
+          # Quoted heredoc delimiter ('DOCKERFILE_EOF') -- the shell writing
+          # this file must NEVER expand $SOURCE_BASE_IMAGE/${OCI_SOURCE}/
+          # ${OCI_VERSION}; those are Docker ARG references, resolved only
+          # by `docker build`, not by this script.
+          cat <<'DOCKERFILE_EOF' > "$DOCKERFILE_PATH"
+          # syntax=docker/dockerfile:1
+
+          ARG SOURCE_BASE_IMAGE
+          FROM ${SOURCE_BASE_IMAGE}
+
+          ARG OCI_SOURCE=""
+          ARG OCI_VERSION="development"
+
+          LABEL org.opencontainers.image.title="goldengate-monitor-python-base" \
+                org.opencontainers.image.description="Approved Python foundation for the shared GoldenGate monitor" \
+                org.opencontainers.image.source="${OCI_SOURCE}" \
+                org.opencontainers.image.version="${OCI_VERSION}"
+
+          ENV PYTHONUNBUFFERED=1 \
+              PYTHONDONTWRITEBYTECODE=1 \
+              PIP_DISABLE_PIP_VERSION_CHECK=1
+
+          RUN apt-get update \
+              && apt-get install -y --no-install-recommends \
+                 ca-certificates \
+                 passwd \
+              && update-ca-certificates \
+              && command -v python3 >/dev/null \
+              && command -v pip >/dev/null \
+              && command -v groupadd >/dev/null \
+              && command -v useradd >/dev/null \
+              && test -s /etc/ssl/certs/ca-certificates.crt \
+              && rm -rf /var/lib/apt/lists/*
+          DOCKERFILE_EOF
+
+          echo "GENERATED_DOCKERFILE_PATH=${DOCKERFILE_PATH}" >> "$GITHUB_ENV"
+          echo "OK: base Dockerfile generated at a runner-temporary path (never committed to the repository)."
+
+      - name: Compute the deterministic content-addressed tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Deterministic: the same source image reference + the same
+          # generated Dockerfile bytes + the same fixed platform always
+          # produce the same tag. Changing any one of the three changes it.
+          TAG_INPUT_PATH="${RUNNER_TEMP}/goldengate-monitor-base.tag-input"
+          {
+            printf '%s\n' "$SOURCE_PYTHON_IMAGE"
+            cat "$GENERATED_DOCKERFILE_PATH"
+            printf '%s\n' "$TARGET_PLATFORM"
+          } > "$TAG_INPUT_PATH"
+
+          GENERATED_HASH="$(sha256sum "$TAG_INPUT_PATH" | awk '{print $1}')"
+          GENERATED_TAG="monitor-python-base-${GENERATED_HASH:0:12}"
+          DESTINATION_IMAGE="${ECR_REGISTRY}/${TARGET_REPOSITORY}:${GENERATED_TAG}"
+
+          echo "GENERATED_TAG=${GENERATED_TAG}" >> "$GITHUB_ENV"
+          echo "DESTINATION_IMAGE=${DESTINATION_IMAGE}" >> "$GITHUB_ENV"
+          echo "Generated tag: ${GENERATED_TAG}"
+          echo "Destination: ${DESTINATION_IMAGE}"
+
+      - name: Ensure target ECR repository exists with the required settings
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if aws ecr describe-repositories \
+            --region "$AWS_REGION" \
+            --repository-names "$TARGET_REPOSITORY" \
+            > "${RUNNER_TEMP}/describe-repo.json" 2>"${RUNNER_TEMP}/describe-repo-error.txt"; then
+
+            echo "ECR repository already exists: ${TARGET_REPOSITORY}. Validating its settings (never changing them)."
+
+            MUTABILITY="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['repositories'][0]['imageTagMutability'])" "${RUNNER_TEMP}/describe-repo.json")"
+            SCAN_ON_PUSH="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['repositories'][0]['imageScanningConfiguration']['scanOnPush'])" "${RUNNER_TEMP}/describe-repo.json")"
+
+            if [ "$MUTABILITY" != "IMMUTABLE" ]; then
+              echo "FAIL: existing repository ${TARGET_REPOSITORY} is not IMMUTABLE (found: ${MUTABILITY}). Refusing to change it automatically."
+              exit 1
+            fi
+            if [ "$SCAN_ON_PUSH" != "True" ]; then
+              echo "FAIL: existing repository ${TARGET_REPOSITORY} does not have scanOnPush enabled. Refusing to change it automatically."
+              exit 1
+            fi
+            echo "OK: existing repository is IMMUTABLE with scanOnPush enabled."
+          else
+            if grep -q "RepositoryNotFoundException" "${RUNNER_TEMP}/describe-repo-error.txt"; then
+              echo "Creating ECR repository: ${TARGET_REPOSITORY}"
+              aws ecr create-repository \
+                --region "$AWS_REGION" \
+                --repository-name "$TARGET_REPOSITORY" \
+                --tags Key=ApplicationName,Value=CloudFactory Key=DataClassification,Value=General Key=BusinessCriticality,Value=Low Key=BusinessUnit,Value=TechnologyPlatform Key=CostCenter,Value=219 \
+                --image-scanning-configuration scanOnPush=true \
+                --image-tag-mutability IMMUTABLE >/dev/null
+              echo "Created ECR repository: ${TARGET_REPOSITORY} (IMMUTABLE, scanOnPush=true)."
+            else
+              echo "Failed to check for the existing repository:"
+              cat "${RUNNER_TEMP}/describe-repo-error.txt"
+              exit 1
+            fi
+          fi
+
+          # Deliberately no EKS-workload-account pull policy on this
+          # repository: the EKS runtime never pulls the base image
+          # directly -- only the final goldengate-monitor application image
+          # (pushed to the separate goldengate-monitor ECR repository)
+          # requires EKS runtime pull access. No cross-account permission
+          # is added here.
+
+      - name: Check whether the generated tag already exists
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if aws ecr describe-images \
+            --region "$AWS_REGION" \
+            --repository-name "$TARGET_REPOSITORY" \
+            --image-ids "imageTag=${GENERATED_TAG}" >/dev/null 2>"${RUNNER_TEMP}/describe-images-error.txt"; then
+            echo "Image already exists in ECR for this exact tag. Reusing it -- no rebuild or push will occur."
+            echo "IMAGE_EXISTED=true" >> "$GITHUB_ENV"
+          else
+            if grep -q "ImageNotFoundException" "${RUNNER_TEMP}/describe-images-error.txt"; then
+              echo "Tag not found in ECR. It will be built and pushed."
+              echo "IMAGE_EXISTED=false" >> "$GITHUB_ENV"
+            else
+              echo "Failed to check for the existing tag:"
+              cat "${RUNNER_TEMP}/describe-images-error.txt"
+              exit 1
+            fi
+          fi
+
+      - name: Build the approved base image
+        if: env.IMAGE_EXISTED != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BUILD_CONTEXT="${RUNNER_TEMP}/goldengate-monitor-base-context"
+          mkdir -p "$BUILD_CONTEXT"
+
+          export DOCKER_BUILDKIT=1
+
+          echo "Building ${DESTINATION_IMAGE} for platform ${TARGET_PLATFORM}..."
+
+          docker build \
+            --platform "$TARGET_PLATFORM" \
+            -f "$GENERATED_DOCKERFILE_PATH" \
+            --build-arg "SOURCE_BASE_IMAGE=${SOURCE_PYTHON_IMAGE}" \
+            --build-arg "OCI_SOURCE=${{ github.server_url }}/${{ github.repository }}" \
+            --build-arg "OCI_VERSION=run-${{ github.run_id }}-${{ github.run_attempt }}" \
+            -t "$DESTINATION_IMAGE" \
+            "$BUILD_CONTEXT"
+
+      - name: Smoke-test the built base image
+        if: env.IMAGE_EXISTED != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Bounded, read-only checks only -- never prints the full
+          # environment. boto3/PyYAML are NOT expected here; those belong
+          # to the final monitor build (monitoring/monitor/requirements.txt).
+          docker run --rm --platform "$TARGET_PLATFORM" "$DESTINATION_IMAGE" sh -c '
+            set -eu
+            ARCH="$(uname -m)"
+            if [ "$ARCH" != "x86_64" ]; then echo "Unexpected architecture: not amd64."; exit 1; fi
+
+            PYVER="$(python3 -c "import sys; print(str(sys.version_info[0]) + \".\" + str(sys.version_info[1]))")"
+            if [ "$PYVER" != "3.12" ]; then echo "Unexpected Python version (expected 3.12)."; exit 1; fi
+
+            python3 -c "import json, ssl, urllib.request, http.server, threading, datetime" \
+              || { echo "A required standard-library module failed to import."; exit 1; }
+
+            python3 -c "import ssl; ssl.create_default_context()" \
+              || { echo "Python SSL support failed to initialize."; exit 1; }
+
+            pip --version >/dev/null 2>&1 || { echo "pip does not work."; exit 1; }
+
+            if [ ! -s /etc/ssl/certs/ca-certificates.crt ]; then
+              echo "Default CA bundle is missing or empty."
+              exit 1
+            fi
+
+            command -v groupadd >/dev/null 2>&1 || { echo "groupadd not found."; exit 1; }
+            command -v useradd >/dev/null 2>&1 || { echo "useradd not found."; exit 1; }
+
+            if [ ! -f /etc/debian_version ]; then
+              echo "Not a Debian-compatible operating system."
+              exit 1
+            fi
+
+            echo "Smoke test passed: amd64, Python 3.12, pip, SSL, CA bundle, groupadd/useradd, Debian-compatible, required stdlib imports."
+          '
+
+      - name: Push the approved base image
+        if: env.IMAGE_EXISTED != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Pushing ${DESTINATION_IMAGE}..."
+          docker push "$DESTINATION_IMAGE"
+
+      - name: Resolve the authoritative ECR image digest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE_DIGEST="$(aws ecr describe-images \
+            --region "$AWS_REGION" \
+            --repository-name "$TARGET_REPOSITORY" \
+            --image-ids "imageTag=${GENERATED_TAG}" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text)"
+
+          DIGEST_PATTERN='^sha256:[0-9a-f]{64}$'
+          if [[ ! "$IMAGE_DIGEST" =~ $DIGEST_PATTERN ]]; then
+            echo "Resolved digest does not match the expected sha256:<64 lowercase hex characters> form."
+            exit 1
+          fi
+
+          FINAL_BASE_IMAGE_REF="${ECR_REGISTRY}/${TARGET_REPOSITORY}@${IMAGE_DIGEST}"
+
+          echo "IMAGE_DIGEST=${IMAGE_DIGEST}" >> "$GITHUB_ENV"
+          echo "FINAL_BASE_IMAGE_REF=${FINAL_BASE_IMAGE_REF}" >> "$GITHUB_ENV"
+          echo "Resolved digest: ${IMAGE_DIGEST}"
+          echo "Final MONITOR_BASE_IMAGE value: ${FINAL_BASE_IMAGE_REF}"
+
+      - name: Check ECR scan status (best-effort, never broadens IAM)
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${IMAGE_DIGEST:-}" ]; then
+            echo "No resolved digest available; skipping scan-status check."
+            echo "SCAN_STATUS_SUMMARY=not checked (no digest resolved)" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          SCAN_STATUS="$(aws ecr describe-image-scan-findings \
+            --region "$AWS_REGION" \
+            --repository-name "$TARGET_REPOSITORY" \
+            --image-id "imageDigest=${IMAGE_DIGEST}" \
+            --query 'imageScanStatus.status' \
+            --output text 2>"${RUNNER_TEMP}/scan-status-error.txt" || true)"
+
+          if [ -z "$SCAN_STATUS" ] || [ "$SCAN_STATUS" = "None" ]; then
+            if grep -qi "AccessDenied" "${RUNNER_TEMP}/scan-status-error.txt" 2>/dev/null; then
+              echo "Scan status unavailable: this workflow's role has no ECR scan-read permission. Not treated as a failure; no IAM change was made."
+              echo "SCAN_STATUS_SUMMARY=unavailable (role lacks scan-read permission)" >> "$GITHUB_ENV"
+            else
+              echo "Scan status not yet available (scan may still be in progress, or findings do not exist yet)."
+              echo "SCAN_STATUS_SUMMARY=pending or unavailable" >> "$GITHUB_ENV"
+            fi
+            exit 0
+          fi
+
+          echo "Scan status: ${SCAN_STATUS}"
+
+          SEVERITY_COUNTS="$(aws ecr describe-image-scan-findings \
+            --region "$AWS_REGION" \
+            --repository-name "$TARGET_REPOSITORY" \
+            --image-id "imageDigest=${IMAGE_DIGEST}" \
+            --query 'imageScanFindings.findingSeverityCounts' \
+            --output json 2>/dev/null || echo '{}')"
+
+          echo "Severity counts: ${SEVERITY_COUNTS}"
+          echo "SCAN_STATUS_SUMMARY=${SCAN_STATUS} ${SEVERITY_COUNTS}" >> "$GITHUB_ENV"
+
+      - name: Workflow summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## GoldenGate monitor base image -- one-time build"
+            echo ""
+            echo "- Source: \`${SOURCE_PYTHON_IMAGE:-unknown}\` (accepted as a digest-pinned official Python image)"
+            echo "- Target ECR repository: \`${TARGET_REPOSITORY:-unknown}\`"
+            echo "- Generated immutable tag: \`${GENERATED_TAG:-unknown}\`"
+            echo "- Image reused (already existed): \`${IMAGE_EXISTED:-unknown}\`"
+            echo "- Resolved ECR image digest: \`${IMAGE_DIGEST:-unknown}\`"
+            echo "- Architecture: amd64"
+            echo "- Python version: 3.12"
+            echo "- Scan status: \`${SCAN_STATUS_SUMMARY:-not checked}\`"
+            echo ""
+            echo "### Final digest-pinned MONITOR_BASE_IMAGE value"
+            echo ""
+            echo "\`\`\`"
+            echo "${FINAL_BASE_IMAGE_REF:-unavailable}"
+            echo "\`\`\`"
+            echo ""
+            echo "### Next manual action"
+            echo ""
+            echo "Configure the following DEV environment variable only after the ECR image"
+            echo "scan/security review is approved:"
+            echo ""
+            echo "Name:"
+            echo "MONITOR_BASE_IMAGE"
+            echo ""
+            echo "Value:"
+            echo "\`${FINAL_BASE_IMAGE_REF:-unavailable}\`"
+            echo ""
+            echo "Then run:"
+            echo ""
+            echo ".github/workflows/goldengate-monitor.yaml"
+            echo ""
+            echo "with:"
+            echo ""
+            echo "- environment=dev"
+            echo "- deploy=false"
+            echo "- enable_cloudwatch_publication=false"
+            echo ""
+            echo "This workflow does not modify GitHub environment variables and does not"
+            echo "invoke the monitor workflow automatically."
+            echo ""
+            echo "This workflow file is temporary and must be deleted from the repository"
+            echo "only after MONITOR_BASE_IMAGE has been configured and validated by"
+            echo "goldengate-monitor.yaml."
+          } >> "$GITHUB_STEP_SUMMARY"
