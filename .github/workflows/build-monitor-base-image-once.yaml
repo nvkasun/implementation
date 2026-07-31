@@ -43,6 +43,14 @@ permissions:
   id-token: write
   contents: read
 
+# Fixed, static group -- never derived from a workflow input -- so any two
+# runs of this one-time workflow (regardless of source_python_image/
+# target_repository) can never execute concurrently and race against the
+# same immutable ECR tag.
+concurrency:
+  group: goldengate-monitor-base-image-one-time
+  cancel-in-progress: false
+
 env:
   # Reused verbatim from .github/workflows/push_docker_images_to_ECR.yaml --
   # this workflow is a one-time build/push utility in the same build/ECR
@@ -230,9 +238,15 @@ jobs:
           # contain this runtime foundation (see "Validate source runtime
           # prerequisites" above) -- the single RUN below only ASSERTS
           # that, never installs or modifies OS packages.
+          #
+          # No "# syntax=docker/dockerfile:1" frontend directive: this
+          # Dockerfile uses only standard ARG/FROM/LABEL/ENV/RUN
+          # instructions and needs no external, mutable Dockerfile
+          # frontend reference. (The separate, unmodified application
+          # Dockerfile at monitoring/monitor/Dockerfile still has this
+          # directive -- see the final report; removing it there is a
+          # separate correction, out of scope for this temporary workflow.)
           cat <<'DOCKERFILE_EOF' > "$DOCKERFILE_PATH"
-          # syntax=docker/dockerfile:1
-
           ARG SOURCE_BASE_IMAGE
           FROM ${SOURCE_BASE_IMAGE}
 
@@ -535,15 +549,34 @@ jobs:
 
           echo "Scan status: ${SCAN_STATUS}"
 
-          SEVERITY_COUNTS="$(aws ecr describe-image-scan-findings \
+          # aws --output json can pretty-print (embedded newlines), and the
+          # query path can legitimately resolve to `null`. Either would
+          # break a plain "KEY=...multi-line-value..." append to
+          # GITHUB_ENV (each line becomes its own bogus env-file entry).
+          # Canonicalize through Python's json module into a single
+          # compact, deterministically-sorted line before ever writing it.
+          if SEVERITY_COUNTS_RAW="$(aws ecr describe-image-scan-findings \
             --region "$AWS_REGION" \
             --repository-name "$TARGET_REPOSITORY" \
             --image-id "imageDigest=${IMAGE_DIGEST}" \
             --query 'imageScanFindings.findingSeverityCounts' \
-            --output json 2>/dev/null || echo '{}')"
+            --output json 2>/dev/null)"; then
+            SEVERITY_COUNTS="$(
+              printf '%s' "$SEVERITY_COUNTS_RAW" |
+                python3 -c '
+          import json
+          import sys
+          value = json.load(sys.stdin) or {}
+          print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+          '
+            )"
+          else
+            SEVERITY_COUNTS='{}'
+          fi
 
-          echo "Severity counts: ${SEVERITY_COUNTS}"
-          echo "SCAN_STATUS_SUMMARY=${SCAN_STATUS} ${SEVERITY_COUNTS}" >> "$GITHUB_ENV"
+          printf 'Severity counts: %s\n' "$SEVERITY_COUNTS"
+          printf 'SCAN_STATUS_SUMMARY=%s %s\n' \
+            "$SCAN_STATUS" "$SEVERITY_COUNTS" >> "$GITHUB_ENV"
 
       - name: Workflow summary
         if: always()
