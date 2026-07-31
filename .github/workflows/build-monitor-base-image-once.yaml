@@ -176,8 +176,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Bounded, read-only checks only -- never prints env vars,
-          # package indexes, credentials, or the full container config.
+          # The approved source image must already contain the full
+          # runtime foundation the derived Dockerfile only ASSERTS (never
+          # installs -- see "Generate the base Dockerfile" below). Bounded,
+          # read-only checks only -- never prints env vars, package
+          # indexes, credentials, or the full container config.
           docker run --rm --platform "$TARGET_PLATFORM" "$SOURCE_PYTHON_IMAGE" sh -c '
             set -eu
             ARCH="$(uname -m)"
@@ -192,12 +195,21 @@ jobs:
               exit 1
             fi
             command -v pip >/dev/null 2>&1 || { echo "pip not found."; exit 1; }
-            command -v apt-get >/dev/null 2>&1 || { echo "apt-get not found."; exit 1; }
             if [ ! -f /etc/debian_version ]; then
               echo "Not a Debian-compatible operating system."
               exit 1
             fi
-            echo "Source runtime prerequisites confirmed: amd64, Python 3.12, pip, apt-get, Debian-compatible."
+            if [ ! -s /etc/ssl/certs/ca-certificates.crt ]; then
+              echo "Default CA bundle is missing or empty."
+              exit 1
+            fi
+            command -v groupadd >/dev/null 2>&1 || { echo "groupadd not found."; exit 1; }
+            command -v useradd >/dev/null 2>&1 || { echo "useradd not found."; exit 1; }
+            python3 -c "import ssl; ssl.create_default_context()" \
+              || { echo "Python SSL support failed to initialize."; exit 1; }
+            python3 -c "import json, ssl, urllib.request, http.server, threading, datetime" \
+              || { echo "A required standard-library module failed to import."; exit 1; }
+            echo "Source runtime prerequisites confirmed: amd64, Python 3.12, pip, CA bundle, groupadd, useradd, Debian-compatible, SSL init, required stdlib imports."
           '
 
       - name: Generate the base Dockerfile
@@ -211,6 +223,13 @@ jobs:
           # this file must NEVER expand $SOURCE_BASE_IMAGE/${OCI_SOURCE}/
           # ${OCI_VERSION}; those are Docker ARG references, resolved only
           # by `docker build`, not by this script.
+          #
+          # No apt-get/package installation here: those results would not
+          # be covered by the source-image digest or the deterministic tag.
+          # The approved source image is instead REQUIRED to already
+          # contain this runtime foundation (see "Validate source runtime
+          # prerequisites" above) -- the single RUN below only ASSERTS
+          # that, never installs or modifies OS packages.
           cat <<'DOCKERFILE_EOF' > "$DOCKERFILE_PATH"
           # syntax=docker/dockerfile:1
 
@@ -229,17 +248,11 @@ jobs:
               PYTHONDONTWRITEBYTECODE=1 \
               PIP_DISABLE_PIP_VERSION_CHECK=1
 
-          RUN apt-get update \
-              && apt-get install -y --no-install-recommends \
-                 ca-certificates \
-                 passwd \
-              && update-ca-certificates \
-              && command -v python3 >/dev/null \
+          RUN command -v python3 >/dev/null \
               && command -v pip >/dev/null \
               && command -v groupadd >/dev/null \
               && command -v useradd >/dev/null \
-              && test -s /etc/ssl/certs/ca-certificates.crt \
-              && rm -rf /var/lib/apt/lists/*
+              && test -s /etc/ssl/certs/ca-certificates.crt
           DOCKERFILE_EOF
 
           echo "GENERATED_DOCKERFILE_PATH=${DOCKERFILE_PATH}" >> "$GITHUB_ENV"
@@ -250,20 +263,36 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Runner-provided environment variables, not a direct GitHub
+          # expression inside shell source -- GITHUB_SERVER_URL/
+          # GITHUB_REPOSITORY are ordinary env vars every step already has.
+          OCI_SOURCE_VALUE="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+
           # Deterministic: the same source image reference + the same
-          # generated Dockerfile bytes + the same fixed platform always
-          # produce the same tag. Changing any one of the three changes it.
+          # generated Dockerfile bytes + the same fixed platform + the same
+          # repository source URL always produce the same tag. Changing
+          # any one of these actual inputs changes it. Nothing
+          # run-specific (github.run_id/run_attempt) participates -- those
+          # would make identical actual inputs produce a different tag/
+          # image metadata on every single run.
           TAG_INPUT_PATH="${RUNNER_TEMP}/goldengate-monitor-base.tag-input"
           {
             printf '%s\n' "$SOURCE_PYTHON_IMAGE"
             cat "$GENERATED_DOCKERFILE_PATH"
             printf '%s\n' "$TARGET_PLATFORM"
+            printf '%s\n' "$OCI_SOURCE_VALUE"
           } > "$TAG_INPUT_PATH"
 
           GENERATED_HASH="$(sha256sum "$TAG_INPUT_PATH" | awk '{print $1}')"
           GENERATED_TAG="monitor-python-base-${GENERATED_HASH:0:12}"
           DESTINATION_IMAGE="${ECR_REGISTRY}/${TARGET_REPOSITORY}:${GENERATED_TAG}"
 
+          # Stable OCI version metadata: derived only from the already-
+          # deterministic GENERATED_TAG, never from run_id/run_attempt.
+          OCI_VERSION_VALUE="${GENERATED_TAG}"
+
+          echo "OCI_SOURCE_VALUE=${OCI_SOURCE_VALUE}" >> "$GITHUB_ENV"
+          echo "OCI_VERSION_VALUE=${OCI_VERSION_VALUE}" >> "$GITHUB_ENV"
           echo "GENERATED_TAG=${GENERATED_TAG}" >> "$GITHUB_ENV"
           echo "DESTINATION_IMAGE=${DESTINATION_IMAGE}" >> "$GITHUB_ENV"
           echo "Generated tag: ${GENERATED_TAG}"
@@ -356,20 +385,58 @@ jobs:
             --platform "$TARGET_PLATFORM" \
             -f "$GENERATED_DOCKERFILE_PATH" \
             --build-arg "SOURCE_BASE_IMAGE=${SOURCE_PYTHON_IMAGE}" \
-            --build-arg "OCI_SOURCE=${{ github.server_url }}/${{ github.repository }}" \
-            --build-arg "OCI_VERSION=run-${{ github.run_id }}-${{ github.run_attempt }}" \
+            --build-arg "OCI_SOURCE=${OCI_SOURCE_VALUE}" \
+            --build-arg "OCI_VERSION=${OCI_VERSION_VALUE}" \
             -t "$DESTINATION_IMAGE" \
             "$BUILD_CONTEXT"
 
-      - name: Smoke-test the built base image
-        if: env.IMAGE_EXISTED != 'true'
+      - name: Pull the reused base image
+        if: env.IMAGE_EXISTED == 'true'
         shell: bash
         run: |
           set -euo pipefail
 
-          # Bounded, read-only checks only -- never prints the full
-          # environment. boto3/PyYAML are NOT expected here; those belong
-          # to the final monitor build (monitoring/monitor/requirements.txt).
+          echo "Pulling existing image ${DESTINATION_IMAGE} for platform ${TARGET_PLATFORM} (reused, never rebuilt or overwritten)..."
+          docker pull --platform "$TARGET_PLATFORM" "$DESTINATION_IMAGE"
+
+      - name: Verify OCI labels
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Runs unconditionally for both a freshly built image and a
+          # reused ECR image -- the image is available locally either way
+          # (just built and tagged, or just pulled above).
+          TITLE_LABEL="$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.title" }}' "$DESTINATION_IMAGE")"
+          SOURCE_LABEL="$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.source" }}' "$DESTINATION_IMAGE")"
+          VERSION_LABEL="$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$DESTINATION_IMAGE")"
+
+          if [ "$TITLE_LABEL" != "goldengate-monitor-python-base" ]; then
+            echo "FAIL: org.opencontainers.image.title label is absent or does not match the expected value."
+            exit 1
+          fi
+          if [ -z "$SOURCE_LABEL" ] || [ "$SOURCE_LABEL" != "$OCI_SOURCE_VALUE" ]; then
+            echo "FAIL: org.opencontainers.image.source label is absent or does not match the expected repository source URL."
+            exit 1
+          fi
+          if [ -z "$VERSION_LABEL" ] || [ "$VERSION_LABEL" != "$OCI_VERSION_VALUE" ]; then
+            echo "FAIL: org.opencontainers.image.version label is absent or does not match the generated tag."
+            exit 1
+          fi
+
+          echo "OK: OCI labels verified (title/source/version)."
+
+      - name: Smoke-test the base image (new or reused)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Runs unconditionally for both a freshly built image and a
+          # reused ECR image -- never skipped merely because the tag
+          # already existed. Bounded, read-only checks only -- never
+          # prints the full environment. boto3/PyYAML are NOT expected
+          # here; those belong to the final monitor build
+          # (monitoring/monitor/requirements.txt).
           docker run --rm --platform "$TARGET_PLATFORM" "$DESTINATION_IMAGE" sh -c '
             set -eu
             ARCH="$(uname -m)"
