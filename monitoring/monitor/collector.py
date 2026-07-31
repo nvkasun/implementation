@@ -988,16 +988,28 @@ def build_metric_batch(pipeline, deployment_type, flags, procs=None,
     return md
 
 
-def publish_metric_batch(cw, metric_data):
+def publish_metric_batch(cw, metric_data, pipeline=None):
     """The only boto3-calling half of metric emission -- always called behind
-    cloudwatch_enabled_for(cfg), never while the hard switch is false."""
+    cloudwatch_enabled_for(cfg), never while the hard switch is false. A
+    PutMetricData failure is swallowed here (sanitized structured log only,
+    never a raw exception/traceback) so it can never crash the polling loop
+    or affect a DynamoDB deployment-status write -- no retries, matching the
+    manager-compatible one-publication-attempt semantics."""
     if not cw or not metric_data:
         return
-    for i in range(0, len(metric_data), 20):  # PutMetricData max 20/call
+    batches = [metric_data[i:i + 20] for i in range(0, len(metric_data), 20)]  # PutMetricData max 20/call
+    for batch_index, batch in enumerate(batches):
         try:
-            cw.put_metric_data(Namespace=CLOUDWATCH_NAMESPACE, MetricData=metric_data[i:i + 20])
-        except Exception:
-            logger.exception("CloudWatch put_metric_data failed; continuing")
+            cw.put_metric_data(Namespace=CLOUDWATCH_NAMESPACE, MetricData=batch)
+        except Exception as exc:
+            logger.error(json.dumps({
+                "event": "cloudwatch_put_metric_data_failed",
+                "deployment": pipeline,
+                "metricCount": len(batch),
+                "batchIndex": batch_index,
+                "batchCount": len(batches),
+                "errorCategory": type(exc).__name__,
+            }))
 
 
 class _FencedOff(Exception):
@@ -1181,7 +1193,7 @@ def polling_loop(deployment, table, mgr, state, stop_event):
                 # build_metric_batch's heartbeat_ok docstring).
                 if cloudwatch_enabled_for(cfg):
                     metric_data = build_metric_batch(pipeline, deployment_type, flags, heartbeat_ok=True)
-                    publish_metric_batch(_cloudwatch_client(), metric_data)
+                    publish_metric_batch(_cloudwatch_client(), metric_data, pipeline=pipeline)
                 _sleep_watching_leadership(interval)
                 continue
 
@@ -1262,7 +1274,7 @@ def polling_loop(deployment, table, mgr, state, stop_event):
                 metric_data = build_metric_batch(pipeline, deployment_type, flags, procs=procs,
                                                  critical_service_status=svc_up,
                                                  abend_events=abend_event_names, heartbeat_ok=True)
-                publish_metric_batch(_cloudwatch_client(), metric_data)
+                publish_metric_batch(_cloudwatch_client(), metric_data, pipeline=pipeline)
 
         except _FencedOff:
             pass

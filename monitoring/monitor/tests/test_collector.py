@@ -671,6 +671,69 @@ class PublishMetricBatchTests(unittest.TestCase):
         cw.put_metric_data.assert_not_called()
 
 
+class PublishMetricBatchFailureLoggingTests(unittest.TestCase):
+    """Phase 4D1 correction: a PutMetricData failure must never crash the
+    caller and must be logged with only safe, closed fields -- never a raw
+    exception message, traceback, ARN, hostname, secret path, or process
+    name. No retries -- one publication attempt per batch."""
+
+    def _failing_cw(self, message):
+        cw = MagicMock()
+        cw.put_metric_data.side_effect = RuntimeError(message)
+        return cw
+
+    def test_failure_does_not_raise(self):
+        cw = self._failing_cw("boom")
+        metric_data = [{"MetricName": "AbendState", "Dimensions": [], "Value": 0.0, "Unit": "Count"}]
+        core.publish_metric_batch(cw, metric_data, pipeline="gg-oracle-payments-01")  # must not raise
+
+    def test_failure_log_contains_no_raw_exception_or_internal_detail(self):
+        secret_message = (
+            "arn:aws:sts::668311715351:assumed-role/GoldenGateMonitorReadRole-dev/i-0123456789abcdef "
+            "AccessDenied for host gg-oracle-payments-01.goldengate-dev.svc.cluster.local "
+            "process EXTORA1 secret=/mnt/secrets-store/dev-goldengate-source-admin")
+        cw = self._failing_cw(secret_message)
+        metric_data = [{"MetricName": "AbendState", "Dimensions": [{"Name": "Process", "Value": "EXTORA1"}],
+                        "Value": 0.0, "Unit": "Count"}]
+        with self.assertLogs(core.logger, level="ERROR") as log_ctx:
+            core.publish_metric_batch(cw, metric_data, pipeline="gg-oracle-payments-01")
+        combined = "\n".join(log_ctx.output)
+        for forbidden in ("arn:aws", "GoldenGateMonitorReadRole-dev", "i-0123456789abcdef",
+                         "goldengate-dev.svc.cluster.local", "EXTORA1", "/mnt/secrets-store",
+                         "Traceback", "AccessDenied"):
+            self.assertNotIn(forbidden, combined)
+
+    def test_failure_log_contains_only_the_documented_safe_fields(self):
+        cw = self._failing_cw("boom")
+        metric_data = [{"MetricName": "AbendState", "Dimensions": [], "Value": 0.0, "Unit": "Count"}]
+        with self.assertLogs(core.logger, level="ERROR") as log_ctx:
+            core.publish_metric_batch(cw, metric_data, pipeline="gg-oracle-payments-01")
+        record = json.loads(log_ctx.records[0].getMessage())
+        self.assertEqual(record["event"], "cloudwatch_put_metric_data_failed")
+        self.assertEqual(record["deployment"], "gg-oracle-payments-01")
+        self.assertEqual(record["metricCount"], 1)
+        self.assertEqual(record["batchIndex"], 0)
+        self.assertEqual(record["batchCount"], 1)
+        self.assertEqual(record["errorCategory"], "RuntimeError")
+        self.assertEqual(set(record.keys()),
+                         {"event", "deployment", "metricCount", "batchIndex", "batchCount", "errorCategory"})
+
+    def test_failure_in_one_batch_does_not_stop_remaining_batches(self):
+        cw = MagicMock()
+        cw.put_metric_data.side_effect = [RuntimeError("boom"), None]
+        metric_data = [{"MetricName": "AbendState", "Dimensions": [{"Name": "Process", "Value": f"P{i}"}],
+                        "Value": 0.0, "Unit": "Count"} for i in range(25)]
+        with self.assertLogs(core.logger, level="ERROR"):
+            core.publish_metric_batch(cw, metric_data, pipeline="gg-x")
+        self.assertEqual(cw.put_metric_data.call_count, 2)
+
+    def test_no_raw_exception_logging_helper_used_in_source(self):
+        import inspect
+        src = inspect.getsource(core.publish_metric_batch)
+        self.assertNotIn("logger.exception", src)
+        self.assertNotIn("exc_info=True", src)
+
+
 class MetricPublicationIntegrationTests(unittest.TestCase):
     """Wires build_metric_batch/publish_metric_batch into polling_loop:
     heartbeat semantics must depend on an actual successful, fenced
@@ -732,7 +795,7 @@ class MetricPublicationIntegrationTests(unittest.TestCase):
                      mock.patch.object(core, "_cloudwatch_client",
                                        side_effect=lambda: cw_client_calls.append(1) or MagicMock()), \
                      mock.patch.object(core, "publish_metric_batch",
-                                       side_effect=lambda cw, md: publish_calls.append(md)):
+                                       side_effect=lambda cw, md, pipeline=None: publish_calls.append(md)):
                     core.polling_loop(self.DEPLOYMENT, table, mgr, state, stop_event)
             finally:
                 core.CLOUDWATCH_PUBLISH_ENABLED = False

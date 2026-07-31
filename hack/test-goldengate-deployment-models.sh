@@ -603,6 +603,71 @@ else
   fail "monitor.py /api/processes canonical-view helper or no-Scan guarantee changed unexpectedly"
 fi
 
+# ---------------------------------------------------------------------
+# 17. Phase 4D1: CloudWatch metric-path source hardening -- exact manager-
+#     compatible metric contract, sanitized PutMetricData failure logging,
+#     hard switch still gates client construction, no alarm/SNS/gg-alerter/
+#     Fluent Bit or read/alarm CloudWatch IAM permission introduced.
+# ---------------------------------------------------------------------
+echo ""
+echo "--- Phase 4D1: CloudWatch metric-path source hardening ---"
+
+COLLECTOR_SRC="${MONITOR_APP_DIR}/collector.py"
+
+METRIC_CONTRACT_OK="true"
+for token in 'CLOUDWATCH_NAMESPACE = "GoldenGate/Pipelines"' '"LagBreached"' '"AbendFailure"' \
+             '"DeploymentDown"' '"HeartbeatAgeSeconds"' '"CriticalServiceDown"' \
+             '"ExtractLagSeconds"' '"ReplicatLagSeconds"' '"AbendState"' '"AbendEvent"'; do
+  if ! grep -qF "$token" "$COLLECTOR_SRC" 2>/dev/null; then
+    fail "collector.py is missing expected metric-contract token: ${token}"
+    METRIC_CONTRACT_OK="false"
+  fi
+done
+[ "$METRIC_CONTRACT_OK" = "true" ] && pass "collector.py defines the exact manager-compatible namespace/metric-name contract"
+
+if grep -q "def build_metric_batch" "$COLLECTOR_SRC" 2>/dev/null \
+    && grep -q "def publish_metric_batch" "$COLLECTOR_SRC" 2>/dev/null; then
+  pass "collector.py keeps build_metric_batch (pure) and publish_metric_batch (boto3-isolated) as separate functions"
+else
+  fail "collector.py is missing build_metric_batch/publish_metric_batch"
+fi
+
+if grep -q "logger.exception(\"CloudWatch put_metric_data failed" "$COLLECTOR_SRC" 2>/dev/null; then
+  fail "publish_metric_batch still uses raw logger.exception for PutMetricData failures"
+else
+  pass "publish_metric_batch no longer logs a raw exception/traceback on PutMetricData failure"
+fi
+
+if grep -q '"event": "cloudwatch_put_metric_data_failed"' "$COLLECTOR_SRC" 2>/dev/null; then
+  pass "publish_metric_batch logs a sanitized structured event on PutMetricData failure"
+else
+  fail "publish_metric_batch is missing the sanitized cloudwatch_put_metric_data_failed log event"
+fi
+
+if grep -q "cloudwatch:GetMetricData\|cloudwatch:DescribeAlarms\|cloudwatch:ListMetrics\|cloudwatch:GetMetricStatistics" \
+    envs/dev/policies/goldengate-monitor-read-dev/policies/*.json 2>/dev/null; then
+  fail "goldengate-monitor-read-dev policy introduces a CloudWatch read/alarm permission"
+else
+  pass "goldengate-monitor-read-dev IAM policy grants CloudWatch PutMetricData only (no read/alarm actions)"
+fi
+
+ALARM_SNS_FOUND="false"
+if find . -path ./.git -prune -o \( -iname "*gg-alerter*" -o -iname "*fluent-bit*" \) -print 2>/dev/null \
+    | grep -q .; then
+  ALARM_SNS_FOUND="true"
+fi
+if [ "$ALARM_SNS_FOUND" = "false" ]; then
+  pass "no gg-alerter or Fluent Bit implementation exists yet"
+else
+  fail "unexpected gg-alerter/Fluent Bit file found -- out of scope for this phase"
+fi
+
+if [ -f "hack/comma.yaml" ]; then
+  fail "hack/comma.yaml (unreferenced pasted operator note) still present"
+else
+  pass "hack/comma.yaml removed"
+fi
+
 echo ""
 echo "=================================================="
 echo "Summary: ${PASS_COUNT} passed, ${FAIL_COUNT} failed, ${SKIP_COUNT} skipped"
