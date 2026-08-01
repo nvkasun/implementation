@@ -83,9 +83,35 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Verify Python and PyYAML prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # GoldenGate deployment classification (deploymentModel detection,
+          # used to decide what enters the active/deletion matrices) requires
+          # actual YAML parsing -- there is no regex/text fallback. Fail
+          # closed here, with a fixed message, rather than ever letting the
+          # classifier silently accept malformed input.
+          if ! command -v python3 >/dev/null 2>&1; then
+            echo "FAIL: python3 is required to classify GoldenGate deployment values files and is not available on this runner."
+            exit 1
+          fi
+
+          if ! python3 -c "import yaml" >/dev/null 2>&1; then
+            echo "FAIL: PyYAML is required to classify GoldenGate deployment values files and is not available on this runner."
+            exit 1
+          fi
+
+          echo "OK: python3 and PyYAML are available."
+
       - name: Detect changed deployments
         id: detect
         shell: bash
+        env:
+          INPUT_ENVIRONMENT: ${{ inputs.environment }}
+          INPUT_DEPLOYMENT_ID: ${{ inputs.deployment_id }}
+          INPUT_DEPLOY: ${{ inputs.deploy }}
         run: |
           set -euo pipefail
 
@@ -217,36 +243,24 @@ jobs:
             return 0
           }
 
-          # Returns 0 (is a GoldenGate runtime deployment values file) or 1
-          # (is not) on stdout as a one-line reason, for a given
-          # envs/dev/<id>/values.yaml path. Classification is based solely
-          # on content -- never on directory name, and never on
-          # deployment.enabled/lifecycle.state (that is a separate,
-          # orthogonal active/inactive concern handled by
-          # is_active_deployment_values_file above). A file only qualifies
-          # as a GoldenGate deployment when it is a non-empty, valid YAML
-          # mapping whose top-level deploymentModel is exactly "singleRuntime"
-          # or "legacyPair". This is what keeps unrelated envs/dev/<x>/
-          # values files (e.g. the separate goldengate-monitor chart's own
-          # values, or Argo CD's own values) out of every GoldenGate
-          # workflow matrix, without hardcoding their folder names.
-          is_goldengate_deployment_values_file() {
-            local values_file="$1"
+          # Strict, fail-closed YAML classifier shared by every GoldenGate-
+          # deployment classification call site in this workflow (active
+          # matrix, workflow_dispatch validation, current-file deletion
+          # classification, and base-revision removed-file classification).
+          # No regex/text fallback: this repository's runner is required
+          # (see "Verify Python and PyYAML prerequisites" above) to have
+          # python3 + PyYAML, so a values file only ever qualifies after
+          # actual YAML parsing. $1 is a path to a file already known to
+          # exist and be non-empty (the two callers below each check that
+          # themselves, since a working-tree file and a git-show'd temp
+          # file have different "missing"/"empty" semantics).
+          _classify_deployment_model_yaml() {
+            local content_file="$1"
 
-            if [ ! -f "$values_file" ]; then
-              echo "missing values.yaml"
-              return 1
-            fi
-
-            if [ ! -s "$values_file" ]; then
-              echo "empty values.yaml"
-              return 1
-            fi
-
-            if command -v python3 >/dev/null 2>&1; then
-              python3 - "$values_file" <<'PYEOF'
-          import re
+            python3 - "$content_file" <<'PYEOF'
           import sys
+
+          import yaml
 
           path = sys.argv[1]
 
@@ -259,22 +273,6 @@ jobs:
           ]
           if not non_comment_lines:
               print("empty/comment-only values.yaml")
-              sys.exit(1)
-
-          ALLOWED_MODELS = ("singleRuntime", "legacyPair")
-
-          try:
-              import yaml
-          except ImportError:
-              # Conservative fallback without PyYAML: only recognizes a
-              # top-level deploymentModel: <literal> line, not arbitrary
-              # YAML nesting/quoting.
-              m = re.search(r'(?m)^deploymentModel\s*:\s*(\S+)\s*$', raw)
-              model = m.group(1).strip("\"'") if m else None
-              if model in ALLOWED_MODELS:
-                  print(f"deploymentModel={model} (text fallback, PyYAML unavailable)")
-                  sys.exit(0)
-              print(f"not a GoldenGate deployment values file: deploymentModel={model!r} (text fallback, PyYAML unavailable)")
               sys.exit(1)
 
           try:
@@ -291,41 +289,99 @@ jobs:
               print("parsed YAML is not a mapping")
               sys.exit(1)
 
+          ALLOWED_MODELS = ("singleRuntime", "legacyPair")
           model = data.get("deploymentModel")
-          if model in ALLOWED_MODELS:
+
+          if isinstance(model, str) and model in ALLOWED_MODELS:
               print(f"deploymentModel={model}")
               sys.exit(0)
 
           print(f"not a GoldenGate deployment values file: deploymentModel={model!r}")
           sys.exit(1)
           PYEOF
-              return $?
-            fi
+            return $?
+          }
 
-            echo "python3 not available on this runner, using conservative bash fallback"
+          # Returns 0 (is a GoldenGate runtime deployment values file) or 1
+          # (is not) on stdout as a one-line reason, for a given
+          # envs/dev/<id>/values.yaml path in the current working tree.
+          # Classification is based solely on content -- never on directory
+          # name, and never on deployment.enabled/lifecycle.state (that is a
+          # separate, orthogonal active/inactive concern handled by
+          # is_active_deployment_values_file above). A file only qualifies
+          # as a GoldenGate deployment when it is a non-empty, valid YAML
+          # mapping whose top-level deploymentModel is a string exactly
+          # equal to "singleRuntime" or "legacyPair". This is what keeps
+          # unrelated envs/dev/<x>/ values files (e.g. the separate
+          # goldengate-monitor chart's own values, or Argo CD's own values)
+          # out of every GoldenGate workflow matrix, without hardcoding
+          # their folder names.
+          is_goldengate_deployment_values_file() {
+            local values_file="$1"
 
-            local non_comment
-            non_comment="$(grep -vE '^[[:space:]]*(#.*)?$' "$values_file" || true)"
-            if [ -z "$non_comment" ]; then
-              echo "empty/comment-only values.yaml (bash fallback)"
+            if [ ! -f "$values_file" ]; then
+              echo "missing values.yaml"
               return 1
             fi
 
-            local model
-            model="$(grep -E '^deploymentModel:' "$values_file" | head -1 | sed -E 's/^deploymentModel:[[:space:]]*//' | tr -d '"'"'"'\r' | xargs || true)"
-            if [ "$model" = "singleRuntime" ] || [ "$model" = "legacyPair" ]; then
-              echo "deploymentModel=${model} (bash fallback)"
-              return 0
+            if [ ! -s "$values_file" ]; then
+              echo "empty values.yaml"
+              return 1
             fi
 
-            echo "not a GoldenGate deployment values file: deploymentModel=${model:-<missing>} (bash fallback)"
-            return 1
+            _classify_deployment_model_yaml "$values_file"
+            return $?
+          }
+
+          # Same classification, applied to a values file's content as it
+          # existed at a specific Git revision (never the working tree) --
+          # used for a removed/renamed deletion candidate, whose current
+          # working-tree content no longer exists. Fails closed (returns 1,
+          # never defaults to any deploymentModel) when the path did not
+          # exist at that revision, was empty, or fails the same strict
+          # YAML/mapping/deploymentModel checks as the working-tree version.
+          is_goldengate_deployment_values_file_at_ref() {
+            local ref="$1"
+            local path="$2"
+            local tmp_file
+            tmp_file="$(mktemp)"
+
+            if ! git show "${ref}:${path}" > "$tmp_file" 2>/dev/null; then
+              echo "missing at ${ref}:${path}"
+              rm -f "$tmp_file"
+              return 1
+            fi
+
+            if [ ! -s "$tmp_file" ]; then
+              echo "empty at ${ref}:${path}"
+              rm -f "$tmp_file"
+              return 1
+            fi
+
+            local reason status
+            reason="$(_classify_deployment_model_yaml "$tmp_file")"
+            status=$?
+            rm -f "$tmp_file"
+            echo "$reason"
+            return $status
           }
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            ENVIRONMENT="${{ inputs.environment }}"
-            DEPLOYMENT_ID="${{ inputs.deployment_id }}"
-            DEPLOY="${{ inputs.deploy }}"
+            # Inert assignment only -- the actual GitHub expression is never
+            # interpolated into this (or any) run script body, only passed
+            # through the step-level env: mapping above. $INPUT_* is always
+            # treated as opaque string data by bash, never as shell source.
+            ENVIRONMENT="$INPUT_ENVIRONMENT"
+            DEPLOYMENT_ID="$INPUT_DEPLOYMENT_ID"
+            DEPLOY="$INPUT_DEPLOY"
+
+            if [[ ! "$DEPLOYMENT_ID" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
+              echo "Invalid deployment_id: $DEPLOYMENT_ID"
+              echo "Use lowercase letters, numbers, and hyphens only."
+              echo "Example: payments-ora-to-pg-001"
+              exit 1
+            fi
+
             VALUES_FILE="envs/${ENVIRONMENT}/${DEPLOYMENT_ID}/values.yaml"
 
             echo "Manual workflow_dispatch trigger for deployment_id=${DEPLOYMENT_ID}, environment=${ENVIRONMENT}."
@@ -464,68 +520,6 @@ jobs:
           done
 
           echo ""
-          # Resolves deploymentModel for a deletion candidate from the BASE
-          # revision (the last commit where the file still existed), not the
-          # working tree -- a deleted file no longer exists there at all.
-          # The deletion job needs this to know whether it may ever clean up
-          # a deployment-specific namespace (legacyPair) or must never touch
-          # the shared namespace (singleRuntime). Same PyYAML-preferred,
-          # conservative-text-fallback approach used elsewhere in this
-          # workflow; any failure (file absent at that ref, unparsable,
-          # unrecognized value) defaults to legacyPair.
-          resolve_deployment_model_from_git() {
-            local ref="$1"
-            local path="$2"
-            local tmp_file
-            tmp_file="$(mktemp)"
-
-            if ! git show "${ref}:${path}" > "$tmp_file" 2>/dev/null || [ ! -s "$tmp_file" ]; then
-              rm -f "$tmp_file"
-              echo "legacyPair"
-              return 0
-            fi
-
-            local model
-            if command -v python3 >/dev/null 2>&1; then
-              model="$(python3 - "$tmp_file" <<'PYEOF'
-          import sys
-
-          path = sys.argv[1]
-
-          try:
-              import yaml
-          except ImportError:
-              import re
-              with open(path) as f:
-                  raw = f.read()
-              m = re.search(r'(?m)^deploymentModel\s*:\s*(\S+)\s*$', raw)
-              model = m.group(1).strip("\"'") if m else "legacyPair"
-              print(model if model in ("legacyPair", "singleRuntime") else "legacyPair")
-              sys.exit(0)
-
-          with open(path) as f:
-              data = yaml.safe_load(f)
-
-          model = "legacyPair"
-          if isinstance(data, dict):
-              raw_model = data.get("deploymentModel")
-              if raw_model in ("legacyPair", "singleRuntime"):
-                  model = raw_model
-
-          print(model)
-          PYEOF
-          )"
-            else
-              model="$(grep -E '^deploymentModel:' "$tmp_file" | head -1 | sed -E 's/^deploymentModel:[[:space:]]*//' | tr -d '"'"'"'\r' | xargs || true)"
-              if [ "$model" != "singleRuntime" ]; then
-                model="legacyPair"
-              fi
-            fi
-
-            rm -f "$tmp_file"
-            echo "$model"
-          }
-
           echo "Detecting deleted or newly-inactive deployment folders under envs/dev/..."
 
           NAME_STATUS="$(git diff --name-status "$BEFORE_SHA" "$AFTER_SHA" -- 'envs/dev/**' 'helm/goldengate/**' || true)"
@@ -557,25 +551,43 @@ jobs:
           for CANDIDATE_ID in $DELETION_CANDIDATE_IDS; do
             VALUES_FILE="envs/dev/${CANDIDATE_ID}/values.yaml"
 
-            # If the values file still exists (was modified, not removed),
-            # it must classify as a GoldenGate deployment before any
-            # deletion evaluation applies to it -- otherwise a different
-            # chart's values file under envs/dev/ could be misread as a
-            # GoldenGate deployment deletion candidate merely because it
-            # changed in this push. A genuinely removed file (no longer
-            # present) still falls through to the existing base-revision
-            # resolution below unchanged.
+            # Classify once, from whichever source actually has content: the
+            # working tree when the file still exists (was modified, not
+            # removed/renamed), otherwise its content at the base revision
+            # (BEFORE_SHA) -- the last point a removed/renamed file's
+            # content can still be read. Fails closed either way: a
+            # candidate that does not resolve to a valid GoldenGate
+            # deploymentModel (singleRuntime/legacyPair) from EITHER source
+            # is never added to the deletion matrix, and is never assumed to
+            # be legacyPair (or any other value) by default. This is what
+            # keeps a removed/renamed different-chart values file (e.g. the
+            # separate goldengate-monitor chart's own, or Argo CD's own)
+            # from ever entering the GoldenGate deletion matrix.
             if [ -f "$VALUES_FILE" ]; then
+              GG_SOURCE="working tree"
               set +e
               GG_REASON="$(is_goldengate_deployment_values_file "$VALUES_FILE")"
               GG_STATUS=$?
               set -e
-
-              if [ "$GG_STATUS" -ne 0 ]; then
-                echo "Not a GoldenGate deployment: ${CANDIDATE_ID} (${GG_REASON}) -- ignoring for deletion evaluation."
-                continue
-              fi
+            else
+              GG_SOURCE="base revision (${BEFORE_SHA})"
+              set +e
+              GG_REASON="$(is_goldengate_deployment_values_file_at_ref "$BEFORE_SHA" "$VALUES_FILE")"
+              GG_STATUS=$?
+              set -e
             fi
+
+            if [ "$GG_STATUS" -ne 0 ]; then
+              echo "Not a GoldenGate deployment: ${CANDIDATE_ID} (${GG_REASON}, from ${GG_SOURCE}) -- ignoring for deletion evaluation."
+              continue
+            fi
+
+            # GG_REASON is exactly "deploymentModel=<singleRuntime|legacyPair>"
+            # on success (see _classify_deployment_model_yaml) -- the
+            # deployment_model placed in the deletion matrix below comes
+            # directly from this same successfully parsed and classified
+            # document, never re-derived separately.
+            CANDIDATE_DEPLOYMENT_MODEL="${GG_REASON#deploymentModel=}"
 
             set +e
             REASON="$(is_active_deployment_values_file "$VALUES_FILE")"
@@ -598,9 +610,7 @@ jobs:
                 *)
                   echo "Inactive/deleted: ${CANDIDATE_ID} (${REASON})"
                   INACTIVE_LOG="${INACTIVE_LOG}  - ${CANDIDATE_ID} (${REASON})\n"
-
-                  CANDIDATE_DEPLOYMENT_MODEL="$(resolve_deployment_model_from_git "$BEFORE_SHA" "$VALUES_FILE")"
-                  echo "  deploymentModel at base revision (${BEFORE_SHA}): ${CANDIDATE_DEPLOYMENT_MODEL}"
+                  echo "  deploymentModel (${GG_SOURCE}): ${CANDIDATE_DEPLOYMENT_MODEL}"
 
                   DELETION_MATRIX_ITEMS="$(echo "$DELETION_MATRIX_ITEMS" | jq -c \
                     --arg deployment_id "$CANDIDATE_ID" \
@@ -1386,18 +1396,38 @@ jobs:
           )
 
           # --- Services: exactly one ClusterIP, one headless -----------------------
+          # Exact partition, not a substring/"occurs somewhere" check: every
+          # rendered Service is classified into exactly one of two disjoint
+          # buckets by its own clusterIP (and, for the normal bucket, its
+          # type), and each bucket's length must be exactly 1.
           services = [d for d in documents if d.get("kind") == "Service"]
           if len(services) != 2:
               print(f"FAIL: expected exactly 2 Service documents (one ClusterIP, one headless), found {len(services)}.")
               sys.exit(1)
 
-          service_types = [(s.get("spec") or {}).get("type") for s in services]
-          cluster_ips = [(s.get("spec") or {}).get("clusterIP") for s in services]
-          if "ClusterIP" not in service_types:
-              print(f"FAIL: expected ClusterIP Service not found. Types: {service_types}")
+          headless_services = [
+              s for s in services
+              if (s.get("spec") or {}).get("clusterIP") == "None"
+          ]
+          normal_services = [
+              s for s in services
+              if (s.get("spec") or {}).get("clusterIP") != "None"
+              and (s.get("spec") or {}).get("type") in (None, "ClusterIP")
+          ]
+
+          if len(headless_services) != 1:
+              print(
+                  "FAIL: expected exactly one headless Service (spec.clusterIP == 'None'), "
+                  f"found {len(headless_services)}."
+              )
               sys.exit(1)
-          if "None" not in cluster_ips:
-              print(f"FAIL: expected headless Service (clusterIP: None) not found. clusterIPs: {cluster_ips}")
+
+          if len(normal_services) != 1:
+              print(
+                  "FAIL: expected exactly one normal ClusterIP Service "
+                  "(spec.clusterIP != 'None' and type ClusterIP or omitted/defaulted), "
+                  f"found {len(normal_services)}."
+              )
               sys.exit(1)
           print("OK: exactly one ClusterIP Service and one headless Service.")
 

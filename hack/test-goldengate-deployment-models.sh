@@ -1025,7 +1025,29 @@ else:
 PYEOF
 
   awk '/^is_active_deployment_values_file\(\) \{/,/^\}$/' "${WORKDIR}/detect_script.sh" > "${WORKDIR}/is_active_fn.sh"
-  awk '/^is_goldengate_deployment_values_file\(\) \{/,/^\}$/' "${WORKDIR}/detect_script.sh" > "${WORKDIR}/is_gg_fn.sh"
+
+  # is_goldengate_deployment_values_file and its git-revision sibling both
+  # depend on _classify_deployment_model_yaml -- all three must be extracted
+  # and sourced together, in dependency order, or the classifier fails with
+  # "command not found" while still being source-able (a broken harness that
+  # silently produces no useful assertion, exactly the defect being fixed
+  # here).
+  {
+    awk '/^_classify_deployment_model_yaml\(\) \{/,/^\}$/' "${WORKDIR}/detect_script.sh"
+    echo ""
+    awk '/^is_goldengate_deployment_values_file\(\) \{/,/^\}$/' "${WORKDIR}/detect_script.sh"
+    echo ""
+    awk '/^is_goldengate_deployment_values_file_at_ref\(\) \{/,/^\}$/' "${WORKDIR}/detect_script.sh"
+  } > "${WORKDIR}/is_gg_fn.sh"
+
+  # Fail loudly (not silently) if any expected function body failed to
+  # extract -- an empty/missing body here would make every downstream
+  # source-and-call test below meaningless.
+  for required_fn in _classify_deployment_model_yaml is_goldengate_deployment_values_file is_goldengate_deployment_values_file_at_ref; do
+    if ! grep -q "^${required_fn}() {" "${WORKDIR}/is_gg_fn.sh"; then
+      fail "could not extract ${required_fn}() from ${EKS_APP_WORKFLOW} -- the classifier test harness cannot run"
+    fi
+  done
 
   cat > "${WORKDIR}/run_is_active_checks.sh" <<HARNESS
 #!/bin/bash
@@ -1154,48 +1176,114 @@ HARNESS
   fi
 
   # Deletion-candidate safeguard: extract the real case-statement logic and
-  # prove deployment.enabled=false never queues a deletion request, while a
-  # genuinely removed file or lifecycle.state=absent still does.
+  # exercise it, together with the REAL classifier functions (never stubs
+  # for is_goldengate_deployment_values_file/_at_ref -- only jq is stubbed,
+  # since its own JSON behavior is not what this test verifies), against a
+  # throwaway, self-contained Git repository built specifically to exercise
+  # all 7 required scenarios: existing/removed files, GoldenGate/non-
+  # GoldenGate deploymentModel, and malformed/unknown content.
   awk '/^for CANDIDATE_ID in \$DELETION_CANDIDATE_IDS; do$/,/^done$/' "${WORKDIR}/detect_script.sh" > "${WORKDIR}/deletion_loop.sh"
 
-  if [ -s "${WORKDIR}/deletion_loop.sh" ]; then
-    DELETION_TEST_OUTPUT="$(bash -c '
+  if [ -s "${WORKDIR}/deletion_loop.sh" ] && [ -s "${WORKDIR}/is_gg_fn.sh" ]; then
+    DELETION_REPO="${WORKDIR}/deletion-repo"
+    rm -rf "$DELETION_REPO"
+    mkdir -p "$DELETION_REPO"
+
+    mkdir -p "${DELETION_REPO}/envs/dev/case2-removed-canonical" \
+             "${DELETION_REPO}/envs/dev/goldengate-monitor" \
+             "${DELETION_REPO}/envs/dev/argocd" \
+             "${DELETION_REPO}/envs/dev/case6-malformed" \
+             "${DELETION_REPO}/envs/dev/case7-unknown-model"
+
+    printf 'deploymentModel: singleRuntime\nrunning: at-base-revision\n' > "${DELETION_REPO}/envs/dev/case2-removed-canonical/values.yaml"
+    printf 'global:\n  environment: dev\nnamespace:\n  create: true\n' > "${DELETION_REPO}/envs/dev/goldengate-monitor/values.yaml"
+    printf 'server:\n  extraArgs: []\n' > "${DELETION_REPO}/envs/dev/argocd/values.yaml"
+    printf 'deploymentModel: singleRuntime\n  bad indent: [unterminated\n' > "${DELETION_REPO}/envs/dev/case6-malformed/values.yaml"
+    printf 'deploymentModel: someUnknownModel\n' > "${DELETION_REPO}/envs/dev/case7-unknown-model/values.yaml"
+
+    git -C "$DELETION_REPO" init -q
+    git -C "$DELETION_REPO" config user.email "test@test.invalid"
+    git -C "$DELETION_REPO" config user.name "test"
+    git -C "$DELETION_REPO" add -A
+    git -C "$DELETION_REPO" commit -q -m "base revision"
+    DELETION_BEFORE_SHA="$(git -C "$DELETION_REPO" rev-parse HEAD)"
+
+    # Now mutate the working tree to the "after" state the loop actually
+    # evaluates: case2/4/5/6/7 are removed (git rm, matching a real
+    # removed/renamed deletion candidate); case1 and case3 are added fresh
+    # in the working tree only (never committed -- they represent "still
+    # exists, but now inactive" candidates, which is what the loop's
+    # is_goldengate_deployment_values_file working-tree path reads).
+    git -C "$DELETION_REPO" rm -rq envs/dev/case2-removed-canonical envs/dev/goldengate-monitor envs/dev/argocd envs/dev/case6-malformed envs/dev/case7-unknown-model
+
+    mkdir -p "${DELETION_REPO}/envs/dev/case1-payments-ora-to-pg-001" "${DELETION_REPO}/envs/dev/case3-lifecycle-absent"
+    printf 'deploymentModel: legacyPair\ndeployment:\n  enabled: false\n' > "${DELETION_REPO}/envs/dev/case1-payments-ora-to-pg-001/values.yaml"
+    printf 'deploymentModel: legacyPair\nlifecycle:\n  state: absent\n' > "${DELETION_REPO}/envs/dev/case3-lifecycle-absent/values.yaml"
+
+    DELETION_TEST_OUTPUT="$(cd "$DELETION_REPO" && bash -c '
       set -euo pipefail
-      is_active_deployment_values_file() { echo "$FAKE_REASON"; return "$FAKE_STATUS"; }
-      resolve_deployment_model_from_git() { echo "legacyPair"; }
-      jq() { echo "[DELETION_ADDED]"; }
-      BEFORE_SHA="deadbeef"
-      LOOP_SCRIPT="'"${WORKDIR}"'/deletion_loop.sh"
-
-      run_case() {
-        local id="$1" status="$2" reason="$3"
-        FAKE_STATUS="$status"; FAKE_REASON="$reason"
-        DELETION_MATRIX_ITEMS="[]"; INACTIVE_LOG=""
-        DELETION_CANDIDATE_IDS="$id"
-        source "$LOOP_SCRIPT"
-        echo "$id|$reason|$DELETION_MATRIX_ITEMS"
+      source "'"${WORKDIR}"'/is_gg_fn.sh"
+      source "'"${WORKDIR}"'/is_active_fn.sh"
+      jq() {
+        shift
+        local args=("$@") model="" id=""
+        for i in "${!args[@]}"; do
+          [ "${args[$i]}" = "deployment_id" ] && id="${args[$((i+1))]}"
+          [ "${args[$i]}" = "deployment_model" ] && model="${args[$((i+1))]}"
+        done
+        echo "[ADDED id=${id} model=${model}]"
       }
+      BEFORE_SHA="'"$DELETION_BEFORE_SHA"'"
 
-      run_case "payments-ora-to-pg-001" 1 "deployment.enabled=false"
-      run_case "some-removed-deployment" 1 "missing values.yaml"
-      run_case "some-retired-deployment" 1 "lifecycle.state=absent"
-    ' 2>&1 || true)"
+      for id in case1-payments-ora-to-pg-001 case2-removed-canonical case3-lifecycle-absent goldengate-monitor argocd case6-malformed case7-unknown-model; do
+        DELETION_MATRIX_ITEMS="[]"
+        INACTIVE_LOG=""
+        DELETION_CANDIDATE_IDS="$id"
+        source "'"${WORKDIR}"'/deletion_loop.sh"
+        echo "RESULT ${id} => ${DELETION_MATRIX_ITEMS}"
+      done
+    ' 2>&1)"
+    DELETION_HARNESS_STATUS=$?
     echo "$DELETION_TEST_OUTPUT"
 
-    if echo "$DELETION_TEST_OUTPUT" | grep -q '^payments-ora-to-pg-001|deployment.enabled=false|\[\]$'; then
-      pass "disabling the legacy folder (deployment.enabled=false) produces no deletion-matrix entry (deletion_matrix=[])"
+    # The harness itself must never silently swallow a broken classifier:
+    # any command-not-found or Python traceback anywhere in the captured
+    # output fails this test outright, regardless of what the individual
+    # case assertions below would otherwise report.
+    if [ "$DELETION_HARNESS_STATUS" -ne 0 ] \
+        || echo "$DELETION_TEST_OUTPUT" | grep -qiE "command not found|Traceback \(most recent call last\)|: not found$"; then
+      fail "the deletion-candidate test harness itself failed or is broken (command-not-found/traceback/non-zero exit) -- see output above"
     else
-      fail "disabling the legacy folder unexpectedly produced a deletion-matrix entry"
+      pass "the deletion-candidate test harness ran the real classifier functions with no command-not-found/traceback"
     fi
 
-    if echo "$DELETION_TEST_OUTPUT" | grep -q '^some-removed-deployment|missing values.yaml|\[DELETION_ADDED\]$' \
-        && echo "$DELETION_TEST_OUTPUT" | grep -q '^some-retired-deployment|lifecycle.state=absent|\[DELETION_ADDED\]$'; then
-      pass "a genuinely removed file or lifecycle.state=absent still produces a deletion-matrix entry (deletion safeguards preserved)"
-    else
-      fail "genuine deletion candidates no longer produce a deletion-matrix entry -- deletion safeguard regressed"
-    fi
+    check_deletion_case() {
+      local label="$1" pattern="$2"
+      if echo "$DELETION_TEST_OUTPUT" | grep -qE "$pattern"; then
+        pass "$label"
+      else
+        fail "$label -- expected pattern not found: ${pattern}"
+      fi
+    }
+
+    check_deletion_case "1: existing payments-ora-to-pg-001 with deployment.enabled=false produces no deletion entry" \
+      '^RESULT case1-payments-ora-to-pg-001 => \[\]$'
+    check_deletion_case "2: removed canonical GoldenGate values (deploymentModel: singleRuntime) produces a deletion entry with deployment_model=singleRuntime" \
+      '^RESULT case2-removed-canonical => \[ADDED id=case2-removed-canonical model=singleRuntime\]$'
+    check_deletion_case "3: existing GoldenGate file with lifecycle.state=absent produces a deletion entry" \
+      '^RESULT case3-lifecycle-absent => \[ADDED id=case3-lifecycle-absent model=legacyPair\]$'
+    check_deletion_case "4: removed goldengate-monitor values (no deploymentModel) produces no deletion entry" \
+      '^RESULT goldengate-monitor => \[\]$'
+    check_deletion_case "5: removed argocd values (no deploymentModel) produces no deletion entry" \
+      '^RESULT argocd => \[\]$'
+    check_deletion_case "6: removed malformed YAML produces no deletion entry" \
+      '^RESULT case6-malformed => \[\]$'
+    check_deletion_case "7: removed unknown deploymentModel produces no deletion entry" \
+      '^RESULT case7-unknown-model => \[\]$'
+
+    rm -rf "$DELETION_REPO"
   else
-    fail "could not extract the deletion-candidate loop from ${EKS_APP_WORKFLOW}"
+    fail "could not extract the deletion-candidate loop and/or classifier functions from ${EKS_APP_WORKFLOW}"
   fi
 else
   skip "Phase 5A legacy-folder behavioral checks -- ${EKS_APP_WORKFLOW} or python3 not available"
@@ -1224,6 +1312,81 @@ if [ -f "$EKS_APP_WORKFLOW" ]; then
   fi
 else
   skip "deletion-command sweep -- ${EKS_APP_WORKFLOW} not found"
+fi
+
+echo ""
+echo "--- Phase 5A: no direct \${{ inputs.* }} interpolation in run scripts; marker-file injection tests ---"
+
+if [ -f "$EKS_APP_WORKFLOW" ]; then
+  INPUTS_INTERP_HITS="$(grep -n '\${{ *inputs\.' "$EKS_APP_WORKFLOW" | grep -v '^\s*[0-9]*: *INPUT_[A-Z_]*: \${{ *inputs\.' || true)"
+  # The only acceptable occurrences are inside a step-level `env:` mapping
+  # (INPUT_X: ${{ inputs.x }}), never inside a run-script body. Re-check
+  # precisely against the full line text (grep -v above already filtered
+  # the common env-mapping shape; anything left over is a real hit).
+  if [ -n "$INPUTS_INTERP_HITS" ]; then
+    fail "\${{ inputs.* }} appears outside a step-level env: mapping in ${EKS_APP_WORKFLOW}:"$'\n'"${INPUTS_INTERP_HITS}"
+  else
+    pass "every \${{ inputs.* }} occurrence in ${EKS_APP_WORKFLOW} is confined to a step-level env: mapping, never a run-script body"
+  fi
+else
+  skip "inputs.* interpolation sweep -- ${EKS_APP_WORKFLOW} not found"
+fi
+
+if [ -f "${WORKDIR}/detect_script.sh" ] && command -v python3 >/dev/null 2>&1; then
+  # Marker-file proof: feed the real extracted "Detect changed deployments"
+  # script a workflow_dispatch deployment_id containing shell metacharacters
+  # via INPUT_DEPLOYMENT_ID (exactly how the real env: mapping delivers it),
+  # and confirm the payload is never evaluated as shell code. github.actor/
+  # github.event_name are the only remaining ${{ }} expressions in the run
+  # body; substitute them the same way GitHub Actions itself would before
+  # execution, since this script is never otherwise runnable standalone.
+  sed -e 's/\${{ *github\.event_name *}}/workflow_dispatch/g' \
+      "${WORKDIR}/detect_script.sh" > "${WORKDIR}/detect_script_resolved.sh"
+
+  MARKER_DIR="${WORKDIR}/marker-test"
+  mkdir -p "$MARKER_DIR"
+  MARKER_FILE="${MARKER_DIR}/PWNED"
+
+  INJECTION_FAILED="false"
+  run_injection_case() {
+    local label="$1" payload="$2"
+    rm -f "$MARKER_FILE"
+    INJECTION_OUTPUT="$(
+      cd "$REPO_ROOT" && \
+      INPUT_ENVIRONMENT="dev" \
+      INPUT_DEPLOYMENT_ID="$payload" \
+      INPUT_DEPLOY="true" \
+      GITHUB_OUTPUT="$(mktemp)" \
+      GITHUB_ENV="$(mktemp)" \
+      MARKER_FILE_FOR_TEST="$MARKER_FILE" \
+      bash "${WORKDIR}/detect_script_resolved.sh" 2>&1 || true
+    )"
+    if [ -f "$MARKER_FILE" ]; then
+      fail "marker-file injection succeeded for ${label} (deployment_id=${payload@Q}) -- command execution occurred"
+      INJECTION_FAILED="true"
+    fi
+  }
+
+  # Payloads reference $MARKER_FILE_FOR_TEST (exported above) rather than an
+  # embedded absolute path, so the exact same payload strings work
+  # regardless of $WORKDIR's location.
+  run_injection_case "command-substitution" '$(touch "$MARKER_FILE_FOR_TEST")'
+  run_injection_case "backticks" '`touch "$MARKER_FILE_FOR_TEST"`'
+  run_injection_case "double-quote-break" 'x"; touch "$MARKER_FILE_FOR_TEST"; echo "'
+  run_injection_case "single-quote-break" "x'; touch \"\$MARKER_FILE_FOR_TEST\"; echo '"
+  run_injection_case "semicolon" 'x; touch "$MARKER_FILE_FOR_TEST"'
+  run_injection_case "newline" "$(printf 'x\ntouch "$MARKER_FILE_FOR_TEST"')"
+  run_injection_case "dollar-brace-ifs" '${IFS}touch${IFS}"$MARKER_FILE_FOR_TEST"'
+  run_injection_case "background-ampersand" 'x & touch "$MARKER_FILE_FOR_TEST"'
+  run_injection_case "pipe" 'x | touch "$MARKER_FILE_FOR_TEST"'
+
+  if [ "$INJECTION_FAILED" = "false" ]; then
+    pass "9 shell-metacharacter payloads in deployment_id (\$(...), backticks, quotes, semicolons, newlines, \${IFS}, &, |) cannot execute commands (marker file never created)"
+  fi
+
+  rm -rf "$MARKER_DIR"
+else
+  skip "marker-file injection tests -- ${WORKDIR}/detect_script.sh or python3 not available"
 fi
 
 echo ""
@@ -1446,6 +1609,81 @@ if command -v python3 >/dev/null 2>&1; then
   fi
 else
   skip "hack/ YAML-validity guard -- python3 not available"
+fi
+
+# ---------------------------------------------------------------------
+# 25. Repository hygiene: proven-dead file cleanup regression checks.
+# ---------------------------------------------------------------------
+echo ""
+echo "--- Repository hygiene: dead-file cleanup ---"
+
+if [ -f ".github/workflows/build-monitor-base-image-once.yaml" ]; then
+  fail "the temporary base-image workflow (build-monitor-base-image-once.yaml) still exists"
+else
+  pass "no temporary base-image workflow remains"
+fi
+
+JUNK_ARTIFACTS="$(find . -not -path "./.git/*" \( \
+  -iname "__pycache__" -o -iname "*.pyc" -o -iname ".pytest_cache" -o -iname ".mypy_cache" \
+  -o -iname ".DS_Store" -o -iname "Thumbs.db" -o -iname "*.tmp" -o -iname "*.bak" \
+  -o -iname "*.orig" -o -iname "*.rej" -o -iname "*~" -o -iname "rendered" \
+  \) 2>/dev/null || true)"
+if [ -z "$JUNK_ARTIFACTS" ]; then
+  pass "no Python cache, pytest/mypy cache, editor backup, or rendered/ artifacts exist in the repository"
+else
+  fail "junk/cache artifacts found:${JUNK_ARTIFACTS}"
+fi
+
+if [ -d "envs/dev/payments-ora-to-pg-001" ] && [ -f "envs/dev/payments-ora-to-pg-001/values.yaml" ]; then
+  pass "the retired legacy values folder (envs/dev/payments-ora-to-pg-001) remains present"
+else
+  fail "the retired legacy values folder is missing -- it must be retained until Phase 5B"
+fi
+
+CANONICAL_PRESENCE_MISSING=""
+for f in \
+  envs/dev/gg-oracle-payments-01/values.yaml \
+  envs/dev/gg-postgresql-payments-01/values.yaml \
+  envs/dev/goldengate-monitor/values.yaml \
+  helm/goldengate/templates/source-statefulset.yaml \
+  helm/goldengate/templates/target-statefulset.yaml \
+  helm/goldengate/templates/runtime-statefulset.yaml \
+  helm/goldengate/templates/ingress.yaml \
+  helm/goldengate/templates/namespace.yaml \
+  helm/goldengate-monitor/templates/deployment.yaml \
+  monitoring/monitor/monitor.py \
+  monitoring/monitor/collector.py \
+  monitoring/monitor/config.py \
+  monitoring/monitor/health_rules.py \
+  monitoring/monitor/tools/gg_api_contract_probe.py \
+  monitoring/monitor/requirements-test.txt \
+  ; do
+  [ -e "$f" ] || CANONICAL_PRESENCE_MISSING="${CANONICAL_PRESENCE_MISSING} ${f}"
+done
+if [ -z "$CANONICAL_PRESENCE_MISSING" ]; then
+  pass "all canonical runtime and monitor files remain present"
+else
+  fail "canonical runtime/monitor file(s) unexpectedly missing:${CANONICAL_PRESENCE_MISSING}"
+fi
+
+if [ -d "helm/argocd/charts/argo-cd" ] && [ -f "helm/argocd/Chart.lock" ]; then
+  if [ "$HELM_AVAILABLE" = "true" ]; then
+    if helm lint helm/argocd >"${WORKDIR}/argocd-lint.log" 2>&1 \
+        && helm template argocd-hygiene-check helm/argocd --namespace argocd >"${WORKDIR}/argocd-template.log" 2>"${WORKDIR}/argocd-template.err"; then
+      pass "the Argo CD vendored dependency (helm/argocd/charts/argo-cd) remains functional: helm lint and helm template both succeed"
+    else
+      fail "the Argo CD vendored dependency is present but helm lint/template failed"
+      cat "${WORKDIR}/argocd-lint.log" "${WORKDIR}/argocd-template.err" 2>/dev/null
+    fi
+  else
+    skip "Argo CD vendored dependency functional check -- helm not available"
+  fi
+else
+  fail "the Argo CD vendored dependency directory or Chart.lock is missing -- helm/argocd/charts/argo-cd and helm/argocd/Chart.lock must be retained"
+fi
+
+if [ -f "helm/argocd/charts/argo-cd-9.3.7.tgz" ]; then
+  echo "INFO: helm/argocd/charts/argo-cd-9.3.7.tgz is present (a redundant, Helm-regenerable duplicate of the vendored directory was removed when proven safe; its presence here is not itself a failure, only a note)."
 fi
 
 echo ""
