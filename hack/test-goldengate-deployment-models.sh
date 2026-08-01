@@ -1545,14 +1545,251 @@ else
   fail "unexpected alarm/SNS/gg-alerter/Fluent Bit implementation found in:${NOT_YET_HITS}"
 fi
 
-# Whitespace/line-ending-only diffs are pre-existing baseline noise in this
-# repository (unrelated to any session's actual edits) -- compare with
-# --ignore-all-space so only substantive content changes count.
-IAM_DIFF="$(git diff --ignore-all-space -- envs/dev/iam.tf envs/dev/policies/goldengate-secrets-read-dev envs/dev/policies/goldengate-monitor-read-dev 2>/dev/null || true)"
-if [ -z "$IAM_DIFF" ]; then
-  pass "envs/dev/iam.tf and the goldengate-secrets-read-dev/goldengate-monitor-read-dev policies have no substantive changes"
+# Phase 5B1 legitimately changes envs/dev/policies/goldengate-secrets-read-dev
+# (observer DynamoDB/CloudWatch statements removed) and envs/dev/iam.tf's
+# comments/description text -- the monitor role's policy folder must remain
+# completely untouched, and iam.tf's structural identifiers (role names,
+# policy_folder attachments) must not change even though description text
+# may. Whitespace/line-ending-only diffs are pre-existing baseline noise in
+# this repository -- compare with --ignore-all-space so only substantive
+# content changes count.
+MONITOR_IAM_DIFF="$(git diff --ignore-all-space -- envs/dev/policies/goldengate-monitor-read-dev 2>/dev/null || true)"
+if [ -z "$MONITOR_IAM_DIFF" ]; then
+  pass "envs/dev/policies/goldengate-monitor-read-dev has no substantive changes (monitor IAM untouched)"
 else
-  fail "unexpected IAM/policy content changes detected (beyond whitespace) in envs/dev/iam.tf or its policies"
+  fail "unexpected change detected in envs/dev/policies/goldengate-monitor-read-dev -- the monitor role must remain untouched"
+fi
+
+# ---------------------------------------------------------------------
+# 27. Phase 5B1: runtime IAM least-privilege reduction (observer DynamoDB/
+#     CloudWatch permissions removed; monitor IAM and Secrets Manager/KMS
+#     access for canonical and legacy runtime pods unchanged).
+# ---------------------------------------------------------------------
+echo ""
+echo "--- Phase 5B1: runtime IAM least-privilege reduction ---"
+
+RUNTIME_POLICY_FILE="envs/dev/policies/goldengate-secrets-read-dev/policies/policies_1.json"
+MONITOR_POLICY_FILE="envs/dev/policies/goldengate-monitor-read-dev/policies/policies_1.json"
+
+if [ -f "$RUNTIME_POLICY_FILE" ] && [ -f "$MONITOR_POLICY_FILE" ] && command -v python3 >/dev/null 2>&1; then
+  IAM_TEST_OUTPUT="$(python3 - "$RUNTIME_POLICY_FILE" "$MONITOR_POLICY_FILE" <<'PYEOF'
+import json
+import sys
+
+runtime_path, monitor_path = sys.argv[1:3]
+
+with open(runtime_path) as f:
+    runtime = json.load(f)
+
+with open(monitor_path) as f:
+    monitor = json.load(f)
+
+runtime_statements = runtime.get("Statement") or []
+monitor_statements = monitor.get("Statement") or []
+
+
+def actions_of(stmt):
+    a = stmt.get("Action")
+    if isinstance(a, str):
+        return {a}
+    return set(a or [])
+
+
+def find_sid(statements, sid):
+    for s in statements:
+        if s.get("Sid") == sid:
+            return s
+    return None
+
+
+results = []
+
+
+def check(label, condition):
+    results.append((label, bool(condition)))
+
+
+# 1. Runtime policy grants no DynamoDB action anywhere (the entire
+# monitoring-state statement, not just its Sid, must be gone).
+runtime_dynamodb_actions = set()
+for s in runtime_statements:
+    runtime_dynamodb_actions |= {a for a in actions_of(s) if a.startswith("dynamodb:")}
+check("1_no_dynamodb_actions", not runtime_dynamodb_actions)
+
+# 2. Runtime policy grants no cloudwatch:PutMetricData (or any cloudwatch:*).
+runtime_cloudwatch_actions = set()
+for s in runtime_statements:
+    runtime_cloudwatch_actions |= {a for a in actions_of(s) if a.startswith("cloudwatch:")}
+check("2_no_cloudwatch_actions", not runtime_cloudwatch_actions)
+
+# 3. Runtime role retains its Secrets Manager statement, byte-identical to
+# the original (never broadened to compensate for the removed statements).
+secrets_stmt = find_sid(runtime_statements, "AllowReadGoldenGateDevSecrets")
+check(
+    "3_secrets_manager_retained",
+    secrets_stmt is not None
+    and actions_of(secrets_stmt) == {"secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"}
+    and secrets_stmt.get("Resource") == ["arn:aws:secretsmanager:eu-west-1:668311715351:secret:dev/goldengate/*"]
+    and secrets_stmt.get("Effect") == "Allow",
+)
+
+# 4. Runtime role retains its KMS Decrypt statement, byte-identical.
+kms_stmt = find_sid(runtime_statements, "AllowDecryptGoldenGateSecretsKms")
+check(
+    "4_kms_retained",
+    kms_stmt is not None
+    and actions_of(kms_stmt) == {"kms:Decrypt"}
+    and kms_stmt.get("Resource") == "*"
+    and kms_stmt.get("Effect") == "Allow",
+)
+
+# 5. Monitor role retains DynamoDB read/write (CONFIG reads + LEASE/STATE#
+# writes travel over the same table-level actions) and PutMetricData scoped
+# to GoldenGate/Pipelines.
+monitor_ddb_stmt = find_sid(monitor_statements, "AllowReadWriteGoldenGateMonitoringState")
+monitor_cw_stmt = find_sid(monitor_statements, "AllowPublishGoldenGateMonitoringMetrics")
+check(
+    "5_monitor_dynamodb_and_metrics_retained",
+    monitor_ddb_stmt is not None
+    and actions_of(monitor_ddb_stmt) == {
+        "dynamodb:GetItem", "dynamodb:Query", "dynamodb:PutItem",
+        "dynamodb:UpdateItem", "dynamodb:DescribeTable",
+    }
+    and monitor_ddb_stmt.get("Resource") == "arn:aws:dynamodb:eu-west-1:668311715351:table/gg-eks-pipeline"
+    and monitor_cw_stmt is not None
+    and actions_of(monitor_cw_stmt) == {"cloudwatch:PutMetricData"}
+    and (monitor_cw_stmt.get("Condition") or {}).get("StringEquals", {}).get("cloudwatch:namespace") == "GoldenGate/Pipelines",
+)
+
+# 6. Runtime and monitor policies remain distinct documents (never merged/
+# aliased into each other).
+check("6_roles_remain_separate", runtime_path != monitor_path and runtime_statements != monitor_statements)
+
+# 9. No wildcard (Resource: "*") DynamoDB, CloudWatch, or Secrets Manager
+# action exists in the runtime policy (the pre-existing KMS Decrypt
+# Resource: "*" is a known, unchanged, intentionally broad grant -- not
+# newly introduced by this phase -- so it is exempted here and covered by
+# checks 3/4's byte-identical comparison instead).
+wildcard_violations = []
+for s in runtime_statements:
+    if s.get("Resource") == "*":
+        for a in actions_of(s):
+            if a.startswith("dynamodb:") or a.startswith("cloudwatch:") or a.startswith("secretsmanager:"):
+                wildcard_violations.append(a)
+check("9_no_new_wildcard_access", not wildcard_violations)
+
+print(f"RESULT={json.dumps(dict(results))}")
+for label, ok in results:
+    print(f"{'PASS' if ok else 'FAIL'} {label}")
+PYEOF
+  )"
+  echo "$IAM_TEST_OUTPUT"
+
+  if echo "$IAM_TEST_OUTPUT" | grep -q "^PASS 1_no_dynamodb_actions$"; then
+    pass "1: runtime policy grants no dynamodb:* action (GetItem/Query/PutItem/UpdateItem/DescribeTable against gg-eks-pipeline removed)"
+  else
+    fail "1: runtime policy still grants a dynamodb:* action"
+  fi
+
+  if echo "$IAM_TEST_OUTPUT" | grep -q "^PASS 2_no_cloudwatch_actions$"; then
+    pass "2: runtime policy grants no cloudwatch:PutMetricData (or any cloudwatch:*) action"
+  else
+    fail "2: runtime policy still grants a cloudwatch:* action"
+  fi
+
+  if echo "$IAM_TEST_OUTPUT" | grep -q "^PASS 3_secrets_manager_retained$"; then
+    pass "3: runtime role retains its required Secrets Manager permissions, byte-identical to the original"
+  else
+    fail "3: runtime role's Secrets Manager permissions are missing or were altered"
+  fi
+
+  if echo "$IAM_TEST_OUTPUT" | grep -q "^PASS 4_kms_retained$"; then
+    pass "4: runtime role retains its required KMS Decrypt permission, byte-identical to the original"
+  else
+    fail "4: runtime role's KMS Decrypt permission is missing or was altered"
+  fi
+
+  if echo "$IAM_TEST_OUTPUT" | grep -q "^PASS 5_monitor_dynamodb_and_metrics_retained$"; then
+    pass "5: monitor role retains DynamoDB read/write (CONFIG reads, LEASE/STATE# writes) and PutMetricData scoped to GoldenGate/Pipelines"
+  else
+    fail "5: monitor role's DynamoDB or scoped CloudWatch permissions are missing or were altered"
+  fi
+
+  if echo "$IAM_TEST_OUTPUT" | grep -q "^PASS 6_roles_remain_separate$"; then
+    pass "6: runtime and monitor IAM policies remain separate documents"
+  else
+    fail "6: runtime and monitor IAM policies are not distinct"
+  fi
+
+  if echo "$IAM_TEST_OUTPUT" | grep -q "^PASS 9_no_new_wildcard_access$"; then
+    pass "9: no wildcard DynamoDB, CloudWatch, or Secrets Manager access exists in the runtime policy"
+  else
+    fail "9: a wildcard-resourced DynamoDB/CloudWatch/Secrets Manager action was found in the runtime policy"
+  fi
+
+  # 10. No statement was broadened to compensate: the runtime policy has
+  # exactly the 2 retained statements, nothing more.
+  RUNTIME_STMT_COUNT="$(python3 -c "import json; print(len((json.load(open('${RUNTIME_POLICY_FILE}')) or {}).get('Statement') or []))")"
+  if [ "$RUNTIME_STMT_COUNT" = "2" ]; then
+    pass "10: runtime policy has exactly 2 statements (no broadening or replacement compensation)"
+  else
+    fail "10: runtime policy has ${RUNTIME_STMT_COUNT} statements, expected exactly 2"
+  fi
+else
+  skip "Phase 5B1 IAM least-privilege checks -- policy files or python3 not available"
+fi
+
+# 7. Canonical runtime ServiceAccounts still reference GoldenGateSecretsReadRole-dev.
+RUNTIME_ROLE_REF_MISSING=""
+for f in envs/dev/gg-oracle-payments-01/values.yaml envs/dev/gg-postgresql-payments-01/values.yaml; do
+  grep -q "role/GoldenGateSecretsReadRole-dev" "$f" 2>/dev/null || RUNTIME_ROLE_REF_MISSING="${RUNTIME_ROLE_REF_MISSING} ${f}"
+done
+if [ -z "$RUNTIME_ROLE_REF_MISSING" ]; then
+  pass "7: canonical runtime ServiceAccounts (Oracle, PostgreSQL) still reference GoldenGateSecretsReadRole-dev"
+else
+  fail "7: canonical runtime values file(s) no longer reference GoldenGateSecretsReadRole-dev:${RUNTIME_ROLE_REF_MISSING}"
+fi
+
+# 8. gg-monitor still references GoldenGateMonitorReadRole-dev.
+if grep -q "role/GoldenGateMonitorReadRole-dev" "envs/dev/goldengate-monitor/values.yaml" 2>/dev/null; then
+  pass "8: gg-monitor still references GoldenGateMonitorReadRole-dev"
+else
+  fail "8: envs/dev/goldengate-monitor/values.yaml no longer references GoldenGateMonitorReadRole-dev"
+fi
+
+# 11. Terraform references remain valid: iam.tf's module block still exists,
+# still names the same role, and still attaches the same policy_folder.
+if grep -q 'module "goldengate_secrets_read_role_dev"' envs/dev/iam.tf \
+    && grep -q 'name          = "GoldenGateSecretsReadRole-dev"' envs/dev/iam.tf \
+    && grep -q 'policy_folder = "goldengate-secrets-read-dev"' envs/dev/iam.tf \
+    && grep -q 'module "goldengate_monitor_read_role_dev"' envs/dev/iam.tf \
+    && grep -q 'name          = "GoldenGateMonitorReadRole-dev"' envs/dev/iam.tf \
+    && grep -q 'policy_folder = "goldengate-monitor-read-dev"' envs/dev/iam.tf; then
+  pass "11: envs/dev/iam.tf's module blocks still name the same roles and attach the same policy_folder values"
+else
+  fail "11: envs/dev/iam.tf's role/policy_folder identifiers appear to have changed"
+fi
+
+if command -v terraform >/dev/null 2>&1; then
+  TF_FMT_OUTPUT="$(terraform fmt -check -recursive -diff envs/dev/ 2>&1 || true)"
+  if [ -z "$TF_FMT_OUTPUT" ]; then
+    pass "11b: terraform fmt -check -recursive reports no formatting differences"
+  else
+    fail "11b: terraform fmt -check -recursive found formatting differences"
+    echo "$TF_FMT_OUTPUT"
+  fi
+else
+  skip "terraform fmt -check -- terraform not available"
+fi
+
+# 12. No manager metric/DynamoDB/lease behavior changed: collector.py and
+# monitor.py are untouched by this IAM-only phase.
+IAM_PHASE_COLLECTOR_DIFF="$(git diff --stat -- monitoring/monitor/collector.py 2>/dev/null || true)"
+IAM_PHASE_MONITOR_DIFF="$(git diff --stat -- monitoring/monitor/monitor.py 2>/dev/null || true)"
+if [ -z "$IAM_PHASE_COLLECTOR_DIFF" ] && [ -z "$IAM_PHASE_MONITOR_DIFF" ]; then
+  pass "12: collector.py and monitor.py are unchanged -- no manager metric/DynamoDB/lease behavior was altered"
+else
+  fail "12: collector.py and/or monitor.py were unexpectedly modified during an IAM-only phase"
 fi
 
 echo ""
@@ -1969,6 +2206,35 @@ with open('${EFS_WORKDIR}/rendered/duplicate-storageclass.yaml', 'w') as f:
   fi
 else
   skip "EFS persistence validation regression tests -- helm and/or python3/PyYAML not available"
+fi
+
+# ---------------------------------------------------------------------
+# 28. Phase 5B2 legacy cleanup runbook: present, non-executing, and
+#     contains no credential/secret material.
+# ---------------------------------------------------------------------
+echo ""
+echo "--- Phase 5B2 legacy cleanup runbook ---"
+
+RUNBOOK_FILE="docs/phase-5b2-legacy-cleanup-runbook.md"
+if [ -f "$RUNBOOK_FILE" ]; then
+  pass "the Phase 5B2 legacy cleanup runbook exists at ${RUNBOOK_FILE}"
+else
+  fail "the Phase 5B2 legacy cleanup runbook is missing at ${RUNBOOK_FILE}"
+fi
+
+if [ -f "$RUNBOOK_FILE" ]; then
+  if grep -qiE "AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|password[[:space:]]*[:=][[:space:]]*[^ ]|secret[_ ]?key[[:space:]]*[:=][[:space:]]*[^ ]" "$RUNBOOK_FILE"; then
+    fail "the Phase 5B2 runbook appears to contain credential/secret-value-shaped content"
+  else
+    pass "the Phase 5B2 runbook contains no credential/secret-value-shaped content"
+  fi
+
+  RUNBOOK_DESTRUCTIVE_HITS="$(grep -nE '^\s*(aws |kubectl |terraform apply|helm (install|upgrade))' "$RUNBOOK_FILE" || true)"
+  if [ -z "$RUNBOOK_DESTRUCTIVE_HITS" ]; then
+    pass "the Phase 5B2 runbook contains no executable destructive command lines (planning document only)"
+  else
+    fail "the Phase 5B2 runbook appears to contain executable command lines:${RUNBOOK_DESTRUCTIVE_HITS}"
+  fi
 fi
 
 echo ""
