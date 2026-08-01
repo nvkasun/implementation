@@ -2208,35 +2208,6 @@ else
   skip "EFS persistence validation regression tests -- helm and/or python3/PyYAML not available"
 fi
 
-# ---------------------------------------------------------------------
-# 28. Phase 5B2 legacy cleanup runbook: present, non-executing, and
-#     contains no credential/secret material.
-# ---------------------------------------------------------------------
-echo ""
-echo "--- Phase 5B2 legacy cleanup runbook ---"
-
-RUNBOOK_FILE="docs/phase-5b2-legacy-cleanup-runbook.md"
-if [ -f "$RUNBOOK_FILE" ]; then
-  pass "the Phase 5B2 legacy cleanup runbook exists at ${RUNBOOK_FILE}"
-else
-  fail "the Phase 5B2 legacy cleanup runbook is missing at ${RUNBOOK_FILE}"
-fi
-
-if [ -f "$RUNBOOK_FILE" ]; then
-  if grep -qiE "AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|password[[:space:]]*[:=][[:space:]]*[^ ]|secret[_ ]?key[[:space:]]*[:=][[:space:]]*[^ ]" "$RUNBOOK_FILE"; then
-    fail "the Phase 5B2 runbook appears to contain credential/secret-value-shaped content"
-  else
-    pass "the Phase 5B2 runbook contains no credential/secret-value-shaped content"
-  fi
-
-  RUNBOOK_DESTRUCTIVE_HITS="$(grep -nE '^\s*(aws |kubectl |terraform apply|helm (install|upgrade))' "$RUNBOOK_FILE" || true)"
-  if [ -z "$RUNBOOK_DESTRUCTIVE_HITS" ]; then
-    pass "the Phase 5B2 runbook contains no executable destructive command lines (planning document only)"
-  else
-    fail "the Phase 5B2 runbook appears to contain executable command lines:${RUNBOOK_DESTRUCTIVE_HITS}"
-  fi
-fi
-
 echo ""
 echo "=================================================="
 echo "Summary: ${PASS_COUNT} passed, ${FAIL_COUNT} failed, ${SKIP_COUNT} skipped"

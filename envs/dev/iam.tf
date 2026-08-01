@@ -24,15 +24,22 @@ module "goldengate_eks_deploy_role_dev" {
 # deployment is retired in a later phase. The shared monitor uses its OWN
 # role (goldengate_monitor_read_role_dev below), not this one.
 #
-# Phase 5B1: the DynamoDB/CloudWatch monitoring actions previously granted
-# here existed only for the retired observer sidecar (canonical runtime pods
-# never had them; the observer wrote its own legacy STATE records and
-# published metrics directly). They have been removed -- shared gg-monitor
-# now exclusively owns canonical LEASE/STATE# writes and manager-compatible
-# metric publication through its own IRSA role. Note: while the legacy
-# deployment's observer sidecar remains live (pre-Phase-5B2 retirement), it
-# shares this same role, so this reduction also removes its DynamoDB/
-# CloudWatch access -- see the Phase 5B2 cleanup runbook.
+# This role's policy previously also granted DynamoDB (gg-eks-pipeline)
+# and CloudWatch (GoldenGate/Pipelines PutMetricData) actions. Because this
+# role is shared by every runtime pod's ServiceAccount, those permissions
+# were available to canonical pods too, even though only the now-retired
+# observer sidecars ever actually required or used them -- canonical
+# GoldenGate application containers never called DynamoDB or CloudWatch.
+# Shared gg-monitor now exclusively owns canonical LEASE/STATE# writes and
+# manager-compatible metric publication through its own IRSA role
+# (goldengate_monitor_read_role_dev below), so those two statements have
+# been removed from this policy.
+#
+# IMPORTANT: the retained legacy deployment's observer pods are still live
+# and still assume this same role. Do not apply this IAM reduction
+# (terraform apply) while those legacy observer pods are still running --
+# doing so removes their DynamoDB/CloudWatch access immediately. Apply this
+# change only after the legacy observer pods have been retired.
 module "goldengate_secrets_read_role_dev" {
   source = "git::https://github.com/AbuDhabiCommercialBank/aws-tf-module-iam-role.git?ref=v2.0.0"
 
