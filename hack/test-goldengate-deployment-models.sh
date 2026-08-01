@@ -1686,6 +1686,291 @@ if [ -f "helm/argocd/charts/argo-cd-9.3.7.tgz" ]; then
   echo "INFO: helm/argocd/charts/argo-cd-9.3.7.tgz is present (a redundant, Helm-regenerable duplicate of the vendored directory was removed when proven safe; its presence here is not itself a failure, only a note)."
 fi
 
+# ---------------------------------------------------------------------
+# 26. EFS rendered-resource validation: strict basePath derivation
+#     (matching goldengate.efsBasePath), fail-closed YAML parsing, no
+#     fragile grep on an optional key under set -euo pipefail.
+# ---------------------------------------------------------------------
+echo ""
+echo "--- EFS persistence validation: basePath derivation, strict parsing, StorageClass/PVC checks ---"
+
+if [ "$HELM_AVAILABLE" = "true" ] && [ "$PYTHON_AVAILABLE" = "true" ]; then
+  python3 - "$EKS_APP_WORKFLOW" > "${WORKDIR}/efs_validate.sh" <<'PYEOF'
+import sys
+import yaml
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+for step in doc["jobs"]["build_publish_and_deploy"]["steps"]:
+    if step.get("name") == "Validate EFS persistence resources are rendered":
+        sys.stdout.write(step["run"])
+        break
+else:
+    sys.exit("step not found")
+PYEOF
+
+  if [ ! -s "${WORKDIR}/efs_validate.sh" ]; then
+    fail "could not extract the 'Validate EFS persistence resources are rendered' step from ${EKS_APP_WORKFLOW}"
+  else
+    EFS_WORKDIR="${WORKDIR}/efs-test"
+    mkdir -p "${EFS_WORKDIR}/rendered" "${EFS_WORKDIR}/values"
+
+    run_efs_step() {
+      ( cd "$EFS_WORKDIR" && \
+        RELEASE_NAME="$1" VALUES_FILE="$2" DEPLOYMENT_ID="$3" DEPLOYMENT_MODEL="$4" ENVIRONMENT="$5" \
+        bash "${WORKDIR}/efs_validate.sh" 2>&1 )
+      return $?
+    }
+
+    helm template gg-oracle-payments-01 "$RUNTIME_CHART" --namespace goldengate-dev \
+      --values "${REPO_ROOT}/envs/dev/gg-oracle-payments-01/values.yaml" \
+      --set global.environment=dev --set global.deploymentId=gg-oracle-payments-01 \
+      > "${EFS_WORKDIR}/rendered/gg-oracle-payments-01.yaml" 2>"${EFS_WORKDIR}/oracle-render.err" || true
+    helm template gg-postgresql-payments-01 "$RUNTIME_CHART" --namespace goldengate-dev \
+      --values "${REPO_ROOT}/envs/dev/gg-postgresql-payments-01/values.yaml" \
+      --set global.environment=dev --set global.deploymentId=gg-postgresql-payments-01 \
+      > "${EFS_WORKDIR}/rendered/gg-postgresql-payments-01.yaml" 2>"${EFS_WORKDIR}/postgres-render.err" || true
+    helm template ogg-payments-ora-to-pg-001 "$RUNTIME_CHART" --namespace gg-dev-payments-ora-to-pg-001 \
+      --values "${REPO_ROOT}/envs/dev/payments-ora-to-pg-001/values.yaml" \
+      --set global.environment=dev --set global.deploymentId=payments-ora-to-pg-001 \
+      > "${EFS_WORKDIR}/rendered/ogg-payments-ora-to-pg-001.yaml" 2>"${EFS_WORKDIR}/legacy-render.err" || true
+
+    set +e
+    ORACLE_OUT="$(run_efs_step "gg-oracle-payments-01" "${REPO_ROOT}/envs/dev/gg-oracle-payments-01/values.yaml" "gg-oracle-payments-01" "singleRuntime" "dev")"
+    ORACLE_STATUS=$?
+    set -e
+    echo "$ORACLE_OUT"
+    if [ "$ORACLE_STATUS" -eq 0 ] && echo "$ORACLE_OUT" | grep -qF "Expected EFS basePath: /gg-oracle-payments-01"; then
+      pass "1: gg-oracle-payments-01 (no explicit basePath) resolves to /gg-oracle-payments-01"
+    else
+      fail "1: gg-oracle-payments-01 basePath derivation failed or produced an unexpected value"
+    fi
+
+    set +e
+    POSTGRES_OUT="$(run_efs_step "gg-postgresql-payments-01" "${REPO_ROOT}/envs/dev/gg-postgresql-payments-01/values.yaml" "gg-postgresql-payments-01" "singleRuntime" "dev")"
+    POSTGRES_STATUS=$?
+    set -e
+    echo "$POSTGRES_OUT"
+    if [ "$POSTGRES_STATUS" -eq 0 ] && echo "$POSTGRES_OUT" | grep -qF "Expected EFS basePath: /gg-postgresql-payments-01"; then
+      pass "2: gg-postgresql-payments-01 (no explicit basePath) resolves to /gg-postgresql-payments-01"
+    else
+      fail "2: gg-postgresql-payments-01 basePath derivation failed or produced an unexpected value"
+    fi
+
+    if [ "$ORACLE_STATUS" -eq 0 ] && [ "$POSTGRES_STATUS" -eq 0 ] \
+        && echo "$ORACLE_OUT" | grep -qF "OK: EFS StorageClass, runtime PVC, and StatefulSet u02/u03" \
+        && echo "$POSTGRES_OUT" | grep -qF "OK: EFS StorageClass, runtime PVC, and StatefulSet u02/u03"; then
+      pass "3: both actual rendered manifests (Oracle and PostgreSQL) pass full EFS validation"
+    else
+      fail "3: one or both actual rendered manifests failed EFS validation"
+    fi
+
+    # 4: an explicit non-empty basePath override is honored.
+    python3 -c "
+import yaml
+with open('${REPO_ROOT}/envs/dev/gg-oracle-payments-01/values.yaml') as f:
+    data = yaml.safe_load(f)
+data['persistence']['efs']['storageClass']['basePath'] = '/custom-override-path'
+with open('${EFS_WORKDIR}/values/oracle-override.yaml', 'w') as f:
+    yaml.dump(data, f)
+"
+    helm template gg-oracle-payments-01 "$RUNTIME_CHART" --namespace goldengate-dev \
+      --values "${EFS_WORKDIR}/values/oracle-override.yaml" \
+      --set global.environment=dev --set global.deploymentId=gg-oracle-payments-01 \
+      > "${EFS_WORKDIR}/rendered/oracle-override.yaml" 2>"${EFS_WORKDIR}/override-render.err" || true
+
+    set +e
+    OVERRIDE_OUT="$(run_efs_step "oracle-override" "${EFS_WORKDIR}/values/oracle-override.yaml" "gg-oracle-payments-01" "singleRuntime" "dev")"
+    OVERRIDE_STATUS=$?
+    set -e
+    if [ "$OVERRIDE_STATUS" -eq 0 ] && echo "$OVERRIDE_OUT" | grep -qF "Expected EFS basePath: /custom-override-path"; then
+      pass "4: an explicit non-empty basePath override is honored"
+    else
+      fail "4: explicit basePath override was not honored"
+      echo "$OVERRIDE_OUT"
+    fi
+
+    # 5: a missing fileSystemId fails with a clear controlled error (never
+    # an unexplained shell abort).
+    cat > "${EFS_WORKDIR}/values/missing-fsid.yaml" <<'EOF'
+deploymentModel: singleRuntime
+persistence:
+  enabled: true
+  provider: efs
+  efs:
+    storageClass:
+      basePath: /x
+EOF
+    set +e
+    MISSING_FSID_OUT="$(run_efs_step "x" "${EFS_WORKDIR}/values/missing-fsid.yaml" "gg-oracle-payments-01" "singleRuntime" "dev")"
+    MISSING_FSID_STATUS=$?
+    set -e
+    if [ "$MISSING_FSID_STATUS" -ne 0 ] && echo "$MISSING_FSID_OUT" | grep -qF "persistence.efs.fileSystemId must be a non-empty string"; then
+      pass "5: a missing fileSystemId fails with a clear controlled error"
+    else
+      fail "5: a missing fileSystemId did not fail with the expected controlled error"
+      echo "$MISSING_FSID_OUT"
+    fi
+
+    # 6: malformed YAML fails closed.
+    cat > "${EFS_WORKDIR}/values/malformed.yaml" <<'EOF'
+deploymentModel: singleRuntime
+persistence:
+  enabled: true
+  provider: efs
+  efs:
+    fileSystemId: fs-x
+  bad indent: [unterminated
+EOF
+    set +e
+    MALFORMED_OUT="$(run_efs_step "x" "${EFS_WORKDIR}/values/malformed.yaml" "gg-oracle-payments-01" "singleRuntime" "dev")"
+    MALFORMED_STATUS=$?
+    set -e
+    if [ "$MALFORMED_STATUS" -ne 0 ] && echo "$MALFORMED_OUT" | grep -qF "is not valid YAML"; then
+      pass "6: malformed YAML fails closed"
+    else
+      fail "6: malformed YAML did not fail closed as expected"
+      echo "$MALFORMED_OUT"
+    fi
+
+    # 7: an unknown deploymentModel fails closed.
+    cat > "${EFS_WORKDIR}/values/unknown-model.yaml" <<'EOF'
+deploymentModel: someWeirdModel
+persistence:
+  enabled: true
+  provider: efs
+  efs:
+    fileSystemId: fs-x
+EOF
+    set +e
+    UNKNOWN_MODEL_OUT="$(run_efs_step "x" "${EFS_WORKDIR}/values/unknown-model.yaml" "gg-oracle-payments-01" "someWeirdModel" "dev")"
+    UNKNOWN_MODEL_STATUS=$?
+    set -e
+    if [ "$UNKNOWN_MODEL_STATUS" -ne 0 ] && echo "$UNKNOWN_MODEL_OUT" | grep -qF "unknown deploymentModel"; then
+      pass "7: an unknown deploymentModel fails closed"
+    else
+      fail "7: an unknown deploymentModel did not fail closed as expected"
+      echo "$UNKNOWN_MODEL_OUT"
+    fi
+
+    # 8/9/11: mutate a real rendered manifest's StorageClass to prove the
+    # rendered-resource checks have teeth (wrong basePath, wrong
+    # fileSystemId, and a duplicate matching-name StorageClass).
+    python3 -c "
+import yaml
+with open('${EFS_WORKDIR}/rendered/gg-oracle-payments-01.yaml') as f:
+    docs = list(yaml.safe_load_all(f))
+out = []
+for d in docs:
+    if d and d.get('kind') == 'StorageClass':
+        d['parameters']['basePath'] = '/wrong-base-path'
+    out.append(d)
+with open('${EFS_WORKDIR}/rendered/wrong-basepath.yaml', 'w') as f:
+    yaml.dump_all(out, f)
+"
+    set +e
+    WRONG_BASEPATH_OUT="$(run_efs_step "wrong-basepath" "${REPO_ROOT}/envs/dev/gg-oracle-payments-01/values.yaml" "gg-oracle-payments-01" "singleRuntime" "dev")"
+    WRONG_BASEPATH_STATUS=$?
+    set -e
+    if [ "$WRONG_BASEPATH_STATUS" -ne 0 ] && echo "$WRONG_BASEPATH_OUT" | grep -qF "parameters.basePath"; then
+      pass "8: a rendered StorageClass with the wrong basePath fails"
+    else
+      fail "8: a rendered StorageClass with the wrong basePath did not fail as expected"
+      echo "$WRONG_BASEPATH_OUT"
+    fi
+
+    python3 -c "
+import yaml
+with open('${EFS_WORKDIR}/rendered/gg-oracle-payments-01.yaml') as f:
+    docs = list(yaml.safe_load_all(f))
+out = []
+for d in docs:
+    if d and d.get('kind') == 'StorageClass':
+        d['parameters']['fileSystemId'] = 'fs-wrongwrongwrong'
+    out.append(d)
+with open('${EFS_WORKDIR}/rendered/wrong-fsid.yaml', 'w') as f:
+    yaml.dump_all(out, f)
+"
+    set +e
+    WRONG_FSID_OUT="$(run_efs_step "wrong-fsid" "${REPO_ROOT}/envs/dev/gg-oracle-payments-01/values.yaml" "gg-oracle-payments-01" "singleRuntime" "dev")"
+    WRONG_FSID_STATUS=$?
+    set -e
+    if [ "$WRONG_FSID_STATUS" -ne 0 ] && echo "$WRONG_FSID_OUT" | grep -qF "parameters.fileSystemId"; then
+      pass "9: a rendered StorageClass with the wrong filesystem ID fails"
+    else
+      fail "9: a rendered StorageClass with the wrong filesystem ID did not fail as expected"
+      echo "$WRONG_FSID_OUT"
+    fi
+
+    # 10: absence of the optional basePath key never causes an unexplained
+    # shell exit -- structural proof (the fragile grep pattern is gone) plus
+    # behavioral proof (tests 1/2 above already completed with a clean
+    # PASS/FAIL verdict, not a raw "unbound variable"/pipefail abort).
+    if grep -qE "grep.*basePath" "${WORKDIR}/efs_validate.sh"; then
+      fail "10: the EFS validation step still greps for basePath in the values file -- the fragile fallback was not removed"
+    else
+      pass "10: the EFS validation step no longer greps for the optional basePath key (no set -e/pipefail exposure)"
+    fi
+
+    python3 -c "
+import yaml
+with open('${EFS_WORKDIR}/rendered/gg-oracle-payments-01.yaml') as f:
+    docs = list(yaml.safe_load_all(f))
+out = list(docs)
+for d in docs:
+    if d and d.get('kind') == 'StorageClass':
+        out.append(dict(d))
+        break
+with open('${EFS_WORKDIR}/rendered/duplicate-storageclass.yaml', 'w') as f:
+    yaml.dump_all(out, f)
+"
+    set +e
+    DUP_SC_OUT="$(run_efs_step "duplicate-storageclass" "${REPO_ROOT}/envs/dev/gg-oracle-payments-01/values.yaml" "gg-oracle-payments-01" "singleRuntime" "dev")"
+    DUP_SC_STATUS=$?
+    set -e
+    if [ "$DUP_SC_STATUS" -ne 0 ] && echo "$DUP_SC_OUT" | grep -qF "expected exactly one StorageClass"; then
+      pass "11: exactly one expected StorageClass is required (a duplicate is rejected)"
+    else
+      fail "11: a duplicate matching-name StorageClass was not rejected as expected"
+      echo "$DUP_SC_OUT"
+    fi
+
+    # 12: legacyPair source/target PVC and StatefulSet u02/u03 validation
+    # continues passing (existing behavior, not weakened).
+    set +e
+    LEGACY_OUT="$(run_efs_step "ogg-payments-ora-to-pg-001" "${REPO_ROOT}/envs/dev/payments-ora-to-pg-001/values.yaml" "payments-ora-to-pg-001" "legacyPair" "dev")"
+    LEGACY_STATUS=$?
+    set -e
+    if [ "$LEGACY_STATUS" -eq 0 ] && echo "$LEGACY_OUT" | grep -qF "OK: EFS StorageClass, source/target PVCs, and StatefulSet u02/u03"; then
+      pass "12: legacyPair source/target PVC and StatefulSet u02/u03 validation continues passing"
+    else
+      fail "12: legacyPair EFS validation regressed"
+      echo "$LEGACY_OUT"
+    fi
+
+    # 13: this EFS-only correction did not touch observer removal or the
+    # workflow-matrix classifier logic elsewhere in the same file.
+    PHASE5A_SPOTCHECK_OK="true"
+    if grep -q "^  ensure_observer_image:" "$EKS_APP_WORKFLOW"; then
+      PHASE5A_SPOTCHECK_OK="false"
+    fi
+    if ! grep -q "is_goldengate_deployment_values_file() {" "$EKS_APP_WORKFLOW"; then
+      PHASE5A_SPOTCHECK_OK="false"
+    fi
+    if grep -q "LEGACY_FALLBACK_ENABLED" "helm/goldengate-monitor/templates/deployment.yaml" 2>/dev/null; then
+      PHASE5A_SPOTCHECK_OK="false"
+    fi
+    if [ "$PHASE5A_SPOTCHECK_OK" = "true" ]; then
+      pass "13: this EFS-only correction did not reintroduce observer/legacy-fallback logic or remove the workflow-matrix classifier"
+    else
+      fail "13: unexpected Phase 5A regression detected alongside the EFS correction"
+    fi
+
+    rm -rf "$EFS_WORKDIR"
+  fi
+else
+  skip "EFS persistence validation regression tests -- helm and/or python3/PyYAML not available"
+fi
+
 echo ""
 echo "=================================================="
 echo "Summary: ${PASS_COUNT} passed, ${FAIL_COUNT} failed, ${SKIP_COUNT} skipped"

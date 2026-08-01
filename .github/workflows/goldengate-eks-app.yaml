@@ -1106,120 +1106,306 @@ jobs:
 
           RENDERED="rendered/${RELEASE_NAME}.yaml"
 
-          PERSISTENCE_EFS_ENABLED="false"
-          if grep -A2 '^persistence:' "$VALUES_FILE" | grep -q 'enabled: true' \
-            && grep -A2 '^persistence:' "$VALUES_FILE" | grep -q 'provider: efs'; then
-            PERSISTENCE_EFS_ENABLED="true"
+          if ! command -v python3 >/dev/null 2>&1; then
+            echo "FAIL: python3 is required to validate EFS persistence configuration and is not available on this runner."
+            exit 1
           fi
 
-          if [ "$PERSISTENCE_EFS_ENABLED" != "true" ]; then
+          if ! python3 -c "import yaml" >/dev/null 2>&1; then
+            echo "FAIL: PyYAML is required to validate EFS persistence configuration and is not available on this runner."
+            exit 1
+          fi
+
+          # Strict, fail-closed values-file parsing: never grep for an
+          # optional key (an absent persistence.efs.storageClass.basePath is
+          # expected and must not abort the script under set -euo
+          # pipefail). Derives the expected default basePath using exactly
+          # the same contract as helm/goldengate/templates/_helpers.tpl's
+          # goldengate.efsBasePath -- never a re-invented name.
+          set +e
+          EFS_FACTS="$(python3 - "$VALUES_FILE" "$DEPLOYMENT_ID" "$DEPLOYMENT_MODEL" <<'PYEOF'
+          import sys
+
+          import yaml
+
+          values_path, deployment_id, deployment_model = sys.argv[1:4]
+
+          with open(values_path) as f:
+              raw = f.read()
+
+          try:
+              data = yaml.safe_load(raw)
+          except yaml.YAMLError as exc:
+              print(f"FAIL: {values_path} is not valid YAML: {exc}")
+              sys.exit(1)
+
+          if not data or not isinstance(data, dict):
+              print(f"FAIL: {values_path} root must be a non-empty YAML mapping.")
+              sys.exit(1)
+
+          persistence = data.get("persistence")
+          if persistence is not None and not isinstance(persistence, dict):
+              print(f"FAIL: {values_path} persistence must be a mapping, got {type(persistence).__name__}.")
+              sys.exit(1)
+
+          persistence = persistence or {}
+          efs_enabled = persistence.get("enabled") is True and persistence.get("provider") == "efs"
+
+          if not efs_enabled:
+              print("PERSISTENCE_EFS_ENABLED=false")
+              sys.exit(0)
+
+          efs = persistence.get("efs")
+          if not isinstance(efs, dict):
+              print(f"FAIL: {values_path} persistence.efs must be a mapping when persistence.enabled=true and provider=efs.")
+              sys.exit(1)
+
+          file_system_id = efs.get("fileSystemId")
+          if not isinstance(file_system_id, str) or not file_system_id.strip():
+              print(f"FAIL: {values_path} persistence.efs.fileSystemId must be a non-empty string when EFS is enabled.")
+              sys.exit(1)
+
+          storage_class = efs.get("storageClass")
+          if storage_class is not None and not isinstance(storage_class, dict):
+              print(f"FAIL: {values_path} persistence.efs.storageClass must be a mapping when present, got {type(storage_class).__name__}.")
+              sys.exit(1)
+
+          explicit_base_path = (storage_class or {}).get("basePath")
+          if explicit_base_path is not None and not isinstance(explicit_base_path, str):
+              print(f"FAIL: {values_path} persistence.efs.storageClass.basePath must be a string when present, got {type(explicit_base_path).__name__}.")
+              sys.exit(1)
+
+          if isinstance(explicit_base_path, str) and explicit_base_path.strip():
+              base_path = explicit_base_path
+          elif deployment_model == "singleRuntime":
+              # Mirrors goldengate.efsBasePath: an absent/null/empty basePath
+              # derives from the canonical runtime name (fullnameOverride,
+              # then name, then -- matching Release.Name in the chart --
+              # this workflow's own deployment_id, since envs/dev/<id>/ is
+              # itself named after the canonical runtime name).
+              runtime = data.get("runtime") or {}
+              runtime_name = runtime.get("fullnameOverride") or runtime.get("name") or deployment_id
+              if not isinstance(runtime_name, str) or not runtime_name.strip():
+                  print(f"FAIL: {values_path} could not resolve a runtime name for the default EFS basePath.")
+                  sys.exit(1)
+              base_path = f"/{runtime_name}"
+          elif deployment_model == "legacyPair":
+              global_values = data.get("global") or {}
+              global_deployment_id = global_values.get("deploymentId")
+              if not isinstance(global_deployment_id, str) or not global_deployment_id.strip():
+                  print(f"FAIL: {values_path} global.deploymentId is required to derive the default EFS basePath for deploymentModel=legacyPair.")
+                  sys.exit(1)
+              base_path = f"/{global_deployment_id}"
+          else:
+              print(f"FAIL: unknown deploymentModel {deployment_model!r} -- cannot derive the default EFS basePath (expected singleRuntime or legacyPair).")
+              sys.exit(1)
+
+          print("PERSISTENCE_EFS_ENABLED=true")
+          print(f"EFS_FILESYSTEM_ID={file_system_id}")
+          print(f"EFS_BASE_PATH={base_path}")
+          PYEOF
+          )"
+          EFS_FACTS_STATUS=$?
+          set -e
+
+          if [ "$EFS_FACTS_STATUS" -ne 0 ]; then
+            echo "$EFS_FACTS"
+            exit 1
+          fi
+
+          source <(printf '%s\n' "$EFS_FACTS")
+
+          if [ "${PERSISTENCE_EFS_ENABLED:-false}" != "true" ]; then
             echo "persistence.enabled/provider=efs not set in ${VALUES_FILE}. Skipping EFS persistence render checks."
             exit 0
           fi
 
           echo "persistence.enabled=true and provider=efs in ${VALUES_FILE}. Checking rendered manifest: ${RENDERED}"
+          echo "Expected EFS fileSystemId: ${EFS_FILESYSTEM_ID}"
+          echo "Expected EFS basePath: ${EFS_BASE_PATH}"
 
-          EFS_FILESYSTEM_ID="$(grep -E '^\s*fileSystemId:' "$VALUES_FILE" | head -1 | sed -E 's/^\s*fileSystemId:\s*//' | tr -d '"'"'"'\r' | xargs)"
+          python3 - "$RENDERED" "$VALUES_FILE" "$DEPLOYMENT_ID" "$DEPLOYMENT_MODEL" "$ENVIRONMENT" "$EFS_FILESYSTEM_ID" "$EFS_BASE_PATH" <<'PYEOF'
+          import re
+          import sys
 
-          if [ -z "$EFS_FILESYSTEM_ID" ]; then
-            echo "persistence.efs.fileSystemId not found in ${VALUES_FILE}. Cannot validate the rendered StorageClass."
-            exit 1
-          fi
+          import yaml
 
-          EFS_BASE_PATH="$(grep -E '^\s*basePath:' "$VALUES_FILE" | head -1 | sed -E 's/^\s*basePath:\s*//' | tr -d '"'"'"'\r' | xargs)"
 
-          if [ -z "$EFS_BASE_PATH" ]; then
-            echo "persistence.efs.storageClass.basePath not found in ${VALUES_FILE}. Cannot validate the rendered StorageClass."
-            exit 1
-          fi
+          class DuplicateKeyError(Exception):
+              pass
 
-          STORAGE_CLASS_NAME="gg-efs-${ENVIRONMENT}-${DEPLOYMENT_ID}"
 
-          if [ "$DEPLOYMENT_MODEL" = "singleRuntime" ]; then
-            # The candidate values contract deliberately leaves
-            # runtime.storage.u02.claimName empty so the chart generates it
-            # from the canonical runtime name (<runtime-name>-u02) -- and
-            # envs/dev/<deployment_id>/ is itself named after the canonical
-            # runtime name, so DEPLOYMENT_ID and the runtime name are the
-            # same string here.
-            RUNTIME_PVC_NAME="${DEPLOYMENT_ID}-u02"
+          class StrictSafeLoader(yaml.SafeLoader):
+              pass
 
-            echo "Checking StorageClass ${STORAGE_CLASS_NAME}..."
-            grep -q "kind: StorageClass" "$RENDERED"
-            grep -q "name: ${STORAGE_CLASS_NAME}" "$RENDERED"
-            grep -q "provisioner: efs.csi.aws.com" "$RENDERED"
-            grep -q "provisioningMode: efs-ap" "$RENDERED"
-            grep -q "fileSystemId: \"${EFS_FILESYSTEM_ID}\"" "$RENDERED"
-            grep -q "basePath: \"${EFS_BASE_PATH}\"" "$RENDERED"
-            grep -q 'subPathPattern: "\${.PVC.name}"' "$RENDERED"
-            grep -q 'ensureUniqueDirectory: "true"' "$RENDERED"
-            grep -q "reclaimPolicy: Retain" "$RENDERED"
 
-            echo "Checking PersistentVolumeClaim ${RUNTIME_PVC_NAME}..."
-            grep -q "kind: PersistentVolumeClaim" "$RENDERED"
-            grep -q "name: ${RUNTIME_PVC_NAME}" "$RENDERED"
+          def _no_duplicates_constructor(loader, node, deep=False):
+              mapping = {}
+              for key_node, value_node in node.value:
+                  key = loader.construct_object(key_node, deep=deep)
+                  if key in mapping:
+                      raise DuplicateKeyError(
+                          f"duplicate mapping key {key!r} at line {key_node.start_mark.line + 1}"
+                      )
+                  value = loader.construct_object(value_node, deep=deep)
+                  mapping[key] = value
+              return mapping
 
-            echo "Checking StatefulSet volumes (u02 must use persistentVolumeClaim with the expected claimName, u03 must stay emptyDir)..."
-            RUNTIME_STS="$(awk '/^# Source: .*runtime-statefulset\.yaml$/{flag=1} flag{print} /^---$/{if(flag) exit}' "$RENDERED")"
 
-            echo "$RUNTIME_STS" | grep -A1 "^        - name: u02" | grep -q "persistentVolumeClaim:"
-            echo "$RUNTIME_STS" | grep -q "claimName: ${RUNTIME_PVC_NAME}"
-            echo "$RUNTIME_STS" | grep -A1 "^        - name: u03" | grep -q "emptyDir: {}"
+          StrictSafeLoader.add_constructor(
+              yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _no_duplicates_constructor
+          )
 
-            echo "OK: EFS StorageClass, runtime PVC, and StatefulSet u02/u03 volumes all match the expected persistence configuration."
-          else
-            # PVC claim names are read from the values file rather than
-            # re-derived from ENVIRONMENT/DEPLOYMENT_ID: EFS enforces a
-            # 100-character access point path limit (basePath + PVC name +
-            # a unique suffix), so deployments intentionally set short,
-            # explicit claimName overrides instead of using the long
-            # environment-deploymentId-based generated defaults.
-            SOURCE_BLOCK="$(awk '/^source:/{flag=1} flag{print} /^[a-zA-Z]/{if(flag && !/^source:/) exit}' "$VALUES_FILE")"
-            TARGET_BLOCK="$(awk '/^target:/{flag=1} flag{print} /^[a-zA-Z]/{if(flag && !/^target:/) exit}' "$VALUES_FILE")"
+          (rendered_path, values_path, deployment_id, deployment_model,
+           environment, expected_file_system_id, expected_base_path) = sys.argv[1:8]
 
-            SOURCE_PVC_NAME="$(echo "$SOURCE_BLOCK" | grep -E '^\s*claimName:' | head -1 | sed -E 's/^\s*claimName:\s*//' | tr -d '"'"'"'\r' | xargs)"
-            TARGET_PVC_NAME="$(echo "$TARGET_BLOCK" | grep -E '^\s*claimName:' | head -1 | sed -E 's/^\s*claimName:\s*//' | tr -d '"'"'"'\r' | xargs)"
+          with open(rendered_path) as f:
+              raw = f.read()
 
-            if [ -z "$SOURCE_PVC_NAME" ] || [ -z "$TARGET_PVC_NAME" ]; then
-              echo "source.storage.u02.claimName or target.storage.u02.claimName not found in ${VALUES_FILE}. Cannot validate the rendered PVCs."
-              exit 1
-            fi
+          # Attribute each rendered document to the template that rendered
+          # it using Helm's own leading "# Source: <path>" comment -- never
+          # re-deriving the chart's resource-naming fallback chains
+          # (goldengate.sourceName/targetName/...) independently in Python.
+          documents = []
+          for chunk in re.split(r"(?m)^---$", raw):
+              chunk = chunk.strip("\n")
+              if not chunk.strip():
+                  continue
+              source_template = None
+              for line in chunk.splitlines():
+                  line = line.strip()
+                  if not line:
+                      continue
+                  if line.startswith("# Source:"):
+                      source_template = line[len("# Source:"):].strip()
+                  break
+              try:
+                  doc = yaml.load(chunk, Loader=StrictSafeLoader)
+              except DuplicateKeyError as exc:
+                  print(f"FAIL: duplicate YAML mapping key in rendered manifest ({source_template}): {exc}")
+                  sys.exit(1)
+              except yaml.YAMLError as exc:
+                  print(f"FAIL: rendered manifest document is not valid YAML ({source_template}): {exc}")
+                  sys.exit(1)
+              if doc:
+                  documents.append((source_template, doc))
 
-            echo "Checking StorageClass ${STORAGE_CLASS_NAME}..."
-            grep -q "kind: StorageClass" "$RENDERED"
-            grep -q "name: ${STORAGE_CLASS_NAME}" "$RENDERED"
-            grep -q "provisioner: efs.csi.aws.com" "$RENDERED"
-            grep -q "provisioningMode: efs-ap" "$RENDERED"
-            grep -q "fileSystemId: \"${EFS_FILESYSTEM_ID}\"" "$RENDERED"
-            grep -q "basePath: \"${EFS_BASE_PATH}\"" "$RENDERED"
-            grep -q 'subPathPattern: "\${.PVC.name}"' "$RENDERED"
-            grep -q 'ensureUniqueDirectory: "true"' "$RENDERED"
-            grep -q "reclaimPolicy: Retain" "$RENDERED"
+          expected_storage_class_name = f"gg-efs-{environment}-{deployment_id}"
 
-            echo "Checking PersistentVolumeClaims ${SOURCE_PVC_NAME} / ${TARGET_PVC_NAME}..."
-            grep -q "kind: PersistentVolumeClaim" "$RENDERED"
-            grep -q "name: ${SOURCE_PVC_NAME}" "$RENDERED"
-            grep -q "name: ${TARGET_PVC_NAME}" "$RENDERED"
+          storage_classes = [
+              doc for _, doc in documents
+              if doc.get("kind") == "StorageClass"
+              and (doc.get("metadata") or {}).get("name") == expected_storage_class_name
+          ]
+          if len(storage_classes) != 1:
+              all_names = [(doc.get("metadata") or {}).get("name") for _, doc in documents if doc.get("kind") == "StorageClass"]
+              print(f"FAIL: expected exactly one StorageClass named {expected_storage_class_name!r}, found {len(storage_classes)} (all rendered StorageClass names: {all_names}).")
+              sys.exit(1)
 
-            echo "Checking StatefulSet volumes (u02 must use persistentVolumeClaim with the expected claimName, u03 must stay emptyDir)..."
+          sc = storage_classes[0]
+          parameters = sc.get("parameters") or {}
 
-            # Isolate each StatefulSet's own rendered document so the u02/u03
-            # check is unambiguous -- a plain grep across the whole manifest
-            # can't tell the source StatefulSet's volumes apart from the
-            # target StatefulSet's.
-            SOURCE_STS="$(awk '/^# Source: .*source-statefulset\.yaml$/{flag=1} flag{print} /^---$/{if(flag) exit}' "$RENDERED")"
-            TARGET_STS="$(awk '/^# Source: .*target-statefulset\.yaml$/{flag=1} flag{print} /^---$/{if(flag) exit}' "$RENDERED")"
+          checks = [
+              (sc.get("provisioner") == "efs.csi.aws.com",
+               f"provisioner (expected 'efs.csi.aws.com', got {sc.get('provisioner')!r})"),
+              (parameters.get("provisioningMode") == "efs-ap",
+               f"parameters.provisioningMode (expected 'efs-ap', got {parameters.get('provisioningMode')!r})"),
+              (parameters.get("fileSystemId") == expected_file_system_id,
+               f"parameters.fileSystemId (expected {expected_file_system_id!r}, got {parameters.get('fileSystemId')!r})"),
+              (parameters.get("basePath") == expected_base_path,
+               f"parameters.basePath (expected {expected_base_path!r}, got {parameters.get('basePath')!r})"),
+              (parameters.get("subPathPattern") == "${.PVC.name}",
+               f"parameters.subPathPattern (expected '\x24{{.PVC.name}}', got {parameters.get('subPathPattern')!r})"),
+              (parameters.get("ensureUniqueDirectory") == "true",
+               f"parameters.ensureUniqueDirectory (expected 'true', got {parameters.get('ensureUniqueDirectory')!r})"),
+              (sc.get("reclaimPolicy") == "Retain",
+               f"reclaimPolicy (expected 'Retain', got {sc.get('reclaimPolicy')!r})"),
+          ]
+          failed = [msg for ok, msg in checks if not ok]
+          if failed:
+              print(f"FAIL: rendered StorageClass {expected_storage_class_name!r} does not match the expected configuration:")
+              for msg in failed:
+                  print(f"  - {msg}")
+              sys.exit(1)
 
-            echo "$SOURCE_STS" | grep -A1 "^        - name: u02" | grep -q "persistentVolumeClaim:"
-            echo "$SOURCE_STS" | grep -q "claimName: ${SOURCE_PVC_NAME}"
-            echo "$SOURCE_STS" | grep -A1 "^        - name: u03" | grep -q "emptyDir: {}"
+          print(f"OK: StorageClass {expected_storage_class_name!r} matches the expected configuration (provisioner, provisioningMode, fileSystemId, basePath={expected_base_path!r}, subPathPattern, ensureUniqueDirectory, reclaimPolicy).")
 
-            echo "$TARGET_STS" | grep -A1 "^        - name: u02" | grep -q "persistentVolumeClaim:"
-            echo "$TARGET_STS" | grep -q "claimName: ${TARGET_PVC_NAME}"
-            echo "$TARGET_STS" | grep -A1 "^        - name: u03" | grep -q "emptyDir: {}"
+          def _volume(sts_doc, name):
+              volumes = ((sts_doc.get("spec") or {}).get("template") or {}).get("spec", {}).get("volumes") or []
+              for v in volumes:
+                  if v.get("name") == name:
+                      return v
+              return None
 
-            echo "OK: EFS StorageClass, source/target PVCs, and StatefulSet u02/u03 volumes all match the expected persistence configuration."
-          fi
+          def _check_u02_u03(label, sts_doc, expected_pvc_name):
+              u02 = _volume(sts_doc, "u02")
+              if not u02 or (u02.get("persistentVolumeClaim") or {}).get("claimName") != expected_pvc_name:
+                  print(f"FAIL: {label} StatefulSet u02 volume does not use persistentVolumeClaim.claimName={expected_pvc_name!r} (found: {u02!r}).")
+                  sys.exit(1)
+              u03 = _volume(sts_doc, "u03")
+              if not u03 or "emptyDir" not in u03:
+                  print(f"FAIL: {label} StatefulSet u03 volume is not emptyDir (found: {u03!r}).")
+                  sys.exit(1)
+
+          if deployment_model == "singleRuntime":
+              expected_pvc_name = f"{deployment_id}-u02"
+
+              pvcs = [
+                  doc for _, doc in documents
+                  if doc.get("kind") == "PersistentVolumeClaim"
+                  and (doc.get("metadata") or {}).get("name") == expected_pvc_name
+              ]
+              if len(pvcs) != 1:
+                  print(f"FAIL: expected exactly one PersistentVolumeClaim named {expected_pvc_name!r}, found {len(pvcs)}.")
+                  sys.exit(1)
+
+              statefulsets = [doc for _, doc in documents if doc.get("kind") == "StatefulSet"]
+              if len(statefulsets) != 1:
+                  print(f"FAIL: expected exactly one StatefulSet, found {len(statefulsets)}.")
+                  sys.exit(1)
+
+              _check_u02_u03("runtime", statefulsets[0], expected_pvc_name)
+
+              print("OK: EFS StorageClass, runtime PVC, and StatefulSet u02/u03 volumes all match the expected persistence configuration.")
+          else:
+              with open(values_path) as f:
+                  values = yaml.safe_load(f) or {}
+
+              source_values = values.get("source") or {}
+              target_values = values.get("target") or {}
+              source_pvc_name = ((source_values.get("storage") or {}).get("u02") or {}).get("claimName")
+              target_pvc_name = ((target_values.get("storage") or {}).get("u02") or {}).get("claimName")
+
+              if not isinstance(source_pvc_name, str) or not source_pvc_name.strip() \
+                 or not isinstance(target_pvc_name, str) or not target_pvc_name.strip():
+                  print(f"FAIL: source.storage.u02.claimName or target.storage.u02.claimName not found in {values_path}. Cannot validate the rendered PVCs.")
+                  sys.exit(1)
+
+              for pvc_name in (source_pvc_name, target_pvc_name):
+                  pvcs = [
+                      doc for _, doc in documents
+                      if doc.get("kind") == "PersistentVolumeClaim"
+                      and (doc.get("metadata") or {}).get("name") == pvc_name
+                  ]
+                  if len(pvcs) != 1:
+                      print(f"FAIL: expected exactly one PersistentVolumeClaim named {pvc_name!r}, found {len(pvcs)}.")
+                      sys.exit(1)
+
+              source_statefulsets = [doc for template, doc in documents if doc.get("kind") == "StatefulSet" and template and template.endswith("source-statefulset.yaml")]
+              target_statefulsets = [doc for template, doc in documents if doc.get("kind") == "StatefulSet" and template and template.endswith("target-statefulset.yaml")]
+
+              if len(source_statefulsets) != 1:
+                  print(f"FAIL: expected exactly one source StatefulSet (source-statefulset.yaml), found {len(source_statefulsets)}.")
+                  sys.exit(1)
+              if len(target_statefulsets) != 1:
+                  print(f"FAIL: expected exactly one target StatefulSet (target-statefulset.yaml), found {len(target_statefulsets)}.")
+                  sys.exit(1)
+
+              _check_u02_u03("source", source_statefulsets[0], source_pvc_name)
+              _check_u02_u03("target", target_statefulsets[0], target_pvc_name)
+
+              print("OK: EFS StorageClass, source/target PVCs, and StatefulSet u02/u03 volumes all match the expected persistence configuration.")
+          PYEOF
 
       - name: Validate no observer sidecar is rendered
         shell: bash
