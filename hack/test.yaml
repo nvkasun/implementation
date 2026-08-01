@@ -20,3 +20,9 @@ grep -E 'cloudwatch_client_creation_failed|cloudwatch_put_metric_data_failed|tic
 Expected: no output.
 
 Check the actual metric
+
+kubectl logs \
+  -n goldengate-monitoring \
+  deployment/gg-monitor \
+  --since=15m |
+grep -E 'cloudwatch_client_creation_failed|cloudwatch_put_metric_data_failed|tick failed' || true
