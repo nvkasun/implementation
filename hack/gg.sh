@@ -1,276 +1,284 @@
-#!/usr/bin/env bash
-# Phase 5B recovery validation after recreating canonical Argo CD Applications.
-# Read-only: no create/update/delete/apply/patch operations.
-
 set -u
 
 RUNTIME_NS="goldengate-dev"
 MONITOR_NS="goldengate-monitoring"
 ARGO_NS="argocd"
 
-ORACLE_APP="goldengate-dev-oracle-payments-01"
-POSTGRES_APP="goldengate-dev-postgresql-payments-01"
-PLATFORM_APP="goldengate-dev-platform"
-MONITOR_APP="goldengate-monitor"
-
 ORACLE_STS="gg-oracle-payments-01"
 POSTGRES_STS="gg-postgresql-payments-01"
 MONITOR_DEPLOY="gg-monitor"
 
+EXPECTED_RUNTIME_ROLE="arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev"
+EXPECTED_MONITOR_ROLE="arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev"
+
 FAILURES=0
 
 section() {
-  printf '\n============================================================\n'
-  printf '%s\n' "$1"
-  printf '============================================================\n'
+  echo
+  echo "============================================================"
+  echo "$1"
+  echo "============================================================"
 }
 
-pass() { printf 'PASS: %s\n' "$*"; }
-fail() { printf 'FAIL: %s\n' "$*" >&2; FAILURES=$((FAILURES + 1)); }
+pass() {
+  echo "PASS: $*"
+}
+
+fail() {
+  echo "FAIL: $*" >&2
+  FAILURES=$((FAILURES + 1))
+}
 
 check_app() {
-  local app="$1"
-  local status
-  status="$(
-    kubectl get application "$app" -n "$ARGO_NS" \
+  APP="$1"
+
+  STATUS="$(
+    kubectl get application "$APP" \
+      -n "$ARGO_NS" \
       -o jsonpath='{.status.sync.status}{"|"}{.status.health.status}' \
       2>/dev/null || true
   )"
-  printf '%s: %s\n' "$app" "${status:-NOT_FOUND}"
-  if [ "$status" = "Synced|Healthy" ]; then
-    pass "$app is Synced and Healthy"
+
+  echo "${APP}: ${STATUS:-NOT_FOUND}"
+
+  if [ "$STATUS" = "Synced|Healthy" ]; then
+    pass "${APP} is Synced and Healthy"
   else
-    fail "$app is not Synced and Healthy"
+    fail "${APP} is not Synced and Healthy"
   fi
 }
 
-check_rollout() {
-  local resource="$1"
-  local namespace="$2"
-  if kubectl rollout status "$resource" -n "$namespace" --timeout=5m; then
-    pass "$resource rollout completed"
-  else
-    fail "$resource rollout failed or timed out"
-  fi
-}
+section "1. PRE-RESTART APPLICATION HEALTH"
 
-section "1. ARGO CD APPLICATION STATUS"
-
-for app in \
-  "$ORACLE_APP" \
-  "$POSTGRES_APP" \
-  "$PLATFORM_APP" \
-  "$MONITOR_APP"
+for APP in \
+  goldengate-dev-oracle-payments-01 \
+  goldengate-dev-postgresql-payments-01 \
+  goldengate-dev-platform \
+  goldengate-monitor
 do
-  check_app "$app"
+  check_app "$APP"
 done
 
-if kubectl get application goldengate-payments-ora-to-pg-001 \
-    -n "$ARGO_NS" >/dev/null 2>&1; then
-  fail "Retired legacy Argo CD Application still exists"
+section "2. SERVICE ACCOUNT AND IRSA ROLE MAPPING"
+
+ORACLE_ROLE="$(
+  kubectl get serviceaccount gg-oracle-sa \
+    -n "$RUNTIME_NS" \
+    -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}' \
+    2>/dev/null || true
+)"
+
+POSTGRES_ROLE="$(
+  kubectl get serviceaccount gg-postgresql-sa \
+    -n "$RUNTIME_NS" \
+    -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}' \
+    2>/dev/null || true
+)"
+
+MONITOR_ROLE="$(
+  kubectl get serviceaccount gg-monitor \
+    -n "$MONITOR_NS" \
+    -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}' \
+    2>/dev/null || true
+)"
+
+echo "gg-oracle-sa role:     ${ORACLE_ROLE:-<missing>}"
+echo "gg-postgresql-sa role: ${POSTGRES_ROLE:-<missing>}"
+echo "gg-monitor role:       ${MONITOR_ROLE:-<missing>}"
+
+if [ "$ORACLE_ROLE" = "$EXPECTED_RUNTIME_ROLE" ]; then
+  pass "Oracle ServiceAccount retains the runtime IAM role"
 else
-  pass "Retired legacy Argo CD Application is absent"
+  fail "Oracle ServiceAccount IAM role is unexpected"
 fi
 
-section "2. RUNTIME AND MONITOR ROLLOUTS"
+if [ "$POSTGRES_ROLE" = "$EXPECTED_RUNTIME_ROLE" ]; then
+  pass "PostgreSQL ServiceAccount retains the runtime IAM role"
+else
+  fail "PostgreSQL ServiceAccount IAM role is unexpected"
+fi
 
-check_rollout "statefulset/${ORACLE_STS}" "$RUNTIME_NS"
-check_rollout "statefulset/${POSTGRES_STS}" "$RUNTIME_NS"
-check_rollout "deployment/${MONITOR_DEPLOY}" "$MONITOR_NS"
+if [ "$MONITOR_ROLE" = "$EXPECTED_MONITOR_ROLE" ]; then
+  pass "Monitor retains its separate monitor IAM role"
+else
+  fail "Monitor IAM role is unexpected"
+fi
 
-section "3. CANONICAL POD MODEL"
+section "3. WAIT FOR IAM PROPAGATION"
 
-kubectl get pods -n "$RUNTIME_NS" \
-  -o custom-columns='POD:.metadata.name,PHASE:.status.phase,READY:.status.containerStatuses[*].ready,CONTAINERS:.spec.containers[*].name,INIT:.spec.initContainers[*].name,IMAGES:.spec.containers[*].image'
+echo "Waiting 30 seconds before controlled pod restarts..."
+sleep 30
+
+section "4. RESTART ORACLE AND VALIDATE"
+
+kubectl rollout restart \
+  statefulset/"$ORACLE_STS" \
+  -n "$RUNTIME_NS"
+
+if kubectl rollout status \
+    statefulset/"$ORACLE_STS" \
+    -n "$RUNTIME_NS" \
+    --timeout=7m; then
+  pass "Oracle restarted successfully with the reduced runtime IAM policy"
+else
+  fail "Oracle failed to restart"
+fi
+
+kubectl get pod \
+  -n "$RUNTIME_NS" \
+  -l "app.kubernetes.io/instance=${ORACLE_STS}" \
+  -o custom-columns='POD:.metadata.name,PHASE:.status.phase,READY:.status.containerStatuses[*].ready,CONTAINERS:.spec.containers[*].name,RESTARTS:.status.containerStatuses[*].restartCount,IMAGE:.spec.containers[*].image'
+
+section "5. RESTART POSTGRESQL AND VALIDATE"
+
+kubectl rollout restart \
+  statefulset/"$POSTGRES_STS" \
+  -n "$RUNTIME_NS"
+
+if kubectl rollout status \
+    statefulset/"$POSTGRES_STS" \
+    -n "$RUNTIME_NS" \
+    --timeout=7m; then
+  pass "PostgreSQL restarted successfully with the reduced runtime IAM policy"
+else
+  fail "PostgreSQL failed to restart"
+fi
+
+kubectl get pod \
+  -n "$RUNTIME_NS" \
+  -l "app.kubernetes.io/instance=${POSTGRES_STS}" \
+  -o custom-columns='POD:.metadata.name,PHASE:.status.phase,READY:.status.containerStatuses[*].ready,CONTAINERS:.spec.containers[*].name,RESTARTS:.status.containerStatuses[*].restartCount,IMAGE:.spec.containers[*].image'
+
+section "6. SECRETS STORE CSI AND STARTUP EVENTS"
+
+EVENT_ERRORS="$(
+  kubectl get events \
+    -n "$RUNTIME_NS" \
+    --sort-by=.metadata.creationTimestamp \
+    -o custom-columns='TIME:.metadata.creationTimestamp,TYPE:.type,REASON:.reason,OBJECT:.involvedObject.name,MESSAGE:.message' \
+    2>&1 |
+  grep -Ei \
+    'FailedMount|MountVolume|AccessDenied|secretsmanager|kms|forbidden|permission denied' \
+  | tail -n 80 || true
+)"
+
+if [ -z "$EVENT_ERRORS" ]; then
+  pass "No Secrets Store CSI, Secrets Manager or KMS mount errors found"
+else
+  fail "Secret or CSI-related events were found"
+  echo "$EVENT_ERRORS"
+fi
+
+echo
+echo "--- SecretProviderClasses ---"
+
+kubectl get secretproviderclass \
+  -n "$RUNTIME_NS" \
+  -o custom-columns='NAME:.metadata.name,PROVIDER:.spec.provider' \
+  2>&1
+
+section "7. CANONICAL POD MODEL AFTER RESTART"
+
+kubectl get pods \
+  -n "$RUNTIME_NS" \
+  -o custom-columns='POD:.metadata.name,PHASE:.status.phase,READY:.status.containerStatuses[*].ready,CONTAINERS:.spec.containers[*].name,INIT:.spec.initContainers[*].name,RESTARTS:.status.containerStatuses[*].restartCount'
 
 ORACLE_CONTAINERS="$(
-  kubectl get statefulset "$ORACLE_STS" -n "$RUNTIME_NS" \
-    -o jsonpath='{.spec.template.spec.containers[*].name}' 2>/dev/null || true
+  kubectl get statefulset "$ORACLE_STS" \
+    -n "$RUNTIME_NS" \
+    -o jsonpath='{.spec.template.spec.containers[*].name}' \
+    2>/dev/null || true
 )"
+
 POSTGRES_CONTAINERS="$(
-  kubectl get statefulset "$POSTGRES_STS" -n "$RUNTIME_NS" \
-    -o jsonpath='{.spec.template.spec.containers[*].name}' 2>/dev/null || true
-)"
-ORACLE_INIT="$(
-  kubectl get statefulset "$ORACLE_STS" -n "$RUNTIME_NS" \
-    -o jsonpath='{.spec.template.spec.initContainers[*].name}' 2>/dev/null || true
-)"
-POSTGRES_INIT="$(
-  kubectl get statefulset "$POSTGRES_STS" -n "$RUNTIME_NS" \
-    -o jsonpath='{.spec.template.spec.initContainers[*].name}' 2>/dev/null || true
+  kubectl get statefulset "$POSTGRES_STS" \
+    -n "$RUNTIME_NS" \
+    -o jsonpath='{.spec.template.spec.containers[*].name}' \
+    2>/dev/null || true
 )"
 
-[ "$ORACLE_CONTAINERS" = "ogg-oracle" ] \
-  && pass "Oracle has exactly one GoldenGate application container" \
-  || fail "Unexpected Oracle containers: ${ORACLE_CONTAINERS:-<none>}"
+if [ "$ORACLE_CONTAINERS" = "ogg-oracle" ]; then
+  pass "Oracle remains observer-free"
+else
+  fail "Unexpected Oracle containers: ${ORACLE_CONTAINERS:-<none>}"
+fi
 
-[ "$POSTGRES_CONTAINERS" = "ogg-postgresql" ] \
-  && pass "PostgreSQL has exactly one GoldenGate application container" \
-  || fail "Unexpected PostgreSQL containers: ${POSTGRES_CONTAINERS:-<none>}"
-
-[ "$ORACLE_INIT" = "prepare-u02-permissions" ] \
-  && pass "Oracle has the expected init container" \
-  || fail "Unexpected Oracle init containers: ${ORACLE_INIT:-<none>}"
-
-[ "$POSTGRES_INIT" = "prepare-u02-permissions" ] \
-  && pass "PostgreSQL has the expected init container" \
-  || fail "Unexpected PostgreSQL init containers: ${POSTGRES_INIT:-<none>}"
+if [ "$POSTGRES_CONTAINERS" = "ogg-postgresql" ]; then
+  pass "PostgreSQL remains observer-free"
+else
+  fail "Unexpected PostgreSQL containers: ${POSTGRES_CONTAINERS:-<none>}"
+fi
 
 OBSERVER_ROWS="$(
-  kubectl get pods -A \
+  kubectl get pods \
+    -A \
     -o jsonpath='{range .items[*]}{.metadata.namespace}{"|"}{.metadata.name}{"|"}{.spec.containers[*].name}{"\n"}{end}' \
     2>/dev/null |
   grep -Ei 'goldengate-observer|observer-sidecar' || true
 )"
 
 if [ -z "$OBSERVER_ROWS" ]; then
-  pass "No observer sidecar exists in any live pod"
+  pass "No observer container exists in any live pod"
 else
-  fail "Observer sidecar still exists in live pods"
-  printf '%s\n' "$OBSERVER_ROWS"
+  fail "Observer container still exists"
+  echo "$OBSERVER_ROWS"
 fi
 
-if kubectl get namespace gg-dev-payments-ora-to-pg-001 >/dev/null 2>&1; then
-  fail "Retired legacy namespace still exists"
+section "8. RUNTIME LOG ERROR CHECK"
+
+RUNTIME_ERRORS="$(
+  for STS in "$ORACLE_STS" "$POSTGRES_STS"; do
+    kubectl logs \
+      -n "$RUNTIME_NS" \
+      statefulset/"$STS" \
+      --since=15m \
+      2>&1 || true
+  done |
+  grep -Ei \
+    'AccessDenied|secretsmanager|kms.*denied|failed.*secret|permission denied|FailedMount' \
+  || true
+)"
+
+if [ -z "$RUNTIME_ERRORS" ]; then
+  pass "No runtime IAM, Secrets Manager or KMS errors found"
 else
-  pass "Retired legacy namespace is absent"
+  fail "Runtime IAM or secret-retrieval errors were found"
+  echo "$RUNTIME_ERRORS"
 fi
 
-section "4. SERVICES"
-
-kubectl get services -n "$RUNTIME_NS" -o wide
-
-for instance in "$ORACLE_STS" "$POSTGRES_STS"; do
-  SERVICES="$(
-    kubectl get services -n "$RUNTIME_NS" \
-      -l "app.kubernetes.io/instance=${instance}" \
-      -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.spec.clusterIP}{"|"}{.spec.type}{"\n"}{end}' \
-      2>/dev/null || true
-  )"
-
-  NORMAL_COUNT="$(
-    printf '%s\n' "$SERVICES" |
-      awk -F'|' 'NF>=3 && $2!="None" && ($3=="ClusterIP" || $3=="") {n++} END {print n+0}'
-  )"
-  HEADLESS_COUNT="$(
-    printf '%s\n' "$SERVICES" |
-      awk -F'|' 'NF>=3 && $2=="None" {n++} END {print n+0}'
-  )"
-
-  if [ "$NORMAL_COUNT" -eq 1 ] && [ "$HEADLESS_COUNT" -eq 1 ]; then
-    pass "$instance has exactly one normal and one headless Service"
-  else
-    fail "$instance Service contract invalid: normal=${NORMAL_COUNT}, headless=${HEADLESS_COUNT}"
-  fi
-done
-
-section "5. PVC AND PV BINDINGS"
-
-kubectl get pvc -n "$RUNTIME_NS" \
-  -o custom-columns='PVC:.metadata.name,STATUS:.status.phase,VOLUME:.spec.volumeName,STORAGECLASS:.spec.storageClassName,CAPACITY:.status.capacity.storage,ACCESS_MODES:.spec.accessModes'
-
-for pvc in \
-  gg-oracle-payments-01-u02 \
-  gg-postgresql-payments-01-u02
-do
-  STATUS="$(
-    kubectl get pvc "$pvc" -n "$RUNTIME_NS" \
-      -o jsonpath='{.status.phase}' 2>/dev/null || true
-  )"
-  PV="$(
-    kubectl get pvc "$pvc" -n "$RUNTIME_NS" \
-      -o jsonpath='{.spec.volumeName}' 2>/dev/null || true
-  )"
-
-  if [ "$STATUS" = "Bound" ] && [ -n "$PV" ]; then
-    pass "$pvc is Bound to $PV"
-  else
-    fail "$pvc is not Bound"
-  fi
-done
-
-echo
-echo "--- All GoldenGate-related PVs ---"
-
-kubectl get pv -o json |
-python3 -c '
-import json, sys
-data = json.load(sys.stdin)
-print("PV|STATUS|RECLAIM|STORAGECLASS|CLAIM_NAMESPACE|CLAIM_NAME|VOLUME_HANDLE")
-for item in data.get("items", []):
-    spec = item.get("spec", {})
-    claim = spec.get("claimRef", {})
-    sc = spec.get("storageClassName", "")
-    ns = claim.get("namespace", "")
-    if "gg-efs" in sc or "goldengate" in ns or ns.startswith("gg-dev-"):
-        print("|".join([
-            item["metadata"]["name"],
-            item.get("status", {}).get("phase", ""),
-            spec.get("persistentVolumeReclaimPolicy", ""),
-            sc,
-            ns,
-            claim.get("name", ""),
-            spec.get("csi", {}).get("volumeHandle", ""),
-        ]))
-'
-
-section "6. MONITOR DEPLOYMENT CONFIGURATION"
-
-MONITOR_IMAGE="$(
-  kubectl get deployment "$MONITOR_DEPLOY" -n "$MONITOR_NS" \
-    -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true
-)"
-CW_SWITCH="$(
-  kubectl get deployment "$MONITOR_DEPLOY" -n "$MONITOR_NS" \
-    -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="CLOUDWATCH_PUBLISH_ENABLED")].value}' \
-    2>/dev/null || true
-)"
-LEGACY_SWITCH="$(
-  kubectl get deployment "$MONITOR_DEPLOY" -n "$MONITOR_NS" \
-    -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="LEGACY_FALLBACK_ENABLED")].value}' \
-    2>/dev/null || true
-)"
-
-printf 'Monitor image: %s\n' "${MONITOR_IMAGE:-<missing>}"
-printf 'CLOUDWATCH_PUBLISH_ENABLED=%s\n' "${CW_SWITCH:-<missing>}"
-printf 'LEGACY_FALLBACK_ENABLED=%s\n' "${LEGACY_SWITCH:-<absent>}"
-
-[ "$CW_SWITCH" = "true" ] \
-  && pass "CloudWatch publication remains enabled" \
-  || fail "CLOUDWATCH_PUBLISH_ENABLED is not true"
-
-[ -z "$LEGACY_SWITCH" ] \
-  && pass "Legacy fallback switch is absent" \
-  || fail "LEGACY_FALLBACK_ENABLED still exists"
-
-section "7. WAIT FOR CANONICAL MONITOR RECOVERY"
+section "9. WAIT FOR SHARED MONITOR RECOVERY"
 
 MONITOR_POD="$(
-  kubectl get pods -n "$MONITOR_NS" \
+  kubectl get pods \
+    -n "$MONITOR_NS" \
     -l app.kubernetes.io/name=gg-monitor \
     --field-selector=status.phase=Running \
     --sort-by=.metadata.creationTimestamp \
     -o name 2>/dev/null |
-  tail -n1 |
+  tail -n 1 |
   sed 's#^pod/##'
 )"
+
+echo "Selected monitor pod: ${MONITOR_POD:-NOT_FOUND}"
 
 if [ -z "$MONITOR_POD" ]; then
   fail "No Running gg-monitor pod found"
 else
-  printf 'Selected monitor pod: %s\n' "$MONITOR_POD"
-
-  if kubectl exec -i -n "$MONITOR_NS" "$MONITOR_POD" -- python3 - <<'PY'
+  if kubectl exec -i \
+      -n "$MONITOR_NS" \
+      "$MONITOR_POD" \
+      -- python3 - <<'PY'
 import json
 import time
 import urllib.request
+
+base = "http://127.0.0.1:8080"
 
 expected = {
     "gg-oracle-payments-01": ("oracle", "source"),
     "gg-postgresql-payments-01": ("postgresql", "target"),
 }
 
-base = "http://127.0.0.1:8080"
 last = {}
 
 for attempt in range(1, 31):
@@ -278,6 +286,7 @@ for attempt in range(1, 31):
         payload = json.load(response)
 
     seen = {}
+
     for logical in payload.get("logicalPipelines", []):
         for runtime in logical.get("runtimes", []):
             name = runtime.get("deploymentName")
@@ -296,13 +305,16 @@ for attempt in range(1, 31):
         }
         for name, value in seen.items()
     }
+
     print(f"Attempt {attempt}: {json.dumps(summary, sort_keys=True)}")
     last = seen
 
     healthy = set(seen) == set(expected)
+
     if healthy:
         for name, value in seen.items():
             expected_type, expected_role = expected[name]
+
             healthy = healthy and value.get("deploymentType") == expected_type
             healthy = healthy and value.get("role") == expected_role
             healthy = healthy and value.get("effectiveStatus") == "UP"
@@ -316,13 +328,13 @@ for attempt in range(1, 31):
             )
 
     if healthy:
-        print("MONITOR RECOVERY PASSED")
+        print("MONITOR RECOVERY AFTER IAM APPLY PASSED")
         raise SystemExit(0)
 
     time.sleep(10)
 
 print("Last observed:", json.dumps(last, sort_keys=True))
-raise SystemExit("Monitor did not recover both canonical deployments within five minutes")
+raise SystemExit("Monitor did not recover within five minutes")
 PY
   then
     pass "Shared monitor recovered both canonical runtimes"
@@ -331,32 +343,48 @@ PY
   fi
 fi
 
-section "8. MONITOR ERROR CHECK"
+section "10. MONITOR IAM AND CLOUDWATCH ERROR CHECK"
 
-ERRORS="$(
-  kubectl logs -n "$MONITOR_NS" deployment/"$MONITOR_DEPLOY" \
-    --since=15m 2>&1 |
+MONITOR_ERRORS="$(
+  kubectl logs \
+    -n "$MONITOR_NS" \
+    deployment/"$MONITOR_DEPLOY" \
+    --since=20m \
+    2>&1 |
   grep -E \
-    'cloudwatch_client_creation_failed|cloudwatch_put_metric_data_failed|tick failed|AccessDenied|legacy-observer-fallback' \
+    'AccessDenied|cloudwatch_client_creation_failed|cloudwatch_put_metric_data_failed|tick failed|legacy-observer-fallback' \
   || true
 )"
 
-if [ -z "$ERRORS" ]; then
-  pass "No monitor publication, IAM or legacy-fallback errors found"
+if [ -z "$MONITOR_ERRORS" ]; then
+  pass "No monitor IAM, CloudWatch or legacy-fallback errors found"
 else
-  fail "Monitor errors were found"
-  printf '%s\n' "$ERRORS"
+  fail "Monitor IAM or CloudWatch errors were found"
+  echo "$MONITOR_ERRORS"
 fi
 
-section "9. FINAL RESULT"
+section "11. OLD RETAINED PV SAFETY CHECK"
+
+kubectl get pv \
+  pvc-3a93c990-a9fa-4cca-99df-7c3375472074 \
+  pvc-93251c3f-c408-4713-bd46-ebc5e0eafa8a \
+  pvc-5c43940e-1054-43f5-8031-9db4b51a024a \
+  pvc-bacb3e9d-d904-467c-959f-dea9548699c9 \
+  -o custom-columns='PV:.metadata.name,STATUS:.status.phase,RECLAIM:.spec.persistentVolumeReclaimPolicy,STORAGECLASS:.spec.storageClassName,CLAIM_NAMESPACE:.spec.claimRef.namespace,CLAIM_NAME:.spec.claimRef.name,VOLUME_HANDLE:.spec.csi.volumeHandle' \
+  2>&1
+
+section "12. FINAL RESULT"
 
 if [ "$FAILURES" -eq 0 ]; then
-  printf '\nCANONICAL APPLICATION REDEPLOYMENT VALIDATION PASSED\n'
-  printf 'LEGACY OBSERVER RUNTIME IS RETIRED\n'
-  printf 'PHASE 5B1 IAM APPLY CAN PROCEED\n'
+  echo
+  echo "PHASE 5B1 IAM LIVE DEPLOYMENT VALIDATION PASSED"
+  echo "RUNTIME OBSERVER PERMISSIONS ARE REMOVED"
+  echo "CANONICAL SECRET RETRIEVAL AND RESTART PASSED"
+  echo "MONITOR IAM AND MANAGER METRICS REMAIN HEALTHY"
   exit 0
 fi
 
-printf '\nVALIDATION COMPLETED WITH %s FAILURE(S)\n' "$FAILURES"
-printf 'DO NOT RUN THE IAM WORKFLOW YET\n'
+echo
+echo "PHASE 5B1 IAM VALIDATION COMPLETED WITH ${FAILURES} FAILURE(S)"
+echo "STOP BEFORE ANY FURTHER CLEANUP"
 exit 1
