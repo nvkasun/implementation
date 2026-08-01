@@ -182,16 +182,20 @@ class MonitorConfigLoadTests(unittest.TestCase):
         config = cfgmod.load_config({"AWS_REGION": "eu-west-1", "DYNAMODB_TABLE": "gg-eks-pipeline"})
         self.assertEqual(config.aws_region, "eu-west-1")
         self.assertEqual(config.port, 8080)
-        self.assertTrue(config.legacy_fallback_enabled)
+        self.assertFalse(hasattr(config, "legacy_fallback_enabled"))
 
     def test_missing_required_env_fails(self):
         with self.assertRaises(cfgmod.ConfigError):
             cfgmod.load_config({"AWS_REGION": "eu-west-1"})
 
-    def test_legacy_fallback_disable(self):
+    def test_no_legacy_fallback_config_field(self):
+        # Phase 5A: legacy-observer fallback has been retired. The monitor
+        # must not read LEGACY_FALLBACK_ENABLED at all, and must not expose
+        # any legacy-fallback field on MonitorConfig.
         config = cfgmod.load_config({"AWS_REGION": "eu-west-1", "DYNAMODB_TABLE": "t",
-                                     "LEGACY_FALLBACK_ENABLED": "false"})
-        self.assertFalse(config.legacy_fallback_enabled)
+                                     "LEGACY_FALLBACK_ENABLED": "true"})
+        self.assertFalse(hasattr(config, "legacy_fallback_enabled"))
+        self.assertNotIn("LEGACY_FALLBACK_ENABLED", cfgmod.DEFAULTS)
 
 
 class CredentialPathsTests(unittest.TestCase):

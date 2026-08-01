@@ -119,7 +119,7 @@ class ConfigValidationTests(unittest.TestCase):
         config = make_config()
         self.assertEqual(config.aws_region, "eu-west-1")
         self.assertEqual(config.port, 8080)
-        self.assertTrue(config.legacy_fallback_enabled)
+        self.assertFalse(hasattr(config, "legacy_fallback_enabled"))
 
     def test_missing_aws_region(self):
         with self.assertRaises(cfgmod.ConfigError):
@@ -168,24 +168,6 @@ class CanonicalEffectiveStatusTests(unittest.TestCase):
         self.assertEqual(out["ageSeconds"], 0)
 
 
-class LegacyEffectiveStatusTests(unittest.TestCase):
-    def test_healthy_maps_to_up(self):
-        item = {"pipeline": "gg-payments-ora-to-pg-001-source", "recordType": "STATE#_deployment",
-               "status": "HEALTHY", "recordedAt": 1780000000}
-        out = monitor.compute_legacy_effective_status(item, now=1780000010, stale_after_seconds=120)
-        self.assertEqual(out["effectiveStatus"], "UP")
-
-    def test_degraded_maps_to_unknown(self):
-        item = {"pipeline": "gg-payments-ora-to-pg-001-source", "recordType": "STATE#_deployment",
-               "status": "DEGRADED", "recordedAt": 1780000000}
-        out = monitor.compute_legacy_effective_status(item, now=1780000010, stale_after_seconds=120)
-        self.assertEqual(out["effectiveStatus"], "UNKNOWN")
-
-    def test_missing_legacy_item_is_missing(self):
-        out = monitor.compute_legacy_effective_status(None, now=1780000000, stale_after_seconds=120)
-        self.assertEqual(out["effectiveStatus"], "MISSING")
-
-
 class ProcessRowNormalizationTests(unittest.TestCase):
     def test_running_stopped_abended_pass_through(self):
         for raw in ("RUNNING", "STOPPED", "ABENDED"):
@@ -203,8 +185,9 @@ class ProcessRowNormalizationTests(unittest.TestCase):
 
 
 class ReadRuntimeViewTests(unittest.TestCase):
-    """Canonical-preferred-over-legacy, fallback-when-missing, and
-    fallback-disabled behaviour."""
+    """Canonical-only behaviour: no legacy-observer fallback of any kind."""
+
+    LEGACY_PARTITION_NAMES = ("gg-payments-ora-to-pg-001-source", "gg-payments-ora-to-pg-001-target")
 
     def _meta(self):
         return {"type": "oracle", "enabled": True}
@@ -212,99 +195,82 @@ class ReadRuntimeViewTests(unittest.TestCase):
     def test_canonical_data_used_when_present(self):
         now = 1780000010
         table = FakeTable([make_deployment_state_item(recorded_at=now - 5)])
-        out = monitor.read_runtime_view(table, "payments-ora-to-pg-001", "source", "gg-oracle-payments-01",
-                                        self._meta(), legacy_fallback_enabled=True, now=now, stale_after_seconds=120)
+        out = monitor.read_runtime_view(table, "source", "gg-oracle-payments-01",
+                                        self._meta(), now=now, stale_after_seconds=120)
         self.assertEqual(out["dataSource"], "canonical-monitor")
         self.assertEqual(out["effectiveStatus"], "UP")
 
-    def test_falls_back_to_legacy_when_canonical_missing_and_enabled(self):
+    def test_missing_canonical_state_reports_missing_never_legacy(self):
+        # No canonical STATE#_deployment record at all -- even if a legacy
+        # per-role partition happens to hold data, it must never be read.
         now = 1780000010
         legacy_item = {"pipeline": "gg-payments-ora-to-pg-001-source", "recordType": "STATE#_deployment",
                        "status": "HEALTHY", "recordedAt": now - 5}
         table = FakeTable([legacy_item])
-        out = monitor.read_runtime_view(table, "payments-ora-to-pg-001", "source", "gg-oracle-payments-01",
-                                        self._meta(), legacy_fallback_enabled=True, now=now, stale_after_seconds=120)
-        self.assertEqual(out["dataSource"], "legacy-observer-fallback")
-        self.assertEqual(out["effectiveStatus"], "UP")
-
-    def test_no_legacy_key_hardcoded_in_source(self):
-        import inspect
-        src = inspect.getsource(monitor.read_runtime_view)
-        self.assertIn('f"gg-{pipeline_id}-{role}"', src)
-        self.assertNotIn("gg-payments-ora-to-pg-001-source", src)
-
-    def test_fallback_disabled_shows_missing_not_legacy_data(self):
-        now = 1780000010
-        legacy_item = {"pipeline": "gg-payments-ora-to-pg-001-source", "recordType": "STATE#_deployment",
-                       "status": "HEALTHY", "recordedAt": now - 5}
-        table = FakeTable([legacy_item])
-        out = monitor.read_runtime_view(table, "payments-ora-to-pg-001", "source", "gg-oracle-payments-01",
-                                        self._meta(), legacy_fallback_enabled=False, now=now, stale_after_seconds=120)
+        out = monitor.read_runtime_view(table, "source", "gg-oracle-payments-01",
+                                        self._meta(), now=now, stale_after_seconds=120)
         self.assertEqual(out["dataSource"], "canonical-monitor")
         self.assertEqual(out["effectiveStatus"], "MISSING")
+        # The legacy per-role partition must never even be queried.
+        queried_pipelines = {call["pipeline"] for call in table.get_item_calls}
+        self.assertNotIn("gg-payments-ora-to-pg-001-source", queried_pipelines)
 
-    def test_canonical_always_wins_even_when_legacy_also_present(self):
+    def test_no_legacy_partition_names_hardcoded_in_source(self):
+        import inspect
+        src = inspect.getsource(monitor.read_runtime_view)
+        for legacy_name in self.LEGACY_PARTITION_NAMES:
+            self.assertNotIn(legacy_name, src)
+        self.assertNotIn("legacy", src.lower())
+
+    def test_no_legacy_fallback_function_or_status_map_exists(self):
+        self.assertFalse(hasattr(monitor, "compute_legacy_effective_status"))
+        self.assertFalse(hasattr(monitor, "_LEGACY_STATUS_MAP"))
+
+    def test_data_source_is_always_canonical_monitor(self):
         now = 1780000010
-        table = FakeTable([
-            make_deployment_state_item(recorded_at=now - 5, status="UP"),
-            {"pipeline": "gg-payments-ora-to-pg-001-source", "recordType": "STATE#_deployment",
-             "status": "DOWN", "recordedAt": now - 5},
-        ])
-        out = monitor.read_runtime_view(table, "payments-ora-to-pg-001", "source", "gg-oracle-payments-01",
-                                        self._meta(), legacy_fallback_enabled=True, now=now, stale_after_seconds=120)
-        self.assertEqual(out["dataSource"], "canonical-monitor")
-        self.assertEqual(out["effectiveStatus"], "UP")
+        for table in (FakeTable([make_deployment_state_item(recorded_at=now - 5)]), FakeTable([])):
+            out = monitor.read_runtime_view(table, "source", "gg-oracle-payments-01",
+                                            self._meta(), now=now, stale_after_seconds=120)
+            self.assertEqual(out["dataSource"], "canonical-monitor")
 
     def test_no_process_state_rows_produces_empty_list_not_crash(self):
         now = 1780000010
         table = FakeTable([make_deployment_state_item(recorded_at=now - 5)])
-        out = monitor.read_runtime_view(table, "payments-ora-to-pg-001", "source", "gg-oracle-payments-01",
-                                        self._meta(), legacy_fallback_enabled=True, now=now, stale_after_seconds=120)
+        out = monitor.read_runtime_view(table, "source", "gg-oracle-payments-01",
+                                        self._meta(), now=now, stale_after_seconds=120)
         self.assertEqual(out["processes"], [])
 
     def test_critical_service_state_passed_through(self):
         now = 1780000010
         table = FakeTable([make_deployment_state_item(recorded_at=now - 5,
                                                       criticalServices={"adminsrvr": {"reachable": True}})])
-        out = monitor.read_runtime_view(table, "payments-ora-to-pg-001", "source", "gg-oracle-payments-01",
-                                        self._meta(), legacy_fallback_enabled=True, now=now, stale_after_seconds=120)
+        out = monitor.read_runtime_view(table, "source", "gg-oracle-payments-01",
+                                        self._meta(), now=now, stale_after_seconds=120)
         self.assertEqual(out["criticalServices"], {"adminsrvr": True})
 
     def test_lease_freshness_exposed(self):
         now = 1780000010
         table = FakeTable([make_deployment_state_item(recorded_at=now - 5), make_lease_item(now=now)])
-        out = monitor.read_runtime_view(table, "payments-ora-to-pg-001", "source", "gg-oracle-payments-01",
-                                        self._meta(), legacy_fallback_enabled=True, now=now, stale_after_seconds=120)
+        out = monitor.read_runtime_view(table, "source", "gg-oracle-payments-01",
+                                        self._meta(), now=now, stale_after_seconds=120)
         self.assertTrue(out["lease"]["fresh"])
 
     def test_expired_lease_shown_as_not_fresh(self):
         now = 1780000010
         table = FakeTable([make_deployment_state_item(recorded_at=now - 5),
                            make_lease_item(now=now, expiresAt=now - 100)])
-        out = monitor.read_runtime_view(table, "payments-ora-to-pg-001", "source", "gg-oracle-payments-01",
-                                        self._meta(), legacy_fallback_enabled=True, now=now, stale_after_seconds=120)
+        out = monitor.read_runtime_view(table, "source", "gg-oracle-payments-01",
+                                        self._meta(), now=now, stale_after_seconds=120)
         self.assertFalse(out["lease"]["fresh"])
 
-    def test_canonical_process_rows_shown_when_deployment_state_missing_and_fallback_disabled(self):
+    def test_canonical_process_rows_shown_when_deployment_state_missing(self):
         # STATE#_deployment absent (eg a race during first-tick startup)
         # must not suppress independently-existing STATE#<process> rows.
         now = 1780000010
         table = FakeTable([make_process_item(recorded_at=now - 3)])
-        out = monitor.read_runtime_view(table, "payments-ora-to-pg-001", "source", "gg-oracle-payments-01",
-                                        self._meta(), legacy_fallback_enabled=False, now=now, stale_after_seconds=120)
-        self.assertEqual(out["effectiveStatus"], "MISSING")
-        self.assertEqual(len(out["processes"]), 1)
-        self.assertEqual(out["processes"][0]["process"], "EXTORA1")
-
-    def test_canonical_process_rows_shown_when_deployment_state_missing_and_legacy_fallback_enabled(self):
-        # The legacy-fallback branch still owns deployment-status
-        # resolution, but canonical process rows under the canonical
-        # partition key must still surface -- never invented legacy rows.
-        now = 1780000010
-        table = FakeTable([make_process_item(recorded_at=now - 3)])
-        out = monitor.read_runtime_view(table, "payments-ora-to-pg-001", "source", "gg-oracle-payments-01",
-                                        self._meta(), legacy_fallback_enabled=True, now=now, stale_after_seconds=120)
-        self.assertEqual(out["dataSource"], "legacy-observer-fallback")
+        out = monitor.read_runtime_view(table, "source", "gg-oracle-payments-01",
+                                        self._meta(), now=now, stale_after_seconds=120)
+        self.assertEqual(out["dataSource"], "canonical-monitor")
         self.assertEqual(out["effectiveStatus"], "MISSING")
         self.assertEqual(len(out["processes"]), 1)
         self.assertEqual(out["processes"][0]["process"], "EXTORA1")
@@ -312,8 +278,8 @@ class ReadRuntimeViewTests(unittest.TestCase):
     def test_malformed_critical_services_root_does_not_crash(self):
         now = 1780000010
         table = FakeTable([make_deployment_state_item(recorded_at=now - 5, criticalServices="not-a-dict")])
-        out = monitor.read_runtime_view(table, "payments-ora-to-pg-001", "source", "gg-oracle-payments-01",
-                                        self._meta(), legacy_fallback_enabled=True, now=now, stale_after_seconds=120)
+        out = monitor.read_runtime_view(table, "source", "gg-oracle-payments-01",
+                                        self._meta(), now=now, stale_after_seconds=120)
         self.assertEqual(out["criticalServices"], {})
 
     def test_malformed_critical_service_item_does_not_crash(self):
@@ -321,14 +287,17 @@ class ReadRuntimeViewTests(unittest.TestCase):
         table = FakeTable([make_deployment_state_item(
             recorded_at=now - 5,
             criticalServices={"adminsrvr": True, "distsrvr": None, "metricsrvr": "unexpected"})])
-        out = monitor.read_runtime_view(table, "payments-ora-to-pg-001", "source", "gg-oracle-payments-01",
-                                        self._meta(), legacy_fallback_enabled=True, now=now, stale_after_seconds=120)
+        out = monitor.read_runtime_view(table, "source", "gg-oracle-payments-01",
+                                        self._meta(), now=now, stale_after_seconds=120)
         self.assertEqual(out["criticalServices"], {"adminsrvr": False, "distsrvr": False, "metricsrvr": False})
 
 
 class BuildStatusPayloadTests(unittest.TestCase):
     def test_end_to_end_shape_matches_recommended_schema(self):
         now = 1780000010
+        # A legacy per-role partition (gg-payments-ora-to-pg-001-target) is
+        # deliberately included with data: canonical-only behavior means it
+        # must be completely ignored, leaving the target role MISSING.
         table = FakeTable([
             make_deployment_state_item(pipeline="gg-oracle-payments-01", recorded_at=now - 5, status="UP"),
             make_process_item(pipeline="gg-oracle-payments-01", process="EXTORA1", recorded_at=now - 5),
@@ -345,7 +314,8 @@ class BuildStatusPayloadTests(unittest.TestCase):
         self.assertEqual(roles["source"]["deploymentName"], "gg-oracle-payments-01")
         self.assertEqual(roles["source"]["dataSource"], "canonical-monitor")
         self.assertEqual(roles["target"]["deploymentName"], "gg-postgresql-payments-01")
-        self.assertEqual(roles["target"]["dataSource"], "legacy-observer-fallback")
+        self.assertEqual(roles["target"]["dataSource"], "canonical-monitor")
+        self.assertEqual(roles["target"]["effectiveStatus"], "MISSING")
 
     def test_dynamodb_read_failure_raises_read_error(self):
         from botocore.exceptions import ClientError
@@ -974,9 +944,10 @@ class ApiProcessesTests(unittest.TestCase):
             self.assertNotIn(forbidden, raw)
 
     def test_uses_canonical_state_schema_only_no_legacy_fallback(self):
-        # a legacy-only record (no canonical STATE#_deployment) must show
-        # MISSING here -- /api/processes never falls back to the legacy
-        # observer's per-role key, unlike /api/status.
+        # A legacy-shaped record under a legacy per-role partition key (never
+        # the canonical STATE#_deployment key for this deployment) must show
+        # MISSING here -- /api/processes reads canonical STATE# records only,
+        # same as /api/status (Phase 5A: no fallback of any kind remains).
         now = 1780000010
         legacy_item = {"pipeline": "gg-payments-ora-to-pg-001-source", "recordType": "STATE#_deployment",
                        "status": "HEALTHY", "recordedAt": now - 5}
@@ -1027,11 +998,12 @@ class ApiProcessesTests(unittest.TestCase):
         dep = next(d for d in body["deployments"] if d["deploymentName"] == "gg-oracle-payments-01")
         self.assertEqual(dep["processes"], [])
 
-    def test_legacy_observer_fallback_for_api_status_remains_unchanged(self):
-        # Confirms this phase did not alter /api/status's existing
-        # legacy-fallback behaviour (a separate, pre-existing endpoint).
-        # Goes through the real HTTP handler (real wall-clock time) -- the
-        # fixture must be fresh relative to it.
+    def test_api_status_never_falls_back_to_legacy_observer_partition(self):
+        # Phase 5A: /api/status's legacy-observer fallback has been retired.
+        # A record under the legacy per-role partition key must be
+        # completely ignored -- the role reports MISSING, not the legacy
+        # record's status. Goes through the real HTTP handler (real
+        # wall-clock time) -- the fixture must be fresh relative to it.
         now = int(time.time())
         legacy_item = {"pipeline": "gg-payments-ora-to-pg-001-source", "recordType": "STATE#_deployment",
                        "status": "HEALTHY", "recordedAt": now - 5}
@@ -1042,8 +1014,8 @@ class ApiProcessesTests(unittest.TestCase):
         body = json.loads(writes[0][2])
         lp = body["logicalPipelines"][0]
         source = next(r for r in lp["runtimes"] if r["role"] == "source")
-        self.assertEqual(source["dataSource"], "legacy-observer-fallback")
-        self.assertEqual(source["effectiveStatus"], "UP")
+        self.assertEqual(source["dataSource"], "canonical-monitor")
+        self.assertEqual(source["effectiveStatus"], "MISSING")
 
 
 class ThreadSafetyTests(unittest.TestCase):

@@ -470,21 +470,22 @@ never stored redundantly.
   `Query` (portal).
 - No `Scan`, no `BatchWriteItem`, no legacy singleton `recordType=STATE`.
 
-## Legacy fallback
+## Canonical-only records
 
-For a role whose canonical STATE#_deployment record does not yet exist, the
-portal may fall back to the old observer's record under the legacy key
-`gg-<pipelineId>-<role>` (derived, never hardcoded). Controlled by
-`legacyFallback.enabled` (Helm value); canonical data always takes
-precedence once present.
+The portal and API read canonical `STATE#_deployment`/`STATE#<process>`
+records only. There is no fallback to any other partition or record shape:
+a deployment whose canonical `STATE#_deployment` record does not (yet) exist
+reports `effectiveStatus=MISSING`, and canonical `STATE#<process>` rows
+remain visible independently of whether that deployment-status record
+exists.
 
 ## Endpoints
 
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /` | HTML operator portal, grouped by logical pipeline |
-| `GET /api/status` | JSON status (see monitor.py's recommended schema); canonical-first, legacy-observer-fallback-second, like the portal |
-| `GET /api/processes` | JSON deployment + process detail, **canonical `STATE#` records only** -- no legacy-observer fallback |
+| `GET /api/status` | JSON status (see monitor.py's recommended schema); canonical-only, like the portal |
+| `GET /api/processes` | JSON deployment + process detail, **canonical `STATE#` records only** |
 | `GET /healthz` | Process liveness only -- never touches DynamoDB |
 | `GET /readyz` | Collector readiness + a bounded `DescribeTable` check |
 
@@ -502,10 +503,9 @@ cell (e.g. `5s / thr 300s (alert)`, `N/A` when both are absent), record age
 credentials, secret/CA paths, internal hostnames, AWS ARNs, and exception text
 are never exposed -- only the existing closed `statusCode`/`statusMessage`
 vocabulary. All HTML output is escaped exactly once per value (including the
-lease holder). `/api/processes` is deliberately canonical-only (no
-legacy-observer fallback, no legacy singleton `STATE` record, no PMS
-service-process rows) -- it is a new endpoint, not a replacement for
-`/api/status`'s existing migration-compatibility behavior.
+lease holder). `/api/processes` is deliberately canonical-only (no legacy
+singleton `STATE` record, no PMS service-process rows) -- it is a separate
+endpoint from `/api/status`, not a replacement for it.
 
 The HTML portal (`/`) groups deployments by logical pipeline (`<h2>`) and
 renders each deployment as its own card/section beneath that heading --
@@ -516,9 +516,8 @@ dedicated CSS row class, so no separate per-process "fresh" column is needed.
 
 Canonical `STATE#<process>` rows are queried independently of whether
 `STATE#_deployment` exists: if the deployment-status record is missing (eg a
-race during first-tick startup), `effectiveStatus` resolves to `MISSING` (or
-falls back to the legacy observer's status when fallback is enabled), but any
-`STATE#<process>` rows already present under that deployment's canonical
+race during first-tick startup), `effectiveStatus` resolves to `MISSING`, but
+any `STATE#<process>` rows already present under that deployment's canonical
 partition key are still returned and rendered. This holds for both `/`
 (`read_runtime_view`) and `/api/processes` (`read_deployment_processes_view`);
 neither path ever invents or mixes in legacy process rows.

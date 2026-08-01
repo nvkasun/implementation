@@ -52,8 +52,6 @@ spec:
         goldengate.adcb/environment: {{ .Values.global.environment | quote }}
         goldengate.adcb/deployment-id: {{ .Values.global.deploymentId | quote }}
         app.kubernetes.io/engine: {{ .Values.target.engine | quote }}
-      annotations:
-        goldengate.adcb/observer-enabled: {{ .Values.monitoring.observer.enabled | quote }}
     spec:
       serviceAccountName: {{ include "goldengate.targetServiceAccountName" . }}
 
@@ -224,10 +222,6 @@ spec:
 
 {{- with .Values.target.extraContainers }}
         {{- toYaml . | nindent 8 }}
-{{- end }}
-
-{{- if .Values.monitoring.observer.enabled }}
-        {{- include "goldengate.observerContainer" (dict "root" $ "component" "target") | nindent 8 }}
 {{- end }}
 
       volumes:

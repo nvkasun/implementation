@@ -2,6 +2,30 @@ global:
   environment: dev
   deploymentId: payments-ora-to-pg-001
 
+# Phase 5A: this is the retired legacy source+target combined
+# (deploymentModel=legacyPair) model, superseded by the two canonical
+# single-runtime deployments (envs/dev/gg-oracle-payments-01/,
+# envs/dev/gg-postgresql-payments-01/). It is retained here temporarily,
+# unmodified, only as a migration/rollback reference -- it is not deleted.
+#
+# deployment.enabled=false below marks this folder inactive: the
+# goldengate-eks-app.yaml workflow's is_active_deployment_values_file() check
+# excludes it from every active-deployment matrix (manual workflow_dispatch,
+# push-triggered per-folder changes, and shared-Helm-chart-change selection
+# across all envs/dev/*/values.yaml folders alike), so it is never built,
+# packaged, or synced by Argo CD while disabled.
+#
+# Disabling this values folder is intentionally non-destructive: it must
+# never delete or otherwise mutate any live Kubernetes resource. The
+# workflow's deletion-candidate logic treats deployment.enabled=false as
+# "retired but retained" and does not queue it for Argo CD Application or
+# namespace deletion -- only a genuinely removed values.yaml or an explicit
+# lifecycle.state=absent is treated as a deletion request. Any cleanup of the
+# legacyPair Argo CD Application, namespace, or other legacy resources is
+# deferred to a later phase.
+deployment:
+  enabled: false
+
 # Phase 1: explicit, unchanged behavior -- this is the existing live
 # one-Helm-release-per-logical-pipeline model. See helm/goldengate/values.yaml
 # for the deploymentModel contract.
@@ -254,15 +278,6 @@ configJob:
 
 monitoring:
   labels:
-    enabled: true
-
-  # Observer image repository/tag are intentionally NOT set here -- the
-  # GoldenGate GitHub Actions workflow injects the content-addressed
-  # repository/tag at Helm lint/render/Argo CD time via
-  # --set-string monitoring.observer.image.repository/tag (and the matching
-  # Argo CD Application Helm parameters), so this file never needs updating
-  # when the observer image changes.
-  observer:
     enabled: true
 
 podSecurityContext: {}

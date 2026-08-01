@@ -399,59 +399,6 @@ monitoring:
   labels:
     enabled: true
 
-  # legacyPair-only observer sidecar. Disabled by default; a deployment
-  # opts in via monitoring.observer.enabled=true (see _observer.tpl).
-  observer:
-    enabled: false
-
-    image:
-      repository: ""
-      tag: ""
-      pullPolicy: IfNotPresent
-
-    awsRegion: eu-west-1
-    dynamodbTable: gg-eks-pipeline
-    cloudWatchNamespace: GoldenGate/Pipelines
-
-    adminHost: 127.0.0.1
-    metricsHost: 127.0.0.1
-    u02Path: /u02
-
-    checkIntervalSeconds: 30
-    connectTimeoutSeconds: 3
-
-    health:
-      # 18080 (not 8080): all containers in a GoldenGate pod share the same
-      # network namespace, and something else in the pod already listens on
-      # 8080 -- the observer's ThreadingHTTPServer failed to bind with
-      # "OSError: [Errno 98] Address already in use" and crash-looped. 18080
-      # is a dedicated port for the observer's own health endpoint only.
-      port: 18080
-      initialDelaySeconds: 15
-      periodSeconds: 30
-      timeoutSeconds: 3
-      failureThreshold: 3
-
-    resources:
-      requests:
-        cpu: 25m
-        memory: 64Mi
-      limits:
-        cpu: 200m
-        memory: 256Mi
-
-    securityContext:
-      runAsNonRoot: true
-      runAsUser: 10001
-      runAsGroup: 10001
-      allowPrivilegeEscalation: false
-      readOnlyRootFilesystem: true
-      capabilities:
-        drop:
-          - ALL
-      seccompProfile:
-        type: RuntimeDefault
-
 nodeSelector: {}
 
 tolerations: []

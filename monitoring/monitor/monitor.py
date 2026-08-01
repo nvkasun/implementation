@@ -39,10 +39,6 @@ CANONICAL_RAW_STATUSES = ("UP", "STARTING", "DEPLOYMENT_DOWN")
 EFFECTIVE_STATUSES = ("UP", "STARTING", "DOWN", "STALE", "MISSING", "UNKNOWN")
 _CANONICAL_STATUS_MAP = {"UP": "UP", "STARTING": "STARTING", "DEPLOYMENT_DOWN": "DOWN"}
 
-# Legacy-observer fallback only. DEGRADED intentionally maps to UNKNOWN,
-# not STARTING/DOWN -- it must never overclaim either direction.
-_LEGACY_STATUS_MAP = {"HEALTHY": "UP", "DOWN": "DOWN", "DEGRADED": "UNKNOWN"}
-
 PROCESS_STATUSES = ("RUNNING", "STOPPED", "ABENDED", "UNKNOWN")
 
 FUTURE_TIMESTAMP_TOLERANCE_SECONDS = 300
@@ -243,19 +239,6 @@ def compute_canonical_effective_status(item, now, stale_after_seconds):
     return {"effectiveStatus": mapped, "recordedAt": recorded_at, "ageSeconds": age, "fresh": True}
 
 
-def compute_legacy_effective_status(item, now, stale_after_seconds):
-    if item is None:
-        return {"effectiveStatus": "MISSING", "recordedAt": None, "ageSeconds": None, "fresh": False}
-    recorded_at = _parse_epoch(item.get("recordedAt"))
-    age, plausible = _freshness(recorded_at, now)
-    if not plausible:
-        return {"effectiveStatus": "UNKNOWN", "recordedAt": None, "ageSeconds": None, "fresh": False}
-    if age > stale_after_seconds:
-        return {"effectiveStatus": "STALE", "recordedAt": recorded_at, "ageSeconds": age, "fresh": False}
-    mapped = _LEGACY_STATUS_MAP.get(str(item.get("status", "")), "UNKNOWN")
-    return {"effectiveStatus": mapped, "recordedAt": recorded_at, "ageSeconds": age, "fresh": True}
-
-
 def lease_view(lease_item, now):
     if lease_item is None:
         return None
@@ -280,17 +263,16 @@ def normalize_critical_services(raw):
     return normalized
 
 
-def read_runtime_view(table, pipeline_id, role, deployment_name, deployment_meta,
-                      legacy_fallback_enabled, now, stale_after_seconds):
-    """Canonical-first, legacy-fallback-second: the canonical
-    STATE#_deployment record always wins the instant it exists. Only when
-    missing, and only when enabled, falls back to the legacy per-role key
-    "gg-<pipelineId>-<role>" (derived here, never hardcoded). Canonical
-    STATE#<process> rows are queried independently of STATE#_deployment's
-    existence -- a partition can hold process rows even when the
-    deployment-status record itself is missing (eg a race during first-tick
-    startup), and those rows must still surface here regardless of which
-    status branch below is taken."""
+def read_runtime_view(table, role, deployment_name, deployment_meta,
+                      now, stale_after_seconds):
+    """Canonical-only: the STATE#_deployment record for deployment_name is
+    the sole source of truth. A missing record reports effectiveStatus
+    MISSING -- it never falls back to any other partition or record shape.
+    Canonical STATE#<process> rows are queried independently of
+    STATE#_deployment's existence -- a partition can hold process rows even
+    when the deployment-status record itself is missing (eg a race during
+    first-tick startup), and those rows must still surface here regardless
+    of whether the deployment status is present."""
     deployment_type = deployment_meta["type"]
 
     config_item = get_config_item(table, deployment_name)
@@ -300,18 +282,11 @@ def read_runtime_view(table, pipeline_id, role, deployment_name, deployment_meta
     process_rows = query_process_state_items(table, deployment_name)
     processes = [normalize_process_row(r, now, stale_after_seconds) for r in process_rows]
 
+    data_source = "canonical-monitor"
     if dep_item is not None:
-        data_source = "canonical-monitor"
         status_fields = compute_canonical_effective_status(dep_item, now, stale_after_seconds)
         critical_services = normalize_critical_services(dep_item.get("criticalServices"))
-    elif legacy_fallback_enabled:
-        legacy_pipeline = f"gg-{pipeline_id}-{role}"
-        legacy_item = get_deployment_state_item(table, legacy_pipeline)
-        data_source = "legacy-observer-fallback"
-        status_fields = compute_legacy_effective_status(legacy_item, now, stale_after_seconds)
-        critical_services = {}
     else:
-        data_source = "canonical-monitor"
         status_fields = {"effectiveStatus": "MISSING", "recordedAt": None, "ageSeconds": None, "fresh": False}
         critical_services = {}
 
@@ -342,8 +317,8 @@ def build_status_payload(config, table, deployments, logical_pipelines, clock=ti
                 deployment_name = lp["roles"][role]
                 deployment_meta = deployments_by_name.get(deployment_name, {})
                 runtimes_out.append(
-                    read_runtime_view(table, lp["pipelineId"], role, deployment_name, deployment_meta,
-                                      config.legacy_fallback_enabled, now, config.stale_after_seconds))
+                    read_runtime_view(table, role, deployment_name, deployment_meta,
+                                      now, config.stale_after_seconds))
             logical_out.append({"pipelineId": lp["pipelineId"], "runtimes": runtimes_out})
     except (BotoCoreError, ClientError) as exc:
         summary = sanitize_error(exc)
@@ -354,10 +329,8 @@ def build_status_payload(config, table, deployments, logical_pipelines, clock=ti
 
 
 def read_deployment_processes_view(table, deployment_meta, now, stale_after_seconds):
-    """Canonical STATE#-only view for one deployment -- no legacy-observer
-    fallback (that migration-compatibility concern belongs to
-    read_runtime_view/build_status_payload only). GetItem/Query only, never
-    Scan, never writes. Canonical STATE#<process> rows are queried
+    """Canonical STATE#-only view for one deployment. GetItem/Query only,
+    never Scan, never writes. Canonical STATE#<process> rows are queried
     independently of STATE#_deployment's existence, matching
     read_runtime_view: a missing deployment-status record only means
     effectiveStatus == MISSING, it does not imply an empty process list."""
@@ -751,8 +724,7 @@ def main():
         collector_threads.append(t)
 
     log_event("INFO", "monitor_started", version=config.monitor_version, port=config.port,
-             enabledDeployments=[d["name"] for d in enabled],
-             legacyFallbackEnabled=config.legacy_fallback_enabled)
+             enabledDeployments=[d["name"] for d in enabled])
 
     try:
         while not stop_event.is_set():

@@ -26,7 +26,6 @@ DEFAULTS = {
     "STALE_AFTER_SECONDS": "120",
     "REFRESH_SECONDS": "30",
     "MONITOR_VERSION": "development",
-    "LEGACY_FALLBACK_ENABLED": "true",
 }
 
 
@@ -46,15 +45,9 @@ def _get_int(env, name, default):
         raise ConfigError(f"{name} must be an integer, got {raw!r}") from None
 
 
-def _parse_bool_env(raw, default):
-    if raw is None:
-        return default
-    return str(raw).strip().lower() in ("true", "1", "yes")
-
-
 class MonitorConfig:
     def __init__(self, aws_region, dynamodb_table, port, stale_after_seconds,
-                refresh_seconds, monitor_version, repo_config_root, legacy_fallback_enabled):
+                refresh_seconds, monitor_version, repo_config_root):
         self.aws_region = aws_region
         self.dynamodb_table = dynamodb_table
         self.port = port
@@ -62,7 +55,6 @@ class MonitorConfig:
         self.refresh_seconds = refresh_seconds
         self.monitor_version = monitor_version
         self.repo_config_root = repo_config_root
-        self.legacy_fallback_enabled = legacy_fallback_enabled
 
 
 def load_config(env) -> MonitorConfig:
@@ -90,8 +82,6 @@ def load_config(env) -> MonitorConfig:
         refresh_seconds=refresh_seconds,
         monitor_version=env.get("MONITOR_VERSION", DEFAULTS["MONITOR_VERSION"]),
         repo_config_root=env.get("REPO_CONFIG_ROOT", DEFAULT_REPO_ROOT),
-        legacy_fallback_enabled=_parse_bool_env(
-            env.get("LEGACY_FALLBACK_ENABLED"), DEFAULTS["LEGACY_FALLBACK_ENABLED"] == "true"),
     )
 
 

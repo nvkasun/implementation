@@ -24,13 +24,6 @@ dynamodb:
 canonicalConfig:
   root: /etc/gg-canonical
 
-# Temporary fallback to the OLD observer's STATE#_deployment records for a
-# role whose canonical record does not exist yet. Canonical data always
-# takes precedence. Remove by setting legacyFallback.enabled=false once
-# every canonical STATE#_deployment record is confirmed present.
-legacyFallback:
-  enabled: true
-
 staleAfterSeconds: 120
 refreshSeconds: 30
 

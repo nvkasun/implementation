@@ -117,8 +117,6 @@ ingress:
 monitoring:
   labels:
     enabled: true
-  observer:
-    enabled: false
 
 podSecurityContext: {}
 

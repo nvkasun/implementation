@@ -18,11 +18,11 @@ aws:
 dynamodb:
   tableName: gg-eks-pipeline
 
-# canonicalConfig.root / legacyFallback.enabled use the library chart's
-# defaults (helm/goldengate-monitor/values.yaml) -- no environment override
-# required. The portal derives its logical-pipeline/role grouping from the
-# canonical inventory ConfigMap (templates/configmap.yaml), not a
-# hand-configured pipeline list.
+# canonicalConfig.root uses the library chart's default
+# (helm/goldengate-monitor/values.yaml) -- no environment override required.
+# The portal derives its logical-pipeline/role grouping from the canonical
+# inventory ConfigMap (templates/configmap.yaml), not a hand-configured
+# pipeline list.
 
 staleAfterSeconds: 120
 refreshSeconds: 30

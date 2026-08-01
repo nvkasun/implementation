@@ -24,6 +24,7 @@ PLATFORM_CHART="helm/goldengate-platform"
 MONITOR_CHART="helm/goldengate-monitor"
 MONITOR_APP_DIR="monitoring/monitor"
 MONITOR_WORKFLOW=".github/workflows/goldengate-monitor.yaml"
+EKS_APP_WORKFLOW=".github/workflows/goldengate-eks-app.yaml"
 
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT
@@ -464,9 +465,9 @@ else
 fi
 
 if [ -d "monitoring/observer" ]; then
-  pass "legacy observer (monitoring/observer) remains present"
+  fail "monitoring/observer still exists -- Phase 5A requires observer source retirement"
 else
-  fail "monitoring/observer is missing -- legacy observer must remain operational"
+  pass "monitoring/observer has been removed (Phase 5A observer retirement)"
 fi
 
 # ---------------------------------------------------------------------
@@ -995,6 +996,362 @@ if grep -q "def resolve_critical_services" "${MONITOR_APP_DIR}/health_rules.py" 
   pass "health_rules.py defines a bounded, fail-safe resolve_critical_services helper for the optional CONFIG override"
 else
   fail "health_rules.py is missing resolve_critical_services"
+fi
+
+# ---------------------------------------------------------------------
+# 23. Phase 5A: observer source/build/chart retirement, legacy-values
+#     folder disablement without deletion, and gg-monitor legacy-fallback
+#     removal.
+# ---------------------------------------------------------------------
+echo ""
+echo "--- Phase 5A: legacy values folder disabled (retained, not deleted) ---"
+
+if [ -f "$EKS_APP_WORKFLOW" ] && command -v python3 >/dev/null 2>&1; then
+  # Extract the real, unmodified "Detect changed deployments" run script from
+  # the workflow (never a reimplementation) and exercise its
+  # is_active_deployment_values_file() function and its deletion-candidate
+  # case statement directly, against the real repository files.
+  python3 - "$EKS_APP_WORKFLOW" > "${WORKDIR}/detect_script.sh" <<'PYEOF'
+import sys
+import yaml
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+for step in doc["jobs"]["detect_changed_deployments"]["steps"]:
+    if step.get("name") == "Detect changed deployments":
+        sys.stdout.write(step["run"])
+        break
+else:
+    sys.exit("step not found")
+PYEOF
+
+  awk '/^is_active_deployment_values_file\(\) \{/,/^\}$/' "${WORKDIR}/detect_script.sh" > "${WORKDIR}/is_active_fn.sh"
+
+  cat > "${WORKDIR}/run_is_active_checks.sh" <<HARNESS
+#!/bin/bash
+set -euo pipefail
+source "${WORKDIR}/is_active_fn.sh"
+
+check_one() {
+  local file="\$1" expect_status="\$2" label="\$3"
+  set +e
+  reason="\$(is_active_deployment_values_file "\$file")"
+  status=\$?
+  set -e
+  if [ "\$status" -eq "\$expect_status" ]; then
+    echo "PASS \$label (\$reason)"
+  else
+    echo "FAIL \$label (expected status \$expect_status, got \$status, reason: \$reason)"
+  fi
+}
+
+check_one "envs/dev/payments-ora-to-pg-001/values.yaml" 1 "legacy-inactive"
+check_one "envs/dev/gg-oracle-payments-01/values.yaml" 0 "oracle-active"
+check_one "envs/dev/gg-postgresql-payments-01/values.yaml" 0 "postgresql-active"
+HARNESS
+
+  ACTIVE_CHECK_OUTPUT="$(bash "${WORKDIR}/run_is_active_checks.sh" 2>&1 || true)"
+  echo "$ACTIVE_CHECK_OUTPUT"
+
+  if echo "$ACTIVE_CHECK_OUTPUT" | grep -q "^PASS legacy-inactive"; then
+    pass "the real workflow's is_active_deployment_values_file() reports payments-ora-to-pg-001 inactive"
+  else
+    fail "payments-ora-to-pg-001 is not reported inactive by the real workflow function"
+  fi
+
+  if echo "$ACTIVE_CHECK_OUTPUT" | grep -q "^PASS oracle-active" && echo "$ACTIVE_CHECK_OUTPUT" | grep -q "^PASS postgresql-active"; then
+    pass "the real workflow's is_active_deployment_values_file() reports both canonical folders active"
+  else
+    fail "one or both canonical folders are not reported active by the real workflow function"
+  fi
+
+  # A shared-chart-change selection scans every envs/dev/<id>/values.yaml
+  # (excluding argocd/) exactly as the workflow does, then filters through
+  # the same real function -- proving the canonical folders are selected
+  # and the legacy folder is not, using the actual discovery command.
+  CANDIDATE_IDS="$(find envs/dev -mindepth 2 -maxdepth 2 -name values.yaml -not -path 'envs/dev/argocd/*' \
+    | sed -E 's#^envs/dev/([^/]+)/values\.yaml$#\1#' | sort -u)"
+  ACTIVE_IDS=""
+  for id in $CANDIDATE_IDS; do
+    set +e
+    bash -c "source '${WORKDIR}/is_active_fn.sh'; is_active_deployment_values_file 'envs/dev/${id}/values.yaml'" >/dev/null 2>&1
+    st=$?
+    set -e
+    [ "$st" -eq 0 ] && ACTIVE_IDS="${ACTIVE_IDS} ${id}"
+  done
+  echo "Active candidate IDs for a shared-chart-change selection: ${ACTIVE_IDS}"
+
+  if echo "$ACTIVE_IDS" | grep -qw "gg-oracle-payments-01" \
+      && echo "$ACTIVE_IDS" | grep -qw "gg-postgresql-payments-01" \
+      && ! echo "$ACTIVE_IDS" | grep -qw "payments-ora-to-pg-001"; then
+    pass "a shared chart change selects both canonical singleRuntime folders and excludes the disabled legacy folder"
+  else
+    fail "shared-chart-change selection does not match the expected canonical-only set"
+  fi
+  # Note (not a failure): envs/dev/goldengate-monitor/values.yaml is a
+  # pre-existing, Phase-5A-unrelated member of this same candidate scan --
+  # it is deployed by the separate goldengate-monitor.yaml workflow, not
+  # goldengate-eks-app.yaml. Its presence here predates and is out of scope
+  # for this phase's observer/legacy-folder retirement work.
+
+  # Deletion-candidate safeguard: extract the real case-statement logic and
+  # prove deployment.enabled=false never queues a deletion request, while a
+  # genuinely removed file or lifecycle.state=absent still does.
+  awk '/^for CANDIDATE_ID in \$DELETION_CANDIDATE_IDS; do$/,/^done$/' "${WORKDIR}/detect_script.sh" > "${WORKDIR}/deletion_loop.sh"
+
+  if [ -s "${WORKDIR}/deletion_loop.sh" ]; then
+    DELETION_TEST_OUTPUT="$(bash -c '
+      set -euo pipefail
+      is_active_deployment_values_file() { echo "$FAKE_REASON"; return "$FAKE_STATUS"; }
+      resolve_deployment_model_from_git() { echo "legacyPair"; }
+      jq() { echo "[DELETION_ADDED]"; }
+      BEFORE_SHA="deadbeef"
+      LOOP_SCRIPT="'"${WORKDIR}"'/deletion_loop.sh"
+
+      run_case() {
+        local id="$1" status="$2" reason="$3"
+        FAKE_STATUS="$status"; FAKE_REASON="$reason"
+        DELETION_MATRIX_ITEMS="[]"; INACTIVE_LOG=""
+        DELETION_CANDIDATE_IDS="$id"
+        source "$LOOP_SCRIPT"
+        echo "$id|$reason|$DELETION_MATRIX_ITEMS"
+      }
+
+      run_case "payments-ora-to-pg-001" 1 "deployment.enabled=false"
+      run_case "some-removed-deployment" 1 "missing values.yaml"
+      run_case "some-retired-deployment" 1 "lifecycle.state=absent"
+    ' 2>&1 || true)"
+    echo "$DELETION_TEST_OUTPUT"
+
+    if echo "$DELETION_TEST_OUTPUT" | grep -q '^payments-ora-to-pg-001|deployment.enabled=false|\[\]$'; then
+      pass "disabling the legacy folder (deployment.enabled=false) produces no deletion-matrix entry (deletion_matrix=[])"
+    else
+      fail "disabling the legacy folder unexpectedly produced a deletion-matrix entry"
+    fi
+
+    if echo "$DELETION_TEST_OUTPUT" | grep -q '^some-removed-deployment|missing values.yaml|\[DELETION_ADDED\]$' \
+        && echo "$DELETION_TEST_OUTPUT" | grep -q '^some-retired-deployment|lifecycle.state=absent|\[DELETION_ADDED\]$'; then
+      pass "a genuinely removed file or lifecycle.state=absent still produces a deletion-matrix entry (deletion safeguards preserved)"
+    else
+      fail "genuine deletion candidates no longer produce a deletion-matrix entry -- deletion safeguard regressed"
+    fi
+  else
+    fail "could not extract the deletion-candidate loop from ${EKS_APP_WORKFLOW}"
+  fi
+else
+  skip "Phase 5A legacy-folder behavioral checks -- ${EKS_APP_WORKFLOW} or python3 not available"
+fi
+
+echo ""
+echo "--- Phase 5A: no Argo CD Application/namespace/PVC/EFS deletion command tied to disabling the legacy folder ---"
+if [ -f "$EKS_APP_WORKFLOW" ]; then
+  # The only place this workflow deletes an Argo CD Application or
+  # namespace is delete_removed_argocd_applications, gated on
+  # has_deletions=true from the deletion matrix -- already proven above to
+  # exclude deployment.enabled=false. No separate, disable-triggered
+  # deletion path may exist anywhere else in the file.
+  DIRECT_DELETE_HITS="$(grep -n 'kubectl delete\|delete-repository\|efs delete-access-point\|delete_access_point' "$EKS_APP_WORKFLOW" | grep -v 'kubectl delete application\|kubectl delete namespace' || true)"
+  if [ -z "$DIRECT_DELETE_HITS" ]; then
+    pass "no unexpected delete command exists outside the guarded Argo CD Application/namespace cleanup path"
+  else
+    fail "unexpected delete command(s) found in ${EKS_APP_WORKFLOW}:"$'\n'"${DIRECT_DELETE_HITS}"
+  fi
+
+  if grep -q 'delete_removed_argocd_applications' "$EKS_APP_WORKFLOW" \
+      && grep -q "needs.detect_changed_deployments.outputs.has_deletions == 'true'" "$EKS_APP_WORKFLOW"; then
+    pass "Argo CD Application/namespace deletion remains gated on has_deletions (deletion-matrix-driven, never folder-disable-driven)"
+  else
+    fail "the deletion job's has_deletions gating condition is missing or changed"
+  fi
+else
+  skip "deletion-command sweep -- ${EKS_APP_WORKFLOW} not found"
+fi
+
+echo ""
+echo "--- Phase 5A: observer Helm/template/chart-values retirement ---"
+
+if [ -f "helm/goldengate/templates/_observer.tpl" ]; then
+  fail "helm/goldengate/templates/_observer.tpl still exists"
+else
+  pass "helm/goldengate/templates/_observer.tpl no longer exists"
+fi
+
+if grep -q "^\s*observer:" "helm/goldengate/values.yaml" 2>/dev/null; then
+  fail "helm/goldengate/values.yaml still exposes a monitoring.observer block"
+else
+  pass "helm/goldengate/values.yaml exposes no monitoring.observer block"
+fi
+
+if grep -A1 "^monitoring:" "helm/goldengate/values.yaml" 2>/dev/null | grep -q "labels:"; then
+  pass "helm/goldengate/values.yaml still exposes monitoring.labels (preserved for shared monitoring/future logging)"
+else
+  fail "helm/goldengate/values.yaml no longer exposes monitoring.labels -- must be preserved"
+fi
+
+OBSERVER_TEMPLATE_HITS="$(grep -l -i "goldengate-observer\|monitoring\.observer\|observerContainer" helm/goldengate/templates/*.yaml 2>/dev/null || true)"
+if [ -z "$OBSERVER_TEMPLATE_HITS" ]; then
+  pass "no helm/goldengate template references an observer container/include/value"
+else
+  fail "observer references remain in: ${OBSERVER_TEMPLATE_HITS}"
+fi
+
+if [ "$HELM_AVAILABLE" = "true" ] && [ "$PYTHON_AVAILABLE" = "true" ]; then
+  for pair in "gg-oracle-payments-01:goldengate-dev" "gg-postgresql-payments-01:goldengate-dev" "payments-ora-to-pg-001:gg-dev-payments-ora-to-pg-001"; do
+    id="${pair%%:*}"; ns="${pair##*:}"
+    VALUES_FILE="envs/dev/${id}/values.yaml"
+    RENDERED="${WORKDIR}/${id}-observer-check.yaml"
+    if helm template "$id" "$RUNTIME_CHART" --namespace "$ns" -f "$VALUES_FILE" \
+        --set global.environment=dev --set global.deploymentId="$id" > "$RENDERED" 2>"${WORKDIR}/${id}-observer-check.err"; then
+      if grep -qi "goldengate-observer\|observer-enabled" "$RENDERED"; then
+        fail "${id}: rendered manifest still contains an observer container/annotation reference"
+      else
+        pass "${id}: rendered manifest contains no observer container/annotation reference"
+      fi
+    else
+      fail "${id}: helm template failed during observer-absence render check"
+      cat "${WORKDIR}/${id}-observer-check.err"
+    fi
+  done
+else
+  skip "rendered-manifest observer-absence check -- helm and/or python3/PyYAML not available"
+fi
+
+if [ -d "monitoring/observer" ]; then
+  fail "monitoring/observer directory still exists"
+else
+  pass "monitoring/observer directory no longer exists"
+fi
+
+echo ""
+echo "--- Phase 5A: observer image logic retired from ${EKS_APP_WORKFLOW} ---"
+if [ -f "$EKS_APP_WORKFLOW" ]; then
+  if grep -q "ensure_observer_image:" "$EKS_APP_WORKFLOW"; then
+    fail "${EKS_APP_WORKFLOW} still defines the ensure_observer_image job"
+  else
+    pass "${EKS_APP_WORKFLOW} no longer defines the ensure_observer_image job"
+  fi
+
+  OBSERVER_ECR_HITS="$(grep -n "OBSERVER_ECR_REPOSITORY\|OBSERVER_SOURCE_PATH\|Ensure observer ECR repository\|observer ECR repository policy" "$EKS_APP_WORKFLOW" || true)"
+  if [ -z "$OBSERVER_ECR_HITS" ]; then
+    pass "${EKS_APP_WORKFLOW} contains no observer ECR repository creation/policy operation"
+  else
+    fail "${EKS_APP_WORKFLOW} still references observer ECR repository operations:"$'\n'"${OBSERVER_ECR_HITS}"
+  fi
+
+  if grep -q "AllowEksDevAccountPullGoldengateObserver" "$EKS_APP_WORKFLOW"; then
+    fail "${EKS_APP_WORKFLOW} still defines the observer cross-account ECR repository policy statement"
+  else
+    pass "${EKS_APP_WORKFLOW} no longer defines the observer cross-account ECR repository policy statement"
+  fi
+
+  if grep -q "monitoring/observer" "$EKS_APP_WORKFLOW"; then
+    fail "${EKS_APP_WORKFLOW} still references monitoring/observer (push trigger path or elsewhere)"
+  else
+    pass "${EKS_APP_WORKFLOW} no longer references monitoring/observer anywhere"
+  fi
+else
+  skip "workflow observer-retirement checks -- ${EKS_APP_WORKFLOW} not found"
+fi
+
+echo ""
+echo "--- Phase 5A: gg-monitor legacy-fallback removal ---"
+
+if grep -q "legacyFallback" "helm/goldengate-monitor/values.yaml" 2>/dev/null; then
+  fail "helm/goldengate-monitor/values.yaml still defines legacyFallback"
+else
+  pass "helm/goldengate-monitor/values.yaml no longer defines legacyFallback"
+fi
+
+if grep -q "LEGACY_FALLBACK_ENABLED" "helm/goldengate-monitor/templates/deployment.yaml" 2>/dev/null; then
+  fail "helm/goldengate-monitor/templates/deployment.yaml still sets LEGACY_FALLBACK_ENABLED"
+else
+  pass "helm/goldengate-monitor/templates/deployment.yaml no longer sets LEGACY_FALLBACK_ENABLED"
+fi
+
+if grep -q "legacy_fallback_enabled\|LEGACY_FALLBACK_ENABLED" "${MONITOR_APP_DIR}/config.py" 2>/dev/null; then
+  fail "config.py still has a legacy_fallback_enabled field"
+else
+  pass "config.py has no legacy_fallback_enabled field"
+fi
+
+if grep -q "compute_legacy_effective_status\|_LEGACY_STATUS_MAP\|legacy-observer-fallback" "${MONITOR_APP_DIR}/monitor.py" 2>/dev/null; then
+  fail "monitor.py still contains legacy-observer status-conversion code or the legacy-observer-fallback data source"
+else
+  pass "monitor.py contains no legacy-observer status-conversion code or legacy-observer-fallback data source"
+fi
+
+if grep -q "gg-{pipeline_id}-{role}\|gg-payments-ora-to-pg-001-source\|gg-payments-ora-to-pg-001-target" "${MONITOR_APP_DIR}/monitor.py" 2>/dev/null; then
+  fail "monitor.py still builds or hardcodes a legacy per-role observer partition key"
+else
+  pass "monitor.py never builds or hardcodes a legacy per-role observer partition key"
+fi
+
+if [ "$HELM_AVAILABLE" = "true" ]; then
+  if helm template gg-monitor "$MONITOR_CHART_STAGED" --namespace goldengate-monitoring \
+      --set image.repository=example.com/x --set image.tag=1 --set serviceAccount.roleArn=arn:aws:iam::000000000000:role/x \
+      2>"${WORKDIR}/monitor-legacy-render.err" | grep -q "LEGACY_FALLBACK_ENABLED"; then
+    fail "rendered goldengate-monitor Deployment still contains LEGACY_FALLBACK_ENABLED"
+  else
+    pass "rendered goldengate-monitor Deployment contains no LEGACY_FALLBACK_ENABLED variable"
+  fi
+else
+  skip "rendered monitor Deployment legacy-fallback check -- helm not available"
+fi
+
+echo ""
+echo "--- Phase 5A: no alarms/SNS/gg-alerter/Fluent Bit introduced; IAM unchanged ---"
+
+# Structural signals only -- never a bare substring grep, which would
+# false-positive on this repository's own negative-assertion code (e.g. a
+# test's forbidden-string tuple, or FORBIDDEN_CONTAINER_SUBSTRINGS in the
+# workflow's singleRuntime contract check -- both deliberately mention these
+# names to prove their absence, not to implement them).
+NOT_YET_HITS=""
+[ -d "monitoring/gg-alerter" ] && NOT_YET_HITS="${NOT_YET_HITS} monitoring/gg-alerter/"
+[ -d "helm/gg-alerter" ] && NOT_YET_HITS="${NOT_YET_HITS} helm/gg-alerter/"
+FLUENTBIT_CHART_HITS="$(find helm -maxdepth 2 -iname "*fluent-bit*" -o -iname "*fluentbit*" 2>/dev/null | grep -v '^helm/argocd/' || true)"
+[ -n "$FLUENTBIT_CHART_HITS" ] && NOT_YET_HITS="${NOT_YET_HITS} ${FLUENTBIT_CHART_HITS}"
+DAEMONSET_HITS="$(grep -rl "kind: DaemonSet" helm/goldengate helm/goldengate-monitor 2>/dev/null || true)"
+[ -n "$DAEMONSET_HITS" ] && NOT_YET_HITS="${NOT_YET_HITS} ${DAEMONSET_HITS}"
+ALARM_SNS_HITS="$(grep -rl "aws_cloudwatch_metric_alarm\|aws cloudwatch put-metric-alarm\|sns:Publish\|sns:CreateTopic\|aws sns create-topic" \
+  envs/dev "$EKS_APP_WORKFLOW" "$MONITOR_WORKFLOW" helm/goldengate-monitor 2>/dev/null || true)"
+[ -n "$ALARM_SNS_HITS" ] && NOT_YET_HITS="${NOT_YET_HITS} ${ALARM_SNS_HITS}"
+
+if [ -z "$NOT_YET_HITS" ]; then
+  pass "no alarm/SNS/gg-alerter/Fluent Bit implementation was introduced"
+else
+  fail "unexpected alarm/SNS/gg-alerter/Fluent Bit implementation found in:${NOT_YET_HITS}"
+fi
+
+# Whitespace/line-ending-only diffs are pre-existing baseline noise in this
+# repository (unrelated to any session's actual edits) -- compare with
+# --ignore-all-space so only substantive content changes count.
+IAM_DIFF="$(git diff --ignore-all-space -- envs/dev/iam.tf envs/dev/policies/goldengate-secrets-read-dev envs/dev/policies/goldengate-monitor-read-dev 2>/dev/null || true)"
+if [ -z "$IAM_DIFF" ]; then
+  pass "envs/dev/iam.tf and the goldengate-secrets-read-dev/goldengate-monitor-read-dev policies have no substantive changes"
+else
+  fail "unexpected IAM/policy content changes detected (beyond whitespace) in envs/dev/iam.tf or its policies"
+fi
+
+echo ""
+echo "--- Phase 5A: stale ServiceManager.pid and Argo CD deletion safeguards preserved ---"
+
+PID_GUARD_MISSING=""
+for f in helm/goldengate/templates/source-statefulset.yaml helm/goldengate/templates/target-statefulset.yaml helm/goldengate/templates/runtime-statefulset.yaml; do
+  [ -f "$f" ] || continue
+  grep -q "ServiceManager.pid" "$f" || PID_GUARD_MISSING="${PID_GUARD_MISSING} ${f}"
+done
+if [ -z "$PID_GUARD_MISSING" ]; then
+  pass "stale ServiceManager.pid cleanup remains present in every StatefulSet template"
+else
+  fail "stale ServiceManager.pid cleanup is missing from:${PID_GUARD_MISSING}"
+fi
+
+if grep -q "resources-finalizer.argocd.argoproj.io" "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && grep -q "Refusing to delete namespace" "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && grep -q "ownership labels" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "Argo CD deletion safeguards (finalizer wait, shared-namespace refusal, ownership-label verification) remain present"
+else
+  fail "one or more Argo CD deletion safeguards appear to be missing from ${EKS_APP_WORKFLOW}"
 fi
 
 echo ""

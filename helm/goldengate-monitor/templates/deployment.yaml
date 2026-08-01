@@ -73,8 +73,6 @@ spec:
               value: {{ .Values.dynamodb.tableName | quote }}
             - name: REPO_CONFIG_ROOT
               value: {{ .Values.canonicalConfig.root | quote }}
-            - name: LEGACY_FALLBACK_ENABLED
-              value: {{ .Values.legacyFallback.enabled | default false | quote }}
             - name: PORT
               value: {{ .Values.service.port | quote }}
             - name: STALE_AFTER_SECONDS

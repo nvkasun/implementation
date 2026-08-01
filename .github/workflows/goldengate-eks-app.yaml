@@ -31,7 +31,6 @@ on:
     paths:
       - 'envs/dev/**'
       - 'helm/goldengate/**'
-      - 'monitoring/observer/**'
 
 permissions:
   id-token: write
@@ -66,12 +65,6 @@ env:
   HELM_CHART_PATH: helm/goldengate
   ENVS_ROOT: envs
 
-  # GoldenGate monitoring observer: built once per observer-content Git tree
-  # SHA (see ensure_observer_image), independent of the per-deployment Helm
-  # matrix below.
-  OBSERVER_SOURCE_PATH: monitoring/observer
-  OBSERVER_ECR_REPOSITORY: goldengate-observer
-
 jobs:
   detect_changed_deployments:
     name: Detect changed GoldenGate deployments
@@ -83,11 +76,6 @@ jobs:
       deployment_matrix: ${{ steps.detect.outputs.deployment_matrix }}
       has_deletions: ${{ steps.detect.outputs.has_deletions }}
       deletion_matrix: ${{ steps.detect.outputs.deletion_matrix }}
-      observer_changed: ${{ steps.detect.outputs.observer_changed }}
-      observer_tree_sha: ${{ steps.detect.outputs.observer_tree_sha }}
-      observer_image_tag: ${{ steps.detect.outputs.observer_image_tag }}
-      observer_image_repository: ${{ steps.detect.outputs.observer_image_repository }}
-      observer_image_uri: ${{ steps.detect.outputs.observer_image_uri }}
 
     steps:
       - name: Checkout repository
@@ -229,38 +217,6 @@ jobs:
             return 0
           }
 
-          # Observer content-addressed image tag: calculated on every trigger
-          # (push and workflow_dispatch) from the Git tree SHA of
-          # monitoring/observer alone, NOT the overall commit SHA -- a
-          # deployment-values-only or Helm-only change changes github.sha but
-          # never changes this tree SHA, so the observer image tag (and the
-          # existing ECR image, once built) stays stable across those changes.
-          echo "Calculating observer content-addressed image tag from ${OBSERVER_SOURCE_PATH}..."
-
-          OBSERVER_TREE_SHA="$(git rev-parse "HEAD:${OBSERVER_SOURCE_PATH}")"
-          OBSERVER_IMAGE_TAG="obs-${OBSERVER_TREE_SHA:0:12}"
-
-          # OBSERVER_ECR_REPOSITORY (short name, e.g. "goldengate-observer")
-          # stays reserved for AWS CLI operations against ECR. Docker, Helm
-          # (monitoring.observer.image.repository), and the Argo CD Helm
-          # parameter all need the FULL registry/repository URI -- without
-          # it, the Helm template renders an incomplete image reference
-          # (e.g. "goldengate-observer:obs-xxxx" instead of
-          # "229410149234.dkr.ecr.eu-west-1.amazonaws.com/goldengate-observer:obs-xxxx").
-          OBSERVER_IMAGE_REPOSITORY="${ECR_REGISTRY}/${OBSERVER_ECR_REPOSITORY}"
-          OBSERVER_IMAGE_URI="${OBSERVER_IMAGE_REPOSITORY}:${OBSERVER_IMAGE_TAG}"
-
-          echo "Observer tree SHA (monitoring/observer): ${OBSERVER_TREE_SHA}"
-          echo "Observer image tag: ${OBSERVER_IMAGE_TAG}"
-          echo "Observer ECR repository (short name, for AWS CLI): ${OBSERVER_ECR_REPOSITORY}"
-          echo "Observer image repository (full URI, for Docker/Helm/Argo CD): ${OBSERVER_IMAGE_REPOSITORY}"
-          echo "Observer image URI: ${OBSERVER_IMAGE_URI}"
-
-          echo "observer_tree_sha=${OBSERVER_TREE_SHA}" >> "$GITHUB_OUTPUT"
-          echo "observer_image_tag=${OBSERVER_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
-          echo "observer_image_repository=${OBSERVER_IMAGE_REPOSITORY}" >> "$GITHUB_OUTPUT"
-          echo "observer_image_uri=${OBSERVER_IMAGE_URI}" >> "$GITHUB_OUTPUT"
-
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             ENVIRONMENT="${{ inputs.environment }}"
             DEPLOYMENT_ID="${{ inputs.deployment_id }}"
@@ -295,18 +251,11 @@ jobs:
             echo "has_deletions=false" >> "$GITHUB_OUTPUT"
             echo "deletion_matrix=[]" >> "$GITHUB_OUTPUT"
 
-            # Manual dispatch has no "before" commit to diff against, and
-            # always targets exactly the requested deployment_id regardless
-            # of this flag -- ensure_observer_image still runs unconditionally
-            # below and only builds when the content-addressed tag is absent
-            # from ECR.
-            echo "observer_changed=false" >> "$GITHUB_OUTPUT"
-
             echo "Matrix: ${MATRIX_JSON}"
             exit 0
           fi
 
-          echo "Push trigger. Detecting changed deployment folders under envs/dev/, helm/goldengate/, and ${OBSERVER_SOURCE_PATH}/..."
+          echo "Push trigger. Detecting changed deployment folders under envs/dev/ and helm/goldengate/..."
 
           BEFORE_SHA="${{ github.event.before }}"
           AFTER_SHA="${{ github.sha }}"
@@ -317,9 +266,9 @@ jobs:
             BEFORE_SHA="$EMPTY_TREE_SHA"
           fi
 
-          CHANGED_FILES="$(git diff --name-only "$BEFORE_SHA" "$AFTER_SHA" -- 'envs/dev/**' 'helm/goldengate/**' "${OBSERVER_SOURCE_PATH}/**" || true)"
+          CHANGED_FILES="$(git diff --name-only "$BEFORE_SHA" "$AFTER_SHA" -- 'envs/dev/**' 'helm/goldengate/**' || true)"
 
-          echo "Changed files under envs/dev/, helm/goldengate/, and ${OBSERVER_SOURCE_PATH}/:"
+          echo "Changed files under envs/dev/ and helm/goldengate/:"
           echo "${CHANGED_FILES:-<none>}"
 
           CHART_CHANGED="false"
@@ -327,14 +276,7 @@ jobs:
             CHART_CHANGED="true"
           fi
 
-          OBSERVER_CHANGED="false"
-          if echo "$CHANGED_FILES" | grep -q "^${OBSERVER_SOURCE_PATH}/"; then
-            OBSERVER_CHANGED="true"
-          fi
-
           echo "Chart changed: ${CHART_CHANGED}"
-          echo "Observer changed: ${OBSERVER_CHANGED}"
-          echo "observer_changed=${OBSERVER_CHANGED}" >> "$GITHUB_OUTPUT"
 
           DEPLOYMENT_MATRIX_ITEMS="[]"
           DELETION_MATRIX_ITEMS="[]"
@@ -345,19 +287,11 @@ jobs:
           # separate argocd-eks-deployment.yaml workflow. It is never a
           # GoldenGate deployment and must be excluded here.
           #
-          # Selection reason: a shared Helm chart change OR an observer
-          # source change both affect every active deployment (the chart
-          # renders the observer sidecar the same way for all of them), so
-          # either one selects all active deployments. A deployment-values-
-          # only change only affects its own folder.
-          if [ "$CHART_CHANGED" = "true" ] || [ "$OBSERVER_CHANGED" = "true" ]; then
-            if [ "$CHART_CHANGED" = "true" ] && [ "$OBSERVER_CHANGED" = "true" ]; then
-              echo "Selection reason: shared GoldenGate Helm chart AND observer source both changed. Selecting all active dev deployments."
-            elif [ "$CHART_CHANGED" = "true" ]; then
-              echo "Selection reason: shared GoldenGate Helm chart changed. Selecting all active dev deployments."
-            else
-              echo "Selection reason: observer source (${OBSERVER_SOURCE_PATH}/) changed. Selecting all active dev deployments."
-            fi
+          # Selection reason: a shared Helm chart change affects every active
+          # deployment, so it selects all active deployments. A deployment-
+          # values-only change only affects its own folder.
+          if [ "$CHART_CHANGED" = "true" ]; then
+            echo "Selection reason: shared GoldenGate Helm chart changed. Selecting all active dev deployments."
 
             DEPLOYMENT_CANDIDATE_IDS="$(find envs/dev -mindepth 2 -maxdepth 2 -name values.yaml -not -path 'envs/dev/argocd/*' \
               | sed -E 's#^envs/dev/([^/]+)/values\.yaml$#\1#' \
@@ -491,16 +425,31 @@ jobs:
             set -e
 
             if [ "$STATUS" -ne 0 ]; then
-              echo "Inactive/deleted: ${CANDIDATE_ID} (${REASON})"
-              INACTIVE_LOG="${INACTIVE_LOG}  - ${CANDIDATE_ID} (${REASON})\n"
+              # deployment.enabled=false is a "retired but retained" signal
+              # only: the values folder is kept for rollback/reference and
+              # must never drive live Argo CD Application or namespace
+              # deletion. Only a genuinely removed file (missing/deleted) or
+              # an explicit lifecycle.state=absent is treated as a real
+              # deletion request. enabled=false (top-level) is treated the
+              # same as deployment.enabled=false here for consistency.
+              case "$REASON" in
+                deployment.enabled=false*|enabled=false*)
+                  echo "Inactive (retained, not deleted): ${CANDIDATE_ID} (${REASON})"
+                  INACTIVE_LOG="${INACTIVE_LOG}  - ${CANDIDATE_ID} (${REASON}) [retained -- no deletion request]\n"
+                  ;;
+                *)
+                  echo "Inactive/deleted: ${CANDIDATE_ID} (${REASON})"
+                  INACTIVE_LOG="${INACTIVE_LOG}  - ${CANDIDATE_ID} (${REASON})\n"
 
-              CANDIDATE_DEPLOYMENT_MODEL="$(resolve_deployment_model_from_git "$BEFORE_SHA" "$VALUES_FILE")"
-              echo "  deploymentModel at base revision (${BEFORE_SHA}): ${CANDIDATE_DEPLOYMENT_MODEL}"
+                  CANDIDATE_DEPLOYMENT_MODEL="$(resolve_deployment_model_from_git "$BEFORE_SHA" "$VALUES_FILE")"
+                  echo "  deploymentModel at base revision (${BEFORE_SHA}): ${CANDIDATE_DEPLOYMENT_MODEL}"
 
-              DELETION_MATRIX_ITEMS="$(echo "$DELETION_MATRIX_ITEMS" | jq -c \
-                --arg deployment_id "$CANDIDATE_ID" \
-                --arg deployment_model "$CANDIDATE_DEPLOYMENT_MODEL" \
-                '. + [{environment: "dev", deployment_id: $deployment_id, deployment_model: $deployment_model}]')"
+                  DELETION_MATRIX_ITEMS="$(echo "$DELETION_MATRIX_ITEMS" | jq -c \
+                    --arg deployment_id "$CANDIDATE_ID" \
+                    --arg deployment_model "$CANDIDATE_DEPLOYMENT_MODEL" \
+                    '. + [{environment: "dev", deployment_id: $deployment_id, deployment_model: $deployment_model}]')"
+                  ;;
+              esac
             else
               echo "Still active: ${CANDIDATE_ID} (${REASON}) -- not a deletion."
             fi
@@ -545,351 +494,12 @@ jobs:
           echo "Deployment matrix: ${DEPLOYMENT_MATRIX_ITEMS}"
           echo "Deletion matrix: ${DELETION_MATRIX_ITEMS}"
 
-  ensure_observer_image:
-    name: Ensure GoldenGate observer image exists in ECR
-
-    needs: detect_changed_deployments
-    if: needs.detect_changed_deployments.outputs.has_changes == 'true'
-
-    # ubuntu-latest (not the private CodeBuild runner used by the other jobs
-    # in this workflow) -- the CodeBuild runner has no reachable Docker
-    # daemon/socket (docker --version succeeds, docker info fails), so it
-    # cannot build/push images. ubuntu-latest is the established
-    # Docker-capable runner pattern already used by
-    # push_docker_images_to_ECR.yaml. This job never touches the private
-    # EKS cluster or the CodeBuild-only platform tooling, so it doesn't need
-    # that runner.
-    runs-on: ubuntu-latest
-
-    # Runs once per workflow (not once per deployment matrix item) so the
-    # observer image is built at most once per observer-content tree SHA,
-    # regardless of how many deployments are selected below.
-    environment: dev
-
-    outputs:
-      image_repository: ${{ needs.detect_changed_deployments.outputs.observer_image_repository }}
-      image_tag: ${{ needs.detect_changed_deployments.outputs.observer_image_tag }}
-      image_uri: ${{ needs.detect_changed_deployments.outputs.observer_image_uri }}
-      image_existed: ${{ steps.image_check.outputs.image_existed }}
-      image_digest: ${{ steps.resolve_digest.outputs.image_digest }}
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-region: ${{ env.AWS_REGION }}
-          role-to-assume: ${{ env.ROLE_ARN }}
-
-      - name: Verify AWS caller account
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          CALLER_ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
-          echo "Caller account: ${CALLER_ACCOUNT}"
-
-          if [ "$CALLER_ACCOUNT" != "$ECR_ACCOUNT_ID" ]; then
-            echo "Unexpected AWS caller account. Expected ${ECR_ACCOUNT_ID} (ECR/build account), got ${CALLER_ACCOUNT}."
-            exit 1
-          fi
-
-          echo "Confirmed: running in the ECR/build account (${ECR_ACCOUNT_ID})."
-
-      - name: Prepare observer image variables
-        id: prep
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          OBSERVER_IMAGE_REPOSITORY="${{ needs.detect_changed_deployments.outputs.observer_image_repository }}"
-          OBSERVER_IMAGE_TAG="${{ needs.detect_changed_deployments.outputs.observer_image_tag }}"
-          OBSERVER_IMAGE_URI="${{ needs.detect_changed_deployments.outputs.observer_image_uri }}"
-          OBSERVER_TREE_SHA="${{ needs.detect_changed_deployments.outputs.observer_tree_sha }}"
-          OBSERVER_CHANGED="${{ needs.detect_changed_deployments.outputs.observer_changed }}"
-
-          # OBSERVER_IMAGE_REPOSITORY must be the full registry/repository URI
-          # (no tag) -- this is what Helm/Argo CD receive as
-          # monitoring.observer.image.repository. OBSERVER_ECR_REPOSITORY
-          # (the short name, e.g. "goldengate-observer") stays reserved for
-          # AWS CLI operations (describe-repositories, create-repository,
-          # describe-images, get/set-repository-policy) below.
-          if [[ "$OBSERVER_IMAGE_REPOSITORY" != "${ECR_REGISTRY}/"* ]]; then
-            echo "OBSERVER_IMAGE_REPOSITORY does not start with \"${ECR_REGISTRY}/\": ${OBSERVER_IMAGE_REPOSITORY}"
-            echo "This must be the full ECR registry/repository URI, not the short repository name, or Helm/Argo CD will render an incomplete image reference."
-            exit 1
-          fi
-
-          echo "OBSERVER_IMAGE_REPOSITORY=${OBSERVER_IMAGE_REPOSITORY}" >> "$GITHUB_ENV"
-          echo "OBSERVER_IMAGE_TAG=${OBSERVER_IMAGE_TAG}" >> "$GITHUB_ENV"
-          echo "OBSERVER_IMAGE_URI=${OBSERVER_IMAGE_URI}" >> "$GITHUB_ENV"
-          echo "OBSERVER_TREE_SHA=${OBSERVER_TREE_SHA}" >> "$GITHUB_ENV"
-          echo "OBSERVER_CHANGED=${OBSERVER_CHANGED}" >> "$GITHUB_ENV"
-
-          echo "Observer ECR repository (short name, for AWS CLI): ${OBSERVER_ECR_REPOSITORY}"
-          echo "Observer image repository (full URI, for Docker/Helm/Argo CD): ${OBSERVER_IMAGE_REPOSITORY}"
-          echo "Observer tree SHA: ${OBSERVER_TREE_SHA}"
-          echo "Observer image tag: ${OBSERVER_IMAGE_TAG}"
-          echo "Observer image URI: ${OBSERVER_IMAGE_URI}"
-          echo "Observer source changed this trigger: ${OBSERVER_CHANGED}"
-
-      - name: Ensure observer ECR repository exists
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if aws ecr describe-repositories \
-            --region "$AWS_REGION" \
-            --repository-names "$OBSERVER_ECR_REPOSITORY" >/dev/null 2>&1; then
-            echo "ECR repository already exists: ${OBSERVER_ECR_REPOSITORY}. Not changing its tag mutability."
-          else
-            echo "Creating ECR repository: ${OBSERVER_ECR_REPOSITORY}"
-
-            aws ecr create-repository \
-              --region "$AWS_REGION" \
-              --repository-name "$OBSERVER_ECR_REPOSITORY" \
-              --tags Key=ApplicationName,Value=CloudFactory Key=DataClassification,Value=General Key=BusinessCriticality,Value=Low Key=BusinessUnit,Value=TechnologyPlatform Key=CostCenter,Value=219 \
-              --image-scanning-configuration scanOnPush=true \
-              --image-tag-mutability IMMUTABLE >/dev/null
-
-            echo "Created ECR repository: ${OBSERVER_ECR_REPOSITORY} (IMMUTABLE tags, scanOnPush=true)"
-          fi
-
-      - name: Ensure observer ECR repository policy allows EKS workload account pull
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          # Adapted from the equivalent merge-in-place approach used for the
-          # helm/goldengate chart's ECR repository policy elsewhere in this
-          # workflow: existing statements are always preserved, only the Sid
-          # below is replaced.
-          OBSERVER_EKS_PULL_SID="AllowEksDevAccountPullGoldengateObserver"
-
-          echo "Fetching existing ECR repository policy for ${OBSERVER_ECR_REPOSITORY}..."
-
-          EXISTING_POLICY="$(aws ecr get-repository-policy \
-            --region "$AWS_REGION" \
-            --repository-name "$OBSERVER_ECR_REPOSITORY" \
-            --query policyText \
-            --output text 2>/tmp/observer-ecr-get-policy-error.txt)" || {
-              if grep -q "RepositoryPolicyNotFoundException" /tmp/observer-ecr-get-policy-error.txt; then
-                echo "No existing repository policy found. Starting from an empty policy."
-                EXISTING_POLICY='{"Version":"2012-10-17","Statement":[]}'
-              else
-                echo "Failed to read the existing ECR repository policy:"
-                cat /tmp/observer-ecr-get-policy-error.txt
-                echo ""
-                echo "The workflow role (${ROLE_ARN}) must have ecr:GetRepositoryPolicy and"
-                echo "ecr:SetRepositoryPolicy on ${OBSERVER_ECR_REPOSITORY}. Grant those and re-run."
-                exit 1
-              fi
-            }
-
-          echo "Merging in Sid ${OBSERVER_EKS_PULL_SID} (existing statements are preserved)..."
-
-          echo "$EXISTING_POLICY" | jq \
-            --arg sid "$OBSERVER_EKS_PULL_SID" \
-            '
-            .Statement = ([.Statement[] | select(.Sid != $sid)]
-              + [{
-                  Sid: $sid,
-                  Effect: "Allow",
-                  Principal: { AWS: "arn:aws:iam::668311715351:root" },
-                  Action: [
-                    "ecr:BatchCheckLayerAvailability",
-                    "ecr:BatchGetImage",
-                    "ecr:GetDownloadUrlForLayer"
-                  ]
-                }])
-            ' > /tmp/observer-ecr-repository-policy.json
-
-          aws ecr set-repository-policy \
-            --region "$AWS_REGION" \
-            --repository-name "$OBSERVER_ECR_REPOSITORY" \
-            --policy-text file:///tmp/observer-ecr-repository-policy.json >/dev/null
-
-          echo "ECR repository policy on ${OBSERVER_ECR_REPOSITORY} now allows pull from account 668311715351 (EKS workload account)."
-
-      - name: Check whether the observer image already exists
-        id: image_check
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "Checking for existing image: ${OBSERVER_ECR_REPOSITORY}:${OBSERVER_IMAGE_TAG}"
-
-          if aws ecr describe-images \
-            --region "$AWS_REGION" \
-            --repository-name "$OBSERVER_ECR_REPOSITORY" \
-            --image-ids "imageTag=${OBSERVER_IMAGE_TAG}" >/tmp/observer-describe-images.json 2>/tmp/observer-describe-images-error.txt; then
-            echo "Image already exists in ECR. Reusing it -- no build or push will occur."
-            echo "image_existed=true" >> "$GITHUB_OUTPUT"
-            echo "IMAGE_EXISTED=true" >> "$GITHUB_ENV"
-          else
-            if grep -q "ImageNotFoundException" /tmp/observer-describe-images-error.txt; then
-              echo "Image not found in ECR. It will be built and pushed."
-              echo "image_existed=false" >> "$GITHUB_OUTPUT"
-              echo "IMAGE_EXISTED=false" >> "$GITHUB_ENV"
-            else
-              echo "Failed to check for the existing observer image:"
-              cat /tmp/observer-describe-images-error.txt
-              echo ""
-              echo "The workflow role (${ROLE_ARN}) must have ecr:DescribeImages on ${OBSERVER_ECR_REPOSITORY}."
-              exit 1
-            fi
-          fi
-
-      - name: Decide whether unit tests are required this run
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          # Tests act as an observer-code gate: they must run whenever the
-          # image doesn't exist yet (about to be built) or observer source
-          # changed this trigger, but can be skipped when neither is true
-          # (a pure Helm-only or deployment-values-only run reusing an
-          # already-verified, content-addressed image).
-          RUN_TESTS="false"
-          if [ "$IMAGE_EXISTED" != "true" ] || [ "$OBSERVER_CHANGED" = "true" ]; then
-            RUN_TESTS="true"
-          fi
-
-          echo "RUN_TESTS=${RUN_TESTS}" >> "$GITHUB_ENV"
-          echo "Run observer unit tests this run: ${RUN_TESTS}"
-
-      - name: Validate observer Python syntax
-        if: env.RUN_TESTS == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 -m py_compile "${OBSERVER_SOURCE_PATH}/observer.py"
-          python3 -m compileall -q "${OBSERVER_SOURCE_PATH}"
-
-      - name: Run observer unit tests
-        if: env.RUN_TESTS == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 -m unittest discover -s "${OBSERVER_SOURCE_PATH}/tests" -p "test_*.py" -v
-
-      # Everything below this point only runs when the content-addressed
-      # image is actually missing from ECR (IMAGE_EXISTED != 'true'). A
-      # reused image executes no Docker command at all -- not even a version
-      # or daemon check -- so a Helm-only or deployment-values-only run never
-      # depends on Docker being present/functional on the runner.
-
-      - name: Verify Docker binary and daemon are functional
-        if: env.IMAGE_EXISTED != 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if ! command -v docker >/dev/null 2>&1; then
-            echo "docker is not installed on this runner. This workflow does not install Docker automatically."
-            exit 1
-          fi
-
-          docker --version
-
-          if ! docker info >/dev/null 2>&1; then
-            echo "The docker CLI is present but the daemon is not reachable (docker info failed)."
-            echo "This can happen when Docker is on PATH but the daemon/socket is not actually running or connected."
-            exit 1
-          fi
-
-          echo "Docker binary and daemon are both functional."
-
-      - name: Login to Amazon ECR
-        if: env.IMAGE_EXISTED != 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          aws ecr get-login-password --region "$AWS_REGION" \
-            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
-
-      - name: Build observer image
-        if: env.IMAGE_EXISTED != 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "Building ${OBSERVER_IMAGE_URI} from ${OBSERVER_SOURCE_PATH}..."
-
-          docker build \
-            --build-arg "OCI_SOURCE=${{ github.server_url }}/${{ github.repository }}" \
-            --build-arg "OCI_TITLE=goldengate-observer" \
-            --build-arg "OCI_DESCRIPTION=Fail-open GoldenGate monitoring observer sidecar" \
-            --build-arg "OCI_VERSION=${OBSERVER_IMAGE_TAG}" \
-            -t "$OBSERVER_IMAGE_URI" \
-            "$OBSERVER_SOURCE_PATH"
-
-      - name: Push observer image
-        if: env.IMAGE_EXISTED != 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "Pushing ${OBSERVER_IMAGE_URI}..."
-          docker push "$OBSERVER_IMAGE_URI"
-
-      - name: Resolve observer image digest
-        id: resolve_digest
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          IMAGE_DIGEST="$(aws ecr describe-images \
-            --region "$AWS_REGION" \
-            --repository-name "$OBSERVER_ECR_REPOSITORY" \
-            --image-ids "imageTag=${OBSERVER_IMAGE_TAG}" \
-            --query 'imageDetails[0].imageDigest' \
-            --output text)"
-
-          echo "Observer image digest: ${IMAGE_DIGEST}"
-          echo "image_digest=${IMAGE_DIGEST}" >> "$GITHUB_OUTPUT"
-
-      - name: Confirm immutable tag is present in ECR
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          aws ecr describe-images \
-            --region "$AWS_REGION" \
-            --repository-name "$OBSERVER_ECR_REPOSITORY" \
-            --image-ids "imageTag=${OBSERVER_IMAGE_TAG}" >/dev/null
-
-          echo "Confirmed: ${OBSERVER_ECR_REPOSITORY}:${OBSERVER_IMAGE_TAG} is present in ECR."
-
-      - name: Observer image summary
-        if: always()
-        shell: bash
-        run: |
-          {
-            echo "## Observer image"
-            echo ""
-            echo "- Observer tree SHA: \`${OBSERVER_TREE_SHA:-unknown}\`"
-            echo "- Observer image tag: \`${OBSERVER_IMAGE_TAG:-unknown}\`"
-            echo "- Observer image URI: \`${OBSERVER_IMAGE_URI:-unknown}\`"
-            echo "- Observer source changed this trigger: \`${OBSERVER_CHANGED:-unknown}\`"
-            echo "- Image already existed in ECR: \`${IMAGE_EXISTED:-unknown}\`"
-            echo ""
-            echo "Built once here, outside the deployment matrix. Helm-only and"
-            echo "deployment-values-only changes reuse this same image."
-          } >> "$GITHUB_STEP_SUMMARY"
-
   build_publish_and_deploy:
     name: Build, publish, and deploy GoldenGate Helm chart via Argo CD
 
     needs:
       - detect_changed_deployments
-      - ensure_observer_image
-    if: needs.detect_changed_deployments.outputs.has_changes == 'true' && needs.ensure_observer_image.result == 'success'
+    if: needs.detect_changed_deployments.outputs.has_changes == 'true'
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -1135,29 +745,6 @@ jobs:
           echo "helm_chart_ref=${HELM_CHART_REF}" >> "$GITHUB_OUTPUT"
           echo "argocd_app_name=${ARGOCD_APP_NAME}" >> "$GITHUB_OUTPUT"
 
-          # Observer image coordinates come from ensure_observer_image /
-          # detect_changed_deployments -- never recalculated per matrix item.
-          OBSERVER_IMAGE_REPOSITORY="${{ needs.ensure_observer_image.outputs.image_repository }}"
-          OBSERVER_IMAGE_TAG="${{ needs.ensure_observer_image.outputs.image_tag }}"
-          OBSERVER_IMAGE_URI="${{ needs.ensure_observer_image.outputs.image_uri }}"
-
-          # Defense-in-depth at the exact point Helm consumes this value:
-          # monitoring.observer.image.repository must be the full ECR
-          # registry/repository URI, never the short repository name alone.
-          if [[ "$OBSERVER_IMAGE_REPOSITORY" != "${ECR_REGISTRY}/"* ]]; then
-            echo "OBSERVER_IMAGE_REPOSITORY does not start with \"${ECR_REGISTRY}/\": ${OBSERVER_IMAGE_REPOSITORY}"
-            echo "Refusing to pass an incomplete image repository to Helm/Argo CD."
-            exit 1
-          fi
-
-          echo "OBSERVER_IMAGE_REPOSITORY=${OBSERVER_IMAGE_REPOSITORY}" >> "$GITHUB_ENV"
-          echo "OBSERVER_IMAGE_TAG=${OBSERVER_IMAGE_TAG}" >> "$GITHUB_ENV"
-          echo "OBSERVER_IMAGE_URI=${OBSERVER_IMAGE_URI}" >> "$GITHUB_ENV"
-
-          echo "Observer image repository (full URI): ${OBSERVER_IMAGE_REPOSITORY}"
-          echo "Observer image tag: ${OBSERVER_IMAGE_TAG}"
-          echo "Observer image URI: ${OBSERVER_IMAGE_URI}"
-
       - name: Validate required files
         shell: bash
         run: |
@@ -1285,23 +872,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          # singleRuntime never requires or injects observer image parameters
-          # -- the generic runtime chart resources never reference
-          # monitoring.observer at all (no observer sidecar in the approved
-          # single-runtime pod).
-          if [ "$DEPLOYMENT_MODEL" = "singleRuntime" ]; then
-            helm lint "$HELM_CHART_PATH" \
-              --values "$VALUES_FILE" \
-              --set global.environment="$ENVIRONMENT" \
-              --set global.deploymentId="$DEPLOYMENT_ID"
-          else
-            helm lint "$HELM_CHART_PATH" \
-              --values "$VALUES_FILE" \
-              --set global.environment="$ENVIRONMENT" \
-              --set global.deploymentId="$DEPLOYMENT_ID" \
-              --set-string monitoring.observer.image.repository="$OBSERVER_IMAGE_REPOSITORY" \
-              --set-string monitoring.observer.image.tag="$OBSERVER_IMAGE_TAG"
-          fi
+          # Neither deploymentModel injects observer image parameters -- the
+          # chart no longer has an observer sidecar or monitoring.observer
+          # value at all.
+          helm lint "$HELM_CHART_PATH" \
+            --values "$VALUES_FILE" \
+            --set global.environment="$ENVIRONMENT" \
+            --set global.deploymentId="$DEPLOYMENT_ID"
 
       - name: Render manifest for validation
         shell: bash
@@ -1310,23 +887,12 @@ jobs:
 
           mkdir -p rendered
 
-          if [ "$DEPLOYMENT_MODEL" = "singleRuntime" ]; then
-            helm template "$RELEASE_NAME" "$HELM_CHART_PATH" \
-              --namespace "$TARGET_NAMESPACE" \
-              --values "$VALUES_FILE" \
-              --set global.environment="$ENVIRONMENT" \
-              --set global.deploymentId="$DEPLOYMENT_ID" \
-              > "rendered/${RELEASE_NAME}.yaml"
-          else
-            helm template "$RELEASE_NAME" "$HELM_CHART_PATH" \
-              --namespace "$TARGET_NAMESPACE" \
-              --values "$VALUES_FILE" \
-              --set global.environment="$ENVIRONMENT" \
-              --set global.deploymentId="$DEPLOYMENT_ID" \
-              --set-string monitoring.observer.image.repository="$OBSERVER_IMAGE_REPOSITORY" \
-              --set-string monitoring.observer.image.tag="$OBSERVER_IMAGE_TAG" \
-              > "rendered/${RELEASE_NAME}.yaml"
-          fi
+          helm template "$RELEASE_NAME" "$HELM_CHART_PATH" \
+            --namespace "$TARGET_NAMESPACE" \
+            --values "$VALUES_FILE" \
+            --set global.environment="$ENVIRONMENT" \
+            --set global.deploymentId="$DEPLOYMENT_ID" \
+            > "rendered/${RELEASE_NAME}.yaml"
 
           echo "Rendered manifest: rendered/${RELEASE_NAME}.yaml"
 
@@ -1487,7 +1053,7 @@ jobs:
             echo "OK: EFS StorageClass, source/target PVCs, and StatefulSet u02/u03 volumes all match the expected persistence configuration."
           fi
 
-      - name: Validate observer sidecar is rendered correctly
+      - name: Validate no observer sidecar is rendered
         shell: bash
         run: |
           set -euo pipefail
@@ -1621,116 +1187,27 @@ jobs:
           if init_names != ["prepare-u02-permissions"]:
               print(
                   "FAIL: expected exactly one init container named "
-                  "'prepare-u02-permissions', found: "
-                  f"{init_names}"
+                  f"'prepare-u02-permissions', found {init_names}."
               )
               sys.exit(1)
+          print("OK: exactly one init container, name='prepare-u02-permissions'.")
 
-          init_container = init_containers[0]
-
-          def _init_script_text(container):
-              # command/args entries are ordinarily strings, but tolerate a
-              # non-string entry (e.g. a Helm-rendered number) rather than
-              # crashing on it -- only string entries can ever contain the
-              # shell script text we are looking for.
-              parts = []
-              for item in list(container.get("command") or []) + list(container.get("args") or []):
-                  if isinstance(item, str):
-                      parts.append(item)
-              return "\n".join(parts)
-
-          init_script_text = _init_script_text(init_container)
-
-          if "ServiceManager.pid" not in init_script_text:
-              print(
-                  "FAIL: the prepare-u02-permissions init container does not reference "
-                  "ServiceManager.pid -- the stale GoldenGate Service Manager PID "
-                  "safeguard is missing."
-              )
-              sys.exit(1)
-
-          if 'rm -f -- "$SERVICE_MANAGER_PID_FILE"' not in init_script_text:
-              print(
-                  "FAIL: the prepare-u02-permissions init container does not contain "
-                  "the expected stale-PID removal command "
-                  '(rm -f -- "$SERVICE_MANAGER_PID_FILE").'
-              )
-              sys.exit(1)
-
-          print(
-              "OK: required prepare-u02-permissions init container and stale "
-              "ServiceManager.pid cleanup are present."
-          )
-
-          # --- Services: exactly one ClusterIP, one headless -----------------------
-          services = [d for d in documents if d.get("kind") == "Service"]
-          if len(services) != 2:
-              print(f"FAIL: expected exactly 2 Service documents (one ClusterIP, one headless), found {len(services)}.")
-              sys.exit(1)
-
-          service_types = [(s.get("spec") or {}).get("type") for s in services]
-          cluster_ips = [(s.get("spec") or {}).get("clusterIP") for s in services]
-          if "ClusterIP" not in service_types:
-              print(f"FAIL: expected ClusterIP Service not found. Types: {service_types}")
-              sys.exit(1)
-          if "None" not in cluster_ips:
-              print(f"FAIL: expected headless Service (clusterIP: None) not found. clusterIPs: {cluster_ips}")
-              sys.exit(1)
-          print("OK: exactly one ClusterIP Service and one headless Service.")
-
-          # --- Ingress: exactly one, with exactly one host, when enabled -----------
-          ingress_enabled = bool((values.get("ingress") or {}).get("enabled"))
-          ingresses = [d for d in documents if d.get("kind") == "Ingress"]
-          if ingress_enabled:
-              if len(ingresses) != 1:
-                  print(f"FAIL: expected exactly one rendered Ingress, found {len(ingresses)}.")
-                  sys.exit(1)
-              rules = (ingresses[0].get("spec") or {}).get("rules") or []
-              if len(rules) != 1:
-                  print(f"FAIL: expected exactly one Ingress host rule, found {len(rules)}.")
-                  sys.exit(1)
-              print("OK: exactly one Ingress with one host.")
-          else:
-              print("ingress.enabled is not true. Skipping Ingress checks.")
-
-          # --- runtime-qualified resource names + shared namespace -----------------
-          expected_names = {deployment_id, f"{deployment_id}-headless"}
-          found_names = {
-              (doc.get("metadata") or {}).get("name")
-              for doc in documents
-              if (doc.get("metadata") or {}).get("name") in expected_names
-          }
-          missing_names = expected_names - found_names
-          if missing_names:
-              print(f"FAIL: expected resource name(s) not found in the rendered manifest: {sorted(missing_names)}")
-              sys.exit(1)
-
-          spcs = [d for d in documents if d.get("kind") == "SecretProviderClass"]
-          for spc in spcs:
-              name = (spc.get("metadata") or {}).get("name", "")
-              if not name.startswith(f"{deployment_id}-"):
-                  print(f"FAIL: SecretProviderClass name {name!r} is not qualified by the runtime name {deployment_id!r}.")
-                  sys.exit(1)
-          if spcs:
-              print(f"OK: {len(spcs)} SecretProviderClass name(s) are runtime-qualified.")
-
-          namespaced_kinds = {
-              "StatefulSet", "Service", "PersistentVolumeClaim",
-              "SecretProviderClass", "ServiceAccount", "Ingress",
-          }
+          # --- namespaced resources reference the shared namespace -----------------
           namespace_found = False
           for doc in documents:
-              if doc.get("kind") not in namespaced_kinds:
-                  continue
-              ns = (doc.get("metadata") or {}).get("namespace")
-              if ns == target_namespace:
-                  namespace_found = True
-              elif ns is not None:
-                  print(
-                      f"FAIL: {doc.get('kind')} {(doc.get('metadata') or {}).get('name')} uses "
-                      f"unexpected namespace {ns!r}, expected {target_namespace!r}."
-                  )
+              if doc.get("kind") == "Namespace":
+                  print("FAIL: a Namespace document was rendered for a singleRuntime release.")
                   sys.exit(1)
+              metadata = doc.get("metadata") or {}
+              ns = metadata.get("namespace")
+              if ns is not None:
+                  namespace_found = True
+                  if ns != target_namespace:
+                      print(
+                          f"FAIL: {doc.get('kind')} {(doc.get('metadata') or {}).get('name')} uses "
+                          f"unexpected namespace {ns!r}, expected {target_namespace!r}."
+                      )
+                      sys.exit(1)
           if not namespace_found:
               print(f"FAIL: no namespaced resource references the expected shared namespace {target_namespace!r}.")
               sys.exit(1)
@@ -1741,18 +1218,18 @@ jobs:
 
             echo "SOURCE_ENABLED=false" >> "$GITHUB_ENV"
             echo "TARGET_ENABLED=false" >> "$GITHUB_ENV"
-            echo "OBSERVER_ENABLED=false" >> "$GITHUB_ENV"
             exit 0
           fi
 
-          SOURCE_PIPELINE="gg-${DEPLOYMENT_ID}-source"
-          TARGET_PIPELINE="gg-${DEPLOYMENT_ID}-target"
+          # deploymentModel=legacyPair (retired -- retained only for
+          # rollback/reference, never selected for automatic deployment; see
+          # envs/dev/payments-ora-to-pg-001/values.yaml). The chart no longer
+          # renders an observer container, image, port, env var, or
+          # goldengate.adcb/observer-enabled annotation for either
+          # deploymentModel, so this is a simple negative assertion rather
+          # than the previous observer-contract validation.
+          echo "deploymentModel=legacyPair: validating that no observer container or annotation is rendered (observer support has been retired)."
 
-          # The rendered manifest is authoritative: no Python/PyYAML is used
-          # here. A component's StatefulSet either rendered or it didn't
-          # (component disabled) -- derived directly from the manifest text,
-          # so this never silently no-ops when PyYAML happens to be missing
-          # on the runner.
           SOURCE_STS="$(awk '/^# Source: .*source-statefulset\.yaml$/{flag=1} flag{print} /^---$/{if(flag) exit}' "$RENDERED")"
           TARGET_STS="$(awk '/^# Source: .*target-statefulset\.yaml$/{flag=1} flag{print} /^---$/{if(flag) exit}' "$RENDERED")"
 
@@ -1766,290 +1243,35 @@ jobs:
           echo "TARGET_ENABLED=${TARGET_ENABLED}" >> "$GITHUB_ENV"
 
           if [ "$SOURCE_ENABLED" != "true" ] && [ "$TARGET_ENABLED" != "true" ]; then
-            echo "FAIL: neither source nor target is enabled for this deployment -- there is no rendered StatefulSet to carry the goldengate.adcb/observer-enabled annotation, so the effective observer expectation cannot be verified."
+            echo "FAIL: neither source nor target is enabled for this deployment -- there is no rendered StatefulSet to validate."
             exit 1
           fi
 
-          # OBSERVER_EXPECTED comes from the rendered goldengate.adcb/observer-enabled
-          # pod-template annotation (set directly from .Values.monitoring.observer.enabled
-          # in both source-statefulset.yaml and target-statefulset.yaml), NOT from
-          # whether an observer container happens to be present. This is what catches a
-          # chart defect that silently omits the sidecar despite the flag being true --
-          # the previous container-presence-only check would have reported
-          # OBSERVER_ENABLED=false and skipped validation in exactly that case.
-          extract_observer_annotation() {
-            grep -o 'goldengate\.adcb/observer-enabled: "[a-z]*"' | head -1 | sed -E 's/.*: "([a-z]*)"/\1/'
-          }
-
-          SOURCE_OBSERVER_ANNOTATION=""
-          [ "$SOURCE_ENABLED" = "true" ] && SOURCE_OBSERVER_ANNOTATION="$(echo "$SOURCE_STS" | extract_observer_annotation)"
-
-          TARGET_OBSERVER_ANNOTATION=""
-          [ "$TARGET_ENABLED" = "true" ] && TARGET_OBSERVER_ANNOTATION="$(echo "$TARGET_STS" | extract_observer_annotation)"
-
-          OBSERVER_EXPECTED=""
-          if [ -n "$SOURCE_OBSERVER_ANNOTATION" ]; then
-            OBSERVER_EXPECTED="$SOURCE_OBSERVER_ANNOTATION"
-          fi
-          if [ -n "$TARGET_OBSERVER_ANNOTATION" ]; then
-            if [ -n "$OBSERVER_EXPECTED" ] && [ "$OBSERVER_EXPECTED" != "$TARGET_OBSERVER_ANNOTATION" ]; then
-              echo "FAIL: inconsistent goldengate.adcb/observer-enabled annotation -- source=${SOURCE_OBSERVER_ANNOTATION}, target=${TARGET_OBSERVER_ANNOTATION}. Both derive from the same monitoring.observer.enabled value and must agree."
-              exit 1
-            fi
-            OBSERVER_EXPECTED="$TARGET_OBSERVER_ANNOTATION"
-          fi
-
-          if [ -z "$OBSERVER_EXPECTED" ]; then
-            echo "FAIL: could not find the goldengate.adcb/observer-enabled annotation on any rendered, enabled StatefulSet."
-            exit 1
-          fi
-
-          echo "OBSERVER_EXPECTED=${OBSERVER_EXPECTED}" >> "$GITHUB_ENV"
-          echo "Effective observer expectation (from rendered goldengate.adcb/observer-enabled annotation): ${OBSERVER_EXPECTED}"
-
-          # Actual observer-container presence is derived independently of
-          # OBSERVER_EXPECTED, by isolating just the goldengate-observer
-          # container's own YAML block: from its "- name: goldengate-observer"
-          # line up to (not including) the next sibling container
-          # ("        - name:") or the pod-level "volumes:" section -- both
-          # are 6/8-space-indented, so this never bleeds into the main
-          # container or the Pod's volumes: list (which legitimately
-          # references ogg-admin-csi/ogg-nginx-cert-csi for the main
-          # container and would otherwise cause false-positive matches).
-          extract_observer_block() {
-            awk '
-              capture && /^        - name:/ && $0 !~ /goldengate-observer/ { exit }
-              capture && /^      volumes:/ { exit }
-              /^        - name: goldengate-observer/ { capture=1 }
-              capture { print }
-            '
-          }
-
-          SOURCE_OBSERVER_BLOCK=""
-          SOURCE_OBSERVER_PRESENT="false"
-          if [ "$SOURCE_ENABLED" = "true" ]; then
-            SOURCE_OBSERVER_BLOCK="$(echo "$SOURCE_STS" | extract_observer_block)"
-            [ -n "$SOURCE_OBSERVER_BLOCK" ] && SOURCE_OBSERVER_PRESENT="true"
-          fi
-
-          TARGET_OBSERVER_BLOCK=""
-          TARGET_OBSERVER_PRESENT="false"
-          if [ "$TARGET_ENABLED" = "true" ]; then
-            TARGET_OBSERVER_BLOCK="$(echo "$TARGET_STS" | extract_observer_block)"
-            [ -n "$TARGET_OBSERVER_BLOCK" ] && TARGET_OBSERVER_PRESENT="true"
-          fi
-
-          echo "SOURCE_OBSERVER_ENABLED=${SOURCE_OBSERVER_PRESENT}" >> "$GITHUB_ENV"
-          echo "TARGET_OBSERVER_ENABLED=${TARGET_OBSERVER_PRESENT}" >> "$GITHUB_ENV"
-
-          echo "Source StatefulSet rendered: ${SOURCE_ENABLED} (observer container present: ${SOURCE_OBSERVER_PRESENT})"
-          echo "Target StatefulSet rendered: ${TARGET_ENABLED} (observer container present: ${TARGET_OBSERVER_PRESENT})"
-
-          # Downstream steps (e.g. runtime verification) key off OBSERVER_ENABLED
-          # as the effective expectation, not container presence.
-          echo "OBSERVER_ENABLED=${OBSERVER_EXPECTED}" >> "$GITHUB_ENV"
-
-          if [ "$OBSERVER_EXPECTED" = "false" ]; then
-            if [ "$SOURCE_OBSERVER_PRESENT" = "true" ] || [ "$TARGET_OBSERVER_PRESENT" = "true" ]; then
-              echo "FAIL: goldengate.adcb/observer-enabled=false, but a goldengate-observer container was rendered anyway."
-              exit 1
-            fi
-            echo "goldengate.adcb/observer-enabled=false and no observer container rendered anywhere, as expected. Skipping observer render checks and runtime verification."
-            exit 0
-          fi
-
-          echo "goldengate.adcb/observer-enabled=true. Validating rendered observer containers..."
-
-          if [ "$SOURCE_ENABLED" = "true" ] && [ "$SOURCE_OBSERVER_PRESENT" != "true" ]; then
-            echo "FAIL: source is enabled and goldengate.adcb/observer-enabled=true, but no goldengate-observer container was found in the rendered source StatefulSet."
-            exit 1
-          fi
-
-          if [ "$TARGET_ENABLED" = "true" ] && [ "$TARGET_OBSERVER_PRESENT" != "true" ]; then
-            echo "FAIL: target is enabled and goldengate.adcb/observer-enabled=true, but no goldengate-observer container was found in the rendered target StatefulSet."
-            exit 1
-          fi
-
-          # Main container names are configurable (source.containerName /
-          # target.containerName); derive them from the deployment values
-          # file with the same plain-text awk/grep technique already used
-          # above in this workflow (see the EFS persistence validation step)
-          # rather than assuming ogg-oracle/ogg-postgresql always apply.
-          SOURCE_VALUES_BLOCK="$(awk '/^source:/{flag=1} flag{print} /^[a-zA-Z]/{if(flag && !/^source:/) exit}' "$VALUES_FILE")"
-          TARGET_VALUES_BLOCK="$(awk '/^target:/{flag=1} flag{print} /^[a-zA-Z]/{if(flag && !/^target:/) exit}' "$VALUES_FILE")"
-
-          SOURCE_MAIN_CONTAINER="$(echo "$SOURCE_VALUES_BLOCK" | grep -E '^\s*containerName:' | head -1 | sed -E 's/^\s*containerName:\s*//' | tr -d '"'"'"'\r' | xargs)"
-          SOURCE_MAIN_CONTAINER="${SOURCE_MAIN_CONTAINER:-ogg-oracle}"
-
-          TARGET_MAIN_CONTAINER="$(echo "$TARGET_VALUES_BLOCK" | grep -E '^\s*containerName:' | head -1 | sed -E 's/^\s*containerName:\s*//' | tr -d '"'"'"'\r' | xargs)"
-          TARGET_MAIN_CONTAINER="${TARGET_MAIN_CONTAINER:-ogg-postgresql}"
-
-          echo "SOURCE_MAIN_CONTAINER=${SOURCE_MAIN_CONTAINER}" >> "$GITHUB_ENV"
-          echo "TARGET_MAIN_CONTAINER=${TARGET_MAIN_CONTAINER}" >> "$GITHUB_ENV"
-
-          # Extracts the "value:" belonging to a named "- name: <NAME>" env
-          # entry from an observer container block (piped/here-string'd in
-          # via stdin), normalizing surrounding YAML quotes/CR/whitespace.
-          # Matching on the env var NAME (anchored at end-of-line) avoids the
-          # false-positive risk of a generic `grep 'value: "target"'`, which
-          # could match an unrelated env value that happens to equal
-          # "target". Prints nothing (empty string) when the name isn't found.
-          extract_env_value() {
-            local name="$1"
-            awk -v n="$name" '$0 ~ ("name: " n "$") { getline; print; exit }' \
-              | sed -E 's/^[[:space:]]*value:[[:space:]]*//' \
-              | tr -d '"\r' \
-              | xargs
-          }
-
-          for LABEL in SOURCE TARGET; do
-            if [ "$LABEL" = "SOURCE" ]; then
-              ENABLED="$SOURCE_ENABLED"; STS="$SOURCE_STS"; OBSERVER_BLOCK="$SOURCE_OBSERVER_BLOCK"
-              COMPONENT="source"; PIPELINE="$SOURCE_PIPELINE"; MAIN_CONTAINER="$SOURCE_MAIN_CONTAINER"
-            else
-              ENABLED="$TARGET_ENABLED"; STS="$TARGET_STS"; OBSERVER_BLOCK="$TARGET_OBSERVER_BLOCK"
-              COMPONENT="target"; PIPELINE="$TARGET_PIPELINE"; MAIN_CONTAINER="$TARGET_MAIN_CONTAINER"
-            fi
+          for LABEL in source target; do
+            case "$LABEL" in
+              source) ENABLED="$SOURCE_ENABLED"; STS="$SOURCE_STS" ;;
+              target) ENABLED="$TARGET_ENABLED"; STS="$TARGET_STS" ;;
+            esac
 
             if [ "$ENABLED" != "true" ]; then
-              echo "${LABEL} is not enabled for this deployment (no StatefulSet rendered). Skipping observer checks for ${LABEL}."
+              echo "${LABEL} is not enabled for this deployment (no StatefulSet rendered). Skipping."
               continue
             fi
 
-            echo "Checking ${LABEL} StatefulSet observer container..."
-
-            OBSERVER_COUNT="$(echo "$STS" | grep -c "^        - name: goldengate-observer" || true)"
-            if [ "$OBSERVER_COUNT" -ne 1 ]; then
-              echo "FAIL: expected exactly one goldengate-observer container in the rendered ${LABEL} StatefulSet, found ${OBSERVER_COUNT}."
+            if echo "$STS" | grep -q "^        - name: goldengate-observer"; then
+              echo "FAIL: ${LABEL} StatefulSet unexpectedly renders a goldengate-observer container. Observer support has been retired and must never be rendered."
               exit 1
             fi
 
-            # --- observer image -------------------------------------------------
-            RENDERED_OBSERVER_IMAGE="$(
-              grep -E '^[[:space:]]*image:' <<< "$OBSERVER_BLOCK" |
-                head -1 |
-                sed -E 's/^[[:space:]]*image:[[:space:]]*//' |
-                tr -d '"\r' |
-                xargs
-            )"
-
-            if [ -z "$RENDERED_OBSERVER_IMAGE" ]; then
-              echo "FAIL: ${LABEL} goldengate-observer container has no rendered image."
+            if echo "$STS" | grep -q "goldengate\.adcb/observer-enabled"; then
+              echo "FAIL: ${LABEL} StatefulSet unexpectedly renders a goldengate.adcb/observer-enabled annotation. Observer support has been retired."
               exit 1
             fi
 
-            if [ "$RENDERED_OBSERVER_IMAGE" != "$OBSERVER_IMAGE_URI" ]; then
-              echo "FAIL: ${LABEL} observer image mismatch."
-              echo "Expected image: ${OBSERVER_IMAGE_URI}"
-              echo "Rendered image: ${RENDERED_OBSERVER_IMAGE}"
-              exit 1
-            fi
-            echo "OK: ${LABEL} observer image validated."
-
-            # --- COMPONENT env value ---------------------------------------------
-            RENDERED_COMPONENT="$(extract_env_value "COMPONENT" <<< "$OBSERVER_BLOCK")"
-            if [ -z "$RENDERED_COMPONENT" ]; then
-              echo "FAIL: ${LABEL} goldengate-observer container has no rendered COMPONENT environment value."
-              exit 1
-            fi
-            if [ "$RENDERED_COMPONENT" != "$COMPONENT" ]; then
-              echo "FAIL: ${LABEL} observer COMPONENT mismatch."
-              echo "Expected COMPONENT: ${COMPONENT}"
-              echo "Rendered COMPONENT: ${RENDERED_COMPONENT}"
-              exit 1
-            fi
-            echo "OK: ${LABEL} observer COMPONENT validated."
-
-            # --- PIPELINE env value -----------------------------------------------
-            RENDERED_PIPELINE="$(extract_env_value "PIPELINE" <<< "$OBSERVER_BLOCK")"
-            if [ -z "$RENDERED_PIPELINE" ]; then
-              echo "FAIL: ${LABEL} goldengate-observer container has no rendered PIPELINE environment value."
-              exit 1
-            fi
-            if [ "$RENDERED_PIPELINE" != "$PIPELINE" ]; then
-              echo "FAIL: ${LABEL} observer PIPELINE mismatch."
-              echo "Expected PIPELINE: ${PIPELINE}"
-              echo "Rendered PIPELINE: ${RENDERED_PIPELINE}"
-              exit 1
-            fi
-            echo "OK: ${LABEL} observer PIPELINE validated."
-
-            # --- u02 mount: path + readOnly ---------------------------------------
-            # Compare the volume mount against the configured U02_PATH taken
-            # from the container's own rendered env (not a hardcoded /u02),
-            # so this check still means something if u02Path is overridden.
-            CONFIGURED_U02_PATH="$(extract_env_value "U02_PATH" <<< "$OBSERVER_BLOCK")"
-            if [ -z "$CONFIGURED_U02_PATH" ]; then
-              echo "FAIL: could not determine U02_PATH from the rendered ${LABEL} goldengate-observer container env."
-              exit 1
-            fi
-
-            # Compare normalized values rather than a literal grep: the
-            # rendered mountPath is quoted (_observer.tpl uses
-            # {{ $observer.u02Path | quote }}, e.g. mountPath: "/u02"), while
-            # CONFIGURED_U02_PATH above is already unquoted (e.g. /u02) -- a
-            # literal `grep -q "mountPath: ${CONFIGURED_U02_PATH}"` can never
-            # match the quoted rendered line and always fails here.
-            U02_MOUNT_BLOCK="$(
-              grep -A2 "name: u02" <<< "$OBSERVER_BLOCK" |
-                head -3
-            )"
-
-            RENDERED_U02_MOUNT_PATH="$(
-              grep -E '^[[:space:]]*mountPath:' <<< "$U02_MOUNT_BLOCK" |
-                head -1 |
-                sed -E 's/^[[:space:]]*mountPath:[[:space:]]*//' |
-                tr -d '"\r' |
-                xargs
-            )"
-
-            if [ -z "$RENDERED_U02_MOUNT_PATH" ]; then
-              echo "FAIL: could not find the u02 mountPath in the rendered ${LABEL} observer container."
-              exit 1
-            fi
-
-            if [ "$RENDERED_U02_MOUNT_PATH" != "$CONFIGURED_U02_PATH" ]; then
-              echo "FAIL: ${LABEL} observer u02 mountPath mismatch."
-              echo "Expected from U02_PATH: ${CONFIGURED_U02_PATH}"
-              echo "Rendered mountPath:     ${RENDERED_U02_MOUNT_PATH}"
-              exit 1
-            fi
-
-            if ! grep -Fq -- "readOnly: true" <<< "$U02_MOUNT_BLOCK"; then
-              echo "FAIL: ${LABEL} observer u02 volumeMount is not readOnly=true."
-              exit 1
-            fi
-            echo "OK: ${LABEL} observer u02 mount validated (u02Path=${CONFIGURED_U02_PATH})."
-
-            # --- liveness probe ----------------------------------------------------
-            if ! grep -Fq -- "path: /healthz" <<< "$OBSERVER_BLOCK"; then
-              echo "FAIL: ${LABEL} observer liveness probe does not use /healthz."
-              exit 1
-            fi
-            echo "OK: ${LABEL} observer liveness probe validated."
-
-            if grep -Fq -- "readinessProbe:" <<< "$OBSERVER_BLOCK"; then
-              echo "FAIL: unexpected readinessProbe found on the ${LABEL} goldengate-observer container."
-              exit 1
-            fi
-
-            if grep -Eq -- 'ogg-admin-csi|ogg-nginx-cert-csi|secretKeyRef|envFrom' <<< "$OBSERVER_BLOCK"; then
-              echo "FAIL: unexpected secret/CSI mount found on the ${LABEL} goldengate-observer container."
-              exit 1
-            fi
-
-            # --- main GoldenGate container -----------------------------------------
-            if ! grep -Fq -- "- name: ${MAIN_CONTAINER}" <<< "$STS"; then
-              echo "FAIL: ${LABEL} StatefulSet does not contain the expected main container."
-              echo "Expected main container: ${MAIN_CONTAINER}"
-              exit 1
-            fi
-            echo "OK: ${LABEL} main container validated."
-
-            echo "OK: ${LABEL} goldengate-observer container fully validated (u02Path=${CONFIGURED_U02_PATH})."
+            echo "OK: ${LABEL} StatefulSet renders no observer container or annotation."
           done
 
-          echo "OK: goldengate-observer render validation passed for all enabled components."
+          echo "OK: no observer container or annotation rendered for any enabled component."
 
       - name: Package deployment-specific Helm chart
         shell: bash
@@ -2330,10 +1552,6 @@ jobs:
                     value: ${ENVIRONMENT}
                   - name: global.deploymentId
                     value: ${DEPLOYMENT_ID}
-                  - name: monitoring.observer.image.repository
-                    value: ${OBSERVER_IMAGE_REPOSITORY}
-                  - name: monitoring.observer.image.tag
-                    value: ${OBSERVER_IMAGE_TAG}
             destination:
               server: https://kubernetes.default.svc
               namespace: ${TARGET_NAMESPACE}
@@ -2454,289 +1672,6 @@ jobs:
           echo "PVC details:"
           kubectl describe pvc -n "$TARGET_NAMESPACE" || true
 
-      - name: Verify GoldenGate observer runtime state
-        if: ${{ matrix.deploy }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "SOURCE_OBSERVER_STATUS=not_run" >> "$GITHUB_ENV"
-          echo "TARGET_OBSERVER_STATUS=not_run" >> "$GITHUB_ENV"
-          echo "DYNAMODB_VERIFICATION_STATUS=not_run" >> "$GITHUB_ENV"
-          echo "CLOUDWATCH_VERIFICATION_STATUS=not_run" >> "$GITHUB_ENV"
-
-          if [ "$DEPLOYMENT_MODEL" = "singleRuntime" ]; then
-            # Deliberately isolated from the legacy source/target
-            # goldengate-observer runtime verification below -- singleRuntime
-            # releases never render an observer container (see "Validate
-            # observer sidecar is rendered correctly" above, which already
-            # sets OBSERVER_ENABLED=false for this model). This branch exists
-            # so a future singleRuntime-specific runtime verification (shared
-            # gg-monitor REST/PMS polling, per the approved architecture) has
-            # a clearly separate place to live, without being tangled into or
-            # gated by the legacy observer's env vars/logic.
-            echo "deploymentModel=singleRuntime: no per-pod observer runtime verification applies. Shared runtime verification is a later phase (shared gg-monitor)."
-            echo "SOURCE_OBSERVER_STATUS=skipped_single_runtime" >> "$GITHUB_ENV"
-            echo "TARGET_OBSERVER_STATUS=skipped_single_runtime" >> "$GITHUB_ENV"
-            echo "DYNAMODB_VERIFICATION_STATUS=skipped_single_runtime" >> "$GITHUB_ENV"
-            echo "CLOUDWATCH_VERIFICATION_STATUS=skipped_single_runtime" >> "$GITHUB_ENV"
-            exit 0
-          fi
-
-          if [ "${OBSERVER_ENABLED:-false}" != "true" ]; then
-            echo "goldengate-observer is not enabled for this deployment. Skipping observer runtime verification."
-            echo "SOURCE_OBSERVER_STATUS=skipped" >> "$GITHUB_ENV"
-            echo "TARGET_OBSERVER_STATUS=skipped" >> "$GITHUB_ENV"
-            echo "DYNAMODB_VERIFICATION_STATUS=skipped" >> "$GITHUB_ENV"
-            echo "CLOUDWATCH_VERIFICATION_STATUS=skipped" >> "$GITHUB_ENV"
-            exit 0
-          fi
-
-          if [ "${SOURCE_ENABLED:-false}" != "true" ] && [ "${TARGET_ENABLED:-false}" != "true" ]; then
-            echo "FAIL: observer runtime verification was requested (OBSERVER_ENABLED=true) but neither source nor target is enabled for this deployment -- nothing to verify."
-            exit 1
-          fi
-
-          # Bounded waits only -- this step never blocks indefinitely, and it
-          # never fails merely because the observed GoldenGate status is
-          # DEGRADED or DOWN. It only fails when the observer container
-          # itself cannot start/keeps crashing, or cannot get at least one
-          # successful DynamoDB write / CloudWatch publish within the window.
-          POLL_INTERVAL_SECONDS=15
-          MAX_WAIT_SECONDS=180
-
-          wait_for_pod() {
-            local component="$1"
-            local elapsed=0
-            local pod=""
-            while [ -z "$pod" ] && [ "$elapsed" -lt "$MAX_WAIT_SECONDS" ]; do
-              pod="$(kubectl get pods -n "$TARGET_NAMESPACE" \
-                -l "app.kubernetes.io/instance=${RELEASE_NAME},app.kubernetes.io/component=${component}" \
-                -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-              if [ -z "$pod" ]; then
-                sleep "$POLL_INTERVAL_SECONDS"
-                elapsed=$((elapsed + POLL_INTERVAL_SECONDS))
-              fi
-            done
-            echo "$pod"
-          }
-
-          verify_component() {
-            local component="$1"
-            local main_container="$2"
-            local expected_pipeline="gg-${DEPLOYMENT_ID}-${component}"
-
-            echo "=== Verifying ${component} observer (pipeline=${expected_pipeline}) ==="
-
-            local pod
-            pod="$(wait_for_pod "$component")"
-
-            if [ -z "$pod" ]; then
-              echo "FAIL: no ${component} pod found in ${TARGET_NAMESPACE} within ${MAX_WAIT_SECONDS}s."
-              exit 1
-            fi
-
-            echo "Pod: ${pod}"
-
-            local main_state
-            main_state="$(kubectl get pod "$pod" -n "$TARGET_NAMESPACE" \
-              -o jsonpath="{.status.containerStatuses[?(@.name=='${main_container}')].state.running}")"
-            if [ -z "$main_state" ]; then
-              echo "FAIL: main container ${main_container} is not Running in pod ${pod}."
-              exit 1
-            fi
-            echo "Main container (${main_container}): Running."
-
-            local observer_state
-            observer_state="$(kubectl get pod "$pod" -n "$TARGET_NAMESPACE" \
-              -o jsonpath="{.status.containerStatuses[?(@.name=='goldengate-observer')].state.running}")"
-            if [ -z "$observer_state" ]; then
-              echo "FAIL: goldengate-observer container is not Running in pod ${pod}. It cannot have started successfully."
-              exit 1
-            fi
-            echo "Observer container: Running."
-
-            local observer_image
-            observer_image="$(kubectl get pod "$pod" -n "$TARGET_NAMESPACE" \
-              -o jsonpath="{.spec.containers[?(@.name=='goldengate-observer')].image}")"
-            if [ "$observer_image" != "$OBSERVER_IMAGE_URI" ]; then
-              echo "FAIL: goldengate-observer container in pod ${pod} is running image \"${observer_image}\", expected \"${OBSERVER_IMAGE_URI}\"."
-              exit 1
-            fi
-            echo "Observer image matches expected: ${observer_image}"
-
-            local restarts_before restarts_after
-            restarts_before="$(kubectl get pod "$pod" -n "$TARGET_NAMESPACE" \
-              -o jsonpath="{.status.containerStatuses[?(@.name=='goldengate-observer')].restartCount}")"
-            sleep "$POLL_INTERVAL_SECONDS"
-            restarts_after="$(kubectl get pod "$pod" -n "$TARGET_NAMESPACE" \
-              -o jsonpath="{.status.containerStatuses[?(@.name=='goldengate-observer')].restartCount}")"
-
-            echo "Observer restart count: ${restarts_before} -> ${restarts_after} (over ${POLL_INTERVAL_SECONDS}s)."
-            if [ "${restarts_after:-0}" -gt "${restarts_before:-0}" ]; then
-              echo "FAIL: goldengate-observer restart count increased during verification (continuously crashing)."
-              exit 1
-            fi
-
-            echo "Checking /healthz inside the observer container (using its own HEALTH_LISTEN_PORT, 8080 as fallback default only)..."
-            if ! kubectl exec "$pod" -n "$TARGET_NAMESPACE" -c goldengate-observer -- \
-              python3 -c "
-          import os
-          import sys
-          import urllib.request
-
-          port = os.environ.get('HEALTH_LISTEN_PORT', '8080')
-          url = 'http://127.0.0.1:%s/healthz' % port
-          sys.exit(0 if urllib.request.urlopen(url, timeout=3).status == 200 else 1)
-          "; then
-              echo "FAIL: goldengate-observer /healthz did not respond with HTTP 200 inside pod ${pod}."
-              exit 1
-            fi
-            echo "OK: /healthz responded with HTTP 200."
-
-            echo "Waiting (bounded) for observer log events..."
-            local elapsed=0
-            local logs=""
-            local have_started=false
-            local have_completed=false
-            local have_dynamo=false
-            local have_cw=false
-
-            while [ "$elapsed" -lt "$MAX_WAIT_SECONDS" ]; do
-              logs="$(kubectl logs "$pod" -n "$TARGET_NAMESPACE" -c goldengate-observer --since=10m 2>/dev/null || true)"
-
-              echo "$logs" | grep -q '"event": "observer_started"' && have_started=true || true
-              echo "$logs" | grep -q '"event": "observation_completed"' && have_completed=true || true
-              echo "$logs" | grep -q '"event": "dynamodb_update_succeeded"' && have_dynamo=true || true
-              echo "$logs" | grep -q '"event": "cloudwatch_publish_succeeded"' && have_cw=true || true
-
-              # observer_started is informational only (see below) and is
-              # deliberately not part of this break condition -- an existing,
-              # already-healthy pod that this deployment didn't restart has
-              # no reason to log it again inside the --since=10m window, and
-              # that must never make this loop wait out the full timeout.
-              if [ "$have_completed" = "true" ] && [ "$have_dynamo" = "true" ] && [ "$have_cw" = "true" ]; then
-                break
-              fi
-
-              sleep "$POLL_INTERVAL_SECONDS"
-              elapsed=$((elapsed + POLL_INTERVAL_SECONDS))
-            done
-
-            # Informational evidence only: observer_started only logs once,
-            # at process start. A pod that was already Running and healthy
-            # before this workflow run (no pod-template diff, no restart)
-            # legitimately never re-logs it inside the recent window --
-            # that alone must not fail runtime verification.
-            if [ "$have_started" = "true" ]; then
-              echo "INFO: observer_started seen in the recent log window (informational only)."
-            else
-              echo "INFO: observer_started not seen in the recent log window -- expected for an existing pod this run did not restart. Not treated as a failure."
-            fi
-            echo "observation_completed seen: ${have_completed}"
-            echo "dynamodb_update_succeeded seen: ${have_dynamo}"
-            echo "cloudwatch_publish_succeeded seen: ${have_cw}"
-
-            if [ "$have_completed" != "true" ]; then
-              echo "FAIL: observation_completed never logged within ${MAX_WAIT_SECONDS}s (the observation loop never finished a cycle)."
-              exit 1
-            fi
-
-            if [ "$have_dynamo" != "true" ]; then
-              echo "FAIL: dynamodb_update_succeeded never logged within ${MAX_WAIT_SECONDS}s (observer cannot write DynamoDB state)."
-              exit 1
-            fi
-
-            if [ "$have_cw" != "true" ]; then
-              echo "FAIL: cloudwatch_publish_succeeded never logged within ${MAX_WAIT_SECONDS}s (observer cannot publish CloudWatch metrics)."
-              exit 1
-            fi
-
-            if echo "$logs" | grep -qi "AccessDeniedException"; then
-              echo "FAIL: AccessDeniedException found in observer logs for pod ${pod}."
-              exit 1
-            fi
-
-            echo "Verifying the DynamoDB record via the observer's own IRSA identity (GetItem only, no Scan)..."
-            local ddb_check
-            ddb_check="$(kubectl exec "$pod" -n "$TARGET_NAMESPACE" -c goldengate-observer -- python3 -c "
-          import os
-          import time
-          import boto3
-
-          table = boto3.resource('dynamodb', region_name=os.environ['AWS_REGION']).Table(os.environ['DYNAMODB_TABLE'])
-          resp = table.get_item(Key={'pipeline': os.environ['PIPELINE'], 'recordType': 'STATE#_deployment'})
-          item = resp.get('Item')
-          if not item:
-              print('MISSING_ITEM')
-              raise SystemExit(0)
-
-          component_ok = item.get('component') == os.environ['COMPONENT']
-          deployment_ok = item.get('deploymentId') == os.environ['DEPLOYMENT_ID']
-          recorded_at = item.get('recordedAt')
-          recent_ok = bool(recorded_at) and (time.time() - float(recorded_at)) < 900
-          status_ok = item.get('status') in ('HEALTHY', 'DEGRADED', 'DOWN')
-          no_ttl = 'ttl' not in item
-          no_secret_fields = not any(k.lower() in ('password', 'secret', 'credential', 'token') for k in item.keys())
-
-          print('component_ok=%s' % component_ok)
-          print('deployment_ok=%s' % deployment_ok)
-          print('recent_ok=%s' % recent_ok)
-          print('status_ok=%s' % status_ok)
-          print('no_ttl=%s' % no_ttl)
-          print('no_secret_fields=%s' % no_secret_fields)
-          print('status=%s' % item.get('status'))
-          " 2>&1)"
-
-            echo "$ddb_check"
-
-            if echo "$ddb_check" | grep -q "MISSING_ITEM"; then
-              echo "FAIL: expected DynamoDB record (pipeline=${expected_pipeline}) does not exist."
-              exit 1
-            fi
-
-            if echo "$ddb_check" | grep -qE "component_ok=False|deployment_ok=False|recent_ok=False|status_ok=False|no_ttl=False|no_secret_fields=False"; then
-              echo "FAIL: DynamoDB record for ${expected_pipeline} failed one or more verification checks above."
-              exit 1
-            fi
-
-            echo "OK: ${component} observer verified (DynamoDB record present and CloudWatch publish succeeded)."
-          }
-
-          if [ "${SOURCE_ENABLED:-false}" = "true" ]; then
-            verify_component "source" "${SOURCE_MAIN_CONTAINER:-ogg-oracle}"
-            echo "SOURCE_OBSERVER_STATUS=passed" >> "$GITHUB_ENV"
-          else
-            echo "Source is not enabled for this deployment. Not waiting for a source pod."
-            echo "SOURCE_OBSERVER_STATUS=skipped_disabled" >> "$GITHUB_ENV"
-          fi
-
-          if [ "${TARGET_ENABLED:-false}" = "true" ]; then
-            verify_component "target" "${TARGET_MAIN_CONTAINER:-ogg-postgresql}"
-            echo "TARGET_OBSERVER_STATUS=passed" >> "$GITHUB_ENV"
-          else
-            echo "Target is not enabled for this deployment. Not waiting for a target pod."
-            echo "TARGET_OBSERVER_STATUS=skipped_disabled" >> "$GITHUB_ENV"
-          fi
-
-          # Reached only if every enabled component's verify_component call
-          # above succeeded (verify_component exits 1 immediately on any
-          # failure, which stops this script before these lines run).
-          echo "DYNAMODB_VERIFICATION_STATUS=passed" >> "$GITHUB_ENV"
-          echo "CLOUDWATCH_VERIFICATION_STATUS=passed" >> "$GITHUB_ENV"
-
-          echo ""
-          echo "OK: all enabled GoldenGate observers passed runtime verification."
-          echo ""
-          echo "Independent CloudWatch console verification (requires a read-capable identity;"
-          echo "the observer role intentionally has PutMetricData only, not CloudWatch read):"
-          echo "  aws cloudwatch list-metrics --namespace GoldenGate/Pipelines --region ${AWS_REGION}"
-          echo "  aws cloudwatch get-metric-statistics --namespace GoldenGate/Pipelines \\"
-          echo "    --metric-name DeploymentHealthy --start-time \$(date -u -d '-1 hour' +%Y-%m-%dT%H:%M:%SZ) \\"
-          echo "    --end-time \$(date -u +%Y-%m-%dT%H:%M:%SZ) --period 300 --statistics Maximum \\"
-          echo "    --dimensions Name=Pipeline,Value=gg-${DEPLOYMENT_ID}-source Name=Component,Value=source Name=Engine,Value=oracle \\"
-          echo "    --region ${AWS_REGION}"
-
       - name: Upload rendered manifests and chart package
         if: always()
         uses: actions/upload-artifact@v4
@@ -2780,25 +1715,14 @@ jobs:
             echo "- Chart version: \`${CHART_VERSION}\`"
             echo "- ECR OCI repo: \`${HELM_ECR_REPOSITORY}\`"
             echo ""
-            echo "### GoldenGate observer"
-            echo ""
-            echo "- Observer changed this trigger: \`${{ needs.detect_changed_deployments.outputs.observer_changed }}\`"
-            echo "- Observer tree SHA (monitoring/observer): \`${{ needs.detect_changed_deployments.outputs.observer_tree_sha }}\`"
-            echo "- Observer image tag: \`${OBSERVER_IMAGE_TAG}\`"
-            echo "- Observer image URI: \`${OBSERVER_IMAGE_URI}\`"
-            echo "- Observer image digest: \`${{ needs.ensure_observer_image.outputs.image_digest }}\`"
-            echo "- Image already existed in ECR (reused, not rebuilt): \`${{ needs.ensure_observer_image.outputs.image_existed }}\`"
             echo "- Selected deployments this run: \`${{ needs.detect_changed_deployments.outputs.deployment_matrix }}\`"
-            echo "- Source observer verification: \`${SOURCE_OBSERVER_STATUS}\`"
-            echo "- Target observer verification: \`${TARGET_OBSERVER_STATUS}\`"
-            echo "- DynamoDB record verification: \`${DYNAMODB_VERIFICATION_STATUS}\`"
-            echo "- CloudWatch PutMetricData verification: \`${CLOUDWATCH_VERIFICATION_STATUS}\` (based on observer log evidence only -- the observer role has no CloudWatch read permission)"
             echo ""
-            echo "The observer image is built at most once per workflow run, in the"
-            echo "\`ensure_observer_image\` job, outside this deployment matrix. A Helm-only or"
-            echo "deployment-values-only change reuses the existing content-addressed image."
-            echo "Observer failures never trigger GoldenGate process control -- the observer is"
-            echo "strictly passive and fail-open."
+            echo "Observer sidecar support has been retired (Phase 5A). No observer image is"
+            echo "built, and no goldengate-observer container is rendered for any deployment"
+            echo "model. Shared GoldenGate monitoring is performed by the shared gg-monitor"
+            echo "Deployment (goldengate-monitoring namespace) polling Admin REST/PMS and"
+            echo "publishing manager-compatible CloudWatch metrics under the GoldenGate/Pipelines"
+            echo "namespace."
             echo ""
             echo "Independent CloudWatch verification (read-capable identity required):"
             echo ""
@@ -2827,11 +1751,14 @@ jobs:
             echo "role pull access on every run, but is not the long-term source of Argo CD's"
             echo "ECR credentials."
             echo ""
-            echo "A deployment can be removed either by deleting its folder/values.yaml or by"
-            echo "making values.yaml inactive using comment-only/empty content or an explicit"
-            echo "disable flag. Inactive values files are treated as deployment removals. A"
-            echo "values.yaml is inactive when it is missing, empty/comment-only, enabled=false,"
-            echo "deployment.enabled=false, or lifecycle.state=absent."
+            echo "A values.yaml is inactive (excluded from the build/update matrix) when it is"
+            echo "missing, empty/comment-only, enabled=false, deployment.enabled=false, or"
+            echo "lifecycle.state=absent. Of those, only a genuinely removed/missing file or an"
+            echo "explicit lifecycle.state=absent is treated as a deletion request (deletes the"
+            echo "Argo CD Application and, if safely identifiable, its namespace)."
+            echo "deployment.enabled=false (and top-level enabled=false) mark a deployment as"
+            echo "retired-but-retained for rollback/reference and never trigger deletion -- see"
+            echo "envs/dev/payments-ora-to-pg-001/values.yaml."
             echo ""
             echo "### Validation commands"
             echo ""
