@@ -5,8 +5,14 @@ global:
 # Phase 5A: this is the retired legacy source+target combined
 # (deploymentModel=legacyPair) model, superseded by the two canonical
 # single-runtime deployments (envs/dev/gg-oracle-payments-01/,
-# envs/dev/gg-postgresql-payments-01/). It is retained here temporarily,
-# unmodified, only as a migration/rollback reference -- it is not deleted.
+# envs/dev/gg-postgresql-payments-01/). It is retained here, inactive and
+# non-destructive, only as a migration/reference artifact -- it is not
+# deleted. It is NOT an immediately deployable bit-for-bit rollback package:
+# Phase 5A also removed this file's now-unsupported monitoring.observer
+# values (observer support was retired repository-wide, including for this
+# folder). A true historical rollback source, including the pre-Phase-5A
+# observer configuration, remains available through Git history if ever
+# needed.
 #
 # deployment.enabled=false below marks this folder inactive: the
 # goldengate-eks-app.yaml workflow's is_active_deployment_values_file() check

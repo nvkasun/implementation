@@ -217,6 +217,111 @@ jobs:
             return 0
           }
 
+          # Returns 0 (is a GoldenGate runtime deployment values file) or 1
+          # (is not) on stdout as a one-line reason, for a given
+          # envs/dev/<id>/values.yaml path. Classification is based solely
+          # on content -- never on directory name, and never on
+          # deployment.enabled/lifecycle.state (that is a separate,
+          # orthogonal active/inactive concern handled by
+          # is_active_deployment_values_file above). A file only qualifies
+          # as a GoldenGate deployment when it is a non-empty, valid YAML
+          # mapping whose top-level deploymentModel is exactly "singleRuntime"
+          # or "legacyPair". This is what keeps unrelated envs/dev/<x>/
+          # values files (e.g. the separate goldengate-monitor chart's own
+          # values, or Argo CD's own values) out of every GoldenGate
+          # workflow matrix, without hardcoding their folder names.
+          is_goldengate_deployment_values_file() {
+            local values_file="$1"
+
+            if [ ! -f "$values_file" ]; then
+              echo "missing values.yaml"
+              return 1
+            fi
+
+            if [ ! -s "$values_file" ]; then
+              echo "empty values.yaml"
+              return 1
+            fi
+
+            if command -v python3 >/dev/null 2>&1; then
+              python3 - "$values_file" <<'PYEOF'
+          import re
+          import sys
+
+          path = sys.argv[1]
+
+          with open(path, "r") as f:
+              raw = f.read()
+
+          non_comment_lines = [
+              line for line in raw.splitlines()
+              if line.strip() and not line.strip().startswith("#")
+          ]
+          if not non_comment_lines:
+              print("empty/comment-only values.yaml")
+              sys.exit(1)
+
+          ALLOWED_MODELS = ("singleRuntime", "legacyPair")
+
+          try:
+              import yaml
+          except ImportError:
+              # Conservative fallback without PyYAML: only recognizes a
+              # top-level deploymentModel: <literal> line, not arbitrary
+              # YAML nesting/quoting.
+              m = re.search(r'(?m)^deploymentModel\s*:\s*(\S+)\s*$', raw)
+              model = m.group(1).strip("\"'") if m else None
+              if model in ALLOWED_MODELS:
+                  print(f"deploymentModel={model} (text fallback, PyYAML unavailable)")
+                  sys.exit(0)
+              print(f"not a GoldenGate deployment values file: deploymentModel={model!r} (text fallback, PyYAML unavailable)")
+              sys.exit(1)
+
+          try:
+              data = yaml.safe_load(raw)
+          except yaml.YAMLError as exc:
+              print(f"unparsable YAML: {exc}")
+              sys.exit(1)
+
+          if not data:
+              print("empty/null parsed YAML")
+              sys.exit(1)
+
+          if not isinstance(data, dict):
+              print("parsed YAML is not a mapping")
+              sys.exit(1)
+
+          model = data.get("deploymentModel")
+          if model in ALLOWED_MODELS:
+              print(f"deploymentModel={model}")
+              sys.exit(0)
+
+          print(f"not a GoldenGate deployment values file: deploymentModel={model!r}")
+          sys.exit(1)
+          PYEOF
+              return $?
+            fi
+
+            echo "python3 not available on this runner, using conservative bash fallback"
+
+            local non_comment
+            non_comment="$(grep -vE '^[[:space:]]*(#.*)?$' "$values_file" || true)"
+            if [ -z "$non_comment" ]; then
+              echo "empty/comment-only values.yaml (bash fallback)"
+              return 1
+            fi
+
+            local model
+            model="$(grep -E '^deploymentModel:' "$values_file" | head -1 | sed -E 's/^deploymentModel:[[:space:]]*//' | tr -d '"'"'"'\r' | xargs || true)"
+            if [ "$model" = "singleRuntime" ] || [ "$model" = "legacyPair" ]; then
+              echo "deploymentModel=${model} (bash fallback)"
+              return 0
+            fi
+
+            echo "not a GoldenGate deployment values file: deploymentModel=${model:-<missing>} (bash fallback)"
+            return 1
+          }
+
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             ENVIRONMENT="${{ inputs.environment }}"
             DEPLOYMENT_ID="${{ inputs.deployment_id }}"
@@ -225,6 +330,22 @@ jobs:
 
             echo "Manual workflow_dispatch trigger for deployment_id=${DEPLOYMENT_ID}, environment=${ENVIRONMENT}."
             echo "Validating deployment values file: ${VALUES_FILE}"
+
+            # Fail closed: a manually requested deployment_id must resolve to
+            # an actual GoldenGate runtime deployment values file (never a
+            # different chart's values under envs/dev/, e.g. the shared
+            # monitor's or Argo CD's own values file).
+            set +e
+            GG_REASON="$(is_goldengate_deployment_values_file "$VALUES_FILE")"
+            GG_STATUS=$?
+            set -e
+
+            if [ "$GG_STATUS" -ne 0 ]; then
+              echo "Deployment values file check failed: ${GG_REASON}"
+              echo ""
+              echo "${VALUES_FILE} is not a GoldenGate runtime deployment values file (deploymentModel must be exactly singleRuntime or legacyPair). Refusing to build a matrix for it."
+              exit 1
+            fi
 
             set +e
             REASON="$(is_active_deployment_values_file "$VALUES_FILE")"
@@ -308,6 +429,23 @@ jobs:
 
           for DEPLOYMENT_ID in $DEPLOYMENT_CANDIDATE_IDS; do
             VALUES_FILE="envs/dev/${DEPLOYMENT_ID}/values.yaml"
+
+            # Applies to both shared-chart-change candidates (every
+            # envs/dev/<id>/values.yaml) and per-folder push candidates:
+            # only a values file whose own deploymentModel is singleRuntime
+            # or legacyPair is ever eligible for the GoldenGate matrix --
+            # never inferred from folder name, so a different chart's
+            # values file under envs/dev/ (e.g. the shared monitor's or
+            # Argo CD's own) is excluded here regardless of trigger reason.
+            set +e
+            GG_REASON="$(is_goldengate_deployment_values_file "$VALUES_FILE")"
+            GG_STATUS=$?
+            set -e
+
+            if [ "$GG_STATUS" -ne 0 ]; then
+              echo "Not a GoldenGate deployment: ${DEPLOYMENT_ID} (${GG_REASON}) -- excluded from every GoldenGate matrix."
+              continue
+            fi
 
             set +e
             REASON="$(is_active_deployment_values_file "$VALUES_FILE")"
@@ -418,6 +556,26 @@ jobs:
 
           for CANDIDATE_ID in $DELETION_CANDIDATE_IDS; do
             VALUES_FILE="envs/dev/${CANDIDATE_ID}/values.yaml"
+
+            # If the values file still exists (was modified, not removed),
+            # it must classify as a GoldenGate deployment before any
+            # deletion evaluation applies to it -- otherwise a different
+            # chart's values file under envs/dev/ could be misread as a
+            # GoldenGate deployment deletion candidate merely because it
+            # changed in this push. A genuinely removed file (no longer
+            # present) still falls through to the existing base-revision
+            # resolution below unchanged.
+            if [ -f "$VALUES_FILE" ]; then
+              set +e
+              GG_REASON="$(is_goldengate_deployment_values_file "$VALUES_FILE")"
+              GG_STATUS=$?
+              set -e
+
+              if [ "$GG_STATUS" -ne 0 ]; then
+                echo "Not a GoldenGate deployment: ${CANDIDATE_ID} (${GG_REASON}) -- ignoring for deletion evaluation."
+                continue
+              fi
+            fi
 
             set +e
             REASON="$(is_active_deployment_values_file "$VALUES_FILE")"
@@ -1190,7 +1348,94 @@ jobs:
                   f"'prepare-u02-permissions', found {init_names}."
               )
               sys.exit(1)
-          print("OK: exactly one init container, name='prepare-u02-permissions'.")
+
+          init_container = init_containers[0]
+
+          def _init_script_text(container):
+              # command/args entries are ordinarily strings, but tolerate a
+              # non-string entry (e.g. a Helm-rendered number) rather than
+              # crashing on it -- only string entries can ever contain the
+              # shell script text we are looking for.
+              parts = []
+              for item in list(container.get("command") or []) + list(container.get("args") or []):
+                  if isinstance(item, str):
+                      parts.append(item)
+              return "\n".join(parts)
+
+          init_script_text = _init_script_text(init_container)
+
+          if "ServiceManager.pid" not in init_script_text:
+              print(
+                  "FAIL: the prepare-u02-permissions init container does not reference "
+                  "ServiceManager.pid -- the stale GoldenGate Service Manager PID "
+                  "safeguard is missing."
+              )
+              sys.exit(1)
+
+          if 'rm -f -- "$SERVICE_MANAGER_PID_FILE"' not in init_script_text:
+              print(
+                  "FAIL: the prepare-u02-permissions init container does not contain "
+                  "the expected stale-PID removal command "
+                  '(rm -f -- "$SERVICE_MANAGER_PID_FILE").'
+              )
+              sys.exit(1)
+
+          print(
+              "OK: required prepare-u02-permissions init container and stale "
+              "ServiceManager.pid cleanup are present."
+          )
+
+          # --- Services: exactly one ClusterIP, one headless -----------------------
+          services = [d for d in documents if d.get("kind") == "Service"]
+          if len(services) != 2:
+              print(f"FAIL: expected exactly 2 Service documents (one ClusterIP, one headless), found {len(services)}.")
+              sys.exit(1)
+
+          service_types = [(s.get("spec") or {}).get("type") for s in services]
+          cluster_ips = [(s.get("spec") or {}).get("clusterIP") for s in services]
+          if "ClusterIP" not in service_types:
+              print(f"FAIL: expected ClusterIP Service not found. Types: {service_types}")
+              sys.exit(1)
+          if "None" not in cluster_ips:
+              print(f"FAIL: expected headless Service (clusterIP: None) not found. clusterIPs: {cluster_ips}")
+              sys.exit(1)
+          print("OK: exactly one ClusterIP Service and one headless Service.")
+
+          # --- Ingress: exactly one, with exactly one host, when enabled -----------
+          ingress_enabled = bool((values.get("ingress") or {}).get("enabled"))
+          ingresses = [d for d in documents if d.get("kind") == "Ingress"]
+          if ingress_enabled:
+              if len(ingresses) != 1:
+                  print(f"FAIL: expected exactly one rendered Ingress, found {len(ingresses)}.")
+                  sys.exit(1)
+              rules = (ingresses[0].get("spec") or {}).get("rules") or []
+              if len(rules) != 1:
+                  print(f"FAIL: expected exactly one Ingress host rule, found {len(rules)}.")
+                  sys.exit(1)
+              print("OK: exactly one Ingress with one host.")
+          else:
+              print("ingress.enabled is not true. Skipping Ingress checks.")
+
+          # --- runtime-qualified resource names + shared namespace -----------------
+          expected_names = {deployment_id, f"{deployment_id}-headless"}
+          found_names = {
+              (doc.get("metadata") or {}).get("name")
+              for doc in documents
+              if (doc.get("metadata") or {}).get("name") in expected_names
+          }
+          missing_names = expected_names - found_names
+          if missing_names:
+              print(f"FAIL: expected resource name(s) not found in the rendered manifest: {sorted(missing_names)}")
+              sys.exit(1)
+
+          spcs = [d for d in documents if d.get("kind") == "SecretProviderClass"]
+          for spc in spcs:
+              name = (spc.get("metadata") or {}).get("name", "")
+              if not name.startswith(f"{deployment_id}-"):
+                  print(f"FAIL: SecretProviderClass name {name!r} is not qualified by the runtime name {deployment_id!r}.")
+                  sys.exit(1)
+          if spcs:
+              print(f"OK: {len(spcs)} SecretProviderClass name(s) are runtime-qualified.")
 
           # --- namespaced resources reference the shared namespace -----------------
           namespace_found = False

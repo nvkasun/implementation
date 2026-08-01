@@ -1025,6 +1025,7 @@ else:
 PYEOF
 
   awk '/^is_active_deployment_values_file\(\) \{/,/^\}$/' "${WORKDIR}/detect_script.sh" > "${WORKDIR}/is_active_fn.sh"
+  awk '/^is_goldengate_deployment_values_file\(\) \{/,/^\}$/' "${WORKDIR}/detect_script.sh" > "${WORKDIR}/is_gg_fn.sh"
 
   cat > "${WORKDIR}/run_is_active_checks.sh" <<HARNESS
 #!/bin/bash
@@ -1058,6 +1059,49 @@ HARNESS
     fail "payments-ora-to-pg-001 is not reported inactive by the real workflow function"
   fi
 
+  cat > "${WORKDIR}/run_is_gg_checks.sh" <<HARNESS
+#!/bin/bash
+set -euo pipefail
+source "${WORKDIR}/is_gg_fn.sh"
+
+check_one() {
+  local file="\$1" expect_status="\$2" label="\$3"
+  set +e
+  reason="\$(is_goldengate_deployment_values_file "\$file")"
+  status=\$?
+  set -e
+  if [ "\$status" -eq "\$expect_status" ]; then
+    echo "PASS \$label (\$reason)"
+  else
+    echo "FAIL \$label (expected status \$expect_status, got \$status, reason: \$reason)"
+  fi
+}
+
+check_one "envs/dev/gg-oracle-payments-01/values.yaml" 0 "oracle-is-gg"
+check_one "envs/dev/gg-postgresql-payments-01/values.yaml" 0 "postgresql-is-gg"
+check_one "envs/dev/payments-ora-to-pg-001/values.yaml" 0 "legacy-is-gg"
+check_one "envs/dev/goldengate-monitor/values.yaml" 1 "monitor-is-not-gg"
+check_one "envs/dev/argocd/values.yaml" 1 "argocd-is-not-gg"
+HARNESS
+
+  GG_CHECK_OUTPUT="$(bash "${WORKDIR}/run_is_gg_checks.sh" 2>&1 || true)"
+  echo "$GG_CHECK_OUTPUT"
+
+  if echo "$GG_CHECK_OUTPUT" | grep -q "^PASS oracle-is-gg" \
+      && echo "$GG_CHECK_OUTPUT" | grep -q "^PASS postgresql-is-gg" \
+      && echo "$GG_CHECK_OUTPUT" | grep -q "^PASS legacy-is-gg"; then
+    pass "the real workflow's is_goldengate_deployment_values_file() classifies all three GoldenGate deployment folders correctly (regardless of active/inactive state)"
+  else
+    fail "one or more GoldenGate deployment folders are misclassified by is_goldengate_deployment_values_file()"
+  fi
+
+  if echo "$GG_CHECK_OUTPUT" | grep -q "^PASS monitor-is-not-gg" \
+      && echo "$GG_CHECK_OUTPUT" | grep -q "^PASS argocd-is-not-gg"; then
+    pass "the real workflow's is_goldengate_deployment_values_file() correctly rejects goldengate-monitor and argocd (no deploymentModel field)"
+  else
+    fail "goldengate-monitor and/or argocd are incorrectly classified as GoldenGate deployments"
+  fi
+
   if echo "$ACTIVE_CHECK_OUTPUT" | grep -q "^PASS oracle-active" && echo "$ACTIVE_CHECK_OUTPUT" | grep -q "^PASS postgresql-active"; then
     pass "the real workflow's is_active_deployment_values_file() reports both canonical folders active"
   else
@@ -1066,32 +1110,48 @@ HARNESS
 
   # A shared-chart-change selection scans every envs/dev/<id>/values.yaml
   # (excluding argocd/) exactly as the workflow does, then filters through
-  # the same real function -- proving the canonical folders are selected
-  # and the legacy folder is not, using the actual discovery command.
+  # the same two real functions, in the same order the workflow applies them
+  # (is_goldengate_deployment_values_file first, then
+  # is_active_deployment_values_file) -- proving the exact resulting active
+  # set, using the actual discovery command.
   CANDIDATE_IDS="$(find envs/dev -mindepth 2 -maxdepth 2 -name values.yaml -not -path 'envs/dev/argocd/*' \
     | sed -E 's#^envs/dev/([^/]+)/values\.yaml$#\1#' | sort -u)"
   ACTIVE_IDS=""
   for id in $CANDIDATE_IDS; do
+    set +e
+    bash -c "source '${WORKDIR}/is_gg_fn.sh'; is_goldengate_deployment_values_file 'envs/dev/${id}/values.yaml'" >/dev/null 2>&1
+    gg_st=$?
+    set -e
+    if [ "$gg_st" -ne 0 ]; then
+      continue
+    fi
     set +e
     bash -c "source '${WORKDIR}/is_active_fn.sh'; is_active_deployment_values_file 'envs/dev/${id}/values.yaml'" >/dev/null 2>&1
     st=$?
     set -e
     [ "$st" -eq 0 ] && ACTIVE_IDS="${ACTIVE_IDS} ${id}"
   done
-  echo "Active candidate IDs for a shared-chart-change selection: ${ACTIVE_IDS}"
+  ACTIVE_IDS_SORTED="$(echo "$ACTIVE_IDS" | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' ' | sed -E 's/ $//')"
+  echo "Active candidate IDs for a shared-chart-change selection: ${ACTIVE_IDS_SORTED}"
 
-  if echo "$ACTIVE_IDS" | grep -qw "gg-oracle-payments-01" \
-      && echo "$ACTIVE_IDS" | grep -qw "gg-postgresql-payments-01" \
-      && ! echo "$ACTIVE_IDS" | grep -qw "payments-ora-to-pg-001"; then
-    pass "a shared chart change selects both canonical singleRuntime folders and excludes the disabled legacy folder"
+  EXPECTED_ACTIVE_IDS="gg-oracle-payments-01 gg-postgresql-payments-01"
+  if [ "$ACTIVE_IDS_SORTED" = "$EXPECTED_ACTIVE_IDS" ]; then
+    pass "a shared chart change produces exactly the canonical active set (${EXPECTED_ACTIVE_IDS}) -- no additional ID present"
   else
-    fail "shared-chart-change selection does not match the expected canonical-only set"
+    fail "a shared chart change produced an unexpected active set: got [${ACTIVE_IDS_SORTED}], expected [${EXPECTED_ACTIVE_IDS}]"
   fi
-  # Note (not a failure): envs/dev/goldengate-monitor/values.yaml is a
-  # pre-existing, Phase-5A-unrelated member of this same candidate scan --
-  # it is deployed by the separate goldengate-monitor.yaml workflow, not
-  # goldengate-eks-app.yaml. Its presence here predates and is out of scope
-  # for this phase's observer/legacy-folder retirement work.
+
+  if echo "$ACTIVE_IDS_SORTED" | grep -qw "goldengate-monitor"; then
+    fail "goldengate-monitor is present in the shared-chart-change active set -- it must never enter the GoldenGate matrix"
+  else
+    pass "goldengate-monitor is absent from the shared-chart-change active set"
+  fi
+
+  if echo "$ACTIVE_IDS_SORTED" | grep -qw "argocd"; then
+    fail "argocd is present in the shared-chart-change active set -- it must never enter the GoldenGate matrix"
+  else
+    pass "argocd is absent from the shared-chart-change active set"
+  fi
 
   # Deletion-candidate safeguard: extract the real case-statement logic and
   # prove deployment.enabled=false never queues a deletion request, while a
@@ -1352,6 +1412,40 @@ if grep -q "resources-finalizer.argocd.argoproj.io" "$EKS_APP_WORKFLOW" 2>/dev/n
   pass "Argo CD deletion safeguards (finalizer wait, shared-namespace refusal, ownership-label verification) remain present"
 else
   fail "one or more Argo CD deletion safeguards appear to be missing from ${EKS_APP_WORKFLOW}"
+fi
+
+# ---------------------------------------------------------------------
+# 24. No accidental pasted command-note files under hack/.
+# ---------------------------------------------------------------------
+echo ""
+echo "--- No accidental command-note files under hack/ ---"
+
+if [ -f "hack/test.yaml" ]; then
+  fail "hack/test.yaml exists -- this was an accidental pasted VDR command note and is not a legitimate repository file"
+else
+  pass "hack/test.yaml does not exist"
+fi
+
+# Generic guard: any *.yaml/*.yml file anywhere under hack/ must actually
+# parse as YAML -- a plain-prose/shell command note accidentally saved with
+# a .yaml/.yml extension (exactly how hack/test.yaml happened) is caught
+# here even if it is renamed or a new one is added later.
+BAD_HACK_YAML=""
+if command -v python3 >/dev/null 2>&1; then
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    if ! python3 -c "import sys, yaml; yaml.safe_load(open(sys.argv[1]))" "$f" >/dev/null 2>&1; then
+      BAD_HACK_YAML="${BAD_HACK_YAML} ${f}"
+    fi
+  done <<< "$(find hack -type f \( -iname "*.yaml" -o -iname "*.yml" \) 2>/dev/null || true)"
+
+  if [ -z "$BAD_HACK_YAML" ]; then
+    pass "every *.yaml/*.yml file under hack/ parses as valid YAML (no pasted command notes)"
+  else
+    fail "file(s) under hack/ have a YAML extension but do not parse as YAML (likely an accidental command-note paste):${BAD_HACK_YAML}"
+  fi
+else
+  skip "hack/ YAML-validity guard -- python3 not available"
 fi
 
 echo ""
