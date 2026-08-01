@@ -1,0 +1,22 @@
+Final live validation
+
+Run these two commands.
+
+1. Confirm the running Deployment switch
+kubectl get deployment gg-monitor \
+  -n goldengate-monitoring \
+  -o jsonpath='{range .spec.template.spec.containers[0].env[?(@.name=="CLOUDWATCH_PUBLISH_ENABLED")]}{.name}={.value}{"\n"}{end}'
+
+Expected:
+
+CLOUDWATCH_PUBLISH_ENABLED=true
+2. Check publication errors
+kubectl logs \
+  -n goldengate-monitoring \
+  deployment/gg-monitor \
+  --since=15m |
+grep -E 'cloudwatch_client_creation_failed|cloudwatch_put_metric_data_failed|tick failed' || true
+
+Expected: no output.
+
+Check the actual metric
