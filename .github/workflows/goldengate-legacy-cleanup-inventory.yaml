@@ -1,0 +1,106 @@
+name: GoldenGate legacy cleanup inventory
+
+run-name: "GoldenGate legacy cleanup inventory | environment=${{ inputs.environment }} | ran by ${{ github.actor }}"
+
+# Read-only, workflow_dispatch-only. This workflow never creates, modifies,
+# or deletes any AWS or Kubernetes resource -- it only inventories retired
+# legacy resources (see hack/inventory-goldengate-legacy-resources.sh) and
+# emits a deterministic JSON cleanup manifest for later human review. There
+# is deliberately no push trigger and no apply/delete/mutation input.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment (read-only inventory only)"
+        required: true
+        type: choice
+        default: dev
+        options:
+          - dev
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ROLE_ARN: ${{ vars.GOLDENGATE_AWS_ROLE_ARN }}
+  EKS_ACCOUNT_ID: ${{ vars.ACCOUNT_ID_DEV }}
+  EKS_CLUSTER_NAME: ${{ vars.AWS_CLUSTER_NAME }}
+  EKS_CLUSTER_ARN: ${{ vars.AWS_CLUSTER_ARN }}
+  EKS_DEPLOY_ROLE_ARN: ${{ vars.EKS_DEPLOY_ROLE_ARN }}
+
+jobs:
+  inventory:
+    name: Read-only legacy resource inventory
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.ROLE_ARN }}
+
+      - name: Install kubectl and jq if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KUBECTL_VERSION="v1.35.0"
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64) KUBECTL_ARCH="amd64" ;;
+              aarch64|arm64) KUBECTL_ARCH="arm64" ;;
+              *) echo "Unsupported architecture for kubectl: $ARCH"; exit 1 ;;
+            esac
+            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+            sudo chmod +x /usr/local/bin/kubectl
+          fi
+
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "jq is required and is not available on this runner."
+            exit 1
+          fi
+
+          kubectl version --client=true
+          jq --version
+
+      - name: Connect to EKS cluster (read-only)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}" \
+            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
+            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
+
+          kubectl config current-context
+
+      - name: Run legacy resource inventory
+        id: inventory
+        shell: bash
+        env:
+          INPUT_ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+
+          # The full read-only inventory implementation lives in a tracked,
+          # independently testable repository script -- never duplicated
+          # inline here. Every value it needs arrives above as opaque
+          # string data through env:, never as a GitHub expression
+          # interpolated directly into a shell statement. This script
+          # performs Describe/Get/List/Query calls only; it contains no
+          # delete/patch/update/put/apply/mutation action of any kind. The
+          # full manifest and a concise summary are printed directly to the
+          # job log and the GitHub Actions job summary -- reviewing the
+          # result never requires downloading or transferring a file.
+          bash hack/inventory-goldengate-legacy-resources.sh

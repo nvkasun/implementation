@@ -26,6 +26,8 @@ MONITOR_APP_DIR="monitoring/monitor"
 MONITOR_WORKFLOW=".github/workflows/goldengate-monitor.yaml"
 EKS_APP_WORKFLOW=".github/workflows/goldengate-eks-app.yaml"
 DETECT_SCRIPT="hack/detect-goldengate-deployments.sh"
+INVENTORY_SCRIPT="hack/inventory-goldengate-legacy-resources.sh"
+INVENTORY_WORKFLOW=".github/workflows/goldengate-legacy-cleanup-inventory.yaml"
 
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT
@@ -2916,6 +2918,407 @@ if [ -f "$DETECT_SCRIPT" ]; then
   bash -n "$DETECT_SCRIPT" >/dev/null 2>&1 && pass "${DETECT_SCRIPT} passes bash -n syntax check" || fail "${DETECT_SCRIPT} fails bash -n syntax check"
 else
   skip "external script executable/output checks -- ${DETECT_SCRIPT} not found"
+fi
+
+# ---------------------------------------------------------------------
+# Phase 5B2B1: read-only legacy external-resource cleanup inventory.
+# hack/inventory-goldengate-legacy-resources.sh and
+# .github/workflows/goldengate-legacy-cleanup-inventory.yaml never create,
+# modify, or delete any AWS/Kubernetes resource -- these tests prove that,
+# prove the canonical deny-list can never be overridden by any observed
+# evidence, and prove permission gaps are reported rather than guessed.
+# ---------------------------------------------------------------------
+echo ""
+echo "--- Phase 5B2B1: read-only legacy cleanup inventory ---"
+
+FORBIDDEN_MUTATION_PATTERN='kubectl (delete|patch|apply|edit|scale|rollout restart)|aws efs delete-access-point|aws dynamodb (delete-item|batch-write-item)|aws ecr (delete-repository|batch-delete-image)|aws route53 change-resource-record-sets|aws secretsmanager delete-secret|terraform apply|helm (install|upgrade)|argocd app delete'
+
+if [ -f "$INVENTORY_WORKFLOW" ] && [ "$PYTHON_AVAILABLE" = "true" ]; then
+  INVENTORY_HEADER_CHECK="$(python3 - "$INVENTORY_WORKFLOW" <<'PYEOF'
+import sys
+import yaml
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    doc = yaml.safe_load(f)
+
+# YAML 1.1 boolean-key quirk: PyYAML resolves the unquoted key "on" to the
+# Python boolean True -- accept either, matching the same handling used for
+# goldengate-eks-app.yaml elsewhere in this test suite.
+on_key = True if True in doc else "on"
+triggers = doc.get(on_key, {}) or {}
+
+print(f"only_workflow_dispatch={sorted(triggers.keys()) == ['workflow_dispatch']}")
+print(f"has_push={'push' in triggers}")
+
+inputs = ((triggers.get("workflow_dispatch") or {}).get("inputs")) or {}
+print(f"input_names={sorted(inputs.keys())}")
+
+mutation_keywords = ("apply", "delete", "mutate", "mutation", "confirm", "destructive", "force")
+suspicious_inputs = [name for name in inputs if any(k in name.lower() for k in mutation_keywords)]
+print(f"suspicious_inputs={suspicious_inputs}")
+
+run_lengths = []
+for job in doc.get("jobs", {}).values():
+    for step in job.get("steps", []):
+        run = step.get("run")
+        if run is not None:
+            run_lengths.append(len(run.encode("utf-8")))
+print(f"max_run_length={max(run_lengths) if run_lengths else 0}")
+
+detect_calls_script = any(
+    "bash hack/inventory-goldengate-legacy-resources.sh" in (step.get("run") or "")
+    for job in doc.get("jobs", {}).values()
+    for step in job.get("steps", [])
+)
+print(f"invokes_script={detect_calls_script}")
+PYEOF
+)"
+  echo "$INVENTORY_HEADER_CHECK"
+
+  # 1/2: workflow_dispatch-only, no push trigger.
+  if echo "$INVENTORY_HEADER_CHECK" | grep -q "^only_workflow_dispatch=True$"; then
+    pass "1: ${INVENTORY_WORKFLOW} is workflow_dispatch-only"
+  else
+    fail "1: ${INVENTORY_WORKFLOW} is not workflow_dispatch-only"
+  fi
+
+  if echo "$INVENTORY_HEADER_CHECK" | grep -q "^has_push=False$"; then
+    pass "2: ${INVENTORY_WORKFLOW} has no push trigger"
+  else
+    fail "2: ${INVENTORY_WORKFLOW} unexpectedly has a push trigger"
+  fi
+
+  # 3: no mutation input -- exactly the minimal safe "environment" input,
+  # and no input name suggests an apply/delete/mutation mode.
+  if echo "$INVENTORY_HEADER_CHECK" | grep -q "^input_names=\['environment'\]$" \
+      && echo "$INVENTORY_HEADER_CHECK" | grep -q "^suspicious_inputs=\[\]$"; then
+    pass "3: ${INVENTORY_WORKFLOW} has no mutation input (only environment)"
+  else
+    fail "3: ${INVENTORY_WORKFLOW} has an unexpected or suspicious input"
+  fi
+
+  # 5 (part): the workflow step invokes the real external script, never a
+  # duplicated inline implementation.
+  if echo "$INVENTORY_HEADER_CHECK" | grep -q "^invokes_script=True$"; then
+    pass "${INVENTORY_WORKFLOW} invokes ${INVENTORY_SCRIPT} rather than embedding its own implementation"
+  else
+    fail "${INVENTORY_WORKFLOW} does not invoke ${INVENTORY_SCRIPT}"
+  fi
+
+  # 20: every run: block in every workflow file (not just this new one)
+  # stays below GitHub's 21,000-character limit.
+  ALL_WORKFLOW_MAX_LENGTH=0
+  for wf in .github/workflows/*.yaml .github/workflows/*.yml; do
+    [ -f "$wf" ] || continue
+    WF_MAX="$(python3 - "$wf" <<'PYEOF'
+import sys, yaml
+with open(sys.argv[1], encoding="utf-8") as f:
+    doc = yaml.safe_load(f)
+lengths = [len((step.get("run") or "").encode("utf-8"))
+           for job in (doc.get("jobs") or {}).values()
+           for step in job.get("steps", [])]
+print(max(lengths) if lengths else 0)
+PYEOF
+)"
+    if [ "${WF_MAX:-0}" -gt "$ALL_WORKFLOW_MAX_LENGTH" ]; then
+      ALL_WORKFLOW_MAX_LENGTH="$WF_MAX"
+    fi
+  done
+  if [ "$ALL_WORKFLOW_MAX_LENGTH" -lt 21000 ]; then
+    pass "20: every run: block across all workflow files is below 21,000 characters (max=${ALL_WORKFLOW_MAX_LENGTH})"
+  else
+    fail "20: at least one run: block across the workflow files is at/above 21,000 characters (max=${ALL_WORKFLOW_MAX_LENGTH})"
+  fi
+else
+  skip "inventory workflow header/trigger checks -- ${INVENTORY_WORKFLOW} or python3 not available"
+fi
+
+if [ -f "$INVENTORY_WORKFLOW" ]; then
+  WORKFLOW_MUTATION_HITS="$(grep -nE "$FORBIDDEN_MUTATION_PATTERN" "$INVENTORY_WORKFLOW" || true)"
+  if [ -z "$WORKFLOW_MUTATION_HITS" ]; then
+    pass "${INVENTORY_WORKFLOW} contains no forbidden mutation command"
+  else
+    fail "${INVENTORY_WORKFLOW} contains forbidden mutation command(s):"$'\n'"${WORKFLOW_MUTATION_HITS}"
+  fi
+fi
+
+if [ -f "$INVENTORY_SCRIPT" ]; then
+  # 4: the script contains no forbidden mutation command.
+  SCRIPT_MUTATION_HITS="$(grep -nE "$FORBIDDEN_MUTATION_PATTERN" "$INVENTORY_SCRIPT" || true)"
+  if [ -z "$SCRIPT_MUTATION_HITS" ]; then
+    pass "4: ${INVENTORY_SCRIPT} contains no forbidden mutation command"
+  else
+    fail "4: ${INVENTORY_SCRIPT} contains forbidden mutation command(s):"$'\n'"${SCRIPT_MUTATION_HITS}"
+  fi
+
+  bash -n "$INVENTORY_SCRIPT" >/dev/null 2>&1 && pass "${INVENTORY_SCRIPT} passes bash -n syntax check" || fail "${INVENTORY_SCRIPT} fails bash -n syntax check"
+
+  [ -x "$INVENTORY_SCRIPT" ] && pass "7: ${INVENTORY_SCRIPT} is executable" || fail "7: ${INVENTORY_SCRIPT} is not executable"
+
+  # 5: the four known old PV IDs are exactly the script's candidate list.
+  EXPECTED_PV_CANDIDATES="pvc-3a93c990-a9fa-4cca-99df-7c3375472074 pvc-93251c3f-c408-4713-bd46-ebc5e0eafa8a pvc-5c43940e-1054-43f5-8031-9db4b51a024a pvc-bacb3e9d-d904-467c-959f-dea9548699c9"
+  PV_CANDIDATES_MISSING=""
+  for pv_id in $EXPECTED_PV_CANDIDATES; do
+    grep -qF "\"${pv_id}\"" "$INVENTORY_SCRIPT" || PV_CANDIDATES_MISSING="${PV_CANDIDATES_MISSING} ${pv_id}"
+  done
+  if [ -z "$PV_CANDIDATES_MISSING" ]; then
+    pass "5: all four known old PV IDs are present as inventory candidates in ${INVENTORY_SCRIPT}"
+  else
+    fail "5: ${INVENTORY_SCRIPT} is missing expected candidate PV ID(s):${PV_CANDIDATES_MISSING}"
+  fi
+
+  # 11: DynamoDB inventory uses Query against an exact partition key, never
+  # a table-wide Scan.
+  if grep -q "aws dynamodb query" "$INVENTORY_SCRIPT" && ! grep -qE "aws dynamodb scan| --scan " "$INVENTORY_SCRIPT"; then
+    pass "11: ${INVENTORY_SCRIPT} uses 'aws dynamodb query' (exact partition key) and never 'aws dynamodb scan'"
+  else
+    fail "11: ${INVENTORY_SCRIPT} does not exclusively use Query for DynamoDB (scan present or query absent)"
+  fi
+
+  # 13: missing EFS/ECR permissions produce a permission-gap literal,
+  # exactly as specified, rather than the script guessing eligibility.
+  if grep -q "EFS_METADATA_PERMISSION_MISSING" "$INVENTORY_SCRIPT" && grep -q "OBSERVER_ECR_PERMISSION_MISSING" "$INVENTORY_SCRIPT"; then
+    pass "13: ${INVENTORY_SCRIPT} reports EFS_METADATA_PERMISSION_MISSING and OBSERVER_ECR_PERMISSION_MISSING on missing permissions"
+  else
+    fail "13: ${INVENTORY_SCRIPT} is missing the required permission-gap literal(s)"
+  fi
+
+  # 14: the manifest JSON schema contains every required top-level and
+  # candidates sub-key.
+  SCHEMA_KEYS_MISSING=""
+  for key in environment generatedAt canonical candidates blocked permissionGaps; do
+    grep -qE "^\s*${key}:" "$INVENTORY_SCRIPT" || SCHEMA_KEYS_MISSING="${SCHEMA_KEYS_MISSING} ${key}"
+  done
+  for key in persistentVolumes efsAccessPoints storageClasses dynamodbPartitions ecrRepositories ecrImages; do
+    grep -qE "^\s*${key}:" "$INVENTORY_SCRIPT" || SCHEMA_KEYS_MISSING="${SCHEMA_KEYS_MISSING} ${key}"
+  done
+  if [ -z "$SCHEMA_KEYS_MISSING" ]; then
+    pass "14: the manifest JSON schema in ${INVENTORY_SCRIPT} contains every required key"
+  else
+    fail "14: the manifest JSON schema in ${INVENTORY_SCRIPT} is missing key(s):${SCHEMA_KEYS_MISSING}"
+  fi
+
+  # PVCs have no candidate resourceType at all in the schema -- structurally
+  # deny-listed (7): there is no "persistentVolumeClaims" candidate array,
+  # so a PVC can never appear as a cleanup candidate regardless of any
+  # observed state.
+  if ! grep -qE "^\s*persistentVolumeClaims:" "$INVENTORY_SCRIPT"; then
+    pass "7: PersistentVolumeClaims have no candidate resourceType in the manifest schema -- structurally deny-listed"
+  else
+    fail "7: ${INVENTORY_SCRIPT} unexpectedly defines a persistentVolumeClaims candidate list"
+  fi
+
+  # 15: no secret-value retrieval anywhere in the script (Secrets Manager
+  # GetSecretValue, or any other "get secret value" shaped call).
+  if grep -qiE "get-secret-value|getsecretvalue" "$INVENTORY_SCRIPT"; then
+    fail "15: ${INVENTORY_SCRIPT} appears to retrieve a secret value"
+  else
+    pass "15: ${INVENTORY_SCRIPT} never retrieves a secret value"
+  fi
+
+  # Confirm the script never logs/echoes a raw AWS Secret string value
+  # (only Secrets Manager *paths*, e.g. dev/goldengate/source/admin, are
+  # ever referenced -- paths are identifiers, not secret values).
+  if grep -qE "SecretString|secretString" "$INVENTORY_SCRIPT"; then
+    fail "15b: ${INVENTORY_SCRIPT} appears to reference a raw secret string field"
+  else
+    pass "15b: ${INVENTORY_SCRIPT} never references a raw secret string field"
+  fi
+else
+  fail "${INVENTORY_SCRIPT} does not exist"
+fi
+
+if [ -f "$INVENTORY_SCRIPT" ] && command -v python3 >/dev/null 2>&1; then
+  # Extract just the constants + pure classification functions (never the
+  # live AWS/kubectl collection code) so eligibility logic can be unit-
+  # tested deterministically, the same established pattern already used
+  # elsewhere in this file for the detection script's classifier.
+  python3 - "$INVENTORY_SCRIPT" > "${WORKDIR}/inventory_classify_funcs.sh" <<'PYEOF'
+import re
+import sys
+
+with open(sys.argv[1]) as f:
+    lines = f.readlines()
+
+start = next(i for i, l in enumerate(lines) if l.startswith("ENVIRONMENT="))
+end = None
+for i, l in enumerate(lines):
+    if l.startswith("classify_observer_image() {"):
+        for j in range(i, len(lines)):
+            if lines[j].strip() == "}":
+                end = j
+                break
+        break
+
+if end is None:
+    sys.exit("could not locate classify_observer_image() function body")
+
+# Drop the "prerequisites" tool-check block (MISSING_TOOLS.. through
+# in_array()) -- not needed and not relevant for pure-function testing;
+# keeping it would make this fixture depend on jq/python3 being on PATH
+# purely to reach the functions under test.
+body = "".join(lines[start:end + 1])
+prereq_start = body.find("MISSING_TOOLS=()")
+prereq_end = body.find("in_array()")
+if prereq_start != -1 and prereq_end != -1:
+    body = body[:prereq_start] + body[prereq_end:]
+
+sys.stdout.write("set -uo pipefail\n")
+sys.stdout.write(body)
+PYEOF
+
+  if [ -s "${WORKDIR}/inventory_classify_funcs.sh" ] && bash -n "${WORKDIR}/inventory_classify_funcs.sh" >/dev/null 2>&1; then
+    INVENTORY_CLASSIFY_OUTPUT="$(bash -c '
+      source "'"${WORKDIR}"'/inventory_classify_funcs.sh"
+
+      echo "--- 6: current canonical PV is deny-listed ---"
+      set +e
+      classify_pv "pvc-dd1bc7bc-b736-4fee-abfe-abf622e70550" "Released" "Retain" "fs-05cadf3570f23cd39::fsap-canonical1" "" "" "false" "true"
+      echo "exit=$?"
+
+      echo "--- old-candidate PV, fully eligible ---"
+      classify_pv "pvc-3a93c990-a9fa-4cca-99df-7c3375472074" "Released" "Retain" "fs-05cadf3570f23cd39::fsap-007cfc2ff801c24b8" "" "" "false" "true"
+      echo "exit=$?"
+
+      echo "--- old-candidate PV, unverified volume handle fails closed ---"
+      classify_pv "pvc-93251c3f-c408-4713-bd46-ebc5e0eafa8a" "Released" "Retain" "unknown" "" "" "false" "false"
+      echo "exit=$?"
+
+      echo "--- 8: canonical Oracle StorageClass is retained ---"
+      classify_storage_class "gg-efs-dev-gg-oracle-payments-01" "true"
+      echo "exit=$?"
+
+      echo "--- 8: canonical PostgreSQL StorageClass is retained ---"
+      classify_storage_class "gg-efs-dev-gg-postgresql-payments-01" "false"
+      echo "exit=$?"
+
+      echo "--- 9: legacy StorageClass still in use is blocked ---"
+      classify_storage_class "gg-efs-dev-payments-ora-to-pg-001" "true"
+      echo "exit=$?"
+
+      echo "--- 9: legacy StorageClass proven unused is eligible ---"
+      classify_storage_class "gg-efs-dev-payments-ora-to-pg-001" "false"
+      echo "exit=$?"
+
+      echo "--- 10: canonical DynamoDB partition never a candidate, even with items ---"
+      classify_dynamodb_partition "gg-oracle-payments-01" 999
+      echo "exit=$?"
+      classify_dynamodb_partition "gg-postgresql-payments-01" 1
+      echo "exit=$?"
+
+      echo "--- legacy DynamoDB partition with items is eligible ---"
+      classify_dynamodb_partition "gg-payments-ora-to-pg-001-source" 2
+      echo "exit=$?"
+
+      echo "--- unrecognized DynamoDB partition name is never a candidate ---"
+      classify_dynamodb_partition "some-unrelated-pipeline" 5
+      echo "exit=$?"
+
+      echo "--- 12: observer image with zero live references is eligible ---"
+      classify_observer_image "[\"obs-abc123def456\"]" 0
+      echo "exit=$?"
+
+      echo "--- 12: observer image still referenced is blocked ---"
+      classify_observer_image "[\"obs-abc123def456\"]" 3
+      echo "exit=$?"
+
+      echo "--- EFS access point: current canonical is deny-listed ---"
+      CANONICAL_EFS_ACCESS_POINT_IDS=("fsap-canonical1" "fsap-canonical2")
+      classify_efs_access_point "fsap-canonical1" "true" "fs-05cadf3570f23cd39" "false"
+      echo "exit=$?"
+
+      echo "--- EFS access point: old candidate, unreferenced, correct filesystem -> eligible ---"
+      classify_efs_access_point "fsap-007cfc2ff801c24b8" "true" "fs-05cadf3570f23cd39" "false"
+      echo "exit=$?"
+    ' 2>&1)"
+    echo "$INVENTORY_CLASSIFY_OUTPUT"
+
+    if echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "6: current canonical PV is deny-listed" | grep -q "^exit=1$"; then
+      pass "6: the current canonical PV ID is deny-listed from cleanup (classify_pv blocks it unconditionally)"
+    else
+      fail "6: the current canonical PV ID was not blocked as expected"
+    fi
+
+    if echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "old-candidate PV, fully eligible" | grep -q "^exit=0$"; then
+      pass "a genuinely obsolete, fully-verified old PV is correctly classified eligible"
+    else
+      fail "a genuinely obsolete, fully-verified old PV was not classified eligible as expected"
+    fi
+
+    if echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "unverified volume handle fails closed" | grep -q "^exit=1$"; then
+      pass "an old-candidate PV whose volume handle could not be independently verified fails closed (never guessed eligible)"
+    else
+      fail "an old-candidate PV with an unverified volume handle was not blocked as expected"
+    fi
+
+    if echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "8: canonical Oracle StorageClass is retained" | grep -q "^exit=1$" \
+        && echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "8: canonical PostgreSQL StorageClass is retained" | grep -q "^exit=1$"; then
+      pass "8: both active canonical StorageClasses are retained (never a cleanup candidate)"
+    else
+      fail "8: at least one active canonical StorageClass was not retained as expected"
+    fi
+
+    if echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "9: legacy StorageClass still in use is blocked" | grep -q "^exit=1$" \
+        && echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "9: legacy StorageClass proven unused is eligible" | grep -q "^exit=0$"; then
+      pass "9: the legacy StorageClass requires proof of zero active PVC usage before becoming eligible"
+    else
+      fail "9: the legacy StorageClass unused-proof requirement did not behave as expected"
+    fi
+
+    CANONICAL_DDB_EXIT_CODES="$(echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A4 "10: canonical DynamoDB partition never a candidate" | grep "^exit=" | tr -d '\n')"
+    if [ "$CANONICAL_DDB_EXIT_CODES" = "exit=1exit=1" ] \
+        && echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "legacy DynamoDB partition with items is eligible" | grep -q "^exit=0$" \
+        && echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "unrecognized DynamoDB partition name is never a candidate" | grep -q "^exit=1$"; then
+      pass "10: canonical DynamoDB partitions can never become cleanup candidates, even when items are present"
+    else
+      fail "10: canonical DynamoDB partition deny-list did not behave as expected (canonical exit codes: ${CANONICAL_DDB_EXIT_CODES})"
+    fi
+
+    if echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "12: observer image with zero live references is eligible" | grep -q "^exit=0$" \
+        && echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "12: observer image still referenced is blocked" | grep -q "^exit=1$"; then
+      pass "12: an observer ECR image is only eligible when it has zero live workload references"
+    else
+      fail "12: observer ECR image live-reference gating did not behave as expected"
+    fi
+
+    if echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "EFS access point: current canonical is deny-listed" | grep -q "^exit=1$" \
+        && echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "old candidate, unreferenced, correct filesystem -> eligible" | grep -q "^exit=0$"; then
+      pass "a current canonical EFS access point is deny-listed while a verified-unreferenced old access point is eligible"
+    else
+      fail "EFS access point canonical deny-list / eligibility did not behave as expected"
+    fi
+  else
+    fail "could not extract or syntax-validate the pure classification functions from ${INVENTORY_SCRIPT}"
+  fi
+else
+  skip "inventory classification unit tests -- ${INVENTORY_SCRIPT} or python3 not available"
+fi
+
+# 16: no docs directory or runbook was added by this phase.
+NEW_DOC_FILES="$(git -C "$REPO_ROOT" status --porcelain=v1 2>/dev/null | grep -E '^\?\? .*\.(md|MD)$' || true)"
+if [ -z "$NEW_DOC_FILES" ] && [ ! -d "docs" ]; then
+  pass "16: no docs directory or runbook (.md file) was added"
+else
+  fail "16: unexpected new documentation file(s)/directory found:"$'\n'"${NEW_DOC_FILES}"
+fi
+
+# 17/18: collector.py, monitor.py, and IAM remain unchanged.
+if command -v git >/dev/null 2>&1 && git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  COLLECTOR_MONITOR_DIFF="$(git -C "$REPO_ROOT" diff --stat -- monitoring/monitor/collector.py monitoring/monitor/monitor.py 2>/dev/null || true)"
+  if [ -z "$COLLECTOR_MONITOR_DIFF" ]; then
+    pass "17: collector.py and monitor.py are unchanged"
+  else
+    fail "17: collector.py and/or monitor.py were unexpectedly modified"
+  fi
+
+  IAM_DIFF="$(git -C "$REPO_ROOT" diff --stat --ignore-all-space -- envs/dev/policies envs/dev/iam.tf 2>/dev/null || true)"
+  if [ -z "$IAM_DIFF" ]; then
+    pass "18: IAM (envs/dev/policies, envs/dev/iam.tf) is unchanged"
+  else
+    fail "18: IAM was unexpectedly modified:"$'\n'"${IAM_DIFF}"
+  fi
+else
+  skip "collector.py/monitor.py/IAM unchanged checks -- not a git repository"
 fi
 
 echo ""
