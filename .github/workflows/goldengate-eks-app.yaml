@@ -244,25 +244,47 @@ jobs:
           }
 
           # Strict, fail-closed YAML classifier shared by every GoldenGate-
-          # deployment classification call site in this workflow (active
-          # matrix, workflow_dispatch validation, current-file deletion
-          # classification, and base-revision removed-file classification).
-          # No regex/text fallback: this repository's runner is required
-          # (see "Verify Python and PyYAML prerequisites" above) to have
-          # python3 + PyYAML, so a values file only ever qualifies after
-          # actual YAML parsing. $1 is a path to a file already known to
-          # exist and be non-empty (the two callers below each check that
-          # themselves, since a working-tree file and a git-show'd temp
-          # file have different "missing"/"empty" semantics).
+          # deployment classification call site in this workflow. No regex/
+          # text fallback: this repository's runner is required (see
+          # "Verify Python and PyYAML prerequisites" above) to have python3
+          # + PyYAML, so a values file only ever qualifies after actual YAML
+          # parsing. $1 is a path to a file already known to exist and be
+          # non-empty (the two callers below each check that themselves,
+          # since a working-tree file and a git-show'd temp file have
+          # different "missing"/"empty" semantics). $2 is a comma-separated
+          # list of the deploymentModel values this call site accepts --
+          # there is no built-in default set here, and a value outside that
+          # list is never silently accepted no matter which caller invokes
+          # this.
+          #
+          # Two explicit, distinct contracts share this one parser:
+          #   ACTIVE CONTRACT ($2="singleRuntime", via
+          #   is_goldengate_deployment_values_file below): used by
+          #   workflow_dispatch validation, the active push build/update
+          #   matrix, and the build/deploy job. legacyPair, missing, and
+          #   unknown models all fail closed here -- excluded from every
+          #   active path, never inferred or defaulted to anything.
+          #   HISTORICAL DELETION CONTRACT ($2="singleRuntime,legacyPair",
+          #   via is_goldengate_deployment_values_file_at_ref below): used
+          #   only to classify a deployment's content as it existed at a
+          #   *previous* Git revision, for deletion purposes -- a removed/
+          #   renamed file, or the base-revision fallback for a current file
+          #   that was deliberately emptied. legacyPair still classifies
+          #   correctly here because a historical legacyPair deployment must
+          #   remain deletable even though the model is no longer
+          #   deployable. An unrecognized value still fails closed and is
+          #   never defaulted under this contract either.
           _classify_deployment_model_yaml() {
             local content_file="$1"
+            local allowed_models_csv="$2"
 
-            python3 - "$content_file" <<'PYEOF'
+            python3 - "$content_file" "$allowed_models_csv" <<'PYEOF'
           import sys
 
           import yaml
 
-          path = sys.argv[1]
+          path, allowed_models_csv = sys.argv[1:3]
+          ALLOWED_MODELS = tuple(m for m in allowed_models_csv.split(",") if m)
 
           with open(path, "r") as f:
               raw = f.read()
@@ -289,7 +311,6 @@ jobs:
               print("parsed YAML is not a mapping")
               sys.exit(1)
 
-          ALLOWED_MODELS = ("singleRuntime", "legacyPair")
           model = data.get("deploymentModel")
 
           if isinstance(model, str) and model in ALLOWED_MODELS:
@@ -302,20 +323,23 @@ jobs:
             return $?
           }
 
-          # Returns 0 (is a GoldenGate runtime deployment values file) or 1
-          # (is not) on stdout as a one-line reason, for a given
-          # envs/dev/<id>/values.yaml path in the current working tree.
-          # Classification is based solely on content -- never on directory
-          # name, and never on deployment.enabled/lifecycle.state (that is a
-          # separate, orthogonal active/inactive concern handled by
+          # ACTIVE CONTRACT. Returns 0 (is an actively deployable GoldenGate
+          # runtime deployment values file) or 1 (is not) on stdout as a
+          # one-line reason, for a given envs/dev/<id>/values.yaml path in
+          # the current working tree. Classification is based solely on
+          # content -- never on directory name, and never on
+          # deployment.enabled/lifecycle.state (that is a separate,
+          # orthogonal active/inactive concern handled by
           # is_active_deployment_values_file above). A file only qualifies
-          # as a GoldenGate deployment when it is a non-empty, valid YAML
-          # mapping whose top-level deploymentModel is a string exactly
-          # equal to "singleRuntime" or "legacyPair". This is what keeps
-          # unrelated envs/dev/<x>/ values files (e.g. the separate
-          # goldengate-monitor chart's own values, or Argo CD's own values)
-          # out of every GoldenGate workflow matrix, without hardcoding
-          # their folder names.
+          # when it is a non-empty, valid YAML mapping whose top-level
+          # deploymentModel is a string exactly equal to "singleRuntime" --
+          # legacyPair is a historical-only model and is rejected here just
+          # like any other unrecognized value, never accepted or defaulted.
+          # This is what keeps unrelated envs/dev/<x>/ values files (e.g.
+          # the separate goldengate-monitor chart's own values, or Argo
+          # CD's own values) -- and any legacyPair deployment someone might
+          # try to (re)introduce -- out of every active GoldenGate workflow
+          # path, without hardcoding folder names.
           is_goldengate_deployment_values_file() {
             local values_file="$1"
 
@@ -329,14 +353,20 @@ jobs:
               return 1
             fi
 
-            _classify_deployment_model_yaml "$values_file"
+            _classify_deployment_model_yaml "$values_file" "singleRuntime"
             return $?
           }
 
-          # Same classification, applied to a values file's content as it
-          # existed at a specific Git revision (never the working tree) --
-          # used for a removed/renamed deletion candidate, whose current
-          # working-tree content no longer exists. Fails closed (returns 1,
+          # HISTORICAL DELETION CONTRACT. Same shape of classification
+          # (0/1 plus a one-line reason on stdout), applied to a values
+          # file's content as it existed at a specific Git revision (never
+          # the working tree) -- used only for a removed/renamed deletion
+          # candidate, or the base-revision fallback for a current file that
+          # was deliberately emptied, whose current working-tree content no
+          # longer reflects what needs classifying. Accepts singleRuntime
+          # *and* legacyPair, since a historical legacyPair deployment must
+          # still be classifiable for deletion even though legacyPair is no
+          # longer an active, deployable model. Fails closed (returns 1,
           # never defaults to any deploymentModel) when the path did not
           # exist at that revision, was empty, or fails the same strict
           # YAML/mapping/deploymentModel checks as the working-tree version.
@@ -359,7 +389,7 @@ jobs:
             fi
 
             local reason status
-            reason="$(_classify_deployment_model_yaml "$tmp_file")"
+            reason="$(_classify_deployment_model_yaml "$tmp_file" "singleRuntime,legacyPair")"
             status=$?
             rm -f "$tmp_file"
             echo "$reason"
@@ -399,9 +429,15 @@ jobs:
             if [ "$GG_STATUS" -ne 0 ]; then
               echo "Deployment values file check failed: ${GG_REASON}"
               echo ""
-              echo "${VALUES_FILE} is not a GoldenGate runtime deployment values file (deploymentModel must be exactly singleRuntime or legacyPair). Refusing to build a matrix for it."
+              echo "${VALUES_FILE} is not an actively deployable GoldenGate runtime deployment values file (deploymentModel must be exactly singleRuntime -- legacyPair is retired and is no longer deployable). Refusing to build a matrix for it."
               exit 1
             fi
+
+            # GG_REASON is exactly "deploymentModel=singleRuntime" on success
+            # under the active contract (the only value it ever accepts) --
+            # carried into the matrix below so the build job never has to
+            # re-infer or default deploymentModel itself.
+            ACTIVE_DEPLOYMENT_MODEL="${GG_REASON#deploymentModel=}"
 
             set +e
             REASON="$(is_active_deployment_values_file "$VALUES_FILE")"
@@ -420,8 +456,9 @@ jobs:
             MATRIX_JSON="$(jq -nc \
               --arg environment "$ENVIRONMENT" \
               --arg deployment_id "$DEPLOYMENT_ID" \
+              --arg deployment_model "$ACTIVE_DEPLOYMENT_MODEL" \
               --argjson deploy "$DEPLOY" \
-              '[{environment: $environment, deployment_id: $deployment_id, deploy: $deploy}]')"
+              '[{environment: $environment, deployment_id: $deployment_id, deployment_model: $deployment_model, deploy: $deploy}]')"
 
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
             echo "deployment_matrix=${MATRIX_JSON}" >> "$GITHUB_OUTPUT"
@@ -489,19 +526,27 @@ jobs:
             # Applies to both shared-chart-change candidates (every
             # envs/dev/<id>/values.yaml) and per-folder push candidates:
             # only a values file whose own deploymentModel is singleRuntime
-            # or legacyPair is ever eligible for the GoldenGate matrix --
-            # never inferred from folder name, so a different chart's
-            # values file under envs/dev/ (e.g. the shared monitor's or
-            # Argo CD's own) is excluded here regardless of trigger reason.
+            # (the active contract -- legacyPair fails closed here just like
+            # any other unrecognized value) is ever eligible for the active
+            # build/update matrix -- never inferred from folder name, so a
+            # different chart's values file under envs/dev/ (e.g. the shared
+            # monitor's or Argo CD's own), or a legacyPair deployment, is
+            # excluded here regardless of trigger reason.
             set +e
             GG_REASON="$(is_goldengate_deployment_values_file "$VALUES_FILE")"
             GG_STATUS=$?
             set -e
 
             if [ "$GG_STATUS" -ne 0 ]; then
-              echo "Not a GoldenGate deployment: ${DEPLOYMENT_ID} (${GG_REASON}) -- excluded from every GoldenGate matrix."
+              echo "Not an actively deployable GoldenGate deployment: ${DEPLOYMENT_ID} (${GG_REASON}) -- excluded from the build/update matrix."
               continue
             fi
+
+            # GG_REASON is exactly "deploymentModel=singleRuntime" on success
+            # under the active contract -- carried into the matrix entry
+            # below so the build job never has to re-infer or default
+            # deploymentModel itself.
+            ACTIVE_DEPLOYMENT_MODEL="${GG_REASON#deploymentModel=}"
 
             set +e
             REASON="$(is_active_deployment_values_file "$VALUES_FILE")"
@@ -513,7 +558,8 @@ jobs:
               ACTIVE_LOG="${ACTIVE_LOG}  - ${DEPLOYMENT_ID} (${REASON})\n"
               DEPLOYMENT_MATRIX_ITEMS="$(echo "$DEPLOYMENT_MATRIX_ITEMS" | jq -c \
                 --arg deployment_id "$DEPLOYMENT_ID" \
-                '. + [{environment: "dev", deployment_id: $deployment_id, deploy: true}]')"
+                --arg deployment_model "$ACTIVE_DEPLOYMENT_MODEL" \
+                '. + [{environment: "dev", deployment_id: $deployment_id, deployment_model: $deployment_model, deploy: true}]')"
             else
               echo "Not active: ${DEPLOYMENT_ID} (${REASON}) -- skipping build/update for this candidate."
             fi
@@ -823,79 +869,31 @@ jobs:
 
           VALUES_FILE="${ENVS_ROOT}/${ENVIRONMENT}/${DEPLOYMENT_ID}/values.yaml"
 
-          # deploymentModel is resolved from the deployment values file itself,
-          # robustly: prefers PyYAML (full parse), falls back to a conservative
-          # text pattern only if PyYAML isn't installed on the runner, and
-          # defaults any missing/unrecognized value to legacyPair -- an old
-          # values file with no deploymentModel key at all keeps behaving
-          # exactly as before.
-          resolve_deployment_model() {
-            local values_file="$1"
+          # deploymentModel is never inferred or defaulted here -- it comes
+          # straight from the validated active matrix built by
+          # detect_changed_deployments, which only ever admits a deployment
+          # whose own values file classified as deploymentModel=singleRuntime
+          # under the active contract (see is_goldengate_deployment_values_file
+          # in that job). This is a defense-in-depth assertion, not a guess:
+          # any other value reaching this job is a bug upstream and must fail
+          # closed immediately rather than silently proceed under a defaulted
+          # or re-inferred model.
+          DEPLOYMENT_MODEL="${{ matrix.deployment_model }}"
 
-            if [ ! -f "$values_file" ]; then
-              echo "legacyPair"
-              return 0
-            fi
-
-            if command -v python3 >/dev/null 2>&1; then
-              python3 - "$values_file" <<'PYEOF'
-          import sys
-
-          path = sys.argv[1]
-
-          try:
-              import yaml
-          except ImportError:
-              import re
-              with open(path) as f:
-                  raw = f.read()
-              m = re.search(r'(?m)^deploymentModel\s*:\s*(\S+)\s*$', raw)
-              model = m.group(1).strip("\"'") if m else "legacyPair"
-              print(model if model in ("legacyPair", "singleRuntime") else "legacyPair")
-              sys.exit(0)
-
-          with open(path) as f:
-              data = yaml.safe_load(f)
-
-          model = "legacyPair"
-          if isinstance(data, dict):
-              raw_model = data.get("deploymentModel")
-              if raw_model in ("legacyPair", "singleRuntime"):
-                  model = raw_model
-
-          print(model)
-          PYEOF
-              return $?
-            fi
-
-            echo "python3 not available on this runner, using conservative bash fallback" >&2
-            local raw
-            raw="$(grep -E '^deploymentModel:' "$values_file" | head -1 | sed -E 's/^deploymentModel:[[:space:]]*//' | tr -d '"'"'"'\r' | xargs || true)"
-            if [ "$raw" = "singleRuntime" ]; then
-              echo "singleRuntime"
-            else
-              echo "legacyPair"
-            fi
-          }
-
-          DEPLOYMENT_MODEL="$(resolve_deployment_model "$VALUES_FILE")"
-          echo "Resolved deploymentModel: ${DEPLOYMENT_MODEL} (from ${VALUES_FILE})"
-
-          if [ "$DEPLOYMENT_MODEL" = "legacyPair" ]; then
-            TARGET_NAMESPACE="gg-${ENVIRONMENT}-${DEPLOYMENT_ID}"
-            RELEASE_NAME="ogg-${DEPLOYMENT_ID}"
-            ARGOCD_APP_NAME="goldengate-${DEPLOYMENT_ID}"
-          elif [ "$DEPLOYMENT_MODEL" = "singleRuntime" ]; then
-            TARGET_NAMESPACE="goldengate-${ENVIRONMENT}"
-            RELEASE_NAME="${DEPLOYMENT_ID}"
-            # Remove the leading "gg-" only for the Argo CD Application name
-            # suffix, e.g. gg-oracle-payments-01 -> goldengate-dev-oracle-payments-01.
-            APP_SUFFIX="${DEPLOYMENT_ID#gg-}"
-            ARGOCD_APP_NAME="goldengate-${ENVIRONMENT}-${APP_SUFFIX}"
-          else
-            echo "Unknown deploymentModel: ${DEPLOYMENT_MODEL} (must be legacyPair or singleRuntime)"
+          if [ "$DEPLOYMENT_MODEL" != "singleRuntime" ]; then
+            echo "FAIL: matrix.deployment_model is '${DEPLOYMENT_MODEL}', expected exactly 'singleRuntime'."
+            echo "The active build/deploy path only ever supports deploymentModel=singleRuntime -- legacyPair is retired and is never deployed by this job. This indicates the upstream active matrix admitted an unexpected value; refusing to guess or default."
             exit 1
           fi
+
+          echo "deploymentModel: ${DEPLOYMENT_MODEL} (from the validated active matrix, deployment_id=${DEPLOYMENT_ID})"
+
+          TARGET_NAMESPACE="goldengate-${ENVIRONMENT}"
+          RELEASE_NAME="${DEPLOYMENT_ID}"
+          # Remove the leading "gg-" only for the Argo CD Application name
+          # suffix, e.g. gg-oracle-payments-01 -> goldengate-dev-oracle-payments-01.
+          APP_SUFFIX="${DEPLOYMENT_ID#gg-}"
+          ARGOCD_APP_NAME="goldengate-${ENVIRONMENT}-${APP_SUFFIX}"
 
           TEMP_CHART_PATH="work/charts/${DEPLOYMENT_ID}/goldengate"
 
@@ -1074,13 +1072,21 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Neither deploymentModel injects observer image parameters -- the
+          # global.deploymentId is not consumed anywhere in helm/goldengate
+          # (the runtime name/labels derive from Release.Name /
+          # runtime.name/runtime.fullnameOverride -- see
+          # goldengate.runtimeName in _helpers.tpl), so it is never passed
+          # here. deploymentModel itself is never set via --set either: the
+          # deployment values file ($VALUES_FILE) always declares its own
+          # deploymentModel, and this job has already asserted it is exactly
+          # "singleRuntime" above -- helm/goldengate's own unconditional
+          # goldengate.assertSupportedDeploymentModel check re-verifies the
+          # same thing at render time as a second, independent gate. The
           # chart no longer has an observer sidecar or monitoring.observer
           # value at all.
           helm lint "$HELM_CHART_PATH" \
             --values "$VALUES_FILE" \
-            --set global.environment="$ENVIRONMENT" \
-            --set global.deploymentId="$DEPLOYMENT_ID"
+            --set global.environment="$ENVIRONMENT"
 
       - name: Render manifest for validation
         shell: bash
@@ -1093,7 +1099,6 @@ jobs:
             --namespace "$TARGET_NAMESPACE" \
             --values "$VALUES_FILE" \
             --set global.environment="$ENVIRONMENT" \
-            --set global.deploymentId="$DEPLOYMENT_ID" \
             > "rendered/${RELEASE_NAME}.yaml"
 
           echo "Rendered manifest: rendered/${RELEASE_NAME}.yaml"
@@ -1105,33 +1110,22 @@ jobs:
 
           RENDERED="rendered/${RELEASE_NAME}.yaml"
 
-          if [ "$DEPLOYMENT_MODEL" = "singleRuntime" ]; then
-            echo "deploymentModel=singleRuntime: checking that NO Namespace document is rendered from this release: ${RENDERED}"
+          echo "deploymentModel=singleRuntime: checking that NO Namespace document is rendered from this release: ${RENDERED}"
 
-            # A single-runtime release must never render a Namespace -- it
-            # deploys into the shared goldengate-<environment> namespace,
-            # which this release does not create or own (see
-            # helm/goldengate/templates/namespace.yaml, gated to legacyPair only).
-            if grep -qE '^kind: Namespace$' "$RENDERED"; then
-              echo "FAIL: a Namespace document was rendered for a singleRuntime release. This must never happen -- singleRuntime releases must not create or own the shared namespace."
-              exit 1
-            fi
-
-            echo "OK: no Namespace document rendered, as expected for deploymentModel=singleRuntime."
-          else
-            echo "Checking rendered manifest for the GoldenGate Namespace: ${RENDERED}"
-
-            # Fails before package/push/deploy if helm/goldengate/templates/namespace.yaml
-            # is missing, misconfigured, or the ownership labels don't match this
-            # deployment -- the namespace is now an Argo CD-managed resource, so it
-            # must render correctly for cleanup to work on deletion.
-            grep -q "kind: Namespace" "$RENDERED"
-            grep -q "name: ${TARGET_NAMESPACE}" "$RENDERED"
-            grep -q "goldengate.adcb/deployment-id: \"${DEPLOYMENT_ID}\"" "$RENDERED"
-            grep -q "goldengate.adcb/environment: \"${ENVIRONMENT}\"" "$RENDERED"
-
-            echo "OK: Namespace ${TARGET_NAMESPACE} is present in the rendered manifest with the expected ownership labels."
+          # A single-runtime release must never render a Namespace -- it
+          # deploys into the shared goldengate-<environment> namespace,
+          # which this release does not create or own. The chart's
+          # legacyPair Namespace template was removed entirely once
+          # legacyPair rendering was retired (helm/goldengate/templates/
+          # namespace.yaml no longer exists), so this is now the only
+          # deployment model this job ever handles, and this check is
+          # unconditional.
+          if grep -qE '^kind: Namespace$' "$RENDERED"; then
+            echo "FAIL: a Namespace document was rendered for a singleRuntime release. This must never happen -- singleRuntime releases must not create or own the shared namespace."
+            exit 1
           fi
+
+          echo "OK: no Namespace document rendered, as expected for deploymentModel=singleRuntime."
 
       - name: Validate EFS persistence resources are rendered
         shell: bash
@@ -1163,6 +1157,16 @@ jobs:
           import yaml
 
           values_path, deployment_id, deployment_model = sys.argv[1:4]
+
+          # Defense in depth: this job asserted deployment_model ==
+          # "singleRuntime" already in "Prepare deployment variables" -- this
+          # is that same validated value passed through, never re-inferred.
+          # legacyPair's EFS basePath derivation (global.deploymentId-based)
+          # was removed entirely along with the rest of the active legacyPair
+          # path; only singleRuntime is ever handled here now.
+          if deployment_model != "singleRuntime":
+              print(f"FAIL: unexpected deploymentModel {deployment_model!r} reached EFS validation -- only singleRuntime is supported for active deployments.")
+              sys.exit(1)
 
           with open(values_path) as f:
               raw = f.read()
@@ -1211,7 +1215,7 @@ jobs:
 
           if isinstance(explicit_base_path, str) and explicit_base_path.strip():
               base_path = explicit_base_path
-          elif deployment_model == "singleRuntime":
+          else:
               # Mirrors goldengate.efsBasePath: an absent/null/empty basePath
               # derives from the canonical runtime name (fullnameOverride,
               # then name, then -- matching Release.Name in the chart --
@@ -1223,16 +1227,6 @@ jobs:
                   print(f"FAIL: {values_path} could not resolve a runtime name for the default EFS basePath.")
                   sys.exit(1)
               base_path = f"/{runtime_name}"
-          elif deployment_model == "legacyPair":
-              global_values = data.get("global") or {}
-              global_deployment_id = global_values.get("deploymentId")
-              if not isinstance(global_deployment_id, str) or not global_deployment_id.strip():
-                  print(f"FAIL: {values_path} global.deploymentId is required to derive the default EFS basePath for deploymentModel=legacyPair.")
-                  sys.exit(1)
-              base_path = f"/{global_deployment_id}"
-          else:
-              print(f"FAIL: unknown deploymentModel {deployment_model!r} -- cannot derive the default EFS basePath (expected singleRuntime or legacyPair).")
-              sys.exit(1)
 
           print("PERSISTENCE_EFS_ENABLED=true")
           print(f"EFS_FILESYSTEM_ID={file_system_id}")
@@ -1381,64 +1375,35 @@ jobs:
                   print(f"FAIL: {label} StatefulSet u03 volume is not emptyDir (found: {u03!r}).")
                   sys.exit(1)
 
-          if deployment_model == "singleRuntime":
-              expected_pvc_name = f"{deployment_id}-u02"
+          # Defense in depth, matching the same assertion above: only
+          # singleRuntime is ever validated here. legacyPair's source/target
+          # PVC and StatefulSet validation was removed entirely along with
+          # the rest of the active legacyPair path -- helm/goldengate no
+          # longer renders source-statefulset.yaml/target-statefulset.yaml
+          # at all (see Git history for the removed templates).
+          if deployment_model != "singleRuntime":
+              print(f"FAIL: unexpected deploymentModel {deployment_model!r} reached EFS rendered-resource validation -- only singleRuntime is supported for active deployments.")
+              sys.exit(1)
 
-              pvcs = [
-                  doc for _, doc in documents
-                  if doc.get("kind") == "PersistentVolumeClaim"
-                  and (doc.get("metadata") or {}).get("name") == expected_pvc_name
-              ]
-              if len(pvcs) != 1:
-                  print(f"FAIL: expected exactly one PersistentVolumeClaim named {expected_pvc_name!r}, found {len(pvcs)}.")
-                  sys.exit(1)
+          expected_pvc_name = f"{deployment_id}-u02"
 
-              statefulsets = [doc for _, doc in documents if doc.get("kind") == "StatefulSet"]
-              if len(statefulsets) != 1:
-                  print(f"FAIL: expected exactly one StatefulSet, found {len(statefulsets)}.")
-                  sys.exit(1)
+          pvcs = [
+              doc for _, doc in documents
+              if doc.get("kind") == "PersistentVolumeClaim"
+              and (doc.get("metadata") or {}).get("name") == expected_pvc_name
+          ]
+          if len(pvcs) != 1:
+              print(f"FAIL: expected exactly one PersistentVolumeClaim named {expected_pvc_name!r}, found {len(pvcs)}.")
+              sys.exit(1)
 
-              _check_u02_u03("runtime", statefulsets[0], expected_pvc_name)
+          statefulsets = [doc for _, doc in documents if doc.get("kind") == "StatefulSet"]
+          if len(statefulsets) != 1:
+              print(f"FAIL: expected exactly one StatefulSet, found {len(statefulsets)}.")
+              sys.exit(1)
 
-              print("OK: EFS StorageClass, runtime PVC, and StatefulSet u02/u03 volumes all match the expected persistence configuration.")
-          else:
-              with open(values_path) as f:
-                  values = yaml.safe_load(f) or {}
+          _check_u02_u03("runtime", statefulsets[0], expected_pvc_name)
 
-              source_values = values.get("source") or {}
-              target_values = values.get("target") or {}
-              source_pvc_name = ((source_values.get("storage") or {}).get("u02") or {}).get("claimName")
-              target_pvc_name = ((target_values.get("storage") or {}).get("u02") or {}).get("claimName")
-
-              if not isinstance(source_pvc_name, str) or not source_pvc_name.strip() \
-                 or not isinstance(target_pvc_name, str) or not target_pvc_name.strip():
-                  print(f"FAIL: source.storage.u02.claimName or target.storage.u02.claimName not found in {values_path}. Cannot validate the rendered PVCs.")
-                  sys.exit(1)
-
-              for pvc_name in (source_pvc_name, target_pvc_name):
-                  pvcs = [
-                      doc for _, doc in documents
-                      if doc.get("kind") == "PersistentVolumeClaim"
-                      and (doc.get("metadata") or {}).get("name") == pvc_name
-                  ]
-                  if len(pvcs) != 1:
-                      print(f"FAIL: expected exactly one PersistentVolumeClaim named {pvc_name!r}, found {len(pvcs)}.")
-                      sys.exit(1)
-
-              source_statefulsets = [doc for template, doc in documents if doc.get("kind") == "StatefulSet" and template and template.endswith("source-statefulset.yaml")]
-              target_statefulsets = [doc for template, doc in documents if doc.get("kind") == "StatefulSet" and template and template.endswith("target-statefulset.yaml")]
-
-              if len(source_statefulsets) != 1:
-                  print(f"FAIL: expected exactly one source StatefulSet (source-statefulset.yaml), found {len(source_statefulsets)}.")
-                  sys.exit(1)
-              if len(target_statefulsets) != 1:
-                  print(f"FAIL: expected exactly one target StatefulSet (target-statefulset.yaml), found {len(target_statefulsets)}.")
-                  sys.exit(1)
-
-              _check_u02_u03("source", source_statefulsets[0], source_pvc_name)
-              _check_u02_u03("target", target_statefulsets[0], target_pvc_name)
-
-              print("OK: EFS StorageClass, source/target PVCs, and StatefulSet u02/u03 volumes all match the expected persistence configuration.")
+          print("OK: EFS StorageClass, runtime PVC, and StatefulSet u02/u03 volumes all match the expected persistence configuration.")
           PYEOF
 
       - name: Validate no observer sidecar is rendered
@@ -1448,20 +1413,19 @@ jobs:
 
           RENDERED="rendered/${RELEASE_NAME}.yaml"
 
-          if [ "$DEPLOYMENT_MODEL" = "singleRuntime" ]; then
-            echo "deploymentModel=singleRuntime: validating the generic runtime resource contract with Python/PyYAML -- never indentation-based grep for Kubernetes object structure."
+          echo "deploymentModel=singleRuntime: validating the generic runtime resource contract with Python/PyYAML -- never indentation-based grep for Kubernetes object structure."
 
-            if ! command -v python3 >/dev/null 2>&1; then
-              echo "FAIL: python3 is required to validate singleRuntime rendered manifests and is not available on this runner."
-              exit 1
-            fi
+          if ! command -v python3 >/dev/null 2>&1; then
+            echo "FAIL: python3 is required to validate singleRuntime rendered manifests and is not available on this runner."
+            exit 1
+          fi
 
-            if ! python3 -c "import yaml" >/dev/null 2>&1; then
-              echo "FAIL: PyYAML is required to validate singleRuntime rendered manifests and is not available on this runner."
-              exit 1
-            fi
+          if ! python3 -c "import yaml" >/dev/null 2>&1; then
+            echo "FAIL: PyYAML is required to validate singleRuntime rendered manifests and is not available on this runner."
+            exit 1
+          fi
 
-            python3 - "$RENDERED" "$VALUES_FILE" "$DEPLOYMENT_ID" "$TARGET_NAMESPACE" <<'PYEOF'
+          python3 - "$RENDERED" "$VALUES_FILE" "$DEPLOYMENT_ID" "$TARGET_NAMESPACE" <<'PYEOF'
           import sys
           import yaml
 
@@ -1711,66 +1675,6 @@ jobs:
           print("OK: singleRuntime rendered manifest passed all generic runtime contract checks (Python/PyYAML, duplicate-key-safe).")
           PYEOF
 
-            echo "SOURCE_ENABLED=false" >> "$GITHUB_ENV"
-            echo "TARGET_ENABLED=false" >> "$GITHUB_ENV"
-            exit 0
-          fi
-
-          # deploymentModel=legacyPair: retired. No active values folder uses
-          # this model anymore (the last one, envs/dev/payments-ora-to-pg-001/,
-          # was removed from the repository once its live Argo CD Application
-          # and namespace were already retired -- historical source remains
-          # available through Git history). helm/goldengate now rejects
-          # deploymentModel=legacyPair with a controlled error at render time,
-          # so this branch is unreachable in normal operation; it is left in
-          # place only as inert defensive code, never selected for automatic
-          # deployment. This is a simple negative assertion, not observer-
-          # contract validation.
-          echo "deploymentModel=legacyPair: validating that no observer container or annotation is rendered (observer support has been retired)."
-
-          SOURCE_STS="$(awk '/^# Source: .*source-statefulset\.yaml$/{flag=1} flag{print} /^---$/{if(flag) exit}' "$RENDERED")"
-          TARGET_STS="$(awk '/^# Source: .*target-statefulset\.yaml$/{flag=1} flag{print} /^---$/{if(flag) exit}' "$RENDERED")"
-
-          SOURCE_ENABLED="false"
-          [ -n "$SOURCE_STS" ] && SOURCE_ENABLED="true"
-
-          TARGET_ENABLED="false"
-          [ -n "$TARGET_STS" ] && TARGET_ENABLED="true"
-
-          echo "SOURCE_ENABLED=${SOURCE_ENABLED}" >> "$GITHUB_ENV"
-          echo "TARGET_ENABLED=${TARGET_ENABLED}" >> "$GITHUB_ENV"
-
-          if [ "$SOURCE_ENABLED" != "true" ] && [ "$TARGET_ENABLED" != "true" ]; then
-            echo "FAIL: neither source nor target is enabled for this deployment -- there is no rendered StatefulSet to validate."
-            exit 1
-          fi
-
-          for LABEL in source target; do
-            case "$LABEL" in
-              source) ENABLED="$SOURCE_ENABLED"; STS="$SOURCE_STS" ;;
-              target) ENABLED="$TARGET_ENABLED"; STS="$TARGET_STS" ;;
-            esac
-
-            if [ "$ENABLED" != "true" ]; then
-              echo "${LABEL} is not enabled for this deployment (no StatefulSet rendered). Skipping."
-              continue
-            fi
-
-            if echo "$STS" | grep -q "^        - name: goldengate-observer"; then
-              echo "FAIL: ${LABEL} StatefulSet unexpectedly renders a goldengate-observer container. Observer support has been retired and must never be rendered."
-              exit 1
-            fi
-
-            if echo "$STS" | grep -q "goldengate\.adcb/observer-enabled"; then
-              echo "FAIL: ${LABEL} StatefulSet unexpectedly renders a goldengate.adcb/observer-enabled annotation. Observer support has been retired."
-              exit 1
-            fi
-
-            echo "OK: ${LABEL} StatefulSet renders no observer container or annotation."
-          done
-
-          echo "OK: no observer container or annotation rendered for any enabled component."
-
       - name: Package deployment-specific Helm chart
         shell: bash
         run: |
@@ -1976,15 +1880,19 @@ jobs:
 
           echo "Applying Argo CD Application: ${ARGOCD_APP_NAME} (deploymentModel=${DEPLOYMENT_MODEL})"
 
-          if [ "$DEPLOYMENT_MODEL" = "singleRuntime" ]; then
-            # singleRuntime deploys into the shared goldengate-<environment>
-            # namespace, which this Application does not create or own:
-            # no CreateNamespace=true, no managedNamespaceMetadata. That
-            # namespace is provisioned and owned by a separate, later
-            # platform/bootstrap step. No observer Helm parameters either --
-            # the generic runtime chart resources never reference
-            # monitoring.observer.
-            cat <<EOF | kubectl apply -f -
+          # singleRuntime deploys into the shared goldengate-<environment>
+          # namespace, which this Application does not create or own: no
+          # CreateNamespace=true, no managedNamespaceMetadata. That namespace
+          # is provisioned and owned by a separate, later platform/bootstrap
+          # step. No observer Helm parameters either -- the generic runtime
+          # chart resources never reference monitoring.observer. No
+          # global.deploymentId parameter either -- it has no call-site
+          # anywhere in helm/goldengate (the runtime name derives from
+          # Release.Name/runtime.name/runtime.fullnameOverride). This is now
+          # the only deployment model this job ever handles (legacyPair's
+          # CreateNamespace=true / managedNamespaceMetadata Application shape
+          # was removed along with the rest of the active legacyPair path).
+          cat <<EOF | kubectl apply -f -
           apiVersion: argoproj.io/v1alpha1
           kind: Application
           metadata:
@@ -2010,8 +1918,6 @@ jobs:
                 parameters:
                   - name: global.environment
                     value: ${ENVIRONMENT}
-                  - name: global.deploymentId
-                    value: ${DEPLOYMENT_ID}
             destination:
               server: https://kubernetes.default.svc
               namespace: ${TARGET_NAMESPACE}
@@ -2021,53 +1927,6 @@ jobs:
                 selfHeal: true
             revisionHistoryLimit: 10
           EOF
-          else
-            cat <<EOF | kubectl apply -f -
-          apiVersion: argoproj.io/v1alpha1
-          kind: Application
-          metadata:
-            name: ${ARGOCD_APP_NAME}
-            namespace: ${ARGOCD_NAMESPACE}
-            finalizers:
-              - resources-finalizer.argocd.argoproj.io
-            labels:
-              app.kubernetes.io/name: goldengate
-              app.kubernetes.io/managed-by: argocd
-              goldengate.adcb/environment: ${ENVIRONMENT}
-              goldengate.adcb/deployment-id: ${DEPLOYMENT_ID}
-          spec:
-            project: default
-            source:
-              repoURL: ${HELM_CHART_REF}
-              targetRevision: ${CHART_VERSION}
-              path: .
-              helm:
-                releaseName: ${RELEASE_NAME}
-                valueFiles:
-                  - values-deployment.yaml
-                parameters:
-                  - name: global.environment
-                    value: ${ENVIRONMENT}
-                  - name: global.deploymentId
-                    value: ${DEPLOYMENT_ID}
-            destination:
-              server: https://kubernetes.default.svc
-              namespace: ${TARGET_NAMESPACE}
-            syncPolicy:
-              automated:
-                prune: true
-                selfHeal: true
-              syncOptions:
-                - CreateNamespace=true
-              managedNamespaceMetadata:
-                labels:
-                  app.kubernetes.io/name: goldengate
-                  app.kubernetes.io/managed-by: argocd
-                  goldengate.adcb/environment: ${ENVIRONMENT}
-                  goldengate.adcb/deployment-id: ${DEPLOYMENT_ID}
-            revisionHistoryLimit: 10
-          EOF
-          fi
 
           echo "Forcing Argo CD refresh for ${ARGOCD_APP_NAME}..."
 
@@ -2250,12 +2109,27 @@ jobs:
             echo "ECR credentials."
             echo ""
             echo "A values.yaml is inactive (excluded from the build/update matrix) when it is"
-            echo "missing, empty/comment-only, enabled=false, deployment.enabled=false, or"
-            echo "lifecycle.state=absent. Of those, only a genuinely removed/missing file or an"
-            echo "explicit lifecycle.state=absent is treated as a deletion request (deletes the"
-            echo "Argo CD Application and, if safely identifiable, its namespace)."
-            echo "deployment.enabled=false (and top-level enabled=false) mark a deployment as"
-            echo "retired-but-retained for rollback/reference and never trigger deletion."
+            echo "missing, zero-byte, whitespace-only, comment-only, parses to YAML null,"
+            echo "enabled=false, deployment.enabled=false, or lifecycle.state=absent."
+            echo ""
+            echo "Of those, deletion (deletes the Argo CD Application and, if safely"
+            echo "identifiable, its namespace) is triggered by:"
+            echo "- physical removal of the values file or its whole deployment folder"
+            echo "  (including removal of the entire envs/dev/ directory);"
+            echo "- a values file that still exists but is now zero-byte;"
+            echo "- a values file that still exists but is now whitespace-only;"
+            echo "- a values file that still exists but is now comment-only;"
+            echo "- a values file that still exists but now parses to YAML null;"
+            echo "- an explicit lifecycle.state=absent."
+            echo "The four \"still exists but emptied\" shapes above only trigger deletion when"
+            echo "the previous revision at that path was a valid GoldenGate deployment -- the"
+            echo "deployment_model recorded for deletion is always read from that previous,"
+            echo "valid revision, never inferred or defaulted."
+            echo ""
+            echo "enabled=false and deployment.enabled=false mark a deployment as"
+            echo "retired-but-retained for rollback/reference and never trigger deletion --"
+            echo "the values folder stays in place and is excluded from the build/update"
+            echo "matrix, but no Argo CD Application or namespace is touched."
             echo ""
             echo "### Validation commands"
             echo ""
@@ -2352,18 +2226,29 @@ jobs:
             exit 1
           fi
 
-          # deployment_model comes from detect_changed_deployments, which
-          # already defaults a missing/unrecognized value at the base
-          # revision to legacyPair -- but re-normalize defensively here too,
-          # since this value directly controls namespace deletion safety
-          # below.
+          # deployment_model comes from detect_changed_deployments' deletion
+          # matrix, which only ever emits exactly "singleRuntime" or
+          # "legacyPair" under the historical deletion contract (see
+          # is_goldengate_deployment_values_file_at_ref/
+          # _classify_deployment_model_yaml in that job) -- it never defaults
+          # an unrecognized value to either model. This value directly
+          # controls namespace deletion safety below, so re-verify it here
+          # defensively too, and fail closed (never default/guess) if it is
+          # ever anything else: that would mean the upstream matrix is
+          # broken, not a case to paper over.
           if [ "$DEPLOYMENT_MODEL" != "legacyPair" ] && [ "$DEPLOYMENT_MODEL" != "singleRuntime" ]; then
-            echo "Unrecognized deployment_model '${DEPLOYMENT_MODEL}' from the deletion matrix -- defaulting to legacyPair."
-            DEPLOYMENT_MODEL="legacyPair"
+            echo "FAIL: unrecognized deployment_model '${DEPLOYMENT_MODEL}' from the deletion matrix (expected exactly 'singleRuntime' or 'legacyPair')."
+            echo "Refusing to guess or default this value -- it directly controls which namespace/Application this job targets for deletion. This indicates a bug in the upstream deletion matrix; investigate detect_changed_deployments before re-running."
+            exit 1
           fi
 
           ARGOCD_NAMESPACE="argocd"
 
+          # legacyPair mapping is retained here ONLY (not in the active
+          # build/deploy job) because historical legacyPair resources that
+          # may still need deletion used this exact naming:
+          #   Application: goldengate-<deployment-id>
+          #   namespace:   gg-<environment>-<deployment-id>
           if [ "$DEPLOYMENT_MODEL" = "singleRuntime" ]; then
             TARGET_NAMESPACE="goldengate-${ENVIRONMENT}"
             APP_SUFFIX="${DEPLOYMENT_ID#gg-}"

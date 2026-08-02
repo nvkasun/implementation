@@ -189,10 +189,20 @@ fi
 echo ""
 echo "--- Helm lint ---"
 if [ "$HELM_AVAILABLE" = "true" ]; then
-  if helm lint "$RUNTIME_CHART" >"${WORKDIR}/lint-runtime.log" 2>&1; then
-    pass "helm lint ${RUNTIME_CHART}"
+  # helm/goldengate's deploymentModel value has no usable default (it is ""
+  # in values.yaml) and goldengate.assertSupportedDeploymentModel fires
+  # unconditionally at render time -- lint the same way the real workflow
+  # always does: against a real canonical deployment values file (which
+  # declares deploymentModel: singleRuntime itself), never bare/values-less.
+  # (helm lint does not propagate a template "fail" call as a non-zero exit
+  # by itself, so a bare, values-less invocation here would not actually
+  # exercise or prove anything about the assertion either way -- using a
+  # canonical values file keeps this check meaningful and representative of
+  # how the chart is actually linted in production.)
+  if helm lint "$RUNTIME_CHART" -f "${REPO_ROOT}/envs/dev/gg-oracle-payments-01/values.yaml" --set global.environment=dev >"${WORKDIR}/lint-runtime.log" 2>&1; then
+    pass "helm lint ${RUNTIME_CHART} (canonical singleRuntime values)"
   else
-    fail "helm lint ${RUNTIME_CHART}"
+    fail "helm lint ${RUNTIME_CHART} (canonical singleRuntime values)"
     cat "${WORKDIR}/lint-runtime.log"
   fi
 
@@ -1188,7 +1198,8 @@ HARNESS
              "${DELETION_REPO}/envs/dev/case-empty-zerobyte" \
              "${DELETION_REPO}/envs/dev/case-empty-comment" \
              "${DELETION_REPO}/envs/dev/case-empty-whitespace" \
-             "${DELETION_REPO}/envs/dev/case-empty-null"
+             "${DELETION_REPO}/envs/dev/case-empty-null" \
+             "${DELETION_REPO}/envs/dev/case3-historical-legacypair-removed"
 
     printf 'deploymentModel: singleRuntime\nrunning: at-base-revision\n' > "${DELETION_REPO}/envs/dev/case2-removed-canonical/values.yaml"
     printf 'global:\n  environment: dev\nnamespace:\n  create: true\n' > "${DELETION_REPO}/envs/dev/goldengate-monitor/values.yaml"
@@ -1199,6 +1210,7 @@ HARNESS
     printf 'deploymentModel: singleRuntime\nrunning: at-base-revision\n' > "${DELETION_REPO}/envs/dev/case-empty-comment/values.yaml"
     printf 'deploymentModel: singleRuntime\nrunning: at-base-revision\n' > "${DELETION_REPO}/envs/dev/case-empty-whitespace/values.yaml"
     printf 'deploymentModel: singleRuntime\nrunning: at-base-revision\n' > "${DELETION_REPO}/envs/dev/case-empty-null/values.yaml"
+    printf 'deploymentModel: legacyPair\nrunning: at-base-revision\n' > "${DELETION_REPO}/envs/dev/case3-historical-legacypair-removed/values.yaml"
 
     git -C "$DELETION_REPO" init -q
     git -C "$DELETION_REPO" config user.email "test@test.invalid"
@@ -1208,19 +1220,24 @@ HARNESS
     DELETION_BEFORE_SHA="$(git -C "$DELETION_REPO" rev-parse HEAD)"
 
     # Now mutate the working tree to the "after" state the loop actually
-    # evaluates: case2/4/5/6/7 are removed (git rm, matching a real
-    # removed/renamed deletion candidate); case1 and case3 are added fresh
-    # in the working tree only (never committed -- they represent "still
-    # exists, but now inactive" candidates, which is what the loop's
-    # is_goldengate_deployment_values_file working-tree path reads); the
-    # case-empty-* files are overwritten IN PLACE (never git rm'd) with each
-    # of the four "deliberately empty" shapes the Phase 5B2A classification
-    # fix must fall back through to their still-valid content at BEFORE_SHA.
-    git -C "$DELETION_REPO" rm -rq envs/dev/case2-removed-canonical envs/dev/goldengate-monitor envs/dev/argocd envs/dev/case6-malformed envs/dev/case7-unknown-model
+    # evaluates: case2/3/4/5/6/7 are removed (git rm, matching a real
+    # removed/renamed deletion candidate -- case3 specifically proves the
+    # HISTORICAL DELETION CONTRACT still classifies a legacyPair deployment
+    # that existed at the base revision, exactly how the real, now-removed
+    # envs/dev/payments-ora-to-pg-001/ deletion actually worked); case1 is
+    # added fresh in the working tree only (never committed -- it
+    # represents a "still exists, but now inactive" candidate, which is
+    # what the loop's is_goldengate_deployment_values_file working-tree/
+    # ACTIVE CONTRACT path reads -- and, being legacyPair, is correctly
+    # invisible to that active-only path regardless of its
+    # deployment.enabled value); the case-empty-* files are overwritten IN
+    # PLACE (never git rm'd) with each of the four "deliberately empty"
+    # shapes the classification fix must fall back through to their still-
+    # valid content at BEFORE_SHA.
+    git -C "$DELETION_REPO" rm -rq envs/dev/case2-removed-canonical envs/dev/goldengate-monitor envs/dev/argocd envs/dev/case6-malformed envs/dev/case7-unknown-model envs/dev/case3-historical-legacypair-removed
 
-    mkdir -p "${DELETION_REPO}/envs/dev/case1-retired-legacypair-retained" "${DELETION_REPO}/envs/dev/case3-lifecycle-absent"
+    mkdir -p "${DELETION_REPO}/envs/dev/case1-retired-legacypair-retained"
     printf 'deploymentModel: legacyPair\ndeployment:\n  enabled: false\n' > "${DELETION_REPO}/envs/dev/case1-retired-legacypair-retained/values.yaml"
-    printf 'deploymentModel: legacyPair\nlifecycle:\n  state: absent\n' > "${DELETION_REPO}/envs/dev/case3-lifecycle-absent/values.yaml"
 
     : > "${DELETION_REPO}/envs/dev/case-empty-zerobyte/values.yaml"
     printf '# retired\n# nothing here\n' > "${DELETION_REPO}/envs/dev/case-empty-comment/values.yaml"
@@ -1242,7 +1259,7 @@ HARNESS
       }
       BEFORE_SHA="'"$DELETION_BEFORE_SHA"'"
 
-      for id in case1-retired-legacypair-retained case2-removed-canonical case3-lifecycle-absent goldengate-monitor argocd case6-malformed case7-unknown-model case-empty-zerobyte case-empty-comment case-empty-whitespace case-empty-null; do
+      for id in case1-retired-legacypair-retained case2-removed-canonical case3-historical-legacypair-removed goldengate-monitor argocd case6-malformed case7-unknown-model case-empty-zerobyte case-empty-comment case-empty-whitespace case-empty-null; do
         DELETION_MATRIX_ITEMS="[]"
         INACTIVE_LOG=""
         DELETION_CANDIDATE_IDS="$id"
@@ -1277,8 +1294,8 @@ HARNESS
       '^RESULT case1-retired-legacypair-retained => \[\]$'
     check_deletion_case "2: removed canonical GoldenGate values (deploymentModel: singleRuntime) produces a deletion entry with deployment_model=singleRuntime" \
       '^RESULT case2-removed-canonical => \[ADDED id=case2-removed-canonical model=singleRuntime\]$'
-    check_deletion_case "3: existing GoldenGate file with lifecycle.state=absent produces a deletion entry" \
-      '^RESULT case3-lifecycle-absent => \[ADDED id=case3-lifecycle-absent model=legacyPair\]$'
+    check_deletion_case "4-req: the historical deletion contract still classifies a removed legacyPair deployment (deployment_model=legacyPair) even though legacyPair is no longer active/deployable" \
+      '^RESULT case3-historical-legacypair-removed => \[ADDED id=case3-historical-legacypair-removed model=legacyPair\]$'
     check_deletion_case "11: removed goldengate-monitor values does not enter the GoldenGate deletion matrix" \
       '^RESULT goldengate-monitor => \[\]$'
     check_deletion_case "12: removed argocd values does not enter the GoldenGate deletion matrix" \
@@ -1302,6 +1319,266 @@ HARNESS
   fi
 else
   skip "Phase 5A legacy-folder behavioral checks -- ${EKS_APP_WORKFLOW} or python3 not available"
+fi
+
+# ---------------------------------------------------------------------
+# Phase 5B2A pre-deployment correction: active/historical classifier split
+# regression tests. Covers the required proofs: manual legacyPair
+# deployment is rejected; active legacyPair cannot enter the build matrix;
+# missing/unknown current deploymentModel never defaults to legacyPair;
+# unknown deletion-matrix model fails closed; no active build/Application
+# path contains legacyPair; no source/target StatefulSet/PVC validation
+# remains; the workflow summary accurately documents all deletion
+# triggers. (Historical-legacyPair deletion classification is covered
+# above by case3-historical-legacypair-removed.)
+# ---------------------------------------------------------------------
+echo ""
+echo "--- Phase 5B2A: active-contract rejection of legacyPair; deletion-job fail-closed; no legacyPair in the active build/Application path ---"
+
+if [ -f "${WORKDIR}/is_gg_fn.sh" ] && [ -s "${WORKDIR}/is_gg_fn.sh" ]; then
+  CLASSIFIER_REPO="${WORKDIR}/classifier-repo"
+  rm -rf "$CLASSIFIER_REPO"
+  mkdir -p "${CLASSIFIER_REPO}/envs/dev/case-manual-legacypair" \
+           "${CLASSIFIER_REPO}/envs/dev/case-push-active-legacypair" \
+           "${CLASSIFIER_REPO}/envs/dev/case-no-model" \
+           "${CLASSIFIER_REPO}/envs/dev/case-unknown-model-active"
+  printf 'deploymentModel: legacyPair\nrunning: true\n' > "${CLASSIFIER_REPO}/envs/dev/case-manual-legacypair/values.yaml"
+  printf 'deploymentModel: legacyPair\nrunning: true\n' > "${CLASSIFIER_REPO}/envs/dev/case-push-active-legacypair/values.yaml"
+  printf 'runtime:\n  replicas: 1\n' > "${CLASSIFIER_REPO}/envs/dev/case-no-model/values.yaml"
+  printf 'deploymentModel: totallyMadeUp\n' > "${CLASSIFIER_REPO}/envs/dev/case-unknown-model-active/values.yaml"
+
+  CLASSIFIER_OUT="$(cd "$CLASSIFIER_REPO" && bash -c '
+    set -euo pipefail
+    source "'"${WORKDIR}"'/is_gg_fn.sh"
+    for id in case-manual-legacypair case-push-active-legacypair case-no-model case-unknown-model-active; do
+      set +e
+      REASON="$(is_goldengate_deployment_values_file "envs/dev/${id}/values.yaml")"
+      STATUS=$?
+      set -e
+      echo "CLASSIFY ${id} status=${STATUS} reason=${REASON}"
+    done
+  ' 2>&1)"
+  echo "$CLASSIFIER_OUT"
+
+  # 1: manual (workflow_dispatch-equivalent) legacyPair deployment request
+  # is rejected by the active contract -- workflow_dispatch validates the
+  # requested deployment_id's values file with exactly this same function.
+  if echo "$CLASSIFIER_OUT" | grep -qE "^CLASSIFY case-manual-legacypair status=1 reason=not a GoldenGate deployment values file: deploymentModel='legacyPair'$"; then
+    pass "1: a manual (workflow_dispatch) request for a legacyPair deployment is rejected by the active contract"
+  else
+    fail "1: a manual legacyPair deployment request was not rejected as expected"
+  fi
+
+  # 2: active legacyPair cannot enter the push-triggered build/update
+  # matrix -- that loop classifies every candidate with exactly this same
+  # function before ever considering active/inactive status.
+  if echo "$CLASSIFIER_OUT" | grep -qE "^CLASSIFY case-push-active-legacypair status=1 reason=not a GoldenGate deployment values file: deploymentModel='legacyPair'$"; then
+    pass "2: a legacyPair deployment values file cannot enter the active push build/update matrix"
+  else
+    fail "2: a legacyPair deployment values file was not excluded from the active build matrix as expected"
+  fi
+
+  # 3: missing/unknown current deploymentModel never defaults to
+  # legacyPair -- both a file with no deploymentModel key at all, and a
+  # file with an unrecognized value, must be rejected (reason mentions the
+  # actual value/None), never silently treated as legacyPair or accepted.
+  if echo "$CLASSIFIER_OUT" | grep -qE "^CLASSIFY case-no-model status=1 reason=not a GoldenGate deployment values file: deploymentModel=None$" \
+      && ! echo "$CLASSIFIER_OUT" | grep -q "case-no-model.*legacyPair"; then
+    pass "3a: a current values file with no deploymentModel key is rejected, never defaulted to legacyPair"
+  else
+    fail "3a: a current values file with no deploymentModel key was not handled as expected"
+  fi
+  if echo "$CLASSIFIER_OUT" | grep -qE "^CLASSIFY case-unknown-model-active status=1 reason=not a GoldenGate deployment values file: deploymentModel='totallyMadeUp'$"; then
+    pass "3b: a current values file with an unrecognized deploymentModel is rejected, never defaulted to legacyPair"
+  else
+    fail "3b: a current values file with an unrecognized deploymentModel was not handled as expected"
+  fi
+
+  rm -rf "$CLASSIFIER_REPO"
+else
+  skip "active-contract classifier rejection tests -- ${WORKDIR}/is_gg_fn.sh not available"
+fi
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  # 5: the deletion job's "Prepare deletion variables" step must fail
+  # closed (non-zero exit, no defaulting) when matrix.deployment_model is
+  # neither singleRuntime nor legacyPair.
+  python3 - "$EKS_APP_WORKFLOW" > "${WORKDIR}/prepare_deletion_vars.sh" <<'PYEOF'
+import sys
+import yaml
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+for step in doc["jobs"]["delete_removed_argocd_applications"]["steps"]:
+    if step.get("name") == "Prepare deletion variables":
+        text = step["run"]
+        text = text.replace('${{ matrix.environment }}', '$TEST_ENVIRONMENT')
+        text = text.replace('${{ matrix.deployment_id }}', '$TEST_DEPLOYMENT_ID')
+        text = text.replace('${{ matrix.deployment_model }}', '$TEST_DEPLOYMENT_MODEL')
+        sys.stdout.write(text)
+        break
+else:
+    sys.exit("step not found")
+PYEOF
+
+  if [ -s "${WORKDIR}/prepare_deletion_vars.sh" ]; then
+    set +e
+    UNKNOWN_DELETION_MODEL_OUT="$(TEST_ENVIRONMENT="dev" TEST_DEPLOYMENT_ID="gg-oracle-payments-01" TEST_DEPLOYMENT_MODEL="bogusModel" \
+      bash -c 'set -euo pipefail; GITHUB_ENV=/dev/null; source "'"${WORKDIR}"'/prepare_deletion_vars.sh"' 2>&1)"
+    UNKNOWN_DELETION_MODEL_STATUS=$?
+    set -e
+    echo "$UNKNOWN_DELETION_MODEL_OUT"
+
+    if [ "$UNKNOWN_DELETION_MODEL_STATUS" -ne 0 ] \
+        && echo "$UNKNOWN_DELETION_MODEL_OUT" | grep -qF "FAIL: unrecognized deployment_model 'bogusModel'" \
+        && ! echo "$UNKNOWN_DELETION_MODEL_OUT" | grep -qi "defaulting to legacyPair"; then
+      pass "5: an unknown deletion-matrix deployment_model fails the deletion job closed (never defaults to legacyPair)"
+    else
+      fail "5: an unknown deletion-matrix deployment_model was not rejected as expected (status=${UNKNOWN_DELETION_MODEL_STATUS})"
+    fi
+
+    # Sanity: singleRuntime and legacyPair both still resolve without error.
+    set +e
+    SINGLE_OK_OUT="$(TEST_ENVIRONMENT="dev" TEST_DEPLOYMENT_ID="gg-oracle-payments-01" TEST_DEPLOYMENT_MODEL="singleRuntime" \
+      bash -c 'set -euo pipefail; GITHUB_ENV=/dev/null; source "'"${WORKDIR}"'/prepare_deletion_vars.sh"; echo "OK namespace=${TARGET_NAMESPACE} app=${ARGOCD_APP_NAME}"' 2>&1)"
+    SINGLE_OK_STATUS=$?
+    LEGACY_OK_OUT="$(TEST_ENVIRONMENT="dev" TEST_DEPLOYMENT_ID="payments-ora-to-pg-001" TEST_DEPLOYMENT_MODEL="legacyPair" \
+      bash -c 'set -euo pipefail; GITHUB_ENV=/dev/null; source "'"${WORKDIR}"'/prepare_deletion_vars.sh"; echo "OK namespace=${TARGET_NAMESPACE} app=${ARGOCD_APP_NAME}"' 2>&1)"
+    LEGACY_OK_STATUS=$?
+    set -e
+
+    if [ "$SINGLE_OK_STATUS" -eq 0 ] && echo "$SINGLE_OK_OUT" | grep -qF "OK namespace=goldengate-dev app=goldengate-dev-oracle-payments-01"; then
+      pass "the deletion job still resolves singleRuntime namespace/Application naming correctly"
+    else
+      fail "the deletion job did not resolve singleRuntime namespace/Application naming as expected"
+      echo "$SINGLE_OK_OUT"
+    fi
+
+    if [ "$LEGACY_OK_STATUS" -eq 0 ] && echo "$LEGACY_OK_OUT" | grep -qF "OK namespace=gg-dev-payments-ora-to-pg-001 app=goldengate-payments-ora-to-pg-001"; then
+      pass "the deletion job still resolves the historical legacyPair namespace/Application naming (gg-<env>-<id> / goldengate-<id>) correctly"
+    else
+      fail "the deletion job did not resolve the historical legacyPair namespace/Application naming as expected"
+      echo "$LEGACY_OK_OUT"
+    fi
+  else
+    fail "could not extract the 'Prepare deletion variables' step from ${EKS_APP_WORKFLOW}"
+  fi
+else
+  skip "deletion-job fail-closed unknown-model test -- python3 not available"
+fi
+
+# 6/7: static checks that no active build/Application-path code contains
+# legacyPair conditional logic, and that no source/target StatefulSet/PVC
+# validation remains anywhere in the workflow.
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  BUILD_JOB_LEGACY_CODE_HITS="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import sys
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+
+hits = []
+for step in doc["jobs"]["build_publish_and_deploy"]["steps"]:
+    run = step.get("run", "")
+    for lineno, line in enumerate(run.splitlines(), start=1):
+        if "legacypair" not in line.lower():
+            continue
+        stripped = line.strip()
+        # Allowed: blank, a comment line (bash '#' or Python '#' -- this
+        # job's run: blocks are bash with embedded python3 heredocs, and
+        # both comment styles use '#'), or a bare echo/print statement --
+        # those are informational log/error-message text (e.g. explaining
+        # *why* legacyPair is rejected), never branching/decision logic.
+        # What must be absent is legacyPair appearing in an actual
+        # conditional, comparison, assignment, or case pattern.
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("echo ") or stripped.startswith('echo"') \
+                or stripped.startswith("print(") or stripped.startswith("print ("):
+            continue
+        hits.append(f'{step.get("name")}:{lineno}: {stripped}')
+
+for hit in hits:
+    print(hit)
+PYEOF
+)"
+  echo "$BUILD_JOB_LEGACY_CODE_HITS"
+
+  if [ -z "$BUILD_JOB_LEGACY_CODE_HITS" ]; then
+    pass "6: no active build/Application-path code (non-comment lines) in build_publish_and_deploy references legacyPair"
+  else
+    fail "6: build_publish_and_deploy still contains non-comment legacyPair references:"$'\n'"${BUILD_JOB_LEGACY_CODE_HITS}"
+  fi
+
+  # Only non-comment lines count as "validation remaining" -- a comment
+  # that merely explains what was removed (e.g. "no longer renders
+  # source-statefulset.yaml") is expected and must not be flagged.
+  strip_comment_hits() {
+    while IFS= read -r hit; do
+      [ -z "$hit" ] && continue
+      content="${hit#*:}"
+      case "$(echo "$content" | sed -E 's/^[[:space:]]*//')" in
+        "#"*) continue ;;
+        *) echo "$hit" ;;
+      esac
+    done
+  }
+
+  SOURCE_TARGET_HITS="$(grep -nE "source-statefulset\.yaml|target-statefulset\.yaml|source_pvc_name|target_pvc_name|SOURCE_STS|TARGET_STS|SOURCE_ENABLED|TARGET_ENABLED" "$EKS_APP_WORKFLOW" | strip_comment_hits || true)"
+  if [ -z "$SOURCE_TARGET_HITS" ]; then
+    pass "7: no source/target StatefulSet/PVC validation (source-statefulset.yaml, target-statefulset.yaml, SOURCE_STS/TARGET_STS, source_pvc_name/target_pvc_name) remains anywhere in ${EKS_APP_WORKFLOW}"
+  else
+    fail "7: source/target StatefulSet/PVC validation references remain in ${EKS_APP_WORKFLOW}:"$'\n'"${SOURCE_TARGET_HITS}"
+  fi
+
+  CREATE_NAMESPACE_HITS="$(grep -n "CreateNamespace=true\|managedNamespaceMetadata" "$EKS_APP_WORKFLOW" | strip_comment_hits || true)"
+  if [ -z "$CREATE_NAMESPACE_HITS" ]; then
+    pass "the Argo CD Application manifest no longer has a CreateNamespace=true/managedNamespaceMetadata (legacyPair-only) branch"
+  else
+    fail "CreateNamespace=true/managedNamespaceMetadata still present in ${EKS_APP_WORKFLOW}:"$'\n'"${CREATE_NAMESPACE_HITS}"
+  fi
+
+  RESOLVE_MODEL_HITS="$(grep -n "resolve_deployment_model" "$EKS_APP_WORKFLOW" || true)"
+  if [ -z "$RESOLVE_MODEL_HITS" ]; then
+    pass "resolve_deployment_model() (which defaulted missing/unknown values to legacyPair) no longer exists in ${EKS_APP_WORKFLOW}"
+  else
+    fail "resolve_deployment_model() still present in ${EKS_APP_WORKFLOW}:"$'\n'"${RESOLVE_MODEL_HITS}"
+  fi
+else
+  skip "static legacyPair/source-target-validation absence checks -- python3 not available"
+fi
+
+# 9: the build job's workflow summary accurately documents every deletion
+# trigger (physical removal, zero-byte, whitespace-only, comment-only,
+# YAML null, lifecycle.state=absent) and correctly describes enabled=false/
+# deployment.enabled=false as retained (non-deleting).
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  BUILD_SUMMARY_TEXT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import sys
+import yaml
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+for step in doc["jobs"]["build_publish_and_deploy"]["steps"]:
+    if step.get("name") == "Workflow summary":
+        sys.stdout.write(step["run"])
+        break
+else:
+    sys.exit("step not found")
+PYEOF
+)"
+
+  SUMMARY_MISSING=""
+  for phrase in "zero-byte" "whitespace-only" "comment-only" "YAML null" "lifecycle.state=absent" "physical removal" "retired-but-retained" "never trigger deletion"; do
+    echo "$BUILD_SUMMARY_TEXT" | grep -qF "$phrase" || SUMMARY_MISSING="${SUMMARY_MISSING} [${phrase}]"
+  done
+
+  if [ -z "$SUMMARY_MISSING" ]; then
+    pass "9: the workflow summary documents every deletion trigger (physical removal, zero-byte, whitespace-only, comment-only, YAML null, lifecycle.state=absent) and describes enabled=false/deployment.enabled=false as retained, never deleting"
+  else
+    fail "9: the workflow summary is missing expected deletion-trigger documentation:${SUMMARY_MISSING}"
+  fi
+else
+  skip "workflow summary deletion-trigger documentation check -- python3 not available"
 fi
 
 # ---------------------------------------------------------------------
@@ -2258,7 +2535,9 @@ EOF
       echo "$MALFORMED_OUT"
     fi
 
-    # 7: an unknown deploymentModel fails closed.
+    # 7: an unknown deploymentModel fails closed (this EFS validation step
+    # now only ever expects deployment_model=singleRuntime, passed through
+    # from the job's own upstream assertion -- never re-inferred here).
     cat > "${EFS_WORKDIR}/values/unknown-model.yaml" <<'EOF'
 deploymentModel: someWeirdModel
 persistence:
@@ -2271,7 +2550,7 @@ EOF
     UNKNOWN_MODEL_OUT="$(run_efs_step "x" "${EFS_WORKDIR}/values/unknown-model.yaml" "gg-oracle-payments-01" "someWeirdModel" "dev")"
     UNKNOWN_MODEL_STATUS=$?
     set -e
-    if [ "$UNKNOWN_MODEL_STATUS" -ne 0 ] && echo "$UNKNOWN_MODEL_OUT" | grep -qF "unknown deploymentModel"; then
+    if [ "$UNKNOWN_MODEL_STATUS" -ne 0 ] && echo "$UNKNOWN_MODEL_OUT" | grep -qF "unexpected deploymentModel"; then
       pass "7: an unknown deploymentModel fails closed"
     else
       fail "7: an unknown deploymentModel did not fail closed as expected"

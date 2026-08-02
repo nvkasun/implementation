@@ -1,6 +1,5 @@
 global:
   environment: ""
-  deploymentId: ""
 
 # Deployment model switch. singleRuntime is the only supported value: one
 # GoldenGate runtime StatefulSet per Helm release/Argo CD Application,
