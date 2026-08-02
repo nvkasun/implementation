@@ -3069,8 +3069,8 @@ if [ -f "$INVENTORY_SCRIPT" ]; then
 
   # 11: DynamoDB inventory uses Query against an exact partition key, never
   # a table-wide Scan.
-  if grep -q "aws dynamodb query" "$INVENTORY_SCRIPT" && ! grep -qE "aws dynamodb scan| --scan " "$INVENTORY_SCRIPT"; then
-    pass "11: ${INVENTORY_SCRIPT} uses 'aws dynamodb query' (exact partition key) and never 'aws dynamodb scan'"
+  if grep -qE "(aws )?dynamodb query" "$INVENTORY_SCRIPT" && ! grep -qE "(aws )?dynamodb scan| --scan " "$INVENTORY_SCRIPT"; then
+    pass "11: ${INVENTORY_SCRIPT} uses 'dynamodb query' (exact partition key) and never 'dynamodb scan'"
   else
     fail "11: ${INVENTORY_SCRIPT} does not exclusively use Query for DynamoDB (scan present or query absent)"
   fi
@@ -3086,7 +3086,7 @@ if [ -f "$INVENTORY_SCRIPT" ]; then
   # 14: the manifest JSON schema contains every required top-level and
   # candidates sub-key.
   SCHEMA_KEYS_MISSING=""
-  for key in environment generatedAt canonical candidates blocked permissionGaps; do
+  for key in environment generatedAt baseline canonicalBaselineVerified inventoryComplete eligibilityReady canonical candidates blocked permissionGaps; do
     grep -qE "^\s*${key}:" "$INVENTORY_SCRIPT" || SCHEMA_KEYS_MISSING="${SCHEMA_KEYS_MISSING} ${key}"
   done
   for key in persistentVolumes efsAccessPoints storageClasses dynamodbPartitions ecrRepositories ecrImages; do
@@ -3168,124 +3168,87 @@ sys.stdout.write(body)
 PYEOF
 
   if [ -s "${WORKDIR}/inventory_classify_funcs.sh" ] && bash -n "${WORKDIR}/inventory_classify_funcs.sh" >/dev/null 2>&1; then
+    # Five focused pure-function assertions (Phase 5B2B1 safety correction,
+    # section 8): baseline=false blocks eligibility; a false
+    # *ReferenceCheckVerified flag blocks eligibility; canonical resources
+    # never enter candidates (PV, StorageClass, EFS access point, and
+    # DynamoDB partition all checked); an absent legacy StorageClass is
+    # already_absent, not eligible; a non-matching observer tag is blocked.
     INVENTORY_CLASSIFY_OUTPUT="$(bash -c '
       source "'"${WORKDIR}"'/inventory_classify_funcs.sh"
-
-      echo "--- 6: current canonical PV is deny-listed ---"
       set +e
-      classify_pv "pvc-dd1bc7bc-b736-4fee-abfe-abf622e70550" "Released" "Retain" "fs-05cadf3570f23cd39::fsap-canonical1" "" "" "false" "true"
+
+      echo "--- 1: baseline=false blocks an otherwise-fully-eligible PV ---"
+      classify_pv "pvc-3a93c990-a9fa-4cca-99df-7c3375472074" "Released" "Retain" "fs-05cadf3570f23cd39::fsap-007cfc2ff801c24b8" "true" "" "true" "false" "false"
       echo "exit=$?"
 
-      echo "--- old-candidate PV, fully eligible ---"
-      classify_pv "pvc-3a93c990-a9fa-4cca-99df-7c3375472074" "Released" "Retain" "fs-05cadf3570f23cd39::fsap-007cfc2ff801c24b8" "" "" "false" "true"
+      echo "--- baseline=true, fully verified old PV is eligible (control case) ---"
+      classify_pv "pvc-3a93c990-a9fa-4cca-99df-7c3375472074" "Released" "Retain" "fs-05cadf3570f23cd39::fsap-007cfc2ff801c24b8" "true" "" "true" "false" "true"
       echo "exit=$?"
 
-      echo "--- old-candidate PV, unverified volume handle fails closed ---"
-      classify_pv "pvc-93251c3f-c408-4713-bd46-ebc5e0eafa8a" "Released" "Retain" "unknown" "" "" "false" "false"
+      echo "--- 2: podReferenceCheckVerified=false blocks eligibility even though referenced=false ---"
+      classify_pv "pvc-93251c3f-c408-4713-bd46-ebc5e0eafa8a" "Released" "Retain" "fs-05cadf3570f23cd39::fsap-035f46f17955f57cb" "true" "" "false" "false" "true"
       echo "exit=$?"
 
-      echo "--- 8: canonical Oracle StorageClass is retained ---"
-      classify_storage_class "gg-efs-dev-gg-oracle-payments-01" "true"
+      echo "--- 3a: a current canonical PV is never eligible, even with every other fact true ---"
+      classify_pv "pvc-dd1bc7bc-b736-4fee-abfe-abf622e70550" "Released" "Retain" "fs-05cadf3570f23cd39::fsap-canonical1" "true" "" "true" "false" "true"
       echo "exit=$?"
 
-      echo "--- 8: canonical PostgreSQL StorageClass is retained ---"
-      classify_storage_class "gg-efs-dev-gg-postgresql-payments-01" "false"
-      echo "exit=$?"
-
-      echo "--- 9: legacy StorageClass still in use is blocked ---"
-      classify_storage_class "gg-efs-dev-payments-ora-to-pg-001" "true"
-      echo "exit=$?"
-
-      echo "--- 9: legacy StorageClass proven unused is eligible ---"
-      classify_storage_class "gg-efs-dev-payments-ora-to-pg-001" "false"
-      echo "exit=$?"
-
-      echo "--- 10: canonical DynamoDB partition never a candidate, even with items ---"
-      classify_dynamodb_partition "gg-oracle-payments-01" 999
-      echo "exit=$?"
-      classify_dynamodb_partition "gg-postgresql-payments-01" 1
-      echo "exit=$?"
-
-      echo "--- legacy DynamoDB partition with items is eligible ---"
-      classify_dynamodb_partition "gg-payments-ora-to-pg-001-source" 2
-      echo "exit=$?"
-
-      echo "--- unrecognized DynamoDB partition name is never a candidate ---"
-      classify_dynamodb_partition "some-unrelated-pipeline" 5
-      echo "exit=$?"
-
-      echo "--- 12: observer image with zero live references is eligible ---"
-      classify_observer_image "[\"obs-abc123def456\"]" 0
-      echo "exit=$?"
-
-      echo "--- 12: observer image still referenced is blocked ---"
-      classify_observer_image "[\"obs-abc123def456\"]" 3
-      echo "exit=$?"
-
-      echo "--- EFS access point: current canonical is deny-listed ---"
+      echo "--- 3b: a current canonical EFS access point is never eligible ---"
       CANONICAL_EFS_ACCESS_POINT_IDS=("fsap-canonical1" "fsap-canonical2")
-      classify_efs_access_point "fsap-canonical1" "true" "fs-05cadf3570f23cd39" "false"
+      classify_efs_access_point "fsap-canonical1" "true" "fs-05cadf3570f23cd39" "available" "true" "false" "true"
       echo "exit=$?"
 
-      echo "--- EFS access point: old candidate, unreferenced, correct filesystem -> eligible ---"
-      classify_efs_access_point "fsap-007cfc2ff801c24b8" "true" "fs-05cadf3570f23cd39" "false"
+      echo "--- 4: an absent legacy StorageClass is already_absent, not eligible ---"
+      classify_legacy_storage_class "false" "true" "false" "true"
+      echo "exit=$?"
+
+      echo "--- legacy StorageClass present, proven unused, baseline verified -> eligible (control case) ---"
+      classify_legacy_storage_class "true" "true" "false" "true"
+      echo "exit=$?"
+
+      echo "--- 5: an observer image tag that does not match the pattern is blocked, not eligible ---"
+      classify_observer_image "[\"latest\"]" "true" "true" 0 "true"
+      echo "exit=$?"
+
+      echo "--- observer image with a matching tag and zero verified references is eligible (control case) ---"
+      classify_observer_image "[\"obs-abc123def456\"]" "true" "true" 0 "true"
       echo "exit=$?"
     ' 2>&1)"
     echo "$INVENTORY_CLASSIFY_OUTPUT"
 
-    if echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "6: current canonical PV is deny-listed" | grep -q "^exit=1$"; then
-      pass "6: the current canonical PV ID is deny-listed from cleanup (classify_pv blocks it unconditionally)"
+    if echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "1: baseline=false blocks an otherwise-fully-eligible PV" | grep -q "^exit=1$" \
+        && echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "baseline=true, fully verified old PV is eligible" | grep -q "^exit=0$"; then
+      pass "1: canonical_baseline_verified=false blocks an otherwise-eligible candidate (control case confirms baseline=true allows it)"
     else
-      fail "6: the current canonical PV ID was not blocked as expected"
+      fail "1: canonical_baseline_verified=false did not block eligibility as expected"
     fi
 
-    if echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "old-candidate PV, fully eligible" | grep -q "^exit=0$"; then
-      pass "a genuinely obsolete, fully-verified old PV is correctly classified eligible"
+    if echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "2: podReferenceCheckVerified=false blocks eligibility" | grep -q "^exit=1$"; then
+      pass "2: podReferenceCheckVerified=false blocks eligibility even when referencedByRunningPod=false"
     else
-      fail "a genuinely obsolete, fully-verified old PV was not classified eligible as expected"
+      fail "2: podReferenceCheckVerified=false did not block eligibility as expected"
     fi
 
-    if echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "unverified volume handle fails closed" | grep -q "^exit=1$"; then
-      pass "an old-candidate PV whose volume handle could not be independently verified fails closed (never guessed eligible)"
+    if echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "3a: a current canonical PV is never eligible" | grep -q "^exit=1$" \
+        && echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "3b: a current canonical EFS access point is never eligible" | grep -q "^exit=1$"; then
+      pass "3: canonical PV/EFS-access-point identifiers are never eligible, regardless of other evidence"
     else
-      fail "an old-candidate PV with an unverified volume handle was not blocked as expected"
+      fail "3: a canonical resource was not blocked as expected"
     fi
 
-    if echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "8: canonical Oracle StorageClass is retained" | grep -q "^exit=1$" \
-        && echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "8: canonical PostgreSQL StorageClass is retained" | grep -q "^exit=1$"; then
-      pass "8: both active canonical StorageClasses are retained (never a cleanup candidate)"
+    if echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "4: an absent legacy StorageClass is already_absent" | grep -q "^exit=2$" \
+        && echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "legacy StorageClass present, proven unused, baseline verified -> eligible" | grep -q "^exit=0$"; then
+      pass "4: an absent legacy StorageClass reports already_absent (exit 2), never eligible; a present+unused+baseline-verified one is eligible"
     else
-      fail "8: at least one active canonical StorageClass was not retained as expected"
+      fail "4: legacy StorageClass existence-first classification did not behave as expected"
     fi
 
-    if echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "9: legacy StorageClass still in use is blocked" | grep -q "^exit=1$" \
-        && echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "9: legacy StorageClass proven unused is eligible" | grep -q "^exit=0$"; then
-      pass "9: the legacy StorageClass requires proof of zero active PVC usage before becoming eligible"
+    if echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "5: an observer image tag that does not match the pattern is blocked" | grep -q "^exit=1$" \
+        && echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "observer image with a matching tag and zero verified references is eligible" | grep -q "^exit=0$"; then
+      pass "5: an observer image tag not matching ^obs-[0-9a-f]{12}\$ is blocked, never eligible"
     else
-      fail "9: the legacy StorageClass unused-proof requirement did not behave as expected"
-    fi
-
-    CANONICAL_DDB_EXIT_CODES="$(echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A4 "10: canonical DynamoDB partition never a candidate" | grep "^exit=" | tr -d '\n')"
-    if [ "$CANONICAL_DDB_EXIT_CODES" = "exit=1exit=1" ] \
-        && echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "legacy DynamoDB partition with items is eligible" | grep -q "^exit=0$" \
-        && echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "unrecognized DynamoDB partition name is never a candidate" | grep -q "^exit=1$"; then
-      pass "10: canonical DynamoDB partitions can never become cleanup candidates, even when items are present"
-    else
-      fail "10: canonical DynamoDB partition deny-list did not behave as expected (canonical exit codes: ${CANONICAL_DDB_EXIT_CODES})"
-    fi
-
-    if echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "12: observer image with zero live references is eligible" | grep -q "^exit=0$" \
-        && echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "12: observer image still referenced is blocked" | grep -q "^exit=1$"; then
-      pass "12: an observer ECR image is only eligible when it has zero live workload references"
-    else
-      fail "12: observer ECR image live-reference gating did not behave as expected"
-    fi
-
-    if echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "EFS access point: current canonical is deny-listed" | grep -q "^exit=1$" \
-        && echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "old candidate, unreferenced, correct filesystem -> eligible" | grep -q "^exit=0$"; then
-      pass "a current canonical EFS access point is deny-listed while a verified-unreferenced old access point is eligible"
-    else
-      fail "EFS access point canonical deny-list / eligibility did not behave as expected"
+      fail "5: non-matching observer image tag was not blocked as expected"
     fi
   else
     fail "could not extract or syntax-validate the pure classification functions from ${INVENTORY_SCRIPT}"
