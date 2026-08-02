@@ -1,141 +1,375 @@
-set -euo pipefail
+cat > validate-phase6a.sh <<'SCRIPT'
+#!/usr/bin/env bash
+set -u
 
-STALE_NS="goldengate-monitoring-dev"
-CANONICAL_NS="goldengate-monitoring"
-PLATFORM_APP="goldengate-dev-platform"
+NS="goldengate-dev"
+MONITOR_NS="goldengate-monitoring"
 ARGO_NS="argocd"
-RUNTIME_NS="goldengate-dev"
+APP="goldengate-dev-platform"
 
-echo
-echo "============================================================"
-echo "1. VERIFY CANONICAL MONITOR NAMESPACE"
-echo "============================================================"
+EXPECTED_IMAGE="229410149234.dkr.ecr.eu-west-1.amazonaws.com/aws-cloud-factory-fluent-bit@sha256:366923ffc51dfde4966e743dcbd4ca05211b733d4f69c7591903bc7660fbf243"
 
-kubectl get namespace "$CANONICAL_NS"
-kubectl get deployment gg-monitor -n "$CANONICAL_NS" -o wide
-kubectl get pods -n "$CANONICAL_NS" -o wide
+FAILURES=0
 
-echo
-echo "============================================================"
-echo "2. INSPECT STALE NAMESPACE"
-echo "============================================================"
-
-kubectl get namespace "$STALE_NS" -o yaml
-
-echo
-echo "--- Workloads in stale namespace ---"
-
-kubectl get \
-  pods,deployments,statefulsets,daemonsets,services,jobs,cronjobs,pvc,ingress \
-  -n "$STALE_NS" \
-  --ignore-not-found
-
-WORKLOAD_COUNT="$(
-  {
-    kubectl get pods -n "$STALE_NS" --no-headers 2>/dev/null || true
-    kubectl get deployments -n "$STALE_NS" --no-headers 2>/dev/null || true
-    kubectl get statefulsets -n "$STALE_NS" --no-headers 2>/dev/null || true
-    kubectl get daemonsets -n "$STALE_NS" --no-headers 2>/dev/null || true
-    kubectl get jobs -n "$STALE_NS" --no-headers 2>/dev/null || true
-    kubectl get cronjobs -n "$STALE_NS" --no-headers 2>/dev/null || true
-    kubectl get pvc -n "$STALE_NS" --no-headers 2>/dev/null || true
-    kubectl get ingress -n "$STALE_NS" --no-headers 2>/dev/null || true
-  } |
-  sed '/^[[:space:]]*$/d' |
-  wc -l |
-  tr -d ' '
-)"
-
-echo "Workload/resource count requiring review: $WORKLOAD_COUNT"
-
-if [ "$WORKLOAD_COUNT" -ne 0 ]; then
+section() {
   echo
-  echo "STOP: goldengate-monitoring-dev is not empty."
-  echo "Do not delete it until the listed resources are reviewed."
-  exit 1
-fi
+  echo "============================================================"
+  echo "$1"
+  echo "============================================================"
+}
 
-echo
-echo "PASS: stale namespace contains no application workloads or PVCs"
+pass() {
+  echo "PASS: $*"
+}
 
-echo
-echo "============================================================"
-echo "3. DELETE ONLY THE STALE NAMESPACE"
-echo "============================================================"
+fail() {
+  echo "FAIL: $*" >&2
+  FAILURES=$((FAILURES + 1))
+}
 
-kubectl delete namespace "$STALE_NS" --wait=true --timeout=5m
+section "1. ARGO CD PLATFORM STATUS"
 
-if kubectl get namespace "$STALE_NS" >/dev/null 2>&1; then
-  echo "FAIL: stale namespace still exists"
-  exit 1
-fi
-
-echo "PASS: stale namespace deleted"
-
-echo
-echo "============================================================"
-echo "4. REFRESH AND CHECK ARGO CD APPLICATION"
-echo "============================================================"
-
-kubectl annotate application "$PLATFORM_APP" \
-  -n "$ARGO_NS" \
-  argocd.argoproj.io/refresh=hard \
-  --overwrite
-
-sleep 15
-
-for i in $(seq 1 30); do
-  STATUS="$(
-    kubectl get application "$PLATFORM_APP" \
-      -n "$ARGO_NS" \
-      -o jsonpath='{.status.sync.status}{"|"}{.status.health.status}' \
-      2>/dev/null || true
-  )"
-
-  echo "Attempt ${i}: ${STATUS:-UNKNOWN}"
-
-  if [ "$STATUS" = "Synced|Healthy" ]; then
-    break
-  fi
-
-  sleep 10
-done
-
-FINAL_STATUS="$(
-  kubectl get application "$PLATFORM_APP" \
+APP_STATUS="$(
+  kubectl get application "$APP" \
     -n "$ARGO_NS" \
     -o jsonpath='{.status.sync.status}{"|"}{.status.health.status}' \
     2>/dev/null || true
 )"
 
-echo "Final platform status: ${FINAL_STATUS:-UNKNOWN}"
+echo "${APP}: ${APP_STATUS:-NOT_FOUND}"
 
-if [ "$FINAL_STATUS" != "Synced|Healthy" ]; then
-  echo "FAIL: platform Application is still not Synced and Healthy"
-  kubectl describe application "$PLATFORM_APP" -n "$ARGO_NS"
-  exit 1
+[ "$APP_STATUS" = "Synced|Healthy" ] \
+  && pass "Platform Application is Synced and Healthy" \
+  || fail "Platform Application is not Synced and Healthy"
+
+section "2. FLUENT BIT DAEMONSET ROLLOUT"
+
+kubectl get daemonset gg-fluent-bit \
+  -n "$NS" \
+  -o wide 2>/dev/null || true
+
+if kubectl rollout status \
+    daemonset/gg-fluent-bit \
+    -n "$NS" \
+    --timeout=5m; then
+  pass "Fluent Bit DaemonSet rollout completed"
+else
+  fail "Fluent Bit DaemonSet rollout failed"
 fi
 
-echo "PASS: platform Application is Synced and Healthy"
+DESIRED="$(
+  kubectl get daemonset gg-fluent-bit \
+    -n "$NS" \
+    -o jsonpath='{.status.desiredNumberScheduled}' \
+    2>/dev/null || true
+)"
 
-echo
-echo "============================================================"
-echo "5. VERIFY FLUENT BIT"
-echo "============================================================"
+READY="$(
+  kubectl get daemonset gg-fluent-bit \
+    -n "$NS" \
+    -o jsonpath='{.status.numberReady}' \
+    2>/dev/null || true
+)"
 
-kubectl get daemonset gg-fluent-bit -n "$RUNTIME_NS" -o wide
+AVAILABLE="$(
+  kubectl get daemonset gg-fluent-bit \
+    -n "$NS" \
+    -o jsonpath='{.status.numberAvailable}' \
+    2>/dev/null || true
+)"
 
-kubectl rollout status \
-  daemonset/gg-fluent-bit \
-  -n "$RUNTIME_NS" \
-  --timeout=5m
+echo "desired=${DESIRED:-missing} ready=${READY:-missing} available=${AVAILABLE:-missing}"
+
+if [ -n "$DESIRED" ] &&
+   [ "$DESIRED" != "0" ] &&
+   [ "$READY" = "$DESIRED" ] &&
+   [ "$AVAILABLE" = "$DESIRED" ]; then
+  pass "Fluent Bit is Ready on all scheduled nodes"
+else
+  fail "Fluent Bit readiness does not match desired count"
+fi
+
+section "3. PRIVATE IMMUTABLE IMAGE"
+
+LIVE_IMAGE="$(
+  kubectl get daemonset gg-fluent-bit \
+    -n "$NS" \
+    -o jsonpath='{.spec.template.spec.containers[0].image}' \
+    2>/dev/null || true
+)"
+
+echo "Expected: $EXPECTED_IMAGE"
+echo "Live:     ${LIVE_IMAGE:-NOT_FOUND}"
+
+[ "$LIVE_IMAGE" = "$EXPECTED_IMAGE" ] \
+  && pass "Approved private immutable Fluent Bit image is active" \
+  || fail "Live Fluent Bit image does not match the approved digest"
+
+section "4. SERVICEACCOUNT AND IRSA"
+
+SERVICE_ACCOUNT="$(
+  kubectl get daemonset gg-fluent-bit \
+    -n "$NS" \
+    -o jsonpath='{.spec.template.spec.serviceAccountName}' \
+    2>/dev/null || true
+)"
+
+ROLE_ARN="$(
+  kubectl get serviceaccount gg-fluent-bit \
+    -n "$NS" \
+    -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}' \
+    2>/dev/null || true
+)"
+
+echo "ServiceAccount: ${SERVICE_ACCOUNT:-MISSING}"
+echo "IRSA role:      ${ROLE_ARN:-MISSING}"
+
+[ "$SERVICE_ACCOUNT" = "gg-fluent-bit" ] \
+  && pass "DaemonSet uses the dedicated Fluent Bit ServiceAccount" \
+  || fail "Unexpected Fluent Bit ServiceAccount"
+
+case "$ROLE_ARN" in
+  arn:aws:iam::668311715351:role/*GoldenGatePlatformLoggingRole-dev*)
+    pass "Dedicated platform logging IRSA role is configured"
+    ;;
+  *)
+    fail "Unexpected or missing Fluent Bit IRSA role"
+    ;;
+esac
+
+section "5. SECURITY CONTEXT"
+
+kubectl get daemonset gg-fluent-bit \
+  -n "$NS" \
+  -o jsonpath='
+privileged={.spec.template.spec.containers[0].securityContext.privileged}
+allowPrivilegeEscalation={.spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation}
+readOnlyRootFilesystem={.spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem}
+hostNetwork={.spec.template.spec.hostNetwork}
+hostPID={.spec.template.spec.hostPID}
+hostIPC={.spec.template.spec.hostIPC}
+capabilitiesDrop={.spec.template.spec.containers[0].securityContext.capabilities.drop[*]}
+{"\n"}' 2>/dev/null || true
+
+PRIVILEGED="$(
+  kubectl get daemonset gg-fluent-bit \
+    -n "$NS" \
+    -o jsonpath='{.spec.template.spec.containers[0].securityContext.privileged}' \
+    2>/dev/null || true
+)"
+
+ALLOW_ESC="$(
+  kubectl get daemonset gg-fluent-bit \
+    -n "$NS" \
+    -o jsonpath='{.spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation}' \
+    2>/dev/null || true
+)"
+
+READ_ONLY_ROOT="$(
+  kubectl get daemonset gg-fluent-bit \
+    -n "$NS" \
+    -o jsonpath='{.spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem}' \
+    2>/dev/null || true
+)"
+
+[ "$PRIVILEGED" = "false" ] \
+  && pass "privileged=false" \
+  || fail "privileged is not false"
+
+[ "$ALLOW_ESC" = "false" ] \
+  && pass "allowPrivilegeEscalation=false" \
+  || fail "allowPrivilegeEscalation is not false"
+
+[ "$READ_ONLY_ROOT" = "true" ] \
+  && pass "readOnlyRootFilesystem=true" \
+  || fail "readOnlyRootFilesystem is not true"
+
+section "6. HOST MOUNTS AND STATE STORAGE"
+
+kubectl get daemonset gg-fluent-bit \
+  -n "$NS" \
+  -o jsonpath='{range .spec.template.spec.containers[0].volumeMounts[*]}{.name}{"|"}{.mountPath}{"|readOnly="}{.readOnly}{"\n"}{end}' \
+  2>/dev/null || true
+
+VARLOG_READONLY="$(
+  kubectl get daemonset gg-fluent-bit \
+    -n "$NS" \
+    -o jsonpath='{.spec.template.spec.containers[0].volumeMounts[?(@.mountPath=="/var/log")].readOnly}' \
+    2>/dev/null || true
+)"
+
+STATE_SIZE="$(
+  kubectl get daemonset gg-fluent-bit \
+    -n "$NS" \
+    -o jsonpath='{.spec.template.spec.volumes[?(@.name=="fluent-bit-state")].emptyDir.sizeLimit}' \
+    2>/dev/null || true
+)"
+
+echo "fluent-bit-state sizeLimit=${STATE_SIZE:-MISSING}"
+
+[ "$VARLOG_READONLY" = "true" ] \
+  && pass "/var/log host mount is read-only" \
+  || fail "/var/log host mount is not read-only"
+
+[ "$STATE_SIZE" = "300Mi" ] \
+  && pass "Fluent Bit state volume is bounded to 300Mi" \
+  || fail "Unexpected or missing Fluent Bit state-volume sizeLimit"
+
+section "7. FLUENT BIT CONFIGURATION"
+
+CONFIG="$(
+  kubectl get configmap gg-fluent-bit \
+    -n "$NS" \
+    -o jsonpath='{.data.fluent-bit\.conf}' \
+    2>/dev/null || true
+)"
+
+printf '%s\n' "$CONFIG" |
+grep -E \
+  'Path |Name cloudwatch_logs|log_group_name|auto_create_group|storage.total_limit_size|Regex' \
+  || true
+
+EXPECTED_PATH='/var/log/containers/*_goldengate-dev_*.log,/var/log/containers/*_goldengate-monitoring_*.log'
+
+printf '%s\n' "$CONFIG" |
+grep -Fq "$EXPECTED_PATH" \
+  && pass "Tail input is restricted to GoldenGate namespaces" \
+  || fail "Expected GoldenGate namespace Tail path is missing"
+
+if printf '%s\n' "$CONFIG" |
+   grep -Fq '/var/log/containers/*.log'; then
+  fail "Unrestricted cluster-wide Tail path is present"
+else
+  pass "No unrestricted cluster-wide Tail path exists"
+fi
+
+printf '%s\n' "$CONFIG" |
+grep -q '/adcb/goldengate/dev/runtime' \
+  && pass "Runtime CloudWatch log group is configured" \
+  || fail "Runtime CloudWatch log group is missing"
+
+printf '%s\n' "$CONFIG" |
+grep -q '/adcb/goldengate/dev/monitor' \
+  && pass "Monitor CloudWatch log group is configured" \
+  || fail "Monitor CloudWatch log group is missing"
+
+OUTPUT_LIMIT_COUNT="$(
+  printf '%s\n' "$CONFIG" |
+  grep -c 'storage.total_limit_size[[:space:]]\+128M' || true
+)"
+
+[ "$OUTPUT_LIMIT_COUNT" -eq 2 ] \
+  && pass "Both CloudWatch outputs have bounded 128M queues" \
+  || fail "Expected two output queue limits, found ${OUTPUT_LIMIT_COUNT}"
+
+AUTO_CREATE_COUNT="$(
+  printf '%s\n' "$CONFIG" |
+  grep -c 'auto_create_group[[:space:]]\+false' || true
+)"
+
+[ "$AUTO_CREATE_COUNT" -eq 2 ] \
+  && pass "Both outputs prohibit automatic log-group creation" \
+  || fail "Expected two auto_create_group false settings"
+
+section "8. FLUENT BIT PODS"
 
 kubectl get pods \
-  -n "$RUNTIME_NS" \
-  -l app.kubernetes.io/name=fluent-bit \
-  -o wide
+  -n "$NS" \
+  -o custom-columns='POD:.metadata.name,PHASE:.status.phase,READY:.status.containerStatuses[*].ready,NODE:.spec.nodeName,IMAGE:.spec.containers[*].image' |
+grep -E 'POD|gg-fluent-bit' || true
+
+section "9. FLUENT BIT RECENT LOGS"
+
+FLUENT_LOGS="$(
+  kubectl logs \
+    -n "$NS" \
+    daemonset/gg-fluent-bit \
+    --since=20m \
+    --tail=1000 \
+    2>&1 || true
+)"
+
+printf '%s\n' "$FLUENT_LOGS" | tail -n 300
+
+ERRORS="$(
+  printf '%s\n' "$FLUENT_LOGS" |
+  grep -Ei \
+    'AccessDenied|NoCredentialProviders|WebIdentityErr|InvalidIdentityToken|ResourceNotFoundException|failed to create log stream|PutLogEvents.*failed|cloudwatch_logs.*error|configuration error|permission denied|cannot open|read-only file system|failed to flush chunk|retry in' \
+  || true
+)"
+
+if [ -z "$ERRORS" ]; then
+  pass "No Fluent Bit IAM, filesystem, configuration or CloudWatch errors found"
+else
+  fail "Fluent Bit errors were found"
+  echo "$ERRORS"
+fi
+
+section "10. RUNTIME SIDECAR REGRESSION"
+
+for STS in \
+  gg-oracle-payments-01 \
+  gg-postgresql-payments-01
+do
+  CONTAINERS="$(
+    kubectl get statefulset "$STS" \
+      -n "$NS" \
+      -o jsonpath='{.spec.template.spec.containers[*].name}' \
+      2>/dev/null || true
+  )"
+
+  echo "${STS}: ${CONTAINERS:-NOT_FOUND}"
+
+  case "$CONTAINERS" in
+    *fluent-bit*|*fluentbit*)
+      fail "${STS} contains an unexpected Fluent Bit sidecar"
+      ;;
+    "")
+      fail "${STS} StatefulSet was not found"
+      ;;
+    *)
+      pass "${STS} remains Fluent Bit sidecar-free"
+      ;;
+  esac
+done
+
+section "11. MONITOR STILL HEALTHY"
+
+MONITOR_STATUS="$(
+  kubectl get deployment gg-monitor \
+    -n "$MONITOR_NS" \
+    -o jsonpath='{.status.readyReplicas}{"|"}{.status.replicas}' \
+    2>/dev/null || true
+)"
+
+echo "gg-monitor ready/replicas: ${MONITOR_STATUS:-NOT_FOUND}"
+
+case "$MONITOR_STATUS" in
+  1\|1)
+    pass "Shared monitor remains healthy"
+    ;;
+  *)
+    fail "Shared monitor is not fully ready"
+    ;;
+esac
+
+section "12. FINAL RESULT"
+
+if [ "$FAILURES" -eq 0 ]; then
+  echo
+  echo "PHASE 6A LIVE KUBERNETES VALIDATION PASSED"
+  echo "CENTRALIZED FLUENT BIT DAEMONSET IS HEALTHY"
+  echo "PRIVATE IMMUTABLE FLUENT BIT IMAGE IS ACTIVE"
+  echo "INPUT IS LIMITED TO GOLDENGATE NAMESPACES"
+  echo "FILESYSTEM BUFFERING IS BOUNDED"
+  echo "GOLDENGATE RUNTIMES REMAIN SIDECAR-FREE"
+  exit 0
+fi
 
 echo
-echo "STALE PLATFORM NAMESPACE CLEANUP PASSED"
-echo "ARGO CD PLATFORM APPLICATION IS SYNCED AND HEALTHY"
-echo "FLUENT BIT DAEMONSET IS DEPLOYED"
+echo "PHASE 6A VALIDATION COMPLETED WITH ${FAILURES} FAILURE(S)"
+exit 1
+SCRIPT
+
+chmod +x validate-phase6a.sh
+./validate-phase6a.sh
