@@ -97,3 +97,32 @@ module "goldengate_argocd_ecr_read_role_dev" {
   data_classification  = "General"
   env                  = "dev"
 }
+
+
+# Phase 6A: dedicated IRSA role for the platform-level Fluent Bit DaemonSet
+# (helm/goldengate-platform, fluentBit.create=true). Trust: exactly
+# system:serviceaccount:goldengate-dev:gg-fluent-bit -- see
+# envs/dev/policies/goldengate-platform-logging-dev/assume_role_policy/sts.json.
+# Deliberately its own role, never a reuse of GoldenGateSecretsReadRole-dev,
+# GoldenGateMonitorReadRole-dev, or GoldenGateEKSDeployRole-dev: this is the
+# only role in this environment that may write to the pre-created
+# /adcb/goldengate/dev/runtime and /adcb/goldengate/dev/monitor CloudWatch
+# Logs groups (see envs/dev/cloudwatch_logs.tf), and it must never carry any
+# Secrets Manager, DynamoDB, EFS, or Kubernetes control permission.
+module "goldengate_platform_logging_role_dev" {
+  source = "git::https://github.com/AbuDhabiCommercialBank/aws-tf-module-iam-role.git?ref=v2.0.0"
+
+  name          = "GoldenGatePlatformLoggingRole-dev"
+  description   = "IRSA role for the platform Fluent Bit DaemonSet: write-only access to the pre-created GoldenGate runtime and monitor CloudWatch Logs groups"
+  policy_folder = "goldengate-platform-logging-dev"
+
+  managed_policy_arns = []
+
+  map_migrated         = "comm5TZY31HX9S"
+  business_criticality = "Low"
+  application_name     = "CloudFactory"
+  cost_center          = "219"
+  business_unit        = "TechnologyPlatform"
+  data_classification  = "General"
+  env                  = "dev"
+}

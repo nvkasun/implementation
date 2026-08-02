@@ -23,3 +23,22 @@ serviceAccounts:
     create: true
     name: gg-postgresql-sa
     roleArn: ""
+
+# Phase 6A: centralized container logging (platform DaemonSet). roleArn and
+# aws.region are intentionally empty here too -- injected the same way as
+# the ServiceAccount roleArns above, at deploy time.
+fluentBit:
+  create: true
+  serviceAccount:
+    create: true
+    name: gg-fluent-bit
+    roleArn: ""
+  aws:
+    region: ""
+  namespaces:
+    runtime: goldengate-dev
+    monitoring: goldengate-monitoring
+  cloudwatch:
+    runtimeLogGroupName: /adcb/goldengate/dev/runtime
+    monitorLogGroupName: /adcb/goldengate/dev/monitor
+    logStreamPrefix: fluent-bit-

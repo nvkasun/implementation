@@ -32,3 +32,83 @@ serviceAccounts:
     create: false
     name: ""
     roleArn: ""
+
+# Phase 6A: centralized container logging (platform-level DaemonSet, never a
+# GoldenGate runtime/observer sidecar). Collects Kubernetes container
+# stdout/stderr only -- this does NOT provide EFS /u02 GoldenGate file-log
+# (ggserr.log, dirrpt/*.rpt) coverage; that remains a separate, later,
+# explicitly-approved mechanism. Deployed into namespaces.runtime.name
+# (goldengate-dev) alongside the shared engine ServiceAccounts above --
+# DaemonSet pods still schedule on every node regardless of the namespace
+# they are defined in, so this does not require a second shared namespace.
+fluentBit:
+  create: false
+  image:
+    # AWS's own CloudWatch Logs output plugin (cloudwatch_logs) only ships
+    # in the aws-for-fluent-bit distribution, never in upstream fluent/fluent-bit.
+    repository: public.ecr.aws/aws-observability/aws-for-fluent-bit
+    tag: "2.32.2"
+    pullPolicy: IfNotPresent
+
+  serviceAccount:
+    create: true
+    name: gg-fluent-bit
+    # Required (chart fails to render otherwise) whenever create=true.
+    # Dedicated least-privilege logging role -- never
+    # GoldenGateSecretsReadRole-dev/GoldenGateMonitorReadRole-dev/
+    # GoldenGateEKSDeployRole-dev.
+    roleArn: ""
+
+  aws:
+    region: ""
+
+  # Namespaces this DaemonSet is permitted to ship logs from. A record
+  # whose kubernetes.namespace_name is not in this list is dropped by the
+  # grep filter before it ever reaches an OUTPUT -- never collected
+  # cluster-wide by default.
+  namespaces:
+    runtime: goldengate-dev
+    monitoring: goldengate-monitoring
+
+  # Pre-created (Terraform-managed) CloudWatch Logs destinations -- this
+  # DaemonSet is never granted logs:CreateLogGroup and never relies on
+  # auto_create_group. Must match envs/dev/cloudwatch_logs.tf exactly.
+  cloudwatch:
+    runtimeLogGroupName: /adcb/goldengate/dev/runtime
+    monitorLogGroupName: /adcb/goldengate/dev/monitor
+    logStreamPrefix: fluent-bit-
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+  # aws-for-fluent-bit >= 2.31 supports running as a non-root UID (995,
+  # matching upstream fluent/fluent-bit's built-in non-root user). Verify
+  # this UID against the exact deployed image tag before go-live -- if it
+  # ever regresses log collection on a node, only this block should need to
+  # change, never the tail/filter/output pipeline.
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 995
+    runAsGroup: 995
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+    seccompProfile:
+      type: RuntimeDefault
+
+  nodeSelector: {}
+  tolerations:
+    # DaemonSets must run on every node that can host a GoldenGate or
+    # monitor pod -- an unconditional toleration set would also schedule
+    # onto unrelated tainted node pools this chart has no business running
+    # on, so none are set by default. Add environment-specific tolerations
+    # here only if the target node group actually requires them.
+    []
+  annotations: {}

@@ -17,3 +17,24 @@ app.kubernetes.io/part-of: goldengate
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 goldengate.adcb/environment: {{ required "environment is required." .Values.environment | quote }}
 {{- end }}
+
+{{- /*
+Fluent Bit (Phase 6A centralized container logging) labels. Distinct
+app.kubernetes.io/name and component from goldengate-platform.labels above:
+this is a distinct workload (the platform chart's only workload) the
+existing "namespaces and shared ServiceAccounts only" identity must never
+be confused with.
+*/ -}}
+{{- define "goldengate-platform.fluentBit.labels" -}}
+app.kubernetes.io/name: gg-fluent-bit
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: logging
+app.kubernetes.io/part-of: goldengate
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+goldengate.adcb/environment: {{ required "environment is required." .Values.environment | quote }}
+{{- end }}
+
+{{- define "goldengate-platform.fluentBit.selectorLabels" -}}
+app.kubernetes.io/name: gg-fluent-bit
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}

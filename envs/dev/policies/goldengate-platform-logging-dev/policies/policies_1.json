@@ -1,0 +1,18 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowWriteGoldenGateContainerLogsToPreCreatedGroups",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogStream",
+        "logs:DescribeLogStreams",
+        "logs:PutLogEvents"
+      ],
+      "Resource": [
+        "arn:aws:logs:eu-west-1:668311715351:log-group:/adcb/goldengate/dev/runtime:*",
+        "arn:aws:logs:eu-west-1:668311715351:log-group:/adcb/goldengate/dev/monitor:*"
+      ]
+    }
+  ]
+}

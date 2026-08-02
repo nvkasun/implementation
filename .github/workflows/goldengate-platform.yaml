@@ -84,6 +84,15 @@ env:
   ORACLE_SA_NAME: gg-oracle-sa
   POSTGRESQL_SA_NAME: gg-postgresql-sa
 
+  # Phase 6A: the second namespace the Fluent Bit DaemonSet is permitted to
+  # ship logs from (the shared monitor's namespace, owned by
+  # helm/goldengate-monitor, never created or altered by this chart), and
+  # the exact pre-created CloudWatch Logs destinations
+  # (envs/dev/cloudwatch_logs.tf) it must write to.
+  MONITOR_NAMESPACE: goldengate-monitoring
+  FLUENT_BIT_RUNTIME_LOG_GROUP: /adcb/goldengate/dev/runtime
+  FLUENT_BIT_MONITOR_LOG_GROUP: /adcb/goldengate/dev/monitor
+
   # Both ServiceAccounts use the shared GoldenGateSecretsReadRole-dev role
   # (also used by the shared monitor). See
   # envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json
@@ -97,6 +106,14 @@ env:
   # arn:aws:iam::<account>:role/<name>.
   ORACLE_RUNTIME_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev
   POSTGRESQL_RUNTIME_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev
+
+  # Phase 6A: platform-level Fluent Bit DaemonSet (centralized container
+  # logging). Dedicated least-privilege role -- see
+  # envs/dev/policies/goldengate-platform-logging-dev/. Same deterministic
+  # ARN-prediction pattern as the two role ARNs above (no Terraform
+  # outputs.tf in this repository).
+  FLUENT_BIT_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGatePlatformLoggingRole-dev
+  FLUENT_BIT_SA_NAME: gg-fluent-bit
 
 concurrency:
   group: goldengate-platform-deploy-${{ github.ref }}
@@ -293,7 +310,9 @@ jobs:
           helm lint "$HELM_CHART_PATH" \
             --values "$VALUES_FILE" \
             --set-string serviceAccounts.oracle.roleArn="$ORACLE_RUNTIME_ROLE_ARN" \
-            --set-string serviceAccounts.postgresql.roleArn="$POSTGRESQL_RUNTIME_ROLE_ARN"
+            --set-string serviceAccounts.postgresql.roleArn="$POSTGRESQL_RUNTIME_ROLE_ARN" \
+            --set-string fluentBit.serviceAccount.roleArn="$FLUENT_BIT_ROLE_ARN" \
+            --set-string fluentBit.aws.region="$AWS_REGION"
 
       - name: Render platform manifest for validation
         shell: bash
@@ -306,6 +325,8 @@ jobs:
             --values "$VALUES_FILE" \
             --set-string serviceAccounts.oracle.roleArn="$ORACLE_RUNTIME_ROLE_ARN" \
             --set-string serviceAccounts.postgresql.roleArn="$POSTGRESQL_RUNTIME_ROLE_ARN" \
+            --set-string fluentBit.serviceAccount.roleArn="$FLUENT_BIT_ROLE_ARN" \
+            --set-string fluentBit.aws.region="$AWS_REGION" \
             > "rendered/${RELEASE_NAME}.yaml"
 
           echo "Rendered manifest: rendered/${RELEASE_NAME}.yaml"
@@ -400,16 +421,23 @@ jobs:
 
           assert_deletion_protected "Namespace ${RUNTIME_NAMESPACE}" "$RUNTIME_NS_BLOCK"
 
-          echo "Validating exactly two ServiceAccount documents..."
+          echo "Validating exactly three ServiceAccount documents..."
           SERVICEACCOUNT_COUNT="$(grep -c '^kind: ServiceAccount$' "$RENDERED")"
-          if [ "$SERVICEACCOUNT_COUNT" -ne 2 ]; then
-            echo "FAIL: expected exactly 2 rendered ServiceAccount documents, found ${SERVICEACCOUNT_COUNT}."
+          if [ "$SERVICEACCOUNT_COUNT" -ne 3 ]; then
+            echo "FAIL: expected exactly 3 rendered ServiceAccount documents (oracle, postgresql, gg-fluent-bit), found ${SERVICEACCOUNT_COUNT}."
             exit 1
           fi
 
+          # deletion_protected: "true" for the shared, engine-level
+          # oracle/postgresql identities (must survive this Application's
+          # own deletion -- other runtime releases still reference them by
+          # name); "false" for gg-fluent-bit, which belongs solely to this
+          # platform release's own DaemonSet and should be pruned/deleted
+          # normally along with it.
           validate_runtime_sa() {
             local sa_name="$1"
             local expected_role_arn="$2"
+            local deletion_protected="$3"
             local sa_block
             sa_block="$(select_document "$RENDERED" "ServiceAccount" "${sa_name}")"
             if [ -z "$sa_block" ]; then
@@ -437,20 +465,109 @@ jobs:
             fi
             echo "OK: ServiceAccount ${sa_name} is in ${RUNTIME_NAMESPACE} with the expected IRSA role ARN."
 
-            assert_deletion_protected "ServiceAccount ${sa_name}" "$sa_block"
+            if [ "$deletion_protected" = "true" ]; then
+              assert_deletion_protected "ServiceAccount ${sa_name}" "$sa_block"
+            fi
           }
 
-          validate_runtime_sa "$ORACLE_SA_NAME" "$ORACLE_RUNTIME_ROLE_ARN"
-          validate_runtime_sa "$POSTGRESQL_SA_NAME" "$POSTGRESQL_RUNTIME_ROLE_ARN"
+          validate_runtime_sa "$ORACLE_SA_NAME" "$ORACLE_RUNTIME_ROLE_ARN" "true"
+          validate_runtime_sa "$POSTGRESQL_SA_NAME" "$POSTGRESQL_RUNTIME_ROLE_ARN" "true"
+          validate_runtime_sa "$FLUENT_BIT_SA_NAME" "$FLUENT_BIT_ROLE_ARN" "false"
 
-          echo "Validating no runtime/workload resources are rendered by this chart..."
-          for forbidden_kind in StatefulSet Deployment DaemonSet Service Ingress PersistentVolumeClaim SecretProviderClass; do
+          echo "Validating no GoldenGate runtime/workload resources are rendered by this chart..."
+          # DaemonSet is deliberately no longer forbidden here: Phase 6A adds
+          # exactly one platform-level Fluent Bit DaemonSet
+          # (gg-fluent-bit) to this chart. This chart still owns no
+          # GoldenGate runtime workload of any kind -- StatefulSet/
+          # Deployment/Service/Ingress/PersistentVolumeClaim/
+          # SecretProviderClass remain forbidden, and the DaemonSet count
+          # is validated exactly below.
+          for forbidden_kind in StatefulSet Deployment Service Ingress PersistentVolumeClaim SecretProviderClass; do
             if grep -qE "^kind: ${forbidden_kind}\$" "$RENDERED"; then
-              echo "FAIL: a ${forbidden_kind} was rendered by the platform chart -- it must only create shared namespaces and shared runtime ServiceAccounts."
+              echo "FAIL: a ${forbidden_kind} was rendered by the platform chart -- it must only create shared namespaces, shared runtime ServiceAccounts, and the platform logging DaemonSet."
               exit 1
             fi
           done
-          echo "OK: no StatefulSet/Deployment/DaemonSet/Service/Ingress/PersistentVolumeClaim/SecretProviderClass rendered."
+          echo "OK: no StatefulSet/Deployment/Service/Ingress/PersistentVolumeClaim/SecretProviderClass rendered."
+
+          echo "Validating exactly one Fluent Bit DaemonSet document..."
+          DAEMONSET_COUNT="$(grep -c '^kind: DaemonSet$' "$RENDERED")"
+          if [ "$DAEMONSET_COUNT" -ne 1 ]; then
+            echo "FAIL: expected exactly 1 rendered DaemonSet document, found ${DAEMONSET_COUNT}."
+            exit 1
+          fi
+
+          FLUENT_BIT_DS_BLOCK="$(select_document "$RENDERED" "DaemonSet" "gg-fluent-bit")"
+          if [ -z "$FLUENT_BIT_DS_BLOCK" ]; then
+            echo "FAIL: rendered DaemonSet gg-fluent-bit was not found."
+            exit 1
+          fi
+          echo "OK: exactly 1 DaemonSet document, gg-fluent-bit."
+
+          echo "Validating the Fluent Bit DaemonSet carries no privileged mode..."
+          if grep -Fq -- "privileged: true" <<< "$FLUENT_BIT_DS_BLOCK"; then
+            echo "FAIL: gg-fluent-bit DaemonSet requests privileged mode."
+            exit 1
+          fi
+          if ! grep -Fq -- "privileged: false" <<< "$FLUENT_BIT_DS_BLOCK"; then
+            echo "FAIL: gg-fluent-bit DaemonSet does not explicitly set privileged: false."
+            exit 1
+          fi
+          echo "OK: gg-fluent-bit DaemonSet is not privileged."
+
+          echo "Validating the Fluent Bit DaemonSet has no hostNetwork..."
+          if ! grep -Fq -- "hostNetwork: false" <<< "$FLUENT_BIT_DS_BLOCK"; then
+            echo "FAIL: gg-fluent-bit DaemonSet does not explicitly set hostNetwork: false."
+            exit 1
+          fi
+          echo "OK: gg-fluent-bit DaemonSet does not use host networking."
+
+          echo "Validating the Fluent Bit DaemonSet's host log mount is read-only..."
+          # hostPath volume named "varlog" must be paired with a matching
+          # volumeMount that sets readOnly: true -- a plain string search
+          # for "readOnly: true" alone would not prove it applies to the
+          # host mount specifically, so the hostPath volume block and its
+          # matching mount are extracted first.
+          if ! grep -Fq -- "hostPath:" <<< "$FLUENT_BIT_DS_BLOCK"; then
+            echo "FAIL: gg-fluent-bit DaemonSet does not mount a host path for container logs."
+            exit 1
+          fi
+          VARLOG_MOUNT_BLOCK="$(awk '/name: varlog/{found=1} found{print} found && /readOnly:/{exit}' <<< "$FLUENT_BIT_DS_BLOCK")"
+          if ! grep -Fq -- "readOnly: true" <<< "$VARLOG_MOUNT_BLOCK"; then
+            echo "FAIL: gg-fluent-bit DaemonSet's varlog host mount is not read-only."
+            exit 1
+          fi
+          echo "OK: gg-fluent-bit DaemonSet's host log mount (varlog) is read-only."
+
+          echo "Validating the Fluent Bit ConfigMap enforces namespace filtering and exact CloudWatch log-group destinations..."
+          FLUENT_BIT_CM_BLOCK="$(select_document "$RENDERED" "ConfigMap" "gg-fluent-bit-config")"
+          if [ -z "$FLUENT_BIT_CM_BLOCK" ]; then
+            echo "FAIL: rendered ConfigMap gg-fluent-bit-config was not found."
+            exit 1
+          fi
+          if ! grep -Fq -- 'Name   grep' <<< "$FLUENT_BIT_CM_BLOCK"; then
+            echo "FAIL: gg-fluent-bit-config does not contain a namespace-filtering grep FILTER."
+            exit 1
+          fi
+          if ! grep -Fq -- "${RUNTIME_NAMESPACE}|${MONITOR_NAMESPACE}" <<< "$FLUENT_BIT_CM_BLOCK"; then
+            echo "FAIL: gg-fluent-bit-config's namespace filter does not reference exactly ${RUNTIME_NAMESPACE} and ${MONITOR_NAMESPACE}."
+            exit 1
+          fi
+          for expected_log_group in "$FLUENT_BIT_RUNTIME_LOG_GROUP" "$FLUENT_BIT_MONITOR_LOG_GROUP"; do
+            if ! grep -Fq -- "log_group_name    ${expected_log_group}" <<< "$FLUENT_BIT_CM_BLOCK"; then
+              echo "FAIL: gg-fluent-bit-config does not target the exact pre-created log group ${expected_log_group}."
+              exit 1
+            fi
+          done
+          if grep -Fq -- "auto_create_group true" <<< "$FLUENT_BIT_CM_BLOCK"; then
+            echo "FAIL: gg-fluent-bit-config allows Fluent Bit to auto-create CloudWatch log groups."
+            exit 1
+          fi
+          if ! grep -Fq -- "auto_create_group false" <<< "$FLUENT_BIT_CM_BLOCK"; then
+            echo "FAIL: gg-fluent-bit-config does not explicitly disable auto_create_group."
+            exit 1
+          fi
+          echo "OK: namespace filtering is present and both CloudWatch log-group destinations are exact and pre-created (auto_create_group false)."
 
           echo "OK: rendered platform manifest passed all checks."
 
@@ -599,6 +716,10 @@ jobs:
                     value: ${ORACLE_RUNTIME_ROLE_ARN}
                   - name: serviceAccounts.postgresql.roleArn
                     value: ${POSTGRESQL_RUNTIME_ROLE_ARN}
+                  - name: fluentBit.serviceAccount.roleArn
+                    value: ${FLUENT_BIT_ROLE_ARN}
+                  - name: fluentBit.aws.region
+                    value: ${AWS_REGION}
             destination:
               server: https://kubernetes.default.svc
               namespace: ${RUNTIME_NAMESPACE}
@@ -688,17 +809,26 @@ jobs:
           fi
           echo "OK: ${POSTGRESQL_SA_NAME} IRSA role annotation matches ${POSTGRESQL_RUNTIME_ROLE_ARN}."
 
-          echo "Confirming this Application owns no workload resources (namespaces/ServiceAccounts only)..."
+          echo "Confirming this Application owns no GoldenGate runtime workload resources (namespaces/ServiceAccounts and the Phase 6A Fluent Bit DaemonSet only)..."
           WORKLOAD_COUNT=0
-          for kind in statefulset deployment daemonset; do
+          for kind in statefulset deployment; do
             COUNT="$(kubectl get "$kind" -n "$RUNTIME_NAMESPACE" -l app.kubernetes.io/instance="$RELEASE_NAME" --no-headers 2>/dev/null | wc -l | tr -d ' ')"
             WORKLOAD_COUNT=$((WORKLOAD_COUNT + COUNT))
           done
           if [ "$WORKLOAD_COUNT" -ne 0 ]; then
-            echo "FAIL: found ${WORKLOAD_COUNT} workload resource(s) owned by ${RELEASE_NAME} -- the platform release must only own namespaces and ServiceAccounts."
+            echo "FAIL: found ${WORKLOAD_COUNT} StatefulSet/Deployment resource(s) owned by ${RELEASE_NAME} -- the platform release must never own a GoldenGate runtime workload."
             exit 1
           fi
-          echo "OK: no workload resources are owned by ${RELEASE_NAME}."
+          echo "OK: no StatefulSet/Deployment resources are owned by ${RELEASE_NAME}."
+
+          echo "Confirming this Application owns exactly one DaemonSet (gg-fluent-bit)..."
+          DAEMONSET_COUNT="$(kubectl get daemonset -n "$RUNTIME_NAMESPACE" -l app.kubernetes.io/instance="$RELEASE_NAME" --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+          if [ "$DAEMONSET_COUNT" -ne 1 ]; then
+            echo "FAIL: expected exactly 1 DaemonSet owned by ${RELEASE_NAME}, found ${DAEMONSET_COUNT}."
+            exit 1
+          fi
+          kubectl get daemonset gg-fluent-bit -n "$RUNTIME_NAMESPACE" >/dev/null
+          echo "OK: exactly 1 DaemonSet (gg-fluent-bit) is owned by ${RELEASE_NAME}."
 
       - name: Upload rendered manifests and chart package
         if: always()
@@ -732,6 +862,14 @@ jobs:
             echo "ServiceAccount/${POSTGRESQL_SA_NAME}. Individual GoldenGate runtime"
             echo "Applications (goldengate-eks-app.yaml) reference these ServiceAccounts by"
             echo "name only (serviceAccount.create=false) and never own or delete them."
+            echo ""
+            echo "Phase 6A: this Application also owns DaemonSet/gg-fluent-bit"
+            echo "(platform-level centralized container logging, ServiceAccount/${FLUENT_BIT_SA_NAME})."
+            echo "It ships Kubernetes container stdout/stderr only, from"
+            echo "\`${RUNTIME_NAMESPACE}\` and \`${MONITOR_NAMESPACE}\`, to the pre-created"
+            echo "CloudWatch Logs groups \`${FLUENT_BIT_RUNTIME_LOG_GROUP}\` and"
+            echo "\`${FLUENT_BIT_MONITOR_LOG_GROUP}\`. It is never a GoldenGate runtime or"
+            echo "observer sidecar and provides no EFS /u02 application file-log coverage."
             echo ""
             echo "### Required deployment order"
             echo ""

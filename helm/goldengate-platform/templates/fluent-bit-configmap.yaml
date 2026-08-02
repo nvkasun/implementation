@@ -1,0 +1,116 @@
+{{- if .Values.fluentBit.create }}
+{{- if not .Values.fluentBit.aws.region }}
+{{- fail "fluentBit.aws.region is required when fluentBit.create=true." }}
+{{- end }}
+{{- if not .Values.fluentBit.namespaces.runtime }}
+{{- fail "fluentBit.namespaces.runtime is required when fluentBit.create=true." }}
+{{- end }}
+{{- if not .Values.fluentBit.namespaces.monitoring }}
+{{- fail "fluentBit.namespaces.monitoring is required when fluentBit.create=true." }}
+{{- end }}
+{{- if not .Values.fluentBit.cloudwatch.runtimeLogGroupName }}
+{{- fail "fluentBit.cloudwatch.runtimeLogGroupName is required when fluentBit.create=true." }}
+{{- end }}
+{{- if not .Values.fluentBit.cloudwatch.monitorLogGroupName }}
+{{- fail "fluentBit.cloudwatch.monitorLogGroupName is required when fluentBit.create=true." }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gg-fluent-bit-config
+  namespace: {{ .Values.namespaces.runtime.name | quote }}
+  labels:
+    {{- include "goldengate-platform.fluentBit.labels" . | nindent 4 }}
+data:
+  fluent-bit.conf: |
+    [SERVICE]
+        Flush                 5
+        Daemon                Off
+        Log_Level             info
+        Parsers_File          parsers.conf
+        HTTP_Server           On
+        HTTP_Listen           0.0.0.0
+        HTTP_PORT             2020
+        Health_Check          On
+        # Bounded, durable filesystem-backed chunk buffering (not the raw
+        # host log mounts, which stay read-only) -- backed by the writable
+        # emptyDir mounted at /var/fluent-bit/state, never the host.
+        storage.path           /var/fluent-bit/state/buffer
+        storage.sync           normal
+        storage.checksum       off
+        storage.max_chunks_up  128
+        storage.backlog.mem_limit 5M
+
+    # Kubernetes container stdout/stderr only. This does NOT tail
+    # application files under /u02 (ggserr.log, dirrpt/*.rpt) -- container
+    # log collection here provides no EFS file-log coverage; that is a
+    # separate, later, explicitly-approved mechanism.
+    [INPUT]
+        Name              tail
+        Tag               kube.*
+        Path              /var/log/containers/*.log
+        multiline.parser  docker, cri
+        DB                /var/fluent-bit/state/flb_kube.db
+        Mem_Buf_Limit     5MB
+        Buffer_Chunk_Size 32k
+        Buffer_Max_Size   256k
+        Skip_Long_Lines   On
+        Refresh_Interval  10
+        storage.type      filesystem
+
+    [FILTER]
+        Name                kubernetes
+        Match               kube.*
+        Kube_URL            https://kubernetes.default.svc:443
+        Kube_CA_File        /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        Kube_Token_File     /var/run/secrets/kubernetes.io/serviceaccount/token
+        Merge_Log           On
+        Merge_Log_Key       log_processed
+        K8S-Logging.Parser  On
+        K8S-Logging.Exclude On
+        Labels              On
+        Annotations         Off
+        Buffer_Size         0
+
+    # environment=dev static metadata -- the same literal value this chart
+    # is rendered with (.Values.environment), never fabricated per record.
+    [FILTER]
+        Name   record_modifier
+        Match  kube.*
+        Record environment {{ .Values.environment }}
+
+    # Namespace allow-list: goldengate-dev and goldengate-monitoring only.
+    # A record whose kubernetes.namespace_name is not one of these two is
+    # dropped here and never reaches an OUTPUT -- this chart does not
+    # collect every cluster namespace.
+    [FILTER]
+        Name   grep
+        Match  kube.*
+        Regex  $kubernetes['namespace_name']  ^({{ .Values.fluentBit.namespaces.runtime }}|{{ .Values.fluentBit.namespaces.monitoring }})$
+
+    # Route to a distinct tag per approved namespace so each can target its
+    # own pre-created, exact CloudWatch log group below (never a single
+    # dynamic/templated group name, never auto-created).
+    [FILTER]
+        Name         rewrite_tag
+        Match        kube.*
+        Rule         $kubernetes['namespace_name']  ^{{ .Values.fluentBit.namespaces.runtime }}$      runtime.$TAG  false
+        Rule         $kubernetes['namespace_name']  ^{{ .Values.fluentBit.namespaces.monitoring }}$   monitor.$TAG  false
+        Emitter_Name gg_fluent_bit_re_emitted
+
+    [OUTPUT]
+        Name              cloudwatch_logs
+        Match             runtime.*
+        region            {{ .Values.fluentBit.aws.region }}
+        log_group_name    {{ .Values.fluentBit.cloudwatch.runtimeLogGroupName }}
+        log_stream_prefix {{ .Values.fluentBit.cloudwatch.logStreamPrefix }}
+        auto_create_group false
+
+    [OUTPUT]
+        Name              cloudwatch_logs
+        Match             monitor.*
+        region            {{ .Values.fluentBit.aws.region }}
+        log_group_name    {{ .Values.fluentBit.cloudwatch.monitorLogGroupName }}
+        log_stream_prefix {{ .Values.fluentBit.cloudwatch.logStreamPrefix }}
+        auto_create_group false
+{{- end }}

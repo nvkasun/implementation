@@ -1,0 +1,37 @@
+{{- if .Values.fluentBit.create }}
+# Read-only, cluster-scoped: the Fluent Bit "kubernetes" filter resolves
+# pod/namespace metadata (labels, owner references) via the API server for
+# whatever pod produced each tailed log line. get/list/watch only -- no
+# create/update/patch/delete anywhere, i.e. no Kubernetes control
+# permissions of any kind.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Values.fluentBit.serviceAccount.name }}
+  labels:
+    {{- include "goldengate-platform.fluentBit.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources:
+      - namespaces
+      - pods
+    verbs:
+      - get
+      - list
+      - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Values.fluentBit.serviceAccount.name }}
+  labels:
+    {{- include "goldengate-platform.fluentBit.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Values.fluentBit.serviceAccount.name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.fluentBit.serviceAccount.name }}
+    namespace: {{ .Values.namespaces.runtime.name | quote }}
+{{- end }}

@@ -1,0 +1,139 @@
+{{- if .Values.fluentBit.create }}
+{{- if not .Values.fluentBit.image.repository }}
+{{- fail "fluentBit.image.repository cannot be empty." }}
+{{- end }}
+{{- if not .Values.fluentBit.image.tag }}
+{{- fail "fluentBit.image.tag cannot be empty." }}
+{{- end }}
+{{- if not .Values.namespaces.runtime.name }}
+{{- fail "namespaces.runtime.name is required when fluentBit.create=true." }}
+{{- end }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gg-fluent-bit
+  namespace: {{ .Values.namespaces.runtime.name | quote }}
+  labels:
+    {{- include "goldengate-platform.fluentBit.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "goldengate-platform.fluentBit.selectorLabels" . | nindent 6 }}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        {{- include "goldengate-platform.fluentBit.labels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/fluent-bit-configmap.yaml") . | sha256sum }}
+        {{- with .Values.fluentBit.annotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ .Values.fluentBit.serviceAccount.name }}
+      # IRSA requires the projected ServiceAccount token to be mounted.
+      automountServiceAccountToken: true
+      hostNetwork: false
+      hostPID: false
+      hostIPC: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: {{ .Values.fluentBit.securityContext.runAsNonRoot }}
+        runAsUser: {{ .Values.fluentBit.securityContext.runAsUser }}
+        runAsGroup: {{ .Values.fluentBit.securityContext.runAsGroup }}
+        seccompProfile:
+          {{- toYaml .Values.fluentBit.securityContext.seccompProfile | nindent 10 }}
+      containers:
+        - name: fluent-bit
+          image: "{{ .Values.fluentBit.image.repository }}:{{ .Values.fluentBit.image.tag }}"
+          imagePullPolicy: {{ .Values.fluentBit.image.pullPolicy | default "IfNotPresent" }}
+          securityContext:
+            allowPrivilegeEscalation: {{ .Values.fluentBit.securityContext.allowPrivilegeEscalation }}
+            readOnlyRootFilesystem: {{ .Values.fluentBit.securityContext.readOnlyRootFilesystem }}
+            privileged: false
+            capabilities:
+              {{- toYaml .Values.fluentBit.securityContext.capabilities | nindent 14 }}
+          env:
+            - name: AWS_REGION
+              value: {{ .Values.fluentBit.aws.region | quote }}
+            - name: AWS_DEFAULT_REGION
+              value: {{ .Values.fluentBit.aws.region | quote }}
+            - name: AWS_STS_REGIONAL_ENDPOINTS
+              value: "regional"
+            - name: AWS_EC2_METADATA_DISABLED
+              value: "true"
+            - name: AWS_CONFIG_FILE
+              value: /tmp/.aws/config
+            - name: AWS_SHARED_CREDENTIALS_FILE
+              value: /tmp/.aws/credentials
+            - name: HOME
+              value: /tmp
+          ports:
+            - name: http
+              containerPort: 2020
+              protocol: TCP
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: fluent-bit-state
+              mountPath: /var/fluent-bit/state
+            - name: fluent-bit-config
+              mountPath: /fluent-bit/etc/fluent-bit.conf
+              subPath: fluent-bit.conf
+              readOnly: true
+            # Read-only host log mounts only -- container stdout/stderr
+            # under /var/log/containers (symlinked from /var/log/pods).
+            # Never a writable host mount, never /var/lib/docker (not
+            # applicable on the containerd/CRI runtime this cluster uses).
+            - name: varlog
+              mountPath: /var/log
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.fluentBit.resources | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        # Fluent Bit's own tail-position DB and filesystem-backed chunk
+        # buffer -- internal working storage, not a host log mount, so
+        # readOnlyRootFilesystem compatibility does not conflict with the
+        # read-only /var/log mount below.
+        - name: fluent-bit-state
+          emptyDir: {}
+        - name: fluent-bit-config
+          configMap:
+            name: gg-fluent-bit-config
+            items:
+              - key: fluent-bit.conf
+                path: fluent-bit.conf
+        - name: varlog
+          hostPath:
+            path: /var/log
+            type: Directory
+{{- with .Values.fluentBit.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+{{- end }}
+{{- with .Values.fluentBit.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+{{- end }}
+{{- end }}

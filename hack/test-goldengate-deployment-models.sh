@@ -25,6 +25,7 @@ MONITOR_CHART="helm/goldengate-monitor"
 MONITOR_APP_DIR="monitoring/monitor"
 MONITOR_WORKFLOW=".github/workflows/goldengate-monitor.yaml"
 EKS_APP_WORKFLOW=".github/workflows/goldengate-eks-app.yaml"
+PLATFORM_WORKFLOW=".github/workflows/goldengate-platform.yaml"
 DETECT_SCRIPT="hack/detect-goldengate-deployments.sh"
 INVENTORY_SCRIPT="hack/inventory-goldengate-legacy-resources.sh"
 INVENTORY_WORKFLOW=".github/workflows/goldengate-legacy-cleanup-inventory.yaml"
@@ -214,6 +215,158 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
   else
     fail "helm lint ${PLATFORM_CHART}"
     cat "${WORKDIR}/lint-platform.log"
+  fi
+
+  # Phase 6A: centralized container logging (platform Fluent Bit
+  # DaemonSet). Essential, focused checks only -- same real dev values file
+  # and --set-string role-ARN/region injection pattern the actual
+  # goldengate-platform.yaml workflow uses, not a fake Kubernetes/AWS
+  # environment.
+  PLATFORM_DEV_VALUES="${REPO_ROOT}/platform/dev/goldengate-platform/values.yaml"
+  FAKE_ORACLE_ROLE_ARN="arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev"
+  FAKE_FLUENT_BIT_ROLE_ARN="arn:aws:iam::668311715351:role/GoldenGatePlatformLoggingRole-dev"
+  if helm lint "$PLATFORM_CHART" \
+      --values "$PLATFORM_DEV_VALUES" \
+      --set-string serviceAccounts.oracle.roleArn="$FAKE_ORACLE_ROLE_ARN" \
+      --set-string serviceAccounts.postgresql.roleArn="$FAKE_ORACLE_ROLE_ARN" \
+      --set-string fluentBit.serviceAccount.roleArn="$FAKE_FLUENT_BIT_ROLE_ARN" \
+      --set-string fluentBit.aws.region="eu-west-1" \
+      >"${WORKDIR}/lint-platform-fluentbit.log" 2>&1; then
+    pass "helm lint ${PLATFORM_CHART} (dev values, fluentBit.create=true)"
+  else
+    fail "helm lint ${PLATFORM_CHART} (dev values, fluentBit.create=true)"
+    cat "${WORKDIR}/lint-platform-fluentbit.log"
+  fi
+
+  PLATFORM_FLUENTBIT_RENDERED="${WORKDIR}/platform-fluentbit-rendered.yaml"
+  if helm template goldengate-dev-platform "$PLATFORM_CHART" \
+      --values "$PLATFORM_DEV_VALUES" \
+      --set-string serviceAccounts.oracle.roleArn="$FAKE_ORACLE_ROLE_ARN" \
+      --set-string serviceAccounts.postgresql.roleArn="$FAKE_ORACLE_ROLE_ARN" \
+      --set-string fluentBit.serviceAccount.roleArn="$FAKE_FLUENT_BIT_ROLE_ARN" \
+      --set-string fluentBit.aws.region="eu-west-1" \
+      > "$PLATFORM_FLUENTBIT_RENDERED" 2>"${WORKDIR}/template-platform-fluentbit.log"; then
+    pass "helm template ${PLATFORM_CHART} (dev values, fluentBit.create=true) renders"
+  else
+    fail "helm template ${PLATFORM_CHART} (dev values, fluentBit.create=true) renders"
+    cat "${WORKDIR}/template-platform-fluentbit.log"
+  fi
+
+  if [ -s "$PLATFORM_FLUENTBIT_RENDERED" ]; then
+    DAEMONSET_COUNT="$(grep -c '^kind: DaemonSet$' "$PLATFORM_FLUENTBIT_RENDERED" || true)"
+    if [ "$DAEMONSET_COUNT" -eq 1 ] && grep -q '^  name: gg-fluent-bit$' "$PLATFORM_FLUENTBIT_RENDERED"; then
+      pass "exactly one gg-fluent-bit DaemonSet is rendered"
+    else
+      fail "expected exactly one gg-fluent-bit DaemonSet, found ${DAEMONSET_COUNT}"
+    fi
+
+    if grep -q 'privileged: true' "$PLATFORM_FLUENTBIT_RENDERED"; then
+      fail "gg-fluent-bit DaemonSet requests privileged mode"
+    else
+      pass "gg-fluent-bit DaemonSet has no privileged mode"
+    fi
+
+    FLUENT_BIT_DS_ONLY="$(awk '/^kind: DaemonSet$/{f=1} f{print} f && /^---$/{exit}' "$PLATFORM_FLUENTBIT_RENDERED")"
+    if echo "$FLUENT_BIT_DS_ONLY" | grep -A2 'name: varlog' | grep -q 'readOnly: true'; then
+      pass "gg-fluent-bit DaemonSet's host log mount (varlog) is read-only"
+    else
+      fail "gg-fluent-bit DaemonSet's host log mount is not confirmed read-only"
+    fi
+    if echo "$FLUENT_BIT_DS_ONLY" | grep -q 'hostNetwork: false'; then
+      pass "gg-fluent-bit DaemonSet does not use host networking"
+    else
+      fail "gg-fluent-bit DaemonSet does not explicitly disable host networking"
+    fi
+
+    if grep -qE "Regex\s+\\\$kubernetes\['namespace_name'\]\s+\^\(goldengate-dev\|goldengate-monitoring\)\\\$" "$PLATFORM_FLUENTBIT_RENDERED"; then
+      pass "Fluent Bit namespace filtering is present and limited to goldengate-dev/goldengate-monitoring"
+    else
+      fail "Fluent Bit namespace-filtering grep FILTER was not found as expected"
+    fi
+
+    if grep -q 'log_group_name    /adcb/goldengate/dev/runtime' "$PLATFORM_FLUENTBIT_RENDERED" \
+        && grep -q 'log_group_name    /adcb/goldengate/dev/monitor' "$PLATFORM_FLUENTBIT_RENDERED" \
+        && grep -q 'auto_create_group false' "$PLATFORM_FLUENTBIT_RENDERED" \
+        && ! grep -q 'auto_create_group true' "$PLATFORM_FLUENTBIT_RENDERED"; then
+      pass "Fluent Bit targets the exact pre-created CloudWatch log groups and never auto-creates a group"
+    else
+      fail "Fluent Bit CloudWatch log-group destinations are not exactly as expected"
+    fi
+
+    if grep -qE '^kind: (StatefulSet|Deployment)$' "$PLATFORM_FLUENTBIT_RENDERED"; then
+      fail "a GoldenGate runtime workload (StatefulSet/Deployment) was rendered by the platform chart"
+    else
+      pass "no GoldenGate runtime StatefulSet/Deployment is rendered by the platform chart"
+    fi
+  else
+    skip "gg-fluent-bit DaemonSet structural checks -- rendered manifest not available"
+  fi
+
+  # No GoldenGate runtime sidecar: the runtime chart itself (never touched
+  # by Phase 6A) must still define exactly one application container and
+  # exactly one init container.
+  RUNTIME_STATEFULSET="${RUNTIME_CHART}/templates/runtime-statefulset.yaml"
+  if [ -f "$RUNTIME_STATEFULSET" ]; then
+    INIT_CONTAINER_COUNT="$(grep -c '^\s*initContainers:$' "$RUNTIME_STATEFULSET")"
+    APP_CONTAINER_BLOCK_COUNT="$(grep -c '^\s*containers:$' "$RUNTIME_STATEFULSET")"
+    if [ "$INIT_CONTAINER_COUNT" -eq 1 ] && [ "$APP_CONTAINER_BLOCK_COUNT" -eq 1 ] \
+        && grep -q 'name: prepare-u02-permissions' "$RUNTIME_STATEFULSET"; then
+      pass "GoldenGate runtime StatefulSet still defines exactly one init container (prepare-u02-permissions) and one containers: block -- no logging sidecar introduced"
+    else
+      fail "GoldenGate runtime StatefulSet container shape changed unexpectedly"
+    fi
+  else
+    fail "${RUNTIME_STATEFULSET} not found"
+  fi
+
+  # IAM least privilege: the new logging policy must contain exactly the
+  # required log-writing actions and nothing else (no CreateLogGroup/
+  # DeleteLogGroup, no alarms, no DynamoDB/Secrets Manager/EFS/Kubernetes
+  # control permissions).
+  LOGGING_POLICY_FILE="${REPO_ROOT}/envs/dev/policies/goldengate-platform-logging-dev/policies/policies_1.json"
+  if [ -f "$LOGGING_POLICY_FILE" ] && command -v python3 >/dev/null 2>&1; then
+    LOGGING_POLICY_CHECK="$(python3 - "$LOGGING_POLICY_FILE" <<'PYEOF'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+actions = set()
+for s in doc["Statement"]:
+    a = s["Action"]
+    actions.update([a] if isinstance(a, str) else a)
+allowed = {"logs:CreateLogStream", "logs:DescribeLogStreams", "logs:PutLogEvents"}
+print("OK" if actions == allowed else f"MISMATCH:{sorted(actions)}")
+PYEOF
+)"
+    if [ "$LOGGING_POLICY_CHECK" = "OK" ]; then
+      pass "GoldenGatePlatformLoggingRole-dev policy contains exactly the required log-writing actions (no CreateLogGroup/DeleteLogGroup/alarms/DynamoDB/Secrets Manager/EFS/Kubernetes control permissions)"
+    else
+      fail "GoldenGatePlatformLoggingRole-dev policy action set unexpected: ${LOGGING_POLICY_CHECK}"
+    fi
+  else
+    fail "${LOGGING_POLICY_FILE} not found, or python3 unavailable"
+  fi
+
+  # Strict YAML parse of the platform workflow (must still parse cleanly
+  # after the Phase 6A Fluent Bit role-ARN/region plumbing was added), plus
+  # a forbidden-mutation-command scan limited to the new/changed lines --
+  # this workflow legitimately runs many AWS/kubectl mutating calls
+  # elsewhere (namespace/Application apply, ECR repository creation, etc.),
+  # so the scan here only proves the Phase 6A additions themselves
+  # introduced no new destructive AWS Logs action (no CreateLogGroup/
+  # DeleteLogGroup/PutRetentionPolicy anywhere in the whole file).
+  if [ -f "${REPO_ROOT}/${PLATFORM_WORKFLOW}" ] && command -v python3 >/dev/null 2>&1; then
+    if python3 -c "import yaml; yaml.safe_load(open('${REPO_ROOT}/${PLATFORM_WORKFLOW}'))" >/dev/null 2>&1; then
+      pass "${PLATFORM_WORKFLOW} parses as strict YAML"
+    else
+      fail "${PLATFORM_WORKFLOW} does not parse as strict YAML"
+    fi
+
+    if grep -qE 'logs:CreateLogGroup|logs:DeleteLogGroup|logs:PutRetentionPolicy|aws logs create-log-group|aws logs delete-log-group' "${REPO_ROOT}/${PLATFORM_WORKFLOW}"; then
+      fail "${PLATFORM_WORKFLOW} contains a CloudWatch Logs group create/delete/retention-mutation action"
+    else
+      pass "${PLATFORM_WORKFLOW} contains no CloudWatch Logs group create/delete/retention-mutation action"
+    fi
+  else
+    fail "${PLATFORM_WORKFLOW} not found, or python3 unavailable"
   fi
 
   # The monitor chart's ConfigMap reads a staged copy of the canonical
@@ -665,15 +818,24 @@ else
   pass "goldengate-monitor-read-dev IAM policy grants CloudWatch PutMetricData only (no read/alarm actions)"
 fi
 
-ALARM_SNS_FOUND="false"
-if find . -path ./.git -prune -o \( -iname "*gg-alerter*" -o -iname "*fluent-bit*" \) -print 2>/dev/null \
-    | grep -q .; then
-  ALARM_SNS_FOUND="true"
-fi
-if [ "$ALARM_SNS_FOUND" = "false" ]; then
-  pass "no gg-alerter or Fluent Bit implementation exists yet"
+if find . -path ./.git -prune -o -iname "*gg-alerter*" -print 2>/dev/null | grep -q .; then
+  fail "unexpected gg-alerter file found -- out of scope for this phase"
 else
-  fail "unexpected gg-alerter/Fluent Bit file found -- out of scope for this phase"
+  pass "no gg-alerter implementation exists yet"
+fi
+
+# Phase 6A introduced the platform-level Fluent Bit DaemonSet -- no longer
+# blanket-forbidden, but still confined to its expected locations (the
+# goldengate-platform chart templates, its dedicated IRSA policy folder,
+# and the CloudWatch Logs Terraform) and never inside the GoldenGate
+# runtime/monitor charts or Python code.
+UNEXPECTED_FLUENT_BIT_LOCATIONS="$(find . -path ./.git -prune -o -iname "*fluent-bit*" -print 2>/dev/null \
+  | grep -v -E '^\./helm/goldengate-platform/templates/fluent-bit-|^\./envs/dev/policies/goldengate-platform-logging-dev(/|$)' \
+  || true)"
+if [ -z "$UNEXPECTED_FLUENT_BIT_LOCATIONS" ]; then
+  pass "Fluent Bit files exist only in the expected Phase 6A platform-chart/IAM locations"
+else
+  fail "unexpected Fluent Bit file(s) outside the expected Phase 6A locations:${UNEXPECTED_FLUENT_BIT_LOCATIONS}"
 fi
 
 if [ -f "hack/comma.yaml" ]; then
@@ -1982,13 +2144,17 @@ else
 fi
 
 echo ""
-echo "--- Phase 5A: no alarms/SNS/gg-alerter/Fluent Bit introduced; IAM unchanged ---"
+echo "--- Phase 5A: no alarms/SNS/gg-alerter introduced; no Fluent Bit outside the Phase 6A platform chart; IAM unchanged ---"
 
 # Structural signals only -- never a bare substring grep, which would
 # false-positive on this repository's own negative-assertion code (e.g. a
 # test's forbidden-string tuple, or FORBIDDEN_CONTAINER_SUBSTRINGS in the
 # workflow's singleRuntime contract check -- both deliberately mention these
-# names to prove their absence, not to implement them).
+# names to prove their absence, not to implement them). Phase 6A legitimately
+# added helm/goldengate-platform/templates/fluent-bit-*.yaml (checked
+# separately above); this block only proves Fluent Bit was never added as
+# its own sibling chart (helm/<name>, maxdepth 2) or into the GoldenGate
+# runtime/monitor charts specifically.
 NOT_YET_HITS=""
 [ -d "monitoring/gg-alerter" ] && NOT_YET_HITS="${NOT_YET_HITS} monitoring/gg-alerter/"
 [ -d "helm/gg-alerter" ] && NOT_YET_HITS="${NOT_YET_HITS} helm/gg-alerter/"
@@ -3545,26 +3711,35 @@ if command -v git >/dev/null 2>&1 && git -C "$REPO_ROOT" rev-parse --is-inside-w
     fail "17: collector.py and/or monitor.py were unexpectedly modified"
   fi
 
-  # 18: IAM is unchanged, except that the dual-account correction is
-  # explicitly required to add exactly one statement each of
-  # dynamodb:Query (scoped to gg-eks-pipeline) and elasticfilesystem:
-  # Describe* (Resource "*", unsupported at resource-level) to the
-  # GoldenGateEKSDeployRole-dev policy. GoldenGateSecretsReadRole-dev and
-  # GoldenGateMonitorReadRole-dev must never be touched by this phase.
+  # 18: IAM is unchanged, except for the specific, already-reviewed
+  # additions from prior phases and Phase 6A:
+  #   - Phase 5B2B1 dual-account correction: exactly one statement each of
+  #     dynamodb:Query (scoped to gg-eks-pipeline) and elasticfilesystem:
+  #     Describe* added to the GoldenGateEKSDeployRole-dev policy.
+  #   - Phase 6A: envs/dev/iam.tf gains the new, dedicated
+  #     goldengate_platform_logging_role_dev module block (a NEW IAM role,
+  #     never a change to an existing one).
+  # GoldenGateSecretsReadRole-dev and GoldenGateMonitorReadRole-dev must
+  # never be touched by either phase. New files under a brand-new policy
+  # folder (e.g. goldengate-platform-logging-dev/) are untracked, not a
+  # "diff" of an existing file, so they never appear here -- that is
+  # exactly the expected shape of adding a new role.
   # --name-only does not fully honor --ignore-all-space in this git version
   # (it still lists files whose only diff is line-ending noise), so the
   # --stat form (which does honor it, confirmed empty for whitespace-only
   # files) is used and parsed for real changed paths instead.
-  EXPECTED_MODIFIED_IAM_FILE="envs/dev/policies/goldengate-eks-deploy-dev/policies/policies_1.json"
+  EXPECTED_MODIFIED_IAM_FILES="envs/dev/policies/goldengate-eks-deploy-dev/policies/policies_1.json
+envs/dev/iam.tf"
   IAM_DIFF_STAT="$(git -C "$REPO_ROOT" diff --stat=300 --ignore-all-space -- envs/dev/policies envs/dev/iam.tf 2>/dev/null || true)"
   IAM_DIFF_FILES="$(echo "$IAM_DIFF_STAT" | grep -oE '\S+\.(json|tf)' | sort -u || true)"
+  UNEXPECTED_IAM_DIFF_FILES="$(comm -23 <(echo "$IAM_DIFF_FILES") <(echo "$EXPECTED_MODIFIED_IAM_FILES" | sort -u) 2>/dev/null || true)"
   SECRETS_MONITOR_DIFF="$(git -C "$REPO_ROOT" diff --stat --ignore-all-space -- envs/dev/policies/goldengate-secrets-read-dev envs/dev/policies/goldengate-monitor-read-dev 2>/dev/null || true)"
   if [ -z "$IAM_DIFF_FILES" ]; then
     pass "18: IAM (envs/dev/policies, envs/dev/iam.tf) is unchanged"
-  elif [ "$IAM_DIFF_FILES" = "$EXPECTED_MODIFIED_IAM_FILE" ] && [ -z "$SECRETS_MONITOR_DIFF" ]; then
-    pass "18: only the required GoldenGateEKSDeployRole-dev policy (${EXPECTED_MODIFIED_IAM_FILE}) changed; GoldenGateSecretsReadRole-dev and GoldenGateMonitorReadRole-dev are unchanged"
+  elif [ -z "$UNEXPECTED_IAM_DIFF_FILES" ] && [ -z "$SECRETS_MONITOR_DIFF" ]; then
+    pass "18: only the expected files changed (${IAM_DIFF_FILES//$'\n'/, }); GoldenGateSecretsReadRole-dev and GoldenGateMonitorReadRole-dev are unchanged"
   else
-    fail "18: IAM changed outside the expected ${EXPECTED_MODIFIED_IAM_FILE}, or a protected role's policy was touched:"$'\n'"changed files: ${IAM_DIFF_FILES}"$'\n'"${SECRETS_MONITOR_DIFF}"
+    fail "18: IAM changed outside the expected file set, or a protected role's policy was touched:"$'\n'"unexpected changed files: ${UNEXPECTED_IAM_DIFF_FILES}"$'\n'"${SECRETS_MONITOR_DIFF}"
   fi
 else
   skip "collector.py/monitor.py/IAM unchanged checks -- not a git repository"
