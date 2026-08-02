@@ -14,10 +14,10 @@ on:
           - dev
 
       deployment_id:
-        description: "Unique GoldenGate deployment ID, example: payments-ora-to-pg-001"
+        description: "Unique GoldenGate deployment ID, example: gg-oracle-payments-01"
         required: true
         type: string
-        default: payments-ora-to-pg-001
+        default: gg-oracle-payments-01
 
       deploy:
         description: "Deploy to EKS after publishing Helm chart"
@@ -378,7 +378,7 @@ jobs:
             if [[ ! "$DEPLOYMENT_ID" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
               echo "Invalid deployment_id: $DEPLOYMENT_ID"
               echo "Use lowercase letters, numbers, and hyphens only."
-              echo "Example: payments-ora-to-pg-001"
+              echo "Example: gg-oracle-payments-01"
               exit 1
             fi
 
@@ -569,6 +569,40 @@ jobs:
               GG_REASON="$(is_goldengate_deployment_values_file "$VALUES_FILE")"
               GG_STATUS=$?
               set -e
+
+              if [ "$GG_STATUS" -ne 0 ]; then
+                case "$GG_REASON" in
+                  "empty values.yaml"|"empty/comment-only values.yaml"|"empty/null parsed YAML")
+                    # The file still exists but was deliberately emptied
+                    # (zero-byte, whitespace/comment-only, or YAML null) --
+                    # this is a recognized intentional-deletion shape, not a
+                    # classification failure. Fall back to the previous
+                    # valid content at the base revision to determine
+                    # whether it used to be a genuine GoldenGate deployment
+                    # and, if so, which deploymentModel it was.
+                    echo "${VALUES_FILE} is now deliberately empty (${GG_REASON}). Checking its previous content at base revision (${BEFORE_SHA})..."
+                    GG_SOURCE="base revision (${BEFORE_SHA}), current file deliberately emptied"
+                    set +e
+                    GG_REASON="$(is_goldengate_deployment_values_file_at_ref "$BEFORE_SHA" "$VALUES_FILE")"
+                    GG_STATUS=$?
+                    set -e
+                    ;;
+                  "unparsable YAML:"*|"parsed YAML is not a mapping")
+                    # Malformed or structurally invalid current YAML is
+                    # never treated as an intentional deletion signal, and
+                    # never silently ignored either -- fail the workflow
+                    # closed with a clear error so the mistake is visible.
+                    echo "FAIL: ${VALUES_FILE} could not be classified: ${GG_REASON}"
+                    echo "This is not a recognized intentional-deletion shape (missing, zero-byte, whitespace/comment-only, or YAML null) -- it looks like invalid content instead. Fix or intentionally empty the file, or remove it entirely, before this push can be processed."
+                    exit 1
+                    ;;
+                  *)
+                    # A syntactically valid mapping that simply isn't a
+                    # GoldenGate deployment (no/unknown deploymentModel) --
+                    # not a deletion signal, not an error either.
+                    ;;
+                esac
+              fi
             else
               GG_SOURCE="base revision (${BEFORE_SHA})"
               set +e
@@ -783,7 +817,7 @@ jobs:
           if [[ ! "$DEPLOYMENT_ID" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
             echo "Invalid deployment_id: $DEPLOYMENT_ID"
             echo "Use lowercase letters, numbers, and hyphens only."
-            echo "Example: payments-ora-to-pg-001"
+            echo "Example: gg-oracle-payments-01"
             exit 1
           fi
 
@@ -1682,13 +1716,16 @@ jobs:
             exit 0
           fi
 
-          # deploymentModel=legacyPair (retired -- retained only for
-          # rollback/reference, never selected for automatic deployment; see
-          # envs/dev/payments-ora-to-pg-001/values.yaml). The chart no longer
-          # renders an observer container, image, port, env var, or
-          # goldengate.adcb/observer-enabled annotation for either
-          # deploymentModel, so this is a simple negative assertion rather
-          # than the previous observer-contract validation.
+          # deploymentModel=legacyPair: retired. No active values folder uses
+          # this model anymore (the last one, envs/dev/payments-ora-to-pg-001/,
+          # was removed from the repository once its live Argo CD Application
+          # and namespace were already retired -- historical source remains
+          # available through Git history). helm/goldengate now rejects
+          # deploymentModel=legacyPair with a controlled error at render time,
+          # so this branch is unreachable in normal operation; it is left in
+          # place only as inert defensive code, never selected for automatic
+          # deployment. This is a simple negative assertion, not observer-
+          # contract validation.
           echo "deploymentModel=legacyPair: validating that no observer container or annotation is rendered (observer support has been retired)."
 
           SOURCE_STS="$(awk '/^# Source: .*source-statefulset\.yaml$/{flag=1} flag{print} /^---$/{if(flag) exit}' "$RENDERED")"
@@ -2218,8 +2255,7 @@ jobs:
             echo "explicit lifecycle.state=absent is treated as a deletion request (deletes the"
             echo "Argo CD Application and, if safely identifiable, its namespace)."
             echo "deployment.enabled=false (and top-level enabled=false) mark a deployment as"
-            echo "retired-but-retained for rollback/reference and never trigger deletion -- see"
-            echo "envs/dev/payments-ora-to-pg-001/values.yaml."
+            echo "retired-but-retained for rollback/reference and never trigger deletion."
             echo ""
             echo "### Validation commands"
             echo ""

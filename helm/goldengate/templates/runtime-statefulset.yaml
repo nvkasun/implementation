@@ -1,4 +1,5 @@
-{{- if and (eq (default "legacyPair" .Values.deploymentModel) "singleRuntime") .Values.runtime.enabled }}
+{{- include "goldengate.assertSupportedDeploymentModel" . }}
+{{- if .Values.runtime.enabled }}
 {{- if and .Values.runtime.csi.enabled .Values.runtime.csi.admin.enabled (not .Values.runtime.csi.admin.objectName) }}
 {{- fail "runtime.csi.admin.objectName is required when runtime.csi.admin.enabled=true." }}
 {{- end }}

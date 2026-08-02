@@ -1,4 +1,4 @@
-{{- if and (eq (default "legacyPair" .Values.deploymentModel) "singleRuntime") .Values.runtime.enabled .Values.ingress.enabled }}
+{{- if and .Values.runtime.enabled .Values.ingress.enabled }}
 {{- if not (or (eq .Values.ingress.mode "shared") (eq .Values.ingress.mode "standalone")) }}
 {{- fail (printf "ingress.mode must be either \"shared\" or \"standalone\", got %q" .Values.ingress.mode) }}
 {{- end }}

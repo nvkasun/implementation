@@ -1,4 +1,4 @@
-{{- if and (eq (default "legacyPair" .Values.deploymentModel) "singleRuntime") .Values.runtime.enabled .Values.persistence.enabled (eq .Values.persistence.provider "efs") (eq .Values.runtime.storage.u02.type "efs") (not .Values.runtime.storage.u02.existingClaim) }}
+{{- if and .Values.runtime.enabled .Values.persistence.enabled (eq .Values.persistence.provider "efs") (eq .Values.runtime.storage.u02.type "efs") (not .Values.runtime.storage.u02.existingClaim) }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

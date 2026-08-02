@@ -1067,19 +1067,12 @@ check_one() {
   fi
 }
 
-check_one "envs/dev/payments-ora-to-pg-001/values.yaml" 1 "legacy-inactive"
 check_one "envs/dev/gg-oracle-payments-01/values.yaml" 0 "oracle-active"
 check_one "envs/dev/gg-postgresql-payments-01/values.yaml" 0 "postgresql-active"
 HARNESS
 
   ACTIVE_CHECK_OUTPUT="$(bash "${WORKDIR}/run_is_active_checks.sh" 2>&1 || true)"
   echo "$ACTIVE_CHECK_OUTPUT"
-
-  if echo "$ACTIVE_CHECK_OUTPUT" | grep -q "^PASS legacy-inactive"; then
-    pass "the real workflow's is_active_deployment_values_file() reports payments-ora-to-pg-001 inactive"
-  else
-    fail "payments-ora-to-pg-001 is not reported inactive by the real workflow function"
-  fi
 
   cat > "${WORKDIR}/run_is_gg_checks.sh" <<HARNESS
 #!/bin/bash
@@ -1101,7 +1094,6 @@ check_one() {
 
 check_one "envs/dev/gg-oracle-payments-01/values.yaml" 0 "oracle-is-gg"
 check_one "envs/dev/gg-postgresql-payments-01/values.yaml" 0 "postgresql-is-gg"
-check_one "envs/dev/payments-ora-to-pg-001/values.yaml" 0 "legacy-is-gg"
 check_one "envs/dev/goldengate-monitor/values.yaml" 1 "monitor-is-not-gg"
 check_one "envs/dev/argocd/values.yaml" 1 "argocd-is-not-gg"
 HARNESS
@@ -1110,11 +1102,10 @@ HARNESS
   echo "$GG_CHECK_OUTPUT"
 
   if echo "$GG_CHECK_OUTPUT" | grep -q "^PASS oracle-is-gg" \
-      && echo "$GG_CHECK_OUTPUT" | grep -q "^PASS postgresql-is-gg" \
-      && echo "$GG_CHECK_OUTPUT" | grep -q "^PASS legacy-is-gg"; then
-    pass "the real workflow's is_goldengate_deployment_values_file() classifies all three GoldenGate deployment folders correctly (regardless of active/inactive state)"
+      && echo "$GG_CHECK_OUTPUT" | grep -q "^PASS postgresql-is-gg"; then
+    pass "the real workflow's is_goldengate_deployment_values_file() classifies both canonical GoldenGate deployment folders correctly"
   else
-    fail "one or more GoldenGate deployment folders are misclassified by is_goldengate_deployment_values_file()"
+    fail "one or more canonical GoldenGate deployment folders are misclassified by is_goldengate_deployment_values_file()"
   fi
 
   if echo "$GG_CHECK_OUTPUT" | grep -q "^PASS monitor-is-not-gg" \
@@ -1193,13 +1184,21 @@ HARNESS
              "${DELETION_REPO}/envs/dev/goldengate-monitor" \
              "${DELETION_REPO}/envs/dev/argocd" \
              "${DELETION_REPO}/envs/dev/case6-malformed" \
-             "${DELETION_REPO}/envs/dev/case7-unknown-model"
+             "${DELETION_REPO}/envs/dev/case7-unknown-model" \
+             "${DELETION_REPO}/envs/dev/case-empty-zerobyte" \
+             "${DELETION_REPO}/envs/dev/case-empty-comment" \
+             "${DELETION_REPO}/envs/dev/case-empty-whitespace" \
+             "${DELETION_REPO}/envs/dev/case-empty-null"
 
     printf 'deploymentModel: singleRuntime\nrunning: at-base-revision\n' > "${DELETION_REPO}/envs/dev/case2-removed-canonical/values.yaml"
     printf 'global:\n  environment: dev\nnamespace:\n  create: true\n' > "${DELETION_REPO}/envs/dev/goldengate-monitor/values.yaml"
     printf 'server:\n  extraArgs: []\n' > "${DELETION_REPO}/envs/dev/argocd/values.yaml"
     printf 'deploymentModel: singleRuntime\n  bad indent: [unterminated\n' > "${DELETION_REPO}/envs/dev/case6-malformed/values.yaml"
     printf 'deploymentModel: someUnknownModel\n' > "${DELETION_REPO}/envs/dev/case7-unknown-model/values.yaml"
+    printf 'deploymentModel: singleRuntime\nrunning: at-base-revision\n' > "${DELETION_REPO}/envs/dev/case-empty-zerobyte/values.yaml"
+    printf 'deploymentModel: singleRuntime\nrunning: at-base-revision\n' > "${DELETION_REPO}/envs/dev/case-empty-comment/values.yaml"
+    printf 'deploymentModel: singleRuntime\nrunning: at-base-revision\n' > "${DELETION_REPO}/envs/dev/case-empty-whitespace/values.yaml"
+    printf 'deploymentModel: singleRuntime\nrunning: at-base-revision\n' > "${DELETION_REPO}/envs/dev/case-empty-null/values.yaml"
 
     git -C "$DELETION_REPO" init -q
     git -C "$DELETION_REPO" config user.email "test@test.invalid"
@@ -1213,12 +1212,20 @@ HARNESS
     # removed/renamed deletion candidate); case1 and case3 are added fresh
     # in the working tree only (never committed -- they represent "still
     # exists, but now inactive" candidates, which is what the loop's
-    # is_goldengate_deployment_values_file working-tree path reads).
+    # is_goldengate_deployment_values_file working-tree path reads); the
+    # case-empty-* files are overwritten IN PLACE (never git rm'd) with each
+    # of the four "deliberately empty" shapes the Phase 5B2A classification
+    # fix must fall back through to their still-valid content at BEFORE_SHA.
     git -C "$DELETION_REPO" rm -rq envs/dev/case2-removed-canonical envs/dev/goldengate-monitor envs/dev/argocd envs/dev/case6-malformed envs/dev/case7-unknown-model
 
-    mkdir -p "${DELETION_REPO}/envs/dev/case1-payments-ora-to-pg-001" "${DELETION_REPO}/envs/dev/case3-lifecycle-absent"
-    printf 'deploymentModel: legacyPair\ndeployment:\n  enabled: false\n' > "${DELETION_REPO}/envs/dev/case1-payments-ora-to-pg-001/values.yaml"
+    mkdir -p "${DELETION_REPO}/envs/dev/case1-retired-legacypair-retained" "${DELETION_REPO}/envs/dev/case3-lifecycle-absent"
+    printf 'deploymentModel: legacyPair\ndeployment:\n  enabled: false\n' > "${DELETION_REPO}/envs/dev/case1-retired-legacypair-retained/values.yaml"
     printf 'deploymentModel: legacyPair\nlifecycle:\n  state: absent\n' > "${DELETION_REPO}/envs/dev/case3-lifecycle-absent/values.yaml"
+
+    : > "${DELETION_REPO}/envs/dev/case-empty-zerobyte/values.yaml"
+    printf '# retired\n# nothing here\n' > "${DELETION_REPO}/envs/dev/case-empty-comment/values.yaml"
+    printf '   \n\n   \n' > "${DELETION_REPO}/envs/dev/case-empty-whitespace/values.yaml"
+    printf 'null\n' > "${DELETION_REPO}/envs/dev/case-empty-null/values.yaml"
 
     DELETION_TEST_OUTPUT="$(cd "$DELETION_REPO" && bash -c '
       set -euo pipefail
@@ -1235,7 +1242,7 @@ HARNESS
       }
       BEFORE_SHA="'"$DELETION_BEFORE_SHA"'"
 
-      for id in case1-payments-ora-to-pg-001 case2-removed-canonical case3-lifecycle-absent goldengate-monitor argocd case6-malformed case7-unknown-model; do
+      for id in case1-retired-legacypair-retained case2-removed-canonical case3-lifecycle-absent goldengate-monitor argocd case6-malformed case7-unknown-model case-empty-zerobyte case-empty-comment case-empty-whitespace case-empty-null; do
         DELETION_MATRIX_ITEMS="[]"
         INACTIVE_LOG=""
         DELETION_CANDIDATE_IDS="$id"
@@ -1266,20 +1273,28 @@ HARNESS
       fi
     }
 
-    check_deletion_case "1: existing payments-ora-to-pg-001 with deployment.enabled=false produces no deletion entry" \
-      '^RESULT case1-payments-ora-to-pg-001 => \[\]$'
+    check_deletion_case "retained legacyPair (deployment.enabled=false) produces no deletion entry" \
+      '^RESULT case1-retired-legacypair-retained => \[\]$'
     check_deletion_case "2: removed canonical GoldenGate values (deploymentModel: singleRuntime) produces a deletion entry with deployment_model=singleRuntime" \
       '^RESULT case2-removed-canonical => \[ADDED id=case2-removed-canonical model=singleRuntime\]$'
     check_deletion_case "3: existing GoldenGate file with lifecycle.state=absent produces a deletion entry" \
       '^RESULT case3-lifecycle-absent => \[ADDED id=case3-lifecycle-absent model=legacyPair\]$'
-    check_deletion_case "4: removed goldengate-monitor values (no deploymentModel) produces no deletion entry" \
+    check_deletion_case "11: removed goldengate-monitor values does not enter the GoldenGate deletion matrix" \
       '^RESULT goldengate-monitor => \[\]$'
-    check_deletion_case "5: removed argocd values (no deploymentModel) produces no deletion entry" \
+    check_deletion_case "12: removed argocd values does not enter the GoldenGate deletion matrix" \
       '^RESULT argocd => \[\]$'
-    check_deletion_case "6: removed malformed YAML produces no deletion entry" \
+    check_deletion_case "13: removed malformed previous YAML does not enter deletion" \
       '^RESULT case6-malformed => \[\]$'
-    check_deletion_case "7: removed unknown deploymentModel produces no deletion entry" \
+    check_deletion_case "14: removed unknown deploymentModel does not enter deletion" \
       '^RESULT case7-unknown-model => \[\]$'
+    check_deletion_case "8: a zero-byte values file (previously valid) creates its deletion entry" \
+      '^RESULT case-empty-zerobyte => \[ADDED id=case-empty-zerobyte model=singleRuntime\]$'
+    check_deletion_case "6: a comment-only canonical values file creates its deletion entry" \
+      '^RESULT case-empty-comment => \[ADDED id=case-empty-comment model=singleRuntime\]$'
+    check_deletion_case "7: a whitespace-only values file creates its deletion entry" \
+      '^RESULT case-empty-whitespace => \[ADDED id=case-empty-whitespace model=singleRuntime\]$'
+    check_deletion_case "9: YAML null creates its deletion entry when the previous file was valid" \
+      '^RESULT case-empty-null => \[ADDED id=case-empty-null model=singleRuntime\]$'
 
     rm -rf "$DELETION_REPO"
   else
@@ -1287,6 +1302,176 @@ HARNESS
   fi
 else
   skip "Phase 5A legacy-folder behavioral checks -- ${EKS_APP_WORKFLOW} or python3 not available"
+fi
+
+# ---------------------------------------------------------------------
+# Phase 5B2A: malformed CURRENT YAML must fail the workflow closed (never
+# silently skipped, never silently deleted); whole-folder, whole-envs-
+# directory, and rename scenarios exercised through the REAL discovery
+# logic (git diff --name-status), not just the isolated per-ID loop above.
+# ---------------------------------------------------------------------
+echo ""
+echo "--- Phase 5B2A: malformed-current-YAML hard failure; folder/envs-directory/rename discovery ---"
+
+if [ -f "${WORKDIR}/detect_script.sh" ] && [ -s "${WORKDIR}/detect_script.sh" ] && command -v python3 >/dev/null 2>&1; then
+  # 15: malformed CURRENT YAML (file still exists, still has bytes, but is
+  # not valid YAML) must abort the whole detection script with a clear
+  # error -- never be treated as an intentional deletion signal, and never
+  # silently ignored either.
+  MALFORMED_REPO="${WORKDIR}/malformed-repo"
+  rm -rf "$MALFORMED_REPO"
+  mkdir -p "${MALFORMED_REPO}/envs/dev/case-malformed-current"
+  printf 'deploymentModel: singleRuntime\nrunning: at-base-revision\n' > "${MALFORMED_REPO}/envs/dev/case-malformed-current/values.yaml"
+  git -C "$MALFORMED_REPO" init -q
+  git -C "$MALFORMED_REPO" config user.email "test@test.invalid"
+  git -C "$MALFORMED_REPO" config user.name "test"
+  git -C "$MALFORMED_REPO" add -A
+  git -C "$MALFORMED_REPO" commit -q -m "base revision"
+  MALFORMED_BEFORE_SHA="$(git -C "$MALFORMED_REPO" rev-parse HEAD)"
+  printf 'deploymentModel: singleRuntime\n  bad indent: [unterminated\n' > "${MALFORMED_REPO}/envs/dev/case-malformed-current/values.yaml"
+
+  set +e
+  MALFORMED_CURRENT_OUTPUT="$(cd "$MALFORMED_REPO" && bash -c '
+    set -euo pipefail
+    source "'"${WORKDIR}"'/is_gg_fn.sh"
+    source "'"${WORKDIR}"'/is_active_fn.sh"
+    jq() { echo "[SHOULD_NOT_BE_CALLED]"; }
+    BEFORE_SHA="'"$MALFORMED_BEFORE_SHA"'"
+    DELETION_MATRIX_ITEMS="[]"
+    INACTIVE_LOG=""
+    DELETION_CANDIDATE_IDS="case-malformed-current"
+    source "'"${WORKDIR}"'/deletion_loop.sh"
+    echo "RESULT case-malformed-current => ${DELETION_MATRIX_ITEMS}"
+  ' 2>&1)"
+  MALFORMED_CURRENT_STATUS=$?
+  set -e
+  echo "$MALFORMED_CURRENT_OUTPUT"
+
+  if [ "$MALFORMED_CURRENT_STATUS" -ne 0 ] \
+      && echo "$MALFORMED_CURRENT_OUTPUT" | grep -qF "FAIL:" \
+      && ! echo "$MALFORMED_CURRENT_OUTPUT" | grep -q "SHOULD_NOT_BE_CALLED" \
+      && ! echo "$MALFORMED_CURRENT_OUTPUT" | grep -q "^RESULT"; then
+    pass "15: malformed current YAML fails the workflow closed (non-zero exit, clear FAIL message, never reaches deletion-matrix construction)"
+  else
+    fail "15: malformed current YAML did not fail closed as expected (status=${MALFORMED_CURRENT_STATUS})"
+  fi
+  rm -rf "$MALFORMED_REPO"
+
+  # 4/5/10: exercise the REAL discovery logic (REMOVED_PATH_IDS/
+  # CHANGED_VALUES_IDS via git diff --name-status), not just a manually
+  # supplied DELETION_CANDIDATE_IDS, for: whole-folder deletion, whole-envs-
+  # directory deletion, and folder rename.
+  # Extract only the discovery half (NAME_STATUS/REMOVED_PATH_IDS/
+  # CHANGED_VALUES_IDS/DELETION_CANDIDATE_IDS construction), stopping
+  # before the "for CANDIDATE_ID in $DELETION_CANDIDATE_IDS" loop --
+  # that loop is reused as-is from the already-extracted, already-proven
+  # deletion_loop.sh above, so this test never needs to stub the
+  # unrelated DEPLOYMENT_MATRIX_ITEMS jq recomputation that follows it
+  # in the real script (which requires real jq and $GITHUB_OUTPUT).
+  awk '/^NAME_STATUS="\$\(git diff --name-status/,/^DELETION_CANDIDATE_IDS=/' "${WORKDIR}/detect_script.sh" > "${WORKDIR}/discovery_only.sh"
+
+  if [ -s "${WORKDIR}/discovery_only.sh" ] && [ -s "${WORKDIR}/deletion_loop.sh" ]; then
+    DISCOVERY_REPO="${WORKDIR}/discovery-repo"
+
+    run_discovery_case() {
+      local label="$1" setup_fn="$2" expect_pattern="$3" unexpected_pattern="$4"
+      rm -rf "$DISCOVERY_REPO"
+      mkdir -p "${DISCOVERY_REPO}/envs/dev/gg-oracle-payments-01" "${DISCOVERY_REPO}/envs/dev/gg-postgresql-payments-01"
+      printf 'deploymentModel: singleRuntime\nname: oracle\n' > "${DISCOVERY_REPO}/envs/dev/gg-oracle-payments-01/values.yaml"
+      printf 'deploymentModel: singleRuntime\nname: postgresql\n' > "${DISCOVERY_REPO}/envs/dev/gg-postgresql-payments-01/values.yaml"
+      mkdir -p "${DISCOVERY_REPO}/envs/dev/goldengate-monitor"
+      printf 'global:\n  environment: dev\n' > "${DISCOVERY_REPO}/envs/dev/goldengate-monitor/values.yaml"
+      "$setup_fn" "$DISCOVERY_REPO"
+      git -C "$DISCOVERY_REPO" init -q
+      git -C "$DISCOVERY_REPO" config user.email "test@test.invalid"
+      git -C "$DISCOVERY_REPO" config user.name "test"
+      git -C "$DISCOVERY_REPO" add -A
+      git -C "$DISCOVERY_REPO" commit -q -m "base revision"
+      local before_sha
+      before_sha="$(git -C "$DISCOVERY_REPO" rev-parse HEAD)"
+      "${setup_fn}_mutate" "$DISCOVERY_REPO"
+      git -C "$DISCOVERY_REPO" add -A
+      git -C "$DISCOVERY_REPO" commit -q -m "after revision" --allow-empty
+      local after_sha
+      after_sha="$(git -C "$DISCOVERY_REPO" rev-parse HEAD)"
+
+      local out status
+      set +e
+      out="$(cd "$DISCOVERY_REPO" && bash -c '
+        set -euo pipefail
+        source "'"${WORKDIR}"'/is_gg_fn.sh"
+        source "'"${WORKDIR}"'/is_active_fn.sh"
+        jq() {
+          local stdin_content
+          stdin_content="$(cat)"
+          shift
+          local args=("$@") model="" id=""
+          for i in "${!args[@]}"; do
+            [ "${args[$i]}" = "deployment_id" ] && id="${args[$((i+1))]}"
+            [ "${args[$i]}" = "deployment_model" ] && model="${args[$((i+1))]}"
+          done
+          if [ "$stdin_content" = "[]" ]; then
+            echo "[ADDED id=${id} model=${model}]"
+          else
+            echo "${stdin_content} [ADDED id=${id} model=${model}]"
+          fi
+        }
+        BEFORE_SHA="'"$before_sha"'"
+        AFTER_SHA="'"$after_sha"'"
+        DELETION_MATRIX_ITEMS="[]"
+        INACTIVE_LOG=""
+        CHANGED_FILES="$(git diff --name-only "$BEFORE_SHA" "$AFTER_SHA" -- "envs/dev/**" "helm/goldengate/**" || true)"
+        source "'"${WORKDIR}"'/discovery_only.sh"
+        source "'"${WORKDIR}"'/deletion_loop.sh"
+        echo "FINAL_DELETION_MATRIX=${DELETION_MATRIX_ITEMS}"
+      ' 2>&1)"
+      status=$?
+      set -e
+      echo "$out"
+
+      if [ "$status" -eq 0 ] && echo "$out" | grep -qE "$expect_pattern" \
+          && { [ -z "$unexpected_pattern" ] || ! echo "$out" | grep -qE "$unexpected_pattern"; }; then
+        pass "$label"
+      else
+        fail "$label -- expected pattern [${expect_pattern}] not satisfied (or unexpected [${unexpected_pattern}] present), status=${status}"
+      fi
+    }
+
+    # Test 4: deleting an entire canonical deployment folder.
+    setup_folder_delete() { :; }
+    setup_folder_delete_mutate() { rm -rf "$1/envs/dev/gg-postgresql-payments-01"; }
+    run_discovery_case "4: deleting an entire canonical deployment folder creates its deletion entry" \
+      setup_folder_delete \
+      'ADDED id=gg-postgresql-payments-01 model=singleRuntime' \
+      'ADDED id=gg-oracle-payments-01'
+
+    # Test 5: deleting the complete envs directory.
+    setup_envs_delete() { :; }
+    setup_envs_delete_mutate() { rm -rf "$1/envs"; }
+    run_discovery_case "5: deleting the complete envs directory creates deletion entries for all previously valid GoldenGate deployments and no unrelated folders" \
+      setup_envs_delete \
+      'ADDED id=gg-oracle-payments-01 model=singleRuntime' \
+      'ADDED id=goldengate-monitor'
+
+    # Test 10: renaming a deployment folder deletes the old ID and the new
+    # ID is discovered as an independent candidate (build-matrix discovery
+    # is a separate code path from the deletion loop under test here, so
+    # this proves the deletion half of the contract: the OLD id must be
+    # queued for deletion; the NEW id must never itself appear as a
+    # deletion entry).
+    setup_rename() { :; }
+    setup_rename_mutate() { git -C "$1" mv envs/dev/gg-oracle-payments-01 envs/dev/gg-oracle-payments-01-renamed; }
+    run_discovery_case "10: renaming a deployment folder deletes the old ID (and never queues the new ID for deletion)" \
+      setup_rename \
+      'ADDED id=gg-oracle-payments-01 model=singleRuntime' \
+      'ADDED id=gg-oracle-payments-01-renamed'
+
+    rm -rf "$DISCOVERY_REPO"
+  else
+    fail "could not extract the discovery-plus-deletion block from ${EKS_APP_WORKFLOW} for folder/envs-directory/rename tests"
+  fi
+else
+  skip "malformed-current-YAML and folder/envs-directory/rename discovery tests -- detect_script.sh or python3 not available"
 fi
 
 echo ""
@@ -1418,7 +1603,7 @@ else
 fi
 
 if [ "$HELM_AVAILABLE" = "true" ] && [ "$PYTHON_AVAILABLE" = "true" ]; then
-  for pair in "gg-oracle-payments-01:goldengate-dev" "gg-postgresql-payments-01:goldengate-dev" "payments-ora-to-pg-001:gg-dev-payments-ora-to-pg-001"; do
+  for pair in "gg-oracle-payments-01:goldengate-dev" "gg-postgresql-payments-01:goldengate-dev"; do
     id="${pair%%:*}"; ns="${pair##*:}"
     VALUES_FILE="envs/dev/${id}/values.yaml"
     RENDERED="${WORKDIR}/${id}-observer-check.yaml"
@@ -1796,14 +1981,20 @@ echo ""
 echo "--- Phase 5A: stale ServiceManager.pid and Argo CD deletion safeguards preserved ---"
 
 PID_GUARD_MISSING=""
-for f in helm/goldengate/templates/source-statefulset.yaml helm/goldengate/templates/target-statefulset.yaml helm/goldengate/templates/runtime-statefulset.yaml; do
+for f in helm/goldengate/templates/runtime-statefulset.yaml; do
   [ -f "$f" ] || continue
   grep -q "ServiceManager.pid" "$f" || PID_GUARD_MISSING="${PID_GUARD_MISSING} ${f}"
 done
 if [ -z "$PID_GUARD_MISSING" ]; then
-  pass "stale ServiceManager.pid cleanup remains present in every StatefulSet template"
+  pass "27: exact ServiceManager.pid cleanup remains present in the runtime StatefulSet template"
 else
   fail "stale ServiceManager.pid cleanup is missing from:${PID_GUARD_MISSING}"
+fi
+
+if [ -f "helm/goldengate/templates/source-statefulset.yaml" ] || [ -f "helm/goldengate/templates/target-statefulset.yaml" ]; then
+  fail "legacyPair source-statefulset.yaml/target-statefulset.yaml still exist -- must be removed"
+else
+  pass "legacyPair source-statefulset.yaml/target-statefulset.yaml no longer exist"
 fi
 
 if grep -q "resources-finalizer.argocd.argoproj.io" "$EKS_APP_WORKFLOW" 2>/dev/null \
@@ -1871,10 +2062,16 @@ else
   fail "junk/cache artifacts found:${JUNK_ARTIFACTS}"
 fi
 
-if [ -d "envs/dev/payments-ora-to-pg-001" ] && [ -f "envs/dev/payments-ora-to-pg-001/values.yaml" ]; then
-  pass "the retired legacy values folder (envs/dev/payments-ora-to-pg-001) remains present"
+if [ ! -d "envs/dev/payments-ora-to-pg-001" ]; then
+  pass "20: the retired payments-ora-to-pg-001 source folder is absent (removed in Phase 5B2A; still available via Git history)"
 else
-  fail "the retired legacy values folder is missing -- it must be retained until Phase 5B"
+  fail "20: envs/dev/payments-ora-to-pg-001 still exists -- it must be fully removed in Phase 5B2A"
+fi
+
+if ! grep -rn "payments-ora-to-pg-001" envs/dev/goldengate-deployments.yaml 2>/dev/null | grep -qv "pipeline:"; then
+  pass "21: no active deployment-registry configuration references the retired deployment folder (only the shared logical pipeline: grouping id remains, which is unrelated and intentionally preserved)"
+else
+  fail "21: envs/dev/goldengate-deployments.yaml appears to reference the retired deployment beyond the shared pipeline: grouping id"
 fi
 
 CANONICAL_PRESENCE_MISSING=""
@@ -1882,11 +2079,8 @@ for f in \
   envs/dev/gg-oracle-payments-01/values.yaml \
   envs/dev/gg-postgresql-payments-01/values.yaml \
   envs/dev/goldengate-monitor/values.yaml \
-  helm/goldengate/templates/source-statefulset.yaml \
-  helm/goldengate/templates/target-statefulset.yaml \
   helm/goldengate/templates/runtime-statefulset.yaml \
-  helm/goldengate/templates/ingress.yaml \
-  helm/goldengate/templates/namespace.yaml \
+  helm/goldengate/templates/runtime-ingress.yaml \
   helm/goldengate-monitor/templates/deployment.yaml \
   monitoring/monitor/monitor.py \
   monitoring/monitor/collector.py \
@@ -1966,11 +2160,6 @@ PYEOF
       --values "${REPO_ROOT}/envs/dev/gg-postgresql-payments-01/values.yaml" \
       --set global.environment=dev --set global.deploymentId=gg-postgresql-payments-01 \
       > "${EFS_WORKDIR}/rendered/gg-postgresql-payments-01.yaml" 2>"${EFS_WORKDIR}/postgres-render.err" || true
-    helm template ogg-payments-ora-to-pg-001 "$RUNTIME_CHART" --namespace gg-dev-payments-ora-to-pg-001 \
-      --values "${REPO_ROOT}/envs/dev/payments-ora-to-pg-001/values.yaml" \
-      --set global.environment=dev --set global.deploymentId=payments-ora-to-pg-001 \
-      > "${EFS_WORKDIR}/rendered/ogg-payments-ora-to-pg-001.yaml" 2>"${EFS_WORKDIR}/legacy-render.err" || true
-
     set +e
     ORACLE_OUT="$(run_efs_step "gg-oracle-payments-01" "${REPO_ROOT}/envs/dev/gg-oracle-payments-01/values.yaml" "gg-oracle-payments-01" "singleRuntime" "dev")"
     ORACLE_STATUS=$?
@@ -2171,17 +2360,36 @@ with open('${EFS_WORKDIR}/rendered/duplicate-storageclass.yaml', 'w') as f:
       echo "$DUP_SC_OUT"
     fi
 
-    # 12: legacyPair source/target PVC and StatefulSet u02/u03 validation
-    # continues passing (existing behavior, not weakened).
+    # 22: legacyPair Helm rendering is rejected with a clear controlled
+    # error (the chart no longer implements legacyPair source/target
+    # rendering -- it was removed in Phase 5B2A). Also confirm an unknown
+    # deploymentModel fails closed the same way.
     set +e
-    LEGACY_OUT="$(run_efs_step "ogg-payments-ora-to-pg-001" "${REPO_ROOT}/envs/dev/payments-ora-to-pg-001/values.yaml" "payments-ora-to-pg-001" "legacyPair" "dev")"
-    LEGACY_STATUS=$?
+    LEGACY_REJECT_ERR="$(helm template ogg-legacy-reject "$RUNTIME_CHART" --namespace goldengate-dev \
+      --values "${REPO_ROOT}/envs/dev/gg-oracle-payments-01/values.yaml" \
+      --set global.environment=dev --set global.deploymentId=ogg-legacy-reject \
+      --set deploymentModel=legacyPair 2>&1)"
+    LEGACY_REJECT_STATUS=$?
     set -e
-    if [ "$LEGACY_STATUS" -eq 0 ] && echo "$LEGACY_OUT" | grep -qF "OK: EFS StorageClass, source/target PVCs, and StatefulSet u02/u03"; then
-      pass "12: legacyPair source/target PVC and StatefulSet u02/u03 validation continues passing"
+    if [ "$LEGACY_REJECT_STATUS" -ne 0 ] && echo "$LEGACY_REJECT_ERR" | grep -qF "deploymentModel=legacyPair is no longer supported by this chart"; then
+      pass "22: legacyPair Helm rendering is rejected with the expected controlled error"
     else
-      fail "12: legacyPair EFS validation regressed"
-      echo "$LEGACY_OUT"
+      fail "22: legacyPair Helm rendering was not rejected as expected (status=${LEGACY_REJECT_STATUS})"
+      echo "$LEGACY_REJECT_ERR"
+    fi
+
+    set +e
+    UNKNOWN_MODEL_ERR="$(helm template ogg-unknown-reject "$RUNTIME_CHART" --namespace goldengate-dev \
+      --values "${REPO_ROOT}/envs/dev/gg-oracle-payments-01/values.yaml" \
+      --set global.environment=dev --set global.deploymentId=ogg-unknown-reject \
+      --set deploymentModel=someUnknownModel 2>&1)"
+    UNKNOWN_MODEL_STATUS=$?
+    set -e
+    if [ "$UNKNOWN_MODEL_STATUS" -ne 0 ] && echo "$UNKNOWN_MODEL_ERR" | grep -qF "Unsupported or missing deploymentModel"; then
+      pass "an unknown/missing deploymentModel fails closed with a clear controlled error"
+    else
+      fail "an unknown deploymentModel was not rejected as expected (status=${UNKNOWN_MODEL_STATUS})"
+      echo "$UNKNOWN_MODEL_ERR"
     fi
 
     # 13: this EFS-only correction did not touch observer removal or the
