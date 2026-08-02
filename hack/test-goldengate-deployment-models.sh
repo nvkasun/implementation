@@ -25,6 +25,7 @@ MONITOR_CHART="helm/goldengate-monitor"
 MONITOR_APP_DIR="monitoring/monitor"
 MONITOR_WORKFLOW=".github/workflows/goldengate-monitor.yaml"
 EKS_APP_WORKFLOW=".github/workflows/goldengate-eks-app.yaml"
+DETECT_SCRIPT="hack/detect-goldengate-deployments.sh"
 
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT
@@ -1016,23 +1017,15 @@ fi
 echo ""
 echo "--- Phase 5A: legacy values folder disabled (retained, not deleted) ---"
 
-if [ -f "$EKS_APP_WORKFLOW" ] && command -v python3 >/dev/null 2>&1; then
-  # Extract the real, unmodified "Detect changed deployments" run script from
-  # the workflow (never a reimplementation) and exercise its
-  # is_active_deployment_values_file() function and its deletion-candidate
-  # case statement directly, against the real repository files.
-  python3 - "$EKS_APP_WORKFLOW" > "${WORKDIR}/detect_script.sh" <<'PYEOF'
-import sys
-import yaml
-with open(sys.argv[1]) as f:
-    doc = yaml.safe_load(f)
-for step in doc["jobs"]["detect_changed_deployments"]["steps"]:
-    if step.get("name") == "Detect changed deployments":
-        sys.stdout.write(step["run"])
-        break
-else:
-    sys.exit("step not found")
-PYEOF
+if [ -f "$DETECT_SCRIPT" ] && command -v python3 >/dev/null 2>&1; then
+  # Use the real, tracked, executable detection script directly (never a
+  # reimplementation, never re-extracted from the workflow YAML -- since
+  # Phase 5B2A's workflow-compilation-size fix, the workflow step itself is
+  # only a thin wrapper that calls this script; the actual implementation
+  # lives here) and exercise its is_active_deployment_values_file()
+  # function and its deletion-candidate case statement directly, against
+  # the real repository files.
+  cp "$DETECT_SCRIPT" "${WORKDIR}/detect_script.sh"
 
   awk '/^is_active_deployment_values_file\(\) \{/,/^\}$/' "${WORKDIR}/detect_script.sh" > "${WORKDIR}/is_active_fn.sh"
 
@@ -1055,7 +1048,7 @@ PYEOF
   # source-and-call test below meaningless.
   for required_fn in _classify_deployment_model_yaml is_goldengate_deployment_values_file is_goldengate_deployment_values_file_at_ref; do
     if ! grep -q "^${required_fn}() {" "${WORKDIR}/is_gg_fn.sh"; then
-      fail "could not extract ${required_fn}() from ${EKS_APP_WORKFLOW} -- the classifier test harness cannot run"
+      fail "could not extract ${required_fn}() from ${DETECT_SCRIPT} -- the classifier test harness cannot run"
     fi
   done
 
@@ -1315,10 +1308,10 @@ HARNESS
 
     rm -rf "$DELETION_REPO"
   else
-    fail "could not extract the deletion-candidate loop and/or classifier functions from ${EKS_APP_WORKFLOW}"
+    fail "could not extract the deletion-candidate loop and/or classifier functions from ${DETECT_SCRIPT}"
   fi
 else
-  skip "Phase 5A legacy-folder behavioral checks -- ${EKS_APP_WORKFLOW} or python3 not available"
+  skip "Phase 5A legacy-folder behavioral checks -- ${DETECT_SCRIPT} or python3 not available"
 fi
 
 # ---------------------------------------------------------------------
@@ -1745,7 +1738,7 @@ if [ -f "${WORKDIR}/detect_script.sh" ] && [ -s "${WORKDIR}/detect_script.sh" ] 
 
     rm -rf "$DISCOVERY_REPO"
   else
-    fail "could not extract the discovery-plus-deletion block from ${EKS_APP_WORKFLOW} for folder/envs-directory/rename tests"
+    fail "could not extract the discovery-plus-deletion block from ${DETECT_SCRIPT} for folder/envs-directory/rename tests"
   fi
 else
   skip "malformed-current-YAML and folder/envs-directory/rename discovery tests -- detect_script.sh or python3 not available"
@@ -1794,16 +1787,17 @@ else
   skip "inputs.* interpolation sweep -- ${EKS_APP_WORKFLOW} not found"
 fi
 
-if [ -f "${WORKDIR}/detect_script.sh" ] && command -v python3 >/dev/null 2>&1; then
-  # Marker-file proof: feed the real extracted "Detect changed deployments"
-  # script a workflow_dispatch deployment_id containing shell metacharacters
-  # via INPUT_DEPLOYMENT_ID (exactly how the real env: mapping delivers it),
-  # and confirm the payload is never evaluated as shell code. github.actor/
-  # github.event_name are the only remaining ${{ }} expressions in the run
-  # body; substitute them the same way GitHub Actions itself would before
-  # execution, since this script is never otherwise runnable standalone.
-  sed -e 's/\${{ *github\.event_name *}}/workflow_dispatch/g' \
-      "${WORKDIR}/detect_script.sh" > "${WORKDIR}/detect_script_resolved.sh"
+if [ -f "$DETECT_SCRIPT" ] && command -v python3 >/dev/null 2>&1; then
+  # Marker-file proof: feed the real, tracked hack/detect-goldengate-
+  # deployments.sh a workflow_dispatch deployment_id containing shell
+  # metacharacters via INPUT_DEPLOYMENT_ID (exactly how the real step-level
+  # env: mapping delivers it), and confirm the payload is never evaluated
+  # as shell code. EVENT_NAME/BEFORE_SHA/AFTER_SHA are plain environment
+  # variables in this script (never ${{ }} GitHub expression syntax --
+  # that substitution happens once, outside this script, in the workflow's
+  # own env: mapping), so no sed-based expression resolution is needed
+  # here: set EVENT_NAME=workflow_dispatch directly, the same opaque-string
+  # way the real workflow step would.
 
   MARKER_DIR="${WORKDIR}/marker-test"
   mkdir -p "$MARKER_DIR"
@@ -1815,13 +1809,16 @@ if [ -f "${WORKDIR}/detect_script.sh" ] && command -v python3 >/dev/null 2>&1; t
     rm -f "$MARKER_FILE"
     INJECTION_OUTPUT="$(
       cd "$REPO_ROOT" && \
+      EVENT_NAME="workflow_dispatch" \
       INPUT_ENVIRONMENT="dev" \
       INPUT_DEPLOYMENT_ID="$payload" \
       INPUT_DEPLOY="true" \
+      BEFORE_SHA="" \
+      AFTER_SHA="" \
       GITHUB_OUTPUT="$(mktemp)" \
       GITHUB_ENV="$(mktemp)" \
       MARKER_FILE_FOR_TEST="$MARKER_FILE" \
-      bash "${WORKDIR}/detect_script_resolved.sh" 2>&1 || true
+      bash "$DETECT_SCRIPT" 2>&1 || true
     )"
     if [ -f "$MARKER_FILE" ]; then
       fail "marker-file injection succeeded for ${label} (deployment_id=${payload@Q}) -- command execution occurred"
@@ -1848,7 +1845,7 @@ if [ -f "${WORKDIR}/detect_script.sh" ] && command -v python3 >/dev/null 2>&1; t
 
   rm -rf "$MARKER_DIR"
 else
-  skip "marker-file injection tests -- ${WORKDIR}/detect_script.sh or python3 not available"
+  skip "marker-file injection tests -- ${DETECT_SCRIPT} or python3 not available"
 fi
 
 echo ""
@@ -2677,7 +2674,7 @@ with open('${EFS_WORKDIR}/rendered/duplicate-storageclass.yaml', 'w') as f:
     if grep -q "^  ensure_observer_image:" "$EKS_APP_WORKFLOW"; then
       PHASE5A_SPOTCHECK_OK="false"
     fi
-    if ! grep -q "is_goldengate_deployment_values_file() {" "$EKS_APP_WORKFLOW"; then
+    if ! grep -q "is_goldengate_deployment_values_file() {" "$DETECT_SCRIPT"; then
       PHASE5A_SPOTCHECK_OK="false"
     fi
     if grep -q "LEGACY_FALLBACK_ENABLED" "helm/goldengate-monitor/templates/deployment.yaml" 2>/dev/null; then
@@ -2693,6 +2690,232 @@ with open('${EFS_WORKDIR}/rendered/duplicate-storageclass.yaml', 'w') as f:
   fi
 else
   skip "EFS persistence validation regression tests -- helm and/or python3/PyYAML not available"
+fi
+
+# ---------------------------------------------------------------------
+# Phase 5B2A workflow-compilation-size correction: the "Detect changed
+# deployments" step's inline run: scalar previously reached ~23,971 UTF-8
+# characters, above GitHub Actions' ~21,000-character limit for a single
+# run: command -- GitHub rejected the whole workflow file at compile time
+# (falling back to displaying it by file path, not its configured name/
+# run-name). The fix moves the real implementation into the tracked,
+# executable hack/detect-goldengate-deployments.sh; the workflow step is
+# now only a small env:-mapping-plus-invocation wrapper. These tests prove
+# the fix and guard against regressing back over the limit.
+# ---------------------------------------------------------------------
+echo ""
+echo "--- Phase 5B2A: workflow-compilation-size correction ---"
+
+if [ -f "$EKS_APP_WORKFLOW" ] && [ "$PYTHON_AVAILABLE" = "true" ]; then
+  RUN_LENGTHS_JSON="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import json
+import sys
+import yaml
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    doc = yaml.safe_load(f)
+
+results = []
+for jobname, job in doc.get("jobs", {}).items():
+    for step in job.get("steps", []):
+        run = step.get("run")
+        if run is None:
+            continue
+        results.append({
+            "job": jobname,
+            "name": step.get("name", "<unnamed>"),
+            "length": len(run.encode("utf-8")),
+        })
+
+detect_step = None
+for r in results:
+    if r["job"] == "detect_changed_deployments" and r["name"] == "Detect changed deployments":
+        detect_step = r
+        break
+
+print(json.dumps({
+    "results": sorted(results, key=lambda r: -r["length"]),
+    "detect_step_length": detect_step["length"] if detect_step else None,
+    "max_length": max((r["length"] for r in results), default=0),
+}))
+PYEOF
+)"
+  echo "$RUN_LENGTHS_JSON" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for r in data['results'][:6]:
+    print(f\"{r['length']:7d} chars  job={r['job']:30s} step={r['name']}\")
+print()
+print('detect_step_length:', data['detect_step_length'])
+print('max_length:', data['max_length'])
+"
+
+  # 1: the "Detect changed deployments" run: body is below GitHub's
+  # 21,000-character limit (the exact defect this phase fixes).
+  DETECT_STEP_LENGTH="$(echo "$RUN_LENGTHS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['detect_step_length'])")"
+  if [ -n "$DETECT_STEP_LENGTH" ] && [ "$DETECT_STEP_LENGTH" -lt 21000 ]; then
+    pass "1: the 'Detect changed deployments' run: body (${DETECT_STEP_LENGTH} chars) is below GitHub's 21,000-character run: limit"
+  else
+    fail "1: the 'Detect changed deployments' run: body is missing or still at/above the 21,000-character limit (length=${DETECT_STEP_LENGTH:-<missing>})"
+  fi
+
+  # 2: safety margin -- every run: scalar in the whole workflow is below
+  # 18,000 characters, not just below the hard 21,000 limit.
+  MAX_RUN_LENGTH="$(echo "$RUN_LENGTHS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['max_length'])")"
+  if [ -n "$MAX_RUN_LENGTH" ] && [ "$MAX_RUN_LENGTH" -lt 18000 ]; then
+    pass "2: every run: scalar in ${EKS_APP_WORKFLOW} is below the 18,000-character safety margin (max=${MAX_RUN_LENGTH})"
+  else
+    fail "2: at least one run: scalar in ${EKS_APP_WORKFLOW} is at/above the 18,000-character safety margin (max=${MAX_RUN_LENGTH:-<missing>})"
+  fi
+
+  # 3/4: the workflow header has a non-empty name and run-name. PyYAML
+  # (YAML 1.1) parses an unquoted top-level "on" key as the boolean True,
+  # not the string "on" -- that is expected and must not be treated as a
+  # missing/malformed key here or anywhere else this script inspects the
+  # parsed workflow document.
+  HEADER_CHECK="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import sys
+import yaml
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    doc = yaml.safe_load(f)
+
+name_ok = isinstance(doc.get("name"), str) and doc.get("name").strip() != ""
+run_name_ok = isinstance(doc.get("run-name"), str) and doc.get("run-name").strip() != ""
+
+# YAML 1.1 boolean-key quirk: PyYAML resolves the unquoted key "on" to the
+# Python boolean True. Both True and the literal string "on" are accepted
+# here as "the trigger key is present" -- this must never be scored as a
+# missing key/false failure.
+on_present = True in doc or "on" in doc
+
+print(f"name_ok={name_ok}")
+print(f"run_name_ok={run_name_ok}")
+print(f"on_present={on_present}")
+print(f"name={doc.get('name')!r}")
+PYEOF
+)"
+  echo "$HEADER_CHECK"
+
+  if echo "$HEADER_CHECK" | grep -q "^name_ok=True$"; then
+    pass "3: the workflow header contains a non-empty name"
+  else
+    fail "3: the workflow header name is missing or empty"
+  fi
+
+  if echo "$HEADER_CHECK" | grep -q "^run_name_ok=True$"; then
+    pass "4: the workflow header contains a non-empty run-name"
+  else
+    fail "4: the workflow header run-name is missing or empty"
+  fi
+
+  if echo "$HEADER_CHECK" | grep -q "^on_present=True$"; then
+    pass "the workflow's trigger key (\"on\", resolved by PyYAML/YAML 1.1 as boolean True) is present -- this is expected YAML 1.1 behavior, not a parse defect"
+  else
+    fail "the workflow's trigger key (on:) could not be found under either its YAML 1.1 boolean-True resolution or the literal string \"on\""
+  fi
+
+  # 5: the detection step actually calls the external script.
+  if python3 -c "
+import sys, yaml
+doc = yaml.safe_load(open('$EKS_APP_WORKFLOW'))
+for step in doc['jobs']['detect_changed_deployments']['steps']:
+    if step.get('name') == 'Detect changed deployments':
+        sys.exit(0 if 'bash hack/detect-goldengate-deployments.sh' in step.get('run', '') else 1)
+sys.exit(1)
+"; then
+    pass "5: the 'Detect changed deployments' step invokes hack/detect-goldengate-deployments.sh"
+  else
+    fail "5: the 'Detect changed deployments' step does not invoke hack/detect-goldengate-deployments.sh"
+  fi
+
+  # 6: no second, embedded copy of _classify_deployment_model_yaml remains
+  # inside the workflow YAML -- the one and only implementation lives in
+  # ${DETECT_SCRIPT}.
+  CLASSIFIER_IN_WORKFLOW_COUNT="$(grep -c "_classify_deployment_model_yaml() {" "$EKS_APP_WORKFLOW" || true)"
+  if [ "${CLASSIFIER_IN_WORKFLOW_COUNT:-0}" -eq 0 ]; then
+    pass "6: no embedded copy of _classify_deployment_model_yaml exists inside ${EKS_APP_WORKFLOW}"
+  else
+    fail "6: ${EKS_APP_WORKFLOW} still contains an embedded _classify_deployment_model_yaml definition (found ${CLASSIFIER_IN_WORKFLOW_COUNT})"
+  fi
+
+  # 9: workflow input/context expressions are mapped through a step-level
+  # env: block, never pasted directly into the external shell
+  # implementation. Checked two ways: the workflow step's env: mapping
+  # carries INPUT_*/EVENT_NAME/BEFORE_SHA/AFTER_SHA, and the external
+  # script itself contains no "${{ ... }}" GitHub Actions expression
+  # syntax at all (it only ever reads plain shell environment variables).
+  ENV_MAPPING_CHECK="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import sys
+import yaml
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    doc = yaml.safe_load(f)
+
+for step in doc["jobs"]["detect_changed_deployments"]["steps"]:
+    if step.get("name") == "Detect changed deployments":
+        env = step.get("env", {})
+        required = {"INPUT_ENVIRONMENT", "INPUT_DEPLOYMENT_ID", "INPUT_DEPLOY", "EVENT_NAME", "BEFORE_SHA", "AFTER_SHA"}
+        missing = required - set(env.keys())
+        print(f"missing={sorted(missing)}")
+        break
+else:
+    print("missing=<step not found>")
+PYEOF
+)"
+  echo "$ENV_MAPPING_CHECK"
+
+  if [ "$ENV_MAPPING_CHECK" = "missing=[]" ]; then
+    pass "9a: the workflow step maps INPUT_ENVIRONMENT/INPUT_DEPLOYMENT_ID/INPUT_DEPLOY/EVENT_NAME/BEFORE_SHA/AFTER_SHA through env:, not directly into the run: body"
+  else
+    fail "9a: the workflow step's env: mapping is missing required keys (${ENV_MAPPING_CHECK})"
+  fi
+
+  if [ -f "$DETECT_SCRIPT" ]; then
+    GITHUB_EXPR_IN_SCRIPT="$(grep -c '\${{' "$DETECT_SCRIPT" || true)"
+    if [ "${GITHUB_EXPR_IN_SCRIPT:-0}" -eq 0 ]; then
+      pass "9b: ${DETECT_SCRIPT} contains no \${{ ... }} GitHub Actions expression syntax -- it only reads plain shell environment variables"
+    else
+      fail "9b: ${DETECT_SCRIPT} still contains \${{ ... }} GitHub Actions expression syntax (found ${GITHUB_EXPR_IN_SCRIPT} occurrence(s))"
+    fi
+  else
+    fail "9b: ${DETECT_SCRIPT} does not exist"
+  fi
+else
+  skip "workflow-compilation-size checks -- ${EKS_APP_WORKFLOW} or python3/PyYAML not available"
+fi
+
+if [ -f "$DETECT_SCRIPT" ]; then
+  # 7: the external script is executable, or is explicitly invoked
+  # through bash regardless of its own executable bit (the workflow
+  # wrapper always does `bash hack/detect-goldengate-deployments.sh`, so
+  # either property alone is sufficient -- this test accepts either).
+  SCRIPT_IS_EXECUTABLE="false"
+  [ -x "$DETECT_SCRIPT" ] && SCRIPT_IS_EXECUTABLE="true"
+  SCRIPT_INVOKED_VIA_BASH="false"
+  grep -q "bash hack/detect-goldengate-deployments.sh" "$EKS_APP_WORKFLOW" 2>/dev/null && SCRIPT_INVOKED_VIA_BASH="true"
+
+  if [ "$SCRIPT_IS_EXECUTABLE" = "true" ] || [ "$SCRIPT_INVOKED_VIA_BASH" = "true" ]; then
+    pass "7: ${DETECT_SCRIPT} is executable (${SCRIPT_IS_EXECUTABLE}) or explicitly invoked through bash (${SCRIPT_INVOKED_VIA_BASH})"
+  else
+    fail "7: ${DETECT_SCRIPT} is neither executable nor explicitly invoked through bash from ${EKS_APP_WORKFLOW}"
+  fi
+
+  # 8: the external script writes all four required GitHub outputs.
+  OUTPUTS_MISSING=""
+  for output_name in has_changes deployment_matrix has_deletions deletion_matrix; do
+    grep -qE "echo \"${output_name}=" "$DETECT_SCRIPT" || OUTPUTS_MISSING="${OUTPUTS_MISSING} ${output_name}"
+  done
+  if [ -z "$OUTPUTS_MISSING" ]; then
+    pass "8: ${DETECT_SCRIPT} writes all four required GitHub outputs (has_changes, deployment_matrix, has_deletions, deletion_matrix)"
+  else
+    fail "8: ${DETECT_SCRIPT} is missing output(s):${OUTPUTS_MISSING}"
+  fi
+
+  bash -n "$DETECT_SCRIPT" >/dev/null 2>&1 && pass "${DETECT_SCRIPT} passes bash -n syntax check" || fail "${DETECT_SCRIPT} fails bash -n syntax check"
+else
+  skip "external script executable/output checks -- ${DETECT_SCRIPT} not found"
 fi
 
 echo ""
