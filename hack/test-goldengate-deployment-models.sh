@@ -3168,30 +3168,34 @@ sys.stdout.write(body)
 PYEOF
 
   if [ -s "${WORKDIR}/inventory_classify_funcs.sh" ] && bash -n "${WORKDIR}/inventory_classify_funcs.sh" >/dev/null 2>&1; then
-    # Five focused pure-function assertions (Phase 5B2B1 safety correction,
-    # section 8): baseline=false blocks eligibility; a false
-    # *ReferenceCheckVerified flag blocks eligibility; canonical resources
-    # never enter candidates (PV, StorageClass, EFS access point, and
-    # DynamoDB partition all checked); an absent legacy StorageClass is
-    # already_absent, not eligible; a non-matching observer tag is blocked.
+    # Focused pure-function assertions. classify_pv/classify_observer_image/
+    # classify_ecr_repository signatures below match the PV active-PVC-
+    # reference and ECR image-inventory-gating corrections -- baseline=false
+    # blocks eligibility; a false *ReferenceCheckVerified flag blocks
+    # eligibility; canonical resources never enter candidates; an absent
+    # legacy StorageClass is already_absent, not eligible; a non-matching
+    # observer tag is blocked; a PVC-list read failure blocks PV
+    # eligibility; an active PVC reference blocks PV eligibility; an ECR
+    # image-inventory read failure blocks repository eligibility; a
+    # repository URI mismatch blocks image eligibility.
     INVENTORY_CLASSIFY_OUTPUT="$(bash -c '
       source "'"${WORKDIR}"'/inventory_classify_funcs.sh"
       set +e
 
       echo "--- 1: baseline=false blocks an otherwise-fully-eligible PV ---"
-      classify_pv "pvc-3a93c990-a9fa-4cca-99df-7c3375472074" "Released" "Retain" "fs-05cadf3570f23cd39::fsap-007cfc2ff801c24b8" "true" "" "true" "false" "false"
+      classify_pv "pvc-3a93c990-a9fa-4cca-99df-7c3375472074" "Released" "Retain" "fs-05cadf3570f23cd39::fsap-007cfc2ff801c24b8" "true" "true" "false" "true" "false" "false"
       echo "exit=$?"
 
       echo "--- baseline=true, fully verified old PV is eligible (control case) ---"
-      classify_pv "pvc-3a93c990-a9fa-4cca-99df-7c3375472074" "Released" "Retain" "fs-05cadf3570f23cd39::fsap-007cfc2ff801c24b8" "true" "" "true" "false" "true"
+      classify_pv "pvc-3a93c990-a9fa-4cca-99df-7c3375472074" "Released" "Retain" "fs-05cadf3570f23cd39::fsap-007cfc2ff801c24b8" "true" "true" "false" "true" "false" "true"
       echo "exit=$?"
 
       echo "--- 2: podReferenceCheckVerified=false blocks eligibility even though referenced=false ---"
-      classify_pv "pvc-93251c3f-c408-4713-bd46-ebc5e0eafa8a" "Released" "Retain" "fs-05cadf3570f23cd39::fsap-035f46f17955f57cb" "true" "" "false" "false" "true"
+      classify_pv "pvc-93251c3f-c408-4713-bd46-ebc5e0eafa8a" "Released" "Retain" "fs-05cadf3570f23cd39::fsap-035f46f17955f57cb" "true" "true" "false" "false" "false" "true"
       echo "exit=$?"
 
       echo "--- 3a: a current canonical PV is never eligible, even with every other fact true ---"
-      classify_pv "pvc-dd1bc7bc-b736-4fee-abfe-abf622e70550" "Released" "Retain" "fs-05cadf3570f23cd39::fsap-canonical1" "true" "" "true" "false" "true"
+      classify_pv "pvc-dd1bc7bc-b736-4fee-abfe-abf622e70550" "Released" "Retain" "fs-05cadf3570f23cd39::fsap-canonical1" "true" "true" "false" "true" "false" "true"
       echo "exit=$?"
 
       echo "--- 3b: a current canonical EFS access point is never eligible ---"
@@ -3208,11 +3212,31 @@ PYEOF
       echo "exit=$?"
 
       echo "--- 5: an observer image tag that does not match the pattern is blocked, not eligible ---"
-      classify_observer_image "[\"latest\"]" "true" "true" 0 "true"
+      classify_observer_image "[\"latest\"]" "true" "true" "true" 0 "true"
       echo "exit=$?"
 
       echo "--- observer image with a matching tag and zero verified references is eligible (control case) ---"
-      classify_observer_image "[\"obs-abc123def456\"]" "true" "true" 0 "true"
+      classify_observer_image "[\"obs-abc123def456\"]" "true" "true" "true" 0 "true"
+      echo "exit=$?"
+
+      echo "--- 6: PVC reference verification failure blocks PV eligibility ---"
+      classify_pv "pvc-3a93c990-a9fa-4cca-99df-7c3375472074" "Released" "Retain" "fs-05cadf3570f23cd39::fsap-007cfc2ff801c24b8" "true" "false" "false" "true" "false" "true"
+      echo "exit=$?"
+
+      echo "--- 7: an active PVC reference blocks PV eligibility ---"
+      classify_pv "pvc-3a93c990-a9fa-4cca-99df-7c3375472074" "Released" "Retain" "fs-05cadf3570f23cd39::fsap-007cfc2ff801c24b8" "true" "true" "true" "true" "false" "true"
+      echo "exit=$?"
+
+      echo "--- 8: ECR image-inventory verification failure blocks repository eligibility ---"
+      classify_ecr_repository "uri" "true" "true" "true" 0 "false" "false" "true"
+      echo "exit=$?"
+
+      echo "--- ECR repository fully verified with an empty, verified image inventory is eligible (control case) ---"
+      classify_ecr_repository "uri" "true" "true" "true" 0 "true" "false" "true"
+      echo "exit=$?"
+
+      echo "--- 9: repository URI mismatch blocks image eligibility ---"
+      classify_observer_image "[\"obs-abc123def456\"]" "false" "true" "true" 0 "true"
       echo "exit=$?"
     ' 2>&1)"
     echo "$INVENTORY_CLASSIFY_OUTPUT"
@@ -3250,11 +3274,87 @@ PYEOF
     else
       fail "5: non-matching observer image tag was not blocked as expected"
     fi
+
+    if echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "6: PVC reference verification failure blocks PV eligibility" | grep -q "^exit=1$"; then
+      pass "6: a PVC-list (pvcReferenceCheckVerified=false) read failure blocks PV eligibility"
+    else
+      fail "6: pvcReferenceCheckVerified=false did not block PV eligibility as expected"
+    fi
+
+    if echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "7: an active PVC reference blocks PV eligibility" | grep -q "^exit=1$"; then
+      pass "7: a PV referenced by an active PVC (referencedByActivePvc=true) is blocked, never eligible"
+    else
+      fail "7: an active PVC reference did not block PV eligibility as expected"
+    fi
+
+    if echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "8: ECR image-inventory verification failure blocks repository eligibility" | grep -q "^exit=1$" \
+        && echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "ECR repository fully verified with an empty, verified image inventory is eligible" | grep -q "^exit=0$"; then
+      pass "8: imageInventoryVerified=false blocks repository eligibility; a verified empty image inventory does not"
+    else
+      fail "8: ECR image-inventory gating did not behave as expected"
+    fi
+
+    if echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "9: repository URI mismatch blocks image eligibility" | grep -q "^exit=1$"; then
+      pass "9: repositoryUriMatch=false blocks observer image eligibility, even with a matching tag and zero references"
+    else
+      fail "9: repository URI mismatch did not block image eligibility as expected"
+    fi
   else
     fail "could not extract or syntax-validate the pure classification functions from ${INVENTORY_SCRIPT}"
   fi
 else
   skip "inventory classification unit tests -- ${INVENTORY_SCRIPT} or python3 not available"
+fi
+
+if [ -f "$INVENTORY_SCRIPT" ] && command -v python3 >/dev/null 2>&1; then
+  # 10: eligibilityReady=false leaves no candidate with eligibility=eligible.
+  # enforce_eligibility_readiness lives in Section 5 (after the live-
+  # collection code), so it is extracted on its own -- never alongside
+  # Section 4, which makes real kubectl/aws calls at source time and must
+  # never be sourced in a local test.
+  python3 - "$INVENTORY_SCRIPT" > "${WORKDIR}/inventory_enforce_fn.sh" <<'PYEOF'
+import sys
+
+with open(sys.argv[1]) as f:
+    lines = f.readlines()
+
+start = next(i for i, l in enumerate(lines) if l.startswith("enforce_eligibility_readiness() {"))
+end = None
+for j in range(start, len(lines)):
+    if lines[j].strip() == "}":
+        end = j
+        break
+if end is None:
+    sys.exit("could not locate enforce_eligibility_readiness() function body")
+
+sys.stdout.write("set -uo pipefail\n")
+sys.stdout.writelines(lines[start:end + 1])
+PYEOF
+
+  if [ -s "${WORKDIR}/inventory_enforce_fn.sh" ] && bash -n "${WORKDIR}/inventory_enforce_fn.sh" >/dev/null 2>&1; then
+    ENFORCE_OUTPUT="$(bash -c '
+      source "'"${WORKDIR}"'/inventory_enforce_fn.sh"
+      ELIGIBILITY_READY="false"
+      CANDIDATES_PV="$(jq -nc "[{resourceType:\"PersistentVolume\", identifier:\"pv-1\", eligibility:\"eligible\", evidence:{foo:1}, blockingReasons:[]}, {resourceType:\"PersistentVolume\", identifier:\"pv-2\", eligibility:\"blocked\", evidence:{}, blockingReasons:[\"phase_not_released(Bound)\"]}]")"
+      enforce_eligibility_readiness CANDIDATES_PV
+      echo "$CANDIDATES_PV"
+    ' 2>&1)"
+    echo "$ENFORCE_OUTPUT"
+
+    REMAINING_ELIGIBLE="$(echo "$ENFORCE_OUTPUT" | tail -1 | jq '[.[] | select(.eligibility=="eligible")] | length' 2>/dev/null || echo "parse_error")"
+    EVIDENCE_PRESERVED="$(echo "$ENFORCE_OUTPUT" | tail -1 | jq -r '.[0].evidence.foo // empty' 2>/dev/null || echo "")"
+    REASON_ADDED="$(echo "$ENFORCE_OUTPUT" | tail -1 | jq -r 'any(.[]; .blockingReasons | index("inventory_not_eligibility_ready") != null)' 2>/dev/null || echo "false")"
+
+    if [ "$REMAINING_ELIGIBLE" = "0" ] && [ "$EVIDENCE_PRESERVED" = "1" ] && [ "$REASON_ADDED" = "true" ]; then
+      pass "10: eligibilityReady=false leaves no candidate with eligibility=eligible (evidence preserved, inventory_not_eligibility_ready added)"
+    else
+      fail "10: eligibilityReady=false did not deterministically downgrade every eligible candidate as expected"
+    fi
+  else
+    fail "could not extract or syntax-validate enforce_eligibility_readiness() from ${INVENTORY_SCRIPT}"
+  fi
+else
+  skip "eligibilityReady enforcement test -- ${INVENTORY_SCRIPT} or python3 not available"
 fi
 
 # 16: no docs directory or runbook was added by this phase.

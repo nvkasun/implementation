@@ -301,20 +301,25 @@ is_canonical_volume_handle() {
 }
 
 # classify_pv PV_ID PHASE RECLAIM_POLICY VOLUME_HANDLE HANDLE_FORMAT_VALID
-#             BOUND_CLAIM_NAME POD_REFERENCE_CHECK_VERIFIED
-#             REFERENCED_BY_RUNNING_POD CANONICAL_BASELINE_VERIFIED
+#             PVC_REFERENCE_CHECK_VERIFIED REFERENCED_BY_ACTIVE_PVC
+#             POD_REFERENCE_CHECK_VERIFIED REFERENCED_BY_RUNNING_POD
+#             CANONICAL_BASELINE_VERIFIED
 #
 # Prints "eligible" and returns 0 only when every required condition holds
 # AND every relevant verification flag is exactly "true". Otherwise prints
 # a semicolon-separated list of blocking reasons and returns 1. Fails
 # closed: a failed/unavailable read is never converted into "zero
-# references" or "eligible" -- POD_REFERENCE_CHECK_VERIFIED=false and
-# CANONICAL_BASELINE_VERIFIED=false each independently block, always.
+# references" or "eligible" -- PVC_REFERENCE_CHECK_VERIFIED=false,
+# POD_REFERENCE_CHECK_VERIFIED=false, and CANONICAL_BASELINE_VERIFIED=false
+# each independently block, always. Active-PVC reference is proven from the
+# verified global PVC list (.spec.volumeName == PV_ID) -- never from PV
+# phase alone or a stale claimRef.
 classify_pv() {
   local pv_id="$1" phase="$2" reclaim_policy="$3" volume_handle="$4"
-  local handle_format_valid="$5" bound_claim_name="$6"
-  local pod_reference_check_verified="$7" referenced_by_running_pod="$8"
-  local canonical_baseline_verified="$9"
+  local handle_format_valid="$5"
+  local pvc_reference_check_verified="$6" referenced_by_active_pvc="$7"
+  local pod_reference_check_verified="$8" referenced_by_running_pod="$9"
+  local canonical_baseline_verified="${10}"
   local reasons=""
 
   if [ "$canonical_baseline_verified" != "true" ]; then
@@ -339,8 +344,10 @@ classify_pv() {
     reasons="${reasons}matches_canonical_volume_handle;"
   fi
 
-  if [ -n "$bound_claim_name" ]; then
-    reasons="${reasons}still_referenced_by_active_pvc(${bound_claim_name});"
+  if [ "$pvc_reference_check_verified" != "true" ]; then
+    reasons="${reasons}pvc_reference_check_not_verified;"
+  elif [ "$referenced_by_active_pvc" = "true" ]; then
+    reasons="${reasons}referenced_by_active_pvc;"
   fi
 
   if [ "$pod_reference_check_verified" != "true" ]; then
@@ -495,10 +502,20 @@ classify_dynamodb_partition() {
 # classify_ecr_repository REPOSITORY_URI EXPECTED_URI_MATCH
 #                          WORKLOAD_REFERENCE_CHECK_VERIFIED
 #                          ARGO_REFERENCE_CHECK_VERIFIED
-#                          LIVE_REFERENCE_COUNT CANONICAL_BASELINE_VERIFIED
+#                          LIVE_REFERENCE_COUNT IMAGE_INVENTORY_VERIFIED
+#                          HAS_UNEXPECTED_IMAGES CANONICAL_BASELINE_VERIFIED
+#
+# The repository is never classified before its image inventory
+# (describe-images) has been attempted -- IMAGE_INVENTORY_VERIFIED=false
+# (a failed/unavailable describe-images call) blocks unconditionally, the
+# same way every other unverified check does. An exact empty repository
+# (image_inventory_verified=true, has_unexpected_images=false because
+# there are zero images to be unexpected) may still be eligible when every
+# other check passes.
 classify_ecr_repository() {
   local expected_uri_match="$2" workload_verified="$3" argo_verified="$4"
-  local live_reference_count="$5" canonical_baseline_verified="$6"
+  local live_reference_count="$5" image_inventory_verified="$6"
+  local has_unexpected_images="$7" canonical_baseline_verified="$8"
   local reasons=""
 
   if [ "$canonical_baseline_verified" != "true" ]; then
@@ -521,6 +538,12 @@ classify_ecr_repository() {
     reasons="${reasons}referenced_by_${live_reference_count}_live_workload(s);"
   fi
 
+  if [ "$image_inventory_verified" != "true" ]; then
+    reasons="${reasons}image_inventory_not_verified;"
+  elif [ "$has_unexpected_images" = "true" ]; then
+    reasons="${reasons}unexpected_or_non_observer_tagged_images_present;"
+  fi
+
   if [ -z "$reasons" ]; then
     echo "eligible"
     return 0
@@ -529,16 +552,21 @@ classify_ecr_repository() {
   return 1
 }
 
-# classify_observer_image TAGS_JSON WORKLOAD_REFERENCE_CHECK_VERIFIED
+# classify_observer_image TAGS_JSON REPOSITORY_URI_MATCH
+#                          WORKLOAD_REFERENCE_CHECK_VERIFIED
 #                          ARGO_REFERENCE_CHECK_VERIFIED
 #                          LIVE_REFERENCE_COUNT CANONICAL_BASELINE_VERIFIED
 classify_observer_image() {
-  local tags_json="$1" workload_verified="$2" argo_verified="$3"
-  local live_reference_count="$4" canonical_baseline_verified="$5"
+  local tags_json="$1" repository_uri_match="$2" workload_verified="$3" argo_verified="$4"
+  local live_reference_count="$5" canonical_baseline_verified="$6"
   local reasons=""
 
   if [ "$canonical_baseline_verified" != "true" ]; then
     reasons="${reasons}canonical_safety_baseline_not_verified;"
+  fi
+
+  if [ "$repository_uri_match" != "true" ]; then
+    reasons="${reasons}unexpected_repository_uri;"
   fi
 
   local matches_pattern
@@ -897,37 +925,50 @@ if [ "$HAVE_KUBECTL" = "true" ]; then
       AP_ID="$(efs_ap_id_from_handle "$VOLUME_HANDLE")"
     fi
 
-    # Currently bound? (claimRef alone can be stale after the claim is
-    # gone -- cross-check the claim namespace/name still resolves live.)
-    BOUND_CLAIM_NAME=""
-    if [ "$PHASE" = "Bound" ] && [ -n "$OLD_CLAIM_NAME" ]; then
-      run_kubectl_json get pvc "$OLD_CLAIM_NAME" -n "$OLD_CLAIM_NS"
-      [ "$LAST_KUBECTL_OK" = "true" ] && BOUND_CLAIM_NAME="$OLD_CLAIM_NAME"
+    # Active PVC reference: derived from the verified global PVC list
+    # (Section A: PVC_LIST_JSON/PVC_LIST_VERIFIED), never from PV phase
+    # alone or a stale claimRef. A PVC references this PV when
+    # .spec.volumeName == pv_id. A failed/unavailable PVC list read blocks
+    # eligibility -- it is never converted into "not referenced".
+    PVC_REFERENCE_CHECK_VERIFIED="$PVC_LIST_VERIFIED"
+    REFERENCED_BY_ACTIVE_PVC="false"
+    REFERENCING_PVC_NAMES="[]"
+    if [ "$PVC_LIST_VERIFIED" = "true" ]; then
+      REFERENCING_PVC_NAMES="$(echo "$PVC_LIST_JSON" | jq -c --arg pv "$pv_id" \
+        '[.items[] | select(.spec.volumeName == $pv) | {namespace: .metadata.namespace, name: .metadata.name}]')"
+      REFERENCING_COUNT="$(echo "$REFERENCING_PVC_NAMES" | jq 'length')"
+      [ "${REFERENCING_COUNT:-0}" -gt 0 ] && REFERENCED_BY_ACTIVE_PVC="true"
+    else
+      add_permission_gap "KUBECTL_PVC_LIST_PERMISSION_MISSING"
     fi
 
-    # Referenced by any running pod's volumes? Only meaningful (and only
-    # attempted) when there is a claim namespace/name to check against --
-    # with nothing to check, the check is vacuously verified-true and
-    # referenced=false, never "unperformed but assumed safe". A failed
-    # read is never converted into "zero references".
+    # Referenced by any running pod's volumes? Checked against every
+    # discovered referencing PVC's namespace/name from the scan above --
+    # never a stale claimRef. With no referencing PVC to check, the check
+    # is vacuously verified-true and referenced=false, never "unperformed
+    # but assumed safe". A failed pod-list read is never converted into
+    # "zero references".
     POD_REFERENCE_CHECK_VERIFIED="true"
     REFERENCED_BY_POD="false"
-    if [ -n "$OLD_CLAIM_NAME" ]; then
-      run_kubectl_json get pods -n "$OLD_CLAIM_NS"
+    while IFS= read -r pvc_entry; do
+      [ -z "$pvc_entry" ] && continue
+      PVC_ENTRY_NS="$(echo "$pvc_entry" | jq -r '.namespace')"
+      PVC_ENTRY_NAME="$(echo "$pvc_entry" | jq -r '.name')"
+      run_kubectl_json get pods -n "$PVC_ENTRY_NS"
       if [ "$LAST_KUBECTL_OK" = "true" ]; then
-        POD_REFS="$(echo "$LAST_KUBECTL_JSON" | jq -r --arg claim "$OLD_CLAIM_NAME" \
+        POD_REFS="$(echo "$LAST_KUBECTL_JSON" | jq -r --arg claim "$PVC_ENTRY_NAME" \
           '[.items[] | select(.spec.volumes[]?.persistentVolumeClaim.claimName == $claim) | select(.status.phase=="Running")] | length')"
         [ "${POD_REFS:-0}" -gt 0 ] && REFERENCED_BY_POD="true"
       else
         POD_REFERENCE_CHECK_VERIFIED="false"
         add_permission_gap "KUBECTL_POD_LIST_PERMISSION_MISSING"
       fi
-    fi
+    done < <(echo "$REFERENCING_PVC_NAMES" | jq -c '.[]?')
 
-    echo "PV ${pv_id}: phase=${PHASE} reclaimPolicy=${RECLAIM_POLICY} storageClass=${STORAGE_CLASS} oldClaim=${OLD_CLAIM_NS}/${OLD_CLAIM_NAME} volumeHandle=${VOLUME_HANDLE} handleFormatValid=${HANDLE_FORMAT_VALID} fsId=${FS_ID} apId=${AP_ID} created=${CREATION_TS} finalizers=${FINALIZERS} podReferenceCheckVerified=${POD_REFERENCE_CHECK_VERIFIED} referencedByRunningPod=${REFERENCED_BY_POD}"
+    echo "PV ${pv_id}: phase=${PHASE} reclaimPolicy=${RECLAIM_POLICY} storageClass=${STORAGE_CLASS} oldClaim=${OLD_CLAIM_NS}/${OLD_CLAIM_NAME} volumeHandle=${VOLUME_HANDLE} handleFormatValid=${HANDLE_FORMAT_VALID} fsId=${FS_ID} apId=${AP_ID} created=${CREATION_TS} finalizers=${FINALIZERS} pvcReferenceCheckVerified=${PVC_REFERENCE_CHECK_VERIFIED} referencedByActivePvc=${REFERENCED_BY_ACTIVE_PVC} referencingPvcNames=${REFERENCING_PVC_NAMES} podReferenceCheckVerified=${POD_REFERENCE_CHECK_VERIFIED} referencedByRunningPod=${REFERENCED_BY_POD}"
 
     set +e
-    RESULT="$(classify_pv "$pv_id" "$PHASE" "$RECLAIM_POLICY" "$VOLUME_HANDLE" "$HANDLE_FORMAT_VALID" "$BOUND_CLAIM_NAME" "$POD_REFERENCE_CHECK_VERIFIED" "$REFERENCED_BY_POD" "$CANONICAL_BASELINE_VERIFIED")"
+    RESULT="$(classify_pv "$pv_id" "$PHASE" "$RECLAIM_POLICY" "$VOLUME_HANDLE" "$HANDLE_FORMAT_VALID" "$PVC_REFERENCE_CHECK_VERIFIED" "$REFERENCED_BY_ACTIVE_PVC" "$POD_REFERENCE_CHECK_VERIFIED" "$REFERENCED_BY_POD" "$CANONICAL_BASELINE_VERIFIED")"
     STATUS=$?
     set -e
 
@@ -937,9 +978,12 @@ if [ "$HAVE_KUBECTL" = "true" ]; then
       --arg volumeHandle "$VOLUME_HANDLE" --argjson handleFormatValid "$([ "$HANDLE_FORMAT_VALID" = "true" ] && echo true || echo false)" \
       --arg efsFileSystemId "$FS_ID" --arg efsAccessPointId "$AP_ID" \
       --arg creationTimestamp "$CREATION_TS" --argjson finalizers "$FINALIZERS" \
+      --argjson pvcReferenceCheckVerified "$([ "$PVC_REFERENCE_CHECK_VERIFIED" = "true" ] && echo true || echo false)" \
+      --argjson referencedByActivePvc "$([ "$REFERENCED_BY_ACTIVE_PVC" = "true" ] && echo true || echo false)" \
+      --argjson referencingPvcNames "$REFERENCING_PVC_NAMES" \
       --argjson podReferenceCheckVerified "$([ "$POD_REFERENCE_CHECK_VERIFIED" = "true" ] && echo true || echo false)" \
       --argjson referencedByRunningPod "$([ "$REFERENCED_BY_POD" = "true" ] && echo true || echo false)" \
-      '{phase:$phase, reclaimPolicy:$reclaimPolicy, storageClass:$storageClass, oldClaimNamespace:$oldClaimNamespace, oldClaimName:$oldClaimName, volumeHandle:$volumeHandle, handleFormatValid:$handleFormatValid, efsFileSystemId:$efsFileSystemId, efsAccessPointId:$efsAccessPointId, creationTimestamp:$creationTimestamp, finalizers:$finalizers, podReferenceCheckVerified:$podReferenceCheckVerified, referencedByRunningPod:$referencedByRunningPod}')"
+      '{phase:$phase, reclaimPolicy:$reclaimPolicy, storageClass:$storageClass, oldClaimNamespace:$oldClaimNamespace, oldClaimName:$oldClaimName, volumeHandle:$volumeHandle, handleFormatValid:$handleFormatValid, efsFileSystemId:$efsFileSystemId, efsAccessPointId:$efsAccessPointId, creationTimestamp:$creationTimestamp, finalizers:$finalizers, pvcReferenceCheckVerified:$pvcReferenceCheckVerified, referencedByActivePvc:$referencedByActivePvc, referencingPvcNames:$referencingPvcNames, podReferenceCheckVerified:$podReferenceCheckVerified, referencedByRunningPod:$referencedByRunningPod}')"
 
     if [ "$STATUS" -eq 0 ]; then
       add_candidate CANDIDATES_PV "PersistentVolume" "$pv_id" "eligible" "$EVIDENCE_JSON" ""
@@ -1204,8 +1248,27 @@ if [ "$HAVE_AWS" = "true" ]; then
     [ "$REPO_URI" = "$OBSERVER_ECR_REPOSITORY_URI_EXPECTED" ] && REPO_URI_MATCH="true"
     echo "Repository ${OBSERVER_ECR_REPOSITORY}: uri=${REPO_URI} expectedUriMatch=${REPO_URI_MATCH} created=${REPO_CREATED}"
 
+    # Image inventory MUST be gathered before the repository is classified
+    # -- repository eligibility depends on it (imageInventoryVerified, and
+    # whether any unexpected/non-observer-tagged image is present).
+    IMAGE_INVENTORY_VERIFIED="false"
+    HAS_UNEXPECTED_IMAGES="false"
+    IMAGES_JSON="[]"
+    run_aws_json ecr describe-images --repository-name "$OBSERVER_ECR_REPOSITORY" --registry-id "$ECR_ACCOUNT_ID_EXPECTED" --region "$AWS_REGION_EXPECTED"
+    if [ "$LAST_AWS_OK" != "true" ]; then
+      add_permission_gap "OBSERVER_ECR_PERMISSION_MISSING"
+      echo "OBSERVER_ECR_PERMISSION_MISSING (describe-images) -- repository eligibility remains blocked (imageInventoryVerified=false)."
+    else
+      IMAGE_INVENTORY_VERIFIED="true"
+      IMAGES_JSON="$(echo "$LAST_AWS_JSON" | jq -c '.imageDetails // []')"
+      IMAGE_COUNT="$(echo "$IMAGES_JSON" | jq 'length')"
+      HAS_UNEXPECTED_IMAGES="$(echo "$IMAGES_JSON" | jq -r --arg pat "$OBSERVER_ECR_TAG_PATTERN" \
+        '[.[] | select(((.imageTags // []) | map(select(test($pat)))) | length == 0)] | length > 0')"
+      echo "Images found in ${OBSERVER_ECR_REPOSITORY}: ${IMAGE_COUNT} imageInventoryVerified=${IMAGE_INVENTORY_VERIFIED} hasUnexpectedImages=${HAS_UNEXPECTED_IMAGES}"
+    fi
+
     set +e
-    RESULT="$(classify_ecr_repository "$REPO_URI" "$REPO_URI_MATCH" "$WORKLOAD_REFERENCE_CHECK_VERIFIED" "$ARGO_REFERENCE_CHECK_VERIFIED" "$LIVE_WORKLOAD_REFERENCE_COUNT" "$CANONICAL_BASELINE_VERIFIED")"
+    RESULT="$(classify_ecr_repository "$REPO_URI" "$REPO_URI_MATCH" "$WORKLOAD_REFERENCE_CHECK_VERIFIED" "$ARGO_REFERENCE_CHECK_VERIFIED" "$LIVE_WORKLOAD_REFERENCE_COUNT" "$IMAGE_INVENTORY_VERIFIED" "$HAS_UNEXPECTED_IMAGES" "$CANONICAL_BASELINE_VERIFIED")"
     STATUS=$?
     set -e
 
@@ -1215,7 +1278,9 @@ if [ "$HAVE_AWS" = "true" ]; then
       --argjson workloadReferenceCheckVerified "$([ "$WORKLOAD_REFERENCE_CHECK_VERIFIED" = "true" ] && echo true || echo false)" \
       --argjson argoReferenceCheckVerified "$([ "$ARGO_REFERENCE_CHECK_VERIFIED" = "true" ] && echo true || echo false)" \
       --argjson liveWorkloadReferences "$LIVE_WORKLOAD_REFERENCE_COUNT" \
-      '{repositoryUri:$uri, expectedUriMatch:$expectedUriMatch, createdAt:$created, workloadReferenceCheckVerified:$workloadReferenceCheckVerified, argoReferenceCheckVerified:$argoReferenceCheckVerified, liveWorkloadReferences:$liveWorkloadReferences}')"
+      --argjson imageInventoryVerified "$([ "$IMAGE_INVENTORY_VERIFIED" = "true" ] && echo true || echo false)" \
+      --argjson hasUnexpectedImages "$([ "$HAS_UNEXPECTED_IMAGES" = "true" ] && echo true || echo false)" \
+      '{repositoryUri:$uri, expectedUriMatch:$expectedUriMatch, createdAt:$created, workloadReferenceCheckVerified:$workloadReferenceCheckVerified, argoReferenceCheckVerified:$argoReferenceCheckVerified, liveWorkloadReferences:$liveWorkloadReferences, imageInventoryVerified:$imageInventoryVerified, hasUnexpectedImages:$hasUnexpectedImages}')"
 
     if [ "$STATUS" -eq 0 ]; then
       add_candidate CANDIDATES_ECR_REPOSITORIES "EcrRepository" "$OBSERVER_ECR_REPOSITORY" "eligible" "$REPO_EVIDENCE_JSON" ""
@@ -1225,13 +1290,7 @@ if [ "$HAVE_AWS" = "true" ]; then
       echo "  -> blocked: ${RESULT}"
     fi
 
-    run_aws_json ecr describe-images --repository-name "$OBSERVER_ECR_REPOSITORY" --registry-id "$ECR_ACCOUNT_ID_EXPECTED" --region "$AWS_REGION_EXPECTED"
-    if [ "$LAST_AWS_OK" != "true" ]; then
-      add_permission_gap "OBSERVER_ECR_PERMISSION_MISSING"
-      echo "OBSERVER_ECR_PERMISSION_MISSING (describe-images)"
-    else
-      IMAGE_COUNT="$(echo "$LAST_AWS_JSON" | jq -r '.imageDetails | length')"
-      echo "Images found in ${OBSERVER_ECR_REPOSITORY}: ${IMAGE_COUNT}"
+    if [ "$IMAGE_INVENTORY_VERIFIED" = "true" ]; then
       while IFS= read -r image_row; do
         [ -z "$image_row" ] && continue
         DIGEST="$(echo "$image_row" | jq -r '.imageDigest // ""')"
@@ -1239,23 +1298,24 @@ if [ "$HAVE_AWS" = "true" ]; then
         PUSHED_AT="$(echo "$image_row" | jq -r '.imagePushedAt // ""')"
 
         set +e
-        IMG_RESULT="$(classify_observer_image "$TAGS" "$WORKLOAD_REFERENCE_CHECK_VERIFIED" "$ARGO_REFERENCE_CHECK_VERIFIED" "$LIVE_WORKLOAD_REFERENCE_COUNT" "$CANONICAL_BASELINE_VERIFIED")"
+        IMG_RESULT="$(classify_observer_image "$TAGS" "$REPO_URI_MATCH" "$WORKLOAD_REFERENCE_CHECK_VERIFIED" "$ARGO_REFERENCE_CHECK_VERIFIED" "$LIVE_WORKLOAD_REFERENCE_COUNT" "$CANONICAL_BASELINE_VERIFIED")"
         IMG_STATUS=$?
         set -e
 
         IMG_EVIDENCE_JSON="$(jq -nc \
           --arg digest "$DIGEST" --argjson tags "$TAGS" --arg pushedAt "$PUSHED_AT" \
+          --argjson repositoryUriMatch "$([ "$REPO_URI_MATCH" = "true" ] && echo true || echo false)" \
           --argjson workloadReferenceCheckVerified "$([ "$WORKLOAD_REFERENCE_CHECK_VERIFIED" = "true" ] && echo true || echo false)" \
           --argjson argoReferenceCheckVerified "$([ "$ARGO_REFERENCE_CHECK_VERIFIED" = "true" ] && echo true || echo false)" \
           --argjson liveWorkloadReferences "$LIVE_WORKLOAD_REFERENCE_COUNT" \
-          '{digest:$digest, tags:$tags, pushedAt:$pushedAt, workloadReferenceCheckVerified:$workloadReferenceCheckVerified, argoReferenceCheckVerified:$argoReferenceCheckVerified, liveWorkloadReferences:$liveWorkloadReferences}')"
+          '{digest:$digest, tags:$tags, pushedAt:$pushedAt, repositoryUriMatch:$repositoryUriMatch, workloadReferenceCheckVerified:$workloadReferenceCheckVerified, argoReferenceCheckVerified:$argoReferenceCheckVerified, liveWorkloadReferences:$liveWorkloadReferences}')"
 
         if [ "$IMG_STATUS" -eq 0 ]; then
           add_candidate CANDIDATES_ECR_IMAGES "EcrImage" "${DIGEST}" "eligible" "$IMG_EVIDENCE_JSON" ""
         else
           add_candidate CANDIDATES_ECR_IMAGES "EcrImage" "${DIGEST}" "blocked" "$IMG_EVIDENCE_JSON" "$IMG_RESULT"
         fi
-      done < <(echo "$LAST_AWS_JSON" | jq -c '.imageDetails[]?')
+      done < <(echo "$IMAGES_JSON" | jq -c '.[]?')
     fi
   fi
 else
@@ -1306,6 +1366,34 @@ INVENTORY_COMPLETE="false"
 
 ELIGIBILITY_READY="false"
 [ "$CANONICAL_BASELINE_VERIFIED" = "true" ] && [ "$INVENTORY_COMPLETE" = "true" ] && ELIGIBILITY_READY="true"
+
+# enforce_eligibility_readiness LIST_VAR
+#
+# Deterministically enforces the summary's own stated contract ("no
+# candidate is ever eligible unless eligibilityReady is true"): downgrades
+# every eligibility=="eligible" entry in LIST_VAR to "blocked" when
+# ELIGIBILITY_READY is not true, appending inventory_not_eligibility_ready
+# to its blockingReasons. The underlying resource-level evidence object is
+# never removed or altered -- only the final eligibility verdict and
+# blockingReasons are adjusted. A no-op when ELIGIBILITY_READY is true.
+enforce_eligibility_readiness() {
+  local list_var="$1"
+  [ "$ELIGIBILITY_READY" = "true" ] && return 0
+  local current="${!list_var}"
+  local updated
+  updated="$(echo "$current" | jq -c \
+    '[ .[] | if .eligibility == "eligible" then
+        .eligibility = "blocked" | .blockingReasons += ["inventory_not_eligibility_ready"]
+      else . end ]')"
+  printf -v "$list_var" '%s' "$updated"
+}
+
+for candidate_list_var in CANDIDATES_PV CANDIDATES_EFS_AP CANDIDATES_STORAGE_CLASS CANDIDATES_DYNAMODB CANDIDATES_ECR_REPOSITORIES CANDIDATES_ECR_IMAGES; do
+  enforce_eligibility_readiness "$candidate_list_var"
+done
+if [ "$ELIGIBILITY_READY" != "true" ]; then
+  echo "eligibilityReady=false -- every provisionally eligible candidate has been deterministically converted to blocked (inventory_not_eligibility_ready) before manifest emission."
+fi
 
 BASELINE_JSON="$(jq -nc \
   --argjson verified "$([ "$CANONICAL_BASELINE_VERIFIED" = "true" ] && echo true || echo false)" \
