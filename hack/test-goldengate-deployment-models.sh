@@ -219,22 +219,25 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
 
   # Phase 6A: centralized container logging (platform Fluent Bit
   # DaemonSet). Essential, focused checks only -- same real dev values file
-  # and --set-string role-ARN/region injection pattern the actual
+  # and --set-string role-ARN/region/image injection pattern the actual
   # goldengate-platform.yaml workflow uses, not a fake Kubernetes/AWS
-  # environment.
+  # environment. The digest below is the real, verified private ECR digest
+  # supplied via the FLUENT_BIT_IMAGE repository variable.
   PLATFORM_DEV_VALUES="${REPO_ROOT}/platform/dev/goldengate-platform/values.yaml"
   FAKE_ORACLE_ROLE_ARN="arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev"
   FAKE_FLUENT_BIT_ROLE_ARN="arn:aws:iam::668311715351:role/GoldenGatePlatformLoggingRole-dev"
+  FAKE_FLUENT_BIT_IMAGE="229410149234.dkr.ecr.eu-west-1.amazonaws.com/aws-cloud-factory-fluent-bit@sha256:366923ffc51dfde4966e743dcbd4ca05211b733d4f69c7591903bc7660fbf243"
   if helm lint "$PLATFORM_CHART" \
       --values "$PLATFORM_DEV_VALUES" \
       --set-string serviceAccounts.oracle.roleArn="$FAKE_ORACLE_ROLE_ARN" \
       --set-string serviceAccounts.postgresql.roleArn="$FAKE_ORACLE_ROLE_ARN" \
       --set-string fluentBit.serviceAccount.roleArn="$FAKE_FLUENT_BIT_ROLE_ARN" \
       --set-string fluentBit.aws.region="eu-west-1" \
+      --set-string fluentBit.image.reference="$FAKE_FLUENT_BIT_IMAGE" \
       >"${WORKDIR}/lint-platform-fluentbit.log" 2>&1; then
-    pass "helm lint ${PLATFORM_CHART} (dev values, fluentBit.create=true)"
+    pass "helm lint ${PLATFORM_CHART} (dev values, fluentBit.create=true, private digest image)"
   else
-    fail "helm lint ${PLATFORM_CHART} (dev values, fluentBit.create=true)"
+    fail "helm lint ${PLATFORM_CHART} (dev values, fluentBit.create=true, private digest image)"
     cat "${WORKDIR}/lint-platform-fluentbit.log"
   fi
 
@@ -245,11 +248,31 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
       --set-string serviceAccounts.postgresql.roleArn="$FAKE_ORACLE_ROLE_ARN" \
       --set-string fluentBit.serviceAccount.roleArn="$FAKE_FLUENT_BIT_ROLE_ARN" \
       --set-string fluentBit.aws.region="eu-west-1" \
+      --set-string fluentBit.image.reference="$FAKE_FLUENT_BIT_IMAGE" \
       > "$PLATFORM_FLUENTBIT_RENDERED" 2>"${WORKDIR}/template-platform-fluentbit.log"; then
-    pass "helm template ${PLATFORM_CHART} (dev values, fluentBit.create=true) renders"
+    pass "helm template ${PLATFORM_CHART} (dev values, fluentBit.create=true, private digest image) renders"
   else
-    fail "helm template ${PLATFORM_CHART} (dev values, fluentBit.create=true) renders"
+    fail "helm template ${PLATFORM_CHART} (dev values, fluentBit.create=true, private digest image) renders"
     cat "${WORKDIR}/template-platform-fluentbit.log"
+  fi
+
+  # The chart must fail clearly (not silently fall back to any image) when
+  # fluentBit.create=true and no image reference is supplied at all.
+  if helm template goldengate-dev-platform "$PLATFORM_CHART" \
+      --values "$PLATFORM_DEV_VALUES" \
+      --set-string serviceAccounts.oracle.roleArn="$FAKE_ORACLE_ROLE_ARN" \
+      --set-string serviceAccounts.postgresql.roleArn="$FAKE_ORACLE_ROLE_ARN" \
+      --set-string fluentBit.serviceAccount.roleArn="$FAKE_FLUENT_BIT_ROLE_ARN" \
+      --set-string fluentBit.aws.region="eu-west-1" \
+      >"${WORKDIR}/template-platform-no-image.log" 2>&1; then
+    fail "helm template ${PLATFORM_CHART} unexpectedly succeeded with fluentBit.image.reference empty"
+  else
+    if grep -q "fluentBit.image.reference is required" "${WORKDIR}/template-platform-no-image.log"; then
+      pass "the chart fails clearly (required) when fluentBit.create=true and fluentBit.image.reference is empty"
+    else
+      fail "the chart failed with fluentBit.image.reference empty, but not with the expected required-value error"
+      cat "${WORKDIR}/template-platform-no-image.log"
+    fi
   fi
 
   if [ -s "$PLATFORM_FLUENTBIT_RENDERED" ]; then
@@ -278,19 +301,67 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
       fail "gg-fluent-bit DaemonSet does not explicitly disable host networking"
     fi
 
+    # Deployment image reference: exact, private, immutable digest -- never
+    # public.ecr.aws, never a mutable tag.
+    if echo "$FLUENT_BIT_DS_ONLY" | grep -Fq -- "image: \"${FAKE_FLUENT_BIT_IMAGE}\""; then
+      pass "gg-fluent-bit DaemonSet image exactly matches the supplied private immutable digest reference"
+    else
+      fail "gg-fluent-bit DaemonSet image does not exactly match the supplied private immutable digest reference"
+    fi
+    if grep -q 'public.ecr.aws' "$PLATFORM_FLUENTBIT_RENDERED"; then
+      fail "rendered manifest contains a public.ecr.aws reference"
+    else
+      pass "rendered manifest contains no public.ecr.aws reference"
+    fi
+
     if grep -qE "Regex\s+\\\$kubernetes\['namespace_name'\]\s+\^\(goldengate-dev\|goldengate-monitoring\)\\\$" "$PLATFORM_FLUENTBIT_RENDERED"; then
-      pass "Fluent Bit namespace filtering is present and limited to goldengate-dev/goldengate-monitoring"
+      pass "Fluent Bit namespace filtering (defense-in-depth grep FILTER) is present and limited to goldengate-dev/goldengate-monitoring"
     else
       fail "Fluent Bit namespace-filtering grep FILTER was not found as expected"
     fi
 
-    if grep -q 'log_group_name    /adcb/goldengate/dev/runtime' "$PLATFORM_FLUENTBIT_RENDERED" \
-        && grep -q 'log_group_name    /adcb/goldengate/dev/monitor' "$PLATFORM_FLUENTBIT_RENDERED" \
-        && grep -q 'auto_create_group false' "$PLATFORM_FLUENTBIT_RENDERED" \
-        && ! grep -q 'auto_create_group true' "$PLATFORM_FLUENTBIT_RENDERED"; then
+    # Input-level scoping: the Tail Path itself must be restricted to the
+    # two approved namespaces' container-log filename convention -- never
+    # the unrestricted /var/log/containers/*.log.
+    EXPECTED_TAIL_PATH="/var/log/containers/*_goldengate-dev_*.log,/var/log/containers/*_goldengate-monitoring_*.log"
+    if grep -Fq -- "$EXPECTED_TAIL_PATH" "$PLATFORM_FLUENTBIT_RENDERED" \
+        && ! grep -Fq -- 'Path              /var/log/containers/*.log' "$PLATFORM_FLUENTBIT_RENDERED"; then
+      pass "Fluent Bit Tail input Path is restricted to exactly the two approved namespace patterns"
+    else
+      fail "Fluent Bit Tail input Path is not restricted as expected"
+    fi
+
+    if grep -qE 'log_group_name[[:space:]]+/adcb/goldengate/dev/runtime$' "$PLATFORM_FLUENTBIT_RENDERED" \
+        && grep -qE 'log_group_name[[:space:]]+/adcb/goldengate/dev/monitor$' "$PLATFORM_FLUENTBIT_RENDERED" \
+        && grep -qE 'auto_create_group[[:space:]]+false' "$PLATFORM_FLUENTBIT_RENDERED" \
+        && ! grep -qE 'auto_create_group[[:space:]]+true' "$PLATFORM_FLUENTBIT_RENDERED"; then
       pass "Fluent Bit targets the exact pre-created CloudWatch log groups and never auto-creates a group"
     else
       fail "Fluent Bit CloudWatch log-group destinations are not exactly as expected"
+    fi
+
+    # Bounded filesystem buffering: both cloudwatch_logs OUTPUTs carry
+    # storage.total_limit_size, and the fluent-bit-state emptyDir carries a
+    # sizeLimit -- distinct from (and in addition to) the pre-existing
+    # Mem_Buf_Limit/storage.max_chunks_up/storage.backlog.mem_limit memory
+    # and in-flight backlog controls, which bound something different (RAM
+    # and in-flight chunks, not the total on-disk buffer directory size).
+    TOTAL_LIMIT_SIZE_COUNT="$(grep -v '^\s*#' "$PLATFORM_FLUENTBIT_RENDERED" | grep -cE 'storage\.total_limit_size[[:space:]]+[0-9]' || true)"
+    if [ "$TOTAL_LIMIT_SIZE_COUNT" -eq 2 ]; then
+      pass "both cloudwatch_logs OUTPUTs set storage.total_limit_size (filesystem queue bound)"
+    else
+      fail "expected storage.total_limit_size on exactly 2 cloudwatch_logs OUTPUTs, found ${TOTAL_LIMIT_SIZE_COUNT}"
+    fi
+    if echo "$FLUENT_BIT_DS_ONLY" | grep -A2 'name: fluent-bit-state' | grep -q 'sizeLimit:'; then
+      pass "the fluent-bit-state emptyDir volume sets sizeLimit (node ephemeral-storage bound)"
+    else
+      fail "the fluent-bit-state emptyDir volume does not set sizeLimit"
+    fi
+    if echo "$FLUENT_BIT_DS_ONLY" | grep -q 'Mem_Buf_Limit\|storage.max_chunks_up\|storage.backlog.mem_limit' \
+        || grep -q 'Mem_Buf_Limit\|storage.max_chunks_up\|storage.backlog.mem_limit' "$PLATFORM_FLUENTBIT_RENDERED"; then
+      pass "existing memory/backlog controls (Mem_Buf_Limit, storage.max_chunks_up, storage.backlog.mem_limit) are retained"
+    else
+      fail "existing memory/backlog controls were unexpectedly removed"
     fi
 
     if grep -qE '^kind: (StatefulSet|Deployment)$' "$PLATFORM_FLUENTBIT_RENDERED"; then
@@ -300,6 +371,38 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
     fi
   else
     skip "gg-fluent-bit DaemonSet structural checks -- rendered manifest not available"
+  fi
+
+  # Private-image-reference format validation: exercise the exact same
+  # regex the workflow's "Validate FLUENT_BIT_IMAGE format" step uses,
+  # confirming the real digest passes and representative malformed values
+  # (tag-based, public.ecr.aws, wrong repository/account, malformed digest)
+  # are all rejected.
+  FLUENT_BIT_IMAGE_PATTERN='^229410149234\.dkr\.ecr\.eu-west-1\.amazonaws\.com/aws-cloud-factory-fluent-bit@sha256:[a-f0-9]{64}$'
+  FLUENT_BIT_IMAGE_FORMAT_ALL_OK="true"
+  while IFS='|' read -r label candidate expect_match; do
+    [ -z "$label" ] && continue
+    if [[ "$candidate" =~ $FLUENT_BIT_IMAGE_PATTERN ]]; then
+      actual_match="true"
+    else
+      actual_match="false"
+    fi
+    if [ "$actual_match" != "$expect_match" ]; then
+      FLUENT_BIT_IMAGE_FORMAT_ALL_OK="false"
+      echo "  image-format mismatch: ${label} expected match=${expect_match} got=${actual_match} (${candidate})"
+    fi
+  done <<'CASES'
+valid private digest|229410149234.dkr.ecr.eu-west-1.amazonaws.com/aws-cloud-factory-fluent-bit@sha256:366923ffc51dfde4966e743dcbd4ca05211b733d4f69c7591903bc7660fbf243|true
+tag-based|229410149234.dkr.ecr.eu-west-1.amazonaws.com/aws-cloud-factory-fluent-bit:3.4.0|false
+public.ecr.aws|public.ecr.aws/aws-observability/aws-for-fluent-bit@sha256:366923ffc51dfde4966e743dcbd4ca05211b733d4f69c7591903bc7660fbf243|false
+wrong repository|229410149234.dkr.ecr.eu-west-1.amazonaws.com/some-other-repo@sha256:366923ffc51dfde4966e743dcbd4ca05211b733d4f69c7591903bc7660fbf243|false
+wrong account|999999999999.dkr.ecr.eu-west-1.amazonaws.com/aws-cloud-factory-fluent-bit@sha256:366923ffc51dfde4966e743dcbd4ca05211b733d4f69c7591903bc7660fbf243|false
+malformed digest|229410149234.dkr.ecr.eu-west-1.amazonaws.com/aws-cloud-factory-fluent-bit@sha256:abc123|false
+CASES
+  if [ "$FLUENT_BIT_IMAGE_FORMAT_ALL_OK" = "true" ]; then
+    pass "FLUENT_BIT_IMAGE format regex accepts the exact private digest and rejects tag/public/wrong-repo/wrong-account/malformed-digest variants"
+  else
+    fail "FLUENT_BIT_IMAGE format regex did not behave as expected for one or more cases (see output above)"
   fi
 
   # No GoldenGate runtime sidecar: the runtime chart itself (never touched
@@ -343,6 +446,28 @@ PYEOF
     fi
   else
     fail "${LOGGING_POLICY_FILE} not found, or python3 unavailable"
+  fi
+
+  # CloudWatch Logs encryption correction: no kms_key_id (guessed or
+  # otherwise) may be set on either log group -- both groups must rely on
+  # CloudWatch Logs' own default server-side encryption until an approved
+  # customer-managed KMS key ARN is actually supplied. The two log groups
+  # and their retention/tags remain otherwise unchanged.
+  CLOUDWATCH_LOGS_TF="${REPO_ROOT}/envs/dev/cloudwatch_logs.tf"
+  if [ -f "$CLOUDWATCH_LOGS_TF" ]; then
+    if grep -v '^\s*#' "$CLOUDWATCH_LOGS_TF" | grep -qE 'kms_key_id\s*='; then
+      fail "envs/dev/cloudwatch_logs.tf still sets kms_key_id -- must rely on CloudWatch Logs default server-side encryption only"
+    else
+      pass "envs/dev/cloudwatch_logs.tf sets no kms_key_id -- relies on CloudWatch Logs default server-side encryption"
+    fi
+    if grep -q '"/adcb/goldengate/dev/runtime"' "$CLOUDWATCH_LOGS_TF" && grep -q '"/adcb/goldengate/dev/monitor"' "$CLOUDWATCH_LOGS_TF" \
+        && grep -q 'retention_in_days' "$CLOUDWATCH_LOGS_TF"; then
+      pass "envs/dev/cloudwatch_logs.tf still defines both log groups with retention configured"
+    else
+      fail "envs/dev/cloudwatch_logs.tf no longer defines both expected log groups with retention"
+    fi
+  else
+    fail "${CLOUDWATCH_LOGS_TF} not found"
   fi
 
   # Strict YAML parse of the platform workflow (must still parse cleanly

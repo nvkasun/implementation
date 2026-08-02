@@ -7,11 +7,18 @@
 # hard failure, not a silently-created, never-expiring, unbounded-cost
 # group.
 #
-# No new KMS CMK: encrypted with the account's existing AWS-managed
-# alias/aws/logs key, the same "no bespoke CMK" pattern already used
-# elsewhere in this environment (envs/dev/dynamodb.tf custom_kms_key_arn =
-# null; envs/dev/secret.tf secrets have no custom key either -- both rely
-# on the relevant service's AWS-managed default key).
+# Encryption: no kms_key_id is set on either log group below, so both rely
+# on CloudWatch Logs' own default server-side encryption (AWS-owned key,
+# not a customer-managed key this repository administers). This repository
+# has no approved CloudWatch Logs customer-managed KMS key ARN yet -- do
+# not set kms_key_id to a guessed alias (e.g. "alias/aws/logs" is not a
+# valid kms_key_id value for this resource; it is not the account's actual
+# default CloudWatch Logs encryption behavior) and do not create a new KMS
+# CMK just to satisfy this field. This matches the same "no bespoke CMK"
+# posture already used elsewhere in this environment (envs/dev/dynamodb.tf
+# custom_kms_key_arn = null; envs/dev/secret.tf secrets have no custom key
+# either), extended here one step further: no key reference of any kind
+# until an approved CMK ARN is actually supplied.
 #
 # Naming matches the goldengate.adcb/ label prefix already used throughout
 # this repository (e.g. helm/goldengate-platform, helm/goldengate,
@@ -40,7 +47,6 @@ locals {
 resource "aws_cloudwatch_log_group" "goldengate_runtime" {
   name              = "/adcb/goldengate/dev/runtime"
   retention_in_days = var.goldengate_log_retention_days
-  kms_key_id        = "alias/aws/logs"
 
   tags = merge(local.goldengate_log_group_tags, {
     Name = "/adcb/goldengate/dev/runtime"
@@ -51,7 +57,6 @@ resource "aws_cloudwatch_log_group" "goldengate_runtime" {
 resource "aws_cloudwatch_log_group" "goldengate_monitor" {
   name              = "/adcb/goldengate/dev/monitor"
   retention_in_days = var.goldengate_log_retention_days
-  kms_key_id        = "alias/aws/logs"
 
   tags = merge(local.goldengate_log_group_tags, {
     Name = "/adcb/goldengate/dev/monitor"

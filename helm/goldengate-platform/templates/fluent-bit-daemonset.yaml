@@ -1,12 +1,9 @@
 {{- if .Values.fluentBit.create }}
-{{- if not .Values.fluentBit.image.repository }}
-{{- fail "fluentBit.image.repository cannot be empty." }}
-{{- end }}
-{{- if not .Values.fluentBit.image.tag }}
-{{- fail "fluentBit.image.tag cannot be empty." }}
-{{- end }}
 {{- if not .Values.namespaces.runtime.name }}
 {{- fail "namespaces.runtime.name is required when fluentBit.create=true." }}
+{{- end }}
+{{- if not .Values.fluentBit.buffering.stateVolumeSizeLimit }}
+{{- fail "fluentBit.buffering.stateVolumeSizeLimit is required when fluentBit.create=true (bounds the fluent-bit-state emptyDir on node ephemeral storage)." }}
 {{- end }}
 apiVersion: apps/v1
 kind: DaemonSet
@@ -42,13 +39,21 @@ spec:
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: {{ .Values.fluentBit.securityContext.runAsNonRoot }}
+        {{- if .Values.fluentBit.securityContext.runAsUser }}
         runAsUser: {{ .Values.fluentBit.securityContext.runAsUser }}
+        {{- end }}
+        {{- if .Values.fluentBit.securityContext.runAsGroup }}
         runAsGroup: {{ .Values.fluentBit.securityContext.runAsGroup }}
+        {{- end }}
+        {{- if .Values.fluentBit.securityContext.fsGroup }}
+        fsGroup: {{ .Values.fluentBit.securityContext.fsGroup }}
+        fsGroupChangePolicy: {{ .Values.fluentBit.securityContext.fsGroupChangePolicy | default "OnRootMismatch" }}
+        {{- end }}
         seccompProfile:
           {{- toYaml .Values.fluentBit.securityContext.seccompProfile | nindent 10 }}
       containers:
         - name: fluent-bit
-          image: "{{ .Values.fluentBit.image.repository }}:{{ .Values.fluentBit.image.tag }}"
+          image: {{ required "fluentBit.image.reference is required when fluentBit.create=true -- it must be the immutable private ECR digest reference (FLUENT_BIT_IMAGE), never a public.ecr.aws or tag-based image." .Values.fluentBit.image.reference | quote }}
           imagePullPolicy: {{ .Values.fluentBit.image.pullPolicy | default "IfNotPresent" }}
           securityContext:
             allowPrivilegeEscalation: {{ .Values.fluentBit.securityContext.allowPrivilegeEscalation }}
@@ -115,9 +120,14 @@ spec:
         # Fluent Bit's own tail-position DB and filesystem-backed chunk
         # buffer -- internal working storage, not a host log mount, so
         # readOnlyRootFilesystem compatibility does not conflict with the
-        # read-only /var/log mount below.
+        # read-only /var/log mount below. sizeLimit bounds this on node
+        # ephemeral storage (kubelet evicts the pod if it is exceeded)
+        # -- the actual queue-size bound Fluent Bit itself enforces is
+        # storage.total_limit_size in fluent-bit-configmap.yaml, kept in
+        # the same order of magnitude as this value.
         - name: fluent-bit-state
-          emptyDir: {}
+          emptyDir:
+            sizeLimit: {{ .Values.fluentBit.buffering.stateVolumeSizeLimit | quote }}
         - name: fluent-bit-config
           configMap:
             name: gg-fluent-bit-config

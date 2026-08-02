@@ -115,17 +115,34 @@ env:
   FLUENT_BIT_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGatePlatformLoggingRole-dev
   FLUENT_BIT_SA_NAME: gg-fluent-bit
 
+  # Phase 6A production-readiness correction: the private, immutable
+  # digest-pinned Fluent Bit image reference. The official AWS-published
+  # image was already mirrored into this account's own ECR repository
+  # (aws-cloud-factory-fluent-bit) outside this workflow -- this workflow
+  # never mirrors, copies, or writes an image, it only reads and verifies
+  # the already-mirrored digest via the "Validate FLUENT_BIT_IMAGE format"
+  # and "Private ECR digest preflight" steps below.
+  FLUENT_BIT_ECR_REPOSITORY_EXPECTED: aws-cloud-factory-fluent-bit
+  FLUENT_BIT_IMAGE_PREFIX_EXPECTED: "229410149234.dkr.ecr.eu-west-1.amazonaws.com/aws-cloud-factory-fluent-bit@"
+
 concurrency:
   group: goldengate-platform-deploy-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   # ---------------------------------------------------------------------
-  # Single job: this chart has no container image (Namespaces and
-  # ServiceAccounts only), so there is no separate image-build job like
-  # goldengate-monitor.yaml's ensure_monitor_image. Runs on the private
-  # CodeBuild runner, same as every other Helm/Argo CD deployment job in
-  # this repository.
+  # Single job. This chart creates no container image of its own to
+  # build/push (Namespaces, shared engine ServiceAccounts, and -- Phase
+  # 6A -- the platform-level Fluent Bit DaemonSet with its supporting
+  # RBAC/ConfigMap/ServiceAccount), so there is no separate image-build job
+  # like goldengate-monitor.yaml's ensure_monitor_image. The Fluent Bit
+  # container image itself is never built or copied here either: it is a
+  # pre-mirrored, immutable digest reference read from the FLUENT_BIT_IMAGE
+  # repository variable and verified read-only against the already-mirrored
+  # private ECR repository (see "Validate FLUENT_BIT_IMAGE format" and
+  # "Private ECR digest preflight for the Fluent Bit image" below). Runs on
+  # the private CodeBuild runner, same as every other Helm/Argo CD
+  # deployment job in this repository.
   # ---------------------------------------------------------------------
   package_publish_and_deploy:
     name: Build, publish, and deploy the GoldenGate platform bootstrap via Argo CD
@@ -187,6 +204,95 @@ jobs:
           aws --version
           helm version --short
           kubectl version --client=true
+
+      - name: Validate FLUENT_BIT_IMAGE format
+        shell: bash
+        env:
+          # Read through a step-level environment variable, per the
+          # required correction -- never interpolated directly into a
+          # shell statement, exactly like every other vars./secrets.
+          # reference in this repository's workflows.
+          FLUENT_BIT_IMAGE: ${{ vars.FLUENT_BIT_IMAGE }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${FLUENT_BIT_IMAGE:-}" ]; then
+            echo "FAIL: the FLUENT_BIT_IMAGE repository variable is not set."
+            exit 1
+          fi
+
+          # Exact private, immutable digest reference only -- no tag
+          # suffix, no public.ecr.aws, no other registry or repository.
+          EXPECTED_PATTERN='^229410149234\.dkr\.ecr\.eu-west-1\.amazonaws\.com/aws-cloud-factory-fluent-bit@sha256:[a-f0-9]{64}$'
+          if ! [[ "$FLUENT_BIT_IMAGE" =~ $EXPECTED_PATTERN ]]; then
+            echo "FAIL: FLUENT_BIT_IMAGE does not match the required private immutable digest format."
+            echo "Expected pattern: ${EXPECTED_PATTERN}"
+            echo "Got: ${FLUENT_BIT_IMAGE}"
+            exit 1
+          fi
+          if [[ "$FLUENT_BIT_IMAGE" == *public.ecr.aws* ]]; then
+            echo "FAIL: FLUENT_BIT_IMAGE references public.ecr.aws -- the deployed image must be the private ECR mirror only."
+            exit 1
+          fi
+
+          # Parsed from FLUENT_BIT_IMAGE itself -- never maintained as a
+          # second, independently-editable deployment value that could
+          # drift from the actual variable.
+          FLUENT_BIT_ECR_DIGEST="${FLUENT_BIT_IMAGE#*@}"
+          REGISTRY_AND_REPOSITORY="${FLUENT_BIT_IMAGE%@*}"
+          FLUENT_BIT_ECR_REPOSITORY="${REGISTRY_AND_REPOSITORY#*/}"
+
+          if [ "$FLUENT_BIT_ECR_REPOSITORY" != "$FLUENT_BIT_ECR_REPOSITORY_EXPECTED" ]; then
+            echo "FAIL: FLUENT_BIT_IMAGE repository is ${FLUENT_BIT_ECR_REPOSITORY}, expected ${FLUENT_BIT_ECR_REPOSITORY_EXPECTED}."
+            exit 1
+          fi
+
+          echo "FLUENT_BIT_IMAGE=${FLUENT_BIT_IMAGE}" >> "$GITHUB_ENV"
+          echo "FLUENT_BIT_ECR_REPOSITORY=${FLUENT_BIT_ECR_REPOSITORY}" >> "$GITHUB_ENV"
+          echo "FLUENT_BIT_ECR_DIGEST=${FLUENT_BIT_ECR_DIGEST}" >> "$GITHUB_ENV"
+
+          echo "OK: FLUENT_BIT_IMAGE is a validly-formatted private immutable digest reference."
+          echo "Repository: ${FLUENT_BIT_ECR_REPOSITORY}"
+          echo "Digest:     ${FLUENT_BIT_ECR_DIGEST}"
+
+      - name: Private ECR digest preflight for the Fluent Bit image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CALLER_ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
+          if [ "$CALLER_ACCOUNT" != "$ECR_ACCOUNT_ID" ]; then
+            echo "FAIL: AWS caller account is ${CALLER_ACCOUNT}, expected ${ECR_ACCOUNT_ID}."
+            exit 1
+          fi
+          echo "OK: AWS caller account is ${ECR_ACCOUNT_ID}."
+
+          # Read-only Describe call only -- no ECR write permission is used
+          # or required, and this workflow never copies/mirrors the image
+          # itself.
+          if ! DESCRIBE_IMAGES_JSON="$(aws ecr describe-images \
+              --region "$AWS_REGION" \
+              --repository-name "$FLUENT_BIT_ECR_REPOSITORY" \
+              --image-ids imageDigest="$FLUENT_BIT_ECR_DIGEST" \
+              --output json 2>/tmp/fluent-bit-describe-images-error.txt)"; then
+            if grep -q "RepositoryNotFoundException" /tmp/fluent-bit-describe-images-error.txt; then
+              echo "FAIL: private ECR repository ${FLUENT_BIT_ECR_REPOSITORY} was not found."
+            elif grep -q "ImageNotFoundException" /tmp/fluent-bit-describe-images-error.txt; then
+              echo "FAIL: digest ${FLUENT_BIT_ECR_DIGEST} was not found in repository ${FLUENT_BIT_ECR_REPOSITORY}."
+            else
+              echo "FAIL: aws ecr describe-images failed:"
+              cat /tmp/fluent-bit-describe-images-error.txt
+            fi
+            exit 1
+          fi
+
+          RETURNED_DIGEST="$(echo "$DESCRIBE_IMAGES_JSON" | jq -r '.imageDetails[0].imageDigest // empty')"
+          if [ "$RETURNED_DIGEST" != "$FLUENT_BIT_ECR_DIGEST" ]; then
+            echo "FAIL: ECR returned digest ${RETURNED_DIGEST}, expected ${FLUENT_BIT_ECR_DIGEST}."
+            exit 1
+          fi
+
+          echo "OK: verified digest ${FLUENT_BIT_ECR_DIGEST} exists in ${FLUENT_BIT_ECR_REPOSITORY} (account ${ECR_ACCOUNT_ID})."
 
       - name: Prepare platform deployment variables
         id: prep
@@ -312,7 +418,8 @@ jobs:
             --set-string serviceAccounts.oracle.roleArn="$ORACLE_RUNTIME_ROLE_ARN" \
             --set-string serviceAccounts.postgresql.roleArn="$POSTGRESQL_RUNTIME_ROLE_ARN" \
             --set-string fluentBit.serviceAccount.roleArn="$FLUENT_BIT_ROLE_ARN" \
-            --set-string fluentBit.aws.region="$AWS_REGION"
+            --set-string fluentBit.aws.region="$AWS_REGION" \
+            --set-string fluentBit.image.reference="$FLUENT_BIT_IMAGE"
 
       - name: Render platform manifest for validation
         shell: bash
@@ -327,6 +434,7 @@ jobs:
             --set-string serviceAccounts.postgresql.roleArn="$POSTGRESQL_RUNTIME_ROLE_ARN" \
             --set-string fluentBit.serviceAccount.roleArn="$FLUENT_BIT_ROLE_ARN" \
             --set-string fluentBit.aws.region="$AWS_REGION" \
+            --set-string fluentBit.image.reference="$FLUENT_BIT_IMAGE" \
             > "rendered/${RELEASE_NAME}.yaml"
 
           echo "Rendered manifest: rendered/${RELEASE_NAME}.yaml"
@@ -554,20 +662,90 @@ jobs:
             exit 1
           fi
           for expected_log_group in "$FLUENT_BIT_RUNTIME_LOG_GROUP" "$FLUENT_BIT_MONITOR_LOG_GROUP"; do
-            if ! grep -Fq -- "log_group_name    ${expected_log_group}" <<< "$FLUENT_BIT_CM_BLOCK"; then
+            if ! grep -Eq -- "log_group_name[[:space:]]+${expected_log_group}$" <<< "$FLUENT_BIT_CM_BLOCK"; then
               echo "FAIL: gg-fluent-bit-config does not target the exact pre-created log group ${expected_log_group}."
               exit 1
             fi
           done
-          if grep -Fq -- "auto_create_group true" <<< "$FLUENT_BIT_CM_BLOCK"; then
+          if grep -Eq -- "auto_create_group[[:space:]]+true" <<< "$FLUENT_BIT_CM_BLOCK"; then
             echo "FAIL: gg-fluent-bit-config allows Fluent Bit to auto-create CloudWatch log groups."
             exit 1
           fi
-          if ! grep -Fq -- "auto_create_group false" <<< "$FLUENT_BIT_CM_BLOCK"; then
+          if ! grep -Eq -- "auto_create_group[[:space:]]+false" <<< "$FLUENT_BIT_CM_BLOCK"; then
             echo "FAIL: gg-fluent-bit-config does not explicitly disable auto_create_group."
             exit 1
           fi
           echo "OK: namespace filtering is present and both CloudWatch log-group destinations are exact and pre-created (auto_create_group false)."
+
+          echo "Validating the rendered Fluent Bit DaemonSet image matches FLUENT_BIT_IMAGE exactly..."
+          RENDERED_IMAGE_LINE="$(grep -m1 -- "image:" <<< "$FLUENT_BIT_DS_BLOCK" || true)"
+          if [ -z "$RENDERED_IMAGE_LINE" ]; then
+            echo "FAIL: gg-fluent-bit DaemonSet has no image: field."
+            exit 1
+          fi
+          RENDERED_IMAGE="$(normalize_value "${RENDERED_IMAGE_LINE#*image:}")"
+          if [ "$RENDERED_IMAGE" != "$FLUENT_BIT_IMAGE" ]; then
+            echo "FAIL: rendered gg-fluent-bit image does not match FLUENT_BIT_IMAGE."
+            echo "Expected: ${FLUENT_BIT_IMAGE}"
+            echo "Actual:   ${RENDERED_IMAGE}"
+            exit 1
+          fi
+          echo "OK: rendered gg-fluent-bit image exactly matches FLUENT_BIT_IMAGE: ${RENDERED_IMAGE}"
+
+          echo "Validating no public.ecr.aws reference remains in the active (non-comment) Phase 6A chart values/templates or the rendered manifest..."
+          # Exclude comment-only lines (# ...) -- this repository's chart
+          # source deliberately documents "never public.ecr.aws" as a
+          # prohibition in prose/required-message text, which must not
+          # itself be flagged as a live reference. The rendered manifest
+          # check below (no comments possible in rendered output) is the
+          # authoritative proof of the actually-deployed image.
+          PUBLIC_ECR_HITS="$(grep -rn "public.ecr.aws" "$HELM_CHART_PATH/values.yaml" "$HELM_CHART_PATH/templates"/fluent-bit-*.yaml 2>/dev/null \
+            | grep -vE ':\s*#|"[^"]*public\.ecr\.aws[^"]*"' || true)"
+          if [ -n "$PUBLIC_ECR_HITS" ]; then
+            echo "FAIL: a live public.ecr.aws reference remains in the Phase 6A chart source:"
+            echo "${PUBLIC_ECR_HITS}"
+            exit 1
+          fi
+          if grep -q "public.ecr.aws" "$RENDERED"; then
+            echo "FAIL: a public.ecr.aws reference remains in the rendered manifest."
+            exit 1
+          fi
+          echo "OK: no live public.ecr.aws reference anywhere in the Phase 6A chart source or rendered manifest."
+
+          echo "Validating the Tail input Path is restricted to exactly the two approved namespace patterns..."
+          EXPECTED_TAIL_PATH="/var/log/containers/*_${RUNTIME_NAMESPACE}_*.log,/var/log/containers/*_${MONITOR_NAMESPACE}_*.log"
+          if ! grep -Fq -- "Path              ${EXPECTED_TAIL_PATH}" "$RENDERED"; then
+            echo "FAIL: Fluent Bit tail INPUT Path is not restricted to exactly: ${EXPECTED_TAIL_PATH}"
+            exit 1
+          fi
+          if grep -Fq -- "Path              /var/log/containers/*.log" "$RENDERED"; then
+            echo "FAIL: Fluent Bit tail INPUT Path still tails every container log cluster-wide."
+            exit 1
+          fi
+          echo "OK: Tail input Path is restricted to exactly the two approved namespace patterns."
+
+          echo "Validating both cloudwatch_logs OUTPUTs are filesystem-buffer bounded..."
+          TOTAL_LIMIT_SIZE_COUNT="$(grep -v '^\s*#' "$RENDERED" | grep -cE 'storage\.total_limit_size[[:space:]]+[0-9]')"
+          if [ "$TOTAL_LIMIT_SIZE_COUNT" -ne 2 ]; then
+            echo "FAIL: expected storage.total_limit_size on both cloudwatch_logs OUTPUTs, found ${TOTAL_LIMIT_SIZE_COUNT} occurrence(s)."
+            exit 1
+          fi
+          echo "OK: both cloudwatch_logs OUTPUTs set storage.total_limit_size."
+
+          echo "Validating the fluent-bit-state emptyDir has a sizeLimit..."
+          STATE_VOLUME_BLOCK="$(awk '/name: fluent-bit-state/{found=1} found{print} found && /emptyDir:/{c++} c==1 && /sizeLimit:|hostPath:|configMap:|- name:/{if (++n>1) exit}' <<< "$FLUENT_BIT_DS_BLOCK")"
+          if ! echo "$STATE_VOLUME_BLOCK" | grep -q 'sizeLimit:'; then
+            echo "FAIL: the fluent-bit-state emptyDir volume does not set sizeLimit."
+            exit 1
+          fi
+          echo "OK: the fluent-bit-state emptyDir volume sets sizeLimit."
+
+          echo "Validating no GoldenGate runtime StatefulSet template gained a Fluent Bit sidecar..."
+          if grep -rlq "fluent-bit\|fluentbit" helm/goldengate/templates/runtime-statefulset.yaml 2>/dev/null; then
+            echo "FAIL: helm/goldengate/templates/runtime-statefulset.yaml references Fluent Bit -- no GoldenGate runtime sidecar is permitted."
+            exit 1
+          fi
+          echo "OK: no Fluent Bit sidecar reference in the GoldenGate runtime StatefulSet template."
 
           echo "OK: rendered platform manifest passed all checks."
 
@@ -720,6 +898,8 @@ jobs:
                     value: ${FLUENT_BIT_ROLE_ARN}
                   - name: fluentBit.aws.region
                     value: ${AWS_REGION}
+                  - name: fluentBit.image.reference
+                    value: ${FLUENT_BIT_IMAGE}
             destination:
               server: https://kubernetes.default.svc
               namespace: ${RUNTIME_NAMESPACE}
@@ -864,7 +1044,9 @@ jobs:
             echo "name only (serviceAccount.create=false) and never own or delete them."
             echo ""
             echo "Phase 6A: this Application also owns DaemonSet/gg-fluent-bit"
-            echo "(platform-level centralized container logging, ServiceAccount/${FLUENT_BIT_SA_NAME})."
+            echo "(platform-level centralized container logging, ServiceAccount/${FLUENT_BIT_SA_NAME},"
+            echo "and its supporting ClusterRole/ClusterRoleBinding and ConfigMap). It runs the"
+            echo "private, immutable digest image \`${FLUENT_BIT_IMAGE:-unknown}\`."
             echo "It ships Kubernetes container stdout/stderr only, from"
             echo "\`${RUNTIME_NAMESPACE}\` and \`${MONITOR_NAMESPACE}\`, to the pre-created"
             echo "CloudWatch Logs groups \`${FLUENT_BIT_RUNTIME_LOG_GROUP}\` and"

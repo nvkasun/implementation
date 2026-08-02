@@ -2,11 +2,14 @@
 # is inert (create: false / empty) by default; an environment values file
 # (e.g. platform/dev/goldengate-platform/values.yaml) opts in explicitly.
 #
-# This chart is the SINGLE designated owner of the shared namespaces and the
-# shared engine-level runtime ServiceAccounts. It must never be confused with
-# an individual GoldenGate runtime release (helm/goldengate,
-# deploymentModel=singleRuntime) -- those reference these ServiceAccounts by
-# name only (serviceAccount.create=false) and must never create or own them.
+# This chart is the SINGLE designated owner of the shared namespaces, the
+# shared engine-level runtime ServiceAccounts, and (Phase 6A) the
+# platform-level Fluent Bit DaemonSet with its supporting RBAC, ConfigMap,
+# and ServiceAccount. It must never be confused with an individual
+# GoldenGate runtime release (helm/goldengate, deploymentModel=singleRuntime)
+# -- those reference the shared ServiceAccounts above by name only
+# (serviceAccount.create=false) and must never create or own them, and never
+# run a Fluent Bit/observer/manager-utility logging sidecar of their own.
 
 environment: ""
 
@@ -44,10 +47,17 @@ serviceAccounts:
 fluentBit:
   create: false
   image:
-    # AWS's own CloudWatch Logs output plugin (cloudwatch_logs) only ships
-    # in the aws-for-fluent-bit distribution, never in upstream fluent/fluent-bit.
-    repository: public.ecr.aws/aws-observability/aws-for-fluent-bit
-    tag: "2.32.2"
+    # One complete, immutable image reference -- never a repository/tag
+    # pair. Must be the private ECR digest reference published as the
+    # FLUENT_BIT_IMAGE GitHub repository variable, e.g.:
+    #   229410149234.dkr.ecr.eu-west-1.amazonaws.com/aws-cloud-factory-fluent-bit@sha256:<64 hex>
+    # Never public.ecr.aws (the upstream AWS-published image is mirrored
+    # into the approved private ECR account first) and never a mutable tag
+    # (a tag can move; a digest cannot). Deliberately empty by default --
+    # the chart must fail clearly (see fluent-bit-daemonset.yaml's
+    # `required`) rather than silently fall back to any public or
+    # tag-based image when fluentBit.create=true and this was not supplied.
+    reference: ""
     pullPolicy: IfNotPresent
 
   serviceAccount:
@@ -86,15 +96,37 @@ fluentBit:
       cpu: 200m
       memory: 256Mi
 
-  # aws-for-fluent-bit >= 2.31 supports running as a non-root UID (995,
-  # matching upstream fluent/fluent-bit's built-in non-root user). Verify
-  # this UID against the exact deployed image tag before go-live -- if it
-  # ever regresses log collection on a node, only this block should need to
-  # change, never the tail/filter/output pipeline.
+  # Bounded filesystem-backed chunk buffering (Section 6 correction): the
+  # earlier design bounded only in-memory buffering (Mem_Buf_Limit) and the
+  # in-flight backlog (storage.backlog.mem_limit), neither of which bounds
+  # how large the filesystem-backed buffer directory itself can grow on
+  # node ephemeral storage. outputQueueLimit becomes each cloudwatch_logs
+  # OUTPUT's storage.total_limit_size; stateVolumeSizeLimit becomes the
+  # fluent-bit-state emptyDir's sizeLimit, so the two are meant to be kept
+  # in the same rough order of magnitude (the emptyDir must be large enough
+  # to hold both outputs' queues plus the tail position DB).
+  buffering:
+    outputQueueLimit: 128M
+    stateVolumeSizeLimit: 300Mi
+
+  # UID/GID are deliberately left unset (empty) by default: the private
+  # immutable image (FLUENT_BIT_IMAGE) has not been verified against a
+  # specific non-root UID from this repository, and asserting
+  # runAsNonRoot=true with a guessed UID that turns out wrong would refuse
+  # to schedule at all (or silently break log collection), not just add
+  # friction -- guessing here is worse than leaving it unset. Every other
+  # hardening control below is fully and unconditionally enforced
+  # regardless of which user the container ultimately runs as.
+  #
+  # Once the image's actual supported non-root user has been verified
+  # (e.g. `docker run --rm <FLUENT_BIT_IMAGE> id`), set runAsNonRoot: true
+  # and runAsUser/runAsGroup to that UID/GID, and set fsGroup (with
+  # fsGroupChangePolicy) to the same GID so the writable fluent-bit-state
+  # emptyDir is writable by that user too.
   securityContext:
-    runAsNonRoot: true
-    runAsUser: 995
-    runAsGroup: 995
+    runAsNonRoot: false
+    runAsUser: ""
+    runAsGroup: ""
     allowPrivilegeEscalation: false
     readOnlyRootFilesystem: true
     capabilities:
@@ -102,6 +134,8 @@ fluentBit:
         - ALL
     seccompProfile:
       type: RuntimeDefault
+    fsGroup: ""
+    fsGroupChangePolicy: OnRootMismatch
 
   nodeSelector: {}
   tolerations:
