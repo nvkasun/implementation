@@ -8,6 +8,23 @@
         "eks:DescribeCluster"
       ],
       "Resource": "arn:aws:eks:eu-west-1:668311715351:cluster/gg-poc-dev"
+    },
+    {
+      "Sid": "AllowQueryGoldenGateLegacyInventoryDynamoDbTable",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:Query"
+      ],
+      "Resource": "arn:aws:dynamodb:eu-west-1:668311715351:table/gg-eks-pipeline"
+    },
+    {
+      "Sid": "AllowDescribeGoldenGateLegacyInventoryEfsResources",
+      "Effect": "Allow",
+      "Action": [
+        "elasticfilesystem:DescribeAccessPoints",
+        "elasticfilesystem:DescribeFileSystems"
+      ],
+      "Resource": "*"
     }
   ]
 }

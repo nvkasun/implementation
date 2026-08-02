@@ -266,6 +266,104 @@ run_aws_json() {
   rm -f "$stderr_file"
 }
 
+# --- Workload-account (EKS_DEPLOY_ROLE_ARN) temporary session -------------
+# Read-only workload-account calls (STS baseline, EFS Describe, DynamoDB
+# Query) run under a SEPARATE, temporary sts:AssumeRole session to
+# EKS_DEPLOY_ROLE_ARN -- the build/ECR-account session already established
+# by the workflow's own "Configure AWS credentials" step is NEVER replaced
+# globally, because ECR repository/image inspection must keep running
+# against the build/ECR account (229410149234). Credentials are held only
+# in-memory, for the lifetime of this script; they are never printed,
+# logged, or written to any file.
+WORKLOAD_SESSION_ESTABLISHED="false"
+WORKLOAD_AWS_ACCESS_KEY_ID=""
+WORKLOAD_AWS_SECRET_ACCESS_KEY=""
+WORKLOAD_AWS_SESSION_TOKEN=""
+
+# establish_workload_aws_session -- assumes EKS_DEPLOY_ROLE_ARN exactly
+# once (subsequent calls are a no-op once established) and caches the
+# temporary credentials in-memory. Returns 1 (never assumed/cached) if the
+# role ARN is unavailable, aws is unavailable, or the AssumeRole call
+# itself fails/is incomplete -- callers must treat that as "workload
+# session unverified", never as "workload resource absent".
+establish_workload_aws_session() {
+  [ "$WORKLOAD_SESSION_ESTABLISHED" = "true" ] && return 0
+  [ "$HAVE_AWS" = "true" ] || return 1
+  [ -n "${EKS_DEPLOY_ROLE_ARN:-}" ] || return 1
+
+  local assume_json status
+  set +e
+  assume_json="$(aws sts assume-role \
+    --role-arn "$EKS_DEPLOY_ROLE_ARN" \
+    --role-session-name "gg-legacy-inventory-workload" \
+    --duration-seconds 900 \
+    --output json 2>/dev/null)"
+  status=$?
+  set -e
+  if [ "$status" -ne 0 ] || [ -z "$assume_json" ]; then
+    return 1
+  fi
+
+  WORKLOAD_AWS_ACCESS_KEY_ID="$(echo "$assume_json" | jq -r '.Credentials.AccessKeyId // empty')"
+  WORKLOAD_AWS_SECRET_ACCESS_KEY="$(echo "$assume_json" | jq -r '.Credentials.SecretAccessKey // empty')"
+  WORKLOAD_AWS_SESSION_TOKEN="$(echo "$assume_json" | jq -r '.Credentials.SessionToken // empty')"
+  unset assume_json
+
+  if [ -z "$WORKLOAD_AWS_ACCESS_KEY_ID" ] || [ -z "$WORKLOAD_AWS_SECRET_ACCESS_KEY" ] || [ -z "$WORKLOAD_AWS_SESSION_TOKEN" ]; then
+    WORKLOAD_AWS_ACCESS_KEY_ID=""
+    WORKLOAD_AWS_SECRET_ACCESS_KEY=""
+    WORKLOAD_AWS_SESSION_TOKEN=""
+    return 1
+  fi
+
+  WORKLOAD_SESSION_ESTABLISHED="true"
+  return 0
+}
+
+# run_workload_aws_json ARG... -- same contract as run_aws_json (Describe/
+# Get/List/Query only -- callers pass the same read-only subcommands), but
+# always runs under the temporary workload-account (EKS_DEPLOY_ROLE_ARN)
+# session, never the build/ECR-account session. Sets LAST_WORKLOAD_AWS_OK,
+# LAST_WORKLOAD_AWS_JSON, LAST_WORKLOAD_AWS_NOTFOUND, and
+# LAST_WORKLOAD_SESSION_OK ("false" when the AssumeRole itself could not be
+# established -- distinct from "the call ran under the workload session
+# but failed/was denied"). A failed AssumeRole or a failed call is never
+# converted into "resource absent".
+run_workload_aws_json() {
+  if ! establish_workload_aws_session; then
+    LAST_WORKLOAD_SESSION_OK="false"
+    LAST_WORKLOAD_AWS_OK="false"
+    LAST_WORKLOAD_AWS_JSON=""
+    LAST_WORKLOAD_AWS_NOTFOUND="false"
+    return 1
+  fi
+  LAST_WORKLOAD_SESSION_OK="true"
+
+  local stderr_file out status
+  stderr_file="$(mktemp)"
+  set +e
+  out="$(AWS_ACCESS_KEY_ID="$WORKLOAD_AWS_ACCESS_KEY_ID" \
+         AWS_SECRET_ACCESS_KEY="$WORKLOAD_AWS_SECRET_ACCESS_KEY" \
+         AWS_SESSION_TOKEN="$WORKLOAD_AWS_SESSION_TOKEN" \
+         aws "$@" --output json 2>"$stderr_file")"
+  status=$?
+  set -e
+  if [ "$status" -eq 0 ]; then
+    LAST_WORKLOAD_AWS_OK="true"
+    LAST_WORKLOAD_AWS_JSON="$out"
+    LAST_WORKLOAD_AWS_NOTFOUND="false"
+  else
+    LAST_WORKLOAD_AWS_OK="false"
+    LAST_WORKLOAD_AWS_JSON=""
+    if grep -qiE "ResourceNotFoundException|NotFoundException|does not exist|NoSuchEntity|AccessPointNotFound|FileSystemNotFound" "$stderr_file"; then
+      LAST_WORKLOAD_AWS_NOTFOUND="true"
+    else
+      LAST_WORKLOAD_AWS_NOTFOUND="false"
+    fi
+  fi
+  rm -f "$stderr_file"
+}
+
 is_valid_efs_volume_handle() {
   [[ "$1" =~ $EFS_VOLUME_HANDLE_REGEX ]]
 }
@@ -671,17 +769,37 @@ BASELINE_ENVIRONMENT_OK="false"
 [ "$ENVIRONMENT" = "$ENVIRONMENT_EXPECTED" ] && BASELINE_ENVIRONMENT_OK="true"
 echo "environment: expected=${ENVIRONMENT_EXPECTED} observed=${ENVIRONMENT} match=${BASELINE_ENVIRONMENT_OK}"
 
-BASELINE_ACCOUNT_OK="false"
+# Two legitimate, distinct AWS account contexts: the primary session
+# established by the workflow (build/ECR account, 229410149234 -- used
+# as-is for ECR repository/image inspection) and a separate, temporary
+# workload-account session assumed via EKS_DEPLOY_ROLE_ARN (668311715351 --
+# used for EFS/DynamoDB/STS baseline). Neither is inferred from the other;
+# each is independently verified via its own sts:GetCallerIdentity call.
+BASELINE_BUILD_ACCOUNT_OK="false"
+BASELINE_WORKLOAD_ACCOUNT_OK="false"
 BASELINE_REGION_OK="false"
 if [ "$HAVE_AWS" = "true" ]; then
   run_aws_json sts get-caller-identity
   if [ "$LAST_AWS_OK" = "true" ]; then
-    LIVE_ACCOUNT_ID="$(echo "$LAST_AWS_JSON" | jq -r '.Account // empty')"
-    [ "$LIVE_ACCOUNT_ID" = "$WORKLOAD_ACCOUNT_ID_EXPECTED" ] && BASELINE_ACCOUNT_OK="true"
-    echo "Workload account: expected=${WORKLOAD_ACCOUNT_ID_EXPECTED} observed=${LIVE_ACCOUNT_ID:-<unavailable>} match=${BASELINE_ACCOUNT_OK}"
+    LIVE_BUILD_ACCOUNT_ID="$(echo "$LAST_AWS_JSON" | jq -r '.Account // empty')"
+    [ "$LIVE_BUILD_ACCOUNT_ID" = "$ECR_ACCOUNT_ID_EXPECTED" ] && BASELINE_BUILD_ACCOUNT_OK="true"
+    echo "Build/ECR account (primary session): expected=${ECR_ACCOUNT_ID_EXPECTED} observed=${LIVE_BUILD_ACCOUNT_ID:-<unavailable>} match=${BASELINE_BUILD_ACCOUNT_OK}"
   else
     add_permission_gap "STS_GET_CALLER_IDENTITY_PERMISSION_MISSING"
-    echo "Could not call sts get-caller-identity -- reporting as a permission gap. BASELINE_ACCOUNT_OK remains false."
+    echo "Could not call sts get-caller-identity (build/ECR account) -- reporting as a permission gap. BASELINE_BUILD_ACCOUNT_OK remains false."
+  fi
+
+  run_workload_aws_json sts get-caller-identity
+  if [ "$LAST_WORKLOAD_SESSION_OK" != "true" ]; then
+    add_permission_gap "WORKLOAD_ASSUME_ROLE_PERMISSION_MISSING"
+    echo "Could not assume EKS_DEPLOY_ROLE_ARN for the workload-account session -- reporting as a permission gap. BASELINE_WORKLOAD_ACCOUNT_OK remains false."
+  elif [ "$LAST_WORKLOAD_AWS_OK" = "true" ]; then
+    LIVE_WORKLOAD_ACCOUNT_ID="$(echo "$LAST_WORKLOAD_AWS_JSON" | jq -r '.Account // empty')"
+    [ "$LIVE_WORKLOAD_ACCOUNT_ID" = "$WORKLOAD_ACCOUNT_ID_EXPECTED" ] && BASELINE_WORKLOAD_ACCOUNT_OK="true"
+    echo "Workload account (assumed EKS_DEPLOY_ROLE_ARN session): expected=${WORKLOAD_ACCOUNT_ID_EXPECTED} observed=${LIVE_WORKLOAD_ACCOUNT_ID:-<unavailable>} match=${BASELINE_WORKLOAD_ACCOUNT_OK}"
+  else
+    add_permission_gap "STS_GET_CALLER_IDENTITY_PERMISSION_MISSING"
+    echo "Could not call sts get-caller-identity (workload account) -- reporting as a permission gap. BASELINE_WORKLOAD_ACCOUNT_OK remains false."
   fi
 
   LIVE_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
@@ -691,7 +809,7 @@ if [ "$HAVE_AWS" = "true" ]; then
   echo "Region: expected=${AWS_REGION_EXPECTED} observed=${LIVE_REGION:-<unset>} match=${BASELINE_REGION_OK}"
 else
   add_permission_gap "AWS_CLI_UNAVAILABLE"
-  echo "aws CLI not available on this runner -- reporting as a permission gap. BASELINE_ACCOUNT_OK/BASELINE_REGION_OK remain false."
+  echo "aws CLI not available on this runner -- reporting as a permission gap. BASELINE_BUILD_ACCOUNT_OK/BASELINE_WORKLOAD_ACCOUNT_OK/BASELINE_REGION_OK remain false."
 fi
 
 BASELINE_CLUSTER_OK="false"
@@ -838,44 +956,127 @@ else
 fi
 
 # --- Shared monitor functional validation (task section 3) -----------------
-echo "Validating shared monitor (gg-monitor) functionally via its own read-only API..."
+# Manager-aligned, read-only DynamoDB validation of the canonical CONFIG /
+# LEASE / STATE#_deployment records for each canonical partition -- this is
+# the same schema monitor.py's portal/API reads (RECORD_TYPE_CONFIG,
+# RECORD_TYPE_LEASE, RECORD_TYPE_DEPLOYMENT_STATE; see the Section 0
+# comment above DYNAMODB_TABLE), so it is treated as equivalent to the
+# portal/API contract. No Kubernetes Services/proxy RBAC is used or added
+# for this: the only kubectl call here is a read-only Deployment Get, used
+# solely to discover the monitor's own deployed STALE_AFTER_SECONDS value
+# so this script never invents a separate freshness threshold.
+echo "Validating shared monitor via canonical DynamoDB CONFIG/LEASE/STATE records (workload account)..."
 BASELINE_MONITOR_VALIDATED="false"
+MONITOR_STALE_AFTER_SECONDS=""
+MONITOR_STALE_AFTER_SECONDS_VERIFIED="false"
 if [ "$HAVE_KUBECTL" = "true" ]; then
-  run_kubectl_raw "/api/v1/namespaces/${MONITOR_NAMESPACE}/services/${MONITOR_SERVICE_NAME}:${MONITOR_SERVICE_PORT}/proxy/api/status"
-  if [ "$LAST_KUBECTL_RAW_OK" = "true" ] && echo "$LAST_KUBECTL_RAW_BODY" | jq -e . >/dev/null 2>&1; then
-    MONITOR_STATUS_JSON="$LAST_KUBECTL_RAW_BODY"
-    MONITOR_ALL_OK="true"
-    for deployment_id in "${CANONICAL_DEPLOYMENT_IDS[@]}"; do
-      RUNTIME_JSON="$(echo "$MONITOR_STATUS_JSON" | jq -c --arg n "$deployment_id" \
-        '[.logicalPipelines[]?.runtimes[]? | select(.deploymentName == $n)] | first // {}')"
-      EFFECTIVE_STATUS="$(echo "$RUNTIME_JSON" | jq -r '.effectiveStatus // "MISSING"')"
-      FRESH="$(echo "$RUNTIME_JSON" | jq -r '.fresh // false')"
-      DATA_SOURCE="$(echo "$RUNTIME_JSON" | jq -r '.dataSource // ""')"
-      METRICS_ENABLED="$(echo "$RUNTIME_JSON" | jq -r '.metricsEnabled // false')"
-      ALERTS_ENABLED="$(echo "$RUNTIME_JSON" | jq -r '.alertsEnabled // true')"
-      ADMINSRVR="$(echo "$RUNTIME_JSON" | jq -r '.criticalServices.adminsrvr // false')"
-      DISTSRVR="$(echo "$RUNTIME_JSON" | jq -r '.criticalServices.distsrvr // false')"
-      RECVSRVR="$(echo "$RUNTIME_JSON" | jq -r '.criticalServices.recvsrvr // false')"
-
-      echo "  monitor(${deployment_id}): effectiveStatus=${EFFECTIVE_STATUS} fresh=${FRESH} dataSource=${DATA_SOURCE} metricsEnabled=${METRICS_ENABLED} alertsEnabled=${ALERTS_ENABLED} adminsrvr=${ADMINSRVR} distsrvr=${DISTSRVR} recvsrvr=${RECVSRVR}"
-
-      if [ "$EFFECTIVE_STATUS" != "UP" ] || [ "$FRESH" != "true" ] || [ "$DATA_SOURCE" != "canonical-monitor" ] \
-          || [ "$METRICS_ENABLED" != "true" ] || [ "$ALERTS_ENABLED" != "false" ] \
-          || [ "$ADMINSRVR" != "true" ] || [ "$DISTSRVR" != "true" ] || [ "$RECVSRVR" != "true" ]; then
-        MONITOR_ALL_OK="false"
-      fi
-    done
-    BASELINE_MONITOR_VALIDATED="$MONITOR_ALL_OK"
+  run_kubectl_json get deployment "$MONITOR_SERVICE_NAME" -n "$MONITOR_NAMESPACE"
+  if [ "$LAST_KUBECTL_OK" = "true" ]; then
+    RAW_STALE_AFTER_SECONDS="$(echo "$LAST_KUBECTL_JSON" | jq -r \
+      '[.spec.template.spec.containers[]?.env[]? | select(.name=="STALE_AFTER_SECONDS") | .value] | first // ""')"
+    if [[ "$RAW_STALE_AFTER_SECONDS" =~ ^[0-9]+$ ]] && [ "$RAW_STALE_AFTER_SECONDS" -gt 0 ]; then
+      MONITOR_STALE_AFTER_SECONDS="$RAW_STALE_AFTER_SECONDS"
+      MONITOR_STALE_AFTER_SECONDS_VERIFIED="true"
+      echo "Live gg-monitor Deployment STALE_AFTER_SECONDS=${MONITOR_STALE_AFTER_SECONDS}"
+    else
+      add_permission_gap "MONITOR_STALE_AFTER_SECONDS_UNAVAILABLE"
+      echo "gg-monitor Deployment did not report a valid STALE_AFTER_SECONDS value -- monitor validation blocked."
+    fi
   else
-    add_permission_gap "MONITOR_API_READ_PERMISSION_MISSING"
-    echo "Could not query the shared monitor's /api/status via the read-only Service proxy -- reporting as a permission gap."
+    add_permission_gap "MONITOR_STALE_AFTER_SECONDS_UNAVAILABLE"
+    echo "Could not read the gg-monitor Deployment -- reporting as a permission gap. Monitor validation blocked."
   fi
 else
   add_permission_gap "KUBECTL_UNAVAILABLE"
 fi
 
+if [ "$MONITOR_STALE_AFTER_SECONDS_VERIFIED" = "true" ]; then
+  MONITOR_ALL_OK="true"
+  NOW_EPOCH="$(date -u +%s)"
+  for deployment_id in "${CANONICAL_DEPLOYMENT_IDS[@]}"; do
+    case "$deployment_id" in
+      *oracle*) EXPECTED_DEPLOYMENT_TYPE="oracle" ;;
+      *postgresql*) EXPECTED_DEPLOYMENT_TYPE="postgresql" ;;
+      *) EXPECTED_DEPLOYMENT_TYPE="" ;;
+    esac
+
+    run_workload_aws_json dynamodb query \
+      --table-name "$DYNAMODB_TABLE" \
+      --key-condition-expression "#p = :p" \
+      --expression-attribute-names "{\"#p\":\"${DYNAMODB_HASH_KEY}\"}" \
+      --expression-attribute-values "{\":p\":{\"S\":\"${deployment_id}\"}}" \
+      --region "$AWS_REGION_EXPECTED"
+
+    if [ "$LAST_WORKLOAD_SESSION_OK" != "true" ]; then
+      add_permission_gap "WORKLOAD_ASSUME_ROLE_PERMISSION_MISSING"
+      echo "  monitor(${deployment_id}): could not establish workload-account session -- blocking monitor validation."
+      MONITOR_ALL_OK="false"
+      continue
+    fi
+    if [ "$LAST_WORKLOAD_AWS_OK" != "true" ]; then
+      add_permission_gap "DYNAMODB_QUERY_PERMISSION_MISSING"
+      echo "  monitor(${deployment_id}): could not query canonical partition -- blocking monitor validation."
+      MONITOR_ALL_OK="false"
+      continue
+    fi
+
+    ITEMS_JSON="$LAST_WORKLOAD_AWS_JSON"
+    CONFIG_ITEM="$(echo "$ITEMS_JSON" | jq -c '[.Items[]? | select(.recordType.S=="CONFIG")] | first // {}')"
+    LEASE_ITEM="$(echo "$ITEMS_JSON" | jq -c '[.Items[]? | select(.recordType.S=="LEASE")] | first // {}')"
+    STATE_ITEM="$(echo "$ITEMS_JSON" | jq -c '[.Items[]? | select(.recordType.S=="STATE#_deployment")] | first // {}')"
+
+    # jq's `//` alternative operator treats a literal `false` as falsy (the
+    # same as null/absent), so `.field.BOOL // "MISSING"` would silently
+    # turn a correct, explicit `false` into "MISSING". Every DynamoDB BOOL
+    # field is extracted with an explicit true/false/MISSING three-way
+    # check instead, so an explicit false is never confused with "the field
+    # was never verified".
+    BOOL_FIELD_JQ='if . == true then "true" elif . == false then "false" else "MISSING" end'
+    METRICS_ENABLED="$(echo "$CONFIG_ITEM" | jq -r ".metricsEnabled.BOOL | ${BOOL_FIELD_JQ}")"
+    ALERTS_ENABLED="$(echo "$CONFIG_ITEM" | jq -r ".alertsEnabled.BOOL | ${BOOL_FIELD_JQ}")"
+    LEASE_HOLDER="$(echo "$LEASE_ITEM" | jq -r '.holder.S // ""')"
+    LEASE_EXPIRES_AT="$(echo "$LEASE_ITEM" | jq -r '.expiresAt.N // ""')"
+    STATE_STATUS="$(echo "$STATE_ITEM" | jq -r '.status.S // "MISSING"')"
+    STATE_RECORDED_AT="$(echo "$STATE_ITEM" | jq -r '.recordedAt.N // ""')"
+    STATE_DEPLOYMENT_TYPE="$(echo "$STATE_ITEM" | jq -r '.deploymentType.S // "MISSING"')"
+    ADMINSRVR_REACHABLE="$(echo "$STATE_ITEM" | jq -r ".criticalServices.M.adminsrvr.M.reachable.BOOL | ${BOOL_FIELD_JQ}")"
+    DISTSRVR_REACHABLE="$(echo "$STATE_ITEM" | jq -r ".criticalServices.M.distsrvr.M.reachable.BOOL | ${BOOL_FIELD_JQ}")"
+    RECVSRVR_REACHABLE="$(echo "$STATE_ITEM" | jq -r ".criticalServices.M.recvsrvr.M.reachable.BOOL | ${BOOL_FIELD_JQ}")"
+
+    RECORD_OK="true"
+    [ "$METRICS_ENABLED" = "true" ] || RECORD_OK="false"
+    [ "$ALERTS_ENABLED" = "false" ] || RECORD_OK="false"
+    [ -n "$LEASE_HOLDER" ] || RECORD_OK="false"
+    if [[ "$LEASE_EXPIRES_AT" =~ ^[0-9]+$ ]] && [ "$LEASE_EXPIRES_AT" -gt "$NOW_EPOCH" ]; then
+      :
+    else
+      RECORD_OK="false"
+    fi
+    [ "$STATE_STATUS" = "UP" ] || RECORD_OK="false"
+    if [[ "$STATE_RECORDED_AT" =~ ^[0-9]+$ ]]; then
+      AGE_SECONDS=$(( NOW_EPOCH - STATE_RECORDED_AT ))
+      if [ "$AGE_SECONDS" -lt 0 ] || [ "$AGE_SECONDS" -gt "$MONITOR_STALE_AFTER_SECONDS" ]; then
+        RECORD_OK="false"
+      fi
+    else
+      RECORD_OK="false"
+    fi
+    [ -n "$EXPECTED_DEPLOYMENT_TYPE" ] && [ "$STATE_DEPLOYMENT_TYPE" = "$EXPECTED_DEPLOYMENT_TYPE" ] || RECORD_OK="false"
+    [ "$ADMINSRVR_REACHABLE" = "true" ] || RECORD_OK="false"
+    [ "$DISTSRVR_REACHABLE" = "true" ] || RECORD_OK="false"
+    [ "$RECVSRVR_REACHABLE" = "true" ] || RECORD_OK="false"
+
+    echo "  monitor(${deployment_id}): metricsEnabled=${METRICS_ENABLED} alertsEnabled=${ALERTS_ENABLED} leaseHolder=${LEASE_HOLDER:-<empty>} leaseExpiresAt=${LEASE_EXPIRES_AT:-<empty>} status=${STATE_STATUS} recordedAt=${STATE_RECORDED_AT:-<empty>} staleAfterSeconds=${MONITOR_STALE_AFTER_SECONDS} deploymentType=${STATE_DEPLOYMENT_TYPE} adminsrvrReachable=${ADMINSRVR_REACHABLE} distsrvrReachable=${DISTSRVR_REACHABLE} recvsrvrReachable=${RECVSRVR_REACHABLE} recordOk=${RECORD_OK}"
+
+    [ "$RECORD_OK" = "true" ] || MONITOR_ALL_OK="false"
+  done
+  BASELINE_MONITOR_VALIDATED="$MONITOR_ALL_OK"
+else
+  echo "Monitor validation blocked: STALE_AFTER_SECONDS could not be obtained from the live gg-monitor Deployment."
+fi
+
 CANONICAL_BASELINE_VERIFIED="false"
-if [ "$BASELINE_ENVIRONMENT_OK" = "true" ] && [ "$BASELINE_ACCOUNT_OK" = "true" ] && [ "$BASELINE_REGION_OK" = "true" ] \
+if [ "$BASELINE_ENVIRONMENT_OK" = "true" ] && [ "$BASELINE_WORKLOAD_ACCOUNT_OK" = "true" ] && [ "$BASELINE_REGION_OK" = "true" ] \
     && [ "$BASELINE_CLUSTER_OK" = "true" ] && [ "$BASELINE_APPLICATIONS_OK" = "true" ] \
     && [ "$BASELINE_LEGACY_APPLICATION_ABSENT" = "true" ] && [ "$BASELINE_LEGACY_NAMESPACE_ABSENT" = "true" ] \
     && [ "$BASELINE_STATEFULSETS_READY" = "true" ] && [ "$BASELINE_PVCS_BOUND" = "true" ] \
@@ -1005,23 +1206,33 @@ echo ""
 echo "--- C. EFS access-point validation ---"
 if [ "$HAVE_AWS" = "true" ]; then
   for ap_id in "${CANDIDATE_EFS_ACCESS_POINT_IDS[@]}"; do
-    run_aws_json efs describe-access-points --access-point-id "$ap_id" --region "$AWS_REGION_EXPECTED"
-    if [ "$LAST_AWS_NOTFOUND" = "true" ]; then
-      echo "EFS access point ${ap_id}: confirmed not found."
+    run_workload_aws_json efs describe-access-points --access-point-id "$ap_id" --region "$AWS_REGION_EXPECTED"
+    if [ "$LAST_WORKLOAD_SESSION_OK" != "true" ]; then
+      # The workload-account session itself (AssumeRole of
+      # EKS_DEPLOY_ROLE_ARN) could not be established -- this is never
+      # treated as "not found" or "absent". EFS lives in the workload
+      # account, so without that session no EFS evidence is trustworthy.
+      add_permission_gap "WORKLOAD_ASSUME_ROLE_PERMISSION_MISSING"
+      echo "EFS access point ${ap_id}: could not establish workload-account session -- reporting as a permission gap and blocking."
+      add_candidate CANDIDATES_EFS_AP "EfsAccessPoint" "$ap_id" "blocked" "{}" "workload_account_session_unavailable;"
+      continue
+    fi
+    if [ "$LAST_WORKLOAD_AWS_NOTFOUND" = "true" ]; then
+      echo "EFS access point ${ap_id}: confirmed not found in workload account (${WORKLOAD_ACCOUNT_ID_EXPECTED})."
       add_blocked "EfsAccessPoint" "$ap_id" "not_found"
       continue
     fi
-    if [ "$LAST_AWS_OK" != "true" ] || [ "$(echo "$LAST_AWS_JSON" | jq -r '.AccessPoints | length')" -eq 0 ]; then
+    if [ "$LAST_WORKLOAD_AWS_OK" != "true" ] || [ "$(echo "$LAST_WORKLOAD_AWS_JSON" | jq -r '.AccessPoints | length')" -eq 0 ]; then
       # A failed or ambiguous describe call is never converted into
       # "does not exist"/"unused" -- always a permission gap plus a
       # blocked candidate.
       add_permission_gap "EFS_METADATA_PERMISSION_MISSING"
-      echo "EFS access point ${ap_id}: describe call did not succeed or returned no access point -- reporting as a permission gap and blocking."
+      echo "EFS access point ${ap_id}: workload-account describe call did not succeed or returned no access point -- reporting as a permission gap and blocking."
       add_candidate CANDIDATES_EFS_AP "EfsAccessPoint" "$ap_id" "blocked" "{}" "describe_call_did_not_succeed;"
       continue
     fi
 
-    AP_JSON="$LAST_AWS_JSON"
+    AP_JSON="$LAST_WORKLOAD_AWS_JSON"
     FS_ID="$(echo "$AP_JSON" | jq -r '.AccessPoints[0].FileSystemId // ""')"
     LIFECYCLE_STATE="$(echo "$AP_JSON" | jq -r '.AccessPoints[0].LifeCycleState // ""')"
     ROOT_PATH="$(echo "$AP_JSON" | jq -r '.AccessPoints[0].RootDirectory.Path // ""')"
@@ -1136,21 +1347,31 @@ done
 
 if [ "$HAVE_AWS" = "true" ]; then
   for pipeline_id in "${LEGACY_DYNAMODB_PARTITIONS[@]}"; do
-    run_aws_json dynamodb query \
+    run_workload_aws_json dynamodb query \
       --table-name "$DYNAMODB_TABLE" \
       --key-condition-expression "#p = :p" \
       --expression-attribute-names "{\"#p\":\"${DYNAMODB_HASH_KEY}\"}" \
       --expression-attribute-values "{\":p\":{\"S\":\"${pipeline_id}\"}}" \
       --region "$AWS_REGION_EXPECTED"
 
-    if [ "$LAST_AWS_OK" != "true" ]; then
+    if [ "$LAST_WORKLOAD_SESSION_OK" != "true" ]; then
+      # DynamoDB lives in the workload account. Without a successfully
+      # assumed EKS_DEPLOY_ROLE_ARN session, no query result is
+      # trustworthy -- never fall back to the build-account session.
+      add_permission_gap "WORKLOAD_ASSUME_ROLE_PERMISSION_MISSING"
+      echo "DynamoDB partition ${pipeline_id}: could not establish workload-account session -- reporting as a permission gap and blocking."
+      add_candidate CANDIDATES_DYNAMODB "DynamoDbPartition" "$pipeline_id" "blocked" "{}" "workload_account_session_unavailable;"
+      continue
+    fi
+
+    if [ "$LAST_WORKLOAD_AWS_OK" != "true" ]; then
       add_permission_gap "DYNAMODB_QUERY_PERMISSION_MISSING"
-      echo "DynamoDB partition ${pipeline_id}: could not query -- reporting as a permission gap and blocking."
+      echo "DynamoDB partition ${pipeline_id}: could not query (workload account) -- reporting as a permission gap and blocking."
       add_candidate CANDIDATES_DYNAMODB "DynamoDbPartition" "$pipeline_id" "blocked" "{}" "query_not_verified;"
       continue
     fi
 
-    QUERY_JSON="$LAST_AWS_JSON"
+    QUERY_JSON="$LAST_WORKLOAD_AWS_JSON"
     ITEM_COUNT="$(echo "$QUERY_JSON" | jq -r '.Count // 0')"
     SORT_KEYS="$(echo "$QUERY_JSON" | jq -c "[.Items[]?.${DYNAMODB_RANGE_KEY}.S]")"
     TTL_VALUES="$(echo "$QUERY_JSON" | jq -c '[.Items[]? | select(has("ttl")) | .ttl.N]')"
@@ -1398,7 +1619,8 @@ fi
 BASELINE_JSON="$(jq -nc \
   --argjson verified "$([ "$CANONICAL_BASELINE_VERIFIED" = "true" ] && echo true || echo false)" \
   --argjson environmentOk "$([ "$BASELINE_ENVIRONMENT_OK" = "true" ] && echo true || echo false)" \
-  --argjson accountOk "$([ "$BASELINE_ACCOUNT_OK" = "true" ] && echo true || echo false)" \
+  --argjson buildAccountOk "$([ "$BASELINE_BUILD_ACCOUNT_OK" = "true" ] && echo true || echo false)" \
+  --argjson workloadAccountOk "$([ "$BASELINE_WORKLOAD_ACCOUNT_OK" = "true" ] && echo true || echo false)" \
   --argjson regionOk "$([ "$BASELINE_REGION_OK" = "true" ] && echo true || echo false)" \
   --argjson clusterOk "$([ "$BASELINE_CLUSTER_OK" = "true" ] && echo true || echo false)" \
   --argjson applicationsOk "$([ "$BASELINE_APPLICATIONS_OK" = "true" ] && echo true || echo false)" \
@@ -1411,7 +1633,8 @@ BASELINE_JSON="$(jq -nc \
   '{
     verified: $verified,
     environmentOk: $environmentOk,
-    accountOk: $accountOk,
+    buildAccountOk: $buildAccountOk,
+    workloadAccountOk: $workloadAccountOk,
     regionOk: $regionOk,
     clusterOk: $clusterOk,
     applicationsOk: $applicationsOk,

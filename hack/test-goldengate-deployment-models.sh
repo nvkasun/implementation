@@ -3306,6 +3306,177 @@ else
   skip "inventory classification unit tests -- ${INVENTORY_SCRIPT} or python3 not available"
 fi
 
+if [ -f "$INVENTORY_SCRIPT" ] && command -v python3 >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+  # Dual-account correction (Phase 5B2B1 account-context correction) focused
+  # checks. These extract the exact production account-baseline block and
+  # the exact production canonical-monitor-validation block (never the rest
+  # of Section 4, which makes real kubectl/aws calls at source time) and run
+  # them under small in-test stub run_aws_json/run_workload_aws_json/
+  # run_kubectl_json/add_permission_gap functions -- never a fake aws/
+  # kubectl binary or an end-to-end integration-test framework.
+  python3 - "$INVENTORY_SCRIPT" > "${WORKDIR}/inventory_account_block.sh" <<'PYEOF'
+import sys
+
+with open(sys.argv[1]) as f:
+    lines = f.readlines()
+
+const_start = next(i for i, l in enumerate(lines) if l.startswith("ENVIRONMENT="))
+const_end = next(i for i, l in enumerate(lines) if l.startswith("GENERATED_AT="))
+
+block_start = next(i for i, l in enumerate(lines) if l.startswith('BASELINE_BUILD_ACCOUNT_OK="false"'))
+marker = next(i for i, l in enumerate(lines) if "aws CLI not available on this runner" in l)
+block_end = None
+for j in range(marker, len(lines)):
+    if lines[j].strip() == "fi":
+        block_end = j
+        break
+if block_end is None:
+    sys.exit("could not locate end of account baseline block")
+
+sys.stdout.write("".join(lines[const_start:const_end]))
+sys.stdout.write("".join(lines[block_start:block_end + 1]))
+PYEOF
+
+  python3 - "$INVENTORY_SCRIPT" > "${WORKDIR}/inventory_monitor_block.sh" <<'PYEOF'
+import sys
+
+with open(sys.argv[1]) as f:
+    lines = f.readlines()
+
+const_start = next(i for i, l in enumerate(lines) if l.startswith("ENVIRONMENT="))
+const_end = next(i for i, l in enumerate(lines) if l.startswith("GENERATED_AT="))
+
+block_start = next(i for i, l in enumerate(lines)
+                    if l.startswith('echo "Validating shared monitor via canonical DynamoDB'))
+marker = next(i for i, l in enumerate(lines)
+              if "Monitor validation blocked: STALE_AFTER_SECONDS could not be obtained" in l)
+block_end = marker + 1
+if lines[block_end].strip() != "fi":
+    sys.exit("could not locate end of monitor validation block")
+
+sys.stdout.write("".join(lines[const_start:const_end]))
+sys.stdout.write("".join(lines[block_start:block_end + 1]))
+PYEOF
+
+  if [ -s "${WORKDIR}/inventory_account_block.sh" ] && bash -n "${WORKDIR}/inventory_account_block.sh" >/dev/null 2>&1; then
+    ACCOUNT_BLOCK_OUTPUT="$(bash -c '
+      add_permission_gap() { :; }
+      HAVE_AWS="true"
+      AWS_REGION="eu-west-1"
+
+      echo "--- separation: build session reports build account, workload session reports workload account ---"
+      run_aws_json() { LAST_AWS_OK="true"; LAST_AWS_JSON="{\"Account\":\"229410149234\"}"; }
+      run_workload_aws_json() { LAST_WORKLOAD_SESSION_OK="true"; LAST_WORKLOAD_AWS_OK="true"; LAST_WORKLOAD_AWS_JSON="{\"Account\":\"668311715351\"}"; }
+      source "'"${WORKDIR}"'/inventory_account_block.sh"
+      echo "buildOk=${BASELINE_BUILD_ACCOUNT_OK} workloadOk=${BASELINE_WORKLOAD_ACCOUNT_OK}"
+
+      echo "--- mismatch: workload session actually resolves to the build account (wrong-account evidence) ---"
+      run_aws_json() { LAST_AWS_OK="true"; LAST_AWS_JSON="{\"Account\":\"229410149234\"}"; }
+      run_workload_aws_json() { LAST_WORKLOAD_SESSION_OK="true"; LAST_WORKLOAD_AWS_OK="true"; LAST_WORKLOAD_AWS_JSON="{\"Account\":\"229410149234\"}"; }
+      source "'"${WORKDIR}"'/inventory_account_block.sh"
+      echo "buildOk=${BASELINE_BUILD_ACCOUNT_OK} workloadOk=${BASELINE_WORKLOAD_ACCOUNT_OK}"
+
+      echo "--- assume-role failure: workload session unavailable ---"
+      run_aws_json() { LAST_AWS_OK="true"; LAST_AWS_JSON="{\"Account\":\"229410149234\"}"; }
+      run_workload_aws_json() { LAST_WORKLOAD_SESSION_OK="false"; LAST_WORKLOAD_AWS_OK="false"; LAST_WORKLOAD_AWS_JSON=""; }
+      source "'"${WORKDIR}"'/inventory_account_block.sh"
+      echo "buildOk=${BASELINE_BUILD_ACCOUNT_OK} workloadOk=${BASELINE_WORKLOAD_ACCOUNT_OK}"
+    ' 2>&1)"
+    echo "$ACCOUNT_BLOCK_OUTPUT"
+
+    if echo "$ACCOUNT_BLOCK_OUTPUT" | grep -A4 "separation: build session reports build account" | grep -q "^buildOk=true workloadOk=true$"; then
+      pass "dual-account 1: build-account and workload-account sessions are independently verified against their own expected account IDs"
+    else
+      fail "dual-account 1: build/workload account separation did not behave as expected"
+    fi
+
+    if echo "$ACCOUNT_BLOCK_OUTPUT" | grep -A4 "mismatch: workload session actually resolves to the build account" | grep -q "^buildOk=true workloadOk=false$"; then
+      pass "dual-account 2: a workload session that resolves to the build account is never treated as workloadAccountOk"
+    else
+      fail "dual-account 2: workload/build account mismatch was not detected as expected"
+    fi
+
+    if echo "$ACCOUNT_BLOCK_OUTPUT" | grep -A4 "assume-role failure: workload session unavailable" | grep -q "^buildOk=true workloadOk=false$"; then
+      pass "dual-account 2b: a failed AssumeRole of EKS_DEPLOY_ROLE_ARN never becomes workloadAccountOk=true"
+    else
+      fail "dual-account 2b: an unavailable workload session was not correctly reported as workloadAccountOk=false"
+    fi
+  else
+    fail "could not extract or syntax-validate the account baseline block from ${INVENTORY_SCRIPT}"
+  fi
+
+  if grep -qE '\[ "\$BASELINE_WORKLOAD_ACCOUNT_OK" = "true" \]' "$INVENTORY_SCRIPT" && ! grep -q 'BASELINE_ACCOUNT_OK=' "$INVENTORY_SCRIPT"; then
+    pass "dual-account 2c: CANONICAL_BASELINE_VERIFIED requires BASELINE_WORKLOAD_ACCOUNT_OK, and the old single-session BASELINE_ACCOUNT_OK no longer exists"
+  else
+    fail "dual-account 2c: CANONICAL_BASELINE_VERIFIED does not require BASELINE_WORKLOAD_ACCOUNT_OK, or a stale BASELINE_ACCOUNT_OK reference remains"
+  fi
+
+  # 3: EFS access-point NotFound evidence must come from the workload-account
+  # session (LAST_WORKLOAD_AWS_NOTFOUND / LAST_WORKLOAD_SESSION_OK), never
+  # from the build-account session (LAST_AWS_NOTFOUND) -- a build-account
+  # "not found" result is exactly the untrustworthy evidence this correction
+  # removes.
+  EFS_SECTION="$(sed -n '/^echo "--- C\. EFS access-point validation ---"$/,/^echo "--- D\. StorageClass validation ---"$/p' "$INVENTORY_SCRIPT")"
+  if echo "$EFS_SECTION" | grep -q 'run_workload_aws_json efs describe-access-points' \
+      && echo "$EFS_SECTION" | grep -q 'LAST_WORKLOAD_AWS_NOTFOUND' \
+      && echo "$EFS_SECTION" | grep -q 'LAST_WORKLOAD_SESSION_OK' \
+      && ! echo "$EFS_SECTION" | grep -qE 'run_aws_json efs|LAST_AWS_NOTFOUND|LAST_AWS_OK|LAST_AWS_JSON'; then
+    pass "dual-account 3: EFS access-point NotFound evidence is derived only from the workload-account session, never the build-account session"
+  else
+    fail "dual-account 3: EFS access-point validation does not cleanly use the workload-account session for NotFound evidence"
+  fi
+
+  if [ -s "${WORKDIR}/inventory_monitor_block.sh" ] && bash -n "${WORKDIR}/inventory_monitor_block.sh" >/dev/null 2>&1; then
+    MONITOR_BLOCK_OUTPUT="$(bash -c '
+      add_permission_gap() { :; }
+      HAVE_KUBECTL="true"
+      run_kubectl_json() {
+        LAST_KUBECTL_OK="true"
+        LAST_KUBECTL_JSON="{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"env\":[{\"name\":\"STALE_AFTER_SECONDS\",\"value\":\"120\"}]}]}}}}"
+      }
+
+      echo "--- canonical CONFIG/LEASE/STATE success validates the monitor ---"
+      run_workload_aws_json() {
+        local args="$*" dep_type="" now recorded expires
+        case "$args" in
+          *gg-oracle-payments-01*) dep_type="oracle" ;;
+          *gg-postgresql-payments-01*) dep_type="postgresql" ;;
+        esac
+        now="$(date -u +%s)"; recorded=$((now - 10)); expires=$((now + 500))
+        LAST_WORKLOAD_SESSION_OK="true"; LAST_WORKLOAD_AWS_OK="true"
+        LAST_WORKLOAD_AWS_JSON="$(jq -nc --arg t "$dep_type" --argjson recorded "$recorded" --argjson expires "$expires" \
+          "{Items: [{recordType:{S:\"CONFIG\"}, metricsEnabled:{BOOL:true}, alertsEnabled:{BOOL:false}}, {recordType:{S:\"LEASE\"}, holder:{S:\"gg-monitor-0\"}, expiresAt:{N:(\$expires|tostring)}}, {recordType:{S:\"STATE#_deployment\"}, status:{S:\"UP\"}, recordedAt:{N:(\$recorded|tostring)}, deploymentType:{S:\$t}, criticalServices:{M:{adminsrvr:{M:{reachable:{BOOL:true}}}, distsrvr:{M:{reachable:{BOOL:true}}}, recvsrvr:{M:{reachable:{BOOL:true}}}}}}]}")"
+      }
+      source "'"${WORKDIR}"'/inventory_monitor_block.sh"
+      echo "monitorValidated=${BASELINE_MONITOR_VALIDATED}"
+
+      echo "--- a failed workload-account DynamoDB query blocks monitor validation ---"
+      run_workload_aws_json() {
+        LAST_WORKLOAD_SESSION_OK="true"; LAST_WORKLOAD_AWS_OK="false"; LAST_WORKLOAD_AWS_JSON=""
+      }
+      source "'"${WORKDIR}"'/inventory_monitor_block.sh"
+      echo "monitorValidated=${BASELINE_MONITOR_VALIDATED}"
+    ' 2>&1)"
+    echo "$MONITOR_BLOCK_OUTPUT"
+
+    if echo "$MONITOR_BLOCK_OUTPUT" | grep -A5 "canonical CONFIG/LEASE/STATE success validates the monitor" | grep -q "^monitorValidated=true$"; then
+      pass "dual-account 5: fully-conforming canonical CONFIG/LEASE/STATE#_deployment records (via the workload-account session) validate the monitor"
+    else
+      fail "dual-account 5: canonical CONFIG/LEASE/STATE records that satisfy the manager contract did not validate the monitor"
+    fi
+
+    if echo "$MONITOR_BLOCK_OUTPUT" | grep -A5 "a failed workload-account DynamoDB query blocks monitor validation" | grep -q "^monitorValidated=false$"; then
+      pass "dual-account 4: a failed workload-account DynamoDB Query blocks monitor validation, never silently passes it"
+    else
+      fail "dual-account 4: a failed DynamoDB query did not block monitor validation as expected"
+    fi
+  else
+    fail "could not extract or syntax-validate the monitor validation block from ${INVENTORY_SCRIPT}"
+  fi
+else
+  skip "dual-account inventory unit tests -- ${INVENTORY_SCRIPT}, python3, or jq not available"
+fi
+
 if [ -f "$INVENTORY_SCRIPT" ] && command -v python3 >/dev/null 2>&1; then
   # 10: eligibilityReady=false leaves no candidate with eligibility=eligible.
   # enforce_eligibility_readiness lives in Section 5 (after the live-
@@ -3374,11 +3545,26 @@ if command -v git >/dev/null 2>&1 && git -C "$REPO_ROOT" rev-parse --is-inside-w
     fail "17: collector.py and/or monitor.py were unexpectedly modified"
   fi
 
-  IAM_DIFF="$(git -C "$REPO_ROOT" diff --stat --ignore-all-space -- envs/dev/policies envs/dev/iam.tf 2>/dev/null || true)"
-  if [ -z "$IAM_DIFF" ]; then
+  # 18: IAM is unchanged, except that the dual-account correction is
+  # explicitly required to add exactly one statement each of
+  # dynamodb:Query (scoped to gg-eks-pipeline) and elasticfilesystem:
+  # Describe* (Resource "*", unsupported at resource-level) to the
+  # GoldenGateEKSDeployRole-dev policy. GoldenGateSecretsReadRole-dev and
+  # GoldenGateMonitorReadRole-dev must never be touched by this phase.
+  # --name-only does not fully honor --ignore-all-space in this git version
+  # (it still lists files whose only diff is line-ending noise), so the
+  # --stat form (which does honor it, confirmed empty for whitespace-only
+  # files) is used and parsed for real changed paths instead.
+  EXPECTED_MODIFIED_IAM_FILE="envs/dev/policies/goldengate-eks-deploy-dev/policies/policies_1.json"
+  IAM_DIFF_STAT="$(git -C "$REPO_ROOT" diff --stat=300 --ignore-all-space -- envs/dev/policies envs/dev/iam.tf 2>/dev/null || true)"
+  IAM_DIFF_FILES="$(echo "$IAM_DIFF_STAT" | grep -oE '\S+\.(json|tf)' | sort -u || true)"
+  SECRETS_MONITOR_DIFF="$(git -C "$REPO_ROOT" diff --stat --ignore-all-space -- envs/dev/policies/goldengate-secrets-read-dev envs/dev/policies/goldengate-monitor-read-dev 2>/dev/null || true)"
+  if [ -z "$IAM_DIFF_FILES" ]; then
     pass "18: IAM (envs/dev/policies, envs/dev/iam.tf) is unchanged"
+  elif [ "$IAM_DIFF_FILES" = "$EXPECTED_MODIFIED_IAM_FILE" ] && [ -z "$SECRETS_MONITOR_DIFF" ]; then
+    pass "18: only the required GoldenGateEKSDeployRole-dev policy (${EXPECTED_MODIFIED_IAM_FILE}) changed; GoldenGateSecretsReadRole-dev and GoldenGateMonitorReadRole-dev are unchanged"
   else
-    fail "18: IAM was unexpectedly modified:"$'\n'"${IAM_DIFF}"
+    fail "18: IAM changed outside the expected ${EXPECTED_MODIFIED_IAM_FILE}, or a protected role's policy was touched:"$'\n'"changed files: ${IAM_DIFF_FILES}"$'\n'"${SECRETS_MONITOR_DIFF}"
   fi
 else
   skip "collector.py/monitor.py/IAM unchanged checks -- not a git repository"
