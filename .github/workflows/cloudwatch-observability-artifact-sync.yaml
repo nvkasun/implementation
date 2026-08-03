@@ -1,0 +1,625 @@
+name: Cloud Factory - CloudWatch Observability artifact sync
+
+run-name: "Cloud Factory - CloudWatch Observability artifact sync (Phase 6B1) ran by ${{ github.actor }}"
+
+# Phase 6B1 ONLY: private supply-chain mirroring and verification for the
+# upstream amazon-cloudwatch-observability Helm chart and its required
+# container images. This workflow performs NO Kubernetes/EKS operation of
+# any kind -- no kubectl, no helm install/upgrade, no Argo CD Application,
+# no Terraform. It only reads an upstream chart/images, verifies them, and
+# writes them into this account's own private ECR (229410149234).
+#
+# Deploying amazon-cloudwatch-observability to the gg-poc-dev cluster (as a
+# separate Argo CD Application) and any IAM identity-policy update to
+# GoldenGateArgocdECRRead-dev are later, explicitly separate phases
+# (6B2+). Do not extend this workflow to perform them.
+#
+# workflow_dispatch only, deliberately no push trigger -- this is a manual,
+# occasional supply-chain sync, not something that should fire on every
+# commit.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: eu-west-1
+  ECR_ACCOUNT_ID: "229410149234"
+  ECR_REGISTRY: 229410149234.dkr.ecr.eu-west-1.amazonaws.com
+
+  # Same role already used by push_docker_images_to_ECR.yaml -- this
+  # workflow follows the exact same image-sync AWS identity pattern, not a
+  # new/different role.
+  ROLE_ARN: arn:aws:iam::229410149234:role/adcb-modelmonitoring-sit-codep-rDeployCodeBuildRole-KMCFNIKqpuUL
+
+  # EKS workload account whose node/pod IAM identity needs pull access to
+  # the four mirrored image repositories (never to the Helm chart
+  # repository -- that gets a separate, narrower policy for the Argo CD
+  # chart-read role only, applied below).
+  EKS_WORKLOAD_ACCOUNT_ID: "668311715351"
+  ARGOCD_ECR_READ_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateArgocdECRRead-dev
+
+  # Pinned upstream chart. Never "latest" -- a specific, verified version
+  # only.
+  UPSTREAM_CHART_REPO_NAME: aws-observability
+  UPSTREAM_CHART_REPO_URL: https://aws-observability.github.io/helm-charts
+  CHART_NAME: amazon-cloudwatch-observability
+  CHART_VERSION: "6.2.0"
+  HELM_OCI_NAMESPACE: helm
+  CHART_ECR_REPOSITORY: helm/amazon-cloudwatch-observability
+
+  # clusterName/region are only rendering inputs for the mandatory
+  # validation-values render below (helm template never contacts a
+  # cluster) -- this workflow never connects to gg-poc-dev.
+  RENDER_CLUSTER_NAME: gg-poc-dev
+  RENDER_REGION: eu-west-1
+
+  WORKDIR: work
+
+concurrency:
+  group: cloudwatch-observability-artifact-sync-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  mirror_and_verify:
+    name: Mirror and verify the amazon-cloudwatch-observability supply chain (Phase 6B1)
+
+    # Deliberately NOT the private CodeBuild runner used by every other
+    # deployment workflow in this repository: this job needs outbound
+    # internet access to the public aws-observability Helm repository and
+    # to public.ecr.aws/registry.k8s.io/quay.io, which the private runner
+    # does not have. Same reasoning as push_docker_images_to_ECR.yaml.
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.ROLE_ARN }}
+
+      - name: Fail closed unless the AWS caller account is the approved private ECR account
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CALLER_ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
+          if [ "$CALLER_ACCOUNT" != "$ECR_ACCOUNT_ID" ]; then
+            echo "FAIL: AWS caller account is ${CALLER_ACCOUNT}, expected ${ECR_ACCOUNT_ID}."
+            exit 1
+          fi
+          echo "OK: AWS caller account is ${ECR_ACCOUNT_ID}."
+
+      - name: Install or validate required tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! command -v helm >/dev/null 2>&1; then
+            HELM_VERSION="v3.15.4"
+            curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" -o /tmp/helm.tar.gz
+            tar -zxf /tmp/helm.tar.gz -C /tmp
+            sudo mv /tmp/linux-amd64/helm /usr/local/bin/helm
+            sudo chmod +x /usr/local/bin/helm
+          fi
+          HELM_SEMVER="$(helm version --short | sed -E 's/^v//' | cut -d+ -f1)"
+          echo "Helm version: ${HELM_SEMVER} (required: 3.9 or later)"
+          HELM_MAJOR="$(echo "$HELM_SEMVER" | cut -d. -f1)"
+          HELM_MINOR="$(echo "$HELM_SEMVER" | cut -d. -f2)"
+          if [ "$HELM_MAJOR" -lt 3 ] || { [ "$HELM_MAJOR" -eq 3 ] && [ "$HELM_MINOR" -lt 9 ]; }; then
+            echo "FAIL: Helm ${HELM_SEMVER} is older than the required 3.9."
+            exit 1
+          fi
+
+          if ! command -v skopeo >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y skopeo
+          fi
+          skopeo --version
+
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y jq
+          fi
+          jq --version
+
+          python3 --version
+          python3 -c "import yaml" 2>/dev/null || sudo apt-get install -y python3-yaml
+          python3 -c "import yaml; print('PyYAML', yaml.__version__)"
+
+      - name: Write the image mirror inventory (single source of truth)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$WORKDIR"
+
+          # source_ref|target_repository|target_tag -- exactly the four
+          # images required for the approved metrics-only render. This one
+          # table drives repository creation, EKS pull policy, mirroring,
+          # digest recording, and (combined with the live helm-template
+          # render) the mandatory rendered-image-set verification below --
+          # never five separately hand-maintained lists that could drift.
+          cat > "$WORKDIR/image-table.psv" <<'EOF'
+          public.ecr.aws/cloudwatch-agent/cloudwatch-agent-operator:3.4.2|aws-cloud-factory-cloudwatch-agent-operator|3.4.2
+          public.ecr.aws/cloudwatch-agent/cloudwatch-agent:1.300069.0b1529|aws-cloud-factory-cloudwatch-agent|1.300069.0b1529
+          registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.18.0|aws-cloud-factory-kube-state-metrics|v2.18.0
+          quay.io/prometheus/node-exporter:v1.11.1|aws-cloud-factory-node-exporter|v1.11.1
+          EOF
+          echo "Image mirror inventory:"
+          cat "$WORKDIR/image-table.psv"
+
+      - name: Pull the pinned upstream chart
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$WORKDIR/upstream"
+
+          helm repo add "$UPSTREAM_CHART_REPO_NAME" "$UPSTREAM_CHART_REPO_URL"
+          helm repo update "$UPSTREAM_CHART_REPO_NAME"
+
+          helm pull "${UPSTREAM_CHART_REPO_NAME}/${CHART_NAME}" \
+            --version "$CHART_VERSION" \
+            --destination "$WORKDIR/upstream"
+
+          CHART_TGZ="${WORKDIR}/upstream/${CHART_NAME}-${CHART_VERSION}.tgz"
+          if [ ! -f "$CHART_TGZ" ]; then
+            echo "FAIL: expected chart package ${CHART_TGZ} was not produced by helm pull."
+            exit 1
+          fi
+          echo "CHART_TGZ=${CHART_TGZ}" >> "$GITHUB_ENV"
+
+      - name: Verify the downloaded chart's name and version exactly
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          helm show chart "$CHART_TGZ" > "${WORKDIR}/Chart.yaml"
+
+          python3 - "${WORKDIR}/Chart.yaml" "$CHART_NAME" "$CHART_VERSION" <<'PYEOF'
+          import sys, yaml
+          path, expected_name, expected_version = sys.argv[1], sys.argv[2], sys.argv[3]
+          with open(path) as f:
+              chart = yaml.safe_load(f)
+          name = chart.get("name")
+          version = chart.get("version")
+          if name != expected_name:
+              sys.exit(f"FAIL: chart name is {name!r}, expected {expected_name!r}.")
+          if version != expected_version:
+              sys.exit(f"FAIL: chart version is {version!r}, expected {expected_version!r}.")
+          print(f"OK: chart name={name} version={version}")
+          PYEOF
+
+      - name: Write the temporary metrics-only validation values file
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Validation only -- this file is never used to deploy anything;
+          # it exists solely so `helm template` can render the exact
+          # future metrics-only configuration for the mandatory
+          # rendered-image-set check below. containerLogs/containerInsights
+          # log collection and Application Signals are disabled: Fluent
+          # Bit (helm/goldengate-platform) remains the sole log collector,
+          # and this chart is metrics-only per the approved architecture.
+          cat > "${WORKDIR}/validate-values.yaml" <<EOF
+          clusterName: ${RENDER_CLUSTER_NAME}
+          region: ${RENDER_REGION}
+
+          containerLogs:
+            enabled: false
+
+          containerInsights:
+            enabled: false
+
+          applicationSignals:
+            enabled: false
+
+          manager:
+            applicationSignals:
+              autoMonitor:
+                monitorAllServices: false
+
+          otelContainerInsights:
+            enabled: true
+            logs:
+              enabled: false
+
+          dcgmExporter:
+            enabled: false
+
+          neuronMonitor:
+            enabled: false
+
+          kubeStateMetrics:
+            enabled: true
+
+          nodeExporter:
+            enabled: true
+          EOF
+          cat "${WORKDIR}/validate-values.yaml"
+
+      - name: Render the chart and verify the rendered image set exactly
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          helm template cw-observability-validate "$CHART_TGZ" \
+            --namespace amazon-cloudwatch \
+            --values "${WORKDIR}/validate-values.yaml" \
+            > "${WORKDIR}/rendered.yaml"
+
+          # Expected image set is derived from the single image-table.psv
+          # written above -- never a second, independently-maintained
+          # list that could silently drift from what this workflow
+          # actually mirrors.
+          cut -d'|' -f1 "${WORKDIR}/image-table.psv" | sort -u > "${WORKDIR}/expected-images.txt"
+
+          # Mandatory rendered-image-set verification: recursively walk
+          # every rendered Kubernetes document (not a manually maintained
+          # image list, not a text grep) and collect every "image:" field
+          # anywhere in the tree -- covers containers, initContainers, and
+          # any other embedded image reference (e.g. inside a CRD spec).
+          python3 - "${WORKDIR}/rendered.yaml" <<'PYEOF' > "${WORKDIR}/rendered-images.txt"
+          import sys, yaml
+
+          with open(sys.argv[1]) as f:
+              docs = list(yaml.safe_load_all(f))
+
+          images = set()
+
+          def walk(node):
+              if isinstance(node, dict):
+                  for k, v in node.items():
+                      if k == "image" and isinstance(v, str):
+                          images.add(v)
+                      else:
+                          walk(v)
+              elif isinstance(node, list):
+                  for item in node:
+                      walk(item)
+
+          for d in docs:
+              if d is not None:
+                  walk(d)
+
+          for img in sorted(images):
+              print(img)
+          PYEOF
+
+          echo "Rendered image set:"
+          cat "${WORKDIR}/rendered-images.txt"
+          echo "Expected image set:"
+          cat "${WORKDIR}/expected-images.txt"
+
+          if ! diff -u "${WORKDIR}/expected-images.txt" "${WORKDIR}/rendered-images.txt" >"${WORKDIR}/image-diff.txt"; then
+            echo "FAIL: rendered image set does not exactly match the four approved upstream images."
+            cat "${WORKDIR}/image-diff.txt"
+            exit 1
+          fi
+          echo "OK: rendered image set is exactly the four approved upstream images (no fifth image, no Fluent Bit, no GPU/Neuron, no Application Signals auto-instrumentation)."
+
+          # Explicit forbidden-image guard in addition to the exact-set
+          # diff above -- makes the specific, named exclusions visible in
+          # the log even though the diff above already enforces them.
+          for forbidden in "aws-for-fluent-bit" "dcgm-exporter" "neuron-monitor" "adot-autoinstrumentation" "cloudwatch-agent-target-allocator"; do
+            if grep -qi -- "$forbidden" "${WORKDIR}/rendered-images.txt"; then
+              echo "FAIL: forbidden image reference '${forbidden}' found in the rendered image set."
+              exit 1
+            fi
+          done
+          echo "OK: none of the explicitly forbidden images are present."
+
+      - name: Ensure all five ECR repositories exist (fail on unexpected mutability)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          create_repo_if_missing() {
+            local repo="$1"
+            local describe_json
+            if describe_json="$(aws ecr describe-repositories \
+                --region "$AWS_REGION" \
+                --repository-names "$repo" \
+                --output json 2>"${WORKDIR}/describe-repo-error.txt")"; then
+              local mutability
+              mutability="$(echo "$describe_json" | jq -r '.repositories[0].imageTagMutability')"
+              if [ "$mutability" != "IMMUTABLE" ]; then
+                echo "FAIL: existing repository ${repo} has imageTagMutability=${mutability}, expected IMMUTABLE."
+                echo "Refusing to silently change mutability on an existing repository -- explicit review required."
+                exit 1
+              fi
+              echo "OK: repository ${repo} already exists and is IMMUTABLE."
+            else
+              if grep -q "RepositoryNotFoundException" "${WORKDIR}/describe-repo-error.txt"; then
+                echo "Creating ECR repository: ${repo}"
+                aws ecr create-repository \
+                  --region "$AWS_REGION" \
+                  --repository-name "$repo" \
+                  --tags Key=ApplicationName,Value=CloudFactory Key=DataClassification,Value=General Key=BusinessCriticality,Value=Low Key=BusinessUnit,Value=TechnologyPlatform Key=CostCenter,Value=219 \
+                  --image-scanning-configuration scanOnPush=true \
+                  --image-tag-mutability IMMUTABLE >/dev/null
+                echo "Created ECR repository: ${repo} (IMMUTABLE)."
+              else
+                echo "FAIL: could not describe repository ${repo}:"
+                cat "${WORKDIR}/describe-repo-error.txt"
+                exit 1
+              fi
+            fi
+          }
+
+          create_repo_if_missing "$CHART_ECR_REPOSITORY"
+          while IFS='|' read -r _source target_repo _tag; do
+            [ -z "$target_repo" ] && continue
+            create_repo_if_missing "$target_repo"
+          done < "${WORKDIR}/image-table.psv"
+
+      - name: Apply EKS workload-account pull policy to the four image repositories
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EKS_PULL_PRINCIPAL="arn:aws:iam::${EKS_WORKLOAD_ACCOUNT_ID}:root"
+          POLICY_SID="AllowEksWorkloadAccountPullCloudwatchObservabilityImages"
+
+          apply_pull_policy() {
+            local repo="$1"
+            local existing_policy
+            existing_policy="$(aws ecr get-repository-policy \
+              --region "$AWS_REGION" \
+              --repository-name "$repo" \
+              --query policyText \
+              --output text 2>/dev/null || true)"
+
+            if [ -z "$existing_policy" ] || [ "$existing_policy" = "None" ]; then
+              existing_policy='{"Version":"2012-10-17","Statement":[]}'
+            fi
+
+            echo "$existing_policy" | jq \
+              --arg sid "$POLICY_SID" \
+              --arg principal "$EKS_PULL_PRINCIPAL" \
+              '
+              .Statement = ([.Statement[] | select(.Sid != $sid)]
+                + [{
+                    Sid: $sid,
+                    Effect: "Allow",
+                    Principal: { AWS: $principal },
+                    Action: [
+                      "ecr:BatchCheckLayerAvailability",
+                      "ecr:BatchGetImage",
+                      "ecr:GetDownloadUrlForLayer"
+                    ]
+                  }])
+              ' > "${WORKDIR}/repo-policy-${repo//\//-}.json"
+
+            aws ecr set-repository-policy \
+              --region "$AWS_REGION" \
+              --repository-name "$repo" \
+              --policy-text "file://${WORKDIR}/repo-policy-${repo//\//-}.json" >/dev/null
+            echo "OK: ${repo} allows pull from ${EKS_PULL_PRINCIPAL} (existing statements preserved)."
+          }
+
+          while IFS='|' read -r _source target_repo _tag; do
+            [ -z "$target_repo" ] && continue
+            apply_pull_policy "$target_repo"
+          done < "${WORKDIR}/image-table.psv"
+
+      - name: Apply Argo CD chart-read resource policy to the chart repository
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Resource (repository) policy only -- this is NOT the Phase 6B2
+          # identity-policy update to GoldenGateArgocdECRRead-dev itself;
+          # envs/dev/policies/argocd-ecr-oci-read-dev/ is untouched by this
+          # workflow. Same pattern already used for the goldengate-platform
+          # chart repository.
+          ARGOCD_SID="AllowArgocdEksRolePullAmazonCloudwatchObservabilityHelmChart"
+
+          EXISTING_POLICY="$(aws ecr get-repository-policy \
+            --region "$AWS_REGION" \
+            --repository-name "$CHART_ECR_REPOSITORY" \
+            --query policyText \
+            --output text 2>"${WORKDIR}/chart-repo-policy-error.txt")" || {
+              if grep -q "RepositoryPolicyNotFoundException" "${WORKDIR}/chart-repo-policy-error.txt"; then
+                echo "No existing repository policy found. Starting from an empty policy."
+                EXISTING_POLICY='{"Version":"2012-10-17","Statement":[]}'
+              else
+                echo "FAIL: could not read the existing chart repository policy:"
+                cat "${WORKDIR}/chart-repo-policy-error.txt"
+                exit 1
+              fi
+            }
+
+          echo "$EXISTING_POLICY" | jq \
+            --arg sid "$ARGOCD_SID" \
+            --arg roleArn "$ARGOCD_ECR_READ_ROLE_ARN" \
+            '
+            .Statement = ([.Statement[] | select(.Sid != $sid)]
+              + [{
+                  Sid: $sid,
+                  Effect: "Allow",
+                  Principal: { AWS: $roleArn },
+                  Action: [
+                    "ecr:BatchCheckLayerAvailability",
+                    "ecr:BatchGetImage",
+                    "ecr:GetDownloadUrlForLayer",
+                    "ecr:DescribeImages",
+                    "ecr:DescribeRepositories"
+                  ]
+                }])
+            ' > "${WORKDIR}/chart-repo-policy.json"
+
+          aws ecr set-repository-policy \
+            --region "$AWS_REGION" \
+            --repository-name "$CHART_ECR_REPOSITORY" \
+            --policy-text "file://${WORKDIR}/chart-repo-policy.json" >/dev/null
+
+          echo "OK: ${CHART_ECR_REPOSITORY} allows pull from ${ARGOCD_ECR_READ_ROLE_ARN} (existing statements preserved)."
+
+      - name: Log in to private ECR (skopeo and Helm)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | skopeo login --username AWS --password-stdin "$ECR_REGISTRY"
+
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | helm registry login --username AWS --password-stdin "$ECR_REGISTRY"
+
+      - name: Mirror each approved image with skopeo (idempotent, never overwrites a tag)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          raw_manifest_digest() {
+            # sha256 of the exact raw manifest (or manifest list) bytes
+            # served at this reference -- computed identically for source
+            # and destination so a match proves byte-for-byte equivalence
+            # of whatever `skopeo copy --all` preserved (the manifest list
+            # and every per-architecture manifest it points to).
+            sha256sum | awk '{print "sha256:" $1}'
+          }
+
+          while IFS='|' read -r source_ref target_repo target_tag; do
+            [ -z "$source_ref" ] && continue
+            dest_ref="${ECR_REGISTRY}/${target_repo}:${target_tag}"
+            echo "--- ${source_ref} -> ${dest_ref} ---"
+
+            if ! source_digest="$(skopeo inspect --raw "docker://${source_ref}" 2>"${WORKDIR}/skopeo-src-error.txt" | raw_manifest_digest)" || [ -z "$source_digest" ]; then
+              echo "FAIL: could not inspect source image ${source_ref}:"
+              cat "${WORKDIR}/skopeo-src-error.txt"
+              exit 1
+            fi
+            echo "Source raw manifest digest: ${source_digest}"
+
+            if dest_digest="$(skopeo inspect --raw "docker://${dest_ref}" 2>"${WORKDIR}/skopeo-dest-error.txt" | raw_manifest_digest)" && [ -n "$dest_digest" ]; then
+              echo "Target tag already exists. Target raw manifest digest: ${dest_digest}"
+              if [ "$source_digest" != "$dest_digest" ]; then
+                echo "FAIL: immutable target tag ${dest_ref} already exists with a DIFFERENT manifest digest than the source."
+                echo "Refusing to overwrite an existing tag. Source=${source_digest} Target=${dest_digest}"
+                exit 1
+              fi
+              echo "OK: ${dest_ref} already mirrored and matches the source digest exactly. Skipping copy."
+            else
+              if grep -qiE "manifest unknown|name unknown|not found|NAME_UNKNOWN|MANIFEST_UNKNOWN" "${WORKDIR}/skopeo-dest-error.txt"; then
+                echo "Target tag absent. Copying (skopeo copy --all preserves the manifest list and every architecture)..."
+                skopeo copy --all "docker://${source_ref}" "docker://${dest_ref}"
+                echo "OK: copied ${source_ref} -> ${dest_ref}"
+              else
+                echo "FAIL: could not inspect destination ${dest_ref} for a reason other than 'tag absent':"
+                cat "${WORKDIR}/skopeo-dest-error.txt"
+                exit 1
+              fi
+            fi
+
+            echo "${target_repo}|${target_tag}|${source_digest}" >> "${WORKDIR}/mirrored-images.psv"
+          done < "${WORKDIR}/image-table.psv"
+
+      - name: Push the unmodified upstream Helm chart package (idempotent, never overwrites)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CHART_OCI_REF="oci://${ECR_REGISTRY}/${HELM_OCI_NAMESPACE}/${CHART_NAME}"
+
+          if helm pull "$CHART_OCI_REF" \
+              --version "$CHART_VERSION" \
+              --destination "${WORKDIR}/existing-chart" 2>"${WORKDIR}/helm-pull-error.txt"; then
+            EXISTING_TGZ="${WORKDIR}/existing-chart/${CHART_NAME}-${CHART_VERSION}.tgz"
+            EXISTING_SHA="$(sha256sum "$EXISTING_TGZ" | awk '{print $1}')"
+            UPSTREAM_SHA="$(sha256sum "$CHART_TGZ" | awk '{print $1}')"
+            echo "Existing private chart checksum: ${EXISTING_SHA}"
+            echo "Upstream chart checksum:          ${UPSTREAM_SHA}"
+            if [ "$EXISTING_SHA" != "$UPSTREAM_SHA" ]; then
+              echo "FAIL: private chart ${CHART_ECR_REPOSITORY}:${CHART_VERSION} already exists and its content does NOT match the upstream package."
+              echo "Refusing to overwrite an existing chart version."
+              exit 1
+            fi
+            echo "OK: ${CHART_ECR_REPOSITORY}:${CHART_VERSION} already exists and matches the upstream package exactly. Skipping push."
+          else
+            if grep -qiE "not found|NAME_UNKNOWN|MANIFEST_UNKNOWN|manifest unknown" "${WORKDIR}/helm-pull-error.txt"; then
+              echo "Chart version absent from private ECR. Pushing the unmodified upstream package..."
+              helm push "$CHART_TGZ" "oci://${ECR_REGISTRY}/${HELM_OCI_NAMESPACE}"
+              echo "OK: pushed ${CHART_ECR_REPOSITORY}:${CHART_VERSION}"
+            else
+              echo "FAIL: could not check for an existing private chart version for a reason other than 'absent':"
+              cat "${WORKDIR}/helm-pull-error.txt"
+              exit 1
+            fi
+          fi
+
+      - name: Record final digests for the summary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CHART_DIGEST="$(aws ecr describe-images \
+            --region "$AWS_REGION" \
+            --repository-name "$CHART_ECR_REPOSITORY" \
+            --image-ids imageTag="$CHART_VERSION" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text)"
+          echo "CHART_DIGEST=${CHART_DIGEST}" >> "$GITHUB_ENV"
+
+          : > "${WORKDIR}/image-digests.psv"
+          while IFS='|' read -r _source target_repo target_tag; do
+            [ -z "$target_repo" ] && continue
+            digest="$(aws ecr describe-images \
+              --region "$AWS_REGION" \
+              --repository-name "$target_repo" \
+              --image-ids imageTag="$target_tag" \
+              --query 'imageDetails[0].imageDigest' \
+              --output text)"
+            echo "${target_repo}|${target_tag}|${digest}" >> "${WORKDIR}/image-digests.psv"
+          done < "${WORKDIR}/image-table.psv"
+
+          echo "Recorded digests:"
+          cat "${WORKDIR}/image-digests.psv"
+
+      - name: Workflow summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## CloudWatch Observability artifact sync summary (Phase 6B1)"
+            echo ""
+            echo "**Phase 6B1 only** -- private supply-chain mirroring and verification."
+            echo ""
+            echo "- No EKS deployment performed."
+            echo "- No IAM Terraform changes performed (the Phase 6B2 identity-policy"
+            echo "  update to \`GoldenGateArgocdECRRead-dev\` is a separate, later phase)."
+            echo "- No Argo CD Application created."
+            echo "- Chart version mirrored: \`${CHART_NAME}:${CHART_VERSION}\`."
+            echo "- Four images mirrored and verified against the live \`helm template\`"
+            echo "  render (metrics-only validation values -- containerLogs, containerInsights,"
+            echo "  and applicationSignals all disabled)."
+            echo "- The Fluent Bit image is intentionally excluded (gg-fluent-bit remains the"
+            echo "  sole GoldenGate runtime/monitor log collector)."
+            echo "- Application Signals images are intentionally excluded (disabled in this render)."
+            echo "- GPU (dcgm-exporter) and Neuron (neuron-monitor) images are intentionally excluded."
+            echo ""
+            echo "### Chart"
+            echo ""
+            echo "| Repository | Tag | Digest |"
+            echo "|---|---|---|"
+            echo "| \`${CHART_ECR_REPOSITORY}\` | \`${CHART_VERSION}\` | \`${CHART_DIGEST:-unknown}\` |"
+            echo ""
+            echo "### Images"
+            echo ""
+            echo "| Target repository | Tag | Digest | Private reference |"
+            echo "|---|---|---|---|"
+            if [ -f "${WORKDIR}/image-digests.psv" ]; then
+              while IFS='|' read -r repo tag digest; do
+                [ -z "$repo" ] && continue
+                echo "| \`${repo}\` | \`${tag}\` | \`${digest}\` | \`${ECR_REGISTRY}/${repo}:${tag}\` |"
+              done < "${WORKDIR}/image-digests.psv"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
