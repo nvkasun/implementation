@@ -126,3 +126,52 @@ module "goldengate_platform_logging_role_dev" {
   data_classification  = "General"
   env                  = "dev"
 }
+
+
+# Phase 6B2A: dedicated IRSA role for the future amazon-cloudwatch-observability
+# CloudWatch Agent / OTel Container Insights collectors (the Kubernetes
+# ServiceAccount, namespace, operator, and Argo CD Application that will
+# assume this role are NOT created in this phase -- IAM/Terraform
+# prerequisites only). Trust: exactly
+# system:serviceaccount:amazon-cloudwatch:cloudwatch-agent -- see
+# envs/dev/policies/goldengate-cloudwatch-metrics-dev/assume_role_policy/sts.json.
+#
+# This role publishes EKS cluster/node/pod/container resource metrics
+# (cloudwatch:PutMetricData, namespace=ContainerInsights) and writes
+# Container Insights performance events to the single pre-created
+# /aws/containerinsights/gg-poc-dev/performance log group (see
+# envs/dev/cloudwatch_observability.tf) -- it is never granted
+# logs:CreateLogGroup or logs:PutRetentionPolicy. Application Signals and
+# X-Ray are out of scope for this role and are not granted here.
+#
+# Deliberately its own role, never shared with or reused by:
+#   - gg-fluent-bit (GoldenGatePlatformLoggingRole-dev owns GoldenGate
+#     runtime/monitor stdout/stderr log delivery; that ownership is
+#     unchanged by this role);
+#   - gg-monitor (GoldenGateMonitorReadRole-dev);
+#   - GoldenGate runtime pods (GoldenGateSecretsReadRole-dev);
+#   - Argo CD (GoldenGateArgocdECRRead-dev);
+#   - kube-state-metrics, node-exporter, or the CloudWatch Agent operator
+#     itself (those workloads do not call AWS APIs and so do not assume
+#     any IRSA role);
+#   - GitHub Actions (GoldenGateEKSDeployRole-dev).
+# Ordinary GoldenGate/gg-monitor application container stdout/stderr logs
+# remain owned exclusively by gg-fluent-bit; this role never writes to the
+# /adcb/goldengate/dev/* log groups.
+module "goldengate_cloudwatch_metrics_role_dev" {
+  source = "git::https://github.com/AbuDhabiCommercialBank/aws-tf-module-iam-role.git?ref=v2.0.0"
+
+  name          = "GoldenGateCloudWatchMetricsRole-dev"
+  description   = "IRSA role for the CloudWatch Agent / OTel Container Insights collectors: publish EKS cluster/node/pod/container metrics and write Container Insights performance events to the pre-created log group"
+  policy_folder = "goldengate-cloudwatch-metrics-dev"
+
+  managed_policy_arns = []
+
+  map_migrated         = "comm5TZY31HX9S"
+  business_criticality = "Low"
+  application_name     = "CloudFactory"
+  cost_center          = "219"
+  business_unit        = "TechnologyPlatform"
+  data_classification  = "General"
+  env                  = "dev"
+}

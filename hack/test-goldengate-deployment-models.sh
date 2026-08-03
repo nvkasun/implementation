@@ -519,6 +519,229 @@ PYEOF
     fail "${CLOUDWATCH_LOGS_TF} not found"
   fi
 
+  # ---------------------------------------------------------------------
+  # Phase 6B2A: GoldenGateCloudWatchMetricsRole-dev IAM/Terraform
+  # prerequisites (IAM only -- no Kubernetes/Argo CD resource of any kind
+  # is created in this phase, so there is nothing Kubernetes-shaped to
+  # assert here).
+  # ---------------------------------------------------------------------
+  IAM_TF="${REPO_ROOT}/envs/dev/iam.tf"
+  if [ -f "$IAM_TF" ]; then
+    if grep -q 'module "goldengate_cloudwatch_metrics_role_dev"' "$IAM_TF"; then
+      pass "envs/dev/iam.tf contains module goldengate_cloudwatch_metrics_role_dev"
+    else
+      fail "envs/dev/iam.tf is missing module goldengate_cloudwatch_metrics_role_dev"
+    fi
+
+    # Extract just this module's block (from its opening line to the next
+    # top-level '}' at column 0) so the name/policy_folder/managed_policy_arns
+    # checks below cannot accidentally match a different module.
+    CLOUDWATCH_METRICS_MODULE_BLOCK="$(awk '/^module "goldengate_cloudwatch_metrics_role_dev" \{/{f=1} f{print} f && /^}$/{exit}' "$IAM_TF")"
+    if echo "$CLOUDWATCH_METRICS_MODULE_BLOCK" | grep -q '"GoldenGateCloudWatchMetricsRole-dev"' \
+        && echo "$CLOUDWATCH_METRICS_MODULE_BLOCK" | grep -q 'policy_folder = "goldengate-cloudwatch-metrics-dev"' \
+        && echo "$CLOUDWATCH_METRICS_MODULE_BLOCK" | grep -q 'managed_policy_arns = \[\]'; then
+      pass "goldengate_cloudwatch_metrics_role_dev uses name=GoldenGateCloudWatchMetricsRole-dev, policy_folder=goldengate-cloudwatch-metrics-dev, managed_policy_arns=[]"
+    else
+      fail "goldengate_cloudwatch_metrics_role_dev module block does not contain the expected name/policy_folder/managed_policy_arns"
+    fi
+
+    # No direct aws_iam_* resource anywhere in this file -- every role in
+    # this environment (including the new one) must go through the
+    # existing ADCB Terraform module pattern, never a raw resource block.
+    if grep -qE '^\s*resource\s+"aws_iam_(role|policy|role_policy|role_policy_attachment)"' "$IAM_TF"; then
+      fail "envs/dev/iam.tf contains a direct aws_iam_* resource -- all roles must be created through the existing IAM module pattern"
+    else
+      pass "envs/dev/iam.tf contains no direct aws_iam_role/aws_iam_policy/aws_iam_role_policy/aws_iam_role_policy_attachment resource"
+    fi
+  else
+    fail "${IAM_TF} not found"
+  fi
+
+  CW_METRICS_TRUST_FILE="${REPO_ROOT}/envs/dev/policies/goldengate-cloudwatch-metrics-dev/assume_role_policy/sts.json"
+  CW_METRICS_POLICY_FILE="${REPO_ROOT}/envs/dev/policies/goldengate-cloudwatch-metrics-dev/policies/policies_1.json"
+
+  if [ -f "$CW_METRICS_TRUST_FILE" ] && command -v python3 >/dev/null 2>&1; then
+    CW_TRUST_CHECK="$(python3 - "$CW_METRICS_TRUST_FILE" <<'PYEOF'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+stmts = doc.get("Statement")
+if not isinstance(stmts, list) or len(stmts) != 1:
+    print("MISMATCH:not-exactly-one-statement")
+    raise SystemExit
+s = stmts[0]
+principal = s.get("Principal", {})
+federated = principal.get("Federated", "")
+if "arn:aws:iam::668311715351:oidc-provider/oidc.eks.eu-west-1.amazonaws.com/id/407C4385FF87947926730569F1E564FB" != federated:
+    print(f"MISMATCH:federated={federated}")
+    raise SystemExit
+if s.get("Action") != "sts:AssumeRoleWithWebIdentity":
+    print(f"MISMATCH:action={s.get('Action')}")
+    raise SystemExit
+cond = s.get("Condition", {}).get("StringEquals", {})
+aud_key = next((k for k in cond if k.endswith(":aud")), None)
+sub_key = next((k for k in cond if k.endswith(":sub")), None)
+if cond.get(aud_key) != "sts.amazonaws.com":
+    print(f"MISMATCH:aud={cond.get(aud_key)}")
+    raise SystemExit
+if cond.get(sub_key) != "system:serviceaccount:amazon-cloudwatch:cloudwatch-agent":
+    print(f"MISMATCH:sub={cond.get(sub_key)}")
+    raise SystemExit
+if "*" in json.dumps(doc):
+    print("MISMATCH:wildcard-present")
+    raise SystemExit
+print("OK")
+PYEOF
+)"
+    if [ "$CW_TRUST_CHECK" = "OK" ]; then
+      pass "goldengate-cloudwatch-metrics-dev trust policy uses the approved OIDC provider, aud=sts.amazonaws.com, sub=system:serviceaccount:amazon-cloudwatch:cloudwatch-agent, and contains no wildcard"
+    else
+      fail "goldengate-cloudwatch-metrics-dev trust policy check failed: ${CW_TRUST_CHECK}"
+    fi
+  else
+    fail "${CW_METRICS_TRUST_FILE} not found, or python3 unavailable"
+  fi
+
+  if [ -f "$CW_METRICS_POLICY_FILE" ] && command -v python3 >/dev/null 2>&1; then
+    CW_POLICY_CHECK="$(python3 - "$CW_METRICS_POLICY_FILE" <<'PYEOF'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+stmts = doc["Statement"]
+
+actions = set()
+for s in stmts:
+    a = s["Action"]
+    actions.update([a] if isinstance(a, str) else a)
+
+expected = {
+    "cloudwatch:PutMetricData",
+    "logs:CreateLogStream", "logs:DescribeLogStreams", "logs:PutLogEvents",
+    "logs:DescribeLogGroups",
+    "ec2:DescribeTags", "ec2:DescribeVolumes",
+}
+if actions != expected:
+    print(f"MISMATCH:actions={sorted(actions)}")
+    raise SystemExit
+
+put_metric_stmt = next(s for s in stmts if "cloudwatch:PutMetricData" in
+                        ([s["Action"]] if isinstance(s["Action"], str) else s["Action"]))
+ns_cond = put_metric_stmt.get("Condition", {}).get("StringEquals", {}).get("cloudwatch:namespace")
+if ns_cond != "ContainerInsights":
+    print(f"MISMATCH:namespace-condition={ns_cond}")
+    raise SystemExit
+
+logs_write_stmt = next(s for s in stmts if "logs:PutLogEvents" in
+                        ([s["Action"]] if isinstance(s["Action"], str) else s["Action"]))
+resource = logs_write_stmt["Resource"]
+resources = [resource] if isinstance(resource, str) else resource
+expected_arn = "arn:aws:logs:eu-west-1:668311715351:log-group:/aws/containerinsights/gg-poc-dev/performance:*"
+if resources != [expected_arn]:
+    print(f"MISMATCH:logs-resource={resources}")
+    raise SystemExit
+
+doc_str = json.dumps(doc)
+forbidden = ["CreateLogGroup", "PutRetentionPolicy", "DeleteLogGroup", "DeleteLogStream",
+             "DeleteRetentionPolicy", "xray:", "application-signals", "secretsmanager:",
+             "dynamodb:", "ecr:", "eks:", "kms:", "s3:", "sts:AssumeRole", "iam:",
+             "autoscaling:", '"Action": "*"', "logs:*", "cloudwatch:*"]
+for f in forbidden:
+    if f in doc_str:
+        print(f"MISMATCH:forbidden-found={f}")
+        raise SystemExit
+
+print("OK")
+PYEOF
+)"
+    if [ "$CW_POLICY_CHECK" = "OK" ]; then
+      pass "goldengate-cloudwatch-metrics-dev permissions policy grants exactly PutMetricData(ContainerInsights)/log-write(performance group only)/DescribeLogGroups/ec2:DescribeTags+DescribeVolumes, with no forbidden action"
+    else
+      fail "goldengate-cloudwatch-metrics-dev permissions policy check failed: ${CW_POLICY_CHECK}"
+    fi
+  else
+    fail "${CW_METRICS_POLICY_FILE} not found, or python3 unavailable"
+  fi
+
+  CLOUDWATCH_OBSERVABILITY_TF="${REPO_ROOT}/envs/dev/cloudwatch_observability.tf"
+  if [ -f "$CLOUDWATCH_OBSERVABILITY_TF" ]; then
+    if grep -q '"/aws/containerinsights/gg-poc-dev/performance"' "$CLOUDWATCH_OBSERVABILITY_TF" \
+        && grep -q 'default\s*=\s*30' "$CLOUDWATCH_OBSERVABILITY_TF" \
+        && grep -q 'goldengate_container_insights_retention_days' "$CLOUDWATCH_OBSERVABILITY_TF"; then
+      pass "envs/dev/cloudwatch_observability.tf defines /aws/containerinsights/gg-poc-dev/performance with a 30-day default retention variable"
+    else
+      fail "envs/dev/cloudwatch_observability.tf does not define the expected performance log group and/or 30-day default retention"
+    fi
+    if grep -qE '"/aws/containerinsights/gg-poc-dev/(application|dataplane|host)"' "$CLOUDWATCH_OBSERVABILITY_TF"; then
+      fail "envs/dev/cloudwatch_observability.tf unexpectedly defines an application/dataplane/host Container Insights log group"
+    else
+      pass "envs/dev/cloudwatch_observability.tf defines no application/dataplane/host Container Insights log group"
+    fi
+  else
+    fail "${CLOUDWATCH_OBSERVABILITY_TF} not found"
+  fi
+
+  ARGOCD_ECR_POLICY_FILE="${REPO_ROOT}/envs/dev/policies/argocd-ecr-oci-read-dev/policies/policies_1.json"
+  if [ -f "$ARGOCD_ECR_POLICY_FILE" ] && command -v python3 >/dev/null 2>&1; then
+    ARGOCD_ECR_CHECK="$(python3 - "$ARGOCD_ECR_POLICY_FILE" <<'PYEOF'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+stmts = doc["Statement"]
+
+expected_arn = "arn:aws:ecr:eu-west-1:229410149234:repository/helm/amazon-cloudwatch-observability"
+matching = [s for s in stmts if s.get("Resource") == expected_arn]
+if len(matching) != 1:
+    print(f"MISMATCH:found={len(matching)}-statements-for-expected-arn")
+    raise SystemExit
+
+# Preservation check: every pre-existing repository ARN this policy already
+# granted (goldengate, goldengate-monitor, goldengate-platform, gg-monitor)
+# must still be present unchanged.
+preexisting_arns = {
+    "arn:aws:ecr:eu-west-1:229410149234:repository/helm/goldengate",
+    "arn:aws:ecr:eu-west-1:229410149234:repository/helm/goldengate-monitor",
+    "arn:aws:ecr:eu-west-1:229410149234:repository/helm/goldengate-platform",
+    "arn:aws:ecr:eu-west-1:229410149234:repository/helm/gg-monitor",
+}
+present_arns = {s.get("Resource") for s in stmts}
+missing = preexisting_arns - present_arns
+if missing:
+    print(f"MISMATCH:missing-preexisting-arns={sorted(missing)}")
+    raise SystemExit
+
+# ecr:GetAuthorizationToken statement (Resource "*") must be preserved
+# unchanged.
+auth_token_stmts = [s for s in stmts if s.get("Resource") == "*"
+                     and "ecr:GetAuthorizationToken" in
+                     ([s["Action"]] if isinstance(s["Action"], str) else s["Action"])]
+if len(auth_token_stmts) != 1:
+    print("MISMATCH:ecr-GetAuthorizationToken-statement-missing-or-changed")
+    raise SystemExit
+
+print("OK")
+PYEOF
+)"
+    if [ "$ARGOCD_ECR_CHECK" = "OK" ]; then
+      pass "argocd-ecr-oci-read-dev policy grants the exact amazon-cloudwatch-observability chart repository ARN while preserving every pre-existing statement (including ecr:GetAuthorizationToken)"
+    else
+      fail "argocd-ecr-oci-read-dev policy check failed: ${ARGOCD_ECR_CHECK}"
+    fi
+  else
+    fail "${ARGOCD_ECR_POLICY_FILE} not found, or python3 unavailable"
+  fi
+
+  # Regression proof: the existing Fluent Bit log-group ARNs and policy
+  # files are unchanged by this phase -- Phase 6B2A only adds a new role
+  # and a new log group, it never touches GoldenGatePlatformLoggingRole-dev
+  # or the /adcb/goldengate/dev/* groups.
+  FLUENT_BIT_TRUST_FILE="${REPO_ROOT}/envs/dev/policies/goldengate-platform-logging-dev/assume_role_policy/sts.json"
+  if [ -f "$FLUENT_BIT_TRUST_FILE" ] \
+      && grep -q '"system:serviceaccount:goldengate-dev:gg-fluent-bit"' "$FLUENT_BIT_TRUST_FILE" \
+      && [ -f "$LOGGING_POLICY_FILE" ] \
+      && grep -q '"arn:aws:logs:eu-west-1:668311715351:log-group:/adcb/goldengate/dev/runtime:\*"' "$LOGGING_POLICY_FILE" \
+      && grep -q '"arn:aws:logs:eu-west-1:668311715351:log-group:/adcb/goldengate/dev/monitor:\*"' "$LOGGING_POLICY_FILE"; then
+    pass "existing gg-fluent-bit trust subject and GoldenGatePlatformLoggingRole-dev log-group ARNs remain exactly as before"
+  else
+    fail "gg-fluent-bit trust subject or GoldenGatePlatformLoggingRole-dev log-group ARNs appear to have changed"
+  fi
+
   # Strict YAML parse of the platform workflow (must still parse cleanly
   # after the Phase 6A Fluent Bit role-ARN/region plumbing was added), plus
   # a forbidden-mutation-command scan limited to the new/changed lines --
@@ -3886,24 +4109,33 @@ if command -v git >/dev/null 2>&1 && git -C "$REPO_ROOT" rev-parse --is-inside-w
   fi
 
   # 18: IAM is unchanged, except for the specific, already-reviewed
-  # additions from prior phases and Phase 6A:
+  # additions from prior phases, Phase 6A, and Phase 6B2A:
   #   - Phase 5B2B1 dual-account correction: exactly one statement each of
   #     dynamodb:Query (scoped to gg-eks-pipeline) and elasticfilesystem:
   #     Describe* added to the GoldenGateEKSDeployRole-dev policy.
   #   - Phase 6A: envs/dev/iam.tf gains the new, dedicated
   #     goldengate_platform_logging_role_dev module block (a NEW IAM role,
   #     never a change to an existing one).
+  #   - Phase 6B2A: envs/dev/iam.tf gains the new, dedicated
+  #     goldengate_cloudwatch_metrics_role_dev module block (another NEW IAM
+  #     role, never a change to an existing one), and
+  #     envs/dev/policies/argocd-ecr-oci-read-dev/policies/policies_1.json
+  #     gains exactly one new statement (the amazon-cloudwatch-observability
+  #     Helm OCI chart repository ARN) alongside its unchanged pre-existing
+  #     statements.
   # GoldenGateSecretsReadRole-dev and GoldenGateMonitorReadRole-dev must
-  # never be touched by either phase. New files under a brand-new policy
-  # folder (e.g. goldengate-platform-logging-dev/) are untracked, not a
-  # "diff" of an existing file, so they never appear here -- that is
-  # exactly the expected shape of adding a new role.
+  # never be touched by any of these phases. New files under a brand-new
+  # policy folder (e.g. goldengate-platform-logging-dev/,
+  # goldengate-cloudwatch-metrics-dev/) are untracked, not a "diff" of an
+  # existing file, so they never appear here -- that is exactly the
+  # expected shape of adding a new role.
   # --name-only does not fully honor --ignore-all-space in this git version
   # (it still lists files whose only diff is line-ending noise), so the
   # --stat form (which does honor it, confirmed empty for whitespace-only
   # files) is used and parsed for real changed paths instead.
   EXPECTED_MODIFIED_IAM_FILES="envs/dev/policies/goldengate-eks-deploy-dev/policies/policies_1.json
-envs/dev/iam.tf"
+envs/dev/iam.tf
+envs/dev/policies/argocd-ecr-oci-read-dev/policies/policies_1.json"
   IAM_DIFF_STAT="$(git -C "$REPO_ROOT" diff --stat=300 --ignore-all-space -- envs/dev/policies envs/dev/iam.tf 2>/dev/null || true)"
   IAM_DIFF_FILES="$(echo "$IAM_DIFF_STAT" | grep -oE '\S+\.(json|tf)' | sort -u || true)"
   UNEXPECTED_IAM_DIFF_FILES="$(comm -23 <(echo "$IAM_DIFF_FILES") <(echo "$EXPECTED_MODIFIED_IAM_FILES" | sort -u) 2>/dev/null || true)"
