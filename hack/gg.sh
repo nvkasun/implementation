@@ -1,75 +1,90 @@
-cat > check-container-insights.sh <<'SCRIPT'
-#!/usr/bin/env bash
-set -u
+NS="amazon-cloudwatch"
 
-section() {
-  echo
-  echo "============================================================"
-  echo "$1"
-  echo "============================================================"
-}
+echo "Cluster-scraper CR:"
+kubectl get amazoncloudwatchagent \
+  cloudwatch-agent-cluster-scraper \
+  -n "$NS" \
+  -o json |
+jq '{
+  name: .metadata.name,
+  generation: .metadata.generation,
+  mode: .spec.mode,
+  hostNetwork: .spec.hostNetwork
+}'
 
-section "1. AMAZON-CLOUDWATCH NAMESPACE"
+echo "Cluster-scraper Deployment:"
+kubectl get deployment \
+  cloudwatch-agent-cluster-scraper \
+  -n "$NS" \
+  -o json |
+jq '{
+  name: .metadata.name,
+  generation: .metadata.generation,
+  observedGeneration: .status.observedGeneration,
+  hostNetwork: .spec.template.spec.hostNetwork,
+  replicas: .status.replicas,
+  updatedReplicas: .status.updatedReplicas,
+  availableReplicas: .status.availableReplicas
+}'
 
-if kubectl get namespace amazon-cloudwatch >/dev/null 2>&1; then
-  echo "FOUND: namespace amazon-cloudwatch"
-  kubectl get namespace amazon-cloudwatch
-else
-  echo "ABSENT: namespace amazon-cloudwatch"
-fi
 
-section "2. CLOUDWATCH / OTEL PODS"
 
-kubectl get pods -A -o wide 2>/dev/null |
-grep -Ei \
-  'NAMESPACE|cloudwatch-agent|amazon-cloudwatch|cloudwatch-observability|aws-otel|adot|otel-collector' \
-  || echo "No CloudWatch Agent or OTel pods found"
+------------------------
 
-section "3. CLOUDWATCH / OTEL WORKLOADS"
+SELECTOR="$(
+  kubectl get deployment cloudwatch-agent-cluster-scraper \
+    -n "$NS" \
+    -o json |
+  jq -r '
+    .spec.selector.matchLabels
+    | to_entries
+    | map("\(.key)=\(.value)")
+    | join(",")
+  '
+)"
 
-kubectl get daemonsets,deployments,statefulsets -A -o wide 2>/dev/null |
-grep -Ei \
-  'NAMESPACE|cloudwatch-agent|amazon-cloudwatch|cloudwatch-observability|aws-otel|adot|otel-collector|gg-fluent-bit' \
-  || true
+kubectl get pods \
+  -n "$NS" \
+  -l "$SELECTOR" \
+  -o json |
+jq -r '
+  .items[]
+  | select(.metadata.deletionTimestamp == null)
+  | [
+      .metadata.name,
+      .spec.nodeName,
+      (.spec.hostNetwork // false),
+      .status.hostIP,
+      .status.podIP,
+      .status.phase
+    ]
+  | @tsv
+'
 
-section "4. CLOUDWATCH OBSERVABILITY CUSTOM RESOURCES"
+------------------------
 
-echo "--- Matching API resources ---"
+NODE="ip-10-238-84-118.eu-west-1.compute.internal"
 
-kubectl api-resources 2>/dev/null |
-grep -Ei \
-  'amazoncloudwatchagent|cloudwatchagent|instrumentation|opentelemetry' \
-  || echo "No matching CloudWatch/OTel API resources found"
+kubectl get pods -A \
+  --field-selector "spec.nodeName=${NODE}" \
+  -o json |
+jq -r '
+  .items[]
+  | select(.metadata.deletionTimestamp == null)
+  | select((.spec.hostNetwork // false) == true)
+  | [
+      .metadata.namespace,
+      .metadata.name,
+      (.metadata.ownerReferences[0].kind // "-"),
+      (.metadata.ownerReferences[0].name // "-"),
+      (
+        .spec.containers
+        | map(.name + "=" + .image)
+        | join(",")
+      )
+    ]
+  | @tsv
+'
 
-echo
-echo "--- AmazonCloudWatchAgent resources ---"
-
-kubectl get amazoncloudwatchagent -A -o wide 2>/dev/null \
-  || echo "No AmazonCloudWatchAgent resource or API is available"
-
-section "5. CLOUDWATCH / OTEL CRDS"
-
-kubectl get crd 2>/dev/null |
-grep -Ei \
-  'amazoncloudwatchagent|cloudwatch|opentelemetry|instrumentation' \
-  || echo "No CloudWatch/OTel CRDs found"
-
-section "6. SERVICEACCOUNTS"
-
-kubectl get serviceaccounts -A 2>/dev/null |
-grep -Ei \
-  'NAMESPACE|cloudwatch-agent|amazon-cloudwatch|observability|otel|adot' \
-  || echo "No CloudWatch Agent or OTel ServiceAccount found"
-
-section "7. EXISTING FLUENT BIT OWNERSHIP"
-
-kubectl get daemonset gg-fluent-bit \
-  -n goldengate-dev \
-  -o custom-columns='NAME:.metadata.name,DESIRED:.status.desiredNumberScheduled,READY:.status.numberReady,IMAGE:.spec.template.spec.containers[0].image'
-
-echo
-echo "Container Insights ownership check completed."
-SCRIPT
-
-chmod +x check-container-insights.sh
-./check-container-insights.sh
+---------------------------
+sudo ss -ltnp '( sport = :8888 )'
