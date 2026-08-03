@@ -1103,9 +1103,16 @@ else:
         results.append("live-image-check-missing-containers")
 
     # --- Correction 6: every AmazonCloudWatchAgent CR checked for filelog
-    if "amazoncloudwatchagents.cloudwatch.aws.amazon.com -n \"$TARGET_NAMESPACE\"" not in run_text:
+    # (scoped to the filelog section only -- section "14." legitimately
+    # looks up the specific named cloudwatch-agent/cluster-scraper CRs for
+    # the unrelated Phase 6B2B host-network isolation check added later in
+    # this same step, so the hardcoded-single-CR-name regression check
+    # below must not fire on that different, intentional lookup).
+    filelog_section_match = re.search(r'13\. No deployed AmazonCloudWatchAgent.*?(?=14\. CloudWatch Agent host-network isolation|\Z)', run_text, re.S)
+    filelog_section = filelog_section_match.group(0) if filelog_section_match else run_text
+    if "amazoncloudwatchagents.cloudwatch.aws.amazon.com -n \"$TARGET_NAMESPACE\"" not in filelog_section:
         results.append("filelog-check-not-listing-all-crs")
-    if re.search(r'amazoncloudwatchagents\.cloudwatch\.aws\.amazon\.com\s+cloudwatch-agent\s+-n', run_text):
+    if re.search(r'amazoncloudwatchagents\.cloudwatch\.aws\.amazon\.com\s+cloudwatch-agent\s+-n', filelog_section):
         results.append("filelog-check-still-hardcodes-single-cr-name")
 
 # --- Correction 7: IRSA env var NAME checks without printing values -------
@@ -1405,9 +1412,16 @@ else:
 # causes the false-positive-rollout-status problem is exactly what this
 # correction's own comments legitimately do; only actual code/config use is
 # forbidden.
+#
+# hostNetwork is deliberately NOT in this list: a later, separately
+# authorized Phase 6B2B host-network isolation correction legitimately
+# reads/validates spec.hostNetwork and spec.template.spec.hostNetwork
+# (read-only kubectl get/jsonpath checks, never a probe/resource/
+# toleration/updateStrategy/maxUnavailable change) -- see check 19/20
+# below, which validate that correction's actual scope precisely.
 forbidden_markers = [
     "maxUnavailable", "readinessProbe", "livenessProbe",
-    "resources:", "tolerations:", "hostNetwork",
+    "resources:", "tolerations:",
     "updateStrategy",
 ]
 code_lines = [ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
@@ -1427,8 +1441,223 @@ PYEOF
     else
       fail "18: goldengate-observability.yaml Phase 6B2B DaemonSet full-readiness/diagnostics correction check failed: ${DAEMONSET_READINESS_CHECK}"
     fi
+
+    # -------------------------------------------------------------------
+    # Phase 6B2B host-network isolation correction (focused, static/
+    # offline only) -- workflow-side checks: semantic validation, rendered
+    # CR validation, live hostNetwork validation, and the exact crash-
+    # symptom log check.
+    # -------------------------------------------------------------------
+    HOSTNETWORK_WORKFLOW_CHECK="$(python3 - "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" <<'PYEOF'
+import sys
+import yaml
+
+path = sys.argv[1]
+with open(path) as f:
+    text = f.read()
+    doc = yaml.safe_load(text)
+
+results = []
+
+job = doc["jobs"]["validate_and_deploy"]
+steps = job["steps"]
+
+def get_step(name):
+    return next((s for s in steps if s.get("name") == name), None)
+
+# 6: the semantic-values-validation step validates both agents.
+semantic_step = get_step("Semantically validate the generated deployment values")
+if semantic_step is None:
+    results.append("missing-semantic-validation-step")
+else:
+    run_text = semantic_step.get("run", "")
+    for marker in (
+        'v.get("agents")',
+        "len(agents) != 2",
+        'expected_names = {"cloudwatch-agent", "cloudwatch-agent-cluster-scraper"}',
+        'expect(cw_agent.get("mode"), "daemonset"',
+        'cw_agent.get("hostNetwork") is not True',
+        'expect(scraper_agent.get("mode"), "deployment"',
+        'expect(scraper_agent.get("config"), "default"',
+        'scraper_agent.get("hostNetwork") is not False',
+    ):
+        if marker not in run_text:
+            results.append(f"semantic-validation-missing:{marker}")
+
+# 7: a step validates the two rendered AmazonCloudWatchAgent resources.
+render_step = get_step("Validate rendered CloudWatch Agent host-network isolation")
+if render_step is None:
+    results.append("missing-rendered-cr-hostnetwork-step")
+else:
+    run_text = render_step.get("run", "")
+    for marker in (
+        'find_one("AmazonCloudWatchAgent", "cloudwatch-agent")',
+        'find_one("AmazonCloudWatchAgent", "cloudwatch-agent-cluster-scraper")',
+        "cw_mode != \"daemonset\"",
+        "cw_host_network is not True",
+        "scraper_mode != \"deployment\"",
+        "scraper_host_network is not False",
+    ):
+        if marker not in run_text:
+            results.append(f"rendered-cr-check-missing:{marker}")
+
+# 8: live validation checks both custom-resource and workload hostNetwork.
+live_step = get_step("Live Kubernetes validation")
+if live_step is None:
+    results.append("missing-live-validation-step")
+else:
+    run_text = live_step.get("run", "")
+    for marker in (
+        "amazoncloudwatchagents.cloudwatch.aws.amazon.com cloudwatch-agent -n",
+        "amazoncloudwatchagents.cloudwatch.aws.amazon.com cloudwatch-agent-cluster-scraper -n",
+        '"$CW_AGENT_CR_HOSTNET" != "true"',
+        '"$SCRAPER_CR_HOSTNET" != "false"',
+        "kubectl get daemonset cloudwatch-agent -n \"$TARGET_NAMESPACE\" -o jsonpath='{.spec.template.spec.hostNetwork}'",
+        "kubectl get deployment cloudwatch-agent-cluster-scraper -n \"$TARGET_NAMESPACE\" -o jsonpath='{.spec.template.spec.hostNetwork}'",
+        '"$CW_DS_HOSTNET" != "true"',
+        '"$SCRAPER_DEPLOY_HOSTNET" != "false"',
+    ):
+        if marker not in run_text:
+            results.append(f"live-hostnetwork-check-missing:{marker}")
+
+    # every node-agent pod and every active cluster-scraper pod checked,
+    # via a dynamically derived selector (no hardcoded chart labels).
+    if run_text.count("spec.selector.matchLabels") < 2:
+        results.append("live-validation-selector-not-dynamically-derived-for-both-workloads")
+    if '"$pod_hostnet" != "true"' not in run_text:
+        results.append("live-validation-missing-per-pod-node-agent-hostnetwork-check")
+    if '"$pod_hostnet" != "false"' not in run_text:
+        results.append("live-validation-missing-per-pod-scraper-hostnetwork-check")
+
+    # 9: the workflow detects the exact observed crash symptom.
+    if "bind: address already in use" not in run_text:
+        results.append("missing-exact-crash-pattern:bind-address-already-in-use")
+    if "binding address localhost:8888" not in run_text:
+        results.append("missing-exact-crash-pattern:binding-address-localhost-8888")
+    if "--tail=80" not in run_text:
+        results.append("crash-log-check-not-bounded")
+
+if results:
+    print("MISMATCH:" + ";".join(results))
+else:
+    print("OK")
+PYEOF
+)"
+    if [ "$HOSTNETWORK_WORKFLOW_CHECK" = "OK" ]; then
+      pass "19: goldengate-observability.yaml Phase 6B2B host-network isolation correction (workflow): semantic values validation requires exactly 2 named agents with cloudwatch-agent.mode=daemonset/hostNetwork=true and cloudwatch-agent-cluster-scraper.mode=deployment/config=default/hostNetwork=false; a dedicated step validates the two rendered AmazonCloudWatchAgent custom resources' spec.mode/spec.hostNetwork; Live Kubernetes validation checks both CR and DaemonSet/Deployment spec.template.spec.hostNetwork plus every individual node-agent and cluster-scraper pod via dynamically-derived selectors; and a bounded (--tail=80) log check detects the exact observed 'bind: address already in use' / 'binding address localhost:8888' crash symptom"
+    else
+      fail "19: goldengate-observability.yaml Phase 6B2B host-network isolation correction (workflow) check failed: ${HOSTNETWORK_WORKFLOW_CHECK}"
+    fi
   else
     fail "${OBSERVABILITY_WORKFLOW} not found, or python3 unavailable"
+  fi
+
+  # -------------------------------------------------------------------
+  # Phase 6B2B host-network isolation correction (focused, static/offline
+  # only) -- values.yaml-side checks.
+  # -------------------------------------------------------------------
+  if [ -f "${REPO_ROOT}/${OBSERVABILITY_VALUES_FILE}" ] && command -v python3 >/dev/null 2>&1; then
+    HOSTNETWORK_VALUES_CHECK="$(python3 - "${REPO_ROOT}/${OBSERVABILITY_VALUES_FILE}" <<'PYEOF'
+import sys
+import yaml
+
+path = sys.argv[1]
+
+class DupCheckLoader(yaml.SafeLoader):
+    pass
+
+def no_dup_construct_mapping(loader, node, deep=False):
+    mapping = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise ValueError(f"Duplicate key found: {key!r}")
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+DupCheckLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, no_dup_construct_mapping)
+
+with open(path) as f:
+    text = f.read()
+    v = yaml.load(text, Loader=DupCheckLoader)
+
+results = []
+
+# 1 & 4: agents is a top-level key (not nested under agent), exactly 2 entries.
+agents = v.get("agents")
+if not isinstance(agents, list):
+    results.append(f"agents-not-a-list:{type(agents).__name__}")
+elif len(agents) != 2:
+    results.append(f"agents-entry-count:{len(agents)}")
+
+agent_block = v.get("agent")
+if not isinstance(agent_block, dict) or "agents" in agent_block:
+    results.append("agents-nested-under-agent-or-agent-block-missing")
+
+if isinstance(agents, list):
+    by_name = {a.get("name"): a for a in agents}
+
+    # 2: cloudwatch-agent -- mode daemonset, hostNetwork true.
+    cw = by_name.get("cloudwatch-agent")
+    if cw is None:
+        results.append("cloudwatch-agent-entry-missing")
+    else:
+        if cw.get("mode") != "daemonset":
+            results.append(f"cloudwatch-agent-mode:{cw.get('mode')!r}")
+        if cw.get("hostNetwork") is not True:
+            results.append(f"cloudwatch-agent-hostNetwork:{cw.get('hostNetwork')!r}")
+
+    # 3: cluster-scraper -- mode deployment, config default, hostNetwork false.
+    scraper = by_name.get("cloudwatch-agent-cluster-scraper")
+    if scraper is None:
+        results.append("cluster-scraper-entry-missing")
+    else:
+        if scraper.get("mode") != "deployment":
+            results.append(f"cluster-scraper-mode:{scraper.get('mode')!r}")
+        if scraper.get("config") != "default":
+            results.append(f"cluster-scraper-config:{scraper.get('config')!r}")
+        if scraper.get("hostNetwork") is not False:
+            results.append(f"cluster-scraper-hostNetwork:{scraper.get('hostNetwork')!r}")
+
+# 5: existing top-level agent image/ServiceAccount/target-allocator/
+# private-ECR configuration remains present and unweakened.
+if isinstance(agent_block, dict):
+    if agent_block.get("serviceAccount", {}).get("name") != "cloudwatch-agent":
+        results.append("agent.serviceAccount.name-missing-or-changed")
+    img = agent_block.get("image", {})
+    if img.get("repository") != "aws-cloud-factory-cloudwatch-agent":
+        results.append("agent.image.repository-missing-or-changed")
+    if img.get("repositoryDomainMap", {}).get("public") != "229410149234.dkr.ecr.eu-west-1.amazonaws.com":
+        results.append("agent.image.repositoryDomainMap.public-missing-or-changed")
+    if agent_block.get("prometheus", {}).get("targetAllocator", {}).get("enabled") is not False:
+        results.append("agent.prometheus.targetAllocator.enabled-missing-or-changed")
+else:
+    results.append("agent-block-missing")
+
+# 10: no port override, hostPort, or anti-affinity workaround introduced.
+code_lines = [ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+code_text = "\n".join(code_lines)
+for marker in ("hostPort", "podAntiAffinity", "8889", "8887"):
+    if marker in code_text:
+        results.append(f"forbidden-marker-in-values:{marker}")
+# port 8888 itself must never be manually assigned a value in code (only
+# ever discussed in comments, which are excluded above).
+if "8888" in code_text:
+    results.append("port-8888-referenced-outside-comments")
+
+if results:
+    print("MISMATCH:" + ";".join(results))
+else:
+    print("OK")
+PYEOF
+)"
+    if [ "$HOSTNETWORK_VALUES_CHECK" = "OK" ]; then
+      pass "20: goldengate-observability values.yaml Phase 6B2B host-network isolation correction: top-level agents list (not nested under agent) contains exactly 2 entries -- cloudwatch-agent (mode=daemonset, hostNetwork=true) and cloudwatch-agent-cluster-scraper (mode=deployment, config=default, hostNetwork=false) -- while the existing agent.serviceAccount.name/agent.image/agent.prometheus.targetAllocator private-ECR configuration remains unchanged, and no hostPort/anti-affinity/manual-8888-port-value workaround was introduced"
+    else
+      fail "20: goldengate-observability values.yaml Phase 6B2B host-network isolation correction check failed: ${HOSTNETWORK_VALUES_CHECK}"
+    fi
+  else
+    fail "${OBSERVABILITY_VALUES_FILE} not found, or python3 unavailable"
   fi
 
   # 13: no wrapper chart was created for this phase.

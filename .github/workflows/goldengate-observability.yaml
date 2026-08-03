@@ -526,6 +526,45 @@ jobs:
           expect(v.get("agent", {}).get("prometheus", {}).get("targetAllocator", {}).get("enabled"), False, "agent.prometheus.targetAllocator.enabled")
           expect(v.get("agent", {}).get("serviceAccount", {}).get("name"), "cloudwatch-agent", "agent.serviceAccount.name")
 
+          # Phase 6B2B host-network isolation correction: the top-level
+          # `agents` list (never nested under `agent`) must contain exactly
+          # the two installations this chart is pinned to run, with the
+          # node-level DaemonSet keeping hostNetwork=true and the cluster
+          # scraper Deployment explicitly isolated with hostNetwork=false --
+          # this is the actual fix for the observed cloudwatch-agent
+          # CrashLoopBackOff ("bind: address already in use" on
+          # 127.0.0.1:8888). A weakened or missing override here would
+          # silently reintroduce the port collision.
+          agents = v.get("agents")
+          if not isinstance(agents, list):
+              sys.exit(f"FAIL: agents is {type(agents).__name__}, expected a list")
+          if len(agents) != 2:
+              sys.exit(f"FAIL: agents has {len(agents)} entries, expected exactly 2")
+          print(f"OK: agents is a list of exactly {len(agents)} entries.")
+
+          agent_names = [a.get("name") for a in agents]
+          if len(agent_names) != len(set(agent_names)):
+              sys.exit(f"FAIL: agents contains duplicate names: {agent_names}")
+          expected_names = {"cloudwatch-agent", "cloudwatch-agent-cluster-scraper"}
+          if set(agent_names) != expected_names:
+              sys.exit(f"FAIL: agents names are {sorted(agent_names)}, expected exactly {sorted(expected_names)} -- no other agent installation is permitted")
+          print(f"OK: agents names are exactly {sorted(expected_names)}, no duplicates.")
+
+          agents_by_name = {a.get("name"): a for a in agents}
+
+          cw_agent = agents_by_name["cloudwatch-agent"]
+          expect(cw_agent.get("mode"), "daemonset", "agents[cloudwatch-agent].mode")
+          if cw_agent.get("hostNetwork") is not True:
+              sys.exit(f"FAIL: agents[cloudwatch-agent].hostNetwork is {cw_agent.get('hostNetwork')!r}, expected literal true")
+          print("OK: agents[cloudwatch-agent].hostNetwork is literal true.")
+
+          scraper_agent = agents_by_name["cloudwatch-agent-cluster-scraper"]
+          expect(scraper_agent.get("mode"), "deployment", "agents[cloudwatch-agent-cluster-scraper].mode")
+          expect(scraper_agent.get("config"), "default", "agents[cloudwatch-agent-cluster-scraper].config")
+          if scraper_agent.get("hostNetwork") is not False:
+              sys.exit(f"FAIL: agents[cloudwatch-agent-cluster-scraper].hostNetwork is {scraper_agent.get('hostNetwork')!r}, expected literal false")
+          print("OK: agents[cloudwatch-agent-cluster-scraper].hostNetwork is literal false.")
+
           private_domain = "229410149234.dkr.ecr.eu-west-1.amazonaws.com"
           for top_key, image_key in [("manager", "image"), ("agent", "image"), ("kubeStateMetrics", "image"), ("nodeExporter", "image")]:
               block = v[top_key][image_key]
@@ -797,6 +836,60 @@ jobs:
           find_one("ServiceAccount", "amazon-cloudwatch-observability-controller-manager")
 
           print("OK: every expected chart-rendered resource name is present exactly once.")
+          PYEOF
+
+      - name: Validate rendered CloudWatch Agent host-network isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RENDERED="rendered/${RELEASE_NAME}.yaml"
+
+          # Phase 6B2B host-network isolation correction. This chart version
+          # only renders the two AmazonCloudWatchAgent custom resources --
+          # the actual DaemonSet/Deployment workloads (spec.template.spec.
+          # hostNetwork) are created dynamically at reconcile time by the
+          # cloudwatch-agent-operator controller, not by this Helm template
+          # render (confirmed: `helm template --include-crds` never
+          # produces a DaemonSet/Deployment named cloudwatch-agent or
+          # cloudwatch-agent-cluster-scraper -- only the two CRs that drive
+          # the operator to create them). This step therefore validates the
+          # only thing actually renderable offline: the two CRs' spec.mode
+          # and spec.hostNetwork. The corresponding live DaemonSet/
+          # Deployment hostNetwork values can only be confirmed once the
+          # operator has reconciled them -- see the deploy=true "Live
+          # Kubernetes validation" step below for that check.
+          python3 - "$RENDERED" <<'PYEOF'
+          import sys, yaml
+
+          with open(sys.argv[1]) as f:
+              docs = [d for d in yaml.safe_load_all(f) if d]
+
+          def find_one(kind, name):
+              matches = [d for d in docs if d.get("kind") == kind and (d.get("metadata") or {}).get("name") == name]
+              if len(matches) != 1:
+                  sys.exit(f"FAIL: expected exactly 1 {kind}/{name}, found {len(matches)}.")
+              return matches[0]
+
+          cw_agent_cr = find_one("AmazonCloudWatchAgent", "cloudwatch-agent")
+          cw_mode = cw_agent_cr.get("spec", {}).get("mode")
+          cw_host_network = cw_agent_cr.get("spec", {}).get("hostNetwork")
+          if cw_mode != "daemonset":
+              sys.exit(f"FAIL: AmazonCloudWatchAgent/cloudwatch-agent spec.mode is {cw_mode!r}, expected 'daemonset'.")
+          if cw_host_network is not True:
+              sys.exit(f"FAIL: AmazonCloudWatchAgent/cloudwatch-agent spec.hostNetwork is {cw_host_network!r}, expected literal true.")
+          print(f"OK: AmazonCloudWatchAgent/cloudwatch-agent mode={cw_mode} hostNetwork={cw_host_network}")
+
+          scraper_cr = find_one("AmazonCloudWatchAgent", "cloudwatch-agent-cluster-scraper")
+          scraper_mode = scraper_cr.get("spec", {}).get("mode")
+          scraper_host_network = scraper_cr.get("spec", {}).get("hostNetwork")
+          if scraper_mode != "deployment":
+              sys.exit(f"FAIL: AmazonCloudWatchAgent/cloudwatch-agent-cluster-scraper spec.mode is {scraper_mode!r}, expected 'deployment'.")
+          if scraper_host_network is not False:
+              sys.exit(f"FAIL: AmazonCloudWatchAgent/cloudwatch-agent-cluster-scraper spec.hostNetwork is {scraper_host_network!r}, expected literal false.")
+          print(f"OK: AmazonCloudWatchAgent/cloudwatch-agent-cluster-scraper mode={scraper_mode} hostNetwork={scraper_host_network}")
+
+          print("OK: rendered CloudWatch Agent custom resources have the expected host-network isolation (node-level agent=true, cluster scraper=false).")
           PYEOF
 
       - name: Upload rendered manifests
@@ -1655,6 +1748,110 @@ jobs:
             fi
             echo "OK: AmazonCloudWatchAgent/${cr_name} -- no filelog receiver."
           done <<< "$AGENT_CR_NAMES"
+
+          echo ""
+          echo "14. CloudWatch Agent host-network isolation (Phase 6B2B correction -- fixes the 127.0.0.1:8888 bind collision documented in platform/dev/goldengate-observability/values.yaml). Only resource name, mode, and hostNetwork are printed -- never a full spec:"
+
+          CW_AGENT_CR_JSON="$(kubectl get amazoncloudwatchagents.cloudwatch.aws.amazon.com cloudwatch-agent -n "$TARGET_NAMESPACE" -o json)"
+          CW_AGENT_CR_MODE="$(jq -r '.spec.mode // empty' <<<"$CW_AGENT_CR_JSON")"
+          CW_AGENT_CR_HOSTNET="$(jq -r '.spec.hostNetwork' <<<"$CW_AGENT_CR_JSON")"
+          echo "AmazonCloudWatchAgent/cloudwatch-agent: mode=${CW_AGENT_CR_MODE} hostNetwork=${CW_AGENT_CR_HOSTNET}"
+          if [ "$CW_AGENT_CR_HOSTNET" != "true" ]; then
+            echo "FAIL: AmazonCloudWatchAgent/cloudwatch-agent spec.hostNetwork is ${CW_AGENT_CR_HOSTNET}, expected true."
+            exit 1
+          fi
+
+          SCRAPER_CR_JSON="$(kubectl get amazoncloudwatchagents.cloudwatch.aws.amazon.com cloudwatch-agent-cluster-scraper -n "$TARGET_NAMESPACE" -o json)"
+          SCRAPER_CR_MODE="$(jq -r '.spec.mode // empty' <<<"$SCRAPER_CR_JSON")"
+          SCRAPER_CR_HOSTNET="$(jq -r '.spec.hostNetwork' <<<"$SCRAPER_CR_JSON")"
+          echo "AmazonCloudWatchAgent/cloudwatch-agent-cluster-scraper: mode=${SCRAPER_CR_MODE} hostNetwork=${SCRAPER_CR_HOSTNET}"
+          if [ "$SCRAPER_CR_HOSTNET" != "false" ]; then
+            echo "FAIL: AmazonCloudWatchAgent/cloudwatch-agent-cluster-scraper spec.hostNetwork is ${SCRAPER_CR_HOSTNET}, expected false."
+            exit 1
+          fi
+
+          CW_DS_HOSTNET="$(kubectl get daemonset cloudwatch-agent -n "$TARGET_NAMESPACE" -o jsonpath='{.spec.template.spec.hostNetwork}')"
+          echo "DaemonSet/cloudwatch-agent: mode=daemonset hostNetwork=${CW_DS_HOSTNET:-false}"
+          if [ "$CW_DS_HOSTNET" != "true" ]; then
+            echo "FAIL: DaemonSet/cloudwatch-agent spec.template.spec.hostNetwork is ${CW_DS_HOSTNET:-<absent>}, expected true."
+            exit 1
+          fi
+
+          SCRAPER_DEPLOY_HOSTNET="$(kubectl get deployment cloudwatch-agent-cluster-scraper -n "$TARGET_NAMESPACE" -o jsonpath='{.spec.template.spec.hostNetwork}')"
+          echo "Deployment/cloudwatch-agent-cluster-scraper: mode=deployment hostNetwork=${SCRAPER_DEPLOY_HOSTNET:-false}"
+          if [ -n "$SCRAPER_DEPLOY_HOSTNET" ] && [ "$SCRAPER_DEPLOY_HOSTNET" != "false" ]; then
+            echo "FAIL: Deployment/cloudwatch-agent-cluster-scraper spec.template.spec.hostNetwork is ${SCRAPER_DEPLOY_HOSTNET}, expected false (Kubernetes omits an explicit false, so an absent value is also acceptable)."
+            exit 1
+          fi
+
+          echo ""
+          echo "Every node-agent pod (selector dynamically derived from DaemonSet/cloudwatch-agent spec.selector.matchLabels, never hardcoded):"
+          CW_DS_JSON2="$(kubectl get daemonset cloudwatch-agent -n "$TARGET_NAMESPACE" -o json)"
+          CW_SELECTOR="$(jq -r '(.spec.selector.matchLabels // {}) | to_entries | map("\(.key)=\(.value)") | join(",")' <<<"$CW_DS_JSON2")"
+          if [ -z "$CW_SELECTOR" ] || [ "$CW_SELECTOR" = "null" ]; then
+            echo "FAIL: could not derive a pod selector for DaemonSet/cloudwatch-agent."
+            exit 1
+          fi
+          CW_PODS_JSON="$(kubectl get pods -n "$TARGET_NAMESPACE" -l "$CW_SELECTOR" -o json)"
+          CW_POD_COUNT="$(jq '.items | length' <<<"$CW_PODS_JSON")"
+          if [ "$CW_POD_COUNT" -eq 0 ]; then
+            echo "FAIL: no node-agent pods found for selector ${CW_SELECTOR}."
+            exit 1
+          fi
+          while IFS= read -r pod_name; do
+            [ -z "$pod_name" ] && continue
+            pod_hostnet="$(jq -r --arg n "$pod_name" '.items[] | select(.metadata.name==$n) | (.spec.hostNetwork // false)' <<<"$CW_PODS_JSON")"
+            echo "pod/${pod_name}: mode=daemonset hostNetwork=${pod_hostnet}"
+            if [ "$pod_hostnet" != "true" ]; then
+              echo "FAIL: node-agent pod ${pod_name} spec.hostNetwork is ${pod_hostnet}, expected true."
+              exit 1
+            fi
+          done < <(jq -r '.items[].metadata.name' <<<"$CW_PODS_JSON")
+          echo "OK: all ${CW_POD_COUNT} node-agent pods have hostNetwork=true."
+
+          echo ""
+          echo "Every active (Running) cluster-scraper pod (selector dynamically derived from Deployment/cloudwatch-agent-cluster-scraper spec.selector.matchLabels):"
+          SCRAPER_DEPLOY_JSON="$(kubectl get deployment cloudwatch-agent-cluster-scraper -n "$TARGET_NAMESPACE" -o json)"
+          SCRAPER_SELECTOR="$(jq -r '(.spec.selector.matchLabels // {}) | to_entries | map("\(.key)=\(.value)") | join(",")' <<<"$SCRAPER_DEPLOY_JSON")"
+          if [ -z "$SCRAPER_SELECTOR" ] || [ "$SCRAPER_SELECTOR" = "null" ]; then
+            echo "FAIL: could not derive a pod selector for Deployment/cloudwatch-agent-cluster-scraper."
+            exit 1
+          fi
+          SCRAPER_PODS_JSON="$(kubectl get pods -n "$TARGET_NAMESPACE" -l "$SCRAPER_SELECTOR" --field-selector=status.phase=Running -o json)"
+          SCRAPER_POD_COUNT="$(jq '.items | length' <<<"$SCRAPER_PODS_JSON")"
+          if [ "$SCRAPER_POD_COUNT" -eq 0 ]; then
+            echo "FAIL: no active (Running) cluster-scraper pods found for selector ${SCRAPER_SELECTOR}."
+            exit 1
+          fi
+          while IFS= read -r pod_name; do
+            [ -z "$pod_name" ] && continue
+            pod_hostnet="$(jq -r --arg n "$pod_name" '.items[] | select(.metadata.name==$n) | (.spec.hostNetwork // false)' <<<"$SCRAPER_PODS_JSON")"
+            echo "pod/${pod_name}: mode=deployment hostNetwork=${pod_hostnet}"
+            if [ "$pod_hostnet" != "false" ]; then
+              echo "FAIL: cluster-scraper pod ${pod_name} spec.hostNetwork is ${pod_hostnet}, expected false."
+              exit 1
+            fi
+          done < <(jq -r '.items[].metadata.name' <<<"$SCRAPER_PODS_JSON")
+          echo "OK: all ${SCRAPER_POD_COUNT} active cluster-scraper pods have hostNetwork=false."
+
+          echo ""
+          echo "15. Bounded log check (last 80 lines per pod) for the previously observed 127.0.0.1:8888 port-collision crash on every node-agent pod:"
+          CRASH_PATTERN='bind: address already in use|binding address localhost:8888'
+          CRASH_FOUND="false"
+          while IFS= read -r pod_name; do
+            [ -z "$pod_name" ] && continue
+            POD_LOG_TAIL="$(kubectl logs "$pod_name" -n "$TARGET_NAMESPACE" --tail=80 2>/dev/null || true)"
+            if echo "$POD_LOG_TAIL" | grep -qEi "$CRASH_PATTERN"; then
+              echo "FAIL: pod ${pod_name} log (last 80 lines) matches the previously observed host-network port-collision symptom:"
+              echo "$POD_LOG_TAIL" | grep -Ei "$CRASH_PATTERN"
+              CRASH_FOUND="true"
+            fi
+          done < <(jq -r '.items[].metadata.name' <<<"$CW_PODS_JSON")
+          if [ "$CRASH_FOUND" = "true" ]; then
+            echo "FAIL: at least one node-agent pod still shows the 127.0.0.1:8888 bind collision -- the host-network isolation fix did not take effect."
+            exit 1
+          fi
+          echo "OK: no node-agent pod log (last 80 lines each) shows the previously observed 127.0.0.1:8888 bind collision."
 
       - name: Check bounded recent logs for authorization and startup failures
         # Phase 6B2B DaemonSet full-readiness correction: this must still run

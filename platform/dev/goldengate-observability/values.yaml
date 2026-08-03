@@ -68,6 +68,52 @@ manager:
     repositoryDomainMap:
       public: 229410149234.dkr.ecr.eu-west-1.amazonaws.com
 
+# Phase 6B2B host-network isolation correction. Explicit, top-level
+# `agents` list (chart-supported: templates/linux/cloudwatch-agent-custom-
+# resource.yaml ranges over `.Values.agents`, merging each entry over a
+# deep copy of `.Values.agent` below via mergeOverwrite -- only fields set
+# here override the shared `agent:` defaults). This is a top-level value,
+# never nested under `agent:`, and the whole list must be repeated here in
+# full: Helm list values are replaced wholesale, not deep-merged, so the
+# upstream chart default list (which installs the same two agents but
+# leaves cluster-scraper's hostNetwork unset) would otherwise be silently
+# discarded were this list omitted, or replaced by an incomplete one.
+#
+# Root cause this fixes: the shared `agent:` block below defaults
+# hostNetwork to true. The upstream chart's own default `agents` list never
+# overrides hostNetwork for cloudwatch-agent-cluster-scraper, so that
+# Deployment inherits hostNetwork=true. When its pod lands on the same node
+# as the cloudwatch-agent DaemonSet pod, both processes share the node's
+# network namespace and race to bind the CloudWatch Agent/OTel internal
+# Prometheus telemetry endpoint at 127.0.0.1:8888 -- whichever binds first
+# wins, and the loser CrashLoopBackOffs with "bind: address already in
+# use" (the exact observed failure on ip-10-238-84-118, pod
+# cloudwatch-agent-2gfb8).
+#
+# Fix: give each of the two installations its own explicit hostNetwork.
+#   - cloudwatch-agent (mode: daemonset) keeps hostNetwork: true -- the
+#     per-node agent must run in the node's own network namespace to
+#     collect node-level network/interface metrics.
+#   - cloudwatch-agent-cluster-scraper (mode: deployment) does not collect
+#     per-node network metrics -- it scrapes the apiserver and
+#     kube-state-metrics over the normal cluster network -- so it does not
+#     need the host network namespace at all. hostNetwork: false gives it
+#     its own isolated pod network namespace, so its internal
+#     127.0.0.1:8888 telemetry listener can never collide with the
+#     DaemonSet pod's identical listener on the same node again.
+# This does not touch the 8888 port number itself, add a hostPort, add
+# anti-affinity, or change replica counts -- it only isolates the two
+# workloads' network namespaces from each other.
+agents:
+  - name: cloudwatch-agent
+    mode: daemonset
+    hostNetwork: true
+
+  - name: cloudwatch-agent-cluster-scraper
+    mode: deployment
+    config: "default"
+    hostNetwork: false
+
 agent:
   # Chart-supported field: names the ServiceAccount the CloudWatch Agent
   # custom resources reference (agent.serviceAccount.name, see
