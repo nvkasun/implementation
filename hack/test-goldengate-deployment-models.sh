@@ -29,6 +29,10 @@ PLATFORM_WORKFLOW=".github/workflows/goldengate-platform.yaml"
 DETECT_SCRIPT="hack/detect-goldengate-deployments.sh"
 INVENTORY_SCRIPT="hack/inventory-goldengate-legacy-resources.sh"
 INVENTORY_WORKFLOW=".github/workflows/goldengate-legacy-cleanup-inventory.yaml"
+OBSERVABILITY_VALUES_FILE="platform/dev/goldengate-observability/values.yaml"
+OBSERVABILITY_WORKFLOW=".github/workflows/goldengate-observability.yaml"
+ARGOCD_VALUES_FILE="envs/dev/argocd/values.yaml"
+ARGOCD_DEPLOY_WORKFLOW=".github/workflows/argocd-eks-deployment.yaml"
 
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT
@@ -740,6 +744,301 @@ PYEOF
     pass "existing gg-fluent-bit trust subject and GoldenGatePlatformLoggingRole-dev log-group ARNs remain exactly as before"
   else
     fail "gg-fluent-bit trust subject or GoldenGatePlatformLoggingRole-dev log-group ARNs appear to have changed"
+  fi
+
+  # ---------------------------------------------------------------------
+  # Phase 6B2B: private-image-only CloudWatch Observability GitOps source
+  # and deployment workflow. Static/offline only -- no AWS/Terraform/
+  # kubectl/Argo CD/Git/network call of any kind.
+  # ---------------------------------------------------------------------
+
+  # 1-9: the committed observability values file.
+  if [ -f "${REPO_ROOT}/${OBSERVABILITY_VALUES_FILE}" ] && command -v python3 >/dev/null 2>&1; then
+    pass "1: ${OBSERVABILITY_VALUES_FILE} exists"
+
+    OBSERVABILITY_VALUES_CHECK="$(python3 - "${REPO_ROOT}/${OBSERVABILITY_VALUES_FILE}" <<'PYEOF'
+import sys
+import yaml
+
+class DupKeyLoader(yaml.SafeLoader):
+    pass
+
+def construct_mapping(loader, node, deep=False):
+    mapping = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            print(f"MISMATCH:duplicate-key:{key!r}")
+            raise SystemExit
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+DupKeyLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, construct_mapping)
+
+with open(sys.argv[1]) as f:
+    v = yaml.load(f, Loader=DupKeyLoader)
+
+def check(actual, expected, label, results):
+    if actual != expected:
+        results.append(f"{label}={actual!r}(expected {expected!r})")
+
+results = []
+check(v.get("clusterName"), "gg-poc-dev", "clusterName", results)
+check(v.get("region"), "eu-west-1", "region", results)
+check(v.get("k8sMode"), "EKS", "k8sMode", results)
+check(v.get("containerLogs", {}).get("enabled"), False, "containerLogs.enabled", results)
+check(v.get("containerInsights", {}).get("enabled"), False, "containerInsights.enabled", results)
+check(v.get("applicationSignals", {}).get("enabled"), False, "applicationSignals.enabled", results)
+check(v.get("manager", {}).get("applicationSignals", {}).get("autoMonitor", {}).get("monitorAllServices"), False, "manager.applicationSignals.autoMonitor.monitorAllServices", results)
+check(v.get("otelContainerInsights", {}).get("enabled"), True, "otelContainerInsights.enabled", results)
+check(v.get("otelContainerInsights", {}).get("logs", {}).get("enabled"), False, "otelContainerInsights.logs.enabled", results)
+check(v.get("dcgmExporter", {}).get("enabled"), False, "dcgmExporter.enabled", results)
+check(v.get("neuronMonitor", {}).get("enabled"), False, "neuronMonitor.enabled", results)
+check(v.get("kubeStateMetrics", {}).get("enabled"), True, "kubeStateMetrics.enabled", results)
+check(v.get("nodeExporter", {}).get("enabled"), True, "nodeExporter.enabled", results)
+check(v.get("agent", {}).get("prometheus", {}).get("targetAllocator", {}).get("enabled"), False, "agent.prometheus.targetAllocator.enabled", results)
+check(v.get("agent", {}).get("serviceAccount", {}).get("name"), "cloudwatch-agent", "agent.serviceAccount.name", results)
+
+private_domain = "229410149234.dkr.ecr.eu-west-1.amazonaws.com"
+expected_repos = {
+    "manager": "aws-cloud-factory-cloudwatch-agent-operator",
+    "agent": "aws-cloud-factory-cloudwatch-agent",
+    "kubeStateMetrics": "aws-cloud-factory-kube-state-metrics",
+    "nodeExporter": "aws-cloud-factory-node-exporter",
+}
+found_repos = set()
+for top_key, expected_repo in expected_repos.items():
+    image = v.get(top_key, {}).get("image", {})
+    check(image.get("repositoryDomainMap", {}).get("public"), private_domain, f"{top_key}.image.repositoryDomainMap.public", results)
+    check(image.get("repository"), expected_repo, f"{top_key}.image.repository", results)
+    found_repos.add(image.get("repository"))
+
+if found_repos != set(expected_repos.values()):
+    results.append(f"image-repository-set={sorted(found_repos)}")
+
+values_text = open(sys.argv[1]).read()
+for public_registry in ("public.ecr.aws", "registry.k8s.io", "quay.io", "docker.io", "ghcr.io", "gcr.io", "nvcr.io"):
+    # Only flag a *live* (non-comment) reference -- this file's own
+    # documentation comments legitimately mention these registries by name
+    # to record what is NOT used, matching the established convention
+    # elsewhere in this repository for negative-assertion prose.
+    live_lines = [l for l in values_text.splitlines() if public_registry in l and not l.strip().startswith("#")]
+    if live_lines:
+        results.append(f"live-public-registry-reference={public_registry}:{live_lines}")
+
+if results:
+    print("MISMATCH:" + ";".join(results))
+else:
+    print("OK")
+PYEOF
+)"
+    if [ "$OBSERVABILITY_VALUES_CHECK" = "OK" ]; then
+      pass "2-9: ${OBSERVABILITY_VALUES_FILE} pins cluster/region/k8sMode, all required feature flags (containerLogs/containerInsights/applicationSignals/autoMonitor/otelContainerInsights+logs/dcgmExporter/neuronMonitor/kubeStateMetrics/nodeExporter/targetAllocator), agent.serviceAccount.name, exactly the four private image repositories, and no live public registry reference"
+    else
+      fail "2-9: ${OBSERVABILITY_VALUES_FILE} check failed: ${OBSERVABILITY_VALUES_CHECK}"
+    fi
+  else
+    fail "${OBSERVABILITY_VALUES_FILE} not found, or python3 unavailable"
+  fi
+
+  # 10: the Argo CD values file contains exactly four OCI repositories and
+  # the exact new Secret name, with the pre-existing three preserved.
+  if [ -f "${REPO_ROOT}/${ARGOCD_VALUES_FILE}" ] && command -v python3 >/dev/null 2>&1; then
+    ARGOCD_VALUES_CHECK="$(python3 - "${REPO_ROOT}/${ARGOCD_VALUES_FILE}" <<'PYEOF'
+import sys
+import yaml
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+repos = doc.get("ecrTokenSync", {}).get("repositories", [])
+expected = [
+    ("goldengate", "helm/goldengate", "argocd-ecr-goldengate-oci"),
+    ("goldengate-monitor", "helm/goldengate-monitor", "argocd-ecr-goldengate-monitor-oci"),
+    ("goldengate-platform", "helm/goldengate-platform", "argocd-ecr-goldengate-platform-oci"),
+    ("amazon-cloudwatch-observability", "helm/amazon-cloudwatch-observability", "argocd-ecr-amazon-cloudwatch-observability-oci"),
+]
+actual = [(r.get("name"), r.get("helmOciRepository"), r.get("argocdRepositorySecretName")) for r in repos]
+if len(actual) != 4:
+    print(f"MISMATCH:count={len(actual)}")
+elif actual != expected:
+    print(f"MISMATCH:actual={actual}")
+else:
+    print("OK")
+PYEOF
+)"
+    if [ "$ARGOCD_VALUES_CHECK" = "OK" ]; then
+      pass "10: ${ARGOCD_VALUES_FILE} ecrTokenSync.repositories contains exactly the four expected entries (goldengate, goldengate-monitor, goldengate-platform, amazon-cloudwatch-observability) with the exact new Secret name, in order"
+    else
+      fail "10: ${ARGOCD_VALUES_FILE} check failed: ${ARGOCD_VALUES_CHECK}"
+    fi
+
+    # The four container-image repositories must never be added to Argo CD
+    # token sync -- it only ever refreshes Helm OCI chart credentials.
+    if python3 -c "
+import yaml
+doc = yaml.safe_load(open('${REPO_ROOT}/${ARGOCD_VALUES_FILE}'))
+repos = doc.get('ecrTokenSync', {}).get('repositories', [])
+names = {r.get('helmOciRepository') for r in repos}
+forbidden = {'aws-cloud-factory-cloudwatch-agent-operator', 'aws-cloud-factory-cloudwatch-agent', 'aws-cloud-factory-kube-state-metrics', 'aws-cloud-factory-node-exporter'}
+assert not (names & forbidden), names & forbidden
+"; then
+      pass "10b: none of the four container-image repositories were added to Argo CD ecrTokenSync"
+    else
+      fail "10b: a container-image repository was unexpectedly added to Argo CD ecrTokenSync"
+    fi
+  else
+    fail "${ARGOCD_VALUES_FILE} not found, or python3 unavailable"
+  fi
+
+  # 11: argocd-eks-deployment.yaml validates all four repository Secrets.
+  if [ -f "${REPO_ROOT}/${ARGOCD_DEPLOY_WORKFLOW}" ]; then
+    if python3 -c "import yaml; yaml.safe_load(open('${REPO_ROOT}/${ARGOCD_DEPLOY_WORKFLOW}'))" >/dev/null 2>&1; then
+      pass "11a: ${ARGOCD_DEPLOY_WORKFLOW} parses as strict YAML"
+    else
+      fail "11a: ${ARGOCD_DEPLOY_WORKFLOW} does not parse as strict YAML"
+    fi
+
+    if grep -q 'argocd-ecr-amazon-cloudwatch-observability-oci' "${REPO_ROOT}/${ARGOCD_DEPLOY_WORKFLOW}" \
+        && grep -q 'helm/amazon-cloudwatch-observability' "${REPO_ROOT}/${ARGOCD_DEPLOY_WORKFLOW}" \
+        && grep -qi 'all four' "${REPO_ROOT}/${ARGOCD_DEPLOY_WORKFLOW}" \
+        && ! grep -qi 'all three' "${REPO_ROOT}/${ARGOCD_DEPLOY_WORKFLOW}"; then
+      pass "11b: ${ARGOCD_DEPLOY_WORKFLOW} references the fourth repository/Secret and its exact-count checks/comments were updated from three to four (no stale 'all three' text remains)"
+    else
+      fail "11b: ${ARGOCD_DEPLOY_WORKFLOW} does not fully reference the fourth repository, or a stale 'all three' comment/echo remains"
+    fi
+
+    # The IAM-policy static-validation step's expected_repos dict must
+    # include the fourth ARN.
+    if grep -q 'helm/amazon-cloudwatch-observability.*arn:aws:ecr:eu-west-1:229410149234:repository/helm/amazon-cloudwatch-observability\|"helm/amazon-cloudwatch-observability": "arn:aws:ecr:eu-west-1:229410149234:repository/helm/amazon-cloudwatch-observability"' "${REPO_ROOT}/${ARGOCD_DEPLOY_WORKFLOW}"; then
+      pass "11c: ${ARGOCD_DEPLOY_WORKFLOW}'s IAM-policy validation step expects the amazon-cloudwatch-observability repository ARN"
+    else
+      fail "11c: ${ARGOCD_DEPLOY_WORKFLOW}'s IAM-policy validation step does not reference the amazon-cloudwatch-observability repository ARN"
+    fi
+  else
+    fail "${ARGOCD_DEPLOY_WORKFLOW} not found"
+  fi
+
+  # 12: the new goldengate-observability.yaml workflow.
+  if [ -f "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" ] && command -v python3 >/dev/null 2>&1; then
+    if python3 -c "import yaml; yaml.safe_load(open('${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}'))" >/dev/null 2>&1; then
+      pass "12a: ${OBSERVABILITY_WORKFLOW} parses as strict YAML"
+    else
+      fail "12a: ${OBSERVABILITY_WORKFLOW} does not parse as strict YAML"
+    fi
+
+    OBSERVABILITY_WORKFLOW_CHECK="$(python3 - "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" <<'PYEOF'
+import sys
+import yaml
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+
+results = []
+
+if "workflow_dispatch" not in doc.get(True, doc.get("on", {})) and "workflow_dispatch" not in doc.get("on", {}):
+    results.append("not-workflow_dispatch-only")
+on_block = doc.get(True, doc.get("on", {}))
+if set(on_block.keys()) != {"workflow_dispatch"}:
+    results.append(f"unexpected-trigger-keys={list(on_block.keys())}")
+
+deploy_input = on_block.get("workflow_dispatch", {}).get("inputs", {}).get("deploy", {})
+if deploy_input.get("default") is not False:
+    results.append(f"deploy-default={deploy_input.get('default')!r}")
+if deploy_input.get("type") != "boolean":
+    results.append(f"deploy-type={deploy_input.get('type')!r}")
+
+steps = doc["jobs"]["validate_and_deploy"]["steps"]
+all_run_text = "\n".join(s.get("run", "") for s in steps)
+
+if "6.2.0" not in all_run_text:
+    results.append("chart-version-6.2.0-not-referenced")
+if "oci://" not in all_run_text or "helm/amazon-cloudwatch-observability" not in all_run_text:
+    results.append("private-oci-chart-ref-not-referenced")
+if "aws-observability" in all_run_text.lower() and "helm repo add" in all_run_text.lower():
+    results.append("workflow-adds-public-helm-repo")
+for repo in ("aws-cloud-factory-cloudwatch-agent-operator", "aws-cloud-factory-cloudwatch-agent",
+             "aws-cloud-factory-kube-state-metrics", "aws-cloud-factory-node-exporter"):
+    if repo not in all_run_text:
+        results.append(f"missing-image-repo-reference:{repo}")
+if "imageDigest" not in all_run_text and "imageDetails[0].imageDigest" not in all_run_text:
+    results.append("no-digest-resolution")
+if "GoldenGateCloudWatchMetricsRole-dev" not in all_run_text:
+    results.append("missing-iam-role-reference")
+# The Secret name is an env: block value (ARGOCD_OBSERVABILITY_SECRET_NAME),
+# referenced in run: blocks only via that variable -- so this check must
+# scan the whole document, not just run: block text.
+whole_doc_text = str(doc)
+if "argocd-ecr-amazon-cloudwatch-observability-oci" not in whole_doc_text:
+    results.append("missing-new-argocd-secret-reference")
+if "goldengate-observability" not in whole_doc_text:
+    results.append("missing-application-name-reference")
+
+# Application creation must be gated by inputs.deploy.
+create_app_step = next((s for s in steps if s.get("name") == "Create or update the Argo CD Application"), None)
+if create_app_step is None:
+    results.append("missing-create-application-step")
+elif create_app_step.get("if") != "${{ inputs.deploy }}":
+    results.append(f"create-application-step-if={create_app_step.get('if')!r}")
+
+if results:
+    print("MISMATCH:" + ";".join(results))
+else:
+    print("OK")
+PYEOF
+)"
+    if [ "$OBSERVABILITY_WORKFLOW_CHECK" = "OK" ]; then
+      pass "12b: ${OBSERVABILITY_WORKFLOW} is workflow_dispatch-only, defaults deploy=false, pins chart 6.2.0, pulls only the private OCI chart, validates all four image repositories, resolves digests, injects the exact IAM role, requires the new Argo CD Secret, and creates the Application only behind deploy=true"
+    else
+      fail "12b: ${OBSERVABILITY_WORKFLOW} check failed: ${OBSERVABILITY_WORKFLOW_CHECK}"
+    fi
+
+    # \\? tolerates the workflow's own shell-regex source (e.g.
+    # 'public\.ecr\.aws|...') where dots are backslash-escaped in the
+    # literal file content, as well as a plain-text mention.
+    if grep -qE 'public\\?\.ecr\\?\.aws|registry\\?\.k8s\\?\.io|quay\\?\.io|docker\\?\.io|ghcr\\?\.io|gcr\\?\.io|nvcr\\?\.io' "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}"; then
+      pass "12c: ${OBSERVABILITY_WORKFLOW} contains a public-registry rejection check"
+    else
+      fail "12c: ${OBSERVABILITY_WORKFLOW} does not appear to reject public registries"
+    fi
+
+    if grep -q 'fluent-bit\|fluentbit' "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" \
+        && grep -q 'DcgmExporter\|dcgm' "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" \
+        && grep -q 'NeuronMonitor\|neuron' "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}"; then
+      pass "12d: ${OBSERVABILITY_WORKFLOW} validates against Fluent Bit/GPU/Neuron resources"
+    else
+      fail "12d: ${OBSERVABILITY_WORKFLOW} is missing a Fluent Bit/GPU/Neuron validation check"
+    fi
+  else
+    fail "${OBSERVABILITY_WORKFLOW} not found, or python3 unavailable"
+  fi
+
+  # 13: no wrapper chart was created for this phase.
+  if [ -d "${REPO_ROOT}/helm/goldengate-observability" ]; then
+    fail "13: helm/goldengate-observability/ wrapper chart unexpectedly exists -- Argo CD must consume the private upstream OCI chart directly"
+  else
+    pass "13: no helm/goldengate-observability wrapper chart was created"
+  fi
+
+  # 14: no EKS Terraform enable_cloudwatch variable was introduced anywhere
+  # in this repository's Terraform.
+  if grep -rl 'enable_cloudwatch' "${REPO_ROOT}/envs" 2>/dev/null | grep -q .; then
+    fail "14: an enable_cloudwatch Terraform variable/reference was unexpectedly introduced under envs/"
+  else
+    pass "14: no enable_cloudwatch Terraform variable/reference exists under envs/"
+  fi
+
+  # 15: Phase 6A and Phase 6B1 resources remain untouched by this phase.
+  PHASE_6A_6B1_DIFF="$(git -C "$REPO_ROOT" diff --stat --ignore-all-space -- \
+    .github/workflows/cloudwatch-observability-artifact-sync.yaml \
+    helm/goldengate-platform \
+    platform/dev/goldengate-platform \
+    envs/dev/cloudwatch_observability.tf \
+    envs/dev/cloudwatch_logs.tf \
+    envs/dev/policies/goldengate-cloudwatch-metrics-dev \
+    envs/dev/policies/goldengate-platform-logging-dev \
+    2>/dev/null || true)"
+  if [ -z "$PHASE_6A_6B1_DIFF" ]; then
+    pass "15: Phase 6A (gg-fluent-bit) and Phase 6B1/6B2A (CloudWatch Observability supply chain, IAM) files are unchanged"
+  else
+    fail "15: an unexpected change was found in Phase 6A/6B1/6B2A files:"$'\n'"${PHASE_6A_6B1_DIFF}"
   fi
 
   # Strict YAML parse of the platform workflow (must still parse cleanly

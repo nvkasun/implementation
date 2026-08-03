@@ -1,0 +1,1187 @@
+name: Goldengate observability deployment
+
+run-name: "Cloud Factory - GoldenGate observability (CloudWatch metrics) build and deploy | ${{ inputs.environment }} | deploy=${{ inputs.deploy }} | ran by ${{ github.actor }}"
+
+# Phase 6B2B ONLY: private-image-only source and deployment workflow for the
+# separate goldengate-observability Argo CD Application. This deploys the
+# upstream amazon-cloudwatch-observability Helm chart DIRECTLY from private
+# ECR -- there is no wrapper chart (no helm/goldengate-observability/) and
+# no second Helm OCI artifact is published anywhere. Argo CD consumes
+# oci://229410149234.dkr.ecr.eu-west-1.amazonaws.com/helm/amazon-cloudwatch-observability
+# at the exact pinned version 6.2.0, already mirrored and verified in
+# Phase 6B1.
+#
+# Scope: EKS cluster/node/pod/container and Kubernetes resource metrics
+# only (CloudWatch Agent + OTel Container Insights + kube-state-metrics +
+# node-exporter). This workflow never touches:
+#   - gg-fluent-bit (helm/goldengate-platform) -- GoldenGate runtime/monitor
+#     stdout/stderr logs remain its sole responsibility;
+#   - gg-monitor -- GoldenGate deployment/service/lag/abend/process metrics
+#     remain its sole responsibility;
+#   - CloudWatch alarms, SNS, dashboards, the shared alerter, a
+#     metrics-history writer, or GoldenGate replication (all out of scope
+#     for this phase);
+#   - the shared EKS Terraform module's enable_cloudwatch setting (not used
+#     by this repository at all).
+#
+# workflow_dispatch only, deliberately no push trigger -- same reasoning as
+# every other deployment workflow in this repository: this is a manual,
+# reviewed rollout, not something that should fire on every commit.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Deployment environment"
+        required: true
+        type: choice
+        default: dev
+        options:
+          - dev
+
+      deploy:
+        description: "false (default) = validation only (pull/verify/render/inspect, no cluster changes). true = additionally create/update the goldengate-observability Argo CD Application and perform live Kubernetes validation."
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: eu-west-1
+  ECR_ACCOUNT_ID: "229410149234"
+  ECR_REGISTRY: 229410149234.dkr.ecr.eu-west-1.amazonaws.com
+
+  # Same build/ECR-account role and identity pattern already used by
+  # goldengate-platform.yaml and cloudwatch-observability-artifact-sync.yaml
+  # -- never a new/different role.
+  ROLE_ARN: ${{ vars.GOLDENGATE_AWS_ROLE_ARN }}
+
+  # EKS workload account and cluster -- same repository variables and
+  # cross-account deploy-role pattern already used by every other
+  # deployment workflow in this repository.
+  EKS_WORKLOAD_ACCOUNT_ID: "668311715351"
+  EKS_CLUSTER_NAME: ${{ vars.AWS_CLUSTER_NAME }}
+  EKS_CLUSTER_ARN: ${{ vars.AWS_CLUSTER_ARN }}
+  EKS_DEPLOY_ROLE_ARN: ${{ vars.EKS_DEPLOY_ROLE_ARN }}
+
+  # Phase 6B2A: dedicated, least-privilege IRSA role for the CloudWatch
+  # Agent ServiceAccount only (system:serviceaccount:amazon-cloudwatch:
+  # cloudwatch-agent). Never assigned to the operator, kube-state-metrics,
+  # node-exporter, Fluent Bit, GoldenGate runtime pods, gg-monitor, or
+  # Argo CD.
+  CW_METRICS_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateCloudWatchMetricsRole-dev
+
+  # Pinned private chart (Phase 6B1). Never the public chart, never "latest".
+  HELM_OCI_NAMESPACE: helm
+  CHART_NAME: amazon-cloudwatch-observability
+  CHART_VERSION: "6.2.0"
+  CHART_ECR_REPOSITORY: helm/amazon-cloudwatch-observability
+  VALUES_FILE: platform/dev/goldengate-observability/values.yaml
+
+  RELEASE_NAME: amazon-cloudwatch-observability
+  ARGOCD_NAMESPACE: argocd
+  ARGOCD_APP_NAME: goldengate-observability
+  TARGET_NAMESPACE: amazon-cloudwatch
+  ARGOCD_OBSERVABILITY_SECRET_NAME: argocd-ecr-amazon-cloudwatch-observability-oci
+
+  # CloudWatch Agent ServiceAccount this phase's IRSA role is exclusively
+  # for -- see the "Annotate the CloudWatch Agent ServiceAccount" step below
+  # for why this is applied via kubectl rather than a Helm value.
+  CLOUDWATCH_AGENT_SERVICE_ACCOUNT: cloudwatch-agent
+
+  WORKDIR: work
+
+concurrency:
+  group: goldengate-observability-deploy-${{ github.ref }}-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  validate_and_deploy:
+    name: Validate and (optionally) deploy the goldengate-observability Argo CD Application
+
+    runs-on: ubuntu-latest
+
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.ROLE_ARN }}
+
+      - name: Install or validate required tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! command -v helm >/dev/null 2>&1; then
+            HELM_VERSION="v3.15.4"
+            curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" -o /tmp/helm.tar.gz
+            tar -zxf /tmp/helm.tar.gz -C /tmp
+            sudo mv /tmp/linux-amd64/helm /usr/local/bin/helm
+            sudo chmod +x /usr/local/bin/helm
+          fi
+          HELM_SEMVER="$(helm version --short | sed -E 's/^v//' | cut -d+ -f1)"
+          echo "Helm version: ${HELM_SEMVER} (required: 3.9 or later)"
+          HELM_MAJOR="$(echo "$HELM_SEMVER" | cut -d. -f1)"
+          HELM_MINOR="$(echo "$HELM_SEMVER" | cut -d. -f2)"
+          if [ "$HELM_MAJOR" -lt 3 ] || { [ "$HELM_MAJOR" -eq 3 ] && [ "$HELM_MINOR" -lt 9 ]; }; then
+            echo "FAIL: Helm ${HELM_SEMVER} is older than the required 3.9."
+            exit 1
+          fi
+
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KUBECTL_VERSION="v1.35.0"
+            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" -o /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+            sudo chmod +x /usr/local/bin/kubectl
+          fi
+          kubectl version --client=true
+
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y jq
+          fi
+          jq --version
+
+          python3 --version
+          python3 -c "import yaml" 2>/dev/null || sudo apt-get install -y python3-yaml
+          python3 -c "import yaml; print('PyYAML', yaml.__version__)"
+
+      - name: Fail closed unless the AWS caller account is the approved build/ECR account
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CALLER_ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
+          if [ "$CALLER_ACCOUNT" != "$ECR_ACCOUNT_ID" ]; then
+            echo "FAIL: AWS caller account is ${CALLER_ACCOUNT}, expected ${ECR_ACCOUNT_ID}."
+            exit 1
+          fi
+          echo "OK: AWS caller account is ${ECR_ACCOUNT_ID}."
+
+      - name: Write the private image mirror inventory (single source of truth)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$WORKDIR"
+
+          # repository|tag -- the exact four images mirrored and verified in
+          # Phase 6B1. This one table drives repository/mutability/tag
+          # checks, digest resolution, generated-values injection, and the
+          # expected rendered-image set below -- never five separately
+          # hand-maintained lists.
+          cat > "$WORKDIR/image-table.psv" <<'EOF'
+          aws-cloud-factory-cloudwatch-agent-operator|3.4.2
+          aws-cloud-factory-cloudwatch-agent|1.300069.0b1529
+          aws-cloud-factory-kube-state-metrics|v2.18.0
+          aws-cloud-factory-node-exporter|v1.11.1
+          EOF
+          echo "Image mirror inventory:"
+          cat "$WORKDIR/image-table.psv"
+
+      - name: Verify all five ECR repositories exist
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          check_repo_exists() {
+            local repo="$1"
+            if ! aws ecr describe-repositories --region "$AWS_REGION" --repository-names "$repo" >/dev/null 2>"${WORKDIR}/describe-error.txt"; then
+              echo "FAIL: ECR repository ${repo} does not exist or could not be described:"
+              cat "${WORKDIR}/describe-error.txt"
+              exit 1
+            fi
+            echo "OK: repository ${repo} exists."
+          }
+
+          check_repo_exists "$CHART_ECR_REPOSITORY"
+          while IFS='|' read -r repo _tag; do
+            [ -z "$repo" ] && continue
+            check_repo_exists "$repo"
+          done < "${WORKDIR}/image-table.psv"
+
+      - name: Verify every image repository is IMMUTABLE
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Fails closed rather than silently modifying mutability -- this
+          # workflow never calls put-image-tag-mutability. Phase 6B1 created
+          # all four image repositories as IMMUTABLE; this only re-confirms
+          # that has not changed since.
+          while IFS='|' read -r repo _tag; do
+            [ -z "$repo" ] && continue
+            MUTABILITY="$(aws ecr describe-repositories --region "$AWS_REGION" --repository-names "$repo" --query 'repositories[0].imageTagMutability' --output text)"
+            if [ "$MUTABILITY" != "IMMUTABLE" ]; then
+              echo "FAIL: repository ${repo} has imageTagMutability=${MUTABILITY}, expected IMMUTABLE."
+              exit 1
+            fi
+            echo "OK: repository ${repo} is IMMUTABLE."
+          done < "${WORKDIR}/image-table.psv"
+
+      - name: Verify all four expected image tags exist and resolve manifest digests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          : > "${WORKDIR}/image-digests.psv"
+          SEEN_REPOS=""
+
+          while IFS='|' read -r repo tag; do
+            [ -z "$repo" ] && continue
+
+            # Duplicate/unexpected-repository guard: the table above must
+            # never list the same repository twice.
+            if grep -qx -- "$repo" <<< "$SEEN_REPOS"; then
+              echo "FAIL: repository ${repo} appears more than once in the image inventory."
+              exit 1
+            fi
+            SEEN_REPOS="$(printf '%s\n%s' "$SEEN_REPOS" "$repo")"
+
+            if ! DESCRIBE_JSON="$(aws ecr describe-images \
+                --region "$AWS_REGION" \
+                --repository-name "$repo" \
+                --image-ids imageTag="$tag" \
+                --output json 2>"${WORKDIR}/describe-images-error.txt")"; then
+              echo "FAIL: tag ${tag} not found in repository ${repo}:"
+              cat "${WORKDIR}/describe-images-error.txt"
+              exit 1
+            fi
+
+            DIGEST="$(echo "$DESCRIBE_JSON" | jq -r '.imageDetails[0].imageDigest // empty')"
+            if [ -z "$DIGEST" ]; then
+              echo "FAIL: empty digest resolved for ${repo}:${tag}."
+              exit 1
+            fi
+            if ! [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+              echo "FAIL: malformed digest resolved for ${repo}:${tag}: ${DIGEST}"
+              exit 1
+            fi
+
+            echo "OK: ${repo}:${tag} -> ${DIGEST}"
+            echo "${repo}|${tag}|${DIGEST}" >> "${WORKDIR}/image-digests.psv"
+          done < "${WORKDIR}/image-table.psv"
+
+          echo "Resolved digests:"
+          cat "${WORKDIR}/image-digests.psv"
+
+      - name: Authenticate Helm to private ECR
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | helm registry login --username AWS --password-stdin "$ECR_REGISTRY"
+
+      - name: Pull only the private chart
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "${WORKDIR}/chart"
+
+          # Never the public aws-observability repository -- only the
+          # already-mirrored private OCI chart from Phase 6B1.
+          helm pull "oci://${ECR_REGISTRY}/${HELM_OCI_NAMESPACE}/${CHART_NAME}" \
+            --version "$CHART_VERSION" \
+            --untar \
+            --untardir "${WORKDIR}/chart"
+
+          CHART_DIR="${WORKDIR}/chart/${CHART_NAME}"
+          if [ ! -f "${CHART_DIR}/Chart.yaml" ]; then
+            echo "FAIL: expected chart directory ${CHART_DIR} was not produced by helm pull."
+            exit 1
+          fi
+          echo "CHART_DIR=${CHART_DIR}" >> "$GITHUB_ENV"
+
+      - name: Verify the private chart's name and version exactly
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - "${CHART_DIR}/Chart.yaml" "$CHART_NAME" "$CHART_VERSION" <<'PYEOF'
+          import sys, yaml
+          path, expected_name, expected_version = sys.argv[1], sys.argv[2], sys.argv[3]
+          with open(path) as f:
+              chart = yaml.safe_load(f)
+          name = chart.get("name")
+          version = chart.get("version")
+          if name != expected_name:
+              sys.exit(f"FAIL: chart name is {name!r}, expected {expected_name!r}.")
+          if version != expected_version:
+              sys.exit(f"FAIL: chart version is {version!r}, expected {expected_version!r}.")
+          print(f"OK: private chart name={name} version={version}")
+          PYEOF
+
+      - name: Generate the temporary deployment values file
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Starts from the committed values file (never mutated) and
+          # injects only the tag@digest image references resolved above.
+          # Strict YAML parsing with duplicate-key rejection on the way in;
+          # the committed file is never written back to.
+          #
+          # The CloudWatch Agent IRSA role annotation is deliberately NOT
+          # injected here. Verified against the exact pinned chart (6.2.0):
+          # neither templates/cloudwatch-agent-serviceaccount.yaml nor
+          # templates/operator-serviceaccount.yaml (nor any other template
+          # in this chart version) ever reads a "serviceAccount.annotations"
+          # value -- `grep -rn serviceAccount.annotations templates/` on the
+          # pulled chart returns no matches at all. There is no
+          # chart-supported values path for this. The role is instead
+          # applied as a bounded, explicit `kubectl annotate` step in the
+          # deploy-guarded section below, directly on the ServiceAccount
+          # Argo CD creates (never a second Kubernetes resource created by
+          # this workflow).
+          python3 - "$VALUES_FILE" "${WORKDIR}/image-digests.psv" "${WORKDIR}/generated-values.yaml" <<'PYEOF'
+          import sys
+          import yaml
+
+          committed_values_path, digests_path, output_path = sys.argv[1], sys.argv[2], sys.argv[3]
+
+          class DupKeyLoader(yaml.SafeLoader):
+              pass
+
+          def construct_mapping(loader, node, deep=False):
+              mapping = {}
+              for key_node, value_node in node.value:
+                  key = loader.construct_object(key_node, deep=deep)
+                  if key in mapping:
+                      sys.exit(f"FAIL: duplicate key {key!r} in {committed_values_path}")
+                  mapping[key] = loader.construct_object(value_node, deep=deep)
+              return mapping
+
+          DupKeyLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, construct_mapping)
+
+          with open(committed_values_path) as f:
+              values = yaml.load(f, Loader=DupKeyLoader)
+
+          digests_by_repo = {}
+          with open(digests_path) as f:
+              for line in f:
+                  line = line.strip()
+                  if not line:
+                      continue
+                  repo, tag, digest = line.split("|")
+                  digests_by_repo[repo] = (tag, digest)
+
+          image_paths = {
+              "aws-cloud-factory-cloudwatch-agent-operator": ("manager", "image"),
+              "aws-cloud-factory-cloudwatch-agent": ("agent", "image"),
+              "aws-cloud-factory-kube-state-metrics": ("kubeStateMetrics", "image"),
+              "aws-cloud-factory-node-exporter": ("nodeExporter", "image"),
+          }
+
+          for repo, (top_key, image_key) in image_paths.items():
+              if repo not in digests_by_repo:
+                  sys.exit(f"FAIL: no resolved digest for repository {repo}")
+              tag, digest = digests_by_repo[repo]
+              image_block = values[top_key][image_key]
+              if image_block["repository"] != repo:
+                  sys.exit(f"FAIL: {top_key}.{image_key}.repository is {image_block['repository']!r}, expected {repo!r}")
+              if image_block["tag"] != tag:
+                  sys.exit(f"FAIL: {top_key}.{image_key}.tag is {image_block['tag']!r}, expected base tag {tag!r} before digest injection")
+              image_block["tag"] = f"{tag}@{digest}"
+
+          with open(output_path, "w") as f:
+              yaml.safe_dump(values, f, default_flow_style=False, sort_keys=False)
+
+          print(f"OK: generated {output_path} with tag@digest for all four images.")
+          PYEOF
+
+          echo "Generated values file (committed file is unchanged):"
+          cat "${WORKDIR}/generated-values.yaml"
+
+      - name: Semantically validate the generated deployment values
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - "${WORKDIR}/generated-values.yaml" <<'PYEOF'
+          import sys
+          import yaml
+
+          with open(sys.argv[1]) as f:
+              v = yaml.safe_load(f)
+
+          def expect(actual, expected, label):
+              if actual != expected:
+                  sys.exit(f"FAIL: {label} is {actual!r}, expected {expected!r}")
+              print(f"OK: {label} == {expected!r}")
+
+          expect(v.get("clusterName"), "gg-poc-dev", "clusterName")
+          expect(v.get("region"), "eu-west-1", "region")
+          expect(v.get("k8sMode"), "EKS", "k8sMode")
+          expect(v.get("containerLogs", {}).get("enabled"), False, "containerLogs.enabled")
+          expect(v.get("containerInsights", {}).get("enabled"), False, "containerInsights.enabled")
+          expect(v.get("applicationSignals", {}).get("enabled"), False, "applicationSignals.enabled")
+          expect(v.get("manager", {}).get("applicationSignals", {}).get("autoMonitor", {}).get("monitorAllServices"), False, "manager.applicationSignals.autoMonitor.monitorAllServices")
+          expect(v.get("otelContainerInsights", {}).get("enabled"), True, "otelContainerInsights.enabled")
+          expect(v.get("otelContainerInsights", {}).get("logs", {}).get("enabled"), False, "otelContainerInsights.logs.enabled")
+          expect(v.get("dcgmExporter", {}).get("enabled"), False, "dcgmExporter.enabled")
+          expect(v.get("neuronMonitor", {}).get("enabled"), False, "neuronMonitor.enabled")
+          expect(v.get("kubeStateMetrics", {}).get("enabled"), True, "kubeStateMetrics.enabled")
+          expect(v.get("nodeExporter", {}).get("enabled"), True, "nodeExporter.enabled")
+          expect(v.get("agent", {}).get("prometheus", {}).get("targetAllocator", {}).get("enabled"), False, "agent.prometheus.targetAllocator.enabled")
+          expect(v.get("agent", {}).get("serviceAccount", {}).get("name"), "cloudwatch-agent", "agent.serviceAccount.name")
+
+          private_domain = "229410149234.dkr.ecr.eu-west-1.amazonaws.com"
+          for top_key, image_key in [("manager", "image"), ("agent", "image"), ("kubeStateMetrics", "image"), ("nodeExporter", "image")]:
+              block = v[top_key][image_key]
+              domain = block.get("repositoryDomainMap", {}).get("public")
+              expect(domain, private_domain, f"{top_key}.{image_key}.repositoryDomainMap.public")
+              tag = block.get("tag", "")
+              if "@sha256:" not in tag:
+                  sys.exit(f"FAIL: {top_key}.{image_key}.tag ({tag!r}) does not contain @sha256:")
+              print(f"OK: {top_key}.{image_key}.tag contains @sha256: ({tag})")
+
+          print("OK: generated values file passes every semantic check.")
+          PYEOF
+
+          EXPECTED_CW_ROLE_ARN="arn:aws:iam::668311715351:role/GoldenGateCloudWatchMetricsRole-dev"
+          if [ "$CW_METRICS_ROLE_ARN" != "$EXPECTED_CW_ROLE_ARN" ]; then
+            echo "FAIL: workflow CW_METRICS_ROLE_ARN (${CW_METRICS_ROLE_ARN}) does not match the expected dedicated role ARN."
+            exit 1
+          fi
+          echo "OK: workflow CW_METRICS_ROLE_ARN matches the dedicated GoldenGateCloudWatchMetricsRole-dev ARN exactly (applied via kubectl annotate -- see the deploy-guarded section)."
+
+      - name: Render the private chart locally
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p rendered
+
+          helm template "$RELEASE_NAME" "$CHART_DIR" \
+            --namespace "$TARGET_NAMESPACE" \
+            --include-crds \
+            --values "${WORKDIR}/generated-values.yaml" \
+            > "rendered/${RELEASE_NAME}.yaml"
+
+          echo "Rendered manifest: rendered/${RELEASE_NAME}.yaml ($(wc -l < "rendered/${RELEASE_NAME}.yaml") lines)"
+
+      - name: Recursively extract and validate rendered image references
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RENDERED="rendered/${RELEASE_NAME}.yaml"
+
+          # Reuses the same robust recursive-walk approach established in
+          # cloudwatch-observability-artifact-sync.yaml: collect every
+          # "image:" field anywhere in the parsed document tree (covers
+          # containers, initContainers, and image fields embedded inside
+          # operator custom resources like AmazonCloudWatchAgent) -- never a
+          # manually maintained list, never a plain-text grep.
+          python3 - "$RENDERED" <<'PYEOF' > "${WORKDIR}/rendered-images.txt"
+          import sys, yaml
+
+          with open(sys.argv[1]) as f:
+              docs = list(yaml.safe_load_all(f))
+
+          images = set()
+
+          def walk(node):
+              if isinstance(node, dict):
+                  for k, v in node.items():
+                      if k == "image" and isinstance(v, str):
+                          images.add(v)
+                      else:
+                          walk(v)
+              elif isinstance(node, list):
+                  for item in node:
+                      walk(item)
+
+          for d in docs:
+              if d is not None:
+                  walk(d)
+
+          for img in sorted(images):
+              print(img)
+          PYEOF
+
+          echo "Rendered image set:"
+          cat "${WORKDIR}/rendered-images.txt"
+
+          EXPECTED_PREFIX="${ECR_REGISTRY}/"
+          ALLOWED_REPOS="aws-cloud-factory-cloudwatch-agent-operator aws-cloud-factory-cloudwatch-agent aws-cloud-factory-kube-state-metrics aws-cloud-factory-node-exporter"
+
+          UNAPPROVED_REGISTRIES='public\.ecr\.aws|registry\.k8s\.io|quay\.io|docker\.io|ghcr\.io|gcr\.io|nvcr\.io'
+          if grep -Eiq "$UNAPPROVED_REGISTRIES" "${WORKDIR}/rendered-images.txt"; then
+            echo "FAIL: rendered image set references an unapproved public registry:"
+            grep -Ei "$UNAPPROVED_REGISTRIES" "${WORKDIR}/rendered-images.txt"
+            exit 1
+          fi
+          echo "OK: no unapproved public registry reference."
+
+          IMAGE_COUNT=0
+          while IFS= read -r image_ref; do
+            [ -z "$image_ref" ] && continue
+            IMAGE_COUNT=$((IMAGE_COUNT + 1))
+
+            if [[ "$image_ref" != "${EXPECTED_PREFIX}"* ]]; then
+              echo "FAIL: image ${image_ref} does not use the private registry ${EXPECTED_PREFIX}"
+              exit 1
+            fi
+            if [[ "$image_ref" != *"@sha256:"* ]]; then
+              echo "FAIL: image ${image_ref} has no @sha256: digest."
+              exit 1
+            fi
+
+            REPO_AND_REST="${image_ref#"$EXPECTED_PREFIX"}"
+            REPO="${REPO_AND_REST%%:*}"
+            FOUND_ALLOWED="false"
+            for allowed in $ALLOWED_REPOS; do
+              if [ "$REPO" = "$allowed" ]; then
+                FOUND_ALLOWED="true"
+                break
+              fi
+            done
+            if [ "$FOUND_ALLOWED" != "true" ]; then
+              echo "FAIL: image ${image_ref} belongs to repository ${REPO}, which is outside the four allow-listed repositories."
+              exit 1
+            fi
+          done < "${WORKDIR}/rendered-images.txt"
+
+          if [ "$IMAGE_COUNT" -ne 4 ]; then
+            echo "FAIL: expected exactly 4 unique rendered images, found ${IMAGE_COUNT}."
+            exit 1
+          fi
+          echo "OK: exactly 4 unique rendered images, all private, all repository-allow-listed, all digest-pinned."
+
+      - name: Validate no forbidden component was rendered
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RENDERED="rendered/${RELEASE_NAME}.yaml"
+
+          # CRD schemas for DcgmExporter/NeuronMonitor/Instrumentation are
+          # always installed by this operator chart regardless of whether
+          # those features are used (confirmed locally: `--include-crds`
+          # always renders crds/cloudwatch.aws.amazon.com_dcgmexporters.yaml
+          # etc even with dcgmExporter.enabled=false/neuronMonitor.enabled=
+          # false). A CRD's mere existence is not a live GPU/Neuron/
+          # auto-instrumentation workload -- only an actual CR *instance*
+          # would be, so this check looks for CR instances/workloads, not
+          # for the CRD definitions themselves.
+          python3 - "$RENDERED" <<'PYEOF'
+          import sys, yaml
+
+          with open(sys.argv[1]) as f:
+              docs = [d for d in yaml.safe_load_all(f) if d]
+
+          forbidden_kinds = {"DcgmExporter", "NeuronMonitor", "Instrumentation"}
+          present_forbidden_kinds = {d.get("kind") for d in docs} & forbidden_kinds
+          if present_forbidden_kinds:
+              sys.exit(f"FAIL: forbidden CR instance kind(s) rendered: {sorted(present_forbidden_kinds)}")
+
+          forbidden_name_substrings = ["fluent-bit", "fluentbit", "dcgm", "neuron", "adot", "target-allocator", "auto-instrumentation"]
+          for d in docs:
+              if d.get("kind") == "CustomResourceDefinition":
+                  # CRD schemas are expected and harmless (see comment above).
+                  continue
+              name = ((d.get("metadata") or {}).get("name") or "").lower()
+              for f in forbidden_name_substrings:
+                  if f in name:
+                      sys.exit(f"FAIL: forbidden resource name '{name}' (kind={d.get('kind')}) matches forbidden substring '{f}'.")
+
+          print("OK: no DcgmExporter/NeuronMonitor/Instrumentation CR instance, and no fluent-bit/dcgm/neuron/adot/target-allocator/auto-instrumentation named resource, was rendered.")
+
+          # No container-log/filelog pipeline: every AmazonCloudWatchAgent
+          # CR's otelConfig (when present) must not contain a filelog
+          # receiver, since otelContainerInsights.logs.enabled is false.
+          for d in docs:
+              if d.get("kind") == "AmazonCloudWatchAgent":
+                  otel_config = str(d.get("spec", {}).get("otelConfig", ""))
+                  if "filelog" in otel_config:
+                      sys.exit(f"FAIL: AmazonCloudWatchAgent/{d['metadata']['name']} otelConfig contains a filelog receiver -- OTel logs must stay disabled.")
+          print("OK: no filelog receiver in any rendered AmazonCloudWatchAgent otelConfig.")
+          PYEOF
+
+          if grep -q "kind: DaemonSet" "$RENDERED" && grep -B5 "kind: DaemonSet" "$RENDERED" | grep -qi "fluent-bit"; then
+            echo "FAIL: a Fluent Bit DaemonSet was rendered."
+            exit 1
+          fi
+          echo "OK: no Fluent Bit DaemonSet or container rendered."
+
+      - name: Validate the rendered CloudWatch Agent ServiceAccount
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RENDERED="rendered/${RELEASE_NAME}.yaml"
+
+          python3 - "$RENDERED" <<'PYEOF'
+          import sys, yaml
+
+          with open(sys.argv[1]) as f:
+              docs = [d for d in yaml.safe_load_all(f) if d]
+
+          service_accounts = [d for d in docs if d.get("kind") == "ServiceAccount"]
+          cw_agent_sas = [sa for sa in service_accounts
+                          if sa["metadata"]["name"] == "cloudwatch-agent"
+                          and sa["metadata"].get("namespace") == "amazon-cloudwatch"]
+          if len(cw_agent_sas) != 1:
+              sys.exit(f"FAIL: expected exactly 1 ServiceAccount amazon-cloudwatch/cloudwatch-agent, found {len(cw_agent_sas)}.")
+          print("OK: ServiceAccount amazon-cloudwatch/cloudwatch-agent is rendered by the chart.")
+
+          # Confirmed against the pinned chart's templates (see the
+          # "Generate the temporary deployment values file" step): this
+          # exact chart version never renders an
+          # eks.amazonaws.com/role-arin annotation on any ServiceAccount
+          # via values. This assertion documents and locks in that
+          # understanding -- if a future chart version starts rendering
+          # this annotation on an unrelated ServiceAccount unexpectedly,
+          # this check fails loudly instead of silently passing.
+          for sa in service_accounts:
+              annotations = sa["metadata"].get("annotations") or {}
+              role_arn = annotations.get("eks.amazonaws.com/role-arn")
+              if role_arn and sa["metadata"]["name"] != "cloudwatch-agent":
+                  sys.exit(f"FAIL: unexpected eks.amazonaws.com/role-arn annotation on unrelated ServiceAccount {sa['metadata']['name']}: {role_arn}")
+              if role_arn and sa["metadata"]["name"] == "cloudwatch-agent":
+                  sys.exit("FAIL: chart unexpectedly renders a role-arn annotation on cloudwatch-agent directly -- update the digest-injection step to stop double-annotating.")
+          print("OK: no ServiceAccount carries an eks.amazonaws.com/role-arn annotation from the chart render itself (applied post-sync instead -- see below).")
+          PYEOF
+
+      - name: Document and verify the exact chart-rendered resource names
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RENDERED="rendered/${RELEASE_NAME}.yaml"
+
+          # Discovered locally by rendering this exact pinned chart (6.2.0)
+          # with the metrics-only values above -- never invented names.
+          # These become the following live Kubernetes objects once the
+          # operator reconciles the two AmazonCloudWatchAgent custom
+          # resources (agents[].mode determines DaemonSet vs Deployment):
+          #   - AmazonCloudWatchAgent/cloudwatch-agent (mode: daemonset)
+          #     -> DaemonSet/cloudwatch-agent (the per-node agent)
+          #   - AmazonCloudWatchAgent/cloudwatch-agent-cluster-scraper
+          #     (mode: deployment) -> Deployment/cloudwatch-agent-cluster-scraper
+          #     (the "cluster scraper": apiserver/kube-state-metrics OTel
+          #     scraping -- only rendered because otelContainerInsights.
+          #     enabled=true)
+          #   - Deployment/amazon-cloudwatch-observability-controller-manager
+          #     (the operator/manager), ServiceAccount of the same name
+          #   - Deployment/kube-state-metrics, ServiceAccount/kube-state-metrics-service-acct
+          #   - DaemonSet/node-exporter, ServiceAccount/node-exporter-service-acct
+          # Two additional AmazonCloudWatchAgent CRs
+          # (cloudwatch-agent-windows, cloudwatch-agent-windows-container-insights)
+          # also render unconditionally from this chart version, constrained
+          # to kubernetes.io/os=windows via nodeSelector -- harmless on this
+          # Linux-only cluster (no Windows node will ever exist to schedule
+          # them), and they resolve to the same private cloudwatch-agent
+          # image, not a fifth image.
+          python3 - "$RENDERED" <<'PYEOF'
+          import sys, yaml
+
+          with open(sys.argv[1]) as f:
+              docs = [d for d in yaml.safe_load_all(f) if d]
+
+          def find_one(kind, name):
+              matches = [d for d in docs if d.get("kind") == kind and (d.get("metadata") or {}).get("name") == name]
+              if len(matches) != 1:
+                  sys.exit(f"FAIL: expected exactly 1 {kind}/{name}, found {len(matches)}.")
+              return matches[0]
+
+          find_one("AmazonCloudWatchAgent", "cloudwatch-agent")
+          find_one("AmazonCloudWatchAgent", "cloudwatch-agent-cluster-scraper")
+          find_one("Deployment", "amazon-cloudwatch-observability-controller-manager")
+          find_one("Deployment", "kube-state-metrics")
+          find_one("DaemonSet", "node-exporter")
+          find_one("ServiceAccount", "kube-state-metrics-service-acct")
+          find_one("ServiceAccount", "node-exporter-service-acct")
+          find_one("ServiceAccount", "amazon-cloudwatch-observability-controller-manager")
+
+          print("OK: every expected chart-rendered resource name is present exactly once.")
+          PYEOF
+
+      - name: Upload rendered manifests
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: goldengate-observability-artifacts-${{ inputs.environment }}
+          path: |
+            rendered/
+            work/generated-values.yaml
+            work/image-digests.psv
+          if-no-files-found: warn
+          retention-days: 7
+
+      # =======================================================================
+      # Everything below this point only runs when inputs.deploy=true. It
+      # performs live Kubernetes/Argo CD operations -- never executed as
+      # part of local validation.
+      # =======================================================================
+
+      - name: Connect to EKS cluster
+        if: ${{ inputs.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws sts get-caller-identity
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}" \
+            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
+            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
+
+          kubectl config current-context
+          kubectl version --client=true
+
+      - name: Ensure Argo CD Application CRD exists
+        if: ${{ inputs.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl get crd applications.argoproj.io >/dev/null || {
+            echo "CRD applications.argoproj.io not found."
+            echo "Argo CD must be installed on this cluster before this Application can be deployed."
+            echo "Run the argocd-eks-deployment.yaml workflow first."
+            exit 1
+          }
+          echo "Argo CD Application CRD is present."
+
+      - name: Confirm the observability Argo CD repository Secret exists
+        if: ${{ inputs.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! kubectl get secret "$ARGOCD_OBSERVABILITY_SECRET_NAME" -n "$ARGOCD_NAMESPACE" >/dev/null 2>&1; then
+            echo "PREREQUISITE NOT MET: Secret ${ARGOCD_OBSERVABILITY_SECRET_NAME} does not exist in namespace ${ARGOCD_NAMESPACE}."
+            echo ""
+            echo "Required order before running this workflow with deploy=true:"
+            echo "  1. Phase 6B2A IAM/Terraform workflow completed (GoldenGateCloudWatchMetricsRole-dev, performance log group)."
+            echo "  2. Re-run argocd-eks-deployment.yaml (picks up the new amazon-cloudwatch-observability"
+            echo "     entry in envs/dev/argocd/values.yaml ecrTokenSync.repositories and provisions this Secret)."
+            echo "  3. Re-run this workflow (goldengate-observability.yaml) with deploy=true."
+            echo ""
+            echo "Refusing to inject a short-lived credential as a workaround -- the in-cluster IRSA token sync is the only long-term credential mechanism."
+            exit 1
+          fi
+
+          ACTUAL_URL="$(kubectl get secret "$ARGOCD_OBSERVABILITY_SECRET_NAME" -n "$ARGOCD_NAMESPACE" -o jsonpath='{.data.url}' | base64 --decode)"
+          EXPECTED_URL="oci://${ECR_REGISTRY}/${HELM_OCI_NAMESPACE}/${CHART_NAME}"
+          if [ "$ACTUAL_URL" != "$EXPECTED_URL" ]; then
+            echo "FAIL: Secret ${ARGOCD_OBSERVABILITY_SECRET_NAME} url mismatch. Expected ${EXPECTED_URL}, got ${ACTUAL_URL}."
+            exit 1
+          fi
+          echo "OK: ${ARGOCD_OBSERVABILITY_SECRET_NAME} exists and points to ${EXPECTED_URL}."
+
+      - name: Create or update the Argo CD Application
+        if: ${{ inputs.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Generated via Python/PyYAML (not shell heredoc interpolation):
+          # the Helm inline values field below must carry the complete,
+          # already-validated generated-values.yaml content verbatim, which
+          # is too large/structurally rich to safely inline through shell
+          # string interpolation.
+          #
+          # ServerSideApply=true: this operator chart's own CRD
+          # (cloudwatch.aws.amazon.com_amazoncloudwatchagents.yaml) is
+          # ~603KB on disk in the pinned 6.2.0 chart -- verified locally
+          # (`wc -c` on the pulled chart's crds/ directory) -- which is
+          # already larger than the ~262144-byte practical limit on the
+          # kubectl.kubernetes.io/last-applied-configuration annotation
+          # that client-side apply relies on. Server-side apply avoids that
+          # annotation entirely, so it is required here, not optional.
+          python3 - "${WORKDIR}/generated-values.yaml" "${WORKDIR}/application.yaml" <<'PYEOF'
+          import sys
+          import yaml
+
+          values_path, output_path = sys.argv[1], sys.argv[2]
+
+          with open(values_path) as f:
+              values_text = f.read()
+
+          class LiteralStr(str):
+              pass
+
+          def literal_str_representer(dumper, data):
+              return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|")
+
+          yaml.add_representer(LiteralStr, literal_str_representer)
+
+          application = {
+              "apiVersion": "argoproj.io/v1alpha1",
+              "kind": "Application",
+              "metadata": {
+                  "name": "goldengate-observability",
+                  "namespace": "argocd",
+                  "finalizers": ["resources-finalizer.argocd.argoproj.io"],
+                  "labels": {
+                      "app.kubernetes.io/name": "goldengate-observability",
+                      "app.kubernetes.io/managed-by": "argocd",
+                  },
+              },
+              "spec": {
+                  "project": "default",
+                  "source": {
+                      "repoURL": "oci://229410149234.dkr.ecr.eu-west-1.amazonaws.com/helm/amazon-cloudwatch-observability",
+                      "targetRevision": "6.2.0",
+                      "helm": {
+                          "releaseName": "amazon-cloudwatch-observability",
+                          "values": LiteralStr(values_text),
+                      },
+                  },
+                  "destination": {
+                      "server": "https://kubernetes.default.svc",
+                      "namespace": "amazon-cloudwatch",
+                  },
+                  "syncPolicy": {
+                      "automated": {
+                          "prune": True,
+                          "selfHeal": True,
+                      },
+                      "syncOptions": [
+                          "CreateNamespace=true",
+                          "ServerSideApply=true",
+                      ],
+                      "managedNamespaceMetadata": {
+                          "labels": {
+                              "app.kubernetes.io/name": "goldengate-observability",
+                              "app.kubernetes.io/managed-by": "argocd",
+                          },
+                      },
+                  },
+                  "revisionHistoryLimit": 10,
+              },
+          }
+
+          with open(output_path, "w") as f:
+              yaml.dump(application, f, default_flow_style=False, sort_keys=False)
+
+          print(f"Generated {output_path}")
+          PYEOF
+
+          echo "Applying Argo CD Application: ${ARGOCD_APP_NAME}"
+          kubectl apply -f "${WORKDIR}/application.yaml"
+
+          kubectl annotate application "${ARGOCD_APP_NAME}" \
+            -n "${ARGOCD_NAMESPACE}" \
+            argocd.argoproj.io/refresh=hard \
+            --overwrite
+
+      - name: Wait for Argo CD sync and health
+        if: ${{ inputs.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TIMEOUT_SECONDS=900
+          INTERVAL_SECONDS=15
+          ELAPSED=0
+
+          while true; do
+            if kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" >/dev/null 2>&1; then
+              SYNC_STATUS="$(kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" -o jsonpath='{.status.sync.status}' 2>/dev/null || echo "Unknown")"
+              HEALTH_STATUS="$(kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" -o jsonpath='{.status.health.status}' 2>/dev/null || echo "Unknown")"
+
+              echo "[$(date -u +%H:%M:%S)] sync=${SYNC_STATUS} health=${HEALTH_STATUS} (elapsed ${ELAPSED}s / ${TIMEOUT_SECONDS}s)"
+
+              if [ "${HEALTH_STATUS}" = "Degraded" ]; then
+                echo "FAIL: Argo CD Application ${ARGOCD_APP_NAME} is Degraded."
+                kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" -o wide
+                exit 1
+              fi
+
+              if [ "${SYNC_STATUS}" = "Synced" ] && [ "${HEALTH_STATUS}" = "Healthy" ]; then
+                echo "Argo CD Application ${ARGOCD_APP_NAME} is Synced and Healthy."
+                break
+              fi
+            else
+              echo "[$(date -u +%H:%M:%S)] Argo CD Application ${ARGOCD_APP_NAME} not found yet (elapsed ${ELAPSED}s / ${TIMEOUT_SECONDS}s)."
+            fi
+
+            if [ "${ELAPSED}" -ge "${TIMEOUT_SECONDS}" ]; then
+              echo "FAIL: timed out after ${TIMEOUT_SECONDS}s waiting for ${ARGOCD_APP_NAME} to become Synced and Healthy."
+              kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" -o wide || true
+              kubectl get pods -n "${TARGET_NAMESPACE}" || true
+              exit 1
+            fi
+
+            sleep "${INTERVAL_SECONDS}"
+            ELAPSED=$((ELAPSED + INTERVAL_SECONDS))
+          done
+
+      - name: Annotate the CloudWatch Agent ServiceAccount with the dedicated IRSA role
+        if: ${{ inputs.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Compensates for a verified gap in the pinned chart (6.2.0): it
+          # has no values-driven ServiceAccount annotation mechanism (see
+          # the "Generate the temporary deployment values file" step's
+          # comment for the exact evidence). This annotates the single
+          # ServiceAccount Argo CD's sync already created -- it does not
+          # create a new Kubernetes ServiceAccount resource. Argo CD's
+          # selfHeal will not revert this: the annotation is not part of
+          # the chart's own rendered manifest, so Argo CD's diff never
+          # considers it managed/out-of-sync.
+          kubectl get serviceaccount "$CLOUDWATCH_AGENT_SERVICE_ACCOUNT" -n "$TARGET_NAMESPACE" >/dev/null
+
+          kubectl annotate serviceaccount "$CLOUDWATCH_AGENT_SERVICE_ACCOUNT" -n "$TARGET_NAMESPACE" \
+            "eks.amazonaws.com/role-arn=${CW_METRICS_ROLE_ARN}" \
+            --overwrite
+
+          ACTUAL_ROLE_ARN="$(kubectl get serviceaccount "$CLOUDWATCH_AGENT_SERVICE_ACCOUNT" -n "$TARGET_NAMESPACE" -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}')"
+          if [ "$ACTUAL_ROLE_ARN" != "$CW_METRICS_ROLE_ARN" ]; then
+            echo "FAIL: ServiceAccount ${CLOUDWATCH_AGENT_SERVICE_ACCOUNT} role-arn annotation is ${ACTUAL_ROLE_ARN}, expected ${CW_METRICS_ROLE_ARN}."
+            exit 1
+          fi
+          echo "OK: ServiceAccount ${TARGET_NAMESPACE}/${CLOUDWATCH_AGENT_SERVICE_ACCOUNT} annotated with ${CW_METRICS_ROLE_ARN}."
+
+          # Existing pods (if any were already created by the operator
+          # before this annotation existed) must be recreated to pick up
+          # the projected IRSA token volume -- restarting only the
+          # workloads that use this ServiceAccount.
+          if kubectl get daemonset cloudwatch-agent -n "$TARGET_NAMESPACE" >/dev/null 2>&1; then
+            kubectl rollout restart daemonset/cloudwatch-agent -n "$TARGET_NAMESPACE"
+          fi
+          if kubectl get deployment cloudwatch-agent-cluster-scraper -n "$TARGET_NAMESPACE" >/dev/null 2>&1; then
+            kubectl rollout restart deployment/cloudwatch-agent-cluster-scraper -n "$TARGET_NAMESPACE"
+          fi
+
+      - name: Wait for CloudWatch Agent workloads to roll out
+        if: ${{ inputs.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if kubectl get daemonset cloudwatch-agent -n "$TARGET_NAMESPACE" >/dev/null 2>&1; then
+            kubectl rollout status daemonset/cloudwatch-agent -n "$TARGET_NAMESPACE" --timeout=10m
+          fi
+          if kubectl get deployment cloudwatch-agent-cluster-scraper -n "$TARGET_NAMESPACE" >/dev/null 2>&1; then
+            kubectl rollout status deployment/cloudwatch-agent-cluster-scraper -n "$TARGET_NAMESPACE" --timeout=10m
+          fi
+          kubectl rollout status deployment/amazon-cloudwatch-observability-controller-manager -n "$TARGET_NAMESPACE" --timeout=10m
+          kubectl rollout status deployment/kube-state-metrics -n "$TARGET_NAMESPACE" --timeout=10m
+          kubectl rollout status daemonset/node-exporter -n "$TARGET_NAMESPACE" --timeout=10m
+
+      - name: Live Kubernetes validation
+        if: ${{ inputs.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "1. Namespace:"
+          kubectl get namespace "$TARGET_NAMESPACE"
+
+          echo ""
+          echo "2. CloudWatch Agent ServiceAccount annotation:"
+          ROLE_ARN_ANNOTATION="$(kubectl get serviceaccount "$CLOUDWATCH_AGENT_SERVICE_ACCOUNT" -n "$TARGET_NAMESPACE" -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}')"
+          if [ "$ROLE_ARN_ANNOTATION" != "$CW_METRICS_ROLE_ARN" ]; then
+            echo "FAIL: unexpected role-arn annotation: ${ROLE_ARN_ANNOTATION}"
+            exit 1
+          fi
+          echo "OK: ${ROLE_ARN_ANNOTATION}"
+
+          echo ""
+          echo "3. Operator Deployment:"
+          kubectl get deployment amazon-cloudwatch-observability-controller-manager -n "$TARGET_NAMESPACE"
+          kubectl wait --for=condition=Available deployment/amazon-cloudwatch-observability-controller-manager -n "$TARGET_NAMESPACE" --timeout=60s
+
+          echo ""
+          echo "4. Node-level CloudWatch Agent DaemonSet:"
+          kubectl get daemonset cloudwatch-agent -n "$TARGET_NAMESPACE"
+          DESIRED="$(kubectl get daemonset cloudwatch-agent -n "$TARGET_NAMESPACE" -o jsonpath='{.status.desiredNumberScheduled}')"
+          READY="$(kubectl get daemonset cloudwatch-agent -n "$TARGET_NAMESPACE" -o jsonpath='{.status.numberReady}')"
+          echo "desired=${DESIRED} ready=${READY}"
+          if [ "${READY:-0}" -lt "${DESIRED:-1}" ]; then
+            echo "FAIL: cloudwatch-agent DaemonSet does not have all desired pods ready."
+            exit 1
+          fi
+
+          echo ""
+          echo "5. Cluster scraper Deployment:"
+          kubectl get deployment cloudwatch-agent-cluster-scraper -n "$TARGET_NAMESPACE"
+          kubectl wait --for=condition=Available deployment/cloudwatch-agent-cluster-scraper -n "$TARGET_NAMESPACE" --timeout=60s
+
+          echo ""
+          echo "6. kube-state-metrics:"
+          kubectl get deployment kube-state-metrics -n "$TARGET_NAMESPACE"
+          kubectl wait --for=condition=Available deployment/kube-state-metrics -n "$TARGET_NAMESPACE" --timeout=60s
+
+          echo ""
+          echo "7. node-exporter:"
+          kubectl get daemonset node-exporter -n "$TARGET_NAMESPACE"
+          NE_DESIRED="$(kubectl get daemonset node-exporter -n "$TARGET_NAMESPACE" -o jsonpath='{.status.desiredNumberScheduled}')"
+          NE_READY="$(kubectl get daemonset node-exporter -n "$TARGET_NAMESPACE" -o jsonpath='{.status.numberReady}')"
+          echo "desired=${NE_DESIRED} ready=${NE_READY}"
+          if [ "${NE_READY:-0}" -lt "${NE_DESIRED:-1}" ]; then
+            echo "FAIL: node-exporter DaemonSet does not have all desired pods ready."
+            exit 1
+          fi
+
+          echo ""
+          echo "8. Every running image in ${TARGET_NAMESPACE} is private, allow-listed, and digest-pinned:"
+          RUNNING_IMAGES="$(kubectl get pods -n "$TARGET_NAMESPACE" -o jsonpath='{range .items[*].spec.containers[*]}{.image}{"\n"}{end}' | sort -u)"
+          echo "$RUNNING_IMAGES"
+          ALLOWED_REPOS="aws-cloud-factory-cloudwatch-agent-operator aws-cloud-factory-cloudwatch-agent aws-cloud-factory-kube-state-metrics aws-cloud-factory-node-exporter"
+          while IFS= read -r image_ref; do
+            [ -z "$image_ref" ] && continue
+            if [[ "$image_ref" != "${ECR_REGISTRY}/"* ]]; then
+              echo "FAIL: running image ${image_ref} is not on the private registry."
+              exit 1
+            fi
+            if [[ "$image_ref" != *"@sha256:"* ]]; then
+              echo "FAIL: running image ${image_ref} has no immutable digest."
+              exit 1
+            fi
+            REPO="${image_ref#"${ECR_REGISTRY}/"}"
+            REPO="${REPO%%:*}"
+            FOUND="false"
+            for allowed in $ALLOWED_REPOS; do
+              [ "$REPO" = "$allowed" ] && FOUND="true"
+            done
+            if [ "$FOUND" != "true" ]; then
+              echo "FAIL: running image ${image_ref} belongs to an unapproved repository ${REPO}."
+              exit 1
+            fi
+          done <<< "$RUNNING_IMAGES"
+          echo "OK: every running image in ${TARGET_NAMESPACE} is private, allow-listed, and digest-pinned."
+
+          echo ""
+          echo "9. No Fluent Bit container or DaemonSet in ${TARGET_NAMESPACE}:"
+          if kubectl get daemonset -n "$TARGET_NAMESPACE" -o name | grep -qi fluent; then
+            echo "FAIL: a Fluent Bit-like DaemonSet exists in ${TARGET_NAMESPACE}."
+            exit 1
+          fi
+          echo "OK: none found."
+
+          echo ""
+          echo "10. No Application Signals instrumentation resources:"
+          if kubectl get instrumentations.cloudwatch.aws.amazon.com -A --no-headers 2>/dev/null | grep -q .; then
+            echo "FAIL: an Instrumentation resource exists."
+            exit 1
+          fi
+          echo "OK: none found."
+
+          echo ""
+          echo "11. No GPU or Neuron workload:"
+          if kubectl get dcgmexporters.cloudwatch.aws.amazon.com -A --no-headers 2>/dev/null | grep -q .; then
+            echo "FAIL: a DcgmExporter resource exists."
+            exit 1
+          fi
+          if kubectl get neuronmonitors.cloudwatch.aws.amazon.com -A --no-headers 2>/dev/null | grep -q .; then
+            echo "FAIL: a NeuronMonitor resource exists."
+            exit 1
+          fi
+          echo "OK: none found."
+
+          echo ""
+          echo "12. No target allocator:"
+          if kubectl get pods -n "$TARGET_NAMESPACE" -o name | grep -qi target-allocator; then
+            echo "FAIL: a target-allocator pod exists."
+            exit 1
+          fi
+          echo "OK: none found."
+
+          echo ""
+          echo "13. Deployed CloudWatch Agent config has no filelog receiver / container-log pipeline:"
+          AGENT_CONFIG="$(kubectl get amazoncloudwatchagents.cloudwatch.aws.amazon.com cloudwatch-agent -n "$TARGET_NAMESPACE" -o jsonpath='{.spec.otelConfig}')"
+          if echo "$AGENT_CONFIG" | grep -qi filelog; then
+            echo "FAIL: deployed CloudWatch Agent otelConfig contains a filelog receiver."
+            exit 1
+          fi
+          echo "OK: no filelog receiver in the deployed configuration."
+
+      - name: Check bounded recent logs for authorization and startup failures
+        if: ${{ inputs.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Bounded (--tail, --since) and pattern-matched only -- never a
+          # full/unbounded log dump, never credentials, tokens, environment
+          # variables, or full pod specs.
+          ERROR_PATTERNS='AccessDenied|NoCredentialProviders|WebIdentityErr|AssumeRoleWithWebIdentity|PutMetricData.*(Unauthorized|AccessDenied)|PutLogEvents.*(Unauthorized|AccessDenied)|ImagePullBackOff|ErrImagePull|x509|webhook.*certificate'
+
+          echo "Operator logs (last 200 lines, last 15m):"
+          OPERATOR_POD="$(kubectl get pods -n "$TARGET_NAMESPACE" -l control-plane=controller-manager -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+          if [ -n "$OPERATOR_POD" ]; then
+            kubectl logs "$OPERATOR_POD" -n "$TARGET_NAMESPACE" --tail=200 --since=15m 2>/dev/null | grep -Ei "$ERROR_PATTERNS" || echo "No matching error patterns found."
+          else
+            echo "Operator pod not found (label control-plane=controller-manager)."
+          fi
+
+          echo ""
+          echo "CloudWatch Agent logs (one sample pod, last 200 lines, last 15m):"
+          AGENT_POD="$(kubectl get pods -n "$TARGET_NAMESPACE" -l app.kubernetes.io/name=cloudwatch-agent -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+          if [ -n "$AGENT_POD" ]; then
+            kubectl logs "$AGENT_POD" -n "$TARGET_NAMESPACE" --tail=200 --since=15m 2>/dev/null | grep -Ei "$ERROR_PATTERNS" || echo "No matching error patterns found."
+          else
+            echo "CloudWatch Agent pod not found (label app.kubernetes.io/name=cloudwatch-agent)."
+          fi
+
+          echo ""
+          echo "NOTE: healthy pods and absent error patterns above do NOT confirm CloudWatch metrics are"
+          echo "actually visible in the console/API. That final data-plane confirmation belongs to"
+          echo "Phase 6B3 and requires actual CloudWatch evidence supplied by the user."
+
+      - name: Workflow summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## GoldenGate observability (CloudWatch metrics) deploy summary"
+            echo ""
+            echo "**Phase 6B2B** -- private-image-only GitOps source and deployment workflow."
+            echo ""
+            echo "- Environment: \`${{ inputs.environment }}\`"
+            echo "- Deploy requested: \`${{ inputs.deploy }}\`"
+            echo "- Chart: \`oci://${ECR_REGISTRY}/${HELM_OCI_NAMESPACE}/${CHART_NAME}:${CHART_VERSION}\`"
+            echo "- Argo CD Application: \`${ARGOCD_APP_NAME}\` (namespace \`${ARGOCD_NAMESPACE}\`)"
+            echo "- Release: \`${RELEASE_NAME}\` -> namespace \`${TARGET_NAMESPACE}\`"
+            echo "- Values source: \`${VALUES_FILE}\` (committed; never mutated)"
+            echo ""
+            echo "### Private images (Phase 6B1, verified in this run)"
+            echo ""
+            echo "| Repository | Tag |"
+            echo "|---|---|"
+            if [ -f "${WORKDIR}/image-digests.psv" ]; then
+              while IFS='|' read -r repo tag _digest; do
+                [ -z "$repo" ] && continue
+                echo "| \`${repo}\` | \`${tag}\` |"
+              done < "${WORKDIR}/image-digests.psv"
+            fi
+            echo ""
+            echo "### Explicitly out of scope for this phase"
+            echo ""
+            echo "- CloudWatch alarms, SNS, dashboards"
+            echo "- Shared alerter, metrics-history writer"
+            echo "- GoldenGate replication"
+            echo "- Fluent Bit changes (gg-fluent-bit remains the sole log collector)"
+            echo "- EKS Terraform module enable_cloudwatch (not used by this repository)"
+            echo "- CloudWatch data-plane confirmation (Phase 6B3)"
+            echo ""
+            if [ "${{ inputs.deploy }}" != "true" ]; then
+              echo "### Validation-only run"
+              echo ""
+              echo "deploy=false: no Argo CD Application was created or updated, and no live Kubernetes"
+              echo "validation was performed. Re-run with deploy=true after confirming the required order:"
+              echo "1. Phase 6B2A IAM/Terraform workflow completed."
+              echo "2. argocd-eks-deployment.yaml re-run after this Phase 6B2B source change."
+              echo "3. This workflow (goldengate-observability.yaml) run with deploy=true."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,165 @@
+# GoldenGate observability (Phase 6B2B) -- dev environment values for the
+# upstream amazon-cloudwatch-observability Helm chart, version 6.2.0.
+#
+# This file is consumed directly by Argo CD's goldengate-observability
+# Application (created by .github/workflows/goldengate-observability.yaml).
+# There is no wrapper chart -- Argo CD pulls
+# oci://229410149234.dkr.ecr.eu-west-1.amazonaws.com/helm/amazon-cloudwatch-observability
+# and renders it with a temporary, workflow-generated copy of this file (see
+# below) that additionally carries the CloudWatch Agent IRSA role ARN and
+# tag@digest image references. This committed file is never mutated by the
+# workflow.
+#
+# Responsibility separation (do not blur these):
+#   - gg-fluent-bit (helm/goldengate-platform): GoldenGate runtime and
+#     gg-monitor stdout/stderr logs. Unaffected by this file.
+#   - goldengate-observability (this chart): EKS cluster/node/pod/container
+#     and Kubernetes resource metrics only. No log collection of any kind.
+#   - gg-monitor: GoldenGate deployment/service/lag/abend/process metrics
+#     (its own IRSA role, its own DynamoDB records). Unaffected by this file.
+#
+# Schema verified locally against the exact pinned chart (read-only):
+#   helm repo add aws-observability https://aws-observability.github.io/helm-charts
+#   helm repo update aws-observability
+#   helm pull aws-observability/amazon-cloudwatch-observability --version 6.2.0 --untar --untardir work/upstream
+# This public pull is a local, read-only schema/render check only -- it
+# introduces no public runtime reference into this repository, and the
+# deployment workflow itself pulls only the private mirrored chart.
+
+clusterName: gg-poc-dev
+region: eu-west-1
+k8sMode: EKS
+
+# Traditional (Fluent Bit based) container log collection stays fully
+# disabled -- gg-fluent-bit remains the only application/container log
+# collector. Chart default is true; this is an explicit override.
+containerLogs:
+  enabled: false
+
+# Classic (non-OTel) Container Insights stays disabled -- this deployment
+# uses the OTel Container Insights pipeline exclusively (below). Chart
+# default is true; this is an explicit override.
+containerInsights:
+  enabled: false
+
+# Application Signals (traces/APM) is out of scope for this phase. Chart
+# default is true; this is an explicit override.
+applicationSignals:
+  enabled: false
+
+manager:
+  # Auto-instrumentation injection must never be enabled implicitly.
+  # Chart computes a region-dependent default when unset; pinned to false
+  # explicitly here regardless of region.
+  applicationSignals:
+    autoMonitor:
+      monitorAllServices: false
+  # Operator image: private ECR only. repositoryDomainMap.public and
+  # repository are overridden; repositoryDomainMap's other (China/GovCloud)
+  # entries are chart defaults this environment never uses and are left
+  # untouched by this partial override (Helm deep-merges maps).
+  # tag is the base upstream tag as mirrored in Phase 6B1; the deployment
+  # workflow replaces it with "<tag>@sha256:<digest>" in a temporary
+  # generated values file -- this committed tag is never itself a valid
+  # final deployment reference on its own.
+  image:
+    repository: aws-cloud-factory-cloudwatch-agent-operator
+    tag: "3.4.2"
+    repositoryDomainMap:
+      public: 229410149234.dkr.ecr.eu-west-1.amazonaws.com
+
+agent:
+  # Chart-supported field: names the ServiceAccount the CloudWatch Agent
+  # custom resources reference (agent.serviceAccount.name, see
+  # templates/cloudwatch-agent-serviceaccount.yaml and
+  # templates/linux/cloudwatch-agent-custom-resource.yaml in the pinned
+  # chart). No other ServiceAccount may be named "cloudwatch-agent".
+  serviceAccount:
+    name: cloudwatch-agent
+  # CloudWatch Agent image: private ECR only, same override shape as
+  # manager.image above.
+  image:
+    repository: aws-cloud-factory-cloudwatch-agent
+    tag: "1.300069.0b1529"
+    repositoryDomainMap:
+      public: 229410149234.dkr.ecr.eu-west-1.amazonaws.com
+  # Prometheus target allocator: disabled. This already matches the chart's
+  # own default (false) -- set explicitly here so the intent is visible in
+  # this repository rather than relying on an unstated upstream default.
+  prometheus:
+    targetAllocator:
+      enabled: false
+
+# OTel-native Container Insights: the approved metrics pipeline for this
+# phase (cluster/node/pod/container resource metrics via the OTel collector
+# built into the CloudWatch Agent custom resources). logs.enabled stays
+# false -- this chart is metrics-only; no OTel log (filelog) pipeline is
+# enabled, and gg-fluent-bit is not affected or replaced.
+otelContainerInsights:
+  enabled: true
+  logs:
+    enabled: false
+
+# GPU metrics (NVIDIA DCGM exporter): out of scope for this phase. Chart
+# default is true; this is an explicit override.
+dcgmExporter:
+  enabled: false
+
+# AWS Neuron (Trainium/Inferentia) metrics: out of scope for this phase.
+# Chart default is true; this is an explicit override.
+neuronMonitor:
+  enabled: false
+
+# Kubernetes resource metrics (kube-state-metrics). Already the chart
+# default (true); set explicitly here for visibility, plus the private
+# image override.
+kubeStateMetrics:
+  enabled: true
+  image:
+    repository: aws-cloud-factory-kube-state-metrics
+    tag: "v2.18.0"
+    repositoryDomainMap:
+      public: 229410149234.dkr.ecr.eu-west-1.amazonaws.com
+
+# Node-level resource metrics (Prometheus node-exporter). Already the chart
+# default (true); set explicitly here for visibility, plus the private
+# image override.
+nodeExporter:
+  enabled: true
+  image:
+    repository: aws-cloud-factory-node-exporter
+    tag: "v1.11.1"
+    repositoryDomainMap:
+      public: 229410149234.dkr.ecr.eu-west-1.amazonaws.com
+
+# --------------------------------------------------------------------------
+# NOT configured here, deliberately (see the Phase 6B2B task scope):
+#   - /aws/containerinsights/gg-poc-dev/application
+#   - /aws/containerinsights/gg-poc-dev/dataplane
+#   - /aws/containerinsights/gg-poc-dev/host
+#   (only /aws/containerinsights/gg-poc-dev/performance is pre-created --
+#   see envs/dev/cloudwatch_observability.tf -- and only because
+#   otelContainerInsights writes cluster/node/pod/container performance
+#   events there; no application/dataplane/host log group exists or is
+#   referenced)
+#   - Fluent Bit (containerLogs.enabled: false above)
+#   - Application Signals / X-Ray / auto-instrumentation
+#     (applicationSignals.enabled: false, manager.applicationSignals.
+#     autoMonitor.monitorAllServices: false above)
+#   - Prometheus remote write (not configured anywhere in this file)
+#   - GPU monitoring (dcgmExporter.enabled: false above)
+#   - Neuron monitoring (neuronMonitor.enabled: false above)
+#
+# NOT settable here at all (verified against the pinned chart's actual
+# templates, not assumed): chart 6.2.0 has no values-driven annotation
+# field for either the CloudWatch Agent ServiceAccount
+# (templates/cloudwatch-agent-serviceaccount.yaml) or the operator
+# ServiceAccount (templates/operator-serviceaccount.yaml) -- neither
+# template, nor any other template in this chart version, ever reads a
+# "serviceAccount.annotations" value. The IRSA role annotation
+# (eks.amazonaws.com/role-arn) is therefore applied by the deployment
+# workflow as a bounded post-sync kubectl annotate step, never by a values
+# override in this file and never by a second Kubernetes resource created
+# outside the chart. See goldengate-observability.yaml for the exact
+# mechanism and the cited template evidence.
+# --------------------------------------------------------------------------

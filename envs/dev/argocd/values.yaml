@@ -99,6 +99,15 @@ ecrTokenSync:
       helmOciRepository: helm/goldengate-platform
       argocdRepositorySecretName: argocd-ecr-goldengate-platform-oci
 
+    # Phase 6B2B: the amazon-cloudwatch-observability Helm OCI chart only.
+    # The four mirrored container images (Phase 6B1) are pulled directly by
+    # EKS nodes via the ECR repository policies already established there --
+    # they are never added to Argo CD token sync, which only ever refreshes
+    # credentials for pulling Helm charts.
+    - name: amazon-cloudwatch-observability
+      helmOciRepository: helm/amazon-cloudwatch-observability
+      argocdRepositorySecretName: argocd-ecr-amazon-cloudwatch-observability-oci
+
   image:
     repository: 229410149234.dkr.ecr.eu-west-1.amazonaws.com/aws-cloud-factory-infra-aws-kubectl
     tag: "1.33.13"
