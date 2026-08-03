@@ -101,7 +101,23 @@ jobs:
   validate_and_deploy:
     name: Validate and (optionally) deploy the goldengate-observability Argo CD Application
 
-    runs-on: ubuntu-latest
+    # Phase 6B2B runner/connectivity correction: the gg-poc-dev EKS API
+    # endpoint is private (resolves to an RFC1918 address inside the VPC).
+    # Every step that may reach it -- Connect to EKS cluster and everything
+    # after it, all deploy=true only -- must execute from the VPC-connected
+    # private CodeBuild runner, not a GitHub-hosted runner. GitHub-hosted
+    # ubuntu-latest has no network route to that private address at all
+    # (this is exactly what previously surfaced as "dial tcp
+    # 10.x.x.x:443: i/o timeout", which a later step then misdiagnosed as
+    # "CRD applications.argoproj.io not found" -- see the "Verify private
+    # EKS API connectivity and access" and "Ensure Argo CD Application CRD
+    # exists" steps below for the corrected behavior). Same runner pattern
+    # already used by argocd-eks-deployment.yaml and goldengate-platform.yaml.
+    # This workflow builds no Docker image, so the CodeBuild runner's lack
+    # of a Docker socket does not matter here. deploy=false still performs
+    # no Kubernetes/Argo CD operation on this runner -- running here changes
+    # only network reachability, not what deploy=false actually does.
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
     environment: ${{ inputs.environment }}
 
@@ -120,11 +136,31 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Architecture-detection pattern copied exactly from
+          # argocd-eks-deployment.yaml / goldengate-platform.yaml -- the
+          # CodeBuild runner is not guaranteed to be x86_64, unlike
+          # ubuntu-latest, so a hardcoded linux-amd64 download is no longer
+          # safe here.
           if ! command -v helm >/dev/null 2>&1; then
             HELM_VERSION="v3.15.4"
-            curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" -o /tmp/helm.tar.gz
-            tar -zxf /tmp/helm.tar.gz -C /tmp
-            sudo mv /tmp/linux-amd64/helm /usr/local/bin/helm
+
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64)
+                HELM_ARCH="amd64"
+                ;;
+              aarch64|arm64)
+                HELM_ARCH="arm64"
+                ;;
+              *)
+                echo "Unsupported architecture for Helm: $ARCH"
+                exit 1
+                ;;
+            esac
+
+            curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-${HELM_ARCH}.tar.gz" -o /tmp/helm.tar.gz
+            tar -zxvf /tmp/helm.tar.gz -C /tmp
+            sudo mv "/tmp/linux-${HELM_ARCH}/helm" /usr/local/bin/helm
             sudo chmod +x /usr/local/bin/helm
           fi
           HELM_SEMVER="$(helm version --short | sed -E 's/^v//' | cut -d+ -f1)"
@@ -138,20 +174,65 @@ jobs:
 
           if ! command -v kubectl >/dev/null 2>&1; then
             KUBECTL_VERSION="v1.35.0"
-            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" -o /tmp/kubectl
+
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64)
+                KUBECTL_ARCH="amd64"
+                ;;
+              aarch64|arm64)
+                KUBECTL_ARCH="arm64"
+                ;;
+              *)
+                echo "Unsupported architecture for kubectl: $ARCH"
+                exit 1
+                ;;
+            esac
+
+            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /tmp/kubectl
             sudo mv /tmp/kubectl /usr/local/bin/kubectl
             sudo chmod +x /usr/local/bin/kubectl
           fi
           kubectl version --client=true
 
+          # jq: prefer apt-get (Debian/Ubuntu-based CodeBuild images), fall
+          # back to dnf, then yum (RPM-based images) -- fail clearly rather
+          # than silently continuing without jq if none of these package
+          # managers exist.
           if ! command -v jq >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y jq
+            if command -v apt-get >/dev/null 2>&1; then
+              sudo apt-get update
+              sudo apt-get install -y jq
+            elif command -v dnf >/dev/null 2>&1; then
+              sudo dnf install -y jq
+            elif command -v yum >/dev/null 2>&1; then
+              sudo yum install -y jq
+            else
+              echo "FAIL: jq is not installed and no supported package manager (apt-get, dnf, yum) is available to install it."
+              exit 1
+            fi
           fi
           jq --version
 
           python3 --version
-          python3 -c "import yaml" 2>/dev/null || sudo apt-get install -y python3-yaml
+          if ! python3 -c "import yaml" 2>/dev/null; then
+            if command -v pip3 >/dev/null 2>&1 || python3 -m pip --version >/dev/null 2>&1; then
+              python3 -m pip install --user PyYAML
+            elif command -v apt-get >/dev/null 2>&1; then
+              sudo apt-get update
+              sudo apt-get install -y python3-yaml
+            elif command -v dnf >/dev/null 2>&1; then
+              sudo dnf install -y python3-pyyaml
+            elif command -v yum >/dev/null 2>&1; then
+              sudo yum install -y python3-pyyaml
+            else
+              echo "FAIL: PyYAML is not installed and no pip or supported package manager is available to install it."
+              exit 1
+            fi
+          fi
+          # Verify the import actually succeeds after installation -- never
+          # silently continue without PyYAML (every later step in this
+          # workflow that parses/generates YAML depends on it).
           python3 -c "import yaml; print('PyYAML', yaml.__version__)"
 
       - name: Fail closed unless the AWS caller account is the approved build/ECR account
@@ -753,19 +834,107 @@ jobs:
           kubectl config current-context
           kubectl version --client=true
 
+      - name: Verify private EKS API connectivity and access
+        if: ${{ inputs.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # gg-poc-dev's EKS API endpoint is private (an RFC1918 address
+          # inside the VPC). This step proves the runner can actually reach
+          # it BEFORE any step interprets a connection failure as something
+          # else (e.g. "the Argo CD CRD is missing") -- exactly the false
+          # diagnosis previously produced when this workflow ran on
+          # GitHub-hosted ubuntu-latest, which has no route to that
+          # address at all ("dial tcp 10.x.x.x:443: i/o timeout").
+          #
+          # Bounded (--request-timeout=20s): never hangs the job. Output is
+          # captured to a file and only ever grepped/printed in small,
+          # bounded pieces below -- never the full kubeconfig, an AWS
+          # credential, a token, or an environment-variable value.
+          set +e
+          kubectl get --raw="/readyz" --request-timeout=20s >"${WORKDIR}/readyz-stdout.txt" 2>"${WORKDIR}/readyz-stderr.txt"
+          READYZ_STATUS=$?
+          set -e
+
+          READYZ_OUTPUT="$(cat "${WORKDIR}/readyz-stdout.txt" "${WORKDIR}/readyz-stderr.txt" 2>/dev/null || true)"
+
+          if [ "$READYZ_STATUS" -eq 0 ]; then
+            echo "Private EKS API is reachable from the CodeBuild runner."
+            exit 0
+          fi
+
+          NETWORK_ERROR_PATTERN='i/o timeout|connection timed out|no route to host|context deadline exceeded|connection refused'
+          AUTH_ERROR_PATTERN='Unauthorized|[Ff]orbidden|the server has asked for the client to provide credentials|exec credential|AssumeRole'
+
+          if echo "$READYZ_OUTPUT" | grep -qEi "$NETWORK_ERROR_PATTERN"; then
+            echo "FAIL: the CodeBuild runner cannot reach the private EKS API endpoint."
+            echo "This is a network-reachability failure, not proof that Argo CD or its"
+            echo "applications.argoproj.io CRD is missing -- do not reinstall Argo CD"
+            echo "based on this error alone."
+            echo "This workflow must run from the VPC-connected private CodeBuild runner"
+            echo "(runs-on: codebuild-\${{ vars.PROJECT_NAME_DEV }}-...), which it now does;"
+            echo "if this still fails, the runner's VPC/security-group/routing configuration"
+            echo "to the EKS API endpoint needs investigation, not this workflow's logic."
+            echo "Matched network error pattern in the readyz response."
+            exit 1
+          fi
+
+          if echo "$READYZ_OUTPUT" | grep -qE "$AUTH_ERROR_PATTERN"; then
+            echo "FAIL: the Kubernetes API responded, but EKS authentication or RBAC authorization failed."
+            echo "This indicates a problem with EKS_DEPLOY_ROLE_ARN's aws-auth mapping or"
+            echo "IAM trust, not a missing CRD and not a network-reachability problem."
+            exit 1
+          fi
+
+          echo "FAIL: the private EKS API connectivity check failed for an unexpected reason."
+          echo "Bounded diagnostic (readyz exit status ${READYZ_STATUS}):"
+          echo "$READYZ_OUTPUT" | head -n 15
+          exit 1
+
       - name: Ensure Argo CD Application CRD exists
         if: ${{ inputs.deploy }}
         shell: bash
         run: |
           set -euo pipefail
 
-          kubectl get crd applications.argoproj.io >/dev/null || {
-            echo "CRD applications.argoproj.io not found."
+          # The connectivity preflight above already proved the Kubernetes
+          # API is reachable, so a failure here is about this one specific
+          # CRD lookup, never a reason to re-suspect network reachability.
+          # Every outcome is classified explicitly -- never a single
+          # "kubectl ... || { echo not found }" that silently treats any
+          # failure (network, auth, or otherwise) as "CRD missing".
+          set +e
+          kubectl get crd applications.argoproj.io --request-timeout=20s >"${WORKDIR}/crd-stdout.txt" 2>"${WORKDIR}/crd-stderr.txt"
+          CRD_STATUS=$?
+          set -e
+
+          CRD_OUTPUT="$(cat "${WORKDIR}/crd-stdout.txt" "${WORKDIR}/crd-stderr.txt" 2>/dev/null || true)"
+
+          if [ "$CRD_STATUS" -eq 0 ]; then
+            echo "OK: Argo CD Application CRD (applications.argoproj.io) is present."
+            exit 0
+          fi
+
+          if echo "$CRD_OUTPUT" | grep -qEi 'NotFound|not found'; then
+            echo "FAIL: the Kubernetes API is reachable, but applications.argoproj.io is genuinely absent."
             echo "Argo CD must be installed on this cluster before this Application can be deployed."
             echo "Run the argocd-eks-deployment.yaml workflow first."
             exit 1
-          }
-          echo "Argo CD Application CRD is present."
+          fi
+
+          if echo "$CRD_OUTPUT" | grep -qEi 'Forbidden'; then
+            echo "FAIL: the deploy identity (EKS_DEPLOY_ROLE_ARN) lacks permission to read"
+            echo "CustomResourceDefinitions (applications.argoproj.io). This is an RBAC"
+            echo "authorization gap, not a missing CRD."
+            exit 1
+          fi
+
+          echo "FAIL: the Argo CD Application CRD check failed for an unexpected reason"
+          echo "(status ${CRD_STATUS}) -- this is not a confirmed 'CRD missing' result."
+          echo "Bounded diagnostic:"
+          echo "$CRD_OUTPUT" | head -n 15
+          exit 1
 
       - name: Confirm the observability Argo CD repository Secret exists
         if: ${{ inputs.deploy }}

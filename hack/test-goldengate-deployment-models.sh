@@ -1136,6 +1136,118 @@ PYEOF
     else
       fail "16: goldengate-observability.yaml Phase 6B2B safety correction check failed: ${OBSERVABILITY_CORRECTION_CHECK}"
     fi
+
+    # -------------------------------------------------------------------
+    # Phase 6B2B runner/connectivity correction (focused, static/offline
+    # only -- no AWS/kubectl/network/Git call).
+    # -------------------------------------------------------------------
+    RUNNER_CONNECTIVITY_CHECK="$(python3 - "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" <<'PYEOF'
+import sys
+import yaml
+
+path = sys.argv[1]
+with open(path) as f:
+    text = f.read()
+    doc = yaml.safe_load(text)
+
+results = []
+
+job = doc["jobs"]["validate_and_deploy"]
+steps = job["steps"]
+
+def get_step(name):
+    return next((s for s in steps if s.get("name") == name), None)
+
+# 1-2: exact CodeBuild runner, no ubuntu-latest anywhere in the job.
+EXPECTED_RUNNER = "codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}"
+if job.get("runs-on") != EXPECTED_RUNNER:
+    results.append(f"runs-on={job.get('runs-on')!r}")
+import re
+if re.search(r'runs-on:\s*ubuntu-latest', text):
+    results.append("ubuntu-latest-still-used-as-runs-on")
+
+# 3-4: Helm/kubectl installation supports both amd64 and arm64.
+install_step = get_step("Install or validate required tools")
+if install_step is None:
+    results.append("missing-install-tools-step")
+else:
+    run_text = install_step.get("run", "")
+    if run_text.count("x86_64") < 2:
+        results.append("arch-detection-not-applied-to-both-helm-and-kubectl")
+    if "HELM_ARCH=\"amd64\"" not in run_text and 'HELM_ARCH="amd64"' not in run_text:
+        results.append("helm-amd64-mapping-missing")
+    if 'HELM_ARCH="arm64"' not in run_text:
+        results.append("helm-arm64-mapping-missing")
+    if 'KUBECTL_ARCH="amd64"' not in run_text:
+        results.append("kubectl-amd64-mapping-missing")
+    if 'KUBECTL_ARCH="arm64"' not in run_text:
+        results.append("kubectl-arm64-mapping-missing")
+    if "linux-amd64.tar.gz" in run_text or "linux/amd64/kubectl" in run_text:
+        results.append("hardcoded-linux-amd64-still-present")
+
+# 5-6: connectivity step exists and is deploy-guarded.
+connectivity_step = get_step("Verify private EKS API connectivity and access")
+if connectivity_step is None:
+    results.append("missing-connectivity-step")
+elif connectivity_step.get("if") != "${{ inputs.deploy }}":
+    results.append(f"connectivity-step-if={connectivity_step.get('if')!r}")
+
+# 7: ordering -- Connect to EKS cluster < connectivity step < CRD step.
+names = [s.get("name") for s in steps]
+try:
+    connect_idx = names.index("Connect to EKS cluster")
+    connectivity_idx = names.index("Verify private EKS API connectivity and access")
+    crd_idx = names.index("Ensure Argo CD Application CRD exists")
+    if not (connect_idx < connectivity_idx < crd_idx):
+        results.append(f"step-order-wrong:{connect_idx},{connectivity_idx},{crd_idx}")
+except ValueError as e:
+    results.append(f"step-not-found-for-ordering:{e}")
+
+# 8: bounded request timeout on the connectivity step.
+if connectivity_step is not None:
+    run_text = connectivity_step.get("run", "")
+    if "--request-timeout=20s" not in run_text:
+        results.append("connectivity-step-missing-bounded-timeout")
+
+    # 9: error handling mentions private EKS/network reachability and does
+    # NOT claim the CRD is missing.
+    lowered = run_text.lower()
+    if "private eks api" not in lowered and "network-reachability" not in lowered and "network reachability" not in lowered:
+        results.append("connectivity-step-missing-network-reachability-wording")
+    if "crd applications.argoproj.io not found" in lowered:
+        results.append("connectivity-step-still-claims-crd-missing")
+
+# 10: CRD step separately handles present/not-found/forbidden/unexpected.
+crd_step = get_step("Ensure Argo CD Application CRD exists")
+if crd_step is None:
+    results.append("missing-crd-step")
+else:
+    run_text = crd_step.get("run", "")
+    lowered = run_text.lower()
+    if "is present" not in lowered:
+        results.append("crd-step-missing-present-case")
+    if "genuinely absent" not in lowered and ("not found" not in lowered and "notfound" not in lowered):
+        results.append("crd-step-missing-not-found-case")
+    if "forbidden" not in lowered:
+        results.append("crd-step-missing-forbidden-case")
+    if "unexpected reason" not in lowered:
+        results.append("crd-step-missing-unexpected-case")
+
+    # 11: the old unconditional false-diagnosis pattern must be gone.
+    if "kubectl get crd applications.argoproj.io >/dev/null || {" in run_text:
+        results.append("old-false-diagnosis-pattern-still-present")
+
+if results:
+    print("MISMATCH:" + ";".join(results))
+else:
+    print("OK")
+PYEOF
+)"
+    if [ "$RUNNER_CONNECTIVITY_CHECK" = "OK" ]; then
+      pass "17: goldengate-observability.yaml Phase 6B2B runner/connectivity correction: exact CodeBuild runs-on (no ubuntu-latest), Helm/kubectl amd64+arm64 arch detection, a deploy-guarded 'Verify private EKS API connectivity and access' step correctly ordered between 'Connect to EKS cluster' and 'Ensure Argo CD Application CRD exists' with a bounded request timeout and non-CRD-blaming network-failure wording, and a CRD step that separately classifies present/not-found/forbidden/unexpected (the old unconditional false-diagnosis pattern is gone)"
+    else
+      fail "17: goldengate-observability.yaml Phase 6B2B runner/connectivity correction check failed: ${RUNNER_CONNECTIVITY_CHECK}"
+    fi
   else
     fail "${OBSERVABILITY_WORKFLOW} not found, or python3 unavailable"
   fi
