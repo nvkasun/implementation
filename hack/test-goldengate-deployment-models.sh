@@ -314,21 +314,70 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
       pass "rendered manifest contains no public.ecr.aws reference"
     fi
 
-    if grep -qE "Regex\s+\\\$kubernetes\['namespace_name'\]\s+\^\(goldengate-dev\|goldengate-monitoring\)\\\$" "$PLATFORM_FLUENTBIT_RENDERED"; then
-      pass "Fluent Bit namespace filtering (defense-in-depth grep FILTER) is present and limited to goldengate-dev/goldengate-monitoring"
+    # Deterministic per-namespace tag routing (Phase 6A log-routing
+    # correction): live verification found the previous single-Tail-input
+    # + grep FILTER + rewrite_tag design silently dropped every record
+    # (tail=1032, kubernetes=1032, record_modifier=1032, grep=1032,
+    # grep_dropped=1032, rewrite_tag=0, cloudwatch proc_records=0) because
+    # the grep filter's $kubernetes['namespace_name'] match depended on
+    # Kubernetes-metadata enrichment that had not completed. Replaced with
+    # two independent, deterministic Tail inputs (runtime.*, monitor.*),
+    # each Path-restricted to its own namespace's container-log filename
+    # convention, each enriched by its own kubernetes FILTER (explicit
+    # Kube_Tag_Prefix, enrichment only -- never a routing dependency), and
+    # each OUTPUT matching directly on its own input's tag.
+    TAIL_INPUT_COUNT="$(grep -cE '^\s*Name\s+tail\s*$' "$PLATFORM_FLUENTBIT_RENDERED" || true)"
+    if [ "$TAIL_INPUT_COUNT" -eq 2 ]; then
+      pass "exactly 2 Tail inputs are rendered (runtime, monitor)"
     else
-      fail "Fluent Bit namespace-filtering grep FILTER was not found as expected"
+      fail "expected exactly 2 Tail inputs, found ${TAIL_INPUT_COUNT}"
     fi
 
-    # Input-level scoping: the Tail Path itself must be restricted to the
-    # two approved namespaces' container-log filename convention -- never
-    # the unrestricted /var/log/containers/*.log.
-    EXPECTED_TAIL_PATH="/var/log/containers/*_goldengate-dev_*.log,/var/log/containers/*_goldengate-monitoring_*.log"
-    if grep -Fq -- "$EXPECTED_TAIL_PATH" "$PLATFORM_FLUENTBIT_RENDERED" \
-        && ! grep -Fq -- 'Path              /var/log/containers/*.log' "$PLATFORM_FLUENTBIT_RENDERED"; then
-      pass "Fluent Bit Tail input Path is restricted to exactly the two approved namespace patterns"
+    if grep -Fq -- 'DB                /var/fluent-bit/state/flb_runtime.db' "$PLATFORM_FLUENTBIT_RENDERED" \
+        && grep -Fq -- 'DB                /var/fluent-bit/state/flb_monitor.db' "$PLATFORM_FLUENTBIT_RENDERED"; then
+      pass "runtime and monitor Tail inputs use two separate, non-shared position DB files"
     else
-      fail "Fluent Bit Tail input Path is not restricted as expected"
+      fail "runtime and monitor Tail inputs do not use two separate DB files as expected"
+    fi
+
+    if grep -Fq -- 'Path              /var/log/containers/*_goldengate-dev_*.log' "$PLATFORM_FLUENTBIT_RENDERED" \
+        && grep -Fq -- 'Path              /var/log/containers/*_goldengate-monitoring_*.log' "$PLATFORM_FLUENTBIT_RENDERED" \
+        && ! grep -Fq -- 'Path              /var/log/containers/*.log' "$PLATFORM_FLUENTBIT_RENDERED"; then
+      pass "runtime and monitor Tail inputs have exact, deterministic Paths; no unrestricted /var/log/containers/*.log Path exists"
+    else
+      fail "Tail input Paths are not exactly as expected"
+    fi
+
+    if grep -Fq -- 'Tag               runtime.*' "$PLATFORM_FLUENTBIT_RENDERED" \
+        && grep -Fq -- 'Tag               monitor.*' "$PLATFORM_FLUENTBIT_RENDERED"; then
+      pass "runtime Tail input Tag is runtime.* and monitor Tail input Tag is monitor.*"
+    else
+      fail "Tail input Tags are not exactly runtime.* / monitor.* as expected"
+    fi
+
+    if grep -Fq -- 'Kube_Tag_Prefix   runtime.var.log.containers.' "$PLATFORM_FLUENTBIT_RENDERED" \
+        && grep -Fq -- 'Kube_Tag_Prefix   monitor.var.log.containers.' "$PLATFORM_FLUENTBIT_RENDERED"; then
+      pass "runtime and monitor kubernetes FILTERs set the expected explicit Kube_Tag_Prefix"
+    else
+      fail "explicit Kube_Tag_Prefix values were not found as expected"
+    fi
+
+    if grep -Fq -- 'Match                   runtime.*' "$PLATFORM_FLUENTBIT_RENDERED" \
+        && grep -Fq -- 'Match                   monitor.*' "$PLATFORM_FLUENTBIT_RENDERED"; then
+      pass "runtime cloudwatch_logs OUTPUT uses Match runtime.* and monitor OUTPUT uses Match monitor.*"
+    else
+      fail "cloudwatch_logs OUTPUT Match values are not exactly runtime.* / monitor.* as expected"
+    fi
+
+    if grep -Eq 'Name\s+grep' "$PLATFORM_FLUENTBIT_RENDERED"; then
+      fail "a grep FILTER is still rendered -- routing must not depend on Kubernetes-metadata enrichment"
+    else
+      pass "no grep FILTER is rendered"
+    fi
+    if grep -Eq 'Name\s+rewrite_tag|Emitter_Name|Emitter_Storage\.type|runtime\.\$TAG|monitor\.\$TAG' "$PLATFORM_FLUENTBIT_RENDERED"; then
+      fail "a rewrite_tag FILTER or emitter is still rendered"
+    else
+      pass "no rewrite_tag FILTER or emitter is rendered"
     fi
 
     if grep -qE 'log_group_name[[:space:]]+/adcb/goldengate/dev/runtime$' "$PLATFORM_FLUENTBIT_RENDERED" \

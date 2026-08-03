@@ -647,18 +647,86 @@ jobs:
           fi
           echo "OK: gg-fluent-bit DaemonSet's host log mount (varlog) is read-only."
 
-          echo "Validating the Fluent Bit ConfigMap enforces namespace filtering and exact CloudWatch log-group destinations..."
+          echo "Validating the Fluent Bit ConfigMap uses deterministic per-namespace tag routing (not Kubernetes-metadata-dependent grep/rewrite_tag)..."
           FLUENT_BIT_CM_BLOCK="$(select_document "$RENDERED" "ConfigMap" "gg-fluent-bit-config")"
           if [ -z "$FLUENT_BIT_CM_BLOCK" ]; then
             echo "FAIL: rendered ConfigMap gg-fluent-bit-config was not found."
             exit 1
           fi
-          if ! grep -Fq -- 'Name   grep' <<< "$FLUENT_BIT_CM_BLOCK"; then
-            echo "FAIL: gg-fluent-bit-config does not contain a namespace-filtering grep FILTER."
+
+          # 1: exactly two Tail inputs (runtime, monitor) -- never a single
+          # shared input routed downstream by a metadata-dependent filter.
+          TAIL_INPUT_COUNT="$(grep -cE '^\s*Name\s+tail\s*$' <<< "$FLUENT_BIT_CM_BLOCK")"
+          if [ "$TAIL_INPUT_COUNT" -ne 2 ]; then
+            echo "FAIL: expected exactly 2 Tail inputs, found ${TAIL_INPUT_COUNT}."
             exit 1
           fi
-          if ! grep -Fq -- "${RUNTIME_NAMESPACE}|${MONITOR_NAMESPACE}" <<< "$FLUENT_BIT_CM_BLOCK"; then
-            echo "FAIL: gg-fluent-bit-config's namespace filter does not reference exactly ${RUNTIME_NAMESPACE} and ${MONITOR_NAMESPACE}."
+          echo "OK: exactly 2 Tail inputs are rendered."
+
+          # 2-5: each input's Path and Tag are exact and deterministic.
+          if ! grep -Fq -- "Path              /var/log/containers/*_${RUNTIME_NAMESPACE}_*.log" <<< "$FLUENT_BIT_CM_BLOCK"; then
+            echo "FAIL: runtime Tail input Path is not exactly /var/log/containers/*_${RUNTIME_NAMESPACE}_*.log"
+            exit 1
+          fi
+          if ! grep -Fq -- "Path              /var/log/containers/*_${MONITOR_NAMESPACE}_*.log" <<< "$FLUENT_BIT_CM_BLOCK"; then
+            echo "FAIL: monitor Tail input Path is not exactly /var/log/containers/*_${MONITOR_NAMESPACE}_*.log"
+            exit 1
+          fi
+          if grep -Fq -- "Path              /var/log/containers/*.log" <<< "$FLUENT_BIT_CM_BLOCK"; then
+            echo "FAIL: an unrestricted /var/log/containers/*.log Tail Path still exists."
+            exit 1
+          fi
+          if ! grep -Fq -- 'Tag               runtime.*' <<< "$FLUENT_BIT_CM_BLOCK"; then
+            echo "FAIL: runtime Tail input Tag is not exactly runtime.*"
+            exit 1
+          fi
+          if ! grep -Fq -- 'Tag               monitor.*' <<< "$FLUENT_BIT_CM_BLOCK"; then
+            echo "FAIL: monitor Tail input Tag is not exactly monitor.*"
+            exit 1
+          fi
+          echo "OK: runtime and monitor Tail inputs have exact, deterministic Path and Tag values; no unrestricted Path remains."
+
+          # 6-7: each Kubernetes filter carries an explicit Kube_Tag_Prefix
+          # matching its Tail Tag's expansion -- enrichment metadata, never
+          # a routing dependency.
+          if ! grep -Fq -- 'Kube_Tag_Prefix   runtime.var.log.containers.' <<< "$FLUENT_BIT_CM_BLOCK"; then
+            echo "FAIL: runtime Kubernetes filter does not set Kube_Tag_Prefix runtime.var.log.containers."
+            exit 1
+          fi
+          if ! grep -Fq -- 'Kube_Tag_Prefix   monitor.var.log.containers.' <<< "$FLUENT_BIT_CM_BLOCK"; then
+            echo "FAIL: monitor Kubernetes filter does not set Kube_Tag_Prefix monitor.var.log.containers."
+            exit 1
+          fi
+          KUBERNETES_FILTER_COUNT="$(grep -cE '^\s*Name\s+kubernetes\s*$' <<< "$FLUENT_BIT_CM_BLOCK")"
+          if [ "$KUBERNETES_FILTER_COUNT" -ne 2 ]; then
+            echo "FAIL: expected exactly 2 kubernetes FILTERs (one per input), found ${KUBERNETES_FILTER_COUNT}."
+            exit 1
+          fi
+          echo "OK: both kubernetes FILTERs set the expected explicit Kube_Tag_Prefix."
+
+          # 10-11: the previously-verified-broken metadata-dependent
+          # routing stages (grep filter, rewrite_tag filter/emitter) must
+          # be completely absent.
+          if grep -Eq -- 'Name\s+grep' <<< "$FLUENT_BIT_CM_BLOCK"; then
+            echo "FAIL: a grep FILTER is still rendered -- routing must not depend on Kubernetes-metadata enrichment."
+            exit 1
+          fi
+          if grep -Eq -- 'Name\s+rewrite_tag|Emitter_Name|Emitter_Storage\.type|runtime\.\$TAG|monitor\.\$TAG' <<< "$FLUENT_BIT_CM_BLOCK"; then
+            echo "FAIL: a rewrite_tag FILTER or emitter is still rendered -- routing must be direct via Tail Tag, not rewritten downstream."
+            exit 1
+          fi
+          echo "OK: no grep FILTER and no rewrite_tag FILTER/emitter are rendered."
+
+          # 8-9, 12-13: outputs match directly on each Tail input's own tag
+          # and retain the exact, pre-created CloudWatch log-group
+          # destinations, storage.total_limit_size, and auto_create_group
+          # false.
+          if ! grep -Fq -- 'Match                   runtime.*' <<< "$FLUENT_BIT_CM_BLOCK"; then
+            echo "FAIL: runtime cloudwatch_logs OUTPUT does not use Match runtime.*"
+            exit 1
+          fi
+          if ! grep -Fq -- 'Match                   monitor.*' <<< "$FLUENT_BIT_CM_BLOCK"; then
+            echo "FAIL: monitor cloudwatch_logs OUTPUT does not use Match monitor.*"
             exit 1
           fi
           for expected_log_group in "$FLUENT_BIT_RUNTIME_LOG_GROUP" "$FLUENT_BIT_MONITOR_LOG_GROUP"; do
@@ -675,7 +743,7 @@ jobs:
             echo "FAIL: gg-fluent-bit-config does not explicitly disable auto_create_group."
             exit 1
           fi
-          echo "OK: namespace filtering is present and both CloudWatch log-group destinations are exact and pre-created (auto_create_group false)."
+          echo "OK: each OUTPUT matches directly on its own input's tag, and both CloudWatch log-group destinations are exact and pre-created (auto_create_group false)."
 
           echo "Validating the rendered Fluent Bit DaemonSet image matches FLUENT_BIT_IMAGE exactly..."
           RENDERED_IMAGE_LINE="$(grep -m1 -- "image:" <<< "$FLUENT_BIT_DS_BLOCK" || true)"
@@ -711,18 +779,6 @@ jobs:
             exit 1
           fi
           echo "OK: no live public.ecr.aws reference anywhere in the Phase 6A chart source or rendered manifest."
-
-          echo "Validating the Tail input Path is restricted to exactly the two approved namespace patterns..."
-          EXPECTED_TAIL_PATH="/var/log/containers/*_${RUNTIME_NAMESPACE}_*.log,/var/log/containers/*_${MONITOR_NAMESPACE}_*.log"
-          if ! grep -Fq -- "Path              ${EXPECTED_TAIL_PATH}" "$RENDERED"; then
-            echo "FAIL: Fluent Bit tail INPUT Path is not restricted to exactly: ${EXPECTED_TAIL_PATH}"
-            exit 1
-          fi
-          if grep -Fq -- "Path              /var/log/containers/*.log" "$RENDERED"; then
-            echo "FAIL: Fluent Bit tail INPUT Path still tails every container log cluster-wide."
-            exit 1
-          fi
-          echo "OK: Tail input Path is restricted to exactly the two approved namespace patterns."
 
           echo "Validating both cloudwatch_logs OUTPUTs are filesystem-buffer bounded..."
           TOTAL_LIMIT_SIZE_COUNT="$(grep -v '^\s*#' "$RENDERED" | grep -cE 'storage\.total_limit_size[[:space:]]+[0-9]')"

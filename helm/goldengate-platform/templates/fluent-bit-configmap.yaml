@@ -45,21 +45,33 @@ data:
         storage.backlog.mem_limit 5M
 
     # Kubernetes container stdout/stderr only, and only for the two
-    # approved namespaces -- Path itself is restricted (not merely filtered
-    # downstream) to the standard containerd/CRI container-log filename
-    # convention /var/log/containers/<pod>_<namespace>_<container>-<id>.log,
-    # so logs from any other namespace are never tailed at all. The
-    # Kubernetes-metadata grep FILTER below is kept as defense-in-depth in
-    # case that filename convention ever changes. This does NOT tail
-    # application files under /u02 (ggserr.log, dirrpt/*.rpt) -- container
-    # log collection here provides no EFS file-log coverage; that is a
-    # separate, later, explicitly-approved mechanism.
+    # approved namespaces. Two separate, deterministic Tail inputs (one per
+    # namespace, each with its own Tag and its own position DB) -- never a
+    # single shared input routed downstream by Kubernetes-metadata-
+    # dependent filters. Live verification found the previous single-input
+    # + grep + rewrite_tag design silently dropped every record: the grep
+    # filter's $kubernetes['namespace_name'] match depends on the
+    # kubernetes FILTER having already enriched the record, and under the
+    # deployed conditions that enrichment did not complete before the grep
+    # filter ran, so 100% of records were removed (tail=1032,
+    # kubernetes=1032, record_modifier=1032, grep=1032,
+    # grep_dropped=1032, rewrite_tag=0, cloudwatch proc_records=0). Path
+    # itself is restricted to the standard containerd/CRI container-log
+    # filename convention /var/log/containers/<pod>_<namespace>_<container>-<id>.log,
+    # so logs from any other namespace are never tailed at all -- this
+    # restriction happens before any Kubernetes enrichment and does not
+    # depend on it succeeding. This does NOT tail application files under
+    # /u02 (ggserr.log, dirrpt/*.rpt) -- container log collection here
+    # provides no EFS file-log coverage; that is a separate, later,
+    # explicitly-approved mechanism. Read_from_Head is deliberately not
+    # set (defaults to Off) -- only new records after rollout are ingested,
+    # existing historical container logs are not unexpectedly re-ingested.
     [INPUT]
         Name              tail
-        Tag               kube.*
-        Path              /var/log/containers/*_{{ .Values.fluentBit.namespaces.runtime }}_*.log,/var/log/containers/*_{{ .Values.fluentBit.namespaces.monitoring }}_*.log
+        Tag               runtime.*
+        Path              /var/log/containers/*_{{ .Values.fluentBit.namespaces.runtime }}_*.log
         multiline.parser  docker, cri
-        DB                /var/fluent-bit/state/flb_kube.db
+        DB                /var/fluent-bit/state/flb_runtime.db
         Mem_Buf_Limit     5MB
         Buffer_Chunk_Size 32k
         Buffer_Max_Size   256k
@@ -67,9 +79,47 @@ data:
         Refresh_Interval  10
         storage.type      filesystem
 
+    [INPUT]
+        Name              tail
+        Tag               monitor.*
+        Path              /var/log/containers/*_{{ .Values.fluentBit.namespaces.monitoring }}_*.log
+        multiline.parser  docker, cri
+        DB                /var/fluent-bit/state/flb_monitor.db
+        Mem_Buf_Limit     5MB
+        Buffer_Chunk_Size 32k
+        Buffer_Max_Size   256k
+        Skip_Long_Lines   On
+        Refresh_Interval  10
+        storage.type      filesystem
+
+    # Kubernetes metadata enrichment (namespace/pod/container/labels) only
+    # -- never a routing dependency. Each Tail input's tag already
+    # determines its CloudWatch destination (see the OUTPUT Match values
+    # below); an enrichment failure here can degrade metadata but can never
+    # drop or misroute a record, unlike the previous grep-filter design.
+    # Kube_Tag_Prefix is set explicitly per input, matching each Tail Tag's
+    # expansion exactly (tag = "<prefix><tail-of-path>", where the tailed
+    # path is under /var/log/containers/), rather than relying on Fluent
+    # Bit's automatic kube.*-only prefix stripping.
     [FILTER]
-        Name                kubernetes
-        Match               kube.*
+        Name              kubernetes
+        Match             runtime.*
+        Kube_Tag_Prefix   runtime.var.log.containers.
+        Kube_URL            https://kubernetes.default.svc:443
+        Kube_CA_File        /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        Kube_Token_File     /var/run/secrets/kubernetes.io/serviceaccount/token
+        Merge_Log           On
+        Merge_Log_Key       log_processed
+        K8S-Logging.Parser  On
+        K8S-Logging.Exclude On
+        Labels              On
+        Annotations         Off
+        Buffer_Size         0
+
+    [FILTER]
+        Name              kubernetes
+        Match             monitor.*
+        Kube_Tag_Prefix   monitor.var.log.containers.
         Kube_URL            https://kubernetes.default.svc:443
         Kube_CA_File        /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
         Kube_Token_File     /var/run/secrets/kubernetes.io/serviceaccount/token
@@ -83,29 +133,14 @@ data:
 
     # environment=dev static metadata -- the same literal value this chart
     # is rendered with (.Values.environment), never fabricated per record.
+    # Match * is safe here: the only application log inputs in this
+    # configuration are runtime.* and monitor.* (no other INPUT exists),
+    # so this can never pick up an unrelated/unapproved namespace's
+    # records.
     [FILTER]
         Name   record_modifier
-        Match  kube.*
+        Match  *
         Record environment {{ .Values.environment }}
-
-    # Namespace allow-list: goldengate-dev and goldengate-monitoring only.
-    # A record whose kubernetes.namespace_name is not one of these two is
-    # dropped here and never reaches an OUTPUT -- this chart does not
-    # collect every cluster namespace.
-    [FILTER]
-        Name   grep
-        Match  kube.*
-        Regex  $kubernetes['namespace_name']  ^({{ .Values.fluentBit.namespaces.runtime }}|{{ .Values.fluentBit.namespaces.monitoring }})$
-
-    # Route to a distinct tag per approved namespace so each can target its
-    # own pre-created, exact CloudWatch log group below (never a single
-    # dynamic/templated group name, never auto-created).
-    [FILTER]
-        Name         rewrite_tag
-        Match        kube.*
-        Rule         $kubernetes['namespace_name']  ^{{ .Values.fluentBit.namespaces.runtime }}$      runtime.$TAG  false
-        Rule         $kubernetes['namespace_name']  ^{{ .Values.fluentBit.namespaces.monitoring }}$   monitor.$TAG  false
-        Emitter_Name gg_fluent_bit_re_emitted
 
     [OUTPUT]
         Name                    cloudwatch_logs
