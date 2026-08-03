@@ -1205,8 +1205,164 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Phase 6B2B DaemonSet full-readiness correction: `kubectl rollout
+          # status` on a DaemonSet only proves the rolling update *finished*
+          # -- with the default rollingUpdate.maxUnavailable=1, it reports
+          # success even while one pod is still not Ready/Available. This is
+          # exactly what happened live: rollout status succeeded with
+          # READY=1 AVAILABLE=1 against DESIRED=2. wait_for_daemonset_fully_ready
+          # below is a bounded, exact-readiness gate on top of rollout
+          # status -- it never replaces it -- and show_daemonset_diagnostics
+          # prints bounded, credential-free evidence the moment that gate
+          # times out, so a future occurrence is diagnosable from the
+          # workflow log instead of requiring live kubectl access.
+
+          wait_for_daemonset_fully_ready() {
+            local namespace="$1"
+            local ds_name="$2"
+            local timeout_seconds="$3"
+            local poll_interval=10
+            local start_ts elapsed now_ts
+            local generation observed desired current updated ready available unavailable
+            local ds_json
+
+            start_ts="$(date +%s)"
+
+            while true; do
+              ds_json="$(kubectl get daemonset "$ds_name" -n "$namespace" -o json)"
+
+              generation="$(jq -r '.metadata.generation // 0' <<<"$ds_json")"
+              observed="$(jq -r '.status.observedGeneration // 0' <<<"$ds_json")"
+              desired="$(jq -r '.status.desiredNumberScheduled // 0' <<<"$ds_json")"
+              current="$(jq -r '.status.currentNumberScheduled // 0' <<<"$ds_json")"
+              updated="$(jq -r '.status.updatedNumberScheduled // 0' <<<"$ds_json")"
+              ready="$(jq -r '.status.numberReady // 0' <<<"$ds_json")"
+              available="$(jq -r '.status.numberAvailable // 0' <<<"$ds_json")"
+              unavailable="$(jq -r '.status.numberUnavailable // 0' <<<"$ds_json")"
+
+              echo "${ds_name}: generation=${generation} observed=${observed} desired=${desired} current=${current} updated=${updated} ready=${ready} available=${available} unavailable=${unavailable}"
+
+              if [ "$generation" = "$observed" ] \
+                && [ "$desired" -gt 0 ] \
+                && [ "$current" -eq "$desired" ] \
+                && [ "$updated" -eq "$desired" ] \
+                && [ "$ready" -eq "$desired" ] \
+                && [ "$available" -eq "$desired" ] \
+                && [ "$unavailable" -eq 0 ]; then
+                echo "OK: ${ds_name} is fully ready (${ready}/${desired}, generation=${generation} observed=${observed})."
+                return 0
+              fi
+
+              now_ts="$(date +%s)"
+              elapsed=$(( now_ts - start_ts ))
+              if [ "$elapsed" -ge "$timeout_seconds" ]; then
+                return 1
+              fi
+              sleep "$poll_interval"
+            done
+          }
+
+          show_daemonset_diagnostics() {
+            local namespace="$1"
+            local ds_name="$2"
+            local ds_json selector pods_json not_ready_pods
+
+            echo "----- DaemonSet diagnostics: ${namespace}/${ds_name} -----"
+
+            ds_json="$(kubectl get daemonset "$ds_name" -n "$namespace" -o json 2>/dev/null || true)"
+            if [ -z "$ds_json" ]; then
+              echo "Could not retrieve DaemonSet ${ds_name} for diagnostics."
+              return 0
+            fi
+
+            echo "Status fields:"
+            jq -r '.status | "desiredNumberScheduled=\(.desiredNumberScheduled // 0) currentNumberScheduled=\(.currentNumberScheduled // 0) updatedNumberScheduled=\(.updatedNumberScheduled // 0) numberReady=\(.numberReady // 0) numberAvailable=\(.numberAvailable // 0) numberUnavailable=\(.numberUnavailable // 0) numberMisscheduled=\(.numberMisscheduled // 0) observedGeneration=\(.observedGeneration // 0)"' <<<"$ds_json"
+
+            selector="$(jq -r '(.spec.selector.matchLabels // {}) | to_entries | map("\(.key)=\(.value)") | join(",")' <<<"$ds_json")"
+            if [ -z "$selector" ] || [ "$selector" = "null" ]; then
+              echo "Could not derive a pod selector from spec.selector.matchLabels."
+              return 0
+            fi
+            echo "Derived pod selector (from spec.selector.matchLabels): ${selector}"
+
+            pods_json="$(kubectl get pods -n "$namespace" -l "$selector" -o json 2>/dev/null || true)"
+            if [ -z "$pods_json" ]; then
+              echo "Could not list pods for selector ${selector}."
+              return 0
+            fi
+
+            echo ""
+            echo "Matching pods (bounded table, no full pod spec):"
+            echo "NAME|NODE|PHASE|READY|CONTAINERS_READY|RESTARTS|WAITING_REASON|TERMINATED_REASON"
+            jq -r '
+              .items[]
+              | [
+                  .metadata.name,
+                  (.spec.nodeName // "<none>"),
+                  (.status.phase // "<none>"),
+                  ([.status.conditions[]? | select(.type=="Ready") | .status] | first // "Unknown"),
+                  ((([.status.containerStatuses[]? | select(.ready==true)] | length) | tostring) + "/" + ((.status.containerStatuses // []) | length | tostring)),
+                  (([.status.containerStatuses[]?.restartCount] | add // 0) | tostring),
+                  (([.status.containerStatuses[]?.state.waiting.reason] | map(select(. != null))) | join(";")),
+                  (([.status.containerStatuses[]?.state.terminated.reason] | map(select(. != null))) | join(";"))
+                ]
+              | join("|")
+            ' <<<"$pods_json" || true
+
+            not_ready_pods="$(jq -r '.items[] | select(([.status.conditions[]? | select(.type=="Ready" and .status=="True")] | length) == 0) | .metadata.name' <<<"$pods_json")"
+
+            if [ -z "$not_ready_pods" ]; then
+              echo ""
+              echo "No non-Ready pods matched the selector (the readiness gap is in another exact-readiness field)."
+              echo "----- end diagnostics: ${namespace}/${ds_name} -----"
+              return 0
+            fi
+
+            while IFS= read -r pod_name; do
+              [ -z "$pod_name" ] && continue
+
+              local pod_json node_name restart_count container_names container_name
+
+              pod_json="$(jq -c --arg n "$pod_name" '.items[] | select(.metadata.name==$n)' <<<"$pods_json")"
+              node_name="$(jq -r '.spec.nodeName // "<none>"' <<<"$pod_json")"
+              restart_count="$(jq -r '[.status.containerStatuses[]?.restartCount] | add // 0' <<<"$pod_json")"
+
+              echo ""
+              echo "--- Not-Ready pod: ${pod_name} (node: ${node_name}) ---"
+
+              echo "Recent events (bounded to ~20 lines):"
+              kubectl get events -n "$namespace" --field-selector "involvedObject.name=${pod_name}" --sort-by=.lastTimestamp 2>/dev/null | tail -n 20 || echo "Could not retrieve events."
+
+              # Container name(s) come from the pod's own spec -- never an
+              # assumed/invented name -- so this works regardless of what
+              # the pinned chart actually names the container.
+              container_names="$(jq -r '.spec.containers[]?.name' <<<"$pod_json")"
+
+              while IFS= read -r container_name; do
+                [ -z "$container_name" ] && continue
+
+                echo ""
+                echo "Current logs, container '${container_name}' (last 80 lines, no env values/tokens/full spec):"
+                kubectl logs "$pod_name" -n "$namespace" -c "$container_name" --tail=80 2>/dev/null || echo "No current logs available."
+
+                if [ "${restart_count:-0}" -gt 0 ]; then
+                  echo ""
+                  echo "Previous logs, container '${container_name}' (last 80 lines, --previous):"
+                  kubectl logs "$pod_name" -n "$namespace" -c "$container_name" --tail=80 --previous 2>/dev/null || echo "No previous logs available (tolerated)."
+                fi
+              done <<< "$container_names"
+            done <<< "$not_ready_pods"
+
+            echo "----- end diagnostics: ${namespace}/${ds_name} -----"
+          }
+
           if kubectl get daemonset cloudwatch-agent -n "$TARGET_NAMESPACE" >/dev/null 2>&1; then
             kubectl rollout status daemonset/cloudwatch-agent -n "$TARGET_NAMESPACE" --timeout=10m
+            if ! wait_for_daemonset_fully_ready "$TARGET_NAMESPACE" cloudwatch-agent 600; then
+              show_daemonset_diagnostics "$TARGET_NAMESPACE" cloudwatch-agent
+              echo "FAIL: cloudwatch-agent did not reach full readiness before the bounded timeout."
+              exit 1
+            fi
           fi
           if kubectl get deployment cloudwatch-agent-cluster-scraper -n "$TARGET_NAMESPACE" >/dev/null 2>&1; then
             kubectl rollout status deployment/cloudwatch-agent-cluster-scraper -n "$TARGET_NAMESPACE" --timeout=10m
@@ -1214,6 +1370,11 @@ jobs:
           kubectl rollout status deployment/amazon-cloudwatch-observability-controller-manager -n "$TARGET_NAMESPACE" --timeout=10m
           kubectl rollout status deployment/kube-state-metrics -n "$TARGET_NAMESPACE" --timeout=10m
           kubectl rollout status daemonset/node-exporter -n "$TARGET_NAMESPACE" --timeout=10m
+          if ! wait_for_daemonset_fully_ready "$TARGET_NAMESPACE" node-exporter 600; then
+            show_daemonset_diagnostics "$TARGET_NAMESPACE" node-exporter
+            echo "FAIL: node-exporter did not reach full readiness before the bounded timeout."
+            exit 1
+          fi
 
       - name: Verify IRSA injection on the recreated CloudWatch Agent pods
         if: ${{ inputs.deploy }}
@@ -1225,6 +1386,13 @@ jobs:
           # the projected IRSA token wired in -- never prints an env var
           # value, the token itself, or a full pod spec; only the variable
           # NAMES are checked for presence.
+          #
+          # Phase 6B2B DaemonSet full-readiness correction: this now checks
+          # EVERY node-level cloudwatch-agent DaemonSet pod, not just one
+          # ready sample -- a single unready/misconfigured node-agent pod
+          # (the exact live symptom: READY=1 against DESIRED=2) must not be
+          # able to hide behind a different, already-healthy pod being
+          # picked at random.
           find_ready_pod_owned_by() {
             local owner_kind="$1"
             local owner_name_prefix="$2"
@@ -1243,22 +1411,36 @@ jobs:
             local pod_name="$2"
 
             if [ -z "$pod_name" ]; then
-              echo "FAIL: no ready pod found for ${workload_label}."
+              echo "FAIL: no pod name supplied for ${workload_label}."
               exit 1
             fi
             echo "Checking ${workload_label} pod: ${pod_name}"
 
-            local pod_sa
-            pod_sa="$(kubectl get pod "$pod_name" -n "$TARGET_NAMESPACE" -o jsonpath='{.spec.serviceAccountName}')"
+            local pod_json phase ready_status pod_sa env_names
+
+            pod_json="$(kubectl get pod "$pod_name" -n "$TARGET_NAMESPACE" -o json)"
+
+            phase="$(jq -r '.status.phase // ""' <<<"$pod_json")"
+            if [ "$phase" != "Running" ]; then
+              echo "FAIL: ${workload_label} pod ${pod_name} is in phase ${phase}, expected Running."
+              exit 1
+            fi
+
+            ready_status="$(jq -r '([.status.conditions[]? | select(.type=="Ready")] | first | .status) // "Unknown"' <<<"$pod_json")"
+            if [ "$ready_status" != "True" ]; then
+              echo "FAIL: ${workload_label} pod ${pod_name} Ready condition is ${ready_status}, expected True."
+              exit 1
+            fi
+            echo "OK: phase=Running, Ready=True"
+
+            pod_sa="$(jq -r '.spec.serviceAccountName // ""' <<<"$pod_json")"
             if [ "$pod_sa" != "$CLOUDWATCH_AGENT_SERVICE_ACCOUNT" ]; then
               echo "FAIL: ${workload_label} pod ${pod_name} uses serviceAccountName=${pod_sa}, expected ${CLOUDWATCH_AGENT_SERVICE_ACCOUNT}."
               exit 1
             fi
             echo "OK: serviceAccountName == ${CLOUDWATCH_AGENT_SERVICE_ACCOUNT}"
 
-            local env_names
-            env_names="$(kubectl get pod "$pod_name" -n "$TARGET_NAMESPACE" \
-              -o jsonpath='{range .spec.containers[*]}{range .env[*]}{.name}{"\n"}{end}{end}')"
+            env_names="$(jq -r '[.spec.containers[]?.env[]?.name] | .[]' <<<"$pod_json")"
 
             if ! grep -qx "AWS_ROLE_ARN" <<< "$env_names"; then
               echo "FAIL: ${workload_label} pod ${pod_name} is missing the AWS_ROLE_ARN environment variable."
@@ -1273,13 +1455,54 @@ jobs:
             echo "OK: AWS_WEB_IDENTITY_TOKEN_FILE is present (value not printed)."
           }
 
-          DAEMONSET_POD="$(find_ready_pod_owned_by "DaemonSet" "cloudwatch-agent")"
-          verify_pod_irsa "cloudwatch-agent DaemonSet" "$DAEMONSET_POD"
+          verify_daemonset_irsa_all_pods() {
+            local namespace="$1"
+            local ds_name="$2"
+            local ds_json desired selector pods_json pod_count pod_names checked pod_name
+
+            ds_json="$(kubectl get daemonset "$ds_name" -n "$namespace" -o json)"
+            desired="$(jq -r '.status.desiredNumberScheduled // 0' <<<"$ds_json")"
+            selector="$(jq -r '(.spec.selector.matchLabels // {}) | to_entries | map("\(.key)=\(.value)") | join(",")' <<<"$ds_json")"
+
+            if [ -z "$selector" ] || [ "$selector" = "null" ]; then
+              echo "FAIL: could not derive a pod selector for DaemonSet ${ds_name} from spec.selector.matchLabels."
+              exit 1
+            fi
+            if [ -z "$desired" ] || [ "$desired" -eq 0 ]; then
+              echo "FAIL: DaemonSet ${ds_name} desiredNumberScheduled is zero or empty (${desired})."
+              exit 1
+            fi
+
+            echo "Verifying IRSA on every ${ds_name} pod (selector: ${selector}, expected count: ${desired})..."
+
+            pods_json="$(kubectl get pods -n "$namespace" -l "$selector" -o json)"
+            pod_count="$(jq '.items | length' <<<"$pods_json")"
+            if [ "$pod_count" -ne "$desired" ]; then
+              echo "FAIL: found ${pod_count} pods for DaemonSet ${ds_name}, expected exactly ${desired} (desiredNumberScheduled) -- a desired node-agent pod is missing."
+              exit 1
+            fi
+
+            pod_names="$(jq -r '.items[].metadata.name' <<<"$pods_json")"
+            checked=0
+            while IFS= read -r pod_name; do
+              [ -z "$pod_name" ] && continue
+              verify_pod_irsa "${ds_name} DaemonSet" "$pod_name"
+              checked=$((checked + 1))
+            done <<< "$pod_names"
+
+            if [ "$checked" -ne "$desired" ]; then
+              echo "FAIL: checked ${checked} ${ds_name} pods, expected ${desired}."
+              exit 1
+            fi
+            echo "OK: IRSA verified on all ${checked} ${ds_name} DaemonSet pods (matches desiredNumberScheduled=${desired})."
+          }
+
+          verify_daemonset_irsa_all_pods "$TARGET_NAMESPACE" cloudwatch-agent
 
           CLUSTER_SCRAPER_POD="$(find_ready_pod_owned_by "ReplicaSet" "cloudwatch-agent-cluster-scraper")"
           verify_pod_irsa "cloudwatch-agent-cluster-scraper Deployment" "$CLUSTER_SCRAPER_POD"
 
-          echo "OK: IRSA injection verified on at least one ready pod from each CloudWatch Agent workload."
+          echo "OK: IRSA injection verified on every cloudwatch-agent DaemonSet pod and the cluster-scraper pod."
 
       - name: Live Kubernetes validation
         if: ${{ inputs.deploy }}
@@ -1305,15 +1528,22 @@ jobs:
           kubectl wait --for=condition=Available deployment/amazon-cloudwatch-observability-controller-manager -n "$TARGET_NAMESPACE" --timeout=60s
 
           echo ""
-          echo "4. Node-level CloudWatch Agent DaemonSet:"
+          echo "4. Node-level CloudWatch Agent DaemonSet (confirmation after the earlier exact-readiness wait in \"Wait for CloudWatch Agent workloads to roll out\" -- this is not the first place complete readiness is enforced):"
           kubectl get daemonset cloudwatch-agent -n "$TARGET_NAMESPACE"
-          DESIRED="$(kubectl get daemonset cloudwatch-agent -n "$TARGET_NAMESPACE" -o jsonpath='{.status.desiredNumberScheduled}')"
-          READY="$(kubectl get daemonset cloudwatch-agent -n "$TARGET_NAMESPACE" -o jsonpath='{.status.numberReady}')"
-          echo "desired=${DESIRED} ready=${READY}"
-          if [ "${READY:-0}" -lt "${DESIRED:-1}" ]; then
-            echo "FAIL: cloudwatch-agent DaemonSet does not have all desired pods ready."
+          CW_DS_JSON="$(kubectl get daemonset cloudwatch-agent -n "$TARGET_NAMESPACE" -o json)"
+          DESIRED="$(jq -r '.status.desiredNumberScheduled // empty' <<<"$CW_DS_JSON")"
+          READY="$(jq -r '.status.numberReady // 0' <<<"$CW_DS_JSON")"
+          AVAILABLE="$(jq -r '.status.numberAvailable // 0' <<<"$CW_DS_JSON")"
+          echo "desired=${DESIRED:-<empty>} ready=${READY} available=${AVAILABLE}"
+          if [ -z "${DESIRED:-}" ] || [ "$DESIRED" -eq 0 ]; then
+            echo "FAIL: cloudwatch-agent DaemonSet desiredNumberScheduled is zero or empty -- cannot validate readiness."
             exit 1
           fi
+          if [ "$READY" -ne "$DESIRED" ] || [ "$AVAILABLE" -ne "$DESIRED" ]; then
+            echo "FAIL: cloudwatch-agent DaemonSet does not have all desired pods ready and available (desired=${DESIRED} ready=${READY} available=${AVAILABLE})."
+            exit 1
+          fi
+          echo "OK: cloudwatch-agent DaemonSet is fully ready and available (${READY}/${DESIRED})."
 
           echo ""
           echo "5. Cluster scraper Deployment:"
@@ -1326,15 +1556,22 @@ jobs:
           kubectl wait --for=condition=Available deployment/kube-state-metrics -n "$TARGET_NAMESPACE" --timeout=60s
 
           echo ""
-          echo "7. node-exporter:"
+          echo "7. node-exporter (confirmation after the earlier exact-readiness wait, not the first place complete readiness is enforced):"
           kubectl get daemonset node-exporter -n "$TARGET_NAMESPACE"
-          NE_DESIRED="$(kubectl get daemonset node-exporter -n "$TARGET_NAMESPACE" -o jsonpath='{.status.desiredNumberScheduled}')"
-          NE_READY="$(kubectl get daemonset node-exporter -n "$TARGET_NAMESPACE" -o jsonpath='{.status.numberReady}')"
-          echo "desired=${NE_DESIRED} ready=${NE_READY}"
-          if [ "${NE_READY:-0}" -lt "${NE_DESIRED:-1}" ]; then
-            echo "FAIL: node-exporter DaemonSet does not have all desired pods ready."
+          NE_DS_JSON="$(kubectl get daemonset node-exporter -n "$TARGET_NAMESPACE" -o json)"
+          NE_DESIRED="$(jq -r '.status.desiredNumberScheduled // empty' <<<"$NE_DS_JSON")"
+          NE_READY="$(jq -r '.status.numberReady // 0' <<<"$NE_DS_JSON")"
+          NE_AVAILABLE="$(jq -r '.status.numberAvailable // 0' <<<"$NE_DS_JSON")"
+          echo "desired=${NE_DESIRED:-<empty>} ready=${NE_READY} available=${NE_AVAILABLE}"
+          if [ -z "${NE_DESIRED:-}" ] || [ "$NE_DESIRED" -eq 0 ]; then
+            echo "FAIL: node-exporter DaemonSet desiredNumberScheduled is zero or empty -- cannot validate readiness."
             exit 1
           fi
+          if [ "$NE_READY" -ne "$NE_DESIRED" ] || [ "$NE_AVAILABLE" -ne "$NE_DESIRED" ]; then
+            echo "FAIL: node-exporter DaemonSet does not have all desired pods ready and available (desired=${NE_DESIRED} ready=${NE_READY} available=${NE_AVAILABLE})."
+            exit 1
+          fi
+          echo "OK: node-exporter DaemonSet is fully ready and available (${NE_READY}/${NE_DESIRED})."
 
           echo ""
           echo "8. Every running image (containers and initContainers) in ${TARGET_NAMESPACE} is private, allow-listed, and digest-pinned:"
@@ -1420,37 +1657,82 @@ jobs:
           done <<< "$AGENT_CR_NAMES"
 
       - name: Check bounded recent logs for authorization and startup failures
-        if: ${{ inputs.deploy }}
+        # Phase 6B2B DaemonSet full-readiness correction: this must still run
+        # (and still only as a non-destructive, evidence-only diagnostic)
+        # when an earlier deploy=true step -- e.g. the exact-readiness wait
+        # or Live Kubernetes validation -- has already failed the job.
+        # Previously this step was skipped in exactly that case, discarding
+        # the log evidence a real failure needs. always() is paired with
+        # inputs.deploy so it still never runs on deploy=false.
+        if: ${{ always() && inputs.deploy }}
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          # Deliberately no "set -e": every command below is individually
+          # guarded so this diagnostic step always finishes with exit 0 --
+          # including when the cluster state it inspects is itself partial
+          # or broken because an earlier step failed. It must never replace
+          # or mask the original failure, only add bounded, credential-free
+          # evidence alongside it.
 
           # Bounded (--tail, --since) and pattern-matched only -- never a
           # full/unbounded log dump, never credentials, tokens, environment
           # variables, or full pod specs.
-          ERROR_PATTERNS='AccessDenied|NoCredentialProviders|WebIdentityErr|AssumeRoleWithWebIdentity|PutMetricData.*(Unauthorized|AccessDenied)|PutLogEvents.*(Unauthorized|AccessDenied)|ImagePullBackOff|ErrImagePull|x509|webhook.*certificate'
+          ERROR_PATTERNS='AccessDenied|UnauthorizedOperation|NoCredentialProviders|WebIdentityErr|AssumeRoleWithWebIdentity|PutMetricData|PutLogEvents|ImagePullBackOff|ErrImagePull|CrashLoopBackOff|[Rr]eadiness probe failed|connection refused|[Tt]imeout|OOMKilled|x509|webhook.*certificate'
 
-          echo "Operator logs (last 200 lines, last 15m):"
+          echo "Operator logs (last 80 lines, last 15m):"
           OPERATOR_POD="$(kubectl get pods -n "$TARGET_NAMESPACE" -l control-plane=controller-manager -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
           if [ -n "$OPERATOR_POD" ]; then
-            kubectl logs "$OPERATOR_POD" -n "$TARGET_NAMESPACE" --tail=200 --since=15m 2>/dev/null | grep -Ei "$ERROR_PATTERNS" || echo "No matching error patterns found."
+            kubectl logs "$OPERATOR_POD" -n "$TARGET_NAMESPACE" --tail=80 --since=15m 2>/dev/null | grep -Ei "$ERROR_PATTERNS" || echo "No matching error patterns found."
           else
             echo "Operator pod not found (label control-plane=controller-manager)."
           fi
 
           echo ""
-          echo "CloudWatch Agent logs (one sample pod, last 200 lines, last 15m):"
-          AGENT_POD="$(kubectl get pods -n "$TARGET_NAMESPACE" -l app.kubernetes.io/name=cloudwatch-agent -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-          if [ -n "$AGENT_POD" ]; then
-            kubectl logs "$AGENT_POD" -n "$TARGET_NAMESPACE" --tail=200 --since=15m 2>/dev/null | grep -Ei "$ERROR_PATTERNS" || echo "No matching error patterns found."
+          echo "CloudWatch Agent node-agent pod logs (every DaemonSet pod, last 80 lines each, last 15m):"
+          CW_DS_JSON="$(kubectl get daemonset cloudwatch-agent -n "$TARGET_NAMESPACE" -o json 2>/dev/null || true)"
+          if [ -n "$CW_DS_JSON" ]; then
+            CW_SELECTOR="$(jq -r '(.spec.selector.matchLabels // {}) | to_entries | map("\(.key)=\(.value)") | join(",")' <<<"$CW_DS_JSON" 2>/dev/null || true)"
+            if [ -n "$CW_SELECTOR" ] && [ "$CW_SELECTOR" != "null" ]; then
+              AGENT_PODS="$(kubectl get pods -n "$TARGET_NAMESPACE" -l "$CW_SELECTOR" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)"
+              if [ -n "$AGENT_PODS" ]; then
+                while IFS= read -r agent_pod; do
+                  [ -z "$agent_pod" ] && continue
+                  echo "-- ${agent_pod}:"
+                  kubectl logs "$agent_pod" -n "$TARGET_NAMESPACE" --tail=80 --since=15m 2>/dev/null | grep -Ei "$ERROR_PATTERNS" || echo "No matching error patterns found."
+                done <<< "$AGENT_PODS"
+              else
+                echo "No cloudwatch-agent pods found for selector ${CW_SELECTOR}."
+              fi
+            else
+              echo "Could not derive a pod selector from the cloudwatch-agent DaemonSet's spec.selector.matchLabels."
+            fi
           else
-            echo "CloudWatch Agent pod not found (label app.kubernetes.io/name=cloudwatch-agent)."
+            echo "cloudwatch-agent DaemonSet not found."
+          fi
+
+          echo ""
+          echo "cloudwatch-agent-cluster-scraper logs (last 80 lines, last 15m):"
+          SCRAPER_JSON="$(kubectl get deployment cloudwatch-agent-cluster-scraper -n "$TARGET_NAMESPACE" -o json 2>/dev/null || true)"
+          SCRAPER_POD=""
+          if [ -n "$SCRAPER_JSON" ]; then
+            SCRAPER_SELECTOR="$(jq -r '(.spec.selector.matchLabels // {}) | to_entries | map("\(.key)=\(.value)") | join(",")' <<<"$SCRAPER_JSON" 2>/dev/null || true)"
+            if [ -n "$SCRAPER_SELECTOR" ] && [ "$SCRAPER_SELECTOR" != "null" ]; then
+              SCRAPER_POD="$(kubectl get pods -n "$TARGET_NAMESPACE" -l "$SCRAPER_SELECTOR" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+            fi
+          fi
+          if [ -n "$SCRAPER_POD" ]; then
+            kubectl logs "$SCRAPER_POD" -n "$TARGET_NAMESPACE" --tail=80 --since=15m 2>/dev/null | grep -Ei "$ERROR_PATTERNS" || echo "No matching error patterns found."
+          else
+            echo "cloudwatch-agent-cluster-scraper pod not found."
           fi
 
           echo ""
           echo "NOTE: healthy pods and absent error patterns above do NOT confirm CloudWatch metrics are"
           echo "actually visible in the console/API. That final data-plane confirmation belongs to"
           echo "Phase 6B3 and requires actual CloudWatch evidence supplied by the user."
+
+          exit 0
 
       - name: Workflow summary
         if: always()

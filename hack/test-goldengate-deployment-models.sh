@@ -1248,6 +1248,185 @@ PYEOF
     else
       fail "17: goldengate-observability.yaml Phase 6B2B runner/connectivity correction check failed: ${RUNNER_CONNECTIVITY_CHECK}"
     fi
+
+    # -------------------------------------------------------------------
+    # Phase 6B2B DaemonSet full-readiness and failure-diagnostics
+    # correction (focused, static/offline only).
+    # -------------------------------------------------------------------
+    DAEMONSET_READINESS_CHECK="$(python3 - "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" <<'PYEOF'
+import sys
+import yaml
+
+path = sys.argv[1]
+with open(path) as f:
+    text = f.read()
+    doc = yaml.safe_load(text)
+
+results = []
+
+job = doc["jobs"]["validate_and_deploy"]
+steps = job["steps"]
+
+def get_step(name):
+    return next((s for s in steps if s.get("name") == name), None)
+
+# 1-3: a reusable exact DaemonSet readiness function comparing all required
+# fields, with a bounded timeout and polling interval.
+wait_step = get_step("Wait for CloudWatch Agent workloads to roll out")
+if wait_step is None:
+    results.append("missing-wait-step")
+else:
+    run_text = wait_step.get("run", "")
+
+    if "wait_for_daemonset_fully_ready()" not in run_text and "wait_for_daemonset_fully_ready ()" not in run_text:
+        results.append("missing-wait_for_daemonset_fully_ready-function")
+
+    required_fields = [
+        "metadata.generation", "observedGeneration",
+        "desiredNumberScheduled", "currentNumberScheduled",
+        "updatedNumberScheduled", "numberReady", "numberAvailable",
+        "numberUnavailable",
+    ]
+    for field in required_fields:
+        if field not in run_text:
+            results.append(f"missing-field-reference:{field}")
+
+    # exact comparisons, not merely field mentions
+    for exact_cmp in (
+        '[ "$generation" = "$observed" ]',
+        '[ "$current" -eq "$desired" ]',
+        '[ "$updated" -eq "$desired" ]',
+        '[ "$ready" -eq "$desired" ]',
+        '[ "$available" -eq "$desired" ]',
+        '[ "$unavailable" -eq 0 ]',
+        '[ "$desired" -gt 0 ]',
+    ):
+        if exact_cmp not in run_text:
+            results.append(f"missing-exact-comparison:{exact_cmp}")
+
+    if "timeout_seconds" not in run_text or "poll_interval" not in run_text:
+        results.append("missing-bounded-timeout-or-poll-interval")
+
+    # 4: applied to both cloudwatch-agent and node-exporter.
+    if 'wait_for_daemonset_fully_ready "$TARGET_NAMESPACE" cloudwatch-agent' not in run_text:
+        results.append("waiter-not-applied-to-cloudwatch-agent")
+    if 'wait_for_daemonset_fully_ready "$TARGET_NAMESPACE" node-exporter' not in run_text:
+        results.append("waiter-not-applied-to-node-exporter")
+
+    # rollout status must still be present (kept, not replaced).
+    if "kubectl rollout status daemonset/cloudwatch-agent" not in run_text:
+        results.append("rollout-status-for-cloudwatch-agent-removed")
+    if "kubectl rollout status daemonset/node-exporter" not in run_text:
+        results.append("rollout-status-for-node-exporter-removed")
+
+    # 5: dynamically derived selector from spec.selector.matchLabels (no
+    # hardcoded chart labels).
+    if "spec.selector.matchLabels" not in run_text:
+        results.append("missing-dynamic-selector-derivation")
+    if "show_daemonset_diagnostics()" not in run_text and "show_daemonset_diagnostics ()" not in run_text:
+        results.append("missing-show_daemonset_diagnostics-function")
+
+    # 6: failure diagnostics include bounded pod state, node name, waiting
+    # reason, restart count, bounded events, bounded current/previous logs.
+    for marker in (
+        "nodeName", "restartCount", "state.waiting.reason",
+        "kubectl get events", "--tail=80", "--previous",
+        "tolerated",
+    ):
+        if marker not in run_text:
+            results.append(f"diagnostics-missing:{marker}")
+
+    # Correction 3: diagnostics called before failing, exit non-zero, and
+    # no proceeding past the timeout.
+    if run_text.count("show_daemonset_diagnostics \"$TARGET_NAMESPACE\" cloudwatch-agent") < 1:
+        results.append("diagnostics-not-called-for-cloudwatch-agent")
+    if run_text.count("show_daemonset_diagnostics \"$TARGET_NAMESPACE\" node-exporter") < 1:
+        results.append("diagnostics-not-called-for-node-exporter")
+    if "FAIL: cloudwatch-agent did not reach full readiness" not in run_text:
+        results.append("missing-cloudwatch-agent-timeout-fail-message")
+    if "FAIL: node-exporter did not reach full readiness" not in run_text:
+        results.append("missing-node-exporter-timeout-fail-message")
+
+# 7-8: IRSA check iterates across every CloudWatch Agent DaemonSet pod, and
+# the checked count must equal desiredNumberScheduled.
+irsa_step = get_step("Verify IRSA injection on the recreated CloudWatch Agent pods")
+if irsa_step is None:
+    results.append("missing-irsa-step")
+else:
+    run_text = irsa_step.get("run", "")
+    if "verify_daemonset_irsa_all_pods()" not in run_text and "verify_daemonset_irsa_all_pods ()" not in run_text:
+        results.append("missing-verify_daemonset_irsa_all_pods-function")
+    if 'pod_count -ne "$desired"' not in run_text and 'pod_count" -ne "$desired"' not in run_text:
+        results.append("irsa-pod-count-not-compared-to-desired")
+    if 'checked -ne "$desired"' not in run_text and 'checked" -ne "$desired"' not in run_text:
+        results.append("irsa-checked-count-not-compared-to-desired")
+    if "verify_daemonset_irsa_all_pods \"$TARGET_NAMESPACE\" cloudwatch-agent" not in run_text:
+        results.append("irsa-all-pods-not-invoked-for-cloudwatch-agent")
+    # cluster-scraper verification retained.
+    if "cloudwatch-agent-cluster-scraper Deployment" not in run_text:
+        results.append("cluster-scraper-irsa-check-removed")
+    # phase/Ready must be checked per pod (not only serviceAccount/env).
+    if '.status.phase' not in run_text:
+        results.append("irsa-check-missing-phase-check")
+
+# 9: live validation requires both numberReady and numberAvailable to equal
+# desiredNumberScheduled (not READY >= DESIRED).
+live_step = get_step("Live Kubernetes validation")
+if live_step is None:
+    results.append("missing-live-validation-step")
+else:
+    run_text = live_step.get("run", "")
+    if '-lt "${DESIRED:-1}"' in run_text or '-lt "${NE_DESIRED:-1}"' in run_text:
+        results.append("live-validation-still-uses-weak-lt-comparison")
+    if '"$READY" -ne "$DESIRED"' not in run_text or '"$AVAILABLE" -ne "$DESIRED"' not in run_text:
+        results.append("live-validation-missing-cloudwatch-agent-ready-and-available-equality")
+    if '"$NE_READY" -ne "$NE_DESIRED"' not in run_text or '"$NE_AVAILABLE" -ne "$NE_DESIRED"' not in run_text:
+        results.append("live-validation-missing-node-exporter-ready-and-available-equality")
+    if 'DESIRED" -eq 0' not in run_text and "DESIRED\" -eq 0" not in run_text:
+        results.append("live-validation-missing-zero-desired-guard")
+
+# 10: the bounded log diagnostic step uses always() with deploy=true and
+# does not fail the workflow itself.
+log_step = get_step("Check bounded recent logs for authorization and startup failures")
+if log_step is None:
+    results.append("missing-log-diagnostic-step")
+else:
+    if log_step.get("if") != "${{ always() && inputs.deploy }}":
+        results.append(f"log-step-if={log_step.get('if')!r}")
+    run_text = log_step.get("run", "")
+    if "set -euo pipefail" in run_text:
+        results.append("log-step-still-uses-set-e-which-could-fail-the-step-itself")
+    if "exit 0" not in run_text:
+        results.append("log-step-missing-explicit-exit-0")
+
+# 11: no maxUnavailable, probe, resource, toleration, IAM, Terraform, or
+# Helm value change was introduced anywhere in this workflow file. Comment
+# lines are excluded -- explaining *why* the default maxUnavailable=1
+# causes the false-positive-rollout-status problem is exactly what this
+# correction's own comments legitimately do; only actual code/config use is
+# forbidden.
+forbidden_markers = [
+    "maxUnavailable", "readinessProbe", "livenessProbe",
+    "resources:", "tolerations:", "hostNetwork",
+    "updateStrategy",
+]
+code_lines = [ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+code_text = "\n".join(code_lines)
+for marker in forbidden_markers:
+    if marker in code_text:
+        results.append(f"forbidden-workload-change-introduced:{marker.strip()}")
+
+if results:
+    print("MISMATCH:" + ";".join(results))
+else:
+    print("OK")
+PYEOF
+)"
+    if [ "$DAEMONSET_READINESS_CHECK" = "OK" ]; then
+      pass "18: goldengate-observability.yaml Phase 6B2B DaemonSet full-readiness/diagnostics correction: wait_for_daemonset_fully_ready compares generation/observedGeneration/desired/current/updated/ready/available/unavailable with a bounded timeout+poll interval and is applied to both cloudwatch-agent and node-exporter (kubectl rollout status kept, not replaced); show_daemonset_diagnostics dynamically derives the pod selector from spec.selector.matchLabels and prints bounded pod state/events/current+previous logs before the step fails and exits non-zero; IRSA verification now iterates every cloudwatch-agent DaemonSet pod and requires the checked count to equal desiredNumberScheduled while still checking the cluster-scraper pod; Live Kubernetes validation requires exact numberReady==desired and numberAvailable==desired (no weak >=) with a zero-desired guard; the bounded log-diagnostics step is always()-guarded, never uses set -e, and exits 0; and no maxUnavailable/probe/resource/toleration/updateStrategy change was introduced"
+    else
+      fail "18: goldengate-observability.yaml Phase 6B2B DaemonSet full-readiness/diagnostics correction check failed: ${DAEMONSET_READINESS_CHECK}"
+    fi
   else
     fail "${OBSERVABILITY_WORKFLOW} not found, or python3 unavailable"
   fi
