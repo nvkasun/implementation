@@ -1006,6 +1006,136 @@ PYEOF
     else
       fail "12d: ${OBSERVABILITY_WORKFLOW} is missing a Fluent Bit/GPU/Neuron validation check"
     fi
+
+    # ---------------------------------------------------------------------
+    # Phase 6B2B pre-deployment safety correction (focused, static/offline
+    # only -- no AWS/Kubernetes/Argo CD/Git/network call).
+    # ---------------------------------------------------------------------
+
+    OBSERVABILITY_CORRECTION_CHECK="$(python3 - "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" <<'PYEOF'
+import re
+import sys
+import yaml
+
+path = sys.argv[1]
+with open(path) as f:
+    text = f.read()
+    doc = yaml.safe_load(text)
+
+steps = doc["jobs"]["validate_and_deploy"]["steps"]
+results = []
+
+def get_step(name):
+    return next((s for s in steps if s.get("name") == name), None)
+
+# --- Correction 1: OCI source path is exactly "." ------------------------
+create_app_step = get_step("Create or update the Argo CD Application")
+if create_app_step is None:
+    results.append("missing-create-application-step")
+else:
+    run_text = create_app_step.get("run", "")
+    # Matches the Python dict-literal source the step embeds -- proves
+    # "path" is the literal string "." (not merely "path" appearing
+    # anywhere, and not a "chart:" field).
+    if not re.search(r'"path"\s*:\s*"\."\s*,', run_text):
+        results.append("oci-path-not-exactly-dot")
+    if re.search(r'"chart"\s*:', run_text):
+        results.append("unexpected-chart-field-present")
+    if 'repoURL": "oci://229410149234.dkr.ecr.eu-west-1.amazonaws.com/helm/amazon-cloudwatch-observability"' not in run_text:
+        results.append("repoURL-changed-or-missing")
+    if '"targetRevision": "6.2.0"' not in run_text:
+        results.append("targetRevision-changed-or-missing")
+
+    # --- Correction 2: ignoreDifferences + RespectIgnoreDifferences -------
+    if not re.search(r'"group"\s*:\s*""\s*,\s*\n\s*"kind"\s*:\s*"ServiceAccount"\s*,\s*\n\s*"name"\s*:\s*"cloudwatch-agent"\s*,\s*\n\s*"namespace"\s*:\s*"amazon-cloudwatch"', run_text):
+        results.append("ignoreDifferences-rule-not-exact")
+    if '/metadata/annotations/eks.amazonaws.com~1role-arn' not in run_text:
+        results.append("missing-role-arn-json-pointer")
+    if "RespectIgnoreDifferences=true" not in run_text:
+        results.append("missing-RespectIgnoreDifferences")
+    if "CreateNamespace=true" not in run_text:
+        results.append("missing-CreateNamespace")
+    if "ServerSideApply=true" not in run_text:
+        results.append("missing-ServerSideApply")
+    # No broad group/kind/name wildcard: the ignoreDifferences block must
+    # reference exactly one Sid-equivalent rule, not e.g. a bare "kind":
+    # "ServiceAccount" without a name, or a missing namespace.
+    ignore_diff_block_match = re.search(r'"ignoreDifferences"\s*:\s*\[(.*?)\],\s*\n\s*"revisionHistoryLimit"', run_text, re.S)
+    if ignore_diff_block_match:
+        block = ignore_diff_block_match.group(1)
+        if block.count('"kind"') != 1 or block.count('"name"') != 1 or block.count('"namespace"') != 1:
+            results.append("ignoreDifferences-has-more-than-one-rule-or-is-ambiguous")
+        if '"name": "*"' in block or '"kind": "*"' in block:
+            results.append("ignoreDifferences-uses-a-wildcard")
+    else:
+        results.append("ignoreDifferences-block-not-found")
+
+# --- Correction 3: chart repository participates in the immutability check
+immutable_step = get_step("Verify all five repositories (chart + four images) are IMMUTABLE")
+if immutable_step is None:
+    results.append("missing-renamed-immutability-step")
+else:
+    run_text = immutable_step.get("run", "")
+    if "check_repo_immutable \"$CHART_ECR_REPOSITORY\"" not in run_text:
+        results.append("chart-repo-not-checked-for-immutability")
+
+# --- Correction 4: namespace-scoped negative live checks (no -A) ----------
+live_validation_step = get_step("Live Kubernetes validation")
+if live_validation_step is None:
+    results.append("missing-live-validation-step")
+else:
+    run_text = live_validation_step.get("run", "")
+    for forbidden_kind in ("instrumentations.cloudwatch.aws.amazon.com", "dcgmexporters.cloudwatch.aws.amazon.com", "neuronmonitors.cloudwatch.aws.amazon.com"):
+        pattern = re.escape(f"kubectl get {forbidden_kind}")
+        matches = re.findall(pattern + r'[^\n]*', run_text)
+        if not matches:
+            results.append(f"missing-check:{forbidden_kind}")
+        for m in matches:
+            if " -A " in m or m.rstrip().endswith(" -A"):
+                results.append(f"still-uses--A:{forbidden_kind}")
+            if f'-n "$TARGET_NAMESPACE"' not in m:
+                results.append(f"not-namespace-scoped:{forbidden_kind}")
+
+    # --- Correction 5: live image extraction includes initContainers -----
+    if "spec.initContainers" not in run_text and ".spec.initContainers" not in run_text:
+        results.append("live-image-check-missing-initContainers")
+    if "spec.containers" not in run_text:
+        results.append("live-image-check-missing-containers")
+
+    # --- Correction 6: every AmazonCloudWatchAgent CR checked for filelog
+    if "amazoncloudwatchagents.cloudwatch.aws.amazon.com -n \"$TARGET_NAMESPACE\"" not in run_text:
+        results.append("filelog-check-not-listing-all-crs")
+    if re.search(r'amazoncloudwatchagents\.cloudwatch\.aws\.amazon\.com\s+cloudwatch-agent\s+-n', run_text):
+        results.append("filelog-check-still-hardcodes-single-cr-name")
+
+# --- Correction 7: IRSA env var NAME checks without printing values -------
+irsa_step = get_step("Verify IRSA injection on the recreated CloudWatch Agent pods")
+if irsa_step is None:
+    results.append("missing-irsa-verification-step")
+else:
+    run_text = irsa_step.get("run", "")
+    if "AWS_ROLE_ARN" not in run_text:
+        results.append("irsa-check-missing-AWS_ROLE_ARN")
+    if "AWS_WEB_IDENTITY_TOKEN_FILE" not in run_text:
+        results.append("irsa-check-missing-AWS_WEB_IDENTITY_TOKEN_FILE")
+    if "serviceAccountName" not in run_text:
+        results.append("irsa-check-missing-serviceAccountName-check")
+    # Must never print the resolved env var VALUE or a full env dump --
+    # only the pattern that captures NAMES (jsonpath .name, not .value).
+    if re.search(r'\.env\[\*\]\}\{\.value\}', run_text):
+        results.append("irsa-check-appears-to-print-env-values")
+
+if results:
+    print("MISMATCH:" + ";".join(results))
+else:
+    print("OK")
+PYEOF
+)"
+    if [ "$OBSERVABILITY_CORRECTION_CHECK" = "OK" ]; then
+      pass "16: goldengate-observability.yaml Phase 6B2B safety correction: OCI path='.', ignoreDifferences/RespectIgnoreDifferences, chart-repository immutability, namespace-scoped negative checks, initContainers image coverage, all-CR filelog check, and IRSA env-var-name-only verification are all present exactly as required"
+    else
+      fail "16: goldengate-observability.yaml Phase 6B2B safety correction check failed: ${OBSERVABILITY_CORRECTION_CHECK}"
+    fi
   else
     fail "${OBSERVABILITY_WORKFLOW} not found, or python3 unavailable"
   fi

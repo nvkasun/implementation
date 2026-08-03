@@ -2112,6 +2112,7 @@ rules:
       - argocd-ecr-goldengate-oci
       - argocd-ecr-goldengate-monitor-oci
       - argocd-ecr-goldengate-platform-oci
+      - argocd-ecr-amazon-cloudwatch-observability-oci
     verbs:
       - get
       - update

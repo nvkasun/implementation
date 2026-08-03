@@ -208,23 +208,33 @@ jobs:
             check_repo_exists "$repo"
           done < "${WORKDIR}/image-table.psv"
 
-      - name: Verify every image repository is IMMUTABLE
+      - name: Verify all five repositories (chart + four images) are IMMUTABLE
         shell: bash
         run: |
           set -euo pipefail
 
           # Fails closed rather than silently modifying mutability -- this
           # workflow never calls put-image-tag-mutability. Phase 6B1 created
-          # all four image repositories as IMMUTABLE; this only re-confirms
-          # that has not changed since.
-          while IFS='|' read -r repo _tag; do
-            [ -z "$repo" ] && continue
-            MUTABILITY="$(aws ecr describe-repositories --region "$AWS_REGION" --repository-names "$repo" --query 'repositories[0].imageTagMutability' --output text)"
-            if [ "$MUTABILITY" != "IMMUTABLE" ]; then
-              echo "FAIL: repository ${repo} has imageTagMutability=${MUTABILITY}, expected IMMUTABLE."
+          # all five repositories (the chart repository and all four image
+          # repositories) as IMMUTABLE; this only re-confirms that has not
+          # changed since. The chart repository is checked first, using the
+          # exact same check function as the four image repositories --
+          # never a separate, weaker code path.
+          check_repo_immutable() {
+            local repo="$1"
+            local mutability
+            mutability="$(aws ecr describe-repositories --region "$AWS_REGION" --repository-names "$repo" --query 'repositories[0].imageTagMutability' --output text)"
+            if [ "$mutability" != "IMMUTABLE" ]; then
+              echo "FAIL: repository ${repo} has imageTagMutability=${mutability}, expected IMMUTABLE."
               exit 1
             fi
             echo "OK: repository ${repo} is IMMUTABLE."
+          }
+
+          check_repo_immutable "$CHART_ECR_REPOSITORY"
+          while IFS='|' read -r repo _tag; do
+            [ -z "$repo" ] && continue
+            check_repo_immutable "$repo"
           done < "${WORKDIR}/image-table.psv"
 
       - name: Verify all four expected image tags exist and resolve manifest digests
@@ -838,6 +848,14 @@ jobs:
                   "source": {
                       "repoURL": "oci://229410149234.dkr.ecr.eu-west-1.amazonaws.com/helm/amazon-cloudwatch-observability",
                       "targetRevision": "6.2.0",
+                      # Direct OCI artifact source model (this repository's
+                      # established pattern -- see goldengate-platform.yaml/
+                      # goldengate-monitor.yaml's Argo CD Applications):
+                      # path: "." identifies the chart root within the OCI
+                      # artifact itself. Never a "chart:" field -- that
+                      # belongs to the separate Helm-repository chart source
+                      # model this repository does not use.
+                      "path": ".",
                       "helm": {
                           "releaseName": "amazon-cloudwatch-observability",
                           "values": LiteralStr(values_text),
@@ -855,6 +873,16 @@ jobs:
                       "syncOptions": [
                           "CreateNamespace=true",
                           "ServerSideApply=true",
+                          # Required for ignoreDifferences (below) to have any
+                          # effect on a selfHeal=true Application: without
+                          # RespectIgnoreDifferences=true, a later automated
+                          # sync (selfHeal) can still overwrite the ignored
+                          # field back to the chart's rendered value (here:
+                          # absent, since the chart never renders this
+                          # annotation at all) -- this option is what makes
+                          # the ignore rule actually stick across syncs, not
+                          # just the first one.
+                          "RespectIgnoreDifferences=true",
                       ],
                       "managedNamespaceMetadata": {
                           "labels": {
@@ -863,6 +891,37 @@ jobs:
                           },
                       },
                   },
+                  # ignoreDifferences does NOT mean Argo CD "automatically
+                  # ignores" any annotation applied outside the chart -- by
+                  # default Argo CD's selfHeal would eventually reconcile
+                  # this ServiceAccount back to exactly what the chart
+                  # renders (i.e. with NO eks.amazonaws.com/role-arn
+                  # annotation at all), removing the post-sync annotation
+                  # the "Annotate the CloudWatch Agent ServiceAccount" step
+                  # below applies. This rule explicitly excludes only that
+                  # one exact JSON pointer, on only this one exact
+                  # ServiceAccount, from Argo CD's diff -- so selfHeal never
+                  # even considers that field "out of sync" and never
+                  # touches it. If this ServiceAccount is ever deleted and
+                  # recreated by Argo CD (e.g. after a full app delete/
+                  # recreate), the annotation is gone and the
+                  # goldengate-observability.yaml deployment workflow (with
+                  # deploy=true) must be rerun to restore it -- this ignore
+                  # rule does not itself preserve or restore the annotation
+                  # across a resource recreation, it only stops Argo CD from
+                  # actively removing it while the same ServiceAccount
+                  # object still exists.
+                  "ignoreDifferences": [
+                      {
+                          "group": "",
+                          "kind": "ServiceAccount",
+                          "name": "cloudwatch-agent",
+                          "namespace": "amazon-cloudwatch",
+                          "jsonPointers": [
+                              "/metadata/annotations/eks.amazonaws.com~1role-arn",
+                          ],
+                      },
+                  ],
                   "revisionHistoryLimit": 10,
               },
           }
@@ -934,10 +993,19 @@ jobs:
           # the "Generate the temporary deployment values file" step's
           # comment for the exact evidence). This annotates the single
           # ServiceAccount Argo CD's sync already created -- it does not
-          # create a new Kubernetes ServiceAccount resource. Argo CD's
-          # selfHeal will not revert this: the annotation is not part of
-          # the chart's own rendered manifest, so Argo CD's diff never
-          # considers it managed/out-of-sync.
+          # create a new Kubernetes ServiceAccount resource.
+          #
+          # This is NOT automatically ignored by Argo CD. It survives
+          # selfHeal only because the Application's own
+          # spec.ignoreDifferences rule (see "Create or update the Argo CD
+          # Application" above) explicitly excludes exactly this one JSON
+          # pointer (/metadata/annotations/eks.amazonaws.com~1role-arn) on
+          # exactly this one ServiceAccount from Argo CD's diff, combined
+          # with syncOptions: RespectIgnoreDifferences=true (without which a
+          # later automated sync could still remove it). If this
+          # ServiceAccount is ever deleted and recreated, the annotation is
+          # gone and this workflow must be rerun with deploy=true to
+          # restore it.
           kubectl get serviceaccount "$CLOUDWATCH_AGENT_SERVICE_ACCOUNT" -n "$TARGET_NAMESPACE" >/dev/null
 
           kubectl annotate serviceaccount "$CLOUDWATCH_AGENT_SERVICE_ACCOUNT" -n "$TARGET_NAMESPACE" \
@@ -977,6 +1045,72 @@ jobs:
           kubectl rollout status deployment/amazon-cloudwatch-observability-controller-manager -n "$TARGET_NAMESPACE" --timeout=10m
           kubectl rollout status deployment/kube-state-metrics -n "$TARGET_NAMESPACE" --timeout=10m
           kubectl rollout status daemonset/node-exporter -n "$TARGET_NAMESPACE" --timeout=10m
+
+      - name: Verify IRSA injection on the recreated CloudWatch Agent pods
+        if: ${{ inputs.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Confirms the rollout-restart above actually produced pods with
+          # the projected IRSA token wired in -- never prints an env var
+          # value, the token itself, or a full pod spec; only the variable
+          # NAMES are checked for presence.
+          find_ready_pod_owned_by() {
+            local owner_kind="$1"
+            local owner_name_prefix="$2"
+            kubectl get pods -n "$TARGET_NAMESPACE" -o json \
+              | jq -r --arg kind "$owner_kind" --arg prefix "$owner_name_prefix" '
+                  .items[]
+                  | select(.status.phase == "Running")
+                  | select([.status.conditions[]? | select(.type == "Ready" and .status == "True")] | length > 0)
+                  | select(.metadata.ownerReferences[]? | .kind == $kind and (.name | startswith($prefix)))
+                  | .metadata.name
+                ' | head -n1
+          }
+
+          verify_pod_irsa() {
+            local workload_label="$1"
+            local pod_name="$2"
+
+            if [ -z "$pod_name" ]; then
+              echo "FAIL: no ready pod found for ${workload_label}."
+              exit 1
+            fi
+            echo "Checking ${workload_label} pod: ${pod_name}"
+
+            local pod_sa
+            pod_sa="$(kubectl get pod "$pod_name" -n "$TARGET_NAMESPACE" -o jsonpath='{.spec.serviceAccountName}')"
+            if [ "$pod_sa" != "$CLOUDWATCH_AGENT_SERVICE_ACCOUNT" ]; then
+              echo "FAIL: ${workload_label} pod ${pod_name} uses serviceAccountName=${pod_sa}, expected ${CLOUDWATCH_AGENT_SERVICE_ACCOUNT}."
+              exit 1
+            fi
+            echo "OK: serviceAccountName == ${CLOUDWATCH_AGENT_SERVICE_ACCOUNT}"
+
+            local env_names
+            env_names="$(kubectl get pod "$pod_name" -n "$TARGET_NAMESPACE" \
+              -o jsonpath='{range .spec.containers[*]}{range .env[*]}{.name}{"\n"}{end}{end}')"
+
+            if ! grep -qx "AWS_ROLE_ARN" <<< "$env_names"; then
+              echo "FAIL: ${workload_label} pod ${pod_name} is missing the AWS_ROLE_ARN environment variable."
+              exit 1
+            fi
+            echo "OK: AWS_ROLE_ARN is present (value not printed)."
+
+            if ! grep -qx "AWS_WEB_IDENTITY_TOKEN_FILE" <<< "$env_names"; then
+              echo "FAIL: ${workload_label} pod ${pod_name} is missing the AWS_WEB_IDENTITY_TOKEN_FILE environment variable."
+              exit 1
+            fi
+            echo "OK: AWS_WEB_IDENTITY_TOKEN_FILE is present (value not printed)."
+          }
+
+          DAEMONSET_POD="$(find_ready_pod_owned_by "DaemonSet" "cloudwatch-agent")"
+          verify_pod_irsa "cloudwatch-agent DaemonSet" "$DAEMONSET_POD"
+
+          CLUSTER_SCRAPER_POD="$(find_ready_pod_owned_by "ReplicaSet" "cloudwatch-agent-cluster-scraper")"
+          verify_pod_irsa "cloudwatch-agent-cluster-scraper Deployment" "$CLUSTER_SCRAPER_POD"
+
+          echo "OK: IRSA injection verified on at least one ready pod from each CloudWatch Agent workload."
 
       - name: Live Kubernetes validation
         if: ${{ inputs.deploy }}
@@ -1034,8 +1168,8 @@ jobs:
           fi
 
           echo ""
-          echo "8. Every running image in ${TARGET_NAMESPACE} is private, allow-listed, and digest-pinned:"
-          RUNNING_IMAGES="$(kubectl get pods -n "$TARGET_NAMESPACE" -o jsonpath='{range .items[*].spec.containers[*]}{.image}{"\n"}{end}' | sort -u)"
+          echo "8. Every running image (containers and initContainers) in ${TARGET_NAMESPACE} is private, allow-listed, and digest-pinned:"
+          RUNNING_IMAGES="$(kubectl get pods -n "$TARGET_NAMESPACE" -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.image}{"\n"}{end}{range .spec.initContainers[*]}{.image}{"\n"}{end}{end}' | sort -u)"
           echo "$RUNNING_IMAGES"
           ALLOWED_REPOS="aws-cloud-factory-cloudwatch-agent-operator aws-cloud-factory-cloudwatch-agent aws-cloud-factory-kube-state-metrics aws-cloud-factory-node-exporter"
           while IFS= read -r image_ref; do
@@ -1070,24 +1204,24 @@ jobs:
           echo "OK: none found."
 
           echo ""
-          echo "10. No Application Signals instrumentation resources:"
-          if kubectl get instrumentations.cloudwatch.aws.amazon.com -A --no-headers 2>/dev/null | grep -q .; then
-            echo "FAIL: an Instrumentation resource exists."
+          echo "10. No Application Signals instrumentation resources created by this Application (scoped to ${TARGET_NAMESPACE} only -- this cluster may host unrelated Applications elsewhere that legitimately use this resource kind):"
+          if kubectl get instrumentations.cloudwatch.aws.amazon.com -n "$TARGET_NAMESPACE" --no-headers 2>/dev/null | grep -q .; then
+            echo "FAIL: an Instrumentation resource exists in ${TARGET_NAMESPACE}."
             exit 1
           fi
-          echo "OK: none found."
+          echo "OK: none found in ${TARGET_NAMESPACE}."
 
           echo ""
-          echo "11. No GPU or Neuron workload:"
-          if kubectl get dcgmexporters.cloudwatch.aws.amazon.com -A --no-headers 2>/dev/null | grep -q .; then
-            echo "FAIL: a DcgmExporter resource exists."
+          echo "11. No GPU or Neuron workload created by this Application (scoped to ${TARGET_NAMESPACE} only -- same reasoning as #10):"
+          if kubectl get dcgmexporters.cloudwatch.aws.amazon.com -n "$TARGET_NAMESPACE" --no-headers 2>/dev/null | grep -q .; then
+            echo "FAIL: a DcgmExporter resource exists in ${TARGET_NAMESPACE}."
             exit 1
           fi
-          if kubectl get neuronmonitors.cloudwatch.aws.amazon.com -A --no-headers 2>/dev/null | grep -q .; then
-            echo "FAIL: a NeuronMonitor resource exists."
+          if kubectl get neuronmonitors.cloudwatch.aws.amazon.com -n "$TARGET_NAMESPACE" --no-headers 2>/dev/null | grep -q .; then
+            echo "FAIL: a NeuronMonitor resource exists in ${TARGET_NAMESPACE}."
             exit 1
           fi
-          echo "OK: none found."
+          echo "OK: none found in ${TARGET_NAMESPACE}."
 
           echo ""
           echo "12. No target allocator:"
@@ -1098,13 +1232,23 @@ jobs:
           echo "OK: none found."
 
           echo ""
-          echo "13. Deployed CloudWatch Agent config has no filelog receiver / container-log pipeline:"
-          AGENT_CONFIG="$(kubectl get amazoncloudwatchagents.cloudwatch.aws.amazon.com cloudwatch-agent -n "$TARGET_NAMESPACE" -o jsonpath='{.spec.otelConfig}')"
-          if echo "$AGENT_CONFIG" | grep -qi filelog; then
-            echo "FAIL: deployed CloudWatch Agent otelConfig contains a filelog receiver."
+          echo "13. No deployed AmazonCloudWatchAgent resource has a filelog receiver / container-log pipeline (every CR in ${TARGET_NAMESPACE}, not just one):"
+          # Only resource names and pass/fail are ever printed -- never a
+          # complete otelConfig.
+          AGENT_CR_NAMES="$(kubectl get amazoncloudwatchagents.cloudwatch.aws.amazon.com -n "$TARGET_NAMESPACE" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')"
+          if [ -z "$AGENT_CR_NAMES" ]; then
+            echo "FAIL: no AmazonCloudWatchAgent resource found in ${TARGET_NAMESPACE}."
             exit 1
           fi
-          echo "OK: no filelog receiver in the deployed configuration."
+          while IFS= read -r cr_name; do
+            [ -z "$cr_name" ] && continue
+            CR_OTEL_CONFIG="$(kubectl get amazoncloudwatchagents.cloudwatch.aws.amazon.com "$cr_name" -n "$TARGET_NAMESPACE" -o jsonpath='{.spec.otelConfig}')"
+            if echo "$CR_OTEL_CONFIG" | grep -qi filelog; then
+              echo "FAIL: AmazonCloudWatchAgent/${cr_name} otelConfig contains a filelog receiver."
+              exit 1
+            fi
+            echo "OK: AmazonCloudWatchAgent/${cr_name} -- no filelog receiver."
+          done <<< "$AGENT_CR_NAMES"
 
       - name: Check bounded recent logs for authorization and startup failures
         if: ${{ inputs.deploy }}
