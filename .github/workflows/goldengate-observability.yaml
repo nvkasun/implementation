@@ -1244,6 +1244,308 @@ jobs:
             ELAPSED=$((ELAPSED + INTERVAL_SECONDS))
           done
 
+      - name: Ensure cluster-scraper Deployment host-network isolation
+        # Phase 6B2B corrective-recreation correction. Proven root cause
+        # (executed against the real, unmodified operator source -- both
+        # 3.4.2 and 3.5.0, identical in both): the chart/CR layer has
+        # always been correct -- agents[cloudwatch-agent-cluster-scraper].
+        # hostNetwork=false reaches AmazonCloudWatchAgent.spec.hostNetwork
+        # correctly. The bug is in the operator's reconciliation UPDATE
+        # path for an ALREADY-EXISTING Deployment, in
+        # internal/manifests/mutate.go's mutateDeployment():
+        #   mergo.Merge(&existing.Spec.Template, desired.Spec.Template, mergo.WithOverride)
+        # mergo.WithOverride treats a Go zero value in the merge source
+        # (false, for a non-pointer bool field) as "not set" and never
+        # overwrites a non-zero existing value with it -- so an existing
+        # Deployment created earlier with hostNetwork=true never gets
+        # flipped to false no matter how many times the CR is correctly
+        # updated. A BRAND-NEW object is unaffected: ctrl.CreateOrUpdate
+        # creates it directly from the desired object (no merge involved),
+        # so deleting the stale Deployment and letting the operator's
+        # normal creation path recreate it from scratch is the correct,
+        # supported remediation -- not a manual field patch, and not a
+        # workaround for the merge bug itself (which remains present in
+        # both operator versions and is unaffected by this correction).
+        if: ${{ inputs.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CLUSTER_SCRAPER_CR="cloudwatch-agent-cluster-scraper"
+          CLUSTER_SCRAPER_DEPLOYMENT="cloudwatch-agent-cluster-scraper"
+          RECONCILE_ANNOTATION="cloudfactory.adcb/reconcile-requested-at"
+          CORRECTION_SUMMARY_FILE="${WORKDIR}/cluster-scraper-correction-summary.txt"
+          echo "unknown" > "$CORRECTION_SUMMARY_FILE"
+
+          ensure_cluster_scraper_host_network_isolated() {
+            # 1. Read the live CR -- also confirms it exists (fails closed
+            # via set -e if the CR is missing).
+            local cr_json
+            cr_json="$(kubectl get amazoncloudwatchagents.cloudwatch.aws.amazon.com "$CLUSTER_SCRAPER_CR" -n "$TARGET_NAMESPACE" -o json)"
+
+            local cr_mode cr_hostnetwork cr_uid
+            cr_mode="$(jq -r '.spec.mode // empty' <<<"$cr_json")"
+            cr_hostnetwork="$(jq -r '.spec.hostNetwork' <<<"$cr_json")"
+            cr_uid="$(jq -r '.metadata.uid // empty' <<<"$cr_json")"
+            echo "AmazonCloudWatchAgent/${CLUSTER_SCRAPER_CR}: mode=${cr_mode} hostNetwork=${cr_hostnetwork}"
+
+            # 2. Require mode==deployment and hostNetwork==false. Fail
+            # closed otherwise -- this correction only ever acts on a CR
+            # that already carries the corrected value.
+            if [ "$cr_mode" != "deployment" ]; then
+              echo "FAIL: CR ${CLUSTER_SCRAPER_CR} spec.mode is ${cr_mode}, expected deployment."
+              exit 1
+            fi
+            if [ "$cr_hostnetwork" != "false" ]; then
+              echo "FAIL: CR ${CLUSTER_SCRAPER_CR} spec.hostNetwork is ${cr_hostnetwork}, expected false -- refusing to touch the Deployment based on a CR that does not yet carry the corrected value."
+              exit 1
+            fi
+            if [ -z "$cr_uid" ]; then
+              echo "FAIL: could not read metadata.uid for CR ${CLUSTER_SCRAPER_CR}."
+              exit 1
+            fi
+
+            # 3. Read the existing Deployment, if any.
+            local deploy_json=""
+            if kubectl get deployment "$CLUSTER_SCRAPER_DEPLOYMENT" -n "$TARGET_NAMESPACE" >/dev/null 2>&1; then
+              deploy_json="$(kubectl get deployment "$CLUSTER_SCRAPER_DEPLOYMENT" -n "$TARGET_NAMESPACE" -o json)"
+            fi
+
+            if [ -z "$deploy_json" ]; then
+              echo "Deployment/${CLUSTER_SCRAPER_DEPLOYMENT} does not exist yet -- nothing to correct; the operator's normal creation path (not the buggy merge/update path) will produce hostNetwork=false directly."
+              echo "not_required" > "$CORRECTION_SUMMARY_FILE"
+              return 0
+            fi
+
+            local deploy_hostnetwork
+            deploy_hostnetwork="$(jq -r '.spec.template.spec.hostNetwork // false' <<<"$deploy_json")"
+
+            # 4. Already false: nothing to do, idempotent success.
+            if [ "$deploy_hostnetwork" = "false" ]; then
+              echo "OK: Deployment/${CLUSTER_SCRAPER_DEPLOYMENT} spec.template.spec.hostNetwork is already false -- correction not required."
+              echo "not_required" > "$CORRECTION_SUMMARY_FILE"
+              return 0
+            fi
+
+            # 5. hostNetwork == true: perform every ownership check before
+            # any deletion.
+            echo "Deployment/${CLUSTER_SCRAPER_DEPLOYMENT} spec.template.spec.hostNetwork is true -- verifying ownership before any deletion."
+
+            local owner_count
+            owner_count="$(jq '[.metadata.ownerReferences[]? | select(.controller == true)] | length' <<<"$deploy_json")"
+            if [ "$owner_count" -ne 1 ]; then
+              echo "FAIL: Deployment/${CLUSTER_SCRAPER_DEPLOYMENT} has ${owner_count} controller ownerReferences, expected exactly 1. Refusing to delete."
+              exit 1
+            fi
+
+            local owner_kind owner_name owner_apiversion owner_uid deploy_namespace deploy_name
+            owner_kind="$(jq -r '[.metadata.ownerReferences[]? | select(.controller == true)][0].kind' <<<"$deploy_json")"
+            owner_name="$(jq -r '[.metadata.ownerReferences[]? | select(.controller == true)][0].name' <<<"$deploy_json")"
+            owner_apiversion="$(jq -r '[.metadata.ownerReferences[]? | select(.controller == true)][0].apiVersion' <<<"$deploy_json")"
+            owner_uid="$(jq -r '[.metadata.ownerReferences[]? | select(.controller == true)][0].uid' <<<"$deploy_json")"
+            deploy_namespace="$(jq -r '.metadata.namespace' <<<"$deploy_json")"
+            deploy_name="$(jq -r '.metadata.name' <<<"$deploy_json")"
+
+            local ownership_ok="true"
+            [ "$owner_kind" = "AmazonCloudWatchAgent" ] || { echo "FAIL: ownerReference.kind is ${owner_kind}, expected AmazonCloudWatchAgent."; ownership_ok="false"; }
+            [ "$owner_name" = "$CLUSTER_SCRAPER_CR" ] || { echo "FAIL: ownerReference.name is ${owner_name}, expected ${CLUSTER_SCRAPER_CR}."; ownership_ok="false"; }
+            case "$owner_apiversion" in
+              cloudwatch.aws.amazon.com/*) ;;
+              *) echo "FAIL: ownerReference.apiVersion is ${owner_apiversion}, expected the cloudwatch.aws.amazon.com API group."; ownership_ok="false" ;;
+            esac
+            [ "$deploy_namespace" = "$TARGET_NAMESPACE" ] || { echo "FAIL: Deployment namespace is ${deploy_namespace}, expected ${TARGET_NAMESPACE}."; ownership_ok="false"; }
+            [ "$deploy_name" = "$CLUSTER_SCRAPER_DEPLOYMENT" ] || { echo "FAIL: Deployment name is ${deploy_name}, expected ${CLUSTER_SCRAPER_DEPLOYMENT}."; ownership_ok="false"; }
+
+            local uid_match="false"
+            [ "$owner_uid" = "$cr_uid" ] && uid_match="true"
+            [ "$uid_match" = "true" ] || { echo "FAIL: ownerReference.uid does not match the live CR metadata.uid."; ownership_ok="false"; }
+
+            echo "Ownership validation: name=${deploy_name} uidMatch=${uid_match} hostNetwork=${deploy_hostnetwork} result=${ownership_ok}"
+
+            if [ "$ownership_ok" != "true" ]; then
+              echo "FAIL: ownership validation failed -- never deleting an unowned, differently owned, or ambiguously owned Deployment."
+              exit 1
+            fi
+
+            # Task 4: controlled delete and recreate -- at most one
+            # deletion per workflow run.
+            local old_uid
+            old_uid="$(jq -r '.metadata.uid' <<<"$deploy_json")"
+
+            echo "Deleting deployment/${CLUSTER_SCRAPER_DEPLOYMENT} in ${TARGET_NAMESPACE} (bounded, idempotent corrective recreation -- the operator's own creation path will rebuild it with the correct hostNetwork=false)."
+            kubectl delete deployment "$CLUSTER_SCRAPER_DEPLOYMENT" -n "$TARGET_NAMESPACE" --wait=true --timeout=60s
+
+            local gone_elapsed=0
+            while kubectl get deployment "$CLUSTER_SCRAPER_DEPLOYMENT" -n "$TARGET_NAMESPACE" >/dev/null 2>&1; do
+              if [ "$gone_elapsed" -ge 30 ]; then
+                echo "FAIL: Deployment/${CLUSTER_SCRAPER_DEPLOYMENT} did not disappear within 30s of deletion."
+                exit 1
+              fi
+              sleep 5
+              gone_elapsed=$((gone_elapsed + 5))
+            done
+            echo "OK: Deployment/${CLUSTER_SCRAPER_DEPLOYMENT} deletion confirmed."
+
+            local RECREATE_TIMEOUT=180
+            local NUDGE_AFTER=60
+            local recreate_elapsed=0
+            local nudged="false"
+            local new_uid=""
+
+            while true; do
+              if kubectl get deployment "$CLUSTER_SCRAPER_DEPLOYMENT" -n "$TARGET_NAMESPACE" >/dev/null 2>&1; then
+                new_uid="$(kubectl get deployment "$CLUSTER_SCRAPER_DEPLOYMENT" -n "$TARGET_NAMESPACE" -o jsonpath='{.metadata.uid}')"
+                if [ -n "$new_uid" ] && [ "$new_uid" != "$old_uid" ]; then
+                  echo "OK: Deployment/${CLUSTER_SCRAPER_DEPLOYMENT} was recreated by the operator (new UID differs from the deleted one)."
+                  break
+                fi
+              fi
+
+              if [ "$recreate_elapsed" -ge "$RECREATE_TIMEOUT" ]; then
+                echo "FAIL: operator did not recreate deployment/${CLUSTER_SCRAPER_DEPLOYMENT} with a new UID within ${RECREATE_TIMEOUT}s."
+                exit 1
+              fi
+
+              if [ "$nudged" != "true" ] && [ "$recreate_elapsed" -ge "$NUDGE_AFTER" ]; then
+                echo "Operator has not recreated the Deployment after ${NUDGE_AFTER}s -- triggering a harmless reconciliation nudge via a dedicated CR annotation (no spec field is touched)."
+                kubectl annotate amazoncloudwatchagents.cloudwatch.aws.amazon.com "$CLUSTER_SCRAPER_CR" -n "$TARGET_NAMESPACE" \
+                  "${RECONCILE_ANNOTATION}=$(date -u +%Y-%m-%dT%H:%M:%SZ)" --overwrite
+                nudged="true"
+              fi
+
+              sleep 10
+              recreate_elapsed=$((recreate_elapsed + 10))
+            done
+
+            # Task 5: validate the recreated Deployment via bounded polling.
+            local RECREATE_VALIDATE_TIMEOUT=180
+            local validate_elapsed=0
+            while true; do
+              deploy_json="$(kubectl get deployment "$CLUSTER_SCRAPER_DEPLOYMENT" -n "$TARGET_NAMESPACE" -o json)"
+
+              local d_uid d_deletion_ts d_generation d_observed d_hostnetwork d_desired d_updated d_available d_unavailable
+              d_uid="$(jq -r '.metadata.uid' <<<"$deploy_json")"
+              d_deletion_ts="$(jq -r '.metadata.deletionTimestamp // empty' <<<"$deploy_json")"
+              d_generation="$(jq -r '.metadata.generation // 0' <<<"$deploy_json")"
+              d_observed="$(jq -r '.status.observedGeneration // 0' <<<"$deploy_json")"
+              d_hostnetwork="$(jq -r '.spec.template.spec.hostNetwork // false' <<<"$deploy_json")"
+              d_desired="$(jq -r '.spec.replicas // 0' <<<"$deploy_json")"
+              d_updated="$(jq -r '.status.updatedReplicas // 0' <<<"$deploy_json")"
+              d_available="$(jq -r '.status.availableReplicas // 0' <<<"$deploy_json")"
+              d_unavailable="$(jq -r '.status.unavailableReplicas // 0' <<<"$deploy_json")"
+
+              echo "Recreated Deployment poll: uidChanged=$([ "$d_uid" != "$old_uid" ] && echo true || echo false) hostNetwork=${d_hostnetwork} generation=${d_generation} observed=${d_observed} desired=${d_desired} updated=${d_updated} available=${d_available} unavailable=${d_unavailable}"
+
+              if [ "$d_uid" = "$old_uid" ]; then
+                echo "FAIL: Deployment UID did not change -- this is not actually a recreated object."
+                exit 1
+              fi
+              if [ -n "$d_deletion_ts" ]; then
+                echo "FAIL: recreated Deployment already has a deletionTimestamp."
+                exit 1
+              fi
+              if [ "$d_hostnetwork" != "false" ]; then
+                echo "FAIL: recreated Deployment spec.template.spec.hostNetwork is ${d_hostnetwork}, expected false -- the corrective recreate did not fix the issue. Not deleting a second time."
+                exit 1
+              fi
+
+              if [ "$d_generation" = "$d_observed" ] && [ "$d_desired" -gt 0 ] && [ "$d_updated" -eq "$d_desired" ] && [ "$d_available" -eq "$d_desired" ] && { [ -z "$d_unavailable" ] || [ "$d_unavailable" = "0" ]; }; then
+                echo "OK: recreated Deployment/${CLUSTER_SCRAPER_DEPLOYMENT} is fully ready and available (hostNetwork=false, ${d_available}/${d_desired})."
+                break
+              fi
+
+              if [ "$validate_elapsed" -ge "$RECREATE_VALIDATE_TIMEOUT" ]; then
+                echo "FAIL: recreated Deployment/${CLUSTER_SCRAPER_DEPLOYMENT} did not become fully ready within ${RECREATE_VALIDATE_TIMEOUT}s."
+                exit 1
+              fi
+              sleep 10
+              validate_elapsed=$((validate_elapsed + 10))
+            done
+
+            echo "recreated_once" > "$CORRECTION_SUMMARY_FILE"
+          }
+
+          ensure_cluster_scraper_host_network_isolated
+
+          # Task 6: validate the active scraper pod(s), unconditionally --
+          # whether or not a recreate just happened, the current state must
+          # hold. Selector is dynamically derived from the live Deployment,
+          # never hardcoded.
+          FINAL_DEPLOY_JSON="$(kubectl get deployment "$CLUSTER_SCRAPER_DEPLOYMENT" -n "$TARGET_NAMESPACE" -o json)"
+          FINAL_DEPLOY_UID="$(jq -r '.metadata.uid' <<<"$FINAL_DEPLOY_JSON")"
+          FINAL_SELECTOR="$(jq -r '(.spec.selector.matchLabels // {}) | to_entries | map("\(.key)=\(.value)") | join(",")' <<<"$FINAL_DEPLOY_JSON")"
+          if [ -z "$FINAL_SELECTOR" ] || [ "$FINAL_SELECTOR" = "null" ]; then
+            echo "FAIL: could not derive a pod selector for Deployment/${CLUSTER_SCRAPER_DEPLOYMENT}."
+            exit 1
+          fi
+
+          ALL_SCRAPER_PODS_JSON="$(kubectl get pods -n "$TARGET_NAMESPACE" -l "$FINAL_SELECTOR" -o json)"
+          ACTIVE_POD_FOUND="false"
+
+          while IFS= read -r pod_name; do
+            [ -z "$pod_name" ] && continue
+            pod_json="$(jq -c --arg n "$pod_name" '.items[] | select(.metadata.name==$n)' <<<"$ALL_SCRAPER_PODS_JSON")"
+
+            deletion_ts="$(jq -r '.metadata.deletionTimestamp // empty' <<<"$pod_json")"
+            [ -n "$deletion_ts" ] && continue
+
+            rs_owner_name="$(jq -r '[.metadata.ownerReferences[]? | select(.controller==true and .kind=="ReplicaSet")][0].name // empty' <<<"$pod_json")"
+            [ -z "$rs_owner_name" ] && continue
+
+            rs_json="$(kubectl get replicaset "$rs_owner_name" -n "$TARGET_NAMESPACE" -o json 2>/dev/null || true)"
+            [ -z "$rs_json" ] && continue
+            rs_deploy_uid="$(jq -r '[.metadata.ownerReferences[]? | select(.controller==true and .kind=="Deployment")][0].uid // empty' <<<"$rs_json")"
+            [ "$rs_deploy_uid" != "$FINAL_DEPLOY_UID" ] && continue
+
+            phase="$(jq -r '.status.phase // ""' <<<"$pod_json")"
+            ready_status="$(jq -r '([.status.conditions[]? | select(.type=="Ready")] | first | .status) // "Unknown"' <<<"$pod_json")"
+            pod_hostnetwork="$(jq -r '.spec.hostNetwork // false' <<<"$pod_json")"
+            pod_ip="$(jq -r '.status.podIP // ""' <<<"$pod_json")"
+            host_ip="$(jq -r '.status.hostIP // ""' <<<"$pod_json")"
+            node_name="$(jq -r '.spec.nodeName // "<none>"' <<<"$pod_json")"
+            pod_sa="$(jq -r '.spec.serviceAccountName // ""' <<<"$pod_json")"
+            env_names="$(jq -r '[.spec.containers[]?.env[]?.name] | .[]' <<<"$pod_json")"
+
+            [ "$phase" != "Running" ] && continue
+            [ "$ready_status" != "True" ] && continue
+
+            ACTIVE_POD_FOUND="true"
+            ip_differs="false"
+            [ -n "$pod_ip" ] && [ -n "$host_ip" ] && [ "$pod_ip" != "$host_ip" ] && ip_differs="true"
+
+            echo "pod/${pod_name}: node=${node_name} hostNetwork=${pod_hostnetwork} podIPDiffersFromHostIP=${ip_differs} ready=${ready_status} serviceAccount=${pod_sa}"
+
+            if [ "$pod_hostnetwork" != "false" ]; then
+              echo "FAIL: active scraper pod ${pod_name} spec.hostNetwork is ${pod_hostnetwork}, expected false."
+              exit 1
+            fi
+            if [ "$ip_differs" != "true" ]; then
+              echo "FAIL: active scraper pod ${pod_name} podIP does not differ from hostIP (podIP=${pod_ip:-<empty>})."
+              exit 1
+            fi
+            if [ "$pod_sa" != "$CLOUDWATCH_AGENT_SERVICE_ACCOUNT" ]; then
+              echo "FAIL: active scraper pod ${pod_name} serviceAccountName is ${pod_sa}, expected ${CLOUDWATCH_AGENT_SERVICE_ACCOUNT}."
+              exit 1
+            fi
+            if ! grep -qx "AWS_ROLE_ARN" <<< "$env_names"; then
+              echo "FAIL: active scraper pod ${pod_name} is missing the AWS_ROLE_ARN environment variable."
+              exit 1
+            fi
+            if ! grep -qx "AWS_WEB_IDENTITY_TOKEN_FILE" <<< "$env_names"; then
+              echo "FAIL: active scraper pod ${pod_name} is missing the AWS_WEB_IDENTITY_TOKEN_FILE environment variable."
+              exit 1
+            fi
+            echo "OK: pod/${pod_name} -- IRSA variable names present (values not printed)."
+          done < <(jq -r '.items[].metadata.name' <<<"$ALL_SCRAPER_PODS_JSON")
+
+          if [ "$ACTIVE_POD_FOUND" != "true" ]; then
+            echo "FAIL: no active (Running, Ready, current-ReplicaSet) cluster-scraper pod was found."
+            exit 1
+          fi
+          echo "OK: every active cluster-scraper pod has hostNetwork=false, a distinct podIP/hostIP, the correct ServiceAccount, and both IRSA environment variable names present."
+
+          echo "Cluster-scraper correction summary: $(cat "$CORRECTION_SUMMARY_FILE")"
+
       - name: Annotate the CloudWatch Agent ServiceAccount with the dedicated IRSA role
         if: ${{ inputs.deploy }}
         shell: bash
@@ -1750,6 +2052,15 @@ jobs:
           done <<< "$AGENT_CR_NAMES"
 
           echo ""
+          # This is a confirmation, not the first place hostNetwork=false is
+          # established. The CR side was always correctly synced by Argo CD
+          # -- syncing alone was never sufficient proof that the Deployment
+          # would match it, because of the mutateDeployment() mergo merge
+          # bug documented in the "Ensure cluster-scraper Deployment
+          # host-network isolation" step above (which runs earlier in this
+          # job and performs the actual corrective delete/recreate when
+          # needed). By the time this step runs, that step has already
+          # guaranteed the Deployment reflects the CR's hostNetwork=false.
           echo "14. CloudWatch Agent host-network isolation (Phase 6B2B correction -- fixes the 127.0.0.1:8888 bind collision documented in platform/dev/goldengate-observability/values.yaml). Only resource name, mode, and hostNetwork are printed -- never a full spec:"
 
           CW_AGENT_CR_JSON="$(kubectl get amazoncloudwatchagents.cloudwatch.aws.amazon.com cloudwatch-agent -n "$TARGET_NAMESPACE" -o json)"
@@ -1835,23 +2146,58 @@ jobs:
           echo "OK: all ${SCRAPER_POD_COUNT} active cluster-scraper pods have hostNetwork=false."
 
           echo ""
-          echo "15. Bounded log check (last 80 lines per pod) for the previously observed 127.0.0.1:8888 port-collision crash on every node-agent pod:"
-          CRASH_PATTERN='bind: address already in use|binding address localhost:8888'
+          echo "15. Bounded log check (last 80 lines per pod) for the previously observed 127.0.0.1:8888 port-collision crash on active, current-revision node-agent and cluster-scraper pods only:"
+          CRASH_PATTERN='bind: address already in use|binding address localhost:8888|listen tcp 127\.0\.0\.1:8888|failed to create SDK'
           CRASH_FOUND="false"
+
+          # Node-agent (DaemonSet) pods: exclude terminating pods. A
+          # DaemonSet has no "old ReplicaSet" concept, but a pod mid-
+          # termination during a rollout can still linger briefly with a
+          # deletionTimestamp, so it is excluded the same way.
           while IFS= read -r pod_name; do
             [ -z "$pod_name" ] && continue
+            pod_deletion_ts="$(jq -r --arg n "$pod_name" '.items[] | select(.metadata.name==$n) | (.metadata.deletionTimestamp // empty)' <<<"$CW_PODS_JSON")"
+            [ -n "$pod_deletion_ts" ] && continue
             POD_LOG_TAIL="$(kubectl logs "$pod_name" -n "$TARGET_NAMESPACE" --tail=80 2>/dev/null || true)"
             if echo "$POD_LOG_TAIL" | grep -qEi "$CRASH_PATTERN"; then
-              echo "FAIL: pod ${pod_name} log (last 80 lines) matches the previously observed host-network port-collision symptom:"
+              echo "FAIL: node-agent pod ${pod_name} log (last 80 lines) matches the previously observed host-network port-collision symptom:"
               echo "$POD_LOG_TAIL" | grep -Ei "$CRASH_PATTERN"
               CRASH_FOUND="true"
             fi
           done < <(jq -r '.items[].metadata.name' <<<"$CW_PODS_JSON")
+
+          # Cluster-scraper (Deployment) pods: exclude terminating pods and
+          # pods owned by an old/stale ReplicaSet -- only pods whose
+          # controller ReplicaSet is itself owned by the CURRENT Deployment
+          # UID are inspected.
+          SCRAPER_DEPLOY_UID_FOR_LOGS="$(jq -r '.metadata.uid' <<<"$SCRAPER_DEPLOY_JSON")"
+          while IFS= read -r pod_name; do
+            [ -z "$pod_name" ] && continue
+            pod_json_for_logs="$(jq -c --arg n "$pod_name" '.items[] | select(.metadata.name==$n)' <<<"$SCRAPER_PODS_JSON")"
+
+            pod_deletion_ts="$(jq -r '.metadata.deletionTimestamp // empty' <<<"$pod_json_for_logs")"
+            [ -n "$pod_deletion_ts" ] && continue
+
+            rs_owner_name_for_logs="$(jq -r '[.metadata.ownerReferences[]? | select(.controller==true and .kind=="ReplicaSet")][0].name // empty' <<<"$pod_json_for_logs")"
+            [ -z "$rs_owner_name_for_logs" ] && continue
+            rs_json_for_logs="$(kubectl get replicaset "$rs_owner_name_for_logs" -n "$TARGET_NAMESPACE" -o json 2>/dev/null || true)"
+            [ -z "$rs_json_for_logs" ] && continue
+            rs_deploy_uid_for_logs="$(jq -r '[.metadata.ownerReferences[]? | select(.controller==true and .kind=="Deployment")][0].uid // empty' <<<"$rs_json_for_logs")"
+            [ "$rs_deploy_uid_for_logs" != "$SCRAPER_DEPLOY_UID_FOR_LOGS" ] && continue
+
+            POD_LOG_TAIL="$(kubectl logs "$pod_name" -n "$TARGET_NAMESPACE" --tail=80 2>/dev/null || true)"
+            if echo "$POD_LOG_TAIL" | grep -qEi "$CRASH_PATTERN"; then
+              echo "FAIL: cluster-scraper pod ${pod_name} log (last 80 lines) matches the previously observed host-network port-collision symptom:"
+              echo "$POD_LOG_TAIL" | grep -Ei "$CRASH_PATTERN"
+              CRASH_FOUND="true"
+            fi
+          done < <(jq -r '.items[].metadata.name' <<<"$SCRAPER_PODS_JSON")
+
           if [ "$CRASH_FOUND" = "true" ]; then
-            echo "FAIL: at least one node-agent pod still shows the 127.0.0.1:8888 bind collision -- the host-network isolation fix did not take effect."
+            echo "FAIL: at least one active, current-revision node-agent or cluster-scraper pod still shows the 127.0.0.1:8888 bind collision -- the host-network isolation fix did not take effect."
             exit 1
           fi
-          echo "OK: no node-agent pod log (last 80 lines each) shows the previously observed 127.0.0.1:8888 bind collision."
+          echo "OK: no active, current-revision node-agent or cluster-scraper pod log (last 80 lines each) shows the previously observed 127.0.0.1:8888 bind collision."
 
       - name: Check bounded recent logs for authorization and startup failures
         # Phase 6B2B DaemonSet full-readiness correction: this must still run
@@ -1958,6 +2304,24 @@ jobs:
               done < "${WORKDIR}/image-digests.psv"
             fi
             echo ""
+            if [ "${{ inputs.deploy }}" = "true" ]; then
+              echo "### Cluster-scraper Deployment host-network correction"
+              echo ""
+              CORRECTION_SUMMARY_FILE="${WORKDIR}/cluster-scraper-correction-summary.txt"
+              CORRECTION_RESULT="$(cat "$CORRECTION_SUMMARY_FILE" 2>/dev/null || echo "unknown")"
+              case "$CORRECTION_RESULT" in
+                not_required)
+                  echo "Correction: not required (Deployment already had hostNetwork=false)."
+                  ;;
+                recreated_once)
+                  echo "Correction: Deployment recreated once (was hostNetwork=true, operator recreation confirmed hostNetwork=false)."
+                  ;;
+                *)
+                  echo "Correction: unknown (summary marker file was not found -- see the \"Ensure cluster-scraper Deployment host-network isolation\" step log)."
+                  ;;
+              esac
+              echo ""
+            fi
             echo "### Explicitly out of scope for this phase"
             echo ""
             echo "- CloudWatch alarms, SNS, dashboards"

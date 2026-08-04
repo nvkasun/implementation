@@ -1660,6 +1660,161 @@ PYEOF
     fail "${OBSERVABILITY_VALUES_FILE} not found, or python3 unavailable"
   fi
 
+  # -------------------------------------------------------------------
+  # Phase 6B2B cluster-scraper Deployment recreate correction (focused,
+  # static/offline only).
+  # -------------------------------------------------------------------
+  if [ -f "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" ] && command -v python3 >/dev/null 2>&1; then
+    RECREATE_CORRECTION_CHECK="$(python3 - "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" <<'PYEOF'
+import sys
+import yaml
+
+path = sys.argv[1]
+with open(path) as f:
+    text = f.read()
+    doc = yaml.safe_load(text)
+
+results = []
+
+job = doc["jobs"]["validate_and_deploy"]
+steps = job["steps"]
+
+def get_step(name):
+    return next((s for s in steps if s.get("name") == name), None)
+
+names = [s.get("name") for s in steps]
+
+recreate_step = get_step("Ensure cluster-scraper Deployment host-network isolation")
+if recreate_step is None:
+    results.append("missing-recreate-step")
+else:
+    if recreate_step.get("if") != "${{ inputs.deploy }}":
+        results.append(f"recreate-step-if={recreate_step.get('if')!r}")
+
+    # ordering: after "Wait for Argo CD sync and health", before
+    # "Annotate the CloudWatch Agent ServiceAccount with the dedicated IRSA role"
+    try:
+        sync_idx = names.index("Wait for Argo CD sync and health")
+        recreate_idx = names.index("Ensure cluster-scraper Deployment host-network isolation")
+        annotate_idx = names.index("Annotate the CloudWatch Agent ServiceAccount with the dedicated IRSA role")
+        if not (sync_idx < recreate_idx < annotate_idx):
+            results.append(f"step-order-wrong:{sync_idx},{recreate_idx},{annotate_idx}")
+    except ValueError as e:
+        results.append(f"step-not-found-for-ordering:{e}")
+
+    run_text = recreate_step.get("run", "")
+
+    # 2: confirms CR hostNetwork=false before any deletion (the mode/
+    # hostNetwork check happens before the delete call in source order).
+    cr_check_idx = run_text.find('"$cr_hostnetwork" != "false"')
+    delete_idx = run_text.find("kubectl delete deployment")
+    if cr_check_idx == -1:
+        results.append("missing-cr-hostnetwork-false-check")
+    if delete_idx == -1:
+        results.append("missing-delete-call")
+    if cr_check_idx != -1 and delete_idx != -1 and not (cr_check_idx < delete_idx):
+        results.append("cr-hostnetwork-check-not-before-delete")
+
+    # 3: checks the exact controller ownerReference UID against the CR UID.
+    if 'owner_uid="$(jq -r' not in run_text or "cr_uid" not in run_text:
+        results.append("missing-owner-uid-vs-cr-uid-check")
+    if 'uid_match="false"' not in run_text or '[ "$owner_uid" = "$cr_uid" ]' not in run_text:
+        results.append("missing-explicit-uid-comparison")
+
+    # 4/5: deletes only the exact cluster-scraper Deployment; never the
+    # CR, DaemonSet, pods, operator, ServiceAccount, Secret, or ConfigMap.
+    delete_calls = [ln for ln in run_text.splitlines() if "kubectl delete" in ln]
+    if len(delete_calls) != 1:
+        results.append(f"unexpected-delete-call-count:{len(delete_calls)}")
+    elif "kubectl delete deployment \"$CLUSTER_SCRAPER_DEPLOYMENT\" -n \"$TARGET_NAMESPACE\"" not in delete_calls[0]:
+        results.append(f"delete-call-not-exact-deployment:{delete_calls[0].strip()}")
+    for forbidden in ("delete daemonset", "delete pod ", "delete serviceaccount", "delete secret", "delete configmap", "delete amazoncloudwatchagent"):
+        if forbidden in run_text:
+            results.append(f"forbidden-delete-target-present:{forbidden.strip()}")
+
+    # 6: at most one deletion is possible per workflow run -- exactly one
+    # kubectl delete call exists in source (already checked above), and
+    # there is no loop/retry wrapping it that could invoke it twice.
+    if run_text.count("kubectl delete deployment") != 1:
+        results.append("delete-call-appears-more-than-once-in-source")
+
+    # 7: records old UID and requires a different new UID.
+    if "old_uid=" not in run_text:
+        results.append("missing-old-uid-recording")
+    if '"$d_uid" = "$old_uid"' not in run_text:
+        results.append("missing-new-uid-differs-from-old-check")
+
+    # 8: validates the recreated Deployment hostNetwork=false.
+    if '"$d_hostnetwork" != "false"' not in run_text:
+        results.append("missing-recreated-deployment-hostnetwork-false-check")
+
+    # 9: validates active scraper pods hostNetwork=false and podIP != hostIP.
+    if '"$pod_hostnetwork" != "false"' not in run_text:
+        results.append("missing-active-pod-hostnetwork-false-check")
+    if "ip_differs" not in run_text or '"$pod_ip" != "$host_ip"' not in run_text:
+        results.append("missing-podip-differs-from-hostip-check")
+    if '"$pod_sa" != "$CLOUDWATCH_AGENT_SERVICE_ACCOUNT"' not in run_text:
+        results.append("missing-active-pod-serviceaccount-check")
+    if "AWS_ROLE_ARN" not in run_text or "AWS_WEB_IDENTITY_TOKEN_FILE" not in run_text:
+        results.append("missing-active-pod-irsa-env-name-checks")
+
+    # 10: idempotent when the Deployment is already false (no delete call
+    # reachable on that path -- the "already false" branch returns early).
+    if 'echo "not_required" > "$CORRECTION_SUMMARY_FILE"' not in run_text:
+        results.append("missing-idempotent-not-required-summary")
+    if run_text.count('echo "not_required" > "$CORRECTION_SUMMARY_FILE"') < 2:
+        results.append("idempotent-early-return-not-covering-both-no-op-paths")
+
+    # 13a (scoped to this step): no telemetry port / spec.args / direct CR
+    # / wrapper chart content introduced here.
+    for marker in ("8889", "service::telemetry", "spec.args", "args:\n", "370-line"):
+        if marker in run_text:
+            results.append(f"forbidden-marker-in-recreate-step:{marker.strip()}")
+
+# 11: strict node-agent readiness remains unchanged (still present, still
+# exact equality, not weakened).
+wait_step = get_step("Wait for CloudWatch Agent workloads to roll out")
+if wait_step is None:
+    results.append("missing-wait-step")
+else:
+    wait_run = wait_step.get("run", "")
+    if "wait_for_daemonset_fully_ready" not in wait_run:
+        results.append("node-agent-strict-readiness-waiter-missing")
+    if 'wait_for_daemonset_fully_ready "$TARGET_NAMESPACE" cloudwatch-agent' not in wait_run:
+        results.append("node-agent-strict-readiness-not-applied-to-cloudwatch-agent")
+
+# 12: the exact localhost:8888 collision signatures remain checked
+# (searched across the whole file since this correction may check them in
+# more than one step).
+for pattern in ("binding address localhost:8888", r"listen tcp 127\.0\.0\.1:8888", "bind: address already in use", "failed to create SDK"):
+    if pattern not in text:
+        results.append(f"missing-collision-signature:{pattern}")
+
+# 13b (whole-file scope): no chart/image/IAM/Terraform change, no direct
+# CR, no wrapper chart, no telemetry port override, no spec.args mechanism.
+code_lines = [ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+code_text = "\n".join(code_lines)
+if 'CHART_VERSION: "6.2.0"' not in text:
+    results.append("chart-version-changed")
+for marker in ("service::telemetry", "--set=service", "helm/goldengate-observability-adcb"):
+    if marker in code_text:
+        results.append(f"forbidden-whole-file-marker:{marker}")
+
+if results:
+    print("MISMATCH:" + ";".join(results))
+else:
+    print("OK")
+PYEOF
+)"
+    if [ "$RECREATE_CORRECTION_CHECK" = "OK" ]; then
+      pass "21: goldengate-observability.yaml Phase 6B2B cluster-scraper Deployment recreate correction: the new deploy-guarded 'Ensure cluster-scraper Deployment host-network isolation' step is correctly ordered between Argo CD sync/health and the ServiceAccount annotation step; it confirms the live CR has hostNetwork=false before any deletion; validates the exact controller ownerReference UID against the CR UID before deleting; deletes only deployment/cloudwatch-agent-cluster-scraper (never the CR, DaemonSet, pods, ServiceAccount, Secret, or ConfigMap) with exactly one delete call in source; records the old UID and requires the recreated UID to differ; validates the recreated Deployment's hostNetwork=false and full readiness; validates every active scraper pod's hostNetwork=false, podIP!=hostIP, ServiceAccount, and IRSA env-var-name presence; is idempotent (both no-op paths mark 'not_required'); strict node-agent DaemonSet readiness is unchanged; the exact 127.0.0.1:8888 collision signatures remain checked; and no telemetry-port override, spec.args, direct CR, wrapper chart, chart/image upgrade, IAM, or Terraform change was introduced"
+    else
+      fail "21: goldengate-observability.yaml Phase 6B2B cluster-scraper Deployment recreate correction check failed: ${RECREATE_CORRECTION_CHECK}"
+    fi
+  else
+    fail "${OBSERVABILITY_WORKFLOW} not found, or python3 unavailable"
+  fi
+
   # 13: no wrapper chart was created for this phase.
   if [ -d "${REPO_ROOT}/helm/goldengate-observability" ]; then
     fail "13: helm/goldengate-observability/ wrapper chart unexpectedly exists -- Argo CD must consume the private upstream OCI chart directly"
