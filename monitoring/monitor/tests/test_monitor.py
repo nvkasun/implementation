@@ -1783,7 +1783,7 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         verify_idx = self.monitor_text.index("- name: Verify GoldenGate monitor runtime state")
         upload_idx = self.monitor_text.index("- name: Upload rendered manifests and chart package")
         verify_step_text = self.monitor_text[verify_idx:upload_idx]
-        post_rollout_idx = verify_step_text.index("ENABLED_DEPLOYMENTS_POST")
+        post_rollout_idx = verify_step_text.index("ENABLED_DEPLOYMENT_PAIRS_POST")
         post_rollout_awk_text = verify_step_text[post_rollout_idx:post_rollout_idx + 600]
         self.assertNotIn(r"\s", post_rollout_awk_text)
         self.assertIn("[[:space:]]", post_rollout_awk_text)
@@ -1791,16 +1791,22 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
     def test_deployment_discovery_awk_returns_exactly_both_enabled_deployments(self):
         # Executes the actual committed awk snippet (extracted from the
         # preflight step) under the system's real awk against the real
-        # canonical config -- not a reimplementation.
+        # canonical config -- not a reimplementation. Phase 6C1: the
+        # preflight now needs each enabled deployment's canonical type (to
+        # validate CONFIG.deploymentType), so the awk emits "name|type"
+        # pairs rather than bare names -- this asserts both the parsed
+        # names and their types.
         if shutil.which("awk") is None:
             raise unittest.SkipTest("awk not available")
-        preflight_idx = self.monitor_text.index("mapfile -t ENABLED_DEPLOYMENTS < <(awk '")
+        preflight_idx = self.monitor_text.index("mapfile -t ENABLED_DEPLOYMENT_PAIRS < <(awk '")
         script_start = self.monitor_text.index("'", preflight_idx) + 1
         script_end = self.monitor_text.index("'", script_start)
         awk_script = self.monitor_text[script_start:script_end]
         proc = subprocess.run(["awk", awk_script, DEPLOYMENTS_FILE_PATH], capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        names = [line for line in proc.stdout.splitlines() if line]
+        pairs = [line for line in proc.stdout.splitlines() if line]
+        self.assertEqual(pairs, ["gg-oracle-payments-01|oracle", "gg-postgresql-payments-01|postgresql"])
+        names = [pair.split("|", 1)[0] for pair in pairs]
         self.assertEqual(names, ["gg-oracle-payments-01", "gg-postgresql-payments-01"])
 
     def test_deployment_discovery_never_hardcodes_names_in_production_logic(self):
@@ -1969,7 +1975,7 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
 
     def test_cloudwatch_preflight_step_exists_gated_on_enable_input(self):
         condition = _extract_step_if_condition(
-            self.monitor_text, "CloudWatch publication preflight (CONFIG.metricsEnabled)")
+            self.monitor_text, "CloudWatch publication preflight (gate inventory)")
         self.assertEqual(
             condition,
             "${{ (github.event_name != 'workflow_dispatch' || inputs.deploy) "
@@ -2001,10 +2007,69 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         self.assertNotIn("gg-postgresql-payments-01", preflight_step_text)
 
     def test_cloudwatch_preflight_output_is_sanitized_deployment_result_only(self):
+        # Phase 6C1: the preflight was rewritten from an unconditional
+        # "every enabled deployment must already have metricsEnabled=true"
+        # check into a gate-inventory read gated by metrics_gate_expectation.
+        # These assertions inspect the actual rewritten step text (not a
+        # reimplementation of it) to prove the new behaviour, rather than
+        # pinning the exact obsolete literal this test used to assert on.
+        preflight_idx = self.monitor_text.index("- name: CloudWatch publication preflight")
+        argocd_idx = self.monitor_text.index("- name: Create or update Argo CD Application")
+        preflight_step_text = self.monitor_text[preflight_idx:argocd_idx]
+
+        # 1. CONFIG.metricsEnabled is validated as a literal DynamoDB Boolean.
+        self.assertIn("isinstance(metrics_enabled, bool)", preflight_step_text)
+        self.assertIn("result=metricsenabled-not-boolean", preflight_step_text)
+
+        # 2. CONFIG.alertsEnabled is validated as the literal Boolean false.
+        self.assertIn("alerts_enabled is not False", preflight_step_text)
+        self.assertIn("result=alertsenabled-not-false", preflight_step_text)
+
+        # 3. CONFIG.deploymentType is validated against the canonical
+        # per-deployment type discovered from the registry.
+        self.assertIn('item.get("deploymentType") != expected_type', preflight_step_text)
+        self.assertIn("result=deploymenttype-mismatch", preflight_step_text)
+
+        # 4. metrics_gate_expectation supports any/all-disabled/all-enabled.
+        doc = yaml.safe_load(self.monitor_text)
+        triggers = doc.get("on") or doc.get(True)
+        expectation_input = triggers["workflow_dispatch"]["inputs"]["metrics_gate_expectation"]
+        self.assertEqual(sorted(expectation_input["options"]), ["all-disabled", "all-enabled", "any"])
+        self.assertEqual(expectation_input["default"], "any")
+
+        # 5. Publication is no longer unconditionally gated on every enabled
+        # deployment already having metricsEnabled=true: a deployment with
+        # metricsEnabled=false only fails the preflight when the expectation
+        # is all-enabled, never unconditionally.
         self.assertIn(
-            'metricsEnabled=true" if ok else f"deployment={pipeline} metricsEnabled-not-literal-true',
-            self.monitor_text)
-        self.assertIn("except Exception:", self.monitor_text)
+            'DISABLED_CONFIG_COUNT=$((DISABLED_CONFIG_COUNT + 1))\n'
+            '              if [ "$GATE_EXPECTATION" = "all-enabled" ]; then',
+            preflight_step_text)
+        self.assertIn(
+            'ENABLED_CONFIG_COUNT=$((ENABLED_CONFIG_COUNT + 1))\n'
+            '              if [ "$GATE_EXPECTATION" = "all-disabled" ]; then',
+            preflight_step_text)
+
+        # 6. Still fails closed on missing or malformed CONFIG.
+        self.assertIn("result=missing-config", preflight_step_text)
+        self.assertIn("result=bad-recordtype", preflight_step_text)
+        self.assertIn(
+            'if [ "$RESULT_STATUS" -ne 0 ] || [[ "$RESULT" != "deployment=${name} deploymentType=${expected_type} metricsEnabled="* ]]',
+            preflight_step_text)
+
+        # 7. Uses GetItem only, never Scan.
+        self.assertIn("table.get_item(", preflight_step_text)
+        self.assertNotIn(".scan(", preflight_step_text)
+        self.assertNotIn(".Scan(", preflight_step_text)
+
+        # 8. The double-gate model is preserved: this whole step (and thus
+        # the CONFIG gate inventory) only runs when the global hard switch
+        # input is true -- the per-deployment CONFIG read never substitutes
+        # for, or bypasses, that global switch.
+        self.assertIn(
+            "if: ${{ (github.event_name != 'workflow_dispatch' || inputs.deploy) "
+            "&& inputs.enable_cloudwatch_publication }}",
+            preflight_step_text)
 
     def test_cloudwatch_preflight_first_deployment_prerequisite_message(self):
         preflight_idx = self.monitor_text.index("- name: CloudWatch publication preflight")

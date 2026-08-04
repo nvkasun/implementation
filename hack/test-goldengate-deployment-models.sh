@@ -24,6 +24,8 @@ PLATFORM_CHART="helm/goldengate-platform"
 MONITOR_CHART="helm/goldengate-monitor"
 MONITOR_APP_DIR="monitoring/monitor"
 MONITOR_WORKFLOW=".github/workflows/goldengate-monitor.yaml"
+METRICS_CONFIG_WORKFLOW=".github/workflows/goldengate-monitor-metrics-config.yaml"
+METRICS_CONFIG_HELPER_SCRIPT="hack/goldengate-metrics-config.py"
 EKS_APP_WORKFLOW=".github/workflows/goldengate-eks-app.yaml"
 PLATFORM_WORKFLOW=".github/workflows/goldengate-platform.yaml"
 DETECT_SCRIPT="hack/detect-goldengate-deployments.sh"
@@ -2666,10 +2668,33 @@ else
   fail "goldengate-monitor.yaml is missing the expected enable_cloudwatch_publication Boolean workflow_dispatch input"
 fi
 
-if grep -q "name: CloudWatch publication preflight (CONFIG.metricsEnabled)" "$MONITOR_WORKFLOW" 2>/dev/null; then
+if grep -q "name: CloudWatch publication preflight (gate inventory)" "$MONITOR_WORKFLOW" 2>/dev/null; then
   pass "goldengate-monitor.yaml defines the CloudWatch publication preflight step"
 else
   fail "goldengate-monitor.yaml is missing the CloudWatch publication preflight step"
+fi
+
+# Phase 6C1: the preflight moved from an unconditional "every enabled
+# deployment must already have metricsEnabled=true" check to a gate
+# inventory governed by metrics_gate_expectation (any/all-disabled/
+# all-enabled), enabling the staged activation order (deploy the global
+# switch with every gate closed, enable deployments individually via the
+# dedicated config workflow, then verify in CloudWatch).
+if grep -q "metrics_gate_expectation:" "$MONITOR_WORKFLOW" 2>/dev/null \
+    && grep -A10 "metrics_gate_expectation:" "$MONITOR_WORKFLOW" | grep -q -- "- any" \
+    && grep -A10 "metrics_gate_expectation:" "$MONITOR_WORKFLOW" | grep -q -- "- all-disabled" \
+    && grep -A10 "metrics_gate_expectation:" "$MONITOR_WORKFLOW" | grep -q -- "- all-enabled" \
+    && grep -A10 "metrics_gate_expectation:" "$MONITOR_WORKFLOW" | grep -q "default: any"; then
+  pass "goldengate-monitor.yaml defines metrics_gate_expectation with any/all-disabled/all-enabled, defaulting to any"
+else
+  fail "goldengate-monitor.yaml is missing the metrics_gate_expectation workflow_dispatch input or its expected options/default"
+fi
+
+if grep -q 'if \[ "\$GATE_EXPECTATION" = "all-enabled" \]' "$MONITOR_WORKFLOW" 2>/dev/null \
+    && grep -q 'if \[ "\$GATE_EXPECTATION" = "all-disabled" \]' "$MONITOR_WORKFLOW" 2>/dev/null; then
+  pass "goldengate-monitor.yaml's preflight only fails a metricsEnabled=false/true deployment when the expectation requires it -- publication is no longer unconditionally gated on every deployment already being enabled"
+else
+  fail "goldengate-monitor.yaml's preflight no longer conditions its pass/fail decision on metrics_gate_expectation"
 fi
 
 if grep -q "table.get_item(" "$MONITOR_WORKFLOW" 2>/dev/null \
@@ -5521,6 +5546,123 @@ envs/dev/policies/goldengate-cloudwatch-metrics-dev/policies/policies_1.json"
   fi
 else
   skip "collector.py/monitor.py/IAM unchanged checks -- not a git repository"
+fi
+
+# ---------------------------------------------------------------------
+# 21. Phase 6C1: goldengate-monitor-metrics-config.yaml + the piped
+#     hack/goldengate-metrics-config.py helper -- the dedicated, controlled
+#     workflow for tuning a single deployment's CONFIG.metricsEnabled
+#     outside Terraform. Static structural checks only (functional/mocked
+#     behavior is covered by hack/test-goldengate-metrics-config.py).
+# ---------------------------------------------------------------------
+echo ""
+echo "--- Phase 6C1: metrics config workflow + helper ---"
+
+if [ -f "$METRICS_CONFIG_WORKFLOW" ]; then
+  pass "21: goldengate-monitor-metrics-config.yaml exists"
+else
+  fail "21: goldengate-monitor-metrics-config.yaml is missing"
+fi
+
+if python3 -c "import yaml,sys; yaml.safe_load(open(sys.argv[1]))" "$METRICS_CONFIG_WORKFLOW" 2>/dev/null; then
+  pass "21: goldengate-monitor-metrics-config.yaml is valid YAML"
+else
+  fail "21: goldengate-monitor-metrics-config.yaml is not valid YAML"
+fi
+
+if grep -q "workflow_dispatch:" "$METRICS_CONFIG_WORKFLOW" 2>/dev/null \
+    && ! grep -qE "^\s*(push|pull_request|schedule):" "$METRICS_CONFIG_WORKFLOW" 2>/dev/null; then
+  pass "21: goldengate-monitor-metrics-config.yaml is workflow_dispatch only, no automatic trigger"
+else
+  fail "21: goldengate-monitor-metrics-config.yaml has an unexpected trigger"
+fi
+
+if grep -q "deployment_name:" "$METRICS_CONFIG_WORKFLOW" 2>/dev/null \
+    && grep -A3 "deployment_name:" "$METRICS_CONFIG_WORKFLOW" | grep -q "type: string" \
+    && ! grep -A6 "deployment_name:" "$METRICS_CONFIG_WORKFLOW" | grep -q "type: choice"; then
+  pass "21: deployment_name is a free-form string input, not a hardcoded choice list"
+else
+  fail "21: deployment_name input is missing or unexpectedly a hardcoded choice list"
+fi
+
+if grep -q "Validate deployment_name against the canonical registry" "$METRICS_CONFIG_WORKFLOW" 2>/dev/null \
+    && grep -q 'CANONICAL_REGISTRY: envs/dev/goldengate-deployments.yaml' "$METRICS_CONFIG_WORKFLOW" 2>/dev/null \
+    && ! grep -q "gg-oracle-payments-01" "$METRICS_CONFIG_WORKFLOW" 2>/dev/null \
+    && ! grep -q "gg-postgresql-payments-01" "$METRICS_CONFIG_WORKFLOW" 2>/dev/null; then
+  pass "21: deployment_name is validated dynamically against the canonical registry, never hardcoded"
+else
+  fail "21: deployment_name validation is missing, or a deployment name is hardcoded in workflow logic"
+fi
+
+if grep -q 'CANONICAL_ENABLED" != "true"' "$METRICS_CONFIG_WORKFLOW" 2>/dev/null; then
+  pass "21: registry validation refuses a deployment_name that is not enabled=true"
+else
+  fail "21: registry validation does not check the canonical enabled flag"
+fi
+
+if grep -q 'EXPECTED="ENABLE \${DEPLOYMENT_NAME}"' "$METRICS_CONFIG_WORKFLOW" 2>/dev/null \
+    && grep -q 'EXPECTED="DISABLE \${DEPLOYMENT_NAME}"' "$METRICS_CONFIG_WORKFLOW" 2>/dev/null \
+    && grep -q 'CONFIRMATION" != "\$EXPECTED"' "$METRICS_CONFIG_WORKFLOW" 2>/dev/null; then
+  pass "21: apply_change=true requires an exact ENABLE/DISABLE <deployment_name> confirmation string"
+else
+  fail "21: exact confirmation-string validation is missing or weakened"
+fi
+
+if grep -q "Confirm the global hard switch when enabling" "$METRICS_CONFIG_WORKFLOW" 2>/dev/null \
+    && grep -q 'if: \${{ inputs.desired_metrics_enabled }}' "$METRICS_CONFIG_WORKFLOW" 2>/dev/null \
+    && grep -q 'POD_CLOUDWATCH_ENV" != "true"' "$METRICS_CONFIG_WORKFLOW" 2>/dev/null; then
+  pass "21: enabling a deployment's gate requires the deployed global hard switch to already be true"
+else
+  fail "21: the global-hard-switch precondition for enabling is missing"
+fi
+
+if grep -q "table.get_item(" "$METRICS_CONFIG_HELPER_SCRIPT" 2>/dev/null \
+    && ! grep -qE '\.[Ss]can\(' "$METRICS_CONFIG_WORKFLOW" "$METRICS_CONFIG_HELPER_SCRIPT" 2>/dev/null; then
+  pass "21: the metrics-config workflow/helper use GetItem only, never Scan"
+else
+  fail "21: the metrics-config workflow/helper no longer use GetItem-only reads"
+fi
+
+if grep -qE "cloudwatch:(ListMetrics|GetMetricData|DescribeAlarms|PutMetricAlarm)" "$METRICS_CONFIG_WORKFLOW" "$METRICS_CONFIG_HELPER_SCRIPT" 2>/dev/null \
+    || grep -qiE "sns|gg-alert|alarm" "$METRICS_CONFIG_WORKFLOW" 2>/dev/null; then
+  fail "21: the metrics-config workflow references a CloudWatch read/alarm/SNS/gg-alerter concept -- none is in scope for Phase 6C1"
+else
+  pass "21: the metrics-config workflow introduces no CloudWatch read, alarm, SNS, or gg-alerter reference"
+fi
+
+if grep -qE "docker (build|push)|helm (package|push)|argocd|kubectl apply|kubectl create|kubectl patch|kubectl delete" "$METRICS_CONFIG_WORKFLOW" 2>/dev/null; then
+  fail "21: the metrics-config workflow appears to build/push an image, package/push a Helm chart, touch Argo CD, or mutate a Kubernetes object"
+else
+  pass "21: the metrics-config workflow never builds/pushes an image, packages/pushes a Helm chart, touches Argo CD, or mutates a Kubernetes object"
+fi
+
+if grep -q "kubectl exec -i \"\$POD_NAME\"" "$METRICS_CONFIG_WORKFLOW" 2>/dev/null \
+    && grep -q '< "\$METRICS_CONFIG_HELPER"' "$METRICS_CONFIG_WORKFLOW" 2>/dev/null; then
+  pass "21: the DynamoDB update runs inside the existing gg-monitor pod via its own IRSA (piped kubectl exec), not the workflow's own AWS credentials"
+else
+  fail "21: the metrics-config workflow no longer runs the update inside the gg-monitor pod's own IRSA"
+fi
+
+if grep -q 'SET metricsEnabled = :desired' "$METRICS_CONFIG_HELPER_SCRIPT" 2>/dev/null \
+    && ! grep -qE 'SET (deploymentType|alertsEnabled|pipeline|recordType)' "$METRICS_CONFIG_HELPER_SCRIPT" 2>/dev/null; then
+  pass "21: hack/goldengate-metrics-config.py's UpdateExpression only ever sets metricsEnabled"
+else
+  fail "21: hack/goldengate-metrics-config.py's UpdateExpression writes an unexpected attribute"
+fi
+
+if grep -q 'Attr("metricsEnabled").eq(current_metrics_enabled)' "$METRICS_CONFIG_HELPER_SCRIPT" 2>/dev/null \
+    && grep -q "ConditionalCheckFailedException" "$METRICS_CONFIG_HELPER_SCRIPT" 2>/dev/null \
+    && grep -qi "not retrying automatically" "$METRICS_CONFIG_HELPER_SCRIPT" 2>/dev/null; then
+  pass "21: hack/goldengate-metrics-config.py uses optimistic concurrency and never auto-retries a ConditionalCheckFailedException"
+else
+  fail "21: hack/goldengate-metrics-config.py is missing its optimistic-concurrency guard or auto-retries on conflict"
+fi
+
+if python3 -m py_compile "$METRICS_CONFIG_HELPER_SCRIPT" 2>/dev/null; then
+  pass "21: hack/goldengate-metrics-config.py compiles cleanly"
+  find hack -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+else
+  fail "21: hack/goldengate-metrics-config.py fails to compile"
 fi
 
 echo ""

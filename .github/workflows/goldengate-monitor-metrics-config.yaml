@@ -1,0 +1,426 @@
+name: GoldenGate monitor metrics configuration
+
+run-name: "Cloud Factory - GoldenGate monitor metrics CONFIG update | ${{ inputs.deployment_name }} -> metricsEnabled=${{ inputs.desired_metrics_enabled }} (apply=${{ inputs.apply_change }}) | ran by ${{ github.actor }}"
+
+# Phase 6C1: the dedicated, controlled workflow for tuning a single
+# deployment's CONFIG.metricsEnabled value outside Terraform (Terraform
+# seeds CONFIG once with lifecycle.ignore_changes = [item] -- see
+# envs/dev/dynamodb.tf -- so it can never be used to update an existing
+# item). This workflow never builds/pushes an image, never packages/pushes
+# a Helm chart, never creates or updates the Argo CD Application, and never
+# creates/modifies any Kubernetes object -- it only reads the state of an
+# existing, already-Ready gg-monitor pod and, optionally, execs the
+# source-controlled helper (hack/goldengate-metrics-config.py) inside that
+# pod so the update runs under the monitor's own IRSA
+# (GoldenGateMonitorReadRole-dev), which already has the DynamoDB
+# GetItem/UpdateItem permissions this needs. The GitHub/EKS deployment role
+# used by this workflow's own AWS credentials is never broadened with any
+# DynamoDB permission.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Deployment environment"
+        required: true
+        type: choice
+        default: dev
+        options:
+          - dev
+
+      deployment_name:
+        description: "Canonical deployment name (envs/dev/goldengate-deployments.yaml). Validated dynamically against that file -- there is no hardcoded list here, so this input alone does not guarantee validity."
+        required: true
+        type: string
+
+      desired_metrics_enabled:
+        description: "Desired CONFIG.metricsEnabled value for this one deployment (literal Boolean). true additionally requires the deployed monitor's global hard switch (CLOUDWATCH_PUBLISH_ENABLED) to already be true."
+        required: true
+        type: boolean
+        default: false
+
+      apply_change:
+        description: "false (default) = dry run: validate and report the proposed action only, no DynamoDB write. true = perform the conditional UpdateItem if the current value differs from desired (also requires the exact confirmation input)."
+        required: true
+        type: boolean
+        default: false
+
+      confirmation:
+        description: "Required only when apply_change=true. Must be exactly \"ENABLE <deployment_name>\" when desired_metrics_enabled=true, or exactly \"DISABLE <deployment_name>\" when desired_metrics_enabled=false. Ignored (any value accepted) when apply_change=false."
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ROLE_ARN: ${{ vars.GOLDENGATE_AWS_ROLE_ARN }}
+
+  EKS_ACCOUNT_ID: ${{ vars.ACCOUNT_ID_DEV }}
+  EKS_CLUSTER_NAME: ${{ vars.AWS_CLUSTER_NAME }}
+  EKS_CLUSTER_ARN: ${{ vars.AWS_CLUSTER_ARN }}
+  EKS_DEPLOY_ROLE_ARN: ${{ vars.EKS_DEPLOY_ROLE_ARN }}
+
+  TARGET_NAMESPACE: goldengate-monitoring
+  MONITOR_SERVICE_ACCOUNT: gg-monitor
+  MONITOR_IRSA_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev
+  CANONICAL_REGISTRY: envs/dev/goldengate-deployments.yaml
+  METRICS_CONFIG_HELPER: hack/goldengate-metrics-config.py
+
+concurrency:
+  group: goldengate-monitor-metrics-config-${{ github.ref }}-${{ inputs.deployment_name }}
+  cancel-in-progress: false
+
+jobs:
+  configure_metrics_gate:
+    name: Update one deployment's CONFIG.metricsEnabled gate
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    environment: dev
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.ROLE_ARN }}
+
+      - name: Verify AWS caller account
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CALLER_ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
+          echo "Caller account: ${CALLER_ACCOUNT}"
+
+          if [ -n "${EKS_ACCOUNT_ID:-}" ] && [ "$CALLER_ACCOUNT" != "$EKS_ACCOUNT_ID" ]; then
+            echo "Note: caller account (${CALLER_ACCOUNT}) differs from EKS_ACCOUNT_ID (${EKS_ACCOUNT_ID}) -- expected when this role only assumes a cross-account EKS deploy role. The actual cluster/account binding is validated by the EKS connection step below via EKS_DEPLOY_ROLE_ARN."
+          fi
+
+      - name: Validate deployment_name against the canonical registry
+        id: registry
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "$CANONICAL_REGISTRY" ]; then
+            echo "FAIL: canonical registry ${CANONICAL_REGISTRY} not found."
+            exit 1
+          fi
+
+          REQUESTED_NAME="${{ inputs.deployment_name }}"
+          if [ -z "$REQUESTED_NAME" ]; then
+            echo "FAIL: deployment_name must not be empty."
+            exit 1
+          fi
+
+          # Dynamic discovery only -- never a hardcoded choice list. Emits
+          # "name|type|enabled" triples for every deployment entry, then
+          # this step selects the one matching REQUESTED_NAME.
+          MATCH="$(awk -v want="$REQUESTED_NAME" '
+            /^[[:space:]]*-[[:space:]]*name:/ {
+              if (name != "") print name "|" type "|" enabled
+              name=$0; sub(/^[[:space:]]*-[[:space:]]*name:[[:space:]]*/, "", name); gsub(/["\x27\r]/, "", name)
+              type=""; enabled=""
+              next
+            }
+            /^[[:space:]]*type:[[:space:]]*/ {
+              if (type == "") { t=$0; sub(/^[[:space:]]*type:[[:space:]]*/, "", t); gsub(/["\x27\r]/, "", t); type=t }
+              next
+            }
+            /^[[:space:]]*enabled:[[:space:]]*true/ { enabled="true"; next }
+            /^[[:space:]]*enabled:[[:space:]]*false/ { enabled="false"; next }
+            END { if (name != "") print name "|" type "|" enabled }
+          ' "$CANONICAL_REGISTRY" | awk -F'|' -v want="$REQUESTED_NAME" '$1 == want { print; found=1 } END { if (!found) exit 1 }')" || {
+            echo "FAIL: deployment_name \"${REQUESTED_NAME}\" was not found in ${CANONICAL_REGISTRY}."
+            echo "This workflow never accepts an unvalidated deployment name -- refusing to proceed before any kubectl exec."
+            exit 1
+          }
+
+          CANONICAL_TYPE="$(cut -d'|' -f2 <<< "$MATCH")"
+          CANONICAL_ENABLED="$(cut -d'|' -f3 <<< "$MATCH")"
+
+          if [ -z "$CANONICAL_TYPE" ]; then
+            echo "FAIL: deployment_name \"${REQUESTED_NAME}\" has no type in ${CANONICAL_REGISTRY}."
+            exit 1
+          fi
+          if [ "$CANONICAL_ENABLED" != "true" ]; then
+            echo "FAIL: deployment_name \"${REQUESTED_NAME}\" is not an enabled canonical deployment (enabled=${CANONICAL_ENABLED:-<missing>})."
+            exit 1
+          fi
+
+          echo "OK: deployment_name=${REQUESTED_NAME} type=${CANONICAL_TYPE} enabled=${CANONICAL_ENABLED}"
+          echo "canonical_type=${CANONICAL_TYPE}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate the exact confirmation string
+        if: ${{ inputs.apply_change }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DEPLOYMENT_NAME="${{ inputs.deployment_name }}"
+          DESIRED="${{ inputs.desired_metrics_enabled }}"
+          CONFIRMATION="${{ inputs.confirmation }}"
+
+          if [ "$DESIRED" = "true" ]; then
+            EXPECTED="ENABLE ${DEPLOYMENT_NAME}"
+          else
+            EXPECTED="DISABLE ${DEPLOYMENT_NAME}"
+          fi
+
+          if [ "$CONFIRMATION" != "$EXPECTED" ]; then
+            echo "FAIL: apply_change=true requires the exact confirmation \"${EXPECTED}\"."
+            echo "This workflow never treats a near-match, a different deployment name, or an empty value as confirmation."
+            exit 1
+          fi
+
+          echo "OK: confirmation matches the required \"${EXPECTED}\"."
+
+      - name: Install kubectl if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KUBECTL_VERSION="v1.35.0"
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64) KUBECTL_ARCH="amd64" ;;
+              aarch64|arm64) KUBECTL_ARCH="arm64" ;;
+              *) echo "Unsupported architecture for kubectl: $ARCH"; exit 1 ;;
+            esac
+            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+            sudo chmod +x /usr/local/bin/kubectl
+          fi
+          kubectl version --client=true
+
+      - name: Connect to EKS cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws sts get-caller-identity
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}" \
+            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
+            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
+
+          kubectl config current-context
+          kubectl version --client=true
+
+      - name: Bounded connectivity preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! kubectl get namespace "$TARGET_NAMESPACE" --request-timeout=20s >/dev/null; then
+            echo "FAIL: could not reach the private EKS API / read namespace ${TARGET_NAMESPACE} within the bounded timeout."
+            exit 1
+          fi
+          echo "OK: private EKS API is reachable and namespace ${TARGET_NAMESPACE} exists."
+
+      - name: Locate the authenticated, Ready gg-monitor pod
+        id: pod
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Deployment/ReplicaSet ownership-chain filtering, matching the
+          # active-pod pattern established for the observability workflow:
+          # never a blind ".items[0]" and never trusting only a label
+          # selector -- the pod must be Running, Ready, non-terminating,
+          # use serviceAccountName=gg-monitor, AND be owned by a
+          # ReplicaSet that is itself owned by the current gg-monitor
+          # Deployment. Only the pod name is ever captured/printed; the
+          # full pod object is never printed.
+          DEPLOY_JSON="$(kubectl get deployment gg-monitor -n "$TARGET_NAMESPACE" -o json)"
+          DEPLOY_UID="$(jq -r '.metadata.uid' <<<"$DEPLOY_JSON")"
+          SELECTOR="$(jq -r '(.spec.selector.matchLabels // {}) | to_entries | map("\(.key)=\(.value)") | join(",")' <<<"$DEPLOY_JSON")"
+          if [ -z "$SELECTOR" ] || [ "$SELECTOR" = "null" ]; then
+            echo "FAIL: could not derive a pod selector for Deployment/gg-monitor."
+            exit 1
+          fi
+
+          PODS_JSON="$(kubectl get pods -n "$TARGET_NAMESPACE" -l "$SELECTOR" -o json)"
+          POD_NAME=""
+
+          while IFS= read -r candidate; do
+            [ -z "$candidate" ] && continue
+            pod_json="$(jq -c --arg n "$candidate" '.items[] | select(.metadata.name==$n)' <<<"$PODS_JSON")"
+
+            deletion_ts="$(jq -r '.metadata.deletionTimestamp // empty' <<<"$pod_json")"
+            [ -n "$deletion_ts" ] && continue
+
+            phase="$(jq -r '.status.phase // ""' <<<"$pod_json")"
+            [ "$phase" != "Running" ] && continue
+
+            ready_status="$(jq -r '([.status.conditions[]? | select(.type=="Ready")] | first | .status) // "Unknown"' <<<"$pod_json")"
+            [ "$ready_status" != "True" ] && continue
+
+            pod_sa="$(jq -r '.spec.serviceAccountName // ""' <<<"$pod_json")"
+            [ "$pod_sa" != "$MONITOR_SERVICE_ACCOUNT" ] && continue
+
+            rs_owner_name="$(jq -r '[.metadata.ownerReferences[]? | select(.controller==true and .kind=="ReplicaSet")][0].name // empty' <<<"$pod_json")"
+            [ -z "$rs_owner_name" ] && continue
+            rs_json="$(kubectl get replicaset "$rs_owner_name" -n "$TARGET_NAMESPACE" -o json 2>/dev/null || true)"
+            [ -z "$rs_json" ] && continue
+            rs_deploy_uid="$(jq -r '[.metadata.ownerReferences[]? | select(.controller==true and .kind=="Deployment")][0].uid // empty' <<<"$rs_json")"
+            [ "$rs_deploy_uid" != "$DEPLOY_UID" ] && continue
+
+            POD_NAME="$candidate"
+            break
+          done < <(jq -r '.items[].metadata.name' <<<"$PODS_JSON")
+
+          if [ -z "$POD_NAME" ]; then
+            echo "FAIL: no Running, Ready, non-terminating gg-monitor pod (serviceAccountName=${MONITOR_SERVICE_ACCOUNT}, owned by the current Deployment/ReplicaSet) was found in ${TARGET_NAMESPACE}."
+            exit 1
+          fi
+
+          echo "OK: using pod ${POD_NAME}."
+          echo "pod_name=${POD_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Confirm the global hard switch when enabling
+        if: ${{ inputs.desired_metrics_enabled }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          POD_NAME="${{ steps.pod.outputs.pod_name }}"
+          POD_CLOUDWATCH_ENV="$(kubectl get pod "$POD_NAME" -n "$TARGET_NAMESPACE" \
+            -o jsonpath='{range .spec.containers[0].env[?(@.name=="CLOUDWATCH_PUBLISH_ENABLED")]}{.value}{end}')"
+
+          echo "Deployed CLOUDWATCH_PUBLISH_ENABLED=${POD_CLOUDWATCH_ENV:-<absent>}"
+
+          if [ "$POD_CLOUDWATCH_ENV" != "true" ]; then
+            echo "FAIL: desired_metrics_enabled=true requires the deployed monitor's global hard switch (CLOUDWATCH_PUBLISH_ENABLED) to already be true. It is \"${POD_CLOUDWATCH_ENV:-<absent>}\"."
+            echo "Refusing to change DynamoDB. Run goldengate-monitor.yaml with enable_cloudwatch_publication=true first (see its metrics_gate_expectation=all-disabled staged-activation step), then re-run this workflow."
+            exit 1
+          fi
+          echo "OK: global hard switch is already true -- safe to proceed with enabling this deployment's gate."
+
+      - name: Run the metrics-config helper inside the monitor pod
+        id: helper
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          POD_NAME="${{ steps.pod.outputs.pod_name }}"
+          CANONICAL_TYPE="${{ steps.registry.outputs.canonical_type }}"
+          DEPLOYMENT_NAME="${{ inputs.deployment_name }}"
+          DESIRED="${{ inputs.desired_metrics_enabled }}"
+          APPLY="${{ inputs.apply_change }}"
+
+          echo "Executing ${METRICS_CONFIG_HELPER} inside pod ${POD_NAME} (deployment=${DEPLOYMENT_NAME} type=${CANONICAL_TYPE} desired=${DESIRED} apply=${APPLY})..."
+          echo "This uses the pod's own IRSA (${MONITOR_IRSA_ROLE_ARN}) -- no AWS key/credential is injected by this workflow, and no web-identity token content is ever read or displayed."
+
+          set +e
+          HELPER_OUTPUT="$(kubectl exec -i "$POD_NAME" -n "$TARGET_NAMESPACE" -- \
+            python3 - "$DEPLOYMENT_NAME" "$CANONICAL_TYPE" "$DESIRED" "$APPLY" < "$METRICS_CONFIG_HELPER" 2>&1)"
+          HELPER_STATUS=$?
+          set -e
+
+          echo "$HELPER_OUTPUT"
+
+          if [ "$HELPER_STATUS" -ne 0 ]; then
+            echo "FAIL: the metrics-config helper exited ${HELPER_STATUS}."
+            exit 1
+          fi
+
+          ACTION_LINE="$(grep -m1 '^action=' <<< "$HELPER_OUTPUT" || true)"
+          echo "helper_action=${ACTION_LINE#action=}" >> "$GITHUB_OUTPUT"
+
+      - name: Post-update observation
+        if: ${{ inputs.apply_change }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          POD_NAME="${{ steps.pod.outputs.pod_name }}"
+          CANONICAL_TYPE="${{ steps.registry.outputs.canonical_type }}"
+          DEPLOYMENT_NAME="${{ inputs.deployment_name }}"
+          DESIRED="${{ inputs.desired_metrics_enabled }}"
+
+          VALIDATION_START_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          OBSERVATION_PERIOD_SECONDS=90
+          echo "Observing gg-monitor for ${OBSERVATION_PERIOD_SECONDS}s starting at ${VALIDATION_START_TS} (covers at least one monitor polling/config interval)..."
+          sleep "$OBSERVATION_PERIOD_SECONDS"
+
+          echo "Re-reading the CONFIG item (dry-run mode: no further write) to confirm the new value took effect..."
+          set +e
+          REREAD_OUTPUT="$(kubectl exec -i "$POD_NAME" -n "$TARGET_NAMESPACE" -- \
+            python3 - "$DEPLOYMENT_NAME" "$CANONICAL_TYPE" "$DESIRED" "false" < "$METRICS_CONFIG_HELPER" 2>&1)"
+          REREAD_STATUS=$?
+          set -e
+          echo "$REREAD_OUTPUT"
+          if [ "$REREAD_STATUS" -ne 0 ]; then
+            echo "FAIL: post-update re-read of the CONFIG item failed."
+            exit 1
+          fi
+          if ! grep -qx "currentMetricsEnabled=${DESIRED}" <<< "$REREAD_OUTPUT"; then
+            echo "FAIL: post-update CONFIG.metricsEnabled does not equal the desired value ${DESIRED}."
+            exit 1
+          fi
+          if ! grep -qx "alertsEnabled=false" <<< "$REREAD_OUTPUT"; then
+            echo "FAIL: post-update CONFIG.alertsEnabled is no longer the literal Boolean false."
+            exit 1
+          fi
+          echo "OK: post-update CONFIG.metricsEnabled=${DESIRED}, alertsEnabled=false confirmed."
+
+          echo "Retrieving current gg-monitor logs since ${VALIDATION_START_TS}..."
+          set +e
+          RECENT_LOGS="$(kubectl logs "$POD_NAME" -n "$TARGET_NAMESPACE" --since-time="$VALIDATION_START_TS" 2>&1)"
+          LOGS_STATUS=$?
+          set -e
+          if [ "$LOGS_STATUS" -ne 0 ]; then
+            echo "FAIL: could not retrieve gg-monitor logs since ${VALIDATION_START_TS} (kubectl logs exited ${LOGS_STATUS})."
+            exit 1
+          fi
+
+          LOG_FAILURE="false"
+          for forbidden in "cloudwatch_client_creation_failed" "cloudwatch_put_metric_data_failed" "AccessDeniedException" "not authorized to perform" "tick failed"; do
+            if grep -Fq -- "$forbidden" <<< "$RECENT_LOGS"; then
+              echo "FAIL: \"${forbidden}\" found in gg-monitor logs since ${VALIDATION_START_TS}."
+              LOG_FAILURE="true"
+            fi
+          done
+          if [ "$LOG_FAILURE" = "true" ]; then
+            exit 1
+          fi
+          echo "OK: no CloudWatch client-creation/PutMetricData/AccessDenied/authorization/tick-failed signature found since ${VALIDATION_START_TS}."
+
+          if [ "$DESIRED" = "true" ]; then
+            echo ""
+            echo "Configuration gate enabled. This does not by itself prove that metrics reached CloudWatch."
+          else
+            echo ""
+            echo "Configuration gate disabled. New metric publication for this deployment is blocked by the per-deployment gate."
+          fi
+
+      - name: Workflow summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## GoldenGate monitor metrics CONFIG update summary"
+            echo ""
+            echo "- Deployment: \`${{ inputs.deployment_name }}\`"
+            echo "- Desired metricsEnabled: \`${{ inputs.desired_metrics_enabled }}\`"
+            echo "- apply_change: \`${{ inputs.apply_change }}\`"
+            echo "- Helper action: \`${{ steps.helper.outputs.helper_action || 'unknown' }}\`"
+            echo ""
+            echo "### Scope"
+            echo ""
+            echo "This workflow updates at most one deployment's CONFIG.metricsEnabled per run,"
+            echo "via a conditional DynamoDB UpdateItem executed under the existing gg-monitor"
+            echo "pod's own IRSA (GoldenGateMonitorReadRole-dev). It never builds/pushes an"
+            echo "image, never packages/pushes a Helm chart, never touches the Argo CD"
+            echo "Application, and never creates or modifies a Kubernetes object."
+          } >> "$GITHUB_STEP_SUMMARY"

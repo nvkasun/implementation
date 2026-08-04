@@ -25,10 +25,20 @@ on:
         default: true
 
       enable_cloudwatch_publication:
-        description: "Enable GoldenGate custom metric publication (CloudWatch namespace GoldenGate/Pipelines) in DEV. Requires CONFIG.metricsEnabled=true (literal Boolean) for every enabled canonical deployment -- verified before the Argo CD Application is ever updated. Set false to roll back to disabled."
+        description: "Enable GoldenGate custom metric publication (CloudWatch namespace GoldenGate/Pipelines) in DEV -- the global hard switch (CLOUDWATCH_PUBLISH_ENABLED). Publication also requires each individual deployment's CONFIG.metricsEnabled=true (literal Boolean); see metrics_gate_expectation for how that per-deployment state is verified. Set false to roll back to disabled."
         required: true
         type: boolean
         default: false
+
+      metrics_gate_expectation:
+        description: "Only checked when enable_cloudwatch_publication=true. Safe staged activation order: (1) first run with publication=true and expectation=all-disabled to prove the global switch deploys while every deployment gate stays closed; (2) use the separate goldengate-monitor-metrics-config.yaml workflow to enable each deployment's CONFIG.metricsEnabled individually and verify custom metrics manually in CloudWatch; (3) once satisfied, run this workflow again with publication=true and expectation=all-enabled. 'any' accepts a valid mixture of literal true/false CONFIG values (still rejects missing/malformed CONFIG or alertsEnabled=true) -- use only once staged activation is already complete and mixed states are expected/intentional."
+        required: true
+        type: choice
+        default: any
+        options:
+          - any
+          - all-disabled
+          - all-enabled
 
 permissions:
   id-token: write
@@ -1256,13 +1266,27 @@ jobs:
 
           echo "OK: ${ARGOCD_MONITOR_SECRET_NAME} exists and points to ${EXPECTED_URL}."
 
-      - name: CloudWatch publication preflight (CONFIG.metricsEnabled)
+      - name: CloudWatch publication preflight (gate inventory)
         if: ${{ (github.event_name != 'workflow_dispatch' || inputs.deploy) && inputs.enable_cloudwatch_publication }}
+        # Phase 6C1: replaces the old always-require-true preflight, which
+        # made the safe staged activation order (1: deploy the global hard
+        # switch true while every deployment gate stays closed, 2: enable
+        # deployments individually via the dedicated config workflow, 3:
+        # verify metrics manually in CloudWatch, 4: only then run again with
+        # expectation=all-enabled) impossible -- it always refused to touch
+        # the Argo CD Application unless every enabled deployment already
+        # had metricsEnabled=true. This step instead takes an INVENTORY of
+        # the current gate state (still GetItem-only, still one call per
+        # enabled deployment, still the existing running pod's own IRSA via
+        # kubectl exec, never Scan, never a new IAM permission, never a
+        # CloudWatch client) and applies metrics_gate_expectation to decide
+        # whether that inventory is acceptable before the Argo CD
+        # Application is ever touched.
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "enable_cloudwatch_publication=true requested -- verifying CONFIG.metricsEnabled is literal Boolean true for every enabled canonical deployment before the Argo CD Application is touched."
+          echo "enable_cloudwatch_publication=true requested (metrics_gate_expectation=${{ inputs.metrics_gate_expectation }}) -- taking a safe CONFIG gate inventory for every enabled canonical deployment before the Argo CD Application is touched."
           echo "This never uses DynamoDB Scan, never broadens IAM, and never constructs a CloudWatch client -- it reuses the existing running monitor pod's own IRSA (GoldenGateMonitorReadRole-dev) via a bounded kubectl exec, one GetItem per enabled deployment."
 
           # A Ready pod only -- never a blind .items[0] (which could select a
@@ -1277,55 +1301,123 @@ jobs:
           if [ -z "$POD_NAME" ]; then
             echo ""
             echo "PREREQUISITE NOT MET: no Ready gg-monitor pod found in namespace ${TARGET_NAMESPACE}."
-            echo "CONFIG.metricsEnabled cannot be verified without an authenticated read path, and this workflow never bypasses that check merely because the monitor does not exist yet or is not Ready."
+            echo "The CONFIG gate inventory cannot be taken without an authenticated read path, and this workflow never bypasses that check merely because the monitor does not exist yet or is not Ready."
             echo ""
             echo "Prerequisite: first deploy the monitor with enable_cloudwatch_publication=false (the default), confirm it is Ready, then re-run this workflow with enable_cloudwatch_publication=true."
             exit 1
           fi
           echo "Using the existing monitor pod for this read-only preflight: ${POD_NAME}"
 
-          # Canonical enabled-deployment names, discovered the same way the
-          # SecretProviderClass-alias check above does -- never hardcoded.
-          mapfile -t ENABLED_DEPLOYMENTS < <(awk '
-            /^[[:space:]]*-[[:space:]]*name:/ { if (name != "" && enabled == "true") print name; name=$0; sub(/^[[:space:]]*-[[:space:]]*name:[[:space:]]*/, "", name); gsub(/["\x27\r]/, "", name); enabled="" }
-            /^[[:space:]]*enabled:[[:space:]]*true/ { enabled="true" }
-            /^[[:space:]]*enabled:[[:space:]]*false/ { enabled="false" }
-            END { if (name != "" && enabled == "true") print name }
+          # Canonical enabled deployment name|type pairs, discovered the
+          # same way the SecretProviderClass-alias check above discovers
+          # names -- never hardcoded, and now also carrying each
+          # deployment's canonical type for the deploymentType check below.
+          mapfile -t ENABLED_DEPLOYMENT_PAIRS < <(awk '
+            /^[[:space:]]*-[[:space:]]*name:/ {
+              if (name != "" && enabled == "true") print name "|" type
+              name=$0; sub(/^[[:space:]]*-[[:space:]]*name:[[:space:]]*/, "", name); gsub(/["\x27\r]/, "", name)
+              type=""; enabled=""
+              next
+            }
+            /^[[:space:]]*type:[[:space:]]*/ {
+              if (type == "") { t=$0; sub(/^[[:space:]]*type:[[:space:]]*/, "", t); gsub(/["\x27\r]/, "", t); type=t }
+              next
+            }
+            /^[[:space:]]*enabled:[[:space:]]*true/ { enabled="true"; next }
+            /^[[:space:]]*enabled:[[:space:]]*false/ { enabled="false"; next }
+            END { if (name != "" && enabled == "true") print name "|" type }
           ' envs/dev/goldengate-deployments.yaml)
 
-          if [ "${#ENABLED_DEPLOYMENTS[@]}" -eq 0 ]; then
+          if [ "${#ENABLED_DEPLOYMENT_PAIRS[@]}" -eq 0 ]; then
             echo "FAIL: no enabled deployments discovered from envs/dev/goldengate-deployments.yaml."
             exit 1
           fi
 
+          GATE_EXPECTATION="${{ inputs.metrics_gate_expectation }}"
           PREFLIGHT_FAILED="false"
-          for name in "${ENABLED_DEPLOYMENTS[@]}"; do
+          ENABLED_CONFIG_COUNT=0
+          DISABLED_CONFIG_COUNT=0
+          ALERTS_ENABLED_COUNT=0
+
+          for pair in "${ENABLED_DEPLOYMENT_PAIRS[@]}"; do
+            name="${pair%%|*}"
+            expected_type="${pair#*|}"
+
+            set +e
             RESULT="$(kubectl exec "$POD_NAME" -n "$TARGET_NAMESPACE" -- python3 -c '
           import boto3, os, sys
           pipeline = sys.argv[1]
+          expected_type = sys.argv[2]
           try:
               table = boto3.resource("dynamodb", region_name=os.environ.get("AWS_REGION", "eu-west-1")).Table(os.environ["DYNAMODB_TABLE"])
               item = table.get_item(Key={"pipeline": pipeline, "recordType": "CONFIG"}).get("Item")
-              ok = isinstance(item, dict) and item.get("metricsEnabled") is True
-          except Exception:
-              ok = False
-          print(f"deployment={pipeline} metricsEnabled=true" if ok else f"deployment={pipeline} metricsEnabled-not-literal-true")
-          ' "$name" 2>/dev/null)" || RESULT="deployment=${name} metricsEnabled-not-literal-true"
+              if not isinstance(item, dict):
+                  print(f"deployment={pipeline} result=missing-config"); sys.exit(1)
+              if item.get("recordType") != "CONFIG":
+                  print(f"deployment={pipeline} result=bad-recordtype"); sys.exit(1)
+              if item.get("deploymentType") != expected_type:
+                  print(f"deployment={pipeline} result=deploymenttype-mismatch"); sys.exit(1)
+              metrics_enabled = item.get("metricsEnabled")
+              alerts_enabled = item.get("alertsEnabled")
+              if not isinstance(metrics_enabled, bool):
+                  print(f"deployment={pipeline} result=metricsenabled-not-boolean"); sys.exit(1)
+              if alerts_enabled is not False:
+                  print(f"deployment={pipeline} result=alertsenabled-not-false"); sys.exit(1)
+              print(f"deployment={pipeline} deploymentType={expected_type} metricsEnabled={\"true\" if metrics_enabled else \"false\"} alertsEnabled=false")
+          except SystemExit:
+              raise
+          except Exception as exc:
+              print(f"deployment={pipeline} result=read-error"); sys.exit(1)
+          ' "$name" "$expected_type" 2>/dev/null)"
+            RESULT_STATUS=$?
+            set -e
 
             echo "$RESULT"
-            if [ "$RESULT" != "deployment=${name} metricsEnabled=true" ]; then
+
+            if [ "$RESULT_STATUS" -ne 0 ] || [[ "$RESULT" != "deployment=${name} deploymentType=${expected_type} metricsEnabled="* ]]; then
+              echo "FAIL: gate inventory read failed for deployment ${name} (missing CONFIG, malformed metricsEnabled/alertsEnabled, deploymentType mismatch, or a DynamoDB read error)."
               PREFLIGHT_FAILED="true"
+              if [[ "$RESULT" == *"result=alertsenabled-not-false"* ]]; then
+                ALERTS_ENABLED_COUNT=$((ALERTS_ENABLED_COUNT + 1))
+              fi
+              continue
+            fi
+
+            if [[ "$RESULT" == *"metricsEnabled=true"* ]]; then
+              ENABLED_CONFIG_COUNT=$((ENABLED_CONFIG_COUNT + 1))
+              if [ "$GATE_EXPECTATION" = "all-disabled" ]; then
+                echo "FAIL: expectation=all-disabled but ${name} has metricsEnabled=true."
+                PREFLIGHT_FAILED="true"
+              fi
+            else
+              DISABLED_CONFIG_COUNT=$((DISABLED_CONFIG_COUNT + 1))
+              if [ "$GATE_EXPECTATION" = "all-enabled" ]; then
+                echo "FAIL: expectation=all-enabled but ${name} has metricsEnabled=false."
+                PREFLIGHT_FAILED="true"
+              fi
             fi
           done
 
+          # Written before the pass/fail decision so the inventory is
+          # always visible in the run summary, including on failure.
+          {
+            echo "### CloudWatch publication preflight (gate inventory)"
+            echo ""
+            echo "- Global hard switch requested: \`true\`"
+            echo "- metrics_gate_expectation: \`${GATE_EXPECTATION}\`"
+            echo "- Canonical enabled deployments: \`${#ENABLED_DEPLOYMENT_PAIRS[@]}\`"
+            echo "- CONFIG.metricsEnabled=true count: \`${ENABLED_CONFIG_COUNT}\`"
+            echo "- CONFIG.metricsEnabled=false count: \`${DISABLED_CONFIG_COUNT}\`"
+            echo "- CONFIG.alertsEnabled=true count (must be zero): \`${ALERTS_ENABLED_COUNT}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
           if [ "$PREFLIGHT_FAILED" = "true" ]; then
             echo ""
-            echo "FAIL: CloudWatch publication preflight failed -- at least one enabled canonical deployment does not have CONFIG.metricsEnabled set to the literal Boolean true."
-            echo "Refusing to update the Argo CD Application. No CloudWatch client will be constructed; publication stays disabled."
+            echo "FAIL: CloudWatch publication preflight failed. Refusing to update the Argo CD Application. No CloudWatch client will be constructed; publication stays disabled."
             exit 1
           fi
 
-          echo "OK: CONFIG.metricsEnabled is literal Boolean true for every enabled canonical deployment."
+          echo "OK: gate inventory satisfies metrics_gate_expectation=${GATE_EXPECTATION} for every enabled canonical deployment (alertsEnabled confirmed false throughout)."
 
       - name: Create or update Argo CD Application
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.deploy }}
@@ -1587,48 +1679,115 @@ jobs:
             echo ""
             echo "CloudWatch publication is enabled -- verifying source-side/runtime safety only. This never adds a CloudWatch read call or IAM permission: no ListMetrics/GetMetricData is used anywhere."
 
-            echo "Re-verifying CONFIG.metricsEnabled via the running (post-rollout) pod..."
-            mapfile -t ENABLED_DEPLOYMENTS_POST < <(awk '
-              /^[[:space:]]*-[[:space:]]*name:/ { if (name != "" && enabled == "true") print name; name=$0; sub(/^[[:space:]]*-[[:space:]]*name:[[:space:]]*/, "", name); gsub(/["\x27\r]/, "", name); enabled="" }
-              /^[[:space:]]*enabled:[[:space:]]*true/ { enabled="true" }
-              /^[[:space:]]*enabled:[[:space:]]*false/ { enabled="false" }
-              END { if (name != "" && enabled == "true") print name }
+            GATE_EXPECTATION_POST="${{ inputs.metrics_gate_expectation }}"
+            echo "Re-taking the CONFIG gate inventory via the running (post-rollout) pod, reapplying metrics_gate_expectation=${GATE_EXPECTATION_POST}..."
+
+            mapfile -t ENABLED_DEPLOYMENT_PAIRS_POST < <(awk '
+              /^[[:space:]]*-[[:space:]]*name:/ {
+                if (name != "" && enabled == "true") print name "|" type
+                name=$0; sub(/^[[:space:]]*-[[:space:]]*name:[[:space:]]*/, "", name); gsub(/["\x27\r]/, "", name)
+                type=""; enabled=""
+                next
+              }
+              /^[[:space:]]*type:[[:space:]]*/ {
+                if (type == "") { t=$0; sub(/^[[:space:]]*type:[[:space:]]*/, "", t); gsub(/["\x27\r]/, "", t); type=t }
+                next
+              }
+              /^[[:space:]]*enabled:[[:space:]]*true/ { enabled="true"; next }
+              /^[[:space:]]*enabled:[[:space:]]*false/ { enabled="false"; next }
+              END { if (name != "" && enabled == "true") print name "|" type }
             ' envs/dev/goldengate-deployments.yaml)
-            for name in "${ENABLED_DEPLOYMENTS_POST[@]}"; do
+
+            POST_GATE_FAILED="false"
+            for pair in "${ENABLED_DEPLOYMENT_PAIRS_POST[@]}"; do
+              name="${pair%%|*}"
+              expected_type="${pair#*|}"
+
+              set +e
               RESULT="$(kubectl exec "$POD_NAME" -n "$TARGET_NAMESPACE" -- python3 -c '
           import boto3, os, sys
           pipeline = sys.argv[1]
+          expected_type = sys.argv[2]
           try:
               table = boto3.resource("dynamodb", region_name=os.environ.get("AWS_REGION", "eu-west-1")).Table(os.environ["DYNAMODB_TABLE"])
               item = table.get_item(Key={"pipeline": pipeline, "recordType": "CONFIG"}).get("Item")
-              ok = isinstance(item, dict) and item.get("metricsEnabled") is True
-          except Exception:
-              ok = False
-          print(f"deployment={pipeline} metricsEnabled=true" if ok else f"deployment={pipeline} metricsEnabled-not-literal-true")
-          ' "$name" 2>/dev/null)" || RESULT="deployment=${name} metricsEnabled-not-literal-true"
+              if not isinstance(item, dict):
+                  print(f"deployment={pipeline} result=missing-config"); sys.exit(1)
+              if item.get("recordType") != "CONFIG":
+                  print(f"deployment={pipeline} result=bad-recordtype"); sys.exit(1)
+              if item.get("deploymentType") != expected_type:
+                  print(f"deployment={pipeline} result=deploymenttype-mismatch"); sys.exit(1)
+              metrics_enabled = item.get("metricsEnabled")
+              alerts_enabled = item.get("alertsEnabled")
+              if not isinstance(metrics_enabled, bool):
+                  print(f"deployment={pipeline} result=metricsenabled-not-boolean"); sys.exit(1)
+              if alerts_enabled is not False:
+                  print(f"deployment={pipeline} result=alertsenabled-not-false"); sys.exit(1)
+              print(f"deployment={pipeline} deploymentType={expected_type} metricsEnabled={\"true\" if metrics_enabled else \"false\"} alertsEnabled=false")
+          except SystemExit:
+              raise
+          except Exception as exc:
+              print(f"deployment={pipeline} result=read-error"); sys.exit(1)
+          ' "$name" "$expected_type" 2>/dev/null)"
+              RESULT_STATUS=$?
+              set -e
+
               echo "$RESULT"
-              if [ "$RESULT" != "deployment=${name} metricsEnabled=true" ]; then
-                echo "FAIL: post-rollout CONFIG.metricsEnabled check failed for ${name}."
-                exit 1
+
+              if [ "$RESULT_STATUS" -ne 0 ] || [[ "$RESULT" != "deployment=${name} deploymentType=${expected_type} metricsEnabled="* ]]; then
+                echo "FAIL: post-rollout gate inventory read failed for deployment ${name}."
+                POST_GATE_FAILED="true"
+                continue
+              fi
+
+              if [[ "$RESULT" == *"metricsEnabled=true"* ]] && [ "$GATE_EXPECTATION_POST" = "all-disabled" ]; then
+                echo "FAIL: post-rollout expectation=all-disabled but ${name} has metricsEnabled=true."
+                POST_GATE_FAILED="true"
+              elif [[ "$RESULT" == *"metricsEnabled=false"* ]] && [ "$GATE_EXPECTATION_POST" = "all-enabled" ]; then
+                echo "FAIL: post-rollout expectation=all-enabled but ${name} has metricsEnabled=false."
+                POST_GATE_FAILED="true"
               fi
             done
-            echo "OK: CONFIG.metricsEnabled remains literal Boolean true for every enabled deployment."
 
-            echo "Checking recent monitor logs for CloudWatch failure signatures..."
+            if [ "$POST_GATE_FAILED" = "true" ]; then
+              echo "FAIL: post-rollout CONFIG gate inventory failed."
+              exit 1
+            fi
+            echo "OK: post-rollout gate inventory satisfies metrics_gate_expectation=${GATE_EXPECTATION_POST} for every enabled deployment; alertsEnabled confirmed false throughout."
+
+            # Bounded observation window using --since-time (never a broad
+            # historical window) so pre-existing/historical log lines from
+            # before this validation cannot cause a false failure.
+            VALIDATION_START_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            OBSERVATION_PERIOD_SECONDS=90
+            echo "Observing gg-monitor logs for ${OBSERVATION_PERIOD_SECONDS}s starting at ${VALIDATION_START_TS} (covers at least one full polling/config interval)..."
+            sleep "$OBSERVATION_PERIOD_SECONDS"
+
+            set +e
+            RECENT_LOGS="$(kubectl logs "$POD_NAME" -n "$TARGET_NAMESPACE" --since-time="$VALIDATION_START_TS" 2>&1)"
+            LOGS_STATUS=$?
+            set -e
+            if [ "$LOGS_STATUS" -ne 0 ]; then
+              echo "FAIL: could not retrieve gg-monitor logs since ${VALIDATION_START_TS} (kubectl logs exited ${LOGS_STATUS})."
+              exit 1
+            fi
+
             CLOUDWATCH_LOG_FAILURE="false"
-            for forbidden in "cloudwatch_client_creation_failed" "cloudwatch_put_metric_data_failed" "tick failed"; do
-              if grep -Fq -- "$forbidden" <<< "$POD_LOGS"; then
-                echo "FAIL: \"${forbidden}\" found in recent gg-monitor logs while CloudWatch publication is enabled."
+            for forbidden in "cloudwatch_client_creation_failed" "cloudwatch_put_metric_data_failed" "AccessDeniedException" "not authorized to perform" "tick failed"; do
+              if grep -Fq -- "$forbidden" <<< "$RECENT_LOGS"; then
+                echo "FAIL: \"${forbidden}\" found in gg-monitor logs since ${VALIDATION_START_TS}."
                 CLOUDWATCH_LOG_FAILURE="true"
               fi
             done
             if [ "$CLOUDWATCH_LOG_FAILURE" = "true" ]; then
               exit 1
             fi
-            echo "OK: no CloudWatch client-creation/PutMetricData failure or generic tick-failed signature found in recent logs."
+            echo "OK: no CloudWatch client-creation/PutMetricData/AccessDenied/authorization/tick-failed signature found since ${VALIDATION_START_TS}."
             echo "Note: process-level metrics (ExtractLagSeconds/ReplicatLagSeconds/AbendState/AbendEvent) may legitimately be absent until real replication-process STATE rows exist -- this is not checked here and does not fail this step."
+            echo ""
+            echo "Source-side publication gates and recent error logs passed. CloudWatch metric arrival must still be confirmed in the CloudWatch console."
           else
-            echo "CloudWatch publication is disabled -- no CONFIG.metricsEnabled check or CloudWatch-failure log check is required."
+            echo "CloudWatch publication is disabled -- no CONFIG gate inventory or CloudWatch-failure log check is required."
           fi
 
       - name: Upload rendered manifests and chart package
