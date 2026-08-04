@@ -27,15 +27,24 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import json
 import os
+import shutil
+import stat
+import subprocess
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
+import yaml  # noqa: E402
+
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MONITOR_SRC = os.path.join(REPO_ROOT, "monitoring", "monitor")
 HELPER_PATH = os.path.join(REPO_ROOT, "hack", "goldengate-metrics-config.py")
+MONITOR_WORKFLOW_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "goldengate-monitor.yaml")
+METRICS_CONFIG_WORKFLOW_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "goldengate-monitor-metrics-config.yaml")
 
 sys.path.insert(0, MONITOR_SRC)
 
@@ -103,6 +112,68 @@ def run_helper(argv):
     finally:
         sys.argv = old_argv
     return code, buf.getvalue()
+
+
+# ---------------------------------------------------------------------
+# Workflow functional-test infrastructure: extracts the ACTUAL committed
+# run: script text for a named step from the real workflow YAML (never a
+# reimplementation of it) and executes it under real bash, with a mocked
+# kubectl/jq PATH standing in for the cluster. This proves the exact
+# committed bash content behaves correctly, not a copy of its logic.
+# ---------------------------------------------------------------------
+def _get_step(workflow_path, step_name):
+    with open(workflow_path) as f:
+        doc = yaml.safe_load(f)
+    for job in doc.get("jobs", {}).values():
+        for step in job.get("steps", []):
+            if step.get("name") == step_name:
+                return step
+    raise AssertionError(f"step {step_name!r} not found in {workflow_path}")
+
+
+def _workflow_top_level_env(workflow_path):
+    """Only the literal (non-${{ }}) values from the workflow's top-level
+    env: block -- these are constants the run: scripts reference directly
+    (e.g. TARGET_NAMESPACE), never a value that depends on live AWS/GitHub
+    context."""
+    with open(workflow_path) as f:
+        doc = yaml.safe_load(f)
+    out = {}
+    for k, v in (doc.get("env") or {}).items():
+        if isinstance(v, str) and "${{" not in v:
+            out[k] = v
+    return out
+
+
+def run_step_script(workflow_path, step_name, script_text, env_overrides, bin_dir=None, timeout=20,
+                     gh_expression_overrides=None):
+    """Runs `script_text` (the real, extracted run: body, or a bounded
+    fragment of it) under bash. env_overrides simulates exactly what GitHub
+    Actions' own ${{ }} substitution would have injected into the step's
+    env: block -- the run: text itself is never modified/reimplemented.
+
+    gh_expression_overrides pre-substitutes any remaining literal
+    "${{ ... }}" text the same way the real GitHub Actions preprocessor
+    would, before bash ever parses the script -- needed only for
+    expressions Task 1 did not relocate to env: (goldengate-monitor.yaml's
+    ${{ inputs.metrics_gate_expectation }} choice input is out of Task 1's
+    scope, which applies only to goldengate-monitor-metrics-config.yaml)."""
+    for literal, value in (gh_expression_overrides or {}).items():
+        script_text = script_text.replace(literal, value)
+    env = dict(os.environ)
+    env.update(_workflow_top_level_env(workflow_path))
+    env.update(env_overrides)
+    if bin_dir:
+        env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+    proc = subprocess.run(["bash", "-c", script_text], env=env, capture_output=True, text=True, timeout=timeout)
+    return proc
+
+
+def write_executable(path, content):
+    with open(path, "w") as f:
+        f.write(content)
+    st = os.stat(path)
+    os.chmod(path, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
 
 # ---------------------------------------------------------------------
@@ -377,6 +448,561 @@ class MetricsConfigHelperTests(unittest.TestCase):
         code, out = run_helper([self.PIPELINE, self.TYPE, "yes", "false"])
         self.assertNotEqual(code, 0)
         self.assertIn("USAGE ERROR", out)
+
+    @mock_aws
+    def test_consistent_read_prevents_stale_value_causing_wrong_decision(self):
+        # Proves the initial GetItem's ConsistentRead=True actually matters:
+        # a get_item call WITHOUT ConsistentRead=True is made to return a
+        # fabricated stale (pre-write) value; a call WITH it delegates to
+        # the real, fresh, moto-backed data. Since the real helper always
+        # passes ConsistentRead=True, it must observe the fresh value
+        # (already == desired) and correctly decide no update is needed --
+        # never act on the stale replica.
+        table = make_table()
+        self._seed(table, self.PIPELINE, self.TYPE, metrics_enabled=True)
+        real_get_item = table.get_item
+
+        def stale_unless_consistent(*args, **kwargs):
+            if kwargs.get("ConsistentRead") is True:
+                return real_get_item(*args, **kwargs)
+            return {"Item": {
+                "pipeline": self.PIPELINE, "recordType": "CONFIG",
+                "deploymentType": self.TYPE, "metricsEnabled": False, "alertsEnabled": False,
+            }}
+
+        with mock.patch("boto3.resource") as mock_resource:
+            wrapped = mock.MagicMock(wraps=table)
+            wrapped.get_item.side_effect = stale_unless_consistent
+            mock_resource.return_value.Table.return_value = wrapped
+            code, out = run_helper([self.PIPELINE, self.TYPE, "true", "true"])
+
+        self.assertEqual(code, 0)
+        self.assertIn("action=none", out)
+        wrapped.update_item.assert_not_called()
+
+    @mock_aws
+    def test_returned_all_new_attributes_are_validated_independently(self):
+        # The real DynamoDB write succeeds correctly (moto-backed), but the
+        # ALL_NEW Attributes the helper receives back are tampered with --
+        # proving the helper validates that response itself, not only the
+        # separate follow-up GetItem.
+        table = make_table()
+        self._seed(table, self.PIPELINE, self.TYPE, metrics_enabled=False)
+        real_update_item = table.update_item
+
+        def tampered_update_item(**kwargs):
+            response = real_update_item(**kwargs)
+            response["Attributes"]["metricsEnabled"] = False
+            return response
+
+        with mock.patch("boto3.resource") as mock_resource:
+            wrapped = mock.MagicMock(wraps=table)
+            wrapped.update_item.side_effect = tampered_update_item
+            mock_resource.return_value.Table.return_value = wrapped
+            code, out = run_helper([self.PIPELINE, self.TYPE, "true", "true"])
+
+        self.assertNotEqual(code, 0)
+        self.assertIn("ALL_NEW attributes show metricsEnabled", out)
+
+
+# ---------------------------------------------------------------------
+# Task 7 corrections: static source-level invariants for
+# hack/goldengate-metrics-config.py and the two inline CONFIG readers in
+# goldengate-monitor.yaml.
+# ---------------------------------------------------------------------
+class SourceLevelSafetyInvariantTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        with open(HELPER_PATH) as f:
+            cls.helper_source = f.read()
+        with open(MONITOR_WORKFLOW_PATH) as f:
+            cls.monitor_workflow_text = f.read()
+
+    def test_helper_initial_get_item_uses_consistent_read(self):
+        idx = self.helper_source.index("# 1. Read the current CONFIG item")
+        chunk = self.helper_source[idx:idx + 500]
+        self.assertIn("ConsistentRead=True", chunk)
+
+    def test_helper_verification_get_item_uses_consistent_read(self):
+        idx = self.helper_source.index("def _consistent_verification_get_item")
+        chunk = self.helper_source[idx:idx + 600]
+        self.assertIn("ConsistentRead=True", chunk)
+
+    def test_helper_update_item_uses_return_values_all_new(self):
+        idx = self.helper_source.index("table.update_item(")
+        chunk = self.helper_source[idx:idx + 400]
+        self.assertIn('ReturnValues="ALL_NEW"', chunk)
+
+    def test_helper_has_exactly_one_update_item_call_site(self):
+        self.assertEqual(self.helper_source.count("table.update_item("), 1)
+
+    def test_helper_validates_all_new_returned_attributes(self):
+        self.assertIn('new_attributes = update_response.get("Attributes")', self.helper_source)
+        self.assertIn('new_attributes.get("metricsEnabled") is not desired_metrics_enabled', self.helper_source)
+        self.assertIn('new_attributes.get("alertsEnabled") is not False', self.helper_source)
+        self.assertIn('new_attributes.get("deploymentType") != canonical_type', self.helper_source)
+
+    def test_helper_retry_helper_never_calls_update_item(self):
+        # The bounded retry applies only to the verification read -- it
+        # must never be able to issue (or retry) an UpdateItem itself.
+        idx = self.helper_source.index("def _consistent_verification_get_item")
+        end = self.helper_source.index("# 1. Read the current CONFIG item")
+        retry_fn_source = self.helper_source[idx:end]
+        self.assertNotIn("update_item", retry_fn_source)
+
+    def test_helper_never_retries_conditional_check_failed(self):
+        idx = self.helper_source.index('if code == "ConditionalCheckFailedException":')
+        chunk = self.helper_source[idx:idx + 400]
+        self.assertIn("Not retrying automatically", chunk)
+        # The ConditionalCheckFailedException branch must exit immediately
+        # (sys.exit), never loop back to retry update_item.
+        self.assertIn("sys.exit(", chunk)
+
+    def test_monitor_workflow_inline_readers_use_consistent_read(self):
+        # Exactly two inline CONFIG-inventory readers exist (preflight +
+        # post-rollout verification), and both must request ConsistentRead.
+        self.assertEqual(self.monitor_workflow_text.count("ConsistentRead=True"), 2)
+        self.assertEqual(
+            self.monitor_workflow_text.count('table.get_item(Key={"pipeline": pipeline, "recordType": "CONFIG"}'),
+            2)
+
+
+# ---------------------------------------------------------------------
+# Task 7 items 1-2: shell-injection-shaped input is never executed. Task 1
+# moved every user-controlled string input out of the run: script body and
+# into the step's env: block -- these tests prove the ACTUAL committed
+# run: text (unmodified) treats a malicious value as inert data even when
+# it contains command substitution / quote-breaking syntax.
+# ---------------------------------------------------------------------
+class ShellInjectionSafetyTests(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.registry_path = os.path.join(self.tmpdir, "goldengate-deployments.yaml")
+        with open(self.registry_path, "w") as f:
+            f.write(
+                "deployments:\n"
+                "  - name: gg-oracle-payments-01\n"
+                "    type: oracle\n"
+                "    enabled: true\n"
+            )
+        self.sentinel = os.path.join(self.tmpdir, "pwned")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _payloads(self):
+        s = self.sentinel
+        return [
+            f"$(touch {s})",
+            f"`touch {s}`",
+            f'"; touch {s}; echo "',
+            f"'; touch {s}; echo '",
+            f"$(touch {s})\"; echo pwned",
+        ]
+
+    def test_registry_validation_rejects_injection_without_executing_it(self):
+        step = _get_step(METRICS_CONFIG_WORKFLOW_PATH, "Validate deployment_name against the canonical registry")
+        run_text = step["run"]
+        self.assertNotIn("${{ inputs.deployment_name }}", run_text)  # Task 1 invariant
+
+        for payload in self._payloads():
+            with self.subTest(payload=payload):
+                if os.path.exists(self.sentinel):
+                    os.remove(self.sentinel)
+                proc = run_step_script(
+                    METRICS_CONFIG_WORKFLOW_PATH, step["name"], run_text,
+                    {"REQUESTED_NAME": payload, "CANONICAL_REGISTRY": self.registry_path},
+                )
+                self.assertFalse(os.path.exists(self.sentinel), f"injection payload executed: {payload!r}")
+                self.assertNotEqual(proc.returncode, 0, f"expected safe failure for payload: {payload!r}")
+
+    def test_confirmation_validation_rejects_injection_without_executing_it(self):
+        step = _get_step(METRICS_CONFIG_WORKFLOW_PATH, "Validate the exact confirmation string")
+        run_text = step["run"]
+        self.assertNotIn("${{ inputs.deployment_name }}", run_text)
+        self.assertNotIn("${{ inputs.confirmation }}", run_text)
+
+        for payload in self._payloads():
+            with self.subTest(payload=payload):
+                if os.path.exists(self.sentinel):
+                    os.remove(self.sentinel)
+                proc = run_step_script(
+                    METRICS_CONFIG_WORKFLOW_PATH, step["name"], run_text,
+                    {"DEPLOYMENT_NAME": payload, "DESIRED": "true", "CONFIRMATION": payload},
+                )
+                self.assertFalse(os.path.exists(self.sentinel), f"injection payload executed: {payload!r}")
+                # A malicious value is never equal to "ENABLE <payload>" is
+                # actually possible by construction here (CONFIRMATION ==
+                # DEPLOYMENT_NAME), so assert on the sentinel only -- the
+                # important invariant is that nothing executed, regardless
+                # of the pass/fail verdict.
+
+    def test_no_direct_input_substitution_anywhere_in_config_workflow_run_blocks(self):
+        with open(METRICS_CONFIG_WORKFLOW_PATH) as f:
+            doc = yaml.safe_load(f)
+        for job in doc.get("jobs", {}).values():
+            for step in job.get("steps", []):
+                run = step.get("run")
+                if not run:
+                    continue
+                self.assertNotIn("${{ inputs.deployment_name }}", run, step.get("name"))
+                self.assertNotIn("${{ inputs.confirmation }}", run, step.get("name"))
+
+
+# ---------------------------------------------------------------------
+# Task 7 items 3-4: the observation timestamp is captured before the
+# helper/UpdateItem runs (not after), and the post-update step reuses that
+# exact value rather than recomputing a later one.
+# ---------------------------------------------------------------------
+class TimestampOrderingTests(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.bin_dir = os.path.join(self.tmpdir, "bin")
+        os.makedirs(self.bin_dir)
+        self.github_env = os.path.join(self.tmpdir, "github_env")
+        self.github_output = os.path.join(self.tmpdir, "github_output")
+        open(self.github_env, "w").close()
+        open(self.github_output, "w").close()
+        self.dummy_helper_file = os.path.join(self.tmpdir, "helper.py")
+        open(self.dummy_helper_file, "w").close()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_timestamp_captured_before_helper_exec_not_after(self):
+        step = _get_step(METRICS_CONFIG_WORKFLOW_PATH, "Run the metrics-config helper inside the monitor pod")
+        run_text = step["run"]
+        self.assertNotIn("${{ inputs.deployment_name }}", run_text)
+
+        # Mock kubectl: when invoked for "exec", checks whether
+        # VALIDATION_START_TS has ALREADY been appended to GITHUB_ENV --
+        # if not, this proves the real committed script tried to run the
+        # helper before capturing the timestamp.
+        write_executable(os.path.join(self.bin_dir, "kubectl"), f"""#!/usr/bin/env bash
+if [ "$1" = "exec" ]; then
+  if ! grep -q '^VALIDATION_START_TS=' "{self.github_env}" 2>/dev/null; then
+    echo "ORDER_VIOLATION: timestamp not captured before helper exec" >&2
+    exit 1
+  fi
+  echo "action=updated"
+  exit 0
+fi
+echo "mock kubectl: unhandled: $*" >&2
+exit 1
+""")
+
+        proc = run_step_script(
+            METRICS_CONFIG_WORKFLOW_PATH, step["name"], run_text,
+            {
+                "POD_NAME": "gg-monitor-test", "CANONICAL_TYPE": "oracle",
+                "DEPLOYMENT_NAME": "gg-oracle-payments-01", "DESIRED": "true", "APPLY": "true",
+                "TARGET_NAMESPACE": "goldengate-monitoring",
+                "METRICS_CONFIG_HELPER": self.dummy_helper_file,
+                "GITHUB_ENV": self.github_env, "GITHUB_OUTPUT": self.github_output,
+            },
+            bin_dir=self.bin_dir,
+        )
+
+        self.assertNotIn("ORDER_VIOLATION", proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        with open(self.github_env) as f:
+            env_content = f.read()
+        self.assertIn("VALIDATION_START_TS=", env_content)
+        with open(self.github_output) as f:
+            output_content = f.read()
+        self.assertIn("helper_action=updated", output_content)
+
+    def test_no_timestamp_captured_when_apply_change_false(self):
+        step = _get_step(METRICS_CONFIG_WORKFLOW_PATH, "Run the metrics-config helper inside the monitor pod")
+        run_text = step["run"]
+
+        write_executable(os.path.join(self.bin_dir, "kubectl"), """#!/usr/bin/env bash
+if [ "$1" = "exec" ]; then
+  echo "action=plan"
+  exit 0
+fi
+exit 1
+""")
+
+        run_step_script(
+            METRICS_CONFIG_WORKFLOW_PATH, step["name"], run_text,
+            {
+                "POD_NAME": "gg-monitor-test", "CANONICAL_TYPE": "oracle",
+                "DEPLOYMENT_NAME": "gg-oracle-payments-01", "DESIRED": "true", "APPLY": "false",
+                "TARGET_NAMESPACE": "goldengate-monitoring",
+                "METRICS_CONFIG_HELPER": self.dummy_helper_file,
+                "GITHUB_ENV": self.github_env, "GITHUB_OUTPUT": self.github_output,
+            },
+            bin_dir=self.bin_dir,
+        )
+        with open(self.github_env) as f:
+            self.assertEqual(f.read(), "")
+
+    def test_post_update_step_never_recomputes_timestamp(self):
+        # Static: the post-update-observation step's run: text must not
+        # contain a fresh `date -u` capture -- it only ever reads
+        # VALIDATION_START_TS inherited via GITHUB_ENV.
+        step = _get_step(METRICS_CONFIG_WORKFLOW_PATH, "Post-update observation")
+        run_text = step["run"]
+        self.assertNotIn('VALIDATION_START_TS="$(date -u', run_text)
+        self.assertIn('VALIDATION_START_TS:-', run_text)  # fails closed if unset
+
+    def test_post_update_log_retrieval_uses_the_inherited_timestamp_unmodified(self):
+        # Functional: extracts the real committed fragment starting at the
+        # log-retrieval echo (skipping the real 90s sleep, which is
+        # orthogonal to which timestamp value gets used) and proves
+        # `kubectl logs --since-time=` receives EXACTLY the pre-set
+        # (inherited) VALIDATION_START_TS, never a freshly computed one --
+        # this is the property that guarantees an error emitted immediately
+        # after UpdateItem falls inside the observation window.
+        step = _get_step(METRICS_CONFIG_WORKFLOW_PATH, "Post-update observation")
+        run_text = step["run"]
+        marker = 'echo "Retrieving current gg-monitor logs since ${VALIDATION_START_TS}...'
+        idx = run_text.index(marker)
+        fragment = "set -euo pipefail\n" + run_text[idx:]
+
+        since_time_capture = os.path.join(self.tmpdir, "since_time.txt")
+        write_executable(os.path.join(self.bin_dir, "kubectl"), f"""#!/usr/bin/env bash
+if [ "$1" = "logs" ]; then
+  for arg in "$@"; do
+    case "$arg" in
+      --since-time=*) echo "${{arg#--since-time=}}" > "{since_time_capture}" ;;
+    esac
+  done
+  exit 0
+fi
+exit 1
+""")
+        sentinel_ts = "2020-01-01T00:00:00Z"
+        proc = run_step_script(
+            METRICS_CONFIG_WORKFLOW_PATH, "Post-update observation (log fragment)", fragment,
+            {
+                "POD_NAME": "gg-monitor-test", "TARGET_NAMESPACE": "goldengate-monitoring",
+                "VALIDATION_START_TS": sentinel_ts, "DESIRED": "true",
+            },
+            bin_dir=self.bin_dir,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        with open(since_time_capture) as f:
+            captured = f.read().strip()
+        self.assertEqual(captured, sentinel_ts)
+
+
+# ---------------------------------------------------------------------
+# Task 7 item 12: the helper action must be exactly one of none/plan/
+# updated -- never a silently empty/unknown output.
+# ---------------------------------------------------------------------
+class HelperActionValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.bin_dir = os.path.join(self.tmpdir, "bin")
+        os.makedirs(self.bin_dir)
+        self.github_env = os.path.join(self.tmpdir, "github_env")
+        self.github_output = os.path.join(self.tmpdir, "github_output")
+        open(self.github_env, "w").close()
+        open(self.github_output, "w").close()
+        self.dummy_helper_file = os.path.join(self.tmpdir, "helper.py")
+        open(self.dummy_helper_file, "w").close()
+        self.step = _get_step(METRICS_CONFIG_WORKFLOW_PATH, "Run the metrics-config helper inside the monitor pod")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _run(self, mock_helper_output):
+        output_file = os.path.join(self.tmpdir, "mock_helper_stdout.txt")
+        with open(output_file, "w") as f:
+            f.write(mock_helper_output)
+        write_executable(os.path.join(self.bin_dir, "kubectl"), f"""#!/usr/bin/env bash
+if [ "$1" = "exec" ]; then
+  cat "{output_file}"
+  exit 0
+fi
+exit 1
+""")
+        return run_step_script(
+            METRICS_CONFIG_WORKFLOW_PATH, self.step["name"], self.step["run"],
+            {
+                "POD_NAME": "gg-monitor-test", "CANONICAL_TYPE": "oracle",
+                "DEPLOYMENT_NAME": "gg-oracle-payments-01", "DESIRED": "false", "APPLY": "false",
+                "TARGET_NAMESPACE": "goldengate-monitoring",
+                "METRICS_CONFIG_HELPER": self.dummy_helper_file,
+                "GITHUB_ENV": self.github_env, "GITHUB_OUTPUT": self.github_output,
+            },
+            bin_dir=self.bin_dir,
+        )
+
+    def test_valid_action_updated_is_accepted(self):
+        proc = self._run("deployment=x\naction=updated\n")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        with open(self.github_output) as f:
+            self.assertIn("helper_action=updated", f.read())
+
+    def test_missing_action_line_fails(self):
+        proc = self._run("deployment=x\n")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("expected exactly one action=", proc.stdout + proc.stderr)
+
+    def test_duplicate_action_lines_fail(self):
+        proc = self._run("action=none\naction=plan\n")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("expected exactly one action=", proc.stdout + proc.stderr)
+
+    def test_unknown_action_value_fails(self):
+        proc = self._run("action=bogus\n")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("is not one of none, plan, updated", proc.stdout + proc.stderr)
+
+
+# ---------------------------------------------------------------------
+# Task 7 item 11: the main workflow's CloudWatch preflight verifies
+# Deployment/ReplicaSet ownership, not just a label match. Extracts the
+# real committed pod-selection fragment (step start through the "Using the
+# existing monitor pod" success echo) and drives it against a mocked
+# kubectl/jq backed by JSON fixtures.
+# ---------------------------------------------------------------------
+class MainWorkflowPodOwnershipTests(unittest.TestCase):
+    DEPLOY_UID = "dep-uid-current"
+    STALE_DEPLOY_UID = "dep-uid-STALE"
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.bin_dir = os.path.join(self.tmpdir, "bin")
+        self.fixture_dir = os.path.join(self.tmpdir, "fixtures")
+        self.rs_dir = os.path.join(self.fixture_dir, "replicasets")
+        os.makedirs(self.bin_dir)
+        os.makedirs(self.rs_dir)
+
+        step = _get_step(MONITOR_WORKFLOW_PATH, "CloudWatch publication preflight (gate inventory)")
+        run_text = step["run"]
+        marker = 'echo "Using the existing monitor pod for this read-only preflight: ${POD_NAME}"'
+        idx = run_text.index(marker)
+        end = idx + len(marker)
+        self.fragment = run_text[:end]
+
+        real_jq = shutil.which("jq")
+        assert real_jq, "jq must be installed to run this test"
+        os.symlink(real_jq, os.path.join(self.bin_dir, "jq"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _pod(self, name, phase="Running", ready=True, deletion_ts=None,
+              service_account="gg-monitor", rs_owner="gg-monitor-rs-current"):
+        owner_refs = []
+        if rs_owner:
+            owner_refs = [{"controller": True, "kind": "ReplicaSet", "name": rs_owner}]
+        pod = {
+            "metadata": {"name": name, "ownerReferences": owner_refs},
+            "status": {
+                "phase": phase,
+                "conditions": [{"type": "Ready", "status": "True" if ready else "False"}],
+            },
+            "spec": {"serviceAccountName": service_account},
+        }
+        if deletion_ts:
+            pod["metadata"]["deletionTimestamp"] = deletion_ts
+        return pod
+
+    def _write_fixtures(self, pods, deploy_uid=None, rs_owner_uid_by_name=None):
+        deploy = {
+            "metadata": {"uid": deploy_uid or self.DEPLOY_UID},
+            "spec": {"selector": {"matchLabels": {"app.kubernetes.io/name": "gg-monitor"}}},
+        }
+        with open(os.path.join(self.fixture_dir, "deployment.json"), "w") as f:
+            json.dump(deploy, f)
+        with open(os.path.join(self.fixture_dir, "pods.json"), "w") as f:
+            json.dump({"items": pods}, f)
+        for rs_name, owner_uid in (rs_owner_uid_by_name or {}).items():
+            rs = {"metadata": {"ownerReferences": [{"controller": True, "kind": "Deployment", "uid": owner_uid}]}}
+            with open(os.path.join(self.rs_dir, f"{rs_name}.json"), "w") as f:
+                json.dump(rs, f)
+
+        write_executable(os.path.join(self.bin_dir, "kubectl"), f"""#!/usr/bin/env bash
+if [ "$1" = "get" ] && [ "$2" = "deployment" ] && [ "$3" = "gg-monitor" ]; then
+  cat "{self.fixture_dir}/deployment.json"
+  exit 0
+fi
+if [ "$1" = "get" ] && [ "$2" = "pods" ]; then
+  cat "{self.fixture_dir}/pods.json"
+  exit 0
+fi
+if [ "$1" = "get" ] && [ "$2" = "replicaset" ]; then
+  RS_FILE="{self.rs_dir}/$3.json"
+  if [ -f "$RS_FILE" ]; then
+    cat "$RS_FILE"
+    exit 0
+  fi
+  exit 1
+fi
+echo "mock kubectl: unhandled: $*" >&2
+exit 1
+""")
+
+    def _run_fragment(self):
+        return run_step_script(
+            MONITOR_WORKFLOW_PATH, "CloudWatch publication preflight (pod selection fragment)", self.fragment,
+            {"TARGET_NAMESPACE": "goldengate-monitoring"},
+            bin_dir=self.bin_dir,
+            gh_expression_overrides={"${{ inputs.metrics_gate_expectation }}": "any"},
+        )
+
+    def test_selects_pod_owned_by_current_deployment(self):
+        self._write_fixtures(
+            pods=[self._pod("gg-monitor-abc")],
+            rs_owner_uid_by_name={"gg-monitor-rs-current": self.DEPLOY_UID},
+        )
+        proc = self._run_fragment()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("Using the existing monitor pod for this read-only preflight: gg-monitor-abc", proc.stdout)
+
+    def test_rejects_pod_owned_by_a_stale_replicaset(self):
+        # The ReplicaSet exists and owns the pod, but that ReplicaSet's own
+        # controller Deployment UID does not match the CURRENT gg-monitor
+        # Deployment -- a stale/orphaned ReplicaSet from a prior rollout.
+        self._write_fixtures(
+            pods=[self._pod("gg-monitor-old")],
+            rs_owner_uid_by_name={"gg-monitor-rs-current": self.STALE_DEPLOY_UID},
+        )
+        proc = self._run_fragment()
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("PREREQUISITE NOT MET", proc.stdout)
+
+    def test_rejects_pod_with_wrong_service_account(self):
+        self._write_fixtures(
+            pods=[self._pod("gg-monitor-wrong-sa", service_account="default")],
+            rs_owner_uid_by_name={"gg-monitor-rs-current": self.DEPLOY_UID},
+        )
+        proc = self._run_fragment()
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("PREREQUISITE NOT MET", proc.stdout)
+
+    def test_rejects_terminating_pod(self):
+        self._write_fixtures(
+            pods=[self._pod("gg-monitor-terminating", deletion_ts="2024-01-01T00:00:00Z")],
+            rs_owner_uid_by_name={"gg-monitor-rs-current": self.DEPLOY_UID},
+        )
+        proc = self._run_fragment()
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("PREREQUISITE NOT MET", proc.stdout)
+
+    def test_rejects_not_ready_pod(self):
+        self._write_fixtures(
+            pods=[self._pod("gg-monitor-not-ready", ready=False)],
+            rs_owner_uid_by_name={"gg-monitor-rs-current": self.DEPLOY_UID},
+        )
+        proc = self._run_fragment()
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("PREREQUISITE NOT MET", proc.stdout)
+
+    def test_never_prints_full_pod_deployment_or_replicaset_object(self):
+        self._write_fixtures(
+            pods=[self._pod("gg-monitor-abc")],
+            rs_owner_uid_by_name={"gg-monitor-rs-current": self.DEPLOY_UID},
+        )
+        proc = self._run_fragment()
+        combined = proc.stdout + proc.stderr
+        self.assertNotIn('"ownerReferences"', combined)
+        self.assertNotIn('"selector"', combined)
 
 
 if __name__ == "__main__":

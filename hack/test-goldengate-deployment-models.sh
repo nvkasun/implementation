@@ -2904,11 +2904,18 @@ else
   fail "goldengate-monitor.yaml's hash no longer incorporates the resolved base-image reference"
 fi
 
-TERMINATING_EXCLUSION_COUNT="$(grep -c 'deletionTimestamp == null' "$MONITOR_WORKFLOW" 2>/dev/null || true)"
-if [ "${TERMINATING_EXCLUSION_COUNT:-0}" -eq 2 ]; then
-  pass "both Ready-pod jq filters (preflight and post-deployment verification) exclude terminating pods"
+# Phase 6C1 correction: the preflight's pod selection was rewritten into a
+# Deployment/ReplicaSet ownership-chain loop, which excludes a terminating
+# pod via `deletionTimestamp // empty` + a bash comparison rather than the
+# single-jq-filter `deletionTimestamp == null` style still used, unchanged,
+# by the post-deployment verification step -- so one of each pattern is now
+# expected, not two of the same pattern.
+VERIFY_TERMINATING_EXCLUSION_COUNT="$(grep -c 'deletionTimestamp == null' "$MONITOR_WORKFLOW" 2>/dev/null || true)"
+PREFLIGHT_TERMINATING_EXCLUSION_COUNT="$(grep -c 'deletionTimestamp // empty' "$MONITOR_WORKFLOW" 2>/dev/null || true)"
+if [ "${VERIFY_TERMINATING_EXCLUSION_COUNT:-0}" -eq 1 ] && [ "${PREFLIGHT_TERMINATING_EXCLUSION_COUNT:-0}" -eq 1 ]; then
+  pass "both the preflight (ownership-chain) and post-deployment verification (jq filter) pod selections exclude terminating pods"
 else
-  fail "expected exactly 2 Ready-pod jq filters excluding terminating pods, found ${TERMINATING_EXCLUSION_COUNT:-0}"
+  fail "expected exactly 1 ownership-chain and 1 jq-filter terminating-pod exclusion, found ${PREFLIGHT_TERMINATING_EXCLUSION_COUNT:-0} and ${VERIFY_TERMINATING_EXCLUSION_COUNT:-0}"
 fi
 
 # ---------------------------------------------------------------------
@@ -5663,6 +5670,107 @@ if python3 -m py_compile "$METRICS_CONFIG_HELPER_SCRIPT" 2>/dev/null; then
   find hack -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
 else
   fail "21: hack/goldengate-metrics-config.py fails to compile"
+fi
+
+# ---------------------------------------------------------------------
+# 22. Phase 6C1 corrections: no direct input interpolation in shell run:
+#     blocks, timestamp captured before UpdateItem, ConsistentRead=True /
+#     ReturnValues=ALL_NEW, hardened preflight pod-selection ownership
+#     chain, and a validated helper action line.
+# ---------------------------------------------------------------------
+echo ""
+echo "--- Phase 6C1 corrections: input safety, timestamp ordering, consistency, pod ownership ---"
+
+if python3 -c "
+import yaml
+doc = yaml.safe_load(open('$METRICS_CONFIG_WORKFLOW'))
+bad = []
+for job in doc.get('jobs', {}).values():
+    for step in job.get('steps', []):
+        run = step.get('run')
+        if not run:
+            continue
+        if '\${{ inputs.deployment_name }}' in run or '\${{ inputs.confirmation }}' in run:
+            bad.append(step.get('name'))
+import sys
+sys.exit(1 if bad else 0)
+" 2>/dev/null; then
+  pass "22: goldengate-monitor-metrics-config.yaml never substitutes inputs.deployment_name/inputs.confirmation directly inside a run: block"
+else
+  fail "22: goldengate-monitor-metrics-config.yaml still substitutes a user-controlled string input directly inside a run: block"
+fi
+
+for step_name in "Validate deployment_name against the canonical registry" "Validate the exact confirmation string" \
+                 "Run the metrics-config helper inside the monitor pod" "Post-update observation" "Workflow summary"; do
+  if grep -A2 "name: ${step_name}\$" "$METRICS_CONFIG_WORKFLOW" 2>/dev/null | grep -q "env:"; then
+    pass "22: '${step_name}' step passes user-controlled/expression values through env:"
+  else
+    fail "22: '${step_name}' step is missing an env: block for its expression values"
+  fi
+done
+
+if grep -q 'VALIDATION_START_TS="\$(date -u +%Y-%m-%dT%H:%M:%SZ)"' "$METRICS_CONFIG_WORKFLOW" 2>/dev/null \
+    && grep -q 'echo "VALIDATION_START_TS=\${VALIDATION_START_TS}" >> "\$GITHUB_ENV"' "$METRICS_CONFIG_WORKFLOW" 2>/dev/null; then
+  pass "22: goldengate-monitor-metrics-config.yaml captures VALIDATION_START_TS via GITHUB_ENV in the helper-execution step"
+else
+  fail "22: goldengate-monitor-metrics-config.yaml no longer captures VALIDATION_START_TS before the helper runs"
+fi
+
+if grep -A20 "name: Post-update observation" "$METRICS_CONFIG_WORKFLOW" 2>/dev/null | grep -q "VALIDATION_START_TS:-" \
+    && ! grep -A80 "name: Post-update observation" "$METRICS_CONFIG_WORKFLOW" 2>/dev/null | grep -q 'VALIDATION_START_TS="\$(date -u'; then
+  pass "22: Post-update observation reuses the inherited VALIDATION_START_TS and never recomputes it"
+else
+  fail "22: Post-update observation may recompute VALIDATION_START_TS after the helper already ran"
+fi
+
+if grep -q "ACTION_LINE_COUNT" "$METRICS_CONFIG_WORKFLOW" 2>/dev/null \
+    && grep -q "none|plan|updated) ;;" "$METRICS_CONFIG_WORKFLOW" 2>/dev/null; then
+  pass "22: goldengate-monitor-metrics-config.yaml requires exactly one action= line in {none,plan,updated}"
+else
+  fail "22: goldengate-monitor-metrics-config.yaml no longer validates the helper's action= line"
+fi
+
+CONSISTENT_READ_COUNT_HELPER="$(grep -c "ConsistentRead=True" "$METRICS_CONFIG_HELPER_SCRIPT" 2>/dev/null || true)"
+if [ "${CONSISTENT_READ_COUNT_HELPER:-0}" -ge 2 ]; then
+  pass "22: hack/goldengate-metrics-config.py uses ConsistentRead=True on both the initial and verification GetItem"
+else
+  fail "22: hack/goldengate-metrics-config.py is missing ConsistentRead=True on one or both GetItem calls (found ${CONSISTENT_READ_COUNT_HELPER:-0})"
+fi
+
+CONSISTENT_READ_COUNT_MONITOR="$(grep -c "ConsistentRead=True" "$MONITOR_WORKFLOW" 2>/dev/null || true)"
+if [ "${CONSISTENT_READ_COUNT_MONITOR:-0}" -eq 2 ]; then
+  pass "22: goldengate-monitor.yaml's two inline CONFIG-inventory readers both use ConsistentRead=True"
+else
+  fail "22: goldengate-monitor.yaml's inline CONFIG-inventory readers do not both use ConsistentRead=True (found ${CONSISTENT_READ_COUNT_MONITOR:-0}, expected 2)"
+fi
+
+if grep -q 'ReturnValues="ALL_NEW"' "$METRICS_CONFIG_HELPER_SCRIPT" 2>/dev/null \
+    && grep -q "new_attributes = update_response.get" "$METRICS_CONFIG_HELPER_SCRIPT" 2>/dev/null; then
+  pass "22: hack/goldengate-metrics-config.py requests and validates UpdateItem's ReturnValues=ALL_NEW attributes"
+else
+  fail "22: hack/goldengate-metrics-config.py no longer requests/validates ReturnValues=ALL_NEW"
+fi
+
+UPDATE_ITEM_CALL_COUNT="$(grep -c "table.update_item(" "$METRICS_CONFIG_HELPER_SCRIPT" 2>/dev/null || true)"
+if [ "${UPDATE_ITEM_CALL_COUNT:-0}" -eq 1 ]; then
+  pass "22: hack/goldengate-metrics-config.py has exactly one UpdateItem call site"
+else
+  fail "22: hack/goldengate-metrics-config.py has ${UPDATE_ITEM_CALL_COUNT:-0} UpdateItem call sites, expected exactly 1"
+fi
+
+if grep -q "DEPLOY_UID=" "$MONITOR_WORKFLOW" 2>/dev/null \
+    && grep -q "rs_deploy_uid.*!= .\$DEPLOY_UID" "$MONITOR_WORKFLOW" 2>/dev/null \
+    && grep -q 'pod_sa" != "gg-monitor"' "$MONITOR_WORKFLOW" 2>/dev/null; then
+  pass "22: goldengate-monitor.yaml's CloudWatch preflight verifies Deployment/ReplicaSet pod ownership, not just a label match"
+else
+  fail "22: goldengate-monitor.yaml's CloudWatch preflight no longer verifies pod ownership"
+fi
+
+if python3 hack/test-goldengate-metrics-config.py >/dev/null 2>&1; then
+  pass "22: hack/test-goldengate-metrics-config.py (Phase 6C1 corrections functional suite) passes"
+  find hack -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+else
+  fail "22: hack/test-goldengate-metrics-config.py failed"
 fi
 
 echo ""

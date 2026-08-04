@@ -1702,13 +1702,24 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         self.assertIn(".dockerignore", readme_text)
 
     def test_pod_selection_excludes_terminating_pods(self):
-        for marker_text in (
-            self.monitor_text[self.monitor_text.index("- name: CloudWatch publication preflight"):
-                              self.monitor_text.index("- name: Create or update Argo CD Application")],
-            self.monitor_text[self.monitor_text.index("- name: Verify GoldenGate monitor runtime state"):
-                              self.monitor_text.index("- name: Upload rendered manifests and chart package")],
-        ):
-            self.assertIn(".metadata.deletionTimestamp == null", marker_text)
+        # Phase 6C1 correction: the preflight's pod selection was rewritten
+        # from a single jq filter into a Deployment/ReplicaSet
+        # ownership-chain loop (see
+        # test_preflight_pod_selection_verifies_ownership_chain below), so
+        # it excludes a terminating pod via a bash comparison on a jq-r
+        # extracted field rather than an inline jq boolean expression. The
+        # "Verify GoldenGate monitor runtime state" step's own (unchanged)
+        # pod selection still uses the original inline jq filter.
+        preflight_step_text = self.monitor_text[
+            self.monitor_text.index("- name: CloudWatch publication preflight"):
+            self.monitor_text.index("- name: Create or update Argo CD Application")]
+        self.assertIn('deletion_ts="$(jq -r \'.metadata.deletionTimestamp // empty\'', preflight_step_text)
+        self.assertIn('[ -n "$deletion_ts" ] && continue', preflight_step_text)
+
+        verify_step_text = self.monitor_text[
+            self.monitor_text.index("- name: Verify GoldenGate monitor runtime state"):
+            self.monitor_text.index("- name: Upload rendered manifests and chart package")]
+        self.assertIn(".metadata.deletionTimestamp == null", verify_step_text)
 
     def test_oci_description_reflects_collector_and_portal(self):
         self.assertNotIn("Read-only shared GoldenGate monitoring portal", self.monitor_text)
@@ -1838,14 +1849,25 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         self.assertNotIn(".items[0].metadata.name", self.monitor_text)
 
     def test_pod_selection_requires_running_phase_and_ready_containers(self):
-        for marker_text in (
-            self.monitor_text[self.monitor_text.index("- name: CloudWatch publication preflight"):
-                              self.monitor_text.index("- name: Create or update Argo CD Application")],
-            self.monitor_text[self.monitor_text.index("- name: Verify GoldenGate monitor runtime state"):
-                              self.monitor_text.index("- name: Upload rendered manifests and chart package")],
-        ):
-            self.assertIn('.status.phase == "Running"', marker_text)
-            self.assertIn("all(.ready == true)", marker_text)
+        # Phase 6C1 correction: the preflight now checks the pod's Ready
+        # *condition* (status.conditions[type==Ready].status == "True"),
+        # matching goldengate-monitor-metrics-config.yaml's own ownership-
+        # chain pattern, rather than containerStatuses[].ready. The
+        # "Verify GoldenGate monitor runtime state" step's pod selection is
+        # unchanged and still uses the original inline jq filter.
+        preflight_step_text = self.monitor_text[
+            self.monitor_text.index("- name: CloudWatch publication preflight"):
+            self.monitor_text.index("- name: Create or update Argo CD Application")]
+        self.assertIn('phase="$(jq -r \'.status.phase // ""\'', preflight_step_text)
+        self.assertIn('[ "$phase" != "Running" ] && continue', preflight_step_text)
+        self.assertIn('select(.type=="Ready")', preflight_step_text)
+        self.assertIn('[ "$ready_status" != "True" ] && continue', preflight_step_text)
+
+        verify_step_text = self.monitor_text[
+            self.monitor_text.index("- name: Verify GoldenGate monitor runtime state"):
+            self.monitor_text.index("- name: Upload rendered manifests and chart package")]
+        self.assertIn('.status.phase == "Running"', verify_step_text)
+        self.assertIn("all(.ready == true)", verify_step_text)
 
     def test_pod_selection_never_prints_full_pod_object(self):
         preflight_idx = self.monitor_text.index("- name: CloudWatch publication preflight")
@@ -1855,52 +1877,40 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
                          preflight_step_text.replace("\n", " ").replace("            ", " "))
         self.assertNotIn("echo \"$POD_NAME\" -o json", preflight_step_text)
 
-    def test_ready_pod_selection_jq_filter_selects_only_ready_pod(self):
-        if shutil.which("jq") is None:
-            raise unittest.SkipTest("jq not available")
-        preflight_idx = self.monitor_text.index("- name: CloudWatch publication preflight")
-        argocd_idx = self.monitor_text.index("- name: Create or update Argo CD Application")
-        preflight_step_text = self.monitor_text[preflight_idx:argocd_idx]
-        filter_start = preflight_step_text.index("jq -r '") + len("jq -r '")
-        filter_end = preflight_step_text.index("'", filter_start)
-        jq_filter = preflight_step_text[filter_start:filter_end]
+    def test_preflight_pod_selection_verifies_ownership_chain(self):
+        # Phase 6C1 correction: the preflight's pod selection is no longer
+        # a single jq filter (that approach lived here before, and is still
+        # exactly what the "Verify GoldenGate monitor runtime state" step
+        # below uses, unchanged) -- it now mirrors
+        # goldengate-monitor-metrics-config.yaml's own multi-call
+        # Deployment/ReplicaSet ownership-chain selection: read the
+        # Deployment, derive its selector, and for each candidate pod
+        # require Running + Ready + non-terminating + serviceAccountName=
+        # gg-monitor + owned by a ReplicaSet whose own controller
+        # Deployment UID matches. A full FUNCTIONAL proof of this exact
+        # extracted fragment (mocked kubectl/jq, Running/Ready/terminating/
+        # wrong-serviceAccount/stale-ReplicaSet scenarios) lives in
+        # hack/test-goldengate-metrics-config.py::MainWorkflowPodOwnershipTests
+        # -- this test only proves the ownership-chain properties are
+        # textually present in the committed step, matching this class's
+        # static-analysis focus.
+        preflight_step_text = self.monitor_text[
+            self.monitor_text.index("- name: CloudWatch publication preflight"):
+            self.monitor_text.index("- name: Create or update Argo CD Application")]
 
-        # Pending, Running-but-NotReady, Running+Ready+terminating (has
-        # deletionTimestamp), and Running+Ready+non-terminating -- only the
-        # last one may ever be selected.
-        mixed_pods = {"items": [
-            {"status": {"phase": "Pending", "containerStatuses": []},
-             "metadata": {"name": "gg-monitor-pending"}},
-            {"status": {"phase": "Running", "containerStatuses": [{"ready": False}]},
-             "metadata": {"name": "gg-monitor-notready"}},
-            {"status": {"phase": "Running", "containerStatuses": [{"ready": True}]},
-             "metadata": {"name": "gg-monitor-terminating", "deletionTimestamp": "2026-07-21T00:00:00Z"}},
-            {"status": {"phase": "Running", "containerStatuses": [{"ready": True}]},
-             "metadata": {"name": "gg-monitor-ready"}},
-        ]}
-        proc = subprocess.run(["jq", "-r", jq_filter], input=json.dumps(mixed_pods),
-                              capture_output=True, text=True)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.strip(), "gg-monitor-ready")
+        self.assertIn('kubectl get deployment gg-monitor -n "$TARGET_NAMESPACE" -o json', preflight_step_text)
+        self.assertIn("DEPLOY_UID=", preflight_step_text)
+        self.assertIn(".spec.selector.matchLabels", preflight_step_text)
+        self.assertIn('[ "$pod_sa" != "gg-monitor" ] && continue', preflight_step_text)
+        self.assertIn('select(.controller==true and .kind=="ReplicaSet")', preflight_step_text)
+        self.assertIn('kubectl get replicaset "$rs_owner_name"', preflight_step_text)
+        self.assertIn('select(.controller==true and .kind=="Deployment")', preflight_step_text)
+        self.assertIn('[ "$rs_deploy_uid" != "$DEPLOY_UID" ] && continue', preflight_step_text)
 
-        no_ready_pods = {"items": [
-            {"status": {"phase": "Pending", "containerStatuses": []}, "metadata": {"name": "x"}},
-        ]}
-        proc = subprocess.run(["jq", "-r", jq_filter], input=json.dumps(no_ready_pods),
-                              capture_output=True, text=True)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.strip(), "")
-
-        # A Ready pod that is ALSO terminating must never be selected, even
-        # when it is the only pod present.
-        only_terminating_pod = {"items": [
-            {"status": {"phase": "Running", "containerStatuses": [{"ready": True}]},
-             "metadata": {"name": "gg-monitor-only-terminating", "deletionTimestamp": "2026-07-21T00:00:00Z"}},
-        ]}
-        proc = subprocess.run(["jq", "-r", jq_filter], input=json.dumps(only_terminating_pod),
-                              capture_output=True, text=True)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.strip(), "")
+        verify_step_text = self.monitor_text[
+            self.monitor_text.index("- name: Verify GoldenGate monitor runtime state"):
+            self.monitor_text.index("- name: Upload rendered manifests and chart package")]
+        self.assertIn("jq -r '[.items[] | select(", verify_step_text)
 
     def test_ready_pod_selection_jq_filter_used_by_post_deployment_verification_also_excludes_terminating(self):
         if shutil.which("jq") is None:

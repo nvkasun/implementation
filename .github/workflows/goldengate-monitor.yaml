@@ -1289,15 +1289,54 @@ jobs:
           echo "enable_cloudwatch_publication=true requested (metrics_gate_expectation=${{ inputs.metrics_gate_expectation }}) -- taking a safe CONFIG gate inventory for every enabled canonical deployment before the Argo CD Application is touched."
           echo "This never uses DynamoDB Scan, never broadens IAM, and never constructs a CloudWatch client -- it reuses the existing running monitor pod's own IRSA (GoldenGateMonitorReadRole-dev) via a bounded kubectl exec, one GetItem per enabled deployment."
 
-          # A Ready pod only -- never a blind .items[0] (which could select a
-          # Pending/CrashLooping/Terminating pod). Only the pod name is ever
-          # captured; the full pod object is never printed.
-          POD_NAME="$(kubectl get pods -n "$TARGET_NAMESPACE" -l app.kubernetes.io/name=gg-monitor -o json 2>/dev/null \
-            | jq -r '[.items[] | select(.status.phase == "Running"
-                and .metadata.deletionTimestamp == null
-                and ((.status.containerStatuses // []) | length > 0)
-                and ((.status.containerStatuses // []) | all(.ready == true)))]
-              | .[0].metadata.name // empty' 2>/dev/null || true)"
+          # Phase 6C1 correction: Deployment/ReplicaSet ownership-chain pod
+          # selection, matching the pattern already used in
+          # goldengate-monitor-metrics-config.yaml -- never a blind
+          # ".items[0]" and never trusting only a label selector. The pod
+          # must be Running, Ready, non-terminating, use
+          # serviceAccountName=gg-monitor, AND be owned by a ReplicaSet that
+          # is itself owned by the current gg-monitor Deployment. Only the
+          # pod name is ever captured/printed; the full pod, ReplicaSet, or
+          # Deployment object is never printed.
+          POD_NAME=""
+          DEPLOY_JSON="$(kubectl get deployment gg-monitor -n "$TARGET_NAMESPACE" -o json 2>/dev/null || true)"
+          if [ -n "$DEPLOY_JSON" ]; then
+            DEPLOY_UID="$(jq -r '.metadata.uid' <<<"$DEPLOY_JSON")"
+            SELECTOR="$(jq -r '(.spec.selector.matchLabels // {}) | to_entries | map("\(.key)=\(.value)") | join(",")' <<<"$DEPLOY_JSON")"
+
+            if [ -n "$SELECTOR" ] && [ "$SELECTOR" != "null" ]; then
+              PODS_JSON="$(kubectl get pods -n "$TARGET_NAMESPACE" -l "$SELECTOR" -o json 2>/dev/null || true)"
+
+              if [ -n "$PODS_JSON" ]; then
+                while IFS= read -r candidate; do
+                  [ -z "$candidate" ] && continue
+                  pod_json="$(jq -c --arg n "$candidate" '.items[] | select(.metadata.name==$n)' <<<"$PODS_JSON")"
+
+                  deletion_ts="$(jq -r '.metadata.deletionTimestamp // empty' <<<"$pod_json")"
+                  [ -n "$deletion_ts" ] && continue
+
+                  phase="$(jq -r '.status.phase // ""' <<<"$pod_json")"
+                  [ "$phase" != "Running" ] && continue
+
+                  ready_status="$(jq -r '([.status.conditions[]? | select(.type=="Ready")] | first | .status) // "Unknown"' <<<"$pod_json")"
+                  [ "$ready_status" != "True" ] && continue
+
+                  pod_sa="$(jq -r '.spec.serviceAccountName // ""' <<<"$pod_json")"
+                  [ "$pod_sa" != "gg-monitor" ] && continue
+
+                  rs_owner_name="$(jq -r '[.metadata.ownerReferences[]? | select(.controller==true and .kind=="ReplicaSet")][0].name // empty' <<<"$pod_json")"
+                  [ -z "$rs_owner_name" ] && continue
+                  rs_json="$(kubectl get replicaset "$rs_owner_name" -n "$TARGET_NAMESPACE" -o json 2>/dev/null || true)"
+                  [ -z "$rs_json" ] && continue
+                  rs_deploy_uid="$(jq -r '[.metadata.ownerReferences[]? | select(.controller==true and .kind=="Deployment")][0].uid // empty' <<<"$rs_json")"
+                  [ "$rs_deploy_uid" != "$DEPLOY_UID" ] && continue
+
+                  POD_NAME="$candidate"
+                  break
+                done < <(jq -r '.items[].metadata.name' <<<"$PODS_JSON")
+              fi
+            fi
+          fi
           if [ -z "$POD_NAME" ]; then
             echo ""
             echo "PREREQUISITE NOT MET: no Ready gg-monitor pod found in namespace ${TARGET_NAMESPACE}."
@@ -1350,7 +1389,7 @@ jobs:
           expected_type = sys.argv[2]
           try:
               table = boto3.resource("dynamodb", region_name=os.environ.get("AWS_REGION", "eu-west-1")).Table(os.environ["DYNAMODB_TABLE"])
-              item = table.get_item(Key={"pipeline": pipeline, "recordType": "CONFIG"}).get("Item")
+              item = table.get_item(Key={"pipeline": pipeline, "recordType": "CONFIG"}, ConsistentRead=True).get("Item")
               if not isinstance(item, dict):
                   print(f"deployment={pipeline} result=missing-config"); sys.exit(1)
               if item.get("recordType") != "CONFIG":
@@ -1363,7 +1402,8 @@ jobs:
                   print(f"deployment={pipeline} result=metricsenabled-not-boolean"); sys.exit(1)
               if alerts_enabled is not False:
                   print(f"deployment={pipeline} result=alertsenabled-not-false"); sys.exit(1)
-              print(f"deployment={pipeline} deploymentType={expected_type} metricsEnabled={\"true\" if metrics_enabled else \"false\"} alertsEnabled=false")
+              metrics_enabled_str = "true" if metrics_enabled else "false"
+              print(f"deployment={pipeline} deploymentType={expected_type} metricsEnabled={metrics_enabled_str} alertsEnabled=false")
           except SystemExit:
               raise
           except Exception as exc:
@@ -1710,7 +1750,7 @@ jobs:
           expected_type = sys.argv[2]
           try:
               table = boto3.resource("dynamodb", region_name=os.environ.get("AWS_REGION", "eu-west-1")).Table(os.environ["DYNAMODB_TABLE"])
-              item = table.get_item(Key={"pipeline": pipeline, "recordType": "CONFIG"}).get("Item")
+              item = table.get_item(Key={"pipeline": pipeline, "recordType": "CONFIG"}, ConsistentRead=True).get("Item")
               if not isinstance(item, dict):
                   print(f"deployment={pipeline} result=missing-config"); sys.exit(1)
               if item.get("recordType") != "CONFIG":
@@ -1723,7 +1763,8 @@ jobs:
                   print(f"deployment={pipeline} result=metricsenabled-not-boolean"); sys.exit(1)
               if alerts_enabled is not False:
                   print(f"deployment={pipeline} result=alertsenabled-not-false"); sys.exit(1)
-              print(f"deployment={pipeline} deploymentType={expected_type} metricsEnabled={\"true\" if metrics_enabled else \"false\"} alertsEnabled=false")
+              metrics_enabled_str = "true" if metrics_enabled else "false"
+              print(f"deployment={pipeline} deploymentType={expected_type} metricsEnabled={metrics_enabled_str} alertsEnabled=false")
           except SystemExit:
               raise
           except Exception as exc:
