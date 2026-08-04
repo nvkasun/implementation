@@ -1375,30 +1375,35 @@ jobs:
             echo "Deleting deployment/${CLUSTER_SCRAPER_DEPLOYMENT} in ${TARGET_NAMESPACE} (bounded, idempotent corrective recreation -- the operator's own creation path will rebuild it with the correct hostNetwork=false)."
             kubectl delete deployment "$CLUSTER_SCRAPER_DEPLOYMENT" -n "$TARGET_NAMESPACE" --wait=true --timeout=60s
 
-            local gone_elapsed=0
-            while kubectl get deployment "$CLUSTER_SCRAPER_DEPLOYMENT" -n "$TARGET_NAMESPACE" >/dev/null 2>&1; do
-              if [ "$gone_elapsed" -ge 30 ]; then
-                echo "FAIL: Deployment/${CLUSTER_SCRAPER_DEPLOYMENT} did not disappear within 30s of deletion."
-                exit 1
-              fi
-              sleep 5
-              gone_elapsed=$((gone_elapsed + 5))
-            done
-            echo "OK: Deployment/${CLUSTER_SCRAPER_DEPLOYMENT} deletion confirmed."
-
+            # Kubernetes UID replacement -- never an observed NotFound
+            # interval -- is the authoritative recreation signal. Live
+            # evidence proved the operator can recreate a same-named
+            # Deployment between two polling intervals, so a poll may never
+            # actually witness the object absent even though the deletion
+            # genuinely happened and a brand-new object (new UID) already
+            # exists in its place; requiring an observed NotFound is
+            # therefore a false-failure risk, not a correctness signal.
             local RECREATE_TIMEOUT=180
             local NUDGE_AFTER=60
             local recreate_elapsed=0
             local nudged="false"
-            local new_uid=""
+            local new_uid new_deletion_ts new_deploy_json
 
             while true; do
-              if kubectl get deployment "$CLUSTER_SCRAPER_DEPLOYMENT" -n "$TARGET_NAMESPACE" >/dev/null 2>&1; then
-                new_uid="$(kubectl get deployment "$CLUSTER_SCRAPER_DEPLOYMENT" -n "$TARGET_NAMESPACE" -o jsonpath='{.metadata.uid}')"
+              if new_deploy_json="$(kubectl get deployment "$CLUSTER_SCRAPER_DEPLOYMENT" -n "$TARGET_NAMESPACE" -o json 2>/dev/null)"; then
+                new_uid="$(jq -r '.metadata.uid // empty' <<<"$new_deploy_json")"
+                new_deletion_ts="$(jq -r '.metadata.deletionTimestamp // empty' <<<"$new_deploy_json")"
+
                 if [ -n "$new_uid" ] && [ "$new_uid" != "$old_uid" ]; then
                   echo "OK: Deployment/${CLUSTER_SCRAPER_DEPLOYMENT} was recreated by the operator (new UID differs from the deleted one)."
                   break
+                elif [ -n "$new_deletion_ts" ]; then
+                  echo "Deployment/${CLUSTER_SCRAPER_DEPLOYMENT} still carries the old UID and is terminating -- continuing to wait."
+                else
+                  echo "Deployment/${CLUSTER_SCRAPER_DEPLOYMENT} still carries the old UID -- continuing to wait for recreation."
                 fi
+              else
+                echo "Deployment/${CLUSTER_SCRAPER_DEPLOYMENT} not found (not yet recreated) -- continuing to wait."
               fi
 
               if [ "$recreate_elapsed" -ge "$RECREATE_TIMEOUT" ]; then
@@ -1898,6 +1903,117 @@ jobs:
           verify_pod_irsa "cloudwatch-agent-cluster-scraper Deployment" "$CLUSTER_SCRAPER_POD"
 
           echo "OK: IRSA injection verified on every cloudwatch-agent DaemonSet pod and the cluster-scraper pod."
+
+      - name: Validate CloudWatch metrics authorization and export
+        # Phase 6B2B correction. The network-namespace/port-collision fix
+        # (above) does not by itself prove metrics are actually being
+        # accepted by CloudWatch -- live evidence showed IRSA/network
+        # working correctly while every export attempt was rejected with
+        # HTTP 403 PermissionDenied, because the IAM policy's original
+        # StringEquals condition on cloudwatch:namespace implicitly denies
+        # OTLP PutMetricData requests that omit that condition key entirely
+        # (see envs/dev/policies/goldengate-cloudwatch-metrics-dev/policies/
+        # policies_1.json, corrected in this same phase to
+        # StringEqualsIfExists). This step fails closed on that exact
+        # symptom so a future regression of either the IAM policy or the
+        # export path is caught here rather than silently dropping metrics.
+        if: ${{ inputs.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Captured BEFORE the observation period so --since-time excludes
+          # any historical errors already in the logs from before this run
+          # (e.g. from prior to the IAM policy correction taking effect).
+          VALIDATION_START_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          # Bounded wait to let at least a couple of the OTel Container
+          # Insights export cycles actually occur before inspecting logs --
+          # not a poll loop, since this only needs to *observe*, not wait
+          # for a state transition.
+          OBSERVATION_PERIOD_SECONDS=90
+          echo "Observing active CloudWatch Agent pod logs for ${OBSERVATION_PERIOD_SECONDS}s starting at ${VALIDATION_START_TS} (covers multiple export attempts)."
+          sleep "$OBSERVATION_PERIOD_SECONDS"
+
+          AUTH_ERROR_PATTERN='PermissionDenied|HTTP Status Code 403|not authorized to perform: cloudwatch:PutMetricData|no identity-based policy allows|Exporting failed\. Dropping data\.|error exporting items|resource: arn:aws:cloudwatch:|dataset/default'
+          STARTUP_ERROR_PATTERN='binding address localhost:8888|listen tcp 127\.0\.0\.1:8888|bind: address already in use|failed to create SDK'
+
+          ANY_NEW_ERROR="false"
+
+          check_pod_logs() {
+            local pod_name="$1"
+            local pod_json="$2"
+
+            local container_names container_name
+            container_names="$(jq -r '.spec.containers[]?.name' <<<"$pod_json")"
+
+            while IFS= read -r container_name; do
+              [ -z "$container_name" ] && continue
+
+              local log_tail
+              log_tail="$(kubectl logs "$pod_name" -n "$TARGET_NAMESPACE" -c "$container_name" --since-time="$VALIDATION_START_TS" --tail=80 2>/dev/null || true)"
+
+              local auth_found="false"
+              local startup_found="false"
+              echo "$log_tail" | grep -qEi "$AUTH_ERROR_PATTERN" && auth_found="true"
+              echo "$log_tail" | grep -qEi "$STARTUP_ERROR_PATTERN" && startup_found="true"
+
+              echo "pod/${pod_name} container/${container_name}: newAuthorizationErrors=${auth_found} newPortCollisionErrors=${startup_found}"
+
+              if [ "$auth_found" = "true" ]; then
+                echo "FAIL: pod ${pod_name} container ${container_name} emitted a new CloudWatch metrics authorization/export error since ${VALIDATION_START_TS} (bounded, matching lines only):"
+                echo "$log_tail" | grep -Ei "$AUTH_ERROR_PATTERN" | head -n 15
+                ANY_NEW_ERROR="true"
+              fi
+              if [ "$startup_found" = "true" ]; then
+                echo "FAIL: pod ${pod_name} container ${container_name} emitted a new port-collision/startup error since ${VALIDATION_START_TS}:"
+                echo "$log_tail" | grep -Ei "$STARTUP_ERROR_PATTERN" | head -n 15
+                ANY_NEW_ERROR="true"
+              fi
+            done <<< "$container_names"
+          }
+
+          # Active, current-revision cloudwatch-agent DaemonSet pods.
+          CW_DS_JSON_AUTH="$(kubectl get daemonset cloudwatch-agent -n "$TARGET_NAMESPACE" -o json)"
+          CW_DS_UID_AUTH="$(jq -r '.metadata.uid' <<<"$CW_DS_JSON_AUTH")"
+          CW_SELECTOR_AUTH="$(jq -r '(.spec.selector.matchLabels // {}) | to_entries | map("\(.key)=\(.value)") | join(",")' <<<"$CW_DS_JSON_AUTH")"
+          CW_PODS_JSON_AUTH="$(kubectl get pods -n "$TARGET_NAMESPACE" -l "$CW_SELECTOR_AUTH" -o json)"
+
+          while IFS= read -r pod_name; do
+            [ -z "$pod_name" ] && continue
+            pod_json="$(jq -c --arg n "$pod_name" '.items[] | select(.metadata.name==$n)' <<<"$CW_PODS_JSON_AUTH")"
+            deletion_ts="$(jq -r '.metadata.deletionTimestamp // empty' <<<"$pod_json")"
+            [ -n "$deletion_ts" ] && continue
+            owner_uid="$(jq -r '[.metadata.ownerReferences[]? | select(.controller==true and .kind=="DaemonSet")][0].uid // empty' <<<"$pod_json")"
+            [ "$owner_uid" != "$CW_DS_UID_AUTH" ] && continue
+            check_pod_logs "$pod_name" "$pod_json"
+          done < <(jq -r '.items[].metadata.name' <<<"$CW_PODS_JSON_AUTH")
+
+          # Active, current-ReplicaSet cloudwatch-agent-cluster-scraper pods.
+          SCRAPER_DEPLOY_JSON_AUTH="$(kubectl get deployment cloudwatch-agent-cluster-scraper -n "$TARGET_NAMESPACE" -o json)"
+          SCRAPER_DEPLOY_UID_AUTH="$(jq -r '.metadata.uid' <<<"$SCRAPER_DEPLOY_JSON_AUTH")"
+          SCRAPER_SELECTOR_AUTH="$(jq -r '(.spec.selector.matchLabels // {}) | to_entries | map("\(.key)=\(.value)") | join(",")' <<<"$SCRAPER_DEPLOY_JSON_AUTH")"
+          SCRAPER_PODS_JSON_AUTH="$(kubectl get pods -n "$TARGET_NAMESPACE" -l "$SCRAPER_SELECTOR_AUTH" -o json)"
+
+          while IFS= read -r pod_name; do
+            [ -z "$pod_name" ] && continue
+            pod_json="$(jq -c --arg n "$pod_name" '.items[] | select(.metadata.name==$n)' <<<"$SCRAPER_PODS_JSON_AUTH")"
+            deletion_ts="$(jq -r '.metadata.deletionTimestamp // empty' <<<"$pod_json")"
+            [ -n "$deletion_ts" ] && continue
+            rs_owner_name="$(jq -r '[.metadata.ownerReferences[]? | select(.controller==true and .kind=="ReplicaSet")][0].name // empty' <<<"$pod_json")"
+            [ -z "$rs_owner_name" ] && continue
+            rs_json="$(kubectl get replicaset "$rs_owner_name" -n "$TARGET_NAMESPACE" -o json 2>/dev/null || true)"
+            [ -z "$rs_json" ] && continue
+            rs_deploy_uid="$(jq -r '[.metadata.ownerReferences[]? | select(.controller==true and .kind=="Deployment")][0].uid // empty' <<<"$rs_json")"
+            [ "$rs_deploy_uid" != "$SCRAPER_DEPLOY_UID_AUTH" ] && continue
+            check_pod_logs "$pod_name" "$pod_json"
+          done < <(jq -r '.items[].metadata.name' <<<"$SCRAPER_PODS_JSON_AUTH")
+
+          if [ "$ANY_NEW_ERROR" = "true" ]; then
+            echo "FAIL: at least one active, current-revision CloudWatch Agent pod emitted a new authorization or port-collision error since ${VALIDATION_START_TS}."
+            exit 1
+          fi
+          echo "OK: no active, current-revision CloudWatch Agent pod emitted a new authorization or port-collision error in the ${OBSERVATION_PERIOD_SECONDS}s observation window."
 
       - name: Live Kubernetes validation
         if: ${{ inputs.deploy }}

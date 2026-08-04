@@ -9,7 +9,7 @@
       ],
       "Resource": "*",
       "Condition": {
-        "StringEquals": {
+        "StringEqualsIfExists": {
           "cloudwatch:namespace": "ContainerInsights"
         }
       }

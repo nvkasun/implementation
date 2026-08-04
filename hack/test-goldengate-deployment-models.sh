@@ -628,7 +628,21 @@ if actions != expected:
 
 put_metric_stmt = next(s for s in stmts if "cloudwatch:PutMetricData" in
                         ([s["Action"]] if isinstance(s["Action"], str) else s["Action"]))
-ns_cond = put_metric_stmt.get("Condition", {}).get("StringEquals", {}).get("cloudwatch:namespace")
+
+# Phase 6B2B OTLP-authorization correction: the condition operator must be
+# StringEqualsIfExists (permits OTLP PutMetricData requests that omit the
+# cloudwatch:namespace key entirely, while still enforcing the namespace
+# restriction whenever that key IS present) -- never StringEquals (which
+# implicitly denies any request omitting the key at all, including OTLP
+# ingestion), and never an unconditioned/empty allow.
+put_metric_condition = put_metric_stmt.get("Condition", {})
+if not put_metric_condition:
+    print("MISMATCH:put-metric-data-statement-has-no-condition-at-all")
+    raise SystemExit
+if "StringEquals" in put_metric_condition:
+    print(f"MISMATCH:old-stringequals-operator-still-present={put_metric_condition.get('StringEquals')}")
+    raise SystemExit
+ns_cond = put_metric_condition.get("StringEqualsIfExists", {}).get("cloudwatch:namespace")
 if ns_cond != "ContainerInsights":
     print(f"MISMATCH:namespace-condition={ns_cond}")
     raise SystemExit
@@ -662,6 +676,46 @@ PYEOF
     fi
   else
     fail "${CW_METRICS_POLICY_FILE} not found, or python3 unavailable"
+  fi
+
+  # No managed broad CloudWatch policy (e.g. CloudWatchFullAccess,
+  # CloudWatchAgentServerPolicy) was attached to this role in addition to
+  # its custom policy_folder -- confirms the module block's
+  # managed_policy_arns stays empty.
+  CW_METRICS_IAM_TF="${REPO_ROOT}/envs/dev/iam.tf"
+  if [ -f "$CW_METRICS_IAM_TF" ] && command -v python3 >/dev/null 2>&1; then
+    CW_MANAGED_ARNS_CHECK="$(python3 - "$CW_METRICS_IAM_TF" <<'PYEOF'
+import re
+import sys
+
+text = open(sys.argv[1]).read()
+m = re.search(r'module\s+"goldengate_cloudwatch_metrics_role_dev"\s*\{(.*?)\n\}', text, re.S)
+if not m:
+    print("MISMATCH:module-block-not-found")
+    raise SystemExit
+block = m.group(1)
+arns_match = re.search(r'managed_policy_arns\s*=\s*(\[[^\]]*\])', block)
+if not arns_match:
+    print("MISMATCH:managed_policy_arns-not-found")
+    raise SystemExit
+arns_value = arns_match.group(1)
+if arns_value.strip() != "[]":
+    print(f"MISMATCH:managed_policy_arns-not-empty={arns_value}")
+    raise SystemExit
+for forbidden in ("CloudWatchFullAccess", "CloudWatchAgentServerPolicy", "AdministratorAccess"):
+    if forbidden in block:
+        print(f"MISMATCH:forbidden-managed-policy-reference={forbidden}")
+        raise SystemExit
+print("OK")
+PYEOF
+)"
+    if [ "$CW_MANAGED_ARNS_CHECK" = "OK" ]; then
+      pass "goldengate_cloudwatch_metrics_role_dev module block has managed_policy_arns=[] and no CloudWatchFullAccess/CloudWatchAgentServerPolicy/AdministratorAccess reference -- the custom policy_folder statement is the only source of permissions"
+    else
+      fail "goldengate_cloudwatch_metrics_role_dev managed-policy check failed: ${CW_MANAGED_ARNS_CHECK}"
+    fi
+  else
+    fail "${CW_METRICS_IAM_TF} not found, or python3 unavailable"
   fi
 
   CLOUDWATCH_OBSERVABILITY_TF="${REPO_ROOT}/envs/dev/cloudwatch_observability.tf"
@@ -1815,6 +1869,151 @@ PYEOF
     fail "${OBSERVABILITY_WORKFLOW} not found, or python3 unavailable"
   fi
 
+  # -------------------------------------------------------------------
+  # Phase 6B2B UID-based recreation detection + hostNetwork null
+  # normalization + CloudWatch metrics authorization/export validation
+  # (focused, static/offline only).
+  # -------------------------------------------------------------------
+  if [ -f "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" ] && command -v python3 >/dev/null 2>&1; then
+    UID_AUTH_CHECK="$(python3 - "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" <<'PYEOF'
+import sys
+import yaml
+
+path = sys.argv[1]
+with open(path) as f:
+    text = f.read()
+    doc = yaml.safe_load(text)
+
+results = []
+job = doc["jobs"]["validate_and_deploy"]
+steps = job["steps"]
+names = [s.get("name") for s in steps]
+
+def get_step(name):
+    return next((s for s in steps if s.get("name") == name), None)
+
+# --- Task 3: UID-based recreation detection, never an observed NotFound ---
+recreate_step = get_step("Ensure cluster-scraper Deployment host-network isolation")
+if recreate_step is None:
+    results.append("missing-recreate-step")
+else:
+    run_text = recreate_step.get("run", "")
+
+    # The old anti-pattern required observing the object's *absence*
+    # (existence-check loop keyed only on exit status, no UID comparison)
+    # before ever polling for recreation. That must be gone.
+    if "did not disappear within 30s" in run_text:
+        results.append("old-notfound-interval-anti-pattern-still-present")
+
+    # The new pattern must poll via -o json and branch on UID comparison
+    # for every one of the required states, never requiring NotFound.
+    if 'new_deploy_json="$(kubectl get deployment "$CLUSTER_SCRAPER_DEPLOYMENT" -n "$TARGET_NAMESPACE" -o json 2>/dev/null)"' not in run_text:
+        results.append("missing-uid-based-poll")
+    if '[ -n "$new_uid" ] && [ "$new_uid" != "$old_uid" ]' not in run_text:
+        results.append("missing-new-uid-differs-from-old-check")
+    if "still carries the old UID and is terminating" not in run_text:
+        results.append("missing-same-uid-terminating-state-handling")
+    if "still carries the old UID -- continuing to wait for recreation" not in run_text:
+        results.append("missing-same-uid-not-terminating-state-handling")
+    if "not found (not yet recreated) -- continuing to wait" not in run_text:
+        results.append("missing-notfound-state-handling")
+    if "old_uid=" not in run_text:
+        results.append("missing-old-uid-recording")
+    # the harmless reconciliation nudge must still exist.
+    if "cloudfactory.adcb/reconcile-requested-at" not in run_text:
+        results.append("missing-reconciliation-nudge")
+    # the one-delete guard: exactly one kubectl delete call in source.
+    if run_text.count("kubectl delete deployment") != 1:
+        results.append(f"unexpected-delete-call-count:{run_text.count('kubectl delete deployment')}")
+
+    # --- Task 4: null/false normalization on Deployment and Pod, CR stays
+    # strict (no // false on the CR's own hostNetwork read). ---
+    if run_text.count('.spec.template.spec.hostNetwork // false') < 2:
+        results.append("deployment-hostnetwork-normalization-missing-or-incomplete")
+    if "'.spec.hostNetwork // false'" not in run_text:
+        results.append("pod-hostnetwork-normalization-missing")
+    if "cr_hostnetwork=\"$(jq -r '.spec.hostNetwork // false'" in run_text:
+        results.append("cr-hostnetwork-incorrectly-normalized-must-stay-strict")
+    if '"$cr_hostnetwork" != "false"' not in run_text:
+        results.append("cr-hostnetwork-strict-check-missing")
+
+# --- Task 5: bounded authorization/export validation step ---
+auth_step = get_step("Validate CloudWatch metrics authorization and export")
+if auth_step is None:
+    results.append("missing-authorization-validation-step")
+else:
+    if auth_step.get("if") != "${{ inputs.deploy }}":
+        results.append(f"authorization-step-if={auth_step.get('if')!r}")
+
+    try:
+        irsa_idx = names.index("Verify IRSA injection on the recreated CloudWatch Agent pods")
+        auth_idx = names.index("Validate CloudWatch metrics authorization and export")
+        live_idx = names.index("Live Kubernetes validation")
+        if not (irsa_idx < auth_idx < live_idx):
+            results.append(f"authorization-step-order-wrong:{irsa_idx},{auth_idx},{live_idx}")
+    except ValueError as e:
+        results.append(f"step-not-found-for-ordering:{e}")
+
+    run_text = auth_step.get("run", "")
+
+    if "VALIDATION_START_TS=" not in run_text:
+        results.append("missing-validation-start-timestamp")
+    if "--since-time=\"$VALIDATION_START_TS\"" not in run_text:
+        results.append("missing-since-time-usage")
+    if "--tail=80" not in run_text:
+        results.append("missing-bounded-tail")
+
+    required_auth_signatures = [
+        "PermissionDenied", "HTTP Status Code 403",
+        "not authorized to perform: cloudwatch:PutMetricData",
+        "no identity-based policy allows",
+        r"Exporting failed\. Dropping data\.",
+        "error exporting items",
+        "resource: arn:aws:cloudwatch:",
+        "dataset/default",
+    ]
+    for sig in required_auth_signatures:
+        if sig not in run_text:
+            results.append(f"missing-auth-error-signature:{sig}")
+
+    required_startup_signatures = [
+        "binding address localhost:8888",
+        r"listen tcp 127\.0\.0\.1:8888",
+        "bind: address already in use",
+        "failed to create SDK",
+    ]
+    for sig in required_startup_signatures:
+        if sig not in run_text:
+            results.append(f"missing-startup-error-signature:{sig}")
+
+    # active/current-revision filtering for BOTH workload kinds.
+    if 'select(.controller==true and .kind=="DaemonSet")' not in run_text:
+        results.append("missing-daemonset-owner-filtering")
+    if 'select(.controller==true and .kind=="ReplicaSet")' not in run_text:
+        results.append("missing-replicaset-owner-filtering")
+    if run_text.count("deletionTimestamp") < 2:
+        results.append("missing-deletion-timestamp-exclusion")
+
+    # never prints secrets/tokens/env values/full manifests.
+    for forbidden in ("AWS_WEB_IDENTITY_TOKEN_FILE\"", "env_names", "envFrom", "kubectl get secret", "-o yaml"):
+        if forbidden in run_text:
+            results.append(f"forbidden-content-in-authorization-step:{forbidden}")
+
+if results:
+    print("MISMATCH:" + ";".join(results))
+else:
+    print("OK")
+PYEOF
+)"
+    if [ "$UID_AUTH_CHECK" = "OK" ]; then
+      pass "22: goldengate-observability.yaml Phase 6B2B UID-based recreation detection, hostNetwork null-normalization, and CloudWatch metrics authorization/export validation: the old NotFound-interval anti-pattern is gone and replaced by a UID-comparison state machine handling NotFound/same-UID-terminating/same-UID/different-UID without ever requiring an observed absence, while preserving the one-delete guard and the reconciliation nudge; Deployment and Pod hostNetwork reads normalize null/omitted to false while the CR's own hostNetwork read stays strict; and the new deploy-guarded 'Validate CloudWatch metrics authorization and export' step is correctly ordered after IRSA verification and before Live Kubernetes validation, captures a validation-start timestamp, uses --since-time and a bounded --tail=80, checks all required authorization and startup-collision signatures on active current-revision DaemonSet and ReplicaSet pods only, and never prints secrets, tokens, env values, or full manifests"
+    else
+      fail "22: goldengate-observability.yaml Phase 6B2B UID-based recreation / hostNetwork normalization / authorization validation check failed: ${UID_AUTH_CHECK}"
+    fi
+  else
+    fail "${OBSERVABILITY_WORKFLOW} not found, or python3 unavailable"
+  fi
+
   # 13: no wrapper chart was created for this phase.
   if [ -d "${REPO_ROOT}/helm/goldengate-observability" ]; then
     fail "13: helm/goldengate-observability/ wrapper chart unexpectedly exists -- Argo CD must consume the private upstream OCI chart directly"
@@ -1831,13 +2030,18 @@ PYEOF
   fi
 
   # 15: Phase 6A and Phase 6B1 resources remain untouched by this phase.
+  # envs/dev/policies/goldengate-cloudwatch-metrics-dev is deliberately
+  # EXCLUDED from this scan (not from IAM protection generally -- see the
+  # dedicated goldengate-cloudwatch-metrics-dev permissions policy check
+  # above, which pins its content precisely): the Phase 6B2B OTLP-
+  # authorization correction intentionally changes exactly one condition
+  # operator in that folder's policies_1.json.
   PHASE_6A_6B1_DIFF="$(git -C "$REPO_ROOT" diff --stat --ignore-all-space -- \
     .github/workflows/cloudwatch-observability-artifact-sync.yaml \
     helm/goldengate-platform \
     platform/dev/goldengate-platform \
     envs/dev/cloudwatch_observability.tf \
     envs/dev/cloudwatch_logs.tf \
-    envs/dev/policies/goldengate-cloudwatch-metrics-dev \
     envs/dev/policies/goldengate-platform-logging-dev \
     2>/dev/null || true)"
   if [ -z "$PHASE_6A_6B1_DIFF" ]; then
@@ -5227,6 +5431,20 @@ if command -v git >/dev/null 2>&1 && git -C "$REPO_ROOT" rev-parse --is-inside-w
   #     gains exactly one new statement (the amazon-cloudwatch-observability
   #     Helm OCI chart repository ARN) alongside its unchanged pre-existing
   #     statements.
+  #   - Phase 6B2B OTLP-authorization correction: the sole condition
+  #     operator on GoldenGateCloudWatchMetricsRole-dev's
+  #     AllowPutContainerInsightsMetricData statement
+  #     (envs/dev/policies/goldengate-cloudwatch-metrics-dev/policies/
+  #     policies_1.json) changes from StringEquals to StringEqualsIfExists
+  #     for the cloudwatch:namespace=ContainerInsights condition key --
+  #     StringEquals implicitly denies OTLP PutMetricData requests that omit
+  #     the cloudwatch:namespace key entirely (the OTel Container Insights
+  #     exporter's ingestion path), while StringEqualsIfExists still
+  #     enforces the namespace restriction whenever that key IS present
+  #     (ordinary/legacy PutMetricData calls). Effect, Action
+  #     (cloudwatch:PutMetricData only), Resource ("*"), and the condition
+  #     *value* (ContainerInsights) are all unchanged; every other statement
+  #     in this file, and the role's trust policy, are unchanged.
   # GoldenGateSecretsReadRole-dev and GoldenGateMonitorReadRole-dev must
   # never be touched by any of these phases. New files under a brand-new
   # policy folder (e.g. goldengate-platform-logging-dev/,
@@ -5239,7 +5457,8 @@ if command -v git >/dev/null 2>&1 && git -C "$REPO_ROOT" rev-parse --is-inside-w
   # files) is used and parsed for real changed paths instead.
   EXPECTED_MODIFIED_IAM_FILES="envs/dev/policies/goldengate-eks-deploy-dev/policies/policies_1.json
 envs/dev/iam.tf
-envs/dev/policies/argocd-ecr-oci-read-dev/policies/policies_1.json"
+envs/dev/policies/argocd-ecr-oci-read-dev/policies/policies_1.json
+envs/dev/policies/goldengate-cloudwatch-metrics-dev/policies/policies_1.json"
   IAM_DIFF_STAT="$(git -C "$REPO_ROOT" diff --stat=300 --ignore-all-space -- envs/dev/policies envs/dev/iam.tf 2>/dev/null || true)"
   IAM_DIFF_FILES="$(echo "$IAM_DIFF_STAT" | grep -oE '\S+\.(json|tf)' | sort -u || true)"
   UNEXPECTED_IAM_DIFF_FILES="$(comm -23 <(echo "$IAM_DIFF_FILES") <(echo "$EXPECTED_MODIFIED_IAM_FILES" | sort -u) 2>/dev/null || true)"
