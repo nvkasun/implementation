@@ -1904,19 +1904,28 @@ jobs:
 
           echo "OK: IRSA injection verified on every cloudwatch-agent DaemonSet pod and the cluster-scraper pod."
 
-      - name: Validate CloudWatch metrics authorization and export
+      - name: Validate no recent CloudWatch export errors
         # Phase 6B2B correction. The network-namespace/port-collision fix
-        # (above) does not by itself prove metrics are actually being
-        # accepted by CloudWatch -- live evidence showed IRSA/network
-        # working correctly while every export attempt was rejected with
-        # HTTP 403 PermissionDenied, because the IAM policy's original
-        # StringEquals condition on cloudwatch:namespace implicitly denies
-        # OTLP PutMetricData requests that omit that condition key entirely
-        # (see envs/dev/policies/goldengate-cloudwatch-metrics-dev/policies/
+        # (above) does not by itself prove metrics export is healthy --
+        # live evidence showed IRSA/network working correctly while every
+        # export attempt was rejected with HTTP 403 PermissionDenied,
+        # because the IAM policy's original StringEquals condition on
+        # cloudwatch:namespace implicitly denies OTLP PutMetricData
+        # requests that omit that condition key entirely (see
+        # envs/dev/policies/goldengate-cloudwatch-metrics-dev/policies/
         # policies_1.json, corrected in this same phase to
-        # StringEqualsIfExists). This step fails closed on that exact
-        # symptom so a future regression of either the IAM policy or the
-        # export path is caught here rather than silently dropping metrics.
+        # StringEqualsIfExists).
+        #
+        # This step proves only the ABSENCE of recently emitted
+        # authorization/export/port-collision error signatures in the
+        # observation window -- it does not call the CloudWatch API and
+        # does NOT prove metrics were successfully accepted or are visible
+        # in CloudWatch. That data-plane confirmation is Phase 6B3's
+        # responsibility and requires real CloudWatch evidence, not
+        # something derivable from collector-side pod logs alone. This
+        # role intentionally has no CloudWatch read permissions (e.g.
+        # cloudwatch:GetMetricData/ListMetrics) -- none are added here or
+        # elsewhere merely to support this log-based validation.
         if: ${{ inputs.deploy }}
         shell: bash
         run: |
@@ -1940,6 +1949,12 @@ jobs:
 
           ANY_NEW_ERROR="false"
 
+          # Deliberately no "|| true" on kubectl logs: a failure to
+          # retrieve logs from an expected active pod/container (RBAC
+          # error, pod evicted mid-check, container not found, API error)
+          # must fail this step, not be silently treated as "no errors
+          # found" -- an empty result from a failed call is indistinguishable
+          # from a genuinely clean log unless the exit status is checked.
           check_pod_logs() {
             local pod_name="$1"
             local pod_json="$2"
@@ -1950,8 +1965,16 @@ jobs:
             while IFS= read -r container_name; do
               [ -z "$container_name" ] && continue
 
-              local log_tail
-              log_tail="$(kubectl logs "$pod_name" -n "$TARGET_NAMESPACE" -c "$container_name" --since-time="$VALIDATION_START_TS" --tail=80 2>/dev/null || true)"
+              local log_tail log_status
+              set +e
+              log_tail="$(kubectl logs "$pod_name" -n "$TARGET_NAMESPACE" -c "$container_name" --since-time="$VALIDATION_START_TS" --tail=80 2>&1)"
+              log_status=$?
+              set -e
+
+              if [ "$log_status" -ne 0 ]; then
+                echo "FAIL: could not retrieve logs for pod ${pod_name} container ${container_name} (kubectl logs exited ${log_status})."
+                exit 1
+              fi
 
               local auth_found="false"
               local startup_found="false"
@@ -1976,9 +1999,11 @@ jobs:
           # Active, current-revision cloudwatch-agent DaemonSet pods.
           CW_DS_JSON_AUTH="$(kubectl get daemonset cloudwatch-agent -n "$TARGET_NAMESPACE" -o json)"
           CW_DS_UID_AUTH="$(jq -r '.metadata.uid' <<<"$CW_DS_JSON_AUTH")"
+          CW_DS_DESIRED_AUTH="$(jq -r '.status.desiredNumberScheduled // 0' <<<"$CW_DS_JSON_AUTH")"
           CW_SELECTOR_AUTH="$(jq -r '(.spec.selector.matchLabels // {}) | to_entries | map("\(.key)=\(.value)") | join(",")' <<<"$CW_DS_JSON_AUTH")"
           CW_PODS_JSON_AUTH="$(kubectl get pods -n "$TARGET_NAMESPACE" -l "$CW_SELECTOR_AUTH" -o json)"
 
+          CHECKED_NODE_AGENT_PODS=0
           while IFS= read -r pod_name; do
             [ -z "$pod_name" ] && continue
             pod_json="$(jq -c --arg n "$pod_name" '.items[] | select(.metadata.name==$n)' <<<"$CW_PODS_JSON_AUTH")"
@@ -1987,7 +2012,14 @@ jobs:
             owner_uid="$(jq -r '[.metadata.ownerReferences[]? | select(.controller==true and .kind=="DaemonSet")][0].uid // empty' <<<"$pod_json")"
             [ "$owner_uid" != "$CW_DS_UID_AUTH" ] && continue
             check_pod_logs "$pod_name" "$pod_json"
+            CHECKED_NODE_AGENT_PODS=$((CHECKED_NODE_AGENT_PODS + 1))
           done < <(jq -r '.items[].metadata.name' <<<"$CW_PODS_JSON_AUTH")
+
+          echo "Checked node-agent pods: ${CHECKED_NODE_AGENT_PODS} (DaemonSet desiredNumberScheduled=${CW_DS_DESIRED_AUTH})"
+          if [ "$CHECKED_NODE_AGENT_PODS" -ne "$CW_DS_DESIRED_AUTH" ]; then
+            echo "FAIL: checked ${CHECKED_NODE_AGENT_PODS} active node-agent pods, expected exactly desiredNumberScheduled=${CW_DS_DESIRED_AUTH}."
+            exit 1
+          fi
 
           # Active, current-ReplicaSet cloudwatch-agent-cluster-scraper pods.
           SCRAPER_DEPLOY_JSON_AUTH="$(kubectl get deployment cloudwatch-agent-cluster-scraper -n "$TARGET_NAMESPACE" -o json)"
@@ -1995,6 +2027,7 @@ jobs:
           SCRAPER_SELECTOR_AUTH="$(jq -r '(.spec.selector.matchLabels // {}) | to_entries | map("\(.key)=\(.value)") | join(",")' <<<"$SCRAPER_DEPLOY_JSON_AUTH")"
           SCRAPER_PODS_JSON_AUTH="$(kubectl get pods -n "$TARGET_NAMESPACE" -l "$SCRAPER_SELECTOR_AUTH" -o json)"
 
+          CHECKED_SCRAPER_PODS=0
           while IFS= read -r pod_name; do
             [ -z "$pod_name" ] && continue
             pod_json="$(jq -c --arg n "$pod_name" '.items[] | select(.metadata.name==$n)' <<<"$SCRAPER_PODS_JSON_AUTH")"
@@ -2007,13 +2040,20 @@ jobs:
             rs_deploy_uid="$(jq -r '[.metadata.ownerReferences[]? | select(.controller==true and .kind=="Deployment")][0].uid // empty' <<<"$rs_json")"
             [ "$rs_deploy_uid" != "$SCRAPER_DEPLOY_UID_AUTH" ] && continue
             check_pod_logs "$pod_name" "$pod_json"
+            CHECKED_SCRAPER_PODS=$((CHECKED_SCRAPER_PODS + 1))
           done < <(jq -r '.items[].metadata.name' <<<"$SCRAPER_PODS_JSON_AUTH")
+
+          echo "Checked cluster-scraper pods: ${CHECKED_SCRAPER_PODS}"
+          if [ "$CHECKED_SCRAPER_PODS" -lt 1 ]; then
+            echo "FAIL: checked ${CHECKED_SCRAPER_PODS} active cluster-scraper pods, expected at least 1."
+            exit 1
+          fi
 
           if [ "$ANY_NEW_ERROR" = "true" ]; then
             echo "FAIL: at least one active, current-revision CloudWatch Agent pod emitted a new authorization or port-collision error since ${VALIDATION_START_TS}."
             exit 1
           fi
-          echo "OK: no active, current-revision CloudWatch Agent pod emitted a new authorization or port-collision error in the ${OBSERVATION_PERIOD_SECONDS}s observation window."
+          echo "OK: no active, current-revision CloudWatch Agent pod emitted a new authorization or port-collision error in the ${OBSERVATION_PERIOD_SECONDS}s observation window (this does not by itself confirm successful export to CloudWatch -- see Phase 6B3)."
 
       - name: Live Kubernetes validation
         if: ${{ inputs.deploy }}

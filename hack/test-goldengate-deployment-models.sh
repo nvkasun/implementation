@@ -1875,7 +1875,9 @@ PYEOF
   # (focused, static/offline only).
   # -------------------------------------------------------------------
   if [ -f "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" ] && command -v python3 >/dev/null 2>&1; then
-    UID_AUTH_CHECK="$(python3 - "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" <<'PYEOF'
+    UID_AUTH_CHECK="$(python3 - "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" "${CW_METRICS_POLICY_FILE}" <<'PYEOF'
+import os
+import re
 import sys
 import yaml
 
@@ -1883,6 +1885,12 @@ path = sys.argv[1]
 with open(path) as f:
     text = f.read()
     doc = yaml.safe_load(text)
+
+cw_policy_path = sys.argv[2]
+CW_METRICS_POLICY_FILE_TEXT = None
+if os.path.isfile(cw_policy_path):
+    with open(cw_policy_path) as f:
+        CW_METRICS_POLICY_FILE_TEXT = f.read()
 
 results = []
 job = doc["jobs"]["validate_and_deploy"]
@@ -1937,8 +1945,8 @@ else:
     if '"$cr_hostnetwork" != "false"' not in run_text:
         results.append("cr-hostnetwork-strict-check-missing")
 
-# --- Task 5: bounded authorization/export validation step ---
-auth_step = get_step("Validate CloudWatch metrics authorization and export")
+# --- Task 5: bounded "no recent export errors" validation step ---
+auth_step = get_step("Validate no recent CloudWatch export errors")
 if auth_step is None:
     results.append("missing-authorization-validation-step")
 else:
@@ -1947,7 +1955,7 @@ else:
 
     try:
         irsa_idx = names.index("Verify IRSA injection on the recreated CloudWatch Agent pods")
-        auth_idx = names.index("Validate CloudWatch metrics authorization and export")
+        auth_idx = names.index("Validate no recent CloudWatch export errors")
         live_idx = names.index("Live Kubernetes validation")
         if not (irsa_idx < auth_idx < live_idx):
             results.append(f"authorization-step-order-wrong:{irsa_idx},{auth_idx},{live_idx}")
@@ -1962,6 +1970,37 @@ else:
         results.append("missing-since-time-usage")
     if "--tail=80" not in run_text:
         results.append("missing-bounded-tail")
+
+    # The step's own runtime output must not claim successful export was
+    # proven -- only that no recent error signatures were found.
+    if "does not by itself confirm successful export to CloudWatch" not in run_text:
+        results.append("step-overclaims-successful-export")
+
+    # kubectl logs must never be silently swallowed with "|| true" -- a
+    # retrieval failure from an expected active pod/container must fail
+    # the step, via an explicit captured exit status.
+    if "kubectl logs" in run_text and re.search(r'kubectl logs[^\n]*\|\|\s*true', run_text):
+        results.append("kubectl-logs-still-uses-or-true-fallback")
+    if "log_status=$?" not in run_text:
+        results.append("missing-explicit-log-retrieval-exit-status-check")
+    if '"$log_status" -ne 0' not in run_text:
+        results.append("missing-log-retrieval-failure-check")
+    if "could not retrieve logs for pod" not in run_text:
+        results.append("missing-log-retrieval-failure-message")
+
+    # Checked node-agent pod count must equal DaemonSet desiredNumberScheduled.
+    if "CHECKED_NODE_AGENT_PODS=$((CHECKED_NODE_AGENT_PODS + 1))" not in run_text:
+        results.append("missing-node-agent-pod-counting")
+    if 'desiredNumberScheduled // 0' not in run_text:
+        results.append("missing-daemonset-desired-count-read")
+    if '"$CHECKED_NODE_AGENT_PODS" -ne "$CW_DS_DESIRED_AUTH"' not in run_text:
+        results.append("missing-node-agent-checked-count-equals-desired-check")
+
+    # Checked cluster-scraper pod count must be >= 1.
+    if "CHECKED_SCRAPER_PODS=$((CHECKED_SCRAPER_PODS + 1))" not in run_text:
+        results.append("missing-scraper-pod-counting")
+    if '"$CHECKED_SCRAPER_PODS" -lt 1' not in run_text:
+        results.append("missing-scraper-checked-count-at-least-one-check")
 
     required_auth_signatures = [
         "PermissionDenied", "HTTP Status Code 403",
@@ -1999,6 +2038,16 @@ else:
         if forbidden in run_text:
             results.append(f"forbidden-content-in-authorization-step:{forbidden}")
 
+# No CloudWatch read permission (e.g. GetMetricData, ListMetrics) was added
+# to the collector role merely to support this log-based workflow
+# validation -- the step only ever calls "kubectl logs", never the
+# CloudWatch API, so the role's action set (checked exhaustively above)
+# must remain exactly PutMetricData plus the pre-existing logs/ec2 actions.
+if CW_METRICS_POLICY_FILE_TEXT is not None:
+    for forbidden_cw_read in ("cloudwatch:GetMetricData", "cloudwatch:ListMetrics", "cloudwatch:GetMetricStatistics", "cloudwatch:DescribeAlarms"):
+        if forbidden_cw_read in CW_METRICS_POLICY_FILE_TEXT:
+            results.append(f"cloudwatch-read-permission-added-for-validation:{forbidden_cw_read}")
+
 if results:
     print("MISMATCH:" + ";".join(results))
 else:
@@ -2006,7 +2055,7 @@ else:
 PYEOF
 )"
     if [ "$UID_AUTH_CHECK" = "OK" ]; then
-      pass "22: goldengate-observability.yaml Phase 6B2B UID-based recreation detection, hostNetwork null-normalization, and CloudWatch metrics authorization/export validation: the old NotFound-interval anti-pattern is gone and replaced by a UID-comparison state machine handling NotFound/same-UID-terminating/same-UID/different-UID without ever requiring an observed absence, while preserving the one-delete guard and the reconciliation nudge; Deployment and Pod hostNetwork reads normalize null/omitted to false while the CR's own hostNetwork read stays strict; and the new deploy-guarded 'Validate CloudWatch metrics authorization and export' step is correctly ordered after IRSA verification and before Live Kubernetes validation, captures a validation-start timestamp, uses --since-time and a bounded --tail=80, checks all required authorization and startup-collision signatures on active current-revision DaemonSet and ReplicaSet pods only, and never prints secrets, tokens, env values, or full manifests"
+      pass "22: goldengate-observability.yaml Phase 6B2B UID-based recreation detection, hostNetwork null-normalization, and 'no recent CloudWatch export errors' validation: the old NotFound-interval anti-pattern is gone and replaced by a UID-comparison state machine handling NotFound/same-UID-terminating/same-UID/different-UID without ever requiring an observed absence, while preserving the one-delete guard and the reconciliation nudge; Deployment and Pod hostNetwork reads normalize null/omitted to false while the CR's own hostNetwork read stays strict; and the new deploy-guarded 'Validate no recent CloudWatch export errors' step is correctly ordered after IRSA verification and before Live Kubernetes validation, never uses a 'kubectl logs ... || true' fallback (failing closed instead on a retrieval error), requires checked node-agent pods to equal the DaemonSet's desiredNumberScheduled and checked scraper pods to be at least 1, captures a validation-start timestamp, uses --since-time and a bounded --tail=80, checks all required authorization and startup-collision signatures on active current-revision DaemonSet and ReplicaSet pods only, never claims successful export was proven, never prints secrets/tokens/env values/full manifests, and adds no CloudWatch read permission to the collector role"
     else
       fail "22: goldengate-observability.yaml Phase 6B2B UID-based recreation / hostNetwork normalization / authorization validation check failed: ${UID_AUTH_CHECK}"
     fi
