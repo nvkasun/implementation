@@ -1,11 +1,5 @@
 {{- if .Values.networkPolicy.enabled }}
-# Ingress-only NetworkPolicy: restricts who may reach the portal's HTTP port,
-# but deliberately does NOT declare an Egress policyType/rules. Egress
-# CIDRs for the DynamoDB VPC endpoint, DNS, and the exact source behavior of
-# ALB Controller target-group traffic have not been confirmed for this
-# cluster -- guessing them here could silently break DynamoDB access or ALB
-# health checks. Enable this policy only after those are confirmed; until
-# then it is safe to leave networkPolicy.enabled=false (the chart default).
+# Ingress-only: deliberately no Egress policyType/rules -- egress CIDRs (DynamoDB VPC endpoint, DNS, ALB target-group traffic) are unconfirmed for this cluster; enable only after they are.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

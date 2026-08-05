@@ -1,26 +1,4 @@
-"""collector.py: passive GoldenGate Admin REST poller and DynamoDB writer.
-
-Owns LEASE acquisition/renewal and recordType=STATE#_deployment /
-STATE#<process> writes -- one lease per deployment, renewed on its own
-cadence independent of the poll interval. Never restarts, stops, or fences
-a GoldenGate process, and never calls a Kubernetes API.
-
-PMS collection (production, bounded): once per successful leader tick, the
-same authenticated/TLS-verified HTTPS adminPort 8443 opener used for the
-rest of Admin REST polling is reused to GET the confirmed process inventory
-(/services/v2/mpoints/processes) exactly once, then up to 20 unique,
-deduplicated processName values are followed with sequential, bounded
-processPerformance + serviceHealth GETs only. Heartbeat age is derived from
-inventory.lastHeartbeat -- the /heartbeat endpoint returned 404 in the
-validated live environment and is never called. /threadPerformance,
-/process, /services/v2/monitoring/statusChanges, /services/v2/metrics, and
-direct authenticated HTTP port 9015 are never used by this production path
-either. A PMS failure is recorded as its own bounded, sanitized status
-(collect_pms never raises) and never marks an otherwise-healthy Admin REST
-deployment DOWN. The result is folded into the existing guarded/fenced
-STATE#_deployment write only -- no new DynamoDB table, recordType, or
-per-PMS-process STATE# row is created.
-"""
+"""collector.py: passive GoldenGate Admin REST poller and DynamoDB writer; never restarts/fences a process."""
 from __future__ import annotations
 
 import functools
@@ -57,29 +35,18 @@ CLOUDWATCH_NAMESPACE = "GoldenGate/Pipelines"
 
 
 def _parse_strict_bool_env(raw):
-    """Only a trimmed, case-insensitive "true" parses to True. "1", "yes",
-    "on", "false", any other non-empty string, and a missing value all
-    parse to False -- no permissive truthy-string aliases."""
+    """Only a trimmed, case-insensitive "true" parses to True; no permissive truthy-string aliases."""
     if raw is None:
         return False
     return str(raw).strip().lower() == "true"
 
 
-# Hard CloudWatch kill switch, independent of CONFIG.metricsEnabled: CONFIG
-# is Terraform-owned and protected by lifecycle.ignore_changes, so an
-# already-applied item could carry metricsEnabled=true forever. Publishing
-# requires BOTH this env var AND CONFIG.metricsEnabled.
+# Hard CloudWatch kill switch: publishing requires BOTH this env var AND CONFIG.metricsEnabled.
 CLOUDWATCH_PUBLISH_ENABLED = _parse_strict_bool_env(os.environ.get("CLOUDWATCH_PUBLISH_ENABLED"))
 
 
 def cloudwatch_enabled_for(cfg):
-    """Fail-closed by identity, not truthiness: neither side of this gate
-    may be satisfied by "true"/"false" strings, 1/0, or any other
-    truthy/falsy non-Boolean value -- only the literal Boolean True on both
-    sides enables publication. Deliberately does not rely on
-    health_rules.resolve_config to have already normalized this field; the
-    gate itself must fail closed even if a malformed CONFIG item reaches it
-    directly."""
+    """Fail-closed by identity: only the literal Boolean True on both sides enables publication."""
     return CLOUDWATCH_PUBLISH_ENABLED is True and cfg.get("metricsEnabled") is True
 
 
@@ -154,11 +121,7 @@ class LeaseManager:
 
 
 class LeaseState:
-    """Thread-safe leader/readiness state shared between one deployment's
-    lease-control loop and its polling loop (two independent threads).
-    credentials_ok is set by the polling loop itself when the admin
-    username/password file is missing or empty -- combined with is_ready()
-    (lease-API health) wherever overall readiness is reported."""
+    """Thread-safe leader/readiness state shared between one deployment's lease-control and polling loops."""
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -212,10 +175,7 @@ def lease_control_loop(mgr, state, stop_event, renew_interval=RENEW_INTERVAL):
         stop_event.wait(renew_interval)
 
 
-# TLS: full server identity verification always on (check_hostname=True,
-# CERT_REQUIRED). The connect host and the TLS server-name-to-verify differ
-# by design -- the shared wildcard cert's SAN matches the external Ingress
-# hostname pattern, not *.svc.cluster.local.
+# Connect host and TLS server-name-to-verify differ by design: the shared wildcard cert's SAN matches Ingress, not *.svc.cluster.local.
 _SSL_CTX = None
 
 
@@ -234,8 +194,7 @@ def _build_ssl_context(ca_file=CA_FILE):
 
 
 def _read_secret_file(path):
-    """Re-read each cycle so a rotated secret is picked up without a pod
-    restart. Never logs content; a read failure degrades to empty string."""
+    """Re-read each cycle so a rotated secret is picked up without a pod restart; never logs content."""
     try:
         with open(path) as f:
             return f.read().strip()
@@ -286,10 +245,7 @@ _KNOWN_PROCESS_STATUSES = ("RUNNING", "STOPPED", "ABENDED")
 
 
 def _valid_process_name(raw):
-    """A real GoldenGate process name only -- never a synthetic fallback
-    (e.g. "unknown" or an internal $id). Returns None when the item carries
-    no usable name, so the caller can skip it entirely rather than ever
-    producing a STATE#unknown record."""
+    """A real process name only, never a synthetic fallback; returns None so the caller can skip the item."""
     name = str(raw).strip() if raw is not None else ""
     return name or None
 
@@ -300,8 +256,7 @@ def _normalize_status(raw):
 
 
 def _normalize_lag(raw):
-    """Never non-negative, never an exception -- a malformed/negative value
-    degrades to 0.0 rather than aborting the tick."""
+    """A malformed or negative value degrades to 0.0 rather than aborting the tick."""
     try:
         lag = float(raw)
     except (TypeError, ValueError):
@@ -310,13 +265,7 @@ def _normalize_lag(raw):
 
 
 def fetch_gg_processes(base, opener):
-    """GoldenGate Admin REST polling (port 8443 only). Tolerant of malformed
-    per-item data: an item with no valid process name is skipped rather than
-    recorded under a synthetic name, so STATE#unknown can never be produced.
-    Duplicate (type, name) pairs -- e.g. a repeated list entry -- keep only
-    the first occurrence. An empty process list is a valid result, never
-    treated as a deployment failure. Never logs a raw response body or raw
-    exception text -- only the endpoint kind and exception class."""
+    """Admin REST polling (port 8443 only); skips unnamed items, dedupes by (type, name), never logs raw responses."""
     _http_json(f"{base}/services/v2/deployments", opener)  # liveness probe
     procs = []
     seen = set()
@@ -381,8 +330,7 @@ def discovery_counts(procs):
 
 
 def log_discovery_summary(pipeline, procs):
-    """One structured, non-sensitive log line per deployment tick. Never
-    logs the process payload itself -- only per-type counts."""
+    """One structured, non-sensitive log line per deployment tick; never logs the process payload itself."""
     counts = discovery_counts(procs)
     logger.info(json.dumps({
         "event": "process_discovery_summary",
@@ -408,33 +356,16 @@ def probe_critical_services(base, opener, critical):
     return out
 
 
-# ---------------------------------------------------------------------------
-# PMS collection (production, bounded) -- see module docstring for the full
-# request-model summary. Live-confirmed contract only: /heartbeat 404s in
-# the validated environment and is never called; /threadPerformance and
-# /process are intentionally not polled (redundant with inventory / high
-# cardinality, deferred).
-# ---------------------------------------------------------------------------
-
+# PMS collection (production, bounded): /heartbeat 404s live and is never called; /threadPerformance, /process are deferred.
 PMS_INVENTORY_PATH = "/services/v2/mpoints/processes"
 PMS_DETAIL_KINDS = ("processPerformance", "serviceHealth")
 MAX_FOLLOWED_PMS_PROCESSES = 20
 
-# Fixed, non-operator-tunable total-time safety net: the theoretical worst
-# case is 1 inventory + (MAX_FOLLOWED_PMS_PROCESSES * len(PMS_DETAIL_KINDS))
-# detail requests. At the old default 5s-per-request timeout that is up to
-# 205s -- comfortably past the deployed 120s stale threshold, which could
-# make an otherwise-healthy deployment appear stale before
-# STATE#_deployment is even written. PMS_REQUEST_TIMEOUT_SECONDS caps each
-# individual request; PMS_COLLECTION_BUDGET_SECONDS caps the whole pass --
-# once the absolute deadline is reached, no further PMS request is issued
-# (no sleep, no retry) and whatever was already normalized is returned.
+# Fixed safety net: caps each request and the whole pass so a slow PMS collection can never outlast the stale threshold.
 PMS_REQUEST_TIMEOUT_SECONDS = 2
 PMS_COLLECTION_BUDGET_SECONDS = 30
 
-# Mirrors (does not import -- collector.py must not depend on tools/) the
-# contract-probe tool's proven bound: an oversized PMS response is never
-# parsed, sized, or logged.
+# Mirrors (does not import) the contract-probe tool's bound: an oversized PMS response is never parsed, sized, or logged.
 PMS_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 
 PMS_ERROR_CATEGORIES = (
@@ -444,18 +375,10 @@ PMS_ERROR_CATEGORIES = (
 
 _PMS_CONTROL_CHARS = frozenset(chr(c) for c in list(range(0x00, 0x20)) + [0x7f])
 
-# Production PMS process-name bound: not a runtime tuning knob, a fixed
-# safety limit. A name longer than this is skipped entirely rather than
-# truncated -- see _valid_pms_process_name.
+# Fixed safety limit, not a tuning knob: a name longer than this is skipped entirely (see _valid_pms_process_name).
 MAX_PMS_PROCESS_NAME_LENGTH = 128
 
-# Comfortably within DynamoDB's Number precision (up to 38 digits) and far
-# beyond any plausible value for a PMS counter/byte-count field -- a fixed,
-# documented safety bound, not a real-world limit. A value outside
-# [0, PMS_MAX_SAFE_NUMBER] becomes 0 rather than ever being stored. Kept at
-# or below 2**53 (IEEE-754 double's exact-integer range) so the boundary
-# itself is never blurred by float rounding -- one quadrillion is already
-# far beyond any real cumulative counter/byte-count value.
+# Fixed safety bound within DynamoDB Number precision and IEEE-754 exact-integer range; out-of-range values become 0.
 PMS_MAX_SAFE_NUMBER = 10 ** 15
 
 _PMS_INVENTORY_STRING_FIELDS = (
@@ -475,9 +398,7 @@ _PMS_SERVICE_HEALTH_FIELDS = ("isHealthy", "criticalResourcesHealthy", "critical
 
 
 def _http_json_bounded(url, opener, timeout=5, max_bytes=PMS_MAX_RESPONSE_BYTES):
-    """Like _http_json but the body is read to at most max_bytes+1 bytes --
-    an oversized response is never parsed. PMS-request-only; the existing
-    extract/replicat/distpath discovery path (_http_json) is unchanged."""
+    """Like _http_json but reads at most max_bytes+1 bytes; an oversized response is never parsed. PMS-only."""
     with opener.open(url, timeout=timeout) as resp:
         raw = resp.read(max_bytes + 1)
     if len(raw) > max_bytes:
@@ -486,24 +407,12 @@ def _http_json_bounded(url, opener, timeout=5, max_bytes=PMS_MAX_RESPONSE_BYTES)
 
 
 def _has_surrogate_codepoint(s):
-    """True if s contains any lone Unicode surrogate code point (U+D800 -
-    U+DFFF). A JSON payload can legally decode into a Python str containing
-    these (json.loads tolerates \\uD800-\\uDFFF escapes that don't form a
-    valid surrogate pair), but such a str cannot be UTF-8 encoded --
-    urllib.parse.quote would raise UnicodeEncodeError on it."""
+    """True if s contains a lone Unicode surrogate code point, which cannot be UTF-8 encoded."""
     return any(0xD800 <= ord(c) <= 0xDFFF for c in s)
 
 
 def _valid_pms_process_name(raw):
-    """A production-safe PMS process name: a string with at least one
-    non-whitespace character, no longer than MAX_PMS_PROCESS_NAME_LENGTH,
-    containing no ASCII control character or lone Unicode surrogate code
-    point (which cannot be UTF-8 encoded -- see _has_surrogate_codepoint),
-    and never '.' or '..' (the only values urllib.parse.quote(safe="")
-    leaves unescaped that could act as a traversal-equivalent path
-    segment). Returns the name EXACTLY as given when valid -- never
-    rewritten, stripped, or truncated -- or None to signal "skip this item"
-    when invalid."""
+    """Returns raw unmodified if it's a safe, bounded PMS process name (no control chars, not "." or ".."), else None."""
     if not isinstance(raw, str):
         return None
     if not raw.strip():
@@ -520,19 +429,12 @@ def _valid_pms_process_name(raw):
 
 
 def _normalize_pms_number(raw):
-    """A PMS number is never allowed to become an exception or a silently
-    wrong type: malformed, NaN, infinite, negative, boolean, or
-    out-of-DynamoDB-safe-range input all become 0 rather than propagating
-    or overflowing. Cumulative counters within the safe range are preserved
-    exactly -- never converted into a rate/percentage."""
+    """Malformed, NaN, infinite, negative, boolean, or out-of-range input all become 0; never raises."""
     if isinstance(raw, bool):
         return 0
     try:
         value = float(raw)
-    except (TypeError, ValueError, OverflowError):
-        # OverflowError: e.g. float(10**400) on a huge raw int -- Python
-        # raises rather than returning inf for int->float, unlike the
-        # string-parsing path below.
+    except (TypeError, ValueError, OverflowError):  # OverflowError: e.g. float(10**400) on a huge raw int
         return 0
     if not math.isfinite(value) or value < 0 or value > PMS_MAX_SAFE_NUMBER:
         return 0
@@ -540,9 +442,7 @@ def _normalize_pms_number(raw):
 
 
 def normalize_pms_inventory_item(raw):
-    """Bounded, pure: only the confirmed inventory fields, safe types only.
-    Unknown fields are ignored; missing fields are simply absent (never
-    invented)."""
+    """Only the confirmed inventory fields, safe types only; unknown fields ignored, missing fields absent."""
     if not isinstance(raw, dict):
         return {}
     out = {}
@@ -557,11 +457,7 @@ def normalize_pms_inventory_item(raw):
 
 
 def normalize_pms_performance(raw):
-    """Bounded, pure: only the confirmed numeric processPerformance fields.
-    cpuTimeUs/kernelTimeUs/userTimeUs are cumulative counters -- preserved
-    as-is here, never converted to a rate/percentage (that needs two
-    validated time samples and an approved manager contract, neither of
-    which exist yet)."""
+    """Only the confirmed numeric processPerformance fields; cumulative counters preserved as-is, never rated."""
     if not isinstance(raw, dict):
         return {}
     return {key: _normalize_pms_number(raw[key])
@@ -569,10 +465,7 @@ def normalize_pms_performance(raw):
 
 
 def normalize_pms_service_health(raw):
-    """Bounded, pure: {isHealthy, criticalResourcesHealthy,
-    criticalResourcesUnhealthy} with safe defaults. isHealthy fails closed
-    to False for anything that isn't literally a bool (never silently
-    accepts a truthy non-boolean as healthy)."""
+    """isHealthy/criticalResourcesHealthy/criticalResourcesUnhealthy with safe defaults; isHealthy fails closed."""
     if not isinstance(raw, dict):
         return {"isHealthy": False, "criticalResourcesHealthy": 0, "criticalResourcesUnhealthy": 0}
     is_healthy = raw.get("isHealthy")
@@ -584,12 +477,7 @@ def normalize_pms_service_health(raw):
 
 
 def heartbeat_age_seconds(last_heartbeat, now=None):
-    """Pure, timezone-aware. Returns a non-negative int age in seconds, or
-    None when last_heartbeat is missing/malformed -- never raises, never
-    logs the raw value. now is injectable (defaults to real current UTC
-    time) for deterministic tests. A naive (timezone-less) timestamp is
-    treated as unusable rather than assumed to be local or UTC. A future
-    timestamp clamps to age 0 rather than going negative."""
+    """Non-negative age in seconds, or None if malformed/naive; never raises. A future timestamp clamps to 0."""
     if not isinstance(last_heartbeat, str) or not last_heartbeat.strip():
         return None
     raw = last_heartbeat.strip()
@@ -607,12 +495,7 @@ def heartbeat_age_seconds(last_heartbeat, now=None):
 
 
 def _valid_pms_inventory_shape(payload):
-    """True only when payload is a dict whose "response" is a dict whose
-    "processes" is a list -- the three required shape checks. An empty
-    processes list IS a valid shape (status OK, zero followed); anything
-    else about the shape being wrong (missing/null/non-dict response,
-    non-list processes, or a non-dict top level) is not, and must be
-    classified INVALID_RESPONSE rather than silently treated as empty."""
+    """True iff payload.response.processes is a list; an empty list is valid, a wrong shape is INVALID_RESPONSE."""
     if not isinstance(payload, dict):
         return False
     response = payload.get("response")
@@ -622,13 +505,7 @@ def _valid_pms_inventory_shape(payload):
 
 
 def _pms_valid_process_names(payload):
-    """Returns (names, inventory_item_count): unique, production-safe
-    processName strings from response.processes, first-seen order
-    preserved -- never processId, never any other field. Only call this
-    after _valid_pms_inventory_shape confirms the shape. Non-dict items,
-    items with no valid processName (see _valid_pms_process_name), and
-    repeat names are skipped. inventory_item_count is the TRUE raw
-    response.processes list length, unaffected by validity or dedup."""
+    """Returns (unique valid processNames in first-seen order, raw response.processes length pre-dedup)."""
     if not isinstance(payload, dict):
         return [], 0
     response = payload.get("response")
@@ -649,12 +526,7 @@ def _pms_valid_process_names(payload):
 
 
 def _pms_detail_path(name, kind):
-    """Encodes name as exactly one URL path segment. Returns None (skip)
-    for any name _valid_pms_process_name itself would reject -- defense in
-    depth, since callers already filter through that function first. Also
-    catches UnicodeEncodeError from quote() itself as a second, independent
-    layer of defense -- quote() encodes to UTF-8 internally, which raises
-    for any string _valid_pms_process_name did not already catch."""
+    """Encodes name as one URL path segment; returns None for anything _valid_pms_process_name would reject."""
     if _valid_pms_process_name(name) is None:
         return None
     try:
@@ -665,30 +537,17 @@ def _pms_detail_path(name, kind):
 
 
 def _valid_pms_performance_shape(response):
-    """A processPerformance response must be a dict containing at least
-    one of the confirmed numeric fields -- missing, null, scalar, list, or
-    empty all fail this check (counted as a failed detail request, never a
-    silent success with an empty performance map)."""
+    """Must be a dict with at least one confirmed numeric field, else counted as a failed detail request."""
     return isinstance(response, dict) and any(k in response for k in _PMS_PERFORMANCE_NUMERIC_FIELDS)
 
 
 def _valid_pms_service_health_shape(response):
-    """A serviceHealth response must be a dict whose isHealthy field is a
-    LITERAL boolean -- missing, null, or any non-bool isHealthy fails this
-    check (a failed detail request), rather than being silently normalized
-    into a false-but-successful {isHealthy: False, ...} result. This is
-    intentionally stricter than _valid_pms_performance_shape: isHealthy is
-    the one field this response type cannot be considered valid without."""
+    """Must be a dict whose isHealthy field is a literal bool, else counted as a failed detail request."""
     return isinstance(response, dict) and isinstance(response.get("isHealthy"), bool)
 
 
 def _contains_pms_tls_error(exc, max_nodes=10):
-    """Bounded, cycle-safe search for an ssl.SSLError (ssl.SSLCertVerificationError
-    subclasses it) anywhere in exc's chain: the exception itself,
-    urllib.error.URLError.reason, and __cause__/__context__ at every node.
-    Mirrors (does not import -- collector.py must not depend on tools/) the
-    contract-probe tool's proven equivalent. Never inspects or returns the
-    raw exception text -- classification only."""
+    """Bounded, cycle-safe search for an ssl.SSLError anywhere in exc's chain; classification only, never raw text."""
     if exc is None:
         return False
     seen_ids = set()
@@ -718,8 +577,7 @@ def _contains_pms_tls_error(exc, max_nodes=10):
 
 
 def _classify_pms_error(exc):
-    """Bounded, closed classification for a PMS request failure. Never
-    inspects or returns the raw exception text."""
+    """Bounded, closed classification for a PMS request failure; never returns the raw exception text."""
     if isinstance(exc, urllib.error.HTTPError):
         if exc.code in (401, 403):
             return "AUTH_FAILED"
@@ -732,11 +590,7 @@ def _classify_pms_error(exc):
 
 
 def _pms_unavailable_snapshot(status):
-    """A current, sanitized, empty PMS snapshot for a tick where PMS
-    collection did not run at all (Admin REST itself is unreachable) or
-    where collect_pms raised unexpectedly. collectedAt is always "now" for
-    THIS tick -- a stale snapshot from a prior successful tick must never
-    survive unattributed to a new one."""
+    """A sanitized, empty PMS snapshot for a tick where PMS collection didn't run; collectedAt is always now."""
     return {
         "status": status, "collectedAt": cfgmod.now_epoch(),
         "inventoryCount": 0, "followedCount": 0, "successCount": 0, "failureCount": 0,
@@ -746,35 +600,7 @@ def _pms_unavailable_snapshot(status):
 
 def _collect_pms_impl(base, opener, now=None, clock=time.monotonic,
                       budget_seconds=PMS_COLLECTION_BUDGET_SECONDS):
-    """One bounded PMS collection pass for this tick. Reuses the caller's
-    already-authenticated, TLS-verified opener. GETs the confirmed process
-    inventory once; follows up to MAX_FOLLOWED_PMS_PROCESSES unique,
-    deduplicated, production-safe processName values with sequential,
-    bounded processPerformance + serviceHealth GETs only. Never logs a raw
-    exception, response body, or process name anywhere in this function.
-    Guards its own known failure modes (network errors, invalid shapes),
-    but see collect_pms() for the final catch-all boundary against any
-    unanticipated internal failure (e.g. an edge case in path construction
-    or normalization this function's own guards did not foresee).
-
-    A structurally invalid inventory response (not the three required
-    shape checks) is INVALID_RESPONSE -- distinct from a genuinely empty
-    processes list, which is a valid OK result. status is derived from
-    whether any individual detail GET actually succeeded this tick, not
-    merely from whether a process's BOTH details succeeded -- so a tick
-    where every process got exactly one of its two details is correctly
-    PARTIAL, never UNAVAILABLE. An individual detail failure (network error
-    or a malformed/empty response shape) only affects that one detail call
-    -- the remaining calls and processes are still attempted.
-
-    Bounded total time: clock() (time.monotonic by default, injectable for
-    deterministic tests) is checked against an absolute deadline
-    (clock()-at-entry + budget_seconds) before every request, inventory or
-    detail. Each request's own timeout is min(PMS_REQUEST_TIMEOUT_SECONDS,
-    time remaining until the deadline). Once the deadline passes, no
-    further PMS request is issued at all (no sleep, no retry) -- whatever
-    was already normalized is preserved and returned; nothing already
-    collected is discarded."""
+    """One bounded PMS pass: GETs inventory once, follows up to MAX_FOLLOWED_PMS_PROCESSES with detail GETs, stopping once the budget_seconds deadline passes."""
     deadline = clock() + budget_seconds
     collected_at = cfgmod.now_epoch()
 
@@ -836,10 +662,7 @@ def _collect_pms_impl(base, opener, now=None, clock=time.monotonic,
         for kind in PMS_DETAIL_KINDS:
             timeout = _next_timeout()
             if timeout is None:
-                # Budget exhausted -- this detail was never even attempted,
-                # which is exactly as much a "did not collect this data"
-                # outcome as a network failure would have been; it must
-                # count the same way for PARTIAL/UNAVAILABLE purposes.
+                # Budget exhausted: counts the same as a network failure for PARTIAL/UNAVAILABLE purposes.
                 process_ok = False
                 detail_failure_count += 1
                 budget_exhausted = True
@@ -880,12 +703,7 @@ def _collect_pms_impl(base, opener, now=None, clock=time.monotonic,
         if budget_exhausted:
             break
 
-    # Any process in `followed` that never even got a turn (the outer-loop
-    # budget check tripped before it started) contributed zero detail
-    # attempts of its own -- account for those as failures too, so status
-    # reflects "most of the intended work never happened" rather than
-    # silently reporting OK/PARTIAL based only on the few requests that
-    # happened to complete before the deadline.
+    # Processes that never got a turn before the budget tripped count as failures too.
     unattempted = len(followed) - len(processes_out)
     if unattempted > 0:
         detail_failure_count += unattempted * len(PMS_DETAIL_KINDS)
@@ -893,9 +711,7 @@ def _collect_pms_impl(base, opener, now=None, clock=time.monotonic,
 
     followed_count = len(followed)
     if followed_count == 0:
-        # Inventory GET succeeded with a valid shape; there is simply
-        # nothing (valid) to follow this tick -- OK, not UNAVAILABLE.
-        status = "OK"
+        status = "OK"  # valid inventory shape, simply nothing to follow this tick
     elif detail_success_count == 0:
         status = "UNAVAILABLE"  # zero detail GETs succeeded this tick
     elif detail_failure_count > 0:
@@ -914,25 +730,7 @@ def _collect_pms_impl(base, opener, now=None, clock=time.monotonic,
 
 def collect_pms(base, opener, now=None, clock=time.monotonic,
                 budget_seconds=PMS_COLLECTION_BUDGET_SECONDS):
-    """Public entry point: one bounded PMS collection pass for this tick,
-    bounded in both request count (MAX_FOLLOWED_PMS_PROCESSES) and total
-    wall-clock time (budget_seconds, measured via clock() -- time.monotonic
-    by default, injectable for deterministic tests). The caller decides
-    whether to persist the result (this function performs no DynamoDB or
-    CloudWatch I/O and does not know about lease/fencing -- it is a pure
-    network/normalization operation only).
-
-    This is a thin wrapper around _collect_pms_impl that adds a final,
-    unconditional defensive boundary: _collect_pms_impl already guards its
-    own known failure modes (network errors, invalid inventory/detail
-    shapes, unsafe process names, budget exhaustion), but an unanticipated
-    internal failure (e.g. a normalization or path-construction edge case
-    neither of those guards foresaw) must still never escape as an
-    exception. On any such failure this returns a current, bounded,
-    sanitized snapshot (status=INVALID_RESPONSE, zero counts,
-    heartbeatAgeSeconds=None, empty processes) with no logging and no raw
-    exception/process-name/URL exposure -- collect_pms as a whole must
-    never raise."""
+    """Public entry point: a pure network/normalization operation, no DynamoDB/CloudWatch I/O, and never raises."""
     try:
         return _collect_pms_impl(base, opener, now=now, clock=clock, budget_seconds=budget_seconds)
     except Exception:
@@ -948,21 +746,7 @@ _LAG_METRIC_BY_PROCESS_TYPE = {"extract": "ExtractLagSeconds", "replicat": "Repl
 
 def build_metric_batch(pipeline, deployment_type, flags, procs=None,
                        critical_service_status=None, abend_events=None, heartbeat_ok=False):
-    """Pure builder for the full manager-compatible metric contract: ordinary
-    dicts only, no boto3 calls, no CloudWatch client -- safe to unit-test
-    while CLOUDWATCH_PUBLISH_ENABLED stays false.
-
-    flags: {"lag": 0/1, "abend": 0/1, "down": 0/1} deployment-level breach
-    flags for this tick.
-    procs: normalized process rows (process/type/lagSeconds/abended); unknown
-    process types receive AbendState only, never a lag metric.
-    critical_service_status: {serviceName: up_bool}.
-    abend_events: process names that just transitioned into a countable abend
-    event this tick (per the existing abend-rule cadence, not every tick).
-    heartbeat_ok: True only when the caller has already completed a
-    successful, fenced STATE#_deployment write for this tick -- see
-    run_pipeline/polling_loop for the shared-monitor heartbeat semantics.
-    """
+    """Pure builder for the full metric contract: ordinary dicts only, no boto3/CloudWatch calls."""
     procs = procs or []
     critical_service_status = critical_service_status or {}
     abend_events = abend_events or ()
@@ -999,12 +783,7 @@ def build_metric_batch(pipeline, deployment_type, flags, procs=None,
 
 
 def publish_metric_batch(cw, metric_data, pipeline=None):
-    """The only boto3-calling half of metric emission -- always called behind
-    cloudwatch_enabled_for(cfg), never while the hard switch is false. A
-    PutMetricData failure is swallowed here (sanitized structured log only,
-    never a raw exception/traceback) so it can never crash the polling loop
-    or affect a DynamoDB deployment-status write -- no retries, matching the
-    manager-compatible one-publication-attempt semantics."""
+    """The only boto3-calling half of metric emission; a PutMetricData failure is swallowed, sanitized, no retries."""
     if not cw or not metric_data:
         return
     batches = [metric_data[i:i + 20] for i in range(0, len(metric_data), 20)]  # PutMetricData max 20/call
@@ -1023,17 +802,7 @@ def publish_metric_batch(cw, metric_data, pipeline=None):
 
 
 def publish_metrics_if_enabled(cfg, pipeline, metric_data):
-    """The single protected publication boundary both polling_loop call
-    sites (Admin-REST-down and normal-UP) must go through. Re-checks the
-    strict double gate itself (fail closed even if a caller's own check
-    were ever removed), constructs no CloudWatch client while disabled, and
-    never lets a client-construction failure raise, log a raw
-    exception/traceback, or reach the outer per-tick exception handler --
-    it is caught here, logged with only closed/safe fields, and the
-    function returns. The already-written DynamoDB deployment status is
-    unaffected either way, and no retry is attempted, matching
-    publish_metric_batch's own one-attempt semantics for the PutMetricData
-    call that follows."""
+    """The single protected publication boundary; re-checks the double gate itself and never lets a client-construction failure escape."""
     if not cloudwatch_enabled_for(cfg):
         return
     try:
@@ -1105,16 +874,7 @@ def read_config(table, pipeline):
 
 
 def check_static_prerequisites(deployment, table):
-    """Returns (ok, reason). A transient failure here just keeps retrying;
-    it never crashes the process. Deliberately excludes GoldenGate Admin
-    REST reachability -- the runtime API being down must not make the
-    monitor pod unready.
-
-    reason is always a fixed, generic string (plus, where noted, the
-    canonical deployment name / expected-vs-actual type) -- never a
-    credential file path, CA path, secret value, or raw AWS exception. The
-    caller (run_pipeline) logs this reason on every retry, so it must stay
-    safe to log repeatedly."""
+    """Returns (ok, reason); reason is always a fixed, generic, safe-to-log string, excludes Admin REST reachability."""
     pipeline = deployment["name"]
     user_file, pwd_file = cfgmod.credential_paths(pipeline)
     if not _read_secret_file(user_file):
@@ -1189,10 +949,7 @@ def polling_loop(deployment, table, mgr, state, stop_event):
             user = _read_secret_file(user_file)
             pwd = _read_secret_file(pwd_file)
             if not user or not pwd:
-                # Fail closed: never guess a username, never attempt Basic
-                # auth, never poll GoldenGate, never write a deployment
-                # STATE this tick. Only the canonical deployment name is
-                # logged -- never a file path or secret value.
+                # Fail closed: never guess credentials, poll, or write STATE this tick.
                 state.set_credentials_ok(False)
                 logger.warning("admin credentials unavailable for %s; skipping this tick", pipeline)
                 _sleep_watching_leadership(interval)
@@ -1211,22 +968,14 @@ def polling_loop(deployment, table, mgr, state, stop_event):
                     flags["down"] = 1
                 transitioned = (status != last_dep_status)
                 dep_snap = {"processType": "deployment", "status": status, "recordedAt": cfgmod.now_epoch()}
-                # PMS depends on the same Admin REST connectivity that just
-                # failed, so it is not attempted -- but a prior successful
-                # tick's pms map must never be left attached looking current.
-                # Overwrite it with a sanitized, current-tick ENDPOINT_UNAVAILABLE
-                # snapshot every time, in the same guarded write.
+                # PMS isn't attempted here; always overwrite any stale pms map with a current UNAVAILABLE snapshot.
                 dep_snap["pms"] = _pms_unavailable_snapshot("ENDPOINT_UNAVAILABLE")
                 if transitioned:
                     dep_snap["lastTransitionAt"] = cfgmod.now_epoch()
                 _guarded_write("_deployment", dep_snap)
                 last_dep_status = status
                 logger.warning("GoldenGate Admin REST unreachable for %s (%s): %s", pipeline, status, e)
-                # The _deployment write above just succeeded (it would have
-                # raised _FencedOff otherwise) -- the monitor itself is alive
-                # even though GoldenGate is unreachable, so the heartbeat
-                # still fires here (shared-monitor semantics; see
-                # build_metric_batch's heartbeat_ok docstring).
+                # The guarded write above succeeded, so the monitor is alive; the heartbeat still fires.
                 metric_data = build_metric_batch(pipeline, deployment_type, flags, heartbeat_ok=True)
                 publish_metrics_if_enabled(cfg, pipeline, metric_data)
                 _sleep_watching_leadership(interval)
@@ -1273,22 +1022,12 @@ def polling_loop(deployment, table, mgr, state, stop_event):
                 except Exception:
                     logger.exception("process %s evaluation failed; skipped", name)
 
-            # Manager-compatible: every deployment probes the full
-            # adminsrvr/distsrvr/recvsrvr set by default, regardless of
-            # type; cfg["criticalServices"] already resolved any (bounded,
-            # validated) CONFIG override -- see health_rules.resolve_critical_services.
+            # cfg["criticalServices"] already resolved any CONFIG override -- see resolve_critical_services.
             critical = cfg["criticalServices"]
             svc_up = probe_critical_services(base, opener, critical)
             cs_new = {svc: {"reachable": bool(up)} for svc, up in svc_up.items()}
 
-            # PMS is additional observability only: collect_pms never raises
-            # and its result never influences the deployment's own UP status
-            # above -- a PMS failure must not mark an otherwise-healthy
-            # Admin REST deployment DOWN. Belt-and-suspenders try/except in
-            # case of an unexpected bug in this still-new code path -- even
-            # then, a CURRENT sanitized snapshot is written, never a stale
-            # one left over from a prior successful tick, and never a raw
-            # exception/traceback in the log.
+            # PMS is additional observability only; a PMS failure must never mark the deployment DOWN.
             try:
                 pms_result = collect_pms(base, opener)
             except Exception:
@@ -1330,10 +1069,7 @@ def _cloudwatch_client():
 
 
 def run_pipeline(deployment, stop_event, ready_state, aws_region, dynamodb_table, monitor_instance):
-    """Sets up dedicated Table/LeaseManager pairs for the lease-control and
-    polling loops (boto3 Table objects are not safe to share across
-    concurrent update_item calls), waits for static prerequisites, then
-    runs both loops as daemon threads."""
+    """Sets up dedicated Table/LeaseManager pairs (not safe to share across threads) and runs both loops."""
     pipeline = deployment["name"]
 
     lease_table = boto3.resource("dynamodb", region_name=aws_region).Table(dynamodb_table)

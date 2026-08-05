@@ -10,9 +10,6 @@ metadata:
     {{- include "goldengate-platform.labels" . | nindent 4 }}
   annotations:
     argocd.argoproj.io/sync-wave: "-10"
-    # Prune=false,Delete=false (not PruneLast=true): this is a shared,
-    # engine-level resource -- Application cascading deletion or a future
-    # prune must never remove it. PruneLast alone only affects prune
-    # *ordering*, not whether the object is prunable/deletable at all.
+    # Shared, engine-level resource -- Application cascading deletion or a future prune must never remove it.
     argocd.argoproj.io/sync-options: Prune=false,Delete=false
 {{- end }}

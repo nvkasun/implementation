@@ -39,12 +39,7 @@ module "goldengate_pipeline_state" {
   env                  = "dev"
 }
 
-# CONFIG is Terraform-owned; the shared monitor owns LEASE/STATE#_deployment/
-# STATE#<process> and never writes CONFIG. Seeded generically from
-# goldengate-deployments.yaml -- deployment.name is used directly as the
-# partition key, no prefix added. ignore_changes = [item]: Terraform seeds
-# CONFIG once; later tuning is done outside Terraform and must not be reset
-# on a subsequent apply.
+# CONFIG is Terraform-owned (monitor owns LEASE/STATE#*); seeded from goldengate-deployments.yaml; ignore_changes=[item] so later manual tuning survives apply.
 moved {
   from = aws_dynamodb_table_item.gg_oracle_payments_01_config
   to   = aws_dynamodb_table_item.pipeline_config["gg-oracle-payments-01"]
@@ -142,9 +137,7 @@ module "goldengate_alerts" {
   env                  = "dev"
 }
 
-# GLOBAL is the routing-policy singleton for gg-alerter (not yet
-# implemented) -- disabled/empty until an operator configures it via the
-# DynamoDB console. ignore_changes = [item]: Terraform seeds once only.
+# GLOBAL is the routing-policy singleton for gg-alerter (not yet implemented); disabled/empty until configured via the DynamoDB console.
 resource "aws_dynamodb_table_item" "alerts_global" {
   depends_on = [
     module.goldengate_alerts
@@ -206,5 +199,4 @@ module "goldengate_metrics_history" {
   env                  = "dev"
 }
 
-# No seed items -- populated only by a future gg-alerter/metrics-history
-# writer (not implemented yet).
+# No seed items -- populated only by a future gg-alerter/metrics-history writer (not implemented yet).

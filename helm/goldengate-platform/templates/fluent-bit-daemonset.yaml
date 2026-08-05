@@ -89,10 +89,7 @@ spec:
               mountPath: /fluent-bit/etc/fluent-bit.conf
               subPath: fluent-bit.conf
               readOnly: true
-            # Read-only host log mounts only -- container stdout/stderr
-            # under /var/log/containers (symlinked from /var/log/pods).
-            # Never a writable host mount, never /var/lib/docker (not
-            # applicable on the containerd/CRI runtime this cluster uses).
+            # Read-only host log mount: container stdout/stderr under /var/log/containers (symlinked from /var/log/pods).
             - name: varlog
               mountPath: /var/log
               readOnly: true
@@ -117,14 +114,7 @@ spec:
       volumes:
         - name: tmp
           emptyDir: {}
-        # Fluent Bit's own tail-position DB and filesystem-backed chunk
-        # buffer -- internal working storage, not a host log mount, so
-        # readOnlyRootFilesystem compatibility does not conflict with the
-        # read-only /var/log mount below. sizeLimit bounds this on node
-        # ephemeral storage (kubelet evicts the pod if it is exceeded)
-        # -- the actual queue-size bound Fluent Bit itself enforces is
-        # storage.total_limit_size in fluent-bit-configmap.yaml, kept in
-        # the same order of magnitude as this value.
+        # Fluent Bit's own tail-position DB / chunk buffer (internal working storage); sizeLimit bounds it on node ephemeral storage (kubelet evicts the pod if exceeded).
         - name: fluent-bit-state
           emptyDir:
             sizeLimit: {{ .Values.fluentBit.buffering.stateVolumeSizeLimit | quote }}

@@ -54,8 +54,7 @@ class LoadDeploymentsTests(unittest.TestCase):
             self.assertEqual(d["metricsPort"], 9015)
 
     def test_derivation_uses_no_prefix_manipulation(self):
-        """deployment.name IS the DynamoDB partition key -- no gg- prefix
-        is prepended or stripped anywhere in the loader."""
+        """deployment.name IS the DynamoDB partition key -- the loader never prepends or strips a gg- prefix."""
         with tempfile.TemporaryDirectory() as tmp:
             write_deployments_yaml(tmp, VALID_DOC)
             doc = cfgmod.load_deployments(tmp)
@@ -189,9 +188,7 @@ class MonitorConfigLoadTests(unittest.TestCase):
             cfgmod.load_config({"AWS_REGION": "eu-west-1"})
 
     def test_no_legacy_fallback_config_field(self):
-        # Phase 5A: legacy-observer fallback has been retired. The monitor
-        # must not read LEGACY_FALLBACK_ENABLED at all, and must not expose
-        # any legacy-fallback field on MonitorConfig.
+        # Legacy-observer fallback is retired: must not read LEGACY_FALLBACK_ENABLED or expose it on MonitorConfig.
         config = cfgmod.load_config({"AWS_REGION": "eu-west-1", "DYNAMODB_TABLE": "t",
                                      "LEGACY_FALLBACK_ENABLED": "true"})
         self.assertFalse(hasattr(config, "legacy_fallback_enabled"))

@@ -1,11 +1,4 @@
-"""health_rules.py: pure health-evaluation logic (CONFIG resolution,
-per-process rule resolution, quiet-hours, abend counters, distpath stall
-detection, lag-breach classification, service-up classification).
-
-Passive only: this module computes an abend "failover" flag for schema
-fidelity but nothing in this application ever acts on it -- no restart,
-fence, or Kubernetes API call exists anywhere in this codebase.
-"""
+"""health_rules.py: pure health-evaluation logic. Passive only -- never acts on its own failover flag."""
 from __future__ import annotations
 
 import logging
@@ -34,23 +27,12 @@ DEFAULTS = {
 
 _RULE_KEYS = tuple(DEFAULTS["defaults"].keys())
 
-# Manager-compatible functional contract (confirmed against the manager
-# reference for its default critical-service set only -- reimplemented
-# independently here, never copied): every deployment, regardless of type,
-# defaults to this fixed three-service set. Probed purely for observational
-# CriticalServiceDown metrics/state -- never gates any healing, restart, or
-# Kubernetes action.
+# Fixed three-service default for every deployment type; observational only, never gates any action.
 RECOGNIZED_CRITICAL_SERVICES = ("adminsrvr", "distsrvr", "recvsrvr")
 
 
 def resolve_critical_services(raw):
-    """Bounded, fail-safe resolution of an optional CONFIG.criticalServices
-    override. The override may only narrow the recognized set (deduplicated,
-    order-preserved) -- it can never introduce a name outside
-    RECOGNIZED_CRITICAL_SERVICES, so an unknown/malformed entry can never
-    become an arbitrary CloudWatch Service dimension. Any non-list value, an
-    empty list, or a list that resolves to no recognized names all fail
-    safely to the full three-service default."""
+    """CONFIG.criticalServices may only narrow RECOGNIZED_CRITICAL_SERVICES; anything else falls back to it."""
     if isinstance(raw, list):
         resolved = []
         for item in raw:
@@ -161,8 +143,7 @@ def lag_rule_now(cfg, process, now=None):
 
 
 def abend_step(status, state, now, rule, alerts_enabled):
-    """One tick of the per-process abend counter machine. Still computes
-    act["failover"] for schema fidelity -- never acted on anywhere."""
+    """One tick of the per-process abend counter machine; act["failover"] is computed but never acted on."""
     st = {
         "consecutiveAbends": _to_int(state.get("consecutiveAbends"), 0),
         "lastAbendAt": _to_int(state.get("lastAbendAt"), 0),
@@ -192,8 +173,7 @@ BYTES_KEYS = ("bytesSent", "outputBytes", "bytes")
 
 
 def distpath_step(state, bytes_now, source_active, stall_checks):
-    """A distpath is 'stalled' when RUNNING but moving no bytes across
-    <stall_checks> consecutive ticks while its source extract is active."""
+    """A distpath is 'stalled' when moving no bytes across stall_checks ticks while its source extract is active."""
     st = {"stallCount": _to_int(state.get("stallCount"), 0),
           "lastBytes": _to_int(state.get("lastBytes"), -1)}
     if stall_checks is None or stall_checks <= 0:
@@ -224,8 +204,7 @@ def lag_breached(cfg, process, lag_seconds, now=None):
 
 
 def classify_service_up(http_status):
-    """A GG microservice is UP iff its proxied endpoint answers. 2xx or 401
-    (auth challenge) => up. 5xx or None (refused/timeout) => down."""
+    """A GG microservice is UP iff its proxied endpoint answers with 2xx or a 401 auth challenge."""
     if http_status is None:
         return False
     return http_status < 500 or http_status == 401

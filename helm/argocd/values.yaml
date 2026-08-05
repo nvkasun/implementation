@@ -1,39 +1,11 @@
-# Base values for the argocd wrapper chart.
-#
-# This file intentionally carries no environment-specific settings (image
-# registries, replica counts, RBAC policy, etc). All of that belongs in
-# envs/<environment>/argocd/values.yaml and is passed in via --values at
-# lint/template/deploy time -- the same pattern already used for the
-# GoldenGate chart (helm/goldengate + envs/dev/payments-ora-to-pg-*/values.yaml).
-#
-# Values for the vendored upstream chart must be namespaced under the
-# `argo-cd:` key below, matching the dependency name declared in Chart.yaml:
-#
-#   argo-cd:
-#     global:
-#       image:
-#         repository: <private-ecr-repo>
-#         tag: <tag>
-#
-# See helm/argocd/charts/argo-cd/values.yaml for the full set of
-# upstream-supported keys and their defaults.
-
+# Base values for the argocd wrapper chart; no environment-specific settings here (see envs/<environment>/argocd/values.yaml). Upstream chart values must be namespaced under `argo-cd:` (see helm/argocd/charts/argo-cd/values.yaml for supported keys).
 argo-cd: {}
 
-# Disabled by default here (this is a structural toggle, not an
-# environment-specific value). Environments that need the in-cluster Argo CD
-# ECR OCI token-refresh CronJob turn it on and supply the role ARN,
-# registry, repository list, and image details in their own values.yaml
-# overlay. repositories defaults to empty here -- it is only required
-# (and validated as non-empty) once enabled=true, see
-# templates/ecr-token-sync-cronjob.yaml.
+# Structural toggle, disabled by default; environments that need the in-cluster ECR token-refresh CronJob enable it and supply role ARN/registry/repositories/image in their own values.yaml overlay.
 ecrTokenSync:
   enabled: false
   repositories: []
 
-# Disabled by default here (this is a structural toggle, not an
-# environment-specific value). Environments that need to expose the Argo CD
-# UI through the shared internal ALB turn this on and supply the hostname,
-# ALB group, and certificate details in their own values.yaml overlay.
+# Structural toggle, disabled by default; environments that need to expose the Argo CD UI on the shared internal ALB enable it and supply hostname/ALB group/certificate in their own values.yaml overlay.
 argocdServerIngress:
   enabled: false

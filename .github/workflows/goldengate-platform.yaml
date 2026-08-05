@@ -2,22 +2,7 @@ name: Goldengate platform deployment
 
 run-name: "Cloud Factory - GoldenGate platform bootstrap build and deploy | ${{ github.event_name == 'workflow_dispatch' && format('manual dispatch (deploy={0})', inputs.deploy) || format('auto: platform changes on {0}', github.sha) }} | ran by ${{ github.actor }}"
 
-# Manual-only (workflow_dispatch), deliberately with no push trigger. This
-# enforces the required deployment order:
-#   1. IAM Terraform apply (applies the extended trust policy on the
-#      existing, proven GoldenGateSecretsReadRole-dev role -- see
-#      envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json
-#      -- this workflow's roleArn inputs would be invalid before this runs).
-#   2. argocd-eks-deployment.yaml (provisions the
-#      argocd-ecr-goldengate-platform-oci repository Secret this workflow's
-#      "Confirm the platform Argo CD repository Secret exists" step
-#      requires).
-#   3. This workflow.
-# A push trigger on helm/goldengate-platform/** or
-# platform/dev/goldengate-platform/** could fire before steps 1-2 complete
-# and fail (or worse, half-succeed) against a cluster/IAM state that isn't
-# ready yet. Do not re-add a push trigger or workflow_run chaining without
-# also solving that ordering problem.
+# Manual dispatch only, deliberately with no push trigger: this workflow must run after the IAM Terraform apply and argocd-eks-deployment.yaml (see the required order in the "Workflow summary" step); do not re-add a push trigger without also solving that ordering problem.
 on:
   workflow_dispatch:
     inputs:
@@ -55,16 +40,7 @@ env:
   EKS_CLUSTER_ARN: ${{ vars.AWS_CLUSTER_ARN }}
   EKS_DEPLOY_ROLE_ARN: ${{ vars.EKS_DEPLOY_ROLE_ARN }}
 
-  # IRSA role the in-cluster argocd-ecr-token-sync CronJob assumes to pull
-  # the goldengate-platform Helm OCI chart. envs/dev/argocd/values.yaml
-  # ecrTokenSync.repositories carries a "goldengate-platform" entry
-  # (argocdRepositorySecretName: argocd-ecr-goldengate-platform-oci) so the
-  # existing, generic ecr-token-sync-cronjob.yaml template (helm/argocd)
-  # provisions and refreshes that Secret the same way it already does for
-  # the goldengate and goldengate-monitor repositories -- no chart template
-  # changes were required for that. This role, its trust policy, and its
-  # ServiceAccount are unchanged by this workflow -- see
-  # envs/dev/policies/argocd-ecr-oci-read-dev/.
+  # IRSA role the in-cluster argocd-ecr-token-sync CronJob assumes to pull this Helm OCI chart; role/trust policy/ServiceAccount are unchanged by this workflow -- see envs/dev/policies/argocd-ecr-oci-read-dev/.
   ARGOCD_ECR_READ_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateArgocdECRRead-dev
 
   HELM_OCI_NAMESPACE: helm
@@ -78,50 +54,25 @@ env:
   ARGOCD_APP_NAME: goldengate-dev-platform
   ARGOCD_PLATFORM_SECRET_NAME: argocd-ecr-goldengate-platform-oci
 
-  # Shared, engine-level runtime identities this chart is the single owner
-  # of. Never used by an individual GoldenGate runtime release.
+  # Shared, engine-level runtime identities this chart is the single owner of; never used by an individual GoldenGate runtime release.
   RUNTIME_NAMESPACE: goldengate-dev
   ORACLE_SA_NAME: gg-oracle-sa
   POSTGRESQL_SA_NAME: gg-postgresql-sa
 
-  # Phase 6A: the second namespace the Fluent Bit DaemonSet is permitted to
-  # ship logs from (the shared monitor's namespace, owned by
-  # helm/goldengate-monitor, never created or altered by this chart), and
-  # the exact pre-created CloudWatch Logs destinations
-  # (envs/dev/cloudwatch_logs.tf) it must write to.
+  # The second namespace the Fluent Bit DaemonSet ships logs from (the shared monitor's namespace, owned by helm/goldengate-monitor, never created/altered by this chart).
   MONITOR_NAMESPACE: goldengate-monitoring
   FLUENT_BIT_RUNTIME_LOG_GROUP: /adcb/goldengate/dev/runtime
   FLUENT_BIT_MONITOR_LOG_GROUP: /adcb/goldengate/dev/monitor
 
-  # Both ServiceAccounts use the shared GoldenGateSecretsReadRole-dev role
-  # (also used by the shared monitor). See
-  # envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json
-  # for the extended trust (adds goldengate-dev:gg-oracle-sa and
-  # goldengate-dev:gg-postgresql-sa alongside the untouched legacy
-  # gg-dev-*:ogg-oracle-sa subject).
-  #
-  # Deterministic IRSA role ARN -- this repository has no Terraform
-  # outputs.tf anywhere (every other role ARN referenced by these workflows,
-  # e.g. ARGOCD_ECR_READ_ROLE_ARN above, is also a literal predicted ARN):
-  # arn:aws:iam::<account>:role/<name>.
+  # Both ServiceAccounts use the shared GoldenGateSecretsReadRole-dev role (also used by the shared monitor; extended trust policy at envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json); this ARN is a literal predicted value since this repository has no Terraform outputs.tf.
   ORACLE_RUNTIME_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev
   POSTGRESQL_RUNTIME_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev
 
-  # Phase 6A: platform-level Fluent Bit DaemonSet (centralized container
-  # logging). Dedicated least-privilege role -- see
-  # envs/dev/policies/goldengate-platform-logging-dev/. Same deterministic
-  # ARN-prediction pattern as the two role ARNs above (no Terraform
-  # outputs.tf in this repository).
+  # Platform-level Fluent Bit DaemonSet's dedicated least-privilege role -- see envs/dev/policies/goldengate-platform-logging-dev/.
   FLUENT_BIT_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGatePlatformLoggingRole-dev
   FLUENT_BIT_SA_NAME: gg-fluent-bit
 
-  # Phase 6A production-readiness correction: the private, immutable
-  # digest-pinned Fluent Bit image reference. The official AWS-published
-  # image was already mirrored into this account's own ECR repository
-  # (aws-cloud-factory-fluent-bit) outside this workflow -- this workflow
-  # never mirrors, copies, or writes an image, it only reads and verifies
-  # the already-mirrored digest via the "Validate FLUENT_BIT_IMAGE format"
-  # and "Private ECR digest preflight" steps below.
+  # Private, immutable digest-pinned Fluent Bit image; the AWS-published image is pre-mirrored into this account's ECR outside this workflow, which only reads and verifies the digest.
   FLUENT_BIT_ECR_REPOSITORY_EXPECTED: aws-cloud-factory-fluent-bit
   FLUENT_BIT_IMAGE_PREFIX_EXPECTED: "229410149234.dkr.ecr.eu-west-1.amazonaws.com/aws-cloud-factory-fluent-bit@"
 
@@ -130,20 +81,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # ---------------------------------------------------------------------
-  # Single job. This chart creates no container image of its own to
-  # build/push (Namespaces, shared engine ServiceAccounts, and -- Phase
-  # 6A -- the platform-level Fluent Bit DaemonSet with its supporting
-  # RBAC/ConfigMap/ServiceAccount), so there is no separate image-build job
-  # like goldengate-monitor.yaml's ensure_monitor_image. The Fluent Bit
-  # container image itself is never built or copied here either: it is a
-  # pre-mirrored, immutable digest reference read from the FLUENT_BIT_IMAGE
-  # repository variable and verified read-only against the already-mirrored
-  # private ECR repository (see "Validate FLUENT_BIT_IMAGE format" and
-  # "Private ECR digest preflight for the Fluent Bit image" below). Runs on
-  # the private CodeBuild runner, same as every other Helm/Argo CD
-  # deployment job in this repository.
-  # ---------------------------------------------------------------------
+  # Single job: this chart builds/pushes no container image of its own (Namespaces, shared ServiceAccounts, and the Fluent Bit DaemonSet are the only resources), so unlike goldengate-monitor.yaml there is no separate image-build job -- the Fluent Bit image is a pre-mirrored digest reference only read and verified here, never built or copied.
   package_publish_and_deploy:
     name: Build, publish, and deploy the GoldenGate platform bootstrap via Argo CD
 
@@ -208,10 +146,7 @@ jobs:
       - name: Validate FLUENT_BIT_IMAGE format
         shell: bash
         env:
-          # Read through a step-level environment variable, per the
-          # required correction -- never interpolated directly into a
-          # shell statement, exactly like every other vars./secrets.
-          # reference in this repository's workflows.
+          # Read through a step-level environment variable, never interpolated directly into a shell statement, like every other vars./secrets. reference in this repository's workflows.
           FLUENT_BIT_IMAGE: ${{ vars.FLUENT_BIT_IMAGE }}
         run: |
           set -euo pipefail
@@ -221,8 +156,7 @@ jobs:
             exit 1
           fi
 
-          # Exact private, immutable digest reference only -- no tag
-          # suffix, no public.ecr.aws, no other registry or repository.
+          # Exact private, immutable digest reference only -- no tag suffix, no public.ecr.aws, no other registry or repository.
           EXPECTED_PATTERN='^229410149234\.dkr\.ecr\.eu-west-1\.amazonaws\.com/aws-cloud-factory-fluent-bit@sha256:[a-f0-9]{64}$'
           if ! [[ "$FLUENT_BIT_IMAGE" =~ $EXPECTED_PATTERN ]]; then
             echo "FAIL: FLUENT_BIT_IMAGE does not match the required private immutable digest format."
@@ -235,9 +169,7 @@ jobs:
             exit 1
           fi
 
-          # Parsed from FLUENT_BIT_IMAGE itself -- never maintained as a
-          # second, independently-editable deployment value that could
-          # drift from the actual variable.
+          # Parsed from FLUENT_BIT_IMAGE itself -- never maintained as a second, independently-editable value that could drift from it.
           FLUENT_BIT_ECR_DIGEST="${FLUENT_BIT_IMAGE#*@}"
           REGISTRY_AND_REPOSITORY="${FLUENT_BIT_IMAGE%@*}"
           FLUENT_BIT_ECR_REPOSITORY="${REGISTRY_AND_REPOSITORY#*/}"
@@ -267,9 +199,7 @@ jobs:
           fi
           echo "OK: AWS caller account is ${ECR_ACCOUNT_ID}."
 
-          # Read-only Describe call only -- no ECR write permission is used
-          # or required, and this workflow never copies/mirrors the image
-          # itself.
+          # Read-only Describe call only -- no ECR write permission is used or required, and this workflow never copies/mirrors the image itself.
           if ! DESCRIBE_IMAGES_JSON="$(aws ecr describe-images \
               --region "$AWS_REGION" \
               --repository-name "$FLUENT_BIT_ECR_REPOSITORY" \
@@ -446,10 +376,7 @@ jobs:
 
           RENDERED="rendered/${RELEASE_NAME}.yaml"
 
-          # Reusable, dependency-free (no yq/jq/PyYAML) exact-document
-          # selector, same pattern as goldengate-monitor.yaml: splits the
-          # multi-document rendered manifest on "---" and returns the one
-          # document whose kind and metadata.name match exactly.
+          # Dependency-free (no yq/jq/PyYAML) exact-document selector: splits the rendered manifest on "---" and returns the one document whose kind and metadata.name match exactly.
           select_document() {
             local rendered_file="$1"
             local expected_kind="$2"
@@ -509,10 +436,7 @@ jobs:
           fi
           echo "OK: no per-runtime ownership label on the shared namespace."
 
-          # Shared objects must be protected from Argo CD prune/cascading
-          # deletion via Prune=false,Delete=false -- PruneLast=true alone
-          # only affects prune *ordering*, it does not make an object
-          # unprunable/undeletable.
+          # Shared objects must be protected via Prune=false,Delete=false -- PruneLast=true alone only affects prune *ordering*, it does not make an object unprunable/undeletable.
           assert_deletion_protected() {
             local kind="$1"
             local block="$2"
@@ -536,12 +460,7 @@ jobs:
             exit 1
           fi
 
-          # deletion_protected: "true" for the shared, engine-level
-          # oracle/postgresql identities (must survive this Application's
-          # own deletion -- other runtime releases still reference them by
-          # name); "false" for gg-fluent-bit, which belongs solely to this
-          # platform release's own DaemonSet and should be pruned/deleted
-          # normally along with it.
+          # deletion_protected is "true" for the shared oracle/postgresql identities (must survive this Application's own deletion) and "false" for gg-fluent-bit (pruned/deleted normally with this release).
           validate_runtime_sa() {
             local sa_name="$1"
             local expected_role_arn="$2"
@@ -583,13 +502,7 @@ jobs:
           validate_runtime_sa "$FLUENT_BIT_SA_NAME" "$FLUENT_BIT_ROLE_ARN" "false"
 
           echo "Validating no GoldenGate runtime/workload resources are rendered by this chart..."
-          # DaemonSet is deliberately no longer forbidden here: Phase 6A adds
-          # exactly one platform-level Fluent Bit DaemonSet
-          # (gg-fluent-bit) to this chart. This chart still owns no
-          # GoldenGate runtime workload of any kind -- StatefulSet/
-          # Deployment/Service/Ingress/PersistentVolumeClaim/
-          # SecretProviderClass remain forbidden, and the DaemonSet count
-          # is validated exactly below.
+          # DaemonSet is deliberately not forbidden here (the platform-level gg-fluent-bit DaemonSet is validated exactly below); all other GoldenGate runtime workload kinds remain forbidden.
           for forbidden_kind in StatefulSet Deployment Service Ingress PersistentVolumeClaim SecretProviderClass; do
             if grep -qE "^kind: ${forbidden_kind}\$" "$RENDERED"; then
               echo "FAIL: a ${forbidden_kind} was rendered by the platform chart -- it must only create shared namespaces, shared runtime ServiceAccounts, and the platform logging DaemonSet."
@@ -631,11 +544,7 @@ jobs:
           echo "OK: gg-fluent-bit DaemonSet does not use host networking."
 
           echo "Validating the Fluent Bit DaemonSet's host log mount is read-only..."
-          # hostPath volume named "varlog" must be paired with a matching
-          # volumeMount that sets readOnly: true -- a plain string search
-          # for "readOnly: true" alone would not prove it applies to the
-          # host mount specifically, so the hostPath volume block and its
-          # matching mount are extracted first.
+          # The hostPath volume block and its matching mount are extracted first, since a plain "readOnly: true" search would not prove it applies to the host mount specifically.
           if ! grep -Fq -- "hostPath:" <<< "$FLUENT_BIT_DS_BLOCK"; then
             echo "FAIL: gg-fluent-bit DaemonSet does not mount a host path for container logs."
             exit 1
@@ -654,8 +563,7 @@ jobs:
             exit 1
           fi
 
-          # 1: exactly two Tail inputs (runtime, monitor) -- never a single
-          # shared input routed downstream by a metadata-dependent filter.
+          # 1: exactly two Tail inputs (runtime, monitor) -- never a single shared input routed downstream by a metadata-dependent filter.
           TAIL_INPUT_COUNT="$(grep -cE '^\s*Name\s+tail\s*$' <<< "$FLUENT_BIT_CM_BLOCK")"
           if [ "$TAIL_INPUT_COUNT" -ne 2 ]; then
             echo "FAIL: expected exactly 2 Tail inputs, found ${TAIL_INPUT_COUNT}."
@@ -686,9 +594,7 @@ jobs:
           fi
           echo "OK: runtime and monitor Tail inputs have exact, deterministic Path and Tag values; no unrestricted Path remains."
 
-          # 6-7: each Kubernetes filter carries an explicit Kube_Tag_Prefix
-          # matching its Tail Tag's expansion -- enrichment metadata, never
-          # a routing dependency.
+          # 6-7: each Kubernetes filter carries an explicit Kube_Tag_Prefix matching its Tail Tag's expansion -- enrichment metadata, never a routing dependency.
           if ! grep -Fq -- 'Kube_Tag_Prefix   runtime.var.log.containers.' <<< "$FLUENT_BIT_CM_BLOCK"; then
             echo "FAIL: runtime Kubernetes filter does not set Kube_Tag_Prefix runtime.var.log.containers."
             exit 1
@@ -704,9 +610,7 @@ jobs:
           fi
           echo "OK: both kubernetes FILTERs set the expected explicit Kube_Tag_Prefix."
 
-          # 10-11: the previously-verified-broken metadata-dependent
-          # routing stages (grep filter, rewrite_tag filter/emitter) must
-          # be completely absent.
+          # 10-11: the metadata-dependent routing stages (grep filter, rewrite_tag filter/emitter) must be completely absent.
           if grep -Eq -- 'Name\s+grep' <<< "$FLUENT_BIT_CM_BLOCK"; then
             echo "FAIL: a grep FILTER is still rendered -- routing must not depend on Kubernetes-metadata enrichment."
             exit 1
@@ -717,10 +621,7 @@ jobs:
           fi
           echo "OK: no grep FILTER and no rewrite_tag FILTER/emitter are rendered."
 
-          # 8-9, 12-13: outputs match directly on each Tail input's own tag
-          # and retain the exact, pre-created CloudWatch log-group
-          # destinations, storage.total_limit_size, and auto_create_group
-          # false.
+          # 8-9, 12-13: outputs match directly on each Tail input's own tag and retain the exact, pre-created CloudWatch log-group destinations, storage.total_limit_size, and auto_create_group false.
           if ! grep -Fq -- 'Match                   runtime.*' <<< "$FLUENT_BIT_CM_BLOCK"; then
             echo "FAIL: runtime cloudwatch_logs OUTPUT does not use Match runtime.*"
             exit 1
@@ -761,12 +662,7 @@ jobs:
           echo "OK: rendered gg-fluent-bit image exactly matches FLUENT_BIT_IMAGE: ${RENDERED_IMAGE}"
 
           echo "Validating no public.ecr.aws reference remains in the active (non-comment) Phase 6A chart values/templates or the rendered manifest..."
-          # Exclude comment-only lines (# ...) -- this repository's chart
-          # source deliberately documents "never public.ecr.aws" as a
-          # prohibition in prose/required-message text, which must not
-          # itself be flagged as a live reference. The rendered manifest
-          # check below (no comments possible in rendered output) is the
-          # authoritative proof of the actually-deployed image.
+          # Exclude comment-only lines and quoted prohibition text -- only the rendered manifest check below is authoritative proof of the actually-deployed image.
           PUBLIC_ECR_HITS="$(grep -rn "public.ecr.aws" "$HELM_CHART_PATH/values.yaml" "$HELM_CHART_PATH/templates"/fluent-bit-*.yaml 2>/dev/null \
             | grep -vE ':\s*#|"[^"]*public\.ecr\.aws[^"]*"' || true)"
           if [ -n "$PUBLIC_ECR_HITS" ]; then
@@ -885,11 +781,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Same required-order check as goldengate-monitor.yaml: this
-          # workflow must fail clearly here, not inject a credential, if
-          # argocd-eks-deployment.yaml has not yet been re-run since the
-          # goldengate-platform entry was added to
-          # envs/dev/argocd/values.yaml ecrTokenSync.repositories.
+          # Must fail clearly here, not inject a credential, if argocd-eks-deployment.yaml has not yet provisioned this Secret.
           if ! kubectl get secret "$ARGOCD_PLATFORM_SECRET_NAME" -n "$ARGOCD_NAMESPACE" >/dev/null 2>&1; then
             echo "PREREQUISITE NOT MET: Secret ${ARGOCD_PLATFORM_SECRET_NAME} does not exist in namespace ${ARGOCD_NAMESPACE}."
             echo ""
@@ -920,10 +812,7 @@ jobs:
 
           echo "Applying Argo CD Application: ${ARGOCD_APP_NAME}"
 
-          # This Application is the single designated owner of the shared
-          # runtime namespace, so (unlike every per-runtime
-          # goldengate-eks-app.yaml Application) it is allowed
-          # CreateNamespace=true and managedNamespaceMetadata.
+          # Single designated owner of the shared runtime namespace, so (unlike per-runtime goldengate-eks-app.yaml Applications) it is allowed CreateNamespace=true and managedNamespaceMetadata.
           kubectl apply -f - <<EOF
           apiVersion: argoproj.io/v1alpha1
           kind: Application

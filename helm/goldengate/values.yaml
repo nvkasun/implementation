@@ -1,23 +1,13 @@
 global:
   environment: ""
 
-# Deployment model switch. singleRuntime is the only supported value: one
-# GoldenGate runtime StatefulSet per Helm release/Argo CD Application,
-# deployed into a shared per-environment namespace this chart never creates
-# or owns (see the runtime: block below). Any other value (including the
-# retired legacyPair model) is rejected with a controlled error at render
-# time -- see goldengate.assertSupportedDeploymentModel in _helpers.tpl. No
-# default is set here deliberately: a deployment values file must always
-# state its deploymentModel explicitly.
+# Deployment model switch; singleRuntime is the only supported value (see goldengate.assertSupportedDeploymentModel in _helpers.tpl). No default: a deployment values file must always state it explicitly.
 deploymentModel: ""
 
 nameOverride: ""
 fullnameOverride: ""
 
-# EFS-backed persistence for /u02 (trails, checkpoints, config, recovery
-# artifacts). Disabled by default (emptyDir) unless a deployment opts in.
-# Only the EFS filesystem ID is consumed here; the filesystem itself is
-# provisioned outside this chart.
+# EFS-backed persistence for /u02; disabled by default (emptyDir) unless a deployment opts in. The filesystem itself is provisioned outside this chart.
 persistence:
   enabled: false
   provider: efs
@@ -41,9 +31,7 @@ podSecurityContext: {}
 
 securityContext: {}
 
-# Generic single-runtime GoldenGate deployment. Exactly one container per
-# pod: no runtime.extraContainers key exists -- no observer/utility/Fluent
-# Bit sidecar in this model.
+# Generic single-runtime GoldenGate deployment; exactly one container per pod, no observer/utility/Fluent Bit sidecar in this model.
 runtime:
   enabled: false
 
@@ -61,8 +49,7 @@ runtime:
     tag: ""
     pullPolicy: IfNotPresent
 
-  # OGG_DEPLOYMENT/OGG_DOMAIN and the admin Secret name are derived
-  # from the runtime name (Release.Name) -- see _helpers.tpl.
+  # OGG_DEPLOYMENT/OGG_DOMAIN and the admin Secret name are derived from the runtime name (Release.Name) -- see _helpers.tpl.
   ogg:
     secureDeployment: false
 
@@ -140,27 +127,16 @@ runtime:
 
 ingress:
   enabled: false
-  # mode: shared  -> join an existing (resident) ALB group; emit only
-  #                   application/group-level annotations.
-  # mode: standalone -> this Ingress owns its own ALB; emit full ALB
-  #                      annotations (scheme, subnets, certificateArn, ...).
+  # mode: shared -> join an existing ALB group (app/group-level annotations only); standalone -> owns its own ALB (full annotations).
   mode: shared
   className: alb
 
-  # host, if set, is used verbatim; otherwise it is derived as
-  # "<runtimeName>.<hostDomain>".
+  # host, if set, is used verbatim; otherwise derived as "<runtimeName>.<hostDomain>".
   host: ""
   hostDomain: ""
 
   alb:
-    # These are library defaults only -- ingress.enabled is false by default,
-    # so nothing renders out of the box. If a deployment sets
-    # ingress.enabled=true and this alb.listenPorts (or an override) contains
-    # "HTTPS", ingress.alb.certificateArn MUST also be provided, or the chart
-    # fails to render. Environment values files (envs/<env>/<deployment>/values.yaml)
-    # are expected to fully override this alb block with real, deployment-specific
-    # ALB settings (group name/order, certificate ARN, listen ports, etc.) --
-    # these library defaults are not meant to be deployed as-is.
+    # Library defaults only, not meant to be deployed as-is: environment values files are expected to fully override this block. If ingress.enabled=true and listenPorts contains "HTTPS", certificateArn MUST also be provided.
     scheme: internal
     targetType: ip
     groupName: ""

@@ -1,4 +1,5 @@
 import html as html_module
+import inspect
 import json
 import os
 import re
@@ -20,8 +21,7 @@ MONITOR_WORKFLOW_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "goldeng
 ARGOCD_WORKFLOW_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "argocd-eks-deployment.yaml")
 DEPLOYMENTS_FILE_PATH = os.path.join(REPO_ROOT, "envs", "dev", "goldengate-deployments.yaml")
 
-# boto3/botocore are runtime dependencies but not required to run this
-# suite: every test injects a fake/mock table. Stub only when unavailable.
+# Not required to run this suite (every test injects a fake/mock table); stub only when unavailable.
 try:
     import boto3  # noqa: F401
 except ImportError:
@@ -50,6 +50,7 @@ except ImportError:
 
 import config as cfgmod  # noqa: E402
 import monitor  # noqa: E402
+import ui  # noqa: E402
 
 
 def make_config(**overrides):
@@ -69,8 +70,7 @@ LOGICAL_PIPELINES = cfgmod.build_logical_pipelines(DEPLOYMENTS)
 
 
 class FakeTable:
-    """Minimal in-memory stand-in for a boto3 DynamoDB Table -- supports
-    only get_item/query, matching this portal's read-only surface."""
+    """Minimal in-memory stand-in for a boto3 DynamoDB Table -- supports only get_item/query."""
 
     def __init__(self, items=None):
         self.items = list(items or [])
@@ -201,8 +201,7 @@ class ReadRuntimeViewTests(unittest.TestCase):
         self.assertEqual(out["effectiveStatus"], "UP")
 
     def test_missing_canonical_state_reports_missing_never_legacy(self):
-        # No canonical STATE#_deployment record at all -- even if a legacy
-        # per-role partition happens to hold data, it must never be read.
+        # No canonical record: even if a legacy per-role partition holds data, it must never be read.
         now = 1780000010
         legacy_item = {"pipeline": "gg-payments-ora-to-pg-001-source", "recordType": "STATE#_deployment",
                        "status": "HEALTHY", "recordedAt": now - 5}
@@ -264,8 +263,7 @@ class ReadRuntimeViewTests(unittest.TestCase):
         self.assertFalse(out["lease"]["fresh"])
 
     def test_canonical_process_rows_shown_when_deployment_state_missing(self):
-        # STATE#_deployment absent (eg a race during first-tick startup)
-        # must not suppress independently-existing STATE#<process> rows.
+        # STATE#_deployment absent (eg a race at first-tick startup) must not suppress process rows.
         now = 1780000010
         table = FakeTable([make_process_item(recorded_at=now - 3)])
         out = monitor.read_runtime_view(table, "source", "gg-oracle-payments-01",
@@ -295,9 +293,7 @@ class ReadRuntimeViewTests(unittest.TestCase):
 class BuildStatusPayloadTests(unittest.TestCase):
     def test_end_to_end_shape_matches_recommended_schema(self):
         now = 1780000010
-        # A legacy per-role partition (gg-payments-ora-to-pg-001-target) is
-        # deliberately included with data: canonical-only behavior means it
-        # must be completely ignored, leaving the target role MISSING.
+        # A legacy per-role partition is deliberately included with data to prove it's ignored.
         table = FakeTable([
             make_deployment_state_item(pipeline="gg-oracle-payments-01", recorded_at=now - 5, status="UP"),
             make_process_item(pipeline="gg-oracle-payments-01", process="EXTORA1", recorded_at=now - 5),
@@ -350,6 +346,7 @@ class DecimalConversionTests(unittest.TestCase):
 
 class HtmlEscapingTests(unittest.TestCase):
     def test_malicious_values_are_escaped_in_html(self):
+        # Page has one static <script> (theme toggle); assertion is that attacker input is escaped, not that no <script> exists.
         malicious = '<script>alert(1)</script>'
         payload = {"generatedAt": 1780000010, "logicalPipelines": [{
             "pipelineId": malicious,
@@ -358,7 +355,7 @@ class HtmlEscapingTests(unittest.TestCase):
                          "lease": None, "processes": []}],
         }]}
         rendered = monitor.render_html(payload, make_config())
-        self.assertNotIn("<script>", rendered)
+        self.assertNotIn(malicious, rendered)
         self.assertIn(html_module.escape(malicious), rendered)
 
     def test_no_process_rows_shows_fixed_message(self):
@@ -369,7 +366,8 @@ class HtmlEscapingTests(unittest.TestCase):
                          "lease": None, "processes": []}],
         }]}
         rendered = monitor.render_html(payload, make_config())
-        self.assertIn("No process STATE rows found.", rendered)
+        self.assertIn("No process state available", rendered)
+        self.assertIn("No Extract or Replicat process STATE rows have been recorded.", rendered)
 
 
 class HealthAndReadyTests(unittest.TestCase):
@@ -483,9 +481,7 @@ class DynamoDbAccessPatternTests(unittest.TestCase):
 
 
 class ProcessRowManagerFieldsTests(unittest.TestCase):
-    """Phase 4C2: manager-parity process fields the collector already
-    writes (resolvedThreshold/resolvedMode/consecutiveAbends) must be
-    surfaced by normalize_process_row with safe defaults when absent."""
+    """Manager-parity process fields must be surfaced by normalize_process_row with safe defaults when absent."""
 
     def test_resolved_threshold_mode_and_abends_passed_through(self):
         row = make_process_item(resolvedThreshold=300, resolvedMode="alert", consecutiveAbends=2)
@@ -527,9 +523,7 @@ class ProcessRowManagerFieldsTests(unittest.TestCase):
 
 
 class FormatRelativeAgeTests(unittest.TestCase):
-    """Phase 4C2 correction: manager-contract relative-age text, reimplemented
-    independently against this codebase's None-based missing-value
-    convention (not the manager's -1 sentinel)."""
+    """Manager-contract relative-age text, reimplemented against this codebase's None (not the manager's -1 sentinel) missing-value convention."""
 
     def test_missing_returns_never_by_default(self):
         self.assertEqual(monitor.format_relative_age(None), "never")
@@ -560,9 +554,7 @@ class FormatRelativeAgeTests(unittest.TestCase):
 
 
 class FormatLagThresholdModeTests(unittest.TestCase):
-    """Phase 4C2 correction: manager-contract combined lag/threshold/mode
-    cell text, reimplemented independently against this codebase's
-    None-based missing-value convention (not the manager's -1 sentinel)."""
+    """Manager-contract combined lag/threshold/mode cell text, reimplemented against this codebase's None (not the manager's -1 sentinel) missing-value convention."""
 
     def test_full_values_combined_matches_operator_facing_string(self):
         self.assertEqual(monitor.format_lag_threshold_mode(5, 300, "alert"), "5s / thr 300s (alert)")
@@ -588,9 +580,7 @@ class FormatLagThresholdModeTests(unittest.TestCase):
 
 
 class CriticalServiceNormalizationTests(unittest.TestCase):
-    """Section 4: normalize_critical_services must never raise, regardless
-    of malformed shape, and must degrade unsafe entries to a fail-closed
-    (unreachable) representation."""
+    """normalize_critical_services must never raise on malformed shape and must fail closed (unreachable)."""
 
     def test_well_formed_service_passes_through(self):
         self.assertEqual(
@@ -658,14 +648,12 @@ class CriticalServiceNormalizationTests(unittest.TestCase):
             {"adminsrvr": False})
 
     def test_boolean_root_service_value_rejected(self):
-        # {"adminsrvr": True} -- the service value itself, not a
-        # {"reachable": ...} dict -- must fail closed, not be coerced.
+        # The service value itself (not a {"reachable": ...} dict) must fail closed, not be coerced.
         self.assertEqual(monitor.normalize_critical_services({"adminsrvr": True}), {"adminsrvr": False})
 
 
 class PortalHtmlManagerParityTests(unittest.TestCase):
-    """Phase 4C2: every required HTML field is present, HTML-escaped, and
-    never leaks raw errorMsg/credentials/secrets/hostnames/ARNs."""
+    """Every required HTML field is present, HTML-escaped, and never leaks raw errorMsg/credentials/secrets/hostnames/ARNs."""
 
     def _payload_with_full_runtime(self, **overrides):
         runtime = {
@@ -736,10 +724,7 @@ class PortalHtmlManagerParityTests(unittest.TestCase):
         self.assertIn("down", rendered)
 
     def test_malformed_critical_service_values_render_as_down_never_reachable(self):
-        # Defense in depth at the HTML layer: even if a non-True truthy
-        # value somehow reaches render_html directly (bypassing
-        # normalize_critical_services), only the literal Boolean True may
-        # render as "reachable".
+        # Defense in depth at the HTML layer: even if a non-True truthy value bypasses normalize_critical_services, only literal Boolean True may render as "reachable".
         payload = self._payload_with_full_runtime(criticalServices={
             "svc-true": True, "svc-str-true": "true", "svc-str-false": "false",
             "svc-one": 1, "svc-zero": 0, "svc-none": None, "svc-list": ["reachable"],
@@ -748,9 +733,7 @@ class PortalHtmlManagerParityTests(unittest.TestCase):
         for name in ("svc-true", "svc-str-true", "svc-str-false", "svc-one",
                     "svc-zero", "svc-none", "svc-list"):
             self.assertIn(name, rendered)
-        # Exactly one genuinely-reachable service (svc-true, literal True);
-        # every malformed truthy/falsy value must render as down, never
-        # reachable.
+        # Exactly one genuinely-reachable service (svc-true); every other malformed value must render as down.
         self.assertEqual(rendered.count(">reachable<"), 1)
         self.assertEqual(rendered.count(">down<"), 6)
 
@@ -828,8 +811,7 @@ class PortalHtmlManagerParityTests(unittest.TestCase):
         self.assertNotIn("db-internal.example.local", rendered)
 
     def test_per_deployment_card_structure_not_a_wide_outer_table(self):
-        # Section 1 correction: no wide outer table with the process table
-        # nested inside its final <td>.
+        # No wide outer table with the process table nested inside its final <td>.
         rendered = monitor.render_html(self._payload_with_full_runtime(), make_config())
         self.assertNotIn("<th>Role</th>", rendered)
         self.assertNotIn("<th>Critical Services</th><th>Processes</th>", rendered)
@@ -844,7 +826,7 @@ class PortalHtmlManagerParityTests(unittest.TestCase):
         rendered = monitor.render_html(payload, make_config())
         self.assertEqual(rendered.count("gg-oracle-payments-01"), 1)
         self.assertEqual(rendered.count("gg-postgresql-payments-01"), 1)
-        self.assertEqual(rendered.count('border-radius:6px;padding:8px 14px 12px'), 2)
+        self.assertEqual(rendered.count('<article class="card">'), 2)
 
     def test_stale_process_row_has_class_and_visible_prefix(self):
         payload = self._payload_with_full_runtime()
@@ -855,8 +837,7 @@ class PortalHtmlManagerParityTests(unittest.TestCase):
 
     def test_fresh_process_row_has_no_stale_marker(self):
         rendered = monitor.render_html(self._payload_with_full_runtime(), make_config())
-        # the stylesheet's static tr.stale-row rule is always present;
-        # what must be absent is the class actually applied to a row.
+        # The stylesheet's static tr.stale-row rule is always present; what must be absent is its use on a row.
         self.assertNotIn('<tr class="stale-row"', rendered)
         self.assertNotIn("[STALE]", rendered)
 
@@ -865,15 +846,216 @@ class PortalHtmlManagerParityTests(unittest.TestCase):
         payload = self._payload_with_full_runtime(
             lease={"holder": malicious_holder, "expiresAt": 1780000040, "fresh": True})
         rendered = monitor.render_html(payload, make_config())
-        self.assertNotIn("<script>", rendered)
+        self.assertNotIn(malicious_holder, rendered)
         self.assertNotIn("&amp;amp;", rendered)
         self.assertIn(html_module.escape(malicious_holder), rendered)
 
 
+def _ui_payload(**overrides):
+    runtime = {
+        "role": "source", "deploymentName": "gg-oracle-payments-01", "deploymentType": "oracle",
+        "effectiveStatus": "UP", "fresh": True, "dataSource": "canonical-monitor",
+        "alertsEnabled": False, "metricsEnabled": True, "ageSeconds": 3, "recordedAt": 1780000007,
+        "lease": {"holder": "gg-monitor-0", "expiresAt": 1780000040, "fresh": True},
+        "criticalServices": {"adminsrvr": True, "distsrvr": False},
+        "processes": [{
+            "process": "EXTORA1", "processType": "extract", "status": "RUNNING", "stale": False,
+            "recordedAt": 1780000007, "ageSeconds": 3, "lagSeconds": 5,
+            "resolvedThreshold": 300, "resolvedMode": "alert", "consecutiveAbends": 0,
+            "hasError": False, "statusCode": "NONE", "statusMessage": "No error.",
+        }],
+    }
+    runtime.update(overrides)
+    return {"generatedAt": 1780000010, "logicalPipelines": [
+        {"pipelineId": "payments-ora-to-pg-001", "runtimes": [runtime]}]}
+
+
+class UiRedesignPhase6C1Tests(unittest.TestCase):
+    """Phase 6C1-UI: the redesigned ADCB-inspired portal (monitoring/monitor/ui.py)."""
+
+    def test_no_inline_style_attributes_remain(self):
+        rendered = monitor.render_html(_ui_payload(), make_config())
+        self.assertNotIn('style="', rendered)
+
+    def test_no_inline_event_handler_attributes_exist(self):
+        rendered = monitor.render_html(_ui_payload(), make_config())
+        self.assertIsNone(re.search(r'\son[a-z]+\s*=', rendered, re.IGNORECASE))
+
+    def test_light_and_dark_theme_css_variables_exist(self):
+        self.assertIn("--gg-bg", ui.CSS_TEXT)
+        self.assertIn("--gg-text", ui.CSS_TEXT)
+        self.assertIn(':root[data-theme="dark"]', ui.CSS_TEXT)
+        self.assertIn(':root[data-theme="light"]', ui.CSS_TEXT)
+
+    def test_theme_toggle_button_exists_and_is_a_native_keyboard_operable_element(self):
+        rendered = monitor.render_html(_ui_payload(), make_config())
+        self.assertIn('<button type="button" id="theme-toggle"', rendered)
+        self.assertIn('aria-pressed=', rendered)
+
+    def test_theme_persistence_uses_local_storage_only(self):
+        self.assertIn("localStorage", ui.JS_TEXT)
+        self.assertNotIn("document.cookie", ui.JS_TEXT)
+
+    def test_system_color_scheme_preference_is_supported(self):
+        self.assertIn("prefers-color-scheme", ui.CSS_TEXT)
+        self.assertIn("prefers-color-scheme", ui.JS_TEXT)
+
+    def test_theme_javascript_contains_no_network_request(self):
+        for forbidden in ("fetch(", "XMLHttpRequest", "WebSocket", "sendBeacon", "import(", "http://", "https://"):
+            self.assertNotIn(forbidden, ui.JS_TEXT)
+
+    def test_csp_permits_only_the_exact_computed_script_and_style_hashes(self):
+        import base64
+        import hashlib
+        style_hash = "sha256-" + base64.b64encode(hashlib.sha256(ui.CSS_TEXT.encode("utf-8")).digest()).decode("ascii")
+        script_hash = "sha256-" + base64.b64encode(hashlib.sha256(ui.JS_TEXT.encode("utf-8")).digest()).decode("ascii")
+        csp = ui.SECURITY_HEADERS["Content-Security-Policy"]
+        self.assertIn(f"style-src '{style_hash}'", csp)
+        self.assertIn(f"script-src '{script_hash}'", csp)
+
+    def test_csp_does_not_contain_unsafe_inline(self):
+        csp = ui.SECURITY_HEADERS["Content-Security-Policy"]
+        self.assertNotIn("unsafe-inline", csp)
+        self.assertNotIn("unsafe-eval", csp)
+        self.assertNotIn("*", csp)
+
+    def test_rendered_script_and_style_blocks_match_the_hashed_constants_exactly(self):
+        rendered = monitor.render_html(_ui_payload(), make_config())
+        self.assertIn(f"<script>{ui.JS_TEXT}</script>", rendered)
+        self.assertIn(f"<style>{ui.CSS_TEXT}</style>", rendered)
+
+    def test_responsive_viewport_metadata_exists(self):
+        rendered = monitor.render_html(_ui_payload(), make_config())
+        self.assertIn('<meta name="viewport" content="width=device-width, initial-scale=1">', rendered)
+
+    def test_semantic_header_main_footer_elements_exist(self):
+        rendered = monitor.render_html(_ui_payload(), make_config())
+        self.assertIn("<header", rendered)
+        self.assertIn("<main>", rendered)
+        self.assertIn("<footer>", rendered)
+
+    def test_summary_totals_are_correctly_calculated(self):
+        payload = _ui_payload()
+        second = dict(payload["logicalPipelines"][0]["runtimes"][0])
+        second.update(deploymentName="gg-postgresql-payments-01", role="target",
+                      effectiveStatus="DOWN", fresh=False, criticalServices={}, processes=[])
+        payload["logicalPipelines"][0]["runtimes"].append(second)
+        summary = ui._compute_summary(payload)
+        self.assertEqual(summary["totalDeployments"], 2)
+        self.assertEqual(summary["upDeployments"], 1)
+        self.assertEqual(summary["attentionDeployments"], 1)
+        self.assertEqual(summary["reachableServices"], 1)
+        self.assertEqual(summary["totalServices"], 2)
+        self.assertEqual(summary["totalProcesses"], 1)
+        self.assertFalse(summary["overallHealthy"])
+
+    def test_summary_calculation_makes_no_new_calls_pure_function_of_payload(self):
+        payload = _ui_payload()
+        summary_a = ui._compute_summary(payload)
+        summary_b = ui._compute_summary(payload)
+        self.assertEqual(summary_a, summary_b)
+
+    def test_down_condition_produces_attention_summary_and_non_healthy_banner(self):
+        payload = _ui_payload(effectiveStatus="DOWN", fresh=False)
+        rendered = monitor.render_html(payload, make_config())
+        self.assertIn('class="overall-banner attention"', rendered)
+        self.assertNotIn('class="overall-banner ok"', rendered)
+
+    def test_stale_missing_unknown_all_produce_attention(self):
+        for status in ("STALE", "MISSING", "UNKNOWN"):
+            with self.subTest(status=status):
+                summary = ui._compute_summary(_ui_payload(effectiveStatus=status))
+                self.assertEqual(summary["attentionDeployments"], 1)
+                self.assertFalse(summary["overallHealthy"])
+
+    def test_starting_status_does_not_by_itself_block_healthy(self):
+        summary = ui._compute_summary(_ui_payload(effectiveStatus="STARTING"))
+        self.assertEqual(summary["attentionDeployments"], 0)
+
+    def test_all_up_produces_healthy_overall_banner(self):
+        rendered = monitor.render_html(_ui_payload(), make_config())
+        self.assertIn('class="overall-banner ok"', rendered)
+
+    def test_service_reachable_and_down_chip_text_remains_visible(self):
+        rendered = monitor.render_html(_ui_payload(), make_config())
+        self.assertIn('class="chip chip-reachable">reachable<', rendered)
+        self.assertIn('class="chip chip-unreachable">down<', rendered)
+
+    def test_process_rows_preserve_every_existing_field(self):
+        rendered = monitor.render_html(_ui_payload(), make_config())
+        self.assertIn("EXTORA1", rendered)
+        self.assertIn("extract", rendered)
+        self.assertIn("RUNNING", rendered)
+        self.assertIn("5s / thr 300s (alert)", rendered)
+        self.assertIn("3s ago", rendered)
+        self.assertIn(">0<", rendered)
+
+    def test_empty_process_state_does_not_claim_replication_health(self):
+        rendered = monitor.render_html(_ui_payload(processes=[]), make_config())
+        self.assertIn("No process state available", rendered)
+        for forbidden in ("replication is healthy", "is healthy", "replicating normally"):
+            self.assertNotIn(forbidden, rendered)
+
+    def test_empty_process_state_does_not_hide_the_missing_discovery_condition(self):
+        rendered = monitor.render_html(_ui_payload(processes=[]), make_config())
+        self.assertIn("No Extract or Replicat process STATE rows have been recorded.", rendered)
+
+    def test_error_banner_remains_sanitized_and_has_role_alert(self):
+        rendered = monitor.render_html(_ui_payload(), make_config(),
+                                       error_message=monitor.CLIENT_SAFE_DYNAMODB_ERROR_MESSAGE)
+        self.assertIn('role="alert"', rendered)
+        self.assertIn(monitor.CLIENT_SAFE_DYNAMODB_ERROR_MESSAGE, rendered)
+        self.assertNotIn("Traceback", rendered)
+
+    def test_meta_auto_refresh_retains_the_configured_interval(self):
+        cfg = make_config(REFRESH_SECONDS="45")
+        rendered = monitor.render_html(_ui_payload(), cfg)
+        self.assertIn('<meta http-equiv="refresh" content="45">', rendered)
+        self.assertIn("Auto-refresh: 45s", rendered)
+
+    def test_manual_refresh_control_exists_as_a_plain_navigation_link(self):
+        rendered = monitor.render_html(_ui_payload(), make_config())
+        self.assertIn('<a class="btn" href="/"', rendered)
+
+    def test_alerts_enabled_and_metrics_enabled_are_displayed(self):
+        rendered = monitor.render_html(_ui_payload(alertsEnabled=True, metricsEnabled=False), make_config())
+        self.assertIn("Alerts enabled", rendered)
+        self.assertIn("Metrics enabled", rendered)
+        self.assertIn(">true<", rendered)
+        self.assertIn(">false<", rendered)
+
+    def test_lease_state_and_holder_remain_displayed(self):
+        rendered = monitor.render_html(_ui_payload(), make_config())
+        self.assertIn("Lease holder", rendered)
+        self.assertIn("Lease validity", rendered)
+        self.assertIn("gg-monitor-0", rendered)
+        self.assertIn("valid", rendered)
+
+    def test_api_status_and_api_processes_handlers_still_use_the_unmodified_data_functions(self):
+        source = inspect.getsource(monitor)
+        self.assertIn("build_status_payload(config, table, deployments, logical_pipelines)", source)
+        self.assertIn("build_processes_payload(config, table, deployments)", source)
+
+    def test_healthz_and_readyz_handlers_are_unaffected_by_the_ui_module(self):
+        source = inspect.getsource(monitor._make_handler)
+        healthz_start = source.index("_handle_healthz")
+        readyz_start = source.index("_handle_readyz")
+        handler_region = source[min(healthz_start, readyz_start):min(healthz_start, readyz_start) + 1200]
+        self.assertNotIn("ui.", handler_region)
+
+    def test_no_external_script_style_font_or_cdn_reference(self):
+        rendered = monitor.render_html(_ui_payload(), make_config())
+        for forbidden in ("http://", "https://", "cdn.", "fonts.googleapis", "<link rel=\"stylesheet\""):
+            self.assertNotIn(forbidden, rendered)
+
+    def test_no_react_angular_vue_or_npm_artifact_referenced(self):
+        source = ui.CSS_TEXT + ui.JS_TEXT
+        for forbidden in ("react", "angular", "vue", "node_modules", "webpack"):
+            self.assertNotIn(forbidden, source.lower())
+
+
 class ApiProcessesTests(unittest.TestCase):
-    """Phase 4C2: GET /api/processes -- canonical STATE# only, GetItem/Query
-    only, no legacy-observer fallback, no writes, no secret/internal
-    leakage."""
+    """GET /api/processes: canonical STATE# only, GetItem/Query only, no legacy fallback, no writes, no secret leakage."""
 
     def _handler(self, table_factory):
         handler_cls = monitor._make_handler(make_config(), table_factory, DEPLOYMENTS, LOGICAL_PIPELINES, {}, [])
@@ -883,9 +1065,7 @@ class ApiProcessesTests(unittest.TestCase):
         return handler, writes
 
     def test_success_returns_200_with_expected_schema(self):
-        # Goes through the real HTTP handler (build_processes_payload's
-        # default clock=time.time, not an injected one) -- fixture
-        # timestamps must be fresh relative to real wall-clock time.
+        # Goes through the real HTTP handler (uses time.time, not an injected clock), so fixtures must be fresh.
         now = int(time.time())
         table = FakeTable([
             make_deployment_state_item(recorded_at=now - 5,
@@ -944,10 +1124,7 @@ class ApiProcessesTests(unittest.TestCase):
             self.assertNotIn(forbidden, raw)
 
     def test_uses_canonical_state_schema_only_no_legacy_fallback(self):
-        # A legacy-shaped record under a legacy per-role partition key (never
-        # the canonical STATE#_deployment key for this deployment) must show
-        # MISSING here -- /api/processes reads canonical STATE# records only,
-        # same as /api/status (Phase 5A: no fallback of any kind remains).
+        # A record under the legacy per-role partition key must show MISSING; /api/processes reads canonical STATE# records only, same as /api/status.
         now = 1780000010
         legacy_item = {"pipeline": "gg-payments-ora-to-pg-001-source", "recordType": "STATE#_deployment",
                        "status": "HEALTHY", "recordedAt": now - 5}
@@ -960,9 +1137,7 @@ class ApiProcessesTests(unittest.TestCase):
         self.assertEqual(dep["effectiveStatus"], "MISSING")
 
     def test_canonical_process_rows_returned_when_deployment_state_missing(self):
-        # Section 3 correction: STATE#_deployment missing must not suppress
-        # independently-existing STATE#<process> rows in this canonical-only
-        # endpoint either.
+        # STATE#_deployment missing must not suppress independently-existing STATE#<process> rows either.
         now = 1780000010
         table = FakeTable([make_process_item(recorded_at=now - 3)])
         handler, writes = self._handler(lambda: table)
@@ -999,11 +1174,7 @@ class ApiProcessesTests(unittest.TestCase):
         self.assertEqual(dep["processes"], [])
 
     def test_api_status_never_falls_back_to_legacy_observer_partition(self):
-        # Phase 5A: /api/status's legacy-observer fallback has been retired.
-        # A record under the legacy per-role partition key must be
-        # completely ignored -- the role reports MISSING, not the legacy
-        # record's status. Goes through the real HTTP handler (real
-        # wall-clock time) -- the fixture must be fresh relative to it.
+        # A record under the legacy per-role partition key must be ignored -- role reports MISSING, not its status.
         now = int(time.time())
         legacy_item = {"pipeline": "gg-payments-ora-to-pg-001-source", "recordType": "STATE#_deployment",
                        "status": "HEALTHY", "recordedAt": now - 5}
@@ -1070,9 +1241,7 @@ class ThreadSafetyTests(unittest.TestCase):
         self.assertEqual(len(set(id(t) for t in created)), 8)
 
 def _extract_run_block(workflow_text, step_name):
-    """Extract a step's `run: |` block body, dedented, using plain text
-    scanning -- deliberately dependency-free (no PyYAML) so these tests run
-    anywhere the rest of this dependency-free suite runs."""
+    """Extract a step's `run: |` block body, dedented, via plain text scanning (no PyYAML) to stay dependency-free."""
     lines = workflow_text.splitlines()
     step_marker = f"- name: {step_name}"
     step_idx = None
@@ -1122,10 +1291,7 @@ MONITOR_CHART_PATH = os.path.join(REPO_ROOT, "helm", "goldengate-monitor")
 
 
 class SecretProviderClassRenderTests(unittest.TestCase):
-    """Renders the real helm/goldengate-monitor chart (with the canonical
-    config staged exactly as the workflow stages it) and asserts the
-    generated SecretProviderClass and CSI volume wiring -- not a
-    reimplementation of the template logic inside this test suite."""
+    """Renders the real helm chart (staged as the workflow stages it) and asserts the generated SecretProviderClass/CSI wiring, not a reimplementation of the template logic."""
 
     @classmethod
     def setUpClass(cls):
@@ -1190,10 +1356,7 @@ class SecretProviderClassRenderTests(unittest.TestCase):
 
 
 class CloudWatchActivationHelmRenderTests(unittest.TestCase):
-    """Phase 4D2: --set cloudwatch.publishEnabled=<bool> (the same mechanism
-    the workflow's Argo CD Application Helm parameter uses) must render the
-    exact literal string the strict env parser accepts -- proven against the
-    real chart, not a reimplementation of Helm's own type inference."""
+    """--set cloudwatch.publishEnabled=<bool> must render the exact literal string the strict env parser accepts, proven against the real chart, not a reimplementation of Helm's type inference."""
 
     def _render(self, publish_enabled):
         if shutil.which("helm") is None:
@@ -1233,9 +1396,7 @@ class CloudWatchActivationHelmRenderTests(unittest.TestCase):
 
 
 def _extract_monitor_image_hash_script(workflow_text):
-    """Pulls the exact, committed hash-computation snippet (from the array
-    of input paths through the MONITOR_IMAGE_TAG= assignment) out of the
-    real workflow file -- executed verbatim in tests, never reimplemented."""
+    """Pulls the exact, committed hash-computation snippet out of the real workflow file, executed verbatim in tests, never reimplemented."""
     start = workflow_text.index("MONITOR_IMAGE_INPUT_PATHS=(")
     end = workflow_text.index('MONITOR_IMAGE_TAG="mon-', start)
     end = workflow_text.index("\n", end) + 1
@@ -1243,12 +1404,7 @@ def _extract_monitor_image_hash_script(workflow_text):
 
 
 def _extract_base_image_validation_script(workflow_text):
-    """Pulls the exact, committed base-image validation snippet out of the
-    real workflow file -- executed verbatim in tests, never reimplemented.
-    No GitHub-Actions templating token remains inside this snippet at all
-    (it is only ever referenced in the step-level `env:` mapping, not in
-    the run script) -- so, unlike earlier phases, no textual substitution
-    is needed before this can be executed as ordinary bash."""
+    """Pulls the committed base-image validation snippet out of the real workflow, executed verbatim as ordinary bash (no GitHub-Actions token substitution needed since it's only referenced via step-level `env:`)."""
     start = workflow_text.index('MONITOR_BASE_IMAGE="$MONITOR_BASE_IMAGE_INPUT"')
     end = workflow_text.index("Confirmed: MONITOR_BASE_IMAGE is a digest-pinned", start)
     end = workflow_text.index("\n", end) + 1
@@ -1256,11 +1412,7 @@ def _extract_base_image_validation_script(workflow_text):
 
 
 class MonitorBaseImageValidationTests(unittest.TestCase):
-    """Phase 4D2 correction: fail-closed, digest-pinned private-ECR
-    base-image gate -- proven by executing the actual committed validation
-    script (extracted from the workflow, not reimplemented). The GitHub
-    expression is supplied only via step-level env (MONITOR_BASE_IMAGE_INPUT),
-    never interpolated into the shell source itself."""
+    """Fail-closed, digest-pinned private-ECR base-image gate, proven by executing the actual committed validation script (not reimplemented); the GitHub expression is supplied only via step-level env, never interpolated into the shell source."""
 
     ECR_REGISTRY = "229410149234.dkr.ecr.eu-west-1.amazonaws.com"
     APPROVED_DIGEST_REF = f"{ECR_REGISTRY}/goldengate-monitor-base@sha256:{'a' * 64}"
@@ -1288,8 +1440,7 @@ class MonitorBaseImageValidationTests(unittest.TestCase):
 
     def test_no_direct_github_expression_interpolation_remains_in_run_script(self):
         self.assertNotIn("${{ vars.MONITOR_BASE_IMAGE }}", self.validation_script)
-        # The one legitimate occurrence must be in a step-level `env:` value,
-        # never inside a `run:` script body.
+        # The one legitimate occurrence must be in a step-level `env:` value, never inside a `run:` script body.
         self.assertIn("MONITOR_BASE_IMAGE_INPUT: ${{ vars.MONITOR_BASE_IMAGE }}", self.workflow_text)
 
     def test_missing_base_image_fails(self):
@@ -1379,13 +1530,7 @@ class MonitorBaseImageValidationTests(unittest.TestCase):
         self.assertNotIn("a" * 64, proc.stdout)
 
     def _run_with_marker_file(self, base_image_input):
-        """Proves the value is handled as inert data, never executed as a
-        command: a payload attempting $()/backtick/`;`-style command
-        injection is given a harmless, distinctive command
-        (`touch <marker>`) to run *if* it were ever evaluated as shell
-        code. The validation script must reject the malformed reference
-        (never digest-pinned/never matching the private registry) without
-        the marker file ever being created."""
+        """Proves the value is handled as inert data: an injection payload runs `touch <marker>` if it were ever evaluated as shell code, and the marker must never be created."""
         with tempfile.TemporaryDirectory() as tmp:
             marker_path = os.path.join(tmp, "command-executed.marker")
             proc = self._run(base_image_input, extra_env={"MARKER_PATH": marker_path})
@@ -1417,10 +1562,7 @@ class MonitorBaseImageValidationTests(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
 
     def test_embedded_control_character_payload_never_executes(self):
-        # \x00 (NUL) cannot be represented in a process environment variable
-        # at all (envp entries are NUL-terminated C strings) -- \x01/\x1b
-        # are real control characters that CAN appear in an env var value
-        # and must still be rejected, never executed.
+        # \x00 can't appear in an env var (NUL-terminated C strings), but \x01/\x1b can and must still be rejected.
         proc, marker_created = self._run_with_marker_file(
             f'{self.ECR_REGISTRY}/base\x01\x1b@sha256:' + "a" * 64)
         self.assertFalse(marker_created, "embedded control-character payload executed a command")
@@ -1440,11 +1582,7 @@ class MonitorBaseImageValidationTests(unittest.TestCase):
 
 
 class MonitorImageHashTests(unittest.TestCase):
-    """Phase 4D2 correction: the runtime-image content hash must depend
-    only on exactly the paths the Dockerfile COPYs -- never README.md,
-    requirements-test.txt, or tests/**. Proven by executing the actual
-    committed hash script (extracted from the workflow, not reimplemented)
-    against a throwaway git repository."""
+    """The runtime-image content hash must depend only on the paths the Dockerfile COPYs (never README.md/requirements-test.txt/tests/**), proven by executing the actual committed hash script against a throwaway git repository."""
 
     @classmethod
     def setUpClass(cls):
@@ -1461,9 +1599,7 @@ class MonitorImageHashTests(unittest.TestCase):
         "@sha256:" + "b" * 64)
 
     def _compute_hash(self, repo_dir, base_image=None):
-        # hash_script already ends with a newline (it was sliced through the
-        # MONITOR_IMAGE_TAG= line), so the appended echo starts on its own
-        # line -- no extra ";" (which would be a stray empty statement).
+        # hash_script already ends with a newline, so the appended echo starts on its own line.
         script = f'set -euo pipefail\n{self.hash_script}echo "$MONITOR_TREE_SHA"'
         proc = subprocess.run(
             ["bash", "-c", script],
@@ -1622,9 +1758,7 @@ class MonitorImageHashTests(unittest.TestCase):
 
 
 class WorkflowStaticAnalysisTests(unittest.TestCase):
-    """Static inspection of the two GitHub Actions workflow files. These
-    prove the actual committed bash/YAML content was fixed -- not a
-    reimplementation of the same logic inside this test suite."""
+    """Static inspection of the two GitHub Actions workflow files: proves the actual committed bash/YAML content was fixed, not a reimplementation of the same logic inside this test suite."""
 
     @classmethod
     def setUpClass(cls):
@@ -1702,14 +1836,7 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         self.assertIn(".dockerignore", readme_text)
 
     def test_pod_selection_excludes_terminating_pods(self):
-        # Phase 6C1 correction: the preflight's pod selection was rewritten
-        # from a single jq filter into a Deployment/ReplicaSet
-        # ownership-chain loop (see
-        # test_preflight_pod_selection_verifies_ownership_chain below), so
-        # it excludes a terminating pod via a bash comparison on a jq-r
-        # extracted field rather than an inline jq boolean expression. The
-        # "Verify GoldenGate monitor runtime state" step's own (unchanged)
-        # pod selection still uses the original inline jq filter.
+        # The preflight excludes terminating pods via a bash comparison on a jq-r extracted field (not an inline jq boolean expression), unlike the unchanged "Verify" step below.
         preflight_step_text = self.monitor_text[
             self.monitor_text.index("- name: CloudWatch publication preflight"):
             self.monitor_text.index("- name: Create or update Argo CD Application")]
@@ -1744,10 +1871,7 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
                 self.assertEqual(condition, expected)
 
     def test_push_event_deploy_condition_evaluates_true_for_push(self):
-        # A push event never populates the `inputs` context, so relying on
-        # `inputs.deploy` alone would be falsy/undefined on a push run. The
-        # normalized expression must short-circuit to true via
-        # github.event_name before ever evaluating inputs.deploy.
+        # A push event never populates `inputs`, so the expression must short-circuit true via github.event_name before evaluating inputs.deploy.
         github_event_name = "push"
         inputs_deploy = None  # unset, as it would be on a real push trigger
         normalized = (github_event_name != "workflow_dispatch") or bool(inputs_deploy)
@@ -1783,8 +1907,7 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         self.assertLess(names.index("Run monitor unit tests"), names.index("Verify Docker binary and daemon are functional"))
 
     def test_deployment_discovery_awk_uses_posix_space_class_not_gnu_s(self):
-        # \s is a GNU/PCRE-only escape, not POSIX awk -- [[:space:]] is the
-        # portable bracket expression every POSIX-conforming awk supports.
+        # \s is a GNU/PCRE-only escape, not POSIX awk; [[:space:]] is the portable bracket expression.
         preflight_idx = self.monitor_text.index("- name: CloudWatch publication preflight")
         argocd_idx = self.monitor_text.index("- name: Create or update Argo CD Application")
         preflight_step_text = self.monitor_text[preflight_idx:argocd_idx]
@@ -1800,13 +1923,7 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         self.assertIn("[[:space:]]", post_rollout_awk_text)
 
     def test_deployment_discovery_awk_returns_exactly_both_enabled_deployments(self):
-        # Executes the actual committed awk snippet (extracted from the
-        # preflight step) under the system's real awk against the real
-        # canonical config -- not a reimplementation. Phase 6C1: the
-        # preflight now needs each enabled deployment's canonical type (to
-        # validate CONFIG.deploymentType), so the awk emits "name|type"
-        # pairs rather than bare names -- this asserts both the parsed
-        # names and their types.
+        # Executes the actual committed awk snippet under the system's real awk against the real config, not a reimplementation; the awk emits "name|type" pairs so this asserts both.
         if shutil.which("awk") is None:
             raise unittest.SkipTest("awk not available")
         preflight_idx = self.monitor_text.index("mapfile -t ENABLED_DEPLOYMENT_PAIRS < <(awk '")
@@ -1837,8 +1954,7 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         self.assertIn("targetRevision: ${CHART_VERSION}", self.monitor_text)
 
     def test_rerun_produces_a_distinct_chart_version(self):
-        # Pure simulation of the SemVer expression: same run_number, a
-        # different run_attempt (as on a workflow rerun) must never collide.
+        # Pure simulation of the SemVer expression: same run_number, a different run_attempt must never collide.
         def render(run_number, run_attempt):
             return f"0.{run_number}.{run_attempt}"
         first_attempt = render(42, 1)
@@ -1849,12 +1965,7 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         self.assertNotIn(".items[0].metadata.name", self.monitor_text)
 
     def test_pod_selection_requires_running_phase_and_ready_containers(self):
-        # Phase 6C1 correction: the preflight now checks the pod's Ready
-        # *condition* (status.conditions[type==Ready].status == "True"),
-        # matching goldengate-monitor-metrics-config.yaml's own ownership-
-        # chain pattern, rather than containerStatuses[].ready. The
-        # "Verify GoldenGate monitor runtime state" step's pod selection is
-        # unchanged and still uses the original inline jq filter.
+        # The preflight checks the pod's Ready *condition* (not containerStatuses[].ready); the "Verify" step below is unchanged and still uses containerStatuses[].ready.
         preflight_step_text = self.monitor_text[
             self.monitor_text.index("- name: CloudWatch publication preflight"):
             self.monitor_text.index("- name: Create or update Argo CD Application")]
@@ -1878,22 +1989,7 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         self.assertNotIn("echo \"$POD_NAME\" -o json", preflight_step_text)
 
     def test_preflight_pod_selection_verifies_ownership_chain(self):
-        # Phase 6C1 correction: the preflight's pod selection is no longer
-        # a single jq filter (that approach lived here before, and is still
-        # exactly what the "Verify GoldenGate monitor runtime state" step
-        # below uses, unchanged) -- it now mirrors
-        # goldengate-monitor-metrics-config.yaml's own multi-call
-        # Deployment/ReplicaSet ownership-chain selection: read the
-        # Deployment, derive its selector, and for each candidate pod
-        # require Running + Ready + non-terminating + serviceAccountName=
-        # gg-monitor + owned by a ReplicaSet whose own controller
-        # Deployment UID matches. A full FUNCTIONAL proof of this exact
-        # extracted fragment (mocked kubectl/jq, Running/Ready/terminating/
-        # wrong-serviceAccount/stale-ReplicaSet scenarios) lives in
-        # hack/test-goldengate-metrics-config.py::MainWorkflowPodOwnershipTests
-        # -- this test only proves the ownership-chain properties are
-        # textually present in the committed step, matching this class's
-        # static-analysis focus.
+        # This only proves the Deployment/ReplicaSet ownership-chain properties are textually present (static analysis); the full functional proof (mocked kubectl/jq scenarios) lives in hack/test-goldengate-metrics-config.py::MainWorkflowPodOwnershipTests.
         preflight_step_text = self.monitor_text[
             self.monitor_text.index("- name: CloudWatch publication preflight"):
             self.monitor_text.index("- name: Create or update Argo CD Application")]
@@ -1974,10 +2070,7 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
             self.monitor_text)
 
     def test_cloudwatch_argocd_helm_parameter_uses_plain_set_not_set_string(self):
-        # A plain `--set`/parameter value lets Helm's own strvals parser
-        # infer a real Boolean from the literal text "true"/"false" -- a
-        # --set-string would force the *string* "true", which is exactly
-        # the antipattern this phase must avoid propagating further.
+        # A plain `--set` lets Helm infer a real Boolean from "true"/"false"; --set-string would force the string "true", the antipattern to avoid.
         self.assertIn("--set cloudwatch.publishEnabled=", self.monitor_text)
         self.assertNotIn("--set-string cloudwatch.publishEnabled", self.monitor_text)
         self.assertIn("- name: cloudwatch.publishEnabled", self.monitor_text)
@@ -2017,12 +2110,7 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         self.assertNotIn("gg-postgresql-payments-01", preflight_step_text)
 
     def test_cloudwatch_preflight_output_is_sanitized_deployment_result_only(self):
-        # Phase 6C1: the preflight was rewritten from an unconditional
-        # "every enabled deployment must already have metricsEnabled=true"
-        # check into a gate-inventory read gated by metrics_gate_expectation.
-        # These assertions inspect the actual rewritten step text (not a
-        # reimplementation of it) to prove the new behaviour, rather than
-        # pinning the exact obsolete literal this test used to assert on.
+        # Inspects the actual rewritten step text (not a reimplementation) to prove the gate-inventory behaviour, rather than pinning an obsolete literal.
         preflight_idx = self.monitor_text.index("- name: CloudWatch publication preflight")
         argocd_idx = self.monitor_text.index("- name: Create or update Argo CD Application")
         preflight_step_text = self.monitor_text[preflight_idx:argocd_idx]
@@ -2035,8 +2123,7 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         self.assertIn("alerts_enabled is not False", preflight_step_text)
         self.assertIn("result=alertsenabled-not-false", preflight_step_text)
 
-        # 3. CONFIG.deploymentType is validated against the canonical
-        # per-deployment type discovered from the registry.
+        # 3. CONFIG.deploymentType is validated against the canonical per-deployment type from the registry.
         self.assertIn('item.get("deploymentType") != expected_type', preflight_step_text)
         self.assertIn("result=deploymenttype-mismatch", preflight_step_text)
 
@@ -2047,10 +2134,7 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         self.assertEqual(sorted(expectation_input["options"]), ["all-disabled", "all-enabled", "any"])
         self.assertEqual(expectation_input["default"], "any")
 
-        # 5. Publication is no longer unconditionally gated on every enabled
-        # deployment already having metricsEnabled=true: a deployment with
-        # metricsEnabled=false only fails the preflight when the expectation
-        # is all-enabled, never unconditionally.
+        # 5. A deployment with metricsEnabled=false only fails the preflight when the expectation is all-enabled.
         self.assertIn(
             'DISABLED_CONFIG_COUNT=$((DISABLED_CONFIG_COUNT + 1))\n'
             '              if [ "$GATE_EXPECTATION" = "all-enabled" ]; then',
@@ -2072,10 +2156,7 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         self.assertNotIn(".scan(", preflight_step_text)
         self.assertNotIn(".Scan(", preflight_step_text)
 
-        # 8. The double-gate model is preserved: this whole step (and thus
-        # the CONFIG gate inventory) only runs when the global hard switch
-        # input is true -- the per-deployment CONFIG read never substitutes
-        # for, or bypasses, that global switch.
+        # 8. The double-gate model is preserved: this step only runs when the global hard switch input is true.
         self.assertIn(
             "if: ${{ (github.event_name != 'workflow_dispatch' || inputs.deploy) "
             "&& inputs.enable_cloudwatch_publication }}",
@@ -2089,8 +2170,7 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         self.assertIn("Prerequisite:", preflight_step_text)
 
     def test_disabled_cloudwatch_request_never_reaches_preflight_condition(self):
-        # Pure boolean simulation of the step's `if:` gate -- proves a false
-        # request short-circuits before any CONFIG check would run.
+        # Pure boolean simulation of the step's `if:` gate: proves a false request short-circuits before any CONFIG check runs.
         github_event_name = "workflow_dispatch"
         inputs_deploy = True
         inputs_enable_cloudwatch_publication = False
@@ -2111,8 +2191,7 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         self.assertIn('"tick failed"', verify_step_text)
 
     def test_rollback_supported_by_same_workflow_no_dynamodb_mutation(self):
-        # Rollback is documented as re-running with enable_cloudwatch_publication=false --
-        # no separate rollback workflow, no CONFIG PutItem/UpdateItem call anywhere.
+        # Rollback is documented as re-running with enable_cloudwatch_publication=false; no separate rollback workflow or CONFIG mutation exists.
         self.assertNotIn("put_item", self.monitor_text)
         self.assertNotIn("update_item", self.monitor_text)
         self.assertNotIn("UpdateItem", self.monitor_text)
@@ -2145,11 +2224,7 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         self.assertIn("name: argocd-ecr-token-sync", self.argocd_text)
 
     def test_multi_document_rbac_extraction_selects_correct_role(self):
-        """Run the actual production RBAC-selection snippet (extracted
-        verbatim from the workflow file) against a synthetic multi-document
-        manifest where an unrelated Role -- granting delete/list/watch --
-        appears before the real argocd-ecr-token-sync Role. Proves the
-        correct Role is selected by kind+name, not by document order."""
+        """Runs the actual production RBAC-selection snippet (verbatim from the workflow) against a synthetic multi-document manifest to prove the correct Role is selected by kind+name, not document order."""
         snippet = _extract_run_block(self.argocd_text, "Validate ECR token sync resources are rendered")
         start = snippet.index('echo "Checking RBAC resourceNames')
         end = snippet.index('echo "OK: ServiceAccount/Role/RoleBinding/CronJob')
@@ -2210,9 +2285,7 @@ metadata:
         self.assertIn("OK: ServiceAccount/Role/RoleBinding/CronJob", proc.stdout)
 
     def test_multi_document_rbac_extraction_fails_when_role_incomplete(self):
-        """Same production snippet, but the real token-sync Role is missing
-        one required resourceName -- must fail loudly, proving the check is
-        not vacuously true."""
+        """Same production snippet, but the real Role is missing a required resourceName; must fail loudly, proving the check isn't vacuously true."""
         snippet = _extract_run_block(self.argocd_text, "Validate ECR token sync resources are rendered")
         start = snippet.index('echo "Checking RBAC resourceNames')
         end = snippet.index('echo "OK: ServiceAccount/Role/RoleBinding/CronJob')
@@ -2264,10 +2337,7 @@ SERVICEACCOUNT_TEMPLATE_PATH = os.path.join(
 
 
 def _extract_manifest_validation_helpers(monitor_text):
-    """The shared select_document()/normalize_value() bash function
-    definitions from the "Validate rendered monitor manifest" step --
-    required by every resource-specific slice extracted below, since those
-    slices call the functions rather than reimplementing the logic inline."""
+    """The shared select_document()/normalize_value() bash functions from the manifest-validation step; required by every slice below since they call these rather than reimplementing the logic."""
     full_step = _extract_run_block(monitor_text, "Validate rendered monitor manifest")
     start = full_step.index("select_document() {")
     end = full_step.index('echo "Validating Namespace')
@@ -2275,8 +2345,7 @@ def _extract_manifest_validation_helpers(monitor_text):
 
 
 def _extract_serviceaccount_validation_snippet(monitor_text):
-    """The ServiceAccount/IRSA validation portion of the "Validate rendered
-    monitor manifest" step, extracted verbatim from the real workflow."""
+    """The ServiceAccount/IRSA validation portion of the manifest-validation step, extracted verbatim from the real workflow."""
     full_step = _extract_run_block(monitor_text, "Validate rendered monitor manifest")
     start = full_step.index('echo "Validating ServiceAccount')
     end = full_step.index('echo "Validating Deployment uses')
@@ -2284,9 +2353,7 @@ def _extract_serviceaccount_validation_snippet(monitor_text):
 
 
 def _extract_ingress_validation_snippet(monitor_text):
-    """The Ingress host/certificate/protocol validation portion of the
-    "Validate rendered monitor manifest" step, extracted verbatim from the
-    real workflow."""
+    """The Ingress host/certificate/protocol validation portion of the manifest-validation step, extracted verbatim from the real workflow."""
     full_step = _extract_run_block(monitor_text, "Validate rendered monitor manifest")
     start = full_step.index('echo "Validating Ingress exists')
     end = full_step.index('echo "Validating the canonical inventory ConfigMap')
@@ -2323,9 +2390,7 @@ class ReadmeRoleDocumentationTests(unittest.TestCase):
 
 
 class ServiceAccountIrsaValidationTests(unittest.TestCase):
-    """Regression coverage for the quote-sensitive ServiceAccount role-arn
-    grep that silently passed the workflow step under set -euo pipefail
-    while never actually matching the (correctly quoted) rendered value."""
+    """Regression coverage for the quote-sensitive ServiceAccount role-arn grep that silently passed under set -euo pipefail while never actually matching the (correctly quoted) rendered value."""
 
     EXPECTED_ARN = "arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev"
 
@@ -2426,10 +2491,7 @@ metadata:
         self.assertIn("FAIL: rendered ServiceAccount gg-monitor was not found.", proc.stdout)
 
     def test_unrelated_serviceaccount_before_gg_monitor_is_not_selected(self):
-        """An unrelated ServiceAccount (even one with a similarly-prefixed
-        name and a deliberately wrong ARN) rendered before gg-monitor must
-        never be mistaken for it -- the real gg-monitor document, appearing
-        second, must still be the one validated."""
+        """An unrelated ServiceAccount (similarly-prefixed name, wrong ARN) rendered before gg-monitor must never be mistaken for it."""
         rendered = """---
 apiVersion: v1
 kind: ServiceAccount
@@ -2480,10 +2542,7 @@ spec:
 
 
 class IngressValidationTests(unittest.TestCase):
-    """Regression coverage for the quote-sensitive Ingress host grep (the
-    same class of bug already fixed for the ServiceAccount role-arn
-    annotation) plus the strengthened certificate-ARN and protocol
-    annotation checks, all scoped to the exact gg-monitor Ingress document."""
+    """Regression coverage for the quote-sensitive Ingress host grep (same bug class already fixed for ServiceAccount role-arn) plus certificate-ARN/protocol checks, scoped to the gg-monitor Ingress document."""
 
     EXPECTED_HOST = "monitor.goldengate-dev.adcbmis.local"
     EXPECTED_CERT_ARN = "arn:aws:acm:eu-west-1:668311715351:certificate/9e53e28e-3243-47fc-85a1-50f9a94acde7"
@@ -2637,19 +2696,13 @@ spec:
         self.assertIn(".Values.ingress.host | quote", template_text)
 
     def test_no_bare_positive_grep_remains_in_manifest_validation(self):
-        """Every remaining assertion in the full "Validate rendered monitor
-        manifest" run block must be an explicit conditional -- no bare
-        `grep -q ... "$RENDERED"`/`"$SOME_BLOCK"` left unguarded that would
-        silently exit the step under set -euo pipefail on a mismatch."""
+        """Every assertion in the manifest-validation run block must be an explicit conditional; a bare unguarded grep would silently exit the step under set -euo pipefail on a mismatch."""
         full_step = _extract_run_block(self.monitor_text, "Validate rendered monitor manifest")
         for line in full_step.splitlines():
             stripped = line.strip()
             if not stripped or stripped.startswith("#"):
                 continue
-            # A bare assertion is a line that IS a grep invocation (not
-            # inside an if/while condition or a command substitution) with
-            # no leading "if "/"! "/"elif " guard and no trailing "|| true"
-            # escape hatch used for controlled lookups.
+            # A bare assertion is a grep invocation with no if/while/guard and no "|| true" escape hatch.
             if re.match(r'^grep\s', stripped) and "$(" not in stripped:
                 self.fail(f"bare unguarded grep assertion found: {stripped!r}")
 
@@ -2658,10 +2711,7 @@ spec:
         self.assertNotRegex(snippet, r'echo\s+"\$[A-Za-z_]+"\s*\|\s*grep')
 
     def test_existing_serviceaccount_tests_still_pass(self):
-        """Sanity check that the ServiceAccount slice extraction/execution
-        still works after the shared select_document/normalize_value
-        functions were factored out -- full coverage lives in
-        ServiceAccountIrsaValidationTests."""
+        """Sanity check that ServiceAccount slice extraction still works after factoring out the shared helpers; full coverage lives in ServiceAccountIrsaValidationTests."""
         rendered = """---
 apiVersion: v1
 kind: ServiceAccount

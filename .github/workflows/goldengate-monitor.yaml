@@ -3,10 +3,7 @@ name: Goldengate monitor deployment
 run-name: "Cloud Factory - GoldenGate monitor build and deploy | manual dispatch (deploy=${{ inputs.deploy }}, cloudwatch=${{ inputs.enable_cloudwatch_publication }}) | ran by ${{ github.actor }}"
 
 
-# Manual dispatch only during the first controlled deployment -- pushing
-# this repository to main must not automatically deploy a new DynamoDB
-# writer before Terraform/IAM prerequisites are reviewed and applied. The
-# automatic push trigger is restored once the initial rollout is validated.
+# Manual dispatch only until the initial rollout is validated; automatic push trigger is restored afterward.
 on:
   workflow_dispatch:
     inputs:
@@ -60,12 +57,7 @@ env:
   EKS_CLUSTER_ARN: ${{ vars.AWS_CLUSTER_ARN }}
   EKS_DEPLOY_ROLE_ARN: ${{ vars.EKS_DEPLOY_ROLE_ARN }}
 
-  # IRSA role the in-cluster argocd-ecr-token-sync CronJob assumes to pull
-  # the goldengate-monitor Helm OCI chart. The helm/goldengate-monitor ECR
-  # repository policy must grant this exact role pull access -- see the
-  # "Ensure Helm ECR repository policy allows Argo CD pull" step below. This
-  # role, its trust policy, and its ServiceAccount are unchanged by this
-  # workflow -- see envs/dev/policies/argocd-ecr-oci-read-dev/.
+  # IRSA role for the in-cluster argocd-ecr-token-sync CronJob; the ECR repository policy must grant it pull access (see "Ensure Helm ECR repository policy allows Argo CD pull" step below).
   ARGOCD_ECR_READ_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateArgocdECRRead-dev
 
   MONITOR_SOURCE_PATH: monitoring/monitor
@@ -89,11 +81,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # ---------------------------------------------------------------------
-  # Image job: ubuntu-latest only, because the CodeBuild runner used by
-  # every other job/workflow in this repository has no reachable Docker
-  # daemon/socket. This job never touches the private EKS cluster.
-  # ---------------------------------------------------------------------
+  # ubuntu-latest only: the CodeBuild runner used elsewhere in this repo has no reachable Docker daemon; this job never touches the private EKS cluster.
   ensure_monitor_image:
     name: Ensure GoldenGate monitor image exists in ECR
 
@@ -138,27 +126,13 @@ jobs:
 
       - name: Validate approved base image reference
         env:
-          # GitHub-expression content must never be interpolated directly
-          # into executable shell source (it would be inserted as literal
-          # script text before bash ever parses it). Passed through
-          # step-level env instead -- ordinary shell-variable expansion of
-          # $MONITOR_BASE_IMAGE_INPUT below treats it strictly as inert
-          # data, never as command text, regardless of its content.
+          # Passed through step-level env (never interpolated directly into the script) so it is treated strictly as inert data, never as command text.
           MONITOR_BASE_IMAGE_INPUT: ${{ vars.MONITOR_BASE_IMAGE }}
         shell: bash
         run: |
           set -euo pipefail
 
-          # Fail-closed, digest-pinned private base-image gate: no public
-          # registry, no mutable tag, no invented repository, and no
-          # default supplied by the Dockerfile itself (see
-          # monitoring/monitor/Dockerfile: `ARG BASE_IMAGE` has no value).
-          # The approved reference is supplied externally as a repository/
-          # environment variable, following this workflow's existing
-          # vars.* convention (AWS_REGION, GOLDENGATE_AWS_ROLE_ARN, ...) --
-          # never hardcoded here. On any failure below, and even on
-          # success, only a fixed/generic message is printed -- the raw
-          # supplied value itself is never echoed.
+          # Fail-closed, digest-pinned private base-image gate; the Dockerfile's `ARG BASE_IMAGE` has no default, so the approved reference must come from vars.MONITOR_BASE_IMAGE.
           MONITOR_BASE_IMAGE="$MONITOR_BASE_IMAGE_INPUT"
 
           if [ -z "$MONITOR_BASE_IMAGE" ]; then
@@ -176,16 +150,7 @@ jobs:
             exit 1
           fi
 
-          # The required registry prefix is retained, but everything AFTER
-          # it is validated as a single, fully-anchored grammar -- not just
-          # a prefix check plus a suffix check. Lowercase alphanumeric path
-          # component(s), each internal separator limited to a single '.',
-          # '_', or '-', optional further '/'-separated components, always
-          # ending in exactly "@sha256:" + 64 lowercase hex characters. This
-          # single pattern alone rejects: an empty repository; whitespace or
-          # control characters; $(), backticks, quotes, and shell
-          # metacharacters; "../" or "./" path components; uppercase;
-          # tag-only references; and a short/uppercase/non-hex digest.
+          # Everything after the registry prefix is validated as a single, fully-anchored grammar (not a prefix+suffix check), rejecting shell metacharacters, path traversal, uppercase, tag-only refs, and malformed digests.
           MONITOR_BASE_IMAGE_REMAINDER="${MONITOR_BASE_IMAGE#"${MONITOR_BASE_IMAGE_REQUIRED_PREFIX}"}"
           MONITOR_BASE_IMAGE_PATTERN='^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*@sha256:[0-9a-f]{64}$'
           if [[ ! "$MONITOR_BASE_IMAGE_REMAINDER" =~ $MONITOR_BASE_IMAGE_PATTERN ]]; then
@@ -203,14 +168,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Content-addressed tag: a deterministic Git-based hash (mode,
-          # blob id, path -- via `git ls-tree`) over exactly the paths that
-          # affect the Docker build context/output, never the overall
-          # commit SHA and never the whole monitoring/monitor tree.
-          # README.md, requirements-test.txt, and tests/** are deliberately
-          # excluded: the Dockerfile never reads them, so a README-only or
-          # tests-only change must never produce a new tag/rebuild.
-          # .dockerignore IS included -- it shapes the build context itself.
+          # Content-addressed tag via `git ls-tree` over only the paths that affect the Docker build; README.md/requirements-test.txt/tests/** are deliberately excluded so doc/test-only changes don't trigger a rebuild.
           MONITOR_IMAGE_INPUT_PATHS=(
             "${MONITOR_SOURCE_PATH}/Dockerfile"
             "${MONITOR_SOURCE_PATH}/.dockerignore"
@@ -219,6 +177,7 @@ jobs:
             "${MONITOR_SOURCE_PATH}/collector.py"
             "${MONITOR_SOURCE_PATH}/config.py"
             "${MONITOR_SOURCE_PATH}/health_rules.py"
+            "${MONITOR_SOURCE_PATH}/ui.py"
             "${MONITOR_SOURCE_PATH}/tools"
           )
           MONITOR_LS_TREE="$(git ls-tree -r HEAD -- "${MONITOR_IMAGE_INPUT_PATHS[@]}")"
@@ -228,12 +187,7 @@ jobs:
             exit 1
           fi
 
-          # The approved base-image reference (already validated
-          # fail-closed as digest-pinned/private in the preceding step)
-          # participates in the same hash: the same runtime inputs built
-          # from a different base digest must produce a different tag, and
-          # an unchanged base digest with unchanged runtime inputs must
-          # reuse the existing tag.
+          # The base-image digest participates in the same hash so a base-digest change alone produces a new tag.
           if [ -z "${MONITOR_BASE_IMAGE:-}" ]; then
             echo "MONITOR_BASE_IMAGE is not set -- the \"Validate approved base image reference\" step must run and succeed before this step."
             exit 1
@@ -246,9 +200,7 @@ jobs:
           )"
           MONITOR_IMAGE_TAG="mon-${MONITOR_TREE_SHA:0:12}"
 
-          # MONITOR_ECR_REPOSITORY (short name) stays reserved for AWS CLI
-          # operations. Docker, Helm (image.repository), and the Argo CD
-          # Helm parameter all need the FULL registry/repository URI.
+          # MONITOR_ECR_REPOSITORY (short name) is for AWS CLI only; Docker/Helm/Argo CD need the full registry/repository URI.
           MONITOR_IMAGE_REPOSITORY="${ECR_REGISTRY}/${MONITOR_ECR_REPOSITORY}"
           MONITOR_IMAGE_URI="${MONITOR_IMAGE_REPOSITORY}:${MONITOR_IMAGE_TAG}"
 
@@ -376,10 +328,7 @@ jobs:
             fi
           fi
 
-      # Python setup, dependency install, syntax validation, and the full
-      # unit-test suite run on EVERY execution, regardless of IMAGE_EXISTED
-      # -- an existing/reused runtime image must never skip test coverage
-      # for the source that produced it.
+      # Python setup/deps/syntax/tests run on EVERY execution, regardless of IMAGE_EXISTED, so a reused image never skips test coverage.
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -413,9 +362,7 @@ jobs:
 
           python3 -m unittest discover -s "${MONITOR_SOURCE_PATH}/tests" -p "test_*.py" -v
 
-      # Everything below only runs when the content-addressed runtime image
-      # is actually missing from ECR. A reused image executes no Docker
-      # command at all -- not even a version or daemon check.
+      # Everything below only runs when the image is missing from ECR; a reused image executes no Docker command at all.
       - name: Verify Docker binary and daemon are functional
         if: env.IMAGE_EXISTED != 'true'
         shell: bash
@@ -515,11 +462,7 @@ jobs:
             echo "Helm-only and environment-values-only changes reuse this same image."
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # ---------------------------------------------------------------------
-  # Deployment job: private-platform CodeBuild runner, same pattern as
-  # every other Helm/Argo CD deployment job in this repository. Never
-  # runs Docker.
-  # ---------------------------------------------------------------------
+  # Deployment job: private-platform CodeBuild runner, same pattern as every other Helm/Argo CD deployment job in this repository; never runs Docker.
   build_publish_and_deploy:
     name: Build, publish, and deploy the GoldenGate monitor via Argo CD
 
@@ -604,24 +547,14 @@ jobs:
             exit 1
           fi
 
-          # Valid SemVer containing both run_number and run_attempt: the
-          # Helm ECR repository is mutable, and a workflow RERUN keeps the
-          # same run_number but increments run_attempt, so run_number alone
-          # would silently overwrite/reuse an existing OCI chart tag on
-          # rerun. Every attempt of every run gets its own chart version.
+          # Includes run_attempt (not just run_number) so a workflow rerun gets its own chart version instead of overwriting the existing OCI chart tag.
           CHART_VERSION="0.${{ github.run_number }}.${{ github.run_attempt }}"
           TEMP_CHART_PATH="work/charts/goldengate-monitor"
           HELM_ECR_REPOSITORY="${HELM_OCI_NAMESPACE}/${CHART_NAME}"
           HELM_PUSH_URL="oci://${ECR_REGISTRY}/${HELM_OCI_NAMESPACE}"
           HELM_CHART_REF="oci://${ECR_REGISTRY}/${HELM_ECR_REPOSITORY}"
 
-          # Strict Boolean-only value for cloudwatch.publishEnabled ->
-          # CLOUDWATCH_PUBLISH_ENABLED. GitHub renders a workflow_dispatch
-          # `type: boolean` input as the literal string "true" or "false"
-          # here -- never "1"/"yes"/"on" -- but this is verified explicitly
-          # rather than trusted blindly, since this value ultimately gates a
-          # hard CloudWatch kill switch (see collector.py
-          # _parse_strict_bool_env, which itself only accepts "true").
+          # Verified explicitly (not trusted blindly) since this gates a hard CloudWatch kill switch; collector.py _parse_strict_bool_env itself only accepts "true".
           CLOUDWATCH_PUBLISH_ENABLED_VALUE="${{ inputs.enable_cloudwatch_publication }}"
           if [[ "$CLOUDWATCH_PUBLISH_ENABLED_VALUE" != "true" && "$CLOUDWATCH_PUBLISH_ENABLED_VALUE" != "false" ]]; then
             echo "Unexpected enable_cloudwatch_publication value: \"${CLOUDWATCH_PUBLISH_ENABLED_VALUE}\" (expected literal true or false)."
@@ -661,12 +594,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # The base repository chart stays free of generated copies: this
-          # workflow copies the whole chart into a workflow-local temp
-          # directory (git-ignored, never committed) and stages the single
-          # canonical source file there, byte-identical, before any Helm
-          # lint/render/package. Every later step uses TEMP_CHART_PATH, not
-          # HELM_CHART_PATH.
+          # Chart is copied into a workflow-local temp dir (git-ignored) so the canonical config is staged without generated copies polluting the repo chart; every later step uses TEMP_CHART_PATH, not HELM_CHART_PATH.
           rm -rf "$TEMP_CHART_PATH"
           mkdir -p "$TEMP_CHART_PATH"
           cp -a "$HELM_CHART_PATH/." "$TEMP_CHART_PATH/"
@@ -792,14 +720,7 @@ jobs:
 
           RENDERED="rendered/${RELEASE_NAME}.yaml"
 
-          # Reusable, dependency-free (no yq/jq/PyYAML) exact-document
-          # selector: splits the multi-document rendered manifest on "---"
-          # and returns the one document whose kind and metadata.name match
-          # exactly. This is required, not cosmetic: a whole-manifest grep
-          # for "kind: Service" is a substring match that is also silently
-          # satisfied by "kind: ServiceAccount" -- exact per-document
-          # selection is the only way to validate one resource without risk
-          # of being fooled by an unrelated one, regardless of render order.
+          # Dependency-free (no yq/jq/PyYAML) exact-document selector; a whole-manifest grep for "kind: Service" would also match "kind: ServiceAccount".
           select_document() {
             local rendered_file="$1"
             local expected_kind="$2"
@@ -824,13 +745,7 @@ jobs:
             printf '%s' "$found"
           }
 
-          # Normalizes a raw "key:<tail>" string into a bare value: strips a
-          # trailing CR, leading/trailing whitespace (also drops the "- "
-          # YAML list-item marker when present, since it is never left
-          # attached once the leading "key:" substring has been cut away),
-          # then one matching layer of surrounding single or double YAML
-          # quotes -- so every comparison below passes whether Helm's
-          # `| quote` filter rendered the value quoted or not.
+          # Strips trailing CR/whitespace and one matching layer of quotes, so comparisons pass whether Helm's `| quote` filter rendered the value quoted or not.
           normalize_value() {
             local value="$1"
             value="${value//$'\r'/}"
@@ -1109,11 +1024,7 @@ jobs:
             echo "FAIL: rendered ConfigMap goldengate-monitor-canonical-config was not found."
             exit 1
           fi
-          # Expected deployment/pipeline names are read from the canonical
-          # source file itself -- never hardcoded here -- so this check
-          # adapts automatically as deployments are added/renamed.
-          # Dependency-free (no yq/jq/PyYAML): "name:"/"pipeline:" are
-          # simple scalar keys in this file's fixed schema.
+          # Expected names are read from the canonical source file itself (never hardcoded) so this check adapts automatically as deployments are added/renamed.
           EXPECTED_NAMES="$(grep -E '^\s*-?\s*(name|pipeline):' envs/dev/goldengate-deployments.yaml \
             | sed -E 's/^\s*-?\s*(name|pipeline):\s*//' | tr -d '"'"'"'\r' | sort -u)"
           while IFS= read -r expected; do
@@ -1168,9 +1079,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # TEMP_CHART_PATH was already prepared (chart copy + staged
-          # canonical config) by the earlier step -- reused here, not
-          # rebuilt, so the packaged chart matches what was linted/rendered.
+          # TEMP_CHART_PATH is reused (not rebuilt) so the packaged chart matches what was linted/rendered.
           mkdir -p packaged
           cp "$VALUES_FILE" "$TEMP_CHART_PATH/values-deployment.yaml"
 
@@ -1242,9 +1151,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # This is the required prerequisite check: the monitor workflow
-          # must fail clearly here (not inject a credential) if steps 1-2 of
-          # the documented deployment order have not run yet.
+          # Must fail clearly here (not inject a credential) if steps 1-2 of the documented deployment order have not run yet.
           if ! kubectl get secret "$ARGOCD_MONITOR_SECRET_NAME" -n "$ARGOCD_NAMESPACE" >/dev/null 2>&1; then
             echo "PREREQUISITE NOT MET: Secret ${ARGOCD_MONITOR_SECRET_NAME} does not exist in namespace ${ARGOCD_NAMESPACE}."
             echo ""
@@ -1268,20 +1175,6 @@ jobs:
 
       - name: CloudWatch publication preflight (gate inventory)
         if: ${{ (github.event_name != 'workflow_dispatch' || inputs.deploy) && inputs.enable_cloudwatch_publication }}
-        # Phase 6C1: replaces the old always-require-true preflight, which
-        # made the safe staged activation order (1: deploy the global hard
-        # switch true while every deployment gate stays closed, 2: enable
-        # deployments individually via the dedicated config workflow, 3:
-        # verify metrics manually in CloudWatch, 4: only then run again with
-        # expectation=all-enabled) impossible -- it always refused to touch
-        # the Argo CD Application unless every enabled deployment already
-        # had metricsEnabled=true. This step instead takes an INVENTORY of
-        # the current gate state (still GetItem-only, still one call per
-        # enabled deployment, still the existing running pod's own IRSA via
-        # kubectl exec, never Scan, never a new IAM permission, never a
-        # CloudWatch client) and applies metrics_gate_expectation to decide
-        # whether that inventory is acceptable before the Argo CD
-        # Application is ever touched.
         shell: bash
         run: |
           set -euo pipefail
@@ -1289,15 +1182,7 @@ jobs:
           echo "enable_cloudwatch_publication=true requested (metrics_gate_expectation=${{ inputs.metrics_gate_expectation }}) -- taking a safe CONFIG gate inventory for every enabled canonical deployment before the Argo CD Application is touched."
           echo "This never uses DynamoDB Scan, never broadens IAM, and never constructs a CloudWatch client -- it reuses the existing running monitor pod's own IRSA (GoldenGateMonitorReadRole-dev) via a bounded kubectl exec, one GetItem per enabled deployment."
 
-          # Phase 6C1 correction: Deployment/ReplicaSet ownership-chain pod
-          # selection, matching the pattern already used in
-          # goldengate-monitor-metrics-config.yaml -- never a blind
-          # ".items[0]" and never trusting only a label selector. The pod
-          # must be Running, Ready, non-terminating, use
-          # serviceAccountName=gg-monitor, AND be owned by a ReplicaSet that
-          # is itself owned by the current gg-monitor Deployment. Only the
-          # pod name is ever captured/printed; the full pod, ReplicaSet, or
-          # Deployment object is never printed.
+          # Deployment/ReplicaSet ownership-chain pod selection (never a blind ".items[0]" or a bare label selector): pod must be Running, Ready, use serviceAccountName=gg-monitor, and be owned by a ReplicaSet owned by the current gg-monitor Deployment.
           POD_NAME=""
           DEPLOY_JSON="$(kubectl get deployment gg-monitor -n "$TARGET_NAMESPACE" -o json 2>/dev/null || true)"
           if [ -n "$DEPLOY_JSON" ]; then
@@ -1347,10 +1232,7 @@ jobs:
           fi
           echo "Using the existing monitor pod for this read-only preflight: ${POD_NAME}"
 
-          # Canonical enabled deployment name|type pairs, discovered the
-          # same way the SecretProviderClass-alias check above discovers
-          # names -- never hardcoded, and now also carrying each
-          # deployment's canonical type for the deploymentType check below.
+          # Canonical enabled deployment name|type pairs, discovered from the source file (never hardcoded), carrying each deployment's type for the deploymentType check below.
           mapfile -t ENABLED_DEPLOYMENT_PAIRS < <(awk '
             /^[[:space:]]*-[[:space:]]*name:/ {
               if (name != "" && enabled == "true") print name "|" type
@@ -1438,8 +1320,7 @@ jobs:
             fi
           done
 
-          # Written before the pass/fail decision so the inventory is
-          # always visible in the run summary, including on failure.
+          # Written before the pass/fail decision so the inventory is always visible in the run summary, including on failure.
           {
             echo "### CloudWatch publication preflight (gate inventory)"
             echo ""
@@ -1586,8 +1467,7 @@ jobs:
           fi
           echo "OK: gg-monitor has ${READY_REPLICAS} ready replica(s)."
 
-          # A Ready pod only -- never a blind .items[0]. Only the pod name is
-          # ever captured; the full pod object is never printed.
+          # A Ready pod only -- never a blind .items[0].
           POD_NAME="$(kubectl get pods -n "$TARGET_NAMESPACE" -l app.kubernetes.io/name=gg-monitor -o json \
             | jq -r '[.items[] | select(.status.phase == "Running"
                 and .metadata.deletionTimestamp == null
@@ -1673,9 +1553,7 @@ jobs:
             exit 1
           }
 
-          # Expected names come from the canonical source file itself --
-          # never hardcoded here -- so this check adapts automatically as
-          # deployments are added/renamed.
+          # Expected names come from the canonical source file itself (never hardcoded) so this check adapts automatically as deployments are added/renamed.
           EXPECTED_NAMES="$(grep -E '^\s*-?\s*(name|pipeline):' envs/dev/goldengate-deployments.yaml \
             | sed -E 's/^\s*-?\s*(name|pipeline):\s*//' | tr -d '"'"'"'\r' | sort -u)"
           while IFS= read -r expected; do
@@ -1694,10 +1572,7 @@ jobs:
             exit 1
           fi
 
-          # Any observed effective status (UP/STARTING/DOWN/STALE/MISSING/
-          # UNKNOWN) is a valid operational state and never fails this step
-          # -- only the portal's own inability to run/authenticate/serve
-          # does.
+          # Any observed effective status (UP/STARTING/DOWN/STALE/MISSING/UNKNOWN) is valid and never fails this step -- only the portal's own inability to run/authenticate/serve does.
           echo "OK: /api/status is valid JSON and contains all canonical deployments/pipelines."
 
           echo "Checking collector and portal logs for forbidden patterns..."
@@ -1796,9 +1671,7 @@ jobs:
             fi
             echo "OK: post-rollout gate inventory satisfies metrics_gate_expectation=${GATE_EXPECTATION_POST} for every enabled deployment; alertsEnabled confirmed false throughout."
 
-            # Bounded observation window using --since-time (never a broad
-            # historical window) so pre-existing/historical log lines from
-            # before this validation cannot cause a false failure.
+            # Bounded observation window using --since-time (never a broad historical window) so pre-existing log lines cannot cause a false failure.
             VALIDATION_START_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             OBSERVATION_PERIOD_SECONDS=90
             echo "Observing gg-monitor logs for ${OBSERVATION_PERIOD_SECONDS}s starting at ${VALIDATION_START_TS} (covers at least one full polling/config interval)..."

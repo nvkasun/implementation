@@ -24,10 +24,7 @@ env:
   ECR_ACCOUNT_ID: "229410149234"
   ECR_REGISTRY: 229410149234.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com
 
-  # Role used by GitHub Actions / CodeBuild runner. Reuses the same runner
-  # role/pattern as the GoldenGate deployment workflow -- it already has
-  # the ECR push/pull and EKS access this workflow needs, and this avoids
-  # provisioning a second dedicated IAM role for Argo CD.
+  # Reuses the GoldenGate deployment workflow's runner role (already has ECR + EKS access) instead of provisioning a second IAM role.
   ROLE_ARN: ${{ vars.GOLDENGATE_AWS_ROLE_ARN }}
 
   # Target EKS cluster details (same private dev/test cluster as GoldenGate).
@@ -234,14 +231,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Static, repo-file-only check (no AWS calls): proves the
-          # GoldenGateArgocdECRRead-dev identity policy actually grants pull
-          # access to each exact repository ARN and the required actions,
-          # before this workflow ever provisions the in-cluster Secret that
-          # depends on it. This is deliberately narrower than a wildcard --
-          # it must be an exact ARN match, one statement per repository.
-          # Phase 6B2B added the fourth entry (amazon-cloudwatch-observability)
-          # -- its identity-policy statement was already added in Phase 6B2A.
+          # Static check (no AWS calls) that the ECR read policy grants pull access via an exact ARN match per repository, not a wildcard.
           POLICY_FILE="envs/dev/policies/argocd-ecr-oci-read-dev/policies/policies_1.json"
 
           if [ ! -f "$POLICY_FILE" ]; then
@@ -363,10 +353,7 @@ jobs:
 
           echo "Checking rendered manifest for ECR token sync resources: ${RENDERED}"
 
-          # Fails the workflow before package/push/deploy if the CronJob,
-          # its ServiceAccount/RBAC, IRSA annotation, or the pinned image
-          # are missing from the rendered chart -- catches a regression or
-          # a values misconfiguration before it ever reaches the cluster.
+          # Fails before package/push/deploy if the CronJob, its RBAC, IRSA annotation, or pinned image are missing from the rendered chart.
           grep -q "kind: CronJob" "$RENDERED"
           grep -q "name: argocd-ecr-token-sync" "$RENDERED"
           grep -q "eks.amazonaws.com/role-arn: arn:aws:iam::668311715351:role/GoldenGateArgocdECRRead-dev" "$RENDERED"
@@ -374,8 +361,7 @@ jobs:
 
           echo "Checking multi-repository token sync (all four GoldenGate/CloudWatch Observability Helm OCI repositories: goldengate, goldengate-monitor, goldengate-platform, amazon-cloudwatch-observability)..."
 
-          # All four Helm OCI repository names must be baked into the
-          # rendered CronJob's bash arrays.
+          # All four Helm OCI repository names must be baked into the rendered CronJob's bash arrays.
           grep -q 'helm/goldengate"' "$RENDERED"
           grep -q 'helm/goldengate-monitor"' "$RENDERED"
           grep -q 'helm/goldengate-platform"' "$RENDERED"
@@ -661,10 +647,7 @@ jobs:
 
           echo ""
           echo "ECR token sync resources:"
-          # No "|| true" here on purpose: with set -e, a missing resource
-          # aborts this step and fails the job instead of silently passing
-          # -- Argo CD's ECR OCI credentials won't stay refreshed without
-          # all four of these existing.
+          # No "|| true": a missing resource here aborts the job under set -e instead of silently passing.
           kubectl get serviceaccount argocd-ecr-token-sync -n "${ARGOCD_NAMESPACE}"
           kubectl get role argocd-ecr-token-sync -n "${ARGOCD_NAMESPACE}"
           kubectl get rolebinding argocd-ecr-token-sync -n "${ARGOCD_NAMESPACE}"
@@ -706,22 +689,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Rather than waiting up to six hours for the CronJob's own
-          # schedule, trigger one bounded, disposable Job run right now from
-          # the existing CronJob spec, so this workflow proves the
-          # multi-repository token sync actually works before it finishes.
-          # No short-lived ECR password is ever injected from GitHub Actions
-          # here -- this Job runs the exact same in-cluster IRSA-based
-          # script the CronJob already uses.
-          # run_attempt (not just run_id) is required: a GitHub Actions rerun
-          # reuses the same run_id but increments run_attempt, and failed
-          # validation Jobs are deliberately retained as evidence -- so a
-          # rerun must not collide with a still-retained failed Job's name.
+          # run_attempt (not just run_id): reruns keep the same run_id but bump run_attempt, and failed validation Jobs are retained as evidence, so the name must not collide with one still retained.
           JOB_NAME="ecr-token-sync-verify-${{ github.run_id }}-${{ github.run_attempt }}"
           # Kubernetes Job names must be <=63 chars, lowercase alphanumeric/hyphen.
           JOB_NAME="$(echo "$JOB_NAME" | tr '[:upper:]' '[:lower:]' | cut -c1-63 | sed -E 's/-+$//')"
 
           echo "Creating one-off Job ${JOB_NAME} from cronjob/argocd-ecr-token-sync in namespace ${ARGOCD_NAMESPACE}..."
+          # Triggers a bounded Job now instead of waiting for the CronJob's own schedule; reuses the CronJob's in-cluster IRSA script, no ECR password from GitHub Actions.
           kubectl create job "$JOB_NAME" \
             --from=cronjob/argocd-ecr-token-sync \
             -n "$ARGOCD_NAMESPACE"

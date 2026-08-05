@@ -1,14 +1,4 @@
-# Canonical GoldenGate deployment/topology source for dev. Consumed by
-# envs/dev/dynamodb.tf (CONFIG seed), monitoring/monitor (collector +
-# portal), the goldengate-monitor Helm ConfigMap, workflow validation, and
-# tests. This is the single source -- no other file repeats this data.
-#
-# Internal service host, TLS server name, and default ports are DERIVED,
-# never stored here:
-#   service host:  <name>.<runtimeNamespace>.svc.cluster.local
-#   TLS server name: <name>.<dnsDomain>
-#   admin port: 8443 unless overridden per deployment
-#   metrics port: 9015 unless overridden per deployment
+# Canonical GoldenGate deployment/topology source for dev (consumed by dynamodb.tf, the monitor, the goldengate-monitor Helm ConfigMap, and tests); service host/TLS name/ports are derived, not stored here.
 
 environment: dev
 runtimeNamespace: goldengate-dev

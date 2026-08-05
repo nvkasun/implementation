@@ -1,28 +1,4 @@
-"""hack/test-goldengate-metrics-config.py: Phase 6C1 offline tests.
-
-Covers two independent things, both entirely offline/mocked -- never a live
-AWS call:
-
-1. The existing GoldenGate custom-metric double-gate contract in
-   monitoring/monitor/collector.py (collector.py itself is never modified
-   by this phase) -- proves Global=false/CONFIG=false,
-   Global=false/CONFIG=true, and Global=true/CONFIG=false all construct no
-   CloudWatch client and issue no PutMetricData, while
-   Global=true/CONFIG=true reaches the publication boundary. Also proves
-   the metric/dimension contract (LagBreached/AbendFailure/DeploymentDown/
-   HeartbeatAgeSeconds with Deployment+DeploymentType; CriticalServiceDown
-   with +Service; ExtractLagSeconds/ReplicatLagSeconds/AbendState/
-   AbendEvent with +Process) is unchanged, and that no ProcessType/
-   ServiceName dimension has been introduced.
-
-2. hack/goldengate-metrics-config.py, the exact-conditional-update helper
-   piped into the gg-monitor pod by goldengate-monitor-metrics-config.yaml
-   -- using moto's emulated DynamoDB (same convention already established
-   in monitoring/monitor/tests/test_collector.py: @mock_aws + a real
-   boto3 Table backed by moto, never a live table).
-
-Run directly: python3 hack/test-goldengate-metrics-config.py
-"""
+"""Offline/mocked tests (no live AWS) for the CloudWatch double-gate metric contract in monitoring/monitor/collector.py and for the hack/goldengate-metrics-config.py DynamoDB update helper; run directly via `python3 hack/test-goldengate-metrics-config.py`."""
 from __future__ import annotations
 
 import importlib.util
@@ -68,9 +44,7 @@ def make_table():
 
 
 def load_helper_module():
-    """Fresh module object per call -- the helper has no import-time side
-    effects (all AWS access happens inside main()), so re-loading is cheap
-    and keeps tests independent."""
+    """Loads a fresh module object per call; safe/cheap since the helper has no import-time AWS side effects (all AWS access happens inside main())."""
     spec = importlib.util.spec_from_file_location("goldengate_metrics_config_helper", HELPER_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -78,18 +52,14 @@ def load_helper_module():
 
 
 def run_helper(argv):
-    """Runs the helper's main() with the given argv against
-    AWS_REGION=eu-west-1 / DYNAMODB_TABLE=gg-eks-pipeline, capturing stdout
-    and the exit code. Returns (exit_code, stdout_text)."""
+    """Runs the helper's main() with argv against AWS_REGION=eu-west-1 / DYNAMODB_TABLE=gg-eks-pipeline, capturing stdout+stderr; returns (exit_code, output_text)."""
     module = load_helper_module()
     buf = io.StringIO()
     old_argv = sys.argv
     sys.argv = ["goldengate-metrics-config.py"] + argv
     env_patch = {"AWS_REGION": "eu-west-1", "DYNAMODB_TABLE": "gg-eks-pipeline"}
     try:
-        # sys.exit("message") prints to stderr, not stdout -- both are
-        # captured into the same buffer so assertions can check either a
-        # normal report() line or a fail-closed usage/validation message.
+        # stdout and stderr share one buffer so assertions can check either a report() line or a fail-closed message.
         with mock.patch.dict(os.environ, env_patch, clear=False), \
              redirect_stdout(buf), redirect_stderr(buf):
             try:
@@ -99,13 +69,7 @@ def run_helper(argv):
                 if isinstance(exc.code, int):
                     code = exc.code
                 else:
-                    # sys.exit("message") only auto-prints its message via
-                    # the interpreter's own top-level handler for a truly
-                    # uncaught SystemExit -- catching it here ourselves
-                    # means that never happens automatically, so it is
-                    # replicated explicitly (matching real `python3 x.py`
-                    # subprocess behavior, where this would land on
-                    # stderr).
+                    # Catching SystemExit ourselves suppresses the interpreter's auto-print of exc.code, so replicate it on stderr (matching real `python3 x.py` behavior).
                     if exc.code:
                         print(exc.code, file=sys.stderr)
                     code = 1 if exc.code else 0
@@ -114,13 +78,7 @@ def run_helper(argv):
     return code, buf.getvalue()
 
 
-# ---------------------------------------------------------------------
-# Workflow functional-test infrastructure: extracts the ACTUAL committed
-# run: script text for a named step from the real workflow YAML (never a
-# reimplementation of it) and executes it under real bash, with a mocked
-# kubectl/jq PATH standing in for the cluster. This proves the exact
-# committed bash content behaves correctly, not a copy of its logic.
-# ---------------------------------------------------------------------
+# Workflow functional-test infrastructure: extracts the ACTUAL committed run: script text for a named step from the real workflow YAML and executes it under real bash with a mocked kubectl/jq PATH, proving the committed bash itself (not a reimplementation of it) behaves correctly.
 def _get_step(workflow_path, step_name):
     with open(workflow_path) as f:
         doc = yaml.safe_load(f)
@@ -132,10 +90,7 @@ def _get_step(workflow_path, step_name):
 
 
 def _workflow_top_level_env(workflow_path):
-    """Only the literal (non-${{ }}) values from the workflow's top-level
-    env: block -- these are constants the run: scripts reference directly
-    (e.g. TARGET_NAMESPACE), never a value that depends on live AWS/GitHub
-    context."""
+    """Returns only the literal (non-${{ }}) values from the workflow's top-level env: block -- constants like TARGET_NAMESPACE that run: scripts reference directly, never a live AWS/GitHub context value."""
     with open(workflow_path) as f:
         doc = yaml.safe_load(f)
     out = {}
@@ -147,17 +102,7 @@ def _workflow_top_level_env(workflow_path):
 
 def run_step_script(workflow_path, step_name, script_text, env_overrides, bin_dir=None, timeout=20,
                      gh_expression_overrides=None):
-    """Runs `script_text` (the real, extracted run: body, or a bounded
-    fragment of it) under bash. env_overrides simulates exactly what GitHub
-    Actions' own ${{ }} substitution would have injected into the step's
-    env: block -- the run: text itself is never modified/reimplemented.
-
-    gh_expression_overrides pre-substitutes any remaining literal
-    "${{ ... }}" text the same way the real GitHub Actions preprocessor
-    would, before bash ever parses the script -- needed only for
-    expressions Task 1 did not relocate to env: (goldengate-monitor.yaml's
-    ${{ inputs.metrics_gate_expectation }} choice input is out of Task 1's
-    scope, which applies only to goldengate-monitor-metrics-config.yaml)."""
+    """Runs the real, unmodified `script_text` under bash: env_overrides stands in for GitHub Actions' own ${{ }} substitution into the step's env: block, and gh_expression_overrides pre-substitutes any remaining literal "${{ ... }}" text the same way the GitHub Actions preprocessor would."""
     for literal, value in (gh_expression_overrides or {}).items():
         script_text = script_text.replace(literal, value)
     env = dict(os.environ)
@@ -176,9 +121,7 @@ def write_executable(path, content):
     os.chmod(path, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
 
-# ---------------------------------------------------------------------
-# Task 10: existing metric-contract / double-gate tests.
-# ---------------------------------------------------------------------
+# Existing metric-contract / double-gate tests.
 class MetricContractDoubleGateTests(unittest.TestCase):
     @staticmethod
     def _cfg(metrics_enabled):
@@ -285,10 +228,7 @@ class MetricContractDoubleGateTests(unittest.TestCase):
         self.assertEqual(core.CLOUDWATCH_NAMESPACE, "GoldenGate/Pipelines")
 
 
-# ---------------------------------------------------------------------
-# Task 11 (I, K partially at helper level, L, M, N, O): the exact
-# conditional-update helper.
-# ---------------------------------------------------------------------
+# The exact conditional-update helper.
 class MetricsConfigHelperTests(unittest.TestCase):
     PIPELINE = "gg-oracle-payments-01"
     TYPE = "oracle"
@@ -334,9 +274,7 @@ class MetricsConfigHelperTests(unittest.TestCase):
 
     @mock_aws
     def test_M_idempotent_target_performs_no_update_item(self):
-        # table is created via the real (not-yet-patched) boto3.resource,
-        # exactly like test_N below -- constructing the "real" reference
-        # AFTER boto3.resource is patched would just wrap another mock.
+        # table uses the real, not-yet-patched boto3.resource (like test_N below), since building it after patching would just wrap another mock.
         table = make_table()
         self._seed(table, self.PIPELINE, self.TYPE, metrics_enabled=True)
 
@@ -358,8 +296,7 @@ class MetricsConfigHelperTests(unittest.TestCase):
 
         def racing_get_item(*args, **kwargs):
             result = real_get_item(*args, **kwargs)
-            # Simulate a concurrent actor changing the item between this
-            # helper's own read and its own write.
+            # Simulate a concurrent actor changing the item between this helper's own read and its own write.
             table.update_item(
                 Key={"pipeline": self.PIPELINE, "recordType": "CONFIG"},
                 UpdateExpression="SET metricsEnabled = :v",
@@ -451,13 +388,7 @@ class MetricsConfigHelperTests(unittest.TestCase):
 
     @mock_aws
     def test_consistent_read_prevents_stale_value_causing_wrong_decision(self):
-        # Proves the initial GetItem's ConsistentRead=True actually matters:
-        # a get_item call WITHOUT ConsistentRead=True is made to return a
-        # fabricated stale (pre-write) value; a call WITH it delegates to
-        # the real, fresh, moto-backed data. Since the real helper always
-        # passes ConsistentRead=True, it must observe the fresh value
-        # (already == desired) and correctly decide no update is needed --
-        # never act on the stale replica.
+        # Proves ConsistentRead=True actually matters: a get_item call without it returns a fabricated stale value, so the helper -- which always passes ConsistentRead=True -- must observe the fresh (already-desired) value and decide no update is needed, never acting on the stale replica.
         table = make_table()
         self._seed(table, self.PIPELINE, self.TYPE, metrics_enabled=True)
         real_get_item = table.get_item
@@ -482,10 +413,7 @@ class MetricsConfigHelperTests(unittest.TestCase):
 
     @mock_aws
     def test_returned_all_new_attributes_are_validated_independently(self):
-        # The real DynamoDB write succeeds correctly (moto-backed), but the
-        # ALL_NEW Attributes the helper receives back are tampered with --
-        # proving the helper validates that response itself, not only the
-        # separate follow-up GetItem.
+        # The real (moto-backed) write succeeds, but the ALL_NEW Attributes returned are tampered with, proving the helper validates that response itself and not only the separate follow-up GetItem.
         table = make_table()
         self._seed(table, self.PIPELINE, self.TYPE, metrics_enabled=False)
         real_update_item = table.update_item
@@ -505,11 +433,7 @@ class MetricsConfigHelperTests(unittest.TestCase):
         self.assertIn("ALL_NEW attributes show metricsEnabled", out)
 
 
-# ---------------------------------------------------------------------
-# Task 7 corrections: static source-level invariants for
-# hack/goldengate-metrics-config.py and the two inline CONFIG readers in
-# goldengate-monitor.yaml.
-# ---------------------------------------------------------------------
+# Static source-level invariants for hack/goldengate-metrics-config.py and the two inline CONFIG readers in goldengate-monitor.yaml.
 class SourceLevelSafetyInvariantTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -543,8 +467,7 @@ class SourceLevelSafetyInvariantTests(unittest.TestCase):
         self.assertIn('new_attributes.get("deploymentType") != canonical_type', self.helper_source)
 
     def test_helper_retry_helper_never_calls_update_item(self):
-        # The bounded retry applies only to the verification read -- it
-        # must never be able to issue (or retry) an UpdateItem itself.
+        # The bounded retry applies only to the verification read -- it must never issue/retry an UpdateItem itself.
         idx = self.helper_source.index("def _consistent_verification_get_item")
         end = self.helper_source.index("# 1. Read the current CONFIG item")
         retry_fn_source = self.helper_source[idx:end]
@@ -554,26 +477,18 @@ class SourceLevelSafetyInvariantTests(unittest.TestCase):
         idx = self.helper_source.index('if code == "ConditionalCheckFailedException":')
         chunk = self.helper_source[idx:idx + 400]
         self.assertIn("Not retrying automatically", chunk)
-        # The ConditionalCheckFailedException branch must exit immediately
-        # (sys.exit), never loop back to retry update_item.
+        # The ConditionalCheckFailedException branch must exit immediately (sys.exit), never loop back to retry update_item.
         self.assertIn("sys.exit(", chunk)
 
     def test_monitor_workflow_inline_readers_use_consistent_read(self):
-        # Exactly two inline CONFIG-inventory readers exist (preflight +
-        # post-rollout verification), and both must request ConsistentRead.
+        # Exactly two inline CONFIG-inventory readers exist (preflight + post-rollout verification), and both must request ConsistentRead.
         self.assertEqual(self.monitor_workflow_text.count("ConsistentRead=True"), 2)
         self.assertEqual(
             self.monitor_workflow_text.count('table.get_item(Key={"pipeline": pipeline, "recordType": "CONFIG"}'),
             2)
 
 
-# ---------------------------------------------------------------------
-# Task 7 items 1-2: shell-injection-shaped input is never executed. Task 1
-# moved every user-controlled string input out of the run: script body and
-# into the step's env: block -- these tests prove the ACTUAL committed
-# run: text (unmodified) treats a malicious value as inert data even when
-# it contains command substitution / quote-breaking syntax.
-# ---------------------------------------------------------------------
+# Shell-injection-shaped input is never executed: user-controlled string input lives only in the step's env: block, so these tests prove the ACTUAL committed run: text (unmodified) treats a malicious value as inert data even when it contains command substitution / quote-breaking syntax.
 class ShellInjectionSafetyTests(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
@@ -631,11 +546,7 @@ class ShellInjectionSafetyTests(unittest.TestCase):
                     {"DEPLOYMENT_NAME": payload, "DESIRED": "true", "CONFIRMATION": payload},
                 )
                 self.assertFalse(os.path.exists(self.sentinel), f"injection payload executed: {payload!r}")
-                # A malicious value is never equal to "ENABLE <payload>" is
-                # actually possible by construction here (CONFIRMATION ==
-                # DEPLOYMENT_NAME), so assert on the sentinel only -- the
-                # important invariant is that nothing executed, regardless
-                # of the pass/fail verdict.
+                # CONFIRMATION == DEPLOYMENT_NAME here, so a coincidental "ENABLE <payload>" match is possible by construction -- only the sentinel is asserted on, since the invariant is that nothing executed, regardless of pass/fail verdict.
 
     def test_no_direct_input_substitution_anywhere_in_config_workflow_run_blocks(self):
         with open(METRICS_CONFIG_WORKFLOW_PATH) as f:
@@ -649,11 +560,7 @@ class ShellInjectionSafetyTests(unittest.TestCase):
                 self.assertNotIn("${{ inputs.confirmation }}", run, step.get("name"))
 
 
-# ---------------------------------------------------------------------
-# Task 7 items 3-4: the observation timestamp is captured before the
-# helper/UpdateItem runs (not after), and the post-update step reuses that
-# exact value rather than recomputing a later one.
-# ---------------------------------------------------------------------
+# The observation timestamp is captured before the helper/UpdateItem runs (not after), and the post-update step reuses that exact value rather than recomputing a later one.
 class TimestampOrderingTests(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
@@ -674,10 +581,7 @@ class TimestampOrderingTests(unittest.TestCase):
         run_text = step["run"]
         self.assertNotIn("${{ inputs.deployment_name }}", run_text)
 
-        # Mock kubectl: when invoked for "exec", checks whether
-        # VALIDATION_START_TS has ALREADY been appended to GITHUB_ENV --
-        # if not, this proves the real committed script tried to run the
-        # helper before capturing the timestamp.
+        # Mock kubectl: on "exec", fails unless VALIDATION_START_TS was already appended to GITHUB_ENV, proving the real committed script captures the timestamp before running the helper.
         write_executable(os.path.join(self.bin_dir, "kubectl"), f"""#!/usr/bin/env bash
 if [ "$1" = "exec" ]; then
   if ! grep -q '^VALIDATION_START_TS=' "{self.github_env}" 2>/dev/null; then
@@ -739,22 +643,14 @@ exit 1
             self.assertEqual(f.read(), "")
 
     def test_post_update_step_never_recomputes_timestamp(self):
-        # Static: the post-update-observation step's run: text must not
-        # contain a fresh `date -u` capture -- it only ever reads
-        # VALIDATION_START_TS inherited via GITHUB_ENV.
+        # Static check: the post-update-observation step must not contain a fresh `date -u` capture -- it only reads VALIDATION_START_TS inherited via GITHUB_ENV.
         step = _get_step(METRICS_CONFIG_WORKFLOW_PATH, "Post-update observation")
         run_text = step["run"]
         self.assertNotIn('VALIDATION_START_TS="$(date -u', run_text)
         self.assertIn('VALIDATION_START_TS:-', run_text)  # fails closed if unset
 
     def test_post_update_log_retrieval_uses_the_inherited_timestamp_unmodified(self):
-        # Functional: extracts the real committed fragment starting at the
-        # log-retrieval echo (skipping the real 90s sleep, which is
-        # orthogonal to which timestamp value gets used) and proves
-        # `kubectl logs --since-time=` receives EXACTLY the pre-set
-        # (inherited) VALIDATION_START_TS, never a freshly computed one --
-        # this is the property that guarantees an error emitted immediately
-        # after UpdateItem falls inside the observation window.
+        # Functional check (skips the real 90s sleep, orthogonal to which timestamp is used): proves `kubectl logs --since-time=` receives EXACTLY the pre-set VALIDATION_START_TS, never a freshly computed one -- the property that guarantees an error right after UpdateItem falls inside the observation window.
         step = _get_step(METRICS_CONFIG_WORKFLOW_PATH, "Post-update observation")
         run_text = step["run"]
         marker = 'echo "Retrieving current gg-monitor logs since ${VALIDATION_START_TS}...'
@@ -788,10 +684,7 @@ exit 1
         self.assertEqual(captured, sentinel_ts)
 
 
-# ---------------------------------------------------------------------
-# Task 7 item 12: the helper action must be exactly one of none/plan/
-# updated -- never a silently empty/unknown output.
-# ---------------------------------------------------------------------
+# The helper action must be exactly one of none/plan/updated -- never a silently empty/unknown output.
 class HelperActionValidationTests(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
@@ -853,13 +746,7 @@ exit 1
         self.assertIn("is not one of none, plan, updated", proc.stdout + proc.stderr)
 
 
-# ---------------------------------------------------------------------
-# Task 7 item 11: the main workflow's CloudWatch preflight verifies
-# Deployment/ReplicaSet ownership, not just a label match. Extracts the
-# real committed pod-selection fragment (step start through the "Using the
-# existing monitor pod" success echo) and drives it against a mocked
-# kubectl/jq backed by JSON fixtures.
-# ---------------------------------------------------------------------
+# The main workflow's CloudWatch preflight verifies Deployment/ReplicaSet ownership, not just a label match: extracts the real committed pod-selection fragment and drives it against a mocked kubectl/jq backed by JSON fixtures.
 class MainWorkflowPodOwnershipTests(unittest.TestCase):
     DEPLOY_UID = "dep-uid-current"
     STALE_DEPLOY_UID = "dep-uid-STALE"
@@ -956,9 +843,7 @@ exit 1
         self.assertIn("Using the existing monitor pod for this read-only preflight: gg-monitor-abc", proc.stdout)
 
     def test_rejects_pod_owned_by_a_stale_replicaset(self):
-        # The ReplicaSet exists and owns the pod, but that ReplicaSet's own
-        # controller Deployment UID does not match the CURRENT gg-monitor
-        # Deployment -- a stale/orphaned ReplicaSet from a prior rollout.
+        # The ReplicaSet owns the pod, but its own controller Deployment UID doesn't match the CURRENT gg-monitor Deployment -- a stale/orphaned ReplicaSet from a prior rollout.
         self._write_fixtures(
             pods=[self._pod("gg-monitor-old")],
             rs_owner_uid_by_name={"gg-monitor-rs-current": self.STALE_DEPLOY_UID},

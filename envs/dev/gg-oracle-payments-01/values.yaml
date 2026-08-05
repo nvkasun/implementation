@@ -1,7 +1,4 @@
-# Oracle GoldenGate runtime, single-runtime deployment model.
-# Runtime identity (name, OGG_DEPLOYMENT, Service/Secret/StorageClass/
-# Ingress names) derives from Release.Name (this folder's basename) --
-# see helm/goldengate/templates/_helpers.tpl.
+# Oracle GoldenGate runtime, single-runtime deployment model; runtime identity derives from Release.Name (see helm/goldengate/templates/_helpers.tpl).
 deployment:
   enabled: true
 
@@ -31,9 +28,7 @@ runtime:
 
     admin:
       enabled: true
-      # TEMPORARY: shared POC Secrets Manager object, reused across
-      # payments-ora-to-pg-* deployments. A later phase should scope this
-      # per deployment.
+      # TEMPORARY: shared POC Secrets Manager object reused across payments-ora-to-pg-* deployments; a later phase should scope this per deployment.
       objectName: dev/goldengate/source/admin
       objectType: secretsmanager
       mountPath: /mnt/secrets-store/admin
@@ -61,8 +56,7 @@ runtime:
     enabled: true
     mode: "0777"
 
-  # gg-oracle-sa is a shared, engine-level identity owned by
-  # helm/goldengate-platform -- never created here.
+  # gg-oracle-sa is a shared, engine-level identity owned by helm/goldengate-platform -- never created here.
   serviceAccount:
     create: false
     name: gg-oracle-sa
@@ -131,8 +125,7 @@ tolerations: []
 
 affinity: {}
 
-# reclaimPolicy: Retain -- GoldenGate storage holds trail/checkpoint/
-# recovery state and must survive PVC deletion.
+# reclaimPolicy: Retain -- GoldenGate storage holds trail/checkpoint/recovery state and must survive PVC deletion.
 persistence:
   enabled: true
   provider: efs

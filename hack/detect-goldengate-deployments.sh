@@ -1,34 +1,8 @@
 #!/usr/bin/env bash
-# Detects which GoldenGate deployment folders under envs/dev/ should be
-# built/updated (deployment_matrix) and which should be deleted
-# (deletion_matrix) for this push/workflow_dispatch run. This is the real,
-# single production implementation -- .github/workflows/goldengate-eks-app.yaml
-# only wraps this script (env: mapping + `bash hack/detect-goldengate-deployments.sh`),
-# it never re-implements any of this logic inline.
-#
-# Required environment (all opaque string data -- never treated as shell
-# source, only ever read via "$VAR"):
-#   INPUT_ENVIRONMENT   -- workflow_dispatch input: target environment
-#   INPUT_DEPLOYMENT_ID -- workflow_dispatch input: deployment_id
-#   INPUT_DEPLOY        -- workflow_dispatch input: deploy (true/false)
-#   EVENT_NAME          -- github.event_name (e.g. "push", "workflow_dispatch")
-#   BEFORE_SHA          -- github.event.before (push trigger only; may be empty)
-#   AFTER_SHA           -- github.sha
-#   GITHUB_OUTPUT       -- path to the GitHub Actions step output file
-#
-# Writes exactly four step outputs to GITHUB_OUTPUT, format/field names
-# unchanged from the original inline implementation:
-#   has_changes, deployment_matrix, has_deletions, deletion_matrix
+# Builds deployment_matrix/deletion_matrix step outputs for envs/dev/ GoldenGate deployments; the single implementation wrapped by .github/workflows/goldengate-eks-app.yaml.
 set -euo pipefail
 
-# Returns 0 (active) or 1 (inactive) on stdout as a one-line
-# reason, for a given envs/dev/<id>/values.yaml path. A deployment
-# is inactive if: the file is missing, empty, comment-only, parses
-# to null/empty YAML, or explicitly disables itself via
-# enabled: false, deployment.enabled: false, or
-# lifecycle.state: absent. Prefers PyYAML (safe, full parse) and
-# falls back to conservative text patterns only if PyYAML isn't
-# installed on the runner -- never installs anything.
+# Returns 0/1 (active/inactive) with a one-line reason on stdout; inactive if missing/empty/comment-only/null YAML, or enabled:false/deployment.enabled:false/lifecycle.state:absent; prefers PyYAML, falls back to text patterns.
 is_active_deployment_values_file() {
   local values_file="$1"
 
@@ -63,8 +37,7 @@ if not non_comment_lines:
 try:
     import yaml
 except ImportError:
-    # Conservative fallback without PyYAML: only recognizes the three
-    # documented disable-flag shapes, not arbitrary YAML nesting.
+    # Fallback without PyYAML: only recognizes the three documented disable-flag shapes, not arbitrary YAML nesting.
     if re.search(r'(?m)^\s*enabled\s*:\s*false\s*$', raw):
         print("enabled=false (text fallback, PyYAML unavailable)")
         sys.exit(1)
@@ -149,37 +122,7 @@ PYEOF
   return 0
 }
 
-# Strict, fail-closed YAML classifier shared by every GoldenGate-
-# deployment classification call site in this workflow. No regex/
-# text fallback: this repository's runner is required (see
-# "Verify Python and PyYAML prerequisites" in the workflow) to have
-# python3 + PyYAML, so a values file only ever qualifies after actual YAML
-# parsing. $1 is a path to a file already known to exist and be
-# non-empty (the two callers below each check that themselves,
-# since a working-tree file and a git-show'd temp file have
-# different "missing"/"empty" semantics). $2 is a comma-separated
-# list of the deploymentModel values this call site accepts --
-# there is no built-in default set here, and a value outside that
-# list is never silently accepted no matter which caller invokes
-# this.
-#
-# Two explicit, distinct contracts share this one parser:
-#   ACTIVE CONTRACT ($2="singleRuntime", via
-#   is_goldengate_deployment_values_file below): used by
-#   workflow_dispatch validation, the active push build/update
-#   matrix, and the build/deploy job. legacyPair, missing, and
-#   unknown models all fail closed here -- excluded from every
-#   active path, never inferred or defaulted to anything.
-#   HISTORICAL DELETION CONTRACT ($2="singleRuntime,legacyPair",
-#   via is_goldengate_deployment_values_file_at_ref below): used
-#   only to classify a deployment's content as it existed at a
-#   *previous* Git revision, for deletion purposes -- a removed/
-#   renamed file, or the base-revision fallback for a current file
-#   that was deliberately emptied. legacyPair still classifies
-#   correctly here because a historical legacyPair deployment must
-#   remain deletable even though the model is no longer
-#   deployable. An unrecognized value still fails closed and is
-#   never defaulted under this contract either.
+# Strict, fail-closed YAML classifier (no regex/text fallback; requires PyYAML) shared by both contracts below: $1 is a values file already known to exist/be non-empty, $2 is the comma-separated list of deploymentModel values this call site accepts.
 _classify_deployment_model_yaml() {
   local content_file="$1"
   local allowed_models_csv="$2"
@@ -229,23 +172,7 @@ PYEOF
   return $?
 }
 
-# ACTIVE CONTRACT. Returns 0 (is an actively deployable GoldenGate
-# runtime deployment values file) or 1 (is not) on stdout as a
-# one-line reason, for a given envs/dev/<id>/values.yaml path in
-# the current working tree. Classification is based solely on
-# content -- never on directory name, and never on
-# deployment.enabled/lifecycle.state (that is a separate,
-# orthogonal active/inactive concern handled by
-# is_active_deployment_values_file above). A file only qualifies
-# when it is a non-empty, valid YAML mapping whose top-level
-# deploymentModel is a string exactly equal to "singleRuntime" --
-# legacyPair is a historical-only model and is rejected here just
-# like any other unrecognized value, never accepted or defaulted.
-# This is what keeps unrelated envs/dev/<x>/ values files (e.g.
-# the separate goldengate-monitor chart's own values, or Argo
-# CD's own values) -- and any legacyPair deployment someone might
-# try to (re)introduce -- out of every active GoldenGate workflow
-# path, without hardcoding folder names.
+# ACTIVE CONTRACT: qualifies only a non-empty, valid YAML mapping whose deploymentModel is exactly "singleRuntime" (legacyPair and unrecognized values fail closed); content-based only, independent of the enabled/lifecycle check above.
 is_goldengate_deployment_values_file() {
   local values_file="$1"
 
@@ -263,19 +190,7 @@ is_goldengate_deployment_values_file() {
   return $?
 }
 
-# HISTORICAL DELETION CONTRACT. Same shape of classification
-# (0/1 plus a one-line reason on stdout), applied to a values
-# file's content as it existed at a specific Git revision (never
-# the working tree) -- used only for a removed/renamed deletion
-# candidate, or the base-revision fallback for a current file that
-# was deliberately emptied, whose current working-tree content no
-# longer reflects what needs classifying. Accepts singleRuntime
-# *and* legacyPair, since a historical legacyPair deployment must
-# still be classifiable for deletion even though legacyPair is no
-# longer an active, deployable model. Fails closed (returns 1,
-# never defaults to any deploymentModel) when the path did not
-# exist at that revision, was empty, or fails the same strict
-# YAML/mapping/deploymentModel checks as the working-tree version.
+# HISTORICAL DELETION CONTRACT: classifies content at a specific Git revision (never the working tree), for a removed/renamed candidate or an emptied current file; accepts singleRuntime and legacyPair since a historical legacyPair must remain deletable.
 is_goldengate_deployment_values_file_at_ref() {
   local ref="$1"
   local path="$2"
@@ -302,9 +217,7 @@ is_goldengate_deployment_values_file_at_ref() {
   return $status
 }
 
-# Inert assignment only -- $EVENT_NAME/$INPUT_* arrive as opaque string data
-# through the workflow step's env: mapping (never interpolated GitHub
-# expression syntax), and are only ever read here via "$VAR".
+# $EVENT_NAME/$INPUT_* arrive as opaque data via the workflow step's env: mapping (never interpolated GitHub expression syntax).
 if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
   ENVIRONMENT="$INPUT_ENVIRONMENT"
   DEPLOYMENT_ID="$INPUT_DEPLOYMENT_ID"
@@ -322,10 +235,7 @@ if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
   echo "Manual workflow_dispatch trigger for deployment_id=${DEPLOYMENT_ID}, environment=${ENVIRONMENT}."
   echo "Validating deployment values file: ${VALUES_FILE}"
 
-  # Fail closed: a manually requested deployment_id must resolve to
-  # an actual GoldenGate runtime deployment values file (never a
-  # different chart's values under envs/dev/, e.g. the shared
-  # monitor's or Argo CD's own values file).
+  # Fail closed: deployment_id must resolve to an actual GoldenGate values file, never a different chart's values (e.g. monitor/Argo CD).
   set +e
   GG_REASON="$(is_goldengate_deployment_values_file "$VALUES_FILE")"
   GG_STATUS=$?
@@ -338,10 +248,7 @@ if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
     exit 1
   fi
 
-  # GG_REASON is exactly "deploymentModel=singleRuntime" on success
-  # under the active contract (the only value it ever accepts) --
-  # carried into the matrix below so the build job never has to
-  # re-infer or default deploymentModel itself.
+  # GG_REASON is exactly deploymentModel=singleRuntime on success; carried into the matrix so the build job never re-infers it.
   ACTIVE_DEPLOYMENT_MODEL="${GG_REASON#deploymentModel=}"
 
   set +e
@@ -376,9 +283,7 @@ fi
 
 echo "Push trigger. Detecting changed deployment folders under envs/dev/ and helm/goldengate/..."
 
-# BEFORE_SHA/AFTER_SHA arrive as opaque string data via the workflow step's
-# env: mapping (EVENT_NAME/BEFORE_SHA/AFTER_SHA), already set in the
-# environment -- read here via "$VAR" only, never re-interpolated.
+# BEFORE_SHA/AFTER_SHA arrive as opaque data via the workflow step's env: mapping, read only via "$VAR".
 EMPTY_TREE_SHA="4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
 if [ -z "$BEFORE_SHA" ] || [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
@@ -403,13 +308,7 @@ DELETION_MATRIX_ITEMS="[]"
 ACTIVE_LOG=""
 INACTIVE_LOG=""
 
-# envs/dev/argocd/ holds Argo CD's own values file, deployed by the
-# separate argocd-eks-deployment.yaml workflow. It is never a
-# GoldenGate deployment and must be excluded here.
-#
-# Selection reason: a shared Helm chart change affects every active
-# deployment, so it selects all active deployments. A deployment-
-# values-only change only affects its own folder.
+# Excludes envs/dev/argocd/ (Argo CD's own values, not a GoldenGate deployment); chart-wide changes select all active deployments, otherwise only changed folders.
 if [ "$CHART_CHANGED" = "true" ]; then
   echo "Selection reason: shared GoldenGate Helm chart changed. Selecting all active dev deployments."
 
@@ -429,15 +328,7 @@ fi
 for DEPLOYMENT_ID in $DEPLOYMENT_CANDIDATE_IDS; do
   VALUES_FILE="envs/dev/${DEPLOYMENT_ID}/values.yaml"
 
-  # Applies to both shared-chart-change candidates (every
-  # envs/dev/<id>/values.yaml) and per-folder push candidates:
-  # only a values file whose own deploymentModel is singleRuntime
-  # (the active contract -- legacyPair fails closed here just like
-  # any other unrecognized value) is ever eligible for the active
-  # build/update matrix -- never inferred from folder name, so a
-  # different chart's values file under envs/dev/ (e.g. the shared
-  # monitor's or Argo CD's own), or a legacyPair deployment, is
-  # excluded here regardless of trigger reason.
+  # Only a values file whose own deploymentModel is singleRuntime is ever eligible (never inferred from folder name).
   set +e
   GG_REASON="$(is_goldengate_deployment_values_file "$VALUES_FILE")"
   GG_STATUS=$?
@@ -448,10 +339,7 @@ for DEPLOYMENT_ID in $DEPLOYMENT_CANDIDATE_IDS; do
     continue
   fi
 
-  # GG_REASON is exactly "deploymentModel=singleRuntime" on success
-  # under the active contract -- carried into the matrix entry
-  # below so the build job never has to re-infer or default
-  # deploymentModel itself.
+  # GG_REASON is exactly deploymentModel=singleRuntime here too; carried into the matrix entry below.
   ACTIVE_DEPLOYMENT_MODEL="${GG_REASON#deploymentModel=}"
 
   set +e
@@ -479,9 +367,7 @@ NAME_STATUS="$(git diff --name-status "$BEFORE_SHA" "$AFTER_SHA" -- 'envs/dev/**
 echo "Name-status diff under envs/dev/ and helm/goldengate/:"
 echo "${NAME_STATUS:-<none>}"
 
-# A path is a deletion candidate when it was removed (D) or is the
-# old side of a rename (R). Only envs/dev/<id>/ paths matter here;
-# helm/goldengate/** changes never produce a deployment deletion.
+# Deletion candidates are removed (D) or renamed-away (R) envs/dev/<id>/ paths; helm/goldengate/** changes never produce a deletion.
 REMOVED_PATH_IDS="$(echo "$NAME_STATUS" \
   | awk '$1 ~ /^D/ { print $2 } $1 ~ /^R/ { print $2 }' \
   | grep -E '^envs/dev/[^/]+/' \
@@ -489,9 +375,7 @@ REMOVED_PATH_IDS="$(echo "$NAME_STATUS" \
   | sed -E 's#^envs/dev/([^/]+)/.*#\1#' \
   | sort -u || true)"
 
-# Deployments whose values.yaml itself changed (added/modified) in
-# this push must be re-checked too: the file can still exist but
-# have just become comment-only/empty/disabled.
+# Also re-check deployments whose values.yaml changed in this push -- it may have just become comment-only/empty/disabled.
 CHANGED_VALUES_IDS="$(echo "$CHANGED_FILES" \
   | grep -E '^envs/dev/[^/]+/values\.yaml$' \
   | grep -v '^envs/dev/argocd/' \
@@ -503,18 +387,7 @@ DELETION_CANDIDATE_IDS="$(printf '%s\n%s\n' "$REMOVED_PATH_IDS" "$CHANGED_VALUES
 for CANDIDATE_ID in $DELETION_CANDIDATE_IDS; do
   VALUES_FILE="envs/dev/${CANDIDATE_ID}/values.yaml"
 
-  # Classify once, from whichever source actually has content: the
-  # working tree when the file still exists (was modified, not
-  # removed/renamed), otherwise its content at the base revision
-  # (BEFORE_SHA) -- the last point a removed/renamed file's
-  # content can still be read. Fails closed either way: a
-  # candidate that does not resolve to a valid GoldenGate
-  # deploymentModel (singleRuntime/legacyPair) from EITHER source
-  # is never added to the deletion matrix, and is never assumed to
-  # be legacyPair (or any other value) by default. This is what
-  # keeps a removed/renamed different-chart values file (e.g. the
-  # separate goldengate-monitor chart's own, or Argo CD's own)
-  # from ever entering the GoldenGate deletion matrix.
+  # Classify from the working tree if the file still exists, otherwise from its content at BEFORE_SHA; fails closed either way, never defaults to a model.
   if [ -f "$VALUES_FILE" ]; then
     GG_SOURCE="working tree"
     set +e
@@ -525,13 +398,7 @@ for CANDIDATE_ID in $DELETION_CANDIDATE_IDS; do
     if [ "$GG_STATUS" -ne 0 ]; then
       case "$GG_REASON" in
         "empty values.yaml"|"empty/comment-only values.yaml"|"empty/null parsed YAML")
-          # The file still exists but was deliberately emptied
-          # (zero-byte, whitespace/comment-only, or YAML null) --
-          # this is a recognized intentional-deletion shape, not a
-          # classification failure. Fall back to the previous
-          # valid content at the base revision to determine
-          # whether it used to be a genuine GoldenGate deployment
-          # and, if so, which deploymentModel it was.
+          # Deliberately emptied file (zero-byte/comment-only/null YAML) is an intentional-deletion shape; fall back to its content at the base revision.
           echo "${VALUES_FILE} is now deliberately empty (${GG_REASON}). Checking its previous content at base revision (${BEFORE_SHA})..."
           GG_SOURCE="base revision (${BEFORE_SHA}), current file deliberately emptied"
           set +e
@@ -540,18 +407,13 @@ for CANDIDATE_ID in $DELETION_CANDIDATE_IDS; do
           set -e
           ;;
         "unparsable YAML:"*|"parsed YAML is not a mapping")
-          # Malformed or structurally invalid current YAML is
-          # never treated as an intentional deletion signal, and
-          # never silently ignored either -- fail the workflow
-          # closed with a clear error so the mistake is visible.
+          # Malformed/invalid YAML is not an intentional-deletion signal -- fail the workflow closed instead of ignoring it.
           echo "FAIL: ${VALUES_FILE} could not be classified: ${GG_REASON}"
           echo "This is not a recognized intentional-deletion shape (missing, zero-byte, whitespace/comment-only, or YAML null) -- it looks like invalid content instead. Fix or intentionally empty the file, or remove it entirely, before this push can be processed."
           exit 1
           ;;
         *)
-          # A syntactically valid mapping that simply isn't a
-          # GoldenGate deployment (no/unknown deploymentModel) --
-          # not a deletion signal, not an error either.
+          # Valid mapping but not a GoldenGate deployment -- not a deletion signal, not an error.
           ;;
       esac
     fi
@@ -568,11 +430,7 @@ for CANDIDATE_ID in $DELETION_CANDIDATE_IDS; do
     continue
   fi
 
-  # GG_REASON is exactly "deploymentModel=<singleRuntime|legacyPair>"
-  # on success (see _classify_deployment_model_yaml) -- the
-  # deployment_model placed in the deletion matrix below comes
-  # directly from this same successfully parsed and classified
-  # document, never re-derived separately.
+  # GG_REASON is deploymentModel=<singleRuntime|legacyPair> on success; the deletion matrix's deployment_model comes directly from it.
   CANDIDATE_DEPLOYMENT_MODEL="${GG_REASON#deploymentModel=}"
 
   set +e
@@ -581,13 +439,7 @@ for CANDIDATE_ID in $DELETION_CANDIDATE_IDS; do
   set -e
 
   if [ "$STATUS" -ne 0 ]; then
-    # deployment.enabled=false is a "retired but retained" signal
-    # only: the values folder is kept for rollback/reference and
-    # must never drive live Argo CD Application or namespace
-    # deletion. Only a genuinely removed file (missing/deleted) or
-    # an explicit lifecycle.state=absent is treated as a real
-    # deletion request. enabled=false (top-level) is treated the
-    # same as deployment.enabled=false here for consistency.
+    # deployment.enabled=false (or top-level enabled=false) is retired-but-retained -- never drives deletion; only a removed file or lifecycle.state=absent does.
     case "$REASON" in
       deployment.enabled=false*|enabled=false*)
         echo "Inactive (retained, not deleted): ${CANDIDATE_ID} (${REASON})"
@@ -609,9 +461,7 @@ for CANDIDATE_ID in $DELETION_CANDIDATE_IDS; do
   fi
 done
 
-# Deletion wins: drop any ID from the deployment matrix that also
-# ended up in the deletion matrix (e.g. a deployment that changed
-# to inactive content in the same push helm/goldengate/** changed).
+# Deletion wins: drop any ID from the deployment matrix that also ended up in the deletion matrix.
 DEPLOYMENT_MATRIX_ITEMS="$(echo "$DEPLOYMENT_MATRIX_ITEMS" | jq -c \
   --argjson deletions "$DELETION_MATRIX_ITEMS" \
   '[ .[] | select(.deployment_id as $id | ($deletions | map(.deployment_id) | index($id)) == null) ]')"

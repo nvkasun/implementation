@@ -2,21 +2,7 @@ name: Cloud Factory - CloudWatch Observability artifact sync
 
 run-name: "Cloud Factory - CloudWatch Observability artifact sync (Phase 6B1) ran by ${{ github.actor }}"
 
-# Phase 6B1 ONLY: private supply-chain mirroring and verification for the
-# upstream amazon-cloudwatch-observability Helm chart and its required
-# container images. This workflow performs NO Kubernetes/EKS operation of
-# any kind -- no kubectl, no helm install/upgrade, no Argo CD Application,
-# no Terraform. It only reads an upstream chart/images, verifies them, and
-# writes them into this account's own private ECR (229410149234).
-#
-# Deploying amazon-cloudwatch-observability to the gg-poc-dev cluster (as a
-# separate Argo CD Application) and any IAM identity-policy update to
-# GoldenGateArgocdECRRead-dev are later, explicitly separate phases
-# (6B2+). Do not extend this workflow to perform them.
-#
-# workflow_dispatch only, deliberately no push trigger -- this is a manual,
-# occasional supply-chain sync, not something that should fire on every
-# commit.
+# Supply-chain mirroring/verification only (no kubectl/helm install/Argo CD/Terraform); manual dispatch only, no push trigger.
 on:
   workflow_dispatch: {}
 
@@ -29,31 +15,20 @@ env:
   ECR_ACCOUNT_ID: "229410149234"
   ECR_REGISTRY: 229410149234.dkr.ecr.eu-west-1.amazonaws.com
 
-  # Same role already used by push_docker_images_to_ECR.yaml -- this
-  # workflow follows the exact same image-sync AWS identity pattern, not a
-  # new/different role.
-  ROLE_ARN: arn:aws:iam::229410149234:role/adcb-modelmonitoring-sit-codep-rDeployCodeBuildRole-KMCFNIKqpuUL
+  ROLE_ARN: arn:aws:iam::229410149234:role/adcb-modelmonitoring-sit-codep-rDeployCodeBuildRole-KMCFNIKqpuUL  # same role as push_docker_images_to_ECR.yaml
 
-  # EKS workload account whose node/pod IAM identity needs pull access to
-  # the four mirrored image repositories (never to the Helm chart
-  # repository -- that gets a separate, narrower policy for the Argo CD
-  # chart-read role only, applied below).
+  # EKS_WORKLOAD_ACCOUNT_ID gets pull access only to the four mirrored image repos, never to the chart repo (that gets ARGOCD_ECR_READ_ROLE_ARN below).
   EKS_WORKLOAD_ACCOUNT_ID: "668311715351"
   ARGOCD_ECR_READ_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateArgocdECRRead-dev
 
-  # Pinned upstream chart. Never "latest" -- a specific, verified version
-  # only.
-  UPSTREAM_CHART_REPO_NAME: aws-observability
+  UPSTREAM_CHART_REPO_NAME: aws-observability  # pinned version below; never "latest"
   UPSTREAM_CHART_REPO_URL: https://aws-observability.github.io/helm-charts
   CHART_NAME: amazon-cloudwatch-observability
   CHART_VERSION: "6.2.0"
   HELM_OCI_NAMESPACE: helm
   CHART_ECR_REPOSITORY: helm/amazon-cloudwatch-observability
 
-  # clusterName/region are only rendering inputs for the mandatory
-  # validation-values render below (helm template never contacts a
-  # cluster) -- this workflow never connects to gg-poc-dev.
-  RENDER_CLUSTER_NAME: gg-poc-dev
+  RENDER_CLUSTER_NAME: gg-poc-dev  # rendering input only for the validation-values template; helm template never contacts a cluster
   RENDER_REGION: eu-west-1
 
   WORKDIR: work
@@ -66,12 +41,7 @@ jobs:
   mirror_and_verify:
     name: Mirror and verify the amazon-cloudwatch-observability supply chain (Phase 6B1)
 
-    # Deliberately NOT the private CodeBuild runner used by every other
-    # deployment workflow in this repository: this job needs outbound
-    # internet access to the public aws-observability Helm repository and
-    # to public.ecr.aws/registry.k8s.io/quay.io, which the private runner
-    # does not have. Same reasoning as push_docker_images_to_ECR.yaml.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest  # not the private CodeBuild runner: needs outbound internet to the public Helm repo and public.ecr.aws/registry.k8s.io/quay.io
 
     steps:
       - name: Checkout repository
@@ -139,12 +109,7 @@ jobs:
 
           mkdir -p "$WORKDIR"
 
-          # source_ref|target_repository|target_tag -- exactly the four
-          # images required for the approved metrics-only render. This one
-          # table drives repository creation, EKS pull policy, mirroring,
-          # digest recording, and (combined with the live helm-template
-          # render) the mandatory rendered-image-set verification below --
-          # never five separately hand-maintained lists that could drift.
+          # source_ref|target_repository|target_tag: single source of truth driving repo creation, pull policy, mirroring, digests, and the rendered-image-set check.
           cat > "$WORKDIR/image-table.psv" <<'EOF'
           public.ecr.aws/cloudwatch-agent/cloudwatch-agent-operator:3.4.2|aws-cloud-factory-cloudwatch-agent-operator|3.4.2
           public.ecr.aws/cloudwatch-agent/cloudwatch-agent:1.300069.0b1529|aws-cloud-factory-cloudwatch-agent|1.300069.0b1529
@@ -201,13 +166,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Validation only -- this file is never used to deploy anything;
-          # it exists solely so `helm template` can render the exact
-          # future metrics-only configuration for the mandatory
-          # rendered-image-set check below. containerLogs/containerInsights
-          # log collection and Application Signals are disabled: Fluent
-          # Bit (helm/goldengate-platform) remains the sole log collector,
-          # and this chart is metrics-only per the approved architecture.
+          # Validation only, never deployed: renders the metrics-only config used by the rendered-image-set check below (Fluent Bit stays the sole log collector).
           cat > "${WORKDIR}/validate-values.yaml" <<EOF
           clusterName: ${RENDER_CLUSTER_NAME}
           region: ${RENDER_REGION}
@@ -255,17 +214,9 @@ jobs:
             --values "${WORKDIR}/validate-values.yaml" \
             > "${WORKDIR}/rendered.yaml"
 
-          # Expected image set is derived from the single image-table.psv
-          # written above -- never a second, independently-maintained
-          # list that could silently drift from what this workflow
-          # actually mirrors.
-          cut -d'|' -f1 "${WORKDIR}/image-table.psv" | sort -u > "${WORKDIR}/expected-images.txt"
+          cut -d'|' -f1 "${WORKDIR}/image-table.psv" | sort -u > "${WORKDIR}/expected-images.txt"  # expected set derived from image-table.psv, never a second hand-maintained list
 
-          # Mandatory rendered-image-set verification: recursively walk
-          # every rendered Kubernetes document (not a manually maintained
-          # image list, not a text grep) and collect every "image:" field
-          # anywhere in the tree -- covers containers, initContainers, and
-          # any other embedded image reference (e.g. inside a CRD spec).
+          # Recursively walks every rendered document for any "image:" field (containers, initContainers, CRD specs, etc.), not just a text grep.
           python3 - "${WORKDIR}/rendered.yaml" <<'PYEOF' > "${WORKDIR}/rendered-images.txt"
           import sys, yaml
 
@@ -305,9 +256,7 @@ jobs:
           fi
           echo "OK: rendered image set is exactly the four approved upstream images (no fifth image, no Fluent Bit, no GPU/Neuron, no Application Signals auto-instrumentation)."
 
-          # Explicit forbidden-image guard in addition to the exact-set
-          # diff above -- makes the specific, named exclusions visible in
-          # the log even though the diff above already enforces them.
+          # Named-exclusion guard, redundant with the exact-set diff above but keeps the specific forbidden images visible in the log.
           for forbidden in "aws-for-fluent-bit" "dcgm-exporter" "neuron-monitor" "adot-autoinstrumentation" "cloudwatch-agent-target-allocator"; do
             if grep -qi -- "$forbidden" "${WORKDIR}/rendered-images.txt"; then
               echo "FAIL: forbidden image reference '${forbidden}' found in the rendered image set."
@@ -415,11 +364,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Resource (repository) policy only -- this is NOT the Phase 6B2
-          # identity-policy update to GoldenGateArgocdECRRead-dev itself;
-          # envs/dev/policies/argocd-ecr-oci-read-dev/ is untouched by this
-          # workflow. Same pattern already used for the goldengate-platform
-          # chart repository.
+          # Resource (repository) policy only; the GoldenGateArgocdECRRead-dev identity policy itself (envs/dev/policies/argocd-ecr-oci-read-dev/) is untouched by this workflow.
           ARGOCD_SID="AllowArgocdEksRolePullAmazonCloudwatchObservabilityHelmChart"
 
           EXISTING_POLICY="$(aws ecr get-repository-policy \
@@ -480,11 +425,7 @@ jobs:
           set -euo pipefail
 
           raw_manifest_digest() {
-            # sha256 of the exact raw manifest (or manifest list) bytes
-            # served at this reference -- computed identically for source
-            # and destination so a match proves byte-for-byte equivalence
-            # of whatever `skopeo copy --all` preserved (the manifest list
-            # and every per-architecture manifest it points to).
+            # sha256 of the exact raw manifest bytes; computed identically for source and destination to prove byte-for-byte equivalence.
             sha256sum | awk '{print "sha256:" $1}'
           }
 

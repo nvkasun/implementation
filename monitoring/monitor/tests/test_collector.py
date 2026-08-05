@@ -92,8 +92,7 @@ class WriteProcessStateTests(unittest.TestCase):
 
     @mock_aws
     def test_config_never_written_by_collector(self):
-        """Terraform owns CONFIG -- the collector module has no code path
-        that writes it."""
+        """Terraform owns CONFIG -- the collector module must have no code path that writes it."""
         import inspect
         src = inspect.getsource(core)
         self.assertNotIn('"CONFIG"', src.replace('recordType": "CONFIG"', ""))
@@ -118,8 +117,7 @@ class CheckStaticPrerequisitesTests(unittest.TestCase):
         self.assertIn("CONFIG", reason)
 
     def test_never_calls_lease_apis(self):
-        """check_static_prerequisites must not call acquire/renew -- an
-        early test-acquire would desync LeaseState.is_leader()."""
+        """Must not call acquire/renew -- an early test-acquire would desync LeaseState.is_leader()."""
         import inspect
         src = inspect.getsource(core.check_static_prerequisites)
         self.assertNotIn(".acquire(", src)
@@ -127,10 +125,7 @@ class CheckStaticPrerequisitesTests(unittest.TestCase):
 
 
 class PrerequisiteReasonSanitizationTests(unittest.TestCase):
-    """check_static_prerequisites reasons -- and the warning run_pipeline
-    logs from them on every retry -- must never carry a credential/CA path,
-    secret value, or raw AWS exception. The canonical deployment name may
-    appear."""
+    """Reasons -- and the run_pipeline warning logged from them on every retry -- must never carry a credential/CA path, secret value, or raw AWS exception (canonical deployment name is allowed)."""
 
     DEPLOYMENT = {"name": "gg-oracle-payments-01", "type": "oracle"}
     SYNTHETIC_USER = "synthetic-test-oggadmin"
@@ -208,9 +203,7 @@ class PrerequisiteReasonSanitizationTests(unittest.TestCase):
         self._assert_reason_clean(reason)
 
     def test_run_pipeline_retry_warning_is_generic(self):
-        """The actual logger.warning(...) call in run_pipeline's retry loop
-        -- not just check_static_prerequisites's return value -- must stay
-        clean on every retry."""
+        """The actual logger.warning(...) call in run_pipeline's retry loop must stay clean, not just check_static_prerequisites's return value."""
         stop_event = threading.Event()
 
         fake_table = MagicMock()
@@ -272,9 +265,7 @@ class CloudWatchGateTests(unittest.TestCase):
             core.CLOUDWATCH_PUBLISH_ENABLED = False
 
     def test_publish_enabled_env_gate_must_be_literal_true(self):
-        # Even if a caller (or a future refactor) assigned a non-Boolean
-        # truthy value to the module-level switch, the gate must not accept
-        # it via truthiness.
+        # A non-Boolean truthy value on the module-level switch must not be accepted via truthiness.
         core.CLOUDWATCH_PUBLISH_ENABLED = "true"
         try:
             self.assertFalse(core.cloudwatch_enabled_for({"metricsEnabled": True}))
@@ -315,17 +306,13 @@ class NoActiveHealingTests(unittest.TestCase):
 
 
 class CredentialFailClosedTests(unittest.TestCase):
-    """Missing/empty admin credential files must fail closed: no GoldenGate
-    HTTP call, no Basic auth attempt, no fallback username, readiness false
-    for that deployment, and no credential value in the log."""
+    """Missing/empty admin credential files must fail closed: no GoldenGate HTTP call, no Basic auth attempt, no fallback username, readiness false, and no credential value in the log."""
 
     SYNTHETIC_USER = "synthetic-test-oggadmin"
     SYNTHETIC_PASSWORD = "synthetic-test-P@ssw0rd!"
 
     def _run_one_tick(self, user_file, pwd_file):
-        """Runs polling_loop for exactly one tick: checkIntervalSeconds=0
-        makes every sleep instantaneous, and a side effect on the first
-        CONFIG read sets stop_event so the loop body runs exactly once."""
+        """Runs polling_loop for exactly one tick (checkIntervalSeconds=0, stop_event set on the first CONFIG read)."""
         deployment = {
             "name": "gg-oracle-payments-01",
             "type": "oracle",
@@ -433,9 +420,7 @@ class CredentialFailClosedTests(unittest.TestCase):
 
 
 class ProcessDiscoveryTests(unittest.TestCase):
-    """fetch_gg_processes hardening: no STATE#unknown, no exception on
-    malformed data, no duplicate/synthetic process rows, exact real names
-    preserved, empty results always valid."""
+    """fetch_gg_processes hardening: no STATE#unknown, no exception on malformed data, no duplicate/synthetic rows, exact real names preserved, empty results always valid."""
 
     BASE = "https://gg-test:8443"
 
@@ -605,8 +590,7 @@ class ProcessDiscoveryTests(unittest.TestCase):
 
 
 class BuildMetricBatchTests(unittest.TestCase):
-    """build_metric_batch: pure, no boto3, exact manager-compatible metric
-    names/dimensions/units."""
+    """build_metric_batch: pure, no boto3, exact manager-compatible metric names/dimensions/units."""
 
     def test_namespace_constant(self):
         self.assertEqual(core.CLOUDWATCH_NAMESPACE, "GoldenGate/Pipelines")
@@ -679,8 +663,7 @@ class BuildMetricBatchTests(unittest.TestCase):
         self.assertEqual(ev["Dimensions"][-1], {"Name": "Process", "Value": "EXT1"})
 
     def test_no_boto3_reference_in_build_function(self):
-        # co_names holds the actual names the function body loads/calls --
-        # unlike source text, it can't false-positive on the docstring.
+        # co_names holds the actual names loaded/called -- unlike source text, can't false-positive on the docstring.
         names = core.build_metric_batch.__code__.co_names
         self.assertNotIn("boto3", names)
         self.assertNotIn("put_metric_data", names)
@@ -706,10 +689,7 @@ class PublishMetricBatchTests(unittest.TestCase):
 
 
 class PublishMetricsIfEnabledTests(unittest.TestCase):
-    """Phase 4D1 correction: publish_metrics_if_enabled is the single
-    protected publication boundary -- it must construct no CloudWatch
-    client while either gate is false, and a client-construction failure
-    must never raise or reach a raw-exception log path."""
+    """publish_metrics_if_enabled is the single protected publication boundary: no CloudWatch client while either gate is false, and a client-construction failure must never raise or reach a raw-exception log path."""
 
     METRIC_DATA = [{"MetricName": "AbendState", "Dimensions": [], "Value": 0.0, "Unit": "Count"}]
 
@@ -779,10 +759,7 @@ class PublishMetricsIfEnabledTests(unittest.TestCase):
 
 
 class PublishMetricBatchFailureLoggingTests(unittest.TestCase):
-    """Phase 4D1 correction: a PutMetricData failure must never crash the
-    caller and must be logged with only safe, closed fields -- never a raw
-    exception message, traceback, ARN, hostname, secret path, or process
-    name. No retries -- one publication attempt per batch."""
+    """A PutMetricData failure must never crash the caller and must be logged with only safe, closed fields -- never a raw exception message, traceback, ARN, hostname, secret path, or process name. No retries."""
 
     def _failing_cw(self, message):
         cw = MagicMock()
@@ -842,10 +819,7 @@ class PublishMetricBatchFailureLoggingTests(unittest.TestCase):
 
 
 class MetricPublicationIntegrationTests(unittest.TestCase):
-    """Wires build_metric_batch/publish_metric_batch into polling_loop:
-    heartbeat semantics must depend on an actual successful, fenced
-    STATE#_deployment write for this tick -- never on process status, never
-    published from a standby, never published when CloudWatch is disabled."""
+    """Wires build_metric_batch/publish_metric_batch into polling_loop: heartbeat semantics must depend on an actual successful, fenced STATE#_deployment write for this tick -- never on process status, standby, or disabled CloudWatch."""
 
     DEPLOYMENT = {
         "name": "gg-oracle-payments-01",
@@ -981,9 +955,7 @@ class MetricPublicationIntegrationTests(unittest.TestCase):
         self.assertEqual(set(record.keys()), {"event", "deployment", "errorCategory"})
 
     def test_client_construction_failure_log_contains_no_raw_internal_detail(self):
-        # Scoped to the cloudwatch_client_creation_failed record itself --
-        # unrelated startup INFO logging legitimately includes the
-        # deployment's own admin hostname and is not part of this check.
+        # Scoped to the cloudwatch_client_creation_failed record; unrelated startup INFO logging may include the hostname.
         _publish_calls, _cw_calls, _table, log_ctx = self._run_tick(
             leader=True, fence_write=False, cloudwatch_enabled=True, client_construction_fails=True)
         matches = [r for r in log_ctx.records if "cloudwatch_client_creation_failed" in r.getMessage()]
@@ -996,12 +968,7 @@ class MetricPublicationIntegrationTests(unittest.TestCase):
 
 
 class CriticalServiceResolutionTests(unittest.TestCase):
-    """health_rules.resolve_critical_services: manager-compatible default
-    (adminsrvr/distsrvr/recvsrvr for every deployment, regardless of type)
-    with a bounded, fail-safe CONFIG.criticalServices override. Purely a
-    pure-function unit-test layer -- see CriticalServiceCoverageTests below
-    for the end-to-end polling_loop/build_metric_batch/STATE#_deployment
-    proof."""
+    """health_rules.resolve_critical_services: manager-compatible default (adminsrvr/distsrvr/recvsrvr) with a bounded, fail-safe CONFIG.criticalServices override; pure-function layer only, see CriticalServiceCoverageTests for the end-to-end proof."""
 
     def test_recognized_set_is_exactly_the_manager_default(self):
         self.assertEqual(gh.RECOGNIZED_CRITICAL_SERVICES, ("adminsrvr", "distsrvr", "recvsrvr"))
@@ -1051,14 +1018,7 @@ class CriticalServiceResolutionTests(unittest.TestCase):
 
 
 class CriticalServiceCoverageTests(unittest.TestCase):
-    """Phase 4D2 correction: manager-compatible critical-service coverage.
-    Every deployment -- Oracle and PostgreSQL alike -- defaults to probing
-    the full adminsrvr/distsrvr/recvsrvr set (the manager's own default
-    critical-service list, confirmed read-only against the manager
-    reference and reimplemented independently here, never copied), with an
-    optional bounded CONFIG.criticalServices override. Proven end-to-end
-    through polling_loop: probe_critical_services call, the published
-    CriticalServiceDown metrics, and the persisted STATE#_deployment write."""
+    """Every deployment type defaults to probing the full adminsrvr/distsrvr/recvsrvr set (reimplemented independently, never copied, from the manager's own default), with an optional bounded override, proven end-to-end through polling_loop."""
 
     _UNSET = object()
 
@@ -1201,11 +1161,7 @@ class CriticalServiceCoverageTests(unittest.TestCase):
 
 
 class LoggerHierarchyIntegrationTests(unittest.TestCase):
-    """Proves the actual running-container logging path: monitor.py
-    configures goldengate.monitor's level/handler; collector.py's logger
-    must be a child of it (goldengate.monitor.collector), carry no handler
-    of its own, and never duplicate a log line. Without this, INFO records
-    such as process_discovery_summary are silently dropped in production."""
+    """Proves the actual running-container logging path: collector.py's logger must be a child of goldengate.monitor (configured by monitor.py), carry no handler of its own, and never duplicate a log line."""
 
     @classmethod
     def setUpClass(cls):
@@ -1218,23 +1174,18 @@ class LoggerHierarchyIntegrationTests(unittest.TestCase):
         self.assertEqual(core.logger.parent.name, "goldengate.monitor")
 
     def test_collector_logger_has_no_handlers_of_its_own(self):
-        # No new StreamHandler, no basicConfig -- only the parent's handler
-        # (installed by monitor.py) may ever fire.
+        # No new StreamHandler, no basicConfig -- only the parent's handler (installed by monitor.py) may fire.
         self.assertEqual(core.logger.handlers, [])
 
     def test_collector_inherits_configured_info_level(self):
         self.assertEqual(core.logger.getEffectiveLevel(), logging.INFO)
 
     def test_goldengate_monitor_carries_exactly_one_handler(self):
-        # Proves collector.py never adds a second handler to the shared
-        # parent logger (no duplicate-output path exists).
+        # Proves collector.py never adds a second handler to the shared parent logger (no duplicate-output path).
         self.assertEqual(len(self.monitor_module.logger.handlers), 1)
 
     def _capture_real_handler_output(self, fn):
-        """Swaps the actual configured StreamHandler's target stream (not
-        sys.stdout, which the handler captured a fixed reference to at
-        import time) so we observe exactly what the real handler chain
-        would write to container stdout."""
+        """Swaps the real StreamHandler's target stream (not sys.stdout, which it fixed a reference to at import time) to observe what it actually writes to container stdout."""
         import io
         handler = self.monitor_module._handler
         buf = io.StringIO()
@@ -1290,8 +1241,7 @@ class LoggerHierarchyIntegrationTests(unittest.TestCase):
 
 
 class PmsNormalizationTests(unittest.TestCase):
-    """Pure PMS normalization helpers: bounded, safe types only, never an
-    exception, never a silently-wrong type."""
+    """Pure PMS normalization helpers: bounded, safe types only, never an exception, never a silently-wrong type."""
 
     def test_number_malformed_becomes_zero(self):
         self.assertEqual(core._normalize_pms_number("not-a-number"), 0)
@@ -1348,8 +1298,7 @@ class PmsNormalizationTests(unittest.TestCase):
         self.assertEqual(set(out.keys()), set(core._PMS_PERFORMANCE_NUMERIC_FIELDS))
 
     def test_performance_normalization_cumulative_counters_preserved_as_is(self):
-        # cpuTimeUs/kernelTimeUs/userTimeUs must never be converted into a
-        # rate/percentage in this phase -- preserved exactly (post-safety-clamp).
+        # cpuTimeUs/kernelTimeUs/userTimeUs must never be converted into a rate/percentage -- preserved exactly.
         raw = {"cpuTimeUs": 999999, "kernelTimeUs": 111111, "userTimeUs": 222222}
         out = core.normalize_pms_performance(raw)
         self.assertEqual(out["cpuTimeUs"], 999999)
@@ -1418,9 +1367,7 @@ class HeartbeatAgeTests(unittest.TestCase):
         self.assertIsNone(core.heartbeat_age_seconds(["2026-07-30T08:59:00Z"], now=self.NOW))
 
     def test_default_now_is_real_utc_when_not_injected(self):
-        # sanity check that the pure helper still works without an injected
-        # clock (uses real current time) -- age should be a small
-        # non-negative number for a timestamp a few seconds ago.
+        # Sanity check without an injected clock (uses real current time); age should be small and non-negative.
         import datetime as _dt
         recent = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=5)).isoformat()
         age = core.heartbeat_age_seconds(recent)
@@ -1429,8 +1376,7 @@ class HeartbeatAgeTests(unittest.TestCase):
 
 
 class PmsRequestSequenceTests(unittest.TestCase):
-    """collect_pms(): the full bounded, sequential production PMS request
-    model, end to end against a mocked opener. Synthetic data only."""
+    """collect_pms(): the full bounded, sequential production PMS request model, end to end against a mocked opener. Synthetic data only."""
 
     BASE = "https://gg-test:8443"
 
@@ -1553,8 +1499,7 @@ class PmsRequestSequenceTests(unittest.TestCase):
         self.assertFalse(any("statusChanges" in c or "v2/metrics" in c for c in calls))
 
     def test_no_direct_port_9015_used(self):
-        # collect_pms only ever receives/uses the caller's base -- it never
-        # constructs an alternate metricsPort/9015 URL of its own.
+        # collect_pms only ever receives/uses the caller's base -- never constructs its own metricsPort/9015 URL.
         with open(core.__file__) as f:
             src = f.read()
         collect_pms_src = src[src.index("def collect_pms"):]
@@ -1659,8 +1604,7 @@ class PmsRequestSequenceTests(unittest.TestCase):
 
 
 class PmsResponseShapeValidationTests(unittest.TestCase):
-    """Section 3/4 correction: a structurally invalid inventory or detail
-    response must never be silently accepted as healthy."""
+    """A structurally invalid inventory or detail response must never be silently accepted as healthy."""
 
     BASE = "https://gg-test:8443"
 
@@ -1750,9 +1694,7 @@ class PmsResponseShapeValidationTests(unittest.TestCase):
         self.assertEqual(result["processes"]["P1"]["serviceHealth"], {})
 
     def test_service_health_missing_isHealthy_fails_even_with_other_fields(self):
-        # Under the tightened rule, isHealthy specifically must be a literal
-        # bool -- merely having criticalResourcesHealthy/Unhealthy present
-        # (the old, looser "any of 3 fields" rule) is no longer sufficient.
+        # isHealthy specifically must be a literal bool -- merely having the other two fields is not sufficient.
         o = self._detail_shape_opener(
             self._single_process_inventory(), {"cpuTimeUs": 1},
             {"criticalResourcesHealthy": 3, "criticalResourcesUnhealthy": 0})
@@ -1782,9 +1724,7 @@ class PmsResponseShapeValidationTests(unittest.TestCase):
 
 
 class PmsPartialUnavailableSemanticsTests(unittest.TestCase):
-    """Section 5 correction: status is derived from whether any individual
-    detail GET succeeded this tick -- not merely from whether some single
-    process got BOTH of its details."""
+    """status is derived from whether any individual detail GET succeeded this tick -- not merely from whether some single process got BOTH of its details."""
 
     BASE = "https://gg-test:8443"
 
@@ -1824,8 +1764,7 @@ class PmsPartialUnavailableSemanticsTests(unittest.TestCase):
         }
         o = self._opener(inventory, detail, exceptions)
         result = core.collect_pms(self.BASE, o)
-        # process-level successCount is 0 (neither process got BOTH details)
-        # -- but real usable data WAS collected, so this must be PARTIAL.
+        # process-level successCount is 0, but real usable data WAS collected, so this must be PARTIAL.
         self.assertEqual(result["successCount"], 0)
         self.assertEqual(result["status"], "PARTIAL")
 
@@ -1857,9 +1796,7 @@ class PmsPartialUnavailableSemanticsTests(unittest.TestCase):
 
 
 class PmsProcessNameBoundsTests(unittest.TestCase):
-    """Section 6 correction: process names are validated (length, control
-    characters, '.'/'..' ) before ever being followed, and are preserved
-    EXACTLY (never rewritten/truncated) when accepted."""
+    """Process names are validated (length, control characters, '.'/'..') before ever being followed, and preserved EXACTLY (never rewritten/truncated) when accepted."""
 
     def test_name_longer_than_limit_skipped(self):
         overlong = "P" * (core.MAX_PMS_PROCESS_NAME_LENGTH + 1)
@@ -1905,8 +1842,7 @@ class PmsProcessNameBoundsTests(unittest.TestCase):
         self.assertEqual(count, 4)
 
     def test_unpaired_high_surrogate_rejected(self):
-        # \ud800 is a valid Python str character (json.loads tolerates a
-        # lone \uD800 escape) but cannot be UTF-8 encoded.
+        # \ud800 is a valid Python str character (json.loads tolerates a lone \uD800 escape) but not UTF-8 encodable.
         self.assertIsNone(core._valid_pms_process_name("\ud800"))
         self.assertIsNone(core._valid_pms_process_name("EXTRACT_\ud800_01"))
 
@@ -1924,9 +1860,7 @@ class PmsProcessNameBoundsTests(unittest.TestCase):
 
 
 class PmsSnapshotSizeBudgetTests(unittest.TestCase):
-    """Section 6 required proof: the maximum permitted bounded PMS snapshot
-    (20 processes, maximum-length names, all confirmed fields populated)
-    stays comfortably below DynamoDB's 400 KB item-size limit."""
+    """The maximum permitted bounded PMS snapshot stays comfortably below DynamoDB's 400 KB item-size limit."""
 
     def test_maximum_snapshot_stays_below_size_budget(self):
         max_name = "P" * core.MAX_PMS_PROCESS_NAME_LENGTH
@@ -1944,15 +1878,12 @@ class PmsSnapshotSizeBudgetTests(unittest.TestCase):
             "heartbeatAgeSeconds": 9999, "processes": processes,
         }
         size_bytes = len(json.dumps(snapshot).encode("utf-8"))
-        # DynamoDB's per-item limit is 400 KB (409,600 bytes). "Comfortably
-        # below" -- assert well under 10% of that budget.
+        # DynamoDB's per-item limit is 400 KB (409,600 bytes); assert well under 10% of that budget.
         self.assertLess(size_bytes, 40_000, f"PMS snapshot is {size_bytes} bytes")
 
 
 class PmsNumericHardeningTests(unittest.TestCase):
-    """Section 7 correction: _normalize_pms_number must never raise,
-    including OverflowError from float(huge_int), and must reject anything
-    outside the documented DynamoDB-safe range."""
+    """_normalize_pms_number must never raise, including OverflowError from float(huge_int), and must reject anything outside the documented DynamoDB-safe range."""
 
     def test_huge_integer_becomes_zero(self):
         self.assertEqual(core._normalize_pms_number(10 ** 400), 0)
@@ -1994,9 +1925,7 @@ class PmsNumericHardeningTests(unittest.TestCase):
 
 
 class PmsCollectionBudgetTests(unittest.TestCase):
-    """Section 6: a fixed, non-operator-tunable total-time safety net so PMS
-    can never make a healthy deployment appear stale before
-    STATE#_deployment is written."""
+    """A fixed, non-operator-tunable total-time safety net so PMS can never make a healthy deployment appear stale before STATE#_deployment is written."""
 
     BASE = "https://gg-test:8443"
 
@@ -2080,15 +2009,12 @@ class PmsCollectionBudgetTests(unittest.TestCase):
     def test_budget_constants_are_fixed_and_conservative(self):
         self.assertEqual(core.PMS_REQUEST_TIMEOUT_SECONDS, 2)
         self.assertEqual(core.PMS_COLLECTION_BUDGET_SECONDS, 30)
-        # theoretical worst case must stay comfortably under the deployed
-        # 120s stale threshold once the budget (not the per-request
-        # timeout) is the binding constraint.
+        # Theoretical worst case must stay comfortably under the deployed 120s stale threshold.
         self.assertLess(core.PMS_COLLECTION_BUDGET_SECONDS, 120)
 
 
 class PmsWrappedTlsClassificationTests(unittest.TestCase):
-    """Section 10 correction: TLS failures classify correctly regardless of
-    how deeply they are wrapped, without importing tools/."""
+    """TLS failures classify correctly regardless of how deeply they are wrapped, without importing tools/."""
 
     def test_direct_ssl_error(self):
         self.assertEqual(core._classify_pms_error(ssl.SSLError("bad cert")), "TLS_FAILED")
@@ -2137,11 +2063,7 @@ class PmsWrappedTlsClassificationTests(unittest.TestCase):
 
 
 class PmsSurrogateAndDefensiveBoundaryTests(unittest.TestCase):
-    """Reproduces and fixes the reported defect: a processName containing
-    an unpaired Unicode surrogate must never reach urllib.parse.quote (and
-    if it somehow did, must never let UnicodeEncodeError escape
-    collect_pms), and no unanticipated internal failure may ever escape
-    collect_pms as a whole."""
+    """A processName containing an unpaired Unicode surrogate must never reach urllib.parse.quote (and if it somehow did, must never let UnicodeEncodeError escape collect_pms); no unanticipated internal failure may ever escape collect_pms."""
 
     BASE = "https://gg-test:8443"
 
@@ -2181,9 +2103,7 @@ class PmsSurrogateAndDefensiveBoundaryTests(unittest.TestCase):
             except Exception as e:  # pragma: no cover
                 self.fail(f"collect_pms raised: {e!r}")
         self.assertIsInstance(result, dict)
-        # OK1 was still followed (a real, valid name) -- its path just
-        # couldn't be built this tick, so no data was collected for it, but
-        # it is not silently dropped from the map, and no exception escaped.
+        # OK1 was still followed but its path couldn't be built this tick -- not silently dropped, no exception escaped.
         self.assertEqual(result["processes"]["OK1"], {
             "performance": {}, "serviceHealth": {}, "heartbeatAgeSeconds": None})
         self.assertEqual(result["failureCount"], 1)
@@ -2224,11 +2144,7 @@ class PmsSurrogateAndDefensiveBoundaryTests(unittest.TestCase):
 
 
 class PmsPollingLoopIntegrationTests(unittest.TestCase):
-    """Wires collect_pms into polling_loop's guarded STATE#_deployment
-    write: PMS enrichment must respect the exact same lease/fencing rules
-    as everything else -- standby never requests PMS, a fenced tick never
-    writes PMS state, and a PMS failure must never affect the deployment's
-    own UP/DOWN status."""
+    """Wires collect_pms into polling_loop's guarded STATE#_deployment write: PMS enrichment must respect the same lease/fencing rules as everything else, and a PMS failure must never affect the deployment's own UP/DOWN status."""
 
     DEPLOYMENT = {
         "name": "gg-oracle-payments-01",
@@ -2331,10 +2247,7 @@ class PmsPollingLoopIntegrationTests(unittest.TestCase):
         self.assertEqual(process_record_types, set())
 
     def test_admin_rest_down_write_overwrites_stale_pms_with_current_unavailable_state(self):
-        # collect_pms itself is never called when Admin REST is down (PMS
-        # depends on the same connectivity) -- but the write must still
-        # carry a CURRENT, sanitized pms snapshot, never leave a prior
-        # UP-tick's map silently attached/stale.
+        # collect_pms is never called when Admin REST is down, but the write must still carry a CURRENT pms snapshot, never a stale prior UP-tick's map.
         pms_calls, update_calls = self._run_tick(leader=True, fence_write=False, raise_on_fetch=True)
         self.assertEqual(pms_calls, [])
         deployment_writes = [c for c in update_calls if c["Key"].get("recordType") == "STATE#_deployment"]

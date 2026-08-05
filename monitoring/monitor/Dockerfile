@@ -1,7 +1,4 @@
-# No public default: BASE_IMAGE must be explicitly supplied as a
-# digest-pinned, private-ECR reference by the caller (see
-# .github/workflows/goldengate-monitor.yaml's "Validate approved base image
-# reference" step). There is deliberately no Docker Hub fallback.
+# No public default: caller must supply a digest-pinned, private-ECR BASE_IMAGE (validated in goldengate-monitor.yaml).
 ARG BASE_IMAGE
 
 FROM ${BASE_IMAGE}
@@ -34,7 +31,7 @@ WORKDIR ${APP_HOME}
 COPY requirements.txt ./
 RUN pip install --no-cache-dir --no-compile -r requirements.txt
 
-COPY monitor.py collector.py health_rules.py config.py ./
+COPY monitor.py collector.py health_rules.py config.py ui.py ./
 COPY tools/ ./tools/
 
 USER ${APP_UID}:${APP_GID}

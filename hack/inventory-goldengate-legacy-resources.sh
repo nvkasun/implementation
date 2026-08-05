@@ -1,37 +1,8 @@
 #!/usr/bin/env bash
-# Phase 5B2B1: read-only inventory of retired legacy GoldenGate external
-# resources (envs/dev/payments-ora-to-pg-001, deleted in Phase 5B2A).
-#
-# Produces a deterministic JSON cleanup manifest for later human review.
-# This script NEVER deletes, patches, updates, applies, or otherwise
-# mutates any AWS or Kubernetes resource -- every AWS CLI/kubectl/argocd
-# invocation in this file is a read-only Describe/Get/List/Query call.
-# Canonical (live, in-use) resources are deny-listed and can never be
-# reported as cleanup candidates, no matter what live data is observed.
-#
-# Required environment (opaque string data, never interpolated GitHub
-# expression syntax -- see .github/workflows/goldengate-legacy-cleanup-
-# inventory.yaml, which only maps values through env: and invokes this
-# script):
-#   INPUT_ENVIRONMENT -- workflow_dispatch input: target environment
-#   GITHUB_OUTPUT     -- path to the GitHub Actions step output file (optional)
-#   GITHUB_STEP_SUMMARY -- path to the GitHub Actions job summary file (optional)
-#
-# Exit code is always 0 on a successful inventory run (including when
-# permission gaps are encountered -- those are reported in the manifest,
-# never treated as a hard failure of the read-only inventory itself).
-# Exit code is non-zero only for a genuine script defect (e.g. jq/python3
-# unavailable, malformed live JSON that cannot be parsed at all).
+# Read-only inventory of retired legacy GoldenGate resources (envs/dev/payments-ora-to-pg-001); never mutates AWS/K8s state, and canonical resources are deny-listed and never reported as cleanup candidates.
 set -euo pipefail
 
-# ===========================================================================
-# Section 0: canonical facts (the deny-list). These are the verified-live
-# facts this phase was given -- never re-derived by guessing, never
-# overridden by anything this script observes live. A resource matching one
-# of these identifiers is RETAIN, full stop, regardless of any other
-# evidence.
-# ===========================================================================
-
+# Section 0: canonical, verified-live facts (deny-list) -- never re-derived or overridden by live observations; a match is RETAIN, full stop.
 ENVIRONMENT="${INPUT_ENVIRONMENT:-dev}"
 AWS_REGION_EXPECTED="eu-west-1"
 EKS_CLUSTER_EXPECTED="gg-poc-dev"
@@ -63,8 +34,7 @@ CANONICAL_PV_IDS=(
   "pvc-5f29ad65-0a5b-4d7a-9568-2d82b3bd1b38"
 )
 
-# Known Released/Retain PV cleanup candidates -- eligibility is still
-# independently re-verified below, never assumed safe merely from this list.
+# Known Released/Retain PV cleanup candidates -- eligibility is independently re-verified below, never assumed safe from this list alone.
 CANDIDATE_PV_IDS=(
   "pvc-3a93c990-a9fa-4cca-99df-7c3375472074"
   "pvc-93251c3f-c408-4713-bd46-ebc5e0eafa8a"
@@ -72,8 +42,7 @@ CANDIDATE_PV_IDS=(
   "pvc-bacb3e9d-d904-467c-959f-dea9548699c9"
 )
 
-# Known access-point handles recorded by those old PVs -- also
-# independently re-verified below, never assumed safe merely from this list.
+# Known access-point handles recorded by those old PVs -- also independently re-verified below, never assumed safe alone.
 CANDIDATE_EFS_ACCESS_POINT_IDS=(
   "fsap-007cfc2ff801c24b8"
   "fsap-035f46f17955f57cb"
@@ -81,18 +50,13 @@ CANDIDATE_EFS_ACCESS_POINT_IDS=(
   "fsap-09566a2339f781a33"
 )
 
-# EFS filesystem ID shared by both canonical deployments (envs/dev/gg-
-# oracle-payments-01/values.yaml and envs/dev/gg-postgresql-payments-01/
-# values.yaml, persistence.efs.fileSystemId -- identical in both).
+# EFS filesystem ID shared by both canonical deployments' persistence.efs.fileSystemId (identical in both values.yaml files).
 EFS_FILESYSTEM_ID_EXPECTED="fs-05cadf3570f23cd39"
 
-# EFS CSI volumeHandle is either "<fs-id>" or "<fs-id>::<fsap-id>". Any
-# other shape is never trusted -- fsId/apId extraction blocks rather than
-# guesses when the handle doesn't match this exact shape.
+# EFS CSI volumeHandle is either "<fs-id>" or "<fs-id>::<fsap-id>"; any other shape is rejected, never guessed.
 EFS_VOLUME_HANDLE_REGEX='^fs-[0-9a-f]+(::fsap-[0-9a-f]+)?$'
 
-# Only an access point actually available for use is ever eligible -- one
-# already mid-delete/errored is never a "candidate".
+# Only an access point actually available for use is ever eligible -- one mid-delete/errored is never a candidate.
 EFS_ACCEPTABLE_LIFECYCLE_STATES=("available")
 
 CANONICAL_STORAGE_CLASSES=(
@@ -101,43 +65,19 @@ CANONICAL_STORAGE_CLASSES=(
 )
 LEGACY_STORAGE_CLASS="gg-efs-dev-payments-ora-to-pg-001"
 
-# DynamoDB: table name, hash/range key names, and legacy per-role partition
-# names, all confirmed from this repository's own source and test fixtures
-# (never guessed): envs/dev/dynamodb.tf declares hash_key=pipeline,
-# range_key=recordType, table_name=gg-eks-pipeline; monitoring/monitor/
-# monitor.py defines RECORD_TYPE_CONFIG="CONFIG", RECORD_TYPE_LEASE="LEASE",
-# RECORD_TYPE_DEPLOYMENT_STATE="STATE#_deployment", STATE_PREFIX="STATE#";
-# monitoring/monitor/tests/test_monitor.py's ReadRuntimeViewTests class
-# hardcodes LEGACY_PARTITION_NAMES = ("gg-payments-ora-to-pg-001-source",
-# "gg-payments-ora-to-pg-001-target") as the exact legacy per-role
-# partitions monitor.py must never query -- the same two names used here.
+# DynamoDB table/key names and legacy partition names, confirmed from envs/dev/dynamodb.tf, monitoring/monitor/monitor.py, and monitoring/monitor/tests/test_monitor.py (never guessed).
 DYNAMODB_TABLE="gg-eks-pipeline"
 DYNAMODB_HASH_KEY="pipeline"
 DYNAMODB_RANGE_KEY="recordType"
 CANONICAL_DYNAMODB_PARTITIONS=("gg-oracle-payments-01" "gg-postgresql-payments-01")
 LEGACY_DYNAMODB_PARTITIONS=("gg-payments-ora-to-pg-001-source" "gg-payments-ora-to-pg-001-target")
 
-# Observer ECR: repository short name and account, confirmed from this
-# repository's own Git history (the "Detect changed deployments" step as it
-# existed before Phase 5A observer retirement declared
-# OBSERVER_ECR_REPOSITORY: goldengate-observer and
-# ECR_REGISTRY: 229410149234.dkr.ecr.eu-west-1.amazonaws.com, with image
-# tags of the exact content-addressed form obs-<12-hex-chars> derived from
-# `git rev-parse HEAD:monitoring/observer`). No tag/digest is hardcoded
-# here -- they are enumerated live from ECR when this script runs, never
-# guessed.
+# Observer ECR repo/account confirmed from this repo's own Git history (pre-observer-retirement); tags/digests are enumerated live from ECR, never hardcoded.
 OBSERVER_ECR_REPOSITORY="goldengate-observer"
 OBSERVER_ECR_TAG_PATTERN='^obs-[0-9a-f]{12}$'
 OBSERVER_ECR_REPOSITORY_URI_EXPECTED="${ECR_ACCOUNT_ID_EXPECTED}.dkr.ecr.${AWS_REGION_EXPECTED}.amazonaws.com/${OBSERVER_ECR_REPOSITORY}"
 
-# Shared infrastructure identifiers the retired legacy deployment used --
-# confirmed by diffing the last committed content of the deleted
-# envs/dev/payments-ora-to-pg-001/values.yaml against the current canonical
-# values files. These are IDENTICAL in both (same Secrets Manager
-# objectNames, same ALB groupName, same ACM certificateArn), so they are
-# still actively used by the canonical deployments today and must be
-# reported RETAIN -- never a candidate, regardless of the fact that the
-# retired legacy values file also referenced them.
+# Shared infra identifiers the retired legacy deployment used, confirmed identical in the current canonical values files -- still actively used, so always RETAIN, never a candidate.
 SHARED_SECRETS_MANAGER_PATHS=(
   "dev/goldengate/source/admin"
   "dev/goldengate/target/admin"
@@ -146,19 +86,7 @@ SHARED_SECRETS_MANAGER_PATHS=(
 SHARED_ALB_GROUP_NAME="gg-poc-dev-alb"
 SHARED_ACM_CERTIFICATE_ARN="arn:aws:acm:eu-west-1:668311715351:certificate/9e53e28e-3243-47fc-85a1-50f9a94acde7"
 
-# Legacy-specific Ingress hostnames (unique to the retired legacyPair
-# deployment, never used by canonical singleRuntime deployments -- those
-# use <deploymentId>.<hostDomain>, e.g. gg-oracle-payments-01.goldengate-
-# dev.adcbmis.local). Confirmed from the same last-committed legacy values
-# file. The underlying Ingress Kubernetes object was owned by the already-
-# deleted legacy Argo CD Application/namespace, so any corresponding ALB
-# listener rule is expected to have been cascade-removed by the AWS Load
-# Balancer Controller when that Ingress was deleted -- this script reports
-# these hostnames informationally (never as a delete candidate: there is no
-# Terraform-managed Route53/ALB resource for them in this repository to
-# even describe, and guessing live ALB/Route53 rule state from repository
-# content alone is exactly the "guessing ownership from a similar name"
-# this phase must not do).
+# Legacy-specific Ingress hostnames (unique to the retired legacyPair deployment); reported informationally only -- never a delete candidate, since there's no Terraform-managed resource here to describe and live ALB/Route53 state can't be safely guessed from repo content.
 LEGACY_INGRESS_HOSTNAMES=(
   "ogg-oracle-payments-ora-to-pg-001.goldengate-dev.adcbmis.local"
   "ogg-postgresql-payments-ora-to-pg-001.goldengate-dev.adcbmis.local"
@@ -166,10 +94,7 @@ LEGACY_INGRESS_HOSTNAMES=(
 
 GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-# ===========================================================================
 # Section 1: prerequisites and small helpers.
-# ===========================================================================
-
 MISSING_TOOLS=()
 command -v jq >/dev/null 2>&1 || MISSING_TOOLS+=("jq")
 command -v python3 >/dev/null 2>&1 || MISSING_TOOLS+=("python3")
@@ -190,14 +115,7 @@ in_array() {
   return 1
 }
 
-# run_kubectl_json ARG... -- runs `kubectl ARG... -o json`, capturing
-# stdout separately from stderr so a genuine "not found" (single-resource
-# get) can be distinguished from any other failure (permission denied, API
-# unreachable, timeout, ...). A failed or ambiguous read is NEVER treated
-# as "not found" -- only an explicit NotFound error is.
-# Sets: LAST_KUBECTL_OK ("true"/"false"), LAST_KUBECTL_JSON (valid only
-# when OK), LAST_KUBECTL_NOTFOUND ("true" only for a confirmed NotFound on
-# a single-resource get; "false" in every other case, including success).
+# Runs `kubectl ARG... -o json`; sets LAST_KUBECTL_OK/LAST_KUBECTL_JSON/LAST_KUBECTL_NOTFOUND, distinguishing a confirmed NotFound from any other failure (permission denied, unreachable, timeout).
 run_kubectl_json() {
   local stderr_file out status
   stderr_file="$(mktemp)"
@@ -221,10 +139,7 @@ run_kubectl_json() {
   rm -f "$stderr_file"
 }
 
-# run_kubectl_raw PATH -- `kubectl get --raw PATH`, for a read-only HTTP GET
-# against a Service's own API through the API server's built-in proxy
-# (never a port-forward/exec shell). Sets LAST_KUBECTL_RAW_OK,
-# LAST_KUBECTL_RAW_BODY.
+# `kubectl get --raw PATH` -- read-only HTTP GET through the API server's built-in proxy (never a port-forward/exec shell). Sets LAST_KUBECTL_RAW_OK/LAST_KUBECTL_RAW_BODY.
 run_kubectl_raw() {
   local path="$1" out status
   set +e
@@ -240,9 +155,7 @@ run_kubectl_raw() {
   fi
 }
 
-# run_aws_json ARG... -- runs `aws ARG... --output json`, distinguishing a
-# confirmed "does not exist" AWS error from any other failure the same way
-# run_kubectl_json does. Sets LAST_AWS_OK, LAST_AWS_JSON, LAST_AWS_NOTFOUND.
+# Runs `aws ARG... --output json`, same not-found-vs-other-failure distinction as run_kubectl_json. Sets LAST_AWS_OK/LAST_AWS_JSON/LAST_AWS_NOTFOUND.
 run_aws_json() {
   local stderr_file out status
   stderr_file="$(mktemp)"
@@ -266,26 +179,13 @@ run_aws_json() {
   rm -f "$stderr_file"
 }
 
-# --- Workload-account (EKS_DEPLOY_ROLE_ARN) temporary session -------------
-# Read-only workload-account calls (STS baseline, EFS Describe, DynamoDB
-# Query) run under a SEPARATE, temporary sts:AssumeRole session to
-# EKS_DEPLOY_ROLE_ARN -- the build/ECR-account session already established
-# by the workflow's own "Configure AWS credentials" step is NEVER replaced
-# globally, because ECR repository/image inspection must keep running
-# against the build/ECR account (229410149234). Credentials are held only
-# in-memory, for the lifetime of this script; they are never printed,
-# logged, or written to any file.
+# Workload-account calls (STS baseline, EFS Describe, DynamoDB Query) run under a separate, temporary AssumeRole session to EKS_DEPLOY_ROLE_ARN -- the build/ECR-account session is never replaced globally; credentials are held only in-memory, never printed/logged/written.
 WORKLOAD_SESSION_ESTABLISHED="false"
 WORKLOAD_AWS_ACCESS_KEY_ID=""
 WORKLOAD_AWS_SECRET_ACCESS_KEY=""
 WORKLOAD_AWS_SESSION_TOKEN=""
 
-# establish_workload_aws_session -- assumes EKS_DEPLOY_ROLE_ARN exactly
-# once (subsequent calls are a no-op once established) and caches the
-# temporary credentials in-memory. Returns 1 (never assumed/cached) if the
-# role ARN is unavailable, aws is unavailable, or the AssumeRole call
-# itself fails/is incomplete -- callers must treat that as "workload
-# session unverified", never as "workload resource absent".
+# Assumes EKS_DEPLOY_ROLE_ARN exactly once (later calls are a no-op) and caches credentials in-memory; returns 1 on any failure -- callers must treat that as "unverified", never "resource absent".
 establish_workload_aws_session() {
   [ "$WORKLOAD_SESSION_ESTABLISHED" = "true" ] && return 0
   [ "$HAVE_AWS" = "true" ] || return 1
@@ -320,15 +220,7 @@ establish_workload_aws_session() {
   return 0
 }
 
-# run_workload_aws_json ARG... -- same contract as run_aws_json (Describe/
-# Get/List/Query only -- callers pass the same read-only subcommands), but
-# always runs under the temporary workload-account (EKS_DEPLOY_ROLE_ARN)
-# session, never the build/ECR-account session. Sets LAST_WORKLOAD_AWS_OK,
-# LAST_WORKLOAD_AWS_JSON, LAST_WORKLOAD_AWS_NOTFOUND, and
-# LAST_WORKLOAD_SESSION_OK ("false" when the AssumeRole itself could not be
-# established -- distinct from "the call ran under the workload session
-# but failed/was denied"). A failed AssumeRole or a failed call is never
-# converted into "resource absent".
+# Same contract as run_aws_json but always runs under the temporary workload-account session; LAST_WORKLOAD_SESSION_OK distinguishes "AssumeRole failed" from "the call itself failed/was denied".
 run_workload_aws_json() {
   if ! establish_workload_aws_session; then
     LAST_WORKLOAD_SESSION_OK="false"
@@ -376,15 +268,7 @@ efs_ap_id_from_handle() {
   echo "$1" | awk -F'::' '{print $2}'
 }
 
-# ===========================================================================
-# Section 2: pure classification/eligibility functions. Each takes already-
-# collected facts as explicit arguments and returns a decision plus
-# blocking reasons -- no live AWS/kubectl call inside these functions, which
-# is what makes them independently unit-testable (see hack/test-
-# goldengate-deployment-models.sh). Live collection happens separately in
-# Section 3 and is passed into these as plain arguments.
-# ===========================================================================
-
+# Section 2: pure classification/eligibility functions -- no live AWS/kubectl calls, which is what makes them unit-testable (see hack/test-goldengate-deployment-models.sh); live collection happens separately in Section 3.
 is_canonical_pv_id() {
   in_array "$1" "${CANONICAL_PV_IDS[@]}"
 }
@@ -398,20 +282,7 @@ is_canonical_volume_handle() {
   return 1
 }
 
-# classify_pv PV_ID PHASE RECLAIM_POLICY VOLUME_HANDLE HANDLE_FORMAT_VALID
-#             PVC_REFERENCE_CHECK_VERIFIED REFERENCED_BY_ACTIVE_PVC
-#             POD_REFERENCE_CHECK_VERIFIED REFERENCED_BY_RUNNING_POD
-#             CANONICAL_BASELINE_VERIFIED
-#
-# Prints "eligible" and returns 0 only when every required condition holds
-# AND every relevant verification flag is exactly "true". Otherwise prints
-# a semicolon-separated list of blocking reasons and returns 1. Fails
-# closed: a failed/unavailable read is never converted into "zero
-# references" or "eligible" -- PVC_REFERENCE_CHECK_VERIFIED=false,
-# POD_REFERENCE_CHECK_VERIFIED=false, and CANONICAL_BASELINE_VERIFIED=false
-# each independently block, always. Active-PVC reference is proven from the
-# verified global PVC list (.spec.volumeName == PV_ID) -- never from PV
-# phase alone or a stale claimRef.
+# Returns 0/"eligible" only when every condition holds and every verification flag is exactly true, else 1/semicolon-separated blocking reasons; fails closed on any unverified flag, and active-PVC reference is proven from the global PVC list, never PV phase alone.
 classify_pv() {
   local pv_id="$1" phase="$2" reclaim_policy="$3" volume_handle="$4"
   local handle_format_valid="$5"
@@ -470,9 +341,6 @@ is_acceptable_efs_lifecycle_state() {
   in_array "$1" "${EFS_ACCEPTABLE_LIFECYCLE_STATES[@]}"
 }
 
-# classify_efs_access_point AP_ID DESCRIBE_OK FILESYSTEM_ID LIFECYCLE_STATE
-#                            BOUND_PV_REFERENCE_CHECK_VERIFIED
-#                            REFERENCED_BY_BOUND_PV CANONICAL_BASELINE_VERIFIED
 classify_efs_access_point() {
   local ap_id="$1" describe_ok="$2" filesystem_id="$3" lifecycle_state="$4"
   local bound_pv_reference_check_verified="$5" referenced_by_bound_pv="$6"
@@ -514,17 +382,7 @@ classify_efs_access_point() {
   return 1
 }
 
-# classify_legacy_storage_class EXISTS_STATE PVC_USAGE_CHECK_VERIFIED
-#                                IN_USE CANONICAL_BASELINE_VERIFIED
-#
-# EXISTS_STATE is one of: "true" (confirmed present), "false" (confirmed
-# absent -- a real kubectl NotFound), "unknown" (existence read failed for
-# a reason other than NotFound). Only ever called for the legacy
-# StorageClass -- canonical StorageClasses are never classified, only
-# recorded RETAIN directly by the caller (add_blocked), so they can never
-# appear in candidates.storageClasses.
-#
-# Return codes: 0 = eligible, 1 = blocked, 2 = already_absent.
+# EXISTS_STATE: true=present, false=confirmed absent (NotFound), unknown=read failed; returns 0=eligible, 1=blocked, 2=already_absent. Only ever called for the legacy StorageClass -- canonical ones are recorded RETAIN directly by the caller instead.
 classify_legacy_storage_class() {
   local exists_state="$1" pvc_usage_check_verified="$2" in_use="$3"
   local canonical_baseline_verified="$4"
@@ -558,14 +416,7 @@ classify_legacy_storage_class() {
   return 1
 }
 
-# classify_dynamodb_partition PIPELINE_ID QUERY_VERIFIED ITEM_COUNT
-#                              CANONICAL_BASELINE_VERIFIED
-#
-# Only ever called for a recognized legacy partition -- canonical
-# partitions are never classified, only recorded RETAIN directly by the
-# caller (add_blocked); the hard deny-list is therefore enforced at the
-# call site, not here, so a canonical partition can never even reach this
-# function.
+# Only ever called for a recognized legacy partition; canonical partitions are deny-listed at the call site and never reach this function.
 classify_dynamodb_partition() {
   local pipeline_id="$1" query_verified="$2" item_count="$3"
   local canonical_baseline_verified="$4"
@@ -597,19 +448,7 @@ classify_dynamodb_partition() {
   return 1
 }
 
-# classify_ecr_repository REPOSITORY_URI EXPECTED_URI_MATCH
-#                          WORKLOAD_REFERENCE_CHECK_VERIFIED
-#                          ARGO_REFERENCE_CHECK_VERIFIED
-#                          LIVE_REFERENCE_COUNT IMAGE_INVENTORY_VERIFIED
-#                          HAS_UNEXPECTED_IMAGES CANONICAL_BASELINE_VERIFIED
-#
-# The repository is never classified before its image inventory
-# (describe-images) has been attempted -- IMAGE_INVENTORY_VERIFIED=false
-# (a failed/unavailable describe-images call) blocks unconditionally, the
-# same way every other unverified check does. An exact empty repository
-# (image_inventory_verified=true, has_unexpected_images=false because
-# there are zero images to be unexpected) may still be eligible when every
-# other check passes.
+# Blocks unconditionally when IMAGE_INVENTORY_VERIFIED is false; an exact-empty repository (verified, zero images) can still be eligible if every other check passes.
 classify_ecr_repository() {
   local expected_uri_match="$2" workload_verified="$3" argo_verified="$4"
   local live_reference_count="$5" image_inventory_verified="$6"
@@ -650,10 +489,6 @@ classify_ecr_repository() {
   return 1
 }
 
-# classify_observer_image TAGS_JSON REPOSITORY_URI_MATCH
-#                          WORKLOAD_REFERENCE_CHECK_VERIFIED
-#                          ARGO_REFERENCE_CHECK_VERIFIED
-#                          LIVE_REFERENCE_COUNT CANONICAL_BASELINE_VERIFIED
 classify_observer_image() {
   local tags_json="$1" repository_uri_match="$2" workload_verified="$3" argo_verified="$4"
   local live_reference_count="$5" canonical_baseline_verified="$6"
@@ -693,14 +528,7 @@ classify_observer_image() {
   return 1
 }
 
-# ===========================================================================
-# Section 3: manifest accumulation. jq -c is used throughout (matching this
-# repository's established convention in .github/workflows/goldengate-eks-
-# app.yaml and hack/detect-goldengate-deployments.sh) so the final manifest
-# is always valid, deterministically-ordered JSON -- never hand-built via
-# string concatenation.
-# ===========================================================================
-
+# Section 3: manifest accumulation (jq -c throughout for deterministic, valid JSON -- never hand-built via string concatenation).
 CANDIDATES_PV="[]"
 CANDIDATES_EFS_AP="[]"
 CANDIDATES_STORAGE_CLASS="[]"
@@ -744,14 +572,7 @@ add_permission_gap() {
   PERMISSION_GAPS="$(echo "$PERMISSION_GAPS" | jq -c --arg gap "$gap" '. + [$gap] | unique')"
 }
 
-# ===========================================================================
-# Section 4: live, read-only collection. Every AWS CLI/kubectl/argocd call
-# below is Describe/Get/List/Query only. Each is wrapped so a missing
-# permission or unreachable cluster produces a permission-gap entry in the
-# manifest instead of crashing the script or being silently treated as
-# "safe to delete."
-# ===========================================================================
-
+# Section 4: live, read-only collection (Describe/Get/List/Query only); a missing permission or unreachable cluster becomes a permission-gap entry, never a crash or silent "safe to delete."
 HAVE_KUBECTL="false"
 command -v kubectl >/dev/null 2>&1 && HAVE_KUBECTL="true"
 HAVE_AWS="false"
@@ -769,12 +590,7 @@ BASELINE_ENVIRONMENT_OK="false"
 [ "$ENVIRONMENT" = "$ENVIRONMENT_EXPECTED" ] && BASELINE_ENVIRONMENT_OK="true"
 echo "environment: expected=${ENVIRONMENT_EXPECTED} observed=${ENVIRONMENT} match=${BASELINE_ENVIRONMENT_OK}"
 
-# Two legitimate, distinct AWS account contexts: the primary session
-# established by the workflow (build/ECR account, 229410149234 -- used
-# as-is for ECR repository/image inspection) and a separate, temporary
-# workload-account session assumed via EKS_DEPLOY_ROLE_ARN (668311715351 --
-# used for EFS/DynamoDB/STS baseline). Neither is inferred from the other;
-# each is independently verified via its own sts:GetCallerIdentity call.
+# Build/ECR account (229410149234, primary session) and workload account (668311715351, via EKS_DEPLOY_ROLE_ARN) are independently verified, never inferred from each other.
 BASELINE_BUILD_ACCOUNT_OK="false"
 BASELINE_WORKLOAD_ACCOUNT_OK="false"
 BASELINE_REGION_OK="false"
@@ -929,10 +745,7 @@ if [ "$HAVE_KUBECTL" = "true" ]; then
   BASELINE_PVCS_BOUND="$ALL_PVCS_BOUND"
   [ "$ALL_PV_INFO_OBTAINED" = "true" ] && [ "${#CANONICAL_VOLUME_HANDLES[@]}" -eq "${#CANONICAL_PVC_NAMES[@]}" ] && BASELINE_CANONICAL_PV_INFO_OBTAINED="true"
 
-  # Global list reads reused across Sections C/D/F -- read exactly once,
-  # verified flag reused everywhere it applies rather than re-reading (and
-  # rather than letting one section's failure be masked by another
-  # section's independent, possibly-successful read of the same kind).
+  # Global list reads reused across Sections C/D/F -- read exactly once, never re-read or masked by another section's independent read.
   run_kubectl_json get pvc -A
   if [ "$LAST_KUBECTL_OK" = "true" ]; then
     PVC_LIST_JSON="$LAST_KUBECTL_JSON"
@@ -955,16 +768,7 @@ else
   echo "kubectl not available on this runner -- reporting as a permission gap."
 fi
 
-# --- Shared monitor functional validation (task section 3) -----------------
-# Manager-aligned, read-only DynamoDB validation of the canonical CONFIG /
-# LEASE / STATE#_deployment records for each canonical partition -- this is
-# the same schema monitor.py's portal/API reads (RECORD_TYPE_CONFIG,
-# RECORD_TYPE_LEASE, RECORD_TYPE_DEPLOYMENT_STATE; see the Section 0
-# comment above DYNAMODB_TABLE), so it is treated as equivalent to the
-# portal/API contract. No Kubernetes Services/proxy RBAC is used or added
-# for this: the only kubectl call here is a read-only Deployment Get, used
-# solely to discover the monitor's own deployed STALE_AFTER_SECONDS value
-# so this script never invents a separate freshness threshold.
+# Read-only DynamoDB validation of canonical CONFIG/LEASE/STATE#_deployment records, matching monitor.py's own schema; STALE_AFTER_SECONDS is read from the live gg-monitor Deployment, never invented separately.
 echo "Validating shared monitor via canonical DynamoDB CONFIG/LEASE/STATE records (workload account)..."
 BASELINE_MONITOR_VALIDATED="false"
 MONITOR_STALE_AFTER_SECONDS=""
@@ -1025,12 +829,7 @@ if [ "$MONITOR_STALE_AFTER_SECONDS_VERIFIED" = "true" ]; then
     LEASE_ITEM="$(echo "$ITEMS_JSON" | jq -c '[.Items[]? | select(.recordType.S=="LEASE")] | first // {}')"
     STATE_ITEM="$(echo "$ITEMS_JSON" | jq -c '[.Items[]? | select(.recordType.S=="STATE#_deployment")] | first // {}')"
 
-    # jq's `//` alternative operator treats a literal `false` as falsy (the
-    # same as null/absent), so `.field.BOOL // "MISSING"` would silently
-    # turn a correct, explicit `false` into "MISSING". Every DynamoDB BOOL
-    # field is extracted with an explicit true/false/MISSING three-way
-    # check instead, so an explicit false is never confused with "the field
-    # was never verified".
+    # jq's // treats literal false as falsy, so .field.BOOL // "MISSING" would hide an explicit false; every BOOL field uses this explicit three-way check instead.
     BOOL_FIELD_JQ='if . == true then "true" elif . == false then "false" else "MISSING" end'
     METRICS_ENABLED="$(echo "$CONFIG_ITEM" | jq -r ".metricsEnabled.BOOL | ${BOOL_FIELD_JQ}")"
     ALERTS_ENABLED="$(echo "$CONFIG_ITEM" | jq -r ".alertsEnabled.BOOL | ${BOOL_FIELD_JQ}")"
@@ -1126,11 +925,7 @@ if [ "$HAVE_KUBECTL" = "true" ]; then
       AP_ID="$(efs_ap_id_from_handle "$VOLUME_HANDLE")"
     fi
 
-    # Active PVC reference: derived from the verified global PVC list
-    # (Section A: PVC_LIST_JSON/PVC_LIST_VERIFIED), never from PV phase
-    # alone or a stale claimRef. A PVC references this PV when
-    # .spec.volumeName == pv_id. A failed/unavailable PVC list read blocks
-    # eligibility -- it is never converted into "not referenced".
+    # Active PVC reference is proven from the verified global PVC list (.spec.volumeName == pv_id), never PV phase or a stale claimRef; an unverified read blocks, never "not referenced".
     PVC_REFERENCE_CHECK_VERIFIED="$PVC_LIST_VERIFIED"
     REFERENCED_BY_ACTIVE_PVC="false"
     REFERENCING_PVC_NAMES="[]"
@@ -1143,12 +938,7 @@ if [ "$HAVE_KUBECTL" = "true" ]; then
       add_permission_gap "KUBECTL_PVC_LIST_PERMISSION_MISSING"
     fi
 
-    # Referenced by any running pod's volumes? Checked against every
-    # discovered referencing PVC's namespace/name from the scan above --
-    # never a stale claimRef. With no referencing PVC to check, the check
-    # is vacuously verified-true and referenced=false, never "unperformed
-    # but assumed safe". A failed pod-list read is never converted into
-    # "zero references".
+    # Checked only against discovered referencing PVCs; a failed pod-list read blocks (never "zero references"), and no referencing PVC means vacuously verified/not-referenced.
     POD_REFERENCE_CHECK_VERIFIED="true"
     REFERENCED_BY_POD="false"
     while IFS= read -r pvc_entry; do
@@ -1208,10 +998,7 @@ if [ "$HAVE_AWS" = "true" ]; then
   for ap_id in "${CANDIDATE_EFS_ACCESS_POINT_IDS[@]}"; do
     run_workload_aws_json efs describe-access-points --access-point-id "$ap_id" --region "$AWS_REGION_EXPECTED"
     if [ "$LAST_WORKLOAD_SESSION_OK" != "true" ]; then
-      # The workload-account session itself (AssumeRole of
-      # EKS_DEPLOY_ROLE_ARN) could not be established -- this is never
-      # treated as "not found" or "absent". EFS lives in the workload
-      # account, so without that session no EFS evidence is trustworthy.
+      # EFS lives in the workload account; an unestablished session is never treated as "not found"/"absent".
       add_permission_gap "WORKLOAD_ASSUME_ROLE_PERMISSION_MISSING"
       echo "EFS access point ${ap_id}: could not establish workload-account session -- reporting as a permission gap and blocking."
       add_candidate CANDIDATES_EFS_AP "EfsAccessPoint" "$ap_id" "blocked" "{}" "workload_account_session_unavailable;"
@@ -1223,9 +1010,7 @@ if [ "$HAVE_AWS" = "true" ]; then
       continue
     fi
     if [ "$LAST_WORKLOAD_AWS_OK" != "true" ] || [ "$(echo "$LAST_WORKLOAD_AWS_JSON" | jq -r '.AccessPoints | length')" -eq 0 ]; then
-      # A failed or ambiguous describe call is never converted into
-      # "does not exist"/"unused" -- always a permission gap plus a
-      # blocked candidate.
+      # A failed/ambiguous describe call is never converted into "does not exist"/"unused" -- always a permission gap plus blocked candidate.
       add_permission_gap "EFS_METADATA_PERMISSION_MISSING"
       echo "EFS access point ${ap_id}: workload-account describe call did not succeed or returned no access point -- reporting as a permission gap and blocking."
       add_candidate CANDIDATES_EFS_AP "EfsAccessPoint" "$ap_id" "blocked" "{}" "describe_call_did_not_succeed;"
@@ -1239,10 +1024,7 @@ if [ "$HAVE_AWS" = "true" ]; then
     POSIX_USER="$(echo "$AP_JSON" | jq -c '.AccessPoints[0].PosixUser // {}')"
     TAGS="$(echo "$AP_JSON" | jq -c '.AccessPoints[0].Tags // []')"
 
-    # A Bound PV referencing this access point? Uses the single global PV
-    # list already fetched (and its verified flag) in Section A -- never a
-    # fresh, independently-fallible read per access point, and never
-    # converted into "false" when that list read failed.
+    # Uses the single global PV list from Section A -- never a fresh per-access-point read, and never "false" when that read failed.
     REFERENCED_BY_BOUND_PV="false"
     if [ "$PV_LIST_VERIFIED" = "true" ]; then
       BOUND_PV_REFS="$(echo "$PV_LIST_JSON" | jq -r --arg ap "$ap_id" \
@@ -1284,16 +1066,13 @@ echo ""
 # --- D. StorageClass validation ---------------------------------------------
 echo "--- D. StorageClass validation ---"
 if [ "$HAVE_KUBECTL" = "true" ]; then
-  # Canonical StorageClasses: RETAIN unconditionally, recorded only in
-  # blocked (informational) -- never classified, never placed in
-  # candidates.storageClasses.
+  # Canonical StorageClasses: RETAIN unconditionally, recorded only in blocked -- never classified, never a candidate.
   for sc_name in "${CANONICAL_STORAGE_CLASSES[@]}"; do
     add_blocked "StorageClass" "$sc_name" "retain_canonical"
     echo "StorageClass ${sc_name}: RETAIN (canonical) -- recorded in blocked, never a candidate."
   done
 
-  # Legacy StorageClass: existence must be proven first (a real kubectl
-  # NotFound, not merely an empty/failed read).
+  # Legacy StorageClass existence must be proven first (a real kubectl NotFound, not merely an empty/failed read).
   run_kubectl_json get storageclass "$LEGACY_STORAGE_CLASS"
   LEGACY_SC_EXISTS_STATE="unknown"
   if [ "$LAST_KUBECTL_NOTFOUND" = "true" ]; then
@@ -1355,9 +1134,7 @@ if [ "$HAVE_AWS" = "true" ]; then
       --region "$AWS_REGION_EXPECTED"
 
     if [ "$LAST_WORKLOAD_SESSION_OK" != "true" ]; then
-      # DynamoDB lives in the workload account. Without a successfully
-      # assumed EKS_DEPLOY_ROLE_ARN session, no query result is
-      # trustworthy -- never fall back to the build-account session.
+      # DynamoDB lives in the workload account; without a successfully assumed session, no query result is trustworthy.
       add_permission_gap "WORKLOAD_ASSUME_ROLE_PERMISSION_MISSING"
       echo "DynamoDB partition ${pipeline_id}: could not establish workload-account session -- reporting as a permission gap and blocking."
       add_candidate CANDIDATES_DYNAMODB "DynamoDbPartition" "$pipeline_id" "blocked" "{}" "workload_account_session_unavailable;"
@@ -1409,10 +1186,7 @@ echo ""
 # --- F. Observer ECR inventory ----------------------------------------------
 echo "--- F. Observer ECR inventory ---"
 
-# Cluster-wide workload reference sweep -- read exactly once (four list
-# calls, one per kind), combined into one workloadReferenceCheckVerified
-# flag: ALL four must succeed for the count to be trusted at all. A
-# failure of any one of them is never converted into "zero references".
+# Combines four list calls (one per kind) into one workloadReferenceCheckVerified flag -- ALL four must succeed for the count to be trusted; any failure is never "zero references".
 WORKLOAD_REFERENCE_CHECK_VERIFIED="false"
 LIVE_WORKLOAD_REFERENCE_COUNT=0
 if [ "$HAVE_KUBECTL" = "true" ]; then
@@ -1433,12 +1207,7 @@ else
   add_permission_gap "KUBECTL_UNAVAILABLE"
 fi
 
-# Argo CD Application reference inspection -- reuses the single Application
-# list already fetched (and its verified flag) in Section A. Inspects both
-# spec.source (single-source Applications) and spec.sources[] (multi-
-# source Applications) Helm parameter values for an observer repository
-# reference. A failed/unavailable Application list is never converted into
-# "zero references".
+# Reuses the Application list from Section A; inspects both spec.source and spec.sources[] for an observer repository reference; an unavailable list is never "zero references".
 ARGO_REFERENCE_CHECK_VERIFIED="$ARGOCD_APPS_VERIFIED"
 if [ "$ARGOCD_APPS_VERIFIED" = "true" ]; then
   ARGO_REF_COUNT="$(echo "$ARGOCD_APPS_JSON" | jq -r --arg repo "$OBSERVER_ECR_REPOSITORY" '
@@ -1469,9 +1238,7 @@ if [ "$HAVE_AWS" = "true" ]; then
     [ "$REPO_URI" = "$OBSERVER_ECR_REPOSITORY_URI_EXPECTED" ] && REPO_URI_MATCH="true"
     echo "Repository ${OBSERVER_ECR_REPOSITORY}: uri=${REPO_URI} expectedUriMatch=${REPO_URI_MATCH} created=${REPO_CREATED}"
 
-    # Image inventory MUST be gathered before the repository is classified
-    # -- repository eligibility depends on it (imageInventoryVerified, and
-    # whether any unexpected/non-observer-tagged image is present).
+    # Image inventory must be gathered before the repository is classified -- eligibility depends on imageInventoryVerified/hasUnexpectedImages.
     IMAGE_INVENTORY_VERIFIED="false"
     HAS_UNEXPECTED_IMAGES="false"
     IMAGES_JSON="[]"
@@ -1578,25 +1345,14 @@ echo "script never guesses live ALB/Route 53 rule ownership from a hostname"
 echo "pattern -- reported informationally only, never as a delete candidate."
 echo ""
 
-# ===========================================================================
 # Section 5: assemble and emit the final manifest.
-# ===========================================================================
-
 INVENTORY_COMPLETE="false"
 [ "$(echo "$PERMISSION_GAPS" | jq 'length')" -eq 0 ] && INVENTORY_COMPLETE="true"
 
 ELIGIBILITY_READY="false"
 [ "$CANONICAL_BASELINE_VERIFIED" = "true" ] && [ "$INVENTORY_COMPLETE" = "true" ] && ELIGIBILITY_READY="true"
 
-# enforce_eligibility_readiness LIST_VAR
-#
-# Deterministically enforces the summary's own stated contract ("no
-# candidate is ever eligible unless eligibilityReady is true"): downgrades
-# every eligibility=="eligible" entry in LIST_VAR to "blocked" when
-# ELIGIBILITY_READY is not true, appending inventory_not_eligibility_ready
-# to its blockingReasons. The underlying resource-level evidence object is
-# never removed or altered -- only the final eligibility verdict and
-# blockingReasons are adjusted. A no-op when ELIGIBILITY_READY is true.
+# Downgrades every eligible entry in LIST_VAR to blocked (appending inventory_not_eligibility_ready) when ELIGIBILITY_READY isn't true; evidence is preserved, only the verdict changes; no-op otherwise.
 enforce_eligibility_readiness() {
   local list_var="$1"
   [ "$ELIGIBILITY_READY" = "true" ] && return 0
@@ -1743,9 +1499,7 @@ if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
   echo "$SUMMARY" >> "$GITHUB_STEP_SUMMARY"
 fi
 
-# Only small scalar outputs go to GITHUB_OUTPUT -- the full (potentially
-# large) manifest is never written there. It is printed to the job log and
-# the job summary above, which is where it must be reviewed.
+# Only small scalar outputs go to GITHUB_OUTPUT -- the full manifest is only printed to the job log/summary.
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
   echo "inventory_complete=${INVENTORY_COMPLETE}" >> "$GITHUB_OUTPUT"
   echo "eligibility_ready=${ELIGIBILITY_READY}" >> "$GITHUB_OUTPUT"

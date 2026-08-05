@@ -1,40 +1,4 @@
-"""goldengate-metrics-config.py: exact, conditional CONFIG.metricsEnabled
-update helper for a single canonical GoldenGate deployment.
-
-Phase 6C1. This file is never imported -- it is piped as source into a
-`python3 -` process running INSIDE the existing, authenticated, Ready
-gg-monitor pod (IRSA role GoldenGateMonitorReadRole-dev already grants the
-DynamoDB GetItem/UpdateItem this needs on gg-eks-pipeline; no new IAM
-permission is required or added). It intentionally has no imports beyond the
-standard library plus boto3 (already present in the monitor image), reads
-AWS_REGION/DYNAMODB_TABLE from the pod's existing environment, and accepts
-exactly four positional arguments -- nothing else:
-
-    python3 - <deployment> <canonical_type> <true|false> <true|false> < this_file
-
-    argv[1]  deployment name (DynamoDB partition key "pipeline")
-    argv[2]  canonical deployment type (must match CONFIG.deploymentType)
-    argv[3]  desired metricsEnabled value -- literal "true" or "false"
-    argv[4]  apply_change -- literal "true" (perform the UpdateItem if
-             needed) or "false" (dry run: validate and report only)
-
-Never uses Scan. Never reads or prints the complete CONFIG item, an AWS
-credential, or a web-identity token. Only ever updates the single attribute
-metricsEnabled -- deploymentType, alertsEnabled, and every other attribute
-are read for validation only and are never written by this script.
-
-Phase 6C1 correction: every GetItem (the initial read and the post-update
-verification read) uses ConsistentRead=True -- these are low-volume
-control-plane reads, at most a couple per invocation, and a rollout decision
-must never be made from an eventually consistent value. UpdateItem uses
-ReturnValues="ALL_NEW" and the returned attributes are validated directly, in
-addition to (not instead of) the separate strongly consistent GetItem
-verification that follows. A small bounded retry applies ONLY to the
-post-update verification read, and only for transport-level failures
-(throttling/internal-server/timeout-shaped codes) -- a
-ConditionalCheckFailedException from UpdateItem is never retried, and this
-script issues at most one UpdateItem per invocation.
-"""
+"""Exact, conditional CONFIG.metricsEnabled update helper, piped as source into `python3 -` inside the gg-monitor pod."""
 from __future__ import annotations
 
 import os
@@ -43,9 +7,7 @@ import time
 
 
 def _parse_strict_bool_arg(raw, label):
-    """Only the exact strings "true"/"false" are accepted -- matches
-    collector.py's own fail-closed Boolean parsing convention. Anything
-    else (empty, "True", "1", "yes", ...) is a usage error."""
+    """Only the exact strings "true"/"false" are accepted; anything else is a usage error."""
     if raw == "true":
         return True
     if raw == "false":
@@ -90,11 +52,7 @@ def main():
     }
 
     def _consistent_verification_get_item(max_attempts=3):
-        # Bounded retry for the post-update verification read ONLY, and
-        # only for transport-shaped failures -- never used for the initial
-        # read, and never used to retry a ConditionalCheckFailedException
-        # from UpdateItem (that is handled separately below and is never
-        # retried).
+        # Bounded retry for transport-shaped failures on the post-update verification read only.
         for attempt in range(1, max_attempts + 1):
             try:
                 return table.get_item(
@@ -107,9 +65,7 @@ def main():
                     raise
                 time.sleep(0.5 * attempt)
 
-    # 1. Read the current CONFIG item (GetItem only, never Scan; strongly
-    # consistent -- this control-plane read directly drives the rollout
-    # decision below and must never be based on a stale replica).
+    # 1. Read the current CONFIG item (GetItem only, strongly consistent -- this drives the rollout decision).
     try:
         item = table.get_item(
             Key={"pipeline": deployment, "recordType": "CONFIG"},
@@ -146,8 +102,7 @@ def main():
         print(f"action={action}")
 
     if not apply_change:
-        # Dry run: validation already passed above -- report the proposed
-        # action only, no UpdateItem, exit successfully.
+        # Dry run: report the proposed action only, no UpdateItem.
         action = "none" if current_metrics_enabled == desired_metrics_enabled else "plan"
         report(action)
         return
@@ -157,11 +112,7 @@ def main():
         report("none")
         return
 
-    # 2. Conditional UpdateItem -- metricsEnabled only, guarded by an
-    # optimistic-concurrency condition on every field this decision was
-    # based on, so an unnoticed concurrent change (by anyone/anything else)
-    # between the GetItem above and this UpdateItem is rejected rather than
-    # silently overwritten.
+    # 2. Conditional UpdateItem: an optimistic-concurrency condition rejects any concurrent change since the GetItem.
     condition = (
         Attr("pipeline").exists()
         & Attr("recordType").eq("CONFIG")
@@ -169,9 +120,7 @@ def main():
         & Attr("alertsEnabled").eq(False)
         & Attr("metricsEnabled").eq(current_metrics_enabled)
     )
-    # This is the ONLY UpdateItem call site in this script -- at most one
-    # conditional write is ever issued per invocation, and a
-    # ConditionalCheckFailedException below is never retried/re-attempted.
+    # The only UpdateItem call site in this script; a ConditionalCheckFailedException below is never retried.
     try:
         update_response = table.update_item(
             Key={"pipeline": deployment, "recordType": "CONFIG"},
@@ -190,8 +139,7 @@ def main():
             )
         sys.exit(f"FAIL: DynamoDB UpdateItem failed: {code}")
 
-    # 3. Validate the ALL_NEW attributes DynamoDB returned with the
-    # UpdateItem response itself -- before ever issuing a second read.
+    # 3. Validate the ALL_NEW attributes from the UpdateItem response itself, before issuing a second read.
     new_attributes = update_response.get("Attributes")
     if not isinstance(new_attributes, dict):
         sys.exit(f"FAIL: UpdateItem for deployment={deployment} did not return ALL_NEW attributes.")
@@ -205,9 +153,7 @@ def main():
     if new_attributes.get("deploymentType") != canonical_type:
         sys.exit("FAIL: UpdateItem ALL_NEW attributes show deploymentType changed unexpectedly.")
 
-    # 4. A second, independent, strongly consistent GetItem verification
-    # (bounded retry for transport failures only -- see
-    # _consistent_verification_get_item above).
+    # 4. A second, independent, strongly consistent GetItem verification.
     try:
         verify_item = _consistent_verification_get_item()
     except ClientError as exc:

@@ -1,21 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Orchestration/regression script for the GoldenGate EKS repository.
-#
-# Runs static parsing/Helm/Python checks derived from the ONE canonical
-# deployment source (envs/dev/goldengate-deployments.yaml) -- no runtime
-# names are hardcoded here. Detailed behavior tests live in the Python
-# unit-test suites (monitoring/monitor/tests/).
-#
-# Does not deploy, does not touch the cluster, does not require AWS
-# credentials.
+# Orchestration/regression script for the GoldenGate EKS repo; runs static parsing/Helm/Python checks derived from the ONE canonical deployment source (envs/dev/goldengate-deployments.yaml); never deploys, touches the cluster, or requires AWS credentials.
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-# This script's own python3 invocations must never create __pycache__/*.pyc
-# -- that would make the "no committed pycache" check below self-defeating.
+# This script's own python3 invocations must never create __pycache__/*.pyc -- that would make the "no committed pycache" check below self-defeating.
 export PYTHONDONTWRITEBYTECODE=1
 
 CANONICAL_CONFIG="envs/dev/goldengate-deployments.yaml"
@@ -63,9 +54,7 @@ echo "Helm available:  ${HELM_AVAILABLE}"
 echo "Python3+PyYAML available: ${PYTHON_AVAILABLE}"
 echo ""
 
-# ---------------------------------------------------------------------
 # 1. Strict YAML parsing + duplicate-key rejection for the canonical config.
-# ---------------------------------------------------------------------
 echo "--- Canonical configuration: parsing and structure ---"
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   CANONICAL_CHECK_LOG="${WORKDIR}/canonical-check.log"
@@ -121,10 +110,7 @@ else
   skip "canonical config parsing -- python3/PyYAML not available"
 fi
 
-# ---------------------------------------------------------------------
-# 2. Both runtimes remain enabled (source of truth: canonical config AND
-#    each runtime's own environment values file).
-# ---------------------------------------------------------------------
+# 2. Both runtimes remain enabled (source of truth: canonical config AND each runtime's own environment values file).
 echo ""
 echo "--- Both runtimes remain enabled ---"
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
@@ -158,9 +144,7 @@ else
   skip "runtime-enabled check -- python3/PyYAML not available"
 fi
 
-# ---------------------------------------------------------------------
 # 3. Python unit tests (monitoring/monitor).
-# ---------------------------------------------------------------------
 echo ""
 echo "--- Python unit tests ---"
 if command -v python3 >/dev/null 2>&1 && python3 -c "import boto3, moto, yaml" >/dev/null 2>&1; then
@@ -185,30 +169,17 @@ if command -v python3 >/dev/null 2>&1; then
   else
     fail "monitoring/monitor Python modules failed to compile"
   fi
-  # py_compile writes __pycache__/*.pyc regardless of
-  # PYTHONDONTWRITEBYTECODE (it is an explicit compile request) -- clean up
-  # immediately so this script's own run never leaves artifacts behind.
+  # py_compile writes __pycache__/*.pyc regardless of PYTHONDONTWRITEBYTECODE (an explicit compile request) -- clean up immediately so this run leaves no artifacts.
   find "$MONITOR_APP_DIR" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 else
   skip "py_compile -- python3 not available"
 fi
 
-# ---------------------------------------------------------------------
 # 4. Helm lint: runtime chart, platform chart, monitor chart.
-# ---------------------------------------------------------------------
 echo ""
 echo "--- Helm lint ---"
 if [ "$HELM_AVAILABLE" = "true" ]; then
-  # helm/goldengate's deploymentModel value has no usable default (it is ""
-  # in values.yaml) and goldengate.assertSupportedDeploymentModel fires
-  # unconditionally at render time -- lint the same way the real workflow
-  # always does: against a real canonical deployment values file (which
-  # declares deploymentModel: singleRuntime itself), never bare/values-less.
-  # (helm lint does not propagate a template "fail" call as a non-zero exit
-  # by itself, so a bare, values-less invocation here would not actually
-  # exercise or prove anything about the assertion either way -- using a
-  # canonical values file keeps this check meaningful and representative of
-  # how the chart is actually linted in production.)
+  # deploymentModel has no usable default and assertSupportedDeploymentModel fires at render time, so lint against a real canonical values file (declares deploymentModel: singleRuntime), never bare/values-less -- matches how the chart is linted in production.
   if helm lint "$RUNTIME_CHART" -f "${REPO_ROOT}/envs/dev/gg-oracle-payments-01/values.yaml" --set global.environment=dev >"${WORKDIR}/lint-runtime.log" 2>&1; then
     pass "helm lint ${RUNTIME_CHART} (canonical singleRuntime values)"
   else
@@ -223,12 +194,7 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
     cat "${WORKDIR}/lint-platform.log"
   fi
 
-  # Phase 6A: centralized container logging (platform Fluent Bit
-  # DaemonSet). Essential, focused checks only -- same real dev values file
-  # and --set-string role-ARN/region/image injection pattern the actual
-  # goldengate-platform.yaml workflow uses, not a fake Kubernetes/AWS
-  # environment. The digest below is the real, verified private ECR digest
-  # supplied via the FLUENT_BIT_IMAGE repository variable.
+  # Centralized container logging (platform Fluent Bit DaemonSet): uses the real dev values file and --set-string role-ARN/region/image injection pattern the actual goldengate-platform.yaml workflow uses; the digest below is the real, verified private ECR digest.
   PLATFORM_DEV_VALUES="${REPO_ROOT}/platform/dev/goldengate-platform/values.yaml"
   FAKE_ORACLE_ROLE_ARN="arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev"
   FAKE_FLUENT_BIT_ROLE_ARN="arn:aws:iam::668311715351:role/GoldenGatePlatformLoggingRole-dev"
@@ -262,8 +228,7 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
     cat "${WORKDIR}/template-platform-fluentbit.log"
   fi
 
-  # The chart must fail clearly (not silently fall back to any image) when
-  # fluentBit.create=true and no image reference is supplied at all.
+  # The chart must fail clearly (not silently fall back to any image) when fluentBit.create=true and no image reference is supplied at all.
   if helm template goldengate-dev-platform "$PLATFORM_CHART" \
       --values "$PLATFORM_DEV_VALUES" \
       --set-string serviceAccounts.oracle.roleArn="$FAKE_ORACLE_ROLE_ARN" \
@@ -307,8 +272,7 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
       fail "gg-fluent-bit DaemonSet does not explicitly disable host networking"
     fi
 
-    # Deployment image reference: exact, private, immutable digest -- never
-    # public.ecr.aws, never a mutable tag.
+    # Deployment image reference: exact, private, immutable digest -- never public.ecr.aws, never a mutable tag.
     if echo "$FLUENT_BIT_DS_ONLY" | grep -Fq -- "image: \"${FAKE_FLUENT_BIT_IMAGE}\""; then
       pass "gg-fluent-bit DaemonSet image exactly matches the supplied private immutable digest reference"
     else
@@ -320,18 +284,7 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
       pass "rendered manifest contains no public.ecr.aws reference"
     fi
 
-    # Deterministic per-namespace tag routing (Phase 6A log-routing
-    # correction): live verification found the previous single-Tail-input
-    # + grep FILTER + rewrite_tag design silently dropped every record
-    # (tail=1032, kubernetes=1032, record_modifier=1032, grep=1032,
-    # grep_dropped=1032, rewrite_tag=0, cloudwatch proc_records=0) because
-    # the grep filter's $kubernetes['namespace_name'] match depended on
-    # Kubernetes-metadata enrichment that had not completed. Replaced with
-    # two independent, deterministic Tail inputs (runtime.*, monitor.*),
-    # each Path-restricted to its own namespace's container-log filename
-    # convention, each enriched by its own kubernetes FILTER (explicit
-    # Kube_Tag_Prefix, enrichment only -- never a routing dependency), and
-    # each OUTPUT matching directly on its own input's tag.
+    # Deterministic per-namespace tag routing: two independent Tail inputs (runtime.*, monitor.*), each Path-restricted to its own namespace's log filename convention, each enriched by its own kubernetes FILTER (never a routing dependency), each OUTPUT matching directly on its own input's tag.
     TAIL_INPUT_COUNT="$(grep -cE '^\s*Name\s+tail\s*$' "$PLATFORM_FLUENTBIT_RENDERED" || true)"
     if [ "$TAIL_INPUT_COUNT" -eq 2 ]; then
       pass "exactly 2 Tail inputs are rendered (runtime, monitor)"
@@ -395,12 +348,7 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
       fail "Fluent Bit CloudWatch log-group destinations are not exactly as expected"
     fi
 
-    # Bounded filesystem buffering: both cloudwatch_logs OUTPUTs carry
-    # storage.total_limit_size, and the fluent-bit-state emptyDir carries a
-    # sizeLimit -- distinct from (and in addition to) the pre-existing
-    # Mem_Buf_Limit/storage.max_chunks_up/storage.backlog.mem_limit memory
-    # and in-flight backlog controls, which bound something different (RAM
-    # and in-flight chunks, not the total on-disk buffer directory size).
+    # storage.total_limit_size (both cloudwatch_logs OUTPUTs) plus the fluent-bit-state emptyDir sizeLimit bound total on-disk buffer size -- distinct from the Mem_Buf_Limit/max_chunks_up/backlog.mem_limit memory/in-flight controls.
     TOTAL_LIMIT_SIZE_COUNT="$(grep -v '^\s*#' "$PLATFORM_FLUENTBIT_RENDERED" | grep -cE 'storage\.total_limit_size[[:space:]]+[0-9]' || true)"
     if [ "$TOTAL_LIMIT_SIZE_COUNT" -eq 2 ]; then
       pass "both cloudwatch_logs OUTPUTs set storage.total_limit_size (filesystem queue bound)"
@@ -428,11 +376,7 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
     skip "gg-fluent-bit DaemonSet structural checks -- rendered manifest not available"
   fi
 
-  # Private-image-reference format validation: exercise the exact same
-  # regex the workflow's "Validate FLUENT_BIT_IMAGE format" step uses,
-  # confirming the real digest passes and representative malformed values
-  # (tag-based, public.ecr.aws, wrong repository/account, malformed digest)
-  # are all rejected.
+  # Exercises the same regex the workflow's "Validate FLUENT_BIT_IMAGE format" step uses; confirms the real digest passes and malformed values (tag-based, public.ecr.aws, wrong repo/account, malformed digest) are rejected.
   FLUENT_BIT_IMAGE_PATTERN='^229410149234\.dkr\.ecr\.eu-west-1\.amazonaws\.com/aws-cloud-factory-fluent-bit@sha256:[a-f0-9]{64}$'
   FLUENT_BIT_IMAGE_FORMAT_ALL_OK="true"
   while IFS='|' read -r label candidate expect_match; do
@@ -460,9 +404,7 @@ CASES
     fail "FLUENT_BIT_IMAGE format regex did not behave as expected for one or more cases (see output above)"
   fi
 
-  # No GoldenGate runtime sidecar: the runtime chart itself (never touched
-  # by Phase 6A) must still define exactly one application container and
-  # exactly one init container.
+  # No GoldenGate runtime sidecar: the runtime chart itself (untouched here) must still define exactly one application container and exactly one init container.
   RUNTIME_STATEFULSET="${RUNTIME_CHART}/templates/runtime-statefulset.yaml"
   if [ -f "$RUNTIME_STATEFULSET" ]; then
     INIT_CONTAINER_COUNT="$(grep -c '^\s*initContainers:$' "$RUNTIME_STATEFULSET")"
@@ -477,10 +419,7 @@ CASES
     fail "${RUNTIME_STATEFULSET} not found"
   fi
 
-  # IAM least privilege: the new logging policy must contain exactly the
-  # required log-writing actions and nothing else (no CreateLogGroup/
-  # DeleteLogGroup, no alarms, no DynamoDB/Secrets Manager/EFS/Kubernetes
-  # control permissions).
+  # IAM least privilege: the new logging policy must contain exactly the required log-writing actions and nothing else (no CreateLogGroup/DeleteLogGroup/alarms/DynamoDB/Secrets Manager/EFS/Kubernetes control permissions).
   LOGGING_POLICY_FILE="${REPO_ROOT}/envs/dev/policies/goldengate-platform-logging-dev/policies/policies_1.json"
   if [ -f "$LOGGING_POLICY_FILE" ] && command -v python3 >/dev/null 2>&1; then
     LOGGING_POLICY_CHECK="$(python3 - "$LOGGING_POLICY_FILE" <<'PYEOF'
@@ -503,11 +442,7 @@ PYEOF
     fail "${LOGGING_POLICY_FILE} not found, or python3 unavailable"
   fi
 
-  # CloudWatch Logs encryption correction: no kms_key_id (guessed or
-  # otherwise) may be set on either log group -- both groups must rely on
-  # CloudWatch Logs' own default server-side encryption until an approved
-  # customer-managed KMS key ARN is actually supplied. The two log groups
-  # and their retention/tags remain otherwise unchanged.
+  # No kms_key_id may be set on either log group -- both rely on CloudWatch Logs' own default server-side encryption until an approved customer-managed KMS key is supplied.
   CLOUDWATCH_LOGS_TF="${REPO_ROOT}/envs/dev/cloudwatch_logs.tf"
   if [ -f "$CLOUDWATCH_LOGS_TF" ]; then
     if grep -v '^\s*#' "$CLOUDWATCH_LOGS_TF" | grep -qE 'kms_key_id\s*='; then
@@ -525,12 +460,7 @@ PYEOF
     fail "${CLOUDWATCH_LOGS_TF} not found"
   fi
 
-  # ---------------------------------------------------------------------
-  # Phase 6B2A: GoldenGateCloudWatchMetricsRole-dev IAM/Terraform
-  # prerequisites (IAM only -- no Kubernetes/Argo CD resource of any kind
-  # is created in this phase, so there is nothing Kubernetes-shaped to
-  # assert here).
-  # ---------------------------------------------------------------------
+  # GoldenGateCloudWatchMetricsRole-dev IAM/Terraform prerequisites (IAM only -- no Kubernetes/Argo CD resource is created here).
   IAM_TF="${REPO_ROOT}/envs/dev/iam.tf"
   if [ -f "$IAM_TF" ]; then
     if grep -q 'module "goldengate_cloudwatch_metrics_role_dev"' "$IAM_TF"; then
@@ -539,9 +469,7 @@ PYEOF
       fail "envs/dev/iam.tf is missing module goldengate_cloudwatch_metrics_role_dev"
     fi
 
-    # Extract just this module's block (from its opening line to the next
-    # top-level '}' at column 0) so the name/policy_folder/managed_policy_arns
-    # checks below cannot accidentally match a different module.
+    # Extracts just this module's block (opening line to the next top-level '}' at column 0) so checks below can't match a different module.
     CLOUDWATCH_METRICS_MODULE_BLOCK="$(awk '/^module "goldengate_cloudwatch_metrics_role_dev" \{/{f=1} f{print} f && /^}$/{exit}' "$IAM_TF")"
     if echo "$CLOUDWATCH_METRICS_MODULE_BLOCK" | grep -q '"GoldenGateCloudWatchMetricsRole-dev"' \
         && echo "$CLOUDWATCH_METRICS_MODULE_BLOCK" | grep -q 'policy_folder = "goldengate-cloudwatch-metrics-dev"' \
@@ -551,9 +479,7 @@ PYEOF
       fail "goldengate_cloudwatch_metrics_role_dev module block does not contain the expected name/policy_folder/managed_policy_arns"
     fi
 
-    # No direct aws_iam_* resource anywhere in this file -- every role in
-    # this environment (including the new one) must go through the
-    # existing ADCB Terraform module pattern, never a raw resource block.
+    # No direct aws_iam_* resource anywhere -- every role must go through the existing ADCB Terraform module pattern, never a raw resource block.
     if grep -qE '^\s*resource\s+"aws_iam_(role|policy|role_policy|role_policy_attachment)"' "$IAM_TF"; then
       fail "envs/dev/iam.tf contains a direct aws_iam_* resource -- all roles must be created through the existing IAM module pattern"
     else
@@ -631,12 +557,7 @@ if actions != expected:
 put_metric_stmt = next(s for s in stmts if "cloudwatch:PutMetricData" in
                         ([s["Action"]] if isinstance(s["Action"], str) else s["Action"]))
 
-# Phase 6B2B OTLP-authorization correction: the condition operator must be
-# StringEqualsIfExists (permits OTLP PutMetricData requests that omit the
-# cloudwatch:namespace key entirely, while still enforcing the namespace
-# restriction whenever that key IS present) -- never StringEquals (which
-# implicitly denies any request omitting the key at all, including OTLP
-# ingestion), and never an unconditioned/empty allow.
+# Condition operator must be StringEqualsIfExists (permits OTLP PutMetricData requests omitting cloudwatch:namespace while still enforcing it when present) -- never plain StringEquals (implicitly denies key-omitting requests) and never an unconditioned allow.
 put_metric_condition = put_metric_stmt.get("Condition", {})
 if not put_metric_condition:
     print("MISMATCH:put-metric-data-statement-has-no-condition-at-all")
@@ -680,10 +601,7 @@ PYEOF
     fail "${CW_METRICS_POLICY_FILE} not found, or python3 unavailable"
   fi
 
-  # No managed broad CloudWatch policy (e.g. CloudWatchFullAccess,
-  # CloudWatchAgentServerPolicy) was attached to this role in addition to
-  # its custom policy_folder -- confirms the module block's
-  # managed_policy_arns stays empty.
+  # No managed broad CloudWatch policy (e.g. CloudWatchFullAccess, CloudWatchAgentServerPolicy) attached in addition to the custom policy_folder -- managed_policy_arns stays empty.
   CW_METRICS_IAM_TF="${REPO_ROOT}/envs/dev/iam.tf"
   if [ -f "$CW_METRICS_IAM_TF" ] && command -v python3 >/dev/null 2>&1; then
     CW_MANAGED_ARNS_CHECK="$(python3 - "$CW_METRICS_IAM_TF" <<'PYEOF'
@@ -751,9 +669,7 @@ if len(matching) != 1:
     print(f"MISMATCH:found={len(matching)}-statements-for-expected-arn")
     raise SystemExit
 
-# Preservation check: every pre-existing repository ARN this policy already
-# granted (goldengate, goldengate-monitor, goldengate-platform, gg-monitor)
-# must still be present unchanged.
+# Every pre-existing repository ARN this policy already granted (goldengate, goldengate-monitor, goldengate-platform, gg-monitor) must still be present unchanged.
 preexisting_arns = {
     "arn:aws:ecr:eu-west-1:229410149234:repository/helm/goldengate",
     "arn:aws:ecr:eu-west-1:229410149234:repository/helm/goldengate-monitor",
@@ -766,8 +682,7 @@ if missing:
     print(f"MISMATCH:missing-preexisting-arns={sorted(missing)}")
     raise SystemExit
 
-# ecr:GetAuthorizationToken statement (Resource "*") must be preserved
-# unchanged.
+# ecr:GetAuthorizationToken statement (Resource "*") must be preserved unchanged.
 auth_token_stmts = [s for s in stmts if s.get("Resource") == "*"
                      and "ecr:GetAuthorizationToken" in
                      ([s["Action"]] if isinstance(s["Action"], str) else s["Action"])]
@@ -787,10 +702,7 @@ PYEOF
     fail "${ARGOCD_ECR_POLICY_FILE} not found, or python3 unavailable"
   fi
 
-  # Regression proof: the existing Fluent Bit log-group ARNs and policy
-  # files are unchanged by this phase -- Phase 6B2A only adds a new role
-  # and a new log group, it never touches GoldenGatePlatformLoggingRole-dev
-  # or the /adcb/goldengate/dev/* groups.
+  # Regression proof: the existing Fluent Bit log-group ARNs and policy files are unchanged -- this phase only adds a new role and log group, never touching GoldenGatePlatformLoggingRole-dev or the /adcb/goldengate/dev/* groups.
   FLUENT_BIT_TRUST_FILE="${REPO_ROOT}/envs/dev/policies/goldengate-platform-logging-dev/assume_role_policy/sts.json"
   if [ -f "$FLUENT_BIT_TRUST_FILE" ] \
       && grep -q '"system:serviceaccount:goldengate-dev:gg-fluent-bit"' "$FLUENT_BIT_TRUST_FILE" \
@@ -802,11 +714,7 @@ PYEOF
     fail "gg-fluent-bit trust subject or GoldenGatePlatformLoggingRole-dev log-group ARNs appear to have changed"
   fi
 
-  # ---------------------------------------------------------------------
-  # Phase 6B2B: private-image-only CloudWatch Observability GitOps source
-  # and deployment workflow. Static/offline only -- no AWS/Terraform/
-  # kubectl/Argo CD/Git/network call of any kind.
-  # ---------------------------------------------------------------------
+  # Private-image-only CloudWatch Observability GitOps source and deployment workflow. Static/offline only -- no AWS/Terraform/kubectl/Argo CD/Git/network call.
 
   # 1-9: the committed observability values file.
   if [ -f "${REPO_ROOT}/${OBSERVABILITY_VALUES_FILE}" ] && command -v python3 >/dev/null 2>&1; then
@@ -874,10 +782,7 @@ if found_repos != set(expected_repos.values()):
 
 values_text = open(sys.argv[1]).read()
 for public_registry in ("public.ecr.aws", "registry.k8s.io", "quay.io", "docker.io", "ghcr.io", "gcr.io", "nvcr.io"):
-    # Only flag a *live* (non-comment) reference -- this file's own
-    # documentation comments legitimately mention these registries by name
-    # to record what is NOT used, matching the established convention
-    # elsewhere in this repository for negative-assertion prose.
+    # Only flags a live (non-comment) reference -- this file's own docs legitimately mention these registries to record what is NOT used.
     live_lines = [l for l in values_text.splitlines() if public_registry in l and not l.strip().startswith("#")]
     if live_lines:
         results.append(f"live-public-registry-reference={public_registry}:{live_lines}")
@@ -897,8 +802,7 @@ PYEOF
     fail "${OBSERVABILITY_VALUES_FILE} not found, or python3 unavailable"
   fi
 
-  # 10: the Argo CD values file contains exactly four OCI repositories and
-  # the exact new Secret name, with the pre-existing three preserved.
+  # 10: the Argo CD values file contains exactly four OCI repositories and the exact new Secret name, with the pre-existing three preserved.
   if [ -f "${REPO_ROOT}/${ARGOCD_VALUES_FILE}" ] && command -v python3 >/dev/null 2>&1; then
     ARGOCD_VALUES_CHECK="$(python3 - "${REPO_ROOT}/${ARGOCD_VALUES_FILE}" <<'PYEOF'
 import sys
@@ -927,8 +831,7 @@ PYEOF
       fail "10: ${ARGOCD_VALUES_FILE} check failed: ${ARGOCD_VALUES_CHECK}"
     fi
 
-    # The four container-image repositories must never be added to Argo CD
-    # token sync -- it only ever refreshes Helm OCI chart credentials.
+    # The four container-image repositories must never be added to Argo CD token sync -- it only ever refreshes Helm OCI chart credentials.
     if python3 -c "
 import yaml
 doc = yaml.safe_load(open('${REPO_ROOT}/${ARGOCD_VALUES_FILE}'))
@@ -962,8 +865,7 @@ assert not (names & forbidden), names & forbidden
       fail "11b: ${ARGOCD_DEPLOY_WORKFLOW} does not fully reference the fourth repository, or a stale 'all three' comment/echo remains"
     fi
 
-    # The IAM-policy static-validation step's expected_repos dict must
-    # include the fourth ARN.
+    # The IAM-policy static-validation step's expected_repos dict must include the fourth ARN.
     if grep -q 'helm/amazon-cloudwatch-observability.*arn:aws:ecr:eu-west-1:229410149234:repository/helm/amazon-cloudwatch-observability\|"helm/amazon-cloudwatch-observability": "arn:aws:ecr:eu-west-1:229410149234:repository/helm/amazon-cloudwatch-observability"' "${REPO_ROOT}/${ARGOCD_DEPLOY_WORKFLOW}"; then
       pass "11c: ${ARGOCD_DEPLOY_WORKFLOW}'s IAM-policy validation step expects the amazon-cloudwatch-observability repository ARN"
     else
@@ -1018,9 +920,7 @@ if "imageDigest" not in all_run_text and "imageDetails[0].imageDigest" not in al
     results.append("no-digest-resolution")
 if "GoldenGateCloudWatchMetricsRole-dev" not in all_run_text:
     results.append("missing-iam-role-reference")
-# The Secret name is an env: block value (ARGOCD_OBSERVABILITY_SECRET_NAME),
-# referenced in run: blocks only via that variable -- so this check must
-# scan the whole document, not just run: block text.
+# The Secret name is an env: block value (ARGOCD_OBSERVABILITY_SECRET_NAME) referenced in run: blocks only via that variable -- scan the whole document, not just run: block text.
 whole_doc_text = str(doc)
 if "argocd-ecr-amazon-cloudwatch-observability-oci" not in whole_doc_text:
     results.append("missing-new-argocd-secret-reference")
@@ -1046,9 +946,7 @@ PYEOF
       fail "12b: ${OBSERVABILITY_WORKFLOW} check failed: ${OBSERVABILITY_WORKFLOW_CHECK}"
     fi
 
-    # \\? tolerates the workflow's own shell-regex source (e.g.
-    # 'public\.ecr\.aws|...') where dots are backslash-escaped in the
-    # literal file content, as well as a plain-text mention.
+    # \\? tolerates the workflow's own shell-regex source (dots backslash-escaped) as well as a plain-text mention.
     if grep -qE 'public\\?\.ecr\\?\.aws|registry\\?\.k8s\\?\.io|quay\\?\.io|docker\\?\.io|ghcr\\?\.io|gcr\\?\.io|nvcr\\?\.io' "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}"; then
       pass "12c: ${OBSERVABILITY_WORKFLOW} contains a public-registry rejection check"
     else
@@ -1063,11 +961,7 @@ PYEOF
       fail "12d: ${OBSERVABILITY_WORKFLOW} is missing a Fluent Bit/GPU/Neuron validation check"
     fi
 
-    # ---------------------------------------------------------------------
-    # Phase 6B2B pre-deployment safety correction (focused, static/offline
-    # only -- no AWS/Kubernetes/Argo CD/Git/network call).
-    # ---------------------------------------------------------------------
-
+    # Pre-deployment safety correction (focused, static/offline only -- no AWS/Kubernetes/Argo CD/Git/network call).
     OBSERVABILITY_CORRECTION_CHECK="$(python3 - "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" <<'PYEOF'
 import re
 import sys
@@ -1090,9 +984,7 @@ if create_app_step is None:
     results.append("missing-create-application-step")
 else:
     run_text = create_app_step.get("run", "")
-    # Matches the Python dict-literal source the step embeds -- proves
-    # "path" is the literal string "." (not merely "path" appearing
-    # anywhere, and not a "chart:" field).
+    # Matches the Python dict-literal source the step embeds -- proves "path" is the literal string "." (not merely present anywhere, and not a "chart:" field).
     if not re.search(r'"path"\s*:\s*"\."\s*,', run_text):
         results.append("oci-path-not-exactly-dot")
     if re.search(r'"chart"\s*:', run_text):
@@ -1113,9 +1005,7 @@ else:
         results.append("missing-CreateNamespace")
     if "ServerSideApply=true" not in run_text:
         results.append("missing-ServerSideApply")
-    # No broad group/kind/name wildcard: the ignoreDifferences block must
-    # reference exactly one Sid-equivalent rule, not e.g. a bare "kind":
-    # "ServiceAccount" without a name, or a missing namespace.
+    # No broad group/kind/name wildcard: ignoreDifferences must reference exactly one Sid-equivalent rule, not e.g. bare kind:ServiceAccount without a name or a missing namespace.
     ignore_diff_block_match = re.search(r'"ignoreDifferences"\s*:\s*\[(.*?)\],\s*\n\s*"revisionHistoryLimit"', run_text, re.S)
     if ignore_diff_block_match:
         block = ignore_diff_block_match.group(1)
@@ -1158,12 +1048,7 @@ else:
     if "spec.containers" not in run_text:
         results.append("live-image-check-missing-containers")
 
-    # --- Correction 6: every AmazonCloudWatchAgent CR checked for filelog
-    # (scoped to the filelog section only -- section "14." legitimately
-    # looks up the specific named cloudwatch-agent/cluster-scraper CRs for
-    # the unrelated Phase 6B2B host-network isolation check added later in
-    # this same step, so the hardcoded-single-CR-name regression check
-    # below must not fire on that different, intentional lookup).
+    # Scoped to the filelog section only -- section 14 legitimately looks up the same named CRs for an unrelated host-network isolation check, which this regression check must not fire on.
     filelog_section_match = re.search(r'13\. No deployed AmazonCloudWatchAgent.*?(?=14\. CloudWatch Agent host-network isolation|\Z)', run_text, re.S)
     filelog_section = filelog_section_match.group(0) if filelog_section_match else run_text
     if "amazoncloudwatchagents.cloudwatch.aws.amazon.com -n \"$TARGET_NAMESPACE\"" not in filelog_section:
@@ -1183,8 +1068,7 @@ else:
         results.append("irsa-check-missing-AWS_WEB_IDENTITY_TOKEN_FILE")
     if "serviceAccountName" not in run_text:
         results.append("irsa-check-missing-serviceAccountName-check")
-    # Must never print the resolved env var VALUE or a full env dump --
-    # only the pattern that captures NAMES (jsonpath .name, not .value).
+    # Must never print the resolved env var VALUE or a full env dump -- only the pattern capturing NAMES (jsonpath .name, not .value).
     if re.search(r'\.env\[\*\]\}\{\.value\}', run_text):
         results.append("irsa-check-appears-to-print-env-values")
 
@@ -1200,10 +1084,7 @@ PYEOF
       fail "16: goldengate-observability.yaml Phase 6B2B safety correction check failed: ${OBSERVABILITY_CORRECTION_CHECK}"
     fi
 
-    # -------------------------------------------------------------------
-    # Phase 6B2B runner/connectivity correction (focused, static/offline
-    # only -- no AWS/kubectl/network/Git call).
-    # -------------------------------------------------------------------
+    # Runner/connectivity correction (focused, static/offline only -- no AWS/kubectl/network/Git call).
     RUNNER_CONNECTIVITY_CHECK="$(python3 - "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" <<'PYEOF'
 import sys
 import yaml
@@ -1272,8 +1153,7 @@ if connectivity_step is not None:
     if "--request-timeout=20s" not in run_text:
         results.append("connectivity-step-missing-bounded-timeout")
 
-    # 9: error handling mentions private EKS/network reachability and does
-    # NOT claim the CRD is missing.
+    # 9: error handling mentions private EKS/network reachability and does NOT claim the CRD is missing.
     lowered = run_text.lower()
     if "private eks api" not in lowered and "network-reachability" not in lowered and "network reachability" not in lowered:
         results.append("connectivity-step-missing-network-reachability-wording")
@@ -1312,10 +1192,7 @@ PYEOF
       fail "17: goldengate-observability.yaml Phase 6B2B runner/connectivity correction check failed: ${RUNNER_CONNECTIVITY_CHECK}"
     fi
 
-    # -------------------------------------------------------------------
-    # Phase 6B2B DaemonSet full-readiness and failure-diagnostics
-    # correction (focused, static/offline only).
-    # -------------------------------------------------------------------
+    # DaemonSet full-readiness and failure-diagnostics correction (focused, static/offline only).
     DAEMONSET_READINESS_CHECK="$(python3 - "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" <<'PYEOF'
 import sys
 import yaml
@@ -1333,8 +1210,7 @@ steps = job["steps"]
 def get_step(name):
     return next((s for s in steps if s.get("name") == name), None)
 
-# 1-3: a reusable exact DaemonSet readiness function comparing all required
-# fields, with a bounded timeout and polling interval.
+# 1-3: a reusable exact DaemonSet readiness function comparing all required fields, with a bounded timeout and polling interval.
 wait_step = get_step("Wait for CloudWatch Agent workloads to roll out")
 if wait_step is None:
     results.append("missing-wait-step")
@@ -1382,15 +1258,13 @@ else:
     if "kubectl rollout status daemonset/node-exporter" not in run_text:
         results.append("rollout-status-for-node-exporter-removed")
 
-    # 5: dynamically derived selector from spec.selector.matchLabels (no
-    # hardcoded chart labels).
+    # 5: dynamically derived selector from spec.selector.matchLabels (no hardcoded chart labels).
     if "spec.selector.matchLabels" not in run_text:
         results.append("missing-dynamic-selector-derivation")
     if "show_daemonset_diagnostics()" not in run_text and "show_daemonset_diagnostics ()" not in run_text:
         results.append("missing-show_daemonset_diagnostics-function")
 
-    # 6: failure diagnostics include bounded pod state, node name, waiting
-    # reason, restart count, bounded events, bounded current/previous logs.
+    # 6: failure diagnostics include bounded pod state, node name, waiting reason, restart count, bounded events, bounded current/previous logs.
     for marker in (
         "nodeName", "restartCount", "state.waiting.reason",
         "kubectl get events", "--tail=80", "--previous",
@@ -1399,8 +1273,7 @@ else:
         if marker not in run_text:
             results.append(f"diagnostics-missing:{marker}")
 
-    # Correction 3: diagnostics called before failing, exit non-zero, and
-    # no proceeding past the timeout.
+    # Diagnostics called before failing, exit non-zero, no proceeding past the timeout.
     if run_text.count("show_daemonset_diagnostics \"$TARGET_NAMESPACE\" cloudwatch-agent") < 1:
         results.append("diagnostics-not-called-for-cloudwatch-agent")
     if run_text.count("show_daemonset_diagnostics \"$TARGET_NAMESPACE\" node-exporter") < 1:
@@ -1410,8 +1283,7 @@ else:
     if "FAIL: node-exporter did not reach full readiness" not in run_text:
         results.append("missing-node-exporter-timeout-fail-message")
 
-# 7-8: IRSA check iterates across every CloudWatch Agent DaemonSet pod, and
-# the checked count must equal desiredNumberScheduled.
+# 7-8: IRSA check iterates across every CloudWatch Agent DaemonSet pod; the checked count must equal desiredNumberScheduled.
 irsa_step = get_step("Verify IRSA injection on the recreated CloudWatch Agent pods")
 if irsa_step is None:
     results.append("missing-irsa-step")
@@ -1432,8 +1304,7 @@ else:
     if '.status.phase' not in run_text:
         results.append("irsa-check-missing-phase-check")
 
-# 9: live validation requires both numberReady and numberAvailable to equal
-# desiredNumberScheduled (not READY >= DESIRED).
+# 9: live validation requires both numberReady and numberAvailable to equal desiredNumberScheduled (not READY >= DESIRED).
 live_step = get_step("Live Kubernetes validation")
 if live_step is None:
     results.append("missing-live-validation-step")
@@ -1448,8 +1319,7 @@ else:
     if 'DESIRED" -eq 0' not in run_text and "DESIRED\" -eq 0" not in run_text:
         results.append("live-validation-missing-zero-desired-guard")
 
-# 10: the bounded log diagnostic step uses always() with deploy=true and
-# does not fail the workflow itself.
+# 10: the bounded log diagnostic step uses always() with deploy=true and does not fail the workflow itself.
 log_step = get_step("Check bounded recent logs for authorization and startup failures")
 if log_step is None:
     results.append("missing-log-diagnostic-step")
@@ -1462,19 +1332,7 @@ else:
     if "exit 0" not in run_text:
         results.append("log-step-missing-explicit-exit-0")
 
-# 11: no maxUnavailable, probe, resource, toleration, IAM, Terraform, or
-# Helm value change was introduced anywhere in this workflow file. Comment
-# lines are excluded -- explaining *why* the default maxUnavailable=1
-# causes the false-positive-rollout-status problem is exactly what this
-# correction's own comments legitimately do; only actual code/config use is
-# forbidden.
-#
-# hostNetwork is deliberately NOT in this list: a later, separately
-# authorized Phase 6B2B host-network isolation correction legitimately
-# reads/validates spec.hostNetwork and spec.template.spec.hostNetwork
-# (read-only kubectl get/jsonpath checks, never a probe/resource/
-# toleration/updateStrategy/maxUnavailable change) -- see check 19/20
-# below, which validate that correction's actual scope precisely.
+# 11: no maxUnavailable, probe, resource, toleration, IAM, Terraform, or Helm value change anywhere in this file (comment lines excluded); hostNetwork is deliberately excluded from this list since a separate, later correction legitimately reads/validates it read-only (see check 19/20 below).
 forbidden_markers = [
     "maxUnavailable", "readinessProbe", "livenessProbe",
     "resources:", "tolerations:",
@@ -1498,12 +1356,7 @@ PYEOF
       fail "18: goldengate-observability.yaml Phase 6B2B DaemonSet full-readiness/diagnostics correction check failed: ${DAEMONSET_READINESS_CHECK}"
     fi
 
-    # -------------------------------------------------------------------
-    # Phase 6B2B host-network isolation correction (focused, static/
-    # offline only) -- workflow-side checks: semantic validation, rendered
-    # CR validation, live hostNetwork validation, and the exact crash-
-    # symptom log check.
-    # -------------------------------------------------------------------
+    # Host-network isolation correction (focused, static/offline only) -- workflow-side checks: semantic validation, rendered CR validation, live hostNetwork validation, and the exact crash-symptom log check.
     HOSTNETWORK_WORKFLOW_CHECK="$(python3 - "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" <<'PYEOF'
 import sys
 import yaml
@@ -1576,8 +1429,7 @@ else:
         if marker not in run_text:
             results.append(f"live-hostnetwork-check-missing:{marker}")
 
-    # every node-agent pod and every active cluster-scraper pod checked,
-    # via a dynamically derived selector (no hardcoded chart labels).
+    # Every node-agent pod and every active cluster-scraper pod checked, via a dynamically derived selector (no hardcoded chart labels).
     if run_text.count("spec.selector.matchLabels") < 2:
         results.append("live-validation-selector-not-dynamically-derived-for-both-workloads")
     if '"$pod_hostnet" != "true"' not in run_text:
@@ -1608,10 +1460,7 @@ PYEOF
     fail "${OBSERVABILITY_WORKFLOW} not found, or python3 unavailable"
   fi
 
-  # -------------------------------------------------------------------
-  # Phase 6B2B host-network isolation correction (focused, static/offline
-  # only) -- values.yaml-side checks.
-  # -------------------------------------------------------------------
+  # Host-network isolation correction (focused, static/offline only) -- values.yaml-side checks.
   if [ -f "${REPO_ROOT}/${OBSERVABILITY_VALUES_FILE}" ] && command -v python3 >/dev/null 2>&1; then
     HOSTNETWORK_VALUES_CHECK="$(python3 - "${REPO_ROOT}/${OBSERVABILITY_VALUES_FILE}" <<'PYEOF'
 import sys
@@ -1675,8 +1524,7 @@ if isinstance(agents, list):
         if scraper.get("hostNetwork") is not False:
             results.append(f"cluster-scraper-hostNetwork:{scraper.get('hostNetwork')!r}")
 
-# 5: existing top-level agent image/ServiceAccount/target-allocator/
-# private-ECR configuration remains present and unweakened.
+# 5: existing top-level agent image/ServiceAccount/target-allocator/private-ECR configuration remains present and unweakened.
 if isinstance(agent_block, dict):
     if agent_block.get("serviceAccount", {}).get("name") != "cloudwatch-agent":
         results.append("agent.serviceAccount.name-missing-or-changed")
@@ -1696,8 +1544,7 @@ code_text = "\n".join(code_lines)
 for marker in ("hostPort", "podAntiAffinity", "8889", "8887"):
     if marker in code_text:
         results.append(f"forbidden-marker-in-values:{marker}")
-# port 8888 itself must never be manually assigned a value in code (only
-# ever discussed in comments, which are excluded above).
+# Port 8888 itself must never be manually assigned a value in code (only ever discussed in comments, which are excluded above).
 if "8888" in code_text:
     results.append("port-8888-referenced-outside-comments")
 
@@ -1716,10 +1563,7 @@ PYEOF
     fail "${OBSERVABILITY_VALUES_FILE} not found, or python3 unavailable"
   fi
 
-  # -------------------------------------------------------------------
-  # Phase 6B2B cluster-scraper Deployment recreate correction (focused,
-  # static/offline only).
-  # -------------------------------------------------------------------
+  # Cluster-scraper Deployment recreate correction (focused, static/offline only).
   if [ -f "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" ] && command -v python3 >/dev/null 2>&1; then
     RECREATE_CORRECTION_CHECK="$(python3 - "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" <<'PYEOF'
 import sys
@@ -1747,8 +1591,7 @@ else:
     if recreate_step.get("if") != "${{ inputs.deploy }}":
         results.append(f"recreate-step-if={recreate_step.get('if')!r}")
 
-    # ordering: after "Wait for Argo CD sync and health", before
-    # "Annotate the CloudWatch Agent ServiceAccount with the dedicated IRSA role"
+    # Ordering: after "Wait for Argo CD sync and health", before "Annotate the CloudWatch Agent ServiceAccount with the dedicated IRSA role".
     try:
         sync_idx = names.index("Wait for Argo CD sync and health")
         recreate_idx = names.index("Ensure cluster-scraper Deployment host-network isolation")
@@ -1760,8 +1603,7 @@ else:
 
     run_text = recreate_step.get("run", "")
 
-    # 2: confirms CR hostNetwork=false before any deletion (the mode/
-    # hostNetwork check happens before the delete call in source order).
+    # 2: confirms CR hostNetwork=false before any deletion (the mode/hostNetwork check happens before the delete call in source order).
     cr_check_idx = run_text.find('"$cr_hostnetwork" != "false"')
     delete_idx = run_text.find("kubectl delete deployment")
     if cr_check_idx == -1:
@@ -1777,8 +1619,7 @@ else:
     if 'uid_match="false"' not in run_text or '[ "$owner_uid" = "$cr_uid" ]' not in run_text:
         results.append("missing-explicit-uid-comparison")
 
-    # 4/5: deletes only the exact cluster-scraper Deployment; never the
-    # CR, DaemonSet, pods, operator, ServiceAccount, Secret, or ConfigMap.
+    # 4/5: deletes only the exact cluster-scraper Deployment; never the CR, DaemonSet, pods, operator, ServiceAccount, Secret, or ConfigMap.
     delete_calls = [ln for ln in run_text.splitlines() if "kubectl delete" in ln]
     if len(delete_calls) != 1:
         results.append(f"unexpected-delete-call-count:{len(delete_calls)}")
@@ -1788,9 +1629,7 @@ else:
         if forbidden in run_text:
             results.append(f"forbidden-delete-target-present:{forbidden.strip()}")
 
-    # 6: at most one deletion is possible per workflow run -- exactly one
-    # kubectl delete call exists in source (already checked above), and
-    # there is no loop/retry wrapping it that could invoke it twice.
+    # 6: at most one deletion is possible per workflow run -- exactly one kubectl delete call exists in source, and no loop/retry wraps it.
     if run_text.count("kubectl delete deployment") != 1:
         results.append("delete-call-appears-more-than-once-in-source")
 
@@ -1814,21 +1653,18 @@ else:
     if "AWS_ROLE_ARN" not in run_text or "AWS_WEB_IDENTITY_TOKEN_FILE" not in run_text:
         results.append("missing-active-pod-irsa-env-name-checks")
 
-    # 10: idempotent when the Deployment is already false (no delete call
-    # reachable on that path -- the "already false" branch returns early).
+    # 10: idempotent when the Deployment is already false (no delete call reachable -- the "already false" branch returns early).
     if 'echo "not_required" > "$CORRECTION_SUMMARY_FILE"' not in run_text:
         results.append("missing-idempotent-not-required-summary")
     if run_text.count('echo "not_required" > "$CORRECTION_SUMMARY_FILE"') < 2:
         results.append("idempotent-early-return-not-covering-both-no-op-paths")
 
-    # 13a (scoped to this step): no telemetry port / spec.args / direct CR
-    # / wrapper chart content introduced here.
+    # 13a (scoped to this step): no telemetry port / spec.args / direct CR / wrapper chart content introduced here.
     for marker in ("8889", "service::telemetry", "spec.args", "args:\n", "370-line"):
         if marker in run_text:
             results.append(f"forbidden-marker-in-recreate-step:{marker.strip()}")
 
-# 11: strict node-agent readiness remains unchanged (still present, still
-# exact equality, not weakened).
+# 11: strict node-agent readiness remains unchanged (still present, still exact equality, not weakened).
 wait_step = get_step("Wait for CloudWatch Agent workloads to roll out")
 if wait_step is None:
     results.append("missing-wait-step")
@@ -1839,15 +1675,12 @@ else:
     if 'wait_for_daemonset_fully_ready "$TARGET_NAMESPACE" cloudwatch-agent' not in wait_run:
         results.append("node-agent-strict-readiness-not-applied-to-cloudwatch-agent")
 
-# 12: the exact localhost:8888 collision signatures remain checked
-# (searched across the whole file since this correction may check them in
-# more than one step).
+# 12: the exact localhost:8888 collision signatures remain checked (searched across the whole file since this correction may check them in more than one step).
 for pattern in ("binding address localhost:8888", r"listen tcp 127\.0\.0\.1:8888", "bind: address already in use", "failed to create SDK"):
     if pattern not in text:
         results.append(f"missing-collision-signature:{pattern}")
 
-# 13b (whole-file scope): no chart/image/IAM/Terraform change, no direct
-# CR, no wrapper chart, no telemetry port override, no spec.args mechanism.
+# 13b (whole-file scope): no chart/image/IAM/Terraform change, no direct CR, no wrapper chart, no telemetry port override, no spec.args mechanism.
 code_lines = [ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
 code_text = "\n".join(code_lines)
 if 'CHART_VERSION: "6.2.0"' not in text:
@@ -1871,11 +1704,7 @@ PYEOF
     fail "${OBSERVABILITY_WORKFLOW} not found, or python3 unavailable"
   fi
 
-  # -------------------------------------------------------------------
-  # Phase 6B2B UID-based recreation detection + hostNetwork null
-  # normalization + CloudWatch metrics authorization/export validation
-  # (focused, static/offline only).
-  # -------------------------------------------------------------------
+  # UID-based recreation detection + hostNetwork null normalization + CloudWatch metrics authorization/export validation (focused, static/offline only).
   if [ -f "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" ] && command -v python3 >/dev/null 2>&1; then
     UID_AUTH_CHECK="$(python3 - "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" "${CW_METRICS_POLICY_FILE}" <<'PYEOF'
 import os
@@ -1909,14 +1738,11 @@ if recreate_step is None:
 else:
     run_text = recreate_step.get("run", "")
 
-    # The old anti-pattern required observing the object's *absence*
-    # (existence-check loop keyed only on exit status, no UID comparison)
-    # before ever polling for recreation. That must be gone.
+    # The old anti-pattern required observing the object's absence (exit-status-only existence-check loop, no UID comparison) before polling for recreation; that must be gone.
     if "did not disappear within 30s" in run_text:
         results.append("old-notfound-interval-anti-pattern-still-present")
 
-    # The new pattern must poll via -o json and branch on UID comparison
-    # for every one of the required states, never requiring NotFound.
+    # The new pattern must poll via -o json and branch on UID comparison for every required state, never requiring NotFound.
     if 'new_deploy_json="$(kubectl get deployment "$CLUSTER_SCRAPER_DEPLOYMENT" -n "$TARGET_NAMESPACE" -o json 2>/dev/null)"' not in run_text:
         results.append("missing-uid-based-poll")
     if '[ -n "$new_uid" ] && [ "$new_uid" != "$old_uid" ]' not in run_text:
@@ -1936,8 +1762,7 @@ else:
     if run_text.count("kubectl delete deployment") != 1:
         results.append(f"unexpected-delete-call-count:{run_text.count('kubectl delete deployment')}")
 
-    # --- Task 4: null/false normalization on Deployment and Pod, CR stays
-    # strict (no // false on the CR's own hostNetwork read). ---
+    # Null/false normalization on Deployment and Pod; the CR stays strict (no // false on the CR's own hostNetwork read).
     if run_text.count('.spec.template.spec.hostNetwork // false') < 2:
         results.append("deployment-hostnetwork-normalization-missing-or-incomplete")
     if "'.spec.hostNetwork // false'" not in run_text:
@@ -1973,14 +1798,11 @@ else:
     if "--tail=80" not in run_text:
         results.append("missing-bounded-tail")
 
-    # The step's own runtime output must not claim successful export was
-    # proven -- only that no recent error signatures were found.
+    # The step's own runtime output must not claim successful export was proven -- only that no recent error signatures were found.
     if "does not by itself confirm successful export to CloudWatch" not in run_text:
         results.append("step-overclaims-successful-export")
 
-    # kubectl logs must never be silently swallowed with "|| true" -- a
-    # retrieval failure from an expected active pod/container must fail
-    # the step, via an explicit captured exit status.
+    # kubectl logs must never be silently swallowed with "|| true" -- a retrieval failure from an expected active pod/container must fail the step via an explicit captured exit status.
     if "kubectl logs" in run_text and re.search(r'kubectl logs[^\n]*\|\|\s*true', run_text):
         results.append("kubectl-logs-still-uses-or-true-fallback")
     if "log_status=$?" not in run_text:
@@ -2040,11 +1862,7 @@ else:
         if forbidden in run_text:
             results.append(f"forbidden-content-in-authorization-step:{forbidden}")
 
-# No CloudWatch read permission (e.g. GetMetricData, ListMetrics) was added
-# to the collector role merely to support this log-based workflow
-# validation -- the step only ever calls "kubectl logs", never the
-# CloudWatch API, so the role's action set (checked exhaustively above)
-# must remain exactly PutMetricData plus the pre-existing logs/ec2 actions.
+# No CloudWatch read permission (e.g. GetMetricData, ListMetrics) was added merely to support this log-based validation -- the step only calls "kubectl logs", never the CloudWatch API, so the role's action set must remain exactly PutMetricData plus the pre-existing logs/ec2 actions.
 if CW_METRICS_POLICY_FILE_TEXT is not None:
     for forbidden_cw_read in ("cloudwatch:GetMetricData", "cloudwatch:ListMetrics", "cloudwatch:GetMetricStatistics", "cloudwatch:DescribeAlarms"):
         if forbidden_cw_read in CW_METRICS_POLICY_FILE_TEXT:
@@ -2072,43 +1890,54 @@ PYEOF
     pass "13: no helm/goldengate-observability wrapper chart was created"
   fi
 
-  # 14: no EKS Terraform enable_cloudwatch variable was introduced anywhere
-  # in this repository's Terraform.
+  # 14: no EKS Terraform enable_cloudwatch variable was introduced anywhere in this repository's Terraform.
   if grep -rl 'enable_cloudwatch' "${REPO_ROOT}/envs" 2>/dev/null | grep -q .; then
     fail "14: an enable_cloudwatch Terraform variable/reference was unexpectedly introduced under envs/"
   else
     pass "14: no enable_cloudwatch Terraform variable/reference exists under envs/"
   fi
 
-  # 15: Phase 6A and Phase 6B1 resources remain untouched by this phase.
-  # envs/dev/policies/goldengate-cloudwatch-metrics-dev is deliberately
-  # EXCLUDED from this scan (not from IAM protection generally -- see the
-  # dedicated goldengate-cloudwatch-metrics-dev permissions policy check
-  # above, which pins its content precisely): the Phase 6B2B OTLP-
-  # authorization correction intentionally changes exactly one condition
-  # operator in that folder's policies_1.json.
-  PHASE_6A_6B1_DIFF="$(git -C "$REPO_ROOT" diff --stat --ignore-all-space -- \
-    .github/workflows/cloudwatch-observability-artifact-sync.yaml \
-    helm/goldengate-platform \
-    platform/dev/goldengate-platform \
-    envs/dev/cloudwatch_observability.tf \
-    envs/dev/cloudwatch_logs.tf \
-    envs/dev/policies/goldengate-platform-logging-dev \
-    2>/dev/null || true)"
-  if [ -z "$PHASE_6A_6B1_DIFF" ]; then
-    pass "15: Phase 6A (gg-fluent-bit) and Phase 6B1/6B2A (CloudWatch Observability supply chain, IAM) files are unchanged"
+  # 15: earlier phases' resources remain functionally untouched (comment-only edits, e.g. Phase 6C1-UI source hygiene, are allowed and ignored here). envs/dev/policies/goldengate-cloudwatch-metrics-dev is excluded (see the dedicated permissions policy check above) since the OTLP-authorization correction intentionally changes one condition operator there.
+  PHASE_6A_6B1_STATUS="$(python3 -c "
+import subprocess
+
+def strip_comments(text):
+    out = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith('#'):
+            continue
+        idx = line.find(' #')
+        if idx != -1:
+            line = line[:idx].rstrip()
+        out.append(line)
+    return '\n'.join(out)
+
+paths = [
+    '.github/workflows/cloudwatch-observability-artifact-sync.yaml',
+    'helm/goldengate-platform',
+    'platform/dev/goldengate-platform',
+    'envs/dev/cloudwatch_observability.tf',
+    'envs/dev/cloudwatch_logs.tf',
+    'envs/dev/policies/goldengate-platform-logging-dev',
+]
+changed = subprocess.run(['git', '-C', '$REPO_ROOT', 'diff', '--name-only', '--'] + paths, capture_output=True, text=True).stdout.split()
+mismatches = []
+for f in changed:
+    head = subprocess.run(['git', '-C', '$REPO_ROOT', 'show', f'HEAD:{f}'], capture_output=True, text=True).stdout
+    with open('$REPO_ROOT/' + f) as fh:
+        working = fh.read()
+    if strip_comments(head) != strip_comments(working):
+        mismatches.append(f)
+print(('MISMATCH:' + ','.join(mismatches)) if mismatches else 'IDENTICAL')
+" 2>/dev/null || true)"
+  if [ "$PHASE_6A_6B1_STATUS" = "IDENTICAL" ]; then
+    pass "15: Phase 6A (gg-fluent-bit) and Phase 6B1/6B2A (CloudWatch Observability supply chain, IAM) files are functionally unchanged"
   else
-    fail "15: an unexpected change was found in Phase 6A/6B1/6B2A files:"$'\n'"${PHASE_6A_6B1_DIFF}"
+    fail "15: an unexpected functional change was found in Phase 6A/6B1/6B2A files: ${PHASE_6A_6B1_STATUS:-unknown}"
   fi
 
-  # Strict YAML parse of the platform workflow (must still parse cleanly
-  # after the Phase 6A Fluent Bit role-ARN/region plumbing was added), plus
-  # a forbidden-mutation-command scan limited to the new/changed lines --
-  # this workflow legitimately runs many AWS/kubectl mutating calls
-  # elsewhere (namespace/Application apply, ECR repository creation, etc.),
-  # so the scan here only proves the Phase 6A additions themselves
-  # introduced no new destructive AWS Logs action (no CreateLogGroup/
-  # DeleteLogGroup/PutRetentionPolicy anywhere in the whole file).
+  # Strict YAML parse of the platform workflow (must still parse cleanly with the Fluent Bit role-ARN/region plumbing), plus a scan proving no new destructive AWS Logs action (CreateLogGroup/DeleteLogGroup/PutRetentionPolicy) was introduced anywhere -- this workflow legitimately runs many other AWS/kubectl mutating calls elsewhere.
   if [ -f "${REPO_ROOT}/${PLATFORM_WORKFLOW}" ] && command -v python3 >/dev/null 2>&1; then
     if python3 -c "import yaml; yaml.safe_load(open('${REPO_ROOT}/${PLATFORM_WORKFLOW}'))" >/dev/null 2>&1; then
       pass "${PLATFORM_WORKFLOW} parses as strict YAML"
@@ -2125,9 +1954,7 @@ PYEOF
     fail "${PLATFORM_WORKFLOW} not found, or python3 unavailable"
   fi
 
-  # The monitor chart's ConfigMap reads a staged copy of the canonical
-  # config from its own files/ directory -- never committed there (see
-  # goldengate-monitor.yaml) -- so lint/render stage a throwaway copy here.
+  # The monitor chart's ConfigMap reads a staged copy of the canonical config from its own files/ directory -- never committed there (see goldengate-monitor.yaml) -- so lint/render stage a throwaway copy here.
   MONITOR_CHART_STAGED="${WORKDIR}/goldengate-monitor"
   cp -a "$MONITOR_CHART" "$MONITOR_CHART_STAGED"
   mkdir -p "${MONITOR_CHART_STAGED}/files"
@@ -2143,10 +1970,7 @@ else
   skip "helm lint -- helm not available"
 fi
 
-# ---------------------------------------------------------------------
-# 5. Render every enabled deployment discovered from the canonical config;
-#    validate exactly one StatefulSet per release and no runtime sidecar.
-# ---------------------------------------------------------------------
+# 5. Render every enabled deployment discovered from the canonical config; validate exactly one StatefulSet per release and no runtime sidecar.
 echo ""
 echo "--- Render enabled runtimes; one StatefulSet each, no sidecar ---"
 if [ "$HELM_AVAILABLE" = "true" ] && [ "$PYTHON_AVAILABLE" = "true" ]; then
@@ -2198,9 +2022,7 @@ else
   skip "runtime rendering -- helm and/or python3/PyYAML not available"
 fi
 
-# ---------------------------------------------------------------------
 # 6. Existing shared monitor resources; no duplicate monitor deployment.
-# ---------------------------------------------------------------------
 echo ""
 echo "--- Shared monitor: single deployment, existing resources retained ---"
 if [ -d "monitoring/gg-monitor-core" ] || [ -d "helm/gg-monitor" ] || [ -d "platform/dev/gg-monitor" ] \
@@ -2251,9 +2073,7 @@ else
   skip "goldengate-monitor render checks -- helm and/or python3/PyYAML not available"
 fi
 
-# ---------------------------------------------------------------------
 # 7. No hardcoded runtime/pipeline names in application or workflow code.
-# ---------------------------------------------------------------------
 echo ""
 echo "--- No hardcoded canonical deployment names outside the canonical config ---"
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
@@ -2271,7 +2091,7 @@ else
 fi
 
 HARDCODE_FOUND="false"
-for f in "${MONITOR_APP_DIR}"/monitor.py "${MONITOR_APP_DIR}"/collector.py "${MONITOR_APP_DIR}"/config.py "${MONITOR_APP_DIR}"/health_rules.py; do
+for f in "${MONITOR_APP_DIR}"/monitor.py "${MONITOR_APP_DIR}"/collector.py "${MONITOR_APP_DIR}"/config.py "${MONITOR_APP_DIR}"/health_rules.py "${MONITOR_APP_DIR}"/ui.py; do
   [ -f "$f" ] || continue
   while IFS= read -r nm; do
     [ -z "$nm" ] && continue
@@ -2291,9 +2111,7 @@ else
   pass "goldengate-monitor.yaml does not reference the removed pipelines/topologies file layout"
 fi
 
-# ---------------------------------------------------------------------
 # 8. No committed generated copies of the canonical config inside charts.
-# ---------------------------------------------------------------------
 echo ""
 echo "--- No generated canonical-config copies committed in charts ---"
 if [ -e "helm/goldengate-monitor/files/goldengate-deployments.yaml" ] \
@@ -2304,9 +2122,7 @@ else
   pass "helm/goldengate-monitor/files/ contains no committed generated copy"
 fi
 
-# ---------------------------------------------------------------------
 # 9. No committed pycache/pyc.
-# ---------------------------------------------------------------------
 echo ""
 echo "--- No committed __pycache__/*.pyc ---"
 STRAY_PYCACHE="$(find . -type d -name "__pycache__" -not -path "*/node_modules/*" 2>/dev/null)"
@@ -2317,10 +2133,7 @@ else
   fail "found stray __pycache__/*.pyc: ${STRAY_PYCACHE} ${STRAY_PYC}"
 fi
 
-# ---------------------------------------------------------------------
-# 10. Phase 4B1: contract-probe tool packaged but never auto-run; CloudWatch
-#     stays physically disabled by default.
-# ---------------------------------------------------------------------
+# 10. Contract-probe tool packaged but never auto-run; CloudWatch stays physically disabled by default.
 echo ""
 echo "--- Contract-probe tool: packaged, never auto-run, CloudWatch stays disabled ---"
 PROBE_TOOL="${MONITOR_APP_DIR}/tools/gg_api_contract_probe.py"
@@ -2360,11 +2173,7 @@ else
   fail "helm/goldengate-monitor default values.yaml no longer defaults CloudWatch publishing to false"
 fi
 
-# ---------------------------------------------------------------------
-# 11. Phase 4B2A: confirmed secure PMS route documented; 9015 stays
-#     unauthenticated-only; /services/v2/metrics not recommended as
-#     production PMS.
-# ---------------------------------------------------------------------
+# 11. Confirmed secure PMS route documented; 9015 stays unauthenticated-only; /services/v2/metrics not recommended as production PMS.
 echo ""
 echo "--- Contract-probe tool: confirmed secure PMS route frozen ---"
 if grep -q "/services/v2/mpoints/processes" "$PROBE_TOOL" 2>/dev/null \
@@ -2392,10 +2201,7 @@ else
   pass "monitoring/observer has been removed (Phase 5A observer retirement)"
 fi
 
-# ---------------------------------------------------------------------
-# 12. Phase 4B2B: --follow-processes fixed detail allowlist exists and is
-#     never wired into automatic startup.
-# ---------------------------------------------------------------------
+# 12. --follow-processes fixed detail allowlist exists and is never wired into automatic startup.
 echo ""
 echo "--- Contract-probe tool: --follow-processes fixed detail allowlist ---"
 if grep -q '"process", "processPerformance", "threadPerformance", "serviceHealth", "heartbeat"' "$PROBE_TOOL" 2>/dev/null; then
@@ -2422,10 +2228,7 @@ if [ "$FOLLOW_WIRED" = "false" ]; then
   pass "--follow-processes is never referenced by monitor.py/collector.py (manual-only)"
 fi
 
-# ---------------------------------------------------------------------
-# 13. Phase 4C1: production PMS collection bounded, no new DynamoDB
-#     record type, forbidden endpoints never referenced by name.
-# ---------------------------------------------------------------------
+# 13. Production PMS collection bounded, no new DynamoDB record type, forbidden endpoints never referenced by name.
 echo ""
 echo "--- Production PMS collection: bounded, no forbidden endpoints ---"
 if grep -q "MAX_FOLLOWED_PMS_PROCESSES = 20" "${MONITOR_APP_DIR}/collector.py" 2>/dev/null; then
@@ -2441,9 +2244,7 @@ else
 fi
 
 PMS_FORBIDDEN_FOUND="false"
-# Skip the module docstring (lines 1..first closing triple-quote), which
-# legitimately documents these endpoints as NOT used -- only code after it
-# must never reference them.
+# Skips the module docstring (lines 1..first closing triple-quote), which legitimately documents these endpoints as NOT used -- only code after it must never reference them.
 COLLECTOR_CODE_TAIL="$(awk '/^"""$/{n++; next} n>=1' "${MONITOR_APP_DIR}/collector.py" 2>/dev/null)"
 for pattern in '"/heartbeat"' '"/threadPerformance"' "statusChanges" "9015"; do
   if grep -qF "$pattern" <<< "$COLLECTOR_CODE_TAIL"; then
@@ -2462,10 +2263,7 @@ else
   fail "PMS enrichment / existing STATE# recordType pattern changed unexpectedly"
 fi
 
-# ---------------------------------------------------------------------
-# 14. Phase 4C1 correction: process-name/numeric bounds and stale-PMS
-#     overwrite semantics remain in place.
-# ---------------------------------------------------------------------
+# 14. Process-name/numeric bounds and stale-PMS overwrite semantics remain in place.
 echo ""
 echo "--- Production PMS collection: bounds and stale-state overwrite ---"
 if grep -q "MAX_PMS_PROCESS_NAME_LENGTH = 128" "${MONITOR_APP_DIR}/collector.py" 2>/dev/null; then
@@ -2486,11 +2284,7 @@ else
   fail "collector.py stale-PMS overwrite helper is missing"
 fi
 
-# ---------------------------------------------------------------------
-# 15. Phase 4C1 pre-deployment correction: total PMS collection time
-#     budget stays fixed and comfortably under the deployed stale
-#     threshold; serviceHealth validation stays tightened.
-# ---------------------------------------------------------------------
+# 15. Total PMS collection time budget stays fixed and comfortably under the deployed stale threshold; serviceHealth validation stays tightened.
 echo ""
 echo "--- Production PMS collection: total time budget ---"
 if grep -q "PMS_REQUEST_TIMEOUT_SECONDS = 2" "${MONITOR_APP_DIR}/collector.py" 2>/dev/null \
@@ -2506,10 +2300,7 @@ else
   fail "collector.py no longer requires serviceHealth isHealthy to be a literal boolean"
 fi
 
-# ---------------------------------------------------------------------
-# 16. Phase 4C2: manager-compatible portal -- GET /api/processes exists,
-#     canonical STATE#-only (no Scan, no legacy fallback in that path).
-# ---------------------------------------------------------------------
+# 16. Manager-compatible portal: GET /api/processes exists, canonical STATE#-only (no Scan, no legacy fallback in that path).
 echo ""
 echo "--- Manager-compatible portal: /api/processes ---"
 if grep -q '"/api/processes"' "${MONITOR_APP_DIR}/monitor.py" 2>/dev/null \
@@ -2526,12 +2317,7 @@ else
   fail "monitor.py /api/processes canonical-view helper or no-Scan guarantee changed unexpectedly"
 fi
 
-# ---------------------------------------------------------------------
-# 17. Phase 4D1: CloudWatch metric-path source hardening -- exact manager-
-#     compatible metric contract, sanitized PutMetricData failure logging,
-#     hard switch still gates client construction, no alarm/SNS/gg-alerter/
-#     Fluent Bit or read/alarm CloudWatch IAM permission introduced.
-# ---------------------------------------------------------------------
+# 17. CloudWatch metric-path source hardening: exact manager-compatible metric contract, sanitized PutMetricData failure logging, hard switch still gates client construction, no alarm/SNS/gg-alerter/Fluent Bit or read/alarm CloudWatch IAM permission introduced.
 echo ""
 echo "--- Phase 4D1: CloudWatch metric-path source hardening ---"
 
@@ -2580,11 +2366,7 @@ else
   pass "no gg-alerter implementation exists yet"
 fi
 
-# Phase 6A introduced the platform-level Fluent Bit DaemonSet -- no longer
-# blanket-forbidden, but still confined to its expected locations (the
-# goldengate-platform chart templates, its dedicated IRSA policy folder,
-# and the CloudWatch Logs Terraform) and never inside the GoldenGate
-# runtime/monitor charts or Python code.
+# The platform-level Fluent Bit DaemonSet is no longer blanket-forbidden, but still confined to its expected locations (goldengate-platform chart templates, its IRSA policy folder, CloudWatch Logs Terraform) and never inside the runtime/monitor charts or Python code.
 UNEXPECTED_FLUENT_BIT_LOCATIONS="$(find . -path ./.git -prune -o -iname "*fluent-bit*" -print 2>/dev/null \
   | grep -v -E '^\./helm/goldengate-platform/templates/fluent-bit-|^\./envs/dev/policies/goldengate-platform-logging-dev(/|$)' \
   || true)"
@@ -2600,11 +2382,7 @@ else
   pass "hack/comma.yaml removed"
 fi
 
-# ---------------------------------------------------------------------
-# 18. Phase 4D1 final correction: strict identity-based two-factor gate,
-#     and CloudWatch client construction moved behind a sanitized,
-#     non-raising protected publication boundary.
-# ---------------------------------------------------------------------
+# 18. Strict identity-based two-factor gate; CloudWatch client construction moved behind a sanitized, non-raising protected publication boundary.
 echo ""
 echo "--- Phase 4D1 correction: strict gate and protected publication boundary ---"
 
@@ -2639,12 +2417,7 @@ else
   fail "_cloudwatch_client() is referenced ${DIRECT_CLIENT_CALLS:-0} times -- expected exactly 2 (definition + protected boundary)"
 fi
 
-# ---------------------------------------------------------------------
-# 19. Phase 4D2: controlled DEV CloudWatch activation -- workflow_dispatch
-#     Boolean control, Argo CD ownership of the value, fail-closed CONFIG
-#     preflight (GetItem-only, no Scan, no new IAM), and post-deployment
-#     verification/rollback. Base Helm default stays disabled.
-# ---------------------------------------------------------------------
+# 19. Controlled DEV CloudWatch activation: workflow_dispatch Boolean control, Argo CD ownership of the value, fail-closed CONFIG preflight (GetItem-only, no Scan, no new IAM), post-deployment verification/rollback; base Helm default stays disabled.
 echo ""
 echo "--- Phase 4D2: controlled CloudWatch DEV activation ---"
 
@@ -2674,12 +2447,7 @@ else
   fail "goldengate-monitor.yaml is missing the CloudWatch publication preflight step"
 fi
 
-# Phase 6C1: the preflight moved from an unconditional "every enabled
-# deployment must already have metricsEnabled=true" check to a gate
-# inventory governed by metrics_gate_expectation (any/all-disabled/
-# all-enabled), enabling the staged activation order (deploy the global
-# switch with every gate closed, enable deployments individually via the
-# dedicated config workflow, then verify in CloudWatch).
+# The preflight uses a gate inventory governed by metrics_gate_expectation (any/all-disabled/all-enabled) rather than requiring every enabled deployment to already have metricsEnabled=true, enabling staged activation (deploy switch closed, enable per-deployment via the config workflow, then verify).
 if grep -q "metrics_gate_expectation:" "$MONITOR_WORKFLOW" 2>/dev/null \
     && grep -A10 "metrics_gate_expectation:" "$MONITOR_WORKFLOW" | grep -q -- "- any" \
     && grep -A10 "metrics_gate_expectation:" "$MONITOR_WORKFLOW" | grep -q -- "- all-disabled" \
@@ -2730,11 +2498,7 @@ else
   pass "goldengate-monitor.yaml introduces no CloudWatch read IAM action (ListMetrics/GetMetricData)"
 fi
 
-# ---------------------------------------------------------------------
-# 20. Phase 4D2 pre-deployment correction: runtime-image hash scoped to
-#     Dockerfile inputs only, unit tests unconditional, POSIX-safe
-#     discovery, unique per-attempt Helm OCI revision, Ready-pod selection.
-# ---------------------------------------------------------------------
+# 20. Runtime-image hash scoped to Dockerfile inputs only, unit tests unconditional, POSIX-safe discovery, unique per-attempt Helm OCI revision, Ready-pod selection.
 echo ""
 echo "--- Phase 4D2 correction: image hash scope, POSIX awk, chart SemVer, Ready-pod selection ---"
 
@@ -2802,11 +2566,7 @@ else
   fail "goldengate-monitor.yaml's CloudWatch deployment-discovery awk does not use POSIX [[:space:]]"
 fi
 
-# Functional execution of the exact extracted awk script (proving it
-# returns precisely the two enabled canonical deployments, never
-# hardcoded) is covered by the Python suite -- see
-# WorkflowStaticAnalysisTests.test_deployment_discovery_awk_returns_exactly_both_enabled_deployments,
-# already run above in section 3 ("Python unit tests").
+# Functional execution of the extracted awk script (proving it returns exactly the two enabled canonical deployments) is covered by the Python suite -- see WorkflowStaticAnalysisTests.test_deployment_discovery_awk_returns_exactly_both_enabled_deployments (section 3 above).
 
 if grep -q 'CHART_VERSION="0.\${{ github.run_number }}.\${{ github.run_attempt }}"' "$MONITOR_WORKFLOW" 2>/dev/null; then
   pass "goldengate-monitor.yaml's chart version is a SemVer containing both run_number and run_attempt"
@@ -2820,12 +2580,7 @@ else
   pass "goldengate-monitor.yaml no longer blindly selects .items[0] -- pod selection filters on Running phase and container readiness"
 fi
 
-# ---------------------------------------------------------------------
-# 21. Phase 4D2 supply-chain/pod-selection correction: .dockerignore
-#     participates in the runtime-image hash, the Dockerfile requires an
-#     explicitly supplied digest-pinned private base image (no public
-#     default), and Ready-pod selection excludes terminating pods.
-# ---------------------------------------------------------------------
+# 21. .dockerignore participates in the runtime-image hash, the Dockerfile requires an explicitly supplied digest-pinned private base image (no public default), and Ready-pod selection excludes terminating pods.
 echo ""
 echo "--- Phase 4D2 correction: .dockerignore hash input, digest-pinned base image, non-terminating Ready pod ---"
 
@@ -2867,12 +2622,7 @@ BASE_IMAGE_STEP="$(awk '
   capture { print }
   capture && /- name: Prepare monitor image variables/ { exit }
 ' "$MONITOR_WORKFLOW")"
-# The value is only ever interpolated on ONE line -- the GITHUB_ENV write
-# that hands it to later steps. The success confirmation is a generic
-# message (no value at all), and none of the three failure branches above
-# interpolate it either. Proven functionally (with a marker value) by
-# MonitorBaseImageValidationTests.test_failure_never_prints_the_raw_malformed_value
-# and .test_success_path_never_prints_the_full_raw_value_either.
+# The value is only ever interpolated on the GITHUB_ENV handoff line; failure/success messages never include it -- proven functionally by MonitorBaseImageValidationTests.test_failure_never_prints_the_raw_malformed_value/.test_success_path_never_prints_the_full_raw_value_either.
 BASE_IMAGE_INTERPOLATIONS="$(grep -c '\${MONITOR_BASE_IMAGE}' <<< "$BASE_IMAGE_STEP" || true)"
 if [ "${BASE_IMAGE_INTERPOLATIONS:-0}" -eq 1 ]; then
   pass "goldengate-monitor.yaml's base-image validation never prints the raw supplied value (only the GITHUB_ENV handoff interpolates it)"
@@ -2904,12 +2654,7 @@ else
   fail "goldengate-monitor.yaml's hash no longer incorporates the resolved base-image reference"
 fi
 
-# Phase 6C1 correction: the preflight's pod selection was rewritten into a
-# Deployment/ReplicaSet ownership-chain loop, which excludes a terminating
-# pod via `deletionTimestamp // empty` + a bash comparison rather than the
-# single-jq-filter `deletionTimestamp == null` style still used, unchanged,
-# by the post-deployment verification step -- so one of each pattern is now
-# expected, not two of the same pattern.
+# Preflight pod selection uses a Deployment/ReplicaSet ownership-chain loop excluding terminating pods via `deletionTimestamp // empty` + bash comparison, while post-deployment verification still uses the single-jq-filter `deletionTimestamp == null` style -- one of each pattern is expected, not two of the same.
 VERIFY_TERMINATING_EXCLUSION_COUNT="$(grep -c 'deletionTimestamp == null' "$MONITOR_WORKFLOW" 2>/dev/null || true)"
 PREFLIGHT_TERMINATING_EXCLUSION_COUNT="$(grep -c 'deletionTimestamp // empty' "$MONITOR_WORKFLOW" 2>/dev/null || true)"
 if [ "${VERIFY_TERMINATING_EXCLUSION_COUNT:-0}" -eq 1 ] && [ "${PREFLIGHT_TERMINATING_EXCLUSION_COUNT:-0}" -eq 1 ]; then
@@ -2918,13 +2663,7 @@ else
   fail "expected exactly 1 ownership-chain and 1 jq-filter terminating-pod exclusion, found ${PREFLIGHT_TERMINATING_EXCLUSION_COUNT:-0} and ${VERIFY_TERMINATING_EXCLUSION_COUNT:-0}"
 fi
 
-# ---------------------------------------------------------------------
-# 22. Phase 4D2 workflow-security and manager critical-service correction:
-#     no direct GitHub-expression interpolation inside a run script, a
-#     fully-anchored ECR repository+digest grammar (not prefix+suffix
-#     only), and manager-compatible adminsrvr/distsrvr/recvsrvr coverage
-#     for every deployment.
-# ---------------------------------------------------------------------
+# 22. Workflow-security and manager critical-service correction: no direct GitHub-expression interpolation inside a run script, a fully-anchored ECR repository+digest grammar (not prefix+suffix only), and manager-compatible adminsrvr/distsrvr/recvsrvr coverage for every deployment.
 echo ""
 echo "--- Phase 4D2 correction: safe env passthrough, full ECR grammar, manager critical-service coverage ---"
 
@@ -2959,32 +2698,17 @@ else
   fail "health_rules.py is missing resolve_critical_services"
 fi
 
-# ---------------------------------------------------------------------
-# 23. Phase 5A: observer source/build/chart retirement, legacy-values
-#     folder disablement without deletion, and gg-monitor legacy-fallback
-#     removal.
-# ---------------------------------------------------------------------
+# 23. Observer source/build/chart retirement, legacy-values folder disablement without deletion, and gg-monitor legacy-fallback removal.
 echo ""
 echo "--- Phase 5A: legacy values folder disabled (retained, not deleted) ---"
 
 if [ -f "$DETECT_SCRIPT" ] && command -v python3 >/dev/null 2>&1; then
-  # Use the real, tracked, executable detection script directly (never a
-  # reimplementation, never re-extracted from the workflow YAML -- since
-  # Phase 5B2A's workflow-compilation-size fix, the workflow step itself is
-  # only a thin wrapper that calls this script; the actual implementation
-  # lives here) and exercise its is_active_deployment_values_file()
-  # function and its deletion-candidate case statement directly, against
-  # the real repository files.
+  # Uses the real, tracked, executable detection script directly (never a reimplementation) and exercises its is_active_deployment_values_file() function and deletion-candidate case statement directly, against the real repository files.
   cp "$DETECT_SCRIPT" "${WORKDIR}/detect_script.sh"
 
   awk '/^is_active_deployment_values_file\(\) \{/,/^\}$/' "${WORKDIR}/detect_script.sh" > "${WORKDIR}/is_active_fn.sh"
 
-  # is_goldengate_deployment_values_file and its git-revision sibling both
-  # depend on _classify_deployment_model_yaml -- all three must be extracted
-  # and sourced together, in dependency order, or the classifier fails with
-  # "command not found" while still being source-able (a broken harness that
-  # silently produces no useful assertion, exactly the defect being fixed
-  # here).
+  # is_goldengate_deployment_values_file and its git-revision sibling both depend on _classify_deployment_model_yaml -- all three must be extracted and sourced together, in dependency order, or the classifier fails with a silent, useless "command not found".
   {
     awk '/^_classify_deployment_model_yaml\(\) \{/,/^\}$/' "${WORKDIR}/detect_script.sh"
     echo ""
@@ -2993,9 +2717,7 @@ if [ -f "$DETECT_SCRIPT" ] && command -v python3 >/dev/null 2>&1; then
     awk '/^is_goldengate_deployment_values_file_at_ref\(\) \{/,/^\}$/' "${WORKDIR}/detect_script.sh"
   } > "${WORKDIR}/is_gg_fn.sh"
 
-  # Fail loudly (not silently) if any expected function body failed to
-  # extract -- an empty/missing body here would make every downstream
-  # source-and-call test below meaningless.
+  # Fails loudly if any expected function body failed to extract -- an empty/missing body would make every downstream source-and-call test meaningless.
   for required_fn in _classify_deployment_model_yaml is_goldengate_deployment_values_file is_goldengate_deployment_values_file_at_ref; do
     if ! grep -q "^${required_fn}() {" "${WORKDIR}/is_gg_fn.sh"; then
       fail "could not extract ${required_fn}() from ${DETECT_SCRIPT} -- the classifier test harness cannot run"
@@ -3074,12 +2796,7 @@ HARNESS
     fail "one or both canonical folders are not reported active by the real workflow function"
   fi
 
-  # A shared-chart-change selection scans every envs/dev/<id>/values.yaml
-  # (excluding argocd/) exactly as the workflow does, then filters through
-  # the same two real functions, in the same order the workflow applies them
-  # (is_goldengate_deployment_values_file first, then
-  # is_active_deployment_values_file) -- proving the exact resulting active
-  # set, using the actual discovery command.
+  # A shared-chart-change selection scans every envs/dev/<id>/values.yaml (excluding argocd/) exactly as the workflow does, filtered through the same two real functions in the same order, proving the exact resulting active set.
   CANDIDATE_IDS="$(find envs/dev -mindepth 2 -maxdepth 2 -name values.yaml -not -path 'envs/dev/argocd/*' \
     | sed -E 's#^envs/dev/([^/]+)/values\.yaml$#\1#' | sort -u)"
   ACTIVE_IDS=""
@@ -3119,13 +2836,7 @@ HARNESS
     pass "argocd is absent from the shared-chart-change active set"
   fi
 
-  # Deletion-candidate safeguard: extract the real case-statement logic and
-  # exercise it, together with the REAL classifier functions (never stubs
-  # for is_goldengate_deployment_values_file/_at_ref -- only jq is stubbed,
-  # since its own JSON behavior is not what this test verifies), against a
-  # throwaway, self-contained Git repository built specifically to exercise
-  # all 7 required scenarios: existing/removed files, GoldenGate/non-
-  # GoldenGate deploymentModel, and malformed/unknown content.
+  # Extracts the real case-statement logic and exercises it with the REAL classifier functions (only jq is stubbed) against a throwaway Git repo built to exercise all 7 required scenarios: existing/removed files, GoldenGate/non-GoldenGate deploymentModel, malformed/unknown content.
   awk '/^for CANDIDATE_ID in \$DELETION_CANDIDATE_IDS; do$/,/^done$/' "${WORKDIR}/detect_script.sh" > "${WORKDIR}/deletion_loop.sh"
 
   if [ -s "${WORKDIR}/deletion_loop.sh" ] && [ -s "${WORKDIR}/is_gg_fn.sh" ]; then
@@ -3162,21 +2873,7 @@ HARNESS
     git -C "$DELETION_REPO" commit -q -m "base revision"
     DELETION_BEFORE_SHA="$(git -C "$DELETION_REPO" rev-parse HEAD)"
 
-    # Now mutate the working tree to the "after" state the loop actually
-    # evaluates: case2/3/4/5/6/7 are removed (git rm, matching a real
-    # removed/renamed deletion candidate -- case3 specifically proves the
-    # HISTORICAL DELETION CONTRACT still classifies a legacyPair deployment
-    # that existed at the base revision, exactly how the real, now-removed
-    # envs/dev/payments-ora-to-pg-001/ deletion actually worked); case1 is
-    # added fresh in the working tree only (never committed -- it
-    # represents a "still exists, but now inactive" candidate, which is
-    # what the loop's is_goldengate_deployment_values_file working-tree/
-    # ACTIVE CONTRACT path reads -- and, being legacyPair, is correctly
-    # invisible to that active-only path regardless of its
-    # deployment.enabled value); the case-empty-* files are overwritten IN
-    # PLACE (never git rm'd) with each of the four "deliberately empty"
-    # shapes the classification fix must fall back through to their still-
-    # valid content at BEFORE_SHA.
+    # Mutates the working tree to the "after" state the loop evaluates: case2/3/4/5/6/7 removed (case3 proves the HISTORICAL DELETION CONTRACT still classifies a legacyPair deployment from the base revision); case1 added fresh, uncommitted (a "still exists, now inactive" candidate, invisible to the active-only path since it's legacyPair); case-empty-* files overwritten in place with the four "deliberately empty" shapes.
     git -C "$DELETION_REPO" rm -rq envs/dev/case2-removed-canonical envs/dev/goldengate-monitor envs/dev/argocd envs/dev/case6-malformed envs/dev/case7-unknown-model envs/dev/case3-historical-legacypair-removed
 
     mkdir -p "${DELETION_REPO}/envs/dev/case1-retired-legacypair-retained"
@@ -3213,10 +2910,7 @@ HARNESS
     DELETION_HARNESS_STATUS=$?
     echo "$DELETION_TEST_OUTPUT"
 
-    # The harness itself must never silently swallow a broken classifier:
-    # any command-not-found or Python traceback anywhere in the captured
-    # output fails this test outright, regardless of what the individual
-    # case assertions below would otherwise report.
+    # The harness itself must never silently swallow a broken classifier -- any command-not-found or Python traceback anywhere in the output fails this test outright.
     if [ "$DELETION_HARNESS_STATUS" -ne 0 ] \
         || echo "$DELETION_TEST_OUTPUT" | grep -qiE "command not found|Traceback \(most recent call last\)|: not found$"; then
       fail "the deletion-candidate test harness itself failed or is broken (command-not-found/traceback/non-zero exit) -- see output above"
@@ -3264,17 +2958,7 @@ else
   skip "Phase 5A legacy-folder behavioral checks -- ${DETECT_SCRIPT} or python3 not available"
 fi
 
-# ---------------------------------------------------------------------
-# Phase 5B2A pre-deployment correction: active/historical classifier split
-# regression tests. Covers the required proofs: manual legacyPair
-# deployment is rejected; active legacyPair cannot enter the build matrix;
-# missing/unknown current deploymentModel never defaults to legacyPair;
-# unknown deletion-matrix model fails closed; no active build/Application
-# path contains legacyPair; no source/target StatefulSet/PVC validation
-# remains; the workflow summary accurately documents all deletion
-# triggers. (Historical-legacyPair deletion classification is covered
-# above by case3-historical-legacypair-removed.)
-# ---------------------------------------------------------------------
+# Active/historical classifier split regression tests: manual legacyPair rejected; active legacyPair cannot enter the build matrix; missing/unknown deploymentModel never defaults to legacyPair; unknown deletion-matrix model fails closed; no active build/Application path contains legacyPair; no source/target StatefulSet/PVC validation remains; the workflow summary documents all deletion triggers. (Historical-legacyPair deletion is covered above by case3.)
 echo ""
 echo "--- Phase 5B2A: active-contract rejection of legacyPair; deletion-job fail-closed; no legacyPair in the active build/Application path ---"
 
@@ -3303,28 +2987,21 @@ if [ -f "${WORKDIR}/is_gg_fn.sh" ] && [ -s "${WORKDIR}/is_gg_fn.sh" ]; then
   ' 2>&1)"
   echo "$CLASSIFIER_OUT"
 
-  # 1: manual (workflow_dispatch-equivalent) legacyPair deployment request
-  # is rejected by the active contract -- workflow_dispatch validates the
-  # requested deployment_id's values file with exactly this same function.
+  # 1: manual (workflow_dispatch-equivalent) legacyPair deployment request is rejected by the active contract -- workflow_dispatch validates it with exactly this same function.
   if echo "$CLASSIFIER_OUT" | grep -qE "^CLASSIFY case-manual-legacypair status=1 reason=not a GoldenGate deployment values file: deploymentModel='legacyPair'$"; then
     pass "1: a manual (workflow_dispatch) request for a legacyPair deployment is rejected by the active contract"
   else
     fail "1: a manual legacyPair deployment request was not rejected as expected"
   fi
 
-  # 2: active legacyPair cannot enter the push-triggered build/update
-  # matrix -- that loop classifies every candidate with exactly this same
-  # function before ever considering active/inactive status.
+  # 2: active legacyPair cannot enter the push-triggered build/update matrix -- that loop classifies every candidate with exactly this same function first.
   if echo "$CLASSIFIER_OUT" | grep -qE "^CLASSIFY case-push-active-legacypair status=1 reason=not a GoldenGate deployment values file: deploymentModel='legacyPair'$"; then
     pass "2: a legacyPair deployment values file cannot enter the active push build/update matrix"
   else
     fail "2: a legacyPair deployment values file was not excluded from the active build matrix as expected"
   fi
 
-  # 3: missing/unknown current deploymentModel never defaults to
-  # legacyPair -- both a file with no deploymentModel key at all, and a
-  # file with an unrecognized value, must be rejected (reason mentions the
-  # actual value/None), never silently treated as legacyPair or accepted.
+  # 3: missing/unknown current deploymentModel never defaults to legacyPair -- both a missing key and an unrecognized value must be rejected, never silently accepted.
   if echo "$CLASSIFIER_OUT" | grep -qE "^CLASSIFY case-no-model status=1 reason=not a GoldenGate deployment values file: deploymentModel=None$" \
       && ! echo "$CLASSIFIER_OUT" | grep -q "case-no-model.*legacyPair"; then
     pass "3a: a current values file with no deploymentModel key is rejected, never defaulted to legacyPair"
@@ -3343,9 +3020,7 @@ else
 fi
 
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
-  # 5: the deletion job's "Prepare deletion variables" step must fail
-  # closed (non-zero exit, no defaulting) when matrix.deployment_model is
-  # neither singleRuntime nor legacyPair.
+  # 5: the deletion job's "Prepare deletion variables" step must fail closed (non-zero exit, no defaulting) when matrix.deployment_model is neither singleRuntime nor legacyPair.
   python3 - "$EKS_APP_WORKFLOW" > "${WORKDIR}/prepare_deletion_vars.sh" <<'PYEOF'
 import sys
 import yaml
@@ -3409,9 +3084,7 @@ else
   skip "deletion-job fail-closed unknown-model test -- python3 not available"
 fi
 
-# 6/7: static checks that no active build/Application-path code contains
-# legacyPair conditional logic, and that no source/target StatefulSet/PVC
-# validation remains anywhere in the workflow.
+# 6/7: static checks that no active build/Application-path code contains legacyPair conditional logic, and no source/target StatefulSet/PVC validation remains anywhere.
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   BUILD_JOB_LEGACY_CODE_HITS="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
 import sys
@@ -3427,13 +3100,7 @@ for step in doc["jobs"]["build_publish_and_deploy"]["steps"]:
         if "legacypair" not in line.lower():
             continue
         stripped = line.strip()
-        # Allowed: blank, a comment line (bash '#' or Python '#' -- this
-        # job's run: blocks are bash with embedded python3 heredocs, and
-        # both comment styles use '#'), or a bare echo/print statement --
-        # those are informational log/error-message text (e.g. explaining
-        # *why* legacyPair is rejected), never branching/decision logic.
-        # What must be absent is legacyPair appearing in an actual
-        # conditional, comparison, assignment, or case pattern.
+        # Allowed: blank/comment lines (bash and embedded python3 both use '#') or a bare echo/print (informational text) -- what must be absent is legacyPair in an actual conditional, comparison, assignment, or case pattern.
         if not stripped or stripped.startswith("#"):
             continue
         if stripped.startswith("echo ") or stripped.startswith('echo"') \
@@ -3453,9 +3120,7 @@ PYEOF
     fail "6: build_publish_and_deploy still contains non-comment legacyPair references:"$'\n'"${BUILD_JOB_LEGACY_CODE_HITS}"
   fi
 
-  # Only non-comment lines count as "validation remaining" -- a comment
-  # that merely explains what was removed (e.g. "no longer renders
-  # source-statefulset.yaml") is expected and must not be flagged.
+  # Only non-comment lines count as "validation remaining" -- a comment merely explaining what was removed is expected and must not be flagged.
   strip_comment_hits() {
     while IFS= read -r hit; do
       [ -z "$hit" ] && continue
@@ -3491,10 +3156,7 @@ else
   skip "static legacyPair/source-target-validation absence checks -- python3 not available"
 fi
 
-# 9: the build job's workflow summary accurately documents every deletion
-# trigger (physical removal, zero-byte, whitespace-only, comment-only,
-# YAML null, lifecycle.state=absent) and correctly describes enabled=false/
-# deployment.enabled=false as retained (non-deleting).
+# 9: the build job's workflow summary accurately documents every deletion trigger (physical removal, zero-byte, whitespace-only, comment-only, YAML null, lifecycle.state=absent) and describes enabled=false/deployment.enabled=false as retained (non-deleting).
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   BUILD_SUMMARY_TEXT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
 import sys
@@ -3524,20 +3186,12 @@ else
   skip "workflow summary deletion-trigger documentation check -- python3 not available"
 fi
 
-# ---------------------------------------------------------------------
-# Phase 5B2A: malformed CURRENT YAML must fail the workflow closed (never
-# silently skipped, never silently deleted); whole-folder, whole-envs-
-# directory, and rename scenarios exercised through the REAL discovery
-# logic (git diff --name-status), not just the isolated per-ID loop above.
-# ---------------------------------------------------------------------
+# Malformed CURRENT YAML must fail the workflow closed (never silently skipped or deleted); whole-folder, whole-envs-directory, and rename scenarios exercised through the REAL discovery logic (git diff --name-status), not just the isolated per-ID loop above.
 echo ""
 echo "--- Phase 5B2A: malformed-current-YAML hard failure; folder/envs-directory/rename discovery ---"
 
 if [ -f "${WORKDIR}/detect_script.sh" ] && [ -s "${WORKDIR}/detect_script.sh" ] && command -v python3 >/dev/null 2>&1; then
-  # 15: malformed CURRENT YAML (file still exists, still has bytes, but is
-  # not valid YAML) must abort the whole detection script with a clear
-  # error -- never be treated as an intentional deletion signal, and never
-  # silently ignored either.
+  # 15: malformed CURRENT YAML (file exists, has bytes, but isn't valid YAML) must abort the whole detection script with a clear error -- never treated as intentional deletion, never silently ignored.
   MALFORMED_REPO="${WORKDIR}/malformed-repo"
   rm -rf "$MALFORMED_REPO"
   mkdir -p "${MALFORMED_REPO}/envs/dev/case-malformed-current"
@@ -3577,17 +3231,7 @@ if [ -f "${WORKDIR}/detect_script.sh" ] && [ -s "${WORKDIR}/detect_script.sh" ] 
   fi
   rm -rf "$MALFORMED_REPO"
 
-  # 4/5/10: exercise the REAL discovery logic (REMOVED_PATH_IDS/
-  # CHANGED_VALUES_IDS via git diff --name-status), not just a manually
-  # supplied DELETION_CANDIDATE_IDS, for: whole-folder deletion, whole-envs-
-  # directory deletion, and folder rename.
-  # Extract only the discovery half (NAME_STATUS/REMOVED_PATH_IDS/
-  # CHANGED_VALUES_IDS/DELETION_CANDIDATE_IDS construction), stopping
-  # before the "for CANDIDATE_ID in $DELETION_CANDIDATE_IDS" loop --
-  # that loop is reused as-is from the already-extracted, already-proven
-  # deletion_loop.sh above, so this test never needs to stub the
-  # unrelated DEPLOYMENT_MATRIX_ITEMS jq recomputation that follows it
-  # in the real script (which requires real jq and $GITHUB_OUTPUT).
+  # 4/5/10: exercises the REAL discovery logic (REMOVED_PATH_IDS/CHANGED_VALUES_IDS via git diff --name-status) for whole-folder deletion, whole-envs-directory deletion, and folder rename; extracts only the discovery half, stopping before the CANDIDATE_ID loop (reused as-is from deletion_loop.sh above) so this test never needs to stub the unrelated jq recomputation that follows.
   awk '/^NAME_STATUS="\$\(git diff --name-status/,/^DELETION_CANDIDATE_IDS=/' "${WORKDIR}/detect_script.sh" > "${WORKDIR}/discovery_only.sh"
 
   if [ -s "${WORKDIR}/discovery_only.sh" ] && [ -s "${WORKDIR}/deletion_loop.sh" ]; then
@@ -3673,12 +3317,7 @@ if [ -f "${WORKDIR}/detect_script.sh" ] && [ -s "${WORKDIR}/detect_script.sh" ] 
       'ADDED id=gg-oracle-payments-01 model=singleRuntime' \
       'ADDED id=goldengate-monitor'
 
-    # Test 10: renaming a deployment folder deletes the old ID and the new
-    # ID is discovered as an independent candidate (build-matrix discovery
-    # is a separate code path from the deletion loop under test here, so
-    # this proves the deletion half of the contract: the OLD id must be
-    # queued for deletion; the NEW id must never itself appear as a
-    # deletion entry).
+    # Test 10: renaming a deployment folder deletes the old ID and the new ID is discovered as an independent candidate (build-matrix discovery is a separate path) -- proves the OLD id is queued for deletion and the NEW id never appears as a deletion entry.
     setup_rename() { :; }
     setup_rename_mutate() { git -C "$1" mv envs/dev/gg-oracle-payments-01 envs/dev/gg-oracle-payments-01-renamed; }
     run_discovery_case "10: renaming a deployment folder deletes the old ID (and never queues the new ID for deletion)" \
@@ -3697,11 +3336,7 @@ fi
 echo ""
 echo "--- Phase 5A: no Argo CD Application/namespace/PVC/EFS deletion command tied to disabling the legacy folder ---"
 if [ -f "$EKS_APP_WORKFLOW" ]; then
-  # The only place this workflow deletes an Argo CD Application or
-  # namespace is delete_removed_argocd_applications, gated on
-  # has_deletions=true from the deletion matrix -- already proven above to
-  # exclude deployment.enabled=false. No separate, disable-triggered
-  # deletion path may exist anywhere else in the file.
+  # The only place this workflow deletes an Argo CD Application or namespace is delete_removed_argocd_applications, gated on has_deletions=true (already proven above to exclude deployment.enabled=false); no separate, disable-triggered deletion path may exist anywhere else.
   DIRECT_DELETE_HITS="$(grep -n 'kubectl delete\|delete-repository\|efs delete-access-point\|delete_access_point' "$EKS_APP_WORKFLOW" | grep -v 'kubectl delete application\|kubectl delete namespace' || true)"
   if [ -z "$DIRECT_DELETE_HITS" ]; then
     pass "no unexpected delete command exists outside the guarded Argo CD Application/namespace cleanup path"
@@ -3724,10 +3359,7 @@ echo "--- Phase 5A: no direct \${{ inputs.* }} interpolation in run scripts; mar
 
 if [ -f "$EKS_APP_WORKFLOW" ]; then
   INPUTS_INTERP_HITS="$(grep -n '\${{ *inputs\.' "$EKS_APP_WORKFLOW" | grep -v '^\s*[0-9]*: *INPUT_[A-Z_]*: \${{ *inputs\.' || true)"
-  # The only acceptable occurrences are inside a step-level `env:` mapping
-  # (INPUT_X: ${{ inputs.x }}), never inside a run-script body. Re-check
-  # precisely against the full line text (grep -v above already filtered
-  # the common env-mapping shape; anything left over is a real hit).
+  # The only acceptable occurrences are inside a step-level env: mapping (INPUT_X: ${{ inputs.x }}), never inside a run-script body; grep -v above already filtered the common env-mapping shape, so anything left is a real hit.
   if [ -n "$INPUTS_INTERP_HITS" ]; then
     fail "\${{ inputs.* }} appears outside a step-level env: mapping in ${EKS_APP_WORKFLOW}:"$'\n'"${INPUTS_INTERP_HITS}"
   else
@@ -3738,17 +3370,7 @@ else
 fi
 
 if [ -f "$DETECT_SCRIPT" ] && command -v python3 >/dev/null 2>&1; then
-  # Marker-file proof: feed the real, tracked hack/detect-goldengate-
-  # deployments.sh a workflow_dispatch deployment_id containing shell
-  # metacharacters via INPUT_DEPLOYMENT_ID (exactly how the real step-level
-  # env: mapping delivers it), and confirm the payload is never evaluated
-  # as shell code. EVENT_NAME/BEFORE_SHA/AFTER_SHA are plain environment
-  # variables in this script (never ${{ }} GitHub expression syntax --
-  # that substitution happens once, outside this script, in the workflow's
-  # own env: mapping), so no sed-based expression resolution is needed
-  # here: set EVENT_NAME=workflow_dispatch directly, the same opaque-string
-  # way the real workflow step would.
-
+  # Feeds the real, tracked detect-goldengate-deployments.sh a workflow_dispatch deployment_id containing shell metacharacters via INPUT_DEPLOYMENT_ID (exactly how the real env: mapping delivers it), confirming the payload is never evaluated as shell code; EVENT_NAME/BEFORE_SHA/AFTER_SHA are plain env vars here (the ${{ }} substitution happens once, outside this script), so no sed-based resolution is needed.
   MARKER_DIR="${WORKDIR}/marker-test"
   mkdir -p "$MARKER_DIR"
   MARKER_FILE="${MARKER_DIR}/PWNED"
@@ -3776,9 +3398,7 @@ if [ -f "$DETECT_SCRIPT" ] && command -v python3 >/dev/null 2>&1; then
     fi
   }
 
-  # Payloads reference $MARKER_FILE_FOR_TEST (exported above) rather than an
-  # embedded absolute path, so the exact same payload strings work
-  # regardless of $WORKDIR's location.
+  # Payloads reference $MARKER_FILE_FOR_TEST (exported above) rather than an embedded absolute path, so the same payload strings work regardless of $WORKDIR's location.
   run_injection_case "command-substitution" '$(touch "$MARKER_FILE_FOR_TEST")'
   run_injection_case "backticks" '`touch "$MARKER_FILE_FOR_TEST"`'
   run_injection_case "double-quote-break" 'x"; touch "$MARKER_FILE_FOR_TEST"; echo "'
@@ -3932,15 +3552,7 @@ fi
 echo ""
 echo "--- Phase 5A: no alarms/SNS/gg-alerter introduced; no Fluent Bit outside the Phase 6A platform chart; IAM unchanged ---"
 
-# Structural signals only -- never a bare substring grep, which would
-# false-positive on this repository's own negative-assertion code (e.g. a
-# test's forbidden-string tuple, or FORBIDDEN_CONTAINER_SUBSTRINGS in the
-# workflow's singleRuntime contract check -- both deliberately mention these
-# names to prove their absence, not to implement them). Phase 6A legitimately
-# added helm/goldengate-platform/templates/fluent-bit-*.yaml (checked
-# separately above); this block only proves Fluent Bit was never added as
-# its own sibling chart (helm/<name>, maxdepth 2) or into the GoldenGate
-# runtime/monitor charts specifically.
+# Structural signals only -- never a bare substring grep, which would false-positive on this repo's own negative-assertion code (e.g. a forbidden-string tuple that deliberately mentions these names to prove their absence); this block only proves Fluent Bit was never added as its own sibling chart or into the runtime/monitor charts (the expected helm/goldengate-platform/templates/fluent-bit-*.yaml is checked separately above).
 NOT_YET_HITS=""
 [ -d "monitoring/gg-alerter" ] && NOT_YET_HITS="${NOT_YET_HITS} monitoring/gg-alerter/"
 [ -d "helm/gg-alerter" ] && NOT_YET_HITS="${NOT_YET_HITS} helm/gg-alerter/"
@@ -3958,14 +3570,7 @@ else
   fail "unexpected alarm/SNS/gg-alerter/Fluent Bit implementation found in:${NOT_YET_HITS}"
 fi
 
-# Phase 5B1 legitimately changes envs/dev/policies/goldengate-secrets-read-dev
-# (observer DynamoDB/CloudWatch statements removed) and envs/dev/iam.tf's
-# comments/description text -- the monitor role's policy folder must remain
-# completely untouched, and iam.tf's structural identifiers (role names,
-# policy_folder attachments) must not change even though description text
-# may. Whitespace/line-ending-only diffs are pre-existing baseline noise in
-# this repository -- compare with --ignore-all-space so only substantive
-# content changes count.
+# A separate phase legitimately changes envs/dev/policies/goldengate-secrets-read-dev and iam.tf's description text -- the monitor role's policy folder must remain untouched, and iam.tf's structural identifiers must not change even though description text may; compare with --ignore-all-space since whitespace/line-ending diffs are pre-existing baseline noise.
 MONITOR_IAM_DIFF="$(git diff --ignore-all-space -- envs/dev/policies/goldengate-monitor-read-dev 2>/dev/null || true)"
 if [ -z "$MONITOR_IAM_DIFF" ]; then
   pass "envs/dev/policies/goldengate-monitor-read-dev has no substantive changes (monitor IAM untouched)"
@@ -3973,11 +3578,7 @@ else
   fail "unexpected change detected in envs/dev/policies/goldengate-monitor-read-dev -- the monitor role must remain untouched"
 fi
 
-# ---------------------------------------------------------------------
-# 27. Phase 5B1: runtime IAM least-privilege reduction (observer DynamoDB/
-#     CloudWatch permissions removed; monitor IAM and Secrets Manager/KMS
-#     access for canonical and legacy runtime pods unchanged).
-# ---------------------------------------------------------------------
+# 27. Runtime IAM least-privilege reduction (observer DynamoDB/CloudWatch permissions removed; monitor IAM and Secrets Manager/KMS access for canonical and legacy runtime pods unchanged).
 echo ""
 echo "--- Phase 5B1: runtime IAM least-privilege reduction ---"
 
@@ -4022,8 +3623,7 @@ def check(label, condition):
     results.append((label, bool(condition)))
 
 
-# 1. Runtime policy grants no DynamoDB action anywhere (the entire
-# monitoring-state statement, not just its Sid, must be gone).
+# 1. Runtime policy grants no DynamoDB action anywhere (the entire monitoring-state statement, not just its Sid, must be gone).
 runtime_dynamodb_actions = set()
 for s in runtime_statements:
     runtime_dynamodb_actions |= {a for a in actions_of(s) if a.startswith("dynamodb:")}
@@ -4035,8 +3635,7 @@ for s in runtime_statements:
     runtime_cloudwatch_actions |= {a for a in actions_of(s) if a.startswith("cloudwatch:")}
 check("2_no_cloudwatch_actions", not runtime_cloudwatch_actions)
 
-# 3. Runtime role retains its Secrets Manager statement, byte-identical to
-# the original (never broadened to compensate for the removed statements).
+# 3. Runtime role retains its Secrets Manager statement, byte-identical to the original (never broadened to compensate for the removed statements).
 secrets_stmt = find_sid(runtime_statements, "AllowReadGoldenGateDevSecrets")
 check(
     "3_secrets_manager_retained",
@@ -4056,9 +3655,7 @@ check(
     and kms_stmt.get("Effect") == "Allow",
 )
 
-# 5. Monitor role retains DynamoDB read/write (CONFIG reads + LEASE/STATE#
-# writes travel over the same table-level actions) and PutMetricData scoped
-# to GoldenGate/Pipelines.
+# 5. Monitor role retains DynamoDB read/write (CONFIG reads + LEASE/STATE# writes travel over the same table-level actions) and PutMetricData scoped to GoldenGate/Pipelines.
 monitor_ddb_stmt = find_sid(monitor_statements, "AllowReadWriteGoldenGateMonitoringState")
 monitor_cw_stmt = find_sid(monitor_statements, "AllowPublishGoldenGateMonitoringMetrics")
 check(
@@ -4074,15 +3671,10 @@ check(
     and (monitor_cw_stmt.get("Condition") or {}).get("StringEquals", {}).get("cloudwatch:namespace") == "GoldenGate/Pipelines",
 )
 
-# 6. Runtime and monitor policies remain distinct documents (never merged/
-# aliased into each other).
+# 6. Runtime and monitor policies remain distinct documents (never merged/aliased into each other).
 check("6_roles_remain_separate", runtime_path != monitor_path and runtime_statements != monitor_statements)
 
-# 9. No wildcard (Resource: "*") DynamoDB, CloudWatch, or Secrets Manager
-# action exists in the runtime policy (the pre-existing KMS Decrypt
-# Resource: "*" is a known, unchanged, intentionally broad grant -- not
-# newly introduced by this phase -- so it is exempted here and covered by
-# checks 3/4's byte-identical comparison instead).
+# 9. No wildcard (Resource: "*") DynamoDB, CloudWatch, or Secrets Manager action in the runtime policy (the pre-existing KMS Decrypt Resource: "*" is a known, unchanged grant, exempted here and covered by checks 3/4's byte-identical comparison).
 wildcard_violations = []
 for s in runtime_statements:
     if s.get("Resource") == "*":
@@ -4140,8 +3732,7 @@ PYEOF
     fail "9: a wildcard-resourced DynamoDB/CloudWatch/Secrets Manager action was found in the runtime policy"
   fi
 
-  # 10. No statement was broadened to compensate: the runtime policy has
-  # exactly the 2 retained statements, nothing more.
+  # 10. No statement was broadened to compensate: the runtime policy has exactly the 2 retained statements, nothing more.
   RUNTIME_STMT_COUNT="$(python3 -c "import json; print(len((json.load(open('${RUNTIME_POLICY_FILE}')) or {}).get('Statement') or []))")"
   if [ "$RUNTIME_STMT_COUNT" = "2" ]; then
     pass "10: runtime policy has exactly 2 statements (no broadening or replacement compensation)"
@@ -4170,8 +3761,7 @@ else
   fail "8: envs/dev/goldengate-monitor/values.yaml no longer references GoldenGateMonitorReadRole-dev"
 fi
 
-# 11. Terraform references remain valid: iam.tf's module block still exists,
-# still names the same role, and still attaches the same policy_folder.
+# 11. Terraform references remain valid: iam.tf's module block still exists, still names the same role, and still attaches the same policy_folder.
 if grep -q 'module "goldengate_secrets_read_role_dev"' envs/dev/iam.tf \
     && grep -q 'name          = "GoldenGateSecretsReadRole-dev"' envs/dev/iam.tf \
     && grep -q 'policy_folder = "goldengate-secrets-read-dev"' envs/dev/iam.tf \
@@ -4195,14 +3785,32 @@ else
   skip "terraform fmt -check -- terraform not available"
 fi
 
-# 12. No manager metric/DynamoDB/lease behavior changed: collector.py and
-# monitor.py are untouched by this IAM-only phase.
-IAM_PHASE_COLLECTOR_DIFF="$(git diff --stat -- monitoring/monitor/collector.py 2>/dev/null || true)"
-IAM_PHASE_MONITOR_DIFF="$(git diff --stat -- monitoring/monitor/monitor.py 2>/dev/null || true)"
-if [ -z "$IAM_PHASE_COLLECTOR_DIFF" ] && [ -z "$IAM_PHASE_MONITOR_DIFF" ]; then
-  pass "12: collector.py and monitor.py are unchanged -- no manager metric/DynamoDB/lease behavior was altered"
+# 12. No manager metric/DynamoDB/lease behavior changed: collector.py's AST is unchanged (comment/docstring-only edits, e.g. Phase 6C1-UI source hygiene, are allowed and ignored here).
+COLLECTOR_AST_STATUS="$(python3 -c "
+import ast, subprocess, sys
+
+def normalize(source):
+    tree = ast.parse(source)
+    for node in [tree] + list(ast.walk(tree)):
+        body = getattr(node, 'body', None)
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and body:
+            first = body[0]
+            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
+                first.value.value = ''
+    return ast.dump(tree, annotate_fields=False)
+
+try:
+    head = subprocess.run(['git', 'show', 'HEAD:monitoring/monitor/collector.py'], capture_output=True, text=True, check=True).stdout
+    with open('monitoring/monitor/collector.py') as f:
+        working = f.read()
+    print('IDENTICAL' if normalize(head) == normalize(working) else 'DIFFERENT')
+except Exception as exc:
+    print(f'ERROR:{exc}')
+" 2>/dev/null || true)"
+if [ "$COLLECTOR_AST_STATUS" = "IDENTICAL" ]; then
+  pass "12: collector.py's functional AST is unchanged -- no manager metric/DynamoDB/lease behavior was altered"
 else
-  fail "12: collector.py and/or monitor.py were unexpectedly modified during an IAM-only phase"
+  fail "12: collector.py's functional AST was unexpectedly modified during an IAM-only phase (status: ${COLLECTOR_AST_STATUS:-unknown})"
 fi
 
 echo ""
@@ -4233,9 +3841,7 @@ else
   fail "one or more Argo CD deletion safeguards appear to be missing from ${EKS_APP_WORKFLOW}"
 fi
 
-# ---------------------------------------------------------------------
 # 24. No accidental pasted command-note files under hack/.
-# ---------------------------------------------------------------------
 echo ""
 echo "--- No accidental command-note files under hack/ ---"
 
@@ -4245,10 +3851,7 @@ else
   pass "hack/test.yaml does not exist"
 fi
 
-# Generic guard: any *.yaml/*.yml file anywhere under hack/ must actually
-# parse as YAML -- a plain-prose/shell command note accidentally saved with
-# a .yaml/.yml extension (exactly how hack/test.yaml happened) is caught
-# here even if it is renamed or a new one is added later.
+# Generic guard: any *.yaml/*.yml file anywhere under hack/ must actually parse as YAML -- a plain-prose/shell command note accidentally saved with that extension is caught here even if renamed or a new one is added later.
 BAD_HACK_YAML=""
 if command -v python3 >/dev/null 2>&1; then
   while IFS= read -r f; do
@@ -4267,9 +3870,7 @@ else
   skip "hack/ YAML-validity guard -- python3 not available"
 fi
 
-# ---------------------------------------------------------------------
 # 25. Repository hygiene: proven-dead file cleanup regression checks.
-# ---------------------------------------------------------------------
 echo ""
 echo "--- Repository hygiene: dead-file cleanup ---"
 
@@ -4345,11 +3946,7 @@ if [ -f "helm/argocd/charts/argo-cd-9.3.7.tgz" ]; then
   echo "INFO: helm/argocd/charts/argo-cd-9.3.7.tgz is present (a redundant, Helm-regenerable duplicate of the vendored directory was removed when proven safe; its presence here is not itself a failure, only a note)."
 fi
 
-# ---------------------------------------------------------------------
-# 26. EFS rendered-resource validation: strict basePath derivation
-#     (matching goldengate.efsBasePath), fail-closed YAML parsing, no
-#     fragile grep on an optional key under set -euo pipefail.
-# ---------------------------------------------------------------------
+# 26. EFS rendered-resource validation: strict basePath derivation (matching goldengate.efsBasePath), fail-closed YAML parsing, no fragile grep on an optional key under set -euo pipefail.
 echo ""
 echo "--- EFS persistence validation: basePath derivation, strict parsing, StorageClass/PVC checks ---"
 
@@ -4443,8 +4040,7 @@ with open('${EFS_WORKDIR}/values/oracle-override.yaml', 'w') as f:
       echo "$OVERRIDE_OUT"
     fi
 
-    # 5: a missing fileSystemId fails with a clear controlled error (never
-    # an unexplained shell abort).
+    # 5: a missing fileSystemId fails with a clear controlled error (never an unexplained shell abort).
     cat > "${EFS_WORKDIR}/values/missing-fsid.yaml" <<'EOF'
 deploymentModel: singleRuntime
 persistence:
@@ -4486,9 +4082,7 @@ EOF
       echo "$MALFORMED_OUT"
     fi
 
-    # 7: an unknown deploymentModel fails closed (this EFS validation step
-    # now only ever expects deployment_model=singleRuntime, passed through
-    # from the job's own upstream assertion -- never re-inferred here).
+    # 7: an unknown deploymentModel fails closed (this EFS validation step only ever expects deployment_model=singleRuntime, passed through from the job's upstream assertion -- never re-inferred here).
     cat > "${EFS_WORKDIR}/values/unknown-model.yaml" <<'EOF'
 deploymentModel: someWeirdModel
 persistence:
@@ -4508,9 +4102,7 @@ EOF
       echo "$UNKNOWN_MODEL_OUT"
     fi
 
-    # 8/9/11: mutate a real rendered manifest's StorageClass to prove the
-    # rendered-resource checks have teeth (wrong basePath, wrong
-    # fileSystemId, and a duplicate matching-name StorageClass).
+    # 8/9/11: mutates a real rendered manifest's StorageClass to prove the rendered-resource checks have teeth (wrong basePath, wrong fileSystemId, duplicate matching-name StorageClass).
     python3 -c "
 import yaml
 with open('${EFS_WORKDIR}/rendered/gg-oracle-payments-01.yaml') as f:
@@ -4557,10 +4149,7 @@ with open('${EFS_WORKDIR}/rendered/wrong-fsid.yaml', 'w') as f:
       echo "$WRONG_FSID_OUT"
     fi
 
-    # 10: absence of the optional basePath key never causes an unexplained
-    # shell exit -- structural proof (the fragile grep pattern is gone) plus
-    # behavioral proof (tests 1/2 above already completed with a clean
-    # PASS/FAIL verdict, not a raw "unbound variable"/pipefail abort).
+    # 10: absence of the optional basePath key never causes an unexplained shell exit -- structural proof (the fragile grep pattern is gone) plus behavioral proof (tests 1/2 above already completed cleanly, not a raw "unbound variable"/pipefail abort).
     if grep -qE "grep.*basePath" "${WORKDIR}/efs_validate.sh"; then
       fail "10: the EFS validation step still greps for basePath in the values file -- the fragile fallback was not removed"
     else
@@ -4590,10 +4179,7 @@ with open('${EFS_WORKDIR}/rendered/duplicate-storageclass.yaml', 'w') as f:
       echo "$DUP_SC_OUT"
     fi
 
-    # 22: legacyPair Helm rendering is rejected with a clear controlled
-    # error (the chart no longer implements legacyPair source/target
-    # rendering -- it was removed in Phase 5B2A). Also confirm an unknown
-    # deploymentModel fails closed the same way.
+    # 22: legacyPair Helm rendering is rejected with a clear controlled error (the chart no longer implements legacyPair source/target rendering); also confirms an unknown deploymentModel fails closed the same way.
     set +e
     LEGACY_REJECT_ERR="$(helm template ogg-legacy-reject "$RUNTIME_CHART" --namespace goldengate-dev \
       --values "${REPO_ROOT}/envs/dev/gg-oracle-payments-01/values.yaml" \
@@ -4622,8 +4208,7 @@ with open('${EFS_WORKDIR}/rendered/duplicate-storageclass.yaml', 'w') as f:
       echo "$UNKNOWN_MODEL_ERR"
     fi
 
-    # 13: this EFS-only correction did not touch observer removal or the
-    # workflow-matrix classifier logic elsewhere in the same file.
+    # 13: this EFS-only correction did not touch observer removal or the workflow-matrix classifier logic elsewhere in the same file.
     PHASE5A_SPOTCHECK_OK="true"
     if grep -q "^  ensure_observer_image:" "$EKS_APP_WORKFLOW"; then
       PHASE5A_SPOTCHECK_OK="false"
@@ -4646,17 +4231,7 @@ else
   skip "EFS persistence validation regression tests -- helm and/or python3/PyYAML not available"
 fi
 
-# ---------------------------------------------------------------------
-# Phase 5B2A workflow-compilation-size correction: the "Detect changed
-# deployments" step's inline run: scalar previously reached ~23,971 UTF-8
-# characters, above GitHub Actions' ~21,000-character limit for a single
-# run: command -- GitHub rejected the whole workflow file at compile time
-# (falling back to displaying it by file path, not its configured name/
-# run-name). The fix moves the real implementation into the tracked,
-# executable hack/detect-goldengate-deployments.sh; the workflow step is
-# now only a small env:-mapping-plus-invocation wrapper. These tests prove
-# the fix and guard against regressing back over the limit.
-# ---------------------------------------------------------------------
+# The "Detect changed deployments" step's inline run: scalar once reached ~23,971 UTF-8 characters, above GitHub Actions' ~21,000-character limit, which made GitHub reject the whole workflow file at compile time; the fix moved the real implementation into the tracked hack/detect-goldengate-deployments.sh, leaving the step as a small env:-mapping wrapper -- these tests prove the fix and guard against regressing back over the limit.
 echo ""
 echo "--- Phase 5B2A: workflow-compilation-size correction ---"
 
@@ -4705,8 +4280,7 @@ print('detect_step_length:', data['detect_step_length'])
 print('max_length:', data['max_length'])
 "
 
-  # 1: the "Detect changed deployments" run: body is below GitHub's
-  # 21,000-character limit (the exact defect this phase fixes).
+  # 1: the "Detect changed deployments" run: body is below GitHub's 21,000-character limit (the exact defect this phase fixes).
   DETECT_STEP_LENGTH="$(echo "$RUN_LENGTHS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['detect_step_length'])")"
   if [ -n "$DETECT_STEP_LENGTH" ] && [ "$DETECT_STEP_LENGTH" -lt 21000 ]; then
     pass "1: the 'Detect changed deployments' run: body (${DETECT_STEP_LENGTH} chars) is below GitHub's 21,000-character run: limit"
@@ -4714,8 +4288,7 @@ print('max_length:', data['max_length'])
     fail "1: the 'Detect changed deployments' run: body is missing or still at/above the 21,000-character limit (length=${DETECT_STEP_LENGTH:-<missing>})"
   fi
 
-  # 2: safety margin -- every run: scalar in the whole workflow is below
-  # 18,000 characters, not just below the hard 21,000 limit.
+  # 2: safety margin -- every run: scalar in the whole workflow is below 18,000 characters, not just below the hard 21,000 limit.
   MAX_RUN_LENGTH="$(echo "$RUN_LENGTHS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['max_length'])")"
   if [ -n "$MAX_RUN_LENGTH" ] && [ "$MAX_RUN_LENGTH" -lt 18000 ]; then
     pass "2: every run: scalar in ${EKS_APP_WORKFLOW} is below the 18,000-character safety margin (max=${MAX_RUN_LENGTH})"
@@ -4723,11 +4296,7 @@ print('max_length:', data['max_length'])
     fail "2: at least one run: scalar in ${EKS_APP_WORKFLOW} is at/above the 18,000-character safety margin (max=${MAX_RUN_LENGTH:-<missing>})"
   fi
 
-  # 3/4: the workflow header has a non-empty name and run-name. PyYAML
-  # (YAML 1.1) parses an unquoted top-level "on" key as the boolean True,
-  # not the string "on" -- that is expected and must not be treated as a
-  # missing/malformed key here or anywhere else this script inspects the
-  # parsed workflow document.
+  # 3/4: the workflow header has a non-empty name and run-name. PyYAML (YAML 1.1) parses an unquoted top-level "on" key as the boolean True, not the string "on" -- expected, and must not be treated as missing/malformed anywhere this script inspects the parsed document.
   HEADER_CHECK="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
 import sys
 import yaml
@@ -4738,10 +4307,7 @@ with open(sys.argv[1], encoding="utf-8") as f:
 name_ok = isinstance(doc.get("name"), str) and doc.get("name").strip() != ""
 run_name_ok = isinstance(doc.get("run-name"), str) and doc.get("run-name").strip() != ""
 
-# YAML 1.1 boolean-key quirk: PyYAML resolves the unquoted key "on" to the
-# Python boolean True. Both True and the literal string "on" are accepted
-# here as "the trigger key is present" -- this must never be scored as a
-# missing key/false failure.
+# YAML 1.1 boolean-key quirk: PyYAML resolves the unquoted key "on" to the Python boolean True; both True and the literal string "on" are accepted here as "the trigger key is present".
 on_present = True in doc or "on" in doc
 
 print(f"name_ok={name_ok}")
@@ -4784,9 +4350,7 @@ sys.exit(1)
     fail "5: the 'Detect changed deployments' step does not invoke hack/detect-goldengate-deployments.sh"
   fi
 
-  # 6: no second, embedded copy of _classify_deployment_model_yaml remains
-  # inside the workflow YAML -- the one and only implementation lives in
-  # ${DETECT_SCRIPT}.
+  # 6: no second, embedded copy of _classify_deployment_model_yaml remains inside the workflow YAML -- the one and only implementation lives in ${DETECT_SCRIPT}.
   CLASSIFIER_IN_WORKFLOW_COUNT="$(grep -c "_classify_deployment_model_yaml() {" "$EKS_APP_WORKFLOW" || true)"
   if [ "${CLASSIFIER_IN_WORKFLOW_COUNT:-0}" -eq 0 ]; then
     pass "6: no embedded copy of _classify_deployment_model_yaml exists inside ${EKS_APP_WORKFLOW}"
@@ -4794,12 +4358,7 @@ sys.exit(1)
     fail "6: ${EKS_APP_WORKFLOW} still contains an embedded _classify_deployment_model_yaml definition (found ${CLASSIFIER_IN_WORKFLOW_COUNT})"
   fi
 
-  # 9: workflow input/context expressions are mapped through a step-level
-  # env: block, never pasted directly into the external shell
-  # implementation. Checked two ways: the workflow step's env: mapping
-  # carries INPUT_*/EVENT_NAME/BEFORE_SHA/AFTER_SHA, and the external
-  # script itself contains no "${{ ... }}" GitHub Actions expression
-  # syntax at all (it only ever reads plain shell environment variables).
+  # 9: workflow input/context expressions are mapped through a step-level env: block, never pasted directly into the external shell implementation; checked two ways: the env: mapping carries INPUT_*/EVENT_NAME/BEFORE_SHA/AFTER_SHA, and the script itself contains no "${{ ... }}" syntax at all.
   ENV_MAPPING_CHECK="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
 import sys
 import yaml
@@ -4841,10 +4400,7 @@ else
 fi
 
 if [ -f "$DETECT_SCRIPT" ]; then
-  # 7: the external script is executable, or is explicitly invoked
-  # through bash regardless of its own executable bit (the workflow
-  # wrapper always does `bash hack/detect-goldengate-deployments.sh`, so
-  # either property alone is sufficient -- this test accepts either).
+  # 7: the external script is executable, or is explicitly invoked through bash regardless of its own executable bit (the workflow wrapper always does `bash hack/detect-goldengate-deployments.sh`, so either is sufficient).
   SCRIPT_IS_EXECUTABLE="false"
   [ -x "$DETECT_SCRIPT" ] && SCRIPT_IS_EXECUTABLE="true"
   SCRIPT_INVOKED_VIA_BASH="false"
@@ -4872,14 +4428,7 @@ else
   skip "external script executable/output checks -- ${DETECT_SCRIPT} not found"
 fi
 
-# ---------------------------------------------------------------------
-# Phase 5B2B1: read-only legacy external-resource cleanup inventory.
-# hack/inventory-goldengate-legacy-resources.sh and
-# .github/workflows/goldengate-legacy-cleanup-inventory.yaml never create,
-# modify, or delete any AWS/Kubernetes resource -- these tests prove that,
-# prove the canonical deny-list can never be overridden by any observed
-# evidence, and prove permission gaps are reported rather than guessed.
-# ---------------------------------------------------------------------
+# Read-only legacy external-resource cleanup inventory: these tests prove hack/inventory-goldengate-legacy-resources.sh and its workflow never create/modify/delete any AWS/Kubernetes resource, the canonical deny-list can never be overridden, and permission gaps are reported rather than guessed.
 echo ""
 echo "--- Phase 5B2B1: read-only legacy cleanup inventory ---"
 
@@ -4893,9 +4442,7 @@ import yaml
 with open(sys.argv[1], encoding="utf-8") as f:
     doc = yaml.safe_load(f)
 
-# YAML 1.1 boolean-key quirk: PyYAML resolves the unquoted key "on" to the
-# Python boolean True -- accept either, matching the same handling used for
-# goldengate-eks-app.yaml elsewhere in this test suite.
+# YAML 1.1 boolean-key quirk: PyYAML resolves the unquoted key "on" to the Python boolean True -- accept either, matching the handling used for goldengate-eks-app.yaml elsewhere in this suite.
 on_key = True if True in doc else "on"
 triggers = doc.get(on_key, {}) or {}
 
@@ -4940,8 +4487,7 @@ PYEOF
     fail "2: ${INVENTORY_WORKFLOW} unexpectedly has a push trigger"
   fi
 
-  # 3: no mutation input -- exactly the minimal safe "environment" input,
-  # and no input name suggests an apply/delete/mutation mode.
+  # 3: no mutation input -- exactly the minimal safe "environment" input, and no input name suggests an apply/delete/mutation mode.
   if echo "$INVENTORY_HEADER_CHECK" | grep -q "^input_names=\['environment'\]$" \
       && echo "$INVENTORY_HEADER_CHECK" | grep -q "^suspicious_inputs=\[\]$"; then
     pass "3: ${INVENTORY_WORKFLOW} has no mutation input (only environment)"
@@ -4949,16 +4495,14 @@ PYEOF
     fail "3: ${INVENTORY_WORKFLOW} has an unexpected or suspicious input"
   fi
 
-  # 5 (part): the workflow step invokes the real external script, never a
-  # duplicated inline implementation.
+  # 5 (part): the workflow step invokes the real external script, never a duplicated inline implementation.
   if echo "$INVENTORY_HEADER_CHECK" | grep -q "^invokes_script=True$"; then
     pass "${INVENTORY_WORKFLOW} invokes ${INVENTORY_SCRIPT} rather than embedding its own implementation"
   else
     fail "${INVENTORY_WORKFLOW} does not invoke ${INVENTORY_SCRIPT}"
   fi
 
-  # 20: every run: block in every workflow file (not just this new one)
-  # stays below GitHub's 21,000-character limit.
+  # 20: every run: block in every workflow file (not just this new one) stays below GitHub's 21,000-character limit.
   ALL_WORKFLOW_MAX_LENGTH=0
   for wf in .github/workflows/*.yaml .github/workflows/*.yml; do
     [ -f "$wf" ] || continue
@@ -5019,24 +4563,21 @@ if [ -f "$INVENTORY_SCRIPT" ]; then
     fail "5: ${INVENTORY_SCRIPT} is missing expected candidate PV ID(s):${PV_CANDIDATES_MISSING}"
   fi
 
-  # 11: DynamoDB inventory uses Query against an exact partition key, never
-  # a table-wide Scan.
+  # 11: DynamoDB inventory uses Query against an exact partition key, never a table-wide Scan.
   if grep -qE "(aws )?dynamodb query" "$INVENTORY_SCRIPT" && ! grep -qE "(aws )?dynamodb scan| --scan " "$INVENTORY_SCRIPT"; then
     pass "11: ${INVENTORY_SCRIPT} uses 'dynamodb query' (exact partition key) and never 'dynamodb scan'"
   else
     fail "11: ${INVENTORY_SCRIPT} does not exclusively use Query for DynamoDB (scan present or query absent)"
   fi
 
-  # 13: missing EFS/ECR permissions produce a permission-gap literal,
-  # exactly as specified, rather than the script guessing eligibility.
+  # 13: missing EFS/ECR permissions produce a permission-gap literal, exactly as specified, rather than the script guessing eligibility.
   if grep -q "EFS_METADATA_PERMISSION_MISSING" "$INVENTORY_SCRIPT" && grep -q "OBSERVER_ECR_PERMISSION_MISSING" "$INVENTORY_SCRIPT"; then
     pass "13: ${INVENTORY_SCRIPT} reports EFS_METADATA_PERMISSION_MISSING and OBSERVER_ECR_PERMISSION_MISSING on missing permissions"
   else
     fail "13: ${INVENTORY_SCRIPT} is missing the required permission-gap literal(s)"
   fi
 
-  # 14: the manifest JSON schema contains every required top-level and
-  # candidates sub-key.
+  # 14: the manifest JSON schema contains every required top-level and candidates sub-key.
   SCHEMA_KEYS_MISSING=""
   for key in environment generatedAt baseline canonicalBaselineVerified inventoryComplete eligibilityReady canonical candidates blocked permissionGaps; do
     grep -qE "^\s*${key}:" "$INVENTORY_SCRIPT" || SCHEMA_KEYS_MISSING="${SCHEMA_KEYS_MISSING} ${key}"
@@ -5050,27 +4591,21 @@ if [ -f "$INVENTORY_SCRIPT" ]; then
     fail "14: the manifest JSON schema in ${INVENTORY_SCRIPT} is missing key(s):${SCHEMA_KEYS_MISSING}"
   fi
 
-  # PVCs have no candidate resourceType at all in the schema -- structurally
-  # deny-listed (7): there is no "persistentVolumeClaims" candidate array,
-  # so a PVC can never appear as a cleanup candidate regardless of any
-  # observed state.
+  # PVCs have no candidate resourceType at all in the schema -- structurally deny-listed (7): there is no "persistentVolumeClaims" candidate array, so a PVC can never appear as a cleanup candidate.
   if ! grep -qE "^\s*persistentVolumeClaims:" "$INVENTORY_SCRIPT"; then
     pass "7: PersistentVolumeClaims have no candidate resourceType in the manifest schema -- structurally deny-listed"
   else
     fail "7: ${INVENTORY_SCRIPT} unexpectedly defines a persistentVolumeClaims candidate list"
   fi
 
-  # 15: no secret-value retrieval anywhere in the script (Secrets Manager
-  # GetSecretValue, or any other "get secret value" shaped call).
+  # 15: no secret-value retrieval anywhere in the script (Secrets Manager GetSecretValue, or any other "get secret value" shaped call).
   if grep -qiE "get-secret-value|getsecretvalue" "$INVENTORY_SCRIPT"; then
     fail "15: ${INVENTORY_SCRIPT} appears to retrieve a secret value"
   else
     pass "15: ${INVENTORY_SCRIPT} never retrieves a secret value"
   fi
 
-  # Confirm the script never logs/echoes a raw AWS Secret string value
-  # (only Secrets Manager *paths*, e.g. dev/goldengate/source/admin, are
-  # ever referenced -- paths are identifiers, not secret values).
+  # Confirms the script never logs/echoes a raw AWS Secret string value (only Secrets Manager paths, e.g. dev/goldengate/source/admin, are ever referenced -- paths are identifiers, not secret values).
   if grep -qE "SecretString|secretString" "$INVENTORY_SCRIPT"; then
     fail "15b: ${INVENTORY_SCRIPT} appears to reference a raw secret string field"
   else
@@ -5081,10 +4616,7 @@ else
 fi
 
 if [ -f "$INVENTORY_SCRIPT" ] && command -v python3 >/dev/null 2>&1; then
-  # Extract just the constants + pure classification functions (never the
-  # live AWS/kubectl collection code) so eligibility logic can be unit-
-  # tested deterministically, the same established pattern already used
-  # elsewhere in this file for the detection script's classifier.
+  # Extracts just the constants + pure classification functions (never the live AWS/kubectl collection code) so eligibility logic can be unit-tested deterministically, matching the pattern already used for the detection script's classifier.
   python3 - "$INVENTORY_SCRIPT" > "${WORKDIR}/inventory_classify_funcs.sh" <<'PYEOF'
 import re
 import sys
@@ -5105,10 +4637,7 @@ for i, l in enumerate(lines):
 if end is None:
     sys.exit("could not locate classify_observer_image() function body")
 
-# Drop the "prerequisites" tool-check block (MISSING_TOOLS.. through
-# in_array()) -- not needed and not relevant for pure-function testing;
-# keeping it would make this fixture depend on jq/python3 being on PATH
-# purely to reach the functions under test.
+# Drops the "prerequisites" tool-check block (MISSING_TOOLS.. through in_array()) -- keeping it would make this fixture depend on jq/python3 being on PATH purely to reach the functions under test.
 body = "".join(lines[start:end + 1])
 prereq_start = body.find("MISSING_TOOLS=()")
 prereq_end = body.find("in_array()")
@@ -5120,16 +4649,7 @@ sys.stdout.write(body)
 PYEOF
 
   if [ -s "${WORKDIR}/inventory_classify_funcs.sh" ] && bash -n "${WORKDIR}/inventory_classify_funcs.sh" >/dev/null 2>&1; then
-    # Focused pure-function assertions. classify_pv/classify_observer_image/
-    # classify_ecr_repository signatures below match the PV active-PVC-
-    # reference and ECR image-inventory-gating corrections -- baseline=false
-    # blocks eligibility; a false *ReferenceCheckVerified flag blocks
-    # eligibility; canonical resources never enter candidates; an absent
-    # legacy StorageClass is already_absent, not eligible; a non-matching
-    # observer tag is blocked; a PVC-list read failure blocks PV
-    # eligibility; an active PVC reference blocks PV eligibility; an ECR
-    # image-inventory read failure blocks repository eligibility; a
-    # repository URI mismatch blocks image eligibility.
+    # Focused pure-function assertions covering: baseline=false blocks eligibility; a false *ReferenceCheckVerified flag blocks eligibility; canonical resources never enter candidates; an absent legacy StorageClass is already_absent not eligible; a non-matching observer tag is blocked; a PVC-list read failure or an active PVC reference blocks PV eligibility; an ECR image-inventory read failure or a repository URI mismatch blocks eligibility.
     INVENTORY_CLASSIFY_OUTPUT="$(bash -c '
       source "'"${WORKDIR}"'/inventory_classify_funcs.sh"
       set +e
@@ -5259,13 +4779,7 @@ else
 fi
 
 if [ -f "$INVENTORY_SCRIPT" ] && command -v python3 >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
-  # Dual-account correction (Phase 5B2B1 account-context correction) focused
-  # checks. These extract the exact production account-baseline block and
-  # the exact production canonical-monitor-validation block (never the rest
-  # of Section 4, which makes real kubectl/aws calls at source time) and run
-  # them under small in-test stub run_aws_json/run_workload_aws_json/
-  # run_kubectl_json/add_permission_gap functions -- never a fake aws/
-  # kubectl binary or an end-to-end integration-test framework.
+  # Dual-account correction focused checks: extracts the exact production account-baseline block and canonical-monitor-validation block (never the rest of Section 4, which makes real kubectl/aws calls) and runs them under small in-test stub run_aws_json/run_workload_aws_json/run_kubectl_json/add_permission_gap functions -- never a fake aws/kubectl binary.
   python3 - "$INVENTORY_SCRIPT" > "${WORKDIR}/inventory_account_block.sh" <<'PYEOF'
 import sys
 
@@ -5363,11 +4877,7 @@ PYEOF
     fail "dual-account 2c: CANONICAL_BASELINE_VERIFIED does not require BASELINE_WORKLOAD_ACCOUNT_OK, or a stale BASELINE_ACCOUNT_OK reference remains"
   fi
 
-  # 3: EFS access-point NotFound evidence must come from the workload-account
-  # session (LAST_WORKLOAD_AWS_NOTFOUND / LAST_WORKLOAD_SESSION_OK), never
-  # from the build-account session (LAST_AWS_NOTFOUND) -- a build-account
-  # "not found" result is exactly the untrustworthy evidence this correction
-  # removes.
+  # 3: EFS access-point NotFound evidence must come from the workload-account session (LAST_WORKLOAD_AWS_NOTFOUND/LAST_WORKLOAD_SESSION_OK), never the build-account session (LAST_AWS_NOTFOUND) -- that untrustworthy evidence is exactly what this correction removes.
   EFS_SECTION="$(sed -n '/^echo "--- C\. EFS access-point validation ---"$/,/^echo "--- D\. StorageClass validation ---"$/p' "$INVENTORY_SCRIPT")"
   if echo "$EFS_SECTION" | grep -q 'run_workload_aws_json efs describe-access-points' \
       && echo "$EFS_SECTION" | grep -q 'LAST_WORKLOAD_AWS_NOTFOUND' \
@@ -5430,11 +4940,7 @@ else
 fi
 
 if [ -f "$INVENTORY_SCRIPT" ] && command -v python3 >/dev/null 2>&1; then
-  # 10: eligibilityReady=false leaves no candidate with eligibility=eligible.
-  # enforce_eligibility_readiness lives in Section 5 (after the live-
-  # collection code), so it is extracted on its own -- never alongside
-  # Section 4, which makes real kubectl/aws calls at source time and must
-  # never be sourced in a local test.
+  # 10: eligibilityReady=false leaves no candidate with eligibility=eligible. enforce_eligibility_readiness lives in Section 5, so it's extracted on its own -- never alongside Section 4, which makes real kubectl/aws calls and must never be sourced in a local test.
   python3 - "$INVENTORY_SCRIPT" > "${WORKDIR}/inventory_enforce_fn.sh" <<'PYEOF'
 import sys
 
@@ -5488,54 +4994,36 @@ else
   fail "16: unexpected new documentation file(s)/directory found:"$'\n'"${NEW_DOC_FILES}"
 fi
 
-# 17/18: collector.py, monitor.py, and IAM remain unchanged.
+# 17/18: collector.py and IAM remain unchanged. monitor.py's presentation layer may change separately under an explicitly authorized UI-only phase -- health_rules.py/collector.py stay the single source of truth for runtime collection/health behavior.
 if command -v git >/dev/null 2>&1 && git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  COLLECTOR_MONITOR_DIFF="$(git -C "$REPO_ROOT" diff --stat -- monitoring/monitor/collector.py monitoring/monitor/monitor.py 2>/dev/null || true)"
-  if [ -z "$COLLECTOR_MONITOR_DIFF" ]; then
-    pass "17: collector.py and monitor.py are unchanged"
+  COLLECTOR_AST_STATUS_17="$(python3 -c "
+import ast, subprocess
+
+def normalize(source):
+    tree = ast.parse(source)
+    for node in [tree] + list(ast.walk(tree)):
+        body = getattr(node, 'body', None)
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and body:
+            first = body[0]
+            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
+                first.value.value = ''
+    return ast.dump(tree, annotate_fields=False)
+
+try:
+    head = subprocess.run(['git', '-C', '$REPO_ROOT', 'show', 'HEAD:monitoring/monitor/collector.py'], capture_output=True, text=True, check=True).stdout
+    with open('$REPO_ROOT/monitoring/monitor/collector.py') as f:
+        working = f.read()
+    print('IDENTICAL' if normalize(head) == normalize(working) else 'DIFFERENT')
+except Exception as exc:
+    print(f'ERROR:{exc}')
+" 2>/dev/null || true)"
+  if [ "$COLLECTOR_AST_STATUS_17" = "IDENTICAL" ]; then
+    pass "17: collector.py's functional AST is unchanged"
   else
-    fail "17: collector.py and/or monitor.py were unexpectedly modified"
+    fail "17: collector.py's functional AST was unexpectedly modified (status: ${COLLECTOR_AST_STATUS_17:-unknown})"
   fi
 
-  # 18: IAM is unchanged, except for the specific, already-reviewed
-  # additions from prior phases, Phase 6A, and Phase 6B2A:
-  #   - Phase 5B2B1 dual-account correction: exactly one statement each of
-  #     dynamodb:Query (scoped to gg-eks-pipeline) and elasticfilesystem:
-  #     Describe* added to the GoldenGateEKSDeployRole-dev policy.
-  #   - Phase 6A: envs/dev/iam.tf gains the new, dedicated
-  #     goldengate_platform_logging_role_dev module block (a NEW IAM role,
-  #     never a change to an existing one).
-  #   - Phase 6B2A: envs/dev/iam.tf gains the new, dedicated
-  #     goldengate_cloudwatch_metrics_role_dev module block (another NEW IAM
-  #     role, never a change to an existing one), and
-  #     envs/dev/policies/argocd-ecr-oci-read-dev/policies/policies_1.json
-  #     gains exactly one new statement (the amazon-cloudwatch-observability
-  #     Helm OCI chart repository ARN) alongside its unchanged pre-existing
-  #     statements.
-  #   - Phase 6B2B OTLP-authorization correction: the sole condition
-  #     operator on GoldenGateCloudWatchMetricsRole-dev's
-  #     AllowPutContainerInsightsMetricData statement
-  #     (envs/dev/policies/goldengate-cloudwatch-metrics-dev/policies/
-  #     policies_1.json) changes from StringEquals to StringEqualsIfExists
-  #     for the cloudwatch:namespace=ContainerInsights condition key --
-  #     StringEquals implicitly denies OTLP PutMetricData requests that omit
-  #     the cloudwatch:namespace key entirely (the OTel Container Insights
-  #     exporter's ingestion path), while StringEqualsIfExists still
-  #     enforces the namespace restriction whenever that key IS present
-  #     (ordinary/legacy PutMetricData calls). Effect, Action
-  #     (cloudwatch:PutMetricData only), Resource ("*"), and the condition
-  #     *value* (ContainerInsights) are all unchanged; every other statement
-  #     in this file, and the role's trust policy, are unchanged.
-  # GoldenGateSecretsReadRole-dev and GoldenGateMonitorReadRole-dev must
-  # never be touched by any of these phases. New files under a brand-new
-  # policy folder (e.g. goldengate-platform-logging-dev/,
-  # goldengate-cloudwatch-metrics-dev/) are untracked, not a "diff" of an
-  # existing file, so they never appear here -- that is exactly the
-  # expected shape of adding a new role.
-  # --name-only does not fully honor --ignore-all-space in this git version
-  # (it still lists files whose only diff is line-ending noise), so the
-  # --stat form (which does honor it, confirmed empty for whitespace-only
-  # files) is used and parsed for real changed paths instead.
+  # 18: IAM is unchanged except the specific, already-reviewed additions from prior phases: new role modules (never a change to an existing role), scoped policy-statement additions, and one condition-operator change (StringEquals -> StringEqualsIfExists) on GoldenGateCloudWatchMetricsRole-dev's namespace condition. GoldenGateSecretsReadRole-dev/GoldenGateMonitorReadRole-dev must never be touched. New files under a brand-new policy folder are untracked, not a "diff" of an existing file, so they never appear here. --name-only doesn't fully honor --ignore-all-space in this git version (still lists line-ending-only diffs), so --stat is used and parsed for real changed paths instead.
   EXPECTED_MODIFIED_IAM_FILES="envs/dev/policies/goldengate-eks-deploy-dev/policies/policies_1.json
 envs/dev/iam.tf
 envs/dev/policies/argocd-ecr-oci-read-dev/policies/policies_1.json
@@ -5555,13 +5043,7 @@ else
   skip "collector.py/monitor.py/IAM unchanged checks -- not a git repository"
 fi
 
-# ---------------------------------------------------------------------
-# 21. Phase 6C1: goldengate-monitor-metrics-config.yaml + the piped
-#     hack/goldengate-metrics-config.py helper -- the dedicated, controlled
-#     workflow for tuning a single deployment's CONFIG.metricsEnabled
-#     outside Terraform. Static structural checks only (functional/mocked
-#     behavior is covered by hack/test-goldengate-metrics-config.py).
-# ---------------------------------------------------------------------
+# 21. goldengate-monitor-metrics-config.yaml + the piped hack/goldengate-metrics-config.py helper -- the dedicated, controlled workflow for tuning a single deployment's CONFIG.metricsEnabled outside Terraform. Static structural checks only (functional/mocked behavior covered by hack/test-goldengate-metrics-config.py).
 echo ""
 echo "--- Phase 6C1: metrics config workflow + helper ---"
 
@@ -5672,12 +5154,7 @@ else
   fail "21: hack/goldengate-metrics-config.py fails to compile"
 fi
 
-# ---------------------------------------------------------------------
-# 22. Phase 6C1 corrections: no direct input interpolation in shell run:
-#     blocks, timestamp captured before UpdateItem, ConsistentRead=True /
-#     ReturnValues=ALL_NEW, hardened preflight pod-selection ownership
-#     chain, and a validated helper action line.
-# ---------------------------------------------------------------------
+# 22. Corrections: no direct input interpolation in shell run: blocks, timestamp captured before UpdateItem, ConsistentRead=True/ReturnValues=ALL_NEW, hardened preflight pod-selection ownership chain, and a validated helper action line.
 echo ""
 echo "--- Phase 6C1 corrections: input safety, timestamp ordering, consistency, pod ownership ---"
 

@@ -2,31 +2,7 @@ name: Goldengate observability deployment
 
 run-name: "Cloud Factory - GoldenGate observability (CloudWatch metrics) build and deploy | ${{ inputs.environment }} | deploy=${{ inputs.deploy }} | ran by ${{ github.actor }}"
 
-# Phase 6B2B ONLY: private-image-only source and deployment workflow for the
-# separate goldengate-observability Argo CD Application. This deploys the
-# upstream amazon-cloudwatch-observability Helm chart DIRECTLY from private
-# ECR -- there is no wrapper chart (no helm/goldengate-observability/) and
-# no second Helm OCI artifact is published anywhere. Argo CD consumes
-# oci://229410149234.dkr.ecr.eu-west-1.amazonaws.com/helm/amazon-cloudwatch-observability
-# at the exact pinned version 6.2.0, already mirrored and verified in
-# Phase 6B1.
-#
-# Scope: EKS cluster/node/pod/container and Kubernetes resource metrics
-# only (CloudWatch Agent + OTel Container Insights + kube-state-metrics +
-# node-exporter). This workflow never touches:
-#   - gg-fluent-bit (helm/goldengate-platform) -- GoldenGate runtime/monitor
-#     stdout/stderr logs remain its sole responsibility;
-#   - gg-monitor -- GoldenGate deployment/service/lag/abend/process metrics
-#     remain its sole responsibility;
-#   - CloudWatch alarms, SNS, dashboards, the shared alerter, a
-#     metrics-history writer, or GoldenGate replication (all out of scope
-#     for this phase);
-#   - the shared EKS Terraform module's enable_cloudwatch setting (not used
-#     by this repository at all).
-#
-# workflow_dispatch only, deliberately no push trigger -- same reasoning as
-# every other deployment workflow in this repository: this is a manual,
-# reviewed rollout, not something that should fire on every commit.
+# Deploys the upstream amazon-cloudwatch-observability Helm chart directly from private ECR (no wrapper chart) for EKS cluster/node/pod metrics only; logs and GoldenGate-specific metrics are handled by gg-fluent-bit and gg-monitor respectively. workflow_dispatch only, no push trigger.
 on:
   workflow_dispatch:
     inputs:
@@ -53,24 +29,16 @@ env:
   ECR_ACCOUNT_ID: "229410149234"
   ECR_REGISTRY: 229410149234.dkr.ecr.eu-west-1.amazonaws.com
 
-  # Same build/ECR-account role and identity pattern already used by
-  # goldengate-platform.yaml and cloudwatch-observability-artifact-sync.yaml
-  # -- never a new/different role.
+  # Same build/ECR-account role used by goldengate-platform.yaml and cloudwatch-observability-artifact-sync.yaml.
   ROLE_ARN: ${{ vars.GOLDENGATE_AWS_ROLE_ARN }}
 
-  # EKS workload account and cluster -- same repository variables and
-  # cross-account deploy-role pattern already used by every other
-  # deployment workflow in this repository.
+  # Same cross-account deploy-role pattern used by every other deployment workflow in this repository.
   EKS_WORKLOAD_ACCOUNT_ID: "668311715351"
   EKS_CLUSTER_NAME: ${{ vars.AWS_CLUSTER_NAME }}
   EKS_CLUSTER_ARN: ${{ vars.AWS_CLUSTER_ARN }}
   EKS_DEPLOY_ROLE_ARN: ${{ vars.EKS_DEPLOY_ROLE_ARN }}
 
-  # Phase 6B2A: dedicated, least-privilege IRSA role for the CloudWatch
-  # Agent ServiceAccount only (system:serviceaccount:amazon-cloudwatch:
-  # cloudwatch-agent). Never assigned to the operator, kube-state-metrics,
-  # node-exporter, Fluent Bit, GoldenGate runtime pods, gg-monitor, or
-  # Argo CD.
+  # Least-privilege IRSA role for the CloudWatch Agent ServiceAccount only (system:serviceaccount:amazon-cloudwatch:cloudwatch-agent).
   CW_METRICS_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateCloudWatchMetricsRole-dev
 
   # Pinned private chart (Phase 6B1). Never the public chart, never "latest".
@@ -86,9 +54,7 @@ env:
   TARGET_NAMESPACE: amazon-cloudwatch
   ARGOCD_OBSERVABILITY_SECRET_NAME: argocd-ecr-amazon-cloudwatch-observability-oci
 
-  # CloudWatch Agent ServiceAccount this phase's IRSA role is exclusively
-  # for -- see the "Annotate the CloudWatch Agent ServiceAccount" step below
-  # for why this is applied via kubectl rather than a Helm value.
+  # ServiceAccount the IRSA role above is exclusively for; annotated via kubectl (see step below) rather than a Helm value.
   CLOUDWATCH_AGENT_SERVICE_ACCOUNT: cloudwatch-agent
 
   WORKDIR: work
@@ -101,22 +67,7 @@ jobs:
   validate_and_deploy:
     name: Validate and (optionally) deploy the goldengate-observability Argo CD Application
 
-    # Phase 6B2B runner/connectivity correction: the gg-poc-dev EKS API
-    # endpoint is private (resolves to an RFC1918 address inside the VPC).
-    # Every step that may reach it -- Connect to EKS cluster and everything
-    # after it, all deploy=true only -- must execute from the VPC-connected
-    # private CodeBuild runner, not a GitHub-hosted runner. GitHub-hosted
-    # ubuntu-latest has no network route to that private address at all
-    # (this is exactly what previously surfaced as "dial tcp
-    # 10.x.x.x:443: i/o timeout", which a later step then misdiagnosed as
-    # "CRD applications.argoproj.io not found" -- see the "Verify private
-    # EKS API connectivity and access" and "Ensure Argo CD Application CRD
-    # exists" steps below for the corrected behavior). Same runner pattern
-    # already used by argocd-eks-deployment.yaml and goldengate-platform.yaml.
-    # This workflow builds no Docker image, so the CodeBuild runner's lack
-    # of a Docker socket does not matter here. deploy=false still performs
-    # no Kubernetes/Argo CD operation on this runner -- running here changes
-    # only network reachability, not what deploy=false actually does.
+    # Must run on the VPC-connected private CodeBuild runner, not GitHub-hosted: the EKS API endpoint is private and unreachable from ubuntu-latest.
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
     environment: ${{ inputs.environment }}
@@ -136,11 +87,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Architecture-detection pattern copied exactly from
-          # argocd-eks-deployment.yaml / goldengate-platform.yaml -- the
-          # CodeBuild runner is not guaranteed to be x86_64, unlike
-          # ubuntu-latest, so a hardcoded linux-amd64 download is no longer
-          # safe here.
+          # CodeBuild runner is not guaranteed to be x86_64, unlike ubuntu-latest, so detect arch instead of hardcoding linux-amd64.
           if ! command -v helm >/dev/null 2>&1; then
             HELM_VERSION="v3.15.4"
 
@@ -195,10 +142,7 @@ jobs:
           fi
           kubectl version --client=true
 
-          # jq: prefer apt-get (Debian/Ubuntu-based CodeBuild images), fall
-          # back to dnf, then yum (RPM-based images) -- fail clearly rather
-          # than silently continuing without jq if none of these package
-          # managers exist.
+          # Prefer apt-get, fall back to dnf then yum; fail clearly if none exist rather than continuing without jq.
           if ! command -v jq >/dev/null 2>&1; then
             if command -v apt-get >/dev/null 2>&1; then
               sudo apt-get update
@@ -230,9 +174,7 @@ jobs:
               exit 1
             fi
           fi
-          # Verify the import actually succeeds after installation -- never
-          # silently continue without PyYAML (every later step in this
-          # workflow that parses/generates YAML depends on it).
+          # Verify the import actually succeeds; later steps that parse/generate YAML depend on it.
           python3 -c "import yaml; print('PyYAML', yaml.__version__)"
 
       - name: Fail closed unless the AWS caller account is the approved build/ECR account
@@ -254,11 +196,7 @@ jobs:
 
           mkdir -p "$WORKDIR"
 
-          # repository|tag -- the exact four images mirrored and verified in
-          # Phase 6B1. This one table drives repository/mutability/tag
-          # checks, digest resolution, generated-values injection, and the
-          # expected rendered-image set below -- never five separately
-          # hand-maintained lists.
+          # repository|tag single source of truth driving mutability/tag checks, digest resolution, and generated-values injection below.
           cat > "$WORKDIR/image-table.psv" <<'EOF'
           aws-cloud-factory-cloudwatch-agent-operator|3.4.2
           aws-cloud-factory-cloudwatch-agent|1.300069.0b1529
@@ -294,13 +232,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Fails closed rather than silently modifying mutability -- this
-          # workflow never calls put-image-tag-mutability. Phase 6B1 created
-          # all five repositories (the chart repository and all four image
-          # repositories) as IMMUTABLE; this only re-confirms that has not
-          # changed since. The chart repository is checked first, using the
-          # exact same check function as the four image repositories --
-          # never a separate, weaker code path.
+          # Fails closed rather than modifying mutability; this workflow never calls put-image-tag-mutability.
           check_repo_immutable() {
             local repo="$1"
             local mutability
@@ -329,8 +261,7 @@ jobs:
           while IFS='|' read -r repo tag; do
             [ -z "$repo" ] && continue
 
-            # Duplicate/unexpected-repository guard: the table above must
-            # never list the same repository twice.
+            # Guard against the table above listing the same repository twice.
             if grep -qx -- "$repo" <<< "$SEEN_REPOS"; then
               echo "FAIL: repository ${repo} appears more than once in the image inventory."
               exit 1
@@ -379,8 +310,7 @@ jobs:
 
           mkdir -p "${WORKDIR}/chart"
 
-          # Never the public aws-observability repository -- only the
-          # already-mirrored private OCI chart from Phase 6B1.
+          # Only the already-mirrored private OCI chart, never the public aws-observability repository.
           helm pull "oci://${ECR_REGISTRY}/${HELM_OCI_NAMESPACE}/${CHART_NAME}" \
             --version "$CHART_VERSION" \
             --untar \
@@ -417,23 +347,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Starts from the committed values file (never mutated) and
-          # injects only the tag@digest image references resolved above.
-          # Strict YAML parsing with duplicate-key rejection on the way in;
-          # the committed file is never written back to.
-          #
-          # The CloudWatch Agent IRSA role annotation is deliberately NOT
-          # injected here. Verified against the exact pinned chart (6.2.0):
-          # neither templates/cloudwatch-agent-serviceaccount.yaml nor
-          # templates/operator-serviceaccount.yaml (nor any other template
-          # in this chart version) ever reads a "serviceAccount.annotations"
-          # value -- `grep -rn serviceAccount.annotations templates/` on the
-          # pulled chart returns no matches at all. There is no
-          # chart-supported values path for this. The role is instead
-          # applied as a bounded, explicit `kubectl annotate` step in the
-          # deploy-guarded section below, directly on the ServiceAccount
-          # Argo CD creates (never a second Kubernetes resource created by
-          # this workflow).
+          # Injects tag@digest image references into the committed values file (never mutated); the CloudWatch Agent IRSA role annotation is applied later via kubectl since this chart has no serviceAccount.annotations values path.
           python3 - "$VALUES_FILE" "${WORKDIR}/image-digests.psv" "${WORKDIR}/generated-values.yaml" <<'PYEOF'
           import sys
           import yaml
@@ -526,15 +440,7 @@ jobs:
           expect(v.get("agent", {}).get("prometheus", {}).get("targetAllocator", {}).get("enabled"), False, "agent.prometheus.targetAllocator.enabled")
           expect(v.get("agent", {}).get("serviceAccount", {}).get("name"), "cloudwatch-agent", "agent.serviceAccount.name")
 
-          # Phase 6B2B host-network isolation correction: the top-level
-          # `agents` list (never nested under `agent`) must contain exactly
-          # the two installations this chart is pinned to run, with the
-          # node-level DaemonSet keeping hostNetwork=true and the cluster
-          # scraper Deployment explicitly isolated with hostNetwork=false --
-          # this is the actual fix for the observed cloudwatch-agent
-          # CrashLoopBackOff ("bind: address already in use" on
-          # 127.0.0.1:8888). A weakened or missing override here would
-          # silently reintroduce the port collision.
+          # Top-level `agents` list must contain exactly 2 entries: DaemonSet (hostNetwork=true) and scraper Deployment (hostNetwork=false), to avoid a port collision on 127.0.0.1:8888.
           agents = v.get("agents")
           if not isinstance(agents, list):
               sys.exit(f"FAIL: agents is {type(agents).__name__}, expected a list")
@@ -607,12 +513,7 @@ jobs:
 
           RENDERED="rendered/${RELEASE_NAME}.yaml"
 
-          # Reuses the same robust recursive-walk approach established in
-          # cloudwatch-observability-artifact-sync.yaml: collect every
-          # "image:" field anywhere in the parsed document tree (covers
-          # containers, initContainers, and image fields embedded inside
-          # operator custom resources like AmazonCloudWatchAgent) -- never a
-          # manually maintained list, never a plain-text grep.
+          # Recursively collects every "image:" field in the parsed document tree, including those inside operator custom resources like AmazonCloudWatchAgent.
           python3 - "$RENDERED" <<'PYEOF' > "${WORKDIR}/rendered-images.txt"
           import sys, yaml
 
@@ -696,15 +597,7 @@ jobs:
 
           RENDERED="rendered/${RELEASE_NAME}.yaml"
 
-          # CRD schemas for DcgmExporter/NeuronMonitor/Instrumentation are
-          # always installed by this operator chart regardless of whether
-          # those features are used (confirmed locally: `--include-crds`
-          # always renders crds/cloudwatch.aws.amazon.com_dcgmexporters.yaml
-          # etc even with dcgmExporter.enabled=false/neuronMonitor.enabled=
-          # false). A CRD's mere existence is not a live GPU/Neuron/
-          # auto-instrumentation workload -- only an actual CR *instance*
-          # would be, so this check looks for CR instances/workloads, not
-          # for the CRD definitions themselves.
+          # CRD schemas for these kinds are always rendered regardless of feature flags, so this checks for CR instances, not the CRD definitions.
           python3 - "$RENDERED" <<'PYEOF'
           import sys, yaml
 
@@ -728,9 +621,7 @@ jobs:
 
           print("OK: no DcgmExporter/NeuronMonitor/Instrumentation CR instance, and no fluent-bit/dcgm/neuron/adot/target-allocator/auto-instrumentation named resource, was rendered.")
 
-          # No container-log/filelog pipeline: every AmazonCloudWatchAgent
-          # CR's otelConfig (when present) must not contain a filelog
-          # receiver, since otelContainerInsights.logs.enabled is false.
+          # otelContainerInsights.logs.enabled is false, so no CR's otelConfig may contain a filelog receiver.
           for d in docs:
               if d.get("kind") == "AmazonCloudWatchAgent":
                   otel_config = str(d.get("spec", {}).get("otelConfig", ""))
@@ -766,14 +657,7 @@ jobs:
               sys.exit(f"FAIL: expected exactly 1 ServiceAccount amazon-cloudwatch/cloudwatch-agent, found {len(cw_agent_sas)}.")
           print("OK: ServiceAccount amazon-cloudwatch/cloudwatch-agent is rendered by the chart.")
 
-          # Confirmed against the pinned chart's templates (see the
-          # "Generate the temporary deployment values file" step): this
-          # exact chart version never renders an
-          # eks.amazonaws.com/role-arin annotation on any ServiceAccount
-          # via values. This assertion documents and locks in that
-          # understanding -- if a future chart version starts rendering
-          # this annotation on an unrelated ServiceAccount unexpectedly,
-          # this check fails loudly instead of silently passing.
+          # Locks in that this chart never renders an eks.amazonaws.com/role-arn annotation via values; fails loudly if a future chart version starts doing so unexpectedly.
           for sa in service_accounts:
               annotations = sa["metadata"].get("annotations") or {}
               role_arn = annotations.get("eks.amazonaws.com/role-arn")
@@ -791,29 +675,7 @@ jobs:
 
           RENDERED="rendered/${RELEASE_NAME}.yaml"
 
-          # Discovered locally by rendering this exact pinned chart (6.2.0)
-          # with the metrics-only values above -- never invented names.
-          # These become the following live Kubernetes objects once the
-          # operator reconciles the two AmazonCloudWatchAgent custom
-          # resources (agents[].mode determines DaemonSet vs Deployment):
-          #   - AmazonCloudWatchAgent/cloudwatch-agent (mode: daemonset)
-          #     -> DaemonSet/cloudwatch-agent (the per-node agent)
-          #   - AmazonCloudWatchAgent/cloudwatch-agent-cluster-scraper
-          #     (mode: deployment) -> Deployment/cloudwatch-agent-cluster-scraper
-          #     (the "cluster scraper": apiserver/kube-state-metrics OTel
-          #     scraping -- only rendered because otelContainerInsights.
-          #     enabled=true)
-          #   - Deployment/amazon-cloudwatch-observability-controller-manager
-          #     (the operator/manager), ServiceAccount of the same name
-          #   - Deployment/kube-state-metrics, ServiceAccount/kube-state-metrics-service-acct
-          #   - DaemonSet/node-exporter, ServiceAccount/node-exporter-service-acct
-          # Two additional AmazonCloudWatchAgent CRs
-          # (cloudwatch-agent-windows, cloudwatch-agent-windows-container-insights)
-          # also render unconditionally from this chart version, constrained
-          # to kubernetes.io/os=windows via nodeSelector -- harmless on this
-          # Linux-only cluster (no Windows node will ever exist to schedule
-          # them), and they resolve to the same private cloudwatch-agent
-          # image, not a fifth image.
+          # Exact names as rendered by chart 6.2.0 with the metrics-only values above. Two Windows-only AmazonCloudWatchAgent CRs also render unconditionally but are harmless (no Windows nodes on this cluster).
           python3 - "$RENDERED" <<'PYEOF'
           import sys, yaml
 
@@ -845,20 +707,7 @@ jobs:
 
           RENDERED="rendered/${RELEASE_NAME}.yaml"
 
-          # Phase 6B2B host-network isolation correction. This chart version
-          # only renders the two AmazonCloudWatchAgent custom resources --
-          # the actual DaemonSet/Deployment workloads (spec.template.spec.
-          # hostNetwork) are created dynamically at reconcile time by the
-          # cloudwatch-agent-operator controller, not by this Helm template
-          # render (confirmed: `helm template --include-crds` never
-          # produces a DaemonSet/Deployment named cloudwatch-agent or
-          # cloudwatch-agent-cluster-scraper -- only the two CRs that drive
-          # the operator to create them). This step therefore validates the
-          # only thing actually renderable offline: the two CRs' spec.mode
-          # and spec.hostNetwork. The corresponding live DaemonSet/
-          # Deployment hostNetwork values can only be confirmed once the
-          # operator has reconciled them -- see the deploy=true "Live
-          # Kubernetes validation" step below for that check.
+          # Only the two AmazonCloudWatchAgent CRs are renderable offline; the actual DaemonSet/Deployment hostNetwork values are set by the operator at reconcile time and are checked later in the deploy=true "Live Kubernetes validation" step.
           python3 - "$RENDERED" <<'PYEOF'
           import sys, yaml
 
@@ -904,12 +753,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      # =======================================================================
-      # Everything below this point only runs when inputs.deploy=true. It
-      # performs live Kubernetes/Argo CD operations -- never executed as
-      # part of local validation.
-      # =======================================================================
-
+      # Everything below this point only runs when inputs.deploy=true and performs live Kubernetes/Argo CD operations.
       - name: Connect to EKS cluster
         if: ${{ inputs.deploy }}
         shell: bash
@@ -933,18 +777,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # gg-poc-dev's EKS API endpoint is private (an RFC1918 address
-          # inside the VPC). This step proves the runner can actually reach
-          # it BEFORE any step interprets a connection failure as something
-          # else (e.g. "the Argo CD CRD is missing") -- exactly the false
-          # diagnosis previously produced when this workflow ran on
-          # GitHub-hosted ubuntu-latest, which has no route to that
-          # address at all ("dial tcp 10.x.x.x:443: i/o timeout").
-          #
-          # Bounded (--request-timeout=20s): never hangs the job. Output is
-          # captured to a file and only ever grepped/printed in small,
-          # bounded pieces below -- never the full kubeconfig, an AWS
-          # credential, a token, or an environment-variable value.
+          # Proves the runner can reach the private EKS API before a later step misdiagnoses a connection failure as a missing CRD; output stays bounded and is never a full kubeconfig/credential/token dump.
           set +e
           kubectl get --raw="/readyz" --request-timeout=20s >"${WORKDIR}/readyz-stdout.txt" 2>"${WORKDIR}/readyz-stderr.txt"
           READYZ_STATUS=$?
@@ -991,12 +824,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # The connectivity preflight above already proved the Kubernetes
-          # API is reachable, so a failure here is about this one specific
-          # CRD lookup, never a reason to re-suspect network reachability.
-          # Every outcome is classified explicitly -- never a single
-          # "kubectl ... || { echo not found }" that silently treats any
-          # failure (network, auth, or otherwise) as "CRD missing".
+          # Connectivity was already proven above, so a failure here is about this specific CRD lookup, not network reachability; each outcome is classified explicitly rather than treating any failure as "CRD missing".
           set +e
           kubectl get crd applications.argoproj.io --request-timeout=20s >"${WORKDIR}/crd-stdout.txt" 2>"${WORKDIR}/crd-stderr.txt"
           CRD_STATUS=$?
@@ -1062,20 +890,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Generated via Python/PyYAML (not shell heredoc interpolation):
-          # the Helm inline values field below must carry the complete,
-          # already-validated generated-values.yaml content verbatim, which
-          # is too large/structurally rich to safely inline through shell
-          # string interpolation.
-          #
-          # ServerSideApply=true: this operator chart's own CRD
-          # (cloudwatch.aws.amazon.com_amazoncloudwatchagents.yaml) is
-          # ~603KB on disk in the pinned 6.2.0 chart -- verified locally
-          # (`wc -c` on the pulled chart's crds/ directory) -- which is
-          # already larger than the ~262144-byte practical limit on the
-          # kubectl.kubernetes.io/last-applied-configuration annotation
-          # that client-side apply relies on. Server-side apply avoids that
-          # annotation entirely, so it is required here, not optional.
+          # Generated via Python/PyYAML since the Helm values content is too large/structurally rich to safely inline through shell string interpolation.
           python3 - "${WORKDIR}/generated-values.yaml" "${WORKDIR}/application.yaml" <<'PYEOF'
           import sys
           import yaml
@@ -1110,13 +925,7 @@ jobs:
                   "source": {
                       "repoURL": "oci://229410149234.dkr.ecr.eu-west-1.amazonaws.com/helm/amazon-cloudwatch-observability",
                       "targetRevision": "6.2.0",
-                      # Direct OCI artifact source model (this repository's
-                      # established pattern -- see goldengate-platform.yaml/
-                      # goldengate-monitor.yaml's Argo CD Applications):
-                      # path: "." identifies the chart root within the OCI
-                      # artifact itself. Never a "chart:" field -- that
-                      # belongs to the separate Helm-repository chart source
-                      # model this repository does not use.
+                      # path: "." identifies the chart root within the OCI artifact itself (never a "chart:" field, which is for the Helm-repository source model).
                       "path": ".",
                       "helm": {
                           "releaseName": "amazon-cloudwatch-observability",
@@ -1134,16 +943,9 @@ jobs:
                       },
                       "syncOptions": [
                           "CreateNamespace=true",
+                          # Required because this CRD is ~603KB, over the ~262144-byte limit for the client-side last-applied-configuration annotation.
                           "ServerSideApply=true",
-                          # Required for ignoreDifferences (below) to have any
-                          # effect on a selfHeal=true Application: without
-                          # RespectIgnoreDifferences=true, a later automated
-                          # sync (selfHeal) can still overwrite the ignored
-                          # field back to the chart's rendered value (here:
-                          # absent, since the chart never renders this
-                          # annotation at all) -- this option is what makes
-                          # the ignore rule actually stick across syncs, not
-                          # just the first one.
+                          # Required for ignoreDifferences (below) to survive later selfHeal syncs, not just the first one.
                           "RespectIgnoreDifferences=true",
                       ],
                       "managedNamespaceMetadata": {
@@ -1153,26 +955,7 @@ jobs:
                           },
                       },
                   },
-                  # ignoreDifferences does NOT mean Argo CD "automatically
-                  # ignores" any annotation applied outside the chart -- by
-                  # default Argo CD's selfHeal would eventually reconcile
-                  # this ServiceAccount back to exactly what the chart
-                  # renders (i.e. with NO eks.amazonaws.com/role-arn
-                  # annotation at all), removing the post-sync annotation
-                  # the "Annotate the CloudWatch Agent ServiceAccount" step
-                  # below applies. This rule explicitly excludes only that
-                  # one exact JSON pointer, on only this one exact
-                  # ServiceAccount, from Argo CD's diff -- so selfHeal never
-                  # even considers that field "out of sync" and never
-                  # touches it. If this ServiceAccount is ever deleted and
-                  # recreated by Argo CD (e.g. after a full app delete/
-                  # recreate), the annotation is gone and the
-                  # goldengate-observability.yaml deployment workflow (with
-                  # deploy=true) must be rerun to restore it -- this ignore
-                  # rule does not itself preserve or restore the annotation
-                  # across a resource recreation, it only stops Argo CD from
-                  # actively removing it while the same ServiceAccount
-                  # object still exists.
+                  # Stops selfHeal from reverting the post-sync role-arn annotation (applied outside the chart) back to the chart's unannotated render; if this ServiceAccount is ever recreated, rerun this workflow with deploy=true to restore the annotation.
                   "ignoreDifferences": [
                       {
                           "group": "",
@@ -1245,27 +1028,7 @@ jobs:
           done
 
       - name: Ensure cluster-scraper Deployment host-network isolation
-        # Phase 6B2B corrective-recreation correction. Proven root cause
-        # (executed against the real, unmodified operator source -- both
-        # 3.4.2 and 3.5.0, identical in both): the chart/CR layer has
-        # always been correct -- agents[cloudwatch-agent-cluster-scraper].
-        # hostNetwork=false reaches AmazonCloudWatchAgent.spec.hostNetwork
-        # correctly. The bug is in the operator's reconciliation UPDATE
-        # path for an ALREADY-EXISTING Deployment, in
-        # internal/manifests/mutate.go's mutateDeployment():
-        #   mergo.Merge(&existing.Spec.Template, desired.Spec.Template, mergo.WithOverride)
-        # mergo.WithOverride treats a Go zero value in the merge source
-        # (false, for a non-pointer bool field) as "not set" and never
-        # overwrites a non-zero existing value with it -- so an existing
-        # Deployment created earlier with hostNetwork=true never gets
-        # flipped to false no matter how many times the CR is correctly
-        # updated. A BRAND-NEW object is unaffected: ctrl.CreateOrUpdate
-        # creates it directly from the desired object (no merge involved),
-        # so deleting the stale Deployment and letting the operator's
-        # normal creation path recreate it from scratch is the correct,
-        # supported remediation -- not a manual field patch, and not a
-        # workaround for the merge bug itself (which remains present in
-        # both operator versions and is unaffected by this correction).
+        # Works around an operator bug (mutateDeployment's mergo.WithOverride merge never overwrites an existing hostNetwork=true with the CR's false); deleting the stale Deployment lets the operator recreate it correctly from scratch.
         if: ${{ inputs.deploy }}
         shell: bash
         run: |
@@ -1278,8 +1041,7 @@ jobs:
           echo "unknown" > "$CORRECTION_SUMMARY_FILE"
 
           ensure_cluster_scraper_host_network_isolated() {
-            # 1. Read the live CR -- also confirms it exists (fails closed
-            # via set -e if the CR is missing).
+            # 1. Read the live CR; fails closed via set -e if missing.
             local cr_json
             cr_json="$(kubectl get amazoncloudwatchagents.cloudwatch.aws.amazon.com "$CLUSTER_SCRAPER_CR" -n "$TARGET_NAMESPACE" -o json)"
 
@@ -1289,9 +1051,7 @@ jobs:
             cr_uid="$(jq -r '.metadata.uid // empty' <<<"$cr_json")"
             echo "AmazonCloudWatchAgent/${CLUSTER_SCRAPER_CR}: mode=${cr_mode} hostNetwork=${cr_hostnetwork}"
 
-            # 2. Require mode==deployment and hostNetwork==false. Fail
-            # closed otherwise -- this correction only ever acts on a CR
-            # that already carries the corrected value.
+            # 2. Require mode==deployment and hostNetwork==false; only ever acts on a CR that already carries the corrected value.
             if [ "$cr_mode" != "deployment" ]; then
               echo "FAIL: CR ${CLUSTER_SCRAPER_CR} spec.mode is ${cr_mode}, expected deployment."
               exit 1
@@ -1327,8 +1087,7 @@ jobs:
               return 0
             fi
 
-            # 5. hostNetwork == true: perform every ownership check before
-            # any deletion.
+            # 5. hostNetwork == true: perform every ownership check before any deletion.
             echo "Deployment/${CLUSTER_SCRAPER_DEPLOYMENT} spec.template.spec.hostNetwork is true -- verifying ownership before any deletion."
 
             local owner_count
@@ -1367,22 +1126,14 @@ jobs:
               exit 1
             fi
 
-            # Task 4: controlled delete and recreate -- at most one
-            # deletion per workflow run.
+            # Task 4: controlled delete and recreate -- at most one deletion per workflow run.
             local old_uid
             old_uid="$(jq -r '.metadata.uid' <<<"$deploy_json")"
 
             echo "Deleting deployment/${CLUSTER_SCRAPER_DEPLOYMENT} in ${TARGET_NAMESPACE} (bounded, idempotent corrective recreation -- the operator's own creation path will rebuild it with the correct hostNetwork=false)."
             kubectl delete deployment "$CLUSTER_SCRAPER_DEPLOYMENT" -n "$TARGET_NAMESPACE" --wait=true --timeout=60s
 
-            # Kubernetes UID replacement -- never an observed NotFound
-            # interval -- is the authoritative recreation signal. Live
-            # evidence proved the operator can recreate a same-named
-            # Deployment between two polling intervals, so a poll may never
-            # actually witness the object absent even though the deletion
-            # genuinely happened and a brand-new object (new UID) already
-            # exists in its place; requiring an observed NotFound is
-            # therefore a false-failure risk, not a correctness signal.
+            # UID replacement, not an observed NotFound interval, is the recreation signal: the operator can recreate a same-named Deployment between polls, so NotFound may never be witnessed.
             local RECREATE_TIMEOUT=180
             local NUDGE_AFTER=60
             local recreate_elapsed=0
@@ -1472,10 +1223,7 @@ jobs:
 
           ensure_cluster_scraper_host_network_isolated
 
-          # Task 6: validate the active scraper pod(s), unconditionally --
-          # whether or not a recreate just happened, the current state must
-          # hold. Selector is dynamically derived from the live Deployment,
-          # never hardcoded.
+          # Task 6: validate active scraper pod(s) unconditionally; selector is dynamically derived from the live Deployment, never hardcoded.
           FINAL_DEPLOY_JSON="$(kubectl get deployment "$CLUSTER_SCRAPER_DEPLOYMENT" -n "$TARGET_NAMESPACE" -o json)"
           FINAL_DEPLOY_UID="$(jq -r '.metadata.uid' <<<"$FINAL_DEPLOY_JSON")"
           FINAL_SELECTOR="$(jq -r '(.spec.selector.matchLabels // {}) | to_entries | map("\(.key)=\(.value)") | join(",")' <<<"$FINAL_DEPLOY_JSON")"
@@ -1557,24 +1305,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Compensates for a verified gap in the pinned chart (6.2.0): it
-          # has no values-driven ServiceAccount annotation mechanism (see
-          # the "Generate the temporary deployment values file" step's
-          # comment for the exact evidence). This annotates the single
-          # ServiceAccount Argo CD's sync already created -- it does not
-          # create a new Kubernetes ServiceAccount resource.
-          #
-          # This is NOT automatically ignored by Argo CD. It survives
-          # selfHeal only because the Application's own
-          # spec.ignoreDifferences rule (see "Create or update the Argo CD
-          # Application" above) explicitly excludes exactly this one JSON
-          # pointer (/metadata/annotations/eks.amazonaws.com~1role-arn) on
-          # exactly this one ServiceAccount from Argo CD's diff, combined
-          # with syncOptions: RespectIgnoreDifferences=true (without which a
-          # later automated sync could still remove it). If this
-          # ServiceAccount is ever deleted and recreated, the annotation is
-          # gone and this workflow must be rerun with deploy=true to
-          # restore it.
+          # This chart has no values-driven ServiceAccount annotation mechanism, so this annotates the existing ServiceAccount directly; it survives selfHeal only via the Application's ignoreDifferences + RespectIgnoreDifferences=true (see "Create or update the Argo CD Application" above).
           kubectl get serviceaccount "$CLOUDWATCH_AGENT_SERVICE_ACCOUNT" -n "$TARGET_NAMESPACE" >/dev/null
 
           kubectl annotate serviceaccount "$CLOUDWATCH_AGENT_SERVICE_ACCOUNT" -n "$TARGET_NAMESPACE" \
@@ -1588,10 +1319,7 @@ jobs:
           fi
           echo "OK: ServiceAccount ${TARGET_NAMESPACE}/${CLOUDWATCH_AGENT_SERVICE_ACCOUNT} annotated with ${CW_METRICS_ROLE_ARN}."
 
-          # Existing pods (if any were already created by the operator
-          # before this annotation existed) must be recreated to pick up
-          # the projected IRSA token volume -- restarting only the
-          # workloads that use this ServiceAccount.
+          # Restart workloads using this ServiceAccount so existing pods pick up the projected IRSA token volume.
           if kubectl get daemonset cloudwatch-agent -n "$TARGET_NAMESPACE" >/dev/null 2>&1; then
             kubectl rollout restart daemonset/cloudwatch-agent -n "$TARGET_NAMESPACE"
           fi
@@ -1605,18 +1333,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Phase 6B2B DaemonSet full-readiness correction: `kubectl rollout
-          # status` on a DaemonSet only proves the rolling update *finished*
-          # -- with the default rollingUpdate.maxUnavailable=1, it reports
-          # success even while one pod is still not Ready/Available. This is
-          # exactly what happened live: rollout status succeeded with
-          # READY=1 AVAILABLE=1 against DESIRED=2. wait_for_daemonset_fully_ready
-          # below is a bounded, exact-readiness gate on top of rollout
-          # status -- it never replaces it -- and show_daemonset_diagnostics
-          # prints bounded, credential-free evidence the moment that gate
-          # times out, so a future occurrence is diagnosable from the
-          # workflow log instead of requiring live kubectl access.
-
+          # `kubectl rollout status` on a DaemonSet can report success while a pod is still not Ready (e.g. READY=1 AVAILABLE=1 against DESIRED=2 with maxUnavailable=1); wait_for_daemonset_fully_ready below is an additional exact-readiness gate on top of it.
           wait_for_daemonset_fully_ready() {
             local namespace="$1"
             local ds_name="$2"
@@ -1733,9 +1450,7 @@ jobs:
               echo "Recent events (bounded to ~20 lines):"
               kubectl get events -n "$namespace" --field-selector "involvedObject.name=${pod_name}" --sort-by=.lastTimestamp 2>/dev/null | tail -n 20 || echo "Could not retrieve events."
 
-              # Container name(s) come from the pod's own spec -- never an
-              # assumed/invented name -- so this works regardless of what
-              # the pinned chart actually names the container.
+              # Container name(s) come from the pod's own spec, never an assumed/invented name.
               container_names="$(jq -r '.spec.containers[]?.name' <<<"$pod_json")"
 
               while IFS= read -r container_name; do
@@ -1782,17 +1497,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Confirms the rollout-restart above actually produced pods with
-          # the projected IRSA token wired in -- never prints an env var
-          # value, the token itself, or a full pod spec; only the variable
-          # NAMES are checked for presence.
-          #
-          # Phase 6B2B DaemonSet full-readiness correction: this now checks
-          # EVERY node-level cloudwatch-agent DaemonSet pod, not just one
-          # ready sample -- a single unready/misconfigured node-agent pod
-          # (the exact live symptom: READY=1 against DESIRED=2) must not be
-          # able to hide behind a different, already-healthy pod being
-          # picked at random.
+          # Only checks env var NAMES for presence, never a value/token/full pod spec. Checks EVERY node-level cloudwatch-agent DaemonSet pod, not just one sample, so a single unready pod cannot hide behind an already-healthy one picked at random.
           find_ready_pod_owned_by() {
             local owner_kind="$1"
             local owner_name_prefix="$2"
@@ -1905,41 +1610,16 @@ jobs:
           echo "OK: IRSA injection verified on every cloudwatch-agent DaemonSet pod and the cluster-scraper pod."
 
       - name: Validate no recent CloudWatch export errors
-        # Phase 6B2B correction. The network-namespace/port-collision fix
-        # (above) does not by itself prove metrics export is healthy --
-        # live evidence showed IRSA/network working correctly while every
-        # export attempt was rejected with HTTP 403 PermissionDenied,
-        # because the IAM policy's original StringEquals condition on
-        # cloudwatch:namespace implicitly denies OTLP PutMetricData
-        # requests that omit that condition key entirely (see
-        # envs/dev/policies/goldengate-cloudwatch-metrics-dev/policies/
-        # policies_1.json, corrected in this same phase to
-        # StringEqualsIfExists).
-        #
-        # This step proves only the ABSENCE of recently emitted
-        # authorization/export/port-collision error signatures in the
-        # observation window -- it does not call the CloudWatch API and
-        # does NOT prove metrics were successfully accepted or are visible
-        # in CloudWatch. That data-plane confirmation is Phase 6B3's
-        # responsibility and requires real CloudWatch evidence, not
-        # something derivable from collector-side pod logs alone. This
-        # role intentionally has no CloudWatch read permissions (e.g.
-        # cloudwatch:GetMetricData/ListMetrics) -- none are added here or
-        # elsewhere merely to support this log-based validation.
+        # Proves only the ABSENCE of recent authorization/export/port-collision error signatures in collector pod logs; it does not call the CloudWatch API and does not prove metrics are visible in CloudWatch (this role has no CloudWatch read permissions).
         if: ${{ inputs.deploy }}
         shell: bash
         run: |
           set -euo pipefail
 
-          # Captured BEFORE the observation period so --since-time excludes
-          # any historical errors already in the logs from before this run
-          # (e.g. from prior to the IAM policy correction taking effect).
+          # Captured before the observation period so --since-time excludes historical errors already in the logs from before this run.
           VALIDATION_START_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-          # Bounded wait to let at least a couple of the OTel Container
-          # Insights export cycles actually occur before inspecting logs --
-          # not a poll loop, since this only needs to *observe*, not wait
-          # for a state transition.
+          # Bounded wait to let a couple of export cycles occur before inspecting logs; this only needs to observe, not wait for a state transition.
           OBSERVATION_PERIOD_SECONDS=90
           echo "Observing active CloudWatch Agent pod logs for ${OBSERVATION_PERIOD_SECONDS}s starting at ${VALIDATION_START_TS} (covers multiple export attempts)."
           sleep "$OBSERVATION_PERIOD_SECONDS"
@@ -1949,12 +1629,7 @@ jobs:
 
           ANY_NEW_ERROR="false"
 
-          # Deliberately no "|| true" on kubectl logs: a failure to
-          # retrieve logs from an expected active pod/container (RBAC
-          # error, pod evicted mid-check, container not found, API error)
-          # must fail this step, not be silently treated as "no errors
-          # found" -- an empty result from a failed call is indistinguishable
-          # from a genuinely clean log unless the exit status is checked.
+          # Deliberately no "|| true" on kubectl logs: a failed retrieval must fail this step rather than being silently treated as "no errors found".
           check_pod_logs() {
             local pod_name="$1"
             local pod_json="$2"
@@ -2190,8 +1865,7 @@ jobs:
 
           echo ""
           echo "13. No deployed AmazonCloudWatchAgent resource has a filelog receiver / container-log pipeline (every CR in ${TARGET_NAMESPACE}, not just one):"
-          # Only resource names and pass/fail are ever printed -- never a
-          # complete otelConfig.
+          # Only resource names and pass/fail are ever printed, never a complete otelConfig.
           AGENT_CR_NAMES="$(kubectl get amazoncloudwatchagents.cloudwatch.aws.amazon.com -n "$TARGET_NAMESPACE" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')"
           if [ -z "$AGENT_CR_NAMES" ]; then
             echo "FAIL: no AmazonCloudWatchAgent resource found in ${TARGET_NAMESPACE}."
@@ -2208,15 +1882,7 @@ jobs:
           done <<< "$AGENT_CR_NAMES"
 
           echo ""
-          # This is a confirmation, not the first place hostNetwork=false is
-          # established. The CR side was always correctly synced by Argo CD
-          # -- syncing alone was never sufficient proof that the Deployment
-          # would match it, because of the mutateDeployment() mergo merge
-          # bug documented in the "Ensure cluster-scraper Deployment
-          # host-network isolation" step above (which runs earlier in this
-          # job and performs the actual corrective delete/recreate when
-          # needed). By the time this step runs, that step has already
-          # guaranteed the Deployment reflects the CR's hostNetwork=false.
+          # Confirmation only: the "Ensure cluster-scraper Deployment host-network isolation" step above already guarantees the Deployment reflects the CR's hostNetwork=false by the time this step runs.
           echo "14. CloudWatch Agent host-network isolation (Phase 6B2B correction -- fixes the 127.0.0.1:8888 bind collision documented in platform/dev/goldengate-observability/values.yaml). Only resource name, mode, and hostNetwork are printed -- never a full spec:"
 
           CW_AGENT_CR_JSON="$(kubectl get amazoncloudwatchagents.cloudwatch.aws.amazon.com cloudwatch-agent -n "$TARGET_NAMESPACE" -o json)"
@@ -2306,10 +1972,7 @@ jobs:
           CRASH_PATTERN='bind: address already in use|binding address localhost:8888|listen tcp 127\.0\.0\.1:8888|failed to create SDK'
           CRASH_FOUND="false"
 
-          # Node-agent (DaemonSet) pods: exclude terminating pods. A
-          # DaemonSet has no "old ReplicaSet" concept, but a pod mid-
-          # termination during a rollout can still linger briefly with a
-          # deletionTimestamp, so it is excluded the same way.
+          # Node-agent (DaemonSet) pods: exclude terminating pods (a pod mid-termination can still linger briefly with a deletionTimestamp).
           while IFS= read -r pod_name; do
             [ -z "$pod_name" ] && continue
             pod_deletion_ts="$(jq -r --arg n "$pod_name" '.items[] | select(.metadata.name==$n) | (.metadata.deletionTimestamp // empty)' <<<"$CW_PODS_JSON")"
@@ -2322,10 +1985,7 @@ jobs:
             fi
           done < <(jq -r '.items[].metadata.name' <<<"$CW_PODS_JSON")
 
-          # Cluster-scraper (Deployment) pods: exclude terminating pods and
-          # pods owned by an old/stale ReplicaSet -- only pods whose
-          # controller ReplicaSet is itself owned by the CURRENT Deployment
-          # UID are inspected.
+          # Cluster-scraper (Deployment) pods: exclude terminating pods and pods owned by an old/stale ReplicaSet; only pods owned by the CURRENT Deployment UID are inspected.
           SCRAPER_DEPLOY_UID_FOR_LOGS="$(jq -r '.metadata.uid' <<<"$SCRAPER_DEPLOY_JSON")"
           while IFS= read -r pod_name; do
             [ -z "$pod_name" ] && continue
@@ -2356,27 +2016,14 @@ jobs:
           echo "OK: no active, current-revision node-agent or cluster-scraper pod log (last 80 lines each) shows the previously observed 127.0.0.1:8888 bind collision."
 
       - name: Check bounded recent logs for authorization and startup failures
-        # Phase 6B2B DaemonSet full-readiness correction: this must still run
-        # (and still only as a non-destructive, evidence-only diagnostic)
-        # when an earlier deploy=true step -- e.g. the exact-readiness wait
-        # or Live Kubernetes validation -- has already failed the job.
-        # Previously this step was skipped in exactly that case, discarding
-        # the log evidence a real failure needs. always() is paired with
-        # inputs.deploy so it still never runs on deploy=false.
+        # always() ensures this evidence-only diagnostic still runs even if an earlier deploy=true step already failed the job; paired with inputs.deploy so it never runs on deploy=false.
         if: ${{ always() && inputs.deploy }}
         shell: bash
         run: |
           set -uo pipefail
-          # Deliberately no "set -e": every command below is individually
-          # guarded so this diagnostic step always finishes with exit 0 --
-          # including when the cluster state it inspects is itself partial
-          # or broken because an earlier step failed. It must never replace
-          # or mask the original failure, only add bounded, credential-free
-          # evidence alongside it.
+          # Deliberately no "set -e": every command is individually guarded so this diagnostic always finishes with exit 0 and never masks the original failure.
 
-          # Bounded (--tail, --since) and pattern-matched only -- never a
-          # full/unbounded log dump, never credentials, tokens, environment
-          # variables, or full pod specs.
+          # Bounded (--tail, --since) and pattern-matched only, never a full/unbounded log dump or credentials/tokens/env vars.
           ERROR_PATTERNS='AccessDenied|UnauthorizedOperation|NoCredentialProviders|WebIdentityErr|AssumeRoleWithWebIdentity|PutMetricData|PutLogEvents|ImagePullBackOff|ErrImagePull|CrashLoopBackOff|[Rr]eadiness probe failed|connection refused|[Tt]imeout|OOMKilled|x509|webhook.*certificate'
 
           echo "Operator logs (last 80 lines, last 15m):"

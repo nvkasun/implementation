@@ -63,11 +63,7 @@ spec:
               echo "ok" > /u02/oggf/certificate/write-test.txt
               rm -f /u02/oggf/certificate/write-test.txt
 
-              # ServiceManager.pid survives on persistent EFS across pod
-              # restarts even though the process it names is gone. A stale
-              # PID makes Service Manager refuse to start ("already
-              # running"), which cascades into every managed process never
-              # starting -- must be removed on every pod start.
+              # A stale PID surviving on persistent EFS makes Service Manager refuse to start; remove it every boot.
               SERVICE_MANAGER_PID_FILE="/u02/ServiceManager/var/run/ServiceManager.pid"
 
               if [ -e "$SERVICE_MANAGER_PID_FILE" ] || [ -L "$SERVICE_MANAGER_PID_FILE" ]; then

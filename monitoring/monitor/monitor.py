@@ -1,14 +1,4 @@
-"""monitor.py: the one shared GoldenGate monitoring application.
-
-Runs the passive collector (calls GoldenGate Admin REST, owns LEASE, writes
-STATE#_deployment/STATE#<process> -- see collector.py) and the portal
-(CONFIG/LEASE/STATE# reads only, HTML/JSON UI, /healthz, /readyz) in one
-process. This module is not read-only as a whole -- only the portal's own
-data-reading functions are. CONFIG stays Terraform-owned: neither the
-collector nor the portal ever writes it. Never Scans. Never calls the
-Kubernetes API.
-"""
-import html
+"""monitor.py: runs the passive collector and the read-only monitoring portal in one process."""
 import json
 import logging
 import os
@@ -25,6 +15,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 import collector
 import config as cfgmod
+import ui
 
 RECORD_TYPE_CONFIG = "CONFIG"
 RECORD_TYPE_LEASE = "LEASE"
@@ -45,10 +36,7 @@ FUTURE_TIMESTAMP_TOLERANCE_SECONDS = 300
 
 CLIENT_SAFE_DYNAMODB_ERROR_MESSAGE = "Monitoring data is temporarily unavailable."
 
-# STATE#<process>.errorMsg is raw GoldenGate Admin REST client text
-# (hostnames, schema names, driver/TLS detail). It stays in DynamoDB for a
-# future alerter; only this fixed, closed statusCode + generic message is
-# ever exposed to a client.
+# errorMsg is raw GoldenGate REST text; only this fixed statusCode+message is ever exposed to a client.
 _PROCESS_STATUS_CODE_MESSAGES = {
     "NONE": "No error.",
     "POLL_FAILED": "The last poll of this process reported an error.",
@@ -58,13 +46,6 @@ _PROCESS_STATUS_CODE_MESSAGES = {
     "STALE": "Monitoring data for this process is stale.",
     "PROCESS_ABENDED": "This process has abended.",
     "UNKNOWN": "An unspecified error occurred.",
-}
-
-STATUS_COLORS = {
-    "UP": "#1a7f37", "STARTING": "#9a6700", "DOWN": "#cf222e",
-    "STALE": "#9a6700", "MISSING": "#cf222e", "UNKNOWN": "#57606a",
-    "RUNNING": "#1a7f37", "STOPPED": "#9a6700", "ABENDED": "#cf222e",
-    "FRESH": "#1a7f37", "REACHABLE": "#1a7f37", "DOWN_SVC": "#cf222e",
 }
 
 logger = logging.getLogger("goldengate.monitor")
@@ -103,8 +84,7 @@ def _boto_config() -> BotoConfig:
 
 
 def create_dynamodb_table_factory(config: cfgmod.MonitorConfig):
-    """Zero-argument callable -- each request obtains its OWN Table object,
-    never a single shared boto3 resource read across threads."""
+    """Zero-argument callable; each request gets its own Table object, never a shared one."""
     def _factory():
         session = boto3.session.Session()
         resource = session.resource("dynamodb", region_name=config.aws_region, config=_boto_config())
@@ -196,9 +176,7 @@ def _sanitized_process_error(status, error_msg, stale):
 
 
 def normalize_process_row(row, now, stale_after_seconds):
-    """Manager-compatible process fields only, all safe types, missing
-    values defaulting sensibly (resolvedThreshold/resolvedMode -> None,
-    consecutiveAbends -> 0) -- never raises on a malformed/partial row."""
+    """Normalizes a process STATE row to safe types; never raises on malformed/partial input."""
     recorded_at = _parse_epoch(row.get("recordedAt"))
     age, plausible = _freshness(recorded_at, now)
     stale = (not plausible) or age > stale_after_seconds
@@ -248,12 +226,7 @@ def lease_view(lease_item, now):
 
 
 def normalize_critical_services(raw):
-    """Fail-closed critical-service normalization -- never raises regardless
-    of shape. Only {"<name>": {"reachable": True}} entries are trusted; the
-    reachable field must be the literal Boolean True, not merely truthy --
-    values like "true", 1, or any other object fail closed to False, as does
-    any other per-service shape (bool, null, string, list, ...) or a
-    non-dict root."""
+    """Fail-closed: only a literal reachable=True entry counts as reachable, any other shape fails closed."""
     if not isinstance(raw, dict):
         return {}
     normalized = {}
@@ -265,14 +238,7 @@ def normalize_critical_services(raw):
 
 def read_runtime_view(table, role, deployment_name, deployment_meta,
                       now, stale_after_seconds):
-    """Canonical-only: the STATE#_deployment record for deployment_name is
-    the sole source of truth. A missing record reports effectiveStatus
-    MISSING -- it never falls back to any other partition or record shape.
-    Canonical STATE#<process> rows are queried independently of
-    STATE#_deployment's existence -- a partition can hold process rows even
-    when the deployment-status record itself is missing (eg a race during
-    first-tick startup), and those rows must still surface here regardless
-    of whether the deployment status is present."""
+    """A missing STATE#_deployment record reports MISSING; process rows are queried independently of it."""
     deployment_type = deployment_meta["type"]
 
     config_item = get_config_item(table, deployment_name)
@@ -329,11 +295,7 @@ def build_status_payload(config, table, deployments, logical_pipelines, clock=ti
 
 
 def read_deployment_processes_view(table, deployment_meta, now, stale_after_seconds):
-    """Canonical STATE#-only view for one deployment. GetItem/Query only,
-    never Scan, never writes. Canonical STATE#<process> rows are queried
-    independently of STATE#_deployment's existence, matching
-    read_runtime_view: a missing deployment-status record only means
-    effectiveStatus == MISSING, it does not imply an empty process list."""
+    """Canonical STATE#-only view for one deployment; GetItem/Query only, never Scan or write."""
     deployment_name = deployment_meta["name"]
     config_item = get_config_item(table, deployment_name)
     lease_item = get_lease_item(table, deployment_name)
@@ -357,10 +319,7 @@ def read_deployment_processes_view(table, deployment_meta, now, stale_after_seco
 
 
 def build_processes_payload(config, table, deployments, clock=time.time):
-    """/api/processes: canonical STATE# records only, one entry per
-    configured deployment (not grouped by logical pipeline -- this endpoint
-    is deployment/process-centric, not pipeline-pairing-centric). Never
-    writes DynamoDB, never Scans."""
+    """/api/processes: one entry per configured deployment, not grouped by pipeline."""
     now = int(clock())
     try:
         deployments_out = [read_deployment_processes_view(table, d, now, config.stale_after_seconds)
@@ -379,188 +338,10 @@ def _json_default(value):
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
-def _esc(value, default="-"):
-    return html.escape(default) if value is None else html.escape(str(value))
-
-
-def _status_badge(status):
-    color = STATUS_COLORS.get(status, STATUS_COLORS["UNKNOWN"])
-    return (f'<span style="display:inline-block;padding:2px 10px;border-radius:4px;'
-            f'background:{html.escape(color)};color:#ffffff;font-weight:600;font-size:0.85em;">'
-            f"{html.escape(str(status))}</span>")
-
-
-def _fresh_badge(fresh):
-    label = "Fresh" if fresh else "STALE"
-    color = STATUS_COLORS["FRESH"] if fresh else STATUS_COLORS["STALE"]
-    return (f'<span style="display:inline-block;padding:2px 10px;border-radius:4px;'
-            f'background:{html.escape(color)};color:#ffffff;font-weight:600;font-size:0.85em;">'
-            f"{html.escape(label)}</span>")
-
-
-def _reachable_badge(reachable):
-    label = "reachable" if reachable else "down"
-    color = STATUS_COLORS["REACHABLE"] if reachable else STATUS_COLORS["DOWN_SVC"]
-    return (f'<span style="display:inline-block;padding:1px 8px;border-radius:4px;'
-            f'background:{html.escape(color)};color:#ffffff;font-size:0.8em;">'
-            f"{html.escape(label)}</span>")
-
-
-def _critical_services_html(critical_services):
-    if not critical_services:
-        return "-"
-    return " ".join(
-        f"{_esc(svc)} {_reachable_badge(up is True)}"
-        for svc, up in sorted(critical_services.items()))
-
-
-def _alerts_enabled_text(alerts_enabled):
-    if alerts_enabled is None:
-        return "unknown"
-    return "true" if alerts_enabled else "false"
-
-
-def format_relative_age(seconds, missing_text="never"):
-    """Manager-contract relative-age text, reimplemented independently
-    against this codebase's None-based missing-value convention (the
-    manager reference uses a -1 sentinel, which is not reused here):
-    None -> missing_text; <60s -> "Ns ago"; <1h -> "Nm ago"; else -> "Nh ago"."""
-    if seconds is None:
-        return missing_text
-    seconds = int(seconds)
-    if seconds < 60:
-        return f"{seconds}s ago"
-    if seconds < 3600:
-        return f"{seconds // 60}m ago"
-    return f"{seconds // 3600}h ago"
-
-
-def format_lag_threshold_mode(lag_seconds, threshold_seconds, mode):
-    """Manager-contract combined lag/threshold/mode cell text, reimplemented
-    independently (not copied) against this codebase's None-based
-    missing-value convention. Both missing -> "N/A"; a single missing value
-    renders as "?", never the literal "None"."""
-    if lag_seconds is None and threshold_seconds is None:
-        return "N/A"
-    lag_text = f"{lag_seconds}s" if lag_seconds is not None else "?"
-    threshold_text = f"thr {threshold_seconds}s" if threshold_seconds is not None else "thr ?"
-    mode_text = str(mode) if mode else "?"
-    return f"{lag_text} / {threshold_text} ({mode_text})"
-
-
-def _render_process_table(processes):
-    if not processes:
-        return "<p><em>No process STATE rows found.</em></p>"
-    rows = []
-    for p in processes:
-        stale = bool(p.get("stale"))
-        process_cell = _esc(p.get("process"))
-        if stale:
-            process_cell = f'<span style="font-weight:600;">[STALE]</span> {process_cell}'
-        lag_cell = html.escape(format_lag_threshold_mode(
-            p.get("lagSeconds"), p.get("resolvedThreshold"), p.get("resolvedMode")))
-        age_cell = html.escape(format_relative_age(p.get("ageSeconds")))
-        error_cell = _esc(p.get("statusMessage")) if p.get("hasError") else ""
-        row_open = ('<tr class="stale-row" style="color:#9a6700;font-style:italic;">'
-                   if stale else "<tr>")
-        rows.append(
-            f"{row_open}"
-            f"<td>{process_cell}</td>"
-            f"<td>{_esc(p.get('processType'))}</td>"
-            f"<td>{_status_badge(p.get('status'))}</td>"
-            f"<td>{lag_cell}</td>"
-            f"<td>{age_cell}</td>"
-            f"<td>{_esc(p.get('consecutiveAbends'))}</td>"
-            f"<td>{error_cell}</td>"
-            "</tr>")
-    return ('<table style="margin-top:6px;width:100%;font-size:0.85em;border-collapse:collapse;">'
-           "<thead><tr><th>Process</th><th>Type</th><th>Status</th>"
-           "<th>Lag / Threshold (mode)</th><th>Recorded</th><th>Abends</th><th>Error</th>"
-           "</tr></thead>"
-           f"<tbody>{''.join(rows)}</tbody></table>")
-
-
-def _render_deployment_card(r):
-    fresh = bool(r.get("fresh"))
-    age_text = html.escape(format_relative_age(r.get("ageSeconds"), missing_text="-"))
-
-    lease = r.get("lease")
-    if lease:
-        holder_text = _esc(lease.get("holder") or "none")
-        state_text = "valid" if lease.get("fresh") else "EXPIRED"
-        lease_html = f"lease={holder_text} ({state_text})"
-    else:
-        lease_html = "lease=none"
-
-    header = (
-        f'<div style="font-weight:600;font-size:1.05em;margin-top:4px;">{_esc(r.get("deploymentName"))}</div>'
-        f'<div style="margin-top:2px;">{_status_badge(r.get("effectiveStatus"))} {_fresh_badge(fresh)}</div>'
-        f'<div style="margin-top:2px;color:#57606a;">role={_esc(r.get("role"))} | '
-        f'type={_esc(r.get("deploymentType"))} | '
-        f'alertsEnabled={html.escape(_alerts_enabled_text(r.get("alertsEnabled")))}</div>'
-        f'<div style="margin-top:2px;color:#57606a;">source={_esc(r.get("dataSource"))} | '
-        f'{lease_html} | updated {age_text}</div>'
-        f'<div style="margin-top:2px;">services: {_critical_services_html(r.get("criticalServices"))}</div>')
-
-    process_table = _render_process_table(r.get("processes") or [])
-
-    return (
-        '<div style="border:1px solid #d0d7de;border-radius:6px;padding:8px 14px 12px;margin-top:12px;">'
-        f"{header}{process_table}"
-        "</div>")
-
-
-def render_html(payload, config, error_message=None):
-    sections = []
-    if error_message:
-        sections.append(
-            '<div style="background:#ffebe9;border:1px solid #cf222e;color:#82071e;'
-            'padding:10px 14px;border-radius:6px;margin-bottom:16px;">'
-            f"Unable to read monitoring data: {html.escape(error_message)}</div>")
-
-    for lp in payload.get("logicalPipelines", []):
-        cards = "".join(_render_deployment_card(r) for r in lp.get("runtimes", []))
-        sections.append(
-            f'<h2 style="margin-top:24px;">{_esc(lp.get("pipelineId"))}</h2>{cards}')
-
-    if not payload.get("logicalPipelines"):
-        sections.append("<p>No logical pipelines found in the canonical topology.</p>")
-
-    generated_at = html.escape(str(payload.get("generatedAt", "-")))
-    stale_after = html.escape(str(config.stale_after_seconds))
-    version = html.escape(str(config.monitor_version))
-    refresh_seconds = int(config.refresh_seconds)
-
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta http-equiv="refresh" content="{refresh_seconds}">
-<title>GoldenGate Monitoring Portal</title>
-<style>
-  body {{ font-family: -apple-system, Segoe UI, Helvetica, Arial, sans-serif; margin: 24px; color: #1f2328; background: #ffffff; }}
-  table {{ margin-top: 8px; }}
-  th, td {{ padding: 6px 10px; border-bottom: 1px solid #eaeef2; vertical-align: top; }}
-  tr.stale-row td {{ color: #9a6700; font-style: italic; }}
-  footer {{ margin-top: 32px; color: #57606a; font-size: 0.8em; }}
-</style>
-</head>
-<body>
-<h1>GoldenGate Monitoring Portal</h1>
-{"".join(sections)}
-<footer>Generated at {generated_at} (epoch seconds) &middot; stale after {stale_after}s &middot; monitor {version} &middot; auto-refreshes every {refresh_seconds}s</footer>
-</body>
-</html>
-"""
-
-
-SECURITY_HEADERS = {
-    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none';",
-    "X-Content-Type-Options": "nosniff",
-    "Referrer-Policy": "no-referrer",
-    "Cache-Control": "no-store",
-    "X-Frame-Options": "DENY",
-}
+render_html = ui.render_html
+format_relative_age = ui.format_relative_age
+format_lag_threshold_mode = ui.format_lag_threshold_mode
+SECURITY_HEADERS = ui.SECURITY_HEADERS
 
 
 def _make_handler(config, table_factory, deployments, logical_pipelines, ready_state, expected_pipelines):
@@ -603,8 +384,7 @@ def _make_handler(config, table_factory, deployments, logical_pipelines, ready_s
             self._write(200, "application/json", body)
 
         def _handle_readyz(self):
-            """Collector readiness (in-process ready_state) AND a bounded
-            DescribeTable via a request-local Table object."""
+            """Collector readiness plus a bounded DescribeTable via a request-local Table."""
             if expected_pipelines and not all(ready_state.get(p) for p in expected_pipelines):
                 self._write(503, "application/json", json.dumps({"status": "not_ready"}).encode("utf-8"))
                 return

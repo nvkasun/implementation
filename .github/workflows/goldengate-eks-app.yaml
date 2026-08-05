@@ -54,10 +54,7 @@ env:
   # Optional. Add this repo variable later only if cross-account EKS auth fails.
   EKS_DEPLOY_ROLE_ARN: ${{ vars.EKS_DEPLOY_ROLE_ARN }}
 
-  # IRSA role the in-cluster argocd-ecr-token-sync CronJob assumes to pull
-  # the GoldenGate Helm OCI chart. The helm/goldengate ECR repository policy
-  # must grant this exact role pull access -- see the "Ensure Helm ECR
-  # repository policy allows Argo CD pull" step below.
+  # IRSA role the in-cluster argocd-ecr-token-sync CronJob assumes to pull the Helm OCI chart (see "Ensure Helm ECR repository policy allows Argo CD pull" step below).
   ARGOCD_ECR_READ_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateArgocdECRRead-dev
 
   HELM_OCI_NAMESPACE: helm
@@ -88,11 +85,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # GoldenGate deployment classification (deploymentModel detection,
-          # used to decide what enters the active/deletion matrices) requires
-          # actual YAML parsing -- there is no regex/text fallback. Fail
-          # closed here, with a fixed message, rather than ever letting the
-          # classifier silently accept malformed input.
+          # Deployment classification requires real YAML parsing (no regex/text fallback); fail closed if unavailable.
           if ! command -v python3 >/dev/null 2>&1; then
             echo "FAIL: python3 is required to classify GoldenGate deployment values files and is not available on this runner."
             exit 1
@@ -118,15 +111,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # The actual detection/classification implementation lives in a
-          # tracked, independently testable repository script -- never
-          # duplicated inline here. GitHub Actions rejects a single run:
-          # command above ~21,000 characters at compile time; keeping the
-          # real implementation out of this YAML file is what keeps this
-          # step (and every other step in this workflow) well under that
-          # limit. Every value this script needs arrives above as opaque
-          # string data through env:, never as a GitHub expression
-          # interpolated directly into a shell statement.
+          # Implementation lives in hack/detect-goldengate-deployments.sh (keeps this run: block under GitHub's ~21,000 char limit); inputs arrive via env: above, never interpolated directly.
           bash hack/detect-goldengate-deployments.sh
 
   build_publish_and_deploy:
@@ -256,15 +241,7 @@ jobs:
 
           VALUES_FILE="${ENVS_ROOT}/${ENVIRONMENT}/${DEPLOYMENT_ID}/values.yaml"
 
-          # deploymentModel is never inferred or defaulted here -- it comes
-          # straight from the validated active matrix built by
-          # detect_changed_deployments, which only ever admits a deployment
-          # whose own values file classified as deploymentModel=singleRuntime
-          # under the active contract (see is_goldengate_deployment_values_file
-          # in that job). This is a defense-in-depth assertion, not a guess:
-          # any other value reaching this job is a bug upstream and must fail
-          # closed immediately rather than silently proceed under a defaulted
-          # or re-inferred model.
+          # deploymentModel comes straight from the validated active matrix (never inferred/defaulted); any other value reaching here is an upstream bug.
           DEPLOYMENT_MODEL="${{ matrix.deployment_model }}"
 
           if [ "$DEPLOYMENT_MODEL" != "singleRuntime" ]; then
@@ -277,8 +254,7 @@ jobs:
 
           TARGET_NAMESPACE="goldengate-${ENVIRONMENT}"
           RELEASE_NAME="${DEPLOYMENT_ID}"
-          # Remove the leading "gg-" only for the Argo CD Application name
-          # suffix, e.g. gg-oracle-payments-01 -> goldengate-dev-oracle-payments-01.
+          # Strip leading "gg-" for the Argo CD Application name suffix, e.g. gg-oracle-payments-01 -> goldengate-dev-oracle-payments-01.
           APP_SUFFIX="${DEPLOYMENT_ID#gg-}"
           ARGOCD_APP_NAME="goldengate-${ENVIRONMENT}-${APP_SUFFIX}"
 
@@ -302,9 +278,7 @@ jobs:
             exit 1
           fi
 
-          # Unique per deployment: matrix jobs for different deployment_ids
-          # share the same run_number, so the shared suffix alone would
-          # collide when they package different deployment-specific values.
+          # Includes deployment_id because matrix jobs share the same run_number and would otherwise collide.
           CHART_VERSION="0.1.${{ github.run_number }}-${DEPLOYMENT_ID}"
           HELM_ECR_REPOSITORY="${HELM_OCI_NAMESPACE}/${CHART_NAME}"
           HELM_PUSH_URL="oci://${ECR_REGISTRY}/${HELM_OCI_NAMESPACE}"
@@ -392,9 +366,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Runs every time (repo newly created or already existing) so the
-          # in-cluster Argo CD ECR OCI IRSA role always has pull access,
-          # without clobbering any other statements already on this repo.
+          # Runs every time (new or existing repo) so Argo CD's IRSA role keeps pull access, without clobbering other statements.
           ARGOCD_ECR_STATEMENT_SID="AllowArgocdEksRolePullGoldengateHelmChart"
 
           echo "Fetching existing ECR repository policy for ${HELM_ECR_REPOSITORY}..."
@@ -459,18 +431,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # global.deploymentId is not consumed anywhere in helm/goldengate
-          # (the runtime name/labels derive from Release.Name /
-          # runtime.name/runtime.fullnameOverride -- see
-          # goldengate.runtimeName in _helpers.tpl), so it is never passed
-          # here. deploymentModel itself is never set via --set either: the
-          # deployment values file ($VALUES_FILE) always declares its own
-          # deploymentModel, and this job has already asserted it is exactly
-          # "singleRuntime" above -- helm/goldengate's own unconditional
-          # goldengate.assertSupportedDeploymentModel check re-verifies the
-          # same thing at render time as a second, independent gate. The
-          # chart no longer has an observer sidecar or monitoring.observer
-          # value at all.
+          # global.deploymentId/deploymentModel are intentionally not passed via --set; the chart derives runtime name from Release.Name and reads deploymentModel from $VALUES_FILE itself.
           helm lint "$HELM_CHART_PATH" \
             --values "$VALUES_FILE" \
             --set global.environment="$ENVIRONMENT"
@@ -499,14 +460,7 @@ jobs:
 
           echo "deploymentModel=singleRuntime: checking that NO Namespace document is rendered from this release: ${RENDERED}"
 
-          # A single-runtime release must never render a Namespace -- it
-          # deploys into the shared goldengate-<environment> namespace,
-          # which this release does not create or own. The chart's
-          # legacyPair Namespace template was removed entirely once
-          # legacyPair rendering was retired (helm/goldengate/templates/
-          # namespace.yaml no longer exists), so this is now the only
-          # deployment model this job ever handles, and this check is
-          # unconditional.
+          # singleRuntime releases must never render a Namespace -- they deploy into the shared goldengate-<environment> namespace, which they don't own.
           if grep -qE '^kind: Namespace$' "$RENDERED"; then
             echo "FAIL: a Namespace document was rendered for a singleRuntime release. This must never happen -- singleRuntime releases must not create or own the shared namespace."
             exit 1
@@ -531,12 +485,7 @@ jobs:
             exit 1
           fi
 
-          # Strict, fail-closed values-file parsing: never grep for an
-          # optional key (an absent persistence.efs.storageClass.basePath is
-          # expected and must not abort the script under set -euo
-          # pipefail). Derives the expected default basePath using exactly
-          # the same contract as helm/goldengate/templates/_helpers.tpl's
-          # goldengate.efsBasePath -- never a re-invented name.
+          # Strict PyYAML parsing; default path mirrors _helpers.tpl's goldengate.efsBasePath.
           set +e
           EFS_FACTS="$(python3 - "$VALUES_FILE" "$DEPLOYMENT_ID" "$DEPLOYMENT_MODEL" <<'PYEOF'
           import sys
@@ -545,12 +494,7 @@ jobs:
 
           values_path, deployment_id, deployment_model = sys.argv[1:4]
 
-          # Defense in depth: this job asserted deployment_model ==
-          # "singleRuntime" already in "Prepare deployment variables" -- this
-          # is that same validated value passed through, never re-inferred.
-          # legacyPair's EFS basePath derivation (global.deploymentId-based)
-          # was removed entirely along with the rest of the active legacyPair
-          # path; only singleRuntime is ever handled here now.
+          # Defense in depth: deployment_model was already validated as singleRuntime upstream; re-check here rather than trust it blindly.
           if deployment_model != "singleRuntime":
               print(f"FAIL: unexpected deploymentModel {deployment_model!r} reached EFS validation -- only singleRuntime is supported for active deployments.")
               sys.exit(1)
@@ -603,11 +547,7 @@ jobs:
           if isinstance(explicit_base_path, str) and explicit_base_path.strip():
               base_path = explicit_base_path
           else:
-              # Mirrors goldengate.efsBasePath: an absent/null/empty basePath
-              # derives from the canonical runtime name (fullnameOverride,
-              # then name, then -- matching Release.Name in the chart --
-              # this workflow's own deployment_id, since envs/dev/<id>/ is
-              # itself named after the canonical runtime name).
+              # Mirrors goldengate.efsBasePath: falls back to fullnameOverride, then name, then deployment_id.
               runtime = data.get("runtime") or {}
               runtime_name = runtime.get("fullnameOverride") or runtime.get("name") or deployment_id
               if not isinstance(runtime_name, str) or not runtime_name.strip():
@@ -677,10 +617,7 @@ jobs:
           with open(rendered_path) as f:
               raw = f.read()
 
-          # Attribute each rendered document to the template that rendered
-          # it using Helm's own leading "# Source: <path>" comment -- never
-          # re-deriving the chart's resource-naming fallback chains
-          # (goldengate.sourceName/targetName/...) independently in Python.
+          # Attribute each document to its template via Helm's own leading "# Source: <path>" comment.
           documents = []
           for chunk in re.split(r"(?m)^---$", raw):
               chunk = chunk.strip("\n")
@@ -762,12 +699,7 @@ jobs:
                   print(f"FAIL: {label} StatefulSet u03 volume is not emptyDir (found: {u03!r}).")
                   sys.exit(1)
 
-          # Defense in depth, matching the same assertion above: only
-          # singleRuntime is ever validated here. legacyPair's source/target
-          # PVC and StatefulSet validation was removed entirely along with
-          # the rest of the active legacyPair path -- helm/goldengate no
-          # longer renders source-statefulset.yaml/target-statefulset.yaml
-          # at all (see Git history for the removed templates).
+          # Defense in depth: only singleRuntime is validated here (matches the assertion above).
           if deployment_model != "singleRuntime":
               print(f"FAIL: unexpected deploymentModel {deployment_model!r} reached EFS rendered-resource validation -- only singleRuntime is supported for active deployments.")
               sys.exit(1)
@@ -916,10 +848,7 @@ jobs:
                   sys.exit(1)
           print("OK: no observer/utility-sidecar/Fluent Bit reference in the regular container.")
 
-          # --- initContainers: exactly one prepare-u02-permissions, with the
-          # stale ServiceManager.pid safeguard intact. An empty initContainers
-          # list must fail here, not pass vacuously -- the mandatory
-          # permissions/stale-PID init container is required, not optional.
+          # initContainers must be exactly [prepare-u02-permissions] -- an empty list must fail here, not pass vacuously.
           init_containers = pod_spec.get("initContainers") or []
           init_names = [c.get("name") for c in init_containers]
 
@@ -933,10 +862,7 @@ jobs:
           init_container = init_containers[0]
 
           def _init_script_text(container):
-              # command/args entries are ordinarily strings, but tolerate a
-              # non-string entry (e.g. a Helm-rendered number) rather than
-              # crashing on it -- only string entries can ever contain the
-              # shell script text we are looking for.
+              # Tolerate non-string command/args entries (e.g. Helm-rendered numbers) instead of crashing.
               parts = []
               for item in list(container.get("command") or []) + list(container.get("args") or []):
                   if isinstance(item, str):
@@ -966,11 +892,7 @@ jobs:
               "ServiceManager.pid cleanup are present."
           )
 
-          # --- Services: exactly one ClusterIP, one headless -----------------------
-          # Exact partition, not a substring/"occurs somewhere" check: every
-          # rendered Service is classified into exactly one of two disjoint
-          # buckets by its own clusterIP (and, for the normal bucket, its
-          # type), and each bucket's length must be exactly 1.
+          # --- Services: exactly one ClusterIP + one headless, partitioned strictly by clusterIP/type ---
           services = [d for d in documents if d.get("kind") == "Service"]
           if len(services) != 2:
               print(f"FAIL: expected exactly 2 Service documents (one ClusterIP, one headless), found {len(services)}.")
@@ -1071,10 +993,7 @@ jobs:
           rm -rf "$TEMP_CHART_PATH"
           mkdir -p "$TEMP_CHART_PATH"
 
-          # Argo CD (running inside the private EKS cluster) cannot reach
-          # this GitHub repo's envs/dev/<id>/values.yaml path directly, so
-          # the deployment values file is baked into a deployment-specific,
-          # self-contained copy of the chart before packaging.
+          # Argo CD can't reach envs/dev/<id>/values.yaml directly, so bake it into a self-contained chart copy before packaging.
           echo "Copying base chart from $HELM_CHART_PATH into $TEMP_CHART_PATH..."
           cp -a "$HELM_CHART_PATH/." "$TEMP_CHART_PATH/"
 
@@ -1221,13 +1140,7 @@ jobs:
           echo "Argo CD Application CRD is present."
 
       - name: (Emergency fallback only) Refresh temporary Argo CD ECR OCI password
-        # Not the long-term auth path. Long-term, Argo CD's ECR OCI repository
-        # credentials are refreshed in-cluster by the argocd-ecr-token-sync
-        # component via IRSA role GoldenGateArgocdECRRead-dev (see
-        # policies/argocd-ecr-oci-read-dev/ and the ECR repository policy
-        # step above). This step only runs if explicitly enabled via the
-        # ENABLE_TEMP_ARGOCD_ECR_PASSWORD_INJECTION repository variable, for
-        # emergency use before that component is deployed.
+        # Emergency fallback only; long-term auth is handled in-cluster by argocd-ecr-token-sync (IRSA role GoldenGateArgocdECRRead-dev).
         if: ${{ matrix.deploy && vars.ENABLE_TEMP_ARGOCD_ECR_PASSWORD_INJECTION == 'true' }}
         shell: bash
         run: |
@@ -1267,18 +1180,7 @@ jobs:
 
           echo "Applying Argo CD Application: ${ARGOCD_APP_NAME} (deploymentModel=${DEPLOYMENT_MODEL})"
 
-          # singleRuntime deploys into the shared goldengate-<environment>
-          # namespace, which this Application does not create or own: no
-          # CreateNamespace=true, no managedNamespaceMetadata. That namespace
-          # is provisioned and owned by a separate, later platform/bootstrap
-          # step. No observer Helm parameters either -- the generic runtime
-          # chart resources never reference monitoring.observer. No
-          # global.deploymentId parameter either -- it has no call-site
-          # anywhere in helm/goldengate (the runtime name derives from
-          # Release.Name/runtime.name/runtime.fullnameOverride). This is now
-          # the only deployment model this job ever handles (legacyPair's
-          # CreateNamespace=true / managedNamespaceMetadata Application shape
-          # was removed along with the rest of the active legacyPair path).
+          # singleRuntime deploys into the shared goldengate-<environment> namespace (no CreateNamespace/managedNamespaceMetadata); no observer or global.deploymentId parameters needed.
           cat <<EOF | kubectl apply -f -
           apiVersion: argoproj.io/v1alpha1
           kind: Application
@@ -1403,8 +1305,7 @@ jobs:
 
           echo ""
           echo "EFS StorageClass for this deployment:"
-          # Not fatal: grep exits non-zero if no line matches, but that's a
-          # meaningful "not found" signal here, not a script failure.
+          # Not fatal: grep exiting non-zero here just means "not found".
           kubectl get storageclass | grep "gg-efs-${ENVIRONMENT}-${DEPLOYMENT_ID}" || true
 
           echo ""
@@ -1613,16 +1514,7 @@ jobs:
             exit 1
           fi
 
-          # deployment_model comes from detect_changed_deployments' deletion
-          # matrix, which only ever emits exactly "singleRuntime" or
-          # "legacyPair" under the historical deletion contract (see
-          # is_goldengate_deployment_values_file_at_ref/
-          # _classify_deployment_model_yaml in that job) -- it never defaults
-          # an unrecognized value to either model. This value directly
-          # controls namespace deletion safety below, so re-verify it here
-          # defensively too, and fail closed (never default/guess) if it is
-          # ever anything else: that would mean the upstream matrix is
-          # broken, not a case to paper over.
+          # deployment_model must be exactly "singleRuntime" or "legacyPair" from the deletion matrix; it directly controls namespace deletion safety below, so fail closed on anything else.
           if [ "$DEPLOYMENT_MODEL" != "legacyPair" ] && [ "$DEPLOYMENT_MODEL" != "singleRuntime" ]; then
             echo "FAIL: unrecognized deployment_model '${DEPLOYMENT_MODEL}' from the deletion matrix (expected exactly 'singleRuntime' or 'legacyPair')."
             echo "Refusing to guess or default this value -- it directly controls which namespace/Application this job targets for deletion. This indicates a bug in the upstream deletion matrix; investigate detect_changed_deployments before re-running."
@@ -1631,11 +1523,7 @@ jobs:
 
           ARGOCD_NAMESPACE="argocd"
 
-          # legacyPair mapping is retained here ONLY (not in the active
-          # build/deploy job) because historical legacyPair resources that
-          # may still need deletion used this exact naming:
-          #   Application: goldengate-<deployment-id>
-          #   namespace:   gg-<environment>-<deployment-id>
+          # legacyPair naming (kept only here, for deleting historical resources): Application=goldengate-<deployment-id>, namespace=gg-<environment>-<deployment-id>.
           if [ "$DEPLOYMENT_MODEL" = "singleRuntime" ]; then
             TARGET_NAMESPACE="goldengate-${ENVIRONMENT}"
             APP_SUFFIX="${DEPLOYMENT_ID#gg-}"
@@ -1705,27 +1593,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          # HARD FAIL-SAFE (unconditional, checked before anything else,
-          # regardless of deployment_model or namespace labels): a
-          # singleRuntime release's TARGET_NAMESPACE is always the shared
-          # goldengate-<environment> namespace. That namespace is never
-          # created or owned by any individual runtime release/Application,
-          # so it must never be deleted from here -- even if it happened to
-          # carry matching-looking ownership labels. This check is
-          # deliberately independent of DEPLOYMENT_MODEL: it triggers on the
-          # namespace *value* itself, so it still protects the shared
-          # namespace even if deployment_model were ever wrong/missing.
+          # HARD FAIL-SAFE: never delete the shared goldengate-<environment> namespace, regardless of deployment_model or labels -- checked on the namespace value itself.
           if [ "$TARGET_NAMESPACE" = "goldengate-${ENVIRONMENT}" ]; then
             echo "Refusing to delete namespace ${TARGET_NAMESPACE}: this is the shared goldengate-${ENVIRONMENT} namespace, never owned by an individual deployment/Application. Namespace deletion is unconditionally skipped for singleRuntime deployments."
             exit 0
           fi
 
-          # CreateNamespace=true only guarantees the namespace exists for
-          # sync -- it is not a guaranteed cleanup mechanism on Application
-          # deletion. This is a guarded fallback: it only deletes the
-          # namespace when it still exists AND carries exactly the
-          # ownership labels this deployment would have set, so it can
-          # never touch a namespace it doesn't unambiguously own.
+          # Guarded fallback: only deletes the namespace if it still exists AND carries exactly this deployment's ownership labels.
           if kubectl get namespace "$TARGET_NAMESPACE" >/dev/null 2>&1; then
             echo "Namespace ${TARGET_NAMESPACE} still exists after Argo CD Application deletion. Verifying ownership labels before cleanup..."
 

@@ -17,29 +17,7 @@ module "goldengate_eks_deploy_role_dev" {
 }
 
 
-# IRSA role for GoldenGate runtime pods: canonical (gg-oracle-sa,
-# gg-postgresql-sa) and the retired legacy deployment's ServiceAccount
-# subject (ogg-oracle-sa), which still exists live and still needs Secrets
-# Manager/KMS access for its CSI-mounted credentials until that legacy
-# deployment is retired in a later phase. The shared monitor uses its OWN
-# role (goldengate_monitor_read_role_dev below), not this one.
-#
-# This role's policy previously also granted DynamoDB (gg-eks-pipeline)
-# and CloudWatch (GoldenGate/Pipelines PutMetricData) actions. Because this
-# role is shared by every runtime pod's ServiceAccount, those permissions
-# were available to canonical pods too, even though only the now-retired
-# observer sidecars ever actually required or used them -- canonical
-# GoldenGate application containers never called DynamoDB or CloudWatch.
-# Shared gg-monitor now exclusively owns canonical LEASE/STATE# writes and
-# manager-compatible metric publication through its own IRSA role
-# (goldengate_monitor_read_role_dev below), so those two statements have
-# been removed from this policy.
-#
-# IMPORTANT: the retained legacy deployment's observer pods are still live
-# and still assume this same role. Do not apply this IAM reduction
-# (terraform apply) while those legacy observer pods are still running --
-# doing so removes their DynamoDB/CloudWatch access immediately. Apply this
-# change only after the legacy observer pods have been retired.
+# IRSA role for GoldenGate runtime pods (canonical + still-live legacy ogg-oracle-sa); DynamoDB/CloudWatch access now lives solely on goldengate_monitor_read_role_dev below -- do not apply this reduction until legacy observer pods are retired.
 module "goldengate_secrets_read_role_dev" {
   source = "git::https://github.com/AbuDhabiCommercialBank/aws-tf-module-iam-role.git?ref=v2.0.0"
 
@@ -59,8 +37,7 @@ module "goldengate_secrets_read_role_dev" {
 }
 
 
-# IRSA role for the shared monitor (collector + portal). Trust: exactly
-# system:serviceaccount:goldengate-monitoring:gg-monitor.
+# IRSA role for the shared monitor (collector + portal); trust: exactly system:serviceaccount:goldengate-monitoring:gg-monitor.
 module "goldengate_monitor_read_role_dev" {
   source = "git::https://github.com/AbuDhabiCommercialBank/aws-tf-module-iam-role.git?ref=v2.0.0"
 
@@ -99,16 +76,7 @@ module "goldengate_argocd_ecr_read_role_dev" {
 }
 
 
-# Phase 6A: dedicated IRSA role for the platform-level Fluent Bit DaemonSet
-# (helm/goldengate-platform, fluentBit.create=true). Trust: exactly
-# system:serviceaccount:goldengate-dev:gg-fluent-bit -- see
-# envs/dev/policies/goldengate-platform-logging-dev/assume_role_policy/sts.json.
-# Deliberately its own role, never a reuse of GoldenGateSecretsReadRole-dev,
-# GoldenGateMonitorReadRole-dev, or GoldenGateEKSDeployRole-dev: this is the
-# only role in this environment that may write to the pre-created
-# /adcb/goldengate/dev/runtime and /adcb/goldengate/dev/monitor CloudWatch
-# Logs groups (see envs/dev/cloudwatch_logs.tf), and it must never carry any
-# Secrets Manager, DynamoDB, EFS, or Kubernetes control permission.
+# Dedicated IRSA role for the platform Fluent Bit DaemonSet; trust: exactly system:serviceaccount:goldengate-dev:gg-fluent-bit. Never reused by other roles; the only role permitted to write the /adcb/goldengate/dev/* log groups, and must never carry Secrets Manager/DynamoDB/EFS/K8s-control permissions.
 module "goldengate_platform_logging_role_dev" {
   source = "git::https://github.com/AbuDhabiCommercialBank/aws-tf-module-iam-role.git?ref=v2.0.0"
 
@@ -128,36 +96,7 @@ module "goldengate_platform_logging_role_dev" {
 }
 
 
-# Phase 6B2A: dedicated IRSA role for the future amazon-cloudwatch-observability
-# CloudWatch Agent / OTel Container Insights collectors (the Kubernetes
-# ServiceAccount, namespace, operator, and Argo CD Application that will
-# assume this role are NOT created in this phase -- IAM/Terraform
-# prerequisites only). Trust: exactly
-# system:serviceaccount:amazon-cloudwatch:cloudwatch-agent -- see
-# envs/dev/policies/goldengate-cloudwatch-metrics-dev/assume_role_policy/sts.json.
-#
-# This role publishes EKS cluster/node/pod/container resource metrics
-# (cloudwatch:PutMetricData, namespace=ContainerInsights) and writes
-# Container Insights performance events to the single pre-created
-# /aws/containerinsights/gg-poc-dev/performance log group (see
-# envs/dev/cloudwatch_observability.tf) -- it is never granted
-# logs:CreateLogGroup or logs:PutRetentionPolicy. Application Signals and
-# X-Ray are out of scope for this role and are not granted here.
-#
-# Deliberately its own role, never shared with or reused by:
-#   - gg-fluent-bit (GoldenGatePlatformLoggingRole-dev owns GoldenGate
-#     runtime/monitor stdout/stderr log delivery; that ownership is
-#     unchanged by this role);
-#   - gg-monitor (GoldenGateMonitorReadRole-dev);
-#   - GoldenGate runtime pods (GoldenGateSecretsReadRole-dev);
-#   - Argo CD (GoldenGateArgocdECRRead-dev);
-#   - kube-state-metrics, node-exporter, or the CloudWatch Agent operator
-#     itself (those workloads do not call AWS APIs and so do not assume
-#     any IRSA role);
-#   - GitHub Actions (GoldenGateEKSDeployRole-dev).
-# Ordinary GoldenGate/gg-monitor application container stdout/stderr logs
-# remain owned exclusively by gg-fluent-bit; this role never writes to the
-# /adcb/goldengate/dev/* log groups.
+# Dedicated IRSA role for the future CloudWatch Observability agent (IAM/Terraform prerequisites only); trust: exactly system:serviceaccount:amazon-cloudwatch:cloudwatch-agent. Publishes ContainerInsights metrics and writes only the pre-created performance log group; never shared with other roles and never writes /adcb/goldengate/dev/* logs.
 module "goldengate_cloudwatch_metrics_role_dev" {
   source = "git::https://github.com/AbuDhabiCommercialBank/aws-tf-module-iam-role.git?ref=v2.0.0"
 

@@ -2,11 +2,7 @@ name: GoldenGate legacy cleanup inventory
 
 run-name: "GoldenGate legacy cleanup inventory | environment=${{ inputs.environment }} | ran by ${{ github.actor }}"
 
-# Read-only, workflow_dispatch-only. This workflow never creates, modifies,
-# or deletes any AWS or Kubernetes resource -- it only inventories retired
-# legacy resources (see hack/inventory-goldengate-legacy-resources.sh) and
-# emits a deterministic JSON cleanup manifest for later human review. There
-# is deliberately no push trigger and no apply/delete/mutation input.
+# Read-only, workflow_dispatch-only: inventories retired legacy resources, never mutates AWS/Kubernetes state.
 on:
   workflow_dispatch:
     inputs:
@@ -93,14 +89,5 @@ jobs:
         run: |
           set -euo pipefail
 
-          # The full read-only inventory implementation lives in a tracked,
-          # independently testable repository script -- never duplicated
-          # inline here. Every value it needs arrives above as opaque
-          # string data through env:, never as a GitHub expression
-          # interpolated directly into a shell statement. This script
-          # performs Describe/Get/List/Query calls only; it contains no
-          # delete/patch/update/put/apply/mutation action of any kind. The
-          # full manifest and a concise summary are printed directly to the
-          # job log and the GitHub Actions job summary -- reviewing the
-          # result never requires downloading or transferring a file.
+          # Read-only Describe/Get/List/Query calls only; inputs arrive via env: to avoid interpolating expressions into the shell.
           bash hack/inventory-goldengate-legacy-resources.sh

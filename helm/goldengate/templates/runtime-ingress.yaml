@@ -16,9 +16,7 @@ metadata:
   labels:
     {{- include "goldengate.runtimeLabels" . | nindent 4 }}
   annotations:
-    # Application/group-level annotations. Safe to set regardless of mode:
-    # every Ingress in an ALB group must agree on these, and GoldenGate only
-    # ever runs its own backend/health-check settings here.
+    # Application/group-level annotations, safe regardless of mode: every Ingress in an ALB group must agree on these.
     alb.ingress.kubernetes.io/backend-protocol: {{ .Values.ingress.alb.backendProtocol | quote }}
     alb.ingress.kubernetes.io/healthcheck-protocol: {{ .Values.ingress.alb.healthcheckProtocol | quote }}
     alb.ingress.kubernetes.io/healthcheck-port: {{ .Values.ingress.alb.healthcheckPort | quote }}
@@ -31,34 +29,19 @@ metadata:
     alb.ingress.kubernetes.io/group.order: {{ .Values.ingress.alb.groupOrder | quote }}
 {{- end }}
 {{- if .Values.ingress.alb.listenPorts }}
-    # listen-ports tells the controller which listener(s) this Ingress's
-    # rules attach to. It is required even in shared mode: the resident
-    # Ingress owns the listener/certificate, but each joining Ingress must
-    # still declare its own rules' listener or they are never attached to
-    # HTTPS 443 and requests fall through to the ALB default 404 action.
+    # Required even in shared mode: each joining Ingress must declare its own rules' listener or requests fall through to the ALB default 404 action.
     alb.ingress.kubernetes.io/listen-ports: {{ .Values.ingress.alb.listenPorts | quote }}
 {{- end }}
 {{- if .Values.ingress.alb.certificateArn }}
-    # certificate-arn is required whenever this Ingress declares an HTTPS
-    # listener (listen-ports contains HTTPS), even in shared mode: without
-    # it the controller falls back to per-Ingress host-based ACM discovery,
-    # which fails for hosts that don't match a discoverable certificate
-    # (e.g. temporary/local hostnames) with "no certificate found for host".
+    # Required whenever this Ingress declares an HTTPS listener, even in shared mode, or the controller falls back to per-Ingress host-based ACM discovery.
     alb.ingress.kubernetes.io/certificate-arn: {{ .Values.ingress.alb.certificateArn | quote }}
 {{- end }}
 {{- if .Values.ingress.alb.targetType }}
-    # target-type is a per-TargetGroup setting, not an ALB-level setting: it
-    # is required in shared mode too. Our backend Service is ClusterIP, so
-    # without target-type=ip the controller defaults to instance mode, which
-    # requires NodePort/LoadBalancer Services and fails with "TargetGroup
-    # port is empty" against a ClusterIP Service.
+    # Required in shared mode too: our backend Service is ClusterIP, so without target-type=ip the controller defaults to instance mode.
     alb.ingress.kubernetes.io/target-type: {{ .Values.ingress.alb.targetType | quote }}
 {{- end }}
 {{- if eq .Values.ingress.mode "standalone" }}
-    # ALB-level/exclusive annotations. Only emitted in standalone mode: an
-    # Ingress joining an existing (resident) ALB group must NOT repeat
-    # these, or the AWS Load Balancer Controller fails model reconciliation
-    # with a conflicting-attribute error against the group's owning Ingress.
+    # ALB-level/exclusive annotations, only emitted in standalone mode: a joining Ingress must NOT repeat these or the controller fails model reconciliation.
     alb.ingress.kubernetes.io/scheme: {{ .Values.ingress.alb.scheme | quote }}
 {{- if .Values.ingress.alb.sslPolicy }}
     alb.ingress.kubernetes.io/ssl-policy: {{ .Values.ingress.alb.sslPolicy | quote }}

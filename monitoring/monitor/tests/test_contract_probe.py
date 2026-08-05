@@ -1,9 +1,4 @@
-"""Synthetic-only tests for tools/gg_api_contract_probe.py: canonical
-deployment resolution, port selection, unsafe-path/deployment rejection,
-sanitized structural output, closed error-category classification, and
-proof that no DynamoDB write, CloudWatch call, or GoldenGate-modifying
-request is ever made. No real credentials or corporate hostnames are used
-anywhere in this file."""
+"""Synthetic-only tests for tools/gg_api_contract_probe.py covering deployment resolution, path/port validation, sanitized output, error classification, and proof that no write/mutating call is ever made."""
 import json
 import os
 import ssl
@@ -115,14 +110,12 @@ class PathValidationTests(unittest.TestCase):
             probe.validate_path("/services/v2/%00extracts")
 
     def test_rejects_double_percent_encoded_traversal(self):
-        # %252e%252e decodes once to "%2e%2e", then again to ".." -- bounded
-        # iterative decoding must still catch this.
+        # %252e%252e decodes to "%2e%2e" then to ".." -- bounded iterative decoding must catch double-encoding.
         with self.assertRaises(probe.ProbeValidationError):
             probe.validate_path("/services/v2/%252e%252e/admin")
 
     def test_rejects_malformed_percent_encoding(self):
-        # %ff is not valid standalone UTF-8 -- unquote(errors="strict") must
-        # raise, and validate_path must turn that into a rejection.
+        # %ff is not valid standalone UTF-8; unquote(errors="strict") must raise and be turned into a rejection.
         with self.assertRaises(probe.ProbeValidationError):
             probe.validate_path("/services/v2/%ffextracts")
 
@@ -135,8 +128,7 @@ class PathValidationTests(unittest.TestCase):
             probe.validate_path("/services//v2/extracts")
 
     def test_still_accepts_other_legitimate_services_paths(self):
-        # no broad allowlist: any other well-formed /services/... path
-        # remains probeable for future legitimate read-only endpoints.
+        # no broad allowlist: any other well-formed /services/... path stays probeable for future endpoints.
         self.assertEqual(probe.validate_path("/services/v2/deployments"), "/services/v2/deployments")
 
 
@@ -215,8 +207,7 @@ class ErrorClassificationTests(unittest.TestCase):
 
 
 class WrappedTlsClassificationTests(unittest.TestCase):
-    """A TLS failure must classify as TLS_FAILED regardless of how deep it is
-    wrapped -- direct, URLError.reason, or chained __cause__/__context__."""
+    """A TLS failure must classify as TLS_FAILED no matter how deep it is wrapped (direct, URLError.reason, or chained __cause__/__context__)."""
 
     def test_direct_ssl_error(self):
         self.assertTrue(probe._contains_tls_error(ssl.SSLError("bad cert")))
@@ -272,8 +263,7 @@ class WrappedTlsClassificationTests(unittest.TestCase):
             nxt = RuntimeError(f"wrapper-{i}")
             nxt.__cause__ = current
             current = nxt
-        # root TLS error is beyond max_nodes -- bounded traversal is allowed
-        # to miss it, but must not hang or crash.
+        # root TLS error is beyond max_nodes; bounded traversal may miss it but must not hang or crash.
         result = probe._contains_tls_error(current)
         self.assertIn(result, (True, False))
 
@@ -338,8 +328,7 @@ class SummarizeJsonTests(unittest.TestCase):
 
 
 class CollectionSummarizationTests(unittest.TestCase):
-    """Every list-valued response.* field -- not just response.items --
-    becomes its own sanitized entry in "collections"."""
+    """Every list-valued response.* field, not just response.items, becomes its own sanitized entry in "collections"."""
 
     def test_response_processes_empty_list(self):
         payload = {"response": {"processes": []}}
@@ -510,8 +499,7 @@ class CollectionSummarizationTests(unittest.TestCase):
 
 
 class RunProbeTests(unittest.TestCase):
-    """run_probe exercised with a fully mocked HTTP layer -- never touches a
-    real socket, DynamoDB, or CloudWatch."""
+    """run_probe exercised with a fully mocked HTTP layer -- never touches a real socket, DynamoDB, or CloudWatch."""
 
     def _deployment_with_creds(self, tmp):
         user_file = os.path.join(tmp, "user")
@@ -649,9 +637,7 @@ class RunProbeTests(unittest.TestCase):
 
 
 class ResponseSizeLimitTests(unittest.TestCase):
-    """The response body must be read bounded (MAX_RESPONSE_BYTES + 1, never
-    unbounded), and an oversized body must never be parsed, sized, or
-    echoed -- only a fixed, sanitized UNEXPECTED_RESPONSE."""
+    """The response body read must be bounded (MAX_RESPONSE_BYTES + 1, never unbounded); an oversized body is never parsed, sized, or echoed -- only a fixed, sanitized UNEXPECTED_RESPONSE."""
 
     def _deployment_with_creds(self, tmp):
         user_file = os.path.join(tmp, "user")
@@ -667,8 +653,7 @@ class ResponseSizeLimitTests(unittest.TestCase):
         fake_resp = MagicMock()
         fake_resp.status = 200
         fake_resp.headers = {"Content-Type": "application/json"}
-        # Mirrors the real http.client behaviour that resp.read(n) returns
-        # at most n bytes -- exercises the exact bounded-read contract.
+        # Mirrors real http.client behaviour: resp.read(n) returns at most n bytes.
         fake_resp.read.side_effect = lambda n=None: body_bytes[:n] if n is not None else body_bytes
         fake_resp.__enter__.return_value = fake_resp
         fake_resp.__exit__.return_value = False
@@ -688,8 +673,7 @@ class ResponseSizeLimitTests(unittest.TestCase):
         fake_resp.read.assert_called_once_with(probe.MAX_RESPONSE_BYTES + 1)
 
     def test_body_exactly_at_limit_is_accepted(self):
-        # Pad a valid JSON document with whitespace so its exact byte length
-        # equals MAX_RESPONSE_BYTES while still parsing successfully.
+        # Pad a valid JSON document so its byte length equals MAX_RESPONSE_BYTES while still parsing.
         base = {"response": {"processes": []}}
         core_bytes = json.dumps(base).encode()
         pad = b" " * (probe.MAX_RESPONSE_BYTES - len(core_bytes))
@@ -742,9 +726,7 @@ class ResponseSizeLimitTests(unittest.TestCase):
 
 
 class KeyOutputBoundingTests(unittest.TestCase):
-    """topLevelKeys/responseKeys/collection field names are sorted,
-    length-bounded, and count-bounded -- an omitted key is never emitted
-    partial, and the *Truncated flags say when something was dropped."""
+    """topLevelKeys/responseKeys/collection field names are sorted, length-bounded, and count-bounded -- an omitted key is never emitted partial, and the *Truncated flags say when something was dropped."""
 
     def test_excess_top_level_keys_capped_and_flagged(self):
         payload = {f"k{i:04d}": i for i in range(probe.MAX_TOP_LEVEL_KEYS + 20)}
@@ -824,9 +806,7 @@ class KeyOutputBoundingTests(unittest.TestCase):
 
 
 class ExplicitPathCollectionNameBoundTests(unittest.TestCase):
-    """A list-valued response.* field whose OWN name (not its item field
-    names) is longer than MAX_KEY_LENGTH must be omitted entirely -- never
-    inspected, never partially emitted -- with collectionsTruncated=true."""
+    """A list-valued response.* field whose OWN name (not its item field names) exceeds MAX_KEY_LENGTH must be omitted entirely, never inspected or partially emitted, with collectionsTruncated=true."""
 
     def test_overlong_collection_name_omitted(self):
         overlong = "c" * (probe.MAX_KEY_LENGTH + 1)
@@ -858,11 +838,7 @@ class ExplicitPathCollectionNameBoundTests(unittest.TestCase):
 
 
 class MetricsPortSecurityTests(unittest.TestCase):
-    """Direct metricsPort 9015 is confirmed plain HTTP in the live
-    environment: the probe must never read credential files, build a
-    Basic-Auth opener, or otherwise attach the mounted admin credentials to
-    a metrics-port request -- there is no HTTP credential-transport
-    fallback path in this tool at all."""
+    """metricsPort 9015 is confirmed plain HTTP: the probe must never read credential files, build a Basic-Auth opener, or otherwise attach mounted admin credentials to a metrics-port request."""
 
     def test_metrics_port_never_reads_credential_files(self):
         d = _deployment()
@@ -888,9 +864,7 @@ class MetricsPortSecurityTests(unittest.TestCase):
         mock_basic_opener.assert_not_called()
 
     def test_metrics_port_opener_has_no_auth_handler(self):
-        # build_opener() with no arguments installs only the default
-        # handlers -- no HTTPBasicAuthHandler, so no Authorization header
-        # can ever be attached to a metrics-port request.
+        # build_opener() with no args installs only defaults -- no HTTPBasicAuthHandler, so no Authorization header can be attached.
         opener = __import__("urllib.request", fromlist=["build_opener"]).build_opener()
         import urllib.request as _ur
         self.assertFalse(any(isinstance(h, _ur.HTTPBasicAuthHandler) for h in opener.handlers))
@@ -935,9 +909,7 @@ class DocumentationClaimsTests(unittest.TestCase):
 
 
 class NoSideEffectTests(unittest.TestCase):
-    """The probe tool must never write DynamoDB, never call CloudWatch, and
-    never issue a request that could modify a GoldenGate deployment (GET
-    only, on the confirmed read-only Admin REST paths)."""
+    """The probe tool must never write DynamoDB or call CloudWatch, and must issue only GET requests on confirmed read-only Admin REST paths."""
 
     def test_module_never_imports_boto3_dynamodb_write_apis(self):
         names = set()
@@ -956,18 +928,14 @@ class NoSideEffectTests(unittest.TestCase):
     def test_only_http_get_is_used(self):
         with open(probe.__file__) as f:
             src = f.read()
-        # opener.open(...) is a GET by construction (no data= is ever passed,
-        # which would turn a urllib request into a POST).
+        # opener.open(...) is a GET by construction; passing data= would turn it into a POST.
         self.assertNotIn("data=", src)
         self.assertNotIn("method=\"POST\"", src)
         self.assertNotIn("method='POST'", src)
 
 
 class FollowProcessesTests(unittest.TestCase):
-    """--follow-processes: inventory GET + up to MAX_FOLLOWED_PROCESSES
-    sequential, bounded per-process detail GETs, merging structural schema.
-    Never outputs a process name, process ID, or constructed URL. Synthetic
-    data only."""
+    """--follow-processes: inventory GET + bounded per-process detail GETs, merging structural schema; never outputs a process name, process ID, or constructed URL."""
 
     SYNTHETIC_NAMES = ("SYNTHETIC_EXTRACT_01", "SYNTHETIC_REPLICAT_01")
 
@@ -1036,8 +1004,7 @@ class FollowProcessesTests(unittest.TestCase):
         with mock.patch.object(probe, "_fetch_json", side_effect=stub):
             probe.follow_processes(d, "process")
         detail_call_path = calls[1][1]
-        # exactly 5 segments: '', services, v2, mpoints, <encoded>, process --
-        # i.e. the encoded name is ONE segment, never introducing a new '/'.
+        # the encoded name must be ONE segment ('', services, v2, mpoints, <encoded>, process), never introducing a new '/'.
         segments = detail_call_path.split("/")
         self.assertEqual(len(segments), 6)
         self.assertNotIn("PROC/WITH/SLASHES", detail_call_path)
@@ -1410,14 +1377,12 @@ class FollowProcessesTests(unittest.TestCase):
 
 
 def ProbeRequestErrorFactory(category, http_status=None):
-    """Helper: builds the exception, for use as a detail_side_effect return
-    value that _stub_fetch raises."""
+    """Builds the exception for use as a detail_side_effect return value that _stub_fetch raises."""
     return probe.ProbeRequestError(category, http_status=http_status)
 
 
 class FollowProcessesCliTests(unittest.TestCase):
-    """CLI wiring for --follow-processes / --detail; the existing
-    explicit-path mode must remain fully unchanged."""
+    """CLI wiring for --follow-processes / --detail; the existing explicit-path mode must remain fully unchanged."""
 
     def _doc(self):
         return {"environment": "dev", "runtimeNamespace": "goldengate-dev",

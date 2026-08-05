@@ -18,26 +18,21 @@ aws:
 dynamodb:
   tableName: gg-eks-pipeline
 
-# envs/dev/goldengate-deployments.yaml, staged read-only under this
-# chart's files/ directory (never committed there -- see
-# .github/workflows/goldengate-monitor.yaml) and mounted into the pod here.
+# envs/dev/goldengate-deployments.yaml, staged read-only under this chart's files/ directory (never committed there) and mounted into the pod here.
 canonicalConfig:
   root: /etc/gg-canonical
 
 staleAfterSeconds: 120
 refreshSeconds: 30
 
-# Hard kill switch, independent of CONFIG.metricsEnabled. Publishing
-# requires BOTH to be true (see health_rules.py). Never true here.
+# Hard kill switch, independent of CONFIG.metricsEnabled; publishing requires BOTH to be true (see health_rules.py).
 cloudwatch:
   publishEnabled: false
 
 serviceAccount:
   create: true
   name: gg-monitor
-  # Required (see templates/serviceaccount.yaml `required` guard) whenever
-  # serviceAccount.create=true -- IRSA needs the role ARN to annotate the
-  # ServiceAccount with.
+  # Required whenever serviceAccount.create=true -- IRSA needs the role ARN to annotate the ServiceAccount with.
   roleArn: ""
 
 service:
@@ -46,10 +41,7 @@ service:
 
 ingress:
   enabled: false
-  # mode: shared  -> join an existing (resident) ALB group; emit only
-  #                   application/group-level annotations.
-  # mode: standalone -> this Ingress owns its own ALB; emit full ALB
-  #                      annotations (scheme, subnets, certificateArn, ...).
+  # mode: shared -> join an existing ALB group (app/group-level annotations only); standalone -> owns its own ALB (full annotations).
   mode: shared
   className: alb
   host: ""
@@ -58,8 +50,7 @@ ingress:
     groupName: ""
     groupOrder: ""
     targetType: ip
-    # The portal serves plain HTTP on :8080 -- do not set HTTPS here. The
-    # shared ALB terminates HTTPS externally and forwards HTTP to the pod.
+    # Portal serves plain HTTP on :8080; do not set HTTPS -- the shared ALB terminates HTTPS externally and forwards HTTP to the pod.
     backendProtocol: HTTP
     listenPorts: '[{"HTTPS":443}]'
     certificateArn: ""
@@ -67,8 +58,7 @@ ingress:
     healthcheckPort: traffic-port
     healthcheckPath: /healthz
     successCodes: "200"
-    # Standalone-mode-only fields (ALB-exclusive; never emitted in shared
-    # mode -- see templates/ingress.yaml).
+    # Standalone-mode-only fields (never emitted in shared mode).
     scheme: internal
     sslPolicy: ""
     sslRedirect: ""
@@ -100,10 +90,7 @@ securityContext:
     type: RuntimeDefault
 
 networkPolicy:
-  # Kept disabled by default: a restrictive egress policy must not be
-  # enabled by guessing VPC endpoint CIDRs, DNS requirements, or ALB traffic
-  # source behavior. The template exists so it can be turned on later once
-  # those are confirmed for this cluster.
+  # Kept disabled by default: egress CIDRs (VPC endpoint, DNS, ALB traffic) must be confirmed for this cluster before enabling.
   enabled: false
 
 nodeSelector: {}

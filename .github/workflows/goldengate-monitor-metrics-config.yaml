@@ -2,20 +2,7 @@ name: GoldenGate monitor metrics configuration
 
 run-name: "Cloud Factory - GoldenGate monitor metrics CONFIG update | ${{ inputs.deployment_name }} -> metricsEnabled=${{ inputs.desired_metrics_enabled }} (apply=${{ inputs.apply_change }}) | ran by ${{ github.actor }}"
 
-# Phase 6C1: the dedicated, controlled workflow for tuning a single
-# deployment's CONFIG.metricsEnabled value outside Terraform (Terraform
-# seeds CONFIG once with lifecycle.ignore_changes = [item] -- see
-# envs/dev/dynamodb.tf -- so it can never be used to update an existing
-# item). This workflow never builds/pushes an image, never packages/pushes
-# a Helm chart, never creates or updates the Argo CD Application, and never
-# creates/modifies any Kubernetes object -- it only reads the state of an
-# existing, already-Ready gg-monitor pod and, optionally, execs the
-# source-controlled helper (hack/goldengate-metrics-config.py) inside that
-# pod so the update runs under the monitor's own IRSA
-# (GoldenGateMonitorReadRole-dev), which already has the DynamoDB
-# GetItem/UpdateItem permissions this needs. The GitHub/EKS deployment role
-# used by this workflow's own AWS credentials is never broadened with any
-# DynamoDB permission.
+# Updates CONFIG.metricsEnabled for one deployment via the gg-monitor pod's own IRSA; never touches Terraform, images, Helm, Argo CD, or other Kubernetes objects.
 on:
   workflow_dispatch:
     inputs:
@@ -105,13 +92,7 @@ jobs:
       - name: Validate deployment_name against the canonical registry
         id: registry
         env:
-          # Phase 6C1 correction: user-controlled string inputs are never
-          # substituted directly into a run: script body -- ${{ }} expansion
-          # happens before bash ever sees the script, so a value containing
-          # quotes/backticks/$() could otherwise break out of the intended
-          # string and inject arbitrary shell syntax. Passing it through
-          # env: means bash only ever sees it as inert environment-variable
-          # data, never as script text.
+          # Passed via env: (not inlined into the script) to avoid shell injection from this user-controlled value.
           REQUESTED_NAME: ${{ inputs.deployment_name }}
         shell: bash
         run: |
@@ -127,9 +108,7 @@ jobs:
             exit 1
           fi
 
-          # Dynamic discovery only -- never a hardcoded choice list. Emits
-          # "name|type|enabled" triples for every deployment entry, then
-          # this step selects the one matching REQUESTED_NAME.
+          # Dynamic discovery (no hardcoded list): emits name|type|enabled triples, then selects the one matching REQUESTED_NAME.
           MATCH="$(awk -v want="$REQUESTED_NAME" '
             /^[[:space:]]*-[[:space:]]*name:/ {
               if (name != "") print name "|" type "|" enabled
@@ -241,14 +220,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Deployment/ReplicaSet ownership-chain filtering, matching the
-          # active-pod pattern established for the observability workflow:
-          # never a blind ".items[0]" and never trusting only a label
-          # selector -- the pod must be Running, Ready, non-terminating,
-          # use serviceAccountName=gg-monitor, AND be owned by a
-          # ReplicaSet that is itself owned by the current gg-monitor
-          # Deployment. Only the pod name is ever captured/printed; the
-          # full pod object is never printed.
+          # Selects a pod that is Running, Ready, non-terminating, uses serviceAccountName=gg-monitor, and is owned (via ReplicaSet) by the current Deployment -- never a blind ".items[0]" or label-only match.
           DEPLOY_JSON="$(kubectl get deployment gg-monitor -n "$TARGET_NAMESPACE" -o json)"
           DEPLOY_UID="$(jq -r '.metadata.uid' <<<"$DEPLOY_JSON")"
           SELECTOR="$(jq -r '(.spec.selector.matchLabels // {}) | to_entries | map("\(.key)=\(.value)") | join(",")' <<<"$DEPLOY_JSON")"
@@ -327,11 +299,7 @@ jobs:
           set -euo pipefail
 
           if [ "$APPLY" = "true" ]; then
-            # Phase 6C1 correction: captured immediately before the helper
-            # may perform its conditional UpdateItem (not after), and
-            # exposed via GITHUB_ENV so the post-update observation step's
-            # --since-time log window can never start after an error the
-            # helper itself already triggered.
+            # Captured before the helper's possible UpdateItem and exported via GITHUB_ENV so the post-update log window can't start after an error the helper triggered.
             VALIDATION_START_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "VALIDATION_START_TS=${VALIDATION_START_TS}" >> "$GITHUB_ENV"
             echo "Observation window will start at ${VALIDATION_START_TS} (captured before the helper runs)."
@@ -353,9 +321,7 @@ jobs:
             exit 1
           fi
 
-          # Phase 6C1 correction: require exactly one action= line, value
-          # constrained to the known set -- never silently default to an
-          # empty/unknown helper_action output.
+          # Require exactly one action= line, constrained to the known set -- never silently default to an empty/unknown value.
           ACTION_LINE_COUNT="$(grep -c '^action=' <<< "$HELPER_OUTPUT" || true)"
           if [ "$ACTION_LINE_COUNT" -ne 1 ]; then
             echo "FAIL: expected exactly one action= line in the helper output, found ${ACTION_LINE_COUNT}."
@@ -383,11 +349,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Phase 6C1 correction: VALIDATION_START_TS is NOT recomputed here
-          # -- it was captured in the helper-execution step immediately
-          # before the (possible) UpdateItem, and handed to this step via
-          # GITHUB_ENV, so the log window below can never start after an
-          # error the helper itself already triggered.
+          # VALIDATION_START_TS is not recomputed here -- it was captured in the helper-execution step (before the possible UpdateItem) and handed over via GITHUB_ENV.
           if [ -z "${VALIDATION_START_TS:-}" ]; then
             echo "FAIL: VALIDATION_START_TS was not captured before the helper ran -- refusing to observe with an unbounded/undefined log window."
             exit 1

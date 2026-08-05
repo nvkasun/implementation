@@ -85,8 +85,7 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            # Hard kill switch: publishing also requires CONFIG.metricsEnabled
-            # (see health_rules.py) -- either alone is not sufficient.
+            # Hard kill switch: publishing also requires CONFIG.metricsEnabled (see health_rules.py) -- either alone is not sufficient.
             - name: CLOUDWATCH_PUBLISH_ENABLED
               value: {{ .Values.cloudwatch.publishEnabled | quote }}
             - name: AWS_CONFIG_FILE
@@ -137,9 +136,7 @@ spec:
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
-        # read-only-root-filesystem compatibility: the app writes nothing
-        # persistent, but boto3/AWS SDK config/cache paths above point at
-        # /tmp, which must be writable.
+        # read-only-root-filesystem compatibility: boto3/AWS SDK config/cache paths above point at /tmp, which must be writable.
         - name: tmp
           emptyDir: {}
         - name: canonical-config

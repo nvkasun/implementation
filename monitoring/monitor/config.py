@@ -1,10 +1,4 @@
-"""config.py: canonical deployment/topology loader and process configuration.
-
-Single source of deployment data: envs/dev/goldengate-deployments.yaml (or
-its ConfigMap-mounted copy at REPO_CONFIG_ROOT in-cluster). Internal
-service host, TLS server name, and default ports are derived here, never
-stored in the source file.
-"""
+"""config.py: loads envs/dev/goldengate-deployments.yaml and derives runtime config."""
 from __future__ import annotations
 
 import os
@@ -94,9 +88,7 @@ def _tls_server_name(name, dns_domain):
 
 
 def credential_paths(name, mount_root="/mnt/secrets-store"):
-    """CSI-mounted credential file paths, derived only from the canonical
-    deployment name -- matches the SecretProviderClass alias convention in
-    the runtime Helm chart, so both sides agree without cross-referencing."""
+    """CSI-mounted credential file paths, derived from the canonical deployment name."""
     return f"{mount_root}/{name}-admin-user", f"{mount_root}/{name}-admin-password"
 
 
@@ -114,9 +106,7 @@ def load_deployments_document(repo_root=None):
 
 
 def load_deployments(repo_root=None):
-    """Returns {"environment", "runtimeNamespace", "monitoringNamespace",
-    "dnsDomain", "deployments": [...]}. Each deployment dict adds the
-    derived adminHost/adminPort/tlsServerName/metricsPort fields."""
+    """Returns the deployments document with derived adminHost/adminPort/tlsServerName/metricsPort fields added."""
     doc = load_deployments_document(repo_root)
     for key in ("environment", "runtimeNamespace", "monitoringNamespace", "dnsDomain", "deployments"):
         if key not in doc:
@@ -171,8 +161,7 @@ class StartupValidationError(Exception):
 
 
 def validate_enabled_deployments(deployments):
-    """Fails startup clearly for any enabled deployment missing what the
-    collector needs -- never silently polls with an empty admin secret."""
+    """Fails startup for any enabled deployment missing a supported type or adminSecret."""
     problems = []
     for d in deployments:
         if not d["enabled"]:
@@ -186,9 +175,7 @@ def validate_enabled_deployments(deployments):
 
 
 def build_logical_pipelines(deployments):
-    """Groups canonical deployments by pipeline -> {role: name}. A logical
-    pipeline is a relationship between deployments, never a runtime
-    identity in its own right."""
+    """Groups canonical deployments by pipeline -> {role: name}."""
     by_pipeline = {}
     for d in deployments:
         roles = by_pipeline.setdefault(d["pipeline"], {})
