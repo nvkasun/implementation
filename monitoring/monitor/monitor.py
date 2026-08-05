@@ -344,7 +344,8 @@ format_lag_threshold_mode = ui.format_lag_threshold_mode
 SECURITY_HEADERS = ui.SECURITY_HEADERS
 
 
-def _make_handler(config, table_factory, deployments, logical_pipelines, ready_state, expected_pipelines):
+def _make_handler(config, table_factory, deployments, logical_pipelines, ready_state, expected_pipelines,
+                  environment=None):
     class Handler(BaseHTTPRequestHandler):
         server_version = "gg-monitor"
 
@@ -437,7 +438,7 @@ def _make_handler(config, table_factory, deployments, logical_pipelines, ready_s
             payload, error_message = self._build_payload()
             if payload is None:
                 payload = {"generatedAt": int(time.time()), "logicalPipelines": []}
-            body = render_html(payload, config, error_message=error_message).encode("utf-8")
+            body = render_html(payload, config, error_message=error_message, environment=environment).encode("utf-8")
             self._write(200, "text/html; charset=utf-8", body)
 
         def log_message(self, fmt, *args):
@@ -446,8 +447,10 @@ def _make_handler(config, table_factory, deployments, logical_pipelines, ready_s
     return Handler
 
 
-def start_http_server(config, table_factory, deployments, logical_pipelines, ready_state, expected_pipelines):
-    handler_cls = _make_handler(config, table_factory, deployments, logical_pipelines, ready_state, expected_pipelines)
+def start_http_server(config, table_factory, deployments, logical_pipelines, ready_state, expected_pipelines,
+                      environment=None):
+    handler_cls = _make_handler(config, table_factory, deployments, logical_pipelines, ready_state,
+                                expected_pipelines, environment=environment)
     server = ThreadingHTTPServer(("0.0.0.0", config.port), handler_cls)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -486,7 +489,7 @@ def main():
 
     table_factory = create_dynamodb_table_factory(config)
     server = start_http_server(config, table_factory, deployments, logical_pipelines,
-                               ready_state, [d["name"] for d in enabled])
+                               ready_state, [d["name"] for d in enabled], environment=doc["environment"])
 
     def _handle_signal(signum, _frame):
         stop_event.set()

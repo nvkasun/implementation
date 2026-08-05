@@ -66,9 +66,13 @@ CSS_TEXT = """
     --gg-text: #e6edf3;
     --gg-text-muted: #9198a1;
     --gg-border: #30363d;
+    --gg-green: #56d364;
     --gg-green-bg: #12261c;
+    --gg-amber: #e3b341;
     --gg-amber-bg: #2b2111;
+    --gg-red: #ff7b72;
     --gg-red-bg: #2d1214;
+    --gg-gray: #b1bac4;
     --gg-gray-bg: #21262d;
     --gg-focus: #58a6ff;
     color-scheme: dark;
@@ -81,9 +85,13 @@ CSS_TEXT = """
   --gg-text: #e6edf3;
   --gg-text-muted: #9198a1;
   --gg-border: #30363d;
+  --gg-green: #56d364;
   --gg-green-bg: #12261c;
+  --gg-amber: #e3b341;
   --gg-amber-bg: #2b2111;
+  --gg-red: #ff7b72;
   --gg-red-bg: #2d1214;
+  --gg-gray: #b1bac4;
   --gg-gray-bg: #21262d;
   --gg-focus: #58a6ff;
   color-scheme: dark;

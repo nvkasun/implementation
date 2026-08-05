@@ -429,6 +429,60 @@ class RootPageErrorBannerTests(unittest.TestCase):
         self.assertNotIn("Traceback", body)
 
 
+class EnvironmentPropagationTests(unittest.TestCase):
+    """Proves the real server/root-page path threads doc["environment"] into render_html, not just direct calls."""
+
+    def _handler(self, environment):
+        table = mock.Mock()
+        handler_cls = monitor._make_handler(make_config(), lambda: table, DEPLOYMENTS, LOGICAL_PIPELINES, {}, [],
+                                            environment=environment)
+        handler = handler_cls.__new__(handler_cls)
+        handler.path = "/"
+        writes = []
+        handler._write = lambda status, ctype, body: writes.append((status, ctype, body))
+        return handler, writes
+
+    def test_root_page_renders_environment_passed_to_make_handler(self):
+        handler, writes = self._handler("vdr")
+        handler.do_GET()
+        body = writes[0][2].decode("utf-8")
+        self.assertIn('<span class="badge-env">VDR</span>', body)
+
+    def test_root_page_shows_environment_unknown_when_make_handler_gets_none(self):
+        handler, writes = self._handler(None)
+        handler.do_GET()
+        body = writes[0][2].decode("utf-8")
+        self.assertIn('<span class="badge-env">ENVIRONMENT UNKNOWN</span>', body)
+
+    def test_start_http_server_forwards_environment_into_make_handler(self):
+        with mock.patch.object(monitor, "ThreadingHTTPServer") as mock_server_cls, \
+             mock.patch.object(monitor, "_make_handler", wraps=monitor._make_handler) as spy_make_handler:
+            monitor.start_http_server(make_config(), lambda: mock.Mock(), DEPLOYMENTS, LOGICAL_PIPELINES, {}, [],
+                                      environment="prod")
+        _, kwargs = spy_make_handler.call_args
+        self.assertEqual(kwargs.get("environment"), "prod")
+        mock_server_cls.assert_called_once()
+
+    def test_start_http_server_defaults_environment_to_none(self):
+        with mock.patch.object(monitor, "ThreadingHTTPServer"), \
+             mock.patch.object(monitor, "_make_handler", wraps=monitor._make_handler) as spy_make_handler:
+            monitor.start_http_server(make_config(), lambda: mock.Mock(), DEPLOYMENTS, LOGICAL_PIPELINES, {}, [])
+        _, kwargs = spy_make_handler.call_args
+        self.assertIsNone(kwargs.get("environment"))
+
+    def test_hostile_environment_from_server_path_is_escaped(self):
+        malicious = '<script>alert(1)</script>'
+        handler, writes = self._handler(malicious)
+        handler.do_GET()
+        body = writes[0][2].decode("utf-8")
+        self.assertNotIn(malicious, body)
+        self.assertIn(html_module.escape(malicious.upper()), body)
+
+    def test_main_passes_doc_environment_to_start_http_server(self):
+        source = inspect.getsource(monitor.main)
+        self.assertIn('environment=doc["environment"]', source)
+
+
 class ClientFacingErrorSanitizationTests(unittest.TestCase):
     SIMULATED_ARN_LEAK = (
         "An error occurred (AccessDeniedException) when calling the GetItem operation: "
@@ -868,6 +922,62 @@ def _ui_payload(**overrides):
     runtime.update(overrides)
     return {"generatedAt": 1780000010, "logicalPipelines": [
         {"pipelineId": "payments-ora-to-pg-001", "runtimes": [runtime]}]}
+
+
+def _relative_luminance(hex_color):
+    hex_color = hex_color.lstrip("#")
+    channels = [int(hex_color[i:i + 2], 16) / 255.0 for i in (0, 2, 4)]
+    linear = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in channels]
+    return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+
+def _contrast_ratio(hex_a, hex_b):
+    la, lb = _relative_luminance(hex_a), _relative_luminance(hex_b)
+    lighter, darker = max(la, lb), min(la, lb)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def _extract_css_block(css_text, selector):
+    start = css_text.index(selector)
+    open_brace = css_text.index("{", start)
+    close_brace = css_text.index("}", open_brace)
+    return css_text[open_brace:close_brace]
+
+
+def _extract_token(block, name):
+    match = re.search(rf"--{re.escape(name)}:\s*(#[0-9a-fA-F]{{6}})", block)
+    return match.group(1)
+
+
+class DarkThemeContrastTests(unittest.TestCase):
+    """Standard-library-only WCAG contrast check for the dark-theme status foreground/background pairs."""
+
+    REQUIRED_PAIRS = (("gg-green", "gg-green-bg"), ("gg-amber", "gg-amber-bg"),
+                      ("gg-red", "gg-red-bg"), ("gg-gray", "gg-gray-bg"))
+
+    def test_dark_theme_status_pairs_meet_4_5_to_1_contrast(self):
+        block = _extract_css_block(ui.CSS_TEXT, ':root[data-theme="dark"]')
+        for fg_name, bg_name in self.REQUIRED_PAIRS:
+            with self.subTest(pair=f"{fg_name}/{bg_name}"):
+                fg = _extract_token(block, fg_name)
+                bg = _extract_token(block, bg_name)
+                ratio = _contrast_ratio(fg, bg)
+                self.assertGreaterEqual(ratio, 4.5, f"{fg_name} ({fg}) vs {bg_name} ({bg}) = {ratio:.2f}:1")
+
+    def test_system_preference_dark_block_matches_explicit_dark_block(self):
+        media_block = _extract_css_block(ui.CSS_TEXT, ":root:not([data-theme])")
+        explicit_block = _extract_css_block(ui.CSS_TEXT, ':root[data-theme="dark"]')
+        for fg_name, bg_name in self.REQUIRED_PAIRS:
+            with self.subTest(pair=f"{fg_name}/{bg_name}"):
+                self.assertEqual(_extract_token(media_block, fg_name), _extract_token(explicit_block, fg_name))
+                self.assertEqual(_extract_token(media_block, bg_name), _extract_token(explicit_block, bg_name))
+
+    def test_dark_foreground_tokens_differ_from_light_theme_values(self):
+        root_block = _extract_css_block(ui.CSS_TEXT, ":root {")
+        dark_block = _extract_css_block(ui.CSS_TEXT, ':root[data-theme="dark"]')
+        for fg_name, _bg_name in self.REQUIRED_PAIRS:
+            with self.subTest(token=fg_name):
+                self.assertNotEqual(_extract_token(root_block, fg_name), _extract_token(dark_block, fg_name))
 
 
 class UiRedesignPhase6C1Tests(unittest.TestCase):
