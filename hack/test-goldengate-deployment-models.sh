@@ -5302,6 +5302,136 @@ else
 fi
 find hack -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
 
+# 24. Phase 6C2: Terraform-managed GoldenGate CloudWatch fleet dashboard.
+echo ""
+echo "--- Phase 6C2: CloudWatch fleet dashboard ---"
+
+DASHBOARD_TF="envs/dev/cloudwatch_dashboard.tf"
+
+if [ -f "$DASHBOARD_TF" ]; then
+  pass "24: envs/dev/cloudwatch_dashboard.tf exists"
+else
+  fail "24: envs/dev/cloudwatch_dashboard.tf is missing"
+fi
+
+if grep -q 'dashboard_name = "gg-dev-fleet-overview"' "$DASHBOARD_TF" 2>/dev/null; then
+  pass "24: dashboard name is exactly gg-dev-fleet-overview"
+else
+  fail "24: dashboard name is missing or not exactly gg-dev-fleet-overview"
+fi
+
+if grep -q 'yamldecode(file("\${path.module}/goldengate-deployments.yaml"))' "$DASHBOARD_TF" 2>/dev/null; then
+  pass "24: dashboard source reads envs/dev/goldengate-deployments.yaml via yamldecode(file(...))"
+else
+  fail "24: dashboard source no longer reads the canonical registry via yamldecode(file(...))"
+fi
+
+if grep -q "gg-oracle-payments-01" "$DASHBOARD_TF" 2>/dev/null || grep -q "gg-postgresql-payments-01" "$DASHBOARD_TF" 2>/dev/null; then
+  fail "24: cloudwatch_dashboard.tf hardcodes a canonical deployment name"
+else
+  pass "24: cloudwatch_dashboard.tf does not hardcode gg-oracle-payments-01/gg-postgresql-payments-01"
+fi
+
+if grep -q 'try(d.enabled, null) == true' "$DASHBOARD_TF" 2>/dev/null; then
+  pass "24: disabled deployments are excluded by a literal Boolean enabled==true check"
+else
+  fail "24: dashboard eligibility no longer requires a literal Boolean enabled==true"
+fi
+
+if grep -q 'sort(keys(local.gg_dashboard_enabled_deployments))' "$DASHBOARD_TF" 2>/dev/null; then
+  pass "24: deployment ordering is deterministic (sort(keys(...)))"
+else
+  fail "24: deployment name ordering no longer uses sort()"
+fi
+
+if grep -q 'gg_dashboard_namespace *= "GoldenGate/Pipelines"' "$DASHBOARD_TF" 2>/dev/null; then
+  pass "24: dashboard namespace is exactly GoldenGate/Pipelines"
+else
+  fail "24: dashboard namespace is missing or not exactly GoldenGate/Pipelines"
+fi
+
+REQUIRED_METRIC_NAMES_LINE="$(grep 'gg_dashboard_deployment_metric_names = \[' "$DASHBOARD_TF" 2>/dev/null || true)"
+if echo "$REQUIRED_METRIC_NAMES_LINE" | grep -q '"DeploymentDown"' \
+    && echo "$REQUIRED_METRIC_NAMES_LINE" | grep -q '"HeartbeatAgeSeconds"' \
+    && echo "$REQUIRED_METRIC_NAMES_LINE" | grep -q '"LagBreached"' \
+    && echo "$REQUIRED_METRIC_NAMES_LINE" | grep -q '"AbendFailure"' \
+    && [ "$(echo "$REQUIRED_METRIC_NAMES_LINE" | grep -o '"[A-Za-z]*"' | wc -l)" -eq 4 ]; then
+  pass "24: required deployment metrics are present exactly (DeploymentDown, HeartbeatAgeSeconds, LagBreached, AbendFailure)"
+else
+  fail "24: dashboard deployment metric set is missing an expected metric or includes an unexpected one"
+fi
+
+if grep -q '"CriticalServiceDown"' "$DASHBOARD_TF" 2>/dev/null; then
+  pass "24: CriticalServiceDown metric is present"
+else
+  fail "24: CriticalServiceDown metric is missing"
+fi
+
+if grep -q 'gg_dashboard_critical_services = \["adminsrvr", "distsrvr", "recvsrvr"\]' "$DASHBOARD_TF" 2>/dev/null; then
+  pass "24: critical-service list is exactly adminsrvr/distsrvr/recvsrvr"
+else
+  fail "24: critical-service list is missing or does not exactly match adminsrvr/distsrvr/recvsrvr"
+fi
+
+if grep -q "aws_cloudwatch_log_group.goldengate_runtime.name" "$DASHBOARD_TF" 2>/dev/null \
+    && grep -q "aws_cloudwatch_log_group.goldengate_monitor.name" "$DASHBOARD_TF" 2>/dev/null; then
+  pass "24: dashboard references the existing Terraform log-group resources by attribute, never a duplicated literal"
+else
+  fail "24: dashboard no longer references the existing log-group resources by attribute"
+fi
+
+DASHBOARD_FORBIDDEN_FOUND="false"
+if grep -q "aws_cloudwatch_metric_alarm" "$DASHBOARD_TF" 2>/dev/null; then
+  fail "24: cloudwatch_dashboard.tf introduces an aws_cloudwatch_metric_alarm resource"
+  DASHBOARD_FORBIDDEN_FOUND="true"
+fi
+if grep -qi "aws_sns_topic\|aws_sns" "$DASHBOARD_TF" 2>/dev/null; then
+  fail "24: cloudwatch_dashboard.tf introduces an SNS resource"
+  DASHBOARD_FORBIDDEN_FOUND="true"
+fi
+if grep -qE 'cloudwatch:(GetMetricData|ListMetrics|DescribeAlarms|GetDashboard)' "$DASHBOARD_TF" 2>/dev/null || grep -q 'resource "aws_iam' "$DASHBOARD_TF" 2>/dev/null; then
+  fail "24: cloudwatch_dashboard.tf references a CloudWatch read IAM action or defines a new IAM resource"
+  DASHBOARD_FORBIDDEN_FOUND="true"
+fi
+if grep -qE '<<-?(EOT|EOF)' "$DASHBOARD_TF" 2>/dev/null; then
+  fail "24: cloudwatch_dashboard.tf uses a heredoc, expected native Terraform collections passed to jsonencode"
+  DASHBOARD_FORBIDDEN_FOUND="true"
+fi
+if [ "$DASHBOARD_FORBIDDEN_FOUND" = "false" ]; then
+  pass "24: no alarm, SNS, CloudWatch-read IAM action, new IAM resource, or heredoc-built JSON is present"
+fi
+
+if grep -q "Real Extract and Replicat processes are not configured yet" "$DASHBOARD_TF" 2>/dev/null \
+    && grep -q 'STATE#<process>' "$DASHBOARD_TF" 2>/dev/null; then
+  pass "24: dashboard includes honest process-visibility deferral text"
+else
+  fail "24: dashboard is missing the honest process-visibility deferral text"
+fi
+
+if grep -q "Terraform-managed PromQL charts" "$DASHBOARD_TF" 2>/dev/null \
+    && grep -q "console-generated query source" "$DASHBOARD_TF" 2>/dev/null; then
+  pass "24: dashboard includes honest Container Insights/PromQL deferral text"
+else
+  fail "24: dashboard is missing the honest Container Insights/PromQL deferral text"
+fi
+
+if grep -qi "FILL(" "$DASHBOARD_TF" 2>/dev/null || grep -q '"expression"' "$DASHBOARD_TF" 2>/dev/null; then
+  fail "24: cloudwatch_dashboard.tf converts missing data to a healthy zero via a metric expression"
+else
+  pass "24: no metric expression converts missing data to a healthy zero"
+fi
+
+if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  WORKLOAD_IAM_DIFF="$(git diff --stat --ignore-all-space -- envs/dev/iam.tf envs/dev/policies 2>/dev/null || true)"
+  if [ -z "$WORKLOAD_IAM_DIFF" ]; then
+    pass "24: no workload IAM policy file changed"
+  else
+    fail "24: a workload IAM policy file changed unexpectedly:"$'\n'"${WORKLOAD_IAM_DIFF}"
+  fi
+else
+  skip "24: workload IAM unchanged check -- not a git repository"
+fi
+
 if python3 hack/test-goldengate-metrics-config.py >/dev/null 2>&1; then
   pass "22: hack/test-goldengate-metrics-config.py (Phase 6C1 corrections functional suite) passes"
   find hack -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
