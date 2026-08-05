@@ -980,6 +980,39 @@ class DarkThemeContrastTests(unittest.TestCase):
                 self.assertNotEqual(_extract_token(root_block, fg_name), _extract_token(dark_block, fg_name))
 
 
+class EnvironmentBadgeContrastTests(unittest.TestCase):
+    """Brand red (badge background) is a separate token from theme-aware status red (foreground)."""
+
+    def test_badge_env_uses_brand_red_not_status_red(self):
+        badge_rule = _extract_css_block(ui.CSS_TEXT, ".badge-env {")
+        self.assertIn("var(--gg-brand-red)", badge_rule)
+        self.assertNotIn("var(--gg-red)", badge_rule)
+
+    def test_brand_red_token_is_defined_as_expected_hex(self):
+        root_block = _extract_css_block(ui.CSS_TEXT, ":root {")
+        self.assertEqual(_extract_token(root_block, "gg-brand-red"), "#c8102e")
+
+    def test_white_on_brand_red_meets_4_5_to_1_contrast(self):
+        root_block = _extract_css_block(ui.CSS_TEXT, ":root {")
+        brand_red = _extract_token(root_block, "gg-brand-red")
+        ratio = _contrast_ratio("#ffffff", brand_red)
+        self.assertGreaterEqual(ratio, 4.5, f"#ffffff vs {brand_red} = {ratio:.2f}:1")
+
+    def test_brand_red_is_never_overridden_in_dark_mode(self):
+        for selector in (":root:not([data-theme])", ':root[data-theme="dark"]'):
+            with self.subTest(selector=selector):
+                block = _extract_css_block(ui.CSS_TEXT, selector)
+                self.assertNotIn("--gg-brand-red:", block)
+
+    def test_dark_status_red_foreground_is_unchanged(self):
+        dark_block = _extract_css_block(ui.CSS_TEXT, ':root[data-theme="dark"]')
+        self.assertEqual(_extract_token(dark_block, "gg-red"), "#ff7b72")
+
+    def test_no_raw_brand_red_literal_in_badge_rule(self):
+        badge_rule = _extract_css_block(ui.CSS_TEXT, ".badge-env {")
+        self.assertNotIn("#c8102e", badge_rule)
+
+
 class UiRedesignPhase6C1Tests(unittest.TestCase):
     """Phase 6C1-UI: the redesigned ADCB-inspired portal (monitoring/monitor/ui.py)."""
 

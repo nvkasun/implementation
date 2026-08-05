@@ -42,6 +42,7 @@ CSS_TEXT = """
   --gg-navy-light: #16345f;
   --gg-blue: #0057b8;
   --gg-red: #c8102e;
+  --gg-brand-red: #c8102e;
   --gg-teal: #1b998b;
   --gg-green: #1a7f37;
   --gg-green-bg: #dafbe1;
@@ -131,7 +132,7 @@ a { color: var(--gg-blue); }
   display: inline-block;
   padding: 2px 10px;
   border-radius: 999px;
-  background: var(--gg-red);
+  background: var(--gg-brand-red);
   color: #ffffff;
   font-size: 0.72rem;
   font-weight: 700;
