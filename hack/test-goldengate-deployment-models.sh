@@ -5243,6 +5243,65 @@ else
   fail "22: goldengate-monitor.yaml's CloudWatch preflight no longer verifies pod ownership"
 fi
 
+# 23. Phase 6C1-UI correction: comment-style checker YAML block-scalar awareness, wired in as the single implementation of the rule.
+echo ""
+echo "--- Phase 6C1-UI correction: comment-style checker ---"
+
+COMMENT_CHECKER_FIXTURE_STATUS="$(python3 -c "
+import importlib.util, os, tempfile
+
+spec = importlib.util.spec_from_file_location('check_comment_style', os.path.join(os.getcwd(), 'hack', 'check-comment-style.py'))
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+def check_text(text, suffix='.yaml'):
+    fd, path = tempfile.mkstemp(suffix=suffix)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            f.write(text)
+        return mod.check_file(path)
+    finally:
+        os.remove(path)
+
+failures = []
+
+v = check_text('key: |\n  # this looks like a comment but is data\n  # so is this\n  real: content\n')
+if v:
+    failures.append(f'A (block-scalar comment ignored): expected 0 violations, got {v!r}')
+
+v = check_text('# real comment line one\n# real comment line two\nkey: value\n')
+if len(v) != 1:
+    failures.append(f'B (real 2-line yaml comment): expected exactly 1 violation, got {v!r}')
+
+v = check_text('key: |\n  # inside block, data\n  still inside\nouter:\n  # real comment 1\n  # real comment 2\n  value: 1\n')
+if len(v) != 1:
+    failures.append(f'C (block scalar ends by dedent): expected exactly 1 violation, got {v!r}')
+elif v[0][1] != 5:
+    failures.append(f'C (block scalar ends by dedent): expected the violation anchored at line 5, got {v!r}')
+
+v = check_text('# real comment line one\n# real comment line two\necho hi\n', suffix='.sh')
+if len(v) != 1:
+    failures.append(f'D (shell unaffected): expected exactly 1 violation, got {v!r}')
+
+v = check_text('# real comment line one\n# real comment line two\nx = 1\n', suffix='.py')
+if len(v) != 1:
+    failures.append(f'D (python unaffected): expected exactly 1 violation, got {v!r}')
+
+print('FAIL:' + '; '.join(failures) if failures else 'OK')
+" 2>&1)"
+if [ "$COMMENT_CHECKER_FIXTURE_STATUS" = "OK" ]; then
+  pass "23: comment-style checker correctly distinguishes YAML block-scalar data from real source comments"
+else
+  fail "23: comment-style checker fixture tests failed: ${COMMENT_CHECKER_FIXTURE_STATUS}"
+fi
+
+if python3 hack/check-comment-style.py; then
+  pass "23: hack/check-comment-style.py reports zero real violations across the approved executable-source scope"
+else
+  fail "23: hack/check-comment-style.py reported one or more comment-style violations (see output above)"
+fi
+find hack -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+
 if python3 hack/test-goldengate-metrics-config.py >/dev/null 2>&1; then
   pass "22: hack/test-goldengate-metrics-config.py (Phase 6C1 corrections functional suite) passes"
   find hack -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true

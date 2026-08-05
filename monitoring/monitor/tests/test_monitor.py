@@ -947,7 +947,7 @@ class UiRedesignPhase6C1Tests(unittest.TestCase):
         self.assertEqual(summary["reachableServices"], 1)
         self.assertEqual(summary["totalServices"], 2)
         self.assertEqual(summary["totalProcesses"], 1)
-        self.assertFalse(summary["overallHealthy"])
+        self.assertEqual(summary["overallState"], ui.OVERALL_ATTENTION)
 
     def test_summary_calculation_makes_no_new_calls_pure_function_of_payload(self):
         payload = _ui_payload()
@@ -966,15 +966,56 @@ class UiRedesignPhase6C1Tests(unittest.TestCase):
             with self.subTest(status=status):
                 summary = ui._compute_summary(_ui_payload(effectiveStatus=status))
                 self.assertEqual(summary["attentionDeployments"], 1)
-                self.assertFalse(summary["overallHealthy"])
+                self.assertEqual(summary["overallState"], ui.OVERALL_ATTENTION)
 
     def test_starting_status_does_not_by_itself_block_healthy(self):
         summary = ui._compute_summary(_ui_payload(effectiveStatus="STARTING"))
         self.assertEqual(summary["attentionDeployments"], 0)
 
     def test_all_up_produces_healthy_overall_banner(self):
-        rendered = monitor.render_html(_ui_payload(), make_config())
+        payload = _ui_payload(criticalServices={"adminsrvr": True, "distsrvr": True})
+        rendered = monitor.render_html(payload, make_config())
         self.assertIn('class="overall-banner ok"', rendered)
+        self.assertEqual(ui._compute_summary(payload)["overallState"], ui.OVERALL_HEALTHY)
+
+    def test_overall_state_healthy_requires_deployment_services_and_processes(self):
+        payload = _ui_payload(criticalServices={"adminsrvr": True, "distsrvr": True})
+        self.assertEqual(ui._compute_summary(payload)["overallState"], ui.OVERALL_HEALTHY)
+
+    def test_overall_state_limited_visibility_when_no_process_rows(self):
+        payload = _ui_payload(criticalServices={"adminsrvr": True, "distsrvr": True}, processes=[])
+        self.assertEqual(ui._compute_summary(payload)["overallState"], ui.OVERALL_LIMITED_VISIBILITY)
+        rendered = monitor.render_html(payload, make_config())
+        self.assertIn('class="overall-banner limited"', rendered)
+        self.assertIn("Process visibility unavailable", rendered)
+        self.assertNotIn("Overall: Healthy", rendered)
+
+    def test_overall_state_attention_on_service_down(self):
+        payload = _ui_payload(criticalServices={"adminsrvr": True, "distsrvr": False})
+        self.assertEqual(ui._compute_summary(payload)["overallState"], ui.OVERALL_ATTENTION)
+
+    def test_overall_state_attention_on_process_abended(self):
+        payload = _ui_payload(criticalServices={"adminsrvr": True, "distsrvr": True})
+        payload["logicalPipelines"][0]["runtimes"][0]["processes"][0]["status"] = "ABENDED"
+        self.assertEqual(ui._compute_summary(payload)["overallState"], ui.OVERALL_ATTENTION)
+
+    def test_overall_state_attention_on_deployment_stale_down_missing_unknown(self):
+        for status in ("STALE", "DOWN", "MISSING", "UNKNOWN"):
+            with self.subTest(status=status):
+                payload = _ui_payload(criticalServices={"adminsrvr": True, "distsrvr": True}, effectiveStatus=status)
+                self.assertEqual(ui._compute_summary(payload)["overallState"], ui.OVERALL_ATTENTION)
+
+    def test_overall_state_empty_deployment_set_never_healthy(self):
+        payload = {"generatedAt": 1, "logicalPipelines": []}
+        self.assertEqual(ui._compute_summary(payload)["overallState"], ui.OVERALL_ATTENTION)
+        rendered = monitor.render_html(payload, make_config())
+        self.assertNotIn("Overall: Healthy", rendered)
+
+    def test_limited_visibility_never_claims_process_health(self):
+        payload = _ui_payload(criticalServices={"adminsrvr": True, "distsrvr": True}, processes=[])
+        rendered = monitor.render_html(payload, make_config())
+        for forbidden in ("processes healthy", "replication healthy", "Extract healthy", "Replicat healthy"):
+            self.assertNotIn(forbidden, rendered)
 
     def test_service_reachable_and_down_chip_text_remains_visible(self):
         rendered = monitor.render_html(_ui_payload(), make_config())
@@ -1023,6 +1064,45 @@ class UiRedesignPhase6C1Tests(unittest.TestCase):
         self.assertIn("Metrics enabled", rendered)
         self.assertIn(">true<", rendered)
         self.assertIn(">false<", rendered)
+
+    def test_environment_badge_is_not_hardcoded_to_dev(self):
+        source = inspect.getsource(ui)
+        self.assertNotIn('<span class="badge-env">DEV</span>', source)
+
+    def test_environment_badge_renders_supplied_dev_value(self):
+        rendered = monitor.render_html(_ui_payload(), make_config(), environment="dev")
+        self.assertIn('<span class="badge-env">DEV</span>', rendered)
+
+    def test_environment_badge_renders_supplied_vdr_value(self):
+        rendered = monitor.render_html(_ui_payload(), make_config(), environment="vdr")
+        self.assertIn('<span class="badge-env">VDR</span>', rendered)
+
+    def test_environment_badge_renders_supplied_prod_value(self):
+        rendered = monitor.render_html(_ui_payload(), make_config(), environment="prod")
+        self.assertIn('<span class="badge-env">PROD</span>', rendered)
+
+    def test_environment_badge_reads_from_payload_when_no_kwarg_given(self):
+        payload = _ui_payload()
+        payload["environment"] = "vdr"
+        rendered = monitor.render_html(payload, make_config())
+        self.assertIn('<span class="badge-env">VDR</span>', rendered)
+
+    def test_environment_badge_reads_from_config_when_present(self):
+        config = make_config()
+        config.environment = "prod"
+        rendered = monitor.render_html(_ui_payload(), config)
+        self.assertIn('<span class="badge-env">PROD</span>', rendered)
+
+    def test_environment_badge_escapes_hostile_text(self):
+        malicious = '<script>alert(1)</script>'
+        rendered = monitor.render_html(_ui_payload(), make_config(), environment=malicious)
+        self.assertNotIn(malicious, rendered)
+        self.assertIn(html_module.escape(malicious.upper()), rendered)
+
+    def test_environment_badge_missing_value_is_handled_honestly(self):
+        rendered = monitor.render_html(_ui_payload(), make_config())
+        self.assertIn('<span class="badge-env">ENVIRONMENT UNKNOWN</span>', rendered)
+        self.assertNotIn('<span class="badge-env">DEV</span>', rendered)
 
     def test_lease_state_and_holder_remain_displayed(self):
         rendered = monitor.render_html(_ui_payload(), make_config())
@@ -1808,6 +1888,24 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         with open(os.path.join(REPO_ROOT, "monitoring", "monitor", "Dockerfile")) as f:
             dockerfile_text = f.read()
         self.assertNotIn("requirements-test.txt", dockerfile_text)
+
+    def test_ui_module_is_copied_into_the_docker_image(self):
+        with open(os.path.join(REPO_ROOT, "monitoring", "monitor", "Dockerfile")) as f:
+            dockerfile_text = f.read()
+        copy_lines = [line for line in dockerfile_text.splitlines() if line.startswith("COPY ")]
+        self.assertTrue(any("ui.py" in line for line in copy_lines))
+
+    def test_ui_module_is_included_in_the_workflow_image_content_hash(self):
+        hash_input_idx = self.monitor_text.index("MONITOR_IMAGE_INPUT_PATHS=(")
+        ls_tree_idx = self.monitor_text.index("MONITOR_LS_TREE=")
+        hash_input_block = self.monitor_text[hash_input_idx:ls_tree_idx]
+        self.assertIn('"${MONITOR_SOURCE_PATH}/ui.py"', hash_input_block)
+
+    def test_ui_module_is_mentioned_in_the_hash_reporting_message(self):
+        report_idx = self.monitor_text.index("Monitor runtime-input hash (")
+        report_line_end = self.monitor_text.index("\n", report_idx)
+        report_line = self.monitor_text[report_idx:report_line_end]
+        self.assertIn("ui.py", report_line)
 
     def test_dockerfile_has_no_public_base_image_default(self):
         with open(os.path.join(REPO_ROOT, "monitoring", "monitor", "Dockerfile")) as f:

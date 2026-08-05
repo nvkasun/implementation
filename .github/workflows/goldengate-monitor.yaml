@@ -209,7 +209,7 @@ jobs:
             exit 1
           fi
 
-          echo "Monitor runtime-input hash (Dockerfile/.dockerignore/requirements.txt/monitor.py/collector.py/config.py/health_rules.py/tools/base-image-digest): ${MONITOR_TREE_SHA}"
+          echo "Monitor runtime-input hash (Dockerfile/.dockerignore/requirements.txt/monitor.py/collector.py/config.py/health_rules.py/ui.py/tools/base-image-digest): ${MONITOR_TREE_SHA}"
           echo "Monitor image tag: ${MONITOR_IMAGE_TAG}"
           echo "Monitor ECR repository (short name, for AWS CLI): ${MONITOR_ECR_REPOSITORY}"
           echo "Monitor image repository (full URI): ${MONITOR_IMAGE_REPOSITORY}"

@@ -5,6 +5,10 @@ import html
 
 ATTENTION_STATUSES = ("DOWN", "STALE", "MISSING", "UNKNOWN")
 
+OVERALL_HEALTHY = "HEALTHY"
+OVERALL_ATTENTION = "ATTENTION"
+OVERALL_LIMITED_VISIBILITY = "LIMITED_VISIBILITY"
+
 _ESCAPED_DASH = html.escape("-")
 
 
@@ -173,6 +177,7 @@ main { max-width: 1400px; margin: 0 auto; padding: 20px; }
 }
 .overall-banner.ok { background: var(--gg-green-bg); color: var(--gg-green); }
 .overall-banner.attention { background: var(--gg-red-bg); color: var(--gg-red); }
+.overall-banner.limited { background: var(--gg-amber-bg); color: var(--gg-amber); }
 .refresh-info { font-size: 0.78rem; color: rgba(255, 255, 255, 0.85); }
 .alert-banner {
   background: var(--gg-red-bg);
@@ -443,6 +448,16 @@ def _render_deployment_card(r):
         "</article>")
 
 
+def _compute_overall_state(total_deployments, attention_deployments, services_down, abended_processes, any_processes):
+    if total_deployments == 0:
+        return OVERALL_ATTENTION
+    if attention_deployments > 0 or services_down > 0 or abended_processes > 0:
+        return OVERALL_ATTENTION
+    if not any_processes:
+        return OVERALL_LIMITED_VISIBILITY
+    return OVERALL_HEALTHY
+
+
 def _compute_summary(payload):
     total_deployments = 0
     up_deployments = 0
@@ -470,16 +485,21 @@ def _compute_summary(payload):
             total_processes += len(processes)
             abended_processes += sum(1 for p in processes if p.get("status") == "ABENDED")
 
+    services_down = total_services - reachable_services
+    overall_state = _compute_overall_state(
+        total_deployments, attention_deployments, services_down, abended_processes, any_processes)
+
     return {
         "totalDeployments": total_deployments,
         "upDeployments": up_deployments,
         "attentionDeployments": attention_deployments,
         "reachableServices": reachable_services,
         "totalServices": total_services,
+        "servicesDown": services_down,
         "totalProcesses": total_processes,
         "abendProcesses": abended_processes,
         "anyProcesses": any_processes,
-        "overallHealthy": attention_deployments == 0 and total_deployments > 0,
+        "overallState": overall_state,
     }
 
 
@@ -503,18 +523,29 @@ def _render_summary(summary):
     return f'<div class="summary-grid">{cards_html}</div>'
 
 
-def _render_header(summary, config, generated_at_text):
-    if summary["overallHealthy"]:
+def _resolve_environment_badge_text(config, payload, environment):
+    value = environment or (payload or {}).get("environment") or getattr(config, "environment", None)
+    if not value:
+        return "ENVIRONMENT UNKNOWN"
+    return html.escape(str(value).upper())
+
+
+def _render_header(summary, config, payload, generated_at_text, environment):
+    state = summary["overallState"]
+    if state == OVERALL_HEALTHY:
         banner = '<span class="overall-banner ok">Overall: Healthy</span>'
+    elif state == OVERALL_LIMITED_VISIBILITY:
+        banner = '<span class="overall-banner limited">Runtime services healthy &middot; Process visibility unavailable</span>'
     else:
         banner = '<span class="overall-banner attention">Overall: Needs attention</span>'
 
+    env_badge_text = _resolve_environment_badge_text(config, payload, environment)
     refresh_seconds = int(config.refresh_seconds)
     return f"""<header class="site-header">
 <div class="header-row">
 <div class="brand">
 <h1>GoldenGate Monitoring</h1>
-<span class="badge-env">DEV</span>
+<span class="badge-env">{env_badge_text}</span>
 <span class="subtitle">Oracle GoldenGate on EKS</span>
 </div>
 {banner}
@@ -527,7 +558,7 @@ def _render_header(summary, config, generated_at_text):
 </header>"""
 
 
-def render_html(payload, config, error_message=None):
+def render_html(payload, config, error_message=None, environment=None):
     summary = _compute_summary(payload)
     generated_at_raw = payload.get("generatedAt", "-")
     generated_at_text = str(generated_at_raw)
@@ -554,7 +585,7 @@ def render_html(payload, config, error_message=None):
     stale_after = html.escape(str(config.stale_after_seconds))
     version = html.escape(str(config.monitor_version))
     refresh_seconds = int(config.refresh_seconds)
-    header_html = _render_header(summary, config, generated_at_text)
+    header_html = _render_header(summary, config, payload, generated_at_text, environment)
 
     return f"""<!doctype html>
 <html lang="en">

@@ -42,6 +42,61 @@ def _is_directive(stripped_line):
     return any(p.match(stripped_line) for p in DIRECTIVE_PATTERNS)
 
 
+YAML_BLOCK_SCALAR_EXTENSIONS = (".yaml", ".yml", ".tpl")
+
+# A line ending in a YAML block-scalar indicator: optional "- " marker, optional "key:", then |/> with an optional chomp/indent modifier.
+BLOCK_SCALAR_START_RE = re.compile(r"^([ \t]*)(?:-[ \t]*)?(?:[\w.\-]+:)?[ \t]*[|>][+\-]?[0-9]*[ \t]*$")
+
+# A line that is entirely a Helm/Go-template action; "-" trim markers make its own indentation unreliable, so never treat it as a block-scalar dedent.
+GO_TEMPLATE_ONLY_RE = re.compile(r"^[ \t]*\{\{-?.*-?\}\}[ \t]*$")
+
+
+def compute_block_scalar_mask(lines):
+    """Per-line bool: True when the line is DATA inside a YAML block scalar, never a source comment."""
+    mask = [False] * len(lines)
+    i = 0
+    n = len(lines)
+    while i < n:
+        stripped_end = lines[i].rstrip()
+        match = BLOCK_SCALAR_START_RE.match(stripped_end)
+        if not match:
+            i += 1
+            continue
+        start_indent = len(match.group(1))
+
+        content_indent = None
+        j = i + 1
+        while j < n:
+            candidate = lines[j]
+            if candidate.strip() == "" or GO_TEMPLATE_ONLY_RE.match(candidate):
+                j += 1
+                continue
+            candidate_indent = len(candidate) - len(candidate.lstrip(" \t"))
+            if candidate_indent <= start_indent:
+                break
+            content_indent = candidate_indent
+            break
+
+        if content_indent is None:
+            i += 1
+            continue
+
+        k = i + 1
+        while k < n:
+            line_k = lines[k]
+            if line_k.strip() == "" or GO_TEMPLATE_ONLY_RE.match(line_k):
+                mask[k] = True
+                k += 1
+                continue
+            indent_k = len(line_k) - len(line_k.lstrip(" \t"))
+            if indent_k < content_indent:
+                break
+            mask[k] = True
+            k += 1
+        i = k
+    return mask
+
+
 def find_source_files():
     files = []
     for rel_root, extensions in INCLUDED_ROOTS.items():
@@ -71,9 +126,20 @@ def find_source_files():
 
 
 def check_line_comment_blocks(path, lines):
+    block_scalar_mask = (
+        compute_block_scalar_mask(lines)
+        if os.path.splitext(path)[1] in YAML_BLOCK_SCALAR_EXTENSIONS
+        else [False] * len(lines)
+    )
+
     violations = []
     run = []
     for idx, raw_line in enumerate(lines, start=1):
+        if block_scalar_mask[idx - 1]:
+            if run and len(run) > 1:
+                violations.append((path, run[0], f"consecutive standalone comment block ({len(run)} lines)"))
+            run = []
+            continue
         stripped = raw_line.strip()
         if stripped.startswith("#") and not _is_directive(stripped):
             run.append(idx)
