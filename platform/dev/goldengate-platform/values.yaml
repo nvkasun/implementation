@@ -1,12 +1,3 @@
-# Shared GoldenGate platform bootstrap -- dev environment values.
-#
-# Deliberately NOT under envs/dev/<folder>: the GoldenGate runtime workflow
-# scans envs/dev/* folders as runtime deployment candidates, and this is not
-# a runtime -- it is the single owner of the shared namespaces and the
-# shared engine-level runtime ServiceAccounts (gg-oracle-sa, gg-postgresql-sa)
-# that the runtime candidates in envs/dev/gg-*-payments-01 reference by name
-# only. roleArn values below are intentionally empty; the workflow injects
-# or resolves the Terraform-created IRSA role ARNs at deploy time.
 environment: dev
 
 namespaces:
@@ -24,9 +15,6 @@ serviceAccounts:
     name: gg-postgresql-sa
     roleArn: ""
 
-# Phase 6A: centralized container logging (platform DaemonSet). roleArn and
-# aws.region are intentionally empty here too -- injected the same way as
-# the ServiceAccount roleArns above, at deploy time.
 fluentBit:
   create: true
   serviceAccount:
