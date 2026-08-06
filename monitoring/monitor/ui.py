@@ -522,13 +522,14 @@ def _render_deployment_card(r):
 
 
 def _compute_overall_state(total_deployments, attention_deployments, services_down, abended_processes,
-                           stale_processes, discovery_issues, active_processes):
+                           stale_processes, discovery_issues, all_deployments_current_ok):
+    """HEALTHY requires EVERY deployment individually current -- one healthy runtime never hides another's gap."""
     if total_deployments == 0:
         return OVERALL_ATTENTION
     if (attention_deployments > 0 or services_down > 0 or abended_processes > 0
             or stale_processes > 0 or discovery_issues > 0):
         return OVERALL_ATTENTION
-    if active_processes == 0:
+    if not all_deployments_current_ok:
         return OVERALL_LIMITED_VISIBILITY
     return OVERALL_HEALTHY
 
@@ -545,6 +546,7 @@ def _compute_summary(payload):
     active_processes = 0
     discovery_issues = 0
     any_processes = False
+    all_deployments_current_ok = True
 
     for lp in payload.get("logicalPipelines", []):
         for r in lp.get("runtimes", []):
@@ -563,15 +565,18 @@ def _compute_summary(payload):
             total_processes += len(processes)
             abended_processes += sum(1 for p in processes if p.get("status") == "ABENDED")
             stale_processes += sum(1 for p in processes if p.get("stale"))
-            active_processes += sum(1 for p in processes if not p.get("stale"))
+            own_active_processes = sum(1 for p in processes if not p.get("stale"))
+            active_processes += own_active_processes
             discovery_status = (r.get("processDiscovery") or {}).get("status")
             if discovery_status in _DISCOVERY_ATTENTION_STATUSES:
                 discovery_issues += 1
+            if not (discovery_status == "OK" and own_active_processes > 0):
+                all_deployments_current_ok = False
 
     services_down = total_services - reachable_services
     overall_state = _compute_overall_state(
         total_deployments, attention_deployments, services_down, abended_processes,
-        stale_processes, discovery_issues, active_processes)
+        stale_processes, discovery_issues, all_deployments_current_ok)
 
     return {
         "totalDeployments": total_deployments,

@@ -736,6 +736,9 @@ class CriticalServiceNormalizationTests(unittest.TestCase):
         self.assertEqual(monitor.normalize_critical_services({"adminsrvr": True}), {"adminsrvr": False})
 
 
+DISCOVERY_STATUSES_UNDER_TEST = ("OK", "EMPTY", "PARTIAL", "UNAVAILABLE", "INVALID_RESPONSE", "MADE_UP")
+
+
 class NormalizeProcessDiscoveryTests(unittest.TestCase):
     """normalize_process_discovery: strict, additive, fail-closed normalization of STATE#_deployment.processDiscovery."""
 
@@ -757,8 +760,17 @@ class NormalizeProcessDiscoveryTests(unittest.TestCase):
             with self.subTest(bad=bad):
                 self.assertIsNone(monitor.normalize_process_discovery(bad))
 
-    def test_unknown_status_fails_closed_to_none(self):
-        self.assertIsNone(monitor.normalize_process_discovery(self._valid(status="MADE_UP")))
+    def test_unknown_status_fails_closed_to_invalid_response_not_none(self):
+        out = monitor.normalize_process_discovery(self._valid(status="MADE_UP"))
+        self.assertIsNotNone(out)
+        self.assertEqual(out["status"], "INVALID_RESPONSE")
+        self.assertEqual(out["extractCount"], 1)
+
+    def test_missing_status_fails_closed_to_invalid_response(self):
+        d = self._valid()
+        del d["status"]
+        out = monitor.normalize_process_discovery(d)
+        self.assertEqual(out["status"], "INVALID_RESPONSE")
 
     def test_every_fixed_status_accepted(self):
         for status in ("OK", "EMPTY", "PARTIAL", "UNAVAILABLE", "INVALID_RESPONSE"):
@@ -801,6 +813,66 @@ class NormalizeProcessDiscoveryTests(unittest.TestCase):
         d["processes"] = [{"process": "SUPER_SECRET_NAME"}]
         out = monitor.normalize_process_discovery(d)
         self.assertNotIn("processes", out)
+
+    def test_float_nan_and_infinity_counts_never_raise_and_become_zero(self):
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(bad=bad):
+                out = monitor.normalize_process_discovery(self._valid(extractCount=bad))
+                self.assertEqual(out["extractCount"], 0)
+
+    def test_decimal_nan_and_infinity_counts_never_raise_and_become_zero(self):
+        from decimal import Decimal
+        for bad in (Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity")):
+            with self.subTest(bad=bad):
+                out = monitor.normalize_process_discovery(self._valid(detailFailureCount=bad))
+                self.assertEqual(out["detailFailureCount"], 0)
+
+    def test_object_with_failing_int_conversion_never_raises(self):
+        class Unconvertible:
+            def __int__(self):
+                raise ValueError("cannot convert")
+
+        out = monitor.normalize_process_discovery(self._valid(totalCount=Unconvertible()))
+        self.assertEqual(out["totalCount"], 0)
+
+    def test_string_and_list_counts_never_raise_and_become_zero(self):
+        for bad in ("5", "not-a-number", [1, 2], {"a": 1}, object()):
+            with self.subTest(bad=bad):
+                out = monitor.normalize_process_discovery(self._valid(replicatCount=bad))
+                self.assertEqual(out["replicatCount"], 0)
+
+    def test_float_nan_and_infinity_collected_at_becomes_none(self):
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(bad=bad):
+                out = monitor.normalize_process_discovery(self._valid(collectedAt=bad))
+                self.assertIsNone(out["collectedAt"])
+
+    def test_decimal_nan_and_infinity_collected_at_becomes_none(self):
+        from decimal import Decimal
+        for bad in (Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity")):
+            with self.subTest(bad=bad):
+                out = monitor.normalize_process_discovery(self._valid(collectedAt=bad))
+                self.assertIsNone(out["collectedAt"])
+
+    def test_string_and_boolean_collected_at_becomes_none(self):
+        for bad in ("not-a-timestamp", True, [1, 2], object()):
+            with self.subTest(bad=bad):
+                out = monitor.normalize_process_discovery(self._valid(collectedAt=bad))
+                self.assertIsNone(out["collectedAt"])
+
+    def test_no_malformed_input_ever_raises(self):
+        malformed_values = (float("nan"), float("inf"), float("-inf"), True, False, "garbage",
+                            [1, 2], {"nested": "dict"}, object(), None)
+        for status in DISCOVERY_STATUSES_UNDER_TEST:
+            for field in ("extractCount", "replicatCount", "distpathCount", "totalCount",
+                         "detailFailureCount", "collectedAt", "extractsStatus", "replicatsStatus",
+                         "sourcesStatus"):
+                for bad in malformed_values:
+                    with self.subTest(status=status, field=field, bad=bad):
+                        try:
+                            monitor.normalize_process_discovery(self._valid(status=status, **{field: bad}))
+                        except Exception as exc:  # pragma: no cover -- the assertion below always fires first
+                            self.fail(f"normalize_process_discovery raised {exc!r} for {field}={bad!r}")
 
 
 class PortalHtmlManagerParityTests(unittest.TestCase):
@@ -1213,14 +1285,21 @@ class UiRedesignPhase6C1Tests(unittest.TestCase):
         self.assertEqual(summary["attentionDeployments"], 0)
 
     def test_all_up_produces_healthy_overall_banner(self):
-        payload = _ui_payload(criticalServices={"adminsrvr": True, "distsrvr": True})
+        payload = _ui_payload(criticalServices={"adminsrvr": True, "distsrvr": True},
+                              processDiscovery={"status": "OK"})
         rendered = monitor.render_html(payload, make_config())
         self.assertIn('class="overall-banner ok"', rendered)
         self.assertEqual(ui._compute_summary(payload)["overallState"], ui.OVERALL_HEALTHY)
 
     def test_overall_state_healthy_requires_deployment_services_and_processes(self):
-        payload = _ui_payload(criticalServices={"adminsrvr": True, "distsrvr": True})
+        payload = _ui_payload(criticalServices={"adminsrvr": True, "distsrvr": True},
+                              processDiscovery={"status": "OK"})
         self.assertEqual(ui._compute_summary(payload)["overallState"], ui.OVERALL_HEALTHY)
+
+    def test_missing_discovery_with_active_process_remains_limited_visibility(self):
+        # Task 4 correction: an active process row alone must never imply discovery is OK.
+        payload = _ui_payload(criticalServices={"adminsrvr": True, "distsrvr": True})
+        self.assertEqual(ui._compute_summary(payload)["overallState"], ui.OVERALL_LIMITED_VISIBILITY)
 
     def test_overall_state_limited_visibility_when_no_process_rows(self):
         payload = _ui_payload(criticalServices={"adminsrvr": True, "distsrvr": True}, processes=[])
@@ -1370,6 +1449,34 @@ class OverallStateDiscoveryAndStaleTests(unittest.TestCase):
         summary = ui._compute_summary(payload)
         self.assertEqual(summary["discoveryIssues"], 1)
         self.assertEqual(summary["staleProcesses"], 1)
+
+    def test_empty_discovery_with_an_active_legacy_row_remains_limited_visibility(self):
+        # A stale-schema STATE row predating discovery reporting must never upgrade an EMPTY discovery to healthy.
+        payload = _ui_payload(criticalServices={"adminsrvr": True, "distsrvr": True},
+                              processDiscovery={"status": "EMPTY"})
+        self.assertEqual(ui._compute_summary(payload)["overallState"], ui.OVERALL_LIMITED_VISIBILITY)
+
+    def test_ok_discovery_with_zero_process_rows_remains_limited_visibility(self):
+        payload = _ui_payload(criticalServices={"adminsrvr": True, "distsrvr": True}, processes=[],
+                              processDiscovery={"status": "OK"})
+        self.assertEqual(ui._compute_summary(payload)["overallState"], ui.OVERALL_LIMITED_VISIBILITY)
+
+    def test_one_ok_runtime_and_one_empty_runtime_remains_limited_visibility(self):
+        payload = _ui_payload(criticalServices={"adminsrvr": True, "distsrvr": True},
+                              processDiscovery={"status": "OK"})
+        second = dict(payload["logicalPipelines"][0]["runtimes"][0])
+        second.update(deploymentName="gg-postgresql-payments-01", role="target", processes=[],
+                     processDiscovery={"status": "EMPTY"})
+        payload["logicalPipelines"][0]["runtimes"].append(second)
+        self.assertEqual(ui._compute_summary(payload)["overallState"], ui.OVERALL_LIMITED_VISIBILITY)
+
+    def test_every_runtime_ok_with_current_non_abended_rows_is_healthy(self):
+        payload = _ui_payload(criticalServices={"adminsrvr": True, "distsrvr": True},
+                              processDiscovery={"status": "OK"})
+        second = dict(payload["logicalPipelines"][0]["runtimes"][0])
+        second.update(deploymentName="gg-postgresql-payments-01", role="target")
+        payload["logicalPipelines"][0]["runtimes"].append(second)
+        self.assertEqual(ui._compute_summary(payload)["overallState"], ui.OVERALL_HEALTHY)
 
     def test_error_banner_remains_sanitized_and_has_role_alert(self):
         rendered = monitor.render_html(_ui_payload(), make_config(),

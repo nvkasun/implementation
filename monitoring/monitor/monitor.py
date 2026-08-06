@@ -1,6 +1,7 @@
 """monitor.py: runs the passive collector and the read-only monitoring portal in one process."""
 import json
 import logging
+import math
 import os
 import signal
 import sys
@@ -128,11 +129,16 @@ def decimal_to_jsonsafe(value):
 
 
 def _parse_epoch(raw):
-    if raw is None:
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, Decimal) and not raw.is_finite():
         return None
     try:
-        return int(decimal_to_jsonsafe(raw))
-    except (TypeError, ValueError):
+        value = decimal_to_jsonsafe(raw)
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -231,22 +237,31 @@ INCOMPLETE_DISCOVERY_STATUSES = ("PARTIAL", "UNAVAILABLE", "INVALID_RESPONSE")
 
 
 def _non_negative_int(raw):
-    value = decimal_to_jsonsafe(raw) if isinstance(raw, Decimal) else raw
-    if isinstance(value, bool):
+    """Never raises: NaN/Infinity (float or Decimal), Booleans, strings, negatives, and failed conversions all become 0."""
+    if isinstance(raw, bool):
         return 0
-    if not isinstance(value, (int, float)):
+    if isinstance(raw, Decimal):
+        if not raw.is_finite():
+            return 0
+        raw = int(raw)
+    if not isinstance(raw, (int, float)):
         return 0
-    value = int(value)
+    if isinstance(raw, float) and not math.isfinite(raw):
+        return 0
+    try:
+        value = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        return 0
     return value if value >= 0 else 0
 
 
 def normalize_process_discovery(raw):
-    """Strict, additive-only normalization of STATE#_deployment.processDiscovery; unknown/malformed fields fail closed."""
+    """Strict, additive-only normalization of STATE#_deployment.processDiscovery; malformed fields fail closed, never raises."""
     if not isinstance(raw, dict):
         return None
     status = str(raw.get("status") or "")
     if status not in DISCOVERY_STATUSES:
-        return None
+        status = "INVALID_RESPONSE"
     collected_at = _parse_epoch(raw.get("collectedAt"))
 
     def _endpoint_status(value):

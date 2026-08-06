@@ -460,6 +460,16 @@ def log_discovery_summary(pipeline, discovery):
         }))
 
 
+def _unavailable_discovery_snapshot():
+    """Sanitized processDiscovery snapshot for a tick where Admin REST itself was unreachable."""
+    return {
+        "status": "UNAVAILABLE", "collectedAt": cfgmod.now_epoch(),
+        "extractsStatus": "UNAVAILABLE", "replicatsStatus": "UNAVAILABLE", "sourcesStatus": "UNAVAILABLE",
+        "extractCount": 0, "replicatCount": 0, "distpathCount": 0, "totalCount": 0,
+        "detailFailureCount": 0,
+    }
+
+
 _SVC_PROBE_PATH = {"adminsrvr": "extracts", "distsrvr": "sources", "recvsrvr": "targets"}
 
 
@@ -1092,13 +1102,20 @@ def polling_loop(deployment, table, mgr, state, stop_event):
                     flags["down"] = 1
                 transitioned = (status != last_dep_status)
                 dep_snap = {"processType": "deployment", "status": status, "recordedAt": cfgmod.now_epoch()}
-                # PMS isn't attempted here; always overwrite any stale pms map with a current UNAVAILABLE snapshot.
+                # PMS isn't attempted here; always overwrite any stale pms/processDiscovery map with a current UNAVAILABLE snapshot.
                 dep_snap["pms"] = _pms_unavailable_snapshot("ENDPOINT_UNAVAILABLE")
+                dep_snap["processDiscovery"] = _unavailable_discovery_snapshot()
                 if transitioned:
                     dep_snap["lastTransitionAt"] = cfgmod.now_epoch()
                 _guarded_write("_deployment", dep_snap)
                 last_dep_status = status
-                logger.warning("GoldenGate Admin REST unreachable for %s (%s): %s", pipeline, status, e)
+                logger.warning(json.dumps({
+                    "event": "admin_rest_unreachable",
+                    "deployment": pipeline,
+                    "status": status,
+                    "discoveryStatus": "UNAVAILABLE",
+                    "exceptionType": type(e).__name__,
+                }))
                 # Write succeeded so heartbeat fires, but discovery never ran this tick -- never a healthy 0.
                 metric_data = build_metric_batch(pipeline, deployment_type, flags, heartbeat_ok=True,
                                                  process_inventory_complete=False)

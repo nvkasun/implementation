@@ -1389,6 +1389,114 @@ class ProcessDiscoveryPersistenceTests(unittest.TestCase):
         table.scan.assert_not_called()
 
 
+class AdminRestLivenessFailureTests(unittest.TestCase):
+    """Admin REST /services/v2/deployments liveness failure: STATE#_deployment.processDiscovery must become UNAVAILABLE, and the failure log must be fully sanitized."""
+
+    DEPLOYMENT = {
+        "name": "gg-oracle-payments-01",
+        "type": "oracle",
+        "adminHost": "gg-oracle-payments-01.goldengate-dev.svc.cluster.local",
+        "adminPort": 8443,
+        "tlsServerName": "gg-oracle-payments-01.goldengate-dev.adcbmis.local",
+        "pipeline": "payments-ora-to-pg-001",
+    }
+
+    def _run_tick(self, exc):
+        stop_event = threading.Event()
+
+        def fake_get_item(Key):
+            if Key.get("recordType") == "CONFIG":
+                stop_event.set()
+                return {"Item": {"deploymentType": "oracle", "checkIntervalSeconds": 0,
+                                 "alertsEnabled": False, "metricsEnabled": False,
+                                 "startupGraceSeconds": 0}}
+            return {"Item": {}}
+
+        table = MagicMock()
+        table.get_item.side_effect = fake_get_item
+
+        mgr = MagicMock()
+        mgr.renew.return_value = True
+
+        state = core.LeaseState()
+        state.set_leader(True)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            user_file = os.path.join(tmp, "user")
+            pwd_file = os.path.join(tmp, "pwd")
+            with open(user_file, "w") as f:
+                f.write("synthetic-user")
+            with open(pwd_file, "w") as f:
+                f.write("synthetic-pass")
+
+            with mock.patch.object(core.cfgmod, "credential_paths", return_value=(user_file, pwd_file)), \
+                 mock.patch.object(core, "discover_processes", side_effect=exc), \
+                 mock.patch.object(core, "_basic_opener", return_value=MagicMock()), \
+                 mock.patch.object(core, "_build_ssl_context", return_value=MagicMock()):
+                with self.assertLogs(core.logger, level="WARNING") as log_ctx:
+                    core.polling_loop(self.DEPLOYMENT, table, mgr, state, stop_event)
+
+        return table, log_ctx
+
+    def _deployment_write(self, table):
+        writes = [c for c in table.update_item.call_args_list
+                 if c.kwargs["Key"].get("recordType") == "STATE#_deployment"]
+        self.assertEqual(len(writes), 1)
+        return writes[0].kwargs
+
+    def test_process_discovery_becomes_unavailable_on_liveness_failure(self):
+        table, _log_ctx = self._run_tick(RuntimeError("admin rest down"))
+        write = self._deployment_write(table)
+        pd = write["ExpressionAttributeValues"][":pd"]
+        self.assertEqual(pd, {
+            "status": "UNAVAILABLE", "collectedAt": pd["collectedAt"],
+            "extractsStatus": "UNAVAILABLE", "replicatsStatus": "UNAVAILABLE", "sourcesStatus": "UNAVAILABLE",
+            "extractCount": 0, "replicatCount": 0, "distpathCount": 0, "totalCount": 0,
+            "detailFailureCount": 0,
+        })
+        self.assertIsInstance(pd["collectedAt"], int)
+
+    def test_no_process_row_written_on_liveness_failure(self):
+        table, _log_ctx = self._run_tick(RuntimeError("admin rest down"))
+        process_writes = [c for c in table.update_item.call_args_list
+                          if c.kwargs["Key"].get("recordType") not in ("STATE#_deployment",)]
+        self.assertEqual(process_writes, [])
+
+    def test_failure_log_contains_only_the_documented_safe_fields(self):
+        _table, log_ctx = self._run_tick(RuntimeError("admin rest down"))
+        matches = [r for r in log_ctx.records if "admin_rest_unreachable" in r.getMessage()]
+        self.assertEqual(len(matches), 1)
+        record = json.loads(matches[0].getMessage())
+        self.assertEqual(record["event"], "admin_rest_unreachable")
+        self.assertEqual(record["deployment"], "gg-oracle-payments-01")
+        self.assertEqual(record["discoveryStatus"], "UNAVAILABLE")
+        self.assertEqual(record["exceptionType"], "RuntimeError")
+        self.assertEqual(set(record.keys()), {"event", "deployment", "status", "discoveryStatus", "exceptionType"})
+
+    def test_failure_log_and_persisted_state_never_contain_exception_text(self):
+        secret_message = ("SECRET-MARKER-zzz connection to gg-oracle-payments-01.goldengate-dev.svc.cluster.local "
+                          "failed at https://gg-oracle-payments-01.goldengate-dev.svc.cluster.local:8443/services/v2/deployments "
+                          "<html><body>Internal Server Error</body></html>")
+        table, log_ctx = self._run_tick(RuntimeError(secret_message))
+        combined_log = "\n".join(log_ctx.output)
+        write = self._deployment_write(table)
+        persisted = json.dumps(write["ExpressionAttributeValues"], default=str)
+        for forbidden in ("SECRET-MARKER-zzz", "goldengate-dev.svc.cluster.local", "https://",
+                         "<html>", "Internal Server Error"):
+            self.assertNotIn(forbidden, combined_log)
+            self.assertNotIn(forbidden, persisted)
+
+    def test_deployment_down_status_and_flags_preserved(self):
+        table, _log_ctx = self._run_tick(RuntimeError("admin rest down"))
+        write = self._deployment_write(table)
+        self.assertEqual(write["ExpressionAttributeValues"][":st"], "DEPLOYMENT_DOWN")
+
+    def test_pms_endpoint_unavailable_snapshot_preserved(self):
+        table, _log_ctx = self._run_tick(RuntimeError("admin rest down"))
+        write = self._deployment_write(table)
+        self.assertEqual(write["ExpressionAttributeValues"][":pms"]["status"], "ENDPOINT_UNAVAILABLE")
+
+
 class CriticalServiceResolutionTests(unittest.TestCase):
     """health_rules.resolve_critical_services: manager-compatible default (adminsrvr/distsrvr/recvsrvr) with a bounded, fail-safe CONFIG.criticalServices override; pure-function layer only, see CriticalServiceCoverageTests for the end-to-end proof."""
 

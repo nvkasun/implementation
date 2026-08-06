@@ -38,6 +38,102 @@ pass() { echo "PASS: $1"; PASS_COUNT=$((PASS_COUNT + 1)); }
 fail() { echo "FAIL: $1"; FAIL_COUNT=$((FAIL_COUNT + 1)); }
 skip() { echo "SKIP: $1"; SKIP_COUNT=$((SKIP_COUNT + 1)); }
 
+# Stable, commit-independent invariant checks (used at two checkpoints below); replaces the former HEAD-relative whole-AST diff, which broke whenever collector.py legitimately changed.
+collector_safety_contract_check() {
+  local label="$1"
+  local collector_module_count
+  collector_module_count="$(grep -l '^def polling_loop' monitoring/monitor/*.py 2>/dev/null | wc -l || true)"
+  if [ "$collector_module_count" -eq 1 ]; then
+    pass "${label}: exactly one shared collector module defines polling_loop"
+  else
+    fail "${label}: expected exactly one module defining polling_loop, found ${collector_module_count}"
+  fi
+
+  if grep -qiE 'sidecar|utility-sidecar|observer[_-]?sidecar' monitoring/monitor/collector.py monitoring/monitor/monitor.py 2>/dev/null; then
+    fail "${label}: sidecar/observer-sidecar terminology found in collector.py or monitor.py"
+  else
+    pass "${label}: no observer/manager sidecar logic exists in collector.py or monitor.py"
+  fi
+
+  if grep -qE '\.put_item\(|\.update_item\(.*"CONFIG"' monitoring/monitor/collector.py 2>/dev/null; then
+    fail "${label}: collector.py appears to write CONFIG"
+  else
+    pass "${label}: CONFIG is never written by the collector (only read via read_config/GetItem)"
+  fi
+
+  if grep -qE '\.scan\(' monitoring/monitor/collector.py monitoring/monitor/monitor.py 2>/dev/null; then
+    fail "${label}: a DynamoDB Scan call exists"
+  else
+    pass "${label}: no DynamoDB Scan call exists in collector.py or monitor.py"
+  fi
+
+  if grep -q 'delete_item' monitoring/monitor/collector.py 2>/dev/null; then
+    fail "${label}: a DeleteItem call exists in collector.py"
+  else
+    pass "${label}: no DeleteItem call exists in collector.py"
+  fi
+
+  if grep -q '"CONFIG"' monitoring/monitor/collector.py 2>/dev/null \
+      && grep -q '"LEASE"' monitoring/monitor/collector.py 2>/dev/null \
+      && grep -q 'STATE#' monitoring/monitor/collector.py 2>/dev/null; then
+    pass "${label}: canonical CONFIG/LEASE/STATE# record-type keys remain"
+  else
+    fail "${label}: a canonical CONFIG/LEASE/STATE# record-type key is missing"
+  fi
+
+  local LEASE_KEY_COUNT
+  LEASE_KEY_COUNT="$(grep -c '"recordType": "LEASE"' monitoring/monitor/collector.py 2>/dev/null || true)"
+  if [ "${LEASE_KEY_COUNT:-0}" -eq 1 ]; then
+    pass "${label}: LEASE remains writer-coordination-only (exactly one recordType=LEASE key site)"
+  else
+    fail "${label}: LEASE recordType key site count changed unexpectedly (${LEASE_KEY_COUNT:-0}), expected exactly 1"
+  fi
+
+  if grep -qiE 'kubernetes|kubectl|client\.CoreV1Api|V1Pod|\.delete_namespaced|\.restart\(' \
+      monitoring/monitor/collector.py monitoring/monitor/monitor.py 2>/dev/null; then
+    fail "${label}: a Kubernetes healing/restart action reference exists in collector.py or monitor.py"
+  else
+    pass "${label}: no Kubernetes healing/restart/start/stop action exists in collector.py or monitor.py"
+  fi
+
+  if grep -q 'CLOUDWATCH_NAMESPACE = "GoldenGate/Pipelines"' monitoring/monitor/collector.py 2>/dev/null; then
+    pass "${label}: GoldenGate/Pipelines CloudWatch namespace remains"
+  else
+    fail "${label}: GoldenGate/Pipelines CloudWatch namespace constant is missing or changed"
+  fi
+
+  local expected_metrics="AbendEvent AbendFailure AbendState CriticalServiceDown DeploymentDown HeartbeatAgeSeconds LagBreached ExtractLagSeconds ReplicatLagSeconds"
+  local actual_metrics unexpected="false" name
+  actual_metrics="$(grep -oE '"MetricName": "[A-Za-z]+"' monitoring/monitor/collector.py | sed -E 's/"MetricName": "([A-Za-z]+)"/\1/' | sort -u || true)"
+  for name in $actual_metrics; do
+    case " $expected_metrics " in
+      *" $name "*) ;;
+      *) unexpected="true" ;;
+    esac
+  done
+  if [ "$unexpected" = "false" ]; then
+    pass "${label}: the approved CloudWatch metric-name allowlist remains exact"
+  else
+    fail "${label}: an unexpected CloudWatch metric name exists outside the approved allowlist"
+  fi
+
+  if grep -qE 'cloudwatch:(GetMetricData|ListMetrics|DescribeAlarms|GetDashboard)|get_metric_data|list_metrics|describe_alarms' \
+      monitoring/monitor/collector.py monitoring/monitor/monitor.py 2>/dev/null; then
+    fail "${label}: a CloudWatch-read action reference exists in the runtime application code"
+  else
+    pass "${label}: no runtime IAM/CloudWatch-read coupling exists in collector.py or monitor.py"
+  fi
+
+  if (cd "$MONITOR_APP_DIR" && python3 -m unittest \
+      tests.test_collector.PublishMetricBatchTests.test_batches_of_at_most_20 \
+      tests.test_collector.CriticalServiceCoverageTests.test_no_kubernetes_healing_restart_or_fencing_action_introduced \
+      >/dev/null 2>&1); then
+    pass "${label}: focused unit tests confirm CloudWatch batching stays at most 20 and no healing action exists"
+  else
+    fail "${label}: focused batching/no-healing-action unit tests failed"
+  fi
+}
+
 HELM_AVAILABLE="false"
 command -v helm >/dev/null 2>&1 && HELM_AVAILABLE="true"
 
@@ -3785,33 +3881,8 @@ else
   skip "terraform fmt -check -- terraform not available"
 fi
 
-# 12. No manager metric/DynamoDB/lease behavior changed: collector.py's AST is unchanged (comment/docstring-only edits, e.g. Phase 6C1-UI source hygiene, are allowed and ignored here).
-COLLECTOR_AST_STATUS="$(python3 -c "
-import ast, subprocess, sys
-
-def normalize(source):
-    tree = ast.parse(source)
-    for node in [tree] + list(ast.walk(tree)):
-        body = getattr(node, 'body', None)
-        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and body:
-            first = body[0]
-            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
-                first.value.value = ''
-    return ast.dump(tree, annotate_fields=False)
-
-try:
-    head = subprocess.run(['git', 'show', 'HEAD:monitoring/monitor/collector.py'], capture_output=True, text=True, check=True).stdout
-    with open('monitoring/monitor/collector.py') as f:
-        working = f.read()
-    print('IDENTICAL' if normalize(head) == normalize(working) else 'DIFFERENT')
-except Exception as exc:
-    print(f'ERROR:{exc}')
-" 2>/dev/null || true)"
-if [ "$COLLECTOR_AST_STATUS" = "IDENTICAL" ]; then
-  pass "12: collector.py's functional AST is unchanged -- no manager metric/DynamoDB/lease behavior was altered"
-else
-  fail "12: collector.py's functional AST was unexpectedly modified during an IAM-only phase (status: ${COLLECTOR_AST_STATUS:-unknown})"
-fi
+# 12. Stable, commit-independent collector safety-contract checks (see collector_safety_contract_check above).
+collector_safety_contract_check "12"
 
 echo ""
 echo "--- Phase 5A: stale ServiceManager.pid and Argo CD deletion safeguards preserved ---"
@@ -4994,35 +5065,10 @@ else
   fail "16: unexpected new documentation file(s)/directory found:"$'\n'"${NEW_DOC_FILES}"
 fi
 
-# 17/18: collector.py and IAM remain unchanged. monitor.py's presentation layer may change separately under an explicitly authorized UI-only phase -- health_rules.py/collector.py stay the single source of truth for runtime collection/health behavior.
+# 17/18: stable collector safety-contract re-check (second checkpoint) plus IAM remains unchanged.
+collector_safety_contract_check "17"
+
 if command -v git >/dev/null 2>&1 && git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  COLLECTOR_AST_STATUS_17="$(python3 -c "
-import ast, subprocess
-
-def normalize(source):
-    tree = ast.parse(source)
-    for node in [tree] + list(ast.walk(tree)):
-        body = getattr(node, 'body', None)
-        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and body:
-            first = body[0]
-            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
-                first.value.value = ''
-    return ast.dump(tree, annotate_fields=False)
-
-try:
-    head = subprocess.run(['git', '-C', '$REPO_ROOT', 'show', 'HEAD:monitoring/monitor/collector.py'], capture_output=True, text=True, check=True).stdout
-    with open('$REPO_ROOT/monitoring/monitor/collector.py') as f:
-        working = f.read()
-    print('IDENTICAL' if normalize(head) == normalize(working) else 'DIFFERENT')
-except Exception as exc:
-    print(f'ERROR:{exc}')
-" 2>/dev/null || true)"
-  if [ "$COLLECTOR_AST_STATUS_17" = "IDENTICAL" ]; then
-    pass "17: collector.py's functional AST is unchanged"
-  else
-    fail "17: collector.py's functional AST was unexpectedly modified (status: ${COLLECTOR_AST_STATUS_17:-unknown})"
-  fi
-
   # 18: IAM is unchanged except the specific, already-reviewed additions from prior phases: new role modules (never a change to an existing role), scoped policy-statement additions, and one condition-operator change (StringEquals -> StringEqualsIfExists) on GoldenGateCloudWatchMetricsRole-dev's namespace condition. GoldenGateSecretsReadRole-dev/GoldenGateMonitorReadRole-dev must never be touched. New files under a brand-new policy folder are untracked, not a "diff" of an existing file, so they never appear here. --name-only doesn't fully honor --ignore-all-space in this git version (still lists line-ending-only diffs), so --stat is used and parsed for real changed paths instead.
   EXPECTED_MODIFIED_IAM_FILES="envs/dev/policies/goldengate-eks-deploy-dev/policies/policies_1.json
 envs/dev/iam.tf
@@ -5514,10 +5560,191 @@ else
   pass "25: no synthetic process fallback exists"
 fi
 
+REGISTRY_EXTRACTION_FIXTURE_RESULT="$(python3 - "$MONITOR_WORKFLOW" <<'PYEOF'
+import subprocess
+import sys
+import tempfile
+import os
+
+import yaml
+
+
+class Loader(yaml.SafeLoader):
+    pass
+
+
+Loader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, lambda l, n: l.construct_mapping(n))
+
+with open(sys.argv[1]) as f:
+    doc = yaml.load(f, Loader=Loader)
+
+run_text = None
+for job in doc["jobs"].values():
+    for step in job.get("steps", []):
+        run = step.get("run") or ""
+        if "ENABLED_DEPLOYMENT_PAIRS_DISCOVERY" in run:
+            run_text = run
+            break
+    if run_text is not None:
+        break
+
+if run_text is None:
+    print("FAIL: could not locate the ENABLED_DEPLOYMENT_PAIRS_DISCOVERY extraction step in the workflow")
+    sys.exit(1)
+
+start_marker = "< <(awk '\n"
+end_marker = "\n' envs/dev/goldengate-deployments.yaml)"
+start = run_text.index(start_marker) + len(start_marker)
+end = run_text.index(end_marker, start)
+awk_script = run_text[start:end]
+
+if "\\s" in awk_script:
+    print("FAIL: extracted extraction logic still contains a non-portable \\s AWK pattern")
+    sys.exit(1)
+
+awk_file = tempfile.NamedTemporaryFile(mode="w", suffix=".awk", delete=False)
+awk_file.write(awk_script)
+awk_file.close()
+
+
+def run_awk(registry_path):
+    result = subprocess.run(["awk", "-f", awk_file.name, registry_path], capture_output=True, text=True, check=True)
+    return sorted(line.split("|", 1)[0] for line in result.stdout.splitlines() if line.strip())
+
+
+real_names = run_awk("envs/dev/goldengate-deployments.yaml")
+if real_names != ["gg-oracle-payments-01", "gg-postgresql-payments-01"]:
+    print(f"FAIL: real-registry extraction returned {real_names!r}, expected both canonical DEV deployments")
+    sys.exit(1)
+
+fixture_yaml = (
+    "environment: dev\n"
+    "runtimeNamespace: goldengate-dev\n"
+    "deployments:\n"
+    "  - name: gg-fixture-enabled\n"
+    "    type: oracle\n"
+    "    enabled: true\n"
+    "  - name: gg-fixture-disabled\n"
+    "    type: oracle\n"
+    "    enabled: false\n"
+)
+fixture_file = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False)
+fixture_file.write(fixture_yaml)
+fixture_file.close()
+
+fixture_names = run_awk(fixture_file.name)
+os.unlink(awk_file.name)
+os.unlink(fixture_file.name)
+
+if fixture_names != ["gg-fixture-enabled"]:
+    print(f"FAIL: fixture-registry extraction returned {fixture_names!r}, expected only the enabled deployment")
+    sys.exit(1)
+
+print("OK")
+PYEOF
+)"
+if [ "$REGISTRY_EXTRACTION_FIXTURE_RESULT" = "OK" ]; then
+  pass "25: post-rollout registry extraction is portable AWK and returns the exact expected names against both the real DEV registry and a temporary enabled/disabled fixture"
+else
+  fail "25: registry-extraction fixture failed:"$'\n'"${REGISTRY_EXTRACTION_FIXTURE_RESULT}"
+fi
+
 if grep -q 'status not in ("OK", "EMPTY")' "$MONITOR_WORKFLOW" 2>/dev/null; then
   pass "25: post-rollout workflow validates OK/EMPTY and rejects incomplete discovery"
 else
   fail "25: post-rollout workflow no longer validates OK/EMPTY discovery status"
+fi
+
+DISCOVERY_CONSISTENCY_FIXTURE_RESULT="$(python3 - "$MONITOR_WORKFLOW" <<'PYEOF'
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+import yaml
+
+
+class Loader(yaml.SafeLoader):
+    pass
+
+
+Loader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, lambda l, n: l.construct_mapping(n))
+
+with open(sys.argv[1]) as f:
+    doc = yaml.load(f, Loader=Loader)
+
+run_text = None
+for job in doc["jobs"].values():
+    for step in job.get("steps", []):
+        run = step.get("run") or ""
+        if "PROCESS_DISCOVERY_CHECK" in run and "<<'PYEOF'" in run:
+            run_text = run
+            break
+    if run_text is not None:
+        break
+
+if run_text is None:
+    print("FAIL: could not locate the PROCESS_DISCOVERY_CHECK validation step")
+    sys.exit(1)
+
+start_marker = "<<'PYEOF'\n"
+end_marker = "\nPYEOF"
+start = run_text.index(start_marker) + len(start_marker)
+end = run_text.index(end_marker, start)
+script_body = run_text[start:end]
+
+script_file = tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False)
+script_file.write(script_body)
+script_file.close()
+
+base = {"deploymentName": "gg-x", "alertsEnabled": False, "processes": []}
+
+
+def run_case(discovery):
+    names_file = tempfile.NamedTemporaryFile(mode="w", delete=False)
+    names_file.write("gg-x")
+    names_file.close()
+    status_file = tempfile.NamedTemporaryFile(mode="w", delete=False)
+    json.dump({"logicalPipelines": [{"runtimes": [{**base, "processDiscovery": discovery}]}]}, status_file)
+    status_file.close()
+    env = dict(os.environ, ENABLED_NAMES_FILE=names_file.name, API_STATUS_FILE=status_file.name)
+    proc = subprocess.run([sys.executable, script_file.name], capture_output=True, text=True, env=env)
+    os.unlink(names_file.name)
+    os.unlink(status_file.name)
+    return proc.returncode
+
+
+cases = [
+    ("OK, extract=1", {"status": "OK", "extractCount": 1, "replicatCount": 0, "distpathCount": 0,
+                       "totalCount": 1, "detailFailureCount": 0, "extractsStatus": "OK", "replicatsStatus": "EMPTY"}, 0),
+    ("EMPTY, distpath=3 (independent)", {"status": "EMPTY", "extractCount": 0, "replicatCount": 0, "distpathCount": 3,
+                                         "totalCount": 0, "detailFailureCount": 0, "extractsStatus": "EMPTY", "replicatsStatus": "EMPTY"}, 0),
+    ("OK, extract=0 replicat=0", {"status": "OK", "extractCount": 0, "replicatCount": 0, "distpathCount": 0,
+                                  "totalCount": 0, "detailFailureCount": 0, "extractsStatus": "OK", "replicatsStatus": "OK"}, 1),
+    ("EMPTY, extract=1", {"status": "EMPTY", "extractCount": 1, "replicatCount": 0, "distpathCount": 0,
+                          "totalCount": 1, "detailFailureCount": 0, "extractsStatus": "EMPTY", "replicatsStatus": "EMPTY"}, 1),
+    ("OK, boolean extractCount", {"status": "OK", "extractCount": True, "replicatCount": 0, "distpathCount": 0,
+                                  "totalCount": 1, "detailFailureCount": 0, "extractsStatus": "OK", "replicatsStatus": "OK"}, 1),
+    ("OK, detailFailureCount=1", {"status": "OK", "extractCount": 1, "replicatCount": 0, "distpathCount": 0,
+                                  "totalCount": 1, "detailFailureCount": 1, "extractsStatus": "OK", "replicatsStatus": "OK"}, 1),
+]
+
+failed = False
+for label, discovery, expected_code in cases:
+    actual_code = run_case(discovery)
+    if actual_code != expected_code:
+        print(f"FAIL: case {label!r} expected exit {expected_code}, got {actual_code}")
+        failed = True
+
+os.unlink(script_file.name)
+print("FAIL" if failed else "OK")
+PYEOF
+)"
+if [ "$DISCOVERY_CONSISTENCY_FIXTURE_RESULT" = "OK" ]; then
+  pass "25: post-rollout discovery-consistency validation enforces OK/EMPTY count rules, rejects Boolean counts, and treats distribution count independently"
+else
+  fail "25: discovery-consistency fixture failed:"$'\n'"${DISCOVERY_CONSISTENCY_FIXTURE_RESULT}"
 fi
 
 if grep -qE 'totalCount.*>\s*0|len\(.*processes.*\)\s*>\s*0|require.*non-?zero.*process' "$MONITOR_WORKFLOW" 2>/dev/null; then

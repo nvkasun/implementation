@@ -1577,17 +1577,32 @@ jobs:
 
           echo "Validating processDiscovery for every enabled canonical deployment..."
 
-          # Reuses the same dependency-free name/enabled extraction already used above (no yq/PyYAML on this runner).
-          ENABLED_NAMES="$(awk '
-            /^\s*-\s*name:/ { if (name != "" && enabled == "true") print name; name=$0; sub(/^\s*-\s*name:\s*/, "", name); gsub(/["\x27\r]/, "", name); enabled="" }
-            /^\s*enabled:\s*true/ { enabled="true" }
-            /^\s*enabled:\s*false/ { enabled="false" }
-            END { if (name != "" && enabled == "true") print name }
-          ' envs/dev/goldengate-deployments.yaml)"
-          if [ -z "$ENABLED_NAMES" ]; then
+          # Byte-identical to the proven ENABLED_DEPLOYMENT_PAIRS/ENABLED_DEPLOYMENT_PAIRS_POST extraction above (no yq/PyYAML on this runner).
+          mapfile -t ENABLED_DEPLOYMENT_PAIRS_DISCOVERY < <(awk '
+            /^[[:space:]]*-[[:space:]]*name:/ {
+              if (name != "" && enabled == "true") print name "|" type
+              name=$0; sub(/^[[:space:]]*-[[:space:]]*name:[[:space:]]*/, "", name); gsub(/["\x27\r]/, "", name)
+              type=""; enabled=""
+              next
+            }
+            /^[[:space:]]*type:[[:space:]]*/ {
+              if (type == "") { t=$0; sub(/^[[:space:]]*type:[[:space:]]*/, "", t); gsub(/["\x27\r]/, "", t); type=t }
+              next
+            }
+            /^[[:space:]]*enabled:[[:space:]]*true/ { enabled="true"; next }
+            /^[[:space:]]*enabled:[[:space:]]*false/ { enabled="false"; next }
+            END { if (name != "" && enabled == "true") print name "|" type }
+          ' envs/dev/goldengate-deployments.yaml)
+
+          if [ "${#ENABLED_DEPLOYMENT_PAIRS_DISCOVERY[@]}" -eq 0 ]; then
             echo "FAIL: no enabled canonical deployment found in envs/dev/goldengate-deployments.yaml."
             exit 1
           fi
+
+          ENABLED_NAMES=""
+          for pair in "${ENABLED_DEPLOYMENT_PAIRS_DISCOVERY[@]}"; do
+            ENABLED_NAMES="${ENABLED_NAMES}${pair%%|*}"$'\n'
+          done
 
           PROCESS_DISCOVERY_CHECK="$(mktemp)"
           cat > "$PROCESS_DISCOVERY_CHECK" <<'PYEOF'
@@ -1605,6 +1620,13 @@ jobs:
           for lp in payload.get("logicalPipelines", []):
               for r in lp.get("runtimes", []):
                   runtimes_by_name[r.get("deploymentName")] = r
+
+
+          def non_negative_int(value):
+              if isinstance(value, bool) or not isinstance(value, int):
+                  return None
+              return value if value >= 0 else None
+
 
           failed = False
           for name in enabled_names:
@@ -1626,6 +1648,46 @@ jobs:
                   failed = True
                   continue
 
+              counts = {}
+              counts_ok = True
+              for field in ("extractCount", "replicatCount", "distpathCount", "totalCount", "detailFailureCount"):
+                  value = non_negative_int(discovery.get(field))
+                  if value is None:
+                      print(f"FAIL: {name} processDiscovery.{field} is {discovery.get(field)!r}, expected a non-negative integer.")
+                      failed = True
+                      counts_ok = False
+                  counts[field] = value
+              if not counts_ok:
+                  continue
+
+              extracts_status = discovery.get("extractsStatus")
+              replicats_status = discovery.get("replicatsStatus")
+              if extracts_status not in ("OK", "EMPTY") or replicats_status not in ("OK", "EMPTY"):
+                  print(f"FAIL: {name} extractsStatus/replicatsStatus must each be OK or EMPTY for an accepted "
+                        f"discovery status, got extractsStatus={extracts_status!r} replicatsStatus={replicats_status!r}.")
+                  failed = True
+                  continue
+
+              if status == "OK":
+                  if counts["extractCount"] + counts["replicatCount"] <= 0:
+                      print(f"FAIL: {name} discoveryStatus=OK requires extractCount + replicatCount > 0, got "
+                            f"extractCount={counts['extractCount']} replicatCount={counts['replicatCount']}.")
+                      failed = True
+                  if counts["detailFailureCount"] != 0:
+                      print(f"FAIL: {name} discoveryStatus=OK requires detailFailureCount=0, got {counts['detailFailureCount']}.")
+                      failed = True
+              else:
+                  if counts["extractCount"] != 0:
+                      print(f"FAIL: {name} discoveryStatus=EMPTY requires extractCount=0, got {counts['extractCount']}.")
+                      failed = True
+                  if counts["replicatCount"] != 0:
+                      print(f"FAIL: {name} discoveryStatus=EMPTY requires replicatCount=0, got {counts['replicatCount']}.")
+                      failed = True
+                  if counts["detailFailureCount"] != 0:
+                      print(f"FAIL: {name} discoveryStatus=EMPTY requires detailFailureCount=0, got {counts['detailFailureCount']}.")
+                      failed = True
+                  # distpathCount may be non-zero here -- /sources is optional and independent of the core status.
+
               for p in runtime.get("processes") or []:
                   proc_name = p.get("process")
                   if not isinstance(proc_name, str) or not proc_name.strip() or proc_name.strip().lower() in ("unknown", "none"):
@@ -1637,9 +1699,9 @@ jobs:
                   print(f"FAIL: {name} alertsEnabled is {alerts_enabled!r}, expected literal false.")
                   failed = True
 
-              print(f"{name}: status={status} extract={discovery.get('extractCount')} "
-                    f"replicat={discovery.get('replicatCount')} distribution={discovery.get('distpathCount')} "
-                    f"detailFailures={discovery.get('detailFailureCount')}")
+              print(f"{name}: status={status} extract={counts['extractCount']} "
+                    f"replicat={counts['replicatCount']} distribution={counts['distpathCount']} "
+                    f"detailFailures={counts['detailFailureCount']}")
 
           sys.exit(1 if failed else 0)
           PYEOF
