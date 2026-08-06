@@ -146,14 +146,24 @@ class RealRepositoryDescriptorTests(unittest.TestCase):
         names = {d["name"] for d in registry["deployments"]}
         self.assertEqual(names, {"gg-oracle-payments-01", "gg-postgresql-payments-01"})
 
-    def test_both_existing_deployments_use_gg_runtime_sa(self):
+    def test_existing_oracle_still_uses_gg_oracle_sa(self):
+        active, _inactive, _invalid = gdm.scan("dev")
+        by_id = {d["deploymentId"]: d for d in active}
+        self.assertEqual(by_id["gg-oracle-payments-01"]["runtimeServiceAccountName"], "gg-oracle-sa")
+
+    def test_existing_postgresql_still_uses_gg_postgresql_sa(self):
+        active, _inactive, _invalid = gdm.scan("dev")
+        by_id = {d["deploymentId"]: d for d in active}
+        self.assertEqual(by_id["gg-postgresql-payments-01"]["runtimeServiceAccountName"], "gg-postgresql-sa")
+
+    def test_no_existing_deployment_resolves_to_gg_runtime_sa(self):
         active, _inactive, _invalid = gdm.scan("dev")
         for d in active:
-            self.assertEqual(d["runtimeServiceAccountName"], "gg-runtime-sa")
+            self.assertNotEqual(d["runtimeServiceAccountName"], "gg-runtime-sa")
 
 
 class GenericDeploymentTypeTests(ScratchEnvironmentTestCase):
-    """The tool must accept any safe token as deploymentType, without a fixed engine allowlist."""
+    """runtime.deploymentType itself remains a free-form safe token, but resolving a ServiceAccount is gated by the approved platform identity map (a platform approval check, not a monitor engine allowlist)."""
 
     def test_synthetic_postgresql_source_descriptor_parses(self):
         write_descriptor(self._tmp.name, "dev", "gg-postgresql-payments-sqlserver-01",
@@ -171,14 +181,11 @@ class GenericDeploymentTypeTests(ScratchEnvironmentTestCase):
         self.assertEqual(active[0]["deploymentType"], "sqlserver")
         self.assertEqual(active[0]["adminSecretName"], "dev/goldengate/target/admin")
 
-    def test_synthetic_mysql_descriptor_parses_without_engine_allowlist(self):
+    def test_unapproved_deployment_type_fails_onboarding(self):
         write_descriptor(self._tmp.name, "dev", "gg-mysql-fixture-01", deployment_type="mysql")
-        active, _inactive, invalid = gdm.scan("dev")
-        self.assertEqual(invalid, [])
-        self.assertEqual(active[0]["deploymentType"], "mysql")
-        with open(TOOL_PATH) as f:
-            source = f.read()
-        self.assertNotIn('"mysql"', source)
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+        self.assertIn("does not have an approved runtime identity", invalid[0][1])
 
     def test_safe_distributed_type_parses(self):
         write_descriptor(self._tmp.name, "dev", "gg-distributed-fixture-01", deployment_type="distributed")
@@ -199,6 +206,62 @@ class GenericDeploymentTypeTests(ScratchEnvironmentTestCase):
     def test_trailing_newline_rejected_not_matched_before_dollar_anchor(self):
         # Regression: Python's $ matches just before a trailing \n even without re.MULTILINE; \Z does not.
         self.assertFalse(gdm._safe_token("gg-oracle-payments-01\n", 63))
+
+
+class RuntimeIdentityMapTests(unittest.TestCase):
+    """Tests 1-5: the one central approved flavour-identity map, and its fail-closed behavior for unapproved types."""
+
+    def test_oracle_resolves_to_gg_oracle_sa(self):
+        self.assertEqual(gdm.resolve_runtime_service_account("oracle"), "gg-oracle-sa")
+
+    def test_postgresql_resolves_to_gg_postgresql_sa(self):
+        self.assertEqual(gdm.resolve_runtime_service_account("postgresql"), "gg-postgresql-sa")
+
+    def test_sqlserver_resolves_to_gg_mssql_sa(self):
+        self.assertEqual(gdm.resolve_runtime_service_account("sqlserver"), "gg-mssql-sa")
+
+    def test_distributed_resolves_to_gg_daa_sa(self):
+        self.assertEqual(gdm.resolve_runtime_service_account("distributed"), "gg-daa-sa")
+
+    def test_unapproved_type_raises_with_fixed_message(self):
+        with self.assertRaises(gdm.DescriptorError) as ctx:
+            gdm.resolve_runtime_service_account("mysql")
+        self.assertEqual(ctx.exception.reason, "Deployment type 'mysql' does not have an approved runtime identity.")
+
+
+class SyntheticFlavourRenderTests(ScratchEnvironmentTestCase):
+    """Tests 16-19: synthetic SQL Server/distributed descriptors resolve the approved identity; image stays values-file-derived."""
+
+    def test_synthetic_sqlserver_runtime_resolves_gg_mssql_sa(self):
+        write_descriptor(self._tmp.name, "dev", "gg-sqlserver-fixture-01",
+                         pipeline="p1", role="target", deployment_type="sqlserver")
+        active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        self.assertEqual(active[0]["runtimeServiceAccountName"], "gg-mssql-sa")
+
+    def test_synthetic_distributed_runtime_resolves_gg_daa_sa(self):
+        write_descriptor(self._tmp.name, "dev", "gg-distributed-fixture-01",
+                         pipeline="p1", role="source", deployment_type="distributed")
+        active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        self.assertEqual(active[0]["runtimeServiceAccountName"], "gg-daa-sa")
+
+    def test_sqlserver_image_comes_from_the_values_file_not_a_mapping(self):
+        write_descriptor(self._tmp.name, "dev", "gg-sqlserver-fixture-01",
+                         pipeline="p1", role="target", deployment_type="sqlserver",
+                         repository="229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-sqlserver-custom", tag="9.9.9")
+        active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        self.assertEqual(active[0]["imageRepository"], "229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-sqlserver-custom")
+        self.assertEqual(active[0]["imageTag"], "9.9.9")
+
+    def test_no_deployment_type_to_image_mapping_exists_in_source(self):
+        with open(TOOL_PATH) as f:
+            source = f.read()
+        self.assertNotIn("ogg-oracle", source)
+        self.assertNotIn("ogg-postgresql", source)
+        self.assertNotIn("ogg-sqlserver", source)
+        self.assertNotIn("ogg-distributed", source)
 
 
 class SharedSecretDerivationTests(unittest.TestCase):
@@ -285,24 +348,27 @@ class ForbiddenOverrideTests(ScratchEnvironmentTestCase):
         write_descriptor(self._tmp.name, "dev", "gg-fixture-01", service_account_name="gg-something-else")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
+        self.assertIn("runtime.serviceAccount", invalid[0][1])
 
-    def test_service_account_create_true_override_is_rejected(self):
+    def test_service_account_create_override_is_rejected_even_when_literal_false(self):
         write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
-                         service_account_name="gg-runtime-sa", service_account_create=True)
+                         service_account_name="gg-oracle-sa", service_account_create=False)
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
+        self.assertIn("runtime.serviceAccount", invalid[0][1])
 
-    def test_correct_service_account_override_is_tolerated(self):
+    def test_a_correctly_named_service_account_override_is_still_rejected(self):
+        # No operator override is ever tolerated, even one that happens to match the derived identity exactly.
         write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
-                         service_account_name="gg-runtime-sa", service_account_create=False)
+                         service_account_name="gg-oracle-sa", service_account_create=False)
         _active, _inactive, invalid = gdm.scan("dev")
-        self.assertEqual(invalid, [])
+        self.assertEqual(len(invalid), 1)
 
     def test_service_account_omitted_entirely_is_valid(self):
         write_descriptor(self._tmp.name, "dev", "gg-fixture-01")
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
-        self.assertEqual(active[0]["runtimeServiceAccountName"], "gg-runtime-sa")
+        self.assertEqual(active[0]["runtimeServiceAccountName"], "gg-oracle-sa")
 
 
 class EnvironmentScopedContractTests(ScratchEnvironmentTestCase):

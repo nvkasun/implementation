@@ -28,9 +28,9 @@ OBSERVABILITY_WORKFLOW=".github/workflows/goldengate-observability.yaml"
 ARGOCD_VALUES_FILE="envs/dev/argocd/values.yaml"
 ARGOCD_DEPLOY_WORKFLOW=".github/workflows/argocd-eks-deployment.yaml"
 
-# Shared-secret identities the deploy workflow injects via --set; direct helm invocations below must mirror them.
-ORACLE_SHARED_OVERRIDES=(--set runtime.csi.admin.objectName=dev/goldengate/source/admin --set runtime.csi.certificate.objectName=dev/goldengate/tls-certificate --set runtime.serviceAccount.create=false --set runtime.serviceAccount.name=gg-runtime-sa)
-POSTGRESQL_SHARED_OVERRIDES=(--set runtime.csi.admin.objectName=dev/goldengate/target/admin --set runtime.csi.certificate.objectName=dev/goldengate/tls-certificate --set runtime.serviceAccount.create=false --set runtime.serviceAccount.name=gg-runtime-sa)
+# Shared-secret/per-flavour identities the deploy workflow injects via --set; direct helm invocations below must mirror them.
+ORACLE_SHARED_OVERRIDES=(--set runtime.csi.admin.objectName=dev/goldengate/source/admin --set runtime.csi.certificate.objectName=dev/goldengate/tls-certificate --set runtime.serviceAccount.create=false --set runtime.serviceAccount.name=gg-oracle-sa)
+POSTGRESQL_SHARED_OVERRIDES=(--set runtime.csi.admin.objectName=dev/goldengate/target/admin --set runtime.csi.certificate.objectName=dev/goldengate/tls-certificate --set runtime.serviceAccount.create=false --set runtime.serviceAccount.name=gg-postgresql-sa)
 
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT
@@ -311,9 +311,10 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
   FAKE_FLUENT_BIT_IMAGE="229410149234.dkr.ecr.eu-west-1.amazonaws.com/aws-cloud-factory-fluent-bit@sha256:366923ffc51dfde4966e743dcbd4ca05211b733d4f69c7591903bc7660fbf243"
   if helm lint "$PLATFORM_CHART" \
       --values "$PLATFORM_DEV_VALUES" \
-      --set-string serviceAccounts.runtime.roleArn="$FAKE_ORACLE_ROLE_ARN" \
       --set-string serviceAccounts.oracle.roleArn="$FAKE_ORACLE_ROLE_ARN" \
       --set-string serviceAccounts.postgresql.roleArn="$FAKE_ORACLE_ROLE_ARN" \
+      --set-string serviceAccounts.mssql.roleArn="$FAKE_ORACLE_ROLE_ARN" \
+      --set-string serviceAccounts.daa.roleArn="$FAKE_ORACLE_ROLE_ARN" \
       --set-string fluentBit.serviceAccount.roleArn="$FAKE_FLUENT_BIT_ROLE_ARN" \
       --set-string fluentBit.aws.region="eu-west-1" \
       --set-string fluentBit.image.reference="$FAKE_FLUENT_BIT_IMAGE" \
@@ -327,9 +328,10 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
   PLATFORM_FLUENTBIT_RENDERED="${WORKDIR}/platform-fluentbit-rendered.yaml"
   if helm template goldengate-dev-platform "$PLATFORM_CHART" \
       --values "$PLATFORM_DEV_VALUES" \
-      --set-string serviceAccounts.runtime.roleArn="$FAKE_ORACLE_ROLE_ARN" \
       --set-string serviceAccounts.oracle.roleArn="$FAKE_ORACLE_ROLE_ARN" \
       --set-string serviceAccounts.postgresql.roleArn="$FAKE_ORACLE_ROLE_ARN" \
+      --set-string serviceAccounts.mssql.roleArn="$FAKE_ORACLE_ROLE_ARN" \
+      --set-string serviceAccounts.daa.roleArn="$FAKE_ORACLE_ROLE_ARN" \
       --set-string fluentBit.serviceAccount.roleArn="$FAKE_FLUENT_BIT_ROLE_ARN" \
       --set-string fluentBit.aws.region="eu-west-1" \
       --set-string fluentBit.image.reference="$FAKE_FLUENT_BIT_IMAGE" \
@@ -343,9 +345,10 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
   # The chart must fail clearly (not silently fall back to any image) when fluentBit.create=true and no image reference is supplied at all.
   if helm template goldengate-dev-platform "$PLATFORM_CHART" \
       --values "$PLATFORM_DEV_VALUES" \
-      --set-string serviceAccounts.runtime.roleArn="$FAKE_ORACLE_ROLE_ARN" \
       --set-string serviceAccounts.oracle.roleArn="$FAKE_ORACLE_ROLE_ARN" \
       --set-string serviceAccounts.postgresql.roleArn="$FAKE_ORACLE_ROLE_ARN" \
+      --set-string serviceAccounts.mssql.roleArn="$FAKE_ORACLE_ROLE_ARN" \
+      --set-string serviceAccounts.daa.roleArn="$FAKE_ORACLE_ROLE_ARN" \
       --set-string fluentBit.serviceAccount.roleArn="$FAKE_FLUENT_BIT_ROLE_ARN" \
       --set-string fluentBit.aws.region="eu-west-1" \
       >"${WORKDIR}/template-platform-no-image.log" 2>&1; then
@@ -2010,7 +2013,7 @@ PYEOF
     pass "14: no enable_cloudwatch Terraform variable/reference exists under envs/"
   fi
 
-  # 15: earlier phases' resources remain functionally untouched (comment-only edits are allowed and ignored here). envs/dev/policies/goldengate-cloudwatch-metrics-dev is excluded since the OTLP-authorization correction intentionally changes one condition operator there; helm/goldengate-platform and platform/dev/goldengate-platform are excluded since Phase 6D0 legitimately adds the shared gg-runtime-sa there (guarded instead by the dedicated ServiceAccount/Fluent-Bit safety checks in this same suite).
+  # 15: earlier phases' resources remain functionally untouched (comment-only edits are allowed and ignored here). envs/dev/policies/goldengate-cloudwatch-metrics-dev is excluded since the OTLP-authorization correction intentionally changes one condition operator there; helm/goldengate-platform and platform/dev/goldengate-platform are excluded since Phase 6D0 legitimately changes the per-flavour runtime ServiceAccounts there (guarded instead by the dedicated ServiceAccount/Fluent-Bit safety checks in this same suite).
   PHASE_6A_6B1_STATUS="$(python3 -c "
 import subprocess
 
@@ -3856,11 +3859,14 @@ else
   skip "Phase 5B1 IAM least-privilege checks -- policy files or python3 not available"
 fi
 
-# 7. The shared gg-runtime-sa ServiceAccount (annotated by the platform workflow, never duplicated in per-deployment values) references GoldenGateSecretsReadRole-dev.
-if grep -q "RUNTIME_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev" "$PLATFORM_WORKFLOW" 2>/dev/null; then
-  pass "7: the shared gg-runtime-sa ServiceAccount (platform workflow) references GoldenGateSecretsReadRole-dev"
+# 7. Each of the four approved per-flavour runtime ServiceAccounts (annotated by the platform workflow, never duplicated in per-deployment values) references GoldenGateSecretsReadRole-dev.
+if grep -q "ORACLE_RUNTIME_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev" "$PLATFORM_WORKFLOW" 2>/dev/null \
+    && grep -q "POSTGRESQL_RUNTIME_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev" "$PLATFORM_WORKFLOW" 2>/dev/null \
+    && grep -q "MSSQL_RUNTIME_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev" "$PLATFORM_WORKFLOW" 2>/dev/null \
+    && grep -q "DAA_RUNTIME_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev" "$PLATFORM_WORKFLOW" 2>/dev/null; then
+  pass "7: all four approved per-flavour runtime ServiceAccounts (platform workflow) reference GoldenGateSecretsReadRole-dev"
 else
-  fail "7: the platform workflow no longer references GoldenGateSecretsReadRole-dev for the shared runtime ServiceAccount"
+  fail "7: the platform workflow no longer references GoldenGateSecretsReadRole-dev for all four approved runtime ServiceAccounts"
 fi
 
 # 8. gg-monitor still references GoldenGateMonitorReadRole-dev.
@@ -5093,7 +5099,7 @@ envs/dev/policies/goldengate-cloudwatch-metrics-dev/policies/policies_1.json"
   IAM_DIFF_FILES="$(echo "$IAM_DIFF_STAT" | grep -oE '\S+\.(json|tf)' | sort -u || true)"
   UNEXPECTED_IAM_DIFF_FILES="$(comm -23 <(echo "$IAM_DIFF_FILES") <(echo "$EXPECTED_MODIFIED_IAM_FILES" | sort -u) 2>/dev/null || true)"
   MONITOR_ROLE_DIFF="$(git -C "$REPO_ROOT" diff --stat --ignore-all-space -- envs/dev/policies/goldengate-monitor-read-dev 2>/dev/null || true)"
-  # Phase 6D0 (Task 14) explicitly authorizes exactly one addition to GoldenGateSecretsReadRole-dev's trust policy: the gg-runtime-sa subject; anything else there still fails closed.
+  # Phase 6D0 (manager-aligned correction) explicitly authorizes exactly this change to GoldenGateSecretsReadRole-dev's trust policy: the retired gg-runtime-sa subject is removed and the gg-mssql-sa/gg-daa-sa subjects are added; anything else there still fails closed.
   SECRETS_ROLE_DIFF="$(git -C "$REPO_ROOT" diff --ignore-all-space -- envs/dev/policies/goldengate-secrets-read-dev 2>/dev/null || true)"
   SECRETS_ROLE_DIFF_OK="$(python3 -c "
 import json, subprocess
@@ -5108,8 +5114,11 @@ try:
     head_copy = json.loads(json.dumps(head_doc))
     subs = head_copy['Statement'][0]['Condition']['StringLike'][
         'oidc.eks.eu-west-1.amazonaws.com/id/407C4385FF87947926730569F1E564FB:sub']
-    if 'system:serviceaccount:goldengate-dev:gg-runtime-sa' not in subs:
-        subs.append('system:serviceaccount:goldengate-dev:gg-runtime-sa')
+    if 'system:serviceaccount:goldengate-dev:gg-runtime-sa' in subs:
+        subs.remove('system:serviceaccount:goldengate-dev:gg-runtime-sa')
+    for expected_sub in ('system:serviceaccount:goldengate-dev:gg-mssql-sa', 'system:serviceaccount:goldengate-dev:gg-daa-sa'):
+        if expected_sub not in subs:
+            subs.append(expected_sub)
     print('true' if head_copy == working_doc else 'false')
 except Exception:
     print('false')
@@ -5117,7 +5126,7 @@ except Exception:
   if [ -z "$IAM_DIFF_FILES" ] && [ -z "$MONITOR_ROLE_DIFF" ] && [ -z "$SECRETS_ROLE_DIFF" ]; then
     pass "18: IAM (envs/dev/policies, envs/dev/iam.tf) is unchanged"
   elif [ -z "$UNEXPECTED_IAM_DIFF_FILES" ] && [ -z "$MONITOR_ROLE_DIFF" ] && [ "$SECRETS_ROLE_DIFF_OK" = "true" ]; then
-    pass "18: only the expected files changed; GoldenGateMonitorReadRole-dev is unchanged, and GoldenGateSecretsReadRole-dev gained exactly the reviewed gg-runtime-sa trust subject"
+    pass "18: only the expected files changed; GoldenGateMonitorReadRole-dev is unchanged, and GoldenGateSecretsReadRole-dev's trust policy changed exactly as reviewed (gg-runtime-sa removed, gg-mssql-sa/gg-daa-sa added)"
   else
     fail "18: IAM changed outside the expected file set, or a protected role's policy was touched:"$'\n'"unexpected changed files: ${UNEXPECTED_IAM_DIFF_FILES}"$'\n'"${MONITOR_ROLE_DIFF}"$'\n'"${SECRETS_ROLE_DIFF}"
   fi
@@ -5876,34 +5885,76 @@ else
   fail "26: deployment-role read-only secret validation is not scoped to the three approved shared secret ARNs"
 fi
 
-if grep -q "serviceAccounts:" helm/goldengate-platform/values.yaml 2>/dev/null \
-    && grep -q "gg-runtime-sa" platform/dev/goldengate-platform/values.yaml 2>/dev/null \
-    && grep -q "goldengate.adcb/purpose: runtime" helm/goldengate-platform/templates/runtime-serviceaccounts.yaml 2>/dev/null; then
-  pass "26: shared gg-runtime-sa is defined with a non-engine-specific purpose label"
+# Phase 6D0 (manager-aligned correction): one approved runtime ServiceAccount per flavour, never a single shared gg-runtime-sa.
+if grep -q "gg-runtime-sa" helm/goldengate-platform/values.yaml 2>/dev/null \
+    || grep -q "gg-runtime-sa" platform/dev/goldengate-platform/values.yaml 2>/dev/null \
+    || grep -q "gg-runtime-sa" helm/goldengate-platform/templates/runtime-serviceaccounts.yaml 2>/dev/null; then
+  fail "26: the retired shared gg-runtime-sa identity still exists in the platform chart"
 else
-  fail "26: shared gg-runtime-sa is missing from the platform chart"
+  pass "26: the shared gg-runtime-sa identity no longer exists anywhere in the platform chart"
 fi
 
 if grep -q "gg-oracle-sa" platform/dev/goldengate-platform/values.yaml 2>/dev/null \
-    && grep -q "gg-postgresql-sa" platform/dev/goldengate-platform/values.yaml 2>/dev/null; then
-  pass "26: transitional legacy ServiceAccounts (gg-oracle-sa, gg-postgresql-sa) remain available"
+    && grep -q "gg-postgresql-sa" platform/dev/goldengate-platform/values.yaml 2>/dev/null \
+    && grep -q "gg-mssql-sa" platform/dev/goldengate-platform/values.yaml 2>/dev/null \
+    && grep -q "gg-daa-sa" platform/dev/goldengate-platform/values.yaml 2>/dev/null; then
+  pass "26: all four approved per-flavour runtime ServiceAccounts (gg-oracle-sa, gg-postgresql-sa, gg-mssql-sa, gg-daa-sa) are defined"
 else
-  fail "26: a transitional legacy ServiceAccount was unexpectedly removed"
+  fail "26: at least one approved per-flavour runtime ServiceAccount is missing from the platform chart"
+fi
+
+if grep -q "goldengate.adcb/engine: oracle" helm/goldengate-platform/templates/runtime-serviceaccounts.yaml 2>/dev/null \
+    && grep -q "goldengate.adcb/engine: postgresql" helm/goldengate-platform/templates/runtime-serviceaccounts.yaml 2>/dev/null \
+    && grep -q "goldengate.adcb/engine: sqlserver" helm/goldengate-platform/templates/runtime-serviceaccounts.yaml 2>/dev/null \
+    && grep -q "goldengate.adcb/engine: distributed" helm/goldengate-platform/templates/runtime-serviceaccounts.yaml 2>/dev/null; then
+  pass "26: each runtime ServiceAccount carries its own flavour-specific goldengate.adcb/engine label"
+else
+  fail "26: a flavour-specific goldengate.adcb/engine label is missing from the platform chart template"
+fi
+
+if [ "$HELM_AVAILABLE" = "true" ]; then
+  PLATFORM_SA_RENDER="$(helm template gg-platform helm/goldengate-platform \
+    --values platform/dev/goldengate-platform/values.yaml \
+    --set-string serviceAccounts.oracle.roleArn=arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev \
+    --set-string serviceAccounts.postgresql.roleArn=arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev \
+    --set-string serviceAccounts.mssql.roleArn=arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev \
+    --set-string serviceAccounts.daa.roleArn=arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev \
+    --set-string fluentBit.serviceAccount.roleArn=arn:aws:iam::668311715351:role/GoldenGatePlatformLoggingRole-dev \
+    --set-string fluentBit.aws.region=eu-west-1 \
+    --set-string fluentBit.image.reference=229410149234.dkr.ecr.eu-west-1.amazonaws.com/aws-cloud-factory-fluent-bit@sha256:366923ffc51dfde4966e743dcbd4ca05211b733d4f69c7591903bc7660fbf243 \
+    2>/dev/null)"
+  RENDERED_SA_COUNT="$(echo "$PLATFORM_SA_RENDER" | grep -c '^kind: ServiceAccount$' || true)"
+  if [ "$RENDERED_SA_COUNT" -eq 5 ] \
+      && echo "$PLATFORM_SA_RENDER" | grep -q "name: gg-oracle-sa" \
+      && echo "$PLATFORM_SA_RENDER" | grep -q "name: gg-postgresql-sa" \
+      && echo "$PLATFORM_SA_RENDER" | grep -q "name: gg-mssql-sa" \
+      && echo "$PLATFORM_SA_RENDER" | grep -q "name: gg-daa-sa" \
+      && echo "$PLATFORM_SA_RENDER" | grep -q "name: gg-fluent-bit" \
+      && ! echo "$PLATFORM_SA_RENDER" | grep -q "name: gg-runtime-sa"; then
+    pass "26: the platform chart renders exactly 5 ServiceAccounts (4 approved runtime flavours + gg-fluent-bit), never gg-runtime-sa"
+  else
+    fail "26: the rendered platform chart ServiceAccount set is not exactly the 4 approved runtime flavours plus gg-fluent-bit"
+  fi
+else
+  skip "26: platform ServiceAccount render check -- helm not available"
 fi
 
 STS_TRUST_POLICY="envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json"
-if grep -q "goldengate-dev:gg-runtime-sa" "$STS_TRUST_POLICY" 2>/dev/null \
-    && grep -q "goldengate-dev:gg-oracle-sa" "$STS_TRUST_POLICY" 2>/dev/null; then
-  pass "26: IAM trust includes gg-runtime-sa and retains the exact legacy subjects"
+if grep -q "goldengate-dev:gg-oracle-sa" "$STS_TRUST_POLICY" 2>/dev/null \
+    && grep -q "goldengate-dev:gg-postgresql-sa" "$STS_TRUST_POLICY" 2>/dev/null \
+    && grep -q "goldengate-dev:gg-mssql-sa" "$STS_TRUST_POLICY" 2>/dev/null \
+    && grep -q "goldengate-dev:gg-daa-sa" "$STS_TRUST_POLICY" 2>/dev/null \
+    && ! grep -q "goldengate-dev:gg-runtime-sa" "$STS_TRUST_POLICY" 2>/dev/null; then
+  pass "26: IAM trust policy has exact subjects for all four approved runtime ServiceAccounts and no longer trusts gg-runtime-sa"
 else
-  fail "26: IAM trust policy for gg-runtime-sa is missing an expected exact subject"
+  fail "26: IAM trust policy subjects do not match the four approved runtime ServiceAccounts"
 fi
 
 # Honestly-reported blocker: cannot be removed without live-cluster inventory evidence; SKIP, never a false PASS.
 if grep -qE '"system:serviceaccount:[^"]*\*[^"]*"' "$STS_TRUST_POLICY" 2>/dev/null; then
-  skip "26: IAM trust for gg-runtime-sa still contains a namespace-wildcard subject (system:serviceaccount:gg-dev-*:ogg-oracle-sa) -- unresolved, requires live-cluster inventory evidence not available offline"
+  skip "26: IAM trust still contains the legacy namespace-wildcard subject (system:serviceaccount:gg-dev-*:ogg-oracle-sa) -- unresolved, requires live-cluster inventory evidence not available offline (see: kubectl get pods -A -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,SA:.spec.serviceAccountName' and kubectl get serviceaccounts -A -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name')"
 else
-  pass "26: IAM trust for gg-runtime-sa contains no namespace or ServiceAccount wildcard"
+  fail "26: the legacy namespace-wildcard subject disappeared from the trust policy without live-cluster evidence -- this must never happen silently"
 fi
 
 if grep -q "SUPPORTED_TYPES" monitoring/monitor/config.py 2>/dev/null; then
@@ -5946,6 +5997,167 @@ if python3 hack/check-comment-style.py >/dev/null 2>&1; then
   pass "26: comment-style checker remains integrated and reports zero violations"
 else
   fail "26: comment-style checker reported a violation in the Phase 6D0 files"
+fi
+
+echo ""
+echo "--- Phase 6D0: central runtime-identity contract agreement (Python vs Terraform) ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  set +e
+  IDENTITY_MAP_AGREEMENT_CHECK="$(python3 - "$DEPLOYMENT_MODEL_TOOL" "$INVENTORY_TF" <<'PYEOF'
+import re
+import sys
+
+tool_path, tf_path = sys.argv[1], sys.argv[2]
+
+with open(tool_path) as f:
+    tool_src = f.read()
+m = re.search(r"RUNTIME_IDENTITY_MAP\s*=\s*\{(.*?)\}", tool_src, re.S)
+if not m:
+    print("FAIL: RUNTIME_IDENTITY_MAP not found in the deployment-model tool")
+    sys.exit(1)
+python_map = dict(re.findall(r'"(\w+)"\s*:\s*"([\w-]+)"', m.group(1)))
+
+with open(tf_path) as f:
+    tf_src = f.read()
+m = re.search(r"goldengate_runtime_identity_map\s*=\s*\{(.*?)\}", tf_src, re.S)
+if not m:
+    print("FAIL: goldengate_runtime_identity_map not found in envs/dev/goldengate_inventory.tf")
+    sys.exit(1)
+tf_map = dict(re.findall(r'(\w+)\s*=\s*"([\w-]+)"', m.group(1)))
+
+if python_map != tf_map:
+    print(f"FAIL: identity maps diverge -- python={python_map!r} terraform={tf_map!r}")
+    sys.exit(1)
+
+expected = {"oracle": "gg-oracle-sa", "postgresql": "gg-postgresql-sa", "sqlserver": "gg-mssql-sa", "distributed": "gg-daa-sa"}
+if python_map != expected:
+    print(f"FAIL: identity map does not match the approved manager-aligned contract -- got {python_map!r}")
+    sys.exit(1)
+
+print("OK: hack/goldengate-deployment-model.py's RUNTIME_IDENTITY_MAP and envs/dev/goldengate_inventory.tf's goldengate_runtime_identity_map are identical and match the approved contract")
+PYEOF
+)"
+  IDENTITY_MAP_AGREEMENT_STATUS=$?
+  set -e
+  if [ "$IDENTITY_MAP_AGREEMENT_STATUS" -eq 0 ]; then
+    pass "26: ${IDENTITY_MAP_AGREEMENT_CHECK}"
+  else
+    fail "26: ${IDENTITY_MAP_AGREEMENT_CHECK}"
+  fi
+else
+  skip "26: runtime-identity contract agreement check -- python3 unavailable"
+fi
+
+echo ""
+echo "--- Phase 6D0: synthetic SQL Server / distributed flavour rendering (no live folders added) ---"
+
+if [ "$HELM_AVAILABLE" = "true" ]; then
+  SYNTHETIC_VALUES_DIR="$(mktemp -d)"
+  cat > "${SYNTHETIC_VALUES_DIR}/sqlserver.yaml" <<'EOF'
+deployment:
+  enabled: true
+  pipeline: synthetic-test-pipeline
+  role: source
+global:
+  environment: dev
+deploymentModel: singleRuntime
+replication:
+  enabled: false
+runtime:
+  enabled: true
+  deploymentType: sqlserver
+  businessDomain: payments
+  containerName: ogg-sqlserver
+  replicas: 1
+  image:
+    repository: 229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-sqlserver
+    tag: "23.26.2.0.1"
+  csi:
+    enabled: true
+    admin:
+      enabled: true
+      objectType: secretsmanager
+      mountPath: /mnt/secrets-store/admin
+    certificate:
+      enabled: true
+      objectType: secretsmanager
+      mountPath: /etc/nginx/cert
+  service:
+    type: ClusterIP
+    ports:
+      https: 8443
+      metrics: 9015
+  storage:
+    u02:
+      type: efs
+    u03:
+      type: emptyDir
+ingress:
+  enabled: true
+  mode: shared
+  className: alb
+  hostDomain: goldengate-dev.adcbmis.local
+  alb:
+    groupName: gg-poc-dev-alb
+    groupOrder: "199"
+    certificateArn: arn:aws:acm:eu-west-1:668311715351:certificate/9e53e28e-3243-47fc-85a1-50f9a94acde7
+persistence:
+  enabled: true
+  provider: efs
+  efs:
+    fileSystemId: fs-05cadf3570f23cd39
+    storageClass:
+      create: true
+EOF
+  sed -e 's/deploymentType: sqlserver/deploymentType: distributed/' \
+      -e 's/ogg-sqlserver/ogg-daa/g' \
+      -e 's/groupOrder: "199"/groupOrder: "198"/' \
+      "${SYNTHETIC_VALUES_DIR}/sqlserver.yaml" > "${SYNTHETIC_VALUES_DIR}/distributed.yaml"
+
+  if helm template synthetic-sqlserver "$RUNTIME_CHART" \
+      --namespace goldengate-dev \
+      --values "${SYNTHETIC_VALUES_DIR}/sqlserver.yaml" \
+      --set global.environment=dev \
+      --set runtime.csi.admin.objectName=dev/goldengate/source/admin \
+      --set runtime.csi.certificate.objectName=dev/goldengate/tls-certificate \
+      --set runtime.serviceAccount.create=false \
+      --set runtime.serviceAccount.name=gg-mssql-sa \
+      > "${SYNTHETIC_VALUES_DIR}/sqlserver-rendered.yaml" 2>"${SYNTHETIC_VALUES_DIR}/sqlserver.log" \
+      && grep -q "serviceAccountName: gg-mssql-sa" "${SYNTHETIC_VALUES_DIR}/sqlserver-rendered.yaml" \
+      && grep -q "image: \"229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-sqlserver:23.26.2.0.1\"" "${SYNTHETIC_VALUES_DIR}/sqlserver-rendered.yaml"; then
+    pass "26: a synthetic SQL Server descriptor renders with serviceAccountName: gg-mssql-sa and the image taken directly from the values file"
+  else
+    fail "26: synthetic SQL Server rendering failed or used an unexpected ServiceAccount/image"
+    cat "${SYNTHETIC_VALUES_DIR}/sqlserver.log" 2>/dev/null || true
+  fi
+
+  if helm template synthetic-daa "$RUNTIME_CHART" \
+      --namespace goldengate-dev \
+      --values "${SYNTHETIC_VALUES_DIR}/distributed.yaml" \
+      --set global.environment=dev \
+      --set runtime.csi.admin.objectName=dev/goldengate/source/admin \
+      --set runtime.csi.certificate.objectName=dev/goldengate/tls-certificate \
+      --set runtime.serviceAccount.create=false \
+      --set runtime.serviceAccount.name=gg-daa-sa \
+      > "${SYNTHETIC_VALUES_DIR}/distributed-rendered.yaml" 2>"${SYNTHETIC_VALUES_DIR}/distributed.log" \
+      && grep -q "serviceAccountName: gg-daa-sa" "${SYNTHETIC_VALUES_DIR}/distributed-rendered.yaml" \
+      && grep -q "image: \"229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-daa:23.26.2.0.1\"" "${SYNTHETIC_VALUES_DIR}/distributed-rendered.yaml"; then
+    pass "26: a synthetic distributed (DAA) descriptor renders with serviceAccountName: gg-daa-sa and the image taken directly from the values file"
+  else
+    fail "26: synthetic distributed rendering failed or used an unexpected ServiceAccount/image"
+    cat "${SYNTHETIC_VALUES_DIR}/distributed.log" 2>/dev/null || true
+  fi
+
+  rm -rf "$SYNTHETIC_VALUES_DIR"
+
+  if [ -d "envs/dev/gg-sqlserver-payments-01" ] || [ -d "envs/dev/gg-daa-payments-01" ] || [ -d "envs/dev/gg-mssql-payments-01" ]; then
+    fail "26: a real SQL Server/DAA runtime deployment folder was added -- out of scope for this phase"
+  else
+    pass "26: no real SQL Server/DAA runtime deployment folder was added"
+  fi
+else
+  skip "26: synthetic SQL Server/distributed rendering -- helm not available"
 fi
 
 echo ""
@@ -6100,18 +6312,31 @@ else
 fi
 
 echo ""
-echo "--- Phase 6D0 correction: migration safety (offline manifest comparison) ---"
+echo "--- Phase 6D0: existing Oracle/PostgreSQL runtime identity stability (no migration) ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  ORACLE_RESOLVED_SA="$(python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev describe gg-oracle-payments-01 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["runtimeServiceAccountName"])' 2>/dev/null || true)"
+  POSTGRESQL_RESOLVED_SA="$(python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev describe gg-postgresql-payments-01 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["runtimeServiceAccountName"])' 2>/dev/null || true)"
+  if [ "$ORACLE_RESOLVED_SA" = "gg-oracle-sa" ] && [ "$POSTGRESQL_RESOLVED_SA" = "gg-postgresql-sa" ]; then
+    pass "28: gg-oracle-payments-01 and gg-postgresql-payments-01 still resolve to gg-oracle-sa/gg-postgresql-sa -- no runtime identity migration occurs in this phase"
+  else
+    fail "28: gg-oracle-payments-01/gg-postgresql-payments-01 resolved to (${ORACLE_RESOLVED_SA}, ${POSTGRESQL_RESOLVED_SA}), expected (gg-oracle-sa, gg-postgresql-sa)"
+  fi
+else
+  skip "28: runtime identity stability check -- python3 unavailable"
+fi
 
 if [ "$HELM_AVAILABLE" = "true" ]; then
   for pair in "gg-oracle-payments-01:dev/goldengate/source/admin:gg-oracle-sa" "gg-postgresql-payments-01:dev/goldengate/target/admin:gg-postgresql-sa"; do
     id="${pair%%:*}"
     rest="${pair#*:}"
     admin_secret="${rest%%:*}"
-    legacy_sa="${rest##*:}"
+    approved_sa="${rest##*:}"
 
-    CURRENT_RENDER="${WORKDIR}/migration-current-${id}.yaml"
-    LEGACY_RENDER="${WORKDIR}/migration-legacy-${id}.yaml"
+    RENDER_APPROVED="${WORKDIR}/identity-approved-${id}.yaml"
+    RENDER_OTHER="${WORKDIR}/identity-other-${id}.yaml"
 
+    # The chart must not couple ServiceAccount identity to any other field, regardless of the name compared.
     if helm template "$id" "$RUNTIME_CHART" \
         --namespace goldengate-dev \
         --values "envs/dev/${id}/values.yaml" \
@@ -6119,8 +6344,8 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
         --set runtime.csi.admin.objectName="$admin_secret" \
         --set runtime.csi.certificate.objectName=dev/goldengate/tls-certificate \
         --set runtime.serviceAccount.create=false \
-        --set runtime.serviceAccount.name=gg-runtime-sa \
-        > "$CURRENT_RENDER" 2>"${WORKDIR}/migration-current-${id}.log" \
+        --set runtime.serviceAccount.name="$approved_sa" \
+        > "$RENDER_APPROVED" 2>"${WORKDIR}/identity-approved-${id}.log" \
       && helm template "$id" "$RUNTIME_CHART" \
         --namespace goldengate-dev \
         --values "envs/dev/${id}/values.yaml" \
@@ -6128,25 +6353,30 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
         --set runtime.csi.admin.objectName="$admin_secret" \
         --set runtime.csi.certificate.objectName=dev/goldengate/tls-certificate \
         --set runtime.serviceAccount.create=false \
-        --set runtime.serviceAccount.name="$legacy_sa" \
-        > "$LEGACY_RENDER" 2>"${WORKDIR}/migration-legacy-${id}.log"; then
+        --set runtime.serviceAccount.name=gg-isolation-probe-sa \
+        > "$RENDER_OTHER" 2>"${WORKDIR}/identity-other-${id}.log"; then
 
-      MIGRATION_DIFF="$(diff "$CURRENT_RENDER" "$LEGACY_RENDER" || true)"
-      DIFF_LINE_COUNT="$(echo "$MIGRATION_DIFF" | grep -cE '^[<>]' || true)"
-
-      if [ "$DIFF_LINE_COUNT" -eq 2 ] \
-          && echo "$MIGRATION_DIFF" | grep -qE '^<\s+serviceAccountName: gg-runtime-sa$' \
-          && echo "$MIGRATION_DIFF" | grep -qE "^>\s+serviceAccountName: ${legacy_sa}\$"; then
-        pass "28: ${id} migration from ${legacy_sa} to gg-runtime-sa changed only serviceAccountName -- StatefulSet name, PVC/EFS identity, image, ports, ingress/ALB order, admin secret, and TLS are byte-identical"
+      if grep -q "serviceAccountName: ${approved_sa}" "$RENDER_APPROVED"; then
+        pass "28: ${id} renders serviceAccountName: ${approved_sa}"
       else
-        fail "28: ${id} migration diff is not limited to serviceAccountName alone:"$'\n'"${MIGRATION_DIFF}"
+        fail "28: ${id} does not render the expected serviceAccountName: ${approved_sa}"
+      fi
+
+      ISOLATION_DIFF="$(diff "$RENDER_APPROVED" "$RENDER_OTHER" || true)"
+      DIFF_LINE_COUNT="$(echo "$ISOLATION_DIFF" | grep -cE '^[<>]' || true)"
+      if [ "$DIFF_LINE_COUNT" -eq 2 ] \
+          && echo "$ISOLATION_DIFF" | grep -qE "^<\s+serviceAccountName: ${approved_sa}\$" \
+          && echo "$ISOLATION_DIFF" | grep -qE '^>\s+serviceAccountName: gg-isolation-probe-sa$'; then
+        pass "28: ${id} ServiceAccount identity is fully decoupled from all other manifest fields (StatefulSet name, PVC/EFS identity, image, ports, ingress/ALB order, admin secret, and TLS are byte-identical regardless of ServiceAccount name)"
+      else
+        fail "28: ${id} changing the ServiceAccount name unexpectedly changed more than serviceAccountName:"$'\n'"${ISOLATION_DIFF}"
       fi
     else
-      fail "28: ${id} migration-safety render failed"
+      fail "28: ${id} identity-stability render failed"
     fi
   done
 else
-  skip "28: migration-safety manifest comparison -- helm not available"
+  skip "28: identity-stability manifest comparison -- helm not available"
 fi
 
 echo ""
@@ -6296,6 +6526,34 @@ EOF
       cat "${TF_PLAN_SCRATCH}/plan-dup-alb.log"
     fi
     cp "${TF_PLAN_SCRATCH}/postgresql-backup2.yaml" "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-payments-01/values.yaml"
+
+    cp "${TF_PLAN_SCRATCH}/envs/dev/gg-oracle-payments-01/values.yaml" "${TF_PLAN_SCRATCH}/oracle-backup2.yaml"
+    sed -i 's/deploymentType: oracle/deploymentType: mysql/' "${TF_PLAN_SCRATCH}/envs/dev/gg-oracle-payments-01/values.yaml"
+    set +e
+    (cd "${TF_PLAN_SCRATCH}/envs/dev" && terraform plan -input=false) >"${TF_PLAN_SCRATCH}/plan-unapproved-identity.log" 2>&1
+    TF_PLAN_UNAPPROVED_STATUS=$?
+    set -e
+    if [ "$TF_PLAN_UNAPPROVED_STATUS" -ne 0 ] && grep -q "approved runtime identity" "${TF_PLAN_SCRATCH}/plan-unapproved-identity.log"; then
+      pass "30: an unapproved runtime.deploymentType produces a non-zero Terraform plan exit"
+    else
+      fail "30: an unapproved runtime.deploymentType did not block Terraform plan as expected (exit=${TF_PLAN_UNAPPROVED_STATUS})"
+      cat "${TF_PLAN_SCRATCH}/plan-unapproved-identity.log"
+    fi
+    cp "${TF_PLAN_SCRATCH}/oracle-backup2.yaml" "${TF_PLAN_SCRATCH}/envs/dev/gg-oracle-payments-01/values.yaml"
+
+    cp "${TF_PLAN_SCRATCH}/envs/dev/gg-oracle-payments-01/values.yaml" "${TF_PLAN_SCRATCH}/oracle-backup3.yaml"
+    sed -i '/^runtime:/a\  serviceAccount: gg-operator-chosen-sa' "${TF_PLAN_SCRATCH}/envs/dev/gg-oracle-payments-01/values.yaml"
+    set +e
+    (cd "${TF_PLAN_SCRATCH}/envs/dev" && terraform plan -input=false) >"${TF_PLAN_SCRATCH}/plan-sa-override.log" 2>&1
+    TF_PLAN_SA_OVERRIDE_STATUS=$?
+    set -e
+    if [ "$TF_PLAN_SA_OVERRIDE_STATUS" -ne 0 ] && grep -q "forbidden override" "${TF_PLAN_SCRATCH}/plan-sa-override.log"; then
+      pass "30: an operator-supplied runtime.serviceAccount produces a non-zero Terraform plan exit"
+    else
+      fail "30: an operator-supplied runtime.serviceAccount did not block Terraform plan as expected (exit=${TF_PLAN_SA_OVERRIDE_STATUS})"
+      cat "${TF_PLAN_SCRATCH}/plan-sa-override.log"
+    fi
+    cp "${TF_PLAN_SCRATCH}/oracle-backup3.yaml" "${TF_PLAN_SCRATCH}/envs/dev/gg-oracle-payments-01/values.yaml"
   fi
   rm -rf "${TF_PLAN_SCRATCH}"
 else

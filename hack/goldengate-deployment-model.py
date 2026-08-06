@@ -16,7 +16,13 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 APPROVED_ECR_ACCOUNT = "229410149234"
 APPROVED_ECR_REGION = "eu-west-1"
 FORBIDDEN_IMAGE_TAG = "latest"
-RUNTIME_SERVICE_ACCOUNT_NAME = "gg-runtime-sa"
+
+RUNTIME_IDENTITY_MAP = {
+    "oracle": "gg-oracle-sa",
+    "postgresql": "gg-postgresql-sa",
+    "sqlserver": "gg-mssql-sa",
+    "distributed": "gg-daa-sa",
+}
 
 IGNORED_NON_RUNTIME_FOLDER_NAMES = ("argocd", "goldengate-monitor")
 
@@ -51,6 +57,14 @@ def resolve_admin_secret(environment, role):
 
 def resolve_tls_secret(environment):
     return f"{environment}/goldengate/tls-certificate"
+
+
+def resolve_runtime_service_account(deployment_type):
+    """The one and only ServiceAccount derivation rule: deployment_type alone selects the approved platform identity."""
+    try:
+        return RUNTIME_IDENTITY_MAP[deployment_type]
+    except KeyError:
+        raise DescriptorError(f"Deployment type {deployment_type!r} does not have an approved runtime identity.") from None
 
 
 def _safe_token(value, max_length):
@@ -150,19 +164,6 @@ def _parse_image(runtime):
     return {"repository": repository, "tag": tag}
 
 
-def _parse_service_account(runtime):
-    """Optional in the descriptor: the shared invariant is injected by the deploy workflow. A present value must match exactly -- it is never a per-deployment override."""
-    sa = runtime.get("serviceAccount")
-    if sa is None:
-        return
-    _require_dict(sa, "invalid ServiceAccount configuration: runtime.serviceAccount must be a mapping")
-    name = sa.get("name")
-    if name != RUNTIME_SERVICE_ACCOUNT_NAME:
-        raise DescriptorError(f"invalid ServiceAccount override: runtime.serviceAccount.name must be {RUNTIME_SERVICE_ACCOUNT_NAME!r} or omitted")
-    if sa.get("create") is not False:
-        raise DescriptorError("invalid ServiceAccount override: runtime.serviceAccount.create must be literal false or omitted")
-
-
 def _reject_forbidden_overrides(doc):
     """These identities are shared platform invariants, derived once and injected by the deploy workflow; an operator descriptor must never define them."""
     deployment = doc.get("deployment") or {}
@@ -170,6 +171,8 @@ def _reject_forbidden_overrides(doc):
         raise DescriptorError("forbidden override: deployment.adminSecret is derived from deployment.role and must not be set")
 
     runtime = doc.get("runtime") or {}
+    if "serviceAccount" in runtime:
+        raise DescriptorError("forbidden override: runtime.serviceAccount is derived from runtime.deploymentType and must not be set")
     csi = runtime.get("csi") or {}
     if "serviceAccountRoleArn" in csi:
         raise DescriptorError("forbidden override: runtime.csi.serviceAccountRoleArn is a shared platform invariant and must not be set")
@@ -259,7 +262,7 @@ def parse_descriptor(deployment_id, environment, doc, shared=None):
         raise DescriptorError("invalid deployment metadata: runtime.deploymentType must be a safe lowercase token")
 
     image = _parse_image(runtime)
-    _parse_service_account(runtime)
+    runtime_service_account_name = resolve_runtime_service_account(deployment_type)
     admin_secret_name = resolve_admin_secret(environment, role)
     tls_secret_name = resolve_tls_secret(environment)
     _parse_csi_structure(runtime)
@@ -296,7 +299,7 @@ def parse_descriptor(deployment_id, environment, doc, shared=None):
         "imageRepository": image["repository"],
         "imageTag": image["tag"],
         "containerName": container_name,
-        "runtimeServiceAccountName": RUNTIME_SERVICE_ACCOUNT_NAME,
+        "runtimeServiceAccountName": runtime_service_account_name,
         "adminSecretName": admin_secret_name,
         "tlsSecretName": tls_secret_name,
         "runtimeNamespace": shared["runtimeNamespace"],

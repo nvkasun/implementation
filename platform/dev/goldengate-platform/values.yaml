@@ -6,10 +6,6 @@ namespaces:
     name: goldengate-dev
 
 serviceAccounts:
-  runtime:
-    create: true
-    name: gg-runtime-sa
-    roleArn: ""
   oracle:
     create: true
     name: gg-oracle-sa
@@ -17,6 +13,14 @@ serviceAccounts:
   postgresql:
     create: true
     name: gg-postgresql-sa
+    roleArn: ""
+  mssql:
+    create: true
+    name: gg-mssql-sa
+    roleArn: ""
+  daa:
+    create: true
+    name: gg-daa-sa
     roleArn: ""
 
 fluentBit:

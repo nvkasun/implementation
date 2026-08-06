@@ -17,7 +17,8 @@
             "system:serviceaccount:gg-dev-*:ogg-oracle-sa",
             "system:serviceaccount:goldengate-dev:gg-oracle-sa",
             "system:serviceaccount:goldengate-dev:gg-postgresql-sa",
-            "system:serviceaccount:goldengate-dev:gg-runtime-sa"
+            "system:serviceaccount:goldengate-dev:gg-mssql-sa",
+            "system:serviceaccount:goldengate-dev:gg-daa-sa"
           ]
         }
       }

@@ -38,6 +38,9 @@ locals {
   goldengate_deployment_admin_secret_declared = {
     for id, doc in local.goldengate_runtime_documents : id => try(doc.deployment.adminSecret, null) != null
   }
+  goldengate_service_account_declared = {
+    for id, doc in local.goldengate_runtime_documents : id => try(doc.runtime.serviceAccount, null) != null
+  }
   goldengate_csi_admin_object_name_declared = {
     for id, doc in local.goldengate_runtime_documents : id => try(doc.runtime.csi.admin.objectName, null) != null
   }
@@ -48,15 +51,15 @@ locals {
     for id, doc in local.goldengate_runtime_documents : id => try(doc.runtime.csi.serviceAccountRoleArn, null) != null
   }
 
-  # runtime.serviceAccount is optional (the workflow injects it); when present it must match the shared invariant exactly.
-  goldengate_service_account_declared = {
-    for id, doc in local.goldengate_runtime_documents : id => try(doc.runtime.serviceAccount, null) != null
+  # The one central approved flavour-identity map; mirrors hack/goldengate-deployment-model.py's RUNTIME_IDENTITY_MAP exactly.
+  goldengate_runtime_identity_map = {
+    oracle      = "gg-oracle-sa"
+    postgresql  = "gg-postgresql-sa"
+    sqlserver   = "gg-mssql-sa"
+    distributed = "gg-daa-sa"
   }
-  goldengate_service_account_name_raw = {
-    for id, doc in local.goldengate_runtime_documents : id => try(doc.runtime.serviceAccount.name, "")
-  }
-  goldengate_service_account_create_jsonenc = {
-    for id, doc in local.goldengate_runtime_documents : id => try(jsonencode(doc.runtime.serviceAccount.create), "")
+  goldengate_deployment_type_raw = {
+    for id, doc in local.goldengate_runtime_documents : id => try(doc.runtime.deploymentType, "")
   }
 
   # No filtering here; terraform_data.goldengate_runtime_contract enforces the full contract as a plan-blocking precondition.
@@ -95,8 +98,13 @@ locals {
     : "${var.environment}/goldengate/target/admin"
   }
 
-  goldengate_tls_secret_name              = "${var.environment}/goldengate/tls-certificate"
-  goldengate_runtime_service_account_name = "gg-runtime-sa"
+  goldengate_tls_secret_name = "${var.environment}/goldengate/tls-certificate"
+
+  # deploymentType alone selects the approved runtime identity; a document with no approved identity never reaches this map (the precondition below blocks plan first).
+  goldengate_runtime_service_account_names = {
+    for id in local.goldengate_deployment_names : id =>
+    lookup(local.goldengate_runtime_identity_map, try(local.goldengate_enabled_deployments[id].runtime.deploymentType, ""), null)
+  }
 
   goldengate_platform_values = yamldecode(file("${path.module}/../../platform/${var.environment}/goldengate-platform/values.yaml"))
   goldengate_monitor_values  = yamldecode(file("${path.module}/goldengate-monitor/values.yaml"))
@@ -156,14 +164,12 @@ resource "terraform_data" "goldengate_runtime_contract" {
       error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.image.tag must be explicit and must not be \"latest\"."
     }
     precondition {
-      condition = (
-        !local.goldengate_service_account_declared[each.key]
-        || (
-          local.goldengate_service_account_name_raw[each.key] == "gg-runtime-sa"
-          && local.goldengate_service_account_create_jsonenc[each.key] == "false"
-        )
-      )
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.serviceAccount, when present, must be exactly {name: gg-runtime-sa, create: false} (a shared platform invariant, best left omitted)."
+      condition     = contains(keys(local.goldengate_runtime_identity_map), local.goldengate_deployment_type_raw[each.key])
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.deploymentType does not have an approved runtime identity."
+    }
+    precondition {
+      condition     = !local.goldengate_service_account_declared[each.key]
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.serviceAccount is a forbidden override -- it is derived solely from runtime.deploymentType."
     }
     precondition {
       condition     = !local.goldengate_deployment_admin_secret_declared[each.key]

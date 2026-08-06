@@ -63,11 +63,12 @@ env:
   ARGOCD_APP_NAME: goldengate-dev-platform
   ARGOCD_PLATFORM_SECRET_NAME: argocd-ecr-goldengate-platform-oci
 
-  # Shared, engine-level runtime identities this chart is the single owner of; never used by an individual GoldenGate runtime release.
+  # One approved runtime ServiceAccount per GoldenGate deployment flavour this chart is the single owner of; never used by an individual GoldenGate runtime release.
   RUNTIME_NAMESPACE: goldengate-dev
-  RUNTIME_SA_NAME: gg-runtime-sa
   ORACLE_SA_NAME: gg-oracle-sa
   POSTGRESQL_SA_NAME: gg-postgresql-sa
+  MSSQL_SA_NAME: gg-mssql-sa
+  DAA_SA_NAME: gg-daa-sa
 
   # The second namespace the Fluent Bit DaemonSet ships logs from (the shared monitor's namespace, owned by helm/goldengate-monitor, never created/altered by this chart).
   MONITOR_NAMESPACE: goldengate-monitoring
@@ -75,9 +76,10 @@ env:
   FLUENT_BIT_MONITOR_LOG_GROUP: /adcb/goldengate/dev/monitor
 
   # All runtime ServiceAccounts use the shared GoldenGateSecretsReadRole-dev role (also used by the shared monitor; extended trust policy at envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json); this ARN is a literal predicted value since this repository has no Terraform outputs.tf.
-  RUNTIME_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev
   ORACLE_RUNTIME_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev
   POSTGRESQL_RUNTIME_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev
+  MSSQL_RUNTIME_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev
+  DAA_RUNTIME_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev
 
   # Platform-level Fluent Bit DaemonSet's dedicated least-privilege role -- see envs/dev/policies/goldengate-platform-logging-dev/.
   FLUENT_BIT_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGatePlatformLoggingRole-dev
@@ -356,9 +358,10 @@ jobs:
 
           helm lint "$HELM_CHART_PATH" \
             --values "$VALUES_FILE" \
-            --set-string serviceAccounts.runtime.roleArn="$RUNTIME_ROLE_ARN" \
             --set-string serviceAccounts.oracle.roleArn="$ORACLE_RUNTIME_ROLE_ARN" \
             --set-string serviceAccounts.postgresql.roleArn="$POSTGRESQL_RUNTIME_ROLE_ARN" \
+            --set-string serviceAccounts.mssql.roleArn="$MSSQL_RUNTIME_ROLE_ARN" \
+            --set-string serviceAccounts.daa.roleArn="$DAA_RUNTIME_ROLE_ARN" \
             --set-string fluentBit.serviceAccount.roleArn="$FLUENT_BIT_ROLE_ARN" \
             --set-string fluentBit.aws.region="$AWS_REGION" \
             --set-string fluentBit.image.reference="$FLUENT_BIT_IMAGE"
@@ -372,9 +375,10 @@ jobs:
 
           helm template "$RELEASE_NAME" "$HELM_CHART_PATH" \
             --values "$VALUES_FILE" \
-            --set-string serviceAccounts.runtime.roleArn="$RUNTIME_ROLE_ARN" \
             --set-string serviceAccounts.oracle.roleArn="$ORACLE_RUNTIME_ROLE_ARN" \
             --set-string serviceAccounts.postgresql.roleArn="$POSTGRESQL_RUNTIME_ROLE_ARN" \
+            --set-string serviceAccounts.mssql.roleArn="$MSSQL_RUNTIME_ROLE_ARN" \
+            --set-string serviceAccounts.daa.roleArn="$DAA_RUNTIME_ROLE_ARN" \
             --set-string fluentBit.serviceAccount.roleArn="$FLUENT_BIT_ROLE_ARN" \
             --set-string fluentBit.aws.region="$AWS_REGION" \
             --set-string fluentBit.image.reference="$FLUENT_BIT_IMAGE" \
@@ -466,7 +470,7 @@ jobs:
 
           assert_deletion_protected "Namespace ${RUNTIME_NAMESPACE}" "$RUNTIME_NS_BLOCK"
 
-          # No fixed total ServiceAccount count: legacy oracle/postgresql identities are optional during the gg-runtime-sa migration.
+          # No fixed total ServiceAccount count: unrelated platform ServiceAccounts may exist; validate each approved identity by expected name and annotation instead.
           count_serviceaccount_documents() {
             local sa_name="$1"
             local split_dir count doc
@@ -494,7 +498,10 @@ jobs:
               exit 1
             fi
           }
-          assert_exactly_one_serviceaccount "$RUNTIME_SA_NAME"
+          assert_exactly_one_serviceaccount "$ORACLE_SA_NAME"
+          assert_exactly_one_serviceaccount "$POSTGRESQL_SA_NAME"
+          assert_exactly_one_serviceaccount "$MSSQL_SA_NAME"
+          assert_exactly_one_serviceaccount "$DAA_SA_NAME"
           assert_exactly_one_serviceaccount "$FLUENT_BIT_SA_NAME"
 
           # deletion_protected is "true" for the shared oracle/postgresql identities (must survive this Application's own deletion) and "false" for gg-fluent-bit (pruned/deleted normally with this release).
@@ -534,18 +541,14 @@ jobs:
             fi
           }
 
-          validate_runtime_sa "$RUNTIME_SA_NAME" "$RUNTIME_ROLE_ARN" "true"
-          # Legacy per-engine identities render correctly only while still enabled in the DEV values file; retained during the gg-runtime-sa migration.
-          if [ -n "$(select_document "$RENDERED" "ServiceAccount" "$ORACLE_SA_NAME")" ]; then
-            validate_runtime_sa "$ORACLE_SA_NAME" "$ORACLE_RUNTIME_ROLE_ARN" "true"
-          fi
-          if [ -n "$(select_document "$RENDERED" "ServiceAccount" "$POSTGRESQL_SA_NAME")" ]; then
-            validate_runtime_sa "$POSTGRESQL_SA_NAME" "$POSTGRESQL_RUNTIME_ROLE_ARN" "true"
-          fi
+          validate_runtime_sa "$ORACLE_SA_NAME" "$ORACLE_RUNTIME_ROLE_ARN" "true"
+          validate_runtime_sa "$POSTGRESQL_SA_NAME" "$POSTGRESQL_RUNTIME_ROLE_ARN" "true"
+          validate_runtime_sa "$MSSQL_SA_NAME" "$MSSQL_RUNTIME_ROLE_ARN" "true"
+          validate_runtime_sa "$DAA_SA_NAME" "$DAA_RUNTIME_ROLE_ARN" "true"
           validate_runtime_sa "$FLUENT_BIT_SA_NAME" "$FLUENT_BIT_ROLE_ARN" "false"
 
           echo "Validating no unexpected IRSA role is used by any rendered ServiceAccount..."
-          ALLOWED_RUNTIME_ROLE_ARNS="$(printf '%s\n%s' "$RUNTIME_ROLE_ARN" "$FLUENT_BIT_ROLE_ARN")"
+          ALLOWED_RUNTIME_ROLE_ARNS="$(printf '%s\n%s\n%s\n%s\n%s' "$ORACLE_RUNTIME_ROLE_ARN" "$POSTGRESQL_RUNTIME_ROLE_ARN" "$MSSQL_RUNTIME_ROLE_ARN" "$DAA_RUNTIME_ROLE_ARN" "$FLUENT_BIT_ROLE_ARN")"
           while IFS= read -r role_arn_line; do
             [ -z "$role_arn_line" ] && continue
             actual_role_arn="$(normalize_value "${role_arn_line#*role-arn:}")"
@@ -890,12 +893,14 @@ jobs:
                 valueFiles:
                   - values-deployment.yaml
                 parameters:
-                  - name: serviceAccounts.runtime.roleArn
-                    value: ${RUNTIME_ROLE_ARN}
                   - name: serviceAccounts.oracle.roleArn
                     value: ${ORACLE_RUNTIME_ROLE_ARN}
                   - name: serviceAccounts.postgresql.roleArn
                     value: ${POSTGRESQL_RUNTIME_ROLE_ARN}
+                  - name: serviceAccounts.mssql.roleArn
+                    value: ${MSSQL_RUNTIME_ROLE_ARN}
+                  - name: serviceAccounts.daa.roleArn
+                    value: ${DAA_RUNTIME_ROLE_ARN}
                   - name: fluentBit.serviceAccount.roleArn
                     value: ${FLUENT_BIT_ROLE_ARN}
                   - name: fluentBit.aws.region
@@ -991,6 +996,22 @@ jobs:
           fi
           echo "OK: ${POSTGRESQL_SA_NAME} IRSA role annotation matches ${POSTGRESQL_RUNTIME_ROLE_ARN}."
 
+          kubectl get serviceaccount "$MSSQL_SA_NAME" -n "$RUNTIME_NAMESPACE"
+          MSSQL_ROLE_ANNOTATION="$(kubectl get serviceaccount "$MSSQL_SA_NAME" -n "$RUNTIME_NAMESPACE" -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}')"
+          if [ "$MSSQL_ROLE_ANNOTATION" != "$MSSQL_RUNTIME_ROLE_ARN" ]; then
+            echo "FAIL: unexpected IRSA role annotation on ServiceAccount ${MSSQL_SA_NAME}: ${MSSQL_ROLE_ANNOTATION}"
+            exit 1
+          fi
+          echo "OK: ${MSSQL_SA_NAME} IRSA role annotation matches ${MSSQL_RUNTIME_ROLE_ARN}."
+
+          kubectl get serviceaccount "$DAA_SA_NAME" -n "$RUNTIME_NAMESPACE"
+          DAA_ROLE_ANNOTATION="$(kubectl get serviceaccount "$DAA_SA_NAME" -n "$RUNTIME_NAMESPACE" -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}')"
+          if [ "$DAA_ROLE_ANNOTATION" != "$DAA_RUNTIME_ROLE_ARN" ]; then
+            echo "FAIL: unexpected IRSA role annotation on ServiceAccount ${DAA_SA_NAME}: ${DAA_ROLE_ANNOTATION}"
+            exit 1
+          fi
+          echo "OK: ${DAA_SA_NAME} IRSA role annotation matches ${DAA_RUNTIME_ROLE_ARN}."
+
           echo "Confirming this Application owns no GoldenGate runtime workload resources (namespaces/ServiceAccounts and the Phase 6A Fluent Bit DaemonSet only)..."
           WORKLOAD_COUNT=0
           for kind in statefulset deployment; do
@@ -1040,10 +1061,12 @@ jobs:
             echo "### Ownership"
             echo ""
             echo "This is the single designated owner of Namespace/${RUNTIME_NAMESPACE},"
-            echo "ServiceAccount/${ORACLE_SA_NAME}, and"
-            echo "ServiceAccount/${POSTGRESQL_SA_NAME}. Individual GoldenGate runtime"
-            echo "Applications (goldengate-eks-app.yaml) reference these ServiceAccounts by"
-            echo "name only (serviceAccount.create=false) and never own or delete them."
+            echo "ServiceAccount/${ORACLE_SA_NAME}, ServiceAccount/${POSTGRESQL_SA_NAME},"
+            echo "ServiceAccount/${MSSQL_SA_NAME}, and ServiceAccount/${DAA_SA_NAME} --"
+            echo "one approved runtime identity per GoldenGate deployment flavour. Individual"
+            echo "GoldenGate runtime Applications (goldengate-eks-app.yaml) reference these"
+            echo "ServiceAccounts by name only (serviceAccount.create=false) and never own or"
+            echo "delete them."
             echo ""
             echo "Phase 6A: this Application also owns DaemonSet/gg-fluent-bit"
             echo "(platform-level centralized container logging, ServiceAccount/${FLUENT_BIT_SA_NAME},"
