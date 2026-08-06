@@ -128,7 +128,15 @@ jobs:
       - validate_model
     if: needs.validate_model.outputs.effective_deploy == 'true'
 
+    # The called Terraform chain needs packages/pull-requests beyond the orchestrator's own top-level permissions; a callee can never be elevated above its caller.
+    permissions:
+      id-token: write
+      contents: read
+      packages: write
+      pull-requests: read
+
     uses: ./.github/workflows/gg-iam-secrets-deployment.yaml
+    secrets: inherit
     with:
       environment: dev
       region: eu-west-1
@@ -542,6 +550,7 @@ jobs:
           echo "Deployment values: $VALUES_FILE"
 
       - name: Login Helm to Amazon ECR
+        if: ${{ matrix.deploy }}
         shell: bash
         run: |
           set -euo pipefail
@@ -550,6 +559,7 @@ jobs:
             | helm registry login --username AWS --password-stdin "$ECR_REGISTRY"
 
       - name: Ensure Helm ECR repository exists
+        if: ${{ matrix.deploy }}
         shell: bash
         run: |
           set -euo pipefail
@@ -572,6 +582,7 @@ jobs:
           fi
 
       - name: Ensure Helm ECR repository policy allows Argo CD pull
+        if: ${{ matrix.deploy }}
         shell: bash
         run: |
           set -euo pipefail
@@ -1277,6 +1288,7 @@ jobs:
           ls -lrt packaged
 
       - name: Push Helm chart to ECR as OCI artifact
+        if: ${{ matrix.deploy }}
         shell: bash
         run: |
           set -euo pipefail
@@ -1287,6 +1299,7 @@ jobs:
           echo "$HELM_CHART_REF:$CHART_VERSION"
 
       - name: Verify Helm chart can be pulled from ECR
+        if: ${{ matrix.deploy }}
         shell: bash
         run: |
           set -euo pipefail
@@ -1930,22 +1943,110 @@ jobs:
       - validate_shared_secrets_once
       - build_publish_and_deploy
       - delete_removed_argocd_applications
-    if: ${{ always() && needs.validate_shared_secrets_once.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' }}
+    # goldengate-monitor.yaml publishes unconditionally on every internal step, so this call must be skipped entirely for deploy=false.
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && always() && needs.validate_shared_secrets_once.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' }}
 
     uses: ./.github/workflows/goldengate-monitor.yaml
     with:
       environment: dev
-      deploy: ${{ needs.validate_model.outputs.effective_deploy == 'true' }}
+      deploy: true
       # The global CloudWatch publisher must never be disabled by this orchestrator; existing gates stay whatever CONFIG already has (metrics_gate_expectation=any).
       enable_cloudwatch_publication: true
       metrics_gate_expectation: any
+
+  monitor_dry_run_validation:
+    name: Validate the GoldenGate monitor locally (deploy=false, no publishing)
+
+    needs:
+      - validate_model
+      - validate_shared_secrets_once
+      - build_publish_and_deploy
+      - delete_removed_argocd_applications
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'false' && always() && needs.validate_shared_secrets_once.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' }}
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            monitoring/monitor/requirements.txt
+            monitoring/monitor/requirements-test.txt
+
+      - name: Install monitor runtime and test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install --disable-pip-version-check \
+            -r monitoring/monitor/requirements.txt \
+            -r monitoring/monitor/requirements-test.txt
+
+      - name: Run monitor unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 -m unittest discover -s monitoring/monitor/tests -p "test_*.py" -v
+
+      - name: Generate and validate the folder-driven registry (no publish)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p work/generated/dev
+          python3 hack/goldengate-deployment-model.py --environment dev registry --output work/generated/dev/goldengate-deployments.yaml
+          echo "Generated registry:"
+          cat work/generated/dev/goldengate-deployments.yaml
+
+      - name: Helm lint and template the monitor chart locally
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! command -v helm >/dev/null 2>&1; then
+            echo "FAIL: helm is required for local monitor chart validation and is not available on this runner."
+            exit 1
+          fi
+
+          STAGED_CHART="work/staged/goldengate-monitor"
+          rm -rf "$STAGED_CHART"
+          mkdir -p "$STAGED_CHART" "$STAGED_CHART/files"
+          cp -a helm/goldengate-monitor/. "$STAGED_CHART/"
+          cp work/generated/dev/goldengate-deployments.yaml "$STAGED_CHART/files/goldengate-deployments.yaml"
+
+          helm lint "$STAGED_CHART" \
+            --set image.repository=example.invalid/goldengate-monitor \
+            --set image.tag=dry-run \
+            --set serviceAccount.roleArn=arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev
+
+          mkdir -p rendered
+          helm template gg-monitor "$STAGED_CHART" \
+            --namespace goldengate-monitoring \
+            -f envs/dev/goldengate-monitor/values.yaml \
+            --set image.repository=example.invalid/goldengate-monitor \
+            --set image.tag=dry-run \
+            --set serviceAccount.roleArn=arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev \
+            > rendered/gg-monitor-dry-run.yaml
+
+          echo "OK: monitor chart lints and renders cleanly (no image build, no ECR push, no Argo CD/Kubernetes mutation)."
 
   final_validation:
     name: Final validation
 
     needs:
+      - validate_shared_secrets_once
+      - build_publish_and_deploy
+      - delete_removed_argocd_applications
       - monitor_sync_once
-    if: ${{ always() && needs.monitor_sync_once.result == 'success' }}
+      - monitor_dry_run_validation
+    if: ${{ always() && needs.validate_shared_secrets_once.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' && needs.monitor_sync_once.result != 'failure' && needs.monitor_sync_once.result != 'cancelled' && needs.monitor_dry_run_validation.result != 'failure' && needs.monitor_dry_run_validation.result != 'cancelled' }}
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -1969,7 +2070,7 @@ jobs:
           {
             echo "### GoldenGate onboarding orchestrator summary"
             echo ""
-            echo "validate-model -> terraform-sync-once -> platform-sync-once -> bootstrap-admin-secrets -> runtime-deployment -> monitor-sync-once -> final-validation"
+            echo "validate-model -> terraform-sync-once -> platform-sync-once -> validate-shared-secrets-once -> runtime-deployment -> monitor-sync-once (or monitor-dry-run-validation) -> final-validation"
             echo ""
             echo "All required stages completed successfully."
           } >> "$GITHUB_STEP_SUMMARY"

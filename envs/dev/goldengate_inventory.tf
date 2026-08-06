@@ -208,6 +208,47 @@ resource "terraform_data" "goldengate_runtime_contract" {
   }
 }
 
+# Aggregate, plan-blocking cross-pipeline rules; check blocks below are diagnostic-only and never block plan/apply on their own.
+resource "terraform_data" "goldengate_cross_pipeline_contract" {
+  input = "goldengate-cross-pipeline-contract"
+
+  lifecycle {
+    precondition {
+      condition = alltrue([
+        for pipeline in local.goldengate_pipeline_names : length([
+          for id in local.goldengate_deployment_names : id
+          if try(local.goldengate_enabled_deployments[id].deployment.pipeline, "") == pipeline
+          && try(local.goldengate_enabled_deployments[id].deployment.role, "") == "source"
+        ]) <= 1
+      ])
+      error_message = "A GoldenGate pipeline has more than one enabled source deployment."
+    }
+    precondition {
+      condition = alltrue([
+        for pipeline in local.goldengate_pipeline_names : length([
+          for id in local.goldengate_deployment_names : id
+          if try(local.goldengate_enabled_deployments[id].deployment.pipeline, "") == pipeline
+          && try(local.goldengate_enabled_deployments[id].deployment.role, "") == "target"
+        ]) <= 1
+      ])
+      error_message = "A GoldenGate pipeline has more than one enabled target deployment."
+    }
+    precondition {
+      condition = alltrue([
+        for id in local.goldengate_deployment_names : !contains(local.goldengate_duplicate_alb_group_order_ids, id)
+      ])
+      error_message = "Two or more enabled GoldenGate deployments share the same ALB group order."
+    }
+    precondition {
+      condition = alltrue([
+        for id in local.goldengate_deployment_names :
+        try(local.goldengate_enabled_deployments[id].replication.enabled, false) == false
+      ])
+      error_message = "Replication bootstrap activation is not available in Phase 6D0. Complete the approved database and GoldenGate Admin REST validation phase first."
+    }
+  }
+}
+
 check "goldengate_candidate_count_matches_value_file_count" {
   assert {
     condition     = length(local.goldengate_runtime_candidates) == length(local.goldengate_runtime_value_files)

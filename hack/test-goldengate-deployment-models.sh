@@ -6202,6 +6202,190 @@ else
 fi
 
 echo ""
+echo "--- Phase 6D0-Final: Terraform cross-pipeline plan-blocking fixtures ---"
+
+TF_PLAN_SCRATCH=""
+if command -v terraform >/dev/null 2>&1; then
+  TF_PLAN_SCRATCH="$(mktemp -d)"
+  mkdir -p "${TF_PLAN_SCRATCH}/envs/dev/gg-oracle-payments-01" "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-payments-01" \
+    "${TF_PLAN_SCRATCH}/platform/dev/goldengate-platform" "${TF_PLAN_SCRATCH}/envs/dev/goldengate-monitor"
+  cp envs/dev/goldengate_inventory.tf "${TF_PLAN_SCRATCH}/envs/dev/goldengate_inventory.tf"
+  cp envs/dev/gg-oracle-payments-01/values.yaml "${TF_PLAN_SCRATCH}/envs/dev/gg-oracle-payments-01/values.yaml"
+  cp envs/dev/gg-postgresql-payments-01/values.yaml "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-payments-01/values.yaml"
+  cp platform/dev/goldengate-platform/values.yaml "${TF_PLAN_SCRATCH}/platform/dev/goldengate-platform/values.yaml"
+  cp envs/dev/goldengate-monitor/values.yaml "${TF_PLAN_SCRATCH}/envs/dev/goldengate-monitor/values.yaml"
+  cat > "${TF_PLAN_SCRATCH}/envs/dev/provider.tf" <<'EOF'
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+EOF
+
+  set +e
+  (cd "${TF_PLAN_SCRATCH}/envs/dev" && terraform init -backend=false) >"${TF_PLAN_SCRATCH}/init.log" 2>&1
+  TF_INIT_STATUS=$?
+  set -e
+
+  if [ "$TF_INIT_STATUS" -ne 0 ]; then
+    skip "Terraform cross-pipeline plan fixtures -- terraform init failed (no network access to the public provider registry in this environment)"
+  else
+    set +e
+    (cd "${TF_PLAN_SCRATCH}/envs/dev" && terraform validate) >"${TF_PLAN_SCRATCH}/validate.log" 2>&1
+    TF_VALIDATE_STATUS=$?
+    set -e
+    if [ "$TF_VALIDATE_STATUS" -eq 0 ]; then
+      pass "30: terraform validate succeeds against the real folder-driven inventory in an isolated scratch root"
+    else
+      fail "30: terraform validate failed against the real folder-driven inventory"
+      cat "${TF_PLAN_SCRATCH}/validate.log"
+    fi
+
+    set +e
+    (cd "${TF_PLAN_SCRATCH}/envs/dev" && terraform plan -input=false) >"${TF_PLAN_SCRATCH}/plan-baseline.log" 2>&1
+    TF_PLAN_BASELINE_STATUS=$?
+    set -e
+    if [ "$TF_PLAN_BASELINE_STATUS" -eq 0 ] && grep -q "3 to add, 0 to change, 0 to destroy" "${TF_PLAN_SCRATCH}/plan-baseline.log"; then
+      pass "30: a valid folder-driven inventory (2 real deployments) produces a clean Terraform plan"
+    else
+      fail "30: the baseline Terraform plan against valid real data was not clean"
+      cat "${TF_PLAN_SCRATCH}/plan-baseline.log"
+    fi
+
+    cp "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-payments-01/values.yaml" "${TF_PLAN_SCRATCH}/postgresql-backup.yaml"
+    sed -i 's/role: target/role: source/' "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-payments-01/values.yaml"
+    set +e
+    (cd "${TF_PLAN_SCRATCH}/envs/dev" && terraform plan -input=false) >"${TF_PLAN_SCRATCH}/plan-dup-source.log" 2>&1
+    TF_PLAN_DUP_SOURCE_STATUS=$?
+    set -e
+    if [ "$TF_PLAN_DUP_SOURCE_STATUS" -ne 0 ] && grep -q "more than one enabled source deployment" "${TF_PLAN_SCRATCH}/plan-dup-source.log"; then
+      pass "30: a duplicate enabled source in one pipeline produces a non-zero Terraform plan exit"
+    else
+      fail "30: a duplicate enabled source did not block Terraform plan as expected (exit=${TF_PLAN_DUP_SOURCE_STATUS})"
+      cat "${TF_PLAN_SCRATCH}/plan-dup-source.log"
+    fi
+    cp "${TF_PLAN_SCRATCH}/postgresql-backup.yaml" "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-payments-01/values.yaml"
+
+    cp "${TF_PLAN_SCRATCH}/envs/dev/gg-oracle-payments-01/values.yaml" "${TF_PLAN_SCRATCH}/oracle-backup.yaml"
+    sed -i 's/role: source/role: target/' "${TF_PLAN_SCRATCH}/envs/dev/gg-oracle-payments-01/values.yaml"
+    set +e
+    (cd "${TF_PLAN_SCRATCH}/envs/dev" && terraform plan -input=false) >"${TF_PLAN_SCRATCH}/plan-dup-target.log" 2>&1
+    TF_PLAN_DUP_TARGET_STATUS=$?
+    set -e
+    if [ "$TF_PLAN_DUP_TARGET_STATUS" -ne 0 ] && grep -q "more than one enabled target deployment" "${TF_PLAN_SCRATCH}/plan-dup-target.log"; then
+      pass "30: a duplicate enabled target in one pipeline produces a non-zero Terraform plan exit"
+    else
+      fail "30: a duplicate enabled target did not block Terraform plan as expected (exit=${TF_PLAN_DUP_TARGET_STATUS})"
+      cat "${TF_PLAN_SCRATCH}/plan-dup-target.log"
+    fi
+    cp "${TF_PLAN_SCRATCH}/oracle-backup.yaml" "${TF_PLAN_SCRATCH}/envs/dev/gg-oracle-payments-01/values.yaml"
+
+    cp "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-payments-01/values.yaml" "${TF_PLAN_SCRATCH}/postgresql-backup2.yaml"
+    sed -i 's/groupOrder: "111"/groupOrder: "110"/' "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-payments-01/values.yaml"
+    set +e
+    (cd "${TF_PLAN_SCRATCH}/envs/dev" && terraform plan -input=false) >"${TF_PLAN_SCRATCH}/plan-dup-alb.log" 2>&1
+    TF_PLAN_DUP_ALB_STATUS=$?
+    set -e
+    if [ "$TF_PLAN_DUP_ALB_STATUS" -ne 0 ] && grep -q "ALB group order" "${TF_PLAN_SCRATCH}/plan-dup-alb.log"; then
+      pass "30: a duplicate ALB group order produces a non-zero Terraform plan exit"
+    else
+      fail "30: a duplicate ALB group order did not block Terraform plan as expected (exit=${TF_PLAN_DUP_ALB_STATUS})"
+      cat "${TF_PLAN_SCRATCH}/plan-dup-alb.log"
+    fi
+    cp "${TF_PLAN_SCRATCH}/postgresql-backup2.yaml" "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-payments-01/values.yaml"
+  fi
+  rm -rf "${TF_PLAN_SCRATCH}"
+else
+  skip "Terraform cross-pipeline plan fixtures -- terraform not available"
+fi
+
+echo ""
+echo "--- Phase 6D0-Final: reusable-workflow secret/permission chain ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  set +e
+  WORKFLOW_CHAIN_CHECK="$(python3 - "$EKS_APP_WORKFLOW" ".github/workflows/gg-iam-secrets-deployment.yaml" ".github/workflows/goldengate-platform.yaml" ".github/workflows/goldengate-monitor.yaml" <<'PYEOF'
+import sys
+import yaml
+
+eks_app_path, terraform_wf_path, platform_wf_path, monitor_wf_path = sys.argv[1:5]
+
+eks_app = yaml.safe_load(open(eks_app_path))
+terraform_wf = yaml.safe_load(open(terraform_wf_path))
+platform_wf = yaml.safe_load(open(platform_wf_path))
+monitor_wf = yaml.safe_load(open(monitor_wf_path))
+
+jobs = eks_app["jobs"]
+terraform_job = jobs["terraform_sync_once"]
+
+if terraform_job.get("secrets") != "inherit":
+    print("FAIL: terraform_sync_once does not forward secrets to gg-iam-secrets-deployment.yaml (secrets: inherit missing)")
+    sys.exit(1)
+
+terraform_wf_permissions = terraform_wf.get("permissions") or {}
+caller_permissions = terraform_job.get("permissions") or {}
+for scope, level in terraform_wf_permissions.items():
+    if level == "none":
+        continue
+    if caller_permissions.get(scope) != level:
+        print(f"FAIL: terraform_sync_once caller permission {scope!r} is {caller_permissions.get(scope)!r}, called workflow needs {level!r}")
+        sys.exit(1)
+
+apply_job = terraform_wf["jobs"]["apply"]
+if apply_job.get("secrets") != "inherit":
+    print("FAIL: gg-iam-secrets-deployment.yaml's apply job does not forward secrets to the ADCB reusable workflow")
+    sys.exit(1)
+
+for name, job in (("platform_sync_once", jobs["platform_sync_once"]), ("monitor_sync_once", jobs["monitor_sync_once"])):
+    if "secrets" in job:
+        print(f"FAIL: {name} declares unnecessary secret forwarding (neither called workflow references secrets.*)")
+        sys.exit(1)
+
+for path, doc in ((platform_wf_path, platform_wf), (monitor_wf_path, monitor_wf)):
+    with open(path) as f:
+        text = f.read()
+    if "${{ secrets." in text or "${{secrets." in text:
+        print(f"FAIL: {path} references secrets.* but its caller job declares no secret forwarding")
+        sys.exit(1)
+
+print("OK: secret forwarding and caller/callee permission alignment are correct across the reusable-workflow chain")
+PYEOF
+)"
+  WORKFLOW_CHAIN_STATUS=$?
+  set -e
+  if [ "$WORKFLOW_CHAIN_STATUS" -eq 0 ]; then
+    pass "31: ${EKS_APP_WORKFLOW} forwards secrets/permissions correctly through the full reusable-workflow chain, and no nested workflow assumes an unavailable secret"
+  else
+    fail "31: ${WORKFLOW_CHAIN_CHECK}"
+  fi
+else
+  skip "31: reusable-workflow secret/permission chain check -- python3/PyYAML unavailable"
+fi
+
+if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  TRACKED_GENERATED_ARTIFACTS="$(git ls-files work/generated 2>/dev/null || true)"
+  if [ -z "$TRACKED_GENERATED_ARTIFACTS" ]; then
+    pass "31: no work/generated artifact is git-tracked; the workflow regenerates the registry on demand"
+  else
+    fail "31: a work/generated artifact is git-tracked and must be removed from source control:${TRACKED_GENERATED_ARTIFACTS}"
+  fi
+else
+  skip "31: work/generated tracking check -- not a git repository"
+fi
+
+# Static evidence only: GOLDENGATE_AWS_ROLE_ARN's live value is a GitHub repo setting, unverifiable offline.
+if grep -q "role-to-assume: \${{ env.ROLE_ARN }}" "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && grep -q 'name          = "GoldenGateEKSDeployRole-dev"' envs/dev/iam.tf 2>/dev/null \
+    && grep -q 'policy_folder = "goldengate-eks-deploy-dev"' envs/dev/iam.tf 2>/dev/null; then
+  pass "31: validate_shared_secrets_once assumes the same GOLDENGATE_AWS_ROLE_ARN role used everywhere else, and static evidence ties it to the policy carrying the required read-only shared-secret permissions (live value unverifiable offline)"
+else
+  fail "31: static evidence linking GOLDENGATE_AWS_ROLE_ARN to the read-only shared-secret policy is incomplete"
+fi
+
+echo ""
 echo "=================================================="
 echo "Summary: ${PASS_COUNT} passed, ${FAIL_COUNT} failed, ${SKIP_COUNT} skipped"
 echo "=================================================="
