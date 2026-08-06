@@ -7,12 +7,16 @@ namespaces:
     create: false
     name: ""
 
-# Shared, engine-level IRSA identities: one ServiceAccount per GoldenGate engine (not per runtime release/deployment), shared by all releases of that engine.
+# Shared runtime IRSA identity for every GoldenGate deployment type, plus optional legacy per-engine identities retained until migration completes.
 serviceAccounts:
-  oracle:
+  runtime:
     create: false
     name: ""
     # Required whenever create=true (IRSA needs the role ARN); never hard-code an account-specific ARN here -- the environment values file supplies it.
+    roleArn: ""
+  oracle:
+    create: false
+    name: ""
     roleArn: ""
   postgresql:
     create: false

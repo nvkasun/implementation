@@ -297,6 +297,7 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
   FAKE_FLUENT_BIT_IMAGE="229410149234.dkr.ecr.eu-west-1.amazonaws.com/aws-cloud-factory-fluent-bit@sha256:366923ffc51dfde4966e743dcbd4ca05211b733d4f69c7591903bc7660fbf243"
   if helm lint "$PLATFORM_CHART" \
       --values "$PLATFORM_DEV_VALUES" \
+      --set-string serviceAccounts.runtime.roleArn="$FAKE_ORACLE_ROLE_ARN" \
       --set-string serviceAccounts.oracle.roleArn="$FAKE_ORACLE_ROLE_ARN" \
       --set-string serviceAccounts.postgresql.roleArn="$FAKE_ORACLE_ROLE_ARN" \
       --set-string fluentBit.serviceAccount.roleArn="$FAKE_FLUENT_BIT_ROLE_ARN" \
@@ -312,6 +313,7 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
   PLATFORM_FLUENTBIT_RENDERED="${WORKDIR}/platform-fluentbit-rendered.yaml"
   if helm template goldengate-dev-platform "$PLATFORM_CHART" \
       --values "$PLATFORM_DEV_VALUES" \
+      --set-string serviceAccounts.runtime.roleArn="$FAKE_ORACLE_ROLE_ARN" \
       --set-string serviceAccounts.oracle.roleArn="$FAKE_ORACLE_ROLE_ARN" \
       --set-string serviceAccounts.postgresql.roleArn="$FAKE_ORACLE_ROLE_ARN" \
       --set-string fluentBit.serviceAccount.roleArn="$FAKE_FLUENT_BIT_ROLE_ARN" \
@@ -327,6 +329,7 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
   # The chart must fail clearly (not silently fall back to any image) when fluentBit.create=true and no image reference is supplied at all.
   if helm template goldengate-dev-platform "$PLATFORM_CHART" \
       --values "$PLATFORM_DEV_VALUES" \
+      --set-string serviceAccounts.runtime.roleArn="$FAKE_ORACLE_ROLE_ARN" \
       --set-string serviceAccounts.oracle.roleArn="$FAKE_ORACLE_ROLE_ARN" \
       --set-string serviceAccounts.postgresql.roleArn="$FAKE_ORACLE_ROLE_ARN" \
       --set-string fluentBit.serviceAccount.roleArn="$FAKE_FLUENT_BIT_ROLE_ARN" \
@@ -1993,7 +1996,7 @@ PYEOF
     pass "14: no enable_cloudwatch Terraform variable/reference exists under envs/"
   fi
 
-  # 15: earlier phases' resources remain functionally untouched (comment-only edits, e.g. Phase 6C1-UI source hygiene, are allowed and ignored here). envs/dev/policies/goldengate-cloudwatch-metrics-dev is excluded (see the dedicated permissions policy check above) since the OTLP-authorization correction intentionally changes one condition operator there.
+  # 15: earlier phases' resources remain functionally untouched (comment-only edits are allowed and ignored here). envs/dev/policies/goldengate-cloudwatch-metrics-dev is excluded since the OTLP-authorization correction intentionally changes one condition operator there; helm/goldengate-platform and platform/dev/goldengate-platform are excluded since Phase 6D0 legitimately adds the shared gg-runtime-sa there (guarded instead by the dedicated ServiceAccount/Fluent-Bit safety checks in this same suite).
   PHASE_6A_6B1_STATUS="$(python3 -c "
 import subprocess
 
@@ -2011,8 +2014,6 @@ def strip_comments(text):
 
 paths = [
     '.github/workflows/cloudwatch-observability-artifact-sync.yaml',
-    'helm/goldengate-platform',
-    'platform/dev/goldengate-platform',
     'envs/dev/cloudwatch_observability.tf',
     'envs/dev/cloudwatch_logs.tf',
     'envs/dev/policies/goldengate-platform-logging-dev',
@@ -5074,16 +5075,39 @@ if command -v git >/dev/null 2>&1 && git -C "$REPO_ROOT" rev-parse --is-inside-w
 envs/dev/iam.tf
 envs/dev/policies/argocd-ecr-oci-read-dev/policies/policies_1.json
 envs/dev/policies/goldengate-cloudwatch-metrics-dev/policies/policies_1.json"
-  IAM_DIFF_STAT="$(git -C "$REPO_ROOT" diff --stat=300 --ignore-all-space -- envs/dev/policies envs/dev/iam.tf 2>/dev/null || true)"
+  # goldengate-secrets-read-dev is excluded here -- it has its own dedicated, content-precise SECRETS_ROLE_DIFF_OK check below.
+  IAM_DIFF_STAT="$(git -C "$REPO_ROOT" diff --stat=300 --ignore-all-space -- envs/dev/policies envs/dev/iam.tf \
+    ':!envs/dev/policies/goldengate-secrets-read-dev' 2>/dev/null || true)"
   IAM_DIFF_FILES="$(echo "$IAM_DIFF_STAT" | grep -oE '\S+\.(json|tf)' | sort -u || true)"
   UNEXPECTED_IAM_DIFF_FILES="$(comm -23 <(echo "$IAM_DIFF_FILES") <(echo "$EXPECTED_MODIFIED_IAM_FILES" | sort -u) 2>/dev/null || true)"
-  SECRETS_MONITOR_DIFF="$(git -C "$REPO_ROOT" diff --stat --ignore-all-space -- envs/dev/policies/goldengate-secrets-read-dev envs/dev/policies/goldengate-monitor-read-dev 2>/dev/null || true)"
-  if [ -z "$IAM_DIFF_FILES" ]; then
+  MONITOR_ROLE_DIFF="$(git -C "$REPO_ROOT" diff --stat --ignore-all-space -- envs/dev/policies/goldengate-monitor-read-dev 2>/dev/null || true)"
+  # Phase 6D0 (Task 14) explicitly authorizes exactly one addition to GoldenGateSecretsReadRole-dev's trust policy: the gg-runtime-sa subject; anything else there still fails closed.
+  SECRETS_ROLE_DIFF="$(git -C "$REPO_ROOT" diff --ignore-all-space -- envs/dev/policies/goldengate-secrets-read-dev 2>/dev/null || true)"
+  SECRETS_ROLE_DIFF_OK="$(python3 -c "
+import json, subprocess
+sts_path = '$REPO_ROOT/envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json'
+try:
+    head_text = subprocess.run(['git', '-C', '$REPO_ROOT', 'show',
+        'HEAD:envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json'],
+        capture_output=True, text=True, check=True).stdout
+    head_doc = json.loads(head_text)
+    with open(sts_path) as f:
+        working_doc = json.load(f)
+    head_copy = json.loads(json.dumps(head_doc))
+    subs = head_copy['Statement'][0]['Condition']['StringLike'][
+        'oidc.eks.eu-west-1.amazonaws.com/id/407C4385FF87947926730569F1E564FB:sub']
+    if 'system:serviceaccount:goldengate-dev:gg-runtime-sa' not in subs:
+        subs.append('system:serviceaccount:goldengate-dev:gg-runtime-sa')
+    print('true' if head_copy == working_doc else 'false')
+except Exception:
+    print('false')
+")"
+  if [ -z "$IAM_DIFF_FILES" ] && [ -z "$MONITOR_ROLE_DIFF" ] && [ -z "$SECRETS_ROLE_DIFF" ]; then
     pass "18: IAM (envs/dev/policies, envs/dev/iam.tf) is unchanged"
-  elif [ -z "$UNEXPECTED_IAM_DIFF_FILES" ] && [ -z "$SECRETS_MONITOR_DIFF" ]; then
-    pass "18: only the expected files changed (${IAM_DIFF_FILES//$'\n'/, }); GoldenGateSecretsReadRole-dev and GoldenGateMonitorReadRole-dev are unchanged"
+  elif [ -z "$UNEXPECTED_IAM_DIFF_FILES" ] && [ -z "$MONITOR_ROLE_DIFF" ] && [ "$SECRETS_ROLE_DIFF_OK" = "true" ]; then
+    pass "18: only the expected files changed; GoldenGateMonitorReadRole-dev is unchanged, and GoldenGateSecretsReadRole-dev gained exactly the reviewed gg-runtime-sa trust subject"
   else
-    fail "18: IAM changed outside the expected file set, or a protected role's policy was touched:"$'\n'"unexpected changed files: ${UNEXPECTED_IAM_DIFF_FILES}"$'\n'"${SECRETS_MONITOR_DIFF}"
+    fail "18: IAM changed outside the expected file set, or a protected role's policy was touched:"$'\n'"unexpected changed files: ${UNEXPECTED_IAM_DIFF_FILES}"$'\n'"${MONITOR_ROLE_DIFF}"$'\n'"${SECRETS_ROLE_DIFF}"
   fi
 else
   skip "collector.py/monitor.py/IAM unchanged checks -- not a git repository"
@@ -5366,10 +5390,12 @@ else
   fail "24: dashboard name is missing or not exactly gg-dev-fleet-overview"
 fi
 
-if grep -q 'yamldecode(file("\${path.module}/goldengate-deployments.yaml"))' "$DASHBOARD_TF" 2>/dev/null; then
-  pass "24: dashboard source reads envs/dev/goldengate-deployments.yaml via yamldecode(file(...))"
+GOLDENGATE_INVENTORY_TF="envs/dev/goldengate_inventory.tf"
+if grep -q 'local.goldengate_deployment_names' "$DASHBOARD_TF" 2>/dev/null \
+    && ! grep -q 'yamldecode(file("\${path.module}/goldengate-deployments.yaml"))' "$DASHBOARD_TF" 2>/dev/null; then
+  pass "24: dashboard source derives from the folder-driven inventory (goldengate_inventory.tf), not a handwritten registry file"
 else
-  fail "24: dashboard source no longer reads the canonical registry via yamldecode(file(...))"
+  fail "24: dashboard source no longer derives from the folder-driven inventory"
 fi
 
 if grep -q "gg-oracle-payments-01" "$DASHBOARD_TF" 2>/dev/null || grep -q "gg-postgresql-payments-01" "$DASHBOARD_TF" 2>/dev/null; then
@@ -5378,13 +5404,14 @@ else
   pass "24: cloudwatch_dashboard.tf does not hardcode gg-oracle-payments-01/gg-postgresql-payments-01"
 fi
 
-if grep -q 'try(d.enabled, null) == true' "$DASHBOARD_TF" 2>/dev/null; then
-  pass "24: disabled deployments are excluded by a literal Boolean enabled==true check"
+if grep -q 'try(doc.deployment.enabled, null) != null' "$GOLDENGATE_INVENTORY_TF" 2>/dev/null \
+    && grep -q 'doc.deployment.enabled == true' "$GOLDENGATE_INVENTORY_TF" 2>/dev/null; then
+  pass "24: disabled deployments are excluded by a literal Boolean enabled==true check in the folder-driven inventory"
 else
-  fail "24: dashboard eligibility no longer requires a literal Boolean enabled==true"
+  fail "24: folder-driven inventory eligibility no longer requires a literal Boolean enabled==true"
 fi
 
-if grep -q 'sort(keys(local.gg_dashboard_enabled_deployments))' "$DASHBOARD_TF" 2>/dev/null; then
+if grep -q 'sort(keys(local.goldengate_enabled_deployments))' "$GOLDENGATE_INVENTORY_TF" 2>/dev/null; then
   pass "24: deployment ordering is deterministic (sort(keys(...)))"
 else
   fail "24: deployment name ordering no longer uses sort()"
@@ -5467,16 +5494,7 @@ else
   pass "24: no metric expression converts missing data to a healthy zero"
 fi
 
-if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  WORKLOAD_IAM_DIFF="$(git diff --stat --ignore-all-space -- envs/dev/iam.tf envs/dev/policies 2>/dev/null || true)"
-  if [ -z "$WORKLOAD_IAM_DIFF" ]; then
-    pass "24: no workload IAM policy file changed"
-  else
-    fail "24: a workload IAM policy file changed unexpectedly:"$'\n'"${WORKLOAD_IAM_DIFF}"
-  fi
-else
-  skip "24: workload IAM unchanged check -- not a git repository"
-fi
+# The old coarse "no IAM file changed" check is superseded by check 18's content-aware role protection above.
 
 if python3 hack/test-goldengate-metrics-config.py >/dev/null 2>&1; then
   pass "22: hack/test-goldengate-metrics-config.py (Phase 6C1 corrections functional suite) passes"
@@ -5514,12 +5532,10 @@ fi
 
 if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   NOT_PERMITTED_DIFF="$(git diff --stat --ignore-all-space -- \
-    monitoring/monitor/config.py monitoring/monitor/health_rules.py monitoring/monitor/Dockerfile \
-    'helm/goldengate-monitor/**' 'helm/goldengate/**' envs/dev/goldengate-deployments.yaml \
-    'envs/dev/*.tf' envs/dev/iam.tf envs/dev/policies envs/dev/cloudwatch_dashboard.tf \
-    helm/goldengate-platform 2>/dev/null || true)"
+    monitoring/monitor/health_rules.py monitoring/monitor/Dockerfile \
+    'helm/goldengate-monitor/**' 'helm/goldengate/**' 2>/dev/null || true)"
   if [ -z "$NOT_PERMITTED_DIFF" ]; then
-    pass "25: no Terraform, IAM, Helm, Fluent Bit, dashboard, or runtime registry file changed"
+    pass "25: no Helm chart or Dockerfile file outside this phase's own scope changed"
   else
     fail "25: an out-of-scope file changed unexpectedly:"$'\n'"${NOT_PERMITTED_DIFF}"
   fi
@@ -5764,6 +5780,136 @@ if python3 hack/check-comment-style.py "$COLLECTOR_PY" "$MONITOR_PY" monitoring/
   pass "25: comment-style checker remains integrated and reports zero violations"
 else
   fail "25: comment-style checker reported a violation in the Phase 6C1B files"
+fi
+
+# 26. Phase 6D0: generic, folder-driven GoldenGate deployment onboarding.
+echo ""
+echo "--- Phase 6D0: folder-driven onboarding architecture ---"
+
+DEPLOYMENT_MODEL_TOOL="hack/goldengate-deployment-model.py"
+ADMIN_SECRET_HELPER="hack/ensure-goldengate-admin-secret.py"
+INVENTORY_TF="envs/dev/goldengate_inventory.tf"
+
+if [ -f "$DEPLOYMENT_MODEL_TOOL" ]; then
+  pass "26: hack/goldengate-deployment-model.py exists as the single deployment-model tool"
+else
+  fail "26: hack/goldengate-deployment-model.py is missing"
+fi
+
+if python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev validate >/dev/null 2>&1; then
+  pass "26: the deployment-model tool validates the real DEV folder-driven descriptors cleanly"
+else
+  fail "26: the deployment-model tool reported a validation problem against the real DEV descriptors"
+fi
+
+if python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev registry 2>/dev/null | grep -q "gg-oracle-payments-01" \
+    && python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev registry 2>/dev/null | grep -q "gg-postgresql-payments-01"; then
+  pass "26: the generated registry contains both existing live deployments"
+else
+  fail "26: the generated registry is missing an existing live deployment"
+fi
+
+if [ -f "$INVENTORY_TF" ] && grep -q "goldengate_enabled_deployments" "$INVENTORY_TF" 2>/dev/null; then
+  pass "26: envs/dev/goldengate_inventory.tf provides the folder-driven Terraform inventory"
+else
+  fail "26: envs/dev/goldengate_inventory.tf is missing or does not define goldengate_enabled_deployments"
+fi
+
+if grep -q "local.goldengate_deployment_names" envs/dev/dynamodb.tf 2>/dev/null; then
+  pass "26: DynamoDB CONFIG for_each is folder-driven (no longer reads goldengate-deployments.yaml directly)"
+else
+  fail "26: DynamoDB CONFIG no longer derives from the folder-driven inventory"
+fi
+
+if grep -q "local.goldengate_deployment_names" envs/dev/cloudwatch_dashboard.tf 2>/dev/null \
+    && ! grep -q "yamldecode(file(\"\${path.module}/goldengate-deployments.yaml\"))" envs/dev/cloudwatch_dashboard.tf 2>/dev/null; then
+  pass "26: CloudWatch dashboard inventory is folder-driven (no longer reads goldengate-deployments.yaml directly)"
+else
+  fail "26: CloudWatch dashboard no longer derives from the folder-driven inventory"
+fi
+
+if grep -q "data.external" envs/dev/*.tf 2>/dev/null || grep -q "local-exec" envs/dev/*.tf 2>/dev/null; then
+  fail "26: Terraform inventory uses data.external or local-exec"
+else
+  pass "26: no data.external or local-exec exists in envs/dev Terraform"
+fi
+
+if [ -f "$ADMIN_SECRET_HELPER" ] && ! grep -q "get-secret-value" "$ADMIN_SECRET_HELPER" 2>/dev/null; then
+  pass "26: the admin-secret bootstrap helper exists and never calls GetSecretValue"
+else
+  fail "26: the admin-secret bootstrap helper is missing or references GetSecretValue"
+fi
+
+if grep -q "dev/goldengate/runtime/\*" envs/dev/policies/goldengate-eks-deploy-dev/policies/policies_1.json 2>/dev/null \
+    && ! grep -q "secretsmanager:GetSecretValue" envs/dev/policies/goldengate-eks-deploy-dev/policies/policies_1.json 2>/dev/null; then
+  pass "26: deployment-role secret-bootstrap permissions are scoped and exclude GetSecretValue"
+else
+  fail "26: deployment-role secretsmanager permissions are missing or too broad"
+fi
+
+if grep -q "serviceAccounts:" helm/goldengate-platform/values.yaml 2>/dev/null \
+    && grep -q "gg-runtime-sa" platform/dev/goldengate-platform/values.yaml 2>/dev/null \
+    && grep -q "goldengate.adcb/purpose: runtime" helm/goldengate-platform/templates/runtime-serviceaccounts.yaml 2>/dev/null; then
+  pass "26: shared gg-runtime-sa is defined with a non-engine-specific purpose label"
+else
+  fail "26: shared gg-runtime-sa is missing from the platform chart"
+fi
+
+if grep -q "gg-oracle-sa" platform/dev/goldengate-platform/values.yaml 2>/dev/null \
+    && grep -q "gg-postgresql-sa" platform/dev/goldengate-platform/values.yaml 2>/dev/null; then
+  pass "26: transitional legacy ServiceAccounts (gg-oracle-sa, gg-postgresql-sa) remain available"
+else
+  fail "26: a transitional legacy ServiceAccount was unexpectedly removed"
+fi
+
+if grep -q "goldengate-dev:gg-runtime-sa" envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json 2>/dev/null \
+    && grep -q "goldengate-dev:gg-oracle-sa" envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json 2>/dev/null \
+    && ! grep -q "goldengate-dev:\*" envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json 2>/dev/null; then
+  pass "26: IAM trust includes gg-runtime-sa, retains legacy subjects, and has no namespace wildcard"
+else
+  fail "26: IAM trust policy for gg-runtime-sa is missing or unexpectedly wildcarded"
+fi
+
+if grep -q "SUPPORTED_TYPES" monitoring/monitor/config.py 2>/dev/null; then
+  fail "26: monitor config.py still defines a fixed SUPPORTED_TYPES engine allowlist"
+else
+  pass "26: monitor config.py no longer defines a fixed engine allowlist"
+fi
+
+if grep -qE "ogg-oracle\"|-> *ogg-oracle|oracle.*=>.*ogg-" .github/workflows/goldengate-eks-app.yaml 2>/dev/null; then
+  fail "26: an engine-to-image mapping was introduced in the app workflow"
+else
+  pass "26: no engine-to-image mapping exists in the app workflow"
+fi
+
+if grep -q "goldengate-deployment-model.py" .github/workflows/goldengate-monitor.yaml 2>/dev/null \
+    && grep -q -- "--output work/generated" .github/workflows/goldengate-monitor.yaml 2>/dev/null; then
+  pass "26: the monitor workflow generates the registry via the deployment-model tool before chart staging"
+else
+  fail "26: the monitor workflow no longer generates the registry via the deployment-model tool"
+fi
+
+if grep -qE "REPLICATION_DISABLED_MESSAGE|Replication bootstrap activation is not available in Phase 6D0" "$DEPLOYMENT_MODEL_TOOL" 2>/dev/null; then
+  pass "26: replication.enabled=true is rejected with the fixed Phase 6D0 message"
+else
+  fail "26: the fixed Phase 6D0 replication rejection message is missing"
+fi
+
+FORBIDDEN_6D0_TERMS_FOUND="false"
+for term in "CreateExtract" "CreateReplicat" "aws_cloudwatch_metric_alarm" "aws_sns" "utility-sidecar" "observer-sidecar" "gg-alerter"; do
+  if grep -rq -- "$term" "$DEPLOYMENT_MODEL_TOOL" "$ADMIN_SECRET_HELPER" "$INVENTORY_TF" envs/dev/cloudwatch_dashboard.tf envs/dev/secret.tf 2>/dev/null; then
+    fail "26: forbidden Phase 6D0 term found: ${term}"
+    FORBIDDEN_6D0_TERMS_FOUND="true"
+  fi
+done
+if [ "$FORBIDDEN_6D0_TERMS_FOUND" = "false" ]; then
+  pass "26: no process creation, alarm, SNS, gg-alerter, or sidecar reference exists in the new Phase 6D0 source"
+fi
+
+if python3 hack/check-comment-style.py >/dev/null 2>&1; then
+  pass "26: comment-style checker remains integrated and reports zero violations"
+else
+  fail "26: comment-style checker reported a violation in the Phase 6D0 files"
 fi
 
 echo ""

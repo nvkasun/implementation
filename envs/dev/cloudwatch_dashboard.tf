@@ -1,22 +1,17 @@
 # Fleet-overview CloudWatch dashboard; widgets are generated from the canonical registry, never hand-listed per deployment.
 
 locals {
-  gg_dashboard_registry = yamldecode(file("${path.module}/goldengate-deployments.yaml"))
-
-  gg_dashboard_eligible_list = [
-    for d in local.gg_dashboard_registry.deployments : d
-    if try(d.enabled, null) == true
-    && try(d.name, "") != ""
-    && try(d.type, "") != ""
-    && try(d.pipeline, "") != ""
-    && contains(["source", "target"], try(d.role, ""))
-  ]
-
+  # Sourced from the folder-driven inventory in goldengate_inventory.tf, never a handwritten registry file.
   gg_dashboard_enabled_deployments = {
-    for d in local.gg_dashboard_eligible_list : d.name => d
+    for id in local.goldengate_deployment_names : id => {
+      name     = id
+      type     = local.goldengate_enabled_deployments[id].runtime.deploymentType
+      pipeline = local.goldengate_enabled_deployments[id].deployment.pipeline
+      role     = local.goldengate_enabled_deployments[id].deployment.role
+    }
   }
 
-  gg_dashboard_deployment_names = sort(keys(local.gg_dashboard_enabled_deployments))
+  gg_dashboard_deployment_names = local.goldengate_deployment_names
 
   gg_dashboard_pipeline_names = sort(distinct([
     for name in local.gg_dashboard_deployment_names : local.gg_dashboard_enabled_deployments[name].pipeline
@@ -35,7 +30,7 @@ locals {
   gg_dashboard_namespace         = "GoldenGate/Pipelines"
   gg_dashboard_region            = "eu-west-1"
   gg_dashboard_eks_cluster       = "gg-poc-dev"
-  gg_dashboard_monitor_host      = "monitor.${local.gg_dashboard_registry.dnsDomain}"
+  gg_dashboard_monitor_host      = "monitor.${local.goldengate_shared_environment.dnsDomain}"
 
   gg_dashboard_deployment_metric_names = ["DeploymentDown", "LagBreached", "AbendFailure", "HeartbeatAgeSeconds"]
 
@@ -73,11 +68,11 @@ locals {
   gg_dashboard_header_markdown = join("\n", [
     "# GoldenGate DEV Fleet Overview",
     "",
-    "- **Environment:** ${local.gg_dashboard_registry.environment}",
+    "- **Environment:** ${local.goldengate_shared_environment.environment}",
     "- **AWS region:** ${local.gg_dashboard_region}",
     "- **EKS cluster:** ${local.gg_dashboard_eks_cluster}",
-    "- **Runtime namespace:** ${local.gg_dashboard_registry.runtimeNamespace}",
-    "- **Monitoring namespace:** ${local.gg_dashboard_registry.monitoringNamespace}",
+    "- **Runtime namespace:** ${local.goldengate_shared_environment.runtimeNamespace}",
+    "- **Monitoring namespace:** ${local.goldengate_shared_environment.monitoringNamespace}",
     "- **Enabled deployments:** ${length(local.gg_dashboard_deployment_names)} (source: ${local.gg_dashboard_source_count}, target: ${local.gg_dashboard_target_count})",
     "- **Logical pipelines:** ${join(", ", local.gg_dashboard_pipeline_names)}",
     "- **Monitoring portal:** ${local.gg_dashboard_monitor_host}",

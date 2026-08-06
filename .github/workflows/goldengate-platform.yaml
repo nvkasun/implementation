@@ -56,6 +56,7 @@ env:
 
   # Shared, engine-level runtime identities this chart is the single owner of; never used by an individual GoldenGate runtime release.
   RUNTIME_NAMESPACE: goldengate-dev
+  RUNTIME_SA_NAME: gg-runtime-sa
   ORACLE_SA_NAME: gg-oracle-sa
   POSTGRESQL_SA_NAME: gg-postgresql-sa
 
@@ -64,7 +65,8 @@ env:
   FLUENT_BIT_RUNTIME_LOG_GROUP: /adcb/goldengate/dev/runtime
   FLUENT_BIT_MONITOR_LOG_GROUP: /adcb/goldengate/dev/monitor
 
-  # Both ServiceAccounts use the shared GoldenGateSecretsReadRole-dev role (also used by the shared monitor; extended trust policy at envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json); this ARN is a literal predicted value since this repository has no Terraform outputs.tf.
+  # All runtime ServiceAccounts use the shared GoldenGateSecretsReadRole-dev role (also used by the shared monitor; extended trust policy at envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json); this ARN is a literal predicted value since this repository has no Terraform outputs.tf.
+  RUNTIME_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev
   ORACLE_RUNTIME_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev
   POSTGRESQL_RUNTIME_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev
 
@@ -345,6 +347,7 @@ jobs:
 
           helm lint "$HELM_CHART_PATH" \
             --values "$VALUES_FILE" \
+            --set-string serviceAccounts.runtime.roleArn="$RUNTIME_ROLE_ARN" \
             --set-string serviceAccounts.oracle.roleArn="$ORACLE_RUNTIME_ROLE_ARN" \
             --set-string serviceAccounts.postgresql.roleArn="$POSTGRESQL_RUNTIME_ROLE_ARN" \
             --set-string fluentBit.serviceAccount.roleArn="$FLUENT_BIT_ROLE_ARN" \
@@ -360,6 +363,7 @@ jobs:
 
           helm template "$RELEASE_NAME" "$HELM_CHART_PATH" \
             --values "$VALUES_FILE" \
+            --set-string serviceAccounts.runtime.roleArn="$RUNTIME_ROLE_ARN" \
             --set-string serviceAccounts.oracle.roleArn="$ORACLE_RUNTIME_ROLE_ARN" \
             --set-string serviceAccounts.postgresql.roleArn="$POSTGRESQL_RUNTIME_ROLE_ARN" \
             --set-string fluentBit.serviceAccount.roleArn="$FLUENT_BIT_ROLE_ARN" \
@@ -453,12 +457,36 @@ jobs:
 
           assert_deletion_protected "Namespace ${RUNTIME_NAMESPACE}" "$RUNTIME_NS_BLOCK"
 
-          echo "Validating exactly three ServiceAccount documents..."
-          SERVICEACCOUNT_COUNT="$(grep -c '^kind: ServiceAccount$' "$RENDERED")"
-          if [ "$SERVICEACCOUNT_COUNT" -ne 3 ]; then
-            echo "FAIL: expected exactly 3 rendered ServiceAccount documents (oracle, postgresql, gg-fluent-bit), found ${SERVICEACCOUNT_COUNT}."
-            exit 1
-          fi
+          # No fixed total ServiceAccount count: legacy oracle/postgresql identities are optional during the gg-runtime-sa migration.
+          count_serviceaccount_documents() {
+            local sa_name="$1"
+            local split_dir count doc
+            split_dir="$(mktemp -d)"
+            awk -v outdir="$split_dir" '
+              BEGIN { docnum = 0; fname = outdir "/doc-0.yaml" }
+              /^---$/ { docnum++; fname = outdir "/doc-" docnum ".yaml"; next }
+              { print > fname }
+            ' "$RENDERED"
+            count=0
+            for doc in "$split_dir"/doc-*.yaml; do
+              if grep -q "^kind: ServiceAccount\$" "$doc" && grep -q "^  name: ${sa_name}\$" "$doc"; then
+                count=$((count + 1))
+              fi
+            done
+            rm -rf "$split_dir"
+            echo "$count"
+          }
+          assert_exactly_one_serviceaccount() {
+            local sa_name="$1"
+            local count
+            count="$(count_serviceaccount_documents "$sa_name")"
+            if [ "$count" -ne 1 ]; then
+              echo "FAIL: expected exactly one rendered ServiceAccount named ${sa_name}, found ${count}."
+              exit 1
+            fi
+          }
+          assert_exactly_one_serviceaccount "$RUNTIME_SA_NAME"
+          assert_exactly_one_serviceaccount "$FLUENT_BIT_SA_NAME"
 
           # deletion_protected is "true" for the shared oracle/postgresql identities (must survive this Application's own deletion) and "false" for gg-fluent-bit (pruned/deleted normally with this release).
           validate_runtime_sa() {
@@ -497,9 +525,27 @@ jobs:
             fi
           }
 
-          validate_runtime_sa "$ORACLE_SA_NAME" "$ORACLE_RUNTIME_ROLE_ARN" "true"
-          validate_runtime_sa "$POSTGRESQL_SA_NAME" "$POSTGRESQL_RUNTIME_ROLE_ARN" "true"
+          validate_runtime_sa "$RUNTIME_SA_NAME" "$RUNTIME_ROLE_ARN" "true"
+          # Legacy per-engine identities render correctly only while still enabled in the DEV values file; retained during the gg-runtime-sa migration.
+          if [ -n "$(select_document "$RENDERED" "ServiceAccount" "$ORACLE_SA_NAME")" ]; then
+            validate_runtime_sa "$ORACLE_SA_NAME" "$ORACLE_RUNTIME_ROLE_ARN" "true"
+          fi
+          if [ -n "$(select_document "$RENDERED" "ServiceAccount" "$POSTGRESQL_SA_NAME")" ]; then
+            validate_runtime_sa "$POSTGRESQL_SA_NAME" "$POSTGRESQL_RUNTIME_ROLE_ARN" "true"
+          fi
           validate_runtime_sa "$FLUENT_BIT_SA_NAME" "$FLUENT_BIT_ROLE_ARN" "false"
+
+          echo "Validating no unexpected IRSA role is used by any rendered ServiceAccount..."
+          ALLOWED_RUNTIME_ROLE_ARNS="$(printf '%s\n%s' "$RUNTIME_ROLE_ARN" "$FLUENT_BIT_ROLE_ARN")"
+          while IFS= read -r role_arn_line; do
+            [ -z "$role_arn_line" ] && continue
+            actual_role_arn="$(normalize_value "${role_arn_line#*role-arn:}")"
+            if ! grep -Fxq -- "$actual_role_arn" <<< "$ALLOWED_RUNTIME_ROLE_ARNS"; then
+              echo "FAIL: unexpected IRSA role introduced by the platform chart: ${actual_role_arn}"
+              exit 1
+            fi
+          done < <(grep -- "eks.amazonaws.com/role-arn:" "$RENDERED")
+          echo "OK: every rendered ServiceAccount uses only an approved IRSA role."
 
           echo "Validating no GoldenGate runtime/workload resources are rendered by this chart..."
           # DaemonSet is deliberately not forbidden here (the platform-level gg-fluent-bit DaemonSet is validated exactly below); all other GoldenGate runtime workload kinds remain forbidden.
@@ -835,6 +881,8 @@ jobs:
                 valueFiles:
                   - values-deployment.yaml
                 parameters:
+                  - name: serviceAccounts.runtime.roleArn
+                    value: ${RUNTIME_ROLE_ARN}
                   - name: serviceAccounts.oracle.roleArn
                     value: ${ORACLE_RUNTIME_ROLE_ARN}
                   - name: serviceAccounts.postgresql.roleArn

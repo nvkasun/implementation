@@ -6,6 +6,10 @@ namespaces:
     name: goldengate-dev
 
 serviceAccounts:
+  runtime:
+    create: true
+    name: gg-runtime-sa
+    roleArn: ""
   oracle:
     create: true
     name: gg-oracle-sa

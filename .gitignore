@@ -5,3 +5,4 @@ rendered/
 *.tfplan
 *.tfstate
 *.tfstate.*
+work/generated/

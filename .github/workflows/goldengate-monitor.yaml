@@ -589,21 +589,32 @@ jobs:
           done
           echo "Required files are present."
 
+      - name: Generate the folder-driven canonical registry
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
+
+          mkdir -p work/generated/dev
+          python3 hack/goldengate-deployment-model.py --environment dev registry --output work/generated/dev/goldengate-deployments.yaml
+          echo "Generated registry:"
+          cat work/generated/dev/goldengate-deployments.yaml
+
       - name: Prepare temporary chart directory with the canonical config staged
         shell: bash
         run: |
           set -euo pipefail
 
-          # Chart is copied into a workflow-local temp dir (git-ignored) so the canonical config is staged without generated copies polluting the repo chart; every later step uses TEMP_CHART_PATH, not HELM_CHART_PATH.
+          # Chart is copied into a workflow-local temp dir (git-ignored) so the generated registry is staged without polluting the repo chart; every later step uses TEMP_CHART_PATH, not HELM_CHART_PATH.
           rm -rf "$TEMP_CHART_PATH"
           mkdir -p "$TEMP_CHART_PATH"
           cp -a "$HELM_CHART_PATH/." "$TEMP_CHART_PATH/"
 
           mkdir -p "$TEMP_CHART_PATH/files"
-          cp envs/dev/goldengate-deployments.yaml "$TEMP_CHART_PATH/files/goldengate-deployments.yaml"
-          diff -q envs/dev/goldengate-deployments.yaml "$TEMP_CHART_PATH/files/goldengate-deployments.yaml"
+          cp work/generated/dev/goldengate-deployments.yaml "$TEMP_CHART_PATH/files/goldengate-deployments.yaml"
 
-          echo "OK: canonical config staged into ${TEMP_CHART_PATH}, byte-identical to the source."
+          echo "OK: folder-driven registry staged into ${TEMP_CHART_PATH} (never committed to the reusable chart)."
 
       - name: Login Helm to Amazon ECR
         shell: bash

@@ -56,10 +56,8 @@ resource "aws_dynamodb_table_item" "pipeline_config" {
   ]
 
   for_each = {
-    for d in yamldecode(
-      file("${path.module}/goldengate-deployments.yaml")
-    ).deployments :
-    d.name => d.type
+    for id in local.goldengate_deployment_names :
+    id => local.goldengate_enabled_deployments[id].runtime.deploymentType
   }
 
   table_name = "gg-eks-pipeline"

@@ -1,11 +1,34 @@
 # PostgreSQL GoldenGate runtime, single-runtime deployment model; runtime identity derives from Release.Name (see helm/goldengate/templates/_helpers.tpl).
 deployment:
   enabled: true
+  pipeline: payments-ora-to-pg-001
+  role: target
+  adminSecret:
+    name: dev/goldengate/target/admin
+    managed: false
 
 global:
   environment: dev
 
 deploymentModel: singleRuntime
+
+replication:
+  enabled: false
+  databaseCredentialSecret: ""
+  extract:
+    enabled: false
+    name: ""
+    trailName: ""
+    tables: []
+  distribution:
+    enabled: false
+    pathName: ""
+    targetDeployment: ""
+  replicat:
+    enabled: false
+    name: ""
+    checkpointTable: ""
+    mappings: []
 
 runtime:
   enabled: true
@@ -56,10 +79,10 @@ runtime:
     enabled: true
     mode: "0777"
 
-  # gg-postgresql-sa is a shared, engine-level identity owned by helm/goldengate-platform -- never created here.
+  # gg-runtime-sa is the shared runtime identity owned by helm/goldengate-platform -- never created here.
   serviceAccount:
     create: false
-    name: gg-postgresql-sa
+    name: gg-runtime-sa
     annotations: {}
 
   service:

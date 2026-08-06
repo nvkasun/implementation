@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 
 import yaml
@@ -13,7 +14,15 @@ DEPLOYMENTS_FILE_RELPATH = "goldengate-deployments.yaml"
 DEFAULT_ADMIN_PORT = 8443
 DEFAULT_METRICS_PORT = 9015
 
-SUPPORTED_TYPES = ("oracle", "postgresql")
+MAX_DEPLOYMENT_TYPE_LENGTH = 32
+_DEPLOYMENT_TYPE_RE = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*\Z")
+
+
+def is_safe_deployment_type(value):
+    """Generic safe-token check, never a fixed engine allowlist; oracle/postgresql/sqlserver/mysql/distributed and future types are all accepted equally."""
+    if not isinstance(value, str) or not value or len(value) > MAX_DEPLOYMENT_TYPE_LENGTH:
+        return False
+    return bool(_DEPLOYMENT_TYPE_RE.match(value))
 
 DEFAULTS = {
     "PORT": "8080",
@@ -166,8 +175,8 @@ def validate_enabled_deployments(deployments):
     for d in deployments:
         if not d["enabled"]:
             continue
-        if d["type"] not in SUPPORTED_TYPES:
-            problems.append(f"{d['name']}: unsupported type {d['type']!r} (supported: {SUPPORTED_TYPES})")
+        if not is_safe_deployment_type(d["type"]):
+            problems.append(f"{d['name']}: unsafe deployment type {d['type']!r}")
         if not d["adminSecret"]:
             problems.append(f"{d['name']}: adminSecret is required")
     if problems:

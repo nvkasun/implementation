@@ -25,6 +25,24 @@
         "elasticfilesystem:DescribeFileSystems"
       ],
       "Resource": "*"
+    },
+    {
+      "Sid": "AllowGoldenGateManagedRuntimeSecretBootstrap",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:DescribeSecret",
+        "secretsmanager:ListSecretVersionIds",
+        "secretsmanager:PutSecretValue"
+      ],
+      "Resource": "arn:aws:secretsmanager:eu-west-1:668311715351:secret:dev/goldengate/runtime/*"
+    },
+    {
+      "Sid": "AllowGoldenGateAdminSecretPasswordGeneration",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetRandomPassword"
+      ],
+      "Resource": "*"
     }
   ]
 }
