@@ -360,6 +360,60 @@ def _reachable_chip(reachable):
     return f'<span class="chip {css_class}">{html.escape(label)}</span>'
 
 
+_DISCOVERY_STATUS_TEXT = {
+    "OK": "Complete",
+    "EMPTY": "Empty inventory",
+    "PARTIAL": "Partially available",
+    "UNAVAILABLE": "Unavailable",
+    "INVALID_RESPONSE": "Invalid response",
+}
+
+_DISCOVERY_EXPLANATION = {
+    "EMPTY": ("No replication processes discovered",
+             "The GoldenGate Admin REST API returned a valid empty Extract and Replicat inventory. "
+             "Replication health is not claimed."),
+    "PARTIAL": ("Process discovery partially available",
+               "Only part of the GoldenGate process inventory was available during the latest monitoring cycle."),
+    "UNAVAILABLE": ("Process discovery unavailable",
+                    "The monitor could not retrieve the Extract and Replicat inventories during the latest cycle."),
+    "INVALID_RESPONSE": ("Invalid process inventory response",
+                         "The latest Admin REST inventory response did not match the approved structure."),
+}
+
+_DISCOVERY_ATTENTION_STATUSES = ("PARTIAL", "UNAVAILABLE", "INVALID_RESPONSE")
+
+
+def _discovery_status_text(discovery):
+    if not discovery:
+        return "Not reported"
+    return _DISCOVERY_STATUS_TEXT.get(str(discovery.get("status") or ""), "Not reported")
+
+
+def _discovery_counts_text(discovery):
+    discovery = discovery or {}
+    return (f"Extract {_esc(discovery.get('extractCount', 0))} · "
+           f"Replicat {_esc(discovery.get('replicatCount', 0))} · "
+           f"Distribution {_esc(discovery.get('distpathCount', 0))}")
+
+
+def _render_discovery_field(discovery):
+    status_label = html.escape(_discovery_status_text(discovery))
+    return _field("Process discovery", f"{status_label} &middot; {_discovery_counts_text(discovery)}")
+
+
+def _render_discovery_explanation(discovery):
+    status = str((discovery or {}).get("status") or "")
+    info = _DISCOVERY_EXPLANATION.get(status)
+    if not info:
+        return ""
+    title, detail = info
+    return (
+        '<div class="empty-state">'
+        f'<div class="empty-title">{html.escape(title)}</div>'
+        f'<div class="empty-detail">{html.escape(detail)}</div>'
+        "</div>")
+
+
 def _critical_services_html(critical_services):
     if not critical_services:
         return '<span class="field-value">-</span>'
@@ -377,6 +431,13 @@ def _alerts_enabled_text(value):
 def _field(label, value_html):
     return (f'<div class="field"><div class="field-label">{html.escape(label)}</div>'
             f'<div class="field-value">{value_html}</div></div>')
+
+
+def _render_process_section(processes, discovery):
+    """Empty processes with a reported discovery status defer to that status's own explanation block."""
+    if not processes and discovery:
+        return ""
+    return _render_process_table(processes)
 
 
 def _render_process_table(processes):
@@ -442,10 +503,12 @@ def _render_deployment_card(r):
         _field("Alerts enabled", html.escape(_alerts_enabled_text(r.get("alertsEnabled")))),
         _field("Metrics enabled", html.escape(_alerts_enabled_text(r.get("metricsEnabled")))),
         _field("Process count", str(process_count)),
+        _render_discovery_field(r.get("processDiscovery")),
     ])
 
     chips = f'{_status_chip(r.get("effectiveStatus"))}{_fresh_chip(fresh)}'
     services_html = _critical_services_html(r.get("criticalServices"))
+    discovery_explanation_html = _render_discovery_explanation(r.get("processDiscovery"))
 
     return (
         '<article class="card">'
@@ -453,16 +516,19 @@ def _render_deployment_card(r):
         f'<div class="card-chips">{chips}</div>'
         f'<div class="field-grid">{fields}</div>'
         f'<div class="services-row"><span class="field-label">Critical services</span> {services_html}</div>'
-        f'{_render_process_table(r.get("processes") or [])}'
+        f'{discovery_explanation_html}'
+        f'{_render_process_section(r.get("processes") or [], r.get("processDiscovery"))}'
         "</article>")
 
 
-def _compute_overall_state(total_deployments, attention_deployments, services_down, abended_processes, any_processes):
+def _compute_overall_state(total_deployments, attention_deployments, services_down, abended_processes,
+                           stale_processes, discovery_issues, active_processes):
     if total_deployments == 0:
         return OVERALL_ATTENTION
-    if attention_deployments > 0 or services_down > 0 or abended_processes > 0:
+    if (attention_deployments > 0 or services_down > 0 or abended_processes > 0
+            or stale_processes > 0 or discovery_issues > 0):
         return OVERALL_ATTENTION
-    if not any_processes:
+    if active_processes == 0:
         return OVERALL_LIMITED_VISIBILITY
     return OVERALL_HEALTHY
 
@@ -475,6 +541,9 @@ def _compute_summary(payload):
     total_services = 0
     total_processes = 0
     abended_processes = 0
+    stale_processes = 0
+    active_processes = 0
+    discovery_issues = 0
     any_processes = False
 
     for lp in payload.get("logicalPipelines", []):
@@ -493,10 +562,16 @@ def _compute_summary(payload):
                 any_processes = True
             total_processes += len(processes)
             abended_processes += sum(1 for p in processes if p.get("status") == "ABENDED")
+            stale_processes += sum(1 for p in processes if p.get("stale"))
+            active_processes += sum(1 for p in processes if not p.get("stale"))
+            discovery_status = (r.get("processDiscovery") or {}).get("status")
+            if discovery_status in _DISCOVERY_ATTENTION_STATUSES:
+                discovery_issues += 1
 
     services_down = total_services - reachable_services
     overall_state = _compute_overall_state(
-        total_deployments, attention_deployments, services_down, abended_processes, any_processes)
+        total_deployments, attention_deployments, services_down, abended_processes,
+        stale_processes, discovery_issues, active_processes)
 
     return {
         "totalDeployments": total_deployments,
@@ -507,6 +582,8 @@ def _compute_summary(payload):
         "servicesDown": services_down,
         "totalProcesses": total_processes,
         "abendProcesses": abended_processes,
+        "staleProcesses": stale_processes,
+        "discoveryIssues": discovery_issues,
         "anyProcesses": any_processes,
         "overallState": overall_state,
     }
@@ -524,6 +601,11 @@ def _render_summary(summary):
     if summary["anyProcesses"]:
         stat_cards.append(("Process ABENDs", str(summary["abendProcesses"]),
                            "attention" if summary["abendProcesses"] else "ok"))
+        stat_cards.append(("Stale processes", str(summary["staleProcesses"]),
+                           "attention" if summary["staleProcesses"] else "ok"))
+    if summary["totalDeployments"]:
+        stat_cards.append(("Discovery issues", str(summary["discoveryIssues"]),
+                           "attention" if summary["discoveryIssues"] else "ok"))
 
     cards_html = "".join(
         f'<div class="stat-card {css_class}"><div class="stat-label">{html.escape(label)}</div>'

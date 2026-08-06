@@ -1575,6 +1575,85 @@ jobs:
           # Any observed effective status (UP/STARTING/DOWN/STALE/MISSING/UNKNOWN) is valid and never fails this step -- only the portal's own inability to run/authenticate/serve does.
           echo "OK: /api/status is valid JSON and contains all canonical deployments/pipelines."
 
+          echo "Validating processDiscovery for every enabled canonical deployment..."
+
+          # Reuses the same dependency-free name/enabled extraction already used above (no yq/PyYAML on this runner).
+          ENABLED_NAMES="$(awk '
+            /^\s*-\s*name:/ { if (name != "" && enabled == "true") print name; name=$0; sub(/^\s*-\s*name:\s*/, "", name); gsub(/["\x27\r]/, "", name); enabled="" }
+            /^\s*enabled:\s*true/ { enabled="true" }
+            /^\s*enabled:\s*false/ { enabled="false" }
+            END { if (name != "" && enabled == "true") print name }
+          ' envs/dev/goldengate-deployments.yaml)"
+          if [ -z "$ENABLED_NAMES" ]; then
+            echo "FAIL: no enabled canonical deployment found in envs/dev/goldengate-deployments.yaml."
+            exit 1
+          fi
+
+          PROCESS_DISCOVERY_CHECK="$(mktemp)"
+          cat > "$PROCESS_DISCOVERY_CHECK" <<'PYEOF'
+          import json
+          import os
+          import sys
+
+          with open(os.environ["ENABLED_NAMES_FILE"]) as f:
+              enabled_names = [line.strip() for line in f if line.strip()]
+
+          with open(os.environ["API_STATUS_FILE"]) as f:
+              payload = json.load(f)
+
+          runtimes_by_name = {}
+          for lp in payload.get("logicalPipelines", []):
+              for r in lp.get("runtimes", []):
+                  runtimes_by_name[r.get("deploymentName")] = r
+
+          failed = False
+          for name in enabled_names:
+              runtime = runtimes_by_name.get(name)
+              if runtime is None:
+                  print(f"FAIL: /api/status has no runtime entry for {name}.")
+                  failed = True
+                  continue
+
+              discovery = runtime.get("processDiscovery")
+              if not isinstance(discovery, dict):
+                  print(f"FAIL: {name} is missing processDiscovery metadata after the observation period.")
+                  failed = True
+                  continue
+
+              status = discovery.get("status")
+              if status not in ("OK", "EMPTY"):
+                  print(f"FAIL: {name} processDiscovery status is {status!r}, expected OK or EMPTY.")
+                  failed = True
+                  continue
+
+              for p in runtime.get("processes") or []:
+                  proc_name = p.get("process")
+                  if not isinstance(proc_name, str) or not proc_name.strip() or proc_name.strip().lower() in ("unknown", "none"):
+                      print(f"FAIL: {name} has an empty or synthetic process name: {proc_name!r}.")
+                      failed = True
+
+              alerts_enabled = runtime.get("alertsEnabled")
+              if alerts_enabled is not False:
+                  print(f"FAIL: {name} alertsEnabled is {alerts_enabled!r}, expected literal false.")
+                  failed = True
+
+              print(f"{name}: status={status} extract={discovery.get('extractCount')} "
+                    f"replicat={discovery.get('replicatCount')} distribution={discovery.get('distpathCount')} "
+                    f"detailFailures={discovery.get('detailFailureCount')}")
+
+          sys.exit(1 if failed else 0)
+          PYEOF
+
+          ENABLED_NAMES_FILE="$(mktemp)"
+          printf '%s\n' "$ENABLED_NAMES" > "$ENABLED_NAMES_FILE"
+          API_STATUS_FILE="$(mktemp)"
+          printf '%s' "$API_STATUS_BODY" > "$API_STATUS_FILE"
+
+          ENABLED_NAMES_FILE="$ENABLED_NAMES_FILE" API_STATUS_FILE="$API_STATUS_FILE" python3 "$PROCESS_DISCOVERY_CHECK"
+
+          rm -f "$PROCESS_DISCOVERY_CHECK" "$ENABLED_NAMES_FILE" "$API_STATUS_FILE"
+          echo "OK: processDiscovery is OK or EMPTY for every enabled deployment, alertsEnabled remains false, and no process has an empty or synthetic name. A zero process count is not required."
+
           echo "Checking collector and portal logs for forbidden patterns..."
           POD_LOGS="$(kubectl logs "$POD_NAME" -n "$TARGET_NAMESPACE" --since=10m 2>/dev/null || true)"
 

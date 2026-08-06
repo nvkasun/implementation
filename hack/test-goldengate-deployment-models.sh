@@ -5439,6 +5439,106 @@ else
   fail "22: hack/test-goldengate-metrics-config.py failed"
 fi
 
+# 25. Phase 6C1B: process-discovery status and fail-closed STATE-row correction.
+echo ""
+echo "--- Phase 6C1B: process-discovery status correction ---"
+
+COLLECTOR_PY="monitoring/monitor/collector.py"
+MONITOR_PY="monitoring/monitor/monitor.py"
+MONITOR_WORKFLOW=".github/workflows/goldengate-monitor.yaml"
+
+if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  NEW_WORKFLOW_FILES="$(git status --porcelain=v1 2>/dev/null | grep -E '^\?\? \.github/workflows/.*\.ya?ml$' || true)"
+  if [ -z "$NEW_WORKFLOW_FILES" ]; then
+    pass "25: no new workflow file introduced (goldengate-monitor.yaml modified in place)"
+  else
+    fail "25: an unexpected new workflow file was introduced:"$'\n'"${NEW_WORKFLOW_FILES}"
+  fi
+else
+  skip "25: no-new-workflow check -- not a git repository"
+fi
+
+if grep -q '"${MONITOR_SOURCE_PATH}/collector.py"' "$MONITOR_WORKFLOW" 2>/dev/null \
+    && grep -q '"${MONITOR_SOURCE_PATH}/monitor.py"' "$MONITOR_WORKFLOW" 2>/dev/null \
+    && grep -q '"${MONITOR_SOURCE_PATH}/ui.py"' "$MONITOR_WORKFLOW" 2>/dev/null; then
+  pass "25: monitor image content hash still covers collector.py, monitor.py, and ui.py"
+else
+  fail "25: monitor image content hash no longer covers all three changed source files"
+fi
+
+if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  NOT_PERMITTED_DIFF="$(git diff --stat --ignore-all-space -- \
+    monitoring/monitor/config.py monitoring/monitor/health_rules.py monitoring/monitor/Dockerfile \
+    'helm/goldengate-monitor/**' 'helm/goldengate/**' envs/dev/goldengate-deployments.yaml \
+    'envs/dev/*.tf' envs/dev/iam.tf envs/dev/policies envs/dev/cloudwatch_dashboard.tf \
+    helm/goldengate-platform 2>/dev/null || true)"
+  if [ -z "$NOT_PERMITTED_DIFF" ]; then
+    pass "25: no Terraform, IAM, Helm, Fluent Bit, dashboard, or runtime registry file changed"
+  else
+    fail "25: an out-of-scope file changed unexpectedly:"$'\n'"${NOT_PERMITTED_DIFF}"
+  fi
+else
+  skip "25: out-of-scope file check -- not a git repository"
+fi
+
+if grep -q "delete_item" "$COLLECTOR_PY" 2>/dev/null; then
+  fail "25: collector.py introduces a DeleteItem call into the process lifecycle"
+else
+  pass "25: no DeleteItem call exists in collector.py"
+fi
+
+if grep -qE '\.scan\(' "$COLLECTOR_PY" "$MONITOR_PY" 2>/dev/null; then
+  fail "25: a DynamoDB Scan call was introduced"
+else
+  pass "25: no DynamoDB Scan call exists in collector.py or monitor.py"
+fi
+
+EXPECTED_METRIC_NAMES="AbendEvent AbendFailure AbendState CriticalServiceDown DeploymentDown HeartbeatAgeSeconds LagBreached ExtractLagSeconds ReplicatLagSeconds"
+ACTUAL_METRIC_NAMES="$(grep -oE '"MetricName": "[A-Za-z]+"' "$COLLECTOR_PY" | sed -E 's/"MetricName": "([A-Za-z]+)"/\1/' | sort -u)"
+UNEXPECTED_METRIC_NAMES="false"
+for name in $ACTUAL_METRIC_NAMES; do
+  case " $EXPECTED_METRIC_NAMES " in
+    *" $name "*) ;;
+    *) UNEXPECTED_METRIC_NAMES="true"; echo "  unexpected metric name: $name" ;;
+  esac
+done
+if [ "$UNEXPECTED_METRIC_NAMES" = "false" ]; then
+  pass "25: no new CloudWatch metric name introduced"
+else
+  fail "25: an unexpected CloudWatch metric name was introduced"
+fi
+
+if grep -qE 'STATE#unknown|STATE#None|STATE#["'"'"']?\s*\+|recordType.*=.*"STATE#"\s*$' "$COLLECTOR_PY" 2>/dev/null; then
+  fail "25: a synthetic process fallback (STATE#unknown/STATE#None/STATE#) may exist"
+else
+  pass "25: no synthetic process fallback exists"
+fi
+
+if grep -q 'status not in ("OK", "EMPTY")' "$MONITOR_WORKFLOW" 2>/dev/null; then
+  pass "25: post-rollout workflow validates OK/EMPTY and rejects incomplete discovery"
+else
+  fail "25: post-rollout workflow no longer validates OK/EMPTY discovery status"
+fi
+
+if grep -qE 'totalCount.*>\s*0|len\(.*processes.*\)\s*>\s*0|require.*non-?zero.*process' "$MONITOR_WORKFLOW" 2>/dev/null; then
+  fail "25: workflow appears to require a non-zero process count"
+else
+  pass "25: workflow does not require a non-zero process count"
+fi
+
+if grep -q 'alerts_enabled is not False' "$MONITOR_WORKFLOW" 2>/dev/null; then
+  pass "25: post-rollout workflow confirms alertsEnabled remains literal false"
+else
+  fail "25: post-rollout workflow no longer confirms alertsEnabled remains false"
+fi
+
+if python3 hack/check-comment-style.py "$COLLECTOR_PY" "$MONITOR_PY" monitoring/monitor/ui.py \
+    monitoring/monitor/tests/test_collector.py monitoring/monitor/tests/test_monitor.py "$MONITOR_WORKFLOW" >/dev/null 2>&1; then
+  pass "25: comment-style checker remains integrated and reports zero violations"
+else
+  fail "25: comment-style checker reported a violation in the Phase 6C1B files"
+fi
+
 echo ""
 echo "=================================================="
 echo "Summary: ${PASS_COUNT} passed, ${FAIL_COUNT} failed, ${SKIP_COUNT} skipped"

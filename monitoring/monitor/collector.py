@@ -243,11 +243,39 @@ def _http_status(url, opener, timeout=5):
 
 _KNOWN_PROCESS_STATUSES = ("RUNNING", "STOPPED", "ABENDED")
 
+_DISCOVERY_STATUSES = ("OK", "EMPTY", "PARTIAL", "UNAVAILABLE", "INVALID_RESPONSE")
+_ENDPOINT_STATUSES = ("OK", "EMPTY", "UNAVAILABLE", "INVALID_RESPONSE")
+_INCOMPLETE_DISCOVERY_STATUSES = ("PARTIAL", "UNAVAILABLE", "INVALID_RESPONSE")
+_VALID_ENDPOINT_STATUSES = ("OK", "EMPTY")
 
-def _valid_process_name(raw):
-    """A real process name only, never a synthetic fallback; returns None so the caller can skip the item."""
-    name = str(raw).strip() if raw is not None else ""
-    return name or None
+MAX_PROCESS_NAME_LENGTH = 128
+_PROCESS_CONTROL_CHARS = frozenset(chr(c) for c in list(range(0x00, 0x20)) + [0x7f])
+
+
+def _safe_process_name(raw):
+    """A real, path-safe process name only; used for both STATE keys and detail-request URLs, never a fallback."""
+    if not isinstance(raw, str):
+        return None
+    if not raw.strip():
+        return None
+    if len(raw) > MAX_PROCESS_NAME_LENGTH:
+        return None
+    if any(c in _PROCESS_CONTROL_CHARS for c in raw):
+        return None
+    if _has_surrogate_codepoint(raw):
+        return None
+    if "/" in raw or "\\" in raw:
+        return None
+    if raw in (".", ".."):
+        return None
+    return raw
+
+
+def _process_detail_url(base, kind, name):
+    """Encodes name as exactly one URL path segment; returns None for anything _safe_process_name would reject."""
+    if _safe_process_name(name) is None:
+        return None
+    return f"{base}/services/v2/{kind}/{urllib.parse.quote(name, safe='')}"
 
 
 def _normalize_status(raw):
@@ -264,61 +292,67 @@ def _normalize_lag(raw):
     return lag if lag > 0 else 0.0
 
 
-def fetch_gg_processes(base, opener):
-    """Admin REST polling (port 8443 only); skips unnamed items, dedupes by (type, name), never logs raw responses."""
-    _http_json(f"{base}/services/v2/deployments", opener)  # liveness probe
-    procs = []
-    seen = set()
-    for kind, ptype in (("extracts", "extract"), ("replicats", "replicat")):
-        try:
-            items = _http_json(f"{base}/services/v2/{kind}", opener).get("response", {}).get("items", [])
-        except Exception as e:
-            logger.warning("listing %s failed: %s", kind, type(e).__name__)
-            items = []
-        if not isinstance(items, list):
-            items = []
-        for it in items:
-            if not isinstance(it, dict):
-                continue
-            name = _valid_process_name(it.get("name"))
-            if name is None or (ptype, name) in seen:
-                continue
-            detail = {}
-            try:
-                raw_detail = _http_json(f"{base}/services/v2/{kind}/{name}", opener).get("response", {})
-                if isinstance(raw_detail, dict):
-                    detail = raw_detail
-            except Exception as e:
-                logger.warning("detail fetch failed for %s process: %s", ptype, type(e).__name__)
-            status = _normalize_status(detail.get("status", it.get("status")))
-            lag = _normalize_lag(detail.get("lag", detail.get("lagSeconds", it.get("lagSeconds", 0))))
-            err = str(detail.get("lastError") or detail.get("error")
-                      or detail.get("message") or "") if status == "ABENDED" else ""
-            seen.add((ptype, name))
-            procs.append({"process": name, "type": ptype, "lagSeconds": lag,
-                          "abended": status == "ABENDED", "status": status,
-                          "metrics": detail or {}, "error": err})
+def _valid_gg_inventory_shape(payload):
+    """True iff payload.response.items is a list; an empty list is valid, any other shape is not."""
+    if not isinstance(payload, dict):
+        return False
+    response = payload.get("response")
+    if not isinstance(response, dict):
+        return False
+    return isinstance(response.get("items"), list)
+
+
+def _fetch_gg_inventory(kind, url, opener):
+    """Returns (endpoint_status, items) for one Extract/Replicat/Distribution inventory endpoint."""
     try:
-        items = _http_json(f"{base}/services/v2/sources", opener).get("response", {}).get("items", [])
+        payload = _http_json(url, opener)
     except Exception as e:
-        logger.debug("dispatch sources scrape skipped: %s", type(e).__name__)
-        items = []
-    if not isinstance(items, list):
-        items = []
+        logger.warning("listing %s failed: %s", kind, type(e).__name__)
+        return "UNAVAILABLE", []
+    if not _valid_gg_inventory_shape(payload):
+        logger.warning("listing %s returned an unexpected response shape", kind)
+        return "INVALID_RESPONSE", []
+    items = payload["response"]["items"]
+    return ("OK" if items else "EMPTY"), items
+
+
+def _collect_named_processes(base, kind, ptype, items, opener, seen, detail_failures):
+    """Builds process dicts for one Extract/Replicat inventory; detail_failures[0] counts failed/unsafe detail fetches."""
+    out = []
     for it in items:
         if not isinstance(it, dict):
             continue
-        name = _valid_process_name(it.get("name"))
-        if name is None or ("distpath", name) in seen:
+        name = _safe_process_name(it.get("name"))
+        if name is None or (ptype, name) in seen:
             continue
-        status = _normalize_status(it.get("status"))
-        bytes_now = next((it.get(k) for k in gh.BYTES_KEYS if it.get(k) is not None), None)
-        seen.add(("distpath", name))
-        procs.append({"process": name, "type": "distpath", "lagSeconds": 0.0,
-                      "abended": status == "ABENDED", "status": status,
-                      "bytes": bytes_now, "metrics": it or {},
-                      "error": "" if status != "ABENDED" else str(it.get("lastError") or "")})
-    return procs
+        seen.add((ptype, name))
+        detail = {}
+        poll_status = "OK"
+        detail_url = _process_detail_url(base, kind, name)
+        if detail_url is None:
+            poll_status = "DETAIL_UNAVAILABLE"
+            detail_failures[0] += 1
+        else:
+            try:
+                raw_detail = _http_json(detail_url, opener).get("response", {})
+                if isinstance(raw_detail, dict):
+                    detail = raw_detail
+                else:
+                    poll_status = "DETAIL_UNAVAILABLE"
+                    detail_failures[0] += 1
+            except Exception as e:
+                logger.warning("detail fetch failed for %s process: %s", ptype, type(e).__name__)
+                poll_status = "DETAIL_UNAVAILABLE"
+                detail_failures[0] += 1
+        # A failed detail fetch leaves detail={}, so status/lag fall back to the list item's own fields.
+        status = _normalize_status(detail.get("status", it.get("status")))
+        lag = _normalize_lag(detail.get("lag", detail.get("lagSeconds", it.get("lagSeconds", 0))))
+        err = str(detail.get("lastError") or detail.get("error")
+                  or detail.get("message") or "") if status == "ABENDED" else ""
+        out.append({"process": name, "type": ptype, "lagSeconds": lag,
+                    "abended": status == "ABENDED", "status": status,
+                    "metrics": detail or {}, "error": err, "pollStatus": poll_status})
+    return out
 
 
 def discovery_counts(procs):
@@ -329,17 +363,101 @@ def discovery_counts(procs):
     return counts
 
 
-def log_discovery_summary(pipeline, procs):
-    """One structured, non-sensitive log line per deployment tick; never logs the process payload itself."""
-    counts = discovery_counts(procs)
-    logger.info(json.dumps({
-        "event": "process_discovery_summary",
-        "deployment": pipeline,
+def discover_processes(base, opener):
+    """Structured Extract/Replicat/Distribution discovery that distinguishes a valid empty inventory from a failed one."""
+    _http_json(f"{base}/services/v2/deployments", opener)  # liveness probe; a failure aborts discovery for this tick
+
+    seen = set()
+    detail_failures = [0]
+
+    extracts_status, extract_items = _fetch_gg_inventory("extracts", f"{base}/services/v2/extracts", opener)
+    replicats_status, replicat_items = _fetch_gg_inventory("replicats", f"{base}/services/v2/replicats", opener)
+    sources_status, source_items = _fetch_gg_inventory("sources", f"{base}/services/v2/sources", opener)
+
+    extract_procs = (_collect_named_processes(base, "extracts", "extract", extract_items, opener, seen, detail_failures)
+                     if extracts_status in _VALID_ENDPOINT_STATUSES else [])
+    replicat_procs = (_collect_named_processes(base, "replicats", "replicat", replicat_items, opener, seen, detail_failures)
+                      if replicats_status in _VALID_ENDPOINT_STATUSES else [])
+
+    distpath_procs = []
+    if sources_status in _VALID_ENDPOINT_STATUSES:
+        for it in source_items:
+            if not isinstance(it, dict):
+                continue
+            name = _safe_process_name(it.get("name"))
+            if name is None or ("distpath", name) in seen:
+                continue
+            seen.add(("distpath", name))
+            status = _normalize_status(it.get("status"))
+            bytes_now = next((it.get(k) for k in gh.BYTES_KEYS if it.get(k) is not None), None)
+            distpath_procs.append({"process": name, "type": "distpath", "lagSeconds": 0.0,
+                                   "abended": status == "ABENDED", "status": status,
+                                   "bytes": bytes_now, "metrics": it or {},
+                                   "error": "" if status != "ABENDED" else str(it.get("lastError") or ""),
+                                   "pollStatus": "OK"})
+
+    processes = extract_procs + replicat_procs + distpath_procs
+    counts = discovery_counts(processes)
+    detail_failure_count = detail_failures[0]
+
+    core_both_valid = extracts_status in _VALID_ENDPOINT_STATUSES and replicats_status in _VALID_ENDPOINT_STATUSES
+    core_either_valid = extracts_status in _VALID_ENDPOINT_STATUSES or replicats_status in _VALID_ENDPOINT_STATUSES
+
+    if core_both_valid:
+        if detail_failure_count > 0:
+            combined = "PARTIAL"
+        elif extract_procs or replicat_procs:
+            combined = "OK"
+        else:
+            combined = "EMPTY"
+    elif core_either_valid:
+        combined = "PARTIAL"
+    elif extracts_status == "INVALID_RESPONSE" or replicats_status == "INVALID_RESPONSE":
+        combined = "INVALID_RESPONSE"  # malformed structure outranks a plain request failure when neither core inventory is usable
+    else:
+        combined = "UNAVAILABLE"
+
+    return {
+        "processes": processes,
+        "status": combined,
+        "collectedAt": cfgmod.now_epoch(),
         "extractCount": counts["extract"],
         "replicatCount": counts["replicat"],
         "distpathCount": counts["distpath"],
         "totalCount": counts["extract"] + counts["replicat"] + counts["distpath"],
+        "extractsStatus": extracts_status,
+        "replicatsStatus": replicats_status,
+        "sourcesStatus": sources_status,
+        "detailFailureCount": detail_failure_count,
+    }
+
+
+def fetch_gg_processes(base, opener):
+    """Compatibility wrapper over discover_processes: returns only the flat process list."""
+    return discover_processes(base, opener)["processes"]
+
+
+def log_discovery_summary(pipeline, discovery):
+    """One structured, non-sensitive log line per deployment tick; never logs the process payload itself."""
+    logger.info(json.dumps({
+        "event": "process_discovery_summary",
+        "deployment": pipeline,
+        "discoveryStatus": discovery.get("status"),
+        "extractCount": discovery.get("extractCount", 0),
+        "replicatCount": discovery.get("replicatCount", 0),
+        "distpathCount": discovery.get("distpathCount", 0),
+        "totalCount": discovery.get("totalCount", 0),
+        "detailFailureCount": discovery.get("detailFailureCount", 0),
+        "extractsStatus": discovery.get("extractsStatus"),
+        "replicatsStatus": discovery.get("replicatsStatus"),
+        "sourcesStatus": discovery.get("sourcesStatus"),
     }))
+    if discovery.get("status") in _INCOMPLETE_DISCOVERY_STATUSES:
+        logger.warning(json.dumps({
+            "event": "process_discovery_incomplete",
+            "deployment": pipeline,
+            "discoveryStatus": discovery.get("status"),
+        }))
 
 
 _SVC_PROBE_PATH = {"adminsrvr": "extracts", "distsrvr": "sources", "recvsrvr": "targets"}
@@ -745,17 +863,20 @@ _LAG_METRIC_BY_PROCESS_TYPE = {"extract": "ExtractLagSeconds", "replicat": "Repl
 
 
 def build_metric_batch(pipeline, deployment_type, flags, procs=None,
-                       critical_service_status=None, abend_events=None, heartbeat_ok=False):
-    """Pure builder for the full metric contract: ordinary dicts only, no boto3/CloudWatch calls."""
+                       critical_service_status=None, abend_events=None, heartbeat_ok=False,
+                       process_inventory_complete=True):
+    """Pure builder for the full metric contract; process_inventory_complete=False omits LagBreached/AbendFailure only."""
     procs = procs or []
     critical_service_status = critical_service_status or {}
     abend_events = abend_events or ()
 
     dep_dims = [{"Name": "Deployment", "Value": pipeline}, {"Name": "DeploymentType", "Value": deployment_type}]
-    md = [{"MetricName": n, "Dimensions": dep_dims, "Value": float(v), "Unit": "Count"}
-          for n, v in (("LagBreached", flags.get("lag", 0)),
-                       ("AbendFailure", flags.get("abend", 0)),
-                       ("DeploymentDown", flags.get("down", 0)))]
+    md = [{"MetricName": "DeploymentDown", "Dimensions": dep_dims, "Value": float(flags.get("down", 0)), "Unit": "Count"}]
+    if process_inventory_complete:
+        md.append({"MetricName": "LagBreached", "Dimensions": dep_dims,
+                   "Value": float(flags.get("lag", 0)), "Unit": "Count"})
+        md.append({"MetricName": "AbendFailure", "Dimensions": dep_dims,
+                   "Value": float(flags.get("abend", 0)), "Unit": "Count"})
 
     if heartbeat_ok:
         md.append({"MetricName": "HeartbeatAgeSeconds", "Dimensions": dep_dims, "Value": 0.0, "Unit": "Seconds"})
@@ -835,7 +956,7 @@ def write_process_state(table, mgr, pipeline, deployment_type, process, snapshot
         ":dt": deployment_type,
     }
     for key in ("processType", "lagSeconds", "lastTransitionAt",
-                "resolvedThreshold", "resolvedMode", "pipelineName", "errorMsg"):
+                "resolvedThreshold", "resolvedMode", "pipelineName", "errorMsg", "pollStatus"):
         if key in snapshot:
             sets.append(f"{key}=:{key}")
             v = snapshot[key]
@@ -849,6 +970,9 @@ def write_process_state(table, mgr, pipeline, deployment_type, process, snapshot
     if "pms" in snapshot:
         sets.append("pms=:pms")
         vals[":pms"] = _ddb_safe(snapshot.get("pms") or {})
+    if "processDiscovery" in snapshot:
+        sets.append("processDiscovery=:pd")
+        vals[":pd"] = _ddb_safe(snapshot.get("processDiscovery") or {})
     if counters is not None:
         for key in ("consecutiveAbends", "lastAbendAt", "nextRecheckAt"):
             sets.append(f"{key}=:{key}")
@@ -960,7 +1084,7 @@ def polling_loop(deployment, table, mgr, state, stop_event):
             opener = _basic_opener(user, pwd, base, ssl_ctx, tls_server_name)
 
             try:
-                procs = fetch_gg_processes(base, opener)
+                discovery = discover_processes(base, opener)
             except Exception as e:
                 in_grace = (cfgmod.now_epoch() - started) < cfg["startupGraceSeconds"]
                 status = "STARTING" if in_grace else "DEPLOYMENT_DOWN"
@@ -975,13 +1099,16 @@ def polling_loop(deployment, table, mgr, state, stop_event):
                 _guarded_write("_deployment", dep_snap)
                 last_dep_status = status
                 logger.warning("GoldenGate Admin REST unreachable for %s (%s): %s", pipeline, status, e)
-                # The guarded write above succeeded, so the monitor is alive; the heartbeat still fires.
-                metric_data = build_metric_batch(pipeline, deployment_type, flags, heartbeat_ok=True)
+                # Write succeeded so heartbeat fires, but discovery never ran this tick -- never a healthy 0.
+                metric_data = build_metric_batch(pipeline, deployment_type, flags, heartbeat_ok=True,
+                                                 process_inventory_complete=False)
                 publish_metrics_if_enabled(cfg, pipeline, metric_data)
                 _sleep_watching_leadership(interval)
                 continue
 
-            log_discovery_summary(pipeline, procs)
+            procs = discovery["processes"]
+            log_discovery_summary(pipeline, discovery)
+            process_inventory_complete = discovery["status"] in _VALID_ENDPOINT_STATUSES
             source_active = any(p["type"] == "extract" and p["status"] == "RUNNING" for p in procs)
 
             for p in procs:
@@ -1012,7 +1139,8 @@ def polling_loop(deployment, table, mgr, state, stop_event):
                         "resolvedThreshold": thr, "resolvedMode": mode,
                         "pipelineName": deployment["pipeline"],
                         "errorMsg": str(p.get("error", "")),
-                        "performanceMetrics": p.get("metrics") or {}}
+                        "performanceMetrics": p.get("metrics") or {},
+                        "pollStatus": str(p.get("pollStatus", "OK"))}
                 if str(prev.get("status")) != status:
                     snap["lastTransitionAt"] = cfgmod.now_epoch()
                 try:
@@ -1034,10 +1162,15 @@ def polling_loop(deployment, table, mgr, state, stop_event):
                 logger.warning("PMS collection unavailable for %s; using sanitized current-tick state", pipeline)
                 pms_result = _pms_unavailable_snapshot("UNAVAILABLE")
 
+            # Only the sanitized summary fields are persisted -- never process names, raw bodies, or URLs.
+            discovery_snapshot = {k: discovery[k] for k in (
+                "status", "collectedAt", "extractsStatus", "replicatsStatus", "sourcesStatus",
+                "extractCount", "replicatCount", "distpathCount", "totalCount", "detailFailureCount")}
+
             transitioned = ("UP" != last_dep_status)
             dep_snap = {"processType": "deployment", "status": "UP",
                         "recordedAt": cfgmod.now_epoch(), "criticalServices": cs_new,
-                        "pms": pms_result}
+                        "pms": pms_result, "processDiscovery": discovery_snapshot}
             if transitioned:
                 dep_snap["lastTransitionAt"] = cfgmod.now_epoch()
             _guarded_write("_deployment", dep_snap)
@@ -1046,7 +1179,8 @@ def polling_loop(deployment, table, mgr, state, stop_event):
             # The _deployment write above just succeeded -- heartbeat fires.
             metric_data = build_metric_batch(pipeline, deployment_type, flags, procs=procs,
                                              critical_service_status=svc_up,
-                                             abend_events=abend_event_names, heartbeat_ok=True)
+                                             abend_events=abend_event_names, heartbeat_ok=True,
+                                             process_inventory_complete=process_inventory_complete)
             publish_metrics_if_enabled(cfg, pipeline, metric_data)
 
         except _FencedOff:

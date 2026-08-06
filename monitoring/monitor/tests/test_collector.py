@@ -32,6 +32,23 @@ def make_table():
     return boto3.resource("dynamodb", region_name="eu-west-1").Table("gg-eks-pipeline")
 
 
+def _discovery(status="EMPTY", processes=None, **overrides):
+    """Builds a structured discovery dict for mocking core.discover_processes at the polling_loop boundary."""
+    valid = status in ("OK", "EMPTY")
+    d = {
+        "processes": processes or [],
+        "status": status,
+        "collectedAt": 0,
+        "extractCount": 0, "replicatCount": 0, "distpathCount": 0, "totalCount": 0,
+        "extractsStatus": status if valid else "UNAVAILABLE",
+        "replicatsStatus": status if valid else "UNAVAILABLE",
+        "sourcesStatus": "EMPTY",
+        "detailFailureCount": 0,
+    }
+    d.update(overrides)
+    return d
+
+
 class LeaseManagerTests(unittest.TestCase):
     @mock_aws
     def test_acquire_and_renew(self):
@@ -340,7 +357,7 @@ class CredentialFailClosedTests(unittest.TestCase):
         opener_calls = []
 
         with mock.patch.object(core.cfgmod, "credential_paths", return_value=(user_file, pwd_file)), \
-             mock.patch.object(core, "fetch_gg_processes", side_effect=lambda *a, **k: fetch_calls.append(1) or []), \
+             mock.patch.object(core, "discover_processes", side_effect=lambda *a, **k: fetch_calls.append(1) or _discovery()), \
              mock.patch.object(core, "_basic_opener", side_effect=lambda *a, **k: opener_calls.append(1) or MagicMock()), \
              mock.patch.object(core, "_build_ssl_context", return_value=MagicMock()):
             with self.assertLogs(core.logger, level="INFO") as log_ctx:
@@ -572,21 +589,274 @@ class ProcessDiscoveryTests(unittest.TestCase):
             {"process": "D1", "type": "distpath"},
         ]
         self.assertEqual(core.discovery_counts(procs), {"extract": 2, "replicat": 1, "distpath": 1})
+        discovery = _discovery(status="OK", processes=procs, extractCount=2, replicatCount=1,
+                               distpathCount=1, totalCount=4)
         with self.assertLogs(core.logger, level="INFO") as log_ctx:
-            core.log_discovery_summary("gg-oracle-payments-01", procs)
+            core.log_discovery_summary("gg-oracle-payments-01", discovery)
         combined = "\n".join(log_ctx.output)
         self.assertIn('"event": "process_discovery_summary"', combined)
         self.assertIn('"deployment": "gg-oracle-payments-01"', combined)
+        self.assertIn('"discoveryStatus": "OK"', combined)
         self.assertIn('"extractCount": 2', combined)
         self.assertIn('"replicatCount": 1', combined)
         self.assertIn('"distpathCount": 1', combined)
         self.assertIn('"totalCount": 4', combined)
+        self.assertIn('"detailFailureCount": 0', combined)
 
     def test_zero_process_discovery_summary_is_valid(self):
         with self.assertLogs(core.logger, level="INFO") as log_ctx:
-            core.log_discovery_summary("gg-oracle-payments-01", [])
+            core.log_discovery_summary("gg-oracle-payments-01", _discovery())
         combined = "\n".join(log_ctx.output)
         self.assertIn('"totalCount": 0', combined)
+
+    def test_incomplete_discovery_emits_a_fixed_warning_event(self):
+        for status in ("PARTIAL", "UNAVAILABLE", "INVALID_RESPONSE"):
+            with self.subTest(status=status):
+                with self.assertLogs(core.logger, level="WARNING") as log_ctx:
+                    core.log_discovery_summary("gg-oracle-payments-01", _discovery(status=status))
+                combined = "\n".join(log_ctx.output)
+                self.assertIn('"event": "process_discovery_incomplete"', combined)
+                self.assertIn(f'"discoveryStatus": "{status}"', combined)
+
+    def test_complete_discovery_emits_no_warning_event(self):
+        for status in ("OK", "EMPTY"):
+            with self.subTest(status=status):
+                with self.assertLogs(core.logger, level="INFO") as log_ctx:
+                    core.log_discovery_summary("gg-oracle-payments-01", _discovery(status=status))
+                combined = "\n".join(log_ctx.output)
+                self.assertNotIn("process_discovery_incomplete", combined)
+
+
+class SafeProcessNameTests(unittest.TestCase):
+    """_safe_process_name: the hardened validator used for both STATE keys and detail-request URLs."""
+
+    def test_normal_name_accepted_unmodified(self):
+        self.assertEqual(core._safe_process_name("EXTORA1"), "EXTORA1")
+
+    def test_underscore_name_accepted(self):
+        self.assertEqual(core._safe_process_name("EXT_ORA_PAYMENTS_01"), "EXT_ORA_PAYMENTS_01")
+
+    def test_name_requiring_url_encoding_still_accepted_by_the_validator(self):
+        # _safe_process_name only validates safety; URL-encoding itself is _process_detail_url's job.
+        self.assertEqual(core._safe_process_name("EXT PROC"), "EXT PROC")
+
+    def test_empty_and_whitespace_only_rejected(self):
+        for bad in ("", "   ", "\t"):
+            with self.subTest(bad=bad):
+                self.assertIsNone(core._safe_process_name(bad))
+
+    def test_non_string_rejected(self):
+        for bad in (None, 42, 3.5, True, {}, [], object()):
+            with self.subTest(bad=bad):
+                self.assertIsNone(core._safe_process_name(bad))
+
+    def test_path_separators_rejected(self):
+        for bad in ("EXT/1", "EXT\\1", "/EXT1", "..\\EXT1"):
+            with self.subTest(bad=bad):
+                self.assertIsNone(core._safe_process_name(bad))
+
+    def test_dot_and_dotdot_rejected(self):
+        self.assertIsNone(core._safe_process_name("."))
+        self.assertIsNone(core._safe_process_name(".."))
+
+    def test_control_characters_rejected(self):
+        for bad in ("EXT\x001", "EXT\n1", "EXT\r1", "EXT\x7f1"):
+            with self.subTest(bad=repr(bad)):
+                self.assertIsNone(core._safe_process_name(bad))
+
+    def test_overlong_name_rejected(self):
+        self.assertIsNone(core._safe_process_name("E" * 129))
+
+    def test_max_length_name_accepted(self):
+        name = "E" * 128
+        self.assertEqual(core._safe_process_name(name), name)
+
+    def test_lone_surrogate_rejected(self):
+        self.assertIsNone(core._safe_process_name("EXT\ud800"))
+
+    def test_process_detail_url_encodes_as_one_segment(self):
+        url = core._process_detail_url("https://gg-test:8443", "extracts", "EXT 1/2")
+        self.assertIsNone(url)  # "/" makes it unsafe; never concatenated raw
+
+    def test_process_detail_url_percent_encodes_special_characters(self):
+        url = core._process_detail_url("https://gg-test:8443", "extracts", "EXT 1")
+        self.assertEqual(url, "https://gg-test:8443/services/v2/extracts/EXT%201")
+
+    def test_process_detail_url_none_for_unsafe_name(self):
+        self.assertIsNone(core._process_detail_url("https://gg-test:8443", "extracts", "../etc/passwd"))
+
+
+class DiscoverProcessesTests(unittest.TestCase):
+    """discover_processes: the structured discovery contract distinguishing EMPTY/OK/PARTIAL/UNAVAILABLE/INVALID_RESPONSE."""
+
+    BASE = "https://gg-test:8443"
+
+    def _discover(self, responses):
+        def _stub(url, opener, timeout=5):
+            for suffix, payload in responses.items():
+                if url == self.BASE + suffix:
+                    return payload
+            raise AssertionError(f"unexpected URL requested in test: {url}")
+        with mock.patch.object(core, "_http_json", side_effect=_stub):
+            return core.discover_processes(self.BASE, opener=MagicMock())
+
+    def test_valid_empty_extract_and_replicat_produces_empty(self):
+        d = self._discover({
+            "/services/v2/deployments": {},
+            "/services/v2/extracts": {"response": {"items": []}},
+            "/services/v2/replicats": {"response": {"items": []}},
+            "/services/v2/sources": {"response": {"items": []}},
+        })
+        self.assertEqual(d["status"], "EMPTY")
+        self.assertEqual(d["extractsStatus"], "EMPTY")
+        self.assertEqual(d["replicatsStatus"], "EMPTY")
+        self.assertEqual(d["detailFailureCount"], 0)
+        self.assertEqual(d["processes"], [])
+
+    def test_valid_non_empty_inventory_produces_ok(self):
+        d = self._discover({
+            "/services/v2/deployments": {},
+            "/services/v2/extracts": {"response": {"items": [{"name": "EXT1"}]}},
+            "/services/v2/extracts/EXT1": {"response": {"status": "RUNNING"}},
+            "/services/v2/replicats": {"response": {"items": []}},
+            "/services/v2/sources": {"response": {"items": []}},
+        })
+        self.assertEqual(d["status"], "OK")
+        self.assertEqual(d["extractCount"], 1)
+        self.assertEqual(d["totalCount"], 1)
+
+    def test_one_unavailable_core_endpoint_produces_partial(self):
+        d = self._discover({
+            "/services/v2/deployments": {},
+            "/services/v2/extracts": {"response": {"items": [{"name": "EXT1"}]}},
+            "/services/v2/extracts/EXT1": {"response": {"status": "RUNNING"}},
+            # /services/v2/replicats deliberately missing from the stub -> AssertionError -> UNAVAILABLE
+            "/services/v2/sources": {"response": {"items": []}},
+        })
+        self.assertEqual(d["extractsStatus"], "OK")
+        self.assertEqual(d["replicatsStatus"], "UNAVAILABLE")
+        self.assertEqual(d["status"], "PARTIAL")
+        self.assertEqual(d["extractCount"], 1)  # the valid side's real process is still preserved
+
+    def test_both_core_endpoints_unavailable_produces_unavailable(self):
+        def _stub(url, opener, timeout=5):
+            if url.endswith("/services/v2/deployments"):
+                return {}
+            raise RuntimeError("network down")
+        with mock.patch.object(core, "_http_json", side_effect=_stub):
+            d = core.discover_processes(self.BASE, opener=MagicMock())
+        self.assertEqual(d["extractsStatus"], "UNAVAILABLE")
+        self.assertEqual(d["replicatsStatus"], "UNAVAILABLE")
+        self.assertEqual(d["status"], "UNAVAILABLE")
+        self.assertEqual(d["processes"], [])
+
+    def test_invalid_response_shape_on_both_core_endpoints_produces_invalid_response(self):
+        d = self._discover({
+            "/services/v2/deployments": {},
+            "/services/v2/extracts": {"response": {"items": "not-a-list"}},
+            "/services/v2/replicats": {"response": "not-a-dict"},
+            "/services/v2/sources": {"response": {"items": []}},
+        })
+        self.assertEqual(d["extractsStatus"], "INVALID_RESPONSE")
+        self.assertEqual(d["replicatsStatus"], "INVALID_RESPONSE")
+        self.assertEqual(d["status"], "INVALID_RESPONSE")
+
+    def test_invalid_response_shape_on_one_core_endpoint_produces_partial(self):
+        d = self._discover({
+            "/services/v2/deployments": {},
+            "/services/v2/extracts": {"response": {"items": []}},
+            "/services/v2/replicats": {"response": {"items": "not-a-list"}},
+            "/services/v2/sources": {"response": {"items": []}},
+        })
+        self.assertEqual(d["extractsStatus"], "EMPTY")
+        self.assertEqual(d["replicatsStatus"], "INVALID_RESPONSE")
+        self.assertEqual(d["status"], "PARTIAL")
+
+    def test_sources_failure_alone_does_not_downgrade_a_complete_core_inventory(self):
+        d = self._discover({
+            "/services/v2/deployments": {},
+            "/services/v2/extracts": {"response": {"items": [{"name": "EXT1"}]}},
+            "/services/v2/extracts/EXT1": {"response": {"status": "RUNNING"}},
+            "/services/v2/replicats": {"response": {"items": []}},
+            # /services/v2/sources deliberately missing -> UNAVAILABLE, but must not affect the combined status
+        })
+        self.assertEqual(d["sourcesStatus"], "UNAVAILABLE")
+        self.assertEqual(d["status"], "OK")
+
+    def test_detail_request_failure_retains_process_and_produces_partial(self):
+        def _stub(url, opener, timeout=5):
+            if url == self.BASE + "/services/v2/deployments":
+                return {}
+            if url == self.BASE + "/services/v2/extracts":
+                return {"response": {"items": [{"name": "EXT1", "status": "RUNNING", "lagSeconds": 7}]}}
+            if url == self.BASE + "/services/v2/extracts/EXT1":
+                raise RuntimeError("detail unreachable")
+            if url == self.BASE + "/services/v2/replicats":
+                return {"response": {"items": []}}
+            if url == self.BASE + "/services/v2/sources":
+                return {"response": {"items": []}}
+            raise AssertionError(url)
+        with mock.patch.object(core, "_http_json", side_effect=_stub):
+            d = core.discover_processes(self.BASE, opener=MagicMock())
+        self.assertEqual(d["status"], "PARTIAL")
+        self.assertEqual(d["detailFailureCount"], 1)
+        self.assertEqual(len(d["processes"]), 1)
+        p = d["processes"][0]
+        self.assertEqual(p["process"], "EXT1")
+        self.assertEqual(p["pollStatus"], "DETAIL_UNAVAILABLE")
+        # List-level status/lag are used as the fallback when the detail request fails.
+        self.assertEqual(p["status"], "RUNNING")
+        self.assertEqual(p["lagSeconds"], 7.0)
+
+    def test_no_raw_exception_text_logged(self):
+        def _stub(url, opener, timeout=5):
+            if url.endswith("/services/v2/deployments"):
+                return {}
+            raise RuntimeError("SECRET-MARKER-abc raw body <html>should not appear</html>")
+        with mock.patch.object(core, "_http_json", side_effect=_stub):
+            with self.assertLogs(core.logger, level="WARNING") as log_ctx:
+                d = core.discover_processes(self.BASE, opener=MagicMock())
+        self.assertEqual(d["status"], "UNAVAILABLE")
+        combined = "\n".join(log_ctx.output)
+        self.assertNotIn("SECRET-MARKER-abc", combined)
+        self.assertNotIn("<html>", combined)
+
+    def test_unsafe_process_names_are_skipped_not_stored(self):
+        d = self._discover({
+            "/services/v2/deployments": {},
+            "/services/v2/extracts": {"response": {"items": [
+                {"name": "../etc/passwd"}, {"name": "EXT/1"}, {"name": ""}, {"name": "EXT1"},
+            ]}},
+            "/services/v2/extracts/EXT1": {"response": {"status": "RUNNING"}},
+            "/services/v2/replicats": {"response": {"items": []}},
+            "/services/v2/sources": {"response": {"items": []}},
+        })
+        self.assertEqual([p["process"] for p in d["processes"]], ["EXT1"])
+
+    def test_deduplication_is_deterministic(self):
+        d = self._discover({
+            "/services/v2/deployments": {},
+            "/services/v2/extracts": {"response": {"items": [{"name": "EXT1"}, {"name": "EXT1"}, {"name": "EXT1"}]}},
+            "/services/v2/extracts/EXT1": {"response": {"status": "RUNNING"}},
+            "/services/v2/replicats": {"response": {"items": []}},
+            "/services/v2/sources": {"response": {"items": []}},
+        })
+        self.assertEqual(len(d["processes"]), 1)
+
+    def test_future_third_deployment_style_growth_keeps_counts_consistent(self):
+        d = self._discover({
+            "/services/v2/deployments": {},
+            "/services/v2/extracts": {"response": {"items": [{"name": "EXT1"}, {"name": "EXT2"}]}},
+            "/services/v2/extracts/EXT1": {"response": {"status": "RUNNING"}},
+            "/services/v2/extracts/EXT2": {"response": {"status": "RUNNING"}},
+            "/services/v2/replicats": {"response": {"items": [{"name": "REP1"}]}},
+            "/services/v2/replicats/REP1": {"response": {"status": "RUNNING"}},
+            "/services/v2/sources": {"response": {"items": []}},
+        })
+        self.assertEqual(d["extractCount"], 2)
+        self.assertEqual(d["replicatCount"], 1)
+        self.assertEqual(d["totalCount"], 3)
+        self.assertEqual(d["status"], "OK")
 
 
 class BuildMetricBatchTests(unittest.TestCase):
@@ -667,6 +937,51 @@ class BuildMetricBatchTests(unittest.TestCase):
         names = core.build_metric_batch.__code__.co_names
         self.assertNotIn("boto3", names)
         self.assertNotIn("put_metric_data", names)
+
+    def test_complete_inventory_publishes_lag_breached_and_abend_failure_as_zero(self):
+        md = core.build_metric_batch("gg-x", "oracle", {"lag": 0, "abend": 0, "down": 0},
+                                     process_inventory_complete=True)
+        names = [m["MetricName"] for m in md]
+        self.assertIn("LagBreached", names)
+        self.assertIn("AbendFailure", names)
+        by_name = {m["MetricName"]: m for m in md}
+        self.assertEqual(by_name["LagBreached"]["Value"], 0.0)
+        self.assertEqual(by_name["AbendFailure"]["Value"], 0.0)
+
+    def test_incomplete_inventory_omits_lag_breached_and_abend_failure_entirely(self):
+        md = core.build_metric_batch("gg-x", "oracle", {"lag": 0, "abend": 0, "down": 0},
+                                     process_inventory_complete=False)
+        names = [m["MetricName"] for m in md]
+        self.assertNotIn("LagBreached", names)
+        self.assertNotIn("AbendFailure", names)
+
+    def test_incomplete_inventory_still_publishes_deployment_down(self):
+        md = core.build_metric_batch("gg-x", "oracle", {"lag": 0, "abend": 0, "down": 1},
+                                     process_inventory_complete=False)
+        by_name = {m["MetricName"]: m for m in md}
+        self.assertEqual(by_name["DeploymentDown"]["Value"], 1.0)
+
+    def test_incomplete_inventory_still_publishes_heartbeat_and_critical_service(self):
+        md = core.build_metric_batch("gg-x", "oracle", {"lag": 0, "abend": 0, "down": 0},
+                                     critical_service_status={"adminsrvr": True}, heartbeat_ok=True,
+                                     process_inventory_complete=False)
+        names = [m["MetricName"] for m in md]
+        self.assertIn("HeartbeatAgeSeconds", names)
+        self.assertIn("CriticalServiceDown", names)
+
+    def test_incomplete_inventory_still_publishes_real_process_metrics(self):
+        procs = [{"process": "EXT1", "type": "extract", "lagSeconds": 5.0, "abended": False}]
+        md = core.build_metric_batch("gg-x", "oracle", {"lag": 0, "abend": 0, "down": 0}, procs=procs,
+                                     process_inventory_complete=False)
+        names = [m["MetricName"] for m in md]
+        self.assertIn("ExtractLagSeconds", names)
+        self.assertIn("AbendState", names)
+
+    def test_default_process_inventory_complete_is_true(self):
+        md = core.build_metric_batch("gg-x", "oracle", {"lag": 0, "abend": 0, "down": 0})
+        names = [m["MetricName"] for m in md]
+        self.assertIn("LagBreached", names)
+        self.assertIn("AbendFailure", names)
 
 
 class PublishMetricBatchTests(unittest.TestCase):
@@ -856,7 +1171,7 @@ class MetricPublicationIntegrationTests(unittest.TestCase):
         def fake_fetch(*a, **k):
             if raise_on_fetch:
                 raise RuntimeError("admin rest down")
-            return []
+            return _discovery()
 
         def fake_cw_client():
             cw_client_calls.append(1)
@@ -878,7 +1193,7 @@ class MetricPublicationIntegrationTests(unittest.TestCase):
             core.CLOUDWATCH_PUBLISH_ENABLED = cloudwatch_enabled
             try:
                 with mock.patch.object(core.cfgmod, "credential_paths", return_value=(user_file, pwd_file)), \
-                     mock.patch.object(core, "fetch_gg_processes", side_effect=fake_fetch), \
+                     mock.patch.object(core, "discover_processes", side_effect=fake_fetch), \
                      mock.patch.object(core, "_basic_opener", return_value=MagicMock()), \
                      mock.patch.object(core, "_build_ssl_context", return_value=MagicMock()), \
                      mock.patch.object(core, "probe_critical_services",
@@ -965,6 +1280,113 @@ class MetricPublicationIntegrationTests(unittest.TestCase):
                          "goldengate-dev.svc.cluster.local", "EXTORA1", "/mnt/secrets-store",
                          "AccessDenied", "Traceback"):
             self.assertNotIn(forbidden, failure_message)
+
+
+class ProcessDiscoveryPersistenceTests(unittest.TestCase):
+    """Wires discover_processes into polling_loop's STATE#_deployment/STATE#<process> writes."""
+
+    DEPLOYMENT = {
+        "name": "gg-oracle-payments-01",
+        "type": "oracle",
+        "adminHost": "gg-oracle-payments-01.goldengate-dev.svc.cluster.local",
+        "adminPort": 8443,
+        "tlsServerName": "gg-oracle-payments-01.goldengate-dev.adcbmis.local",
+        "pipeline": "payments-ora-to-pg-001",
+    }
+
+    def _run_tick(self, discovery):
+        stop_event = threading.Event()
+
+        def fake_get_item(Key):
+            if Key.get("recordType") == "CONFIG":
+                stop_event.set()
+                return {"Item": {"deploymentType": "oracle", "checkIntervalSeconds": 0,
+                                 "alertsEnabled": False, "metricsEnabled": False}}
+            return {"Item": {}}
+
+        table = MagicMock()
+        table.get_item.side_effect = fake_get_item
+
+        mgr = MagicMock()
+        mgr.renew.return_value = True
+
+        state = core.LeaseState()
+        state.set_leader(True)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            user_file = os.path.join(tmp, "user")
+            pwd_file = os.path.join(tmp, "pwd")
+            with open(user_file, "w") as f:
+                f.write("synthetic-user")
+            with open(pwd_file, "w") as f:
+                f.write("synthetic-pass")
+
+            with mock.patch.object(core.cfgmod, "credential_paths", return_value=(user_file, pwd_file)), \
+                 mock.patch.object(core, "discover_processes", return_value=discovery), \
+                 mock.patch.object(core, "_basic_opener", return_value=MagicMock()), \
+                 mock.patch.object(core, "_build_ssl_context", return_value=MagicMock()), \
+                 mock.patch.object(core, "probe_critical_services", return_value={}):
+                core.polling_loop(self.DEPLOYMENT, table, mgr, state, stop_event)
+
+        return table
+
+    def _deployment_write(self, table):
+        writes = [c for c in table.update_item.call_args_list
+                 if c.kwargs["Key"].get("recordType") == "STATE#_deployment"]
+        self.assertEqual(len(writes), 1)
+        return writes[0].kwargs
+
+    def test_process_discovery_persisted_into_state_deployment(self):
+        discovery = _discovery(status="EMPTY", extractsStatus="EMPTY", replicatsStatus="EMPTY",
+                               sourcesStatus="EMPTY", detailFailureCount=0)
+        table = self._run_tick(discovery)
+        write = self._deployment_write(table)
+        self.assertIn("processDiscovery=:pd", write["UpdateExpression"])
+        pd = write["ExpressionAttributeValues"][":pd"]
+        self.assertEqual(pd["status"], "EMPTY")
+        self.assertEqual(pd["extractsStatus"], "EMPTY")
+        self.assertEqual(pd["detailFailureCount"], 0)
+
+    def test_process_discovery_summary_never_contains_process_names(self):
+        procs = [{"process": "SUPER_SECRET_NAME", "type": "extract", "status": "RUNNING",
+                 "lagSeconds": 1.0, "abended": False, "metrics": {}, "error": "", "pollStatus": "OK"}]
+        discovery = _discovery(status="OK", processes=procs, extractCount=1, totalCount=1)
+        table = self._run_tick(discovery)
+        write = self._deployment_write(table)
+        pd = write["ExpressionAttributeValues"][":pd"]
+        self.assertNotIn("processes", pd)
+        self.assertNotIn("SUPER_SECRET_NAME", json.dumps(pd, default=str))
+
+    def test_real_process_row_carries_poll_status(self):
+        procs = [{"process": "EXT1", "type": "extract", "status": "RUNNING",
+                 "lagSeconds": 1.0, "abended": False, "metrics": {}, "error": "", "pollStatus": "DETAIL_UNAVAILABLE"}]
+        discovery = _discovery(status="PARTIAL", processes=procs, extractCount=1, totalCount=1,
+                               detailFailureCount=1)
+        table = self._run_tick(discovery)
+        process_writes = [c for c in table.update_item.call_args_list
+                          if c.kwargs["Key"].get("recordType") == "STATE#EXT1"]
+        self.assertEqual(len(process_writes), 1)
+        vals = process_writes[0].kwargs["ExpressionAttributeValues"]
+        self.assertEqual(vals[":pollStatus"], "DETAIL_UNAVAILABLE")
+
+    def test_no_synthetic_process_row_written(self):
+        discovery = _discovery(status="EMPTY")
+        table = self._run_tick(discovery)
+        record_types = {c.kwargs["Key"].get("recordType") for c in table.update_item.call_args_list}
+        for rt in record_types:
+            self.assertNotIn("STATE#unknown", rt)
+            self.assertNotIn("STATE#None", rt)
+            self.assertNotEqual(rt, "STATE#")
+
+    def test_no_delete_item_call_in_process_lifecycle(self):
+        discovery = _discovery(status="EMPTY")
+        table = self._run_tick(discovery)
+        table.delete_item.assert_not_called()
+
+    def test_no_scan_call_introduced(self):
+        discovery = _discovery(status="EMPTY")
+        table = self._run_tick(discovery)
+        table.scan.assert_not_called()
 
 
 class CriticalServiceResolutionTests(unittest.TestCase):
@@ -1071,7 +1493,7 @@ class CriticalServiceCoverageTests(unittest.TestCase):
             core.CLOUDWATCH_PUBLISH_ENABLED = cloudwatch_enabled
             try:
                 with mock.patch.object(core.cfgmod, "credential_paths", return_value=(user_file, pwd_file)), \
-                     mock.patch.object(core, "fetch_gg_processes", return_value=[]), \
+                     mock.patch.object(core, "discover_processes", return_value=_discovery()), \
                      mock.patch.object(core, "_basic_opener", return_value=MagicMock()), \
                      mock.patch.object(core, "_build_ssl_context", return_value=MagicMock()), \
                      mock.patch.object(core, "probe_critical_services", side_effect=fake_probe), \
@@ -1201,22 +1623,26 @@ class LoggerHierarchyIntegrationTests(unittest.TestCase):
         procs = [{"process": "E1", "type": "extract"},
                 {"process": "R1", "type": "replicat"},
                 {"process": "D1", "type": "distpath"}]
+        discovery = _discovery(status="OK", processes=procs)
         output = self._capture_real_handler_output(
-            lambda: core.log_discovery_summary("gg-oracle-payments-01", procs))
+            lambda: core.log_discovery_summary("gg-oracle-payments-01", discovery))
         lines = [ln for ln in output.splitlines() if "process_discovery_summary" in ln]
         self.assertEqual(len(lines), 1, f"expected exactly one summary line, got: {lines!r}")
 
     def test_discovery_summary_is_valid_json_with_only_allowed_keys(self):
         procs = [{"process": "E1", "type": "extract"}]
+        discovery = _discovery(status="OK", processes=procs, extractCount=1, totalCount=1)
         output = self._capture_real_handler_output(
-            lambda: core.log_discovery_summary("gg-oracle-payments-01", procs))
+            lambda: core.log_discovery_summary("gg-oracle-payments-01", discovery))
         line = next(ln for ln in output.splitlines() if "process_discovery_summary" in ln)
         record = json.loads(line)
         self.assertEqual(record["event"], "process_discovery_summary")
         self.assertEqual(
             set(record.keys()),
-            {"event", "deployment", "extractCount", "replicatCount", "distpathCount", "totalCount"})
+            {"event", "deployment", "discoveryStatus", "extractCount", "replicatCount", "distpathCount",
+             "totalCount", "detailFailureCount", "extractsStatus", "replicatsStatus", "sourcesStatus"})
         self.assertEqual(record["deployment"], "gg-oracle-payments-01")
+        self.assertEqual(record["discoveryStatus"], "OK")
         self.assertEqual(record["extractCount"], 1)
         self.assertEqual(record["replicatCount"], 0)
         self.assertEqual(record["distpathCount"], 0)
@@ -1225,17 +1651,19 @@ class LoggerHierarchyIntegrationTests(unittest.TestCase):
     def test_discovery_summary_no_process_names_or_payload_values(self):
         procs = [{"process": "SUPER_SECRET_PROCESS_NAME", "type": "extract",
                  "metrics": {"password": "should-never-appear"}, "error": "leaky detail"}]
+        discovery = _discovery(status="OK", processes=procs)
         output = self._capture_real_handler_output(
-            lambda: core.log_discovery_summary("gg-oracle-payments-01", procs))
+            lambda: core.log_discovery_summary("gg-oracle-payments-01", discovery))
         self.assertNotIn("SUPER_SECRET_PROCESS_NAME", output)
         self.assertNotIn("should-never-appear", output)
         self.assertNotIn("leaky detail", output)
 
     def test_no_duplicate_output_across_repeated_ticks(self):
         procs = [{"process": "E1", "type": "extract"}]
+        discovery = _discovery(status="OK", processes=procs)
         output = self._capture_real_handler_output(
-            lambda: (core.log_discovery_summary("gg-oracle-payments-01", procs),
-                    core.log_discovery_summary("gg-oracle-payments-01", procs)))
+            lambda: (core.log_discovery_summary("gg-oracle-payments-01", discovery),
+                    core.log_discovery_summary("gg-oracle-payments-01", discovery)))
         lines = [ln for ln in output.splitlines() if "process_discovery_summary" in ln]
         self.assertEqual(len(lines), 2)  # exactly one line per call, no duplication per call
 
@@ -2188,7 +2616,7 @@ class PmsPollingLoopIntegrationTests(unittest.TestCase):
         def fake_fetch(*a, **k):
             if raise_on_fetch:
                 raise RuntimeError("admin rest down")
-            return []
+            return _discovery()
 
         with tempfile.TemporaryDirectory() as tmp:
             user_file = os.path.join(tmp, "user")
@@ -2199,7 +2627,7 @@ class PmsPollingLoopIntegrationTests(unittest.TestCase):
                 f.write("synthetic-pass")
 
             with mock.patch.object(core.cfgmod, "credential_paths", return_value=(user_file, pwd_file)), \
-                 mock.patch.object(core, "fetch_gg_processes", side_effect=fake_fetch), \
+                 mock.patch.object(core, "discover_processes", side_effect=fake_fetch), \
                  mock.patch.object(core, "_basic_opener", return_value=MagicMock()), \
                  mock.patch.object(core, "_build_ssl_context", return_value=MagicMock()), \
                  mock.patch.object(core, "probe_critical_services", return_value={}), \

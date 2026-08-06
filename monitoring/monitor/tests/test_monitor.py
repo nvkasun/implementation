@@ -289,6 +289,36 @@ class ReadRuntimeViewTests(unittest.TestCase):
                                         self._meta(), now=now, stale_after_seconds=120)
         self.assertEqual(out["criticalServices"], {"adminsrvr": False, "distsrvr": False, "metricsrvr": False})
 
+    def test_process_discovery_is_additive_and_normalized(self):
+        now = 1780000010
+        table = FakeTable([make_deployment_state_item(
+            recorded_at=now - 5,
+            processDiscovery={"status": "EMPTY", "collectedAt": now - 5, "extractCount": 0,
+                              "replicatCount": 0, "distpathCount": 0, "totalCount": 0,
+                              "extractsStatus": "EMPTY", "replicatsStatus": "EMPTY",
+                              "sourcesStatus": "EMPTY", "detailFailureCount": 0})])
+        out = monitor.read_runtime_view(table, "source", "gg-oracle-payments-01",
+                                        self._meta(), now=now, stale_after_seconds=120)
+        self.assertEqual(out["processDiscovery"]["status"], "EMPTY")
+        # Every previously existing field must still be present.
+        for key in ("role", "deploymentName", "deploymentType", "dataSource", "effectiveStatus",
+                   "criticalServices", "processes", "lease"):
+            self.assertIn(key, out)
+
+    def test_process_discovery_absent_when_deployment_state_missing(self):
+        now = 1780000010
+        table = FakeTable([])
+        out = monitor.read_runtime_view(table, "source", "gg-oracle-payments-01",
+                                        self._meta(), now=now, stale_after_seconds=120)
+        self.assertIsNone(out["processDiscovery"])
+
+    def test_process_discovery_absent_when_not_yet_reported(self):
+        now = 1780000010
+        table = FakeTable([make_deployment_state_item(recorded_at=now - 5)])
+        out = monitor.read_runtime_view(table, "source", "gg-oracle-payments-01",
+                                        self._meta(), now=now, stale_after_seconds=120)
+        self.assertIsNone(out["processDiscovery"])
+
 
 class BuildStatusPayloadTests(unittest.TestCase):
     def test_end_to_end_shape_matches_recommended_schema(self):
@@ -704,6 +734,73 @@ class CriticalServiceNormalizationTests(unittest.TestCase):
     def test_boolean_root_service_value_rejected(self):
         # The service value itself (not a {"reachable": ...} dict) must fail closed, not be coerced.
         self.assertEqual(monitor.normalize_critical_services({"adminsrvr": True}), {"adminsrvr": False})
+
+
+class NormalizeProcessDiscoveryTests(unittest.TestCase):
+    """normalize_process_discovery: strict, additive, fail-closed normalization of STATE#_deployment.processDiscovery."""
+
+    def _valid(self, **overrides):
+        d = {"status": "OK", "collectedAt": 1780000000, "extractCount": 1, "replicatCount": 1,
+            "distpathCount": 0, "totalCount": 2, "extractsStatus": "OK", "replicatsStatus": "OK",
+            "sourcesStatus": "EMPTY", "detailFailureCount": 0}
+        d.update(overrides)
+        return d
+
+    def test_well_formed_input_passes_through(self):
+        out = monitor.normalize_process_discovery(self._valid())
+        self.assertEqual(out["status"], "OK")
+        self.assertEqual(out["extractCount"], 1)
+        self.assertEqual(out["detailFailureCount"], 0)
+
+    def test_non_dict_root_becomes_none(self):
+        for bad in (None, "unexpected", 42, [], True):
+            with self.subTest(bad=bad):
+                self.assertIsNone(monitor.normalize_process_discovery(bad))
+
+    def test_unknown_status_fails_closed_to_none(self):
+        self.assertIsNone(monitor.normalize_process_discovery(self._valid(status="MADE_UP")))
+
+    def test_every_fixed_status_accepted(self):
+        for status in ("OK", "EMPTY", "PARTIAL", "UNAVAILABLE", "INVALID_RESPONSE"):
+            with self.subTest(status=status):
+                out = monitor.normalize_process_discovery(self._valid(status=status))
+                self.assertEqual(out["status"], status)
+
+    def test_endpoint_status_unknown_value_fails_closed_to_unavailable(self):
+        out = monitor.normalize_process_discovery(self._valid(extractsStatus="MADE_UP"))
+        self.assertEqual(out["extractsStatus"], "UNAVAILABLE")
+
+    def test_negative_counts_become_zero(self):
+        out = monitor.normalize_process_discovery(self._valid(extractCount=-5, detailFailureCount=-1))
+        self.assertEqual(out["extractCount"], 0)
+        self.assertEqual(out["detailFailureCount"], 0)
+
+    def test_non_numeric_counts_become_zero(self):
+        out = monitor.normalize_process_discovery(self._valid(extractCount="not-a-number"))
+        self.assertEqual(out["extractCount"], 0)
+
+    def test_boolean_count_never_treated_as_numeric(self):
+        out = monitor.normalize_process_discovery(self._valid(extractCount=True))
+        self.assertEqual(out["extractCount"], 0)
+
+    def test_decimal_count_converted_to_jsonsafe_int(self):
+        from decimal import Decimal
+        out = monitor.normalize_process_discovery(self._valid(extractCount=Decimal("3")))
+        self.assertEqual(out["extractCount"], 3)
+        self.assertIsInstance(out["extractCount"], int)
+
+    def test_missing_collected_at_becomes_none_not_a_crash(self):
+        d = self._valid()
+        del d["collectedAt"]
+        out = monitor.normalize_process_discovery(d)
+        self.assertIsNone(out["collectedAt"])
+
+    def test_never_persists_process_names(self):
+        # The normalizer only reads the fixed summary keys -- an extra "processes" key must never surface.
+        d = self._valid()
+        d["processes"] = [{"process": "SUPER_SECRET_NAME"}]
+        out = monitor.normalize_process_discovery(d)
+        self.assertNotIn("processes", out)
 
 
 class PortalHtmlManagerParityTests(unittest.TestCase):
@@ -1184,6 +1281,96 @@ class UiRedesignPhase6C1Tests(unittest.TestCase):
         rendered = monitor.render_html(_ui_payload(processes=[]), make_config())
         self.assertIn("No Extract or Replicat process STATE rows have been recorded.", rendered)
 
+    def test_discovery_not_reported_shows_safe_default(self):
+        rendered = monitor.render_html(_ui_payload(), make_config())
+        self.assertIn("Not reported", rendered)
+
+    def test_discovery_empty_renders_honest_empty_state(self):
+        discovery = {"status": "EMPTY", "extractCount": 0, "replicatCount": 0, "distpathCount": 0}
+        rendered = monitor.render_html(_ui_payload(processes=[], processDiscovery=discovery), make_config())
+        self.assertIn("Empty inventory", rendered)
+        self.assertIn("No replication processes discovered", rendered)
+        self.assertIn("Replication health is not claimed.", rendered)
+
+    def test_discovery_partial_renders_attention_text(self):
+        discovery = {"status": "PARTIAL", "extractCount": 1, "replicatCount": 0, "distpathCount": 0}
+        rendered = monitor.render_html(_ui_payload(processDiscovery=discovery), make_config())
+        self.assertIn("Partially available", rendered)
+        self.assertIn("Process discovery partially available", rendered)
+
+    def test_discovery_unavailable_renders_attention_text(self):
+        discovery = {"status": "UNAVAILABLE", "extractCount": 0, "replicatCount": 0, "distpathCount": 0}
+        rendered = monitor.render_html(_ui_payload(processDiscovery=discovery), make_config())
+        self.assertIn("Unavailable", rendered)
+        self.assertIn("Process discovery unavailable", rendered)
+
+    def test_discovery_invalid_response_renders_attention_text(self):
+        discovery = {"status": "INVALID_RESPONSE", "extractCount": 0, "replicatCount": 0, "distpathCount": 0}
+        rendered = monitor.render_html(_ui_payload(processDiscovery=discovery), make_config())
+        self.assertIn("Invalid response", rendered)
+        self.assertIn("Invalid process inventory response", rendered)
+
+    def test_discovery_counts_rendered_compactly(self):
+        discovery = {"status": "OK", "extractCount": 2, "replicatCount": 1, "distpathCount": 3}
+        rendered = monitor.render_html(_ui_payload(processDiscovery=discovery), make_config())
+        self.assertIn("Extract 2", rendered)
+        self.assertIn("Replicat 1", rendered)
+        self.assertIn("Distribution 3", rendered)
+
+    def test_discovery_status_is_html_escaped(self):
+        discovery = {"status": "<script>alert(1)</script>", "extractCount": 0, "replicatCount": 0, "distpathCount": 0}
+        rendered = monitor.render_html(_ui_payload(processDiscovery=discovery), make_config())
+        self.assertNotIn("<script>alert(1)</script>", rendered)
+
+    def test_discovery_never_exposes_a_raw_error_field(self):
+        discovery = {"status": "UNAVAILABLE", "extractCount": 0, "replicatCount": 0, "distpathCount": 0,
+                     "rawError": "connection refused to 10.0.0.5:8443"}
+        rendered = monitor.render_html(_ui_payload(processDiscovery=discovery), make_config())
+        self.assertNotIn("10.0.0.5", rendered)
+        self.assertNotIn("connection refused", rendered)
+
+
+class OverallStateDiscoveryAndStaleTests(unittest.TestCase):
+    """Phase 6C1B Task 11: overall header state driven by processDiscovery and stale process rows."""
+
+    def test_discovery_partial_forces_attention(self):
+        payload = _ui_payload(criticalServices={"adminsrvr": True, "distsrvr": True},
+                              processDiscovery={"status": "PARTIAL"})
+        self.assertEqual(ui._compute_summary(payload)["overallState"], ui.OVERALL_ATTENTION)
+
+    def test_discovery_unavailable_forces_attention(self):
+        payload = _ui_payload(criticalServices={"adminsrvr": True, "distsrvr": True},
+                              processDiscovery={"status": "UNAVAILABLE"})
+        self.assertEqual(ui._compute_summary(payload)["overallState"], ui.OVERALL_ATTENTION)
+
+    def test_discovery_invalid_response_forces_attention(self):
+        payload = _ui_payload(criticalServices={"adminsrvr": True, "distsrvr": True},
+                              processDiscovery={"status": "INVALID_RESPONSE"})
+        self.assertEqual(ui._compute_summary(payload)["overallState"], ui.OVERALL_ATTENTION)
+
+    def test_stale_process_row_forces_attention(self):
+        payload = _ui_payload(criticalServices={"adminsrvr": True, "distsrvr": True})
+        payload["logicalPipelines"][0]["runtimes"][0]["processes"][0]["stale"] = True
+        self.assertEqual(ui._compute_summary(payload)["overallState"], ui.OVERALL_ATTENTION)
+
+    def test_discovery_ok_with_current_process_is_healthy(self):
+        payload = _ui_payload(criticalServices={"adminsrvr": True, "distsrvr": True},
+                              processDiscovery={"status": "OK"})
+        self.assertEqual(ui._compute_summary(payload)["overallState"], ui.OVERALL_HEALTHY)
+
+    def test_discovery_empty_with_no_processes_is_limited_visibility_not_attention(self):
+        payload = _ui_payload(criticalServices={"adminsrvr": True, "distsrvr": True}, processes=[],
+                              processDiscovery={"status": "EMPTY"})
+        self.assertEqual(ui._compute_summary(payload)["overallState"], ui.OVERALL_LIMITED_VISIBILITY)
+
+    def test_summary_reports_discovery_issues_and_stale_process_counts(self):
+        payload = _ui_payload(criticalServices={"adminsrvr": True, "distsrvr": True},
+                              processDiscovery={"status": "PARTIAL"})
+        payload["logicalPipelines"][0]["runtimes"][0]["processes"][0]["stale"] = True
+        summary = ui._compute_summary(payload)
+        self.assertEqual(summary["discoveryIssues"], 1)
+        self.assertEqual(summary["staleProcesses"], 1)
+
     def test_error_banner_remains_sanitized_and_has_role_alert(self):
         rendered = monitor.render_html(_ui_payload(), make_config(),
                                        error_message=monitor.CLIENT_SAFE_DYNAMODB_ERROR_MESSAGE)
@@ -1345,6 +1532,25 @@ class ApiProcessesTests(unittest.TestCase):
         for forbidden in ("errorMsg", "password", "hunter2", "db-internal.example.local",
                           "adminSecret", "arn:aws", "/mnt/secrets-store", "ca-chain-pem"):
             self.assertNotIn(forbidden, raw)
+
+    def test_process_discovery_is_an_additive_field(self):
+        now = int(time.time())
+        table = FakeTable([
+            make_deployment_state_item(recorded_at=now - 5,
+                                       processDiscovery={"status": "OK", "collectedAt": now - 5,
+                                                        "extractCount": 1, "replicatCount": 0,
+                                                        "distpathCount": 0, "totalCount": 1,
+                                                        "extractsStatus": "OK", "replicatsStatus": "OK",
+                                                        "sourcesStatus": "EMPTY", "detailFailureCount": 0}),
+            make_process_item(recorded_at=now - 3),
+        ])
+        handler, writes = self._handler(lambda: table)
+        handler.path = "/api/processes"
+        handler.do_GET()
+        body = json.loads(writes[0][2])
+        dep = next(d for d in body["deployments"] if d["deploymentName"] == "gg-oracle-payments-01")
+        self.assertEqual(dep["processDiscovery"]["status"], "OK")
+        self.assertEqual(dep["processDiscovery"]["extractCount"], 1)
 
     def test_uses_canonical_state_schema_only_no_legacy_fallback(self):
         # A record under the legacy per-role partition key must show MISSING; /api/processes reads canonical STATE# records only, same as /api/status.

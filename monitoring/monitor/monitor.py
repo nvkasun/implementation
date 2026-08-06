@@ -225,6 +225,48 @@ def lease_view(lease_item, now):
     return {"holder": str(lease_item.get("holder", "")), "expiresAt": expires_at, "fresh": fresh}
 
 
+DISCOVERY_STATUSES = ("OK", "EMPTY", "PARTIAL", "UNAVAILABLE", "INVALID_RESPONSE")
+ENDPOINT_DISCOVERY_STATUSES = ("OK", "EMPTY", "UNAVAILABLE", "INVALID_RESPONSE")
+INCOMPLETE_DISCOVERY_STATUSES = ("PARTIAL", "UNAVAILABLE", "INVALID_RESPONSE")
+
+
+def _non_negative_int(raw):
+    value = decimal_to_jsonsafe(raw) if isinstance(raw, Decimal) else raw
+    if isinstance(value, bool):
+        return 0
+    if not isinstance(value, (int, float)):
+        return 0
+    value = int(value)
+    return value if value >= 0 else 0
+
+
+def normalize_process_discovery(raw):
+    """Strict, additive-only normalization of STATE#_deployment.processDiscovery; unknown/malformed fields fail closed."""
+    if not isinstance(raw, dict):
+        return None
+    status = str(raw.get("status") or "")
+    if status not in DISCOVERY_STATUSES:
+        return None
+    collected_at = _parse_epoch(raw.get("collectedAt"))
+
+    def _endpoint_status(value):
+        value = str(value or "")
+        return value if value in ENDPOINT_DISCOVERY_STATUSES else "UNAVAILABLE"
+
+    return {
+        "status": status,
+        "collectedAt": collected_at,
+        "extractCount": _non_negative_int(raw.get("extractCount")),
+        "replicatCount": _non_negative_int(raw.get("replicatCount")),
+        "distpathCount": _non_negative_int(raw.get("distpathCount")),
+        "totalCount": _non_negative_int(raw.get("totalCount")),
+        "extractsStatus": _endpoint_status(raw.get("extractsStatus")),
+        "replicatsStatus": _endpoint_status(raw.get("replicatsStatus")),
+        "sourcesStatus": _endpoint_status(raw.get("sourcesStatus")),
+        "detailFailureCount": _non_negative_int(raw.get("detailFailureCount")),
+    }
+
+
 def normalize_critical_services(raw):
     """Fail-closed: only a literal reachable=True entry counts as reachable, any other shape fails closed."""
     if not isinstance(raw, dict):
@@ -252,9 +294,11 @@ def read_runtime_view(table, role, deployment_name, deployment_meta,
     if dep_item is not None:
         status_fields = compute_canonical_effective_status(dep_item, now, stale_after_seconds)
         critical_services = normalize_critical_services(dep_item.get("criticalServices"))
+        process_discovery = normalize_process_discovery(dep_item.get("processDiscovery"))
     else:
         status_fields = {"effectiveStatus": "MISSING", "recordedAt": None, "ageSeconds": None, "fresh": False}
         critical_services = {}
+        process_discovery = None
 
     return {
         "role": role,
@@ -267,6 +311,7 @@ def read_runtime_view(table, role, deployment_name, deployment_meta,
         "lease": lease_view(lease_item, now),
         "criticalServices": critical_services,
         "processes": processes,
+        "processDiscovery": process_discovery,
         **status_fields,
     }
 
@@ -305,6 +350,7 @@ def read_deployment_processes_view(table, deployment_meta, now, stale_after_seco
     process_rows = query_process_state_items(table, deployment_name)
     processes = [normalize_process_row(r, now, stale_after_seconds) for r in process_rows]
     critical_services = normalize_critical_services(dep_item.get("criticalServices")) if dep_item is not None else {}
+    process_discovery = normalize_process_discovery(dep_item.get("processDiscovery")) if dep_item is not None else None
 
     return {
         "deploymentName": deployment_name,
@@ -314,6 +360,7 @@ def read_deployment_processes_view(table, deployment_meta, now, stale_after_seco
         "lease": lease_view(lease_item, now),
         "criticalServices": critical_services,
         "processes": processes,
+        "processDiscovery": process_discovery,
         **status_fields,
     }
 
