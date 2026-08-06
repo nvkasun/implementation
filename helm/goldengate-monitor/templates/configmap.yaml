@@ -1,10 +1,4 @@
-{{- /*
-Mirrors envs/dev/goldengate-deployments.yaml verbatim into a ConfigMap --
-this is a STAGED COPY under this chart's files/ directory, not a
-hand-authored second list. The base repository chart never carries this
-staged copy: the deploying workflow (.github/workflows/goldengate-monitor.yaml)
-stages it into a temporary chart directory immediately before packaging.
-*/ -}}
+{{- /* Mirrors the deployment-model-generated registry verbatim into a ConfigMap -- a STAGED COPY under this chart's files/ directory, never a hand-authored second list; the deploying workflow stages it into a temporary chart directory immediately before packaging. */ -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:

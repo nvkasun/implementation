@@ -5,9 +5,9 @@ locals {
   gg_dashboard_enabled_deployments = {
     for id in local.goldengate_deployment_names : id => {
       name     = id
-      type     = local.goldengate_enabled_deployments[id].runtime.deploymentType
-      pipeline = local.goldengate_enabled_deployments[id].deployment.pipeline
-      role     = local.goldengate_enabled_deployments[id].deployment.role
+      type     = try(local.goldengate_enabled_deployments[id].runtime.deploymentType, "")
+      pipeline = try(local.goldengate_enabled_deployments[id].deployment.pipeline, "")
+      role     = try(local.goldengate_enabled_deployments[id].deployment.role, "")
     }
   }
 

@@ -39,7 +39,7 @@ module "goldengate_pipeline_state" {
   env                  = "dev"
 }
 
-# CONFIG is Terraform-owned (monitor owns LEASE/STATE#*); seeded from goldengate-deployments.yaml; ignore_changes=[item] so later manual tuning survives apply.
+# CONFIG is Terraform-owned (monitor owns LEASE/STATE#*); seeded from the folder-driven inventory in goldengate_inventory.tf; ignore_changes=[item] so later manual tuning survives apply.
 moved {
   from = aws_dynamodb_table_item.gg_oracle_payments_01_config
   to   = aws_dynamodb_table_item.pipeline_config["gg-oracle-payments-01"]
@@ -57,7 +57,7 @@ resource "aws_dynamodb_table_item" "pipeline_config" {
 
   for_each = {
     for id in local.goldengate_deployment_names :
-    id => local.goldengate_enabled_deployments[id].runtime.deploymentType
+    id => try(local.goldengate_enabled_deployments[id].runtime.deploymentType, "")
   }
 
   table_name = "gg-eks-pipeline"

@@ -19,7 +19,33 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 MONITOR_WORKFLOW_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "goldengate-monitor.yaml")
 ARGOCD_WORKFLOW_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "argocd-eks-deployment.yaml")
-DEPLOYMENTS_FILE_PATH = os.path.join(REPO_ROOT, "envs", "dev", "goldengate-deployments.yaml")
+DEPLOYMENT_MODEL_TOOL_PATH = os.path.join(REPO_ROOT, "hack", "goldengate-deployment-model.py")
+
+
+def _generate_registry_document(environment="dev"):
+    """Invokes the sole folder parser to produce the same registry the workflow generates, never a handwritten fixture."""
+    proc = subprocess.run(
+        [sys.executable, DEPLOYMENT_MODEL_TOOL_PATH, "--environment", environment, "registry"],
+        capture_output=True, text=True, cwd=REPO_ROOT,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(f"deployment-model registry generation failed: {proc.stdout}\n{proc.stderr}")
+    return proc.stdout
+
+
+def _stage_generated_registry(target_dir, environment="dev"):
+    """Writes the generated registry to <target_dir>/goldengate-deployments.yaml, mirroring the workflow's staging step."""
+    os.makedirs(target_dir, exist_ok=True)
+    path = os.path.join(target_dir, "goldengate-deployments.yaml")
+    with open(path, "w") as f:
+        f.write(_generate_registry_document(environment))
+    return path
+
+
+def _stage_generated_registry_dir(environment="dev"):
+    target_dir = tempfile.mkdtemp()
+    _stage_generated_registry(target_dir, environment)
+    return target_dir
 
 # Not required to run this suite (every test injects a fake/mock table); stub only when unavailable.
 try:
@@ -353,7 +379,7 @@ class BuildStatusPayloadTests(unittest.TestCase):
             monitor.build_status_payload(config, table, DEPLOYMENTS, LOGICAL_PIPELINES, clock=lambda: 1780000010)
 
     def test_real_repo_config_produces_two_runtimes_under_one_pipeline(self):
-        doc = cfgmod.load_deployments(os.path.join(REPO_ROOT, "envs", "dev"))
+        doc = cfgmod.load_deployments(_stage_generated_registry_dir())
         lps = cfgmod.build_logical_pipelines(doc["deployments"])
         table = FakeTable([])
         config = make_config()
@@ -1836,8 +1862,7 @@ class SecretProviderClassRenderTests(unittest.TestCase):
         cls.tmpdir = tempfile.mkdtemp()
         staged_chart = os.path.join(cls.tmpdir, "goldengate-monitor")
         shutil.copytree(MONITOR_CHART_PATH, staged_chart)
-        os.makedirs(os.path.join(staged_chart, "files"), exist_ok=True)
-        shutil.copy(DEPLOYMENTS_FILE_PATH, os.path.join(staged_chart, "files", "goldengate-deployments.yaml"))
+        _stage_generated_registry(os.path.join(staged_chart, "files"))
 
         proc = subprocess.run(
             ["helm", "template", "gg-monitor", staged_chart,
@@ -1856,7 +1881,7 @@ class SecretProviderClassRenderTests(unittest.TestCase):
         self.assertEqual(self.rendered.count("kind: SecretProviderClass"), 1)
 
     def test_admin_aliases_present_for_every_enabled_deployment(self):
-        doc = cfgmod.load_deployments(os.path.join(REPO_ROOT, "envs", "dev"))
+        doc = cfgmod.load_deployments(_stage_generated_registry_dir())
         for d in doc["deployments"]:
             if not d["enabled"]:
                 continue
@@ -1866,7 +1891,7 @@ class SecretProviderClassRenderTests(unittest.TestCase):
 
     def test_ca_chain_alias_present(self):
         self.assertIn("ca-chain-pem", self.rendered)
-        doc = cfgmod.load_deployments(os.path.join(REPO_ROOT, "envs", "dev"))
+        doc = cfgmod.load_deployments(_stage_generated_registry_dir())
         self.assertIn(doc["tlsSecret"], self.rendered)
 
     def test_exactly_one_csi_volume_mounted_read_only_at_secrets_store(self):
@@ -1900,8 +1925,7 @@ class CloudWatchActivationHelmRenderTests(unittest.TestCase):
         tmpdir = tempfile.mkdtemp()
         staged_chart = os.path.join(tmpdir, "goldengate-monitor")
         shutil.copytree(MONITOR_CHART_PATH, staged_chart)
-        os.makedirs(os.path.join(staged_chart, "files"), exist_ok=True)
-        shutil.copy(DEPLOYMENTS_FILE_PATH, os.path.join(staged_chart, "files", "goldengate-deployments.yaml"))
+        _stage_generated_registry(os.path.join(staged_chart, "files"))
 
         proc = subprocess.run(
             ["helm", "template", "gg-monitor", staged_chart,
@@ -2409,8 +2433,9 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
     def test_no_unsafe_inputs_deploy_condition_remains(self):
         self.assertNotIn("inputs.deploy != false", self.monitor_text)
 
-    def test_push_event_deploy_condition_is_normalized_on_every_deployment_step(self):
-        expected = "${{ github.event_name != 'workflow_dispatch' || inputs.deploy }}"
+    def test_deploy_condition_is_normalized_on_every_deployment_step(self):
+        # inputs.deploy alone gates every mutating step -- github.event_name reflects the workflow_call caller's trigger, not this workflow's own.
+        expected = "${{ inputs.deploy }}"
         deploy_step_names = (
             "Connect to EKS cluster",
             "Ensure Argo CD Application CRD exists",
@@ -2424,12 +2449,14 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
                 condition = _extract_step_if_condition(self.monitor_text, step_name)
                 self.assertEqual(condition, expected)
 
-    def test_push_event_deploy_condition_evaluates_true_for_push(self):
-        # A push event never populates `inputs`, so the expression must short-circuit true via github.event_name before evaluating inputs.deploy.
-        github_event_name = "push"
-        inputs_deploy = None  # unset, as it would be on a real push trigger
-        normalized = (github_event_name != "workflow_dispatch") or bool(inputs_deploy)
-        self.assertTrue(normalized)
+    def test_workflow_call_trigger_supports_orchestrated_invocation(self):
+        doc = yaml.safe_load(self.monitor_text)
+        triggers = doc.get("on") or doc.get(True)
+        self.assertIn("workflow_call", triggers)
+        call_inputs = triggers["workflow_call"]["inputs"]
+        self.assertEqual(call_inputs["deploy"]["type"], "boolean")
+        self.assertTrue(call_inputs["deploy"]["required"])
+        self.assertEqual(call_inputs["environment"]["type"], "string")
 
     def test_manual_deploy_false_remains_supported(self):
         github_event_name = "workflow_dispatch"
@@ -2484,7 +2511,8 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         script_start = self.monitor_text.index("'", preflight_idx) + 1
         script_end = self.monitor_text.index("'", script_start)
         awk_script = self.monitor_text[script_start:script_end]
-        proc = subprocess.run(["awk", awk_script, DEPLOYMENTS_FILE_PATH], capture_output=True, text=True)
+        registry_path = _stage_generated_registry(tempfile.mkdtemp())
+        proc = subprocess.run(["awk", awk_script, registry_path], capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         pairs = [line for line in proc.stdout.splitlines() if line]
         self.assertEqual(pairs, ["gg-oracle-payments-01|oracle", "gg-postgresql-payments-01|postgresql"])
@@ -2633,10 +2661,7 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
     def test_cloudwatch_preflight_step_exists_gated_on_enable_input(self):
         condition = _extract_step_if_condition(
             self.monitor_text, "CloudWatch publication preflight (gate inventory)")
-        self.assertEqual(
-            condition,
-            "${{ (github.event_name != 'workflow_dispatch' || inputs.deploy) "
-            "&& inputs.enable_cloudwatch_publication }}")
+        self.assertEqual(condition, "${{ inputs.deploy && inputs.enable_cloudwatch_publication }}")
 
     def test_cloudwatch_preflight_precedes_argocd_application_step(self):
         preflight_idx = self.monitor_text.index("- name: CloudWatch publication preflight")
@@ -2659,7 +2684,7 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         preflight_idx = self.monitor_text.index("- name: CloudWatch publication preflight")
         argocd_idx = self.monitor_text.index("- name: Create or update Argo CD Application")
         preflight_step_text = self.monitor_text[preflight_idx:argocd_idx]
-        self.assertIn("envs/dev/goldengate-deployments.yaml", preflight_step_text)
+        self.assertIn("work/generated/dev/goldengate-deployments.yaml", preflight_step_text)
         self.assertNotIn("gg-oracle-payments-01", preflight_step_text)
         self.assertNotIn("gg-postgresql-payments-01", preflight_step_text)
 
@@ -2712,8 +2737,7 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
 
         # 8. The double-gate model is preserved: this step only runs when the global hard switch input is true.
         self.assertIn(
-            "if: ${{ (github.event_name != 'workflow_dispatch' || inputs.deploy) "
-            "&& inputs.enable_cloudwatch_publication }}",
+            "if: ${{ inputs.deploy && inputs.enable_cloudwatch_publication }}",
             preflight_step_text)
 
     def test_cloudwatch_preflight_first_deployment_prerequisite_message(self):

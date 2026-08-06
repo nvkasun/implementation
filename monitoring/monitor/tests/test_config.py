@@ -1,4 +1,5 @@
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -8,6 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config as cfgmod
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+DEPLOYMENT_MODEL_TOOL_PATH = os.path.join(REPO_ROOT, "hack", "goldengate-deployment-model.py")
 
 
 def write_deployments_yaml(root, content):
@@ -15,6 +17,19 @@ def write_deployments_yaml(root, content):
     with open(path, "w") as f:
         f.write(content)
     return path
+
+
+def _stage_generated_registry_dir(environment="dev"):
+    """Generates the registry via the sole folder parser and stages it, mirroring the workflow's staging step."""
+    proc = subprocess.run(
+        [sys.executable, DEPLOYMENT_MODEL_TOOL_PATH, "--environment", environment, "registry"],
+        capture_output=True, text=True, cwd=REPO_ROOT,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(f"deployment-model registry generation failed: {proc.stdout}\n{proc.stderr}")
+    target_dir = tempfile.mkdtemp()
+    write_deployments_yaml(target_dir, proc.stdout)
+    return target_dir
 
 
 VALID_DOC = """
@@ -40,7 +55,7 @@ deployments:
 
 class LoadDeploymentsTests(unittest.TestCase):
     def test_real_repo_config_loads_and_derives_correctly(self):
-        doc = cfgmod.load_deployments(os.path.join(REPO_ROOT, "envs", "dev"))
+        doc = cfgmod.load_deployments(_stage_generated_registry_dir())
         self.assertEqual(doc["environment"], "dev")
         self.assertEqual(doc["runtimeNamespace"], "goldengate-dev")
         self.assertEqual(len(doc["deployments"]), 2)
@@ -222,7 +237,7 @@ class ValidateEnabledDeploymentsTests(unittest.TestCase):
                 cfgmod.validate_enabled_deployments(deployments)  # must not raise
 
     def test_real_repo_config_validates_cleanly(self):
-        doc = cfgmod.load_deployments(os.path.join(REPO_ROOT, "envs", "dev"))
+        doc = cfgmod.load_deployments(_stage_generated_registry_dir())
         cfgmod.validate_enabled_deployments(doc["deployments"])  # must not raise
 
 

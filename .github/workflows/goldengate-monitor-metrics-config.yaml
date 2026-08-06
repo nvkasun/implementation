@@ -15,7 +15,7 @@ on:
           - dev
 
       deployment_name:
-        description: "Canonical deployment name (envs/dev/goldengate-deployments.yaml). Validated dynamically against that file -- there is no hardcoded list here, so this input alone does not guarantee validity."
+        description: "Canonical deployment name, validated dynamically against the deployment-model-generated registry -- there is no hardcoded list here, so this input alone does not guarantee validity."
         required: true
         type: string
 
@@ -52,7 +52,7 @@ env:
   TARGET_NAMESPACE: goldengate-monitoring
   MONITOR_SERVICE_ACCOUNT: gg-monitor
   MONITOR_IRSA_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev
-  CANONICAL_REGISTRY: envs/dev/goldengate-deployments.yaml
+  CANONICAL_REGISTRY: work/generated/dev/goldengate-deployments.yaml
   METRICS_CONFIG_HELPER: hack/goldengate-metrics-config.py
 
 concurrency:
@@ -88,6 +88,18 @@ jobs:
           if [ -n "${EKS_ACCOUNT_ID:-}" ] && [ "$CALLER_ACCOUNT" != "$EKS_ACCOUNT_ID" ]; then
             echo "Note: caller account (${CALLER_ACCOUNT}) differs from EKS_ACCOUNT_ID (${EKS_ACCOUNT_ID}) -- expected when this role only assumes a cross-account EKS deploy role. The actual cluster/account binding is validated by the EKS connection step below via EKS_DEPLOY_ROLE_ARN."
           fi
+
+      - name: Generate the folder-driven canonical registry
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
+
+          mkdir -p "$(dirname "$CANONICAL_REGISTRY")"
+          python3 hack/goldengate-deployment-model.py --environment "${{ inputs.environment }}" registry --output "$CANONICAL_REGISTRY"
+          echo "Generated registry:"
+          cat "$CANONICAL_REGISTRY"
 
       - name: Validate deployment_name against the canonical registry
         id: registry

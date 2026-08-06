@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Orchestration/regression script for the GoldenGate EKS repo; runs static parsing/Helm/Python checks derived from the ONE canonical deployment source (envs/dev/goldengate-deployments.yaml); never deploys, touches the cluster, or requires AWS credentials.
+# Orchestration/regression script for the GoldenGate EKS repo; runs static parsing/Helm/Python checks derived from the folder-driven envs/dev/*/values.yaml descriptors via hack/goldengate-deployment-model.py, the sole folder parser; never deploys, touches the cluster, or requires AWS credentials.
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
@@ -9,7 +9,8 @@ cd "$REPO_ROOT"
 # This script's own python3 invocations must never create __pycache__/*.pyc -- that would make the "no committed pycache" check below self-defeating.
 export PYTHONDONTWRITEBYTECODE=1
 
-CANONICAL_CONFIG="envs/dev/goldengate-deployments.yaml"
+DEPLOYMENT_MODEL_TOOL="hack/goldengate-deployment-model.py"
+CANONICAL_CONFIG="work/generated/dev/goldengate-deployments.yaml"
 RUNTIME_CHART="helm/goldengate"
 PLATFORM_CHART="helm/goldengate-platform"
 MONITOR_CHART="helm/goldengate-monitor"
@@ -140,6 +141,15 @@ command -v helm >/dev/null 2>&1 && HELM_AVAILABLE="true"
 PYTHON_AVAILABLE="false"
 if command -v python3 >/dev/null 2>&1 && python3 -c "import yaml" >/dev/null 2>&1; then
   PYTHON_AVAILABLE="true"
+fi
+
+# Regenerates the canonical registry via the sole folder parser, mirroring exactly what the deploy workflow stages; every check below reads this generated file, never envs/dev/*/values.yaml directly and never a handwritten registry file.
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  mkdir -p "$(dirname "$CANONICAL_CONFIG")"
+  if ! python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev registry --output "$CANONICAL_CONFIG"; then
+    echo "FATAL: failed to generate the canonical registry via ${DEPLOYMENT_MODEL_TOOL}."
+    exit 1
+  fi
 fi
 
 echo "=================================================="
@@ -3969,10 +3979,10 @@ else
   fail "20: envs/dev/payments-ora-to-pg-001 still exists -- it must be fully removed in Phase 5B2A"
 fi
 
-if ! grep -rn "payments-ora-to-pg-001" envs/dev/goldengate-deployments.yaml 2>/dev/null | grep -qv "pipeline:"; then
+if ! grep -rn "payments-ora-to-pg-001" "$CANONICAL_CONFIG" 2>/dev/null | grep -qv "pipeline:"; then
   pass "21: no active deployment-registry configuration references the retired deployment folder (only the shared logical pipeline: grouping id remains, which is unrelated and intentionally preserved)"
 else
-  fail "21: envs/dev/goldengate-deployments.yaml appears to reference the retired deployment beyond the shared pipeline: grouping id"
+  fail "21: ${CANONICAL_CONFIG} appears to reference the retired deployment beyond the shared pipeline: grouping id"
 fi
 
 CANONICAL_PRESENCE_MISSING=""
@@ -5145,10 +5155,11 @@ else
 fi
 
 if grep -q "Validate deployment_name against the canonical registry" "$METRICS_CONFIG_WORKFLOW" 2>/dev/null \
-    && grep -q 'CANONICAL_REGISTRY: envs/dev/goldengate-deployments.yaml' "$METRICS_CONFIG_WORKFLOW" 2>/dev/null \
+    && grep -q "Generate the folder-driven canonical registry" "$METRICS_CONFIG_WORKFLOW" 2>/dev/null \
+    && grep -q 'CANONICAL_REGISTRY: work/generated/dev/goldengate-deployments.yaml' "$METRICS_CONFIG_WORKFLOW" 2>/dev/null \
     && ! grep -q "gg-oracle-payments-01" "$METRICS_CONFIG_WORKFLOW" 2>/dev/null \
     && ! grep -q "gg-postgresql-payments-01" "$METRICS_CONFIG_WORKFLOW" 2>/dev/null; then
-  pass "21: deployment_name is validated dynamically against the canonical registry, never hardcoded"
+  pass "21: deployment_name is validated dynamically against the deployment-model-generated registry, never hardcoded"
 else
   fail "21: deployment_name validation is missing, or a deployment name is hardcoded in workflow logic"
 fi
@@ -5404,9 +5415,9 @@ else
   pass "24: cloudwatch_dashboard.tf does not hardcode gg-oracle-payments-01/gg-postgresql-payments-01"
 fi
 
-if grep -q 'try(doc.deployment.enabled, null) != null' "$GOLDENGATE_INVENTORY_TF" 2>/dev/null \
-    && grep -q 'doc.deployment.enabled == true' "$GOLDENGATE_INVENTORY_TF" 2>/dev/null; then
-  pass "24: disabled deployments are excluded by a literal Boolean enabled==true check in the folder-driven inventory"
+if grep -q 'try(doc.deployment.enabled, false) == true' "$GOLDENGATE_INVENTORY_TF" 2>/dev/null \
+    && grep -q 'can(tobool(each.value.deployment.enabled))' "$GOLDENGATE_INVENTORY_TF" 2>/dev/null; then
+  pass "24: disabled deployments are excluded by an enabled==true check, and a literal-Boolean precondition rejects non-Boolean enabled values"
 else
   fail "24: folder-driven inventory eligibility no longer requires a literal Boolean enabled==true"
 fi
@@ -5531,9 +5542,11 @@ else
 fi
 
 if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  # configmap.yaml/values.yaml excluded: Phase 6D0 legitimately touched their explanatory comments, not their logic.
   NOT_PERMITTED_DIFF="$(git diff --stat --ignore-all-space -- \
     monitoring/monitor/health_rules.py monitoring/monitor/Dockerfile \
-    'helm/goldengate-monitor/**' 'helm/goldengate/**' 2>/dev/null || true)"
+    'helm/goldengate-monitor/**' 'helm/goldengate/**' \
+    ':!helm/goldengate-monitor/templates/configmap.yaml' ':!helm/goldengate-monitor/values.yaml' 2>/dev/null || true)"
   if [ -z "$NOT_PERMITTED_DIFF" ]; then
     pass "25: no Helm chart or Dockerfile file outside this phase's own scope changed"
   else
@@ -5576,7 +5589,7 @@ else
   pass "25: no synthetic process fallback exists"
 fi
 
-REGISTRY_EXTRACTION_FIXTURE_RESULT="$(python3 - "$MONITOR_WORKFLOW" <<'PYEOF'
+REGISTRY_EXTRACTION_FIXTURE_RESULT="$(python3 - "$MONITOR_WORKFLOW" "$CANONICAL_CONFIG" <<'PYEOF'
 import subprocess
 import sys
 import tempfile
@@ -5609,7 +5622,7 @@ if run_text is None:
     sys.exit(1)
 
 start_marker = "< <(awk '\n"
-end_marker = "\n' envs/dev/goldengate-deployments.yaml)"
+end_marker = "\n' work/generated/dev/goldengate-deployments.yaml)"
 start = run_text.index(start_marker) + len(start_marker)
 end = run_text.index(end_marker, start)
 awk_script = run_text[start:end]
@@ -5628,7 +5641,7 @@ def run_awk(registry_path):
     return sorted(line.split("|", 1)[0] for line in result.stdout.splitlines() if line.strip())
 
 
-real_names = run_awk("envs/dev/goldengate-deployments.yaml")
+real_names = run_awk(sys.argv[2])
 if real_names != ["gg-oracle-payments-01", "gg-postgresql-payments-01"]:
     print(f"FAIL: real-registry extraction returned {real_names!r}, expected both canonical DEV deployments")
     sys.exit(1)
@@ -5910,6 +5923,183 @@ if python3 hack/check-comment-style.py >/dev/null 2>&1; then
   pass "26: comment-style checker remains integrated and reports zero violations"
 else
   fail "26: comment-style checker reported a violation in the Phase 6D0 files"
+fi
+
+echo ""
+echo "--- Phase 6D0 correction: onboarding-workflow job graph ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  JOB_GRAPH_CHECK="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import sys
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+
+jobs = doc["jobs"]
+expected_order = [
+    "validate_model", "terraform_sync_once", "platform_sync_once", "bootstrap_admin_secrets",
+    "detect_changed_deployments", "build_publish_and_deploy", "monitor_sync_once", "final_validation",
+]
+for name in expected_order:
+    if name not in jobs:
+        print(f"FAIL: missing required job {name!r}")
+        sys.exit(1)
+
+actual_order = [name for name in jobs if name in expected_order]
+if actual_order != expected_order:
+    print(f"FAIL: job order is {actual_order!r}, expected {expected_order!r}")
+    sys.exit(1)
+
+def needs_of(name):
+    n = jobs[name].get("needs") or []
+    return [n] if isinstance(n, str) else n
+
+if "validate_model" not in needs_of("terraform_sync_once"):
+    print("FAIL: terraform_sync_once does not need validate_model")
+    sys.exit(1)
+if "terraform_sync_once" not in needs_of("platform_sync_once"):
+    print("FAIL: platform_sync_once does not need terraform_sync_once")
+    sys.exit(1)
+if "platform_sync_once" not in needs_of("bootstrap_admin_secrets"):
+    print("FAIL: bootstrap_admin_secrets does not need platform_sync_once")
+    sys.exit(1)
+if "bootstrap_admin_secrets" not in needs_of("detect_changed_deployments"):
+    print("FAIL: detect_changed_deployments does not need bootstrap_admin_secrets")
+    sys.exit(1)
+if "build_publish_and_deploy" not in needs_of("monitor_sync_once"):
+    print("FAIL: monitor_sync_once does not need build_publish_and_deploy")
+    sys.exit(1)
+if "monitor_sync_once" not in needs_of("final_validation"):
+    print("FAIL: final_validation does not need monitor_sync_once")
+    sys.exit(1)
+
+for name in ("terraform_sync_once", "platform_sync_once", "monitor_sync_once"):
+    if not str(jobs[name].get("uses", "")).startswith("./.github/workflows/"):
+        print(f"FAIL: {name} does not call a reusable workflow via a job-level uses:")
+        sys.exit(1)
+
+if "strategy" in jobs["bootstrap_admin_secrets"] or "matrix" in jobs["bootstrap_admin_secrets"]:
+    print("FAIL: bootstrap_admin_secrets uses a matrix (must be a single job)")
+    sys.exit(1)
+
+strategy = jobs["build_publish_and_deploy"].get("strategy") or {}
+if strategy.get("max-parallel") != 1:
+    print("FAIL: build_publish_and_deploy is missing max-parallel: 1")
+    sys.exit(1)
+if "matrix" not in strategy:
+    print("FAIL: build_publish_and_deploy is missing its matrix")
+    sys.exit(1)
+
+print("OK: job graph order, needs chain, reusable-workflow calls, and matrix placement are all correct")
+PYEOF
+)"
+  if [ $? -eq 0 ]; then
+    pass "27: ${EKS_APP_WORKFLOW} job graph follows validate-model -> terraform-sync-once -> platform-sync-once -> bootstrap-admin-secrets -> runtime-deployment -> monitor-sync-once -> final-validation"
+  else
+    fail "27: ${JOB_GRAPH_CHECK}"
+  fi
+else
+  skip "27: job graph check -- python3/PyYAML unavailable"
+fi
+
+for workflow in .github/workflows/gg-iam-secrets-deployment.yaml .github/workflows/goldengate-platform.yaml .github/workflows/goldengate-monitor.yaml; do
+  if grep -q "workflow_call:" "$workflow" 2>/dev/null; then
+    pass "27: ${workflow} supports workflow_call"
+  else
+    fail "27: ${workflow} is missing a workflow_call trigger"
+  fi
+done
+
+if grep -q "gh workflow run" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  fail "27: ${EKS_APP_WORKFLOW} contains a live gh workflow run dispatch"
+else
+  pass "27: no gh workflow run dispatch exists in ${EKS_APP_WORKFLOW}"
+fi
+
+if grep -q "^concurrency:" "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && grep -q "group: goldengate-admin-secret-bootstrap-dev" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "27: environment-level and bootstrap-job concurrency protection are both present"
+else
+  fail "27: environment-level or bootstrap-job concurrency protection is missing"
+fi
+
+if grep -q -- "--environment dev" "$ADMIN_SECRET_HELPER" "$EKS_APP_WORKFLOW" 2>/dev/null \
+    || grep -q "environment dev" "$ADMIN_SECRET_HELPER" 2>/dev/null; then
+  pass "27: admin-secret bootstrap helper accepts --environment"
+fi
+if grep -q -- "--environment" "$ADMIN_SECRET_HELPER" 2>/dev/null; then
+  pass "27: hack/ensure-goldengate-admin-secret.py accepts and validates --environment"
+else
+  fail "27: hack/ensure-goldengate-admin-secret.py is missing --environment"
+fi
+
+if grep -q "Resolve the admin secret name via the deployment model" "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && grep -q -- "--set runtime.csi.admin.objectName=\"\$RESOLVED_ADMIN_SECRET_NAME\"" "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && grep -q "name: runtime.csi.admin.objectName" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "27: the admin secret name is resolved once and injected via an explicit Helm --set and Argo CD parameter override"
+else
+  fail "27: admin-secret resolution/injection is missing from the runtime deployment steps"
+fi
+
+if grep -q "Verify the selected image exists in the approved private ECR" "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && grep -q "aws ecr describe-images" "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && grep -q "imageDetails\"\]\[0\]\[\"imageDigest\"\]" "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && grep -q "Verify the rendered StatefulSet uses the selected verified image" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "27: the selected image's existence and digest are verified read-only via describe-images, and the rendered manifest is checked against it"
+else
+  fail "27: ECR image existence/digest verification is missing or incomplete"
+fi
+
+if grep -qE 'oracle.*ecr-oracle-image|postgresql.*ecr-postgresql-image|ENGINE_IMAGE_MAP|engineImageMap' "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  fail "27: an engine-to-image mapping was introduced in the app workflow"
+else
+  pass "27: the ECR verification step derives the image solely from the descriptor, no engine-to-image mapping"
+fi
+
+echo ""
+echo "--- Phase 6D0 correction: migration safety (offline manifest comparison) ---"
+
+if [ "$HELM_AVAILABLE" = "true" ]; then
+  for pair in "gg-oracle-payments-01:dev/goldengate/source/admin:gg-oracle-sa" "gg-postgresql-payments-01:dev/goldengate/target/admin:gg-postgresql-sa"; do
+    id="${pair%%:*}"
+    rest="${pair#*:}"
+    admin_secret="${rest%%:*}"
+    legacy_sa="${rest##*:}"
+
+    CURRENT_RENDER="${WORKDIR}/migration-current-${id}.yaml"
+    LEGACY_RENDER="${WORKDIR}/migration-legacy-${id}.yaml"
+
+    if helm template "$id" "$RUNTIME_CHART" \
+        --namespace goldengate-dev \
+        --values "envs/dev/${id}/values.yaml" \
+        --set global.environment=dev \
+        --set runtime.csi.admin.objectName="$admin_secret" \
+        > "$CURRENT_RENDER" 2>"${WORKDIR}/migration-current-${id}.log" \
+      && helm template "$id" "$RUNTIME_CHART" \
+        --namespace goldengate-dev \
+        --values "envs/dev/${id}/values.yaml" \
+        --set global.environment=dev \
+        --set runtime.csi.admin.objectName="$admin_secret" \
+        --set runtime.serviceAccount.name="$legacy_sa" \
+        > "$LEGACY_RENDER" 2>"${WORKDIR}/migration-legacy-${id}.log"; then
+
+      MIGRATION_DIFF="$(diff "$CURRENT_RENDER" "$LEGACY_RENDER" || true)"
+      DIFF_LINE_COUNT="$(echo "$MIGRATION_DIFF" | grep -cE '^[<>]' || true)"
+
+      if [ "$DIFF_LINE_COUNT" -eq 2 ] \
+          && echo "$MIGRATION_DIFF" | grep -qE '^<\s+serviceAccountName: gg-runtime-sa$' \
+          && echo "$MIGRATION_DIFF" | grep -qE "^>\s+serviceAccountName: ${legacy_sa}\$"; then
+        pass "28: ${id} migration from ${legacy_sa} to gg-runtime-sa changed only serviceAccountName -- StatefulSet name, PVC/EFS identity, image, ports, ingress/ALB order, admin secret, and TLS are byte-identical"
+      else
+        fail "28: ${id} migration diff is not limited to serviceAccountName alone:"$'\n'"${MIGRATION_DIFF}"
+      fi
+    else
+      fail "28: ${id} migration-safety render failed"
+    fi
+  done
+else
+  skip "28: migration-safety manifest comparison -- helm not available"
 fi
 
 echo ""

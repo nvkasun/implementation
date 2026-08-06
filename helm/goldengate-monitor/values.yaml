@@ -18,7 +18,7 @@ aws:
 dynamodb:
   tableName: gg-eks-pipeline
 
-# envs/dev/goldengate-deployments.yaml, staged read-only under this chart's files/ directory (never committed there) and mounted into the pod here.
+# The deployment-model-generated registry, staged read-only under this chart's files/ directory (never committed there) and mounted into the pod here.
 canonicalConfig:
   root: /etc/gg-canonical
 

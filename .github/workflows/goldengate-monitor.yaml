@@ -37,6 +37,23 @@ on:
           - all-disabled
           - all-enabled
 
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      deploy:
+        required: true
+        type: boolean
+      enable_cloudwatch_publication:
+        required: false
+        type: boolean
+        default: false
+      metrics_gate_expectation:
+        required: false
+        type: string
+        default: any
+
 permissions:
   id-token: write
   contents: read
@@ -915,7 +932,7 @@ jobs:
             /^\s*enabled:\s*true/ { enabled="true" }
             /^\s*enabled:\s*false/ { enabled="false" }
             END { if (name != "" && enabled == "true") print name }
-          ' envs/dev/goldengate-deployments.yaml)
+          ' work/generated/dev/goldengate-deployments.yaml)
           if ! grep -Fq -- "ca-chain-pem" <<< "$SPC_BLOCK"; then
             echo "FAIL: SecretProviderClass is missing the ca-chain-pem alias."
             exit 1
@@ -1035,8 +1052,8 @@ jobs:
             echo "FAIL: rendered ConfigMap goldengate-monitor-canonical-config was not found."
             exit 1
           fi
-          # Expected names are read from the canonical source file itself (never hardcoded) so this check adapts automatically as deployments are added/renamed.
-          EXPECTED_NAMES="$(grep -E '^\s*-?\s*(name|pipeline):' envs/dev/goldengate-deployments.yaml \
+          # Expected names are read from the deployment-model-generated registry (never hardcoded) so this check adapts automatically as deployments are added/renamed.
+          EXPECTED_NAMES="$(grep -E '^\s*-?\s*(name|pipeline):' work/generated/dev/goldengate-deployments.yaml \
             | sed -E 's/^\s*-?\s*(name|pipeline):\s*//' | tr -d '"'"'"'\r' | sort -u)"
           while IFS= read -r expected; do
             [ -z "$expected" ] && continue
@@ -1125,7 +1142,7 @@ jobs:
           ls -lrt pulled
 
       - name: Connect to EKS cluster
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.deploy }}
+        if: ${{ inputs.deploy }}
         shell: bash
         run: |
           set -euo pipefail
@@ -1142,7 +1159,7 @@ jobs:
           kubectl version --client=true
 
       - name: Ensure Argo CD Application CRD exists
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.deploy }}
+        if: ${{ inputs.deploy }}
         shell: bash
         run: |
           set -euo pipefail
@@ -1157,7 +1174,7 @@ jobs:
           echo "Argo CD Application CRD is present."
 
       - name: Confirm the monitor Argo CD repository Secret exists
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.deploy }}
+        if: ${{ inputs.deploy }}
         shell: bash
         run: |
           set -euo pipefail
@@ -1185,7 +1202,7 @@ jobs:
           echo "OK: ${ARGOCD_MONITOR_SECRET_NAME} exists and points to ${EXPECTED_URL}."
 
       - name: CloudWatch publication preflight (gate inventory)
-        if: ${{ (github.event_name != 'workflow_dispatch' || inputs.deploy) && inputs.enable_cloudwatch_publication }}
+        if: ${{ inputs.deploy && inputs.enable_cloudwatch_publication }}
         shell: bash
         run: |
           set -euo pipefail
@@ -1243,7 +1260,7 @@ jobs:
           fi
           echo "Using the existing monitor pod for this read-only preflight: ${POD_NAME}"
 
-          # Canonical enabled deployment name|type pairs, discovered from the source file (never hardcoded), carrying each deployment's type for the deploymentType check below.
+          # Canonical enabled deployment name|type pairs, discovered from the deployment-model-generated registry (never hardcoded), carrying each deployment's type for the deploymentType check below.
           mapfile -t ENABLED_DEPLOYMENT_PAIRS < <(awk '
             /^[[:space:]]*-[[:space:]]*name:/ {
               if (name != "" && enabled == "true") print name "|" type
@@ -1258,10 +1275,10 @@ jobs:
             /^[[:space:]]*enabled:[[:space:]]*true/ { enabled="true"; next }
             /^[[:space:]]*enabled:[[:space:]]*false/ { enabled="false"; next }
             END { if (name != "" && enabled == "true") print name "|" type }
-          ' envs/dev/goldengate-deployments.yaml)
+          ' work/generated/dev/goldengate-deployments.yaml)
 
           if [ "${#ENABLED_DEPLOYMENT_PAIRS[@]}" -eq 0 ]; then
-            echo "FAIL: no enabled deployments discovered from envs/dev/goldengate-deployments.yaml."
+            echo "FAIL: no enabled deployments discovered from work/generated/dev/goldengate-deployments.yaml."
             exit 1
           fi
 
@@ -1352,7 +1369,7 @@ jobs:
           echo "OK: gate inventory satisfies metrics_gate_expectation=${GATE_EXPECTATION} for every enabled canonical deployment (alertsEnabled confirmed false throughout)."
 
       - name: Create or update Argo CD Application
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.deploy }}
+        if: ${{ inputs.deploy }}
         shell: bash
         run: |
           set -euo pipefail
@@ -1409,7 +1426,7 @@ jobs:
             --overwrite
 
       - name: Wait for Argo CD sync and health
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.deploy }}
+        if: ${{ inputs.deploy }}
         shell: bash
         run: |
           set -euo pipefail
@@ -1451,7 +1468,7 @@ jobs:
           done
 
       - name: Verify GoldenGate monitor runtime state
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.deploy }}
+        if: ${{ inputs.deploy }}
         shell: bash
         run: |
           set -euo pipefail
@@ -1564,8 +1581,8 @@ jobs:
             exit 1
           }
 
-          # Expected names come from the canonical source file itself (never hardcoded) so this check adapts automatically as deployments are added/renamed.
-          EXPECTED_NAMES="$(grep -E '^\s*-?\s*(name|pipeline):' envs/dev/goldengate-deployments.yaml \
+          # Expected names come from the deployment-model-generated registry (never hardcoded) so this check adapts automatically as deployments are added/renamed.
+          EXPECTED_NAMES="$(grep -E '^\s*-?\s*(name|pipeline):' work/generated/dev/goldengate-deployments.yaml \
             | sed -E 's/^\s*-?\s*(name|pipeline):\s*//' | tr -d '"'"'"'\r' | sort -u)"
           while IFS= read -r expected; do
             [ -z "$expected" ] && continue
@@ -1603,10 +1620,10 @@ jobs:
             /^[[:space:]]*enabled:[[:space:]]*true/ { enabled="true"; next }
             /^[[:space:]]*enabled:[[:space:]]*false/ { enabled="false"; next }
             END { if (name != "" && enabled == "true") print name "|" type }
-          ' envs/dev/goldengate-deployments.yaml)
+          ' work/generated/dev/goldengate-deployments.yaml)
 
           if [ "${#ENABLED_DEPLOYMENT_PAIRS_DISCOVERY[@]}" -eq 0 ]; then
-            echo "FAIL: no enabled canonical deployment found in envs/dev/goldengate-deployments.yaml."
+            echo "FAIL: no enabled canonical deployment found in work/generated/dev/goldengate-deployments.yaml."
             exit 1
           fi
 
@@ -1763,7 +1780,7 @@ jobs:
               /^[[:space:]]*enabled:[[:space:]]*true/ { enabled="true"; next }
               /^[[:space:]]*enabled:[[:space:]]*false/ { enabled="false"; next }
               END { if (name != "" && enabled == "true") print name "|" type }
-            ' envs/dev/goldengate-deployments.yaml)
+            ' work/generated/dev/goldengate-deployments.yaml)
 
             POST_GATE_FAILED="false"
             for pair in "${ENABLED_DEPLOYMENT_PAIRS_POST[@]}"; do
@@ -1880,7 +1897,7 @@ jobs:
             echo "- Chart ref: \`${HELM_CHART_REF:-unknown}\`"
             echo "- Target namespace: \`${TARGET_NAMESPACE}\`"
             echo "- Argo CD Application: \`${ARGOCD_APP_NAME}\` (namespace: \`${ARGOCD_NAMESPACE}\`)"
-            echo "- Deploy enabled: \`${{ github.event_name != 'workflow_dispatch' || inputs.deploy }}\`"
+            echo "- Deploy enabled: \`${{ inputs.deploy }}\`"
             echo "- CloudWatch publication requested: \`${CLOUDWATCH_PUBLISH_ENABLED_VALUE:-unknown}\`"
             echo ""
             echo "### Ownership"

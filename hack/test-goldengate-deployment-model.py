@@ -40,13 +40,21 @@ runtime:
   serviceAccount:
     create: false
     name: {service_account}
+  csi:
+{csi_admin_block}    certificate:
+      objectName: {csi_certificate_object_name}
+
+ingress:
+  hostDomain: {ingress_host_domain}
+{alb_block}
 {extra}
 """
 
 
 def write_descriptor(root, environment, deployment_id, enabled=True, pipeline="test-pipeline", role="source",
                      deployment_type="oracle", repository=None, tag="1.0.0", service_account="gg-runtime-sa",
-                     admin_secret=None, extra="", raw_override=None):
+                     admin_secret=None, alb_group_order=None, extra="", raw_override=None,
+                     csi_admin_object_name=None, csi_certificate_object_name=None, ingress_host_domain=None):
     folder = os.path.join(root, "envs", environment, deployment_id)
     os.makedirs(folder, exist_ok=True)
     path = os.path.join(folder, "values.yaml")
@@ -59,10 +67,18 @@ def write_descriptor(root, environment, deployment_id, enabled=True, pipeline="t
     if admin_secret is not None:
         name, managed = admin_secret
         admin_secret_block = f"  adminSecret:\n    name: {name}\n    managed: {'true' if managed else 'false'}\n"
+    alb_block = f'  alb:\n    groupOrder: "{alb_group_order}"' if alb_group_order is not None else ""
+    csi_admin_block = f"    admin:\n      objectName: {csi_admin_object_name}\n" if csi_admin_object_name is not None else ""
+    if csi_certificate_object_name is None:
+        csi_certificate_object_name = f"{environment}/goldengate/tls-certificate"
+    if ingress_host_domain is None:
+        ingress_host_domain = f"goldengate-{environment}.adcbmis.local"
     text = BASE_DESCRIPTOR.format(
         enabled=str(enabled).lower(), pipeline=pipeline, role=role, environment=environment,
         deployment_type=deployment_type, repository=repository, tag=tag, service_account=service_account,
-        admin_secret_block=admin_secret_block, extra=extra)
+        admin_secret_block=admin_secret_block, alb_block=alb_block, extra=extra,
+        csi_admin_block=csi_admin_block, csi_certificate_object_name=csi_certificate_object_name,
+        ingress_host_domain=ingress_host_domain)
     with open(path, "w") as f:
         f.write(text)
     return path
@@ -191,6 +207,212 @@ class AdminSecretDerivationTests(ScratchEnvironmentTestCase):
         self.assertEqual(result_a, sorted(result_a))
 
 
+class EnvironmentScopedContractTests(ScratchEnvironmentTestCase):
+    """Phase 6D0 correction Task 1: environment-scoped secrets, CSI consistency, EFS, and stricter ECR/name grammar."""
+
+    def test_default_admin_secret_is_scoped_to_the_selected_environment_not_hardcoded_dev(self):
+        write_descriptor(self._tmp.name, "staging", "gg-fixture-01")
+        active, _inactive, invalid = gdm.scan("staging")
+        self.assertEqual(invalid, [])
+        self.assertEqual(active[0]["adminSecretName"], "staging/goldengate/runtime/gg-fixture-01/admin")
+
+    def test_managed_true_with_non_deterministic_name_fails(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+                         admin_secret=("dev/goldengate/runtime/some-other-id/admin", True))
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+
+    def test_managed_false_with_arn_style_name_fails(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+                         admin_secret=("arn:aws:secretsmanager:eu-west-1:123456789012:secret:x", False))
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+
+    def test_managed_false_with_traversal_name_fails(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+                         admin_secret=("dev/../etc/admin", False))
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+
+    def test_managed_false_with_leading_slash_name_fails(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+                         admin_secret=("/dev/goldengate/legacy/admin", False))
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+
+    def test_managed_false_with_out_of_environment_scope_name_fails(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+                         admin_secret=("prod/goldengate/legacy/admin", False))
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+
+    def test_csi_certificate_object_name_must_match_shared_tls_secret(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+                         csi_certificate_object_name="dev/goldengate/wrong-cert")
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+
+    def test_csi_admin_object_name_mismatch_fails(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+                         csi_admin_object_name="dev/goldengate/wrong-admin")
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+
+    def test_csi_admin_object_name_matching_resolved_name_passes(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+                         csi_admin_object_name="dev/goldengate/runtime/gg-fixture-01/admin")
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+
+    def test_ingress_host_domain_inconsistent_with_shared_domain_fails(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+                         ingress_host_domain="totally-different-domain.example.com")
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+
+    def test_ecr_repository_with_digest_syntax_fails(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+                         repository="229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle@sha256:" + "a" * 64)
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+
+    def test_ecr_repository_with_whitespace_fails(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+                         repository="229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg oracle")
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+
+    def test_ecr_repository_with_empty_suffix_fails(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+                         repository="229410149234.dkr.ecr.eu-west-1.amazonaws.com/")
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+
+    def test_ecr_repository_with_double_slash_fails(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+                         repository="229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg//oracle")
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+
+    def test_multi_segment_ecr_repository_passes(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+                         repository="229410149234.dkr.ecr.eu-west-1.amazonaws.com/goldengate/ogg-oracle")
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+
+    def test_username_key_rejected(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01", extra="dbUsername: admin\n")
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+
+    def test_token_key_rejected(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01", extra="apiToken: xyz\n")
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+
+    def test_database_url_key_rejected(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01", extra="databaseUrl: postgres://x\n")
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+
+    def test_jdbc_url_key_rejected(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01", extra="jdbcUrl: jdbc:postgresql://x\n")
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+
+    def test_field_merely_referencing_a_secret_by_name_is_allowed(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+                         admin_secret=("dev/goldengate/legacy/admin", False))
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+
+    def test_efs_enabled_requires_safe_filesystem_id(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+                         extra="persistence:\n  enabled: true\n  efs:\n    fileSystemId: not-an-fs-id\n")
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+
+    def test_efs_enabled_with_safe_filesystem_id_passes(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+                         extra="persistence:\n  enabled: true\n  efs:\n    fileSystemId: fs-0123456789abcdef0\n")
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+
+    def test_derived_namespace_fields_present(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01")
+        active, _inactive, _invalid = gdm.scan("dev")
+        self.assertEqual(active[0]["runtimeNamespace"], "goldengate-dev")
+        self.assertEqual(active[0]["monitoringNamespace"], "goldengate-monitoring")
+        self.assertEqual(active[0]["ingressDomain"], "goldengate-dev.adcbmis.local")
+        self.assertEqual(active[0]["tlsSecretName"], "dev/goldengate/tls-certificate")
+
+
+class FullValidationGatingTests(unittest.TestCase):
+    """Task 1 item 2: no command may emit partial inventory while another runtime folder is invalid."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._original_root = gdm.REPO_ROOT
+        gdm.REPO_ROOT = self._tmp.name
+
+    def tearDown(self):
+        gdm.REPO_ROOT = self._original_root
+        self._tmp.cleanup()
+
+    def test_list_fails_closed_when_an_unrelated_folder_is_invalid(self):
+        write_descriptor(self._tmp.name, "dev", "gg-good-fixture-01")
+        write_descriptor(self._tmp.name, "dev", "gg-bad-fixture-01", tag="latest")
+        active, inactive, invalid, problems = gdm.cmd_list.__wrapped__(self) if False else (None, None, None, None)
+        # cmd_list prints; assert via the underlying full-validation gate instead of stdout capture.
+        _active, _inactive, invalid, problems = gdm._run_full_validation("dev")
+        self.assertTrue(invalid or problems)
+
+    def test_managed_secrets_command_returns_nonzero_when_a_folder_is_invalid(self):
+        write_descriptor(self._tmp.name, "dev", "gg-good-fixture-01")
+        write_descriptor(self._tmp.name, "dev", "gg-bad-fixture-01", tag="latest")
+
+        class Args:
+            environment = "dev"
+
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            exit_code = gdm.cmd_managed_secrets(Args())
+        self.assertEqual(exit_code, 1)
+        self.assertNotIn("gg-good-fixture-01", buf.getvalue())
+
+    def test_describe_command_returns_nonzero_when_an_unrelated_folder_is_invalid(self):
+        write_descriptor(self._tmp.name, "dev", "gg-good-fixture-01")
+        write_descriptor(self._tmp.name, "dev", "gg-bad-fixture-01", tag="latest")
+
+        class Args:
+            environment = "dev"
+            deployment_id = "gg-good-fixture-01"
+
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            exit_code = gdm.cmd_describe(Args())
+        self.assertEqual(exit_code, 1)
+
+    def test_list_command_returns_nonzero_when_an_unrelated_folder_is_invalid(self):
+        write_descriptor(self._tmp.name, "dev", "gg-good-fixture-01")
+        write_descriptor(self._tmp.name, "dev", "gg-bad-fixture-01", tag="latest")
+
+        class Args:
+            environment = "dev"
+
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            exit_code = gdm.cmd_list(Args())
+        self.assertEqual(exit_code, 1)
+        self.assertNotIn("ACTIVE  gg-good-fixture-01", buf.getvalue())
+
+
 class LifecycleClassificationTests(ScratchEnvironmentTestCase):
     """Tests 13, 14: disabled/absent runtimes validate but are excluded from active inventory."""
 
@@ -258,10 +480,8 @@ class FailClosedTests(ScratchEnvironmentTestCase):
         self.assertTrue(any("more than one target" in p for p in problems))
 
     def test_duplicate_alb_group_order_fails(self):
-        write_descriptor(self._tmp.name, "dev", "gg-alb-a", pipeline="p1", role="source",
-                         extra='\ningress:\n  alb:\n    groupOrder: "110"\n')
-        write_descriptor(self._tmp.name, "dev", "gg-alb-b", pipeline="p2", role="source",
-                         extra='\ningress:\n  alb:\n    groupOrder: "110"\n')
+        write_descriptor(self._tmp.name, "dev", "gg-alb-a", pipeline="p1", role="source", alb_group_order="110")
+        write_descriptor(self._tmp.name, "dev", "gg-alb-b", pipeline="p2", role="source", alb_group_order="110")
         problems = gdm.validate("dev")
         self.assertTrue(any("duplicate ALB group order" in p for p in problems))
 

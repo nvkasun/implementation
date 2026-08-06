@@ -62,9 +62,173 @@ env:
   HELM_CHART_PATH: helm/goldengate
   ENVS_ROOT: envs
 
+# Environment-level protection: only one orchestrator run per branch mutates dev at a time.
+concurrency:
+  group: goldengate-eks-app-orchestrator-dev-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  validate_model:
+    name: Validate the folder-driven deployment model
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    outputs:
+      effective_deploy: ${{ steps.compute.outputs.effective_deploy }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify Python and PyYAML prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! command -v python3 >/dev/null 2>&1; then
+            echo "FAIL: python3 is required and is not available on this runner."
+            exit 1
+          fi
+
+          if ! python3 -c "import yaml" >/dev/null 2>&1; then
+            echo "FAIL: PyYAML is required and is not available on this runner."
+            exit 1
+          fi
+
+          echo "OK: python3 and PyYAML are available."
+
+      - name: Validate the folder-driven deployment model
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Fail-closed gate: no downstream job runs while any envs/dev/*/values.yaml descriptor is invalid.
+          python3 hack/goldengate-deployment-model.py --environment dev validate
+
+      - name: Compute effective deploy flag
+        id: compute
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_DEPLOY: ${{ inputs.deploy }}
+        run: |
+          set -euo pipefail
+
+          # A push event carries no workflow_dispatch inputs and always implies deploy=true, matching the existing detect-goldengate-deployments.sh push-path contract.
+          if [ "$EVENT_NAME" != "workflow_dispatch" ] || [ "$INPUT_DEPLOY" = "true" ]; then
+            echo "effective_deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "effective_deploy=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  terraform_sync_once:
+    name: Synchronize Terraform (once per environment)
+
+    needs:
+      - validate_model
+    if: needs.validate_model.outputs.effective_deploy == 'true'
+
+    uses: ./.github/workflows/gg-iam-secrets-deployment.yaml
+    with:
+      environment: dev
+      region: eu-west-1
+
+  platform_sync_once:
+    name: Synchronize the GoldenGate platform chart (once)
+
+    needs:
+      - validate_model
+      - terraform_sync_once
+    if: needs.validate_model.outputs.effective_deploy == 'true'
+
+    uses: ./.github/workflows/goldengate-platform.yaml
+    with:
+      environment: dev
+      deploy: true
+
+  bootstrap_admin_secrets:
+    name: Bootstrap managed GoldenGate admin secrets
+
+    needs:
+      - validate_model
+      - platform_sync_once
+    if: needs.validate_model.outputs.effective_deploy == 'true'
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    environment: dev
+
+    # Single job, no matrix: the bash loop below processes one managed secret at a time; this group also serializes across concurrent workflow runs.
+    concurrency:
+      group: goldengate-admin-secret-bootstrap-dev
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.ROLE_ARN }}
+
+      - name: Verify AWS identity carries Secrets Manager bootstrap permissions
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # This job never calls "aws eks update-kubeconfig" and never touches kubectl: the identity assumed
+          # above by configure-aws-credentials is the only AWS identity this job ever uses for secretsmanager
+          # calls. Do not add an EKS/kubeconfig step to this job -- update-kubeconfig only configures kubectl's
+          # auth and never changes the AWS CLI/boto session identity used by hack/ensure-goldengate-admin-secret.py.
+          aws sts get-caller-identity
+
+      - name: Resolve managed secrets from the folder-driven inventory
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
+
+          mkdir -p work/generated/dev
+          python3 hack/goldengate-deployment-model.py --environment dev managed-secrets > work/generated/dev/managed-secrets.txt
+          echo "Managed secrets to bootstrap:"
+          cat work/generated/dev/managed-secrets.txt
+
+      - name: Bootstrap each managed admin secret
+        shell: bash
+        env:
+          AWS_REGION: ${{ env.AWS_REGION }}
+        run: |
+          set -euo pipefail
+
+          FAILED=0
+          while IFS=' ' read -r deployment_id secret_name; do
+            [ -z "$deployment_id" ] && continue
+            echo "Bootstrapping ${deployment_id} -> ${secret_name}"
+            if ! python3 hack/ensure-goldengate-admin-secret.py \
+                --deployment-id "$deployment_id" --environment dev \
+                --secret-name "$secret_name" --managed true --region "$AWS_REGION"; then
+              echo "FAIL: admin secret bootstrap failed for ${deployment_id}."
+              FAILED=1
+            fi
+          done < work/generated/dev/managed-secrets.txt
+
+          if [ "$FAILED" -ne 0 ]; then
+            exit 1
+          fi
+
+          echo "OK: every managed admin secret is initialized or already current."
+
   detect_changed_deployments:
     name: Detect changed GoldenGate deployments
+
+    needs:
+      - validate_model
+      - bootstrap_admin_secrets
+    if: success()
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -119,7 +283,7 @@ jobs:
 
     needs:
       - detect_changed_deployments
-    if: needs.detect_changed_deployments.outputs.has_changes == 'true'
+    if: success() && needs.detect_changed_deployments.outputs.has_changes == 'true'
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -127,6 +291,8 @@ jobs:
 
     strategy:
       fail-fast: false
+      # Sequential rollout: an existing-runtime migration failure must block the next; applies to every matrix entry.
+      max-parallel: 1
       matrix:
         include: ${{ fromJson(needs.detect_changed_deployments.outputs.deployment_matrix) }}
 
@@ -306,6 +472,64 @@ jobs:
           echo "helm_chart_ref=${HELM_CHART_REF}" >> "$GITHUB_OUTPUT"
           echo "argocd_app_name=${ARGOCD_APP_NAME}" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve the admin secret name via the deployment model
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
+
+          # The deployment values file never has to duplicate this under runtime.csi.admin.objectName -- it is
+          # resolved once here and injected as an exact Helm/Argo CD value override below, the single source of
+          # truth also used by the monitor registry and Terraform/IAM, so it can never drift between consumers.
+          RESOLVED_ADMIN_SECRET_NAME="$(python3 hack/goldengate-deployment-model.py --environment "$ENVIRONMENT" describe --deployment-id "$DEPLOYMENT_ID" \
+            | python3 -c 'import json, sys; print(json.load(sys.stdin)["adminSecretName"])')"
+
+          if [ -z "$RESOLVED_ADMIN_SECRET_NAME" ]; then
+            echo "FAIL: could not resolve the admin secret name for ${DEPLOYMENT_ID}."
+            exit 1
+          fi
+
+          echo "Resolved admin secret name: ${RESOLVED_ADMIN_SECRET_NAME}"
+          echo "RESOLVED_ADMIN_SECRET_NAME=${RESOLVED_ADMIN_SECRET_NAME}" >> "$GITHUB_ENV"
+
+      - name: Verify the selected image exists in the approved private ECR
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Read-only describe-images call; no engine-to-image mapping and no public-image fallback -- the
+          # repository/tag come only from this deployment's own descriptor, resolved via the deployment model.
+          DESCRIBE_JSON="$(python3 hack/goldengate-deployment-model.py --environment "$ENVIRONMENT" describe --deployment-id "$DEPLOYMENT_ID")"
+          IMAGE_REPOSITORY="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["imageRepository"])' <<< "$DESCRIBE_JSON")"
+          IMAGE_TAG="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["imageTag"])' <<< "$DESCRIBE_JSON")"
+
+          EXPECTED_PREFIX="${ECR_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/"
+          if [[ "$IMAGE_REPOSITORY" != "${EXPECTED_PREFIX}"* ]]; then
+            echo "FAIL: image repository is not the approved private ECR account/region: ${IMAGE_REPOSITORY}"
+            exit 1
+          fi
+
+          ECR_REPO_NAME="${IMAGE_REPOSITORY#"$EXPECTED_PREFIX"}"
+
+          IMAGE_DETAIL_JSON="$(aws ecr describe-images \
+            --region "$AWS_REGION" \
+            --repository-name "$ECR_REPO_NAME" \
+            --image-ids imageTag="$IMAGE_TAG" \
+            --output json)"
+
+          IMAGE_DIGEST="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["imageDetails"][0]["imageDigest"])' <<< "$IMAGE_DETAIL_JSON")"
+
+          if [ -z "$IMAGE_DIGEST" ]; then
+            echo "FAIL: could not resolve a digest for ${IMAGE_REPOSITORY}:${IMAGE_TAG}."
+            exit 1
+          fi
+
+          echo "Verified image exists: ${IMAGE_REPOSITORY}:${IMAGE_TAG} (digest ${IMAGE_DIGEST})"
+          echo "IMAGE_REPOSITORY=${IMAGE_REPOSITORY}" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> "$GITHUB_ENV"
+          echo "IMAGE_DIGEST=${IMAGE_DIGEST}" >> "$GITHUB_ENV"
+
       - name: Validate required files
         shell: bash
         run: |
@@ -434,7 +658,8 @@ jobs:
           # global.deploymentId/deploymentModel are intentionally not passed via --set; the chart derives runtime name from Release.Name and reads deploymentModel from $VALUES_FILE itself.
           helm lint "$HELM_CHART_PATH" \
             --values "$VALUES_FILE" \
-            --set global.environment="$ENVIRONMENT"
+            --set global.environment="$ENVIRONMENT" \
+            --set runtime.csi.admin.objectName="$RESOLVED_ADMIN_SECRET_NAME"
 
       - name: Render manifest for validation
         shell: bash
@@ -447,9 +672,25 @@ jobs:
             --namespace "$TARGET_NAMESPACE" \
             --values "$VALUES_FILE" \
             --set global.environment="$ENVIRONMENT" \
+            --set runtime.csi.admin.objectName="$RESOLVED_ADMIN_SECRET_NAME" \
             > "rendered/${RELEASE_NAME}.yaml"
 
           echo "Rendered manifest: rendered/${RELEASE_NAME}.yaml"
+
+      - name: Verify the rendered StatefulSet uses the selected verified image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RENDERED="rendered/${RELEASE_NAME}.yaml"
+          EXPECTED_IMAGE="${IMAGE_REPOSITORY}:${IMAGE_TAG}"
+
+          if ! grep -qF "image: ${EXPECTED_IMAGE}" "$RENDERED"; then
+            echo "FAIL: rendered StatefulSet does not reference the verified image ${EXPECTED_IMAGE}."
+            exit 1
+          fi
+
+          echo "OK: rendered StatefulSet references the verified image ${EXPECTED_IMAGE} (digest ${IMAGE_DIGEST})."
 
       - name: Validate GoldenGate namespace is rendered
         shell: bash
@@ -1207,6 +1448,8 @@ jobs:
                 parameters:
                   - name: global.environment
                     value: ${ENVIRONMENT}
+                  - name: runtime.csi.admin.objectName
+                    value: ${RESOLVED_ADMIN_SECRET_NAME}
             destination:
               server: https://kubernetes.default.svc
               namespace: ${TARGET_NAMESPACE}
@@ -1434,7 +1677,7 @@ jobs:
     name: Delete removed GoldenGate Argo CD Applications
 
     needs: detect_changed_deployments
-    if: github.event_name == 'push' && needs.detect_changed_deployments.outputs.has_deletions == 'true'
+    if: success() && github.event_name == 'push' && needs.detect_changed_deployments.outputs.has_deletions == 'true'
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -1643,4 +1886,53 @@ jobs:
             echo "Argo CD cascade deletion removes the Application-managed resources. The"
             echo "workflow also performs a guarded namespace cleanup only when the remaining"
             echo "namespace has the expected GoldenGate ownership labels."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  monitor_sync_once:
+    name: Synchronize the GoldenGate monitor (once, after all runtimes)
+
+    needs:
+      - validate_model
+      - bootstrap_admin_secrets
+      - build_publish_and_deploy
+      - delete_removed_argocd_applications
+    if: ${{ always() && needs.bootstrap_admin_secrets.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' }}
+
+    uses: ./.github/workflows/goldengate-monitor.yaml
+    with:
+      environment: dev
+      deploy: ${{ needs.validate_model.outputs.effective_deploy == 'true' }}
+
+  final_validation:
+    name: Final validation
+
+    needs:
+      - monitor_sync_once
+    if: ${{ always() && needs.monitor_sync_once.result == 'success' }}
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Re-validate the folder-driven deployment model after rollout
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
+          python3 hack/goldengate-deployment-model.py --environment dev validate
+
+      - name: Orchestrator summary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          {
+            echo "### GoldenGate onboarding orchestrator summary"
+            echo ""
+            echo "validate-model -> terraform-sync-once -> platform-sync-once -> bootstrap-admin-secrets -> runtime-deployment -> monitor-sync-once -> final-validation"
+            echo ""
+            echo "All required stages completed successfully."
           } >> "$GITHUB_STEP_SUMMARY"

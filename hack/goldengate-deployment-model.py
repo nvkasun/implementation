@@ -32,6 +32,15 @@ _MAX_PIPELINE_LENGTH = 63
 
 _VALID_ROLES = ("source", "target")
 
+_ECR_REPO_SUFFIX_RE = re.compile(r"^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*\Z")
+_EFS_FILESYSTEM_ID_RE = re.compile(r"^fs-[0-9a-f]+\Z")
+
+_CREDENTIAL_KEY_FRAGMENTS = (
+    "password", "passwd", "pwd", "secretvalue", "connectionstring", "conn_str",
+    "username", "token", "apikey", "api_key", "dburl", "database_url", "databaseurl",
+    "jdbcurl", "jdbc_url",
+)
+
 
 def _safe_token(value, max_length):
     if not isinstance(value, str) or not value:
@@ -39,6 +48,21 @@ def _safe_token(value, max_length):
     if len(value) > max_length:
         return False
     return bool(_TOKEN_RE.match(value))
+
+
+def _valid_admin_secret_name(name, environment):
+    """Environment-scoped, no ARN, no traversal, no leading slash, no whitespace/control characters."""
+    if not isinstance(name, str) or not name:
+        return False
+    if name.startswith("arn:"):
+        return False
+    if ".." in name or name.startswith("/"):
+        return False
+    if not name.startswith(f"{environment}/"):
+        return False
+    if any(c.isspace() or ord(c) < 0x20 for c in name):
+        return False
+    return True
 
 
 class DescriptorError(Exception):
@@ -88,12 +112,11 @@ def _require_dict(value, reason):
 
 
 def _contains_credential_like_key(node, path=""):
-    """Fails closed: any key resembling a credential anywhere in the document is rejected."""
-    forbidden_fragments = ("password", "passwd", "pwd", "secretvalue", "connectionstring", "conn_str")
+    """Fails closed on usernames/passwords/tokens/connection-strings/database-URLs/API keys; a mere secret-name reference field (e.g. adminSecret, objectName) is never flagged since "secret" alone is not a forbidden fragment."""
     if isinstance(node, dict):
         for key, value in node.items():
             key_lower = str(key).lower()
-            if any(fragment in key_lower for fragment in forbidden_fragments):
+            if any(fragment in key_lower for fragment in _CREDENTIAL_KEY_FRAGMENTS):
                 return True
             if _contains_credential_like_key(value, f"{path}.{key}"):
                 return True
@@ -118,6 +141,11 @@ def _parse_image(runtime):
     expected_prefix = f"{APPROVED_ECR_ACCOUNT}.dkr.ecr.{APPROVED_ECR_REGION}.amazonaws.com/"
     if not repository.startswith(expected_prefix):
         raise DescriptorError("invalid image configuration: repository is not the approved private ECR account/region")
+    suffix = repository[len(expected_prefix):]
+    if not suffix:
+        raise DescriptorError("invalid image configuration: repository suffix is empty")
+    if not _ECR_REPO_SUFFIX_RE.match(suffix):
+        raise DescriptorError("invalid image configuration: repository suffix is malformed, contains a digest/tag, whitespace, or traversal")
     return {"repository": repository, "tag": tag}
 
 
@@ -132,19 +160,24 @@ def _parse_service_account(runtime):
     return {"name": name, "create": False}
 
 
-def _parse_admin_secret(deployment_id, deployment):
+def default_admin_secret_name(environment, deployment_id):
+    return f"{environment}/goldengate/runtime/{deployment_id}/admin"
+
+
+def _parse_admin_secret(deployment_id, environment, deployment):
     admin_secret = deployment.get("adminSecret")
+    default_name = default_admin_secret_name(environment, deployment_id)
     if admin_secret is None:
-        return {"name": f"dev/goldengate/runtime/{deployment_id}/admin", "managed": True}
+        return {"name": default_name, "managed": True}
     _require_dict(admin_secret, "invalid deployment metadata: deployment.adminSecret must be a mapping")
     name = admin_secret.get("name")
-    if not isinstance(name, str) or not name:
-        raise DescriptorError("invalid deployment metadata: deployment.adminSecret.name is required")
-    if "password" in name.lower() or "pwd" in name.lower():
-        raise DescriptorError("invalid deployment metadata: adminSecret.name looks like a credential value")
+    if not _valid_admin_secret_name(name, environment):
+        raise DescriptorError("invalid deployment metadata: deployment.adminSecret.name is not a safe environment-scoped secret name")
     managed = admin_secret.get("managed")
     if not isinstance(managed, bool):
         raise DescriptorError("invalid deployment metadata: deployment.adminSecret.managed must be a literal Boolean")
+    if managed and name != default_name:
+        raise DescriptorError("invalid deployment metadata: managed=true adminSecret.name must be the deterministic deployment-specific name")
     return {"name": name, "managed": managed}
 
 
@@ -175,8 +208,40 @@ def _parse_lifecycle(doc):
     return state
 
 
-def parse_descriptor(deployment_id, environment, doc):
+def _parse_csi(environment, runtime, admin_secret_name):
+    """runtime.csi.admin.objectName (when supplied) must match the resolved admin secret; runtime.csi.certificate.objectName is required and must match the approved shared TLS secret."""
+    csi = _require_dict(runtime.get("csi"), "invalid CSI configuration: runtime.csi must be a mapping")
+    admin = csi.get("admin") or {}
+    admin_object_name = admin.get("objectName")
+    if admin_object_name is not None and admin_object_name != admin_secret_name:
+        raise DescriptorError("invalid CSI configuration: runtime.csi.admin.objectName does not match the resolved admin-secret name")
+    certificate = _require_dict(csi.get("certificate"), "invalid CSI configuration: runtime.csi.certificate must be a mapping")
+    certificate_object_name = certificate.get("objectName")
+    expected_certificate_name = f"{environment}/goldengate/tls-certificate"
+    if certificate_object_name != expected_certificate_name:
+        raise DescriptorError("invalid CSI configuration: runtime.csi.certificate.objectName must equal the approved shared TLS secret")
+    return {"adminObjectName": admin_object_name or admin_secret_name, "certificateObjectName": certificate_object_name}
+
+
+def _parse_efs(doc):
+    """Derives EFS/PVC identity for migration safety checks; validated only when persistence is actually enabled."""
+    persistence = doc.get("persistence") or {}
+    runtime = doc.get("runtime") or {}
+    storage = runtime.get("storage") or {}
+    u02 = storage.get("u02") or {}
+    filesystem_id = (persistence.get("efs") or {}).get("fileSystemId")
+    if persistence.get("enabled") is True:
+        if not isinstance(filesystem_id, str) or not _EFS_FILESYSTEM_ID_RE.match(filesystem_id):
+            raise DescriptorError("invalid persistence configuration: persistence.efs.fileSystemId is not a safe EFS filesystem ID")
+    pvc_claim_name = u02.get("claimName") or u02.get("existingClaim") or ""
+    return {"fileSystemId": filesystem_id, "pvcClaimName": pvc_claim_name}
+
+
+def parse_descriptor(deployment_id, environment, doc, shared=None):
     """Fully validates one values.yaml document; raises DescriptorError with a fixed, safe reason on any problem."""
+    if shared is None:
+        shared = _load_shared_environment_metadata(environment, None, None)
+
     if not _safe_token(deployment_id, _MAX_ID_LENGTH):
         raise DescriptorError("invalid folder name: deployment ID must be a safe lowercase token")
 
@@ -201,9 +266,11 @@ def parse_descriptor(deployment_id, environment, doc):
 
     image = _parse_image(runtime)
     service_account = _parse_service_account(runtime)
-    admin_secret = _parse_admin_secret(deployment_id, deployment)
+    admin_secret = _parse_admin_secret(deployment_id, environment, deployment)
+    csi = _parse_csi(environment, runtime, admin_secret["name"])
     replication = _parse_replication(deployment_id, doc)
     lifecycle_state = _parse_lifecycle(doc)
+    efs = _parse_efs(doc)
 
     global_cfg = _require_dict(doc.get("global"), "invalid deployment metadata: global must be a mapping")
     if global_cfg.get("environment") != environment:
@@ -216,7 +283,10 @@ def parse_descriptor(deployment_id, environment, doc):
     if not isinstance(container_name, str) or not container_name:
         raise DescriptorError("invalid deployment metadata: runtime.containerName must be a non-empty string")
 
-    ingress = doc.get("ingress") or {}
+    ingress = _require_dict(doc.get("ingress"), "invalid deployment metadata: ingress must be a mapping")
+    ingress_domain = ingress.get("hostDomain")
+    if ingress_domain != shared["dnsDomain"]:
+        raise DescriptorError("inconsistent ingress domain: ingress.hostDomain must match the shared DNS domain")
     alb = ingress.get("alb") or {}
     alb_group_order = alb.get("groupOrder")
 
@@ -234,18 +304,20 @@ def parse_descriptor(deployment_id, environment, doc):
         "serviceAccountName": service_account["name"],
         "adminSecretName": admin_secret["name"],
         "adminSecretManaged": admin_secret["managed"],
-        "runtimeNamespace": global_cfg.get("environment") and _runtime_namespace_hint(doc),
+        "csiAdminObjectName": csi["adminObjectName"],
+        "csiCertificateObjectName": csi["certificateObjectName"],
+        "runtimeNamespace": shared["runtimeNamespace"],
+        "monitoringNamespace": shared["monitoringNamespace"],
+        "ingressDomain": ingress_domain,
+        "tlsSecretName": shared["tlsSecret"],
+        "efsFileSystemId": efs["fileSystemId"],
+        "pvcClaimName": efs["pvcClaimName"],
         "albGroupOrder": alb_group_order,
         "replicationEnabled": replication["enabled"],
     }
 
 
-def _runtime_namespace_hint(doc):
-    # Individual runtime values files don't declare their own namespace; the shared platform namespace is authoritative.
-    return None
-
-
-def classify_folder(path, environment):
+def classify_folder(path, environment, shared):
     """Returns (category, descriptor_or_none, reason_or_none). category is one of ignored/inactive/active/invalid."""
     name = _folder_name(path)
     if name in IGNORED_NON_RUNTIME_FOLDER_NAMES:
@@ -262,7 +334,7 @@ def classify_folder(path, environment):
         return "invalid", None, "document is not a mapping"
 
     try:
-        descriptor = parse_descriptor(name, environment, doc)
+        descriptor = parse_descriptor(name, environment, doc, shared=shared)
     except DescriptorError as exc:
         return "invalid", None, exc.reason
 
@@ -273,9 +345,14 @@ def classify_folder(path, environment):
 
 def scan(environment):
     """Returns (active, inactive, invalid) as (list[descriptor], list[descriptor], list[(path, reason)])."""
+    try:
+        shared = _load_shared_environment_metadata(environment, None, None)
+    except (yaml.YAMLError, OSError) as exc:
+        return [], [], [("shared environment metadata", f"could not load shared platform/monitor values: {type(exc).__name__}")]
+
     active, inactive, invalid = [], [], []
     for path in find_values_files(environment):
-        category, descriptor, reason = classify_folder(path, environment)
+        category, descriptor, reason = classify_folder(path, environment, shared)
         if category == "ignored":
             continue
         if category == "invalid":
@@ -391,37 +468,55 @@ def _print_reasons(invalid):
         print(f"INVALID: {path}: {reason}")
 
 
-def cmd_validate(args):
-    problems = validate(args.environment)
-    _active, _inactive, invalid = scan(args.environment)
-    _print_reasons(invalid)
+def _print_problems(problems):
     for problem in sorted(problems):
         print(f"PROBLEM: {problem}")
-    if problems:
+
+
+def _run_full_validation(environment):
+    """The single fail-closed gate every output-producing command runs first: no command may emit any part of the inventory while another runtime folder is invalid or a cross-descriptor problem exists."""
+    active, inactive, invalid = scan(environment)
+    problems = validate(environment)
+    return active, inactive, invalid, problems
+
+
+def cmd_validate(args):
+    _active, _inactive, invalid, problems = _run_full_validation(args.environment)
+    _print_reasons(invalid)
+    _print_problems(problems)
+    if invalid or problems:
         return 1
     print(f"OK: {args.environment} deployment descriptors are valid")
     return 0
 
 
 def cmd_list(args):
-    active, inactive, invalid = scan(args.environment)
-    _print_reasons(invalid)
+    active, inactive, invalid, problems = _run_full_validation(args.environment)
+    if invalid or problems:
+        _print_reasons(invalid)
+        _print_problems(problems)
+        print("FAIL: refusing to list a partial inventory while validation problems exist")
+        return 1
     for d in sorted(active, key=lambda x: x["deploymentId"]):
         print(f"ACTIVE  {d['deploymentId']} type={d['deploymentType']} role={d['role']} pipeline={d['pipeline']}")
     for d in sorted(inactive, key=lambda x: x["deploymentId"]):
         print(f"INACTIVE {d['deploymentId']} type={d['deploymentType']} role={d['role']} pipeline={d['pipeline']}")
-    return 1 if invalid else 0
+    return 0
 
 
 def cmd_describe(args):
-    active, inactive, invalid = scan(args.environment)
+    active, inactive, invalid, problems = _run_full_validation(args.environment)
+    if invalid or problems:
+        _print_reasons(invalid)
+        _print_problems(problems)
+        print("FAIL: refusing to describe a deployment while validation problems exist")
+        return 1
     by_id = {d["deploymentId"]: d for d in active + inactive}
     d = by_id.get(args.deployment_id)
     if d is None:
         print(f"FAIL: unknown deployment ID: {args.deployment_id}")
         return 1
-    safe = {k: v for k, v in d.items()}
-    print(json.dumps(safe, indent=2, sort_keys=True))
+    print(json.dumps(d, indent=2, sort_keys=True))
     return 0
 
 
@@ -442,7 +537,14 @@ def cmd_registry(args):
 
 
 def cmd_managed_secrets(args):
-    for deployment_id, secret_name in managed_secrets(args.environment):
+    active, inactive, invalid, problems = _run_full_validation(args.environment)
+    if invalid or problems:
+        _print_reasons(invalid)
+        _print_problems(problems)
+        print("FAIL: refusing to list managed secrets while validation problems exist")
+        return 1
+    entries = sorted((d["deploymentId"], d["adminSecretName"]) for d in active if d["adminSecretManaged"])
+    for deployment_id, secret_name in entries:
         print(f"{deployment_id} {secret_name}")
     return 0
 

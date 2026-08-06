@@ -20,6 +20,15 @@ on:
         type: boolean
         default: true
 
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      deploy:
+        required: true
+        type: boolean
+
 permissions:
   id-token: write
   contents: read
@@ -790,7 +799,7 @@ jobs:
           ls -lrt pulled
 
       - name: Connect to EKS cluster
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.deploy }}
+        if: ${{ inputs.deploy }}
         shell: bash
         run: |
           set -euo pipefail
@@ -807,7 +816,7 @@ jobs:
           kubectl version --client=true
 
       - name: Ensure Argo CD Application CRD exists
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.deploy }}
+        if: ${{ inputs.deploy }}
         shell: bash
         run: |
           set -euo pipefail
@@ -822,7 +831,7 @@ jobs:
           echo "Argo CD Application CRD is present."
 
       - name: Confirm the platform Argo CD repository Secret exists
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.deploy }}
+        if: ${{ inputs.deploy }}
         shell: bash
         run: |
           set -euo pipefail
@@ -851,7 +860,7 @@ jobs:
           echo "OK: ${ARGOCD_PLATFORM_SECRET_NAME} exists and points to ${EXPECTED_URL}."
 
       - name: Create or update Argo CD Application
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.deploy }}
+        if: ${{ inputs.deploy }}
         shell: bash
         run: |
           set -euo pipefail
@@ -915,7 +924,7 @@ jobs:
             --overwrite
 
       - name: Wait for Argo CD sync and health
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.deploy }}
+        if: ${{ inputs.deploy }}
         shell: bash
         run: |
           set -euo pipefail
@@ -957,7 +966,7 @@ jobs:
           done
 
       - name: Verify GoldenGate platform runtime state
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.deploy }}
+        if: ${{ inputs.deploy }}
         shell: bash
         run: |
           set -euo pipefail
@@ -1026,7 +1035,7 @@ jobs:
             echo "- Chart ref: \`${HELM_CHART_REF:-unknown}\`"
             echo "- Runtime namespace: \`${RUNTIME_NAMESPACE}\`"
             echo "- Argo CD Application: \`${ARGOCD_APP_NAME}\` (namespace: \`${ARGOCD_NAMESPACE}\`)"
-            echo "- Deploy enabled: \`${{ github.event_name != 'workflow_dispatch' || inputs.deploy }}\`"
+            echo "- Deploy enabled: \`${{ inputs.deploy }}\`"
             echo ""
             echo "### Ownership"
             echo ""
