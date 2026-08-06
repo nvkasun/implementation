@@ -42,6 +42,17 @@ _CREDENTIAL_KEY_FRAGMENTS = (
 )
 
 
+def resolve_admin_secret(environment, role):
+    """The one and only admin-secret derivation rule: role alone selects the shared environment-level secret."""
+    if role not in _VALID_ROLES:
+        raise ValueError(f"invalid role: {role!r}")
+    return f"{environment}/goldengate/{role}/admin"
+
+
+def resolve_tls_secret(environment):
+    return f"{environment}/goldengate/tls-certificate"
+
+
 def _safe_token(value, max_length):
     if not isinstance(value, str) or not value:
         return False
@@ -50,19 +61,9 @@ def _safe_token(value, max_length):
     return bool(_TOKEN_RE.match(value))
 
 
-def _valid_admin_secret_name(name, environment):
-    """Environment-scoped, no ARN, no traversal, no leading slash, no whitespace/control characters."""
-    if not isinstance(name, str) or not name:
-        return False
-    if name.startswith("arn:"):
-        return False
-    if ".." in name or name.startswith("/"):
-        return False
-    if not name.startswith(f"{environment}/"):
-        return False
-    if any(c.isspace() or ord(c) < 0x20 for c in name):
-        return False
-    return True
+def _is_literal_bool(value):
+    """True only for the literal Python bool type; YAML 1.1 "yes"/"no"/"on"/"off" strings must never pass."""
+    return isinstance(value, bool)
 
 
 class DescriptorError(Exception):
@@ -112,7 +113,7 @@ def _require_dict(value, reason):
 
 
 def _contains_credential_like_key(node, path=""):
-    """Fails closed on usernames/passwords/tokens/connection-strings/database-URLs/API keys; a mere secret-name reference field (e.g. adminSecret, objectName) is never flagged since "secret" alone is not a forbidden fragment."""
+    """Fails closed on usernames/passwords/tokens/connection-strings/database-URLs/API keys; a mere secret-name reference field (e.g. objectName) is never flagged since "secret" alone is not a forbidden fragment."""
     if isinstance(node, dict):
         for key, value in node.items():
             key_lower = str(key).lower()
@@ -150,35 +151,34 @@ def _parse_image(runtime):
 
 
 def _parse_service_account(runtime):
+    """Optional in the descriptor: the shared invariant is injected by the deploy workflow. A present value must match exactly -- it is never a per-deployment override."""
     sa = runtime.get("serviceAccount")
+    if sa is None:
+        return
     _require_dict(sa, "invalid ServiceAccount configuration: runtime.serviceAccount must be a mapping")
     name = sa.get("name")
     if name != RUNTIME_SERVICE_ACCOUNT_NAME:
-        raise DescriptorError(f"invalid ServiceAccount: runtime.serviceAccount.name must be {RUNTIME_SERVICE_ACCOUNT_NAME!r}")
+        raise DescriptorError(f"invalid ServiceAccount override: runtime.serviceAccount.name must be {RUNTIME_SERVICE_ACCOUNT_NAME!r} or omitted")
     if sa.get("create") is not False:
-        raise DescriptorError("invalid ServiceAccount: runtime.serviceAccount.create must be literal false (platform-owned)")
-    return {"name": name, "create": False}
+        raise DescriptorError("invalid ServiceAccount override: runtime.serviceAccount.create must be literal false or omitted")
 
 
-def default_admin_secret_name(environment, deployment_id):
-    return f"{environment}/goldengate/runtime/{deployment_id}/admin"
+def _reject_forbidden_overrides(doc):
+    """These identities are shared platform invariants, derived once and injected by the deploy workflow; an operator descriptor must never define them."""
+    deployment = doc.get("deployment") or {}
+    if "adminSecret" in deployment:
+        raise DescriptorError("forbidden override: deployment.adminSecret is derived from deployment.role and must not be set")
 
-
-def _parse_admin_secret(deployment_id, environment, deployment):
-    admin_secret = deployment.get("adminSecret")
-    default_name = default_admin_secret_name(environment, deployment_id)
-    if admin_secret is None:
-        return {"name": default_name, "managed": True}
-    _require_dict(admin_secret, "invalid deployment metadata: deployment.adminSecret must be a mapping")
-    name = admin_secret.get("name")
-    if not _valid_admin_secret_name(name, environment):
-        raise DescriptorError("invalid deployment metadata: deployment.adminSecret.name is not a safe environment-scoped secret name")
-    managed = admin_secret.get("managed")
-    if not isinstance(managed, bool):
-        raise DescriptorError("invalid deployment metadata: deployment.adminSecret.managed must be a literal Boolean")
-    if managed and name != default_name:
-        raise DescriptorError("invalid deployment metadata: managed=true adminSecret.name must be the deterministic deployment-specific name")
-    return {"name": name, "managed": managed}
+    runtime = doc.get("runtime") or {}
+    csi = runtime.get("csi") or {}
+    if "serviceAccountRoleArn" in csi:
+        raise DescriptorError("forbidden override: runtime.csi.serviceAccountRoleArn is a shared platform invariant and must not be set")
+    admin = csi.get("admin") or {}
+    if "objectName" in admin:
+        raise DescriptorError("forbidden override: runtime.csi.admin.objectName is derived from deployment.role and must not be set")
+    certificate = csi.get("certificate") or {}
+    if "objectName" in certificate:
+        raise DescriptorError("forbidden override: runtime.csi.certificate.objectName is a shared platform invariant and must not be set")
 
 
 def _parse_replication(deployment_id, doc):
@@ -187,7 +187,7 @@ def _parse_replication(deployment_id, doc):
         return {"enabled": False}
     _require_dict(replication, "invalid replication configuration: replication must be a mapping")
     enabled = replication.get("enabled", False)
-    if not isinstance(enabled, bool):
+    if not _is_literal_bool(enabled):
         raise DescriptorError("invalid replication configuration: replication.enabled must be a literal Boolean")
     if _contains_credential_like_key(replication):
         raise DescriptorError("embedded credentials found under replication")
@@ -208,19 +208,11 @@ def _parse_lifecycle(doc):
     return state
 
 
-def _parse_csi(environment, runtime, admin_secret_name):
-    """runtime.csi.admin.objectName (when supplied) must match the resolved admin secret; runtime.csi.certificate.objectName is required and must match the approved shared TLS secret."""
+def _parse_csi_structure(runtime):
+    """Validates the CSI block shape only; objectName/serviceAccountRoleArn presence is rejected earlier by _reject_forbidden_overrides."""
     csi = _require_dict(runtime.get("csi"), "invalid CSI configuration: runtime.csi must be a mapping")
-    admin = csi.get("admin") or {}
-    admin_object_name = admin.get("objectName")
-    if admin_object_name is not None and admin_object_name != admin_secret_name:
-        raise DescriptorError("invalid CSI configuration: runtime.csi.admin.objectName does not match the resolved admin-secret name")
-    certificate = _require_dict(csi.get("certificate"), "invalid CSI configuration: runtime.csi.certificate must be a mapping")
-    certificate_object_name = certificate.get("objectName")
-    expected_certificate_name = f"{environment}/goldengate/tls-certificate"
-    if certificate_object_name != expected_certificate_name:
-        raise DescriptorError("invalid CSI configuration: runtime.csi.certificate.objectName must equal the approved shared TLS secret")
-    return {"adminObjectName": admin_object_name or admin_secret_name, "certificateObjectName": certificate_object_name}
+    _require_dict(csi.get("admin"), "invalid CSI configuration: runtime.csi.admin must be a mapping")
+    _require_dict(csi.get("certificate"), "invalid CSI configuration: runtime.csi.certificate must be a mapping")
 
 
 def _parse_efs(doc):
@@ -248,9 +240,11 @@ def parse_descriptor(deployment_id, environment, doc, shared=None):
     if doc.get("deploymentModel") != "singleRuntime":
         raise DescriptorError("missing or invalid deploymentModel: must be exactly \"singleRuntime\"")
 
+    _reject_forbidden_overrides(doc)
+
     deployment = _require_dict(doc.get("deployment"), "invalid deployment metadata: deployment must be a mapping")
     enabled = deployment.get("enabled")
-    if not isinstance(enabled, bool):
+    if not _is_literal_bool(enabled):
         raise DescriptorError("invalid deployment metadata: deployment.enabled must be a literal Boolean")
     pipeline = deployment.get("pipeline")
     if not _safe_token(pipeline, _MAX_PIPELINE_LENGTH):
@@ -265,9 +259,10 @@ def parse_descriptor(deployment_id, environment, doc, shared=None):
         raise DescriptorError("invalid deployment metadata: runtime.deploymentType must be a safe lowercase token")
 
     image = _parse_image(runtime)
-    service_account = _parse_service_account(runtime)
-    admin_secret = _parse_admin_secret(deployment_id, environment, deployment)
-    csi = _parse_csi(environment, runtime, admin_secret["name"])
+    _parse_service_account(runtime)
+    admin_secret_name = resolve_admin_secret(environment, role)
+    tls_secret_name = resolve_tls_secret(environment)
+    _parse_csi_structure(runtime)
     replication = _parse_replication(deployment_id, doc)
     lifecycle_state = _parse_lifecycle(doc)
     efs = _parse_efs(doc)
@@ -284,8 +279,8 @@ def parse_descriptor(deployment_id, environment, doc, shared=None):
         raise DescriptorError("invalid deployment metadata: runtime.containerName must be a non-empty string")
 
     ingress = _require_dict(doc.get("ingress"), "invalid deployment metadata: ingress must be a mapping")
-    ingress_domain = ingress.get("hostDomain")
-    if ingress_domain != shared["dnsDomain"]:
+    ingress_host = ingress.get("hostDomain")
+    if ingress_host != shared["dnsDomain"]:
         raise DescriptorError("inconsistent ingress domain: ingress.hostDomain must match the shared DNS domain")
     alb = ingress.get("alb") or {}
     alb_group_order = alb.get("groupOrder")
@@ -301,15 +296,12 @@ def parse_descriptor(deployment_id, environment, doc, shared=None):
         "imageRepository": image["repository"],
         "imageTag": image["tag"],
         "containerName": container_name,
-        "serviceAccountName": service_account["name"],
-        "adminSecretName": admin_secret["name"],
-        "adminSecretManaged": admin_secret["managed"],
-        "csiAdminObjectName": csi["adminObjectName"],
-        "csiCertificateObjectName": csi["certificateObjectName"],
+        "runtimeServiceAccountName": RUNTIME_SERVICE_ACCOUNT_NAME,
+        "adminSecretName": admin_secret_name,
+        "tlsSecretName": tls_secret_name,
         "runtimeNamespace": shared["runtimeNamespace"],
         "monitoringNamespace": shared["monitoringNamespace"],
-        "ingressDomain": ingress_domain,
-        "tlsSecretName": shared["tlsSecret"],
+        "ingressHost": ingress_host,
         "efsFileSystemId": efs["fileSystemId"],
         "pvcClaimName": efs["pvcClaimName"],
         "albGroupOrder": alb_group_order,
@@ -452,15 +444,8 @@ def _load_shared_environment_metadata(environment, platform_values_path, monitor
         "runtimeNamespace": runtime_namespace,
         "monitoringNamespace": monitoring_namespace,
         "dnsDomain": dns_domain,
-        "tlsSecret": f"{environment}/goldengate/tls-certificate",
+        "tlsSecret": resolve_tls_secret(environment),
     }
-
-
-def managed_secrets(environment):
-    """Deterministic, sorted list of (deploymentId, secretName) for adminSecret.managed=true active deployments."""
-    active, _inactive, _invalid = scan(environment)
-    entries = [(d["deploymentId"], d["adminSecretName"]) for d in active if d["adminSecretManaged"]]
-    return sorted(entries)
 
 
 def _print_reasons(invalid):
@@ -536,16 +521,17 @@ def cmd_registry(args):
     return 0
 
 
-def cmd_managed_secrets(args):
-    active, inactive, invalid, problems = _run_full_validation(args.environment)
+def cmd_shared_secrets(args):
+    """The three fixed environment-level secret identifiers only, never values; independent of which deployments exist."""
+    _active, _inactive, invalid, problems = _run_full_validation(args.environment)
     if invalid or problems:
         _print_reasons(invalid)
         _print_problems(problems)
-        print("FAIL: refusing to list managed secrets while validation problems exist")
+        print("FAIL: refusing to list shared secrets while validation problems exist")
         return 1
-    entries = sorted((d["deploymentId"], d["adminSecretName"]) for d in active if d["adminSecretManaged"])
-    for deployment_id, secret_name in entries:
-        print(f"{deployment_id} {secret_name}")
+    print(resolve_admin_secret(args.environment, "source"))
+    print(resolve_admin_secret(args.environment, "target"))
+    print(resolve_tls_secret(args.environment))
     return 0
 
 
@@ -565,7 +551,7 @@ def main(argv=None):
     registry_parser.add_argument("--output", default=None)
     registry_parser.set_defaults(func=cmd_registry)
 
-    sub.add_parser("managed-secrets").set_defaults(func=cmd_managed_secrets)
+    sub.add_parser("shared-secrets").set_defaults(func=cmd_shared_secrets)
 
     args = parser.parse_args(argv)
     return args.func(args)

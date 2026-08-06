@@ -928,9 +928,9 @@ jobs:
               exit 1
             fi
           done < <(awk '
-            /^\s*-\s*name:/ { if (name != "" && enabled == "true") print name; name=$0; sub(/^\s*-\s*name:\s*/, "", name); gsub(/["\x27\r]/, "", name); enabled="" }
-            /^\s*enabled:\s*true/ { enabled="true" }
-            /^\s*enabled:\s*false/ { enabled="false" }
+            /^[[:space:]]*-[[:space:]]*name:/ { if (name != "" && enabled == "true") print name; name=$0; sub(/^[[:space:]]*-[[:space:]]*name:[[:space:]]*/, "", name); gsub(/["\x27\r]/, "", name); enabled="" }
+            /^[[:space:]]*enabled:[[:space:]]*true/ { enabled="true" }
+            /^[[:space:]]*enabled:[[:space:]]*false/ { enabled="false" }
             END { if (name != "" && enabled == "true") print name }
           ' work/generated/dev/goldengate-deployments.yaml)
           if ! grep -Fq -- "ca-chain-pem" <<< "$SPC_BLOCK"; then
@@ -940,7 +940,7 @@ jobs:
           echo "OK: credential aliases present for every enabled deployment, plus ca-chain-pem."
 
           echo "Validating no plaintext secret value is rendered..."
-          if grep -qiE 'password"?\s*[:=]\s*"[^"$]' "$RENDERED"; then
+          if grep -qiE 'password"?[[:space:]]*[:=][[:space:]]*"[^"$]' "$RENDERED"; then
             echo "FAIL: a literal password-like value was found in the rendered manifest."
             exit 1
           fi
@@ -1053,8 +1053,8 @@ jobs:
             exit 1
           fi
           # Expected names are read from the deployment-model-generated registry (never hardcoded) so this check adapts automatically as deployments are added/renamed.
-          EXPECTED_NAMES="$(grep -E '^\s*-?\s*(name|pipeline):' work/generated/dev/goldengate-deployments.yaml \
-            | sed -E 's/^\s*-?\s*(name|pipeline):\s*//' | tr -d '"'"'"'\r' | sort -u)"
+          EXPECTED_NAMES="$(grep -E '^[[:space:]]*-?[[:space:]]*(name|pipeline):' work/generated/dev/goldengate-deployments.yaml \
+            | sed -E 's/^[[:space:]]*-?[[:space:]]*(name|pipeline):[[:space:]]*//' | tr -d '"'"'"'\r' | sort -u)"
           while IFS= read -r expected; do
             [ -z "$expected" ] && continue
             if ! grep -Fq -- "$expected" <<< "$CONFIGMAP_BLOCK"; then
@@ -1582,8 +1582,8 @@ jobs:
           }
 
           # Expected names come from the deployment-model-generated registry (never hardcoded) so this check adapts automatically as deployments are added/renamed.
-          EXPECTED_NAMES="$(grep -E '^\s*-?\s*(name|pipeline):' work/generated/dev/goldengate-deployments.yaml \
-            | sed -E 's/^\s*-?\s*(name|pipeline):\s*//' | tr -d '"'"'"'\r' | sort -u)"
+          EXPECTED_NAMES="$(grep -E '^[[:space:]]*-?[[:space:]]*(name|pipeline):' work/generated/dev/goldengate-deployments.yaml \
+            | sed -E 's/^[[:space:]]*-?[[:space:]]*(name|pipeline):[[:space:]]*//' | tr -d '"'"'"'\r' | sort -u)"
           while IFS= read -r expected; do
             [ -z "$expected" ] && continue
             if ! grep -Fq -- "$expected" <<< "$API_STATUS_BODY"; then

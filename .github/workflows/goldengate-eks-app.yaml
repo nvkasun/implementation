@@ -146,22 +146,19 @@ jobs:
       environment: dev
       deploy: true
 
-  bootstrap_admin_secrets:
-    name: Bootstrap managed GoldenGate admin secrets
+  validate_shared_secrets_once:
+    name: Validate the three shared GoldenGate secrets exist (read-only, once per environment)
 
     needs:
       - validate_model
+      - terraform_sync_once
       - platform_sync_once
-    if: needs.validate_model.outputs.effective_deploy == 'true'
+    # Runs even when terraform/platform were skipped (deploy=false): only a genuine failure/cancellation upstream blocks this read-only check.
+    if: ${{ always() && needs.validate_model.result == 'success' && needs.terraform_sync_once.result != 'failure' && needs.terraform_sync_once.result != 'cancelled' && needs.platform_sync_once.result != 'failure' && needs.platform_sync_once.result != 'cancelled' }}
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
     environment: dev
-
-    # Single job, no matrix: the bash loop below processes one managed secret at a time; this group also serializes across concurrent workflow runs.
-    concurrency:
-      group: goldengate-admin-secret-bootstrap-dev
-      cancel-in-progress: false
 
     steps:
       - name: Checkout repository
@@ -173,61 +170,43 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           role-to-assume: ${{ env.ROLE_ARN }}
 
-      - name: Verify AWS identity carries Secrets Manager bootstrap permissions
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          # This job never calls "aws eks update-kubeconfig" and never touches kubectl: the identity assumed
-          # above by configure-aws-credentials is the only AWS identity this job ever uses for secretsmanager
-          # calls. Do not add an EKS/kubeconfig step to this job -- update-kubeconfig only configures kubectl's
-          # auth and never changes the AWS CLI/boto session identity used by hack/ensure-goldengate-admin-secret.py.
-          aws sts get-caller-identity
-
-      - name: Resolve managed secrets from the folder-driven inventory
-        id: resolve
+      - name: Verify each shared secret exists with an AWSCURRENT version
         shell: bash
         run: |
           set -euo pipefail
 
           python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
 
-          mkdir -p work/generated/dev
-          python3 hack/goldengate-deployment-model.py --environment dev managed-secrets > work/generated/dev/managed-secrets.txt
-          echo "Managed secrets to bootstrap:"
-          cat work/generated/dev/managed-secrets.txt
-
-      - name: Bootstrap each managed admin secret
-        shell: bash
-        env:
-          AWS_REGION: ${{ env.AWS_REGION }}
-        run: |
-          set -euo pipefail
-
+          # DescribeSecret/ListSecretVersionIds only -- never GetSecretValue. No secret is created, mutated, or rotated here.
           FAILED=0
-          while IFS=' ' read -r deployment_id secret_name; do
-            [ -z "$deployment_id" ] && continue
-            echo "Bootstrapping ${deployment_id} -> ${secret_name}"
-            if ! python3 hack/ensure-goldengate-admin-secret.py \
-                --deployment-id "$deployment_id" --environment dev \
-                --secret-name "$secret_name" --managed true --region "$AWS_REGION"; then
-              echo "FAIL: admin secret bootstrap failed for ${deployment_id}."
+          while IFS= read -r secret_name; do
+            [ -z "$secret_name" ] && continue
+            echo "Checking ${secret_name}..."
+            if ! aws secretsmanager describe-secret --secret-id "$secret_name" --region "$AWS_REGION" >/dev/null; then
+              echo "FAIL: ${secret_name} does not exist or is not accessible."
               FAILED=1
+              continue
             fi
-          done < work/generated/dev/managed-secrets.txt
+            STAGES_JSON="$(aws secretsmanager list-secret-version-ids --secret-id "$secret_name" --region "$AWS_REGION" --include-deprecated --output json)"
+            if ! python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if any("AWSCURRENT" in v.get("VersionStages", []) for v in d.get("Versions", [])) else 1)' <<< "$STAGES_JSON"; then
+              echo "FAIL: ${secret_name} has no AWSCURRENT version."
+              FAILED=1
+              continue
+            fi
+            echo "OK: ${secret_name} exists with an AWSCURRENT version."
+          done < <(python3 hack/goldengate-deployment-model.py --environment dev shared-secrets)
 
           if [ "$FAILED" -ne 0 ]; then
             exit 1
           fi
 
-          echo "OK: every managed admin secret is initialized or already current."
+          echo "OK: all three shared GoldenGate secrets exist with an AWSCURRENT version."
 
   detect_changed_deployments:
     name: Detect changed GoldenGate deployments
 
     needs:
       - validate_model
-      - bootstrap_admin_secrets
     if: success()
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -283,15 +262,17 @@ jobs:
 
     needs:
       - detect_changed_deployments
-    if: success() && needs.detect_changed_deployments.outputs.has_changes == 'true'
+      - validate_shared_secrets_once
+    # The read-only validation steps in this job must still run when deploy=false skipped validate_shared_secrets_once's upstream chain; only a genuine failure/cancellation blocks it.
+    if: ${{ always() && needs.detect_changed_deployments.result == 'success' && needs.detect_changed_deployments.outputs.has_changes == 'true' && needs.validate_shared_secrets_once.result != 'failure' && needs.validate_shared_secrets_once.result != 'cancelled' }}
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
     environment: ${{ matrix.environment }}
 
     strategy:
-      fail-fast: false
-      # Sequential rollout: an existing-runtime migration failure must block the next; applies to every matrix entry.
+      # Sequential rollout: an existing-runtime migration failure must block the next queued migration; max-parallel alone is not sufficient.
+      fail-fast: true
       max-parallel: 1
       matrix:
         include: ${{ fromJson(needs.detect_changed_deployments.outputs.deployment_matrix) }}
@@ -472,26 +453,37 @@ jobs:
           echo "helm_chart_ref=${HELM_CHART_REF}" >> "$GITHUB_OUTPUT"
           echo "argocd_app_name=${ARGOCD_APP_NAME}" >> "$GITHUB_OUTPUT"
 
-      - name: Resolve the admin secret name via the deployment model
+      - name: Resolve deployment identity via the deployment model
         shell: bash
         run: |
           set -euo pipefail
 
           python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
 
-          # The deployment values file never has to duplicate this under runtime.csi.admin.objectName -- it is
-          # resolved once here and injected as an exact Helm/Argo CD value override below, the single source of
-          # truth also used by the monitor registry and Terraform/IAM, so it can never drift between consumers.
-          RESOLVED_ADMIN_SECRET_NAME="$(python3 hack/goldengate-deployment-model.py --environment "$ENVIRONMENT" describe --deployment-id "$DEPLOYMENT_ID" \
-            | python3 -c 'import json, sys; print(json.load(sys.stdin)["adminSecretName"])')"
+          # Single describe call, positional deployment_id (the CLI takes no --deployment-id flag). Every
+          # identity below is resolved once here and injected as an exact Helm/Argo CD value override, the
+          # single source of truth also used by the monitor registry and Terraform/IAM -- never re-derived.
+          DESCRIBE_JSON="$(python3 hack/goldengate-deployment-model.py --environment "$ENVIRONMENT" describe "$DEPLOYMENT_ID")"
 
-          if [ -z "$RESOLVED_ADMIN_SECRET_NAME" ]; then
-            echo "FAIL: could not resolve the admin secret name for ${DEPLOYMENT_ID}."
+          RESOLVED_ADMIN_SECRET_NAME="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["adminSecretName"])' <<< "$DESCRIBE_JSON")"
+          RESOLVED_TLS_SECRET_NAME="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["tlsSecretName"])' <<< "$DESCRIBE_JSON")"
+          RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["runtimeServiceAccountName"])' <<< "$DESCRIBE_JSON")"
+          IMAGE_REPOSITORY="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["imageRepository"])' <<< "$DESCRIBE_JSON")"
+          IMAGE_TAG="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["imageTag"])' <<< "$DESCRIBE_JSON")"
+
+          if [ -z "$RESOLVED_ADMIN_SECRET_NAME" ] || [ -z "$RESOLVED_TLS_SECRET_NAME" ] || [ -z "$RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME" ]; then
+            echo "FAIL: could not resolve deployment identity for ${DEPLOYMENT_ID}."
             exit 1
           fi
 
-          echo "Resolved admin secret name: ${RESOLVED_ADMIN_SECRET_NAME}"
+          echo "Resolved admin secret: ${RESOLVED_ADMIN_SECRET_NAME}"
+          echo "Resolved TLS secret: ${RESOLVED_TLS_SECRET_NAME}"
+          echo "Resolved ServiceAccount: ${RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME}"
           echo "RESOLVED_ADMIN_SECRET_NAME=${RESOLVED_ADMIN_SECRET_NAME}" >> "$GITHUB_ENV"
+          echo "RESOLVED_TLS_SECRET_NAME=${RESOLVED_TLS_SECRET_NAME}" >> "$GITHUB_ENV"
+          echo "RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME=${RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME}" >> "$GITHUB_ENV"
+          echo "IMAGE_REPOSITORY=${IMAGE_REPOSITORY}" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> "$GITHUB_ENV"
 
       - name: Verify the selected image exists in the approved private ECR
         shell: bash
@@ -499,11 +491,7 @@ jobs:
           set -euo pipefail
 
           # Read-only describe-images call; no engine-to-image mapping and no public-image fallback -- the
-          # repository/tag come only from this deployment's own descriptor, resolved via the deployment model.
-          DESCRIBE_JSON="$(python3 hack/goldengate-deployment-model.py --environment "$ENVIRONMENT" describe --deployment-id "$DEPLOYMENT_ID")"
-          IMAGE_REPOSITORY="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["imageRepository"])' <<< "$DESCRIBE_JSON")"
-          IMAGE_TAG="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["imageTag"])' <<< "$DESCRIBE_JSON")"
-
+          # repository/tag come only from this deployment's own descriptor, already resolved above.
           EXPECTED_PREFIX="${ECR_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/"
           if [[ "$IMAGE_REPOSITORY" != "${EXPECTED_PREFIX}"* ]]; then
             echo "FAIL: image repository is not the approved private ECR account/region: ${IMAGE_REPOSITORY}"
@@ -526,8 +514,6 @@ jobs:
           fi
 
           echo "Verified image exists: ${IMAGE_REPOSITORY}:${IMAGE_TAG} (digest ${IMAGE_DIGEST})"
-          echo "IMAGE_REPOSITORY=${IMAGE_REPOSITORY}" >> "$GITHUB_ENV"
-          echo "IMAGE_TAG=${IMAGE_TAG}" >> "$GITHUB_ENV"
           echo "IMAGE_DIGEST=${IMAGE_DIGEST}" >> "$GITHUB_ENV"
 
       - name: Validate required files
@@ -659,7 +645,10 @@ jobs:
           helm lint "$HELM_CHART_PATH" \
             --values "$VALUES_FILE" \
             --set global.environment="$ENVIRONMENT" \
-            --set runtime.csi.admin.objectName="$RESOLVED_ADMIN_SECRET_NAME"
+            --set runtime.csi.admin.objectName="$RESOLVED_ADMIN_SECRET_NAME" \
+            --set runtime.csi.certificate.objectName="$RESOLVED_TLS_SECRET_NAME" \
+            --set runtime.serviceAccount.create=false \
+            --set runtime.serviceAccount.name="$RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME"
 
       - name: Render manifest for validation
         shell: bash
@@ -673,6 +662,9 @@ jobs:
             --values "$VALUES_FILE" \
             --set global.environment="$ENVIRONMENT" \
             --set runtime.csi.admin.objectName="$RESOLVED_ADMIN_SECRET_NAME" \
+            --set runtime.csi.certificate.objectName="$RESOLVED_TLS_SECRET_NAME" \
+            --set runtime.serviceAccount.create=false \
+            --set runtime.serviceAccount.name="$RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME" \
             > "rendered/${RELEASE_NAME}.yaml"
 
           echo "Rendered manifest: rendered/${RELEASE_NAME}.yaml"
@@ -691,6 +683,42 @@ jobs:
           fi
 
           echo "OK: rendered StatefulSet references the verified image ${EXPECTED_IMAGE} (digest ${IMAGE_DIGEST})."
+
+      - name: Verify the rendered StatefulSet uses the shared runtime ServiceAccount
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RENDERED="rendered/${RELEASE_NAME}.yaml"
+
+          if ! grep -qF "serviceAccountName: ${RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME}" "$RENDERED"; then
+            echo "FAIL: rendered StatefulSet does not use serviceAccountName: ${RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME}."
+            exit 1
+          fi
+
+          echo "OK: rendered StatefulSet uses serviceAccountName: ${RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME}."
+
+      - name: Verify the rendered CSI SecretProviderClass selects only this deployment's own admin secret
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RENDERED="rendered/${RELEASE_NAME}.yaml"
+          OTHER_ROLE_ADMIN_SECRET="${ENVIRONMENT}/goldengate/target/admin"
+          if [ "$RESOLVED_ADMIN_SECRET_NAME" = "${ENVIRONMENT}/goldengate/target/admin" ]; then
+            OTHER_ROLE_ADMIN_SECRET="${ENVIRONMENT}/goldengate/source/admin"
+          fi
+
+          if ! grep -qF "objectName: \"${RESOLVED_ADMIN_SECRET_NAME}\"" "$RENDERED"; then
+            echo "FAIL: rendered SecretProviderClass does not select this deployment's own admin secret (${RESOLVED_ADMIN_SECRET_NAME})."
+            exit 1
+          fi
+          if grep -qF "objectName: \"${OTHER_ROLE_ADMIN_SECRET}\"" "$RENDERED"; then
+            echo "FAIL: rendered SecretProviderClass mounts the opposite-role admin secret (${OTHER_ROLE_ADMIN_SECRET})."
+            exit 1
+          fi
+
+          echo "OK: rendered SecretProviderClass mounts only ${RESOLVED_ADMIN_SECRET_NAME}."
 
       - name: Validate GoldenGate namespace is rendered
         shell: bash
@@ -1450,6 +1478,12 @@ jobs:
                     value: ${ENVIRONMENT}
                   - name: runtime.csi.admin.objectName
                     value: ${RESOLVED_ADMIN_SECRET_NAME}
+                  - name: runtime.csi.certificate.objectName
+                    value: ${RESOLVED_TLS_SECRET_NAME}
+                  - name: runtime.serviceAccount.create
+                    value: "false"
+                  - name: runtime.serviceAccount.name
+                    value: ${RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME}
             destination:
               server: https://kubernetes.default.svc
               namespace: ${TARGET_NAMESPACE}
@@ -1893,15 +1927,18 @@ jobs:
 
     needs:
       - validate_model
-      - bootstrap_admin_secrets
+      - validate_shared_secrets_once
       - build_publish_and_deploy
       - delete_removed_argocd_applications
-    if: ${{ always() && needs.bootstrap_admin_secrets.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' }}
+    if: ${{ always() && needs.validate_shared_secrets_once.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' }}
 
     uses: ./.github/workflows/goldengate-monitor.yaml
     with:
       environment: dev
       deploy: ${{ needs.validate_model.outputs.effective_deploy == 'true' }}
+      # The global CloudWatch publisher must never be disabled by this orchestrator; existing gates stay whatever CONFIG already has (metrics_gate_expectation=any).
+      enable_cloudwatch_publication: true
+      metrics_gate_expectation: any
 
   final_validation:
     name: Final validation

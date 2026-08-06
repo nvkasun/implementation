@@ -1916,6 +1916,97 @@ class SecretProviderClassRenderTests(unittest.TestCase):
                 self.assertEqual(self.rendered.count(f"kind: {kind}\n"), 1)
 
 
+SYNTHETIC_SHARED_SECRET_REGISTRY = """\
+environment: dev
+runtimeNamespace: goldengate-dev
+monitoringNamespace: goldengate-monitoring
+dnsDomain: goldengate-dev.adcbmis.local
+tlsSecret: dev/goldengate/tls-certificate
+deployments:
+- name: gg-source-a
+  type: oracle
+  pipeline: pipeline-a
+  role: source
+  enabled: true
+  adminSecret: dev/goldengate/source/admin
+- name: gg-source-b
+  type: postgresql
+  pipeline: pipeline-b
+  role: source
+  enabled: true
+  adminSecret: dev/goldengate/source/admin
+- name: gg-target-a
+  type: sqlserver
+  pipeline: pipeline-a
+  role: target
+  enabled: true
+  adminSecret: dev/goldengate/target/admin
+- name: gg-target-b
+  type: postgresql
+  pipeline: pipeline-b
+  role: target
+  enabled: true
+  adminSecret: dev/goldengate/target/admin
+"""
+
+
+class SharedSecretMonitorAliasRenderTests(unittest.TestCase):
+    """Tasks 9/21 (17, 18): multiple deployments sharing one Secrets Manager object still get distinct monitor credential aliases."""
+
+    @classmethod
+    def setUpClass(cls):
+        if shutil.which("helm") is None:
+            raise unittest.SkipTest("helm not available")
+        cls.tmpdir = tempfile.mkdtemp()
+        staged_chart = os.path.join(cls.tmpdir, "goldengate-monitor")
+        shutil.copytree(MONITOR_CHART_PATH, staged_chart)
+        os.makedirs(os.path.join(staged_chart, "files"), exist_ok=True)
+        with open(os.path.join(staged_chart, "files", "goldengate-deployments.yaml"), "w") as f:
+            f.write(SYNTHETIC_SHARED_SECRET_REGISTRY)
+
+        proc = subprocess.run(
+            ["helm", "template", "gg-monitor", staged_chart,
+             "--namespace", "goldengate-monitoring",
+             "-f", os.path.join(REPO_ROOT, "envs", "dev", "goldengate-monitor", "values.yaml"),
+             "--set", "image.repository=example.invalid/goldengate-monitor",
+             "--set", "image.tag=test",
+             "--set", "serviceAccount.roleArn=arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev"],
+            capture_output=True, text=True, cwd=REPO_ROOT,
+        )
+        if proc.returncode != 0:
+            raise AssertionError(f"helm template failed: {proc.stdout}\n{proc.stderr}")
+        cls.rendered = proc.stdout
+
+    def test_two_sources_sharing_one_secret_get_distinct_aliases(self):
+        self.assertIn("gg-source-a-admin-user", self.rendered)
+        self.assertIn("gg-source-a-admin-password", self.rendered)
+        self.assertIn("gg-source-b-admin-user", self.rendered)
+        self.assertIn("gg-source-b-admin-password", self.rendered)
+
+    def test_two_targets_sharing_one_secret_get_distinct_aliases(self):
+        self.assertIn("gg-target-a-admin-user", self.rendered)
+        self.assertIn("gg-target-a-admin-password", self.rendered)
+        self.assertIn("gg-target-b-admin-user", self.rendered)
+        self.assertIn("gg-target-b-admin-password", self.rendered)
+
+    def test_only_the_two_approved_shared_secret_names_appear(self):
+        self.assertIn('objectName: "dev/goldengate/source/admin"', self.rendered)
+        self.assertIn('objectName: "dev/goldengate/target/admin"', self.rendered)
+        self.assertNotIn("gg-source-a/admin", self.rendered)
+        self.assertNotIn("gg-source-b/admin", self.rendered)
+        self.assertNotIn("gg-target-a/admin", self.rendered)
+        self.assertNotIn("gg-target-b/admin", self.rendered)
+
+    def test_four_deployments_yield_eight_credential_aliases(self):
+        for name in ("gg-source-a", "gg-source-b", "gg-target-a", "gg-target-b"):
+            self.assertEqual(self.rendered.count(f"{name}-admin-user"), 1)
+            self.assertEqual(self.rendered.count(f"{name}-admin-password"), 1)
+
+    def test_no_credential_value_is_rendered(self):
+        for forbidden in ("hunter2", "-----BEGIN", "OGG_ADMIN_PWD\"\n            value:"):
+            self.assertNotIn(forbidden, self.rendered)
+
+
 class CloudWatchActivationHelmRenderTests(unittest.TestCase):
     """--set cloudwatch.publishEnabled=<bool> must render the exact literal string the strict env parser accepts, proven against the real chart, not a reimplementation of Helm's type inference."""
 

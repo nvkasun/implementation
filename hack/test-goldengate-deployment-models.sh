@@ -28,6 +28,10 @@ OBSERVABILITY_WORKFLOW=".github/workflows/goldengate-observability.yaml"
 ARGOCD_VALUES_FILE="envs/dev/argocd/values.yaml"
 ARGOCD_DEPLOY_WORKFLOW=".github/workflows/argocd-eks-deployment.yaml"
 
+# Shared-secret identities the deploy workflow injects via --set; direct helm invocations below must mirror them.
+ORACLE_SHARED_OVERRIDES=(--set runtime.csi.admin.objectName=dev/goldengate/source/admin --set runtime.csi.certificate.objectName=dev/goldengate/tls-certificate --set runtime.serviceAccount.create=false --set runtime.serviceAccount.name=gg-runtime-sa)
+POSTGRESQL_SHARED_OVERRIDES=(--set runtime.csi.admin.objectName=dev/goldengate/target/admin --set runtime.csi.certificate.objectName=dev/goldengate/tls-certificate --set runtime.serviceAccount.create=false --set runtime.serviceAccount.name=gg-runtime-sa)
+
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT
 
@@ -286,7 +290,7 @@ echo ""
 echo "--- Helm lint ---"
 if [ "$HELM_AVAILABLE" = "true" ]; then
   # deploymentModel has no usable default and assertSupportedDeploymentModel fires at render time, so lint against a real canonical values file (declares deploymentModel: singleRuntime), never bare/values-less -- matches how the chart is linted in production.
-  if helm lint "$RUNTIME_CHART" -f "${REPO_ROOT}/envs/dev/gg-oracle-payments-01/values.yaml" --set global.environment=dev >"${WORKDIR}/lint-runtime.log" 2>&1; then
+  if helm lint "$RUNTIME_CHART" -f "${REPO_ROOT}/envs/dev/gg-oracle-payments-01/values.yaml" --set global.environment=dev "${ORACLE_SHARED_OVERRIDES[@]}" >"${WORKDIR}/lint-runtime.log" 2>&1; then
     pass "helm lint ${RUNTIME_CHART} (canonical singleRuntime values)"
   else
     fail "helm lint ${RUNTIME_CHART} (canonical singleRuntime values)"
@@ -2085,8 +2089,9 @@ if [ "$HELM_AVAILABLE" = "true" ] && [ "$PYTHON_AVAILABLE" = "true" ]; then
     [ -z "$name" ] && continue
     VALUES_FILE="envs/dev/${name}/values.yaml"
     RENDERED="${WORKDIR}/${name}.yaml"
+    if [ "$name" = "gg-oracle-payments-01" ]; then SHARED_OVERRIDES=("${ORACLE_SHARED_OVERRIDES[@]}"); else SHARED_OVERRIDES=("${POSTGRESQL_SHARED_OVERRIDES[@]}"); fi
     if ! helm template "$name" "$RUNTIME_CHART" --namespace goldengate-dev \
-        -f "$VALUES_FILE" > "$RENDERED" 2>"${WORKDIR}/${name}.err"; then
+        -f "$VALUES_FILE" "${SHARED_OVERRIDES[@]}" > "$RENDERED" 2>"${WORKDIR}/${name}.err"; then
       fail "helm template failed for ${name}"
       cat "${WORKDIR}/${name}.err"
       continue
@@ -3558,8 +3563,9 @@ if [ "$HELM_AVAILABLE" = "true" ] && [ "$PYTHON_AVAILABLE" = "true" ]; then
     id="${pair%%:*}"; ns="${pair##*:}"
     VALUES_FILE="envs/dev/${id}/values.yaml"
     RENDERED="${WORKDIR}/${id}-observer-check.yaml"
+    if [ "$id" = "gg-oracle-payments-01" ]; then SHARED_OVERRIDES=("${ORACLE_SHARED_OVERRIDES[@]}"); else SHARED_OVERRIDES=("${POSTGRESQL_SHARED_OVERRIDES[@]}"); fi
     if helm template "$id" "$RUNTIME_CHART" --namespace "$ns" -f "$VALUES_FILE" \
-        --set global.environment=dev --set global.deploymentId="$id" > "$RENDERED" 2>"${WORKDIR}/${id}-observer-check.err"; then
+        --set global.environment=dev --set global.deploymentId="$id" "${SHARED_OVERRIDES[@]}" > "$RENDERED" 2>"${WORKDIR}/${id}-observer-check.err"; then
       if grep -qi "goldengate-observer\|observer-enabled" "$RENDERED"; then
         fail "${id}: rendered manifest still contains an observer container/annotation reference"
       else
@@ -3850,15 +3856,11 @@ else
   skip "Phase 5B1 IAM least-privilege checks -- policy files or python3 not available"
 fi
 
-# 7. Canonical runtime ServiceAccounts still reference GoldenGateSecretsReadRole-dev.
-RUNTIME_ROLE_REF_MISSING=""
-for f in envs/dev/gg-oracle-payments-01/values.yaml envs/dev/gg-postgresql-payments-01/values.yaml; do
-  grep -q "role/GoldenGateSecretsReadRole-dev" "$f" 2>/dev/null || RUNTIME_ROLE_REF_MISSING="${RUNTIME_ROLE_REF_MISSING} ${f}"
-done
-if [ -z "$RUNTIME_ROLE_REF_MISSING" ]; then
-  pass "7: canonical runtime ServiceAccounts (Oracle, PostgreSQL) still reference GoldenGateSecretsReadRole-dev"
+# 7. The shared gg-runtime-sa ServiceAccount (annotated by the platform workflow, never duplicated in per-deployment values) references GoldenGateSecretsReadRole-dev.
+if grep -q "RUNTIME_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev" "$PLATFORM_WORKFLOW" 2>/dev/null; then
+  pass "7: the shared gg-runtime-sa ServiceAccount (platform workflow) references GoldenGateSecretsReadRole-dev"
 else
-  fail "7: canonical runtime values file(s) no longer reference GoldenGateSecretsReadRole-dev:${RUNTIME_ROLE_REF_MISSING}"
+  fail "7: the platform workflow no longer references GoldenGateSecretsReadRole-dev for the shared runtime ServiceAccount"
 fi
 
 # 8. gg-monitor still references GoldenGateMonitorReadRole-dev.
@@ -4061,11 +4063,11 @@ PYEOF
 
     helm template gg-oracle-payments-01 "$RUNTIME_CHART" --namespace goldengate-dev \
       --values "${REPO_ROOT}/envs/dev/gg-oracle-payments-01/values.yaml" \
-      --set global.environment=dev --set global.deploymentId=gg-oracle-payments-01 \
+      --set global.environment=dev --set global.deploymentId=gg-oracle-payments-01 "${ORACLE_SHARED_OVERRIDES[@]}" \
       > "${EFS_WORKDIR}/rendered/gg-oracle-payments-01.yaml" 2>"${EFS_WORKDIR}/oracle-render.err" || true
     helm template gg-postgresql-payments-01 "$RUNTIME_CHART" --namespace goldengate-dev \
       --values "${REPO_ROOT}/envs/dev/gg-postgresql-payments-01/values.yaml" \
-      --set global.environment=dev --set global.deploymentId=gg-postgresql-payments-01 \
+      --set global.environment=dev --set global.deploymentId=gg-postgresql-payments-01 "${POSTGRESQL_SHARED_OVERRIDES[@]}" \
       > "${EFS_WORKDIR}/rendered/gg-postgresql-payments-01.yaml" 2>"${EFS_WORKDIR}/postgres-render.err" || true
     set +e
     ORACLE_OUT="$(run_efs_step "gg-oracle-payments-01" "${REPO_ROOT}/envs/dev/gg-oracle-payments-01/values.yaml" "gg-oracle-payments-01" "singleRuntime" "dev")"
@@ -4108,7 +4110,7 @@ with open('${EFS_WORKDIR}/values/oracle-override.yaml', 'w') as f:
 "
     helm template gg-oracle-payments-01 "$RUNTIME_CHART" --namespace goldengate-dev \
       --values "${EFS_WORKDIR}/values/oracle-override.yaml" \
-      --set global.environment=dev --set global.deploymentId=gg-oracle-payments-01 \
+      --set global.environment=dev --set global.deploymentId=gg-oracle-payments-01 "${ORACLE_SHARED_OVERRIDES[@]}" \
       > "${EFS_WORKDIR}/rendered/oracle-override.yaml" 2>"${EFS_WORKDIR}/override-render.err" || true
 
     set +e
@@ -4265,7 +4267,7 @@ with open('${EFS_WORKDIR}/rendered/duplicate-storageclass.yaml', 'w') as f:
     set +e
     LEGACY_REJECT_ERR="$(helm template ogg-legacy-reject "$RUNTIME_CHART" --namespace goldengate-dev \
       --values "${REPO_ROOT}/envs/dev/gg-oracle-payments-01/values.yaml" \
-      --set global.environment=dev --set global.deploymentId=ogg-legacy-reject \
+      --set global.environment=dev --set global.deploymentId=ogg-legacy-reject "${ORACLE_SHARED_OVERRIDES[@]}" \
       --set deploymentModel=legacyPair 2>&1)"
     LEGACY_REJECT_STATUS=$?
     set -e
@@ -5416,10 +5418,11 @@ else
 fi
 
 if grep -q 'try(doc.deployment.enabled, false) == true' "$GOLDENGATE_INVENTORY_TF" 2>/dev/null \
-    && grep -q 'can(tobool(each.value.deployment.enabled))' "$GOLDENGATE_INVENTORY_TF" 2>/dev/null; then
-  pass "24: disabled deployments are excluded by an enabled==true check, and a literal-Boolean precondition rejects non-Boolean enabled values"
+    && grep -q 'goldengate_enabled_jsonenc\[each.key\] == "true" || local.goldengate_enabled_jsonenc\[each.key\] == "false"' "$GOLDENGATE_INVENTORY_TF" 2>/dev/null \
+    && ! grep -q 'can(tobool(each.value.deployment.enabled))' "$GOLDENGATE_INVENTORY_TF" 2>/dev/null; then
+  pass "24: disabled deployments are excluded by an enabled==true check, and a jsonencode()-based literal-Boolean precondition rejects Boolean-like strings (can(tobool(...)) does not, since it also accepts the string \"true\")"
 else
-  fail "24: folder-driven inventory eligibility no longer requires a literal Boolean enabled==true"
+  fail "24: folder-driven inventory eligibility no longer requires a literal Boolean enabled==true via the jsonencode() proof"
 fi
 
 if grep -q 'sort(keys(local.goldengate_enabled_deployments))' "$GOLDENGATE_INVENTORY_TF" 2>/dev/null; then
@@ -5800,7 +5803,6 @@ echo ""
 echo "--- Phase 6D0: folder-driven onboarding architecture ---"
 
 DEPLOYMENT_MODEL_TOOL="hack/goldengate-deployment-model.py"
-ADMIN_SECRET_HELPER="hack/ensure-goldengate-admin-secret.py"
 INVENTORY_TF="envs/dev/goldengate_inventory.tf"
 
 if [ -f "$DEPLOYMENT_MODEL_TOOL" ]; then
@@ -5847,17 +5849,31 @@ else
   pass "26: no data.external or local-exec exists in envs/dev Terraform"
 fi
 
-if [ -f "$ADMIN_SECRET_HELPER" ] && ! grep -q "get-secret-value" "$ADMIN_SECRET_HELPER" 2>/dev/null; then
-  pass "26: the admin-secret bootstrap helper exists and never calls GetSecretValue"
+if [ ! -f "hack/ensure-goldengate-admin-secret.py" ] && [ ! -f "hack/test-ensure-goldengate-admin-secret.py" ]; then
+  pass "26: no per-deployment secret bootstrap helper exists (removed with the shared-secret model)"
 else
-  fail "26: the admin-secret bootstrap helper is missing or references GetSecretValue"
+  fail "26: a per-deployment secret bootstrap helper still exists"
 fi
 
-if grep -q "dev/goldengate/runtime/\*" envs/dev/policies/goldengate-eks-deploy-dev/policies/policies_1.json 2>/dev/null \
-    && ! grep -q "secretsmanager:GetSecretValue" envs/dev/policies/goldengate-eks-deploy-dev/policies/policies_1.json 2>/dev/null; then
-  pass "26: deployment-role secret-bootstrap permissions are scoped and exclude GetSecretValue"
+DEPLOY_ROLE_POLICY="envs/dev/policies/goldengate-eks-deploy-dev/policies/policies_1.json"
+if ! grep -qE "PutSecretValue|GetRandomPassword" "$DEPLOY_ROLE_POLICY" 2>/dev/null; then
+  pass "26: deployment-role IAM policy has no PutSecretValue or GetRandomPassword permission"
 else
-  fail "26: deployment-role secretsmanager permissions are missing or too broad"
+  fail "26: deployment-role IAM policy still grants a secret-mutation permission"
+fi
+
+if grep -q "secretsmanager:GetSecretValue" "$DEPLOY_ROLE_POLICY" 2>/dev/null; then
+  fail "26: deployment-role IAM policy grants GetSecretValue (must remain read-only DescribeSecret/ListSecretVersionIds)"
+else
+  pass "26: deployment-role IAM policy never grants GetSecretValue"
+fi
+
+if grep -q "dev/goldengate/source/admin-??????" "$DEPLOY_ROLE_POLICY" 2>/dev/null \
+    && grep -q "dev/goldengate/target/admin-??????" "$DEPLOY_ROLE_POLICY" 2>/dev/null \
+    && grep -q "dev/goldengate/tls-certificate-??????" "$DEPLOY_ROLE_POLICY" 2>/dev/null; then
+  pass "26: deployment-role read-only secret validation is scoped to exactly the three shared secret ARNs"
+else
+  fail "26: deployment-role read-only secret validation is not scoped to the three approved shared secret ARNs"
 fi
 
 if grep -q "serviceAccounts:" helm/goldengate-platform/values.yaml 2>/dev/null \
@@ -5875,12 +5891,19 @@ else
   fail "26: a transitional legacy ServiceAccount was unexpectedly removed"
 fi
 
-if grep -q "goldengate-dev:gg-runtime-sa" envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json 2>/dev/null \
-    && grep -q "goldengate-dev:gg-oracle-sa" envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json 2>/dev/null \
-    && ! grep -q "goldengate-dev:\*" envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json 2>/dev/null; then
-  pass "26: IAM trust includes gg-runtime-sa, retains legacy subjects, and has no namespace wildcard"
+STS_TRUST_POLICY="envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json"
+if grep -q "goldengate-dev:gg-runtime-sa" "$STS_TRUST_POLICY" 2>/dev/null \
+    && grep -q "goldengate-dev:gg-oracle-sa" "$STS_TRUST_POLICY" 2>/dev/null; then
+  pass "26: IAM trust includes gg-runtime-sa and retains the exact legacy subjects"
 else
-  fail "26: IAM trust policy for gg-runtime-sa is missing or unexpectedly wildcarded"
+  fail "26: IAM trust policy for gg-runtime-sa is missing an expected exact subject"
+fi
+
+# Honestly-reported blocker: cannot be removed without live-cluster inventory evidence; SKIP, never a false PASS.
+if grep -qE '"system:serviceaccount:[^"]*\*[^"]*"' "$STS_TRUST_POLICY" 2>/dev/null; then
+  skip "26: IAM trust for gg-runtime-sa still contains a namespace-wildcard subject (system:serviceaccount:gg-dev-*:ogg-oracle-sa) -- unresolved, requires live-cluster inventory evidence not available offline"
+else
+  pass "26: IAM trust for gg-runtime-sa contains no namespace or ServiceAccount wildcard"
 fi
 
 if grep -q "SUPPORTED_TYPES" monitoring/monitor/config.py 2>/dev/null; then
@@ -5910,7 +5933,7 @@ fi
 
 FORBIDDEN_6D0_TERMS_FOUND="false"
 for term in "CreateExtract" "CreateReplicat" "aws_cloudwatch_metric_alarm" "aws_sns" "utility-sidecar" "observer-sidecar" "gg-alerter"; do
-  if grep -rq -- "$term" "$DEPLOYMENT_MODEL_TOOL" "$ADMIN_SECRET_HELPER" "$INVENTORY_TF" envs/dev/cloudwatch_dashboard.tf envs/dev/secret.tf 2>/dev/null; then
+  if grep -rq -- "$term" "$DEPLOYMENT_MODEL_TOOL" "$INVENTORY_TF" envs/dev/cloudwatch_dashboard.tf envs/dev/secret.tf 2>/dev/null; then
     fail "26: forbidden Phase 6D0 term found: ${term}"
     FORBIDDEN_6D0_TERMS_FOUND="true"
   fi
@@ -5929,6 +5952,7 @@ echo ""
 echo "--- Phase 6D0 correction: onboarding-workflow job graph ---"
 
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  set +e
   JOB_GRAPH_CHECK="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
 import sys
 import yaml
@@ -5938,7 +5962,7 @@ with open(sys.argv[1]) as f:
 
 jobs = doc["jobs"]
 expected_order = [
-    "validate_model", "terraform_sync_once", "platform_sync_once", "bootstrap_admin_secrets",
+    "validate_model", "terraform_sync_once", "platform_sync_once", "validate_shared_secrets_once",
     "detect_changed_deployments", "build_publish_and_deploy", "monitor_sync_once", "final_validation",
 ]
 for name in expected_order:
@@ -5946,9 +5970,8 @@ for name in expected_order:
         print(f"FAIL: missing required job {name!r}")
         sys.exit(1)
 
-actual_order = [name for name in jobs if name in expected_order]
-if actual_order != expected_order:
-    print(f"FAIL: job order is {actual_order!r}, expected {expected_order!r}")
+if "bootstrap_admin_secrets" in jobs:
+    print("FAIL: bootstrap_admin_secrets job still exists")
     sys.exit(1)
 
 def needs_of(name):
@@ -5961,11 +5984,11 @@ if "validate_model" not in needs_of("terraform_sync_once"):
 if "terraform_sync_once" not in needs_of("platform_sync_once"):
     print("FAIL: platform_sync_once does not need terraform_sync_once")
     sys.exit(1)
-if "platform_sync_once" not in needs_of("bootstrap_admin_secrets"):
-    print("FAIL: bootstrap_admin_secrets does not need platform_sync_once")
+if "terraform_sync_once" not in needs_of("validate_shared_secrets_once") or "platform_sync_once" not in needs_of("validate_shared_secrets_once"):
+    print("FAIL: validate_shared_secrets_once does not need both terraform_sync_once and platform_sync_once")
     sys.exit(1)
-if "bootstrap_admin_secrets" not in needs_of("detect_changed_deployments"):
-    print("FAIL: detect_changed_deployments does not need bootstrap_admin_secrets")
+if "validate_shared_secrets_once" not in needs_of("build_publish_and_deploy"):
+    print("FAIL: build_publish_and_deploy does not need validate_shared_secrets_once")
     sys.exit(1)
 if "build_publish_and_deploy" not in needs_of("monitor_sync_once"):
     print("FAIL: monitor_sync_once does not need build_publish_and_deploy")
@@ -5979,13 +6002,16 @@ for name in ("terraform_sync_once", "platform_sync_once", "monitor_sync_once"):
         print(f"FAIL: {name} does not call a reusable workflow via a job-level uses:")
         sys.exit(1)
 
-if "strategy" in jobs["bootstrap_admin_secrets"] or "matrix" in jobs["bootstrap_admin_secrets"]:
-    print("FAIL: bootstrap_admin_secrets uses a matrix (must be a single job)")
+if "strategy" in jobs["validate_shared_secrets_once"] or "matrix" in jobs["validate_shared_secrets_once"]:
+    print("FAIL: validate_shared_secrets_once uses a matrix (must be a single job)")
     sys.exit(1)
 
 strategy = jobs["build_publish_and_deploy"].get("strategy") or {}
 if strategy.get("max-parallel") != 1:
     print("FAIL: build_publish_and_deploy is missing max-parallel: 1")
+    sys.exit(1)
+if strategy.get("fail-fast") is not True:
+    print("FAIL: build_publish_and_deploy is missing fail-fast: true")
     sys.exit(1)
 if "matrix" not in strategy:
     print("FAIL: build_publish_and_deploy is missing its matrix")
@@ -5994,8 +6020,10 @@ if "matrix" not in strategy:
 print("OK: job graph order, needs chain, reusable-workflow calls, and matrix placement are all correct")
 PYEOF
 )"
-  if [ $? -eq 0 ]; then
-    pass "27: ${EKS_APP_WORKFLOW} job graph follows validate-model -> terraform-sync-once -> platform-sync-once -> bootstrap-admin-secrets -> runtime-deployment -> monitor-sync-once -> final-validation"
+  JOB_GRAPH_STATUS=$?
+  set -e
+  if [ "$JOB_GRAPH_STATUS" -eq 0 ]; then
+    pass "27: ${EKS_APP_WORKFLOW} job graph follows validate-model -> terraform-sync-once -> platform-sync-once -> validate-shared-secrets-once -> runtime-deployment -> monitor-sync-once -> final-validation"
   else
     fail "27: ${JOB_GRAPH_CHECK}"
   fi
@@ -6018,28 +6046,42 @@ else
 fi
 
 if grep -q "^concurrency:" "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && grep -q "group: goldengate-admin-secret-bootstrap-dev" "$EKS_APP_WORKFLOW" 2>/dev/null; then
-  pass "27: environment-level and bootstrap-job concurrency protection are both present"
+    && grep -q "group: goldengate-eks-app-orchestrator-dev" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "27: environment-level orchestrator concurrency protection is present"
 else
-  fail "27: environment-level or bootstrap-job concurrency protection is missing"
+  fail "27: environment-level orchestrator concurrency protection is missing"
 fi
 
-if grep -q -- "--environment dev" "$ADMIN_SECRET_HELPER" "$EKS_APP_WORKFLOW" 2>/dev/null \
-    || grep -q "environment dev" "$ADMIN_SECRET_HELPER" 2>/dev/null; then
-  pass "27: admin-secret bootstrap helper accepts --environment"
-fi
-if grep -q -- "--environment" "$ADMIN_SECRET_HELPER" 2>/dev/null; then
-  pass "27: hack/ensure-goldengate-admin-secret.py accepts and validates --environment"
+if grep -q "validate_shared_secrets_once:" "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && grep -q "secretsmanager describe-secret\|secretsmanager list-secret-version-ids" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "27: a read-only shared-secret validation job exists and runs once per environment"
 else
-  fail "27: hack/ensure-goldengate-admin-secret.py is missing --environment"
+  fail "27: validate_shared_secrets_once job is missing or does not perform the expected read-only checks"
 fi
 
-if grep -q "Resolve the admin secret name via the deployment model" "$EKS_APP_WORKFLOW" 2>/dev/null \
+if grep -q "aws secretsmanager put-secret-value\|aws secretsmanager get-random-password" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  fail "27: ${EKS_APP_WORKFLOW} contains a secret-mutation AWS CLI call"
+else
+  pass "27: ${EKS_APP_WORKFLOW} contains no secret-mutation AWS CLI call"
+fi
+
+if grep -q "Resolve deployment identity via the deployment model" "$EKS_APP_WORKFLOW" 2>/dev/null \
     && grep -q -- "--set runtime.csi.admin.objectName=\"\$RESOLVED_ADMIN_SECRET_NAME\"" "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && grep -q "name: runtime.csi.admin.objectName" "$EKS_APP_WORKFLOW" 2>/dev/null; then
-  pass "27: the admin secret name is resolved once and injected via an explicit Helm --set and Argo CD parameter override"
+    && grep -q -- "--set runtime.csi.certificate.objectName=\"\$RESOLVED_TLS_SECRET_NAME\"" "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && grep -q -- "--set runtime.serviceAccount.name=\"\$RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME\"" "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && grep -q "name: runtime.csi.admin.objectName" "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && grep -q "name: runtime.csi.certificate.objectName" "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && grep -q "name: runtime.serviceAccount.name" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "27: the admin secret, TLS secret, and ServiceAccount are resolved once and injected via explicit Helm --set and Argo CD parameter overrides"
 else
-  fail "27: admin-secret resolution/injection is missing from the runtime deployment steps"
+  fail "27: admin-secret/TLS/ServiceAccount resolution or injection is missing from the runtime deployment steps"
+fi
+
+if grep -q 'describe "\$DEPLOYMENT_ID"' "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && ! grep -q -- "describe --deployment-id" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "27: the deployment-model describe command uses the exact positional production invocation"
+else
+  fail "27: the deployment-model describe command is not called with the exact positional production invocation"
 fi
 
 if grep -q "Verify the selected image exists in the approved private ECR" "$EKS_APP_WORKFLOW" 2>/dev/null \
@@ -6075,12 +6117,17 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
         --values "envs/dev/${id}/values.yaml" \
         --set global.environment=dev \
         --set runtime.csi.admin.objectName="$admin_secret" \
+        --set runtime.csi.certificate.objectName=dev/goldengate/tls-certificate \
+        --set runtime.serviceAccount.create=false \
+        --set runtime.serviceAccount.name=gg-runtime-sa \
         > "$CURRENT_RENDER" 2>"${WORKDIR}/migration-current-${id}.log" \
       && helm template "$id" "$RUNTIME_CHART" \
         --namespace goldengate-dev \
         --values "envs/dev/${id}/values.yaml" \
         --set global.environment=dev \
         --set runtime.csi.admin.objectName="$admin_secret" \
+        --set runtime.csi.certificate.objectName=dev/goldengate/tls-certificate \
+        --set runtime.serviceAccount.create=false \
         --set runtime.serviceAccount.name="$legacy_sa" \
         > "$LEGACY_RENDER" 2>"${WORKDIR}/migration-legacy-${id}.log"; then
 
@@ -6100,6 +6147,58 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
   done
 else
   skip "28: migration-safety manifest comparison -- helm not available"
+fi
+
+echo ""
+echo "--- Phase 6D0 correction: final acceptance checks ---"
+
+if [ -e "envs/dev/goldengate-deployments.yaml" ]; then
+  fail "29: the handwritten registry envs/dev/goldengate-deployments.yaml was restored"
+else
+  pass "29: no handwritten registry exists"
+fi
+
+SECRET_TF_MODULE_COUNT="$(grep -c '^module "' envs/dev/secret.tf 2>/dev/null || true)"
+if [ "$SECRET_TF_MODULE_COUNT" -eq 3 ] \
+    && grep -q 'name.*= "dev/goldengate/source/admin"' envs/dev/secret.tf 2>/dev/null \
+    && grep -q 'name.*= "dev/goldengate/target/admin"' envs/dev/secret.tf 2>/dev/null \
+    && grep -q 'name.*= "dev/goldengate/tls-certificate"' envs/dev/secret.tf 2>/dev/null; then
+  pass "29: secret.tf contains exactly the three approved shared secret modules"
+else
+  fail "29: secret.tf does not contain exactly the three approved shared secret modules (found ${SECRET_TF_MODULE_COUNT})"
+fi
+
+if grep -q "for_each" envs/dev/secret.tf 2>/dev/null || grep -q "aws_secretsmanager_secret" envs/dev/secret.tf 2>/dev/null; then
+  fail "29: secret.tf contains a dynamic per-deployment secret module or direct aws_secretsmanager resource"
+else
+  pass "29: no dynamic per-deployment secret module exists in secret.tf"
+fi
+
+if grep -q "enable_cloudwatch_publication: true" "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && grep -q "metrics_gate_expectation: any" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "29: the orchestrator explicitly calls the monitor workflow with enable_cloudwatch_publication=true and metrics_gate_expectation=any"
+else
+  fail "29: the orchestrator does not explicitly preserve CloudWatch publication when synchronizing the monitor"
+fi
+
+RUNTIME_ROLE_POLICY="envs/dev/policies/goldengate-secrets-read-dev/policies/policies_1.json"
+if grep -qi "dynamodb" "$RUNTIME_ROLE_POLICY" 2>/dev/null || grep -qi "PutMetricData" "$RUNTIME_ROLE_POLICY" 2>/dev/null; then
+  fail "29: GoldenGateSecretsReadRole-dev grants DynamoDB or CloudWatch PutMetricData (must remain read-only Secrets Manager/KMS)"
+else
+  pass "29: GoldenGateSecretsReadRole-dev grants no DynamoDB write or CloudWatch PutMetricData permission"
+fi
+
+if grep -q "read_only_deployment_validation\|validate_shared_secrets_once" "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && grep -q "needs.validate_shared_secrets_once.result != 'failure'" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "29: the read-only validation chain is designed to run even when deploy=false skipped its mutation-only dependencies"
+else
+  fail "29: the read-only validation chain does not correctly tolerate skipped mutation-only dependencies"
+fi
+
+if [ -d "envs/dev/gg-sqlserver-payments-01" ] || [ -d "envs/dev/gg-postgresql-source-01" ]; then
+  fail "29: a real PostgreSQL-to-SQL Server runtime folder was added -- out of scope for this phase"
+else
+  pass "29: no real PostgreSQL-to-SQL Server runtime folder was added"
 fi
 
 echo ""

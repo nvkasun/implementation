@@ -619,7 +619,7 @@ jobs:
           fi
 
           # 1: exactly two Tail inputs (runtime, monitor) -- never a single shared input routed downstream by a metadata-dependent filter.
-          TAIL_INPUT_COUNT="$(grep -cE '^\s*Name\s+tail\s*$' <<< "$FLUENT_BIT_CM_BLOCK")"
+          TAIL_INPUT_COUNT="$(grep -cE '^[[:space:]]*Name[[:space:]]+tail[[:space:]]*$' <<< "$FLUENT_BIT_CM_BLOCK")"
           if [ "$TAIL_INPUT_COUNT" -ne 2 ]; then
             echo "FAIL: expected exactly 2 Tail inputs, found ${TAIL_INPUT_COUNT}."
             exit 1
@@ -658,7 +658,7 @@ jobs:
             echo "FAIL: monitor Kubernetes filter does not set Kube_Tag_Prefix monitor.var.log.containers."
             exit 1
           fi
-          KUBERNETES_FILTER_COUNT="$(grep -cE '^\s*Name\s+kubernetes\s*$' <<< "$FLUENT_BIT_CM_BLOCK")"
+          KUBERNETES_FILTER_COUNT="$(grep -cE '^[[:space:]]*Name[[:space:]]+kubernetes[[:space:]]*$' <<< "$FLUENT_BIT_CM_BLOCK")"
           if [ "$KUBERNETES_FILTER_COUNT" -ne 2 ]; then
             echo "FAIL: expected exactly 2 kubernetes FILTERs (one per input), found ${KUBERNETES_FILTER_COUNT}."
             exit 1
@@ -666,11 +666,11 @@ jobs:
           echo "OK: both kubernetes FILTERs set the expected explicit Kube_Tag_Prefix."
 
           # 10-11: the metadata-dependent routing stages (grep filter, rewrite_tag filter/emitter) must be completely absent.
-          if grep -Eq -- 'Name\s+grep' <<< "$FLUENT_BIT_CM_BLOCK"; then
+          if grep -Eq -- 'Name[[:space:]]+grep' <<< "$FLUENT_BIT_CM_BLOCK"; then
             echo "FAIL: a grep FILTER is still rendered -- routing must not depend on Kubernetes-metadata enrichment."
             exit 1
           fi
-          if grep -Eq -- 'Name\s+rewrite_tag|Emitter_Name|Emitter_Storage\.type|runtime\.\$TAG|monitor\.\$TAG' <<< "$FLUENT_BIT_CM_BLOCK"; then
+          if grep -Eq -- 'Name[[:space:]]+rewrite_tag|Emitter_Name|Emitter_Storage\.type|runtime\.\$TAG|monitor\.\$TAG' <<< "$FLUENT_BIT_CM_BLOCK"; then
             echo "FAIL: a rewrite_tag FILTER or emitter is still rendered -- routing must be direct via Tail Tag, not rewritten downstream."
             exit 1
           fi
@@ -719,7 +719,7 @@ jobs:
           echo "Validating no public.ecr.aws reference remains in the active (non-comment) Phase 6A chart values/templates or the rendered manifest..."
           # Exclude comment-only lines and quoted prohibition text -- only the rendered manifest check below is authoritative proof of the actually-deployed image.
           PUBLIC_ECR_HITS="$(grep -rn "public.ecr.aws" "$HELM_CHART_PATH/values.yaml" "$HELM_CHART_PATH/templates"/fluent-bit-*.yaml 2>/dev/null \
-            | grep -vE ':\s*#|"[^"]*public\.ecr\.aws[^"]*"' || true)"
+            | grep -vE ':[[:space:]]*#|"[^"]*public\.ecr\.aws[^"]*"' || true)"
           if [ -n "$PUBLIC_ECR_HITS" ]; then
             echo "FAIL: a live public.ecr.aws reference remains in the Phase 6A chart source:"
             echo "${PUBLIC_ECR_HITS}"
@@ -732,7 +732,7 @@ jobs:
           echo "OK: no live public.ecr.aws reference anywhere in the Phase 6A chart source or rendered manifest."
 
           echo "Validating both cloudwatch_logs OUTPUTs are filesystem-buffer bounded..."
-          TOTAL_LIMIT_SIZE_COUNT="$(grep -v '^\s*#' "$RENDERED" | grep -cE 'storage\.total_limit_size[[:space:]]+[0-9]')"
+          TOTAL_LIMIT_SIZE_COUNT="$(grep -v '^[[:space:]]*#' "$RENDERED" | grep -cE 'storage\.total_limit_size[[:space:]]+[0-9]')"
           if [ "$TOTAL_LIMIT_SIZE_COUNT" -ne 2 ]; then
             echo "FAIL: expected storage.total_limit_size on both cloudwatch_logs OUTPUTs, found ${TOTAL_LIMIT_SIZE_COUNT} occurrence(s)."
             exit 1

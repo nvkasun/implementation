@@ -451,7 +451,7 @@ jobs:
 
           echo "Extracting rendered image references..."
 
-          IMAGES="$(grep -E '^\s*image:\s*\S' "$RENDERED" | sed -E 's/^\s*image:\s*//' | tr -d "\"'" | sort -u)"
+          IMAGES="$(grep -E '^[[:space:]]*image:[[:space:]]*\S' "$RENDERED" | sed -E 's/^[[:space:]]*image:[[:space:]]*//' | tr -d "\"'" | sort -u)"
 
           if [ -z "$IMAGES" ]; then
             echo "No image references found in rendered manifest. This is unexpected -- failing."

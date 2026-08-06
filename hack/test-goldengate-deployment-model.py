@@ -25,7 +25,7 @@ deployment:
   enabled: {enabled}
   pipeline: {pipeline}
   role: {role}
-{admin_secret_block}
+{deployment_admin_secret_block}
 global:
   environment: {environment}
 
@@ -37,13 +37,13 @@ runtime:
   image:
     repository: {repository}
     tag: "{tag}"
-  serviceAccount:
-    create: false
-    name: {service_account}
-  csi:
-{csi_admin_block}    certificate:
-      objectName: {csi_certificate_object_name}
-
+{service_account_block}  csi:
+    enabled: true
+{csi_role_arn_block}    admin:
+      enabled: true
+{csi_admin_object_name_block}    certificate:
+      enabled: true
+{csi_certificate_object_name_block}
 ingress:
   hostDomain: {ingress_host_domain}
 {alb_block}
@@ -52,9 +52,11 @@ ingress:
 
 
 def write_descriptor(root, environment, deployment_id, enabled=True, pipeline="test-pipeline", role="source",
-                     deployment_type="oracle", repository=None, tag="1.0.0", service_account="gg-runtime-sa",
-                     admin_secret=None, alb_group_order=None, extra="", raw_override=None,
-                     csi_admin_object_name=None, csi_certificate_object_name=None, ingress_host_domain=None):
+                     deployment_type="oracle", repository=None, tag="1.0.0",
+                     service_account_name=None, service_account_create=None,
+                     deployment_admin_secret=None, alb_group_order=None, extra="", raw_override=None,
+                     csi_admin_object_name=None, csi_certificate_object_name=None,
+                     csi_service_account_role_arn=None, ingress_host_domain=None):
     folder = os.path.join(root, "envs", environment, deployment_id)
     os.makedirs(folder, exist_ok=True)
     path = os.path.join(folder, "values.yaml")
@@ -63,22 +65,37 @@ def write_descriptor(root, environment, deployment_id, enabled=True, pipeline="t
             f.write(raw_override)
         return path
     repository = repository or f"229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-{deployment_type}"
-    admin_secret_block = ""
-    if admin_secret is not None:
-        name, managed = admin_secret
-        admin_secret_block = f"  adminSecret:\n    name: {name}\n    managed: {'true' if managed else 'false'}\n"
+
+    deployment_admin_secret_block = ""
+    if deployment_admin_secret is not None:
+        deployment_admin_secret_block = f"  adminSecret:\n    name: {deployment_admin_secret}\n"
+
+    service_account_block = ""
+    if service_account_name is not None or service_account_create is not None:
+        lines = ["  serviceAccount:"]
+        if service_account_create is not None:
+            lines.append(f"    create: {str(service_account_create).lower()}")
+        if service_account_name is not None:
+            lines.append(f"    name: {service_account_name}")
+        service_account_block = "\n".join(lines) + "\n"
+
+    csi_role_arn_block = f"    serviceAccountRoleArn: {csi_service_account_role_arn}\n" if csi_service_account_role_arn is not None else ""
+    csi_admin_object_name_block = f"      objectName: {csi_admin_object_name}\n" if csi_admin_object_name is not None else ""
+    csi_certificate_object_name_block = f"      objectName: {csi_certificate_object_name}\n" if csi_certificate_object_name is not None else ""
+
     alb_block = f'  alb:\n    groupOrder: "{alb_group_order}"' if alb_group_order is not None else ""
-    csi_admin_block = f"    admin:\n      objectName: {csi_admin_object_name}\n" if csi_admin_object_name is not None else ""
-    if csi_certificate_object_name is None:
-        csi_certificate_object_name = f"{environment}/goldengate/tls-certificate"
     if ingress_host_domain is None:
         ingress_host_domain = f"goldengate-{environment}.adcbmis.local"
+
     text = BASE_DESCRIPTOR.format(
         enabled=str(enabled).lower(), pipeline=pipeline, role=role, environment=environment,
-        deployment_type=deployment_type, repository=repository, tag=tag, service_account=service_account,
-        admin_secret_block=admin_secret_block, alb_block=alb_block, extra=extra,
-        csi_admin_block=csi_admin_block, csi_certificate_object_name=csi_certificate_object_name,
-        ingress_host_domain=ingress_host_domain)
+        deployment_type=deployment_type, repository=repository, tag=tag,
+        deployment_admin_secret_block=deployment_admin_secret_block,
+        service_account_block=service_account_block,
+        csi_role_arn_block=csi_role_arn_block,
+        csi_admin_object_name_block=csi_admin_object_name_block,
+        csi_certificate_object_name_block=csi_certificate_object_name_block,
+        alb_block=alb_block, extra=extra, ingress_host_domain=ingress_host_domain)
     with open(path, "w") as f:
         f.write(text)
     return path
@@ -98,7 +115,7 @@ class ScratchEnvironmentTestCase(unittest.TestCase):
 
 
 class RealRepositoryDescriptorTests(unittest.TestCase):
-    """Tests 1, 2, 10, 11, 31: exercised against the real, live envs/dev descriptors -- no scratch root."""
+    """Exercised against the real, live envs/dev descriptors -- no scratch root."""
 
     def test_existing_oracle_descriptor_parses(self):
         active, _inactive, invalid = gdm.scan("dev")
@@ -114,26 +131,29 @@ class RealRepositoryDescriptorTests(unittest.TestCase):
         self.assertIn("gg-postgresql-payments-01", by_id)
         self.assertEqual(by_id["gg-postgresql-payments-01"]["deploymentType"], "postgresql")
 
-    def test_existing_oracle_legacy_secret_unchanged(self):
+    def test_existing_oracle_renders_with_source_shared_secret(self):
         active, _inactive, _invalid = gdm.scan("dev")
         by_id = {d["deploymentId"]: d for d in active}
         self.assertEqual(by_id["gg-oracle-payments-01"]["adminSecretName"], "dev/goldengate/source/admin")
-        self.assertFalse(by_id["gg-oracle-payments-01"]["adminSecretManaged"])
 
-    def test_existing_postgresql_legacy_secret_unchanged(self):
+    def test_existing_postgresql_renders_with_target_shared_secret(self):
         active, _inactive, _invalid = gdm.scan("dev")
         by_id = {d["deploymentId"]: d for d in active}
         self.assertEqual(by_id["gg-postgresql-payments-01"]["adminSecretName"], "dev/goldengate/target/admin")
-        self.assertFalse(by_id["gg-postgresql-payments-01"]["adminSecretManaged"])
 
     def test_generated_registry_contains_both_existing_live_deployments(self):
         registry = gdm.build_registry("dev")
         names = {d["name"] for d in registry["deployments"]}
         self.assertEqual(names, {"gg-oracle-payments-01", "gg-postgresql-payments-01"})
 
+    def test_both_existing_deployments_use_gg_runtime_sa(self):
+        active, _inactive, _invalid = gdm.scan("dev")
+        for d in active:
+            self.assertEqual(d["runtimeServiceAccountName"], "gg-runtime-sa")
+
 
 class GenericDeploymentTypeTests(ScratchEnvironmentTestCase):
-    """Tests 3-8: the tool must accept any safe token as deploymentType, without a fixed engine allowlist."""
+    """The tool must accept any safe token as deploymentType, without a fixed engine allowlist."""
 
     def test_synthetic_postgresql_source_descriptor_parses(self):
         write_descriptor(self._tmp.name, "dev", "gg-postgresql-payments-sqlserver-01",
@@ -141,6 +161,7 @@ class GenericDeploymentTypeTests(ScratchEnvironmentTestCase):
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
         self.assertEqual(len(active), 1)
+        self.assertEqual(active[0]["adminSecretName"], "dev/goldengate/source/admin")
 
     def test_synthetic_sqlserver_target_descriptor_parses(self):
         write_descriptor(self._tmp.name, "dev", "gg-sqlserver-payments-01",
@@ -148,13 +169,13 @@ class GenericDeploymentTypeTests(ScratchEnvironmentTestCase):
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
         self.assertEqual(active[0]["deploymentType"], "sqlserver")
+        self.assertEqual(active[0]["adminSecretName"], "dev/goldengate/target/admin")
 
-    def test_synthetic_mysql_descriptor_parses_without_monitor_source_changes(self):
+    def test_synthetic_mysql_descriptor_parses_without_engine_allowlist(self):
         write_descriptor(self._tmp.name, "dev", "gg-mysql-fixture-01", deployment_type="mysql")
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
         self.assertEqual(active[0]["deploymentType"], "mysql")
-        # No mysql-specific branch exists in the tool itself -- generic token validation only.
         with open(TOOL_PATH) as f:
             source = f.read()
         self.assertNotIn('"mysql"', source)
@@ -180,89 +201,118 @@ class GenericDeploymentTypeTests(ScratchEnvironmentTestCase):
         self.assertFalse(gdm._safe_token("gg-oracle-payments-01\n", 63))
 
 
-class AdminSecretDerivationTests(ScratchEnvironmentTestCase):
-    """Tests 9, 12, 33: default managed admin-secret naming and inventory exclusion/ordering."""
+class SharedSecretDerivationTests(unittest.TestCase):
+    """Tests 1-6: role/environment alone select the shared environment-level admin/TLS secrets."""
 
-    def test_default_managed_admin_secret_name_derives_correctly(self):
-        write_descriptor(self._tmp.name, "dev", "gg-new-fixture-01")
-        active, _inactive, _invalid = gdm.scan("dev")
-        self.assertEqual(active[0]["adminSecretName"], "dev/goldengate/runtime/gg-new-fixture-01/admin")
-        self.assertTrue(active[0]["adminSecretManaged"])
+    def test_source_role_resolves_to_source_admin_secret(self):
+        self.assertEqual(gdm.resolve_admin_secret("dev", "source"), "dev/goldengate/source/admin")
 
-    def test_managed_false_secrets_excluded_from_managed_inventory(self):
-        write_descriptor(self._tmp.name, "dev", "gg-legacy-fixture-01",
-                         admin_secret=("dev/goldengate/legacy/admin", False))
-        write_descriptor(self._tmp.name, "dev", "gg-managed-fixture-01", pipeline="other-pipeline")
-        result = gdm.managed_secrets("dev")
-        ids = [entry[0] for entry in result]
-        self.assertNotIn("gg-legacy-fixture-01", ids)
-        self.assertIn("gg-managed-fixture-01", ids)
+    def test_target_role_resolves_to_target_admin_secret(self):
+        self.assertEqual(gdm.resolve_admin_secret("dev", "target"), "dev/goldengate/target/admin")
 
-    def test_secret_inventory_ordering_is_deterministic(self):
-        write_descriptor(self._tmp.name, "dev", "gg-zzz-fixture", pipeline="p1")
-        write_descriptor(self._tmp.name, "dev", "gg-aaa-fixture", pipeline="p2")
-        result_a = gdm.managed_secrets("dev")
-        result_b = gdm.managed_secrets("dev")
-        self.assertEqual(result_a, result_b)
-        self.assertEqual(result_a, sorted(result_a))
+    def test_dev_source_resolves_exactly(self):
+        self.assertEqual(gdm.resolve_admin_secret("dev", "source"), "dev/goldengate/source/admin")
+
+    def test_dev_target_resolves_exactly(self):
+        self.assertEqual(gdm.resolve_admin_secret("dev", "target"), "dev/goldengate/target/admin")
+
+    def test_sit_source_resolves_exactly(self):
+        self.assertEqual(gdm.resolve_admin_secret("sit", "source"), "sit/goldengate/source/admin")
+
+    def test_sit_target_resolves_exactly(self):
+        self.assertEqual(gdm.resolve_admin_secret("sit", "target"), "sit/goldengate/target/admin")
+
+    def test_tls_resolves_from_environment(self):
+        self.assertEqual(gdm.resolve_tls_secret("dev"), "dev/goldengate/tls-certificate")
+        self.assertEqual(gdm.resolve_tls_secret("sit"), "sit/goldengate/tls-certificate")
+
+    def test_invalid_role_raises(self):
+        with self.assertRaises(ValueError):
+            gdm.resolve_admin_secret("dev", "replica")
+
+
+class NoPerDeploymentSecretTests(ScratchEnvironmentTestCase):
+    """Test 7: no per-deployment runtime admin secret is ever derived; two deployments of the same role share one secret."""
+
+    def test_two_sources_in_different_pipelines_share_the_same_admin_secret(self):
+        write_descriptor(self._tmp.name, "dev", "gg-source-a", pipeline="p1", role="source")
+        write_descriptor(self._tmp.name, "dev", "gg-source-b", pipeline="p2", role="source")
+        active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        names = {d["adminSecretName"] for d in active}
+        self.assertEqual(names, {"dev/goldengate/source/admin"})
+
+    def test_no_deployment_specific_runtime_secret_path_exists_in_source(self):
+        with open(TOOL_PATH) as f:
+            source = f.read()
+        self.assertNotIn("goldengate/runtime/", source)
+        self.assertNotIn("managed_secrets", source)
+        self.assertNotIn("adminSecretManaged", source)
+
+
+class ForbiddenOverrideTests(ScratchEnvironmentTestCase):
+    """Tests 8-12: operator descriptors must not override any shared platform invariant."""
+
+    def test_deployment_admin_secret_override_is_rejected(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+                         deployment_admin_secret="dev/goldengate/source/admin")
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+        self.assertIn("adminSecret", invalid[0][1])
+
+    def test_csi_admin_object_name_override_is_rejected(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+                         csi_admin_object_name="dev/goldengate/source/admin")
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+        self.assertIn("csi.admin.objectName", invalid[0][1])
+
+    def test_csi_certificate_object_name_override_is_rejected(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+                         csi_certificate_object_name="dev/goldengate/tls-certificate")
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+        self.assertIn("csi.certificate.objectName", invalid[0][1])
+
+    def test_csi_service_account_role_arn_override_is_rejected(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+                         csi_service_account_role_arn="arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev")
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+        self.assertIn("serviceAccountRoleArn", invalid[0][1])
+
+    def test_wrong_service_account_override_is_rejected(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01", service_account_name="gg-something-else")
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+
+    def test_service_account_create_true_override_is_rejected(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+                         service_account_name="gg-runtime-sa", service_account_create=True)
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+
+    def test_correct_service_account_override_is_tolerated(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+                         service_account_name="gg-runtime-sa", service_account_create=False)
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+
+    def test_service_account_omitted_entirely_is_valid(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01")
+        active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        self.assertEqual(active[0]["runtimeServiceAccountName"], "gg-runtime-sa")
 
 
 class EnvironmentScopedContractTests(ScratchEnvironmentTestCase):
-    """Phase 6D0 correction Task 1: environment-scoped secrets, CSI consistency, EFS, and stricter ECR/name grammar."""
+    """Environment-scoped derivation, ECR/name grammar, and EFS identity."""
 
-    def test_default_admin_secret_is_scoped_to_the_selected_environment_not_hardcoded_dev(self):
-        write_descriptor(self._tmp.name, "staging", "gg-fixture-01")
-        active, _inactive, invalid = gdm.scan("staging")
+    def test_admin_secret_is_scoped_to_the_selected_environment_not_hardcoded_dev(self):
+        write_descriptor(self._tmp.name, "sit", "gg-fixture-01")
+        active, _inactive, invalid = gdm.scan("sit")
         self.assertEqual(invalid, [])
-        self.assertEqual(active[0]["adminSecretName"], "staging/goldengate/runtime/gg-fixture-01/admin")
-
-    def test_managed_true_with_non_deterministic_name_fails(self):
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
-                         admin_secret=("dev/goldengate/runtime/some-other-id/admin", True))
-        _active, _inactive, invalid = gdm.scan("dev")
-        self.assertEqual(len(invalid), 1)
-
-    def test_managed_false_with_arn_style_name_fails(self):
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
-                         admin_secret=("arn:aws:secretsmanager:eu-west-1:123456789012:secret:x", False))
-        _active, _inactive, invalid = gdm.scan("dev")
-        self.assertEqual(len(invalid), 1)
-
-    def test_managed_false_with_traversal_name_fails(self):
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
-                         admin_secret=("dev/../etc/admin", False))
-        _active, _inactive, invalid = gdm.scan("dev")
-        self.assertEqual(len(invalid), 1)
-
-    def test_managed_false_with_leading_slash_name_fails(self):
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
-                         admin_secret=("/dev/goldengate/legacy/admin", False))
-        _active, _inactive, invalid = gdm.scan("dev")
-        self.assertEqual(len(invalid), 1)
-
-    def test_managed_false_with_out_of_environment_scope_name_fails(self):
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
-                         admin_secret=("prod/goldengate/legacy/admin", False))
-        _active, _inactive, invalid = gdm.scan("dev")
-        self.assertEqual(len(invalid), 1)
-
-    def test_csi_certificate_object_name_must_match_shared_tls_secret(self):
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
-                         csi_certificate_object_name="dev/goldengate/wrong-cert")
-        _active, _inactive, invalid = gdm.scan("dev")
-        self.assertEqual(len(invalid), 1)
-
-    def test_csi_admin_object_name_mismatch_fails(self):
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
-                         csi_admin_object_name="dev/goldengate/wrong-admin")
-        _active, _inactive, invalid = gdm.scan("dev")
-        self.assertEqual(len(invalid), 1)
-
-    def test_csi_admin_object_name_matching_resolved_name_passes(self):
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
-                         csi_admin_object_name="dev/goldengate/runtime/gg-fixture-01/admin")
-        _active, _inactive, invalid = gdm.scan("dev")
-        self.assertEqual(invalid, [])
+        self.assertEqual(active[0]["adminSecretName"], "sit/goldengate/source/admin")
 
     def test_ingress_host_domain_inconsistent_with_shared_domain_fails(self):
         write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
@@ -320,12 +370,6 @@ class EnvironmentScopedContractTests(ScratchEnvironmentTestCase):
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
-    def test_field_merely_referencing_a_secret_by_name_is_allowed(self):
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
-                         admin_secret=("dev/goldengate/legacy/admin", False))
-        _active, _inactive, invalid = gdm.scan("dev")
-        self.assertEqual(invalid, [])
-
     def test_efs_enabled_requires_safe_filesystem_id(self):
         write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
                          extra="persistence:\n  enabled: true\n  efs:\n    fileSystemId: not-an-fs-id\n")
@@ -343,12 +387,12 @@ class EnvironmentScopedContractTests(ScratchEnvironmentTestCase):
         active, _inactive, _invalid = gdm.scan("dev")
         self.assertEqual(active[0]["runtimeNamespace"], "goldengate-dev")
         self.assertEqual(active[0]["monitoringNamespace"], "goldengate-monitoring")
-        self.assertEqual(active[0]["ingressDomain"], "goldengate-dev.adcbmis.local")
+        self.assertEqual(active[0]["ingressHost"], "goldengate-dev.adcbmis.local")
         self.assertEqual(active[0]["tlsSecretName"], "dev/goldengate/tls-certificate")
 
 
 class FullValidationGatingTests(unittest.TestCase):
-    """Task 1 item 2: no command may emit partial inventory while another runtime folder is invalid."""
+    """No command may emit partial inventory while another runtime folder is invalid."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -359,15 +403,13 @@ class FullValidationGatingTests(unittest.TestCase):
         gdm.REPO_ROOT = self._original_root
         self._tmp.cleanup()
 
-    def test_list_fails_closed_when_an_unrelated_folder_is_invalid(self):
+    def test_full_validation_gate_trips_when_an_unrelated_folder_is_invalid(self):
         write_descriptor(self._tmp.name, "dev", "gg-good-fixture-01")
         write_descriptor(self._tmp.name, "dev", "gg-bad-fixture-01", tag="latest")
-        active, inactive, invalid, problems = gdm.cmd_list.__wrapped__(self) if False else (None, None, None, None)
-        # cmd_list prints; assert via the underlying full-validation gate instead of stdout capture.
         _active, _inactive, invalid, problems = gdm._run_full_validation("dev")
         self.assertTrue(invalid or problems)
 
-    def test_managed_secrets_command_returns_nonzero_when_a_folder_is_invalid(self):
+    def test_shared_secrets_command_returns_nonzero_when_a_folder_is_invalid(self):
         write_descriptor(self._tmp.name, "dev", "gg-good-fixture-01")
         write_descriptor(self._tmp.name, "dev", "gg-bad-fixture-01", tag="latest")
 
@@ -378,9 +420,8 @@ class FullValidationGatingTests(unittest.TestCase):
         from contextlib import redirect_stdout
         buf = io.StringIO()
         with redirect_stdout(buf):
-            exit_code = gdm.cmd_managed_secrets(Args())
+            exit_code = gdm.cmd_shared_secrets(Args())
         self.assertEqual(exit_code, 1)
-        self.assertNotIn("gg-good-fixture-01", buf.getvalue())
 
     def test_describe_command_returns_nonzero_when_an_unrelated_folder_is_invalid(self):
         write_descriptor(self._tmp.name, "dev", "gg-good-fixture-01")
@@ -413,8 +454,31 @@ class FullValidationGatingTests(unittest.TestCase):
         self.assertNotIn("ACTIVE  gg-good-fixture-01", buf.getvalue())
 
 
+class SharedSecretsCommandTests(ScratchEnvironmentTestCase):
+    """Test 29 support: the shared-secrets command output shape."""
+
+    def test_shared_secrets_command_prints_exactly_three_identifiers(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01")
+
+        class Args:
+            environment = "dev"
+
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            exit_code = gdm.cmd_shared_secrets(Args())
+        self.assertEqual(exit_code, 0)
+        lines = buf.getvalue().splitlines()
+        self.assertEqual(lines, [
+            "dev/goldengate/source/admin",
+            "dev/goldengate/target/admin",
+            "dev/goldengate/tls-certificate",
+        ])
+
+
 class LifecycleClassificationTests(ScratchEnvironmentTestCase):
-    """Tests 13, 14: disabled/absent runtimes validate but are excluded from active inventory."""
+    """Disabled/absent runtimes validate but are excluded from active inventory."""
 
     def test_disabled_runtime_validates_but_excluded(self):
         write_descriptor(self._tmp.name, "dev", "gg-disabled-fixture-01", enabled=False)
@@ -433,7 +497,7 @@ class LifecycleClassificationTests(ScratchEnvironmentTestCase):
 
 
 class FailClosedTests(ScratchEnvironmentTestCase):
-    """Tests 15-26: malformed/invalid candidates never silently disappear."""
+    """Malformed/invalid candidates never silently disappear."""
 
     def test_malformed_yaml_fails(self):
         write_descriptor(self._tmp.name, "dev", "gg-malformed-fixture-01", raw_override="deployment: [unterminated")
@@ -502,11 +566,6 @@ class FailClosedTests(ScratchEnvironmentTestCase):
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
-    def test_wrong_service_account_fails(self):
-        write_descriptor(self._tmp.name, "dev", "gg-wrong-sa-fixture-01", service_account="gg-something-else")
-        _active, _inactive, invalid = gdm.scan("dev")
-        self.assertEqual(len(invalid), 1)
-
     def test_embedded_credentials_fail(self):
         write_descriptor(self._tmp.name, "dev", "gg-cred-fixture-01",
                          extra="\nadminPassword: hunter2\n")
@@ -514,9 +573,21 @@ class FailClosedTests(ScratchEnvironmentTestCase):
         self.assertEqual(len(invalid), 1)
         self.assertNotIn("hunter2", invalid[0][1])
 
+    def test_boolean_like_string_enabled_fails(self):
+        write_descriptor(self._tmp.name, "dev", "gg-boolstr-fixture-01",
+                         raw_override=BASE_DESCRIPTOR.format(
+                             enabled='"true"', pipeline="p1", role="source", environment="dev",
+                             deployment_admin_secret_block="", deployment_type="oracle",
+                             repository="229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle", tag="1.0.0",
+                             service_account_block="", csi_role_arn_block="", csi_admin_object_name_block="",
+                             csi_certificate_object_name_block="", ingress_host_domain="goldengate-dev.adcbmis.local",
+                             alb_block="", extra=""))
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+
 
 class ReplicationSchemaTests(ScratchEnvironmentTestCase):
-    """Tests 29, 30: the Phase 6D0 replication bootstrap gate."""
+    """The Phase 6D0 replication bootstrap gate."""
 
     def test_replication_enabled_false_passes(self):
         write_descriptor(self._tmp.name, "dev", "gg-repl-off-fixture-01",
@@ -532,7 +603,7 @@ class ReplicationSchemaTests(ScratchEnvironmentTestCase):
 
 
 class RegistryDeterminismTests(ScratchEnvironmentTestCase):
-    """Tests 27, 28, 32: deterministic, credential-free registry generation."""
+    """Deterministic, credential-free registry generation using role-derived shared secrets."""
 
     def _write_platform_and_monitor_fixtures(self):
         platform_dir = os.path.join(self._tmp.name, "platform", "dev", "goldengate-platform")
@@ -568,6 +639,28 @@ class RegistryDeterminismTests(ScratchEnvironmentTestCase):
         text = yaml.safe_dump(gdm.build_registry("dev"))
         for forbidden in ("hunter2", "OGG_ADMIN_PWD", "-----BEGIN"):
             self.assertNotIn(forbidden, text)
+
+    def test_two_sources_sharing_one_secret_get_distinct_registry_entries(self):
+        self._write_platform_and_monitor_fixtures()
+        write_descriptor(self._tmp.name, "dev", "gg-source-a", pipeline="p1", role="source")
+        write_descriptor(self._tmp.name, "dev", "gg-source-b", pipeline="p2", role="source")
+        registry = gdm.build_registry("dev")
+        entries = {d["name"]: d["adminSecret"] for d in registry["deployments"]}
+        self.assertEqual(entries, {
+            "gg-source-a": "dev/goldengate/source/admin",
+            "gg-source-b": "dev/goldengate/source/admin",
+        })
+
+    def test_two_targets_sharing_one_secret_get_distinct_registry_entries(self):
+        self._write_platform_and_monitor_fixtures()
+        write_descriptor(self._tmp.name, "dev", "gg-target-a", pipeline="p1", role="target")
+        write_descriptor(self._tmp.name, "dev", "gg-target-b", pipeline="p2", role="target")
+        registry = gdm.build_registry("dev")
+        entries = {d["name"]: d["adminSecret"] for d in registry["deployments"]}
+        self.assertEqual(entries, {
+            "gg-target-a": "dev/goldengate/target/admin",
+            "gg-target-b": "dev/goldengate/target/admin",
+        })
 
 
 if __name__ == "__main__":

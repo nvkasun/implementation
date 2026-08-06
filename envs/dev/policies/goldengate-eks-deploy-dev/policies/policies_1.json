@@ -27,22 +27,17 @@
       "Resource": "*"
     },
     {
-      "Sid": "AllowGoldenGateManagedRuntimeSecretBootstrap",
+      "Sid": "AllowReadOnlyGoldenGateSharedSecretValidation",
       "Effect": "Allow",
       "Action": [
         "secretsmanager:DescribeSecret",
-        "secretsmanager:ListSecretVersionIds",
-        "secretsmanager:PutSecretValue"
+        "secretsmanager:ListSecretVersionIds"
       ],
-      "Resource": "arn:aws:secretsmanager:eu-west-1:668311715351:secret:dev/goldengate/runtime/*"
-    },
-    {
-      "Sid": "AllowGoldenGateAdminSecretPasswordGeneration",
-      "Effect": "Allow",
-      "Action": [
-        "secretsmanager:GetRandomPassword"
-      ],
-      "Resource": "*"
+      "Resource": [
+        "arn:aws:secretsmanager:eu-west-1:668311715351:secret:dev/goldengate/source/admin-??????",
+        "arn:aws:secretsmanager:eu-west-1:668311715351:secret:dev/goldengate/target/admin-??????",
+        "arn:aws:secretsmanager:eu-west-1:668311715351:secret:dev/goldengate/tls-certificate-??????"
+      ]
     }
   ]
 }

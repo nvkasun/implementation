@@ -23,30 +23,40 @@ locals {
     split("/", f)[0] => yamldecode(file("${path.module}/${f}"))
   }
 
-  goldengate_default_admin_secret_names = {
-    for id in keys(local.goldengate_runtime_documents) : id =>
-    "${var.environment}/goldengate/runtime/${id}/admin"
+  # jsonencode() roundtrip proves a literal Boolean: can(tobool("true")) is also true for the STRING "true".
+  goldengate_enabled_jsonenc = {
+    for id, doc in local.goldengate_runtime_documents : id => try(jsonencode(doc.deployment.enabled), "")
+  }
+  goldengate_replication_declared = {
+    for id, doc in local.goldengate_runtime_documents : id => try(doc.replication, null) != null
+  }
+  goldengate_replication_enabled_jsonenc = {
+    for id, doc in local.goldengate_runtime_documents : id => try(jsonencode(doc.replication.enabled), "")
   }
 
-  # Precomputed via try() since Terraform's &&/|| do not short-circuit around attribute-access errors.
-  goldengate_admin_secret_declared = {
+  # Shared platform invariants, derived and injected by the deploy workflow; declaring any of them at all is a forbidden override.
+  goldengate_deployment_admin_secret_declared = {
     for id, doc in local.goldengate_runtime_documents : id => try(doc.deployment.adminSecret, null) != null
   }
-  goldengate_admin_secret_name_raw = {
-    for id, doc in local.goldengate_runtime_documents : id => try(doc.deployment.adminSecret.name, "")
+  goldengate_csi_admin_object_name_declared = {
+    for id, doc in local.goldengate_runtime_documents : id => try(doc.runtime.csi.admin.objectName, null) != null
   }
-  goldengate_admin_secret_managed_is_bool = {
-    for id, doc in local.goldengate_runtime_documents : id => try(can(tobool(doc.deployment.adminSecret.managed)), false)
+  goldengate_csi_certificate_object_name_declared = {
+    for id, doc in local.goldengate_runtime_documents : id => try(doc.runtime.csi.certificate.objectName, null) != null
   }
-  goldengate_admin_secret_managed_bool = {
-    for id, doc in local.goldengate_runtime_documents : id => try(tobool(doc.deployment.adminSecret.managed), false)
+  goldengate_csi_service_account_role_arn_declared = {
+    for id, doc in local.goldengate_runtime_documents : id => try(doc.runtime.csi.serviceAccountRoleArn, null) != null
   }
-  goldengate_resolved_admin_secret_name = {
-    for id in keys(local.goldengate_runtime_documents) : id =>
-    local.goldengate_admin_secret_declared[id] ? local.goldengate_admin_secret_name_raw[id] : local.goldengate_default_admin_secret_names[id]
+
+  # runtime.serviceAccount is optional (the workflow injects it); when present it must match the shared invariant exactly.
+  goldengate_service_account_declared = {
+    for id, doc in local.goldengate_runtime_documents : id => try(doc.runtime.serviceAccount, null) != null
   }
-  goldengate_csi_admin_object_name_raw = {
-    for id, doc in local.goldengate_runtime_documents : id => try(doc.runtime.csi.admin.objectName, null)
+  goldengate_service_account_name_raw = {
+    for id, doc in local.goldengate_runtime_documents : id => try(doc.runtime.serviceAccount.name, "")
+  }
+  goldengate_service_account_create_jsonenc = {
+    for id, doc in local.goldengate_runtime_documents : id => try(jsonencode(doc.runtime.serviceAccount.create), "")
   }
 
   # No filtering here; terraform_data.goldengate_runtime_contract enforces the full contract as a plan-blocking precondition.
@@ -65,20 +75,28 @@ locals {
     for id in local.goldengate_deployment_names : try(local.goldengate_enabled_deployments[id].deployment.pipeline, "")
   ]))
 
-  goldengate_admin_secret_managed = {
-    for id in local.goldengate_deployment_names : id =>
-    try(local.goldengate_enabled_deployments[id].deployment.adminSecret.managed, true)
+  goldengate_alb_group_order_by_enabled_id = {
+    for id in local.goldengate_deployment_names : id => try(local.goldengate_enabled_deployments[id].ingress.alb.groupOrder, null)
   }
+  goldengate_duplicate_alb_group_order_ids = toset([
+    for id in local.goldengate_deployment_names : id
+    if local.goldengate_alb_group_order_by_enabled_id[id] != null
+    && length([
+      for other_id in local.goldengate_deployment_names : other_id
+      if local.goldengate_alb_group_order_by_enabled_id[other_id] == local.goldengate_alb_group_order_by_enabled_id[id]
+    ]) > 1
+  ])
 
+  # The sole admin-secret derivation rule: deployment.role alone selects the shared environment-level secret.
   goldengate_admin_secret_names = {
     for id in local.goldengate_deployment_names : id =>
-    try(local.goldengate_enabled_deployments[id].deployment.adminSecret.name, local.goldengate_default_admin_secret_names[id])
+    try(local.goldengate_enabled_deployments[id].deployment.role, "") == "source"
+    ? "${var.environment}/goldengate/source/admin"
+    : "${var.environment}/goldengate/target/admin"
   }
 
-  goldengate_managed_admin_secrets = {
-    for id in local.goldengate_deployment_names : id => local.goldengate_admin_secret_names[id]
-    if local.goldengate_admin_secret_managed[id]
-  }
+  goldengate_tls_secret_name              = "${var.environment}/goldengate/tls-certificate"
+  goldengate_runtime_service_account_name = "gg-runtime-sa"
 
   goldengate_platform_values = yamldecode(file("${path.module}/../../platform/${var.environment}/goldengate-platform/values.yaml"))
   goldengate_monitor_values  = yamldecode(file("${path.module}/goldengate-monitor/values.yaml"))
@@ -89,7 +107,7 @@ locals {
     runtimeNamespace    = try(local.goldengate_platform_values.namespaces.runtime.name, "goldengate-${var.environment}")
     monitoringNamespace = try(local.goldengate_platform_values.fluentBit.namespaces.monitoring, "goldengate-monitoring")
     dnsDomain           = local.goldengate_monitor_host != "" ? trimprefix(local.goldengate_monitor_host, "monitor.") : "goldengate-${var.environment}.adcbmis.local"
-    tlsSecret           = "${var.environment}/goldengate/tls-certificate"
+    tlsSecret           = local.goldengate_tls_secret_name
   }
 }
 
@@ -105,8 +123,8 @@ resource "terraform_data" "goldengate_runtime_contract" {
       error_message = "envs/${var.environment}/${each.key}/values.yaml: deploymentModel must be exactly \"singleRuntime\"."
     }
     precondition {
-      condition     = can(tobool(each.value.deployment.enabled))
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: deployment.enabled must be a literal Boolean."
+      condition     = local.goldengate_enabled_jsonenc[each.key] == "true" || local.goldengate_enabled_jsonenc[each.key] == "false"
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: deployment.enabled must be a literal Boolean, not a Boolean-like string."
     }
     precondition {
       condition     = try(each.value.deployment.pipeline, "") != "" && can(regex("^[a-z][a-z0-9-]*$", each.value.deployment.pipeline))
@@ -138,34 +156,42 @@ resource "terraform_data" "goldengate_runtime_contract" {
       error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.image.tag must be explicit and must not be \"latest\"."
     }
     precondition {
-      condition     = try(each.value.runtime.serviceAccount.name, "") == "gg-runtime-sa"
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.serviceAccount.name must be \"gg-runtime-sa\"."
-    }
-    precondition {
-      condition     = try(each.value.runtime.serviceAccount.create, true) == false
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.serviceAccount.create must be literal false."
-    }
-    precondition {
       condition = (
-        !local.goldengate_admin_secret_declared[each.key]
+        !local.goldengate_service_account_declared[each.key]
         || (
-          local.goldengate_admin_secret_managed_is_bool[each.key]
-          && local.goldengate_admin_secret_name_raw[each.key] != ""
-          && startswith(local.goldengate_admin_secret_name_raw[each.key], "${var.environment}/")
-          && !can(regex("\\.\\.", local.goldengate_admin_secret_name_raw[each.key]))
-          && !startswith(local.goldengate_admin_secret_name_raw[each.key], "/")
-          && !startswith(local.goldengate_admin_secret_name_raw[each.key], "arn:")
-          && (
-            !local.goldengate_admin_secret_managed_bool[each.key]
-            || local.goldengate_admin_secret_name_raw[each.key] == local.goldengate_default_admin_secret_names[each.key]
-          )
+          local.goldengate_service_account_name_raw[each.key] == "gg-runtime-sa"
+          && local.goldengate_service_account_create_jsonenc[each.key] == "false"
         )
       )
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: deployment.adminSecret is malformed, out of environment scope, or managed=true does not use the deterministic deployment-specific secret name."
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.serviceAccount, when present, must be exactly {name: gg-runtime-sa, create: false} (a shared platform invariant, best left omitted)."
+    }
+    precondition {
+      condition     = !local.goldengate_deployment_admin_secret_declared[each.key]
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: deployment.adminSecret is a forbidden override -- the admin secret is derived solely from deployment.role."
+    }
+    precondition {
+      condition     = !local.goldengate_csi_admin_object_name_declared[each.key]
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.csi.admin.objectName is a forbidden override -- it is derived solely from deployment.role."
+    }
+    precondition {
+      condition     = !local.goldengate_csi_certificate_object_name_declared[each.key]
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.csi.certificate.objectName is a forbidden override -- it is a shared platform invariant."
+    }
+    precondition {
+      condition     = !local.goldengate_csi_service_account_role_arn_declared[each.key]
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.csi.serviceAccountRoleArn is a forbidden override -- it is a shared platform invariant."
     }
     precondition {
       condition     = try(each.value.lifecycle, null) == null || contains(["active", "absent"], try(each.value.lifecycle.state, "active"))
       error_message = "envs/${var.environment}/${each.key}/values.yaml: lifecycle.state must be \"active\" or \"absent\" when lifecycle is present."
+    }
+    precondition {
+      condition = (
+        !local.goldengate_replication_declared[each.key]
+        || local.goldengate_replication_enabled_jsonenc[each.key] == "true"
+        || local.goldengate_replication_enabled_jsonenc[each.key] == "false"
+      )
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: replication.enabled must be a literal Boolean, not a Boolean-like string, when replication is present."
     }
     precondition {
       condition     = try(each.value.replication.enabled, false) == false
@@ -176,15 +202,8 @@ resource "terraform_data" "goldengate_runtime_contract" {
       error_message = "envs/${var.environment}/${each.key}/values.yaml: ingress.hostDomain must match the shared DNS domain."
     }
     precondition {
-      condition     = try(each.value.runtime.csi.certificate.objectName, "") == local.goldengate_shared_environment.tlsSecret
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.csi.certificate.objectName must equal the approved shared TLS secret."
-    }
-    precondition {
-      condition = (
-        local.goldengate_csi_admin_object_name_raw[each.key] == null
-        || local.goldengate_csi_admin_object_name_raw[each.key] == local.goldengate_resolved_admin_secret_name[each.key]
-      )
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.csi.admin.objectName does not match the resolved admin-secret name."
+      condition     = !contains(local.goldengate_duplicate_alb_group_order_ids, each.key)
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: ingress.alb.groupOrder duplicates another enabled runtime's ALB group order."
     }
   }
 }
