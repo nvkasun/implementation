@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import re
@@ -18,11 +19,6 @@ APPROVED_ECR_REGION = "eu-west-1"
 FORBIDDEN_IMAGE_TAG = "latest"
 
 IGNORED_NON_RUNTIME_FOLDER_NAMES = ("argocd", "goldengate-monitor")
-
-REPLICATION_DISABLED_MESSAGE = (
-    "Replication bootstrap activation is not available in Phase 6D0. "
-    "Complete the approved database and GoldenGate Admin REST validation phase first."
-)
 
 _TOKEN_RE = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*\Z")
 _MAX_ID_LENGTH = 63
@@ -39,6 +35,107 @@ _CREDENTIAL_KEY_FRAGMENTS = (
     "username", "token", "apikey", "api_key", "dburl", "database_url", "databaseurl",
     "jdbcurl", "jdbc_url",
 )
+
+# Phase 6D1: the only currently approved replication-adapter pipeline shape.
+REPLICATION_SUPPORTED_SOURCE_TYPE = "postgresql"
+REPLICATION_SUPPORTED_TARGET_TYPE = "mssql"
+REPLICATION_SCOPE_MESSAGE = (
+    "replication.enabled=true is only supported for a postgresql source paired with an mssql target."
+)
+REPLICATION_SUPPORTED_PLUGIN_TYPES = ("pgoutput", "test_decoding")
+REPLICATION_SUPPORTED_PROTOCOL = "wss"
+REPLICATION_SUPPORTED_PORT = 443
+REPLICATION_SUPPORTED_REPLICAT_MODE_TYPE = "nonintegrated"
+
+_PROCESS_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_$]{0,7}\Z")
+_TRAIL_NAME_RE = re.compile(r"^[a-z][a-z0-9]\Z")
+_PATH_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,31}\Z")
+_CREDENTIAL_DOMAIN_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,29}\Z")
+_DB_ALIAS_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,29}\Z")
+_TABLE_IDENTIFIER_PART_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\Z")
+_MAX_TABLE_IDENTIFIER_LENGTH = 128
+_FORBIDDEN_IDENTIFIER_FRAGMENTS = (";", "'", '"', "--", "/*", "*/")
+
+_SECRET_NAME_RE = re.compile(r"^[A-Za-z0-9/_.+=@-]+\Z")
+
+
+def _valid_process_name(value):
+    """Extract/Replicat name: uppercase, first char alphabetic, max 8 chars, no whitespace/slash/control chars."""
+    return isinstance(value, str) and bool(_PROCESS_NAME_RE.match(value))
+
+
+def _valid_trail_name(value):
+    """Trail name: exactly two lowercase characters, first alphabetic, second alphanumeric; never auto-normalized."""
+    return isinstance(value, str) and bool(_TRAIL_NAME_RE.match(value))
+
+
+def _valid_path_name(value):
+    """Distribution path name: 1-32 chars, first alphabetic, remainder letters/digits/dash/underscore/period."""
+    return isinstance(value, str) and bool(_PATH_NAME_RE.match(value))
+
+
+def _valid_credential_domain(value):
+    return isinstance(value, str) and bool(_CREDENTIAL_DOMAIN_RE.match(value))
+
+
+def _valid_derived_alias(value):
+    return isinstance(value, str) and bool(_DB_ALIAS_RE.match(value))
+
+
+def _valid_table_identifier(value, allow_wildcard=True):
+    """schema.table or schema.* only; rejects semicolons, quotes, comment markers, control characters."""
+    if not isinstance(value, str) or not value:
+        return False
+    if len(value) > _MAX_TABLE_IDENTIFIER_LENGTH:
+        return False
+    if any(ord(c) < 0x20 for c in value):
+        return False
+    if any(fragment in value for fragment in _FORBIDDEN_IDENTIFIER_FRAGMENTS):
+        return False
+    parts = value.split(".")
+    if len(parts) != 2:
+        return False
+    schema, table = parts
+    if not _TABLE_IDENTIFIER_PART_RE.match(schema):
+        return False
+    if table == "*":
+        return allow_wildcard
+    return bool(_TABLE_IDENTIFIER_PART_RE.match(table))
+
+
+def _valid_database_credential_secret(value, environment):
+    """dev/goldengate/... shared-secret-style reference only; never an ARN, traversal, or whitespace/control char."""
+    if not isinstance(value, str) or not value:
+        return False
+    if not value.startswith(f"{environment}/goldengate/"):
+        return False
+    if ".." in value:
+        return False
+    if any(ch.isspace() for ch in value):
+        return False
+    if any(ord(c) < 0x20 for c in value):
+        return False
+    if value.startswith("arn:"):
+        return False
+    return bool(_SECRET_NAME_RE.match(value))
+
+
+def derive_database_credential_alias(deployment_id):
+    """Deterministic, collision-tested-by-caller Oracle credential alias; never derived from or containing the DB username."""
+    normalized = re.sub(r"[^A-Za-z0-9]", "_", deployment_id).upper()
+    digest = hashlib.sha256(deployment_id.encode()).hexdigest()[:6].upper()
+    suffix = f"_{digest}"
+    prefix = normalized[: 30 - len(suffix)]
+    if not prefix or not prefix[0].isalpha():
+        prefix = "D" + prefix[: 30 - len(suffix) - 1]
+    return f"{prefix}{suffix}"
+
+
+def derive_network_credential_alias(source_deployment_id, target_deployment_id):
+    """Deterministic Network-domain credential alias derived from the source/target deployment ID pair."""
+    combined = f"{source_deployment_id}:{target_deployment_id}"
+    digest = hashlib.sha256(combined.encode()).hexdigest()[:12].upper()
+    return f"NET_{digest}"
 
 
 def resolve_admin_secret(environment, role):
@@ -174,7 +271,198 @@ def _reject_forbidden_overrides(doc):
         raise DescriptorError("forbidden override: runtime.csi.certificate.objectName is a shared platform invariant and must not be set")
 
 
-def _parse_replication(deployment_id, doc):
+def _parse_supplemental_logging(block):
+    if block is None:
+        return {"enabled": False, "mode": "none", "objects": []}
+    _require_dict(block, "invalid replication configuration: replication.supplementalLogging must be a mapping")
+    enabled = block.get("enabled", False)
+    if not _is_literal_bool(enabled):
+        raise DescriptorError("invalid replication configuration: replication.supplementalLogging.enabled must be a literal Boolean")
+    mode = block.get("mode", "none")
+    if mode not in ("table", "none"):
+        raise DescriptorError("invalid replication configuration: replication.supplementalLogging.mode must be \"table\" or \"none\"")
+    objects = block.get("objects", [])
+    if not isinstance(objects, list):
+        raise DescriptorError("invalid replication configuration: replication.supplementalLogging.objects must be a list")
+    for obj in objects:
+        if not _valid_table_identifier(obj, allow_wildcard=False):
+            raise DescriptorError("invalid replication configuration: replication.supplementalLogging.objects entry is not a safe schema.table identifier")
+    if enabled and (mode != "table" or not objects):
+        raise DescriptorError("invalid replication configuration: replication.supplementalLogging.enabled=true requires mode=table and a non-empty objects list")
+    return {"enabled": enabled, "mode": mode, "objects": list(objects)}
+
+
+def _parse_trail(block, field_name):
+    _require_dict(block, f"invalid replication configuration: {field_name} must be a mapping")
+    name = block.get("name")
+    if not _valid_trail_name(name):
+        raise DescriptorError(f"invalid replication configuration: {field_name}.name must be a safe two-character lowercase trail name")
+    size_mb = block.get("sizeMB")
+    if not isinstance(size_mb, int) or isinstance(size_mb, bool) or size_mb <= 0:
+        raise DescriptorError(f"invalid replication configuration: {field_name}.sizeMB must be a positive integer")
+    subdirectory = block.get("subdirectory", "")
+    if not isinstance(subdirectory, str):
+        raise DescriptorError(f"invalid replication configuration: {field_name}.subdirectory must be a string")
+    return {"name": name, "sizeMB": size_mb, "subdirectory": subdirectory}
+
+
+def _parse_extract(block):
+    if block is None:
+        block = {}
+    _require_dict(block, "invalid replication configuration: replication.extract must be a mapping")
+    enabled = block.get("enabled", False)
+    if not _is_literal_bool(enabled):
+        raise DescriptorError("invalid replication configuration: replication.extract.enabled must be a literal Boolean")
+    if not enabled:
+        return {"enabled": False}
+
+    name = block.get("name")
+    if not _valid_process_name(name):
+        raise DescriptorError("invalid replication configuration: replication.extract.name must be a valid Extract name")
+    description = block.get("description", "")
+    if not isinstance(description, str):
+        raise DescriptorError("invalid replication configuration: replication.extract.description must be a string")
+    plugin_type = block.get("pluginType")
+    if plugin_type not in REPLICATION_SUPPORTED_PLUGIN_TYPES:
+        raise DescriptorError("invalid replication configuration: replication.extract.pluginType must be explicitly set to \"pgoutput\" or \"test_decoding\"")
+    begin = block.get("begin")
+    if not isinstance(begin, str) or not begin:
+        raise DescriptorError("invalid replication configuration: replication.extract.begin must be a non-empty string")
+    trail = _parse_trail(block.get("trail") or {}, "replication.extract.trail")
+    tables = block.get("tables")
+    if not isinstance(tables, list) or not tables:
+        raise DescriptorError("invalid replication configuration: replication.extract.tables must be a non-empty list")
+    for table in tables:
+        if not _valid_table_identifier(table):
+            raise DescriptorError("invalid replication configuration: replication.extract.tables entry is not a safe schema.table identifier")
+    start_on_create = block.get("startOnCreate", False)
+    if not _is_literal_bool(start_on_create):
+        raise DescriptorError("invalid replication configuration: replication.extract.startOnCreate must be a literal Boolean")
+
+    return {
+        "enabled": True, "name": name, "description": description, "pluginType": plugin_type,
+        "begin": begin, "trail": trail, "tables": list(tables), "startOnCreate": start_on_create,
+    }
+
+
+def _parse_distribution(block):
+    if block is None:
+        block = {}
+    _require_dict(block, "invalid replication configuration: replication.distribution must be a mapping")
+    enabled = block.get("enabled", False)
+    if not _is_literal_bool(enabled):
+        raise DescriptorError("invalid replication configuration: replication.distribution.enabled must be a literal Boolean")
+    if not enabled:
+        return {"enabled": False}
+
+    path_name = block.get("pathName")
+    if not _valid_path_name(path_name):
+        raise DescriptorError("invalid replication configuration: replication.distribution.pathName must be a valid path name")
+    target_deployment = block.get("targetDeployment")
+    if not _safe_token(target_deployment, _MAX_ID_LENGTH):
+        raise DescriptorError("invalid replication configuration: replication.distribution.targetDeployment must be a safe deployment ID")
+    source_trail_name = block.get("sourceTrailName")
+    if not _valid_trail_name(source_trail_name):
+        raise DescriptorError("invalid replication configuration: replication.distribution.sourceTrailName must be a valid trail name")
+    target_trail_name = block.get("targetTrailName")
+    if not _valid_trail_name(target_trail_name):
+        raise DescriptorError("invalid replication configuration: replication.distribution.targetTrailName must be a valid trail name")
+    if source_trail_name == target_trail_name:
+        raise DescriptorError("invalid replication configuration: replication.distribution.sourceTrailName and targetTrailName must not collide")
+    protocol = block.get("protocol")
+    if protocol != REPLICATION_SUPPORTED_PROTOCOL:
+        raise DescriptorError("invalid replication configuration: replication.distribution.protocol must be \"wss\"")
+    port = block.get("port")
+    if port != REPLICATION_SUPPORTED_PORT:
+        raise DescriptorError("invalid replication configuration: replication.distribution.port must be 443")
+    start_on_create = block.get("startOnCreate", False)
+    if not _is_literal_bool(start_on_create):
+        raise DescriptorError("invalid replication configuration: replication.distribution.startOnCreate must be a literal Boolean")
+
+    return {
+        "enabled": True, "pathName": path_name, "targetDeployment": target_deployment,
+        "sourceTrailName": source_trail_name, "targetTrailName": target_trail_name,
+        "protocol": protocol, "port": port, "startOnCreate": start_on_create,
+    }
+
+
+def _parse_checkpoint(block):
+    if block is None:
+        block = {}
+    _require_dict(block, "invalid replication configuration: replication.checkpoint must be a mapping")
+    enabled = block.get("enabled", False)
+    if not _is_literal_bool(enabled):
+        raise DescriptorError("invalid replication configuration: replication.checkpoint.enabled must be a literal Boolean")
+    if not enabled:
+        return {"enabled": False}
+
+    table = block.get("table")
+    if not _valid_table_identifier(table, allow_wildcard=False):
+        raise DescriptorError("invalid replication configuration: replication.checkpoint.table must be a safe schema.table identifier")
+    create_if_missing = block.get("createIfMissing", False)
+    if not _is_literal_bool(create_if_missing):
+        raise DescriptorError("invalid replication configuration: replication.checkpoint.createIfMissing must be a literal Boolean")
+
+    return {"enabled": True, "table": table, "createIfMissing": create_if_missing}
+
+
+def _parse_replicat(block):
+    if block is None:
+        block = {}
+    _require_dict(block, "invalid replication configuration: replication.replicat must be a mapping")
+    enabled = block.get("enabled", False)
+    if not _is_literal_bool(enabled):
+        raise DescriptorError("invalid replication configuration: replication.replicat.enabled must be a literal Boolean")
+    if not enabled:
+        return {"enabled": False}
+
+    name = block.get("name")
+    if not _valid_process_name(name):
+        raise DescriptorError("invalid replication configuration: replication.replicat.name must be a valid Replicat name")
+    description = block.get("description", "")
+    if not isinstance(description, str):
+        raise DescriptorError("invalid replication configuration: replication.replicat.description must be a string")
+    source_trail_name = block.get("sourceTrailName")
+    if not _valid_trail_name(source_trail_name):
+        raise DescriptorError("invalid replication configuration: replication.replicat.sourceTrailName must be a valid trail name")
+    begin = block.get("begin")
+    if not isinstance(begin, str) or not begin:
+        raise DescriptorError("invalid replication configuration: replication.replicat.begin must be a non-empty string")
+
+    mode = _require_dict(block.get("mode"), "invalid replication configuration: replication.replicat.mode must be a mapping")
+    mode_type = mode.get("type")
+    if mode_type != REPLICATION_SUPPORTED_REPLICAT_MODE_TYPE:
+        raise DescriptorError("invalid replication configuration: replication.replicat.mode.type must be \"nonintegrated\"")
+    parallel = mode.get("parallel", False)
+    if parallel is not False:
+        raise DescriptorError("invalid replication configuration: replication.replicat.mode.parallel must be the literal false")
+
+    mappings = block.get("mappings")
+    if not isinstance(mappings, list) or not mappings:
+        raise DescriptorError("invalid replication configuration: replication.replicat.mappings must be a non-empty list")
+    normalized_mappings = []
+    for mapping in mappings:
+        _require_dict(mapping, "invalid replication configuration: replication.replicat.mappings entry must be a mapping")
+        source = mapping.get("source")
+        target = mapping.get("target")
+        if not _valid_table_identifier(source, allow_wildcard=False):
+            raise DescriptorError("invalid replication configuration: replication.replicat.mappings source is not a safe schema.table identifier")
+        if not _valid_table_identifier(target, allow_wildcard=False):
+            raise DescriptorError("invalid replication configuration: replication.replicat.mappings target is not a safe schema.table identifier")
+        normalized_mappings.append({"source": source, "target": target})
+    start_on_create = block.get("startOnCreate", False)
+    if not _is_literal_bool(start_on_create):
+        raise DescriptorError("invalid replication configuration: replication.replicat.startOnCreate must be a literal Boolean")
+
+    return {
+        "enabled": True, "name": name, "description": description, "sourceTrailName": source_trail_name,
+        "begin": begin, "mode": {"type": mode_type, "parallel": False},
+        "mappings": normalized_mappings, "startOnCreate": start_on_create,
+    }
+
+
+def _parse_replication(deployment_id, environment, role, deployment_type, doc):
+    """Full Phase 6D1 replication schema; a disabled or absent block always normalizes to {"enabled": False}."""
     replication = doc.get("replication")
     if replication is None:
         return {"enabled": False}
@@ -182,12 +470,47 @@ def _parse_replication(deployment_id, doc):
     enabled = replication.get("enabled", False)
     if not _is_literal_bool(enabled):
         raise DescriptorError("invalid replication configuration: replication.enabled must be a literal Boolean")
+    if not enabled:
+        return {"enabled": False}
+
+    if role == "source" and deployment_type != REPLICATION_SUPPORTED_SOURCE_TYPE:
+        raise DescriptorError(f"unsupported replication scope: {REPLICATION_SCOPE_MESSAGE}")
+    if role == "target" and deployment_type != REPLICATION_SUPPORTED_TARGET_TYPE:
+        raise DescriptorError(f"unsupported replication scope: {REPLICATION_SCOPE_MESSAGE}")
+
     if _contains_credential_like_key(replication):
         raise DescriptorError("embedded credentials found under replication")
-    db_secret = replication.get("databaseCredentialSecret", "")
-    if db_secret and not isinstance(db_secret, str):
-        raise DescriptorError("invalid replication configuration: databaseCredentialSecret must be a string")
-    return {"enabled": enabled}
+
+    db_secret = replication.get("databaseCredentialSecret")
+    if not _valid_database_credential_secret(db_secret, environment):
+        raise DescriptorError("invalid replication configuration: replication.databaseCredentialSecret must be a safe, environment-scoped dev/goldengate/... secret name")
+
+    db_credential = _require_dict(replication.get("databaseCredential"), "invalid replication configuration: replication.databaseCredential must be a mapping")
+    domain = db_credential.get("domain")
+    if not _valid_credential_domain(domain):
+        raise DescriptorError("invalid replication configuration: replication.databaseCredential.domain must be a safe Oracle credential-domain token")
+
+    supplemental_logging = _parse_supplemental_logging(replication.get("supplementalLogging"))
+    extract = _parse_extract(replication.get("extract"))
+    distribution = _parse_distribution(replication.get("distribution"))
+    checkpoint = _parse_checkpoint(replication.get("checkpoint"))
+    replicat = _parse_replicat(replication.get("replicat"))
+
+    database_alias = derive_database_credential_alias(deployment_id)
+    if not _valid_derived_alias(database_alias):
+        raise DescriptorError("internal error: derived database credential alias is not valid")
+
+    return {
+        "enabled": True,
+        "databaseCredentialSecret": db_secret,
+        "databaseCredential": {"domain": domain},
+        "databaseCredentialAlias": database_alias,
+        "supplementalLogging": supplemental_logging,
+        "extract": extract,
+        "distribution": distribution,
+        "checkpoint": checkpoint,
+        "replicat": replicat,
+    }
 
 
 def _parse_lifecycle(doc):
@@ -256,7 +579,7 @@ def parse_descriptor(deployment_id, environment, doc, shared=None):
     admin_secret_name = resolve_admin_secret(environment, role)
     tls_secret_name = resolve_tls_secret(environment)
     _parse_csi_structure(runtime)
-    replication = _parse_replication(deployment_id, doc)
+    replication = _parse_replication(deployment_id, environment, role, deployment_type, doc)
     lifecycle_state = _parse_lifecycle(doc)
     efs = _parse_efs(doc)
 
@@ -299,6 +622,7 @@ def parse_descriptor(deployment_id, environment, doc, shared=None):
         "pvcClaimName": efs["pvcClaimName"],
         "albGroupOrder": alb_group_order,
         "replicationEnabled": replication["enabled"],
+        "replication": replication,
     }
 
 
@@ -349,6 +673,79 @@ def scan(environment):
     return active, inactive, invalid
 
 
+def _validate_replication_pipelines(active):
+    """Task 4: full cross-runtime pipeline contract for every pipeline with at least one replication-enabled member."""
+    problems = []
+    by_pipeline = {}
+    for d in active:
+        by_pipeline.setdefault(d["pipeline"], []).append(d)
+
+    for pipeline, members in sorted(by_pipeline.items()):
+        if not any(d["replicationEnabled"] for d in members):
+            continue
+
+        sources = [d for d in members if d["role"] == "source"]
+        targets = [d for d in members if d["role"] == "target"]
+        if len(sources) != 1:
+            problems.append(f"pipeline {pipeline!r}: replication requires exactly one active source deployment")
+            continue
+        if len(targets) != 1:
+            problems.append(f"pipeline {pipeline!r}: replication requires exactly one active target deployment")
+            continue
+
+        source, target = sources[0], targets[0]
+        if not source["replicationEnabled"] or not target["replicationEnabled"]:
+            problems.append(f"pipeline {pipeline!r}: both the source and target deployment must have replication.enabled=true")
+            continue
+
+        if source["deploymentType"] != REPLICATION_SUPPORTED_SOURCE_TYPE or target["deploymentType"] != REPLICATION_SUPPORTED_TARGET_TYPE:
+            problems.append(f"pipeline {pipeline!r}: {REPLICATION_SCOPE_MESSAGE}")
+            continue
+
+        src_repl, tgt_repl = source["replication"], target["replication"]
+        role_problems = []
+        if not src_repl["extract"]["enabled"]:
+            role_problems.append(f"pipeline {pipeline!r}: source deployment must have replication.extract.enabled=true")
+        if not src_repl["distribution"]["enabled"]:
+            role_problems.append(f"pipeline {pipeline!r}: source deployment must have replication.distribution.enabled=true")
+        if src_repl["replicat"]["enabled"]:
+            role_problems.append(f"pipeline {pipeline!r}: source deployment must have replication.replicat.enabled=false")
+        if src_repl["checkpoint"]["enabled"]:
+            role_problems.append(f"pipeline {pipeline!r}: source deployment must have replication.checkpoint.enabled=false")
+        if tgt_repl["extract"]["enabled"]:
+            role_problems.append(f"pipeline {pipeline!r}: target deployment must have replication.extract.enabled=false")
+        if tgt_repl["distribution"]["enabled"]:
+            role_problems.append(f"pipeline {pipeline!r}: target deployment must have replication.distribution.enabled=false")
+        if not tgt_repl["checkpoint"]["enabled"]:
+            role_problems.append(f"pipeline {pipeline!r}: target deployment must have replication.checkpoint.enabled=true")
+        if not tgt_repl["replicat"]["enabled"]:
+            role_problems.append(f"pipeline {pipeline!r}: target deployment must have replication.replicat.enabled=true")
+        problems.extend(role_problems)
+        if role_problems:
+            continue
+
+        extract, distribution = src_repl["extract"], src_repl["distribution"]
+        checkpoint, replicat = tgt_repl["checkpoint"], tgt_repl["replicat"]
+
+        if distribution["targetDeployment"] != target["deploymentId"]:
+            problems.append(f"pipeline {pipeline!r}: replication.distribution.targetDeployment must equal the target deployment ID")
+        if distribution["sourceTrailName"] != extract["trail"]["name"]:
+            problems.append(f"pipeline {pipeline!r}: replication.distribution.sourceTrailName must equal replication.extract.trail.name")
+        if distribution["targetTrailName"] != replicat["sourceTrailName"]:
+            problems.append(f"pipeline {pipeline!r}: replication.distribution.targetTrailName must equal the target replication.replicat.sourceTrailName")
+
+        extract_tables = set(extract["tables"])
+        supplemental_objects = set(src_repl["supplementalLogging"]["objects"])
+        if extract_tables - supplemental_objects:
+            problems.append(f"pipeline {pipeline!r}: replication.supplementalLogging.objects does not cover every replication.extract.tables entry")
+
+        mapping_sources = {m["source"] for m in replicat["mappings"]}
+        if mapping_sources - extract_tables:
+            problems.append(f"pipeline {pipeline!r}: every replication.replicat.mappings source must exist in the source replication.extract.tables inventory")
+
+    return problems
+
+
 def validate(environment):
     """Cross-descriptor structural validation; returns a list of fixed-reason problem strings (empty if none)."""
     active, inactive, invalid = scan(environment)
@@ -361,9 +758,16 @@ def validate(environment):
             problems.append(f"duplicate deployment ID: {d['deploymentId']}")
         seen_ids.add(d["deploymentId"])
 
-    for d in all_valid:
-        if d["replicationEnabled"]:
-            problems.append(f"{d['deploymentId']}: {REPLICATION_DISABLED_MESSAGE}")
+    problems.extend(_validate_replication_pipelines(active))
+
+    alias_owners = {}
+    for d in active:
+        if not d["replicationEnabled"]:
+            continue
+        alias = d["replication"]["databaseCredentialAlias"]
+        if alias in alias_owners and alias_owners[alias] != d["deploymentId"]:
+            problems.append(f"derived database credential alias collision between {alias_owners[alias]!r} and {d['deploymentId']!r}")
+        alias_owners[alias] = d["deploymentId"]
 
     roles_by_pipeline = {}
     alb_orders_seen = {}
@@ -532,6 +936,104 @@ def cmd_runtime_identities(args):
     return 0
 
 
+def replication_pipeline_ids(active):
+    """Sorted pipeline IDs where an active source and an active target both have replication.enabled=true."""
+    by_pipeline = {}
+    for d in active:
+        by_pipeline.setdefault(d["pipeline"], []).append(d)
+    result = []
+    for pipeline, members in sorted(by_pipeline.items()):
+        if (len(members) == 2 and {m["role"] for m in members} == {"source", "target"}
+                and all(m["replicationEnabled"] for m in members)):
+            result.append(pipeline)
+    return result
+
+
+def find_replication_pipeline(active, pipeline_id):
+    members = [d for d in active if d["pipeline"] == pipeline_id]
+    source = next((d for d in members if d["role"] == "source"), None)
+    target = next((d for d in members if d["role"] == "target"), None)
+    return source, target
+
+
+def build_replication_plan(source, target):
+    """Sanitized desired-state plan for one replication pipeline; contains no username, password, or secret value."""
+    dns_domain = source["ingressHost"]
+    src_repl, tgt_repl = source["replication"], target["replication"]
+
+    return {
+        "pipelineId": source["pipeline"],
+        "tlsSecret": source["tlsSecretName"],
+        "source": {
+            "deploymentId": source["deploymentId"],
+            "deploymentType": source["deploymentType"],
+            "runtimeHost": f"{source['deploymentId']}.{dns_domain}",
+            "serviceAccount": source["runtimeServiceAccountName"],
+            "image": f"{source['imageRepository']}:{source['imageTag']}",
+            "adminSecret": source["adminSecretName"],
+            "databaseSecret": src_repl["databaseCredentialSecret"],
+            "databaseCredentialAlias": src_repl["databaseCredentialAlias"],
+            "databaseCredentialDomain": src_repl["databaseCredential"]["domain"],
+        },
+        "target": {
+            "deploymentId": target["deploymentId"],
+            "deploymentType": target["deploymentType"],
+            "runtimeHost": f"{target['deploymentId']}.{dns_domain}",
+            "serviceAccount": target["runtimeServiceAccountName"],
+            "image": f"{target['imageRepository']}:{target['imageTag']}",
+            "adminSecret": target["adminSecretName"],
+            "databaseSecret": tgt_repl["databaseCredentialSecret"],
+            "databaseCredentialAlias": tgt_repl["databaseCredentialAlias"],
+            "databaseCredentialDomain": tgt_repl["databaseCredential"]["domain"],
+        },
+        "networkCredentialAlias": derive_network_credential_alias(source["deploymentId"], target["deploymentId"]),
+        "networkCredentialDomain": "Network",
+        "supplementalLogging": src_repl["supplementalLogging"],
+        "extract": src_repl["extract"],
+        "distribution": src_repl["distribution"],
+        "checkpoint": tgt_repl["checkpoint"],
+        "replicat": tgt_repl["replicat"],
+        "receiver": {
+            "targetDeployment": target["deploymentId"],
+            "expectedTrail": tgt_repl["replicat"]["sourceTrailName"],
+        },
+    }
+
+
+def cmd_replication_pipelines(args):
+    active, _inactive, invalid, problems = _run_full_validation(args.environment)
+    if invalid or problems:
+        _print_reasons(invalid)
+        _print_problems(problems)
+        print("FAIL: refusing to list replication pipelines while validation problems exist")
+        return 1
+    for pipeline_id in replication_pipeline_ids(active):
+        print(pipeline_id)
+    return 0
+
+
+def cmd_replication_plan(args):
+    active, _inactive, invalid, problems = _run_full_validation(args.environment)
+    if invalid or problems:
+        _print_reasons(invalid)
+        _print_problems(problems)
+        print("FAIL: refusing to build a replication plan while validation problems exist")
+        return 1
+    if args.pipeline_id not in replication_pipeline_ids(active):
+        print(f"FAIL: {args.pipeline_id!r} is not an enabled replication pipeline")
+        return 1
+    source, target = find_replication_pipeline(active, args.pipeline_id)
+    plan = build_replication_plan(source, target)
+    text = json.dumps(plan, indent=2, sort_keys=True)
+    if args.output:
+        os.makedirs(os.path.dirname(args.output), exist_ok=True)
+        with open(args.output, "w") as f:
+            f.write(text)
+    else:
+        print(text)
+    return 0
+
+
 def cmd_shared_secrets(args):
     """The three fixed environment-level secret identifiers only, never values; independent of which deployments exist."""
     _active, _inactive, invalid, problems = _run_full_validation(args.environment)
@@ -565,6 +1067,13 @@ def main(argv=None):
     sub.add_parser("shared-secrets").set_defaults(func=cmd_shared_secrets)
 
     sub.add_parser("runtime-identities").set_defaults(func=cmd_runtime_identities)
+
+    sub.add_parser("replication-pipelines").set_defaults(func=cmd_replication_pipelines)
+
+    replication_plan_parser = sub.add_parser("replication-plan")
+    replication_plan_parser.add_argument("pipeline_id")
+    replication_plan_parser.add_argument("--output", default=None)
+    replication_plan_parser.set_defaults(func=cmd_replication_plan)
 
     args = parser.parse_args(argv)
     return args.func(args)

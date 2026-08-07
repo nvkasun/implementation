@@ -1,11 +1,14 @@
 """Offline tests for hack/goldengate-deployment-model.py; run directly via `python3 hack/test-goldengate-deployment-model.py`."""
 from __future__ import annotations
 
+import copy
 import importlib.util
 import os
 import sys
 import tempfile
 import unittest
+
+import yaml
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL_PATH = os.path.join(REPO_ROOT, "hack", "goldengate-deployment-model.py")
@@ -101,6 +104,91 @@ def write_descriptor(root, environment, deployment_id, enabled=True, pipeline="t
     return path
 
 
+def default_source_doc(environment, pipeline, target_id):
+    return {
+        "deployment": {"enabled": True, "pipeline": pipeline, "role": "source"},
+        "global": {"environment": environment},
+        "deploymentModel": "singleRuntime",
+        "runtime": {
+            "deploymentType": "postgresql",
+            "containerName": "ogg-postgresql",
+            "image": {"repository": "229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-postgresql", "tag": "23.26.2.0.1"},
+            "csi": {"enabled": True, "admin": {"enabled": True}, "certificate": {"enabled": True}},
+        },
+        "ingress": {"hostDomain": f"goldengate-{environment}.adcbmis.local"},
+        "replication": {
+            "enabled": True,
+            "databaseCredentialSecret": f"{environment}/goldengate/databases/{pipeline}/source",
+            "databaseCredential": {"domain": "OracleGoldenGate"},
+            "supplementalLogging": {"enabled": True, "mode": "table", "objects": ["public.payments"]},
+            "extract": {
+                "enabled": True, "name": "PGSRC01", "description": "source extract",
+                "pluginType": "pgoutput", "begin": "now",
+                "trail": {"name": "pa", "sizeMB": 500, "subdirectory": ""},
+                "tables": ["public.payments"], "startOnCreate": True,
+            },
+            "distribution": {
+                "enabled": True, "pathName": "PG2MS01", "targetDeployment": target_id,
+                "sourceTrailName": "pa", "targetTrailName": "ma",
+                "protocol": "wss", "port": 443, "startOnCreate": True,
+            },
+            "checkpoint": {"enabled": False},
+            "replicat": {"enabled": False},
+        },
+    }
+
+
+def default_target_doc(environment, pipeline):
+    return {
+        "deployment": {"enabled": True, "pipeline": pipeline, "role": "target"},
+        "global": {"environment": environment},
+        "deploymentModel": "singleRuntime",
+        "runtime": {
+            "deploymentType": "mssql",
+            "containerName": "ogg-sqlserver",
+            "image": {"repository": "229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-sqlserver", "tag": "23.26.2.0.1"},
+            "csi": {"enabled": True, "admin": {"enabled": True}, "certificate": {"enabled": True}},
+        },
+        "ingress": {"hostDomain": f"goldengate-{environment}.adcbmis.local"},
+        "replication": {
+            "enabled": True,
+            "databaseCredentialSecret": f"{environment}/goldengate/databases/{pipeline}/target",
+            "databaseCredential": {"domain": "OracleGoldenGate"},
+            "supplementalLogging": {"enabled": False, "mode": "none", "objects": []},
+            "extract": {"enabled": False},
+            "distribution": {"enabled": False},
+            "checkpoint": {"enabled": True, "table": "dbo.gg_checkpoint", "createIfMissing": True},
+            "replicat": {
+                "enabled": True, "name": "MSTGT01", "description": "target replicat",
+                "sourceTrailName": "ma", "begin": "now",
+                "mode": {"type": "nonintegrated", "parallel": False},
+                "mappings": [{"source": "public.payments", "target": "dbo.payments"}],
+                "startOnCreate": True,
+            },
+        },
+    }
+
+
+def write_doc(root, environment, deployment_id, doc):
+    folder = os.path.join(root, "envs", environment, deployment_id)
+    os.makedirs(folder, exist_ok=True)
+    with open(os.path.join(folder, "values.yaml"), "w") as f:
+        yaml.safe_dump(doc, f)
+
+
+def write_default_pipeline(root, environment="dev", pipeline="payments-pg-to-mssql-001",
+                           source_id="gg-pg-src-fixture-01", target_id="gg-mssql-tgt-fixture-01",
+                           source_doc=None, target_doc=None, omit_source=False, omit_target=False):
+    """Writes a complete valid PostgreSQL->MSSQL pipeline; callers mutate a deep copy for negative-path tests."""
+    source_doc = source_doc if source_doc is not None else default_source_doc(environment, pipeline, target_id)
+    target_doc = target_doc if target_doc is not None else default_target_doc(environment, pipeline)
+    if not omit_source:
+        write_doc(root, environment, source_id, source_doc)
+    if not omit_target:
+        write_doc(root, environment, target_id, target_doc)
+    return source_id, target_id
+
+
 class ScratchEnvironmentTestCase(unittest.TestCase):
     """Base class: points gdm.REPO_ROOT at an isolated temp directory for the duration of each test."""
 
@@ -160,6 +248,20 @@ class RealRepositoryDescriptorTests(unittest.TestCase):
         active, _inactive, _invalid = gdm.scan("dev")
         for d in active:
             self.assertNotEqual(d["runtimeServiceAccountName"], "gg-runtime-sa")
+
+    def test_replication_1_existing_oracle_disabled_replication_remains_valid(self):
+        active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        by_id = {d["deploymentId"]: d for d in active}
+        self.assertIn("gg-oracle-payments-01", by_id)
+        self.assertFalse(by_id["gg-oracle-payments-01"]["replicationEnabled"])
+
+    def test_replication_2_existing_postgresql_disabled_replication_remains_valid(self):
+        active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        by_id = {d["deploymentId"]: d for d in active}
+        self.assertIn("gg-postgresql-payments-01", by_id)
+        self.assertFalse(by_id["gg-postgresql-payments-01"]["replicationEnabled"])
 
 
 class GenericDeploymentTypeTests(ScratchEnvironmentTestCase):
@@ -726,7 +828,7 @@ class FailClosedTests(ScratchEnvironmentTestCase):
 
 
 class ReplicationSchemaTests(ScratchEnvironmentTestCase):
-    """The Phase 6D0 replication bootstrap gate."""
+    """Task 23 items 1-28: the Phase 6D1 replication contract."""
 
     def test_replication_enabled_false_passes(self):
         write_descriptor(self._tmp.name, "dev", "gg-repl-off-fixture-01",
@@ -734,11 +836,231 @@ class ReplicationSchemaTests(ScratchEnvironmentTestCase):
         problems = gdm.validate("dev")
         self.assertEqual(problems, [])
 
-    def test_replication_enabled_true_fails_with_fixed_message(self):
-        write_descriptor(self._tmp.name, "dev", "gg-repl-on-fixture-01",
-                         extra="\nreplication:\n  enabled: true\n")
+    def test_3_synthetic_postgresql_source_descriptor_is_valid(self):
+        write_default_pipeline(self._tmp.name)
         problems = gdm.validate("dev")
-        self.assertTrue(any(gdm.REPLICATION_DISABLED_MESSAGE in p for p in problems))
+        self.assertEqual(problems, [])
+
+    def test_4_synthetic_mssql_target_descriptor_is_valid(self):
+        source_id, target_id = write_default_pipeline(self._tmp.name)
+        active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        by_id = {d["deploymentId"]: d for d in active}
+        self.assertEqual(by_id[target_id]["deploymentType"], "mssql")
+
+    def test_5_complete_pipeline_is_valid(self):
+        write_default_pipeline(self._tmp.name)
+        problems = gdm.validate("dev")
+        self.assertEqual(problems, [])
+        active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        self.assertEqual(len(active), 2)
+
+    def test_6_missing_source_fails(self):
+        write_default_pipeline(self._tmp.name, omit_source=True)
+        problems = gdm.validate("dev")
+        self.assertTrue(any("exactly one active source" in p for p in problems))
+
+    def test_7_missing_target_fails(self):
+        write_default_pipeline(self._tmp.name, omit_target=True)
+        problems = gdm.validate("dev")
+        self.assertTrue(any("exactly one active target" in p for p in problems))
+
+    def test_8_both_source_and_target_roles_required(self):
+        write_default_pipeline(self._tmp.name, omit_source=True)
+        problems = gdm.validate("dev")
+        self.assertTrue(problems)
+
+    def test_9_unsupported_source_type_fails(self):
+        doc = default_source_doc("dev", "payments-pg-to-mssql-001", "gg-mssql-tgt-fixture-01")
+        doc["runtime"]["deploymentType"] = "oracle"
+        write_default_pipeline(self._tmp.name, source_doc=doc)
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertTrue(any("unsupported replication scope" in reason for _path, reason in invalid))
+
+    def test_10_unsupported_target_type_fails(self):
+        doc = default_target_doc("dev", "payments-pg-to-mssql-001")
+        doc["runtime"]["deploymentType"] = "postgresql"
+        write_default_pipeline(self._tmp.name, target_doc=doc)
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertTrue(any("unsupported replication scope" in reason for _path, reason in invalid))
+
+    def test_11_source_target_deployment_mismatch_fails(self):
+        doc = default_source_doc("dev", "payments-pg-to-mssql-001", "gg-mssql-tgt-fixture-01")
+        doc["replication"]["distribution"]["targetDeployment"] = "gg-wrong-target-01"
+        write_default_pipeline(self._tmp.name, source_doc=doc)
+        problems = gdm.validate("dev")
+        self.assertTrue(any("targetDeployment must equal" in p for p in problems))
+
+    def test_12_source_target_trail_mismatch_fails(self):
+        doc = default_target_doc("dev", "payments-pg-to-mssql-001")
+        doc["replication"]["replicat"]["sourceTrailName"] = "mx"
+        write_default_pipeline(self._tmp.name, target_doc=doc)
+        problems = gdm.validate("dev")
+        self.assertTrue(any("targetTrailName must equal" in p for p in problems))
+
+    def test_13_duplicate_source_fails(self):
+        write_default_pipeline(self._tmp.name)
+        extra_source = default_source_doc("dev", "payments-pg-to-mssql-001", "gg-mssql-tgt-fixture-01")
+        write_doc(self._tmp.name, "dev", "gg-pg-src-fixture-02", extra_source)
+        problems = gdm.validate("dev")
+        self.assertTrue(any("more than one source" in p or "exactly one active source" in p for p in problems))
+
+    def test_14_duplicate_target_fails(self):
+        write_default_pipeline(self._tmp.name)
+        extra_target = default_target_doc("dev", "payments-pg-to-mssql-001")
+        write_doc(self._tmp.name, "dev", "gg-mssql-tgt-fixture-02", extra_target)
+        problems = gdm.validate("dev")
+        self.assertTrue(any("more than one target" in p or "exactly one active target" in p for p in problems))
+
+    def test_15_replication_enabled_string_fails(self):
+        write_descriptor(self._tmp.name, "dev", "gg-repl-bad-bool-01",
+                         extra='\nreplication:\n  enabled: "true"\n')
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertTrue(any("literal Boolean" in reason for _path, reason in invalid))
+
+    def test_16_start_on_create_string_fails(self):
+        doc = default_source_doc("dev", "payments-pg-to-mssql-001", "gg-mssql-tgt-fixture-01")
+        doc["replication"]["extract"]["startOnCreate"] = "true"
+        write_default_pipeline(self._tmp.name, source_doc=doc)
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertTrue(any("startOnCreate must be a literal Boolean" in reason for _path, reason in invalid))
+
+    def test_17_invalid_extract_name_fails(self):
+        doc = default_source_doc("dev", "payments-pg-to-mssql-001", "gg-mssql-tgt-fixture-01")
+        doc["replication"]["extract"]["name"] = "toolongname"
+        write_default_pipeline(self._tmp.name, source_doc=doc)
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertTrue(any("Extract name" in reason for _path, reason in invalid))
+
+    def test_18_invalid_replicat_name_fails(self):
+        doc = default_target_doc("dev", "payments-pg-to-mssql-001")
+        doc["replication"]["replicat"]["name"] = "lowercase"
+        write_default_pipeline(self._tmp.name, target_doc=doc)
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertTrue(any("Replicat name" in reason for _path, reason in invalid))
+
+    def test_19_invalid_trail_name_fails(self):
+        doc = default_source_doc("dev", "payments-pg-to-mssql-001", "gg-mssql-tgt-fixture-01")
+        doc["replication"]["extract"]["trail"]["name"] = "abc"
+        write_default_pipeline(self._tmp.name, source_doc=doc)
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertTrue(any("trail name" in reason for _path, reason in invalid))
+
+    def test_20_invalid_path_name_fails(self):
+        doc = default_source_doc("dev", "payments-pg-to-mssql-001", "gg-mssql-tgt-fixture-01")
+        doc["replication"]["distribution"]["pathName"] = "1BADSTART"
+        write_default_pipeline(self._tmp.name, source_doc=doc)
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertTrue(any("pathName" in reason for _path, reason in invalid))
+
+    def test_21_unsafe_table_identifier_fails(self):
+        doc = default_source_doc("dev", "payments-pg-to-mssql-001", "gg-mssql-tgt-fixture-01")
+        doc["replication"]["extract"]["tables"] = ["public.payments; DROP TABLE x"]
+        write_default_pipeline(self._tmp.name, source_doc=doc)
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertTrue(any("schema.table identifier" in reason for _path, reason in invalid))
+
+    def test_22_unsafe_mapping_fails(self):
+        doc = default_target_doc("dev", "payments-pg-to-mssql-001")
+        doc["replication"]["replicat"]["mappings"] = [{"source": "public.payments", "target": "dbo.pay'ments"}]
+        write_default_pipeline(self._tmp.name, target_doc=doc)
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertTrue(any("schema.table identifier" in reason for _path, reason in invalid))
+
+    def test_23_raw_parameter_injection_fails(self):
+        doc = default_source_doc("dev", "payments-pg-to-mssql-001", "gg-mssql-tgt-fixture-01")
+        doc["replication"]["extract"]["tables"] = ["public.payments\nADD TRANDATA public.other;"]
+        write_default_pipeline(self._tmp.name, source_doc=doc)
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertTrue(any("schema.table identifier" in reason for _path, reason in invalid))
+
+    def test_24_database_secret_reference_validation_works(self):
+        doc = default_source_doc("dev", "payments-pg-to-mssql-001", "gg-mssql-tgt-fixture-01")
+        doc["replication"]["databaseCredentialSecret"] = "arn:aws:secretsmanager:eu-west-1:1:secret:x"
+        write_default_pipeline(self._tmp.name, source_doc=doc)
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertTrue(any("databaseCredentialSecret" in reason for _path, reason in invalid))
+
+    def test_24b_database_secret_reference_traversal_fails(self):
+        doc = default_source_doc("dev", "payments-pg-to-mssql-001", "gg-mssql-tgt-fixture-01")
+        doc["replication"]["databaseCredentialSecret"] = "dev/goldengate/../secret"
+        write_default_pipeline(self._tmp.name, source_doc=doc)
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertTrue(any("databaseCredentialSecret" in reason for _path, reason in invalid))
+
+    def test_25_generated_aliases_are_deterministic(self):
+        alias1 = gdm.derive_database_credential_alias("gg-pg-src-fixture-01")
+        alias2 = gdm.derive_database_credential_alias("gg-pg-src-fixture-01")
+        self.assertEqual(alias1, alias2)
+        self.assertTrue(alias1[0].isalpha())
+        self.assertLessEqual(len(alias1), 30)
+
+    def test_26_generated_aliases_are_collision_checked(self):
+        source_doc = default_source_doc("dev", "pipeline-a", "gg-mssql-tgt-fixture-01")
+        target_doc = default_target_doc("dev", "pipeline-a")
+        write_doc(self._tmp.name, "dev", "gg-pg-src-fixture-01", source_doc)
+        write_doc(self._tmp.name, "dev", "gg-mssql-tgt-fixture-01", target_doc)
+        import unittest.mock as mock
+        with mock.patch.object(gdm, "derive_database_credential_alias", return_value="SAME_ALIAS"):
+            problems = gdm.validate("dev")
+        self.assertTrue(any("alias collision" in p for p in problems))
+
+    def test_27_replication_plan_is_deterministic(self):
+        write_default_pipeline(self._tmp.name)
+        active, _inactive, _invalid = gdm.scan("dev")
+        source, target = gdm.find_replication_pipeline(active, "payments-pg-to-mssql-001")
+        plan1 = gdm.build_replication_plan(source, target)
+        plan2 = gdm.build_replication_plan(source, target)
+        self.assertEqual(plan1, plan2)
+
+    def test_28_replication_plan_contains_no_secret_values(self):
+        write_default_pipeline(self._tmp.name)
+        active, _inactive, _invalid = gdm.scan("dev")
+        source, target = gdm.find_replication_pipeline(active, "payments-pg-to-mssql-001")
+        plan = gdm.build_replication_plan(source, target)
+        text = str(plan)
+        for forbidden in ("OGG_DB_PASSWORD", "OGG_ADMIN_PWD", "password"):
+            self.assertNotIn(forbidden, text)
+
+    def test_supplemental_logging_must_cover_extract_tables(self):
+        doc = default_source_doc("dev", "payments-pg-to-mssql-001", "gg-mssql-tgt-fixture-01")
+        doc["replication"]["extract"]["tables"] = ["public.payments", "public.other"]
+        write_default_pipeline(self._tmp.name, source_doc=doc)
+        problems = gdm.validate("dev")
+        self.assertTrue(any("supplementalLogging.objects does not cover" in p for p in problems))
+
+    def test_replicat_mapping_source_must_exist_in_extract_tables(self):
+        doc = default_target_doc("dev", "payments-pg-to-mssql-001")
+        doc["replication"]["replicat"]["mappings"] = [{"source": "public.unknown", "target": "dbo.unknown"}]
+        write_default_pipeline(self._tmp.name, target_doc=doc)
+        problems = gdm.validate("dev")
+        self.assertTrue(any("mappings source must exist" in p for p in problems))
+
+    def test_pluginType_not_silently_defaulted(self):
+        doc = default_source_doc("dev", "payments-pg-to-mssql-001", "gg-mssql-tgt-fixture-01")
+        del doc["replication"]["extract"]["pluginType"]
+        write_default_pipeline(self._tmp.name, source_doc=doc)
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertTrue(any("pluginType" in reason for _path, reason in invalid))
+
+    def test_replicat_parallel_true_rejected(self):
+        doc = default_target_doc("dev", "payments-pg-to-mssql-001")
+        doc["replication"]["replicat"]["mode"]["parallel"] = True
+        write_default_pipeline(self._tmp.name, target_doc=doc)
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertTrue(any("mode.parallel" in reason for _path, reason in invalid))
+
+    def test_source_replicat_must_be_disabled(self):
+        doc = default_source_doc("dev", "payments-pg-to-mssql-001", "gg-mssql-tgt-fixture-01")
+        doc["replication"]["replicat"] = {
+            "enabled": True, "name": "BADREP01", "sourceTrailName": "ma", "begin": "now",
+            "mode": {"type": "nonintegrated", "parallel": False},
+            "mappings": [{"source": "public.payments", "target": "dbo.payments"}],
+        }
+        write_default_pipeline(self._tmp.name, source_doc=doc)
+        problems = gdm.validate("dev")
+        self.assertTrue(any("source deployment must have replication.replicat.enabled=false" in p for p in problems))
 
 
 class RegistryDeterminismTests(ScratchEnvironmentTestCase):

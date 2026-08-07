@@ -1935,6 +1935,162 @@ jobs:
             echo "namespace has the expected GoldenGate ownership labels."
           } >> "$GITHUB_STEP_SUMMARY"
 
+  replication_reconcile_once:
+    name: Reconcile GoldenGate replication pipelines (once, after all runtimes)
+
+    needs:
+      - validate_model
+      - validate_shared_secrets_once
+      - build_publish_and_deploy
+      - delete_removed_argocd_applications
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && always() && needs.validate_shared_secrets_once.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' }}
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.ROLE_ARN }}
+
+      - name: Connect to EKS cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}" \
+            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
+            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
+
+      - name: List enabled replication pipelines
+        id: pipelines
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PIPELINES="$(python3 hack/goldengate-deployment-model.py --environment dev replication-pipelines)"
+          if [ -z "$PIPELINES" ]; then
+            echo "has_pipelines=false" >> "$GITHUB_OUTPUT"
+            echo "No enabled replication pipelines."
+          else
+            echo "has_pipelines=true" >> "$GITHUB_OUTPUT"
+            echo "Enabled replication pipelines:"
+            echo "$PIPELINES"
+          fi
+          {
+            echo "pipelines<<REPL_PIPELINES_EOF"
+            echo "$PIPELINES"
+            echo "REPL_PIPELINES_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Reconcile each enabled pipeline sequentially (fail-fast)
+        if: steps.pipelines.outputs.has_pipelines == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          while IFS= read -r pipeline_id; do
+            [ -z "$pipeline_id" ] && continue
+            echo "::group::Reconciling ${pipeline_id}"
+
+            OUTDIR="work/replication/${pipeline_id}"
+            mkdir -p "$OUTDIR"
+            python3 hack/goldengate-replication.py render-job \
+              --environment dev --region "${AWS_REGION}" --namespace goldengate-dev \
+              --output-dir "$OUTDIR" "$pipeline_id"
+
+            JOB_NAME="$(python3 -c "import yaml; print(yaml.safe_load(open('${OUTDIR}/job.yaml'))['metadata']['name'])")"
+
+            kubectl apply -f "${OUTDIR}/secretproviderclass.yaml"
+            kubectl apply -f "${OUTDIR}/configmap.yaml"
+            kubectl apply -f "${OUTDIR}/job.yaml"
+
+            if ! kubectl wait --for=condition=complete --timeout=600s "job/${JOB_NAME}" -n goldengate-dev; then
+              echo "FAIL: reconciliation Job ${JOB_NAME} for ${pipeline_id} did not complete successfully."
+              echo "Sanitized Job logs (the worker never prints a mounted secret file):"
+              kubectl logs "job/${JOB_NAME}" -n goldengate-dev --all-containers || true
+              echo "Job evidence retained for diagnosis: job/${JOB_NAME}, configmap/${JOB_NAME}, secretproviderclass/${JOB_NAME} in goldengate-dev."
+              exit 1
+            fi
+
+            echo "Sanitized Job logs (the worker never prints a mounted secret file):"
+            kubectl logs "job/${JOB_NAME}" -n goldengate-dev --all-containers
+
+            kubectl delete job "$JOB_NAME" -n goldengate-dev --ignore-not-found
+            kubectl delete configmap "$JOB_NAME" -n goldengate-dev --ignore-not-found
+            kubectl delete secretproviderclass "$JOB_NAME" -n goldengate-dev --ignore-not-found
+            echo "::endgroup::"
+          done <<< "${{ steps.pipelines.outputs.pipelines }}"
+
+      - name: No replication pipeline enabled
+        if: steps.pipelines.outputs.has_pipelines == 'false'
+        shell: bash
+        run: |
+          echo "No enabled replication pipeline -- clean no-op: no Job created, no existing runtime changed."
+
+  replication_dry_run_validation:
+    name: Validate GoldenGate replication manifests locally (deploy=false, no cluster mutation)
+
+    needs:
+      - validate_model
+      - validate_shared_secrets_once
+      - build_publish_and_deploy
+      - delete_removed_argocd_applications
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'false' && always() && needs.validate_shared_secrets_once.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' }}
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate the full replication schema and pipeline pairing (read-only)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-deployment-model.py --environment dev validate
+
+      - name: Render and validate replication manifests for every enabled pipeline (no cluster mutation)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PIPELINES="$(python3 hack/goldengate-deployment-model.py --environment dev replication-pipelines)"
+          if [ -z "$PIPELINES" ]; then
+            echo "No enabled replication pipelines -- clean no-op."
+            exit 0
+          fi
+
+          while IFS= read -r pipeline_id; do
+            [ -z "$pipeline_id" ] && continue
+            echo "::group::Validating ${pipeline_id}"
+
+            OUTDIR="work/replication/${pipeline_id}"
+            mkdir -p "$OUTDIR"
+            python3 hack/goldengate-replication.py render-job \
+              --environment dev --region "${AWS_REGION}" --namespace goldengate-dev \
+              --output-dir "$OUTDIR" "$pipeline_id"
+
+            for manifest in secretproviderclass configmap job; do
+              python3 -c "import yaml; yaml.safe_load(open('${OUTDIR}/${manifest}.yaml'))"
+            done
+
+            if grep -qE "^\s*(aws_secret_access_key|password)\s*:" "${OUTDIR}/configmap.yaml" "${OUTDIR}/job.yaml" "${OUTDIR}/secretproviderclass.yaml"; then
+              echo "FAIL: a literal secret-like value was found in a rendered replication manifest for ${pipeline_id}."
+              exit 1
+            fi
+
+            echo "OK: ${pipeline_id} replication manifests render and validate cleanly (no secret value, no cluster mutation)."
+            echo "::endgroup::"
+          done <<< "$PIPELINES"
+
   monitor_sync_once:
     name: Synchronize the GoldenGate monitor (once, after all runtimes)
 
@@ -1943,8 +2099,9 @@ jobs:
       - validate_shared_secrets_once
       - build_publish_and_deploy
       - delete_removed_argocd_applications
+      - replication_reconcile_once
     # goldengate-monitor.yaml publishes unconditionally on every internal step, so this call must be skipped entirely for deploy=false.
-    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && always() && needs.validate_shared_secrets_once.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' }}
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && always() && needs.validate_shared_secrets_once.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' && needs.replication_reconcile_once.result != 'failure' && needs.replication_reconcile_once.result != 'cancelled' }}
 
     uses: ./.github/workflows/goldengate-monitor.yaml
     with:
@@ -1962,7 +2119,8 @@ jobs:
       - validate_shared_secrets_once
       - build_publish_and_deploy
       - delete_removed_argocd_applications
-    if: ${{ needs.validate_model.outputs.effective_deploy == 'false' && always() && needs.validate_shared_secrets_once.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' }}
+      - replication_dry_run_validation
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'false' && always() && needs.validate_shared_secrets_once.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' && needs.replication_dry_run_validation.result != 'failure' && needs.replication_dry_run_validation.result != 'cancelled' }}
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -2044,9 +2202,11 @@ jobs:
       - validate_shared_secrets_once
       - build_publish_and_deploy
       - delete_removed_argocd_applications
+      - replication_reconcile_once
+      - replication_dry_run_validation
       - monitor_sync_once
       - monitor_dry_run_validation
-    if: ${{ always() && needs.validate_shared_secrets_once.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' && needs.monitor_sync_once.result != 'failure' && needs.monitor_sync_once.result != 'cancelled' && needs.monitor_dry_run_validation.result != 'failure' && needs.monitor_dry_run_validation.result != 'cancelled' }}
+    if: ${{ always() && needs.validate_shared_secrets_once.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' && needs.replication_reconcile_once.result != 'failure' && needs.replication_reconcile_once.result != 'cancelled' && needs.replication_dry_run_validation.result != 'failure' && needs.replication_dry_run_validation.result != 'cancelled' && needs.monitor_sync_once.result != 'failure' && needs.monitor_sync_once.result != 'cancelled' && needs.monitor_dry_run_validation.result != 'failure' && needs.monitor_dry_run_validation.result != 'cancelled' }}
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 

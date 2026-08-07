@@ -55,6 +55,56 @@ locals {
     for id, doc in local.goldengate_runtime_documents : id => try(doc.runtime.deploymentType, "")
   }
 
+  # Phase 6D1 replication contract: structural gates only, mirroring hack/goldengate-deployment-model.py; never REST reconciliation logic.
+  goldengate_replication_enabled_raw = {
+    for id, doc in local.goldengate_runtime_documents : id => try(doc.replication.enabled, false) == true
+  }
+  goldengate_replication_role_raw = {
+    for id, doc in local.goldengate_runtime_documents : id => try(doc.deployment.role, "")
+  }
+  goldengate_replication_extract_enabled_jsonenc = {
+    for id, doc in local.goldengate_runtime_documents : id => try(jsonencode(doc.replication.extract.enabled), "")
+  }
+  goldengate_replication_distribution_enabled_jsonenc = {
+    for id, doc in local.goldengate_runtime_documents : id => try(jsonencode(doc.replication.distribution.enabled), "")
+  }
+  goldengate_replication_checkpoint_enabled_jsonenc = {
+    for id, doc in local.goldengate_runtime_documents : id => try(jsonencode(doc.replication.checkpoint.enabled), "")
+  }
+  goldengate_replication_replicat_enabled_jsonenc = {
+    for id, doc in local.goldengate_runtime_documents : id => try(jsonencode(doc.replication.replicat.enabled), "")
+  }
+  goldengate_replication_extract_start_jsonenc = {
+    for id, doc in local.goldengate_runtime_documents : id => try(jsonencode(doc.replication.extract.startOnCreate), "")
+  }
+  goldengate_replication_distribution_start_jsonenc = {
+    for id, doc in local.goldengate_runtime_documents : id => try(jsonencode(doc.replication.distribution.startOnCreate), "")
+  }
+  goldengate_replication_replicat_start_jsonenc = {
+    for id, doc in local.goldengate_runtime_documents : id => try(jsonencode(doc.replication.replicat.startOnCreate), "")
+  }
+  goldengate_replication_extract_enabled_raw = {
+    for id, doc in local.goldengate_runtime_documents : id => try(doc.replication.extract.enabled, false) == true
+  }
+  goldengate_replication_distribution_enabled_raw = {
+    for id, doc in local.goldengate_runtime_documents : id => try(doc.replication.distribution.enabled, false) == true
+  }
+  goldengate_replication_checkpoint_enabled_raw = {
+    for id, doc in local.goldengate_runtime_documents : id => try(doc.replication.checkpoint.enabled, false) == true
+  }
+  goldengate_replication_replicat_enabled_raw = {
+    for id, doc in local.goldengate_runtime_documents : id => try(doc.replication.replicat.enabled, false) == true
+  }
+  goldengate_replication_extract_name_raw           = { for id, doc in local.goldengate_runtime_documents : id => try(doc.replication.extract.name, "") }
+  goldengate_replication_extract_trail_raw          = { for id, doc in local.goldengate_runtime_documents : id => try(doc.replication.extract.trail.name, "") }
+  goldengate_replication_replicat_name_raw          = { for id, doc in local.goldengate_runtime_documents : id => try(doc.replication.replicat.name, "") }
+  goldengate_replication_replicat_trail_raw         = { for id, doc in local.goldengate_runtime_documents : id => try(doc.replication.replicat.sourceTrailName, "") }
+  goldengate_replication_distribution_path_raw      = { for id, doc in local.goldengate_runtime_documents : id => try(doc.replication.distribution.pathName, "") }
+  goldengate_replication_distribution_src_trail_raw = { for id, doc in local.goldengate_runtime_documents : id => try(doc.replication.distribution.sourceTrailName, "") }
+  goldengate_replication_distribution_tgt_trail_raw = { for id, doc in local.goldengate_runtime_documents : id => try(doc.replication.distribution.targetTrailName, "") }
+  goldengate_replication_distribution_target_raw    = { for id, doc in local.goldengate_runtime_documents : id => try(doc.replication.distribution.targetDeployment, "") }
+  goldengate_replication_checkpoint_table_raw       = { for id, doc in local.goldengate_runtime_documents : id => try(doc.replication.checkpoint.table, "") }
+
   # No filtering here; terraform_data.goldengate_runtime_contract enforces the full contract as a plan-blocking precondition.
   goldengate_runtime_candidates = local.goldengate_runtime_documents
 
@@ -70,6 +120,30 @@ locals {
   goldengate_pipeline_names = sort(distinct([
     for id in local.goldengate_deployment_names : try(local.goldengate_enabled_deployments[id].deployment.pipeline, "")
   ]))
+
+  goldengate_replication_pipeline_members = {
+    for pipeline in local.goldengate_pipeline_names : pipeline => {
+      source_id = try([
+        for id in local.goldengate_deployment_names : id
+        if try(local.goldengate_enabled_deployments[id].deployment.pipeline, "") == pipeline
+        && try(local.goldengate_enabled_deployments[id].deployment.role, "") == "source"
+      ][0], "")
+      target_id = try([
+        for id in local.goldengate_deployment_names : id
+        if try(local.goldengate_enabled_deployments[id].deployment.pipeline, "") == pipeline
+        && try(local.goldengate_enabled_deployments[id].deployment.role, "") == "target"
+      ][0], "")
+    }
+  }
+
+  # Well-formed replication pipelines only: exactly one source and one target, both enabled+replicating; safe to index by source_id/target_id below.
+  goldengate_replication_pipelines_enabled = [
+    for pipeline in local.goldengate_pipeline_names : pipeline
+    if(
+      try(local.goldengate_replication_enabled_raw[local.goldengate_replication_pipeline_members[pipeline].source_id], false)
+      && try(local.goldengate_replication_enabled_raw[local.goldengate_replication_pipeline_members[pipeline].target_id], false)
+    )
+  ]
 
   goldengate_alb_group_order_by_enabled_id = {
     for id in local.goldengate_deployment_names : id => try(local.goldengate_enabled_deployments[id].ingress.alb.groupOrder, null)
@@ -219,8 +293,122 @@ resource "terraform_data" "goldengate_runtime_contract" {
       error_message = "envs/${var.environment}/${each.key}/values.yaml: replication.enabled must be a literal Boolean, not a Boolean-like string, when replication is present."
     }
     precondition {
-      condition     = try(each.value.replication.enabled, false) == false
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: replication.enabled must be false in Phase 6D0."
+      condition = (
+        !local.goldengate_replication_enabled_raw[each.key]
+        || contains(["source", "target"], local.goldengate_replication_role_raw[each.key])
+      )
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: replication.enabled=true requires deployment.role to be exactly \"source\" or \"target\"."
+    }
+    precondition {
+      condition = (
+        !local.goldengate_replication_enabled_raw[each.key]
+        || (
+          local.goldengate_replication_role_raw[each.key] == "source"
+          ? local.goldengate_deployment_type_raw[each.key] == "postgresql"
+          : local.goldengate_deployment_type_raw[each.key] == "mssql"
+        )
+      )
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: replication.enabled=true is only supported for a postgresql source paired with an mssql target."
+    }
+    precondition {
+      condition = (
+        !local.goldengate_replication_enabled_raw[each.key]
+        || local.goldengate_replication_role_raw[each.key] != "source"
+        || (
+          local.goldengate_replication_extract_enabled_jsonenc[each.key] == "true"
+          && local.goldengate_replication_distribution_enabled_jsonenc[each.key] == "true"
+          && local.goldengate_replication_checkpoint_enabled_jsonenc[each.key] == "false"
+          && local.goldengate_replication_replicat_enabled_jsonenc[each.key] == "false"
+        )
+      )
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: a replication-enabled source must have extract.enabled=true, distribution.enabled=true, checkpoint.enabled=false, replicat.enabled=false, all as literal Booleans."
+    }
+    precondition {
+      condition = (
+        !local.goldengate_replication_enabled_raw[each.key]
+        || local.goldengate_replication_role_raw[each.key] != "target"
+        || (
+          local.goldengate_replication_extract_enabled_jsonenc[each.key] == "false"
+          && local.goldengate_replication_distribution_enabled_jsonenc[each.key] == "false"
+          && local.goldengate_replication_checkpoint_enabled_jsonenc[each.key] == "true"
+          && local.goldengate_replication_replicat_enabled_jsonenc[each.key] == "true"
+        )
+      )
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: a replication-enabled target must have extract.enabled=false, distribution.enabled=false, checkpoint.enabled=true, replicat.enabled=true, all as literal Booleans."
+    }
+    precondition {
+      condition = (
+        !local.goldengate_replication_extract_enabled_raw[each.key]
+        || can(regex("^[A-Z][A-Z0-9_$]{0,7}$", local.goldengate_replication_extract_name_raw[each.key]))
+      )
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: replication.extract.name must be a valid Extract name (uppercase, max 8 characters)."
+    }
+    precondition {
+      condition = (
+        !local.goldengate_replication_extract_enabled_raw[each.key]
+        || can(regex("^[a-z][a-z0-9]$", local.goldengate_replication_extract_trail_raw[each.key]))
+      )
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: replication.extract.trail.name must be a valid two-character lowercase trail name."
+    }
+    precondition {
+      condition = (
+        !local.goldengate_replication_replicat_enabled_raw[each.key]
+        || can(regex("^[A-Z][A-Z0-9_$]{0,7}$", local.goldengate_replication_replicat_name_raw[each.key]))
+      )
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: replication.replicat.name must be a valid Replicat name (uppercase, max 8 characters)."
+    }
+    precondition {
+      condition = (
+        !local.goldengate_replication_replicat_enabled_raw[each.key]
+        || can(regex("^[a-z][a-z0-9]$", local.goldengate_replication_replicat_trail_raw[each.key]))
+      )
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: replication.replicat.sourceTrailName must be a valid two-character lowercase trail name."
+    }
+    precondition {
+      condition = (
+        !local.goldengate_replication_distribution_enabled_raw[each.key]
+        || can(regex("^[A-Za-z][A-Za-z0-9._-]{0,31}$", local.goldengate_replication_distribution_path_raw[each.key]))
+      )
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: replication.distribution.pathName must be a valid path name (1-32 characters)."
+    }
+    precondition {
+      condition = (
+        !local.goldengate_replication_distribution_enabled_raw[each.key]
+        || (
+          can(regex("^[a-z][a-z0-9]$", local.goldengate_replication_distribution_src_trail_raw[each.key]))
+          && can(regex("^[a-z][a-z0-9]$", local.goldengate_replication_distribution_tgt_trail_raw[each.key]))
+          && local.goldengate_replication_distribution_src_trail_raw[each.key] != local.goldengate_replication_distribution_tgt_trail_raw[each.key]
+        )
+      )
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: replication.distribution sourceTrailName/targetTrailName must be valid, non-colliding two-character trail names."
+    }
+    precondition {
+      condition = (
+        !local.goldengate_replication_checkpoint_enabled_raw[each.key]
+        || can(regex("^[A-Za-z_][A-Za-z0-9_]*\\.[A-Za-z_][A-Za-z0-9_]*$", local.goldengate_replication_checkpoint_table_raw[each.key]))
+      )
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: replication.checkpoint.table must be a safe schema.table identifier."
+    }
+    precondition {
+      condition = (
+        !local.goldengate_replication_extract_enabled_raw[each.key]
+        || contains(["true", "false"], local.goldengate_replication_extract_start_jsonenc[each.key])
+      )
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: replication.extract.startOnCreate must be a literal Boolean, not a Boolean-like string."
+    }
+    precondition {
+      condition = (
+        !local.goldengate_replication_distribution_enabled_raw[each.key]
+        || contains(["true", "false"], local.goldengate_replication_distribution_start_jsonenc[each.key])
+      )
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: replication.distribution.startOnCreate must be a literal Boolean, not a Boolean-like string."
+    }
+    precondition {
+      condition = (
+        !local.goldengate_replication_replicat_enabled_raw[each.key]
+        || contains(["true", "false"], local.goldengate_replication_replicat_start_jsonenc[each.key])
+      )
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: replication.replicat.startOnCreate must be a literal Boolean, not a Boolean-like string."
     }
     precondition {
       condition     = try(each.value.ingress.hostDomain, "") == local.goldengate_shared_environment.dnsDomain
@@ -266,10 +454,43 @@ resource "terraform_data" "goldengate_cross_pipeline_contract" {
     }
     precondition {
       condition = alltrue([
-        for id in local.goldengate_deployment_names :
-        try(local.goldengate_enabled_deployments[id].replication.enabled, false) == false
+        for pipeline in local.goldengate_pipeline_names : (
+          length([
+            for id in local.goldengate_deployment_names : id
+            if try(local.goldengate_enabled_deployments[id].deployment.pipeline, "") == pipeline
+            && local.goldengate_replication_enabled_raw[id]
+          ]) == 0
+          || (
+            try(local.goldengate_replication_enabled_raw[local.goldengate_replication_pipeline_members[pipeline].source_id], false)
+            && try(local.goldengate_replication_enabled_raw[local.goldengate_replication_pipeline_members[pipeline].target_id], false)
+          )
+        )
       ])
-      error_message = "Replication bootstrap activation is not available in Phase 6D0. Complete the approved database and GoldenGate Admin REST validation phase first."
+      error_message = "A pipeline with replication.enabled=true must have exactly one enabled source and one enabled target deployment, both with replication.enabled=true."
+    }
+    precondition {
+      condition = alltrue([
+        for pipeline in local.goldengate_replication_pipelines_enabled :
+        local.goldengate_replication_distribution_target_raw[local.goldengate_replication_pipeline_members[pipeline].source_id]
+        == local.goldengate_replication_pipeline_members[pipeline].target_id
+      ])
+      error_message = "replication.distribution.targetDeployment must equal the target deployment ID for its pipeline."
+    }
+    precondition {
+      condition = alltrue([
+        for pipeline in local.goldengate_replication_pipelines_enabled :
+        local.goldengate_replication_distribution_src_trail_raw[local.goldengate_replication_pipeline_members[pipeline].source_id]
+        == local.goldengate_replication_extract_trail_raw[local.goldengate_replication_pipeline_members[pipeline].source_id]
+      ])
+      error_message = "replication.distribution.sourceTrailName must equal replication.extract.trail.name for its pipeline."
+    }
+    precondition {
+      condition = alltrue([
+        for pipeline in local.goldengate_replication_pipelines_enabled :
+        local.goldengate_replication_distribution_tgt_trail_raw[local.goldengate_replication_pipeline_members[pipeline].source_id]
+        == local.goldengate_replication_replicat_trail_raw[local.goldengate_replication_pipeline_members[pipeline].target_id]
+      ])
+      error_message = "replication.distribution.targetTrailName must equal the target replication.replicat.sourceTrailName for its pipeline."
     }
     precondition {
       condition     = local.goldengate_secrets_trust_subjects_non_legacy == local.goldengate_expected_irsa_trust_subjects
@@ -329,12 +550,18 @@ check "goldengate_approved_ecr_registry_only" {
   }
 }
 
-check "goldengate_no_enabled_replication_bootstrap" {
+check "goldengate_replication_pipelines_well_formed" {
   assert {
     condition = alltrue([
-      for id in local.goldengate_deployment_names :
-      try(local.goldengate_enabled_deployments[id].replication.enabled, false) == false
+      for pipeline in local.goldengate_pipeline_names : (
+        length([
+          for id in local.goldengate_deployment_names : id
+          if try(local.goldengate_enabled_deployments[id].deployment.pipeline, "") == pipeline
+          && local.goldengate_replication_enabled_raw[id]
+        ]) == 0
+        || contains(local.goldengate_replication_pipelines_enabled, pipeline)
+      )
     ])
-    error_message = "Replication bootstrap activation is not available in Phase 6D0. Complete the approved database and GoldenGate Admin REST validation phase first."
+    error_message = "A pipeline with replication.enabled=true must have exactly one enabled source and one enabled target deployment, both with replication.enabled=true."
   }
 }

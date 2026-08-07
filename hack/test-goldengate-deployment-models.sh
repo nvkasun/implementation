@@ -3451,8 +3451,8 @@ fi
 echo ""
 echo "--- Phase 5A: no Argo CD Application/namespace/PVC/EFS deletion command tied to disabling the legacy folder ---"
 if [ -f "$EKS_APP_WORKFLOW" ]; then
-  # The only place this workflow deletes an Argo CD Application or namespace is delete_removed_argocd_applications, gated on has_deletions=true (already proven above to exclude deployment.enabled=false); no separate, disable-triggered deletion path may exist anywhere else.
-  DIRECT_DELETE_HITS="$(grep -n 'kubectl delete\|delete-repository\|efs delete-access-point\|delete_access_point' "$EKS_APP_WORKFLOW" | grep -v 'kubectl delete application\|kubectl delete namespace' || true)"
+  # The only place this workflow deletes an Argo CD Application or namespace is delete_removed_argocd_applications, gated on has_deletions=true (already proven above to exclude deployment.enabled=false); no separate, disable-triggered deletion path may exist anywhere else. Phase 6D1 additionally allows deleting only the ephemeral, just-created replication Job/ConfigMap/SecretProviderClass named "$JOB_NAME" after a successful reconciliation -- never a PVC, EFS access point, or existing runtime resource.
+  DIRECT_DELETE_HITS="$(grep -n 'kubectl delete\|delete-repository\|efs delete-access-point\|delete_access_point' "$EKS_APP_WORKFLOW" | grep -v 'kubectl delete application\|kubectl delete namespace\|kubectl delete job "\$JOB_NAME"\|kubectl delete configmap "\$JOB_NAME"\|kubectl delete secretproviderclass "\$JOB_NAME"' || true)"
   if [ -z "$DIRECT_DELETE_HITS" ]; then
     pass "no unexpected delete command exists outside the guarded Argo CD Application/namespace cleanup path"
   else
@@ -5991,10 +5991,17 @@ else
   fail "26: the monitor workflow no longer generates the registry via the deployment-model tool"
 fi
 
-if grep -qE "REPLICATION_DISABLED_MESSAGE|Replication bootstrap activation is not available in Phase 6D0" "$DEPLOYMENT_MODEL_TOOL" 2>/dev/null; then
-  pass "26: replication.enabled=true is rejected with the fixed Phase 6D0 message"
+if grep -q "REPLICATION_DISABLED_MESSAGE" "$DEPLOYMENT_MODEL_TOOL" 2>/dev/null; then
+  fail "26: the retired Phase 6D0 unconditional replication rejection still exists in the deployment-model tool"
 else
-  fail "26: the fixed Phase 6D0 replication rejection message is missing"
+  pass "26: the Phase 6D0 unconditional replication rejection has been fully replaced"
+fi
+
+if grep -q "REPLICATION_SCOPE_MESSAGE" "$DEPLOYMENT_MODEL_TOOL" 2>/dev/null \
+    && grep -q "postgresql source paired with an mssql target" "$DEPLOYMENT_MODEL_TOOL" 2>/dev/null; then
+  pass "26: replication.enabled=true outside the approved postgresql-source/mssql-target scope is rejected with the fixed Phase 6D1 message"
+else
+  fail "26: the fixed Phase 6D1 replication-scope rejection message is missing"
 fi
 
 FORBIDDEN_6D0_TERMS_FOUND="false"
@@ -6725,6 +6732,164 @@ if grep -q "role-to-assume: \${{ env.ROLE_ARN }}" "$EKS_APP_WORKFLOW" 2>/dev/nul
   pass "31: validate_shared_secrets_once assumes the same GOLDENGATE_AWS_ROLE_ARN role used everywhere else, and static evidence ties it to the policy carrying the required read-only shared-secret permissions (live value unverifiable offline)"
 else
   fail "31: static evidence linking GOLDENGATE_AWS_ROLE_ARN to the read-only shared-secret policy is incomplete"
+fi
+
+echo ""
+echo "--- Phase 6D1: folder-driven replication configuration ---"
+
+REPLICATION_TOOL="hack/goldengate-replication.py"
+
+if [ -f "$REPLICATION_TOOL" ]; then
+  pass "32: hack/goldengate-replication.py exists as the dedicated reconciler tool"
+else
+  fail "32: hack/goldengate-replication.py is missing"
+fi
+
+if grep -qE "second values-file parser|goldengate_deployment_model" "$REPLICATION_TOOL" 2>/dev/null \
+    && grep -q "importlib.util.spec_from_file_location" "$REPLICATION_TOOL" 2>/dev/null; then
+  pass "32: the reconciler imports and consumes the deployment model, never parsing values.yaml a second time"
+else
+  fail "32: the reconciler does not clearly import the single deployment-model parser"
+fi
+
+if find envs/dev -maxdepth 1 -iname "*registry*" -o -iname "*pipeline*.yaml" -o -iname "*credential-map*" 2>/dev/null | grep -q .; then
+  fail "32: a separate replication registry/pipeline/credential-mapping file was added under envs/dev"
+else
+  pass "32: one values.yaml per runtime folder remains the only deployment-specific configuration source"
+fi
+
+if grep -q 'REPLICATION_SUPPORTED_SOURCE_TYPE = "postgresql"' "$DEPLOYMENT_MODEL_TOOL" 2>/dev/null \
+    && grep -q 'REPLICATION_SUPPORTED_TARGET_TYPE = "mssql"' "$DEPLOYMENT_MODEL_TOOL" 2>/dev/null; then
+  pass "32: PostgreSQL source paired with MSSQL target is the only approved replication adapter"
+else
+  fail "32: the approved replication adapter scope constants are missing or changed"
+fi
+
+if grep -qE "OGG_DB_USERID|OGG_DB_PASSWORD" "$DEPLOYMENT_MODEL_TOOL" "$REPLICATION_TOOL" 2>/dev/null \
+    && ! grep -qE "^\s*(userid|password)\s*[:=]\s*[\"'][^\"']+[\"']" "$DEPLOYMENT_MODEL_TOOL" "$REPLICATION_TOOL" 2>/dev/null; then
+  pass "32: database credentials are referenced by Secrets Manager key name only, never embedded"
+else
+  fail "32: a database credential appears to be embedded rather than referenced"
+fi
+
+if grep -qE "aws_secretsmanager_secret" envs/dev/*.tf 2>/dev/null | grep -q "databases/"; then
+  fail "32: a Terraform resource creates a database secret -- this remains an external prerequisite"
+else
+  pass "32: no Terraform resource creates a database secret"
+fi
+
+if grep -qiE "route53|ChangeResourceRecordSets" "$REPLICATION_TOOL" "$DEPLOYMENT_MODEL_TOOL" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  fail "32: Route 53 automation was introduced"
+else
+  pass "32: no Route 53 resource or API call exists; the existing wildcard DNS record is used as-is"
+fi
+
+if grep -q '"runtimeHost"' "$DEPLOYMENT_MODEL_TOOL" 2>/dev/null \
+    && grep -qE 'f"\{.*deploymentId.*\}\.\{dns_domain\}"' "$DEPLOYMENT_MODEL_TOOL" 2>/dev/null; then
+  pass "32: source/target runtime hosts are derived from the existing wildcard DNS domain"
+else
+  fail "32: runtime hosts are not clearly derived from the existing wildcard DNS domain"
+fi
+
+if grep -qE "aws_iam_role|module \"goldengate_" envs/dev/iam.tf 2>/dev/null; then
+  IAM_ROLE_COUNT_6D1="$(grep -c 'module "goldengate_' envs/dev/iam.tf 2>/dev/null || true)"
+  if [ "$IAM_ROLE_COUNT_6D1" = "6" ]; then
+    pass "32: the number of IAM role modules in envs/dev/iam.tf is unchanged (6)"
+  else
+    fail "32: the number of IAM role modules in envs/dev/iam.tf changed unexpectedly (found ${IAM_ROLE_COUNT_6D1})"
+  fi
+fi
+
+if grep -qE "gg-oracle-sa|gg-postgresql-sa|gg-mssql-sa|gg-daa-sa" helm/goldengate-platform/templates/runtime-serviceaccounts.yaml 2>/dev/null \
+    || grep -qE '\$type' helm/goldengate-platform/templates/runtime-serviceaccounts.yaml 2>/dev/null; then
+  pass "32: current runtime ServiceAccount naming/rendering is unchanged by Phase 6D1"
+else
+  fail "32: the runtime ServiceAccount template appears to have changed unexpectedly"
+fi
+
+if grep -q "PutSecretValue\|GetRandomPassword" envs/dev/policies/goldengate-secrets-read-dev/policies/policies_1.json 2>/dev/null; then
+  fail "32: a secret-mutation permission was added to the runtime secrets-read policy"
+else
+  pass "32: existing runtime secrets and their read-only IAM policy are unchanged"
+fi
+
+if grep -qi "kms:" envs/dev/policies/goldengate-secrets-read-dev/policies/policies_1.json 2>/dev/null; then
+  KMS_ACTIONS_6D1="$(grep -oE '"kms:[A-Za-z]+"' envs/dev/policies/goldengate-secrets-read-dev/policies/policies_1.json 2>/dev/null | sort -u | tr '\n' ' ')"
+  if [ "$KMS_ACTIONS_6D1" = '"kms:Decrypt" ' ]; then
+    pass "32: KMS permissions on the runtime secrets-read policy are unchanged (Decrypt only)"
+  else
+    fail "32: KMS permissions on the runtime secrets-read policy changed unexpectedly (found: ${KMS_ACTIONS_6D1})"
+  fi
+fi
+
+if grep -qE "229410149234.dkr.ecr" "$REPLICATION_TOOL" 2>/dev/null; then
+  fail "32: the reconciler hardcodes an image reference instead of using the source deployment's existing image"
+else
+  pass "32: no new image reference exists; the reconciliation Job reuses the existing approved source runtime image"
+fi
+
+FORBIDDEN_6D1_TERMS_FOUND="false"
+for term in "utility-sidecar" "observer-sidecar" "gg-alerter" "aws_cloudwatch_metric_alarm" "aws_sns" "def restart_process" "def heal"; do
+  if grep -rq -- "$term" "$REPLICATION_TOOL" "$DEPLOYMENT_MODEL_TOOL" "$INVENTORY_TF" 2>/dev/null; then
+    fail "32: forbidden Phase 6D1 term found: ${term}"
+    FORBIDDEN_6D1_TERMS_FOUND="true"
+  fi
+done
+if [ "$FORBIDDEN_6D1_TERMS_FOUND" = "false" ]; then
+  pass "32: no observer/utility sidecar, alarm, SNS, or automatic-healing reference exists"
+fi
+
+for method in "def delete(" "def put(" "def patch("; do
+  if grep -qF -- "$method" "$REPLICATION_TOOL" 2>/dev/null; then
+    fail "32: the reconciler REST client defines a forbidden ${method%(} method"
+  fi
+done
+pass "32: the reconciler REST client has no delete/put/patch method"
+
+if [ "$HELM_AVAILABLE" = "true" ] && command -v git >/dev/null 2>&1; then
+  ORACLE_HEAD_RENDER="${WORKDIR}/oracle-6d1-head.yaml"
+  ORACLE_WORKING_RENDER="${WORKDIR}/oracle-6d1-working.yaml"
+  if git show "HEAD:helm/goldengate/templates/runtime-statefulset.yaml" > "${WORKDIR}/oracle-sts-head.yaml" 2>/dev/null; then
+    if diff -q "${WORKDIR}/oracle-sts-head.yaml" "helm/goldengate/templates/runtime-statefulset.yaml" >/dev/null 2>&1; then
+      pass "32: helm/goldengate/templates/runtime-statefulset.yaml is byte-identical to HEAD -- existing Oracle/PostgreSQL StatefulSet rendering is untouched by Phase 6D1"
+    else
+      fail "32: helm/goldengate/templates/runtime-statefulset.yaml changed since HEAD"
+    fi
+  else
+    skip "32: runtime-statefulset.yaml HEAD comparison -- not available in this git history"
+  fi
+else
+  skip "32: existing Oracle/PostgreSQL manifest byte comparison -- helm or git not available"
+fi
+
+if grep -q "enable_cloudwatch_publication: true" "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && grep -q "metrics_gate_expectation: any" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "32: monitoring publication remains explicitly enabled after Phase 6D1"
+else
+  fail "32: monitoring publication configuration changed unexpectedly"
+fi
+
+if grep -q "replication_reconcile_once" "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && grep -q "replication_dry_run_validation" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "32: replication_reconcile_once and replication_dry_run_validation jobs exist in the orchestrator"
+else
+  fail "32: the replication workflow jobs are missing from the orchestrator"
+fi
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  set +e
+  REPL_TEST_OUTPUT="$(python3 hack/test-goldengate-replication.py 2>&1)"
+  REPL_TEST_STATUS=$?
+  set -e
+  if [ "$REPL_TEST_STATUS" -eq 0 ]; then
+    RAN_LINE_REPL="$(echo "$REPL_TEST_OUTPUT" | grep -E '^Ran [0-9]+ test' | tail -1)"
+    pass "32: hack/test-goldengate-replication.py: ${RAN_LINE_REPL:-all tests passed}"
+  else
+    fail "32: hack/test-goldengate-replication.py reported a failure"
+    echo "$REPL_TEST_OUTPUT"
+  fi
+else
+  skip "32: replication reconciler unit tests -- python3 unavailable"
 fi
 
 echo ""
