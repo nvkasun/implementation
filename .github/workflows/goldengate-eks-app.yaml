@@ -2003,6 +2003,7 @@ jobs:
             mkdir -p "$OUTDIR"
             python3 hack/goldengate-replication.py render-job \
               --environment dev --region "${AWS_REGION}" --namespace goldengate-dev \
+              --execution-id "${{ github.run_id }}-${{ github.run_attempt }}" \
               --output-dir "$OUTDIR" "$pipeline_id"
 
             JOB_NAME="$(python3 -c "import yaml; print(yaml.safe_load(open('${OUTDIR}/job.yaml'))['metadata']['name'])")"
@@ -2076,13 +2077,14 @@ jobs:
             mkdir -p "$OUTDIR"
             python3 hack/goldengate-replication.py render-job \
               --environment dev --region "${AWS_REGION}" --namespace goldengate-dev \
+              --execution-id "dry-run" \
               --output-dir "$OUTDIR" "$pipeline_id"
 
             for manifest in secretproviderclass configmap job; do
               python3 -c "import yaml; yaml.safe_load(open('${OUTDIR}/${manifest}.yaml'))"
             done
 
-            if grep -qE "^\s*(aws_secret_access_key|password)\s*:" "${OUTDIR}/configmap.yaml" "${OUTDIR}/job.yaml" "${OUTDIR}/secretproviderclass.yaml"; then
+            if grep -qE "^[[:space:]]*(aws_secret_access_key|password)[[:space:]]*:" "${OUTDIR}/configmap.yaml" "${OUTDIR}/job.yaml" "${OUTDIR}/secretproviderclass.yaml"; then
               echo "FAIL: a literal secret-like value was found in a rendered replication manifest for ${pipeline_id}."
               exit 1
             fi
@@ -2195,6 +2197,129 @@ jobs:
 
           echo "OK: monitor chart lints and renders cleanly (no image build, no ECR push, no Argo CD/Kubernetes mutation)."
 
+  replication_monitor_acceptance:
+    name: Replication-specific monitor acceptance (real process names, current, not ABENDED)
+
+    needs:
+      - validate_model
+      - replication_reconcile_once
+      - monitor_sync_once
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && always() && needs.replication_reconcile_once.result == 'success' && needs.monitor_sync_once.result == 'success' }}
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.ROLE_ARN }}
+
+      - name: Connect to EKS cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}" \
+            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
+            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
+
+      - name: List enabled replication pipelines
+        id: pipelines
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PIPELINES="$(python3 hack/goldengate-deployment-model.py --environment dev replication-pipelines)"
+          if [ -z "$PIPELINES" ]; then
+            echo "has_pipelines=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_pipelines=true" >> "$GITHUB_OUTPUT"
+          fi
+          {
+            echo "pipelines<<REPL_MON_EOF"
+            echo "$PIPELINES"
+            echo "REPL_MON_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify replication process acceptance via the monitor API (read-only)
+        if: steps.pipelines.outputs.has_pipelines == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          POD_NAME="$(kubectl get pods -n goldengate-monitoring -l app.kubernetes.io/name=gg-monitor -o json \
+            | python3 -c "import json,sys; items=json.load(sys.stdin)['items']; ready=[i['metadata']['name'] for i in items if i['status'].get('phase')=='Running' and i['metadata'].get('deletionTimestamp') is None and all(c.get('ready') for c in i['status'].get('containerStatuses', []))]; print(ready[0] if ready else '')")"
+          if [ -z "$POD_NAME" ]; then
+            echo "FAIL: no Ready gg-monitor pod found in goldengate-monitoring."
+            exit 1
+          fi
+
+          kubectl exec "$POD_NAME" -n goldengate-monitoring -- \
+            python3 -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8080/api/processes', timeout=5).read().decode('utf-8'))" \
+            > /tmp/api-processes.json
+
+          while IFS= read -r pipeline_id; do
+            [ -z "$pipeline_id" ] && continue
+            echo "::group::Verifying ${pipeline_id}"
+
+            python3 hack/goldengate-deployment-model.py --environment dev replication-plan "$pipeline_id" > /tmp/plan.json
+
+            python3 - "$pipeline_id" <<'PYEOF'
+          import json, sys
+
+          pipeline_id = sys.argv[1]
+          with open("/tmp/plan.json") as f:
+              plan = json.load(f)
+          with open("/tmp/api-processes.json") as f:
+              api = json.load(f)
+
+          deployments = {d["deploymentName"]: d for d in api.get("deployments", [])}
+
+          def require_process(deployment_name, process_name, expect_running):
+              dep = deployments.get(deployment_name)
+              if dep is None:
+                  print(f"FAIL: {pipeline_id}: monitor has no entry for deployment {deployment_name}")
+                  sys.exit(1)
+              discovery = dep.get("processDiscovery") or {}
+              if discovery.get("status") != "OK":
+                  print(f"FAIL: {pipeline_id}: {deployment_name} processDiscovery.status is {discovery.get('status')!r}, expected OK")
+                  sys.exit(1)
+              rows = [p for p in dep.get("processes", []) if p.get("process") == process_name]
+              if not rows:
+                  print(f"FAIL: {pipeline_id}: {deployment_name} has no real process row named {process_name!r}")
+                  sys.exit(1)
+              row = rows[0]
+              if row.get("stale"):
+                  print(f"FAIL: {pipeline_id}: {deployment_name} process {process_name!r} is stale")
+                  sys.exit(1)
+              if row.get("status") == "ABENDED":
+                  print(f"FAIL: {pipeline_id}: {deployment_name} process {process_name!r} is ABENDED")
+                  sys.exit(1)
+              if expect_running and row.get("status") != "RUNNING":
+                  print(f"FAIL: {pipeline_id}: {deployment_name} process {process_name!r} expected RUNNING, found {row.get('status')!r}")
+                  sys.exit(1)
+              print(f"OK: {pipeline_id}: {deployment_name} process {process_name!r} status={row.get('status')} stale={row.get('stale')}")
+
+          require_process(plan["source"]["deploymentId"], plan["extract"]["name"], plan["extract"]["startOnCreate"])
+          require_process(plan["source"]["deploymentId"], plan["distribution"]["pathName"], plan["distribution"]["startOnCreate"])
+          require_process(plan["target"]["deploymentId"], plan["replicat"]["name"], plan["replicat"]["startOnCreate"])
+          print(f"OK: {pipeline_id}: all expected replication process rows are present, current, and not ABENDED")
+          PYEOF
+            echo "::endgroup::"
+          done <<< "${{ steps.pipelines.outputs.pipelines }}"
+
+      - name: No replication pipeline enabled
+        if: steps.pipelines.outputs.has_pipelines == 'false'
+        shell: bash
+        run: |
+          echo "No enabled replication pipeline -- clean no-op: replication-specific monitor acceptance skipped."
+
   final_validation:
     name: Final validation
 
@@ -2206,7 +2331,8 @@ jobs:
       - replication_dry_run_validation
       - monitor_sync_once
       - monitor_dry_run_validation
-    if: ${{ always() && needs.validate_shared_secrets_once.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' && needs.replication_reconcile_once.result != 'failure' && needs.replication_reconcile_once.result != 'cancelled' && needs.replication_dry_run_validation.result != 'failure' && needs.replication_dry_run_validation.result != 'cancelled' && needs.monitor_sync_once.result != 'failure' && needs.monitor_sync_once.result != 'cancelled' && needs.monitor_dry_run_validation.result != 'failure' && needs.monitor_dry_run_validation.result != 'cancelled' }}
+      - replication_monitor_acceptance
+    if: ${{ always() && needs.validate_shared_secrets_once.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' && needs.replication_reconcile_once.result != 'failure' && needs.replication_reconcile_once.result != 'cancelled' && needs.replication_dry_run_validation.result != 'failure' && needs.replication_dry_run_validation.result != 'cancelled' && needs.monitor_sync_once.result != 'failure' && needs.monitor_sync_once.result != 'cancelled' && needs.monitor_dry_run_validation.result != 'failure' && needs.monitor_dry_run_validation.result != 'cancelled' && needs.replication_monitor_acceptance.result != 'failure' && needs.replication_monitor_acceptance.result != 'cancelled' }}
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 

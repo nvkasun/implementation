@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import json
 import os
 import unittest
@@ -51,7 +52,7 @@ PLAN = {
     "supplementalLogging": {"objects": ["public.payments"]},
     "extract": {
         "name": "PGSRC01", "pluginType": "pgoutput", "begin": "now", "startOnCreate": True,
-        "trail": {"name": "pa"}, "tables": ["public.payments"],
+        "trail": {"name": "pa", "sizeMB": 500}, "tables": ["public.payments"],
     },
     "distribution": {
         "pathName": "PG2MS01", "sourceTrailName": "pa", "targetTrailName": "ma",
@@ -60,8 +61,38 @@ PLAN = {
 }
 
 
+def _extract_response(alias="SRC_ALIAS", domain="OracleGoldenGate"):
+    return {"response": {
+        "source": "tranlogs", "pluginType": "pgoutput",
+        "credentials": {"alias": alias, "domain": domain},
+        "targets": [{"name": "pa", "type": "trail", "fileSize": 500}],
+        "config": repl._generate_extract_config(PLAN["extract"], alias, domain),
+    }}
+
+
+def _replicat_response(alias="TGT_ALIAS", domain="OracleGoldenGate"):
+    return {"response": {
+        "source": {"name": "ma", "type": "trail"},
+        "credentials": {"alias": alias, "domain": domain},
+        "checkpoint": {"table": "dbo.gg_checkpoint"},
+        "mode": {"type": "nonintegrated", "parallel": False},
+        "config": repl._generate_replicat_config(PLAN["replicat"], alias, domain),
+    }}
+
+
+def _distribution_response(target_host="gg-mssql-tgt-fixture-01.goldengate-dev.adcbmis.local"):
+    return {"response": {
+        "targetInitiated": False,
+        "source": {"uri": "localtrail:pa"},
+        "target": {
+            "uri": f"wss://{target_host}:443/services/v2/targets?trail=ma",
+            "authenticationMethod": {"alias": "NET_TEST", "domain": "Network"},
+        },
+    }}
+
+
 class FakeClient:
-    """In-memory GET/POST double; never issues DELETE/PUT/PATCH because those methods do not exist on it."""
+    """In-memory GET/POST/PATCH double using sanitized Oracle-contract response shapes; never issues DELETE or credential/config PUT."""
 
     def __init__(self, existing=None, statuses=None):
         self.objects = dict(existing or {})
@@ -77,54 +108,133 @@ class FakeClient:
         if path.endswith("/valid"):
             return 200, {"valid": True}
         if path == "/services/v2/targets":
-            return 200, {"response": {"items": [{"name": "PG2MS01"}]}}
-        if path.startswith("/services/v2/targets/"):
-            return 200, {"response": {"trail": "ma"}}
+            return 200, {"response": {"items": [{"name": "PG2MS01", "trail": "ma"}]}}
         return 404, None
 
     def post(self, path, body):
         self.calls.append(("POST", path, body))
         if path == repl.commands_execute_path():
             return 200, {}
-        self.objects[path] = {"response": {"status": "RUNNING", "trail": body.get("trail")}}
+        if "trandata" in path:
+            if body.get("operation") == "info":
+                return 200, {"response": {"loggingEnabled": False}}
+            return 200, {}
+        if "checkpoint" in path:
+            if body.get("operation") == "info":
+                return 200, {"response": {"exists": False}}
+            return 200, {}
+        if "extracts" in path:
+            self.objects[path] = _extract_response(body["credentials"]["alias"], body["credentials"]["domain"])
+        elif "replicats" in path:
+            self.objects[path] = _replicat_response(body["credentials"]["alias"], body["credentials"]["domain"])
+        elif "sources" in path:
+            self.objects[path] = _distribution_response(body["target"]["uri"].split("//")[1].split(":")[0])
+        elif "credentials" in path:
+            pass
         return 201, {}
 
+    def patch(self, path, body):
+        self.calls.append(("PATCH", path, body))
+        return 200, {}
 
-def with_secret_files(func):
-    return mock.patch.object(repl, "read_secret_file", return_value="fake-value")(func)
+
+def inspect_source(func):
+    return inspect.getsource(func)
 
 
-class CredentialTests(unittest.TestCase):
+class WorkerStdlibOnlyTests(unittest.TestCase):
+    def test_8_worker_mode_does_not_require_pyyaml(self):
+        import sys
+
+        class _BlockYaml:
+            def find_module(self, name, path=None):
+                return self if name == "yaml" else None
+
+            def load_module(self, name):
+                raise ImportError("yaml is deliberately unavailable in this test")
+
+        blocker = _BlockYaml()
+        sys.meta_path.insert(0, blocker)
+        saved = sys.modules.pop("yaml", None)
+        try:
+            spec = importlib.util.spec_from_file_location("goldengate_replication_no_yaml", TOOL_PATH)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            with mock.patch.object(module, "read_secret_file", return_value="fake-value"):
+                src_client, tgt_client = FakeClient(), FakeClient()
+                module.reconcile_pipeline(PLAN, src_client, tgt_client)
+        finally:
+            sys.meta_path.remove(blocker)
+            if saved is not None:
+                sys.modules["yaml"] = saved
+
+    def test_worker_never_imports_deployment_model_module(self):
+        source = inspect_source(repl.reconcile_pipeline)
+        self.assertNotIn("_gdm", source)
+
+    def test_import_statement_is_not_module_level(self):
+        with open(TOOL_PATH) as f:
+            lines = f.read().splitlines()
+        module_level_import_lines = [l for l in lines if l == "import yaml"]
+        self.assertEqual(module_level_import_lines, [])
+        self.assertIn("    import yaml", lines)
+
+
+class CredentialContractTests(unittest.TestCase):
+    def test_3_credential_post_body_has_userid_password_no_alias(self):
+        client = FakeClient()
+        repl.ensure_database_credential(client, "OracleGoldenGate", "SRC_ALIAS", "u", "p")
+        post = next(c for c in client.calls if c[0] == "POST" and "credentials" in c[1])
+        self.assertEqual(set(post[2].keys()), {"userid", "password"})
+        self.assertNotIn("alias", post[2])
+
     def test_29_get_existing_credential_succeeds(self):
         path = repl.credential_path("OracleGoldenGate", "SRC_ALIAS")
         client = FakeClient(existing={path: {"response": {}}})
-        repl.ensure_credential(client, "OracleGoldenGate", "SRC_ALIAS", "u", "p")
+        repl.ensure_database_credential(client, "OracleGoldenGate", "SRC_ALIAS", "u", "p")
         self.assertIn(("GET", path), client.calls)
         self.assertFalse(any(c[0] == "POST" and c[1] == path for c in client.calls))
 
     def test_30_missing_credential_is_created_once(self):
         client = FakeClient()
-        repl.ensure_credential(client, "OracleGoldenGate", "SRC_ALIAS", "u", "p")
+        repl.ensure_database_credential(client, "OracleGoldenGate", "SRC_ALIAS", "u", "p")
         posts = [c for c in client.calls if c[0] == "POST" and "credentials" in c[1]]
         self.assertEqual(len(posts), 1)
 
     def test_31_existing_credential_is_never_replaced(self):
         path = repl.credential_path("OracleGoldenGate", "SRC_ALIAS")
         client = FakeClient(existing={path: {"response": {}}})
-        repl.ensure_credential(client, "OracleGoldenGate", "SRC_ALIAS", "u", "p")
+        repl.ensure_database_credential(client, "OracleGoldenGate", "SRC_ALIAS", "u", "p")
         self.assertNotIn((path,), [c[1:2] for c in client.calls if c[0] == "POST"])
 
-    def test_32_invalid_credential_fails(self):
+    def test_32_invalid_database_credential_fails(self):
         valid_path = repl.credential_valid_path("OracleGoldenGate", "SRC_ALIAS")
         client = FakeClient(statuses={valid_path: 200})
         client.objects[valid_path] = {"valid": False}
         with self.assertRaises(repl.ReplicationError):
-            repl.ensure_credential(client, "OracleGoldenGate", "SRC_ALIAS", "u", "p")
+            repl.ensure_database_credential(client, "OracleGoldenGate", "SRC_ALIAS", "u", "p")
+
+    def test_network_alias_never_calls_valid_endpoint(self):
+        client = FakeClient()
+        repl.ensure_network_credential(client, "Network", "NET_TEST", "u", "p")
+        self.assertFalse(any("/valid" in c[1] for c in client.calls))
+
+    def test_network_credential_post_body_has_no_alias(self):
+        client = FakeClient()
+        repl.ensure_network_credential(client, "Network", "NET_TEST", "u", "p")
+        post = next(c for c in client.calls if c[0] == "POST")
+        self.assertNotIn("alias", post[2])
+
+    def test_network_credential_never_replaced(self):
+        path = repl.credential_path("Network", "NET_TEST")
+        client = FakeClient(existing={path: {"response": {}}})
+        repl.ensure_network_credential(client, "Network", "NET_TEST", "u", "p")
+        self.assertFalse(any(c[0] == "POST" for c in client.calls))
 
     def test_51_no_credential_value_appears_in_error_reason(self):
         client = FakeClient()
         try:
-            repl.ensure_credential(client, "OracleGoldenGate", "SRC_ALIAS", "super-secret-user", "super-secret-pass")
+            repl.ensure_database_credential(client, "OracleGoldenGate", "SRC_ALIAS", "super-secret-user", "super-secret-pass")
         except repl.ReplicationError as exc:
             self.assertNotIn("super-secret", exc.reason)
 
@@ -148,49 +258,122 @@ class CredentialTests(unittest.TestCase):
             repl._build_ssl_context("/nonexistent/ca.pem")
 
 
-class TrandataCheckpointTests(unittest.TestCase):
+class TrandataCheckpointContractTests(unittest.TestCase):
+    def test_trandata_info_runs_before_add(self):
+        client = FakeClient()
+        repl.ensure_trandata(client, "OracleGoldenGate.SRC_ALIAS", "public.payments")
+        posts = [c for c in client.calls if c[0] == "POST" and "trandata" in c[1]]
+        self.assertEqual(posts[0][2]["operation"], "info")
+        self.assertEqual(posts[1][2]["operation"], "add")
+
+    def test_trandata_body_has_operation_and_tableName(self):
+        client = FakeClient()
+        repl.ensure_trandata(client, "OracleGoldenGate.SRC_ALIAS", "public.payments")
+        for _method, _path, body in [c for c in client.calls if c[0] == "POST"]:
+            self.assertEqual(set(body.keys()), {"operation", "tableName"})
+
     def test_33_trandata_missing_is_added(self):
         client = FakeClient()
         repl.ensure_trandata(client, "OracleGoldenGate.SRC_ALIAS", "public.payments")
-        self.assertTrue(any(c[0] == "POST" and "trandata" in c[1] for c in client.calls))
+        add_calls = [c for c in client.calls if c[0] == "POST" and c[2].get("operation") == "add"]
+        self.assertEqual(len(add_calls), 1)
 
-    def test_34_trandata_request_is_idempotent_by_design(self):
+    def test_34_existing_trandata_is_not_modified(self):
         client = FakeClient()
+        client.post = lambda path, body: (200, {"response": {"loggingEnabled": True}})
         repl.ensure_trandata(client, "OracleGoldenGate.SRC_ALIAS", "public.payments")
-        repl.ensure_trandata(client, "OracleGoldenGate.SRC_ALIAS", "public.payments")
-        posts = [c for c in client.calls if c[0] == "POST" and "trandata" in c[1]]
-        self.assertEqual(len(posts), 2)
+
+    def test_trandata_unrecognized_info_response_fails_closed(self):
+        client = FakeClient()
+        client.post = lambda path, body: (200, {"response": {}})
+        with self.assertRaises(repl.ReplicationError):
+            repl.ensure_trandata(client, "OracleGoldenGate.SRC_ALIAS", "public.payments")
+
+    def test_checkpoint_info_runs_before_add(self):
+        client = FakeClient()
+        repl.ensure_checkpoint_table(client, "OracleGoldenGate.TGT_ALIAS", PLAN["checkpoint"])
+        posts = [c for c in client.calls if c[0] == "POST" and "checkpoint" in c[1]]
+        self.assertEqual(posts[0][2]["operation"], "info")
+        self.assertEqual(posts[1][2]["operation"], "add")
+
+    def test_checkpoint_body_has_operation_and_name(self):
+        client = FakeClient()
+        repl.ensure_checkpoint_table(client, "OracleGoldenGate.TGT_ALIAS", PLAN["checkpoint"])
+        for _method, _path, body in [c for c in client.calls if c[0] == "POST"]:
+            self.assertEqual(set(body.keys()), {"operation", "name"})
 
     def test_35_missing_checkpoint_table_is_added(self):
         client = FakeClient()
         repl.ensure_checkpoint_table(client, "OracleGoldenGate.TGT_ALIAS", PLAN["checkpoint"])
-        self.assertTrue(any(c[0] == "POST" and "checkpoint" in c[1] for c in client.calls))
+        add_calls = [c for c in client.calls if c[0] == "POST" and c[2].get("operation") == "add"]
+        self.assertEqual(len(add_calls), 1)
 
-    def test_36_checkpoint_not_requested_when_create_if_missing_false(self):
+    def test_36_existing_checkpoint_table_is_not_modified(self):
         client = FakeClient()
-        repl.ensure_checkpoint_table(client, "OracleGoldenGate.TGT_ALIAS", {"table": "dbo.gg_checkpoint", "createIfMissing": False})
-        self.assertFalse(client.calls)
+        client.post = lambda path, body: (200, {"response": {"exists": True}})
+        repl.ensure_checkpoint_table(client, "OracleGoldenGate.TGT_ALIAS", PLAN["checkpoint"])
+
+    def test_checkpoint_absent_without_create_if_missing_fails(self):
+        client = FakeClient()
+        client.post = lambda path, body: (200, {"response": {"exists": False}})
+        with self.assertRaises(repl.ReplicationError):
+            repl.ensure_checkpoint_table(client, "OracleGoldenGate.TGT_ALIAS", {"table": "dbo.gg_checkpoint", "createIfMissing": False})
 
 
-class ExtractReplicatDistributionTests(unittest.TestCase):
+class ExtractContractTests(unittest.TestCase):
+    def test_extract_uses_config_source_pluginType_targets_credentials_status(self):
+        client = FakeClient()
+        repl.ensure_extract(client, "SRC_ALIAS", "OracleGoldenGate", PLAN["extract"])
+        post = next(c for c in client.calls if c[0] == "POST" and "extracts" in c[1])
+        body = post[2]
+        for key in ("config", "source", "pluginType", "targets", "credentials", "status"):
+            self.assertIn(key, body)
+        self.assertEqual(body["source"], "tranlogs")
+        self.assertEqual(body["status"], "stopped")
+
     def test_37_missing_extract_is_created_stopped(self):
         client = FakeClient()
         state = repl.ensure_extract(client, "SRC_ALIAS", "OracleGoldenGate", PLAN["extract"])
         self.assertEqual(state, "created")
-        post = next(c for c in client.calls if c[0] == "POST")
-        self.assertNotIn("start", json.dumps(post[2]).lower())
 
     def test_38_equivalent_extract_is_accepted(self):
         path = repl.extract_path("PGSRC01")
-        client = FakeClient(existing={path: {"response": {"trail": "pa"}}})
+        client = FakeClient(existing={path: _extract_response()})
         state = repl.ensure_extract(client, "SRC_ALIAS", "OracleGoldenGate", PLAN["extract"])
         self.assertEqual(state, "existing")
 
     def test_39_drifted_extract_fails(self):
         path = repl.extract_path("PGSRC01")
-        client = FakeClient(existing={path: {"response": {"trail": "zz"}}})
+        drifted = _extract_response()
+        drifted["response"]["pluginType"] = "test_decoding"
+        client = FakeClient(existing={path: drifted})
         with self.assertRaises(repl.DriftError):
             repl.ensure_extract(client, "SRC_ALIAS", "OracleGoldenGate", PLAN["extract"])
+
+    def test_8_missing_required_response_field_fails_closed_not_equivalent(self):
+        path = repl.extract_path("PGSRC01")
+        incomplete = {"response": {"source": "tranlogs", "pluginType": "pgoutput"}}
+        client = FakeClient(existing={path: incomplete})
+        with self.assertRaises(repl.ReplicationError) as ctx:
+            repl.ensure_extract(client, "SRC_ALIAS", "OracleGoldenGate", PLAN["extract"])
+        self.assertNotIsInstance(ctx.exception, repl.DriftError)
+
+    def test_8_extract_normalizer_compares_more_than_trail(self):
+        source = inspect_source(repl._normalize_extract_actual)
+        for field in ("source", "pluginType", "credentials", "targets", "config"):
+            self.assertIn(field, source)
+
+
+class ReplicatContractTests(unittest.TestCase):
+    def test_replicat_uses_config_source_checkpoint_mode_credentials_status(self):
+        client = FakeClient()
+        repl.ensure_replicat(client, "TGT_ALIAS", "OracleGoldenGate", PLAN["replicat"], PLAN["checkpoint"])
+        post = next(c for c in client.calls if c[0] == "POST" and "replicats" in c[1])
+        body = post[2]
+        for key in ("config", "source", "checkpoint", "mode", "credentials", "status"):
+            self.assertIn(key, body)
+        self.assertEqual(body["mode"], {"type": "nonintegrated", "parallel": False})
+        self.assertEqual(body["status"], "stopped")
 
     def test_40_missing_replicat_is_created_stopped(self):
         client = FakeClient()
@@ -199,47 +382,156 @@ class ExtractReplicatDistributionTests(unittest.TestCase):
 
     def test_41_equivalent_replicat_is_accepted(self):
         path = repl.replicat_path("MSTGT01")
-        client = FakeClient(existing={path: {"response": {"trail": "ma"}}})
+        client = FakeClient(existing={path: _replicat_response()})
         state = repl.ensure_replicat(client, "TGT_ALIAS", "OracleGoldenGate", PLAN["replicat"], PLAN["checkpoint"])
         self.assertEqual(state, "existing")
 
     def test_42_drifted_replicat_fails(self):
         path = repl.replicat_path("MSTGT01")
-        client = FakeClient(existing={path: {"response": {"trail": "zz"}}})
+        drifted = _replicat_response()
+        drifted["response"]["mode"]["parallel"] = True
+        client = FakeClient(existing={path: drifted})
         with self.assertRaises(repl.DriftError):
             repl.ensure_replicat(client, "TGT_ALIAS", "OracleGoldenGate", PLAN["replicat"], PLAN["checkpoint"])
 
+    def test_10_missing_required_response_field_fails_closed(self):
+        path = repl.replicat_path("MSTGT01")
+        incomplete = {"response": {"source": {"name": "ma"}}}
+        client = FakeClient(existing={path: incomplete})
+        with self.assertRaises(repl.ReplicationError) as ctx:
+            repl.ensure_replicat(client, "TGT_ALIAS", "OracleGoldenGate", PLAN["replicat"], PLAN["checkpoint"])
+        self.assertNotIsInstance(ctx.exception, repl.DriftError)
+
+    def test_10_replicat_normalizer_compares_more_than_trail(self):
+        source = inspect_source(repl._normalize_replicat_actual)
+        for field in ("source", "credentials", "checkpoint", "mode", "config"):
+            self.assertIn(field, source)
+
+    def test_replicat_never_enables_parallel_integrated_or_ddl(self):
+        client = FakeClient()
+        repl.ensure_replicat(client, "TGT_ALIAS", "OracleGoldenGate", PLAN["replicat"], PLAN["checkpoint"])
+        post = next(c for c in client.calls if c[0] == "POST" and "replicats" in c[1])
+        self.assertEqual(post[2]["mode"]["type"], "nonintegrated")
+        self.assertFalse(post[2]["mode"]["parallel"])
+
+
+class StartCommandContractTests(unittest.TestCase):
+    def test_10_start_command_uses_name_processName_processType(self):
+        client = FakeClient()
+        repl.start_process(client, "extract", "PGSRC01")
+        post = next(c for c in client.calls if c[0] == "POST")
+        self.assertEqual(post[2], {"name": "start", "processName": "PGSRC01", "processType": "extract"})
+
+    def test_start_replicat_process_type(self):
+        client = FakeClient()
+        repl.start_process(client, "replicat", "MSTGT01")
+        post = next(c for c in client.calls if c[0] == "POST")
+        self.assertEqual(post[2]["processType"], "replicat")
+
+
+class DistributionContractTests(unittest.TestCase):
+    def test_distribution_uses_source_target_uri_and_authenticationMethod(self):
+        client = FakeClient()
+        repl.ensure_distribution_path(client, PLAN["distribution"], "gg-mssql-tgt-fixture-01.goldengate-dev.adcbmis.local", "NET_TEST", "Network")
+        post = next(c for c in client.calls if c[0] == "POST" and "sources" in c[1])
+        body = post[2]
+        self.assertEqual(body["targetInitiated"], False)
+        self.assertEqual(body["status"], "stopped")
+        self.assertIn("uri", body["source"])
+        self.assertIn("uri", body["target"])
+        self.assertEqual(body["target"]["authenticationMethod"], {"alias": "NET_TEST", "domain": "Network"})
+
+    def test_12_network_alias_referenced_by_distribution_request(self):
+        client = FakeClient()
+        repl.ensure_distribution_path(client, PLAN["distribution"], "gg-mssql-tgt-fixture-01.goldengate-dev.adcbmis.local", "NET_TEST", "Network")
+        post = next(c for c in client.calls if c[0] == "POST" and "sources" in c[1])
+        self.assertEqual(post[2]["target"]["authenticationMethod"]["alias"], "NET_TEST")
+
+    def test_distribution_target_uri_uses_wss_443_and_target_trail(self):
+        client = FakeClient()
+        repl.ensure_distribution_path(client, PLAN["distribution"], "gg-mssql-tgt-fixture-01.goldengate-dev.adcbmis.local", "NET_TEST", "Network")
+        post = next(c for c in client.calls if c[0] == "POST" and "sources" in c[1])
+        self.assertEqual(post[2]["target"]["uri"], "wss://gg-mssql-tgt-fixture-01.goldengate-dev.adcbmis.local:443/services/v2/targets?trail=ma")
+
     def test_43_missing_distribution_path_is_created_stopped(self):
         client = FakeClient()
-        state = repl.ensure_distribution_path(client, PLAN["distribution"], "gg-mssql-tgt-fixture-01.goldengate-dev.adcbmis.local")
+        state = repl.ensure_distribution_path(client, PLAN["distribution"], "gg-mssql-tgt-fixture-01.goldengate-dev.adcbmis.local", "NET_TEST", "Network")
         self.assertEqual(state, "created")
 
     def test_44_equivalent_distribution_path_is_accepted(self):
         path = repl.distribution_path("PG2MS01")
-        client = FakeClient(existing={path: {"response": {"trail": "pa", "target": "gg-mssql-tgt-fixture-01.goldengate-dev.adcbmis.local"}}})
-        state = repl.ensure_distribution_path(client, PLAN["distribution"], "gg-mssql-tgt-fixture-01.goldengate-dev.adcbmis.local")
+        client = FakeClient(existing={path: _distribution_response()})
+        state = repl.ensure_distribution_path(client, PLAN["distribution"], "gg-mssql-tgt-fixture-01.goldengate-dev.adcbmis.local", "NET_TEST", "Network")
         self.assertEqual(state, "existing")
 
     def test_45_drifted_distribution_path_fails(self):
         path = repl.distribution_path("PG2MS01")
-        client = FakeClient(existing={path: {"response": {"trail": "zz"}}})
+        drifted = _distribution_response()
+        drifted["response"]["targetInitiated"] = True
+        client = FakeClient(existing={path: drifted})
         with self.assertRaises(repl.DriftError):
-            repl.ensure_distribution_path(client, PLAN["distribution"], "gg-mssql-tgt-fixture-01.goldengate-dev.adcbmis.local")
+            repl.ensure_distribution_path(client, PLAN["distribution"], "gg-mssql-tgt-fixture-01.goldengate-dev.adcbmis.local", "NET_TEST", "Network")
+
+    def test_14_missing_required_field_fails_closed(self):
+        path = repl.distribution_path("PG2MS01")
+        incomplete = {"response": {"targetInitiated": False}}
+        client = FakeClient(existing={path: incomplete})
+        with self.assertRaises(repl.ReplicationError) as ctx:
+            repl.ensure_distribution_path(client, PLAN["distribution"], "gg-mssql-tgt-fixture-01.goldengate-dev.adcbmis.local", "NET_TEST", "Network")
+        self.assertNotIsInstance(ctx.exception, repl.DriftError)
+
+    def test_13_distribution_status_change_uses_patch_not_commands_execute(self):
+        client = FakeClient()
+        repl.start_distribution_path(client, "PG2MS01")
+        self.assertTrue(any(c[0] == "PATCH" for c in client.calls))
+        self.assertFalse(any(c[0] == "POST" and c[1] == repl.commands_execute_path() for c in client.calls))
+
+    def test_13_patch_never_used_for_credentials_extract_replicat(self):
+        for func in (repl.ensure_database_credential, repl.ensure_network_credential, repl.ensure_extract, repl.ensure_replicat):
+            self.assertNotIn("patch(", inspect_source(func))
+
+    def test_13_patch_body_is_minimal_status_transition(self):
+        client = FakeClient()
+        repl.start_distribution_path(client, "PG2MS01")
+        patch_call = next(c for c in client.calls if c[0] == "PATCH")
+        self.assertEqual(patch_call[2], {"status": "running"})
+
+
+class ReceiverContractTests(unittest.TestCase):
+    def test_15_receiver_matches_by_trail_not_assumed_same_name(self):
+        client = FakeClient()
+        client.get = lambda path, retry=0: (200, {"response": {"items": [{"name": "SOME-OTHER-NAME", "trail": "ma"}]}}) if path == "/services/v2/targets" else (404, None)
+        repl.verify_receiver_path(client, "ma")
+
+    def test_15_no_automatic_detail_get_by_assumed_path_name(self):
+        source = inspect_source(repl.verify_receiver_path)
+        self.assertNotIn("receiver_path_detail_path", source)
 
     def test_46_receiver_path_is_verified(self):
         client = FakeClient()
-        repl.verify_receiver_path(client, "PG2MS01", "ma")
+        repl.verify_receiver_path(client, "ma")
         self.assertTrue(any(c[1] == repl.receiver_paths_path() for c in client.calls))
 
-    def test_46b_duplicate_receiver_path_fails(self):
+    def test_46b_duplicate_receiver_trail_fails(self):
         client = FakeClient()
-        client.get = lambda path, retry=0: (
-            (200, {"response": {"items": [{"name": "PG2MS01"}, {"name": "PG2MS01"}]}}) if path == repl.receiver_paths_path()
-            else (200, {"response": {"trail": "ma"}})
-        )
+        client.get = lambda path, retry=0: (200, {"response": {"items": [{"name": "A", "trail": "ma"}, {"name": "B", "trail": "ma"}]}})
         with self.assertRaises(repl.ReplicationError):
-            repl.verify_receiver_path(client, "PG2MS01", "ma")
+            repl.verify_receiver_path(client, "ma")
 
+    def test_receiver_no_match_fails_closed(self):
+        client = FakeClient()
+        client.get = lambda path, retry=0: (200, {"response": {"items": [{"name": "A", "trail": "zz"}]}})
+        with self.assertRaises(repl.ReplicationError):
+            repl.verify_receiver_path(client, "ma")
+
+    def test_receiver_unrecognized_shape_fails_closed(self):
+        client = FakeClient()
+        client.get = lambda path, retry=0: (200, {"unexpected": "shape"})
+        with self.assertRaises(repl.ReplicationError):
+            repl.verify_receiver_path(client, "ma")
+
+
+class TransportSafetyTests(unittest.TestCase):
     def test_47_unknown_post_result_is_not_blindly_retried(self):
         with mock.patch.object(repl, "_build_ssl_context", return_value=None):
             client_obj = repl.GGClient("example.invalid", "u", "p", "/dev/null", timeout=1)
@@ -249,36 +541,42 @@ class ExtractReplicatDistributionTests(unittest.TestCase):
                 client_obj.post("/services/v2/extracts/PGSRC01", {"name": "PGSRC01"})
             self.assertEqual(mock_conn.return_value.request.call_count, 1)
 
+    def test_unknown_patch_result_is_not_blindly_retried(self):
+        with mock.patch.object(repl, "_build_ssl_context", return_value=None):
+            client_obj = repl.GGClient("example.invalid", "u", "p", "/dev/null", timeout=1)
+        with mock.patch("http.client.HTTPSConnection") as mock_conn:
+            mock_conn.return_value.request.side_effect = TimeoutError("simulated")
+            with self.assertRaises(repl.IndeterminateError):
+                client_obj.patch("/services/v2/sources/PG2MS01", {"status": "running"})
+            self.assertEqual(mock_conn.return_value.request.call_count, 1)
+
     def test_48_no_delete_method_exists_on_client(self):
         self.assertFalse(hasattr(repl.GGClient, "delete"))
 
     def test_49_no_put_method_exists_on_client(self):
         self.assertFalse(hasattr(repl.GGClient, "put"))
 
-    def test_50_no_process_patch_is_issued(self):
-        self.assertFalse(hasattr(repl.GGClient, "patch"))
-        source = inspect_source(repl.ensure_extract)
-        self.assertNotIn("PATCH", source)
-
-
-def inspect_source(func):
-    import inspect
-    return inspect.getsource(func)
+    def test_50_patch_permitted_only_for_distribution_status(self):
+        self.assertTrue(hasattr(repl.GGClient, "patch"))
+        self.assertIn("Distribution", inspect_source(repl.GGClient.patch))
 
 
 class StartSemanticsTests(unittest.TestCase):
     def test_53_54_55_start_order_replicat_then_distribution_then_extract(self):
-        calls = []
         source_client, target_client = FakeClient(), FakeClient()
         with mock.patch.object(repl, "read_secret_file", return_value="fake-value"):
             repl.reconcile_pipeline(PLAN, source_client, target_client)
         target_starts = [c for c in target_client.calls if c[0] == "POST" and c[1] == repl.commands_execute_path()]
-        source_starts = [c for c in source_client.calls if c[0] == "POST" and c[1] == repl.commands_execute_path()]
         self.assertEqual(len(target_starts), 1)
-        self.assertEqual(target_starts[0][2]["type"], "replicat")
-        self.assertEqual(len(source_starts), 2)
-        self.assertEqual(source_starts[0][2]["type"], "source")
-        self.assertEqual(source_starts[1][2]["type"], "extract")
+        self.assertEqual(target_starts[0][2]["processType"], "replicat")
+        distribution_patches = [c for c in source_client.calls if c[0] == "PATCH"]
+        self.assertEqual(len(distribution_patches), 1)
+        extract_starts = [c for c in source_client.calls if c[0] == "POST" and c[1] == repl.commands_execute_path()]
+        self.assertEqual(len(extract_starts), 1)
+        self.assertEqual(extract_starts[0][2]["processType"], "extract")
+        patch_index = source_client.calls.index(distribution_patches[0])
+        extract_index = source_client.calls.index(extract_starts[0])
+        self.assertLess(patch_index, extract_index)
 
     def test_56_existing_stopped_process_is_not_started(self):
         client = FakeClient()
@@ -295,18 +593,77 @@ class StartSemanticsTests(unittest.TestCase):
         self.assertFalse(any(c[0] == "POST" for c in client.calls))
 
     def test_58_a_failure_stops_later_start_steps(self):
-        # Creation already occurred (safe/idempotent) by the time ABENDED is detected at start time; the safety property is that no START command follows.
         source_client, target_client = FakeClient(), FakeClient()
         target_client.objects[repl.replicat_path("MSTGT01")] = {"response": {"status": "ABENDED"}}
         with mock.patch.object(repl, "read_secret_file", return_value="fake-value"):
             with self.assertRaises(repl.ReplicationError):
                 repl.reconcile_pipeline(PLAN, source_client, target_client)
         self.assertFalse(any(c[0] == "POST" and c[1] == repl.commands_execute_path() for c in source_client.calls))
+        self.assertFalse(any(c[0] == "PATCH" for c in source_client.calls))
+
+
+class FlatCsiAliasTests(unittest.TestCase):
+    def setUp(self):
+        self.manifests = repl.render_manifests(PLAN, "goldengate-dev", "eu-west-1", "# source", "test-exec-1")
+
+    def test_9_flat_aliases_no_slashes(self):
+        spc = self.manifests["SecretProviderClass"]
+        objects_text = spc["spec"]["parameters"]["objects"]
+        for alias in ("source-admin-username", "source-admin-password", "target-admin-username", "target-admin-password",
+                      "source-db-userid", "source-db-password", "target-db-userid", "target-db-password", "tls-ca-chain.pem"):
+            self.assertIn(alias, objects_text)
+            self.assertNotIn(f"{alias}/", objects_text)
+
+    def test_9_no_nested_slash_aliases_remain(self):
+        spc = self.manifests["SecretProviderClass"]
+        objects_text = spc["spec"]["parameters"]["objects"]
+        for legacy in ("source-admin/username", "target-admin/username", "source-db/userid", "tls/ca-chain.pem"):
+            self.assertNotIn(legacy, objects_text)
+
+    def test_62_job_mounts_exactly_five_secret_groups(self):
+        spc = self.manifests["SecretProviderClass"]
+        objects_text = spc["spec"]["parameters"]["objects"]
+        self.assertEqual(objects_text.count("objectName:"), 5)
+
+
+class JobRerunSafeNamingTests(unittest.TestCase):
+    def test_17_execution_id_separates_from_plan_checksum(self):
+        desired = repl.desired_state_name(PLAN["pipelineId"], PLAN)
+        name1 = repl.job_resource_name(PLAN["pipelineId"], PLAN, "111-1")
+        name2 = repl.job_resource_name(PLAN["pipelineId"], PLAN, "222-1")
+        self.assertTrue(name1.startswith(desired))
+        self.assertTrue(name2.startswith(desired))
+        self.assertNotEqual(name1, name2)
+
+    def test_17_rerun_with_same_plan_different_execution_id_does_not_collide(self):
+        name1 = repl.job_resource_name(PLAN["pipelineId"], PLAN, "111-1")
+        name2 = repl.job_resource_name(PLAN["pipelineId"], PLAN, "111-2")
+        self.assertNotEqual(name1, name2)
+
+    def test_17_plan_checksum_kept_in_job_annotation(self):
+        manifests = repl.render_manifests(PLAN, "goldengate-dev", "eu-west-1", "# source", "111-1")
+        checksum = repl.plan_checksum(PLAN)
+        self.assertEqual(manifests["Job"]["metadata"]["annotations"]["goldengate.adcb/plan-checksum"], checksum)
+
+    def test_17_dry_run_execution_id_is_deterministic(self):
+        name1 = repl.job_resource_name(PLAN["pipelineId"], PLAN, repl.DETERMINISTIC_DRY_RUN_EXECUTION_ID)
+        name2 = repl.job_resource_name(PLAN["pipelineId"], PLAN, repl.DETERMINISTIC_DRY_RUN_EXECUTION_ID)
+        self.assertEqual(name1, name2)
+
+    def test_execution_id_sanitized_and_bounded(self):
+        name = repl.job_resource_name(PLAN["pipelineId"], PLAN, "Run ID! 123/456")
+        self.assertNotIn(" ", name)
+        self.assertNotIn("!", name)
+        self.assertNotIn("/", name)
+
+    def test_empty_execution_id_rejected(self):
+        with self.assertRaises(repl.ReplicationError):
+            repl.job_resource_name(PLAN["pipelineId"], PLAN, "///")
 
 
 class JobRenderingTests(unittest.TestCase):
     def setUp(self):
-        self.manifests = repl.render_manifests(PLAN, "goldengate-dev", "eu-west-1", "# source")
+        self.manifests = repl.render_manifests(PLAN, "goldengate-dev", "eu-west-1", "# source", "test-exec-1")
 
     def test_59_job_uses_source_deployment_service_account(self):
         job = self.manifests["Job"]
@@ -319,14 +676,6 @@ class JobRenderingTests(unittest.TestCase):
     def test_61_job_has_one_container(self):
         job = self.manifests["Job"]
         self.assertEqual(len(job["spec"]["template"]["spec"]["containers"]), 1)
-
-    def test_62_job_mounts_exactly_five_secret_groups(self):
-        spc = self.manifests["SecretProviderClass"]
-        objects_text = spc["spec"]["parameters"]["objects"]
-        self.assertEqual(objects_text.count("objectName:"), 5)
-        for alias in ("source-admin/username", "source-admin/password", "target-admin/username", "target-admin/password",
-                      "source-db/userid", "source-db/password", "target-db/userid", "target-db/password", "tls/ca-chain.pem"):
-            self.assertIn(alias, objects_text)
 
     def test_63_database_secrets_not_synced_to_kubernetes_secrets(self):
         spc = self.manifests["SecretProviderClass"]
@@ -357,11 +706,6 @@ class JobRenderingTests(unittest.TestCase):
             source = f.read()
         self.assertNotIn('"kind": "Deployment"', source)
 
-    def test_job_name_is_deterministic(self):
-        name1 = repl.job_resource_name(PLAN["pipelineId"], PLAN)
-        name2 = repl.job_resource_name(PLAN["pipelineId"], PLAN)
-        self.assertEqual(name1, name2)
-
     def test_job_command_never_starts_goldengate_directly(self):
         job = self.manifests["Job"]
         command = job["spec"]["template"]["spec"]["containers"][0]["command"]
@@ -371,13 +715,12 @@ class JobRenderingTests(unittest.TestCase):
 
 class ReplicationPlanDeterminismTests(unittest.TestCase):
     def test_71_no_secret_value_present_in_rendered_manifests(self):
-        manifests = repl.render_manifests(PLAN, "goldengate-dev", "eu-west-1", "# source")
+        manifests = repl.render_manifests(PLAN, "goldengate-dev", "eu-west-1", "# source", "test-exec-1")
         text = json.dumps(manifests)
         for forbidden in ("super-secret", "OGG_DB_PASSWORD_VALUE"):
             self.assertNotIn(forbidden, text)
 
     def test_72_reconcile_is_a_clean_noop_when_no_pipeline_enabled(self):
-        # An empty pipeline list at the CLI layer means render_manifests/reconcile_pipeline are never invoked.
         with open(TOOL_PATH) as f:
             source = f.read()
         self.assertIn("is not an enabled replication pipeline", source)

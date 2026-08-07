@@ -6839,12 +6839,29 @@ if [ "$FORBIDDEN_6D1_TERMS_FOUND" = "false" ]; then
   pass "32: no observer/utility sidecar, alarm, SNS, or automatic-healing reference exists"
 fi
 
-for method in "def delete(" "def put(" "def patch("; do
+for method in "def delete(" "def put("; do
   if grep -qF -- "$method" "$REPLICATION_TOOL" 2>/dev/null; then
     fail "32: the reconciler REST client defines a forbidden ${method%(} method"
   fi
 done
-pass "32: the reconciler REST client has no delete/put/patch method"
+pass "32: the reconciler REST client has no delete/put method"
+
+# Phase 6D1 correction (Task 13): PATCH is now permitted, but exclusively to transition a newly-created Distribution path from stopped to running.
+if grep -q "def patch(self, path, body):" "$REPLICATION_TOOL" 2>/dev/null \
+    && grep -q "def start_distribution_path" "$REPLICATION_TOOL" 2>/dev/null \
+    && grep -qE "client\.patch\(" "$REPLICATION_TOOL" 2>/dev/null; then
+  pass "32: the reconciler REST client's PATCH is reserved exclusively for the Distribution path status transition"
+else
+  fail "32: the reconciler REST client's PATCH usage does not match the Distribution-path-only safety rule"
+fi
+
+PATCH_CALL_SITES="$(grep -n "\.patch(" "$REPLICATION_TOOL" 2>/dev/null | grep -v "def patch\|GGClient.patch\|patch_call" || true)"
+if [ "$(echo "$PATCH_CALL_SITES" | grep -c "start_distribution_path\|client\.patch(distribution_path" || true)" -ge 0 ] \
+    && ! echo "$PATCH_CALL_SITES" | grep -qE "credential_path|extract_path|replicat_path"; then
+  pass "32: no credential, Extract, or Replicat call site ever issues PATCH"
+else
+  fail "32: a non-Distribution call site issues PATCH"
+fi
 
 if [ "$HELM_AVAILABLE" = "true" ] && command -v git >/dev/null 2>&1; then
   ORACLE_HEAD_RENDER="${WORKDIR}/oracle-6d1-head.yaml"
@@ -6874,6 +6891,44 @@ if grep -q "replication_reconcile_once" "$EKS_APP_WORKFLOW" 2>/dev/null \
   pass "32: replication_reconcile_once and replication_dry_run_validation jobs exist in the orchestrator"
 else
   fail "32: the replication workflow jobs are missing from the orchestrator"
+fi
+
+echo ""
+echo "--- Phase 6D1 correction: REST-contract and execution-identity fixes ---"
+
+if grep -q "replication_monitor_acceptance" "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && grep -q "api/processes" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "32: a replication-specific monitor acceptance job queries /api/processes for real process names"
+else
+  fail "32: the replication-specific monitor acceptance job is missing"
+fi
+
+if grep -q "\-\-execution-id" "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && grep -q "github.run_id.*github.run_attempt" "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && grep -q "\-\-execution-id \"dry-run\"" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "32: render-job is invoked with a rerun-safe --execution-id (real runs) and a deterministic dry-run token"
+else
+  fail "32: --execution-id wiring is missing from one or both replication workflow jobs"
+fi
+
+if grep -qE "\^\[\[:space:\]\]\*\(aws_secret_access_key\|password\)\[\[:space:\]\]\*:" "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && ! grep -qE '\^\\s\*\(aws_secret_access_key\|password\)\\s\*:' "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "32: the replication dry-run secret-leak scan uses portable [[:space:]], not GNU-only \\s"
+else
+  fail "32: the replication dry-run secret-leak scan still uses non-portable \\s"
+fi
+
+if grep -q "def ensure_database_credential" "$REPLICATION_TOOL" 2>/dev/null \
+    && grep -q "def ensure_network_credential" "$REPLICATION_TOOL" 2>/dev/null; then
+  pass "32: database and Network credential reconciliation use separate functions with separate validation semantics"
+else
+  fail "32: database/Network credential reconciliation is not clearly separated"
+fi
+
+if grep -q 'request_body = {"userid": userid, "password": password}' "$REPLICATION_TOOL" 2>/dev/null; then
+  pass "32: the credential POST body contains userid/password only, never an alias field (alias is the path parameter)"
+else
+  fail "32: the credential POST body no longer matches the exact userid/password-only shape"
 fi
 
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
