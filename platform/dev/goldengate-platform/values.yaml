@@ -5,23 +5,7 @@ namespaces:
     create: true
     name: goldengate-dev
 
-serviceAccounts:
-  oracle:
-    create: true
-    name: gg-oracle-sa
-    roleArn: ""
-  postgresql:
-    create: true
-    name: gg-postgresql-sa
-    roleArn: ""
-  mssql:
-    create: true
-    name: gg-mssql-sa
-    roleArn: ""
-  daa:
-    create: true
-    name: gg-daa-sa
-    roleArn: ""
+# runtimeServiceAccounts is intentionally absent -- the deploy workflow injects it via --set from the folder-driven identity inventory, never hand-maintained.
 
 fluentBit:
   create: true

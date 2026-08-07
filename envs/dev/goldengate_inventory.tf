@@ -51,13 +51,6 @@ locals {
     for id, doc in local.goldengate_runtime_documents : id => try(doc.runtime.csi.serviceAccountRoleArn, null) != null
   }
 
-  # The one central approved flavour-identity map; mirrors hack/goldengate-deployment-model.py's RUNTIME_IDENTITY_MAP exactly.
-  goldengate_runtime_identity_map = {
-    oracle      = "gg-oracle-sa"
-    postgresql  = "gg-postgresql-sa"
-    sqlserver   = "gg-mssql-sa"
-    distributed = "gg-daa-sa"
-  }
   goldengate_deployment_type_raw = {
     for id, doc in local.goldengate_runtime_documents : id => try(doc.runtime.deploymentType, "")
   }
@@ -100,11 +93,37 @@ locals {
 
   goldengate_tls_secret_name = "${var.environment}/goldengate/tls-certificate"
 
-  # deploymentType alone selects the approved runtime identity; a document with no approved identity never reaches this map (the precondition below blocks plan first).
+  # Deterministic naming, never a hardcoded map: deploymentType alone selects the ServiceAccount name. Only a safe token (enforced by the precondition below) ever reaches this string interpolation.
   goldengate_runtime_service_account_names = {
     for id in local.goldengate_deployment_names : id =>
-    lookup(local.goldengate_runtime_identity_map, try(local.goldengate_enabled_deployments[id].runtime.deploymentType, ""), null)
+    "gg-${try(local.goldengate_enabled_deployments[id].runtime.deploymentType, "")}-sa"
   }
+
+  # Unique enabled deployment types, sorted deterministically; mirrors hack/goldengate-deployment-model.py's runtime-identities command.
+  goldengate_enabled_deployment_types = sort(distinct([
+    for id in local.goldengate_deployment_names : local.goldengate_deployment_type_raw[id]
+  ]))
+
+  goldengate_runtime_identity_inventory = {
+    for t in local.goldengate_enabled_deployment_types : t => "gg-${t}-sa"
+  }
+
+  # The retained, honestly-unresolved legacy exception (see envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json); requires live-cluster evidence before removal, never generated or removed by this file.
+  goldengate_legacy_wildcard_trust_subject = "system:serviceaccount:gg-dev-*:ogg-oracle-sa"
+
+  goldengate_expected_irsa_trust_subjects = sort([
+    for t in local.goldengate_enabled_deployment_types :
+    "system:serviceaccount:${local.goldengate_shared_environment.runtimeNamespace}:gg-${t}-sa"
+  ])
+
+  goldengate_secrets_trust_policy = jsondecode(file("${path.module}/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json"))
+  goldengate_secrets_trust_subjects = local.goldengate_secrets_trust_policy.Statement[0].Condition.StringLike[
+    "oidc.eks.eu-west-1.amazonaws.com/id/407C4385FF87947926730569F1E564FB:sub"
+  ]
+  goldengate_secrets_trust_subjects_non_legacy = sort([
+    for s in local.goldengate_secrets_trust_subjects : s
+    if s != local.goldengate_legacy_wildcard_trust_subject
+  ])
 
   goldengate_platform_values = yamldecode(file("${path.module}/../../platform/${var.environment}/goldengate-platform/values.yaml"))
   goldengate_monitor_values  = yamldecode(file("${path.module}/goldengate-monitor/values.yaml"))
@@ -147,8 +166,12 @@ resource "terraform_data" "goldengate_runtime_contract" {
       error_message = "envs/${var.environment}/${each.key}/values.yaml: global.environment must match the scanned environment."
     }
     precondition {
-      condition     = try(each.value.runtime.deploymentType, "") != "" && can(regex("^[a-z][a-z0-9-]*$", each.value.runtime.deploymentType))
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.deploymentType must be a safe lowercase token."
+      condition = (
+        try(each.value.runtime.deploymentType, "") != ""
+        && length(try(each.value.runtime.deploymentType, "")) <= 32
+        && can(regex("^[a-z][a-z0-9]*(-[a-z0-9]+)*$", each.value.runtime.deploymentType))
+      )
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.deploymentType must be a safe lowercase token (letters/digits only, internal hyphens only, no leading/trailing hyphen, max 32 characters)."
     }
     precondition {
       condition = (
@@ -162,10 +185,6 @@ resource "terraform_data" "goldengate_runtime_contract" {
     precondition {
       condition     = try(each.value.runtime.image.tag, "") != "" && try(each.value.runtime.image.tag, "latest") != "latest"
       error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.image.tag must be explicit and must not be \"latest\"."
-    }
-    precondition {
-      condition     = contains(keys(local.goldengate_runtime_identity_map), local.goldengate_deployment_type_raw[each.key])
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.deploymentType does not have an approved runtime identity."
     }
     precondition {
       condition     = !local.goldengate_service_account_declared[each.key]
@@ -251,6 +270,10 @@ resource "terraform_data" "goldengate_cross_pipeline_contract" {
         try(local.goldengate_enabled_deployments[id].replication.enabled, false) == false
       ])
       error_message = "Replication bootstrap activation is not available in Phase 6D0. Complete the approved database and GoldenGate Admin REST validation phase first."
+    }
+    precondition {
+      condition     = local.goldengate_secrets_trust_subjects_non_legacy == local.goldengate_expected_irsa_trust_subjects
+      error_message = "envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json trust subjects do not match the folder-driven runtime identity inventory -- add or remove the exact system:serviceaccount:<namespace>:gg-<type>-sa subject for every enabled deployment type (the legacy gg-dev-*:ogg-oracle-sa wildcard is retained separately and is never generated or removed by this check)."
     }
   }
 }

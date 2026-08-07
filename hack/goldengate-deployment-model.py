@@ -17,13 +17,6 @@ APPROVED_ECR_ACCOUNT = "229410149234"
 APPROVED_ECR_REGION = "eu-west-1"
 FORBIDDEN_IMAGE_TAG = "latest"
 
-RUNTIME_IDENTITY_MAP = {
-    "oracle": "gg-oracle-sa",
-    "postgresql": "gg-postgresql-sa",
-    "sqlserver": "gg-mssql-sa",
-    "distributed": "gg-daa-sa",
-}
-
 IGNORED_NON_RUNTIME_FOLDER_NAMES = ("argocd", "goldengate-monitor")
 
 REPLICATION_DISABLED_MESSAGE = (
@@ -60,11 +53,8 @@ def resolve_tls_secret(environment):
 
 
 def resolve_runtime_service_account(deployment_type):
-    """The one and only ServiceAccount derivation rule: deployment_type alone selects the approved platform identity."""
-    try:
-        return RUNTIME_IDENTITY_MAP[deployment_type]
-    except KeyError:
-        raise DescriptorError(f"Deployment type {deployment_type!r} does not have an approved runtime identity.") from None
+    """The one and only ServiceAccount derivation rule: deterministic naming from the already-validated safe deployment_type token, never a hardcoded map."""
+    return f"gg-{deployment_type}-sa"
 
 
 def _safe_token(value, max_length):
@@ -524,6 +514,24 @@ def cmd_registry(args):
     return 0
 
 
+def runtime_identity_inventory(active):
+    """Unique enabled deployment types, sorted deterministically, each mapped to its derived ServiceAccount."""
+    types = sorted({d["deploymentType"] for d in active})
+    return [(t, resolve_runtime_service_account(t)) for t in types]
+
+
+def cmd_runtime_identities(args):
+    active, _inactive, invalid, problems = _run_full_validation(args.environment)
+    if invalid or problems:
+        _print_reasons(invalid)
+        _print_problems(problems)
+        print("FAIL: refusing to list runtime identities while validation problems exist")
+        return 1
+    for deployment_type, service_account_name in runtime_identity_inventory(active):
+        print(f"{deployment_type},{service_account_name}")
+    return 0
+
+
 def cmd_shared_secrets(args):
     """The three fixed environment-level secret identifiers only, never values; independent of which deployments exist."""
     _active, _inactive, invalid, problems = _run_full_validation(args.environment)
@@ -555,6 +563,8 @@ def main(argv=None):
     registry_parser.set_defaults(func=cmd_registry)
 
     sub.add_parser("shared-secrets").set_defaults(func=cmd_shared_secrets)
+
+    sub.add_parser("runtime-identities").set_defaults(func=cmd_runtime_identities)
 
     args = parser.parse_args(argv)
     return args.func(args)
