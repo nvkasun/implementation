@@ -1096,6 +1096,26 @@ def cmd_shared_secrets(args):
     return 0
 
 
+def cmd_managed_efs_inventory(args):
+    """Expected managed-EFS inventory (JSON array of {deploymentId, efsCreationToken}) for the AWS-side managed_efs_inventory_guard; includes lifecycle.state=absent descriptors on purpose -- their EFS is retained, not decommissioned, so they remain part of the expected set."""
+    active, inactive, invalid, problems = _run_full_validation(args.environment)
+    if invalid or problems:
+        _print_reasons(invalid)
+        _print_problems(problems)
+        print("FAIL: refusing to compute the managed-EFS inventory while validation problems exist")
+        return 1
+    expected = sorted(
+        (
+            {"deploymentId": d["deploymentId"], "efsCreationToken": d["efsCreationToken"]}
+            for d in active + inactive
+            if d["efsMode"] == "managed"
+        ),
+        key=lambda x: x["deploymentId"],
+    )
+    print(json.dumps(expected, indent=2))
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--environment", default="dev")
@@ -1122,6 +1142,8 @@ def main(argv=None):
     replication_plan_parser.add_argument("pipeline_id")
     replication_plan_parser.add_argument("--output", default=None)
     replication_plan_parser.set_defaults(func=cmd_replication_plan)
+
+    sub.add_parser("managed-efs-inventory").set_defaults(func=cmd_managed_efs_inventory)
 
     args = parser.parse_args(argv)
     return args.func(args)

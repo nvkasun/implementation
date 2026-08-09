@@ -838,6 +838,65 @@ class FullValidationGatingTests(unittest.TestCase):
         self.assertNotIn("ACTIVE  gg-good-fixture-01", buf.getvalue())
 
 
+class ManagedEfsInventoryCommandTests(unittest.TestCase):
+    """The managed-efs-inventory command feeds the workflow's managed_efs_inventory_guard; it must include lifecycle.state=absent managed descriptors (their EFS is retained, not decommissioned) and exclude existing-mode descriptors entirely."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._original_root = gdm.REPO_ROOT
+        gdm.REPO_ROOT = self._tmp.name
+
+    def tearDown(self):
+        gdm.REPO_ROOT = self._original_root
+        self._tmp.cleanup()
+
+    def _run(self):
+        class Args:
+            environment = "dev"
+
+        import io
+        import json
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            exit_code = gdm.cmd_managed_efs_inventory(Args())
+        return exit_code, json.loads(buf.getvalue())
+
+    def test_no_managed_descriptors_yields_empty_inventory(self):
+        write_doc(self._tmp.name, "dev", "gg-fixture-01",
+                 _efs_test_doc(persistence={"enabled": True, "provider": "efs", "efs": {"mode": "existing", "fileSystemId": "fs-0123456789abcdef0"}}))
+        exit_code, inventory = self._run()
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(inventory, [])
+
+    def test_managed_descriptor_is_included_with_its_creation_token(self):
+        write_doc(self._tmp.name, "dev", "gg-fixture-01",
+                 _efs_test_doc(persistence={"enabled": True, "provider": "efs", "efs": {"mode": "managed"}}))
+        exit_code, inventory = self._run()
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(inventory, [{"deploymentId": "gg-fixture-01", "efsCreationToken": "dev-gg-fixture-01-efs"}])
+
+    def test_lifecycle_absent_managed_descriptor_is_still_included(self):
+        doc = _efs_test_doc(persistence={"enabled": True, "provider": "efs", "efs": {"mode": "managed"}})
+        doc["lifecycle"] = {"state": "absent"}
+        write_doc(self._tmp.name, "dev", "gg-fixture-01", doc)
+        exit_code, inventory = self._run()
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(inventory, [{"deploymentId": "gg-fixture-01", "efsCreationToken": "dev-gg-fixture-01-efs"}])
+
+    def test_two_managed_descriptors_produce_two_distinct_entries(self):
+        source_doc = _efs_test_doc(persistence={"enabled": True, "provider": "efs", "efs": {"mode": "managed"}})
+        target_doc = copy.deepcopy(source_doc)
+        target_doc["deployment"]["role"] = "target"
+        write_doc(self._tmp.name, "dev", "gg-postgresql-repltest-01", source_doc)
+        write_doc(self._tmp.name, "dev", "gg-mssql-repltest-01", target_doc)
+        exit_code, inventory = self._run()
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(inventory), 2)
+        self.assertEqual({i["deploymentId"] for i in inventory}, {"gg-postgresql-repltest-01", "gg-mssql-repltest-01"})
+        self.assertEqual(len({i["efsCreationToken"] for i in inventory}), 2)
+
+
 class SharedSecretsCommandTests(ScratchEnvironmentTestCase):
     """Test 29 support: the shared-secrets command output shape."""
 

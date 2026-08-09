@@ -7106,89 +7106,118 @@ else
 fi
 
 echo ""
-echo "--- Correction pass, Issue 2/6: isolated runtime-EFS Terraform root, no shared-state ownership ---"
+echo "--- Final correction pass: managed EFS restored to the shared envs/dev root (approved corporate Terraform workflow) ---"
 
-if [ ! -e "envs/dev/efs.tf" ]; then
-  pass "5: envs/dev/efs.tf no longer exists -- the shared envs/dev Terraform state no longer owns per-runtime managed EFS module instances"
+if [ ! -d "envs/dev/runtime-efs" ]; then
+  pass "1: the isolated envs/dev/runtime-efs Terraform root no longer exists"
 else
-  fail "5: envs/dev/efs.tf still exists -- the shared root may still own per-runtime managed EFS"
+  fail "1: envs/dev/runtime-efs still exists -- it cannot be executed through the approved ADCB reusable workflow and must be removed"
 fi
 
-if ! grep -qE 'module\s+"goldengate_runtime_efs"' envs/dev/*.tf 2>/dev/null; then
-  pass "5: no module.goldengate_runtime_efs instance exists anywhere in the shared envs/dev/*.tf root"
+if ! grep -rl "runtime-efs\|runtime_efs" --include='*.tf' envs/ 2>/dev/null | grep -v '^envs/dev/efs.tf$' | grep -q .; then
+  pass "1: no remaining Terraform file references an isolated runtime-efs root"
 else
-  fail "5: a module.goldengate_runtime_efs instance still exists in the shared envs/dev/*.tf root"
+  fail "1: a Terraform file still references the removed isolated runtime-efs root"
 fi
 
-RUNTIME_EFS_TF_COUNT="$(find envs/dev/runtime-efs -maxdepth 1 -name '*.tf' 2>/dev/null | wc -l | tr -d ' ')"
-if [ -d "envs/dev/runtime-efs" ] && [ "$RUNTIME_EFS_TF_COUNT" -gt 0 ]; then
-  pass "6: the reusable runtime-EFS Terraform root exists at envs/dev/runtime-efs/"
+if [ -f "envs/dev/efs.tf" ]; then
+  pass "2: envs/dev/efs.tf exists again in the normal shared Terraform root"
 else
-  fail "6: envs/dev/runtime-efs/ is missing or contains no .tf files"
+  fail "2: envs/dev/efs.tf is missing -- managed EFS must live in the shared envs/dev root processed by the approved corporate workflow"
 fi
 
-PER_DEPLOYMENT_TF_COUNT="$(find envs/dev/gg-oracle-payments-01 envs/dev/gg-postgresql-payments-01 -maxdepth 1 -name '*.tf' 2>/dev/null | wc -l | tr -d ' ')"
-if [ "$PER_DEPLOYMENT_TF_COUNT" -eq 0 ]; then
-  pass "6: no Terraform files exist inside any per-deployment folder -- the runtime-EFS root is not duplicated per deployment"
+if grep -q 'aws-tf-module-efs?ref=v1.0.0' envs/dev/efs.tf 2>/dev/null; then
+  pass "3: envs/dev/efs.tf pins the approved ADCB EFS module at exactly v1.0.0"
 else
-  fail "6: Terraform files were found inside a per-deployment folder -- the runtime-EFS root must exist once, not per deployment"
+  fail "3: envs/dev/efs.tf does not reference the approved ADCB EFS module at the pinned v1.0.0 ref"
 fi
 
-if grep -q 'aws-tf-module-efs?ref=v1.0.0' envs/dev/runtime-efs/main.tf 2>/dev/null; then
-  pass "envs/dev/runtime-efs/main.tf pins the approved ADCB EFS module at v1.0.0 (not silently upgraded)"
+if grep -qE '^module\s+"goldengate_runtime_efs"\s*\{' envs/dev/efs.tf 2>/dev/null \
+    && grep -qE 'for_each\s*=\s*local\.goldengate_managed_efs_deployments' envs/dev/efs.tf 2>/dev/null; then
+  pass "4/5: the EFS module is instantiated via for_each over local.goldengate_managed_efs_deployments -- one Terraform module key (and therefore one dedicated aws_efs_file_system) per managed deployment ID, all inside the single envs/dev state"
 else
-  fail "envs/dev/runtime-efs/main.tf does not reference the approved ADCB EFS module at the pinned v1.0.0 ref"
+  fail "4/5: envs/dev/efs.tf's module block is missing or does not for_each over local.goldengate_managed_efs_deployments"
 fi
 
-if grep -qE '^module\s+"goldengate_runtime_efs"\s*\{' envs/dev/runtime-efs/main.tf 2>/dev/null \
-    && ! grep -qE 'for_each' envs/dev/runtime-efs/main.tf 2>/dev/null; then
-  pass "the runtime-EFS module is a single instance per Terraform apply (no for_each) -- this root is scoped to exactly one runtime deployment"
+if grep -qE '^\s*name\s*=\s*each\.value\.creation_token' envs/dev/efs.tf 2>/dev/null; then
+  pass "7: the module's name input is each.value.creation_token -- the exact deterministic efsCreationToken, and the verified v1.0.0 module sets creation_token = var.name"
 else
-  fail "envs/dev/runtime-efs/main.tf's module block is missing or unexpectedly uses for_each"
+  fail "7: envs/dev/efs.tf does not pass the deterministic creation token as the module's name input"
 fi
 
-if grep -qE '^variable\s+"(environment|deployment_id|efs_creation_name)"' envs/dev/runtime-efs/variables.tf 2>/dev/null; then
-  pass "7: the runtime-EFS root accepts environment and deployment_id as explicit input variables -- state identity is derived from them, not from the folder-driven inventory"
+if ! grep -q 'custom_kms_key_arn' envs/dev/efs.tf 2>/dev/null; then
+  pass "8: envs/dev/efs.tf does not introduce the v1.1.0-only custom_kms_key_arn input -- the module stays pinned to its verified v1.0.0 default KMS-alias lookup behavior"
 else
-  fail "7: envs/dev/runtime-efs/variables.tf is missing the expected environment/deployment_id/efs_creation_name variables"
+  fail "8: envs/dev/efs.tf references custom_kms_key_arn, a v1.1.0-only input not present in the approved pinned v1.0.0 module"
 fi
 
-if ! grep -qiE '\bpipeline\b' envs/dev/runtime-efs/*.tf 2>/dev/null; then
-  pass "9: no runtime-EFS Terraform file references a replication pipeline concept -- state identity is never derived from the pipeline ID"
+if grep -qE '^\s*custom_tags\s*=\s*\{' envs/dev/efs.tf 2>/dev/null \
+    && grep -q 'ManagedBy.*=.*"goldengate-eks-app"' envs/dev/efs.tf 2>/dev/null \
+    && grep -q 'GoldenGateDeploymentId.*=.*each\.key' envs/dev/efs.tf 2>/dev/null \
+    && grep -q 'GoldenGateStorage.*=.*"u02"' envs/dev/efs.tf 2>/dev/null; then
+  pass "9: managed EFS receives deterministic ownership tags (ManagedBy/GoldenGateDeploymentId/GoldenGateStorage/GoldenGateEnvironment) via the verified var.custom_tags input, with GoldenGateDeploymentId mapping one EFS back to exactly one runtime (each.key)"
 else
-  fail "9: envs/dev/runtime-efs/*.tf references \"pipeline\" -- state identity must be derived from deployment_id alone"
+  fail "9: envs/dev/efs.tf is missing the required deterministic ownership tags via custom_tags"
 fi
 
-if grep -qE 'resource\s+"aws_efs_(file_system|mount_target|access_point)"' envs/dev/*.tf envs/dev/runtime-efs/*.tf 2>/dev/null; then
-  fail "26: envs/dev and envs/dev/runtime-efs reimplement EFS with raw aws_efs_* resources instead of using the approved module exclusively, or add a Terraform-owned access point"
+if grep -vE '^\s*#' envs/dev/efs.tf 2>/dev/null | grep -qiE 'credential|secret|password|database'; then
+  fail "envs/dev/efs.tf's non-comment content may reference credentials/secrets/passwords/database details"
 else
-  pass "26: no raw aws_efs_file_system/mount_target/access_point resources exist anywhere in envs/dev/*.tf or envs/dev/runtime-efs/*.tf"
+  pass "no credentials/secret ARNs/passwords/database details appear in envs/dev/efs.tf's non-comment content"
 fi
 
-if grep -qE 'resource\s+"aws_security_group"' envs/dev/*.tf envs/dev/runtime-efs/*.tf 2>/dev/null; then
-  fail "25: a new security group is created somewhere instead of reusing the single shared one via a fail-closed data lookup"
+if grep -qE '^\s*count\s*=\s*length\(local\.goldengate_managed_efs_deployments\)\s*>\s*0' envs/dev/efs.tf 2>/dev/null; then
+  pass "10: the shared EFS security-group data lookup is conditional (count) on at least one managed deployment existing"
 else
-  pass "25: no envs/dev or runtime-efs Terraform file creates a per-deployment security group -- all reuse the single shared one"
+  fail "10: the shared EFS security-group data lookup in envs/dev/efs.tf is not conditional on managed deployments existing"
 fi
 
-if grep -qE '^\s*data\s+"aws_security_group"\s+"goldengate_efs_shared"' envs/dev/runtime-efs/main.tf 2>/dev/null \
-    && ! grep -qE '^\s*data\s+"aws_security_group"' envs/dev/*.tf 2>/dev/null; then
-  pass "24: the shared EFS security-group lookup lives only in envs/dev/runtime-efs (invoked only for managed EFS provisioning) -- the shared envs/dev root never needs to resolve it, so an existing-only environment (zero managed runtimes) requires no SG lookup at all"
+if grep -qE 'resource\s+"aws_efs_(file_system|mount_target|access_point)"' envs/dev/*.tf 2>/dev/null; then
+  fail "42: envs/dev/*.tf reimplements EFS with raw aws_efs_* resources or adds a Terraform-owned access point instead of using the approved module exclusively"
 else
-  fail "24: the shared EFS security-group lookup is missing from runtime-efs, or still present in the shared envs/dev root"
+  pass "42: no raw aws_efs_file_system/mount_target/access_point resources exist anywhere in envs/dev/*.tf"
 fi
 
-if grep -qE '^\s*variable\s+"shared_security_group_description"' envs/dev/runtime-efs/variables.tf 2>/dev/null \
-    && ! grep -q 'shared_security_group_description' envs/dev/gg-*-payments-01/values.yaml 2>/dev/null; then
+if grep -qE 'resource\s+"aws_security_group"' envs/dev/*.tf 2>/dev/null; then
+  fail "envs/dev/*.tf creates a new security group instead of reusing the single shared one via a fail-closed data lookup"
+else
+  pass "envs/dev/*.tf does not create a per-deployment security group -- it looks up the shared one"
+fi
+
+if grep -qE '^\s*variable\s+"goldengate_efs_shared_security_group_description"' envs/dev/efs.tf 2>/dev/null \
+    && ! grep -q 'goldengate_efs_shared_security_group_description' envs/dev/gg-*-payments-01/values.yaml 2>/dev/null; then
   pass "the shared EFS security group is a single environment-level configuration point, never a per-deployment values.yaml setting"
 else
   fail "the shared EFS security group configuration point is missing or leaked into a per-deployment values.yaml"
 fi
 
-if grep -qE 'aws efs delete-file-system|aws efs delete-access-point|terraform destroy' "$EKS_APP_WORKFLOW" envs/dev/runtime-efs/*.tf 2>/dev/null; then
-  fail "27/28/29: the eks-app workflow or runtime-efs root contains a destructive EFS/Terraform command outside the controlled decommission process"
+if grep -qE 'aws efs delete-file-system|aws efs delete-access-point|terraform destroy' "$EKS_APP_WORKFLOW" envs/dev/*.tf 2>/dev/null; then
+  fail "39/40/41: the eks-app workflow or envs/dev root contains a destructive EFS/Terraform command outside the controlled decommission process"
 else
-  pass "27/28/29: neither the eks-app workflow nor envs/dev/runtime-efs contains an aws efs delete-* or terraform destroy command"
+  pass "39/40/41: neither the eks-app workflow nor envs/dev/*.tf contains an aws efs delete-* or terraform destroy command"
+fi
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  set +e
+  TWO_MANAGED_OUT="$(python3 - <<'PYEOF'
+import re
+with open("envs/dev/efs.tf") as f:
+    text = f.read()
+# Structural proof (no Terraform CLI): for_each over the folder-driven local always derives Terraform's module instance address (module.goldengate_runtime_efs[each.key]) from the map key, which is the deployment ID (see goldengate_inventory.tf's goldengate_managed_efs_deployments); two distinct deployment IDs therefore always produce two distinct module addresses/module instances/filesystems, never a shared one.
+assert 'for_each = local.goldengate_managed_efs_deployments' in text
+assert 'each.key' in text
+print("OK")
+PYEOF
+)"
+  TWO_MANAGED_STATUS=$?
+  set -e
+  if [ "$TWO_MANAGED_STATUS" -eq 0 ]; then
+    pass "6: two managed runtime IDs structurally produce two distinct Terraform module instances/addresses (module.goldengate_runtime_efs[each.key], each.key being the deployment ID from the folder-driven inventory)"
+  else
+    fail "6: could not structurally confirm two-managed-runtimes-produce-two-module-keys: ${TWO_MANAGED_OUT}"
+  fi
+else
+  skip "6: two-module-key structural check -- python3 unavailable"
 fi
 
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
@@ -7593,6 +7622,215 @@ PYEOF
   fi
 else
   skip "storage_transition_guard ordering check -- python3/PyYAML unavailable"
+fi
+
+echo ""
+echo "--- Final EFS architecture correction: managed EFS restored to envs/dev, managed_efs_inventory_guard added ---"
+
+if ! grep -qiE '\bpipeline\b' envs/dev/efs.tf 2>/dev/null; then
+  pass "6: envs/dev/efs.tf never references a replication pipeline concept -- the module's for_each key (each.key) is the deployment ID from local.goldengate_managed_efs_deployments, never a pipeline ID"
+else
+  fail "6: envs/dev/efs.tf references \"pipeline\" -- the module key must be derived from deployment ID alone"
+fi
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  set +e
+  LIVE_INVENTORY_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev managed-efs-inventory 2>&1)"
+  LIVE_INVENTORY_STATUS=$?
+  set -e
+  if [ "$LIVE_INVENTORY_STATUS" -eq 0 ] && [ "$LIVE_INVENTORY_OUT" = "[]" ]; then
+    pass "11: today's live dev inventory (both descriptors existing-mode) has zero managed deployments -- envs/dev/efs.tf's shared-SG data-source count therefore evaluates to 0, requiring no managed-EFS SG lookup"
+  else
+    fail "11: expected the live managed-efs-inventory to be empty today (both live descriptors are existing-mode): ${LIVE_INVENTORY_OUT}"
+  fi
+else
+  skip "11: live zero-managed-inventory check -- python3 unavailable"
+fi
+
+if grep -qE '^\s*data\s+"aws_security_group"\s+"goldengate_efs_shared"' envs/dev/efs.tf 2>/dev/null; then
+  pass "the shared EFS security-group lookup remains in envs/dev/efs.tf (the normal shared root, per the corporate Terraform workflow discovery)"
+else
+  fail "the shared EFS security-group lookup is missing from envs/dev/efs.tf"
+fi
+
+if grep -qE '^\s*module\s+"goldengate_runtime_efs"' envs/dev/efs.tf 2>/dev/null; then
+  pass "4: a single module.goldengate_runtime_efs block exists; for_each over local.goldengate_managed_efs_deployments means exactly one Terraform module key (module.goldengate_runtime_efs[<id>]) is created per managed deployment"
+else
+  fail "4: envs/dev/efs.tf is missing the module.goldengate_runtime_efs block"
+fi
+
+if grep -qE '"elasticfilesystem:ListTagsForResource"' envs/dev/policies/goldengate-eks-deploy-dev/policies/policies_1.json 2>/dev/null; then
+  pass "the workload-account read role's existing EFS-read policy statement was minimally extended with elasticfilesystem:ListTagsForResource (no new role, no create/update/delete permission)"
+else
+  fail "elasticfilesystem:ListTagsForResource is missing from the existing GoldenGateEKSDeployRole-dev EFS-read policy statement"
+fi
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  set +e
+  POLICY_CHECK_OUT="$(python3 -c '
+import json
+with open("envs/dev/policies/goldengate-eks-deploy-dev/policies/policies_1.json") as f:
+    doc = json.load(f)
+for stmt in doc["Statement"]:
+    actions = stmt.get("Action", [])
+    for action in actions:
+        if action.startswith("elasticfilesystem:") and action.split(":", 1)[1] not in ("DescribeAccessPoints", "DescribeFileSystems", "ListTagsForResource"):
+            print(f"unexpected EFS action granted: {action}")
+            raise SystemExit(1)
+print("OK")
+' 2>&1)"
+  POLICY_CHECK_STATUS=$?
+  set -e
+  if [ "$POLICY_CHECK_STATUS" -eq 0 ]; then
+    pass "the workload-account read role is granted only read-only EFS actions (DescribeAccessPoints/DescribeFileSystems/ListTagsForResource) -- no create/update/delete permission was added for the inventory guard"
+  else
+    fail "the workload-account read role's EFS policy grants an unexpected action: ${POLICY_CHECK_OUT}"
+  fi
+else
+  skip "EFS read-only policy scope check -- python3 unavailable"
+fi
+
+if [ -f "hack/goldengate-managed-efs-inventory-guard.py" ]; then
+  pass "14: hack/goldengate-managed-efs-inventory-guard.py (the pure comparison logic behind managed_efs_inventory_guard) exists"
+else
+  fail "14: hack/goldengate-managed-efs-inventory-guard.py is missing"
+fi
+
+if grep -qE '^\s*managed_efs_inventory_guard:' "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "14: the managed_efs_inventory_guard job exists in the eks-app workflow"
+else
+  fail "14: the managed_efs_inventory_guard job is missing from the eks-app workflow"
+fi
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  set +e
+  INVENTORY_ORDER_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import sys
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+
+jobs = doc.get("jobs", {})
+problems = []
+
+guard = jobs.get("managed_efs_inventory_guard")
+if guard is None:
+    problems.append("managed_efs_inventory_guard job is missing")
+else:
+    needs = guard.get("needs")
+    needs_list = needs if isinstance(needs, list) else [needs]
+    for required in ("detect_changed_deployments", "managed_efs_deletion_guard", "storage_transition_guard"):
+        if required not in needs_list:
+            problems.append(f"managed_efs_inventory_guard does not need {required}")
+
+tf = jobs.get("terraform_sync_once")
+if tf is None:
+    problems.append("terraform_sync_once job is missing")
+else:
+    needs = tf.get("needs")
+    needs_list = needs if isinstance(needs, list) else [needs]
+    if "managed_efs_inventory_guard" not in needs_list:
+        problems.append("terraform_sync_once does not need managed_efs_inventory_guard")
+    if_expr = str(tf.get("if", ""))
+    if "managed_efs_inventory_guard.result" not in if_expr or "success" not in if_expr:
+        problems.append("terraform_sync_once's if: does not explicitly require managed_efs_inventory_guard to have succeeded")
+
+if problems:
+    print("\n".join(problems))
+    sys.exit(1)
+print("OK")
+PYEOF
+)"
+  INVENTORY_ORDER_STATUS=$?
+  set -e
+  if [ "$INVENTORY_ORDER_STATUS" -eq 0 ]; then
+    pass "15/16: managed_efs_inventory_guard is structurally guaranteed to run after the Git-diff guards and before terraform_sync_once, and terraform_sync_once fails closed if it did not succeed"
+  else
+    fail "15/16: managed_efs_inventory_guard ordering is not correctly wired: ${INVENTORY_ORDER_OUT}"
+  fi
+else
+  skip "15/16: managed_efs_inventory_guard ordering check -- python3/PyYAML unavailable"
+fi
+
+if grep -q 'validate_model' "$EKS_APP_WORKFLOW" 2>/dev/null && [ "$PYTHON_AVAILABLE" = "true" ]; then
+  set +e
+  UNDECLARED_NEEDS_RECHECK_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import re
+import sys
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+
+problems = []
+for job_name, job in doc["jobs"].items():
+    needs = job.get("needs")
+    if needs is None:
+        declared = set()
+    elif isinstance(needs, str):
+        declared = {needs}
+    else:
+        declared = set(needs)
+
+    job_copy = dict(job)
+    job_copy.pop("needs", None)
+    text = yaml.dump(job_copy, default_flow_style=False)
+    refs = set(re.findall(r"needs\.([A-Za-z0-9_-]+)\.", text))
+
+    undeclared = refs - declared
+    if undeclared:
+        problems.append(f"{job_name}: undeclared needs.{{{','.join(sorted(undeclared))}}}")
+
+if problems:
+    print("\n".join(problems))
+    sys.exit(1)
+print("OK")
+PYEOF
+)"
+  UNDECLARED_NEEDS_RECHECK_STATUS=$?
+  set -e
+  if [ "$UNDECLARED_NEEDS_RECHECK_STATUS" -eq 0 ]; then
+    pass "the new managed_efs_inventory_guard job (which references needs.validate_model) does not reintroduce the Issue-1 undeclared-needs bug -- validate_model is explicitly in its own needs: list"
+  else
+    fail "an undeclared needs.<job> reference was reintroduced: ${UNDECLARED_NEEDS_RECHECK_OUT}"
+  fi
+fi
+
+if grep -qF 'expected exactly one EFS filesystem for creation token' "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && grep -qF 'MATCH_COUNT" -ne 1' "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "35: managed EFS resolution fails closed on zero or multiple creation-token matches (MATCH_COUNT != 1), never lists-and-guesses"
+else
+  fail "35: the zero/multiple creation-token match fail-closed check is missing from the workflow"
+fi
+
+if grep -qF 'LifeCycleState' "$EKS_APP_WORKFLOW" 2>/dev/null && grep -qF '"available"' "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "36: managed EFS resolution requires LifeCycleState == available before it is used"
+else
+  fail "36: the LifecycleState==available check is missing from the managed EFS resolution step"
+fi
+
+if grep -qF 'ManagedBy") == "goldengate-eks-app"' "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && grep -qF 'GoldenGateDeploymentId") == sys.argv[1]' "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "the resolved managed EFS filesystem's ownership tags are cross-checked (ManagedBy/GoldenGateDeploymentId/GoldenGateEnvironment) before RESOLVED_EFS_ID is used"
+else
+  fail "the optional tag cross-check on the resolved managed EFS filesystem is missing"
+fi
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  set +e
+  MANAGED_EFS_GUARD_TEST_OUTPUT="$(python3 hack/test-goldengate-managed-efs-inventory-guard.py 2>&1)"
+  MANAGED_EFS_GUARD_TEST_STATUS=$?
+  set -e
+  if [ "$MANAGED_EFS_GUARD_TEST_STATUS" -eq 0 ]; then
+    RAN_LINE_INV="$(echo "$MANAGED_EFS_GUARD_TEST_OUTPUT" | grep -E '^Ran [0-9]+ test' | tail -1)"
+    pass "17/18/19/20/21/22: hack/test-goldengate-managed-efs-inventory-guard.py: ${RAN_LINE_INV:-all tests passed}"
+  else
+    fail "17/18/19/20/21/22: hack/test-goldengate-managed-efs-inventory-guard.py reported a failure"
+    echo "$MANAGED_EFS_GUARD_TEST_OUTPUT"
+  fi
+else
+  skip "17/18/19/20/21/22: managed-efs-inventory-guard unit tests -- python3 unavailable"
 fi
 
 echo ""

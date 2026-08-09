@@ -124,13 +124,14 @@ jobs:
   terraform_sync_once:
     name: Synchronize Terraform (once per environment)
 
-    # Must observe detect_changed_deployments' deletion_matrix and storage_transition_violations (via managed_efs_deletion_guard and storage_transition_guard) before any Terraform apply can run, or a physically-deleted persistence.efs.mode=managed descriptor or an unsafe managed<->existing/fileSystemId mutation could reach `terraform apply` and destroy or repoint a durable EFS filesystem; this job's `if:` is a custom expression, so each needed job's result is checked explicitly below since GitHub Actions does not implicitly require needs to have succeeded once a custom if: is present.
+    # Must observe detect_changed_deployments' deletion_matrix and storage_transition_violations (via managed_efs_deletion_guard and storage_transition_guard) plus the persistent AWS-side orphan check (managed_efs_inventory_guard) before any Terraform apply can run, or a physically-deleted persistence.efs.mode=managed descriptor, an unsafe managed<->existing/fileSystemId mutation, or an AWS-side orphaned managed EFS could reach `terraform apply` and destroy or repoint a durable EFS filesystem; this job's `if:` is a custom expression, so each needed job's result is checked explicitly below since GitHub Actions does not implicitly require needs to have succeeded once a custom if: is present.
     needs:
       - validate_model
       - detect_changed_deployments
       - managed_efs_deletion_guard
       - storage_transition_guard
-    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.detect_changed_deployments.result == 'success' && needs.managed_efs_deletion_guard.result == 'success' && needs.storage_transition_guard.result == 'success' }}
+      - managed_efs_inventory_guard
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.detect_changed_deployments.result == 'success' && needs.managed_efs_deletion_guard.result == 'success' && needs.storage_transition_guard.result == 'success' && needs.managed_efs_inventory_guard.result == 'success' }}
 
     # The called Terraform chain needs packages/pull-requests beyond the orchestrator's own top-level permissions; a callee can never be elevated above its caller.
     permissions:
@@ -356,6 +357,100 @@ jobs:
           fi
 
           echo "OK: no unsafe storage-identity transition detected. Terraform sync may proceed."
+
+  managed_efs_inventory_guard:
+    name: Guard against orphaned AWS-side managed GoldenGate EFS filesystems (read-only)
+
+    # Persistent safety net beyond the Git-diff-only guards above: if a managed descriptor's physical removal or an unsafe storage-mode transition somehow still reaches this point on a later, unrelated commit (where the change is no longer visible in that commit's own diff), this job independently re-derives the CURRENT expected managed-EFS inventory from the deployment model and compares it against what AWS actually has tagged as GoldenGate-managed in this environment, failing closed on any orphan before terraform_sync_once can observe (and potentially destroy) it. Strictly read-only: DescribeFileSystems/ListTagsForResource only, never create/update/delete.
+    needs:
+      - validate_model
+      - detect_changed_deployments
+      - managed_efs_deletion_guard
+      - storage_transition_guard
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.detect_changed_deployments.result == 'success' && needs.managed_efs_deletion_guard.result == 'success' && needs.storage_transition_guard.result == 'success' }}
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    environment: dev
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.ROLE_ARN }}
+
+      - name: Compute expected managed-EFS inventory from the deployment model
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
+          python3 hack/goldengate-deployment-model.py --environment dev managed-efs-inventory > expected-managed-efs.json
+          echo "Expected managed-EFS inventory (includes lifecycle.state=absent descriptors on purpose -- their EFS is retained, not decommissioned):"
+          cat expected-managed-efs.json
+
+      - name: Read the actual AWS-side GoldenGate-managed EFS inventory (read-only)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EXPECTED_WORKLOAD_ACCOUNT_ID="$(echo "$EKS_DEPLOY_ROLE_ARN" | sed -nE 's#^arn:aws:iam::([0-9]{12}):role/.*$#\1#p')"
+          if [ -z "$EXPECTED_WORKLOAD_ACCOUNT_ID" ]; then
+            echo "FAIL: could not extract a 12-digit account ID from EKS_DEPLOY_ROLE_ARN; refusing to read the managed-EFS inventory without a provable expected workload account."
+            exit 1
+          fi
+
+          echo "Assuming ${EKS_DEPLOY_ROLE_ARN} for a read-only elasticfilesystem:DescribeFileSystems/ListTagsForResource inventory scan (this role is never granted EFS create/update/delete permissions; the runtime deployment role is never extended for this guard either)..."
+
+          ASSUME_JSON="$(aws sts assume-role --role-arn "$EKS_DEPLOY_ROLE_ARN" --role-session-name "gg-efs-inventory-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --duration-seconds 900 --output json)"
+          INV_TMP_KEY_ID="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["Credentials"]["AccessKeyId"])' <<< "$ASSUME_JSON")"
+          INV_TMP_SECRET="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["Credentials"]["SecretAccessKey"])' <<< "$ASSUME_JSON")"
+          INV_TMP_TOKEN="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["Credentials"]["SessionToken"])' <<< "$ASSUME_JSON")"
+          unset ASSUME_JSON
+          echo "::add-mask::${INV_TMP_KEY_ID}"
+          echo "::add-mask::${INV_TMP_SECRET}"
+          echo "::add-mask::${INV_TMP_TOKEN}"
+
+          # Confined to this one step's subshells only -- never written to $GITHUB_ENV, so the job-level build-account credentials are untouched once this step ends.
+          ACTUAL_ACCOUNT="$(AWS_ACCESS_KEY_ID="$INV_TMP_KEY_ID" AWS_SECRET_ACCESS_KEY="$INV_TMP_SECRET" AWS_SESSION_TOKEN="$INV_TMP_TOKEN" aws sts get-caller-identity --query Account --output text --region "$AWS_REGION")"
+          if [ "$ACTUAL_ACCOUNT" != "$EXPECTED_WORKLOAD_ACCOUNT_ID" ]; then
+            echo "FAIL: assumed role resolved to account ${ACTUAL_ACCOUNT}, expected the GoldenGate workload account ${EXPECTED_WORKLOAD_ACCOUNT_ID}."
+            unset INV_TMP_KEY_ID INV_TMP_SECRET INV_TMP_TOKEN
+            exit 1
+          fi
+
+          DESCRIBE_ALL_JSON="$(AWS_ACCESS_KEY_ID="$INV_TMP_KEY_ID" AWS_SECRET_ACCESS_KEY="$INV_TMP_SECRET" AWS_SESSION_TOKEN="$INV_TMP_TOKEN" aws efs describe-file-systems --region "$AWS_REGION" --output json)"
+
+          python3 - "$DESCRIBE_ALL_JSON" > filesystem-ids.txt <<'PYEOF'
+          import json, sys
+          data = json.loads(sys.argv[1])
+          for fs in data.get("FileSystems", []):
+              print(fs["FileSystemId"])
+          PYEOF
+
+          ACTUAL_JSON="[]"
+          while IFS= read -r FS_ID; do
+            [ -z "$FS_ID" ] && continue
+            TAGS_JSON="$(AWS_ACCESS_KEY_ID="$INV_TMP_KEY_ID" AWS_SECRET_ACCESS_KEY="$INV_TMP_SECRET" AWS_SESSION_TOKEN="$INV_TMP_TOKEN" aws efs list-tags-for-resource --resource-id "$FS_ID" --region "$AWS_REGION" --output json)"
+            ACTUAL_JSON="$(python3 -c 'import json, sys; items = json.loads(sys.argv[1]); items.append({"FileSystemId": sys.argv[2], "Tags": json.loads(sys.argv[3]).get("Tags", [])}); print(json.dumps(items))' "$ACTUAL_JSON" "$FS_ID" "$TAGS_JSON")"
+          done < filesystem-ids.txt
+
+          unset INV_TMP_KEY_ID INV_TMP_SECRET INV_TMP_TOKEN
+
+          echo "$ACTUAL_JSON" > actual-managed-efs.json
+          echo "Actual AWS-side EFS inventory scanned (region ${AWS_REGION}):"
+          cat actual-managed-efs.json
+
+      - name: Compare expected vs actual managed-EFS inventory (fail closed on any orphan)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-managed-efs-inventory-guard.py dev expected-managed-efs.json actual-managed-efs.json
 
   build_publish_and_deploy:
     name: Build, publish, and deploy GoldenGate Helm chart via Argo CD
@@ -602,7 +697,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Three mutually exclusive resolution paths, each disclosed via an "EFS ID source:" log line: existing (Git-committed passthrough), managed (deploy=true only), and dry-run (deploy=false; a syntactically-valid placeholder that is never committed, never sent to Argo CD/AWS). INTERIM NOTE (correction pass): the managed path below still resolves via AWS DescribeFileSystems-by-creation-token, not `terraform output efs_id` from envs/dev/runtime-efs -- that root's remote-state backend wiring is blocked pending platform-team confirmation of the existing backend convention (see the completion report's TERRAFORM STATE DESIGN section); this AWS-describe path remains the correct, working, tested mechanism until that blocker is resolved, at which point it should be replaced by a `terraform output` read from the runtime's own isolated state.
+          # Three mutually exclusive resolution paths, each disclosed via an "EFS ID source:" log line: existing (Git-committed passthrough), managed (deploy=true only), and dry-run (deploy=false; a syntactically-valid placeholder that is never committed, never sent to Argo CD/AWS). DESIGN NOTE: the managed path resolves via AWS DescribeFileSystems-by-exact-creation-token rather than a Terraform child output on purpose -- the approved corporate reusable workflow (AbuDhabiCommercialBank/adcb-reusable-workflows/aws-terraform-apply.yaml@main) does not expose arbitrary child Terraform outputs back to this orchestrator, so the creation-token contract (verified in the approved ADCB EFS module v1.0.0: `creation_token = var.name`) is the permanent resolution mechanism, not an interim one.
           if [ -z "$EFS_MODE" ]; then
             echo "EFS ID source: not applicable (persistence.efs is not in use for this deployment)."
             echo "RESOLVED_EFS_ID=" >> "$GITHUB_ENV"
@@ -654,21 +749,33 @@ jobs:
           fi
 
           DESCRIBE_EFS_JSON="$(AWS_ACCESS_KEY_ID="$EFS_TMP_KEY_ID" AWS_SECRET_ACCESS_KEY="$EFS_TMP_SECRET" AWS_SESSION_TOKEN="$EFS_TMP_TOKEN" aws efs describe-file-systems --creation-token "$EFS_CREATION_TOKEN" --region "$AWS_REGION" --output json)"
-          unset EFS_TMP_KEY_ID EFS_TMP_SECRET EFS_TMP_TOKEN
 
           MATCH_COUNT="$(python3 -c 'import json, sys; print(len(json.load(sys.stdin)["FileSystems"]))' <<< "$DESCRIBE_EFS_JSON")"
           if [ "$MATCH_COUNT" -ne 1 ]; then
             echo "FAIL: expected exactly one EFS filesystem for creation token ${EFS_CREATION_TOKEN}, found ${MATCH_COUNT}. Refusing to list-and-guess."
+            unset EFS_TMP_KEY_ID EFS_TMP_SECRET EFS_TMP_TOKEN
             exit 1
           fi
 
           LIFECYCLE_STATE="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["FileSystems"][0]["LifeCycleState"])' <<< "$DESCRIBE_EFS_JSON")"
           if [ "$LIFECYCLE_STATE" != "available" ]; then
             echo "FAIL: the managed EFS filesystem for creation token ${EFS_CREATION_TOKEN} is in lifecycle state ${LIFECYCLE_STATE}, not available."
+            unset EFS_TMP_KEY_ID EFS_TMP_SECRET EFS_TMP_TOKEN
             exit 1
           fi
 
           RESOLVED_EFS_ID="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["FileSystems"][0]["FileSystemId"])' <<< "$DESCRIBE_EFS_JSON")"
+
+          # Defense in depth: cross-check the resolved filesystem's tags match the exact ownership tags envs/dev/efs.tf's custom_tags applies -- catches a creation-token collision with an untagged/mistagged filesystem before it ever reaches Helm/Argo.
+          TAGS_JSON="$(AWS_ACCESS_KEY_ID="$EFS_TMP_KEY_ID" AWS_SECRET_ACCESS_KEY="$EFS_TMP_SECRET" AWS_SESSION_TOKEN="$EFS_TMP_TOKEN" aws efs list-tags-for-resource --resource-id "$RESOLVED_EFS_ID" --region "$AWS_REGION" --output json)"
+          unset EFS_TMP_KEY_ID EFS_TMP_SECRET EFS_TMP_TOKEN
+
+          TAGS_OK="$(python3 -c 'import json, sys; tags = {t["Key"]: t["Value"] for t in json.load(sys.stdin).get("Tags", [])}; print("true" if tags.get("ManagedBy") == "goldengate-eks-app" and tags.get("GoldenGateDeploymentId") == sys.argv[1] and tags.get("GoldenGateEnvironment") == sys.argv[2] else "false")' "$DEPLOYMENT_ID" "$ENVIRONMENT" <<< "$TAGS_JSON")"
+          if [ "$TAGS_OK" != "true" ]; then
+            echo "FAIL: the EFS filesystem resolved for creation token ${EFS_CREATION_TOKEN} (${RESOLVED_EFS_ID}) does not carry the expected ManagedBy/GoldenGateDeploymentId/GoldenGateEnvironment ownership tags."
+            exit 1
+          fi
+
           echo "EFS ID source: managed Terraform/AWS resolution (creation token ${EFS_CREATION_TOKEN})."
           echo "Resolved EFS filesystem ID: ${RESOLVED_EFS_ID}"
           echo "RESOLVED_EFS_ID=${RESOLVED_EFS_ID}" >> "$GITHUB_ENV"
