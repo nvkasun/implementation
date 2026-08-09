@@ -554,6 +554,9 @@ def _parse_efs(deployment_id, environment, doc):
     u02 = storage.get("u02") or {}
     pvc_claim_name = u02.get("claimName") or u02.get("existingClaim") or ""
 
+    if "enabled" in persistence and not _is_literal_bool(persistence.get("enabled")):
+        raise DescriptorError("invalid persistence configuration: persistence.enabled must be a literal Boolean")
+
     efs_enabled = persistence.get("enabled") is True and persistence.get("provider") == "efs"
     if not efs_enabled:
         return {"mode": None, "fileSystemId": None, "creationToken": None, "pvcClaimName": pvc_claim_name}

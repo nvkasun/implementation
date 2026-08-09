@@ -731,6 +731,41 @@ class EnvironmentScopedContractTests(ScratchEnvironmentTestCase):
         self.assertEqual(invalid, [])
         self.assertIsNone(active[0]["efsMode"])
 
+    def test_persistence_enabled_string_true_fails_closed_not_silently_skipped(self):
+        write_doc(self._tmp.name, "dev", "gg-fixture-01",
+                 _efs_test_doc(persistence={"enabled": "true", "provider": "efs", "efs": {"mode": "managed"}}))
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+        self.assertIn("persistence.enabled must be a literal Boolean", invalid[0][1])
+
+    def test_persistence_enabled_string_false_fails_closed(self):
+        write_doc(self._tmp.name, "dev", "gg-fixture-01",
+                 _efs_test_doc(persistence={"enabled": "false", "provider": "efs"}))
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+        self.assertIn("persistence.enabled must be a literal Boolean", invalid[0][1])
+
+    def test_persistence_enabled_integer_one_fails_closed(self):
+        write_doc(self._tmp.name, "dev", "gg-fixture-01",
+                 _efs_test_doc(persistence={"enabled": 1, "provider": "efs"}))
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+        self.assertIn("persistence.enabled must be a literal Boolean", invalid[0][1])
+
+    def test_persistence_enabled_literal_true_still_supported(self):
+        write_doc(self._tmp.name, "dev", "gg-fixture-01",
+                 _efs_test_doc(persistence={"enabled": True, "provider": "efs", "efs": {"mode": "managed"}}))
+        active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        self.assertEqual(active[0]["efsMode"], "managed")
+
+    def test_persistence_enabled_literal_false_still_supported(self):
+        write_doc(self._tmp.name, "dev", "gg-fixture-01",
+                 _efs_test_doc(persistence={"enabled": False}))
+        active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        self.assertIsNone(active[0]["efsMode"])
+
     def test_derived_namespace_fields_present(self):
         write_descriptor(self._tmp.name, "dev", "gg-fixture-01")
         active, _inactive, _invalid = gdm.scan("dev")

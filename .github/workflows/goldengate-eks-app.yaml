@@ -124,12 +124,13 @@ jobs:
   terraform_sync_once:
     name: Synchronize Terraform (once per environment)
 
-    # Must observe detect_changed_deployments' deletion_matrix (via managed_efs_deletion_guard) before any Terraform apply can run, or a physically-deleted persistence.efs.mode=managed descriptor could reach `terraform apply` and destroy a durable EFS filesystem; this job's `if:` is a custom expression, so each needed job's result is checked explicitly below since GitHub Actions does not implicitly require needs to have succeeded once a custom if: is present.
+    # Must observe detect_changed_deployments' deletion_matrix and storage_transition_violations (via managed_efs_deletion_guard and storage_transition_guard) before any Terraform apply can run, or a physically-deleted persistence.efs.mode=managed descriptor or an unsafe managed<->existing/fileSystemId mutation could reach `terraform apply` and destroy or repoint a durable EFS filesystem; this job's `if:` is a custom expression, so each needed job's result is checked explicitly below since GitHub Actions does not implicitly require needs to have succeeded once a custom if: is present.
     needs:
       - validate_model
       - detect_changed_deployments
       - managed_efs_deletion_guard
-    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.detect_changed_deployments.result == 'success' && needs.managed_efs_deletion_guard.result == 'success' }}
+      - storage_transition_guard
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.detect_changed_deployments.result == 'success' && needs.managed_efs_deletion_guard.result == 'success' && needs.storage_transition_guard.result == 'success' }}
 
     # The called Terraform chain needs packages/pull-requests beyond the orchestrator's own top-level permissions; a callee can never be elevated above its caller.
     permissions:
@@ -227,6 +228,8 @@ jobs:
       deployment_matrix: ${{ steps.detect.outputs.deployment_matrix }}
       has_deletions: ${{ steps.detect.outputs.has_deletions }}
       deletion_matrix: ${{ steps.detect.outputs.deletion_matrix }}
+      has_storage_transition_violations: ${{ steps.detect.outputs.has_storage_transition_violations }}
+      storage_transition_violations: ${{ steps.detect.outputs.storage_transition_violations }}
 
     steps:
       - name: Checkout repository
@@ -291,19 +294,68 @@ jobs:
           MANAGED_DELETIONS="$(python3 -c '
           import json, sys
           items = json.loads(sys.argv[1])
-          managed = [i.get("deployment_id", "?") for i in items if i.get("efs_mode") == "managed"]
+          managed = [i.get("deployment_id", "?") for i in items if i.get("efs_mode") == "managed" and i.get("reason") == "physical-removal"]
           print("\n".join(managed))
           ' "$DELETION_MATRIX")"
+
+          LIFECYCLE_ABSENT_MANAGED="$(python3 -c '
+          import json, sys
+          items = json.loads(sys.argv[1])
+          managed = [i.get("deployment_id", "?") for i in items if i.get("efs_mode") == "managed" and i.get("reason") == "lifecycle-absent"]
+          print("\n".join(managed))
+          ' "$DELETION_MATRIX")"
+
+          if [ -n "$LIFECYCLE_ABSENT_MANAGED" ]; then
+            echo "ALLOWED (application decommission only, managed storage retained): the following managed-EFS deployment(s) transitioned to lifecycle.state=absent this push -- their descriptor and dedicated EFS filesystem are retained; only application-level resources (Argo CD Application, runtime pod) are affected:"
+            echo "$LIFECYCLE_ABSENT_MANAGED"
+          fi
 
           if [ -n "$MANAGED_DELETIONS" ]; then
             echo "FAIL: the following deployment descriptor(s) were physically deleted while persistence.efs.mode=managed:"
             echo "$MANAGED_DELETIONS"
             echo ""
-            echo "Managed GoldenGate EFS is durable state. Physical deletion of this deployment descriptor is blocked because the next Terraform apply could destroy the filesystem. Use the controlled storage-decommission process."
+            echo "Managed GoldenGate EFS is durable storage. Physical deletion of the deployment descriptor is blocked. Set lifecycle.state=absent first and use the controlled storage-decommission procedure before removing the descriptor."
             exit 1
           fi
 
           echo "OK: no deleted descriptor declared persistence.efs.mode=managed. Terraform sync may proceed."
+
+  storage_transition_guard:
+    name: Guard against unsafe persistence.efs storage-identity transitions
+
+    # A changed-but-still-present descriptor can silently repoint a runtime's StorageClass at a different filesystem (managed<->existing, a mutated existing fileSystemId) or stop declaring EFS at all (managed->disabled/non-EFS) -- each of these is a storage MIGRATION, not an ordinary config edit, and none of them are safe to let reach Terraform/Helm/Argo without an explicit, separate decommission process. This job fails the whole workflow closed before terraform_sync_once can run; no repository checkout or AWS access is needed since detect_changed_deployments already computed the violation list from historical vs current descriptor content.
+    needs:
+      - detect_changed_deployments
+    if: success()
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Fail closed if any changed descriptor made an unsafe storage-identity transition
+        shell: bash
+        env:
+          TRANSITION_VIOLATIONS: ${{ needs.detect_changed_deployments.outputs.storage_transition_violations }}
+        run: |
+          set -euo pipefail
+
+          echo "Storage transition violations: ${TRANSITION_VIOLATIONS}"
+
+          VIOLATION_COUNT="$(python3 -c 'import json, sys; print(len(json.loads(sys.argv[1])))' "$TRANSITION_VIOLATIONS")"
+
+          if [ "$VIOLATION_COUNT" -ne 0 ]; then
+            echo "FAIL: one or more changed deployment descriptors made an unsafe persistence.efs storage-identity transition:"
+            python3 -c '
+          import json, sys
+          for item in json.loads(sys.argv[1]):
+              dep_id, violation = item.get("deployment_id", "?"), item.get("violation", "?")
+              print(f"  {dep_id}: {violation}")
+          ' "$TRANSITION_VIOLATIONS"
+            echo ""
+            echo "managed<->existing, managed->persistence-disabled, managed->non-EFS-provider, and a mutated existing fileSystemId are storage migrations, not ordinary deployment updates. They require a separate, explicit migration/decommission process -- revert the persistence.efs change in this push before it can proceed."
+            exit 1
+          fi
+
+          echo "OK: no unsafe storage-identity transition detected. Terraform sync may proceed."
 
   build_publish_and_deploy:
     name: Build, publish, and deploy GoldenGate Helm chart via Argo CD
@@ -545,11 +597,12 @@ jobs:
       - name: Resolve EFS filesystem ID
         shell: bash
         env:
-          EFFECTIVE_DEPLOY: ${{ needs.validate_model.outputs.effective_deploy }}
+          # matrix.deploy (not needs.validate_model.outputs.effective_deploy) is the correct source here: validate_model is not declared in this job's own needs, so that needs reference would silently resolve empty/undefined and could misclassify a real deploy as dry-run. matrix.deploy already carries this exact per-runtime deploy intent (see the deployment_matrix built by hack/detect-goldengate-deployments.sh) and gates every other deploy-only step in this job.
+          EFFECTIVE_DEPLOY: ${{ matrix.deploy }}
         run: |
           set -euo pipefail
 
-          # Three mutually exclusive resolution paths, each disclosed via an "EFS ID source:" log line: existing (Git-committed passthrough), managed (real AWS lookup by exact creation token, deploy=true only), and dry-run (deploy=false; a syntactically-valid placeholder that is never committed, never sent to Argo CD/AWS).
+          # Three mutually exclusive resolution paths, each disclosed via an "EFS ID source:" log line: existing (Git-committed passthrough), managed (deploy=true only), and dry-run (deploy=false; a syntactically-valid placeholder that is never committed, never sent to Argo CD/AWS). INTERIM NOTE (correction pass): the managed path below still resolves via AWS DescribeFileSystems-by-creation-token, not `terraform output efs_id` from envs/dev/runtime-efs -- that root's remote-state backend wiring is blocked pending platform-team confirmation of the existing backend convention (see the completion report's TERRAFORM STATE DESIGN section); this AWS-describe path remains the correct, working, tested mechanism until that blocker is resolved, at which point it should be replaced by a `terraform output` read from the runtime's own isolated state.
           if [ -z "$EFS_MODE" ]; then
             echo "EFS ID source: not applicable (persistence.efs is not in use for this deployment)."
             echo "RESOLVED_EFS_ID=" >> "$GITHUB_ENV"

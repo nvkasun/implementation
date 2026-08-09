@@ -210,6 +210,80 @@ print(mode if isinstance(mode, str) else "")
 PYEOF
 }
 
+# STORAGE-TRANSITION-GUARD support: prints a compact one-line JSON summary of $1's persistence.efs identity (mode/provider/fileSystemId, each string-or-null, plus enabled as a real JSON boolean) so the caller can diff historical vs current state without re-deriving the efs_enabled gate twice; unparsable/malformed content degrades to an all-null/false summary rather than failing the caller, since the transition guard itself decides what is safe, not this extraction step.
+_persistence_efs_summary_json() {
+  local content_file="$1"
+
+  python3 - "$content_file" <<'PYEOF'
+import json
+import sys
+
+import yaml
+
+path = sys.argv[1]
+with open(path, "r") as f:
+    raw = f.read()
+
+summary = {"enabled": False, "provider": None, "mode": None, "fileSystemId": None}
+
+try:
+    data = yaml.safe_load(raw)
+except yaml.YAMLError:
+    print(json.dumps(summary))
+    sys.exit(0)
+
+if not isinstance(data, dict):
+    print(json.dumps(summary))
+    sys.exit(0)
+
+persistence = data.get("persistence")
+if not isinstance(persistence, dict):
+    print(json.dumps(summary))
+    sys.exit(0)
+
+summary["enabled"] = persistence.get("enabled") is True
+summary["provider"] = persistence.get("provider") if isinstance(persistence.get("provider"), str) else None
+
+if not summary["enabled"] or summary["provider"] != "efs":
+    print(json.dumps(summary))
+    sys.exit(0)
+
+efs = persistence.get("efs")
+if isinstance(efs, dict):
+    summary["mode"] = efs.get("mode") if isinstance(efs.get("mode"), str) else None
+    summary["fileSystemId"] = efs.get("fileSystemId") if isinstance(efs.get("fileSystemId"), str) else None
+
+print(json.dumps(summary))
+PYEOF
+}
+
+# STORAGE-TRANSITION-GUARD rules: given $1=historical and $2=current _persistence_efs_summary_json blobs for the SAME still-present descriptor, prints one non-empty violation reason if the transition is unsafe, otherwise prints nothing. Allowed: new deployment (no historical state, never called for that case -- see the caller), managed->managed, existing->existing with an unchanged fileSystemId, and any change unrelated to persistence.efs identity (e.g. lifecycle.state alone). Blocked: managed->existing, existing->managed, managed->persistence disabled, managed->non-EFS provider, existing fileSystemId mutation.
+_check_storage_transition() {
+  local historical_json="$1"
+  local current_json="$2"
+
+  python3 -c '
+import json, sys
+
+historical, current = json.loads(sys.argv[1]), json.loads(sys.argv[2])
+h_mode, c_mode = historical.get("mode"), current.get("mode")
+
+if h_mode == "managed":
+    if not current.get("enabled"):
+        print("managed -> persistence disabled")
+    elif current.get("provider") != "efs":
+        print("managed -> non-EFS provider")
+    elif c_mode == "existing":
+        print("managed -> existing")
+elif h_mode == "existing":
+    if c_mode == "managed":
+        print("existing -> managed")
+    elif c_mode == "existing" and current.get("fileSystemId") != historical.get("fileSystemId"):
+        old_id, new_id = historical.get("fileSystemId"), current.get("fileSystemId")
+        print(f"existing fileSystemId changed from {old_id!r} to {new_id!r}")
+' "$historical_json" "$current_json"
+}
+
 # ACTIVE CONTRACT: qualifies only a non-empty, valid YAML mapping whose deploymentModel is exactly "singleRuntime" (legacyPair and unrecognized values fail closed); content-based only, independent of the enabled/lifecycle check above.
 is_goldengate_deployment_values_file() {
   local values_file="$1"
@@ -314,6 +388,9 @@ if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
   echo "deployment_matrix=${MATRIX_JSON}" >> "$GITHUB_OUTPUT"
   echo "has_deletions=false" >> "$GITHUB_OUTPUT"
   echo "deletion_matrix=[]" >> "$GITHUB_OUTPUT"
+  # A manual redeploy has no push-diff base to compare against, so the storage-transition guard (which needs BEFORE_SHA content) does not run here; the push path already blocks an unsafe transition before it can be merged.
+  echo "has_storage_transition_violations=false" >> "$GITHUB_OUTPUT"
+  echo "storage_transition_violations=[]" >> "$GITHUB_OUTPUT"
 
   echo "Matrix: ${MATRIX_JSON}"
   exit 0
@@ -477,42 +554,106 @@ for CANDIDATE_ID in $DELETION_CANDIDATE_IDS; do
   set -e
 
   if [ "$STATUS" -ne 0 ]; then
-    # deployment.enabled=false (or top-level enabled=false) is retired-but-retained -- never drives deletion; only a removed file or lifecycle.state=absent does.
+    # deployment.enabled=false (or top-level enabled=false) is retired-but-retained -- never drives deletion. lifecycle.state=absent decommissions the RUNTIME APPLICATION only, while the descriptor (and any managed durable storage it names) is retained -- it must never be conflated with physical removal of the descriptor itself, which is the only shape that can make Terraform observe a vanished module instance.
     case "$REASON" in
       deployment.enabled=false*|enabled=false*)
         echo "Inactive (retained, not deleted): ${CANDIDATE_ID} (${REASON})"
         INACTIVE_LOG="${INACTIVE_LOG}  - ${CANDIDATE_ID} (${REASON}) [retained -- no deletion request]\n"
+        DELETION_REASON=""
+        ;;
+      lifecycle.state=absent*)
+        echo "Lifecycle absent (application decommission, descriptor and storage retained): ${CANDIDATE_ID} (${REASON})"
+        INACTIVE_LOG="${INACTIVE_LOG}  - ${CANDIDATE_ID} (${REASON}) [lifecycle-absent -- application removed, managed storage retained]\n"
+        DELETION_REASON="lifecycle-absent"
         ;;
       *)
-        echo "Inactive/deleted: ${CANDIDATE_ID} (${REASON})"
+        echo "Inactive/deleted (physical removal): ${CANDIDATE_ID} (${REASON})"
         INACTIVE_LOG="${INACTIVE_LOG}  - ${CANDIDATE_ID} (${REASON})\n"
-        echo "  deploymentModel (${GG_SOURCE}): ${CANDIDATE_DEPLOYMENT_MODEL}"
-
-        # Resolve historical persistence.efs.mode from whichever source classified this candidate (working tree if the file still exists there, e.g. lifecycle.state=absent, otherwise its content at BEFORE_SHA) for managed_efs_deletion_guard; never inferred, empty string means EFS/managed was never declared there.
-        if [ -f "$VALUES_FILE" ] && [ -s "$VALUES_FILE" ]; then
-          CANDIDATE_EFS_MODE="$(_efs_mode_from_yaml "$VALUES_FILE")"
-        else
-          EFS_TMP_FILE="$(mktemp)"
-          if git show "${BEFORE_SHA}:${VALUES_FILE}" > "$EFS_TMP_FILE" 2>/dev/null && [ -s "$EFS_TMP_FILE" ]; then
-            CANDIDATE_EFS_MODE="$(_efs_mode_from_yaml "$EFS_TMP_FILE")"
-          else
-            CANDIDATE_EFS_MODE=""
-          fi
-          rm -f "$EFS_TMP_FILE"
-        fi
-        echo "  persistence.efs.mode (${GG_SOURCE}): ${CANDIDATE_EFS_MODE:-<not declared>}"
-
-        DELETION_MATRIX_ITEMS="$(echo "$DELETION_MATRIX_ITEMS" | jq -c \
-          --arg deployment_id "$CANDIDATE_ID" \
-          --arg deployment_model "$CANDIDATE_DEPLOYMENT_MODEL" \
-          --arg efs_mode "$CANDIDATE_EFS_MODE" \
-          '. + [{environment: "dev", deployment_id: $deployment_id, deployment_model: $deployment_model, efs_mode: $efs_mode}]')"
+        DELETION_REASON="physical-removal"
         ;;
     esac
+
+    if [ -n "$DELETION_REASON" ]; then
+      echo "  deploymentModel (${GG_SOURCE}): ${CANDIDATE_DEPLOYMENT_MODEL}"
+
+      # Resolve historical persistence.efs.mode from whichever source classified this candidate (working tree if the file still exists there, e.g. lifecycle.state=absent, otherwise its content at BEFORE_SHA) for managed_efs_deletion_guard; never inferred, empty string means EFS/managed was never declared there.
+      if [ -f "$VALUES_FILE" ] && [ -s "$VALUES_FILE" ]; then
+        CANDIDATE_EFS_MODE="$(_efs_mode_from_yaml "$VALUES_FILE")"
+      else
+        EFS_TMP_FILE="$(mktemp)"
+        if git show "${BEFORE_SHA}:${VALUES_FILE}" > "$EFS_TMP_FILE" 2>/dev/null && [ -s "$EFS_TMP_FILE" ]; then
+          CANDIDATE_EFS_MODE="$(_efs_mode_from_yaml "$EFS_TMP_FILE")"
+        else
+          CANDIDATE_EFS_MODE=""
+        fi
+        rm -f "$EFS_TMP_FILE"
+      fi
+      echo "  persistence.efs.mode (${GG_SOURCE}): ${CANDIDATE_EFS_MODE:-<not declared>}"
+      echo "  reason: ${DELETION_REASON}"
+
+      DELETION_MATRIX_ITEMS="$(echo "$DELETION_MATRIX_ITEMS" | jq -c \
+        --arg deployment_id "$CANDIDATE_ID" \
+        --arg deployment_model "$CANDIDATE_DEPLOYMENT_MODEL" \
+        --arg efs_mode "$CANDIDATE_EFS_MODE" \
+        --arg reason "$DELETION_REASON" \
+        '. + [{environment: "dev", deployment_id: $deployment_id, deployment_model: $deployment_model, efs_mode: $efs_mode, reason: $reason}]')"
+    fi
   else
     echo "Still active: ${CANDIDATE_ID} (${REASON}) -- not a deletion."
   fi
 done
+
+echo ""
+echo "Checking changed-and-still-present descriptors for unsafe storage-identity transitions..."
+
+TRANSITION_VIOLATIONS="[]"
+
+for CHANGED_ID in $CHANGED_VALUES_IDS; do
+  CHANGED_VALUES_FILE="envs/dev/${CHANGED_ID}/values.yaml"
+
+  # Only a still-present descriptor can undergo a "transition" -- a removed/emptied file is a deletion, already handled by the deletion matrix, not a storage-identity mutation of a still-existing runtime.
+  if [ ! -f "$CHANGED_VALUES_FILE" ] || [ ! -s "$CHANGED_VALUES_FILE" ]; then
+    continue
+  fi
+
+  set +e
+  CT_GG_REASON="$(is_goldengate_deployment_values_file "$CHANGED_VALUES_FILE")"
+  CT_GG_STATUS=$?
+  set -e
+  if [ "$CT_GG_STATUS" -ne 0 ]; then
+    continue
+  fi
+
+  # No historical content at BEFORE_SHA means this is a brand-new deployment folder -- any starting persistence.efs.mode is allowed (new managed, new existing).
+  CT_HIST_TMP="$(mktemp)"
+  if ! git show "${BEFORE_SHA}:${CHANGED_VALUES_FILE}" > "$CT_HIST_TMP" 2>/dev/null || [ ! -s "$CT_HIST_TMP" ]; then
+    rm -f "$CT_HIST_TMP"
+    continue
+  fi
+
+  CT_HISTORICAL_JSON="$(_persistence_efs_summary_json "$CT_HIST_TMP")"
+  rm -f "$CT_HIST_TMP"
+  CT_CURRENT_JSON="$(_persistence_efs_summary_json "$CHANGED_VALUES_FILE")"
+
+  CT_VIOLATION="$(_check_storage_transition "$CT_HISTORICAL_JSON" "$CT_CURRENT_JSON")"
+  if [ -n "$CT_VIOLATION" ]; then
+    echo "STORAGE TRANSITION VIOLATION: ${CHANGED_ID}: ${CT_VIOLATION}"
+    TRANSITION_VIOLATIONS="$(echo "$TRANSITION_VIOLATIONS" | jq -c \
+      --arg deployment_id "$CHANGED_ID" \
+      --arg violation "$CT_VIOLATION" \
+      '. + [{environment: "dev", deployment_id: $deployment_id, violation: $violation}]')"
+  fi
+done
+
+TRANSITION_VIOLATION_COUNT="$(echo "$TRANSITION_VIOLATIONS" | jq 'length')"
+if [ "$TRANSITION_VIOLATION_COUNT" -eq 0 ]; then
+  echo "No unsafe storage-identity transitions detected."
+  echo "has_storage_transition_violations=false" >> "$GITHUB_OUTPUT"
+  echo "storage_transition_violations=[]" >> "$GITHUB_OUTPUT"
+else
+  echo "has_storage_transition_violations=true" >> "$GITHUB_OUTPUT"
+  echo "storage_transition_violations=${TRANSITION_VIOLATIONS}" >> "$GITHUB_OUTPUT"
+fi
 
 # Deletion wins: drop any ID from the deployment matrix that also ended up in the deletion matrix.
 DEPLOYMENT_MATRIX_ITEMS="$(echo "$DEPLOYMENT_MATRIX_ITEMS" | jq -c \
@@ -550,3 +691,4 @@ fi
 
 echo "Deployment matrix: ${DEPLOYMENT_MATRIX_ITEMS}"
 echo "Deletion matrix: ${DELETION_MATRIX_ITEMS}"
+echo "Storage transition violations: ${TRANSITION_VIOLATIONS}"

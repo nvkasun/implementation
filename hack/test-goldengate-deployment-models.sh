@@ -2970,9 +2970,11 @@ HARNESS
              "${DELETION_REPO}/envs/dev/case-empty-comment" \
              "${DELETION_REPO}/envs/dev/case-empty-whitespace" \
              "${DELETION_REPO}/envs/dev/case-empty-null" \
-             "${DELETION_REPO}/envs/dev/case3-historical-legacypair-removed"
+             "${DELETION_REPO}/envs/dev/case3-historical-legacypair-removed" \
+             "${DELETION_REPO}/envs/dev/case8-lifecycle-absent"
 
     printf 'deploymentModel: singleRuntime\nrunning: at-base-revision\n' > "${DELETION_REPO}/envs/dev/case2-removed-canonical/values.yaml"
+    printf 'deploymentModel: singleRuntime\ndeployment:\n  enabled: true\npersistence:\n  enabled: true\n  provider: efs\n  efs:\n    mode: managed\n' > "${DELETION_REPO}/envs/dev/case8-lifecycle-absent/values.yaml"
     printf 'global:\n  environment: dev\nnamespace:\n  create: true\n' > "${DELETION_REPO}/envs/dev/goldengate-monitor/values.yaml"
     printf 'server:\n  extraArgs: []\n' > "${DELETION_REPO}/envs/dev/argocd/values.yaml"
     printf 'deploymentModel: singleRuntime\n  bad indent: [unterminated\n' > "${DELETION_REPO}/envs/dev/case6-malformed/values.yaml"
@@ -2996,6 +2998,9 @@ HARNESS
     mkdir -p "${DELETION_REPO}/envs/dev/case1-retired-legacypair-retained"
     printf 'deploymentModel: legacyPair\ndeployment:\n  enabled: false\n' > "${DELETION_REPO}/envs/dev/case1-retired-legacypair-retained/values.yaml"
 
+    # case8: the file is NOT removed -- only its content changes to add lifecycle.state=absent, proving the physical-removal/lifecycle-absent distinction (the descriptor and its managed EFS declaration are still physically present).
+    printf 'deploymentModel: singleRuntime\ndeployment:\n  enabled: true\npersistence:\n  enabled: true\n  provider: efs\n  efs:\n    mode: managed\nlifecycle:\n  state: absent\n' > "${DELETION_REPO}/envs/dev/case8-lifecycle-absent/values.yaml"
+
     : > "${DELETION_REPO}/envs/dev/case-empty-zerobyte/values.yaml"
     printf '# retired\n# nothing here\n' > "${DELETION_REPO}/envs/dev/case-empty-comment/values.yaml"
     printf '   \n\n   \n' > "${DELETION_REPO}/envs/dev/case-empty-whitespace/values.yaml"
@@ -3007,16 +3012,17 @@ HARNESS
       source "'"${WORKDIR}"'/is_active_fn.sh"
       jq() {
         shift
-        local args=("$@") model="" id=""
+        local args=("$@") model="" id="" reason=""
         for i in "${!args[@]}"; do
           [ "${args[$i]}" = "deployment_id" ] && id="${args[$((i+1))]}"
           [ "${args[$i]}" = "deployment_model" ] && model="${args[$((i+1))]}"
+          [ "${args[$i]}" = "reason" ] && reason="${args[$((i+1))]}"
         done
-        echo "[ADDED id=${id} model=${model}]"
+        echo "[ADDED id=${id} model=${model} reason=${reason}]"
       }
       BEFORE_SHA="'"$DELETION_BEFORE_SHA"'"
 
-      for id in case1-retired-legacypair-retained case2-removed-canonical case3-historical-legacypair-removed goldengate-monitor argocd case6-malformed case7-unknown-model case-empty-zerobyte case-empty-comment case-empty-whitespace case-empty-null; do
+      for id in case1-retired-legacypair-retained case2-removed-canonical case3-historical-legacypair-removed goldengate-monitor argocd case6-malformed case7-unknown-model case-empty-zerobyte case-empty-comment case-empty-whitespace case-empty-null case8-lifecycle-absent; do
         DELETION_MATRIX_ITEMS="[]"
         INACTIVE_LOG=""
         DELETION_CANDIDATE_IDS="$id"
@@ -3046,10 +3052,10 @@ HARNESS
 
     check_deletion_case "retained legacyPair (deployment.enabled=false) produces no deletion entry" \
       '^RESULT case1-retired-legacypair-retained => \[\]$'
-    check_deletion_case "2: removed canonical GoldenGate values (deploymentModel: singleRuntime) produces a deletion entry with deployment_model=singleRuntime" \
-      '^RESULT case2-removed-canonical => \[ADDED id=case2-removed-canonical model=singleRuntime\]$'
+    check_deletion_case "2: removed canonical GoldenGate values (deploymentModel: singleRuntime) produces a deletion entry with deployment_model=singleRuntime and reason=physical-removal" \
+      '^RESULT case2-removed-canonical => \[ADDED id=case2-removed-canonical model=singleRuntime reason=physical-removal\]$'
     check_deletion_case "4-req: the historical deletion contract still classifies a removed legacyPair deployment (deployment_model=legacyPair) even though legacyPair is no longer active/deployable" \
-      '^RESULT case3-historical-legacypair-removed => \[ADDED id=case3-historical-legacypair-removed model=legacyPair\]$'
+      '^RESULT case3-historical-legacypair-removed => \[ADDED id=case3-historical-legacypair-removed model=legacyPair reason=physical-removal\]$'
     check_deletion_case "11: removed goldengate-monitor values does not enter the GoldenGate deletion matrix" \
       '^RESULT goldengate-monitor => \[\]$'
     check_deletion_case "12: removed argocd values does not enter the GoldenGate deletion matrix" \
@@ -3058,14 +3064,16 @@ HARNESS
       '^RESULT case6-malformed => \[\]$'
     check_deletion_case "14: removed unknown deploymentModel does not enter deletion" \
       '^RESULT case7-unknown-model => \[\]$'
-    check_deletion_case "8: a zero-byte values file (previously valid) creates its deletion entry" \
-      '^RESULT case-empty-zerobyte => \[ADDED id=case-empty-zerobyte model=singleRuntime\]$'
-    check_deletion_case "6: a comment-only canonical values file creates its deletion entry" \
-      '^RESULT case-empty-comment => \[ADDED id=case-empty-comment model=singleRuntime\]$'
-    check_deletion_case "7: a whitespace-only values file creates its deletion entry" \
-      '^RESULT case-empty-whitespace => \[ADDED id=case-empty-whitespace model=singleRuntime\]$'
-    check_deletion_case "9: YAML null creates its deletion entry when the previous file was valid" \
-      '^RESULT case-empty-null => \[ADDED id=case-empty-null model=singleRuntime\]$'
+    check_deletion_case "8: a zero-byte values file (previously valid) creates its deletion entry with reason=physical-removal" \
+      '^RESULT case-empty-zerobyte => \[ADDED id=case-empty-zerobyte model=singleRuntime reason=physical-removal\]$'
+    check_deletion_case "6: a comment-only canonical values file creates its deletion entry with reason=physical-removal" \
+      '^RESULT case-empty-comment => \[ADDED id=case-empty-comment model=singleRuntime reason=physical-removal\]$'
+    check_deletion_case "7: a whitespace-only values file creates its deletion entry with reason=physical-removal" \
+      '^RESULT case-empty-whitespace => \[ADDED id=case-empty-whitespace model=singleRuntime reason=physical-removal\]$'
+    check_deletion_case "9: YAML null creates its deletion entry when the previous file was valid, reason=physical-removal" \
+      '^RESULT case-empty-null => \[ADDED id=case-empty-null model=singleRuntime reason=physical-removal\]$'
+    check_deletion_case "11 (Issue 3): lifecycle.state=absent while the descriptor still physically exists produces a deletion-matrix entry classified as reason=lifecycle-absent, never physical-removal" \
+      '^RESULT case8-lifecycle-absent => \[ADDED id=case8-lifecycle-absent model=singleRuntime reason=lifecycle-absent\]$'
 
     rm -rf "$DELETION_REPO"
   else
@@ -7097,47 +7105,90 @@ else
   skip "33: managed-EFS deletion guard ordering check -- python3/PyYAML unavailable"
 fi
 
-if [ -f "envs/dev/efs.tf" ]; then
-  pass "33: envs/dev/efs.tf exists"
+echo ""
+echo "--- Correction pass, Issue 2/6: isolated runtime-EFS Terraform root, no shared-state ownership ---"
+
+if [ ! -e "envs/dev/efs.tf" ]; then
+  pass "5: envs/dev/efs.tf no longer exists -- the shared envs/dev Terraform state no longer owns per-runtime managed EFS module instances"
 else
-  fail "33: envs/dev/efs.tf is missing"
+  fail "5: envs/dev/efs.tf still exists -- the shared root may still own per-runtime managed EFS"
 fi
 
-if grep -q 'aws-tf-module-efs?ref=v1.0.0' envs/dev/efs.tf 2>/dev/null; then
-  pass "33: envs/dev/efs.tf pins the approved ADCB EFS module at v1.0.0 (not silently upgraded)"
+if ! grep -qE 'module\s+"goldengate_runtime_efs"' envs/dev/*.tf 2>/dev/null; then
+  pass "5: no module.goldengate_runtime_efs instance exists anywhere in the shared envs/dev/*.tf root"
 else
-  fail "33: envs/dev/efs.tf does not reference the approved ADCB EFS module at the pinned v1.0.0 ref"
+  fail "5: a module.goldengate_runtime_efs instance still exists in the shared envs/dev/*.tf root"
 fi
 
-if grep -qE 'for_each\s*=\s*local\.goldengate_managed_efs_deployments' envs/dev/efs.tf 2>/dev/null; then
-  pass "33: the EFS module is instantiated once per managed-mode deployment via for_each over the folder-driven inventory"
+RUNTIME_EFS_TF_COUNT="$(find envs/dev/runtime-efs -maxdepth 1 -name '*.tf' 2>/dev/null | wc -l | tr -d ' ')"
+if [ -d "envs/dev/runtime-efs" ] && [ "$RUNTIME_EFS_TF_COUNT" -gt 0 ]; then
+  pass "6: the reusable runtime-EFS Terraform root exists at envs/dev/runtime-efs/"
 else
-  fail "33: envs/dev/efs.tf does not for_each over local.goldengate_managed_efs_deployments"
+  fail "6: envs/dev/runtime-efs/ is missing or contains no .tf files"
 fi
 
-if grep -qE 'resource\s+"aws_efs_(file_system|mount_target|access_point)"' envs/dev/*.tf 2>/dev/null; then
-  fail "33: envs/dev/*.tf reimplements EFS with raw aws_efs_* resources instead of using the approved module exclusively"
+PER_DEPLOYMENT_TF_COUNT="$(find envs/dev/gg-oracle-payments-01 envs/dev/gg-postgresql-payments-01 -maxdepth 1 -name '*.tf' 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$PER_DEPLOYMENT_TF_COUNT" -eq 0 ]; then
+  pass "6: no Terraform files exist inside any per-deployment folder -- the runtime-EFS root is not duplicated per deployment"
 else
-  pass "33: no raw aws_efs_file_system/mount_target/access_point resources exist anywhere in envs/dev/*.tf"
+  fail "6: Terraform files were found inside a per-deployment folder -- the runtime-EFS root must exist once, not per deployment"
 fi
 
-if grep -qE 'resource\s+"aws_security_group"' envs/dev/efs.tf 2>/dev/null; then
-  fail "33: envs/dev/efs.tf creates a new security group instead of reusing the single shared one via a fail-closed data lookup"
+if grep -q 'aws-tf-module-efs?ref=v1.0.0' envs/dev/runtime-efs/main.tf 2>/dev/null; then
+  pass "envs/dev/runtime-efs/main.tf pins the approved ADCB EFS module at v1.0.0 (not silently upgraded)"
 else
-  pass "33: envs/dev/efs.tf does not create a per-deployment security group -- it looks up the shared one"
+  fail "envs/dev/runtime-efs/main.tf does not reference the approved ADCB EFS module at the pinned v1.0.0 ref"
 fi
 
-if grep -qE '^\s*variable\s+"goldengate_efs_shared_security_group_description"' envs/dev/efs.tf 2>/dev/null \
-    && ! grep -q 'goldengate_efs_shared_security_group_description' envs/dev/gg-*-payments-01/values.yaml 2>/dev/null; then
-  pass "33: the shared EFS security group is a single environment-level configuration point, never a per-deployment values.yaml setting"
+if grep -qE '^module\s+"goldengate_runtime_efs"\s*\{' envs/dev/runtime-efs/main.tf 2>/dev/null \
+    && ! grep -qE 'for_each' envs/dev/runtime-efs/main.tf 2>/dev/null; then
+  pass "the runtime-EFS module is a single instance per Terraform apply (no for_each) -- this root is scoped to exactly one runtime deployment"
 else
-  fail "33: the shared EFS security group configuration point is missing or leaked into a per-deployment values.yaml"
+  fail "envs/dev/runtime-efs/main.tf's module block is missing or unexpectedly uses for_each"
 fi
 
-if grep -qE 'aws efs delete-file-system|aws efs delete-access-point|terraform destroy' "$EKS_APP_WORKFLOW" 2>/dev/null; then
-  fail "33: the eks-app workflow contains a destructive EFS/Terraform command outside the controlled decommission process"
+if grep -qE '^variable\s+"(environment|deployment_id|efs_creation_name)"' envs/dev/runtime-efs/variables.tf 2>/dev/null; then
+  pass "7: the runtime-EFS root accepts environment and deployment_id as explicit input variables -- state identity is derived from them, not from the folder-driven inventory"
 else
-  pass "33: the eks-app workflow contains no aws efs delete-* or terraform destroy command"
+  fail "7: envs/dev/runtime-efs/variables.tf is missing the expected environment/deployment_id/efs_creation_name variables"
+fi
+
+if ! grep -qiE '\bpipeline\b' envs/dev/runtime-efs/*.tf 2>/dev/null; then
+  pass "9: no runtime-EFS Terraform file references a replication pipeline concept -- state identity is never derived from the pipeline ID"
+else
+  fail "9: envs/dev/runtime-efs/*.tf references \"pipeline\" -- state identity must be derived from deployment_id alone"
+fi
+
+if grep -qE 'resource\s+"aws_efs_(file_system|mount_target|access_point)"' envs/dev/*.tf envs/dev/runtime-efs/*.tf 2>/dev/null; then
+  fail "26: envs/dev and envs/dev/runtime-efs reimplement EFS with raw aws_efs_* resources instead of using the approved module exclusively, or add a Terraform-owned access point"
+else
+  pass "26: no raw aws_efs_file_system/mount_target/access_point resources exist anywhere in envs/dev/*.tf or envs/dev/runtime-efs/*.tf"
+fi
+
+if grep -qE 'resource\s+"aws_security_group"' envs/dev/*.tf envs/dev/runtime-efs/*.tf 2>/dev/null; then
+  fail "25: a new security group is created somewhere instead of reusing the single shared one via a fail-closed data lookup"
+else
+  pass "25: no envs/dev or runtime-efs Terraform file creates a per-deployment security group -- all reuse the single shared one"
+fi
+
+if grep -qE '^\s*data\s+"aws_security_group"\s+"goldengate_efs_shared"' envs/dev/runtime-efs/main.tf 2>/dev/null \
+    && ! grep -qE '^\s*data\s+"aws_security_group"' envs/dev/*.tf 2>/dev/null; then
+  pass "24: the shared EFS security-group lookup lives only in envs/dev/runtime-efs (invoked only for managed EFS provisioning) -- the shared envs/dev root never needs to resolve it, so an existing-only environment (zero managed runtimes) requires no SG lookup at all"
+else
+  fail "24: the shared EFS security-group lookup is missing from runtime-efs, or still present in the shared envs/dev root"
+fi
+
+if grep -qE '^\s*variable\s+"shared_security_group_description"' envs/dev/runtime-efs/variables.tf 2>/dev/null \
+    && ! grep -q 'shared_security_group_description' envs/dev/gg-*-payments-01/values.yaml 2>/dev/null; then
+  pass "the shared EFS security group is a single environment-level configuration point, never a per-deployment values.yaml setting"
+else
+  fail "the shared EFS security group configuration point is missing or leaked into a per-deployment values.yaml"
+fi
+
+if grep -qE 'aws efs delete-file-system|aws efs delete-access-point|terraform destroy' "$EKS_APP_WORKFLOW" envs/dev/runtime-efs/*.tf 2>/dev/null; then
+  fail "27/28/29: the eks-app workflow or runtime-efs root contains a destructive EFS/Terraform command outside the controlled decommission process"
+else
+  pass "27/28/29: neither the eks-app workflow nor envs/dev/runtime-efs contains an aws efs delete-* or terraform destroy command"
 fi
 
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
@@ -7224,6 +7275,324 @@ PYEOF
   fi
 else
   skip "34: EFS ID resolution step branch checks -- python3 unavailable"
+fi
+
+echo ""
+echo "--- Correction pass, Issue 1: EFFECTIVE_DEPLOY / undeclared needs ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  set +e
+  UNDECLARED_NEEDS_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import re
+import sys
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+
+problems = []
+for job_name, job in doc["jobs"].items():
+    needs = job.get("needs")
+    if needs is None:
+        declared = set()
+    elif isinstance(needs, str):
+        declared = {needs}
+    else:
+        declared = set(needs)
+
+    job_copy = dict(job)
+    job_copy.pop("needs", None)
+    text = yaml.dump(job_copy, default_flow_style=False)
+    refs = set(re.findall(r"needs\.([A-Za-z0-9_-]+)\.", text))
+    refs |= set(re.findall(r"needs\['([A-Za-z0-9_-]+)'\]", text))
+    refs |= set(re.findall(r'needs\["([A-Za-z0-9_-]+)"\]', text))
+
+    undeclared = refs - declared
+    if undeclared:
+        problems.append(f"{job_name}: undeclared needs.{{{','.join(sorted(undeclared))}}} (declared needs: {sorted(declared)})")
+
+if problems:
+    print("\n".join(problems))
+    sys.exit(1)
+print("OK")
+PYEOF
+)"
+  UNDECLARED_NEEDS_STATUS=$?
+  set -e
+  if [ "$UNDECLARED_NEEDS_STATUS" -eq 0 ]; then
+    pass "1: no job references needs.<job> for a job it does not declare in its own needs: list"
+  else
+    fail "1: undeclared needs.<job> reference(s) found in ${EKS_APP_WORKFLOW}: ${UNDECLARED_NEEDS_OUT}"
+  fi
+
+  if grep -qE 'EFFECTIVE_DEPLOY:\s*\$\{\{\s*matrix\.deploy\s*\}\}' "$EKS_APP_WORKFLOW"; then
+    pass "1: EFFECTIVE_DEPLOY is now derived directly from matrix.deploy"
+  else
+    fail "1: EFFECTIVE_DEPLOY is not wired to matrix.deploy"
+  fi
+else
+  skip "1: undeclared-needs scan -- python3/PyYAML unavailable"
+fi
+
+# 2/3: structural proof that a dry-run placeholder can never reach the Argo CD create/update step -- that step is itself gated on matrix.deploy, and the dry-run branch inside "Resolve EFS filesystem ID" is only reachable when EFFECTIVE_DEPLOY (== matrix.deploy) is not "true", so the two conditions are mutually exclusive by construction.
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  set +e
+  ARGO_GATE_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import sys
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+
+steps = doc["jobs"]["build_publish_and_deploy"]["steps"]
+argo_step = next((s for s in steps if s.get("name") == "Create or update Argo CD Application"), None)
+if argo_step is None:
+    print("FAIL: 'Create or update Argo CD Application' step not found")
+    sys.exit(1)
+
+cond = str(argo_step.get("if", ""))
+if "matrix.deploy" not in cond:
+    print(f"FAIL: Argo CD Application step's if: does not gate on matrix.deploy (got {cond!r})")
+    sys.exit(1)
+
+print("OK")
+PYEOF
+)"
+  ARGO_GATE_STATUS=$?
+  set -e
+  if [ "$ARGO_GATE_STATUS" -eq 0 ]; then
+    pass "3: the Argo CD Application create/update step is gated on matrix.deploy -- the same condition that keeps the dry-run EFS placeholder branch from ever being reached during a real deploy, so a dry-run placeholder structurally cannot reach Argo CD"
+  else
+    fail "3: the Argo CD Application step is not correctly gated on matrix.deploy: ${ARGO_GATE_OUT}"
+  fi
+else
+  skip "3: Argo CD dry-run-unreachable structural proof -- python3/PyYAML unavailable"
+fi
+
+# 1/2 (behavioral): re-run the "Resolve EFS filesystem ID" step extraction from earlier with EFFECTIVE_DEPLOY driven exactly as matrix.deploy would supply it, proving deploy=true+managed never selects the placeholder and deploy=false+managed may use it (for Helm validation only, never persisted anywhere real).
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -s "${WORKDIR}/resolve_efs_id.sh" ]; then
+  DEPLOY_TRUE_MANAGED_OUT="$(EFS_MODE="managed" EFS_FILE_SYSTEM_ID_DECLARED="" EFS_CREATION_TOKEN="dev-x-efs" \
+    EFFECTIVE_DEPLOY="true" GITHUB_ENV="$(mktemp)" GITHUB_RUN_ID="1" GITHUB_RUN_ATTEMPT="1" AWS_REGION="eu-west-1" \
+    EKS_DEPLOY_ROLE_ARN="arn:aws:iam::668311715351:role/GoldenGateEKSDeployRole-dev" \
+    bash "${WORKDIR}/resolve_efs_id.sh" 2>&1 || true)"
+  if ! echo "$DEPLOY_TRUE_MANAGED_OUT" | grep -qF "fs-0dead0000000beef0"; then
+    pass "1: deploy=true + managed never selects the dry-run placeholder fs-0dead0000000beef0 (it instead attempts real AWS resolution)"
+  else
+    fail "1: deploy=true + managed incorrectly selected the dry-run placeholder"
+    echo "$DEPLOY_TRUE_MANAGED_OUT"
+  fi
+else
+  skip "1: deploy=true+managed placeholder-avoidance check -- prerequisites unavailable"
+fi
+
+echo ""
+echo "--- Correction pass, Issue 3: physical deletion vs lifecycle.state=absent ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  python3 - "$EKS_APP_WORKFLOW" > "${WORKDIR}/deletion_guard.sh" <<'PYEOF'
+import sys
+import yaml
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+for step in doc["jobs"]["managed_efs_deletion_guard"]["steps"]:
+    if step.get("name") == "Fail closed if any deleted descriptor declared persistence.efs.mode=managed":
+        sys.stdout.write(step["run"])
+        break
+else:
+    sys.exit("step not found")
+PYEOF
+
+  if [ ! -s "${WORKDIR}/deletion_guard.sh" ]; then
+    fail "12: could not extract the managed_efs_deletion_guard step from ${EKS_APP_WORKFLOW}"
+  else
+    PHYSICAL_REMOVAL_MATRIX='[{"deployment_id":"gg-x","efs_mode":"managed","reason":"physical-removal"}]'
+    set +e
+    PHYSICAL_OUT="$(DELETION_MATRIX="$PHYSICAL_REMOVAL_MATRIX" bash "${WORKDIR}/deletion_guard.sh" 2>&1)"
+    PHYSICAL_STATUS=$?
+    set -e
+    if [ "$PHYSICAL_STATUS" -ne 0 ] && echo "$PHYSICAL_OUT" | grep -qF "physically deleted while persistence.efs.mode=managed"; then
+      pass "10: managed + reason=physical-removal fails the guard closed"
+    else
+      fail "10: managed + reason=physical-removal did not fail the guard as expected"
+      echo "$PHYSICAL_OUT"
+    fi
+
+    LIFECYCLE_ABSENT_MATRIX='[{"deployment_id":"gg-y","efs_mode":"managed","reason":"lifecycle-absent"}]'
+    set +e
+    LIFECYCLE_OUT="$(DELETION_MATRIX="$LIFECYCLE_ABSENT_MATRIX" bash "${WORKDIR}/deletion_guard.sh" 2>&1)"
+    LIFECYCLE_STATUS=$?
+    set -e
+    if [ "$LIFECYCLE_STATUS" -eq 0 ] && echo "$LIFECYCLE_OUT" | grep -qF "ALLOWED (application decommission only, managed storage retained)"; then
+      pass "12: managed + reason=lifecycle-absent does NOT fail the guard (application decommission allowed, EFS retained, no Terraform destroy triggered)"
+    else
+      fail "12: managed + reason=lifecycle-absent incorrectly failed the guard (or the allowed-path message is missing)"
+      echo "$LIFECYCLE_OUT"
+    fi
+
+    MIXED_MATRIX='[{"deployment_id":"gg-y","efs_mode":"managed","reason":"lifecycle-absent"},{"deployment_id":"gg-x","efs_mode":"managed","reason":"physical-removal"}]'
+    set +e
+    MIXED_OUT="$(DELETION_MATRIX="$MIXED_MATRIX" bash "${WORKDIR}/deletion_guard.sh" 2>&1)"
+    MIXED_STATUS=$?
+    set -e
+    if [ "$MIXED_STATUS" -ne 0 ] && echo "$MIXED_OUT" | grep -qF "gg-x" && ! echo "$MIXED_OUT" | grep -qE "FAIL.*gg-y"; then
+      pass "11: a mixed deletion matrix fails closed only on the physical-removal entry, never conflating it with the lifecycle-absent entry"
+    else
+      fail "11: mixed physical-removal/lifecycle-absent deletion matrix was not classified independently"
+      echo "$MIXED_OUT"
+    fi
+
+    EXISTING_PHYSICAL_MATRIX='[{"deployment_id":"gg-z","efs_mode":"existing","reason":"physical-removal"}]'
+    set +e
+    EXISTING_OUT="$(DELETION_MATRIX="$EXISTING_PHYSICAL_MATRIX" bash "${WORKDIR}/deletion_guard.sh" 2>&1)"
+    EXISTING_STATUS=$?
+    set -e
+    if [ "$EXISTING_STATUS" -eq 0 ]; then
+      pass "existing-mode physical removal does not fail the managed-only guard (Terraform never owned that filesystem)"
+    else
+      fail "existing-mode physical removal incorrectly failed the managed-EFS guard"
+      echo "$EXISTING_OUT"
+    fi
+  fi
+else
+  skip "10/11/12: managed_efs_deletion_guard reason-classification checks -- python3/PyYAML unavailable"
+fi
+
+echo ""
+echo "--- Correction pass, Issue 4: storage-identity transition guard ---"
+
+if [ -f "$DETECT_SCRIPT" ] && [ "$PYTHON_AVAILABLE" = "true" ]; then
+  {
+    awk '/^_persistence_efs_summary_json\(\) \{/,/^\}$/' "$DETECT_SCRIPT"
+    echo ""
+    awk '/^_check_storage_transition\(\) \{/,/^\}$/' "$DETECT_SCRIPT"
+  } > "${WORKDIR}/transition_fn.sh"
+
+  for required_fn in _persistence_efs_summary_json _check_storage_transition; do
+    if ! grep -q "^${required_fn}() {" "${WORKDIR}/transition_fn.sh"; then
+      fail "13-18: could not extract ${required_fn}() from ${DETECT_SCRIPT} -- the transition-guard test harness cannot run"
+    fi
+  done
+
+  TRANSITION_TEST_OUTPUT="$(bash -c '
+    set -euo pipefail
+    source "'"${WORKDIR}"'/transition_fn.sh"
+
+    mk() { printf "%s\n" "$1" > "'"${WORKDIR}"'/t.yaml"; _persistence_efs_summary_json "'"${WORKDIR}"'/t.yaml"; }
+
+    MANAGED="$(mk "persistence:
+  enabled: true
+  provider: efs
+  efs:
+    mode: managed")"
+    EXISTING_A="$(mk "persistence:
+  enabled: true
+  provider: efs
+  efs:
+    mode: existing
+    fileSystemId: fs-aaaaaaaaaaaaaaaaa")"
+    EXISTING_B="$(mk "persistence:
+  enabled: true
+  provider: efs
+  efs:
+    mode: existing
+    fileSystemId: fs-bbbbbbbbbbbbbbbbb")"
+    DISABLED="$(mk "persistence:
+  enabled: false")"
+    NONEFS="$(mk "persistence:
+  enabled: true
+  provider: s3")"
+
+    echo "CASE managed->existing: [$(_check_storage_transition "$MANAGED" "$EXISTING_A")]"
+    echo "CASE existing->managed: [$(_check_storage_transition "$EXISTING_A" "$MANAGED")]"
+    echo "CASE managed->disabled: [$(_check_storage_transition "$MANAGED" "$DISABLED")]"
+    echo "CASE managed->nonefs: [$(_check_storage_transition "$MANAGED" "$NONEFS")]"
+    echo "CASE existing-fsid-changed: [$(_check_storage_transition "$EXISTING_A" "$EXISTING_B")]"
+    echo "CASE existing-same-fsid: [$(_check_storage_transition "$EXISTING_A" "$EXISTING_A")]"
+    echo "CASE managed->managed: [$(_check_storage_transition "$MANAGED" "$MANAGED")]"
+  ' 2>&1)"
+  echo "$TRANSITION_TEST_OUTPUT"
+
+  check_transition_case() {
+    local label="$1" pattern="$2"
+    if echo "$TRANSITION_TEST_OUTPUT" | grep -qE "$pattern"; then
+      pass "$label"
+    else
+      fail "$label -- expected pattern not found: ${pattern}"
+    fi
+  }
+
+  check_transition_case "13: managed -> existing is blocked" \
+    '^CASE managed->existing: \[managed -> existing\]$'
+  check_transition_case "14: existing -> managed is blocked" \
+    '^CASE existing->managed: \[existing -> managed\]$'
+  check_transition_case "15: managed -> persistence disabled is blocked" \
+    '^CASE managed->disabled: \[managed -> persistence disabled\]$'
+  check_transition_case "16: managed -> non-EFS provider is blocked" \
+    '^CASE managed->nonefs: \[managed -> non-EFS provider\]$'
+  check_transition_case "17: existing fileSystemId mutation is blocked" \
+    '^CASE existing-fsid-changed: \[existing fileSystemId changed from'
+  check_transition_case "18: existing -> existing with the same fileSystemId (normal edit) passes" \
+    '^CASE existing-same-fsid: \[\]$'
+  check_transition_case "managed -> managed (normal config update) passes" \
+    '^CASE managed->managed: \[\]$'
+else
+  skip "13-18: storage-transition rule checks -- ${DETECT_SCRIPT} or python3 unavailable"
+fi
+
+if grep -qE '^\s*storage_transition_guard:' "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "the storage_transition_guard job exists in the eks-app workflow"
+else
+  fail "the storage_transition_guard job is missing from the eks-app workflow"
+fi
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  set +e
+  TRANSITION_ORDER_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import sys
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+
+jobs = doc.get("jobs", {})
+problems = []
+
+guard = jobs.get("storage_transition_guard")
+if guard is None:
+    problems.append("storage_transition_guard job is missing")
+else:
+    needs = guard.get("needs")
+    needs_list = needs if isinstance(needs, list) else [needs]
+    if "detect_changed_deployments" not in needs_list:
+        problems.append("storage_transition_guard does not need detect_changed_deployments")
+
+tf = jobs.get("terraform_sync_once")
+if tf is None:
+    problems.append("terraform_sync_once job is missing")
+else:
+    needs = tf.get("needs")
+    needs_list = needs if isinstance(needs, list) else [needs]
+    if "storage_transition_guard" not in needs_list:
+        problems.append("terraform_sync_once does not need storage_transition_guard")
+    if_expr = str(tf.get("if", ""))
+    if "storage_transition_guard.result" not in if_expr or "success" not in if_expr:
+        problems.append("terraform_sync_once's if: does not explicitly require storage_transition_guard to have succeeded")
+
+if problems:
+    print("\n".join(problems))
+    sys.exit(1)
+print("OK")
+PYEOF
+)"
+  TRANSITION_ORDER_STATUS=$?
+  set -e
+  if [ "$TRANSITION_ORDER_STATUS" -eq 0 ]; then
+    pass "storage_transition_guard is structurally guaranteed to run before terraform_sync_once, and terraform_sync_once fails closed if it did not succeed"
+  else
+    fail "storage_transition_guard ordering is not correctly wired: ${TRANSITION_ORDER_OUT}"
+  fi
+else
+  skip "storage_transition_guard ordering check -- python3/PyYAML unavailable"
 fi
 
 echo ""
