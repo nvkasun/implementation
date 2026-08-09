@@ -172,6 +172,44 @@ PYEOF
   return $?
 }
 
+# EFS-MODE EXTRACTION (deletion-guard support): prints persistence.efs.mode from $1's content (a file already known to exist/be non-empty), or the empty string (never inferred/defaulted) when persistence/efs is not declared, not enabled, not provider=efs, unparsable, or not a mapping; never fails the caller since the deletion-safety gate must fail closed on its own comparison, not on a Python exception here.
+_efs_mode_from_yaml() {
+  local content_file="$1"
+
+  python3 - "$content_file" <<'PYEOF'
+import sys
+
+import yaml
+
+path = sys.argv[1]
+with open(path, "r") as f:
+    raw = f.read()
+
+try:
+    data = yaml.safe_load(raw)
+except yaml.YAMLError:
+    print("")
+    sys.exit(0)
+
+if not isinstance(data, dict):
+    print("")
+    sys.exit(0)
+
+persistence = data.get("persistence")
+if not isinstance(persistence, dict):
+    print("")
+    sys.exit(0)
+
+if persistence.get("enabled") is not True or persistence.get("provider") != "efs":
+    print("")
+    sys.exit(0)
+
+efs = persistence.get("efs")
+mode = efs.get("mode") if isinstance(efs, dict) else None
+print(mode if isinstance(mode, str) else "")
+PYEOF
+}
+
 # ACTIVE CONTRACT: qualifies only a non-empty, valid YAML mapping whose deploymentModel is exactly "singleRuntime" (legacyPair and unrecognized values fail closed); content-based only, independent of the enabled/lifecycle check above.
 is_goldengate_deployment_values_file() {
   local values_file="$1"
@@ -450,10 +488,25 @@ for CANDIDATE_ID in $DELETION_CANDIDATE_IDS; do
         INACTIVE_LOG="${INACTIVE_LOG}  - ${CANDIDATE_ID} (${REASON})\n"
         echo "  deploymentModel (${GG_SOURCE}): ${CANDIDATE_DEPLOYMENT_MODEL}"
 
+        # Resolve historical persistence.efs.mode from whichever source classified this candidate (working tree if the file still exists there, e.g. lifecycle.state=absent, otherwise its content at BEFORE_SHA) for managed_efs_deletion_guard; never inferred, empty string means EFS/managed was never declared there.
+        if [ -f "$VALUES_FILE" ] && [ -s "$VALUES_FILE" ]; then
+          CANDIDATE_EFS_MODE="$(_efs_mode_from_yaml "$VALUES_FILE")"
+        else
+          EFS_TMP_FILE="$(mktemp)"
+          if git show "${BEFORE_SHA}:${VALUES_FILE}" > "$EFS_TMP_FILE" 2>/dev/null && [ -s "$EFS_TMP_FILE" ]; then
+            CANDIDATE_EFS_MODE="$(_efs_mode_from_yaml "$EFS_TMP_FILE")"
+          else
+            CANDIDATE_EFS_MODE=""
+          fi
+          rm -f "$EFS_TMP_FILE"
+        fi
+        echo "  persistence.efs.mode (${GG_SOURCE}): ${CANDIDATE_EFS_MODE:-<not declared>}"
+
         DELETION_MATRIX_ITEMS="$(echo "$DELETION_MATRIX_ITEMS" | jq -c \
           --arg deployment_id "$CANDIDATE_ID" \
           --arg deployment_model "$CANDIDATE_DEPLOYMENT_MODEL" \
-          '. + [{environment: "dev", deployment_id: $deployment_id, deployment_model: $deployment_model}]')"
+          --arg efs_mode "$CANDIDATE_EFS_MODE" \
+          '. + [{environment: "dev", deployment_id: $deployment_id, deployment_model: $deployment_model, efs_mode: $efs_mode}]')"
         ;;
     esac
   else

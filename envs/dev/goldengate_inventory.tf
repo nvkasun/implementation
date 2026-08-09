@@ -105,6 +105,53 @@ locals {
   goldengate_replication_distribution_target_raw    = { for id, doc in local.goldengate_runtime_documents : id => try(doc.replication.distribution.targetDeployment, "") }
   goldengate_replication_checkpoint_table_raw       = { for id, doc in local.goldengate_runtime_documents : id => try(doc.replication.checkpoint.table, "") }
 
+  # EFS storage cardinality contract: one runtime deployment = one dedicated EFS filesystem, never one shared between source/target. Mirrors hack/goldengate-deployment-model.py's _parse_efs; never a second inventory implementation, only its Terraform-side precondition mirror.
+  goldengate_persistence_declared = {
+    for id, doc in local.goldengate_runtime_documents : id => try(doc.persistence, null) != null
+  }
+  goldengate_persistence_enabled_jsonenc = {
+    for id, doc in local.goldengate_runtime_documents : id => try(jsonencode(doc.persistence.enabled), "")
+  }
+  goldengate_persistence_enabled_raw = {
+    for id, doc in local.goldengate_runtime_documents : id => try(doc.persistence.enabled, false) == true
+  }
+  goldengate_persistence_provider_raw = {
+    for id, doc in local.goldengate_runtime_documents : id => try(doc.persistence.provider, "")
+  }
+  # efs_enabled precondition: persistence.enabled=true AND persistence.provider="efs" -- the sole gate for reading persistence.efs.* at all, exactly mirroring the Python tool's efs_enabled check.
+  goldengate_persistence_efs_declared = {
+    for id, doc in local.goldengate_runtime_documents : id =>
+    local.goldengate_persistence_enabled_raw[id] && local.goldengate_persistence_provider_raw[id] == "efs"
+  }
+  goldengate_persistence_efs_mode_raw = {
+    for id, doc in local.goldengate_runtime_documents : id => try(doc.persistence.efs.mode, "")
+  }
+  goldengate_persistence_efs_filesystem_id_raw = {
+    for id, doc in local.goldengate_runtime_documents : id => try(doc.persistence.efs.fileSystemId, "")
+  }
+  goldengate_persistence_efs_filesystem_id_declared = {
+    for id, doc in local.goldengate_runtime_documents : id =>
+    try(doc.persistence.efs.fileSystemId, null) != null && try(doc.persistence.efs.fileSystemId, "") != ""
+  }
+  goldengate_runtime_storage_u02_type_raw = {
+    for id, doc in local.goldengate_runtime_documents : id => try(doc.runtime.storage.u02.type, "")
+  }
+
+  # Keyed by every folder-driven document (not just goldengate_enabled_deployments): storage follows the runtime's Git folder, never deployment.enabled/lifecycle.state. A managed EFS module instance must never disappear from this map merely because a deployment is temporarily disabled -- only physical deletion of the values.yaml file removes an entry here, and that case is guarded upstream by the workflow's managed_efs_deletion_guard job, which must run before any Terraform apply can observe the removal.
+  goldengate_managed_efs_deployments = {
+    for id, doc in local.goldengate_runtime_documents : id => {
+      creation_token = "${var.environment}-${id}-efs"
+    }
+    if local.goldengate_persistence_efs_declared[id] && local.goldengate_persistence_efs_mode_raw[id] == "managed"
+  }
+
+  goldengate_existing_efs_deployments = {
+    for id, doc in local.goldengate_runtime_documents : id => {
+      filesystem_id = local.goldengate_persistence_efs_filesystem_id_raw[id]
+    }
+    if local.goldengate_persistence_efs_declared[id] && local.goldengate_persistence_efs_mode_raw[id] == "existing"
+  }
+
   # No filtering here; terraform_data.goldengate_runtime_contract enforces the full contract as a plan-blocking precondition.
   goldengate_runtime_candidates = local.goldengate_runtime_documents
 
@@ -418,6 +465,52 @@ resource "terraform_data" "goldengate_runtime_contract" {
       condition     = !contains(local.goldengate_duplicate_alb_group_order_ids, each.key)
       error_message = "envs/${var.environment}/${each.key}/values.yaml: ingress.alb.groupOrder duplicates another enabled runtime's ALB group order."
     }
+    precondition {
+      condition = (
+        !local.goldengate_persistence_declared[each.key]
+        || local.goldengate_persistence_enabled_jsonenc[each.key] == "true"
+        || local.goldengate_persistence_enabled_jsonenc[each.key] == "false"
+      )
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: persistence.enabled must be a literal Boolean, not a Boolean-like string, when persistence is present."
+    }
+    precondition {
+      condition = (
+        !local.goldengate_persistence_efs_declared[each.key]
+        || local.goldengate_runtime_storage_u02_type_raw[each.key] == "efs"
+      )
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.storage.u02.type must be \"efs\" when persistence.enabled=true and persistence.provider=efs."
+    }
+    precondition {
+      condition = (
+        !local.goldengate_persistence_efs_declared[each.key]
+        || contains(["managed", "existing"], local.goldengate_persistence_efs_mode_raw[each.key])
+      )
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: persistence.efs.mode must be explicitly \"managed\" or \"existing\" when persistence.enabled=true and persistence.provider=efs."
+    }
+    precondition {
+      condition = (
+        !local.goldengate_persistence_efs_declared[each.key]
+        || local.goldengate_persistence_efs_mode_raw[each.key] != "existing"
+        || can(regex("^fs-[0-9a-f]+$", local.goldengate_persistence_efs_filesystem_id_raw[each.key]))
+      )
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: persistence.efs.fileSystemId is not a safe EFS filesystem ID (required when persistence.efs.mode=existing)."
+    }
+    precondition {
+      condition = (
+        !local.goldengate_persistence_efs_declared[each.key]
+        || local.goldengate_persistence_efs_mode_raw[each.key] != "managed"
+        || !local.goldengate_persistence_efs_filesystem_id_declared[each.key]
+      )
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: persistence.efs.fileSystemId must not be set when persistence.efs.mode=managed -- Terraform provisions and resolves it."
+    }
+    precondition {
+      condition = (
+        !local.goldengate_persistence_efs_declared[each.key]
+        || local.goldengate_persistence_efs_mode_raw[each.key] != "managed"
+        || length("${var.environment}-${each.key}-efs") <= 64
+      )
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: derived EFS creation token \"${var.environment}-${each.key}-efs\" exceeds the 64-character AWS EFS creation-token limit."
+    }
   }
 }
 
@@ -547,6 +640,15 @@ check "goldengate_approved_ecr_registry_only" {
       "229410149234.dkr.ecr.eu-west-1.amazonaws.com/")
     ])
     error_message = "An enabled GoldenGate deployment references an image outside the approved private ECR account/region."
+  }
+}
+
+check "goldengate_managed_efs_creation_tokens_unique" {
+  assert {
+    condition = length(local.goldengate_managed_efs_deployments) == length(distinct([
+      for id, v in local.goldengate_managed_efs_deployments : v.creation_token
+    ]))
+    error_message = "Two GoldenGate managed-EFS deployments derive the same EFS creation token -- storage identities must never collide."
   }
 }
 

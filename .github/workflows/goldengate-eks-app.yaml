@@ -124,9 +124,12 @@ jobs:
   terraform_sync_once:
     name: Synchronize Terraform (once per environment)
 
+    # Must observe detect_changed_deployments' deletion_matrix (via managed_efs_deletion_guard) before any Terraform apply can run, or a physically-deleted persistence.efs.mode=managed descriptor could reach `terraform apply` and destroy a durable EFS filesystem; this job's `if:` is a custom expression, so each needed job's result is checked explicitly below since GitHub Actions does not implicitly require needs to have succeeded once a custom if: is present.
     needs:
       - validate_model
-    if: needs.validate_model.outputs.effective_deploy == 'true'
+      - detect_changed_deployments
+      - managed_efs_deletion_guard
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.detect_changed_deployments.result == 'success' && needs.managed_efs_deletion_guard.result == 'success' }}
 
     # The called Terraform chain needs packages/pull-requests beyond the orchestrator's own top-level permissions; a callee can never be elevated above its caller.
     permissions:
@@ -264,6 +267,43 @@ jobs:
 
           # Implementation lives in hack/detect-goldengate-deployments.sh (keeps this run: block under GitHub's ~21,000 char limit); inputs arrive via env: above, never interpolated directly.
           bash hack/detect-goldengate-deployments.sh
+
+  managed_efs_deletion_guard:
+    name: Guard against destroying a managed GoldenGate EFS filesystem
+
+    # /u02 is durable state: a managed EFS filesystem (persistence.efs.mode=managed) must never be destroyed merely because its deployment descriptor was physically deleted from Git, so this job inspects detect_changed_deployments' deletion_matrix (which carries the HISTORICAL efs_mode read from the deleted descriptor's last content) and fails the whole workflow closed before terraform_sync_once can run; no repository checkout or AWS access is needed since the matrix already carries everything this check requires.
+    needs:
+      - detect_changed_deployments
+    if: success()
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Fail closed if any deleted descriptor declared persistence.efs.mode=managed
+        shell: bash
+        env:
+          DELETION_MATRIX: ${{ needs.detect_changed_deployments.outputs.deletion_matrix }}
+        run: |
+          set -euo pipefail
+
+          echo "Deletion matrix: ${DELETION_MATRIX}"
+
+          MANAGED_DELETIONS="$(python3 -c '
+          import json, sys
+          items = json.loads(sys.argv[1])
+          managed = [i.get("deployment_id", "?") for i in items if i.get("efs_mode") == "managed"]
+          print("\n".join(managed))
+          ' "$DELETION_MATRIX")"
+
+          if [ -n "$MANAGED_DELETIONS" ]; then
+            echo "FAIL: the following deployment descriptor(s) were physically deleted while persistence.efs.mode=managed:"
+            echo "$MANAGED_DELETIONS"
+            echo ""
+            echo "Managed GoldenGate EFS is durable state. Physical deletion of this deployment descriptor is blocked because the next Terraform apply could destroy the filesystem. Use the controlled storage-decommission process."
+            exit 1
+          fi
+
+          echo "OK: no deleted descriptor declared persistence.efs.mode=managed. Terraform sync may proceed."
 
   build_publish_and_deploy:
     name: Build, publish, and deploy GoldenGate Helm chart via Argo CD
@@ -479,6 +519,11 @@ jobs:
           IMAGE_REPOSITORY="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["imageRepository"])' <<< "$DESCRIBE_JSON")"
           IMAGE_TAG="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["imageTag"])' <<< "$DESCRIBE_JSON")"
 
+          # EFS storage identity (Phase 6D1 EFS correction); efsMode is null/absent, empty here, when persistence.efs is not in use for this deployment.
+          EFS_MODE="$(python3 -c 'import json, sys; print(json.load(sys.stdin).get("efsMode") or "")' <<< "$DESCRIBE_JSON")"
+          EFS_FILE_SYSTEM_ID_DECLARED="$(python3 -c 'import json, sys; print(json.load(sys.stdin).get("efsFileSystemId") or "")' <<< "$DESCRIBE_JSON")"
+          EFS_CREATION_TOKEN="$(python3 -c 'import json, sys; print(json.load(sys.stdin).get("efsCreationToken") or "")' <<< "$DESCRIBE_JSON")"
+
           if [ -z "$RESOLVED_ADMIN_SECRET_NAME" ] || [ -z "$RESOLVED_TLS_SECRET_NAME" ] || [ -z "$RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME" ]; then
             echo "FAIL: could not resolve deployment identity for ${DEPLOYMENT_ID}."
             exit 1
@@ -487,11 +532,93 @@ jobs:
           echo "Resolved admin secret: ${RESOLVED_ADMIN_SECRET_NAME}"
           echo "Resolved TLS secret: ${RESOLVED_TLS_SECRET_NAME}"
           echo "Resolved ServiceAccount: ${RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME}"
+          echo "Resolved persistence.efs.mode: ${EFS_MODE:-<not in use>}"
           echo "RESOLVED_ADMIN_SECRET_NAME=${RESOLVED_ADMIN_SECRET_NAME}" >> "$GITHUB_ENV"
           echo "RESOLVED_TLS_SECRET_NAME=${RESOLVED_TLS_SECRET_NAME}" >> "$GITHUB_ENV"
           echo "RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME=${RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME}" >> "$GITHUB_ENV"
           echo "IMAGE_REPOSITORY=${IMAGE_REPOSITORY}" >> "$GITHUB_ENV"
           echo "IMAGE_TAG=${IMAGE_TAG}" >> "$GITHUB_ENV"
+          echo "EFS_MODE=${EFS_MODE}" >> "$GITHUB_ENV"
+          echo "EFS_FILE_SYSTEM_ID_DECLARED=${EFS_FILE_SYSTEM_ID_DECLARED}" >> "$GITHUB_ENV"
+          echo "EFS_CREATION_TOKEN=${EFS_CREATION_TOKEN}" >> "$GITHUB_ENV"
+
+      - name: Resolve EFS filesystem ID
+        shell: bash
+        env:
+          EFFECTIVE_DEPLOY: ${{ needs.validate_model.outputs.effective_deploy }}
+        run: |
+          set -euo pipefail
+
+          # Three mutually exclusive resolution paths, each disclosed via an "EFS ID source:" log line: existing (Git-committed passthrough), managed (real AWS lookup by exact creation token, deploy=true only), and dry-run (deploy=false; a syntactically-valid placeholder that is never committed, never sent to Argo CD/AWS).
+          if [ -z "$EFS_MODE" ]; then
+            echo "EFS ID source: not applicable (persistence.efs is not in use for this deployment)."
+            echo "RESOLVED_EFS_ID=" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          if [ "$EFS_MODE" = "existing" ]; then
+            echo "EFS ID source: existing descriptor."
+            echo "Resolved EFS filesystem ID: ${EFS_FILE_SYSTEM_ID_DECLARED}"
+            echo "RESOLVED_EFS_ID=${EFS_FILE_SYSTEM_ID_DECLARED}" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          if [ "$EFFECTIVE_DEPLOY" != "true" ]; then
+            echo "EFS ID source: dry-run placeholder (deploy=false; not a real AWS resource, never committed, never sent to Argo CD)."
+            echo "RESOLVED_EFS_ID=fs-0dead0000000beef0" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          if [ -z "$EFS_CREATION_TOKEN" ]; then
+            echo "FAIL: persistence.efs.mode=managed but no EFS creation token was resolved from the deployment model."
+            exit 1
+          fi
+
+          # The expected workload account is proven directly from the role ARN this step is about to assume, never a separately hardcoded/guessed account number.
+          EXPECTED_WORKLOAD_ACCOUNT_ID="$(echo "$EKS_DEPLOY_ROLE_ARN" | sed -nE 's#^arn:aws:iam::([0-9]{12}):role/.*$#\1#p')"
+          if [ -z "$EXPECTED_WORKLOAD_ACCOUNT_ID" ]; then
+            echo "FAIL: could not extract a 12-digit account ID from EKS_DEPLOY_ROLE_ARN; refusing to resolve an EFS filesystem ID without a provable expected workload account."
+            exit 1
+          fi
+
+          echo "Assuming ${EKS_DEPLOY_ROLE_ARN} for a read-only elasticfilesystem:DescribeFileSystems lookup (this role is never granted EFS creation permissions; creation belongs solely to Terraform)..."
+
+          ASSUME_JSON="$(aws sts assume-role --role-arn "$EKS_DEPLOY_ROLE_ARN" --role-session-name "gg-efs-resolve-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --duration-seconds 900 --output json)"
+          EFS_TMP_KEY_ID="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["Credentials"]["AccessKeyId"])' <<< "$ASSUME_JSON")"
+          EFS_TMP_SECRET="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["Credentials"]["SecretAccessKey"])' <<< "$ASSUME_JSON")"
+          EFS_TMP_TOKEN="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["Credentials"]["SessionToken"])' <<< "$ASSUME_JSON")"
+          unset ASSUME_JSON
+          echo "::add-mask::${EFS_TMP_KEY_ID}"
+          echo "::add-mask::${EFS_TMP_SECRET}"
+          echo "::add-mask::${EFS_TMP_TOKEN}"
+
+          # Confined to this one step's subshells only -- never written to $GITHUB_ENV, so the job-level build-account credentials used for later ECR calls are untouched once this step ends.
+          ACTUAL_ACCOUNT="$(AWS_ACCESS_KEY_ID="$EFS_TMP_KEY_ID" AWS_SECRET_ACCESS_KEY="$EFS_TMP_SECRET" AWS_SESSION_TOKEN="$EFS_TMP_TOKEN" aws sts get-caller-identity --query Account --output text --region "$AWS_REGION")"
+          if [ "$ACTUAL_ACCOUNT" != "$EXPECTED_WORKLOAD_ACCOUNT_ID" ]; then
+            echo "FAIL: assumed role resolved to account ${ACTUAL_ACCOUNT}, expected the GoldenGate workload account ${EXPECTED_WORKLOAD_ACCOUNT_ID}."
+            unset EFS_TMP_KEY_ID EFS_TMP_SECRET EFS_TMP_TOKEN
+            exit 1
+          fi
+
+          DESCRIBE_EFS_JSON="$(AWS_ACCESS_KEY_ID="$EFS_TMP_KEY_ID" AWS_SECRET_ACCESS_KEY="$EFS_TMP_SECRET" AWS_SESSION_TOKEN="$EFS_TMP_TOKEN" aws efs describe-file-systems --creation-token "$EFS_CREATION_TOKEN" --region "$AWS_REGION" --output json)"
+          unset EFS_TMP_KEY_ID EFS_TMP_SECRET EFS_TMP_TOKEN
+
+          MATCH_COUNT="$(python3 -c 'import json, sys; print(len(json.load(sys.stdin)["FileSystems"]))' <<< "$DESCRIBE_EFS_JSON")"
+          if [ "$MATCH_COUNT" -ne 1 ]; then
+            echo "FAIL: expected exactly one EFS filesystem for creation token ${EFS_CREATION_TOKEN}, found ${MATCH_COUNT}. Refusing to list-and-guess."
+            exit 1
+          fi
+
+          LIFECYCLE_STATE="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["FileSystems"][0]["LifeCycleState"])' <<< "$DESCRIBE_EFS_JSON")"
+          if [ "$LIFECYCLE_STATE" != "available" ]; then
+            echo "FAIL: the managed EFS filesystem for creation token ${EFS_CREATION_TOKEN} is in lifecycle state ${LIFECYCLE_STATE}, not available."
+            exit 1
+          fi
+
+          RESOLVED_EFS_ID="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["FileSystems"][0]["FileSystemId"])' <<< "$DESCRIBE_EFS_JSON")"
+          echo "EFS ID source: managed Terraform/AWS resolution (creation token ${EFS_CREATION_TOKEN})."
+          echo "Resolved EFS filesystem ID: ${RESOLVED_EFS_ID}"
+          echo "RESOLVED_EFS_ID=${RESOLVED_EFS_ID}" >> "$GITHUB_ENV"
 
       - name: Verify the selected image exists in the approved private ECR
         shell: bash
@@ -652,14 +779,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          # global.deploymentId/deploymentModel are intentionally not passed via --set; the chart derives runtime name from Release.Name and reads deploymentModel from $VALUES_FILE itself.
+          # global.deploymentId/deploymentModel are intentionally not passed via --set; the chart derives runtime name from Release.Name and reads deploymentModel from $VALUES_FILE itself. persistence.efs.fileSystemId always comes from RESOLVED_EFS_ID, never from $VALUES_FILE -- required for managed mode (never committed to Git) and harmless for existing/not-in-use.
           helm lint "$HELM_CHART_PATH" \
             --values "$VALUES_FILE" \
             --set global.environment="$ENVIRONMENT" \
             --set runtime.csi.admin.objectName="$RESOLVED_ADMIN_SECRET_NAME" \
             --set runtime.csi.certificate.objectName="$RESOLVED_TLS_SECRET_NAME" \
             --set runtime.serviceAccount.create=false \
-            --set runtime.serviceAccount.name="$RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME"
+            --set runtime.serviceAccount.name="$RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME" \
+            --set persistence.efs.fileSystemId="$RESOLVED_EFS_ID"
 
       - name: Render manifest for validation
         shell: bash
@@ -676,6 +804,7 @@ jobs:
             --set runtime.csi.certificate.objectName="$RESOLVED_TLS_SECRET_NAME" \
             --set runtime.serviceAccount.create=false \
             --set runtime.serviceAccount.name="$RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME" \
+            --set persistence.efs.fileSystemId="$RESOLVED_EFS_ID" \
             > "rendered/${RELEASE_NAME}.yaml"
 
           echo "Rendered manifest: rendered/${RELEASE_NAME}.yaml"
@@ -809,9 +938,18 @@ jobs:
               print(f"FAIL: {values_path} persistence.efs must be a mapping when persistence.enabled=true and provider=efs.")
               sys.exit(1)
 
-          file_system_id = efs.get("fileSystemId")
-          if not isinstance(file_system_id, str) or not file_system_id.strip():
-              print(f"FAIL: {values_path} persistence.efs.fileSystemId must be a non-empty string when EFS is enabled.")
+          # Defense in depth: mode was already validated upstream by hack/goldengate-deployment-model.py; re-checked here rather than trusted blindly. The expected fileSystemId itself never comes from this file -- it always comes from the workflow's own RESOLVED_EFS_ID (existing: Git-committed passthrough; managed: real Terraform/AWS resolution; deploy=false: dry-run placeholder).
+          mode = efs.get("mode")
+          if mode not in ("existing", "managed"):
+              print(f"FAIL: {values_path} persistence.efs.mode must be exactly 'existing' or 'managed', got {mode!r}.")
+              sys.exit(1)
+
+          declared_file_system_id = efs.get("fileSystemId")
+          if mode == "existing" and (not isinstance(declared_file_system_id, str) or not declared_file_system_id.strip()):
+              print(f"FAIL: {values_path} persistence.efs.fileSystemId must be a non-empty string when persistence.efs.mode=existing.")
+              sys.exit(1)
+          if mode == "managed" and declared_file_system_id not in (None, ""):
+              print(f"FAIL: {values_path} persistence.efs.fileSystemId must not be set when persistence.efs.mode=managed -- Terraform provisions and resolves it.")
               sys.exit(1)
 
           storage_class = efs.get("storageClass")
@@ -836,7 +974,6 @@ jobs:
               base_path = f"/{runtime_name}"
 
           print("PERSISTENCE_EFS_ENABLED=true")
-          print(f"EFS_FILESYSTEM_ID={file_system_id}")
           print(f"EFS_BASE_PATH={base_path}")
           PYEOF
           )"
@@ -855,11 +992,21 @@ jobs:
             exit 0
           fi
 
+          # The expected fileSystemId never comes from $VALUES_FILE -- it is always $RESOLVED_EFS_ID, the single value already wired into helm lint/template above (existing: Git-committed passthrough; managed: real Terraform/AWS resolution; deploy=false: dry-run placeholder). For existing mode this must also equal the declared Git value, as a defense-in-depth check that the earlier resolution step did not silently diverge.
+          if [ -z "$RESOLVED_EFS_ID" ]; then
+            echo "FAIL: persistence.enabled=true and provider=efs in ${VALUES_FILE}, but RESOLVED_EFS_ID is empty. The EFS resolution step must run before this validation."
+            exit 1
+          fi
+          if [ "$EFS_MODE" = "existing" ] && [ "$RESOLVED_EFS_ID" != "$EFS_FILE_SYSTEM_ID_DECLARED" ]; then
+            echo "FAIL: RESOLVED_EFS_ID (${RESOLVED_EFS_ID}) does not match the declared persistence.efs.fileSystemId (${EFS_FILE_SYSTEM_ID_DECLARED}) in ${VALUES_FILE} for mode=existing."
+            exit 1
+          fi
+
           echo "persistence.enabled=true and provider=efs in ${VALUES_FILE}. Checking rendered manifest: ${RENDERED}"
-          echo "Expected EFS fileSystemId: ${EFS_FILESYSTEM_ID}"
+          echo "Expected EFS fileSystemId (RESOLVED_EFS_ID): ${RESOLVED_EFS_ID}"
           echo "Expected EFS basePath: ${EFS_BASE_PATH}"
 
-          python3 - "$RENDERED" "$VALUES_FILE" "$DEPLOYMENT_ID" "$DEPLOYMENT_MODEL" "$ENVIRONMENT" "$EFS_FILESYSTEM_ID" "$EFS_BASE_PATH" <<'PYEOF'
+          python3 - "$RENDERED" "$VALUES_FILE" "$DEPLOYMENT_ID" "$DEPLOYMENT_MODEL" "$ENVIRONMENT" "$RESOLVED_EFS_ID" "$EFS_BASE_PATH" <<'PYEOF'
           import re
           import sys
 
@@ -1497,6 +1644,8 @@ jobs:
                     value: "false"
                   - name: runtime.serviceAccount.name
                     value: ${RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME}
+                  - name: persistence.efs.fileSystemId
+                    value: ${RESOLVED_EFS_ID}
             destination:
               server: https://kubernetes.default.svc
               namespace: ${TARGET_NAMESPACE}

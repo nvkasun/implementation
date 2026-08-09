@@ -7,11 +7,12 @@ deploymentModel: ""
 nameOverride: ""
 fullnameOverride: ""
 
-# EFS-backed persistence for /u02; disabled by default (emptyDir) unless a deployment opts in. The filesystem itself is provisioned outside this chart.
+# EFS-backed persistence for /u02; disabled by default (emptyDir) unless a deployment opts in. This chart never provisions or resolves the filesystem itself -- it only consumes a concrete fileSystemId, whether that ID is an operator-committed existing filesystem or one a Terraform/workflow managed-mode pipeline resolved before rendering; persistence.efs.mode has no default and must always be set explicitly to "existing" or "managed" by the deployment values file.
 persistence:
   enabled: false
   provider: efs
   efs:
+    mode: ""
     fileSystemId: ""
     storageClass:
       create: false

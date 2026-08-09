@@ -1,6 +1,6 @@
 {{- if and .Values.persistence.enabled (eq .Values.persistence.provider "efs") .Values.persistence.efs.storageClass.create (eq .Values.runtime.storage.u02.type "efs") }}
 {{- if not .Values.persistence.efs.fileSystemId }}
-{{- fail "persistence.efs.fileSystemId is required when persistence.enabled=true and persistence.provider=efs. The EFS filesystem must already exist -- this chart only consumes its ID, it never creates the filesystem." }}
+{{- fail "persistence.efs.fileSystemId is required when persistence.enabled=true and persistence.provider=efs. This chart only consumes a concrete filesystem ID -- it never creates or resolves one: for persistence.efs.mode=existing the ID is the operator-committed value, and for persistence.efs.mode=managed the deploy workflow resolves it via Terraform/AWS beforehand and passes it in at render time." }}
 {{- end }}
 apiVersion: storage.k8s.io/v1
 kind: StorageClass

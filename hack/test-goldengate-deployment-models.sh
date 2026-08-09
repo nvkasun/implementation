@@ -2823,17 +2823,19 @@ if [ -f "$DETECT_SCRIPT" ] && command -v python3 >/dev/null 2>&1; then
 
   awk '/^is_active_deployment_values_file\(\) \{/,/^\}$/' "${WORKDIR}/detect_script.sh" > "${WORKDIR}/is_active_fn.sh"
 
-  # is_goldengate_deployment_values_file and its git-revision sibling both depend on _classify_deployment_model_yaml -- all three must be extracted and sourced together, in dependency order, or the classifier fails with a silent, useless "command not found".
+  # is_goldengate_deployment_values_file and its git-revision sibling both depend on _classify_deployment_model_yaml -- all three must be extracted and sourced together, in dependency order, or the classifier fails with a silent, useless "command not found". _efs_mode_from_yaml is also bundled here since the deletion loop below (deletion_loop.sh) calls it and only sources this same file.
   {
     awk '/^_classify_deployment_model_yaml\(\) \{/,/^\}$/' "${WORKDIR}/detect_script.sh"
     echo ""
     awk '/^is_goldengate_deployment_values_file\(\) \{/,/^\}$/' "${WORKDIR}/detect_script.sh"
     echo ""
     awk '/^is_goldengate_deployment_values_file_at_ref\(\) \{/,/^\}$/' "${WORKDIR}/detect_script.sh"
+    echo ""
+    awk '/^_efs_mode_from_yaml\(\) \{/,/^\}$/' "${WORKDIR}/detect_script.sh"
   } > "${WORKDIR}/is_gg_fn.sh"
 
   # Fails loudly if any expected function body failed to extract -- an empty/missing body would make every downstream source-and-call test meaningless.
-  for required_fn in _classify_deployment_model_yaml is_goldengate_deployment_values_file is_goldengate_deployment_values_file_at_ref; do
+  for required_fn in _classify_deployment_model_yaml is_goldengate_deployment_values_file is_goldengate_deployment_values_file_at_ref _efs_mode_from_yaml; do
     if ! grep -q "^${required_fn}() {" "${WORKDIR}/is_gg_fn.sh"; then
       fail "could not extract ${required_fn}() from ${DETECT_SCRIPT} -- the classifier test harness cannot run"
     fi
@@ -4058,9 +4060,11 @@ PYEOF
     EFS_WORKDIR="${WORKDIR}/efs-test"
     mkdir -p "${EFS_WORKDIR}/rendered" "${EFS_WORKDIR}/values"
 
+    # EFS_MODE/EFS_FILE_SYSTEM_ID_DECLARED/RESOLVED_EFS_ID mirror what the real workflow's earlier "Resolve deployment identity"/"Resolve EFS filesystem ID" steps would have already exported via $GITHUB_ENV; every call site here uses the real committed gg-oracle-payments-01/gg-postgresql-payments-01 existing-mode identity (fs-05cadf3570f23cd39) unless a scenario is expected to fail before that value is ever consulted.
     run_efs_step() {
       ( cd "$EFS_WORKDIR" && \
         RELEASE_NAME="$1" VALUES_FILE="$2" DEPLOYMENT_ID="$3" DEPLOYMENT_MODEL="$4" ENVIRONMENT="$5" \
+        EFS_MODE="existing" EFS_FILE_SYSTEM_ID_DECLARED="fs-05cadf3570f23cd39" RESOLVED_EFS_ID="fs-05cadf3570f23cd39" \
         bash "${WORKDIR}/efs_validate.sh" 2>&1 )
       return $?
     }
@@ -4128,13 +4132,14 @@ with open('${EFS_WORKDIR}/values/oracle-override.yaml', 'w') as f:
       echo "$OVERRIDE_OUT"
     fi
 
-    # 5: a missing fileSystemId fails with a clear controlled error (never an unexplained shell abort).
+    # 5: mode=existing with a missing fileSystemId fails with a clear controlled error (never an unexplained shell abort).
     cat > "${EFS_WORKDIR}/values/missing-fsid.yaml" <<'EOF'
 deploymentModel: singleRuntime
 persistence:
   enabled: true
   provider: efs
   efs:
+    mode: existing
     storageClass:
       basePath: /x
 EOF
@@ -4142,11 +4147,80 @@ EOF
     MISSING_FSID_OUT="$(run_efs_step "x" "${EFS_WORKDIR}/values/missing-fsid.yaml" "gg-oracle-payments-01" "singleRuntime" "dev")"
     MISSING_FSID_STATUS=$?
     set -e
-    if [ "$MISSING_FSID_STATUS" -ne 0 ] && echo "$MISSING_FSID_OUT" | grep -qF "persistence.efs.fileSystemId must be a non-empty string"; then
-      pass "5: a missing fileSystemId fails with a clear controlled error"
+    if [ "$MISSING_FSID_STATUS" -ne 0 ] && echo "$MISSING_FSID_OUT" | grep -qF "persistence.efs.fileSystemId must be a non-empty string when persistence.efs.mode=existing"; then
+      pass "5: mode=existing with a missing fileSystemId fails with a clear controlled error"
     else
       fail "5: a missing fileSystemId did not fail with the expected controlled error"
       echo "$MISSING_FSID_OUT"
+    fi
+
+    # 5b: mode absent entirely fails with a clear controlled error (never silently inferred).
+    cat > "${EFS_WORKDIR}/values/missing-mode.yaml" <<'EOF'
+deploymentModel: singleRuntime
+persistence:
+  enabled: true
+  provider: efs
+  efs:
+    fileSystemId: fs-05cadf3570f23cd39
+EOF
+    set +e
+    MISSING_MODE_OUT="$(run_efs_step "x" "${EFS_WORKDIR}/values/missing-mode.yaml" "gg-oracle-payments-01" "singleRuntime" "dev")"
+    MISSING_MODE_STATUS=$?
+    set -e
+    if [ "$MISSING_MODE_STATUS" -ne 0 ] && echo "$MISSING_MODE_OUT" | grep -qF "persistence.efs.mode must be exactly 'existing' or 'managed'"; then
+      pass "5b: mode absent entirely fails with a clear controlled error"
+    else
+      fail "5b: a missing persistence.efs.mode did not fail with the expected controlled error"
+      echo "$MISSING_MODE_OUT"
+    fi
+
+    # 5c: mode=managed with a committed fileSystemId fails with a clear controlled error (never silently permitted).
+    cat > "${EFS_WORKDIR}/values/managed-with-fsid.yaml" <<'EOF'
+deploymentModel: singleRuntime
+persistence:
+  enabled: true
+  provider: efs
+  efs:
+    mode: managed
+    fileSystemId: fs-05cadf3570f23cd39
+EOF
+    set +e
+    MANAGED_WITH_FSID_OUT="$(run_efs_step "x" "${EFS_WORKDIR}/values/managed-with-fsid.yaml" "gg-oracle-payments-01" "singleRuntime" "dev")"
+    MANAGED_WITH_FSID_STATUS=$?
+    set -e
+    if [ "$MANAGED_WITH_FSID_STATUS" -ne 0 ] && echo "$MANAGED_WITH_FSID_OUT" | grep -qF "must not be set when persistence.efs.mode=managed"; then
+      pass "5c: mode=managed with a committed fileSystemId fails with a clear controlled error"
+    else
+      fail "5c: mode=managed with a committed fileSystemId did not fail with the expected controlled error"
+      echo "$MANAGED_WITH_FSID_OUT"
+    fi
+
+    # 5d: mode=managed without a committed fileSystemId, using the workflow-resolved RESOLVED_EFS_ID (never the values file), passes.
+    cat > "${EFS_WORKDIR}/values/managed-ok.yaml" <<'EOF'
+deploymentModel: singleRuntime
+persistence:
+  enabled: true
+  provider: efs
+  efs:
+    mode: managed
+EOF
+    helm template gg-managed-ok "$RUNTIME_CHART" --namespace goldengate-dev \
+      --values "${REPO_ROOT}/envs/dev/gg-oracle-payments-01/values.yaml" \
+      --set global.environment=dev --set global.deploymentId=gg-managed-ok "${ORACLE_SHARED_OVERRIDES[@]}" \
+      --set persistence.efs.fileSystemId=fs-0123456789abcdef0 \
+      > "${EFS_WORKDIR}/rendered/gg-managed-ok.yaml" 2>"${EFS_WORKDIR}/managed-ok-render.err" || true
+    set +e
+    MANAGED_OK_OUT="$( cd "$EFS_WORKDIR" && \
+      RELEASE_NAME="gg-managed-ok" VALUES_FILE="${EFS_WORKDIR}/values/managed-ok.yaml" DEPLOYMENT_ID="gg-managed-ok" DEPLOYMENT_MODEL="singleRuntime" ENVIRONMENT="dev" \
+      EFS_MODE="managed" EFS_FILE_SYSTEM_ID_DECLARED="" RESOLVED_EFS_ID="fs-0123456789abcdef0" \
+      bash "${WORKDIR}/efs_validate.sh" 2>&1 )"
+    MANAGED_OK_STATUS=$?
+    set -e
+    if [ "$MANAGED_OK_STATUS" -eq 0 ] && echo "$MANAGED_OK_OUT" | grep -qF "Expected EFS fileSystemId (RESOLVED_EFS_ID): fs-0123456789abcdef0"; then
+      pass "5d: mode=managed with no committed fileSystemId validates against RESOLVED_EFS_ID alone"
+    else
+      fail "5d: mode=managed validation against RESOLVED_EFS_ID did not behave as expected"
+      echo "$MANAGED_OK_OUT"
     fi
 
     # 6: malformed YAML fails closed.
@@ -5552,11 +5626,12 @@ else
 fi
 
 if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  # configmap.yaml/values.yaml excluded: Phase 6D0 legitimately touched their explanatory comments, not their logic.
+  # configmap.yaml/values.yaml excluded: Phase 6D0 legitimately touched their explanatory comments, not their logic. efs-storageclass.yaml/goldengate/values.yaml excluded: the Phase 6D1 EFS correction legitimately updated the mode-aware fail-guard wording and added the persistence.efs.mode default, neither a template logic/behavior change.
   NOT_PERMITTED_DIFF="$(git diff --stat --ignore-all-space -- \
     monitoring/monitor/health_rules.py monitoring/monitor/Dockerfile \
     'helm/goldengate-monitor/**' 'helm/goldengate/**' \
-    ':!helm/goldengate-monitor/templates/configmap.yaml' ':!helm/goldengate-monitor/values.yaml' 2>/dev/null || true)"
+    ':!helm/goldengate-monitor/templates/configmap.yaml' ':!helm/goldengate-monitor/values.yaml' \
+    ':!helm/goldengate/templates/efs-storageclass.yaml' ':!helm/goldengate/values.yaml' 2>/dev/null || true)"
   if [ -z "$NOT_PERMITTED_DIFF" ]; then
     pass "25: no Helm chart or Dockerfile file outside this phase's own scope changed"
   else
@@ -6945,6 +7020,210 @@ if [ "$PYTHON_AVAILABLE" = "true" ]; then
   fi
 else
   skip "32: replication reconciler unit tests -- python3 unavailable"
+fi
+
+# --- EFS storage architecture correction: managed-mode deletion safety ordering + Terraform structure (static only) ---
+
+if bash -n "$DETECT_SCRIPT" 2>/dev/null; then
+  pass "33: hack/detect-goldengate-deployments.sh still passes bash -n after the efs_mode deletion-matrix extension"
+else
+  fail "33: hack/detect-goldengate-deployments.sh has a syntax error"
+fi
+
+if grep -q '_efs_mode_from_yaml' "$DETECT_SCRIPT" 2>/dev/null \
+    && grep -q 'efs_mode: \$efs_mode' "$DETECT_SCRIPT" 2>/dev/null; then
+  pass "33: the deletion matrix carries an efs_mode field derived from the historical (pre-deletion) values.yaml content"
+else
+  fail "33: the deletion matrix's efs_mode field is missing or not wired into the jq item construction"
+fi
+
+if grep -qE '^\s*managed_efs_deletion_guard:' "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "33: the managed_efs_deletion_guard job exists in the eks-app workflow"
+else
+  fail "33: the managed_efs_deletion_guard job is missing from the eks-app workflow"
+fi
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  set +e
+  ORDER_CHECK_OUTPUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import sys
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+
+jobs = doc.get("jobs", {})
+problems = []
+
+guard = jobs.get("managed_efs_deletion_guard")
+if guard is None:
+    problems.append("managed_efs_deletion_guard job is missing")
+else:
+    needs = guard.get("needs")
+    needs_list = needs if isinstance(needs, list) else [needs]
+    if "detect_changed_deployments" not in needs_list:
+        problems.append("managed_efs_deletion_guard does not need detect_changed_deployments")
+
+tf = jobs.get("terraform_sync_once")
+if tf is None:
+    problems.append("terraform_sync_once job is missing")
+else:
+    needs = tf.get("needs")
+    needs_list = needs if isinstance(needs, list) else [needs]
+    if "detect_changed_deployments" not in needs_list:
+        problems.append("terraform_sync_once does not need detect_changed_deployments")
+    if "managed_efs_deletion_guard" not in needs_list:
+        problems.append("terraform_sync_once does not need managed_efs_deletion_guard")
+    if_expr = str(tf.get("if", ""))
+    if "managed_efs_deletion_guard.result" not in if_expr or "success" not in if_expr:
+        problems.append("terraform_sync_once's if: does not explicitly require managed_efs_deletion_guard to have succeeded (a custom if: does not implicitly inherit the needs-success default)")
+    if "detect_changed_deployments.result" not in if_expr or "success" not in if_expr:
+        problems.append("terraform_sync_once's if: does not explicitly require detect_changed_deployments to have succeeded")
+
+if problems:
+    print("\n".join(problems))
+    sys.exit(1)
+print("OK")
+PYEOF
+)"
+  ORDER_CHECK_STATUS=$?
+  set -e
+  if [ "$ORDER_CHECK_STATUS" -eq 0 ]; then
+    pass "33: managed_efs_deletion_guard is structurally guaranteed to run before terraform_sync_once, and terraform_sync_once fails closed if either detect_changed_deployments or the guard did not succeed"
+  else
+    fail "33: managed-EFS deletion guard ordering is not correctly wired: ${ORDER_CHECK_OUTPUT}"
+  fi
+else
+  skip "33: managed-EFS deletion guard ordering check -- python3/PyYAML unavailable"
+fi
+
+if [ -f "envs/dev/efs.tf" ]; then
+  pass "33: envs/dev/efs.tf exists"
+else
+  fail "33: envs/dev/efs.tf is missing"
+fi
+
+if grep -q 'aws-tf-module-efs?ref=v1.0.0' envs/dev/efs.tf 2>/dev/null; then
+  pass "33: envs/dev/efs.tf pins the approved ADCB EFS module at v1.0.0 (not silently upgraded)"
+else
+  fail "33: envs/dev/efs.tf does not reference the approved ADCB EFS module at the pinned v1.0.0 ref"
+fi
+
+if grep -qE 'for_each\s*=\s*local\.goldengate_managed_efs_deployments' envs/dev/efs.tf 2>/dev/null; then
+  pass "33: the EFS module is instantiated once per managed-mode deployment via for_each over the folder-driven inventory"
+else
+  fail "33: envs/dev/efs.tf does not for_each over local.goldengate_managed_efs_deployments"
+fi
+
+if grep -qE 'resource\s+"aws_efs_(file_system|mount_target|access_point)"' envs/dev/*.tf 2>/dev/null; then
+  fail "33: envs/dev/*.tf reimplements EFS with raw aws_efs_* resources instead of using the approved module exclusively"
+else
+  pass "33: no raw aws_efs_file_system/mount_target/access_point resources exist anywhere in envs/dev/*.tf"
+fi
+
+if grep -qE 'resource\s+"aws_security_group"' envs/dev/efs.tf 2>/dev/null; then
+  fail "33: envs/dev/efs.tf creates a new security group instead of reusing the single shared one via a fail-closed data lookup"
+else
+  pass "33: envs/dev/efs.tf does not create a per-deployment security group -- it looks up the shared one"
+fi
+
+if grep -qE '^\s*variable\s+"goldengate_efs_shared_security_group_description"' envs/dev/efs.tf 2>/dev/null \
+    && ! grep -q 'goldengate_efs_shared_security_group_description' envs/dev/gg-*-payments-01/values.yaml 2>/dev/null; then
+  pass "33: the shared EFS security group is a single environment-level configuration point, never a per-deployment values.yaml setting"
+else
+  fail "33: the shared EFS security group configuration point is missing or leaked into a per-deployment values.yaml"
+fi
+
+if grep -qE 'aws efs delete-file-system|aws efs delete-access-point|terraform destroy' "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  fail "33: the eks-app workflow contains a destructive EFS/Terraform command outside the controlled decommission process"
+else
+  pass "33: the eks-app workflow contains no aws efs delete-* or terraform destroy command"
+fi
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  set +e
+  LIVE_VALIDATE_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev validate 2>&1)"
+  LIVE_VALIDATE_STATUS=$?
+  set -e
+  if [ "$LIVE_VALIDATE_STATUS" -eq 0 ] \
+      && grep -qE '^\s*mode:\s*existing\s*$' envs/dev/gg-oracle-payments-01/values.yaml 2>/dev/null \
+      && grep -qE '^\s*mode:\s*existing\s*$' envs/dev/gg-postgresql-payments-01/values.yaml 2>/dev/null \
+      && grep -q 'fs-05cadf3570f23cd39' envs/dev/gg-oracle-payments-01/values.yaml 2>/dev/null \
+      && grep -q 'fs-05cadf3570f23cd39' envs/dev/gg-postgresql-payments-01/values.yaml 2>/dev/null; then
+    pass "33: both live Oracle/PostgreSQL descriptors carry the new explicit persistence.efs.mode=existing with a byte-identical fileSystemId, and dev validate still passes"
+  else
+    fail "33: the two live descriptors did not migrate cleanly to persistence.efs.mode=existing: ${LIVE_VALIDATE_OUTPUT}"
+  fi
+else
+  skip "33: live descriptor EFS-mode migration check -- python3 unavailable"
+fi
+
+echo ""
+echo "--- EFS ID resolution step: existing/dry-run/not-applicable branches (no AWS required) ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  python3 - "$EKS_APP_WORKFLOW" > "${WORKDIR}/resolve_efs_id.sh" <<'PYEOF'
+import sys
+import yaml
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+for step in doc["jobs"]["build_publish_and_deploy"]["steps"]:
+    if step.get("name") == "Resolve EFS filesystem ID":
+        sys.stdout.write(step["run"])
+        break
+else:
+    sys.exit("step not found")
+PYEOF
+
+  if [ ! -s "${WORKDIR}/resolve_efs_id.sh" ]; then
+    fail "34: could not extract the 'Resolve EFS filesystem ID' step from ${EKS_APP_WORKFLOW}"
+  else
+    # Only the not-applicable/existing/managed+deploy=false branches are locally testable without AWS credentials -- each returns before ever reaching an aws sts/aws efs call, verified below.
+    run_resolve_efs_id() {
+      local efs_mode="$1" efs_fsid_declared="$2" effective_deploy="$3" github_env_file out status
+      github_env_file="$(mktemp)"
+      out="$(EFS_MODE="$efs_mode" EFS_FILE_SYSTEM_ID_DECLARED="$efs_fsid_declared" EFS_CREATION_TOKEN="dev-x-efs" \
+        EFFECTIVE_DEPLOY="$effective_deploy" GITHUB_ENV="$github_env_file" \
+        GITHUB_RUN_ID="1" GITHUB_RUN_ATTEMPT="1" AWS_REGION="eu-west-1" \
+        EKS_DEPLOY_ROLE_ARN="arn:aws:iam::668311715351:role/GoldenGateEKSDeployRole-dev" \
+        bash "${WORKDIR}/resolve_efs_id.sh" 2>&1 )"
+      status=$?
+      out="${out}"$'\n'"$(cat "$github_env_file")"
+      rm -f "$github_env_file"
+      echo "$out"
+      return $status
+    }
+
+    NOT_APPLICABLE_OUT="$(run_resolve_efs_id "" "" "true")"
+    if echo "$NOT_APPLICABLE_OUT" | grep -qF "EFS ID source: not applicable" \
+        && echo "$NOT_APPLICABLE_OUT" | grep -qE '^RESOLVED_EFS_ID=$'; then
+      pass "34: not-in-use deployments resolve an empty RESOLVED_EFS_ID with an explicit 'not applicable' source"
+    else
+      fail "34: the not-applicable EFS ID resolution branch did not behave as expected"
+      echo "$NOT_APPLICABLE_OUT"
+    fi
+
+    EXISTING_OUT="$(run_resolve_efs_id "existing" "fs-05cadf3570f23cd39" "true")"
+    if echo "$EXISTING_OUT" | grep -qF "EFS ID source: existing descriptor" \
+        && echo "$EXISTING_OUT" | grep -qF "RESOLVED_EFS_ID=fs-05cadf3570f23cd39"; then
+      pass "34: existing mode resolves RESOLVED_EFS_ID as the exact Git-committed passthrough value"
+    else
+      fail "34: the existing-mode EFS ID resolution branch did not behave as expected"
+      echo "$EXISTING_OUT"
+    fi
+
+    DRYRUN_OUT="$(run_resolve_efs_id "managed" "" "false")"
+    if echo "$DRYRUN_OUT" | grep -qF "EFS ID source: dry-run placeholder" \
+        && echo "$DRYRUN_OUT" | grep -qE '^RESOLVED_EFS_ID=fs-[0-9a-f]+$' \
+        && ! echo "$DRYRUN_OUT" | grep -qiE "aws sts|aws efs"; then
+      pass "34: managed mode with deploy=false resolves a syntactically-valid dry-run-only placeholder with no AWS call attempted"
+    else
+      fail "34: the managed/deploy=false dry-run EFS ID resolution branch did not behave as expected"
+      echo "$DRYRUN_OUT"
+    fi
+  fi
+else
+  skip "34: EFS ID resolution step branch checks -- python3 unavailable"
 fi
 
 echo ""

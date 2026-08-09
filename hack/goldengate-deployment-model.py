@@ -30,6 +30,9 @@ _VALID_ROLES = ("source", "target")
 _ECR_REPO_SUFFIX_RE = re.compile(r"^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*\Z")
 _EFS_FILESYSTEM_ID_RE = re.compile(r"^fs-[0-9a-f]+\Z")
 
+_VALID_EFS_MODES = ("managed", "existing")
+_EFS_CREATION_TOKEN_MAX_LENGTH = 64
+
 _CREDENTIAL_KEY_FRAGMENTS = (
     "password", "passwd", "pwd", "secretvalue", "connectionstring", "conn_str",
     "username", "token", "apikey", "api_key", "dburl", "database_url", "databaseurl",
@@ -531,18 +534,48 @@ def _parse_csi_structure(runtime):
     _require_dict(csi.get("certificate"), "invalid CSI configuration: runtime.csi.certificate must be a mapping")
 
 
-def _parse_efs(doc):
-    """Derives EFS/PVC identity for migration safety checks; validated only when persistence is actually enabled."""
-    persistence = doc.get("persistence") or {}
+def derive_efs_creation_token(environment, deployment_id):
+    """Deterministic managed-EFS identity; fails closed rather than silently truncating or hashing the deployment ID."""
+    token = f"{environment}-{deployment_id}-efs"
+    if len(token) > _EFS_CREATION_TOKEN_MAX_LENGTH:
+        raise DescriptorError(f"invalid persistence configuration: derived EFS creation token exceeds the {_EFS_CREATION_TOKEN_MAX_LENGTH}-character AWS limit")
+    return token
+
+
+def _parse_efs(deployment_id, environment, doc):
+    """Existing mode passes through an operator-supplied fileSystemId; managed mode derives a creation token and forbids a committed ID."""
+    persistence = doc.get("persistence")
+    if persistence is not None:
+        _require_dict(persistence, "invalid persistence configuration: persistence must be a mapping")
+    persistence = persistence or {}
+
     runtime = doc.get("runtime") or {}
     storage = runtime.get("storage") or {}
     u02 = storage.get("u02") or {}
-    filesystem_id = (persistence.get("efs") or {}).get("fileSystemId")
-    if persistence.get("enabled") is True:
+    pvc_claim_name = u02.get("claimName") or u02.get("existingClaim") or ""
+
+    efs_enabled = persistence.get("enabled") is True and persistence.get("provider") == "efs"
+    if not efs_enabled:
+        return {"mode": None, "fileSystemId": None, "creationToken": None, "pvcClaimName": pvc_claim_name}
+
+    if u02.get("type") != "efs":
+        raise DescriptorError("invalid persistence configuration: runtime.storage.u02.type must be \"efs\" when persistence.enabled=true and provider=efs")
+
+    efs = _require_dict(persistence.get("efs"), "invalid persistence configuration: persistence.efs must be a mapping when persistence.enabled=true and provider=efs")
+    mode = efs.get("mode")
+    if mode not in _VALID_EFS_MODES:
+        raise DescriptorError("invalid persistence configuration: persistence.efs.mode must be explicitly \"managed\" or \"existing\"")
+
+    filesystem_id = efs.get("fileSystemId")
+    if mode == "existing":
         if not isinstance(filesystem_id, str) or not _EFS_FILESYSTEM_ID_RE.match(filesystem_id):
             raise DescriptorError("invalid persistence configuration: persistence.efs.fileSystemId is not a safe EFS filesystem ID")
-    pvc_claim_name = u02.get("claimName") or u02.get("existingClaim") or ""
-    return {"fileSystemId": filesystem_id, "pvcClaimName": pvc_claim_name}
+        return {"mode": mode, "fileSystemId": filesystem_id, "creationToken": None, "pvcClaimName": pvc_claim_name}
+
+    if filesystem_id not in (None, ""):
+        raise DescriptorError("invalid persistence configuration: persistence.efs.fileSystemId must not be set when persistence.efs.mode=managed -- Terraform provisions and resolves it")
+    creation_token = derive_efs_creation_token(environment, deployment_id)
+    return {"mode": mode, "fileSystemId": None, "creationToken": creation_token, "pvcClaimName": pvc_claim_name}
 
 
 def parse_descriptor(deployment_id, environment, doc, shared=None):
@@ -581,7 +614,7 @@ def parse_descriptor(deployment_id, environment, doc, shared=None):
     _parse_csi_structure(runtime)
     replication = _parse_replication(deployment_id, environment, role, deployment_type, doc)
     lifecycle_state = _parse_lifecycle(doc)
-    efs = _parse_efs(doc)
+    efs = _parse_efs(deployment_id, environment, doc)
 
     global_cfg = _require_dict(doc.get("global"), "invalid deployment metadata: global must be a mapping")
     if global_cfg.get("environment") != environment:
@@ -618,7 +651,9 @@ def parse_descriptor(deployment_id, environment, doc, shared=None):
         "runtimeNamespace": shared["runtimeNamespace"],
         "monitoringNamespace": shared["monitoringNamespace"],
         "ingressHost": ingress_host,
+        "efsMode": efs["mode"],
         "efsFileSystemId": efs["fileSystemId"],
+        "efsCreationToken": efs["creationToken"],
         "pvcClaimName": efs["pvcClaimName"],
         "albGroupOrder": alb_group_order,
         "replicationEnabled": replication["enabled"],
@@ -782,6 +817,16 @@ def validate(environment):
                 problems.append(f"duplicate ALB group order {d['albGroupOrder']!r} "
                                 f"({alb_orders_seen[d['albGroupOrder']]} and {d['deploymentId']})")
             alb_orders_seen[d["albGroupOrder"]] = d["deploymentId"]
+
+    efs_token_owners = {}
+    for d in all_valid:
+        token = d.get("efsCreationToken")
+        if not token:
+            continue
+        if token in efs_token_owners and efs_token_owners[token] != d["deploymentId"]:
+            problems.append(f"managed EFS creation token collision between {efs_token_owners[token]!r} "
+                            f"and {d['deploymentId']!r}: {token!r}")
+        efs_token_owners[token] = d["deploymentId"]
 
     return problems
 

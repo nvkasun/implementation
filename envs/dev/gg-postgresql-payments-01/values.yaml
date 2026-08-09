@@ -139,6 +139,7 @@ persistence:
   enabled: true
   provider: efs
   efs:
+    mode: existing
     fileSystemId: fs-05cadf3570f23cd39
     storageClass:
       create: true

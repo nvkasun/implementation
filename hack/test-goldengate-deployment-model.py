@@ -169,6 +169,26 @@ def default_target_doc(environment, pipeline):
     }
 
 
+def _efs_test_doc(environment="dev", persistence=None):
+    """Minimal valid descriptor with an explicit efs-capable u02 storage block, for persistence.efs.mode tests."""
+    doc = {
+        "deployment": {"enabled": True, "pipeline": "test-pipeline", "role": "source"},
+        "global": {"environment": environment},
+        "deploymentModel": "singleRuntime",
+        "runtime": {
+            "deploymentType": "oracle",
+            "containerName": "ogg-oracle",
+            "image": {"repository": "229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle", "tag": "1.0.0"},
+            "csi": {"enabled": True, "admin": {"enabled": True}, "certificate": {"enabled": True}},
+            "storage": {"u02": {"type": "efs"}},
+        },
+        "ingress": {"hostDomain": f"goldengate-{environment}.adcbmis.local"},
+    }
+    if persistence is not None:
+        doc["persistence"] = persistence
+    return doc
+
+
 def write_doc(root, environment, deployment_id, doc):
     folder = os.path.join(root, "envs", environment, deployment_id)
     os.makedirs(folder, exist_ok=True)
@@ -611,17 +631,105 @@ class EnvironmentScopedContractTests(ScratchEnvironmentTestCase):
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
-    def test_efs_enabled_requires_safe_filesystem_id(self):
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
-                         extra="persistence:\n  enabled: true\n  efs:\n    fileSystemId: not-an-fs-id\n")
+    def test_efs_existing_mode_requires_safe_filesystem_id(self):
+        write_doc(self._tmp.name, "dev", "gg-fixture-01",
+                 _efs_test_doc(persistence={"enabled": True, "provider": "efs",
+                                             "efs": {"mode": "existing", "fileSystemId": "not-an-fs-id"}}))
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
-    def test_efs_enabled_with_safe_filesystem_id_passes(self):
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
-                         extra="persistence:\n  enabled: true\n  efs:\n    fileSystemId: fs-0123456789abcdef0\n")
+    def test_efs_existing_mode_missing_filesystem_id_fails(self):
+        write_doc(self._tmp.name, "dev", "gg-fixture-01",
+                 _efs_test_doc(persistence={"enabled": True, "provider": "efs",
+                                             "efs": {"mode": "existing"}}))
         _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+
+    def test_efs_existing_mode_with_safe_filesystem_id_passes(self):
+        write_doc(self._tmp.name, "dev", "gg-fixture-01",
+                 _efs_test_doc(persistence={"enabled": True, "provider": "efs",
+                                             "efs": {"mode": "existing", "fileSystemId": "fs-0123456789abcdef0"}}))
+        active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
+        self.assertEqual(active[0]["efsMode"], "existing")
+        self.assertEqual(active[0]["efsFileSystemId"], "fs-0123456789abcdef0")
+        self.assertIsNone(active[0]["efsCreationToken"])
+
+    def test_efs_managed_mode_forbids_committed_filesystem_id(self):
+        write_doc(self._tmp.name, "dev", "gg-fixture-01",
+                 _efs_test_doc(persistence={"enabled": True, "provider": "efs",
+                                             "efs": {"mode": "managed", "fileSystemId": "fs-0123456789abcdef0"}}))
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+
+    def test_efs_managed_mode_without_filesystem_id_passes_and_derives_token(self):
+        write_doc(self._tmp.name, "dev", "gg-fixture-01",
+                 _efs_test_doc(persistence={"enabled": True, "provider": "efs", "efs": {"mode": "managed"}}))
+        active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        self.assertEqual(active[0]["efsMode"], "managed")
+        self.assertIsNone(active[0]["efsFileSystemId"])
+        self.assertEqual(active[0]["efsCreationToken"], "dev-gg-fixture-01-efs")
+
+    def test_efs_missing_mode_fails(self):
+        write_doc(self._tmp.name, "dev", "gg-fixture-01",
+                 _efs_test_doc(persistence={"enabled": True, "provider": "efs",
+                                             "efs": {"fileSystemId": "fs-0123456789abcdef0"}}))
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+
+    def test_efs_invalid_mode_value_fails(self):
+        write_doc(self._tmp.name, "dev", "gg-fixture-01",
+                 _efs_test_doc(persistence={"enabled": True, "provider": "efs", "efs": {"mode": "auto"}}))
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+
+    def test_efs_enabled_requires_u02_storage_type_efs(self):
+        doc = _efs_test_doc(persistence={"enabled": True, "provider": "efs", "efs": {"mode": "managed"}})
+        doc["runtime"]["storage"]["u02"]["type"] = "emptyDir"
+        write_doc(self._tmp.name, "dev", "gg-fixture-01", doc)
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+
+    def test_efs_creation_token_derivation_is_deterministic(self):
+        self.assertEqual(gdm.derive_efs_creation_token("dev", "gg-postgresql-repltest-01"),
+                         "dev-gg-postgresql-repltest-01-efs")
+        self.assertEqual(gdm.derive_efs_creation_token("dev", "gg-postgresql-repltest-01"),
+                         gdm.derive_efs_creation_token("dev", "gg-postgresql-repltest-01"))
+
+    def test_efs_creation_token_exceeding_limit_fails_closed(self):
+        long_id = "gg-" + ("x" * 60) + "-fixture"
+        with self.assertRaises(gdm.DescriptorError):
+            gdm.derive_efs_creation_token("dev", long_id)
+
+    def test_efs_creation_token_never_truncated_or_hashed(self):
+        deployment_id = "gg-postgresql-repltest-01"
+        token = gdm.derive_efs_creation_token("dev", deployment_id)
+        self.assertIn(deployment_id, token)
+
+    def test_efs_two_different_deployment_ids_derive_distinct_tokens(self):
+        token_a = gdm.derive_efs_creation_token("dev", "gg-postgresql-repltest-01")
+        token_b = gdm.derive_efs_creation_token("dev", "gg-mssql-repltest-01")
+        self.assertNotEqual(token_a, token_b)
+
+    def test_efs_two_managed_runtimes_validate_together_with_distinct_tokens(self):
+        write_doc(self._tmp.name, "dev", "gg-postgresql-repltest-01",
+                 _efs_test_doc(persistence={"enabled": True, "provider": "efs", "efs": {"mode": "managed"}}))
+        write_doc(self._tmp.name, "dev", "gg-mssql-repltest-01",
+                 _efs_test_doc(persistence={"enabled": True, "provider": "efs", "efs": {"mode": "managed"}}))
+        active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        problems = gdm.validate("dev")
+        self.assertEqual([p for p in problems if "creation token collision" in p], [])
+        tokens = {d["deploymentId"]: d["efsCreationToken"] for d in active}
+        self.assertEqual(len(set(tokens.values())), 2)
+
+    def test_efs_disabled_persistence_skips_efs_validation(self):
+        write_doc(self._tmp.name, "dev", "gg-fixture-01",
+                 _efs_test_doc(persistence={"enabled": False}))
+        active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        self.assertIsNone(active[0]["efsMode"])
 
     def test_derived_namespace_fields_present(self):
         write_descriptor(self._tmp.name, "dev", "gg-fixture-01")
