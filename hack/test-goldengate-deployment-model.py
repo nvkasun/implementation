@@ -249,10 +249,68 @@ class RealRepositoryDescriptorTests(unittest.TestCase):
         by_id = {d["deploymentId"]: d for d in active}
         self.assertEqual(by_id["gg-postgresql-payments-01"]["adminSecretName"], "dev/goldengate/target/admin")
 
-    def test_generated_registry_contains_both_existing_live_deployments(self):
+    def test_generated_registry_contains_all_three_live_deployments(self):
+        # Updated for the first real managed-EFS runtime (gg-postgresql-repltest-01): the live dev registry now has 3 active deployments, not 2 -- this assertion is exact (assertEqual, not a subset check), so it still fails closed if a fourth descriptor is ever added without updating this test.
         registry = gdm.build_registry("dev")
         names = {d["name"] for d in registry["deployments"]}
-        self.assertEqual(names, {"gg-oracle-payments-01", "gg-postgresql-payments-01"})
+        self.assertEqual(names, {"gg-oracle-payments-01", "gg-postgresql-payments-01", "gg-postgresql-repltest-01"})
+
+    def test_existing_repltest_descriptor_parses(self):
+        active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        by_id = {d["deploymentId"]: d for d in active}
+        self.assertIn("gg-postgresql-repltest-01", by_id)
+        self.assertEqual(by_id["gg-postgresql-repltest-01"]["deploymentType"], "postgresql")
+
+    def test_repltest_descriptor_is_the_source_role_on_its_own_new_pipeline(self):
+        active, _inactive, _invalid = gdm.scan("dev")
+        by_id = {d["deploymentId"]: d for d in active}
+        d = by_id["gg-postgresql-repltest-01"]
+        self.assertEqual(d["role"], "source")
+        self.assertEqual(d["pipeline"], "repltest-pg-to-mssql-001")
+        self.assertNotEqual(d["pipeline"], "payments-ora-to-pg-001")
+
+    def test_repltest_descriptor_lifecycle_is_active(self):
+        active, _inactive, _invalid = gdm.scan("dev")
+        by_id = {d["deploymentId"]: d for d in active}
+        self.assertEqual(by_id["gg-postgresql-repltest-01"]["lifecycleState"], "active")
+
+    def test_repltest_descriptor_renders_with_source_shared_secret(self):
+        active, _inactive, _invalid = gdm.scan("dev")
+        by_id = {d["deploymentId"]: d for d in active}
+        self.assertEqual(by_id["gg-postgresql-repltest-01"]["adminSecretName"], "dev/goldengate/source/admin")
+
+    def test_repltest_descriptor_uses_gg_postgresql_sa(self):
+        active, _inactive, _invalid = gdm.scan("dev")
+        by_id = {d["deploymentId"]: d for d in active}
+        self.assertEqual(by_id["gg-postgresql-repltest-01"]["runtimeServiceAccountName"], "gg-postgresql-sa")
+
+    def test_repltest_descriptor_is_the_first_managed_efs_deployment(self):
+        active, _inactive, _invalid = gdm.scan("dev")
+        by_id = {d["deploymentId"]: d for d in active}
+        d = by_id["gg-postgresql-repltest-01"]
+        self.assertEqual(d["efsMode"], "managed")
+        self.assertIsNone(d["efsFileSystemId"])
+        self.assertEqual(d["efsCreationToken"], "dev-gg-postgresql-repltest-01-efs")
+
+    def test_repltest_descriptor_replication_remains_disabled(self):
+        active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        by_id = {d["deploymentId"]: d for d in active}
+        self.assertFalse(by_id["gg-postgresql-repltest-01"]["replicationEnabled"])
+
+    def test_managed_efs_inventory_contains_exactly_the_repltest_deployment(self):
+        # cmd_managed_efs_inventory prints JSON rather than returning it; re-derive the same expected-inventory shape (same filter: efsMode == "managed", same sort key) directly from the scan, to keep this test independent of stdout capture.
+        active, inactive, _invalid = gdm.scan("dev")
+        entries = sorted(
+            (
+                {"deploymentId": d["deploymentId"], "efsCreationToken": d["efsCreationToken"]}
+                for d in active + inactive
+                if d["efsMode"] == "managed"
+            ),
+            key=lambda x: x["deploymentId"],
+        )
+        self.assertEqual(entries, [{"deploymentId": "gg-postgresql-repltest-01", "efsCreationToken": "dev-gg-postgresql-repltest-01-efs"}])
 
     def test_existing_oracle_still_uses_gg_oracle_sa(self):
         active, _inactive, _invalid = gdm.scan("dev")

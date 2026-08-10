@@ -2092,7 +2092,18 @@ if [ "$HELM_AVAILABLE" = "true" ] && [ "$PYTHON_AVAILABLE" = "true" ]; then
     [ -z "$name" ] && continue
     VALUES_FILE="envs/dev/${name}/values.yaml"
     RENDERED="${WORKDIR}/${name}.yaml"
-    if [ "$name" = "gg-oracle-payments-01" ]; then SHARED_OVERRIDES=("${ORACLE_SHARED_OVERRIDES[@]}"); else SHARED_OVERRIDES=("${POSTGRESQL_SHARED_OVERRIDES[@]}"); fi
+
+    # Derived from the deployment model itself (adminSecretName/tlsSecretName/runtimeServiceAccountName/efsMode), mirroring the real workflow's own resolution -- never a fixed oracle-vs-postgresql binary, so this loop stays correct for any current or future descriptor without per-deployment special-casing. persistence.efs.fileSystemId only needs an override for mode=managed (existing mode already carries its own committed value in $VALUES_FILE), using the exact same dry-run placeholder the real deploy=false workflow uses (never a real AWS resource, never committed).
+    DESCRIBE_JSON="$(python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev describe "$name" 2>/dev/null)"
+    RENDER_ADMIN_SECRET="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["adminSecretName"])' <<< "$DESCRIBE_JSON")"
+    RENDER_TLS_SECRET="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["tlsSecretName"])' <<< "$DESCRIBE_JSON")"
+    RENDER_SA_NAME="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["runtimeServiceAccountName"])' <<< "$DESCRIBE_JSON")"
+    RENDER_EFS_MODE="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["efsMode"] or "")' <<< "$DESCRIBE_JSON")"
+    SHARED_OVERRIDES=(--set runtime.csi.admin.objectName="$RENDER_ADMIN_SECRET" --set runtime.csi.certificate.objectName="$RENDER_TLS_SECRET" --set runtime.serviceAccount.create=false --set runtime.serviceAccount.name="$RENDER_SA_NAME")
+    if [ "$RENDER_EFS_MODE" = "managed" ]; then
+      SHARED_OVERRIDES+=(--set persistence.efs.fileSystemId=fs-0dead0000000beef0)
+    fi
+
     if ! helm template "$name" "$RUNTIME_CHART" --namespace goldengate-dev \
         -f "$VALUES_FILE" "${SHARED_OVERRIDES[@]}" > "$RENDERED" 2>"${WORKDIR}/${name}.err"; then
       fail "helm template failed for ${name}"
@@ -2934,7 +2945,8 @@ HARNESS
   ACTIVE_IDS_SORTED="$(echo "$ACTIVE_IDS" | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' ' | sed -E 's/ $//')"
   echo "Active candidate IDs for a shared-chart-change selection: ${ACTIVE_IDS_SORTED}"
 
-  EXPECTED_ACTIVE_IDS="gg-oracle-payments-01 gg-postgresql-payments-01"
+  # Updated for the first real managed-EFS runtime (gg-postgresql-repltest-01): the live dev active set now has 3 canonical folders, not 2.
+  EXPECTED_ACTIVE_IDS="gg-oracle-payments-01 gg-postgresql-payments-01 gg-postgresql-repltest-01"
   if [ "$ACTIVE_IDS_SORTED" = "$EXPECTED_ACTIVE_IDS" ]; then
     pass "a shared chart change produces exactly the canonical active set (${EXPECTED_ACTIVE_IDS}) -- no additional ID present"
   else
@@ -5735,8 +5747,9 @@ def run_awk(registry_path):
 
 
 real_names = run_awk(sys.argv[2])
-if real_names != ["gg-oracle-payments-01", "gg-postgresql-payments-01"]:
-    print(f"FAIL: real-registry extraction returned {real_names!r}, expected both canonical DEV deployments")
+# Updated for the first real managed-EFS runtime (gg-postgresql-repltest-01): the live dev registry now has 3 canonical deployments, not 2.
+if real_names != ["gg-oracle-payments-01", "gg-postgresql-payments-01", "gg-postgresql-repltest-01"]:
+    print(f"FAIL: real-registry extraction returned {real_names!r}, expected all three canonical DEV deployments")
     sys.exit(1)
 
 fixture_yaml = (
@@ -7634,18 +7647,25 @@ else
   fail "6: envs/dev/efs.tf references \"pipeline\" -- the module key must be derived from deployment ID alone"
 fi
 
+# Updated for the first real managed-EFS runtime (gg-postgresql-repltest-01): the live dev managed-EFS inventory is no longer empty -- it now has exactly one entry, and envs/dev/efs.tf's shared-SG data-source count therefore evaluates to 1 (not 0). The two historical existing-mode descriptors (gg-oracle-payments-01, gg-postgresql-payments-01) are still individually asserted as existing-mode with fs-05cadf3570f23cd39 elsewhere in this suite -- they are never reinterpreted as managed here.
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   set +e
   LIVE_INVENTORY_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev managed-efs-inventory 2>&1)"
   LIVE_INVENTORY_STATUS=$?
   set -e
-  if [ "$LIVE_INVENTORY_STATUS" -eq 0 ] && [ "$LIVE_INVENTORY_OUT" = "[]" ]; then
-    pass "11: today's live dev inventory (both descriptors existing-mode) has zero managed deployments -- envs/dev/efs.tf's shared-SG data-source count therefore evaluates to 0, requiring no managed-EFS SG lookup"
+  EXPECTED_LIVE_INVENTORY='[
+  {
+    "deploymentId": "gg-postgresql-repltest-01",
+    "efsCreationToken": "dev-gg-postgresql-repltest-01-efs"
+  }
+]'
+  if [ "$LIVE_INVENTORY_STATUS" -eq 0 ] && [ "$LIVE_INVENTORY_OUT" = "$EXPECTED_LIVE_INVENTORY" ]; then
+    pass "11: today's live dev inventory contains exactly one managed deployment (gg-postgresql-repltest-01, dev-gg-postgresql-repltest-01-efs) -- envs/dev/efs.tf's shared-SG data-source count therefore evaluates to 1, requiring exactly one managed-EFS SG lookup"
   else
-    fail "11: expected the live managed-efs-inventory to be empty today (both live descriptors are existing-mode): ${LIVE_INVENTORY_OUT}"
+    fail "11: expected the live managed-efs-inventory to contain exactly the gg-postgresql-repltest-01 entry: ${LIVE_INVENTORY_OUT}"
   fi
 else
-  skip "11: live zero-managed-inventory check -- python3 unavailable"
+  skip "11: live managed-efs-inventory check -- python3 unavailable"
 fi
 
 if grep -qE '^\s*data\s+"aws_security_group"\s+"goldengate_efs_shared"' envs/dev/efs.tf 2>/dev/null; then
@@ -8827,6 +8847,143 @@ else
 fi
 
 # 17/18/19/20/21: cross-account Secrets Manager fix, structural runtime-image validation fix, EFS/Terraform architecture, Oracle/PostgreSQL descriptors + replication=false, and PostgreSQL->MSSQL Phase 6D1 are all unrelated to this narrowly-scoped monitor_dry_run_validation runner fix and remain covered by their own dedicated, still-passing sections/suites above (the "VDR correction: validate_shared_secrets_once..." section, the "VDR correction: structural rendered-image validation..." section, the "Production hardening, Item 1" section, the Phase 6D0 Oracle/PostgreSQL sections, and hack/test-goldengate-replication.py respectively) -- not re-proved here, to avoid duplicating that logic.
+
+echo ""
+echo "--- First real managed-EFS runtime: gg-postgresql-repltest-01 ---"
+
+# The first real managed-EFS GoldenGate runtime, onboarded purely by adding envs/dev/gg-postgresql-repltest-01/values.yaml -- no Terraform/workflow file was touched; the generic folder-driven for_each architecture (local.goldengate_managed_efs_deployments in envs/dev/goldengate_inventory.tf) must pick it up automatically. It is the future SOURCE side of the PostgreSQL -> MSSQL Phase 6D1 replication test (pipeline repltest-pg-to-mssql-001); replication remains disabled and no gg-mssql-repltest-01 target exists yet.
+
+NEW_DESCRIPTOR_FILE="envs/dev/gg-postgresql-repltest-01/values.yaml"
+
+if [ -f "$NEW_DESCRIPTOR_FILE" ]; then
+  pass "1: ${NEW_DESCRIPTOR_FILE} exists"
+else
+  fail "1: ${NEW_DESCRIPTOR_FILE} does not exist"
+fi
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  NEW_DESCRIPTOR_CHECK="$(python3 -c '
+import json
+import subprocess
+import sys
+
+import yaml
+
+with open("'"$NEW_DESCRIPTOR_FILE"'") as f:
+    doc = yaml.safe_load(f)
+
+results = []
+results.append(("2: deploymentModel == singleRuntime", doc.get("deploymentModel") == "singleRuntime"))
+results.append(("3: deployment.enabled is literal True", doc.get("deployment", {}).get("enabled") is True))
+results.append(("4: deployment.pipeline == repltest-pg-to-mssql-001", doc.get("deployment", {}).get("pipeline") == "repltest-pg-to-mssql-001"))
+results.append(("5: deployment.role == source", doc.get("deployment", {}).get("role") == "source"))
+results.append(("6: lifecycle.state == active", doc.get("lifecycle", {}).get("state") == "active"))
+results.append(("7: global.environment == dev", doc.get("global", {}).get("environment") == "dev"))
+
+runtime = doc.get("runtime", {})
+results.append(("8: runtime.deploymentType == postgresql", runtime.get("deploymentType") == "postgresql"))
+results.append(("9: runtime.containerName == ogg-postgresql", runtime.get("containerName") == "ogg-postgresql"))
+image = runtime.get("image", {})
+results.append(("10: image.repository is exactly the approved ogg-postgresql ECR repository", image.get("repository") == "229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-postgresql"))
+results.append(("11: image.tag is exactly 23.26.2.0.1", image.get("tag") == "23.26.2.0.1"))
+
+ports = runtime.get("service", {}).get("ports", {})
+results.append(("12: source-side ports (https=8443, dist=9013, receiver=null, metrics=9015)", ports == {"https": 8443, "dist": 9013, "receiver": None, "metrics": 9015}))
+
+persistence = doc.get("persistence", {})
+results.append(("13: persistence.enabled is literal True", persistence.get("enabled") is True))
+results.append(("14: persistence.provider == efs", persistence.get("provider") == "efs"))
+efs = persistence.get("efs", {})
+results.append(("15: persistence.efs.mode == managed", efs.get("mode") == "managed"))
+results.append(("16: persistence.efs.fileSystemId is absent", "fileSystemId" not in efs))
+
+storage = runtime.get("storage", {})
+results.append(("18: runtime.storage.u02.type == efs", storage.get("u02", {}).get("type") == "efs"))
+results.append(("19: runtime.storage.u03.type == emptyDir", storage.get("u03", {}).get("type") == "emptyDir"))
+
+storage_class = efs.get("storageClass", {})
+results.append(("20: StorageClass reclaimPolicy == Retain", storage_class.get("reclaimPolicy") == "Retain"))
+results.append(("21: mountOptions includes tls", "tls" in (storage_class.get("mountOptions") or [])))
+
+results.append(("26: replication.enabled is literal False", doc.get("replication", {}).get("enabled") is False))
+
+# 17/22/23/24: derived (never hardcoded) identities, proven via the real deployment-model describe command, never by re-deriving them independently here.
+describe = json.loads(subprocess.run(
+    [sys.executable, "hack/goldengate-deployment-model.py", "--environment", "dev", "describe", "gg-postgresql-repltest-01"],
+    capture_output=True, text=True, check=True,
+).stdout)
+results.append(("17: derived efsCreationToken == dev-gg-postgresql-repltest-01-efs", describe.get("efsCreationToken") == "dev-gg-postgresql-repltest-01-efs"))
+results.append(("22: runtime ServiceAccount resolves to gg-postgresql-sa", describe.get("runtimeServiceAccountName") == "gg-postgresql-sa"))
+results.append(("23: admin secret resolves to dev/goldengate/source/admin", describe.get("adminSecretName") == "dev/goldengate/source/admin"))
+results.append(("24: TLS secret resolves to dev/goldengate/tls-certificate", describe.get("tlsSecretName") == "dev/goldengate/tls-certificate"))
+
+# 25: ALB groupOrder is unique across every active descriptor (not just checked pairwise against the two historical ones).
+orders = []
+import glob
+for path in sorted(glob.glob("envs/dev/gg-*/values.yaml")):
+    with open(path) as f:
+        d = yaml.safe_load(f)
+    order = (d.get("ingress") or {}).get("alb", {}).get("groupOrder")
+    if order is not None:
+        orders.append(order)
+results.append(("25: ALB groupOrder is unique across all active descriptors", len(orders) == len(set(orders))))
+
+# 27: the new descriptor produces exactly one managed-EFS inventory entry (full semantic check, not just non-empty).
+inventory = json.loads(subprocess.run(
+    [sys.executable, "hack/goldengate-deployment-model.py", "--environment", "dev", "managed-efs-inventory"],
+    capture_output=True, text=True, check=True,
+).stdout)
+results.append(("27: managed-efs-inventory contains exactly one entry (gg-postgresql-repltest-01)", inventory == [{"deploymentId": "gg-postgresql-repltest-01", "efsCreationToken": "dev-gg-postgresql-repltest-01-efs"}]))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+' 2>&1)"
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL\ *) fail "${line#FAIL }" ;;
+      OK\ *) pass "${line#OK }" ;;
+      *) fail "new-descriptor structural check crashed: $line" ;;
+    esac
+  done <<< "$NEW_DESCRIPTOR_CHECK"
+else
+  skip "new-descriptor structural checks -- python3/PyYAML unavailable"
+fi
+
+if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  # Scoped to exactly the two Terraform files the managed-EFS architecture is defined in -- other envs/dev/*.tf files (main.tf, iam.tf, secret.tf, ...) may carry pre-existing, unrelated baseline dirtiness from before this task and are intentionally not checked here. "Added" means untracked (?? in --porcelain), never a pre-existing modified (M) file.
+  TERRAFORM_DIFF="$(git diff -- envs/dev/efs.tf envs/dev/goldengate_inventory.tf 2>/dev/null || true)"
+  NEW_TF_FILES="$(git status --porcelain envs/dev 2>/dev/null | grep -E '^\?\? .*\.tf$' || true)"
+  if [ -z "$TERRAFORM_DIFF" ] && [ -z "$NEW_TF_FILES" ]; then
+    pass "28: no Terraform file was added or modified alongside gg-postgresql-repltest-01 -- the generic local.goldengate_managed_efs_deployments for_each in envs/dev/goldengate_inventory.tf and envs/dev/efs.tf owns it automatically"
+  else
+    fail "28: a Terraform file was added or modified alongside the new descriptor -- onboarding must remain folder-driven only: ${NEW_TF_FILES}"
+  fi
+else
+  skip "28: Terraform-file-unchanged check -- not a git repository"
+fi
+
+if grep -qE '^\s*mode:\s*existing\s*$' envs/dev/gg-oracle-payments-01/values.yaml 2>/dev/null \
+    && grep -qE '^\s*mode:\s*existing\s*$' envs/dev/gg-postgresql-payments-01/values.yaml 2>/dev/null \
+    && grep -q 'fs-05cadf3570f23cd39' envs/dev/gg-oracle-payments-01/values.yaml 2>/dev/null \
+    && grep -q 'fs-05cadf3570f23cd39' envs/dev/gg-postgresql-payments-01/values.yaml 2>/dev/null; then
+  pass "29: the existing Oracle/PostgreSQL descriptors remain individually existing-mode with fs-05cadf3570f23cd39, never reinterpreted as managed just because the environment now contains one managed deployment"
+else
+  fail "29: the existing Oracle/PostgreSQL descriptors no longer carry mode=existing / fs-05cadf3570f23cd39"
+fi
+
+if [ ! -d "envs/dev/gg-mssql-repltest-01" ] && ! find envs/dev -maxdepth 1 -iname 'gg-mssql-*' 2>/dev/null | grep -q .; then
+  pass "30: no MSSQL descriptor (gg-mssql-repltest-01 or any gg-mssql-* folder) was created in this task"
+else
+  fail "30: an MSSQL descriptor was unexpectedly created in this task"
+fi
+
+# 31/32: no replication REST code changes, and PostgreSQL->MSSQL Phase 6D1 constants remain unchanged -- proven by hack/test-goldengate-replication.py's own still-passing suite (unaffected file) plus a direct re-check of the two Phase 6D1 scope constants here.
+if grep -qF 'REPLICATION_SUPPORTED_SOURCE_TYPE = "postgresql"' hack/goldengate-deployment-model.py 2>/dev/null \
+    && grep -qF 'REPLICATION_SUPPORTED_TARGET_TYPE = "mssql"' hack/goldengate-deployment-model.py 2>/dev/null; then
+  pass "31/32: PostgreSQL->MSSQL Phase 6D1 constants (REPLICATION_SUPPORTED_SOURCE_TYPE=postgresql, REPLICATION_SUPPORTED_TARGET_TYPE=mssql) remain unchanged; no replication REST code was touched by this onboarding"
+else
+  fail "31/32: the Phase 6D1 replication scope constants have changed"
+fi
 
 echo ""
 echo "=================================================="

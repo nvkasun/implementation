@@ -55,12 +55,13 @@ deployments:
 
 class LoadDeploymentsTests(unittest.TestCase):
     def test_real_repo_config_loads_and_derives_correctly(self):
+        # Updated for the first real managed-EFS runtime (gg-postgresql-repltest-01): the live dev registry now has 3 deployments, not 2.
         doc = cfgmod.load_deployments(_stage_generated_registry_dir())
         self.assertEqual(doc["environment"], "dev")
         self.assertEqual(doc["runtimeNamespace"], "goldengate-dev")
-        self.assertEqual(len(doc["deployments"]), 2)
+        self.assertEqual(len(doc["deployments"]), 3)
         names = {d["name"] for d in doc["deployments"]}
-        self.assertEqual(names, {"gg-oracle-payments-01", "gg-postgresql-payments-01"})
+        self.assertEqual(names, {"gg-oracle-payments-01", "gg-postgresql-payments-01", "gg-postgresql-repltest-01"})
         for d in doc["deployments"]:
             self.assertTrue(d["enabled"])
             self.assertEqual(d["adminHost"], f"{d['name']}.goldengate-dev.svc.cluster.local")

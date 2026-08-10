@@ -379,13 +379,16 @@ class BuildStatusPayloadTests(unittest.TestCase):
             monitor.build_status_payload(config, table, DEPLOYMENTS, LOGICAL_PIPELINES, clock=lambda: 1780000010)
 
     def test_real_repo_config_produces_two_runtimes_under_one_pipeline(self):
+        # Updated for the first real managed-EFS runtime (gg-postgresql-repltest-01, pipeline repltest-pg-to-mssql-001, source only, no target yet): the live dev registry now derives 2 logical pipelines, not 1. payments-ora-to-pg-001 still has exactly 2 runtimes (unchanged); the new pipeline has exactly 1 (source-only, as expected before its future MSSQL target is onboarded).
         doc = cfgmod.load_deployments(_stage_generated_registry_dir())
         lps = cfgmod.build_logical_pipelines(doc["deployments"])
         table = FakeTable([])
         config = make_config()
         payload = monitor.build_status_payload(config, table, doc["deployments"], lps, clock=lambda: 1780000010)
-        self.assertEqual(len(payload["logicalPipelines"]), 1)
-        self.assertEqual(len(payload["logicalPipelines"][0]["runtimes"]), 2)
+        self.assertEqual(len(payload["logicalPipelines"]), 2)
+        by_pipeline_id = {lp["pipelineId"]: lp for lp in payload["logicalPipelines"]}
+        self.assertEqual(len(by_pipeline_id["payments-ora-to-pg-001"]["runtimes"]), 2)
+        self.assertEqual(len(by_pipeline_id["repltest-pg-to-mssql-001"]["runtimes"]), 1)
 
 
 class DecimalConversionTests(unittest.TestCase):
@@ -2594,8 +2597,8 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         self.assertNotIn(r"\s", post_rollout_awk_text)
         self.assertIn("[[:space:]]", post_rollout_awk_text)
 
-    def test_deployment_discovery_awk_returns_exactly_both_enabled_deployments(self):
-        # Executes the actual committed awk snippet under the system's real awk against the real config, not a reimplementation; the awk emits "name|type" pairs so this asserts both.
+    def test_deployment_discovery_awk_returns_exactly_all_enabled_deployments(self):
+        # Executes the actual committed awk snippet under the system's real awk against the real config, not a reimplementation; the awk emits "name|type" pairs so this asserts all three. Updated for the first real managed-EFS runtime (gg-postgresql-repltest-01) -- the registry is deployment-ID-sorted, so it sorts between gg-postgresql-payments-01 and nothing else.
         if shutil.which("awk") is None:
             raise unittest.SkipTest("awk not available")
         preflight_idx = self.monitor_text.index("mapfile -t ENABLED_DEPLOYMENT_PAIRS < <(awk '")
@@ -2606,9 +2609,9 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         proc = subprocess.run(["awk", awk_script, registry_path], capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         pairs = [line for line in proc.stdout.splitlines() if line]
-        self.assertEqual(pairs, ["gg-oracle-payments-01|oracle", "gg-postgresql-payments-01|postgresql"])
+        self.assertEqual(pairs, ["gg-oracle-payments-01|oracle", "gg-postgresql-payments-01|postgresql", "gg-postgresql-repltest-01|postgresql"])
         names = [pair.split("|", 1)[0] for pair in pairs]
-        self.assertEqual(names, ["gg-oracle-payments-01", "gg-postgresql-payments-01"])
+        self.assertEqual(names, ["gg-oracle-payments-01", "gg-postgresql-payments-01", "gg-postgresql-repltest-01"])
 
     def test_deployment_discovery_never_hardcodes_names_in_production_logic(self):
         preflight_idx = self.monitor_text.index("- name: CloudWatch publication preflight")
