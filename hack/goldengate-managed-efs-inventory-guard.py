@@ -5,10 +5,15 @@ import json
 import re
 import sys
 
-_SAFE_DEPLOYMENT_ID_RE = re.compile(r"^[a-z][a-z0-9-]*$")
-_SAFE_ENVIRONMENT_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+# Mirrors hack/goldengate-deployment-model.py's exact safe-token grammar (_TOKEN_RE) for deployment IDs and environments -- the looser trailing/double-hyphen grammar is deliberately not used here.
+_SAFE_DEPLOYMENT_ID_RE = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*\Z")
+_SAFE_ENVIRONMENT_RE = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*\Z")
+# Mirrors derive_efs_creation_token()'s deterministic "<environment>-<deployment_id>-efs" shape and hack/goldengate-deployment-model.py's real AWS EFS creation-token length limit (_EFS_CREATION_TOKEN_MAX_LENGTH).
+_SAFE_CREATION_TOKEN_RE = re.compile(r"^[a-z][a-z0-9-]*-efs\Z")
+_EFS_CREATION_TOKEN_MAX_LENGTH = 64
 
 MANAGED_BY_VALUE = "goldengate-eks-app"
+REQUIRED_STORAGE_VALUE = "u02"
 
 ORPHAN_MESSAGE = (
     "An AWS GoldenGate managed EFS exists without a current managed deployment descriptor. "
@@ -33,8 +38,12 @@ def _normalize_tags(raw_tags):
     return tags
 
 
+def _is_safe_creation_token(value):
+    return isinstance(value, str) and bool(_SAFE_CREATION_TOKEN_RE.match(value)) and len(value) <= _EFS_CREATION_TOKEN_MAX_LENGTH
+
+
 def check_managed_efs_inventory(expected, actual, environment):
-    """expected: [{"deploymentId": ..., "efsCreationToken": ...}, ...] (from the deployment model, includes lifecycle.state=absent). actual: AWS FileSystemDescription-shaped dicts (FileSystemId/CreationToken/Tags) sanitized down to the four GoldenGate tags. Returns the list of orphan deployment IDs (each with the fixed ORPHAN_MESSAGE) -- empty means PASS. Raises InventoryGuardError for a creation-token collision, malformed/missing ownership tags on an otherwise ManagedBy=goldengate-eks-app filesystem, a deployment-tag/creation-token identity mismatch, or a duplicate GoldenGateDeploymentId -- all fail closed before any orphan comparison even runs."""
+    """expected: [{"deploymentId": ..., "efsCreationToken": ...}, ...] (from the deployment model, includes lifecycle.state=absent). actual: AWS FileSystemDescription-shaped dicts (FileSystemId/CreationToken/Tags) sanitized down to the four GoldenGate tags. Returns the list of orphan deployment IDs (each with the fixed ORPHAN_MESSAGE) -- empty means PASS. Raises InventoryGuardError for a creation-token collision, malformed/missing ownership tags on an otherwise ManagedBy=goldengate-eks-app filesystem (checked in full BEFORE any environment-based ignore decision -- a validly-tagged other-environment resource is the only thing ever silently ignored), a deployment-tag/creation-token identity mismatch, or a duplicate GoldenGateDeploymentId -- all fail closed before any orphan comparison even runs."""
     expected_by_id = {e["deploymentId"]: e["efsCreationToken"] for e in expected}
     expected_by_token = {e["efsCreationToken"]: e["deploymentId"] for e in expected}
 
@@ -46,6 +55,7 @@ def check_managed_efs_inventory(expected, actual, environment):
         managed_by = tags.get("ManagedBy")
         environment_tag = tags.get("GoldenGateEnvironment")
         deployment_id_tag = tags.get("GoldenGateDeploymentId")
+        storage_tag = tags.get("GoldenGateStorage")
 
         # Creation-token collision check: applies to EVERY actual filesystem regardless of its own tags -- an untagged, mistagged, or wrong-identity filesystem that happens to share one of our deterministic creation tokens is exactly the ambiguous case this guard exists to catch, before Terraform ever sees it.
         if creation_token in expected_by_token:
@@ -62,15 +72,12 @@ def check_managed_efs_inventory(expected, actual, environment):
         if managed_by != MANAGED_BY_VALUE:
             continue  # unrelated / non-GoldenGate EFS -- already proven not a token collision above, safely ignored
 
-        # From here, ManagedBy is correct: ownership metadata must be structurally valid, never silently ignored.
+        # From here, ManagedBy is correct: EVERY structural ownership field must be validated in full before any environment-based ignore decision is made -- a resource is never silently excused merely because its environment tag happens to look like a different, valid environment while some other ownership field is missing or malformed.
         if not isinstance(environment_tag, str) or not _SAFE_ENVIRONMENT_RE.match(environment_tag):
             raise InventoryGuardError(
                 f"actual EFS {filesystem_id!r} has ManagedBy={MANAGED_BY_VALUE!r} but its GoldenGateEnvironment "
                 f"tag is missing or malformed ({environment_tag!r})."
             )
-
-        if environment_tag != environment:
-            continue  # a validly-tagged GoldenGate EFS for a different environment -- already proven not a token collision above
 
         if not isinstance(deployment_id_tag, str) or not _SAFE_DEPLOYMENT_ID_RE.match(deployment_id_tag):
             raise InventoryGuardError(
@@ -78,11 +85,21 @@ def check_managed_efs_inventory(expected, actual, environment):
                 f"tag is missing or malformed ({deployment_id_tag!r})."
             )
 
-        if not isinstance(creation_token, str) or not creation_token.strip():
+        if not _is_safe_creation_token(creation_token):
             raise InventoryGuardError(
-                f"actual EFS {filesystem_id!r} (GoldenGateDeploymentId={deployment_id_tag!r}) has a missing or "
-                f"malformed CreationToken in its AWS filesystem description."
+                f"actual EFS {filesystem_id!r} (GoldenGateDeploymentId={deployment_id_tag!r}) has a missing, "
+                f"malformed, or oversized CreationToken in its AWS filesystem description ({creation_token!r})."
             )
+
+        if storage_tag != REQUIRED_STORAGE_VALUE:
+            raise InventoryGuardError(
+                f"actual EFS {filesystem_id!r} (GoldenGateDeploymentId={deployment_id_tag!r}) has GoldenGateStorage="
+                f"{storage_tag!r}, expected exactly {REQUIRED_STORAGE_VALUE!r}."
+            )
+
+        # Only now, after every ownership field has been proven structurally valid, may a genuinely different (real) environment be ignored.
+        if environment_tag != environment:
+            continue
 
         in_scope.append((deployment_id_tag, filesystem_id, creation_token))
 

@@ -42,11 +42,3 @@ module "goldengate_runtime_efs" {
     GoldenGateEnvironment  = var.environment
   }
 }
-
-# Safe, non-sensitive output (deployment ID -> AWS-generated EFS filesystem ID, managed-mode only); existing-mode runtimes are excluded since their fileSystemId is already the committed Git value. Not consumed as a cross-child Terraform output by the workflow (the approved corporate reusable workflow does not expose one) -- kept for local/VDR inspection (`terraform output`) and potential future use.
-output "goldengate_runtime_efs_filesystem_ids" {
-  description = "Deployment ID -> resolved EFS filesystem ID, for managed-mode GoldenGate runtime deployments only."
-  value = {
-    for id, mod in module.goldengate_runtime_efs : id => mod.efs_id
-  }
-}

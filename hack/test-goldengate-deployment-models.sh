@@ -6544,11 +6544,10 @@ else
   pass "29: GoldenGateSecretsReadRole-dev grants no DynamoDB write or CloudWatch PutMetricData permission"
 fi
 
-if grep -q "read_only_deployment_validation\|validate_shared_secrets_once" "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && grep -q "needs.validate_shared_secrets_once.result != 'failure'" "$EKS_APP_WORKFLOW" 2>/dev/null; then
-  pass "29: the read-only validation chain is designed to run even when deploy=false skipped its mutation-only dependencies"
+if grep -qF "needs.validate_model.outputs.effective_deploy != 'true' || (needs.terraform_sync_once.result == 'success' && needs.platform_sync_once.result == 'success')" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "29: the read-only validation chain (validate_shared_secrets_once) is deploy-aware and fail-closed -- it tolerates a legitimately skipped terraform/platform sync only when deploy=false, and requires their exact success when deploy=true"
 else
-  fail "29: the read-only validation chain does not correctly tolerate skipped mutation-only dependencies"
+  fail "29: validate_shared_secrets_once no longer contains the required deploy-aware fail-closed condition"
 fi
 
 if [ -d "envs/dev/gg-sqlserver-payments-01" ] || [ -d "envs/dev/gg-postgresql-source-01" ]; then
@@ -7855,6 +7854,291 @@ if [ "$PYTHON_AVAILABLE" = "true" ]; then
   fi
 else
   skip "17/18/19/20/21/22: managed-efs-inventory-guard unit tests -- python3 unavailable"
+fi
+
+echo ""
+echo "--- Final workflow correction, Issue 1: fail-closed job graph for a real deploy ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  set +e
+  FAIL_CLOSED_SIM_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import re
+import sys
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+
+jobs = doc["jobs"]
+
+
+def _extract_if(job_name):
+    raw = jobs[job_name].get("if", "true")
+    raw = str(raw).strip()
+    if raw.startswith("${{") and raw.endswith("}}"):
+        raw = raw[3:-2].strip()
+    return raw
+
+
+class _Parser:
+    """A tiny, bespoke evaluator for exactly the GHA expression subset this workflow uses: && || == != () quoted strings, needs.<job>.result, needs.<job>.outputs.<name>, always(). Not a general GHA expression engine -- just enough to genuinely simulate these four job conditions against a fabricated needs context, rather than trusting a text/regex match against the workflow author's own wording."""
+
+    def __init__(self, expr, needs):
+        self.expr = expr
+        self.needs = needs
+        self.pos = 0
+
+    def _skip_ws(self):
+        while self.pos < len(self.expr) and self.expr[self.pos].isspace():
+            self.pos += 1
+
+    def parse(self):
+        result = self._or()
+        self._skip_ws()
+        if self.pos != len(self.expr):
+            raise ValueError(f"trailing content: {self.expr[self.pos:]!r}")
+        return result
+
+    def _or(self):
+        left = self._and()
+        self._skip_ws()
+        while self.expr[self.pos:self.pos + 2] == "||":
+            self.pos += 2
+            right = self._and()
+            left = left or right
+            self._skip_ws()
+        return left
+
+    def _and(self):
+        left = self._atom()
+        self._skip_ws()
+        while self.expr[self.pos:self.pos + 2] == "&&":
+            self.pos += 2
+            right = self._atom()
+            left = left and right
+            self._skip_ws()
+        return left
+
+    def _atom(self):
+        self._skip_ws()
+        if self.expr[self.pos] == "(":
+            self.pos += 1
+            val = self._or()
+            self._skip_ws()
+            assert self.expr[self.pos] == ")"
+            self.pos += 1
+            return val
+        if self.expr[self.pos:self.pos + 8] == "always()":
+            self.pos += 8
+            return True
+        left_val = self._value()
+        self._skip_ws()
+        op = self.expr[self.pos:self.pos + 2]
+        if op in ("==", "!="):
+            self.pos += 2
+            right_val = self._value()
+            return left_val == right_val if op == "==" else left_val != right_val
+        return bool(left_val)
+
+    def _value(self):
+        self._skip_ws()
+        if self.expr[self.pos] == "'":
+            self.pos += 1
+            start = self.pos
+            while self.expr[self.pos] != "'":
+                self.pos += 1
+            val = self.expr[start:self.pos]
+            self.pos += 1
+            return val
+        m = re.match(r"needs\.([A-Za-z0-9_]+)\.result", self.expr[self.pos:])
+        if m:
+            self.pos += m.end()
+            return self.needs.get(m.group(1), {}).get("result", "")
+        m = re.match(r"needs\.([A-Za-z0-9_]+)\.outputs\.([A-Za-z0-9_]+)", self.expr[self.pos:])
+        if m:
+            self.pos += m.end()
+            return self.needs.get(m.group(1), {}).get("outputs", {}).get(m.group(2), "")
+        raise ValueError(f"cannot parse value at: {self.expr[self.pos:self.pos + 40]!r}")
+
+
+def eval_gha_bool(expr, needs):
+    return bool(_Parser(expr, needs).parse())
+
+
+JOB_ORDER = ["terraform_sync_once", "platform_sync_once", "validate_shared_secrets_once", "build_publish_and_deploy"]
+IF_EXPRS = {job: _extract_if(job) for job in JOB_ORDER}
+
+
+def simulate(initial, outcome_when_run):
+    results = dict(initial)
+    for job in JOB_ORDER:
+        would_run = eval_gha_bool(IF_EXPRS[job], results)
+        results[job] = {"result": (outcome_when_run.get(job, "success") if would_run else "skipped"), "outputs": {}}
+    return results
+
+
+def base_context(effective_deploy, has_changes="true"):
+    return {
+        "validate_model": {"result": "success", "outputs": {"effective_deploy": effective_deploy}},
+        "detect_changed_deployments": {"result": "success", "outputs": {"has_changes": has_changes}},
+        "managed_efs_deletion_guard": {"result": "success", "outputs": {}},
+        "storage_transition_guard": {"result": "success", "outputs": {}},
+        "managed_efs_inventory_guard": {"result": "success", "outputs": {}},
+    }
+
+
+failures = []
+
+
+def check(label, condition):
+    if not condition:
+        failures.append(label)
+
+
+# 1: deploy=true + inventory guard failure -> terraform skipped/blocked -> runtime build/deploy cannot execute.
+ctx = base_context("true")
+ctx["managed_efs_inventory_guard"] = {"result": "failure", "outputs": {}}
+r = simulate(ctx, {})
+check("1: terraform_sync_once must be skipped", r["terraform_sync_once"]["result"] == "skipped")
+check("1: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
+
+# 2: deploy=true + terraform failure -> runtime build/deploy cannot execute.
+ctx = base_context("true")
+r = simulate(ctx, {"terraform_sync_once": "failure"})
+check("2: terraform_sync_once must report failure", r["terraform_sync_once"]["result"] == "failure")
+check("2: platform_sync_once must be skipped", r["platform_sync_once"]["result"] == "skipped")
+check("2: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
+check("2: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
+
+# 3: deploy=true + platform failure -> runtime build/deploy cannot execute.
+ctx = base_context("true")
+r = simulate(ctx, {"platform_sync_once": "failure"})
+check("3: platform_sync_once must report failure", r["platform_sync_once"]["result"] == "failure")
+check("3: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
+check("3: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
+
+# 4: deploy=true + all mutation prerequisites success -> runtime deployment may execute.
+ctx = base_context("true")
+r = simulate(ctx, {})
+check("4: terraform_sync_once must succeed", r["terraform_sync_once"]["result"] == "success")
+check("4: platform_sync_once must succeed", r["platform_sync_once"]["result"] == "success")
+check("4: validate_shared_secrets_once must succeed", r["validate_shared_secrets_once"]["result"] == "success")
+check("4: build_publish_and_deploy must be eligible to run", r["build_publish_and_deploy"]["result"] == "success")
+
+# 5: deploy=false -> terraform/platform may be skipped -> read-only/Helm dry-run path still executes.
+ctx = base_context("false")
+ctx["managed_efs_inventory_guard"] = {"result": "skipped", "outputs": {}}
+r = simulate(ctx, {})
+check("5: terraform_sync_once must be skipped", r["terraform_sync_once"]["result"] == "skipped")
+check("5: platform_sync_once must be skipped", r["platform_sync_once"]["result"] == "skipped")
+check("5: validate_shared_secrets_once must still succeed", r["validate_shared_secrets_once"]["result"] == "success")
+check("5: build_publish_and_deploy dry-run path must still be eligible to run", r["build_publish_and_deploy"]["result"] == "success")
+
+# 6: build_publish_and_deploy requires validate_shared_secrets_once SUCCESS, not merely not-failure/not-cancelled -- simulate a bare "skipped" upstream result directly and confirm it is rejected (the old assertion would have let this through).
+skipped_ctx = base_context("true")
+skipped_ctx["validate_shared_secrets_once"] = {"result": "skipped", "outputs": {}}
+would_run = eval_gha_bool(IF_EXPRS["build_publish_and_deploy"], skipped_ctx)
+check("6: build_publish_and_deploy must reject a skipped validate_shared_secrets_once", would_run is False)
+
+if failures:
+    print("\n".join(failures))
+    sys.exit(1)
+print("OK")
+PYEOF
+)"
+  FAIL_CLOSED_SIM_STATUS=$?
+  set -e
+  if [ "$FAIL_CLOSED_SIM_STATUS" -eq 0 ]; then
+    pass "1: deploy=true + managed_efs_inventory_guard failure blocks terraform_sync_once and build_publish_and_deploy (simulated end-to-end against the real if: expressions)"
+    pass "2: deploy=true + terraform_sync_once failure blocks platform_sync_once/validate_shared_secrets_once/build_publish_and_deploy"
+    pass "3: deploy=true + platform_sync_once failure blocks validate_shared_secrets_once/build_publish_and_deploy"
+    pass "4: deploy=true + all mutation prerequisites succeeding leaves build_publish_and_deploy eligible to run"
+    pass "5: deploy=false correctly skips terraform_sync_once/platform_sync_once while the read-only/dry-run path through validate_shared_secrets_once and build_publish_and_deploy still runs"
+    pass "6: build_publish_and_deploy's if: rejects a skipped validate_shared_secrets_once (requires exact 'success', not the old != failure/!= cancelled assertion)"
+  else
+    fail "fail-closed job-graph simulation found violation(s): ${FAIL_CLOSED_SIM_OUT}"
+  fi
+else
+  skip "1-6: fail-closed job-graph simulation -- python3/PyYAML unavailable"
+fi
+
+if ! grep -qE "validate_shared_secrets_once\.result\s*!=\s*'failure'" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "the old overly-permissive assertion (validate_shared_secrets_once.result != 'failure') has been replaced -- build_publish_and_deploy now requires exact success"
+else
+  fail "build_publish_and_deploy still contains the old != 'failure'/!= 'cancelled' assertion for validate_shared_secrets_once"
+fi
+
+if grep -qF "needs.validate_shared_secrets_once.result == 'success'" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "build_publish_and_deploy's if: explicitly requires needs.validate_shared_secrets_once.result == 'success'"
+else
+  fail "build_publish_and_deploy's if: does not explicitly require validate_shared_secrets_once.result == 'success'"
+fi
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  set +e
+  UNDECLARED_NEEDS_FINAL_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import re
+import sys
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+
+problems = []
+for job_name, job in doc["jobs"].items():
+    needs = job.get("needs")
+    if needs is None:
+        declared = set()
+    elif isinstance(needs, str):
+        declared = {needs}
+    else:
+        declared = set(needs)
+
+    job_copy = dict(job)
+    job_copy.pop("needs", None)
+    text = yaml.dump(job_copy, default_flow_style=False)
+    refs = set(re.findall(r"needs\.([A-Za-z0-9_-]+)\.", text))
+
+    undeclared = refs - declared
+    if undeclared:
+        problems.append(f"{job_name}: undeclared needs.{{{','.join(sorted(undeclared))}}}")
+
+if problems:
+    print("\n".join(problems))
+    sys.exit(1)
+print("OK")
+PYEOF
+)"
+  UNDECLARED_NEEDS_FINAL_STATUS=$?
+  set -e
+  if [ "$UNDECLARED_NEEDS_FINAL_STATUS" -eq 0 ]; then
+    pass "the platform_sync_once/validate_shared_secrets_once fail-closed fixes did not introduce any needs.<job> reference for a job outside that job's own declared needs: list"
+  else
+    fail "an undeclared needs.<job> reference was introduced: ${UNDECLARED_NEEDS_FINAL_OUT}"
+  fi
+else
+  skip "undeclared-needs recheck -- python3/PyYAML unavailable"
+fi
+
+echo ""
+echo "--- Final workflow correction, Issue 3: no unverified Terraform module output dependency ---"
+
+if ! grep -qE '^\s*output\s+"goldengate_runtime_efs_filesystem_ids"' envs/dev/efs.tf 2>/dev/null; then
+  pass "envs/dev/efs.tf no longer declares an output depending on module.goldengate_runtime_efs.efs_id -- the aws-tf-module-efs v1.0.0 outputs.tf contract is not provable from local reference material, so it was removed rather than guessed"
+else
+  fail "envs/dev/efs.tf still declares goldengate_runtime_efs_filesystem_ids, depending on an unverified module.goldengate_runtime_efs.efs_id output"
+fi
+
+if ! grep -qE '\.efs_id\b' envs/dev/*.tf 2>/dev/null; then
+  pass "no envs/dev/*.tf file references module.goldengate_runtime_efs.efs_id or any other unverified module output attribute"
+else
+  fail "an envs/dev/*.tf file still references an unverified module output attribute (.efs_id)"
+fi
+
+if grep -qF 'aws efs describe-file-systems --creation-token' "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "managed EFS resolution remains entirely creation-token-based (aws efs describe-file-systems --creation-token), never dependent on a Terraform child output the approved corporate reusable workflow does not expose"
+else
+  fail "the creation-token-based managed EFS resolution path is missing from the workflow"
 fi
 
 echo ""

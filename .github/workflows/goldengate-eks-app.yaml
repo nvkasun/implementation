@@ -149,10 +149,11 @@ jobs:
   platform_sync_once:
     name: Synchronize the GoldenGate platform chart (once)
 
+    # This job's if: is a custom expression, so terraform_sync_once's result must be checked explicitly -- otherwise, if terraform_sync_once was skipped or failed (e.g. an upstream storage guard failure), this job would still attempt to run since a bare effective_deploy=='true' check says nothing about whether Terraform actually succeeded first.
     needs:
       - validate_model
       - terraform_sync_once
-    if: needs.validate_model.outputs.effective_deploy == 'true'
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.terraform_sync_once.result == 'success' }}
 
     uses: ./.github/workflows/goldengate-platform.yaml
     with:
@@ -166,8 +167,8 @@ jobs:
       - validate_model
       - terraform_sync_once
       - platform_sync_once
-    # Runs even when terraform/platform were skipped (deploy=false): only a genuine failure/cancellation upstream blocks this read-only check.
-    if: ${{ always() && needs.validate_model.result == 'success' && needs.terraform_sync_once.result != 'failure' && needs.terraform_sync_once.result != 'cancelled' && needs.platform_sync_once.result != 'failure' && needs.platform_sync_once.result != 'cancelled' }}
+    # Runs when terraform/platform were legitimately skipped (deploy=false) -- but for a real deploy (effective_deploy=='true'), "skipped" is NOT success: this job must not run unless terraform_sync_once AND platform_sync_once both actually succeeded, closing the path where an inventory-guard/terraform/platform failure upstream (which makes those jobs skip rather than fail their own dependents) would otherwise let this read-only check -- and everything downstream of it -- proceed anyway.
+    if: ${{ always() && needs.validate_model.result == 'success' && (needs.validate_model.outputs.effective_deploy != 'true' || (needs.terraform_sync_once.result == 'success' && needs.platform_sync_once.result == 'success')) }}
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -466,8 +467,8 @@ jobs:
     needs:
       - detect_changed_deployments
       - validate_shared_secrets_once
-    # The read-only validation steps in this job must still run when deploy=false skipped validate_shared_secrets_once's upstream chain; only a genuine failure/cancellation blocks it.
-    if: ${{ always() && needs.detect_changed_deployments.result == 'success' && needs.detect_changed_deployments.outputs.has_changes == 'true' && needs.validate_shared_secrets_once.result != 'failure' && needs.validate_shared_secrets_once.result != 'cancelled' }}
+    # Requires validate_shared_secrets_once.result == 'success' (never the weaker "not failure/not cancelled"): that job is itself now fail-closed for a real deploy (see its own if:), so requiring its strict success here is what actually closes the deploy=true path -- a failed/skipped storage guard or terraform/platform sync upstream now reliably prevents this job from building/deploying anything, while deploy=false's legitimate skip-terraform/platform path still resolves validate_shared_secrets_once to 'success' and this job still runs its read-only/dry-run path.
+    if: ${{ always() && needs.detect_changed_deployments.result == 'success' && needs.detect_changed_deployments.outputs.has_changes == 'true' && needs.validate_shared_secrets_once.result == 'success' }}
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
