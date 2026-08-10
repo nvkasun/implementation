@@ -8735,9 +8735,9 @@ fi
 # 15: deploy=false performing no Argo/EKS runtime mutation is unrelated to this image-validation fix and remains covered by the existing dry-run-unreachable structural proof earlier in this suite (see "Correction pass, Issue ..." sections above). 16/17/18/19: cross-account shared-secret fix (previous VDR turn), EFS/Terraform architecture, Oracle/PostgreSQL descriptors + replication=false, and PostgreSQL->MSSQL Phase 6D1 are all unrelated to this narrowly-scoped rendered-image validation fix and remain covered by their own dedicated, still-passing sections/suites above (the "VDR correction: validate_shared_secrets_once..." section, the "Production hardening, Item 1" section, the Phase 6D0 Oracle/PostgreSQL sections, and hack/test-goldengate-replication.py respectively) -- none of items 15-19 are re-proved here, to avoid duplicating that logic.
 
 echo ""
-echo "--- VDR correction: monitor_dry_run_validation runner (CodeBuild -> ubuntu-latest) ---"
+echo "--- VDR correction: monitor_dry_run_validation runner (CodeBuild -> ubuntu-latest) + least-privilege permissions ---"
 
-# Real VDR evidence: the deploy=false dry-run reached monitor_dry_run_validation and failed at "Set up Python" with "Version 3.12 was not found in the local cache" -- the CodeBuild/self-hosted runner image does not carry the actions/setup-python 3.12 x64 distribution. This is a runner/toolchain gap, not a monitor application, requirements.txt, EFS, ECR, or EKS defect: the job performs only local/read-only CI validation (checkout, Python 3.12 setup, pip install, unit tests, folder-driven registry generation, Helm lint/template) and needs no AWS/EKS/Argo access at all, so it moves to the standard ubuntu-latest runner. No other job's runner changes.
+# Real VDR evidence: the deploy=false dry-run reached monitor_dry_run_validation and failed at "Set up Python" with "Version 3.12 was not found in the local cache" -- the CodeBuild/self-hosted runner image does not carry the actions/setup-python 3.12 x64 distribution. This is a runner/toolchain gap, not a monitor application, requirements.txt, EFS, ECR, or EKS defect: the job performs only local/read-only CI validation (checkout, Python 3.12 setup, pip install, unit tests, folder-driven registry generation, Helm lint/template) and needs no AWS/EKS/Argo access at all, so it moves to the standard ubuntu-latest runner. No other job's runner changes. Least-privilege follow-up: this job otherwise inherits the workflow-level `permissions: id-token: write` even though it never authenticates to AWS, so it now declares its own job-level `permissions: contents: read` (checks LP1-LP3 below), which is sufficient for actions/checkout and leaves id-token absent rather than granted. Checks 1-13 below (runner, Python 3.12, pip cache, no AWS credential setup, no kubectl/Argo, etc.) are re-run unchanged in the same behavioral pass, proving the least-privilege change did not regress any prior monitor dry-run assertion.
 
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   MONITOR_DRY_RUN_CHECK="$(python3 -c '
@@ -8780,6 +8780,13 @@ results.append(("10: no configure-aws-credentials step", not any("aws-actions/co
 results.append(("11: does not assume an AWS role", "assume-role" not in all_run_text and "role-to-assume" not in str(job)))
 results.append(("12: performs no kubectl command", "kubectl " not in all_run_text))
 results.append(("13: performs no Argo mutation", "argocd" not in all_run_text.lower()))
+
+# Least-privilege correction: job-level permissions override the workflow-level id-token: write down to contents: read only for this no-OIDC-needed job.
+job_permissions = job.get("permissions")
+results.append(("LP1: has job-level permissions block", isinstance(job_permissions, dict)))
+results.append(("LP2: permissions.contents == read", isinstance(job_permissions, dict) and job_permissions.get("contents") == "read"))
+results.append(("LP3: id-token is absent (not write)", isinstance(job_permissions, dict) and job_permissions.get("id-token") != "write"))
+results.append(("LP3: permissions has no other key besides contents", isinstance(job_permissions, dict) and set(job_permissions.keys()) == {"contents"}))
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)

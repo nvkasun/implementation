@@ -2485,6 +2485,10 @@ jobs:
     # Local/read-only CI validation only (checkout, Python, pip install, unit tests, folder-driven registry generation, Helm lint/template) -- no AWS credentials, no EKS access, no Argo CD/Kubernetes mutation, so it does not need (and must not depend on) the private CodeBuild runtime that every real cloud-mutating job in this workflow uses. This job's own CodeBuild runner did not carry the actions/setup-python Python 3.12 x64 distribution ("Version 3.12 was not found in the local cache"), which is a runner/toolchain issue, not a monitor application defect -- switching this ONE dry-run job to the standard GitHub-hosted runner fixes it without touching monitor_sync_once or any other job's runner.
     runs-on: ubuntu-latest
 
+    # Least privilege: this job never authenticates to AWS/EKS/Argo, so it explicitly overrides the workflow-level `permissions: id-token: write` (declared at the top of this file for the real cloud-mutating jobs) down to contents: read only -- actions/checkout still works under contents: read, and id-token is left absent rather than set to any value, which GitHub Actions treats as no OIDC token permission for this job.
+    permissions:
+      contents: read
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
