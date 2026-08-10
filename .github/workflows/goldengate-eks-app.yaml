@@ -1009,21 +1009,6 @@ jobs:
 
           echo "Rendered manifest: rendered/${RELEASE_NAME}.yaml"
 
-      - name: Verify the rendered StatefulSet uses the selected verified image
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          RENDERED="rendered/${RELEASE_NAME}.yaml"
-          EXPECTED_IMAGE="${IMAGE_REPOSITORY}:${IMAGE_TAG}"
-
-          if ! grep -qF "image: ${EXPECTED_IMAGE}" "$RENDERED"; then
-            echo "FAIL: rendered StatefulSet does not reference the verified image ${EXPECTED_IMAGE}."
-            exit 1
-          fi
-
-          echo "OK: rendered StatefulSet references the verified image ${EXPECTED_IMAGE} (digest ${IMAGE_DIGEST})."
-
       - name: Verify the rendered StatefulSet uses the shared runtime ServiceAccount
         shell: bash
         run: |
@@ -1352,14 +1337,14 @@ jobs:
           print("OK: EFS StorageClass, runtime PVC, and StatefulSet u02/u03 volumes all match the expected persistence configuration.")
           PYEOF
 
-      - name: Validate no observer sidecar is rendered
+      - name: Validate rendered singleRuntime manifest structure, verified image identity, and no observer sidecar
         shell: bash
         run: |
           set -euo pipefail
 
           RENDERED="rendered/${RELEASE_NAME}.yaml"
 
-          echo "deploymentModel=singleRuntime: validating the generic runtime resource contract with Python/PyYAML -- never indentation-based grep for Kubernetes object structure."
+          echo "deploymentModel=singleRuntime: validating the generic runtime resource contract, including verified-image identity, with Python/PyYAML -- never indentation-based grep for Kubernetes object structure or field values."
 
           if ! command -v python3 >/dev/null 2>&1; then
             echo "FAIL: python3 is required to validate singleRuntime rendered manifests and is not available on this runner."
@@ -1371,7 +1356,7 @@ jobs:
             exit 1
           fi
 
-          python3 - "$RENDERED" "$VALUES_FILE" "$DEPLOYMENT_ID" "$TARGET_NAMESPACE" <<'PYEOF'
+          python3 - "$RENDERED" "$VALUES_FILE" "$DEPLOYMENT_ID" "$TARGET_NAMESPACE" "$IMAGE_REPOSITORY" "$IMAGE_TAG" "$IMAGE_DIGEST" <<'PYEOF'
           import sys
           import yaml
 
@@ -1408,7 +1393,8 @@ jobs:
               "fluentbit",
           )
 
-          rendered_path, values_path, deployment_id, target_namespace = sys.argv[1:5]
+          rendered_path, values_path, deployment_id, target_namespace, image_repository, image_tag, image_digest = sys.argv[1:8]
+          expected_image = f"{image_repository}:{image_tag}"
 
           with open(rendered_path) as f:
               raw = f.read()
@@ -1464,6 +1450,19 @@ jobs:
               f"(spec.template.spec.containers), name={main_container_name!r}."
           )
 
+          # Structural image-identity check (never grep on the rendered text): the Helm template quotes image: "repo:tag", which a plain `grep -qF "image: repo:tag"` (without quotes) never matches -- comparing the PARSED scalar sidesteps that YAML-quoting mismatch entirely, whether the rendered value happens to be quoted or not.
+          main_container_image = main_container.get("image")
+          if main_container_image != expected_image:
+              print(
+                  f"FAIL: rendered StatefulSet main container {main_container_name!r} does not reference "
+                  f"the verified image {expected_image!r} (found {main_container_image!r})."
+              )
+              sys.exit(1)
+          print(
+              f"OK: rendered StatefulSet main container {main_container_name!r} references verified image "
+              f"{expected_image} (verified ECR digest {image_digest})."
+          )
+
           name_lower = (main_container_name or "").lower()
           image_lower = (main_container.get("image") or "").lower()
           for substring in FORBIDDEN_CONTAINER_SUBSTRINGS:
@@ -1487,6 +1486,16 @@ jobs:
               sys.exit(1)
 
           init_container = init_containers[0]
+
+          # prepare-u02-permissions intentionally uses the same runtime image as the main container (current chart contract, helm/goldengate/templates/runtime-statefulset.yaml) -- checked here too so a drift between the two image references is caught, without ever mistaking this initContainer for the regular application container checked above.
+          init_container_image = init_container.get("image")
+          if init_container_image != expected_image:
+              print(
+                  "FAIL: prepare-u02-permissions init container does not reference the verified image "
+                  f"{expected_image!r} (found {init_container_image!r})."
+              )
+              sys.exit(1)
+          print(f"OK: prepare-u02-permissions init container also references verified image {expected_image}.")
 
           def _init_script_text(container):
               # Tolerate non-string command/args entries (e.g. Helm-rendered numbers) instead of crashing.

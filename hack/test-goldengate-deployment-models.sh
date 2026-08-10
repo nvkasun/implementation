@@ -6422,13 +6422,14 @@ else
   fail "27: the deployment-model describe command is not called with the exact positional production invocation"
 fi
 
+# Corrected for the VDR image-validation fix: the rendered-image check is no longer its own grep-based step -- it was merged into the structural PyYAML validator (see the "VDR correction: structural rendered-image validation" section below for the full behavioral proof), so finding a step name alone is no longer sufficient evidence here.
 if grep -q "Verify the selected image exists in the approved private ECR" "$EKS_APP_WORKFLOW" 2>/dev/null \
     && grep -q "aws ecr describe-images" "$EKS_APP_WORKFLOW" 2>/dev/null \
     && grep -q "imageDetails\"\]\[0\]\[\"imageDigest\"\]" "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && grep -q "Verify the rendered StatefulSet uses the selected verified image" "$EKS_APP_WORKFLOW" 2>/dev/null; then
-  pass "27: the selected image's existence and digest are verified read-only via describe-images, and the rendered manifest is checked against it"
+    && ! grep -qF 'grep -qF "image: ${EXPECTED_IMAGE}"' "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "27: the selected image's existence and digest are verified read-only via describe-images, and the obsolete grep-based rendered-image text check no longer exists"
 else
-  fail "27: ECR image existence/digest verification is missing or incomplete"
+  fail "27: ECR image existence/digest verification is missing, or the obsolete grep-based rendered-image check is still present"
 fi
 
 if grep -qE 'oracle.*ecr-oracle-image|postgresql.*ecr-postgresql-image|ENGINE_IMAGE_MAP|engineImageMap' "$EKS_APP_WORKFLOW" 2>/dev/null; then
@@ -8454,6 +8455,284 @@ if grep -q 'replication:' envs/dev/gg-oracle-payments-01/values.yaml 2>/dev/null
 else
   fail "VDR 13: gg-oracle-payments-01/values.yaml's replication.enabled=false declaration is missing or was modified"
 fi
+
+echo ""
+echo "--- VDR correction: structural rendered-image validation (replaces the fragile grep-based check) ---"
+
+# Real VDR evidence: deploy=false for gg-oracle-payments-01 correctly resolved IMAGE_REPOSITORY/IMAGE_TAG/IMAGE_DIGEST from ECR, but then failed at the OLD "Verify the rendered StatefulSet uses the selected verified image" step because it did `grep -qF "image: ${EXPECTED_IMAGE}"` against a rendered value that Helm intentionally quotes (`image: "repo:tag"`). The image was correct; only the text check was wrong. Fix: that grep-based step is REMOVED and its assertion is merged into the existing duplicate-key-safe PyYAML structural validator (no second, inconsistent Kubernetes-parsing implementation is introduced).
+
+if ! grep -qF 'grep -qF "image: ${EXPECTED_IMAGE}"' .github/workflows/goldengate-eks-app.yaml 2>/dev/null \
+    && grep -qF 'main_container_image = main_container.get("image")' .github/workflows/goldengate-eks-app.yaml 2>/dev/null \
+    && grep -qF 'if main_container_image != expected_image:' .github/workflows/goldengate-eks-app.yaml 2>/dev/null; then
+  pass "VDR-IMG 1: image validation is now structural YAML field comparison (main_container.get(\"image\") != expected_image), not a grep against the rendered text"
+else
+  fail "VDR-IMG 1: structural image-identity comparison is missing, or the obsolete grep-based text check is still present"
+fi
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  python3 - "$EKS_APP_WORKFLOW" > "${WORKDIR}/image_validation_step.sh" <<'PYEOF'
+import sys
+import yaml
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+for step in doc["jobs"]["build_publish_and_deploy"]["steps"]:
+    if step.get("name", "").startswith("Validate rendered singleRuntime manifest"):
+        if "if" in step:
+            sys.exit("step unexpectedly has a per-step if: condition")
+        sys.stdout.write(step["run"])
+        break
+else:
+    sys.exit("step not found")
+PYEOF
+
+  if [ ! -s "${WORKDIR}/image_validation_step.sh" ]; then
+    fail "VDR-IMG: could not extract the merged structural validator step from ${EKS_APP_WORKFLOW} (or it now has an unexpected per-step if: condition)"
+  else
+    pass "VDR-IMG 14: the merged structural validator step has no per-step deploy-gating if: condition -- it runs whenever build_publish_and_deploy runs, exactly as the real deploy=false VDR run already exercised it"
+
+    IMG_TEST_DIR="${WORKDIR}/image-validation-fixtures"
+    mkdir -p "${IMG_TEST_DIR}/rendered"
+
+    RELEASE_NAME="gg-oracle-payments-01"
+    DEPLOYMENT_ID="gg-oracle-payments-01"
+    TARGET_NAMESPACE="goldengate-dev"
+    IMAGE_REPOSITORY="229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle"
+    IMAGE_TAG="23.26.2.0.1"
+    IMAGE_DIGEST="sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+    VALUES_FILE="${IMG_TEST_DIR}/values.yaml"
+
+    cat > "$VALUES_FILE" <<'YEOF'
+runtime:
+  containerName: ogg-oracle
+YEOF
+
+    run_image_validation_scenario() {
+      # $1=rendered manifest content, $2=expected exit status, $3=required substring in output, $4=test description
+      printf '%s' "$1" > "${IMG_TEST_DIR}/rendered/${RELEASE_NAME}.yaml"
+      set +e
+      IMG_TEST_OUT="$(cd "$IMG_TEST_DIR" && \
+        RELEASE_NAME="$RELEASE_NAME" VALUES_FILE="$VALUES_FILE" DEPLOYMENT_ID="$DEPLOYMENT_ID" TARGET_NAMESPACE="$TARGET_NAMESPACE" \
+        IMAGE_REPOSITORY="$IMAGE_REPOSITORY" IMAGE_TAG="$IMAGE_TAG" IMAGE_DIGEST="$IMAGE_DIGEST" \
+        bash "${WORKDIR}/image_validation_step.sh" 2>&1)"
+      IMG_TEST_STATUS=$?
+      set -e
+      if [ "$IMG_TEST_STATUS" -eq "$2" ] && echo "$IMG_TEST_OUT" | grep -qF "$3"; then
+        pass "VDR-IMG: $4"
+      else
+        fail "VDR-IMG: $4 (exit=${IMG_TEST_STATUS}, expected=$2)"
+        echo "$IMG_TEST_OUT"
+      fi
+    }
+
+    VALID_SERVICES='
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gg-oracle-payments-01
+  namespace: goldengate-dev
+spec:
+  clusterIP: 10.0.0.5
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gg-oracle-payments-01-headless
+  namespace: goldengate-dev
+spec:
+  clusterIP: None
+'
+    INIT_SCRIPT_ARGS='            - '\''echo cleaning stale ServiceManager.pid ; rm -f -- "$SERVICE_MANAGER_PID_FILE"'\'''
+
+    # 2: quoted rendered image (the real Helm template's actual quoting style) passes end-to-end.
+    run_image_validation_scenario "apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: gg-oracle-payments-01
+  namespace: goldengate-dev
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: prepare-u02-permissions
+          image: \"229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle:23.26.2.0.1\"
+          command: [\"sh\", \"-c\"]
+          args:
+${INIT_SCRIPT_ARGS}
+      containers:
+        - name: ogg-oracle
+          image: \"229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle:23.26.2.0.1\"
+${VALID_SERVICES}" 0 "references verified image 229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle:23.26.2.0.1" \
+      "2: a quoted rendered image (image: \"repo:tag\", the real Helm template's actual style) correctly PASSES structural validation end-to-end"
+
+    # 3: the same manifest with an unquoted image scalar (still valid YAML, same parsed value) also passes.
+    run_image_validation_scenario "apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: gg-oracle-payments-01
+  namespace: goldengate-dev
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: prepare-u02-permissions
+          image: 229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle:23.26.2.0.1
+          command: [\"sh\", \"-c\"]
+          args:
+${INIT_SCRIPT_ARGS}
+      containers:
+        - name: ogg-oracle
+          image: 229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle:23.26.2.0.1
+${VALID_SERVICES}" 0 "references verified image 229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle:23.26.2.0.1" \
+      "3: an unquoted rendered image scalar (still valid YAML, resolves to the identical string) also PASSES -- proving the fix compares the PARSED value, not the rendered text's quoting style"
+
+    # 4: wrong tag fails.
+    run_image_validation_scenario 'apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: gg-oracle-payments-01
+  namespace: goldengate-dev
+spec:
+  template:
+    spec:
+      containers:
+        - name: ogg-oracle
+          image: "229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle:99.99.99.99.9"
+' 1 "does not reference the verified image" \
+      "4: a rendered image with the wrong TAG fails closed"
+
+    # 5: wrong repository fails.
+    run_image_validation_scenario 'apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: gg-oracle-payments-01
+  namespace: goldengate-dev
+spec:
+  template:
+    spec:
+      containers:
+        - name: ogg-oracle
+          image: "229410149234.dkr.ecr.eu-west-1.amazonaws.com/wrong-repo:23.26.2.0.1"
+' 1 "does not reference the verified image" \
+      "5: a rendered image with the wrong REPOSITORY fails closed"
+
+    # 6: missing image field fails.
+    run_image_validation_scenario 'apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: gg-oracle-payments-01
+  namespace: goldengate-dev
+spec:
+  template:
+    spec:
+      containers:
+        - name: ogg-oracle
+' 1 "does not reference the verified image" \
+      "6: a regular container with no image field at all fails closed"
+
+    # 7: zero StatefulSets fails.
+    run_image_validation_scenario 'apiVersion: v1
+kind: Service
+metadata:
+  name: gg-oracle-payments-01
+  namespace: goldengate-dev
+spec:
+  clusterIP: 10.0.0.5
+' 1 "expected exactly one StatefulSet, found 0" \
+      "7: zero rendered StatefulSet documents fails closed"
+
+    # 8: multiple StatefulSets fails.
+    run_image_validation_scenario 'apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: gg-oracle-payments-01
+  namespace: goldengate-dev
+spec:
+  template:
+    spec:
+      containers:
+        - name: ogg-oracle
+          image: "229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle:23.26.2.0.1"
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: gg-oracle-payments-01-dup
+  namespace: goldengate-dev
+spec:
+  template:
+    spec:
+      containers:
+        - name: ogg-oracle
+          image: "229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle:23.26.2.0.1"
+' 1 "expected exactly one StatefulSet, found 2" \
+      "8: multiple rendered StatefulSet documents fails closed"
+
+    # 9: multiple regular containers fails, per the singleRuntime one-application-container contract.
+    run_image_validation_scenario 'apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: gg-oracle-payments-01
+  namespace: goldengate-dev
+spec:
+  template:
+    spec:
+      containers:
+        - name: ogg-oracle
+          image: "229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle:23.26.2.0.1"
+        - name: extra-sidecar
+          image: "229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle:23.26.2.0.1"
+' 1 "expected exactly one regular application container" \
+      "9: multiple regular containers fails closed per the singleRuntime contract"
+
+    # 10: an initContainer-only pod (no regular containers) fails -- proves prepare-u02-permissions can never be mistaken for the main application container.
+    run_image_validation_scenario 'apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: gg-oracle-payments-01
+  namespace: goldengate-dev
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: prepare-u02-permissions
+          image: "229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle:23.26.2.0.1"
+      containers: []
+' 1 "expected exactly one regular application container" \
+      "10: an initContainer-only pod spec (prepare-u02-permissions present, no regular containers) fails closed instead of treating the initContainer as the main container"
+
+    # 11: runtime.containerName mismatch fails, proving that identity check remains enforced.
+    run_image_validation_scenario 'apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: gg-oracle-payments-01
+  namespace: goldengate-dev
+spec:
+  template:
+    spec:
+      containers:
+        - name: wrong-container-name
+          image: "229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle:23.26.2.0.1"
+' 1 "expected main container name 'ogg-oracle', found 'wrong-container-name'" \
+      "11: a main container name that does not match values.yaml's runtime.containerName still fails closed"
+
+    rm -rf "$IMG_TEST_DIR"
+  fi
+else
+  skip "VDR-IMG: structural rendered-image validation behavioral tests -- python3/PyYAML unavailable"
+fi
+
+# 12/13: the ECR image existence/digest verification step itself is untouched by this fix (only the DOWNSTREAM rendered-manifest check changed) -- see check 27 above, which now also confirms the obsolete grep-based text check no longer exists.
+if grep -q "Verify the selected image exists in the approved private ECR" "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && grep -qF 'IMAGE_DIGEST="$(python3 -c' "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && ! grep -qE "aws ecr (put-image|batch-delete-image|start-image-scan)" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "VDR-IMG 12/13: ECR image existence (describe-images) and digest resolution remain read-only and unchanged -- no image is pushed, deleted, or mutated by this fix"
+else
+  fail "VDR-IMG 12/13: ECR image existence/digest verification step is missing, changed, or a mutating ECR call was introduced"
+fi
+
+# 15: deploy=false performing no Argo/EKS runtime mutation is unrelated to this image-validation fix and remains covered by the existing dry-run-unreachable structural proof earlier in this suite (see "Correction pass, Issue ..." sections above). 16/17/18/19: cross-account shared-secret fix (previous VDR turn), EFS/Terraform architecture, Oracle/PostgreSQL descriptors + replication=false, and PostgreSQL->MSSQL Phase 6D1 are all unrelated to this narrowly-scoped rendered-image validation fix and remain covered by their own dedicated, still-passing sections/suites above (the "VDR correction: validate_shared_secrets_once..." section, the "Production hardening, Item 1" section, the Phase 6D0 Oracle/PostgreSQL sections, and hack/test-goldengate-replication.py respectively) -- none of items 15-19 are re-proved here, to avoid duplicating that logic.
 
 echo ""
 echo "=================================================="
