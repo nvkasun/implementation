@@ -191,17 +191,44 @@ jobs:
 
           python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
 
-          # DescribeSecret/ListSecretVersionIds only -- never GetSecretValue. No secret is created, mutated, or rotated here.
+          # The three shared GoldenGate secrets live in the workload account, not the engineering/runner account this job started in (ROLE_ARN above) -- same cross-account pattern as managed_efs_inventory_guard: assume EKS_DEPLOY_ROLE_ARN, verify the assumed identity's own account before any Secrets Manager call, and never let the unverified job-level credentials touch Secrets Manager.
+          EXPECTED_WORKLOAD_ACCOUNT_ID="$(echo "$EKS_DEPLOY_ROLE_ARN" | sed -nE 's#^arn:aws:iam::([0-9]{12}):role/.*$#\1#p')"
+          if [ -z "$EXPECTED_WORKLOAD_ACCOUNT_ID" ]; then
+            echo "FAIL: could not extract a 12-digit account ID from EKS_DEPLOY_ROLE_ARN; refusing to validate shared secrets without a provable expected workload account."
+            exit 1
+          fi
+
+          echo "Assuming ${EKS_DEPLOY_ROLE_ARN} for read-only secretsmanager:DescribeSecret/ListSecretVersionIds calls..."
+
+          ASSUME_JSON="$(aws sts assume-role --role-arn "$EKS_DEPLOY_ROLE_ARN" --role-session-name "gg-shared-secrets-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --duration-seconds 900 --output json)"
+          SEC_TMP_KEY_ID="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["Credentials"]["AccessKeyId"])' <<< "$ASSUME_JSON")"
+          SEC_TMP_SECRET="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["Credentials"]["SecretAccessKey"])' <<< "$ASSUME_JSON")"
+          SEC_TMP_TOKEN="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["Credentials"]["SessionToken"])' <<< "$ASSUME_JSON")"
+          unset ASSUME_JSON
+          echo "::add-mask::${SEC_TMP_KEY_ID}"
+          echo "::add-mask::${SEC_TMP_SECRET}"
+          echo "::add-mask::${SEC_TMP_TOKEN}"
+
+          # Confined to this one step's subshells only -- never written to $GITHUB_ENV, so the job-level engineering-account credentials configured above stay untouched once this step ends.
+          ACTUAL_ACCOUNT="$(AWS_ACCESS_KEY_ID="$SEC_TMP_KEY_ID" AWS_SECRET_ACCESS_KEY="$SEC_TMP_SECRET" AWS_SESSION_TOKEN="$SEC_TMP_TOKEN" aws sts get-caller-identity --query Account --output text --region "$AWS_REGION")"
+          if [ -z "$ACTUAL_ACCOUNT" ] || [ "$ACTUAL_ACCOUNT" != "$EXPECTED_WORKLOAD_ACCOUNT_ID" ]; then
+            echo "FAIL: assumed role resolved to caller account '${ACTUAL_ACCOUNT}', expected the GoldenGate workload account ${EXPECTED_WORKLOAD_ACCOUNT_ID}. Refusing to call Secrets Manager."
+            unset SEC_TMP_KEY_ID SEC_TMP_SECRET SEC_TMP_TOKEN
+            exit 1
+          fi
+          echo "OK: assumed-role caller identity is account ${ACTUAL_ACCOUNT} in region ${AWS_REGION}, matching the expected GoldenGate workload account."
+
+          # DescribeSecret/ListSecretVersionIds only -- never GetSecretValue. No secret is created, mutated, or rotated here. Every call below runs under the assumed workload-account credentials only, never the job's base engineering-account credentials.
           FAILED=0
           while IFS= read -r secret_name; do
             [ -z "$secret_name" ] && continue
             echo "Checking ${secret_name}..."
-            if ! aws secretsmanager describe-secret --secret-id "$secret_name" --region "$AWS_REGION" >/dev/null; then
+            if ! AWS_ACCESS_KEY_ID="$SEC_TMP_KEY_ID" AWS_SECRET_ACCESS_KEY="$SEC_TMP_SECRET" AWS_SESSION_TOKEN="$SEC_TMP_TOKEN" aws secretsmanager describe-secret --secret-id "$secret_name" --region "$AWS_REGION" >/dev/null; then
               echo "FAIL: ${secret_name} does not exist or is not accessible."
               FAILED=1
               continue
             fi
-            STAGES_JSON="$(aws secretsmanager list-secret-version-ids --secret-id "$secret_name" --region "$AWS_REGION" --include-deprecated --output json)"
+            STAGES_JSON="$(AWS_ACCESS_KEY_ID="$SEC_TMP_KEY_ID" AWS_SECRET_ACCESS_KEY="$SEC_TMP_SECRET" AWS_SESSION_TOKEN="$SEC_TMP_TOKEN" aws secretsmanager list-secret-version-ids --secret-id "$secret_name" --region "$AWS_REGION" --include-deprecated --output json)"
             if ! python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if any("AWSCURRENT" in v.get("VersionStages", []) for v in d.get("Versions", [])) else 1)' <<< "$STAGES_JSON"; then
               echo "FAIL: ${secret_name} has no AWSCURRENT version."
               FAILED=1
@@ -209,6 +236,8 @@ jobs:
             fi
             echo "OK: ${secret_name} exists with an AWSCURRENT version."
           done < <(python3 hack/goldengate-deployment-model.py --environment dev shared-secrets)
+
+          unset SEC_TMP_KEY_ID SEC_TMP_SECRET SEC_TMP_TOKEN
 
           if [ "$FAILED" -ne 0 ]; then
             exit 1

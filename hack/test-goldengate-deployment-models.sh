@@ -6807,13 +6807,14 @@ else
   skip "31: work/generated tracking check -- not a git repository"
 fi
 
-# Static evidence only: GOLDENGATE_AWS_ROLE_ARN's live value is a GitHub repo setting, unverifiable offline.
+# Static evidence only: GOLDENGATE_AWS_ROLE_ARN and EKS_DEPLOY_ROLE_ARN's live values are GitHub repo settings, unverifiable offline. Corrected for the VDR cross-account fix: validate_shared_secrets_once now starts from GOLDENGATE_AWS_ROLE_ARN (engineering account, via env.ROLE_ARN) like every other job, then separately assumes EKS_DEPLOY_ROLE_ARN in-step before any Secrets Manager call -- it is that second, workload-account role (GoldenGateEKSDeployRole-dev) that static evidence ties to the policy carrying the required read-only shared-secret permissions.
 if grep -q "role-to-assume: \${{ env.ROLE_ARN }}" "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && grep -qE 'aws sts assume-role --role-arn "\$EKS_DEPLOY_ROLE_ARN"' "$EKS_APP_WORKFLOW" 2>/dev/null \
     && grep -q 'name          = "GoldenGateEKSDeployRole-dev"' envs/dev/iam.tf 2>/dev/null \
     && grep -q 'policy_folder = "goldengate-eks-deploy-dev"' envs/dev/iam.tf 2>/dev/null; then
-  pass "31: validate_shared_secrets_once assumes the same GOLDENGATE_AWS_ROLE_ARN role used everywhere else, and static evidence ties it to the policy carrying the required read-only shared-secret permissions (live value unverifiable offline)"
+  pass "31: validate_shared_secrets_once starts from the same GOLDENGATE_AWS_ROLE_ARN role used everywhere else, then in-step assumes EKS_DEPLOY_ROLE_ARN before any Secrets Manager call; static evidence ties that workload role to the policy carrying the required read-only shared-secret permissions (live values unverifiable offline)"
 else
-  fail "31: static evidence linking GOLDENGATE_AWS_ROLE_ARN to the read-only shared-secret policy is incomplete"
+  fail "31: static evidence linking the validate_shared_secrets_once credential chain to the read-only shared-secret policy is incomplete"
 fi
 
 echo ""
@@ -8275,6 +8276,183 @@ STUBEOF
   fi
 else
   skip "2: end-to-end streaming/sanitization behavioral test -- python3/PyYAML unavailable"
+fi
+
+echo ""
+echo "--- VDR correction: validate_shared_secrets_once cross-account credential fix ---"
+
+# Real VDR evidence: validate_shared_secrets_once's base credentials (role-to-assume: env.ROLE_ARN) resolve to the engineering/runner account (229410149234), so its DescribeSecret calls were hitting the wrong account and failing with ResourceNotFoundException even though the three secrets genuinely exist in the workload account (668311715351). Fix reuses the SAME established cross-account pattern as managed_efs_inventory_guard: assume EKS_DEPLOY_ROLE_ARN, verify the assumed caller's own account before any Secrets Manager call, mask the temporary credentials, and never call GetSecretValue.
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  python3 - "$EKS_APP_WORKFLOW" > "${WORKDIR}/shared_secrets_step.sh" <<'PYEOF'
+import sys
+import yaml
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+steps = doc["jobs"]["validate_shared_secrets_once"]["steps"]
+for step in steps:
+    if step.get("name", "").startswith("Verify each shared secret exists"):
+        # PyYAML/pip access a real package index and are unavailable/unnecessary in this sandboxed behavioral test -- PyYAML is already proven present ($PYTHON_AVAILABLE), so this single install line is stripped before execution; nothing else in the step is touched.
+        lines = [l for l in step["run"].splitlines() if "pip install" not in l]
+        sys.stdout.write("\n".join(lines))
+        break
+else:
+    sys.exit("step not found")
+PYEOF
+
+  if [ ! -s "${WORKDIR}/shared_secrets_step.sh" ]; then
+    fail "VDR: could not extract the 'Verify each shared secret exists...' step from ${EKS_APP_WORKFLOW}"
+  else
+    STEP_TEXT="$(cat "${WORKDIR}/shared_secrets_step.sh")"
+    ASSUME_LINE="$(printf '%s\n' "$STEP_TEXT" | grep -n 'aws sts assume-role' | head -1 | cut -d: -f1 || true)"
+    IDENTITY_LINE="$(printf '%s\n' "$STEP_TEXT" | grep -n 'aws sts get-caller-identity' | head -1 | cut -d: -f1 || true)"
+    FAILCLOSED_LINE="$(printf '%s\n' "$STEP_TEXT" | grep -n 'Refusing to call Secrets Manager' | head -1 | cut -d: -f1 || true)"
+    DESCRIBE_LINE="$(printf '%s\n' "$STEP_TEXT" | grep -n 'aws secretsmanager describe-secret' | head -1 | cut -d: -f1 || true)"
+
+    if [ -n "$ASSUME_LINE" ] && [ -n "$IDENTITY_LINE" ] && [ -n "$FAILCLOSED_LINE" ] && [ -n "$DESCRIBE_LINE" ] \
+        && [ "$ASSUME_LINE" -lt "$IDENTITY_LINE" ] && [ "$IDENTITY_LINE" -lt "$FAILCLOSED_LINE" ] && [ "$FAILCLOSED_LINE" -lt "$DESCRIBE_LINE" ]; then
+      pass "VDR 2/4/5: validate_shared_secrets_once assumes EKS_DEPLOY_ROLE_ARN, verifies caller-identity, and fails closed on a mismatch -- all strictly before the first DescribeSecret call, so DescribeSecret can never execute before a successful, verified workload-role assumption"
+    else
+      fail "VDR 2/4/5: assume-role / caller-identity-check / fail-closed / DescribeSecret ordering is missing or out of sequence in validate_shared_secrets_once"
+    fi
+  fi
+else
+  skip "VDR: step-extraction/ordering checks -- python3/PyYAML unavailable"
+fi
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  FIRST_STEP_CHECK="$(python3 -c '
+import sys
+import yaml
+with open("'"$EKS_APP_WORKFLOW"'") as f:
+    doc = yaml.safe_load(f)
+steps = doc["jobs"]["validate_shared_secrets_once"]["steps"]
+cred_steps = [s for s in steps if s.get("uses", "").startswith("aws-actions/configure-aws-credentials")]
+ok = len(cred_steps) == 1 and cred_steps[0].get("with", {}).get("role-to-assume") == "${{ env.ROLE_ARN }}"
+print("OK" if ok else "FAIL")
+')"
+  if [ "$FIRST_STEP_CHECK" = "OK" ]; then
+    pass "VDR 1: validate_shared_secrets_once still starts by configuring AWS credentials via the engineering RunnerRole (env.ROLE_ARN), exactly as today -- the fix adds a second, in-step assume-role, it does not replace the job-level OIDC credential step"
+  else
+    fail "VDR 1: validate_shared_secrets_once no longer starts from the engineering RunnerRole (env.ROLE_ARN) via aws-actions/configure-aws-credentials"
+  fi
+else
+  skip "VDR 1: base-credential-step check -- python3/PyYAML unavailable"
+fi
+
+if grep -qE 'EXPECTED_WORKLOAD_ACCOUNT_ID="\$\(echo "\$EKS_DEPLOY_ROLE_ARN" \| sed -nE' "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && grep -qE 'ACTUAL_ACCOUNT="\$\(AWS_ACCESS_KEY_ID="\$SEC_TMP_KEY_ID"' "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "VDR 3: the workload role's target account is derived from EKS_DEPLOY_ROLE_ARN itself (the same established derivation managed_efs_inventory_guard already uses) and the post-assume-role caller identity is checked against it -- for the dev environment this expected account is 668311715351, the same value EKS_ACCOUNT_ID (vars.ACCOUNT_ID_DEV) documents"
+else
+  fail "VDR 3: validate_shared_secrets_once does not derive/verify the expected workload-account ID before calling Secrets Manager"
+fi
+
+if grep -qE '"\$ACTUAL_ACCOUNT" != "\$EXPECTED_WORKLOAD_ACCOUNT_ID"' "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && grep -qE '\[ -z "\$ACTUAL_ACCOUNT" \]' "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "VDR 5: an empty or mismatched caller-identity account fails the step closed before any Secrets Manager call"
+else
+  fail "VDR 5: validate_shared_secrets_once does not fail closed on an empty/mismatched caller-identity account"
+fi
+
+SHARED_SECRETS_JOB_TEXT="$(awk '/^  validate_shared_secrets_once:/{flag=1} flag && /^  [a-zA-Z_]+:$/ && !/^  validate_shared_secrets_once:/{if(NR>1 && flag2) exit} flag{print; flag2=1}' "$EKS_APP_WORKFLOW" 2>/dev/null || true)"
+# Matches the real CLI invocation only ("aws secretsmanager get-secret-value") -- not the bare word "GetSecretValue", which legitimately appears once in this job as an explanatory "never call this" comment.
+if ! printf '%s' "$SHARED_SECRETS_JOB_TEXT" | grep -qi "secretsmanager get-secret-value"; then
+  pass "VDR 8: no 'aws secretsmanager get-secret-value' call exists anywhere in the validate_shared_secrets_once job (GetSecretValue is mentioned once only, in a comment explaining it must never be called)"
+else
+  fail "VDR 8: validate_shared_secrets_once job text contains an actual secretsmanager get-secret-value call"
+fi
+
+if printf '%s' "$SHARED_SECRETS_JOB_TEXT" | grep -qE -- '--region "\$AWS_REGION"'; then
+  pass "VDR 6: the region used for the workload-account Secrets Manager/STS calls remains \$AWS_REGION (eu-west-1 for dev), unchanged"
+else
+  fail "VDR 6: validate_shared_secrets_once no longer scopes its AWS calls to \$AWS_REGION"
+fi
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  SECRET_NAME_CHECK="$(python3 -c '
+import re
+with open("hack/goldengate-deployment-model.py") as f:
+    text = f.read()
+assert re.search(r"def resolve_admin_secret\(environment, role\):", text)
+assert re.search(r"return f\"\{environment\}/goldengate/\{role\}/admin\"", text)
+assert re.search(r"def resolve_tls_secret\(environment\):", text)
+assert re.search(r"return f\"\{environment\}/goldengate/tls-certificate\"", text)
+print("OK")
+' 2>&1)"
+  if [ "$SECRET_NAME_CHECK" = "OK" ]; then
+    pass "VDR 7: the exact secret-name derivation (<environment>/goldengate/source|target/admin, <environment>/goldengate/tls-certificate) is unchanged -- for dev this remains dev/goldengate/source/admin, dev/goldengate/target/admin, dev/goldengate/tls-certificate"
+  else
+    fail "VDR 7: secret-name derivation in hack/goldengate-deployment-model.py has changed: ${SECRET_NAME_CHECK}"
+  fi
+else
+  skip "VDR 7: secret-name derivation check -- python3 unavailable"
+fi
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -s "${WORKDIR}/shared_secrets_step.sh" ]; then
+  STUB_DIR2="${WORKDIR}/aws-stub-secrets"
+  mkdir -p "$STUB_DIR2"
+  cat > "${STUB_DIR2}/aws" <<'STUBEOF'
+#!/bin/bash
+if [ "$1" = "sts" ] && [ "$2" = "assume-role" ]; then
+  echo '{"Credentials":{"AccessKeyId":"FAKEKEY2","SecretAccessKey":"FAKESECRET2","SessionToken":"FAKETOKEN2"}}'
+elif [ "$1" = "sts" ] && [ "$2" = "get-caller-identity" ]; then
+  echo "668311715351"
+elif [ "$1" = "secretsmanager" ] && [ "$2" = "describe-secret" ]; then
+  echo '{"ARN":"arn:aws:secretsmanager:eu-west-1:668311715351:secret:stub"}'
+elif [ "$1" = "secretsmanager" ] && [ "$2" = "list-secret-version-ids" ]; then
+  echo '{"Versions":[{"VersionId":"1","VersionStages":["AWSCURRENT"]}]}'
+else
+  echo "unexpected aws call: $*" >&2
+  exit 1
+fi
+STUBEOF
+  chmod +x "${STUB_DIR2}/aws"
+
+  set +e
+  SECRETS_TEST_OUT="$(PATH="${STUB_DIR2}:${PATH}" \
+    EKS_DEPLOY_ROLE_ARN="arn:aws:iam::668311715351:role/GoldenGateEKSDeployRole-dev" \
+    AWS_REGION="eu-west-1" GITHUB_RUN_ID="1" GITHUB_RUN_ATTEMPT="1" \
+    bash "${WORKDIR}/shared_secrets_step.sh" 2>&1)"
+  SECRETS_TEST_STATUS=$?
+  set -e
+
+  MASKED_OK=1
+  for SECRET_VAL in FAKEKEY2 FAKESECRET2 FAKETOKEN2; do
+    MASK_HITS="$(printf '%s\n' "$SECRETS_TEST_OUT" | grep -c "^::add-mask::${SECRET_VAL}\$" || true)"
+    LEAK_HITS="$(printf '%s\n' "$SECRETS_TEST_OUT" | grep -v '^::add-mask::' | grep -c "$SECRET_VAL" || true)"
+    if [ "$MASK_HITS" -lt 1 ] || [ "$LEAK_HITS" -ne 0 ]; then
+      MASKED_OK=0
+    fi
+  done
+
+  if [ "$SECRETS_TEST_STATUS" -eq 0 ] \
+      && echo "$SECRETS_TEST_OUT" | grep -qF "assumed-role caller identity is account 668311715351" \
+      && echo "$SECRETS_TEST_OUT" | grep -qF "dev/goldengate/source/admin exists with an AWSCURRENT version" \
+      && echo "$SECRETS_TEST_OUT" | grep -qF "dev/goldengate/target/admin exists with an AWSCURRENT version" \
+      && echo "$SECRETS_TEST_OUT" | grep -qF "dev/goldengate/tls-certificate exists with an AWSCURRENT version" \
+      && [ "$MASKED_OK" -eq 1 ]; then
+    pass "VDR 9/10: the real extracted validate_shared_secrets_once step, run end-to-end against a stubbed aws CLI, assumes the workload role, verifies its account, validates all three exact secret names read-only, and every temporary credential value appears ONLY inside its own ::add-mask:: directive -- never elsewhere in the step's output (no secret content is logged either, since the stub never returns any)"
+  else
+    fail "VDR 9/10: the extracted validate_shared_secrets_once step did not behave correctly, or leaked/failed to mask a temporary credential, against the stubbed aws CLI"
+    echo "$SECRETS_TEST_OUT"
+  fi
+
+  rm -rf "$STUB_DIR2"
+else
+  skip "VDR 9/10: end-to-end credential-fix behavioral test -- python3/PyYAML unavailable or step extraction failed"
+fi
+
+# VDR 11/12/13/14: unchanged by this narrowly-scoped credential fix -- covered by their own dedicated, still-passing suites/sections rather than duplicated here: hack/test-goldengate-managed-efs-inventory-guard.py (managed-EFS inventory guard, item 11), the "Production hardening, Item 1" section above plus envs/dev/efs.tf itself (Terraform/EFS architecture, item 12), the Phase 6D0/6D0-Final Oracle/PostgreSQL runtime-identity sections above (item 13, replication.enabled=false unchanged), and hack/test-goldengate-replication.py (PostgreSQL->MSSQL Phase 6D1 constants, item 14).
+if ! grep -q 'goldengate_efs_throughput_mode\|throughput_mode\s*=\s*"elastic"\|throughput_mode\s*=\s*"provisioned"' envs/dev/efs.tf 2>/dev/null; then
+  pass "VDR 12: envs/dev/efs.tf's throughput_mode contract (fixed in the immediately-preceding turn) is untouched by this credential-only fix"
+else
+  fail "VDR 12: envs/dev/efs.tf's throughput_mode contract was unexpectedly modified by this turn"
+fi
+
+if grep -q 'replication:' envs/dev/gg-oracle-payments-01/values.yaml 2>/dev/null && grep -qE '^\s*enabled:\s*false' envs/dev/gg-oracle-payments-01/values.yaml 2>/dev/null; then
+  pass "VDR 13: gg-oracle-payments-01/values.yaml still declares replication.enabled=false, unchanged by this credential-only fix"
+else
+  fail "VDR 13: gg-oracle-payments-01/values.yaml's replication.enabled=false declaration is missing or was modified"
 fi
 
 echo ""
