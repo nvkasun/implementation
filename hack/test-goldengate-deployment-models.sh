@@ -8735,6 +8735,93 @@ fi
 # 15: deploy=false performing no Argo/EKS runtime mutation is unrelated to this image-validation fix and remains covered by the existing dry-run-unreachable structural proof earlier in this suite (see "Correction pass, Issue ..." sections above). 16/17/18/19: cross-account shared-secret fix (previous VDR turn), EFS/Terraform architecture, Oracle/PostgreSQL descriptors + replication=false, and PostgreSQL->MSSQL Phase 6D1 are all unrelated to this narrowly-scoped rendered-image validation fix and remain covered by their own dedicated, still-passing sections/suites above (the "VDR correction: validate_shared_secrets_once..." section, the "Production hardening, Item 1" section, the Phase 6D0 Oracle/PostgreSQL sections, and hack/test-goldengate-replication.py respectively) -- none of items 15-19 are re-proved here, to avoid duplicating that logic.
 
 echo ""
+echo "--- VDR correction: monitor_dry_run_validation runner (CodeBuild -> ubuntu-latest) ---"
+
+# Real VDR evidence: the deploy=false dry-run reached monitor_dry_run_validation and failed at "Set up Python" with "Version 3.12 was not found in the local cache" -- the CodeBuild/self-hosted runner image does not carry the actions/setup-python 3.12 x64 distribution. This is a runner/toolchain gap, not a monitor application, requirements.txt, EFS, ECR, or EKS defect: the job performs only local/read-only CI validation (checkout, Python 3.12 setup, pip install, unit tests, folder-driven registry generation, Helm lint/template) and needs no AWS/EKS/Argo access at all, so it moves to the standard ubuntu-latest runner. No other job's runner changes.
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  MONITOR_DRY_RUN_CHECK="$(python3 -c '
+import yaml
+with open("'"$EKS_APP_WORKFLOW"'") as f:
+    doc = yaml.safe_load(f)
+job = doc["jobs"]["monitor_dry_run_validation"]
+results = []
+
+results.append(("1: runs-on is ubuntu-latest", job.get("runs-on") == "ubuntu-latest"))
+results.append(("2: runs-on is not the codebuild runner expression", "codebuild-" not in str(job.get("runs-on"))))
+
+steps = job.get("steps", [])
+py_steps = [s for s in steps if s.get("uses", "").startswith("actions/setup-python@v5")]
+results.append(("3: keeps actions/setup-python@v5", len(py_steps) == 1))
+py_with = py_steps[0].get("with", {}) if py_steps else {}
+results.append(("4: keeps python-version 3.12", py_with.get("python-version") == "3.12"))
+results.append(("5: keeps cache: pip", py_with.get("cache") == "pip"))
+cache_dep_path = py_with.get("cache-dependency-path", "") or ""
+results.append((
+    "5: keeps cache-dependency-path for both monitor requirement files",
+    "monitoring/monitor/requirements.txt" in cache_dep_path and "monitoring/monitor/requirements-test.txt" in cache_dep_path,
+))
+
+all_run_text = "\n".join(s.get("run", "") for s in steps)
+results.append((
+    "6: installs runtime + test requirements",
+    "-r monitoring/monitor/requirements.txt" in all_run_text and "-r monitoring/monitor/requirements-test.txt" in all_run_text,
+))
+results.append(("7: runs monitor unit tests", "python3 -m unittest discover -s monitoring/monitor/tests" in all_run_text))
+results.append((
+    "8: generates the folder-driven registry",
+    "goldengate-deployment-model.py --environment dev registry" in all_run_text,
+))
+results.append(("9: performs Helm lint locally", "helm lint" in all_run_text))
+results.append(("9: performs Helm template locally", "helm template" in all_run_text))
+
+uses_list = [s.get("uses", "") for s in steps]
+results.append(("10: no configure-aws-credentials step", not any("aws-actions/configure-aws-credentials" in u for u in uses_list)))
+results.append(("11: does not assume an AWS role", "assume-role" not in all_run_text and "role-to-assume" not in str(job)))
+results.append(("12: performs no kubectl command", "kubectl " not in all_run_text))
+results.append(("13: performs no Argo mutation", "argocd" not in all_run_text.lower()))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+' 2>&1)"
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL\ *) fail "VDR-MON: ${line#FAIL }" ;;
+      OK\ *) pass "VDR-MON: ${line#OK }" ;;
+    esac
+  done <<< "$MONITOR_DRY_RUN_CHECK"
+else
+  skip "VDR-MON: monitor_dry_run_validation structural checks -- python3/PyYAML unavailable"
+fi
+
+if grep -qF "if: \${{ needs.validate_model.outputs.effective_deploy == 'false' && always() && needs.validate_shared_secrets_once.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' && needs.replication_dry_run_validation.result != 'failure' && needs.replication_dry_run_validation.result != 'cancelled' }}" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "VDR-MON 14: monitor_dry_run_validation's deploy=false job-gating if: condition is byte-for-byte unchanged -- only its runs-on changed"
+else
+  fail "VDR-MON 14: monitor_dry_run_validation's deploy=false job-gating if: condition was unexpectedly modified"
+fi
+
+if grep -qF "uses: ./.github/workflows/goldengate-monitor.yaml" "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && grep -qF "deploy: true" "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && grep -qF "needs.validate_model.outputs.effective_deploy == 'true' && always() && needs.validate_shared_secrets_once.result == 'success'" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "VDR-MON 15: monitor_sync_once's deploy=true reusable-workflow call (goldengate-monitor.yaml, deploy: true) and its job-gating if: condition are unchanged"
+else
+  fail "VDR-MON 15: monitor_sync_once's deploy=true path appears to have changed"
+fi
+
+if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  MONITOR_WORKFLOW_DIFF="$(git diff -- "$MONITOR_WORKFLOW" 2>/dev/null || true)"
+  if [ -z "$MONITOR_WORKFLOW_DIFF" ]; then
+    pass "VDR-MON 16: ${MONITOR_WORKFLOW} (real monitor_sync_once deployment behavior) has no diff -- untouched by this dry-run-only runner fix"
+  else
+    fail "VDR-MON 16: ${MONITOR_WORKFLOW} was unexpectedly modified by this dry-run-only runner fix"
+  fi
+else
+  skip "VDR-MON 16: ${MONITOR_WORKFLOW} diff check -- not a git repository"
+fi
+
+# 17/18/19/20/21: cross-account Secrets Manager fix, structural runtime-image validation fix, EFS/Terraform architecture, Oracle/PostgreSQL descriptors + replication=false, and PostgreSQL->MSSQL Phase 6D1 are all unrelated to this narrowly-scoped monitor_dry_run_validation runner fix and remain covered by their own dedicated, still-passing sections/suites above (the "VDR correction: validate_shared_secrets_once..." section, the "VDR correction: structural rendered-image validation..." section, the "Production hardening, Item 1" section, the Phase 6D0 Oracle/PostgreSQL sections, and hack/test-goldengate-replication.py respectively) -- not re-proved here, to avoid duplicating that logic.
+
+echo ""
 echo "=================================================="
 echo "Summary: ${PASS_COUNT} passed, ${FAIL_COUNT} failed, ${SKIP_COUNT} skipped"
 echo "=================================================="

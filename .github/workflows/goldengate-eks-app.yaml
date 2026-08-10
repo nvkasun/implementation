@@ -2482,7 +2482,8 @@ jobs:
       - replication_dry_run_validation
     if: ${{ needs.validate_model.outputs.effective_deploy == 'false' && always() && needs.validate_shared_secrets_once.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' && needs.replication_dry_run_validation.result != 'failure' && needs.replication_dry_run_validation.result != 'cancelled' }}
 
-    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+    # Local/read-only CI validation only (checkout, Python, pip install, unit tests, folder-driven registry generation, Helm lint/template) -- no AWS credentials, no EKS access, no Argo CD/Kubernetes mutation, so it does not need (and must not depend on) the private CodeBuild runtime that every real cloud-mutating job in this workflow uses. This job's own CodeBuild runner did not carry the actions/setup-python Python 3.12 x64 distribution ("Version 3.12 was not found in the local cache"), which is a runner/toolchain issue, not a monitor application defect -- switching this ONE dry-run job to the standard GitHub-hosted runner fixes it without touching monitor_sync_once or any other job's runner.
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
