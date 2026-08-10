@@ -16,18 +16,7 @@ data "aws_security_group" "goldengate_efs_shared" {
   }
 }
 
-# NOT independently confirmed for ADCB dev/production -- VDR/platform must confirm before apply. "enhanced" is never a valid AWS/Terraform throughput_mode value and has been removed. The default "elastic" is informed by the one piece of real reference Terraform this engagement has for a GoldenGate EFS (the manager reference repo's terraform/platform/efs.tf, which itself labels its whole file as an ephemeral-lab configuration, so this is suggestive evidence, not proof of ADCB's intended production value) -- kept as an explicit, strictly-validated environment-level variable (never a per-deployment values.yaml setting, since no existing architecture requires per-runtime EFS performance profiles) specifically so the real value can be confirmed/overridden without touching the module call itself.
-variable "goldengate_efs_throughput_mode" {
-  description = "AWS EFS throughput mode for every managed GoldenGate runtime filesystem in this environment. Must be confirmed against the real ADCB VDR/platform intent before apply; default is evidence-informed, not proven."
-  type        = string
-  default     = "elastic"
-  validation {
-    condition     = contains(["elastic", "provisioned", "bursting"], var.goldengate_efs_throughput_mode)
-    error_message = "goldengate_efs_throughput_mode must be exactly one of: elastic, provisioned, bursting."
-  }
-}
-
-# One approved-module instance per managed-mode runtime deployment, keyed by deployment ID -- module.goldengate_runtime_efs["gg-a"] and module.goldengate_runtime_efs["gg-b"] are two dedicated filesystems even though both live in this one Terraform state. `name` is the deterministic creation token; the approved module's v1.0.0 source has been manually verified to set `creation_token = var.name`, so this is an exact, verified contract, not an assumption.
+# One approved-module instance per managed-mode runtime deployment, keyed by deployment ID -- module.goldengate_runtime_efs["gg-a"] and module.goldengate_runtime_efs["gg-b"] are two dedicated filesystems even though both live in this one Terraform state. `name` is the deterministic creation token; the approved module's v1.0.0 source has been manually verified to set `creation_token = var.name`, so this is an exact, verified contract, not an assumption. THROUGHPUT CONTRACT WARNING: v1.0.0 does NOT pass throughput_mode straight through to the AWS API -- its verified resource code is `throughput_mode = (var.throughput_mode == "enhanced" ? "elastic" : "bursting")`, so the module INPUT "enhanced" is what produces the AWS EFS API value "elastic" (any other input, including the raw AWS value "elastic" itself, falls through to "bursting"); this exact input/output pair is proven by the real existing filesystem fs-05cadf3570f23cd39 ("gg-poc-dev-efs", AWS-reported Performance mode=General Purpose / Throughput mode=Elastic), created by this same module with performance_mode="generalPurpose"/throughput_mode="enhanced". Do NOT replace "enhanced" below with the raw AWS value "elastic" without re-reading the module's actual resource code first -- v1.0.0 also has no provisioned-throughput branch, so "provisioned" is not a valid input either.
 module "goldengate_runtime_efs" {
   for_each = local.goldengate_managed_efs_deployments
   source   = "git::https://github.com/AbuDhabiCommercialBank/aws-tf-module-efs?ref=v1.0.0"
@@ -35,7 +24,7 @@ module "goldengate_runtime_efs" {
   name             = each.value.creation_token
   env              = var.environment
   performance_mode = "generalPurpose"
-  throughput_mode  = var.goldengate_efs_throughput_mode
+  throughput_mode  = "enhanced"
 
   existing_security_group_ids = [data.aws_security_group.goldengate_efs_shared[0].id]
 

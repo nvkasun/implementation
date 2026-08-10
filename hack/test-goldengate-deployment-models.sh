@@ -8142,56 +8142,60 @@ else
 fi
 
 echo ""
-echo "--- Production hardening, Item 1: EFS throughput_mode ---"
+echo "--- Production hardening, Item 1: EFS throughput_mode (module-input vs AWS-API contract correction) ---"
 
-if ! grep -qE 'throughput_mode\s*=\s*"enhanced"' envs/dev/efs.tf 2>/dev/null; then
-  pass "1: throughput_mode is never assigned the invalid value \"enhanced\" (not a real AWS/Terraform EFS throughput_mode) anywhere in envs/dev/efs.tf"
+# CORRECTED per real AWS evidence (fs-05cadf3570f23cd39, name gg-poc-dev-efs, AWS-reported Throughput mode=Elastic) plus the verified aws-tf-module-efs?ref=v1.0.0 resource source: the module does NOT pass var.throughput_mode straight through -- it applies `throughput_mode = (var.throughput_mode == "enhanced" ? "elastic" : "bursting")`. The module INPUT "enhanced" is therefore the ONLY correct value; the earlier assertions in this section (which required "enhanced" to be absent, and required a goldengate_efs_throughput_mode variable accepting elastic/provisioned/bursting) were themselves wrong and have been replaced below.
+
+if grep -qE 'source\s*=\s*"git::https://github\.com/AbuDhabiCommercialBank/aws-tf-module-efs\?ref=v1\.0\.0"' envs/dev/efs.tf 2>/dev/null; then
+  pass "1: goldengate_runtime_efs remains pinned exactly to aws-tf-module-efs?ref=v1.0.0"
 else
-  fail "1: envs/dev/efs.tf still assigns the invalid throughput_mode value \"enhanced\""
+  fail "1: envs/dev/efs.tf does not pin goldengate_runtime_efs to aws-tf-module-efs?ref=v1.0.0"
 fi
 
-if grep -qE '^\s*variable\s+"goldengate_efs_throughput_mode"' envs/dev/efs.tf 2>/dev/null \
-    && grep -qE '^\s*throughput_mode\s*=\s*var\.goldengate_efs_throughput_mode' envs/dev/efs.tf 2>/dev/null; then
-  pass "1: throughput_mode is an explicit environment-level Terraform variable (goldengate_efs_throughput_mode) wired into the module call, not a bare literal"
+if grep -qE '^\s*performance_mode\s*=\s*"generalPurpose"\s*$' envs/dev/efs.tf 2>/dev/null; then
+  pass "1: performance_mode passed to the module is the literal \"generalPurpose\", matching the real fs-05cadf3570f23cd39 evidence"
 else
-  fail "1: envs/dev/efs.tf does not wire an explicit goldengate_efs_throughput_mode variable into the module's throughput_mode input"
+  fail "1: envs/dev/efs.tf does not pass performance_mode = \"generalPurpose\" to the module"
 fi
 
-if grep -qE 'contains\(\["elastic",\s*"provisioned",\s*"bursting"\],\s*var\.goldengate_efs_throughput_mode\)' envs/dev/efs.tf 2>/dev/null; then
-  pass "1: goldengate_efs_throughput_mode has a strict validation block allowing only the three real AWS API values (elastic/provisioned/bursting)"
+if grep -qE '^\s*throughput_mode\s*=\s*"enhanced"\s*$' envs/dev/efs.tf 2>/dev/null; then
+  pass "1: throughput_mode module input is the literal \"enhanced\" -- the only module input proven (via fs-05cadf3570f23cd39 and the verified v1.0.0 resource ternary) to produce AWS EFS throughput mode Elastic"
 else
-  fail "1: goldengate_efs_throughput_mode is missing the required strict validation block"
+  fail "1: envs/dev/efs.tf does not pass throughput_mode = \"enhanced\" to the module"
 fi
 
-if ! grep -q 'goldengate_efs_throughput_mode' envs/dev/gg-*-payments-01/values.yaml 2>/dev/null; then
-  pass "1: throughput mode is not exposed as a per-deployment values.yaml setting -- no existing architecture requires per-runtime EFS performance profiles"
+if ! grep -qE 'throughput_mode\s*=\s*"elastic"' envs/dev/efs.tf 2>/dev/null; then
+  pass "1: the code never passes the raw AWS API value \"elastic\" directly as the module's throughput_mode input (that would fall through v1.0.0's ternary else-branch to \"bursting\")"
+else
+  fail "1: envs/dev/efs.tf passes the raw AWS value \"elastic\" directly as throughput_mode to the module -- this silently produces \"bursting\" in v1.0.0"
+fi
+
+if ! grep -qE 'throughput_mode\s*=\s*"provisioned"' envs/dev/efs.tf 2>/dev/null; then
+  pass "1: the code never passes \"provisioned\" as the module's throughput_mode input -- v1.0.0's verified resource code has no provisioned-throughput branch"
+else
+  fail "1: envs/dev/efs.tf passes \"provisioned\" as throughput_mode to the module, which v1.0.0 does not support"
+fi
+
+if ! grep -qE '^\s*variable\s+"goldengate_efs_throughput_mode"' envs/dev/efs.tf 2>/dev/null \
+    && ! grep -qE 'var\.goldengate_efs_throughput_mode' envs/dev/efs.tf 2>/dev/null; then
+  pass "1: throughput_mode is a hardcoded module-input literal (Option A) -- no environment-level goldengate_efs_throughput_mode variable exists to drift from the verified single-environment module contract"
+else
+  fail "1: envs/dev/efs.tf still references a goldengate_efs_throughput_mode variable -- if retained it must default to \"enhanced\" and allow only the verified module-input contract"
+fi
+
+if ! grep -q 'throughput_mode' envs/dev/gg-*-payments-01/values.yaml 2>/dev/null; then
+  pass "1: throughput mode is not exposed as a per-deployment values.yaml setting -- it remains an environment/platform storage policy, not an application-owner runtime setting"
 else
   fail "1: throughput mode leaked into a per-deployment values.yaml setting"
 fi
 
-if [ "$PYTHON_AVAILABLE" = "true" ]; then
-  set +e
-  THROUGHPUT_VALIDATION_OUT="$(python3 -c '
-import re
-with open("envs/dev/efs.tf") as f:
-    text = f.read()
-m = re.search(r"variable \"goldengate_efs_throughput_mode\" \{(.*?)\n\}", text, re.S)
-assert m, "variable block not found"
-block = m.group(1)
-assert "elastic" in block and "provisioned" in block and "bursting" in block, "not all three valid values present in the validation condition"
-assert "enhanced" not in block, "the invalid value leaked into the variable block"
-print("OK")
-' 2>&1)"
-  THROUGHPUT_VALIDATION_STATUS=$?
-  set -e
-  if [ "$THROUGHPUT_VALIDATION_STATUS" -eq 0 ]; then
-    pass "1: the throughput_mode variable's validation set is exactly {elastic, provisioned, bursting}, never including the invalid \"enhanced\" value"
-  else
-    fail "1: throughput_mode variable validation structure check failed: ${THROUGHPUT_VALIDATION_OUT}"
-  fi
+if grep -q 'fs-05cadf3570f23cd39' envs/dev/efs.tf 2>/dev/null; then
+  pass "1: envs/dev/efs.tf documents the real fs-05cadf3570f23cd39 evidence backing the enhanced->elastic module-input mapping, for future maintainers"
 else
-  skip "1: throughput_mode variable structure check -- python3 unavailable"
+  fail "1: envs/dev/efs.tf lost the fs-05cadf3570f23cd39 evidence reference that justifies the enhanced module input"
 fi
+
+# Items 8 (Oracle/PostgreSQL descriptors unchanged), 9 (historical EFS ID fs-05cadf3570f23cd39 unchanged), 10 (no replication code changes), and 11 (PostgreSQL->MSSQL Phase 6D1 constants unchanged) are covered by their own pre-existing, still-passing sections of this suite and by hack/test-goldengate-replication.py -- not duplicated here since this section is scoped to the throughput_mode contract only. Item 12 (managed-EFS inventory guard tests) is covered by hack/test-goldengate-managed-efs-inventory-guard.py, run separately as part of the full validation sweep.
 
 echo ""
 echo "--- Production hardening, Item 2: stream DescribeFileSystems safely ---"
