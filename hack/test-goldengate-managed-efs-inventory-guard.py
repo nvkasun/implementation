@@ -8,6 +8,12 @@ import unittest
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL_PATH = os.path.join(REPO_ROOT, "hack", "goldengate-managed-efs-inventory-guard.py")
 
+try:
+    import yaml  # noqa: F401
+    _PYYAML_AVAILABLE = True
+except ImportError:
+    _PYYAML_AVAILABLE = False
+
 
 def _load_tool():
     spec = importlib.util.spec_from_file_location("goldengate_managed_efs_inventory_guard", TOOL_PATH)
@@ -19,8 +25,8 @@ def _load_tool():
 guard = _load_tool()
 
 
-def _fs(filesystem_id, creation_token=None, tags=None):
-    return {"FileSystemId": filesystem_id, "CreationToken": creation_token, "LifeCycleState": "available", "Tags": [{"Key": k, "Value": v} for k, v in (tags or {}).items()]}
+def _fs(filesystem_id, creation_token=None, tags=None, lifecycle_state="available"):
+    return {"FileSystemId": filesystem_id, "CreationToken": creation_token, "LifeCycleState": lifecycle_state, "Tags": [{"Key": k, "Value": v} for k, v in (tags or {}).items()]}
 
 
 def _expected(deployment_id, token=None):
@@ -38,7 +44,7 @@ class ZeroManagedTests(unittest.TestCase):
         self.assertEqual(orphans, [])
 
     def test_zero_expected_with_orphan_actual_fails(self):
-        actual = [_fs("fs-orphan", "some-token-efs", _valid_tags("gg-orphan"))]
+        actual = [_fs("fs-orphan", "dev-gg-orphan-efs", _valid_tags("gg-orphan"))]
         orphans = guard.check_managed_efs_inventory([], actual, "dev")
         self.assertEqual([o["deploymentId"] for o in orphans], ["gg-orphan"])
         self.assertIn("Terraform apply is blocked", orphans[0]["message"])
@@ -132,10 +138,11 @@ class MalformedOwnershipTagTests(unittest.TestCase):
             guard.check_managed_efs_inventory([], actual, "dev")
 
     def test_duplicate_deployment_id_across_two_filesystems_fails(self):
+        # Both filesystems use the same self-consistent token (derived from the same GoldenGateDeploymentId) so this genuinely exercises the duplicate-ID check, not the self-consistency check.
         expected = [_expected("gg-a", "dev-gg-a-efs")]
         actual = [
             _fs("fs-1", "dev-gg-a-efs", _valid_tags("gg-a")),
-            _fs("fs-2", "dev-gg-a-second-efs", _valid_tags("gg-a")),
+            _fs("fs-2", "dev-gg-a-efs", _valid_tags("gg-a")),
         ]
         with self.assertRaises(guard.InventoryGuardError):
             guard.check_managed_efs_inventory(expected, actual, "dev")
@@ -208,6 +215,42 @@ class OwnershipValidationOrderingTests(unittest.TestCase):
         self.assertEqual(orphans, [])
 
 
+class SelfConsistentOwnershipIdentityTests(unittest.TestCase):
+    """Item 3: an actual filesystem's own CreationToken must exactly equal <GoldenGateEnvironment>-<GoldenGateDeploymentId>-efs derived from its OWN tags, checked before any environment-based ignore decision."""
+
+    @unittest.skipUnless(_PYYAML_AVAILABLE, "hack/goldengate-deployment-model.py requires PyYAML at import time")
+    def test_derive_expected_creation_token_matches_the_deployment_model_exactly(self):
+        # Regression proof against drift: mirrors, rather than imports, hack/goldengate-deployment-model.py's derive_efs_creation_token(); this proves the two stay identical for representative inputs.
+        spec = importlib.util.spec_from_file_location("goldengate_deployment_model", os.path.join(REPO_ROOT, "hack", "goldengate-deployment-model.py"))
+        dm = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(dm)
+        for environment, deployment_id in [("dev", "gg-a"), ("sit", "gg-postgresql-orders-01"), ("prod", "gg-mssql-repltest-02")]:
+            self.assertEqual(
+                guard.derive_expected_creation_token(environment, deployment_id),
+                dm.derive_efs_creation_token(environment, deployment_id),
+            )
+
+    def test_other_environment_fully_self_consistent_is_valid_then_ignored(self):
+        # The exact example given: a fully valid other-environment resource whose token derives correctly from its own tags -- valid ownership identity, THEN ignored because current environment=dev.
+        tags = {"ManagedBy": "goldengate-eks-app", "GoldenGateEnvironment": "sit", "GoldenGateDeploymentId": "gg-postgresql-orders-01", "GoldenGateStorage": "u02"}
+        actual = [_fs("fs-sit", "sit-gg-postgresql-orders-01-efs", tags)]
+        orphans = guard.check_managed_efs_inventory([], actual, "dev")
+        self.assertEqual(orphans, [])
+
+    def test_other_environment_self_inconsistent_token_fails_even_during_a_dev_run(self):
+        # The exact counter-example: GoldenGateEnvironment=sit, GoldenGateDeploymentId=gg-postgresql-orders-01, but CreationToken=random-efs does not match the derived value -- must FAIL CLOSED even though the run's own environment is dev and this resource would otherwise be ignorable as "another environment."
+        tags = {"ManagedBy": "goldengate-eks-app", "GoldenGateEnvironment": "sit", "GoldenGateDeploymentId": "gg-postgresql-orders-01", "GoldenGateStorage": "u02"}
+        actual = [_fs("fs-sit", "random-efs", tags)]
+        with self.assertRaises(guard.InventoryGuardError):
+            guard.check_managed_efs_inventory([], actual, "dev")
+
+    def test_current_environment_self_inconsistent_token_fails(self):
+        tags = _valid_tags("gg-a", environment="dev")
+        actual = [_fs("fs-x", "dev-gg-wrong-id-efs", tags)]
+        with self.assertRaises(guard.InventoryGuardError):
+            guard.check_managed_efs_inventory([], actual, "dev")
+
+
 class GrammarTests(unittest.TestCase):
     """Tightened grammar checks: deployment IDs use the exact hack/goldengate-deployment-model.py _TOKEN_RE contract (no trailing/double hyphen), creation tokens must look like the deterministic <environment>-<deployment_id>-efs shape and respect the real AWS length limit."""
 
@@ -229,6 +272,58 @@ class GrammarTests(unittest.TestCase):
         actual = [_fs("fs-x", long_token, tags)]
         with self.assertRaises(guard.InventoryGuardError):
             guard.check_managed_efs_inventory([], actual, "dev")
+
+
+class CurrentEnvironmentLifecycleStateTests(unittest.TestCase):
+    """Item 4: an existing current-environment managed EFS in an unsafe AWS lifecycle state fails closed before Terraform; a brand-new expected descriptor with no AWS EFS yet is never affected."""
+
+    def test_deleting_state_fails(self):
+        expected = [_expected("gg-a", "dev-gg-a-efs")]
+        actual = [_fs("fs-a", "dev-gg-a-efs", _valid_tags("gg-a"), lifecycle_state="deleting")]
+        with self.assertRaises(guard.InventoryGuardError):
+            guard.check_managed_efs_inventory(expected, actual, "dev")
+
+    def test_deleted_state_fails(self):
+        expected = [_expected("gg-a", "dev-gg-a-efs")]
+        actual = [_fs("fs-a", "dev-gg-a-efs", _valid_tags("gg-a"), lifecycle_state="deleted")]
+        with self.assertRaises(guard.InventoryGuardError):
+            guard.check_managed_efs_inventory(expected, actual, "dev")
+
+    def test_error_state_fails(self):
+        expected = [_expected("gg-a", "dev-gg-a-efs")]
+        actual = [_fs("fs-a", "dev-gg-a-efs", _valid_tags("gg-a"), lifecycle_state="error")]
+        with self.assertRaises(guard.InventoryGuardError):
+            guard.check_managed_efs_inventory(expected, actual, "dev")
+
+    def test_creating_state_is_not_failed(self):
+        expected = [_expected("gg-a", "dev-gg-a-efs")]
+        actual = [_fs("fs-a", "dev-gg-a-efs", _valid_tags("gg-a"), lifecycle_state="creating")]
+        orphans = guard.check_managed_efs_inventory(expected, actual, "dev")
+        self.assertEqual(orphans, [])
+
+    def test_updating_state_is_not_failed(self):
+        expected = [_expected("gg-a", "dev-gg-a-efs")]
+        actual = [_fs("fs-a", "dev-gg-a-efs", _valid_tags("gg-a"), lifecycle_state="updating")]
+        orphans = guard.check_managed_efs_inventory(expected, actual, "dev")
+        self.assertEqual(orphans, [])
+
+    def test_available_state_is_unaffected(self):
+        expected = [_expected("gg-a", "dev-gg-a-efs")]
+        actual = [_fs("fs-a", "dev-gg-a-efs", _valid_tags("gg-a"), lifecycle_state="available")]
+        orphans = guard.check_managed_efs_inventory(expected, actual, "dev")
+        self.assertEqual(orphans, [])
+
+    def test_brand_new_expected_descriptor_with_no_aws_efs_yet_is_never_lifecycle_failed(self):
+        # No actual filesystem exists at all for this expected descriptor -- the lifecycle check never runs for it, so Terraform remains free to create it.
+        expected = [_expected("gg-brand-new", "dev-gg-brand-new-efs")]
+        orphans = guard.check_managed_efs_inventory(expected, [], "dev")
+        self.assertEqual(orphans, [])
+
+    def test_other_environment_unsafe_lifecycle_state_is_not_failed(self):
+        # Lifecycle hardening is scoped to the CURRENT environment only -- another environment's filesystem lifecycle is not this run's concern.
+        actual = [_fs("fs-sit", "sit-gg-a-efs", _valid_tags("gg-a", environment="sit"), lifecycle_state="deleting")]
+        orphans = guard.check_managed_efs_inventory([], actual, "dev")
+        self.assertEqual(orphans, [])
 
 
 class LifecycleAbsentInventoryTests(unittest.TestCase):

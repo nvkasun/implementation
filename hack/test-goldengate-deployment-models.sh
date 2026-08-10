@@ -8142,6 +8142,138 @@ else
 fi
 
 echo ""
+echo "--- Production hardening, Item 1: EFS throughput_mode ---"
+
+if ! grep -qE 'throughput_mode\s*=\s*"enhanced"' envs/dev/efs.tf 2>/dev/null; then
+  pass "1: throughput_mode is never assigned the invalid value \"enhanced\" (not a real AWS/Terraform EFS throughput_mode) anywhere in envs/dev/efs.tf"
+else
+  fail "1: envs/dev/efs.tf still assigns the invalid throughput_mode value \"enhanced\""
+fi
+
+if grep -qE '^\s*variable\s+"goldengate_efs_throughput_mode"' envs/dev/efs.tf 2>/dev/null \
+    && grep -qE '^\s*throughput_mode\s*=\s*var\.goldengate_efs_throughput_mode' envs/dev/efs.tf 2>/dev/null; then
+  pass "1: throughput_mode is an explicit environment-level Terraform variable (goldengate_efs_throughput_mode) wired into the module call, not a bare literal"
+else
+  fail "1: envs/dev/efs.tf does not wire an explicit goldengate_efs_throughput_mode variable into the module's throughput_mode input"
+fi
+
+if grep -qE 'contains\(\["elastic",\s*"provisioned",\s*"bursting"\],\s*var\.goldengate_efs_throughput_mode\)' envs/dev/efs.tf 2>/dev/null; then
+  pass "1: goldengate_efs_throughput_mode has a strict validation block allowing only the three real AWS API values (elastic/provisioned/bursting)"
+else
+  fail "1: goldengate_efs_throughput_mode is missing the required strict validation block"
+fi
+
+if ! grep -q 'goldengate_efs_throughput_mode' envs/dev/gg-*-payments-01/values.yaml 2>/dev/null; then
+  pass "1: throughput mode is not exposed as a per-deployment values.yaml setting -- no existing architecture requires per-runtime EFS performance profiles"
+else
+  fail "1: throughput mode leaked into a per-deployment values.yaml setting"
+fi
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  set +e
+  THROUGHPUT_VALIDATION_OUT="$(python3 -c '
+import re
+with open("envs/dev/efs.tf") as f:
+    text = f.read()
+m = re.search(r"variable \"goldengate_efs_throughput_mode\" \{(.*?)\n\}", text, re.S)
+assert m, "variable block not found"
+block = m.group(1)
+assert "elastic" in block and "provisioned" in block and "bursting" in block, "not all three valid values present in the validation condition"
+assert "enhanced" not in block, "the invalid value leaked into the variable block"
+print("OK")
+' 2>&1)"
+  THROUGHPUT_VALIDATION_STATUS=$?
+  set -e
+  if [ "$THROUGHPUT_VALIDATION_STATUS" -eq 0 ]; then
+    pass "1: the throughput_mode variable's validation set is exactly {elastic, provisioned, bursting}, never including the invalid \"enhanced\" value"
+  else
+    fail "1: throughput_mode variable validation structure check failed: ${THROUGHPUT_VALIDATION_OUT}"
+  fi
+else
+  skip "1: throughput_mode variable structure check -- python3 unavailable"
+fi
+
+echo ""
+echo "--- Production hardening, Item 2: stream DescribeFileSystems safely ---"
+
+if ! grep -qE 'DESCRIBE_ALL_JSON="\$\(' "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "2: the account-wide DescribeFileSystems response is no longer captured into a shell variable before sanitizing"
+else
+  fail "2: the workflow still captures the raw DescribeFileSystems response into a shell variable (DESCRIBE_ALL_JSON=\$(...))"
+fi
+
+if grep -qE 'aws efs describe-file-systems --region "\$AWS_REGION" --output json \| python3 "\$EFS_SANITIZER_SCRIPT"' "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "2: aws efs describe-file-systems is piped directly into the sanitizer's stdin (streamed), matching the preferred pattern"
+else
+  fail "2: the streaming pipe from aws efs describe-file-systems into the sanitizer script is missing"
+fi
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  python3 - "$EKS_APP_WORKFLOW" > "${WORKDIR}/inventory_scan.sh" <<'PYEOF'
+import sys
+import yaml
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+for step in doc["jobs"]["managed_efs_inventory_guard"]["steps"]:
+    if step.get("name", "").startswith("Read the actual AWS-side"):
+        sys.stdout.write(step["run"])
+        break
+else:
+    sys.exit("step not found")
+PYEOF
+
+  if [ ! -s "${WORKDIR}/inventory_scan.sh" ]; then
+    fail "2: could not extract the 'Read the actual AWS-side...' step from ${EKS_APP_WORKFLOW}"
+  else
+    STUB_DIR="${WORKDIR}/aws-stub"
+    mkdir -p "$STUB_DIR"
+    cat > "${STUB_DIR}/aws" <<'STUBEOF'
+#!/bin/bash
+if [ "$1" = "sts" ] && [ "$2" = "assume-role" ]; then
+  echo '{"Credentials":{"AccessKeyId":"FAKEKEY","SecretAccessKey":"FAKESECRET","SessionToken":"FAKETOKEN"}}'
+elif [ "$1" = "sts" ] && [ "$2" = "get-caller-identity" ]; then
+  echo "668311715351"
+elif [ "$1" = "efs" ] && [ "$2" = "describe-file-systems" ]; then
+  cat <<'JSONEOF'
+{"FileSystems":[
+  {"FileSystemId":"fs-aaaa","CreationToken":"dev-gg-a-efs","LifeCycleState":"available","Tags":[{"Key":"ManagedBy","Value":"goldengate-eks-app"},{"Key":"GoldenGateDeploymentId","Value":"gg-a"},{"Key":"GoldenGateEnvironment","Value":"dev"},{"Key":"GoldenGateStorage","Value":"u02"},{"Key":"SecretInternalNote","Value":"do-not-leak-this"}]},
+  {"FileSystemId":"fs-unrelated","CreationToken":"some-other-token","LifeCycleState":"available","Tags":[{"Key":"Owner","Value":"other-team"}]}
+]}
+JSONEOF
+else
+  echo "unexpected aws call: $*" >&2
+  exit 1
+fi
+STUBEOF
+    chmod +x "${STUB_DIR}/aws"
+
+    set +e
+    STREAM_TEST_OUT="$(cd "${WORKDIR}" && PATH="${STUB_DIR}:${PATH}" \
+      EKS_DEPLOY_ROLE_ARN="arn:aws:iam::668311715351:role/GoldenGateEKSDeployRole-dev" \
+      AWS_REGION="eu-west-1" GITHUB_RUN_ID="1" GITHUB_RUN_ATTEMPT="1" \
+      bash "${WORKDIR}/inventory_scan.sh" 2>&1; echo "---"; cat "${WORKDIR}/actual-managed-efs.json" 2>/dev/null)"
+    STREAM_TEST_STATUS=$?
+    set -e
+
+    if [ "$STREAM_TEST_STATUS" -eq 0 ] \
+        && echo "$STREAM_TEST_OUT" | grep -qF '"FileSystemId": "fs-aaaa"' \
+        && echo "$STREAM_TEST_OUT" | grep -qF '"GoldenGateDeploymentId", "Value": "gg-a"' \
+        && ! echo "$STREAM_TEST_OUT" | grep -qF "SecretInternalNote" \
+        && ! echo "$STREAM_TEST_OUT" | grep -qF "do-not-leak-this" \
+        && ! echo "$STREAM_TEST_OUT" | grep -qF "other-team"; then
+      pass "2: the real extracted inventory-scan step, run end-to-end against a stubbed aws CLI, correctly streams and sanitizes -- retains the four GoldenGate tags for the in-scope filesystem and strips every unrelated tag (SecretInternalNote, Owner) from both filesystems"
+    else
+      fail "2: the extracted inventory-scan step did not stream/sanitize correctly against the stubbed aws CLI"
+      echo "$STREAM_TEST_OUT"
+    fi
+
+    rm -rf "$STUB_DIR"
+  fi
+else
+  skip "2: end-to-end streaming/sanitization behavioral test -- python3/PyYAML unavailable"
+fi
+
+echo ""
 echo "=================================================="
 echo "Summary: ${PASS_COUNT} passed, ${FAIL_COUNT} failed, ${SKIP_COUNT} skipped"
 echo "=================================================="

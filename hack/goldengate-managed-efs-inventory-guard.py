@@ -42,6 +42,11 @@ def _is_safe_creation_token(value):
     return isinstance(value, str) and bool(_SAFE_CREATION_TOKEN_RE.match(value)) and len(value) <= _EFS_CREATION_TOKEN_MAX_LENGTH
 
 
+def derive_expected_creation_token(environment, deployment_id):
+    """Mirrors hack/goldengate-deployment-model.py's derive_efs_creation_token() exactly -- a separate, dependency-free copy rather than an import, since that module unconditionally requires PyYAML at import time and this one is kept free of it. Regression-tested against the real function to catch any future drift. Takes the FILESYSTEM'S OWN GoldenGateEnvironment/GoldenGateDeploymentId tags, not the current run's environment -- this proves an actual filesystem's CreationToken is self-consistent with its own claimed identity, independent of whether that identity happens to belong to the current environment."""
+    return f"{environment}-{deployment_id}-efs"
+
+
 def check_managed_efs_inventory(expected, actual, environment):
     """expected: [{"deploymentId": ..., "efsCreationToken": ...}, ...] (from the deployment model, includes lifecycle.state=absent). actual: AWS FileSystemDescription-shaped dicts (FileSystemId/CreationToken/Tags) sanitized down to the four GoldenGate tags. Returns the list of orphan deployment IDs (each with the fixed ORPHAN_MESSAGE) -- empty means PASS. Raises InventoryGuardError for a creation-token collision, malformed/missing ownership tags on an otherwise ManagedBy=goldengate-eks-app filesystem (checked in full BEFORE any environment-based ignore decision -- a validly-tagged other-environment resource is the only thing ever silently ignored), a deployment-tag/creation-token identity mismatch, or a duplicate GoldenGateDeploymentId -- all fail closed before any orphan comparison even runs."""
     expected_by_id = {e["deploymentId"]: e["efsCreationToken"] for e in expected}
@@ -97,9 +102,26 @@ def check_managed_efs_inventory(expected, actual, environment):
                 f"{storage_tag!r}, expected exactly {REQUIRED_STORAGE_VALUE!r}."
             )
 
-        # Only now, after every ownership field has been proven structurally valid, may a genuinely different (real) environment be ignored.
+        # Self-consistency: the filesystem's own CreationToken must exactly equal the deterministic token derived from its OWN GoldenGateEnvironment/GoldenGateDeploymentId tags -- checked before any environment-based ignore decision, so a resource cannot claim a foreign identity (e.g. GoldenGateEnvironment=sit, GoldenGateDeploymentId=gg-postgresql-orders-01, CreationToken=random-efs) and be waved through merely because it looks like it belongs to another environment.
+        self_consistent_token = derive_expected_creation_token(environment_tag, deployment_id_tag)
+        if creation_token != self_consistent_token:
+            raise InventoryGuardError(
+                f"actual EFS {filesystem_id!r} is tagged GoldenGateEnvironment={environment_tag!r} "
+                f"GoldenGateDeploymentId={deployment_id_tag!r}, but its CreationToken ({creation_token!r}) does not "
+                f"match the deterministic value derived from its own tags ({self_consistent_token!r})."
+            )
+
+        # Only now, after every ownership field has been proven structurally valid and self-consistent, may a genuinely different (real) environment be ignored.
         if environment_tag != environment:
             continue
+
+        # Current-environment lifecycle hardening: this loop only ever reaches filesystems that already exist in AWS -- a brand-new expected descriptor with no AWS EFS yet never enters this loop at all, so it is never failed here; Terraform remains free to create it. "deleting"/"deleted"/"error" are unsafe to proceed with and fail closed before Terraform apply. "creating"/"updating" are treated as in-progress, not failed -- no retry policy is invented here since none exists elsewhere in this workflow.
+        lifecycle_state = fs.get("LifeCycleState")
+        if lifecycle_state in ("deleting", "deleted", "error"):
+            raise InventoryGuardError(
+                f"actual EFS {filesystem_id!r} (GoldenGateDeploymentId={deployment_id_tag!r}) is in AWS lifecycle "
+                f"state {lifecycle_state!r}, which is unsafe to proceed with."
+            )
 
         in_scope.append((deployment_id_tag, filesystem_id, creation_token))
 

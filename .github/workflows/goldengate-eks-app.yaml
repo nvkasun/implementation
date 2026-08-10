@@ -424,16 +424,14 @@ jobs:
             exit 1
           fi
 
-          DESCRIBE_ALL_JSON="$(AWS_ACCESS_KEY_ID="$INV_TMP_KEY_ID" AWS_SECRET_ACCESS_KEY="$INV_TMP_SECRET" AWS_SESSION_TOKEN="$INV_TMP_TOKEN" aws efs describe-file-systems --region "$AWS_REGION" --output json)"
-          unset INV_TMP_KEY_ID INV_TMP_SECRET INV_TMP_TOKEN
-
-          # Sanitize immediately, before anything is logged or written: keep only FileSystemId/CreationToken/LifeCycleState and the four GoldenGate ownership tags -- every other AWS EFS filesystem's metadata and every non-GoldenGate tag on any filesystem (including account-wide, unrelated resources) is discarded here and never printed or persisted.
-          python3 - "$DESCRIBE_ALL_JSON" > actual-managed-efs.json <<'PYEOF'
+          # The sanitizer script is written to a temp file first (never fed to python3's own stdin) specifically so stdin stays free for the streamed AWS response below -- `python3 - <<EOF` would consume the heredoc as the script itself, leaving no way to also pipe runtime data into the same process.
+          EFS_SANITIZER_SCRIPT="$(mktemp)"
+          cat > "$EFS_SANITIZER_SCRIPT" <<'PYEOF'
           import json, sys
 
           ALLOWED_TAG_KEYS = ("ManagedBy", "GoldenGateDeploymentId", "GoldenGateEnvironment", "GoldenGateStorage")
 
-          data = json.loads(sys.argv[1])
+          data = json.load(sys.stdin)
           sanitized = []
           for fs in data.get("FileSystems", []):
               tags = [{"Key": t.get("Key"), "Value": t.get("Value")} for t in fs.get("Tags", []) if t.get("Key") in ALLOWED_TAG_KEYS]
@@ -445,6 +443,12 @@ jobs:
               })
           print(json.dumps(sanitized))
           PYEOF
+
+          # Streamed directly from the AWS CLI into the sanitizer's stdin -- the complete account-wide DescribeFileSystems response is never captured into a shell variable or passed as a Python argv argument (which would otherwise transiently hold every filesystem's full raw metadata, unrelated tags included, in process argv/shell memory). set -o pipefail (part of set -euo pipefail above) still fails this step closed if the aws call itself fails.
+          AWS_ACCESS_KEY_ID="$INV_TMP_KEY_ID" AWS_SECRET_ACCESS_KEY="$INV_TMP_SECRET" AWS_SESSION_TOKEN="$INV_TMP_TOKEN" aws efs describe-file-systems --region "$AWS_REGION" --output json | python3 "$EFS_SANITIZER_SCRIPT" > actual-managed-efs.json
+
+          rm -f "$EFS_SANITIZER_SCRIPT"
+          unset INV_TMP_KEY_ID INV_TMP_SECRET INV_TMP_TOKEN
 
           IN_SCOPE_COUNT="$(python3 -c '
           import json, sys
