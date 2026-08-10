@@ -361,7 +361,7 @@ jobs:
   managed_efs_inventory_guard:
     name: Guard against orphaned AWS-side managed GoldenGate EFS filesystems (read-only)
 
-    # Persistent safety net beyond the Git-diff-only guards above: if a managed descriptor's physical removal or an unsafe storage-mode transition somehow still reaches this point on a later, unrelated commit (where the change is no longer visible in that commit's own diff), this job independently re-derives the CURRENT expected managed-EFS inventory from the deployment model and compares it against what AWS actually has tagged as GoldenGate-managed in this environment, failing closed on any orphan before terraform_sync_once can observe (and potentially destroy) it. Strictly read-only: DescribeFileSystems/ListTagsForResource only, never create/update/delete.
+    # Persistent safety net beyond the Git-diff-only guards above: if a managed descriptor's physical removal or an unsafe storage-mode transition somehow still reaches this point on a later, unrelated commit (where the change is no longer visible in that commit's own diff), this job independently re-derives the CURRENT expected managed-EFS inventory from the deployment model and compares it against what AWS actually has tagged as GoldenGate-managed in this environment, failing closed on any orphan (or creation-token collision) before terraform_sync_once can observe (and potentially destroy) it. Strictly read-only: a single DescribeFileSystems call only (its FileSystemDescription already carries CreationToken/LifeCycleState/Tags, so list-tags-for-resource is never called), never create/update/delete.
     needs:
       - validate_model
       - detect_changed_deployments
@@ -404,7 +404,7 @@ jobs:
             exit 1
           fi
 
-          echo "Assuming ${EKS_DEPLOY_ROLE_ARN} for a read-only elasticfilesystem:DescribeFileSystems/ListTagsForResource inventory scan (this role is never granted EFS create/update/delete permissions; the runtime deployment role is never extended for this guard either)..."
+          echo "Assuming ${EKS_DEPLOY_ROLE_ARN} for a read-only elasticfilesystem:DescribeFileSystems inventory scan (a single call -- FileSystemDescription already carries CreationToken/LifeCycleState/Tags, so no separate list-tags-for-resource call is made; this role is never granted EFS create/update/delete permissions, and the runtime deployment role is never extended for this guard either)..."
 
           ASSUME_JSON="$(aws sts assume-role --role-arn "$EKS_DEPLOY_ROLE_ARN" --role-session-name "gg-efs-inventory-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --duration-seconds 900 --output json)"
           INV_TMP_KEY_ID="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["Credentials"]["AccessKeyId"])' <<< "$ASSUME_JSON")"
@@ -424,26 +424,34 @@ jobs:
           fi
 
           DESCRIBE_ALL_JSON="$(AWS_ACCESS_KEY_ID="$INV_TMP_KEY_ID" AWS_SECRET_ACCESS_KEY="$INV_TMP_SECRET" AWS_SESSION_TOKEN="$INV_TMP_TOKEN" aws efs describe-file-systems --region "$AWS_REGION" --output json)"
-
-          python3 - "$DESCRIBE_ALL_JSON" > filesystem-ids.txt <<'PYEOF'
-          import json, sys
-          data = json.loads(sys.argv[1])
-          for fs in data.get("FileSystems", []):
-              print(fs["FileSystemId"])
-          PYEOF
-
-          ACTUAL_JSON="[]"
-          while IFS= read -r FS_ID; do
-            [ -z "$FS_ID" ] && continue
-            TAGS_JSON="$(AWS_ACCESS_KEY_ID="$INV_TMP_KEY_ID" AWS_SECRET_ACCESS_KEY="$INV_TMP_SECRET" AWS_SESSION_TOKEN="$INV_TMP_TOKEN" aws efs list-tags-for-resource --resource-id "$FS_ID" --region "$AWS_REGION" --output json)"
-            ACTUAL_JSON="$(python3 -c 'import json, sys; items = json.loads(sys.argv[1]); items.append({"FileSystemId": sys.argv[2], "Tags": json.loads(sys.argv[3]).get("Tags", [])}); print(json.dumps(items))' "$ACTUAL_JSON" "$FS_ID" "$TAGS_JSON")"
-          done < filesystem-ids.txt
-
           unset INV_TMP_KEY_ID INV_TMP_SECRET INV_TMP_TOKEN
 
-          echo "$ACTUAL_JSON" > actual-managed-efs.json
-          echo "Actual AWS-side EFS inventory scanned (region ${AWS_REGION}):"
-          cat actual-managed-efs.json
+          # Sanitize immediately, before anything is logged or written: keep only FileSystemId/CreationToken/LifeCycleState and the four GoldenGate ownership tags -- every other AWS EFS filesystem's metadata and every non-GoldenGate tag on any filesystem (including account-wide, unrelated resources) is discarded here and never printed or persisted.
+          python3 - "$DESCRIBE_ALL_JSON" > actual-managed-efs.json <<'PYEOF'
+          import json, sys
+
+          ALLOWED_TAG_KEYS = ("ManagedBy", "GoldenGateDeploymentId", "GoldenGateEnvironment", "GoldenGateStorage")
+
+          data = json.loads(sys.argv[1])
+          sanitized = []
+          for fs in data.get("FileSystems", []):
+              tags = [{"Key": t.get("Key"), "Value": t.get("Value")} for t in fs.get("Tags", []) if t.get("Key") in ALLOWED_TAG_KEYS]
+              sanitized.append({
+                  "FileSystemId": fs.get("FileSystemId"),
+                  "CreationToken": fs.get("CreationToken"),
+                  "LifeCycleState": fs.get("LifeCycleState"),
+                  "Tags": tags,
+              })
+          print(json.dumps(sanitized))
+          PYEOF
+
+          IN_SCOPE_COUNT="$(python3 -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          count = sum(1 for fs in data if any(t.get("Key") == "ManagedBy" and t.get("Value") == "goldengate-eks-app" for t in fs.get("Tags", [])))
+          print(count)
+          ' < actual-managed-efs.json)"
+          echo "Actual AWS-side EFS scan (region ${AWS_REGION}): ${IN_SCOPE_COUNT} GoldenGate-managed-tagged filesystem(s) found in scope. Unrelated EFS filesystems and any non-GoldenGate tags are never logged."
 
       - name: Compare expected vs actual managed-EFS inventory (fail closed on any orphan)
         shell: bash
@@ -765,14 +773,12 @@ jobs:
           fi
 
           RESOLVED_EFS_ID="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["FileSystems"][0]["FileSystemId"])' <<< "$DESCRIBE_EFS_JSON")"
-
-          # Defense in depth: cross-check the resolved filesystem's tags match the exact ownership tags envs/dev/efs.tf's custom_tags applies -- catches a creation-token collision with an untagged/mistagged filesystem before it ever reaches Helm/Argo.
-          TAGS_JSON="$(AWS_ACCESS_KEY_ID="$EFS_TMP_KEY_ID" AWS_SECRET_ACCESS_KEY="$EFS_TMP_SECRET" AWS_SESSION_TOKEN="$EFS_TMP_TOKEN" aws efs list-tags-for-resource --resource-id "$RESOLVED_EFS_ID" --region "$AWS_REGION" --output json)"
           unset EFS_TMP_KEY_ID EFS_TMP_SECRET EFS_TMP_TOKEN
 
-          TAGS_OK="$(python3 -c 'import json, sys; tags = {t["Key"]: t["Value"] for t in json.load(sys.stdin).get("Tags", [])}; print("true" if tags.get("ManagedBy") == "goldengate-eks-app" and tags.get("GoldenGateDeploymentId") == sys.argv[1] and tags.get("GoldenGateEnvironment") == sys.argv[2] else "false")' "$DEPLOYMENT_ID" "$ENVIRONMENT" <<< "$TAGS_JSON")"
+          # Defense in depth: cross-check the resolved filesystem's ownership tags, already present on this same DescribeFileSystems response (FileSystemDescription.Tags) -- no second list-tags-for-resource call. Catches a creation-token collision with an untagged/mistagged filesystem before it ever reaches Helm/Argo.
+          TAGS_OK="$(python3 -c 'import json, sys; tags = {t["Key"]: t["Value"] for t in json.load(sys.stdin)["FileSystems"][0].get("Tags", [])}; print("true" if tags.get("ManagedBy") == "goldengate-eks-app" and tags.get("GoldenGateDeploymentId") == sys.argv[1] and tags.get("GoldenGateEnvironment") == sys.argv[2] and tags.get("GoldenGateStorage") == "u02" else "false")' "$DEPLOYMENT_ID" "$ENVIRONMENT" <<< "$DESCRIBE_EFS_JSON")"
           if [ "$TAGS_OK" != "true" ]; then
-            echo "FAIL: the EFS filesystem resolved for creation token ${EFS_CREATION_TOKEN} (${RESOLVED_EFS_ID}) does not carry the expected ManagedBy/GoldenGateDeploymentId/GoldenGateEnvironment ownership tags."
+            echo "FAIL: the EFS filesystem resolved for creation token ${EFS_CREATION_TOKEN} (${RESOLVED_EFS_ID}) does not carry the expected ManagedBy/GoldenGateDeploymentId/GoldenGateEnvironment/GoldenGateStorage ownership tags."
             exit 1
           fi
 

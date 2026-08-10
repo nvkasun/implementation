@@ -7659,10 +7659,10 @@ else
   fail "4: envs/dev/efs.tf is missing the module.goldengate_runtime_efs block"
 fi
 
-if grep -qE '"elasticfilesystem:ListTagsForResource"' envs/dev/policies/goldengate-eks-deploy-dev/policies/policies_1.json 2>/dev/null; then
-  pass "the workload-account read role's existing EFS-read policy statement was minimally extended with elasticfilesystem:ListTagsForResource (no new role, no create/update/delete permission)"
+if ! grep -qE '"elasticfilesystem:ListTagsForResource"' envs/dev/policies/goldengate-eks-deploy-dev/policies/policies_1.json 2>/dev/null; then
+  pass "elasticfilesystem:ListTagsForResource has been removed from the workload-account read role -- no replacement IAM permission was added, since DescribeFileSystems' own Tags field is now the sole EFS metadata source"
 else
-  fail "elasticfilesystem:ListTagsForResource is missing from the existing GoldenGateEKSDeployRole-dev EFS-read policy statement"
+  fail "elasticfilesystem:ListTagsForResource is still present in the GoldenGateEKSDeployRole-dev EFS-read policy statement -- it must be removed, not replaced"
 fi
 
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
@@ -7674,7 +7674,7 @@ with open("envs/dev/policies/goldengate-eks-deploy-dev/policies/policies_1.json"
 for stmt in doc["Statement"]:
     actions = stmt.get("Action", [])
     for action in actions:
-        if action.startswith("elasticfilesystem:") and action.split(":", 1)[1] not in ("DescribeAccessPoints", "DescribeFileSystems", "ListTagsForResource"):
+        if action.startswith("elasticfilesystem:") and action.split(":", 1)[1] not in ("DescribeAccessPoints", "DescribeFileSystems"):
             print(f"unexpected EFS action granted: {action}")
             raise SystemExit(1)
 print("OK")
@@ -7682,12 +7682,36 @@ print("OK")
   POLICY_CHECK_STATUS=$?
   set -e
   if [ "$POLICY_CHECK_STATUS" -eq 0 ]; then
-    pass "the workload-account read role is granted only read-only EFS actions (DescribeAccessPoints/DescribeFileSystems/ListTagsForResource) -- no create/update/delete permission was added for the inventory guard"
+    pass "the workload-account read role is granted only read-only EFS actions (DescribeAccessPoints/DescribeFileSystems) -- no ListTagsForResource, no create/update/delete permission"
   else
     fail "the workload-account read role's EFS policy grants an unexpected action: ${POLICY_CHECK_OUT}"
   fi
 else
   skip "EFS read-only policy scope check -- python3 unavailable"
+fi
+
+if ! grep -qF "aws efs list-tags-for-resource" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "no 'aws efs list-tags-for-resource' command remains anywhere in the eks-app workflow"
+else
+  fail "'aws efs list-tags-for-resource' is still present in the eks-app workflow"
+fi
+
+if grep -qE 'json\.load\(sys\.stdin\)\["FileSystems"\]\[0\]\.get\("Tags"' "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "managed-mode EFS resolution reads Tags directly from the same DescribeFileSystems (--creation-token) response used to resolve FileSystemId -- no second tag API call"
+else
+  fail "managed-mode EFS resolution does not read Tags directly from the DescribeFileSystems response"
+fi
+
+if ! grep -qE 'cat actual-managed-efs\.json|echo "\$ACTUAL_JSON"|echo "\$DESCRIBE_ALL_JSON"' "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "the inventory guard's workflow step never dumps the full/raw AWS EFS scan (account-wide tag metadata) to the log -- only a sanitized in-scope count is logged"
+else
+  fail "the inventory guard's workflow step still logs the full/raw AWS EFS scan output"
+fi
+
+if grep -qF 'GoldenGate-managed-tagged filesystem(s) found in scope' "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "the inventory guard logs only the sanitized in-scope GoldenGate-managed filesystem count, never unrelated EFS tags"
+else
+  fail "the inventory guard's summary log line for the sanitized in-scope count is missing"
 fi
 
 if [ -f "hack/goldengate-managed-efs-inventory-guard.py" ]; then
