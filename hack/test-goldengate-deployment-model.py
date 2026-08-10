@@ -1,8 +1,12 @@
 """Offline tests for hack/goldengate-deployment-model.py; run directly via `python3 hack/test-goldengate-deployment-model.py`."""
 from __future__ import annotations
 
+import argparse
+import contextlib
 import copy
 import importlib.util
+import io
+import json
 import os
 import sys
 import tempfile
@@ -249,60 +253,21 @@ class RealRepositoryDescriptorTests(unittest.TestCase):
         by_id = {d["deploymentId"]: d for d in active}
         self.assertEqual(by_id["gg-postgresql-payments-01"]["adminSecretName"], "dev/goldengate/target/admin")
 
-    def test_generated_registry_contains_all_three_live_deployments(self):
-        # Updated for the first real managed-EFS runtime (gg-postgresql-repltest-01): the live dev registry now has 3 active deployments, not 2 -- this assertion is exact (assertEqual, not a subset check), so it still fails closed if a fourth descriptor is ever added without updating this test.
+    def test_registry_contains_exactly_the_scanned_active_ids(self):
+        # Self-service: dynamic invariant, never a hardcoded name/count -- onboarding a new envs/dev/<id>/values.yaml folder must never require editing this test. Proves the registry contains EXACTLY what the canonical folder scanner contains.
+        active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        expected_active_ids = sorted(d["deploymentId"] for d in active)
+
         registry = gdm.build_registry("dev")
-        names = {d["name"] for d in registry["deployments"]}
-        self.assertEqual(names, {"gg-oracle-payments-01", "gg-postgresql-payments-01", "gg-postgresql-repltest-01"})
+        actual_registry_ids = sorted(d["name"] for d in registry["deployments"])
+        self.assertEqual(actual_registry_ids, expected_active_ids)
 
-    def test_existing_repltest_descriptor_parses(self):
-        active, _inactive, invalid = gdm.scan("dev")
+    def test_managed_efs_inventory_matches_dynamically_derived_managed_set(self):
+        # Self-service: never asserts today's managed count is any particular fixed number -- compares the real cmd_managed_efs_inventory JSON output against a set derived independently from the same scan (efsMode == "managed"), including lifecycle.state=absent descriptors (inactive), exactly like the real command.
+        active, inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
-        by_id = {d["deploymentId"]: d for d in active}
-        self.assertIn("gg-postgresql-repltest-01", by_id)
-        self.assertEqual(by_id["gg-postgresql-repltest-01"]["deploymentType"], "postgresql")
-
-    def test_repltest_descriptor_is_the_source_role_on_its_own_new_pipeline(self):
-        active, _inactive, _invalid = gdm.scan("dev")
-        by_id = {d["deploymentId"]: d for d in active}
-        d = by_id["gg-postgresql-repltest-01"]
-        self.assertEqual(d["role"], "source")
-        self.assertEqual(d["pipeline"], "repltest-pg-to-mssql-001")
-        self.assertNotEqual(d["pipeline"], "payments-ora-to-pg-001")
-
-    def test_repltest_descriptor_lifecycle_is_active(self):
-        active, _inactive, _invalid = gdm.scan("dev")
-        by_id = {d["deploymentId"]: d for d in active}
-        self.assertEqual(by_id["gg-postgresql-repltest-01"]["lifecycleState"], "active")
-
-    def test_repltest_descriptor_renders_with_source_shared_secret(self):
-        active, _inactive, _invalid = gdm.scan("dev")
-        by_id = {d["deploymentId"]: d for d in active}
-        self.assertEqual(by_id["gg-postgresql-repltest-01"]["adminSecretName"], "dev/goldengate/source/admin")
-
-    def test_repltest_descriptor_uses_gg_postgresql_sa(self):
-        active, _inactive, _invalid = gdm.scan("dev")
-        by_id = {d["deploymentId"]: d for d in active}
-        self.assertEqual(by_id["gg-postgresql-repltest-01"]["runtimeServiceAccountName"], "gg-postgresql-sa")
-
-    def test_repltest_descriptor_is_the_first_managed_efs_deployment(self):
-        active, _inactive, _invalid = gdm.scan("dev")
-        by_id = {d["deploymentId"]: d for d in active}
-        d = by_id["gg-postgresql-repltest-01"]
-        self.assertEqual(d["efsMode"], "managed")
-        self.assertIsNone(d["efsFileSystemId"])
-        self.assertEqual(d["efsCreationToken"], "dev-gg-postgresql-repltest-01-efs")
-
-    def test_repltest_descriptor_replication_remains_disabled(self):
-        active, _inactive, invalid = gdm.scan("dev")
-        self.assertEqual(invalid, [])
-        by_id = {d["deploymentId"]: d for d in active}
-        self.assertFalse(by_id["gg-postgresql-repltest-01"]["replicationEnabled"])
-
-    def test_managed_efs_inventory_contains_exactly_the_repltest_deployment(self):
-        # cmd_managed_efs_inventory prints JSON rather than returning it; re-derive the same expected-inventory shape (same filter: efsMode == "managed", same sort key) directly from the scan, to keep this test independent of stdout capture.
-        active, inactive, _invalid = gdm.scan("dev")
-        entries = sorted(
+        expected_managed = sorted(
             (
                 {"deploymentId": d["deploymentId"], "efsCreationToken": d["efsCreationToken"]}
                 for d in active + inactive
@@ -310,7 +275,61 @@ class RealRepositoryDescriptorTests(unittest.TestCase):
             ),
             key=lambda x: x["deploymentId"],
         )
-        self.assertEqual(entries, [{"deploymentId": "gg-postgresql-repltest-01", "efsCreationToken": "dev-gg-postgresql-repltest-01-efs"}])
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            exit_code = gdm.cmd_managed_efs_inventory(argparse.Namespace(environment="dev"))
+        self.assertEqual(exit_code, 0)
+        actual_managed = json.loads(buf.getvalue())
+        self.assertEqual(actual_managed, expected_managed)
+
+    def test_at_least_one_managed_efs_descriptor_exists(self):
+        # MILESTONE (temporary, not a permanent inventory coupling): proves the first production managed-EFS runtime was successfully onboarded, without naming it or coupling to an exact count. Safe to delete once managed EFS is routine.
+        active, inactive, _invalid = gdm.scan("dev")
+        managed = [d for d in active + inactive if d["efsMode"] == "managed"]
+        self.assertGreaterEqual(len(managed), 1)
+
+    def test_every_active_descriptor_satisfies_generic_contracts(self):
+        # Self-service: one generic loop, driven entirely by each descriptor's OWN properties (role/persistence mode/deploymentType) -- never by deployment ID -- so it automatically covers any future onboarded folder without new test code.
+        active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        self.assertEqual(gdm.validate("dev"), [])
+
+        alb_orders = []
+        for d in active:
+            with self.subTest(deploymentId=d["deploymentId"]):
+                self.assertEqual(d["runtimeServiceAccountName"], gdm.resolve_runtime_service_account(d["deploymentType"]))
+                self.assertEqual(d["tlsSecretName"], gdm.resolve_tls_secret(d["environment"]))
+                self.assertEqual(d["adminSecretName"], gdm.resolve_admin_secret(d["environment"], d["role"]))
+
+                with open(os.path.join(REPO_ROOT, "envs", "dev", d["deploymentId"], "values.yaml")) as f:
+                    raw = yaml.safe_load(f)
+                ports = ((raw.get("runtime") or {}).get("service") or {}).get("ports") or {}
+                if d["role"] == "source":
+                    self.assertEqual(ports.get("dist"), 9013)
+                    self.assertIsNone(ports.get("receiver"))
+                elif d["role"] == "target":
+                    self.assertIsNone(ports.get("dist"))
+                    self.assertEqual(ports.get("receiver"), 9014)
+
+                if d["albGroupOrder"] is not None:
+                    self.assertTrue(str(d["albGroupOrder"]).lstrip("-").isdigit())
+                    if (raw.get("ingress") or {}).get("mode") == "shared":
+                        alb_orders.append(d["albGroupOrder"])
+
+                persistence = raw.get("persistence") or {}
+                if persistence.get("enabled") is True and persistence.get("provider") == "efs":
+                    efs = persistence.get("efs") or {}
+                    if d["efsMode"] == "managed":
+                        self.assertIsNone(d["efsFileSystemId"])
+                        self.assertTrue(d["efsCreationToken"])
+                        self.assertEqual(d["efsCreationToken"], gdm.derive_efs_creation_token(d["environment"], d["deploymentId"]))
+                        self.assertEqual((efs.get("storageClass") or {}).get("reclaimPolicy"), "Retain")
+                    elif d["efsMode"] == "existing":
+                        self.assertIsNotNone(d["efsFileSystemId"])
+                        self.assertRegex(d["efsFileSystemId"], gdm._EFS_FILESYSTEM_ID_RE.pattern)
+
+        self.assertEqual(len(alb_orders), len(set(alb_orders)), "ALB groupOrder must be unique across every active shared-ALB descriptor")
 
     def test_existing_oracle_still_uses_gg_oracle_sa(self):
         active, _inactive, _invalid = gdm.scan("dev")

@@ -4,6 +4,8 @@ import sys
 import tempfile
 import unittest
 
+import yaml
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import config as cfgmod
@@ -19,16 +21,21 @@ def write_deployments_yaml(root, content):
     return path
 
 
-def _stage_generated_registry_dir(environment="dev"):
-    """Generates the registry via the sole folder parser and stages it, mirroring the workflow's staging step."""
+def _generate_registry_document(environment="dev"):
+    """Invokes the sole folder parser to produce the same registry the workflow generates, never a handwritten fixture."""
     proc = subprocess.run(
         [sys.executable, DEPLOYMENT_MODEL_TOOL_PATH, "--environment", environment, "registry"],
         capture_output=True, text=True, cwd=REPO_ROOT,
     )
     if proc.returncode != 0:
         raise AssertionError(f"deployment-model registry generation failed: {proc.stdout}\n{proc.stderr}")
+    return proc.stdout
+
+
+def _stage_generated_registry_dir(environment="dev"):
+    """Generates the registry via the sole folder parser and stages it, mirroring the workflow's staging step."""
     target_dir = tempfile.mkdtemp()
-    write_deployments_yaml(target_dir, proc.stdout)
+    write_deployments_yaml(target_dir, _generate_registry_document(environment))
     return target_dir
 
 
@@ -55,13 +62,17 @@ deployments:
 
 class LoadDeploymentsTests(unittest.TestCase):
     def test_real_repo_config_loads_and_derives_correctly(self):
-        # Updated for the first real managed-EFS runtime (gg-postgresql-repltest-01): the live dev registry now has 3 deployments, not 2.
-        doc = cfgmod.load_deployments(_stage_generated_registry_dir())
+        # Self-service: dynamic invariant, never a hardcoded deployment count/name set -- onboarding a new envs/dev/<id>/values.yaml folder must never require editing this test. The loaded deployment IDs are compared directly against the registry the model itself produced.
+        registry_document = _generate_registry_document()
+        expected_names = {d["name"] for d in yaml.safe_load(registry_document)["deployments"]}
+
+        target_dir = tempfile.mkdtemp()
+        write_deployments_yaml(target_dir, registry_document)
+        doc = cfgmod.load_deployments(target_dir)
         self.assertEqual(doc["environment"], "dev")
         self.assertEqual(doc["runtimeNamespace"], "goldengate-dev")
-        self.assertEqual(len(doc["deployments"]), 3)
         names = {d["name"] for d in doc["deployments"]}
-        self.assertEqual(names, {"gg-oracle-payments-01", "gg-postgresql-payments-01", "gg-postgresql-repltest-01"})
+        self.assertEqual(names, expected_names)
         for d in doc["deployments"]:
             self.assertTrue(d["enabled"])
             self.assertEqual(d["adminHost"], f"{d['name']}.goldengate-dev.svc.cluster.local")

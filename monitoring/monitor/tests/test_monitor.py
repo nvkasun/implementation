@@ -378,17 +378,28 @@ class BuildStatusPayloadTests(unittest.TestCase):
         with self.assertRaises(monitor.DynamoDbReadError):
             monitor.build_status_payload(config, table, DEPLOYMENTS, LOGICAL_PIPELINES, clock=lambda: 1780000010)
 
-    def test_real_repo_config_produces_two_runtimes_under_one_pipeline(self):
-        # Updated for the first real managed-EFS runtime (gg-postgresql-repltest-01, pipeline repltest-pg-to-mssql-001, source only, no target yet): the live dev registry now derives 2 logical pipelines, not 1. payments-ora-to-pg-001 still has exactly 2 runtimes (unchanged); the new pipeline has exactly 1 (source-only, as expected before its future MSSQL target is onboarded).
+    def test_real_repo_logical_pipelines_match_dynamically_derived_grouping(self):
+        # Self-service: never asserts a fixed pipeline/runtime count -- the expected pipeline -> {role: name} grouping is derived directly from the same generated registry, so onboarding a new deployment (or pairing an existing source-only pipeline with its future target) is automatically reflected without editing this test. A source-only pipeline with replication disabled remains valid.
         doc = cfgmod.load_deployments(_stage_generated_registry_dir())
         lps = cfgmod.build_logical_pipelines(doc["deployments"])
+
+        expected_by_pipeline = {}
+        for d in doc["deployments"]:
+            roles = expected_by_pipeline.setdefault(d["pipeline"], {})
+            roles[d["role"]] = d["name"]
+        expected_lps = sorted(
+            ({"pipelineId": pid, "roles": roles} for pid, roles in expected_by_pipeline.items()),
+            key=lambda lp: lp["pipelineId"],
+        )
+        self.assertEqual(sorted(lps, key=lambda lp: lp["pipelineId"]), expected_lps)
+
         table = FakeTable([])
         config = make_config()
         payload = monitor.build_status_payload(config, table, doc["deployments"], lps, clock=lambda: 1780000010)
-        self.assertEqual(len(payload["logicalPipelines"]), 2)
-        by_pipeline_id = {lp["pipelineId"]: lp for lp in payload["logicalPipelines"]}
-        self.assertEqual(len(by_pipeline_id["payments-ora-to-pg-001"]["runtimes"]), 2)
-        self.assertEqual(len(by_pipeline_id["repltest-pg-to-mssql-001"]["runtimes"]), 1)
+        self.assertEqual(len(payload["logicalPipelines"]), len(expected_lps))
+        runtimes_by_pipeline = {lp["pipelineId"]: len(lp["runtimes"]) for lp in payload["logicalPipelines"]}
+        for pipeline_id, roles in expected_by_pipeline.items():
+            self.assertEqual(runtimes_by_pipeline[pipeline_id], len(roles))
 
 
 class DecimalConversionTests(unittest.TestCase):
@@ -2597,21 +2608,23 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         self.assertNotIn(r"\s", post_rollout_awk_text)
         self.assertIn("[[:space:]]", post_rollout_awk_text)
 
-    def test_deployment_discovery_awk_returns_exactly_all_enabled_deployments(self):
-        # Executes the actual committed awk snippet under the system's real awk against the real config, not a reimplementation; the awk emits "name|type" pairs so this asserts all three. Updated for the first real managed-EFS runtime (gg-postgresql-repltest-01) -- the registry is deployment-ID-sorted, so it sorts between gg-postgresql-payments-01 and nothing else.
+    def test_deployment_discovery_awk_matches_dynamically_derived_registry_pairs(self):
+        # Self-service: executes the actual committed awk snippet under the system's real awk against the real config, not a reimplementation -- compared for EXACT equality against "name|type" pairs derived directly from the same generated registry (never a hardcoded real-inventory list), so onboarding a new folder never requires editing this test.
         if shutil.which("awk") is None:
             raise unittest.SkipTest("awk not available")
         preflight_idx = self.monitor_text.index("mapfile -t ENABLED_DEPLOYMENT_PAIRS < <(awk '")
         script_start = self.monitor_text.index("'", preflight_idx) + 1
         script_end = self.monitor_text.index("'", script_start)
         awk_script = self.monitor_text[script_start:script_end]
+        registry_document = _generate_registry_document()
         registry_path = _stage_generated_registry(tempfile.mkdtemp())
         proc = subprocess.run(["awk", awk_script, registry_path], capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         pairs = [line for line in proc.stdout.splitlines() if line]
-        self.assertEqual(pairs, ["gg-oracle-payments-01|oracle", "gg-postgresql-payments-01|postgresql", "gg-postgresql-repltest-01|postgresql"])
-        names = [pair.split("|", 1)[0] for pair in pairs]
-        self.assertEqual(names, ["gg-oracle-payments-01", "gg-postgresql-payments-01", "gg-postgresql-repltest-01"])
+
+        registry = yaml.safe_load(registry_document)
+        expected_pairs = sorted(f"{d['name']}|{d['type']}" for d in registry["deployments"] if d.get("enabled"))
+        self.assertEqual(pairs, expected_pairs)
 
     def test_deployment_discovery_never_hardcodes_names_in_production_logic(self):
         preflight_idx = self.monitor_text.index("- name: CloudWatch publication preflight")
