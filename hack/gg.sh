@@ -1,129 +1,127 @@
-Verify whether the actual fix succeeded
+What we should do next
 
-Run this:
+Before adding MSSQL, we should finish proving the managed-EFS lifecycle. Terraform creation succeeded and the runtime deployed, but we should now verify the actual chain all the way down to /u02.
 
-NS="amazon-cloudwatch"
+Verify the Kubernetes storage chain. Run these read-only commands:
+kubectl get sts -n goldengate-dev
+kubectl get pods -n goldengate-dev -o wide
+kubectl get pvc -n goldengate-dev -o wide
+kubectl get pv -o wide
+kubectl get storageclass
 
-kubectl get deployment cloudwatch-agent-cluster-scraper \
-  -n "$NS" \
-  -o json |
-jq '{
-  uid: .metadata.uid,
-  deleting: .metadata.deletionTimestamp,
-  generation: .metadata.generation,
-  observedGeneration: .status.observedGeneration,
-  hostNetwork: .spec.template.spec.hostNetwork,
-  replicas: .status.replicas,
-  updatedReplicas: .status.updatedReplicas,
-  availableReplicas: .status.availableReplicas,
-  unavailableReplicas: (.status.unavailableReplicas // 0)
-}'
+Find the resources belonging to:
 
-Expected:
+gg-postgresql-repltest-01
 
-hostNetwork: false
-generation == observedGeneration
-replicas: 1
-updatedReplicas: 1
-availableReplicas: 1
-unavailableReplicas: 0
+The expected relationship is:
 
-Then verify the scraper pod:
+gg-postgresql-repltest-01 Pod
+            ↓
+         /u02
+            ↓
+           PVC
+            ↓
+            PV
+            ↓
+     EFS CSI Access Point
+            ↓
+ NEW dedicated EFS filesystem
 
-SELECTOR="$(
-  kubectl get deployment cloudwatch-agent-cluster-scraper \
-    -n "$NS" \
-    -o json |
-  jq -r '
-    .spec.selector.matchLabels
-    | to_entries
-    | map("\(.key)=\(.value)")
-    | join(",")
-  '
-)"
+Then run:
 
-kubectl get pods \
-  -n "$NS" \
-  -l "$SELECTOR" \
-  -o json |
-jq -r '
-  .items[]
-  | select(.metadata.deletionTimestamp == null)
-  | [
-      .metadata.name,
-      .spec.nodeName,
-      (.spec.hostNetwork // false),
-      .status.hostIP,
-      .status.podIP,
-      .status.phase,
-      (
-        [.status.conditions[]?
-          | select(.type == "Ready")
-          | .status
-        ][0] // "Unknown"
-      )
-    ]
-  | @tsv
-'
+kubectl describe pvc <REPLTEST-PVC-NAME> -n goldengate-dev
 
-Expected:
+and:
 
-hostNetwork=false
-podIP different from hostIP
-phase=Running
-Ready=True
+kubectl get pv <PV-NAME> -o yaml
 
-Finally, verify the node agents:
+We especially want the CSI section from that PV. It should identify the EFS CSI driver and the real EFS filesystem/access-point identity.
 
-kubectl get daemonset cloudwatch-agent \
-  -n "$NS" \
-  -o json |
-jq '{
-  hostNetwork: .spec.template.spec.hostNetwork,
-  desired: .status.desiredNumberScheduled,
-  current: .status.currentNumberScheduled,
-  updated: .status.updatedNumberScheduled,
-  ready: .status.numberReady,
-  available: .status.numberAvailable,
-  unavailable: (.status.numberUnavailable // 0)
-}'
+Then check /u02 from the actual new pod:
 
-Expected:
+kubectl exec -n goldengate-dev <GG-POSTGRESQL-REPLTEST-POD> -- df -hT /u02
 
-hostNetwork: true
-desired: 2
-ready: 2
-available: 2
-unavailable: 0
+and:
 
-If these outputs match, the live CloudWatch correction succeeded. Only the GitHub workflow logic needs adjustment.
+kubectl exec -n goldengate-dev <GG-POSTGRESQL-REPLTEST-POD> -- mount
 
-Correct workflow change
+Don't change anything yet. Send me those outputs/screenshots and I'll verify the mapping.
 
-Remove this hard requirement:
+Verify the new EFS in AWS. In the EFS console, find the filesystem with:
+Name:
+dev-gg-postgresql-repltest-01-efs
 
-The Deployment name must become NotFound before recreation is accepted
+We should confirm:
 
-Replace it with:
+State                    Available
+Performance mode         General Purpose
+Throughput mode          Elastic
+Encrypted                Yes
+KMS key                  approved ADCB EFS key
 
-1. Record old Deployment UID
-2. Delete the Deployment once
-3. Poll the Deployment by name
-4. NotFound is acceptable but not required
-5. Continue while the returned UID equals the old UID
-6. Recreation succeeds when the returned UID differs from the old UID
-7. Validate the new Deployment has hostNetwork=false
+ManagedBy
+  goldengate-eks-app
 
-The polling states should be:
+GoldenGateDeploymentId
+  gg-postgresql-repltest-01
 
-No Deployment found
-→ deletion completed; continue waiting for recreation
+GoldenGateEnvironment
+  dev
 
-Deployment found with old UID and deletionTimestamp
-→ old object is terminating; continue waiting
+GoldenGateStorage
+  u02
 
-Deployment found with old UID
-→ continue waiting until timeout
+And there should be the three mount targets we saw Terraform create.
 
-Deployment found with different UID
-→ new object successfully created; validate it
+Most importantly:
+
+NEW managed PostgreSQL runtime
+        ↓
+NEW fs-xxxxxxxx
+
+must NOT equal
+
+fs-05cadf3570f23cd39
+
+The latter must remain the historical EFS for the old deployments.
+
+After those read-only checks, perform the persistence test. This is the real proof that our /u02 architecture works.
+
+Create a harmless marker in a dedicated test directory:
+
+kubectl exec -n goldengate-dev <POD> -- \
+  sh -c 'mkdir -p /u02/.vdr-persistence-test && date > /u02/.vdr-persistence-test/marker.txt'
+
+Confirm it:
+
+kubectl exec -n goldengate-dev <POD> -- \
+  cat /u02/.vdr-persistence-test/marker.txt
+
+Then recreate only the repltest pod:
+
+kubectl delete pod <POD> -n goldengate-dev
+
+Wait for the StatefulSet to recreate it:
+
+kubectl get pods -n goldengate-dev -w
+
+Once the replacement is Running, check:
+
+kubectl exec -n goldengate-dev <NEW-POD> -- \
+  cat /u02/.vdr-persistence-test/marker.txt
+
+If the original marker is still there:
+
+Pod A
+   ↓ write marker
+EFS-A
+   ↓
+Pod A deleted
+   ↓
+Pod B created
+   ↓
+same EFS-A
+   ↓
+marker survives ✅
+
+Then we can confidently mark managed /u02 persistence as live-proven.
