@@ -75,6 +75,9 @@ env:
   RUNTIME_SA_NAME: gg-runtime-sa
   RUNTIME_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev
 
+  # Fixed, explicitly-reviewed migration-compatibility identities -- NOT derived from the folder-driven deployment inventory. Old historical Oracle/PostgreSQL workloads may still reference them until reconciled onto RUNTIME_SA_NAME; the platform chart must keep rendering them as DESIRED state (never rely on Prune=false alone) until their later, separate, evidence-driven retirement phase. Space-separated since GitHub Actions env vars are plain strings.
+  TRANSITIONAL_RUNTIME_SA_NAMES: "gg-oracle-sa gg-postgresql-sa"
+
   # Platform-level Fluent Bit DaemonSet's dedicated least-privilege role -- see envs/dev/policies/goldengate-platform-logging-dev/.
   FLUENT_BIT_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGatePlatformLoggingRole-dev
   FLUENT_BIT_SA_NAME: gg-fluent-bit
@@ -487,6 +490,9 @@ jobs:
             fi
           }
           assert_exactly_one_serviceaccount "$RUNTIME_SA_NAME"
+          for transitional_sa_name in $TRANSITIONAL_RUNTIME_SA_NAMES; do
+            assert_exactly_one_serviceaccount "$transitional_sa_name"
+          done
           assert_exactly_one_serviceaccount "$FLUENT_BIT_SA_NAME"
 
           # deletion_protected is "true" for every shared runtime identity (must survive this Application's own deletion) and "false" for gg-fluent-bit (pruned/deleted normally with this release).
@@ -527,7 +533,37 @@ jobs:
           }
 
           validate_runtime_sa "$RUNTIME_SA_NAME" "$RUNTIME_ROLE_ARN" "true"
+          for transitional_sa_name in $TRANSITIONAL_RUNTIME_SA_NAMES; do
+            # Transitional identities use the SAME runtime IAM role as RUNTIME_SA_NAME -- no new IAM permissions, and deletion-protected exactly like the canonical identity (they must remain desired state, never rely on Prune=false alone).
+            validate_runtime_sa "$transitional_sa_name" "$RUNTIME_ROLE_ARN" "true"
+          done
           validate_runtime_sa "$FLUENT_BIT_SA_NAME" "$FLUENT_BIT_ROLE_ARN" "false"
+
+          echo "Validating the rendered ServiceAccount set is EXACTLY the canonical + transitional + Fluent Bit identities, never a per-deploymentType identity (e.g. no gg-mssql-sa)..."
+          SA_SPLIT_DIR="$(mktemp -d)"
+          awk -v outdir="$SA_SPLIT_DIR" '
+            BEGIN { docnum = 0; fname = outdir "/doc-0.yaml" }
+            /^---$/ { docnum++; fname = outdir "/doc-" docnum ".yaml"; next }
+            { print > fname }
+          ' "$RENDERED"
+          RENDERED_SA_NAMES=""
+          for doc in "$SA_SPLIT_DIR"/doc-*.yaml; do
+            if grep -q '^kind: ServiceAccount$' "$doc"; then
+              RENDERED_SA_NAMES="${RENDERED_SA_NAMES}
+          $(grep -m1 '^  name:' "$doc" | awk '{print $2}')"
+            fi
+          done
+          rm -rf "$SA_SPLIT_DIR"
+          RENDERED_SA_NAMES="$(echo "$RENDERED_SA_NAMES" | grep -v '^$' | sort -u)"
+          EXPECTED_SA_NAMES="$(printf '%s\n%s\n%s\n' "$RUNTIME_SA_NAME" "$FLUENT_BIT_SA_NAME" "$TRANSITIONAL_RUNTIME_SA_NAMES" | tr ' ' '\n' | grep -v '^$' | sort -u)"
+          if [ "$RENDERED_SA_NAMES" = "$EXPECTED_SA_NAMES" ]; then
+            echo "OK: rendered ServiceAccount set is exactly {$(echo "$EXPECTED_SA_NAMES" | tr '\n' ' ')}."
+          else
+            echo "FAIL: rendered ServiceAccount set does not exactly match the expected canonical+transitional+logging set."
+            echo "Expected:"; echo "$EXPECTED_SA_NAMES"
+            echo "Actual:"; echo "$RENDERED_SA_NAMES"
+            exit 1
+          fi
 
           echo "Validating no unexpected IRSA role is used by any rendered ServiceAccount..."
           ALLOWED_RUNTIME_ROLE_ARNS="$(printf '%s\n%s' "$RUNTIME_ROLE_ARN" "$FLUENT_BIT_ROLE_ARN")"
@@ -955,14 +991,16 @@ jobs:
           echo "Namespace:"
           kubectl get namespace "$RUNTIME_NAMESPACE"
 
-          echo "ServiceAccount and IRSA annotation:"
-          kubectl get serviceaccount "$RUNTIME_SA_NAME" -n "$RUNTIME_NAMESPACE"
-          actual_role_annotation="$(kubectl get serviceaccount "$RUNTIME_SA_NAME" -n "$RUNTIME_NAMESPACE" -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}')"
-          if [ "$actual_role_annotation" != "$RUNTIME_ROLE_ARN" ]; then
-            echo "FAIL: unexpected IRSA role annotation on ServiceAccount ${RUNTIME_SA_NAME}: ${actual_role_annotation}"
-            exit 1
-          fi
-          echo "OK: ${RUNTIME_SA_NAME} IRSA role annotation matches ${RUNTIME_ROLE_ARN}."
+          echo "ServiceAccounts and IRSA annotations (canonical + transitional):"
+          for live_sa_name in "$RUNTIME_SA_NAME" $TRANSITIONAL_RUNTIME_SA_NAMES; do
+            kubectl get serviceaccount "$live_sa_name" -n "$RUNTIME_NAMESPACE"
+            actual_role_annotation="$(kubectl get serviceaccount "$live_sa_name" -n "$RUNTIME_NAMESPACE" -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}')"
+            if [ "$actual_role_annotation" != "$RUNTIME_ROLE_ARN" ]; then
+              echo "FAIL: unexpected IRSA role annotation on ServiceAccount ${live_sa_name}: ${actual_role_annotation}"
+              exit 1
+            fi
+            echo "OK: ${live_sa_name} IRSA role annotation matches ${RUNTIME_ROLE_ARN}."
+          done
 
           echo "Confirming this Application owns no GoldenGate runtime workload resources (namespaces/ServiceAccounts and the Phase 6A Fluent Bit DaemonSet only)..."
           WORKLOAD_COUNT=0
@@ -1012,11 +1050,13 @@ jobs:
             echo ""
             echo "### Ownership"
             echo ""
-            echo "This is the single designated owner of Namespace/${RUNTIME_NAMESPACE} and"
-            echo "ServiceAccount/${RUNTIME_SA_NAME} -- the one shared runtime identity used by"
-            echo "every GoldenGate deployment type. Individual GoldenGate runtime Applications"
-            echo "(goldengate-eks-app.yaml) reference this ServiceAccount by name only"
-            echo "(serviceAccount.create=false) and never own or delete it."
+            echo "This is the single designated owner of Namespace/${RUNTIME_NAMESPACE},"
+            echo "ServiceAccount/${RUNTIME_SA_NAME} (the one canonical runtime identity every"
+            echo "GoldenGate deployment type shares), and the fixed transitional migration-"
+            echo "compatibility identities (${TRANSITIONAL_RUNTIME_SA_NAMES// /, }) still used by"
+            echo "old historical runtimes. Individual GoldenGate runtime Applications"
+            echo "(goldengate-eks-app.yaml) reference their resolved ServiceAccount by name only"
+            echo "(serviceAccount.create=false) and never own or delete any of them."
             echo ""
             echo "Phase 6A: this Application also owns DaemonSet/gg-fluent-bit"
             echo "(platform-level centralized container logging, ServiceAccount/${FLUENT_BIT_SA_NAME},"

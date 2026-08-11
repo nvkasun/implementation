@@ -6016,6 +6016,21 @@ else
   fail "26: the platform chart's shared runtime ServiceAccount is missing the goldengate.adcb/purpose: runtime label"
 fi
 
+# Rollout-safety correction: gg-oracle-sa/gg-postgresql-sa are a FIXED, explicitly-reviewed transitional migration-compatibility list -- retained in values.yaml (never derived from the folder-driven deployment inventory), rendered via one generic range in the template (never a per-flavour branch).
+if grep -qE '^\s*transitionalRuntimeServiceAccounts:\s*$' helm/goldengate-platform/values.yaml 2>/dev/null \
+    && grep -qE '^\s*-\s*name:\s*gg-oracle-sa\s*$' helm/goldengate-platform/values.yaml 2>/dev/null \
+    && grep -qE '^\s*-\s*name:\s*gg-postgresql-sa\s*$' helm/goldengate-platform/values.yaml 2>/dev/null; then
+  pass "26: the platform chart's values.yaml declares the fixed transitionalRuntimeServiceAccounts list (gg-oracle-sa, gg-postgresql-sa)"
+else
+  fail "26: the platform chart's values.yaml is missing the fixed transitionalRuntimeServiceAccounts list"
+fi
+
+if grep -qE '\{\{-?\s*range\s+\.Values\.transitionalRuntimeServiceAccounts' helm/goldengate-platform/templates/runtime-serviceaccounts.yaml 2>/dev/null; then
+  pass "26: the platform chart template renders transitionalRuntimeServiceAccounts via one generic range, never a per-flavour branch"
+else
+  fail "26: the platform chart template no longer generically renders transitionalRuntimeServiceAccounts"
+fi
+
 if [ "$HELM_AVAILABLE" = "true" ]; then
   PLATFORM_SA_RENDER="$(helm template gg-platform helm/goldengate-platform \
     --values platform/dev/goldengate-platform/values.yaml \
@@ -6025,13 +6040,59 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
     --set-string fluentBit.image.reference=229410149234.dkr.ecr.eu-west-1.amazonaws.com/aws-cloud-factory-fluent-bit@sha256:366923ffc51dfde4966e743dcbd4ca05211b733d4f69c7591903bc7660fbf243 \
     2>/dev/null)"
   RENDERED_SA_COUNT="$(echo "$PLATFORM_SA_RENDER" | grep -c '^kind: ServiceAccount$' || true)"
-  if [ "$RENDERED_SA_COUNT" -eq 2 ] \
+  if [ "$RENDERED_SA_COUNT" -eq 4 ] \
       && [ "$(echo "$PLATFORM_SA_RENDER" | grep -c 'name: gg-runtime-sa')" -eq 1 ] \
+      && [ "$(echo "$PLATFORM_SA_RENDER" | grep -c 'name: gg-oracle-sa')" -eq 1 ] \
+      && [ "$(echo "$PLATFORM_SA_RENDER" | grep -c 'name: gg-postgresql-sa')" -eq 1 ] \
       && echo "$PLATFORM_SA_RENDER" | grep -q "name: gg-fluent-bit" \
-      && ! echo "$PLATFORM_SA_RENDER" | grep -qE "name: gg-(oracle|postgresql|mssql|daa|mysql)-sa"; then
-    pass "26: the platform chart renders exactly 2 ServiceAccounts (the one shared gg-runtime-sa + gg-fluent-bit), never a per-engine identity"
+      && ! echo "$PLATFORM_SA_RENDER" | grep -qE "name: gg-(mssql|daa|mysql|sqlserver|distributed)-sa"; then
+    pass "26: the platform chart renders exactly the 4 expected ServiceAccounts (canonical gg-runtime-sa + transitional gg-oracle-sa/gg-postgresql-sa + gg-fluent-bit), never a per-deploymentType identity"
   else
-    fail "26: the rendered platform chart ServiceAccount set is not exactly {gg-runtime-sa, gg-fluent-bit} (found ${RENDERED_SA_COUNT} ServiceAccount documents)"
+    fail "26: the rendered platform chart ServiceAccount set is not exactly {gg-runtime-sa, gg-oracle-sa, gg-postgresql-sa, gg-fluent-bit} (found ${RENDERED_SA_COUNT} ServiceAccount documents)"
+  fi
+
+  PLATFORM_SA_SPLIT_DIR="$(mktemp -d)"
+  awk -v outdir="$PLATFORM_SA_SPLIT_DIR" '
+    BEGIN { docnum = 0; fname = outdir "/doc-0.yaml" }
+    /^---$/ { docnum++; fname = outdir "/doc-" docnum ".yaml"; next }
+    { print > fname }
+  ' <<< "$PLATFORM_SA_RENDER"
+  ORACLE_SA_BLOCK=""
+  POSTGRESQL_SA_BLOCK=""
+  for doc in "$PLATFORM_SA_SPLIT_DIR"/doc-*.yaml; do
+    if grep -q '^kind: ServiceAccount$' "$doc" && grep -q '^  name: gg-oracle-sa$' "$doc"; then
+      ORACLE_SA_BLOCK="$(cat "$doc")"
+    fi
+    if grep -q '^kind: ServiceAccount$' "$doc" && grep -q '^  name: gg-postgresql-sa$' "$doc"; then
+      POSTGRESQL_SA_BLOCK="$(cat "$doc")"
+    fi
+  done
+  rm -rf "$PLATFORM_SA_SPLIT_DIR"
+  if echo "$ORACLE_SA_BLOCK" | grep -q "goldengate.adcb/engine: oracle" \
+      && echo "$ORACLE_SA_BLOCK" | grep -qF "arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev" \
+      && echo "$ORACLE_SA_BLOCK" | grep -qF "argocd.argoproj.io/sync-options: Prune=false,Delete=false" \
+      && echo "$POSTGRESQL_SA_BLOCK" | grep -q "goldengate.adcb/engine: postgresql" \
+      && echo "$POSTGRESQL_SA_BLOCK" | grep -qF "arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev" \
+      && echo "$POSTGRESQL_SA_BLOCK" | grep -qF "argocd.argoproj.io/sync-options: Prune=false,Delete=false"; then
+    pass "26: gg-oracle-sa/gg-postgresql-sa preserve their exact pre-migration goldengate.adcb/engine label, use the SAME runtime IAM role as gg-runtime-sa (no new IAM permissions), and remain deletion-protected (Prune=false,Delete=false)"
+  else
+    fail "26: the transitional gg-oracle-sa/gg-postgresql-sa ServiceAccounts do not preserve the expected label/role-ARN/deletion-protection metadata contract"
+  fi
+
+  # ROLLOUT-SAFETY REGRESSION: the defect found in review was that the platform Argo Application has automated.prune=true, so any ServiceAccount missing from Helm's DESIRED state (not just "orphaned but Prune=false") would be treated as removed. This proves the desired render itself -- never reliance on Prune=false alone -- is what keeps gg-oracle-sa/gg-postgresql-sa alive during this migration phase.
+  if grep -qF "automated:" "$PLATFORM_WORKFLOW" 2>/dev/null && grep -qF "prune: true" "$PLATFORM_WORKFLOW" 2>/dev/null && grep -qF "selfHeal: true" "$PLATFORM_WORKFLOW" 2>/dev/null \
+      && [ "$(echo "$PLATFORM_SA_RENDER" | grep -c 'name: gg-oracle-sa')" -eq 1 ] \
+      && [ "$(echo "$PLATFORM_SA_RENDER" | grep -c 'name: gg-postgresql-sa')" -eq 1 ]; then
+    pass "26 (Argo prune safety): the platform Application keeps automated.prune=true/selfHeal=true AND the Helm desired state itself still renders gg-oracle-sa/gg-postgresql-sa -- they survive the next sync as genuine desired resources, never merely as orphaned Prune=false extras"
+  else
+    fail "26 (Argo prune safety): either automated.prune/selfHeal changed, or the transitional ServiceAccounts are missing from the rendered desired state -- with prune=true this would delete them on the next sync"
+  fi
+
+  # Adding a brand-new deploymentType (e.g. mysql, mssql) must have ZERO effect on the platform chart's rendered ServiceAccount set -- it is driven entirely by fixed values.yaml data, never by the folder-driven deployment inventory.
+  if ! echo "$PLATFORM_SA_RENDER" | grep -q "name: gg-mysql-sa" && ! echo "$PLATFORM_SA_RENDER" | grep -q "name: gg-mssql-sa"; then
+    pass "26: the real gg-mssql-repltest-01 descriptor (and any synthetic mysql deployment) never causes the platform chart to render gg-mssql-sa/gg-mysql-sa -- the ServiceAccount set is fixed values.yaml data, not folder-derived"
+  else
+    fail "26: an engine-specific ServiceAccount (gg-mssql-sa/gg-mysql-sa) was rendered by the platform chart -- self-service onboarding must never create one"
   fi
 else
   skip "26: platform ServiceAccount render check -- helm not available"
@@ -6042,6 +6103,26 @@ if grep -q "goldengate-dev:gg-runtime-sa" "$STS_TRUST_POLICY" 2>/dev/null; then
   pass "26: IAM trust policy trusts the permanent canonical system:serviceaccount:goldengate-dev:gg-runtime-sa subject"
 else
   fail "26: IAM trust policy is missing the canonical system:serviceaccount:goldengate-dev:gg-runtime-sa subject"
+fi
+
+# During this migration phase, the two transitional subjects must remain EXACTLY as-is -- fixed migration-compatibility entries, never derived from or affected by the folder-driven deployment inventory (a new deploymentType must never touch this file).
+if grep -q "goldengate-dev:gg-oracle-sa" "$STS_TRUST_POLICY" 2>/dev/null \
+    && grep -q "goldengate-dev:gg-postgresql-sa" "$STS_TRUST_POLICY" 2>/dev/null; then
+  pass "26: IAM trust policy still trusts both fixed transitional subjects (system:serviceaccount:goldengate-dev:gg-oracle-sa, gg-postgresql-sa) exactly as before"
+else
+  fail "26: IAM trust policy is missing one or both fixed transitional subjects (gg-oracle-sa/gg-postgresql-sa)"
+fi
+
+if grep -q "gg-dev-\*:ogg-oracle-sa" "$STS_TRUST_POLICY" 2>/dev/null; then
+  pass "26: IAM trust policy still retains the unchanged legacy historical Oracle wildcard exception (system:serviceaccount:gg-dev-*:ogg-oracle-sa)"
+else
+  fail "26: IAM trust policy's legacy historical Oracle wildcard exception is missing"
+fi
+
+if grep -qE '"system:serviceaccount:goldengate-dev:\*"|goldengate-dev:gg-\\?\*-sa|goldengate-dev:gg-mssql-sa' "$STS_TRUST_POLICY" 2>/dev/null; then
+  fail "26: IAM trust policy contains an unexpected new wildcard or gg-mssql-sa subject"
+else
+  pass "26: IAM trust policy contains no new wildcard and no gg-mssql-sa subject"
 fi
 
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
