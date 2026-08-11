@@ -304,8 +304,8 @@ fi
 echo ""
 echo "--- Helm lint ---"
 if [ "$HELM_AVAILABLE" = "true" ]; then
-  # deploymentModel has no usable default and assertSupportedDeploymentModel fires at render time, so lint against a real canonical values file (declares deploymentModel: singleRuntime), never bare/values-less -- matches how the chart is linted in production.
-  if helm lint "$RUNTIME_CHART" -f "${REPO_ROOT}/envs/dev/gg-oracle-payments-01/values.yaml" --set global.environment=dev "${ORACLE_SHARED_OVERRIDES[@]}" >"${WORKDIR}/lint-runtime.log" 2>&1; then
+  # deploymentModel has no usable default and assertSupportedDeploymentModel fires at render time, so lint against a real canonical values file (declares deploymentModel: singleRuntime), never bare/values-less -- matches how the chart is linted in production. gg-postgresql-repltest-01 is role=source, so it takes the source-secret override set (ORACLE_SHARED_OVERRIDES is named for the historical oracle=source descriptor but its objectName values are role-based, not engine-based).
+  if helm lint "$RUNTIME_CHART" -f "${REPO_ROOT}/envs/dev/gg-postgresql-repltest-01/values.yaml" --set global.environment=dev "${ORACLE_SHARED_OVERRIDES[@]}" >"${WORKDIR}/lint-runtime.log" 2>&1; then
     pass "helm lint ${RUNTIME_CHART} (canonical singleRuntime values)"
   else
     fail "helm lint ${RUNTIME_CHART} (canonical singleRuntime values)"
@@ -2867,8 +2867,8 @@ check_one() {
   fi
 }
 
-check_one "envs/dev/gg-oracle-payments-01/values.yaml" 0 "oracle-active"
-check_one "envs/dev/gg-postgresql-payments-01/values.yaml" 0 "postgresql-active"
+check_one "envs/dev/gg-postgresql-repltest-01/values.yaml" 0 "postgresql-repltest-active"
+check_one "envs/dev/gg-mssql-repltest-01/values.yaml" 0 "mssql-repltest-active"
 HARNESS
 
   ACTIVE_CHECK_OUTPUT="$(bash "${WORKDIR}/run_is_active_checks.sh" 2>&1 || true)"
@@ -2892,8 +2892,8 @@ check_one() {
   fi
 }
 
-check_one "envs/dev/gg-oracle-payments-01/values.yaml" 0 "oracle-is-gg"
-check_one "envs/dev/gg-postgresql-payments-01/values.yaml" 0 "postgresql-is-gg"
+check_one "envs/dev/gg-postgresql-repltest-01/values.yaml" 0 "postgresql-repltest-is-gg"
+check_one "envs/dev/gg-mssql-repltest-01/values.yaml" 0 "mssql-repltest-is-gg"
 check_one "envs/dev/goldengate-monitor/values.yaml" 1 "monitor-is-not-gg"
 check_one "envs/dev/argocd/values.yaml" 1 "argocd-is-not-gg"
 HARNESS
@@ -2901,8 +2901,8 @@ HARNESS
   GG_CHECK_OUTPUT="$(bash "${WORKDIR}/run_is_gg_checks.sh" 2>&1 || true)"
   echo "$GG_CHECK_OUTPUT"
 
-  if echo "$GG_CHECK_OUTPUT" | grep -q "^PASS oracle-is-gg" \
-      && echo "$GG_CHECK_OUTPUT" | grep -q "^PASS postgresql-is-gg"; then
+  if echo "$GG_CHECK_OUTPUT" | grep -q "^PASS postgresql-repltest-is-gg" \
+      && echo "$GG_CHECK_OUTPUT" | grep -q "^PASS mssql-repltest-is-gg"; then
     pass "the real workflow's is_goldengate_deployment_values_file() classifies both canonical GoldenGate deployment folders correctly"
   else
     fail "one or more canonical GoldenGate deployment folders are misclassified by is_goldengate_deployment_values_file()"
@@ -2915,7 +2915,7 @@ HARNESS
     fail "goldengate-monitor and/or argocd are incorrectly classified as GoldenGate deployments"
   fi
 
-  if echo "$ACTIVE_CHECK_OUTPUT" | grep -q "^PASS oracle-active" && echo "$ACTIVE_CHECK_OUTPUT" | grep -q "^PASS postgresql-active"; then
+  if echo "$ACTIVE_CHECK_OUTPUT" | grep -q "^PASS postgresql-repltest-active" && echo "$ACTIVE_CHECK_OUTPUT" | grep -q "^PASS mssql-repltest-active"; then
     pass "the real workflow's is_active_deployment_values_file() reports both canonical folders active"
   else
     fail "one or both canonical folders are not reported active by the real workflow function"
@@ -3460,6 +3460,64 @@ if [ -f "${WORKDIR}/detect_script.sh" ] && [ -s "${WORKDIR}/detect_script.sh" ] 
       setup_rename \
       'ADDED id=gg-oracle-payments-01 model=singleRuntime' \
       'ADDED id=gg-oracle-payments-01-renamed'
+
+    # RETIREMENT PROOF: replays the actual physical removal performed by this task -- both gg-oracle-payments-01 and gg-postgresql-payments-01 (their real, last-committed existing-mode content, pulled from this repo's own Git history) deleted in a single commit -- through the real discovery+deletion logic against a genuine Git diff, and confirms deploymentModel/efs_mode/reason for BOTH.
+    RETIREMENT_PROOF_REPO="${WORKDIR}/retirement-proof-repo"
+    rm -rf "$RETIREMENT_PROOF_REPO"
+    mkdir -p "${RETIREMENT_PROOF_REPO}/envs/dev/gg-oracle-payments-01" "${RETIREMENT_PROOF_REPO}/envs/dev/gg-postgresql-payments-01"
+    git show HEAD:envs/dev/gg-oracle-payments-01/values.yaml > "${RETIREMENT_PROOF_REPO}/envs/dev/gg-oracle-payments-01/values.yaml"
+    git show HEAD:envs/dev/gg-postgresql-payments-01/values.yaml > "${RETIREMENT_PROOF_REPO}/envs/dev/gg-postgresql-payments-01/values.yaml"
+    git -C "$RETIREMENT_PROOF_REPO" init -q
+    git -C "$RETIREMENT_PROOF_REPO" config user.email "test@test.invalid"
+    git -C "$RETIREMENT_PROOF_REPO" config user.name "test"
+    git -C "$RETIREMENT_PROOF_REPO" add -A
+    git -C "$RETIREMENT_PROOF_REPO" commit -q -m "base revision: both historical descriptors present"
+    RETIREMENT_BEFORE_SHA="$(git -C "$RETIREMENT_PROOF_REPO" rev-parse HEAD)"
+    rm -rf "${RETIREMENT_PROOF_REPO}/envs/dev/gg-oracle-payments-01" "${RETIREMENT_PROOF_REPO}/envs/dev/gg-postgresql-payments-01"
+    git -C "$RETIREMENT_PROOF_REPO" add -A
+    git -C "$RETIREMENT_PROOF_REPO" commit -q -m "physical removal of both retired descriptors"
+
+    set +e
+    RETIREMENT_PROOF_OUTPUT="$(cd "$RETIREMENT_PROOF_REPO" && bash -c '
+      set -euo pipefail
+      source "'"${WORKDIR}"'/is_gg_fn.sh"
+      source "'"${WORKDIR}"'/is_active_fn.sh"
+      jq() {
+        local stdin_content
+        stdin_content="$(cat)"
+        shift
+        local args=("$@") model="" id="" reason="" efs_mode=""
+        for i in "${!args[@]}"; do
+          [ "${args[$i]}" = "deployment_id" ] && id="${args[$((i+1))]}"
+          [ "${args[$i]}" = "deployment_model" ] && model="${args[$((i+1))]}"
+          [ "${args[$i]}" = "reason" ] && reason="${args[$((i+1))]}"
+          [ "${args[$i]}" = "efs_mode" ] && efs_mode="${args[$((i+1))]}"
+        done
+        if [ "$stdin_content" = "[]" ]; then
+          echo "[ADDED id=${id} model=${model} efs_mode=${efs_mode} reason=${reason}]"
+        else
+          echo "${stdin_content} [ADDED id=${id} model=${model} efs_mode=${efs_mode} reason=${reason}]"
+        fi
+      }
+      BEFORE_SHA="'"$RETIREMENT_BEFORE_SHA"'"
+      DELETION_MATRIX_ITEMS="[]"
+      INACTIVE_LOG=""
+      DELETION_CANDIDATE_IDS="gg-oracle-payments-01 gg-postgresql-payments-01"
+      source "'"${WORKDIR}"'/deletion_loop.sh"
+      echo "FINAL_DELETION_MATRIX=${DELETION_MATRIX_ITEMS}"
+    ' 2>&1)"
+    RETIREMENT_PROOF_STATUS=$?
+    set -e
+    echo "$RETIREMENT_PROOF_OUTPUT"
+
+    if [ "$RETIREMENT_PROOF_STATUS" -eq 0 ] \
+        && echo "$RETIREMENT_PROOF_OUTPUT" | grep -qF "id=gg-oracle-payments-01 model=singleRuntime efs_mode=existing reason=physical-removal" \
+        && echo "$RETIREMENT_PROOF_OUTPUT" | grep -qF "id=gg-postgresql-payments-01 model=singleRuntime efs_mode=existing reason=physical-removal"; then
+      pass "RETIREMENT: physically deleting both gg-oracle-payments-01 and gg-postgresql-payments-01 in one commit is classified, via the real detect-goldengate-deployments.sh discovery+deletion logic against a genuine Git diff, as TWO physical-removal entries (deploymentModel=singleRuntime, efs_mode=existing, reason=physical-removal for both) -- the managed-EFS deletion guard sees efs_mode=existing (never managed) for both, so it passes"
+    else
+      fail "RETIREMENT: the real physical-removal classification for gg-oracle-payments-01/gg-postgresql-payments-01 did not match expectations (status=${RETIREMENT_PROOF_STATUS})"
+    fi
+    rm -rf "$RETIREMENT_PROOF_REPO"
 
     rm -rf "$DISCOVERY_REPO"
   else
@@ -4013,10 +4071,22 @@ else
   fail "21: ${CANONICAL_CONFIG} appears to reference the retired deployment beyond the shared pipeline: grouping id"
 fi
 
+if [ ! -e "envs/dev/gg-oracle-payments-01" ] && [ ! -e "envs/dev/gg-postgresql-payments-01" ]; then
+  pass "the retired gg-oracle-payments-01/gg-postgresql-payments-01 descriptor folders are physically absent (replaced by the live managed pair gg-postgresql-repltest-01/gg-mssql-repltest-01; still available via Git history)"
+else
+  fail "envs/dev/gg-oracle-payments-01 and/or envs/dev/gg-postgresql-payments-01 still exist -- they must be fully removed"
+fi
+
+if ! grep -q "gg-oracle-payments-01\|gg-postgresql-payments-01" "$CANONICAL_CONFIG" 2>/dev/null; then
+  pass "no active deployment-registry configuration references the retired gg-oracle-payments-01/gg-postgresql-payments-01 descriptors"
+else
+  fail "${CANONICAL_CONFIG} still references a retired descriptor"
+fi
+
 CANONICAL_PRESENCE_MISSING=""
 for f in \
-  envs/dev/gg-oracle-payments-01/values.yaml \
-  envs/dev/gg-postgresql-payments-01/values.yaml \
+  envs/dev/gg-postgresql-repltest-01/values.yaml \
+  envs/dev/gg-mssql-repltest-01/values.yaml \
   envs/dev/goldengate-monitor/values.yaml \
   helm/goldengate/templates/runtime-statefulset.yaml \
   helm/goldengate/templates/runtime-ingress.yaml \
@@ -4080,7 +4150,135 @@ PYEOF
     EFS_WORKDIR="${WORKDIR}/efs-test"
     mkdir -p "${EFS_WORKDIR}/rendered" "${EFS_WORKDIR}/values"
 
-    # EFS_MODE/EFS_FILE_SYSTEM_ID_DECLARED/RESOLVED_EFS_ID mirror what the real workflow's earlier "Resolve deployment identity"/"Resolve EFS filesystem ID" steps would have already exported via $GITHUB_ENV; every call site here uses the real committed gg-oracle-payments-01/gg-postgresql-payments-01 existing-mode identity (fs-05cadf3570f23cd39) unless a scenario is expected to fail before that value is ever consulted.
+    # mode=existing scratch fixtures: gg-oracle-payments-01/gg-postgresql-payments-01 were physically retired from envs/dev/; their exact historical existing-mode content (fs-05cadf3570f23cd39) is reproduced here so this generic mode=existing code path keeps full regression coverage without depending on a committed descriptor.
+    ORACLE_EXISTING_FIXTURE="${EFS_WORKDIR}/values/existing-mode-oracle.yaml"
+    POSTGRESQL_EXISTING_FIXTURE="${EFS_WORKDIR}/values/existing-mode-postgresql.yaml"
+    cat > "$ORACLE_EXISTING_FIXTURE" <<'EOF'
+deployment:
+  enabled: true
+  pipeline: payments-ora-to-pg-001
+  role: source
+global:
+  environment: dev
+deploymentModel: singleRuntime
+replication:
+  enabled: false
+runtime:
+  enabled: true
+  deploymentType: oracle
+  businessDomain: payments
+  containerName: ogg-oracle
+  replicas: 1
+  image:
+    repository: 229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle
+    tag: "23.26.2.0.1"
+    pullPolicy: IfNotPresent
+  csi:
+    enabled: true
+    admin:
+      enabled: true
+      objectType: secretsmanager
+      mountPath: /mnt/secrets-store/admin
+      jmesPath:
+        - path: OGG_ADMIN
+          objectAlias: OGG_ADMIN
+        - path: OGG_ADMIN_PWD
+          objectAlias: OGG_ADMIN_PWD
+    certificate:
+      enabled: true
+      objectType: secretsmanager
+      mountPath: /etc/nginx/cert
+      jmesPath:
+        - path: '"ogg.key"'
+          objectAlias: ogg.key
+        - path: '"ogg.pem"'
+          objectAlias: ogg.pem
+        - path: '"ca-chain.pem"'
+          objectAlias: ca-chain.pem
+  initPermissions:
+    enabled: true
+    mode: "0777"
+  service:
+    type: ClusterIP
+    ports:
+      https: 8443
+      dist: 9013
+      receiver: null
+      metrics: 9015
+  storage:
+    u02:
+      type: efs
+      existingClaim: ""
+      claimName: ""
+      size: 20Gi
+      accessModes:
+        - ReadWriteMany
+    u03:
+      type: emptyDir
+  resources: {}
+  extraEnv: []
+  extraVolumeMounts: []
+  extraVolumes: []
+ingress:
+  enabled: true
+  mode: shared
+  className: alb
+  hostDomain: goldengate-dev.adcbmis.local
+  alb:
+    groupName: gg-poc-dev-alb
+    groupOrder: "110"
+    backendProtocol: HTTPS
+    listenPorts: '[{"HTTPS":443}]'
+    certificateArn: arn:aws:acm:eu-west-1:668311715351:certificate/9e53e28e-3243-47fc-85a1-50f9a94acde7
+    targetType: ip
+    healthcheckProtocol: HTTPS
+    healthcheckPort: traffic-port
+    healthcheckPath: /
+    successCodes: "200-499"
+  annotations: {}
+monitoring:
+  labels:
+    enabled: true
+podSecurityContext: {}
+securityContext:
+  runAsUser: 0
+  runAsGroup: 0
+  allowPrivilegeEscalation: false
+nodeSelector: {}
+tolerations: []
+affinity: {}
+persistence:
+  enabled: true
+  provider: efs
+  efs:
+    mode: existing
+    fileSystemId: fs-05cadf3570f23cd39
+    storageClass:
+      create: true
+      reclaimPolicy: Retain
+      volumeBindingMode: Immediate
+      directoryPerms: "0777"
+      subPathPattern: "${.PVC.name}"
+      ensureUniqueDirectory: "true"
+      mountOptions:
+        - tls
+EOF
+    python3 -c "
+import yaml
+with open('${ORACLE_EXISTING_FIXTURE}') as f:
+    data = yaml.safe_load(f)
+data['deployment']['role'] = 'target'
+data['runtime']['deploymentType'] = 'postgresql'
+data['runtime']['containerName'] = 'ogg-postgresql'
+data['runtime']['image']['repository'] = '229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-postgresql'
+data['runtime']['service']['ports']['dist'] = None
+data['runtime']['service']['ports']['receiver'] = 9014
+data['ingress']['alb']['groupOrder'] = '111'
+with open('${POSTGRESQL_EXISTING_FIXTURE}', 'w') as f:
+    yaml.dump(data, f)
+"
+
+    # EFS_MODE/EFS_FILE_SYSTEM_ID_DECLARED/RESOLVED_EFS_ID mirror what the real workflow's earlier "Resolve deployment identity"/"Resolve EFS filesystem ID" steps would have already exported via $GITHUB_ENV; every call site here uses the scratch existing-mode fixtures above (fs-05cadf3570f23cd39) unless a scenario is expected to fail before that value is ever consulted.
     run_efs_step() {
       ( cd "$EFS_WORKDIR" && \
         RELEASE_NAME="$1" VALUES_FILE="$2" DEPLOYMENT_ID="$3" DEPLOYMENT_MODEL="$4" ENVIRONMENT="$5" \
@@ -4090,15 +4288,15 @@ PYEOF
     }
 
     helm template gg-oracle-payments-01 "$RUNTIME_CHART" --namespace goldengate-dev \
-      --values "${REPO_ROOT}/envs/dev/gg-oracle-payments-01/values.yaml" \
+      --values "$ORACLE_EXISTING_FIXTURE" \
       --set global.environment=dev --set global.deploymentId=gg-oracle-payments-01 "${ORACLE_SHARED_OVERRIDES[@]}" \
       > "${EFS_WORKDIR}/rendered/gg-oracle-payments-01.yaml" 2>"${EFS_WORKDIR}/oracle-render.err" || true
     helm template gg-postgresql-payments-01 "$RUNTIME_CHART" --namespace goldengate-dev \
-      --values "${REPO_ROOT}/envs/dev/gg-postgresql-payments-01/values.yaml" \
+      --values "$POSTGRESQL_EXISTING_FIXTURE" \
       --set global.environment=dev --set global.deploymentId=gg-postgresql-payments-01 "${POSTGRESQL_SHARED_OVERRIDES[@]}" \
       > "${EFS_WORKDIR}/rendered/gg-postgresql-payments-01.yaml" 2>"${EFS_WORKDIR}/postgres-render.err" || true
     set +e
-    ORACLE_OUT="$(run_efs_step "gg-oracle-payments-01" "${REPO_ROOT}/envs/dev/gg-oracle-payments-01/values.yaml" "gg-oracle-payments-01" "singleRuntime" "dev")"
+    ORACLE_OUT="$(run_efs_step "gg-oracle-payments-01" "$ORACLE_EXISTING_FIXTURE" "gg-oracle-payments-01" "singleRuntime" "dev")"
     ORACLE_STATUS=$?
     set -e
     echo "$ORACLE_OUT"
@@ -4109,7 +4307,7 @@ PYEOF
     fi
 
     set +e
-    POSTGRES_OUT="$(run_efs_step "gg-postgresql-payments-01" "${REPO_ROOT}/envs/dev/gg-postgresql-payments-01/values.yaml" "gg-postgresql-payments-01" "singleRuntime" "dev")"
+    POSTGRES_OUT="$(run_efs_step "gg-postgresql-payments-01" "$POSTGRESQL_EXISTING_FIXTURE" "gg-postgresql-payments-01" "singleRuntime" "dev")"
     POSTGRES_STATUS=$?
     set -e
     echo "$POSTGRES_OUT"
@@ -4130,7 +4328,7 @@ PYEOF
     # 4: an explicit non-empty basePath override is honored.
     python3 -c "
 import yaml
-with open('${REPO_ROOT}/envs/dev/gg-oracle-payments-01/values.yaml') as f:
+with open('${ORACLE_EXISTING_FIXTURE}') as f:
     data = yaml.safe_load(f)
 data['persistence']['efs']['storageClass']['basePath'] = '/custom-override-path'
 with open('${EFS_WORKDIR}/values/oracle-override.yaml', 'w') as f:
@@ -4225,7 +4423,7 @@ persistence:
     mode: managed
 EOF
     helm template gg-managed-ok "$RUNTIME_CHART" --namespace goldengate-dev \
-      --values "${REPO_ROOT}/envs/dev/gg-oracle-payments-01/values.yaml" \
+      --values "$ORACLE_EXISTING_FIXTURE" \
       --set global.environment=dev --set global.deploymentId=gg-managed-ok "${ORACLE_SHARED_OVERRIDES[@]}" \
       --set persistence.efs.fileSystemId=fs-0123456789abcdef0 \
       > "${EFS_WORKDIR}/rendered/gg-managed-ok.yaml" 2>"${EFS_WORKDIR}/managed-ok-render.err" || true
@@ -4298,7 +4496,7 @@ with open('${EFS_WORKDIR}/rendered/wrong-basepath.yaml', 'w') as f:
     yaml.dump_all(out, f)
 "
     set +e
-    WRONG_BASEPATH_OUT="$(run_efs_step "wrong-basepath" "${REPO_ROOT}/envs/dev/gg-oracle-payments-01/values.yaml" "gg-oracle-payments-01" "singleRuntime" "dev")"
+    WRONG_BASEPATH_OUT="$(run_efs_step "wrong-basepath" "$ORACLE_EXISTING_FIXTURE" "gg-oracle-payments-01" "singleRuntime" "dev")"
     WRONG_BASEPATH_STATUS=$?
     set -e
     if [ "$WRONG_BASEPATH_STATUS" -ne 0 ] && echo "$WRONG_BASEPATH_OUT" | grep -qF "parameters.basePath"; then
@@ -4321,7 +4519,7 @@ with open('${EFS_WORKDIR}/rendered/wrong-fsid.yaml', 'w') as f:
     yaml.dump_all(out, f)
 "
     set +e
-    WRONG_FSID_OUT="$(run_efs_step "wrong-fsid" "${REPO_ROOT}/envs/dev/gg-oracle-payments-01/values.yaml" "gg-oracle-payments-01" "singleRuntime" "dev")"
+    WRONG_FSID_OUT="$(run_efs_step "wrong-fsid" "$ORACLE_EXISTING_FIXTURE" "gg-oracle-payments-01" "singleRuntime" "dev")"
     WRONG_FSID_STATUS=$?
     set -e
     if [ "$WRONG_FSID_STATUS" -ne 0 ] && echo "$WRONG_FSID_OUT" | grep -qF "parameters.fileSystemId"; then
@@ -4351,7 +4549,7 @@ with open('${EFS_WORKDIR}/rendered/duplicate-storageclass.yaml', 'w') as f:
     yaml.dump_all(out, f)
 "
     set +e
-    DUP_SC_OUT="$(run_efs_step "duplicate-storageclass" "${REPO_ROOT}/envs/dev/gg-oracle-payments-01/values.yaml" "gg-oracle-payments-01" "singleRuntime" "dev")"
+    DUP_SC_OUT="$(run_efs_step "duplicate-storageclass" "$ORACLE_EXISTING_FIXTURE" "gg-oracle-payments-01" "singleRuntime" "dev")"
     DUP_SC_STATUS=$?
     set -e
     if [ "$DUP_SC_STATUS" -ne 0 ] && echo "$DUP_SC_OUT" | grep -qF "expected exactly one StorageClass"; then
@@ -4364,7 +4562,7 @@ with open('${EFS_WORKDIR}/rendered/duplicate-storageclass.yaml', 'w') as f:
     # 22: legacyPair Helm rendering is rejected with a clear controlled error (the chart no longer implements legacyPair source/target rendering); also confirms an unknown deploymentModel fails closed the same way.
     set +e
     LEGACY_REJECT_ERR="$(helm template ogg-legacy-reject "$RUNTIME_CHART" --namespace goldengate-dev \
-      --values "${REPO_ROOT}/envs/dev/gg-oracle-payments-01/values.yaml" \
+      --values "$ORACLE_EXISTING_FIXTURE" \
       --set global.environment=dev --set global.deploymentId=ogg-legacy-reject "${ORACLE_SHARED_OVERRIDES[@]}" \
       --set deploymentModel=legacyPair 2>&1)"
     LEGACY_REJECT_STATUS=$?
@@ -4378,7 +4576,7 @@ with open('${EFS_WORKDIR}/rendered/duplicate-storageclass.yaml', 'w') as f:
 
     set +e
     UNKNOWN_MODEL_ERR="$(helm template ogg-unknown-reject "$RUNTIME_CHART" --namespace goldengate-dev \
-      --values "${REPO_ROOT}/envs/dev/gg-oracle-payments-01/values.yaml" \
+      --values "$ORACLE_EXISTING_FIXTURE" \
       --set global.environment=dev --set global.deploymentId=ogg-unknown-reject \
       --set deploymentModel=someUnknownModel 2>&1)"
     UNKNOWN_MODEL_STATUS=$?
@@ -5923,8 +6121,8 @@ else
   fail "26: the deployment-model tool reported a validation problem against the real DEV descriptors"
 fi
 
-if python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev registry 2>/dev/null | grep -q "gg-oracle-payments-01" \
-    && python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev registry 2>/dev/null | grep -q "gg-postgresql-payments-01"; then
+if python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev registry 2>/dev/null | grep -q "gg-postgresql-repltest-01" \
+    && python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev registry 2>/dev/null | grep -q "gg-mssql-repltest-01"; then
   pass "26: the generated registry contains both existing live deployments"
 else
   fail "26: the generated registry is missing an existing live deployment"
@@ -6563,19 +6761,19 @@ echo ""
 echo "--- Restored shared identity: existing Oracle/PostgreSQL now resolve gg-runtime-sa (intentional migration) ---"
 
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
-  ORACLE_RESOLVED_SA="$(python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev describe gg-oracle-payments-01 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["runtimeServiceAccountName"])' 2>/dev/null || true)"
-  POSTGRESQL_RESOLVED_SA="$(python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev describe gg-postgresql-payments-01 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["runtimeServiceAccountName"])' 2>/dev/null || true)"
-  if [ "$ORACLE_RESOLVED_SA" = "gg-runtime-sa" ] && [ "$POSTGRESQL_RESOLVED_SA" = "gg-runtime-sa" ]; then
-    pass "28: gg-oracle-payments-01 and gg-postgresql-payments-01 both now resolve the restored shared gg-runtime-sa identity -- their values.yaml files remain byte-identical since runtime.serviceAccount was never a settable field"
+  SOURCE_RESOLVED_SA="$(python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev describe gg-postgresql-repltest-01 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["runtimeServiceAccountName"])' 2>/dev/null || true)"
+  TARGET_RESOLVED_SA="$(python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev describe gg-mssql-repltest-01 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["runtimeServiceAccountName"])' 2>/dev/null || true)"
+  if [ "$SOURCE_RESOLVED_SA" = "gg-runtime-sa" ] && [ "$TARGET_RESOLVED_SA" = "gg-runtime-sa" ]; then
+    pass "28: gg-postgresql-repltest-01 and gg-mssql-repltest-01 both resolve the restored shared gg-runtime-sa identity -- their values.yaml files remain byte-identical since runtime.serviceAccount was never a settable field"
   else
-    fail "28: gg-oracle-payments-01/gg-postgresql-payments-01 resolved to (${ORACLE_RESOLVED_SA}, ${POSTGRESQL_RESOLVED_SA}), expected (gg-runtime-sa, gg-runtime-sa)"
+    fail "28: gg-postgresql-repltest-01/gg-mssql-repltest-01 resolved to (${SOURCE_RESOLVED_SA}, ${TARGET_RESOLVED_SA}), expected (gg-runtime-sa, gg-runtime-sa)"
   fi
 else
   skip "28: runtime identity stability check -- python3 unavailable"
 fi
 
 if [ "$HELM_AVAILABLE" = "true" ]; then
-  for pair in "gg-oracle-payments-01:dev/goldengate/source/admin:gg-runtime-sa" "gg-postgresql-payments-01:dev/goldengate/target/admin:gg-runtime-sa"; do
+  for pair in "gg-postgresql-repltest-01:dev/goldengate/source/admin:gg-runtime-sa" "gg-mssql-repltest-01:dev/goldengate/target/admin:gg-runtime-sa"; do
     id="${pair%%:*}"
     rest="${pair#*:}"
     admin_secret="${rest%%:*}"
@@ -6584,7 +6782,7 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
     RENDER_APPROVED="${WORKDIR}/identity-approved-${id}.yaml"
     RENDER_OTHER="${WORKDIR}/identity-other-${id}.yaml"
 
-    # The chart must not couple ServiceAccount identity to any other field, regardless of the name compared.
+    # The chart must not couple ServiceAccount identity to any other field, regardless of the name compared. Both current descriptors are persistence.efs.mode=managed, so the workflow-resolved fileSystemId is supplied here exactly as the deploy workflow would.
     if helm template "$id" "$RUNTIME_CHART" \
         --namespace goldengate-dev \
         --values "envs/dev/${id}/values.yaml" \
@@ -6593,6 +6791,7 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
         --set runtime.csi.certificate.objectName=dev/goldengate/tls-certificate \
         --set runtime.serviceAccount.create=false \
         --set runtime.serviceAccount.name="$approved_sa" \
+        --set persistence.efs.fileSystemId=fs-0123456789abcdef0 \
         > "$RENDER_APPROVED" 2>"${WORKDIR}/identity-approved-${id}.log" \
       && helm template "$id" "$RUNTIME_CHART" \
         --namespace goldengate-dev \
@@ -6602,6 +6801,7 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
         --set runtime.csi.certificate.objectName=dev/goldengate/tls-certificate \
         --set runtime.serviceAccount.create=false \
         --set runtime.serviceAccount.name=gg-isolation-probe-sa \
+        --set persistence.efs.fileSystemId=fs-0123456789abcdef0 \
         > "$RENDER_OTHER" 2>"${WORKDIR}/identity-other-${id}.log"; then
 
       if grep -q "serviceAccountName: ${approved_sa}" "$RENDER_APPROVED"; then
@@ -6684,12 +6884,12 @@ echo "--- Phase 6D0-Final: Terraform cross-pipeline plan-blocking fixtures ---"
 TF_PLAN_SCRATCH=""
 if command -v terraform >/dev/null 2>&1; then
   TF_PLAN_SCRATCH="$(mktemp -d)"
-  mkdir -p "${TF_PLAN_SCRATCH}/envs/dev/gg-oracle-payments-01" "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-payments-01" \
+  mkdir -p "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-repltest-01" "${TF_PLAN_SCRATCH}/envs/dev/gg-mssql-repltest-01" \
     "${TF_PLAN_SCRATCH}/platform/dev/goldengate-platform" "${TF_PLAN_SCRATCH}/envs/dev/goldengate-monitor" \
     "${TF_PLAN_SCRATCH}/envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy"
   cp envs/dev/goldengate_inventory.tf "${TF_PLAN_SCRATCH}/envs/dev/goldengate_inventory.tf"
-  cp envs/dev/gg-oracle-payments-01/values.yaml "${TF_PLAN_SCRATCH}/envs/dev/gg-oracle-payments-01/values.yaml"
-  cp envs/dev/gg-postgresql-payments-01/values.yaml "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-payments-01/values.yaml"
+  cp envs/dev/gg-postgresql-repltest-01/values.yaml "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-repltest-01/values.yaml"
+  cp envs/dev/gg-mssql-repltest-01/values.yaml "${TF_PLAN_SCRATCH}/envs/dev/gg-mssql-repltest-01/values.yaml"
   cp platform/dev/goldengate-platform/values.yaml "${TF_PLAN_SCRATCH}/platform/dev/goldengate-platform/values.yaml"
   cp envs/dev/goldengate-monitor/values.yaml "${TF_PLAN_SCRATCH}/envs/dev/goldengate-monitor/values.yaml"
   cp envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json \
@@ -6735,8 +6935,8 @@ EOF
       cat "${TF_PLAN_SCRATCH}/plan-baseline.log"
     fi
 
-    cp "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-payments-01/values.yaml" "${TF_PLAN_SCRATCH}/postgresql-backup.yaml"
-    sed -i 's/role: target/role: source/' "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-payments-01/values.yaml"
+    cp "${TF_PLAN_SCRATCH}/envs/dev/gg-mssql-repltest-01/values.yaml" "${TF_PLAN_SCRATCH}/target-backup.yaml"
+    sed -i 's/role: target/role: source/' "${TF_PLAN_SCRATCH}/envs/dev/gg-mssql-repltest-01/values.yaml"
     set +e
     (cd "${TF_PLAN_SCRATCH}/envs/dev" && terraform plan -input=false) >"${TF_PLAN_SCRATCH}/plan-dup-source.log" 2>&1
     TF_PLAN_DUP_SOURCE_STATUS=$?
@@ -6747,10 +6947,10 @@ EOF
       fail "30: a duplicate enabled source did not block Terraform plan as expected (exit=${TF_PLAN_DUP_SOURCE_STATUS})"
       cat "${TF_PLAN_SCRATCH}/plan-dup-source.log"
     fi
-    cp "${TF_PLAN_SCRATCH}/postgresql-backup.yaml" "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-payments-01/values.yaml"
+    cp "${TF_PLAN_SCRATCH}/target-backup.yaml" "${TF_PLAN_SCRATCH}/envs/dev/gg-mssql-repltest-01/values.yaml"
 
-    cp "${TF_PLAN_SCRATCH}/envs/dev/gg-oracle-payments-01/values.yaml" "${TF_PLAN_SCRATCH}/oracle-backup.yaml"
-    sed -i 's/role: source/role: target/' "${TF_PLAN_SCRATCH}/envs/dev/gg-oracle-payments-01/values.yaml"
+    cp "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-repltest-01/values.yaml" "${TF_PLAN_SCRATCH}/source-backup.yaml"
+    sed -i 's/role: source/role: target/' "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-repltest-01/values.yaml"
     set +e
     (cd "${TF_PLAN_SCRATCH}/envs/dev" && terraform plan -input=false) >"${TF_PLAN_SCRATCH}/plan-dup-target.log" 2>&1
     TF_PLAN_DUP_TARGET_STATUS=$?
@@ -6761,10 +6961,10 @@ EOF
       fail "30: a duplicate enabled target did not block Terraform plan as expected (exit=${TF_PLAN_DUP_TARGET_STATUS})"
       cat "${TF_PLAN_SCRATCH}/plan-dup-target.log"
     fi
-    cp "${TF_PLAN_SCRATCH}/oracle-backup.yaml" "${TF_PLAN_SCRATCH}/envs/dev/gg-oracle-payments-01/values.yaml"
+    cp "${TF_PLAN_SCRATCH}/source-backup.yaml" "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-repltest-01/values.yaml"
 
-    cp "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-payments-01/values.yaml" "${TF_PLAN_SCRATCH}/postgresql-backup2.yaml"
-    sed -i 's/groupOrder: "111"/groupOrder: "110"/' "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-payments-01/values.yaml"
+    cp "${TF_PLAN_SCRATCH}/envs/dev/gg-mssql-repltest-01/values.yaml" "${TF_PLAN_SCRATCH}/target-backup2.yaml"
+    sed -i 's/groupOrder: "113"/groupOrder: "112"/' "${TF_PLAN_SCRATCH}/envs/dev/gg-mssql-repltest-01/values.yaml"
     set +e
     (cd "${TF_PLAN_SCRATCH}/envs/dev" && terraform plan -input=false) >"${TF_PLAN_SCRATCH}/plan-dup-alb.log" 2>&1
     TF_PLAN_DUP_ALB_STATUS=$?
@@ -6775,10 +6975,10 @@ EOF
       fail "30: a duplicate ALB group order did not block Terraform plan as expected (exit=${TF_PLAN_DUP_ALB_STATUS})"
       cat "${TF_PLAN_SCRATCH}/plan-dup-alb.log"
     fi
-    cp "${TF_PLAN_SCRATCH}/postgresql-backup2.yaml" "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-payments-01/values.yaml"
+    cp "${TF_PLAN_SCRATCH}/target-backup2.yaml" "${TF_PLAN_SCRATCH}/envs/dev/gg-mssql-repltest-01/values.yaml"
 
-    cp "${TF_PLAN_SCRATCH}/envs/dev/gg-oracle-payments-01/values.yaml" "${TF_PLAN_SCRATCH}/oracle-backup2.yaml"
-    sed -i 's/deploymentType: oracle/deploymentType: Oracle/' "${TF_PLAN_SCRATCH}/envs/dev/gg-oracle-payments-01/values.yaml"
+    cp "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-repltest-01/values.yaml" "${TF_PLAN_SCRATCH}/source-backup2.yaml"
+    sed -i 's/deploymentType: postgresql/deploymentType: Postgresql/' "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-repltest-01/values.yaml"
     set +e
     (cd "${TF_PLAN_SCRATCH}/envs/dev" && terraform plan -input=false) >"${TF_PLAN_SCRATCH}/plan-unsafe-type.log" 2>&1
     TF_PLAN_UNSAFE_TYPE_STATUS=$?
@@ -6789,11 +6989,11 @@ EOF
       fail "30: an unsafe runtime.deploymentType did not block Terraform plan as expected (exit=${TF_PLAN_UNSAFE_TYPE_STATUS})"
       cat "${TF_PLAN_SCRATCH}/plan-unsafe-type.log"
     fi
-    cp "${TF_PLAN_SCRATCH}/oracle-backup2.yaml" "${TF_PLAN_SCRATCH}/envs/dev/gg-oracle-payments-01/values.yaml"
+    cp "${TF_PLAN_SCRATCH}/source-backup2.yaml" "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-repltest-01/values.yaml"
 
     # Restored shared identity: a brand-new deploymentType (never seen by IAM before) must plan CLEANLY -- it shares the already-trusted gg-runtime-sa, so no new IAM trust subject is ever required.
-    cp "${TF_PLAN_SCRATCH}/envs/dev/gg-oracle-payments-01/values.yaml" "${TF_PLAN_SCRATCH}/oracle-backup2b.yaml"
-    sed -i 's/deploymentType: oracle/deploymentType: mysql/' "${TF_PLAN_SCRATCH}/envs/dev/gg-oracle-payments-01/values.yaml"
+    cp "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-repltest-01/values.yaml" "${TF_PLAN_SCRATCH}/source-backup2b.yaml"
+    sed -i 's/deploymentType: postgresql/deploymentType: mysql/' "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-repltest-01/values.yaml"
     set +e
     (cd "${TF_PLAN_SCRATCH}/envs/dev" && terraform plan -input=false) >"${TF_PLAN_SCRATCH}/plan-new-type-shared-identity.log" 2>&1
     TF_PLAN_NEW_TYPE_STATUS=$?
@@ -6804,10 +7004,10 @@ EOF
       fail "30: a brand-new safe deploymentType (mysql) did not plan cleanly -- the shared gg-runtime-sa self-service promise is broken (exit=${TF_PLAN_NEW_TYPE_STATUS})"
       cat "${TF_PLAN_SCRATCH}/plan-new-type-shared-identity.log"
     fi
-    cp "${TF_PLAN_SCRATCH}/oracle-backup2b.yaml" "${TF_PLAN_SCRATCH}/envs/dev/gg-oracle-payments-01/values.yaml"
+    cp "${TF_PLAN_SCRATCH}/source-backup2b.yaml" "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-repltest-01/values.yaml"
 
-    cp "${TF_PLAN_SCRATCH}/envs/dev/gg-oracle-payments-01/values.yaml" "${TF_PLAN_SCRATCH}/oracle-backup3.yaml"
-    sed -i '/^runtime:/a\  serviceAccount: gg-operator-chosen-sa' "${TF_PLAN_SCRATCH}/envs/dev/gg-oracle-payments-01/values.yaml"
+    cp "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-repltest-01/values.yaml" "${TF_PLAN_SCRATCH}/source-backup3.yaml"
+    sed -i '/^runtime:/a\  serviceAccount: gg-operator-chosen-sa' "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-repltest-01/values.yaml"
     set +e
     (cd "${TF_PLAN_SCRATCH}/envs/dev" && terraform plan -input=false) >"${TF_PLAN_SCRATCH}/plan-sa-override.log" 2>&1
     TF_PLAN_SA_OVERRIDE_STATUS=$?
@@ -6818,7 +7018,7 @@ EOF
       fail "30: an operator-supplied runtime.serviceAccount did not block Terraform plan as expected (exit=${TF_PLAN_SA_OVERRIDE_STATUS})"
       cat "${TF_PLAN_SCRATCH}/plan-sa-override.log"
     fi
-    cp "${TF_PLAN_SCRATCH}/oracle-backup3.yaml" "${TF_PLAN_SCRATCH}/envs/dev/gg-oracle-payments-01/values.yaml"
+    cp "${TF_PLAN_SCRATCH}/source-backup3.yaml" "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-repltest-01/values.yaml"
 
     # Exact-trust-equality edge cases (F is already proven by the clean baseline plan above, run against this same untouched real sts.json). G-K mutate a scratch copy and restore it after each.
     STS_JSON_PATH="${TF_PLAN_SCRATCH}/envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json"
@@ -6884,10 +7084,9 @@ with open(sys.argv[1], "w") as f: json.dump(doc, f, indent=2)
     # L: a brand-new deployment type requires ZERO sts.json change and still plans cleanly against the SAME exact four-subject trust set (sts.json here is the untouched real file, restored after each G-K mutation above).
     mkdir -p "${TF_PLAN_SCRATCH}/envs/dev/gg-mysql-fixture-01"
     sed -e 's/deploymentType: postgresql/deploymentType: mysql/' \
-        -e 's/pipeline: payments-ora-to-pg-001/pipeline: payments-mysql-fixture-001/' \
-        -e 's/role: target/role: source/' \
-        -e 's/groupOrder: "111"/groupOrder: "197"/' \
-        "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-payments-01/values.yaml" > "${TF_PLAN_SCRATCH}/envs/dev/gg-mysql-fixture-01/values.yaml"
+        -e 's/pipeline: repltest-pg-to-mssql-001/pipeline: payments-mysql-fixture-001/' \
+        -e 's/groupOrder: "112"/groupOrder: "197"/' \
+        "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-repltest-01/values.yaml" > "${TF_PLAN_SCRATCH}/envs/dev/gg-mysql-fixture-01/values.yaml"
     set +e
     (cd "${TF_PLAN_SCRATCH}/envs/dev" && terraform plan -input=false) >"${TF_PLAN_SCRATCH}/plan-new-type-onboarded.log" 2>&1
     TF_PLAN_NEW_TYPE_ONBOARDED_STATUS=$?
@@ -7400,13 +7599,13 @@ if [ "$PYTHON_AVAILABLE" = "true" ]; then
   LIVE_VALIDATE_STATUS=$?
   set -e
   if [ "$LIVE_VALIDATE_STATUS" -eq 0 ] \
-      && grep -qE '^\s*mode:\s*existing\s*$' envs/dev/gg-oracle-payments-01/values.yaml 2>/dev/null \
-      && grep -qE '^\s*mode:\s*existing\s*$' envs/dev/gg-postgresql-payments-01/values.yaml 2>/dev/null \
-      && grep -q 'fs-05cadf3570f23cd39' envs/dev/gg-oracle-payments-01/values.yaml 2>/dev/null \
-      && grep -q 'fs-05cadf3570f23cd39' envs/dev/gg-postgresql-payments-01/values.yaml 2>/dev/null; then
-    pass "33: both live Oracle/PostgreSQL descriptors carry the new explicit persistence.efs.mode=existing with a byte-identical fileSystemId, and dev validate still passes"
+      && grep -qE '^\s*mode:\s*managed\s*$' envs/dev/gg-postgresql-repltest-01/values.yaml 2>/dev/null \
+      && grep -qE '^\s*mode:\s*managed\s*$' envs/dev/gg-mssql-repltest-01/values.yaml 2>/dev/null \
+      && ! grep -q 'fileSystemId:' envs/dev/gg-postgresql-repltest-01/values.yaml 2>/dev/null \
+      && ! grep -q 'fileSystemId:' envs/dev/gg-mssql-repltest-01/values.yaml 2>/dev/null; then
+    pass "33: both live gg-postgresql-repltest-01/gg-mssql-repltest-01 descriptors carry persistence.efs.mode=managed with no committed fileSystemId, and dev validate still passes"
   else
-    fail "33: the two live descriptors did not migrate cleanly to persistence.efs.mode=existing: ${LIVE_VALIDATE_OUTPUT}"
+    fail "33: the two live managed-EFS descriptors did not validate cleanly: ${LIVE_VALIDATE_OUTPUT}"
   fi
 else
   skip "33: live descriptor EFS-mode migration check -- python3 unavailable"
@@ -8625,10 +8824,11 @@ else
   fail "VDR 12: envs/dev/efs.tf's throughput_mode contract was unexpectedly modified by this turn"
 fi
 
-if grep -q 'replication:' envs/dev/gg-oracle-payments-01/values.yaml 2>/dev/null && grep -qE '^\s*enabled:\s*false' envs/dev/gg-oracle-payments-01/values.yaml 2>/dev/null; then
-  pass "VDR 13: gg-oracle-payments-01/values.yaml still declares replication.enabled=false, unchanged by this credential-only fix"
+if grep -q 'replication:' envs/dev/gg-postgresql-repltest-01/values.yaml 2>/dev/null && grep -qE '^\s*enabled:\s*false' envs/dev/gg-postgresql-repltest-01/values.yaml 2>/dev/null \
+    && grep -q 'replication:' envs/dev/gg-mssql-repltest-01/values.yaml 2>/dev/null && grep -qE '^\s*enabled:\s*false' envs/dev/gg-mssql-repltest-01/values.yaml 2>/dev/null; then
+  pass "VDR 13: gg-postgresql-repltest-01/gg-mssql-repltest-01 values.yaml still declare replication.enabled=false, unchanged by this credential-only fix"
 else
-  fail "VDR 13: gg-oracle-payments-01/values.yaml's replication.enabled=false declaration is missing or was modified"
+  fail "VDR 13: the live descriptors' replication.enabled=false declaration is missing or was modified"
 fi
 
 echo ""
@@ -9006,7 +9206,7 @@ fi
 echo ""
 echo "--- Self-service test architecture: generic descriptor invariants (no per-deployment-ID test code) ---"
 
-# Production self-service requirement: onboarding envs/dev/<id>/values.yaml must never require editing a test file to add its name/count to a hardcoded list. Every check below is driven dynamically by hack/goldengate-deployment-model.py's own scan/build_registry/managed-efs-inventory semantics, or by each descriptor's OWN properties (role/persistence mode) -- never by a fixed set of real deployment IDs. The two historical existing-EFS descriptors (gg-oracle-payments-01, gg-postgresql-payments-01) remain individually named below only where this suite protects their specific legacy storage contract (mode=existing/fs-05cadf3570f23cd39), which is intentional and does not grow with future onboarding.
+# Production self-service requirement: onboarding envs/dev/<id>/values.yaml must never require editing a test file to add its name/count to a hardcoded list. Every check below is driven dynamically by hack/goldengate-deployment-model.py's own scan/build_registry/managed-efs-inventory semantics, or by each descriptor's OWN properties (role/persistence mode) -- never by a fixed set of real deployment IDs. The historical existing-EFS descriptors (gg-oracle-payments-01, gg-postgresql-payments-01) were physically retired; their legacy storage contract is no longer protected here since the files no longer exist.
 
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   GENERIC_DESCRIPTOR_CHECK="$(python3 -c '
@@ -9124,15 +9324,7 @@ else
   skip "Terraform-file-unchanged check -- not a git repository"
 fi
 
-# Protected legacy storage contract (intentionally explicit by ID, per the two historical existing-EFS deployments -- does not grow as new deployments are onboarded).
-if grep -qE '^\s*mode:\s*existing\s*$' envs/dev/gg-oracle-payments-01/values.yaml 2>/dev/null \
-    && grep -qE '^\s*mode:\s*existing\s*$' envs/dev/gg-postgresql-payments-01/values.yaml 2>/dev/null \
-    && grep -q 'fs-05cadf3570f23cd39' envs/dev/gg-oracle-payments-01/values.yaml 2>/dev/null \
-    && grep -q 'fs-05cadf3570f23cd39' envs/dev/gg-postgresql-payments-01/values.yaml 2>/dev/null; then
-  pass "the existing Oracle/PostgreSQL descriptors remain individually existing-mode with fs-05cadf3570f23cd39, never reinterpreted as managed just because the environment now contains a managed deployment"
-else
-  fail "the existing Oracle/PostgreSQL descriptors no longer carry mode=existing / fs-05cadf3570f23cd39"
-fi
+# The two historical existing-EFS descriptors were physically retired (see the physical-absence check earlier in this suite); this repo no longer carries a mode=existing descriptor to protect.
 
 # Not inventory-count-related -- unaffected by how many deployments exist, so kept as a direct regression check.
 if grep -qF 'REPLICATION_SUPPORTED_SOURCE_TYPE = "postgresql"' hack/goldengate-deployment-model.py 2>/dev/null \

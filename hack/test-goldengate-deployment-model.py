@@ -227,31 +227,30 @@ class ScratchEnvironmentTestCase(unittest.TestCase):
 
 
 class RealRepositoryDescriptorTests(unittest.TestCase):
-    """Exercised against the real, live envs/dev descriptors -- no scratch root."""
+    """Exercised against the real, live envs/dev descriptors -- no scratch root. Derives source/target descriptors by role, never by a specific deployment ID, so retiring or onboarding a descriptor never requires editing this class."""
 
-    def test_existing_oracle_descriptor_parses(self):
+    def _active_by_role(self, role):
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
-        by_id = {d["deploymentId"]: d for d in active}
-        self.assertIn("gg-oracle-payments-01", by_id)
-        self.assertEqual(by_id["gg-oracle-payments-01"]["deploymentType"], "oracle")
+        matches = [d for d in active if d["role"] == role]
+        self.assertTrue(matches, f"expected at least one active {role}-role descriptor")
+        return matches
 
-    def test_existing_postgresql_descriptor_parses(self):
-        active, _inactive, invalid = gdm.scan("dev")
-        self.assertEqual(invalid, [])
-        by_id = {d["deploymentId"]: d for d in active}
-        self.assertIn("gg-postgresql-payments-01", by_id)
-        self.assertEqual(by_id["gg-postgresql-payments-01"]["deploymentType"], "postgresql")
+    def test_current_source_descriptors_parse_with_a_real_deployment_type(self):
+        for d in self._active_by_role("source"):
+            self.assertTrue(d["deploymentType"])
 
-    def test_existing_oracle_renders_with_source_shared_secret(self):
-        active, _inactive, _invalid = gdm.scan("dev")
-        by_id = {d["deploymentId"]: d for d in active}
-        self.assertEqual(by_id["gg-oracle-payments-01"]["adminSecretName"], "dev/goldengate/source/admin")
+    def test_current_target_descriptors_parse_with_a_real_deployment_type(self):
+        for d in self._active_by_role("target"):
+            self.assertTrue(d["deploymentType"])
 
-    def test_existing_postgresql_renders_with_target_shared_secret(self):
-        active, _inactive, _invalid = gdm.scan("dev")
-        by_id = {d["deploymentId"]: d for d in active}
-        self.assertEqual(by_id["gg-postgresql-payments-01"]["adminSecretName"], "dev/goldengate/target/admin")
+    def test_current_source_descriptors_render_with_source_shared_secret(self):
+        for d in self._active_by_role("source"):
+            self.assertEqual(d["adminSecretName"], "dev/goldengate/source/admin")
+
+    def test_current_target_descriptors_render_with_target_shared_secret(self):
+        for d in self._active_by_role("target"):
+            self.assertEqual(d["adminSecretName"], "dev/goldengate/target/admin")
 
     def test_registry_contains_exactly_the_scanned_active_ids(self):
         # Self-service: dynamic invariant, never a hardcoded name/count -- onboarding a new envs/dev/<id>/values.yaml folder must never require editing this test. Proves the registry contains EXACTLY what the canonical folder scanner contains.
@@ -331,35 +330,18 @@ class RealRepositoryDescriptorTests(unittest.TestCase):
 
         self.assertEqual(len(alb_orders), len(set(alb_orders)), "ALB groupOrder must be unique across every active shared-ALB descriptor")
 
-    def test_existing_oracle_uses_the_restored_shared_gg_runtime_sa(self):
-        # Restored shared runtime identity: deploymentType no longer selects the ServiceAccount -- every singleRuntime deployment (including this historical Oracle descriptor, which never overrides runtime.serviceAccount) now resolves the one platform-owned gg-runtime-sa.
-        active, _inactive, _invalid = gdm.scan("dev")
-        by_id = {d["deploymentId"]: d for d in active}
-        self.assertEqual(by_id["gg-oracle-payments-01"]["runtimeServiceAccountName"], "gg-runtime-sa")
-
-    def test_existing_postgresql_uses_the_restored_shared_gg_runtime_sa(self):
-        active, _inactive, _invalid = gdm.scan("dev")
-        by_id = {d["deploymentId"]: d for d in active}
-        self.assertEqual(by_id["gg-postgresql-payments-01"]["runtimeServiceAccountName"], "gg-runtime-sa")
-
     def test_every_active_deployment_resolves_to_gg_runtime_sa(self):
+        # Restored shared runtime identity: deploymentType never selects the ServiceAccount -- every active singleRuntime deployment resolves the one platform-owned gg-runtime-sa.
         active, _inactive, _invalid = gdm.scan("dev")
         for d in active:
             self.assertEqual(d["runtimeServiceAccountName"], "gg-runtime-sa")
 
-    def test_replication_1_existing_oracle_disabled_replication_remains_valid(self):
+    def test_current_active_deployments_have_replication_disabled(self):
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
-        by_id = {d["deploymentId"]: d for d in active}
-        self.assertIn("gg-oracle-payments-01", by_id)
-        self.assertFalse(by_id["gg-oracle-payments-01"]["replicationEnabled"])
-
-    def test_replication_2_existing_postgresql_disabled_replication_remains_valid(self):
-        active, _inactive, invalid = gdm.scan("dev")
-        self.assertEqual(invalid, [])
-        by_id = {d["deploymentId"]: d for d in active}
-        self.assertIn("gg-postgresql-payments-01", by_id)
-        self.assertFalse(by_id["gg-postgresql-payments-01"]["replicationEnabled"])
+        self.assertTrue(active, "expected at least one active dev descriptor")
+        for d in active:
+            self.assertFalse(d["replicationEnabled"])
 
 
 class GenericDeploymentTypeTests(ScratchEnvironmentTestCase):
