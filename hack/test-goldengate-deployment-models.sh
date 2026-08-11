@@ -3461,12 +3461,34 @@ if [ -f "${WORKDIR}/detect_script.sh" ] && [ -s "${WORKDIR}/detect_script.sh" ] 
       'ADDED id=gg-oracle-payments-01 model=singleRuntime' \
       'ADDED id=gg-oracle-payments-01-renamed'
 
-    # RETIREMENT PROOF: replays the actual physical removal performed by this task -- both gg-oracle-payments-01 and gg-postgresql-payments-01 (their real, last-committed existing-mode content, pulled from this repo's own Git history) deleted in a single commit -- through the real discovery+deletion logic against a genuine Git diff, and confirms deploymentModel/efs_mode/reason for BOTH.
+    # RETIREMENT PROOF: fully self-contained -- synthetic existing-mode source/target descriptors (never read from this repo's own Git history, so the test survives a shallow checkout or any future commit that moves HEAD) committed then physically deleted in one commit, replayed through the real discovery+deletion logic against a genuine Git diff, confirming deploymentModel/efs_mode/reason for BOTH.
     RETIREMENT_PROOF_REPO="${WORKDIR}/retirement-proof-repo"
     rm -rf "$RETIREMENT_PROOF_REPO"
     mkdir -p "${RETIREMENT_PROOF_REPO}/envs/dev/gg-oracle-payments-01" "${RETIREMENT_PROOF_REPO}/envs/dev/gg-postgresql-payments-01"
-    git show HEAD:envs/dev/gg-oracle-payments-01/values.yaml > "${RETIREMENT_PROOF_REPO}/envs/dev/gg-oracle-payments-01/values.yaml"
-    git show HEAD:envs/dev/gg-postgresql-payments-01/values.yaml > "${RETIREMENT_PROOF_REPO}/envs/dev/gg-postgresql-payments-01/values.yaml"
+    cat > "${RETIREMENT_PROOF_REPO}/envs/dev/gg-oracle-payments-01/values.yaml" <<'EOF'
+deploymentModel: singleRuntime
+deployment:
+  enabled: true
+  role: source
+persistence:
+  enabled: true
+  provider: efs
+  efs:
+    mode: existing
+    fileSystemId: fs-0123456789abcdef1
+EOF
+    cat > "${RETIREMENT_PROOF_REPO}/envs/dev/gg-postgresql-payments-01/values.yaml" <<'EOF'
+deploymentModel: singleRuntime
+deployment:
+  enabled: true
+  role: target
+persistence:
+  enabled: true
+  provider: efs
+  efs:
+    mode: existing
+    fileSystemId: fs-0123456789abcdef2
+EOF
     git -C "$RETIREMENT_PROOF_REPO" init -q
     git -C "$RETIREMENT_PROOF_REPO" config user.email "test@test.invalid"
     git -C "$RETIREMENT_PROOF_REPO" config user.name "test"
@@ -4150,139 +4172,29 @@ PYEOF
     EFS_WORKDIR="${WORKDIR}/efs-test"
     mkdir -p "${EFS_WORKDIR}/rendered" "${EFS_WORKDIR}/values"
 
-    # mode=existing scratch fixtures: gg-oracle-payments-01/gg-postgresql-payments-01 were physically retired from envs/dev/; their exact historical existing-mode content (fs-05cadf3570f23cd39) is reproduced here so this generic mode=existing code path keeps full regression coverage without depending on a committed descriptor.
-    ORACLE_EXISTING_FIXTURE="${EFS_WORKDIR}/values/existing-mode-oracle.yaml"
-    POSTGRESQL_EXISTING_FIXTURE="${EFS_WORKDIR}/values/existing-mode-postgresql.yaml"
-    cat > "$ORACLE_EXISTING_FIXTURE" <<'EOF'
-deployment:
-  enabled: true
-  pipeline: payments-ora-to-pg-001
-  role: source
-global:
-  environment: dev
-deploymentModel: singleRuntime
-replication:
-  enabled: false
-runtime:
-  enabled: true
-  deploymentType: oracle
-  businessDomain: payments
-  containerName: ogg-oracle
-  replicas: 1
-  image:
-    repository: 229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle
-    tag: "23.26.2.0.1"
-    pullPolicy: IfNotPresent
-  csi:
-    enabled: true
-    admin:
-      enabled: true
-      objectType: secretsmanager
-      mountPath: /mnt/secrets-store/admin
-      jmesPath:
-        - path: OGG_ADMIN
-          objectAlias: OGG_ADMIN
-        - path: OGG_ADMIN_PWD
-          objectAlias: OGG_ADMIN_PWD
-    certificate:
-      enabled: true
-      objectType: secretsmanager
-      mountPath: /etc/nginx/cert
-      jmesPath:
-        - path: '"ogg.key"'
-          objectAlias: ogg.key
-        - path: '"ogg.pem"'
-          objectAlias: ogg.pem
-        - path: '"ca-chain.pem"'
-          objectAlias: ca-chain.pem
-  initPermissions:
-    enabled: true
-    mode: "0777"
-  service:
-    type: ClusterIP
-    ports:
-      https: 8443
-      dist: 9013
-      receiver: null
-      metrics: 9015
-  storage:
-    u02:
-      type: efs
-      existingClaim: ""
-      claimName: ""
-      size: 20Gi
-      accessModes:
-        - ReadWriteMany
-    u03:
-      type: emptyDir
-  resources: {}
-  extraEnv: []
-  extraVolumeMounts: []
-  extraVolumes: []
-ingress:
-  enabled: true
-  mode: shared
-  className: alb
-  hostDomain: goldengate-dev.adcbmis.local
-  alb:
-    groupName: gg-poc-dev-alb
-    groupOrder: "110"
-    backendProtocol: HTTPS
-    listenPorts: '[{"HTTPS":443}]'
-    certificateArn: arn:aws:acm:eu-west-1:668311715351:certificate/9e53e28e-3243-47fc-85a1-50f9a94acde7
-    targetType: ip
-    healthcheckProtocol: HTTPS
-    healthcheckPort: traffic-port
-    healthcheckPath: /
-    successCodes: "200-499"
-  annotations: {}
-monitoring:
-  labels:
-    enabled: true
-podSecurityContext: {}
-securityContext:
-  runAsUser: 0
-  runAsGroup: 0
-  allowPrivilegeEscalation: false
-nodeSelector: {}
-tolerations: []
-affinity: {}
-persistence:
-  enabled: true
-  provider: efs
-  efs:
-    mode: existing
-    fileSystemId: fs-05cadf3570f23cd39
-    storageClass:
-      create: true
-      reclaimPolicy: Retain
-      volumeBindingMode: Immediate
-      directoryPerms: "0777"
-      subPathPattern: "${.PVC.name}"
-      ensureUniqueDirectory: "true"
-      mountOptions:
-        - tls
-EOF
+    # mode=existing scratch fixtures: derived by mutating ONLY persistence.efs on scratch copies of the two current real descriptors (never a hand-duplicated retired production descriptor) -- proves the generic mode=existing code path from a source that always exists.
+    ORACLE_EXISTING_FIXTURE="${EFS_WORKDIR}/values/existing-mode-a.yaml"
+    POSTGRESQL_EXISTING_FIXTURE="${EFS_WORKDIR}/values/existing-mode-b.yaml"
     python3 -c "
 import yaml
-with open('${ORACLE_EXISTING_FIXTURE}') as f:
-    data = yaml.safe_load(f)
-data['deployment']['role'] = 'target'
-data['runtime']['deploymentType'] = 'postgresql'
-data['runtime']['containerName'] = 'ogg-postgresql'
-data['runtime']['image']['repository'] = '229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-postgresql'
-data['runtime']['service']['ports']['dist'] = None
-data['runtime']['service']['ports']['receiver'] = 9014
-data['ingress']['alb']['groupOrder'] = '111'
-with open('${POSTGRESQL_EXISTING_FIXTURE}', 'w') as f:
-    yaml.dump(data, f)
+
+def make_existing_fixture(src_path, dst_path, fs_id):
+    with open(src_path) as f:
+        data = yaml.safe_load(f)
+    data['persistence']['efs']['mode'] = 'existing'
+    data['persistence']['efs']['fileSystemId'] = fs_id
+    with open(dst_path, 'w') as f:
+        yaml.dump(data, f)
+
+make_existing_fixture('envs/dev/gg-postgresql-repltest-01/values.yaml', '${ORACLE_EXISTING_FIXTURE}', 'fs-0123456789abcdef1')
+make_existing_fixture('envs/dev/gg-mssql-repltest-01/values.yaml', '${POSTGRESQL_EXISTING_FIXTURE}', 'fs-0123456789abcdef1')
 "
 
-    # EFS_MODE/EFS_FILE_SYSTEM_ID_DECLARED/RESOLVED_EFS_ID mirror what the real workflow's earlier "Resolve deployment identity"/"Resolve EFS filesystem ID" steps would have already exported via $GITHUB_ENV; every call site here uses the scratch existing-mode fixtures above (fs-05cadf3570f23cd39) unless a scenario is expected to fail before that value is ever consulted.
+    # EFS_MODE/EFS_FILE_SYSTEM_ID_DECLARED/RESOLVED_EFS_ID mirror what the real workflow's earlier "Resolve deployment identity"/"Resolve EFS filesystem ID" steps would have already exported via $GITHUB_ENV; every call site here uses the scratch existing-mode fixtures above (fs-0123456789abcdef1) unless a scenario is expected to fail before that value is ever consulted.
     run_efs_step() {
       ( cd "$EFS_WORKDIR" && \
         RELEASE_NAME="$1" VALUES_FILE="$2" DEPLOYMENT_ID="$3" DEPLOYMENT_MODEL="$4" ENVIRONMENT="$5" \
-        EFS_MODE="existing" EFS_FILE_SYSTEM_ID_DECLARED="fs-05cadf3570f23cd39" RESOLVED_EFS_ID="fs-05cadf3570f23cd39" \
+        EFS_MODE="existing" EFS_FILE_SYSTEM_ID_DECLARED="fs-0123456789abcdef1" RESOLVED_EFS_ID="fs-0123456789abcdef1" \
         bash "${WORKDIR}/efs_validate.sh" 2>&1 )
       return $?
     }
@@ -4379,7 +4291,7 @@ persistence:
   enabled: true
   provider: efs
   efs:
-    fileSystemId: fs-05cadf3570f23cd39
+    fileSystemId: fs-0123456789abcdef1
 EOF
     set +e
     MISSING_MODE_OUT="$(run_efs_step "x" "${EFS_WORKDIR}/values/missing-mode.yaml" "gg-oracle-payments-01" "singleRuntime" "dev")"
@@ -4400,7 +4312,7 @@ persistence:
   provider: efs
   efs:
     mode: managed
-    fileSystemId: fs-05cadf3570f23cd39
+    fileSystemId: fs-0123456789abcdef1
 EOF
     set +e
     MANAGED_WITH_FSID_OUT="$(run_efs_step "x" "${EFS_WORKDIR}/values/managed-with-fsid.yaml" "gg-oracle-payments-01" "singleRuntime" "dev")"
