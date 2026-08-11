@@ -12,12 +12,8 @@ runtimeServiceAccount:
   name: gg-runtime-sa
   roleArn: ""
 
-# Transitional legacy migration-compatibility identities, platform-owned during this staged rollout -- a FIXED, explicitly-reviewed list, NEVER derived from the folder-driven deployment inventory (self-service deployment types, including future ones, must never add an entry here). Same runtime IAM role as runtimeServiceAccount (no new IAM permissions). engine preserves each entry's pre-migration goldengate.adcb/engine label so retaining them causes zero live-resource metadata drift. Remove this list, together with its sts.json trust subjects, only in a later controlled retirement phase once gg-oracle-payments-01/gg-postgresql-payments-01 are migrated/retired.
-transitionalRuntimeServiceAccounts:
-  - name: gg-oracle-sa
-    engine: oracle
-  - name: gg-postgresql-sa
-    engine: postgresql
+# Environment-specific migration compatibility list (see platform/<env>/goldengate-platform/values.yaml); empty by default, never a chart-level default.
+transitionalRuntimeServiceAccounts: []
 
 # Centralized container logging (platform-level DaemonSet, never a runtime/observer sidecar); collects Kubernetes stdout/stderr only, not EFS /u02 GoldenGate file logs.
 fluentBit:

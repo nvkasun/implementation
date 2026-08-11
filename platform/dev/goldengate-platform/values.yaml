@@ -7,6 +7,13 @@ namespaces:
 
 # runtimeServiceAccount.roleArn is intentionally absent -- the deploy workflow injects it via --set (RUNTIME_ROLE_ARN), never hand-maintained here. name defaults to the chart's own gg-runtime-sa (the one shared runtime identity for every deploymentType).
 
+# DEV-only migration compatibility set: old workloads still reference these until reconciled onto gg-runtime-sa.
+transitionalRuntimeServiceAccounts:
+  - name: gg-oracle-sa
+    engine: oracle
+  - name: gg-postgresql-sa
+    engine: postgresql
+
 fluentBit:
   create: true
   serviceAccount:

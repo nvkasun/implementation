@@ -252,9 +252,6 @@ locals {
     "oidc.eks.eu-west-1.amazonaws.com/id/407C4385FF87947926730569F1E564FB:sub"
   ]
 
-  # Fail-closed allowlist check: every actual subject must be the canonical gg-runtime-sa, an explicitly-retained transitional per-engine subject, or the legacy wildcard -- never a new/unexpected subject and never a namespace-wide wildcard. A new deploymentType is never a new subject, so this never grows from onboarding alone.
-  goldengate_unexpected_irsa_trust_subjects = setsubtract(toset(local.goldengate_secrets_trust_subjects), toset(local.goldengate_allowed_irsa_trust_subjects))
-
   goldengate_platform_values = yamldecode(file("${path.module}/../../platform/${var.environment}/goldengate-platform/values.yaml"))
   goldengate_monitor_values  = yamldecode(file("${path.module}/goldengate-monitor/values.yaml"))
   goldengate_monitor_host    = try(local.goldengate_monitor_values.ingress.host, "")
@@ -595,8 +592,12 @@ resource "terraform_data" "goldengate_cross_pipeline_contract" {
       error_message = "replication.distribution.targetTrailName must equal the target replication.replicat.sourceTrailName for its pipeline."
     }
     precondition {
-      condition     = length(local.goldengate_unexpected_irsa_trust_subjects) == 0 && contains(local.goldengate_secrets_trust_subjects, local.goldengate_canonical_runtime_trust_subject)
-      error_message = "envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json trust subjects must contain exactly the permanent canonical system:serviceaccount:<namespace>:gg-runtime-sa subject, only the explicitly-retained transitional gg-oracle-sa/gg-postgresql-sa subjects, and the legacy gg-dev-*:ogg-oracle-sa wildcard -- no other subject (and never a namespace-wide wildcard) is permitted. Onboarding a new deploymentType must never require editing this file, since every deploymentType shares gg-runtime-sa."
+      # Temporary migration-phase contract, not permanent architecture: actual trust subjects must exactly equal the approved allowlist (canonical + transitional + legacy), no duplicates.
+      condition = (
+        length(local.goldengate_secrets_trust_subjects) == length(distinct(local.goldengate_secrets_trust_subjects))
+        && toset(local.goldengate_secrets_trust_subjects) == toset(local.goldengate_allowed_irsa_trust_subjects)
+      )
+      error_message = "envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json trust subjects must exactly equal the currently approved migration allowlist -- the canonical system:serviceaccount:<namespace>:gg-runtime-sa subject, the transitional gg-oracle-sa/gg-postgresql-sa subjects, and the legacy gg-dev-*:ogg-oracle-sa wildcard -- with no duplicates, no missing entry, and no unexpected entry. Onboarding a new deploymentType must never require editing this file."
     }
   }
 }

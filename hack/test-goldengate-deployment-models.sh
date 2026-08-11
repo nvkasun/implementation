@@ -6016,13 +6016,21 @@ else
   fail "26: the platform chart's shared runtime ServiceAccount is missing the goldengate.adcb/purpose: runtime label"
 fi
 
-# Rollout-safety correction: gg-oracle-sa/gg-postgresql-sa are a FIXED, explicitly-reviewed transitional migration-compatibility list -- retained in values.yaml (never derived from the folder-driven deployment inventory), rendered via one generic range in the template (never a per-flavour branch).
-if grep -qE '^\s*transitionalRuntimeServiceAccounts:\s*$' helm/goldengate-platform/values.yaml 2>/dev/null \
-    && grep -qE '^\s*-\s*name:\s*gg-oracle-sa\s*$' helm/goldengate-platform/values.yaml 2>/dev/null \
-    && grep -qE '^\s*-\s*name:\s*gg-postgresql-sa\s*$' helm/goldengate-platform/values.yaml 2>/dev/null; then
-  pass "26: the platform chart's values.yaml declares the fixed transitionalRuntimeServiceAccounts list (gg-oracle-sa, gg-postgresql-sa)"
+# Config-placement: transitionalRuntimeServiceAccounts is a DEV-only migration list, never a chart-level default.
+if grep -qE '^\s*transitionalRuntimeServiceAccounts:\s*\[\]\s*$' helm/goldengate-platform/values.yaml 2>/dev/null; then
+  pass "26: the generic platform chart default is transitionalRuntimeServiceAccounts: [] (empty)"
 else
-  fail "26: the platform chart's values.yaml is missing the fixed transitionalRuntimeServiceAccounts list"
+  fail "26: the generic platform chart default no longer declares an empty transitionalRuntimeServiceAccounts list"
+fi
+
+if grep -qE '^\s*transitionalRuntimeServiceAccounts:\s*$' platform/dev/goldengate-platform/values.yaml 2>/dev/null \
+    && grep -qE '^\s*-\s*name:\s*gg-oracle-sa\s*$' platform/dev/goldengate-platform/values.yaml 2>/dev/null \
+    && grep -qE '^\s*engine:\s*oracle\s*$' platform/dev/goldengate-platform/values.yaml 2>/dev/null \
+    && grep -qE '^\s*-\s*name:\s*gg-postgresql-sa\s*$' platform/dev/goldengate-platform/values.yaml 2>/dev/null \
+    && grep -qE '^\s*engine:\s*postgresql\s*$' platform/dev/goldengate-platform/values.yaml 2>/dev/null; then
+  pass "26: platform/dev/goldengate-platform/values.yaml declares the fixed transitionalRuntimeServiceAccounts list (gg-oracle-sa/oracle, gg-postgresql-sa/postgresql)"
+else
+  fail "26: platform/dev/goldengate-platform/values.yaml is missing the fixed transitionalRuntimeServiceAccounts list"
 fi
 
 if grep -qE '\{\{-?\s*range\s+\.Values\.transitionalRuntimeServiceAccounts' helm/goldengate-platform/templates/runtime-serviceaccounts.yaml 2>/dev/null; then
@@ -6093,6 +6101,21 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
     pass "26: the real gg-mssql-repltest-01 descriptor (and any synthetic mysql deployment) never causes the platform chart to render gg-mssql-sa/gg-mysql-sa -- the ServiceAccount set is fixed values.yaml data, not folder-derived"
   else
     fail "26: an engine-specific ServiceAccount (gg-mssql-sa/gg-mysql-sa) was rendered by the platform chart -- self-service onboarding must never create one"
+  fi
+
+  # Generic render WITHOUT the DEV migration override: proves transitional identities are environment-specific, never library defaults.
+  set +e
+  GENERIC_PLATFORM_SA_RENDER="$(helm template gg-platform helm/goldengate-platform \
+    --set-string runtimeServiceAccount.roleArn=arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev \
+    --set environment=dev --set namespaces.runtime.create=true --set-string namespaces.runtime.name=goldengate-dev \
+    2>&1)"
+  set -e
+  if [ "$(echo "$GENERIC_PLATFORM_SA_RENDER" | grep -c '^kind: ServiceAccount$')" -eq 1 ] \
+      && echo "$GENERIC_PLATFORM_SA_RENDER" | grep -q "name: gg-runtime-sa" \
+      && ! echo "$GENERIC_PLATFORM_SA_RENDER" | grep -qE "name: gg-(oracle|postgresql|mssql|daa|mysql)-sa"; then
+    pass "26: the generic chart render (no DEV override, fluentBit.create defaults false) renders ONLY gg-runtime-sa -- no gg-oracle-sa/gg-postgresql-sa/gg-mssql-sa"
+  else
+    fail "26: the generic chart render (no DEV override) unexpectedly rendered transitional or engine-specific ServiceAccounts"
   fi
 else
   skip "26: platform ServiceAccount render check -- helm not available"
@@ -6797,7 +6820,68 @@ EOF
     fi
     cp "${TF_PLAN_SCRATCH}/oracle-backup3.yaml" "${TF_PLAN_SCRATCH}/envs/dev/gg-oracle-payments-01/values.yaml"
 
-    # Proves true folder-only onboarding under the restored shared identity: a genuinely new type's folder ALONE is sufficient -- goldengate_inventory.tf and sts.json are BOTH never touched (no IAM trust-subject data entry needed at all, unlike the retired per-type architecture).
+    # Exact-trust-equality edge cases (F is already proven by the clean baseline plan above, run against this same untouched real sts.json). G-K mutate a scratch copy and restore it after each.
+    STS_JSON_PATH="${TF_PLAN_SCRATCH}/envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json"
+    STS_SUB_PATH='.Statement[0].Condition.StringLike["oidc.eks.eu-west-1.amazonaws.com/id/407C4385FF87947926730569F1E564FB:sub"]'
+    cp "$STS_JSON_PATH" "${TF_PLAN_SCRATCH}/sts-exact-trust-backup.json"
+
+    run_exact_trust_scenario() {
+      local label="$1" mutate_py="$2" log_name="$3"
+      python3 -c "$mutate_py" "$STS_JSON_PATH"
+      set +e
+      (cd "${TF_PLAN_SCRATCH}/envs/dev" && terraform plan -input=false) >"${TF_PLAN_SCRATCH}/${log_name}" 2>&1
+      local status=$?
+      set -e
+      if [ "$status" -ne 0 ] && grep -q "trust subjects must exactly equal the currently approved migration" "${TF_PLAN_SCRATCH}/${log_name}"; then
+        pass "30: ${label} produces a non-zero Terraform plan exit (exact-trust equality enforced)"
+      else
+        fail "30: ${label} did not block Terraform plan as expected (exit=${status})"
+        cat "${TF_PLAN_SCRATCH}/${log_name}"
+      fi
+      cp "${TF_PLAN_SCRATCH}/sts-exact-trust-backup.json" "$STS_JSON_PATH"
+    }
+
+    run_exact_trust_scenario "G: removing the transitional gg-postgresql-sa subject" '
+import json, sys
+with open(sys.argv[1]) as f: doc = json.load(f)
+subs = doc["Statement"][0]["Condition"]["StringLike"]["oidc.eks.eu-west-1.amazonaws.com/id/407C4385FF87947926730569F1E564FB:sub"]
+subs.remove("system:serviceaccount:goldengate-dev:gg-postgresql-sa")
+with open(sys.argv[1], "w") as f: json.dump(doc, f, indent=2)
+' "plan-missing-transitional.log"
+
+    run_exact_trust_scenario "H: removing the canonical gg-runtime-sa subject" '
+import json, sys
+with open(sys.argv[1]) as f: doc = json.load(f)
+subs = doc["Statement"][0]["Condition"]["StringLike"]["oidc.eks.eu-west-1.amazonaws.com/id/407C4385FF87947926730569F1E564FB:sub"]
+subs.remove("system:serviceaccount:goldengate-dev:gg-runtime-sa")
+with open(sys.argv[1], "w") as f: json.dump(doc, f, indent=2)
+' "plan-missing-canonical.log"
+
+    run_exact_trust_scenario "I: removing the legacy gg-dev-*:ogg-oracle-sa wildcard" '
+import json, sys
+with open(sys.argv[1]) as f: doc = json.load(f)
+subs = doc["Statement"][0]["Condition"]["StringLike"]["oidc.eks.eu-west-1.amazonaws.com/id/407C4385FF87947926730569F1E564FB:sub"]
+subs.remove("system:serviceaccount:gg-dev-*:ogg-oracle-sa")
+with open(sys.argv[1], "w") as f: json.dump(doc, f, indent=2)
+' "plan-missing-legacy.log"
+
+    run_exact_trust_scenario "J: adding an unexpected subject" '
+import json, sys
+with open(sys.argv[1]) as f: doc = json.load(f)
+subs = doc["Statement"][0]["Condition"]["StringLike"]["oidc.eks.eu-west-1.amazonaws.com/id/407C4385FF87947926730569F1E564FB:sub"]
+subs.append("system:serviceaccount:goldengate-dev:gg-unexpected-sa")
+with open(sys.argv[1], "w") as f: json.dump(doc, f, indent=2)
+' "plan-unexpected-subject.log"
+
+    run_exact_trust_scenario "K: duplicating an existing subject" '
+import json, sys
+with open(sys.argv[1]) as f: doc = json.load(f)
+subs = doc["Statement"][0]["Condition"]["StringLike"]["oidc.eks.eu-west-1.amazonaws.com/id/407C4385FF87947926730569F1E564FB:sub"]
+subs.append("system:serviceaccount:goldengate-dev:gg-runtime-sa")
+with open(sys.argv[1], "w") as f: json.dump(doc, f, indent=2)
+' "plan-duplicate-subject.log"
+
+    # L: a brand-new deployment type requires ZERO sts.json change and still plans cleanly against the SAME exact four-subject trust set (sts.json here is the untouched real file, restored after each G-K mutation above).
     mkdir -p "${TF_PLAN_SCRATCH}/envs/dev/gg-mysql-fixture-01"
     sed -e 's/deploymentType: postgresql/deploymentType: mysql/' \
         -e 's/pipeline: payments-ora-to-pg-001/pipeline: payments-mysql-fixture-001/' \
@@ -6809,7 +6893,7 @@ EOF
     TF_PLAN_NEW_TYPE_ONBOARDED_STATUS=$?
     set -e
     if [ "$TF_PLAN_NEW_TYPE_ONBOARDED_STATUS" -eq 0 ] && grep -q "to add, 0 to change, 0 to destroy" "${TF_PLAN_SCRATCH}/plan-new-type-onboarded.log"; then
-      pass "30: a brand-new safe deployment type (mysql) plans cleanly the moment its folder alone exists -- zero .tf source change AND zero sts.json change required, since every deploymentType shares the already-trusted gg-runtime-sa"
+      pass "30: a brand-new safe deployment type (mysql) plans cleanly the moment its folder alone exists -- zero .tf source change AND zero sts.json change required against the same exact four-subject trust set"
     else
       fail "30: onboarding a brand-new safe deployment type via folder data alone did not produce a clean Terraform plan (exit=${TF_PLAN_NEW_TYPE_ONBOARDED_STATUS})"
       cat "${TF_PLAN_SCRATCH}/plan-new-type-onboarded.log"
