@@ -7,8 +7,10 @@ namespaces:
     create: false
     name: ""
 
-# One generated runtime ServiceAccount per enabled GoldenGate deployment type (deterministic gg-<type>-sa naming, manager-aligned), keyed by runtime.deploymentType as {name, roleArn}; never a single shared identity, never a fixed per-flavour template branch, empty by default -- the deploy workflow populates it entirely from the folder-driven identity inventory.
-runtimeServiceAccounts: {}
+# Single shared runtime ServiceAccount for EVERY GoldenGate deployment regardless of deploymentType (restored stable identity boundary): every singleRuntime pod assumes the same runtime IAM role via this one identity, so onboarding a new engine never requires a new IRSA trust subject. name is a fixed platform invariant; roleArn is empty by default -- the deploy workflow populates it with the one runtime IAM role every deploymentType already shares. Never a per-type map, never a fixed per-flavour template branch.
+runtimeServiceAccount:
+  name: gg-runtime-sa
+  roleArn: ""
 
 # Centralized container logging (platform-level DaemonSet, never a runtime/observer sidecar); collects Kubernetes stdout/stderr only, not EFS /u02 GoldenGate file logs.
 fluentBit:

@@ -153,8 +153,8 @@ def resolve_tls_secret(environment):
 
 
 def resolve_runtime_service_account(deployment_type):
-    """The one and only ServiceAccount derivation rule: deterministic naming from the already-validated safe deployment_type token, never a hardcoded map."""
-    return f"gg-{deployment_type}-sa"
+    """The one and only ServiceAccount derivation rule: every singleRuntime deployment shares the platform-owned gg-runtime-sa identity, regardless of deployment_type -- deploymentType controls image/product/ports/replication semantics, never AWS runtime identity. The parameter is kept (rather than removed) so call sites stay symmetric with the rest of the resolve_* family and so a future per-type override would be a single, obvious change point."""
+    return "gg-runtime-sa"
 
 
 def _safe_token(value, max_length):
@@ -262,7 +262,7 @@ def _reject_forbidden_overrides(doc):
 
     runtime = doc.get("runtime") or {}
     if "serviceAccount" in runtime:
-        raise DescriptorError("forbidden override: runtime.serviceAccount is derived from runtime.deploymentType and must not be set")
+        raise DescriptorError("forbidden override: runtime.serviceAccount is a shared platform invariant (gg-runtime-sa for every deploymentType) and must not be set")
     csi = runtime.get("csi") or {}
     if "serviceAccountRoleArn" in csi:
         raise DescriptorError("forbidden override: runtime.csi.serviceAccountRoleArn is a shared platform invariant and must not be set")

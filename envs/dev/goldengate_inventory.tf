@@ -214,37 +214,46 @@ locals {
 
   goldengate_tls_secret_name = "${var.environment}/goldengate/tls-certificate"
 
-  # Deterministic naming, never a hardcoded map: deploymentType alone selects the ServiceAccount name. Only a safe token (enforced by the precondition below) ever reaches this string interpolation.
+  # Restored shared runtime identity: every singleRuntime deployment resolves the SAME platform-owned ServiceAccount regardless of deploymentType -- deploymentType controls image/product/ports/replication semantics, never AWS runtime identity. Mirrors hack/goldengate-deployment-model.py's resolve_runtime_service_account().
   goldengate_runtime_service_account_names = {
-    for id in local.goldengate_deployment_names : id =>
-    "gg-${try(local.goldengate_enabled_deployments[id].runtime.deploymentType, "")}-sa"
+    for id in local.goldengate_deployment_names : id => "gg-runtime-sa"
   }
 
-  # Unique enabled deployment types, sorted deterministically; mirrors hack/goldengate-deployment-model.py's runtime-identities command.
+  # Unique enabled deployment types, sorted deterministically; mirrors hack/goldengate-deployment-model.py's runtime-identities command. No longer drives runtime AWS identity (see goldengate_canonical_runtime_trust_subject below) -- retained as the folder-driven type inventory consumed by DynamoDB CONFIG/dashboard generation.
   goldengate_enabled_deployment_types = sort(distinct([
     for id in local.goldengate_deployment_names : local.goldengate_deployment_type_raw[id]
   ]))
 
+  # Descriptive per-type mirror only, since every type now shares one runtime ServiceAccount; never consumed for IRSA trust.
   goldengate_runtime_identity_inventory = {
-    for t in local.goldengate_enabled_deployment_types : t => "gg-${t}-sa"
+    for t in local.goldengate_enabled_deployment_types : t => "gg-runtime-sa"
   }
 
   # The retained, honestly-unresolved legacy exception (see envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json); requires live-cluster evidence before removal, never generated or removed by this file.
   goldengate_legacy_wildcard_trust_subject = "system:serviceaccount:gg-dev-*:ogg-oracle-sa"
 
-  goldengate_expected_irsa_trust_subjects = sort([
-    for t in local.goldengate_enabled_deployment_types :
-    "system:serviceaccount:${local.goldengate_shared_environment.runtimeNamespace}:gg-${t}-sa"
-  ])
+  # The permanent, stable self-service runtime identity: every singleRuntime deployment of every deploymentType (including future ones) shares this ONE IRSA subject, so onboarding a new engine never requires an IAM trust-policy edit. Never derived from the folder inventory -- it is a platform invariant, not a per-type/per-count value.
+  goldengate_canonical_runtime_trust_subject = "system:serviceaccount:${local.goldengate_shared_environment.runtimeNamespace}:gg-runtime-sa"
+
+  # Transitional per-engine subjects retained from the prior architecture (gg-oracle-sa/gg-postgresql-sa); intentionally a FIXED, explicitly-reviewed allowlist now, never re-derived from the folder inventory -- they shrink only through a later, separate, evidence-driven retirement phase alongside the historical Oracle/PostgreSQL deployments themselves.
+  goldengate_transitional_engine_trust_subjects = [
+    "system:serviceaccount:${local.goldengate_shared_environment.runtimeNamespace}:gg-oracle-sa",
+    "system:serviceaccount:${local.goldengate_shared_environment.runtimeNamespace}:gg-postgresql-sa",
+  ]
+
+  goldengate_allowed_irsa_trust_subjects = sort(concat(
+    [local.goldengate_canonical_runtime_trust_subject],
+    local.goldengate_transitional_engine_trust_subjects,
+    [local.goldengate_legacy_wildcard_trust_subject],
+  ))
 
   goldengate_secrets_trust_policy = jsondecode(file("${path.module}/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json"))
   goldengate_secrets_trust_subjects = local.goldengate_secrets_trust_policy.Statement[0].Condition.StringLike[
     "oidc.eks.eu-west-1.amazonaws.com/id/407C4385FF87947926730569F1E564FB:sub"
   ]
-  goldengate_secrets_trust_subjects_non_legacy = sort([
-    for s in local.goldengate_secrets_trust_subjects : s
-    if s != local.goldengate_legacy_wildcard_trust_subject
-  ])
+
+  # Fail-closed allowlist check: every actual subject must be the canonical gg-runtime-sa, an explicitly-retained transitional per-engine subject, or the legacy wildcard -- never a new/unexpected subject and never a namespace-wide wildcard. A new deploymentType is never a new subject, so this never grows from onboarding alone.
+  goldengate_unexpected_irsa_trust_subjects = setsubtract(toset(local.goldengate_secrets_trust_subjects), toset(local.goldengate_allowed_irsa_trust_subjects))
 
   goldengate_platform_values = yamldecode(file("${path.module}/../../platform/${var.environment}/goldengate-platform/values.yaml"))
   goldengate_monitor_values  = yamldecode(file("${path.module}/goldengate-monitor/values.yaml"))
@@ -309,7 +318,7 @@ resource "terraform_data" "goldengate_runtime_contract" {
     }
     precondition {
       condition     = !local.goldengate_service_account_declared[each.key]
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.serviceAccount is a forbidden override -- it is derived solely from runtime.deploymentType."
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.serviceAccount is a forbidden override -- every singleRuntime deployment shares the platform-owned gg-runtime-sa identity regardless of runtime.deploymentType."
     }
     precondition {
       condition     = !local.goldengate_deployment_admin_secret_declared[each.key]
@@ -586,8 +595,8 @@ resource "terraform_data" "goldengate_cross_pipeline_contract" {
       error_message = "replication.distribution.targetTrailName must equal the target replication.replicat.sourceTrailName for its pipeline."
     }
     precondition {
-      condition     = local.goldengate_secrets_trust_subjects_non_legacy == local.goldengate_expected_irsa_trust_subjects
-      error_message = "envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json trust subjects do not match the folder-driven runtime identity inventory -- add or remove the exact system:serviceaccount:<namespace>:gg-<type>-sa subject for every enabled deployment type (the legacy gg-dev-*:ogg-oracle-sa wildcard is retained separately and is never generated or removed by this check)."
+      condition     = length(local.goldengate_unexpected_irsa_trust_subjects) == 0 && contains(local.goldengate_secrets_trust_subjects, local.goldengate_canonical_runtime_trust_subject)
+      error_message = "envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json trust subjects must contain exactly the permanent canonical system:serviceaccount:<namespace>:gg-runtime-sa subject, only the explicitly-retained transitional gg-oracle-sa/gg-postgresql-sa subjects, and the legacy gg-dev-*:ogg-oracle-sa wildcard -- no other subject (and never a namespace-wide wildcard) is permitted. Onboarding a new deploymentType must never require editing this file, since every deploymentType shares gg-runtime-sa."
     }
   }
 }

@@ -63,7 +63,7 @@ env:
   ARGOCD_APP_NAME: goldengate-dev-platform
   ARGOCD_PLATFORM_SECRET_NAME: argocd-ecr-goldengate-platform-oci
 
-  # One generated runtime ServiceAccount per folder-driven deployment type this chart is the single owner of (see "Compute the folder-driven runtime identity inventory"); never used by an individual GoldenGate runtime release.
+  # The single shared runtime ServiceAccount (RUNTIME_SA_NAME) lives in this namespace; this chart is its sole owner, never an individual GoldenGate runtime release.
   RUNTIME_NAMESPACE: goldengate-dev
 
   # The second namespace the Fluent Bit DaemonSet ships logs from (the shared monitor's namespace, owned by helm/goldengate-monitor, never created/altered by this chart).
@@ -71,7 +71,8 @@ env:
   FLUENT_BIT_RUNTIME_LOG_GROUP: /adcb/goldengate/dev/runtime
   FLUENT_BIT_MONITOR_LOG_GROUP: /adcb/goldengate/dev/monitor
 
-  # Every runtime ServiceAccount (regardless of deployment type) uses this shared GoldenGateSecretsReadRole-dev role (also used by the shared monitor; extended trust policy at envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json); this ARN is a literal predicted value since this repository has no Terraform outputs.tf.
+  # Every GoldenGate runtime pod (regardless of deployment type) shares this ONE ServiceAccount and IAM role (also used by the shared monitor; trust policy at envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json) -- the restored stable runtime identity boundary, never a per-engine identity. This ARN is a literal predicted value since this repository has no Terraform outputs.tf.
+  RUNTIME_SA_NAME: gg-runtime-sa
   RUNTIME_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev
 
   # Platform-level Fluent Bit DaemonSet's dedicated least-privilege role -- see envs/dev/policies/goldengate-platform-logging-dev/.
@@ -264,17 +265,6 @@ jobs:
           done
           echo "Required files are present."
 
-      - name: Compute the folder-driven runtime identity inventory
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p work
-          python3 hack/goldengate-deployment-model.py --environment "$ENVIRONMENT" runtime-identities > work/runtime-identities.csv
-          echo "RUNTIME_IDENTITIES_FILE=work/runtime-identities.csv" >> "$GITHUB_ENV"
-          echo "Folder-driven runtime identities for ${ENVIRONMENT}:"
-          cat work/runtime-identities.csv
-
       - name: Login Helm to Amazon ECR
         shell: bash
         run: |
@@ -360,16 +350,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          RUNTIME_SA_SET_ARGS=()
-          while IFS=',' read -r deployment_type service_account_name; do
-            [ -z "$deployment_type" ] && continue
-            RUNTIME_SA_SET_ARGS+=(--set-string "runtimeServiceAccounts.${deployment_type}.name=${service_account_name}")
-            RUNTIME_SA_SET_ARGS+=(--set-string "runtimeServiceAccounts.${deployment_type}.roleArn=${RUNTIME_ROLE_ARN}")
-          done < "$RUNTIME_IDENTITIES_FILE"
-
           helm lint "$HELM_CHART_PATH" \
             --values "$VALUES_FILE" \
-            "${RUNTIME_SA_SET_ARGS[@]}" \
+            --set-string runtimeServiceAccount.roleArn="$RUNTIME_ROLE_ARN" \
             --set-string fluentBit.serviceAccount.roleArn="$FLUENT_BIT_ROLE_ARN" \
             --set-string fluentBit.aws.region="$AWS_REGION" \
             --set-string fluentBit.image.reference="$FLUENT_BIT_IMAGE"
@@ -381,16 +364,9 @@ jobs:
 
           mkdir -p rendered
 
-          RUNTIME_SA_SET_ARGS=()
-          while IFS=',' read -r deployment_type service_account_name; do
-            [ -z "$deployment_type" ] && continue
-            RUNTIME_SA_SET_ARGS+=(--set-string "runtimeServiceAccounts.${deployment_type}.name=${service_account_name}")
-            RUNTIME_SA_SET_ARGS+=(--set-string "runtimeServiceAccounts.${deployment_type}.roleArn=${RUNTIME_ROLE_ARN}")
-          done < "$RUNTIME_IDENTITIES_FILE"
-
           helm template "$RELEASE_NAME" "$HELM_CHART_PATH" \
             --values "$VALUES_FILE" \
-            "${RUNTIME_SA_SET_ARGS[@]}" \
+            --set-string runtimeServiceAccount.roleArn="$RUNTIME_ROLE_ARN" \
             --set-string fluentBit.serviceAccount.roleArn="$FLUENT_BIT_ROLE_ARN" \
             --set-string fluentBit.aws.region="$AWS_REGION" \
             --set-string fluentBit.image.reference="$FLUENT_BIT_IMAGE" \
@@ -510,10 +486,7 @@ jobs:
               exit 1
             fi
           }
-          while IFS=',' read -r deployment_type service_account_name; do
-            [ -z "$deployment_type" ] && continue
-            assert_exactly_one_serviceaccount "$service_account_name"
-          done < "$RUNTIME_IDENTITIES_FILE"
+          assert_exactly_one_serviceaccount "$RUNTIME_SA_NAME"
           assert_exactly_one_serviceaccount "$FLUENT_BIT_SA_NAME"
 
           # deletion_protected is "true" for every shared runtime identity (must survive this Application's own deletion) and "false" for gg-fluent-bit (pruned/deleted normally with this release).
@@ -553,10 +526,7 @@ jobs:
             fi
           }
 
-          while IFS=',' read -r deployment_type service_account_name; do
-            [ -z "$deployment_type" ] && continue
-            validate_runtime_sa "$service_account_name" "$RUNTIME_ROLE_ARN" "true"
-          done < "$RUNTIME_IDENTITIES_FILE"
+          validate_runtime_sa "$RUNTIME_SA_NAME" "$RUNTIME_ROLE_ARN" "true"
           validate_runtime_sa "$FLUENT_BIT_SA_NAME" "$FLUENT_BIT_ROLE_ARN" "false"
 
           echo "Validating no unexpected IRSA role is used by any rendered ServiceAccount..."
@@ -882,16 +852,6 @@ jobs:
 
           echo "Applying Argo CD Application: ${ARGOCD_APP_NAME}"
 
-          RUNTIME_SA_ARGOCD_PARAMS=""
-          while IFS=',' read -r deployment_type service_account_name; do
-            [ -z "$deployment_type" ] && continue
-            RUNTIME_SA_ARGOCD_PARAMS="${RUNTIME_SA_ARGOCD_PARAMS}
-                  - name: runtimeServiceAccounts.${deployment_type}.name
-                    value: ${service_account_name}
-                  - name: runtimeServiceAccounts.${deployment_type}.roleArn
-                    value: ${RUNTIME_ROLE_ARN}"
-          done < "$RUNTIME_IDENTITIES_FILE"
-
           # Single designated owner of the shared runtime namespace, so (unlike per-runtime goldengate-eks-app.yaml Applications) it is allowed CreateNamespace=true and managedNamespaceMetadata.
           kubectl apply -f - <<EOF
           apiVersion: argoproj.io/v1alpha1
@@ -914,7 +874,9 @@ jobs:
                 releaseName: ${RELEASE_NAME}
                 valueFiles:
                   - values-deployment.yaml
-                parameters:${RUNTIME_SA_ARGOCD_PARAMS}
+                parameters:
+                  - name: runtimeServiceAccount.roleArn
+                    value: ${RUNTIME_ROLE_ARN}
                   - name: fluentBit.serviceAccount.roleArn
                     value: ${FLUENT_BIT_ROLE_ARN}
                   - name: fluentBit.aws.region
@@ -993,17 +955,14 @@ jobs:
           echo "Namespace:"
           kubectl get namespace "$RUNTIME_NAMESPACE"
 
-          echo "ServiceAccounts and IRSA annotations:"
-          while IFS=',' read -r deployment_type service_account_name; do
-            [ -z "$deployment_type" ] && continue
-            kubectl get serviceaccount "$service_account_name" -n "$RUNTIME_NAMESPACE"
-            actual_role_annotation="$(kubectl get serviceaccount "$service_account_name" -n "$RUNTIME_NAMESPACE" -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}')"
-            if [ "$actual_role_annotation" != "$RUNTIME_ROLE_ARN" ]; then
-              echo "FAIL: unexpected IRSA role annotation on ServiceAccount ${service_account_name}: ${actual_role_annotation}"
-              exit 1
-            fi
-            echo "OK: ${service_account_name} IRSA role annotation matches ${RUNTIME_ROLE_ARN}."
-          done < "$RUNTIME_IDENTITIES_FILE"
+          echo "ServiceAccount and IRSA annotation:"
+          kubectl get serviceaccount "$RUNTIME_SA_NAME" -n "$RUNTIME_NAMESPACE"
+          actual_role_annotation="$(kubectl get serviceaccount "$RUNTIME_SA_NAME" -n "$RUNTIME_NAMESPACE" -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}')"
+          if [ "$actual_role_annotation" != "$RUNTIME_ROLE_ARN" ]; then
+            echo "FAIL: unexpected IRSA role annotation on ServiceAccount ${RUNTIME_SA_NAME}: ${actual_role_annotation}"
+            exit 1
+          fi
+          echo "OK: ${RUNTIME_SA_NAME} IRSA role annotation matches ${RUNTIME_ROLE_ARN}."
 
           echo "Confirming this Application owns no GoldenGate runtime workload resources (namespaces/ServiceAccounts and the Phase 6A Fluent Bit DaemonSet only)..."
           WORKLOAD_COUNT=0
@@ -1042,10 +1001,6 @@ jobs:
         if: always()
         shell: bash
         run: |
-          RUNTIME_SA_SUMMARY_LIST="(none discovered)"
-          if [ -f "${RUNTIME_IDENTITIES_FILE:-}" ]; then
-            RUNTIME_SA_SUMMARY_LIST="$(awk -F, '$1 != "" {printf "ServiceAccount/%s, ", $2}' "$RUNTIME_IDENTITIES_FILE" | sed 's/, $//')"
-          fi
           {
             echo "## GoldenGate platform deploy summary"
             echo ""
@@ -1058,10 +1013,10 @@ jobs:
             echo "### Ownership"
             echo ""
             echo "This is the single designated owner of Namespace/${RUNTIME_NAMESPACE} and"
-            echo "${RUNTIME_SA_SUMMARY_LIST} -- one generated runtime identity per folder-driven"
-            echo "GoldenGate deployment type. Individual GoldenGate runtime Applications"
-            echo "(goldengate-eks-app.yaml) reference these ServiceAccounts by name only"
-            echo "(serviceAccount.create=false) and never own or delete them."
+            echo "ServiceAccount/${RUNTIME_SA_NAME} -- the one shared runtime identity used by"
+            echo "every GoldenGate deployment type. Individual GoldenGate runtime Applications"
+            echo "(goldengate-eks-app.yaml) reference this ServiceAccount by name only"
+            echo "(serviceAccount.create=false) and never own or delete it."
             echo ""
             echo "Phase 6A: this Application also owns DaemonSet/gg-fluent-bit"
             echo "(platform-level centralized container logging, ServiceAccount/${FLUENT_BIT_SA_NAME},"

@@ -5,7 +5,7 @@ namespaces:
     create: true
     name: goldengate-dev
 
-# runtimeServiceAccounts is intentionally absent -- the deploy workflow injects it via --set from the folder-driven identity inventory, never hand-maintained.
+# runtimeServiceAccount.roleArn is intentionally absent -- the deploy workflow injects it via --set (RUNTIME_ROLE_ARN), never hand-maintained here. name defaults to the chart's own gg-runtime-sa (the one shared runtime identity for every deploymentType).
 
 fluentBit:
   create: true

@@ -331,20 +331,21 @@ class RealRepositoryDescriptorTests(unittest.TestCase):
 
         self.assertEqual(len(alb_orders), len(set(alb_orders)), "ALB groupOrder must be unique across every active shared-ALB descriptor")
 
-    def test_existing_oracle_still_uses_gg_oracle_sa(self):
+    def test_existing_oracle_uses_the_restored_shared_gg_runtime_sa(self):
+        # Restored shared runtime identity: deploymentType no longer selects the ServiceAccount -- every singleRuntime deployment (including this historical Oracle descriptor, which never overrides runtime.serviceAccount) now resolves the one platform-owned gg-runtime-sa.
         active, _inactive, _invalid = gdm.scan("dev")
         by_id = {d["deploymentId"]: d for d in active}
-        self.assertEqual(by_id["gg-oracle-payments-01"]["runtimeServiceAccountName"], "gg-oracle-sa")
+        self.assertEqual(by_id["gg-oracle-payments-01"]["runtimeServiceAccountName"], "gg-runtime-sa")
 
-    def test_existing_postgresql_still_uses_gg_postgresql_sa(self):
+    def test_existing_postgresql_uses_the_restored_shared_gg_runtime_sa(self):
         active, _inactive, _invalid = gdm.scan("dev")
         by_id = {d["deploymentId"]: d for d in active}
-        self.assertEqual(by_id["gg-postgresql-payments-01"]["runtimeServiceAccountName"], "gg-postgresql-sa")
+        self.assertEqual(by_id["gg-postgresql-payments-01"]["runtimeServiceAccountName"], "gg-runtime-sa")
 
-    def test_no_existing_deployment_resolves_to_gg_runtime_sa(self):
+    def test_every_active_deployment_resolves_to_gg_runtime_sa(self):
         active, _inactive, _invalid = gdm.scan("dev")
         for d in active:
-            self.assertNotEqual(d["runtimeServiceAccountName"], "gg-runtime-sa")
+            self.assertEqual(d["runtimeServiceAccountName"], "gg-runtime-sa")
 
     def test_replication_1_existing_oracle_disabled_replication_remains_valid(self):
         active, _inactive, invalid = gdm.scan("dev")
@@ -380,11 +381,11 @@ class GenericDeploymentTypeTests(ScratchEnvironmentTestCase):
         self.assertEqual(active[0]["deploymentType"], "mssql")
         self.assertEqual(active[0]["adminSecretName"], "dev/goldengate/target/admin")
 
-    def test_any_safe_type_derives_its_service_account_without_a_fixed_allowlist(self):
+    def test_any_safe_type_derives_the_shared_service_account_without_a_fixed_allowlist(self):
         write_descriptor(self._tmp.name, "dev", "gg-mysql-fixture-01", deployment_type="mysql")
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
-        self.assertEqual(active[0]["runtimeServiceAccountName"], "gg-mysql-sa")
+        self.assertEqual(active[0]["runtimeServiceAccountName"], "gg-runtime-sa")
 
     def test_safe_daa_type_parses(self):
         write_descriptor(self._tmp.name, "dev", "gg-daa-fixture-01", deployment_type="daa")
@@ -423,48 +424,49 @@ class GenericDeploymentTypeTests(ScratchEnvironmentTestCase):
 
 
 class RuntimeIdentityNamingTests(unittest.TestCase):
-    """Tests 1-7: deterministic gg-<type>-sa naming, never a hardcoded deploymentType-to-ServiceAccount map."""
+    """Restored shared runtime identity: EVERY deploymentType resolves the same gg-runtime-sa, never a per-type gg-<type>-sa map. deploymentType controls image/product/ports/replication semantics, never AWS runtime identity."""
 
-    def test_oracle_resolves_to_gg_oracle_sa(self):
-        self.assertEqual(gdm.resolve_runtime_service_account("oracle"), "gg-oracle-sa")
+    def test_oracle_resolves_to_gg_runtime_sa(self):
+        self.assertEqual(gdm.resolve_runtime_service_account("oracle"), "gg-runtime-sa")
 
-    def test_postgresql_resolves_to_gg_postgresql_sa(self):
-        self.assertEqual(gdm.resolve_runtime_service_account("postgresql"), "gg-postgresql-sa")
+    def test_postgresql_resolves_to_gg_runtime_sa(self):
+        self.assertEqual(gdm.resolve_runtime_service_account("postgresql"), "gg-runtime-sa")
 
-    def test_mssql_resolves_to_gg_mssql_sa(self):
-        self.assertEqual(gdm.resolve_runtime_service_account("mssql"), "gg-mssql-sa")
+    def test_mssql_resolves_to_gg_runtime_sa(self):
+        self.assertEqual(gdm.resolve_runtime_service_account("mssql"), "gg-runtime-sa")
 
-    def test_daa_resolves_to_gg_daa_sa(self):
-        self.assertEqual(gdm.resolve_runtime_service_account("daa"), "gg-daa-sa")
+    def test_daa_resolves_to_gg_runtime_sa(self):
+        self.assertEqual(gdm.resolve_runtime_service_account("daa"), "gg-runtime-sa")
 
-    def test_mysql_resolves_to_gg_mysql_sa_without_source_changes(self):
-        self.assertEqual(gdm.resolve_runtime_service_account("mysql"), "gg-mysql-sa")
+    def test_mysql_resolves_to_gg_runtime_sa(self):
+        self.assertEqual(gdm.resolve_runtime_service_account("mysql"), "gg-runtime-sa")
 
-    def test_another_synthetic_safe_type_derives_its_matching_service_account(self):
-        self.assertEqual(gdm.resolve_runtime_service_account("cassandra"), "gg-cassandra-sa")
+    def test_another_synthetic_safe_type_also_resolves_to_gg_runtime_sa(self):
+        self.assertEqual(gdm.resolve_runtime_service_account("cassandra"), "gg-runtime-sa")
 
     def test_no_hardcoded_deployment_type_to_service_account_map_exists_in_source(self):
         with open(TOOL_PATH) as f:
             source = f.read()
         self.assertNotIn("RUNTIME_IDENTITY_MAP", source)
+        self.assertNotIn('f"gg-{deployment_type}-sa"', source)
 
 
 class SyntheticFlavourRenderTests(ScratchEnvironmentTestCase):
-    """Tests 8, 9, 15, 16: shared/distinct ServiceAccounts by type, image stays values-file-derived, existing Oracle/PostgreSQL unaffected."""
+    """Tests 8, 9, 15, 16: every type shares the one restored gg-runtime-sa identity, image stays values-file-derived, existing Oracle/PostgreSQL unaffected."""
 
-    def test_synthetic_mssql_runtime_resolves_gg_mssql_sa(self):
+    def test_synthetic_mssql_runtime_resolves_gg_runtime_sa(self):
         write_descriptor(self._tmp.name, "dev", "gg-mssql-fixture-01",
                          pipeline="p1", role="target", deployment_type="mssql")
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
-        self.assertEqual(active[0]["runtimeServiceAccountName"], "gg-mssql-sa")
+        self.assertEqual(active[0]["runtimeServiceAccountName"], "gg-runtime-sa")
 
-    def test_synthetic_daa_runtime_resolves_gg_daa_sa(self):
+    def test_synthetic_daa_runtime_resolves_gg_runtime_sa(self):
         write_descriptor(self._tmp.name, "dev", "gg-daa-fixture-01",
                          pipeline="p1", role="source", deployment_type="daa")
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
-        self.assertEqual(active[0]["runtimeServiceAccountName"], "gg-daa-sa")
+        self.assertEqual(active[0]["runtimeServiceAccountName"], "gg-runtime-sa")
 
     def test_two_deployments_of_the_same_type_share_one_service_account(self):
         write_descriptor(self._tmp.name, "dev", "gg-postgresql-fixture-a", pipeline="pa", role="source", deployment_type="postgresql")
@@ -472,17 +474,18 @@ class SyntheticFlavourRenderTests(ScratchEnvironmentTestCase):
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
         sa_names = {d["runtimeServiceAccountName"] for d in active}
-        self.assertEqual(sa_names, {"gg-postgresql-sa"})
+        self.assertEqual(sa_names, {"gg-runtime-sa"})
 
-    def test_different_types_produce_distinct_service_accounts(self):
+    def test_different_types_still_share_the_same_service_account(self):
+        # Restored shared identity: deploymentType controls image/product/ports/replication semantics, never AWS runtime identity -- different types must NOT produce distinct ServiceAccounts anymore.
         write_descriptor(self._tmp.name, "dev", "gg-oracle-fixture-a", pipeline="pa", role="source", deployment_type="oracle")
         write_descriptor(self._tmp.name, "dev", "gg-mssql-fixture-b", pipeline="pb", role="target", deployment_type="mssql")
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
         sa_names = {d["deploymentId"]: d["runtimeServiceAccountName"] for d in active}
-        self.assertEqual(sa_names["gg-oracle-fixture-a"], "gg-oracle-sa")
-        self.assertEqual(sa_names["gg-mssql-fixture-b"], "gg-mssql-sa")
-        self.assertNotEqual(sa_names["gg-oracle-fixture-a"], sa_names["gg-mssql-fixture-b"])
+        self.assertEqual(sa_names["gg-oracle-fixture-a"], "gg-runtime-sa")
+        self.assertEqual(sa_names["gg-mssql-fixture-b"], "gg-runtime-sa")
+        self.assertEqual(sa_names["gg-oracle-fixture-a"], sa_names["gg-mssql-fixture-b"])
 
     def test_mssql_image_comes_from_the_values_file_not_a_mapping(self):
         write_descriptor(self._tmp.name, "dev", "gg-mssql-fixture-01",
@@ -511,7 +514,7 @@ class SyntheticFlavourRenderTests(ScratchEnvironmentTestCase):
         write_descriptor(self._tmp.name, "dev", "gg-oracle-payments-99", pipeline="p1", role="source", deployment_type="oracle")
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
-        self.assertEqual(active[0]["runtimeServiceAccountName"], "gg-oracle-sa")
+        self.assertEqual(active[0]["runtimeServiceAccountName"], "gg-runtime-sa")
         self.assertNotIn("payments-99", active[0]["runtimeServiceAccountName"])
 
 
@@ -525,7 +528,7 @@ class RuntimeIdentitiesCommandTests(ScratchEnvironmentTestCase):
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
         inventory = gdm.runtime_identity_inventory(active)
-        self.assertEqual(inventory, [("oracle", "gg-oracle-sa"), ("postgresql", "gg-postgresql-sa")])
+        self.assertEqual(inventory, [("oracle", "gg-runtime-sa"), ("postgresql", "gg-runtime-sa")])
 
     def test_disabled_deployment_excluded_from_identity_inventory(self):
         write_descriptor(self._tmp.name, "dev", "gg-oracle-fixture-a", pipeline="pa", role="source", deployment_type="oracle")
@@ -533,7 +536,7 @@ class RuntimeIdentitiesCommandTests(ScratchEnvironmentTestCase):
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
         inventory = gdm.runtime_identity_inventory(active)
-        self.assertEqual(inventory, [("oracle", "gg-oracle-sa")])
+        self.assertEqual(inventory, [("oracle", "gg-runtime-sa")])
 
 
 class SharedSecretDerivationTests(unittest.TestCase):
@@ -640,7 +643,7 @@ class ForbiddenOverrideTests(ScratchEnvironmentTestCase):
         write_descriptor(self._tmp.name, "dev", "gg-fixture-01")
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
-        self.assertEqual(active[0]["runtimeServiceAccountName"], "gg-oracle-sa")
+        self.assertEqual(active[0]["runtimeServiceAccountName"], "gg-runtime-sa")
 
 
 class EnvironmentScopedContractTests(ScratchEnvironmentTestCase):
