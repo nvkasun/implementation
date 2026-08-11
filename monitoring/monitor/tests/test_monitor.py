@@ -1866,6 +1866,58 @@ def _extract_step_if_condition(workflow_text, step_name):
 MONITOR_CHART_PATH = os.path.join(REPO_ROOT, "helm", "goldengate-monitor")
 
 
+def _render_monitor_chart(registry_yaml=None):
+    """Renders the real monitor chart via `helm template`, staged either with the real generated registry (mirrors the workflow's staging step) or a given synthetic registry YAML string. Returns the completed subprocess.CompletedProcess (never raises on a nonzero exit -- callers decide whether that's expected)."""
+    if shutil.which("helm") is None:
+        raise unittest.SkipTest("helm not available")
+    tmpdir = tempfile.mkdtemp()
+    staged_chart = os.path.join(tmpdir, "goldengate-monitor")
+    shutil.copytree(MONITOR_CHART_PATH, staged_chart)
+    files_dir = os.path.join(staged_chart, "files")
+    os.makedirs(files_dir, exist_ok=True)
+    if registry_yaml is None:
+        _stage_generated_registry(files_dir)
+    else:
+        with open(os.path.join(files_dir, "goldengate-deployments.yaml"), "w") as f:
+            f.write(registry_yaml)
+
+    return subprocess.run(
+        ["helm", "template", "gg-monitor", staged_chart,
+         "--namespace", "goldengate-monitoring",
+         "-f", os.path.join(REPO_ROOT, "envs", "dev", "goldengate-monitor", "values.yaml"),
+         "--set", "image.repository=example.invalid/goldengate-monitor",
+         "--set", "image.tag=test",
+         "--set", "serviceAccount.roleArn=arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev"],
+        capture_output=True, text=True, cwd=REPO_ROOT,
+    )
+
+
+def _parse_secretproviderclass_objects(rendered_text):
+    """Two-level parse of the REAL rendered manifest, never a reimplementation/grep of the template logic: (1) the outer multi-document Kubernetes YAML, requiring exactly one SecretProviderClass; (2) spec.parameters.objects itself, which is a YAML string embedded as a block scalar and must be parsed a SECOND time to prove the actual AWS Secrets Store CSI provider-facing descriptor structure."""
+    docs = list(yaml.safe_load_all(rendered_text))
+    secretproviderclasses = [d for d in docs if d and d.get("kind") == "SecretProviderClass"]
+    if len(secretproviderclasses) != 1:
+        raise AssertionError(f"expected exactly one SecretProviderClass document, found {len(secretproviderclasses)}")
+    objects_yaml = secretproviderclasses[0]["spec"]["parameters"]["objects"]
+    objects = yaml.safe_load(objects_yaml)
+    if not isinstance(objects, list) or not all(isinstance(o, dict) for o in objects):
+        raise AssertionError(f"spec.parameters.objects did not parse to a list of mapping descriptors: {objects!r}")
+    return objects
+
+
+def _build_registry_yaml(deployments, tls_secret="dev/goldengate/tls-certificate", environment="dev"):
+    """Builds a synthetic canonical registry document (never a handwritten string) for edge-case fixtures."""
+    doc = {
+        "environment": environment,
+        "runtimeNamespace": "goldengate-dev",
+        "monitoringNamespace": "goldengate-monitoring",
+        "dnsDomain": "goldengate-dev.adcbmis.local",
+        "tlsSecret": tls_secret,
+        "deployments": deployments,
+    }
+    return yaml.safe_dump(doc, sort_keys=False)
+
+
 class SecretProviderClassRenderTests(unittest.TestCase):
     """Renders the real helm chart (staged as the workflow stages it) and asserts the generated SecretProviderClass/CSI wiring, not a reimplementation of the template logic."""
 
@@ -1965,60 +2017,239 @@ deployments:
 
 
 class SharedSecretMonitorAliasRenderTests(unittest.TestCase):
-    """Tasks 9/21 (17, 18): multiple deployments sharing one Secrets Manager object still get distinct monitor credential aliases."""
+    """VDR regression: the AWS Secrets Store CSI provider rejects a duplicate top-level objectName -- multiple enabled deployments of the same role intentionally share one Secrets Manager object (dev/goldengate/<role>/admin), so the SecretProviderClass must render exactly ONE top-level descriptor per unique adminSecret, fanned out to deployment-specific files via jmesPath objectAlias entries. Structurally parses the real rendered manifest (two-level YAML parse), never grep/count-of-text alone."""
 
     @classmethod
     def setUpClass(cls):
-        if shutil.which("helm") is None:
-            raise unittest.SkipTest("helm not available")
-        cls.tmpdir = tempfile.mkdtemp()
-        staged_chart = os.path.join(cls.tmpdir, "goldengate-monitor")
-        shutil.copytree(MONITOR_CHART_PATH, staged_chart)
-        os.makedirs(os.path.join(staged_chart, "files"), exist_ok=True)
-        with open(os.path.join(staged_chart, "files", "goldengate-deployments.yaml"), "w") as f:
-            f.write(SYNTHETIC_SHARED_SECRET_REGISTRY)
-
-        proc = subprocess.run(
-            ["helm", "template", "gg-monitor", staged_chart,
-             "--namespace", "goldengate-monitoring",
-             "-f", os.path.join(REPO_ROOT, "envs", "dev", "goldengate-monitor", "values.yaml"),
-             "--set", "image.repository=example.invalid/goldengate-monitor",
-             "--set", "image.tag=test",
-             "--set", "serviceAccount.roleArn=arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev"],
-            capture_output=True, text=True, cwd=REPO_ROOT,
-        )
+        proc = _render_monitor_chart(registry_yaml=SYNTHETIC_SHARED_SECRET_REGISTRY)
         if proc.returncode != 0:
             raise AssertionError(f"helm template failed: {proc.stdout}\n{proc.stderr}")
         cls.rendered = proc.stdout
+        cls.objects = _parse_secretproviderclass_objects(cls.rendered)
+        cls.by_name = {o["objectName"]: o for o in cls.objects}
 
-    def test_two_sources_sharing_one_secret_get_distinct_aliases(self):
-        self.assertIn("gg-source-a-admin-user", self.rendered)
-        self.assertIn("gg-source-a-admin-password", self.rendered)
-        self.assertIn("gg-source-b-admin-user", self.rendered)
-        self.assertIn("gg-source-b-admin-password", self.rendered)
+    def test_top_level_object_names_are_unique_and_exactly_the_two_shared_secrets_plus_tls(self):
+        names = [o["objectName"] for o in self.objects]
+        self.assertEqual(len(names), len(set(names)), f"duplicate top-level objectName(s): {names}")
+        self.assertEqual(
+            sorted(names),
+            sorted(["dev/goldengate/source/admin", "dev/goldengate/target/admin", "dev/goldengate/tls-certificate"]),
+        )
 
-    def test_two_targets_sharing_one_secret_get_distinct_aliases(self):
-        self.assertIn("gg-target-a-admin-user", self.rendered)
-        self.assertIn("gg-target-a-admin-password", self.rendered)
-        self.assertIn("gg-target-b-admin-user", self.rendered)
-        self.assertIn("gg-target-b-admin-password", self.rendered)
+    def test_source_admin_appears_exactly_once(self):
+        self.assertEqual(sum(1 for o in self.objects if o["objectName"] == "dev/goldengate/source/admin"), 1)
 
-    def test_only_the_two_approved_shared_secret_names_appear(self):
-        self.assertIn('objectName: "dev/goldengate/source/admin"', self.rendered)
-        self.assertIn('objectName: "dev/goldengate/target/admin"', self.rendered)
-        self.assertNotIn("gg-source-a/admin", self.rendered)
-        self.assertNotIn("gg-source-b/admin", self.rendered)
-        self.assertNotIn("gg-target-a/admin", self.rendered)
-        self.assertNotIn("gg-target-b/admin", self.rendered)
+    def test_target_admin_appears_exactly_once(self):
+        self.assertEqual(sum(1 for o in self.objects if o["objectName"] == "dev/goldengate/target/admin"), 1)
 
-    def test_four_deployments_yield_eight_credential_aliases(self):
-        for name in ("gg-source-a", "gg-source-b", "gg-target-a", "gg-target-b"):
-            self.assertEqual(self.rendered.count(f"{name}-admin-user"), 1)
-            self.assertEqual(self.rendered.count(f"{name}-admin-password"), 1)
+    def test_tls_appears_exactly_once(self):
+        self.assertEqual(sum(1 for o in self.objects if o["objectName"] == "dev/goldengate/tls-certificate"), 1)
+
+    def test_source_groups_jmes_path_contains_exactly_the_required_aliases_for_both_sources(self):
+        aliases = {jp["objectAlias"] for jp in self.by_name["dev/goldengate/source/admin"]["jmesPath"]}
+        self.assertEqual(aliases, {
+            "gg-source-a-admin-user", "gg-source-a-admin-password",
+            "gg-source-b-admin-user", "gg-source-b-admin-password",
+        })
+
+    def test_target_groups_jmes_path_contains_exactly_the_required_aliases_for_both_targets(self):
+        aliases = {jp["objectAlias"] for jp in self.by_name["dev/goldengate/target/admin"]["jmesPath"]}
+        self.assertEqual(aliases, {
+            "gg-target-a-admin-user", "gg-target-a-admin-password",
+            "gg-target-b-admin-user", "gg-target-b-admin-password",
+        })
+
+    def test_four_deployments_yield_exactly_eight_unique_credential_file_aliases_globally(self):
+        all_aliases = [jp["objectAlias"] for o in self.objects for jp in o["jmesPath"]]
+        expected = {
+            f"{name}-admin-{suffix}"
+            for name in ("gg-source-a", "gg-source-b", "gg-target-a", "gg-target-b")
+            for suffix in ("user", "password")
+        }
+        self.assertEqual(set(all_aliases) & expected, expected)
+        for alias in expected:
+            self.assertEqual(all_aliases.count(alias), 1)
+        self.assertEqual(len(expected), 8)
 
     def test_no_credential_value_is_rendered(self):
         for forbidden in ("hunter2", "-----BEGIN", "OGG_ADMIN_PWD\"\n            value:"):
             self.assertNotIn(forbidden, self.rendered)
+
+
+class RealRegistrySecretProviderClassStructuralTests(unittest.TestCase):
+    """Self-service: never hardcodes deployment count / admin-secret count -- expectations are derived dynamically from the real generated dev registry, so onboarding a new deployment (even one sharing an existing shared admin secret) never requires a test edit."""
+
+    @classmethod
+    def setUpClass(cls):
+        proc = _render_monitor_chart()
+        if proc.returncode != 0:
+            raise AssertionError(f"helm template failed: {proc.stdout}\n{proc.stderr}")
+        cls.objects = _parse_secretproviderclass_objects(proc.stdout)
+        cls.doc = cfgmod.load_deployments(_stage_generated_registry_dir())
+
+    def test_top_level_object_names_are_unique(self):
+        names = [o["objectName"] for o in self.objects]
+        self.assertEqual(len(names), len(set(names)), f"duplicate top-level objectName(s): {names}")
+
+    def test_admin_descriptor_set_matches_dynamically_derived_unique_admin_secrets(self):
+        expected_admin_secrets = sorted({d["adminSecret"] for d in self.doc["deployments"] if d["enabled"]})
+        actual_names = sorted(o["objectName"] for o in self.objects)
+        actual_admin_secrets = sorted(n for n in actual_names if n != self.doc["tlsSecret"])
+        self.assertEqual(actual_admin_secrets, expected_admin_secrets)
+
+    def test_tls_adds_exactly_one_additional_descriptor(self):
+        tls_descriptors = [o for o in self.objects if o["objectName"] == self.doc["tlsSecret"]]
+        self.assertEqual(len(tls_descriptors), 1)
+        expected_admin_secrets = {d["adminSecret"] for d in self.doc["deployments"] if d["enabled"]}
+        unexpected = [o for o in self.objects if o["objectName"] not in expected_admin_secrets and o["objectName"] != self.doc["tlsSecret"]]
+        self.assertEqual(unexpected, [])
+
+    def test_every_enabled_deployment_gets_its_exact_credential_aliases_exactly_once_globally(self):
+        by_name = {o["objectName"]: o for o in self.objects}
+        all_aliases = [jp["objectAlias"] for o in self.objects for jp in o["jmesPath"]]
+        for d in self.doc["deployments"]:
+            if not d["enabled"]:
+                continue
+            with self.subTest(deployment=d["name"]):
+                user_alias = f"{d['name']}-admin-user"
+                pwd_alias = f"{d['name']}-admin-password"
+                self.assertEqual(all_aliases.count(user_alias), 1)
+                self.assertEqual(all_aliases.count(pwd_alias), 1)
+                group = by_name[d["adminSecret"]]
+                group_paths = {jp["objectAlias"]: jp["path"] for jp in group["jmesPath"]}
+                self.assertEqual(group_paths.get(user_alias), "OGG_ADMIN")
+                self.assertEqual(group_paths.get(pwd_alias), "OGG_ADMIN_PWD")
+
+
+class SecretProviderClassGroupingEdgeCaseTests(unittest.TestCase):
+    """Focused edge-case proofs for the adminSecret-grouping fix (VDR: duplicate top-level objectName rejected by the AWS Secrets Store CSI provider before the monitor container starts)."""
+
+    def _render(self, deployments, tls_secret="dev/goldengate/tls-certificate"):
+        return _render_monitor_chart(registry_yaml=_build_registry_yaml(deployments, tls_secret=tls_secret))
+
+    def test_a_one_deployment_yields_one_source_descriptor(self):
+        proc = self._render([
+            {"name": "gg-a", "type": "oracle", "role": "source", "enabled": True, "adminSecret": "dev/goldengate/source/admin"},
+        ])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        objects = _parse_secretproviderclass_objects(proc.stdout)
+        admin_objects = [o for o in objects if o["objectName"] == "dev/goldengate/source/admin"]
+        self.assertEqual(len(admin_objects), 1)
+        aliases = [jp["objectAlias"] for jp in admin_objects[0]["jmesPath"]]
+        self.assertEqual(aliases, ["gg-a-admin-user", "gg-a-admin-password"])
+
+    def test_b_multiple_deployments_sharing_source_admin_still_yield_one_descriptor(self):
+        proc = self._render([
+            {"name": "gg-a", "type": "oracle", "role": "source", "enabled": True, "adminSecret": "dev/goldengate/source/admin"},
+            {"name": "gg-b", "type": "postgresql", "role": "source", "enabled": True, "adminSecret": "dev/goldengate/source/admin"},
+            {"name": "gg-c", "type": "mysql", "role": "source", "enabled": True, "adminSecret": "dev/goldengate/source/admin"},
+        ])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        objects = _parse_secretproviderclass_objects(proc.stdout)
+        admin_objects = [o for o in objects if o["objectName"] == "dev/goldengate/source/admin"]
+        self.assertEqual(len(admin_objects), 1)
+        aliases = {jp["objectAlias"] for jp in admin_objects[0]["jmesPath"]}
+        self.assertEqual(aliases, {
+            "gg-a-admin-user", "gg-a-admin-password",
+            "gg-b-admin-user", "gg-b-admin-password",
+            "gg-c-admin-user", "gg-c-admin-password",
+        })
+
+    def test_c_source_and_target_groups_yield_one_descriptor_per_unique_secret(self):
+        proc = self._render([
+            {"name": "gg-src", "type": "oracle", "role": "source", "enabled": True, "adminSecret": "dev/goldengate/source/admin"},
+            {"name": "gg-tgt", "type": "postgresql", "role": "target", "enabled": True, "adminSecret": "dev/goldengate/target/admin"},
+        ])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        objects = _parse_secretproviderclass_objects(proc.stdout)
+        names = [o["objectName"] for o in objects]
+        self.assertEqual(len(names), len(set(names)))
+        self.assertEqual(sorted(names), sorted(["dev/goldengate/source/admin", "dev/goldengate/target/admin", "dev/goldengate/tls-certificate"]))
+
+    def test_d_disabled_deployment_sharing_a_secret_contributes_no_aliases(self):
+        proc = self._render([
+            {"name": "gg-active", "type": "oracle", "role": "source", "enabled": True, "adminSecret": "dev/goldengate/source/admin"},
+            {"name": "gg-off", "type": "oracle", "role": "source", "enabled": False, "adminSecret": "dev/goldengate/source/admin"},
+        ])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        objects = _parse_secretproviderclass_objects(proc.stdout)
+        admin_objects = [o for o in objects if o["objectName"] == "dev/goldengate/source/admin"]
+        self.assertEqual(len(admin_objects), 1)
+        aliases = {jp["objectAlias"] for jp in admin_objects[0]["jmesPath"]}
+        self.assertEqual(aliases, {"gg-active-admin-user", "gg-active-admin-password"})
+
+    def test_e_disabled_deployment_with_a_unique_admin_secret_is_never_fetched(self):
+        proc = self._render([
+            {"name": "gg-active", "type": "oracle", "role": "source", "enabled": True, "adminSecret": "dev/goldengate/source/admin"},
+            {"name": "gg-off-unique", "type": "postgresql", "role": "target", "enabled": False, "adminSecret": "dev/goldengate/target/admin"},
+        ])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        objects = _parse_secretproviderclass_objects(proc.stdout)
+        object_names = {o["objectName"] for o in objects}
+        self.assertNotIn("dev/goldengate/target/admin", object_names)
+
+    def test_f_same_admin_secret_across_different_deployment_types_is_grouped_by_secret_identity_not_type(self):
+        proc = self._render([
+            {"name": "gg-oracle-x", "type": "oracle", "role": "source", "enabled": True, "adminSecret": "dev/goldengate/source/admin"},
+            {"name": "gg-postgres-y", "type": "postgresql", "role": "source", "enabled": True, "adminSecret": "dev/goldengate/source/admin"},
+            {"name": "gg-mysql-z", "type": "mysql", "role": "source", "enabled": True, "adminSecret": "dev/goldengate/source/admin"},
+        ])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        objects = _parse_secretproviderclass_objects(proc.stdout)
+        admin_objects = [o for o in objects if o["objectName"] == "dev/goldengate/source/admin"]
+        self.assertEqual(len(admin_objects), 1, "grouping must be by adminSecret identity, never by deploymentType")
+
+    def test_g_missing_admin_secret_on_enabled_deployment_fails_closed(self):
+        proc = self._render([{"name": "gg-x", "type": "oracle", "role": "source", "enabled": True}])
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("is missing adminSecret", proc.stderr)
+
+    def test_h_missing_name_on_enabled_deployment_fails_closed(self):
+        proc = self._render([{"type": "oracle", "role": "source", "enabled": True, "adminSecret": "dev/goldengate/source/admin"}])
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("is missing name", proc.stderr)
+
+    def test_i_duplicate_deployment_name_fails_closed_rather_than_producing_duplicate_filenames(self):
+        proc = self._render([
+            {"name": "gg-dup", "type": "oracle", "role": "source", "enabled": True, "adminSecret": "dev/goldengate/source/admin"},
+            {"name": "gg-dup", "type": "postgresql", "role": "source", "enabled": True, "adminSecret": "dev/goldengate/source/admin"},
+        ])
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("duplicate deployment name", proc.stderr)
+
+    def test_j_tls_secret_remains_exactly_one_top_level_object(self):
+        proc = self._render([
+            {"name": "gg-a", "type": "oracle", "role": "source", "enabled": True, "adminSecret": "dev/goldengate/source/admin"},
+            {"name": "gg-b", "type": "postgresql", "role": "target", "enabled": True, "adminSecret": "dev/goldengate/target/admin"},
+        ])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        objects = _parse_secretproviderclass_objects(proc.stdout)
+        self.assertEqual(sum(1 for o in objects if o["objectName"] == "dev/goldengate/tls-certificate"), 1)
+
+    def test_k_no_kubernetes_secret_or_secretobjects_introduced(self):
+        proc = self._render([{"name": "gg-a", "type": "oracle", "role": "source", "enabled": True, "adminSecret": "dev/goldengate/source/admin"}])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("kind: Secret\n", proc.stdout)
+        self.assertNotIn("secretObjects", proc.stdout)
+        self.assertNotIn("secretKeyRef", proc.stdout)
+        self.assertNotIn("envFrom", proc.stdout)
+
+    def test_l_no_raw_credential_value_appears(self):
+        proc = self._render([{"name": "gg-a", "type": "oracle", "role": "source", "enabled": True, "adminSecret": "dev/goldengate/source/admin"}])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        for forbidden in ("hunter2", "-----BEGIN", "OGG_ADMIN_PWD\"\n            value:"):
+            self.assertNotIn(forbidden, proc.stdout)
+
+    def test_m_output_is_deterministic_across_two_identical_renders(self):
+        deployments = [
+            {"name": "gg-b", "type": "postgresql", "role": "source", "enabled": True, "adminSecret": "dev/goldengate/source/admin"},
+            {"name": "gg-a", "type": "oracle", "role": "target", "enabled": True, "adminSecret": "dev/goldengate/target/admin"},
+        ]
+        proc1 = self._render(deployments)
+        proc2 = self._render(deployments)
+        self.assertEqual(proc1.returncode, 0, proc1.stderr)
+        self.assertEqual(proc2.returncode, 0, proc2.stderr)
+        self.assertEqual(proc1.stdout, proc2.stdout)
 
 
 class CloudWatchActivationHelmRenderTests(unittest.TestCase):

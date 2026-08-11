@@ -5655,11 +5655,12 @@ else
 fi
 
 if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  # configmap.yaml/values.yaml excluded: Phase 6D0 legitimately touched their explanatory comments, not their logic. efs-storageclass.yaml/goldengate/values.yaml excluded: the Phase 6D1 EFS correction legitimately updated the mode-aware fail-guard wording and added the persistence.efs.mode default, neither a template logic/behavior change.
+  # configmap.yaml/values.yaml excluded: Phase 6D0 legitimately touched their explanatory comments, not their logic. efs-storageclass.yaml/goldengate/values.yaml excluded: the Phase 6D1 EFS correction legitimately updated the mode-aware fail-guard wording and added the persistence.efs.mode default, neither a template logic/behavior change. secretproviderclass.yaml excluded: the monitor CSI VDR correction legitimately regrouped the rendered objects by adminSecret (duplicate top-level objectName rejected by the AWS Secrets Store CSI provider), not a Phase 6C1B process-discovery change.
   NOT_PERMITTED_DIFF="$(git diff --stat --ignore-all-space -- \
     monitoring/monitor/health_rules.py monitoring/monitor/Dockerfile \
     'helm/goldengate-monitor/**' 'helm/goldengate/**' \
     ':!helm/goldengate-monitor/templates/configmap.yaml' ':!helm/goldengate-monitor/values.yaml' \
+    ':!helm/goldengate-monitor/templates/secretproviderclass.yaml' \
     ':!helm/goldengate/templates/efs-storageclass.yaml' ':!helm/goldengate/values.yaml' 2>/dev/null || true)"
   if [ -z "$NOT_PERMITTED_DIFF" ]; then
     pass "25: no Helm chart or Dockerfile file outside this phase's own scope changed"
