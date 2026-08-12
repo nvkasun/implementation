@@ -2,111 +2,188 @@ set -euo pipefail
 
 OLD_EFS="fs-05cadf3570f23cd39"
 
-echo
-echo "============================================================"
-echo "1. CURRENT GOLDENGATE RUNTIMES"
-echo "============================================================"
+PG_EFS="fs-09bb3373f132d01b0"
+MSSQL_EFS="fs-03d4beaa58f19be78"
 
-kubectl -n goldengate-dev get sts \
-  -o custom-columns='NAME:.metadata.name,READY:.status.readyReplicas,SA:.spec.template.spec.serviceAccountName'
+OLD_SC="efs-sc"
 
 echo
 echo "============================================================"
-echo "2. ALL PODS USING LEGACY SERVICE ACCOUNTS"
+echo "LEGACY STORAGE CLEANUP"
 echo "============================================================"
 
-LEGACY_PODS="$(
-  kubectl get pods -A \
-    -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,SA:.spec.serviceAccountName' \
+echo
+echo "1. DISCOVER PVs REFERENCING DELETED EFS"
+echo "------------------------------------------------------------"
+
+mapfile -t OLD_PVS < <(
+  kubectl get pv \
+    -o custom-columns='NAME:.metadata.name,HANDLE:.spec.csi.volumeHandle' \
     --no-headers |
-  awk '$3=="gg-oracle-sa" || $3=="gg-postgresql-sa" || $3=="ogg-oracle-sa"'
-)"
+  awk -v fs="$OLD_EFS" '$2 ~ ("^" fs "::") {print $1}'
+)
 
-if [ -n "$LEGACY_PODS" ]; then
-  echo "Legacy-SA consumers found:"
-  echo "$LEGACY_PODS"
+echo "Found ${#OLD_PVS[@]} PV(s)"
+
+printf '%s\n' "${OLD_PVS[@]}"
+
+if [ "${#OLD_PVS[@]}" -eq 0 ]; then
+  echo "No stale PVs found."
 else
-  echo "No pod uses gg-oracle-sa / gg-postgresql-sa / ogg-oracle-sa ✅"
+
+  echo
+  echo "2. FAIL-CLOSED VALIDATION"
+  echo "------------------------------------------------------------"
+
+  for PV in "${OLD_PVS[@]}"; do
+
+    PHASE="$(kubectl get pv "$PV" -o jsonpath='{.status.phase}')"
+    HANDLE="$(kubectl get pv "$PV" -o jsonpath='{.spec.csi.volumeHandle}')"
+
+    echo
+    echo "PV     : $PV"
+    echo "Phase  : $PHASE"
+    echo "Handle : $HANDLE"
+
+    if [ "$PHASE" != "Released" ]; then
+      echo "ERROR: $PV is not Released. Refusing cleanup."
+      exit 1
+    fi
+
+    case "$HANDLE" in
+      "${OLD_EFS}"::*)
+        ;;
+      *)
+        echo "ERROR: $PV does not belong to old EFS."
+        exit 1
+        ;;
+    esac
+
+    case "$HANDLE" in
+      "${PG_EFS}"::*|"${MSSQL_EFS}"::*)
+        echo "ERROR: $PV references ACTIVE managed storage."
+        exit 1
+        ;;
+    esac
+
+    CLAIM_NS="$(kubectl get pv "$PV" \
+      -o jsonpath='{.spec.claimRef.namespace}' 2>/dev/null || true)"
+
+    CLAIM_NAME="$(kubectl get pv "$PV" \
+      -o jsonpath='{.spec.claimRef.name}' 2>/dev/null || true)"
+
+    if [ -n "$CLAIM_NS" ] && [ -n "$CLAIM_NAME" ]; then
+      if kubectl -n "$CLAIM_NS" get pvc "$CLAIM_NAME" >/dev/null 2>&1; then
+        echo "ERROR: PVC $CLAIM_NS/$CLAIM_NAME still exists."
+        exit 1
+      fi
+    fi
+
+    echo "Safe stale PV ✅"
+  done
+
+  echo
+  echo "3. FINAL ACTIVE STORAGE SAFETY CHECK"
+  echo "------------------------------------------------------------"
+
+  for DEP in gg-postgresql-repltest-01 gg-mssql-repltest-01; do
+
+    PVC="${DEP}-u02"
+    PV="$(kubectl -n goldengate-dev get pvc "$PVC" \
+      -o jsonpath='{.spec.volumeName}')"
+
+    HANDLE="$(kubectl get pv "$PV" \
+      -o jsonpath='{.spec.csi.volumeHandle}')"
+
+    echo "$DEP → $HANDLE"
+
+    case "$HANDLE" in
+      "${OLD_EFS}"::*)
+        echo "ERROR: ACTIVE runtime unexpectedly uses old EFS."
+        exit 1
+        ;;
+    esac
+  done
+
+  echo "Active runtime storage safe ✅"
+
+  echo
+  echo "4. DELETE ONLY VERIFIED RELEASED OLD-EFS PVs"
+  echo "------------------------------------------------------------"
+
+  for PV in "${OLD_PVS[@]}"; do
+    echo "Deleting stale PV: $PV"
+    kubectl delete pv "$PV"
+  done
 fi
 
 echo
-echo "============================================================"
-echo "3. LEGACY SERVICE ACCOUNT OBJECTS"
-echo "============================================================"
+echo "5. VERIFY OLD STORAGECLASS"
+echo "------------------------------------------------------------"
 
-kubectl get serviceaccounts -A \
-  -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,ROLE:.metadata.annotations.eks\.amazonaws\.com/role-arn' |
-grep -E 'NAME|gg-oracle-sa|gg-postgresql-sa|ogg-oracle-sa|gg-runtime-sa' || true
+if kubectl get storageclass "$OLD_SC" >/dev/null 2>&1; then
 
-echo
-echo "============================================================"
-echo "4. ALL PVs STILL POINTING TO DELETED OLD EFS"
-echo "============================================================"
+  SC_FS="$(kubectl get storageclass "$OLD_SC" \
+    -o jsonpath='{.parameters.fileSystemId}')"
 
-kubectl get pv \
-  -o custom-columns='PV:.metadata.name,PHASE:.status.phase,HANDLE:.spec.csi.volumeHandle,CLAIM_NS:.spec.claimRef.namespace,CLAIM:.spec.claimRef.name' \
-  --no-headers |
-awk -v fs="$OLD_EFS" '$3 ~ ("^" fs "::") || $3 == fs'
+  echo "$OLD_SC → $SC_FS"
 
-echo
-echo "============================================================"
-echo "5. STORAGECLASSES STILL POINTING TO OLD EFS"
-echo "============================================================"
-
-for SC in $(kubectl get storageclass -o name); do
-  FS="$(kubectl get "$SC" -o jsonpath='{.parameters.fileSystemId}' 2>/dev/null || true)"
-
-  if [ "$FS" = "$OLD_EFS" ]; then
-    kubectl get "$SC" \
-      -o custom-columns='NAME:.metadata.name,PROVISIONER:.provisioner,RECLAIM:.reclaimPolicy,FS:.parameters.fileSystemId'
+  if [ "$SC_FS" != "$OLD_EFS" ]; then
+    echo "ERROR: $OLD_SC no longer points to expected deleted EFS."
+    exit 1
   fi
-done
+
+  PVC_USERS="$(kubectl get pvc -A \
+    -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,SC:.spec.storageClassName' \
+    --no-headers |
+    awk -v sc="$OLD_SC" '$3 == sc {print}')"
+
+  if [ -n "$PVC_USERS" ]; then
+    echo "ERROR: PVCs still reference $OLD_SC:"
+    echo "$PVC_USERS"
+    exit 1
+  fi
+
+  echo "Deleting stale StorageClass $OLD_SC ..."
+  kubectl delete storageclass "$OLD_SC"
+
+else
+  echo "$OLD_SC already absent."
+fi
 
 echo
-echo "============================================================"
-echo "6. OLD NAMESPACES / RESOURCES"
-echo "============================================================"
+echo "6. POST-CLEANUP VERIFICATION"
+echo "------------------------------------------------------------"
 
-kubectl get namespaces \
-  -o custom-columns='NAME:.metadata.name' |
-grep -E '(^NAME$|^ogg$|^gg-dev-|goldengate)' || true
+REMAINING="$(
+  kubectl get pv \
+    -o custom-columns='NAME:.metadata.name,HANDLE:.spec.csi.volumeHandle' \
+    --no-headers |
+  awk -v fs="$OLD_EFS" '$2 ~ ("^" fs "::")'
+)"
+
+if [ -n "$REMAINING" ]; then
+  echo "ERROR: PVs still reference deleted EFS:"
+  echo "$REMAINING"
+  exit 1
+fi
+
+if kubectl get storageclass "$OLD_SC" >/dev/null 2>&1; then
+  echo "ERROR: $OLD_SC still exists."
+  exit 1
+fi
+
+echo "No PV references deleted EFS ✅"
+echo "Old StorageClass removed ✅"
 
 echo
-echo "============================================================"
-echo "7. ACTIVE MANAGED STORAGE — MUST REMAIN"
-echo "============================================================"
+echo "7. ACTIVE RUNTIMES"
+echo "------------------------------------------------------------"
 
-for DEP in \
+kubectl -n goldengate-dev get sts \
   gg-postgresql-repltest-01 \
-  gg-mssql-repltest-01
-do
-  PVC="${DEP}-u02"
-
-  PV="$(kubectl -n goldengate-dev get pvc "$PVC" \
-    -o jsonpath='{.spec.volumeName}')"
-
-  HANDLE="$(kubectl get pv "$PV" \
-    -o jsonpath='{.spec.csi.volumeHandle}')"
-
-  echo "$DEP"
-  echo "  PVC    = $PVC"
-  echo "  PV     = $PV"
-  echo "  Handle = $HANDLE"
-done
+  gg-mssql-repltest-01 \
+  -o custom-columns='NAME:.metadata.name,READY:.status.readyReplicas,SA:.spec.template.spec.serviceAccountName'
 
 echo
-echo "============================================================"
-echo "8. ACTIVE ARGO"
-echo "============================================================"
-
-kubectl -n argocd get applications.argoproj.io \
-  goldengate-dev-platform \
-  goldengate-dev-postgresql-repltest-01 \
-  goldengate-dev-mssql-repltest-01 \
-  goldengate-monitor \
-  -o custom-columns='NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status'
-
-echo
-echo "============================================================"
-echo "READ-ONLY CLEANUP INVENTORY COMPLETE"
-echo "============================================================"
+echo "LEGACY STORAGE CLEANUP PASSED"
