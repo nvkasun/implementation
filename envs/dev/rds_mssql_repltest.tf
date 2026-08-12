@@ -31,7 +31,7 @@ module "rds_mssql_repltest" {
 
   storage_type = "gp3"
 
-  backup_retention_period = 7
+  backup_retention_period = 0
 
   request_reference    = local.tags.request_reference
   map_migrated         = local.tags.map_migrated

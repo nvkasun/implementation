@@ -15,7 +15,7 @@ module "rds_postgres_repltest" {
   multi_az                              = false
   storage                               = 32
   storage_type                          = "gp3"
-  backup_retention_period               = 7
+  backup_retention_period               = 0
   backup_window                         = "19:00-21:00"
   maintenance_window                    = "sat:22:00-sat:23:30"
   recovery_window_in_days               = 0
@@ -25,6 +25,9 @@ module "rds_postgres_repltest" {
   data_classification  = local.tags.data_classification
   business_criticality = local.tags.business_criticality
   business_unit        = local.tags.business_unit
+  business_unit_owner  = local.tags.business_unit_owner
   cost_center          = local.tags.cost_center
+  map_migrated         = local.tags.map_migrated
+  request_reference    = local.tags.request_reference
   env                  = var.environment
 }
