@@ -726,5 +726,44 @@ class ReplicationPlanDeterminismTests(unittest.TestCase):
         self.assertIn("is not an enabled replication pipeline", source)
 
 
+class Python36CompatibilityTests(unittest.TestCase):
+    """The reconciliation Job runs hack/goldengate-replication.py inside the live source runtime image, whose Python is 3.6.8 -- these prove the two known 3.7+ incompatibilities are gone and the CLI's missing-command contract still holds."""
+
+    def test_A_no_future_annotations_import(self):
+        with open(TOOL_PATH) as f:
+            source = f.read()
+        self.assertNotIn("from __future__ import annotations", source)
+
+    def test_B_subparsers_do_not_use_required_kwarg(self):
+        source = inspect_source(repl.main)
+        self.assertNotIn('add_subparsers(dest="command", required=True)', source)
+        self.assertIn('add_subparsers(dest="command")', source)
+
+    def test_C_missing_command_still_fails_closed(self):
+        import contextlib
+        import io
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as ctx:
+                repl.main([])
+        self.assertNotEqual(ctx.exception.code, 0)
+        self.assertIn("a command is required", stderr.getvalue())
+
+    def test_D_verify_mode_never_imports_deployment_model_module(self):
+        source = inspect_source(repl.verify_pipeline)
+        self.assertNotIn("_gdm", source)
+
+    def test_E_job_command_is_exact_worker_invocation_with_source_image(self):
+        manifests = repl.render_manifests(PLAN, "goldengate-dev", "eu-west-1", "# source", "test-exec-1")
+        container = manifests["Job"]["spec"]["template"]["spec"]["containers"][0]
+        self.assertEqual(container["image"], PLAN["source"]["image"])
+        self.assertEqual(container["command"], [
+            "python3", "/mnt/reconciler/goldengate-replication.py", "worker",
+            "--plan", "/mnt/reconciler/plan.json",
+            "--secrets-root", "/mnt/replication-secrets",
+        ])
+
+
 if __name__ == "__main__":
     unittest.main()

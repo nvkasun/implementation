@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""hack/goldengate-replication.py: PostgreSQL->MSSQL GoldenGate replication reconciler; create-only, fail-on-drift, never restarts/heals/deletes. Consumes hack/goldengate-deployment-model.py for all deployment parsing (host-side only); never a second YAML parser. worker/verify modes use the Python standard library only -- PyYAML and goldengate-deployment-model.py are never imported inside the reconciliation Job. Oracle REST request/response shapes below are best-effort from the documented GoldenGate Microservices REST API and have not been verified against a live 23.26.2.0.1 instance in this offline session -- see the Phase 6D1 completion report."""
-from __future__ import annotations
+"""hack/goldengate-replication.py: PostgreSQL->MSSQL GoldenGate replication reconciler; create-only, fail-on-drift, never restarts/heals/deletes. Consumes hack/goldengate-deployment-model.py for all deployment parsing (host-side only); never a second YAML parser. worker/verify modes use the Python standard library only -- PyYAML and goldengate-deployment-model.py are never imported inside the reconciliation Job. Oracle REST request/response shapes below are best-effort from the documented GoldenGate Microservices REST API and have not been verified against a live 23.26.2.0.1 instance in this offline session -- see the Phase 6D1 completion report. Runs under the live source runtime image's Python 3.6.8 -- no deferred-annotation __future__ import, no argparse subparsers required= kwarg, no other 3.7+ syntax/API."""
 
 import argparse
 import base64
@@ -900,7 +899,7 @@ def cmd_verify(args):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command")
 
     plan_parser = sub.add_parser("plan")
     plan_parser.add_argument("--environment", default="dev")
@@ -929,6 +928,8 @@ def main(argv=None):
     verify_parser.set_defaults(func=cmd_verify)
 
     args = parser.parse_args(argv)
+    if not hasattr(args, "func"):
+        parser.error("a command is required")
     return args.func(args)
 
 
