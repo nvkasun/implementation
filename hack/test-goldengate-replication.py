@@ -29,7 +29,7 @@ PLAN = {
     "source": {
         "deploymentId": "gg-pg-src-fixture-01", "deploymentType": "postgresql",
         "runtimeHost": "gg-pg-src-fixture-01.goldengate-dev.adcbmis.local",
-        "serviceAccount": "gg-postgresql-sa",
+        "serviceAccount": "gg-runtime-sa",
         "image": "229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-postgresql:23.26.2.0.1",
         "adminSecret": "dev/goldengate/source/admin",
         "databaseSecret": "dev/goldengate/databases/payments-pg-to-mssql-001/source",
@@ -38,7 +38,7 @@ PLAN = {
     "target": {
         "deploymentId": "gg-mssql-tgt-fixture-01", "deploymentType": "mssql",
         "runtimeHost": "gg-mssql-tgt-fixture-01.goldengate-dev.adcbmis.local",
-        "serviceAccount": "gg-mssql-sa",
+        "serviceAccount": "gg-runtime-sa",
         "image": "229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-sqlserver:23.26.2.0.1",
         "adminSecret": "dev/goldengate/target/admin",
         "databaseSecret": "dev/goldengate/databases/payments-pg-to-mssql-001/target",
@@ -667,7 +667,13 @@ class JobRenderingTests(unittest.TestCase):
 
     def test_59_job_uses_source_deployment_service_account(self):
         job = self.manifests["Job"]
-        self.assertEqual(job["spec"]["template"]["spec"]["serviceAccountName"], "gg-postgresql-sa")
+        self.assertEqual(job["spec"]["template"]["spec"]["serviceAccountName"], "gg-runtime-sa")
+
+    def test_job_service_account_is_taken_from_the_source_plan_identity(self):
+        """Canonical shared runtime identity: render_job() must derive the Job ServiceAccount from plan["source"]["serviceAccount"] (never a hardcoded/per-engine literal) -- every singleRuntime deploymentType, including postgresql/mssql here, resolves the one platform-owned gg-runtime-sa."""
+        job = self.manifests["Job"]
+        self.assertEqual(job["spec"]["template"]["spec"]["serviceAccountName"], PLAN["source"]["serviceAccount"])
+        self.assertEqual(PLAN["source"]["serviceAccount"], "gg-runtime-sa")
 
     def test_60_job_uses_approved_source_runtime_image(self):
         job = self.manifests["Job"]
