@@ -1,6 +1,6 @@
 # DEV-only RDS SQL Server instance for the GoldenGate PostgreSQL -> MSSQL replication test (pipeline repltest-pg-to-mssql-001), paired with module.rds_postgres_repltest. Provisioning only: no database users/schemas/databases/tables/GoldenGate configuration here -- those are created manually once the instance is available. mssql_backup_bucket is deliberately omitted: this DEV replication-test instance does not require the MSSQL native backup-to-S3 integration, and no S3 bucket/module is created to satisfy it -- the real VDR Terraform plan must confirm the corporate module accepts this input being absent. Networking/security-group/master-credential/KMS behavior beyond what is set below is entirely the approved module's own default handling.
 module "rds_mssql_repltest" {
-  source = "git::https://github.com/AbuDhabiCommercialBank/aws-tf-module-rds-mssql?ref=v1.3.0"
+  source = "git::https://github.com/AbuDhabiCommercialBank/aws-tf-module-rds-mssql?ref=v1.4.1"
 
   env        = local.tags.env
   identifier = "gg-repltest-mssql"
