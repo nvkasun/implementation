@@ -9225,18 +9225,12 @@ fi
 if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   # envs/dev/efs.tf is fully generic and must have ZERO diff regardless of any deployment onboarding (past, present, or future) -- proven directly. goldengate_inventory.tf may legitimately change ONCE per deliberate, reviewed architecture decision (e.g. this session's restored shared gg-runtime-sa identity) -- so instead of requiring zero diff there, this proves the file contains no carve-out for one SPECIFIC deployment ID (the generic "mssql" deploymentType keyword itself is pre-existing, legitimate Phase 6D1 replication-scope logic, never a per-ID reference).
   EFS_TF_DIFF="$(git diff -- envs/dev/efs.tf 2>/dev/null || true)"
-  INVENTORY_TF_ID_CARVEOUT="$(grep -F "gg-mssql-repltest-01" envs/dev/goldengate_inventory.tf 2>/dev/null || true)"
-  # A new .tf file is only a "deployment-specific carve-out" if it references the GoldenGate runtime deployment ID itself -- an unrelated new Terraform file (e.g. an RDS test-database instance) is never onboarding-carve-out evidence.
-  NEW_TF_FILES=""
-  for candidate_tf in $(git status --porcelain envs/dev 2>/dev/null | grep -E '^\?\? .*\.tf$' | awk '{print $2}'); do
-    if grep -qF "gg-mssql-repltest-01" "$candidate_tf" 2>/dev/null; then
-      NEW_TF_FILES="${NEW_TF_FILES} ${candidate_tf}"
-    fi
-  done
-  if [ -z "$EFS_TF_DIFF" ] && [ -z "$INVENTORY_TF_ID_CARVEOUT" ] && [ -z "$NEW_TF_FILES" ]; then
-    pass "no deployment-specific Terraform file/carve-out was added for the new MSSQL runtime -- envs/dev/efs.tf is byte-identical, and goldengate_inventory.tf contains no gg-mssql-repltest-01-specific reference; the generic local.goldengate_managed_efs_deployments for_each and the restored shared gg-runtime-sa identity own it automatically"
+  # Repository-wide content scan of every envs/dev/*.tf file -- tracked, untracked, modified, or committed -- so this never weakens once a legitimately new file is committed (a git-status-based untracked-only scan would miss it). A "deployment-specific carve-out" is any .tf file whose content references the GoldenGate runtime deployment ID itself; the legitimate RDS test-database identifier gg-repltest-mssql is a deliberately different string and never matches this.
+  TF_CARVEOUT_MATCHES="$(grep -lF "gg-mssql-repltest-01" envs/dev/*.tf 2>/dev/null || true)"
+  if [ -z "$EFS_TF_DIFF" ] && [ -z "$TF_CARVEOUT_MATCHES" ]; then
+    pass "no deployment-specific Terraform carve-out exists for the MSSQL runtime anywhere under envs/dev/*.tf (tracked or untracked) -- envs/dev/efs.tf is byte-identical, and no .tf file references gg-mssql-repltest-01; the generic local.goldengate_managed_efs_deployments for_each and the restored shared gg-runtime-sa identity own it automatically"
   else
-    fail "a Terraform file was added, or a deployment-ID-specific carve-out exists, alongside the new MSSQL descriptor -- onboarding must remain folder-driven only: ${NEW_TF_FILES}${INVENTORY_TF_ID_CARVEOUT}"
+    fail "a deployment-ID-specific Terraform carve-out exists, or envs/dev/efs.tf changed, alongside the MSSQL descriptor -- onboarding must remain folder-driven only: ${TF_CARVEOUT_MATCHES}"
   fi
 else
   skip "Terraform-file-unchanged check -- not a git repository"
