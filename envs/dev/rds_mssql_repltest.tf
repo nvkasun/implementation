@@ -2,8 +2,8 @@
 module "rds_mssql_repltest" {
   source = "git::https://github.com/AbuDhabiCommercialBank/aws-tf-module-rds-mssql?ref=v1.3.0"
 
-  environment = local.tags.env
-  identifier  = "gg-repltest-mssql"
+  env        = local.tags.env
+  identifier = "gg-repltest-mssql"
 
   instance_class = "db.m5.large"
 
