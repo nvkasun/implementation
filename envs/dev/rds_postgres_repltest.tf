@@ -21,10 +21,10 @@ module "rds_postgres_repltest" {
   recovery_window_in_days               = 0
   additional_security_group_ids         = []
 
-  application_name     = "CloudFactory"
-  data_classification  = "General"
-  business_criticality = "Low"
-  business_unit        = "TechnologyPlatform"
-  cost_center          = "219"
+  application_name     = local.tags.application_name
+  data_classification  = local.tags.data_classification
+  business_criticality = local.tags.business_criticality
+  business_unit        = local.tags.business_unit
+  cost_center          = local.tags.cost_center
   env                  = var.environment
 }

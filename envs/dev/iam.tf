@@ -7,13 +7,13 @@ module "goldengate_eks_deploy_role_dev" {
 
   managed_policy_arns = []
 
-  map_migrated         = "comm5TZY31HX9S"
-  business_criticality = "Low"
-  application_name     = "CloudFactory"
-  cost_center          = "219"
-  business_unit        = "TechnologyPlatform"
-  data_classification  = "General"
-  env                  = "dev"
+  map_migrated         = local.tags.map_migrated
+  business_criticality = local.tags.business_criticality
+  application_name     = local.tags.application_name
+  cost_center          = local.tags.cost_center
+  business_unit        = local.tags.business_unit
+  data_classification  = local.tags.data_classification
+  env                  = local.tags.env
 }
 
 
@@ -27,13 +27,13 @@ module "goldengate_secrets_read_role_dev" {
 
   managed_policy_arns = []
 
-  map_migrated         = "comm5TZY31HX9S"
-  business_criticality = "Low"
-  application_name     = "CloudFactory"
-  cost_center          = "219"
-  business_unit        = "TechnologyPlatform"
-  data_classification  = "General"
-  env                  = "dev"
+  map_migrated         = local.tags.map_migrated
+  business_criticality = local.tags.business_criticality
+  application_name     = local.tags.application_name
+  cost_center          = local.tags.cost_center
+  business_unit        = local.tags.business_unit
+  data_classification  = local.tags.data_classification
+  env                  = local.tags.env
 }
 
 
@@ -47,13 +47,13 @@ module "goldengate_monitor_read_role_dev" {
 
   managed_policy_arns = []
 
-  map_migrated         = "comm5TZY31HX9S"
-  business_criticality = "Low"
-  application_name     = "CloudFactory"
-  cost_center          = "219"
-  business_unit        = "TechnologyPlatform"
-  data_classification  = "General"
-  env                  = "dev"
+  map_migrated         = local.tags.map_migrated
+  business_criticality = local.tags.business_criticality
+  application_name     = local.tags.application_name
+  cost_center          = local.tags.cost_center
+  business_unit        = local.tags.business_unit
+  data_classification  = local.tags.data_classification
+  env                  = local.tags.env
 }
 
 
@@ -66,13 +66,13 @@ module "goldengate_argocd_ecr_read_role_dev" {
 
   managed_policy_arns = []
 
-  map_migrated         = "comm5TZY31HX9S"
-  business_criticality = "Low"
-  application_name     = "CloudFactory"
-  cost_center          = "219"
-  business_unit        = "TechnologyPlatform"
-  data_classification  = "General"
-  env                  = "dev"
+  map_migrated         = local.tags.map_migrated
+  business_criticality = local.tags.business_criticality
+  application_name     = local.tags.application_name
+  cost_center          = local.tags.cost_center
+  business_unit        = local.tags.business_unit
+  data_classification  = local.tags.data_classification
+  env                  = local.tags.env
 }
 
 
@@ -86,13 +86,13 @@ module "goldengate_platform_logging_role_dev" {
 
   managed_policy_arns = []
 
-  map_migrated         = "comm5TZY31HX9S"
-  business_criticality = "Low"
-  application_name     = "CloudFactory"
-  cost_center          = "219"
-  business_unit        = "TechnologyPlatform"
-  data_classification  = "General"
-  env                  = "dev"
+  map_migrated         = local.tags.map_migrated
+  business_criticality = local.tags.business_criticality
+  application_name     = local.tags.application_name
+  cost_center          = local.tags.cost_center
+  business_unit        = local.tags.business_unit
+  data_classification  = local.tags.data_classification
+  env                  = local.tags.env
 }
 
 
@@ -106,11 +106,11 @@ module "goldengate_cloudwatch_metrics_role_dev" {
 
   managed_policy_arns = []
 
-  map_migrated         = "comm5TZY31HX9S"
-  business_criticality = "Low"
-  application_name     = "CloudFactory"
-  cost_center          = "219"
-  business_unit        = "TechnologyPlatform"
-  data_classification  = "General"
-  env                  = "dev"
+  map_migrated         = local.tags.map_migrated
+  business_criticality = local.tags.business_criticality
+  application_name     = local.tags.application_name
+  cost_center          = local.tags.cost_center
+  business_unit        = local.tags.business_unit
+  data_classification  = local.tags.data_classification
+  env                  = local.tags.env
 }

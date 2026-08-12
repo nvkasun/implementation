@@ -29,14 +29,14 @@ module "goldengate_pipeline_state" {
 
   custom_kms_key_arn = null
 
-  map_migrated         = "comm5TZY31HX9S"
-  business_criticality = "Low"
-  application_name     = "CloudFactory"
-  cost_center          = "219"
-  business_unit        = "TechnologyPlatform"
-  business_unit_owner  = "ganesh.harikrishnan"
-  data_classification  = "General"
-  env                  = "dev"
+  map_migrated         = local.tags.map_migrated
+  business_criticality = local.tags.business_criticality
+  application_name     = local.tags.application_name
+  cost_center          = local.tags.cost_center
+  business_unit        = local.tags.business_unit
+  business_unit_owner  = local.tags.business_unit_owner
+  data_classification  = local.tags.data_classification
+  env                  = local.tags.env
 }
 
 # CONFIG is Terraform-owned (monitor owns LEASE/STATE#*); seeded from the folder-driven inventory in goldengate_inventory.tf; ignore_changes=[item] so later manual tuning survives apply.
@@ -125,14 +125,14 @@ module "goldengate_alerts" {
 
   custom_kms_key_arn = null
 
-  map_migrated         = "comm5TZY31HX9S"
-  business_criticality = "Low"
-  application_name     = "CloudFactory"
-  cost_center          = "219"
-  business_unit        = "TechnologyPlatform"
-  business_unit_owner  = "ganesh.harikrishnan"
-  data_classification  = "General"
-  env                  = "dev"
+  map_migrated         = local.tags.map_migrated
+  business_criticality = local.tags.business_criticality
+  application_name     = local.tags.application_name
+  cost_center          = local.tags.cost_center
+  business_unit        = local.tags.business_unit
+  business_unit_owner  = local.tags.business_unit_owner
+  data_classification  = local.tags.data_classification
+  env                  = local.tags.env
 }
 
 # GLOBAL is the routing-policy singleton for gg-alerter (not yet implemented); disabled/empty until configured via the DynamoDB console.
@@ -187,14 +187,14 @@ module "goldengate_metrics_history" {
 
   custom_kms_key_arn = null
 
-  map_migrated         = "comm5TZY31HX9S"
-  business_criticality = "Low"
-  application_name     = "CloudFactory"
-  cost_center          = "219"
-  business_unit        = "TechnologyPlatform"
-  business_unit_owner  = "ganesh.harikrishnan"
-  data_classification  = "General"
-  env                  = "dev"
+  map_migrated         = local.tags.map_migrated
+  business_criticality = local.tags.business_criticality
+  application_name     = local.tags.application_name
+  cost_center          = local.tags.cost_center
+  business_unit        = local.tags.business_unit
+  business_unit_owner  = local.tags.business_unit_owner
+  data_classification  = local.tags.data_classification
+  env                  = local.tags.env
 }
 
 # No seed items -- populated only by a future gg-alerter/metrics-history writer (not implemented yet).
