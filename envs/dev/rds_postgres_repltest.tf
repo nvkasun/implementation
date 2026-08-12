@@ -5,7 +5,7 @@ module "rds_postgres_repltest" {
   identifier     = "gg-repltest-postgresql"
   instance_class = "db.t4g.micro"
   engine_version = "16.14"
-  custom_port    = 4003
+  custom_port    = 4009
 
   enable_performance_insights           = true
   performance_insights_retention_period = 7

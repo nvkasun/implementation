@@ -25,7 +25,7 @@ module "rds_mssql_repltest" {
   multi_az = false
 
   storage = 20
-
+  custom_port = 5002
   enable_autoscaling = true
   max_storage        = 100
 
