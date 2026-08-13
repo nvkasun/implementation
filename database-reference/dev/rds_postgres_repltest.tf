@@ -1,3 +1,4 @@
+# REFERENCE ONLY -- not part of the envs/dev Terraform root and never loaded/applied from here. This is the exact module configuration that provisioned the live gg-repltest-postgresql DEV instance, preserved for change-tracking after the module was detached from Terraform management (see envs/dev/rds_repltest_detach.tf) so manually-applied parameter-group settings for GoldenGate logical replication are never overwritten by a future envs/dev apply.
 # DEV-only RDS PostgreSQL instance for the GoldenGate PostgreSQL -> MSSQL replication test 
 module "rds_postgres_repltest" {
   source = "git::https://github.com/AbuDhabiCommercialBank/aws-tf-module-rds-postgres?ref=v2.1.0"
