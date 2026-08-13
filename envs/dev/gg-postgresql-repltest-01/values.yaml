@@ -5,7 +5,7 @@ deployment:
   role: source
 
 lifecycle:
-  state: active
+  state: absent
 
 global:
   environment: dev
