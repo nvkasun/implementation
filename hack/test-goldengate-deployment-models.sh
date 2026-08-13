@@ -7530,27 +7530,19 @@ by_id = {d["deploymentId"]: d for d in (active + inactive)}
 check("17: both real decommissioned descriptors currently have lifecycle.state=absent", all(by_id[i]["deploymentId"] not in [x["deploymentId"] for x in active] for i in decommission_ids))
 check("18: both real decommissioned descriptors currently have replication.enabled=false", all(by_id[i]["replicationEnabled"] is False for i in decommission_ids))
 
-# --- EFS SG lookup lifecycle: the shared SG data source must be gated on the
-# DESIRED (post-decommission) map, not the canonical inventory, or a plan/apply
-# run after aws-cloud-factory-infra deletes the old-VPC SG would fail trying to
-# resolve an intentionally-deleted security group. ---
+# Verify the shared EFS SG lookup follows the post-decommission desired-EFS map.
 sg_match = re.search(r"data \"aws_security_group\" \"goldengate_efs_shared\" \{(.*?)\n\}", efs_tf, re.S)
 check("19: data.aws_security_group.goldengate_efs_shared exists", sg_match is not None)
 sg_body = sg_match.group(1) if sg_match else ""
 check("20: the SG lookup count is gated on the desired (post-decommission) map, not the canonical inventory", "count = length(local.goldengate_managed_efs_desired_deployments) > 0 ? 1 : 0" in sg_body)
 check("21: the SG lookup count no longer references the unfiltered canonical local directly", "length(local.goldengate_managed_efs_deployments) > 0" not in sg_body)
 
-# The only other reference to the SG data source is inside the module block,
-# whose own for_each is already the same desired-EFS local -- so the [0]
-# index is never evaluated when desired is empty, proving no unconditional
-# reference bypasses the count gate.
+# Verify the SG [0] reference exists only inside the desired-EFS-gated module.
 other_sg_refs = [m.start() for m in re.finditer(r"data\.aws_security_group\.goldengate_efs_shared\[0\]", efs_tf)]
 check("22: every reference to data.aws_security_group.goldengate_efs_shared[0] lives inside the module block gated by the same desired-EFS for_each (no unconditional bypass elsewhere in efs.tf)",
       len(other_sg_refs) == 1 and module_match is not None and module_match.start() < other_sg_refs[0] < module_match.end())
 
-# Empirical: with the real current state (both real deployments decommissioned),
-# the desired-EFS map is empty, so the SG lookup count must evaluate to 0 --
-# proving today'\''s actual plan will not attempt to resolve the old-VPC SG at all.
+# Verify the current fully decommissioned desired-EFS map disables the SG lookup.
 real_desired_ids = sorted(set(canonical_managed_ids) - set(decommission_ids))
 check("23: with the real current descriptor state, the desired-EFS map is empty, so the SG data-source count evaluates to 0 (SG lookup is fully disabled today)", real_desired_ids == [])
 
@@ -9371,8 +9363,7 @@ else
 fi
 
 if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  # envs/dev/efs.tf is exempted from the zero-diff/carve-out scan below ONLY for the explicit, reviewed goldengate_managed_efs_decommission_ids allowlist (structurally verified by the dedicated "Old-VPC EFS decommission" checks above) -- that is a permanent, generic, ID-agnostic mechanism, never a per-onboarding carve-out. Folder-driven onboarding of a brand-new deploymentType still never requires touching ANY OTHER envs/dev/*.tf file, which remains what this proves.
-  # Repository-wide content scan of every envs/dev/*.tf file EXCEPT efs.tf -- tracked, untracked, modified, or committed -- so this never weakens once a legitimately new file is committed (a git-status-based untracked-only scan would miss it). A "deployment-specific carve-out" is any .tf file whose content references the GoldenGate runtime deployment ID itself; the legitimate RDS test-database identifier gg-repltest-mssql is a deliberately different string and never matches this.
+  # Repo-wide scan of envs/dev/*.tf (excluding efs.tf, exempted for the reviewed EFS decommission allowlist) for a deployment-ID-specific carve-out; gg-repltest-mssql is a distinct RDS identifier and never matches.
   TF_CARVEOUT_MATCHES="$(grep -lF "gg-mssql-repltest-01" envs/dev/*.tf 2>/dev/null | grep -vF "envs/dev/efs.tf" || true)"
   if [ -z "$TF_CARVEOUT_MATCHES" ]; then
     pass "no deployment-specific Terraform carve-out exists for the MSSQL runtime anywhere under envs/dev/*.tf (tracked or untracked) outside the explicit, reviewed EFS decommission allowlist -- the generic local.goldengate_managed_efs_deployments for_each and the restored shared gg-runtime-sa identity own it automatically"
