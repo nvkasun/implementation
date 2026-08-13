@@ -24,7 +24,7 @@ serviceAccount:
   roleArn: arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev
 
 ingress:
-  enabled: true
+  enabled: false
   mode: shared
   className: alb
   host: monitor.goldengate-dev.adcbmis.local

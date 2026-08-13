@@ -88,7 +88,7 @@ ecrTokenSync:
 
 # Exposes the Argo CD UI on the same shared internal ALB/wildcard DNS as GoldenGate's ingress; listenPorts/certificateArn must match that ALB's existing listener exactly.
 argocdServerIngress:
-  enabled: true
+  enabled: false
   ingressClassName: alb
   host: argocd.goldengate-dev.adcbmis.local
   serviceName: argocd-server
