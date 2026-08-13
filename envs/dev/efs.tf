@@ -1,19 +1,10 @@
 # Managed-mode GoldenGate runtime EFS filesystems: one dedicated module instance per managed runtime deployment, keyed by deployment ID, created through the approved corporate Terraform workflow (this file lives in the normal envs/dev root processed by .github/workflows/gg-iam-secrets-deployment.yaml -> AbuDhabiCommercialBank/adcb-reusable-workflows/aws-terraform-apply.yaml@main) -- one Terraform state does not mean one EFS: each for_each key below is its own dedicated aws_efs_file_system inside the approved module. Existing-mode deployments get no module instance here since their filesystem already exists outside Terraform. Scope boundary: this file owns the EFS filesystem + mount targets only, via the approved ADCB module below -- it does NOT create EFS access points, which remain owned by the EFS CSI driver's dynamic provisioning (helm/goldengate/templates/efs-storageclass.yaml -> StorageClass -> PVC), exactly as today.
 
-# Single environment-level configuration point for the shared EFS security group (never a per-deployment values.yaml setting); count is conditional on at least one managed deployment existing, so an existing-only environment (today: both live descriptors) never needs to resolve it. The aws_security_group data source itself fails closed if the filter matches zero or more than one security group.
+# Single environment-level configuration point for the shared EFS security group (never a per-deployment values.yaml setting). The aws_security_group data source itself fails closed if the filter matches zero or more than one security group.
 variable "goldengate_efs_shared_security_group_description" {
   description = "Description of the single pre-existing shared security group (NFS/2049 from EKS nodes only) that every GoldenGate runtime EFS filesystem attaches to."
   type        = string
   default     = "Security group for EFS filesystem - NFS port 2049 from EKS nodes only"
-}
-
-data "aws_security_group" "goldengate_efs_shared" {
-  count = length(local.goldengate_managed_efs_deployments) > 0 ? 1 : 0
-
-  filter {
-    name   = "description"
-    values = [var.goldengate_efs_shared_security_group_description]
-  }
 }
 
 # Explicit, narrowly-scoped OLD-ENVIRONMENT EFS decommission control -- NEVER derived from lifecycle.state. lifecycle.state=absent by itself always retains managed EFS (see local.goldengate_managed_efs_deployments's own comment); an ID may be added here ONLY after its workload/PVC/access-point cleanup has been independently verified. Removing an ID later makes its managed EFS desired again, so Terraform recreates it (e.g. in the replacement VPC/EKS environment) without reconstructing the runtime descriptor.
@@ -26,6 +17,16 @@ locals {
   goldengate_managed_efs_desired_deployments = {
     for id, v in local.goldengate_managed_efs_deployments : id => v
     if !contains(local.goldengate_managed_efs_decommission_ids, id)
+  }
+}
+
+# Gated on desired (post-decommission) managed EFS deployments, NOT the canonical inventory: the canonical map deliberately keeps a decommissioned deployment's identity even after its EFS is destroyed (see the canonical map's own comment), but the shared EFS SG itself is owned and lifecycled by the separate aws-cloud-factory-infra repo -- once every desired EFS module instance that needed it is gone, that repo is free to delete the SG, and this data lookup must stop resolving it or a later plan/apply here would fail trying to read an intentionally deleted security group. This file never creates, deletes, or otherwise manages the SG resource itself -- read-only lookup only.
+data "aws_security_group" "goldengate_efs_shared" {
+  count = length(local.goldengate_managed_efs_desired_deployments) > 0 ? 1 : 0
+
+  filter {
+    name   = "description"
+    values = [var.goldengate_efs_shared_security_group_description]
   }
 }
 

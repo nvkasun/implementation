@@ -7452,10 +7452,10 @@ else
   pass "no credentials/secret ARNs/passwords/database details appear in envs/dev/efs.tf's non-comment content"
 fi
 
-if grep -qE '^\s*count\s*=\s*length\(local\.goldengate_managed_efs_deployments\)\s*>\s*0' envs/dev/efs.tf 2>/dev/null; then
-  pass "10: the shared EFS security-group data lookup is conditional (count) on at least one managed deployment existing"
+if grep -qE '^\s*count\s*=\s*length\(local\.goldengate_managed_efs_desired_deployments\)\s*>\s*0' envs/dev/efs.tf 2>/dev/null; then
+  pass "10: the shared EFS security-group data lookup is conditional (count) on at least one DESIRED (post-decommission) managed deployment existing, not the canonical inventory -- so it stops resolving the old-VPC SG once aws-cloud-factory-infra is free to delete it"
 else
-  fail "10: the shared EFS security-group data lookup in envs/dev/efs.tf is not conditional on managed deployments existing"
+  fail "10: the shared EFS security-group data lookup in envs/dev/efs.tf is not conditional on desired managed deployments existing"
 fi
 
 if grep -qE 'resource\s+"aws_efs_(file_system|mount_target|access_point)"' envs/dev/*.tf 2>/dev/null; then
@@ -7530,6 +7530,30 @@ by_id = {d["deploymentId"]: d for d in (active + inactive)}
 check("17: both real decommissioned descriptors currently have lifecycle.state=absent", all(by_id[i]["deploymentId"] not in [x["deploymentId"] for x in active] for i in decommission_ids))
 check("18: both real decommissioned descriptors currently have replication.enabled=false", all(by_id[i]["replicationEnabled"] is False for i in decommission_ids))
 
+# --- EFS SG lookup lifecycle: the shared SG data source must be gated on the
+# DESIRED (post-decommission) map, not the canonical inventory, or a plan/apply
+# run after aws-cloud-factory-infra deletes the old-VPC SG would fail trying to
+# resolve an intentionally-deleted security group. ---
+sg_match = re.search(r"data \"aws_security_group\" \"goldengate_efs_shared\" \{(.*?)\n\}", efs_tf, re.S)
+check("19: data.aws_security_group.goldengate_efs_shared exists", sg_match is not None)
+sg_body = sg_match.group(1) if sg_match else ""
+check("20: the SG lookup count is gated on the desired (post-decommission) map, not the canonical inventory", "count = length(local.goldengate_managed_efs_desired_deployments) > 0 ? 1 : 0" in sg_body)
+check("21: the SG lookup count no longer references the unfiltered canonical local directly", "length(local.goldengate_managed_efs_deployments) > 0" not in sg_body)
+
+# The only other reference to the SG data source is inside the module block,
+# whose own for_each is already the same desired-EFS local -- so the [0]
+# index is never evaluated when desired is empty, proving no unconditional
+# reference bypasses the count gate.
+other_sg_refs = [m.start() for m in re.finditer(r"data\.aws_security_group\.goldengate_efs_shared\[0\]", efs_tf)]
+check("22: every reference to data.aws_security_group.goldengate_efs_shared[0] lives inside the module block gated by the same desired-EFS for_each (no unconditional bypass elsewhere in efs.tf)",
+      len(other_sg_refs) == 1 and module_match is not None and module_match.start() < other_sg_refs[0] < module_match.end())
+
+# Empirical: with the real current state (both real deployments decommissioned),
+# the desired-EFS map is empty, so the SG lookup count must evaluate to 0 --
+# proving today'\''s actual plan will not attempt to resolve the old-VPC SG at all.
+real_desired_ids = sorted(set(canonical_managed_ids) - set(decommission_ids))
+check("23: with the real current descriptor state, the desired-EFS map is empty, so the SG data-source count evaluates to 0 (SG lookup is fully disabled today)", real_desired_ids == [])
+
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
 ' 2>&1)"
@@ -7547,6 +7571,12 @@ if grep -qE 'resource\s+"aws_security_group"' envs/dev/*.tf 2>/dev/null; then
   fail "envs/dev/*.tf creates a new security group instead of reusing the single shared one via a fail-closed data lookup"
 else
   pass "envs/dev/*.tf does not create a per-deployment security group -- it looks up the shared one"
+fi
+
+if grep -rqE 'resource\s+"aws_security_group"' --include='*.tf' . 2>/dev/null; then
+  fail "GOLDENGATE-EKS-APP introduces an aws_security_group resource somewhere in the repo -- the EFS security group (sg-09335be70fbc37745 / gg-poc-dev-efs-sg) remains owned exclusively by the separate aws-cloud-factory-infra repo; this repo may only look it up via a fail-closed data source, never create/manage/destroy it"
+else
+  pass "no aws_security_group resource exists anywhere in GOLDENGATE-EKS-APP -- the shared EFS SG remains owned exclusively by aws-cloud-factory-infra"
 fi
 
 if grep -qE '^\s*variable\s+"goldengate_efs_shared_security_group_description"' envs/dev/efs.tf 2>/dev/null \
@@ -7998,7 +8028,7 @@ else
   fail "6: envs/dev/efs.tf references \"pipeline\" -- the module key must be derived from deployment ID alone"
 fi
 
-# Self-service: never a hardcoded exact inventory -- only proves the live managed-EFS inventory is non-empty (list length >= 1), which is the exact trigger condition envs/dev/efs.tf's shared-SG data-source count depends on (`length(local.goldengate_managed_efs_deployments) > 0 ? 1 : 0`). The full dynamic-vs-derived semantic comparison lives in the "Self-service test architecture: generic descriptor invariants" section above; not duplicated here.
+# Self-service: never a hardcoded exact inventory -- proves the live CANONICAL managed-EFS inventory is non-empty (list length >= 1) while also proving envs/dev/efs.tf's shared-SG data-source count no longer tracks that canonical count directly. Since local.goldengate_managed_efs_desired_deployments = canonical minus the explicit old-VPC decommission allowlist, and today's live decommission set exactly equals the live canonical set (see the "Old-VPC EFS decommission" checks above), the live SG lookup count actually evaluates to 0 even though the canonical inventory itself is non-empty -- this is the whole point of gating on desired rather than canonical (see the "EFS SG lookup lifecycle" checks above). The full dynamic-vs-derived semantic comparison lives in the "Self-service test architecture: generic descriptor invariants" section above; not duplicated here.
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   set +e
   LIVE_INVENTORY_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev managed-efs-inventory 2>&1)"
@@ -8006,7 +8036,7 @@ if [ "$PYTHON_AVAILABLE" = "true" ]; then
   set -e
   LIVE_INVENTORY_COUNT="$(python3 -c 'import json, sys; print(len(json.loads(sys.argv[1])))' "$LIVE_INVENTORY_OUT" 2>/dev/null || echo "-1")"
   if [ "$LIVE_INVENTORY_STATUS" -eq 0 ] && [ "$LIVE_INVENTORY_COUNT" -ge 1 ]; then
-    pass "11: today's live dev inventory contains at least one managed deployment -- envs/dev/efs.tf's shared-SG data-source count therefore evaluates to 1 (not 0), requiring a managed-EFS SG lookup"
+    pass "11: today's live dev CANONICAL managed-EFS inventory contains at least one managed deployment -- but every canonical entry is also in the explicit decommission set, so envs/dev/efs.tf's shared-SG data-source count (gated on desired, not canonical) evaluates to 0 today, not 1"
   else
     fail "11: expected the live managed-efs-inventory to be valid JSON with at least one entry: ${LIVE_INVENTORY_OUT}"
   fi
