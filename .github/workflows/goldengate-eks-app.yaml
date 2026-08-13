@@ -75,6 +75,7 @@ jobs:
 
     outputs:
       effective_deploy: ${{ steps.compute.outputs.effective_deploy }}
+      has_active_deployments: ${{ steps.active_runtime_state.outputs.has_active_deployments }}
 
     steps:
       - name: Checkout repository
@@ -104,6 +105,51 @@ jobs:
 
           # Fail-closed gate: no downstream job runs while any envs/dev/*/values.yaml descriptor is invalid.
           python3 hack/goldengate-deployment-model.py --environment dev validate
+
+      - name: Determine active GoldenGate runtime state
+        id: active_runtime_state
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # GLOBAL folder-driven desired state (not deployment_matrix, which only reflects deployments selected by this push's changed files) -- the canonical registry is the single source of truth monitor_sync_once/monitor_dry_run_validation gate on below.
+          TMP="$(mktemp)"
+          trap 'rm -f "$TMP"' EXIT
+
+          python3 hack/goldengate-deployment-model.py --environment dev registry --output "$TMP"
+
+          ACTIVE_COUNT="$(python3 - "$TMP" <<'PY'
+          import sys
+
+          import yaml
+
+          with open(sys.argv[1]) as f:
+              doc = yaml.safe_load(f)
+
+          if not isinstance(doc, dict):
+              raise SystemExit("registry document is not a mapping")
+
+          deployments = doc.get("deployments")
+          if not isinstance(deployments, list):
+              raise SystemExit("registry deployments is not a list")
+
+          print(len(deployments))
+          PY
+          )"
+
+          if ! [[ "$ACTIVE_COUNT" =~ ^[0-9]+$ ]]; then
+            echo "FAIL: could not determine a numeric active GoldenGate runtime count from the generated registry."
+            exit 1
+          fi
+
+          echo "Active GoldenGate runtime count: ${ACTIVE_COUNT}"
+
+          if [ "$ACTIVE_COUNT" -gt 0 ]; then
+            echo "has_active_deployments=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No active GoldenGate runtimes remain; runtime-dependent monitor stages will be skipped."
+            echo "has_active_deployments=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Compute effective deploy flag
         id: compute
@@ -2460,8 +2506,8 @@ jobs:
       - build_publish_and_deploy
       - delete_removed_argocd_applications
       - replication_reconcile_once
-    # goldengate-monitor.yaml publishes unconditionally on every internal step, so this call must be skipped entirely for deploy=false.
-    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && always() && needs.validate_shared_secrets_once.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' && needs.replication_reconcile_once.result != 'failure' && needs.replication_reconcile_once.result != 'cancelled' }}
+    # goldengate-monitor.yaml publishes unconditionally on every internal step, so this call must be skipped entirely for deploy=false. Also skipped when the canonical model has zero active runtimes (e.g. full decommission): the monitor legitimately refuses to start against an empty registry, so this orchestrator must not invoke it rather than let that be a real failure.
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.validate_model.outputs.has_active_deployments == 'true' && always() && needs.validate_shared_secrets_once.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' && needs.replication_reconcile_once.result != 'failure' && needs.replication_reconcile_once.result != 'cancelled' }}
 
     uses: ./.github/workflows/goldengate-monitor.yaml
     with:
@@ -2480,7 +2526,8 @@ jobs:
       - build_publish_and_deploy
       - delete_removed_argocd_applications
       - replication_dry_run_validation
-    if: ${{ needs.validate_model.outputs.effective_deploy == 'false' && always() && needs.validate_shared_secrets_once.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' && needs.replication_dry_run_validation.result != 'failure' && needs.replication_dry_run_validation.result != 'cancelled' }}
+    # Skipped when the canonical model has zero active runtimes (e.g. full decommission): there is no reason to run the monitor's real-repository unit/chart validation against a deliberately empty runtime registry.
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'false' && needs.validate_model.outputs.has_active_deployments == 'true' && always() && needs.validate_shared_secrets_once.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' && needs.replication_dry_run_validation.result != 'failure' && needs.replication_dry_run_validation.result != 'cancelled' }}
 
     # Local/read-only CI validation only (checkout, Python, pip install, unit tests, folder-driven registry generation, Helm lint/template) -- no AWS credentials, no EKS access, no Argo CD/Kubernetes mutation, so it does not need (and must not depend on) the private CodeBuild runtime that every real cloud-mutating job in this workflow uses. This job's own CodeBuild runner did not carry the actions/setup-python Python 3.12 x64 distribution ("Version 3.12 was not found in the local cache"), which is a runner/toolchain issue, not a monitor application defect -- switching this ONE dry-run job to the standard GitHub-hosted runner fixes it without touching monitor_sync_once or any other job's runner.
     runs-on: ubuntu-latest

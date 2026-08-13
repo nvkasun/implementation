@@ -9089,20 +9089,68 @@ else
   skip "VDR-MON: monitor_dry_run_validation structural checks -- python3/PyYAML unavailable"
 fi
 
-if grep -qF "if: \${{ needs.validate_model.outputs.effective_deploy == 'false' && always() && needs.validate_shared_secrets_once.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' && needs.replication_dry_run_validation.result != 'failure' && needs.replication_dry_run_validation.result != 'cancelled' }}" "$EKS_APP_WORKFLOW" 2>/dev/null; then
-  pass "VDR-MON 14: monitor_dry_run_validation's deploy=false job-gating if: condition is byte-for-byte unchanged -- only its runs-on changed"
+if grep -qF "if: \${{ needs.validate_model.outputs.effective_deploy == 'false' && needs.validate_model.outputs.has_active_deployments == 'true' && always() && needs.validate_shared_secrets_once.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' && needs.replication_dry_run_validation.result != 'failure' && needs.replication_dry_run_validation.result != 'cancelled' }}" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "VDR-MON 14: monitor_dry_run_validation's deploy=false job-gating if: condition retains every original clause plus the additive has_active_deployments=='true' gate"
 else
   fail "VDR-MON 14: monitor_dry_run_validation's deploy=false job-gating if: condition was unexpectedly modified"
 fi
 
 if grep -qF "uses: ./.github/workflows/goldengate-monitor.yaml" "$EKS_APP_WORKFLOW" 2>/dev/null \
     && grep -qF "deploy: true" "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && grep -qF "needs.validate_model.outputs.effective_deploy == 'true' && always() && needs.validate_shared_secrets_once.result == 'success'" "$EKS_APP_WORKFLOW" 2>/dev/null; then
-  pass "VDR-MON 15: monitor_sync_once's deploy=true reusable-workflow call (goldengate-monitor.yaml, deploy: true) and its job-gating if: condition are unchanged"
+    && grep -qF "needs.validate_model.outputs.effective_deploy == 'true' && needs.validate_model.outputs.has_active_deployments == 'true' && always() && needs.validate_shared_secrets_once.result == 'success'" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "VDR-MON 15: monitor_sync_once's deploy=true reusable-workflow call (goldengate-monitor.yaml, deploy: true) is unchanged, and its job-gating if: condition retains every original clause plus the additive has_active_deployments=='true' gate"
 else
   fail "VDR-MON 15: monitor_sync_once's deploy=true path appears to have changed"
 fi
 
+echo ""
+echo "--- Orchestrator gate: monitor stages skip when the canonical model has zero active runtimes ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  ACTIVE_GATE_CHECK="$(python3 -c '
+import yaml
+with open("'"$EKS_APP_WORKFLOW"'") as f:
+    doc = yaml.safe_load(f)
+jobs = doc["jobs"]
+results = []
+
+results.append(("1: validate_model exports has_active_deployments", "has_active_deployments" in jobs["validate_model"].get("outputs", {})))
+
+active_step = next((s for s in jobs["validate_model"]["steps"] if s.get("id") == "active_runtime_state"), None)
+results.append(("2: validate_model has an active_runtime_state step", active_step is not None))
+step_run = (active_step or {}).get("run", "")
+results.append(("3: has_active_deployments is derived from the canonical registry, not deployment_matrix", "goldengate-deployment-model.py --environment dev registry" in step_run and "outputs.deployment_matrix" not in step_run and "DEPLOYMENT_MATRIX" not in step_run))
+results.append(("4: the active-runtime step never greps YAML (uses PyYAML safe_load)", "grep" not in step_run and "yaml.safe_load" in step_run))
+
+monitor_sync_if = jobs["monitor_sync_once"]["if"]
+results.append(("5: monitor_sync_once requires has_active_deployments == \'\''true\'\''", "needs.validate_model.outputs.has_active_deployments == '"'"'true'"'"'" in monitor_sync_if))
+results.append(("6: monitor_sync_once retains its original effective_deploy/dependency clauses", "needs.validate_model.outputs.effective_deploy == '"'"'true'"'"'" in monitor_sync_if and "needs.validate_shared_secrets_once.result == '"'"'success'"'"'" in monitor_sync_if and "needs.replication_reconcile_once.result != '"'"'cancelled'"'"'" in monitor_sync_if))
+
+dry_run_if = jobs["monitor_dry_run_validation"]["if"]
+results.append(("7: monitor_dry_run_validation requires has_active_deployments == \'\''true\'\''", "needs.validate_model.outputs.has_active_deployments == '"'"'true'"'"'" in dry_run_if))
+results.append(("8: monitor_dry_run_validation retains its original effective_deploy/dependency clauses", "needs.validate_model.outputs.effective_deploy == '"'"'false'"'"'" in dry_run_if and "needs.validate_shared_secrets_once.result == '"'"'success'"'"'" in dry_run_if and "needs.replication_dry_run_validation.result != '"'"'cancelled'"'"'" in dry_run_if))
+
+# replication_monitor_acceptance already requires monitor_sync_once.result == "success"; a skipped monitor_sync_once therefore naturally skips it too, with no change needed.
+rma_if = jobs["replication_monitor_acceptance"]["if"]
+results.append(("9: replication_monitor_acceptance still requires monitor_sync_once.result == \'\''success\'\'' (naturally skips when monitor_sync_once is skipped, no change needed)", "needs.monitor_sync_once.result == '"'"'success'"'"'" in rma_if))
+
+# final_validation only ever rejects monitor jobs on failure/cancelled, never on skipped -- so both gated monitor jobs skipping cleanly still lets final_validation run.
+fv_if = jobs["final_validation"]["if"]
+results.append(("10: final_validation only rejects monitor_sync_once on failure/cancelled (never skipped)", "needs.monitor_sync_once.result != '"'"'failure'"'"'" in fv_if and "needs.monitor_sync_once.result != '"'"'cancelled'"'"'" in fv_if and "needs.monitor_sync_once.result == '"'"'skipped'"'"'" not in fv_if and "needs.monitor_sync_once.result == '"'"'success'"'"'" not in fv_if))
+results.append(("11: final_validation only rejects monitor_dry_run_validation on failure/cancelled (never skipped)", "needs.monitor_dry_run_validation.result != '"'"'failure'"'"'" in fv_if and "needs.monitor_dry_run_validation.result != '"'"'cancelled'"'"'" in fv_if))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+' 2>&1)"
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL\ *) fail "ACTIVE-GATE: ${line#FAIL }" ;;
+      OK\ *) pass "ACTIVE-GATE: ${line#OK }" ;;
+    esac
+  done <<< "$ACTIVE_GATE_CHECK"
+else
+  skip "ACTIVE-GATE: monitor active-runtime gating checks -- python3/PyYAML unavailable"
+fi
 
 # 17/18/19/20/21: cross-account Secrets Manager fix, structural runtime-image validation fix, EFS/Terraform architecture, Oracle/PostgreSQL descriptors + replication=false, and PostgreSQL->MSSQL Phase 6D1 are all unrelated to this narrowly-scoped monitor_dry_run_validation runner fix and remain covered by their own dedicated, still-passing sections/suites above (the "VDR correction: validate_shared_secrets_once..." section, the "VDR correction: structural rendered-image validation..." section, the "Production hardening, Item 1" section, the Phase 6D0 Oracle/PostgreSQL sections, and hack/test-goldengate-replication.py respectively) -- not re-proved here, to avoid duplicating that logic.
 
