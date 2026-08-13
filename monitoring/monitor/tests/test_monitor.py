@@ -1977,9 +1977,15 @@ class SecretProviderClassRenderTests(unittest.TestCase):
         self.assertIn('name: CLOUDWATCH_PUBLISH_ENABLED\n              value: "false"', self.rendered)
 
     def test_exactly_one_of_each_core_resource(self):
-        for kind in ("Deployment", "Service", "Ingress", "ServiceAccount", "ConfigMap"):
+        for kind in ("Deployment", "Service", "ServiceAccount", "ConfigMap"):
             with self.subTest(kind=kind):
                 self.assertEqual(self.rendered.count(f"kind: {kind}\n"), 1)
+
+        # Ingress count follows the real envs/dev/goldengate-monitor/values.yaml ingress.enabled setting -- never hardcoded, since this chart legitimately renders zero Ingress resources when ingress.enabled=false.
+        with open(os.path.join(REPO_ROOT, "envs", "dev", "goldengate-monitor", "values.yaml")) as f:
+            monitor_values = yaml.safe_load(f)
+        expected_ingress_count = 1 if (monitor_values.get("ingress") or {}).get("enabled") else 0
+        self.assertEqual(self.rendered.count("kind: Ingress\n"), expected_ingress_count)
 
 
 SYNTHETIC_SHARED_SECRET_REGISTRY = """\
@@ -3269,9 +3275,9 @@ def _extract_serviceaccount_validation_snippet(monitor_text):
 
 
 def _extract_ingress_validation_snippet(monitor_text):
-    """The Ingress host/certificate/protocol validation portion of the manifest-validation step, extracted verbatim from the real workflow."""
+    """The ingress.enabled-conditional Ingress validation portion of the manifest-validation step, extracted verbatim from the real workflow -- includes the DESIRED_INGRESS_ENABLED resolution and the full if/else/fi so the extracted text is self-contained bash on its own."""
     full_step = _extract_run_block(monitor_text, "Validate rendered monitor manifest")
-    start = full_step.index('echo "Validating Ingress exists')
+    start = full_step.index('echo "Resolving desired ingress.enabled')
     end = full_step.index('echo "Validating the canonical inventory ConfigMap')
     return _extract_manifest_validation_helpers(monitor_text) + full_step[start:end]
 
@@ -3292,8 +3298,17 @@ def _run_serviceaccount_snippet(monitor_text, rendered_yaml):
     return _run_snippet(_extract_serviceaccount_validation_snippet(monitor_text), rendered_yaml)
 
 
-def _run_ingress_snippet(monitor_text, rendered_yaml):
-    return _run_snippet(_extract_ingress_validation_snippet(monitor_text), rendered_yaml)
+def _run_ingress_snippet(monitor_text, rendered_yaml, ingress_enabled=True):
+    """Every existing caller exercises the ingress.enabled=true path (unchanged behavior); a real values.yaml fixture is written so the extracted snippet's own ingress.enabled resolution (read from $VALUES_FILE) reflects it."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        values_path = os.path.join(tmpdir, "values.yaml")
+        with open(values_path, "w") as f:
+            yaml.safe_dump({"ingress": {"enabled": ingress_enabled}}, f)
+        return _run_snippet(
+            _extract_ingress_validation_snippet(monitor_text),
+            rendered_yaml,
+            extra_env={"VALUES_FILE": values_path},
+        )
 
 
 class ReadmeRoleDocumentationTests(unittest.TestCase):

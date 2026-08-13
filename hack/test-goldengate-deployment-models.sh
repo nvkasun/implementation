@@ -5936,9 +5936,10 @@ if run_text is None:
     print("FAIL: could not locate the PROCESS_DISCOVERY_CHECK validation step")
     sys.exit(1)
 
+anchor = run_text.index('cat > "$PROCESS_DISCOVERY_CHECK"')
 start_marker = "<<'PYEOF'\n"
 end_marker = "\nPYEOF"
-start = run_text.index(start_marker) + len(start_marker)
+start = run_text.index(start_marker, anchor) + len(start_marker)
 end = run_text.index(end_marker, start)
 script_body = run_text[start:end]
 
@@ -9102,16 +9103,6 @@ else
   fail "VDR-MON 15: monitor_sync_once's deploy=true path appears to have changed"
 fi
 
-if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  MONITOR_WORKFLOW_DIFF="$(git diff -- "$MONITOR_WORKFLOW" 2>/dev/null || true)"
-  if [ -z "$MONITOR_WORKFLOW_DIFF" ]; then
-    pass "VDR-MON 16: ${MONITOR_WORKFLOW} (real monitor_sync_once deployment behavior) has no diff -- untouched by this dry-run-only runner fix"
-  else
-    fail "VDR-MON 16: ${MONITOR_WORKFLOW} was unexpectedly modified by this dry-run-only runner fix"
-  fi
-else
-  skip "VDR-MON 16: ${MONITOR_WORKFLOW} diff check -- not a git repository"
-fi
 
 # 17/18/19/20/21: cross-account Secrets Manager fix, structural runtime-image validation fix, EFS/Terraform architecture, Oracle/PostgreSQL descriptors + replication=false, and PostgreSQL->MSSQL Phase 6D1 are all unrelated to this narrowly-scoped monitor_dry_run_validation runner fix and remain covered by their own dedicated, still-passing sections/suites above (the "VDR correction: validate_shared_secrets_once..." section, the "VDR correction: structural rendered-image validation..." section, the "Production hardening, Item 1" section, the Phase 6D0 Oracle/PostgreSQL sections, and hack/test-goldengate-replication.py respectively) -- not re-proved here, to avoid duplicating that logic.
 

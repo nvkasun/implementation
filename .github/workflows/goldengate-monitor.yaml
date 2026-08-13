@@ -960,91 +960,116 @@ jobs:
             exit 1
           fi
 
-          echo "Validating Ingress exists, and its host/certificate/protocol annotations..."
-          INGRESS_BLOCK="$(select_document "$RENDERED" "Ingress" "gg-monitor")"
-          if [ -z "$INGRESS_BLOCK" ]; then
-            echo "FAIL: rendered Ingress gg-monitor was not found."
-            exit 1
-          fi
-          if ! grep -Fq -- "kind: Ingress" <<< "$INGRESS_BLOCK"; then
-            echo "FAIL: extracted document is not kind: Ingress."
-            exit 1
-          fi
-          if ! grep -Fq -- "  name: gg-monitor" <<< "$INGRESS_BLOCK"; then
-            echo "FAIL: extracted Ingress's metadata.name is not gg-monitor."
-            exit 1
-          fi
+          echo "Resolving desired ingress.enabled from ${VALUES_FILE}..."
+          DESIRED_INGRESS_ENABLED="$(python3 - "$VALUES_FILE" <<'PYEOF'
+          import sys
+          import yaml
+          with open(sys.argv[1]) as f:
+              data = yaml.safe_load(f)
+          enabled = (data.get("ingress") or {}).get("enabled")
+          if not isinstance(enabled, bool):
+              print(f"FAIL: {sys.argv[1]} ingress.enabled is missing or not a literal YAML boolean (got {enabled!r}).", file=sys.stderr)
+              sys.exit(1)
+          print("true" if enabled else "false")
+          PYEOF
+          )"
+          echo "Desired ingress.enabled: ${DESIRED_INGRESS_ENABLED}"
 
-          INGRESS_HOST_LINE="$(grep -m1 -F -- "- host:" <<< "$INGRESS_BLOCK" || true)"
-          if [ -z "$INGRESS_HOST_LINE" ]; then
-            echo "FAIL: host is missing from rendered Ingress gg-monitor."
-            exit 1
-          fi
-          INGRESS_HOST_ACTUAL="$(normalize_value "${INGRESS_HOST_LINE#*host:}")"
-          INGRESS_HOST_EXPECTED="monitor.goldengate-dev.adcbmis.local"
-          if [ "$INGRESS_HOST_ACTUAL" != "$INGRESS_HOST_EXPECTED" ]; then
-            echo "FAIL: gg-monitor Ingress host mismatch."
-            echo "Expected: ${INGRESS_HOST_EXPECTED}"
-            echo "Actual:   ${INGRESS_HOST_ACTUAL}"
-            exit 1
-          fi
-          echo "OK: Ingress gg-monitor uses the expected hostname."
+          if [ "$DESIRED_INGRESS_ENABLED" = "false" ]; then
+            echo "Validating no Ingress gg-monitor is rendered (ingress.enabled=false)..."
+            INGRESS_BLOCK="$(select_document "$RENDERED" "Ingress" "gg-monitor")"
+            if [ -n "$INGRESS_BLOCK" ]; then
+              echo "FAIL: ingress.enabled=false but an Ingress gg-monitor was still rendered."
+              exit 1
+            fi
+            echo "OK: ingress.enabled=false and no gg-monitor Ingress is rendered."
+          else
+            echo "Validating Ingress exists, and its host/certificate/protocol annotations..."
+            INGRESS_BLOCK="$(select_document "$RENDERED" "Ingress" "gg-monitor")"
+            if [ -z "$INGRESS_BLOCK" ]; then
+              echo "FAIL: rendered Ingress gg-monitor was not found."
+              exit 1
+            fi
+            if ! grep -Fq -- "kind: Ingress" <<< "$INGRESS_BLOCK"; then
+              echo "FAIL: extracted document is not kind: Ingress."
+              exit 1
+            fi
+            if ! grep -Fq -- "  name: gg-monitor" <<< "$INGRESS_BLOCK"; then
+              echo "FAIL: extracted Ingress's metadata.name is not gg-monitor."
+              exit 1
+            fi
 
-          INGRESS_CERT_LINE="$(grep -m1 -- "alb.ingress.kubernetes.io/certificate-arn:" <<< "$INGRESS_BLOCK" || true)"
-          if [ -z "$INGRESS_CERT_LINE" ]; then
-            echo "FAIL: certificate ARN annotation is missing from Ingress gg-monitor."
-            exit 1
-          fi
-          INGRESS_CERT_ACTUAL="$(normalize_value "${INGRESS_CERT_LINE#*certificate-arn:}")"
-          INGRESS_CERT_EXPECTED="arn:aws:acm:eu-west-1:668311715351:certificate/9e53e28e-3243-47fc-85a1-50f9a94acde7"
-          if [ "$INGRESS_CERT_ACTUAL" != "$INGRESS_CERT_EXPECTED" ]; then
-            echo "FAIL: gg-monitor Ingress certificate ARN mismatch."
-            echo "Expected: ${INGRESS_CERT_EXPECTED}"
-            echo "Actual:   ${INGRESS_CERT_ACTUAL}"
-            exit 1
-          fi
-          echo "OK: Ingress gg-monitor uses the expected ACM certificate ARN."
+            INGRESS_HOST_LINE="$(grep -m1 -F -- "- host:" <<< "$INGRESS_BLOCK" || true)"
+            if [ -z "$INGRESS_HOST_LINE" ]; then
+              echo "FAIL: host is missing from rendered Ingress gg-monitor."
+              exit 1
+            fi
+            INGRESS_HOST_ACTUAL="$(normalize_value "${INGRESS_HOST_LINE#*host:}")"
+            INGRESS_HOST_EXPECTED="monitor.goldengate-dev.adcbmis.local"
+            if [ "$INGRESS_HOST_ACTUAL" != "$INGRESS_HOST_EXPECTED" ]; then
+              echo "FAIL: gg-monitor Ingress host mismatch."
+              echo "Expected: ${INGRESS_HOST_EXPECTED}"
+              echo "Actual:   ${INGRESS_HOST_ACTUAL}"
+              exit 1
+            fi
+            echo "OK: Ingress gg-monitor uses the expected hostname."
 
-          INGRESS_BACKEND_PROTOCOL_LINE="$(grep -m1 -- "alb.ingress.kubernetes.io/backend-protocol:" <<< "$INGRESS_BLOCK" || true)"
-          if [ -z "$INGRESS_BACKEND_PROTOCOL_LINE" ]; then
-            echo "FAIL: backend-protocol annotation is missing from Ingress gg-monitor."
-            exit 1
-          fi
-          INGRESS_BACKEND_PROTOCOL_ACTUAL="$(normalize_value "${INGRESS_BACKEND_PROTOCOL_LINE#*backend-protocol:}")"
-          if [ "$INGRESS_BACKEND_PROTOCOL_ACTUAL" != "HTTP" ]; then
-            echo "FAIL: gg-monitor Ingress backend protocol mismatch."
-            echo "Expected: HTTP"
-            echo "Actual:   ${INGRESS_BACKEND_PROTOCOL_ACTUAL}"
-            exit 1
-          fi
+            INGRESS_CERT_LINE="$(grep -m1 -- "alb.ingress.kubernetes.io/certificate-arn:" <<< "$INGRESS_BLOCK" || true)"
+            if [ -z "$INGRESS_CERT_LINE" ]; then
+              echo "FAIL: certificate ARN annotation is missing from Ingress gg-monitor."
+              exit 1
+            fi
+            INGRESS_CERT_ACTUAL="$(normalize_value "${INGRESS_CERT_LINE#*certificate-arn:}")"
+            INGRESS_CERT_EXPECTED="arn:aws:acm:eu-west-1:668311715351:certificate/9e53e28e-3243-47fc-85a1-50f9a94acde7"
+            if [ "$INGRESS_CERT_ACTUAL" != "$INGRESS_CERT_EXPECTED" ]; then
+              echo "FAIL: gg-monitor Ingress certificate ARN mismatch."
+              echo "Expected: ${INGRESS_CERT_EXPECTED}"
+              echo "Actual:   ${INGRESS_CERT_ACTUAL}"
+              exit 1
+            fi
+            echo "OK: Ingress gg-monitor uses the expected ACM certificate ARN."
 
-          INGRESS_HEALTHCHECK_PROTOCOL_LINE="$(grep -m1 -- "alb.ingress.kubernetes.io/healthcheck-protocol:" <<< "$INGRESS_BLOCK" || true)"
-          if [ -z "$INGRESS_HEALTHCHECK_PROTOCOL_LINE" ]; then
-            echo "FAIL: healthcheck-protocol annotation is missing from Ingress gg-monitor."
-            exit 1
-          fi
-          INGRESS_HEALTHCHECK_PROTOCOL_ACTUAL="$(normalize_value "${INGRESS_HEALTHCHECK_PROTOCOL_LINE#*healthcheck-protocol:}")"
-          if [ "$INGRESS_HEALTHCHECK_PROTOCOL_ACTUAL" != "HTTP" ]; then
-            echo "FAIL: gg-monitor Ingress health-check protocol mismatch."
-            echo "Expected: HTTP"
-            echo "Actual:   ${INGRESS_HEALTHCHECK_PROTOCOL_ACTUAL}"
-            exit 1
-          fi
+            INGRESS_BACKEND_PROTOCOL_LINE="$(grep -m1 -- "alb.ingress.kubernetes.io/backend-protocol:" <<< "$INGRESS_BLOCK" || true)"
+            if [ -z "$INGRESS_BACKEND_PROTOCOL_LINE" ]; then
+              echo "FAIL: backend-protocol annotation is missing from Ingress gg-monitor."
+              exit 1
+            fi
+            INGRESS_BACKEND_PROTOCOL_ACTUAL="$(normalize_value "${INGRESS_BACKEND_PROTOCOL_LINE#*backend-protocol:}")"
+            if [ "$INGRESS_BACKEND_PROTOCOL_ACTUAL" != "HTTP" ]; then
+              echo "FAIL: gg-monitor Ingress backend protocol mismatch."
+              echo "Expected: HTTP"
+              echo "Actual:   ${INGRESS_BACKEND_PROTOCOL_ACTUAL}"
+              exit 1
+            fi
 
-          INGRESS_TARGET_TYPE_LINE="$(grep -m1 -- "alb.ingress.kubernetes.io/target-type:" <<< "$INGRESS_BLOCK" || true)"
-          if [ -z "$INGRESS_TARGET_TYPE_LINE" ]; then
-            echo "FAIL: target-type annotation is missing from Ingress gg-monitor."
-            exit 1
-          fi
-          INGRESS_TARGET_TYPE_ACTUAL="$(normalize_value "${INGRESS_TARGET_TYPE_LINE#*target-type:}")"
-          if [ "$INGRESS_TARGET_TYPE_ACTUAL" != "ip" ]; then
-            echo "FAIL: gg-monitor Ingress target type mismatch."
-            echo "Expected: ip"
-            echo "Actual:   ${INGRESS_TARGET_TYPE_ACTUAL}"
-            exit 1
-          fi
+            INGRESS_HEALTHCHECK_PROTOCOL_LINE="$(grep -m1 -- "alb.ingress.kubernetes.io/healthcheck-protocol:" <<< "$INGRESS_BLOCK" || true)"
+            if [ -z "$INGRESS_HEALTHCHECK_PROTOCOL_LINE" ]; then
+              echo "FAIL: healthcheck-protocol annotation is missing from Ingress gg-monitor."
+              exit 1
+            fi
+            INGRESS_HEALTHCHECK_PROTOCOL_ACTUAL="$(normalize_value "${INGRESS_HEALTHCHECK_PROTOCOL_LINE#*healthcheck-protocol:}")"
+            if [ "$INGRESS_HEALTHCHECK_PROTOCOL_ACTUAL" != "HTTP" ]; then
+              echo "FAIL: gg-monitor Ingress health-check protocol mismatch."
+              echo "Expected: HTTP"
+              echo "Actual:   ${INGRESS_HEALTHCHECK_PROTOCOL_ACTUAL}"
+              exit 1
+            fi
 
-          echo "OK: Ingress gg-monitor uses HTTP backend/health-check protocols and target-type=ip."
+            INGRESS_TARGET_TYPE_LINE="$(grep -m1 -- "alb.ingress.kubernetes.io/target-type:" <<< "$INGRESS_BLOCK" || true)"
+            if [ -z "$INGRESS_TARGET_TYPE_LINE" ]; then
+              echo "FAIL: target-type annotation is missing from Ingress gg-monitor."
+              exit 1
+            fi
+            INGRESS_TARGET_TYPE_ACTUAL="$(normalize_value "${INGRESS_TARGET_TYPE_LINE#*target-type:}")"
+            if [ "$INGRESS_TARGET_TYPE_ACTUAL" != "ip" ]; then
+              echo "FAIL: gg-monitor Ingress target type mismatch."
+              echo "Expected: ip"
+              echo "Actual:   ${INGRESS_TARGET_TYPE_ACTUAL}"
+              exit 1
+            fi
+
+            echo "OK: Ingress gg-monitor uses HTTP backend/health-check protocols and target-type=ip."
+          fi
 
           echo "Validating the canonical inventory ConfigMap is rendered and mounted..."
           CONFIGMAP_BLOCK="$(select_document "$RENDERED" "ConfigMap" "goldengate-monitor-canonical-config")"
@@ -1549,12 +1574,34 @@ jobs:
           echo "OK: Service gg-monitor is ClusterIP."
 
           echo "Ingress:"
-          INGRESS_HOST="$(kubectl get ingress gg-monitor -n "$TARGET_NAMESPACE" -o jsonpath='{.spec.rules[0].host}')"
-          if [ "$INGRESS_HOST" != "monitor.goldengate-dev.adcbmis.local" ]; then
-            echo "FAIL: Ingress host is ${INGRESS_HOST}, expected monitor.goldengate-dev.adcbmis.local."
-            exit 1
+          DESIRED_INGRESS_ENABLED="$(python3 - "$VALUES_FILE" <<'PYEOF'
+          import sys
+          import yaml
+          with open(sys.argv[1]) as f:
+              data = yaml.safe_load(f)
+          enabled = (data.get("ingress") or {}).get("enabled")
+          if not isinstance(enabled, bool):
+              print(f"FAIL: {sys.argv[1]} ingress.enabled is missing or not a literal YAML boolean (got {enabled!r}).", file=sys.stderr)
+              sys.exit(1)
+          print("true" if enabled else "false")
+          PYEOF
+          )"
+          echo "Desired ingress.enabled: ${DESIRED_INGRESS_ENABLED}"
+
+          if [ "$DESIRED_INGRESS_ENABLED" = "false" ]; then
+            if kubectl get ingress gg-monitor -n "$TARGET_NAMESPACE" >/dev/null 2>&1; then
+              echo "FAIL: ingress.enabled=false but Ingress gg-monitor still exists in ${TARGET_NAMESPACE} after Argo CD sync/prune."
+              exit 1
+            fi
+            echo "OK: gg-monitor Ingress is absent as requested."
+          else
+            INGRESS_HOST="$(kubectl get ingress gg-monitor -n "$TARGET_NAMESPACE" -o jsonpath='{.spec.rules[0].host}')"
+            if [ "$INGRESS_HOST" != "monitor.goldengate-dev.adcbmis.local" ]; then
+              echo "FAIL: Ingress host is ${INGRESS_HOST}, expected monitor.goldengate-dev.adcbmis.local."
+              exit 1
+            fi
+            echo "OK: Ingress host matches expected."
           fi
-          echo "OK: Ingress host matches expected."
 
           echo "Checking /healthz inside the pod..."
           if ! kubectl exec "$POD_NAME" -n "$TARGET_NAMESPACE" -- \
