@@ -1,42 +1,33 @@
-Do this now
+For now, finish the monitor cleanly
 
-First verify the deletion/finalizer state:
+First find the Argo Application owning it:
 
-kubectl get ingress gg-poc-dev-alb-resident \
-  -n alb-resident \
-  -o jsonpath='{.metadata.deletionTimestamp}{"\n"}{.metadata.finalizers}{"\n"}'
+kubectl get ingress gg-monitor \
+  -n goldengate-monitoring \
+  -o jsonpath='{.metadata.labels.argocd\.argoproj\.io/instance}{"\n"}'
 
-Then disable ALB deletion protection on the Ingress:
+If that returns an application name, check it:
 
-kubectl annotate ingress gg-poc-dev-alb-resident \
-  -n alb-resident \
-  alb.ingress.kubernetes.io/load-balancer-attributes='deletion_protection.enabled=false' \
-  --overwrite
+kubectl get application <APP_NAME> -n argocd
 
-Check that it changed:
+Then, since this entire old cluster is being retired, delete that monitor Argo Application:
 
-kubectl get ingress gg-poc-dev-alb-resident \
-  -n alb-resident \
-  -o jsonpath='{.metadata.annotations.alb\.ingress\.kubernetes\.io/load-balancer-attributes}{"\n"}'
-
-Expected:
-
-deletion_protection.enabled=false
-
-Give the AWS Load Balancer Controller roughly 30–60 seconds to reconcile it.
-
-Because you already issued the delete request, it may disappear automatically after the controller disables protection and deletes the ALB.
-
-Check:
-
-kubectl get ingress gg-poc-dev-alb-resident -n alb-resident
-
-If it still exists after a minute, run the delete once more:
-
-kubectl delete ingress gg-poc-dev-alb-resident \
-  -n alb-resident \
+kubectl delete application <APP_NAME> \
+  -n argocd \
   --wait=true
 
-Then:
+That is better than manually deleting gg-monitor again because Argo cascade deletion removes the monitor resources and stops self-healing them back.
+
+Afterward:
 
 kubectl get ingress -A
+
+We want zero old GoldenGate ALB Ingresses.
+
+If the first jsonpath command returns nothing, send me:
+
+kubectl get ingress gg-monitor -n goldengate-monitoring -o yaml
+
+or at least:
+
+kubectl get applications -n argocd | grep -i monitor
