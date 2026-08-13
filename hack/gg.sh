@@ -1,33 +1,41 @@
-For now, finish the monitor cleanly
+Do this first
 
-First find the Argo Application owning it:
-
-kubectl get ingress gg-monitor \
-  -n goldengate-monitoring \
-  -o jsonpath='{.metadata.labels.argocd\.argoproj\.io/instance}{"\n"}'
-
-If that returns an application name, check it:
-
-kubectl get application <APP_NAME> -n argocd
-
-Then, since this entire old cluster is being retired, delete that monitor Argo Application:
-
-kubectl delete application <APP_NAME> \
-  -n argocd \
-  --wait=true
-
-That is better than manually deleting gg-monitor again because Argo cascade deletion removes the monitor resources and stops self-healing them back.
-
-Afterward:
+Give it another minute or two and run:
 
 kubectl get ingress -A
 
-We want zero old GoldenGate ALB Ingresses.
+If it disappears:
 
-If the first jsonpath command returns nothing, send me:
+No resources found
 
-kubectl get ingress gg-monitor -n goldengate-monitoring -o yaml
+then ALB Kubernetes cleanup is complete and we move directly to EFS.
 
-or at least:
+You can also watch it:
 
-kubectl get applications -n argocd | grep -i monitor
+kubectl get ingress gg-monitor \
+  -n goldengate-monitoring \
+  -w
+
+When it finally returns/deletes, Ctrl+C.
+
+If it is still there after ~5 minutes
+
+Then don't force-delete the finalizer. Check the AWS Load Balancer Controller.
+
+First:
+
+kubectl get pods -n kube-system \
+  | grep aws-load-balancer-controller
+
+Then:
+
+kubectl logs \
+  -n kube-system \
+  deployment/aws-load-balancer-controller \
+  --since=15m \
+  | grep -Ei 'gg-poc-dev-alb|gg-monitor|error|accessdenied|delete|reconcile'
+
+Also:
+
+kubectl describe ingress gg-monitor \
+  -n goldengate-monitoring
