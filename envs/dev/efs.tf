@@ -16,9 +16,48 @@ data "aws_security_group" "goldengate_efs_shared" {
   }
 }
 
-# One approved-module instance per managed-mode runtime deployment, keyed by deployment ID -- module.goldengate_runtime_efs["gg-a"] and module.goldengate_runtime_efs["gg-b"] are two dedicated filesystems even though both live in this one Terraform state. `name` is the deterministic creation token; the approved module's v1.0.0 source has been manually verified to set `creation_token = var.name`, so this is an exact, verified contract, not an assumption. THROUGHPUT CONTRACT WARNING: v1.0.0 does NOT pass throughput_mode straight through to the AWS API -- its verified resource code is `throughput_mode = (var.throughput_mode == "enhanced" ? "elastic" : "bursting")`, so the module INPUT "enhanced" is what produces the AWS EFS API value "elastic" (any other input, including the raw AWS value "elastic" itself, falls through to "bursting"); this exact input/output pair is proven by the real existing filesystem fs-05cadf3570f23cd39 ("gg-poc-dev-efs", AWS-reported Performance mode=General Purpose / Throughput mode=Elastic), created by this same module with performance_mode="generalPurpose"/throughput_mode="enhanced". Do NOT replace "enhanced" below with the raw AWS value "elastic" without re-reading the module's actual resource code first -- v1.0.0 also has no provisioned-throughput branch, so "provisioned" is not a valid input either.
+# Explicit, narrowly-scoped OLD-ENVIRONMENT EFS decommission control -- NEVER derived from lifecycle.state. lifecycle.state=absent by itself always retains managed EFS (see local.goldengate_managed_efs_deployments's own comment); an ID may be added here ONLY after its workload/PVC/access-point cleanup has been independently verified. Removing an ID later makes its managed EFS desired again, so Terraform recreates it (e.g. in the replacement VPC/EKS environment) without reconstructing the runtime descriptor.
+locals {
+  goldengate_managed_efs_decommission_ids = toset([
+    "gg-postgresql-repltest-01",
+    "gg-mssql-repltest-01",
+  ])
+
+  goldengate_managed_efs_desired_deployments = {
+    for id, v in local.goldengate_managed_efs_deployments : id => v
+    if !contains(local.goldengate_managed_efs_decommission_ids, id)
+  }
+}
+
+# Fail-closed guard for the decommission set above: an ID that isn't a real managed-EFS deployment is very likely a typo about to silently no-op instead of decommissioning the intended filesystem; each decommissioned ID must also be a genuinely retired runtime (lifecycle.state=absent, replication.enabled=false), never an active one.
+resource "terraform_data" "goldengate_managed_efs_decommission_contract" {
+  input = local.goldengate_managed_efs_decommission_ids
+
+  lifecycle {
+    precondition {
+      condition     = length(setsubtract(local.goldengate_managed_efs_decommission_ids, keys(local.goldengate_managed_efs_deployments))) == 0
+      error_message = "envs/dev/efs.tf: goldengate_managed_efs_decommission_ids contains a deployment ID that is not a current managed-EFS deployment -- refusing to silently no-op an intended EFS decommission."
+    }
+    precondition {
+      condition = alltrue([
+        for id in local.goldengate_managed_efs_decommission_ids :
+        try(local.goldengate_runtime_documents[id].lifecycle.state, "active") == "absent"
+      ])
+      error_message = "envs/dev/efs.tf: every deployment ID in goldengate_managed_efs_decommission_ids must have lifecycle.state=absent -- refusing to decommission managed EFS for a deployment that is still active."
+    }
+    precondition {
+      condition = alltrue([
+        for id in local.goldengate_managed_efs_decommission_ids :
+        try(local.goldengate_runtime_documents[id].replication.enabled, true) == false
+      ])
+      error_message = "envs/dev/efs.tf: every deployment ID in goldengate_managed_efs_decommission_ids must have replication.enabled=false -- refusing to decommission managed EFS while replication is declared enabled."
+    }
+  }
+}
+
+# One approved-module instance per managed-mode runtime deployment EXCLUDING the explicit decommission set above, keyed by deployment ID -- module.goldengate_runtime_efs["gg-a"] and module.goldengate_runtime_efs["gg-b"] are two dedicated filesystems even though both live in this one Terraform state. `name` is the deterministic creation token; the approved module's v1.0.0 source has been manually verified to set `creation_token = var.name`, so this is an exact, verified contract, not an assumption. THROUGHPUT CONTRACT WARNING: v1.0.0 does NOT pass throughput_mode straight through to the AWS API -- its verified resource code is `throughput_mode = (var.throughput_mode == "enhanced" ? "elastic" : "bursting")`, so the module INPUT "enhanced" is what produces the AWS EFS API value "elastic" (any other input, including the raw AWS value "elastic" itself, falls through to "bursting"); this exact input/output pair is proven by the real existing filesystem fs-05cadf3570f23cd39 ("gg-poc-dev-efs", AWS-reported Performance mode=General Purpose / Throughput mode=Elastic), created by this same module with performance_mode="generalPurpose"/throughput_mode="enhanced". Do NOT replace "enhanced" below with the raw AWS value "elastic" without re-reading the module's actual resource code first -- v1.0.0 also has no provisioned-throughput branch, so "provisioned" is not a valid input either.
 module "goldengate_runtime_efs" {
-  for_each = local.goldengate_managed_efs_deployments
+  for_each = local.goldengate_managed_efs_desired_deployments
   source   = "git::https://github.com/AbuDhabiCommercialBank/aws-tf-module-efs?ref=v1.0.0"
 
   name             = each.value.creation_token
