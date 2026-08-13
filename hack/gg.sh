@@ -1,50 +1,16 @@
-Run these first
-kubectl get pods -n goldengate-dev
+So right now, only do these 5 commands
+kubectl delete ingress gg-monitor -n goldengate-monitoring --wait=true
 
-Then:
+kubectl delete ingress argocd-server-ingress -n argocd --wait=true
+
+kubectl delete ingress gg-poc-dev-alb-resident -n alb-resident --wait=true
 
 kubectl get ingress -A
 
-AWS specifically recommends removing load-balancer-backed Ingress/Service resources before destroying EKS; otherwise the ALB can remain orphaned and block VPC deletion.
-
-Then:
-
-kubectl get pvc -n goldengate-dev
-
 and:
 
-kubectl get pv
+kubectl get pv pvc-0c5458bc-a019-4e9e-b734-2f16b6b24c6f \
+  -o jsonpath='{.spec.csi.volumeHandle}{"\n"}'
 
-Look particularly for anything related to:
-
-gg-postgresql-repltest-01-u02
-gg-mssql-repltest-01-u02
-
-and StorageClasses similar to:
-
-gg-efs-dev-gg-postgresql-repltest-01
-gg-efs-dev-gg-mssql-repltest-01
-
-Finally, if you have AWS CLI access:
-
-aws efs describe-access-points \
-  --file-system-id fs-09bb3373f132d01b0 \
-  --region eu-west-1 \
-  --query 'AccessPoints[].{AccessPointId:AccessPointId,State:LifeCycleState,Path:RootDirectory.Path}' \
-  --output table
-aws efs describe-access-points \
-  --file-system-id fs-03d4beaa58f19be78 \
-  --region eu-west-1 \
-  --query 'AccessPoints[].{AccessPointId:AccessPointId,State:LifeCycleState,Path:RootDirectory.Path}' \
-  --output table
-
-And mount targets:
-
-aws efs describe-mount-targets \
-  --file-system-id fs-09bb3373f132d01b0 \
-  --region eu-west-1 \
-  --output table
-aws efs describe-mount-targets \
-  --file-system-id fs-03d4beaa58f19be78 \
-  --region eu-west-1 \
-  --output table
+kubectl get pv pvc-5a38a1af-f8dd-4868-aef3-9b83e110fc26 \
+  -o jsonpath='{.spec.csi.volumeHandle}{"\n"}'
