@@ -1,41 +1,22 @@
-Do this first
-
-Give it another minute or two and run:
-
-kubectl get ingress -A
-
-If it disappears:
-
-No resources found
-
-then ALB Kubernetes cleanup is complete and we move directly to EFS.
-
-You can also watch it:
+Run this to confirm the current state:
 
 kubectl get ingress gg-monitor \
   -n goldengate-monitoring \
-  -w
+  -o jsonpath='{.metadata.deletionTimestamp}{"\n"}{.metadata.finalizers}{"\n"}'
 
-When it finally returns/deletes, Ctrl+C.
-
-If it is still there after ~5 minutes
-
-Then don't force-delete the finalizer. Check the AWS Load Balancer Controller.
-
-First:
-
-kubectl get pods -n kube-system \
-  | grep aws-load-balancer-controller
-
-Then:
+Then get every security-group reference the controller has logged:
 
 kubectl logs \
   -n kube-system \
   deployment/aws-load-balancer-controller \
-  --since=15m \
-  | grep -Ei 'gg-poc-dev-alb|gg-monitor|error|accessdenied|delete|reconcile'
+  --since=30m \
+  | grep -Eo 'sg-[0-9a-f]+' \
+  | sort -u
 
-Also:
+Also check whether the controller has a configured backend SG:
 
-kubectl describe ingress gg-monitor \
-  -n goldengate-monitoring
+kubectl get deployment aws-load-balancer-controller \
+  -n kube-system \
+  -o jsonpath='{.spec.template.spec.containers[0].args}' \
+  | tr ' ' '\n' \
+  | grep -Ei 'security-group|backend'
