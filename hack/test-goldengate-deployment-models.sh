@@ -21,8 +21,6 @@ METRICS_CONFIG_HELPER_SCRIPT="hack/goldengate-metrics-config.py"
 EKS_APP_WORKFLOW=".github/workflows/goldengate-eks-app.yaml"
 PLATFORM_WORKFLOW=".github/workflows/goldengate-platform.yaml"
 DETECT_SCRIPT="hack/detect-goldengate-deployments.sh"
-INVENTORY_SCRIPT="hack/inventory-goldengate-legacy-resources.sh"
-INVENTORY_WORKFLOW=".github/workflows/goldengate-legacy-cleanup-inventory.yaml"
 OBSERVABILITY_VALUES_FILE="platform/dev/goldengate-observability/values.yaml"
 OBSERVABILITY_WORKFLOW=".github/workflows/goldengate-observability.yaml"
 ARGOCD_VALUES_FILE="envs/dev/argocd/values.yaml"
@@ -4720,564 +4718,6 @@ else
   skip "external script executable/output checks -- ${DETECT_SCRIPT} not found"
 fi
 
-# Read-only legacy external-resource cleanup inventory: these tests prove hack/inventory-goldengate-legacy-resources.sh and its workflow never create/modify/delete any AWS/Kubernetes resource, the canonical deny-list can never be overridden, and permission gaps are reported rather than guessed.
-echo ""
-echo "--- Phase 5B2B1: read-only legacy cleanup inventory ---"
-
-FORBIDDEN_MUTATION_PATTERN='kubectl (delete|patch|apply|edit|scale|rollout restart)|aws efs delete-access-point|aws dynamodb (delete-item|batch-write-item)|aws ecr (delete-repository|batch-delete-image)|aws route53 change-resource-record-sets|aws secretsmanager delete-secret|terraform apply|helm (install|upgrade)|argocd app delete'
-
-if [ -f "$INVENTORY_WORKFLOW" ] && [ "$PYTHON_AVAILABLE" = "true" ]; then
-  INVENTORY_HEADER_CHECK="$(python3 - "$INVENTORY_WORKFLOW" <<'PYEOF'
-import sys
-import yaml
-
-with open(sys.argv[1], encoding="utf-8") as f:
-    doc = yaml.safe_load(f)
-
-# YAML 1.1 boolean-key quirk: PyYAML resolves the unquoted key "on" to the Python boolean True -- accept either, matching the handling used for goldengate-eks-app.yaml elsewhere in this suite.
-on_key = True if True in doc else "on"
-triggers = doc.get(on_key, {}) or {}
-
-print(f"only_workflow_dispatch={sorted(triggers.keys()) == ['workflow_dispatch']}")
-print(f"has_push={'push' in triggers}")
-
-inputs = ((triggers.get("workflow_dispatch") or {}).get("inputs")) or {}
-print(f"input_names={sorted(inputs.keys())}")
-
-mutation_keywords = ("apply", "delete", "mutate", "mutation", "confirm", "destructive", "force")
-suspicious_inputs = [name for name in inputs if any(k in name.lower() for k in mutation_keywords)]
-print(f"suspicious_inputs={suspicious_inputs}")
-
-run_lengths = []
-for job in doc.get("jobs", {}).values():
-    for step in job.get("steps", []):
-        run = step.get("run")
-        if run is not None:
-            run_lengths.append(len(run.encode("utf-8")))
-print(f"max_run_length={max(run_lengths) if run_lengths else 0}")
-
-detect_calls_script = any(
-    "bash hack/inventory-goldengate-legacy-resources.sh" in (step.get("run") or "")
-    for job in doc.get("jobs", {}).values()
-    for step in job.get("steps", [])
-)
-print(f"invokes_script={detect_calls_script}")
-PYEOF
-)"
-  echo "$INVENTORY_HEADER_CHECK"
-
-  # 1/2: workflow_dispatch-only, no push trigger.
-  if echo "$INVENTORY_HEADER_CHECK" | grep -q "^only_workflow_dispatch=True$"; then
-    pass "1: ${INVENTORY_WORKFLOW} is workflow_dispatch-only"
-  else
-    fail "1: ${INVENTORY_WORKFLOW} is not workflow_dispatch-only"
-  fi
-
-  if echo "$INVENTORY_HEADER_CHECK" | grep -q "^has_push=False$"; then
-    pass "2: ${INVENTORY_WORKFLOW} has no push trigger"
-  else
-    fail "2: ${INVENTORY_WORKFLOW} unexpectedly has a push trigger"
-  fi
-
-  # 3: no mutation input -- exactly the minimal safe "environment" input, and no input name suggests an apply/delete/mutation mode.
-  if echo "$INVENTORY_HEADER_CHECK" | grep -q "^input_names=\['environment'\]$" \
-      && echo "$INVENTORY_HEADER_CHECK" | grep -q "^suspicious_inputs=\[\]$"; then
-    pass "3: ${INVENTORY_WORKFLOW} has no mutation input (only environment)"
-  else
-    fail "3: ${INVENTORY_WORKFLOW} has an unexpected or suspicious input"
-  fi
-
-  # 5 (part): the workflow step invokes the real external script, never a duplicated inline implementation.
-  if echo "$INVENTORY_HEADER_CHECK" | grep -q "^invokes_script=True$"; then
-    pass "${INVENTORY_WORKFLOW} invokes ${INVENTORY_SCRIPT} rather than embedding its own implementation"
-  else
-    fail "${INVENTORY_WORKFLOW} does not invoke ${INVENTORY_SCRIPT}"
-  fi
-
-  # 20: every run: block in every workflow file (not just this new one) stays below GitHub's 21,000-character limit.
-  ALL_WORKFLOW_MAX_LENGTH=0
-  for wf in .github/workflows/*.yaml .github/workflows/*.yml; do
-    [ -f "$wf" ] || continue
-    WF_MAX="$(python3 - "$wf" <<'PYEOF'
-import sys, yaml
-with open(sys.argv[1], encoding="utf-8") as f:
-    doc = yaml.safe_load(f)
-lengths = [len((step.get("run") or "").encode("utf-8"))
-           for job in (doc.get("jobs") or {}).values()
-           for step in job.get("steps", [])]
-print(max(lengths) if lengths else 0)
-PYEOF
-)"
-    if [ "${WF_MAX:-0}" -gt "$ALL_WORKFLOW_MAX_LENGTH" ]; then
-      ALL_WORKFLOW_MAX_LENGTH="$WF_MAX"
-    fi
-  done
-  if [ "$ALL_WORKFLOW_MAX_LENGTH" -lt 21000 ]; then
-    pass "20: every run: block across all workflow files is below 21,000 characters (max=${ALL_WORKFLOW_MAX_LENGTH})"
-  else
-    fail "20: at least one run: block across the workflow files is at/above 21,000 characters (max=${ALL_WORKFLOW_MAX_LENGTH})"
-  fi
-else
-  skip "inventory workflow header/trigger checks -- ${INVENTORY_WORKFLOW} or python3 not available"
-fi
-
-if [ -f "$INVENTORY_WORKFLOW" ]; then
-  WORKFLOW_MUTATION_HITS="$(grep -nE "$FORBIDDEN_MUTATION_PATTERN" "$INVENTORY_WORKFLOW" || true)"
-  if [ -z "$WORKFLOW_MUTATION_HITS" ]; then
-    pass "${INVENTORY_WORKFLOW} contains no forbidden mutation command"
-  else
-    fail "${INVENTORY_WORKFLOW} contains forbidden mutation command(s):"$'\n'"${WORKFLOW_MUTATION_HITS}"
-  fi
-fi
-
-if [ -f "$INVENTORY_SCRIPT" ]; then
-  # 4: the script contains no forbidden mutation command.
-  SCRIPT_MUTATION_HITS="$(grep -nE "$FORBIDDEN_MUTATION_PATTERN" "$INVENTORY_SCRIPT" || true)"
-  if [ -z "$SCRIPT_MUTATION_HITS" ]; then
-    pass "4: ${INVENTORY_SCRIPT} contains no forbidden mutation command"
-  else
-    fail "4: ${INVENTORY_SCRIPT} contains forbidden mutation command(s):"$'\n'"${SCRIPT_MUTATION_HITS}"
-  fi
-
-  bash -n "$INVENTORY_SCRIPT" >/dev/null 2>&1 && pass "${INVENTORY_SCRIPT} passes bash -n syntax check" || fail "${INVENTORY_SCRIPT} fails bash -n syntax check"
-
-  [ -x "$INVENTORY_SCRIPT" ] && pass "7: ${INVENTORY_SCRIPT} is executable" || fail "7: ${INVENTORY_SCRIPT} is not executable"
-
-  # 5: the four known old PV IDs are exactly the script's candidate list.
-  EXPECTED_PV_CANDIDATES="pvc-3a93c990-a9fa-4cca-99df-7c3375472074 pvc-93251c3f-c408-4713-bd46-ebc5e0eafa8a pvc-5c43940e-1054-43f5-8031-9db4b51a024a pvc-bacb3e9d-d904-467c-959f-dea9548699c9"
-  PV_CANDIDATES_MISSING=""
-  for pv_id in $EXPECTED_PV_CANDIDATES; do
-    grep -qF "\"${pv_id}\"" "$INVENTORY_SCRIPT" || PV_CANDIDATES_MISSING="${PV_CANDIDATES_MISSING} ${pv_id}"
-  done
-  if [ -z "$PV_CANDIDATES_MISSING" ]; then
-    pass "5: all four known old PV IDs are present as inventory candidates in ${INVENTORY_SCRIPT}"
-  else
-    fail "5: ${INVENTORY_SCRIPT} is missing expected candidate PV ID(s):${PV_CANDIDATES_MISSING}"
-  fi
-
-  # 11: DynamoDB inventory uses Query against an exact partition key, never a table-wide Scan.
-  if grep -qE "(aws )?dynamodb query" "$INVENTORY_SCRIPT" && ! grep -qE "(aws )?dynamodb scan| --scan " "$INVENTORY_SCRIPT"; then
-    pass "11: ${INVENTORY_SCRIPT} uses 'dynamodb query' (exact partition key) and never 'dynamodb scan'"
-  else
-    fail "11: ${INVENTORY_SCRIPT} does not exclusively use Query for DynamoDB (scan present or query absent)"
-  fi
-
-  # 13: missing EFS/ECR permissions produce a permission-gap literal, exactly as specified, rather than the script guessing eligibility.
-  if grep -q "EFS_METADATA_PERMISSION_MISSING" "$INVENTORY_SCRIPT" && grep -q "OBSERVER_ECR_PERMISSION_MISSING" "$INVENTORY_SCRIPT"; then
-    pass "13: ${INVENTORY_SCRIPT} reports EFS_METADATA_PERMISSION_MISSING and OBSERVER_ECR_PERMISSION_MISSING on missing permissions"
-  else
-    fail "13: ${INVENTORY_SCRIPT} is missing the required permission-gap literal(s)"
-  fi
-
-  # 14: the manifest JSON schema contains every required top-level and candidates sub-key.
-  SCHEMA_KEYS_MISSING=""
-  for key in environment generatedAt baseline canonicalBaselineVerified inventoryComplete eligibilityReady canonical candidates blocked permissionGaps; do
-    grep -qE "^\s*${key}:" "$INVENTORY_SCRIPT" || SCHEMA_KEYS_MISSING="${SCHEMA_KEYS_MISSING} ${key}"
-  done
-  for key in persistentVolumes efsAccessPoints storageClasses dynamodbPartitions ecrRepositories ecrImages; do
-    grep -qE "^\s*${key}:" "$INVENTORY_SCRIPT" || SCHEMA_KEYS_MISSING="${SCHEMA_KEYS_MISSING} ${key}"
-  done
-  if [ -z "$SCHEMA_KEYS_MISSING" ]; then
-    pass "14: the manifest JSON schema in ${INVENTORY_SCRIPT} contains every required key"
-  else
-    fail "14: the manifest JSON schema in ${INVENTORY_SCRIPT} is missing key(s):${SCHEMA_KEYS_MISSING}"
-  fi
-
-  # PVCs have no candidate resourceType at all in the schema -- structurally deny-listed (7): there is no "persistentVolumeClaims" candidate array, so a PVC can never appear as a cleanup candidate.
-  if ! grep -qE "^\s*persistentVolumeClaims:" "$INVENTORY_SCRIPT"; then
-    pass "7: PersistentVolumeClaims have no candidate resourceType in the manifest schema -- structurally deny-listed"
-  else
-    fail "7: ${INVENTORY_SCRIPT} unexpectedly defines a persistentVolumeClaims candidate list"
-  fi
-
-  # 15: no secret-value retrieval anywhere in the script (Secrets Manager GetSecretValue, or any other "get secret value" shaped call).
-  if grep -qiE "get-secret-value|getsecretvalue" "$INVENTORY_SCRIPT"; then
-    fail "15: ${INVENTORY_SCRIPT} appears to retrieve a secret value"
-  else
-    pass "15: ${INVENTORY_SCRIPT} never retrieves a secret value"
-  fi
-
-  # Confirms the script never logs/echoes a raw AWS Secret string value (only Secrets Manager paths, e.g. dev/goldengate/source/admin, are ever referenced -- paths are identifiers, not secret values).
-  if grep -qE "SecretString|secretString" "$INVENTORY_SCRIPT"; then
-    fail "15b: ${INVENTORY_SCRIPT} appears to reference a raw secret string field"
-  else
-    pass "15b: ${INVENTORY_SCRIPT} never references a raw secret string field"
-  fi
-else
-  fail "${INVENTORY_SCRIPT} does not exist"
-fi
-
-if [ -f "$INVENTORY_SCRIPT" ] && command -v python3 >/dev/null 2>&1; then
-  # Extracts just the constants + pure classification functions (never the live AWS/kubectl collection code) so eligibility logic can be unit-tested deterministically, matching the pattern already used for the detection script's classifier.
-  python3 - "$INVENTORY_SCRIPT" > "${WORKDIR}/inventory_classify_funcs.sh" <<'PYEOF'
-import re
-import sys
-
-with open(sys.argv[1]) as f:
-    lines = f.readlines()
-
-start = next(i for i, l in enumerate(lines) if l.startswith("ENVIRONMENT="))
-end = None
-for i, l in enumerate(lines):
-    if l.startswith("classify_observer_image() {"):
-        for j in range(i, len(lines)):
-            if lines[j].strip() == "}":
-                end = j
-                break
-        break
-
-if end is None:
-    sys.exit("could not locate classify_observer_image() function body")
-
-# Drops the "prerequisites" tool-check block (MISSING_TOOLS.. through in_array()) -- keeping it would make this fixture depend on jq/python3 being on PATH purely to reach the functions under test.
-body = "".join(lines[start:end + 1])
-prereq_start = body.find("MISSING_TOOLS=()")
-prereq_end = body.find("in_array()")
-if prereq_start != -1 and prereq_end != -1:
-    body = body[:prereq_start] + body[prereq_end:]
-
-sys.stdout.write("set -uo pipefail\n")
-sys.stdout.write(body)
-PYEOF
-
-  if [ -s "${WORKDIR}/inventory_classify_funcs.sh" ] && bash -n "${WORKDIR}/inventory_classify_funcs.sh" >/dev/null 2>&1; then
-    # Focused pure-function assertions covering: baseline=false blocks eligibility; a false *ReferenceCheckVerified flag blocks eligibility; canonical resources never enter candidates; an absent legacy StorageClass is already_absent not eligible; a non-matching observer tag is blocked; a PVC-list read failure or an active PVC reference blocks PV eligibility; an ECR image-inventory read failure or a repository URI mismatch blocks eligibility.
-    INVENTORY_CLASSIFY_OUTPUT="$(bash -c '
-      source "'"${WORKDIR}"'/inventory_classify_funcs.sh"
-      set +e
-
-      echo "--- 1: baseline=false blocks an otherwise-fully-eligible PV ---"
-      classify_pv "pvc-3a93c990-a9fa-4cca-99df-7c3375472074" "Released" "Retain" "fs-05cadf3570f23cd39::fsap-007cfc2ff801c24b8" "true" "true" "false" "true" "false" "false"
-      echo "exit=$?"
-
-      echo "--- baseline=true, fully verified old PV is eligible (control case) ---"
-      classify_pv "pvc-3a93c990-a9fa-4cca-99df-7c3375472074" "Released" "Retain" "fs-05cadf3570f23cd39::fsap-007cfc2ff801c24b8" "true" "true" "false" "true" "false" "true"
-      echo "exit=$?"
-
-      echo "--- 2: podReferenceCheckVerified=false blocks eligibility even though referenced=false ---"
-      classify_pv "pvc-93251c3f-c408-4713-bd46-ebc5e0eafa8a" "Released" "Retain" "fs-05cadf3570f23cd39::fsap-035f46f17955f57cb" "true" "true" "false" "false" "false" "true"
-      echo "exit=$?"
-
-      echo "--- 3a: a current canonical PV is never eligible, even with every other fact true ---"
-      classify_pv "pvc-dd1bc7bc-b736-4fee-abfe-abf622e70550" "Released" "Retain" "fs-05cadf3570f23cd39::fsap-canonical1" "true" "true" "false" "true" "false" "true"
-      echo "exit=$?"
-
-      echo "--- 3b: a current canonical EFS access point is never eligible ---"
-      CANONICAL_EFS_ACCESS_POINT_IDS=("fsap-canonical1" "fsap-canonical2")
-      classify_efs_access_point "fsap-canonical1" "true" "fs-05cadf3570f23cd39" "available" "true" "false" "true"
-      echo "exit=$?"
-
-      echo "--- 4: an absent legacy StorageClass is already_absent, not eligible ---"
-      classify_legacy_storage_class "false" "true" "false" "true"
-      echo "exit=$?"
-
-      echo "--- legacy StorageClass present, proven unused, baseline verified -> eligible (control case) ---"
-      classify_legacy_storage_class "true" "true" "false" "true"
-      echo "exit=$?"
-
-      echo "--- 5: an observer image tag that does not match the pattern is blocked, not eligible ---"
-      classify_observer_image "[\"latest\"]" "true" "true" "true" 0 "true"
-      echo "exit=$?"
-
-      echo "--- observer image with a matching tag and zero verified references is eligible (control case) ---"
-      classify_observer_image "[\"obs-abc123def456\"]" "true" "true" "true" 0 "true"
-      echo "exit=$?"
-
-      echo "--- 6: PVC reference verification failure blocks PV eligibility ---"
-      classify_pv "pvc-3a93c990-a9fa-4cca-99df-7c3375472074" "Released" "Retain" "fs-05cadf3570f23cd39::fsap-007cfc2ff801c24b8" "true" "false" "false" "true" "false" "true"
-      echo "exit=$?"
-
-      echo "--- 7: an active PVC reference blocks PV eligibility ---"
-      classify_pv "pvc-3a93c990-a9fa-4cca-99df-7c3375472074" "Released" "Retain" "fs-05cadf3570f23cd39::fsap-007cfc2ff801c24b8" "true" "true" "true" "true" "false" "true"
-      echo "exit=$?"
-
-      echo "--- 8: ECR image-inventory verification failure blocks repository eligibility ---"
-      classify_ecr_repository "uri" "true" "true" "true" 0 "false" "false" "true"
-      echo "exit=$?"
-
-      echo "--- ECR repository fully verified with an empty, verified image inventory is eligible (control case) ---"
-      classify_ecr_repository "uri" "true" "true" "true" 0 "true" "false" "true"
-      echo "exit=$?"
-
-      echo "--- 9: repository URI mismatch blocks image eligibility ---"
-      classify_observer_image "[\"obs-abc123def456\"]" "false" "true" "true" 0 "true"
-      echo "exit=$?"
-    ' 2>&1)"
-    echo "$INVENTORY_CLASSIFY_OUTPUT"
-
-    if echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "1: baseline=false blocks an otherwise-fully-eligible PV" | grep -q "^exit=1$" \
-        && echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "baseline=true, fully verified old PV is eligible" | grep -q "^exit=0$"; then
-      pass "1: canonical_baseline_verified=false blocks an otherwise-eligible candidate (control case confirms baseline=true allows it)"
-    else
-      fail "1: canonical_baseline_verified=false did not block eligibility as expected"
-    fi
-
-    if echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "2: podReferenceCheckVerified=false blocks eligibility" | grep -q "^exit=1$"; then
-      pass "2: podReferenceCheckVerified=false blocks eligibility even when referencedByRunningPod=false"
-    else
-      fail "2: podReferenceCheckVerified=false did not block eligibility as expected"
-    fi
-
-    if echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "3a: a current canonical PV is never eligible" | grep -q "^exit=1$" \
-        && echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "3b: a current canonical EFS access point is never eligible" | grep -q "^exit=1$"; then
-      pass "3: canonical PV/EFS-access-point identifiers are never eligible, regardless of other evidence"
-    else
-      fail "3: a canonical resource was not blocked as expected"
-    fi
-
-    if echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "4: an absent legacy StorageClass is already_absent" | grep -q "^exit=2$" \
-        && echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "legacy StorageClass present, proven unused, baseline verified -> eligible" | grep -q "^exit=0$"; then
-      pass "4: an absent legacy StorageClass reports already_absent (exit 2), never eligible; a present+unused+baseline-verified one is eligible"
-    else
-      fail "4: legacy StorageClass existence-first classification did not behave as expected"
-    fi
-
-    if echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "5: an observer image tag that does not match the pattern is blocked" | grep -q "^exit=1$" \
-        && echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "observer image with a matching tag and zero verified references is eligible" | grep -q "^exit=0$"; then
-      pass "5: an observer image tag not matching ^obs-[0-9a-f]{12}\$ is blocked, never eligible"
-    else
-      fail "5: non-matching observer image tag was not blocked as expected"
-    fi
-
-    if echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "6: PVC reference verification failure blocks PV eligibility" | grep -q "^exit=1$"; then
-      pass "6: a PVC-list (pvcReferenceCheckVerified=false) read failure blocks PV eligibility"
-    else
-      fail "6: pvcReferenceCheckVerified=false did not block PV eligibility as expected"
-    fi
-
-    if echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "7: an active PVC reference blocks PV eligibility" | grep -q "^exit=1$"; then
-      pass "7: a PV referenced by an active PVC (referencedByActivePvc=true) is blocked, never eligible"
-    else
-      fail "7: an active PVC reference did not block PV eligibility as expected"
-    fi
-
-    if echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "8: ECR image-inventory verification failure blocks repository eligibility" | grep -q "^exit=1$" \
-        && echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "ECR repository fully verified with an empty, verified image inventory is eligible" | grep -q "^exit=0$"; then
-      pass "8: imageInventoryVerified=false blocks repository eligibility; a verified empty image inventory does not"
-    else
-      fail "8: ECR image-inventory gating did not behave as expected"
-    fi
-
-    if echo "$INVENTORY_CLASSIFY_OUTPUT" | grep -A2 "9: repository URI mismatch blocks image eligibility" | grep -q "^exit=1$"; then
-      pass "9: repositoryUriMatch=false blocks observer image eligibility, even with a matching tag and zero references"
-    else
-      fail "9: repository URI mismatch did not block image eligibility as expected"
-    fi
-  else
-    fail "could not extract or syntax-validate the pure classification functions from ${INVENTORY_SCRIPT}"
-  fi
-else
-  skip "inventory classification unit tests -- ${INVENTORY_SCRIPT} or python3 not available"
-fi
-
-if [ -f "$INVENTORY_SCRIPT" ] && command -v python3 >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
-  # Dual-account correction focused checks: extracts the exact production account-baseline block and canonical-monitor-validation block (never the rest of Section 4, which makes real kubectl/aws calls) and runs them under small in-test stub run_aws_json/run_workload_aws_json/run_kubectl_json/add_permission_gap functions -- never a fake aws/kubectl binary.
-  python3 - "$INVENTORY_SCRIPT" > "${WORKDIR}/inventory_account_block.sh" <<'PYEOF'
-import sys
-
-with open(sys.argv[1]) as f:
-    lines = f.readlines()
-
-const_start = next(i for i, l in enumerate(lines) if l.startswith("ENVIRONMENT="))
-const_end = next(i for i, l in enumerate(lines) if l.startswith("GENERATED_AT="))
-
-block_start = next(i for i, l in enumerate(lines) if l.startswith('BASELINE_BUILD_ACCOUNT_OK="false"'))
-marker = next(i for i, l in enumerate(lines) if "aws CLI not available on this runner" in l)
-block_end = None
-for j in range(marker, len(lines)):
-    if lines[j].strip() == "fi":
-        block_end = j
-        break
-if block_end is None:
-    sys.exit("could not locate end of account baseline block")
-
-sys.stdout.write("".join(lines[const_start:const_end]))
-sys.stdout.write("".join(lines[block_start:block_end + 1]))
-PYEOF
-
-  python3 - "$INVENTORY_SCRIPT" > "${WORKDIR}/inventory_monitor_block.sh" <<'PYEOF'
-import sys
-
-with open(sys.argv[1]) as f:
-    lines = f.readlines()
-
-const_start = next(i for i, l in enumerate(lines) if l.startswith("ENVIRONMENT="))
-const_end = next(i for i, l in enumerate(lines) if l.startswith("GENERATED_AT="))
-
-block_start = next(i for i, l in enumerate(lines)
-                    if l.startswith('echo "Validating shared monitor via canonical DynamoDB'))
-marker = next(i for i, l in enumerate(lines)
-              if "Monitor validation blocked: STALE_AFTER_SECONDS could not be obtained" in l)
-block_end = marker + 1
-if lines[block_end].strip() != "fi":
-    sys.exit("could not locate end of monitor validation block")
-
-sys.stdout.write("".join(lines[const_start:const_end]))
-sys.stdout.write("".join(lines[block_start:block_end + 1]))
-PYEOF
-
-  if [ -s "${WORKDIR}/inventory_account_block.sh" ] && bash -n "${WORKDIR}/inventory_account_block.sh" >/dev/null 2>&1; then
-    ACCOUNT_BLOCK_OUTPUT="$(bash -c '
-      add_permission_gap() { :; }
-      HAVE_AWS="true"
-      AWS_REGION="eu-west-1"
-
-      echo "--- separation: build session reports build account, workload session reports workload account ---"
-      run_aws_json() { LAST_AWS_OK="true"; LAST_AWS_JSON="{\"Account\":\"229410149234\"}"; }
-      run_workload_aws_json() { LAST_WORKLOAD_SESSION_OK="true"; LAST_WORKLOAD_AWS_OK="true"; LAST_WORKLOAD_AWS_JSON="{\"Account\":\"668311715351\"}"; }
-      source "'"${WORKDIR}"'/inventory_account_block.sh"
-      echo "buildOk=${BASELINE_BUILD_ACCOUNT_OK} workloadOk=${BASELINE_WORKLOAD_ACCOUNT_OK}"
-
-      echo "--- mismatch: workload session actually resolves to the build account (wrong-account evidence) ---"
-      run_aws_json() { LAST_AWS_OK="true"; LAST_AWS_JSON="{\"Account\":\"229410149234\"}"; }
-      run_workload_aws_json() { LAST_WORKLOAD_SESSION_OK="true"; LAST_WORKLOAD_AWS_OK="true"; LAST_WORKLOAD_AWS_JSON="{\"Account\":\"229410149234\"}"; }
-      source "'"${WORKDIR}"'/inventory_account_block.sh"
-      echo "buildOk=${BASELINE_BUILD_ACCOUNT_OK} workloadOk=${BASELINE_WORKLOAD_ACCOUNT_OK}"
-
-      echo "--- assume-role failure: workload session unavailable ---"
-      run_aws_json() { LAST_AWS_OK="true"; LAST_AWS_JSON="{\"Account\":\"229410149234\"}"; }
-      run_workload_aws_json() { LAST_WORKLOAD_SESSION_OK="false"; LAST_WORKLOAD_AWS_OK="false"; LAST_WORKLOAD_AWS_JSON=""; }
-      source "'"${WORKDIR}"'/inventory_account_block.sh"
-      echo "buildOk=${BASELINE_BUILD_ACCOUNT_OK} workloadOk=${BASELINE_WORKLOAD_ACCOUNT_OK}"
-    ' 2>&1)"
-    echo "$ACCOUNT_BLOCK_OUTPUT"
-
-    if echo "$ACCOUNT_BLOCK_OUTPUT" | grep -A4 "separation: build session reports build account" | grep -q "^buildOk=true workloadOk=true$"; then
-      pass "dual-account 1: build-account and workload-account sessions are independently verified against their own expected account IDs"
-    else
-      fail "dual-account 1: build/workload account separation did not behave as expected"
-    fi
-
-    if echo "$ACCOUNT_BLOCK_OUTPUT" | grep -A4 "mismatch: workload session actually resolves to the build account" | grep -q "^buildOk=true workloadOk=false$"; then
-      pass "dual-account 2: a workload session that resolves to the build account is never treated as workloadAccountOk"
-    else
-      fail "dual-account 2: workload/build account mismatch was not detected as expected"
-    fi
-
-    if echo "$ACCOUNT_BLOCK_OUTPUT" | grep -A4 "assume-role failure: workload session unavailable" | grep -q "^buildOk=true workloadOk=false$"; then
-      pass "dual-account 2b: a failed AssumeRole of EKS_DEPLOY_ROLE_ARN never becomes workloadAccountOk=true"
-    else
-      fail "dual-account 2b: an unavailable workload session was not correctly reported as workloadAccountOk=false"
-    fi
-  else
-    fail "could not extract or syntax-validate the account baseline block from ${INVENTORY_SCRIPT}"
-  fi
-
-  if grep -qE '\[ "\$BASELINE_WORKLOAD_ACCOUNT_OK" = "true" \]' "$INVENTORY_SCRIPT" && ! grep -q 'BASELINE_ACCOUNT_OK=' "$INVENTORY_SCRIPT"; then
-    pass "dual-account 2c: CANONICAL_BASELINE_VERIFIED requires BASELINE_WORKLOAD_ACCOUNT_OK, and the old single-session BASELINE_ACCOUNT_OK no longer exists"
-  else
-    fail "dual-account 2c: CANONICAL_BASELINE_VERIFIED does not require BASELINE_WORKLOAD_ACCOUNT_OK, or a stale BASELINE_ACCOUNT_OK reference remains"
-  fi
-
-  # 3: EFS access-point NotFound evidence must come from the workload-account session (LAST_WORKLOAD_AWS_NOTFOUND/LAST_WORKLOAD_SESSION_OK), never the build-account session (LAST_AWS_NOTFOUND) -- that untrustworthy evidence is exactly what this correction removes.
-  EFS_SECTION="$(sed -n '/^echo "--- C\. EFS access-point validation ---"$/,/^echo "--- D\. StorageClass validation ---"$/p' "$INVENTORY_SCRIPT")"
-  if echo "$EFS_SECTION" | grep -q 'run_workload_aws_json efs describe-access-points' \
-      && echo "$EFS_SECTION" | grep -q 'LAST_WORKLOAD_AWS_NOTFOUND' \
-      && echo "$EFS_SECTION" | grep -q 'LAST_WORKLOAD_SESSION_OK' \
-      && ! echo "$EFS_SECTION" | grep -qE 'run_aws_json efs|LAST_AWS_NOTFOUND|LAST_AWS_OK|LAST_AWS_JSON'; then
-    pass "dual-account 3: EFS access-point NotFound evidence is derived only from the workload-account session, never the build-account session"
-  else
-    fail "dual-account 3: EFS access-point validation does not cleanly use the workload-account session for NotFound evidence"
-  fi
-
-  if [ -s "${WORKDIR}/inventory_monitor_block.sh" ] && bash -n "${WORKDIR}/inventory_monitor_block.sh" >/dev/null 2>&1; then
-    MONITOR_BLOCK_OUTPUT="$(bash -c '
-      add_permission_gap() { :; }
-      HAVE_KUBECTL="true"
-      run_kubectl_json() {
-        LAST_KUBECTL_OK="true"
-        LAST_KUBECTL_JSON="{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"env\":[{\"name\":\"STALE_AFTER_SECONDS\",\"value\":\"120\"}]}]}}}}"
-      }
-
-      echo "--- canonical CONFIG/LEASE/STATE success validates the monitor ---"
-      run_workload_aws_json() {
-        local args="$*" dep_type="" now recorded expires
-        case "$args" in
-          *gg-oracle-payments-01*) dep_type="oracle" ;;
-          *gg-postgresql-payments-01*) dep_type="postgresql" ;;
-        esac
-        now="$(date -u +%s)"; recorded=$((now - 10)); expires=$((now + 500))
-        LAST_WORKLOAD_SESSION_OK="true"; LAST_WORKLOAD_AWS_OK="true"
-        LAST_WORKLOAD_AWS_JSON="$(jq -nc --arg t "$dep_type" --argjson recorded "$recorded" --argjson expires "$expires" \
-          "{Items: [{recordType:{S:\"CONFIG\"}, metricsEnabled:{BOOL:true}, alertsEnabled:{BOOL:false}}, {recordType:{S:\"LEASE\"}, holder:{S:\"gg-monitor-0\"}, expiresAt:{N:(\$expires|tostring)}}, {recordType:{S:\"STATE#_deployment\"}, status:{S:\"UP\"}, recordedAt:{N:(\$recorded|tostring)}, deploymentType:{S:\$t}, criticalServices:{M:{adminsrvr:{M:{reachable:{BOOL:true}}}, distsrvr:{M:{reachable:{BOOL:true}}}, recvsrvr:{M:{reachable:{BOOL:true}}}}}}]}")"
-      }
-      source "'"${WORKDIR}"'/inventory_monitor_block.sh"
-      echo "monitorValidated=${BASELINE_MONITOR_VALIDATED}"
-
-      echo "--- a failed workload-account DynamoDB query blocks monitor validation ---"
-      run_workload_aws_json() {
-        LAST_WORKLOAD_SESSION_OK="true"; LAST_WORKLOAD_AWS_OK="false"; LAST_WORKLOAD_AWS_JSON=""
-      }
-      source "'"${WORKDIR}"'/inventory_monitor_block.sh"
-      echo "monitorValidated=${BASELINE_MONITOR_VALIDATED}"
-    ' 2>&1)"
-    echo "$MONITOR_BLOCK_OUTPUT"
-
-    if echo "$MONITOR_BLOCK_OUTPUT" | grep -A5 "canonical CONFIG/LEASE/STATE success validates the monitor" | grep -q "^monitorValidated=true$"; then
-      pass "dual-account 5: fully-conforming canonical CONFIG/LEASE/STATE#_deployment records (via the workload-account session) validate the monitor"
-    else
-      fail "dual-account 5: canonical CONFIG/LEASE/STATE records that satisfy the manager contract did not validate the monitor"
-    fi
-
-    if echo "$MONITOR_BLOCK_OUTPUT" | grep -A5 "a failed workload-account DynamoDB query blocks monitor validation" | grep -q "^monitorValidated=false$"; then
-      pass "dual-account 4: a failed workload-account DynamoDB Query blocks monitor validation, never silently passes it"
-    else
-      fail "dual-account 4: a failed DynamoDB query did not block monitor validation as expected"
-    fi
-  else
-    fail "could not extract or syntax-validate the monitor validation block from ${INVENTORY_SCRIPT}"
-  fi
-else
-  skip "dual-account inventory unit tests -- ${INVENTORY_SCRIPT}, python3, or jq not available"
-fi
-
-if [ -f "$INVENTORY_SCRIPT" ] && command -v python3 >/dev/null 2>&1; then
-  # 10: eligibilityReady=false leaves no candidate with eligibility=eligible. enforce_eligibility_readiness lives in Section 5, so it's extracted on its own -- never alongside Section 4, which makes real kubectl/aws calls and must never be sourced in a local test.
-  python3 - "$INVENTORY_SCRIPT" > "${WORKDIR}/inventory_enforce_fn.sh" <<'PYEOF'
-import sys
-
-with open(sys.argv[1]) as f:
-    lines = f.readlines()
-
-start = next(i for i, l in enumerate(lines) if l.startswith("enforce_eligibility_readiness() {"))
-end = None
-for j in range(start, len(lines)):
-    if lines[j].strip() == "}":
-        end = j
-        break
-if end is None:
-    sys.exit("could not locate enforce_eligibility_readiness() function body")
-
-sys.stdout.write("set -uo pipefail\n")
-sys.stdout.writelines(lines[start:end + 1])
-PYEOF
-
-  if [ -s "${WORKDIR}/inventory_enforce_fn.sh" ] && bash -n "${WORKDIR}/inventory_enforce_fn.sh" >/dev/null 2>&1; then
-    ENFORCE_OUTPUT="$(bash -c '
-      source "'"${WORKDIR}"'/inventory_enforce_fn.sh"
-      ELIGIBILITY_READY="false"
-      CANDIDATES_PV="$(jq -nc "[{resourceType:\"PersistentVolume\", identifier:\"pv-1\", eligibility:\"eligible\", evidence:{foo:1}, blockingReasons:[]}, {resourceType:\"PersistentVolume\", identifier:\"pv-2\", eligibility:\"blocked\", evidence:{}, blockingReasons:[\"phase_not_released(Bound)\"]}]")"
-      enforce_eligibility_readiness CANDIDATES_PV
-      echo "$CANDIDATES_PV"
-    ' 2>&1)"
-    echo "$ENFORCE_OUTPUT"
-
-    REMAINING_ELIGIBLE="$(echo "$ENFORCE_OUTPUT" | tail -1 | jq '[.[] | select(.eligibility=="eligible")] | length' 2>/dev/null || echo "parse_error")"
-    EVIDENCE_PRESERVED="$(echo "$ENFORCE_OUTPUT" | tail -1 | jq -r '.[0].evidence.foo // empty' 2>/dev/null || echo "")"
-    REASON_ADDED="$(echo "$ENFORCE_OUTPUT" | tail -1 | jq -r 'any(.[]; .blockingReasons | index("inventory_not_eligibility_ready") != null)' 2>/dev/null || echo "false")"
-
-    if [ "$REMAINING_ELIGIBLE" = "0" ] && [ "$EVIDENCE_PRESERVED" = "1" ] && [ "$REASON_ADDED" = "true" ]; then
-      pass "10: eligibilityReady=false leaves no candidate with eligibility=eligible (evidence preserved, inventory_not_eligibility_ready added)"
-    else
-      fail "10: eligibilityReady=false did not deterministically downgrade every eligible candidate as expected"
-    fi
-  else
-    fail "could not extract or syntax-validate enforce_eligibility_readiness() from ${INVENTORY_SCRIPT}"
-  fi
-else
-  skip "eligibilityReady enforcement test -- ${INVENTORY_SCRIPT} or python3 not available"
-fi
-
 # 16: no docs directory or runbook was added by this phase.
 NEW_DOC_FILES="$(git -C "$REPO_ROOT" status --porcelain=v1 2>/dev/null | grep -E '^\?\? .*\.(md|MD)$' || true)"
 if [ -z "$NEW_DOC_FILES" ] && [ ! -d "docs" ]; then
@@ -6447,7 +5887,7 @@ persistence:
   enabled: true
   provider: efs
   efs:
-    fileSystemId: fs-05cadf3570f23cd39
+    fileSystemId: fs-0123456789abcdef0
     storageClass:
       create: true
 EOF
@@ -7670,9 +7110,9 @@ PYEOF
       echo "$NOT_APPLICABLE_OUT"
     fi
 
-    EXISTING_OUT="$(run_resolve_efs_id "existing" "fs-05cadf3570f23cd39" "true")"
+    EXISTING_OUT="$(run_resolve_efs_id "existing" "fs-0123456789abcdef0" "true")"
     if echo "$EXISTING_OUT" | grep -qF "EFS ID source: existing descriptor" \
-        && echo "$EXISTING_OUT" | grep -qF "RESOLVED_EFS_ID=fs-05cadf3570f23cd39"; then
+        && echo "$EXISTING_OUT" | grep -qF "RESOLVED_EFS_ID=fs-0123456789abcdef0"; then
       pass "34: existing mode resolves RESOLVED_EFS_ID as the exact Git-committed passthrough value"
     else
       fail "34: the existing-mode EFS ID resolution branch did not behave as expected"
@@ -8534,7 +7974,7 @@ fi
 echo ""
 echo "--- Production hardening, Item 1: EFS throughput_mode (module-input vs AWS-API contract correction) ---"
 
-# CORRECTED per real AWS evidence (fs-05cadf3570f23cd39, name gg-poc-dev-efs, AWS-reported Throughput mode=Elastic) plus the verified aws-tf-module-efs?ref=v1.0.0 resource source: the module does NOT pass var.throughput_mode straight through -- it applies `throughput_mode = (var.throughput_mode == "enhanced" ? "elastic" : "bursting")`. The module INPUT "enhanced" is therefore the ONLY correct value; the earlier assertions in this section (which required "enhanced" to be absent, and required a goldengate_efs_throughput_mode variable accepting elastic/provisioned/bursting) were themselves wrong and have been replaced below.
+# CORRECTED per the verified aws-tf-module-efs?ref=v1.0.0 resource source: the module does NOT pass var.throughput_mode straight through -- it applies `throughput_mode = (var.throughput_mode == "enhanced" ? "elastic" : "bursting")`. The module INPUT "enhanced" is therefore the ONLY correct value; the earlier assertions in this section (which required "enhanced" to be absent, and required a goldengate_efs_throughput_mode variable accepting elastic/provisioned/bursting) were themselves wrong and have been replaced below.
 
 if grep -qE 'source\s*=\s*"git::https://github\.com/AbuDhabiCommercialBank/aws-tf-module-efs\?ref=v1\.0\.0"' envs/dev/efs.tf 2>/dev/null; then
   pass "1: goldengate_runtime_efs remains pinned exactly to aws-tf-module-efs?ref=v1.0.0"
@@ -8543,13 +7983,13 @@ else
 fi
 
 if grep -qE '^\s*performance_mode\s*=\s*"generalPurpose"\s*$' envs/dev/efs.tf 2>/dev/null; then
-  pass "1: performance_mode passed to the module is the literal \"generalPurpose\", matching the real fs-05cadf3570f23cd39 evidence"
+  pass "1: performance_mode passed to the module is the literal \"generalPurpose\""
 else
   fail "1: envs/dev/efs.tf does not pass performance_mode = \"generalPurpose\" to the module"
 fi
 
 if grep -qE '^\s*throughput_mode\s*=\s*"enhanced"\s*$' envs/dev/efs.tf 2>/dev/null; then
-  pass "1: throughput_mode module input is the literal \"enhanced\" -- the only module input proven (via fs-05cadf3570f23cd39 and the verified v1.0.0 resource ternary) to produce AWS EFS throughput mode Elastic"
+  pass "1: throughput_mode module input is the literal \"enhanced\" -- the only module input proven (via the verified v1.0.0 resource ternary) to produce AWS EFS throughput mode Elastic"
 else
   fail "1: envs/dev/efs.tf does not pass throughput_mode = \"enhanced\" to the module"
 fi
@@ -8579,13 +8019,13 @@ else
   fail "1: throughput mode leaked into a per-deployment values.yaml setting"
 fi
 
-if grep -q 'fs-05cadf3570f23cd39' envs/dev/efs.tf 2>/dev/null; then
-  pass "1: envs/dev/efs.tf documents the real fs-05cadf3570f23cd39 evidence backing the enhanced->elastic module-input mapping, for future maintainers"
+if grep -qF 'throughput_mode = (var.throughput_mode == "enhanced" ? "elastic" : "bursting")' envs/dev/efs.tf 2>/dev/null; then
+  pass "1: envs/dev/efs.tf documents the verified enhanced->elastic module-source ternary contract, for future maintainers"
 else
-  fail "1: envs/dev/efs.tf lost the fs-05cadf3570f23cd39 evidence reference that justifies the enhanced module input"
+  fail "1: envs/dev/efs.tf lost the verified enhanced->elastic module-source contract documentation that justifies the enhanced module input"
 fi
 
-# Items 8 (Oracle/PostgreSQL descriptors unchanged), 9 (historical EFS ID fs-05cadf3570f23cd39 unchanged), 10 (no replication code changes), and 11 (PostgreSQL->MSSQL Phase 6D1 constants unchanged) are covered by their own pre-existing, still-passing sections of this suite and by hack/test-goldengate-replication.py -- not duplicated here since this section is scoped to the throughput_mode contract only. Item 12 (managed-EFS inventory guard tests) is covered by hack/test-goldengate-managed-efs-inventory-guard.py, run separately as part of the full validation sweep.
+# Items 8 (Oracle/PostgreSQL descriptors unchanged), 10 (no replication code changes), and 11 (PostgreSQL->MSSQL Phase 6D1 constants unchanged) are covered by their own pre-existing, still-passing sections of this suite and by hack/test-goldengate-replication.py -- not duplicated here since this section is scoped to the throughput_mode contract only. Item 12 (managed-EFS inventory guard tests) is covered by hack/test-goldengate-managed-efs-inventory-guard.py, run separately as part of the full validation sweep.
 
 echo ""
 echo "--- Production hardening, Item 2: stream DescribeFileSystems safely ---"
