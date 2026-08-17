@@ -860,20 +860,36 @@ jobs:
           EFS_FILE_SYSTEM_ID_DECLARED="$(python3 -c 'import json, sys; print(json.load(sys.stdin).get("efsFileSystemId") or "")' <<< "$DESCRIBE_JSON")"
           EFS_CREATION_TOKEN="$(python3 -c 'import json, sys; print(json.load(sys.stdin).get("efsCreationToken") or "")' <<< "$DESCRIBE_JSON")"
 
+          # Fresh-EKS Phase A/Phase 9: shared ingress identity, removed from runtime descriptors, resolved once from the canonical environment config -- the single source of truth also used by Terraform/IAM, never re-derived or hand-maintained per deployment.
+          RESOLVED_DNS_DOMAIN="$(python3 hack/goldengate-environment.py --environment "$ENVIRONMENT" get DNS_DOMAIN)"
+          RESOLVED_ALB_GROUP_NAME="$(python3 hack/goldengate-environment.py --environment "$ENVIRONMENT" get ALB_GROUP_NAME)"
+          RESOLVED_CERTIFICATE_ARN="$(python3 hack/goldengate-environment.py --environment "$ENVIRONMENT" get ACM_CERTIFICATE_ARN)"
+
           if [ -z "$RESOLVED_ADMIN_SECRET_NAME" ] || [ -z "$RESOLVED_TLS_SECRET_NAME" ] || [ -z "$RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME" ]; then
             echo "FAIL: could not resolve deployment identity for ${DEPLOYMENT_ID}."
+            exit 1
+          fi
+
+          if [ -z "$RESOLVED_DNS_DOMAIN" ] || [ -z "$RESOLVED_ALB_GROUP_NAME" ] || [ -z "$RESOLVED_CERTIFICATE_ARN" ]; then
+            echo "FAIL: could not resolve shared ingress identity (DNS_DOMAIN/ALB_GROUP_NAME/ACM_CERTIFICATE_ARN) from envs/dev/environment.yaml."
             exit 1
           fi
 
           echo "Resolved admin secret: ${RESOLVED_ADMIN_SECRET_NAME}"
           echo "Resolved TLS secret: ${RESOLVED_TLS_SECRET_NAME}"
           echo "Resolved ServiceAccount: ${RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME}"
+          echo "Resolved image repository: ${IMAGE_REPOSITORY}"
+          echo "Resolved ingress hostDomain: ${RESOLVED_DNS_DOMAIN}"
+          echo "Resolved ALB group: ${RESOLVED_ALB_GROUP_NAME}"
           echo "Resolved persistence.efs.mode: ${EFS_MODE:-<not in use>}"
           echo "RESOLVED_ADMIN_SECRET_NAME=${RESOLVED_ADMIN_SECRET_NAME}" >> "$GITHUB_ENV"
           echo "RESOLVED_TLS_SECRET_NAME=${RESOLVED_TLS_SECRET_NAME}" >> "$GITHUB_ENV"
           echo "RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME=${RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME}" >> "$GITHUB_ENV"
           echo "IMAGE_REPOSITORY=${IMAGE_REPOSITORY}" >> "$GITHUB_ENV"
           echo "IMAGE_TAG=${IMAGE_TAG}" >> "$GITHUB_ENV"
+          echo "RESOLVED_DNS_DOMAIN=${RESOLVED_DNS_DOMAIN}" >> "$GITHUB_ENV"
+          echo "RESOLVED_ALB_GROUP_NAME=${RESOLVED_ALB_GROUP_NAME}" >> "$GITHUB_ENV"
+          echo "RESOLVED_CERTIFICATE_ARN=${RESOLVED_CERTIFICATE_ARN}" >> "$GITHUB_ENV"
           echo "EFS_MODE=${EFS_MODE}" >> "$GITHUB_ENV"
           echo "EFS_FILE_SYSTEM_ID_DECLARED=${EFS_FILE_SYSTEM_ID_DECLARED}" >> "$GITHUB_ENV"
           echo "EFS_CREATION_TOKEN=${EFS_CREATION_TOKEN}" >> "$GITHUB_ENV"
@@ -1126,10 +1142,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          # global.deploymentId/deploymentModel are intentionally not passed via --set; the chart derives runtime name from Release.Name and reads deploymentModel from $VALUES_FILE itself. persistence.efs.fileSystemId always comes from RESOLVED_EFS_ID, never from $VALUES_FILE -- required for managed mode (never committed to Git) and harmless for existing/not-in-use.
+          # global.deploymentId/deploymentModel are intentionally not passed via --set; the chart derives runtime name from Release.Name and reads deploymentModel from $VALUES_FILE itself. persistence.efs.fileSystemId always comes from RESOLVED_EFS_ID, never from $VALUES_FILE -- required for managed mode (never committed to Git) and harmless for existing/not-in-use. Fresh-EKS Phase A/Phase 9: runtime.image.repository/ingress.hostDomain/ingress.alb.groupName/ingress.alb.certificateArn are shared environment identity, removed from $VALUES_FILE -- always injected here from the same resolved values used by Terraform/IAM, via --set-string so a hostname/ARN is never coerced by Helm's own value-type inference.
           helm lint "$HELM_CHART_PATH" \
             --values "$VALUES_FILE" \
             --set global.environment="$ENVIRONMENT" \
+            --set-string runtime.image.repository="$IMAGE_REPOSITORY" \
+            --set-string ingress.hostDomain="$RESOLVED_DNS_DOMAIN" \
+            --set-string ingress.alb.groupName="$RESOLVED_ALB_GROUP_NAME" \
+            --set-string ingress.alb.certificateArn="$RESOLVED_CERTIFICATE_ARN" \
             --set runtime.csi.admin.objectName="$RESOLVED_ADMIN_SECRET_NAME" \
             --set runtime.csi.certificate.objectName="$RESOLVED_TLS_SECRET_NAME" \
             --set runtime.serviceAccount.create=false \
@@ -1147,6 +1167,10 @@ jobs:
             --namespace "$TARGET_NAMESPACE" \
             --values "$VALUES_FILE" \
             --set global.environment="$ENVIRONMENT" \
+            --set-string runtime.image.repository="$IMAGE_REPOSITORY" \
+            --set-string ingress.hostDomain="$RESOLVED_DNS_DOMAIN" \
+            --set-string ingress.alb.groupName="$RESOLVED_ALB_GROUP_NAME" \
+            --set-string ingress.alb.certificateArn="$RESOLVED_CERTIFICATE_ARN" \
             --set runtime.csi.admin.objectName="$RESOLVED_ADMIN_SECRET_NAME" \
             --set runtime.csi.certificate.objectName="$RESOLVED_TLS_SECRET_NAME" \
             --set runtime.serviceAccount.create=false \
@@ -1992,6 +2016,14 @@ jobs:
                 parameters:
                   - name: global.environment
                     value: ${ENVIRONMENT}
+                  - name: runtime.image.repository
+                    value: ${IMAGE_REPOSITORY}
+                  - name: ingress.hostDomain
+                    value: ${RESOLVED_DNS_DOMAIN}
+                  - name: ingress.alb.groupName
+                    value: ${RESOLVED_ALB_GROUP_NAME}
+                  - name: ingress.alb.certificateArn
+                    value: ${RESOLVED_CERTIFICATE_ARN}
                   - name: runtime.csi.admin.objectName
                     value: ${RESOLVED_ADMIN_SECRET_NAME}
                   - name: runtime.csi.certificate.objectName

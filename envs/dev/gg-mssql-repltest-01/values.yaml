@@ -7,9 +7,6 @@ deployment:
 lifecycle:
   state: absent
 
-global:
-  environment: dev
-
 deploymentModel: singleRuntime
 
 replication:
@@ -40,7 +37,7 @@ runtime:
   replicas: 1
 
   image:
-    repository: 229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-sqlserver
+    repositoryName: ogg-sqlserver
     tag: "23.26.2.0.1"
     pullPolicy: IfNotPresent
 
@@ -105,14 +102,10 @@ ingress:
   mode: shared
   className: alb
 
-  hostDomain: goldengate-dev.adcbmis.local
-
   alb:
-    groupName: gg-poc-dev-alb
     groupOrder: "113"
     backendProtocol: HTTPS
     listenPorts: '[{"HTTPS":443}]'
-    certificateArn: arn:aws:acm:eu-west-1:668311715351:certificate/9e53e28e-3243-47fc-85a1-50f9a94acde7
     targetType: ip
     healthcheckProtocol: HTTPS
     healthcheckPort: traffic-port

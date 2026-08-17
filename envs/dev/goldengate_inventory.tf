@@ -275,8 +275,9 @@ resource "terraform_data" "goldengate_runtime_contract" {
       error_message = "envs/${var.environment}/${each.key}/values.yaml: deployment.role must be exactly \"source\" or \"target\"."
     }
     precondition {
-      condition     = try(each.value.global.environment, "") == var.environment
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: global.environment must match the scanned environment."
+      # Fresh-EKS Phase A/Phase 9: global.environment is shared environment configuration (envs/dev/environment.yaml), no longer descriptor input -- forbid its reintroduction rather than requiring/validating a descriptor-owned copy.
+      condition     = try(each.value.global.environment, null) == null
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: global.environment is a forbidden override -- it is shared environment configuration, injected by the deploy workflow from envs/dev/environment.yaml, and must not be set in a runtime descriptor."
     }
     precondition {
       condition = (
@@ -287,13 +288,16 @@ resource "terraform_data" "goldengate_runtime_contract" {
       error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.deploymentType must be a safe lowercase token (letters/digits only, internal hyphens only, no leading/trailing hyphen, max 32 characters)."
     }
     precondition {
+      # Fresh-EKS Phase A/Phase 9: the descriptor owns only the environment-neutral repositoryName; the full private-ECR repository (local.gg_env_ecr_registry/<repositoryName>) is derived once by the workflow/deployment model, never descriptor input.
       condition = (
-        startswith(try(each.value.runtime.image.repository, ""), "${local.gg_env_ecr_registry}/")
-        && try(each.value.runtime.image.repository, "") != "${local.gg_env_ecr_registry}/"
-        && can(regex("^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*$",
-        trimprefix(try(each.value.runtime.image.repository, ""), "${local.gg_env_ecr_registry}/")))
+        try(each.value.runtime.image.repositoryName, "") != ""
+        && can(regex("^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*$", each.value.runtime.image.repositoryName))
       )
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.image.repository must be a private ECR repository in the approved account/region with a safe, non-empty suffix."
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.image.repositoryName must be a non-empty, safe, environment-neutral ECR repository name (no registry host, tag, digest, whitespace, or traversal)."
+    }
+    precondition {
+      condition     = try(each.value.runtime.image.repository, null) == null
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.image.repository is a forbidden override -- it is shared environment identity, derived from local.gg_env_ecr_registry + runtime.image.repositoryName, and must not be set in a runtime descriptor."
     }
     precondition {
       condition     = try(each.value.runtime.image.tag, "") != "" && try(each.value.runtime.image.tag, "latest") != "latest"
@@ -450,8 +454,17 @@ resource "terraform_data" "goldengate_runtime_contract" {
       error_message = "envs/${var.environment}/${each.key}/values.yaml: replication.replicat.startOnCreate must be a literal Boolean, not a Boolean-like string."
     }
     precondition {
-      condition     = try(each.value.ingress.hostDomain, "") == local.goldengate_shared_environment.dnsDomain
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: ingress.hostDomain must match the shared DNS domain."
+      # Fresh-EKS Phase A/Phase 9: ingress.hostDomain/alb.groupName/alb.certificateArn are shared environment configuration, injected by the deploy workflow from envs/dev/environment.yaml -- forbid their reintroduction rather than requiring/validating a descriptor-owned copy. ingress.alb.groupOrder remains deployment-specific and stays required/validated below.
+      condition     = try(each.value.ingress.hostDomain, null) == null
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: ingress.hostDomain is a forbidden override -- it is shared environment configuration and must not be set in a runtime descriptor."
+    }
+    precondition {
+      condition     = try(each.value.ingress.alb.groupName, null) == null
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: ingress.alb.groupName is a forbidden override -- it is shared environment configuration and must not be set in a runtime descriptor."
+    }
+    precondition {
+      condition     = try(each.value.ingress.alb.certificateArn, null) == null
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: ingress.alb.certificateArn is a forbidden override -- it is shared environment configuration and must not be set in a runtime descriptor."
     }
     precondition {
       condition     = !contains(local.goldengate_duplicate_alb_group_order_ids, each.key)
@@ -628,14 +641,14 @@ check "goldengate_at_most_one_target_per_pipeline" {
   }
 }
 
-check "goldengate_approved_ecr_registry_only" {
+# Fresh-EKS Phase A/Phase 9: the full repository is always derived as local.gg_env_ecr_registry/repositoryName (never descriptor-asserted), so it is definitionally inside the approved private ECR account/region -- this diagnostic now proves every enabled deployment supplies the one thing it DOES own, a non-empty repositoryName (the plan-blocking grammar/safety check itself lives in the goldengate_runtime_contract precondition above).
+check "goldengate_image_repository_name_present" {
   assert {
     condition = alltrue([
       for id in local.goldengate_deployment_names :
-      startswith(try(local.goldengate_enabled_deployments[id].runtime.image.repository, ""),
-      "${local.gg_env_ecr_registry}/")
+      try(local.goldengate_enabled_deployments[id].runtime.image.repositoryName, "") != ""
     ])
-    error_message = "An enabled GoldenGate deployment references an image outside the approved private ECR account/region."
+    error_message = "An enabled GoldenGate deployment is missing runtime.image.repositoryName."
   }
 }
 

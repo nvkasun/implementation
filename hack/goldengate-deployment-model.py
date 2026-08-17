@@ -259,25 +259,22 @@ def _contains_credential_like_key(node, path=""):
 
 
 def _parse_image(environment, runtime):
+    """The descriptor owns only the environment-neutral repositoryName; the full private-ECR repository is derived ONCE here from environment config, never re-typed by a descriptor or a downstream consumer."""
     image = runtime.get("image")
     _require_dict(image, "invalid image configuration: runtime.image must be a mapping")
-    repository = image.get("repository")
+    repository_name = image.get("repositoryName")
     tag = image.get("tag")
-    if not isinstance(repository, str) or not repository:
-        raise DescriptorError("invalid image configuration: runtime.image.repository is required")
+    if not isinstance(repository_name, str) or not repository_name:
+        raise DescriptorError("invalid image configuration: runtime.image.repositoryName is required")
     if not isinstance(tag, str) or not tag:
         raise DescriptorError("invalid image configuration: runtime.image.tag is required and must be explicit")
     if tag == FORBIDDEN_IMAGE_TAG:
         raise DescriptorError("invalid image configuration: runtime.image.tag must not be \"latest\"")
-    expected_prefix = f"{_environment_derived_values(environment)['ECR_REGISTRY']}/"
-    if not repository.startswith(expected_prefix):
-        raise DescriptorError("invalid image configuration: repository is not the approved private ECR account/region")
-    suffix = repository[len(expected_prefix):]
-    if not suffix:
-        raise DescriptorError("invalid image configuration: repository suffix is empty")
-    if not _ECR_REPO_SUFFIX_RE.match(suffix):
-        raise DescriptorError("invalid image configuration: repository suffix is malformed, contains a digest/tag, whitespace, or traversal")
-    return {"repository": repository, "tag": tag}
+    if not _ECR_REPO_SUFFIX_RE.match(repository_name):
+        raise DescriptorError("invalid image configuration: runtime.image.repositoryName is malformed -- must be a safe, environment-neutral ECR repository name with no registry host, tag, digest, whitespace, or traversal")
+    ecr_registry = _environment_derived_values(environment)["ECR_REGISTRY"]
+    full_repository = f"{ecr_registry}/{repository_name}"
+    return {"repository": full_repository, "repositoryName": repository_name, "tag": tag}
 
 
 def _reject_forbidden_overrides(doc):
@@ -298,6 +295,22 @@ def _reject_forbidden_overrides(doc):
     certificate = csi.get("certificate") or {}
     if "objectName" in certificate:
         raise DescriptorError("forbidden override: runtime.csi.certificate.objectName is a shared platform invariant and must not be set")
+    image = runtime.get("image") or {}
+    if "repository" in image:
+        raise DescriptorError("forbidden override: runtime.image.repository is shared environment identity (derived from ECR_REGISTRY + runtime.image.repositoryName) and must not be set")
+
+    global_cfg = doc.get("global") or {}
+    if "environment" in global_cfg:
+        raise DescriptorError("forbidden override: global.environment is shared environment configuration (envs/<environment>/environment.yaml) and must not be set in a runtime descriptor")
+
+    ingress = doc.get("ingress") or {}
+    if "hostDomain" in ingress:
+        raise DescriptorError("forbidden override: ingress.hostDomain is shared environment configuration and must not be set in a runtime descriptor")
+    alb = ingress.get("alb") or {}
+    if "groupName" in alb:
+        raise DescriptorError("forbidden override: ingress.alb.groupName is shared environment configuration and must not be set in a runtime descriptor")
+    if "certificateArn" in alb:
+        raise DescriptorError("forbidden override: ingress.alb.certificateArn is shared environment configuration and must not be set in a runtime descriptor")
 
 
 def _parse_supplemental_logging(block):
@@ -645,10 +658,6 @@ def parse_descriptor(deployment_id, environment, doc, shared=None):
     lifecycle_state = _parse_lifecycle(doc)
     efs = _parse_efs(deployment_id, environment, doc)
 
-    global_cfg = _require_dict(doc.get("global"), "invalid deployment metadata: global must be a mapping")
-    if global_cfg.get("environment") != environment:
-        raise DescriptorError("inconsistent shared environment metadata: global.environment does not match the scanned environment")
-
     if _contains_credential_like_key(doc):
         raise DescriptorError("embedded credentials found in values.yaml")
 
@@ -656,10 +665,8 @@ def parse_descriptor(deployment_id, environment, doc, shared=None):
     if not isinstance(container_name, str) or not container_name:
         raise DescriptorError("invalid deployment metadata: runtime.containerName must be a non-empty string")
 
+    # ingress.hostDomain/alb.groupName/alb.certificateArn are shared environment configuration, not descriptor input (see _reject_forbidden_overrides) -- ingressHost below always reflects the canonical shared DNS domain, never a descriptor-declared value.
     ingress = _require_dict(doc.get("ingress"), "invalid deployment metadata: ingress must be a mapping")
-    ingress_host = ingress.get("hostDomain")
-    if ingress_host != shared["dnsDomain"]:
-        raise DescriptorError("inconsistent ingress domain: ingress.hostDomain must match the shared DNS domain")
     alb = ingress.get("alb") or {}
     alb_group_order = alb.get("groupOrder")
 
@@ -672,6 +679,7 @@ def parse_descriptor(deployment_id, environment, doc, shared=None):
         "lifecycleState": lifecycle_state,
         "deploymentType": deployment_type,
         "imageRepository": image["repository"],
+        "imageRepositoryName": image["repositoryName"],
         "imageTag": image["tag"],
         "containerName": container_name,
         "runtimeServiceAccountName": runtime_service_account_name,
@@ -679,7 +687,7 @@ def parse_descriptor(deployment_id, environment, doc, shared=None):
         "tlsSecretName": tls_secret_name,
         "runtimeNamespace": shared["runtimeNamespace"],
         "monitoringNamespace": shared["monitoringNamespace"],
-        "ingressHost": ingress_host,
+        "ingressHost": shared["dnsDomain"],
         "efsMode": efs["mode"],
         "efsFileSystemId": efs["fileSystemId"],
         "efsCreationToken": efs["creationToken"],

@@ -27,20 +27,27 @@ OBSERVABILITY_WORKFLOW=".github/workflows/goldengate-observability.yaml"
 ARGOCD_VALUES_FILE="envs/dev/argocd/values.yaml"
 ARGOCD_DEPLOY_WORKFLOW=".github/workflows/argocd-eks-deployment.yaml"
 
-# Shared-secret identities (role-derived admin secret) plus the restored shared gg-runtime-sa identity the deploy workflow injects via --set; direct helm invocations against the two known historical fixtures below must mirror them.
-ORACLE_SHARED_OVERRIDES=(--set runtime.csi.admin.objectName=dev/goldengate/source/admin --set runtime.csi.certificate.objectName=dev/goldengate/tls-certificate --set runtime.serviceAccount.create=false --set runtime.serviceAccount.name=gg-runtime-sa)
-POSTGRESQL_SHARED_OVERRIDES=(--set runtime.csi.admin.objectName=dev/goldengate/target/admin --set runtime.csi.certificate.objectName=dev/goldengate/tls-certificate --set runtime.serviceAccount.create=false --set runtime.serviceAccount.name=gg-runtime-sa)
+# runtime.image.repository/ingress.hostDomain/ingress.alb.groupName/ingress.alb.certificateArn are shared environment configuration -- resolved once here via the same resolver the deploy workflow uses, never an independently maintained literal.
+RESOLVED_DNS_DOMAIN="$(python3 "$ENVIRONMENT_TOOL" --environment dev get DNS_DOMAIN)"
+RESOLVED_ALB_GROUP_NAME="$(python3 "$ENVIRONMENT_TOOL" --environment dev get ALB_GROUP_NAME)"
+RESOLVED_CERTIFICATE_ARN="$(python3 "$ENVIRONMENT_TOOL" --environment dev get ACM_CERTIFICATE_ARN)"
+SHARED_INGRESS_OVERRIDES=(--set-string ingress.hostDomain="$RESOLVED_DNS_DOMAIN" --set-string ingress.alb.groupName="$RESOLVED_ALB_GROUP_NAME" --set-string ingress.alb.certificateArn="$RESOLVED_CERTIFICATE_ARN")
+
+# Shared-secret identities (role-derived admin secret) plus the restored shared gg-runtime-sa identity the deploy workflow injects via --set; direct helm invocations against the two known historical fixtures below must mirror them. Image repository is now resolved per-deployment (below) since it depends on the descriptor's own runtime.image.repositoryName.
+ORACLE_SHARED_OVERRIDES=(--set runtime.csi.admin.objectName=dev/goldengate/source/admin --set runtime.csi.certificate.objectName=dev/goldengate/tls-certificate --set runtime.serviceAccount.create=false --set runtime.serviceAccount.name=gg-runtime-sa "${SHARED_INGRESS_OVERRIDES[@]}" --set-string runtime.image.repository="$(python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev describe gg-postgresql-repltest-01 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["imageRepository"])')")
+POSTGRESQL_SHARED_OVERRIDES=(--set runtime.csi.admin.objectName=dev/goldengate/target/admin --set runtime.csi.certificate.objectName=dev/goldengate/tls-certificate --set runtime.serviceAccount.create=false --set runtime.serviceAccount.name=gg-runtime-sa "${SHARED_INGRESS_OVERRIDES[@]}" --set-string runtime.image.repository="$(python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev describe gg-mssql-repltest-01 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["imageRepository"])')")
 
 # Self-service: for any REAL-repository render loop that dynamically iterates the live inventory (never a fixed ID list), overrides are derived from the deployment model's own `describe` output -- never a hardcoded oracle-vs-postgresql binary -- so a newly onboarded folder of any deploymentType/role is rendered correctly without touching this file. Sets the global array SHARED_OVERRIDES. Uses the exact same dry-run managed-EFS placeholder the real deploy=false workflow uses (fs-0dead0000000beef0); mode=existing already carries its own committed fileSystemId in the descriptor's own values.yaml, so no override is needed there.
 derive_shared_overrides_for_deployment() {
   local dep_id="$1"
-  local describe_json admin_secret tls_secret sa_name efs_mode
+  local describe_json admin_secret tls_secret sa_name efs_mode image_repository
   describe_json="$(python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev describe "$dep_id" 2>/dev/null)"
   admin_secret="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["adminSecretName"])' <<< "$describe_json")"
   tls_secret="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["tlsSecretName"])' <<< "$describe_json")"
   sa_name="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["runtimeServiceAccountName"])' <<< "$describe_json")"
   efs_mode="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["efsMode"] or "")' <<< "$describe_json")"
-  SHARED_OVERRIDES=(--set runtime.csi.admin.objectName="$admin_secret" --set runtime.csi.certificate.objectName="$tls_secret" --set runtime.serviceAccount.create=false --set runtime.serviceAccount.name="$sa_name")
+  image_repository="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["imageRepository"])' <<< "$describe_json")"
+  SHARED_OVERRIDES=(--set runtime.csi.admin.objectName="$admin_secret" --set runtime.csi.certificate.objectName="$tls_secret" --set runtime.serviceAccount.create=false --set runtime.serviceAccount.name="$sa_name" --set-string runtime.image.repository="$image_repository" "${SHARED_INGRESS_OVERRIDES[@]}")
   if [ "$efs_mode" = "managed" ]; then
     SHARED_OVERRIDES+=(--set persistence.efs.fileSystemId=fs-0dead0000000beef0)
   fi
@@ -6062,6 +6069,8 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
     RENDER_APPROVED="${WORKDIR}/identity-approved-${id}.yaml"
     RENDER_OTHER="${WORKDIR}/identity-other-${id}.yaml"
 
+    id_image_repository="$(python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev describe "$id" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["imageRepository"])')"
+
     # The chart must not couple ServiceAccount identity to any other field, regardless of the name compared. Both current descriptors are persistence.efs.mode=managed, so the workflow-resolved fileSystemId is supplied here exactly as the deploy workflow would.
     if helm template "$id" "$RUNTIME_CHART" \
         --namespace goldengate-dev \
@@ -6072,6 +6081,8 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
         --set runtime.serviceAccount.create=false \
         --set runtime.serviceAccount.name="$approved_sa" \
         --set persistence.efs.fileSystemId=fs-0123456789abcdef0 \
+        --set-string runtime.image.repository="$id_image_repository" \
+        "${SHARED_INGRESS_OVERRIDES[@]}" \
         > "$RENDER_APPROVED" 2>"${WORKDIR}/identity-approved-${id}.log" \
       && helm template "$id" "$RUNTIME_CHART" \
         --namespace goldengate-dev \
@@ -6082,6 +6093,8 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
         --set runtime.serviceAccount.create=false \
         --set runtime.serviceAccount.name=gg-isolation-probe-sa \
         --set persistence.efs.fileSystemId=fs-0123456789abcdef0 \
+        --set-string runtime.image.repository="$id_image_repository" \
+        "${SHARED_INGRESS_OVERRIDES[@]}" \
         > "$RENDER_OTHER" 2>"${WORKDIR}/identity-other-${id}.log"; then
 
       if grep -q "serviceAccountName: ${approved_sa}" "$RENDER_APPROVED"; then
@@ -6168,18 +6181,23 @@ if command -v terraform >/dev/null 2>&1; then
     "${TF_PLAN_SCRATCH}/platform/dev/goldengate-platform" "${TF_PLAN_SCRATCH}/envs/dev/goldengate-monitor" \
     "${TF_PLAN_SCRATCH}/envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy"
   cp envs/dev/goldengate_inventory.tf "${TF_PLAN_SCRATCH}/envs/dev/goldengate_inventory.tf"
-  # Stand-in for envs/dev/environment.tf's locals, WITHOUT its live aws_eks_cluster/aws_iam_openid_connect_provider data sources -- this harness is intentionally offline/no-AWS-credentials, so it mirrors only the specific local.gg_env_* values goldengate_inventory.tf actually reads, using the real current envs/dev/environment.yaml's resolved values (kept in sync manually; if this harness's Terraform plan output ever disagrees with `python3 hack/goldengate-environment.py --environment dev github-env`, that is the signal to update the literals below).
-  cat > "${TF_PLAN_SCRATCH}/envs/dev/environment_stub.tf" <<'EOF'
-locals {
-  gg_env_dns_domain               = "goldengate-dev.adcbmis.local"
-  gg_env_ecr_registry             = "229410149234.dkr.ecr.eu-west-1.amazonaws.com"
-  gg_env_namespaces               = { runtime = "goldengate-dev", monitoring = "goldengate-monitoring", argocd = "argocd", observability = "amazon-cloudwatch" }
-  gg_env_oidc_hostpath            = "oidc.eks.eu-west-1.amazonaws.com/id/B1DF999126467169346B88078D7927E2"
-  gg_env_source_admin_secret_name = "dev/goldengate/source/admin"
-  gg_env_target_admin_secret_name = "dev/goldengate/target/admin"
-  gg_env_tls_secret_name          = "dev/goldengate/tls-certificate"
-}
-EOF
+  # Stand-in for envs/dev/environment.tf's locals, WITHOUT its live aws_eks_cluster/aws_iam_openid_connect_provider data sources -- this harness is intentionally offline/no-AWS-credentials, so it mirrors only the specific local.gg_env_* values goldengate_inventory.tf actually reads. Generated from the REAL resolver's derived values at run time -- never an independently-maintained literal copy that could silently drift from envs/dev/environment.yaml.
+  python3 -c "
+import importlib.util
+spec = importlib.util.spec_from_file_location('goldengate_environment', '${ENVIRONMENT_TOOL}')
+ge = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ge)
+v = ge.derive_values(ge.load_environment_config('dev'))
+print('locals {')
+print(f'  gg_env_dns_domain               = \"{v[\"DNS_DOMAIN\"]}\"')
+print(f'  gg_env_ecr_registry             = \"{v[\"ECR_REGISTRY\"]}\"')
+print(f'  gg_env_namespaces               = {{ runtime = \"{v[\"RUNTIME_NAMESPACE\"]}\", monitoring = \"{v[\"MONITOR_NAMESPACE\"]}\", argocd = \"{v[\"ARGOCD_NAMESPACE\"]}\", observability = \"{v[\"OBSERVABILITY_NAMESPACE\"]}\" }}')
+print(f'  gg_env_oidc_hostpath            = \"{v[\"EKS_OIDC_HOSTPATH\"]}\"')
+print(f'  gg_env_source_admin_secret_name = \"{v[\"SOURCE_ADMIN_SECRET_NAME\"]}\"')
+print(f'  gg_env_target_admin_secret_name = \"{v[\"TARGET_ADMIN_SECRET_NAME\"]}\"')
+print(f'  gg_env_tls_secret_name          = \"{v[\"TLS_SECRET_NAME\"]}\"')
+print('}')
+" > "${TF_PLAN_SCRATCH}/envs/dev/environment_stub.tf"
   cp envs/dev/gg-postgresql-repltest-01/values.yaml "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-repltest-01/values.yaml"
   cp envs/dev/gg-mssql-repltest-01/values.yaml "${TF_PLAN_SCRATCH}/envs/dev/gg-mssql-repltest-01/values.yaml"
   cp platform/dev/goldengate-platform/values.yaml "${TF_PLAN_SCRATCH}/platform/dev/goldengate-platform/values.yaml"

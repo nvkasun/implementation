@@ -33,16 +33,13 @@ deployment:
   pipeline: {pipeline}
   role: {role}
 {deployment_admin_secret_block}
-global:
-  environment: {environment}
-
 deploymentModel: singleRuntime
 
 runtime:
   deploymentType: {deployment_type}
   containerName: ogg-{deployment_type}
   image:
-    repository: {repository}
+    repositoryName: {repository_name}
     tag: "{tag}"
 {service_account_block}  csi:
     enabled: true
@@ -52,7 +49,7 @@ runtime:
       enabled: true
 {csi_certificate_object_name_block}
 ingress:
-  hostDomain: {ingress_host_domain}
+  enabled: true
 {alb_block}
 {extra}
 """
@@ -115,11 +112,13 @@ def ensure_scratch_environment_yaml(root, environment):
 
 
 def write_descriptor(root, environment, deployment_id, enabled=True, pipeline="test-pipeline", role="source",
-                     deployment_type="oracle", repository=None, tag="1.0.0",
+                     deployment_type="oracle", repository_name=None, tag="1.0.0",
                      service_account_name=None, service_account_create=None,
                      deployment_admin_secret=None, alb_group_order=None, extra="", raw_override=None,
                      csi_admin_object_name=None, csi_certificate_object_name=None,
-                     csi_service_account_role_arn=None, ingress_host_domain=None):
+                     csi_service_account_role_arn=None, ingress_host_domain=None,
+                     image_repository_override=None, global_environment_override=None,
+                     ingress_alb_group_name=None, ingress_alb_certificate_arn=None):
     ensure_scratch_environment_yaml(root, environment)
     folder = os.path.join(root, "envs", environment, deployment_id)
     os.makedirs(folder, exist_ok=True)
@@ -128,7 +127,7 @@ def write_descriptor(root, environment, deployment_id, enabled=True, pipeline="t
         with open(path, "w") as f:
             f.write(raw_override)
         return path
-    repository = repository or f"229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-{deployment_type}"
+    repository_name = repository_name or f"ogg-{deployment_type}"
 
     deployment_admin_secret_block = ""
     if deployment_admin_secret is not None:
@@ -147,19 +146,37 @@ def write_descriptor(root, environment, deployment_id, enabled=True, pipeline="t
     csi_admin_object_name_block = f"      objectName: {csi_admin_object_name}\n" if csi_admin_object_name is not None else ""
     csi_certificate_object_name_block = f"      objectName: {csi_certificate_object_name}\n" if csi_certificate_object_name is not None else ""
 
-    alb_block = f'  alb:\n    groupOrder: "{alb_group_order}"' if alb_group_order is not None else ""
-    if ingress_host_domain is None:
-        ingress_host_domain = f"goldengate-{environment}.adcbmis.local"
+    alb_lines = []
+    if alb_group_order is not None:
+        alb_lines.append(f'    groupOrder: "{alb_group_order}"')
+    # ingress_alb_group_name/ingress_alb_certificate_arn are opt-in, to test the forbidden-override rejection of descriptor-declared shared ALB identity.
+    if ingress_alb_group_name is not None:
+        alb_lines.append(f"    groupName: {ingress_alb_group_name}")
+    if ingress_alb_certificate_arn is not None:
+        alb_lines.append(f"    certificateArn: {ingress_alb_certificate_arn}")
+    alb_block = ("  alb:\n" + "\n".join(alb_lines)) if alb_lines else ""
+    # ingress_host_domain is opt-in; absent by default so no descriptor written here declares hostDomain, matching the real Phase 9 schema.
+    ingress_host_domain_block = f"  hostDomain: {ingress_host_domain}\n" if ingress_host_domain is not None else ""
+
+    # image_repository_override/global_environment_override are opt-in, to test the forbidden-override rejection of descriptor-declared shared identity.
+    if global_environment_override is not None:
+        extra = extra + f"global:\n  environment: {global_environment_override}\n"
 
     text = BASE_DESCRIPTOR.format(
-        enabled=str(enabled).lower(), pipeline=pipeline, role=role, environment=environment,
-        deployment_type=deployment_type, repository=repository, tag=tag,
+        enabled=str(enabled).lower(), pipeline=pipeline, role=role,
+        deployment_type=deployment_type, repository_name=repository_name, tag=tag,
         deployment_admin_secret_block=deployment_admin_secret_block,
         service_account_block=service_account_block,
         csi_role_arn_block=csi_role_arn_block,
         csi_admin_object_name_block=csi_admin_object_name_block,
         csi_certificate_object_name_block=csi_certificate_object_name_block,
-        alb_block=alb_block, extra=extra, ingress_host_domain=ingress_host_domain)
+        alb_block=alb_block, extra=extra)
+    if image_repository_override is not None:
+        text = text.replace(
+            f"    repositoryName: {repository_name}\n",
+            f"    repositoryName: {repository_name}\n    repository: {image_repository_override}\n")
+    if ingress_host_domain_block:
+        text = text.replace("ingress:\n  enabled: true\n", f"ingress:\n  enabled: true\n{ingress_host_domain_block}")
     with open(path, "w") as f:
         f.write(text)
     return path
@@ -168,15 +185,14 @@ def write_descriptor(root, environment, deployment_id, enabled=True, pipeline="t
 def default_source_doc(environment, pipeline, target_id):
     return {
         "deployment": {"enabled": True, "pipeline": pipeline, "role": "source"},
-        "global": {"environment": environment},
         "deploymentModel": "singleRuntime",
         "runtime": {
             "deploymentType": "postgresql",
             "containerName": "ogg-postgresql",
-            "image": {"repository": "229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-postgresql", "tag": "23.26.2.0.1"},
+            "image": {"repositoryName": "ogg-postgresql", "tag": "23.26.2.0.1"},
             "csi": {"enabled": True, "admin": {"enabled": True}, "certificate": {"enabled": True}},
         },
-        "ingress": {"hostDomain": f"goldengate-{environment}.adcbmis.local"},
+        "ingress": {"enabled": True},
         "replication": {
             "enabled": True,
             "databaseCredentialSecret": f"{environment}/goldengate/databases/{pipeline}/source",
@@ -202,15 +218,14 @@ def default_source_doc(environment, pipeline, target_id):
 def default_target_doc(environment, pipeline):
     return {
         "deployment": {"enabled": True, "pipeline": pipeline, "role": "target"},
-        "global": {"environment": environment},
         "deploymentModel": "singleRuntime",
         "runtime": {
             "deploymentType": "mssql",
             "containerName": "ogg-sqlserver",
-            "image": {"repository": "229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-sqlserver", "tag": "23.26.2.0.1"},
+            "image": {"repositoryName": "ogg-sqlserver", "tag": "23.26.2.0.1"},
             "csi": {"enabled": True, "admin": {"enabled": True}, "certificate": {"enabled": True}},
         },
-        "ingress": {"hostDomain": f"goldengate-{environment}.adcbmis.local"},
+        "ingress": {"enabled": True},
         "replication": {
             "enabled": True,
             "databaseCredentialSecret": f"{environment}/goldengate/databases/{pipeline}/target",
@@ -234,16 +249,15 @@ def _efs_test_doc(environment="dev", persistence=None):
     """Minimal valid descriptor with an explicit efs-capable u02 storage block, for persistence.efs.mode tests."""
     doc = {
         "deployment": {"enabled": True, "pipeline": "test-pipeline", "role": "source"},
-        "global": {"environment": environment},
         "deploymentModel": "singleRuntime",
         "runtime": {
             "deploymentType": "oracle",
             "containerName": "ogg-oracle",
-            "image": {"repository": "229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle", "tag": "1.0.0"},
+            "image": {"repositoryName": "ogg-oracle", "tag": "1.0.0"},
             "csi": {"enabled": True, "admin": {"enabled": True}, "certificate": {"enabled": True}},
             "storage": {"u02": {"type": "efs"}},
         },
-        "ingress": {"hostDomain": f"goldengate-{environment}.adcbmis.local"},
+        "ingress": {"enabled": True},
     }
     if persistence is not None:
         doc["persistence"] = persistence
@@ -528,10 +542,11 @@ class SyntheticFlavourRenderTests(ScratchEnvironmentTestCase):
     def test_mssql_image_comes_from_the_values_file_not_a_mapping(self):
         write_descriptor(self._tmp.name, "dev", "gg-mssql-fixture-01",
                          pipeline="p1", role="target", deployment_type="mssql",
-                         repository="229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-sqlserver", tag="9.9.9")
+                         repository_name="ogg-sqlserver", tag="9.9.9")
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
         self.assertEqual(active[0]["imageRepository"], "229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-sqlserver")
+        self.assertEqual(active[0]["imageRepositoryName"], "ogg-sqlserver")
         self.assertEqual(active[0]["imageTag"], "9.9.9")
 
     def test_no_deployment_type_to_image_mapping_exists_in_source(self):
@@ -683,6 +698,33 @@ class ForbiddenOverrideTests(ScratchEnvironmentTestCase):
         self.assertEqual(invalid, [])
         self.assertEqual(active[0]["runtimeServiceAccountName"], "gg-runtime-sa")
 
+    def test_image_repository_override_is_rejected(self):
+        # runtime.image.repository is shared identity derived by the deployment model; a descriptor must never declare it directly.
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+                         image_repository_override="229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle")
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+        self.assertIn("runtime.image.repository", invalid[0][1])
+
+    def test_global_environment_override_is_rejected(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01", global_environment_override="dev")
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+        self.assertIn("global.environment", invalid[0][1])
+
+    def test_ingress_alb_group_name_override_is_rejected(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01", ingress_alb_group_name="gg-poc-dev-alb")
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+        self.assertIn("ingress.alb.groupName", invalid[0][1])
+
+    def test_ingress_alb_certificate_arn_override_is_rejected(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+                         ingress_alb_certificate_arn="arn:aws:acm:eu-west-1:668311715351:certificate/00000000-0000-0000-0000-000000000000")
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+        self.assertIn("ingress.alb.certificateArn", invalid[0][1])
+
 
 class EnvironmentScopedContractTests(ScratchEnvironmentTestCase):
     """Environment-scoped derivation, ECR/name grammar, and EFS identity."""
@@ -693,39 +735,40 @@ class EnvironmentScopedContractTests(ScratchEnvironmentTestCase):
         self.assertEqual(invalid, [])
         self.assertEqual(active[0]["adminSecretName"], "sit/goldengate/source/admin")
 
-    def test_ingress_host_domain_inconsistent_with_shared_domain_fails(self):
+    def test_ingress_host_domain_declared_in_descriptor_fails(self):
+        # ingress.hostDomain is shared environment configuration -- declaring it at all is a forbidden override, regardless of value.
         write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
-                         ingress_host_domain="totally-different-domain.example.com")
+                         ingress_host_domain="goldengate-dev.adcbmis.local")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
-    def test_ecr_repository_with_digest_syntax_fails(self):
+    def test_ecr_repository_name_with_digest_syntax_fails(self):
         write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
-                         repository="229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle@sha256:" + "a" * 64)
+                         repository_name="ogg-oracle@sha256:" + "a" * 64)
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
-    def test_ecr_repository_with_whitespace_fails(self):
+    def test_ecr_repository_name_with_whitespace_fails(self):
         write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
-                         repository="229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg oracle")
+                         repository_name="ogg oracle")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
-    def test_ecr_repository_with_empty_suffix_fails(self):
+    def test_ecr_repository_name_with_empty_suffix_fails(self):
         write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
-                         repository="229410149234.dkr.ecr.eu-west-1.amazonaws.com/")
+                         repository_name="ogg-oracle/")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
-    def test_ecr_repository_with_double_slash_fails(self):
+    def test_ecr_repository_name_with_double_slash_fails(self):
         write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
-                         repository="229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg//oracle")
+                         repository_name="ogg//oracle")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
-    def test_multi_segment_ecr_repository_passes(self):
+    def test_multi_segment_ecr_repository_name_passes(self):
         write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
-                         repository="229410149234.dkr.ecr.eu-west-1.amazonaws.com/goldengate/ogg-oracle")
+                         repository_name="goldengate/ogg-oracle")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
 
@@ -1107,16 +1150,7 @@ class FailClosedTests(ScratchEnvironmentTestCase):
         self.assertEqual(len(invalid), 1)
         self.assertIn("latest", invalid[0][1])
 
-    def test_public_image_repository_fails(self):
-        write_descriptor(self._tmp.name, "dev", "gg-public-fixture-01", repository="docker.io/library/postgres")
-        _active, _inactive, invalid = gdm.scan("dev")
-        self.assertEqual(len(invalid), 1)
-
-    def test_wrong_ecr_account_fails(self):
-        write_descriptor(self._tmp.name, "dev", "gg-wrong-account-fixture-01",
-                         repository="123456789012.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle")
-        _active, _inactive, invalid = gdm.scan("dev")
-        self.assertEqual(len(invalid), 1)
+    # test_public_image_repository_fails/test_wrong_ecr_account_fails no longer apply: a descriptor can't declare a full repository string at all; see test_image_repository_override_is_rejected above.
 
     def test_embedded_credentials_fail(self):
         write_descriptor(self._tmp.name, "dev", "gg-cred-fixture-01",
@@ -1128,11 +1162,11 @@ class FailClosedTests(ScratchEnvironmentTestCase):
     def test_boolean_like_string_enabled_fails(self):
         write_descriptor(self._tmp.name, "dev", "gg-boolstr-fixture-01",
                          raw_override=BASE_DESCRIPTOR.format(
-                             enabled='"true"', pipeline="p1", role="source", environment="dev",
+                             enabled='"true"', pipeline="p1", role="source",
                              deployment_admin_secret_block="", deployment_type="oracle",
-                             repository="229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle", tag="1.0.0",
+                             repository_name="ogg-oracle", tag="1.0.0",
                              service_account_block="", csi_role_arn_block="", csi_admin_object_name_block="",
-                             csi_certificate_object_name_block="", ingress_host_domain="goldengate-dev.adcbmis.local",
+                             csi_certificate_object_name_block="",
                              alb_block="", extra=""))
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
