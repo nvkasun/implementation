@@ -7,7 +7,7 @@ variable "goldengate_efs_shared_security_group_description" {
   default     = "Security group for EFS filesystem - NFS port 2049 from EKS nodes only"
 }
 
-# Explicit, narrowly-scoped OLD-ENVIRONMENT EFS decommission control -- NEVER derived from lifecycle.state. lifecycle.state=absent by itself always retains managed EFS (see local.goldengate_managed_efs_deployments's own comment); an ID may be added here ONLY after its workload/PVC/access-point cleanup has been independently verified. Removing an ID later makes its managed EFS desired again, so Terraform recreates it (e.g. in the replacement VPC/EKS environment) without reconstructing the runtime descriptor.
+# Explicit managed-EFS decommission control -- NEVER derived from lifecycle.state. lifecycle.state=absent by itself always retains managed EFS (see local.goldengate_managed_efs_deployments's own comment); an ID may be added here ONLY after its workload/PVC/access-point cleanup has been independently verified. Removing an ID later makes its managed EFS desired again, so Terraform recreates it in the current environment without reconstructing the runtime descriptor.
 locals {
   goldengate_managed_efs_decommission_ids = toset([
     "gg-postgresql-repltest-01",

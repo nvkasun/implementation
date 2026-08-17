@@ -1,4 +1,4 @@
-# Centralized DEV corporate/business tag values -- every approved module below that accepts these fields references local.tags.* instead of repeating the literal value; every value here is unchanged from what this repo already used, except the newly-established request_reference. Resource-specific identifiers (e.g. gg-repltest-postgresql, gg-repltest-mssql) are never centralized here -- only common metadata.
+# Centralized DEV corporate/business tag values -- every approved module below that accepts these fields references local.tags.* instead of repeating the literal value; every value here is unchanged from what this repo already used, except the newly-established request_reference. Resource-specific identifiers are never centralized here -- only common metadata.
 locals {
   tags = {
     env                  = "dev"

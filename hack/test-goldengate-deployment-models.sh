@@ -7420,7 +7420,7 @@ fi
 
 if grep -qE '^module\s+"goldengate_runtime_efs"\s*\{' envs/dev/efs.tf 2>/dev/null \
     && grep -qE 'for_each\s*=\s*local\.goldengate_managed_efs_desired_deployments' envs/dev/efs.tf 2>/dev/null; then
-  pass "4/5: the EFS module is instantiated via for_each over local.goldengate_managed_efs_desired_deployments (the canonical local.goldengate_managed_efs_deployments filtered by the explicit, reviewed old-VPC decommission allowlist) -- one Terraform module key (and therefore one dedicated aws_efs_file_system) per DESIRED managed deployment ID, all inside the single envs/dev state"
+  pass "4/5: the EFS module is instantiated via for_each over local.goldengate_managed_efs_desired_deployments (the canonical local.goldengate_managed_efs_deployments filtered by the explicit, reviewed managed-EFS decommission allowlist) -- one Terraform module key (and therefore one dedicated aws_efs_file_system) per DESIRED managed deployment ID, all inside the single envs/dev state"
 else
   fail "4/5: envs/dev/efs.tf's module block is missing or does not for_each over local.goldengate_managed_efs_desired_deployments"
 fi
@@ -7453,7 +7453,7 @@ else
 fi
 
 if grep -qE '^\s*count\s*=\s*length\(local\.goldengate_managed_efs_desired_deployments\)\s*>\s*0' envs/dev/efs.tf 2>/dev/null; then
-  pass "10: the shared EFS security-group data lookup is conditional (count) on at least one DESIRED (post-decommission) managed deployment existing, not the canonical inventory -- so it stops resolving the old-VPC SG once aws-cloud-factory-infra is free to delete it"
+  pass "10: the shared EFS security-group data lookup is conditional (count) on at least one DESIRED (post-decommission) managed deployment existing, not the canonical inventory -- so it stops resolving the shared EFS security group once no desired EFS needs it; that security group remains owned exclusively by the separate aws-cloud-factory-infra repository"
 else
   fail "10: the shared EFS security-group data lookup in envs/dev/efs.tf is not conditional on desired managed deployments existing"
 fi
@@ -7465,7 +7465,7 @@ else
 fi
 
 echo ""
-echo "--- Old-VPC EFS decommission: explicit allowlist filters Terraform desired EFS without touching the canonical inventory ---"
+echo "--- Managed EFS decommission: explicit allowlist filters Terraform desired EFS without touching the canonical inventory ---"
 
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   EFS_DECOMMISSION_CHECK="$(python3 -c '
@@ -7556,7 +7556,7 @@ for label, ok in results:
     esac
   done <<< "$EFS_DECOMMISSION_CHECK"
 else
-  skip "EFS-DECOMMISSION: old-VPC EFS decommission allowlist checks -- python3 unavailable"
+  skip "EFS-DECOMMISSION: managed EFS decommission allowlist checks -- python3 unavailable"
 fi
 
 if grep -qE 'resource\s+"aws_security_group"' envs/dev/*.tf 2>/dev/null; then
@@ -7566,7 +7566,7 @@ else
 fi
 
 if grep -rqE 'resource\s+"aws_security_group"' --include='*.tf' . 2>/dev/null; then
-  fail "GOLDENGATE-EKS-APP introduces an aws_security_group resource somewhere in the repo -- the EFS security group (sg-09335be70fbc37745 / gg-poc-dev-efs-sg) remains owned exclusively by the separate aws-cloud-factory-infra repo; this repo may only look it up via a fail-closed data source, never create/manage/destroy it"
+  fail "GOLDENGATE-EKS-APP introduces an aws_security_group resource somewhere in the repo -- the shared GoldenGate EFS security group remains owned exclusively by the separate aws-cloud-factory-infra repository; this repo may only look it up via a fail-closed data source, never create/manage/destroy it"
 else
   pass "no aws_security_group resource exists anywhere in GOLDENGATE-EKS-APP -- the shared EFS SG remains owned exclusively by aws-cloud-factory-infra"
 fi
@@ -7590,7 +7590,7 @@ if [ "$PYTHON_AVAILABLE" = "true" ]; then
 import re
 with open("envs/dev/efs.tf") as f:
     text = f.read()
-# Structural proof (no Terraform CLI): for_each over the desired-EFS local (the folder-driven canonical local filtered by the explicit old-VPC decommission allowlist) always derives Terraform's module instance address (module.goldengate_runtime_efs[each.key]) from the map key, which is the deployment ID (see goldengate_inventory.tf's goldengate_managed_efs_deployments and efs.tf's goldengate_managed_efs_desired_deployments); two distinct DESIRED deployment IDs therefore always produce two distinct module addresses/module instances/filesystems, never a shared one.
+# Structural proof (no Terraform CLI): for_each over the desired-EFS local (the folder-driven canonical local filtered by the explicit managed-EFS decommission allowlist) always derives Terraform's module instance address (module.goldengate_runtime_efs[each.key]) from the map key, which is the deployment ID (see goldengate_inventory.tf's goldengate_managed_efs_deployments and efs.tf's goldengate_managed_efs_desired_deployments); two distinct DESIRED deployment IDs therefore always produce two distinct module addresses/module instances/filesystems, never a shared one.
 assert 'for_each = local.goldengate_managed_efs_desired_deployments' in text
 assert 'each.key' in text
 print("OK")
@@ -8020,7 +8020,7 @@ else
   fail "6: envs/dev/efs.tf references \"pipeline\" -- the module key must be derived from deployment ID alone"
 fi
 
-# Self-service: never a hardcoded exact inventory -- proves the live CANONICAL managed-EFS inventory is non-empty (list length >= 1) while also proving envs/dev/efs.tf's shared-SG data-source count no longer tracks that canonical count directly. Since local.goldengate_managed_efs_desired_deployments = canonical minus the explicit old-VPC decommission allowlist, and today's live decommission set exactly equals the live canonical set (see the "Old-VPC EFS decommission" checks above), the live SG lookup count actually evaluates to 0 even though the canonical inventory itself is non-empty -- this is the whole point of gating on desired rather than canonical (see the "EFS SG lookup lifecycle" checks above). The full dynamic-vs-derived semantic comparison lives in the "Self-service test architecture: generic descriptor invariants" section above; not duplicated here.
+# Self-service: never a hardcoded exact inventory -- proves the live CANONICAL managed-EFS inventory is non-empty (list length >= 1) while also proving envs/dev/efs.tf's shared-SG data-source count no longer tracks that canonical count directly. Since local.goldengate_managed_efs_desired_deployments = canonical minus the explicit managed-EFS decommission allowlist, and today's live decommission set exactly equals the live canonical set (see the "Managed EFS decommission" checks above), the live SG lookup count actually evaluates to 0 even though the canonical inventory itself is non-empty -- this is the whole point of gating on desired rather than canonical (see the "EFS SG lookup lifecycle" checks above). The full dynamic-vs-derived semantic comparison lives in the "Self-service test architecture: generic descriptor invariants" section above; not duplicated here.
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   set +e
   LIVE_INVENTORY_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev managed-efs-inventory 2>&1)"
@@ -8043,7 +8043,7 @@ else
 fi
 
 if grep -qE '^\s*module\s+"goldengate_runtime_efs"' envs/dev/efs.tf 2>/dev/null; then
-  pass "4: a single module.goldengate_runtime_efs block exists; for_each over local.goldengate_managed_efs_desired_deployments means exactly one Terraform module key (module.goldengate_runtime_efs[<id>]) is created per DESIRED managed deployment (canonical managed deployments minus the explicit old-VPC decommission allowlist)"
+  pass "4: a single module.goldengate_runtime_efs block exists; for_each over local.goldengate_managed_efs_desired_deployments means exactly one Terraform module key (module.goldengate_runtime_efs[<id>]) is created per DESIRED managed deployment (canonical managed deployments minus the explicit managed-EFS decommission allowlist)"
 else
   fail "4: envs/dev/efs.tf is missing the module.goldengate_runtime_efs block"
 fi
@@ -9363,7 +9363,7 @@ else
 fi
 
 if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  # Repo-wide scan of envs/dev/*.tf (excluding efs.tf, exempted for the reviewed EFS decommission allowlist) for a deployment-ID-specific carve-out; gg-repltest-mssql is a distinct RDS identifier and never matches.
+  # Repo-wide scan of envs/dev/*.tf (excluding efs.tf, exempted for the reviewed EFS decommission allowlist) for a deployment-ID-specific carve-out.
   TF_CARVEOUT_MATCHES="$(grep -lF "gg-mssql-repltest-01" envs/dev/*.tf 2>/dev/null | grep -vF "envs/dev/efs.tf" || true)"
   if [ -z "$TF_CARVEOUT_MATCHES" ]; then
     pass "no deployment-specific Terraform carve-out exists for the MSSQL runtime anywhere under envs/dev/*.tf (tracked or untracked) outside the explicit, reviewed EFS decommission allowlist -- the generic local.goldengate_managed_efs_deployments for_each and the restored shared gg-runtime-sa identity own it automatically"
