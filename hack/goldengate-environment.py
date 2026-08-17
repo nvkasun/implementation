@@ -431,38 +431,213 @@ def _eks_deploy_assume_role_policy(runner_role_arn):
     }
 
 
-# Fixed source-account/region/cluster/KMS literals that appear in the CURRENT committed policies_1.json templates -- the exact origin values being replaced, never invented. Applied as independent blanket substring substitutions: each token (a 10-char cluster name, a region code, two disjoint 12-digit account IDs, a UUID-shaped KMS key ID, and two disjoint path prefixes) never occurs as a substring of any other token here, so the six rules can never interfere with one another regardless of order.
-_ORIGIN_CLUSTER_NAME = "gg-poc-dev"
-_ORIGIN_REGION = "eu-west-1"
-_ORIGIN_WORKLOAD_ACCOUNT_ID = "668311715351"
-_ORIGIN_ECR_ACCOUNT_ID = "229410149234"
-_ORIGIN_KMS_KEY_ID = "b4220b12-5b1f-4379-a721-c56b09e0048e"
-_ORIGIN_SECRET_PATH_PREFIX = "dev/goldengate/"
-_ORIGIN_LOG_GROUP_PREFIX = "/adcb/goldengate/dev/"
+# Permission-content (policies_1.json) documents: built directly from derive_values(doc) plus these fixed, environment-neutral application constants (approved repository/table names) -- never by reading a previously generated policies_1.json as a template. Every approved Sid/Action/Condition below mirrors the currently-approved policy content exactly; only the environment-identity literals inside Resource/Condition values are ever derived.
+_ECR_OCI_READ_ACTIONS = [
+    "ecr:BatchCheckLayerAvailability",
+    "ecr:BatchGetImage",
+    "ecr:GetDownloadUrlForLayer",
+    "ecr:DescribeImages",
+    "ecr:DescribeRepositories",
+]
+
+# (repository name, Sid) for every approved Helm OCI repository the argocd-ecr-token-sync CronJob reads -- application constants, never per-environment.
+_ARGOCD_ECR_OCI_REPOSITORIES = [
+    ("helm/goldengate", "AllowReadGoldengateHelmOciRepository"),
+    ("helm/goldengate-monitor", "AllowReadGoldengateMonitorHelmOciRepository"),
+    ("helm/goldengate-platform", "AllowReadGoldengatePlatformHelmOciRepository"),
+    ("helm/gg-monitor", "AllowReadGgMonitorHelmOciRepository"),
+    ("helm/amazon-cloudwatch-observability", "AllowReadAmazonCloudWatchObservabilityHelmOciRepository"),
+]
+
+# GoldenGate's one shared canonical pipeline-state/monitoring DynamoDB table (see envs/dev/dynamodb.tf) -- a fixed application constant, never per-environment.
+_MONITOR_DYNAMODB_TABLE_NAME = "gg-eks-pipeline"
 
 
-def _substitute_arns(node, v):
-    """Recursively rewrites the environment-identity literals in policies_1.json permission statements -- account IDs, region, cluster name, KMS key ID, environment-prefixed paths -- from the derived values. Preserves every action/Sid/structure byte-for-byte; only environment-identity literals inside Resource/Condition strings change."""
-    if isinstance(node, dict):
-        return {k: _substitute_arns(val, v) for k, val in node.items()}
-    if isinstance(node, list):
-        return [_substitute_arns(item, v) for item in node]
-    if isinstance(node, str):
-        kms_key_id = v["MONITOR_DYNAMODB_KMS_KEY_ARN"].split(":key/", 1)[-1]
-        result = node
-        result = result.replace(_ORIGIN_CLUSTER_NAME, v["EKS_CLUSTER_NAME"])
-        result = result.replace(_ORIGIN_REGION, v["AWS_REGION"])
-        result = result.replace(_ORIGIN_WORKLOAD_ACCOUNT_ID, v["WORKLOAD_ACCOUNT_ID"])
-        result = result.replace(_ORIGIN_ECR_ACCOUNT_ID, v["ECR_ACCOUNT_ID"])
-        result = result.replace(_ORIGIN_KMS_KEY_ID, kms_key_id)
-        result = result.replace(_ORIGIN_LOG_GROUP_PREFIX, f"/adcb/goldengate/{v['GG_ENVIRONMENT']}/")
-        result = result.replace(_ORIGIN_SECRET_PATH_PREFIX, f"{v['GG_ENVIRONMENT']}/goldengate/")
-        return result
-    return node
+def _argocd_ecr_oci_read_policy(v):
+    statements = [
+        {
+            "Sid": "AllowGetEcrAuthorizationToken",
+            "Effect": "Allow",
+            "Action": ["ecr:GetAuthorizationToken"],
+            "Resource": "*",
+        }
+    ]
+    for repo_name, sid in _ARGOCD_ECR_OCI_REPOSITORIES:
+        statements.append({
+            "Sid": sid,
+            "Effect": "Allow",
+            "Action": list(_ECR_OCI_READ_ACTIONS),
+            "Resource": f"arn:aws:ecr:{v['AWS_REGION']}:{v['ECR_ACCOUNT_ID']}:repository/{repo_name}",
+        })
+    return {"Version": "2012-10-17", "Statement": statements}
+
+
+def _cloudwatch_metrics_policy(v):
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "AllowPutContainerInsightsMetricData",
+                "Effect": "Allow",
+                "Action": ["cloudwatch:PutMetricData"],
+                "Resource": "*",
+                "Condition": {"StringEqualsIfExists": {"cloudwatch:namespace": "ContainerInsights"}},
+            },
+            {
+                "Sid": "AllowWriteContainerInsightsPerformanceLogEvents",
+                "Effect": "Allow",
+                "Action": ["logs:CreateLogStream", "logs:DescribeLogStreams", "logs:PutLogEvents"],
+                "Resource": f"arn:aws:logs:{v['AWS_REGION']}:{v['WORKLOAD_ACCOUNT_ID']}:log-group:{v['CONTAINER_INSIGHTS_LOG_GROUP']}:*",
+            },
+            {
+                "Sid": "AllowDescribeLogGroupsForContainerInsightsDiscovery",
+                "Effect": "Allow",
+                "Action": ["logs:DescribeLogGroups"],
+                "Resource": "*",
+            },
+            {
+                "Sid": "AllowEc2MetadataRequiredByCloudWatchAgent",
+                "Effect": "Allow",
+                "Action": ["ec2:DescribeTags", "ec2:DescribeVolumes"],
+                "Resource": "*",
+            },
+        ],
+    }
+
+
+def _eks_deploy_policy(v):
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "AllowDescribeGoldenGateEksCluster",
+                "Effect": "Allow",
+                "Action": ["eks:DescribeCluster"],
+                "Resource": v["EKS_CLUSTER_ARN"],
+            },
+            {
+                "Sid": "AllowQueryGoldenGateLegacyInventoryDynamoDbTable",
+                "Effect": "Allow",
+                "Action": ["dynamodb:Query"],
+                "Resource": f"arn:aws:dynamodb:{v['AWS_REGION']}:{v['WORKLOAD_ACCOUNT_ID']}:table/{_MONITOR_DYNAMODB_TABLE_NAME}",
+            },
+            {
+                "Sid": "AllowDescribeGoldenGateLegacyInventoryEfsResources",
+                "Effect": "Allow",
+                "Action": ["elasticfilesystem:DescribeAccessPoints", "elasticfilesystem:DescribeFileSystems"],
+                "Resource": "*",
+            },
+            {
+                "Sid": "AllowReadOnlyGoldenGateSharedSecretValidation",
+                "Effect": "Allow",
+                "Action": ["secretsmanager:DescribeSecret", "secretsmanager:ListSecretVersionIds"],
+                "Resource": [
+                    f"arn:aws:secretsmanager:{v['AWS_REGION']}:{v['WORKLOAD_ACCOUNT_ID']}:secret:{v['SOURCE_ADMIN_SECRET_NAME']}-??????",
+                    f"arn:aws:secretsmanager:{v['AWS_REGION']}:{v['WORKLOAD_ACCOUNT_ID']}:secret:{v['TARGET_ADMIN_SECRET_NAME']}-??????",
+                    f"arn:aws:secretsmanager:{v['AWS_REGION']}:{v['WORKLOAD_ACCOUNT_ID']}:secret:{v['TLS_SECRET_NAME']}-??????",
+                ],
+            },
+        ],
+    }
+
+
+def _monitor_read_policy(v):
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "AllowReadGoldenGateMonitorSecrets",
+                "Effect": "Allow",
+                "Action": ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
+                "Resource": [f"arn:aws:secretsmanager:{v['AWS_REGION']}:{v['WORKLOAD_ACCOUNT_ID']}:secret:{v['GG_ENVIRONMENT']}/goldengate/*"],
+            },
+            {
+                "Sid": "AllowDecryptGoldenGateMonitorSecretsKms",
+                "Effect": "Allow",
+                "Action": ["kms:Decrypt"],
+                "Resource": "*",
+            },
+            {
+                "Sid": "AllowReadWriteGoldenGateMonitoringState",
+                "Effect": "Allow",
+                "Action": ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DescribeTable"],
+                "Resource": f"arn:aws:dynamodb:{v['AWS_REGION']}:{v['WORKLOAD_ACCOUNT_ID']}:table/{_MONITOR_DYNAMODB_TABLE_NAME}",
+            },
+            {
+                "Sid": "AllowDecryptGoldenGateMonitoringTable",
+                "Effect": "Allow",
+                "Action": "kms:Decrypt",
+                "Resource": v["MONITOR_DYNAMODB_KMS_KEY_ARN"],
+                "Condition": {
+                    "StringEquals": {
+                        "kms:ViaService": f"dynamodb.{v['AWS_REGION']}.amazonaws.com",
+                        "kms:CallerAccount": v["WORKLOAD_ACCOUNT_ID"],
+                        "kms:EncryptionContext:aws:dynamodb:tableName": _MONITOR_DYNAMODB_TABLE_NAME,
+                        "kms:EncryptionContext:aws:dynamodb:subscriberId": v["WORKLOAD_ACCOUNT_ID"],
+                    },
+                },
+            },
+            {
+                "Sid": "AllowPublishGoldenGateMonitoringMetrics",
+                "Effect": "Allow",
+                "Action": ["cloudwatch:PutMetricData"],
+                "Resource": "*",
+                "Condition": {"StringEquals": {"cloudwatch:namespace": "GoldenGate/Pipelines"}},
+            },
+        ],
+    }
+
+
+def _platform_logging_policy(v):
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "AllowWriteGoldenGateContainerLogsToPreCreatedGroups",
+                "Effect": "Allow",
+                "Action": ["logs:CreateLogStream", "logs:DescribeLogStreams", "logs:PutLogEvents"],
+                "Resource": [
+                    f"arn:aws:logs:{v['AWS_REGION']}:{v['WORKLOAD_ACCOUNT_ID']}:log-group:{v['RUNTIME_LOG_GROUP']}:*",
+                    f"arn:aws:logs:{v['AWS_REGION']}:{v['WORKLOAD_ACCOUNT_ID']}:log-group:{v['MONITOR_LOG_GROUP']}:*",
+                ],
+            },
+        ],
+    }
+
+
+def _secrets_read_policy(v):
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "AllowReadGoldenGateDevSecrets",
+                "Effect": "Allow",
+                "Action": ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
+                "Resource": [f"arn:aws:secretsmanager:{v['AWS_REGION']}:{v['WORKLOAD_ACCOUNT_ID']}:secret:{v['GG_ENVIRONMENT']}/goldengate/*"],
+            },
+            {
+                "Sid": "AllowDecryptGoldenGateSecretsKms",
+                "Effect": "Allow",
+                "Action": ["kms:Decrypt"],
+                "Resource": "*",
+            },
+        ],
+    }
+
+
+# (policy_folder -> builder(v)) for every generated policies_1.json -- the ONLY place permission-policy content is constructed; generate_policy_files() below never reads a generated file as input.
+_PERMISSION_POLICY_BUILDERS = {
+    "argocd-ecr-oci-read-dev": _argocd_ecr_oci_read_policy,
+    "goldengate-cloudwatch-metrics-dev": _cloudwatch_metrics_policy,
+    "goldengate-eks-deploy-dev": _eks_deploy_policy,
+    "goldengate-monitor-read-dev": _monitor_read_policy,
+    "goldengate-platform-logging-dev": _platform_logging_policy,
+    "goldengate-secrets-read-dev": _secrets_read_policy,
+}
 
 
 def generate_policy_files(doc):
-    """Returns {relative_path: parsed_json_dict} for every generated envs/dev/policies/** file, derived purely from environment.yaml + this module's fixed, reviewed permission templates. Deterministic: calling this twice on the same input produces byte-identical output."""
+    """Returns {relative_path: parsed_json_dict} for every generated envs/dev/policies/** file, derived purely from environment.yaml (via derive_values) plus this module's fixed, reviewed permission-policy builders. Never reads a previously generated policies_1.json/sts.json as input -- deterministic and independent of prior output: calling this twice on the same environment.yaml input always produces byte-identical output, even after environment.yaml has changed multiple times in a row."""
     v = derive_values(doc)
     out = {}
 
@@ -475,13 +650,9 @@ def generate_policy_files(doc):
         _eks_deploy_assume_role_policy(v["RUNNER_ROLE_ARN"])
     )
 
-    # Permission-content (policies_1.json) files: read the CURRENT committed file as the template of approved actions/Sids/structure, and rewrite only the environment-identity literals within it. This never invents/broadens an action -- it is a pure identity substitution over the already-approved content.
-    for folder in list(_IRSA_ROLE_FOLDERS.keys()) + ["goldengate-eks-deploy-dev"]:
+    for folder, builder in _PERMISSION_POLICY_BUILDERS.items():
         rel = f"envs/{doc['environment']}/policies/{folder}/policies/policies_1.json"
-        abs_path = os.path.join(REPO_ROOT, rel)
-        with open(abs_path) as f:
-            template = json.load(f)
-        out[rel] = _substitute_arns(template, v)
+        out[rel] = builder(v)
 
     return out
 
