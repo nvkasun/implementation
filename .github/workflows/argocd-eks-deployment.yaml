@@ -59,6 +59,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Load canonical environment configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" validate
+          python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" github-env >> "$GITHUB_ENV"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -328,7 +336,16 @@ jobs:
           set -euo pipefail
 
           helm lint "$HELM_CHART_PATH" \
-            --values "$VALUES_FILE"
+            --values "$VALUES_FILE" \
+            --set-string argo-cd.global.image.repository="${ECR_REGISTRY}/aws-cloud-factory-infra-argocd" \
+            --set-string argo-cd.redis.image.repository="${ECR_REGISTRY}/aws-cloud-factory-infra-redis-alpine" \
+            --set-string ecrTokenSync.roleArn="${ARGOCD_ECR_READ_ROLE_ARN}" \
+            --set-string ecrTokenSync.awsRegion="${AWS_REGION}" \
+            --set-string ecrTokenSync.ecrRegistry="${ECR_REGISTRY}" \
+            --set-string ecrTokenSync.image.repository="${ECR_REGISTRY}/aws-cloud-factory-infra-aws-kubectl" \
+            --set-string argocdServerIngress.host="${ARGOCD_HOST}" \
+            --set-string argocdServerIngress.groupName="${ALB_GROUP_NAME}" \
+            --set-string argocdServerIngress.certificateArn="${ACM_CERTIFICATE_ARN}"
 
       - name: Render Argo CD manifests for validation
         shell: bash
@@ -340,6 +357,15 @@ jobs:
           helm template "$ARGOCD_RELEASE_NAME" "$HELM_CHART_PATH" \
             --namespace "$ARGOCD_NAMESPACE" \
             --values "$VALUES_FILE" \
+            --set-string argo-cd.global.image.repository="${ECR_REGISTRY}/aws-cloud-factory-infra-argocd" \
+            --set-string argo-cd.redis.image.repository="${ECR_REGISTRY}/aws-cloud-factory-infra-redis-alpine" \
+            --set-string ecrTokenSync.roleArn="${ARGOCD_ECR_READ_ROLE_ARN}" \
+            --set-string ecrTokenSync.awsRegion="${AWS_REGION}" \
+            --set-string ecrTokenSync.ecrRegistry="${ECR_REGISTRY}" \
+            --set-string ecrTokenSync.image.repository="${ECR_REGISTRY}/aws-cloud-factory-infra-aws-kubectl" \
+            --set-string argocdServerIngress.host="${ARGOCD_HOST}" \
+            --set-string argocdServerIngress.groupName="${ALB_GROUP_NAME}" \
+            --set-string argocdServerIngress.certificateArn="${ACM_CERTIFICATE_ARN}" \
             > "rendered/${ARGOCD_RELEASE_NAME}.yaml"
 
           echo "Rendered manifest: rendered/${ARGOCD_RELEASE_NAME}.yaml"
@@ -353,11 +379,13 @@ jobs:
 
           echo "Checking rendered manifest for ECR token sync resources: ${RENDERED}"
 
+          ECR_TOKEN_SYNC_TAG="$(python3 -c "import yaml; print(yaml.safe_load(open('${VALUES_FILE}'))['ecrTokenSync']['image']['tag'])")"
+
           # Fails before package/push/deploy if the CronJob, its RBAC, IRSA annotation, or pinned image are missing from the rendered chart.
           grep -q "kind: CronJob" "$RENDERED"
           grep -q "name: argocd-ecr-token-sync" "$RENDERED"
-          grep -q "eks.amazonaws.com/role-arn: arn:aws:iam::668311715351:role/GoldenGateArgocdECRRead-dev" "$RENDERED"
-          grep -q "aws-cloud-factory-infra-aws-kubectl:1.33.13" "$RENDERED"
+          grep -q "eks.amazonaws.com/role-arn: ${ARGOCD_ECR_READ_ROLE_ARN}" "$RENDERED"
+          grep -q "${ECR_REGISTRY}/aws-cloud-factory-infra-aws-kubectl:${ECR_TOKEN_SYNC_TAG}" "$RENDERED"
 
           echo "Checking multi-repository token sync (all four GoldenGate/CloudWatch Observability Helm OCI repositories: goldengate, goldengate-monitor, goldengate-platform, amazon-cloudwatch-observability)..."
 
@@ -596,6 +624,15 @@ jobs:
             --version "$CHART_VERSION" \
             --namespace "$ARGOCD_NAMESPACE" \
             --values "$VALUES_FILE" \
+            --set-string argo-cd.global.image.repository="${ECR_REGISTRY}/aws-cloud-factory-infra-argocd" \
+            --set-string argo-cd.redis.image.repository="${ECR_REGISTRY}/aws-cloud-factory-infra-redis-alpine" \
+            --set-string ecrTokenSync.roleArn="${ARGOCD_ECR_READ_ROLE_ARN}" \
+            --set-string ecrTokenSync.awsRegion="${AWS_REGION}" \
+            --set-string ecrTokenSync.ecrRegistry="${ECR_REGISTRY}" \
+            --set-string ecrTokenSync.image.repository="${ECR_REGISTRY}/aws-cloud-factory-infra-aws-kubectl" \
+            --set-string argocdServerIngress.host="${ARGOCD_HOST}" \
+            --set-string argocdServerIngress.groupName="${ALB_GROUP_NAME}" \
+            --set-string argocdServerIngress.certificateArn="${ACM_CERTIFICATE_ARN}" \
             --wait \
             --atomic \
             --cleanup-on-fail \

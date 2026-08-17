@@ -27,15 +27,29 @@ OBSERVABILITY_WORKFLOW=".github/workflows/goldengate-observability.yaml"
 ARGOCD_VALUES_FILE="envs/dev/argocd/values.yaml"
 ARGOCD_DEPLOY_WORKFLOW=".github/workflows/argocd-eks-deployment.yaml"
 
-# runtime.image.repository/ingress.hostDomain/ingress.alb.groupName/ingress.alb.certificateArn are shared environment configuration -- resolved once here via the same resolver the deploy workflow uses, never an independently maintained literal.
+# runtime.image.repository/ingress.hostDomain/ingress.alb.groupName/ingress.alb.certificateArn/runtime.csi.region are shared environment configuration -- resolved once here via the same resolver the deploy workflow uses, never an independently maintained literal.
 RESOLVED_DNS_DOMAIN="$(python3 "$ENVIRONMENT_TOOL" --environment dev get DNS_DOMAIN)"
 RESOLVED_ALB_GROUP_NAME="$(python3 "$ENVIRONMENT_TOOL" --environment dev get ALB_GROUP_NAME)"
 RESOLVED_CERTIFICATE_ARN="$(python3 "$ENVIRONMENT_TOOL" --environment dev get ACM_CERTIFICATE_ARN)"
+RESOLVED_AWS_REGION="$(python3 "$ENVIRONMENT_TOOL" --environment dev get AWS_REGION)"
 SHARED_INGRESS_OVERRIDES=(--set-string ingress.hostDomain="$RESOLVED_DNS_DOMAIN" --set-string ingress.alb.groupName="$RESOLVED_ALB_GROUP_NAME" --set-string ingress.alb.certificateArn="$RESOLVED_CERTIFICATE_ARN")
 
+# Phase 10B: envs/dev/goldengate-monitor/values.yaml no longer carries namespace.name/aws.region/serviceAccount.roleArn -- resolved here the same way the monitor deploy workflow does.
+RESOLVED_MONITOR_NAMESPACE="$(python3 "$ENVIRONMENT_TOOL" --environment dev get MONITOR_NAMESPACE)"
+RESOLVED_MONITOR_ROLE_ARN="$(python3 "$ENVIRONMENT_TOOL" --environment dev get MONITOR_ROLE_ARN)"
+RESOLVED_MONITOR_HOST="$(python3 "$ENVIRONMENT_TOOL" --environment dev get MONITOR_HOST)"
+MONITOR_SHARED_OVERRIDES=(--set-string namespace.name="$RESOLVED_MONITOR_NAMESPACE" --set-string aws.region="$RESOLVED_AWS_REGION" --set-string serviceAccount.roleArn="$RESOLVED_MONITOR_ROLE_ARN")
+
+# Phase 10C: platform/dev/goldengate-platform/values.yaml no longer carries environment/namespaces.runtime.name/fluentBit.namespaces.*/fluentBit.cloudwatch.* -- resolved here the same way the platform deploy workflow does.
+RESOLVED_GG_ENVIRONMENT="$(python3 "$ENVIRONMENT_TOOL" --environment dev get GG_ENVIRONMENT)"
+RESOLVED_RUNTIME_NAMESPACE="$(python3 "$ENVIRONMENT_TOOL" --environment dev get RUNTIME_NAMESPACE)"
+RESOLVED_RUNTIME_LOG_GROUP="$(python3 "$ENVIRONMENT_TOOL" --environment dev get RUNTIME_LOG_GROUP)"
+RESOLVED_MONITOR_LOG_GROUP="$(python3 "$ENVIRONMENT_TOOL" --environment dev get MONITOR_LOG_GROUP)"
+PLATFORM_SHARED_OVERRIDES=(--set-string environment="$RESOLVED_GG_ENVIRONMENT" --set-string namespaces.runtime.name="$RESOLVED_RUNTIME_NAMESPACE" --set-string fluentBit.namespaces.runtime="$RESOLVED_RUNTIME_NAMESPACE" --set-string fluentBit.namespaces.monitoring="$RESOLVED_MONITOR_NAMESPACE" --set-string fluentBit.cloudwatch.runtimeLogGroupName="$RESOLVED_RUNTIME_LOG_GROUP" --set-string fluentBit.cloudwatch.monitorLogGroupName="$RESOLVED_MONITOR_LOG_GROUP")
+
 # Shared-secret identities (role-derived admin secret) plus the restored shared gg-runtime-sa identity the deploy workflow injects via --set; direct helm invocations against the two known historical fixtures below must mirror them. Image repository is now resolved per-deployment (below) since it depends on the descriptor's own runtime.image.repositoryName.
-ORACLE_SHARED_OVERRIDES=(--set runtime.csi.admin.objectName=dev/goldengate/source/admin --set runtime.csi.certificate.objectName=dev/goldengate/tls-certificate --set runtime.serviceAccount.create=false --set runtime.serviceAccount.name=gg-runtime-sa "${SHARED_INGRESS_OVERRIDES[@]}" --set-string runtime.image.repository="$(python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev describe gg-postgresql-repltest-01 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["imageRepository"])')")
-POSTGRESQL_SHARED_OVERRIDES=(--set runtime.csi.admin.objectName=dev/goldengate/target/admin --set runtime.csi.certificate.objectName=dev/goldengate/tls-certificate --set runtime.serviceAccount.create=false --set runtime.serviceAccount.name=gg-runtime-sa "${SHARED_INGRESS_OVERRIDES[@]}" --set-string runtime.image.repository="$(python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev describe gg-mssql-repltest-01 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["imageRepository"])')")
+ORACLE_SHARED_OVERRIDES=(--set runtime.csi.admin.objectName=dev/goldengate/source/admin --set runtime.csi.certificate.objectName=dev/goldengate/tls-certificate --set-string runtime.csi.region="$RESOLVED_AWS_REGION" --set runtime.serviceAccount.create=false --set runtime.serviceAccount.name=gg-runtime-sa "${SHARED_INGRESS_OVERRIDES[@]}" --set-string runtime.image.repository="$(python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev describe gg-postgresql-repltest-01 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["imageRepository"])')")
+POSTGRESQL_SHARED_OVERRIDES=(--set runtime.csi.admin.objectName=dev/goldengate/target/admin --set runtime.csi.certificate.objectName=dev/goldengate/tls-certificate --set-string runtime.csi.region="$RESOLVED_AWS_REGION" --set runtime.serviceAccount.create=false --set runtime.serviceAccount.name=gg-runtime-sa "${SHARED_INGRESS_OVERRIDES[@]}" --set-string runtime.image.repository="$(python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev describe gg-mssql-repltest-01 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["imageRepository"])')")
 
 # Self-service: for any REAL-repository render loop that dynamically iterates the live inventory (never a fixed ID list), overrides are derived from the deployment model's own `describe` output -- never a hardcoded oracle-vs-postgresql binary -- so a newly onboarded folder of any deploymentType/role is rendered correctly without touching this file. Sets the global array SHARED_OVERRIDES. Uses the exact same dry-run managed-EFS placeholder the real deploy=false workflow uses (fs-0dead0000000beef0); mode=existing already carries its own committed fileSystemId in the descriptor's own values.yaml, so no override is needed there.
 derive_shared_overrides_for_deployment() {
@@ -47,7 +61,7 @@ derive_shared_overrides_for_deployment() {
   sa_name="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["runtimeServiceAccountName"])' <<< "$describe_json")"
   efs_mode="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["efsMode"] or "")' <<< "$describe_json")"
   image_repository="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["imageRepository"])' <<< "$describe_json")"
-  SHARED_OVERRIDES=(--set runtime.csi.admin.objectName="$admin_secret" --set runtime.csi.certificate.objectName="$tls_secret" --set runtime.serviceAccount.create=false --set runtime.serviceAccount.name="$sa_name" --set-string runtime.image.repository="$image_repository" "${SHARED_INGRESS_OVERRIDES[@]}")
+  SHARED_OVERRIDES=(--set runtime.csi.admin.objectName="$admin_secret" --set runtime.csi.certificate.objectName="$tls_secret" --set-string runtime.csi.region="$RESOLVED_AWS_REGION" --set runtime.serviceAccount.create=false --set runtime.serviceAccount.name="$sa_name" --set-string runtime.image.repository="$image_repository" "${SHARED_INGRESS_OVERRIDES[@]}")
   if [ "$efs_mode" = "managed" ]; then
     SHARED_OVERRIDES+=(--set persistence.efs.fileSystemId=fs-0dead0000000beef0)
   fi
@@ -336,6 +350,7 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
       --set-string fluentBit.serviceAccount.roleArn="$FAKE_FLUENT_BIT_ROLE_ARN" \
       --set-string fluentBit.aws.region="eu-west-1" \
       --set-string fluentBit.image.reference="$FAKE_FLUENT_BIT_IMAGE" \
+      "${PLATFORM_SHARED_OVERRIDES[@]}" \
       >"${WORKDIR}/lint-platform-fluentbit.log" 2>&1; then
     pass "helm lint ${PLATFORM_CHART} (dev values, fluentBit.create=true, private digest image)"
   else
@@ -350,6 +365,7 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
       --set-string fluentBit.serviceAccount.roleArn="$FAKE_FLUENT_BIT_ROLE_ARN" \
       --set-string fluentBit.aws.region="eu-west-1" \
       --set-string fluentBit.image.reference="$FAKE_FLUENT_BIT_IMAGE" \
+      "${PLATFORM_SHARED_OVERRIDES[@]}" \
       > "$PLATFORM_FLUENTBIT_RENDERED" 2>"${WORKDIR}/template-platform-fluentbit.log"; then
     pass "helm template ${PLATFORM_CHART} (dev values, fluentBit.create=true, private digest image) renders"
   else
@@ -363,6 +379,7 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
       --set-string runtimeServiceAccount.roleArn="$FAKE_ORACLE_ROLE_ARN" \
       --set-string fluentBit.serviceAccount.roleArn="$FAKE_FLUENT_BIT_ROLE_ARN" \
       --set-string fluentBit.aws.region="eu-west-1" \
+      "${PLATFORM_SHARED_OVERRIDES[@]}" \
       >"${WORKDIR}/template-platform-no-image.log" 2>&1; then
     fail "helm template ${PLATFORM_CHART} unexpectedly succeeded with fluentBit.image.reference empty"
   else
@@ -877,8 +894,11 @@ def check(actual, expected, label, results):
         results.append(f"{label}={actual!r}(expected {expected!r})")
 
 results = []
-check(v.get("clusterName"), "gg-poc-dev", "clusterName", results)
-check(v.get("region"), "eu-west-1", "region", results)
+# Fresh-EKS Phase A/Phase 10: clusterName/region are shared environment identity -- the committed values file must NOT carry them; the deploy workflow injects both into work/generated-values.yaml from the canonical resolver (EKS_CLUSTER_NAME/AWS_REGION).
+if "clusterName" in v:
+    results.append(f"clusterName={v.get('clusterName')!r}(expected absent -- injected into generated-values.yaml, not committed)")
+if "region" in v:
+    results.append(f"region={v.get('region')!r}(expected absent -- injected into generated-values.yaml, not committed)")
 check(v.get("k8sMode"), "EKS", "k8sMode", results)
 check(v.get("containerLogs", {}).get("enabled"), False, "containerLogs.enabled", results)
 check(v.get("containerInsights", {}).get("enabled"), False, "containerInsights.enabled", results)
@@ -893,7 +913,6 @@ check(v.get("nodeExporter", {}).get("enabled"), True, "nodeExporter.enabled", re
 check(v.get("agent", {}).get("prometheus", {}).get("targetAllocator", {}).get("enabled"), False, "agent.prometheus.targetAllocator.enabled", results)
 check(v.get("agent", {}).get("serviceAccount", {}).get("name"), "cloudwatch-agent", "agent.serviceAccount.name", results)
 
-private_domain = "229410149234.dkr.ecr.eu-west-1.amazonaws.com"
 expected_repos = {
     "manager": "aws-cloud-factory-cloudwatch-agent-operator",
     "agent": "aws-cloud-factory-cloudwatch-agent",
@@ -903,7 +922,9 @@ expected_repos = {
 found_repos = set()
 for top_key, expected_repo in expected_repos.items():
     image = v.get(top_key, {}).get("image", {})
-    check(image.get("repositoryDomainMap", {}).get("public"), private_domain, f"{top_key}.image.repositoryDomainMap.public", results)
+    # Fresh-EKS Phase A/Phase 10: repositoryDomainMap.public is shared environment identity (ECR_REGISTRY) -- the committed values file must NOT carry it; the deploy workflow injects it into work/generated-values.yaml for all four images.
+    if "repositoryDomainMap" in image:
+        results.append(f"{top_key}.image.repositoryDomainMap={image.get('repositoryDomainMap')!r}(expected absent -- injected into generated-values.yaml, not committed)")
     check(image.get("repository"), expected_repo, f"{top_key}.image.repository", results)
     found_repos.add(image.get("repository"))
 
@@ -1038,7 +1059,7 @@ all_run_text = "\n".join(s.get("run", "") for s in steps)
 
 if "6.2.0" not in all_run_text:
     results.append("chart-version-6.2.0-not-referenced")
-if "oci://" not in all_run_text or "helm/amazon-cloudwatch-observability" not in all_run_text:
+if "oci://" not in all_run_text or ("helm/amazon-cloudwatch-observability" not in all_run_text and "${HELM_OCI_NAMESPACE}/${CHART_NAME}" not in all_run_text):
     results.append("private-oci-chart-ref-not-referenced")
 if "aws-observability" in all_run_text.lower() and "helm repo add" in all_run_text.lower():
     results.append("workflow-adds-public-helm-repo")
@@ -1119,13 +1140,16 @@ else:
         results.append("oci-path-not-exactly-dot")
     if re.search(r'"chart"\s*:', run_text):
         results.append("unexpected-chart-field-present")
-    if 'repoURL": "oci://229410149234.dkr.ecr.eu-west-1.amazonaws.com/helm/amazon-cloudwatch-observability"' not in run_text:
+    # Fresh-EKS Phase A/Phase 10: repoURL/targetRevision/namespace are shared environment identity, no longer literals embedded in this step -- resolved once via HELM_CHART_REF (built from the canonical ECR_REGISTRY) and the existing CHART_VERSION/OBSERVABILITY_NAMESPACE constants, then passed as argv into this exact Python dict construction.
+    if '"repoURL": helm_chart_ref' not in run_text:
         results.append("repoURL-changed-or-missing")
-    if '"targetRevision": "6.2.0"' not in run_text:
+    if '"targetRevision": chart_version' not in run_text:
         results.append("targetRevision-changed-or-missing")
+    if 'HELM_CHART_REF="oci://${ECR_REGISTRY}/${HELM_OCI_NAMESPACE}/${CHART_NAME}"' not in run_text:
+        results.append("helm-chart-ref-not-derived-from-ecr-registry")
 
     # --- Correction 2: ignoreDifferences + RespectIgnoreDifferences -------
-    if not re.search(r'"group"\s*:\s*""\s*,\s*\n\s*"kind"\s*:\s*"ServiceAccount"\s*,\s*\n\s*"name"\s*:\s*"cloudwatch-agent"\s*,\s*\n\s*"namespace"\s*:\s*"amazon-cloudwatch"', run_text):
+    if not re.search(r'"group"\s*:\s*""\s*,\s*\n\s*"kind"\s*:\s*"ServiceAccount"\s*,\s*\n\s*"name"\s*:\s*"cloudwatch-agent"\s*,\s*\n\s*"namespace"\s*:\s*observability_namespace', run_text):
         results.append("ignoreDifferences-rule-not-exact")
     if '/metadata/annotations/eks.amazonaws.com~1role-arn' not in run_text:
         results.append("missing-role-arn-json-pointer")
@@ -1661,8 +1685,9 @@ if isinstance(agent_block, dict):
     img = agent_block.get("image", {})
     if img.get("repository") != "aws-cloud-factory-cloudwatch-agent":
         results.append("agent.image.repository-missing-or-changed")
-    if img.get("repositoryDomainMap", {}).get("public") != "229410149234.dkr.ecr.eu-west-1.amazonaws.com":
-        results.append("agent.image.repositoryDomainMap.public-missing-or-changed")
+    # Fresh-EKS Phase A/Phase 10: repositoryDomainMap.public is shared environment identity, injected into work/generated-values.yaml by the deploy workflow -- the committed values file must NOT carry it.
+    if "repositoryDomainMap" in img:
+        results.append("agent.image.repositoryDomainMap-present-but-should-be-injected-not-committed")
     if agent_block.get("prometheus", {}).get("targetAllocator", {}).get("enabled") is not False:
         results.append("agent.prometheus.targetAllocator.enabled-missing-or-changed")
 else:
@@ -2172,6 +2197,7 @@ if [ "$HELM_AVAILABLE" = "true" ] && [ "$PYTHON_AVAILABLE" = "true" ]; then
   if helm template gg-monitor "$MONITOR_CHART_STAGED" --namespace goldengate-monitoring \
       -f envs/dev/goldengate-monitor/values.yaml \
       --set image.repository=example.invalid/goldengate-monitor --set image.tag=test \
+      "${MONITOR_SHARED_OVERRIDES[@]}" \
       > "$MONITOR_RENDERED" 2>"${WORKDIR}/monitor-render.err"; then
     for kind_name in "Deployment gg-monitor" "Service gg-monitor" "ServiceAccount gg-monitor" "ConfigMap goldengate-monitor-canonical-config"; do
       kind="${kind_name% *}"
@@ -2186,9 +2212,10 @@ if [ "$HELM_AVAILABLE" = "true" ] && [ "$PYTHON_AVAILABLE" = "true" ]; then
        helm template gg-monitor "$MONITOR_CHART_STAGED" --namespace goldengate-monitoring \
          -f envs/dev/goldengate-monitor/values.yaml \
          --set image.repository=example.invalid/goldengate-monitor --set image.tag=test \
-         --set ingress.enabled=true --set ingress.host=monitor.goldengate-dev.adcbmis.local \
-         --set ingress.alb.certificateArn=arn:aws:acm:eu-west-1:668311715351:certificate/test \
-         2>/dev/null | grep -q "host: monitor.goldengate-dev.adcbmis.local"; then
+         "${MONITOR_SHARED_OVERRIDES[@]}" \
+         --set ingress.enabled=true --set-string ingress.host="$RESOLVED_MONITOR_HOST" \
+         --set-string ingress.alb.certificateArn="$RESOLVED_CERTIFICATE_ARN" \
+         2>/dev/null | grep -q "host: ${RESOLVED_MONITOR_HOST}"; then
       pass "goldengate-monitor Ingress renders with the existing hostname when enabled"
     else
       fail "goldengate-monitor Ingress does not render the existing hostname"
@@ -3763,6 +3790,7 @@ fi
 if [ "$HELM_AVAILABLE" = "true" ]; then
   if helm template gg-monitor "$MONITOR_CHART_STAGED" --namespace goldengate-monitoring \
       --set image.repository=example.com/x --set image.tag=1 --set serviceAccount.roleArn=arn:aws:iam::000000000000:role/x \
+      --set-string namespace.name=goldengate-monitoring --set-string aws.region="$RESOLVED_AWS_REGION" \
       2>"${WORKDIR}/monitor-legacy-render.err" | grep -q "LEGACY_FALLBACK_ENABLED"; then
     fail "rendered goldengate-monitor Deployment still contains LEGACY_FALLBACK_ENABLED"
   else
@@ -3974,11 +4002,13 @@ else
   fail "7: the platform workflow no longer references GoldenGateSecretsReadRole-dev for the shared runtime ServiceAccount"
 fi
 
-# 8. gg-monitor still references GoldenGateMonitorReadRole-dev.
+# 8. Fresh-EKS Phase A/Phase 10: serviceAccount.roleArn is shared environment identity, removed from envs/dev/goldengate-monitor/values.yaml -- gg-monitor's IRSA role must now be injected by the monitor workflow from the canonical resolver (MONITOR_ROLE_ARN), never a re-typed literal in the committed values file.
 if grep -q "role/GoldenGateMonitorReadRole-dev" "envs/dev/goldengate-monitor/values.yaml" 2>/dev/null; then
-  pass "8: gg-monitor still references GoldenGateMonitorReadRole-dev"
+  fail "8: envs/dev/goldengate-monitor/values.yaml still hardcodes GoldenGateMonitorReadRole-dev -- it must be injected via the workflow's resolver, not committed"
+elif grep -q 'set-string serviceAccount.roleArn="\$MONITOR_ROLE_ARN"' "$MONITOR_WORKFLOW" 2>/dev/null; then
+  pass "8: gg-monitor's IRSA role is injected from the canonical resolver (MONITOR_ROLE_ARN), not hardcoded in envs/dev/goldengate-monitor/values.yaml"
 else
-  fail "8: envs/dev/goldengate-monitor/values.yaml no longer references GoldenGateMonitorReadRole-dev"
+  fail "8: the monitor workflow no longer injects serviceAccount.roleArn from MONITOR_ROLE_ARN"
 fi
 
 # 11. Terraform references remain valid: iam.tf's module block still exists, still derives its name from the canonical environment config (Fresh-EKS Phase A -- never a re-typed literal), and still attaches the same policy_folder.
@@ -5170,13 +5200,14 @@ else
 fi
 
 if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  # configmap.yaml/values.yaml excluded: Phase 6D0 legitimately touched their explanatory comments, not their logic. efs-storageclass.yaml/goldengate/values.yaml excluded: the Phase 6D1 EFS correction legitimately updated the mode-aware fail-guard wording and added the persistence.efs.mode default, neither a template logic/behavior change. secretproviderclass.yaml excluded: the monitor CSI VDR correction legitimately regrouped the rendered objects by adminSecret (duplicate top-level objectName rejected by the AWS Secrets Store CSI provider), not a Phase 6C1B process-discovery change.
+  # configmap.yaml/values.yaml excluded: Phase 6D0 legitimately touched their explanatory comments, not their logic. efs-storageclass.yaml/goldengate/values.yaml excluded: the Phase 6D1 EFS correction legitimately updated the mode-aware fail-guard wording and added the persistence.efs.mode default, neither a template logic/behavior change. secretproviderclass.yaml excluded: the monitor CSI VDR correction legitimately regrouped the rendered objects by adminSecret (duplicate top-level objectName rejected by the AWS Secrets Store CSI provider), not a Phase 6C1B process-discovery change. runtime-secretproviderclass.yaml excluded: the Fresh-EKS Phase A/Phase 9-carry-forward correction legitimately made runtime.csi.region fail-closed instead of silently rendering an empty region, not a Phase 6C1B process-discovery change.
   NOT_PERMITTED_DIFF="$(git diff --stat --ignore-all-space -- \
     monitoring/monitor/health_rules.py monitoring/monitor/Dockerfile \
     'helm/goldengate-monitor/**' 'helm/goldengate/**' \
     ':!helm/goldengate-monitor/templates/configmap.yaml' ':!helm/goldengate-monitor/values.yaml' \
     ':!helm/goldengate-monitor/templates/secretproviderclass.yaml' \
-    ':!helm/goldengate/templates/efs-storageclass.yaml' ':!helm/goldengate/values.yaml' 2>/dev/null || true)"
+    ':!helm/goldengate/templates/efs-storageclass.yaml' ':!helm/goldengate/values.yaml' \
+    ':!helm/goldengate/templates/runtime-secretproviderclass.yaml' 2>/dev/null || true)"
   if [ -z "$NOT_PERMITTED_DIFF" ]; then
     pass "25: no Helm chart or Dockerfile file outside this phase's own scope changed"
   else
@@ -5570,6 +5601,7 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
     --set-string fluentBit.serviceAccount.roleArn=arn:aws:iam::668311715351:role/GoldenGatePlatformLoggingRole-dev \
     --set-string fluentBit.aws.region=eu-west-1 \
     --set-string fluentBit.image.reference=229410149234.dkr.ecr.eu-west-1.amazonaws.com/aws-cloud-factory-fluent-bit@sha256:366923ffc51dfde4966e743dcbd4ca05211b733d4f69c7591903bc7660fbf243 \
+    "${PLATFORM_SHARED_OVERRIDES[@]}" \
     2>/dev/null)"
   RENDERED_SA_COUNT="$(echo "$PLATFORM_SA_RENDER" | grep -c '^kind: ServiceAccount$' || true)"
   if [ "$RENDERED_SA_COUNT" -eq 2 ] \
@@ -5854,6 +5886,7 @@ print(spec_globals['resolve_runtime_service_account']('daa'))
       --set global.environment=dev \
       --set runtime.csi.admin.objectName=dev/goldengate/source/admin \
       --set runtime.csi.certificate.objectName=dev/goldengate/tls-certificate \
+      --set-string runtime.csi.region="$RESOLVED_AWS_REGION" \
       --set runtime.serviceAccount.create=false \
       --set runtime.serviceAccount.name="$MSSQL_DERIVED_SA" \
       > "${SYNTHETIC_VALUES_DIR}/mssql-rendered.yaml" 2>"${SYNTHETIC_VALUES_DIR}/mssql.log" \
@@ -5871,6 +5904,7 @@ print(spec_globals['resolve_runtime_service_account']('daa'))
       --set global.environment=dev \
       --set runtime.csi.admin.objectName=dev/goldengate/source/admin \
       --set runtime.csi.certificate.objectName=dev/goldengate/tls-certificate \
+      --set-string runtime.csi.region="$RESOLVED_AWS_REGION" \
       --set runtime.serviceAccount.create=false \
       --set runtime.serviceAccount.name="$DAA_DERIVED_SA" \
       > "${SYNTHETIC_VALUES_DIR}/daa-rendered.yaml" 2>"${SYNTHETIC_VALUES_DIR}/daa.log" \
@@ -6078,6 +6112,7 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
         --set global.environment=dev \
         --set runtime.csi.admin.objectName="$admin_secret" \
         --set runtime.csi.certificate.objectName=dev/goldengate/tls-certificate \
+        --set-string runtime.csi.region="$RESOLVED_AWS_REGION" \
         --set runtime.serviceAccount.create=false \
         --set runtime.serviceAccount.name="$approved_sa" \
         --set persistence.efs.fileSystemId=fs-0123456789abcdef0 \
@@ -6090,6 +6125,7 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
         --set global.environment=dev \
         --set runtime.csi.admin.objectName="$admin_secret" \
         --set runtime.csi.certificate.objectName=dev/goldengate/tls-certificate \
+        --set-string runtime.csi.region="$RESOLVED_AWS_REGION" \
         --set runtime.serviceAccount.create=false \
         --set runtime.serviceAccount.name=gg-isolation-probe-sa \
         --set persistence.efs.fileSystemId=fs-0123456789abcdef0 \
@@ -8858,6 +8894,8 @@ if command -v helm >/dev/null 2>&1 && [ -f "platform/dev/goldengate-platform/val
   PLATFORM_RENDERED="$(helm template goldengate-platform helm/goldengate-platform \
     --values platform/dev/goldengate-platform/values.yaml \
     --set runtimeServiceAccount.roleArn="arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev" \
+    --set-string environment=dev \
+    --set-string namespaces.runtime.name=goldengate-dev \
     --set fluentBit.create=false \
     --show-only templates/runtime-serviceaccounts.yaml 2>&1)"
   if echo "$PLATFORM_RENDERED" | grep -qF "name: gg-runtime-sa" \
@@ -8875,6 +8913,8 @@ if command -v helm >/dev/null 2>&1 && [ -f "platform/dev/goldengate-platform/val
   if helm lint helm/goldengate-platform \
       --values platform/dev/goldengate-platform/values.yaml \
       --set runtimeServiceAccount.roleArn="arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev" \
+      --set-string environment=dev \
+      --set-string namespaces.runtime.name=goldengate-dev \
       --set fluentBit.create=false >/dev/null 2>&1; then
     pass "10: helm lint passes for the goldengate-platform chart against real DEV values"
   else

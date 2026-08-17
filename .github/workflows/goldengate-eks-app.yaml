@@ -1152,6 +1152,7 @@ jobs:
             --set-string ingress.alb.certificateArn="$RESOLVED_CERTIFICATE_ARN" \
             --set runtime.csi.admin.objectName="$RESOLVED_ADMIN_SECRET_NAME" \
             --set runtime.csi.certificate.objectName="$RESOLVED_TLS_SECRET_NAME" \
+            --set-string runtime.csi.region="$AWS_REGION" \
             --set runtime.serviceAccount.create=false \
             --set runtime.serviceAccount.name="$RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME" \
             --set persistence.efs.fileSystemId="$RESOLVED_EFS_ID"
@@ -1173,6 +1174,7 @@ jobs:
             --set-string ingress.alb.certificateArn="$RESOLVED_CERTIFICATE_ARN" \
             --set runtime.csi.admin.objectName="$RESOLVED_ADMIN_SECRET_NAME" \
             --set runtime.csi.certificate.objectName="$RESOLVED_TLS_SECRET_NAME" \
+            --set-string runtime.csi.region="$AWS_REGION" \
             --set runtime.serviceAccount.create=false \
             --set runtime.serviceAccount.name="$RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME" \
             --set persistence.efs.fileSystemId="$RESOLVED_EFS_ID" \
@@ -2028,6 +2030,8 @@ jobs:
                     value: ${RESOLVED_ADMIN_SECRET_NAME}
                   - name: runtime.csi.certificate.objectName
                     value: ${RESOLVED_TLS_SECRET_NAME}
+                  - name: runtime.csi.region
+                    value: ${AWS_REGION}
                   - name: runtime.serviceAccount.create
                     value: "false"
                   - name: runtime.serviceAccount.name

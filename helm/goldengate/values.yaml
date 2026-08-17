@@ -60,7 +60,7 @@ runtime:
 
   csi:
     enabled: false
-    region: eu-west-1
+    region: ""
     serviceAccountRoleArn: ""
 
     admin:

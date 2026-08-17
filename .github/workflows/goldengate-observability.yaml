@@ -76,6 +76,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Load canonical environment configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" validate
+          python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" github-env >> "$GITHUB_ENV"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -347,12 +355,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Injects tag@digest image references into the committed values file (never mutated); the CloudWatch Agent IRSA role annotation is applied later via kubectl since this chart has no serviceAccount.annotations values path.
-          python3 - "$VALUES_FILE" "${WORKDIR}/image-digests.psv" "${WORKDIR}/generated-values.yaml" <<'PYEOF'
+          # Injects tag@digest image references, plus clusterName/region/repositoryDomainMap.public (shared environment identity, resolved from envs/dev/environment.yaml, never committed to VALUES_FILE) into the generated values file; the committed file itself is never mutated. The CloudWatch Agent IRSA role annotation is applied later via kubectl since this chart has no serviceAccount.annotations values path.
+          python3 - "$VALUES_FILE" "${WORKDIR}/image-digests.psv" "${WORKDIR}/generated-values.yaml" "$EKS_CLUSTER_NAME" "$AWS_REGION" "$ECR_REGISTRY" <<'PYEOF'
           import sys
           import yaml
 
-          committed_values_path, digests_path, output_path = sys.argv[1], sys.argv[2], sys.argv[3]
+          committed_values_path, digests_path, output_path, cluster_name, region, ecr_registry = sys.argv[1:7]
 
           class DupKeyLoader(yaml.SafeLoader):
               pass
@@ -370,6 +378,9 @@ jobs:
 
           with open(committed_values_path) as f:
               values = yaml.load(f, Loader=DupKeyLoader)
+
+          values["clusterName"] = cluster_name
+          values["region"] = region
 
           digests_by_repo = {}
           with open(digests_path) as f:
@@ -397,11 +408,12 @@ jobs:
               if image_block["tag"] != tag:
                   sys.exit(f"FAIL: {top_key}.{image_key}.tag is {image_block['tag']!r}, expected base tag {tag!r} before digest injection")
               image_block["tag"] = f"{tag}@{digest}"
+              image_block["repositoryDomainMap"] = {"public": ecr_registry}
 
           with open(output_path, "w") as f:
               yaml.safe_dump(values, f, default_flow_style=False, sort_keys=False)
 
-          print(f"OK: generated {output_path} with tag@digest for all four images.")
+          print(f"OK: generated {output_path} with clusterName/region/repositoryDomainMap.public and tag@digest for all four images.")
           PYEOF
 
           echo "Generated values file (committed file is unchanged):"
@@ -412,11 +424,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          python3 - "${WORKDIR}/generated-values.yaml" <<'PYEOF'
+          python3 - "${WORKDIR}/generated-values.yaml" "$EKS_CLUSTER_NAME" "$AWS_REGION" "$ECR_REGISTRY" <<'PYEOF'
           import sys
           import yaml
 
-          with open(sys.argv[1]) as f:
+          values_path, expected_cluster_name, expected_region, expected_ecr_registry = sys.argv[1:5]
+          with open(values_path) as f:
               v = yaml.safe_load(f)
 
           def expect(actual, expected, label):
@@ -424,8 +437,8 @@ jobs:
                   sys.exit(f"FAIL: {label} is {actual!r}, expected {expected!r}")
               print(f"OK: {label} == {expected!r}")
 
-          expect(v.get("clusterName"), "gg-poc-dev", "clusterName")
-          expect(v.get("region"), "eu-west-1", "region")
+          expect(v.get("clusterName"), expected_cluster_name, "clusterName")
+          expect(v.get("region"), expected_region, "region")
           expect(v.get("k8sMode"), "EKS", "k8sMode")
           expect(v.get("containerLogs", {}).get("enabled"), False, "containerLogs.enabled")
           expect(v.get("containerInsights", {}).get("enabled"), False, "containerInsights.enabled")
@@ -471,11 +484,10 @@ jobs:
               sys.exit(f"FAIL: agents[cloudwatch-agent-cluster-scraper].hostNetwork is {scraper_agent.get('hostNetwork')!r}, expected literal false")
           print("OK: agents[cloudwatch-agent-cluster-scraper].hostNetwork is literal false.")
 
-          private_domain = "229410149234.dkr.ecr.eu-west-1.amazonaws.com"
           for top_key, image_key in [("manager", "image"), ("agent", "image"), ("kubeStateMetrics", "image"), ("nodeExporter", "image")]:
               block = v[top_key][image_key]
               domain = block.get("repositoryDomainMap", {}).get("public")
-              expect(domain, private_domain, f"{top_key}.{image_key}.repositoryDomainMap.public")
+              expect(domain, expected_ecr_registry, f"{top_key}.{image_key}.repositoryDomainMap.public")
               tag = block.get("tag", "")
               if "@sha256:" not in tag:
                   sys.exit(f"FAIL: {top_key}.{image_key}.tag ({tag!r}) does not contain @sha256:")
@@ -484,12 +496,11 @@ jobs:
           print("OK: generated values file passes every semantic check.")
           PYEOF
 
-          EXPECTED_CW_ROLE_ARN="arn:aws:iam::668311715351:role/GoldenGateCloudWatchMetricsRole-dev"
-          if [ "$CW_METRICS_ROLE_ARN" != "$EXPECTED_CW_ROLE_ARN" ]; then
-            echo "FAIL: workflow CW_METRICS_ROLE_ARN (${CW_METRICS_ROLE_ARN}) does not match the expected dedicated role ARN."
+          if [ "$CW_METRICS_ROLE_ARN" != "$CLOUDWATCH_METRICS_ROLE_ARN" ]; then
+            echo "FAIL: workflow CW_METRICS_ROLE_ARN (${CW_METRICS_ROLE_ARN}) does not match the canonical CLOUDWATCH_METRICS_ROLE_ARN (${CLOUDWATCH_METRICS_ROLE_ARN})."
             exit 1
           fi
-          echo "OK: workflow CW_METRICS_ROLE_ARN matches the dedicated GoldenGateCloudWatchMetricsRole-dev ARN exactly (applied via kubectl annotate -- see the deploy-guarded section)."
+          echo "OK: workflow CW_METRICS_ROLE_ARN matches the canonical CLOUDWATCH_METRICS_ROLE_ARN exactly (applied via kubectl annotate -- see the deploy-guarded section)."
 
       - name: Render the private chart locally
         shell: bash
@@ -890,12 +901,14 @@ jobs:
         run: |
           set -euo pipefail
 
+          HELM_CHART_REF="oci://${ECR_REGISTRY}/${HELM_OCI_NAMESPACE}/${CHART_NAME}"
+
           # Generated via Python/PyYAML since the Helm values content is too large/structurally rich to safely inline through shell string interpolation.
-          python3 - "${WORKDIR}/generated-values.yaml" "${WORKDIR}/application.yaml" <<'PYEOF'
+          python3 - "${WORKDIR}/generated-values.yaml" "${WORKDIR}/application.yaml" "$HELM_CHART_REF" "$CHART_VERSION" "$RELEASE_NAME" "$ARGOCD_APP_NAME" "$ARGOCD_NAMESPACE" "$OBSERVABILITY_NAMESPACE" <<'PYEOF'
           import sys
           import yaml
 
-          values_path, output_path = sys.argv[1], sys.argv[2]
+          values_path, output_path, helm_chart_ref, chart_version, release_name, argocd_app_name, argocd_namespace, observability_namespace = sys.argv[1:9]
 
           with open(values_path) as f:
               values_text = f.read()
@@ -912,29 +925,29 @@ jobs:
               "apiVersion": "argoproj.io/v1alpha1",
               "kind": "Application",
               "metadata": {
-                  "name": "goldengate-observability",
-                  "namespace": "argocd",
+                  "name": argocd_app_name,
+                  "namespace": argocd_namespace,
                   "finalizers": ["resources-finalizer.argocd.argoproj.io"],
                   "labels": {
-                      "app.kubernetes.io/name": "goldengate-observability",
+                      "app.kubernetes.io/name": argocd_app_name,
                       "app.kubernetes.io/managed-by": "argocd",
                   },
               },
               "spec": {
                   "project": "default",
                   "source": {
-                      "repoURL": "oci://229410149234.dkr.ecr.eu-west-1.amazonaws.com/helm/amazon-cloudwatch-observability",
-                      "targetRevision": "6.2.0",
+                      "repoURL": helm_chart_ref,
+                      "targetRevision": chart_version,
                       # path: "." identifies the chart root within the OCI artifact itself (never a "chart:" field, which is for the Helm-repository source model).
                       "path": ".",
                       "helm": {
-                          "releaseName": "amazon-cloudwatch-observability",
+                          "releaseName": release_name,
                           "values": LiteralStr(values_text),
                       },
                   },
                   "destination": {
                       "server": "https://kubernetes.default.svc",
-                      "namespace": "amazon-cloudwatch",
+                      "namespace": observability_namespace,
                   },
                   "syncPolicy": {
                       "automated": {
@@ -950,7 +963,7 @@ jobs:
                       ],
                       "managedNamespaceMetadata": {
                           "labels": {
-                              "app.kubernetes.io/name": "goldengate-observability",
+                              "app.kubernetes.io/name": argocd_app_name,
                               "app.kubernetes.io/managed-by": "argocd",
                           },
                       },
@@ -961,7 +974,7 @@ jobs:
                           "group": "",
                           "kind": "ServiceAccount",
                           "name": "cloudwatch-agent",
-                          "namespace": "amazon-cloudwatch",
+                          "namespace": observability_namespace,
                           "jsonPointers": [
                               "/metadata/annotations/eks.amazonaws.com~1role-arn",
                           ],

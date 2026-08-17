@@ -1887,6 +1887,8 @@ def _render_monitor_chart(registry_yaml=None):
          "-f", os.path.join(REPO_ROOT, "envs", "dev", "goldengate-monitor", "values.yaml"),
          "--set", "image.repository=example.invalid/goldengate-monitor",
          "--set", "image.tag=test",
+         "--set", "namespace.name=goldengate-monitoring",
+         "--set", "aws.region=eu-west-1",
          "--set", "serviceAccount.roleArn=arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev"],
         capture_output=True, text=True, cwd=REPO_ROOT,
     )
@@ -1936,6 +1938,8 @@ class SecretProviderClassRenderTests(unittest.TestCase):
              "-f", os.path.join(REPO_ROOT, "envs", "dev", "goldengate-monitor", "values.yaml"),
              "--set", "image.repository=example.invalid/goldengate-monitor",
              "--set", "image.tag=test",
+             "--set", "namespace.name=goldengate-monitoring",
+             "--set", "aws.region=eu-west-1",
              "--set", "serviceAccount.roleArn=arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev"],
             capture_output=True, text=True, cwd=REPO_ROOT,
         )
@@ -2275,6 +2279,8 @@ class CloudWatchActivationHelmRenderTests(unittest.TestCase):
              "-f", os.path.join(REPO_ROOT, "envs", "dev", "goldengate-monitor", "values.yaml"),
              "--set", "image.repository=example.invalid/goldengate-monitor",
              "--set", "image.tag=test",
+             "--set", "namespace.name=goldengate-monitoring",
+             "--set", "aws.region=eu-west-1",
              "--set", "serviceAccount.roleArn=arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev",
              "--set", f"cloudwatch.publishEnabled={publish_enabled}"],
             capture_output=True, text=True, cwd=REPO_ROOT,
@@ -3295,7 +3301,12 @@ def _run_snippet(snippet, rendered_yaml, extra_env=None):
 
 
 def _run_serviceaccount_snippet(monitor_text, rendered_yaml):
-    return _run_snippet(_extract_serviceaccount_validation_snippet(monitor_text), rendered_yaml)
+    # Fresh-EKS Phase A/Phase 10: the real snippet compares against $MONITOR_ROLE_ARN (resolver-injected), no longer a literal -- the extracted snippet is unusable standalone under set -u without it.
+    return _run_snippet(
+        _extract_serviceaccount_validation_snippet(monitor_text),
+        rendered_yaml,
+        extra_env={"MONITOR_ROLE_ARN": ServiceAccountIrsaValidationTests.EXPECTED_ARN},
+    )
 
 
 def _run_ingress_snippet(monitor_text, rendered_yaml, ingress_enabled=True):
@@ -3307,7 +3318,12 @@ def _run_ingress_snippet(monitor_text, rendered_yaml, ingress_enabled=True):
         return _run_snippet(
             _extract_ingress_validation_snippet(monitor_text),
             rendered_yaml,
-            extra_env={"VALUES_FILE": values_path},
+            extra_env={
+                "VALUES_FILE": values_path,
+                # Fresh-EKS Phase A/Phase 10: the real snippet compares against $MONITOR_HOST/$ACM_CERTIFICATE_ARN (resolver-injected), no longer literals -- the extracted snippet is unusable standalone under set -u without them.
+                "MONITOR_HOST": IngressValidationTests.EXPECTED_HOST,
+                "ACM_CERTIFICATE_ARN": IngressValidationTests.EXPECTED_CERT_ARN,
+            },
         )
 
 

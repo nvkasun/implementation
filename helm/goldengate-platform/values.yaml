@@ -32,15 +32,15 @@ fluentBit:
   aws:
     region: ""
 
-  # Namespaces this DaemonSet is permitted to ship logs from; other namespaces are dropped before reaching an OUTPUT, never collected cluster-wide.
+  # Namespaces this DaemonSet is permitted to ship logs from; other namespaces are dropped before reaching an OUTPUT, never collected cluster-wide. Empty by default -- the deploy workflow populates both with the canonical environment namespaces; the chart fails closed rather than falling back to a DEV-specific guess.
   namespaces:
-    runtime: goldengate-dev
-    monitoring: goldengate-monitoring
+    runtime: ""
+    monitoring: ""
 
-  # Pre-created (Terraform-managed) CloudWatch Logs destinations; this DaemonSet never has logs:CreateLogGroup. Must match envs/dev/cloudwatch_logs.tf exactly.
+  # Pre-created (Terraform-managed) CloudWatch Logs destinations; this DaemonSet never has logs:CreateLogGroup. Empty by default -- the deploy workflow populates both from the canonical environment log group names; must match envs/dev/cloudwatch_logs.tf exactly.
   cloudwatch:
-    runtimeLogGroupName: /adcb/goldengate/dev/runtime
-    monitorLogGroupName: /adcb/goldengate/dev/monitor
+    runtimeLogGroupName: ""
+    monitorLogGroupName: ""
     logStreamPrefix: fluent-bit-
 
   resources:

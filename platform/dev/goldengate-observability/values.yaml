@@ -1,5 +1,4 @@
-clusterName: gg-poc-dev
-region: eu-west-1
+# clusterName/region are shared environment identity, injected into work/generated-values.yaml by the deploy workflow from envs/dev/environment.yaml.
 k8sMode: EKS
 
 # Traditional (Fluent Bit based) container log collection stays fully
@@ -29,8 +28,6 @@ manager:
   image:
     repository: aws-cloud-factory-cloudwatch-agent-operator
     tag: "3.4.2"
-    repositoryDomainMap:
-      public: 229410149234.dkr.ecr.eu-west-1.amazonaws.com
 
 agents:
   - name: cloudwatch-agent
@@ -50,8 +47,6 @@ agent:
   image:
     repository: aws-cloud-factory-cloudwatch-agent
     tag: "1.300069.0b1529"
-    repositoryDomainMap:
-      public: 229410149234.dkr.ecr.eu-west-1.amazonaws.com
   prometheus:
     targetAllocator:
       enabled: false
@@ -78,13 +73,9 @@ kubeStateMetrics:
   image:
     repository: aws-cloud-factory-kube-state-metrics
     tag: "v2.18.0"
-    repositoryDomainMap:
-      public: 229410149234.dkr.ecr.eu-west-1.amazonaws.com
 
 nodeExporter:
   enabled: true
   image:
     repository: aws-cloud-factory-node-exporter
     tag: "v1.11.1"
-    repositoryDomainMap:
-      public: 229410149234.dkr.ecr.eu-west-1.amazonaws.com

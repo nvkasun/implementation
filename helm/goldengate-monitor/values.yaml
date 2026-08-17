@@ -8,12 +8,12 @@ image:
 
 namespace:
   create: true
-  name: goldengate-monitoring
+  name: ""
 
 replicaCount: 1
 
 aws:
-  region: eu-west-1
+  region: ""
 
 dynamodb:
   tableName: gg-eks-pipeline

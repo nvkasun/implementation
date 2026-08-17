@@ -68,18 +68,11 @@ env:
 
   # The second namespace the Fluent Bit DaemonSet ships logs from (the shared monitor's namespace, owned by helm/goldengate-monitor, never created/altered by this chart).
   MONITOR_NAMESPACE: goldengate-monitoring
-  FLUENT_BIT_RUNTIME_LOG_GROUP: /adcb/goldengate/dev/runtime
-  FLUENT_BIT_MONITOR_LOG_GROUP: /adcb/goldengate/dev/monitor
 
   # Every GoldenGate runtime pod (regardless of deployment type) shares this ONE ServiceAccount and IAM role (also used by the shared monitor; trust policy at envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json) -- the restored stable runtime identity boundary, never a per-engine identity. This ARN is a literal predicted value since this repository has no Terraform outputs.tf.
   RUNTIME_SA_NAME: gg-runtime-sa
   RUNTIME_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev
 
-  # Fixed, explicitly-reviewed migration-compatibility identities -- NOT derived from the folder-driven deployment inventory. Old historical Oracle/PostgreSQL workloads may still reference them until reconciled onto RUNTIME_SA_NAME; the platform chart must keep rendering them as DESIRED state (never rely on Prune=false alone) until their later, separate, evidence-driven retirement phase. Space-separated since GitHub Actions env vars are plain strings.
-  TRANSITIONAL_RUNTIME_SA_NAMES: "gg-oracle-sa gg-postgresql-sa"
-
-  # Platform-level Fluent Bit DaemonSet's dedicated least-privilege role -- see envs/dev/policies/goldengate-platform-logging-dev/.
-  FLUENT_BIT_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGatePlatformLoggingRole-dev
   FLUENT_BIT_SA_NAME: gg-fluent-bit
 
   # Private, immutable digest-pinned Fluent Bit image; the AWS-published image is pre-mirrored into this account's ECR outside this workflow, which only reads and verifies the digest.
@@ -102,6 +95,14 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Load canonical environment configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" validate
+          python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" github-env >> "$GITHUB_ENV"
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -355,9 +356,15 @@ jobs:
 
           helm lint "$HELM_CHART_PATH" \
             --values "$VALUES_FILE" \
+            --set-string environment="$GG_ENVIRONMENT" \
+            --set-string namespaces.runtime.name="$RUNTIME_NAMESPACE" \
             --set-string runtimeServiceAccount.roleArn="$RUNTIME_ROLE_ARN" \
-            --set-string fluentBit.serviceAccount.roleArn="$FLUENT_BIT_ROLE_ARN" \
+            --set-string fluentBit.serviceAccount.roleArn="$PLATFORM_LOGGING_ROLE_ARN" \
             --set-string fluentBit.aws.region="$AWS_REGION" \
+            --set-string fluentBit.namespaces.runtime="$RUNTIME_NAMESPACE" \
+            --set-string fluentBit.namespaces.monitoring="$MONITOR_NAMESPACE" \
+            --set-string fluentBit.cloudwatch.runtimeLogGroupName="$RUNTIME_LOG_GROUP" \
+            --set-string fluentBit.cloudwatch.monitorLogGroupName="$MONITOR_LOG_GROUP" \
             --set-string fluentBit.image.reference="$FLUENT_BIT_IMAGE"
 
       - name: Render platform manifest for validation
@@ -369,9 +376,15 @@ jobs:
 
           helm template "$RELEASE_NAME" "$HELM_CHART_PATH" \
             --values "$VALUES_FILE" \
+            --set-string environment="$GG_ENVIRONMENT" \
+            --set-string namespaces.runtime.name="$RUNTIME_NAMESPACE" \
             --set-string runtimeServiceAccount.roleArn="$RUNTIME_ROLE_ARN" \
-            --set-string fluentBit.serviceAccount.roleArn="$FLUENT_BIT_ROLE_ARN" \
+            --set-string fluentBit.serviceAccount.roleArn="$PLATFORM_LOGGING_ROLE_ARN" \
             --set-string fluentBit.aws.region="$AWS_REGION" \
+            --set-string fluentBit.namespaces.runtime="$RUNTIME_NAMESPACE" \
+            --set-string fluentBit.namespaces.monitoring="$MONITOR_NAMESPACE" \
+            --set-string fluentBit.cloudwatch.runtimeLogGroupName="$RUNTIME_LOG_GROUP" \
+            --set-string fluentBit.cloudwatch.monitorLogGroupName="$MONITOR_LOG_GROUP" \
             --set-string fluentBit.image.reference="$FLUENT_BIT_IMAGE" \
             > "rendered/${RELEASE_NAME}.yaml"
 
@@ -490,9 +503,6 @@ jobs:
             fi
           }
           assert_exactly_one_serviceaccount "$RUNTIME_SA_NAME"
-          for transitional_sa_name in $TRANSITIONAL_RUNTIME_SA_NAMES; do
-            assert_exactly_one_serviceaccount "$transitional_sa_name"
-          done
           assert_exactly_one_serviceaccount "$FLUENT_BIT_SA_NAME"
 
           # deletion_protected is "true" for every shared runtime identity (must survive this Application's own deletion) and "false" for gg-fluent-bit (pruned/deleted normally with this release).
@@ -533,13 +543,9 @@ jobs:
           }
 
           validate_runtime_sa "$RUNTIME_SA_NAME" "$RUNTIME_ROLE_ARN" "true"
-          for transitional_sa_name in $TRANSITIONAL_RUNTIME_SA_NAMES; do
-            # Transitional identities use the SAME runtime IAM role as RUNTIME_SA_NAME -- no new IAM permissions, and deletion-protected exactly like the canonical identity (they must remain desired state, never rely on Prune=false alone).
-            validate_runtime_sa "$transitional_sa_name" "$RUNTIME_ROLE_ARN" "true"
-          done
-          validate_runtime_sa "$FLUENT_BIT_SA_NAME" "$FLUENT_BIT_ROLE_ARN" "false"
+          validate_runtime_sa "$FLUENT_BIT_SA_NAME" "$PLATFORM_LOGGING_ROLE_ARN" "false"
 
-          echo "Validating the rendered ServiceAccount set is EXACTLY the canonical + transitional + Fluent Bit identities, never a per-deploymentType identity (e.g. no gg-mssql-sa)..."
+          echo "Validating the rendered ServiceAccount set is EXACTLY gg-runtime-sa + gg-fluent-bit, never a per-deploymentType identity (e.g. no gg-mssql-sa) and never a migration-compatibility identity (this is a fresh EKS cluster)..."
           SA_SPLIT_DIR="$(mktemp -d)"
           awk -v outdir="$SA_SPLIT_DIR" '
             BEGIN { docnum = 0; fname = outdir "/doc-0.yaml" }
@@ -555,7 +561,7 @@ jobs:
           done
           rm -rf "$SA_SPLIT_DIR"
           RENDERED_SA_NAMES="$(echo "$RENDERED_SA_NAMES" | grep -v '^$' | sort -u)"
-          EXPECTED_SA_NAMES="$(printf '%s\n%s\n%s\n' "$RUNTIME_SA_NAME" "$FLUENT_BIT_SA_NAME" "$TRANSITIONAL_RUNTIME_SA_NAMES" | tr ' ' '\n' | grep -v '^$' | sort -u)"
+          EXPECTED_SA_NAMES="$(printf '%s\n%s\n' "$RUNTIME_SA_NAME" "$FLUENT_BIT_SA_NAME" | sort -u)"
           if [ "$RENDERED_SA_NAMES" = "$EXPECTED_SA_NAMES" ]; then
             echo "OK: rendered ServiceAccount set is exactly {$(echo "$EXPECTED_SA_NAMES" | tr '\n' ' ')}."
           else
@@ -566,7 +572,7 @@ jobs:
           fi
 
           echo "Validating no unexpected IRSA role is used by any rendered ServiceAccount..."
-          ALLOWED_RUNTIME_ROLE_ARNS="$(printf '%s\n%s' "$RUNTIME_ROLE_ARN" "$FLUENT_BIT_ROLE_ARN")"
+          ALLOWED_RUNTIME_ROLE_ARNS="$(printf '%s\n%s' "$RUNTIME_ROLE_ARN" "$PLATFORM_LOGGING_ROLE_ARN")"
           while IFS= read -r role_arn_line; do
             [ -z "$role_arn_line" ] && continue
             actual_role_arn="$(normalize_value "${role_arn_line#*role-arn:}")"
@@ -706,7 +712,7 @@ jobs:
             echo "FAIL: monitor cloudwatch_logs OUTPUT does not use Match monitor.*"
             exit 1
           fi
-          for expected_log_group in "$FLUENT_BIT_RUNTIME_LOG_GROUP" "$FLUENT_BIT_MONITOR_LOG_GROUP"; do
+          for expected_log_group in "$RUNTIME_LOG_GROUP" "$MONITOR_LOG_GROUP"; do
             if ! grep -Eq -- "log_group_name[[:space:]]+${expected_log_group}$" <<< "$FLUENT_BIT_CM_BLOCK"; then
               echo "FAIL: gg-fluent-bit-config does not target the exact pre-created log group ${expected_log_group}."
               exit 1
@@ -911,12 +917,24 @@ jobs:
                 valueFiles:
                   - values-deployment.yaml
                 parameters:
+                  - name: environment
+                    value: ${GG_ENVIRONMENT}
+                  - name: namespaces.runtime.name
+                    value: ${RUNTIME_NAMESPACE}
                   - name: runtimeServiceAccount.roleArn
                     value: ${RUNTIME_ROLE_ARN}
                   - name: fluentBit.serviceAccount.roleArn
-                    value: ${FLUENT_BIT_ROLE_ARN}
+                    value: ${PLATFORM_LOGGING_ROLE_ARN}
                   - name: fluentBit.aws.region
                     value: ${AWS_REGION}
+                  - name: fluentBit.namespaces.runtime
+                    value: ${RUNTIME_NAMESPACE}
+                  - name: fluentBit.namespaces.monitoring
+                    value: ${MONITOR_NAMESPACE}
+                  - name: fluentBit.cloudwatch.runtimeLogGroupName
+                    value: ${RUNTIME_LOG_GROUP}
+                  - name: fluentBit.cloudwatch.monitorLogGroupName
+                    value: ${MONITOR_LOG_GROUP}
                   - name: fluentBit.image.reference
                     value: ${FLUENT_BIT_IMAGE}
             destination:
@@ -991,8 +1009,8 @@ jobs:
           echo "Namespace:"
           kubectl get namespace "$RUNTIME_NAMESPACE"
 
-          echo "ServiceAccounts and IRSA annotations (canonical + transitional):"
-          for live_sa_name in "$RUNTIME_SA_NAME" $TRANSITIONAL_RUNTIME_SA_NAMES; do
+          echo "ServiceAccounts and IRSA annotations:"
+          for live_sa_name in "$RUNTIME_SA_NAME"; do
             kubectl get serviceaccount "$live_sa_name" -n "$RUNTIME_NAMESPACE"
             actual_role_annotation="$(kubectl get serviceaccount "$live_sa_name" -n "$RUNTIME_NAMESPACE" -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}')"
             if [ "$actual_role_annotation" != "$RUNTIME_ROLE_ARN" ]; then
@@ -1050,13 +1068,13 @@ jobs:
             echo ""
             echo "### Ownership"
             echo ""
-            echo "This is the single designated owner of Namespace/${RUNTIME_NAMESPACE},"
+            echo "This is the single designated owner of Namespace/${RUNTIME_NAMESPACE} and"
             echo "ServiceAccount/${RUNTIME_SA_NAME} (the one canonical runtime identity every"
-            echo "GoldenGate deployment type shares), and the fixed transitional migration-"
-            echo "compatibility identities (${TRANSITIONAL_RUNTIME_SA_NAMES// /, }) still used by"
-            echo "old historical runtimes. Individual GoldenGate runtime Applications"
-            echo "(goldengate-eks-app.yaml) reference their resolved ServiceAccount by name only"
-            echo "(serviceAccount.create=false) and never own or delete any of them."
+            echo "GoldenGate deployment type shares -- this is a fresh EKS cluster, so no"
+            echo "migration-compatibility ServiceAccount is created or expected). Individual"
+            echo "GoldenGate runtime Applications (goldengate-eks-app.yaml) reference their"
+            echo "resolved ServiceAccount by name only (serviceAccount.create=false) and never"
+            echo "own or delete it."
             echo ""
             echo "Phase 6A: this Application also owns DaemonSet/gg-fluent-bit"
             echo "(platform-level centralized container logging, ServiceAccount/${FLUENT_BIT_SA_NAME},"
@@ -1064,8 +1082,8 @@ jobs:
             echo "private, immutable digest image \`${FLUENT_BIT_IMAGE:-unknown}\`."
             echo "It ships Kubernetes container stdout/stderr only, from"
             echo "\`${RUNTIME_NAMESPACE}\` and \`${MONITOR_NAMESPACE}\`, to the pre-created"
-            echo "CloudWatch Logs groups \`${FLUENT_BIT_RUNTIME_LOG_GROUP}\` and"
-            echo "\`${FLUENT_BIT_MONITOR_LOG_GROUP}\`. It is never a GoldenGate runtime or"
+            echo "CloudWatch Logs groups \`${RUNTIME_LOG_GROUP}\` and"
+            echo "\`${MONITOR_LOG_GROUP}\`. It is never a GoldenGate runtime or"
             echo "observer sidecar and provides no EFS /u02 application file-log coverage."
             echo ""
             echo "### Required deployment order"

@@ -1,9 +1,7 @@
-environment: dev
-
+# environment/namespaces.runtime.name are shared environment identity, injected by the deploy workflow from envs/dev/environment.yaml.
 namespaces:
   runtime:
     create: true
-    name: goldengate-dev
 
 # runtimeServiceAccount.roleArn is intentionally absent -- the deploy workflow injects it via --set (RUNTIME_ROLE_ARN), never hand-maintained here. name defaults to the chart's own gg-runtime-sa (the one shared runtime identity for every deploymentType).
 
@@ -14,13 +12,5 @@ fluentBit:
   serviceAccount:
     create: true
     name: gg-fluent-bit
-    roleArn: ""
-  aws:
-    region: ""
-  namespaces:
-    runtime: goldengate-dev
-    monitoring: goldengate-monitoring
   cloudwatch:
-    runtimeLogGroupName: /adcb/goldengate/dev/runtime
-    monitorLogGroupName: /adcb/goldengate/dev/monitor
     logStreamPrefix: fluent-bit-

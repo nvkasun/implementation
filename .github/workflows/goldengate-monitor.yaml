@@ -498,6 +498,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Load canonical environment configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" validate
+          python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" github-env >> "$GITHUB_ENV"
+
+          # TARGET_NAMESPACE is the render/deploy path's namespace identity; it must resolve to the canonical MONITOR_NAMESPACE, never an independent workflow-level literal.
+          echo "TARGET_NAMESPACE=$(python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" get MONITOR_NAMESPACE)" >> "$GITHUB_ENV"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -722,7 +733,14 @@ jobs:
             --values "$VALUES_FILE" \
             --set-string image.repository="$MONITOR_IMAGE_REPOSITORY" \
             --set-string image.tag="$MONITOR_IMAGE_TAG" \
-            --set cloudwatch.publishEnabled="$CLOUDWATCH_PUBLISH_ENABLED_VALUE"
+            --set cloudwatch.publishEnabled="$CLOUDWATCH_PUBLISH_ENABLED_VALUE" \
+            --set-string global.environment="$GG_ENVIRONMENT" \
+            --set-string namespace.name="$TARGET_NAMESPACE" \
+            --set-string aws.region="$AWS_REGION" \
+            --set-string serviceAccount.roleArn="$MONITOR_ROLE_ARN" \
+            --set-string ingress.host="$MONITOR_HOST" \
+            --set-string ingress.alb.groupName="$ALB_GROUP_NAME" \
+            --set-string ingress.alb.certificateArn="$ACM_CERTIFICATE_ARN"
 
       - name: Render monitor manifest for validation
         shell: bash
@@ -737,6 +755,13 @@ jobs:
             --set-string image.repository="$MONITOR_IMAGE_REPOSITORY" \
             --set-string image.tag="$MONITOR_IMAGE_TAG" \
             --set cloudwatch.publishEnabled="$CLOUDWATCH_PUBLISH_ENABLED_VALUE" \
+            --set-string global.environment="$GG_ENVIRONMENT" \
+            --set-string namespace.name="$TARGET_NAMESPACE" \
+            --set-string aws.region="$AWS_REGION" \
+            --set-string serviceAccount.roleArn="$MONITOR_ROLE_ARN" \
+            --set-string ingress.host="$MONITOR_HOST" \
+            --set-string ingress.alb.groupName="$ALB_GROUP_NAME" \
+            --set-string ingress.alb.certificateArn="$ACM_CERTIFICATE_ARN" \
             > "rendered/${RELEASE_NAME}.yaml"
 
           echo "Rendered manifest: rendered/${RELEASE_NAME}.yaml"
@@ -818,7 +843,7 @@ jobs:
           fi
 
           SA_ROLE_ARN_ACTUAL="$(normalize_value "${SA_ROLE_ARN_LINE#*role-arn:}")"
-          SA_ROLE_ARN_EXPECTED="arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev"
+          SA_ROLE_ARN_EXPECTED="$MONITOR_ROLE_ARN"
 
           if [ "$SA_ROLE_ARN_ACTUAL" != "$SA_ROLE_ARN_EXPECTED" ]; then
             echo "FAIL: gg-monitor IRSA role ARN mismatch."
@@ -1005,7 +1030,7 @@ jobs:
               exit 1
             fi
             INGRESS_HOST_ACTUAL="$(normalize_value "${INGRESS_HOST_LINE#*host:}")"
-            INGRESS_HOST_EXPECTED="monitor.goldengate-dev.adcbmis.local"
+            INGRESS_HOST_EXPECTED="$MONITOR_HOST"
             if [ "$INGRESS_HOST_ACTUAL" != "$INGRESS_HOST_EXPECTED" ]; then
               echo "FAIL: gg-monitor Ingress host mismatch."
               echo "Expected: ${INGRESS_HOST_EXPECTED}"
@@ -1020,7 +1045,7 @@ jobs:
               exit 1
             fi
             INGRESS_CERT_ACTUAL="$(normalize_value "${INGRESS_CERT_LINE#*certificate-arn:}")"
-            INGRESS_CERT_EXPECTED="arn:aws:acm:eu-west-1:668311715351:certificate/9e53e28e-3243-47fc-85a1-50f9a94acde7"
+            INGRESS_CERT_EXPECTED="$ACM_CERTIFICATE_ARN"
             if [ "$INGRESS_CERT_ACTUAL" != "$INGRESS_CERT_EXPECTED" ]; then
               echo "FAIL: gg-monitor Ingress certificate ARN mismatch."
               echo "Expected: ${INGRESS_CERT_EXPECTED}"
@@ -1429,6 +1454,20 @@ jobs:
                     value: ${MONITOR_IMAGE_TAG}
                   - name: cloudwatch.publishEnabled
                     value: "${CLOUDWATCH_PUBLISH_ENABLED_VALUE}"
+                  - name: global.environment
+                    value: ${GG_ENVIRONMENT}
+                  - name: namespace.name
+                    value: ${TARGET_NAMESPACE}
+                  - name: aws.region
+                    value: ${AWS_REGION}
+                  - name: serviceAccount.roleArn
+                    value: ${MONITOR_ROLE_ARN}
+                  - name: ingress.host
+                    value: ${MONITOR_HOST}
+                  - name: ingress.alb.groupName
+                    value: ${ALB_GROUP_NAME}
+                  - name: ingress.alb.certificateArn
+                    value: ${ACM_CERTIFICATE_ARN}
             destination:
               server: https://kubernetes.default.svc
               namespace: ${TARGET_NAMESPACE}
@@ -1504,11 +1543,11 @@ jobs:
           echo "ServiceAccount and IRSA annotation:"
           kubectl get serviceaccount gg-monitor -n "$TARGET_NAMESPACE"
           ROLE_ANNOTATION="$(kubectl get serviceaccount gg-monitor -n "$TARGET_NAMESPACE" -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}')"
-          if [ "$ROLE_ANNOTATION" != "arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev" ]; then
+          if [ "$ROLE_ANNOTATION" != "$MONITOR_ROLE_ARN" ]; then
             echo "FAIL: unexpected IRSA role annotation on ServiceAccount gg-monitor: ${ROLE_ANNOTATION}"
             exit 1
           fi
-          echo "OK: IRSA role annotation matches GoldenGateMonitorReadRole-dev."
+          echo "OK: IRSA role annotation matches ${MONITOR_ROLE_ARN}."
 
           echo "Deployment availability:"
           kubectl rollout status deployment/gg-monitor -n "$TARGET_NAMESPACE" --timeout=5m
@@ -1596,8 +1635,8 @@ jobs:
             echo "OK: gg-monitor Ingress is absent as requested."
           else
             INGRESS_HOST="$(kubectl get ingress gg-monitor -n "$TARGET_NAMESPACE" -o jsonpath='{.spec.rules[0].host}')"
-            if [ "$INGRESS_HOST" != "monitor.goldengate-dev.adcbmis.local" ]; then
-              echo "FAIL: Ingress host is ${INGRESS_HOST}, expected monitor.goldengate-dev.adcbmis.local."
+            if [ "$INGRESS_HOST" != "$MONITOR_HOST" ]; then
+              echo "FAIL: Ingress host is ${INGRESS_HOST}, expected ${MONITOR_HOST}."
               exit 1
             fi
             echo "OK: Ingress host matches expected."
