@@ -8,32 +8,32 @@ variable "goldengate_log_retention_days" {
 
 locals {
   goldengate_log_group_tags = {
-    ApplicationName     = "CloudFactory"
-    DataClassification  = "General"
-    BusinessCriticality = "Low"
-    BusinessUnit        = "TechnologyPlatform"
-    CostCenter          = "219"
-    Environment         = "dev"
-    "map-migrated"      = "comm5TZY31HX9S"
+    ApplicationName     = local.gg_env_tags.applicationName
+    DataClassification  = local.gg_env_tags.dataClassification
+    BusinessCriticality = local.gg_env_tags.businessCriticality
+    BusinessUnit        = local.gg_env_tags.businessUnit
+    CostCenter          = local.gg_env_tags.costCenter
+    Environment         = local.gg_env_environment
+    "map-migrated"      = local.gg_env_tags.mapMigrated
   }
 }
 
-# GoldenGate runtime container logs: gg-oracle-payments-01, gg-postgresql-payments-01 (namespace goldengate-dev).
+# GoldenGate runtime container logs (namespace goldengate-dev, all deployment types).
 resource "aws_cloudwatch_log_group" "goldengate_runtime" {
-  name              = "/adcb/goldengate/dev/runtime"
+  name              = local.gg_env_runtime_log_group
   retention_in_days = var.goldengate_log_retention_days
 
   tags = merge(local.goldengate_log_group_tags, {
-    Name = "/adcb/goldengate/dev/runtime"
+    Name = local.gg_env_runtime_log_group
   })
 }
 
 # Shared gg-monitor container logs (namespace goldengate-monitoring).
 resource "aws_cloudwatch_log_group" "goldengate_monitor" {
-  name              = "/adcb/goldengate/dev/monitor"
+  name              = local.gg_env_monitor_log_group
   retention_in_days = var.goldengate_log_retention_days
 
   tags = merge(local.goldengate_log_group_tags, {
-    Name = "/adcb/goldengate/dev/monitor"
+    Name = local.gg_env_monitor_log_group
   })
 }

@@ -58,12 +58,69 @@ ingress:
 """
 
 
+_SYNTHETIC_ENVIRONMENT_YAML = """\
+schemaVersion: 1
+environment: {environment}
+aws:
+  region: eu-west-1
+  workloadAccountId: "668311715351"
+  buildAccountId: "229410149234"
+eks:
+  clusterName: gg-scratch-test
+  oidcIssuer: "https://oidc.eks.eu-west-1.amazonaws.com/id/0123456789ABCDEF0123456789ABCDEF"
+namespaces:
+  runtime: goldengate-{environment}
+  monitoring: goldengate-monitoring
+  argocd: argocd
+  observability: amazon-cloudwatch
+network:
+  dnsDomain: goldengate-{environment}.adcbmis.local
+  albGroupName: gg-scratch-test-alb
+  certificateArn: arn:aws:acm:eu-west-1:668311715351:certificate/00000000-0000-0000-0000-000000000000
+iam:
+  roles:
+    eksDeploy: GoldenGateEKSDeployRole-{environment}
+    runtime: GoldenGateSecretsReadRole-{environment}
+    monitor: GoldenGateMonitorReadRole-{environment}
+    argocdEcrRead: GoldenGateArgocdECRRead-{environment}
+    platformLogging: GoldenGatePlatformLoggingRole-{environment}
+    cloudwatchMetrics: GoldenGateCloudWatchMetricsRole-{environment}
+  runnerRoleName: RunnerRole-goldengate-eks-app_{environment}
+  ecrSyncRoleArn: arn:aws:iam::229410149234:role/scratch-test-ecr-sync-role
+kms:
+  monitorDynamoDbKeyArn: arn:aws:kms:eu-west-1:668311715351:key/00000000-0000-0000-0000-000000000000
+efs:
+  sharedSecurityGroupDescription: "Security group for EFS filesystem - scratch test"
+tags:
+  applicationName: CloudFactory
+  businessCriticality: Low
+  businessUnit: TechnologyPlatform
+  businessUnitOwner: scratch-test-owner
+  costCenter: "000"
+  mapMigrated: scratch-test
+  requestReference: SCRATCH-TEST
+  dataClassification: General
+"""
+
+
+def ensure_scratch_environment_yaml(root, environment):
+    """Writes a deterministic, schema-valid synthetic envs/<environment>/environment.yaml into the isolated scratch root if one doesn't already exist -- account IDs/region/cluster name here are fixed synthetic fixture values (matching this file's own long-established repository/domain fixture defaults below), never production hardcoding, since they only ever exist under a tempfile.TemporaryDirectory() scratch root."""
+    path = os.path.join(root, "envs", environment, "environment.yaml")
+    if os.path.exists(path):
+        return path
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(_SYNTHETIC_ENVIRONMENT_YAML.format(environment=environment))
+    return path
+
+
 def write_descriptor(root, environment, deployment_id, enabled=True, pipeline="test-pipeline", role="source",
                      deployment_type="oracle", repository=None, tag="1.0.0",
                      service_account_name=None, service_account_create=None,
                      deployment_admin_secret=None, alb_group_order=None, extra="", raw_override=None,
                      csi_admin_object_name=None, csi_certificate_object_name=None,
                      csi_service_account_role_arn=None, ingress_host_domain=None):
+    ensure_scratch_environment_yaml(root, environment)
     folder = os.path.join(root, "envs", environment, deployment_id)
     os.makedirs(folder, exist_ok=True)
     path = os.path.join(folder, "values.yaml")
@@ -214,12 +271,13 @@ def write_default_pipeline(root, environment="dev", pipeline="payments-pg-to-mss
 
 
 class ScratchEnvironmentTestCase(unittest.TestCase):
-    """Base class: points gdm.REPO_ROOT at an isolated temp directory for the duration of each test."""
+    """Base class: points gdm.REPO_ROOT at an isolated temp directory for the duration of each test. Also seeds envs/dev/environment.yaml (the overwhelmingly common fixture environment) into that scratch root up front -- individual write_descriptor() calls seed any other environment name (e.g. "sit") on demand."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self._original_root = gdm.REPO_ROOT
         gdm.REPO_ROOT = self._tmp.name
+        ensure_scratch_environment_yaml(self._tmp.name, "dev")
 
     def tearDown(self):
         gdm.REPO_ROOT = self._original_root
@@ -898,17 +956,8 @@ class FullValidationGatingTests(unittest.TestCase):
         self.assertNotIn("ACTIVE  gg-good-fixture-01", buf.getvalue())
 
 
-class ManagedEfsInventoryCommandTests(unittest.TestCase):
+class ManagedEfsInventoryCommandTests(ScratchEnvironmentTestCase):
     """The managed-efs-inventory command feeds the workflow's managed_efs_inventory_guard; it must include lifecycle.state=absent managed descriptors (their EFS is retained, not decommissioned) and exclude existing-mode descriptors entirely."""
-
-    def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self._original_root = gdm.REPO_ROOT
-        gdm.REPO_ROOT = self._tmp.name
-
-    def tearDown(self):
-        gdm.REPO_ROOT = self._original_root
-        self._tmp.cleanup()
 
     def _run(self):
         class Args:

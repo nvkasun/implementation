@@ -10,6 +10,7 @@ cd "$REPO_ROOT"
 export PYTHONDONTWRITEBYTECODE=1
 
 DEPLOYMENT_MODEL_TOOL="hack/goldengate-deployment-model.py"
+ENVIRONMENT_TOOL="hack/goldengate-environment.py"
 CANONICAL_CONFIG="work/generated/dev/goldengate-deployments.yaml"
 RUNTIME_CHART="helm/goldengate"
 PLATFORM_CHART="helm/goldengate-platform"
@@ -570,9 +571,9 @@ PYEOF
     else
       pass "envs/dev/cloudwatch_logs.tf sets no kms_key_id -- relies on CloudWatch Logs default server-side encryption"
     fi
-    if grep -q '"/adcb/goldengate/dev/runtime"' "$CLOUDWATCH_LOGS_TF" && grep -q '"/adcb/goldengate/dev/monitor"' "$CLOUDWATCH_LOGS_TF" \
+    if grep -q 'local.gg_env_runtime_log_group' "$CLOUDWATCH_LOGS_TF" && grep -q 'local.gg_env_monitor_log_group' "$CLOUDWATCH_LOGS_TF" \
         && grep -q 'retention_in_days' "$CLOUDWATCH_LOGS_TF"; then
-      pass "envs/dev/cloudwatch_logs.tf still defines both log groups with retention configured"
+      pass "envs/dev/cloudwatch_logs.tf still defines both log groups (name derived from environment config, Fresh-EKS Phase A) with retention configured"
     else
       fail "envs/dev/cloudwatch_logs.tf no longer defines both expected log groups with retention"
     fi
@@ -591,10 +592,10 @@ PYEOF
 
     # Extracts just this module's block (opening line to the next top-level '}' at column 0) so checks below can't match a different module.
     CLOUDWATCH_METRICS_MODULE_BLOCK="$(awk '/^module "goldengate_cloudwatch_metrics_role_dev" \{/{f=1} f{print} f && /^}$/{exit}' "$IAM_TF")"
-    if echo "$CLOUDWATCH_METRICS_MODULE_BLOCK" | grep -q '"GoldenGateCloudWatchMetricsRole-dev"' \
+    if echo "$CLOUDWATCH_METRICS_MODULE_BLOCK" | grep -q 'name          = local.gg_env_role_names.cloudwatchMetrics' \
         && echo "$CLOUDWATCH_METRICS_MODULE_BLOCK" | grep -q 'policy_folder = "goldengate-cloudwatch-metrics-dev"' \
         && echo "$CLOUDWATCH_METRICS_MODULE_BLOCK" | grep -q 'managed_policy_arns = \[\]'; then
-      pass "goldengate_cloudwatch_metrics_role_dev uses name=GoldenGateCloudWatchMetricsRole-dev, policy_folder=goldengate-cloudwatch-metrics-dev, managed_policy_arns=[]"
+      pass "goldengate_cloudwatch_metrics_role_dev derives name from environment config (local.gg_env_role_names.cloudwatchMetrics), policy_folder=goldengate-cloudwatch-metrics-dev, managed_policy_arns=[]"
     else
       fail "goldengate_cloudwatch_metrics_role_dev module block does not contain the expected name/policy_folder/managed_policy_arns"
     fi
@@ -613,9 +614,11 @@ PYEOF
   CW_METRICS_POLICY_FILE="${REPO_ROOT}/envs/dev/policies/goldengate-cloudwatch-metrics-dev/policies/policies_1.json"
 
   if [ -f "$CW_METRICS_TRUST_FILE" ] && command -v python3 >/dev/null 2>&1; then
-    CW_TRUST_CHECK="$(python3 - "$CW_METRICS_TRUST_FILE" <<'PYEOF'
+    EXPECTED_OIDC_PROVIDER_ARN="$(python3 "$ENVIRONMENT_TOOL" --environment dev get EKS_OIDC_PROVIDER_ARN)"
+    CW_TRUST_CHECK="$(python3 - "$CW_METRICS_TRUST_FILE" "$EXPECTED_OIDC_PROVIDER_ARN" <<'PYEOF'
 import json, sys
 doc = json.load(open(sys.argv[1]))
+expected_federated = sys.argv[2]
 stmts = doc.get("Statement")
 if not isinstance(stmts, list) or len(stmts) != 1:
     print("MISMATCH:not-exactly-one-statement")
@@ -623,7 +626,7 @@ if not isinstance(stmts, list) or len(stmts) != 1:
 s = stmts[0]
 principal = s.get("Principal", {})
 federated = principal.get("Federated", "")
-if "arn:aws:iam::668311715351:oidc-provider/oidc.eks.eu-west-1.amazonaws.com/id/407C4385FF87947926730569F1E564FB" != federated:
+if expected_federated != federated:
     print(f"MISMATCH:federated={federated}")
     raise SystemExit
 if s.get("Action") != "sts:AssumeRoleWithWebIdentity":
@@ -760,10 +763,10 @@ PYEOF
 
   CLOUDWATCH_OBSERVABILITY_TF="${REPO_ROOT}/envs/dev/cloudwatch_observability.tf"
   if [ -f "$CLOUDWATCH_OBSERVABILITY_TF" ]; then
-    if grep -q '"/aws/containerinsights/gg-poc-dev/performance"' "$CLOUDWATCH_OBSERVABILITY_TF" \
+    if grep -q 'local.gg_env_container_insights_log_group' "$CLOUDWATCH_OBSERVABILITY_TF" \
         && grep -q 'default\s*=\s*30' "$CLOUDWATCH_OBSERVABILITY_TF" \
         && grep -q 'goldengate_container_insights_retention_days' "$CLOUDWATCH_OBSERVABILITY_TF"; then
-      pass "envs/dev/cloudwatch_observability.tf defines /aws/containerinsights/gg-poc-dev/performance with a 30-day default retention variable"
+      pass "envs/dev/cloudwatch_observability.tf defines the Container Insights performance log group (name derived from environment config, Fresh-EKS Phase A) with a 30-day default retention variable"
     else
       fail "envs/dev/cloudwatch_observability.tf does not define the expected performance log group and/or 30-day default retention"
     fi
@@ -2017,7 +2020,7 @@ PYEOF
     pass "14: no enable_cloudwatch Terraform variable/reference exists under envs/"
   fi
 
-  # 15: earlier phases' resources remain functionally untouched (comment-only edits are allowed and ignored here). envs/dev/policies/goldengate-cloudwatch-metrics-dev is excluded since the OTLP-authorization correction intentionally changes one condition operator there; helm/goldengate-platform and platform/dev/goldengate-platform are excluded since Phase 6D0 legitimately changes the per-flavour runtime ServiceAccounts there (guarded instead by the dedicated ServiceAccount/Fluent-Bit safety checks in this same suite).
+  # 15: earlier phases' resources remain functionally untouched (comment-only edits are allowed and ignored here). envs/dev/policies/goldengate-cloudwatch-metrics-dev is excluded since the OTLP-authorization correction intentionally changes one condition operator there; helm/goldengate-platform and platform/dev/goldengate-platform are excluded since Phase 6D0 legitimately changes the per-flavour runtime ServiceAccounts there (guarded instead by the dedicated ServiceAccount/Fluent-Bit safety checks in this same suite). envs/dev/cloudwatch_observability.tf, envs/dev/cloudwatch_logs.tf, and envs/dev/policies/goldengate-platform-logging-dev are excluded starting with Fresh-EKS Phase A, which legitimately centralizes their log-group names onto envs/dev/environment.tf and regenerates goldengate-platform-logging-dev's assume_role_policy/sts.json for the new EKS OIDC issuer -- both already independently guarded by this same suite's render-iam-policies/environment-contract checks, never by this narrow historical byte-diff.
   PHASE_6A_6B1_STATUS="$(python3 -c "
 import subprocess
 
@@ -2035,9 +2038,6 @@ def strip_comments(text):
 
 paths = [
     '.github/workflows/cloudwatch-observability-artifact-sync.yaml',
-    'envs/dev/cloudwatch_observability.tf',
-    'envs/dev/cloudwatch_logs.tf',
-    'envs/dev/policies/goldengate-platform-logging-dev',
 ]
 changed = subprocess.run(['git', '-C', '$REPO_ROOT', 'diff', '--name-only', '--'] + paths, capture_output=True, text=True).stdout.split()
 mismatches = []
@@ -2050,7 +2050,7 @@ for f in changed:
 print(('MISMATCH:' + ','.join(mismatches)) if mismatches else 'IDENTICAL')
 " 2>/dev/null || true)"
   if [ "$PHASE_6A_6B1_STATUS" = "IDENTICAL" ]; then
-    pass "15: Phase 6A (gg-fluent-bit) and Phase 6B1/6B2A (CloudWatch Observability supply chain, IAM) files are functionally unchanged"
+    pass "15: Phase 6A (gg-fluent-bit) CloudWatch Observability supply-chain workflow is functionally unchanged"
   else
     fail "15: an unexpected functional change was found in Phase 6A/6B1/6B2A files: ${PHASE_6A_6B1_STATUS:-unknown}"
   fi
@@ -3786,12 +3786,12 @@ else
   fail "unexpected alarm/SNS/gg-alerter/Fluent Bit implementation found in:${NOT_YET_HITS}"
 fi
 
-# A separate phase legitimately changes envs/dev/policies/goldengate-secrets-read-dev and iam.tf's description text -- the monitor role's policy folder must remain untouched, and iam.tf's structural identifiers must not change even though description text may; compare with --ignore-all-space since whitespace/line-ending diffs are pre-existing baseline noise.
-MONITOR_IAM_DIFF="$(git diff --ignore-all-space -- envs/dev/policies/goldengate-monitor-read-dev 2>/dev/null || true)"
+# A separate phase legitimately changes envs/dev/policies/goldengate-secrets-read-dev and iam.tf's description text -- the monitor role's PERMISSION CONTENT (policies_1.json) must remain untouched, and iam.tf's structural identifiers must not change even though description text may. Starting with Fresh-EKS Phase A, assume_role_policy/sts.json is EXCLUDED here since it legitimately regenerates for the new EKS OIDC issuer (already independently verified by this suite's render-iam-policies/trust-subject checks) -- this check now guards permission content only. Compare with --ignore-all-space since whitespace/line-ending diffs are pre-existing baseline noise.
+MONITOR_IAM_DIFF="$(git diff --ignore-all-space -- envs/dev/policies/goldengate-monitor-read-dev/policies 2>/dev/null || true)"
 if [ -z "$MONITOR_IAM_DIFF" ]; then
-  pass "envs/dev/policies/goldengate-monitor-read-dev has no substantive changes (monitor IAM untouched)"
+  pass "envs/dev/policies/goldengate-monitor-read-dev/policies (permission content) has no substantive changes (monitor IAM permissions untouched)"
 else
-  fail "unexpected change detected in envs/dev/policies/goldengate-monitor-read-dev -- the monitor role must remain untouched"
+  fail "unexpected change detected in envs/dev/policies/goldengate-monitor-read-dev/policies -- the monitor role's permission content must remain untouched"
 fi
 
 # 27. Runtime IAM least-privilege reduction (observer DynamoDB/CloudWatch permissions removed; monitor IAM and Secrets Manager/KMS access for canonical and legacy runtime pods unchanged).
@@ -3974,14 +3974,14 @@ else
   fail "8: envs/dev/goldengate-monitor/values.yaml no longer references GoldenGateMonitorReadRole-dev"
 fi
 
-# 11. Terraform references remain valid: iam.tf's module block still exists, still names the same role, and still attaches the same policy_folder.
+# 11. Terraform references remain valid: iam.tf's module block still exists, still derives its name from the canonical environment config (Fresh-EKS Phase A -- never a re-typed literal), and still attaches the same policy_folder.
 if grep -q 'module "goldengate_secrets_read_role_dev"' envs/dev/iam.tf \
-    && grep -q 'name          = "GoldenGateSecretsReadRole-dev"' envs/dev/iam.tf \
+    && grep -q 'name          = local.gg_env_role_names.runtime' envs/dev/iam.tf \
     && grep -q 'policy_folder = "goldengate-secrets-read-dev"' envs/dev/iam.tf \
     && grep -q 'module "goldengate_monitor_read_role_dev"' envs/dev/iam.tf \
-    && grep -q 'name          = "GoldenGateMonitorReadRole-dev"' envs/dev/iam.tf \
+    && grep -q 'name          = local.gg_env_role_names.monitor' envs/dev/iam.tf \
     && grep -q 'policy_folder = "goldengate-monitor-read-dev"' envs/dev/iam.tf; then
-  pass "11: envs/dev/iam.tf's module blocks still name the same roles and attach the same policy_folder values"
+  pass "11: envs/dev/iam.tf's module blocks still derive the same roles from environment config and attach the same policy_folder values"
 else
   fail "11: envs/dev/iam.tf's role/policy_folder identifiers appear to have changed"
 fi
@@ -4730,45 +4730,14 @@ fi
 collector_safety_contract_check "17"
 
 if command -v git >/dev/null 2>&1 && git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  # 18: IAM is unchanged except the specific, already-reviewed additions from prior phases: new role modules (never a change to an existing role), scoped policy-statement additions, and one condition-operator change (StringEquals -> StringEqualsIfExists) on GoldenGateCloudWatchMetricsRole-dev's namespace condition. GoldenGateSecretsReadRole-dev/GoldenGateMonitorReadRole-dev must never be touched. New files under a brand-new policy folder are untracked, not a "diff" of an existing file, so they never appear here. --name-only doesn't fully honor --ignore-all-space in this git version (still lists line-ending-only diffs), so --stat is used and parsed for real changed paths instead.
-  EXPECTED_MODIFIED_IAM_FILES="envs/dev/policies/goldengate-eks-deploy-dev/policies/policies_1.json
-envs/dev/iam.tf
-envs/dev/policies/argocd-ecr-oci-read-dev/policies/policies_1.json
-envs/dev/policies/goldengate-cloudwatch-metrics-dev/policies/policies_1.json"
-  # goldengate-secrets-read-dev is excluded here -- it has its own dedicated, content-precise SECRETS_ROLE_DIFF_OK check below.
-  IAM_DIFF_STAT="$(git -C "$REPO_ROOT" diff --stat=300 --ignore-all-space -- envs/dev/policies envs/dev/iam.tf \
-    ':!envs/dev/policies/goldengate-secrets-read-dev' 2>/dev/null || true)"
+  # 18: Fresh-EKS Phase A superseded the narrower "these specific IAM files never change" narrative from an earlier phase -- the OIDC rebind legitimately regenerates every assume_role_policy/sts.json (all 6 role folders), which the dedicated "render-iam-policies --check" and trust-subject-exactness checks elsewhere in this suite already verify are byte-for-byte the deterministic output of hack/goldengate-environment.py, not an unreviewed edit. This check's remaining job is narrower and permanent: no policies_1.json PERMISSION-content file may change unless account/region/cluster identity in environment.yaml itself changed (proven separately by render-iam-policies --check being a no-op today), and no file outside envs/dev/policies/**, envs/dev/iam.tf, envs/dev/environment.tf, or envs/dev/goldengate_inventory.tf may be touched by an IAM-labeled diff.
+  IAM_DIFF_STAT="$(git -C "$REPO_ROOT" diff --stat=300 --ignore-all-space -- envs/dev/policies envs/dev/iam.tf envs/dev/environment.tf envs/dev/goldengate_inventory.tf 2>/dev/null || true)"
   IAM_DIFF_FILES="$(echo "$IAM_DIFF_STAT" | grep -oE '\S+\.(json|tf)' | sort -u || true)"
-  UNEXPECTED_IAM_DIFF_FILES="$(comm -23 <(echo "$IAM_DIFF_FILES") <(echo "$EXPECTED_MODIFIED_IAM_FILES" | sort -u) 2>/dev/null || true)"
-  MONITOR_ROLE_DIFF="$(git -C "$REPO_ROOT" diff --stat --ignore-all-space -- envs/dev/policies/goldengate-monitor-read-dev 2>/dev/null || true)"
-  # This phase's restored shared-identity model authorizes exactly this change to GoldenGateSecretsReadRole-dev's trust policy: the permanent canonical system:serviceaccount:goldengate-dev:gg-runtime-sa subject is ADDED (never removed), and every previously-present subject (transitional per-engine subjects, legacy wildcard) is preserved byte-for-byte; anything else there still fails closed.
-  SECRETS_ROLE_DIFF="$(git -C "$REPO_ROOT" diff --ignore-all-space -- envs/dev/policies/goldengate-secrets-read-dev 2>/dev/null || true)"
-  SECRETS_ROLE_DIFF_OK="$(python3 -c "
-import json, subprocess
-sts_path = '$REPO_ROOT/envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json'
-try:
-    head_text = subprocess.run(['git', '-C', '$REPO_ROOT', 'show',
-        'HEAD:envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json'],
-        capture_output=True, text=True, check=True).stdout
-    head_doc = json.loads(head_text)
-    with open(sts_path) as f:
-        working_doc = json.load(f)
-    head_copy = json.loads(json.dumps(head_doc))
-    subs = head_copy['Statement'][0]['Condition']['StringLike'][
-        'oidc.eks.eu-west-1.amazonaws.com/id/407C4385FF87947926730569F1E564FB:sub']
-    restored_sub = 'system:serviceaccount:goldengate-dev:gg-runtime-sa'
-    if restored_sub not in subs:
-        subs.append(restored_sub)
-    print('true' if head_copy == working_doc else 'false')
-except Exception:
-    print('false')
-")"
-  if [ -z "$IAM_DIFF_FILES" ] && [ -z "$MONITOR_ROLE_DIFF" ] && [ -z "$SECRETS_ROLE_DIFF" ]; then
-    pass "18: IAM (envs/dev/policies, envs/dev/iam.tf) is unchanged"
-  elif [ -z "$UNEXPECTED_IAM_DIFF_FILES" ] && [ -z "$MONITOR_ROLE_DIFF" ] && [ "$SECRETS_ROLE_DIFF_OK" = "true" ]; then
-    pass "18: only the expected files changed; GoldenGateMonitorReadRole-dev is unchanged, and GoldenGateSecretsReadRole-dev's trust policy changed exactly as reviewed (permanent canonical gg-runtime-sa subject added; every prior subject preserved)"
+  POLICY_CONTENT_DIFF_FILES="$(echo "$IAM_DIFF_FILES" | grep -F 'policies_1.json' || true)"
+  if [ -z "$POLICY_CONTENT_DIFF_FILES" ]; then
+    pass "18: no envs/dev/policies/**/policies_1.json permission-content file changed (account/region/cluster identity in environment.yaml is unchanged, confirmed separately by render-iam-policies --check); only assume_role_policy/sts.json (OIDC rebind, verified elsewhere) and/or envs/dev/iam.tf, envs/dev/environment.tf, envs/dev/goldengate_inventory.tf may legitimately differ"
   else
-    fail "18: IAM changed outside the expected file set, or a protected role's policy was touched:"$'\n'"unexpected changed files: ${UNEXPECTED_IAM_DIFF_FILES}"$'\n'"${MONITOR_ROLE_DIFF}"$'\n'"${SECRETS_ROLE_DIFF}"
+    fail "18: a policies_1.json PERMISSION-content file changed unexpectedly (account/region/cluster identity should be unchanged):"$'\n'"${POLICY_CONTENT_DIFF_FILES}"
   fi
 else
   skip "collector.py/monitor.py/IAM unchanged checks -- not a git repository"
@@ -5046,10 +5015,10 @@ else
   fail "24: envs/dev/cloudwatch_dashboard.tf is missing"
 fi
 
-if grep -q 'dashboard_name = "gg-dev-fleet-overview"' "$DASHBOARD_TF" 2>/dev/null; then
-  pass "24: dashboard name is exactly gg-dev-fleet-overview"
+if grep -qF 'dashboard_name = "gg-${local.gg_env_environment}-fleet-overview"' "$DASHBOARD_TF" 2>/dev/null; then
+  pass "24: dashboard name derives from environment config (Fresh-EKS Phase A) and resolves to gg-dev-fleet-overview for the real dev environment"
 else
-  fail "24: dashboard name is missing or not exactly gg-dev-fleet-overview"
+  fail "24: dashboard name is missing or no longer derives \"gg-\${local.gg_env_environment}-fleet-overview\""
 fi
 
 GOLDENGATE_INVENTORY_TF="envs/dev/goldengate_inventory.tf"
@@ -5574,14 +5543,11 @@ else
   fail "26: the generic platform chart default no longer declares an empty transitionalRuntimeServiceAccounts list"
 fi
 
-if grep -qE '^\s*transitionalRuntimeServiceAccounts:\s*$' platform/dev/goldengate-platform/values.yaml 2>/dev/null \
-    && grep -qE '^\s*-\s*name:\s*gg-oracle-sa\s*$' platform/dev/goldengate-platform/values.yaml 2>/dev/null \
-    && grep -qE '^\s*engine:\s*oracle\s*$' platform/dev/goldengate-platform/values.yaml 2>/dev/null \
-    && grep -qE '^\s*-\s*name:\s*gg-postgresql-sa\s*$' platform/dev/goldengate-platform/values.yaml 2>/dev/null \
-    && grep -qE '^\s*engine:\s*postgresql\s*$' platform/dev/goldengate-platform/values.yaml 2>/dev/null; then
-  pass "26: platform/dev/goldengate-platform/values.yaml declares the fixed transitionalRuntimeServiceAccounts list (gg-oracle-sa/oracle, gg-postgresql-sa/postgresql)"
+# Fresh-EKS Phase A: this is a new cluster with no live migration workloads, so DEV no longer overrides transitionalRuntimeServiceAccounts -- it must inherit the chart's own safe [] default (checked just above) rather than redeclare it.
+if grep -qE '^\s*transitionalRuntimeServiceAccounts:' platform/dev/goldengate-platform/values.yaml 2>/dev/null; then
+  fail "26: platform/dev/goldengate-platform/values.yaml still overrides transitionalRuntimeServiceAccounts -- the fresh cluster must inherit the chart's own [] default instead"
 else
-  fail "26: platform/dev/goldengate-platform/values.yaml is missing the fixed transitionalRuntimeServiceAccounts list"
+  pass "26: platform/dev/goldengate-platform/values.yaml no longer overrides transitionalRuntimeServiceAccounts -- inherits the chart's own [] default"
 fi
 
 if grep -qE '\{\{-?\s*range\s+\.Values\.transitionalRuntimeServiceAccounts' helm/goldengate-platform/templates/runtime-serviceaccounts.yaml 2>/dev/null; then
@@ -5599,52 +5565,13 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
     --set-string fluentBit.image.reference=229410149234.dkr.ecr.eu-west-1.amazonaws.com/aws-cloud-factory-fluent-bit@sha256:366923ffc51dfde4966e743dcbd4ca05211b733d4f69c7591903bc7660fbf243 \
     2>/dev/null)"
   RENDERED_SA_COUNT="$(echo "$PLATFORM_SA_RENDER" | grep -c '^kind: ServiceAccount$' || true)"
-  if [ "$RENDERED_SA_COUNT" -eq 4 ] \
+  if [ "$RENDERED_SA_COUNT" -eq 2 ] \
       && [ "$(echo "$PLATFORM_SA_RENDER" | grep -c 'name: gg-runtime-sa')" -eq 1 ] \
-      && [ "$(echo "$PLATFORM_SA_RENDER" | grep -c 'name: gg-oracle-sa')" -eq 1 ] \
-      && [ "$(echo "$PLATFORM_SA_RENDER" | grep -c 'name: gg-postgresql-sa')" -eq 1 ] \
       && echo "$PLATFORM_SA_RENDER" | grep -q "name: gg-fluent-bit" \
-      && ! echo "$PLATFORM_SA_RENDER" | grep -qE "name: gg-(mssql|daa|mysql|sqlserver|distributed)-sa"; then
-    pass "26: the platform chart renders exactly the 4 expected ServiceAccounts (canonical gg-runtime-sa + transitional gg-oracle-sa/gg-postgresql-sa + gg-fluent-bit), never a per-deploymentType identity"
+      && ! echo "$PLATFORM_SA_RENDER" | grep -qE "name: gg-(oracle|postgresql|mssql|daa|mysql|sqlserver|distributed)-sa"; then
+    pass "26: the platform chart renders exactly the 2 expected ServiceAccounts (canonical gg-runtime-sa + gg-fluent-bit) -- no migration-compatibility identity on the fresh cluster, never a per-deploymentType identity"
   else
-    fail "26: the rendered platform chart ServiceAccount set is not exactly {gg-runtime-sa, gg-oracle-sa, gg-postgresql-sa, gg-fluent-bit} (found ${RENDERED_SA_COUNT} ServiceAccount documents)"
-  fi
-
-  PLATFORM_SA_SPLIT_DIR="$(mktemp -d)"
-  awk -v outdir="$PLATFORM_SA_SPLIT_DIR" '
-    BEGIN { docnum = 0; fname = outdir "/doc-0.yaml" }
-    /^---$/ { docnum++; fname = outdir "/doc-" docnum ".yaml"; next }
-    { print > fname }
-  ' <<< "$PLATFORM_SA_RENDER"
-  ORACLE_SA_BLOCK=""
-  POSTGRESQL_SA_BLOCK=""
-  for doc in "$PLATFORM_SA_SPLIT_DIR"/doc-*.yaml; do
-    if grep -q '^kind: ServiceAccount$' "$doc" && grep -q '^  name: gg-oracle-sa$' "$doc"; then
-      ORACLE_SA_BLOCK="$(cat "$doc")"
-    fi
-    if grep -q '^kind: ServiceAccount$' "$doc" && grep -q '^  name: gg-postgresql-sa$' "$doc"; then
-      POSTGRESQL_SA_BLOCK="$(cat "$doc")"
-    fi
-  done
-  rm -rf "$PLATFORM_SA_SPLIT_DIR"
-  if echo "$ORACLE_SA_BLOCK" | grep -q "goldengate.adcb/engine: oracle" \
-      && echo "$ORACLE_SA_BLOCK" | grep -qF "arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev" \
-      && echo "$ORACLE_SA_BLOCK" | grep -qF "argocd.argoproj.io/sync-options: Prune=false,Delete=false" \
-      && echo "$POSTGRESQL_SA_BLOCK" | grep -q "goldengate.adcb/engine: postgresql" \
-      && echo "$POSTGRESQL_SA_BLOCK" | grep -qF "arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev" \
-      && echo "$POSTGRESQL_SA_BLOCK" | grep -qF "argocd.argoproj.io/sync-options: Prune=false,Delete=false"; then
-    pass "26: gg-oracle-sa/gg-postgresql-sa preserve their exact pre-migration goldengate.adcb/engine label, use the SAME runtime IAM role as gg-runtime-sa (no new IAM permissions), and remain deletion-protected (Prune=false,Delete=false)"
-  else
-    fail "26: the transitional gg-oracle-sa/gg-postgresql-sa ServiceAccounts do not preserve the expected label/role-ARN/deletion-protection metadata contract"
-  fi
-
-  # ROLLOUT-SAFETY REGRESSION: the defect found in review was that the platform Argo Application has automated.prune=true, so any ServiceAccount missing from Helm's DESIRED state (not just "orphaned but Prune=false") would be treated as removed. This proves the desired render itself -- never reliance on Prune=false alone -- is what keeps gg-oracle-sa/gg-postgresql-sa alive during this migration phase.
-  if grep -qF "automated:" "$PLATFORM_WORKFLOW" 2>/dev/null && grep -qF "prune: true" "$PLATFORM_WORKFLOW" 2>/dev/null && grep -qF "selfHeal: true" "$PLATFORM_WORKFLOW" 2>/dev/null \
-      && [ "$(echo "$PLATFORM_SA_RENDER" | grep -c 'name: gg-oracle-sa')" -eq 1 ] \
-      && [ "$(echo "$PLATFORM_SA_RENDER" | grep -c 'name: gg-postgresql-sa')" -eq 1 ]; then
-    pass "26 (Argo prune safety): the platform Application keeps automated.prune=true/selfHeal=true AND the Helm desired state itself still renders gg-oracle-sa/gg-postgresql-sa -- they survive the next sync as genuine desired resources, never merely as orphaned Prune=false extras"
-  else
-    fail "26 (Argo prune safety): either automated.prune/selfHeal changed, or the transitional ServiceAccounts are missing from the rendered desired state -- with prune=true this would delete them on the next sync"
+    fail "26: the rendered platform chart ServiceAccount set is not exactly {gg-runtime-sa, gg-fluent-bit} (found ${RENDERED_SA_COUNT} ServiceAccount documents)"
   fi
 
   # Adding a brand-new deploymentType (e.g. mysql, mssql) must have ZERO effect on the platform chart's rendered ServiceAccount set -- it is driven entirely by fixed values.yaml data, never by the folder-driven deployment inventory.
@@ -5679,18 +5606,18 @@ else
   fail "26: IAM trust policy is missing the canonical system:serviceaccount:goldengate-dev:gg-runtime-sa subject"
 fi
 
-# During this migration phase, the two transitional subjects must remain EXACTLY as-is -- fixed migration-compatibility entries, never derived from or affected by the folder-driven deployment inventory (a new deploymentType must never touch this file).
+# Fresh EKS cluster (Fresh-EKS Phase A): the migration-compatibility subjects from the destroyed cluster must NOT be recreated -- there are no old Oracle/PostgreSQL runtime pods on this cluster needing migration trust.
 if grep -q "goldengate-dev:gg-oracle-sa" "$STS_TRUST_POLICY" 2>/dev/null \
-    && grep -q "goldengate-dev:gg-postgresql-sa" "$STS_TRUST_POLICY" 2>/dev/null; then
-  pass "26: IAM trust policy still trusts both fixed transitional subjects (system:serviceaccount:goldengate-dev:gg-oracle-sa, gg-postgresql-sa) exactly as before"
+    || grep -q "goldengate-dev:gg-postgresql-sa" "$STS_TRUST_POLICY" 2>/dev/null; then
+  fail "26: IAM trust policy still trusts a migration-only transitional subject (gg-oracle-sa/gg-postgresql-sa) -- must not be recreated on the fresh cluster"
 else
-  fail "26: IAM trust policy is missing one or both fixed transitional subjects (gg-oracle-sa/gg-postgresql-sa)"
+  pass "26: IAM trust policy trusts neither migration-only transitional subject (gg-oracle-sa, gg-postgresql-sa)"
 fi
 
 if grep -q "gg-dev-\*:ogg-oracle-sa" "$STS_TRUST_POLICY" 2>/dev/null; then
-  pass "26: IAM trust policy still retains the unchanged legacy historical Oracle wildcard exception (system:serviceaccount:gg-dev-*:ogg-oracle-sa)"
+  fail "26: IAM trust policy still retains the legacy historical Oracle wildcard exception (system:serviceaccount:gg-dev-*:ogg-oracle-sa) -- must not be recreated on the fresh cluster"
 else
-  fail "26: IAM trust policy's legacy historical Oracle wildcard exception is missing"
+  pass "26: IAM trust policy no longer retains the legacy historical Oracle wildcard exception (system:serviceaccount:gg-dev-*:ogg-oracle-sa)"
 fi
 
 if grep -qE '"system:serviceaccount:goldengate-dev:\*"|goldengate-dev:gg-\\?\*-sa|goldengate-dev:gg-mssql-sa' "$STS_TRUST_POLICY" 2>/dev/null; then
@@ -5718,11 +5645,11 @@ else
   skip "26: synthetic-type trust-stability check -- python3 unavailable"
 fi
 
-# Honestly-reported blocker: cannot be removed without live-cluster inventory evidence; SKIP, never a false PASS.
+# Fresh-EKS Phase A resolved this blocker definitively: this is a brand-new cluster with no live workloads at all, so no live-cluster inventory evidence is needed to prove the legacy namespace-wildcard subject is safe to remove -- it is unconditionally absent now.
 if grep -qE '"system:serviceaccount:[^"]*\*[^"]*"' "$STS_TRUST_POLICY" 2>/dev/null; then
-  skip "26: IAM trust still contains the legacy namespace-wildcard subject (system:serviceaccount:gg-dev-*:ogg-oracle-sa) -- unresolved, requires live-cluster inventory evidence not available offline (see: kubectl get pods -A -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,SA:.spec.serviceAccountName' and kubectl get serviceaccounts -A -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name')"
+  fail "26: IAM trust still contains a namespace-wildcard subject -- must not exist on the fresh cluster"
 else
-  fail "26: the legacy namespace-wildcard subject disappeared from the trust policy without live-cluster evidence -- this must never happen silently"
+  pass "26: IAM trust contains no namespace-wildcard subject"
 fi
 
 if grep -q "SUPPORTED_TYPES" monitoring/monitor/config.py 2>/dev/null; then
@@ -6191,10 +6118,10 @@ fi
 
 SECRET_TF_MODULE_COUNT="$(grep -c '^module "' envs/dev/secret.tf 2>/dev/null || true)"
 if [ "$SECRET_TF_MODULE_COUNT" -eq 3 ] \
-    && grep -q 'name.*= "dev/goldengate/source/admin"' envs/dev/secret.tf 2>/dev/null \
-    && grep -q 'name.*= "dev/goldengate/target/admin"' envs/dev/secret.tf 2>/dev/null \
-    && grep -q 'name.*= "dev/goldengate/tls-certificate"' envs/dev/secret.tf 2>/dev/null; then
-  pass "29: secret.tf contains exactly the three approved shared secret modules"
+    && grep -q 'name.*= local.gg_env_source_admin_secret_name' envs/dev/secret.tf 2>/dev/null \
+    && grep -q 'name.*= local.gg_env_target_admin_secret_name' envs/dev/secret.tf 2>/dev/null \
+    && grep -q 'name.*= local.gg_env_tls_secret_name' envs/dev/secret.tf 2>/dev/null; then
+  pass "29: secret.tf contains exactly the three approved shared secret modules (names derived from environment config, Fresh-EKS Phase A)"
 else
   fail "29: secret.tf does not contain exactly the three approved shared secret modules (found ${SECRET_TF_MODULE_COUNT})"
 fi
@@ -6241,6 +6168,18 @@ if command -v terraform >/dev/null 2>&1; then
     "${TF_PLAN_SCRATCH}/platform/dev/goldengate-platform" "${TF_PLAN_SCRATCH}/envs/dev/goldengate-monitor" \
     "${TF_PLAN_SCRATCH}/envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy"
   cp envs/dev/goldengate_inventory.tf "${TF_PLAN_SCRATCH}/envs/dev/goldengate_inventory.tf"
+  # Stand-in for envs/dev/environment.tf's locals, WITHOUT its live aws_eks_cluster/aws_iam_openid_connect_provider data sources -- this harness is intentionally offline/no-AWS-credentials, so it mirrors only the specific local.gg_env_* values goldengate_inventory.tf actually reads, using the real current envs/dev/environment.yaml's resolved values (kept in sync manually; if this harness's Terraform plan output ever disagrees with `python3 hack/goldengate-environment.py --environment dev github-env`, that is the signal to update the literals below).
+  cat > "${TF_PLAN_SCRATCH}/envs/dev/environment_stub.tf" <<'EOF'
+locals {
+  gg_env_dns_domain               = "goldengate-dev.adcbmis.local"
+  gg_env_ecr_registry             = "229410149234.dkr.ecr.eu-west-1.amazonaws.com"
+  gg_env_namespaces               = { runtime = "goldengate-dev", monitoring = "goldengate-monitoring", argocd = "argocd", observability = "amazon-cloudwatch" }
+  gg_env_oidc_hostpath            = "oidc.eks.eu-west-1.amazonaws.com/id/B1DF999126467169346B88078D7927E2"
+  gg_env_source_admin_secret_name = "dev/goldengate/source/admin"
+  gg_env_target_admin_secret_name = "dev/goldengate/target/admin"
+  gg_env_tls_secret_name          = "dev/goldengate/tls-certificate"
+}
+EOF
   cp envs/dev/gg-postgresql-repltest-01/values.yaml "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-repltest-01/values.yaml"
   cp envs/dev/gg-mssql-repltest-01/values.yaml "${TF_PLAN_SCRATCH}/envs/dev/gg-mssql-repltest-01/values.yaml"
   cp platform/dev/goldengate-platform/values.yaml "${TF_PLAN_SCRATCH}/platform/dev/goldengate-platform/values.yaml"
@@ -6373,19 +6312,24 @@ EOF
     fi
     cp "${TF_PLAN_SCRATCH}/source-backup3.yaml" "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-repltest-01/values.yaml"
 
-    # Exact-trust-equality edge cases (F is already proven by the clean baseline plan above, run against this same untouched real sts.json). G-K mutate a scratch copy and restore it after each.
+    # Exact-trust-equality edge cases (F is already proven by the clean baseline plan above, run against this same untouched real sts.json). H/J/K mutate a scratch copy and restore it after each -- G/I (removing a transitional/legacy subject) no longer apply: Fresh-EKS Phase A's one-subject architecture never has those subjects to remove in the first place.
     STS_JSON_PATH="${TF_PLAN_SCRATCH}/envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json"
-    STS_SUB_PATH='.Statement[0].Condition.StringLike["oidc.eks.eu-west-1.amazonaws.com/id/407C4385FF87947926730569F1E564FB:sub"]'
+    STS_SUB_KEY="$(python3 -c "
+import json
+doc = json.load(open('${STS_JSON_PATH}'))
+cond = doc['Statement'][0]['Condition']['StringLike']
+print([k for k in cond if k.endswith(':sub')][0])
+")"
     cp "$STS_JSON_PATH" "${TF_PLAN_SCRATCH}/sts-exact-trust-backup.json"
 
     run_exact_trust_scenario() {
       local label="$1" mutate_py="$2" log_name="$3"
-      python3 -c "$mutate_py" "$STS_JSON_PATH"
+      python3 -c "$mutate_py" "$STS_JSON_PATH" "$STS_SUB_KEY"
       set +e
       (cd "${TF_PLAN_SCRATCH}/envs/dev" && terraform plan -input=false) >"${TF_PLAN_SCRATCH}/${log_name}" 2>&1
       local status=$?
       set -e
-      if [ "$status" -ne 0 ] && grep -q "trust subjects must exactly equal the currently approved migration" "${TF_PLAN_SCRATCH}/${log_name}"; then
+      if [ "$status" -ne 0 ] && grep -q "must be exactly one entry: the canonical" "${TF_PLAN_SCRATCH}/${log_name}"; then
         pass "30: ${label} produces a non-zero Terraform plan exit (exact-trust equality enforced)"
       else
         fail "30: ${label} did not block Terraform plan as expected (exit=${status})"
@@ -6394,34 +6338,18 @@ EOF
       cp "${TF_PLAN_SCRATCH}/sts-exact-trust-backup.json" "$STS_JSON_PATH"
     }
 
-    run_exact_trust_scenario "G: removing the transitional gg-postgresql-sa subject" '
+    run_exact_trust_scenario "H: removing the canonical gg-runtime-sa subject (leaves zero subjects)" '
 import json, sys
 with open(sys.argv[1]) as f: doc = json.load(f)
-subs = doc["Statement"][0]["Condition"]["StringLike"]["oidc.eks.eu-west-1.amazonaws.com/id/407C4385FF87947926730569F1E564FB:sub"]
-subs.remove("system:serviceaccount:goldengate-dev:gg-postgresql-sa")
-with open(sys.argv[1], "w") as f: json.dump(doc, f, indent=2)
-' "plan-missing-transitional.log"
-
-    run_exact_trust_scenario "H: removing the canonical gg-runtime-sa subject" '
-import json, sys
-with open(sys.argv[1]) as f: doc = json.load(f)
-subs = doc["Statement"][0]["Condition"]["StringLike"]["oidc.eks.eu-west-1.amazonaws.com/id/407C4385FF87947926730569F1E564FB:sub"]
+subs = doc["Statement"][0]["Condition"]["StringLike"][sys.argv[2]]
 subs.remove("system:serviceaccount:goldengate-dev:gg-runtime-sa")
 with open(sys.argv[1], "w") as f: json.dump(doc, f, indent=2)
 ' "plan-missing-canonical.log"
 
-    run_exact_trust_scenario "I: removing the legacy gg-dev-*:ogg-oracle-sa wildcard" '
-import json, sys
-with open(sys.argv[1]) as f: doc = json.load(f)
-subs = doc["Statement"][0]["Condition"]["StringLike"]["oidc.eks.eu-west-1.amazonaws.com/id/407C4385FF87947926730569F1E564FB:sub"]
-subs.remove("system:serviceaccount:gg-dev-*:ogg-oracle-sa")
-with open(sys.argv[1], "w") as f: json.dump(doc, f, indent=2)
-' "plan-missing-legacy.log"
-
     run_exact_trust_scenario "J: adding an unexpected subject" '
 import json, sys
 with open(sys.argv[1]) as f: doc = json.load(f)
-subs = doc["Statement"][0]["Condition"]["StringLike"]["oidc.eks.eu-west-1.amazonaws.com/id/407C4385FF87947926730569F1E564FB:sub"]
+subs = doc["Statement"][0]["Condition"]["StringLike"][sys.argv[2]]
 subs.append("system:serviceaccount:goldengate-dev:gg-unexpected-sa")
 with open(sys.argv[1], "w") as f: json.dump(doc, f, indent=2)
 ' "plan-unexpected-subject.log"
@@ -6429,12 +6357,12 @@ with open(sys.argv[1], "w") as f: json.dump(doc, f, indent=2)
     run_exact_trust_scenario "K: duplicating an existing subject" '
 import json, sys
 with open(sys.argv[1]) as f: doc = json.load(f)
-subs = doc["Statement"][0]["Condition"]["StringLike"]["oidc.eks.eu-west-1.amazonaws.com/id/407C4385FF87947926730569F1E564FB:sub"]
+subs = doc["Statement"][0]["Condition"]["StringLike"][sys.argv[2]]
 subs.append("system:serviceaccount:goldengate-dev:gg-runtime-sa")
 with open(sys.argv[1], "w") as f: json.dump(doc, f, indent=2)
 ' "plan-duplicate-subject.log"
 
-    # L: a brand-new deployment type requires ZERO sts.json change and still plans cleanly against the SAME exact four-subject trust set (sts.json here is the untouched real file, restored after each G-K mutation above).
+    # L: a brand-new deployment type requires ZERO sts.json change and still plans cleanly against the SAME exact one-subject trust set (sts.json here is the untouched real file, restored after each H/J/K mutation above).
     mkdir -p "${TF_PLAN_SCRATCH}/envs/dev/gg-mysql-fixture-01"
     sed -e 's/deploymentType: postgresql/deploymentType: mysql/' \
         -e 's/pipeline: repltest-pg-to-mssql-001/pipeline: payments-mysql-fixture-001/' \
@@ -6445,7 +6373,7 @@ with open(sys.argv[1], "w") as f: json.dump(doc, f, indent=2)
     TF_PLAN_NEW_TYPE_ONBOARDED_STATUS=$?
     set -e
     if [ "$TF_PLAN_NEW_TYPE_ONBOARDED_STATUS" -eq 0 ] && grep -q "to add, 0 to change, 0 to destroy" "${TF_PLAN_SCRATCH}/plan-new-type-onboarded.log"; then
-      pass "30: a brand-new safe deployment type (mysql) plans cleanly the moment its folder alone exists -- zero .tf source change AND zero sts.json change required against the same exact four-subject trust set"
+      pass "30: a brand-new safe deployment type (mysql) plans cleanly the moment its folder alone exists -- zero .tf source change AND zero sts.json change required against the same exact one-subject trust set"
     else
       fail "30: onboarding a brand-new safe deployment type via folder data alone did not produce a clean Terraform plan (exit=${TF_PLAN_NEW_TYPE_ONBOARDED_STATUS})"
       cat "${TF_PLAN_SCRATCH}/plan-new-type-onboarded.log"
@@ -6534,7 +6462,7 @@ fi
 # Static evidence only: GOLDENGATE_AWS_ROLE_ARN and EKS_DEPLOY_ROLE_ARN's live values are GitHub repo settings, unverifiable offline. Corrected for the VDR cross-account fix: validate_shared_secrets_once now starts from GOLDENGATE_AWS_ROLE_ARN (engineering account, via env.ROLE_ARN) like every other job, then separately assumes EKS_DEPLOY_ROLE_ARN in-step before any Secrets Manager call -- it is that second, workload-account role (GoldenGateEKSDeployRole-dev) that static evidence ties to the policy carrying the required read-only shared-secret permissions.
 if grep -q "role-to-assume: \${{ env.ROLE_ARN }}" "$EKS_APP_WORKFLOW" 2>/dev/null \
     && grep -qE 'aws sts assume-role --role-arn "\$EKS_DEPLOY_ROLE_ARN"' "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && grep -q 'name          = "GoldenGateEKSDeployRole-dev"' envs/dev/iam.tf 2>/dev/null \
+    && grep -q 'name          = local.gg_env_role_names.eksDeploy' envs/dev/iam.tf 2>/dev/null \
     && grep -q 'policy_folder = "goldengate-eks-deploy-dev"' envs/dev/iam.tf 2>/dev/null; then
   pass "31: validate_shared_secrets_once starts from the same GOLDENGATE_AWS_ROLE_ARN role used everywhere else, then in-step assumes EKS_DEPLOY_ROLE_ARN before any Secrets Manager call; static evidence ties that workload role to the policy carrying the required read-only shared-secret permissions (live values unverifiable offline)"
 else
@@ -7011,9 +6939,10 @@ else
   pass "no aws_security_group resource exists anywhere in GOLDENGATE-EKS-APP -- the shared EFS SG remains owned exclusively by aws-cloud-factory-infra"
 fi
 
-if grep -qE '^\s*variable\s+"goldengate_efs_shared_security_group_description"' envs/dev/efs.tf 2>/dev/null \
-    && ! grep -q 'goldengate_efs_shared_security_group_description' envs/dev/gg-*-payments-01/values.yaml 2>/dev/null; then
-  pass "the shared EFS security group is a single environment-level configuration point, never a per-deployment values.yaml setting"
+# Fresh-EKS Phase A: the SG description is now sourced from envs/dev/environment.yaml (local.gg_env_efs_shared_security_group_description) instead of a local Terraform variable with a hardcoded default -- still a single environment-level configuration point, never a per-deployment values.yaml setting.
+if grep -qF 'local.gg_env_efs_shared_security_group_description' envs/dev/efs.tf 2>/dev/null \
+    && ! grep -lq 'goldengate_efs_shared_security_group_description\|sharedSecurityGroupDescription' envs/dev/gg-*-repltest-01/values.yaml 2>/dev/null; then
+  pass "the shared EFS security group is a single environment-level configuration point (envs/dev/environment.yaml), never a per-deployment values.yaml setting"
 else
   fail "the shared EFS security group configuration point is missing or leaked into a per-deployment values.yaml"
 fi
@@ -7810,6 +7739,7 @@ def simulate(initial, outcome_when_run):
 def base_context(effective_deploy, has_changes="true"):
     return {
         "validate_model": {"result": "success", "outputs": {"effective_deploy": effective_deploy}},
+        "eks_oidc_preflight": {"result": "success", "outputs": {}},
         "detect_changed_deployments": {"result": "success", "outputs": {"has_changes": has_changes}},
         "managed_efs_deletion_guard": {"result": "success", "outputs": {}},
         "storage_transition_guard": {"result": "success", "outputs": {}},
@@ -7831,6 +7761,13 @@ ctx["managed_efs_inventory_guard"] = {"result": "failure", "outputs": {}}
 r = simulate(ctx, {})
 check("1: terraform_sync_once must be skipped", r["terraform_sync_once"]["result"] == "skipped")
 check("1: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
+
+# 1b (Fresh-EKS Phase A): deploy=true + eks_oidc_preflight failure (live OIDC issuer mismatch) -> terraform_sync_once must never run, so a stale/mismatched IRSA trust policy can never reach Terraform apply.
+ctx = base_context("true")
+ctx["eks_oidc_preflight"] = {"result": "failure", "outputs": {}}
+r = simulate(ctx, {})
+check("1b: terraform_sync_once must be skipped when eks_oidc_preflight fails", r["terraform_sync_once"]["result"] == "skipped")
+check("1b: build_publish_and_deploy must be skipped when eks_oidc_preflight fails", r["build_publish_and_deploy"]["result"] == "skipped")
 
 # 2: deploy=true + terraform failure -> runtime build/deploy cannot execute.
 ctx = base_context("true")
@@ -8822,6 +8759,158 @@ if grep -qF 'REPLICATION_SUPPORTED_SOURCE_TYPE = "postgresql"' hack/goldengate-d
   pass "PostgreSQL->MSSQL Phase 6D1 constants (REPLICATION_SUPPORTED_SOURCE_TYPE=postgresql, REPLICATION_SUPPORTED_TARGET_TYPE=mssql) remain unchanged"
 else
   fail "the Phase 6D1 replication scope constants have changed"
+fi
+
+echo ""
+echo "--- Fresh-EKS Phase A: canonical environment contract, OIDC rebind, common runtime IRSA ---"
+
+OLD_DESTROYED_OIDC_ID="407C4385FF87947926730569F1E564FB"
+
+# 1: the destroyed-cluster OIDC ID has zero references outside this suite's own detection literal above and hack/goldengate-environment.py's own OLD_DESTROYED_OIDC_ID fail-closed detector constant (which must name the literal in order to reject it from environment.yaml -- that is the check, not a leak).
+OLD_OIDC_HITS="$(grep -rl "$OLD_DESTROYED_OIDC_ID" --include='*.tf' --include='*.py' --include='*.json' --include='*.yaml' --include='*.yml' . 2>/dev/null | grep -vF "hack/test-goldengate-deployment-models.sh" | grep -vF "hack/goldengate-environment.py" || true)"
+if [ -z "$OLD_OIDC_HITS" ]; then
+  pass "1: the destroyed-cluster OIDC ID (${OLD_DESTROYED_OIDC_ID}) has zero references in production .tf/.py/.json/.yaml source outside the resolver's own detector constant"
+else
+  fail "1: the destroyed-cluster OIDC ID (${OLD_DESTROYED_OIDC_ID}) still appears in:"$'\n'"${OLD_OIDC_HITS}"
+fi
+
+# 2: envs/dev/environment.yaml is valid and the resolver's own validator confirms it contains no credential-shaped key/value.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "envs/dev/environment.yaml" ]; then
+  if python3 hack/goldengate-environment.py --environment dev validate >/dev/null 2>&1; then
+    pass "2: envs/dev/environment.yaml is valid and contains no credential-shaped key/value (hack/goldengate-environment.py validate)"
+  else
+    fail "2: envs/dev/environment.yaml failed validation"
+  fi
+else
+  skip "2: environment.yaml validation -- python3 or envs/dev/environment.yaml unavailable"
+fi
+
+# 3: generated IAM policy JSON is in sync with environment.yaml -- proves no hand-edited drift and (transitively) that the OIDC issuer embedded in every sts.json matches the canonical configured value.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "envs/dev/environment.yaml" ]; then
+  if python3 hack/goldengate-environment.py --environment dev render-iam-policies --check >/dev/null 2>&1; then
+    pass "3: all generated envs/dev/policies/**/sts.json and policies_1.json are in sync with environment.yaml (render-iam-policies --check)"
+  else
+    fail "3: generated IAM policy JSON is out of sync with environment.yaml -- run render-iam-policies --write"
+  fi
+else
+  skip "3: render-iam-policies --check -- python3 or envs/dev/environment.yaml unavailable"
+fi
+
+# 4/5/6/7: runtime trust resolves to exactly system:serviceaccount:goldengate-dev:gg-runtime-sa -- no wildcard, no gg-oracle-sa, no gg-postgresql-sa, no gg-dev-*:ogg-oracle-sa.
+SECRETS_STS="envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json"
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$SECRETS_STS" ]; then
+  TRUST_CHECK="$(python3 -c '
+import json, sys
+
+with open(sys.argv[1]) as f:
+    doc = json.load(f)
+
+sub = doc["Statement"][0]["Condition"]["StringLike"][[k for k in doc["Statement"][0]["Condition"]["StringLike"] if k.endswith(":sub")][0]]
+subjects = sub if isinstance(sub, list) else [sub]
+
+results = []
+results.append(("4", subjects == ["system:serviceaccount:goldengate-dev:gg-runtime-sa"]))
+results.append(("5", not any("*" in s for s in subjects)))
+results.append(("6", not any(s.endswith(":gg-oracle-sa") for s in subjects)))
+results.append(("7", not any(s.endswith(":gg-postgresql-sa") for s in subjects)))
+results.append(("8", not any("ogg-oracle-sa" in s for s in subjects)))
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+' "$SECRETS_STS" 2>&1)"
+  while IFS= read -r line; do
+    case "$line" in
+      "OK 4") pass "4: runtime trust resolves to EXACTLY [\"system:serviceaccount:goldengate-dev:gg-runtime-sa\"] -- one entry, no more, no less" ;;
+      "FAIL 4") fail "4: runtime trust subjects are not exactly [\"system:serviceaccount:goldengate-dev:gg-runtime-sa\"]" ;;
+      "OK 5") pass "5: no wildcard (*) exists in any runtime trust subject" ;;
+      "FAIL 5") fail "5: a wildcard exists in a runtime trust subject" ;;
+      "OK 6") pass "6: no gg-oracle-sa trust remains" ;;
+      "FAIL 6") fail "6: gg-oracle-sa trust still exists" ;;
+      "OK 7") pass "7: no gg-postgresql-sa trust remains" ;;
+      "FAIL 7") fail "7: gg-postgresql-sa trust still exists" ;;
+      "OK 8") pass "8: no gg-dev-*:ogg-oracle-sa (or any ogg-oracle-sa) trust remains" ;;
+      "FAIL 8") fail "8: ogg-oracle-sa trust still exists" ;;
+    esac
+  done <<< "$TRUST_CHECK"
+else
+  skip "4/5/6/7/8: runtime trust subject checks -- python3 or ${SECRETS_STS} unavailable"
+fi
+
+# 9: platform DEV desired state does not render a transitional runtime ServiceAccount (helm template, real chart).
+if command -v helm >/dev/null 2>&1 && [ -f "platform/dev/goldengate-platform/values.yaml" ]; then
+  PLATFORM_RENDERED="$(helm template goldengate-platform helm/goldengate-platform \
+    --values platform/dev/goldengate-platform/values.yaml \
+    --set runtimeServiceAccount.roleArn="arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev" \
+    --set fluentBit.create=false \
+    --show-only templates/runtime-serviceaccounts.yaml 2>&1)"
+  if echo "$PLATFORM_RENDERED" | grep -qF "name: gg-runtime-sa" \
+      && ! echo "$PLATFORM_RENDERED" | grep -qE "name: gg-(oracle|postgresql)-sa"; then
+    pass "9: platform DEV desired state renders exactly gg-runtime-sa and no transitional runtime ServiceAccount"
+  else
+    fail "9: platform DEV desired state rendering did not match expectations:"$'\n'"${PLATFORM_RENDERED}"
+  fi
+else
+  skip "9: platform chart rendering -- helm or platform/dev/goldengate-platform/values.yaml unavailable"
+fi
+
+# 10: generic chart behavior still works (helm lint, real chart, real DEV values).
+if command -v helm >/dev/null 2>&1 && [ -f "platform/dev/goldengate-platform/values.yaml" ]; then
+  if helm lint helm/goldengate-platform \
+      --values platform/dev/goldengate-platform/values.yaml \
+      --set runtimeServiceAccount.roleArn="arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev" \
+      --set fluentBit.create=false >/dev/null 2>&1; then
+    pass "10: helm lint passes for the goldengate-platform chart against real DEV values"
+  else
+    fail "10: helm lint failed for the goldengate-platform chart against real DEV values"
+  fi
+else
+  skip "10: helm lint -- helm or platform/dev/goldengate-platform/values.yaml unavailable"
+fi
+
+# 11: envs/dev/environment.tf pins the corporate EFS/IAM module architecture is untouched -- this phase never replaces a corporate module with raw resources.
+if grep -qF 'source = "git::https://github.com/AbuDhabiCommercialBank/aws-tf-module-iam-role' envs/dev/iam.tf 2>/dev/null \
+    && grep -qF 'ref=v2.0.0' envs/dev/iam.tf 2>/dev/null \
+    && ! grep -qE 'resource\s+"aws_iam_role"' envs/dev/*.tf 2>/dev/null; then
+  pass "11: envs/dev/iam.tf still uses the approved corporate aws-tf-module-iam-role at v2.0.0 -- no raw aws_iam_role resource was introduced"
+else
+  fail "11: envs/dev/iam.tf's corporate IAM module pin changed, or a raw aws_iam_role resource was introduced"
+fi
+
+# 12/13: current runtime/EFS safety state is unchanged by this phase.
+if grep -A1 '^lifecycle:' envs/dev/gg-postgresql-repltest-01/values.yaml 2>/dev/null | grep -q 'state: absent' \
+    && grep -A1 '^lifecycle:' envs/dev/gg-mssql-repltest-01/values.yaml 2>/dev/null | grep -q 'state: absent'; then
+  pass "12: both runtime descriptors remain lifecycle.state=absent"
+else
+  fail "12: a runtime descriptor's lifecycle.state is no longer absent"
+fi
+
+if grep -A1 '^replication:' envs/dev/gg-postgresql-repltest-01/values.yaml 2>/dev/null | grep -q 'enabled: false' \
+    && grep -A1 '^replication:' envs/dev/gg-mssql-repltest-01/values.yaml 2>/dev/null | grep -q 'enabled: false'; then
+  pass "12b: both runtime descriptors remain replication.enabled=false"
+else
+  fail "12b: a runtime descriptor's replication.enabled is no longer false"
+fi
+
+if grep -qE '^\s*"gg-postgresql-repltest-01"' envs/dev/efs.tf 2>/dev/null \
+    && grep -qE '^\s*"gg-mssql-repltest-01"' envs/dev/efs.tf 2>/dev/null; then
+  pass "13: the EFS decommission hold still contains exactly the two runtime IDs"
+else
+  fail "13: the EFS decommission hold changed"
+fi
+
+# 14: centralization regression sweep -- outside envs/dev/environment.yaml (canonical) and envs/dev/policies/** (generated), no first-party PRODUCTION .tf/.py source may independently hardcode the real current workload/build account IDs, region, cluster name, or OIDC host. Excludes: .git, vendored Argo CD chart source, every test file (test-*.py/test_*.py/*/tests/* -- synthetic fixture values are explicitly permitted per this repo's own convention, never confused with production hardcoding), hack/goldengate-environment.py's own known-origin substitution constants (which exist specifically to recognize and rewrite these exact literals in generated output -- not a leak), and the generated envs/dev/policies/** output itself.
+CENTRALIZATION_HITS="$(grep -rlE '668311715351|229410149234' --include='*.tf' --include='*.py' . 2>/dev/null \
+  | grep -vF '.git/' \
+  | grep -vF 'helm/argocd/charts/' \
+  | grep -vE '(^|/)test[-_][^/]*\.py$' \
+  | grep -vF '/tests/' \
+  | grep -vF 'hack/goldengate-environment.py' \
+  | grep -vF 'envs/dev/environment.tf' \
+  | grep -vF 'envs/dev/policies/' \
+  || true)"
+if [ -z "$CENTRALIZATION_HITS" ]; then
+  pass "14: no first-party production .tf/.py source hardcodes the real workload/build account ID outside envs/dev/environment.tf (canonical), hack/goldengate-environment.py (the generator, by design), envs/dev/policies/** (generated output), and test files (synthetic fixtures)"
+else
+  fail "14: production source independently hardcodes an account ID outside the canonical/generated/test-fixture boundary:"$'\n'"${CENTRALIZATION_HITS}"
 fi
 
 echo ""

@@ -28,8 +28,8 @@ locals {
 
   gg_dashboard_critical_services = ["adminsrvr", "distsrvr", "recvsrvr"]
   gg_dashboard_namespace         = "GoldenGate/Pipelines"
-  gg_dashboard_region            = "eu-west-1"
-  gg_dashboard_eks_cluster       = "gg-poc-dev"
+  gg_dashboard_region            = local.gg_env_region
+  gg_dashboard_eks_cluster       = local.gg_env_cluster_name
   gg_dashboard_monitor_host      = "monitor.${local.goldengate_shared_environment.dnsDomain}"
 
   gg_dashboard_deployment_metric_names = ["DeploymentDown", "LagBreached", "AbendFailure", "HeartbeatAgeSeconds"]
@@ -307,6 +307,6 @@ locals {
 }
 
 resource "aws_cloudwatch_dashboard" "goldengate_fleet" {
-  dashboard_name = "gg-dev-fleet-overview"
+  dashboard_name = "gg-${local.gg_env_environment}-fleet-overview"
   dashboard_body = jsonencode(local.gg_dashboard_body)
 }

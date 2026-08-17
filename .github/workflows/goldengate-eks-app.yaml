@@ -106,6 +106,21 @@ jobs:
           # Fail-closed gate: no downstream job runs while any envs/dev/*/values.yaml descriptor is invalid.
           python3 hack/goldengate-deployment-model.py --environment dev validate
 
+      - name: Validate envs/dev/environment.yaml
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment dev validate
+
+      - name: Verify generated IAM policies are in sync with environment.yaml
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Fails closed if envs/dev/policies/**/assume_role_policy/sts.json or policies_1.json were hand-edited out of step with envs/dev/environment.yaml (for example, after eks.oidcIssuer changed) -- the fix is `render-iam-policies --write`, never a manual JSON edit.
+          python3 hack/goldengate-environment.py --environment dev render-iam-policies --check
+
       - name: Determine active GoldenGate runtime state
         id: active_runtime_state
         shell: bash
@@ -167,17 +182,103 @@ jobs:
             echo "effective_deploy=false" >> "$GITHUB_OUTPUT"
           fi
 
+  eks_oidc_preflight:
+    name: Verify live EKS cluster + OIDC issuer match envs/dev/environment.yaml (read-only)
+
+    # Read-only DescribeCluster preflight only -- never creates/modifies EKS, the IAM OIDC provider, or any AWS resource. Skipped for deploy=false (a purely local/offline validation run) so an existing intentionally-offline dry-run path never starts requiring live AWS access. This is the critical safety gate for cluster recreation: a recreated EKS cluster keeps the SAME name but gets a DIFFERENT OIDC issuer, and every generated IRSA trust policy in envs/dev/policies/** is only valid for the issuer envs/dev/environment.yaml declares -- so this must run, and must succeed, before Terraform (which owns applying those trust policies) or any deployment can proceed.
+    needs:
+      - validate_model
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' }}
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Load resolved environment config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment dev github-env >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials (build account)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ vars.GOLDENGATE_AWS_ROLE_ARN }}
+
+      - name: DescribeCluster and verify against envs/dev/environment.yaml (read-only)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Same cross-account pattern as validate_shared_secrets_once/managed_efs_inventory_guard: assume EKS_DEPLOY_ROLE_ARN, verify the assumed identity's own account, and never let the unverified job-level credentials touch EKS. Confined to this step's subshells only -- never written to $GITHUB_ENV.
+          ASSUME_JSON="$(aws sts assume-role --role-arn "$EKS_DEPLOY_ROLE_ARN" --role-session-name "gg-eks-oidc-preflight-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --duration-seconds 900 --output json)"
+          PRE_TMP_KEY_ID="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["Credentials"]["AccessKeyId"])' <<< "$ASSUME_JSON")"
+          PRE_TMP_SECRET="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["Credentials"]["SecretAccessKey"])' <<< "$ASSUME_JSON")"
+          PRE_TMP_TOKEN="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["Credentials"]["SessionToken"])' <<< "$ASSUME_JSON")"
+          unset ASSUME_JSON
+          echo "::add-mask::${PRE_TMP_KEY_ID}"
+          echo "::add-mask::${PRE_TMP_SECRET}"
+          echo "::add-mask::${PRE_TMP_TOKEN}"
+
+          ACTUAL_ACCOUNT="$(AWS_ACCESS_KEY_ID="$PRE_TMP_KEY_ID" AWS_SECRET_ACCESS_KEY="$PRE_TMP_SECRET" AWS_SESSION_TOKEN="$PRE_TMP_TOKEN" aws sts get-caller-identity --query Account --output text --region "$AWS_REGION")"
+          if [ -z "$ACTUAL_ACCOUNT" ] || [ "$ACTUAL_ACCOUNT" != "$WORKLOAD_ACCOUNT_ID" ]; then
+            echo "FAIL: assumed role resolved to caller account '${ACTUAL_ACCOUNT}', expected the GoldenGate workload account ${WORKLOAD_ACCOUNT_ID}. Refusing to call DescribeCluster."
+            unset PRE_TMP_KEY_ID PRE_TMP_SECRET PRE_TMP_TOKEN
+            exit 1
+          fi
+
+          CLUSTER_JSON="$(AWS_ACCESS_KEY_ID="$PRE_TMP_KEY_ID" AWS_SECRET_ACCESS_KEY="$PRE_TMP_SECRET" AWS_SESSION_TOKEN="$PRE_TMP_TOKEN" aws eks describe-cluster --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION" --output json)"
+          unset PRE_TMP_KEY_ID PRE_TMP_SECRET PRE_TMP_TOKEN
+          export CLUSTER_JSON
+
+          python3 - "$EKS_CLUSTER_ARN" "$EKS_OIDC_ISSUER" <<'PYEOF'
+          import json
+          import os
+          import sys
+
+          expected_arn, expected_oidc_issuer = sys.argv[1], sys.argv[2]
+          cluster = json.loads(os.environ["CLUSTER_JSON"])["cluster"]
+
+          problems = []
+          if cluster.get("status") != "ACTIVE":
+              problems.append(f"cluster status is {cluster.get('status')!r}, expected ACTIVE")
+          if cluster.get("arn") != expected_arn:
+              problems.append(f"live cluster ARN {cluster.get('arn')!r} does not match envs/dev/environment.yaml-derived ARN {expected_arn!r}")
+          live_oidc_issuer = cluster.get("identity", {}).get("oidc", {}).get("issuer")
+          if live_oidc_issuer != expected_oidc_issuer:
+              problems.append(
+                  "Configured EKS OIDC issuer does not match the live cluster. "
+                  "Update envs/dev/environment.yaml to the current EKS issuer and regenerate IAM policies before deployment. "
+                  f"(live={live_oidc_issuer!r}, configured={expected_oidc_issuer!r})"
+              )
+
+          if problems:
+              for p in problems:
+                  print(f"FAIL: {p}")
+              sys.exit(1)
+          print(f"OK: live EKS cluster {cluster.get('name')!r} is ACTIVE, ARN and OIDC issuer match envs/dev/environment.yaml.")
+          PYEOF
+
   terraform_sync_once:
     name: Synchronize Terraform (once per environment)
 
-    # Must observe detect_changed_deployments' deletion_matrix and storage_transition_violations (via managed_efs_deletion_guard and storage_transition_guard) plus the persistent AWS-side orphan check (managed_efs_inventory_guard) before any Terraform apply can run, or a physically-deleted persistence.efs.mode=managed descriptor, an unsafe managed<->existing/fileSystemId mutation, or an AWS-side orphaned managed EFS could reach `terraform apply` and destroy or repoint a durable EFS filesystem; this job's `if:` is a custom expression, so each needed job's result is checked explicitly below since GitHub Actions does not implicitly require needs to have succeeded once a custom if: is present.
+    # Must observe detect_changed_deployments' deletion_matrix and storage_transition_violations (via managed_efs_deletion_guard and storage_transition_guard) plus the persistent AWS-side orphan check (managed_efs_inventory_guard) plus the live EKS/OIDC preflight before any Terraform apply can run, or a physically-deleted persistence.efs.mode=managed descriptor, an unsafe managed<->existing/fileSystemId mutation, an AWS-side orphaned managed EFS, or a stale-OIDC-issuer configuration could reach `terraform apply`; this job's `if:` is a custom expression, so each needed job's result is checked explicitly below since GitHub Actions does not implicitly require needs to have succeeded once a custom if: is present.
     needs:
       - validate_model
+      - eks_oidc_preflight
       - detect_changed_deployments
       - managed_efs_deletion_guard
       - storage_transition_guard
       - managed_efs_inventory_guard
-    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.detect_changed_deployments.result == 'success' && needs.managed_efs_deletion_guard.result == 'success' && needs.storage_transition_guard.result == 'success' && needs.managed_efs_inventory_guard.result == 'success' }}
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.eks_oidc_preflight.result == 'success' && needs.detect_changed_deployments.result == 'success' && needs.managed_efs_deletion_guard.result == 'success' && needs.storage_transition_guard.result == 'success' && needs.managed_efs_inventory_guard.result == 'success' }}
 
     # The called Terraform chain needs packages/pull-requests beyond the orchestrator's own top-level permissions; a callee can never be elevated above its caller.
     permissions:

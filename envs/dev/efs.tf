@@ -1,12 +1,5 @@
 # Managed-mode GoldenGate runtime EFS filesystems: one dedicated module instance per managed runtime deployment, keyed by deployment ID, created through the approved corporate Terraform workflow (this file lives in the normal envs/dev root processed by .github/workflows/gg-iam-secrets-deployment.yaml -> AbuDhabiCommercialBank/adcb-reusable-workflows/aws-terraform-apply.yaml@main) -- one Terraform state does not mean one EFS: each for_each key below is its own dedicated aws_efs_file_system inside the approved module. Existing-mode deployments get no module instance here since their filesystem already exists outside Terraform. Scope boundary: this file owns the EFS filesystem + mount targets only, via the approved ADCB module below -- it does NOT create EFS access points, which remain owned by the EFS CSI driver's dynamic provisioning (helm/goldengate/templates/efs-storageclass.yaml -> StorageClass -> PVC), exactly as today.
 
-# Single environment-level configuration point for the shared EFS security group (never a per-deployment values.yaml setting). The aws_security_group data source itself fails closed if the filter matches zero or more than one security group.
-variable "goldengate_efs_shared_security_group_description" {
-  description = "Description of the single pre-existing shared security group (NFS/2049 from EKS nodes only) that every GoldenGate runtime EFS filesystem attaches to."
-  type        = string
-  default     = "Security group for EFS filesystem - NFS port 2049 from EKS nodes only"
-}
-
 # Explicit managed-EFS decommission control -- NEVER derived from lifecycle.state. lifecycle.state=absent by itself always retains managed EFS (see local.goldengate_managed_efs_deployments's own comment); an ID may be added here ONLY after its workload/PVC/access-point cleanup has been independently verified. Removing an ID later makes its managed EFS desired again, so Terraform recreates it in the current environment without reconstructing the runtime descriptor.
 locals {
   goldengate_managed_efs_decommission_ids = toset([
@@ -26,7 +19,7 @@ data "aws_security_group" "goldengate_efs_shared" {
 
   filter {
     name   = "description"
-    values = [var.goldengate_efs_shared_security_group_description]
+    values = [local.gg_env_efs_shared_security_group_description]
   }
 }
 

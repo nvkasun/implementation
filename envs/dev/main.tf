@@ -11,5 +11,7 @@ terraform {
   required_version = ">= 1.5.0"
 }
 
+# Region derives from envs/dev/environment.yaml (see environment.tf) -- never a second, independently-maintained region literal.
 provider "aws" {
+  region = local.gg_env_region
 }

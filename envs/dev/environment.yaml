@@ -1,0 +1,53 @@
+# Canonical, non-secret DEV environment contract -- the single committed source of truth for AWS/EKS/network/IAM identity shared across this repository's Terraform, Python tooling, workflows, and Helm values. Consumed by hack/goldengate-environment.py and envs/dev/environment.tf; never re-typed independently elsewhere. Recreating EKS in the future should require updating only this file (especially eks.oidcIssuer) plus `render-iam-policies --write`, not a checklist of files. Contains no secret VALUES -- only non-secret names/paths/ARNs that reference where secrets live.
+schemaVersion: 1
+
+environment: dev
+
+aws:
+  region: eu-west-1
+  workloadAccountId: "668311715351"
+  buildAccountId: "229410149234"
+
+eks:
+  clusterName: gg-poc-dev
+  oidcIssuer: "https://oidc.eks.eu-west-1.amazonaws.com/id/B1DF999126467169346B88078D7927E2"
+
+namespaces:
+  runtime: goldengate-dev
+  monitoring: goldengate-monitoring
+  argocd: argocd
+  observability: amazon-cloudwatch
+
+network:
+  dnsDomain: goldengate-dev.adcbmis.local
+  albGroupName: gg-poc-dev-alb
+  certificateArn: arn:aws:acm:eu-west-1:668311715351:certificate/9e53e28e-3243-47fc-85a1-50f9a94acde7
+
+iam:
+  roles:
+    eksDeploy: GoldenGateEKSDeployRole-dev
+    runtime: GoldenGateSecretsReadRole-dev
+    monitor: GoldenGateMonitorReadRole-dev
+    argocdEcrRead: GoldenGateArgocdECRRead-dev
+    platformLogging: GoldenGatePlatformLoggingRole-dev
+    cloudwatchMetrics: GoldenGateCloudWatchMetricsRole-dev
+
+  runnerRoleName: RunnerRole-goldengate-eks-app_dev
+
+  ecrSyncRoleArn: arn:aws:iam::229410149234:role/adcb-modelmonitoring-sit-codep-rDeployCodeBuildRole-KMCFNIKqpuUL
+
+kms:
+  monitorDynamoDbKeyArn: arn:aws:kms:eu-west-1:668311715351:key/b4220b12-5b1f-4379-a721-c56b09e0048e
+
+efs:
+  sharedSecurityGroupDescription: "Security group for EFS filesystem - NFS port 2049 from EKS nodes only"
+
+tags:
+  applicationName: CloudFactory
+  businessCriticality: Low
+  businessUnit: TechnologyPlatform
+  businessUnitOwner: ganesh.harikrishnan
+  costCenter: "219"
+  mapMigrated: comm5TZY31HX9S
+  requestReference: P032080
+  dataClassification: General

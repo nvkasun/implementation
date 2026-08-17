@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import glob
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -14,8 +15,33 @@ import yaml
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
-APPROVED_ECR_ACCOUNT = "229410149234"
-APPROVED_ECR_REGION = "eu-west-1"
+_ENVIRONMENT_MODULE_PATH = os.path.join(os.path.dirname(__file__), "goldengate-environment.py")
+_environment_module = None
+_environment_config_cache = {}
+
+
+def _load_environment_module():
+    """Lazy import of hack/goldengate-environment.py -- the single canonical environment-config parser/deriver. Never a second independent schema implementation."""
+    global _environment_module
+    if _environment_module is None:
+        spec = importlib.util.spec_from_file_location("goldengate_environment", _ENVIRONMENT_MODULE_PATH)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _environment_module = module
+    return _environment_module
+
+
+def _environment_derived_values(environment):
+    """Loads+validates+derives envs/<environment>/environment.yaml, cached per (REPO_ROOT, environment) pair. Re-syncs the environment module's own REPO_ROOT to this module's REPO_ROOT on every call: tests monkey-patch REPO_ROOT to an isolated scratch directory per ScratchEnvironmentTestCase, and the environment module -- a separate Python module loaded via importlib -- must follow that same scratch root rather than always resolving the real repository."""
+    env_module = _load_environment_module()
+    env_module.REPO_ROOT = REPO_ROOT
+    cache_key = (REPO_ROOT, environment)
+    if cache_key not in _environment_config_cache:
+        doc = env_module.load_environment_config(environment)
+        _environment_config_cache[cache_key] = env_module.derive_values(doc)
+    return _environment_config_cache[cache_key]
+
+
 FORBIDDEN_IMAGE_TAG = "latest"
 
 IGNORED_NON_RUNTIME_FOLDER_NAMES = ("argocd", "goldengate-monitor")
@@ -232,7 +258,7 @@ def _contains_credential_like_key(node, path=""):
     return False
 
 
-def _parse_image(runtime):
+def _parse_image(environment, runtime):
     image = runtime.get("image")
     _require_dict(image, "invalid image configuration: runtime.image must be a mapping")
     repository = image.get("repository")
@@ -243,7 +269,7 @@ def _parse_image(runtime):
         raise DescriptorError("invalid image configuration: runtime.image.tag is required and must be explicit")
     if tag == FORBIDDEN_IMAGE_TAG:
         raise DescriptorError("invalid image configuration: runtime.image.tag must not be \"latest\"")
-    expected_prefix = f"{APPROVED_ECR_ACCOUNT}.dkr.ecr.{APPROVED_ECR_REGION}.amazonaws.com/"
+    expected_prefix = f"{_environment_derived_values(environment)['ECR_REGISTRY']}/"
     if not repository.startswith(expected_prefix):
         raise DescriptorError("invalid image configuration: repository is not the approved private ECR account/region")
     suffix = repository[len(expected_prefix):]
@@ -610,7 +636,7 @@ def parse_descriptor(deployment_id, environment, doc, shared=None):
     if not _safe_token(deployment_type, _MAX_TYPE_LENGTH):
         raise DescriptorError("invalid deployment metadata: runtime.deploymentType must be a safe lowercase token")
 
-    image = _parse_image(runtime)
+    image = _parse_image(environment, runtime)
     runtime_service_account_name = resolve_runtime_service_account(deployment_type)
     admin_secret_name = resolve_admin_secret(environment, role)
     tls_secret_name = resolve_tls_secret(environment)
@@ -875,14 +901,15 @@ def _load_shared_environment_metadata(environment, platform_values_path, monitor
 
     platform_doc = load_yaml_strict(platform_values_path) if os.path.exists(platform_values_path) else {}
     monitor_doc = load_yaml_strict(monitor_values_path) if os.path.exists(monitor_values_path) else {}
+    env_values = _environment_derived_values(environment)
 
-    runtime_namespace = ((platform_doc or {}).get("namespaces") or {}).get("runtime", {}).get("name") or f"goldengate-{environment}"
+    runtime_namespace = ((platform_doc or {}).get("namespaces") or {}).get("runtime", {}).get("name") or env_values["RUNTIME_NAMESPACE"]
     fluent_bit_namespaces = ((platform_doc or {}).get("fluentBit") or {}).get("namespaces") or {}
-    monitoring_namespace = fluent_bit_namespaces.get("monitoring") or "goldengate-monitoring"
+    monitoring_namespace = fluent_bit_namespaces.get("monitoring") or env_values["MONITOR_NAMESPACE"]
 
     ingress = (monitor_doc or {}).get("ingress") or {}
     monitor_host = ingress.get("host") or ""
-    dns_domain = monitor_host.split("monitor.", 1)[-1] if monitor_host.startswith("monitor.") else f"goldengate-{environment}.adcbmis.local"
+    dns_domain = monitor_host.split("monitor.", 1)[-1] if monitor_host.startswith("monitor.") else env_values["DNS_DOMAIN"]
 
     return {
         "environment": environment,

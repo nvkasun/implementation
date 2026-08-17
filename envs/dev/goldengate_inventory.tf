@@ -208,11 +208,11 @@ locals {
   goldengate_admin_secret_names = {
     for id in local.goldengate_deployment_names : id =>
     try(local.goldengate_enabled_deployments[id].deployment.role, "") == "source"
-    ? "${var.environment}/goldengate/source/admin"
-    : "${var.environment}/goldengate/target/admin"
+    ? local.gg_env_source_admin_secret_name
+    : local.gg_env_target_admin_secret_name
   }
 
-  goldengate_tls_secret_name = "${var.environment}/goldengate/tls-certificate"
+  goldengate_tls_secret_name = local.gg_env_tls_secret_name
 
   # Restored shared runtime identity: every singleRuntime deployment resolves the SAME platform-owned ServiceAccount regardless of deploymentType -- deploymentType controls image/product/ports/replication semantics, never AWS runtime identity. Mirrors hack/goldengate-deployment-model.py's resolve_runtime_service_account().
   goldengate_runtime_service_account_names = {
@@ -229,27 +229,13 @@ locals {
     for t in local.goldengate_enabled_deployment_types : t => "gg-runtime-sa"
   }
 
-  # The retained, honestly-unresolved legacy exception (see envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json); requires live-cluster evidence before removal, never generated or removed by this file.
-  goldengate_legacy_wildcard_trust_subject = "system:serviceaccount:gg-dev-*:ogg-oracle-sa"
-
-  # The permanent, stable self-service runtime identity: every singleRuntime deployment of every deploymentType (including future ones) shares this ONE IRSA subject, so onboarding a new engine never requires an IAM trust-policy edit. Never derived from the folder inventory -- it is a platform invariant, not a per-type/per-count value.
+  # The permanent, stable self-service runtime identity: every singleRuntime deployment of every deploymentType (including future ones) shares this ONE IRSA subject, so onboarding a new engine never requires an IAM trust-policy edit. Never derived from the folder inventory -- it is a platform invariant, not a per-type/per-count value. This is a fresh EKS cluster: there is no migration-compatibility trust to preserve, so this is the ONLY approved runtime trust subject.
   goldengate_canonical_runtime_trust_subject = "system:serviceaccount:${local.goldengate_shared_environment.runtimeNamespace}:gg-runtime-sa"
 
-  # Transitional per-engine subjects retained from the prior architecture (gg-oracle-sa/gg-postgresql-sa); intentionally a FIXED, explicitly-reviewed allowlist now, never re-derived from the folder inventory -- they shrink only through a later, separate, evidence-driven retirement phase alongside the historical Oracle/PostgreSQL deployments themselves.
-  goldengate_transitional_engine_trust_subjects = [
-    "system:serviceaccount:${local.goldengate_shared_environment.runtimeNamespace}:gg-oracle-sa",
-    "system:serviceaccount:${local.goldengate_shared_environment.runtimeNamespace}:gg-postgresql-sa",
-  ]
-
-  goldengate_allowed_irsa_trust_subjects = sort(concat(
-    [local.goldengate_canonical_runtime_trust_subject],
-    local.goldengate_transitional_engine_trust_subjects,
-    [local.goldengate_legacy_wildcard_trust_subject],
-  ))
-
   goldengate_secrets_trust_policy = jsondecode(file("${path.module}/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json"))
+  # The OIDC condition-map key is derived from the live-discovered cluster issuer (envs/dev/environment.tf), never a hardcoded destroyed- or new-cluster literal -- a recreated EKS cluster gets a different issuer, and this lookup must follow it automatically.
   goldengate_secrets_trust_subjects = local.goldengate_secrets_trust_policy.Statement[0].Condition.StringLike[
-    "oidc.eks.eu-west-1.amazonaws.com/id/407C4385FF87947926730569F1E564FB:sub"
+    "${local.gg_env_oidc_hostpath}:sub"
   ]
 
   goldengate_platform_values = yamldecode(file("${path.module}/../../platform/${var.environment}/goldengate-platform/values.yaml"))
@@ -258,9 +244,9 @@ locals {
 
   goldengate_shared_environment = {
     environment         = var.environment
-    runtimeNamespace    = try(local.goldengate_platform_values.namespaces.runtime.name, "goldengate-${var.environment}")
-    monitoringNamespace = try(local.goldengate_platform_values.fluentBit.namespaces.monitoring, "goldengate-monitoring")
-    dnsDomain           = local.goldengate_monitor_host != "" ? trimprefix(local.goldengate_monitor_host, "monitor.") : "goldengate-${var.environment}.adcbmis.local"
+    runtimeNamespace    = try(local.goldengate_platform_values.namespaces.runtime.name, local.gg_env_namespaces.runtime)
+    monitoringNamespace = try(local.goldengate_platform_values.fluentBit.namespaces.monitoring, local.gg_env_namespaces.monitoring)
+    dnsDomain           = local.goldengate_monitor_host != "" ? trimprefix(local.goldengate_monitor_host, "monitor.") : local.gg_env_dns_domain
     tlsSecret           = local.goldengate_tls_secret_name
   }
 }
@@ -302,10 +288,10 @@ resource "terraform_data" "goldengate_runtime_contract" {
     }
     precondition {
       condition = (
-        startswith(try(each.value.runtime.image.repository, ""), "229410149234.dkr.ecr.eu-west-1.amazonaws.com/")
-        && try(each.value.runtime.image.repository, "") != "229410149234.dkr.ecr.eu-west-1.amazonaws.com/"
+        startswith(try(each.value.runtime.image.repository, ""), "${local.gg_env_ecr_registry}/")
+        && try(each.value.runtime.image.repository, "") != "${local.gg_env_ecr_registry}/"
         && can(regex("^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*$",
-        trimprefix(try(each.value.runtime.image.repository, ""), "229410149234.dkr.ecr.eu-west-1.amazonaws.com/")))
+        trimprefix(try(each.value.runtime.image.repository, ""), "${local.gg_env_ecr_registry}/")))
       )
       error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.image.repository must be a private ECR repository in the approved account/region with a safe, non-empty suffix."
     }
@@ -592,12 +578,12 @@ resource "terraform_data" "goldengate_cross_pipeline_contract" {
       error_message = "replication.distribution.targetTrailName must equal the target replication.replicat.sourceTrailName for its pipeline."
     }
     precondition {
-      # Temporary migration-phase contract, not permanent architecture: actual trust subjects must exactly equal the approved allowlist (canonical + transitional + legacy), no duplicates.
+      # Permanent, fresh-cluster architecture: the runtime trust subject must be EXACTLY the one canonical gg-runtime-sa identity -- no wildcard, no per-engine subject, no migration-compatibility entry. try() guards the [0] index: Terraform's && does not short-circuit evaluation errors, so an empty subjects list must not crash `terraform plan` with "Invalid index" -- it must fail this precondition instead.
       condition = (
-        length(local.goldengate_secrets_trust_subjects) == length(distinct(local.goldengate_secrets_trust_subjects))
-        && toset(local.goldengate_secrets_trust_subjects) == toset(local.goldengate_allowed_irsa_trust_subjects)
+        length(local.goldengate_secrets_trust_subjects) == 1
+        && try(local.goldengate_secrets_trust_subjects[0], "") == local.goldengate_canonical_runtime_trust_subject
       )
-      error_message = "envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json trust subjects must exactly equal the currently approved migration allowlist -- the canonical system:serviceaccount:<namespace>:gg-runtime-sa subject, the transitional gg-oracle-sa/gg-postgresql-sa subjects, and the legacy gg-dev-*:ogg-oracle-sa wildcard -- with no duplicates, no missing entry, and no unexpected entry. Onboarding a new deploymentType must never require editing this file."
+      error_message = "envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json trust subjects must be exactly one entry: the canonical system:serviceaccount:<namespace>:gg-runtime-sa subject. No wildcard, no per-engine subject, no migration-compatibility entry. Onboarding a new deploymentType must never require editing this file."
     }
   }
 }
@@ -647,7 +633,7 @@ check "goldengate_approved_ecr_registry_only" {
     condition = alltrue([
       for id in local.goldengate_deployment_names :
       startswith(try(local.goldengate_enabled_deployments[id].runtime.image.repository, ""),
-      "229410149234.dkr.ecr.eu-west-1.amazonaws.com/")
+      "${local.gg_env_ecr_registry}/")
     ])
     error_message = "An enabled GoldenGate deployment references an image outside the approved private ECR account/region."
   }

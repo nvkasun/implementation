@@ -1,14 +1,14 @@
-# Centralized DEV corporate/business tag values -- every approved module below that accepts these fields references local.tags.* instead of repeating the literal value; every value here is unchanged from what this repo already used, except the newly-established request_reference. Resource-specific identifiers are never centralized here -- only common metadata.
+# local.tags is the stable interface every approved module below already references -- its values are mapped from the canonical envs/dev/environment.yaml tags (see environment.tf) rather than restated here, so this file has exactly one thing to change if corporate tag values ever change. Resource-specific identifiers are never centralized here -- only common metadata.
 locals {
   tags = {
-    env                  = "dev"
-    application_name     = "CloudFactory"
-    business_criticality = "Low"
-    business_unit        = "TechnologyPlatform"
-    business_unit_owner  = "ganesh.harikrishnan"
-    cost_center          = "219"
-    map_migrated         = "comm5TZY31HX9S"
-    request_reference    = "P032080"
-    data_classification  = "General"
+    env                  = local.gg_env_environment
+    application_name     = local.gg_env_tags.applicationName
+    business_criticality = local.gg_env_tags.businessCriticality
+    business_unit        = local.gg_env_tags.businessUnit
+    business_unit_owner  = local.gg_env_tags.businessUnitOwner
+    cost_center          = local.gg_env_tags.costCenter
+    map_migrated         = local.gg_env_tags.mapMigrated
+    request_reference    = local.gg_env_tags.requestReference
+    data_classification  = local.gg_env_tags.dataClassification
   }
 }

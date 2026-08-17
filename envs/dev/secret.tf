@@ -3,8 +3,8 @@
 module "tls_certificate_secret_protected" {
   source = "git::https://github.com/AbuDhabiCommercialBank/aws-tf-module-secrets-manager.git?ref=v2.0.2"
 
-  name                    = "dev/goldengate/tls-certificate"
-  description             = "GoldenGate shared wildcard TLS certificate secret for dev"
+  name                    = local.gg_env_tls_secret_name
+  description             = "GoldenGate shared wildcard TLS certificate secret for ${local.gg_env_environment}"
   recovery_window_in_days = 0
   safety_mode             = "protected"
 
@@ -22,8 +22,8 @@ module "tls_certificate_secret_protected" {
 module "source_admin_secret_protected" {
   source = "git::https://github.com/AbuDhabiCommercialBank/aws-tf-module-secrets-manager.git?ref=v2.0.2"
 
-  name                    = "dev/goldengate/source/admin"
-  description             = "GoldenGate source admin login secret for dev"
+  name                    = local.gg_env_source_admin_secret_name
+  description             = "GoldenGate source admin login secret for ${local.gg_env_environment}"
   recovery_window_in_days = 0
   safety_mode             = "protected"
 
@@ -40,8 +40,8 @@ module "source_admin_secret_protected" {
 module "target_admin_secret_protected" {
   source = "git::https://github.com/AbuDhabiCommercialBank/aws-tf-module-secrets-manager.git?ref=v2.0.2"
 
-  name                    = "dev/goldengate/target/admin"
-  description             = "GoldenGate target admin login secret for dev"
+  name                    = local.gg_env_target_admin_secret_name
+  description             = "GoldenGate target admin login secret for ${local.gg_env_environment}"
   recovery_window_in_days = 0
   safety_mode             = "protected"
 
