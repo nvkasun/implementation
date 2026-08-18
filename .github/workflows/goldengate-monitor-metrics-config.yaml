@@ -40,19 +40,9 @@ permissions:
   id-token: write
   contents: read
 
+# Environment identity is loaded via hack/goldengate-environment.py github-env after checkout, strictly before AWS credentials are configured.
 env:
-  AWS_REGION: ${{ vars.AWS_REGION }}
-  ROLE_ARN: ${{ vars.GOLDENGATE_AWS_ROLE_ARN }}
-
-  EKS_ACCOUNT_ID: ${{ vars.ACCOUNT_ID_DEV }}
-  EKS_CLUSTER_NAME: ${{ vars.AWS_CLUSTER_NAME }}
-  EKS_CLUSTER_ARN: ${{ vars.AWS_CLUSTER_ARN }}
-  EKS_DEPLOY_ROLE_ARN: ${{ vars.EKS_DEPLOY_ROLE_ARN }}
-
-  TARGET_NAMESPACE: goldengate-monitoring
   MONITOR_SERVICE_ACCOUNT: gg-monitor
-  MONITOR_IRSA_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev
-  CANONICAL_REGISTRY: work/generated/dev/goldengate-deployments.yaml
   METRICS_CONFIG_HELPER: hack/goldengate-metrics-config.py
 
 concurrency:
@@ -65,17 +55,29 @@ jobs:
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
-    environment: dev
+    environment: ${{ inputs.environment }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Load resolved environment config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" validate
+          python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" github-env >> "$GITHUB_ENV"
+
+          # TARGET_NAMESPACE/CANONICAL_REGISTRY are derived from the canonical GG_ENVIRONMENT/MONITOR_NAMESPACE, never independent literals.
+          echo "TARGET_NAMESPACE=$(python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" get MONITOR_NAMESPACE)" >> "$GITHUB_ENV"
+          echo "CANONICAL_REGISTRY=work/generated/${{ inputs.environment }}/goldengate-deployments.yaml" >> "$GITHUB_ENV"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
-          role-to-assume: ${{ env.ROLE_ARN }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
 
       - name: Verify AWS caller account
         shell: bash
@@ -85,8 +87,8 @@ jobs:
           CALLER_ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
           echo "Caller account: ${CALLER_ACCOUNT}"
 
-          if [ -n "${EKS_ACCOUNT_ID:-}" ] && [ "$CALLER_ACCOUNT" != "$EKS_ACCOUNT_ID" ]; then
-            echo "Note: caller account (${CALLER_ACCOUNT}) differs from EKS_ACCOUNT_ID (${EKS_ACCOUNT_ID}) -- expected when this role only assumes a cross-account EKS deploy role. The actual cluster/account binding is validated by the EKS connection step below via EKS_DEPLOY_ROLE_ARN."
+          if [ -n "${WORKLOAD_ACCOUNT_ID:-}" ] && [ "$CALLER_ACCOUNT" != "$WORKLOAD_ACCOUNT_ID" ]; then
+            echo "Note: caller account (${CALLER_ACCOUNT}) differs from WORKLOAD_ACCOUNT_ID (${WORKLOAD_ACCOUNT_ID}) -- expected when this role only assumes a cross-account EKS deploy role. The actual cluster/account binding is validated by the EKS connection step below via EKS_DEPLOY_ROLE_ARN."
           fi
 
       - name: Generate the folder-driven canonical registry
@@ -318,7 +320,7 @@ jobs:
           fi
 
           echo "Executing ${METRICS_CONFIG_HELPER} inside pod ${POD_NAME} (deployment=${DEPLOYMENT_NAME} type=${CANONICAL_TYPE} desired=${DESIRED} apply=${APPLY})..."
-          echo "This uses the pod's own IRSA (${MONITOR_IRSA_ROLE_ARN}) -- no AWS key/credential is injected by this workflow, and no web-identity token content is ever read or displayed."
+          echo "This uses the pod's own IRSA (${MONITOR_ROLE_ARN}) -- no AWS key/credential is injected by this workflow, and no web-identity token content is ever read or displayed."
 
           set +e
           HELPER_OUTPUT="$(kubectl exec -i "$POD_NAME" -n "$TARGET_NAMESPACE" -- \
@@ -443,7 +445,7 @@ jobs:
             echo ""
             echo "This workflow updates at most one deployment's CONFIG.metricsEnabled per run,"
             echo "via a conditional DynamoDB UpdateItem executed under the existing gg-monitor"
-            echo "pod's own IRSA (GoldenGateMonitorReadRole-dev). It never builds/pushes an"
+            echo "pod's own IRSA (\`${MONITOR_ROLE_ARN}\`). It never builds/pushes an"
             echo "image, never packages/pushes a Helm chart, never touches the Argo CD"
             echo "Application, and never creates or modifies a Kubernetes object."
           } >> "$GITHUB_STEP_SUMMARY"

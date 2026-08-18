@@ -36,27 +36,8 @@ permissions:
   id-token: write
   contents: read
 
+# Environment identity is loaded per-job via hack/goldengate-environment.py github-env after checkout (GITHUB_ENV is job-local), never duplicated here.
 env:
-  AWS_REGION: ${{ vars.AWS_REGION }}
-
-  # ECR / runner account where Helm OCI chart will be pushed.
-  ECR_ACCOUNT_ID: "229410149234"
-  ECR_REGISTRY: 229410149234.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com
-
-  # Role used by GitHub Actions / CodeBuild runner.
-  ROLE_ARN: ${{ vars.GOLDENGATE_AWS_ROLE_ARN }}
-
-  # Target EKS cluster details.
-  EKS_ACCOUNT_ID: ${{ vars.ACCOUNT_ID_DEV }}
-  EKS_CLUSTER_NAME: ${{ vars.AWS_CLUSTER_NAME }}
-  EKS_CLUSTER_ARN: ${{ vars.AWS_CLUSTER_ARN }}
-
-  # Optional. Add this repo variable later only if cross-account EKS auth fails.
-  EKS_DEPLOY_ROLE_ARN: ${{ vars.EKS_DEPLOY_ROLE_ARN }}
-
-  # IRSA role the in-cluster argocd-ecr-token-sync CronJob assumes to pull the Helm OCI chart (see "Ensure Helm ECR repository policy allows Argo CD pull" step below).
-  ARGOCD_ECR_READ_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateArgocdECRRead-dev
-
   HELM_OCI_NAMESPACE: helm
   CHART_NAME: goldengate
   HELM_CHART_PATH: helm/goldengate
@@ -76,6 +57,8 @@ jobs:
     outputs:
       effective_deploy: ${{ steps.compute.outputs.effective_deploy }}
       has_active_deployments: ${{ steps.active_runtime_state.outputs.has_active_deployments }}
+      selected_environment: ${{ steps.resolve_environment.outputs.environment }}
+      aws_region: ${{ steps.load_environment.outputs.aws_region }}
 
     steps:
       - name: Checkout repository
@@ -98,28 +81,50 @@ jobs:
 
           echo "OK: python3 and PyYAML are available."
 
+      - name: Resolve selected environment
+        id: resolve_environment
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+
+          # workflow_dispatch carries an explicit choice; the push trigger is scoped to envs/dev/** only, so the trigger itself selects dev -- never a second independent environment source.
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            SELECTED_ENVIRONMENT="$INPUT_ENVIRONMENT"
+          else
+            SELECTED_ENVIRONMENT="dev"
+          fi
+
+          echo "GG_SELECTED_ENVIRONMENT=${SELECTED_ENVIRONMENT}" >> "$GITHUB_ENV"
+          echo "environment=${SELECTED_ENVIRONMENT}" >> "$GITHUB_OUTPUT"
+
       - name: Validate the folder-driven deployment model
         shell: bash
         run: |
           set -euo pipefail
 
-          # Fail-closed gate: no downstream job runs while any envs/dev/*/values.yaml descriptor is invalid.
-          python3 hack/goldengate-deployment-model.py --environment dev validate
+          # Fail-closed gate: no downstream job runs while any envs/<environment>/*/values.yaml descriptor is invalid.
+          python3 hack/goldengate-deployment-model.py --environment "${GG_SELECTED_ENVIRONMENT}" validate
 
-      - name: Validate envs/dev/environment.yaml
+      - name: Validate and load the selected environment configuration
+        id: load_environment
         shell: bash
         run: |
           set -euo pipefail
 
-          python3 hack/goldengate-environment.py --environment dev validate
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" validate
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+          echo "aws_region=$(python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" get AWS_REGION)" >> "$GITHUB_OUTPUT"
 
       - name: Verify generated IAM policies are in sync with environment.yaml
         shell: bash
         run: |
           set -euo pipefail
 
-          # Fails closed if envs/dev/policies/**/assume_role_policy/sts.json or policies_1.json were hand-edited out of step with envs/dev/environment.yaml (for example, after eks.oidcIssuer changed) -- the fix is `render-iam-policies --write`, never a manual JSON edit.
-          python3 hack/goldengate-environment.py --environment dev render-iam-policies --check
+          # Fails closed if envs/<environment>/policies/**/assume_role_policy/sts.json or policies_1.json were hand-edited out of step with environment.yaml (for example, after eks.oidcIssuer changed) -- the fix is `render-iam-policies --write`, never a manual JSON edit.
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" render-iam-policies --check
 
       - name: Determine active GoldenGate runtime state
         id: active_runtime_state
@@ -131,7 +136,7 @@ jobs:
           TMP="$(mktemp)"
           trap 'rm -f "$TMP"' EXIT
 
-          python3 hack/goldengate-deployment-model.py --environment dev registry --output "$TMP"
+          python3 hack/goldengate-deployment-model.py --environment "${GG_SELECTED_ENVIRONMENT}" registry --output "$TMP"
 
           ACTIVE_COUNT="$(python3 - "$TMP" <<'PY'
           import sys
@@ -202,16 +207,18 @@ jobs:
 
       - name: Load resolved environment config
         shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
         run: |
           set -euo pipefail
 
-          python3 hack/goldengate-environment.py --environment dev github-env >> "$GITHUB_ENV"
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
 
       - name: Configure AWS credentials (build account)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
-          role-to-assume: ${{ vars.GOLDENGATE_AWS_ROLE_ARN }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
 
       - name: DescribeCluster and verify against envs/dev/environment.yaml (read-only)
         shell: bash
@@ -290,8 +297,8 @@ jobs:
     uses: ./.github/workflows/gg-iam-secrets-deployment.yaml
     secrets: inherit
     with:
-      environment: dev
-      region: eu-west-1
+      environment: ${{ needs.validate_model.outputs.selected_environment }}
+      region: ${{ needs.validate_model.outputs.aws_region }}
 
   platform_sync_once:
     name: Synchronize the GoldenGate platform chart (once)
@@ -304,7 +311,7 @@ jobs:
 
     uses: ./.github/workflows/goldengate-platform.yaml
     with:
-      environment: dev
+      environment: ${{ needs.validate_model.outputs.selected_environment }}
       deploy: true
 
   validate_shared_secrets_once:
@@ -319,17 +326,26 @@ jobs:
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
-    environment: dev
+    environment: ${{ needs.validate_model.outputs.selected_environment }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Load resolved environment config
+        shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
-          role-to-assume: ${{ env.ROLE_ARN }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
 
       - name: Verify each shared secret exists with an AWSCURRENT version
         shell: bash
@@ -338,7 +354,7 @@ jobs:
 
           python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
 
-          # The three shared GoldenGate secrets live in the workload account, not the engineering/runner account this job started in (ROLE_ARN above) -- same cross-account pattern as managed_efs_inventory_guard: assume EKS_DEPLOY_ROLE_ARN, verify the assumed identity's own account before any Secrets Manager call, and never let the unverified job-level credentials touch Secrets Manager.
+          # The three shared GoldenGate secrets live in the workload account, not the engineering/runner account this job started in (RUNNER_ROLE_ARN above) -- same cross-account pattern as managed_efs_inventory_guard: assume EKS_DEPLOY_ROLE_ARN, verify the assumed identity's own account before any Secrets Manager call, and never let the unverified job-level credentials touch Secrets Manager.
           EXPECTED_WORKLOAD_ACCOUNT_ID="$(echo "$EKS_DEPLOY_ROLE_ARN" | sed -nE 's#^arn:aws:iam::([0-9]{12}):role/.*$#\1#p')"
           if [ -z "$EXPECTED_WORKLOAD_ACCOUNT_ID" ]; then
             echo "FAIL: could not extract a 12-digit account ID from EKS_DEPLOY_ROLE_ARN; refusing to validate shared secrets without a provable expected workload account."
@@ -382,7 +398,7 @@ jobs:
               continue
             fi
             echo "OK: ${secret_name} exists with an AWSCURRENT version."
-          done < <(python3 hack/goldengate-deployment-model.py --environment dev shared-secrets)
+          done < <(python3 hack/goldengate-deployment-model.py --environment "${GG_SELECTED_ENVIRONMENT}" shared-secrets)
 
           unset SEC_TMP_KEY_ID SEC_TMP_SECRET SEC_TMP_TOKEN
 
@@ -548,17 +564,26 @@ jobs:
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
-    environment: dev
+    environment: ${{ needs.validate_model.outputs.selected_environment }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Load resolved environment config
+        shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
-          role-to-assume: ${{ env.ROLE_ARN }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
 
       - name: Compute expected managed-EFS inventory from the deployment model
         shell: bash
@@ -566,7 +591,7 @@ jobs:
           set -euo pipefail
 
           python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
-          python3 hack/goldengate-deployment-model.py --environment dev managed-efs-inventory > expected-managed-efs.json
+          python3 hack/goldengate-deployment-model.py --environment "${GG_SELECTED_ENVIRONMENT}" managed-efs-inventory > expected-managed-efs.json
           echo "Expected managed-EFS inventory (includes lifecycle.state=absent descriptors on purpose -- their EFS is retained, not decommissioned):"
           cat expected-managed-efs.json
 
@@ -639,7 +664,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          python3 hack/goldengate-managed-efs-inventory-guard.py dev expected-managed-efs.json actual-managed-efs.json
+          python3 hack/goldengate-managed-efs-inventory-guard.py "${GG_SELECTED_ENVIRONMENT}" expected-managed-efs.json actual-managed-efs.json
 
   build_publish_and_deploy:
     name: Build, publish, and deploy GoldenGate Helm chart via Argo CD
@@ -669,11 +694,20 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Load resolved environment config
+        shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ matrix.environment }}
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
-          role-to-assume: ${{ env.ROLE_ARN }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
 
       - name: Install Helm and kubectl if missing
         shell: bash
@@ -746,11 +780,11 @@ jobs:
           helm version --short
           kubectl version --client=true
 
-          echo "Repository variable summary:"
+          echo "Resolved environment identity summary:"
           echo "AWS_REGION=${AWS_REGION}"
           echo "ECR_ACCOUNT_ID=${ECR_ACCOUNT_ID}"
           echo "ECR_REGISTRY=${ECR_REGISTRY}"
-          echo "EKS_ACCOUNT_ID=${EKS_ACCOUNT_ID}"
+          echo "WORKLOAD_ACCOUNT_ID=${WORKLOAD_ACCOUNT_ID}"
           echo "EKS_CLUSTER_NAME=${EKS_CLUSTER_NAME}"
           echo "EKS_CLUSTER_ARN=${EKS_CLUSTER_ARN}"
 
@@ -783,15 +817,14 @@ jobs:
 
           echo "deploymentModel: ${DEPLOYMENT_MODEL} (from the validated active matrix, deployment_id=${DEPLOYMENT_ID})"
 
-          TARGET_NAMESPACE="goldengate-${ENVIRONMENT}"
+          # RUNTIME_NAMESPACE is already loaded (canonical, from envs/${ENVIRONMENT}/environment.yaml) by the "Load resolved environment config" step above -- never reconstructed here.
+          TARGET_NAMESPACE="${RUNTIME_NAMESPACE}"
           RELEASE_NAME="${DEPLOYMENT_ID}"
           # Strip leading "gg-" for the Argo CD Application name suffix, e.g. gg-oracle-payments-01 -> goldengate-dev-oracle-payments-01.
           APP_SUFFIX="${DEPLOYMENT_ID#gg-}"
           ARGOCD_APP_NAME="goldengate-${ENVIRONMENT}-${APP_SUFFIX}"
 
           TEMP_CHART_PATH="work/charts/${DEPLOYMENT_ID}/goldengate"
-
-          ARGOCD_NAMESPACE="argocd"
 
           echo "DEPLOYMENT_MODEL=${DEPLOYMENT_MODEL}" >> "$GITHUB_ENV"
           echo "deployment_model=${DEPLOYMENT_MODEL}" >> "$GITHUB_OUTPUT"
@@ -821,7 +854,6 @@ jobs:
           echo "RELEASE_NAME=${RELEASE_NAME}" >> "$GITHUB_ENV"
           echo "VALUES_FILE=${VALUES_FILE}" >> "$GITHUB_ENV"
           echo "TEMP_CHART_PATH=${TEMP_CHART_PATH}" >> "$GITHUB_ENV"
-          echo "ARGOCD_NAMESPACE=${ARGOCD_NAMESPACE}" >> "$GITHUB_ENV"
           echo "ARGOCD_APP_NAME=${ARGOCD_APP_NAME}" >> "$GITHUB_ENV"
           echo "CHART_VERSION=${CHART_VERSION}" >> "$GITHUB_ENV"
           echo "HELM_ECR_REPOSITORY=${HELM_ECR_REPOSITORY}" >> "$GITHUB_ENV"
@@ -989,8 +1021,9 @@ jobs:
           set -euo pipefail
 
           # Read-only describe-images call; no engine-to-image mapping and no public-image fallback -- the
-          # repository/tag come only from this deployment's own descriptor, already resolved above.
-          EXPECTED_PREFIX="${ECR_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/"
+          # repository/tag come only from this deployment's own descriptor, already resolved above. The
+          # expected registry is the canonical ECR_REGISTRY, never reconstructed from account/region.
+          EXPECTED_PREFIX="${ECR_REGISTRY}/"
           if [[ "$IMAGE_REPOSITORY" != "${EXPECTED_PREFIX}"* ]]; then
             echo "FAIL: image repository is not the approved private ECR account/region: ${IMAGE_REPOSITORY}"
             exit 1
@@ -1849,7 +1882,7 @@ jobs:
 
           echo "Target EKS cluster name: ${EKS_CLUSTER_NAME}"
           echo "Target EKS cluster ARN: ${EKS_CLUSTER_ARN}"
-          echo "Target EKS account ID: ${EKS_ACCOUNT_ID}"
+          echo "Target EKS account ID: ${WORKLOAD_ACCOUNT_ID}"
           echo "Current AWS identity:"
           aws sts get-caller-identity
 
@@ -1951,7 +1984,7 @@ jobs:
           echo "Argo CD Application CRD is present."
 
       - name: (Emergency fallback only) Refresh temporary Argo CD ECR OCI password
-        # Emergency fallback only; long-term auth is handled in-cluster by argocd-ecr-token-sync (IRSA role GoldenGateArgocdECRRead-dev).
+        # Emergency fallback only; long-term auth is handled in-cluster by argocd-ecr-token-sync (IRSA role ARGOCD_ECR_READ_ROLE_ARN).
         if: ${{ matrix.deploy && vars.ENABLE_TEMP_ARGOCD_ECR_PASSWORD_INJECTION == 'true' }}
         shell: bash
         run: |
@@ -1959,7 +1992,7 @@ jobs:
 
           echo "EMERGENCY FALLBACK: injecting a short-lived ECR password into Argo CD."
           echo "This is not the long-term auth path -- disable ENABLE_TEMP_ARGOCD_ECR_PASSWORD_INJECTION"
-          echo "once the in-cluster argocd-ecr-token-sync (IRSA role GoldenGateArgocdECRRead-dev) is live."
+          echo "once the in-cluster argocd-ecr-token-sync (IRSA role ${ARGOCD_ECR_READ_ROLE_ARN}) is live."
 
           ECR_PASSWORD="$(aws ecr get-login-password --region "$AWS_REGION")"
 
@@ -2181,7 +2214,7 @@ jobs:
             echo ""
             echo "- AWS region: \`${AWS_REGION}\`"
             echo "- ECR registry: \`${ECR_REGISTRY}\`"
-            echo "- EKS account ID: \`${EKS_ACCOUNT_ID}\`"
+            echo "- EKS account ID: \`${WORKLOAD_ACCOUNT_ID}\`"
             echo "- EKS cluster name: \`${EKS_CLUSTER_NAME}\`"
             echo "- EKS cluster ARN: \`${EKS_CLUSTER_ARN}\`"
             echo ""
@@ -2196,7 +2229,7 @@ jobs:
             echo "Observer sidecar support has been retired (Phase 5A). No observer image is"
             echo "built, and no goldengate-observer container is rendered for any deployment"
             echo "model. Shared GoldenGate monitoring is performed by the shared gg-monitor"
-            echo "Deployment (goldengate-monitoring namespace) polling Admin REST/PMS and"
+            echo "Deployment (\`${MONITOR_NAMESPACE}\` namespace) polling Admin REST/PMS and"
             echo "publishing manager-compatible CloudWatch metrics under the GoldenGate/Pipelines"
             echo "namespace."
             echo ""
@@ -2209,7 +2242,7 @@ jobs:
             echo "### ECR repository policy prerequisites"
             echo ""
             echo "The \"Ensure Helm ECR repository policy allows Argo CD pull\" step requires the"
-            echo "GitHub Actions workflow role (\`${ROLE_ARN}\`) to have \`ecr:GetRepositoryPolicy\`"
+            echo "GitHub Actions workflow role (\`${RUNNER_ROLE_ARN}\`) to have \`ecr:GetRepositoryPolicy\`"
             echo "and \`ecr:SetRepositoryPolicy\` on \`${HELM_ECR_REPOSITORY}\`. If that step failed"
             echo "above with an access-denied error, grant those two actions to the role before"
             echo "re-running."
@@ -2222,7 +2255,7 @@ jobs:
             echo "\`helm upgrade --install\` or \`helm uninstall\` against the cluster."
             echo ""
             echo "Argo CD ECR OCI repository credentials are expected to be maintained by the"
-            echo "in-cluster token refresh component using IRSA role GoldenGateArgocdECRRead-dev."
+            echo "in-cluster token refresh component using IRSA role \`${ARGOCD_ECR_READ_ROLE_ARN}\`."
             echo "GitHub Actions ensures the helm/goldengate ECR repository policy grants that"
             echo "role pull access on every run, but is not the long-term source of Argo CD's"
             echo "ECR credentials."
@@ -2282,11 +2315,20 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Load resolved environment config
+        shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ matrix.environment }}
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
-          role-to-assume: ${{ env.ROLE_ARN }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
 
       - name: Install kubectl if missing
         shell: bash
@@ -2352,11 +2394,10 @@ jobs:
             exit 1
           fi
 
-          ARGOCD_NAMESPACE="argocd"
-
+          # ARGOCD_NAMESPACE/RUNTIME_NAMESPACE are already loaded (canonical) by the "Load resolved environment config" step above -- never reconstructed here.
           # legacyPair naming (kept only here, for deleting historical resources): Application=goldengate-<deployment-id>, namespace=gg-<environment>-<deployment-id>.
           if [ "$DEPLOYMENT_MODEL" = "singleRuntime" ]; then
-            TARGET_NAMESPACE="goldengate-${ENVIRONMENT}"
+            TARGET_NAMESPACE="${RUNTIME_NAMESPACE}"
             APP_SUFFIX="${DEPLOYMENT_ID#gg-}"
             ARGOCD_APP_NAME="goldengate-${ENVIRONMENT}-${APP_SUFFIX}"
           else
@@ -2367,7 +2408,6 @@ jobs:
           echo "ENVIRONMENT=${ENVIRONMENT}" >> "$GITHUB_ENV"
           echo "DEPLOYMENT_ID=${DEPLOYMENT_ID}" >> "$GITHUB_ENV"
           echo "DEPLOYMENT_MODEL=${DEPLOYMENT_MODEL}" >> "$GITHUB_ENV"
-          echo "ARGOCD_NAMESPACE=${ARGOCD_NAMESPACE}" >> "$GITHUB_ENV"
           echo "ARGOCD_APP_NAME=${ARGOCD_APP_NAME}" >> "$GITHUB_ENV"
           echo "TARGET_NAMESPACE=${TARGET_NAMESPACE}" >> "$GITHUB_ENV"
 
@@ -2424,9 +2464,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          # HARD FAIL-SAFE: never delete the shared goldengate-<environment> namespace, regardless of deployment_model or labels -- checked on the namespace value itself.
-          if [ "$TARGET_NAMESPACE" = "goldengate-${ENVIRONMENT}" ]; then
-            echo "Refusing to delete namespace ${TARGET_NAMESPACE}: this is the shared goldengate-${ENVIRONMENT} namespace, never owned by an individual deployment/Application. Namespace deletion is unconditionally skipped for singleRuntime deployments."
+          # HARD FAIL-SAFE: never delete the shared runtime namespace (canonical RUNTIME_NAMESPACE), regardless of deployment_model or labels -- checked on the namespace value itself, the same canonical value used to set TARGET_NAMESPACE above.
+          if [ "$TARGET_NAMESPACE" = "${RUNTIME_NAMESPACE}" ]; then
+            echo "Refusing to delete namespace ${TARGET_NAMESPACE}: this is the shared ${RUNTIME_NAMESPACE} namespace, never owned by an individual deployment/Application. Namespace deletion is unconditionally skipped for singleRuntime deployments."
             exit 0
           fi
 
@@ -2492,11 +2532,20 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Load resolved environment config
+        shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
-          role-to-assume: ${{ env.ROLE_ARN }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
 
       - name: Connect to EKS cluster
         shell: bash
@@ -2515,7 +2564,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          PIPELINES="$(python3 hack/goldengate-deployment-model.py --environment dev replication-pipelines)"
+          PIPELINES="$(python3 hack/goldengate-deployment-model.py --environment "${GG_SELECTED_ENVIRONMENT}" replication-pipelines)"
           if [ -z "$PIPELINES" ]; then
             echo "has_pipelines=false" >> "$GITHUB_OUTPUT"
             echo "No enabled replication pipelines."
@@ -2543,7 +2592,7 @@ jobs:
             OUTDIR="work/replication/${pipeline_id}"
             mkdir -p "$OUTDIR"
             python3 hack/goldengate-replication.py render-job \
-              --environment dev --region "${AWS_REGION}" --namespace goldengate-dev \
+              --environment "${GG_SELECTED_ENVIRONMENT}" --region "${AWS_REGION}" --namespace "${RUNTIME_NAMESPACE}" \
               --execution-id "${{ github.run_id }}-${{ github.run_attempt }}" \
               --output-dir "$OUTDIR" "$pipeline_id"
 
@@ -2553,20 +2602,20 @@ jobs:
             kubectl apply -f "${OUTDIR}/configmap.yaml"
             kubectl apply -f "${OUTDIR}/job.yaml"
 
-            if ! kubectl wait --for=condition=complete --timeout=600s "job/${JOB_NAME}" -n goldengate-dev; then
+            if ! kubectl wait --for=condition=complete --timeout=600s "job/${JOB_NAME}" -n "${RUNTIME_NAMESPACE}"; then
               echo "FAIL: reconciliation Job ${JOB_NAME} for ${pipeline_id} did not complete successfully."
               echo "Sanitized Job logs (the worker never prints a mounted secret file):"
-              kubectl logs "job/${JOB_NAME}" -n goldengate-dev --all-containers || true
-              echo "Job evidence retained for diagnosis: job/${JOB_NAME}, configmap/${JOB_NAME}, secretproviderclass/${JOB_NAME} in goldengate-dev."
+              kubectl logs "job/${JOB_NAME}" -n "${RUNTIME_NAMESPACE}" --all-containers || true
+              echo "Job evidence retained for diagnosis: job/${JOB_NAME}, configmap/${JOB_NAME}, secretproviderclass/${JOB_NAME} in ${RUNTIME_NAMESPACE}."
               exit 1
             fi
 
             echo "Sanitized Job logs (the worker never prints a mounted secret file):"
-            kubectl logs "job/${JOB_NAME}" -n goldengate-dev --all-containers
+            kubectl logs "job/${JOB_NAME}" -n "${RUNTIME_NAMESPACE}" --all-containers
 
-            kubectl delete job "$JOB_NAME" -n goldengate-dev --ignore-not-found
-            kubectl delete configmap "$JOB_NAME" -n goldengate-dev --ignore-not-found
-            kubectl delete secretproviderclass "$JOB_NAME" -n goldengate-dev --ignore-not-found
+            kubectl delete job "$JOB_NAME" -n "${RUNTIME_NAMESPACE}" --ignore-not-found
+            kubectl delete configmap "$JOB_NAME" -n "${RUNTIME_NAMESPACE}" --ignore-not-found
+            kubectl delete secretproviderclass "$JOB_NAME" -n "${RUNTIME_NAMESPACE}" --ignore-not-found
             echo "::endgroup::"
           done <<< "${{ steps.pipelines.outputs.pipelines }}"
 
@@ -2592,19 +2641,28 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Load resolved environment config
+        shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+
       - name: Validate the full replication schema and pipeline pairing (read-only)
         shell: bash
         run: |
           set -euo pipefail
 
-          python3 hack/goldengate-deployment-model.py --environment dev validate
+          python3 hack/goldengate-deployment-model.py --environment "${GG_SELECTED_ENVIRONMENT}" validate
 
       - name: Render and validate replication manifests for every enabled pipeline (no cluster mutation)
         shell: bash
         run: |
           set -euo pipefail
 
-          PIPELINES="$(python3 hack/goldengate-deployment-model.py --environment dev replication-pipelines)"
+          PIPELINES="$(python3 hack/goldengate-deployment-model.py --environment "${GG_SELECTED_ENVIRONMENT}" replication-pipelines)"
           if [ -z "$PIPELINES" ]; then
             echo "No enabled replication pipelines -- clean no-op."
             exit 0
@@ -2617,7 +2675,7 @@ jobs:
             OUTDIR="work/replication/${pipeline_id}"
             mkdir -p "$OUTDIR"
             python3 hack/goldengate-replication.py render-job \
-              --environment dev --region "${AWS_REGION}" --namespace goldengate-dev \
+              --environment "${GG_SELECTED_ENVIRONMENT}" --region "${AWS_REGION}" --namespace "${RUNTIME_NAMESPACE}" \
               --execution-id "dry-run" \
               --output-dir "$OUTDIR" "$pipeline_id"
 
@@ -2648,7 +2706,7 @@ jobs:
 
     uses: ./.github/workflows/goldengate-monitor.yaml
     with:
-      environment: dev
+      environment: ${{ needs.validate_model.outputs.selected_environment }}
       deploy: true
       # The global CloudWatch publisher must never be disabled by this orchestrator; existing gates stay whatever CONFIG already has (metrics_gate_expectation=any).
       enable_cloudwatch_publication: true
@@ -2695,6 +2753,16 @@ jobs:
             -r monitoring/monitor/requirements.txt \
             -r monitoring/monitor/requirements-test.txt
 
+      - name: Load resolved environment config
+        shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+        run: |
+          set -euo pipefail
+
+          # Local/read-only: this job never authenticates to AWS, but the resolver itself is a pure envs/<environment>/environment.yaml reader and needs no AWS credentials to run.
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+
       - name: Run monitor unit tests
         shell: bash
         run: |
@@ -2707,10 +2775,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          mkdir -p work/generated/dev
-          python3 hack/goldengate-deployment-model.py --environment dev registry --output work/generated/dev/goldengate-deployments.yaml
+          mkdir -p "work/generated/${GG_SELECTED_ENVIRONMENT}"
+          python3 hack/goldengate-deployment-model.py --environment "${GG_SELECTED_ENVIRONMENT}" registry --output "work/generated/${GG_SELECTED_ENVIRONMENT}/goldengate-deployments.yaml"
           echo "Generated registry:"
-          cat work/generated/dev/goldengate-deployments.yaml
+          cat "work/generated/${GG_SELECTED_ENVIRONMENT}/goldengate-deployments.yaml"
 
       - name: Helm lint and template the monitor chart locally
         shell: bash
@@ -2726,20 +2794,20 @@ jobs:
           rm -rf "$STAGED_CHART"
           mkdir -p "$STAGED_CHART" "$STAGED_CHART/files"
           cp -a helm/goldengate-monitor/. "$STAGED_CHART/"
-          cp work/generated/dev/goldengate-deployments.yaml "$STAGED_CHART/files/goldengate-deployments.yaml"
+          cp "work/generated/${GG_SELECTED_ENVIRONMENT}/goldengate-deployments.yaml" "$STAGED_CHART/files/goldengate-deployments.yaml"
 
           helm lint "$STAGED_CHART" \
             --set image.repository=example.invalid/goldengate-monitor \
             --set image.tag=dry-run \
-            --set serviceAccount.roleArn=arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev
+            --set serviceAccount.roleArn="${MONITOR_ROLE_ARN}"
 
           mkdir -p rendered
           helm template gg-monitor "$STAGED_CHART" \
-            --namespace goldengate-monitoring \
-            -f envs/dev/goldengate-monitor/values.yaml \
+            --namespace "${MONITOR_NAMESPACE}" \
+            -f "envs/${GG_SELECTED_ENVIRONMENT}/goldengate-monitor/values.yaml" \
             --set image.repository=example.invalid/goldengate-monitor \
             --set image.tag=dry-run \
-            --set serviceAccount.roleArn=arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev \
+            --set serviceAccount.roleArn="${MONITOR_ROLE_ARN}" \
             > rendered/gg-monitor-dry-run.yaml
 
           echo "OK: monitor chart lints and renders cleanly (no image build, no ECR push, no Argo CD/Kubernetes mutation)."
@@ -2759,11 +2827,20 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Load resolved environment config
+        shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
-          role-to-assume: ${{ env.ROLE_ARN }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
 
       - name: Connect to EKS cluster
         shell: bash
@@ -2782,7 +2859,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          PIPELINES="$(python3 hack/goldengate-deployment-model.py --environment dev replication-pipelines)"
+          PIPELINES="$(python3 hack/goldengate-deployment-model.py --environment "${GG_SELECTED_ENVIRONMENT}" replication-pipelines)"
           if [ -z "$PIPELINES" ]; then
             echo "has_pipelines=false" >> "$GITHUB_OUTPUT"
           else
@@ -2800,14 +2877,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          POD_NAME="$(kubectl get pods -n goldengate-monitoring -l app.kubernetes.io/name=gg-monitor -o json \
+          POD_NAME="$(kubectl get pods -n "${MONITOR_NAMESPACE}" -l app.kubernetes.io/name=gg-monitor -o json \
             | python3 -c "import json,sys; items=json.load(sys.stdin)['items']; ready=[i['metadata']['name'] for i in items if i['status'].get('phase')=='Running' and i['metadata'].get('deletionTimestamp') is None and all(c.get('ready') for c in i['status'].get('containerStatuses', []))]; print(ready[0] if ready else '')")"
           if [ -z "$POD_NAME" ]; then
-            echo "FAIL: no Ready gg-monitor pod found in goldengate-monitoring."
+            echo "FAIL: no Ready gg-monitor pod found in ${MONITOR_NAMESPACE}."
             exit 1
           fi
 
-          kubectl exec "$POD_NAME" -n goldengate-monitoring -- \
+          kubectl exec "$POD_NAME" -n "${MONITOR_NAMESPACE}" -- \
             python3 -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8080/api/processes', timeout=5).read().decode('utf-8'))" \
             > /tmp/api-processes.json
 
@@ -2815,7 +2892,7 @@ jobs:
             [ -z "$pipeline_id" ] && continue
             echo "::group::Verifying ${pipeline_id}"
 
-            python3 hack/goldengate-deployment-model.py --environment dev replication-plan "$pipeline_id" > /tmp/plan.json
+            python3 hack/goldengate-deployment-model.py --environment "${GG_SELECTED_ENVIRONMENT}" replication-plan "$pipeline_id" > /tmp/plan.json
 
             python3 - "$pipeline_id" <<'PYEOF'
           import json, sys
@@ -2871,6 +2948,7 @@ jobs:
     name: Final validation
 
     needs:
+      - validate_model
       - validate_shared_secrets_once
       - build_publish_and_deploy
       - delete_removed_argocd_applications
@@ -2889,11 +2967,13 @@ jobs:
 
       - name: Re-validate the folder-driven deployment model after rollout
         shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
         run: |
           set -euo pipefail
 
           python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
-          python3 hack/goldengate-deployment-model.py --environment dev validate
+          python3 hack/goldengate-deployment-model.py --environment "${GG_SELECTED_ENVIRONMENT}" validate
 
       - name: Orchestrator summary
         shell: bash

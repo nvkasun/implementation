@@ -58,25 +58,8 @@ permissions:
   id-token: write
   contents: read
 
+# Environment identity is loaded per-job via hack/goldengate-environment.py github-env after checkout (GITHUB_ENV is job-local: ensure_monitor_image and build_publish_and_deploy each load it independently), never duplicated here.
 env:
-  AWS_REGION: ${{ vars.AWS_REGION }}
-
-  # ECR / runner account where the monitor image and Helm OCI chart are pushed.
-  ECR_ACCOUNT_ID: "229410149234"
-  ECR_REGISTRY: 229410149234.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com
-
-  # Role used by GitHub Actions / CodeBuild runner.
-  ROLE_ARN: ${{ vars.GOLDENGATE_AWS_ROLE_ARN }}
-
-  # Target EKS cluster details.
-  EKS_ACCOUNT_ID: ${{ vars.ACCOUNT_ID_DEV }}
-  EKS_CLUSTER_NAME: ${{ vars.AWS_CLUSTER_NAME }}
-  EKS_CLUSTER_ARN: ${{ vars.AWS_CLUSTER_ARN }}
-  EKS_DEPLOY_ROLE_ARN: ${{ vars.EKS_DEPLOY_ROLE_ARN }}
-
-  # IRSA role for the in-cluster argocd-ecr-token-sync CronJob; the ECR repository policy must grant it pull access (see "Ensure Helm ECR repository policy allows Argo CD pull" step below).
-  ARGOCD_ECR_READ_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateArgocdECRRead-dev
-
   MONITOR_SOURCE_PATH: monitoring/monitor
   MONITOR_ECR_REPOSITORY: goldengate-monitor
 
@@ -84,12 +67,8 @@ env:
   CHART_NAME: goldengate-monitor
   HELM_CHART_PATH: helm/goldengate-monitor
   ENVS_ROOT: envs
-  ENVIRONMENT: dev
-  VALUES_FILE: envs/dev/goldengate-monitor/values.yaml
 
-  TARGET_NAMESPACE: goldengate-monitoring
   RELEASE_NAME: gg-monitor
-  ARGOCD_NAMESPACE: argocd
   ARGOCD_APP_NAME: goldengate-monitor
   ARGOCD_MONITOR_SECRET_NAME: argocd-ecr-goldengate-monitor-oci
 
@@ -104,7 +83,7 @@ jobs:
 
     runs-on: ubuntu-latest
 
-    environment: dev
+    environment: ${{ inputs.environment }}
 
     outputs:
       image_repository: ${{ steps.prep.outputs.image_repository }}
@@ -120,11 +99,21 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Load resolved environment config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # ubuntu-latest does not guarantee PyYAML; install it explicitly rather than assume it, same as elsewhere in this repo.
+          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
+          python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" validate
+          python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" github-env >> "$GITHUB_ENV"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
-          role-to-assume: ${{ env.ROLE_ARN }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
 
       - name: Verify AWS caller account
         shell: bash
@@ -285,7 +274,7 @@ jobs:
                 echo "Failed to read the existing ECR repository policy:"
                 cat /tmp/monitor-ecr-get-policy-error.txt
                 echo ""
-                echo "The workflow role (${ROLE_ARN}) must have ecr:GetRepositoryPolicy and"
+                echo "The workflow role (${RUNNER_ROLE_ARN}) must have ecr:GetRepositoryPolicy and"
                 echo "ecr:SetRepositoryPolicy on ${MONITOR_ECR_REPOSITORY}. Grant those and re-run."
                 exit 1
               fi
@@ -295,12 +284,13 @@ jobs:
 
           echo "$EXISTING_POLICY" | jq \
             --arg sid "$MONITOR_EKS_PULL_SID" \
+            --arg workloadAccountId "$WORKLOAD_ACCOUNT_ID" \
             '
             .Statement = ([.Statement[] | select(.Sid != $sid)]
               + [{
                   Sid: $sid,
                   Effect: "Allow",
-                  Principal: { AWS: "arn:aws:iam::668311715351:root" },
+                  Principal: { AWS: ("arn:aws:iam::" + $workloadAccountId + ":root") },
                   Action: [
                     "ecr:BatchCheckLayerAvailability",
                     "ecr:BatchGetImage",
@@ -314,7 +304,7 @@ jobs:
             --repository-name "$MONITOR_ECR_REPOSITORY" \
             --policy-text file:///tmp/monitor-ecr-repository-policy.json >/dev/null
 
-          echo "ECR repository policy on ${MONITOR_ECR_REPOSITORY} now allows pull from account 668311715351 (EKS workload account)."
+          echo "ECR repository policy on ${MONITOR_ECR_REPOSITORY} now allows pull from account ${WORKLOAD_ACCOUNT_ID} (EKS workload account)."
 
       - name: Check whether the monitor image already exists
         id: image_check
@@ -488,7 +478,7 @@ jobs:
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
-    environment: dev
+    environment: ${{ inputs.environment }}
 
     concurrency:
       group: goldengate-monitor-helm-deploy-${{ github.ref }}
@@ -509,11 +499,15 @@ jobs:
           # TARGET_NAMESPACE is the render/deploy path's namespace identity; it must resolve to the canonical MONITOR_NAMESPACE, never an independent workflow-level literal.
           echo "TARGET_NAMESPACE=$(python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" get MONITOR_NAMESPACE)" >> "$GITHUB_ENV"
 
+          # VALUES_FILE/GENERATED_REGISTRY_PATH are derived from the canonical GG_ENVIRONMENT, never independently maintained per-environment literals.
+          echo "VALUES_FILE=envs/${{ inputs.environment }}/goldengate-monitor/values.yaml" >> "$GITHUB_ENV"
+          echo "GENERATED_REGISTRY_PATH=work/generated/${{ inputs.environment }}/goldengate-deployments.yaml" >> "$GITHUB_ENV"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
-          role-to-assume: ${{ env.ROLE_ARN }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
 
       - name: Install Helm and kubectl if missing
         shell: bash
@@ -624,10 +618,10 @@ jobs:
 
           python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
 
-          mkdir -p work/generated/dev
-          python3 hack/goldengate-deployment-model.py --environment dev registry --output work/generated/dev/goldengate-deployments.yaml
+          mkdir -p "$(dirname "$GENERATED_REGISTRY_PATH")"
+          python3 hack/goldengate-deployment-model.py --environment "${{ inputs.environment }}" registry --output "$GENERATED_REGISTRY_PATH"
           echo "Generated registry:"
-          cat work/generated/dev/goldengate-deployments.yaml
+          cat "$GENERATED_REGISTRY_PATH"
 
       - name: Prepare temporary chart directory with the canonical config staged
         shell: bash
@@ -640,7 +634,7 @@ jobs:
           cp -a "$HELM_CHART_PATH/." "$TEMP_CHART_PATH/"
 
           mkdir -p "$TEMP_CHART_PATH/files"
-          cp work/generated/dev/goldengate-deployments.yaml "$TEMP_CHART_PATH/files/goldengate-deployments.yaml"
+          cp "$GENERATED_REGISTRY_PATH" "$TEMP_CHART_PATH/files/goldengate-deployments.yaml"
 
           echo "OK: folder-driven registry staged into ${TEMP_CHART_PATH} (never committed to the reusable chart)."
 
@@ -957,7 +951,7 @@ jobs:
             /^[[:space:]]*enabled:[[:space:]]*true/ { enabled="true" }
             /^[[:space:]]*enabled:[[:space:]]*false/ { enabled="false" }
             END { if (name != "" && enabled == "true") print name }
-          ' work/generated/dev/goldengate-deployments.yaml)
+          ' ${GENERATED_REGISTRY_PATH})
           if ! grep -Fq -- "ca-chain-pem" <<< "$SPC_BLOCK"; then
             echo "FAIL: SecretProviderClass is missing the ca-chain-pem alias."
             exit 1
@@ -1103,7 +1097,7 @@ jobs:
             exit 1
           fi
           # Expected names are read from the deployment-model-generated registry (never hardcoded) so this check adapts automatically as deployments are added/renamed.
-          EXPECTED_NAMES="$(grep -E '^[[:space:]]*-?[[:space:]]*(name|pipeline):' work/generated/dev/goldengate-deployments.yaml \
+          EXPECTED_NAMES="$(grep -E '^[[:space:]]*-?[[:space:]]*(name|pipeline):' ${GENERATED_REGISTRY_PATH} \
             | sed -E 's/^[[:space:]]*-?[[:space:]]*(name|pipeline):[[:space:]]*//' | tr -d '"'"'"'\r' | sort -u)"
           while IFS= read -r expected; do
             [ -z "$expected" ] && continue
@@ -1325,10 +1319,10 @@ jobs:
             /^[[:space:]]*enabled:[[:space:]]*true/ { enabled="true"; next }
             /^[[:space:]]*enabled:[[:space:]]*false/ { enabled="false"; next }
             END { if (name != "" && enabled == "true") print name "|" type }
-          ' work/generated/dev/goldengate-deployments.yaml)
+          ' ${GENERATED_REGISTRY_PATH})
 
           if [ "${#ENABLED_DEPLOYMENT_PAIRS[@]}" -eq 0 ]; then
-            echo "FAIL: no enabled deployments discovered from work/generated/dev/goldengate-deployments.yaml."
+            echo "FAIL: no enabled deployments discovered from ${GENERATED_REGISTRY_PATH}."
             exit 1
           fi
 
@@ -1348,7 +1342,7 @@ jobs:
           pipeline = sys.argv[1]
           expected_type = sys.argv[2]
           try:
-              table = boto3.resource("dynamodb", region_name=os.environ.get("AWS_REGION", "eu-west-1")).Table(os.environ["DYNAMODB_TABLE"])
+              table = boto3.resource("dynamodb", region_name=os.environ["AWS_REGION"]).Table(os.environ["DYNAMODB_TABLE"])
               item = table.get_item(Key={"pipeline": pipeline, "recordType": "CONFIG"}, ConsistentRead=True).get("Item")
               if not isinstance(item, dict):
                   print(f"deployment={pipeline} result=missing-config"); sys.exit(1)
@@ -1668,7 +1662,7 @@ jobs:
           }
 
           # Expected names come from the deployment-model-generated registry (never hardcoded) so this check adapts automatically as deployments are added/renamed.
-          EXPECTED_NAMES="$(grep -E '^[[:space:]]*-?[[:space:]]*(name|pipeline):' work/generated/dev/goldengate-deployments.yaml \
+          EXPECTED_NAMES="$(grep -E '^[[:space:]]*-?[[:space:]]*(name|pipeline):' ${GENERATED_REGISTRY_PATH} \
             | sed -E 's/^[[:space:]]*-?[[:space:]]*(name|pipeline):[[:space:]]*//' | tr -d '"'"'"'\r' | sort -u)"
           while IFS= read -r expected; do
             [ -z "$expected" ] && continue
@@ -1706,10 +1700,10 @@ jobs:
             /^[[:space:]]*enabled:[[:space:]]*true/ { enabled="true"; next }
             /^[[:space:]]*enabled:[[:space:]]*false/ { enabled="false"; next }
             END { if (name != "" && enabled == "true") print name "|" type }
-          ' work/generated/dev/goldengate-deployments.yaml)
+          ' ${GENERATED_REGISTRY_PATH})
 
           if [ "${#ENABLED_DEPLOYMENT_PAIRS_DISCOVERY[@]}" -eq 0 ]; then
-            echo "FAIL: no enabled canonical deployment found in work/generated/dev/goldengate-deployments.yaml."
+            echo "FAIL: no enabled canonical deployment found in ${GENERATED_REGISTRY_PATH}."
             exit 1
           fi
 
@@ -1866,7 +1860,7 @@ jobs:
               /^[[:space:]]*enabled:[[:space:]]*true/ { enabled="true"; next }
               /^[[:space:]]*enabled:[[:space:]]*false/ { enabled="false"; next }
               END { if (name != "" && enabled == "true") print name "|" type }
-            ' work/generated/dev/goldengate-deployments.yaml)
+            ' ${GENERATED_REGISTRY_PATH})
 
             POST_GATE_FAILED="false"
             for pair in "${ENABLED_DEPLOYMENT_PAIRS_POST[@]}"; do
@@ -1879,7 +1873,7 @@ jobs:
           pipeline = sys.argv[1]
           expected_type = sys.argv[2]
           try:
-              table = boto3.resource("dynamodb", region_name=os.environ.get("AWS_REGION", "eu-west-1")).Table(os.environ["DYNAMODB_TABLE"])
+              table = boto3.resource("dynamodb", region_name=os.environ["AWS_REGION"]).Table(os.environ["DYNAMODB_TABLE"])
               item = table.get_item(Key={"pipeline": pipeline, "recordType": "CONFIG"}, ConsistentRead=True).get("Item")
               if not isinstance(item, dict):
                   print(f"deployment={pipeline} result=missing-config"); sys.exit(1)

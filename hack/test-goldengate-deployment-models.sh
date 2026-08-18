@@ -1016,9 +1016,10 @@ assert not (names & forbidden), names & forbidden
       fail "11b: ${ARGOCD_DEPLOY_WORKFLOW} does not fully reference the fourth repository, or a stale 'all three' comment/echo remains"
     fi
 
-    # The IAM-policy static-validation step's expected_repos dict must include the fourth ARN.
-    if grep -q 'helm/amazon-cloudwatch-observability.*arn:aws:ecr:eu-west-1:229410149234:repository/helm/amazon-cloudwatch-observability\|"helm/amazon-cloudwatch-observability": "arn:aws:ecr:eu-west-1:229410149234:repository/helm/amazon-cloudwatch-observability"' "${REPO_ROOT}/${ARGOCD_DEPLOY_WORKFLOW}"; then
-      pass "11c: ${ARGOCD_DEPLOY_WORKFLOW}'s IAM-policy validation step expects the amazon-cloudwatch-observability repository ARN"
+    # The IAM-policy static-validation step's expected_repos dict must include the fourth repository name, deriving its ARN from the canonical AWS_REGION/ECR_ACCOUNT_ID (never a second hardcoded account/region).
+    if grep -q '"helm/amazon-cloudwatch-observability"' "${REPO_ROOT}/${ARGOCD_DEPLOY_WORKFLOW}" \
+        && grep -qF 'f"arn:aws:ecr:{region}:{ecr_account_id}:repository/{name}"' "${REPO_ROOT}/${ARGOCD_DEPLOY_WORKFLOW}"; then
+      pass "11c: ${ARGOCD_DEPLOY_WORKFLOW}'s IAM-policy validation step expects the amazon-cloudwatch-observability repository ARN, derived from the canonical AWS_REGION/ECR_ACCOUNT_ID"
     else
       fail "11c: ${ARGOCD_DEPLOY_WORKFLOW}'s IAM-policy validation step does not reference the amazon-cloudwatch-observability repository ARN"
     fi
@@ -1069,7 +1070,7 @@ for repo in ("aws-cloud-factory-cloudwatch-agent-operator", "aws-cloud-factory-c
         results.append(f"missing-image-repo-reference:{repo}")
 if "imageDigest" not in all_run_text and "imageDetails[0].imageDigest" not in all_run_text:
     results.append("no-digest-resolution")
-if "GoldenGateCloudWatchMetricsRole-dev" not in all_run_text:
+if "CLOUDWATCH_METRICS_ROLE_ARN" not in all_run_text:
     results.append("missing-iam-role-reference")
 # The Secret name is an env: block value (ARGOCD_OBSERVABILITY_SECRET_NAME) referenced in run: blocks only via that variable -- scan the whole document, not just run: block text.
 whole_doc_text = str(doc)
@@ -2052,7 +2053,7 @@ PYEOF
     pass "14: no enable_cloudwatch Terraform variable/reference exists under envs/"
   fi
 
-  # 15: earlier phases' resources remain functionally untouched (comment-only edits are allowed and ignored here). envs/dev/policies/goldengate-cloudwatch-metrics-dev is excluded since the OTLP-authorization correction intentionally changes one condition operator there; helm/goldengate-platform and platform/dev/goldengate-platform are excluded since Phase 6D0 legitimately changes the per-flavour runtime ServiceAccounts there (guarded instead by the dedicated ServiceAccount/Fluent-Bit safety checks in this same suite). envs/dev/cloudwatch_observability.tf, envs/dev/cloudwatch_logs.tf, and envs/dev/policies/goldengate-platform-logging-dev are excluded starting with Fresh-EKS Phase A, which legitimately centralizes their log-group names onto envs/dev/environment.tf and regenerates goldengate-platform-logging-dev's assume_role_policy/sts.json for the new EKS OIDC issuer -- both already independently guarded by this same suite's render-iam-policies/environment-contract checks, never by this narrow historical byte-diff.
+  # 15: earlier phases' resources remain functionally untouched (comment-only edits are allowed and ignored here). envs/dev/policies/goldengate-cloudwatch-metrics-dev is excluded since the OTLP-authorization correction intentionally changes one condition operator there; helm/goldengate-platform and platform/dev/goldengate-platform are excluded since Phase 6D0 legitimately changes the per-flavour runtime ServiceAccounts there (guarded instead by the dedicated ServiceAccount/Fluent-Bit safety checks in this same suite). envs/dev/cloudwatch_observability.tf, envs/dev/cloudwatch_logs.tf, and envs/dev/policies/goldengate-platform-logging-dev are excluded starting with Fresh-EKS Phase A, which legitimately centralizes their log-group names onto envs/dev/environment.tf and regenerates goldengate-platform-logging-dev's assume_role_policy/sts.json for the new EKS OIDC issuer -- both already independently guarded by this same suite's render-iam-policies/environment-contract checks, never by this narrow historical byte-diff. This check's own paths list is now empty: cloudwatch-observability-artifact-sync.yaml is excluded starting with Phase 11, which legitimately adds an environment selector and loads canonical identity from envs/<environment>/environment.yaml instead of hardcoding it -- guarded instead by this suite's Phase 11 hardcoding-sweep checks, never by this narrow historical byte-diff.
   PHASE_6A_6B1_STATUS="$(python3 -c "
 import subprocess
 
@@ -2068,10 +2069,9 @@ def strip_comments(text):
         out.append(line)
     return '\n'.join(out)
 
-paths = [
-    '.github/workflows/cloudwatch-observability-artifact-sync.yaml',
-]
-changed = subprocess.run(['git', '-C', '$REPO_ROOT', 'diff', '--name-only', '--'] + paths, capture_output=True, text=True).stdout.split()
+paths = []
+# An empty pathspec list must never fall through to a bare 'git diff --name-only --' (which diffs the whole repo, not nothing).
+changed = subprocess.run(['git', '-C', '$REPO_ROOT', 'diff', '--name-only', '--'] + paths, capture_output=True, text=True).stdout.split() if paths else []
 mismatches = []
 for f in changed:
     head = subprocess.run(['git', '-C', '$REPO_ROOT', 'show', f'HEAD:{f}'], capture_output=True, text=True).stdout
@@ -2082,7 +2082,7 @@ for f in changed:
 print(('MISMATCH:' + ','.join(mismatches)) if mismatches else 'IDENTICAL')
 " 2>/dev/null || true)"
   if [ "$PHASE_6A_6B1_STATUS" = "IDENTICAL" ]; then
-    pass "15: Phase 6A (gg-fluent-bit) CloudWatch Observability supply-chain workflow is functionally unchanged"
+    pass "15: no file remains in this check's historical byte-diff guard set (cloudwatch-observability-artifact-sync.yaml was legitimately released from it by Phase 11's environment centralization)"
   else
     fail "15: an unexpected functional change was found in Phase 6A/6B1/6B2A files: ${PHASE_6A_6B1_STATUS:-unknown}"
   fi
@@ -3222,9 +3222,9 @@ PYEOF
       fail "5: an unknown deletion-matrix deployment_model was not rejected as expected (status=${UNKNOWN_DELETION_MODEL_STATUS})"
     fi
 
-    # Sanity: singleRuntime and legacyPair both still resolve without error.
+    # Sanity: singleRuntime and legacyPair both still resolve without error. RUNTIME_NAMESPACE is exported here to simulate the real job's earlier "Load resolved environment config" step (canonical, never reconstructed inside "Prepare deletion variables" itself) -- legacyPair's naming never depends on it.
     set +e
-    SINGLE_OK_OUT="$(TEST_ENVIRONMENT="dev" TEST_DEPLOYMENT_ID="gg-oracle-payments-01" TEST_DEPLOYMENT_MODEL="singleRuntime" \
+    SINGLE_OK_OUT="$(TEST_ENVIRONMENT="dev" TEST_DEPLOYMENT_ID="gg-oracle-payments-01" TEST_DEPLOYMENT_MODEL="singleRuntime" RUNTIME_NAMESPACE="goldengate-dev" \
       bash -c 'set -euo pipefail; GITHUB_ENV=/dev/null; source "'"${WORKDIR}"'/prepare_deletion_vars.sh"; echo "OK namespace=${TARGET_NAMESPACE} app=${ARGOCD_APP_NAME}"' 2>&1)"
     SINGLE_OK_STATUS=$?
     LEGACY_OK_OUT="$(TEST_ENVIRONMENT="dev" TEST_DEPLOYMENT_ID="payments-ora-to-pg-001" TEST_DEPLOYMENT_MODEL="legacyPair" \
@@ -3994,12 +3994,11 @@ else
   skip "Phase 5B1 IAM least-privilege checks -- policy files or python3 not available"
 fi
 
-# 7. The one shared runtime ServiceAccount (annotated by the platform workflow, never duplicated in per-deployment values) references GoldenGateSecretsReadRole-dev.
-if grep -q "RUNTIME_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev" "$PLATFORM_WORKFLOW" 2>/dev/null \
-    && grep -q "runtimeServiceAccount.roleArn" "$PLATFORM_WORKFLOW" 2>/dev/null; then
-  pass "7: the shared runtime ServiceAccount (platform workflow) references GoldenGateSecretsReadRole-dev"
+# 7. The one shared runtime ServiceAccount (annotated by the platform workflow, never duplicated in per-deployment values) is injected from the canonical resolver (RUNTIME_ROLE_ARN, which resolves to GoldenGateSecretsReadRole-dev for envs/dev/environment.yaml), never a re-typed literal.
+if grep -qF 'runtimeServiceAccount.roleArn="$RUNTIME_ROLE_ARN"' "$PLATFORM_WORKFLOW" 2>/dev/null; then
+  pass "7: the shared runtime ServiceAccount (platform workflow) is injected from the canonical RUNTIME_ROLE_ARN resolver output"
 else
-  fail "7: the platform workflow no longer references GoldenGateSecretsReadRole-dev for the shared runtime ServiceAccount"
+  fail "7: the platform workflow no longer injects runtimeServiceAccount.roleArn from the canonical RUNTIME_ROLE_ARN"
 fi
 
 # 8. Fresh-EKS Phase A/Phase 10: serviceAccount.roleArn is shared environment identity, removed from envs/dev/goldengate-monitor/values.yaml -- gg-monitor's IRSA role must now be injected by the monitor workflow from the canonical resolver (MONITOR_ROLE_ARN), never a re-typed literal in the committed values file.
@@ -4813,7 +4812,7 @@ fi
 
 if grep -q "Validate deployment_name against the canonical registry" "$METRICS_CONFIG_WORKFLOW" 2>/dev/null \
     && grep -q "Generate the folder-driven canonical registry" "$METRICS_CONFIG_WORKFLOW" 2>/dev/null \
-    && grep -q 'CANONICAL_REGISTRY: work/generated/dev/goldengate-deployments.yaml' "$METRICS_CONFIG_WORKFLOW" 2>/dev/null \
+    && grep -qF 'CANONICAL_REGISTRY=work/generated/${{ inputs.environment }}/goldengate-deployments.yaml' "$METRICS_CONFIG_WORKFLOW" 2>/dev/null \
     && ! grep -q "gg-oracle-payments-01" "$METRICS_CONFIG_WORKFLOW" 2>/dev/null \
     && ! grep -q "gg-postgresql-payments-01" "$METRICS_CONFIG_WORKFLOW" 2>/dev/null; then
   pass "21: deployment_name is validated dynamically against the deployment-model-generated registry, never hardcoded"
@@ -5283,7 +5282,7 @@ if run_text is None:
     sys.exit(1)
 
 start_marker = "< <(awk '\n"
-end_marker = "\n' work/generated/dev/goldengate-deployments.yaml)"
+end_marker = "\n' ${GENERATED_REGISTRY_PATH})"
 start = run_text.index(start_marker) + len(start_marker)
 end = run_text.index(end_marker, start)
 awk_script = run_text[start:end]
@@ -5704,7 +5703,7 @@ else
 fi
 
 if grep -q "goldengate-deployment-model.py" .github/workflows/goldengate-monitor.yaml 2>/dev/null \
-    && grep -q -- "--output work/generated" .github/workflows/goldengate-monitor.yaml 2>/dev/null; then
+    && grep -qF 'registry --output "$GENERATED_REGISTRY_PATH"' .github/workflows/goldengate-monitor.yaml 2>/dev/null; then
   pass "26: the monitor workflow generates the registry via the deployment-model tool before chart staging"
 else
   fail "26: the monitor workflow no longer generates the registry via the deployment-model tool"
@@ -6513,12 +6512,12 @@ else
   skip "31: work/generated tracking check -- not a git repository"
 fi
 
-# Static evidence only: GOLDENGATE_AWS_ROLE_ARN and EKS_DEPLOY_ROLE_ARN's live values are GitHub repo settings, unverifiable offline. Corrected for the VDR cross-account fix: validate_shared_secrets_once now starts from GOLDENGATE_AWS_ROLE_ARN (engineering account, via env.ROLE_ARN) like every other job, then separately assumes EKS_DEPLOY_ROLE_ARN in-step before any Secrets Manager call -- it is that second, workload-account role (GoldenGateEKSDeployRole-dev) that static evidence ties to the policy carrying the required read-only shared-secret permissions.
-if grep -q "role-to-assume: \${{ env.ROLE_ARN }}" "$EKS_APP_WORKFLOW" 2>/dev/null \
+# Static evidence only: RUNNER_ROLE_ARN and EKS_DEPLOY_ROLE_ARN's live values come from envs/dev/environment.yaml, unverifiable offline. Corrected for the VDR cross-account fix: validate_shared_secrets_once now starts from the canonical RUNNER_ROLE_ARN (engineering/build account, via env.RUNNER_ROLE_ARN) like every other job, then separately assumes EKS_DEPLOY_ROLE_ARN in-step before any Secrets Manager call -- it is that second, workload-account role (GoldenGateEKSDeployRole-dev) that static evidence ties to the policy carrying the required read-only shared-secret permissions.
+if grep -q "role-to-assume: \${{ env.RUNNER_ROLE_ARN }}" "$EKS_APP_WORKFLOW" 2>/dev/null \
     && grep -qE 'aws sts assume-role --role-arn "\$EKS_DEPLOY_ROLE_ARN"' "$EKS_APP_WORKFLOW" 2>/dev/null \
     && grep -q 'name          = local.gg_env_role_names.eksDeploy' envs/dev/iam.tf 2>/dev/null \
     && grep -q 'policy_folder = "goldengate-eks-deploy-dev"' envs/dev/iam.tf 2>/dev/null; then
-  pass "31: validate_shared_secrets_once starts from the same GOLDENGATE_AWS_ROLE_ARN role used everywhere else, then in-step assumes EKS_DEPLOY_ROLE_ARN before any Secrets Manager call; static evidence ties that workload role to the policy carrying the required read-only shared-secret permissions (live values unverifiable offline)"
+  pass "31: validate_shared_secrets_once starts from the same canonical RUNNER_ROLE_ARN role used everywhere else, then in-step assumes EKS_DEPLOY_ROLE_ARN before any Secrets Manager call; static evidence ties that workload role to the policy carrying the required read-only shared-secret permissions (live values unverifiable offline)"
 else
   fail "31: static evidence linking the validate_shared_secrets_once credential chain to the read-only shared-secret policy is incomplete"
 fi
@@ -8148,13 +8147,13 @@ with open("'"$EKS_APP_WORKFLOW"'") as f:
     doc = yaml.safe_load(f)
 steps = doc["jobs"]["validate_shared_secrets_once"]["steps"]
 cred_steps = [s for s in steps if s.get("uses", "").startswith("aws-actions/configure-aws-credentials")]
-ok = len(cred_steps) == 1 and cred_steps[0].get("with", {}).get("role-to-assume") == "${{ env.ROLE_ARN }}"
+ok = len(cred_steps) == 1 and cred_steps[0].get("with", {}).get("role-to-assume") == "${{ env.RUNNER_ROLE_ARN }}"
 print("OK" if ok else "FAIL")
 ')"
   if [ "$FIRST_STEP_CHECK" = "OK" ]; then
-    pass "VDR 1: validate_shared_secrets_once still starts by configuring AWS credentials via the engineering RunnerRole (env.ROLE_ARN), exactly as today -- the fix adds a second, in-step assume-role, it does not replace the job-level OIDC credential step"
+    pass "VDR 1: validate_shared_secrets_once still starts by configuring AWS credentials via the canonical RUNNER_ROLE_ARN (env.RUNNER_ROLE_ARN, loaded from envs/<environment>/environment.yaml, never a repository variable), exactly as today -- the fix adds a second, in-step assume-role, it does not replace the job-level OIDC credential step"
   else
-    fail "VDR 1: validate_shared_secrets_once no longer starts from the engineering RunnerRole (env.ROLE_ARN) via aws-actions/configure-aws-credentials"
+    fail "VDR 1: validate_shared_secrets_once no longer starts from the canonical RUNNER_ROLE_ARN (env.RUNNER_ROLE_ARN) via aws-actions/configure-aws-credentials"
   fi
 else
   skip "VDR 1: base-credential-step check -- python3/PyYAML unavailable"
@@ -8162,7 +8161,7 @@ fi
 
 if grep -qE 'EXPECTED_WORKLOAD_ACCOUNT_ID="\$\(echo "\$EKS_DEPLOY_ROLE_ARN" \| sed -nE' "$EKS_APP_WORKFLOW" 2>/dev/null \
     && grep -qE 'ACTUAL_ACCOUNT="\$\(AWS_ACCESS_KEY_ID="\$SEC_TMP_KEY_ID"' "$EKS_APP_WORKFLOW" 2>/dev/null; then
-  pass "VDR 3: the workload role's target account is derived from EKS_DEPLOY_ROLE_ARN itself (the same established derivation managed_efs_inventory_guard already uses) and the post-assume-role caller identity is checked against it -- for the dev environment this expected account is 668311715351, the same value EKS_ACCOUNT_ID (vars.ACCOUNT_ID_DEV) documents"
+  pass "VDR 3: the workload role's target account is derived from EKS_DEPLOY_ROLE_ARN itself (the same established derivation managed_efs_inventory_guard already uses) and the post-assume-role caller identity is checked against it -- for the dev environment this expected account is the canonical WORKLOAD_ACCOUNT_ID from envs/dev/environment.yaml, never an independent repository variable"
 else
   fail "VDR 3: validate_shared_secrets_once does not derive/verify the expected workload-account ID before calling Secrets Manager"
 fi
@@ -8231,7 +8230,7 @@ STUBEOF
   set +e
   SECRETS_TEST_OUT="$(PATH="${STUB_DIR2}:${PATH}" \
     EKS_DEPLOY_ROLE_ARN="arn:aws:iam::668311715351:role/GoldenGateEKSDeployRole-dev" \
-    AWS_REGION="eu-west-1" GITHUB_RUN_ID="1" GITHUB_RUN_ATTEMPT="1" \
+    AWS_REGION="eu-west-1" GITHUB_RUN_ID="1" GITHUB_RUN_ATTEMPT="1" GG_SELECTED_ENVIRONMENT="dev" \
     bash "${WORKDIR}/shared_secrets_step.sh" 2>&1)"
   SECRETS_TEST_STATUS=$?
   set -e
@@ -8590,7 +8589,7 @@ results.append((
 results.append(("7: runs monitor unit tests", "python3 -m unittest discover -s monitoring/monitor/tests" in all_run_text))
 results.append((
     "8: generates the folder-driven registry",
-    "goldengate-deployment-model.py --environment dev registry" in all_run_text,
+    "goldengate-deployment-model.py --environment \"${GG_SELECTED_ENVIRONMENT}\" registry" in all_run_text,
 ))
 results.append(("9: performs Helm lint locally", "helm lint" in all_run_text))
 results.append(("9: performs Helm template locally", "helm template" in all_run_text))
@@ -8651,7 +8650,7 @@ results.append(("1: validate_model exports has_active_deployments", "has_active_
 active_step = next((s for s in jobs["validate_model"]["steps"] if s.get("id") == "active_runtime_state"), None)
 results.append(("2: validate_model has an active_runtime_state step", active_step is not None))
 step_run = (active_step or {}).get("run", "")
-results.append(("3: has_active_deployments is derived from the canonical registry, not deployment_matrix", "goldengate-deployment-model.py --environment dev registry" in step_run and "outputs.deployment_matrix" not in step_run and "DEPLOYMENT_MATRIX" not in step_run))
+results.append(("3: has_active_deployments is derived from the canonical registry, not deployment_matrix", "goldengate-deployment-model.py --environment \"${GG_SELECTED_ENVIRONMENT}\" registry" in step_run and "outputs.deployment_matrix" not in step_run and "DEPLOYMENT_MATRIX" not in step_run))
 results.append(("4: the active-runtime step never greps YAML (uses PyYAML safe_load)", "grep" not in step_run and "yaml.safe_load" in step_run))
 
 monitor_sync_if = jobs["monitor_sync_once"]["if"]
@@ -8984,6 +8983,77 @@ if [ -z "$CENTRALIZATION_HITS" ]; then
   pass "14: no first-party production .tf/.py source (including hack/goldengate-environment.py, the generator) hardcodes the real workload/build account ID outside envs/dev/environment.tf (canonical), envs/dev/policies/** (generated output), and test files (synthetic fixtures)"
 else
   fail "14: production source independently hardcodes an account ID outside the canonical/generated/test-fixture boundary:"$'\n'"${CENTRALIZATION_HITS}"
+fi
+
+echo ""
+echo "--- Phase 11: active workflow environment-identity centralization ---"
+
+# 1: no active workflow depends on a retired repository variable that used to independently duplicate envs/dev/environment.yaml identity.
+RETIRED_WORKFLOW_VARS='vars\.AWS_REGION|vars\.ACCOUNT_ID_DEV|vars\.AWS_CLUSTER_NAME|vars\.AWS_CLUSTER_ARN|vars\.EKS_DEPLOY_ROLE_ARN|vars\.GOLDENGATE_AWS_ROLE_ARN'
+RETIRED_VARS_HITS="$(grep -rlE "$RETIRED_WORKFLOW_VARS" .github/workflows/*.yaml 2>/dev/null || true)"
+if [ -z "$RETIRED_VARS_HITS" ]; then
+  pass "Phase 11 1: no active workflow references vars.AWS_REGION/ACCOUNT_ID_DEV/AWS_CLUSTER_NAME/AWS_CLUSTER_ARN/EKS_DEPLOY_ROLE_ARN/GOLDENGATE_AWS_ROLE_ARN -- environment identity is loaded from envs/<environment>/environment.yaml, never a repository variable"
+else
+  fail "Phase 11 1: a retired repository-variable environment-identity reference remains in:"$'\n'"${RETIRED_VARS_HITS}"
+fi
+
+# 2: no active workflow independently hardcodes the real current workload/build account ID, ECR registry, or EKS cluster name as runtime identity. gg-iam-secrets-deployment.yaml's region bootstrap selector (Phase 12) is checked separately below, never lumped in here.
+WORKFLOW_HARDCODE_HITS="$(grep -rlE '668311715351|229410149234|gg-poc-dev|[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com' .github/workflows/*.yaml 2>/dev/null \
+  | grep -vF '.github/workflows/gg-iam-secrets-deployment.yaml' \
+  || true)"
+if [ -z "$WORKFLOW_HARDCODE_HITS" ]; then
+  pass "Phase 11 2: no active workflow independently hardcodes the real workload/build account ID, ECR registry, or EKS cluster name -- every reference is loaded from envs/<environment>/environment.yaml via hack/goldengate-environment.py github-env"
+else
+  fail "Phase 11 2: an active workflow independently hardcodes production account/registry/cluster identity:"$'\n'"${WORKFLOW_HARDCODE_HITS}"
+fi
+
+# 2b: gg-iam-secrets-deployment.yaml itself carries no account/registry/cluster identity literal either -- only its bootstrap region *selector* (Phase 12's known, documented exception) may exist, verified as bootstrap metadata by check 3 below.
+GG_IAM_HARDCODE_HITS="$(grep -nE '668311715351|229410149234|gg-poc-dev|[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com' .github/workflows/gg-iam-secrets-deployment.yaml 2>/dev/null || true)"
+if [ -z "$GG_IAM_HARDCODE_HITS" ]; then
+  pass "Phase 11 2b: gg-iam-secrets-deployment.yaml contains no hardcoded account/registry/cluster-name identity literal"
+else
+  fail "Phase 11 2b: gg-iam-secrets-deployment.yaml unexpectedly hardcodes account/registry/cluster identity:"$'\n'"${GG_IAM_HARDCODE_HITS}"
+fi
+
+# 3: the only remaining "eu-west-1" text in any active workflow is gg-iam-secrets-deployment.yaml's documented Phase-12 region bootstrap selector option, evaluated by GitHub before checkout -- never a second runtime identity source.
+REGION_LITERAL_HITS="$(grep -rl 'eu-west-1' .github/workflows/*.yaml 2>/dev/null || true)"
+if [ "$REGION_LITERAL_HITS" = ".github/workflows/gg-iam-secrets-deployment.yaml" ] \
+    && grep -qF '          - eu-west-1' .github/workflows/gg-iam-secrets-deployment.yaml 2>/dev/null; then
+  pass "Phase 11 3: the sole remaining 'eu-west-1' text in active workflows is gg-iam-secrets-deployment.yaml's documented Phase-12 region bootstrap selector option, not an independent runtime identity source"
+elif [ -z "$REGION_LITERAL_HITS" ]; then
+  pass "Phase 11 3: no active workflow references 'eu-west-1' as a literal"
+else
+  fail "Phase 11 3: an unexpected 'eu-west-1' literal exists outside the documented Phase-12 gg-iam-secrets-deployment.yaml bootstrap selector:"$'\n'"${REGION_LITERAL_HITS}"
+fi
+
+# 4: no active workflow independently hardcodes a full generated IAM role ARN (arn:aws:iam::<12-digit>:role/...) as runtime identity -- every role ARN comes from the canonical resolver's github-env output.
+ROLE_ARN_LITERAL_HITS="$(grep -rlE 'arn:aws:iam::[0-9]{12}:role/' .github/workflows/*.yaml 2>/dev/null || true)"
+if [ -z "$ROLE_ARN_LITERAL_HITS" ]; then
+  pass "Phase 11 4: no active workflow independently hardcodes a full IAM role ARN literal -- every role ARN (RUNNER_ROLE_ARN/EKS_DEPLOY_ROLE_ARN/RUNTIME_ROLE_ARN/MONITOR_ROLE_ARN/ARGOCD_ECR_READ_ROLE_ARN/PLATFORM_LOGGING_ROLE_ARN/CLOUDWATCH_METRICS_ROLE_ARN/ECR_SYNC_ROLE_ARN) is loaded from the canonical resolver"
+else
+  fail "Phase 11 4: an active workflow independently hardcodes a full IAM role ARN literal:"$'\n'"${ROLE_ARN_LITERAL_HITS}"
+fi
+
+# 5: every active workflow that needs canonical identity loads it via hack/goldengate-environment.py github-env after its own checkout -- GITHUB_ENV is job-local, so no job may assume another job's load already ran. gg-iam-secrets-deployment.yaml is excluded: its Phase-12-pending interface derives AWS_REGION via a plain `get` call, not github-env.
+MISSING_LOADER_HITS=""
+for wf in goldengate-eks-app.yaml argocd-eks-deployment.yaml goldengate-platform.yaml goldengate-monitor.yaml goldengate-monitor-metrics-config.yaml goldengate-observability.yaml cloudwatch-observability-artifact-sync.yaml push_docker_images_to_ECR.yaml; do
+  if ! grep -q 'goldengate-environment.py --environment .* github-env' ".github/workflows/${wf}" 2>/dev/null; then
+    MISSING_LOADER_HITS="${MISSING_LOADER_HITS}${wf}"$'\n'
+  fi
+done
+if [ -z "$MISSING_LOADER_HITS" ]; then
+  pass "Phase 11 5: every active workflow that needs canonical identity calls hack/goldengate-environment.py github-env at least once"
+else
+  fail "Phase 11 5: the following workflow(s) no longer call hack/goldengate-environment.py github-env:"$'\n'"${MISSING_LOADER_HITS}"
+fi
+
+# 6: only the approved repository variables remain referenced across active workflows -- PROJECT_NAME_DEV (pre-checkout CodeBuild runs-on) plus the operational vars this phase explicitly keeps.
+APPROVED_VARS_RE='PROJECT_NAME_DEV|FLUENT_BIT_IMAGE|MONITOR_BASE_IMAGE|ENABLE_TEMP_ARGOCD_ECR_PASSWORD_INJECTION'
+UNAPPROVED_VARS_HITS="$(grep -rohE 'vars\.[A-Za-z_]+' .github/workflows/*.yaml 2>/dev/null | sort -u | grep -vE "^vars\.(${APPROVED_VARS_RE})\$" || true)"
+if [ -z "$UNAPPROVED_VARS_HITS" ]; then
+  pass "Phase 11 6: only the approved repository variables (PROJECT_NAME_DEV, FLUENT_BIT_IMAGE, MONITOR_BASE_IMAGE, ENABLE_TEMP_ARGOCD_ECR_PASSWORD_INJECTION) remain referenced across active workflows"
+else
+  fail "Phase 11 6: an unapproved repository variable remains referenced in active workflows:"$'\n'"${UNAPPROVED_VARS_HITS}"
 fi
 
 echo ""

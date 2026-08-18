@@ -24,37 +24,19 @@ permissions:
   id-token: write
   contents: read
 
+# Environment identity is loaded via hack/goldengate-environment.py github-env after checkout, never duplicated here.
 env:
-  AWS_REGION: eu-west-1
-  ECR_ACCOUNT_ID: "229410149234"
-  ECR_REGISTRY: 229410149234.dkr.ecr.eu-west-1.amazonaws.com
-
-  # Same build/ECR-account role used by goldengate-platform.yaml and cloudwatch-observability-artifact-sync.yaml.
-  ROLE_ARN: ${{ vars.GOLDENGATE_AWS_ROLE_ARN }}
-
-  # Same cross-account deploy-role pattern used by every other deployment workflow in this repository.
-  EKS_WORKLOAD_ACCOUNT_ID: "668311715351"
-  EKS_CLUSTER_NAME: ${{ vars.AWS_CLUSTER_NAME }}
-  EKS_CLUSTER_ARN: ${{ vars.AWS_CLUSTER_ARN }}
-  EKS_DEPLOY_ROLE_ARN: ${{ vars.EKS_DEPLOY_ROLE_ARN }}
-
-  # Least-privilege IRSA role for the CloudWatch Agent ServiceAccount only (system:serviceaccount:amazon-cloudwatch:cloudwatch-agent).
-  CW_METRICS_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateCloudWatchMetricsRole-dev
-
   # Pinned private chart (Phase 6B1). Never the public chart, never "latest".
   HELM_OCI_NAMESPACE: helm
   CHART_NAME: amazon-cloudwatch-observability
   CHART_VERSION: "6.2.0"
   CHART_ECR_REPOSITORY: helm/amazon-cloudwatch-observability
-  VALUES_FILE: platform/dev/goldengate-observability/values.yaml
 
   RELEASE_NAME: amazon-cloudwatch-observability
-  ARGOCD_NAMESPACE: argocd
   ARGOCD_APP_NAME: goldengate-observability
-  TARGET_NAMESPACE: amazon-cloudwatch
   ARGOCD_OBSERVABILITY_SECRET_NAME: argocd-ecr-amazon-cloudwatch-observability-oci
 
-  # ServiceAccount the IRSA role above is exclusively for; annotated via kubectl (see step below) rather than a Helm value.
+  # ServiceAccount the CLOUDWATCH_METRICS_ROLE_ARN IRSA role is exclusively for; annotated via kubectl (see step below) rather than a Helm value.
   CLOUDWATCH_AGENT_SERVICE_ACCOUNT: cloudwatch-agent
 
   WORKDIR: work
@@ -84,11 +66,15 @@ jobs:
           python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" validate
           python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" github-env >> "$GITHUB_ENV"
 
+          # VALUES_FILE/TARGET_NAMESPACE are derived from the canonical GG_ENVIRONMENT/OBSERVABILITY_NAMESPACE, never independent literals.
+          echo "VALUES_FILE=platform/${{ inputs.environment }}/goldengate-observability/values.yaml" >> "$GITHUB_ENV"
+          echo "TARGET_NAMESPACE=$(python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" get OBSERVABILITY_NAMESPACE)" >> "$GITHUB_ENV"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
-          role-to-assume: ${{ env.ROLE_ARN }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
 
       - name: Install or validate required tools
         shell: bash
@@ -495,12 +481,6 @@ jobs:
 
           print("OK: generated values file passes every semantic check.")
           PYEOF
-
-          if [ "$CW_METRICS_ROLE_ARN" != "$CLOUDWATCH_METRICS_ROLE_ARN" ]; then
-            echo "FAIL: workflow CW_METRICS_ROLE_ARN (${CW_METRICS_ROLE_ARN}) does not match the canonical CLOUDWATCH_METRICS_ROLE_ARN (${CLOUDWATCH_METRICS_ROLE_ARN})."
-            exit 1
-          fi
-          echo "OK: workflow CW_METRICS_ROLE_ARN matches the canonical CLOUDWATCH_METRICS_ROLE_ARN exactly (applied via kubectl annotate -- see the deploy-guarded section)."
 
       - name: Render the private chart locally
         shell: bash
@@ -1322,15 +1302,15 @@ jobs:
           kubectl get serviceaccount "$CLOUDWATCH_AGENT_SERVICE_ACCOUNT" -n "$TARGET_NAMESPACE" >/dev/null
 
           kubectl annotate serviceaccount "$CLOUDWATCH_AGENT_SERVICE_ACCOUNT" -n "$TARGET_NAMESPACE" \
-            "eks.amazonaws.com/role-arn=${CW_METRICS_ROLE_ARN}" \
+            "eks.amazonaws.com/role-arn=${CLOUDWATCH_METRICS_ROLE_ARN}" \
             --overwrite
 
           ACTUAL_ROLE_ARN="$(kubectl get serviceaccount "$CLOUDWATCH_AGENT_SERVICE_ACCOUNT" -n "$TARGET_NAMESPACE" -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}')"
-          if [ "$ACTUAL_ROLE_ARN" != "$CW_METRICS_ROLE_ARN" ]; then
-            echo "FAIL: ServiceAccount ${CLOUDWATCH_AGENT_SERVICE_ACCOUNT} role-arn annotation is ${ACTUAL_ROLE_ARN}, expected ${CW_METRICS_ROLE_ARN}."
+          if [ "$ACTUAL_ROLE_ARN" != "$CLOUDWATCH_METRICS_ROLE_ARN" ]; then
+            echo "FAIL: ServiceAccount ${CLOUDWATCH_AGENT_SERVICE_ACCOUNT} role-arn annotation is ${ACTUAL_ROLE_ARN}, expected ${CLOUDWATCH_METRICS_ROLE_ARN}."
             exit 1
           fi
-          echo "OK: ServiceAccount ${TARGET_NAMESPACE}/${CLOUDWATCH_AGENT_SERVICE_ACCOUNT} annotated with ${CW_METRICS_ROLE_ARN}."
+          echo "OK: ServiceAccount ${TARGET_NAMESPACE}/${CLOUDWATCH_AGENT_SERVICE_ACCOUNT} annotated with ${CLOUDWATCH_METRICS_ROLE_ARN}."
 
           # Restart workloads using this ServiceAccount so existing pods pick up the projected IRSA token volume.
           if kubectl get daemonset cloudwatch-agent -n "$TARGET_NAMESPACE" >/dev/null 2>&1; then
@@ -1755,7 +1735,7 @@ jobs:
           echo ""
           echo "2. CloudWatch Agent ServiceAccount annotation:"
           ROLE_ARN_ANNOTATION="$(kubectl get serviceaccount "$CLOUDWATCH_AGENT_SERVICE_ACCOUNT" -n "$TARGET_NAMESPACE" -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}')"
-          if [ "$ROLE_ARN_ANNOTATION" != "$CW_METRICS_ROLE_ARN" ]; then
+          if [ "$ROLE_ARN_ANNOTATION" != "$CLOUDWATCH_METRICS_ROLE_ARN" ]; then
             echo "FAIL: unexpected role-arn annotation: ${ROLE_ARN_ANNOTATION}"
             exit 1
           fi

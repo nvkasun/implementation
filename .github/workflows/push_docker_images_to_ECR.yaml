@@ -4,6 +4,14 @@ run-name: 'Cloud Factory - Image Sync Pipeline ran by ${{ github.actor }}'
 on:
   workflow_dispatch:
     inputs:
+      environment:
+        description: "Deployment environment"
+        required: true
+        type: choice
+        default: dev
+        options:
+          - dev
+
       source_url:
         description: 'Source container image reference to pull (example: public.ecr.aws/lambda/python:3.11.2026.06.15.10-x86_64)'
         required: true
@@ -22,28 +30,31 @@ permissions:
   id-token: write
   contents: read
 
-env:
-  AWS_REGION: eu-west-1
-  ACCOUNT_ID: 229410149234
-  ROLE_ARN: arn:aws:iam::229410149234:role/adcb-modelmonitoring-sit-codep-rDeployCodeBuildRole-KMCFNIKqpuUL
-  ECR_REGISTRY: 229410149234.dkr.ecr.eu-west-1.amazonaws.com
-
-  # EKS workload account that needs runtime image pull access.
-  EKS_PULL_ACCOUNT_ID: 668311715351
-
 jobs:
   sync_image_to_ecr:
     runs-on: ubuntu-latest
+
+    environment: ${{ inputs.environment }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Load resolved environment config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # ubuntu-latest does not guarantee PyYAML; install it explicitly rather than assume it, same as elsewhere in this repo.
+          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
+          python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" validate
+          python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" github-env >> "$GITHUB_ENV"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
-          role-to-assume: ${{ env.ROLE_ARN }}
+          role-to-assume: ${{ env.ECR_SYNC_ROLE_ARN }}
 
       - name: Login to Amazon ECR
         id: login-ecr
@@ -107,7 +118,7 @@ jobs:
             aws ecr create-repository \
               --region "$AWS_REGION" \
               --repository-name "$REPOSITORY" \
-              --tags Key=ApplicationName,Value=CloudFactory Key=DataClassification,Value=General Key=BusinessCriticality,Value=Low Key=BusinessUnit,Value=TechnologyPlatform Key=CostCenter,Value=219 \
+              --tags "Key=ApplicationName,Value=${TAG_APPLICATION_NAME}" "Key=DataClassification,Value=${TAG_DATA_CLASSIFICATION}" "Key=BusinessCriticality,Value=${TAG_BUSINESS_CRITICALITY}" "Key=BusinessUnit,Value=${TAG_BUSINESS_UNIT}" "Key=CostCenter,Value=${TAG_COST_CENTER}" \
               --image-scanning-configuration scanOnPush=true \
               --image-tag-mutability MUTABLE >/dev/null
           fi
@@ -118,7 +129,7 @@ jobs:
           set -euo pipefail
 
           REPOSITORY='${{ steps.prep.outputs.target_image }}'
-          EKS_PULL_PRINCIPAL="arn:aws:iam::${EKS_PULL_ACCOUNT_ID}:root"
+          EKS_PULL_PRINCIPAL="arn:aws:iam::${WORKLOAD_ACCOUNT_ID}:root"
           POLICY_SID="AllowEksDevAccountPull"
 
           echo "Applying ECR pull policy to repository: $REPOSITORY"
@@ -212,5 +223,5 @@ jobs:
             echo "- Target image: ${{ steps.prep.outputs.target_image }}"
             echo "- Target tag: ${{ steps.prep.outputs.target_tag }}"
             echo "- Target ECR URI: ${{ steps.prep.outputs.destination_image }}"
-            echo "- EKS pull account allowed: ${EKS_PULL_ACCOUNT_ID}"
+            echo "- EKS pull account allowed: ${WORKLOAD_ACCOUNT_ID}"
           } >> "$GITHUB_STEP_SUMMARY"

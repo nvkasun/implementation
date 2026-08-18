@@ -33,51 +33,20 @@ permissions:
   id-token: write
   contents: read
 
+# Environment identity is loaded via hack/goldengate-environment.py github-env after checkout, never duplicated here.
 env:
-  AWS_REGION: ${{ vars.AWS_REGION }}
-
-  # ECR / runner account where the platform Helm OCI chart is pushed.
-  ECR_ACCOUNT_ID: "229410149234"
-  ECR_REGISTRY: 229410149234.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com
-
-  # Role used by GitHub Actions / CodeBuild runner.
-  ROLE_ARN: ${{ vars.GOLDENGATE_AWS_ROLE_ARN }}
-
-  # Target EKS cluster details.
-  EKS_ACCOUNT_ID: ${{ vars.ACCOUNT_ID_DEV }}
-  EKS_CLUSTER_NAME: ${{ vars.AWS_CLUSTER_NAME }}
-  EKS_CLUSTER_ARN: ${{ vars.AWS_CLUSTER_ARN }}
-  EKS_DEPLOY_ROLE_ARN: ${{ vars.EKS_DEPLOY_ROLE_ARN }}
-
-  # IRSA role the in-cluster argocd-ecr-token-sync CronJob assumes to pull this Helm OCI chart; role/trust policy/ServiceAccount are unchanged by this workflow -- see envs/dev/policies/argocd-ecr-oci-read-dev/.
-  ARGOCD_ECR_READ_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateArgocdECRRead-dev
-
   HELM_OCI_NAMESPACE: helm
   CHART_NAME: goldengate-platform
   HELM_CHART_PATH: helm/goldengate-platform
-  ENVIRONMENT: dev
-  VALUES_FILE: platform/dev/goldengate-platform/values.yaml
-
-  RELEASE_NAME: goldengate-dev-platform
-  ARGOCD_NAMESPACE: argocd
-  ARGOCD_APP_NAME: goldengate-dev-platform
   ARGOCD_PLATFORM_SECRET_NAME: argocd-ecr-goldengate-platform-oci
 
-  # The single shared runtime ServiceAccount (RUNTIME_SA_NAME) lives in this namespace; this chart is its sole owner, never an individual GoldenGate runtime release.
-  RUNTIME_NAMESPACE: goldengate-dev
-
-  # The second namespace the Fluent Bit DaemonSet ships logs from (the shared monitor's namespace, owned by helm/goldengate-monitor, never created/altered by this chart).
-  MONITOR_NAMESPACE: goldengate-monitoring
-
-  # Every GoldenGate runtime pod (regardless of deployment type) shares this ONE ServiceAccount and IAM role (also used by the shared monitor; trust policy at envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json) -- the restored stable runtime identity boundary, never a per-engine identity. This ARN is a literal predicted value since this repository has no Terraform outputs.tf.
+  # The single shared runtime ServiceAccount (RUNTIME_SA_NAME) lives in the canonical RUNTIME_NAMESPACE; this chart is its sole owner, never an individual GoldenGate runtime release.
   RUNTIME_SA_NAME: gg-runtime-sa
-  RUNTIME_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev
 
   FLUENT_BIT_SA_NAME: gg-fluent-bit
 
-  # Private, immutable digest-pinned Fluent Bit image; the AWS-published image is pre-mirrored into this account's ECR outside this workflow, which only reads and verifies the digest.
+  # Private, immutable digest-pinned Fluent Bit image; the AWS-published image is pre-mirrored into this account's ECR outside this workflow, which only reads and verifies the digest against the canonical ECR_REGISTRY.
   FLUENT_BIT_ECR_REPOSITORY_EXPECTED: aws-cloud-factory-fluent-bit
-  FLUENT_BIT_IMAGE_PREFIX_EXPECTED: "229410149234.dkr.ecr.eu-west-1.amazonaws.com/aws-cloud-factory-fluent-bit@"
 
 concurrency:
   group: goldengate-platform-deploy-${{ github.ref }}
@@ -90,7 +59,7 @@ jobs:
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
-    environment: dev
+    environment: ${{ inputs.environment }}
 
     steps:
       - name: Checkout repository
@@ -108,7 +77,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
-          role-to-assume: ${{ env.ROLE_ARN }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
 
       - name: Install Helm and kubectl if missing
         shell: bash
@@ -168,7 +137,9 @@ jobs:
           fi
 
           # Exact private, immutable digest reference only -- no tag suffix, no public.ecr.aws, no other registry or repository.
-          EXPECTED_PATTERN='^229410149234\.dkr\.ecr\.eu-west-1\.amazonaws\.com/aws-cloud-factory-fluent-bit@sha256:[a-f0-9]{64}$'
+          # The expected registry/repository prefix is derived from the canonical ECR_REGISTRY/FLUENT_BIT_ECR_REPOSITORY_EXPECTED, never a second hardcoded account/region.
+          EXPECTED_PREFIX="${ECR_REGISTRY}/${FLUENT_BIT_ECR_REPOSITORY_EXPECTED}@sha256:"
+          EXPECTED_PATTERN="^$(printf '%s' "$EXPECTED_PREFIX" | sed -E 's/[.[\*^$()+?{|]/\\&/g')[a-f0-9]{64}\$"
           if ! [[ "$FLUENT_BIT_IMAGE" =~ $EXPECTED_PATTERN ]]; then
             echo "FAIL: FLUENT_BIT_IMAGE does not match the required private immutable digest format."
             echo "Expected pattern: ${EXPECTED_PATTERN}"
@@ -247,14 +218,25 @@ jobs:
           HELM_PUSH_URL="oci://${ECR_REGISTRY}/${HELM_OCI_NAMESPACE}"
           HELM_CHART_REF="oci://${ECR_REGISTRY}/${HELM_ECR_REPOSITORY}"
 
+          # Derived from the canonical GG_ENVIRONMENT (already loaded above) -- never independently maintained per-environment literals.
+          VALUES_FILE="platform/${GG_ENVIRONMENT}/goldengate-platform/values.yaml"
+          RELEASE_NAME="goldengate-${GG_ENVIRONMENT}-platform"
+          ARGOCD_APP_NAME="goldengate-${GG_ENVIRONMENT}-platform"
+
           echo "CHART_VERSION=${CHART_VERSION}" >> "$GITHUB_ENV"
           echo "TEMP_CHART_PATH=${TEMP_CHART_PATH}" >> "$GITHUB_ENV"
           echo "HELM_ECR_REPOSITORY=${HELM_ECR_REPOSITORY}" >> "$GITHUB_ENV"
           echo "HELM_PUSH_URL=${HELM_PUSH_URL}" >> "$GITHUB_ENV"
           echo "HELM_CHART_REF=${HELM_CHART_REF}" >> "$GITHUB_ENV"
+          echo "VALUES_FILE=${VALUES_FILE}" >> "$GITHUB_ENV"
+          echo "RELEASE_NAME=${RELEASE_NAME}" >> "$GITHUB_ENV"
+          echo "ARGOCD_APP_NAME=${ARGOCD_APP_NAME}" >> "$GITHUB_ENV"
 
           echo "Chart version: ${CHART_VERSION}"
           echo "Helm chart ref: ${HELM_CHART_REF}"
+          echo "Values file: ${VALUES_FILE}"
+          echo "Release name: ${RELEASE_NAME}"
+          echo "Argo CD Application: ${ARGOCD_APP_NAME}"
 
       - name: Validate required files
         shell: bash

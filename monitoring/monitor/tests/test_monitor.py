@@ -3034,7 +3034,9 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         preflight_idx = self.monitor_text.index("- name: CloudWatch publication preflight")
         argocd_idx = self.monitor_text.index("- name: Create or update Argo CD Application")
         preflight_step_text = self.monitor_text[preflight_idx:argocd_idx]
-        self.assertIn("work/generated/dev/goldengate-deployments.yaml", preflight_step_text)
+        # GENERATED_REGISTRY_PATH is the canonical per-environment registry path (Phase 11), never a hardcoded envs/dev literal.
+        self.assertIn("${GENERATED_REGISTRY_PATH}", preflight_step_text)
+        self.assertNotIn("work/generated/dev/goldengate-deployments.yaml", preflight_step_text)
         self.assertNotIn("gg-oracle-payments-01", preflight_step_text)
         self.assertNotIn("gg-postgresql-payments-01", preflight_step_text)
 

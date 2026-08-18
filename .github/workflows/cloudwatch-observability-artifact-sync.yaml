@@ -4,32 +4,28 @@ run-name: "Cloud Factory - CloudWatch Observability artifact sync (Phase 6B1) ra
 
 # Supply-chain mirroring/verification only (no kubectl/helm install/Argo CD/Terraform); manual dispatch only, no push trigger.
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Deployment environment"
+        required: true
+        type: choice
+        default: dev
+        options:
+          - dev
 
 permissions:
   id-token: write
   contents: read
 
+# Environment identity is loaded via hack/goldengate-environment.py github-env after checkout, never duplicated here.
 env:
-  AWS_REGION: eu-west-1
-  ECR_ACCOUNT_ID: "229410149234"
-  ECR_REGISTRY: 229410149234.dkr.ecr.eu-west-1.amazonaws.com
-
-  ROLE_ARN: arn:aws:iam::229410149234:role/adcb-modelmonitoring-sit-codep-rDeployCodeBuildRole-KMCFNIKqpuUL  # same role as push_docker_images_to_ECR.yaml
-
-  # EKS_WORKLOAD_ACCOUNT_ID gets pull access only to the four mirrored image repos, never to the chart repo (that gets ARGOCD_ECR_READ_ROLE_ARN below).
-  EKS_WORKLOAD_ACCOUNT_ID: "668311715351"
-  ARGOCD_ECR_READ_ROLE_ARN: arn:aws:iam::668311715351:role/GoldenGateArgocdECRRead-dev
-
   UPSTREAM_CHART_REPO_NAME: aws-observability  # pinned version below; never "latest"
   UPSTREAM_CHART_REPO_URL: https://aws-observability.github.io/helm-charts
   CHART_NAME: amazon-cloudwatch-observability
   CHART_VERSION: "6.2.0"
   HELM_OCI_NAMESPACE: helm
   CHART_ECR_REPOSITORY: helm/amazon-cloudwatch-observability
-
-  RENDER_CLUSTER_NAME: gg-poc-dev  # rendering input only for the validation-values template; helm template never contacts a cluster
-  RENDER_REGION: eu-west-1
 
   WORKDIR: work
 
@@ -43,15 +39,27 @@ jobs:
 
     runs-on: ubuntu-latest  # not the private CodeBuild runner: needs outbound internet to the public Helm repo and public.ecr.aws/registry.k8s.io/quay.io
 
+    environment: ${{ inputs.environment }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Load resolved environment config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # ubuntu-latest does not guarantee PyYAML; install it explicitly rather than assume it, same as elsewhere in this repo.
+          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
+          python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" validate
+          python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" github-env >> "$GITHUB_ENV"
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
-          role-to-assume: ${{ env.ROLE_ARN }}
+          role-to-assume: ${{ env.ECR_SYNC_ROLE_ARN }}
 
       - name: Fail closed unless the AWS caller account is the approved private ECR account
         shell: bash
@@ -168,8 +176,8 @@ jobs:
 
           # Validation only, never deployed: renders the metrics-only config used by the rendered-image-set check below (Fluent Bit stays the sole log collector).
           cat > "${WORKDIR}/validate-values.yaml" <<EOF
-          clusterName: ${RENDER_CLUSTER_NAME}
-          region: ${RENDER_REGION}
+          clusterName: ${EKS_CLUSTER_NAME}
+          region: ${AWS_REGION}
 
           containerLogs:
             enabled: false
@@ -314,7 +322,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          EKS_PULL_PRINCIPAL="arn:aws:iam::${EKS_WORKLOAD_ACCOUNT_ID}:root"
+          EKS_PULL_PRINCIPAL="arn:aws:iam::${WORKLOAD_ACCOUNT_ID}:root"
           POLICY_SID="AllowEksWorkloadAccountPullCloudwatchObservabilityImages"
 
           apply_pull_policy() {

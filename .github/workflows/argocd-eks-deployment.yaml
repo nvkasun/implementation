@@ -17,30 +17,13 @@ permissions:
   id-token: write
   contents: read
 
+# Environment identity is loaded via hack/goldengate-environment.py github-env after checkout, never duplicated here.
 env:
-  AWS_REGION: ${{ vars.AWS_REGION }}
-
-  # ECR / runner account where Helm OCI chart and runtime images live.
-  ECR_ACCOUNT_ID: "229410149234"
-  ECR_REGISTRY: 229410149234.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com
-
-  # Reuses the GoldenGate deployment workflow's runner role (already has ECR + EKS access) instead of provisioning a second IAM role.
-  ROLE_ARN: ${{ vars.GOLDENGATE_AWS_ROLE_ARN }}
-
-  # Target EKS cluster details (same private dev/test cluster as GoldenGate).
-  EKS_ACCOUNT_ID: ${{ vars.ACCOUNT_ID_DEV }}
-  EKS_CLUSTER_NAME: ${{ vars.AWS_CLUSTER_NAME }}
-  EKS_CLUSTER_ARN: ${{ vars.AWS_CLUSTER_ARN }}
-
-  # Optional. Add this repo variable later only if cross-account EKS auth fails.
-  EKS_DEPLOY_ROLE_ARN: ${{ vars.EKS_DEPLOY_ROLE_ARN }}
-
   HELM_OCI_NAMESPACE: helm
   CHART_NAME: argocd
   HELM_CHART_PATH: helm/argocd
   ENVS_ROOT: envs
 
-  ARGOCD_NAMESPACE: argocd
   ARGOCD_RELEASE_NAME: argocd
 
 concurrency:
@@ -71,7 +54,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
-          role-to-assume: ${{ env.ROLE_ARN }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
 
       - name: Install Helm and kubectl if missing
         shell: bash
@@ -144,11 +127,11 @@ jobs:
           helm version --short
           kubectl version --client=true
 
-          echo "Repository variable summary:"
+          echo "Resolved environment identity summary:"
           echo "AWS_REGION=${AWS_REGION}"
           echo "ECR_ACCOUNT_ID=${ECR_ACCOUNT_ID}"
           echo "ECR_REGISTRY=${ECR_REGISTRY}"
-          echo "EKS_ACCOUNT_ID=${EKS_ACCOUNT_ID}"
+          echo "WORKLOAD_ACCOUNT_ID=${WORKLOAD_ACCOUNT_ID}"
           echo "EKS_CLUSTER_NAME=${EKS_CLUSTER_NAME}"
           echo "EKS_CLUSTER_ARN=${EKS_CLUSTER_ARN}"
 
@@ -247,11 +230,11 @@ jobs:
             exit 1
           fi
 
-          python3 - "$POLICY_FILE" <<'PYEOF'
+          python3 - "$POLICY_FILE" "$AWS_REGION" "$ECR_ACCOUNT_ID" <<'PYEOF'
           import json
           import sys
 
-          policy_file = sys.argv[1]
+          policy_file, region, ecr_account_id = sys.argv[1:4]
           with open(policy_file) as f:
               policy = json.load(f)
 
@@ -262,11 +245,15 @@ jobs:
               "ecr:DescribeImages",
               "ecr:DescribeRepositories",
           }
+          # Derived from the canonical AWS_REGION/ECR_ACCOUNT_ID (never a second hardcoded account/region) plus the application's own repository names.
           expected_repos = {
-              "helm/goldengate": "arn:aws:ecr:eu-west-1:229410149234:repository/helm/goldengate",
-              "helm/goldengate-monitor": "arn:aws:ecr:eu-west-1:229410149234:repository/helm/goldengate-monitor",
-              "helm/goldengate-platform": "arn:aws:ecr:eu-west-1:229410149234:repository/helm/goldengate-platform",
-              "helm/amazon-cloudwatch-observability": "arn:aws:ecr:eu-west-1:229410149234:repository/helm/amazon-cloudwatch-observability",
+              name: f"arn:aws:ecr:{region}:{ecr_account_id}:repository/{name}"
+              for name in (
+                  "helm/goldengate",
+                  "helm/goldengate-monitor",
+                  "helm/goldengate-platform",
+                  "helm/amazon-cloudwatch-observability",
+              )
           }
 
           statements = policy.get("Statement", [])
@@ -564,7 +551,7 @@ jobs:
 
           echo "Target EKS cluster name: ${EKS_CLUSTER_NAME}"
           echo "Target EKS cluster ARN: ${EKS_CLUSTER_ARN}"
-          echo "Target EKS account ID: ${EKS_ACCOUNT_ID}"
+          echo "Target EKS account ID: ${WORKLOAD_ACCOUNT_ID}"
           echo "Current AWS identity:"
           aws sts get-caller-identity
 
