@@ -45,8 +45,10 @@ runtime:
     enabled: true
 {csi_role_arn_block}    admin:
       enabled: true
+      mountPath: /mnt/secrets-store/admin
 {csi_admin_object_name_block}    certificate:
       enabled: true
+      mountPath: /etc/nginx/cert
 {csi_certificate_object_name_block}
 ingress:
   enabled: true
@@ -190,7 +192,7 @@ def default_source_doc(environment, pipeline, target_id):
             "deploymentType": "postgresql",
             "containerName": "ogg-postgresql",
             "image": {"repositoryName": "ogg-postgresql", "tag": "23.26.2.0.1"},
-            "csi": {"enabled": True, "admin": {"enabled": True}, "certificate": {"enabled": True}},
+            "csi": {"enabled": True, "admin": {"enabled": True, "mountPath": "/mnt/secrets-store/admin"}, "certificate": {"enabled": True, "mountPath": "/etc/nginx/cert"}},
         },
         "ingress": {"enabled": True},
         "replication": {
@@ -223,7 +225,7 @@ def default_target_doc(environment, pipeline):
             "deploymentType": "mssql",
             "containerName": "ogg-sqlserver",
             "image": {"repositoryName": "ogg-sqlserver", "tag": "23.26.2.0.1"},
-            "csi": {"enabled": True, "admin": {"enabled": True}, "certificate": {"enabled": True}},
+            "csi": {"enabled": True, "admin": {"enabled": True, "mountPath": "/mnt/secrets-store/admin"}, "certificate": {"enabled": True, "mountPath": "/etc/nginx/cert"}},
         },
         "ingress": {"enabled": True},
         "replication": {
@@ -254,7 +256,7 @@ def _efs_test_doc(environment="dev", persistence=None):
             "deploymentType": "oracle",
             "containerName": "ogg-oracle",
             "image": {"repositoryName": "ogg-oracle", "tag": "1.0.0"},
-            "csi": {"enabled": True, "admin": {"enabled": True}, "certificate": {"enabled": True}},
+            "csi": {"enabled": True, "admin": {"enabled": True, "mountPath": "/mnt/secrets-store/admin"}, "certificate": {"enabled": True, "mountPath": "/etc/nginx/cert"}},
             "storage": {"u02": {"type": "efs"}},
         },
         "ingress": {"enabled": True},
@@ -1477,7 +1479,7 @@ def _minimal_shape_doc(runtime_overrides=None, ingress_overrides=None):
             "deploymentType": "oracle",
             "containerName": "ogg-oracle",
             "image": {"repositoryName": "ogg-oracle", "tag": "1.0.0"},
-            "csi": {"enabled": True, "admin": {"enabled": True}, "certificate": {"enabled": True}},
+            "csi": {"enabled": True, "admin": {"enabled": True, "mountPath": "/mnt/secrets-store/admin"}, "certificate": {"enabled": True, "mountPath": "/etc/nginx/cert"}},
         },
         "ingress": {"enabled": True},
     }
@@ -1559,6 +1561,84 @@ class ExtendedRuntimeShapeFieldsTests(ScratchEnvironmentTestCase):
             self.assertIsInstance(d["initPermissionsEnabled"], bool)
             self.assertIsInstance(d["ingressEnabled"], bool)
             self.assertTrue(d["ingressClassName"])
+            self.assertEqual(d["u02Type"], "efs")
+            self.assertTrue(d["csiEnabled"])
+            self.assertTrue(d["csiAdminEnabled"])
+            self.assertEqual(d["csiAdminMountPath"], "/mnt/secrets-store/admin")
+            self.assertTrue(d["csiCertificateEnabled"])
+            self.assertEqual(d["csiCertificateMountPath"], "/etc/nginx/cert")
+            self.assertEqual(d["extraVolumeNames"], [])
+            self.assertEqual(d["extraVolumeMountNames"], [])
+
+
+class CsiAndStorageFieldsTests(ScratchEnvironmentTestCase):
+    """Phase B3A closeout: u02Type/csiEnabled/csiAdminEnabled/csiAdminMountPath/csiCertificateEnabled/csiCertificateMountPath/extraVolumeNames/extraVolumeMountNames -- the minimum stable fields hack/orchestration/runtime_acceptance.py needs to verify the StatefulSet pod actually consumes the correct storage/secret volumes, never a second descriptor schema."""
+
+    def _describe(self, deployment_id, doc):
+        write_doc(self._tmp.name, "dev", deployment_id, doc)
+        active, inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        by_id = {d["deploymentId"]: d for d in active + inactive}
+        return by_id[deployment_id]
+
+    def test_defaults_when_csi_disabled(self):
+        doc = _minimal_shape_doc(runtime_overrides={"csi": {"enabled": False, "admin": {"enabled": False}, "certificate": {"enabled": False}}})
+        d = self._describe("gg-csi-01", doc)
+        self.assertFalse(d["csiEnabled"])
+        self.assertFalse(d["csiAdminEnabled"])
+        self.assertIsNone(d["csiAdminMountPath"])
+        self.assertFalse(d["csiCertificateEnabled"])
+        self.assertIsNone(d["csiCertificateMountPath"])
+
+    def test_csi_enabled_reflects_exact_mount_paths(self):
+        d = self._describe("gg-csi-02", _minimal_shape_doc())
+        self.assertTrue(d["csiEnabled"])
+        self.assertTrue(d["csiAdminEnabled"])
+        self.assertEqual(d["csiAdminMountPath"], "/mnt/secrets-store/admin")
+        self.assertTrue(d["csiCertificateEnabled"])
+        self.assertEqual(d["csiCertificateMountPath"], "/etc/nginx/cert")
+
+    def test_admin_enabled_without_mount_path_is_rejected(self):
+        doc = _minimal_shape_doc(runtime_overrides={"csi": {"enabled": True, "admin": {"enabled": True}, "certificate": {"enabled": True, "mountPath": "/etc/nginx/cert"}}})
+        write_doc(self._tmp.name, "dev", "gg-csi-03", doc)
+        active, inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+
+    def test_certificate_enabled_without_mount_path_is_rejected(self):
+        doc = _minimal_shape_doc(runtime_overrides={"csi": {"enabled": True, "admin": {"enabled": True, "mountPath": "/mnt/secrets-store/admin"}, "certificate": {"enabled": True}}})
+        write_doc(self._tmp.name, "dev", "gg-csi-04", doc)
+        active, inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+
+    def test_u02_type_efs_is_reflected(self):
+        doc = _minimal_shape_doc(runtime_overrides={"storage": {"u02": {"type": "efs"}}})
+        d = self._describe("gg-csi-05", doc)
+        self.assertEqual(d["u02Type"], "efs")
+
+    def test_u02_type_existing_claim_is_reflected(self):
+        doc = _minimal_shape_doc(runtime_overrides={"storage": {"u02": {"type": "existingClaim", "existingClaim": "external-claim-01"}}})
+        d = self._describe("gg-csi-06", doc)
+        self.assertEqual(d["u02Type"], "existingClaim")
+        self.assertEqual(d["pvcClaimName"], "external-claim-01")
+
+    def test_u02_type_empty_dir_is_reflected(self):
+        doc = _minimal_shape_doc(runtime_overrides={"storage": {"u02": {"type": "emptyDir"}}})
+        d = self._describe("gg-csi-07", doc)
+        self.assertEqual(d["u02Type"], "emptyDir")
+
+    def test_extra_volume_names_default_empty(self):
+        d = self._describe("gg-csi-08", _minimal_shape_doc())
+        self.assertEqual(d["extraVolumeNames"], [])
+        self.assertEqual(d["extraVolumeMountNames"], [])
+
+    def test_extra_volume_names_are_reflected(self):
+        doc = _minimal_shape_doc(runtime_overrides={
+            "extraVolumes": [{"name": "custom-vol", "emptyDir": {}}],
+            "extraVolumeMounts": [{"name": "custom-vol", "mountPath": "/custom"}],
+        })
+        d = self._describe("gg-csi-09", doc)
+        self.assertEqual(d["extraVolumeNames"], ["custom-vol"])
+        self.assertEqual(d["extraVolumeMountNames"], ["custom-vol"])
         gdm.REPO_ROOT = self._tmp.name
 
 

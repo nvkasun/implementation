@@ -567,10 +567,36 @@ def _parse_lifecycle(doc):
 
 
 def _parse_csi_structure(runtime):
-    """Validates the CSI block shape only; objectName/serviceAccountRoleArn presence is rejected earlier by _reject_forbidden_overrides."""
+    """Validates the CSI block shape and extracts the stable enabled/mountPath fields hack/orchestration/runtime_acceptance.py needs to verify actual pod volume/mount wiring against -- never a second descriptor schema, just a few more fields read from the same validated runtime.csi block. objectName/serviceAccountRoleArn presence is rejected earlier by _reject_forbidden_overrides."""
     csi = _require_dict(runtime.get("csi"), "invalid CSI configuration: runtime.csi must be a mapping")
-    _require_dict(csi.get("admin"), "invalid CSI configuration: runtime.csi.admin must be a mapping")
-    _require_dict(csi.get("certificate"), "invalid CSI configuration: runtime.csi.certificate must be a mapping")
+    admin = _require_dict(csi.get("admin"), "invalid CSI configuration: runtime.csi.admin must be a mapping")
+    certificate = _require_dict(csi.get("certificate"), "invalid CSI configuration: runtime.csi.certificate must be a mapping")
+
+    csi_enabled = csi.get("enabled", False)
+    if not _is_literal_bool(csi_enabled):
+        raise DescriptorError("invalid CSI configuration: runtime.csi.enabled must be a literal Boolean")
+
+    admin_enabled = admin.get("enabled", False)
+    if not _is_literal_bool(admin_enabled):
+        raise DescriptorError("invalid CSI configuration: runtime.csi.admin.enabled must be a literal Boolean")
+    admin_mount_path = admin.get("mountPath")
+    if admin_enabled and (not isinstance(admin_mount_path, str) or not admin_mount_path):
+        raise DescriptorError("invalid CSI configuration: runtime.csi.admin.mountPath is required and must be a non-empty string when runtime.csi.admin.enabled=true")
+
+    certificate_enabled = certificate.get("enabled", False)
+    if not _is_literal_bool(certificate_enabled):
+        raise DescriptorError("invalid CSI configuration: runtime.csi.certificate.enabled must be a literal Boolean")
+    certificate_mount_path = certificate.get("mountPath")
+    if certificate_enabled and (not isinstance(certificate_mount_path, str) or not certificate_mount_path):
+        raise DescriptorError("invalid CSI configuration: runtime.csi.certificate.mountPath is required and must be a non-empty string when runtime.csi.certificate.enabled=true")
+
+    return {
+        "csiEnabled": csi_enabled,
+        "csiAdminEnabled": admin_enabled,
+        "csiAdminMountPath": admin_mount_path,
+        "csiCertificateEnabled": certificate_enabled,
+        "csiCertificateMountPath": certificate_mount_path,
+    }
 
 
 def derive_efs_creation_token(environment, deployment_id):
@@ -653,7 +679,7 @@ def parse_descriptor(deployment_id, environment, doc, shared=None):
     runtime_service_account_name = resolve_runtime_service_account(deployment_type)
     admin_secret_name = resolve_admin_secret(environment, role)
     tls_secret_name = resolve_tls_secret(environment)
-    _parse_csi_structure(runtime)
+    csi_fields = _parse_csi_structure(runtime)
     replication = _parse_replication(deployment_id, environment, role, deployment_type, doc)
     lifecycle_state = _parse_lifecycle(doc)
     efs = _parse_efs(deployment_id, environment, doc)
@@ -698,6 +724,11 @@ def parse_descriptor(deployment_id, environment, doc, shared=None):
     if not isinstance(ingress_class_name, str) or not ingress_class_name:
         raise DescriptorError("invalid deployment metadata: ingress.className must be a non-empty string")
 
+    # Phase B3A closeout: u02Type is the chart's own volume-source discriminator (helm/goldengate/templates/runtime-statefulset.yaml branches on it directly: efs/existingClaim/emptyDir) -- read through, never re-derived. extraVolume(Mount)Names are name-only allow-lists (the chart passes runtime.extraVolumes/extraVolumeMounts through verbatim via `toYaml`) so the acceptance classifier's exact-volume-set check never falsely rejects a descriptor that legitimately uses that chart escape hatch, without inventing a second desired shape for volumes this repository does not itself validate in detail.
+    u02_type = ((runtime.get("storage") or {}).get("u02") or {}).get("type")
+    extra_volume_names = sorted({v.get("name") for v in (runtime.get("extraVolumes") or []) if isinstance(v, dict) and v.get("name")})
+    extra_volume_mount_names = sorted({v.get("name") for v in (runtime.get("extraVolumeMounts") or []) if isinstance(v, dict) and v.get("name")})
+
     return {
         "deploymentId": deployment_id,
         "environment": environment,
@@ -729,6 +760,14 @@ def parse_descriptor(deployment_id, environment, doc, shared=None):
         "initPermissionsEnabled": init_permissions_enabled,
         "ingressEnabled": ingress_enabled,
         "ingressClassName": ingress_class_name,
+        "u02Type": u02_type,
+        "csiEnabled": csi_fields["csiEnabled"],
+        "csiAdminEnabled": csi_fields["csiAdminEnabled"],
+        "csiAdminMountPath": csi_fields["csiAdminMountPath"],
+        "csiCertificateEnabled": csi_fields["csiCertificateEnabled"],
+        "csiCertificateMountPath": csi_fields["csiCertificateMountPath"],
+        "extraVolumeNames": extra_volume_names,
+        "extraVolumeMountNames": extra_volume_mount_names,
     }
 
 

@@ -86,6 +86,11 @@ HELM_REPO_PATH = "helm/goldengate"
 INIT_CONTAINER_NAME = "prepare-u02-permissions"
 RUNTIME_SELECTOR_LABELS_TEMPLATE = {"app.kubernetes.io/name": "goldengate"}
 
+# helm/goldengate/templates/runtime-statefulset.yaml's fixed CSI volume names and driver -- never guessed, never a second desired shape.
+ADMIN_CSI_VOLUME_NAME = "ogg-admin-csi"
+CERTIFICATE_CSI_VOLUME_NAME = "ogg-nginx-cert-csi"
+SECRETS_STORE_CSI_DRIVER = "secrets-store.csi.k8s.io"
+
 
 def _app_suffix(deployment_id):
     """APP_SUFFIX="${DEPLOYMENT_ID#gg-}" -- strips a leading "gg-" only if present, exactly like the real workflow's own bash parameter expansion."""
@@ -131,6 +136,122 @@ def _check_application(run, reasons, environment, deployment_id, argocd_namespac
         reasons.append(f"Application {app_name} source.helm.releaseName={helm_source.get('releaseName')!r}, expected {deployment_id!r}")
 
 
+def _expected_u02_claim_name(descriptor, deployment_id):
+    """Mirrors helm/goldengate/templates/runtime-statefulset.yaml's u02 volume claimName resolution exactly for the two PVC-backed u02Type values. Returns None for emptyDir (no PVC) or an unrecognized/unset u02Type."""
+    u02_type = descriptor.get("u02Type")
+    override = descriptor.get("pvcClaimName") or ""
+    if u02_type == "existingClaim":
+        # The chart reads runtime.storage.u02.existingClaim directly in this branch -- never a fallback to claimName or a chart-derived name.
+        return override or None
+    if u02_type == "efs":
+        # existingClaim (if set) takes priority over claimName; otherwise the chart-derived <deployment-id>-u02 name (helm/goldengate/templates/_helpers.tpl's goldengate.runtimeU02PVCName).
+        return override if override else f"{deployment_id}-u02"
+    return None
+
+
+def _expected_pod_volumes(descriptor, deployment_id):
+    """Exact expected spec.template.spec.volumes shape, mirroring helm/goldengate/templates/runtime-statefulset.yaml. Returns {name: {"kind": "emptyDir"|"pvc"|"csi", ...}}."""
+    volumes = {}
+
+    if descriptor.get("u02Type") == "emptyDir":
+        volumes["u02"] = {"kind": "emptyDir"}
+    else:
+        volumes["u02"] = {"kind": "pvc", "claimName": _expected_u02_claim_name(descriptor, deployment_id)}
+
+    volumes["u03"] = {"kind": "emptyDir"}
+
+    if descriptor["csiEnabled"] and descriptor["csiAdminEnabled"]:
+        volumes[ADMIN_CSI_VOLUME_NAME] = {"kind": "csi", "secretProviderClass": f"{deployment_id}-admin"}
+    if descriptor["csiEnabled"] and descriptor["csiCertificateEnabled"]:
+        volumes[CERTIFICATE_CSI_VOLUME_NAME] = {"kind": "csi", "secretProviderClass": f"{deployment_id}-certificate"}
+
+    return volumes
+
+
+def _check_pod_volumes(reasons, deployment_id, pod_spec, descriptor):
+    """Proves the pod actually CONSUMES the storage/secret objects the other checks already proved exist -- correct EFS/CSI objects existing must also imply the StatefulSet mounts the correct claim, never merely that both happen to exist independently."""
+    expected = _expected_pod_volumes(descriptor, deployment_id)
+    extra_allowed = set(descriptor.get("extraVolumeNames") or [])
+    actual_by_name = {v.get("name"): v for v in (pod_spec.get("volumes") or []) if v.get("name")}
+
+    for name, spec in expected.items():
+        if name not in actual_by_name:
+            reasons.append(f"statefulset/{deployment_id} pod is missing expected volume {name!r}")
+            continue
+        actual = actual_by_name[name]
+        if spec["kind"] == "emptyDir":
+            if "emptyDir" not in actual:
+                reasons.append(f"statefulset/{deployment_id} volume {name!r} is not emptyDir (got {sorted(actual.keys())!r})")
+        elif spec["kind"] == "pvc":
+            pvc = actual.get("persistentVolumeClaim")
+            if not pvc:
+                reasons.append(f"statefulset/{deployment_id} volume {name!r} is not a persistentVolumeClaim source (got {sorted(actual.keys())!r})")
+            elif pvc.get("claimName") != spec["claimName"]:
+                reasons.append(f"statefulset/{deployment_id} volume {name!r} claimName={pvc.get('claimName')!r}, expected {spec['claimName']!r}")
+        elif spec["kind"] == "csi":
+            csi = actual.get("csi")
+            if not csi:
+                reasons.append(f"statefulset/{deployment_id} volume {name!r} is not a CSI source (got {sorted(actual.keys())!r})")
+            else:
+                if csi.get("driver") != SECRETS_STORE_CSI_DRIVER:
+                    reasons.append(f"statefulset/{deployment_id} volume {name!r} csi.driver={csi.get('driver')!r}, expected {SECRETS_STORE_CSI_DRIVER!r}")
+                if csi.get("readOnly") is not True:
+                    reasons.append(f"statefulset/{deployment_id} volume {name!r} csi.readOnly={csi.get('readOnly')!r}, expected true")
+                actual_spc = (csi.get("volumeAttributes") or {}).get("secretProviderClass")
+                if actual_spc != spec["secretProviderClass"]:
+                    reasons.append(f"statefulset/{deployment_id} volume {name!r} csi.volumeAttributes.secretProviderClass={actual_spc!r}, expected {spec['secretProviderClass']!r}")
+
+    unexpected = set(actual_by_name) - set(expected) - extra_allowed
+    if unexpected:
+        reasons.append(f"statefulset/{deployment_id} pod has unexpected volume(s) {sorted(unexpected)!r} -- not part of the canonical chart wiring or the descriptor's own declared runtime.extraVolumes")
+
+
+def _expected_container_mounts(descriptor, include_certificate):
+    mounts = {"u02": "/u02", "u03": "/u03"}
+    if descriptor["csiEnabled"] and descriptor["csiAdminEnabled"]:
+        mounts[ADMIN_CSI_VOLUME_NAME] = descriptor["csiAdminMountPath"]
+    if include_certificate and descriptor["csiEnabled"] and descriptor["csiCertificateEnabled"]:
+        mounts[CERTIFICATE_CSI_VOLUME_NAME] = descriptor["csiCertificateMountPath"]
+    return mounts
+
+
+def _check_container_mounts(reasons, label, container, expected_mounts, extra_allowed):
+    actual_by_name = {m.get("name"): m for m in (container.get("volumeMounts") or []) if m.get("name")}
+
+    for name, expected_path in expected_mounts.items():
+        if name not in actual_by_name:
+            reasons.append(f"{label} does not mount volume {name!r}")
+            continue
+        actual = actual_by_name[name]
+        if actual.get("mountPath") != expected_path:
+            reasons.append(f"{label} mounts {name!r} at {actual.get('mountPath')!r}, expected {expected_path!r}")
+        if name in (ADMIN_CSI_VOLUME_NAME, CERTIFICATE_CSI_VOLUME_NAME) and actual.get("readOnly") is not True:
+            reasons.append(f"{label} mount {name!r} readOnly={actual.get('readOnly')!r}, expected true")
+
+    unexpected = set(actual_by_name) - set(expected_mounts) - extra_allowed
+    if unexpected:
+        reasons.append(f"{label} has unexpected volumeMount(s) {sorted(unexpected)!r}")
+
+
+def _check_container_ports(reasons, label, container, expected_ports):
+    """Proves named container ports actually resolve to the expected GoldenGate ports -- what a Service's named targetPort ultimately routes to."""
+    actual_by_name = {p.get("name"): p for p in (container.get("ports") or []) if p.get("name")}
+    if set(actual_by_name) != set(expected_ports):
+        reasons.append(f"{label} container ports={sorted(actual_by_name)!r}, expected {sorted(expected_ports)!r}")
+    for name, expected_port in expected_ports.items():
+        actual = actual_by_name.get(name)
+        if actual is None:
+            continue
+        if actual.get("containerPort") != expected_port:
+            reasons.append(f"{label} container port {name!r} containerPort={actual.get('containerPort')!r}, expected {expected_port!r}")
+        if actual.get("protocol", "TCP") != "TCP":
+            reasons.append(f"{label} container port {name!r} protocol={actual.get('protocol')!r}, expected 'TCP'")
+
+
+def _expected_selector_labels(deployment_id):
+    return {"app.kubernetes.io/name": "goldengate", "app.kubernetes.io/instance": deployment_id}
+
+
 def _check_statefulset_and_pod_shape(run, reasons, deployment_id, runtime_namespace, descriptor):
     found, obj = get_json(run, "statefulset", deployment_id, runtime_namespace)
     if not found:
@@ -142,10 +263,27 @@ def _check_statefulset_and_pod_shape(run, reasons, deployment_id, runtime_namesp
     if not ready:
         reasons.append(f"statefulset/{deployment_id} not ready: {why}")
 
-    pod_spec = (((obj.get("spec") or {}).get("template") or {}).get("spec")) or {}
+    spec = obj.get("spec") or {}
+    expected_headless_name = f"{deployment_id}-headless"
+    if spec.get("serviceName") != expected_headless_name:
+        reasons.append(f"statefulset/{deployment_id} spec.serviceName={spec.get('serviceName')!r}, expected {expected_headless_name!r}")
+
+    expected_selector = _expected_selector_labels(deployment_id)
+    actual_match_labels = ((spec.get("selector") or {}).get("matchLabels")) or {}
+    if actual_match_labels != expected_selector:
+        reasons.append(f"statefulset/{deployment_id} spec.selector.matchLabels={actual_match_labels!r}, expected {expected_selector!r}")
+
+    pod_template_metadata = (((spec.get("template") or {}).get("metadata")) or {})
+    pod_labels = pod_template_metadata.get("labels") or {}
+    for key, expected_value in expected_selector.items():
+        if pod_labels.get(key) != expected_value:
+            reasons.append(f"statefulset/{deployment_id} pod template label {key}={pod_labels.get(key)!r}, expected {expected_value!r}")
+
+    pod_spec = (((spec.get("template") or {}).get("spec")) or {})
     containers = pod_spec.get("containers") or []
     init_containers = pod_spec.get("initContainers") or []
     expected_image = f"{descriptor['imageRepository']}:{descriptor['imageTag']}"
+    expected_container_ports = {name: port for name, port in descriptor["servicePorts"].items() if port is not None}
 
     if len(containers) != 1:
         reasons.append(f"statefulset/{deployment_id} has {len(containers)} container(s) {[c.get('name') for c in containers]!r}, expected exactly 1 (named {descriptor['containerName']!r})")
@@ -155,6 +293,12 @@ def _check_statefulset_and_pod_shape(run, reasons, deployment_id, runtime_namesp
             reasons.append(f"statefulset/{deployment_id}'s sole container is named {container.get('name')!r}, expected {descriptor['containerName']!r}")
         if container.get("image") != expected_image:
             reasons.append(f"statefulset/{deployment_id} container {descriptor['containerName']!r} image={container.get('image')!r}, expected {expected_image!r}")
+        _check_container_mounts(
+            reasons, f"statefulset/{deployment_id} container {descriptor['containerName']!r}",
+            container, _expected_container_mounts(descriptor, include_certificate=True),
+            set(descriptor.get("extraVolumeMountNames") or []),
+        )
+        _check_container_ports(reasons, f"statefulset/{deployment_id} container {descriptor['containerName']!r}", container, expected_container_ports)
 
     if descriptor["initPermissionsEnabled"]:
         if len(init_containers) != 1:
@@ -165,12 +309,20 @@ def _check_statefulset_and_pod_shape(run, reasons, deployment_id, runtime_namesp
                 reasons.append(f"statefulset/{deployment_id}'s sole initContainer is named {init_container.get('name')!r}, expected {INIT_CONTAINER_NAME!r}")
             if init_container.get("image") != expected_image:
                 reasons.append(f"statefulset/{deployment_id} initContainer {INIT_CONTAINER_NAME!r} image={init_container.get('image')!r}, expected the same GoldenGate runtime image {expected_image!r}")
+            # The chart never mounts the certificate CSI secret on the init container -- only u02/u03 and (when enabled) the admin CSI secret.
+            _check_container_mounts(
+                reasons, f"statefulset/{deployment_id} initContainer {INIT_CONTAINER_NAME!r}",
+                init_container, _expected_container_mounts(descriptor, include_certificate=False),
+                set(descriptor.get("extraVolumeMountNames") or []),
+            )
     elif init_containers:
         reasons.append(f"statefulset/{deployment_id} has unexpected initContainer(s) {[c.get('name') for c in init_containers]!r}, but the canonical descriptor has runtime.initPermissions.enabled=false")
 
     actual_sa_name = pod_spec.get("serviceAccountName")
     if actual_sa_name != descriptor["runtimeServiceAccountName"]:
         reasons.append(f"statefulset/{deployment_id} pod template serviceAccountName={actual_sa_name!r}, expected {descriptor['runtimeServiceAccountName']!r}")
+
+    _check_pod_volumes(reasons, deployment_id, pod_spec, descriptor)
 
 
 def _check_storage(run, reasons, environment, deployment_id, runtime_namespace, descriptor, expected_efs_file_system_id):
@@ -200,7 +352,8 @@ def _check_storage(run, reasons, environment, deployment_id, runtime_namespace, 
         if sc_obj.get("reclaimPolicy") != "Retain":
             reasons.append(f"storageclass/{sc_name} reclaimPolicy={sc_obj.get('reclaimPolicy')!r}, expected 'Retain'")
 
-    pvc_name = f"{deployment_id}-u02"
+    # Same claimName resolution as the pod-volume-wiring check above (chart-derived name unless the descriptor declares an explicit override) -- the EFS-object checks below must inspect the SAME PVC the pod actually mounts, never a hardcoded assumption.
+    pvc_name = _expected_u02_claim_name(descriptor, deployment_id) or f"{deployment_id}-u02"
     pvc_found, pvc_obj = get_json(run, "persistentvolumeclaim", pvc_name, runtime_namespace)
     if not pvc_found:
         reasons.append(f"persistentvolumeclaim/{pvc_name} does not exist")
@@ -272,8 +425,21 @@ def _check_admin_secret(run, reasons, deployment_id, runtime_namespace):
             reasons.append(f"secret/{name} is missing required key {required_key!r}")
 
 
-def _expected_selector_labels(deployment_id):
-    return {"app.kubernetes.io/name": "goldengate", "app.kubernetes.io/instance": deployment_id}
+def _check_service_port_contract(reasons, label, ports_list, expected_ports):
+    """Proves the exact TCP target-port contract, not merely name/port -- helm/goldengate/templates/runtime-service.yaml and runtime-headless-service.yaml always set targetPort to the SAME named port and protocol: TCP; a Service that swaps in a numeric/wrong targetPort or a non-TCP protocol routes traffic incorrectly (or not at all) even though its name/port alone look correct."""
+    actual_by_name = {p.get("name"): p for p in (ports_list or []) if p.get("name")}
+    if set(actual_by_name) != set(expected_ports):
+        reasons.append(f"{label} ports={sorted(actual_by_name)!r}, expected {sorted(expected_ports)!r}")
+    for name, expected_port in expected_ports.items():
+        p = actual_by_name.get(name)
+        if p is None:
+            continue
+        if p.get("port") != expected_port:
+            reasons.append(f"{label} port {name!r} port={p.get('port')!r}, expected {expected_port!r}")
+        if p.get("targetPort") != name:
+            reasons.append(f"{label} port {name!r} targetPort={p.get('targetPort')!r}, expected the same named target port {name!r}")
+        if p.get("protocol", "TCP") != "TCP":
+            reasons.append(f"{label} port {name!r} protocol={p.get('protocol')!r}, expected 'TCP'")
 
 
 def _check_services(run, reasons, deployment_id, runtime_namespace, descriptor):
@@ -289,9 +455,7 @@ def _check_services(run, reasons, deployment_id, runtime_namespace, descriptor):
             reasons.append(f"service/{deployment_id} type={spec.get('type')!r}, expected {descriptor['serviceType']!r}")
         if (spec.get("selector") or {}) != expected_selector:
             reasons.append(f"service/{deployment_id} selector={spec.get('selector')!r}, expected {expected_selector!r}")
-        actual_ports = {p.get("name"): p.get("port") for p in (spec.get("ports") or [])}
-        if actual_ports != expected_ports:
-            reasons.append(f"service/{deployment_id} ports={actual_ports!r}, expected {expected_ports!r}")
+        _check_service_port_contract(reasons, f"service/{deployment_id}", spec.get("ports"), expected_ports)
 
     headless_name = f"{deployment_id}-headless"
     headless_found, headless_obj = get_json(run, "service", headless_name, runtime_namespace)
@@ -303,9 +467,7 @@ def _check_services(run, reasons, deployment_id, runtime_namespace, descriptor):
             reasons.append(f"service/{headless_name} clusterIP={spec.get('clusterIP')!r}, expected 'None'")
         if (spec.get("selector") or {}) != expected_selector:
             reasons.append(f"service/{headless_name} selector={spec.get('selector')!r}, expected {expected_selector!r}")
-        actual_ports = {p.get("name"): p.get("port") for p in (spec.get("ports") or [])}
-        if actual_ports != expected_ports:
-            reasons.append(f"service/{headless_name} ports={actual_ports!r}, expected {expected_ports!r}")
+        _check_service_port_contract(reasons, f"service/{headless_name}", spec.get("ports"), expected_ports)
 
     # At least one Ready backing endpoint for the main (routable) Service -- a Ready StatefulSet with no routable backend is still not acceptable.
     slices = list_json(run, "endpointslices.discovery.k8s.io", namespace=runtime_namespace, label_selector=f"kubernetes.io/service-name={deployment_id}")
