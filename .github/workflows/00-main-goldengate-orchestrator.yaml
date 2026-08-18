@@ -4357,6 +4357,7 @@ jobs:
 
     needs:
       - validate_model
+      - detect_changed_deployments
       - validate_shared_secrets_once
       - validate_argocd_ready
       - validate_platform_ready
@@ -4373,7 +4374,7 @@ jobs:
       - validate_monitor_ready
       - replication_monitor_acceptance
       - end_to_end_deployment_acceptance
-    # Phase B3B closeout: final_validation now ALWAYS runs (never itself conditionally skipped by GitHub's default implicit "all needs succeeded" behavior) so it can fail CLOSED -- with useful diagnostics -- when a REQUIRED job was unexpectedly skipped, rather than the job itself silently disappearing. The prior single "!= failure && != cancelled" expression here let a SKIPPED required gate through undetected (skipped is neither failure nor cancelled); the actual mode-aware pass/fail contract now lives entirely in the "Validate the mode-aware final DEPLOY success contract" step below -- one small, explicit, readable branch per resolved mode, never one giant accidental-truth if: expression.
+    # Phase B3B closeout: final_validation now ALWAYS runs (never itself conditionally skipped by GitHub's default implicit "all needs succeeded" behavior) so it can fail CLOSED -- with useful diagnostics -- when a REQUIRED job was unexpectedly skipped, rather than the job itself silently disappearing. The prior single "!= failure && != cancelled" expression here let a SKIPPED required gate through undetected (skipped is neither failure nor cancelled); the actual mode-aware pass/fail contract now lives entirely in the "Validate the mode-aware final DEPLOY success contract" step below -- one small, explicit, readable branch per resolved mode, never one giant accidental-truth if: expression. Final DEPLOY freeze closeout: detect_changed_deployments is added here directly (never merely relied on transitively) so its own has_changes/has_deletions applicability outputs -- and its own result -- can gate the selected-mutation dimension of this same contract.
     if: always()
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -4384,6 +4385,9 @@ jobs:
         env:
           EFFECTIVE_DEPLOY: ${{ needs.validate_model.outputs.effective_deploy }}
           HAS_ACTIVE_DEPLOYMENTS: ${{ needs.validate_model.outputs.has_active_deployments }}
+          HAS_CHANGES: ${{ needs.detect_changed_deployments.outputs.has_changes }}
+          HAS_DELETIONS: ${{ needs.detect_changed_deployments.outputs.has_deletions }}
+          RESULT_detect_changed_deployments: ${{ needs.detect_changed_deployments.result }}
           RESULT_validate_shared_secrets_once: ${{ needs.validate_shared_secrets_once.result }}
           RESULT_validate_argocd_ready: ${{ needs.validate_argocd_ready.result }}
           RESULT_validate_platform_ready: ${{ needs.validate_platform_ready.result }}
@@ -4403,10 +4407,26 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Resolved mode: effective_deploy=${EFFECTIVE_DEPLOY} has_active_deployments=${HAS_ACTIVE_DEPLOYMENTS}"
+          echo "Resolved mode: effective_deploy=${EFFECTIVE_DEPLOY} has_active_deployments=${HAS_ACTIVE_DEPLOYMENTS} has_changes=${HAS_CHANGES} has_deletions=${HAS_DELETIONS}"
 
+          # Every boolean mode/applicability output this gate branches on must be a literal 'true' or 'false' -- empty, null, or unexpected text means the producing job did not resolve a usable outcome, and this gate can never guess which branch of the contract applies. Checked up front, before any require_success/allow_non_failure call, since an unresolved guard makes the rest of this script's branching meaningless.
           if [ "$EFFECTIVE_DEPLOY" != "true" ] && [ "$EFFECTIVE_DEPLOY" != "false" ]; then
             echo "FAIL: validate_model.outputs.effective_deploy is '${EFFECTIVE_DEPLOY}', expected literal 'true' or 'false' -- validate_model itself did not produce a usable outcome, so MAIN cannot resolve which mode-aware contract applies."
+            exit 1
+          fi
+
+          if [ "$HAS_ACTIVE_DEPLOYMENTS" != "true" ] && [ "$HAS_ACTIVE_DEPLOYMENTS" != "false" ]; then
+            echo "FAIL: validate_model.outputs.has_active_deployments is '${HAS_ACTIVE_DEPLOYMENTS}', expected literal 'true' or 'false' -- MAIN cannot resolve which active-runtime branch of the mode-aware contract applies."
+            exit 1
+          fi
+
+          if [ "$HAS_CHANGES" != "true" ] && [ "$HAS_CHANGES" != "false" ]; then
+            echo "FAIL: detect_changed_deployments.outputs.has_changes is '${HAS_CHANGES}', expected literal 'true' or 'false' -- MAIN cannot resolve which selected-mutation branch of the final contract applies."
+            exit 1
+          fi
+
+          if [ "$HAS_DELETIONS" != "true" ] && [ "$HAS_DELETIONS" != "false" ]; then
+            echo "FAIL: detect_changed_deployments.outputs.has_deletions is '${HAS_DELETIONS}', expected literal 'true' or 'false' -- MAIN cannot resolve which selected-deletion branch of the final contract applies."
             exit 1
           fi
 
@@ -4438,11 +4458,30 @@ jobs:
 
           # Foundational -- required in every mode.
           require_success validate_shared_secrets_once
+          require_success detect_changed_deployments
 
-          # These are gated on the SELECTED-deployment-matrix dimension (has_changes), which is orthogonal to the effective_deploy/has_active_deployments mode contract below -- never required to be exactly successful here (a "nothing changed this run" real deploy legitimately skips them), but a real failure/cancellation must still block MAIN. Unchanged from the prior behavior.
-          allow_non_failure runtime_ownership_preflight
-          allow_non_failure build_publish_and_deploy
-          allow_non_failure delete_removed_argocd_applications
+          # Mutation-aware contract: applicability of the selected-deployment build/reconcile, ownership preflight, and deletion stages is already known from detect_changed_deployments' own outputs -- never inferred only from other jobs' transitive downstream behavior. has_changes/has_deletions are orthogonal to the effective_deploy/has_active_deployments mode contract below.
+          if [ "$HAS_CHANGES" = "true" ]; then
+            echo "SELECTED MUTATION: has_changes=true -- the selected-deployment build/reconcile stage is unconditionally required (real deploy: runtime reconciliation; deploy=false: Helm lint/render validation)."
+            require_success build_publish_and_deploy
+            if [ "$EFFECTIVE_DEPLOY" = "true" ]; then
+              require_success runtime_ownership_preflight
+            else
+              # runtime_ownership_preflight's own if: never runs it on deploy=false regardless of has_changes -- a real deploy=false Helm lint/render run legitimately skips it.
+              allow_non_failure runtime_ownership_preflight
+            fi
+          else
+            echo "NO SELECTED MUTATION: has_changes=false -- the selected-deployment build/reconcile and ownership preflight stages are legitimately not applicable and may be cleanly skipped, but a real failure/cancellation still blocks MAIN."
+            allow_non_failure runtime_ownership_preflight
+            allow_non_failure build_publish_and_deploy
+          fi
+
+          if [ "$HAS_DELETIONS" = "true" ]; then
+            echo "SELECTED DELETION: has_deletions=true -- the removed-Application deletion stage is unconditionally required."
+            require_success delete_removed_argocd_applications
+          else
+            allow_non_failure delete_removed_argocd_applications
+          fi
 
           if [ "$EFFECTIVE_DEPLOY" = "true" ]; then
             echo "REAL DEPLOY: Argo CD / Platform / Observability readiness are unconditionally required."

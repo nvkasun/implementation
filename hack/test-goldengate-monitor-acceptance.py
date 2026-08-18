@@ -416,6 +416,23 @@ class MonitorAcceptanceClassifierTests(unittest.TestCase):
         result = _classify(cluster)
         self.assertEqual(result["state"], monitor_acceptance.STATE_HEALTHY, result["reasons"])
 
+    # Final DEPLOY freeze closeout Issue 3: malformed helm parameter rows must never be silently discarded.
+    def test_application_canonical_parameters_plus_non_dict_row_is_broken(self):
+        app = _app_obj()
+        app["spec"]["source"]["helm"]["parameters"].append("not-an-object")
+        cluster = _populate_healthy_cluster(FakeCluster())
+        cluster.put("application", monitor_acceptance.ARGOCD_APP_NAME, ARGOCD_NAMESPACE, app)
+        result = _classify(cluster)
+        _assert_broken(self, result, "source.helm.parameters row #10 is not an object")
+
+    def test_application_canonical_parameters_plus_row_without_usable_name_is_broken(self):
+        app = _app_obj()
+        app["spec"]["source"]["helm"]["parameters"].append({"value": "orphan-value"})
+        cluster = _populate_healthy_cluster(FakeCluster())
+        cluster.put("application", monitor_acceptance.ARGOCD_APP_NAME, ARGOCD_NAMESPACE, app)
+        result = _classify(cluster)
+        _assert_broken(self, result, "has a missing/empty/non-string name")
+
     # 10. Namespace missing -> BROKEN.
     def test_10_namespace_missing_is_broken(self):
         cluster = _populate_healthy_cluster(FakeCluster())
@@ -647,6 +664,31 @@ class MonitorAcceptanceClassifierTests(unittest.TestCase):
         cluster.put("secretproviderclass", "gg-monitor-secrets", MONITOR_NAMESPACE, _secretproviderclass_obj(objects=objects))
         result = _classify(cluster)
         _assert_broken(self, result, "(TLS) jmesPath has unexpected (path, objectAlias) pair(s)")
+
+    # Final DEPLOY freeze closeout Issue 3: malformed SecretProviderClass object/jmesPath rows must never be silently discarded.
+    def test_secretproviderclass_canonical_objects_plus_non_dict_object_row_is_broken(self):
+        objects = _spc_objects()
+        objects.append("not-an-object")
+        cluster = _populate_healthy_cluster(FakeCluster())
+        cluster.put("secretproviderclass", "gg-monitor-secrets", MONITOR_NAMESPACE, _secretproviderclass_obj(objects=objects))
+        result = _classify(cluster)
+        _assert_broken(self, result, f"parameters.objects row #{len(objects) - 1} is not an object")
+
+    def test_secretproviderclass_canonical_admin_jmespath_plus_non_dict_row_is_broken(self):
+        objects = _spc_objects()
+        objects[0]["jmesPath"].append("not-an-object")
+        cluster = _populate_healthy_cluster(FakeCluster())
+        cluster.put("secretproviderclass", "gg-monitor-secrets", MONITOR_NAMESPACE, _secretproviderclass_obj(objects=objects))
+        result = _classify(cluster)
+        _assert_broken(self, result, "jmesPath row #2 is not an object")
+
+    def test_secretproviderclass_canonical_tls_jmespath_plus_non_dict_row_is_broken(self):
+        objects = _spc_objects()
+        objects[-1]["jmesPath"].append("not-an-object")
+        cluster = _populate_healthy_cluster(FakeCluster())
+        cluster.put("secretproviderclass", "gg-monitor-secrets", MONITOR_NAMESPACE, _secretproviderclass_obj(objects=objects))
+        result = _classify(cluster)
+        _assert_broken(self, result, "(TLS) jmesPath row #1 is not an object")
 
     def test_secretproviderclass_exact_correct_mapping_is_healthy(self):
         # Reproduction proof (positive control): the untouched, exactly-correct SecretProviderClass must remain HEALTHY under the new exact-pair validation.

@@ -10900,6 +10900,7 @@ if gate_step is None:
 script = gate_step["run"]
 
 ALL_RESULT_JOBS = (
+    "detect_changed_deployments",
     "validate_shared_secrets_once", "validate_argocd_ready", "validate_platform_ready", "validate_observability_ready",
     "runtime_ownership_preflight", "build_publish_and_deploy", "delete_removed_argocd_applications",
     "validate_active_runtimes", "replication_reconcile_once", "replication_dry_run_validation",
@@ -10908,11 +10909,13 @@ ALL_RESULT_JOBS = (
 )
 
 
-def run_gate(effective_deploy, has_active_deployments, overrides):
+def run_gate(effective_deploy, has_active_deployments, overrides, has_changes="false", has_deletions="false"):
     import os
     env = dict(os.environ)
     env["EFFECTIVE_DEPLOY"] = effective_deploy
     env["HAS_ACTIVE_DEPLOYMENTS"] = has_active_deployments
+    env["HAS_CHANGES"] = has_changes
+    env["HAS_DELETIONS"] = has_deletions
     for job in ALL_RESULT_JOBS:
         env[f"RESULT_{job}"] = overrides.get(job, "success")
     proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=20)
@@ -10965,6 +10968,54 @@ check("E: DRY RUN + live deployment jobs skipped -> final gate SUCCEEDS when app
 proc = run_gate("false", "false", {"validate_shared_secrets_once": "failure"})
 check("sanity: validate_shared_secrets_once=failure fails the gate in every mode", proc.returncode != 0, proc)
 
+# FINAL DEPLOY freeze closeout: all boolean mode/applicability outputs must fail closed, and the selected-mutation (has_changes) / selected-deletion (has_deletions) dimensions are independently, exactly enforced -- never inferred only from other jobs' transitive downstream behavior.
+
+# FREEZE-A: EFFECTIVE_DEPLOY=true, HAS_ACTIVE_DEPLOYMENTS="" -> FAIL (fails closed on an unresolved active-runtime mode output).
+proc = run_gate("true", "", {})
+check("FREEZE-A: EFFECTIVE_DEPLOY=true + HAS_ACTIVE_DEPLOYMENTS='' fails closed", proc.returncode != 0, proc)
+
+# FREEZE-B: HAS_CHANGES="" -> FAIL.
+proc = run_gate("true", "false", {}, has_changes="")
+check("FREEZE-B: HAS_CHANGES='' fails closed", proc.returncode != 0, proc)
+
+# FREEZE-C: HAS_DELETIONS="" -> FAIL.
+proc = run_gate("true", "false", {}, has_deletions="")
+check("FREEZE-C: HAS_DELETIONS='' fails closed", proc.returncode != 0, proc)
+
+# FREEZE-D: DEPLOY=true, HAS_CHANGES=true, runtime_ownership_preflight=skipped -> FAIL.
+proc = run_gate("true", "false", {"runtime_ownership_preflight": "skipped"}, has_changes="true")
+check("FREEZE-D: DEPLOY=true + HAS_CHANGES=true + runtime_ownership_preflight skipped fails", proc.returncode != 0, proc)
+
+# FREEZE-E: DEPLOY=true, HAS_CHANGES=true, build_publish_and_deploy=skipped -> FAIL.
+proc = run_gate("true", "false", {"build_publish_and_deploy": "skipped"}, has_changes="true")
+check("FREEZE-E: DEPLOY=true + HAS_CHANGES=true + build_publish_and_deploy skipped fails", proc.returncode != 0, proc)
+
+# FREEZE-F: DEPLOY=false, HAS_CHANGES=true, build_publish_and_deploy=skipped -> FAIL (the deploy=false Helm lint/render validation path is still required when a deployment was selected).
+proc = run_gate("false", "false", {"build_publish_and_deploy": "skipped", "runtime_ownership_preflight": "skipped"}, has_changes="true")
+check("FREEZE-F: DEPLOY=false + HAS_CHANGES=true + build_publish_and_deploy skipped fails", proc.returncode != 0, proc)
+
+# FREEZE-G: HAS_CHANGES=false, runtime_ownership_preflight=skipped, build_publish_and_deploy=skipped -> allowed when all applicable gates succeed.
+proc = run_gate("true", "false", {"runtime_ownership_preflight": "skipped", "build_publish_and_deploy": "skipped"}, has_changes="false")
+check("FREEZE-G: HAS_CHANGES=false + ownership/build skipped succeeds (legitimately not applicable)", proc.returncode == 0, proc)
+
+# FREEZE-H: HAS_DELETIONS=true, delete_removed_argocd_applications=skipped -> FAIL.
+proc = run_gate("true", "false", {"delete_removed_argocd_applications": "skipped"}, has_deletions="true")
+check("FREEZE-H: HAS_DELETIONS=true + delete_removed_argocd_applications skipped fails", proc.returncode != 0, proc)
+
+# FREEZE-I: HAS_DELETIONS=false, delete_removed_argocd_applications=skipped -> allowed.
+proc = run_gate("true", "false", {"delete_removed_argocd_applications": "skipped"}, has_deletions="false")
+check("FREEZE-I: HAS_DELETIONS=false + delete_removed_argocd_applications skipped succeeds (legitimately not applicable)", proc.returncode == 0, proc)
+
+# FREEZE: manual workflow_dispatch contract (hack/detect-goldengate-deployments.sh always sets has_changes=true/has_deletions=false for a valid selected deployment) -- manual Deploy requires ownership preflight + build success; manual deploy=false validation still requires the build/lint/render stage to succeed even though ownership preflight itself may legitimately skip.
+proc = run_gate("true", "false", {}, has_changes="true", has_deletions="false")
+check("FREEZE: manual Deploy (has_changes=true, has_deletions=false) with everything applicable succeeding -> gate succeeds", proc.returncode == 0, proc)
+proc = run_gate("false", "false", {"runtime_ownership_preflight": "skipped"}, has_changes="true", has_deletions="false")
+check("FREEZE: manual deploy=false validation (has_changes=true) -> ownership preflight may skip, build/lint/render still required and succeeding -> gate succeeds", proc.returncode == 0, proc)
+
+# FREEZE: detect_changed_deployments itself failing must block the gate in every mode (never merely relied on transitively).
+proc = run_gate("false", "false", {"detect_changed_deployments": "failure"})
+check("FREEZE: detect_changed_deployments=failure fails the gate", proc.returncode != 0, proc)
+
 if failures:
     print("\n".join(failures))
     sys.exit(1)
@@ -10980,6 +11031,18 @@ PYEOF
     pass "Phase B3B closeout: D: DEPLOY + zero active runtimes + all B3B runtime/monitor jobs skipped -> final gate succeeds"
     pass "Phase B3B closeout: E: DRY RUN + live deployment jobs skipped -> dry-run final gate succeeds when applicable dry-run jobs succeed"
     pass "Phase B3B closeout: a genuine failure of an always-applicable job still fails the gate regardless of mode"
+    pass "FINAL DEPLOY freeze: FREEZE-A: EFFECTIVE_DEPLOY=true + HAS_ACTIVE_DEPLOYMENTS='' fails closed"
+    pass "FINAL DEPLOY freeze: FREEZE-B: HAS_CHANGES='' fails closed"
+    pass "FINAL DEPLOY freeze: FREEZE-C: HAS_DELETIONS='' fails closed"
+    pass "FINAL DEPLOY freeze: FREEZE-D: DEPLOY=true + HAS_CHANGES=true + runtime_ownership_preflight skipped fails"
+    pass "FINAL DEPLOY freeze: FREEZE-E: DEPLOY=true + HAS_CHANGES=true + build_publish_and_deploy skipped fails"
+    pass "FINAL DEPLOY freeze: FREEZE-F: DEPLOY=false + HAS_CHANGES=true + build_publish_and_deploy skipped fails"
+    pass "FINAL DEPLOY freeze: FREEZE-G: HAS_CHANGES=false + ownership/build skipped succeeds (legitimately not applicable)"
+    pass "FINAL DEPLOY freeze: FREEZE-H: HAS_DELETIONS=true + delete_removed_argocd_applications skipped fails"
+    pass "FINAL DEPLOY freeze: FREEZE-I: HAS_DELETIONS=false + delete_removed_argocd_applications skipped succeeds (legitimately not applicable)"
+    pass "FINAL DEPLOY freeze: manual Deploy (has_changes=true, has_deletions=false) with everything applicable succeeding -> gate succeeds"
+    pass "FINAL DEPLOY freeze: manual deploy=false validation (has_changes=true) -> ownership preflight may skip, build/lint/render still required -> gate succeeds"
+    pass "FINAL DEPLOY freeze: detect_changed_deployments=failure fails the gate"
   else
     fail "Phase B3B closeout final-gate execution proof failed:"$'\n'"${PHASE_B3B_FINAL_GATE_OUT}"
   fi

@@ -146,7 +146,25 @@ def _check_application(run, reasons, argocd_namespace, monitor_namespace, ecr_re
         "ingress.alb.certificateArn": acm_certificate_arn,
     }
 
-    parameter_entries = [p for p in (helm_source.get("parameters") or []) if isinstance(p, dict)]
+    # An exact desired-state classifier must never silently discard malformed data: spec.source.helm.parameters must itself be a list, every member must be a mapping, and every mapping must carry a usable (non-empty, string) name -- any violation is itself a BROKEN condition, not merely excluded from the exact-set comparison below.
+    raw_parameters = helm_source.get("parameters")
+    if raw_parameters is None:
+        raw_parameters = []
+    elif not isinstance(raw_parameters, list):
+        reasons.append(f"Application {ARGOCD_APP_NAME} source.helm.parameters is not a list: {raw_parameters!r}")
+        raw_parameters = []
+
+    parameter_entries = []
+    for index, p in enumerate(raw_parameters):
+        if not isinstance(p, dict):
+            reasons.append(f"Application {ARGOCD_APP_NAME} source.helm.parameters row #{index} is not an object: {p!r}")
+            continue
+        param_name = p.get("name")
+        if not isinstance(param_name, str) or not param_name:
+            reasons.append(f"Application {ARGOCD_APP_NAME} source.helm.parameters row #{index} has a missing/empty/non-string name: {param_name!r}")
+            continue
+        parameter_entries.append(p)
+
     parameter_names_list = [p.get("name") for p in parameter_entries]
 
     # Detect a duplicate parameter NAME before it is ever collapsed into a dict -- {p["name"]: p["value"] for p in ...} would otherwise silently keep only the last occurrence.
@@ -384,10 +402,13 @@ def _check_secretproviderclass(run, reasons, monitor_namespace, aws_region, regi
             expected_groups.setdefault(admin_secret, set()).add(deployment_name)
     tls_secret = registry.get("tlsSecret")
 
+    # A non-object row in parameters.objects is itself a BROKEN condition -- never silently ignored while building actual_by_object_name (a valid canonical inventory plus one malformed extra row must not pass as HEALTHY).
     actual_by_object_name = {}
-    for entry in objects:
-        if isinstance(entry, dict):
-            actual_by_object_name.setdefault(entry.get("objectName"), []).append(entry)
+    for index, entry in enumerate(objects):
+        if not isinstance(entry, dict):
+            reasons.append(f"secretproviderclass/{SECRETPROVIDERCLASS_NAME} parameters.objects row #{index} is not an object: {entry!r}")
+            continue
+        actual_by_object_name.setdefault(entry.get("objectName"), []).append(entry)
 
     for object_name, entries in actual_by_object_name.items():
         if len(entries) > 1:
@@ -398,11 +419,11 @@ def _check_secretproviderclass(run, reasons, monitor_namespace, aws_region, regi
 
     missing_objects = expected_object_names - actual_object_names
     if missing_objects:
-        reasons.append(f"secretproviderclass/{SECRETPROVIDERCLASS_NAME} parameters.objects is missing expected objectName(s) {sorted(missing_objects)!r}")
+        reasons.append(f"secretproviderclass/{SECRETPROVIDERCLASS_NAME} parameters.objects is missing expected objectName(s) {sorted(missing_objects, key=str)!r}")
 
     unknown_objects = actual_object_names - expected_object_names
     if unknown_objects:
-        reasons.append(f"secretproviderclass/{SECRETPROVIDERCLASS_NAME} parameters.objects has unexpected/unknown objectName(s) {sorted(unknown_objects)!r} -- not part of the canonical registry's adminSecret groups or tlsSecret")
+        reasons.append(f"secretproviderclass/{SECRETPROVIDERCLASS_NAME} parameters.objects has unexpected/unknown objectName(s) {sorted(unknown_objects, key=str)!r} -- not part of the canonical registry's adminSecret groups or tlsSecret")
 
     for admin_secret, expected_names in expected_groups.items():
         entries = actual_by_object_name.get(admin_secret)
@@ -431,8 +452,26 @@ def _check_secretproviderclass(run, reasons, monitor_namespace, aws_region, regi
 
 
 def _check_jmespath_pairs(reasons, label, entry, expected_pairs):
-    """Compares the entry's jmesPath list as exact (path, objectAlias) pairs against expected_pairs -- rejects a missing pair, an extra/unknown pair (which also catches a wrong path, a swapped username/password path, and a wrong objectAlias, since any of those changes the pair identity), and a duplicate pair. Malformed (non-dict) jmesPath rows are simply excluded from the actual set, never coerced."""
-    actual_pairs_list = [(j.get("path"), j.get("objectAlias")) for j in (entry.get("jmesPath") or []) if isinstance(j, dict)]
+    """Compares the entry's jmesPath list as exact (path, objectAlias) pairs against expected_pairs -- rejects a missing pair, an extra/unknown pair (which also catches a wrong path, a swapped username/password path, and a wrong objectAlias, since any of those changes the pair identity), and a duplicate pair. jmesPath must itself be a list; every member must be a mapping carrying a usable (non-empty, string) path and objectAlias -- any violation is itself a BROKEN condition, never silently discarded. Never inspects secret VALUES."""
+    raw_jmespath = entry.get("jmesPath")
+    if raw_jmespath is None:
+        raw_jmespath = []
+    elif not isinstance(raw_jmespath, list):
+        reasons.append(f"{label} jmesPath is not a list: {raw_jmespath!r}")
+        raw_jmespath = []
+
+    actual_pairs_list = []
+    for index, j in enumerate(raw_jmespath):
+        if not isinstance(j, dict):
+            reasons.append(f"{label} jmesPath row #{index} is not an object: {j!r}")
+            continue
+        path = j.get("path")
+        object_alias = j.get("objectAlias")
+        if not isinstance(path, str) or not path or not isinstance(object_alias, str) or not object_alias:
+            reasons.append(f"{label} jmesPath row #{index} has a missing/empty/non-string path or objectAlias: path={path!r}, objectAlias={object_alias!r}")
+            continue
+        actual_pairs_list.append((path, object_alias))
+
     actual_pairs_set = set(actual_pairs_list)
 
     if len(actual_pairs_list) != len(actual_pairs_set):
