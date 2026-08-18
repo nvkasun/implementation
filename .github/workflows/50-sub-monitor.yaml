@@ -1300,10 +1300,20 @@ jobs:
                   [ "$pod_sa" != "gg-monitor" ] && continue
 
                   rs_owner_name="$(jq -r '[.metadata.ownerReferences[]? | select(.controller==true and .kind=="ReplicaSet")][0].name // empty' <<<"$pod_json")"
+                  rs_owner_uid="$(jq -r '[.metadata.ownerReferences[]? | select(.controller==true and .kind=="ReplicaSet")][0].uid // empty' <<<"$pod_json")"
                   [ -z "$rs_owner_name" ] && continue
+                  [ -z "$rs_owner_uid" ] && continue
                   rs_json="$(kubectl get replicaset "$rs_owner_name" -n "$TARGET_NAMESPACE" -o json 2>/dev/null || true)"
                   [ -z "$rs_json" ] && continue
+                  # The pod's OWN claimed ReplicaSet uid must match the ACTUAL fetched ReplicaSet's uid -- a name match alone does not prove the pod is owned by the CURRENT ReplicaSet object (a stale/recreated ReplicaSet can share a name with a different uid).
+                  rs_metadata_uid="$(jq -r '.metadata.uid // empty' <<<"$rs_json")"
+                  [ -z "$rs_metadata_uid" ] && continue
+                  [ "$rs_owner_uid" != "$rs_metadata_uid" ] && continue
+                  rs_deploy_name="$(jq -r '[.metadata.ownerReferences[]? | select(.controller==true and .kind=="Deployment")][0].name // empty' <<<"$rs_json")"
                   rs_deploy_uid="$(jq -r '[.metadata.ownerReferences[]? | select(.controller==true and .kind=="Deployment")][0].uid // empty' <<<"$rs_json")"
+                  [ -z "$rs_deploy_name" ] && continue
+                  [ -z "$rs_deploy_uid" ] && continue
+                  [ "$rs_deploy_name" != "gg-monitor" ] && continue
                   [ "$rs_deploy_uid" != "$DEPLOY_UID" ] && continue
 
                   POD_NAME="$candidate"
@@ -1594,10 +1604,20 @@ jobs:
                   [ "$pod_sa" != "gg-monitor" ] && continue
 
                   rs_owner_name="$(jq -r '[.metadata.ownerReferences[]? | select(.controller==true and .kind=="ReplicaSet")][0].name // empty' <<<"$pod_json")"
+                  rs_owner_uid="$(jq -r '[.metadata.ownerReferences[]? | select(.controller==true and .kind=="ReplicaSet")][0].uid // empty' <<<"$pod_json")"
                   [ -z "$rs_owner_name" ] && continue
+                  [ -z "$rs_owner_uid" ] && continue
                   rs_json="$(kubectl get replicaset "$rs_owner_name" -n "$TARGET_NAMESPACE" -o json 2>/dev/null || true)"
                   [ -z "$rs_json" ] && continue
+                  # The pod's OWN claimed ReplicaSet uid must match the ACTUAL fetched ReplicaSet's uid -- a name match alone does not prove the pod is owned by the CURRENT ReplicaSet object (a stale/recreated ReplicaSet can share a name with a different uid).
+                  rs_metadata_uid="$(jq -r '.metadata.uid // empty' <<<"$rs_json")"
+                  [ -z "$rs_metadata_uid" ] && continue
+                  [ "$rs_owner_uid" != "$rs_metadata_uid" ] && continue
+                  rs_deploy_name="$(jq -r '[.metadata.ownerReferences[]? | select(.controller==true and .kind=="Deployment")][0].name // empty' <<<"$rs_json")"
                   rs_deploy_uid="$(jq -r '[.metadata.ownerReferences[]? | select(.controller==true and .kind=="Deployment")][0].uid // empty' <<<"$rs_json")"
+                  [ -z "$rs_deploy_name" ] && continue
+                  [ -z "$rs_deploy_uid" ] && continue
+                  [ "$rs_deploy_name" != "gg-monitor" ] && continue
                   [ "$rs_deploy_uid" != "$DEPLOY_UID" ] && continue
 
                   POD_NAME="$candidate"

@@ -44,6 +44,8 @@ CANONICAL_CONFIG_ROOT = "/etc/gg-canonical"
 STALE_AFTER_SECONDS = 120
 REFRESH_SECONDS = 30
 DEPLOY_UID = "deploy-uid-1"
+RS_UID = "rs-uid-1"
+RS_NAME = "gg-monitor-rs1"
 
 REGISTRY = {
     "environment": ENVIRONMENT,
@@ -256,10 +258,22 @@ def _ready_endpointslice():
     return [{"endpoints": [{"conditions": {"ready": True}}]}]
 
 
-def _replicaset_and_pod():
-    rs_obj = {"metadata": {"name": "gg-monitor-rs1", "ownerReferences": [{"controller": True, "kind": "Deployment", "uid": DEPLOY_UID}]}}
+_UNSET = object()
+
+
+def _replicaset_and_pod(rs_name=RS_NAME, rs_uid=RS_UID, deploy_owner_name="gg-monitor", deploy_owner_uid=DEPLOY_UID,
+                         pod_rs_owner_name=_UNSET, pod_rs_owner_uid=_UNSET):
+    """A correct, full Pod->ReplicaSet->Deployment UID/name ownership chain by default -- pass any of the pod_rs_owner_*/deploy_owner_* kwargs to deliberately corrupt one link for a specific test. Pass pod_rs_owner_name/pod_rs_owner_uid explicitly as None (distinct from the _UNSET default) to omit that key from the pod's ownerReference entirely."""
+    rs_obj = {"metadata": {"name": rs_name, "uid": rs_uid, "ownerReferences": [{"controller": True, "kind": "Deployment", "name": deploy_owner_name, "uid": deploy_owner_uid}]}}
+    pod_owner_ref = {"controller": True, "kind": "ReplicaSet",
+                      "name": rs_name if pod_rs_owner_name is _UNSET else pod_rs_owner_name,
+                      "uid": rs_uid if pod_rs_owner_uid is _UNSET else pod_rs_owner_uid}
+    if pod_owner_ref["uid"] is None:
+        pod_owner_ref.pop("uid")
+    if pod_owner_ref["name"] is None:
+        pod_owner_ref.pop("name")
     pod_obj = {
-        "metadata": {"name": "gg-monitor-rs1-abcde", "ownerReferences": [{"controller": True, "kind": "ReplicaSet", "name": "gg-monitor-rs1"}]},
+        "metadata": {"name": "gg-monitor-rs1-abcde", "ownerReferences": [pod_owner_ref]},
         "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}]},
         "spec": {"serviceAccountName": "gg-monitor"},
     }
@@ -366,6 +380,41 @@ class MonitorAcceptanceClassifierTests(unittest.TestCase):
         cluster = _populate_healthy_cluster(FakeCluster(), app_kwargs={"param_overrides": {"cloudwatch.publishEnabled": "false"}})
         result = _classify(cluster)
         _assert_broken(self, result, "helm parameter cloudwatch.publishEnabled")
+
+    # B3B closeout Issue 5: exact Argo Helm parameter SET (reject extra/duplicate, not merely check the 10 expected values).
+    def test_application_unexpected_extra_helm_parameter_is_broken(self):
+        # Reproduces the exact original defect: all 10 canonical parameters correct, PLUS one unexpected extra parameter -- must be rejected, never accepted merely because the expected 10 all matched.
+        cluster = _populate_healthy_cluster(FakeCluster(), app_kwargs={"param_overrides": {"unexpected.override": "true"}})
+        result = _classify(cluster)
+        _assert_broken(self, result, "helm parameters contain unexpected name(s)")
+        _assert_broken(self, result, "'unexpected.override'")
+
+    def test_application_missing_helm_parameter_is_broken(self):
+        app = _app_obj()
+        app["spec"]["source"]["helm"]["parameters"] = [
+            p for p in app["spec"]["source"]["helm"]["parameters"] if p["name"] != "ingress.alb.certificateArn"
+        ]
+        cluster = _populate_healthy_cluster(FakeCluster())
+        cluster.put("application", monitor_acceptance.ARGOCD_APP_NAME, ARGOCD_NAMESPACE, app)
+        result = _classify(cluster)
+        _assert_broken(self, result, "helm parameters are missing expected name(s)")
+        _assert_broken(self, result, "'ingress.alb.certificateArn'")
+
+    def test_application_duplicate_helm_parameter_name_is_broken(self):
+        # A dict-comprehension collapse ({p["name"]: p["value"] for p in parameters}) would silently keep only the LAST occurrence -- this proves the duplicate is detected before any such collapse.
+        app = _app_obj()
+        app["spec"]["source"]["helm"]["parameters"].append({"name": "image.repository", "value": "some/other/image"})
+        cluster = _populate_healthy_cluster(FakeCluster())
+        cluster.put("application", monitor_acceptance.ARGOCD_APP_NAME, ARGOCD_NAMESPACE, app)
+        result = _classify(cluster)
+        _assert_broken(self, result, "helm parameters contain duplicate name(s)")
+        _assert_broken(self, result, "'image.repository'")
+
+    def test_application_exact_canonical_parameter_set_is_healthy(self):
+        # Positive control: proves the new exact-set validation does not itself introduce a false positive against the existing exact, correct 10-parameter Application.
+        cluster = _populate_healthy_cluster(FakeCluster())
+        result = _classify(cluster)
+        self.assertEqual(result["state"], monitor_acceptance.STATE_HEALTHY, result["reasons"])
 
     # 10. Namespace missing -> BROKEN.
     def test_10_namespace_missing_is_broken(self):
@@ -494,7 +543,7 @@ class MonitorAcceptanceClassifierTests(unittest.TestCase):
         cluster = _populate_healthy_cluster(FakeCluster())
         cluster.put("secretproviderclass", "gg-monitor-secrets", MONITOR_NAMESPACE, _secretproviderclass_obj(objects=objects))
         result = _classify(cluster)
-        _assert_broken(self, result, "is missing expected jmesPath alias")
+        _assert_broken(self, result, "jmesPath is missing expected (path, objectAlias) pair(s)")
 
     # 29. SecretProviderClass unexpected foreign objectName -> BROKEN.
     def test_29_secretproviderclass_unexpected_object_is_broken(self):
@@ -521,6 +570,89 @@ class MonitorAcceptanceClassifierTests(unittest.TestCase):
         cluster.put("secretproviderclass", "gg-monitor-secrets", MONITOR_NAMESPACE, _secretproviderclass_obj(objects=objects))
         result = _classify(cluster)
         _assert_broken(self, result, "duplicate objectName")
+
+    # B3B closeout Issue 2: exact SecretProviderClass field mapping (objectType + (path, objectAlias) pairs, not merely alias presence).
+    def test_secretproviderclass_admin_wrong_object_type_is_broken(self):
+        objects = _spc_objects()
+        objects[0]["objectType"] = "ssmparameter"
+        cluster = _populate_healthy_cluster(FakeCluster())
+        cluster.put("secretproviderclass", "gg-monitor-secrets", MONITOR_NAMESPACE, _secretproviderclass_obj(objects=objects))
+        result = _classify(cluster)
+        _assert_broken(self, result, "objectType='ssmparameter'")
+
+    def test_secretproviderclass_admin_wrong_jmespath_source_field_is_broken(self):
+        # Reproduces the exact original defect: correct objectName, correct alias NAMES, but the jmesPath source field is wrong -- alias-presence-only checking previously let this through as HEALTHY.
+        objects = _spc_objects()
+        objects[0]["jmesPath"][0]["path"] = "WRONG_FIELD"
+        cluster = _populate_healthy_cluster(FakeCluster())
+        cluster.put("secretproviderclass", "gg-monitor-secrets", MONITOR_NAMESPACE, _secretproviderclass_obj(objects=objects))
+        result = _classify(cluster)
+        _assert_broken(self, result, "jmesPath is missing expected (path, objectAlias) pair(s)")
+        _assert_broken(self, result, "jmesPath has unexpected (path, objectAlias) pair(s)")
+
+    def test_secretproviderclass_admin_swapped_username_password_paths_is_broken(self):
+        # Both alias NAMES are still present, but the OGG_ADMIN/OGG_ADMIN_PWD source fields are swapped between them -- must be rejected as a pair-identity mismatch, never accepted merely because both aliases exist somewhere.
+        objects = _spc_objects()
+        objects[0]["jmesPath"][0]["path"], objects[0]["jmesPath"][1]["path"] = (
+            objects[0]["jmesPath"][1]["path"], objects[0]["jmesPath"][0]["path"])
+        cluster = _populate_healthy_cluster(FakeCluster())
+        cluster.put("secretproviderclass", "gg-monitor-secrets", MONITOR_NAMESPACE, _secretproviderclass_obj(objects=objects))
+        result = _classify(cluster)
+        _assert_broken(self, result, "jmesPath is missing expected (path, objectAlias) pair(s)")
+
+    def test_secretproviderclass_admin_duplicate_pair_is_broken(self):
+        objects = _spc_objects()
+        objects[0]["jmesPath"].append(dict(objects[0]["jmesPath"][0]))
+        cluster = _populate_healthy_cluster(FakeCluster())
+        cluster.put("secretproviderclass", "gg-monitor-secrets", MONITOR_NAMESPACE, _secretproviderclass_obj(objects=objects))
+        result = _classify(cluster)
+        _assert_broken(self, result, "jmesPath contains a duplicate (path, objectAlias) pair")
+
+    def test_secretproviderclass_admin_extra_pair_is_broken(self):
+        objects = _spc_objects()
+        objects[0]["jmesPath"].append({"path": "OGG_ADMIN", "objectAlias": "unexpected-extra-alias"})
+        cluster = _populate_healthy_cluster(FakeCluster())
+        cluster.put("secretproviderclass", "gg-monitor-secrets", MONITOR_NAMESPACE, _secretproviderclass_obj(objects=objects))
+        result = _classify(cluster)
+        _assert_broken(self, result, "jmesPath has unexpected (path, objectAlias) pair(s)")
+
+    def test_secretproviderclass_tls_wrong_object_type_is_broken(self):
+        objects = _spc_objects()
+        objects[-1]["objectType"] = "ssmparameter"
+        cluster = _populate_healthy_cluster(FakeCluster())
+        cluster.put("secretproviderclass", "gg-monitor-secrets", MONITOR_NAMESPACE, _secretproviderclass_obj(objects=objects))
+        result = _classify(cluster)
+        _assert_broken(self, result, "(TLS) objectType='ssmparameter'")
+
+    def test_secretproviderclass_tls_wrong_jmespath_source_field_is_broken(self):
+        objects = _spc_objects()
+        objects[-1]["jmesPath"][0]["path"] = "ca-chain.pem"  # missing the required JMESPath-quoted-identifier form
+        cluster = _populate_healthy_cluster(FakeCluster())
+        cluster.put("secretproviderclass", "gg-monitor-secrets", MONITOR_NAMESPACE, _secretproviderclass_obj(objects=objects))
+        result = _classify(cluster)
+        _assert_broken(self, result, "(TLS) jmesPath is missing expected (path, objectAlias) pair(s)")
+
+    def test_secretproviderclass_tls_wrong_alias_is_broken(self):
+        objects = _spc_objects()
+        objects[-1]["jmesPath"][0]["objectAlias"] = "wrong-alias"
+        cluster = _populate_healthy_cluster(FakeCluster())
+        cluster.put("secretproviderclass", "gg-monitor-secrets", MONITOR_NAMESPACE, _secretproviderclass_obj(objects=objects))
+        result = _classify(cluster)
+        _assert_broken(self, result, "(TLS) jmesPath is missing expected (path, objectAlias) pair(s)")
+
+    def test_secretproviderclass_tls_extra_alias_is_broken(self):
+        objects = _spc_objects()
+        objects[-1]["jmesPath"].append({"path": '"ca-chain.pem"', "objectAlias": "extra-alias"})
+        cluster = _populate_healthy_cluster(FakeCluster())
+        cluster.put("secretproviderclass", "gg-monitor-secrets", MONITOR_NAMESPACE, _secretproviderclass_obj(objects=objects))
+        result = _classify(cluster)
+        _assert_broken(self, result, "(TLS) jmesPath has unexpected (path, objectAlias) pair(s)")
+
+    def test_secretproviderclass_exact_correct_mapping_is_healthy(self):
+        # Reproduction proof (positive control): the untouched, exactly-correct SecretProviderClass must remain HEALTHY under the new exact-pair validation.
+        cluster = _populate_healthy_cluster(FakeCluster())
+        result = _classify(cluster)
+        self.assertEqual(result["state"], monitor_acceptance.STATE_HEALTHY, result["reasons"])
 
     # 32. Service missing -> BROKEN.
     def test_32_service_missing_is_broken(self):
@@ -571,6 +703,50 @@ class MonitorAcceptanceClassifierTests(unittest.TestCase):
         cluster.put_list("pods", MONITOR_NAMESPACE, [pod_obj])
         result = _classify(cluster)
         _assert_broken(self, result, "no Ready pod found")
+
+    # B3B closeout Issue 3: full Pod -> ReplicaSet -> Deployment UID/name ownership chain (never a name-only match).
+    def test_pod_ownership_correct_full_uid_chain_is_accepted(self):
+        cluster = _populate_healthy_cluster(FakeCluster())
+        result = _classify(cluster)
+        self.assertEqual(result["state"], monitor_acceptance.STATE_HEALTHY, result["reasons"])
+        self.assertEqual(result["checks"]["ready_pod_name"], "gg-monitor-rs1-abcde")
+
+    def test_pod_owner_replicaset_uid_mismatch_is_rejected(self):
+        # The pod's ownerReference NAME matches the real ReplicaSet, but the pod's claimed uid does not match the fetched ReplicaSet's actual metadata.uid -- a name match alone must never be trusted.
+        cluster = _populate_healthy_cluster(FakeCluster())
+        rs_obj, pod_obj = _replicaset_and_pod(pod_rs_owner_uid="rs-uid-STALE")
+        cluster.put("replicaset", RS_NAME, MONITOR_NAMESPACE, rs_obj)
+        cluster.put_list("pods", MONITOR_NAMESPACE, [pod_obj])
+        result = _classify(cluster)
+        _assert_broken(self, result, "no Ready pod found")
+        self.assertIsNone(result["checks"]["ready_pod_name"])
+
+    def test_pod_owner_replicaset_uid_missing_is_rejected(self):
+        cluster = _populate_healthy_cluster(FakeCluster())
+        rs_obj, pod_obj = _replicaset_and_pod(pod_rs_owner_uid=None)
+        cluster.put("replicaset", RS_NAME, MONITOR_NAMESPACE, rs_obj)
+        cluster.put_list("pods", MONITOR_NAMESPACE, [pod_obj])
+        result = _classify(cluster)
+        _assert_broken(self, result, "no Ready pod found")
+        self.assertIsNone(result["checks"]["ready_pod_name"])
+
+    def test_replicaset_deployment_owner_name_wrong_is_rejected(self):
+        cluster = _populate_healthy_cluster(FakeCluster())
+        rs_obj, pod_obj = _replicaset_and_pod(deploy_owner_name="some-other-deployment")
+        cluster.put("replicaset", RS_NAME, MONITOR_NAMESPACE, rs_obj)
+        cluster.put_list("pods", MONITOR_NAMESPACE, [pod_obj])
+        result = _classify(cluster)
+        _assert_broken(self, result, "no Ready pod found")
+        self.assertIsNone(result["checks"]["ready_pod_name"])
+
+    def test_replicaset_deployment_owner_uid_wrong_is_rejected(self):
+        cluster = _populate_healthy_cluster(FakeCluster())
+        rs_obj, pod_obj = _replicaset_and_pod(deploy_owner_uid="some-other-deployment-uid")
+        cluster.put("replicaset", RS_NAME, MONITOR_NAMESPACE, rs_obj)
+        cluster.put_list("pods", MONITOR_NAMESPACE, [pod_obj])
+        result = _classify(cluster)
+        _assert_broken(self, result, "no Ready pod found")
+        self.assertIsNone(result["checks"]["ready_pod_name"])
 
     # 40. healthz/readyz both healthy (200/200) -> stays HEALTHY.
     def test_40_healthz_readyz_200_stays_healthy(self):

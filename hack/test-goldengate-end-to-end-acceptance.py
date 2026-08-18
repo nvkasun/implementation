@@ -95,6 +95,44 @@ class EndToEndAcceptanceTests(unittest.TestCase):
         result = e2e.classify(ENVIRONMENT, _active_deployments(), {"generatedAt": 1})
         _assert_broken(self, result, "missing a 'deployments' list")
 
+    # B3B closeout Issue 4: a malformed deployment row must never be silently discarded -- it is itself a BROKEN condition, even when the rest of the inventory is exactly correct.
+    def test_healthy_inventory_plus_non_object_row_is_broken(self):
+        doc = _healthy_api_doc()
+        doc["deployments"].append({"foo": "bar"})
+        result = e2e.classify(ENVIRONMENT, _active_deployments(), doc)
+        _assert_broken(self, result, "is missing deploymentName")
+        # The exact-inventory checks (missing/extra) must not be fooled into HEALTHY just because the malformed row happens to add no new name.
+        self.assertNotIn("missing expected ACTIVE deployment(s)", " ".join(result["reasons"]))
+
+    def test_healthy_inventory_plus_null_deployment_name_is_broken(self):
+        doc = _healthy_api_doc()
+        doc["deployments"].append({"deploymentName": None})
+        result = e2e.classify(ENVIRONMENT, _active_deployments(), doc)
+        _assert_broken(self, result, "is missing deploymentName")
+
+    def test_healthy_inventory_plus_empty_deployment_name_is_broken(self):
+        doc = _healthy_api_doc()
+        doc["deployments"].append({"deploymentName": ""})
+        result = e2e.classify(ENVIRONMENT, _active_deployments(), doc)
+        _assert_broken(self, result, "has an empty deploymentName")
+
+    def test_healthy_inventory_plus_integer_deployment_name_is_broken(self):
+        doc = _healthy_api_doc()
+        doc["deployments"].append({"deploymentName": 12345})
+        result = e2e.classify(ENVIRONMENT, _active_deployments(), doc)
+        _assert_broken(self, result, "has a non-string deploymentName")
+
+    def test_healthy_inventory_plus_non_object_row_at_list_index_is_reported_with_index(self):
+        doc = _healthy_api_doc()
+        doc["deployments"].append("not-an-object")
+        result = e2e.classify(ENVIRONMENT, _active_deployments(), doc)
+        _assert_broken(self, result, f"deployment row #{len(doc['deployments']) - 1} is not an object")
+
+    def test_exact_valid_inventory_with_no_malformed_rows_remains_healthy(self):
+        # Positive control: proves the new malformed-row validation does not itself introduce a false positive against the existing exact, valid inventory.
+        result = e2e.classify(ENVIRONMENT, _active_deployments(), _healthy_api_doc())
+        self.assertEqual(result["state"], e2e.STATE_HEALTHY, result["reasons"])
+
     # 4. Missing expected ACTIVE deployment -> BROKEN.
     def test_4_missing_expected_deployment_is_broken(self):
         doc = _healthy_api_doc()

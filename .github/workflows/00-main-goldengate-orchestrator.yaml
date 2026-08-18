@@ -4373,12 +4373,128 @@ jobs:
       - validate_monitor_ready
       - replication_monitor_acceptance
       - end_to_end_deployment_acceptance
-    # Phase B3A: runtime_ownership_preflight/validate_active_runtimes are added explicitly here (not merely relied on transitively through build_publish_and_deploy/replication_reconcile_once's own skip-on-upstream-failure behavior) -- both are jobs whose own FAILURE (BROKEN ownership, or an unhealthy active runtime) must itself prevent MAIN from claiming a successful run, not just cause a downstream job to be quietly skipped. Phase B3B: validate_argocd_ready/validate_platform_ready/validate_observability_ready/monitor_ownership_preflight/validate_monitor_ready/end_to_end_deployment_acceptance are added the same way, for the same reason -- end_to_end_deployment_acceptance itself only runs when its own upstream chain (including the three validate_*_ready jobs) succeeded, so a bare failure there would otherwise SKIP end_to_end_deployment_acceptance rather than fail it, and a skip is never a failure under the existing "!= failure && != cancelled" pattern; listing every one of these jobs here directly closes that gap instead of relying only on transitive failure/skip propagation.
-    if: ${{ always() && needs.validate_shared_secrets_once.result == 'success' && needs.validate_argocd_ready.result != 'failure' && needs.validate_argocd_ready.result != 'cancelled' && needs.validate_platform_ready.result != 'failure' && needs.validate_platform_ready.result != 'cancelled' && needs.validate_observability_ready.result != 'failure' && needs.validate_observability_ready.result != 'cancelled' && needs.runtime_ownership_preflight.result != 'failure' && needs.runtime_ownership_preflight.result != 'cancelled' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' && needs.validate_active_runtimes.result != 'failure' && needs.validate_active_runtimes.result != 'cancelled' && needs.replication_reconcile_once.result != 'failure' && needs.replication_reconcile_once.result != 'cancelled' && needs.replication_dry_run_validation.result != 'failure' && needs.replication_dry_run_validation.result != 'cancelled' && needs.monitor_ownership_preflight.result != 'failure' && needs.monitor_ownership_preflight.result != 'cancelled' && needs.monitor_sync_once.result != 'failure' && needs.monitor_sync_once.result != 'cancelled' && needs.monitor_dry_run_validation.result != 'failure' && needs.monitor_dry_run_validation.result != 'cancelled' && needs.validate_monitor_ready.result != 'failure' && needs.validate_monitor_ready.result != 'cancelled' && needs.replication_monitor_acceptance.result != 'failure' && needs.replication_monitor_acceptance.result != 'cancelled' && needs.end_to_end_deployment_acceptance.result != 'failure' && needs.end_to_end_deployment_acceptance.result != 'cancelled' }}
+    # Phase B3B closeout: final_validation now ALWAYS runs (never itself conditionally skipped by GitHub's default implicit "all needs succeeded" behavior) so it can fail CLOSED -- with useful diagnostics -- when a REQUIRED job was unexpectedly skipped, rather than the job itself silently disappearing. The prior single "!= failure && != cancelled" expression here let a SKIPPED required gate through undetected (skipped is neither failure nor cancelled); the actual mode-aware pass/fail contract now lives entirely in the "Validate the mode-aware final DEPLOY success contract" step below -- one small, explicit, readable branch per resolved mode, never one giant accidental-truth if: expression.
+    if: always()
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
     steps:
+      - name: Validate the mode-aware final DEPLOY success contract
+        shell: bash
+        env:
+          EFFECTIVE_DEPLOY: ${{ needs.validate_model.outputs.effective_deploy }}
+          HAS_ACTIVE_DEPLOYMENTS: ${{ needs.validate_model.outputs.has_active_deployments }}
+          RESULT_validate_shared_secrets_once: ${{ needs.validate_shared_secrets_once.result }}
+          RESULT_validate_argocd_ready: ${{ needs.validate_argocd_ready.result }}
+          RESULT_validate_platform_ready: ${{ needs.validate_platform_ready.result }}
+          RESULT_validate_observability_ready: ${{ needs.validate_observability_ready.result }}
+          RESULT_runtime_ownership_preflight: ${{ needs.runtime_ownership_preflight.result }}
+          RESULT_build_publish_and_deploy: ${{ needs.build_publish_and_deploy.result }}
+          RESULT_delete_removed_argocd_applications: ${{ needs.delete_removed_argocd_applications.result }}
+          RESULT_validate_active_runtimes: ${{ needs.validate_active_runtimes.result }}
+          RESULT_replication_reconcile_once: ${{ needs.replication_reconcile_once.result }}
+          RESULT_replication_dry_run_validation: ${{ needs.replication_dry_run_validation.result }}
+          RESULT_monitor_ownership_preflight: ${{ needs.monitor_ownership_preflight.result }}
+          RESULT_monitor_sync_once: ${{ needs.monitor_sync_once.result }}
+          RESULT_monitor_dry_run_validation: ${{ needs.monitor_dry_run_validation.result }}
+          RESULT_validate_monitor_ready: ${{ needs.validate_monitor_ready.result }}
+          RESULT_replication_monitor_acceptance: ${{ needs.replication_monitor_acceptance.result }}
+          RESULT_end_to_end_deployment_acceptance: ${{ needs.end_to_end_deployment_acceptance.result }}
+        run: |
+          set -euo pipefail
+
+          echo "Resolved mode: effective_deploy=${EFFECTIVE_DEPLOY} has_active_deployments=${HAS_ACTIVE_DEPLOYMENTS}"
+
+          if [ "$EFFECTIVE_DEPLOY" != "true" ] && [ "$EFFECTIVE_DEPLOY" != "false" ]; then
+            echo "FAIL: validate_model.outputs.effective_deploy is '${EFFECTIVE_DEPLOY}', expected literal 'true' or 'false' -- validate_model itself did not produce a usable outcome, so MAIN cannot resolve which mode-aware contract applies."
+            exit 1
+          fi
+
+          FAILED="false"
+
+          require_success() {
+            local job_name="$1"
+            local result_var="RESULT_${job_name}"
+            local result="${!result_var}"
+            if [ "$result" != "success" ]; then
+              echo "FAIL: required job '${job_name}' has result '${result}', expected 'success'. A SKIPPED (or failed/cancelled) REQUIRED gate must prevent MAIN from claiming deployment success."
+              FAILED="true"
+            else
+              echo "OK: required job '${job_name}' succeeded."
+            fi
+          }
+
+          allow_non_failure() {
+            local job_name="$1"
+            local result_var="RESULT_${job_name}"
+            local result="${!result_var}"
+            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+              echo "FAIL: job '${job_name}' has result '${result}' -- this job is not required to run in the current resolved mode, but a real failure/cancellation must still block MAIN."
+              FAILED="true"
+            else
+              echo "OK: job '${job_name}' result '${result}' is acceptable in the current resolved mode (not a real failure/cancellation)."
+            fi
+          }
+
+          # Foundational -- required in every mode.
+          require_success validate_shared_secrets_once
+
+          # These are gated on the SELECTED-deployment-matrix dimension (has_changes), which is orthogonal to the effective_deploy/has_active_deployments mode contract below -- never required to be exactly successful here (a "nothing changed this run" real deploy legitimately skips them), but a real failure/cancellation must still block MAIN. Unchanged from the prior behavior.
+          allow_non_failure runtime_ownership_preflight
+          allow_non_failure build_publish_and_deploy
+          allow_non_failure delete_removed_argocd_applications
+
+          if [ "$EFFECTIVE_DEPLOY" = "true" ]; then
+            echo "REAL DEPLOY: Argo CD / Platform / Observability readiness are unconditionally required."
+            require_success validate_argocd_ready
+            require_success validate_platform_ready
+            require_success validate_observability_ready
+
+            if [ "$HAS_ACTIVE_DEPLOYMENTS" = "true" ]; then
+              echo "REAL DEPLOY + ACTIVE RUNTIMES: the full runtime/replication/monitor/E2E acceptance chain is unconditionally required -- a SKIPPED value for any of these must fail this gate, not merely pass through as 'not a failure'."
+              require_success validate_active_runtimes
+              require_success replication_reconcile_once
+              require_success monitor_ownership_preflight
+              require_success monitor_sync_once
+              require_success validate_monitor_ready
+              require_success replication_monitor_acceptance
+              require_success end_to_end_deployment_acceptance
+            else
+              echo "REAL DEPLOY + NO ACTIVE RUNTIMES: the runtime/replication/monitor/E2E acceptance chain is legitimately not applicable and may be cleanly skipped -- only a real failure/cancellation blocks MAIN."
+              allow_non_failure validate_active_runtimes
+              allow_non_failure replication_reconcile_once
+              allow_non_failure monitor_ownership_preflight
+              allow_non_failure monitor_sync_once
+              allow_non_failure validate_monitor_ready
+              allow_non_failure replication_monitor_acceptance
+              allow_non_failure end_to_end_deployment_acceptance
+            fi
+          else
+            echo "DRY RUN: live Argo CD / Platform / Observability / runtime / monitor deployment gates are legitimately skipped -- the existing dry-run validation path governs success instead."
+            allow_non_failure validate_argocd_ready
+            allow_non_failure validate_platform_ready
+            allow_non_failure validate_observability_ready
+            allow_non_failure validate_active_runtimes
+            allow_non_failure replication_reconcile_once
+            allow_non_failure monitor_ownership_preflight
+            allow_non_failure monitor_sync_once
+            allow_non_failure validate_monitor_ready
+            allow_non_failure replication_monitor_acceptance
+            allow_non_failure end_to_end_deployment_acceptance
+
+            require_success replication_dry_run_validation
+            require_success monitor_dry_run_validation
+          fi
+
+          if [ "$FAILED" = "true" ]; then
+            echo ""
+            echo "FAIL: the mode-aware final DEPLOY success contract was not satisfied -- see diagnostics above. MAIN cannot claim deployment success."
+            exit 1
+          fi
+
+          echo ""
+          echo "OK: every REQUIRED gate for the resolved mode (effective_deploy=${EFFECTIVE_DEPLOY}, has_active_deployments=${HAS_ACTIVE_DEPLOYMENTS}) succeeded."
+
       - name: Checkout repository
         uses: actions/checkout@v4
 

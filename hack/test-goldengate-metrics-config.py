@@ -750,9 +750,14 @@ exit 1
 
 
 # The main workflow's CloudWatch preflight verifies Deployment/ReplicaSet ownership, not just a label match: extracts the real committed pod-selection fragment and drives it against a mocked kubectl/jq backed by JSON fixtures.
+_UNSET = object()
+
+
 class MainWorkflowPodOwnershipTests(unittest.TestCase):
     DEPLOY_UID = "dep-uid-current"
     STALE_DEPLOY_UID = "dep-uid-STALE"
+    RS_UID = "rs-uid-current"
+    STALE_RS_UID = "rs-uid-STALE"
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
@@ -779,10 +784,15 @@ class MainWorkflowPodOwnershipTests(unittest.TestCase):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def _pod(self, name, phase="Running", ready=True, deletion_ts=None,
-              service_account="gg-monitor", rs_owner="gg-monitor-rs-current"):
+              service_account="gg-monitor", rs_owner="gg-monitor-rs-current", rs_owner_uid=_UNSET):
         owner_refs = []
         if rs_owner:
-            owner_refs = [{"controller": True, "kind": "ReplicaSet", "name": rs_owner}]
+            owner_ref = {"controller": True, "kind": "ReplicaSet", "name": rs_owner}
+            # _UNSET (not passed) means "use the correct current RS_UID"; explicit None means "omit the uid key entirely" -- distinct from _UNSET so a test can deliberately construct a pod ownerReference missing uid.
+            uid_value = self.RS_UID if rs_owner_uid is _UNSET else rs_owner_uid
+            if uid_value is not None:
+                owner_ref["uid"] = uid_value
+            owner_refs = [owner_ref]
         pod = {
             "metadata": {"name": name, "ownerReferences": owner_refs},
             "status": {
@@ -795,7 +805,9 @@ class MainWorkflowPodOwnershipTests(unittest.TestCase):
             pod["metadata"]["deletionTimestamp"] = deletion_ts
         return pod
 
-    def _write_fixtures(self, pods, deploy_uid=None, rs_owner_uid_by_name=None):
+    def _write_fixtures(self, pods, deploy_uid=None, rs_owner_uid_by_name=None,
+                         rs_metadata_uid_by_name=None, rs_deploy_name_by_name=None):
+        """rs_owner_uid_by_name: RS name -> the RS's OWN ownerReference.uid pointing at its controlling Deployment (required, one entry per RS to stage). rs_metadata_uid_by_name: RS name -> the RS's own metadata.uid (defaults to self.RS_UID; pass None explicitly to omit the key entirely). rs_deploy_name_by_name: RS name -> the RS's ownerReference.name for its controlling Deployment (defaults to "gg-monitor")."""
         deploy = {
             "metadata": {"uid": deploy_uid or self.DEPLOY_UID},
             "spec": {"selector": {"matchLabels": {"app.kubernetes.io/name": "gg-monitor"}}},
@@ -805,7 +817,12 @@ class MainWorkflowPodOwnershipTests(unittest.TestCase):
         with open(os.path.join(self.fixture_dir, "pods.json"), "w") as f:
             json.dump({"items": pods}, f)
         for rs_name, owner_uid in (rs_owner_uid_by_name or {}).items():
-            rs = {"metadata": {"ownerReferences": [{"controller": True, "kind": "Deployment", "uid": owner_uid}]}}
+            deploy_owner_name = (rs_deploy_name_by_name or {}).get(rs_name, "gg-monitor")
+            rs_metadata = {"ownerReferences": [{"controller": True, "kind": "Deployment", "name": deploy_owner_name, "uid": owner_uid}]}
+            rs_metadata_uid = self.RS_UID if rs_metadata_uid_by_name is None or rs_name not in rs_metadata_uid_by_name else rs_metadata_uid_by_name[rs_name]
+            if rs_metadata_uid is not None:
+                rs_metadata["uid"] = rs_metadata_uid
+            rs = {"metadata": rs_metadata}
             with open(os.path.join(self.rs_dir, f"{rs_name}.json"), "w") as f:
                 json.dump(rs, f)
 
@@ -894,6 +911,151 @@ exit 1
         combined = proc.stdout + proc.stderr
         self.assertNotIn('"ownerReferences"', combined)
         self.assertNotIn('"selector"', combined)
+
+    # B3B closeout Issue 3: full Pod -> ReplicaSet -> Deployment UID/name ownership chain (never a name-only match).
+    def test_pod_owner_replicaset_uid_mismatch_is_rejected(self):
+        # The pod's ownerReference NAME matches the real ReplicaSet, but the pod's claimed uid does not match the fetched ReplicaSet's actual metadata.uid.
+        self._write_fixtures(
+            pods=[self._pod("gg-monitor-abc", rs_owner_uid=self.STALE_RS_UID)],
+            rs_owner_uid_by_name={"gg-monitor-rs-current": self.DEPLOY_UID},
+        )
+        proc = self._run_fragment()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("BOOTSTRAP/REPAIR PATH: no suitable existing Ready gg-monitor pod found", proc.stdout)
+
+    def test_pod_owner_replicaset_uid_missing_is_rejected(self):
+        self._write_fixtures(
+            pods=[self._pod("gg-monitor-abc", rs_owner_uid=None)],
+            rs_owner_uid_by_name={"gg-monitor-rs-current": self.DEPLOY_UID},
+        )
+        proc = self._run_fragment()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("BOOTSTRAP/REPAIR PATH: no suitable existing Ready gg-monitor pod found", proc.stdout)
+
+    def test_replicaset_metadata_uid_missing_is_rejected(self):
+        self._write_fixtures(
+            pods=[self._pod("gg-monitor-abc")],
+            rs_owner_uid_by_name={"gg-monitor-rs-current": self.DEPLOY_UID},
+            rs_metadata_uid_by_name={"gg-monitor-rs-current": None},
+        )
+        proc = self._run_fragment()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("BOOTSTRAP/REPAIR PATH: no suitable existing Ready gg-monitor pod found", proc.stdout)
+
+    def test_replicaset_deployment_owner_name_wrong_is_rejected(self):
+        self._write_fixtures(
+            pods=[self._pod("gg-monitor-abc")],
+            rs_owner_uid_by_name={"gg-monitor-rs-current": self.DEPLOY_UID},
+            rs_deploy_name_by_name={"gg-monitor-rs-current": "some-other-deployment"},
+        )
+        proc = self._run_fragment()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("BOOTSTRAP/REPAIR PATH: no suitable existing Ready gg-monitor pod found", proc.stdout)
+
+    def test_replicaset_deployment_owner_uid_wrong_is_rejected(self):
+        # Same as test_rejects_pod_owned_by_a_stale_replicaset above -- named to match the B3B closeout task's exact scenario list.
+        self._write_fixtures(
+            pods=[self._pod("gg-monitor-abc")],
+            rs_owner_uid_by_name={"gg-monitor-rs-current": self.STALE_DEPLOY_UID},
+        )
+        proc = self._run_fragment()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("BOOTSTRAP/REPAIR PATH: no suitable existing Ready gg-monitor pod found", proc.stdout)
+
+
+# B3B closeout: the Bootstrap/repair path step reuses the IDENTICAL pod-selection loop (byte-for-byte) as the Detect step above -- this class re-runs the exact same fixtures against THAT step's own fragment, proving both 50-SUB selection loops enforce the same full UID-chain checks, never just one of the two.
+class MainWorkflowBootstrapRepairPodOwnershipTests(MainWorkflowPodOwnershipTests):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.bin_dir = os.path.join(self.tmpdir, "bin")
+        self.fixture_dir = os.path.join(self.tmpdir, "fixtures")
+        self.rs_dir = os.path.join(self.fixture_dir, "replicasets")
+        os.makedirs(self.bin_dir)
+        os.makedirs(self.rs_dir)
+
+        step = _get_step(MONITOR_WORKFLOW_PATH, "Bootstrap/repair path -- CONFIG gate via newly Ready pod, then finalize CloudWatch publication")
+        run_text = step["run"]
+        start_marker = "POD_NAME=\"\""
+        start = run_text.index(start_marker)
+        end_marker = "if [ -z \"$POD_NAME\" ]; then"
+        end = run_text.index(end_marker, start)
+        self.fragment = run_text[start:end]
+
+        real_jq = shutil.which("jq")
+        assert real_jq, "jq must be installed to run this test"
+        os.symlink(real_jq, os.path.join(self.bin_dir, "jq"))
+
+    def _run_fragment(self):
+        return run_step_script(
+            MONITOR_WORKFLOW_PATH, "Bootstrap/repair path (pod selection fragment)", self.fragment,
+            {
+                "TARGET_NAMESPACE": "goldengate-monitoring",
+            },
+            bin_dir=self.bin_dir,
+        )
+
+    # The base class's tests assert specific FAST PATH / BOOTSTRAP-REPAIR PATH echo text and a 0 exit code that only the Detect step's fragment produces (this step's own fragment is a bare selection loop with no such echo/exit contract) -- override with assertions on the one thing both fragments share: whether $POD_NAME ends up set.
+    def _assert_pod_selected(self, proc, expected_name):
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        check = run_step_script(MONITOR_WORKFLOW_PATH, "pod name probe", self.fragment + '\necho "POD_NAME_RESULT=${POD_NAME}"',
+                                 {"TARGET_NAMESPACE": "goldengate-monitoring"}, bin_dir=self.bin_dir)
+        self.assertIn(f"POD_NAME_RESULT={expected_name}", check.stdout)
+
+    def _assert_no_pod_selected(self, proc):
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        check = run_step_script(MONITOR_WORKFLOW_PATH, "pod name probe", self.fragment + '\necho "POD_NAME_RESULT=${POD_NAME}"',
+                                 {"TARGET_NAMESPACE": "goldengate-monitoring"}, bin_dir=self.bin_dir)
+        self.assertIn("POD_NAME_RESULT=", check.stdout)
+        self.assertNotIn("POD_NAME_RESULT=gg-monitor", check.stdout)
+
+    def test_selects_pod_owned_by_current_deployment(self):
+        self._write_fixtures(pods=[self._pod("gg-monitor-abc")], rs_owner_uid_by_name={"gg-monitor-rs-current": self.DEPLOY_UID})
+        self._assert_pod_selected(self._run_fragment(), "gg-monitor-abc")
+
+    def test_rejects_pod_owned_by_a_stale_replicaset(self):
+        self._write_fixtures(pods=[self._pod("gg-monitor-old")], rs_owner_uid_by_name={"gg-monitor-rs-current": self.STALE_DEPLOY_UID})
+        self._assert_no_pod_selected(self._run_fragment())
+
+    def test_rejects_pod_with_wrong_service_account(self):
+        self._write_fixtures(pods=[self._pod("gg-monitor-wrong-sa", service_account="default")], rs_owner_uid_by_name={"gg-monitor-rs-current": self.DEPLOY_UID})
+        self._assert_no_pod_selected(self._run_fragment())
+
+    def test_rejects_terminating_pod(self):
+        self._write_fixtures(pods=[self._pod("gg-monitor-terminating", deletion_ts="2024-01-01T00:00:00Z")], rs_owner_uid_by_name={"gg-monitor-rs-current": self.DEPLOY_UID})
+        self._assert_no_pod_selected(self._run_fragment())
+
+    def test_rejects_not_ready_pod(self):
+        self._write_fixtures(pods=[self._pod("gg-monitor-not-ready", ready=False)], rs_owner_uid_by_name={"gg-monitor-rs-current": self.DEPLOY_UID})
+        self._assert_no_pod_selected(self._run_fragment())
+
+    def test_never_prints_full_pod_deployment_or_replicaset_object(self):
+        self._write_fixtures(pods=[self._pod("gg-monitor-abc")], rs_owner_uid_by_name={"gg-monitor-rs-current": self.DEPLOY_UID})
+        proc = self._run_fragment()
+        combined = proc.stdout + proc.stderr
+        self.assertNotIn('"ownerReferences"', combined)
+        self.assertNotIn('"selector"', combined)
+
+    def test_pod_owner_replicaset_uid_mismatch_is_rejected(self):
+        self._write_fixtures(pods=[self._pod("gg-monitor-abc", rs_owner_uid=self.STALE_RS_UID)], rs_owner_uid_by_name={"gg-monitor-rs-current": self.DEPLOY_UID})
+        self._assert_no_pod_selected(self._run_fragment())
+
+    def test_pod_owner_replicaset_uid_missing_is_rejected(self):
+        self._write_fixtures(pods=[self._pod("gg-monitor-abc", rs_owner_uid=None)], rs_owner_uid_by_name={"gg-monitor-rs-current": self.DEPLOY_UID})
+        self._assert_no_pod_selected(self._run_fragment())
+
+    def test_replicaset_metadata_uid_missing_is_rejected(self):
+        self._write_fixtures(pods=[self._pod("gg-monitor-abc")], rs_owner_uid_by_name={"gg-monitor-rs-current": self.DEPLOY_UID},
+                              rs_metadata_uid_by_name={"gg-monitor-rs-current": None})
+        self._assert_no_pod_selected(self._run_fragment())
+
+    def test_replicaset_deployment_owner_name_wrong_is_rejected(self):
+        self._write_fixtures(pods=[self._pod("gg-monitor-abc")], rs_owner_uid_by_name={"gg-monitor-rs-current": self.DEPLOY_UID},
+                              rs_deploy_name_by_name={"gg-monitor-rs-current": "some-other-deployment"})
+        self._assert_no_pod_selected(self._run_fragment())
+
+    def test_replicaset_deployment_owner_uid_wrong_is_rejected(self):
+        self._write_fixtures(pods=[self._pod("gg-monitor-abc")], rs_owner_uid_by_name={"gg-monitor-rs-current": self.STALE_DEPLOY_UID})
+        self._assert_no_pod_selected(self._run_fragment())
 
 
 if __name__ == "__main__":

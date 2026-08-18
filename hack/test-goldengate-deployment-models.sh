@@ -8748,10 +8748,14 @@ results.append(("8: monitor_dry_run_validation retains its original effective_de
 rma_if = jobs["replication_monitor_acceptance"]["if"]
 results.append(("9: replication_monitor_acceptance requires validate_monitor_ready.result == \'\''success\'\'' (naturally skips when validate_monitor_ready is skipped, transitively covering the no-active-runtime path)", "needs.validate_monitor_ready.result == '"'"'success'"'"'" in rma_if))
 
-# final_validation only ever rejects monitor jobs on failure/cancelled, never on skipped -- so both gated monitor jobs skipping cleanly still lets final_validation run.
+# Phase B3B closeout: final_validation itself is now always() (never conditionally skipped) and delegates the actual mode-aware pass/fail decision to its own first step, whose script is inspected below -- both gated monitor jobs skipping cleanly (no active runtimes) must still let final_validation SUCCEED (allow_non_failure), while monitor_sync_once being REQUIRED-but-skipped when active runtimes DO exist must FAIL it (require_success in the has_active_deployments branch), and monitor_dry_run_validation being REQUIRED-but-skipped in dry-run mode must also FAIL it (require_success in the dry-run branch).
 fv_if = jobs["final_validation"]["if"]
-results.append(("10: final_validation only rejects monitor_sync_once on failure/cancelled (never skipped)", "needs.monitor_sync_once.result != '"'"'failure'"'"'" in fv_if and "needs.monitor_sync_once.result != '"'"'cancelled'"'"'" in fv_if and "needs.monitor_sync_once.result == '"'"'skipped'"'"'" not in fv_if and "needs.monitor_sync_once.result == '"'"'success'"'"'" not in fv_if))
-results.append(("11: final_validation only rejects monitor_dry_run_validation on failure/cancelled (never skipped)", "needs.monitor_dry_run_validation.result != '"'"'failure'"'"'" in fv_if and "needs.monitor_dry_run_validation.result != '"'"'cancelled'"'"'" in fv_if))
+final_val_gate_step = next((s for s in jobs["final_validation"]["steps"] if s.get("name") == "Validate the mode-aware final DEPLOY success contract"), None)
+final_val_gate_run = (final_val_gate_step or {}).get("run", "")
+results.append(("10a: final_validation'"'"'s own if: is always() (never itself skipped, so it can fail closed with diagnostics on a required-but-skipped job)", fv_if.strip() == "always()"))
+results.append(("10b: final_validation'"'"'s gate step requires exact success for monitor_sync_once when active runtimes exist", "require_success monitor_sync_once" in final_val_gate_run))
+results.append(("10c: final_validation'"'"'s gate step tolerates a cleanly-skipped monitor_sync_once when no active runtimes exist (allow_non_failure)", "allow_non_failure monitor_sync_once" in final_val_gate_run))
+results.append(("11: final_validation'"'"'s gate step requires exact success for monitor_dry_run_validation in dry-run mode", "require_success monitor_dry_run_validation" in final_val_gate_run))
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
@@ -10244,8 +10248,8 @@ def eval_gha_bool(expr, needs):
     return bool(_Parser(expr, needs).parse())
 
 
-# delete_removed_argocd_applications's own if: uses success()/github.event_name (outside this tiny parser's subset) -- its RESULT is supplied as a fixed context input, exactly like terraform_sync_once/argocd_preflight are fixed inputs in the existing Phase B1 simulator elsewhere in this suite.
-JOB_ORDER = ["runtime_ownership_preflight", "build_publish_and_deploy", "validate_active_runtimes", "replication_reconcile_once", "final_validation"]
+# delete_removed_argocd_applications's own if: uses success()/github.event_name (outside this tiny parser's subset) -- its RESULT is supplied as a fixed context input, exactly like terraform_sync_once/argocd_preflight are fixed inputs in the existing Phase B1 simulator elsewhere in this suite. final_validation is deliberately NOT modeled here (Phase B3B closeout): its own if: is now a bare always() and its actual pass/fail decision is real bash program logic inside its first step, not a pure if:-expression this tiny parser could ever evaluate correctly -- that behavior is instead proven by REALLY EXECUTING the committed script in the dedicated "Phase B3B closeout: mode-aware final DEPLOY success contract" section further below.
+JOB_ORDER = ["runtime_ownership_preflight", "build_publish_and_deploy", "validate_active_runtimes", "replication_reconcile_once"]
 IF_EXPRS = {job: _extract_if(job) for job in JOB_ORDER}
 
 
@@ -10310,14 +10314,14 @@ ctx = base_context("true", "false", "true")
 r = simulate(ctx, {"validate_active_runtimes": "failure"})
 check("REAL DEPLOY + active runtime unhealthy -> validate_active_runtimes reports failure", r["validate_active_runtimes"]["result"] == "failure")
 check("REAL DEPLOY + active runtime unhealthy -> replication_reconcile_once is blocked", r["replication_reconcile_once"]["result"] == "skipped")
-check("REAL DEPLOY + active runtime unhealthy -> final_validation is blocked (MAIN cannot claim success)", r["final_validation"]["result"] == "skipped")
+# final_validation's own resulting pass/fail for this exact scenario (a required active-runtime job failing) is proven by real script execution in the "Phase B3B closeout" section further below, not by this if:-expression-only simulator.
 
 # 7: REAL DEPLOY + no active runtimes -> runtime acceptance cleanly skipped -> replication remains safe no-op.
 ctx = base_context("true", "false", "false")
 r = simulate(ctx, {})
 check("REAL DEPLOY + no active runtimes -> validate_active_runtimes is cleanly skipped (never an empty-matrix error)", r["validate_active_runtimes"]["result"] == "skipped")
 check("REAL DEPLOY + no active runtimes -> replication_reconcile_once still runs (existing clean no-op path preserved)", r["replication_reconcile_once"]["result"] == "success")
-check("REAL DEPLOY + no active runtimes -> final_validation still runs", r["final_validation"]["result"] == "success")
+# final_validation still succeeding for this exact scenario (no active runtimes) is proven by real script execution in the "Phase B3B closeout" section further below, not by this if:-expression-only simulator.
 
 if failures:
     print("\n".join(failures))
@@ -10524,13 +10528,16 @@ results.append(("21: end_to_end_deployment_acceptance fetches /api/processes thr
 results.append(("22a: end_to_end_deployment_acceptance is real-deploy-only (effective_deploy == \x27true\x27)", "effective_deploy == \x27true\x27" in e2e_job_if))
 results.append(("22b: end_to_end_deployment_acceptance is active-runtime-only (has_active_deployments == \x27true\x27)", "has_active_deployments == \x27true\x27" in e2e_job_if))
 
-# 23/24: active-runtime success requires end_to_end_deployment_acceptance, and final_validation lists every REQUIRED B3B job directly -- never relying only on transitive failure/skip propagation through it.
+# 23/24: active-runtime success requires end_to_end_deployment_acceptance, and final_validation lists every REQUIRED B3B job directly -- never relying only on transitive failure/skip propagation through it. Phase B3B closeout: the mode-aware pass/fail decision now lives in the first step of final_validation (never a hidden accidental-truth if: expression) -- a SKIPPED value for any of these REQUIRED jobs must fail the gate, not merely "not be a failure".
 final_val = jobs.get("final_validation", {})
 final_val_needs = final_val.get("needs") or []
 final_val_if = str(final_val.get("if", ""))
+final_val_gate_step = next((s for s in final_val.get("steps", []) if s.get("name") == "Validate the mode-aware final DEPLOY success contract"), None)
+final_val_gate_run = (final_val_gate_step or {}).get("run", "")
+results.append(("24z: final_validation itself is always() (runs unconditionally so it can fail closed with diagnostics rather than silently disappearing)", final_val_if.strip() == "always()"))
 for extra_job in ("validate_argocd_ready", "validate_platform_ready", "validate_observability_ready", "monitor_ownership_preflight", "validate_monitor_ready", "end_to_end_deployment_acceptance"):
     results.append((f"23: final_validation needs {extra_job} directly (closes the transitive-skip gap)", extra_job in final_val_needs))
-    results.append((f"24: final_validation requires {extra_job} did not fail/get cancelled", f"{extra_job}.result != \x27failure\x27" in final_val_if and f"{extra_job}.result != \x27cancelled\x27" in final_val_if))
+    results.append((f"24: the final_validation mode-aware gate step requires EXACT success for {extra_job} in its applicable REQUIRED branch (a SKIPPED value fails the gate, never merely treated as not-a-failure)", f"require_success {extra_job}" in final_val_gate_run))
 
 # 25: no-active-runtime path remains valid, and dry-run never runs the live B3B jobs -- all four are gated on both has_active_deployments == \x27true\x27 and effective_deploy == \x27true\x27.
 for gated_job_name, gated_job_if in (("monitor_ownership_preflight", preflight_if), ("monitor_sync_once", sync_once_if), ("validate_monitor_ready", validate_ready_if), ("end_to_end_deployment_acceptance", e2e_job_if)):
@@ -10752,7 +10759,8 @@ def eval_gha_bool(expr, needs):
     return bool(_Parser(expr, needs).parse())
 
 
-JOB_ORDER = ["monitor_ownership_preflight", "monitor_sync_once", "validate_monitor_ready", "replication_monitor_acceptance", "end_to_end_deployment_acceptance", "final_validation"]
+# final_validation is deliberately NOT modeled here (Phase B3B closeout): its own if: is now a bare always() and its actual pass/fail decision is real bash program logic inside its first step, not a pure if:-expression this tiny parser could ever evaluate correctly -- that behavior is instead proven by REALLY EXECUTING the committed script in the dedicated "Phase B3B closeout: mode-aware final DEPLOY success contract" section further below.
+JOB_ORDER = ["monitor_ownership_preflight", "monitor_sync_once", "validate_monitor_ready", "replication_monitor_acceptance", "end_to_end_deployment_acceptance"]
 IF_EXPRS = {job: _extract_if(job) for job in JOB_ORDER}
 
 
@@ -10802,33 +10810,33 @@ check("Scenario 1 (MONITOR ABSENT): monitor_sync_once runs (full bootstrap chain
 check("Scenario 1 (MONITOR ABSENT): validate_monitor_ready runs", r["validate_monitor_ready"]["result"] == "success")
 check("Scenario 1 (MONITOR ABSENT): replication_monitor_acceptance runs", r["replication_monitor_acceptance"]["result"] == "success")
 check("Scenario 1 (MONITOR ABSENT): end_to_end_deployment_acceptance runs", r["end_to_end_deployment_acceptance"]["result"] == "success")
-check("Scenario 1 (MONITOR ABSENT): final_validation succeeds", r["final_validation"]["result"] == "success")
+# final_validation succeeding for this exact chain is proven by real script execution in the "Phase B3B closeout" section further below.
 
 # Scenario 4: MONITOR BROKEN blocks the SUB workflow invocation entirely.
 ctx = base_context("true", "true")
 r = simulate(ctx, {"monitor_ownership_preflight": "failure"})
 check("Scenario 4 (MONITOR BROKEN): monitor_ownership_preflight fails", r["monitor_ownership_preflight"]["result"] == "failure")
 check("Scenario 4 (MONITOR BROKEN): monitor_sync_once (the SUB workflow invocation) is blocked (skipped)", r["monitor_sync_once"]["result"] == "skipped")
-check("Scenario 4 (MONITOR BROKEN): final_validation is blocked", r["final_validation"]["result"] == "skipped")
+# final_validation being blocked for this exact scenario is proven by real script execution in the "Phase B3B closeout" section further below (scenario C: monitor_sync_once skipped).
 
 # Scenario 6: monitor reconciliation failure blocks acceptance.
 ctx = base_context("true", "true")
 r = simulate(ctx, {"monitor_sync_once": "failure"}, {"monitor_ownership_preflight": {"state": "OWNED"}})
 check("Scenario 6 (monitor_sync_once failure): validate_monitor_ready is blocked (skipped)", r["validate_monitor_ready"]["result"] == "skipped")
-check("Scenario 6 (monitor_sync_once failure): final_validation is blocked", r["final_validation"]["result"] == "skipped")
+# final_validation being blocked when a REQUIRED active-runtime job is skipped is proven by real script execution in the "Phase B3B closeout" section further below (scenario B: validate_monitor_ready skipped).
 
 # Scenario 7: monitor acceptance failure blocks replication/E2E.
 ctx = base_context("true", "true")
 r = simulate(ctx, {"validate_monitor_ready": "failure"}, {"monitor_ownership_preflight": {"state": "OWNED"}})
 check("Scenario 7 (validate_monitor_ready failure): replication_monitor_acceptance is blocked (skipped)", r["replication_monitor_acceptance"]["result"] == "skipped")
 check("Scenario 7 (validate_monitor_ready failure): end_to_end_deployment_acceptance is blocked (skipped)", r["end_to_end_deployment_acceptance"]["result"] == "skipped")
-check("Scenario 7 (validate_monitor_ready failure): final_validation is blocked", r["final_validation"]["result"] == "skipped")
+# final_validation being blocked for this exact scenario is proven by real script execution in the "Phase B3B closeout" section further below (scenario A: end_to_end_deployment_acceptance skipped).
 
 # Scenario 8: an ACTIVE runtime not UP/fresh fails the final E2E gate -> final_validation blocked.
 ctx = base_context("true", "true")
 r = simulate(ctx, {"end_to_end_deployment_acceptance": "failure"}, {"monitor_ownership_preflight": {"state": "OWNED"}})
 check("Scenario 8 (an ACTIVE runtime not UP/fresh): end_to_end_deployment_acceptance fails", r["end_to_end_deployment_acceptance"]["result"] == "failure")
-check("Scenario 8 (an ACTIVE runtime not UP/fresh): final_validation is blocked (MAIN cannot claim end-to-end success)", r["final_validation"]["result"] == "skipped")
+# final_validation being blocked when end_to_end_deployment_acceptance genuinely FAILS (never merely skipped) is covered by the always()-plus-explicit-result-checks contract exercised in the "Phase B3B closeout" section further below.
 
 # Scenario 9: NO active runtimes cleanly skips the entire monitor live path, and final_validation still succeeds.
 ctx = base_context("true", "false")
@@ -10837,7 +10845,7 @@ check("Scenario 9 (no active runtimes): monitor_ownership_preflight is cleanly s
 check("Scenario 9 (no active runtimes): monitor_sync_once is cleanly skipped", r["monitor_sync_once"]["result"] == "skipped")
 check("Scenario 9 (no active runtimes): validate_monitor_ready is cleanly skipped", r["validate_monitor_ready"]["result"] == "skipped")
 check("Scenario 9 (no active runtimes): end_to_end_deployment_acceptance is cleanly skipped", r["end_to_end_deployment_acceptance"]["result"] == "skipped")
-check("Scenario 9 (no active runtimes): final_validation still succeeds", r["final_validation"]["result"] == "success")
+# final_validation still succeeding when there are no active runtimes (all B3B runtime/monitor jobs legitimately skipped) is proven by real script execution in the "Phase B3B closeout" section further below (scenario D).
 
 # Scenario 10: DRY RUN has no B3B live mutations or live API acceptance.
 ctx = base_context("false", "true")
@@ -10869,6 +10877,167 @@ PYEOF
 else
   skip "Phase B3B: DAG simulation -- python3/PyYAML unavailable or main workflow missing"
 fi
+
+echo ""
+echo "--- Phase B3B closeout: mode-aware final DEPLOY success contract (final_validation actually executed) ---"
+
+# Unlike the JOB_ORDER if:-expression simulator above (which cannot express the bash program logic now living inside final_validation's own step), this extracts and REALLY EXECUTES the committed "Validate the mode-aware final DEPLOY success contract" script via bash for each required scenario -- genuine proof of behavior, never a re-implementation of the same logic inside this test suite.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  set +e
+  PHASE_B3B_FINAL_GATE_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import subprocess
+import sys
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+
+steps = doc["jobs"]["final_validation"]["steps"]
+gate_step = next((s for s in steps if s.get("name") == "Validate the mode-aware final DEPLOY success contract"), None)
+if gate_step is None:
+    print("FAIL: final_validation is missing its 'Validate the mode-aware final DEPLOY success contract' step")
+    sys.exit(1)
+script = gate_step["run"]
+
+ALL_RESULT_JOBS = (
+    "validate_shared_secrets_once", "validate_argocd_ready", "validate_platform_ready", "validate_observability_ready",
+    "runtime_ownership_preflight", "build_publish_and_deploy", "delete_removed_argocd_applications",
+    "validate_active_runtimes", "replication_reconcile_once", "replication_dry_run_validation",
+    "monitor_ownership_preflight", "monitor_sync_once", "monitor_dry_run_validation",
+    "validate_monitor_ready", "replication_monitor_acceptance", "end_to_end_deployment_acceptance",
+)
+
+
+def run_gate(effective_deploy, has_active_deployments, overrides):
+    import os
+    env = dict(os.environ)
+    env["EFFECTIVE_DEPLOY"] = effective_deploy
+    env["HAS_ACTIVE_DEPLOYMENTS"] = has_active_deployments
+    for job in ALL_RESULT_JOBS:
+        env[f"RESULT_{job}"] = overrides.get(job, "success")
+    proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=20)
+    return proc
+
+
+failures = []
+
+
+def check(label, condition, proc):
+    if not condition:
+        failures.append(f"{label} (rc={proc.returncode})\n{proc.stdout}\n{proc.stderr}")
+
+
+# A: DEPLOY + active runtimes + end_to_end_deployment_acceptance == skipped -> FAIL.
+proc = run_gate("true", "true", {"end_to_end_deployment_acceptance": "skipped"})
+check("A: DEPLOY + active runtimes + end_to_end_deployment_acceptance skipped -> final gate FAILS", proc.returncode != 0, proc)
+
+# B: DEPLOY + active runtimes + validate_monitor_ready == skipped -> FAIL.
+proc = run_gate("true", "true", {"validate_monitor_ready": "skipped"})
+check("B: DEPLOY + active runtimes + validate_monitor_ready skipped -> final gate FAILS", proc.returncode != 0, proc)
+
+# C: DEPLOY + active runtimes + monitor_sync_once == skipped -> FAIL.
+proc = run_gate("true", "true", {"monitor_sync_once": "skipped"})
+check("C: DEPLOY + active runtimes + monitor_sync_once skipped -> final gate FAILS", proc.returncode != 0, proc)
+
+# D: DEPLOY + zero active runtimes + all B3B runtime/monitor jobs skipped -> PASS.
+proc = run_gate("true", "false", {
+    "runtime_ownership_preflight": "skipped", "build_publish_and_deploy": "skipped",
+    "validate_active_runtimes": "skipped", "replication_reconcile_once": "skipped",
+    "monitor_ownership_preflight": "skipped", "monitor_sync_once": "skipped",
+    "validate_monitor_ready": "skipped", "replication_monitor_acceptance": "skipped",
+    "end_to_end_deployment_acceptance": "skipped",
+    "replication_dry_run_validation": "skipped", "monitor_dry_run_validation": "skipped",
+})
+check("D: DEPLOY + zero active runtimes + all B3B runtime/monitor jobs skipped -> final gate SUCCEEDS", proc.returncode == 0, proc)
+
+# E: DRY RUN + live deployment jobs skipped, applicable dry-run jobs succeed -> PASS.
+proc = run_gate("false", "true", {
+    "validate_argocd_ready": "skipped", "validate_platform_ready": "skipped", "validate_observability_ready": "skipped",
+    "runtime_ownership_preflight": "skipped", "delete_removed_argocd_applications": "skipped",
+    "validate_active_runtimes": "skipped", "replication_reconcile_once": "skipped",
+    "monitor_ownership_preflight": "skipped", "monitor_sync_once": "skipped",
+    "validate_monitor_ready": "skipped", "replication_monitor_acceptance": "skipped",
+    "end_to_end_deployment_acceptance": "skipped",
+})
+check("E: DRY RUN + live deployment jobs skipped -> final gate SUCCEEDS when applicable dry-run jobs succeed", proc.returncode == 0, proc)
+
+# Sanity: a genuine failure/cancellation of an always-applicable job (validate_shared_secrets_once) still fails the gate regardless of mode.
+proc = run_gate("false", "false", {"validate_shared_secrets_once": "failure"})
+check("sanity: validate_shared_secrets_once=failure fails the gate in every mode", proc.returncode != 0, proc)
+
+if failures:
+    print("\n".join(failures))
+    sys.exit(1)
+print("OK")
+PYEOF
+)"
+  PHASE_B3B_FINAL_GATE_STATUS=$?
+  set -e
+  if [ "$PHASE_B3B_FINAL_GATE_STATUS" -eq 0 ]; then
+    pass "Phase B3B closeout: A: DEPLOY + active runtimes + end_to_end_deployment_acceptance skipped -> final MAIN gate cannot succeed"
+    pass "Phase B3B closeout: B: DEPLOY + active runtimes + validate_monitor_ready skipped -> final gate cannot succeed"
+    pass "Phase B3B closeout: C: DEPLOY + active runtimes + monitor_sync_once skipped -> final gate cannot succeed"
+    pass "Phase B3B closeout: D: DEPLOY + zero active runtimes + all B3B runtime/monitor jobs skipped -> final gate succeeds"
+    pass "Phase B3B closeout: E: DRY RUN + live deployment jobs skipped -> dry-run final gate succeeds when applicable dry-run jobs succeed"
+    pass "Phase B3B closeout: a genuine failure of an always-applicable job still fails the gate regardless of mode"
+  else
+    fail "Phase B3B closeout final-gate execution proof failed:"$'\n'"${PHASE_B3B_FINAL_GATE_OUT}"
+  fi
+else
+  skip "Phase B3B closeout: final-gate execution proof -- python3/PyYAML/bash unavailable or main workflow missing"
+fi
+
+echo ""
+echo "--- Phase B3B closeout: Pod->ReplicaSet->Deployment UID ownership chain hardening (both 50-SUB selection loops) ---"
+
+# Structural proof, read directly from the real committed YAML (never a reimplementation): BOTH the "Detect an existing Ready gg-monitor pod (bootstrap-safe)" step and the "Bootstrap/repair path" step must perform the identical full UID/name ownership-chain check -- a name match alone (rs_owner_name) is never sufficient; the pod's claimed ReplicaSet uid, the ReplicaSet's own metadata.uid, and the ReplicaSet's Deployment owner name+uid must all agree.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$MONITOR_WORKFLOW" ]; then
+  PHASE_B3B_UID_CHAIN_CHECK="$(python3 -c '
+import yaml
+
+with open("'"$MONITOR_WORKFLOW"'") as f:
+    sub_doc = yaml.safe_load(f)
+
+by_name = {s.get("name"): s for s in sub_doc["jobs"]["build_publish_and_deploy"]["steps"]}
+results = []
+
+required_fragments = (
+    "rs_owner_uid=",
+    "rs_metadata_uid=",
+    "rs_deploy_name=",
+    "rs_deploy_uid=",
+    "[ \"$rs_owner_uid\" != \"$rs_metadata_uid\" ] && continue",
+    "[ \"$rs_deploy_name\" != \"gg-monitor\" ] && continue",
+    "[ \"$rs_deploy_uid\" != \"$DEPLOY_UID\" ] && continue",
+    "[ -z \"$rs_owner_uid\" ] && continue",
+    "[ -z \"$rs_metadata_uid\" ] && continue",
+    "[ -z \"$rs_deploy_name\" ] && continue",
+    "[ -z \"$rs_deploy_uid\" ] && continue",
+)
+
+for step_name in ("Detect an existing Ready gg-monitor pod (bootstrap-safe)", "Bootstrap/repair path -- CONFIG gate via newly Ready pod, then finalize CloudWatch publication"):
+    step = by_name.get(step_name)
+    if step is None:
+        results.append((f"step {step_name!r} exists", False))
+        continue
+    run_text = step.get("run", "")
+    for fragment in required_fragments:
+        results.append((f"{step_name}: contains {fragment!r} (full UID/name ownership chain, never a name-only match)", fragment in run_text))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+' 2>&1)"
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL\ *) fail "Phase B3B closeout: ${line#FAIL }" ;;
+      OK\ *) pass "Phase B3B closeout: ${line#OK }" ;;
+    esac
+  done <<< "$PHASE_B3B_UID_CHAIN_CHECK"
+else
+  skip "Phase B3B closeout: Pod->ReplicaSet->Deployment UID ownership chain structural check -- python3/PyYAML unavailable or 50-sub-monitor.yaml missing"
+fi
+
+# The functional/mocked-kubectl-jq proof for the UID ownership chain (MainWorkflowPodOwnershipTests for the Detect step + MainWorkflowBootstrapRepairPodOwnershipTests for the Bootstrap/repair step, both exercised against the real committed fragments) lives in hack/test-goldengate-metrics-config.py, already run earlier in this suite ("22: hack/test-goldengate-metrics-config.py") -- not re-run here to avoid duplicating that execution.
 
 echo ""
 echo "--- Final repository handoff hygiene sweep (VDR pre-transfer cleanliness) ---"

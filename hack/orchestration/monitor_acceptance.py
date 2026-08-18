@@ -94,6 +94,13 @@ CONTAINER_NAME = "gg-monitor"
 
 _SELECTOR_LABELS = {"app.kubernetes.io/name": "gg-monitor", "app.kubernetes.io/instance": RELEASE_NAME}
 
+# helm/goldengate-monitor/templates/secretproviderclass.yaml's exact rendered contract -- verified against the real vendored template, never guessed. Every object (admin groups and the shared TLS object) is objectType=secretsmanager. Admin jmesPath entries read the plaintext OGG_ADMIN/OGG_ADMIN_PWD fields of the Secrets Manager JSON secret. The TLS jmesPath path is a JMESPath-quoted identifier (the template's own `path: '"ca-chain.pem"'` YAML scalar parses to the literal string `"ca-chain.pem"`, embedded quote characters included -- required because the field name contains a "." that JMESPath would otherwise treat as a path separator) -- never the bare "ca-chain.pem" without its quoting.
+SPC_OBJECT_TYPE = "secretsmanager"
+ADMIN_JMESPATH_PATH_USER = "OGG_ADMIN"
+ADMIN_JMESPATH_PATH_PASSWORD = "OGG_ADMIN_PWD"
+TLS_JMESPATH_PATH = '"ca-chain.pem"'
+TLS_JMESPATH_ALIAS = "ca-chain-pem"
+
 
 def _check_application(run, reasons, argocd_namespace, monitor_namespace, ecr_registry, expected_chart_version, expected_image_repository, expected_image_tag, expected_cloudwatch_publish_enabled, environment, aws_region, monitor_role_arn, monitor_host, alb_group_name, acm_certificate_arn):
     expected_repo_url = f"oci://{ecr_registry}/{HELM_REPO_PATH}"
@@ -125,7 +132,7 @@ def _check_application(run, reasons, argocd_namespace, monitor_namespace, ecr_re
     if helm_source.get("releaseName") != RELEASE_NAME:
         reasons.append(f"Application {ARGOCD_APP_NAME} source.helm.releaseName={helm_source.get('releaseName')!r}, expected {RELEASE_NAME!r}")
 
-    # .github/workflows/50-sub-monitor.yaml's "Create or update Argo CD Application" step -- the exact parameter set it sets, never a subset assumed sufficient because Argo health looked fine.
+    # .github/workflows/50-sub-monitor.yaml's "Create or update Argo CD Application" step -- the exact parameter SET it sets, never a subset assumed sufficient because Argo health looked fine, and never merely the last of a duplicate name (a dict-comprehension collapse would silently hide a duplicate).
     expected_parameters = {
         "image.repository": expected_image_repository,
         "image.tag": expected_image_tag,
@@ -138,9 +145,34 @@ def _check_application(run, reasons, argocd_namespace, monitor_namespace, ecr_re
         "ingress.alb.groupName": alb_group_name,
         "ingress.alb.certificateArn": acm_certificate_arn,
     }
-    actual_parameters = {p.get("name"): p.get("value") for p in (helm_source.get("parameters") or []) if isinstance(p, dict)}
+
+    parameter_entries = [p for p in (helm_source.get("parameters") or []) if isinstance(p, dict)]
+    parameter_names_list = [p.get("name") for p in parameter_entries]
+
+    # Detect a duplicate parameter NAME before it is ever collapsed into a dict -- {p["name"]: p["value"] for p in ...} would otherwise silently keep only the last occurrence.
+    seen_counts = {}
+    for name in parameter_names_list:
+        seen_counts[name] = seen_counts.get(name, 0) + 1
+    duplicate_names = sorted(name for name, count in seen_counts.items() if count > 1)
+    if duplicate_names:
+        reasons.append(f"Application {ARGOCD_APP_NAME} helm parameters contain duplicate name(s) {duplicate_names!r}")
+
+    actual_parameter_names = set(parameter_names_list)
+    expected_parameter_names = set(expected_parameters)
+
+    missing_parameters = expected_parameter_names - actual_parameter_names
+    if missing_parameters:
+        reasons.append(f"Application {ARGOCD_APP_NAME} helm parameters are missing expected name(s) {sorted(missing_parameters)!r}")
+
+    unexpected_parameters = actual_parameter_names - expected_parameter_names
+    if unexpected_parameters:
+        reasons.append(f"Application {ARGOCD_APP_NAME} helm parameters contain unexpected name(s) {sorted(unexpected_parameters)!r} -- 50-sub-monitor.yaml creates an exact canonical parameter set")
+
+    actual_parameters = {p.get("name"): p.get("value") for p in parameter_entries}
     for name, expected_value in expected_parameters.items():
-        actual_value = actual_parameters.get(name)
+        if name not in actual_parameters:
+            continue  # already reported as missing above
+        actual_value = actual_parameters[name]
         if actual_value != expected_value:
             reasons.append(f"Application {ARGOCD_APP_NAME} helm parameter {name}={actual_value!r}, expected {expected_value!r}")
 
@@ -376,18 +408,43 @@ def _check_secretproviderclass(run, reasons, monitor_namespace, aws_region, regi
         entries = actual_by_object_name.get(admin_secret)
         if not entries:
             continue  # already reported as missing above
-        aliases = {j.get("objectAlias") for j in (entries[0].get("jmesPath") or []) if isinstance(j, dict)}
+        entry = entries[0]
+        if entry.get("objectType") != SPC_OBJECT_TYPE:
+            reasons.append(f"secretproviderclass/{SECRETPROVIDERCLASS_NAME} objectName {admin_secret!r} objectType={entry.get('objectType')!r}, expected {SPC_OBJECT_TYPE!r}")
+
+        # Exact (path, objectAlias) PAIRS, never alias presence alone -- a swapped username/password path, a wrong source field, or a stray extra pair must all be rejected, not just a missing/extra alias NAME.
+        expected_pairs = set()
         for deployment_name in expected_names:
-            for alias in (f"{deployment_name}-admin-user", f"{deployment_name}-admin-password"):
-                if alias not in aliases:
-                    reasons.append(f"secretproviderclass/{SECRETPROVIDERCLASS_NAME} objectName {admin_secret!r} is missing expected jmesPath alias {alias!r}")
+            expected_pairs.add((ADMIN_JMESPATH_PATH_USER, f"{deployment_name}-admin-user"))
+            expected_pairs.add((ADMIN_JMESPATH_PATH_PASSWORD, f"{deployment_name}-admin-password"))
+        _check_jmespath_pairs(reasons, f"secretproviderclass/{SECRETPROVIDERCLASS_NAME} objectName {admin_secret!r}", entry, expected_pairs)
 
     if tls_secret:
         tls_entries = actual_by_object_name.get(tls_secret)
         if tls_entries:
-            aliases = {j.get("objectAlias") for j in (tls_entries[0].get("jmesPath") or []) if isinstance(j, dict)}
-            if "ca-chain-pem" not in aliases:
-                reasons.append(f"secretproviderclass/{SECRETPROVIDERCLASS_NAME} objectName {tls_secret!r} (TLS) is missing expected jmesPath alias 'ca-chain-pem'")
+            entry = tls_entries[0]
+            if entry.get("objectType") != SPC_OBJECT_TYPE:
+                reasons.append(f"secretproviderclass/{SECRETPROVIDERCLASS_NAME} objectName {tls_secret!r} (TLS) objectType={entry.get('objectType')!r}, expected {SPC_OBJECT_TYPE!r}")
+
+            expected_tls_pairs = {(TLS_JMESPATH_PATH, TLS_JMESPATH_ALIAS)}
+            _check_jmespath_pairs(reasons, f"secretproviderclass/{SECRETPROVIDERCLASS_NAME} objectName {tls_secret!r} (TLS)", entry, expected_tls_pairs)
+
+
+def _check_jmespath_pairs(reasons, label, entry, expected_pairs):
+    """Compares the entry's jmesPath list as exact (path, objectAlias) pairs against expected_pairs -- rejects a missing pair, an extra/unknown pair (which also catches a wrong path, a swapped username/password path, and a wrong objectAlias, since any of those changes the pair identity), and a duplicate pair. Malformed (non-dict) jmesPath rows are simply excluded from the actual set, never coerced."""
+    actual_pairs_list = [(j.get("path"), j.get("objectAlias")) for j in (entry.get("jmesPath") or []) if isinstance(j, dict)]
+    actual_pairs_set = set(actual_pairs_list)
+
+    if len(actual_pairs_list) != len(actual_pairs_set):
+        reasons.append(f"{label} jmesPath contains a duplicate (path, objectAlias) pair")
+
+    missing_pairs = expected_pairs - actual_pairs_set
+    if missing_pairs:
+        reasons.append(f"{label} jmesPath is missing expected (path, objectAlias) pair(s) {sorted(missing_pairs, key=str)!r}")
+
+    extra_pairs = actual_pairs_set - expected_pairs
+    if extra_pairs:
+        reasons.append(f"{label} jmesPath has unexpected (path, objectAlias) pair(s) {sorted(extra_pairs, key=str)!r}")
 
 
 def _check_service(run, reasons, monitor_namespace, expected_service_port):
@@ -525,13 +582,19 @@ def _select_ready_pod(run, reasons, monitor_namespace):
         if pod_spec.get("serviceAccountName") != SERVICE_ACCOUNT_NAME:
             continue
         rs_owner = next((o for o in (metadata.get("ownerReferences") or []) if o.get("controller") and o.get("kind") == "ReplicaSet"), None)
-        if not rs_owner:
+        if not rs_owner or not rs_owner.get("name") or not rs_owner.get("uid"):
             continue
         rs_found, rs_obj = get_json(run, "replicaset", rs_owner.get("name"), monitor_namespace)
         if not rs_found:
             continue
-        deploy_owner = next((o for o in ((rs_obj.get("metadata") or {}).get("ownerReferences") or []) if o.get("controller") and o.get("kind") == "Deployment"), None)
-        if not deploy_owner or deploy_owner.get("uid") != deploy_uid:
+        # The pod's OWN claimed ReplicaSet uid must match the ACTUAL fetched ReplicaSet's uid -- a name match alone does not prove the pod is owned by the CURRENT ReplicaSet object (a stale/recreated ReplicaSet can share a name with a different uid). Missing name/uid on either side is never treated as a valid ownership chain.
+        rs_metadata = rs_obj.get("metadata") or {}
+        if rs_owner.get("uid") != rs_metadata.get("uid"):
+            continue
+        deploy_owner = next((o for o in (rs_metadata.get("ownerReferences") or []) if o.get("controller") and o.get("kind") == "Deployment"), None)
+        if not deploy_owner or not deploy_owner.get("uid") or not deploy_owner.get("name"):
+            continue
+        if deploy_owner.get("name") != DEPLOYMENT_NAME or deploy_owner.get("uid") != deploy_uid:
             continue
         return metadata.get("name")
 

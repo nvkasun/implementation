@@ -57,10 +57,23 @@ def classify(environment, active_deployments, api_processes_doc):
         checks["actual_deployment_count"] = 0
         return {"state": STATE_BROKEN, "environment": environment, "reasons": reasons, "checks": checks}
 
+    # Every list member must be validated, never silently discarded: a malformed row (not an object, or missing/null/empty/non-string deploymentName) is itself a BROKEN condition -- it must not be excluded from consideration as though it simply didn't exist, or the exact GLOBAL inventory contract could be satisfied by coincidence while a malformed row goes unnoticed.
     actual_by_name = {}
-    for entry in api_deployments:
-        if isinstance(entry, dict) and entry.get("deploymentName"):
-            actual_by_name.setdefault(entry["deploymentName"], []).append(entry)
+    for index, entry in enumerate(api_deployments):
+        if not isinstance(entry, dict):
+            reasons.append(f"/api/processes deployment row #{index} is not an object: {entry!r}")
+            continue
+        deployment_name = entry.get("deploymentName")
+        if deployment_name is None:
+            reasons.append(f"/api/processes deployment row #{index} is missing deploymentName")
+            continue
+        if not isinstance(deployment_name, str):
+            reasons.append(f"/api/processes deployment row #{index} has a non-string deploymentName: {deployment_name!r}")
+            continue
+        if deployment_name == "":
+            reasons.append(f"/api/processes deployment row #{index} has an empty deploymentName")
+            continue
+        actual_by_name.setdefault(deployment_name, []).append(entry)
 
     for name, entries in actual_by_name.items():
         if len(entries) > 1:
