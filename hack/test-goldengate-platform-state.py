@@ -119,15 +119,21 @@ def _configmap_obj(name):
     return {"metadata": {"name": name}}
 
 
-def _daemonset_obj(name, generation=3, desired=2, service_account=platform_state.FLUENT_BIT_SA_NAME, image=FLUENT_BIT_IMAGE):
+def _daemonset_obj(name, generation=3, desired=2, service_account=platform_state.FLUENT_BIT_SA_NAME, image=FLUENT_BIT_IMAGE, container_name="fluent-bit", extra_containers=None, init_containers=None):
+    containers = [{"name": container_name, "image": image}]
+    if extra_containers:
+        containers.extend(extra_containers)
+    pod_spec = {
+        "serviceAccountName": service_account,
+        "containers": containers,
+    }
+    if init_containers:
+        pod_spec["initContainers"] = init_containers
     return {
         "metadata": {"name": name, "generation": generation},
         "spec": {
             "template": {
-                "spec": {
-                    "serviceAccountName": service_account,
-                    "containers": [{"name": "fluent-bit", "image": image}],
-                },
+                "spec": pod_spec,
             },
         },
         "status": {
@@ -156,16 +162,16 @@ def _populate_healthy_cluster(cluster):
     return cluster
 
 
-def _classify(cluster):
+def _classify(cluster, fluent_bit_image=FLUENT_BIT_IMAGE, ecr_registry=ECR_REGISTRY):
     return platform_state.classify(
         cluster,
         environment=ENVIRONMENT,
         runtime_namespace=RUNTIME_NAMESPACE,
         argocd_namespace=ARGOCD_NAMESPACE,
-        ecr_registry=ECR_REGISTRY,
+        ecr_registry=ecr_registry,
         runtime_role_arn=RUNTIME_ROLE_ARN,
         platform_logging_role_arn=PLATFORM_LOGGING_ROLE_ARN,
-        fluent_bit_image=FLUENT_BIT_IMAGE,
+        fluent_bit_image=fluent_bit_image,
     )
 
 
@@ -283,7 +289,7 @@ class PlatformStateClassifierTests(unittest.TestCase):
         cluster.put("daemonset", platform_state.FLUENT_BIT_DAEMONSET_NAME, RUNTIME_NAMESPACE, ds)
         result = _classify(cluster)
         self.assertEqual(result["state"], platform_state.STATE_BROKEN)
-        self.assertTrue(any("expected to contain FLUENT_BIT_IMAGE" in r for r in result["reasons"]))
+        self.assertTrue(any("expected FLUENT_BIT_IMAGE" in r for r in result["reasons"]))
 
     def test_17_unexpected_platform_owned_deployment_is_broken(self):
         cluster = _populate_healthy_cluster(FakeCluster())
@@ -333,6 +339,100 @@ class PlatformStateClassifierTests(unittest.TestCase):
         self.assertEqual(result["state"], platform_state.STATE_BROKEN)
         self.assertTrue(any("serviceAccountName" in r for r in result["reasons"]))
 
+    # --- Fluent Bit image contract: expected FLUENT_BIT_IMAGE operational configuration itself must be an exact, valid, immutable private-ECR digest reference (a caller configuration error, never ABSENT/HEALTHY/BROKEN cluster state) ---
+
+    def test_20_expected_immutable_fluent_bit_image_passes_validation(self):
+        # Validation alone (never touches the cluster); a still-clean cluster classifies ABSENT, proving no exception was raised for a well-formed FLUENT_BIT_IMAGE.
+        result = _classify(FakeCluster(), fluent_bit_image=FLUENT_BIT_IMAGE)
+        self.assertEqual(result["state"], platform_state.STATE_ABSENT)
+
+    def test_21_expected_image_with_latest_tag_is_configuration_error(self):
+        with self.assertRaises(ValueError):
+            _classify(FakeCluster(), fluent_bit_image=f"{ECR_REGISTRY}/aws-cloud-factory-fluent-bit:latest")
+
+    def test_22_expected_image_with_any_tag_is_configuration_error(self):
+        with self.assertRaises(ValueError):
+            _classify(FakeCluster(), fluent_bit_image=f"{ECR_REGISTRY}/aws-cloud-factory-fluent-bit:v1.2.3")
+
+    def test_23_expected_image_wrong_ecr_registry_is_configuration_error(self):
+        with self.assertRaises(ValueError):
+            _classify(FakeCluster(), fluent_bit_image=f"public.ecr.aws/aws-cloud-factory-fluent-bit@sha256:{'a' * 64}")
+
+    def test_23b_expected_image_wrong_private_registry_is_configuration_error(self):
+        with self.assertRaises(ValueError):
+            _classify(FakeCluster(), fluent_bit_image=f"999999999999.dkr.ecr.eu-west-1.amazonaws.com/aws-cloud-factory-fluent-bit@sha256:{'a' * 64}")
+
+    def test_24_expected_image_wrong_repository_is_configuration_error(self):
+        with self.assertRaises(ValueError):
+            _classify(FakeCluster(), fluent_bit_image=f"{ECR_REGISTRY}/some-other-repository@sha256:{'a' * 64}")
+
+    def test_25_expected_image_malformed_short_digest_is_configuration_error(self):
+        with self.assertRaises(ValueError):
+            _classify(FakeCluster(), fluent_bit_image=f"{ECR_REGISTRY}/aws-cloud-factory-fluent-bit@sha256:{'a' * 40}")
+
+    def test_25b_expected_image_uppercase_digest_is_configuration_error(self):
+        with self.assertRaises(ValueError):
+            _classify(FakeCluster(), fluent_bit_image=f"{ECR_REGISTRY}/aws-cloud-factory-fluent-bit@sha256:{'A' * 64}")
+
+    def test_25c_configuration_error_is_never_an_inspection_error(self):
+        # The two error paths must stay distinct -- a bad FLUENT_BIT_IMAGE is a configuration error (ValueError), never a ClassifierInspectionError, and vice versa.
+        with self.assertRaises(ValueError):
+            _classify(FakeCluster(), fluent_bit_image="not-even-a-plausible-image-reference")
+        try:
+            _classify(FakeCluster(), fluent_bit_image="not-even-a-plausible-image-reference")
+        except platform_state.ClassifierInspectionError:
+            self.fail("an invalid FLUENT_BIT_IMAGE must raise ValueError, never ClassifierInspectionError")
+        except ValueError:
+            pass
+
+    # --- Fluent Bit pod-template contract: exactly one container named fluent-bit using exactly FLUENT_BIT_IMAGE, no initContainers -- never merely "expected_image in images" ---
+
+    def test_26_unexpected_normal_sidecar_alongside_correct_fluent_bit_container_is_broken(self):
+        cluster = _populate_healthy_cluster(FakeCluster())
+        ds = _daemonset_obj(platform_state.FLUENT_BIT_DAEMONSET_NAME, extra_containers=[{"name": "log-shipper-sidecar", "image": "some/other:image"}])
+        cluster.put("daemonset", platform_state.FLUENT_BIT_DAEMONSET_NAME, RUNTIME_NAMESPACE, ds)
+        result = _classify(cluster)
+        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
+        self.assertTrue(any("expected exactly 1" in r for r in result["reasons"]))
+
+    def test_27_unexpected_init_container_alongside_correct_fluent_bit_container_is_broken(self):
+        cluster = _populate_healthy_cluster(FakeCluster())
+        ds = _daemonset_obj(platform_state.FLUENT_BIT_DAEMONSET_NAME, init_containers=[{"name": "wait-for-something", "image": "busybox"}])
+        cluster.put("daemonset", platform_state.FLUENT_BIT_DAEMONSET_NAME, RUNTIME_NAMESPACE, ds)
+        result = _classify(cluster)
+        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
+        self.assertTrue(any("initContainers" in r for r in result["reasons"]))
+
+    def test_28_more_than_one_container_is_broken(self):
+        cluster = _populate_healthy_cluster(FakeCluster())
+        ds = _daemonset_obj(platform_state.FLUENT_BIT_DAEMONSET_NAME, extra_containers=[{"name": "another-container", "image": FLUENT_BIT_IMAGE}])
+        cluster.put("daemonset", platform_state.FLUENT_BIT_DAEMONSET_NAME, RUNTIME_NAMESPACE, ds)
+        result = _classify(cluster)
+        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
+        self.assertTrue(any("expected exactly 1" in r for r in result["reasons"]))
+
+    def test_29_sole_container_name_not_fluent_bit_is_broken(self):
+        cluster = _populate_healthy_cluster(FakeCluster())
+        ds = _daemonset_obj(platform_state.FLUENT_BIT_DAEMONSET_NAME, container_name="unexpected-container")
+        cluster.put("daemonset", platform_state.FLUENT_BIT_DAEMONSET_NAME, RUNTIME_NAMESPACE, ds)
+        result = _classify(cluster)
+        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
+        self.assertTrue(any("sole container is named" in r for r in result["reasons"]))
+
+    def test_30_exactly_one_fluent_bit_container_wrong_image_is_broken(self):
+        cluster = _populate_healthy_cluster(FakeCluster())
+        ds = _daemonset_obj(platform_state.FLUENT_BIT_DAEMONSET_NAME, image=f"{ECR_REGISTRY}/aws-cloud-factory-fluent-bit@sha256:{'b' * 64}")
+        cluster.put("daemonset", platform_state.FLUENT_BIT_DAEMONSET_NAME, RUNTIME_NAMESPACE, ds)
+        result = _classify(cluster)
+        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
+        self.assertTrue(any("image=" in r and FLUENT_BIT_IMAGE in r for r in result["reasons"]))
+
+    def test_31_exact_approved_fluent_bit_shape_is_healthy(self):
+        cluster = _populate_healthy_cluster(FakeCluster())
+        result = _classify(cluster)
+        self.assertEqual(result["state"], platform_state.STATE_HEALTHY)
+        self.assertEqual(result["reasons"], [])
+
     def test_malformed_json_raises_inspection_error(self):
         cluster = FakeCluster()
 
@@ -352,6 +452,39 @@ class PlatformStateClassifierTests(unittest.TestCase):
                 platform_logging_role_arn=PLATFORM_LOGGING_ROLE_ARN,
                 fluent_bit_image=FLUENT_BIT_IMAGE,
             )
+
+
+class PlatformStateFluentBitShapeArchitecturalRegressionTests(unittest.TestCase):
+    """Behavioral proof that the Fluent Bit contract cannot regress back to the old, insufficient `expected_image in images` membership check -- both fixtures below contain FLUENT_BIT_IMAGE somewhere in the pod template (so a membership check would wrongly pass them), yet the real approved shape requires exactly one container named fluent-bit and no initContainers."""
+
+    def test_membership_check_would_have_wrongly_passed_the_sidecar_fixture(self):
+        cluster = _populate_healthy_cluster(FakeCluster())
+        ds = _daemonset_obj(platform_state.FLUENT_BIT_DAEMONSET_NAME, extra_containers=[{"name": "log-shipper-sidecar", "image": "some/other:image"}])
+        cluster.put("daemonset", platform_state.FLUENT_BIT_DAEMONSET_NAME, RUNTIME_NAMESPACE, ds)
+
+        pod_spec = ds["spec"]["template"]["spec"]
+        naive_images = [c["image"] for c in pod_spec.get("containers", [])] + [c["image"] for c in pod_spec.get("initContainers", [])]
+        self.assertIn(FLUENT_BIT_IMAGE, naive_images, "the old membership check's own precondition must hold for this fixture to be a meaningful regression proof")
+
+        result = _classify(cluster)
+        self.assertEqual(result["state"], platform_state.STATE_BROKEN, "the classifier must reject the extra sidecar even though FLUENT_BIT_IMAGE is present somewhere in the pod template")
+
+    def test_membership_check_would_have_wrongly_passed_the_init_container_fixture(self):
+        cluster = _populate_healthy_cluster(FakeCluster())
+        ds = _daemonset_obj(platform_state.FLUENT_BIT_DAEMONSET_NAME, init_containers=[{"name": "wait-for-something", "image": "busybox"}])
+        cluster.put("daemonset", platform_state.FLUENT_BIT_DAEMONSET_NAME, RUNTIME_NAMESPACE, ds)
+
+        pod_spec = ds["spec"]["template"]["spec"]
+        naive_images = [c["image"] for c in pod_spec.get("containers", [])] + [c["image"] for c in pod_spec.get("initContainers", [])]
+        self.assertIn(FLUENT_BIT_IMAGE, naive_images, "the old membership check's own precondition must hold for this fixture to be a meaningful regression proof")
+
+        result = _classify(cluster)
+        self.assertEqual(result["state"], platform_state.STATE_BROKEN, "the classifier must reject the unexpected initContainer even though FLUENT_BIT_IMAGE is present somewhere in the pod template")
+
+    def test_membership_check_would_have_wrongly_passed_a_mutable_tag_used_live(self):
+        # A cluster whose live DaemonSet runs a mutable-tag image would satisfy an "in images" check only if the *expected* value were also mutable -- the real regression this closeout fixes is that the expected FLUENT_BIT_IMAGE itself is now validated up front, so a mutable expected value can never reach the cluster-state comparison at all.
+        with self.assertRaises(ValueError):
+            _classify(FakeCluster(), fluent_bit_image=f"{ECR_REGISTRY}/aws-cloud-factory-fluent-bit:latest")
 
 
 class PlatformStateNoMutationSourceSweepTests(unittest.TestCase):

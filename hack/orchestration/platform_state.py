@@ -6,6 +6,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import sys
 
 
@@ -24,7 +25,6 @@ KubectlRunner = _k8s_common.KubectlRunner
 daemonset_ready = _k8s_common.daemonset_ready
 get_json = _k8s_common.get_json
 list_json = _k8s_common.list_json
-pod_template_images = _k8s_common.pod_template_images
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -65,6 +65,12 @@ FLUENT_BIT_CLUSTERROLEBINDING_NAME = "gg-fluent-bit"
 FLUENT_BIT_CONFIGMAP_NAME = "gg-fluent-bit-config"
 FLUENT_BIT_DAEMONSET_NAME = "gg-fluent-bit"
 
+# The Fluent Bit ECR repository name is an application constant, matching .github/workflows/30-sub-platform.yaml's own FLUENT_BIT_ECR_REPOSITORY_EXPECTED env literal. The registry is never hardcoded here -- it is always the canonical ECR_REGISTRY passed in by the caller.
+FLUENT_BIT_ECR_REPOSITORY = "aws-cloud-factory-fluent-bit"
+
+# helm/goldengate-platform/templates/fluent-bit-daemonset.yaml renders exactly one container (name: fluent-bit) and no initContainers -- never invent a second desired container shape.
+FLUENT_BIT_CONTAINER_NAME = "fluent-bit"
+
 # helm/goldengate-platform's syncPolicy.managedNamespaceMetadata.labels -- applied by Argo CD to RUNTIME_NAMESPACE itself, only once the platform Application has actually synced it.
 MANAGED_NAMESPACE_LABELS = {
     "app.kubernetes.io/name": "goldengate-platform",
@@ -78,8 +84,56 @@ def _release_and_app_name(environment):
     return name, name
 
 
+def _validate_fluent_bit_image(fluent_bit_image, ecr_registry):
+    """Validates the caller-supplied FLUENT_BIT_IMAGE operational configuration (vars.FLUENT_BIT_IMAGE) against the approved contract -- exactly <ECR_REGISTRY>/aws-cloud-factory-fluent-bit@sha256:<64 lowercase hex characters>, matching .github/workflows/30-sub-platform.yaml's own "Validate FLUENT_BIT_IMAGE format" step -- before it is ever trusted as expected cluster state. This is operational-configuration validation, not cluster inspection: a violation means the caller supplied a bad value, never that the cluster is ABSENT/HEALTHY/BROKEN. Raises ValueError (a configuration error), never ClassifierInspectionError."""
+    expected_prefix = f"{ecr_registry}/{FLUENT_BIT_ECR_REPOSITORY}@sha256:"
+    if not fluent_bit_image.startswith(expected_prefix):
+        raise ValueError(
+            f"FLUENT_BIT_IMAGE {fluent_bit_image!r} is not a valid private, immutable digest reference -- "
+            f"expected exactly {expected_prefix!r} followed by a 64-character lowercase hex digest "
+            "(no mutable tag, no public.ecr.aws, no other registry/repository)."
+        )
+    digest = fluent_bit_image[len(expected_prefix):]
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError(
+            f"FLUENT_BIT_IMAGE {fluent_bit_image!r} has an invalid digest {digest!r} -- "
+            "expected exactly 64 lowercase hex characters after @sha256:."
+        )
+
+
+def _fluent_bit_container_shape_reasons(daemonset_name, ds_obj, expected_image):
+    """Explicitly inspects spec.template.spec.containers/initContainers (never merely whether expected_image appears "in" some flattened image list) against the exact approved shape rendered by helm/goldengate-platform/templates/fluent-bit-daemonset.yaml: exactly one container, named fluent-bit, using exactly expected_image, and no initContainers at all."""
+    pod_spec = (((ds_obj.get("spec") or {}).get("template") or {}).get("spec")) or {}
+    containers = pod_spec.get("containers") or []
+    init_containers = pod_spec.get("initContainers") or []
+
+    reasons = []
+
+    if init_containers:
+        init_names = [c.get("name") for c in init_containers]
+        reasons.append(f"daemonset/{daemonset_name} has unexpected initContainers {init_names!r}, expected none")
+
+    if len(containers) != 1:
+        container_names = [c.get("name") for c in containers]
+        reasons.append(f"daemonset/{daemonset_name} has {len(containers)} container(s) {container_names!r}, expected exactly 1 (named {FLUENT_BIT_CONTAINER_NAME!r})")
+        return reasons
+
+    container = containers[0]
+    actual_name = container.get("name")
+    if actual_name != FLUENT_BIT_CONTAINER_NAME:
+        reasons.append(f"daemonset/{daemonset_name}'s sole container is named {actual_name!r}, expected {FLUENT_BIT_CONTAINER_NAME!r}")
+
+    actual_image = container.get("image")
+    if actual_image != expected_image:
+        reasons.append(f"daemonset/{daemonset_name} container {FLUENT_BIT_CONTAINER_NAME!r} image={actual_image!r}, expected FLUENT_BIT_IMAGE {expected_image!r}")
+
+    return reasons
+
+
 def classify(run, environment, runtime_namespace, argocd_namespace, ecr_registry, runtime_role_arn, platform_logging_role_arn, fluent_bit_image):
-    """Returns the stable {"state", "environment", "namespace", "reasons", "checks"} shape. Raises ClassifierInspectionError if Kubernetes access itself could not be trusted -- callers must let that propagate as a hard failure, never a downgrade to ABSENT."""
+    """Returns the stable {"state", "environment", "namespace", "reasons", "checks"} shape. Raises ClassifierInspectionError if Kubernetes access itself could not be trusted -- callers must let that propagate as a hard failure, never a downgrade to ABSENT. Raises ValueError if the caller-supplied FLUENT_BIT_IMAGE operational configuration itself is invalid -- a configuration error, never ABSENT/HEALTHY/BROKEN cluster state."""
+    _validate_fluent_bit_image(fluent_bit_image, ecr_registry)
+
     reasons = []
     checks = {}
 
@@ -194,9 +248,7 @@ def classify(run, environment, runtime_namespace, argocd_namespace, ecr_registry
             if actual_sa_name != FLUENT_BIT_SA_NAME:
                 reasons.append(f"daemonset/{FLUENT_BIT_DAEMONSET_NAME} pod template serviceAccountName={actual_sa_name!r}, expected {FLUENT_BIT_SA_NAME!r}")
 
-            images = pod_template_images(ds_obj)
-            if fluent_bit_image not in images:
-                reasons.append(f"daemonset/{FLUENT_BIT_DAEMONSET_NAME} images={images!r}, expected to contain FLUENT_BIT_IMAGE {fluent_bit_image!r}")
+            reasons.extend(_fluent_bit_container_shape_reasons(FLUENT_BIT_DAEMONSET_NAME, ds_obj, fluent_bit_image))
 
         # The platform release intentionally owns shared namespace/identity/logging resources only -- it must never own a GoldenGate runtime StatefulSet/Deployment (see 30-sub-platform.yaml's own "no StatefulSet/Deployment owned by RELEASE_NAME" check, mirrored here read-only).
         owned_statefulsets = list_json(run, "statefulset", namespace=runtime_namespace, label_selector=f"app.kubernetes.io/instance={release_name}")
@@ -230,7 +282,11 @@ def main(argv=None):
             platform_logging_role_arn=values["PLATFORM_LOGGING_ROLE_ARN"],
             fluent_bit_image=args.fluent_bit_image,
         )
-    except (ClassifierInspectionError, ValueError, OSError) as exc:
+    except ValueError as exc:
+        # A bad --fluent-bit-image (or other caller-supplied) value -- a configuration error, distinct from a Kubernetes inspection failure. Never exposes secrets; the value itself is not secret (it is an image reference, already logged verbatim by 30-sub-platform.yaml).
+        print(f"CONFIGURATION ERROR: {exc}", file=sys.stderr)
+        return 1
+    except (ClassifierInspectionError, OSError) as exc:
         print(f"INSPECTION ERROR: {exc}", file=sys.stderr)
         return 1
 
