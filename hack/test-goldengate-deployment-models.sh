@@ -7812,8 +7812,8 @@ def eval_gha_bool(expr, needs):
     return bool(_Parser(expr, needs).parse())
 
 
-# Phase B1 inserts the Argo CD prerequisite state machine between Terraform and the platform chart; Phase B2 inserts the same ownership-aware state machine, independently in parallel, for the GoldenGate Platform and Observability application prerequisites between validate_argocd_ready and validate_shared_secrets_once -- simulated in real DAG order like every other job here, off the same real if: expressions.
-JOB_ORDER = ["terraform_sync_once", "argocd_preflight", "bootstrap_argocd", "validate_argocd_ready", "platform_preflight", "observability_preflight", "platform_sync_once", "observability_sync_once", "validate_platform_ready", "validate_observability_ready", "validate_shared_secrets_once", "build_publish_and_deploy"]
+# Phase B1 inserts the Argo CD prerequisite state machine between Terraform and the platform chart; Phase B2 inserts the same ownership-aware state machine, independently in parallel, for the GoldenGate Platform and Observability application prerequisites between validate_argocd_ready and validate_shared_secrets_once; Phase B3A inserts the read-only runtime ownership-safety preflight between validate_shared_secrets_once and build_publish_and_deploy -- simulated in real DAG order like every other job here, off the same real if: expressions.
+JOB_ORDER = ["terraform_sync_once", "argocd_preflight", "bootstrap_argocd", "validate_argocd_ready", "platform_preflight", "observability_preflight", "platform_sync_once", "observability_sync_once", "validate_platform_ready", "validate_observability_ready", "validate_shared_secrets_once", "runtime_ownership_preflight", "build_publish_and_deploy"]
 IF_EXPRS = {job: _extract_if(job) for job in JOB_ORDER}
 
 
@@ -7882,9 +7882,9 @@ check("3: validate_observability_ready must still succeed (independent of platfo
 check("3: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
 check("3: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
 
-# 4: deploy=true + all mutation prerequisites success (Argo CD/platform/observability all already HEALTHY) -> runtime deployment may execute.
+# 4: deploy=true + all mutation prerequisites success (Argo CD/platform/observability all already HEALTHY, runtime ownership OWNED) -> runtime deployment may execute.
 ctx = base_context("true")
-r = simulate(ctx, {}, {"argocd_preflight": {"state": "HEALTHY"}, "platform_preflight": {"state": "HEALTHY"}, "observability_preflight": {"state": "HEALTHY"}})
+r = simulate(ctx, {}, {"argocd_preflight": {"state": "HEALTHY"}, "platform_preflight": {"state": "HEALTHY"}, "observability_preflight": {"state": "HEALTHY"}, "runtime_ownership_preflight": {"state": "OWNED"}})
 check("4: terraform_sync_once must succeed", r["terraform_sync_once"]["result"] == "success")
 check("4: validate_argocd_ready must succeed", r["validate_argocd_ready"]["result"] == "success")
 check("4: platform_sync_once must be skipped (already HEALTHY, never reconciled)", r["platform_sync_once"]["result"] == "skipped")
@@ -7892,6 +7892,7 @@ check("4: observability_sync_once must be skipped (already HEALTHY, never reconc
 check("4: validate_platform_ready must succeed", r["validate_platform_ready"]["result"] == "success")
 check("4: validate_observability_ready must succeed", r["validate_observability_ready"]["result"] == "success")
 check("4: validate_shared_secrets_once must succeed", r["validate_shared_secrets_once"]["result"] == "success")
+check("4: runtime_ownership_preflight must succeed (OWNED permits reconciliation)", r["runtime_ownership_preflight"]["result"] == "success")
 check("4: build_publish_and_deploy must be eligible to run", r["build_publish_and_deploy"]["result"] == "success")
 
 # 7: deploy=true + Argo CD ABSENT + bootstrap succeeds -> validate_argocd_ready converges to success -> platform/observability preflights run; platform ABSENT+reconcile success, observability already HEALTHY.
@@ -9727,7 +9728,7 @@ def eval_gha_bool(expr, needs):
     return bool(_Parser(expr, needs).parse())
 
 
-JOB_ORDER = ["platform_preflight", "observability_preflight", "platform_sync_once", "observability_sync_once", "validate_platform_ready", "validate_observability_ready", "validate_shared_secrets_once", "build_publish_and_deploy"]
+JOB_ORDER = ["platform_preflight", "observability_preflight", "platform_sync_once", "observability_sync_once", "validate_platform_ready", "validate_observability_ready", "validate_shared_secrets_once", "runtime_ownership_preflight", "build_publish_and_deploy"]
 IF_EXPRS = {job: _extract_if(job) for job in JOB_ORDER}
 
 
@@ -9976,6 +9977,388 @@ for label, ok in results:
   done <<< "$WORKFLOW_NAMING_CHECK"
 else
   skip "workflow naming: name:/uses: semantic checks -- python3/PyYAML unavailable"
+fi
+
+echo ""
+echo "--- Phase B3A: GoldenGate runtime ownership-safety preflight + post-reconciliation runtime acceptance ---"
+
+# hack/orchestration/runtime_state.py and runtime_acceptance.py must never construct a mutating kubectl/helm/AWS command -- read directly from source, never from the test's own constants. Mirrors the Phase B1/B2 checks above for argocd_state.py/platform_state.py/observability_state.py.
+for B3A_TOOL in hack/orchestration/runtime_state.py hack/orchestration/runtime_acceptance.py; do
+  if [ -f "$B3A_TOOL" ]; then
+    B3A_MUTATING_HITS="$(grep -nE 'kubectl apply|kubectl create|kubectl delete|kubectl patch|kubectl annotate|kubectl label|helm install|helm upgrade|helm uninstall|aws efs create|aws efs delete|aws efs update|"apply"|'"'"'apply'"'"'|"create"|'"'"'create'"'"'|"delete"|'"'"'delete'"'"'|"patch"|'"'"'patch'"'"'|"annotate"|'"'"'annotate'"'"'|"label"|'"'"'label'"'"'' "$B3A_TOOL" 2>/dev/null || true)"
+    if [ -z "$B3A_MUTATING_HITS" ]; then
+      pass "Phase B3A: ${B3A_TOOL} contains no mutating kubectl/helm/AWS command construction -- read-only classifier confirmed"
+    else
+      fail "Phase B3A: ${B3A_TOOL} appears to contain a mutating command construct:"$'\n'"${B3A_MUTATING_HITS}"
+    fi
+  else
+    fail "Phase B3A: ${B3A_TOOL} is missing"
+  fi
+done
+
+# Both classifiers' own dedicated offline unit-test suites are part of the normal regression run, not merely available separately.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f hack/test-goldengate-runtime-state.py ]; then
+  if RUNTIME_STATE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 hack/test-goldengate-runtime-state.py 2>&1)"; then
+    pass "Phase B3A: hack/test-goldengate-runtime-state.py (the runtime ownership-safety classifier's offline ABSENT/OWNED/BROKEN test suite) passes"
+  else
+    fail "Phase B3A: hack/test-goldengate-runtime-state.py failed:"$'\n'"${RUNTIME_STATE_TEST_OUTPUT}"
+  fi
+else
+  skip "Phase B3A: hack/test-goldengate-runtime-state.py -- python3 unavailable or file missing"
+fi
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f hack/test-goldengate-runtime-acceptance.py ]; then
+  if RUNTIME_ACCEPTANCE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 hack/test-goldengate-runtime-acceptance.py 2>&1)"; then
+    pass "Phase B3A: hack/test-goldengate-runtime-acceptance.py (the runtime acceptance classifier's offline HEALTHY/BROKEN test suite) passes"
+  else
+    fail "Phase B3A: hack/test-goldengate-runtime-acceptance.py failed:"$'\n'"${RUNTIME_ACCEPTANCE_TEST_OUTPUT}"
+  fi
+else
+  skip "Phase B3A: hack/test-goldengate-runtime-acceptance.py -- python3 unavailable or file missing"
+fi
+
+# Structural proof, read directly from the real committed YAML (never a reimplementation): active_runtime_matrix wiring, runtime_ownership_preflight/validate_active_runtimes DAG shape, and the ABSENT/OWNED/BROKEN vocabulary.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  PHASE_B3A_STRUCTURAL_CHECK="$(python3 -c '
+import yaml
+
+with open("'"$EKS_APP_WORKFLOW"'") as f:
+    main_doc = yaml.safe_load(f)
+
+results = []
+jobs = main_doc["jobs"]
+
+# 1/2: classifier files exist.
+import os
+results.append(("1: hack/orchestration/runtime_state.py exists", os.path.isfile("hack/orchestration/runtime_state.py")))
+results.append(("2: hack/orchestration/runtime_acceptance.py exists", os.path.isfile("hack/orchestration/runtime_acceptance.py")))
+
+# 3: runtime ownership vocabulary is exactly ABSENT/OWNED/BROKEN (never HEALTHY -- that distinction is intentional).
+with open("hack/orchestration/runtime_state.py") as f:
+    runtime_state_source = f.read()
+results.append(("3a: runtime_state.py defines STATE_ABSENT", "STATE_ABSENT = \"ABSENT\"" in runtime_state_source))
+results.append(("3b: runtime_state.py defines STATE_OWNED", "STATE_OWNED = \"OWNED\"" in runtime_state_source))
+results.append(("3c: runtime_state.py defines STATE_BROKEN", "STATE_BROKEN = \"BROKEN\"" in runtime_state_source))
+results.append(("3d: runtime_state.py never defines a HEALTHY state (ownership preflight is not a HEALTHY-skip prerequisite)", "STATE_HEALTHY" not in runtime_state_source))
+with open("hack/orchestration/runtime_acceptance.py") as f:
+    runtime_acceptance_source = f.read()
+results.append(("3e: runtime_acceptance.py vocabulary is HEALTHY/BROKEN", "STATE_HEALTHY = \"HEALTHY\"" in runtime_acceptance_source and "STATE_BROKEN = \"BROKEN\"" in runtime_acceptance_source))
+results.append(("3f: runtime_acceptance.py never defines an ABSENT state (an active desired runtime that is missing IS BROKEN)", "STATE_ABSENT" not in runtime_acceptance_source))
+
+# 4: MAIN exposes active_runtime_matrix derived from the canonical registry (validate_model job outputs).
+validate_model_outputs = jobs["validate_model"].get("outputs", {})
+results.append(("4: MAIN exposes validate_model.outputs.active_runtime_matrix", "active_runtime_matrix" in validate_model_outputs))
+
+# 6/7/8: runtime_ownership_preflight exists, uses the selected (changed) deployment matrix, and is real-deploy-only.
+results.append(("6: MAIN defines runtime_ownership_preflight", "runtime_ownership_preflight" in jobs))
+preflight = jobs.get("runtime_ownership_preflight", {})
+preflight_matrix = ((preflight.get("strategy") or {}).get("matrix") or {}).get("include", "")
+results.append(("7: runtime_ownership_preflight uses detect_changed_deployments.outputs.deployment_matrix (the SELECTED mutation set)", "detect_changed_deployments.outputs.deployment_matrix" in str(preflight_matrix)))
+preflight_if = preflight.get("if", "")
+results.append(("8: runtime_ownership_preflight is real-deploy-only (effective_deploy == \x27true\x27)", "effective_deploy" in preflight_if and "== \x27true\x27" in preflight_if))
+
+# 9/10: build_publish_and_deploy requires successful preflight on deploy=true; dry-run render does not require the live preflight.
+build = jobs.get("build_publish_and_deploy", {})
+build_needs = build.get("needs") or []
+build_if = build.get("if", "")
+results.append(("9a: build_publish_and_deploy needs runtime_ownership_preflight", "runtime_ownership_preflight" in build_needs))
+results.append(("9b: build_publish_and_deploy requires runtime_ownership_preflight.result == success on deploy=true", "runtime_ownership_preflight.result == \x27success\x27" in build_if))
+results.append(("10: build_publish_and_deploy bypasses the live preflight requirement when effective_deploy != \x27true\x27 (dry-run)", "effective_deploy != \x27true\x27" in build_if))
+
+# 11/12: ABSENT and OWNED both permit reconciliation (no BROKEN/HEALTHY-only gate hardcoded in the if:); BROKEN prevents it via the classifier CLI (not visible as a literal state string in the if:, but the strict-success requirement above is what blocks it -- proven behaviorally by the DAG simulation below).
+results.append(("11: build_publish_and_deploy if: contains no state-specific ABSENT/OWNED branch (both permit reconciliation identically, gated only by preflight SUCCESS)", "ABSENT" not in build_if and "OWNED" not in build_if))
+results.append(("12: build_publish_and_deploy if: contains no BROKEN branch (BROKEN can never be special-cased to proceed)", "BROKEN" not in build_if))
+
+# 13/14: validate_active_runtimes exists and uses the GLOBAL active_runtime_matrix, never the changed deployment_matrix.
+results.append(("13: MAIN defines validate_active_runtimes", "validate_active_runtimes" in jobs))
+validate_active = jobs.get("validate_active_runtimes", {})
+validate_active_matrix = ((validate_active.get("strategy") or {}).get("matrix") or {}).get("include", "")
+results.append(("14a: validate_active_runtimes uses validate_model.outputs.active_runtime_matrix (the GLOBAL desired-state inventory)", "validate_model.outputs.active_runtime_matrix" in str(validate_active_matrix)))
+results.append(("14b: validate_active_runtimes does NOT use detect_changed_deployments.outputs.deployment_matrix", "detect_changed_deployments.outputs.deployment_matrix" not in str(validate_active_matrix)))
+
+# 16: runtime acceptance (validate_active_runtimes) is real-deploy-only.
+validate_active_if = validate_active.get("if", "")
+results.append(("16: validate_active_runtimes is real-deploy-only (effective_deploy == \x27true\x27)", "effective_deploy" in validate_active_if and "== \x27true\x27" in validate_active_if))
+
+# 17/18: replication waits for successful active-runtime acceptance when active deployments exist; the no-active-runtime path remains valid (excluded from the requirement, not merely tolerated).
+replication = jobs.get("replication_reconcile_once", {})
+replication_needs = replication.get("needs") or []
+replication_if = replication.get("if", "")
+results.append(("17a: replication_reconcile_once needs validate_active_runtimes", "validate_active_runtimes" in replication_needs))
+results.append(("17b: replication_reconcile_once requires validate_active_runtimes.result == success when active deployments exist", "validate_active_runtimes.result == \x27success\x27" in replication_if))
+results.append(("18: replication_reconcile_once explicitly bypasses that requirement when has_active_deployments != \x27true\x27 (no-active-runtime path remains valid)", "has_active_deployments != \x27true\x27" in replication_if))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+' 2>&1)"
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL\ *) fail "Phase B3A: ${line#FAIL }" ;;
+      OK\ *) pass "Phase B3A: ${line#OK }" ;;
+    esac
+  done <<< "$PHASE_B3A_STRUCTURAL_CHECK"
+else
+  skip "Phase B3A: structural DAG/workflow checks -- python3/PyYAML unavailable or main workflow missing"
+fi
+
+# 5: current absent descriptors yield [] active_runtime_matrix -- proven directly by running the real folder-driven registry, never asserted as a fixed string.
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  ACTIVE_MATRIX_RESULT="$(python3 -c '
+import json
+import subprocess
+import sys
+
+proc = subprocess.run([sys.executable, "-B", "hack/goldengate-deployment-model.py", "--environment", "dev", "registry"], capture_output=True, text=True)
+if proc.returncode != 0:
+    print(f"FAIL: registry generation failed: {proc.stderr}")
+    sys.exit(0)
+
+import yaml
+doc = yaml.safe_load(proc.stdout)
+deployments = doc.get("deployments") or []
+matrix = [{"environment": "dev", "deployment_id": d["name"]} for d in deployments]
+if matrix == []:
+    print("OK")
+else:
+    print(f"FAIL: expected [] active_runtime_matrix with both runtime descriptors currently lifecycle.state=absent, got {matrix!r}")
+' 2>&1)"
+  if [ "$ACTIVE_MATRIX_RESULT" = "OK" ]; then
+    pass "Phase B3A: 5: current absent descriptors (gg-postgresql-repltest-01/gg-mssql-repltest-01, both lifecycle.state=absent) yield an empty [] active_runtime_matrix"
+  else
+    fail "Phase B3A: 5: ${ACTIVE_MATRIX_RESULT}"
+  fi
+else
+  skip "Phase B3A: 5: active_runtime_matrix emptiness -- python3 unavailable"
+fi
+
+# DAG simulation: the required real-deploy/dry-run/ABSENT/OWNED/BROKEN/global-active-inventory scenarios, exercised against the real if: expressions, never a text/regex match against the workflow author's own wording.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  set +e
+  PHASE_B3A_SIM_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import re
+import sys
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+
+jobs = doc["jobs"]
+
+
+def _extract_if(job_name):
+    raw = jobs[job_name].get("if", "true")
+    raw = str(raw).strip()
+    if raw.startswith("${{") and raw.endswith("}}"):
+        raw = raw[3:-2].strip()
+    return raw
+
+
+class _Parser:
+    """A tiny, bespoke evaluator for exactly the GHA expression subset this workflow uses: && || == != () quoted strings, needs.<job>.result, needs.<job>.outputs.<name>, always(). Not a general GHA expression engine -- just enough to genuinely simulate these job conditions against a fabricated needs context, rather than trusting a text/regex match against the workflow author's own wording."""
+
+    def __init__(self, expr, needs):
+        self.expr = expr
+        self.needs = needs
+        self.pos = 0
+
+    def _skip_ws(self):
+        while self.pos < len(self.expr) and self.expr[self.pos].isspace():
+            self.pos += 1
+
+    def parse(self):
+        result = self._or()
+        self._skip_ws()
+        if self.pos != len(self.expr):
+            raise ValueError(f"trailing content: {self.expr[self.pos:]!r}")
+        return result
+
+    def _or(self):
+        left = self._and()
+        self._skip_ws()
+        while self.expr[self.pos:self.pos + 2] == "||":
+            self.pos += 2
+            right = self._and()
+            left = left or right
+            self._skip_ws()
+        return left
+
+    def _and(self):
+        left = self._atom()
+        self._skip_ws()
+        while self.expr[self.pos:self.pos + 2] == "&&":
+            self.pos += 2
+            right = self._atom()
+            left = left and right
+            self._skip_ws()
+        return left
+
+    def _atom(self):
+        self._skip_ws()
+        if self.expr[self.pos] == "(":
+            self.pos += 1
+            val = self._or()
+            self._skip_ws()
+            assert self.expr[self.pos] == ")"
+            self.pos += 1
+            return val
+        if self.expr[self.pos:self.pos + 8] == "always()":
+            self.pos += 8
+            return True
+        left_val = self._value()
+        self._skip_ws()
+        op = self.expr[self.pos:self.pos + 2]
+        if op in ("==", "!="):
+            self.pos += 2
+            right_val = self._value()
+            return left_val == right_val if op == "==" else left_val != right_val
+        return bool(left_val)
+
+    def _value(self):
+        self._skip_ws()
+        if self.expr[self.pos] == "'":
+            self.pos += 1
+            start = self.pos
+            while self.expr[self.pos] != "'":
+                self.pos += 1
+            val = self.expr[start:self.pos]
+            self.pos += 1
+            return val
+        m = re.match(r"needs\.([A-Za-z0-9_]+)\.result", self.expr[self.pos:])
+        if m:
+            self.pos += m.end()
+            return self.needs.get(m.group(1), {}).get("result", "")
+        m = re.match(r"needs\.([A-Za-z0-9_]+)\.outputs\.([A-Za-z0-9_]+)", self.expr[self.pos:])
+        if m:
+            self.pos += m.end()
+            return self.needs.get(m.group(1), {}).get("outputs", {}).get(m.group(2), "")
+        raise ValueError(f"cannot parse value at: {self.expr[self.pos:self.pos + 40]!r}")
+
+
+def eval_gha_bool(expr, needs):
+    return bool(_Parser(expr, needs).parse())
+
+
+# delete_removed_argocd_applications's own if: uses success()/github.event_name (outside this tiny parser's subset) -- its RESULT is supplied as a fixed context input, exactly like terraform_sync_once/argocd_preflight are fixed inputs in the existing Phase B1 simulator elsewhere in this suite.
+JOB_ORDER = ["runtime_ownership_preflight", "build_publish_and_deploy", "validate_active_runtimes", "replication_reconcile_once", "final_validation"]
+IF_EXPRS = {job: _extract_if(job) for job in JOB_ORDER}
+
+
+def simulate(initial, outcome_when_run, outputs_when_run=None):
+    results = dict(initial)
+    outputs_when_run = outputs_when_run or {}
+    for job in JOB_ORDER:
+        would_run = eval_gha_bool(IF_EXPRS[job], results)
+        if would_run:
+            results[job] = {"result": outcome_when_run.get(job, "success"), "outputs": outputs_when_run.get(job, {})}
+        else:
+            results[job] = {"result": "skipped", "outputs": {}}
+    return results
+
+
+def base_context(effective_deploy, has_changes, has_active):
+    return {
+        "validate_model": {"result": "success", "outputs": {"effective_deploy": effective_deploy, "has_active_deployments": has_active}},
+        "detect_changed_deployments": {"result": "success", "outputs": {"has_changes": has_changes}},
+        "validate_shared_secrets_once": {"result": "success", "outputs": {}},
+        "delete_removed_argocd_applications": {"result": "success", "outputs": {}},
+    }
+
+
+failures = []
+
+
+def check(label, condition):
+    if not condition:
+        failures.append(label)
+
+
+# 1: REAL DEPLOY + changed runtime + preflight ABSENT -> build runs.
+ctx = base_context("true", "true", "false")
+r = simulate(ctx, {}, {"runtime_ownership_preflight": {"state": "ABSENT"}})
+check("REAL DEPLOY + changed runtime + preflight ABSENT -> build_publish_and_deploy runs", r["build_publish_and_deploy"]["result"] == "success")
+
+# 2: REAL DEPLOY + changed runtime + preflight OWNED -> build runs.
+ctx = base_context("true", "true", "false")
+r = simulate(ctx, {}, {"runtime_ownership_preflight": {"state": "OWNED"}})
+check("REAL DEPLOY + changed runtime + preflight OWNED -> build_publish_and_deploy runs", r["build_publish_and_deploy"]["result"] == "success")
+
+# 3: REAL DEPLOY + changed runtime + preflight BROKEN -> build blocked.
+ctx = base_context("true", "true", "false")
+r = simulate(ctx, {"runtime_ownership_preflight": "failure"})
+check("REAL DEPLOY + changed runtime + preflight BROKEN -> build_publish_and_deploy is blocked (skipped)", r["build_publish_and_deploy"]["result"] == "skipped")
+
+# 4: DRY RUN + changed runtime -> live ownership preflight skipped -> local build/render validation still runs.
+ctx = base_context("false", "true", "false")
+r = simulate(ctx, {})
+check("DRY RUN + changed runtime -> runtime_ownership_preflight is skipped (never invoked live)", r["runtime_ownership_preflight"]["result"] == "skipped")
+check("DRY RUN + changed runtime -> build_publish_and_deploy's local render/validation path still runs", r["build_publish_and_deploy"]["result"] == "success")
+
+# 5: REAL DEPLOY + no changed runtimes + active runtime exists -> build may skip -> validate_active_runtimes still runs.
+ctx = base_context("true", "false", "true")
+r = simulate(ctx, {})
+check("REAL DEPLOY + no changed runtimes -> build_publish_and_deploy skips (nothing to build)", r["build_publish_and_deploy"]["result"] == "skipped")
+check("REAL DEPLOY + no changed runtimes + active runtime exists -> validate_active_runtimes still runs", r["validate_active_runtimes"]["result"] == "success")
+
+# 6: REAL DEPLOY + one active runtime unhealthy -> runtime acceptance fails -> replication blocked.
+ctx = base_context("true", "false", "true")
+r = simulate(ctx, {"validate_active_runtimes": "failure"})
+check("REAL DEPLOY + active runtime unhealthy -> validate_active_runtimes reports failure", r["validate_active_runtimes"]["result"] == "failure")
+check("REAL DEPLOY + active runtime unhealthy -> replication_reconcile_once is blocked", r["replication_reconcile_once"]["result"] == "skipped")
+check("REAL DEPLOY + active runtime unhealthy -> final_validation is blocked (MAIN cannot claim success)", r["final_validation"]["result"] == "skipped")
+
+# 7: REAL DEPLOY + no active runtimes -> runtime acceptance cleanly skipped -> replication remains safe no-op.
+ctx = base_context("true", "false", "false")
+r = simulate(ctx, {})
+check("REAL DEPLOY + no active runtimes -> validate_active_runtimes is cleanly skipped (never an empty-matrix error)", r["validate_active_runtimes"]["result"] == "skipped")
+check("REAL DEPLOY + no active runtimes -> replication_reconcile_once still runs (existing clean no-op path preserved)", r["replication_reconcile_once"]["result"] == "success")
+check("REAL DEPLOY + no active runtimes -> final_validation still runs", r["final_validation"]["result"] == "success")
+
+if failures:
+    print("\n".join(failures))
+    sys.exit(1)
+print("OK")
+PYEOF
+)"
+  PHASE_B3A_SIM_STATUS=$?
+  set -e
+  if [ "$PHASE_B3A_SIM_STATUS" -eq 0 ]; then
+    pass "Phase B3A: DAG scenario 1 (REAL DEPLOY + changed runtime + ABSENT preflight -> build runs)"
+    pass "Phase B3A: DAG scenario 2 (REAL DEPLOY + changed runtime + OWNED preflight -> build runs)"
+    pass "Phase B3A: DAG scenario 3 (REAL DEPLOY + changed runtime + BROKEN preflight -> build blocked)"
+    pass "Phase B3A: DAG scenario 4 (DRY RUN + changed runtime -> live preflight skipped, local render path still runs)"
+    pass "Phase B3A: DAG scenario 5 (REAL DEPLOY + no changed runtimes + active runtime exists -> build may skip, validate_active_runtimes still runs)"
+    pass "Phase B3A: DAG scenario 6 (REAL DEPLOY + one active runtime unhealthy -> acceptance fails, replication/final_validation blocked)"
+    pass "Phase B3A: DAG scenario 7 (REAL DEPLOY + no active runtimes -> acceptance cleanly skipped, replication remains safe no-op)"
+  else
+    fail "Phase B3A DAG simulation failed:"$'\n'"${PHASE_B3A_SIM_OUT}"
+  fi
+else
+  skip "Phase B3A: DAG simulation -- python3/PyYAML unavailable or main workflow missing"
+fi
+
+# 19: no Route 53 mutation was introduced anywhere in the repository (aws_route53_record, aws route53 change-resource-record-sets, or similar mutation logic).
+ROUTE53_HITS="$(grep -rln --exclude-dir=.git --exclude="$(basename "$0")" -iE 'aws_route53_record|route53[^[:alnum:]]*change-resource-record-sets|route53:changeresourcerecordsets' . 2>/dev/null || true)"
+if [ -z "$ROUTE53_HITS" ]; then
+  pass "Phase B3A: 19: no Route 53 mutation (aws_route53_record / change-resource-record-sets) was introduced anywhere in the repository"
+else
+  fail "Phase B3A: 19: unexpected Route 53 mutation reference found in:"$'\n'"${ROUTE53_HITS}"
+fi
+
+# 20: no runtime/monitor sidecar architecture was introduced -- the approved chart shape (exactly one application container, no observer/utility/Fluent-Bit sidecar) is unchanged, and the acceptance classifier enforces exactly one container, never a second desired shape.
+if grep -qE '^\s*containers:\s*$' helm/goldengate/templates/runtime-statefulset.yaml 2>/dev/null; then
+  RUNTIME_CONTAINER_COUNT="$(awk '/^      containers:/{c++} c==1 && /^        - name:/{n++} /^      volumes:/{exit} END{print n+0}' helm/goldengate/templates/runtime-statefulset.yaml)"
+  if [ "$RUNTIME_CONTAINER_COUNT" = "1" ]; then
+    pass "Phase B3A: 20: helm/goldengate/templates/runtime-statefulset.yaml still renders exactly one application container (no observer/utility/Fluent-Bit sidecar introduced)"
+  else
+    fail "Phase B3A: 20: helm/goldengate/templates/runtime-statefulset.yaml now renders ${RUNTIME_CONTAINER_COUNT} top-level containers, expected exactly 1"
+  fi
+else
+  fail "Phase B3A: 20: could not locate the containers: block in helm/goldengate/templates/runtime-statefulset.yaml"
+fi
+if grep -qF "len(containers) != 1" hack/orchestration/runtime_acceptance.py 2>/dev/null; then
+  pass "Phase B3A: 20: runtime_acceptance.py enforces exactly one application container, never a second desired sidecar shape"
+else
+  fail "Phase B3A: 20: runtime_acceptance.py no longer enforces the exact one-container pod shape as expected"
 fi
 
 echo ""

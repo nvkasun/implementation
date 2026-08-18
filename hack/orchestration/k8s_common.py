@@ -100,6 +100,24 @@ def daemonset_ready(obj):
     return True, None
 
 
+def statefulset_ready(obj, desired_replicas):
+    """Exact StatefulSet readiness: observedGeneration caught up, a positive desired replica count (from the canonical deployment model, never hardcoded), ready/current/updated all equal to it, and -- where the revision fields are present at all -- currentRevision == updateRevision (rollout fully settled, not mid-rollingUpdate)."""
+    status = obj.get("status") or {}
+    metadata = obj.get("metadata") or {}
+    if metadata.get("generation") != status.get("observedGeneration"):
+        return False, f"status.observedGeneration={status.get('observedGeneration')!r} does not match metadata.generation={metadata.get('generation')!r}"
+    if not desired_replicas or desired_replicas <= 0:
+        return False, f"desired replicas {desired_replicas!r} is not > 0"
+    for field in ("readyReplicas", "currentReplicas", "updatedReplicas"):
+        if status.get(field) != desired_replicas:
+            return False, f"status.{field}={status.get(field)!r}, expected desired replicas={desired_replicas}"
+    current_revision = status.get("currentRevision")
+    update_revision = status.get("updateRevision")
+    if current_revision is not None and update_revision is not None and current_revision != update_revision:
+        return False, f"status.currentRevision={current_revision!r} != status.updateRevision={update_revision!r} -- rollout not yet settled"
+    return True, None
+
+
 def pod_template_images(obj):
     """Every container/initContainer image reference in a Deployment/DaemonSet/StatefulSet's spec.template.spec -- the actual scheduled pod template, never a Helm values guess."""
     pod_spec = (((obj.get("spec") or {}).get("template") or {}).get("spec")) or {}

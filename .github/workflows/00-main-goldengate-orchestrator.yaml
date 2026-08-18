@@ -57,6 +57,7 @@ jobs:
     outputs:
       effective_deploy: ${{ steps.compute.outputs.effective_deploy }}
       has_active_deployments: ${{ steps.active_runtime_state.outputs.has_active_deployments }}
+      active_runtime_matrix: ${{ steps.active_runtime_state.outputs.active_runtime_matrix }}
       selected_environment: ${{ steps.resolve_environment.outputs.environment }}
 
     steps:
@@ -168,6 +169,29 @@ jobs:
             echo "No active GoldenGate runtimes remain; runtime-dependent monitor stages will be skipped."
             echo "has_active_deployments=false" >> "$GITHUB_OUTPUT"
           fi
+
+          # Phase B3A: active_runtime_matrix -- the SAME canonical registry, reshaped into {environment, deployment_id} entries -- is the GLOBAL active-runtime inventory validate_active_runtimes (post-reconciliation acceptance) consumes below. Deliberately NOT re-scanned independently: derived from the identical "$TMP" registry file has_active_deployments above already validated.
+          ACTIVE_RUNTIME_MATRIX="$(python3 - "$TMP" "$GG_SELECTED_ENVIRONMENT" <<'PY'
+          import json
+          import sys
+
+          import yaml
+
+          with open(sys.argv[1]) as f:
+              doc = yaml.safe_load(f)
+          environment = sys.argv[2]
+
+          deployments = doc.get("deployments")
+          if not isinstance(deployments, list):
+              raise SystemExit("registry deployments is not a list")
+
+          matrix = [{"environment": environment, "deployment_id": d["name"]} for d in deployments]
+          print(json.dumps(matrix, sort_keys=True))
+          PY
+          )"
+
+          echo "Active GoldenGate runtime matrix: ${ACTIVE_RUNTIME_MATRIX}"
+          echo "active_runtime_matrix=${ACTIVE_RUNTIME_MATRIX}" >> "$GITHUB_OUTPUT"
 
       - name: Compute effective deploy flag
         id: compute
@@ -1327,14 +1351,129 @@ jobs:
 
           python3 hack/goldengate-managed-efs-inventory-guard.py "${GG_SELECTED_ENVIRONMENT}" expected-managed-efs.json actual-managed-efs.json
 
+  runtime_ownership_preflight:
+    name: Classify GoldenGate runtime ownership safety (read-only, per selected deployment)
+
+    # Phase B3A: read-only pre-reconciliation ownership-safety classifier for the deployment(s) THIS RUN is about to reconcile -- ABSENT (safe to create) / OWNED (safe to reconcile, even if currently unhealthy/out of date) / BROKEN (ownership/collision conflict, fail closed). This is deliberately NOT a HEALTHY-skip prerequisite: a GoldenGate runtime is an actual desired deployment target whose descriptor/image/chart may intentionally change on every run, so OWNED (not HEALTHY) is the "proceed" state here. This job never mutates the cluster -- it only runs hack/orchestration/runtime_state.py, which itself issues read-only `kubectl get` calls.
+    needs:
+      - validate_model
+      - detect_changed_deployments
+      - validate_shared_secrets_once
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.detect_changed_deployments.result == 'success' && needs.detect_changed_deployments.outputs.has_changes == 'true' && needs.validate_shared_secrets_once.result == 'success' }}
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    environment: ${{ matrix.environment }}
+
+    strategy:
+      # Same sequential/fail-fast safety posture as the runtime rollout it gates: an ownership conflict on one deployment must not be masked by a concurrently-evaluated sibling.
+      fail-fast: true
+      max-parallel: 1
+      matrix:
+        include: ${{ fromJson(needs.detect_changed_deployments.outputs.deployment_matrix) }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Load resolved environment config
+        shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ matrix.environment }}
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
+
+      - name: Install kubectl if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking/installing kubectl..."
+
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KUBECTL_VERSION="v1.35.0"
+
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64)
+                KUBECTL_ARCH="amd64"
+                ;;
+              aarch64|arm64)
+                KUBECTL_ARCH="arm64"
+                ;;
+              *)
+                echo "Unsupported architecture for kubectl: $ARCH"
+                exit 1
+                ;;
+            esac
+
+            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+            sudo chmod +x /usr/local/bin/kubectl
+          fi
+
+          kubectl version --client=true
+
+      - name: Connect to EKS cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}" \
+            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
+            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
+
+          echo "Current kube context:"
+          kubectl config current-context
+
+      - name: Classify runtime ownership safety
+        id: classify
+        shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ matrix.environment }}
+          GG_DEPLOYMENT_ID: ${{ matrix.deployment_id }}
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
+
+          # A non-zero exit here is either a configuration error (invalid/unknown deployment ID) or a classifier inspection error (API unreachable, permission denied, malformed JSON) -- never treated as ABSENT.
+          if ! CLASSIFIER_OUTPUT="$(python3 hack/orchestration/runtime_state.py --environment "${GG_SELECTED_ENVIRONMENT}" --deployment-id "${GG_DEPLOYMENT_ID}")"; then
+            echo "FAIL: the GoldenGate runtime ownership classifier could not classify ${GG_DEPLOYMENT_ID} (configuration or inspection error, not ABSENT) -- see diagnostics above."
+            exit 1
+          fi
+
+          echo "$CLASSIFIER_OUTPUT"
+
+          STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
+          echo "GoldenGate runtime ownership-safety state for ${GG_DEPLOYMENT_ID}: ${STATE}"
+          echo "state=${STATE}" >> "$GITHUB_OUTPUT"
+
+          if [ "$STATE" = "BROKEN" ]; then
+            echo "FAIL: GoldenGate runtime ownership-safety state for ${GG_DEPLOYMENT_ID} is BROKEN -- an existing footprint does not clearly belong to this deployment. This is not auto-repaired here -- investigate the diagnostics above before re-running."
+            exit 1
+          fi
+
   build_publish_and_deploy:
     name: Build, publish, and deploy GoldenGate Helm chart via Argo CD
 
     needs:
+      - validate_model
       - detect_changed_deployments
       - validate_shared_secrets_once
-    # Requires validate_shared_secrets_once.result == 'success' (never the weaker "not failure/not cancelled"): that job is itself now fail-closed for a real deploy (see its own if:), so requiring its strict success here is what actually closes the deploy=true path -- a failed/skipped storage guard or terraform/platform sync upstream now reliably prevents this job from building/deploying anything, while deploy=false's legitimate skip-terraform/platform path still resolves validate_shared_secrets_once to 'success' and this job still runs its read-only/dry-run path.
-    if: ${{ always() && needs.detect_changed_deployments.result == 'success' && needs.detect_changed_deployments.outputs.has_changes == 'true' && needs.validate_shared_secrets_once.result == 'success' }}
+      - runtime_ownership_preflight
+    # Requires validate_shared_secrets_once.result == 'success' (never the weaker "not failure/not cancelled"): that job is itself now fail-closed for a real deploy (see its own if:), so requiring its strict success here is what actually closes the deploy=true path -- a failed/skipped storage guard or terraform/platform sync upstream now reliably prevents this job from building/deploying anything, while deploy=false's legitimate skip-terraform/platform path still resolves validate_shared_secrets_once to 'success' and this job still runs its read-only/dry-run path. Phase B3A: the live runtime_ownership_preflight is required ONLY on a real deploy (it never even runs on deploy=false, since its own if: is effective_deploy-gated) -- the `effective_deploy != 'true' || runtime_ownership_preflight.result == 'success'` clause below is what keeps the existing offline Helm lint/render dry-run path completely unaffected by it, while a real deploy is blocked whenever ownership safety was not confirmed ABSENT/OWNED.
+    if: ${{ always() && needs.detect_changed_deployments.result == 'success' && needs.detect_changed_deployments.outputs.has_changes == 'true' && needs.validate_shared_secrets_once.result == 'success' && (needs.validate_model.outputs.effective_deploy != 'true' || needs.runtime_ownership_preflight.result == 'success') }}
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -3179,6 +3318,206 @@ jobs:
             echo "namespace has the expected GoldenGate ownership labels."
           } >> "$GITHUB_STEP_SUMMARY"
 
+  validate_active_runtimes:
+    name: Validate every ACTIVE GoldenGate runtime (read-only, global desired-state acceptance)
+
+    # Phase B3A: post-reconciliation runtime acceptance -- HEALTHY/BROKEN only (never ABSENT: an active desired runtime that is missing IS BROKEN). Deliberately uses needs.validate_model.outputs.active_runtime_matrix (the GLOBAL canonical registry), never detect_changed_deployments.outputs.deployment_matrix (only the deployments THIS RUN selected) -- an unchanged active runtime must be validated too, or MAIN could claim end-to-end success while a previously-deployed runtime silently degraded. This job never mutates the cluster or AWS -- runtime_acceptance.py's Kubernetes calls are read-only `kubectl get`, and any managed-EFS filesystem ID is resolved here via a single read-only elasticfilesystem:DescribeFileSystems call (identical contract to build_publish_and_deploy's own "Resolve EFS filesystem ID" step), never inside the Python tool itself.
+    needs:
+      - validate_model
+      - validate_shared_secrets_once
+      - build_publish_and_deploy
+      - delete_removed_argocd_applications
+    # always() so a legitimately-skipped build_publish_and_deploy (nothing changed this run) does not itself suppress acceptance of the OTHER active runtimes -- only an actual build failure/cancellation blocks this job. has_active_deployments=='false' cleanly skips the whole job rather than attempting an empty matrix.
+    if: ${{ always() && needs.validate_model.outputs.effective_deploy == 'true' && needs.validate_model.outputs.has_active_deployments == 'true' && needs.validate_shared_secrets_once.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' }}
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    environment: ${{ matrix.environment }}
+
+    strategy:
+      # One matrix item per active deployment in the GLOBAL canonical registry; sequential/fail-fast so a BROKEN runtime is reported clearly rather than racing diagnostics from a concurrently-evaluated sibling.
+      fail-fast: true
+      max-parallel: 1
+      matrix:
+        include: ${{ fromJson(needs.validate_model.outputs.active_runtime_matrix) }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Load resolved environment config
+        shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ matrix.environment }}
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
+
+      - name: Install kubectl if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking/installing kubectl..."
+
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KUBECTL_VERSION="v1.35.0"
+
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64)
+                KUBECTL_ARCH="amd64"
+                ;;
+              aarch64|arm64)
+                KUBECTL_ARCH="arm64"
+                ;;
+              *)
+                echo "Unsupported architecture for kubectl: $ARCH"
+                exit 1
+                ;;
+            esac
+
+            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+            sudo chmod +x /usr/local/bin/kubectl
+          fi
+
+          kubectl version --client=true
+
+      - name: Connect to EKS cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}" \
+            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
+            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
+
+          echo "Current kube context:"
+          kubectl config current-context
+
+      - name: Resolve expected managed-EFS filesystem ID (read-only, when applicable)
+        id: resolve_efs
+        shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ matrix.environment }}
+          GG_DEPLOYMENT_ID: ${{ matrix.deployment_id }}
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
+
+          DESCRIBE_JSON="$(python3 hack/goldengate-deployment-model.py --environment "${GG_SELECTED_ENVIRONMENT}" describe "${GG_DEPLOYMENT_ID}")"
+          EFS_MODE="$(python3 -c 'import json, sys; print(json.load(sys.stdin).get("efsMode") or "")' <<< "$DESCRIBE_JSON")"
+
+          if [ -z "$EFS_MODE" ]; then
+            echo "EFS ID source: not applicable (persistence.efs is not in use for ${GG_DEPLOYMENT_ID})."
+            echo "expected_efs_id=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$EFS_MODE" = "existing" ]; then
+            EFS_FILE_SYSTEM_ID_DECLARED="$(python3 -c 'import json, sys; print(json.load(sys.stdin).get("efsFileSystemId") or "")' <<< "$DESCRIBE_JSON")"
+            echo "EFS ID source: existing descriptor."
+            echo "expected_efs_id=${EFS_FILE_SYSTEM_ID_DECLARED}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          EFS_CREATION_TOKEN="$(python3 -c 'import json, sys; print(json.load(sys.stdin).get("efsCreationToken") or "")' <<< "$DESCRIBE_JSON")"
+          if [ -z "$EFS_CREATION_TOKEN" ]; then
+            echo "FAIL: persistence.efs.mode=managed but no EFS creation token was resolved from the deployment model."
+            exit 1
+          fi
+
+          # The expected workload account is proven directly from the role ARN this step is about to assume, never a separately hardcoded/guessed account number. Identical read-only elasticfilesystem:DescribeFileSystems contract as build_publish_and_deploy's own "Resolve EFS filesystem ID" step -- this role is never granted EFS create/update/delete permissions.
+          EXPECTED_WORKLOAD_ACCOUNT_ID="$(echo "$EKS_DEPLOY_ROLE_ARN" | sed -nE 's#^arn:aws:iam::([0-9]{12}):role/.*$#\1#p')"
+          if [ -z "$EXPECTED_WORKLOAD_ACCOUNT_ID" ]; then
+            echo "FAIL: could not extract a 12-digit account ID from EKS_DEPLOY_ROLE_ARN; refusing to resolve an EFS filesystem ID without a provable expected workload account."
+            exit 1
+          fi
+
+          ASSUME_JSON="$(aws sts assume-role --role-arn "$EKS_DEPLOY_ROLE_ARN" --role-session-name "gg-runtime-acceptance-efs-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --duration-seconds 900 --output json)"
+          EFS_TMP_KEY_ID="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["Credentials"]["AccessKeyId"])' <<< "$ASSUME_JSON")"
+          EFS_TMP_SECRET="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["Credentials"]["SecretAccessKey"])' <<< "$ASSUME_JSON")"
+          EFS_TMP_TOKEN="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["Credentials"]["SessionToken"])' <<< "$ASSUME_JSON")"
+          unset ASSUME_JSON
+          echo "::add-mask::${EFS_TMP_KEY_ID}"
+          echo "::add-mask::${EFS_TMP_SECRET}"
+          echo "::add-mask::${EFS_TMP_TOKEN}"
+
+          ACTUAL_ACCOUNT="$(AWS_ACCESS_KEY_ID="$EFS_TMP_KEY_ID" AWS_SECRET_ACCESS_KEY="$EFS_TMP_SECRET" AWS_SESSION_TOKEN="$EFS_TMP_TOKEN" aws sts get-caller-identity --query Account --output text --region "$AWS_REGION")"
+          if [ "$ACTUAL_ACCOUNT" != "$EXPECTED_WORKLOAD_ACCOUNT_ID" ]; then
+            echo "FAIL: assumed role resolved to account ${ACTUAL_ACCOUNT}, expected the GoldenGate workload account ${EXPECTED_WORKLOAD_ACCOUNT_ID}."
+            unset EFS_TMP_KEY_ID EFS_TMP_SECRET EFS_TMP_TOKEN
+            exit 1
+          fi
+
+          DESCRIBE_EFS_JSON="$(AWS_ACCESS_KEY_ID="$EFS_TMP_KEY_ID" AWS_SECRET_ACCESS_KEY="$EFS_TMP_SECRET" AWS_SESSION_TOKEN="$EFS_TMP_TOKEN" aws efs describe-file-systems --creation-token "$EFS_CREATION_TOKEN" --region "$AWS_REGION" --output json)"
+
+          MATCH_COUNT="$(python3 -c 'import json, sys; print(len(json.load(sys.stdin)["FileSystems"]))' <<< "$DESCRIBE_EFS_JSON")"
+          if [ "$MATCH_COUNT" -ne 1 ]; then
+            echo "FAIL: expected exactly one EFS filesystem for creation token ${EFS_CREATION_TOKEN}, found ${MATCH_COUNT}. Refusing to list-and-guess."
+            unset EFS_TMP_KEY_ID EFS_TMP_SECRET EFS_TMP_TOKEN
+            exit 1
+          fi
+
+          RESOLVED_EFS_ID="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["FileSystems"][0]["FileSystemId"])' <<< "$DESCRIBE_EFS_JSON")"
+
+          # Defense in depth: cross-check the resolved filesystem's ownership tags, already present on this same DescribeFileSystems response -- no second list-tags-for-resource call.
+          TAGS_OK="$(python3 -c 'import json, sys; tags = {t["Key"]: t["Value"] for t in json.load(sys.stdin)["FileSystems"][0].get("Tags", [])}; print("true" if tags.get("ManagedBy") == "goldengate-eks-app" and tags.get("GoldenGateDeploymentId") == sys.argv[1] and tags.get("GoldenGateEnvironment") == sys.argv[2] and tags.get("GoldenGateStorage") == "u02" else "false")' "$GG_DEPLOYMENT_ID" "$GG_SELECTED_ENVIRONMENT" <<< "$DESCRIBE_EFS_JSON")"
+          unset EFS_TMP_KEY_ID EFS_TMP_SECRET EFS_TMP_TOKEN
+          if [ "$TAGS_OK" != "true" ]; then
+            echo "FAIL: the EFS filesystem resolved for creation token ${EFS_CREATION_TOKEN} (${RESOLVED_EFS_ID}) does not carry the expected ManagedBy/GoldenGateDeploymentId/GoldenGateEnvironment/GoldenGateStorage ownership tags."
+            exit 1
+          fi
+
+          echo "EFS ID source: managed Terraform/AWS resolution (creation token ${EFS_CREATION_TOKEN})."
+          echo "expected_efs_id=${RESOLVED_EFS_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate runtime acceptance
+        id: classify
+        shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ matrix.environment }}
+          GG_DEPLOYMENT_ID: ${{ matrix.deployment_id }}
+          GG_EXPECTED_EFS_ID: ${{ steps.resolve_efs.outputs.expected_efs_id }}
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
+
+          EFS_ARGS=()
+          if [ -n "$GG_EXPECTED_EFS_ID" ]; then
+            EFS_ARGS=(--expected-efs-file-system-id "$GG_EXPECTED_EFS_ID")
+          fi
+
+          # A non-zero exit here is either a configuration error or a classifier inspection error (API unreachable, permission denied, malformed JSON) -- never a normal BROKEN state.
+          if ! CLASSIFIER_OUTPUT="$(python3 hack/orchestration/runtime_acceptance.py --environment "${GG_SELECTED_ENVIRONMENT}" --deployment-id "${GG_DEPLOYMENT_ID}" "${EFS_ARGS[@]}")"; then
+            echo "FAIL: the GoldenGate runtime acceptance classifier could not evaluate ${GG_DEPLOYMENT_ID} (configuration or inspection error) -- see diagnostics above."
+            exit 1
+          fi
+
+          echo "$CLASSIFIER_OUTPUT"
+
+          STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
+          echo "GoldenGate runtime acceptance state for ${GG_DEPLOYMENT_ID}: ${STATE}"
+
+          if [ "$STATE" != "HEALTHY" ]; then
+            echo "FAIL: GoldenGate runtime acceptance state for ${GG_DEPLOYMENT_ID} is ${STATE}, expected HEALTHY. MAIN cannot claim end-to-end success while an active runtime is unhealthy."
+            exit 1
+          fi
+
+          echo "OK: GoldenGate runtime ${GG_DEPLOYMENT_ID} is HEALTHY."
+
   replication_reconcile_once:
     name: Reconcile GoldenGate replication pipelines (once, after all runtimes)
 
@@ -3187,7 +3526,9 @@ jobs:
       - validate_shared_secrets_once
       - build_publish_and_deploy
       - delete_removed_argocd_applications
-    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && always() && needs.validate_shared_secrets_once.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' }}
+      - validate_active_runtimes
+    # Phase B3A: replication must wait for the GLOBAL active-runtime acceptance gate -- when active deployments exist, validate_active_runtimes.result == 'success' is required; when none exist, the existing clean no-op replication behaviour is preserved unchanged (validate_active_runtimes itself does not even run in that case, so it is excluded from the requirement entirely rather than merely tolerated as skipped).
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && always() && needs.validate_shared_secrets_once.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' && (needs.validate_model.outputs.has_active_deployments != 'true' || needs.validate_active_runtimes.result == 'success') }}
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -3613,14 +3954,17 @@ jobs:
     needs:
       - validate_model
       - validate_shared_secrets_once
+      - runtime_ownership_preflight
       - build_publish_and_deploy
       - delete_removed_argocd_applications
+      - validate_active_runtimes
       - replication_reconcile_once
       - replication_dry_run_validation
       - monitor_sync_once
       - monitor_dry_run_validation
       - replication_monitor_acceptance
-    if: ${{ always() && needs.validate_shared_secrets_once.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' && needs.replication_reconcile_once.result != 'failure' && needs.replication_reconcile_once.result != 'cancelled' && needs.replication_dry_run_validation.result != 'failure' && needs.replication_dry_run_validation.result != 'cancelled' && needs.monitor_sync_once.result != 'failure' && needs.monitor_sync_once.result != 'cancelled' && needs.monitor_dry_run_validation.result != 'failure' && needs.monitor_dry_run_validation.result != 'cancelled' && needs.replication_monitor_acceptance.result != 'failure' && needs.replication_monitor_acceptance.result != 'cancelled' }}
+    # Phase B3A: runtime_ownership_preflight/validate_active_runtimes are added explicitly here (not merely relied on transitively through build_publish_and_deploy/replication_reconcile_once's own skip-on-upstream-failure behavior) -- both are jobs whose own FAILURE (BROKEN ownership, or an unhealthy active runtime) must itself prevent MAIN from claiming a successful run, not just cause a downstream job to be quietly skipped.
+    if: ${{ always() && needs.validate_shared_secrets_once.result == 'success' && needs.runtime_ownership_preflight.result != 'failure' && needs.runtime_ownership_preflight.result != 'cancelled' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' && needs.validate_active_runtimes.result != 'failure' && needs.validate_active_runtimes.result != 'cancelled' && needs.replication_reconcile_once.result != 'failure' && needs.replication_reconcile_once.result != 'cancelled' && needs.replication_dry_run_validation.result != 'failure' && needs.replication_dry_run_validation.result != 'cancelled' && needs.monitor_sync_once.result != 'failure' && needs.monitor_sync_once.result != 'cancelled' && needs.monitor_dry_run_validation.result != 'failure' && needs.monitor_dry_run_validation.result != 'cancelled' && needs.replication_monitor_acceptance.result != 'failure' && needs.replication_monitor_acceptance.result != 'cancelled' }}
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 

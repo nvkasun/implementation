@@ -670,6 +670,34 @@ def parse_descriptor(deployment_id, environment, doc, shared=None):
     alb = ingress.get("alb") or {}
     alb_group_order = alb.get("groupOrder")
 
+    # Phase B3A: focused fields the runtime ownership/acceptance classifiers need (hack/orchestration/runtime_state.py, runtime_acceptance.py) -- never a second descriptor schema, just a few more fields extracted from the same validated document. Light shape validation only; Helm's own `required`/type coercion at render time remains the deeper contract for these fields.
+    service = runtime.get("service") or {}
+    service_type = service.get("type") or "ClusterIP"
+    if not isinstance(service_type, str) or not service_type:
+        raise DescriptorError("invalid deployment metadata: runtime.service.type must be a non-empty string")
+    service_ports_raw = service.get("ports") or {}
+    service_ports = {}
+    for port_name in ("https", "dist", "receiver", "metrics"):
+        port_value = service_ports_raw.get(port_name)
+        if port_value is not None and not (isinstance(port_value, int) and not isinstance(port_value, bool) and 1 <= port_value <= 65535):
+            raise DescriptorError(f"invalid deployment metadata: runtime.service.ports.{port_name} must be a valid port number or null")
+        service_ports[port_name] = port_value
+
+    replicas = runtime.get("replicas", 1)
+    if not (isinstance(replicas, int) and not isinstance(replicas, bool) and replicas >= 1):
+        raise DescriptorError("invalid deployment metadata: runtime.replicas must be a positive integer")
+
+    init_permissions_enabled = (runtime.get("initPermissions") or {}).get("enabled", False)
+    if not _is_literal_bool(init_permissions_enabled):
+        raise DescriptorError("invalid deployment metadata: runtime.initPermissions.enabled must be a literal Boolean")
+
+    ingress_enabled = ingress.get("enabled", False)
+    if not _is_literal_bool(ingress_enabled):
+        raise DescriptorError("invalid deployment metadata: ingress.enabled must be a literal Boolean")
+    ingress_class_name = ingress.get("className") or "alb"
+    if not isinstance(ingress_class_name, str) or not ingress_class_name:
+        raise DescriptorError("invalid deployment metadata: ingress.className must be a non-empty string")
+
     return {
         "deploymentId": deployment_id,
         "environment": environment,
@@ -695,6 +723,12 @@ def parse_descriptor(deployment_id, environment, doc, shared=None):
         "albGroupOrder": alb_group_order,
         "replicationEnabled": replication["enabled"],
         "replication": replication,
+        "replicas": replicas,
+        "serviceType": service_type,
+        "servicePorts": service_ports,
+        "initPermissionsEnabled": init_permissions_enabled,
+        "ingressEnabled": ingress_enabled,
+        "ingressClassName": ingress_class_name,
     }
 
 

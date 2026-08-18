@@ -1469,5 +1469,98 @@ class RegistryDeterminismTests(ScratchEnvironmentTestCase):
         })
 
 
+def _minimal_shape_doc(runtime_overrides=None, ingress_overrides=None):
+    doc = {
+        "deployment": {"enabled": True, "pipeline": "test-pipeline", "role": "source"},
+        "deploymentModel": "singleRuntime",
+        "runtime": {
+            "deploymentType": "oracle",
+            "containerName": "ogg-oracle",
+            "image": {"repositoryName": "ogg-oracle", "tag": "1.0.0"},
+            "csi": {"enabled": True, "admin": {"enabled": True}, "certificate": {"enabled": True}},
+        },
+        "ingress": {"enabled": True},
+    }
+    if runtime_overrides:
+        doc["runtime"].update(runtime_overrides)
+    if ingress_overrides:
+        doc["ingress"].update(ingress_overrides)
+    return doc
+
+
+class ExtendedRuntimeShapeFieldsTests(ScratchEnvironmentTestCase):
+    """Phase B3A: replicas/serviceType/servicePorts/initPermissionsEnabled/ingressEnabled/ingressClassName -- focused fields added to parse_descriptor()'s output for hack/orchestration/runtime_state.py and runtime_acceptance.py, never a second descriptor schema."""
+
+    def _describe(self, deployment_id, doc):
+        write_doc(self._tmp.name, "dev", deployment_id, doc)
+        active, inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        by_id = {d["deploymentId"]: d for d in active + inactive}
+        return by_id[deployment_id]
+
+    def test_defaults_when_fields_absent(self):
+        d = self._describe("gg-shape-01", _minimal_shape_doc())
+        self.assertEqual(d["replicas"], 1)
+        self.assertEqual(d["serviceType"], "ClusterIP")
+        self.assertEqual(d["servicePorts"], {"https": None, "dist": None, "receiver": None, "metrics": None})
+        self.assertFalse(d["initPermissionsEnabled"])
+        self.assertTrue(d["ingressEnabled"])
+        self.assertEqual(d["ingressClassName"], "alb")
+
+    def test_explicit_values_are_reflected_exactly(self):
+        doc = _minimal_shape_doc(
+            runtime_overrides={
+                "replicas": 1,
+                "service": {"type": "ClusterIP", "ports": {"https": 8443, "dist": 9013, "receiver": None, "metrics": 9015}},
+                "initPermissions": {"enabled": True, "mode": "0777"},
+            },
+            ingress_overrides={"className": "alb"},
+        )
+        d = self._describe("gg-shape-02", doc)
+        self.assertEqual(d["servicePorts"]["https"], 8443)
+        self.assertEqual(d["servicePorts"]["dist"], 9013)
+        self.assertIsNone(d["servicePorts"]["receiver"])
+        self.assertEqual(d["servicePorts"]["metrics"], 9015)
+        self.assertTrue(d["initPermissionsEnabled"])
+
+    def test_invalid_replicas_is_rejected(self):
+        doc = _minimal_shape_doc(runtime_overrides={"replicas": 0})
+        write_doc(self._tmp.name, "dev", "gg-shape-03", doc)
+        active, inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+
+    def test_invalid_port_is_rejected(self):
+        doc = _minimal_shape_doc(runtime_overrides={"service": {"ports": {"https": 99999}}})
+        write_doc(self._tmp.name, "dev", "gg-shape-04", doc)
+        active, inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+
+    def test_invalid_ingress_enabled_type_is_rejected(self):
+        doc = _minimal_shape_doc(ingress_overrides={"enabled": "yes"})
+        write_doc(self._tmp.name, "dev", "gg-shape-05", doc)
+        active, inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+
+    def test_invalid_init_permissions_enabled_type_is_rejected(self):
+        doc = _minimal_shape_doc(runtime_overrides={"initPermissions": {"enabled": "yes"}})
+        write_doc(self._tmp.name, "dev", "gg-shape-06", doc)
+        active, inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+
+    def test_real_dev_descriptors_expose_the_new_fields(self):
+        # Not a scratch fixture -- proves the extension works against the real, live envs/dev descriptors too.
+        gdm.REPO_ROOT = self._original_root
+        active, inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        for d in active + inactive:
+            self.assertIsInstance(d["replicas"], int)
+            self.assertGreaterEqual(d["replicas"], 1)
+            self.assertIn("https", d["servicePorts"])
+            self.assertIsInstance(d["initPermissionsEnabled"], bool)
+            self.assertIsInstance(d["ingressEnabled"], bool)
+            self.assertTrue(d["ingressClassName"])
+        gdm.REPO_ROOT = self._tmp.name
+
+
 if __name__ == "__main__":
     unittest.main()
