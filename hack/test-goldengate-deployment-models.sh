@@ -8852,11 +8852,15 @@ fi
 
 # 3b: deterministic environment/IAM generation regression suite -- proves generated output is never read back as a template, A->B->C environment changes never retain a stale identity, --check detects stale generated output, and all six current DEV permission policies remain semantically unchanged.
 if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "hack/test-goldengate-environment.py" ]; then
-  ENV_IAM_SUITE_OUTPUT="$(python3 hack/test-goldengate-environment.py 2>&1)"
-  if [ $? -eq 0 ]; then
+  # Command substitution must sit directly in the if-condition -- set -e would abort the script at a standalone `var=$(...)` assignment before the else branch ever ran.
+  if ENV_IAM_SUITE_OUTPUT="$(
+    PYTHONDONTWRITEBYTECODE=1 \
+    python3 hack/test-goldengate-environment.py 2>&1
+  )"; then
     pass "3b: environment/IAM deterministic generation tests pass (hack/test-goldengate-environment.py)"
   else
-    fail "3b: environment/IAM deterministic generation tests failed (hack/test-goldengate-environment.py):"$'\n'"${ENV_IAM_SUITE_OUTPUT}"
+    ENV_IAM_SUITE_RC=$?
+    fail "3b: environment/IAM deterministic generation tests failed (exit ${ENV_IAM_SUITE_RC}):"$'\n'"${ENV_IAM_SUITE_OUTPUT}"
   fi
 else
   skip "3b: environment/IAM deterministic generation tests -- python3 or hack/test-goldengate-environment.py unavailable"
