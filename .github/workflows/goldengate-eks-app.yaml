@@ -58,7 +58,6 @@ jobs:
       effective_deploy: ${{ steps.compute.outputs.effective_deploy }}
       has_active_deployments: ${{ steps.active_runtime_state.outputs.has_active_deployments }}
       selected_environment: ${{ steps.resolve_environment.outputs.environment }}
-      aws_region: ${{ steps.load_environment.outputs.aws_region }}
 
     steps:
       - name: Checkout repository
@@ -116,7 +115,6 @@ jobs:
 
           python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" validate
           python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
-          echo "aws_region=$(python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" get AWS_REGION)" >> "$GITHUB_OUTPUT"
 
       - name: Verify generated IAM policies are in sync with environment.yaml
         shell: bash
@@ -299,7 +297,6 @@ jobs:
     secrets: inherit
     with:
       environment: ${{ needs.validate_model.outputs.selected_environment }}
-      region: ${{ needs.validate_model.outputs.aws_region }}
 
   platform_sync_once:
     name: Synchronize the GoldenGate platform chart (once)

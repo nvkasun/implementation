@@ -8997,7 +8997,7 @@ else
   fail "Phase 11 1: a retired repository-variable environment-identity reference remains in:"$'\n'"${RETIRED_VARS_HITS}"
 fi
 
-# 2: no active workflow independently hardcodes the real current workload/build account ID, ECR registry, or EKS cluster name as runtime identity. gg-iam-secrets-deployment.yaml's region bootstrap selector (Phase 12) is checked separately below, never lumped in here.
+# 2: no active workflow independently hardcodes the real current workload/build account ID, ECR registry, or EKS cluster name as runtime identity.
 WORKFLOW_HARDCODE_HITS="$(grep -rlE '668311715351|229410149234|gg-poc-dev|[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com' .github/workflows/*.yaml 2>/dev/null \
   | grep -vF '.github/workflows/gg-iam-secrets-deployment.yaml' \
   || true)"
@@ -9007,7 +9007,7 @@ else
   fail "Phase 11 2: an active workflow independently hardcodes production account/registry/cluster identity:"$'\n'"${WORKFLOW_HARDCODE_HITS}"
 fi
 
-# 2b: gg-iam-secrets-deployment.yaml itself carries no account/registry/cluster identity literal either -- only its bootstrap region *selector* (Phase 12's known, documented exception) may exist, verified as bootstrap metadata by check 3 below.
+# 2b: gg-iam-secrets-deployment.yaml itself carries no account/registry/cluster identity literal either.
 GG_IAM_HARDCODE_HITS="$(grep -nE '668311715351|229410149234|gg-poc-dev|[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com' .github/workflows/gg-iam-secrets-deployment.yaml 2>/dev/null || true)"
 if [ -z "$GG_IAM_HARDCODE_HITS" ]; then
   pass "Phase 11 2b: gg-iam-secrets-deployment.yaml contains no hardcoded account/registry/cluster-name identity literal"
@@ -9015,15 +9015,12 @@ else
   fail "Phase 11 2b: gg-iam-secrets-deployment.yaml unexpectedly hardcodes account/registry/cluster identity:"$'\n'"${GG_IAM_HARDCODE_HITS}"
 fi
 
-# 3: the only remaining "eu-west-1" text in any active workflow is gg-iam-secrets-deployment.yaml's documented Phase-12 region bootstrap selector option, evaluated by GitHub before checkout -- never a second runtime identity source.
+# 3: since Phase 12, no active workflow references "eu-west-1" as a literal at all -- envs/dev/environment.yaml via the canonical resolver is the sole region source, including for gg-iam-secrets-deployment.yaml (its former independent region bootstrap selector is gone).
 REGION_LITERAL_HITS="$(grep -rl 'eu-west-1' .github/workflows/*.yaml 2>/dev/null || true)"
-if [ "$REGION_LITERAL_HITS" = ".github/workflows/gg-iam-secrets-deployment.yaml" ] \
-    && grep -qF '          - eu-west-1' .github/workflows/gg-iam-secrets-deployment.yaml 2>/dev/null; then
-  pass "Phase 11 3: the sole remaining 'eu-west-1' text in active workflows is gg-iam-secrets-deployment.yaml's documented Phase-12 region bootstrap selector option, not an independent runtime identity source"
-elif [ -z "$REGION_LITERAL_HITS" ]; then
+if [ -z "$REGION_LITERAL_HITS" ]; then
   pass "Phase 11 3: no active workflow references 'eu-west-1' as a literal"
 else
-  fail "Phase 11 3: an unexpected 'eu-west-1' literal exists outside the documented Phase-12 gg-iam-secrets-deployment.yaml bootstrap selector:"$'\n'"${REGION_LITERAL_HITS}"
+  fail "Phase 11 3: an unexpected 'eu-west-1' literal exists in active workflow source:"$'\n'"${REGION_LITERAL_HITS}"
 fi
 
 # 4: no active workflow independently hardcodes a full generated IAM role ARN (arn:aws:iam::<12-digit>:role/...) as runtime identity -- every role ARN comes from the canonical resolver's github-env output.
@@ -9093,12 +9090,195 @@ else
   fail "Phase 11 10: an active workflow independently embeds a stale environment-derived IAM role name literal:"$'\n'"${STALE_ROLE_NAME_HITS}"
 fi
 
-# 11: no active workflow runtime/validation path references envs/dev/policies/ or envs/dev/argocd/ -- the sole approved pre-checkout bootstrap exceptions are goldengate-eks-app.yaml's push trigger path ('envs/dev/**'), its matching run-name/comment, and gg-iam-secrets-deployment.yaml's documented Phase-12 region selector (checked separately by Phase 11 check 3 above).
+# 11: no active workflow runtime/validation path references envs/dev/policies/ or envs/dev/argocd/ -- the sole approved pre-checkout bootstrap exceptions are goldengate-eks-app.yaml's push trigger path ('envs/dev/**') and its matching run-name/comment.
 ENVS_DEV_RUNTIME_HITS="$(grep -rn 'envs/dev/policies/\|envs/dev/argocd/' .github/workflows/*.yaml 2>/dev/null || true)"
 if [ -z "$ENVS_DEV_RUNTIME_HITS" ]; then
   pass "Phase 11 11: no active workflow runtime/validation path references envs/dev/policies/ or envs/dev/argocd/ -- every reference is environment-derived (envs/\${GG_ENVIRONMENT}/... or envs/<environment>/... in comments)"
 else
   fail "Phase 11 11: an active workflow still references envs/dev/policies/ or envs/dev/argocd/ outside the approved bootstrap exceptions:"$'\n'"${ENVS_DEV_RUNTIME_HITS}"
+fi
+
+echo ""
+echo "--- Phase 12: remove the independent Terraform region input/source ---"
+
+IAM_WORKFLOW=".github/workflows/gg-iam-secrets-deployment.yaml"
+
+# 1/2/4/5/6/7: structural proof, read directly from the real committed YAML (never a reimplementation) -- workflow_dispatch/workflow_call carry no region input, the old supplied-vs-canonical mismatch step is gone, validate_environment_config exposes an aws_region output derived from a step that calls the canonical resolver's `get AWS_REGION`, and apply forwards exactly that job output to the corporate reusable Terraform workflow.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$IAM_WORKFLOW" ]; then
+  PHASE12_IAM_CHECK="$(python3 -c '
+import yaml
+with open("'"$IAM_WORKFLOW"'") as f:
+    doc = yaml.safe_load(f)
+
+results = []
+
+on_block = doc.get(True, doc.get("on", {}))
+wd_inputs = on_block.get("workflow_dispatch", {}).get("inputs", {}) or {}
+wc_inputs = on_block.get("workflow_call", {}).get("inputs", {}) or {}
+results.append(("1: workflow_dispatch has no region input", "region" not in wd_inputs))
+results.append(("2: workflow_call has no region input", "region" not in wc_inputs))
+
+jobs = doc["jobs"]
+vec = jobs["validate_environment_config"]
+steps = vec.get("steps", [])
+step_names = [s.get("name", "") for s in steps]
+results.append(("4: the old supplied-vs-canonical region mismatch step is gone", "Verify supplied region matches the canonical environment region" not in step_names))
+results.append(("5: validate_environment_config exposes a canonical aws_region job output", "aws_region" in (vec.get("outputs") or {})))
+
+resolve_step = next((s for s in steps if s.get("id") == "resolve_environment"), None)
+results.append(("6a: a step with id=resolve_environment exists", resolve_step is not None))
+run_text = (resolve_step or {}).get("run", "")
+results.append(("6b: that step derives AWS_REGION via goldengate-environment.py ... get AWS_REGION", "goldengate-environment.py" in run_text and "get AWS_REGION" in run_text))
+results.append(("6c: that step fails closed on an empty AWS_REGION (no eu-west-1 fallback)", "-z \"${AWS_REGION}\"" in run_text and "eu-west-1" not in run_text))
+
+apply_job = jobs["apply"]
+results.append(("7a: apply.needs == validate_environment_config", apply_job.get("needs") == "validate_environment_config"))
+results.append(("7b: apply.with.region == needs.validate_environment_config.outputs.aws_region", apply_job.get("with", {}).get("region") == "${{ needs.validate_environment_config.outputs.aws_region }}"))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+' 2>&1)"
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL\ *) fail "Phase 12: ${line#FAIL }" ;;
+      OK\ *) pass "Phase 12: ${line#OK }" ;;
+    esac
+  done <<< "$PHASE12_IAM_CHECK"
+else
+  skip "Phase 12 1/2/4/5/6/7: structural checks -- python3/PyYAML unavailable or ${IAM_WORKFLOW} missing"
+fi
+
+# 3: no textual reference to inputs.region/github.event.inputs.region remains anywhere in the IAM workflow (run-name, env:, with:, or run: blocks).
+if grep -qE 'inputs\.region|github\.event\.inputs\.region' "$IAM_WORKFLOW" 2>/dev/null; then
+  fail "Phase 12 3: ${IAM_WORKFLOW} still references inputs.region or github.event.inputs.region"
+else
+  pass "Phase 12 3: ${IAM_WORKFLOW} contains no reference to inputs.region or github.event.inputs.region"
+fi
+
+# SUPPLIED_REGION is the retired Phase-11 transitional variable name; must be fully gone alongside the mismatch step itself.
+if grep -qF 'SUPPLIED_REGION' "$IAM_WORKFLOW" 2>/dev/null; then
+  fail "Phase 12 3b: ${IAM_WORKFLOW} still references the retired SUPPLIED_REGION variable"
+else
+  pass "Phase 12 3b: ${IAM_WORKFLOW} no longer references the retired SUPPLIED_REGION variable"
+fi
+
+# 8/9: the main orchestrator's terraform_sync_once call sends only environment (never region), and validate_model no longer exposes the now-dead cross-job aws_region output.
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  PHASE12_MAIN_CHECK="$(python3 -c '
+import yaml
+with open("'"$EKS_APP_WORKFLOW"'") as f:
+    doc = yaml.safe_load(f)
+jobs = doc["jobs"]
+
+results = []
+
+tsf_with = jobs["terraform_sync_once"].get("with", {}) or {}
+results.append(("8a: terraform_sync_once.with has no region key", "region" not in tsf_with))
+results.append(("8b: terraform_sync_once.with.environment is the selected_environment job output", tsf_with.get("environment") == "${{ needs.validate_model.outputs.selected_environment }}"))
+
+vm_outputs = jobs["validate_model"].get("outputs", {}) or {}
+results.append(("9: validate_model no longer exposes an aws_region output", "aws_region" not in vm_outputs))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+' 2>&1)"
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL\ *) fail "Phase 12: ${line#FAIL }" ;;
+      OK\ *) pass "Phase 12: ${line#OK }" ;;
+    esac
+  done <<< "$PHASE12_MAIN_CHECK"
+else
+  skip "Phase 12 8/9: main-workflow structural checks -- python3/PyYAML unavailable"
+fi
+
+# Dead cross-job wiring must be fully gone from both ends, not just the consumer side.
+if grep -qF 'needs.validate_model.outputs.aws_region' "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  fail "Phase 12 8c: ${EKS_APP_WORKFLOW} still references needs.validate_model.outputs.aws_region"
+else
+  pass "Phase 12 8c: ${EKS_APP_WORKFLOW} no longer references needs.validate_model.outputs.aws_region anywhere"
+fi
+if grep -qF 'steps.load_environment.outputs.aws_region' "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  fail "Phase 12 9b: ${EKS_APP_WORKFLOW} still writes/declares steps.load_environment.outputs.aws_region"
+else
+  pass "Phase 12 9b: ${EKS_APP_WORKFLOW} no longer writes/declares steps.load_environment.outputs.aws_region"
+fi
+
+# 10: no active workflow contains an independent runtime "region: eu-west-1" literal or an "- eu-west-1" choice-input option anywhere in this Terraform orchestration path (or elsewhere).
+PHASE12_REGION_LITERAL_HITS="$(grep -rnE '^[[:space:]]*region:[[:space:]]*eu-west-1|^[[:space:]]*-[[:space:]]*eu-west-1[[:space:]]*$' .github/workflows/*.yaml 2>/dev/null || true)"
+if [ -z "$PHASE12_REGION_LITERAL_HITS" ]; then
+  pass "Phase 12 10: no active workflow contains a runtime 'region: eu-west-1' literal or an '- eu-west-1' choice-input option"
+else
+  fail "Phase 12 10: an active workflow still contains a region literal/choice option:"$'\n'"${PHASE12_REGION_LITERAL_HITS}"
+fi
+
+# Direct-call static regression: extract the REAL, unmodified resolve_environment step and execute it with only TARGET_ENVIRONMENT=dev set (exactly what a direct manual workflow_dispatch run supplies) -- proves the workflow derives its own region with zero other caller participation, never contacting AWS or the corporate reusable workflow.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$IAM_WORKFLOW" ]; then
+  python3 - "$IAM_WORKFLOW" > "${WORKDIR}/resolve_environment_step.sh" <<'PYEOF'
+import sys
+import yaml
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+for step in doc["jobs"]["validate_environment_config"]["steps"]:
+    if step.get("id") == "resolve_environment":
+        sys.stdout.write(step["run"])
+        break
+else:
+    sys.exit("step not found")
+PYEOF
+
+  if [ ! -s "${WORKDIR}/resolve_environment_step.sh" ]; then
+    fail "Phase 12 direct-call: could not extract the resolve_environment step from ${IAM_WORKFLOW}"
+  else
+    DIRECT_CALL_OUTPUT="$(mktemp)"
+    set +e
+    DIRECT_CALL_LOG="$(TARGET_ENVIRONMENT="dev" GITHUB_OUTPUT="$DIRECT_CALL_OUTPUT" bash "${WORKDIR}/resolve_environment_step.sh" 2>&1)"
+    DIRECT_CALL_STATUS=$?
+    set -e
+
+    if [ "$DIRECT_CALL_STATUS" -eq 0 ] && grep -qF "aws_region=eu-west-1" "$DIRECT_CALL_OUTPUT"; then
+      pass "Phase 12 direct-call: given only TARGET_ENVIRONMENT=dev (exactly a direct manual run's inputs.environment), the real resolve_environment step derives aws_region=eu-west-1 from envs/dev/environment.yaml with no other caller participation"
+    else
+      fail "Phase 12 direct-call: the real resolve_environment step did not derive the canonical region from environment=dev alone (status=${DIRECT_CALL_STATUS}):"$'\n'"${DIRECT_CALL_LOG}"
+    fi
+    rm -f "$DIRECT_CALL_OUTPUT"
+  fi
+else
+  skip "Phase 12 direct-call: python3/PyYAML unavailable or ${IAM_WORKFLOW} missing"
+fi
+
+# Region-change regression: two synthetic, fully valid, temporary environment.yaml fixtures (isolated copy of the resolver, never touching envs/dev/) with two different syntactically-valid AWS regions prove the resolver -- and therefore the workflow step above -- is genuinely environment-derived, never a hardcoded eu-west-1 fallback.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f envs/dev/environment.yaml ]; then
+  SYNTH_ROOT="${WORKDIR}/region-synth-repo"
+  rm -rf "$SYNTH_ROOT"
+  mkdir -p "$SYNTH_ROOT/hack" "$SYNTH_ROOT/envs/synth-region-a" "$SYNTH_ROOT/envs/synth-region-b"
+  cp hack/goldengate-environment.py "$SYNTH_ROOT/hack/goldengate-environment.py"
+
+  # Every eu-west-1 occurrence (aws.region, eks.oidcIssuer, network.certificateArn, kms.monitorDynamoDbKeyArn) is substituted together so cross-field region consistency validation still passes -- proven by requiring `validate` to succeed below, not merely `get`.
+  sed -e 's/^environment: dev$/environment: synth-region-a/' -e 's/eu-west-1/ap-southeast-2/g' \
+    envs/dev/environment.yaml > "$SYNTH_ROOT/envs/synth-region-a/environment.yaml"
+  sed -e 's/^environment: dev$/environment: synth-region-b/' -e 's/eu-west-1/us-east-2/g' \
+    envs/dev/environment.yaml > "$SYNTH_ROOT/envs/synth-region-b/environment.yaml"
+
+  set +e
+  SYNTH_VALIDATE_A="$(python3 "$SYNTH_ROOT/hack/goldengate-environment.py" --environment synth-region-a validate 2>&1)"
+  SYNTH_VALIDATE_A_STATUS=$?
+  SYNTH_VALIDATE_B="$(python3 "$SYNTH_ROOT/hack/goldengate-environment.py" --environment synth-region-b validate 2>&1)"
+  SYNTH_VALIDATE_B_STATUS=$?
+  SYNTH_REGION_A="$(python3 "$SYNTH_ROOT/hack/goldengate-environment.py" --environment synth-region-a get AWS_REGION 2>&1)"
+  SYNTH_REGION_B="$(python3 "$SYNTH_ROOT/hack/goldengate-environment.py" --environment synth-region-b get AWS_REGION 2>&1)"
+  set -e
+
+  if [ "$SYNTH_VALIDATE_A_STATUS" -eq 0 ] && [ "$SYNTH_VALIDATE_B_STATUS" -eq 0 ] \
+      && [ "$SYNTH_REGION_A" = "ap-southeast-2" ] && [ "$SYNTH_REGION_B" = "us-east-2" ] \
+      && [ "$SYNTH_REGION_A" != "$SYNTH_REGION_B" ]; then
+    pass "Phase 12 region-change: two synthetic, fully-valid, isolated environment.yaml fixtures with different AWS regions (ap-southeast-2 / us-east-2) each resolve get AWS_REGION to exactly their own region -- the resolver is genuinely environment-derived, no eu-west-1 fallback exists"
+  else
+    fail "Phase 12 region-change: synthetic region-change regression failed (validateA=${SYNTH_VALIDATE_A_STATUS} validateB=${SYNTH_VALIDATE_B_STATUS} regionA=${SYNTH_REGION_A} regionB=${SYNTH_REGION_B})"
+  fi
+  rm -rf "$SYNTH_ROOT"
+else
+  skip "Phase 12 region-change: python3/PyYAML unavailable or envs/dev/environment.yaml missing"
 fi
 
 echo ""
