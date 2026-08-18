@@ -3696,6 +3696,112 @@ jobs:
             echo "::endgroup::"
           done <<< "$PIPELINES"
 
+  monitor_ownership_preflight:
+    name: Classify GoldenGate monitor ownership safety (read-only, singleton)
+
+    # Phase B3B: read-only pre-reconciliation ownership-safety classifier for the shared gg-monitor deployment -- ABSENT (safe to create) / OWNED (safe to reconcile, even if currently unhealthy/out of date) / BROKEN (ownership/collision conflict, fail closed). Like a GoldenGate runtime (never like a static prerequisite), the monitor's canonical registry input changes whenever the GLOBAL active runtime inventory changes -- OWNED (not HEALTHY) is the "safe to reconcile" state. This job never mutates the cluster -- it only runs hack/orchestration/monitor_state.py, which itself issues read-only `kubectl get` calls.
+    needs:
+      - validate_model
+      - validate_shared_secrets_once
+      - replication_reconcile_once
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.validate_model.outputs.has_active_deployments == 'true' && needs.validate_shared_secrets_once.result == 'success' && needs.replication_reconcile_once.result == 'success' }}
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    outputs:
+      state: ${{ steps.classify.outputs.state }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Load resolved environment config
+        shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
+
+      - name: Install kubectl if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking/installing kubectl..."
+
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KUBECTL_VERSION="v1.35.0"
+
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64)
+                KUBECTL_ARCH="amd64"
+                ;;
+              aarch64|arm64)
+                KUBECTL_ARCH="arm64"
+                ;;
+              *)
+                echo "Unsupported architecture for kubectl: $ARCH"
+                exit 1
+                ;;
+            esac
+
+            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+            sudo chmod +x /usr/local/bin/kubectl
+          fi
+
+          kubectl version --client=true
+
+      - name: Connect to EKS cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}" \
+            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
+            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
+
+          echo "Current kube context:"
+          kubectl config current-context
+
+      - name: Classify monitor ownership safety
+        id: classify
+        shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
+
+          # A non-zero exit here is either a configuration error (invalid environment config) or a classifier inspection error (API unreachable, permission denied, malformed JSON) -- never treated as ABSENT.
+          if ! CLASSIFIER_OUTPUT="$(python3 hack/orchestration/monitor_state.py --environment "${GG_SELECTED_ENVIRONMENT}")"; then
+            echo "FAIL: the GoldenGate monitor ownership classifier could not classify the shared monitor (configuration or inspection error, not ABSENT) -- see diagnostics above."
+            exit 1
+          fi
+
+          echo "$CLASSIFIER_OUTPUT"
+
+          STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
+          echo "GoldenGate monitor ownership-safety state: ${STATE}"
+          echo "state=${STATE}" >> "$GITHUB_OUTPUT"
+
+          if [ "$STATE" = "BROKEN" ]; then
+            echo "FAIL: GoldenGate monitor ownership-safety state is BROKEN -- an existing footprint does not clearly belong to the shared monitor. This is not auto-repaired here -- investigate the diagnostics above before re-running."
+            exit 1
+          fi
+
   monitor_sync_once:
     name: Synchronize the GoldenGate monitor (once, after all runtimes)
 
@@ -3705,14 +3811,15 @@ jobs:
       - build_publish_and_deploy
       - delete_removed_argocd_applications
       - replication_reconcile_once
-    # 50-sub-monitor.yaml publishes unconditionally on every internal step, so this call must be skipped entirely for deploy=false. Also skipped when the canonical model has zero active runtimes (e.g. full decommission): the monitor legitimately refuses to start against an empty registry, so this orchestrator must not invoke it rather than let that be a real failure.
-    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.validate_model.outputs.has_active_deployments == 'true' && always() && needs.validate_shared_secrets_once.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' && needs.replication_reconcile_once.result != 'failure' && needs.replication_reconcile_once.result != 'cancelled' }}
+      - monitor_ownership_preflight
+    # 50-sub-monitor.yaml publishes unconditionally on every internal step, so this call must be skipped entirely for deploy=false. Also skipped when the canonical model has zero active runtimes (e.g. full decommission): the monitor legitimately refuses to start against an empty registry, so this orchestrator must not invoke it rather than let that be a real failure. Phase B3B: the monitor is a deployment TARGET (like a GoldenGate runtime), never a HEALTHY-skip prerequisite -- it must ALWAYS reconcile for BOTH the ABSENT and OWNED ownership-safety states (never an "OWNED -> skip" shortcut), because goldengate-deployments.yaml is derived from the GLOBAL active runtime inventory and may have changed independently of the monitor pod's own health. monitor_ownership_preflight already fails closed on BROKEN; the explicit state check below is reinforcement, never a substitute for that.
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.validate_model.outputs.has_active_deployments == 'true' && always() && needs.validate_shared_secrets_once.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' && needs.replication_reconcile_once.result != 'failure' && needs.replication_reconcile_once.result != 'cancelled' && needs.monitor_ownership_preflight.result == 'success' && (needs.monitor_ownership_preflight.outputs.state == 'ABSENT' || needs.monitor_ownership_preflight.outputs.state == 'OWNED') }}
 
     uses: ./.github/workflows/50-sub-monitor.yaml
     with:
       environment: ${{ needs.validate_model.outputs.selected_environment }}
       deploy: true
-      # The global CloudWatch publisher must never be disabled by this orchestrator; existing gates stay whatever CONFIG already has (metrics_gate_expectation=any).
+      # The global CloudWatch publisher must never be disabled by this orchestrator; existing gates stay whatever CONFIG already has (metrics_gate_expectation=any). Phase B3B: 50-sub-monitor.yaml itself now implements the Safe Monitor Publication Bootstrap Contract internally (bootstrap/repair path when no Ready monitor exists yet, fast path otherwise) -- this call site is unchanged.
       enable_cloudwatch_publication: true
       metrics_gate_expectation: any
 
@@ -3816,14 +3923,218 @@ jobs:
 
           echo "OK: monitor chart lints and renders cleanly (no image build, no ECR push, no Argo CD/Kubernetes mutation)."
 
+  validate_monitor_ready:
+    name: Validate the shared GoldenGate monitor is fully healthy (read-only, singleton)
+
+    # Phase B3B: post-reconciliation monitor acceptance -- HEALTHY/BROKEN only (never ABSENT: an expected monitor that is missing after reconciliation IS BROKEN). Runs in two passes through hack/orchestration/monitor_acceptance.py: (1) structural-only, to prove and select a real Ready pod via the Deployment->ReplicaSet->Pod ownership chain; (2) with that EXACT verified pod's own bounded in-pod /healthz and /readyz results folded in. monitor_sync_once succeeding is not enough on its own -- this is the independent structural+health acceptance gate that replication_monitor_acceptance and end_to_end_deployment_acceptance both require before trusting the monitor.
+    needs:
+      - validate_model
+      - validate_shared_secrets_once
+      - monitor_sync_once
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.validate_model.outputs.has_active_deployments == 'true' && needs.validate_shared_secrets_once.result == 'success' && needs.monitor_sync_once.result == 'success' }}
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    outputs:
+      state: ${{ steps.final.outputs.state }}
+      ready_pod_name: ${{ steps.structural.outputs.ready_pod_name }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Load resolved environment config
+        shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
+
+      - name: Install kubectl if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking/installing kubectl..."
+
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KUBECTL_VERSION="v1.35.0"
+
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64)
+                KUBECTL_ARCH="amd64"
+                ;;
+              aarch64|arm64)
+                KUBECTL_ARCH="arm64"
+                ;;
+              *)
+                echo "Unsupported architecture for kubectl: $ARCH"
+                exit 1
+                ;;
+            esac
+
+            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+            sudo chmod +x /usr/local/bin/kubectl
+          fi
+
+          kubectl version --client=true
+
+      - name: Connect to EKS cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}" \
+            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
+            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
+
+      - name: Generate the folder-driven canonical registry (expected state for the ConfigMap/SecretProviderClass comparison)
+        shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
+
+          mkdir -p "work/generated/${GG_SELECTED_ENVIRONMENT}"
+          python3 hack/goldengate-deployment-model.py --environment "${GG_SELECTED_ENVIRONMENT}" registry --output "work/generated/${GG_SELECTED_ENVIRONMENT}/goldengate-deployments.yaml"
+
+      - name: Structural monitor acceptance (select the verified Ready pod)
+        id: structural
+        shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+          GG_EXPECTED_IMAGE_REPOSITORY: ${{ needs.monitor_sync_once.outputs.image_repository }}
+          GG_EXPECTED_IMAGE_TAG: ${{ needs.monitor_sync_once.outputs.image_tag }}
+          GG_EXPECTED_CHART_VERSION: ${{ needs.monitor_sync_once.outputs.chart_version }}
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
+
+          # enable_cloudwatch_publication is always literally true in monitor_sync_once's own `with:` block -- mirrored here as the expected final value, never re-derived from a second source.
+          if ! CLASSIFIER_OUTPUT="$(python3 hack/orchestration/monitor_acceptance.py \
+              --environment "${GG_SELECTED_ENVIRONMENT}" \
+              --expected-image-repository "${GG_EXPECTED_IMAGE_REPOSITORY}" \
+              --expected-image-tag "${GG_EXPECTED_IMAGE_TAG}" \
+              --expected-chart-version "${GG_EXPECTED_CHART_VERSION}" \
+              --expected-cloudwatch-publish-enabled true \
+              --registry-file "work/generated/${GG_SELECTED_ENVIRONMENT}/goldengate-deployments.yaml")"; then
+            echo "FAIL: the GoldenGate monitor acceptance classifier could not evaluate the shared monitor (configuration or inspection error) -- see diagnostics above."
+            exit 1
+          fi
+
+          echo "$CLASSIFIER_OUTPUT"
+
+          STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
+          READY_POD_NAME="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["checks"].get("ready_pod_name") or "")' <<< "$CLASSIFIER_OUTPUT")"
+          echo "GoldenGate monitor structural acceptance state: ${STATE}"
+          echo "ready_pod_name=${READY_POD_NAME}" >> "$GITHUB_OUTPUT"
+
+          if [ "$STATE" != "HEALTHY" ]; then
+            echo "FAIL: GoldenGate monitor structural acceptance state is ${STATE}, expected HEALTHY. Never proceeding to /healthz or /readyz checks against an unverified/absent pod."
+            exit 1
+          fi
+
+      - name: Check /healthz and /readyz on the verified Ready pod (bounded, read-only)
+        id: health
+        shell: bash
+        env:
+          POD_NAME: ${{ steps.structural.outputs.ready_pod_name }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$POD_NAME" ]; then
+            echo "FAIL: no verified Ready pod name was returned by structural acceptance."
+            exit 1
+          fi
+
+          HEALTHZ_STATUS="$(kubectl exec "$POD_NAME" -n "${MONITOR_NAMESPACE}" -- python3 -c "
+          import urllib.request, urllib.error
+          try:
+              print(urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).status)
+          except urllib.error.HTTPError as exc:
+              print(exc.code)
+          except Exception:
+              print(0)
+          ")"
+          READYZ_STATUS="$(kubectl exec "$POD_NAME" -n "${MONITOR_NAMESPACE}" -- python3 -c "
+          import urllib.request, urllib.error
+          try:
+              print(urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=5).status)
+          except urllib.error.HTTPError as exc:
+              print(exc.code)
+          except Exception:
+              print(0)
+          ")"
+
+          echo "pod/${POD_NAME} /healthz -> ${HEALTHZ_STATUS}, /readyz -> ${READYZ_STATUS}"
+          echo "healthz_status=${HEALTHZ_STATUS}" >> "$GITHUB_OUTPUT"
+          echo "readyz_status=${READYZ_STATUS}" >> "$GITHUB_OUTPUT"
+
+      - name: Final monitor acceptance (structural + /healthz + /readyz)
+        id: final
+        shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+          GG_EXPECTED_IMAGE_REPOSITORY: ${{ needs.monitor_sync_once.outputs.image_repository }}
+          GG_EXPECTED_IMAGE_TAG: ${{ needs.monitor_sync_once.outputs.image_tag }}
+          GG_EXPECTED_CHART_VERSION: ${{ needs.monitor_sync_once.outputs.chart_version }}
+          GG_HEALTHZ_STATUS: ${{ steps.health.outputs.healthz_status }}
+          GG_READYZ_STATUS: ${{ steps.health.outputs.readyz_status }}
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
+
+          if ! CLASSIFIER_OUTPUT="$(python3 hack/orchestration/monitor_acceptance.py \
+              --environment "${GG_SELECTED_ENVIRONMENT}" \
+              --expected-image-repository "${GG_EXPECTED_IMAGE_REPOSITORY}" \
+              --expected-image-tag "${GG_EXPECTED_IMAGE_TAG}" \
+              --expected-chart-version "${GG_EXPECTED_CHART_VERSION}" \
+              --expected-cloudwatch-publish-enabled true \
+              --registry-file "work/generated/${GG_SELECTED_ENVIRONMENT}/goldengate-deployments.yaml" \
+              --healthz-status "${GG_HEALTHZ_STATUS}" \
+              --readyz-status "${GG_READYZ_STATUS}")"; then
+            echo "FAIL: the GoldenGate monitor acceptance classifier could not evaluate the shared monitor on the final pass (configuration or inspection error) -- see diagnostics above."
+            exit 1
+          fi
+
+          echo "$CLASSIFIER_OUTPUT"
+
+          STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
+          echo "GoldenGate monitor final acceptance state: ${STATE}"
+          echo "state=${STATE}" >> "$GITHUB_OUTPUT"
+
+          if [ "$STATE" != "HEALTHY" ]; then
+            echo "FAIL: GoldenGate monitor final acceptance state is ${STATE}, expected HEALTHY. MAIN cannot claim the monitor is ready while it is not fully healthy (structural shape, canonical registry equality, /healthz, and /readyz all gate this)."
+            exit 1
+          fi
+
+          echo "OK: the shared GoldenGate monitor is HEALTHY (structural acceptance + /healthz + /readyz)."
+
   replication_monitor_acceptance:
     name: Replication-specific monitor acceptance (real process names, current, not ABENDED)
 
     needs:
       - validate_model
       - replication_reconcile_once
-      - monitor_sync_once
-    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && always() && needs.replication_reconcile_once.result == 'success' && needs.monitor_sync_once.result == 'success' }}
+      - validate_monitor_ready
+    # Phase B3B: rewired to require validate_monitor_ready.result == 'success' -- monitor reconciliation (monitor_sync_once) succeeding alone is not enough; the monitor must first pass its own independent structural + health acceptance before its process data is trusted here.
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && always() && needs.replication_reconcile_once.result == 'success' && needs.validate_monitor_ready.result == 'success' }}
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -3878,13 +4189,14 @@ jobs:
       - name: Verify replication process acceptance via the monitor API (read-only)
         if: steps.pipelines.outputs.has_pipelines == 'true'
         shell: bash
+        env:
+          POD_NAME: ${{ needs.validate_monitor_ready.outputs.ready_pod_name }}
         run: |
           set -euo pipefail
 
-          POD_NAME="$(kubectl get pods -n "${MONITOR_NAMESPACE}" -l app.kubernetes.io/name=gg-monitor -o json \
-            | python3 -c "import json,sys; items=json.load(sys.stdin)['items']; ready=[i['metadata']['name'] for i in items if i['status'].get('phase')=='Running' and i['metadata'].get('deletionTimestamp') is None and all(c.get('ready') for c in i['status'].get('containerStatuses', []))]; print(ready[0] if ready else '')")"
+          # Reuses the SAME ownership-chain-verified Ready pod validate_monitor_ready already selected and health-checked -- never a second, independent pod-selection here.
           if [ -z "$POD_NAME" ]; then
-            echo "FAIL: no Ready gg-monitor pod found in ${MONITOR_NAMESPACE}."
+            echo "FAIL: no verified Ready gg-monitor pod name was provided by validate_monitor_ready."
             exit 1
           fi
 
@@ -3948,23 +4260,121 @@ jobs:
         run: |
           echo "No enabled replication pipeline -- clean no-op: replication-specific monitor acceptance skipped."
 
+  end_to_end_deployment_acceptance:
+    name: Monitor-to-runtime end-to-end deployment acceptance (real deploy, active runtimes only)
+
+    # Phase B3B: the final gate of the DEPLOY success contract -- fetches /api/processes through the SAME verified monitor pod validate_monitor_ready already selected and health-checked, then runs the offline/pure hack/orchestration/end_to_end_acceptance.py against it (deployment inventory equality, UP/fresh/lease/critical-service health, replication-aware process discovery, per-process stale/ABENDED safety). Polls boundedly (never a single instant check) since STATE# records may briefly read MISSING/STARTING immediately after a rollout. Real-deploy + active-runtime only; every job listed in `needs` below is required at .result == 'success' (strict, not merely "not failure") so this can never quietly evaluate against a partially-validated stack.
+    needs:
+      - validate_model
+      - validate_argocd_ready
+      - validate_platform_ready
+      - validate_observability_ready
+      - validate_active_runtimes
+      - replication_reconcile_once
+      - validate_monitor_ready
+      - replication_monitor_acceptance
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.validate_model.outputs.has_active_deployments == 'true' && needs.validate_argocd_ready.result == 'success' && needs.validate_platform_ready.result == 'success' && needs.validate_observability_ready.result == 'success' && needs.validate_active_runtimes.result == 'success' && needs.replication_reconcile_once.result == 'success' && needs.validate_monitor_ready.result == 'success' && needs.replication_monitor_acceptance.result == 'success' }}
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Load resolved environment config
+        shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
+
+      - name: Connect to EKS cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}" \
+            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
+            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
+
+      - name: Poll monitor-to-runtime end-to-end acceptance until convergence (bounded)
+        shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+          POD_NAME: ${{ needs.validate_monitor_ready.outputs.ready_pod_name }}
+        run: |
+          set -uo pipefail
+          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
+
+          if [ -z "$POD_NAME" ]; then
+            echo "FAIL: no verified Ready gg-monitor pod name was provided by validate_monitor_ready."
+            exit 1
+          fi
+
+          # Bounded, matching the established startup/CONFIG-gate observation windows elsewhere in this workflow -- never a single instant check, never an unbounded retry.
+          TIMEOUT_SECONDS=600
+          INTERVAL_SECONDS=15
+          ELAPSED=0
+
+          while true; do
+            if kubectl exec "$POD_NAME" -n "${MONITOR_NAMESPACE}" -- \
+                python3 -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8080/api/processes', timeout=5).read().decode('utf-8'))" \
+                > /tmp/api-processes.json 2>/tmp/api-processes.err; then
+              if OUTPUT="$(python3 hack/orchestration/end_to_end_acceptance.py --environment "${GG_SELECTED_ENVIRONMENT}" --api-processes-file /tmp/api-processes.json 2>&1)"; then
+                echo "$OUTPUT"
+                echo "OK: GoldenGate monitor-to-runtime end-to-end acceptance is HEALTHY."
+                break
+              fi
+              echo "Not yet HEALTHY (elapsed ${ELAPSED}s / ${TIMEOUT_SECONDS}s):"
+              echo "$OUTPUT"
+            else
+              echo "Could not fetch /api/processes from pod ${POD_NAME} this iteration (elapsed ${ELAPSED}s / ${TIMEOUT_SECONDS}s); sanitized error:"
+              tail -c 500 /tmp/api-processes.err || true
+            fi
+
+            if [ "$ELAPSED" -ge "$TIMEOUT_SECONDS" ]; then
+              echo ""
+              echo "FAIL: timed out after ${TIMEOUT_SECONDS}s waiting for GoldenGate monitor-to-runtime end-to-end acceptance to become HEALTHY. This is never suppressed -- a persistent problem must surface as a failed workflow."
+              exit 1
+            fi
+
+            sleep "$INTERVAL_SECONDS"
+            ELAPSED=$((ELAPSED + INTERVAL_SECONDS))
+          done
+
   final_validation:
     name: Final validation
 
     needs:
       - validate_model
       - validate_shared_secrets_once
+      - validate_argocd_ready
+      - validate_platform_ready
+      - validate_observability_ready
       - runtime_ownership_preflight
       - build_publish_and_deploy
       - delete_removed_argocd_applications
       - validate_active_runtimes
       - replication_reconcile_once
       - replication_dry_run_validation
+      - monitor_ownership_preflight
       - monitor_sync_once
       - monitor_dry_run_validation
+      - validate_monitor_ready
       - replication_monitor_acceptance
-    # Phase B3A: runtime_ownership_preflight/validate_active_runtimes are added explicitly here (not merely relied on transitively through build_publish_and_deploy/replication_reconcile_once's own skip-on-upstream-failure behavior) -- both are jobs whose own FAILURE (BROKEN ownership, or an unhealthy active runtime) must itself prevent MAIN from claiming a successful run, not just cause a downstream job to be quietly skipped.
-    if: ${{ always() && needs.validate_shared_secrets_once.result == 'success' && needs.runtime_ownership_preflight.result != 'failure' && needs.runtime_ownership_preflight.result != 'cancelled' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' && needs.validate_active_runtimes.result != 'failure' && needs.validate_active_runtimes.result != 'cancelled' && needs.replication_reconcile_once.result != 'failure' && needs.replication_reconcile_once.result != 'cancelled' && needs.replication_dry_run_validation.result != 'failure' && needs.replication_dry_run_validation.result != 'cancelled' && needs.monitor_sync_once.result != 'failure' && needs.monitor_sync_once.result != 'cancelled' && needs.monitor_dry_run_validation.result != 'failure' && needs.monitor_dry_run_validation.result != 'cancelled' && needs.replication_monitor_acceptance.result != 'failure' && needs.replication_monitor_acceptance.result != 'cancelled' }}
+      - end_to_end_deployment_acceptance
+    # Phase B3A: runtime_ownership_preflight/validate_active_runtimes are added explicitly here (not merely relied on transitively through build_publish_and_deploy/replication_reconcile_once's own skip-on-upstream-failure behavior) -- both are jobs whose own FAILURE (BROKEN ownership, or an unhealthy active runtime) must itself prevent MAIN from claiming a successful run, not just cause a downstream job to be quietly skipped. Phase B3B: validate_argocd_ready/validate_platform_ready/validate_observability_ready/monitor_ownership_preflight/validate_monitor_ready/end_to_end_deployment_acceptance are added the same way, for the same reason -- end_to_end_deployment_acceptance itself only runs when its own upstream chain (including the three validate_*_ready jobs) succeeded, so a bare failure there would otherwise SKIP end_to_end_deployment_acceptance rather than fail it, and a skip is never a failure under the existing "!= failure && != cancelled" pattern; listing every one of these jobs here directly closes that gap instead of relying only on transitive failure/skip propagation.
+    if: ${{ always() && needs.validate_shared_secrets_once.result == 'success' && needs.validate_argocd_ready.result != 'failure' && needs.validate_argocd_ready.result != 'cancelled' && needs.validate_platform_ready.result != 'failure' && needs.validate_platform_ready.result != 'cancelled' && needs.validate_observability_ready.result != 'failure' && needs.validate_observability_ready.result != 'cancelled' && needs.runtime_ownership_preflight.result != 'failure' && needs.runtime_ownership_preflight.result != 'cancelled' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' && needs.validate_active_runtimes.result != 'failure' && needs.validate_active_runtimes.result != 'cancelled' && needs.replication_reconcile_once.result != 'failure' && needs.replication_reconcile_once.result != 'cancelled' && needs.replication_dry_run_validation.result != 'failure' && needs.replication_dry_run_validation.result != 'cancelled' && needs.monitor_ownership_preflight.result != 'failure' && needs.monitor_ownership_preflight.result != 'cancelled' && needs.monitor_sync_once.result != 'failure' && needs.monitor_sync_once.result != 'cancelled' && needs.monitor_dry_run_validation.result != 'failure' && needs.monitor_dry_run_validation.result != 'cancelled' && needs.validate_monitor_ready.result != 'failure' && needs.validate_monitor_ready.result != 'cancelled' && needs.replication_monitor_acceptance.result != 'failure' && needs.replication_monitor_acceptance.result != 'cancelled' && needs.end_to_end_deployment_acceptance.result != 'failure' && needs.end_to_end_deployment_acceptance.result != 'cancelled' }}
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -3990,7 +4400,7 @@ jobs:
           {
             echo "### GoldenGate onboarding orchestrator summary"
             echo ""
-            echo "validate-model -> terraform-sync-once -> platform-sync-once -> validate-shared-secrets-once -> runtime-deployment -> monitor-sync-once (or monitor-dry-run-validation) -> final-validation"
+            echo "validate-model -> terraform-sync-once -> platform-sync-once -> validate-shared-secrets-once -> runtime-deployment -> replication-reconcile-once -> monitor-ownership-preflight -> monitor-sync-once (or monitor-dry-run-validation) -> validate-monitor-ready -> replication-monitor-acceptance -> end-to-end-deployment-acceptance -> final-validation"
             echo ""
             echo "All required stages completed successfully."
           } >> "$GITHUB_STEP_SUMMARY"

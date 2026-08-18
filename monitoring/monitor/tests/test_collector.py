@@ -2821,5 +2821,41 @@ class PmsPollingLoopIntegrationTests(unittest.TestCase):
             mock_cw_client.assert_not_called()
 
 
+class CloudWatchClientRegionTests(unittest.TestCase):
+    """_cloudwatch_client() must always construct the CloudWatch client from the canonical AWS_REGION environment variable -- never a second, independently-editable eu-west-1 (or any other) fallback."""
+
+    def setUp(self):
+        # The client is a module-level singleton cached after first construction; reset it so each test genuinely re-derives the region.
+        core._CW_CLIENT = None
+        self._original_region = os.environ.get("AWS_REGION")
+
+    def tearDown(self):
+        core._CW_CLIENT = None
+        if self._original_region is None:
+            os.environ.pop("AWS_REGION", None)
+        else:
+            os.environ["AWS_REGION"] = self._original_region
+
+    def test_aws_region_present_is_passed_through_to_the_cloudwatch_client(self):
+        os.environ["AWS_REGION"] = "ap-southeast-2"
+        with mock.patch("boto3.client") as mock_client:
+            core._cloudwatch_client()
+            mock_client.assert_called_once_with("cloudwatch", region_name="ap-southeast-2")
+
+    def test_aws_region_missing_raises_instead_of_a_silent_dev_fallback(self):
+        os.environ.pop("AWS_REGION", None)
+        with mock.patch("boto3.client") as mock_client:
+            with self.assertRaises(KeyError):
+                core._cloudwatch_client()
+            mock_client.assert_not_called()
+
+    def test_no_hardcoded_eu_west_1_fallback_in_source(self):
+        source_path = os.path.join(os.path.dirname(__file__), "..", "collector.py")
+        with open(source_path) as f:
+            source = f.read()
+        self.assertNotIn('"AWS_REGION", "eu-west-1"', source)
+        self.assertNotIn("'AWS_REGION', 'eu-west-1'", source)
+
+
 if __name__ == "__main__":
     unittest.main()

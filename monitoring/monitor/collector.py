@@ -1212,10 +1212,11 @@ _CW_LOCK = threading.Lock()
 
 
 def _cloudwatch_client():
+    """AWS_REGION is always set on the deployed pod (the chart's Deployment env always includes it -- helm/goldengate-monitor/templates/deployment.yaml) -- fail closed on a missing environment (KeyError) rather than silently defaulting to any one region. Never re-derive region from a second, independently-editable source."""
     global _CW_CLIENT
     with _CW_LOCK:
         if _CW_CLIENT is None:
-            _CW_CLIENT = boto3.client("cloudwatch", region_name=os.environ.get("AWS_REGION", "eu-west-1"))
+            _CW_CLIENT = boto3.client("cloudwatch", region_name=os.environ["AWS_REGION"])
         return _CW_CLIENT
 
 

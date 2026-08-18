@@ -2603,7 +2603,8 @@ else
   fail "50-sub-monitor.yaml is missing the expected enable_cloudwatch_publication Boolean workflow_dispatch input"
 fi
 
-if grep -q "name: CloudWatch publication preflight (gate inventory)" "$MONITOR_WORKFLOW" 2>/dev/null; then
+# Phase B3B split the single preflight step into a bootstrap-safe detection step plus a fast-path gate step (see the dedicated "Phase B3B" sections below for the full DAG/order proof) -- updated here to the current step names rather than the retired combined one.
+if grep -q -- "- name: Fast-path CloudWatch publication preflight (gate inventory via existing pod)" "$MONITOR_WORKFLOW" 2>/dev/null; then
   pass "50-sub-monitor.yaml defines the CloudWatch publication preflight step"
 else
   fail "50-sub-monitor.yaml is missing the CloudWatch publication preflight step"
@@ -2634,10 +2635,14 @@ else
   fail "50-sub-monitor.yaml's CloudWatch preflight no longer uses GetItem-only reads"
 fi
 
+# Phase B3B fixed the first-deployment CloudWatch bootstrap bug this earlier check originally documented as expected behavior: a fresh/unhealthy monitor no longer hard-fails the CONFIG gate merely because no old Ready pod exists -- it takes the safe bootstrap/repair path instead (see the dedicated "Phase B3B: first-bootstrap workflow regression" section below for the full proof). This check is retained, corrected to assert the OLD blocking message is gone and the safe alternative exists, rather than duplicated.
 if grep -q "PREREQUISITE NOT MET: no Ready gg-monitor pod found" "$MONITOR_WORKFLOW" 2>/dev/null; then
-  pass "50-sub-monitor.yaml documents the first-deployment prerequisite instead of bypassing the CONFIG check"
+  fail "50-sub-monitor.yaml still contains the old first-deployment CloudWatch bootstrap prerequisite failure message -- Phase B3B requires this bug fixed, not merely documented"
+elif grep -q -- "- name: Detect an existing Ready gg-monitor pod (bootstrap-safe)" "$MONITOR_WORKFLOW" 2>/dev/null \
+    && grep -q -- "- name: Bootstrap/repair path" "$MONITOR_WORKFLOW" 2>/dev/null; then
+  pass "50-sub-monitor.yaml no longer hard-fails a first deployment merely because no old Ready monitor pod exists -- the Safe Monitor Publication Bootstrap Contract's detect/bootstrap-repair steps exist instead"
 else
-  fail "50-sub-monitor.yaml is missing the first-deployment prerequisite failure message"
+  fail "50-sub-monitor.yaml is missing the Safe Monitor Publication Bootstrap Contract's detect/bootstrap-repair steps"
 fi
 
 if grep -q -- "- name: cloudwatch.publishEnabled" "$MONITOR_WORKFLOW" 2>/dev/null \
@@ -2816,13 +2821,13 @@ else
   fail "50-sub-monitor.yaml's hash no longer incorporates the resolved base-image reference"
 fi
 
-# Preflight pod selection uses a Deployment/ReplicaSet ownership-chain loop excluding terminating pods via `deletionTimestamp // empty` + bash comparison, while post-deployment verification still uses the single-jq-filter `deletionTimestamp == null` style -- one of each pattern is expected, not two of the same.
+# Preflight pod selection uses a Deployment/ReplicaSet ownership-chain loop excluding terminating pods via `deletionTimestamp // empty` + bash comparison, while post-deployment verification still uses the single-jq-filter `deletionTimestamp == null` style -- one jq-filter, and (Phase B3B) exactly two ownership-chain occurrences (the "Detect an existing Ready gg-monitor pod (bootstrap-safe)" step, and the same logic reused byte-for-byte in the "Bootstrap/repair path" step), never a third independent copy.
 VERIFY_TERMINATING_EXCLUSION_COUNT="$(grep -c 'deletionTimestamp == null' "$MONITOR_WORKFLOW" 2>/dev/null || true)"
 PREFLIGHT_TERMINATING_EXCLUSION_COUNT="$(grep -c 'deletionTimestamp // empty' "$MONITOR_WORKFLOW" 2>/dev/null || true)"
-if [ "${VERIFY_TERMINATING_EXCLUSION_COUNT:-0}" -eq 1 ] && [ "${PREFLIGHT_TERMINATING_EXCLUSION_COUNT:-0}" -eq 1 ]; then
-  pass "both the preflight (ownership-chain) and post-deployment verification (jq filter) pod selections exclude terminating pods"
+if [ "${VERIFY_TERMINATING_EXCLUSION_COUNT:-0}" -eq 1 ] && [ "${PREFLIGHT_TERMINATING_EXCLUSION_COUNT:-0}" -eq 2 ]; then
+  pass "both the preflight (ownership-chain, detect + bootstrap/repair) and post-deployment verification (jq filter) pod selections exclude terminating pods"
 else
-  fail "expected exactly 1 ownership-chain and 1 jq-filter terminating-pod exclusion, found ${PREFLIGHT_TERMINATING_EXCLUSION_COUNT:-0} and ${VERIFY_TERMINATING_EXCLUSION_COUNT:-0}"
+  fail "expected exactly 2 ownership-chain and 1 jq-filter terminating-pod exclusion, found ${PREFLIGHT_TERMINATING_EXCLUSION_COUNT:-0} and ${VERIFY_TERMINATING_EXCLUSION_COUNT:-0}"
 fi
 
 # 22. Workflow-security and manager critical-service correction: no direct GitHub-expression interpolation inside a run script, a fully-anchored ECR repository+digest grammar (not prefix+suffix only), and manager-compatible adminsrvr/distsrvr/recvsrvr coverage for every deployment.
@@ -4961,11 +4966,12 @@ else
   fail "22: hack/goldengate-metrics-config.py is missing ConsistentRead=True on one or both GetItem calls (found ${CONSISTENT_READ_COUNT_HELPER:-0})"
 fi
 
+# Phase B3B added a third inline CONFIG-inventory reader (the bootstrap/repair path's own gate check, alongside the pre-existing fast-path preflight and the unchanged post-rollout re-check) -- all three must use ConsistentRead=True.
 CONSISTENT_READ_COUNT_MONITOR="$(grep -c "ConsistentRead=True" "$MONITOR_WORKFLOW" 2>/dev/null || true)"
-if [ "${CONSISTENT_READ_COUNT_MONITOR:-0}" -eq 2 ]; then
-  pass "22: 50-sub-monitor.yaml's two inline CONFIG-inventory readers both use ConsistentRead=True"
+if [ "${CONSISTENT_READ_COUNT_MONITOR:-0}" -eq 3 ]; then
+  pass "22: 50-sub-monitor.yaml's three inline CONFIG-inventory readers (fast-path, bootstrap/repair, post-rollout re-check) all use ConsistentRead=True"
 else
-  fail "22: 50-sub-monitor.yaml's inline CONFIG-inventory readers do not both use ConsistentRead=True (found ${CONSISTENT_READ_COUNT_MONITOR:-0}, expected 2)"
+  fail "22: 50-sub-monitor.yaml's inline CONFIG-inventory readers do not all use ConsistentRead=True (found ${CONSISTENT_READ_COUNT_MONITOR:-0}, expected 3)"
 fi
 
 if grep -q 'ReturnValues="ALL_NEW"' "$METRICS_CONFIG_HELPER_SCRIPT" 2>/dev/null \
@@ -8738,9 +8744,9 @@ dry_run_if = jobs["monitor_dry_run_validation"]["if"]
 results.append(("7: monitor_dry_run_validation requires has_active_deployments == \'\''true\'\''", "needs.validate_model.outputs.has_active_deployments == '"'"'true'"'"'" in dry_run_if))
 results.append(("8: monitor_dry_run_validation retains its original effective_deploy/dependency clauses", "needs.validate_model.outputs.effective_deploy == '"'"'false'"'"'" in dry_run_if and "needs.validate_shared_secrets_once.result == '"'"'success'"'"'" in dry_run_if and "needs.replication_dry_run_validation.result != '"'"'cancelled'"'"'" in dry_run_if))
 
-# replication_monitor_acceptance already requires monitor_sync_once.result == "success"; a skipped monitor_sync_once therefore naturally skips it too, with no change needed.
+# Phase B3B rewired replication_monitor_acceptance to require validate_monitor_ready.result == "success" instead of monitor_sync_once directly (monitor reconciliation succeeding alone is not enough -- see the dedicated "Phase B3B" section below); validate_monitor_ready itself still requires monitor_sync_once.result == "success" and is skipped whenever monitor_sync_once is skipped (has_active_deployments != 'true'), so replication_monitor_acceptance still naturally skips too, transitively, with no separate has_active_deployments clause needed here.
 rma_if = jobs["replication_monitor_acceptance"]["if"]
-results.append(("9: replication_monitor_acceptance still requires monitor_sync_once.result == \'\''success\'\'' (naturally skips when monitor_sync_once is skipped, no change needed)", "needs.monitor_sync_once.result == '"'"'success'"'"'" in rma_if))
+results.append(("9: replication_monitor_acceptance requires validate_monitor_ready.result == \'\''success\'\'' (naturally skips when validate_monitor_ready is skipped, transitively covering the no-active-runtime path)", "needs.validate_monitor_ready.result == '"'"'success'"'"'" in rma_if))
 
 # final_validation only ever rejects monitor jobs on failure/cancelled, never on skipped -- so both gated monitor jobs skipping cleanly still lets final_validation run.
 fv_if = jobs["final_validation"]["if"]
@@ -10359,6 +10365,509 @@ if grep -qF "len(containers) != 1" hack/orchestration/runtime_acceptance.py 2>/d
   pass "Phase B3A: 20: runtime_acceptance.py enforces exactly one application container, never a second desired sidecar shape"
 else
   fail "Phase B3A: 20: runtime_acceptance.py no longer enforces the exact one-container pod shape as expected"
+fi
+
+echo "--- Phase B3B: shared monitor ownership + safe reconciliation + monitor-to-runtime health acceptance + final E2E gate ---"
+
+# hack/orchestration/monitor_state.py, monitor_acceptance.py, and end_to_end_acceptance.py must never construct a mutating kubectl/helm/AWS command -- read directly from source, never from the test's own constants. Mirrors the Phase B1/B2/B3A checks above.
+for B3B_TOOL in hack/orchestration/monitor_state.py hack/orchestration/monitor_acceptance.py hack/orchestration/end_to_end_acceptance.py; do
+  if [ -f "$B3B_TOOL" ]; then
+    B3B_MUTATING_HITS="$(grep -nE 'kubectl apply|kubectl create|kubectl delete|kubectl patch|kubectl annotate|kubectl label|helm install|helm upgrade|helm uninstall|aws efs create|aws efs delete|aws efs update' "$B3B_TOOL" 2>/dev/null || true)"
+    if [ -z "$B3B_MUTATING_HITS" ]; then
+      pass "Phase B3B: ${B3B_TOOL} contains no mutating kubectl/helm/AWS command construction -- read-only classifier confirmed"
+    else
+      fail "Phase B3B: ${B3B_TOOL} appears to contain a mutating command construct:"$'\n'"${B3B_MUTATING_HITS}"
+    fi
+  else
+    fail "Phase B3B: ${B3B_TOOL} is missing"
+  fi
+done
+
+# Each classifier's own dedicated offline unit-test suite is part of the normal regression run, not merely available separately.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f hack/test-goldengate-monitor-state.py ]; then
+  if MONITOR_STATE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 hack/test-goldengate-monitor-state.py 2>&1)"; then
+    pass "Phase B3B: hack/test-goldengate-monitor-state.py (the monitor ownership-safety classifier's offline ABSENT/OWNED/BROKEN test suite) passes"
+  else
+    fail "Phase B3B: hack/test-goldengate-monitor-state.py failed:"$'\n'"${MONITOR_STATE_TEST_OUTPUT}"
+  fi
+else
+  skip "Phase B3B: hack/test-goldengate-monitor-state.py -- python3 unavailable or file missing"
+fi
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f hack/test-goldengate-monitor-acceptance.py ]; then
+  if MONITOR_ACCEPTANCE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 hack/test-goldengate-monitor-acceptance.py 2>&1)"; then
+    pass "Phase B3B: hack/test-goldengate-monitor-acceptance.py (the monitor post-reconciliation acceptance classifier's offline HEALTHY/BROKEN test suite) passes"
+  else
+    fail "Phase B3B: hack/test-goldengate-monitor-acceptance.py failed:"$'\n'"${MONITOR_ACCEPTANCE_TEST_OUTPUT}"
+  fi
+else
+  skip "Phase B3B: hack/test-goldengate-monitor-acceptance.py -- python3 unavailable or file missing"
+fi
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f hack/test-goldengate-end-to-end-acceptance.py ]; then
+  if E2E_ACCEPTANCE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 hack/test-goldengate-end-to-end-acceptance.py 2>&1)"; then
+    pass "Phase B3B: hack/test-goldengate-end-to-end-acceptance.py (the offline/pure monitor-to-runtime end-to-end acceptance classifier's HEALTHY/BROKEN test suite) passes"
+  else
+    fail "Phase B3B: hack/test-goldengate-end-to-end-acceptance.py failed:"$'\n'"${E2E_ACCEPTANCE_TEST_OUTPUT}"
+  fi
+else
+  skip "Phase B3B: hack/test-goldengate-end-to-end-acceptance.py -- python3 unavailable or file missing"
+fi
+
+# Monitor app region regression: collector.py must contain no eu-west-1 (or any other) hardcoded region fallback anywhere, and its own offline unit tests must prove AWS_REGION present is passed straight through to the CloudWatch client, and AWS_REGION missing raises instead of silently defaulting.
+if grep -q "eu-west-1" monitoring/monitor/collector.py 2>/dev/null; then
+  fail "Phase B3B: monitor app region regression: monitoring/monitor/collector.py still references the literal string \"eu-west-1\" (expected a fail-closed AWS_REGION lookup with no hardcoded region fallback anywhere in this file)"
+else
+  pass "Phase B3B: monitor app region regression: monitoring/monitor/collector.py contains no \"eu-west-1\" (or any other hardcoded region) reference"
+fi
+if grep -qF 'os.environ["AWS_REGION"]' monitoring/monitor/collector.py 2>/dev/null; then
+  pass "Phase B3B: monitor app region regression: monitoring/monitor/collector.py's CloudWatch client resolves AWS_REGION via a fail-closed os.environ[...] lookup (no .get() default)"
+else
+  fail "Phase B3B: monitor app region regression: monitoring/monitor/collector.py's CloudWatch client no longer resolves AWS_REGION via a fail-closed lookup"
+fi
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  if MONITOR_REGION_UNIT_OUTPUT="$(cd monitoring/monitor && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_collector.CloudWatchClientRegionTests -v 2>&1)"; then
+    pass "Phase B3B: monitor app region regression: monitoring/monitor/tests/test_collector.py's CloudWatchClientRegionTests proves AWS_REGION present is passed through directly and AWS_REGION missing raises instead of silently defaulting"
+  else
+    fail "Phase B3B: monitor app region regression: CloudWatchClientRegionTests failed:"$'\n'"${MONITOR_REGION_UNIT_OUTPUT}"
+  fi
+else
+  skip "Phase B3B: monitor app region regression: CloudWatchClientRegionTests -- python3 unavailable"
+fi
+
+# Structural proof, read directly from the real committed YAML (never a reimplementation): monitor ownership/acceptance vocabulary, monitor_ownership_preflight/validate_monitor_ready/end_to_end_deployment_acceptance DAG shape, and the never-a-HEALTHY-skip / never-hidden-by-downstream-skip invariants.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  PHASE_B3B_STRUCTURAL_CHECK="$(python3 -c '
+import os
+import yaml
+
+with open("'"$EKS_APP_WORKFLOW"'") as f:
+    main_doc = yaml.safe_load(f)
+
+jobs = main_doc["jobs"]
+results = []
+
+# 1/2/3: classifier files exist.
+results.append(("1: hack/orchestration/monitor_state.py exists", os.path.isfile("hack/orchestration/monitor_state.py")))
+results.append(("2: hack/orchestration/monitor_acceptance.py exists", os.path.isfile("hack/orchestration/monitor_acceptance.py")))
+results.append(("3: hack/orchestration/end_to_end_acceptance.py exists", os.path.isfile("hack/orchestration/end_to_end_acceptance.py")))
+
+# 4: monitor_state.py vocabulary is exactly ABSENT/OWNED/BROKEN (never HEALTHY).
+with open("hack/orchestration/monitor_state.py") as f:
+    monitor_state_source = f.read()
+results.append(("4a: monitor_state.py defines STATE_ABSENT", "STATE_ABSENT = \"ABSENT\"" in monitor_state_source))
+results.append(("4b: monitor_state.py defines STATE_OWNED", "STATE_OWNED = \"OWNED\"" in monitor_state_source))
+results.append(("4c: monitor_state.py defines STATE_BROKEN", "STATE_BROKEN = \"BROKEN\"" in monitor_state_source))
+results.append(("4d: monitor_state.py never defines a HEALTHY state (ownership preflight is not a HEALTHY-skip prerequisite)", "STATE_HEALTHY" not in monitor_state_source))
+
+# 5: monitor_acceptance.py vocabulary is HEALTHY/BROKEN only (never ABSENT).
+with open("hack/orchestration/monitor_acceptance.py") as f:
+    monitor_acceptance_source = f.read()
+results.append(("5a: monitor_acceptance.py vocabulary is HEALTHY/BROKEN", "STATE_HEALTHY = \"HEALTHY\"" in monitor_acceptance_source and "STATE_BROKEN = \"BROKEN\"" in monitor_acceptance_source))
+results.append(("5b: monitor_acceptance.py never defines an ABSENT state (an expected monitor that is missing after reconciliation IS BROKEN)", "STATE_ABSENT" not in monitor_acceptance_source))
+
+# 6: end_to_end_acceptance.py vocabulary is HEALTHY/BROKEN.
+with open("hack/orchestration/end_to_end_acceptance.py") as f:
+    e2e_source = f.read()
+results.append(("6: end_to_end_acceptance.py vocabulary is HEALTHY/BROKEN", "STATE_HEALTHY = \"HEALTHY\"" in e2e_source and "STATE_BROKEN = \"BROKEN\"" in e2e_source))
+
+# 7/8: monitor_ownership_preflight exists and is real-deploy + active-runtime-only.
+results.append(("7: MAIN defines monitor_ownership_preflight", "monitor_ownership_preflight" in jobs))
+preflight = jobs.get("monitor_ownership_preflight", {})
+preflight_if = str(preflight.get("if", ""))
+results.append(("8a: monitor_ownership_preflight is real-deploy-only (effective_deploy == \x27true\x27)", "effective_deploy == \x27true\x27" in preflight_if))
+results.append(("8b: monitor_ownership_preflight is active-runtime-only (has_active_deployments == \x27true\x27)", "has_active_deployments == \x27true\x27" in preflight_if))
+
+# 9: BROKEN blocks monitor mutation -- monitor_sync_once requires monitor_ownership_preflight.result == success.
+sync_once = jobs.get("monitor_sync_once", {})
+sync_once_needs = sync_once.get("needs") or []
+sync_once_if = str(sync_once.get("if", ""))
+results.append(("9a: monitor_sync_once needs monitor_ownership_preflight", "monitor_ownership_preflight" in sync_once_needs))
+results.append(("9b: monitor_sync_once requires monitor_ownership_preflight.result == success (BROKEN, which fails the preflight job, blocks reconciliation)", "monitor_ownership_preflight.result == \x27success\x27" in sync_once_if))
+
+# 10/11: ABSENT and OWNED both explicitly permit reconciliation -- never an OWNED -> skip shortcut.
+results.append(("10: monitor_sync_once if: explicitly allows state == \x27ABSENT\x27", "monitor_ownership_preflight.outputs.state == \x27ABSENT\x27" in sync_once_if))
+results.append(("11: monitor_sync_once if: explicitly allows state == \x27OWNED\x27 (never an OWNED-only-skip shortcut -- both ABSENT and OWNED reconcile identically)", "monitor_ownership_preflight.outputs.state == \x27OWNED\x27" in sync_once_if))
+
+# 14/15: validate_monitor_ready exists and depends on monitor_sync_once.
+results.append(("14: MAIN defines validate_monitor_ready", "validate_monitor_ready" in jobs))
+validate_ready = jobs.get("validate_monitor_ready", {})
+validate_ready_needs = validate_ready.get("needs") or []
+validate_ready_if = str(validate_ready.get("if", ""))
+results.append(("15: validate_monitor_ready needs monitor_sync_once and requires its success", "monitor_sync_once" in validate_ready_needs and "monitor_sync_once.result == \x27success\x27" in validate_ready_if))
+
+# 16/17: validate_monitor_ready validates canonical registry equality and requires /healthz + /readyz.
+validate_ready_steps = validate_ready.get("steps") or []
+validate_ready_run_text = "\n".join(s.get("run", "") for s in validate_ready_steps)
+results.append(("16: validate_monitor_ready passes --registry-file (canonical registry equality check) to monitor_acceptance.py", "--registry-file" in validate_ready_run_text and "monitor_acceptance.py" in validate_ready_run_text))
+results.append(("17a: validate_monitor_ready checks /healthz on the verified Ready pod", "/healthz" in validate_ready_run_text))
+results.append(("17b: validate_monitor_ready checks /readyz on the verified Ready pod", "/readyz" in validate_ready_run_text))
+results.append(("17c: validate_monitor_ready folds --healthz-status/--readyz-status back into a final monitor_acceptance.py pass", "--healthz-status" in validate_ready_run_text and "--readyz-status" in validate_ready_run_text))
+
+# 18: replication_monitor_acceptance requires validate_monitor_ready, not merely monitor_sync_once.
+repl_mon = jobs.get("replication_monitor_acceptance", {})
+repl_mon_needs = repl_mon.get("needs") or []
+repl_mon_if = str(repl_mon.get("if", ""))
+results.append(("18a: replication_monitor_acceptance needs validate_monitor_ready", "validate_monitor_ready" in repl_mon_needs))
+results.append(("18b: replication_monitor_acceptance requires validate_monitor_ready.result == success", "validate_monitor_ready.result == \x27success\x27" in repl_mon_if))
+results.append(("18c: replication_monitor_acceptance was rewired away from monitor_sync_once (no longer a direct dependency)", "monitor_sync_once" not in repl_mon_needs))
+
+# 19/20/21/22: end_to_end_deployment_acceptance exists, uses the GLOBAL active inventory, validates monitor /api/processes, and is real-deploy + active-runtime only.
+results.append(("19: MAIN defines end_to_end_deployment_acceptance", "end_to_end_deployment_acceptance" in jobs))
+e2e_job = jobs.get("end_to_end_deployment_acceptance", {})
+e2e_job_if = str(e2e_job.get("if", ""))
+e2e_job_steps = e2e_job.get("steps") or []
+e2e_job_run_text = "\n".join(s.get("run", "") for s in e2e_job_steps)
+results.append(("20a: end_to_end_deployment_acceptance invokes hack/orchestration/end_to_end_acceptance.py", "end_to_end_acceptance.py" in e2e_job_run_text))
+results.append(("20b: end_to_end_acceptance.py itself resolves the GLOBAL active deployment set via _run_full_validation (never a per-run selected subset passed in)", "_run_full_validation" in e2e_source))
+results.append(("21: end_to_end_deployment_acceptance fetches /api/processes through the verified monitor pod", "/api/processes" in e2e_job_run_text))
+results.append(("22a: end_to_end_deployment_acceptance is real-deploy-only (effective_deploy == \x27true\x27)", "effective_deploy == \x27true\x27" in e2e_job_if))
+results.append(("22b: end_to_end_deployment_acceptance is active-runtime-only (has_active_deployments == \x27true\x27)", "has_active_deployments == \x27true\x27" in e2e_job_if))
+
+# 23/24: active-runtime success requires end_to_end_deployment_acceptance, and final_validation lists every REQUIRED B3B job directly -- never relying only on transitive failure/skip propagation through it.
+final_val = jobs.get("final_validation", {})
+final_val_needs = final_val.get("needs") or []
+final_val_if = str(final_val.get("if", ""))
+for extra_job in ("validate_argocd_ready", "validate_platform_ready", "validate_observability_ready", "monitor_ownership_preflight", "validate_monitor_ready", "end_to_end_deployment_acceptance"):
+    results.append((f"23: final_validation needs {extra_job} directly (closes the transitive-skip gap)", extra_job in final_val_needs))
+    results.append((f"24: final_validation requires {extra_job} did not fail/get cancelled", f"{extra_job}.result != \x27failure\x27" in final_val_if and f"{extra_job}.result != \x27cancelled\x27" in final_val_if))
+
+# 25: no-active-runtime path remains valid, and dry-run never runs the live B3B jobs -- all four are gated on both has_active_deployments == \x27true\x27 and effective_deploy == \x27true\x27.
+for gated_job_name, gated_job_if in (("monitor_ownership_preflight", preflight_if), ("monitor_sync_once", sync_once_if), ("validate_monitor_ready", validate_ready_if), ("end_to_end_deployment_acceptance", e2e_job_if)):
+    results.append((f"25a: {gated_job_name} is gated on has_active_deployments == \x27true\x27 (no-active-runtime path cleanly skips it, never an empty-registry failure)", "has_active_deployments == \x27true\x27" in gated_job_if))
+    results.append((f"25b: {gated_job_name} is gated on effective_deploy == \x27true\x27 (dry-run never runs it live)", "effective_deploy == \x27true\x27" in gated_job_if))
+
+# 26: no async workflow dispatch introduced -- monitor_sync_once still uses a synchronous reusable-workflow `uses:` call, never a dispatch-and-poll pattern.
+results.append(("26a: monitor_sync_once still uses a synchronous `uses: ./.github/workflows/50-sub-monitor.yaml` reusable-workflow call (never an async dispatch-and-poll)", sync_once.get("uses") == "./.github/workflows/50-sub-monitor.yaml"))
+with open("'"$EKS_APP_WORKFLOW"'") as f:
+    main_source_for_dispatch_check = f.read()
+results.append(("26b: no gh workflow run / workflow-dispatch async trigger construct was introduced anywhere in MAIN", "gh workflow run" not in main_source_for_dispatch_check and "/dispatches" not in main_source_for_dispatch_check))
+
+# 27: no monitor healing/failover/control operation introduced -- the monitor architecture remains passive; no pod-deletion/rollout-restart/failover/auto-heal verb appears in any of the new B3B job step content.
+combined_new_job_text = "\n".join([
+    "\n".join(s.get("run", "") for s in (preflight.get("steps") or [])),
+    "\n".join(s.get("run", "") for s in (sync_once.get("steps") or []) or []),
+    validate_ready_run_text,
+    "\n".join(s.get("run", "") for s in (repl_mon.get("steps") or [])),
+    e2e_job_run_text,
+]).lower()
+for verb in ("kubectl delete pod", "kubectl rollout restart", "failover", "auto-heal", "autoheal"):
+    results.append((f"27: no {verb!r} control-operation construct found in the new/rewired B3B monitor jobs", verb not in combined_new_job_text))
+
+# 28: no Route 53 mutation introduced by this phase -- already swept repository-wide by the Phase B3A check above; not duplicated here.
+results.append(("28: no Route 53 mutation introduced (covered by the repository-wide Phase B3A sweep above, re-confirmed unchanged)", True))
+
+# 29: no Destroy implementation introduced yet -- no destroy input/job exists anywhere in MAIN.
+on_block = main_doc.get(True, main_doc.get("on", {}))
+main_inputs = (on_block.get("workflow_dispatch") or {}).get("inputs", {}) or {}
+results.append(("29a: MAIN workflow_dispatch defines no \x27destroy\x27 input", not any("destroy" in str(k).lower() for k in main_inputs)))
+results.append(("29b: MAIN defines no job whose name contains \x27destroy\x27", not any("destroy" in str(j).lower() for j in jobs)))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+' 2>&1)"
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL\ *) fail "Phase B3B: ${line#FAIL }" ;;
+      OK\ *) pass "Phase B3B: ${line#OK }" ;;
+    esac
+  done <<< "$PHASE_B3B_STRUCTURAL_CHECK"
+else
+  skip "Phase B3B: structural DAG/workflow checks -- python3/PyYAML unavailable or main workflow missing"
+fi
+
+# First-bootstrap workflow regression: proves the exact staged step ORDER in 50-sub-monitor.yaml's build_publish_and_deploy job (publication-disabled -> Ready monitor -> CONFIG gate -> publication-enabled), that the old "you must manually deploy with publication disabled first" hard failure is gone, and that a CONFIG gate failure prevents publication from ever reaching true. Also covers WORKFLOW VALIDATION scenarios 2 (fast path, existing Ready pod) and 3 (safe repair path, no existing Ready pod) via each staged step's own if: gating on EXISTING_READY_MONITOR_POD_NAME.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$MONITOR_WORKFLOW" ]; then
+  PHASE_B3B_BOOTSTRAP_CHECK="$(python3 -c '
+import yaml
+
+with open("'"$MONITOR_WORKFLOW"'") as f:
+    sub_doc = yaml.safe_load(f)
+
+steps = sub_doc["jobs"]["build_publish_and_deploy"]["steps"]
+names = [s.get("name") for s in steps]
+by_name = {s.get("name"): s for s in steps}
+results = []
+
+expected_order = [
+    "Detect an existing Ready gg-monitor pod (bootstrap-safe)",
+    "Fast-path CloudWatch publication preflight (gate inventory via existing pod)",
+    "Create or update Argo CD Application",
+    "Wait for Argo CD sync and health",
+    "Bootstrap/repair path -- CONFIG gate via newly Ready pod, then finalize CloudWatch publication",
+    "Verify GoldenGate monitor runtime state",
+]
+all_present = all(name in names for name in expected_order)
+for name in expected_order:
+    results.append((f"step {name!r} exists in build_publish_and_deploy", name in names))
+if all_present:
+    indices = [names.index(name) for name in expected_order]
+    results.append(("the staged-bootstrap steps appear in the correct order (detect -> fast-path gate -> apply -> wait -> bootstrap/repair gate+finalize -> verify)", indices == sorted(indices)))
+
+detect_run = by_name.get("Detect an existing Ready gg-monitor pod (bootstrap-safe)", {}).get("run", "")
+results.append(("the bootstrap-detection step never hard-fails merely because no old Ready monitor pod exists (the old blocking prerequisite message is gone)", "Prerequisite: first deploy the monitor with enable_cloudwatch_publication=false" not in detect_run))
+results.append(("the bootstrap-detection step contains no exit 1 (detection only, never fatal)", "exit 1" not in detect_run))
+
+apply_run = by_name.get("Create or update Argo CD Application", {}).get("run", "")
+results.append(("Create or update Argo CD Application computes a safe interim cloudwatch.publishEnabled=false value for the bootstrap/repair path", "APPLY_CLOUDWATCH_VALUE=\"false\"" in apply_run))
+results.append(("Create or update Argo CD Application uses the computed APPLY_CLOUDWATCH_VALUE (never the raw final requested value directly) in the Helm parameter", "value: \"${APPLY_CLOUDWATCH_VALUE}\"" in apply_run))
+
+bootstrap_run = by_name.get("Bootstrap/repair path -- CONFIG gate via newly Ready pod, then finalize CloudWatch publication", {}).get("run", "")
+fail_idx = bootstrap_run.find("FAIL: CloudWatch publication preflight failed")
+finalize_idx = bootstrap_run.find("finalizing CloudWatch publication")
+results.append(("the bootstrap/repair step gate-checks BEFORE ever finalizing CloudWatch publication to true", fail_idx != -1 and finalize_idx != -1 and fail_idx < finalize_idx))
+results.append(("a CONFIG gate failure exits non-zero strictly before any second Argo CD Application apply (publication can never reach true on a failed gate)", finalize_idx == -1 or "exit 1" in bootstrap_run[:finalize_idx]))
+results.append(("the bootstrap/repair step re-applies the SAME Application with the FINAL requested cloudwatch.publishEnabled value only after the gate passes", finalize_idx != -1 and "value: \"${CLOUDWATCH_PUBLISH_ENABLED_VALUE}\"" in bootstrap_run[finalize_idx:]))
+
+fast_if = str(by_name.get("Fast-path CloudWatch publication preflight (gate inventory via existing pod)", {}).get("if", ""))
+bootstrap_if = str(by_name.get("Bootstrap/repair path -- CONFIG gate via newly Ready pod, then finalize CloudWatch publication", {}).get("if", ""))
+results.append(("WORKFLOW VALIDATION scenario 2 (fast path): the fast-path gate inventory only runs when an existing Ready pod was detected", "EXISTING_READY_MONITOR_POD_NAME != \x27\x27" in fast_if))
+results.append(("WORKFLOW VALIDATION scenario 3 (safe repair path): the bootstrap/repair path only runs when no existing Ready pod was detected", "EXISTING_READY_MONITOR_POD_NAME == \x27\x27" in bootstrap_if))
+results.append(("the fast-path gate is gated on inputs.enable_cloudwatch_publication (never runs for enable_cloudwatch_publication=false, preserving the standalone rollback path unchanged)", "inputs.enable_cloudwatch_publication" in fast_if))
+results.append(("the bootstrap/repair path is gated on inputs.enable_cloudwatch_publication (never runs for enable_cloudwatch_publication=false, preserving the standalone rollback path unchanged)", "inputs.enable_cloudwatch_publication" in bootstrap_if))
+
+sub_on_block = sub_doc.get(True, sub_doc.get("on", {}))
+sub_outputs = ((sub_on_block.get("workflow_call") or {}).get("outputs")) or {}
+results.append(("50-sub-monitor.yaml workflow_call exposes output image_repository", "image_repository" in sub_outputs))
+results.append(("50-sub-monitor.yaml workflow_call exposes output image_tag", "image_tag" in sub_outputs))
+results.append(("50-sub-monitor.yaml workflow_call exposes output chart_version", "chart_version" in sub_outputs))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+' 2>&1)"
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL\ *) fail "Phase B3B: first-bootstrap workflow regression: ${line#FAIL }" ;;
+      OK\ *) pass "Phase B3B: first-bootstrap workflow regression: ${line#OK }" ;;
+    esac
+  done <<< "$PHASE_B3B_BOOTSTRAP_CHECK"
+else
+  skip "Phase B3B: first-bootstrap workflow regression -- python3/PyYAML unavailable or 50-sub-monitor.yaml missing"
+fi
+
+# DAG simulation: scenarios 1, 4, 6, 7, 8, 9, 10 from the required WORKFLOW VALIDATION list, exercised against the real MAIN if: expressions (scenarios 2/3/5 are exercised structurally above, since 50-sub-monitor.yaml's own internal staged bootstrap/gate logic is not visible as separate MAIN-level job nodes).
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  set +e
+  PHASE_B3B_SIM_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import re
+import sys
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+
+jobs = doc["jobs"]
+
+
+def _extract_if(job_name):
+    raw = jobs[job_name].get("if", "true")
+    raw = str(raw).strip()
+    if raw.startswith("${{") and raw.endswith("}}"):
+        raw = raw[3:-2].strip()
+    return raw
+
+
+class _Parser:
+    """A tiny, bespoke evaluator for exactly the GHA expression subset this workflow uses: && || == != () quoted strings, needs.<job>.result, needs.<job>.outputs.<name>, always(). Not a general GHA expression engine -- just enough to genuinely simulate these job conditions against a fabricated needs context, rather than trusting a text/regex match against the workflow author's own wording."""
+
+    def __init__(self, expr, needs):
+        self.expr = expr
+        self.needs = needs
+        self.pos = 0
+
+    def _skip_ws(self):
+        while self.pos < len(self.expr) and self.expr[self.pos].isspace():
+            self.pos += 1
+
+    def parse(self):
+        result = self._or()
+        self._skip_ws()
+        if self.pos != len(self.expr):
+            raise ValueError(f"trailing content: {self.expr[self.pos:]!r}")
+        return result
+
+    def _or(self):
+        left = self._and()
+        self._skip_ws()
+        while self.expr[self.pos:self.pos + 2] == "||":
+            self.pos += 2
+            right = self._and()
+            left = left or right
+            self._skip_ws()
+        return left
+
+    def _and(self):
+        left = self._atom()
+        self._skip_ws()
+        while self.expr[self.pos:self.pos + 2] == "&&":
+            self.pos += 2
+            right = self._atom()
+            left = left and right
+            self._skip_ws()
+        return left
+
+    def _atom(self):
+        self._skip_ws()
+        if self.expr[self.pos] == "(":
+            self.pos += 1
+            val = self._or()
+            self._skip_ws()
+            assert self.expr[self.pos] == ")"
+            self.pos += 1
+            return val
+        if self.expr[self.pos:self.pos + 8] == "always()":
+            self.pos += 8
+            return True
+        left_val = self._value()
+        self._skip_ws()
+        op = self.expr[self.pos:self.pos + 2]
+        if op in ("==", "!="):
+            self.pos += 2
+            right_val = self._value()
+            return left_val == right_val if op == "==" else left_val != right_val
+        return bool(left_val)
+
+    def _value(self):
+        self._skip_ws()
+        if self.expr[self.pos] == "'":
+            self.pos += 1
+            start = self.pos
+            while self.expr[self.pos] != "'":
+                self.pos += 1
+            val = self.expr[start:self.pos]
+            self.pos += 1
+            return val
+        m = re.match(r"needs\.([A-Za-z0-9_]+)\.result", self.expr[self.pos:])
+        if m:
+            self.pos += m.end()
+            return self.needs.get(m.group(1), {}).get("result", "")
+        m = re.match(r"needs\.([A-Za-z0-9_]+)\.outputs\.([A-Za-z0-9_]+)", self.expr[self.pos:])
+        if m:
+            self.pos += m.end()
+            return self.needs.get(m.group(1), {}).get("outputs", {}).get(m.group(2), "")
+        raise ValueError(f"cannot parse value at: {self.expr[self.pos:self.pos + 40]!r}")
+
+
+def eval_gha_bool(expr, needs):
+    return bool(_Parser(expr, needs).parse())
+
+
+JOB_ORDER = ["monitor_ownership_preflight", "monitor_sync_once", "validate_monitor_ready", "replication_monitor_acceptance", "end_to_end_deployment_acceptance", "final_validation"]
+IF_EXPRS = {job: _extract_if(job) for job in JOB_ORDER}
+
+
+def simulate(initial, outcome_when_run, outputs_when_run=None):
+    results = dict(initial)
+    outputs_when_run = outputs_when_run or {}
+    for job in JOB_ORDER:
+        would_run = eval_gha_bool(IF_EXPRS[job], results)
+        if would_run:
+            results[job] = {"result": outcome_when_run.get(job, "success"), "outputs": outputs_when_run.get(job, {})}
+        else:
+            results[job] = {"result": "skipped", "outputs": {}}
+    return results
+
+
+def base_context(effective_deploy, has_active):
+    # Every OTHER job final_validation's real if: (and monitor_ownership_preflight/monitor_sync_once/validate_monitor_ready/end_to_end_deployment_acceptance's own if: expressions) reference is fixed here as a successful background context -- this simulator's scope is only the B3B-specific dynamic jobs listed in JOB_ORDER above, exactly like the Phase B3A simulator's own use of a fixed base_context() for its own unrelated upstream jobs.
+    return {
+        "validate_model": {"result": "success", "outputs": {"effective_deploy": effective_deploy, "has_active_deployments": has_active}},
+        "validate_shared_secrets_once": {"result": "success", "outputs": {}},
+        "build_publish_and_deploy": {"result": "success", "outputs": {}},
+        "delete_removed_argocd_applications": {"result": "success", "outputs": {}},
+        "replication_reconcile_once": {"result": "success", "outputs": {}},
+        "validate_active_runtimes": {"result": "success", "outputs": {}},
+        "validate_argocd_ready": {"result": "success", "outputs": {}},
+        "validate_platform_ready": {"result": "success", "outputs": {}},
+        "validate_observability_ready": {"result": "success", "outputs": {}},
+        "runtime_ownership_preflight": {"result": "success", "outputs": {}},
+        "replication_dry_run_validation": {"result": "success", "outputs": {}},
+        "monitor_dry_run_validation": {"result": "success", "outputs": {}},
+    }
+
+
+failures = []
+
+
+def check(label, condition):
+    if not condition:
+        failures.append(label)
+
+
+# Scenario 1: MONITOR ABSENT -> full bootstrap chain runs end to end.
+ctx = base_context("true", "true")
+r = simulate(ctx, {}, {"monitor_ownership_preflight": {"state": "ABSENT"}})
+check("Scenario 1 (MONITOR ABSENT): monitor_ownership_preflight succeeds with state ABSENT", r["monitor_ownership_preflight"]["result"] == "success")
+check("Scenario 1 (MONITOR ABSENT): monitor_sync_once runs (full bootstrap chain, no manual prerequisite)", r["monitor_sync_once"]["result"] == "success")
+check("Scenario 1 (MONITOR ABSENT): validate_monitor_ready runs", r["validate_monitor_ready"]["result"] == "success")
+check("Scenario 1 (MONITOR ABSENT): replication_monitor_acceptance runs", r["replication_monitor_acceptance"]["result"] == "success")
+check("Scenario 1 (MONITOR ABSENT): end_to_end_deployment_acceptance runs", r["end_to_end_deployment_acceptance"]["result"] == "success")
+check("Scenario 1 (MONITOR ABSENT): final_validation succeeds", r["final_validation"]["result"] == "success")
+
+# Scenario 4: MONITOR BROKEN blocks the SUB workflow invocation entirely.
+ctx = base_context("true", "true")
+r = simulate(ctx, {"monitor_ownership_preflight": "failure"})
+check("Scenario 4 (MONITOR BROKEN): monitor_ownership_preflight fails", r["monitor_ownership_preflight"]["result"] == "failure")
+check("Scenario 4 (MONITOR BROKEN): monitor_sync_once (the SUB workflow invocation) is blocked (skipped)", r["monitor_sync_once"]["result"] == "skipped")
+check("Scenario 4 (MONITOR BROKEN): final_validation is blocked", r["final_validation"]["result"] == "skipped")
+
+# Scenario 6: monitor reconciliation failure blocks acceptance.
+ctx = base_context("true", "true")
+r = simulate(ctx, {"monitor_sync_once": "failure"}, {"monitor_ownership_preflight": {"state": "OWNED"}})
+check("Scenario 6 (monitor_sync_once failure): validate_monitor_ready is blocked (skipped)", r["validate_monitor_ready"]["result"] == "skipped")
+check("Scenario 6 (monitor_sync_once failure): final_validation is blocked", r["final_validation"]["result"] == "skipped")
+
+# Scenario 7: monitor acceptance failure blocks replication/E2E.
+ctx = base_context("true", "true")
+r = simulate(ctx, {"validate_monitor_ready": "failure"}, {"monitor_ownership_preflight": {"state": "OWNED"}})
+check("Scenario 7 (validate_monitor_ready failure): replication_monitor_acceptance is blocked (skipped)", r["replication_monitor_acceptance"]["result"] == "skipped")
+check("Scenario 7 (validate_monitor_ready failure): end_to_end_deployment_acceptance is blocked (skipped)", r["end_to_end_deployment_acceptance"]["result"] == "skipped")
+check("Scenario 7 (validate_monitor_ready failure): final_validation is blocked", r["final_validation"]["result"] == "skipped")
+
+# Scenario 8: an ACTIVE runtime not UP/fresh fails the final E2E gate -> final_validation blocked.
+ctx = base_context("true", "true")
+r = simulate(ctx, {"end_to_end_deployment_acceptance": "failure"}, {"monitor_ownership_preflight": {"state": "OWNED"}})
+check("Scenario 8 (an ACTIVE runtime not UP/fresh): end_to_end_deployment_acceptance fails", r["end_to_end_deployment_acceptance"]["result"] == "failure")
+check("Scenario 8 (an ACTIVE runtime not UP/fresh): final_validation is blocked (MAIN cannot claim end-to-end success)", r["final_validation"]["result"] == "skipped")
+
+# Scenario 9: NO active runtimes cleanly skips the entire monitor live path, and final_validation still succeeds.
+ctx = base_context("true", "false")
+r = simulate(ctx, {})
+check("Scenario 9 (no active runtimes): monitor_ownership_preflight is cleanly skipped", r["monitor_ownership_preflight"]["result"] == "skipped")
+check("Scenario 9 (no active runtimes): monitor_sync_once is cleanly skipped", r["monitor_sync_once"]["result"] == "skipped")
+check("Scenario 9 (no active runtimes): validate_monitor_ready is cleanly skipped", r["validate_monitor_ready"]["result"] == "skipped")
+check("Scenario 9 (no active runtimes): end_to_end_deployment_acceptance is cleanly skipped", r["end_to_end_deployment_acceptance"]["result"] == "skipped")
+check("Scenario 9 (no active runtimes): final_validation still succeeds", r["final_validation"]["result"] == "success")
+
+# Scenario 10: DRY RUN has no B3B live mutations or live API acceptance.
+ctx = base_context("false", "true")
+r = simulate(ctx, {})
+check("Scenario 10 (DRY RUN): monitor_ownership_preflight never runs live", r["monitor_ownership_preflight"]["result"] == "skipped")
+check("Scenario 10 (DRY RUN): monitor_sync_once never runs live", r["monitor_sync_once"]["result"] == "skipped")
+check("Scenario 10 (DRY RUN): validate_monitor_ready never runs (no live health/API acceptance)", r["validate_monitor_ready"]["result"] == "skipped")
+check("Scenario 10 (DRY RUN): end_to_end_deployment_acceptance never runs (no live health/API acceptance)", r["end_to_end_deployment_acceptance"]["result"] == "skipped")
+
+if failures:
+    print("\n".join(failures))
+    sys.exit(1)
+print("OK")
+PYEOF
+)"
+  PHASE_B3B_SIM_STATUS=$?
+  set -e
+  if [ "$PHASE_B3B_SIM_STATUS" -eq 0 ]; then
+    pass "Phase B3B: DAG scenario 1 (MONITOR ABSENT full bootstrap chain)"
+    pass "Phase B3B: DAG scenario 4 (MONITOR BROKEN blocks SUB invocation)"
+    pass "Phase B3B: DAG scenario 6 (MONITOR reconciliation failure blocks acceptance)"
+    pass "Phase B3B: DAG scenario 7 (MONITOR acceptance failure blocks replication/E2E)"
+    pass "Phase B3B: DAG scenario 8 (ACTIVE runtime not UP/fresh fails E2E)"
+    pass "Phase B3B: DAG scenario 9 (NO active runtimes cleanly skips monitor live path)"
+    pass "Phase B3B: DAG scenario 10 (DRY RUN has no B3B live mutations/API acceptance)"
+  else
+    fail "Phase B3B DAG simulation failed:"$'\n'"${PHASE_B3B_SIM_OUT}"
+  fi
+else
+  skip "Phase B3B: DAG simulation -- python3/PyYAML unavailable or main workflow missing"
 fi
 
 echo ""

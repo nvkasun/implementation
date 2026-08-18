@@ -2762,12 +2762,12 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         self.assertIn(".dockerignore", readme_text)
 
     def test_pod_selection_excludes_terminating_pods(self):
-        # The preflight excludes terminating pods via a bash comparison on a jq-r extracted field (not an inline jq boolean expression), unlike the unchanged "Verify" step below.
-        preflight_step_text = self.monitor_text[
-            self.monitor_text.index("- name: CloudWatch publication preflight"):
-            self.monitor_text.index("- name: Create or update Argo CD Application")]
-        self.assertIn('deletion_ts="$(jq -r \'.metadata.deletionTimestamp // empty\'', preflight_step_text)
-        self.assertIn('[ -n "$deletion_ts" ] && continue', preflight_step_text)
+        # Deployment/ReplicaSet ownership-chain pod selection excludes terminating pods via a bash comparison on a jq-r extracted field (not an inline jq boolean expression), unlike the unchanged "Verify" step below. Phase B3B split the old single preflight step's pod-selection logic into its own dedicated "Detect an existing Ready gg-monitor pod (bootstrap-safe)" step.
+        detect_step_text = self.monitor_text[
+            self.monitor_text.index("- name: Detect an existing Ready gg-monitor pod (bootstrap-safe)"):
+            self.monitor_text.index("- name: Fast-path CloudWatch publication preflight")]
+        self.assertIn('deletion_ts="$(jq -r \'.metadata.deletionTimestamp // empty\'', detect_step_text)
+        self.assertIn('[ -n "$deletion_ts" ] && continue', detect_step_text)
 
         verify_step_text = self.monitor_text[
             self.monitor_text.index("- name: Verify GoldenGate monitor runtime state"):
@@ -2836,14 +2836,19 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         self.assertLess(names.index("Run monitor unit tests"), names.index("Verify Docker binary and daemon are functional"))
 
     def test_deployment_discovery_awk_uses_posix_space_class_not_gnu_s(self):
-        # \s is a GNU/PCRE-only escape, not POSIX awk; [[:space:]] is the portable bracket expression.
-        preflight_idx = self.monitor_text.index("- name: CloudWatch publication preflight")
+        # \s is a GNU/PCRE-only escape, not POSIX awk; [[:space:]] is the portable bracket expression. The CONFIG-gate awk extraction now appears in both the fast-path and bootstrap/repair gate-inventory steps (Phase B3B) plus the unchanged post-rollout re-check inside "Verify" -- all three must use the portable form.
+        fast_path_idx = self.monitor_text.index("- name: Fast-path CloudWatch publication preflight")
         argocd_idx = self.monitor_text.index("- name: Create or update Argo CD Application")
-        preflight_step_text = self.monitor_text[preflight_idx:argocd_idx]
-        self.assertNotIn(r"\s", preflight_step_text)
-        self.assertIn("[[:space:]]", preflight_step_text)
+        fast_path_step_text = self.monitor_text[fast_path_idx:argocd_idx]
+        self.assertNotIn(r"\s", fast_path_step_text)
+        self.assertIn("[[:space:]]", fast_path_step_text)
 
+        wait_idx = self.monitor_text.index("- name: Wait for Argo CD sync and health")
         verify_idx = self.monitor_text.index("- name: Verify GoldenGate monitor runtime state")
+        bootstrap_step_text = self.monitor_text[wait_idx:verify_idx]
+        self.assertNotIn(r"\s", bootstrap_step_text)
+        self.assertIn("[[:space:]]", bootstrap_step_text)
+
         upload_idx = self.monitor_text.index("- name: Upload rendered manifests and chart package")
         verify_step_text = self.monitor_text[verify_idx:upload_idx]
         post_rollout_idx = verify_step_text.index("ENABLED_DEPLOYMENT_PAIRS_POST")
@@ -2870,11 +2875,11 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         self.assertEqual(pairs, expected_pairs)
 
     def test_deployment_discovery_never_hardcodes_names_in_production_logic(self):
-        preflight_idx = self.monitor_text.index("- name: CloudWatch publication preflight")
+        fast_path_idx = self.monitor_text.index("- name: Fast-path CloudWatch publication preflight")
         argocd_idx = self.monitor_text.index("- name: Create or update Argo CD Application")
-        preflight_step_text = self.monitor_text[preflight_idx:argocd_idx]
-        self.assertNotIn("gg-oracle-payments-01", preflight_step_text)
-        self.assertNotIn("gg-postgresql-payments-01", preflight_step_text)
+        fast_path_step_text = self.monitor_text[fast_path_idx:argocd_idx]
+        self.assertNotIn("gg-oracle-payments-01", fast_path_step_text)
+        self.assertNotIn("gg-postgresql-payments-01", fast_path_step_text)
 
     def test_chart_version_is_semver_with_run_number_and_run_attempt(self):
         self.assertIn(
@@ -2897,14 +2902,14 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         self.assertNotIn(".items[0].metadata.name", self.monitor_text)
 
     def test_pod_selection_requires_running_phase_and_ready_containers(self):
-        # The preflight checks the pod's Ready *condition* (not containerStatuses[].ready); the "Verify" step below is unchanged and still uses containerStatuses[].ready.
-        preflight_step_text = self.monitor_text[
-            self.monitor_text.index("- name: CloudWatch publication preflight"):
-            self.monitor_text.index("- name: Create or update Argo CD Application")]
-        self.assertIn('phase="$(jq -r \'.status.phase // ""\'', preflight_step_text)
-        self.assertIn('[ "$phase" != "Running" ] && continue', preflight_step_text)
-        self.assertIn('select(.type=="Ready")', preflight_step_text)
-        self.assertIn('[ "$ready_status" != "True" ] && continue', preflight_step_text)
+        # The bootstrap-detection step checks the pod's Ready *condition* (not containerStatuses[].ready); the "Verify" step below is unchanged and still uses containerStatuses[].ready.
+        detect_step_text = self.monitor_text[
+            self.monitor_text.index("- name: Detect an existing Ready gg-monitor pod (bootstrap-safe)"):
+            self.monitor_text.index("- name: Fast-path CloudWatch publication preflight")]
+        self.assertIn('phase="$(jq -r \'.status.phase // ""\'', detect_step_text)
+        self.assertIn('[ "$phase" != "Running" ] && continue', detect_step_text)
+        self.assertIn('select(.type=="Ready")', detect_step_text)
+        self.assertIn('[ "$ready_status" != "True" ] && continue', detect_step_text)
 
         verify_step_text = self.monitor_text[
             self.monitor_text.index("- name: Verify GoldenGate monitor runtime state"):
@@ -2913,27 +2918,27 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         self.assertIn("all(.ready == true)", verify_step_text)
 
     def test_pod_selection_never_prints_full_pod_object(self):
-        preflight_idx = self.monitor_text.index("- name: CloudWatch publication preflight")
-        argocd_idx = self.monitor_text.index("- name: Create or update Argo CD Application")
-        preflight_step_text = self.monitor_text[preflight_idx:argocd_idx]
+        detect_idx = self.monitor_text.index("- name: Detect an existing Ready gg-monitor pod (bootstrap-safe)")
+        fast_path_idx = self.monitor_text.index("- name: Fast-path CloudWatch publication preflight")
+        detect_step_text = self.monitor_text[detect_idx:fast_path_idx]
         self.assertNotIn("kubectl get pods -n \"$TARGET_NAMESPACE\" -l app.kubernetes.io/name=gg-monitor -o json 2>/dev/null | jq -r .items",
-                         preflight_step_text.replace("\n", " ").replace("            ", " "))
-        self.assertNotIn("echo \"$POD_NAME\" -o json", preflight_step_text)
+                         detect_step_text.replace("\n", " ").replace("            ", " "))
+        self.assertNotIn("echo \"$POD_NAME\" -o json", detect_step_text)
 
     def test_preflight_pod_selection_verifies_ownership_chain(self):
-        # This only proves the Deployment/ReplicaSet ownership-chain properties are textually present (static analysis); the full functional proof (mocked kubectl/jq scenarios) lives in hack/test-goldengate-metrics-config.py::MainWorkflowPodOwnershipTests.
-        preflight_step_text = self.monitor_text[
-            self.monitor_text.index("- name: CloudWatch publication preflight"):
-            self.monitor_text.index("- name: Create or update Argo CD Application")]
+        # This only proves the Deployment/ReplicaSet ownership-chain properties are textually present (static analysis); the full functional proof (mocked kubectl/jq scenarios) lives in hack/test-goldengate-metrics-config.py::MainWorkflowPodOwnershipTests. Phase B3B moved this logic into its own "Detect an existing Ready gg-monitor pod (bootstrap-safe)" step (and it is reused, byte-for-byte, in the "Bootstrap/repair path" step further down).
+        detect_step_text = self.monitor_text[
+            self.monitor_text.index("- name: Detect an existing Ready gg-monitor pod (bootstrap-safe)"):
+            self.monitor_text.index("- name: Fast-path CloudWatch publication preflight")]
 
-        self.assertIn('kubectl get deployment gg-monitor -n "$TARGET_NAMESPACE" -o json', preflight_step_text)
-        self.assertIn("DEPLOY_UID=", preflight_step_text)
-        self.assertIn(".spec.selector.matchLabels", preflight_step_text)
-        self.assertIn('[ "$pod_sa" != "gg-monitor" ] && continue', preflight_step_text)
-        self.assertIn('select(.controller==true and .kind=="ReplicaSet")', preflight_step_text)
-        self.assertIn('kubectl get replicaset "$rs_owner_name"', preflight_step_text)
-        self.assertIn('select(.controller==true and .kind=="Deployment")', preflight_step_text)
-        self.assertIn('[ "$rs_deploy_uid" != "$DEPLOY_UID" ] && continue', preflight_step_text)
+        self.assertIn('kubectl get deployment gg-monitor -n "$TARGET_NAMESPACE" -o json', detect_step_text)
+        self.assertIn("DEPLOY_UID=", detect_step_text)
+        self.assertIn(".spec.selector.matchLabels", detect_step_text)
+        self.assertIn('[ "$pod_sa" != "gg-monitor" ] && continue', detect_step_text)
+        self.assertIn('select(.controller==true and .kind=="ReplicaSet")', detect_step_text)
+        self.assertIn('kubectl get replicaset "$rs_owner_name"', detect_step_text)
+        self.assertIn('select(.controller==true and .kind=="Deployment")', detect_step_text)
+        self.assertIn('[ "$rs_deploy_uid" != "$DEPLOY_UID" ] && continue', detect_step_text)
 
         verify_step_text = self.monitor_text[
             self.monitor_text.index("- name: Verify GoldenGate monitor runtime state"):
@@ -3009,54 +3014,65 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         self.assertIn('value: "${CLOUDWATCH_PUBLISH_ENABLED_VALUE}"', self.monitor_text)
 
     def test_cloudwatch_preflight_step_exists_gated_on_enable_input(self):
+        # Phase B3B (Safe Monitor Publication Bootstrap Contract): the bootstrap-safe detection step now carries this exact top-level gate and never fails merely because a pod is absent; the actual CONFIG gate check only additionally runs once a Ready pod is confirmed to exist (see test_fast_path_gate_only_runs_when_an_existing_pod_was_detected below).
         condition = _extract_step_if_condition(
-            self.monitor_text, "CloudWatch publication preflight (gate inventory)")
+            self.monitor_text, "Detect an existing Ready gg-monitor pod (bootstrap-safe)")
         self.assertEqual(condition, "${{ inputs.deploy && inputs.enable_cloudwatch_publication }}")
 
+    def test_fast_path_gate_only_runs_when_an_existing_pod_was_detected(self):
+        condition = _extract_step_if_condition(
+            self.monitor_text, "Fast-path CloudWatch publication preflight (gate inventory via existing pod)")
+        self.assertEqual(condition, "${{ inputs.deploy && inputs.enable_cloudwatch_publication && env.EXISTING_READY_MONITOR_POD_NAME != '' }}")
+
+    def test_bootstrap_repair_path_only_runs_when_no_existing_pod_was_detected(self):
+        condition = _extract_step_if_condition(
+            self.monitor_text, "Bootstrap/repair path -- CONFIG gate via newly Ready pod, then finalize CloudWatch publication")
+        self.assertEqual(condition, "${{ inputs.deploy && inputs.enable_cloudwatch_publication && env.EXISTING_READY_MONITOR_POD_NAME == '' }}")
+
     def test_cloudwatch_preflight_precedes_argocd_application_step(self):
-        preflight_idx = self.monitor_text.index("- name: CloudWatch publication preflight")
+        detect_idx = self.monitor_text.index("- name: Detect an existing Ready gg-monitor pod (bootstrap-safe)")
         argocd_idx = self.monitor_text.index("- name: Create or update Argo CD Application")
-        self.assertLess(preflight_idx, argocd_idx)
+        self.assertLess(detect_idx, argocd_idx)
 
     def test_cloudwatch_preflight_uses_get_item_never_scan(self):
-        preflight_idx = self.monitor_text.index("- name: CloudWatch publication preflight")
+        fast_path_idx = self.monitor_text.index("- name: Fast-path CloudWatch publication preflight")
         argocd_idx = self.monitor_text.index("- name: Create or update Argo CD Application")
-        preflight_step_text = self.monitor_text[preflight_idx:argocd_idx]
-        self.assertIn("table.get_item(", preflight_step_text)
-        self.assertNotIn(".scan(", preflight_step_text)
-        self.assertNotIn(".Scan(", preflight_step_text)
+        fast_path_step_text = self.monitor_text[fast_path_idx:argocd_idx]
+        self.assertIn("table.get_item(", fast_path_step_text)
+        self.assertNotIn(".scan(", fast_path_step_text)
+        self.assertNotIn(".Scan(", fast_path_step_text)
 
     def test_no_dynamodb_scan_anywhere_in_monitor_workflow(self):
         self.assertNotIn(".scan(", self.monitor_text)
         self.assertNotIn(".Scan(", self.monitor_text)
 
     def test_cloudwatch_preflight_discovers_enabled_deployments_not_hardcoded(self):
-        preflight_idx = self.monitor_text.index("- name: CloudWatch publication preflight")
+        fast_path_idx = self.monitor_text.index("- name: Fast-path CloudWatch publication preflight")
         argocd_idx = self.monitor_text.index("- name: Create or update Argo CD Application")
-        preflight_step_text = self.monitor_text[preflight_idx:argocd_idx]
+        fast_path_step_text = self.monitor_text[fast_path_idx:argocd_idx]
         # GENERATED_REGISTRY_PATH is the canonical per-environment registry path (Phase 11), never a hardcoded envs/dev literal.
-        self.assertIn("${GENERATED_REGISTRY_PATH}", preflight_step_text)
-        self.assertNotIn("work/generated/dev/goldengate-deployments.yaml", preflight_step_text)
-        self.assertNotIn("gg-oracle-payments-01", preflight_step_text)
-        self.assertNotIn("gg-postgresql-payments-01", preflight_step_text)
+        self.assertIn("${GENERATED_REGISTRY_PATH}", fast_path_step_text)
+        self.assertNotIn("work/generated/dev/goldengate-deployments.yaml", fast_path_step_text)
+        self.assertNotIn("gg-oracle-payments-01", fast_path_step_text)
+        self.assertNotIn("gg-postgresql-payments-01", fast_path_step_text)
 
     def test_cloudwatch_preflight_output_is_sanitized_deployment_result_only(self):
         # Inspects the actual rewritten step text (not a reimplementation) to prove the gate-inventory behaviour, rather than pinning an obsolete literal.
-        preflight_idx = self.monitor_text.index("- name: CloudWatch publication preflight")
+        fast_path_idx = self.monitor_text.index("- name: Fast-path CloudWatch publication preflight")
         argocd_idx = self.monitor_text.index("- name: Create or update Argo CD Application")
-        preflight_step_text = self.monitor_text[preflight_idx:argocd_idx]
+        fast_path_step_text = self.monitor_text[fast_path_idx:argocd_idx]
 
         # 1. CONFIG.metricsEnabled is validated as a literal DynamoDB Boolean.
-        self.assertIn("isinstance(metrics_enabled, bool)", preflight_step_text)
-        self.assertIn("result=metricsenabled-not-boolean", preflight_step_text)
+        self.assertIn("isinstance(metrics_enabled, bool)", fast_path_step_text)
+        self.assertIn("result=metricsenabled-not-boolean", fast_path_step_text)
 
         # 2. CONFIG.alertsEnabled is validated as the literal Boolean false.
-        self.assertIn("alerts_enabled is not False", preflight_step_text)
-        self.assertIn("result=alertsenabled-not-false", preflight_step_text)
+        self.assertIn("alerts_enabled is not False", fast_path_step_text)
+        self.assertIn("result=alertsenabled-not-false", fast_path_step_text)
 
         # 3. CONFIG.deploymentType is validated against the canonical per-deployment type from the registry.
-        self.assertIn('item.get("deploymentType") != expected_type', preflight_step_text)
-        self.assertIn("result=deploymenttype-mismatch", preflight_step_text)
+        self.assertIn('item.get("deploymentType") != expected_type', fast_path_step_text)
+        self.assertIn("result=deploymenttype-mismatch", fast_path_step_text)
 
         # 4. metrics_gate_expectation supports any/all-disabled/all-enabled.
         doc = yaml.safe_load(self.monitor_text)
@@ -3069,35 +3085,44 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         self.assertIn(
             'DISABLED_CONFIG_COUNT=$((DISABLED_CONFIG_COUNT + 1))\n'
             '              if [ "$GATE_EXPECTATION" = "all-enabled" ]; then',
-            preflight_step_text)
+            fast_path_step_text)
         self.assertIn(
             'ENABLED_CONFIG_COUNT=$((ENABLED_CONFIG_COUNT + 1))\n'
             '              if [ "$GATE_EXPECTATION" = "all-disabled" ]; then',
-            preflight_step_text)
+            fast_path_step_text)
 
         # 6. Still fails closed on missing or malformed CONFIG.
-        self.assertIn("result=missing-config", preflight_step_text)
-        self.assertIn("result=bad-recordtype", preflight_step_text)
+        self.assertIn("result=missing-config", fast_path_step_text)
+        self.assertIn("result=bad-recordtype", fast_path_step_text)
         self.assertIn(
             'if [ "$RESULT_STATUS" -ne 0 ] || [[ "$RESULT" != "deployment=${name} deploymentType=${expected_type} metricsEnabled="* ]]',
-            preflight_step_text)
+            fast_path_step_text)
 
         # 7. Uses GetItem only, never Scan.
-        self.assertIn("table.get_item(", preflight_step_text)
-        self.assertNotIn(".scan(", preflight_step_text)
-        self.assertNotIn(".Scan(", preflight_step_text)
+        self.assertIn("table.get_item(", fast_path_step_text)
+        self.assertNotIn(".scan(", fast_path_step_text)
+        self.assertNotIn(".Scan(", fast_path_step_text)
 
-        # 8. The double-gate model is preserved: this step only runs when the global hard switch input is true.
+        # 8. The double-gate model is preserved and (Phase B3B) additionally requires an already-detected existing Ready pod -- this step only runs on the fast path.
         self.assertIn(
-            "if: ${{ inputs.deploy && inputs.enable_cloudwatch_publication }}",
-            preflight_step_text)
+            "if: ${{ inputs.deploy && inputs.enable_cloudwatch_publication && env.EXISTING_READY_MONITOR_POD_NAME != '' }}",
+            fast_path_step_text)
 
     def test_cloudwatch_preflight_first_deployment_prerequisite_message(self):
-        preflight_idx = self.monitor_text.index("- name: CloudWatch publication preflight")
-        argocd_idx = self.monitor_text.index("- name: Create or update Argo CD Application")
-        preflight_step_text = self.monitor_text[preflight_idx:argocd_idx]
-        self.assertIn("PREREQUISITE NOT MET", preflight_step_text)
-        self.assertIn("Prerequisite:", preflight_step_text)
+        # Phase B3B fixed the first-deployment CloudWatch bootstrap bug: the old blocking "you must manually deploy with publication disabled first" prerequisite is gone from the CloudWatch-publication path specifically, replaced by the Safe Monitor Publication Bootstrap Contract (detect -> bootstrap/repair with cloudwatch.publishEnabled=false -> gate -> finalize to true). "PREREQUISITE NOT MET" itself still legitimately appears elsewhere in this workflow for an unrelated check (the Argo CD repository Secret existence prerequisite) -- this test only proves the CloudWatch-specific message and its containing step's fatal exit are gone, never a repo-wide ban on the phrase.
+        self.assertNotIn("Prerequisite: first deploy the monitor with enable_cloudwatch_publication=false", self.monitor_text)
+
+        detect_step_text = self.monitor_text[
+            self.monitor_text.index("- name: Detect an existing Ready gg-monitor pod (bootstrap-safe)"):
+            self.monitor_text.index("- name: Fast-path CloudWatch publication preflight")]
+        self.assertNotIn("PREREQUISITE NOT MET", detect_step_text)
+        self.assertNotIn("exit 1", detect_step_text)
+
+        bootstrap_step_text = self.monitor_text[
+            self.monitor_text.index("- name: Bootstrap/repair path"):
+            self.monitor_text.index("- name: Verify GoldenGate monitor runtime state")]
+        self.assertIn("cloudwatch.publishEnabled=false", bootstrap_step_text)
+        self.assertIn("finalizing CloudWatch publication", bootstrap_step_text)
 
     def test_disabled_cloudwatch_request_never_reaches_preflight_condition(self):
         # Pure boolean simulation of the step's `if:` gate: proves a false request short-circuits before any CONFIG check runs.

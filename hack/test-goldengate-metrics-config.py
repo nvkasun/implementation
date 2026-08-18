@@ -481,11 +481,11 @@ class SourceLevelSafetyInvariantTests(unittest.TestCase):
         self.assertIn("sys.exit(", chunk)
 
     def test_monitor_workflow_inline_readers_use_consistent_read(self):
-        # Exactly two inline CONFIG-inventory readers exist (preflight + post-rollout verification), and both must request ConsistentRead.
-        self.assertEqual(self.monitor_workflow_text.count("ConsistentRead=True"), 2)
+        # Exactly three inline CONFIG-inventory readers exist (Phase B3B: fast-path preflight + bootstrap/repair path + the unchanged post-rollout verification), and all three must request ConsistentRead.
+        self.assertEqual(self.monitor_workflow_text.count("ConsistentRead=True"), 3)
         self.assertEqual(
             self.monitor_workflow_text.count('table.get_item(Key={"pipeline": pipeline, "recordType": "CONFIG"}'),
-            2)
+            3)
 
 
 # Shell-injection-shaped input is never executed: user-controlled string input lives only in the step's env: block, so these tests prove the ACTUAL committed run: text (unmodified) treats a malicious value as inert data even when it contains command substitution / quote-breaking syntax.
@@ -762,11 +762,13 @@ class MainWorkflowPodOwnershipTests(unittest.TestCase):
         os.makedirs(self.bin_dir)
         os.makedirs(self.rs_dir)
 
-        step = _get_step(MONITOR_WORKFLOW_PATH, "CloudWatch publication preflight (gate inventory)")
+        # Phase B3B moved pod-selection out of the (now fast-path-only) CONFIG gate preflight into its own dedicated, always-run "Detect an existing Ready gg-monitor pod (bootstrap-safe)" step -- it never hard-fails; absence simply selects the bootstrap/repair path instead of a fatal exit (see the FAST PATH / BOOTSTRAP-REPAIR PATH echo messages below). The fragment is captured up to (but excluding) the final $GITHUB_ENV write, since GITHUB_ENV is not set in this offline harness.
+        step = _get_step(MONITOR_WORKFLOW_PATH, "Detect an existing Ready gg-monitor pod (bootstrap-safe)")
         run_text = step["run"]
-        marker = 'echo "Using the existing monitor pod for this read-only preflight: ${POD_NAME}"'
-        idx = run_text.index(marker)
-        end = idx + len(marker)
+        marker = 'At no point is CloudWatch publication enabled before the CONFIG gate has been verified."'
+        marker_end = run_text.index(marker) + len(marker)
+        # Cut right before the $GITHUB_ENV write (which is not set in this offline harness) -- robust to the exact indentation YAML's block-scalar dedent leaves on the intervening closing `fi`.
+        end = run_text.index('echo "EXISTING_READY_MONITOR_POD_NAME=', marker_end)
         self.fragment = run_text[:end]
 
         real_jq = shutil.which("jq")
@@ -830,13 +832,11 @@ exit 1
 
     def _run_fragment(self):
         return run_step_script(
-            MONITOR_WORKFLOW_PATH, "CloudWatch publication preflight (pod selection fragment)", self.fragment,
+            MONITOR_WORKFLOW_PATH, "Detect an existing Ready gg-monitor pod (bootstrap-safe) (pod selection fragment)", self.fragment,
             {
                 "TARGET_NAMESPACE": "goldengate-monitoring",
-                "MONITOR_ROLE_NAME": "GoldenGateMonitorReadRole-dev",
             },
             bin_dir=self.bin_dir,
-            gh_expression_overrides={"${{ inputs.metrics_gate_expectation }}": "any"},
         )
 
     def test_selects_pod_owned_by_current_deployment(self):
@@ -846,17 +846,17 @@ exit 1
         )
         proc = self._run_fragment()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("Using the existing monitor pod for this read-only preflight: gg-monitor-abc", proc.stdout)
+        self.assertIn("FAST PATH: found an existing Ready gg-monitor pod owned by the current Deployment: gg-monitor-abc.", proc.stdout)
 
     def test_rejects_pod_owned_by_a_stale_replicaset(self):
-        # The ReplicaSet owns the pod, but its own controller Deployment UID doesn't match the CURRENT gg-monitor Deployment -- a stale/orphaned ReplicaSet from a prior rollout.
+        # The ReplicaSet owns the pod, but its own controller Deployment UID doesn't match the CURRENT gg-monitor Deployment -- a stale/orphaned ReplicaSet from a prior rollout. Phase B3B: never a hard failure -- this now selects the bootstrap/repair path instead of a fatal exit.
         self._write_fixtures(
             pods=[self._pod("gg-monitor-old")],
             rs_owner_uid_by_name={"gg-monitor-rs-current": self.STALE_DEPLOY_UID},
         )
         proc = self._run_fragment()
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("PREREQUISITE NOT MET", proc.stdout)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("BOOTSTRAP/REPAIR PATH: no suitable existing Ready gg-monitor pod found", proc.stdout)
 
     def test_rejects_pod_with_wrong_service_account(self):
         self._write_fixtures(
@@ -864,8 +864,8 @@ exit 1
             rs_owner_uid_by_name={"gg-monitor-rs-current": self.DEPLOY_UID},
         )
         proc = self._run_fragment()
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("PREREQUISITE NOT MET", proc.stdout)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("BOOTSTRAP/REPAIR PATH: no suitable existing Ready gg-monitor pod found", proc.stdout)
 
     def test_rejects_terminating_pod(self):
         self._write_fixtures(
@@ -873,8 +873,8 @@ exit 1
             rs_owner_uid_by_name={"gg-monitor-rs-current": self.DEPLOY_UID},
         )
         proc = self._run_fragment()
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("PREREQUISITE NOT MET", proc.stdout)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("BOOTSTRAP/REPAIR PATH: no suitable existing Ready gg-monitor pod found", proc.stdout)
 
     def test_rejects_not_ready_pod(self):
         self._write_fixtures(
@@ -882,8 +882,8 @@ exit 1
             rs_owner_uid_by_name={"gg-monitor-rs-current": self.DEPLOY_UID},
         )
         proc = self._run_fragment()
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("PREREQUISITE NOT MET", proc.stdout)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("BOOTSTRAP/REPAIR PATH: no suitable existing Ready gg-monitor pod found", proc.stdout)
 
     def test_never_prints_full_pod_deployment_or_replicaset_object(self):
         self._write_fixtures(

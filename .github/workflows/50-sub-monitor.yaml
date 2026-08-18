@@ -54,6 +54,16 @@ on:
         required: false
         type: string
         default: any
+    outputs:
+      image_repository:
+        description: "Resolved GoldenGate monitor image repository (ensure_monitor_image's own output -- never re-derived independently by the caller)."
+        value: ${{ jobs.ensure_monitor_image.outputs.image_repository }}
+      image_tag:
+        description: "Resolved GoldenGate monitor image tag (ensure_monitor_image's own output -- never re-derived independently by the caller)."
+        value: ${{ jobs.ensure_monitor_image.outputs.image_tag }}
+      chart_version:
+        description: "Helm chart version actually packaged and pushed for this run (build_publish_and_deploy's own computed CHART_VERSION -- never re-derived independently by the caller)."
+        value: ${{ jobs.build_publish_and_deploy.outputs.chart_version }}
 
 permissions:
   id-token: write
@@ -485,6 +495,9 @@ jobs:
       group: goldengate-monitor-helm-deploy-${{ github.ref }}
       cancel-in-progress: false
 
+    outputs:
+      chart_version: ${{ steps.prep.outputs.chart_version }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -593,6 +606,7 @@ jobs:
           echo "HELM_PUSH_URL=${HELM_PUSH_URL}" >> "$GITHUB_ENV"
           echo "HELM_CHART_REF=${HELM_CHART_REF}" >> "$GITHUB_ENV"
           echo "CLOUDWATCH_PUBLISH_ENABLED_VALUE=${CLOUDWATCH_PUBLISH_ENABLED_VALUE}" >> "$GITHUB_ENV"
+          echo "chart_version=${CHART_VERSION}" >> "$GITHUB_OUTPUT"
 
           echo "Monitor image URI: ${MONITOR_IMAGE_URI}"
           echo "Chart version: ${CHART_VERSION}"
@@ -1249,14 +1263,14 @@ jobs:
 
           echo "OK: ${ARGOCD_MONITOR_SECRET_NAME} exists and points to ${EXPECTED_URL}."
 
-      - name: CloudWatch publication preflight (gate inventory)
+      # Safe Monitor Publication Bootstrap Contract (Phase B3B): the final desired state is always whatever inputs.enable_cloudwatch_publication/CLOUDWATCH_PUBLISH_ENABLED_VALUE says, but getting there must never require a human to have manually run this workflow once before with publication disabled. This step only DETECTS whether a suitable Ready gg-monitor pod already exists; it never fails on its own -- absence simply selects the bootstrap/repair path below instead of the fast path.
+      - name: Detect an existing Ready gg-monitor pod (bootstrap-safe)
         if: ${{ inputs.deploy && inputs.enable_cloudwatch_publication }}
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "enable_cloudwatch_publication=true requested (metrics_gate_expectation=${{ inputs.metrics_gate_expectation }}) -- taking a safe CONFIG gate inventory for every enabled canonical deployment before the Argo CD Application is touched."
-          echo "This never uses DynamoDB Scan, never broadens IAM, and never constructs a CloudWatch client -- it reuses the existing running monitor pod's own IRSA (${MONITOR_ROLE_NAME}) via a bounded kubectl exec, one GetItem per enabled deployment."
+          echo "enable_cloudwatch_publication=true requested -- checking whether a suitable Ready gg-monitor pod already exists before choosing the safe rollout path. This never fails merely because no monitor exists yet or the existing one is unhealthy: that case takes the BOOTSTRAP/REPAIR path below instead of a hard failure."
 
           # Deployment/ReplicaSet ownership-chain pod selection (never a blind ".items[0]" or a bare label selector): pod must be Running, Ready, use serviceAccountName=gg-monitor, and be owned by a ReplicaSet owned by the current gg-monitor Deployment.
           POD_NAME=""
@@ -1298,15 +1312,24 @@ jobs:
               fi
             fi
           fi
-          if [ -z "$POD_NAME" ]; then
-            echo ""
-            echo "PREREQUISITE NOT MET: no Ready gg-monitor pod found in namespace ${TARGET_NAMESPACE}."
-            echo "The CONFIG gate inventory cannot be taken without an authenticated read path, and this workflow never bypasses that check merely because the monitor does not exist yet or is not Ready."
-            echo ""
-            echo "Prerequisite: first deploy the monitor with enable_cloudwatch_publication=false (the default), confirm it is Ready, then re-run this workflow with enable_cloudwatch_publication=true."
-            exit 1
+
+          if [ -n "$POD_NAME" ]; then
+            echo "FAST PATH: found an existing Ready gg-monitor pod owned by the current Deployment: ${POD_NAME}. Gate inventory now, then reconcile directly to the final requested cloudwatch.publishEnabled value."
+          else
+            echo "BOOTSTRAP/REPAIR PATH: no suitable existing Ready gg-monitor pod found in namespace ${TARGET_NAMESPACE}. Reconcile with cloudwatch.publishEnabled=false first (interim, safe), wait for it to become Synced/Healthy/Ready, THEN take the gate inventory through that newly-Ready pod, and only then enable publication. At no point is CloudWatch publication enabled before the CONFIG gate has been verified."
           fi
-          echo "Using the existing monitor pod for this read-only preflight: ${POD_NAME}"
+
+          echo "EXISTING_READY_MONITOR_POD_NAME=${POD_NAME}" >> "$GITHUB_ENV"
+
+      - name: Fast-path CloudWatch publication preflight (gate inventory via existing pod)
+        if: ${{ inputs.deploy && inputs.enable_cloudwatch_publication && env.EXISTING_READY_MONITOR_POD_NAME != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          POD_NAME="$EXISTING_READY_MONITOR_POD_NAME"
+          echo "FAST PATH (metrics_gate_expectation=${{ inputs.metrics_gate_expectation }}): taking a safe CONFIG gate inventory for every enabled canonical deployment through the existing Ready monitor pod (${POD_NAME}) before the Argo CD Application is updated to its final requested value."
+          echo "This never uses DynamoDB Scan, never broadens IAM, and never constructs a CloudWatch client -- it reuses the existing running monitor pod's own IRSA (${MONITOR_ROLE_NAME}) via a bounded kubectl exec, one GetItem per enabled deployment."
 
           # Canonical enabled deployment name|type pairs, discovered from the deployment-model-generated registry (never hardcoded), carrying each deployment's type for the deploymentType check below.
           mapfile -t ENABLED_DEPLOYMENT_PAIRS < <(awk '
@@ -1398,7 +1421,7 @@ jobs:
 
           # Written before the pass/fail decision so the inventory is always visible in the run summary, including on failure.
           {
-            echo "### CloudWatch publication preflight (gate inventory)"
+            echo "### CloudWatch publication preflight (gate inventory, fast path)"
             echo ""
             echo "- Global hard switch requested: \`true\`"
             echo "- metrics_gate_expectation: \`${GATE_EXPECTATION}\`"
@@ -1422,7 +1445,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Applying Argo CD Application: ${ARGOCD_APP_NAME}"
+          # Safe Monitor Publication Bootstrap Contract: only reconcile straight to the final requested cloudwatch.publishEnabled value when publication isn't being requested at all, OR a suitable Ready monitor already exists (fast path, gated above). Otherwise (bootstrap/repair path) reconcile with the safe interim value false first -- the CONFIG gate inventory runs against THAT newly-Ready pod below, and only on success does a later step re-reconcile this SAME Application to the final value.
+          if [ "${{ inputs.enable_cloudwatch_publication }}" = "true" ] && [ -z "${EXISTING_READY_MONITOR_POD_NAME:-}" ]; then
+            APPLY_CLOUDWATCH_VALUE="false"
+            echo "BOOTSTRAP/REPAIR PATH: reconciling ${ARGOCD_APP_NAME} with the safe interim value cloudwatch.publishEnabled=false (final requested value is ${CLOUDWATCH_PUBLISH_ENABLED_VALUE})."
+          else
+            APPLY_CLOUDWATCH_VALUE="$CLOUDWATCH_PUBLISH_ENABLED_VALUE"
+            echo "Reconciling ${ARGOCD_APP_NAME} directly with the final requested value cloudwatch.publishEnabled=${APPLY_CLOUDWATCH_VALUE}."
+          fi
 
           kubectl apply -f - <<EOF
           apiVersion: argoproj.io/v1alpha1
@@ -1451,7 +1481,7 @@ jobs:
                   - name: image.tag
                     value: ${MONITOR_IMAGE_TAG}
                   - name: cloudwatch.publishEnabled
-                    value: "${CLOUDWATCH_PUBLISH_ENABLED_VALUE}"
+                    value: "${APPLY_CLOUDWATCH_VALUE}"
                   - name: global.environment
                     value: ${GG_ENVIRONMENT}
                   - name: namespace.name
@@ -1520,6 +1550,277 @@ jobs:
 
             if [ "${ELAPSED}" -ge "${TIMEOUT_SECONDS}" ]; then
               echo "Timed out after ${TIMEOUT_SECONDS}s waiting for ${ARGOCD_APP_NAME} to become Synced and Healthy."
+              kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" -o wide || true
+              kubectl describe application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" || true
+              exit 1
+            fi
+
+            sleep "${INTERVAL_SECONDS}"
+            ELAPSED=$((ELAPSED + INTERVAL_SECONDS))
+          done
+
+      - name: Bootstrap/repair path -- CONFIG gate via newly Ready pod, then finalize CloudWatch publication
+        if: ${{ inputs.deploy && inputs.enable_cloudwatch_publication && env.EXISTING_READY_MONITOR_POD_NAME == '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "BOOTSTRAP/REPAIR PATH: ${ARGOCD_APP_NAME} was just reconciled with the safe interim value cloudwatch.publishEnabled=false and is now Synced/Healthy. Selecting the newly-Ready gg-monitor pod (Deployment->ReplicaSet->Pod ownership chain) to take the same bounded CONFIG gate inventory before CloudWatch publication is ever enabled."
+
+          POD_NAME=""
+          DEPLOY_JSON="$(kubectl get deployment gg-monitor -n "$TARGET_NAMESPACE" -o json 2>/dev/null || true)"
+          if [ -n "$DEPLOY_JSON" ]; then
+            DEPLOY_UID="$(jq -r '.metadata.uid' <<<"$DEPLOY_JSON")"
+            SELECTOR="$(jq -r '(.spec.selector.matchLabels // {}) | to_entries | map("\(.key)=\(.value)") | join(",")' <<<"$DEPLOY_JSON")"
+
+            if [ -n "$SELECTOR" ] && [ "$SELECTOR" != "null" ]; then
+              PODS_JSON="$(kubectl get pods -n "$TARGET_NAMESPACE" -l "$SELECTOR" -o json 2>/dev/null || true)"
+
+              if [ -n "$PODS_JSON" ]; then
+                while IFS= read -r candidate; do
+                  [ -z "$candidate" ] && continue
+                  pod_json="$(jq -c --arg n "$candidate" '.items[] | select(.metadata.name==$n)' <<<"$PODS_JSON")"
+
+                  deletion_ts="$(jq -r '.metadata.deletionTimestamp // empty' <<<"$pod_json")"
+                  [ -n "$deletion_ts" ] && continue
+
+                  phase="$(jq -r '.status.phase // ""' <<<"$pod_json")"
+                  [ "$phase" != "Running" ] && continue
+
+                  ready_status="$(jq -r '([.status.conditions[]? | select(.type=="Ready")] | first | .status) // "Unknown"' <<<"$pod_json")"
+                  [ "$ready_status" != "True" ] && continue
+
+                  pod_sa="$(jq -r '.spec.serviceAccountName // ""' <<<"$pod_json")"
+                  [ "$pod_sa" != "gg-monitor" ] && continue
+
+                  rs_owner_name="$(jq -r '[.metadata.ownerReferences[]? | select(.controller==true and .kind=="ReplicaSet")][0].name // empty' <<<"$pod_json")"
+                  [ -z "$rs_owner_name" ] && continue
+                  rs_json="$(kubectl get replicaset "$rs_owner_name" -n "$TARGET_NAMESPACE" -o json 2>/dev/null || true)"
+                  [ -z "$rs_json" ] && continue
+                  rs_deploy_uid="$(jq -r '[.metadata.ownerReferences[]? | select(.controller==true and .kind=="Deployment")][0].uid // empty' <<<"$rs_json")"
+                  [ "$rs_deploy_uid" != "$DEPLOY_UID" ] && continue
+
+                  POD_NAME="$candidate"
+                  break
+                done < <(jq -r '.items[].metadata.name' <<<"$PODS_JSON")
+              fi
+            fi
+          fi
+
+          if [ -z "$POD_NAME" ]; then
+            echo "FAIL: ${ARGOCD_APP_NAME} is Synced/Healthy but no Ready pod owned by the current gg-monitor Deployment could be found in ${TARGET_NAMESPACE}. Refusing to enable CloudWatch publication; the Application stays at the safe interim cloudwatch.publishEnabled=false."
+            exit 1
+          fi
+          echo "Using the newly Ready monitor pod for this read-only gate inventory: ${POD_NAME}"
+
+          echo "Confirming /readyz on ${POD_NAME}..."
+          if ! kubectl exec "$POD_NAME" -n "$TARGET_NAMESPACE" -- \
+            python3 -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=5).status == 200 else 1)"; then
+            echo "FAIL: /readyz did not respond with HTTP 200 inside pod ${POD_NAME}. Refusing to enable CloudWatch publication; the Application stays at the safe interim cloudwatch.publishEnabled=false."
+            exit 1
+          fi
+          echo "OK: /readyz responded with HTTP 200."
+
+          echo "Taking the CONFIG gate inventory for every enabled canonical deployment through ${POD_NAME} (metrics_gate_expectation=${{ inputs.metrics_gate_expectation }}). This never uses DynamoDB Scan, never broadens IAM, and never constructs a CloudWatch client -- one GetItem per enabled deployment via the monitor pod's own IRSA."
+
+          mapfile -t ENABLED_DEPLOYMENT_PAIRS_BOOTSTRAP < <(awk '
+            /^[[:space:]]*-[[:space:]]*name:/ {
+              if (name != "" && enabled == "true") print name "|" type
+              name=$0; sub(/^[[:space:]]*-[[:space:]]*name:[[:space:]]*/, "", name); gsub(/["\x27\r]/, "", name)
+              type=""; enabled=""
+              next
+            }
+            /^[[:space:]]*type:[[:space:]]*/ {
+              if (type == "") { t=$0; sub(/^[[:space:]]*type:[[:space:]]*/, "", t); gsub(/["\x27\r]/, "", t); type=t }
+              next
+            }
+            /^[[:space:]]*enabled:[[:space:]]*true/ { enabled="true"; next }
+            /^[[:space:]]*enabled:[[:space:]]*false/ { enabled="false"; next }
+            END { if (name != "" && enabled == "true") print name "|" type }
+          ' ${GENERATED_REGISTRY_PATH})
+
+          if [ "${#ENABLED_DEPLOYMENT_PAIRS_BOOTSTRAP[@]}" -eq 0 ]; then
+            echo "FAIL: no enabled deployments discovered from ${GENERATED_REGISTRY_PATH}."
+            exit 1
+          fi
+
+          GATE_EXPECTATION="${{ inputs.metrics_gate_expectation }}"
+          PREFLIGHT_FAILED="false"
+          ENABLED_CONFIG_COUNT=0
+          DISABLED_CONFIG_COUNT=0
+          ALERTS_ENABLED_COUNT=0
+
+          for pair in "${ENABLED_DEPLOYMENT_PAIRS_BOOTSTRAP[@]}"; do
+            name="${pair%%|*}"
+            expected_type="${pair#*|}"
+
+            set +e
+            RESULT="$(kubectl exec "$POD_NAME" -n "$TARGET_NAMESPACE" -- python3 -c '
+          import boto3, os, sys
+          pipeline = sys.argv[1]
+          expected_type = sys.argv[2]
+          try:
+              table = boto3.resource("dynamodb", region_name=os.environ["AWS_REGION"]).Table(os.environ["DYNAMODB_TABLE"])
+              item = table.get_item(Key={"pipeline": pipeline, "recordType": "CONFIG"}, ConsistentRead=True).get("Item")
+              if not isinstance(item, dict):
+                  print(f"deployment={pipeline} result=missing-config"); sys.exit(1)
+              if item.get("recordType") != "CONFIG":
+                  print(f"deployment={pipeline} result=bad-recordtype"); sys.exit(1)
+              if item.get("deploymentType") != expected_type:
+                  print(f"deployment={pipeline} result=deploymenttype-mismatch"); sys.exit(1)
+              metrics_enabled = item.get("metricsEnabled")
+              alerts_enabled = item.get("alertsEnabled")
+              if not isinstance(metrics_enabled, bool):
+                  print(f"deployment={pipeline} result=metricsenabled-not-boolean"); sys.exit(1)
+              if alerts_enabled is not False:
+                  print(f"deployment={pipeline} result=alertsenabled-not-false"); sys.exit(1)
+              metrics_enabled_str = "true" if metrics_enabled else "false"
+              print(f"deployment={pipeline} deploymentType={expected_type} metricsEnabled={metrics_enabled_str} alertsEnabled=false")
+          except SystemExit:
+              raise
+          except Exception as exc:
+              print(f"deployment={pipeline} result=read-error"); sys.exit(1)
+          ' "$name" "$expected_type" 2>/dev/null)"
+            RESULT_STATUS=$?
+            set -e
+
+            echo "$RESULT"
+
+            if [ "$RESULT_STATUS" -ne 0 ] || [[ "$RESULT" != "deployment=${name} deploymentType=${expected_type} metricsEnabled="* ]]; then
+              echo "FAIL: gate inventory read failed for deployment ${name} (missing CONFIG, malformed metricsEnabled/alertsEnabled, deploymentType mismatch, or a DynamoDB read error)."
+              PREFLIGHT_FAILED="true"
+              if [[ "$RESULT" == *"result=alertsenabled-not-false"* ]]; then
+                ALERTS_ENABLED_COUNT=$((ALERTS_ENABLED_COUNT + 1))
+              fi
+              continue
+            fi
+
+            if [[ "$RESULT" == *"metricsEnabled=true"* ]]; then
+              ENABLED_CONFIG_COUNT=$((ENABLED_CONFIG_COUNT + 1))
+              if [ "$GATE_EXPECTATION" = "all-disabled" ]; then
+                echo "FAIL: expectation=all-disabled but ${name} has metricsEnabled=true."
+                PREFLIGHT_FAILED="true"
+              fi
+            else
+              DISABLED_CONFIG_COUNT=$((DISABLED_CONFIG_COUNT + 1))
+              if [ "$GATE_EXPECTATION" = "all-enabled" ]; then
+                echo "FAIL: expectation=all-enabled but ${name} has metricsEnabled=false."
+                PREFLIGHT_FAILED="true"
+              fi
+            fi
+          done
+
+          {
+            echo "### CloudWatch publication preflight (gate inventory, bootstrap/repair path)"
+            echo ""
+            echo "- Global hard switch requested: \`true\`"
+            echo "- metrics_gate_expectation: \`${GATE_EXPECTATION}\`"
+            echo "- Canonical enabled deployments: \`${#ENABLED_DEPLOYMENT_PAIRS_BOOTSTRAP[@]}\`"
+            echo "- CONFIG.metricsEnabled=true count: \`${ENABLED_CONFIG_COUNT}\`"
+            echo "- CONFIG.metricsEnabled=false count: \`${DISABLED_CONFIG_COUNT}\`"
+            echo "- CONFIG.alertsEnabled=true count (must be zero): \`${ALERTS_ENABLED_COUNT}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$PREFLIGHT_FAILED" = "true" ]; then
+            echo ""
+            echo "FAIL: CloudWatch publication preflight failed. CloudWatch publication remains DISABLED -- ${ARGOCD_APP_NAME} stays at the safe interim cloudwatch.publishEnabled=false. No CloudWatch client will be constructed."
+            exit 1
+          fi
+          echo "OK: gate inventory satisfies metrics_gate_expectation=${GATE_EXPECTATION} for every enabled canonical deployment (alertsEnabled confirmed false throughout)."
+
+          echo "Gate passed -- finalizing CloudWatch publication: reconciling the SAME Argo CD Application ${ARGOCD_APP_NAME} to cloudwatch.publishEnabled=${CLOUDWATCH_PUBLISH_ENABLED_VALUE}. The chart is never repackaged/republished for this second reconciliation -- only the Application's Helm parameter changes."
+
+          kubectl apply -f - <<EOF
+          apiVersion: argoproj.io/v1alpha1
+          kind: Application
+          metadata:
+            name: ${ARGOCD_APP_NAME}
+            namespace: ${ARGOCD_NAMESPACE}
+            finalizers:
+              - resources-finalizer.argocd.argoproj.io
+            labels:
+              app.kubernetes.io/name: gg-monitor
+              app.kubernetes.io/managed-by: argocd
+          spec:
+            project: default
+            source:
+              repoURL: ${HELM_CHART_REF}
+              targetRevision: ${CHART_VERSION}
+              path: .
+              helm:
+                releaseName: ${RELEASE_NAME}
+                valueFiles:
+                  - values-deployment.yaml
+                parameters:
+                  - name: image.repository
+                    value: ${MONITOR_IMAGE_REPOSITORY}
+                  - name: image.tag
+                    value: ${MONITOR_IMAGE_TAG}
+                  - name: cloudwatch.publishEnabled
+                    value: "${CLOUDWATCH_PUBLISH_ENABLED_VALUE}"
+                  - name: global.environment
+                    value: ${GG_ENVIRONMENT}
+                  - name: namespace.name
+                    value: ${TARGET_NAMESPACE}
+                  - name: aws.region
+                    value: ${AWS_REGION}
+                  - name: serviceAccount.roleArn
+                    value: ${MONITOR_ROLE_ARN}
+                  - name: ingress.host
+                    value: ${MONITOR_HOST}
+                  - name: ingress.alb.groupName
+                    value: ${ALB_GROUP_NAME}
+                  - name: ingress.alb.certificateArn
+                    value: ${ACM_CERTIFICATE_ARN}
+            destination:
+              server: https://kubernetes.default.svc
+              namespace: ${TARGET_NAMESPACE}
+            syncPolicy:
+              automated:
+                prune: true
+                selfHeal: true
+              syncOptions:
+                - CreateNamespace=true
+              managedNamespaceMetadata:
+                labels:
+                  app.kubernetes.io/name: gg-monitor
+                  app.kubernetes.io/managed-by: argocd
+            revisionHistoryLimit: 10
+          EOF
+
+          kubectl annotate application "${ARGOCD_APP_NAME}" \
+            -n "${ARGOCD_NAMESPACE}" \
+            argocd.argoproj.io/refresh=hard \
+            --overwrite
+
+          echo "Waiting for the finalized Argo CD Application to become Synced and Healthy..."
+          TIMEOUT_SECONDS=600
+          INTERVAL_SECONDS=15
+          ELAPSED=0
+
+          while true; do
+            if kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" >/dev/null 2>&1; then
+              SYNC_STATUS="$(kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" -o jsonpath='{.status.sync.status}' 2>/dev/null || echo "Unknown")"
+              HEALTH_STATUS="$(kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" -o jsonpath='{.status.health.status}' 2>/dev/null || echo "Unknown")"
+
+              echo "[$(date -u +%H:%M:%S)] sync=${SYNC_STATUS} health=${HEALTH_STATUS} (elapsed ${ELAPSED}s / ${TIMEOUT_SECONDS}s)"
+
+              if [ "${HEALTH_STATUS}" = "Degraded" ]; then
+                echo "Argo CD Application ${ARGOCD_APP_NAME} is Degraded after finalizing CloudWatch publication."
+                kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" -o wide
+                exit 1
+              fi
+
+              if [ "${SYNC_STATUS}" = "Synced" ] && [ "${HEALTH_STATUS}" = "Healthy" ]; then
+                echo "Argo CD Application ${ARGOCD_APP_NAME} is Synced and Healthy with CloudWatch publication finalized."
+                break
+              fi
+            else
+              echo "[$(date -u +%H:%M:%S)] Argo CD Application ${ARGOCD_APP_NAME} not found yet (elapsed ${ELAPSED}s / ${TIMEOUT_SECONDS}s)."
+            fi
+
+            if [ "${ELAPSED}" -ge "${TIMEOUT_SECONDS}" ]; then
+              echo "Timed out after ${TIMEOUT_SECONDS}s waiting for ${ARGOCD_APP_NAME} to become Synced and Healthy after finalizing CloudWatch publication."
               kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" -o wide || true
               kubectl describe application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" || true
               exit 1
