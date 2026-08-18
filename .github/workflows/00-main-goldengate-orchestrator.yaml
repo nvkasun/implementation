@@ -519,19 +519,460 @@ jobs:
 
           echo "OK: Argo CD prerequisite state is HEALTHY."
 
-  platform_sync_once:
-    name: Synchronize the GoldenGate platform chart (once)
+  platform_preflight:
+    name: Classify GoldenGate Platform prerequisite state (read-only)
 
-    # This job's if: is a custom expression, so validate_argocd_ready's result must be checked explicitly -- otherwise, if the Argo CD prerequisite was skipped or failed (BROKEN, or a failed bootstrap), this job would still attempt to run since a bare effective_deploy=='true' check says nothing about whether the Argo CD prerequisite actually converged first. validate_argocd_ready already transitively requires terraform_sync_once, so it is not re-listed here.
+    # Phase B2: the ownership-aware application-prerequisite state machine extended to the GoldenGate Platform chart -- ABSENT -> reconcile via 30-sub-platform.yaml, HEALTHY -> continue, BROKEN -> fail closed, never auto-repaired. Runs independently of observability_preflight (siblings after Argo, not a chain) so both branches can execute in parallel. This job never mutates the cluster -- it only runs hack/orchestration/platform_state.py, which itself issues read-only `kubectl get` calls.
     needs:
       - validate_model
       - validate_argocd_ready
     if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.validate_argocd_ready.result == 'success' }}
 
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    outputs:
+      state: ${{ steps.classify.outputs.state }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Load resolved environment config
+        shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
+
+      - name: Install kubectl if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking/installing kubectl..."
+
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KUBECTL_VERSION="v1.35.0"
+
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64)
+                KUBECTL_ARCH="amd64"
+                ;;
+              aarch64|arm64)
+                KUBECTL_ARCH="arm64"
+                ;;
+              *)
+                echo "Unsupported architecture for kubectl: $ARCH"
+                exit 1
+                ;;
+            esac
+
+            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+            sudo chmod +x /usr/local/bin/kubectl
+          fi
+
+          kubectl version --client=true
+
+      - name: Connect to EKS cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}" \
+            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
+            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
+
+          echo "Current kube context:"
+          kubectl config current-context
+
+      - name: Classify GoldenGate Platform prerequisite state
+        id: classify
+        shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+          # Read through a step-level environment variable, never interpolated directly into a shell statement or hardcoded here -- the same external-operational-configuration pattern 30-sub-platform.yaml itself already uses for this variable.
+          FLUENT_BIT_IMAGE: ${{ vars.FLUENT_BIT_IMAGE }}
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
+
+          if [ -z "${FLUENT_BIT_IMAGE:-}" ]; then
+            echo "FAIL: the FLUENT_BIT_IMAGE repository variable is not set."
+            exit 1
+          fi
+
+          # A non-zero exit here is a classifier inspection error (API unreachable, permission denied, malformed JSON) -- never treated as ABSENT.
+          if ! CLASSIFIER_OUTPUT="$(python3 hack/orchestration/platform_state.py --environment "${GG_SELECTED_ENVIRONMENT}" --fluent-bit-image "${FLUENT_BIT_IMAGE}")"; then
+            echo "FAIL: the GoldenGate Platform classifier could not determine cluster state (inspection error, not ABSENT) -- see diagnostics above."
+            exit 1
+          fi
+
+          echo "$CLASSIFIER_OUTPUT"
+
+          STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
+          echo "GoldenGate Platform prerequisite state: ${STATE}"
+          echo "state=${STATE}" >> "$GITHUB_OUTPUT"
+
+          if [ "$STATE" = "BROKEN" ]; then
+            echo "FAIL: GoldenGate Platform prerequisite state is BROKEN. This is not auto-repaired here -- investigate the diagnostics above and repair the platform (or run 30 | SUB | GoldenGate Platform -- .github/workflows/30-sub-platform.yaml -- standalone) before re-running."
+            exit 1
+          fi
+
+  observability_preflight:
+    name: Classify Observability prerequisite state (read-only)
+
+    # Phase B2: the ownership-aware application-prerequisite state machine extended to Observability -- ABSENT -> reconcile via 40-sub-observability.yaml, HEALTHY -> continue, BROKEN -> fail closed, never auto-repaired. Deliberately does NOT depend on platform_preflight -- both are independent application-owned prerequisites after Argo and run in parallel. This job never mutates the cluster -- it only runs hack/orchestration/observability_state.py, which itself issues read-only `kubectl get` calls.
+    needs:
+      - validate_model
+      - validate_argocd_ready
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.validate_argocd_ready.result == 'success' }}
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    outputs:
+      state: ${{ steps.classify.outputs.state }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Load resolved environment config
+        shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
+
+      - name: Install kubectl if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking/installing kubectl..."
+
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KUBECTL_VERSION="v1.35.0"
+
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64)
+                KUBECTL_ARCH="amd64"
+                ;;
+              aarch64|arm64)
+                KUBECTL_ARCH="arm64"
+                ;;
+              *)
+                echo "Unsupported architecture for kubectl: $ARCH"
+                exit 1
+                ;;
+            esac
+
+            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+            sudo chmod +x /usr/local/bin/kubectl
+          fi
+
+          kubectl version --client=true
+
+      - name: Connect to EKS cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}" \
+            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
+            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
+
+          echo "Current kube context:"
+          kubectl config current-context
+
+      - name: Classify Observability prerequisite state
+        id: classify
+        shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
+
+          # A non-zero exit here is a classifier inspection error (API unreachable, permission denied, malformed JSON) -- never treated as ABSENT.
+          if ! CLASSIFIER_OUTPUT="$(python3 hack/orchestration/observability_state.py --environment "${GG_SELECTED_ENVIRONMENT}")"; then
+            echo "FAIL: the Observability classifier could not determine cluster state (inspection error, not ABSENT) -- see diagnostics above."
+            exit 1
+          fi
+
+          echo "$CLASSIFIER_OUTPUT"
+
+          STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
+          echo "Observability prerequisite state: ${STATE}"
+          echo "state=${STATE}" >> "$GITHUB_OUTPUT"
+
+          if [ "$STATE" = "BROKEN" ]; then
+            echo "FAIL: Observability prerequisite state is BROKEN. This is not auto-repaired here -- investigate the diagnostics above and repair observability (or run 40 | SUB | Observability -- .github/workflows/40-sub-observability.yaml -- standalone) before re-running."
+            exit 1
+          fi
+
+  platform_sync_once:
+    name: Reconcile the GoldenGate platform chart (only when currently absent)
+
+    # Runs the reusable specialist workflow synchronously as part of this DAG -- never an asynchronous CLI/API dispatch or repository_dispatch trigger. Skipped entirely (not run) whenever the platform is already HEALTHY or preflight found it BROKEN -- MAIN is prerequisite orchestration, not a general upgrade engine; an engineer who intentionally wants to upgrade/reconcile an already-existing platform runs 30-sub-platform.yaml standalone.
+    needs:
+      - validate_model
+      - platform_preflight
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.platform_preflight.result == 'success' && needs.platform_preflight.outputs.state == 'ABSENT' }}
+
     uses: ./.github/workflows/30-sub-platform.yaml
     with:
       environment: ${{ needs.validate_model.outputs.selected_environment }}
       deploy: true
+
+  observability_sync_once:
+    name: Reconcile Observability (only when currently absent)
+
+    # Runs the reusable specialist workflow synchronously as part of this DAG -- never an asynchronous CLI/API dispatch or repository_dispatch trigger. Skipped entirely (not run) whenever Observability is already HEALTHY or preflight found it BROKEN -- same ABSENT-only reconciliation boundary as platform_sync_once.
+    needs:
+      - validate_model
+      - observability_preflight
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.observability_preflight.result == 'success' && needs.observability_preflight.outputs.state == 'ABSENT' }}
+
+    uses: ./.github/workflows/40-sub-observability.yaml
+    with:
+      environment: ${{ needs.validate_model.outputs.selected_environment }}
+      deploy: true
+
+  validate_platform_ready:
+    name: Validate GoldenGate Platform is healthy (convergence point for the already-healthy and just-reconciled paths)
+
+    # always() overrides GitHub's default implicit skip-on-skipped-dependency behavior (platform_sync_once is legitimately skipped on the already-HEALTHY path) -- the explicit result/state checks below are what actually keep this fail-closed, exactly like validate_argocd_ready's established always()-plus-explicit-result pattern above.
+    needs:
+      - validate_model
+      - platform_preflight
+      - platform_sync_once
+    if: ${{ always() && needs.validate_model.outputs.effective_deploy == 'true' && needs.platform_preflight.result == 'success' && (needs.platform_preflight.outputs.state == 'HEALTHY' || (needs.platform_preflight.outputs.state == 'ABSENT' && needs.platform_sync_once.result == 'success')) }}
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Load resolved environment config
+        shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
+
+      - name: Install kubectl if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking/installing kubectl..."
+
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KUBECTL_VERSION="v1.35.0"
+
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64)
+                KUBECTL_ARCH="amd64"
+                ;;
+              aarch64|arm64)
+                KUBECTL_ARCH="arm64"
+                ;;
+              *)
+                echo "Unsupported architecture for kubectl: $ARCH"
+                exit 1
+                ;;
+            esac
+
+            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+            sudo chmod +x /usr/local/bin/kubectl
+          fi
+
+          kubectl version --client=true
+
+      - name: Connect to EKS cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}" \
+            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
+            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
+
+          echo "Current kube context:"
+          kubectl config current-context
+
+      - name: Re-classify and require GoldenGate Platform to be exactly HEALTHY
+        shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+          FLUENT_BIT_IMAGE: ${{ vars.FLUENT_BIT_IMAGE }}
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
+
+          if [ -z "${FLUENT_BIT_IMAGE:-}" ]; then
+            echo "FAIL: the FLUENT_BIT_IMAGE repository variable is not set."
+            exit 1
+          fi
+
+          # Reconciliation success (the reusable workflow job returning) is never assumed to mean healthy -- the same read-only classifier is re-run here and must independently confirm HEALTHY.
+          if ! CLASSIFIER_OUTPUT="$(python3 hack/orchestration/platform_state.py --environment "${GG_SELECTED_ENVIRONMENT}" --fluent-bit-image "${FLUENT_BIT_IMAGE}")"; then
+            echo "FAIL: the GoldenGate Platform classifier could not determine cluster state (inspection error) during post-reconciliation validation."
+            exit 1
+          fi
+
+          echo "$CLASSIFIER_OUTPUT"
+
+          STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
+
+          if [ "$STATE" != "HEALTHY" ]; then
+            echo "FAIL: GoldenGate Platform prerequisite state is ${STATE}, expected HEALTHY after preflight/reconciliation. Refusing to proceed."
+            exit 1
+          fi
+
+          echo "OK: GoldenGate Platform prerequisite state is HEALTHY."
+
+  validate_observability_ready:
+    name: Validate Observability is healthy (convergence point for the already-healthy and just-reconciled paths)
+
+    # always() overrides GitHub's default implicit skip-on-skipped-dependency behavior (observability_sync_once is legitimately skipped on the already-HEALTHY path) -- same always()-plus-explicit-result pattern as validate_platform_ready above.
+    needs:
+      - validate_model
+      - observability_preflight
+      - observability_sync_once
+    if: ${{ always() && needs.validate_model.outputs.effective_deploy == 'true' && needs.observability_preflight.result == 'success' && (needs.observability_preflight.outputs.state == 'HEALTHY' || (needs.observability_preflight.outputs.state == 'ABSENT' && needs.observability_sync_once.result == 'success')) }}
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Load resolved environment config
+        shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
+
+      - name: Install kubectl if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking/installing kubectl..."
+
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KUBECTL_VERSION="v1.35.0"
+
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64)
+                KUBECTL_ARCH="amd64"
+                ;;
+              aarch64|arm64)
+                KUBECTL_ARCH="arm64"
+                ;;
+              *)
+                echo "Unsupported architecture for kubectl: $ARCH"
+                exit 1
+                ;;
+            esac
+
+            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+            sudo chmod +x /usr/local/bin/kubectl
+          fi
+
+          kubectl version --client=true
+
+      - name: Connect to EKS cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}" \
+            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
+            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
+
+          echo "Current kube context:"
+          kubectl config current-context
+
+      - name: Re-classify and require Observability to be exactly HEALTHY
+        shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
+
+          # Reconciliation success (the reusable workflow job returning) is never assumed to mean healthy -- the same read-only classifier is re-run here and must independently confirm HEALTHY.
+          if ! CLASSIFIER_OUTPUT="$(python3 hack/orchestration/observability_state.py --environment "${GG_SELECTED_ENVIRONMENT}")"; then
+            echo "FAIL: the Observability classifier could not determine cluster state (inspection error) during post-reconciliation validation."
+            exit 1
+          fi
+
+          echo "$CLASSIFIER_OUTPUT"
+
+          STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
+
+          if [ "$STATE" != "HEALTHY" ]; then
+            echo "FAIL: Observability prerequisite state is ${STATE}, expected HEALTHY after preflight/reconciliation. Refusing to proceed."
+            exit 1
+          fi
+
+          echo "OK: Observability prerequisite state is HEALTHY."
 
   validate_shared_secrets_once:
     name: Validate the three shared GoldenGate secrets exist (read-only, once per environment)
@@ -539,9 +980,10 @@ jobs:
     needs:
       - validate_model
       - terraform_sync_once
-      - platform_sync_once
-    # Runs when terraform/platform were legitimately skipped (deploy=false) -- but for a real deploy (effective_deploy=='true'), "skipped" is NOT success: this job must not run unless terraform_sync_once AND platform_sync_once both actually succeeded, closing the path where an inventory-guard/terraform/platform failure upstream (which makes those jobs skip rather than fail their own dependents) would otherwise let this read-only check -- and everything downstream of it -- proceed anyway.
-    if: ${{ always() && needs.validate_model.result == 'success' && (needs.validate_model.outputs.effective_deploy != 'true' || (needs.terraform_sync_once.result == 'success' && needs.platform_sync_once.result == 'success')) }}
+      - validate_platform_ready
+      - validate_observability_ready
+    # Runs when terraform/platform/observability were legitimately skipped (deploy=false) -- but for a real deploy (effective_deploy=='true'), "skipped" is NOT success: this job must not run unless terraform_sync_once AND validate_platform_ready AND validate_observability_ready all actually succeeded, closing the path where an inventory-guard/terraform/platform/observability failure upstream (which makes those jobs skip rather than fail their own dependents) would otherwise let this read-only check -- and everything downstream of it -- proceed anyway.
+    if: ${{ always() && needs.validate_model.result == 'success' && (needs.validate_model.outputs.effective_deploy != 'true' || (needs.terraform_sync_once.result == 'success' && needs.validate_platform_ready.result == 'success' && needs.validate_observability_ready.result == 'success')) }}
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 

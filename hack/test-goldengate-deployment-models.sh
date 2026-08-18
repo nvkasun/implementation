@@ -1046,8 +1046,15 @@ results = []
 if "workflow_dispatch" not in doc.get(True, doc.get("on", {})) and "workflow_dispatch" not in doc.get("on", {}):
     results.append("not-workflow_dispatch-only")
 on_block = doc.get(True, doc.get("on", {}))
-if set(on_block.keys()) != {"workflow_dispatch"}:
+# Phase B2 made this workflow reusable: workflow_call was added alongside the pre-existing manual workflow_dispatch (never a push trigger, never in place of workflow_dispatch) so MAIN's observability_sync_once can invoke it synchronously.
+if set(on_block.keys()) != {"workflow_dispatch", "workflow_call"}:
     results.append(f"unexpected-trigger-keys={list(on_block.keys())}")
+
+wc_inputs = on_block.get("workflow_call", {}).get("inputs", {})
+if wc_inputs.get("environment", {}).get("type") != "string" or wc_inputs.get("environment", {}).get("required") is not True:
+    results.append(f"workflow_call-environment-input={wc_inputs.get('environment')!r}")
+if wc_inputs.get("deploy", {}).get("type") != "boolean" or wc_inputs.get("deploy", {}).get("required") is not True:
+    results.append(f"workflow_call-deploy-input={wc_inputs.get('deploy')!r}")
 
 deploy_input = on_block.get("workflow_dispatch", {}).get("inputs", {}).get("deploy", {})
 if deploy_input.get("default") is not False:
@@ -5962,18 +5969,35 @@ def needs_of(name):
 if "validate_model" not in needs_of("terraform_sync_once"):
     print("FAIL: terraform_sync_once does not need validate_model")
     sys.exit(1)
-# Phase B1 inserts the Argo CD prerequisite state machine between Terraform and the platform chart: terraform_sync_once -> argocd_preflight -> (bootstrap_argocd) -> validate_argocd_ready -> platform_sync_once. platform_sync_once depends on validate_argocd_ready directly and on terraform_sync_once transitively, not as a direct edge anymore -- guarded in full by the dedicated "Phase B1" DAG checks elsewhere in this suite.
+# Phase B1 inserts the Argo CD prerequisite state machine between Terraform and the platform chart: terraform_sync_once -> argocd_preflight -> (bootstrap_argocd) -> validate_argocd_ready. Phase B2 then inserts the same ownership-aware state machine, independently in parallel, for GoldenGate Platform and Observability: validate_argocd_ready -> (platform_preflight | observability_preflight) -> (platform_sync_once | observability_sync_once) -> (validate_platform_ready | validate_observability_ready) -> validate_shared_secrets_once. platform_sync_once/validate_shared_secrets_once no longer depend on validate_argocd_ready/platform_sync_once directly (only transitively) -- guarded in full by the dedicated "Phase B1"/"Phase B2" DAG checks elsewhere in this suite.
 if "terraform_sync_once" not in needs_of("argocd_preflight"):
     print("FAIL: argocd_preflight does not need terraform_sync_once")
     sys.exit(1)
 if "argocd_preflight" not in needs_of("validate_argocd_ready"):
     print("FAIL: validate_argocd_ready does not need argocd_preflight")
     sys.exit(1)
-if "validate_argocd_ready" not in needs_of("platform_sync_once"):
-    print("FAIL: platform_sync_once does not need validate_argocd_ready")
+if "validate_argocd_ready" not in needs_of("platform_preflight"):
+    print("FAIL: platform_preflight does not need validate_argocd_ready")
     sys.exit(1)
-if "terraform_sync_once" not in needs_of("validate_shared_secrets_once") or "platform_sync_once" not in needs_of("validate_shared_secrets_once"):
-    print("FAIL: validate_shared_secrets_once does not need both terraform_sync_once and platform_sync_once")
+if "platform_preflight" not in needs_of("platform_sync_once"):
+    print("FAIL: platform_sync_once does not need platform_preflight")
+    sys.exit(1)
+if "validate_argocd_ready" not in needs_of("observability_preflight"):
+    print("FAIL: observability_preflight does not need validate_argocd_ready")
+    sys.exit(1)
+if "observability_preflight" not in needs_of("observability_sync_once"):
+    print("FAIL: observability_sync_once does not need observability_preflight")
+    sys.exit(1)
+if "platform_preflight" not in needs_of("validate_platform_ready") or "platform_sync_once" not in needs_of("validate_platform_ready"):
+    print("FAIL: validate_platform_ready does not need both platform_preflight and platform_sync_once")
+    sys.exit(1)
+if "observability_preflight" not in needs_of("validate_observability_ready") or "observability_sync_once" not in needs_of("validate_observability_ready"):
+    print("FAIL: validate_observability_ready does not need both observability_preflight and observability_sync_once")
+    sys.exit(1)
+if ("terraform_sync_once" not in needs_of("validate_shared_secrets_once")
+        or "validate_platform_ready" not in needs_of("validate_shared_secrets_once")
+        or "validate_observability_ready" not in needs_of("validate_shared_secrets_once")):
+    print("FAIL: validate_shared_secrets_once does not need terraform_sync_once, validate_platform_ready, and validate_observability_ready")
     sys.exit(1)
 if "validate_shared_secrets_once" not in needs_of("build_publish_and_deploy"):
     print("FAIL: build_publish_and_deploy does not need validate_shared_secrets_once")
@@ -5985,7 +6009,7 @@ if "monitor_sync_once" not in needs_of("final_validation"):
     print("FAIL: final_validation does not need monitor_sync_once")
     sys.exit(1)
 
-for name in ("terraform_sync_once", "platform_sync_once", "monitor_sync_once"):
+for name in ("terraform_sync_once", "platform_sync_once", "observability_sync_once", "monitor_sync_once"):
     if not str(jobs[name].get("uses", "")).startswith("./.github/workflows/"):
         print(f"FAIL: {name} does not call a reusable workflow via a job-level uses:")
         sys.exit(1)
@@ -6205,8 +6229,8 @@ else
   pass "29: GoldenGateSecretsReadRole-dev grants no DynamoDB write or CloudWatch PutMetricData permission"
 fi
 
-if grep -qF "needs.validate_model.outputs.effective_deploy != 'true' || (needs.terraform_sync_once.result == 'success' && needs.platform_sync_once.result == 'success')" "$EKS_APP_WORKFLOW" 2>/dev/null; then
-  pass "29: the read-only validation chain (validate_shared_secrets_once) is deploy-aware and fail-closed -- it tolerates a legitimately skipped terraform/platform sync only when deploy=false, and requires their exact success when deploy=true"
+if grep -qF "needs.validate_model.outputs.effective_deploy != 'true' || (needs.terraform_sync_once.result == 'success' && needs.validate_platform_ready.result == 'success' && needs.validate_observability_ready.result == 'success')" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "29: the read-only validation chain (validate_shared_secrets_once) is deploy-aware and fail-closed -- it tolerates a legitimately skipped terraform/platform/observability convergence only when deploy=false, and requires their exact success when deploy=true"
 else
   fail "29: validate_shared_secrets_once no longer contains the required deploy-aware fail-closed condition"
 fi
@@ -7788,8 +7812,8 @@ def eval_gha_bool(expr, needs):
     return bool(_Parser(expr, needs).parse())
 
 
-# Phase B1 inserts the Argo CD prerequisite state machine between Terraform and the platform chart -- simulated in real DAG order like every other job here, off the same real if: expressions.
-JOB_ORDER = ["terraform_sync_once", "argocd_preflight", "bootstrap_argocd", "validate_argocd_ready", "platform_sync_once", "validate_shared_secrets_once", "build_publish_and_deploy"]
+# Phase B1 inserts the Argo CD prerequisite state machine between Terraform and the platform chart; Phase B2 inserts the same ownership-aware state machine, independently in parallel, for the GoldenGate Platform and Observability application prerequisites between validate_argocd_ready and validate_shared_secrets_once -- simulated in real DAG order like every other job here, off the same real if: expressions.
+JOB_ORDER = ["terraform_sync_once", "argocd_preflight", "bootstrap_argocd", "validate_argocd_ready", "platform_preflight", "observability_preflight", "platform_sync_once", "observability_sync_once", "validate_platform_ready", "validate_observability_ready", "validate_shared_secrets_once", "build_publish_and_deploy"]
 IF_EXPRS = {job: _extract_if(job) for job in JOB_ORDER}
 
 
@@ -7846,30 +7870,38 @@ check("2: platform_sync_once must be skipped", r["platform_sync_once"]["result"]
 check("2: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
 check("2: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
 
-# 3: deploy=true + Argo CD already HEALTHY (bootstrap correctly skipped) + platform failure -> runtime build/deploy cannot execute.
+# 3: deploy=true + Argo CD already HEALTHY (bootstrap correctly skipped) + platform ABSENT+reconcile failure (observability stays HEALTHY, isolating the failure to platform) -> runtime build/deploy cannot execute.
 ctx = base_context("true")
-r = simulate(ctx, {"platform_sync_once": "failure"}, {"argocd_preflight": {"state": "HEALTHY"}})
+r = simulate(ctx, {"platform_sync_once": "failure"}, {"argocd_preflight": {"state": "HEALTHY"}, "platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "HEALTHY"}})
 check("3: bootstrap_argocd must be skipped when Argo CD is already HEALTHY", r["bootstrap_argocd"]["result"] == "skipped")
 check("3: validate_argocd_ready must succeed on the already-HEALTHY path", r["validate_argocd_ready"]["result"] == "success")
 check("3: platform_sync_once must report failure", r["platform_sync_once"]["result"] == "failure")
+check("3: validate_platform_ready must be skipped after a failed platform_sync_once", r["validate_platform_ready"]["result"] == "skipped")
+check("3: observability_sync_once must be skipped (observability is already HEALTHY)", r["observability_sync_once"]["result"] == "skipped")
+check("3: validate_observability_ready must still succeed (independent of platform's failure)", r["validate_observability_ready"]["result"] == "success")
 check("3: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
 check("3: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
 
-# 4: deploy=true + all mutation prerequisites success (including Argo CD already HEALTHY) -> runtime deployment may execute.
+# 4: deploy=true + all mutation prerequisites success (Argo CD/platform/observability all already HEALTHY) -> runtime deployment may execute.
 ctx = base_context("true")
-r = simulate(ctx, {}, {"argocd_preflight": {"state": "HEALTHY"}})
+r = simulate(ctx, {}, {"argocd_preflight": {"state": "HEALTHY"}, "platform_preflight": {"state": "HEALTHY"}, "observability_preflight": {"state": "HEALTHY"}})
 check("4: terraform_sync_once must succeed", r["terraform_sync_once"]["result"] == "success")
 check("4: validate_argocd_ready must succeed", r["validate_argocd_ready"]["result"] == "success")
-check("4: platform_sync_once must succeed", r["platform_sync_once"]["result"] == "success")
+check("4: platform_sync_once must be skipped (already HEALTHY, never reconciled)", r["platform_sync_once"]["result"] == "skipped")
+check("4: observability_sync_once must be skipped (already HEALTHY, never reconciled)", r["observability_sync_once"]["result"] == "skipped")
+check("4: validate_platform_ready must succeed", r["validate_platform_ready"]["result"] == "success")
+check("4: validate_observability_ready must succeed", r["validate_observability_ready"]["result"] == "success")
 check("4: validate_shared_secrets_once must succeed", r["validate_shared_secrets_once"]["result"] == "success")
 check("4: build_publish_and_deploy must be eligible to run", r["build_publish_and_deploy"]["result"] == "success")
 
-# 7: deploy=true + Argo CD ABSENT + bootstrap succeeds -> validate_argocd_ready converges to success -> platform proceeds.
+# 7: deploy=true + Argo CD ABSENT + bootstrap succeeds -> validate_argocd_ready converges to success -> platform/observability preflights run; platform ABSENT+reconcile success, observability already HEALTHY.
 ctx = base_context("true")
-r = simulate(ctx, {}, {"argocd_preflight": {"state": "ABSENT"}})
+r = simulate(ctx, {}, {"argocd_preflight": {"state": "ABSENT"}, "platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "HEALTHY"}})
 check("7: bootstrap_argocd must run when Argo CD is ABSENT", r["bootstrap_argocd"]["result"] == "success")
 check("7: validate_argocd_ready must succeed after a successful bootstrap", r["validate_argocd_ready"]["result"] == "success")
-check("7: platform_sync_once must be eligible to run after bootstrap", r["platform_sync_once"]["result"] == "success")
+check("7: platform_sync_once must be eligible to run after bootstrap (platform is ABSENT)", r["platform_sync_once"]["result"] == "success")
+check("7: validate_platform_ready must succeed after a successful reconciliation", r["validate_platform_ready"]["result"] == "success")
+check("7: validate_shared_secrets_once must succeed end-to-end", r["validate_shared_secrets_once"]["result"] == "success")
 
 # 8: deploy=true + Argo CD ABSENT + bootstrap FAILS -> validate_argocd_ready must never run -> platform must never run.
 ctx = base_context("true")
@@ -9372,11 +9404,14 @@ results.append(("10a: validate_argocd_ready allows the already-HEALTHY (bootstra
 results.append(("10b: validate_argocd_ready allows the ABSENT-then-successfully-bootstrapped path", "argocd_preflight.outputs.state == \x27ABSENT\x27" in ready_if and "needs.bootstrap_argocd.result == \x27success\x27" in ready_if))
 results.append(("10c: validate_argocd_ready uses always() to survive bootstrap_argocd legitimately being skipped", "always()" in ready_if))
 
+# Phase B2 inserts platform_preflight between validate_argocd_ready and platform_sync_once (see the dedicated "Phase B2" DAG checks elsewhere in this suite) -- platform_sync_once now depends on validate_argocd_ready transitively via platform_preflight, never as a direct edge.
+platform_preflight_b1 = jobs.get("platform_preflight", {})
 platform = jobs.get("platform_sync_once", {})
 platform_needs = platform.get("needs") or []
 platform_if = platform.get("if", "")
-results.append(("11: platform_sync_once needs validate_argocd_ready", "validate_argocd_ready" in platform_needs))
-results.append(("12: platform_sync_once requires validate_argocd_ready to have actually succeeded (BROKEN/failed Argo can never reach platform)", "needs.validate_argocd_ready.result == \x27success\x27" in platform_if))
+results.append(("11: platform_preflight (and therefore platform_sync_once transitively) needs validate_argocd_ready", "validate_argocd_ready" in (platform_preflight_b1.get("needs") or [])))
+results.append(("12: platform_preflight requires validate_argocd_ready to have actually succeeded (BROKEN/failed Argo can never reach platform)", "needs.validate_argocd_ready.result == \x27success\x27" in platform_preflight_b1.get("if", "")))
+results.append(("12b: platform_sync_once needs platform_preflight (the actual direct edge in the new B2 chain)", "platform_preflight" in platform_needs))
 
 results.append(("13: bootstrap_argocd still gates on effective_deploy == \x27true\x27 -- dry-run can never bootstrap Argo", "effective_deploy == \x27true\x27" in bootstrap_if))
 
@@ -9426,6 +9461,420 @@ if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f hack/test-goldengate-argocd-state.py
   fi
 else
   skip "Phase B1: hack/test-goldengate-argocd-state.py -- python3 unavailable or file missing"
+fi
+
+echo ""
+echo "--- Phase B2: GoldenGate Platform + Observability prerequisite classification/conditional reconciliation ---"
+
+# hack/orchestration/platform_state.py and observability_state.py must never construct a mutating kubectl/helm command -- read directly from source, never from the test's own constants. Mirrors the Phase B1 check immediately above for argocd_state.py, plus the shared k8s_common.py helper both new classifiers depend on.
+for B2_TOOL in hack/orchestration/platform_state.py hack/orchestration/observability_state.py hack/orchestration/k8s_common.py; do
+  if [ -f "$B2_TOOL" ]; then
+    B2_MUTATING_HITS="$(grep -nE 'kubectl apply|kubectl create|kubectl delete|kubectl patch|kubectl annotate|kubectl label|helm install|helm upgrade|helm uninstall|"apply"|'"'"'apply'"'"'|"create"|'"'"'create'"'"'|"delete"|'"'"'delete'"'"'|"patch"|'"'"'patch'"'"'|"annotate"|'"'"'annotate'"'"'|"label"|'"'"'label'"'"'' "$B2_TOOL" 2>/dev/null || true)"
+    if [ -z "$B2_MUTATING_HITS" ]; then
+      pass "Phase B2: ${B2_TOOL} contains no mutating kubectl/helm command construction -- read-only classifier confirmed"
+    else
+      fail "Phase B2: ${B2_TOOL} appears to contain a mutating command construct:"$'\n'"${B2_MUTATING_HITS}"
+    fi
+  else
+    fail "Phase B2: ${B2_TOOL} is missing"
+  fi
+done
+
+# Both classifiers' own dedicated offline unit-test suites are part of the normal regression run, not merely available separately.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f hack/test-goldengate-platform-state.py ]; then
+  if PLATFORM_STATE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 hack/test-goldengate-platform-state.py 2>&1)"; then
+    pass "Phase B2: hack/test-goldengate-platform-state.py (the GoldenGate Platform classifier's offline ABSENT/HEALTHY/BROKEN test suite) passes"
+  else
+    fail "Phase B2: hack/test-goldengate-platform-state.py failed:"$'\n'"${PLATFORM_STATE_TEST_OUTPUT}"
+  fi
+else
+  skip "Phase B2: hack/test-goldengate-platform-state.py -- python3 unavailable or file missing"
+fi
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f hack/test-goldengate-observability-state.py ]; then
+  if OBSERVABILITY_STATE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 hack/test-goldengate-observability-state.py 2>&1)"; then
+    pass "Phase B2: hack/test-goldengate-observability-state.py (the Observability classifier's offline ABSENT/HEALTHY/BROKEN test suite) passes"
+  else
+    fail "Phase B2: hack/test-goldengate-observability-state.py failed:"$'\n'"${OBSERVABILITY_STATE_TEST_OUTPUT}"
+  fi
+else
+  skip "Phase B2: hack/test-goldengate-observability-state.py -- python3 unavailable or file missing"
+fi
+
+# Structural proof, read directly from the real committed YAML (never a reimplementation): 40-sub-observability.yaml's workflow_call contract, MAIN's platform_preflight/observability_preflight/platform_sync_once/observability_sync_once/validate_platform_ready/validate_observability_ready DAG wiring, and the cross-file CHART_VERSION constant this classifier is tightly tested against.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$OBSERVABILITY_WORKFLOW" ]; then
+  PHASE_B2_STRUCTURAL_CHECK="$(python3 -c '
+import re
+import yaml
+
+with open("'"$EKS_APP_WORKFLOW"'") as f:
+    main_doc = yaml.safe_load(f)
+with open("'"$OBSERVABILITY_WORKFLOW"'") as f:
+    observability_doc = yaml.safe_load(f)
+
+results = []
+
+observability_on = observability_doc.get(True, observability_doc.get("on", {}))
+results.append(("1: 40-sub-observability.yaml now supports workflow_call", "workflow_call" in observability_on))
+wc_inputs = (observability_on.get("workflow_call") or {}).get("inputs", {}) or {}
+env_input = wc_inputs.get("environment", {})
+deploy_input = wc_inputs.get("deploy", {})
+results.append(("2a: workflow_call accepts a required, canonical string environment input", env_input.get("required") is True and env_input.get("type") == "string"))
+results.append(("2b: workflow_call accepts a required Boolean deploy input", deploy_input.get("required") is True and deploy_input.get("type") == "boolean"))
+dispatch_deploy_default = ((observability_on.get("workflow_dispatch") or {}).get("inputs", {}).get("deploy", {}) or {}).get("default")
+results.append(("18: manual workflow_dispatch deploy default is unchanged (still false)", dispatch_deploy_default is False))
+
+jobs = main_doc["jobs"]
+results.append(("3a: MAIN defines platform_preflight", "platform_preflight" in jobs))
+results.append(("3b: MAIN defines observability_preflight", "observability_preflight" in jobs))
+
+platform_preflight = jobs.get("platform_preflight", {})
+observability_preflight = jobs.get("observability_preflight", {})
+platform_preflight_needs = platform_preflight.get("needs") or []
+observability_preflight_needs = observability_preflight.get("needs") or []
+platform_preflight_if = platform_preflight.get("if", "")
+observability_preflight_if = observability_preflight.get("if", "")
+
+results.append(("4a: platform_preflight depends on validate_argocd_ready", "validate_argocd_ready" in platform_preflight_needs))
+results.append(("4b: observability_preflight depends on validate_argocd_ready", "validate_argocd_ready" in observability_preflight_needs))
+results.append(("5a: platform_preflight is real-deploy-only (effective_deploy == \x27true\x27)", "effective_deploy" in platform_preflight_if and "== \x27true\x27" in platform_preflight_if))
+results.append(("5b: observability_preflight is real-deploy-only (effective_deploy == \x27true\x27)", "effective_deploy" in observability_preflight_if and "== \x27true\x27" in observability_preflight_if))
+
+results.append(("6a: platform_preflight does not depend on observability_preflight", "observability_preflight" not in platform_preflight_needs))
+results.append(("6b: observability_preflight does not depend on platform_preflight", "platform_preflight" not in observability_preflight_needs))
+results.append(("6c: platform_preflight if: does not reference observability_preflight", "observability_preflight" not in platform_preflight_if))
+results.append(("6d: observability_preflight if: does not reference platform_preflight", "platform_preflight" not in observability_preflight_if))
+
+platform_sync_once = jobs.get("platform_sync_once", {})
+platform_sync_once_needs = platform_sync_once.get("needs") or []
+platform_sync_once_if = platform_sync_once.get("if", "")
+results.append(("7a: platform_sync_once needs platform_preflight", "platform_preflight" in platform_sync_once_needs))
+results.append(("7b: platform_sync_once runs only when platform_preflight.outputs.state == ABSENT", "platform_preflight.outputs.state == \x27ABSENT\x27" in platform_sync_once_if))
+results.append(("8a: platform_sync_once condition contains no HEALTHY branch -- HEALTHY can never re-trigger reconciliation", "HEALTHY" not in platform_sync_once_if))
+results.append(("8b: platform_sync_once condition contains no BROKEN branch -- BROKEN can never enter reconciliation", "BROKEN" not in platform_sync_once_if))
+results.append(("8c: platform_sync_once requires platform_preflight to have actually succeeded first", "platform_preflight.result == \x27success\x27" in platform_sync_once_if))
+results.append(("10: platform_sync_once calls the reusable 30-sub-platform.yaml (never gh workflow run)", platform_sync_once.get("uses") == "./.github/workflows/30-sub-platform.yaml"))
+
+results.append(("9: MAIN defines observability_sync_once", "observability_sync_once" in jobs))
+observability_sync_once = jobs.get("observability_sync_once", {})
+observability_sync_once_needs = observability_sync_once.get("needs") or []
+observability_sync_once_if = observability_sync_once.get("if", "")
+results.append(("10b: observability_sync_once calls the reusable 40-sub-observability.yaml (never gh workflow run)", observability_sync_once.get("uses") == "./.github/workflows/40-sub-observability.yaml"))
+results.append(("11: observability_sync_once needs observability_preflight", "observability_preflight" in observability_sync_once_needs))
+results.append(("11b: observability_sync_once runs only when observability_preflight.outputs.state == ABSENT", "observability_preflight.outputs.state == \x27ABSENT\x27" in observability_sync_once_if))
+results.append(("12a: observability_sync_once condition contains no HEALTHY branch", "HEALTHY" not in observability_sync_once_if))
+results.append(("12b: observability_sync_once condition contains no BROKEN branch -- BROKEN can never enter reconciliation", "BROKEN" not in observability_sync_once_if))
+
+results.append(("13a: MAIN defines validate_platform_ready", "validate_platform_ready" in jobs))
+results.append(("13b: MAIN defines validate_observability_ready", "validate_observability_ready" in jobs))
+validate_platform_ready = jobs.get("validate_platform_ready", {})
+validate_observability_ready = jobs.get("validate_observability_ready", {})
+validate_platform_ready_if = validate_platform_ready.get("if", "")
+validate_observability_ready_if = validate_observability_ready.get("if", "")
+results.append(("14a: validate_platform_ready allows the already-HEALTHY (sync-skip) path", "platform_preflight.outputs.state == \x27HEALTHY\x27" in validate_platform_ready_if))
+results.append(("15a: validate_platform_ready allows the ABSENT-then-successfully-reconciled path", "platform_preflight.outputs.state == \x27ABSENT\x27" in validate_platform_ready_if and "platform_sync_once.result == \x27success\x27" in validate_platform_ready_if))
+results.append(("14b: validate_observability_ready allows the already-HEALTHY (sync-skip) path", "observability_preflight.outputs.state == \x27HEALTHY\x27" in validate_observability_ready_if))
+results.append(("15b: validate_observability_ready allows the ABSENT-then-successfully-reconciled path", "observability_preflight.outputs.state == \x27ABSENT\x27" in validate_observability_ready_if and "observability_sync_once.result == \x27success\x27" in validate_observability_ready_if))
+results.append(("validate_platform_ready uses always() to survive platform_sync_once legitimately being skipped", "always()" in validate_platform_ready_if))
+results.append(("validate_observability_ready uses always() to survive observability_sync_once legitimately being skipped", "always()" in validate_observability_ready_if))
+
+shared_secrets = jobs.get("validate_shared_secrets_once", {})
+shared_secrets_needs = shared_secrets.get("needs") or []
+shared_secrets_if = shared_secrets.get("if", "")
+results.append(("19a: validate_shared_secrets_once needs validate_platform_ready", "validate_platform_ready" in shared_secrets_needs))
+results.append(("19b: validate_shared_secrets_once needs validate_observability_ready", "validate_observability_ready" in shared_secrets_needs))
+results.append(("19c: validate_shared_secrets_once requires validate_platform_ready.result == success on a real deploy", "validate_platform_ready.result == \x27success\x27" in shared_secrets_if))
+results.append(("19d: validate_shared_secrets_once requires validate_observability_ready.result == success on a real deploy", "validate_observability_ready.result == \x27success\x27" in shared_secrets_if))
+results.append(("20: validate_shared_secrets_once still bypasses the B2 readiness requirement on dry-run (effective_deploy != \x27true\x27)", "effective_deploy != \x27true\x27" in shared_secrets_if))
+
+whole_text = str(main_doc) + str(observability_doc)
+results.append(("21: no gh workflow run / workflow_dispatch-API / repository_dispatch trigger exists anywhere in either workflow", "gh workflow run" not in whole_text and "repository_dispatch" not in whole_text and "/dispatches" not in whole_text))
+
+# 22: MAIN still does not activate GoldenGate runtimes -- B2 introduces no lifecycle/replication/Extract/Replicat/Distribution mutation; those job bodies are read-only classification/reconciliation-trigger only.
+b2_job_text = str(platform_preflight) + str(observability_preflight) + str(platform_sync_once) + str(observability_sync_once) + str(validate_platform_ready) + str(validate_observability_ready)
+results.append(("22: none of the new B2 jobs reference GoldenGate runtime activation constructs (lifecycle.state, replication.enabled, Extract/Replicat/Distribution creation)", not any(s in b2_job_text for s in ("lifecycle.state", "replication.enabled", "createExtract", "createReplicat", "createDistribution"))))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+' 2>&1)"
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL\ *) fail "Phase B2: ${line#FAIL }" ;;
+      OK\ *) pass "Phase B2: ${line#OK }" ;;
+    esac
+  done <<< "$PHASE_B2_STRUCTURAL_CHECK"
+else
+  skip "Phase B2: structural DAG/workflow_call checks -- python3/PyYAML unavailable or a required workflow file is missing"
+fi
+
+# CHART_VERSION cross-file consistency: observability_state.py checks Application source.targetRevision against its own CHART_VERSION constant; that constant must stay equal to 40-sub-observability.yaml's own CHART_VERSION env literal, or the classifier would silently diverge from what is actually deployed.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f hack/orchestration/observability_state.py ]; then
+  WORKFLOW_CHART_VERSION="$(grep -E '^\s*CHART_VERSION:' "$OBSERVABILITY_WORKFLOW" | head -1 | sed -E 's/.*CHART_VERSION:\s*"([^"]+)".*/\1/')"
+  CLASSIFIER_CHART_VERSION="$(python3 -c 'import re; print(re.search(r"^CHART_VERSION = \"([^\"]+)\"", open("hack/orchestration/observability_state.py").read(), re.M).group(1))')"
+  if [ -n "$WORKFLOW_CHART_VERSION" ] && [ "$WORKFLOW_CHART_VERSION" = "$CLASSIFIER_CHART_VERSION" ]; then
+    pass "Phase B2: observability_state.py's CHART_VERSION ('${CLASSIFIER_CHART_VERSION}') matches 40-sub-observability.yaml's own CHART_VERSION env literal exactly"
+  else
+    fail "Phase B2: CHART_VERSION drift -- workflow='${WORKFLOW_CHART_VERSION}' classifier='${CLASSIFIER_CHART_VERSION}'"
+  fi
+else
+  skip "Phase B2: CHART_VERSION cross-file consistency -- python3 unavailable or observability_state.py missing"
+fi
+
+# DAG simulation: the four-scenario matrix (HEALTHY/ABSENT+success/ABSENT+failure/BROKEN) for platform and observability independently, plus cross-component convergence -- exercised against the real if: expressions, never a text/regex match against the workflow author's own wording.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  set +e
+  PHASE_B2_SIM_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import re
+import sys
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+
+jobs = doc["jobs"]
+
+
+def _extract_if(job_name):
+    raw = jobs[job_name].get("if", "true")
+    raw = str(raw).strip()
+    if raw.startswith("${{") and raw.endswith("}}"):
+        raw = raw[3:-2].strip()
+    return raw
+
+
+class _Parser:
+    """A tiny, bespoke evaluator for exactly the GHA expression subset this workflow uses: && || == != () quoted strings, needs.<job>.result, needs.<job>.outputs.<name>, always(). Not a general GHA expression engine -- just enough to genuinely simulate these job conditions against a fabricated needs context, rather than trusting a text/regex match against the workflow author's own wording."""
+
+    def __init__(self, expr, needs):
+        self.expr = expr
+        self.needs = needs
+        self.pos = 0
+
+    def _skip_ws(self):
+        while self.pos < len(self.expr) and self.expr[self.pos].isspace():
+            self.pos += 1
+
+    def parse(self):
+        result = self._or()
+        self._skip_ws()
+        if self.pos != len(self.expr):
+            raise ValueError(f"trailing content: {self.expr[self.pos:]!r}")
+        return result
+
+    def _or(self):
+        left = self._and()
+        self._skip_ws()
+        while self.expr[self.pos:self.pos + 2] == "||":
+            self.pos += 2
+            right = self._and()
+            left = left or right
+            self._skip_ws()
+        return left
+
+    def _and(self):
+        left = self._atom()
+        self._skip_ws()
+        while self.expr[self.pos:self.pos + 2] == "&&":
+            self.pos += 2
+            right = self._atom()
+            left = left and right
+            self._skip_ws()
+        return left
+
+    def _atom(self):
+        self._skip_ws()
+        if self.expr[self.pos] == "(":
+            self.pos += 1
+            val = self._or()
+            self._skip_ws()
+            assert self.expr[self.pos] == ")"
+            self.pos += 1
+            return val
+        if self.expr[self.pos:self.pos + 8] == "always()":
+            self.pos += 8
+            return True
+        left_val = self._value()
+        self._skip_ws()
+        op = self.expr[self.pos:self.pos + 2]
+        if op in ("==", "!="):
+            self.pos += 2
+            right_val = self._value()
+            return left_val == right_val if op == "==" else left_val != right_val
+        return bool(left_val)
+
+    def _value(self):
+        self._skip_ws()
+        if self.expr[self.pos] == "'":
+            self.pos += 1
+            start = self.pos
+            while self.expr[self.pos] != "'":
+                self.pos += 1
+            val = self.expr[start:self.pos]
+            self.pos += 1
+            return val
+        m = re.match(r"needs\.([A-Za-z0-9_]+)\.result", self.expr[self.pos:])
+        if m:
+            self.pos += m.end()
+            return self.needs.get(m.group(1), {}).get("result", "")
+        m = re.match(r"needs\.([A-Za-z0-9_]+)\.outputs\.([A-Za-z0-9_]+)", self.expr[self.pos:])
+        if m:
+            self.pos += m.end()
+            return self.needs.get(m.group(1), {}).get("outputs", {}).get(m.group(2), "")
+        raise ValueError(f"cannot parse value at: {self.expr[self.pos:self.pos + 40]!r}")
+
+
+def eval_gha_bool(expr, needs):
+    return bool(_Parser(expr, needs).parse())
+
+
+JOB_ORDER = ["platform_preflight", "observability_preflight", "platform_sync_once", "observability_sync_once", "validate_platform_ready", "validate_observability_ready", "validate_shared_secrets_once", "build_publish_and_deploy"]
+IF_EXPRS = {job: _extract_if(job) for job in JOB_ORDER}
+
+
+def simulate(initial, outcome_when_run, outputs_when_run=None):
+    results = dict(initial)
+    outputs_when_run = outputs_when_run or {}
+    for job in JOB_ORDER:
+        would_run = eval_gha_bool(IF_EXPRS[job], results)
+        if would_run:
+            results[job] = {"result": outcome_when_run.get(job, "success"), "outputs": outputs_when_run.get(job, {})}
+        else:
+            results[job] = {"result": "skipped", "outputs": {}}
+    return results
+
+
+def base_context():
+    # Represents "everything upstream of platform_preflight/observability_preflight already succeeded, Argo already validated ready, and a real change was detected" -- effective_deploy='true' throughout, matching a real deploy. detect_changed_deployments is fixed success/has_changes=true here since build_publish_and_deploy's own if: independently requires it -- this simulation is scoped to the B2 platform/observability chain, not a re-test of that upstream detection logic (already covered elsewhere in this suite).
+    return {
+        "validate_model": {"result": "success", "outputs": {"effective_deploy": "true"}},
+        "terraform_sync_once": {"result": "success", "outputs": {}},
+        "validate_argocd_ready": {"result": "success", "outputs": {}},
+        "detect_changed_deployments": {"result": "success", "outputs": {"has_changes": "true"}},
+    }
+
+
+failures = []
+
+
+def check(label, condition):
+    if not condition:
+        failures.append(label)
+
+
+# --- Platform: HEALTHY / ABSENT+success / ABSENT+failure / BROKEN (observability held HEALTHY throughout to isolate platform's own effect) ---
+ctx = base_context()
+r = simulate(ctx, {}, {"platform_preflight": {"state": "HEALTHY"}, "observability_preflight": {"state": "HEALTHY"}})
+check("platform HEALTHY: platform_sync_once must be skipped", r["platform_sync_once"]["result"] == "skipped")
+check("platform HEALTHY: validate_platform_ready must succeed", r["validate_platform_ready"]["result"] == "success")
+check("platform HEALTHY: validate_shared_secrets_once must succeed", r["validate_shared_secrets_once"]["result"] == "success")
+
+ctx = base_context()
+r = simulate(ctx, {}, {"platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "HEALTHY"}})
+check("platform ABSENT+sync success: platform_sync_once must succeed", r["platform_sync_once"]["result"] == "success")
+check("platform ABSENT+sync success: validate_platform_ready must succeed", r["validate_platform_ready"]["result"] == "success")
+check("platform ABSENT+sync success: validate_shared_secrets_once must succeed", r["validate_shared_secrets_once"]["result"] == "success")
+
+ctx = base_context()
+r = simulate(ctx, {"platform_sync_once": "failure"}, {"platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "HEALTHY"}})
+check("platform ABSENT+sync failure: platform_sync_once must report failure", r["platform_sync_once"]["result"] == "failure")
+check("platform ABSENT+sync failure: validate_platform_ready must not proceed (skipped)", r["validate_platform_ready"]["result"] == "skipped")
+check("platform ABSENT+sync failure: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
+check("platform ABSENT+sync failure: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
+
+ctx = base_context()
+r = simulate(ctx, {"platform_preflight": "failure"}, {"observability_preflight": {"state": "HEALTHY"}})
+check("platform BROKEN: platform_preflight must report failure", r["platform_preflight"]["result"] == "failure")
+check("platform BROKEN: platform_sync_once must never run", r["platform_sync_once"]["result"] == "skipped")
+check("platform BROKEN: validate_platform_ready must be skipped", r["validate_platform_ready"]["result"] == "skipped")
+check("platform BROKEN: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
+check("platform BROKEN: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
+
+# --- Observability: HEALTHY / ABSENT+success / ABSENT+failure / BROKEN (platform held HEALTHY throughout to isolate observability's own effect) ---
+ctx = base_context()
+r = simulate(ctx, {}, {"platform_preflight": {"state": "HEALTHY"}, "observability_preflight": {"state": "HEALTHY"}})
+check("observability HEALTHY: observability_sync_once must be skipped", r["observability_sync_once"]["result"] == "skipped")
+check("observability HEALTHY: validate_observability_ready must succeed", r["validate_observability_ready"]["result"] == "success")
+check("observability HEALTHY: validate_shared_secrets_once must succeed", r["validate_shared_secrets_once"]["result"] == "success")
+
+ctx = base_context()
+r = simulate(ctx, {}, {"platform_preflight": {"state": "HEALTHY"}, "observability_preflight": {"state": "ABSENT"}})
+check("observability ABSENT+sync success: observability_sync_once must succeed", r["observability_sync_once"]["result"] == "success")
+check("observability ABSENT+sync success: validate_observability_ready must succeed", r["validate_observability_ready"]["result"] == "success")
+check("observability ABSENT+sync success: validate_shared_secrets_once must succeed", r["validate_shared_secrets_once"]["result"] == "success")
+
+ctx = base_context()
+r = simulate(ctx, {"observability_sync_once": "failure"}, {"platform_preflight": {"state": "HEALTHY"}, "observability_preflight": {"state": "ABSENT"}})
+check("observability ABSENT+sync failure: observability_sync_once must report failure", r["observability_sync_once"]["result"] == "failure")
+check("observability ABSENT+sync failure: validate_observability_ready must not proceed (skipped)", r["validate_observability_ready"]["result"] == "skipped")
+check("observability ABSENT+sync failure: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
+check("observability ABSENT+sync failure: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
+
+ctx = base_context()
+r = simulate(ctx, {"observability_preflight": "failure"}, {"platform_preflight": {"state": "HEALTHY"}})
+check("observability BROKEN: observability_preflight must report failure", r["observability_preflight"]["result"] == "failure")
+check("observability BROKEN: observability_sync_once must never run", r["observability_sync_once"]["result"] == "skipped")
+check("observability BROKEN: validate_observability_ready must be skipped", r["validate_observability_ready"]["result"] == "skipped")
+check("observability BROKEN: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
+check("observability BROKEN: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
+
+# --- Cross-component convergence ---
+ctx = base_context()
+r = simulate(ctx, {}, {"platform_preflight": {"state": "HEALTHY"}, "observability_preflight": {"state": "HEALTHY"}})
+check("cross: platform HEALTHY + observability HEALTHY -> shared secrets continues", r["validate_shared_secrets_once"]["result"] == "success" and r["build_publish_and_deploy"]["result"] == "success")
+
+ctx = base_context()
+r = simulate(ctx, {}, {"platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "HEALTHY"}})
+check("cross: platform ABSENT/reconcile success + observability HEALTHY -> continues", r["validate_shared_secrets_once"]["result"] == "success" and r["build_publish_and_deploy"]["result"] == "success")
+
+ctx = base_context()
+r = simulate(ctx, {}, {"platform_preflight": {"state": "HEALTHY"}, "observability_preflight": {"state": "ABSENT"}})
+check("cross: platform HEALTHY + observability ABSENT/reconcile success -> continues", r["validate_shared_secrets_once"]["result"] == "success" and r["build_publish_and_deploy"]["result"] == "success")
+
+ctx = base_context()
+r = simulate(ctx, {"platform_preflight": "failure"}, {"observability_preflight": {"state": "HEALTHY"}})
+check("cross: platform BROKEN + observability HEALTHY -> shared secrets/runtime does not continue", r["validate_shared_secrets_once"]["result"] == "skipped" and r["build_publish_and_deploy"]["result"] == "skipped")
+
+ctx = base_context()
+r = simulate(ctx, {"observability_preflight": "failure"}, {"platform_preflight": {"state": "HEALTHY"}})
+check("cross: platform HEALTHY + observability BROKEN -> shared secrets/runtime does not continue", r["validate_shared_secrets_once"]["result"] == "skipped" and r["build_publish_and_deploy"]["result"] == "skipped")
+
+# --- Dry-run safety: effective_deploy=false must never invoke either B2 SUB workflow ---
+ctx = {
+    "validate_model": {"result": "success", "outputs": {"effective_deploy": "false"}},
+    "terraform_sync_once": {"result": "skipped", "outputs": {}},
+    "validate_argocd_ready": {"result": "skipped", "outputs": {}},
+}
+r = simulate(ctx, {})
+check("dry-run: platform_preflight must be skipped", r["platform_preflight"]["result"] == "skipped")
+check("dry-run: observability_preflight must be skipped", r["observability_preflight"]["result"] == "skipped")
+check("dry-run: platform_sync_once must be skipped (never invokes 30-sub-platform.yaml)", r["platform_sync_once"]["result"] == "skipped")
+check("dry-run: observability_sync_once must be skipped (never invokes 40-sub-observability.yaml)", r["observability_sync_once"]["result"] == "skipped")
+check("dry-run: validate_shared_secrets_once must still succeed via the dry-run bypass", r["validate_shared_secrets_once"]["result"] == "success")
+
+if failures:
+    print("\n".join(failures))
+    sys.exit(1)
+print("OK")
+PYEOF
+)"
+  PHASE_B2_SIM_STATUS=$?
+  set -e
+  if [ "$PHASE_B2_SIM_STATUS" -eq 0 ]; then
+    pass "Phase B2: platform HEALTHY skips reconciliation and reaches validate_shared_secrets_once"
+    pass "Phase B2: platform ABSENT+successful reconciliation reaches validate_shared_secrets_once"
+    pass "Phase B2: platform ABSENT+failed reconciliation blocks validate_platform_ready/validate_shared_secrets_once/build_publish_and_deploy"
+    pass "Phase B2: platform BROKEN fails closed -- reconciliation never runs, downstream blocked"
+    pass "Phase B2: observability HEALTHY skips reconciliation and reaches validate_shared_secrets_once"
+    pass "Phase B2: observability ABSENT+successful reconciliation reaches validate_shared_secrets_once"
+    pass "Phase B2: observability ABSENT+failed reconciliation blocks validate_observability_ready/validate_shared_secrets_once/build_publish_and_deploy"
+    pass "Phase B2: observability BROKEN fails closed -- reconciliation never runs, downstream blocked"
+    pass "Phase B2: cross-component convergence -- both HEALTHY, either ABSENT+success, continues; either BROKEN blocks shared secrets/runtime"
+    pass "Phase B2: dry-run (effective_deploy=false) never invokes 30-sub-platform.yaml or 40-sub-observability.yaml, and the read-only dry-run path still succeeds"
+  else
+    fail "Phase B2 DAG simulation failed:"$'\n'"${PHASE_B2_SIM_OUT}"
+  fi
+else
+  skip "Phase B2: DAG simulation -- python3/PyYAML unavailable or main workflow missing"
 fi
 
 echo ""
@@ -9511,11 +9960,10 @@ if main_doc is not None:
     jobs = main_doc.get("jobs", {}) or {}
     uses_values = {job_id: (job.get("uses") or "") for job_id, job in jobs.items()}
     all_uses = set(uses_values.values())
-    for expected_sub in ("10-sub-iam-secrets.yaml", "20-sub-argocd.yaml", "30-sub-platform.yaml", "50-sub-monitor.yaml"):
+    # Phase B2 wired 40-sub-observability.yaml into MAIN (via observability_sync_once) alongside the five SUB workflows already called since the workflow-naming task -- all six reusable SUB targets are now expected.
+    for expected_sub in ("10-sub-iam-secrets.yaml", "20-sub-argocd.yaml", "30-sub-platform.yaml", "40-sub-observability.yaml", "50-sub-monitor.yaml"):
         expected_uses = "./.github/workflows/" + expected_sub
         results.append((f"MAIN uses: a reusable-workflow call targeting {expected_sub}", expected_uses in all_uses))
-    # B2 not started yet: 40-sub-observability.yaml must not already be wired into MAIN.
-    results.append(("MAIN does not yet call 40-sub-observability.yaml (reserved for Phase B2)", "./.github/workflows/40-sub-observability.yaml" not in all_uses))
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)

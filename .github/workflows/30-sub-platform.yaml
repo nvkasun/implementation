@@ -1,6 +1,7 @@
 name: "30 | SUB | GoldenGate Platform"
 
-run-name: "SUB | GoldenGate platform bootstrap build and deploy | ${{ github.event_name == 'workflow_dispatch' && format('manual dispatch (deploy={0})', inputs.deploy) || format('auto: platform changes on {0}', github.sha) }} | ran by ${{ github.actor }}"
+# Trigger-neutral: previously branched on github.event_name to say "manual dispatch" vs "auto: platform changes on <sha>", but a workflow_call from MAIN (Phase B2's platform_sync_once) is neither -- it fell through to the misleading "auto" wording. inputs.environment/inputs.deploy are always populated regardless of trigger (workflow_dispatch or workflow_call), so the run-name is accurate for both.
+run-name: "SUB | GoldenGate Platform | env=${{ inputs.environment }} | deploy=${{ inputs.deploy }} | ran by ${{ github.actor }}"
 
 # Manual dispatch only, deliberately with no push trigger: this workflow must run after the IAM Terraform apply and 20-sub-argocd.yaml (see the required order in the "Workflow summary" step); do not re-add a push trigger without also solving that ordering problem.
 on:

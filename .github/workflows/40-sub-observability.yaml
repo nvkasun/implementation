@@ -1,8 +1,9 @@
 name: "40 | SUB | Observability"
 
-run-name: "SUB | GoldenGate observability (CloudWatch metrics) build and deploy | ${{ inputs.environment }} | deploy=${{ inputs.deploy }} | ran by ${{ github.actor }}"
+# Already trigger-neutral (inputs.environment/inputs.deploy, no github.event_name branching); restyled only to match the same "SUB | <Name> | env=... | deploy=..." convention now used across 30-sub-platform.yaml/50-sub-monitor.yaml after Phase B2 added workflow_call here.
+run-name: "SUB | Observability | env=${{ inputs.environment }} | deploy=${{ inputs.deploy }} | ran by ${{ github.actor }}"
 
-# Deploys the upstream amazon-cloudwatch-observability Helm chart directly from private ECR (no wrapper chart) for EKS cluster/node/pod metrics only; logs and GoldenGate-specific metrics are handled by gg-fluent-bit and gg-monitor respectively. workflow_dispatch only, no push trigger.
+# Deploys the upstream amazon-cloudwatch-observability Helm chart directly from private ECR (no wrapper chart) for EKS cluster/node/pod metrics only; logs and GoldenGate-specific metrics are handled by gg-fluent-bit and gg-monitor respectively. Phase B2: also reusable via workflow_call (MAIN's observability_sync_once invokes this synchronously, only when observability_preflight classifies ABSENT), alongside the pre-existing manual workflow_dispatch -- no push trigger either way. The manual dispatch's own deploy=false default is unchanged: that standalone safety behavior is independent of MAIN's explicit deploy=true reconciliation call.
 on:
   workflow_dispatch:
     inputs:
@@ -19,6 +20,15 @@ on:
         required: true
         type: boolean
         default: false
+
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      deploy:
+        required: true
+        type: boolean
 
 permissions:
   id-token: write

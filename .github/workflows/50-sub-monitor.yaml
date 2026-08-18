@@ -1,6 +1,7 @@
 name: "50 | SUB | GoldenGate Monitor"
 
-run-name: "SUB | GoldenGate monitor build and deploy | manual dispatch (deploy=${{ inputs.deploy }}, cloudwatch=${{ inputs.enable_cloudwatch_publication }}) | ran by ${{ github.actor }}"
+# Trigger-neutral: "manual dispatch" previously appeared even when this workflow_call was invoked by MAIN's monitor_sync_once, which is not a manual dispatch. inputs.environment/inputs.deploy/inputs.enable_cloudwatch_publication are always populated regardless of trigger (workflow_dispatch or workflow_call).
+run-name: "SUB | GoldenGate Monitor | env=${{ inputs.environment }} | deploy=${{ inputs.deploy }} | cloudwatch=${{ inputs.enable_cloudwatch_publication }} | ran by ${{ github.actor }}"
 
 
 # Manual dispatch only until the initial rollout is validated; automatic push trigger is restored afterward.
