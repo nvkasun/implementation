@@ -8850,6 +8850,18 @@ else
   skip "3: render-iam-policies --check -- python3 or envs/dev/environment.yaml unavailable"
 fi
 
+# 3b: deterministic environment/IAM generation regression suite -- proves generated output is never read back as a template, A->B->C environment changes never retain a stale identity, --check detects stale generated output, and all six current DEV permission policies remain semantically unchanged.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "hack/test-goldengate-environment.py" ]; then
+  ENV_IAM_SUITE_OUTPUT="$(python3 hack/test-goldengate-environment.py 2>&1)"
+  if [ $? -eq 0 ]; then
+    pass "3b: environment/IAM deterministic generation tests pass (hack/test-goldengate-environment.py)"
+  else
+    fail "3b: environment/IAM deterministic generation tests failed (hack/test-goldengate-environment.py):"$'\n'"${ENV_IAM_SUITE_OUTPUT}"
+  fi
+else
+  skip "3b: environment/IAM deterministic generation tests -- python3 or hack/test-goldengate-environment.py unavailable"
+fi
+
 # 4/5/6/7: runtime trust resolves to exactly system:serviceaccount:goldengate-dev:gg-runtime-sa -- no wildcard, no gg-oracle-sa, no gg-postgresql-sa, no gg-dev-*:ogg-oracle-sa.
 SECRETS_STS="envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json"
 if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$SECRETS_STS" ]; then
@@ -8955,18 +8967,17 @@ else
   fail "13: the EFS decommission hold changed"
 fi
 
-# 14: centralization regression sweep -- outside envs/dev/environment.yaml (canonical) and envs/dev/policies/** (generated), no first-party PRODUCTION .tf/.py source may independently hardcode the real current workload/build account IDs, region, cluster name, or OIDC host. Excludes: .git, vendored Argo CD chart source, every test file (test-*.py/test_*.py/*/tests/* -- synthetic fixture values are explicitly permitted per this repo's own convention, never confused with production hardcoding), hack/goldengate-environment.py's own known-origin substitution constants (which exist specifically to recognize and rewrite these exact literals in generated output -- not a leak), and the generated envs/dev/policies/** output itself.
+# 14: centralization regression sweep -- outside envs/dev/environment.yaml (canonical) and envs/dev/policies/** (generated), no first-party PRODUCTION .tf/.py source may independently hardcode the real current workload/build account IDs, region, cluster name, or OIDC host. Excludes: .git, vendored Argo CD chart source, every test file (test-*.py/test_*.py/*/tests/* -- synthetic fixture values are explicitly permitted per this repo's own convention, never confused with production hardcoding), and the generated envs/dev/policies/** output itself. hack/goldengate-environment.py (the generator) is deliberately NOT excluded: it builds every generated policy purely from derive_values(doc), so a real account ID appearing in its source would itself be a centralization leak.
 CENTRALIZATION_HITS="$(grep -rlE '668311715351|229410149234' --include='*.tf' --include='*.py' . 2>/dev/null \
   | grep -vF '.git/' \
   | grep -vF 'helm/argocd/charts/' \
   | grep -vE '(^|/)test[-_][^/]*\.py$' \
   | grep -vF '/tests/' \
-  | grep -vF 'hack/goldengate-environment.py' \
   | grep -vF 'envs/dev/environment.tf' \
   | grep -vF 'envs/dev/policies/' \
   || true)"
 if [ -z "$CENTRALIZATION_HITS" ]; then
-  pass "14: no first-party production .tf/.py source hardcodes the real workload/build account ID outside envs/dev/environment.tf (canonical), hack/goldengate-environment.py (the generator, by design), envs/dev/policies/** (generated output), and test files (synthetic fixtures)"
+  pass "14: no first-party production .tf/.py source (including hack/goldengate-environment.py, the generator) hardcodes the real workload/build account ID outside envs/dev/environment.tf (canonical), envs/dev/policies/** (generated output), and test files (synthetic fixtures)"
 else
   fail "14: production source independently hardcodes an account ID outside the canonical/generated/test-fixture boundary:"$'\n'"${CENTRALIZATION_HITS}"
 fi
