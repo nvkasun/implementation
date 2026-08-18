@@ -5958,8 +5958,15 @@ def needs_of(name):
 if "validate_model" not in needs_of("terraform_sync_once"):
     print("FAIL: terraform_sync_once does not need validate_model")
     sys.exit(1)
-if "terraform_sync_once" not in needs_of("platform_sync_once"):
-    print("FAIL: platform_sync_once does not need terraform_sync_once")
+# Phase B1 inserts the Argo CD prerequisite state machine between Terraform and the platform chart: terraform_sync_once -> argocd_preflight -> (bootstrap_argocd) -> validate_argocd_ready -> platform_sync_once. platform_sync_once depends on validate_argocd_ready directly and on terraform_sync_once transitively, not as a direct edge anymore -- guarded in full by the dedicated "Phase B1" DAG checks elsewhere in this suite.
+if "terraform_sync_once" not in needs_of("argocd_preflight"):
+    print("FAIL: argocd_preflight does not need terraform_sync_once")
+    sys.exit(1)
+if "argocd_preflight" not in needs_of("validate_argocd_ready"):
+    print("FAIL: validate_argocd_ready does not need argocd_preflight")
+    sys.exit(1)
+if "validate_argocd_ready" not in needs_of("platform_sync_once"):
+    print("FAIL: platform_sync_once does not need validate_argocd_ready")
     sys.exit(1)
 if "terraform_sync_once" not in needs_of("validate_shared_secrets_once") or "platform_sync_once" not in needs_of("validate_shared_secrets_once"):
     print("FAIL: validate_shared_secrets_once does not need both terraform_sync_once and platform_sync_once")
@@ -7777,15 +7784,20 @@ def eval_gha_bool(expr, needs):
     return bool(_Parser(expr, needs).parse())
 
 
-JOB_ORDER = ["terraform_sync_once", "platform_sync_once", "validate_shared_secrets_once", "build_publish_and_deploy"]
+# Phase B1 inserts the Argo CD prerequisite state machine between Terraform and the platform chart -- simulated in real DAG order like every other job here, off the same real if: expressions.
+JOB_ORDER = ["terraform_sync_once", "argocd_preflight", "bootstrap_argocd", "validate_argocd_ready", "platform_sync_once", "validate_shared_secrets_once", "build_publish_and_deploy"]
 IF_EXPRS = {job: _extract_if(job) for job in JOB_ORDER}
 
 
-def simulate(initial, outcome_when_run):
+def simulate(initial, outcome_when_run, outputs_when_run=None):
     results = dict(initial)
+    outputs_when_run = outputs_when_run or {}
     for job in JOB_ORDER:
         would_run = eval_gha_bool(IF_EXPRS[job], results)
-        results[job] = {"result": (outcome_when_run.get(job, "success") if would_run else "skipped"), "outputs": {}}
+        if would_run:
+            results[job] = {"result": outcome_when_run.get(job, "success"), "outputs": outputs_when_run.get(job, {})}
+        else:
+            results[job] = {"result": "skipped", "outputs": {}}
     return results
 
 
@@ -7830,20 +7842,45 @@ check("2: platform_sync_once must be skipped", r["platform_sync_once"]["result"]
 check("2: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
 check("2: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
 
-# 3: deploy=true + platform failure -> runtime build/deploy cannot execute.
+# 3: deploy=true + Argo CD already HEALTHY (bootstrap correctly skipped) + platform failure -> runtime build/deploy cannot execute.
 ctx = base_context("true")
-r = simulate(ctx, {"platform_sync_once": "failure"})
+r = simulate(ctx, {"platform_sync_once": "failure"}, {"argocd_preflight": {"state": "HEALTHY"}})
+check("3: bootstrap_argocd must be skipped when Argo CD is already HEALTHY", r["bootstrap_argocd"]["result"] == "skipped")
+check("3: validate_argocd_ready must succeed on the already-HEALTHY path", r["validate_argocd_ready"]["result"] == "success")
 check("3: platform_sync_once must report failure", r["platform_sync_once"]["result"] == "failure")
 check("3: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
 check("3: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
 
-# 4: deploy=true + all mutation prerequisites success -> runtime deployment may execute.
+# 4: deploy=true + all mutation prerequisites success (including Argo CD already HEALTHY) -> runtime deployment may execute.
 ctx = base_context("true")
-r = simulate(ctx, {})
+r = simulate(ctx, {}, {"argocd_preflight": {"state": "HEALTHY"}})
 check("4: terraform_sync_once must succeed", r["terraform_sync_once"]["result"] == "success")
+check("4: validate_argocd_ready must succeed", r["validate_argocd_ready"]["result"] == "success")
 check("4: platform_sync_once must succeed", r["platform_sync_once"]["result"] == "success")
 check("4: validate_shared_secrets_once must succeed", r["validate_shared_secrets_once"]["result"] == "success")
 check("4: build_publish_and_deploy must be eligible to run", r["build_publish_and_deploy"]["result"] == "success")
+
+# 7: deploy=true + Argo CD ABSENT + bootstrap succeeds -> validate_argocd_ready converges to success -> platform proceeds.
+ctx = base_context("true")
+r = simulate(ctx, {}, {"argocd_preflight": {"state": "ABSENT"}})
+check("7: bootstrap_argocd must run when Argo CD is ABSENT", r["bootstrap_argocd"]["result"] == "success")
+check("7: validate_argocd_ready must succeed after a successful bootstrap", r["validate_argocd_ready"]["result"] == "success")
+check("7: platform_sync_once must be eligible to run after bootstrap", r["platform_sync_once"]["result"] == "success")
+
+# 8: deploy=true + Argo CD ABSENT + bootstrap FAILS -> validate_argocd_ready must never run -> platform must never run.
+ctx = base_context("true")
+r = simulate(ctx, {"bootstrap_argocd": "failure"}, {"argocd_preflight": {"state": "ABSENT"}})
+check("8: bootstrap_argocd must report failure", r["bootstrap_argocd"]["result"] == "failure")
+check("8: validate_argocd_ready must be skipped after a failed bootstrap", r["validate_argocd_ready"]["result"] == "skipped")
+check("8: platform_sync_once must be skipped after a failed bootstrap", r["platform_sync_once"]["result"] == "skipped")
+
+# 9: deploy=true + Argo CD BROKEN (argocd_preflight itself fails closed) -> bootstrap_argocd must never even be entered, and platform must never run.
+ctx = base_context("true")
+r = simulate(ctx, {"argocd_preflight": "failure"})
+check("9: argocd_preflight must report failure on BROKEN", r["argocd_preflight"]["result"] == "failure")
+check("9: bootstrap_argocd must never run on BROKEN", r["bootstrap_argocd"]["result"] == "skipped")
+check("9: validate_argocd_ready must be skipped on BROKEN", r["validate_argocd_ready"]["result"] == "skipped")
+check("9: platform_sync_once must be skipped on BROKEN", r["platform_sync_once"]["result"] == "skipped")
 
 # 5: deploy=false -> terraform/platform may be skipped -> read-only/Helm dry-run path still executes.
 ctx = base_context("false")
@@ -7871,15 +7908,18 @@ PYEOF
   if [ "$FAIL_CLOSED_SIM_STATUS" -eq 0 ]; then
     pass "1: deploy=true + managed_efs_inventory_guard failure blocks terraform_sync_once and build_publish_and_deploy (simulated end-to-end against the real if: expressions)"
     pass "2: deploy=true + terraform_sync_once failure blocks platform_sync_once/validate_shared_secrets_once/build_publish_and_deploy"
-    pass "3: deploy=true + platform_sync_once failure blocks validate_shared_secrets_once/build_publish_and_deploy"
-    pass "4: deploy=true + all mutation prerequisites succeeding leaves build_publish_and_deploy eligible to run"
+    pass "3: deploy=true + Argo CD already HEALTHY (bootstrap skipped) + platform_sync_once failure blocks validate_shared_secrets_once/build_publish_and_deploy"
+    pass "4: deploy=true + all mutation prerequisites succeeding (including Argo CD already HEALTHY) leaves build_publish_and_deploy eligible to run"
     pass "5: deploy=false correctly skips terraform_sync_once/platform_sync_once while the read-only/dry-run path through validate_shared_secrets_once and build_publish_and_deploy still runs"
     pass "6: build_publish_and_deploy's if: rejects a skipped validate_shared_secrets_once (requires exact 'success', not the old != failure/!= cancelled assertion)"
+    pass "7 (Phase B1): Argo CD ABSENT + successful bootstrap converges validate_argocd_ready to success and leaves platform_sync_once eligible to run"
+    pass "8 (Phase B1): Argo CD ABSENT + failed bootstrap_argocd skips validate_argocd_ready and platform_sync_once (never assumes bootstrap success)"
+    pass "9 (Phase B1): Argo CD BROKEN (argocd_preflight itself fails) never enters bootstrap_argocd and skips validate_argocd_ready/platform_sync_once"
   else
     fail "fail-closed job-graph simulation found violation(s): ${FAIL_CLOSED_SIM_OUT}"
   fi
 else
-  skip "1-6: fail-closed job-graph simulation -- python3/PyYAML unavailable"
+  skip "1-9: fail-closed job-graph simulation -- python3/PyYAML unavailable"
 fi
 
 if ! grep -qE "validate_shared_secrets_once\.result\s*!=\s*'failure'" "$EKS_APP_WORKFLOW" 2>/dev/null; then
@@ -9031,7 +9071,7 @@ else
   fail "Phase 11 4: an active workflow independently hardcodes a full IAM role ARN literal:"$'\n'"${ROLE_ARN_LITERAL_HITS}"
 fi
 
-# 5: every active workflow that needs canonical identity loads it via hack/goldengate-environment.py github-env after its own checkout -- GITHUB_ENV is job-local, so no job may assume another job's load already ran. gg-iam-secrets-deployment.yaml is excluded: its Phase-12-pending interface derives AWS_REGION via a plain `get` call, not github-env.
+# 5: every active workflow that needs canonical identity loads it via hack/goldengate-environment.py github-env after its own checkout -- GITHUB_ENV is job-local, so no job may assume another job's load already ran. gg-iam-secrets-deployment.yaml is excluded: by design, it derives its sole canonical value (AWS_REGION) via a plain `get` call, not github-env.
 MISSING_LOADER_HITS=""
 for wf in goldengate-eks-app.yaml argocd-eks-deployment.yaml goldengate-platform.yaml goldengate-monitor.yaml goldengate-monitor-metrics-config.yaml goldengate-observability.yaml cloudwatch-observability-artifact-sync.yaml push_docker_images_to_ECR.yaml; do
   if ! grep -q 'goldengate-environment.py --environment .* github-env' ".github/workflows/${wf}" 2>/dev/null; then
@@ -9279,6 +9319,109 @@ if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f envs/dev/environment.yaml ]; then
   rm -rf "$SYNTH_ROOT"
 else
   skip "Phase 12 region-change: python3/PyYAML unavailable or envs/dev/environment.yaml missing"
+fi
+
+echo ""
+echo "--- Phase B1: Argo CD prerequisite classification + conditional automatic bootstrap ---"
+
+# Structural proof, read directly from the real committed YAML of both workflows (never a reimplementation): argocd-eks-deployment.yaml is reusable via workflow_call, and the main orchestrator's argocd_preflight/bootstrap_argocd/validate_argocd_ready/platform_sync_once DAG has exactly the wiring the ownership-aware ABSENT/HEALTHY/BROKEN contract requires -- bootstrap only on ABSENT, never on BROKEN, and platform never reachable without a validated-healthy Argo CD.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$ARGOCD_DEPLOY_WORKFLOW" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  PHASE_B1_CHECK="$(python3 -c '
+import yaml
+
+with open("'"$ARGOCD_DEPLOY_WORKFLOW"'") as f:
+    argocd_doc = yaml.safe_load(f)
+with open("'"$EKS_APP_WORKFLOW"'") as f:
+    main_doc = yaml.safe_load(f)
+
+results = []
+
+argocd_on = argocd_doc.get(True, argocd_doc.get("on", {}))
+results.append(("1a: argocd-eks-deployment.yaml retains its manual workflow_dispatch trigger", "workflow_dispatch" in argocd_on))
+results.append(("1b: argocd-eks-deployment.yaml now supports workflow_call", "workflow_call" in argocd_on))
+wc_inputs = (argocd_on.get("workflow_call") or {}).get("inputs", {}) or {}
+env_input = wc_inputs.get("environment", {})
+results.append(("2: workflow_call accepts a required, canonical string environment input", env_input.get("required") is True and env_input.get("type") == "string"))
+
+jobs = main_doc["jobs"]
+results.append(("3: main workflow defines argocd_preflight", "argocd_preflight" in jobs))
+
+preflight = jobs.get("argocd_preflight", {})
+preflight_needs = preflight.get("needs") or []
+preflight_if = preflight.get("if", "")
+results.append(("4a: argocd_preflight runs after terraform_sync_once", "terraform_sync_once" in preflight_needs))
+results.append(("4b: argocd_preflight is real-deploy-only (effective_deploy == \x27true\x27)", "effective_deploy" in preflight_if and "== \x27true\x27" in preflight_if))
+results.append(("4c: argocd_preflight exposes a state job output", "state" in (preflight.get("outputs") or {})))
+
+results.append(("5: main workflow defines a conditional reusable bootstrap_argocd", "bootstrap_argocd" in jobs))
+bootstrap = jobs.get("bootstrap_argocd", {})
+results.append(("6: bootstrap_argocd calls the reusable argocd-eks-deployment.yaml (never gh workflow run)", bootstrap.get("uses") == "./.github/workflows/argocd-eks-deployment.yaml"))
+bootstrap_if = bootstrap.get("if", "")
+results.append(("7: bootstrap_argocd runs only when argocd_preflight.outputs.state == ABSENT", "argocd_preflight.outputs.state == \x27ABSENT\x27" in bootstrap_if))
+results.append(("8: bootstrap_argocd condition contains no BROKEN branch -- BROKEN can never enter bootstrap", "BROKEN" not in bootstrap_if))
+results.append(("8b: bootstrap_argocd requires argocd_preflight to have actually succeeded first", "needs.argocd_preflight.result == \x27success\x27" in bootstrap_if))
+
+results.append(("9: main workflow defines a final validate_argocd_ready convergence job", "validate_argocd_ready" in jobs))
+ready = jobs.get("validate_argocd_ready", {})
+ready_if = ready.get("if", "")
+results.append(("10a: validate_argocd_ready allows the already-HEALTHY (bootstrap-skip) path", "argocd_preflight.outputs.state == \x27HEALTHY\x27" in ready_if))
+results.append(("10b: validate_argocd_ready allows the ABSENT-then-successfully-bootstrapped path", "argocd_preflight.outputs.state == \x27ABSENT\x27" in ready_if and "needs.bootstrap_argocd.result == \x27success\x27" in ready_if))
+results.append(("10c: validate_argocd_ready uses always() to survive bootstrap_argocd legitimately being skipped", "always()" in ready_if))
+
+platform = jobs.get("platform_sync_once", {})
+platform_needs = platform.get("needs") or []
+platform_if = platform.get("if", "")
+results.append(("11: platform_sync_once needs validate_argocd_ready", "validate_argocd_ready" in platform_needs))
+results.append(("12: platform_sync_once requires validate_argocd_ready to have actually succeeded (BROKEN/failed Argo can never reach platform)", "needs.validate_argocd_ready.result == \x27success\x27" in platform_if))
+
+results.append(("13: bootstrap_argocd still gates on effective_deploy == \x27true\x27 -- dry-run can never bootstrap Argo", "effective_deploy == \x27true\x27" in bootstrap_if))
+
+whole_text = str(main_doc) + str(argocd_doc)
+results.append(("14: no gh workflow run / workflow_dispatch-API / repository_dispatch trigger exists anywhere in either workflow", "gh workflow run" not in whole_text and "repository_dispatch" not in whole_text and "/dispatches" not in whole_text))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+' 2>&1)"
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL\ *) fail "Phase B1: ${line#FAIL }" ;;
+      OK\ *) pass "Phase B1: ${line#OK }" ;;
+    esac
+  done <<< "$PHASE_B1_CHECK"
+else
+  skip "Phase B1: DAG structural checks -- python3/PyYAML unavailable or a required workflow file is missing"
+fi
+
+# Runtime kept intact: existing defensive `kubectl get crd applications.argoproj.io` checks remain in the callable-standalone workflows, but no longer instruct the engineer to manually run argocd-eks-deployment.yaml as if no owner exists.
+STALE_ARGO_CRD_MSG_HITS="$(grep -rln 'Run the argocd-eks-deployment.yaml workflow first' .github/workflows/*.yaml 2>/dev/null || true)"
+if [ -z "$STALE_ARGO_CRD_MSG_HITS" ]; then
+  pass "Phase B1: no active workflow still tells the engineer to \"Run the argocd-eks-deployment.yaml workflow first\" -- the main orchestrator now owns that prerequisite"
+else
+  fail "Phase B1: a stale 'Run the argocd-eks-deployment.yaml workflow first' message remains in:"$'\n'"${STALE_ARGO_CRD_MSG_HITS}"
+fi
+
+# hack/orchestration/argocd_state.py must never construct a mutating kubectl/helm command -- read directly from source, never from the test's own constants.
+ARGOCD_STATE_TOOL="hack/orchestration/argocd_state.py"
+if [ -f "$ARGOCD_STATE_TOOL" ]; then
+  MUTATING_HITS="$(grep -nE 'kubectl apply|kubectl create|kubectl delete|kubectl patch|kubectl annotate|kubectl label|helm install|helm upgrade|helm uninstall|"apply"|'"'"'apply'"'"'|"create"|'"'"'create'"'"'|"delete"|'"'"'delete'"'"'|"patch"|'"'"'patch'"'"'|"annotate"|'"'"'annotate'"'"'|"label"|'"'"'label'"'"'' "$ARGOCD_STATE_TOOL" 2>/dev/null || true)"
+  if [ -z "$MUTATING_HITS" ]; then
+    pass "Phase B1: ${ARGOCD_STATE_TOOL} contains no mutating kubectl/helm command construction -- read-only classifier confirmed"
+  else
+    fail "Phase B1: ${ARGOCD_STATE_TOOL} appears to contain a mutating command construct:"$'\n'"${MUTATING_HITS}"
+  fi
+else
+  fail "Phase B1: ${ARGOCD_STATE_TOOL} is missing"
+fi
+
+# The classifier's own dedicated offline unit-test suite (ABSENT/HEALTHY/BROKEN, all 15 required scenarios) is part of the normal regression run, not merely available separately.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f hack/test-goldengate-argocd-state.py ]; then
+  if ARGOCD_STATE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 hack/test-goldengate-argocd-state.py 2>&1)"; then
+    pass "Phase B1: hack/test-goldengate-argocd-state.py (the Argo CD classifier's offline ABSENT/HEALTHY/BROKEN test suite) passes"
+  else
+    fail "Phase B1: hack/test-goldengate-argocd-state.py failed:"$'\n'"${ARGOCD_STATE_TEST_OUTPUT}"
+  fi
+else
+  skip "Phase B1: hack/test-goldengate-argocd-state.py -- python3 unavailable or file missing"
 fi
 
 echo ""

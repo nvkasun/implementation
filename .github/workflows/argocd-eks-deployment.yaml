@@ -13,6 +13,12 @@ on:
         options:
           - dev
 
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+
 permissions:
   id-token: write
   contents: read

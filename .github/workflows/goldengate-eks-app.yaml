@@ -298,14 +298,235 @@ jobs:
     with:
       environment: ${{ needs.validate_model.outputs.selected_environment }}
 
-  platform_sync_once:
-    name: Synchronize the GoldenGate platform chart (once)
+  argocd_preflight:
+    name: Classify Argo CD prerequisite state (read-only)
 
-    # This job's if: is a custom expression, so terraform_sync_once's result must be checked explicitly -- otherwise, if terraform_sync_once was skipped or failed (e.g. an upstream storage guard failure), this job would still attempt to run since a bare effective_deploy=='true' check says nothing about whether Terraform actually succeeded first.
+    # First implementation of the ownership-aware application-prerequisite state machine (Phase B1): ABSENT -> bootstrap, HEALTHY -> continue, BROKEN -> fail closed, never auto-repaired. This job never mutates the cluster -- it only runs hack/orchestration/argocd_state.py, which itself issues read-only `kubectl get` calls.
     needs:
       - validate_model
       - terraform_sync_once
     if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.terraform_sync_once.result == 'success' }}
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    outputs:
+      state: ${{ steps.classify.outputs.state }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Load resolved environment config
+        shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
+
+      - name: Install kubectl if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking/installing kubectl..."
+
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KUBECTL_VERSION="v1.35.0"
+
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64)
+                KUBECTL_ARCH="amd64"
+                ;;
+              aarch64|arm64)
+                KUBECTL_ARCH="arm64"
+                ;;
+              *)
+                echo "Unsupported architecture for kubectl: $ARCH"
+                exit 1
+                ;;
+            esac
+
+            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+            sudo chmod +x /usr/local/bin/kubectl
+          fi
+
+          kubectl version --client=true
+
+      - name: Connect to EKS cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}" \
+            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
+            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
+
+          echo "Current kube context:"
+          kubectl config current-context
+
+      - name: Classify Argo CD prerequisite state
+        id: classify
+        shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
+
+          # A non-zero exit here is a classifier inspection error (API unreachable, permission denied, malformed JSON) -- never treated as ABSENT.
+          if ! CLASSIFIER_OUTPUT="$(python3 hack/orchestration/argocd_state.py --environment "${GG_SELECTED_ENVIRONMENT}")"; then
+            echo "FAIL: the Argo CD classifier could not determine cluster state (inspection error, not ABSENT) -- see diagnostics above."
+            exit 1
+          fi
+
+          echo "$CLASSIFIER_OUTPUT"
+
+          STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
+          echo "Argo CD prerequisite state: ${STATE}"
+          echo "state=${STATE}" >> "$GITHUB_OUTPUT"
+
+          if [ "$STATE" = "BROKEN" ]; then
+            echo "FAIL: Argo CD prerequisite state is BROKEN. This is not auto-repaired here -- investigate the diagnostics above and repair Argo CD (or run argocd-eks-deployment.yaml standalone) before re-running."
+            exit 1
+          fi
+
+  bootstrap_argocd:
+    name: Bootstrap Argo CD (only when currently absent)
+
+    # Runs the reusable specialist workflow synchronously as part of this DAG -- never an asynchronous CLI/API dispatch or repository_dispatch trigger. Skipped entirely (not run) whenever Argo CD is already HEALTHY or preflight found it BROKEN.
+    needs:
+      - validate_model
+      - argocd_preflight
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.argocd_preflight.result == 'success' && needs.argocd_preflight.outputs.state == 'ABSENT' }}
+
+    uses: ./.github/workflows/argocd-eks-deployment.yaml
+    secrets: inherit
+    with:
+      environment: ${{ needs.validate_model.outputs.selected_environment }}
+
+  validate_argocd_ready:
+    name: Validate Argo CD is healthy (convergence point for the already-healthy and just-bootstrapped paths)
+
+    # always() overrides GitHub's default implicit skip-on-skipped-dependency behavior (bootstrap_argocd is legitimately skipped on the already-HEALTHY path) -- the explicit result/state checks below are what actually keep this fail-closed, exactly like validate_shared_secrets_once's established always()-plus-explicit-result pattern elsewhere in this workflow.
+    needs:
+      - validate_model
+      - argocd_preflight
+      - bootstrap_argocd
+    if: ${{ always() && needs.validate_model.outputs.effective_deploy == 'true' && needs.argocd_preflight.result == 'success' && (needs.argocd_preflight.outputs.state == 'HEALTHY' || (needs.argocd_preflight.outputs.state == 'ABSENT' && needs.bootstrap_argocd.result == 'success')) }}
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Load resolved environment config
+        shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
+
+      - name: Install kubectl if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking/installing kubectl..."
+
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KUBECTL_VERSION="v1.35.0"
+
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64)
+                KUBECTL_ARCH="amd64"
+                ;;
+              aarch64|arm64)
+                KUBECTL_ARCH="arm64"
+                ;;
+              *)
+                echo "Unsupported architecture for kubectl: $ARCH"
+                exit 1
+                ;;
+            esac
+
+            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+            sudo chmod +x /usr/local/bin/kubectl
+          fi
+
+          kubectl version --client=true
+
+      - name: Connect to EKS cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}" \
+            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
+            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
+
+          echo "Current kube context:"
+          kubectl config current-context
+
+      - name: Re-classify and require Argo CD to be exactly HEALTHY
+        shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
+
+          # Bootstrap success (the reusable workflow job returning) is never assumed to mean healthy -- the same read-only classifier is re-run here and must independently confirm HEALTHY.
+          if ! CLASSIFIER_OUTPUT="$(python3 hack/orchestration/argocd_state.py --environment "${GG_SELECTED_ENVIRONMENT}")"; then
+            echo "FAIL: the Argo CD classifier could not determine cluster state (inspection error) during post-bootstrap validation."
+            exit 1
+          fi
+
+          echo "$CLASSIFIER_OUTPUT"
+
+          STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
+
+          if [ "$STATE" != "HEALTHY" ]; then
+            echo "FAIL: Argo CD prerequisite state is ${STATE}, expected HEALTHY after preflight/bootstrap. Refusing to proceed to the platform stage."
+            exit 1
+          fi
+
+          echo "OK: Argo CD prerequisite state is HEALTHY."
+
+  platform_sync_once:
+    name: Synchronize the GoldenGate platform chart (once)
+
+    # This job's if: is a custom expression, so validate_argocd_ready's result must be checked explicitly -- otherwise, if the Argo CD prerequisite was skipped or failed (BROKEN, or a failed bootstrap), this job would still attempt to run since a bare effective_deploy=='true' check says nothing about whether the Argo CD prerequisite actually converged first. validate_argocd_ready already transitively requires terraform_sync_once, so it is not re-listed here.
+    needs:
+      - validate_model
+      - validate_argocd_ready
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.validate_argocd_ready.result == 'success' }}
 
     uses: ./.github/workflows/goldengate-platform.yaml
     with:
@@ -1974,8 +2195,9 @@ jobs:
 
           kubectl get crd applications.argoproj.io >/dev/null || {
             echo "CRD applications.argoproj.io not found."
-            echo "Argo CD must be installed on this cluster before GoldenGate can be deployed through it."
-            echo "Run the argocd-eks-deployment.yaml workflow first."
+            echo "Argo CD prerequisite is not healthy."
+            echo "This orchestrator's own argocd_preflight/bootstrap_argocd/validate_argocd_ready jobs normally classify and bootstrap-validate Argo CD before this stage runs -- this check is defense in depth, not the primary gate."
+            echo "For standalone execution, deploy/repair Argo CD through argocd-eks-deployment.yaml."
             exit 1
           }
 

@@ -1210,8 +1210,9 @@ jobs:
 
           kubectl get crd applications.argoproj.io >/dev/null || {
             echo "CRD applications.argoproj.io not found."
-            echo "Argo CD must be installed on this cluster before the monitor can be deployed through it."
-            echo "Run the argocd-eks-deployment.yaml workflow first."
+            echo "Argo CD prerequisite is not healthy."
+            echo "The main orchestrator (goldengate-eks-app.yaml) normally classifies and bootstrap-validates Argo CD before this stage runs."
+            echo "For standalone execution, deploy/repair Argo CD through argocd-eks-deployment.yaml."
             exit 1
           }
 
@@ -1227,7 +1228,7 @@ jobs:
           if ! kubectl get secret "$ARGOCD_MONITOR_SECRET_NAME" -n "$ARGOCD_NAMESPACE" >/dev/null 2>&1; then
             echo "PREREQUISITE NOT MET: Secret ${ARGOCD_MONITOR_SECRET_NAME} does not exist in namespace ${ARGOCD_NAMESPACE}."
             echo ""
-            echo "Required order before running this workflow:"
+            echo "Required order before running this workflow standalone (the main orchestrator normally sequences this automatically):"
             echo "  1. Run the IAM/Secrets Terraform workflow (applies the extended Argo CD ECR read policy)."
             echo "  2. Run the argocd-eks-deployment.yaml workflow (deploys multi-repository token sync and creates this Secret)."
             echo "  3. Re-run this workflow."

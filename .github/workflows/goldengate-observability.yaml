@@ -831,8 +831,7 @@ jobs:
 
           if echo "$CRD_OUTPUT" | grep -qEi 'NotFound|not found'; then
             echo "FAIL: the Kubernetes API is reachable, but applications.argoproj.io is genuinely absent."
-            echo "Argo CD must be installed on this cluster before this Application can be deployed."
-            echo "Run the argocd-eks-deployment.yaml workflow first."
+            echo "Argo CD prerequisite is not healthy. This workflow is standalone and does not classify/bootstrap Argo CD itself -- deploy/repair Argo CD through argocd-eks-deployment.yaml, then re-run."
             exit 1
           fi
 

@@ -832,8 +832,9 @@ jobs:
 
           kubectl get crd applications.argoproj.io >/dev/null || {
             echo "CRD applications.argoproj.io not found."
-            echo "Argo CD must be installed on this cluster before the platform bootstrap can be deployed through it."
-            echo "Run the argocd-eks-deployment.yaml workflow first."
+            echo "Argo CD prerequisite is not healthy."
+            echo "The main orchestrator (goldengate-eks-app.yaml) normally classifies and bootstrap-validates Argo CD before this stage runs."
+            echo "For standalone execution, deploy/repair Argo CD through argocd-eks-deployment.yaml."
             exit 1
           }
 
