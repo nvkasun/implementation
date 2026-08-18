@@ -1,8 +1,30 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 rendered/
 *.tfplan
 *.tfstate
 *.tfstate.*
+.terraform/
 work/generated/
+
+# Local Helm/tar packages (e.g. a `helm dependency build` byproduct such as
+# helm/argocd/charts/argo-cd-9.3.7.tgz) -- never a committed source artifact.
+# The unpacked helm/argocd/charts/argo-cd/ directory is the real vendored
+# source and is never matched by these patterns.
+*.tgz
+*.tar
+*.tar.gz
+*.zip
+
+*.log
+*.tmp
+*.bak
+*.orig
+*.rej
+*~
+
+.coverage
+htmlcov/

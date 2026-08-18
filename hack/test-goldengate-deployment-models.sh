@@ -4105,12 +4105,12 @@ else
 fi
 
 JUNK_ARTIFACTS="$(find . -not -path "./.git/*" \( \
-  -iname "__pycache__" -o -iname "*.pyc" -o -iname ".pytest_cache" -o -iname ".mypy_cache" \
-  -o -iname ".DS_Store" -o -iname "Thumbs.db" -o -iname "*.tmp" -o -iname "*.bak" \
+  -iname "__pycache__" -o -iname "*.pyc" -o -iname "*.pyo" -o -iname ".pytest_cache" -o -iname ".mypy_cache" -o -iname ".ruff_cache" \
+  -o -iname ".terraform" -o -iname ".DS_Store" -o -iname "Thumbs.db" -o -iname "*.tmp" -o -iname "*.bak" \
   -o -iname "*.orig" -o -iname "*.rej" -o -iname "*~" -o -iname "rendered" \
   \) 2>/dev/null || true)"
 if [ -z "$JUNK_ARTIFACTS" ]; then
-  pass "no Python cache, pytest/mypy cache, editor backup, or rendered/ artifacts exist in the repository"
+  pass "no Python/pytest/mypy/ruff cache, .terraform, editor backup, or rendered/ artifacts exist in the repository"
 else
   fail "junk/cache artifacts found:${JUNK_ARTIFACTS}"
 fi
@@ -4178,8 +4178,11 @@ else
   fail "the Argo CD vendored dependency directory or Chart.lock is missing -- helm/argocd/charts/argo-cd and helm/argocd/Chart.lock must be retained"
 fi
 
+# The wrapper chart's dependency is repository: "file://charts/argo-cd" (the unpacked directory just proven functional above), never the packaged .tgz -- a committed .tgz would be a redundant, Helm-regenerable duplicate (e.g. left over from a local `helm dependency build`) and must be absent at handoff time, not merely noted.
 if [ -f "helm/argocd/charts/argo-cd-9.3.7.tgz" ]; then
-  echo "INFO: helm/argocd/charts/argo-cd-9.3.7.tgz is present (a redundant, Helm-regenerable duplicate of the vendored directory was removed when proven safe; its presence here is not itself a failure, only a note)."
+  fail "helm/argocd/charts/argo-cd-9.3.7.tgz is present -- it is a redundant, Helm-regenerable duplicate of the vendored helm/argocd/charts/argo-cd/ directory (repository: file://charts/argo-cd) and must be removed before VDR handoff"
+else
+  pass "no redundant helm/argocd/charts/argo-cd-9.3.7.tgz package exists -- only the unpacked vendored directory remains"
 fi
 
 # 26. EFS rendered-resource validation: strict basePath derivation (matching goldengate.efsBasePath), fail-closed YAML parsing, no fragile grep on an optional key under set -euo pipefail.
@@ -9422,6 +9425,35 @@ if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f hack/test-goldengate-argocd-state.py
   fi
 else
   skip "Phase B1: hack/test-goldengate-argocd-state.py -- python3 unavailable or file missing"
+fi
+
+echo ""
+echo "--- Final repository handoff hygiene sweep (VDR pre-transfer cleanliness) ---"
+
+# This is the LAST check in the suite, deliberately: earlier sections legitimately regenerate work/generated/dev/goldengate-deployments.yaml (the folder-driven registry-generation checks) as their own tested behavior -- asserting its absence any earlier would be a self-defeating mid-test assertion. Self-heal only the categories PROVEN elsewhere in this suite to be pure, expected byproducts of exercising real application/tooling behavior (never silently deleting anything whose origin is unknown); everything else must already be absent, or this check fails closed and reports it for a human to investigate before VDR handoff.
+find . -not -path "./.git/*" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+find . -not -path "./.git/*" -type f \( -iname "*.pyc" -o -iname "*.pyo" \) -delete 2>/dev/null || true
+find . -not -path "./.git/*" -type d -iname ".pytest_cache" -exec rm -rf {} + 2>/dev/null || true
+find . -not -path "./.git/*" -type d -iname "rendered" -exec rm -rf {} + 2>/dev/null || true
+rm -rf work/generated
+# The wrapper chart's dependency is repository: "file://charts/argo-cd" (the unpacked directory); any packaged .tgz under its charts/ dir is a `helm dependency build` byproduct, never committed source.
+find helm/argocd/charts -maxdepth 1 -type f -iname "*.tgz" -delete 2>/dev/null || true
+
+FINAL_HYGIENE_SURVIVORS="$(find . -not -path "./.git/*" \( \
+  -iname "__pycache__" -o -iname "*.pyc" -o -iname "*.pyo" \
+  -o -iname ".pytest_cache" -o -iname ".mypy_cache" -o -iname ".ruff_cache" -o -iname ".terraform" \
+  -o -iname "rendered" -o -iname "*.tfplan" \
+  -o -iname "*.tgz" -o -iname "*.tar" -o -iname "*.tar.gz" \
+  -o -iname "*.log" -o -iname "*.tmp" -o -iname "*.bak" -o -iname "*.orig" -o -iname "*.rej" -o -iname "*~" \
+  \) 2>/dev/null || true)"
+if [ -d "work/generated" ]; then
+  FINAL_HYGIENE_SURVIVORS="${FINAL_HYGIENE_SURVIVORS}"$'\n'"work/generated"
+fi
+
+if [ -z "$FINAL_HYGIENE_SURVIVORS" ]; then
+  pass "final repository handoff hygiene sweep: no __pycache__/*.pyc/*.pyo, pytest/mypy/ruff/.terraform cache, work/generated, rendered/, *.tfplan, *.tgz/*.tar/*.tar.gz package, or editor/log/tmp artifact remains anywhere in the application repository"
+else
+  fail "final repository handoff hygiene sweep found artifact(s) that must be investigated/removed before VDR handoff:"$'\n'"${FINAL_HYGIENE_SURVIVORS}"
 fi
 
 echo ""
