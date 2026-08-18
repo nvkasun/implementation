@@ -222,8 +222,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Static check (no AWS calls) that the ECR read policy grants pull access via an exact ARN match per repository, not a wildcard.
-          POLICY_FILE="envs/dev/policies/argocd-ecr-oci-read-dev/policies/policies_1.json"
+          # Static check (no AWS calls) that the ECR read policy grants pull access via an exact ARN match per repository, not a wildcard. Folder name follows the generator's policy_folder = "argocd-ecr-oci-read-<environment>" naming contract (hack/goldengate-environment.py _IRSA_ROLE_FOLDERS) -- never a second hardcoded environment literal.
+          POLICY_FILE="envs/${GG_ENVIRONMENT}/policies/argocd-ecr-oci-read-${GG_ENVIRONMENT}/policies/policies_1.json"
 
           if [ ! -f "$POLICY_FILE" ]; then
             echo "FAIL: missing IAM policy file: ${POLICY_FILE}"
@@ -455,7 +455,7 @@ jobs:
             exit 1
           fi
 
-          echo "OK: ServiceAccount/Role/RoleBinding/CronJob for ECR token sync are all present in the rendered manifest, covering all four repositories, using the existing GoldenGateArgocdECRRead-dev IRSA role. (The next step's public-registry scan covers every rendered image reference, including this CronJob's -- no new public image is introduced here.)"
+          echo "OK: ServiceAccount/Role/RoleBinding/CronJob for ECR token sync are all present in the rendered manifest, covering all four repositories, using the existing ${ARGOCD_ECR_READ_ROLE_NAME} IRSA role. (The next step's public-registry scan covers every rendered image reference, including this CronJob's -- no new public image is introduced here.)"
 
       - name: Extract and validate rendered image references
         shell: bash

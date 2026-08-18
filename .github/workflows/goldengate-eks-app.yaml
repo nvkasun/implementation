@@ -188,9 +188,9 @@ jobs:
           fi
 
   eks_oidc_preflight:
-    name: Verify live EKS cluster + OIDC issuer match envs/dev/environment.yaml (read-only)
+    name: Verify live EKS cluster + OIDC issuer match the selected environment's environment.yaml (read-only)
 
-    # Read-only DescribeCluster preflight only -- never creates/modifies EKS, the IAM OIDC provider, or any AWS resource. Skipped for deploy=false (a purely local/offline validation run) so an existing intentionally-offline dry-run path never starts requiring live AWS access. This is the critical safety gate for cluster recreation: a recreated EKS cluster keeps the SAME name but gets a DIFFERENT OIDC issuer, and every generated IRSA trust policy in envs/dev/policies/** is only valid for the issuer envs/dev/environment.yaml declares -- so this must run, and must succeed, before Terraform (which owns applying those trust policies) or any deployment can proceed.
+    # Read-only DescribeCluster preflight only -- never creates/modifies EKS, the IAM OIDC provider, or any AWS resource. Skipped for deploy=false (a purely local/offline validation run) so an existing intentionally-offline dry-run path never starts requiring live AWS access. This is the critical safety gate for cluster recreation: a recreated EKS cluster keeps the SAME name but gets a DIFFERENT OIDC issuer, and every generated IRSA trust policy in envs/<environment>/policies/** is only valid for the issuer envs/<environment>/environment.yaml declares -- so this must run, and must succeed, before Terraform (which owns applying those trust policies) or any deployment can proceed.
     needs:
       - validate_model
     if: ${{ needs.validate_model.outputs.effective_deploy == 'true' }}
@@ -220,7 +220,7 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
 
-      - name: DescribeCluster and verify against envs/dev/environment.yaml (read-only)
+      - name: DescribeCluster and verify against the selected environment's environment.yaml (read-only)
         shell: bash
         run: |
           set -euo pipefail
@@ -246,24 +246,25 @@ jobs:
           unset PRE_TMP_KEY_ID PRE_TMP_SECRET PRE_TMP_TOKEN
           export CLUSTER_JSON
 
-          python3 - "$EKS_CLUSTER_ARN" "$EKS_OIDC_ISSUER" <<'PYEOF'
+          python3 - "$EKS_CLUSTER_ARN" "$EKS_OIDC_ISSUER" "$GG_SELECTED_ENVIRONMENT" <<'PYEOF'
           import json
           import os
           import sys
 
-          expected_arn, expected_oidc_issuer = sys.argv[1], sys.argv[2]
+          expected_arn, expected_oidc_issuer, selected_environment = sys.argv[1], sys.argv[2], sys.argv[3]
+          environment_yaml_path = f"envs/{selected_environment}/environment.yaml"
           cluster = json.loads(os.environ["CLUSTER_JSON"])["cluster"]
 
           problems = []
           if cluster.get("status") != "ACTIVE":
               problems.append(f"cluster status is {cluster.get('status')!r}, expected ACTIVE")
           if cluster.get("arn") != expected_arn:
-              problems.append(f"live cluster ARN {cluster.get('arn')!r} does not match envs/dev/environment.yaml-derived ARN {expected_arn!r}")
+              problems.append(f"live cluster ARN {cluster.get('arn')!r} does not match {environment_yaml_path}-derived ARN {expected_arn!r}")
           live_oidc_issuer = cluster.get("identity", {}).get("oidc", {}).get("issuer")
           if live_oidc_issuer != expected_oidc_issuer:
               problems.append(
                   "Configured EKS OIDC issuer does not match the live cluster. "
-                  "Update envs/dev/environment.yaml to the current EKS issuer and regenerate IAM policies before deployment. "
+                  f"Update {environment_yaml_path} to the current EKS issuer and regenerate IAM policies before deployment. "
                   f"(live={live_oidc_issuer!r}, configured={expected_oidc_issuer!r})"
               )
 
@@ -271,7 +272,7 @@ jobs:
               for p in problems:
                   print(f"FAIL: {p}")
               sys.exit(1)
-          print(f"OK: live EKS cluster {cluster.get('name')!r} is ACTIVE, ARN and OIDC issuer match envs/dev/environment.yaml.")
+          print(f"OK: live EKS cluster {cluster.get('name')!r} is ACTIVE, ARN and OIDC issuer match {environment_yaml_path}.")
           PYEOF
 
   terraform_sync_once:
@@ -903,7 +904,7 @@ jobs:
           fi
 
           if [ -z "$RESOLVED_DNS_DOMAIN" ] || [ -z "$RESOLVED_ALB_GROUP_NAME" ] || [ -z "$RESOLVED_CERTIFICATE_ARN" ]; then
-            echo "FAIL: could not resolve shared ingress identity (DNS_DOMAIN/ALB_GROUP_NAME/ACM_CERTIFICATE_ARN) from envs/dev/environment.yaml."
+            echo "FAIL: could not resolve shared ingress identity (DNS_DOMAIN/ALB_GROUP_NAME/ACM_CERTIFICATE_ARN) from envs/${ENVIRONMENT}/environment.yaml."
             exit 1
           fi
 
@@ -1835,7 +1836,7 @@ jobs:
           rm -rf "$TEMP_CHART_PATH"
           mkdir -p "$TEMP_CHART_PATH"
 
-          # Argo CD can't reach envs/dev/<id>/values.yaml directly, so bake it into a self-contained chart copy before packaging.
+          # Argo CD can't reach envs/<environment>/<id>/values.yaml directly, so bake it into a self-contained chart copy before packaging.
           echo "Copying base chart from $HELM_CHART_PATH into $TEMP_CHART_PATH..."
           cp -a "$HELM_CHART_PATH/." "$TEMP_CHART_PATH/"
 
@@ -2267,7 +2268,7 @@ jobs:
             echo "Of those, deletion (deletes the Argo CD Application and, if safely"
             echo "identifiable, its namespace) is triggered by:"
             echo "- physical removal of the values file or its whole deployment folder"
-            echo "  (including removal of the entire envs/dev/ directory);"
+            echo "  (including removal of the entire envs/${ENVIRONMENT}/ directory);"
             echo "- a values file that still exists but is now zero-byte;"
             echo "- a values file that still exists but is now whitespace-only;"
             echo "- a values file that still exists but is now comment-only;"

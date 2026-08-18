@@ -3209,7 +3209,8 @@ metadata:
             with open(rendered_path, "w") as f:
                 f.write(synthetic_manifest)
             script = f'set -euo pipefail\nRENDERED="{rendered_path}"\n' + rbac_snippet
-            proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+            env = dict(os.environ, ARGOCD_ECR_READ_ROLE_NAME="GoldenGateArgocdECRRead-dev")
+            proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
 
         self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
         self.assertIn("OK: ServiceAccount/Role/RoleBinding/CronJob", proc.stdout)
@@ -3255,7 +3256,8 @@ rules:
             with open(rendered_path, "w") as f:
                 f.write(incomplete_manifest)
             script = f'set -euo pipefail\nRENDERED="{rendered_path}"\n' + rbac_snippet
-            proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+            env = dict(os.environ, ARGOCD_ECR_READ_ROLE_NAME="GoldenGateArgocdECRRead-dev")
+            proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
 
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("argocd-ecr-goldengate-monitor-oci", proc.stdout)

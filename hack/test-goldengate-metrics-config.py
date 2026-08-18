@@ -831,7 +831,10 @@ exit 1
     def _run_fragment(self):
         return run_step_script(
             MONITOR_WORKFLOW_PATH, "CloudWatch publication preflight (pod selection fragment)", self.fragment,
-            {"TARGET_NAMESPACE": "goldengate-monitoring"},
+            {
+                "TARGET_NAMESPACE": "goldengate-monitoring",
+                "MONITOR_ROLE_NAME": "GoldenGateMonitorReadRole-dev",
+            },
             bin_dir=self.bin_dir,
             gh_expression_overrides={"${{ inputs.metrics_gate_expectation }}": "any"},
         )

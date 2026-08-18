@@ -1252,7 +1252,7 @@ jobs:
           set -euo pipefail
 
           echo "enable_cloudwatch_publication=true requested (metrics_gate_expectation=${{ inputs.metrics_gate_expectation }}) -- taking a safe CONFIG gate inventory for every enabled canonical deployment before the Argo CD Application is touched."
-          echo "This never uses DynamoDB Scan, never broadens IAM, and never constructs a CloudWatch client -- it reuses the existing running monitor pod's own IRSA (GoldenGateMonitorReadRole-dev) via a bounded kubectl exec, one GetItem per enabled deployment."
+          echo "This never uses DynamoDB Scan, never broadens IAM, and never constructs a CloudWatch client -- it reuses the existing running monitor pod's own IRSA (${MONITOR_ROLE_NAME}) via a bounded kubectl exec, one GetItem per enabled deployment."
 
           # Deployment/ReplicaSet ownership-chain pod selection (never a blind ".items[0]" or a bare label selector): pod must be Running, Ready, use serviceAccountName=gg-monitor, and be owned by a ReplicaSet owned by the current gg-monitor Deployment.
           POD_NAME=""

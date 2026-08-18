@@ -218,7 +218,7 @@ jobs:
           set -euo pipefail
 
           helm template cw-observability-validate "$CHART_TGZ" \
-            --namespace amazon-cloudwatch \
+            --namespace "${OBSERVABILITY_NAMESPACE}" \
             --values "${WORKDIR}/validate-values.yaml" \
             > "${WORKDIR}/rendered.yaml"
 
@@ -372,7 +372,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Resource (repository) policy only; the GoldenGateArgocdECRRead-dev identity policy itself (envs/dev/policies/argocd-ecr-oci-read-dev/) is untouched by this workflow.
+          # Resource (repository) policy only; the ARGOCD_ECR_READ_ROLE_NAME identity policy itself (envs/<environment>/policies/argocd-ecr-oci-read-<environment>/) is untouched by this workflow.
           ARGOCD_SID="AllowArgocdEksRolePullAmazonCloudwatchObservabilityHelmChart"
 
           EXISTING_POLICY="$(aws ecr get-repository-policy \
@@ -544,7 +544,7 @@ jobs:
             echo ""
             echo "- No EKS deployment performed."
             echo "- No IAM Terraform changes performed (the Phase 6B2 identity-policy"
-            echo "  update to \`GoldenGateArgocdECRRead-dev\` is a separate, later phase)."
+            echo "  update to \`${ARGOCD_ECR_READ_ROLE_NAME}\` is a separate, later phase)."
             echo "- No Argo CD Application created."
             echo "- Chart version mirrored: \`${CHART_NAME}:${CHART_VERSION}\`."
             echo "- Four images mirrored and verified against the live \`helm template\`"

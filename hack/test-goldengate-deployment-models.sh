@@ -9056,6 +9056,51 @@ else
   fail "Phase 11 6: an unapproved repository variable remains referenced in active workflows:"$'\n'"${UNAPPROVED_VARS_HITS}"
 fi
 
+# 7: argocd-eks-deployment.yaml's IAM-policy validation step derives its POLICY_FILE path from GG_ENVIRONMENT (the generator's policy_folder = "argocd-ecr-oci-read-<environment>" naming contract), never a second hardcoded envs/dev/... literal.
+if grep -qF 'envs/dev/policies/argocd-ecr-oci-read-dev' .github/workflows/argocd-eks-deployment.yaml 2>/dev/null; then
+  fail "Phase 11 7: argocd-eks-deployment.yaml still hardcodes envs/dev/policies/argocd-ecr-oci-read-dev"
+elif grep -qF 'POLICY_FILE="envs/${GG_ENVIRONMENT}/policies/argocd-ecr-oci-read-${GG_ENVIRONMENT}/policies/policies_1.json"' .github/workflows/argocd-eks-deployment.yaml 2>/dev/null; then
+  pass "Phase 11 7: argocd-eks-deployment.yaml's IAM-policy validation step derives POLICY_FILE from GG_ENVIRONMENT, never a hardcoded envs/dev/... literal"
+else
+  fail "Phase 11 7: argocd-eks-deployment.yaml no longer derives POLICY_FILE from GG_ENVIRONMENT as expected"
+fi
+
+# 8: cloudwatch-observability-artifact-sync.yaml's chart-rendering step uses the canonical OBSERVABILITY_NAMESPACE, never a hardcoded amazon-cloudwatch literal.
+if grep -qE -- '--namespace[[:space:]]+amazon-cloudwatch([[:space:]]|$)' .github/workflows/cloudwatch-observability-artifact-sync.yaml 2>/dev/null; then
+  fail "Phase 11 8: cloudwatch-observability-artifact-sync.yaml still renders with a hardcoded --namespace amazon-cloudwatch"
+elif grep -qF -- '--namespace "${OBSERVABILITY_NAMESPACE}"' .github/workflows/cloudwatch-observability-artifact-sync.yaml 2>/dev/null; then
+  pass "Phase 11 8: cloudwatch-observability-artifact-sync.yaml renders with the canonical --namespace \"\${OBSERVABILITY_NAMESPACE}\", never a hardcoded amazon-cloudwatch literal"
+else
+  fail "Phase 11 8: cloudwatch-observability-artifact-sync.yaml no longer renders with --namespace \"\${OBSERVABILITY_NAMESPACE}\" as expected"
+fi
+
+# 9: goldengate-observability.yaml's rendered ServiceAccount validation compares against the canonical target namespace (passed in as argv[2]), never the literal "amazon-cloudwatch".
+if grep -qF 'sa["metadata"].get("namespace") == "amazon-cloudwatch"' .github/workflows/goldengate-observability.yaml 2>/dev/null; then
+  fail "Phase 11 9: goldengate-observability.yaml's ServiceAccount validation still compares against the literal \"amazon-cloudwatch\""
+elif grep -qF 'python3 - "$RENDERED" "$TARGET_NAMESPACE" <<'"'"'PYEOF'"'"'' .github/workflows/goldengate-observability.yaml 2>/dev/null \
+    && grep -qF 'sa["metadata"].get("namespace") == expected_namespace' .github/workflows/goldengate-observability.yaml 2>/dev/null; then
+  pass "Phase 11 9: goldengate-observability.yaml's ServiceAccount validation receives \$TARGET_NAMESPACE as argv[2] and compares against expected_namespace, never the literal \"amazon-cloudwatch\""
+else
+  fail "Phase 11 9: goldengate-observability.yaml's ServiceAccount validation no longer passes/uses the canonical target namespace as expected"
+fi
+
+# 10: known current environment-derived IAM role NAMES are not independently embedded anywhere in active workflow diagnostics -- every one of these has a canonical *_ROLE_NAME resolver output available wherever it was previously hardcoded.
+STALE_ROLE_NAME_RE='GoldenGateSecretsReadRole-dev|GoldenGateArgocdECRRead-dev|GoldenGateCloudWatchMetricsRole-dev|GoldenGateMonitorReadRole-dev|GoldenGatePlatformLoggingRole-dev|GoldenGateEKSDeployRole-dev'
+STALE_ROLE_NAME_HITS="$(grep -rlE "$STALE_ROLE_NAME_RE" .github/workflows/*.yaml 2>/dev/null || true)"
+if [ -z "$STALE_ROLE_NAME_HITS" ]; then
+  pass "Phase 11 10: no active workflow independently embeds a current environment-derived IAM role NAME literal (GoldenGateSecretsReadRole-dev/GoldenGateArgocdECRRead-dev/GoldenGateCloudWatchMetricsRole-dev/GoldenGateMonitorReadRole-dev/GoldenGatePlatformLoggingRole-dev/GoldenGateEKSDeployRole-dev) -- every diagnostic uses the canonical *_ROLE_NAME resolver output"
+else
+  fail "Phase 11 10: an active workflow independently embeds a stale environment-derived IAM role name literal:"$'\n'"${STALE_ROLE_NAME_HITS}"
+fi
+
+# 11: no active workflow runtime/validation path references envs/dev/policies/ or envs/dev/argocd/ -- the sole approved pre-checkout bootstrap exceptions are goldengate-eks-app.yaml's push trigger path ('envs/dev/**'), its matching run-name/comment, and gg-iam-secrets-deployment.yaml's documented Phase-12 region selector (checked separately by Phase 11 check 3 above).
+ENVS_DEV_RUNTIME_HITS="$(grep -rn 'envs/dev/policies/\|envs/dev/argocd/' .github/workflows/*.yaml 2>/dev/null || true)"
+if [ -z "$ENVS_DEV_RUNTIME_HITS" ]; then
+  pass "Phase 11 11: no active workflow runtime/validation path references envs/dev/policies/ or envs/dev/argocd/ -- every reference is environment-derived (envs/\${GG_ENVIRONMENT}/... or envs/<environment>/... in comments)"
+else
+  fail "Phase 11 11: an active workflow still references envs/dev/policies/ or envs/dev/argocd/ outside the approved bootstrap exceptions:"$'\n'"${ENVS_DEV_RUNTIME_HITS}"
+fi
+
 echo ""
 echo "=================================================="
 echo "Summary: ${PASS_COUNT} passed, ${FAIL_COUNT} failed, ${SKIP_COUNT} skipped"
