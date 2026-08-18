@@ -19,8 +19,8 @@ import yaml  # noqa: E402
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MONITOR_SRC = os.path.join(REPO_ROOT, "monitoring", "monitor")
 HELPER_PATH = os.path.join(REPO_ROOT, "hack", "goldengate-metrics-config.py")
-MONITOR_WORKFLOW_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "goldengate-monitor.yaml")
-METRICS_CONFIG_WORKFLOW_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "goldengate-monitor-metrics-config.yaml")
+MONITOR_WORKFLOW_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "50-sub-monitor.yaml")
+METRICS_CONFIG_WORKFLOW_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "80-ops-monitor-metrics-config.yaml")
 
 sys.path.insert(0, MONITOR_SRC)
 
@@ -433,7 +433,7 @@ class MetricsConfigHelperTests(unittest.TestCase):
         self.assertIn("ALL_NEW attributes show metricsEnabled", out)
 
 
-# Static source-level invariants for hack/goldengate-metrics-config.py and the two inline CONFIG readers in goldengate-monitor.yaml.
+# Static source-level invariants for hack/goldengate-metrics-config.py and the two inline CONFIG readers in 50-sub-monitor.yaml.
 class SourceLevelSafetyInvariantTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

@@ -1,8 +1,8 @@
-name: Goldengate platform deployment
+name: "30 | SUB | GoldenGate Platform"
 
-run-name: "Cloud Factory - GoldenGate platform bootstrap build and deploy | ${{ github.event_name == 'workflow_dispatch' && format('manual dispatch (deploy={0})', inputs.deploy) || format('auto: platform changes on {0}', github.sha) }} | ran by ${{ github.actor }}"
+run-name: "SUB | GoldenGate platform bootstrap build and deploy | ${{ github.event_name == 'workflow_dispatch' && format('manual dispatch (deploy={0})', inputs.deploy) || format('auto: platform changes on {0}', github.sha) }} | ran by ${{ github.actor }}"
 
-# Manual dispatch only, deliberately with no push trigger: this workflow must run after the IAM Terraform apply and argocd-eks-deployment.yaml (see the required order in the "Workflow summary" step); do not re-add a push trigger without also solving that ordering problem.
+# Manual dispatch only, deliberately with no push trigger: this workflow must run after the IAM Terraform apply and 20-sub-argocd.yaml (see the required order in the "Workflow summary" step); do not re-add a push trigger without also solving that ordering problem.
 on:
   workflow_dispatch:
     inputs:
@@ -53,7 +53,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Single job: this chart builds/pushes no container image of its own (Namespaces, shared ServiceAccounts, and the Fluent Bit DaemonSet are the only resources), so unlike goldengate-monitor.yaml there is no separate image-build job -- the Fluent Bit image is a pre-mirrored digest reference only read and verified here, never built or copied.
+  # Single job: this chart builds/pushes no container image of its own (Namespaces, shared ServiceAccounts, and the Fluent Bit DaemonSet are the only resources), so unlike 50-sub-monitor.yaml there is no separate image-build job -- the Fluent Bit image is a pre-mirrored digest reference only read and verified here, never built or copied.
   package_publish_and_deploy:
     name: Build, publish, and deploy the GoldenGate platform bootstrap via Argo CD
 
@@ -833,8 +833,10 @@ jobs:
           kubectl get crd applications.argoproj.io >/dev/null || {
             echo "CRD applications.argoproj.io not found."
             echo "Argo CD prerequisite is not healthy."
-            echo "The main orchestrator (goldengate-eks-app.yaml) normally classifies and bootstrap-validates Argo CD before this stage runs."
-            echo "For standalone execution, deploy/repair Argo CD through argocd-eks-deployment.yaml."
+            echo "The MAIN orchestrator normally classifies and bootstrap-validates Argo CD before this stage runs:"
+            echo "  00 | MAIN | GoldenGate EKS End-to-End Deployment (.github/workflows/00-main-goldengate-orchestrator.yaml)"
+            echo "For standalone repair/reconciliation use:"
+            echo "  20 | SUB | Argo CD (.github/workflows/20-sub-argocd.yaml)"
             exit 1
           }
 
@@ -846,13 +848,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Must fail clearly here, not inject a credential, if argocd-eks-deployment.yaml has not yet provisioned this Secret.
+          # Must fail clearly here, not inject a credential, if 20-sub-argocd.yaml has not yet provisioned this Secret.
           if ! kubectl get secret "$ARGOCD_PLATFORM_SECRET_NAME" -n "$ARGOCD_NAMESPACE" >/dev/null 2>&1; then
             echo "PREREQUISITE NOT MET: Secret ${ARGOCD_PLATFORM_SECRET_NAME} does not exist in namespace ${ARGOCD_NAMESPACE}."
             echo ""
             echo "Required order before running this workflow:"
             echo "  1. Run the IAM/Secrets Terraform workflow (applies the extended trust policy on ${RUNTIME_ROLE_NAME})."
-            echo "  2. Re-run the argocd-eks-deployment.yaml workflow (picks up the new goldengate-platform"
+            echo "  2. Re-run the 20-sub-argocd.yaml workflow (picks up the new goldengate-platform"
             echo "     entry in envs/${GG_ENVIRONMENT}/argocd/values.yaml ecrTokenSync.repositories and provisions this Secret)."
             echo "  3. Re-run this workflow."
             echo ""
@@ -877,7 +879,7 @@ jobs:
 
           echo "Applying Argo CD Application: ${ARGOCD_APP_NAME}"
 
-          # Single designated owner of the shared runtime namespace, so (unlike per-runtime goldengate-eks-app.yaml Applications) it is allowed CreateNamespace=true and managedNamespaceMetadata.
+          # Single designated owner of the shared runtime namespace, so (unlike per-runtime 00-main-goldengate-orchestrator.yaml Applications) it is allowed CreateNamespace=true and managedNamespaceMetadata.
           kubectl apply -f - <<EOF
           apiVersion: argoproj.io/v1alpha1
           kind: Application
@@ -1055,7 +1057,7 @@ jobs:
             echo "ServiceAccount/${RUNTIME_SA_NAME} (the one canonical runtime identity every"
             echo "GoldenGate deployment type shares -- this is a fresh EKS cluster, so no"
             echo "migration-compatibility ServiceAccount is created or expected). Individual"
-            echo "GoldenGate runtime Applications (goldengate-eks-app.yaml) reference their"
+            echo "GoldenGate runtime Applications (00-main-goldengate-orchestrator.yaml) reference their"
             echo "resolved ServiceAccount by name only (serviceAccount.create=false) and never"
             echo "own or delete it."
             echo ""
@@ -1072,7 +1074,7 @@ jobs:
             echo "### Required deployment order"
             echo ""
             echo "1. IAM/Secrets Terraform workflow (applies the trust policy on \`${RUNTIME_ROLE_NAME}\` -- see envs/${GG_ENVIRONMENT}/policies/goldengate-secrets-read-${GG_ENVIRONMENT}/)."
-            echo "2. argocd-eks-deployment.yaml (provisions the argocd-ecr-goldengate-platform-oci repository Secret)."
+            echo "2. 20-sub-argocd.yaml (provisions the argocd-ecr-goldengate-platform-oci repository Secret)."
             echo "3. This workflow."
             echo "4. Only then may a runtime candidate (gg-oracle-payments-01, gg-postgresql-payments-01) set deployment.enabled=true."
           } >> "$GITHUB_STEP_SUMMARY"

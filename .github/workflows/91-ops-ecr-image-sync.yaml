@@ -1,5 +1,5 @@
-name: Cloud Factory - Image Sync Pipeline
-run-name: 'Cloud Factory - Image Sync Pipeline ran by ${{ github.actor }}'
+name: "91 | OPS | ECR Image Sync"
+run-name: 'OPS | Image Sync Pipeline ran by ${{ github.actor }}'
 
 on:
   workflow_dispatch:

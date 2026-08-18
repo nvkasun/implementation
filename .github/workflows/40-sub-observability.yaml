@@ -1,6 +1,6 @@
-name: Goldengate observability deployment
+name: "40 | SUB | Observability"
 
-run-name: "Cloud Factory - GoldenGate observability (CloudWatch metrics) build and deploy | ${{ inputs.environment }} | deploy=${{ inputs.deploy }} | ran by ${{ github.actor }}"
+run-name: "SUB | GoldenGate observability (CloudWatch metrics) build and deploy | ${{ inputs.environment }} | deploy=${{ inputs.deploy }} | ran by ${{ github.actor }}"
 
 # Deploys the upstream amazon-cloudwatch-observability Helm chart directly from private ECR (no wrapper chart) for EKS cluster/node/pod metrics only; logs and GoldenGate-specific metrics are handled by gg-fluent-bit and gg-monitor respectively. workflow_dispatch only, no push trigger.
 on:
@@ -831,7 +831,10 @@ jobs:
 
           if echo "$CRD_OUTPUT" | grep -qEi 'NotFound|not found'; then
             echo "FAIL: the Kubernetes API is reachable, but applications.argoproj.io is genuinely absent."
-            echo "Argo CD prerequisite is not healthy. This workflow is standalone and does not classify/bootstrap Argo CD itself -- deploy/repair Argo CD through argocd-eks-deployment.yaml, then re-run."
+            echo "Argo CD prerequisite is not healthy. This workflow is standalone and does not classify/bootstrap Argo CD itself."
+            echo "For standalone repair/reconciliation use:"
+            echo "  20 | SUB | Argo CD (.github/workflows/20-sub-argocd.yaml)"
+            echo "then re-run."
             exit 1
           fi
 
@@ -859,9 +862,9 @@ jobs:
             echo ""
             echo "Required order before running this workflow with deploy=true:"
             echo "  1. Phase 6B2A IAM/Terraform workflow completed (${CLOUDWATCH_METRICS_ROLE_NAME}, performance log group)."
-            echo "  2. Re-run argocd-eks-deployment.yaml (picks up the new amazon-cloudwatch-observability"
+            echo "  2. Re-run 20-sub-argocd.yaml (picks up the new amazon-cloudwatch-observability"
             echo "     entry in envs/${GG_ENVIRONMENT}/argocd/values.yaml ecrTokenSync.repositories and provisions this Secret)."
-            echo "  3. Re-run this workflow (goldengate-observability.yaml) with deploy=true."
+            echo "  3. Re-run this workflow (40-sub-observability.yaml) with deploy=true."
             echo ""
             echo "Refusing to inject a short-lived credential as a workaround -- the in-cluster IRSA token sync is the only long-term credential mechanism."
             exit 1
@@ -2133,7 +2136,7 @@ jobs:
               echo "deploy=false: no Argo CD Application was created or updated, and no live Kubernetes"
               echo "validation was performed. Re-run with deploy=true after confirming the required order:"
               echo "1. Phase 6B2A IAM/Terraform workflow completed."
-              echo "2. argocd-eks-deployment.yaml re-run after this Phase 6B2B source change."
-              echo "3. This workflow (goldengate-observability.yaml) run with deploy=true."
+              echo "2. 20-sub-argocd.yaml re-run after this Phase 6B2B source change."
+              echo "3. This workflow (40-sub-observability.yaml) run with deploy=true."
             fi
           } >> "$GITHUB_STEP_SUMMARY"

@@ -1,6 +1,6 @@
-name: Argo CD EKS deployment
+name: "20 | SUB | Argo CD"
 
-run-name: "Cloud Factory - Argo CD Helm build and deploy | ${{ inputs.environment }} | ran by ${{ github.actor }}"
+run-name: "SUB | Argo CD Helm build and deploy | ${{ inputs.environment }} | ran by ${{ github.actor }}"
 
 on:
   workflow_dispatch:

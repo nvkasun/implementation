@@ -185,7 +185,7 @@ does not override it -- the base default is what deploys unless a specific
 run explicitly requests otherwise.
 
 Activation is controlled by a single workflow_dispatch Boolean input on
-`.github/workflows/goldengate-monitor.yaml`:
+`.github/workflows/50-sub-monitor.yaml`:
 
 - `enable_cloudwatch_publication` (`type: boolean`, `required: true`,
   `default: false`).
@@ -459,7 +459,7 @@ remains unimplemented.
 Single source: the folder-driven `envs/<environment>/*/values.yaml` descriptors,
 parsed exclusively by `hack/goldengate-deployment-model.py`. The workflow
 generates a `goldengate-deployments.yaml` registry from that tool and mounts
-it into the pod (via a ConfigMap staged by `.github/workflows/goldengate-monitor.yaml`)
+it into the pod (via a ConfigMap staged by `.github/workflows/50-sub-monitor.yaml`)
 at `REPO_CONFIG_ROOT` (default `/etc/gg-canonical`). Internal service host,
 TLS server name, and default ports are derived from each deployment's `name`,
 never stored redundantly.
@@ -560,7 +560,7 @@ docker build \
 
 ## Deployment order
 
-1. IAM/Secrets Terraform workflow (`gg-iam-secrets-deployment.yaml`).
-2. Argo CD deployment workflow (`argocd-eks-deployment.yaml`).
-3. `goldengate-monitor.yaml`.
+1. IAM/Secrets Terraform workflow (`10-sub-iam-secrets.yaml`).
+2. Argo CD deployment workflow (`20-sub-argocd.yaml`).
+3. `50-sub-monitor.yaml`.
 4. Verify the portal (`/`, `/api/status`) and the DynamoDB records.

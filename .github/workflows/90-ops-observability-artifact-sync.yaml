@@ -1,6 +1,6 @@
-name: Cloud Factory - CloudWatch Observability artifact sync
+name: "90 | OPS | Observability Artifact Sync"
 
-run-name: "Cloud Factory - CloudWatch Observability artifact sync (Phase 6B1) ran by ${{ github.actor }}"
+run-name: "OPS | CloudWatch Observability artifact sync (Phase 6B1) ran by ${{ github.actor }}"
 
 # Supply-chain mirroring/verification only (no kubectl/helm install/Argo CD/Terraform); manual dispatch only, no push trigger.
 on:

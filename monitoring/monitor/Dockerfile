@@ -1,4 +1,4 @@
-# No public default: caller must supply a digest-pinned, private-ECR BASE_IMAGE (validated in goldengate-monitor.yaml).
+# No public default: caller must supply a digest-pinned, private-ECR BASE_IMAGE (validated in 50-sub-monitor.yaml).
 ARG BASE_IMAGE
 
 FROM ${BASE_IMAGE}

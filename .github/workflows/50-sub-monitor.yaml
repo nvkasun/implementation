@@ -1,6 +1,6 @@
-name: Goldengate monitor deployment
+name: "50 | SUB | GoldenGate Monitor"
 
-run-name: "Cloud Factory - GoldenGate monitor build and deploy | manual dispatch (deploy=${{ inputs.deploy }}, cloudwatch=${{ inputs.enable_cloudwatch_publication }}) | ran by ${{ github.actor }}"
+run-name: "SUB | GoldenGate monitor build and deploy | manual dispatch (deploy=${{ inputs.deploy }}, cloudwatch=${{ inputs.enable_cloudwatch_publication }}) | ran by ${{ github.actor }}"
 
 
 # Manual dispatch only until the initial rollout is validated; automatic push trigger is restored afterward.
@@ -28,7 +28,7 @@ on:
         default: false
 
       metrics_gate_expectation:
-        description: "Only checked when enable_cloudwatch_publication=true. Safe staged activation order: (1) first run with publication=true and expectation=all-disabled to prove the global switch deploys while every deployment gate stays closed; (2) use the separate goldengate-monitor-metrics-config.yaml workflow to enable each deployment's CONFIG.metricsEnabled individually and verify custom metrics manually in CloudWatch; (3) once satisfied, run this workflow again with publication=true and expectation=all-enabled. 'any' accepts a valid mixture of literal true/false CONFIG values (still rejects missing/malformed CONFIG or alertsEnabled=true) -- use only once staged activation is already complete and mixed states are expected/intentional."
+        description: "Only checked when enable_cloudwatch_publication=true. Safe staged activation order: (1) first run with publication=true and expectation=all-disabled to prove the global switch deploys while every deployment gate stays closed; (2) use the separate 80-ops-monitor-metrics-config.yaml workflow to enable each deployment's CONFIG.metricsEnabled individually and verify custom metrics manually in CloudWatch; (3) once satisfied, run this workflow again with publication=true and expectation=all-enabled. 'any' accepts a valid mixture of literal true/false CONFIG values (still rejects missing/malformed CONFIG or alertsEnabled=true) -- use only once staged activation is already complete and mixed states are expected/intentional."
         required: true
         type: choice
         default: any
@@ -1211,8 +1211,10 @@ jobs:
           kubectl get crd applications.argoproj.io >/dev/null || {
             echo "CRD applications.argoproj.io not found."
             echo "Argo CD prerequisite is not healthy."
-            echo "The main orchestrator (goldengate-eks-app.yaml) normally classifies and bootstrap-validates Argo CD before this stage runs."
-            echo "For standalone execution, deploy/repair Argo CD through argocd-eks-deployment.yaml."
+            echo "The MAIN orchestrator normally classifies and bootstrap-validates Argo CD before this stage runs:"
+            echo "  00 | MAIN | GoldenGate EKS End-to-End Deployment (.github/workflows/00-main-goldengate-orchestrator.yaml)"
+            echo "For standalone repair/reconciliation use:"
+            echo "  20 | SUB | Argo CD (.github/workflows/20-sub-argocd.yaml)"
             exit 1
           }
 
@@ -1230,7 +1232,7 @@ jobs:
             echo ""
             echo "Required order before running this workflow standalone (the main orchestrator normally sequences this automatically):"
             echo "  1. Run the IAM/Secrets Terraform workflow (applies the extended Argo CD ECR read policy)."
-            echo "  2. Run the argocd-eks-deployment.yaml workflow (deploys multi-repository token sync and creates this Secret)."
+            echo "  2. Run the 20-sub-argocd.yaml workflow (deploys multi-repository token sync and creates this Secret)."
             echo "  3. Re-run this workflow."
             echo ""
             echo "Refusing to inject a short-lived credential as a workaround -- the in-cluster IRSA token sync is the only long-term credential mechanism."
@@ -1991,7 +1993,7 @@ jobs:
             echo "### Required deployment order"
             echo ""
             echo "1. IAM/Secrets Terraform workflow (extended Argo CD ECR read policy)."
-            echo "2. argocd-eks-deployment.yaml (multi-repository token sync, both repository Secrets)."
+            echo "2. 20-sub-argocd.yaml (multi-repository token sync, both repository Secrets)."
             echo "3. This workflow."
             echo "4. Verify the portal and DynamoDB records."
           } >> "$GITHUB_STEP_SUMMARY"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds deployment_matrix/deletion_matrix step outputs for envs/dev/ GoldenGate deployments; the single implementation wrapped by .github/workflows/goldengate-eks-app.yaml.
+# Builds deployment_matrix/deletion_matrix step outputs for envs/dev/ GoldenGate deployments; the single implementation wrapped by .github/workflows/00-main-goldengate-orchestrator.yaml.
 set -euo pipefail
 
 # Returns 0/1 (active/inactive) with a one-line reason on stdout; inactive if missing/empty/comment-only/null YAML, or enabled:false/deployment.enabled:false/lifecycle.state:absent; prefers PyYAML, falls back to text patterns.

@@ -1,4 +1,4 @@
-# Argo CD dev/test values: non-HA single-replica install; all images must resolve to private ECR (enforced by argocd-eks-deployment.yaml); no Applications/repo creds/SSO configured here.
+# Argo CD dev/test values: non-HA single-replica install; all images must resolve to private ECR (enforced by 20-sub-argocd.yaml); no Applications/repo creds/SSO configured here.
 
 argo-cd:
   global:

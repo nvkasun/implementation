@@ -1,6 +1,6 @@
-name: GoldenGate EKS app deployment
+name: "00 | MAIN | GoldenGate EKS End-to-End Deployment"
 
-run-name: "Cloud Factory - GoldenGate Helm build and deploy | ${{ github.event_name == 'workflow_dispatch' && inputs.deployment_id || format('auto: envs/dev changes on {0}', github.sha) }} | ran by ${{ github.actor }}"
+run-name: "MAIN | GoldenGate Helm build and deploy | ${{ github.event_name == 'workflow_dispatch' && inputs.deployment_id || format('auto: envs/dev changes on {0}', github.sha) }} | ran by ${{ github.actor }}"
 
 on:
   workflow_dispatch:
@@ -293,7 +293,7 @@ jobs:
       packages: write
       pull-requests: read
 
-    uses: ./.github/workflows/gg-iam-secrets-deployment.yaml
+    uses: ./.github/workflows/10-sub-iam-secrets.yaml
     secrets: inherit
     with:
       environment: ${{ needs.validate_model.outputs.selected_environment }}
@@ -399,7 +399,7 @@ jobs:
           echo "state=${STATE}" >> "$GITHUB_OUTPUT"
 
           if [ "$STATE" = "BROKEN" ]; then
-            echo "FAIL: Argo CD prerequisite state is BROKEN. This is not auto-repaired here -- investigate the diagnostics above and repair Argo CD (or run argocd-eks-deployment.yaml standalone) before re-running."
+            echo "FAIL: Argo CD prerequisite state is BROKEN. This is not auto-repaired here -- investigate the diagnostics above and repair Argo CD (or run 20 | SUB | Argo CD -- .github/workflows/20-sub-argocd.yaml -- standalone) before re-running."
             exit 1
           fi
 
@@ -412,7 +412,7 @@ jobs:
       - argocd_preflight
     if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.argocd_preflight.result == 'success' && needs.argocd_preflight.outputs.state == 'ABSENT' }}
 
-    uses: ./.github/workflows/argocd-eks-deployment.yaml
+    uses: ./.github/workflows/20-sub-argocd.yaml
     secrets: inherit
     with:
       environment: ${{ needs.validate_model.outputs.selected_environment }}
@@ -528,7 +528,7 @@ jobs:
       - validate_argocd_ready
     if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.validate_argocd_ready.result == 'success' }}
 
-    uses: ./.github/workflows/goldengate-platform.yaml
+    uses: ./.github/workflows/30-sub-platform.yaml
     with:
       environment: ${{ needs.validate_model.outputs.selected_environment }}
       deploy: true
@@ -2197,7 +2197,8 @@ jobs:
             echo "CRD applications.argoproj.io not found."
             echo "Argo CD prerequisite is not healthy."
             echo "This orchestrator's own argocd_preflight/bootstrap_argocd/validate_argocd_ready jobs normally classify and bootstrap-validate Argo CD before this stage runs -- this check is defense in depth, not the primary gate."
-            echo "For standalone execution, deploy/repair Argo CD through argocd-eks-deployment.yaml."
+            echo "For standalone repair/reconciliation use:"
+            echo "  20 | SUB | Argo CD (.github/workflows/20-sub-argocd.yaml)"
             exit 1
           }
 
@@ -2921,10 +2922,10 @@ jobs:
       - build_publish_and_deploy
       - delete_removed_argocd_applications
       - replication_reconcile_once
-    # goldengate-monitor.yaml publishes unconditionally on every internal step, so this call must be skipped entirely for deploy=false. Also skipped when the canonical model has zero active runtimes (e.g. full decommission): the monitor legitimately refuses to start against an empty registry, so this orchestrator must not invoke it rather than let that be a real failure.
+    # 50-sub-monitor.yaml publishes unconditionally on every internal step, so this call must be skipped entirely for deploy=false. Also skipped when the canonical model has zero active runtimes (e.g. full decommission): the monitor legitimately refuses to start against an empty registry, so this orchestrator must not invoke it rather than let that be a real failure.
     if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.validate_model.outputs.has_active_deployments == 'true' && always() && needs.validate_shared_secrets_once.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' && needs.replication_reconcile_once.result != 'failure' && needs.replication_reconcile_once.result != 'cancelled' }}
 
-    uses: ./.github/workflows/goldengate-monitor.yaml
+    uses: ./.github/workflows/50-sub-monitor.yaml
     with:
       environment: ${{ needs.validate_model.outputs.selected_environment }}
       deploy: true

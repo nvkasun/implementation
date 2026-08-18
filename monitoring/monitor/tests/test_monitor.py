@@ -17,8 +17,8 @@ import yaml
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-MONITOR_WORKFLOW_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "goldengate-monitor.yaml")
-ARGOCD_WORKFLOW_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "argocd-eks-deployment.yaml")
+MONITOR_WORKFLOW_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "50-sub-monitor.yaml")
+ARGOCD_WORKFLOW_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "20-sub-argocd.yaml")
 DEPLOYMENT_MODEL_TOOL_PATH = os.path.join(REPO_ROOT, "hack", "goldengate-deployment-model.py")
 
 

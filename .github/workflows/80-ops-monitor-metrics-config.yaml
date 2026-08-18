@@ -1,6 +1,6 @@
-name: GoldenGate monitor metrics configuration
+name: "80 | OPS | Monitor Metrics Configuration"
 
-run-name: "Cloud Factory - GoldenGate monitor metrics CONFIG update | ${{ inputs.deployment_name }} -> metricsEnabled=${{ inputs.desired_metrics_enabled }} (apply=${{ inputs.apply_change }}) | ran by ${{ github.actor }}"
+run-name: "OPS | GoldenGate monitor metrics CONFIG update | ${{ inputs.deployment_name }} -> metricsEnabled=${{ inputs.desired_metrics_enabled }} (apply=${{ inputs.apply_change }}) | ran by ${{ github.actor }}"
 
 # Updates CONFIG.metricsEnabled for one deployment via the gg-monitor pod's own IRSA; never touches Terraform, images, Helm, Argo CD, or other Kubernetes objects.
 on:
@@ -295,7 +295,7 @@ jobs:
 
           if [ "$POD_CLOUDWATCH_ENV" != "true" ]; then
             echo "FAIL: desired_metrics_enabled=true requires the deployed monitor's global hard switch (CLOUDWATCH_PUBLISH_ENABLED) to already be true. It is \"${POD_CLOUDWATCH_ENV:-<absent>}\"."
-            echo "Refusing to change DynamoDB. Run goldengate-monitor.yaml with enable_cloudwatch_publication=true first (see its metrics_gate_expectation=all-disabled staged-activation step), then re-run this workflow."
+            echo "Refusing to change DynamoDB. Run 50-sub-monitor.yaml with enable_cloudwatch_publication=true first (see its metrics_gate_expectation=all-disabled staged-activation step), then re-run this workflow."
             exit 1
           fi
           echo "OK: global hard switch is already true -- safe to proceed with enabling this deployment's gate."

@@ -16,16 +16,16 @@ RUNTIME_CHART="helm/goldengate"
 PLATFORM_CHART="helm/goldengate-platform"
 MONITOR_CHART="helm/goldengate-monitor"
 MONITOR_APP_DIR="monitoring/monitor"
-MONITOR_WORKFLOW=".github/workflows/goldengate-monitor.yaml"
-METRICS_CONFIG_WORKFLOW=".github/workflows/goldengate-monitor-metrics-config.yaml"
+MONITOR_WORKFLOW=".github/workflows/50-sub-monitor.yaml"
+METRICS_CONFIG_WORKFLOW=".github/workflows/80-ops-monitor-metrics-config.yaml"
 METRICS_CONFIG_HELPER_SCRIPT="hack/goldengate-metrics-config.py"
-EKS_APP_WORKFLOW=".github/workflows/goldengate-eks-app.yaml"
-PLATFORM_WORKFLOW=".github/workflows/goldengate-platform.yaml"
+EKS_APP_WORKFLOW=".github/workflows/00-main-goldengate-orchestrator.yaml"
+PLATFORM_WORKFLOW=".github/workflows/30-sub-platform.yaml"
 DETECT_SCRIPT="hack/detect-goldengate-deployments.sh"
 OBSERVABILITY_VALUES_FILE="platform/dev/goldengate-observability/values.yaml"
-OBSERVABILITY_WORKFLOW=".github/workflows/goldengate-observability.yaml"
+OBSERVABILITY_WORKFLOW=".github/workflows/40-sub-observability.yaml"
 ARGOCD_VALUES_FILE="envs/dev/argocd/values.yaml"
-ARGOCD_DEPLOY_WORKFLOW=".github/workflows/argocd-eks-deployment.yaml"
+ARGOCD_DEPLOY_WORKFLOW=".github/workflows/20-sub-argocd.yaml"
 
 # runtime.image.repository/ingress.hostDomain/ingress.alb.groupName/ingress.alb.certificateArn/runtime.csi.region are shared environment configuration -- resolved once here via the same resolver the deploy workflow uses, never an independently maintained literal.
 RESOLVED_DNS_DOMAIN="$(python3 "$ENVIRONMENT_TOOL" --environment dev get DNS_DOMAIN)"
@@ -339,7 +339,7 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
     cat "${WORKDIR}/lint-platform.log"
   fi
 
-  # Centralized container logging (platform Fluent Bit DaemonSet): uses the real dev values file and --set-string role-ARN/region/image injection pattern the actual goldengate-platform.yaml workflow uses; the digest below is the real, verified private ECR digest.
+  # Centralized container logging (platform Fluent Bit DaemonSet): uses the real dev values file and --set-string role-ARN/region/image injection pattern the actual 30-sub-platform.yaml workflow uses; the digest below is the real, verified private ECR digest.
   PLATFORM_DEV_VALUES="${REPO_ROOT}/platform/dev/goldengate-platform/values.yaml"
   FAKE_ORACLE_ROLE_ARN="arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev"
   FAKE_FLUENT_BIT_ROLE_ARN="arn:aws:iam::668311715351:role/GoldenGatePlatformLoggingRole-dev"
@@ -999,7 +999,7 @@ assert not (names & forbidden), names & forbidden
     fail "${ARGOCD_VALUES_FILE} not found, or python3 unavailable"
   fi
 
-  # 11: argocd-eks-deployment.yaml validates all four repository Secrets.
+  # 11: 20-sub-argocd.yaml validates all four repository Secrets.
   if [ -f "${REPO_ROOT}/${ARGOCD_DEPLOY_WORKFLOW}" ]; then
     if python3 -c "import yaml; yaml.safe_load(open('${REPO_ROOT}/${ARGOCD_DEPLOY_WORKFLOW}'))" >/dev/null 2>&1; then
       pass "11a: ${ARGOCD_DEPLOY_WORKFLOW} parses as strict YAML"
@@ -1027,7 +1027,7 @@ assert not (names & forbidden), names & forbidden
     fail "${ARGOCD_DEPLOY_WORKFLOW} not found"
   fi
 
-  # 12: the new goldengate-observability.yaml workflow.
+  # 12: the new 40-sub-observability.yaml workflow.
   if [ -f "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" ] && command -v python3 >/dev/null 2>&1; then
     if python3 -c "import yaml; yaml.safe_load(open('${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}'))" >/dev/null 2>&1; then
       pass "12a: ${OBSERVABILITY_WORKFLOW} parses as strict YAML"
@@ -1234,9 +1234,9 @@ else:
 PYEOF
 )"
     if [ "$OBSERVABILITY_CORRECTION_CHECK" = "OK" ]; then
-      pass "16: goldengate-observability.yaml Phase 6B2B safety correction: OCI path='.', ignoreDifferences/RespectIgnoreDifferences, chart-repository immutability, namespace-scoped negative checks, initContainers image coverage, all-CR filelog check, and IRSA env-var-name-only verification are all present exactly as required"
+      pass "16: 40-sub-observability.yaml Phase 6B2B safety correction: OCI path='.', ignoreDifferences/RespectIgnoreDifferences, chart-repository immutability, namespace-scoped negative checks, initContainers image coverage, all-CR filelog check, and IRSA env-var-name-only verification are all present exactly as required"
     else
-      fail "16: goldengate-observability.yaml Phase 6B2B safety correction check failed: ${OBSERVABILITY_CORRECTION_CHECK}"
+      fail "16: 40-sub-observability.yaml Phase 6B2B safety correction check failed: ${OBSERVABILITY_CORRECTION_CHECK}"
     fi
 
     # Runner/connectivity correction (focused, static/offline only -- no AWS/kubectl/network/Git call).
@@ -1342,9 +1342,9 @@ else:
 PYEOF
 )"
     if [ "$RUNNER_CONNECTIVITY_CHECK" = "OK" ]; then
-      pass "17: goldengate-observability.yaml Phase 6B2B runner/connectivity correction: exact CodeBuild runs-on (no ubuntu-latest), Helm/kubectl amd64+arm64 arch detection, a deploy-guarded 'Verify private EKS API connectivity and access' step correctly ordered between 'Connect to EKS cluster' and 'Ensure Argo CD Application CRD exists' with a bounded request timeout and non-CRD-blaming network-failure wording, and a CRD step that separately classifies present/not-found/forbidden/unexpected (the old unconditional false-diagnosis pattern is gone)"
+      pass "17: 40-sub-observability.yaml Phase 6B2B runner/connectivity correction: exact CodeBuild runs-on (no ubuntu-latest), Helm/kubectl amd64+arm64 arch detection, a deploy-guarded 'Verify private EKS API connectivity and access' step correctly ordered between 'Connect to EKS cluster' and 'Ensure Argo CD Application CRD exists' with a bounded request timeout and non-CRD-blaming network-failure wording, and a CRD step that separately classifies present/not-found/forbidden/unexpected (the old unconditional false-diagnosis pattern is gone)"
     else
-      fail "17: goldengate-observability.yaml Phase 6B2B runner/connectivity correction check failed: ${RUNNER_CONNECTIVITY_CHECK}"
+      fail "17: 40-sub-observability.yaml Phase 6B2B runner/connectivity correction check failed: ${RUNNER_CONNECTIVITY_CHECK}"
     fi
 
     # DaemonSet full-readiness and failure-diagnostics correction (focused, static/offline only).
@@ -1506,9 +1506,9 @@ else:
 PYEOF
 )"
     if [ "$DAEMONSET_READINESS_CHECK" = "OK" ]; then
-      pass "18: goldengate-observability.yaml Phase 6B2B DaemonSet full-readiness/diagnostics correction: wait_for_daemonset_fully_ready compares generation/observedGeneration/desired/current/updated/ready/available/unavailable with a bounded timeout+poll interval and is applied to both cloudwatch-agent and node-exporter (kubectl rollout status kept, not replaced); show_daemonset_diagnostics dynamically derives the pod selector from spec.selector.matchLabels and prints bounded pod state/events/current+previous logs before the step fails and exits non-zero; IRSA verification now iterates every cloudwatch-agent DaemonSet pod and requires the checked count to equal desiredNumberScheduled while still checking the cluster-scraper pod; Live Kubernetes validation requires exact numberReady==desired and numberAvailable==desired (no weak >=) with a zero-desired guard; the bounded log-diagnostics step is always()-guarded, never uses set -e, and exits 0; and no maxUnavailable/probe/resource/toleration/updateStrategy change was introduced"
+      pass "18: 40-sub-observability.yaml Phase 6B2B DaemonSet full-readiness/diagnostics correction: wait_for_daemonset_fully_ready compares generation/observedGeneration/desired/current/updated/ready/available/unavailable with a bounded timeout+poll interval and is applied to both cloudwatch-agent and node-exporter (kubectl rollout status kept, not replaced); show_daemonset_diagnostics dynamically derives the pod selector from spec.selector.matchLabels and prints bounded pod state/events/current+previous logs before the step fails and exits non-zero; IRSA verification now iterates every cloudwatch-agent DaemonSet pod and requires the checked count to equal desiredNumberScheduled while still checking the cluster-scraper pod; Live Kubernetes validation requires exact numberReady==desired and numberAvailable==desired (no weak >=) with a zero-desired guard; the bounded log-diagnostics step is always()-guarded, never uses set -e, and exits 0; and no maxUnavailable/probe/resource/toleration/updateStrategy change was introduced"
     else
-      fail "18: goldengate-observability.yaml Phase 6B2B DaemonSet full-readiness/diagnostics correction check failed: ${DAEMONSET_READINESS_CHECK}"
+      fail "18: 40-sub-observability.yaml Phase 6B2B DaemonSet full-readiness/diagnostics correction check failed: ${DAEMONSET_READINESS_CHECK}"
     fi
 
     # Host-network isolation correction (focused, static/offline only) -- workflow-side checks: semantic validation, rendered CR validation, live hostNetwork validation, and the exact crash-symptom log check.
@@ -1607,9 +1607,9 @@ else:
 PYEOF
 )"
     if [ "$HOSTNETWORK_WORKFLOW_CHECK" = "OK" ]; then
-      pass "19: goldengate-observability.yaml Phase 6B2B host-network isolation correction (workflow): semantic values validation requires exactly 2 named agents with cloudwatch-agent.mode=daemonset/hostNetwork=true and cloudwatch-agent-cluster-scraper.mode=deployment/config=default/hostNetwork=false; a dedicated step validates the two rendered AmazonCloudWatchAgent custom resources' spec.mode/spec.hostNetwork; Live Kubernetes validation checks both CR and DaemonSet/Deployment spec.template.spec.hostNetwork plus every individual node-agent and cluster-scraper pod via dynamically-derived selectors; and a bounded (--tail=80) log check detects the exact observed 'bind: address already in use' / 'binding address localhost:8888' crash symptom"
+      pass "19: 40-sub-observability.yaml Phase 6B2B host-network isolation correction (workflow): semantic values validation requires exactly 2 named agents with cloudwatch-agent.mode=daemonset/hostNetwork=true and cloudwatch-agent-cluster-scraper.mode=deployment/config=default/hostNetwork=false; a dedicated step validates the two rendered AmazonCloudWatchAgent custom resources' spec.mode/spec.hostNetwork; Live Kubernetes validation checks both CR and DaemonSet/Deployment spec.template.spec.hostNetwork plus every individual node-agent and cluster-scraper pod via dynamically-derived selectors; and a bounded (--tail=80) log check detects the exact observed 'bind: address already in use' / 'binding address localhost:8888' crash symptom"
     else
-      fail "19: goldengate-observability.yaml Phase 6B2B host-network isolation correction (workflow) check failed: ${HOSTNETWORK_WORKFLOW_CHECK}"
+      fail "19: 40-sub-observability.yaml Phase 6B2B host-network isolation correction (workflow) check failed: ${HOSTNETWORK_WORKFLOW_CHECK}"
     fi
   else
     fail "${OBSERVABILITY_WORKFLOW} not found, or python3 unavailable"
@@ -1852,9 +1852,9 @@ else:
 PYEOF
 )"
     if [ "$RECREATE_CORRECTION_CHECK" = "OK" ]; then
-      pass "21: goldengate-observability.yaml Phase 6B2B cluster-scraper Deployment recreate correction: the new deploy-guarded 'Ensure cluster-scraper Deployment host-network isolation' step is correctly ordered between Argo CD sync/health and the ServiceAccount annotation step; it confirms the live CR has hostNetwork=false before any deletion; validates the exact controller ownerReference UID against the CR UID before deleting; deletes only deployment/cloudwatch-agent-cluster-scraper (never the CR, DaemonSet, pods, ServiceAccount, Secret, or ConfigMap) with exactly one delete call in source; records the old UID and requires the recreated UID to differ; validates the recreated Deployment's hostNetwork=false and full readiness; validates every active scraper pod's hostNetwork=false, podIP!=hostIP, ServiceAccount, and IRSA env-var-name presence; is idempotent (both no-op paths mark 'not_required'); strict node-agent DaemonSet readiness is unchanged; the exact 127.0.0.1:8888 collision signatures remain checked; and no telemetry-port override, spec.args, direct CR, wrapper chart, chart/image upgrade, IAM, or Terraform change was introduced"
+      pass "21: 40-sub-observability.yaml Phase 6B2B cluster-scraper Deployment recreate correction: the new deploy-guarded 'Ensure cluster-scraper Deployment host-network isolation' step is correctly ordered between Argo CD sync/health and the ServiceAccount annotation step; it confirms the live CR has hostNetwork=false before any deletion; validates the exact controller ownerReference UID against the CR UID before deleting; deletes only deployment/cloudwatch-agent-cluster-scraper (never the CR, DaemonSet, pods, ServiceAccount, Secret, or ConfigMap) with exactly one delete call in source; records the old UID and requires the recreated UID to differ; validates the recreated Deployment's hostNetwork=false and full readiness; validates every active scraper pod's hostNetwork=false, podIP!=hostIP, ServiceAccount, and IRSA env-var-name presence; is idempotent (both no-op paths mark 'not_required'); strict node-agent DaemonSet readiness is unchanged; the exact 127.0.0.1:8888 collision signatures remain checked; and no telemetry-port override, spec.args, direct CR, wrapper chart, chart/image upgrade, IAM, or Terraform change was introduced"
     else
-      fail "21: goldengate-observability.yaml Phase 6B2B cluster-scraper Deployment recreate correction check failed: ${RECREATE_CORRECTION_CHECK}"
+      fail "21: 40-sub-observability.yaml Phase 6B2B cluster-scraper Deployment recreate correction check failed: ${RECREATE_CORRECTION_CHECK}"
     fi
   else
     fail "${OBSERVABILITY_WORKFLOW} not found, or python3 unavailable"
@@ -2031,9 +2031,9 @@ else:
 PYEOF
 )"
     if [ "$UID_AUTH_CHECK" = "OK" ]; then
-      pass "22: goldengate-observability.yaml Phase 6B2B UID-based recreation detection, hostNetwork null-normalization, and 'no recent CloudWatch export errors' validation: the old NotFound-interval anti-pattern is gone and replaced by a UID-comparison state machine handling NotFound/same-UID-terminating/same-UID/different-UID without ever requiring an observed absence, while preserving the one-delete guard and the reconciliation nudge; Deployment and Pod hostNetwork reads normalize null/omitted to false while the CR's own hostNetwork read stays strict; and the new deploy-guarded 'Validate no recent CloudWatch export errors' step is correctly ordered after IRSA verification and before Live Kubernetes validation, never uses a 'kubectl logs ... || true' fallback (failing closed instead on a retrieval error), requires checked node-agent pods to equal the DaemonSet's desiredNumberScheduled and checked scraper pods to be at least 1, captures a validation-start timestamp, uses --since-time and a bounded --tail=80, checks all required authorization and startup-collision signatures on active current-revision DaemonSet and ReplicaSet pods only, never claims successful export was proven, never prints secrets/tokens/env values/full manifests, and adds no CloudWatch read permission to the collector role"
+      pass "22: 40-sub-observability.yaml Phase 6B2B UID-based recreation detection, hostNetwork null-normalization, and 'no recent CloudWatch export errors' validation: the old NotFound-interval anti-pattern is gone and replaced by a UID-comparison state machine handling NotFound/same-UID-terminating/same-UID/different-UID without ever requiring an observed absence, while preserving the one-delete guard and the reconciliation nudge; Deployment and Pod hostNetwork reads normalize null/omitted to false while the CR's own hostNetwork read stays strict; and the new deploy-guarded 'Validate no recent CloudWatch export errors' step is correctly ordered after IRSA verification and before Live Kubernetes validation, never uses a 'kubectl logs ... || true' fallback (failing closed instead on a retrieval error), requires checked node-agent pods to equal the DaemonSet's desiredNumberScheduled and checked scraper pods to be at least 1, captures a validation-start timestamp, uses --since-time and a bounded --tail=80, checks all required authorization and startup-collision signatures on active current-revision DaemonSet and ReplicaSet pods only, never claims successful export was proven, never prints secrets/tokens/env values/full manifests, and adds no CloudWatch read permission to the collector role"
     else
-      fail "22: goldengate-observability.yaml Phase 6B2B UID-based recreation / hostNetwork normalization / authorization validation check failed: ${UID_AUTH_CHECK}"
+      fail "22: 40-sub-observability.yaml Phase 6B2B UID-based recreation / hostNetwork normalization / authorization validation check failed: ${UID_AUTH_CHECK}"
     fi
   else
     fail "${OBSERVABILITY_WORKFLOW} not found, or python3 unavailable"
@@ -2053,7 +2053,7 @@ PYEOF
     pass "14: no enable_cloudwatch Terraform variable/reference exists under envs/"
   fi
 
-  # 15: earlier phases' resources remain functionally untouched (comment-only edits are allowed and ignored here). envs/dev/policies/goldengate-cloudwatch-metrics-dev is excluded since the OTLP-authorization correction intentionally changes one condition operator there; helm/goldengate-platform and platform/dev/goldengate-platform are excluded since Phase 6D0 legitimately changes the per-flavour runtime ServiceAccounts there (guarded instead by the dedicated ServiceAccount/Fluent-Bit safety checks in this same suite). envs/dev/cloudwatch_observability.tf, envs/dev/cloudwatch_logs.tf, and envs/dev/policies/goldengate-platform-logging-dev are excluded starting with Fresh-EKS Phase A, which legitimately centralizes their log-group names onto envs/dev/environment.tf and regenerates goldengate-platform-logging-dev's assume_role_policy/sts.json for the new EKS OIDC issuer -- both already independently guarded by this same suite's render-iam-policies/environment-contract checks, never by this narrow historical byte-diff. This check's own paths list is now empty: cloudwatch-observability-artifact-sync.yaml is excluded starting with Phase 11, which legitimately adds an environment selector and loads canonical identity from envs/<environment>/environment.yaml instead of hardcoding it -- guarded instead by this suite's Phase 11 hardcoding-sweep checks, never by this narrow historical byte-diff.
+  # 15: earlier phases' resources remain functionally untouched (comment-only edits are allowed and ignored here). envs/dev/policies/goldengate-cloudwatch-metrics-dev is excluded since the OTLP-authorization correction intentionally changes one condition operator there; helm/goldengate-platform and platform/dev/goldengate-platform are excluded since Phase 6D0 legitimately changes the per-flavour runtime ServiceAccounts there (guarded instead by the dedicated ServiceAccount/Fluent-Bit safety checks in this same suite). envs/dev/cloudwatch_observability.tf, envs/dev/cloudwatch_logs.tf, and envs/dev/policies/goldengate-platform-logging-dev are excluded starting with Fresh-EKS Phase A, which legitimately centralizes their log-group names onto envs/dev/environment.tf and regenerates goldengate-platform-logging-dev's assume_role_policy/sts.json for the new EKS OIDC issuer -- both already independently guarded by this same suite's render-iam-policies/environment-contract checks, never by this narrow historical byte-diff. This check's own paths list is now empty: 90-ops-observability-artifact-sync.yaml is excluded starting with Phase 11, which legitimately adds an environment selector and loads canonical identity from envs/<environment>/environment.yaml instead of hardcoding it -- guarded instead by this suite's Phase 11 hardcoding-sweep checks, never by this narrow historical byte-diff.
   PHASE_6A_6B1_STATUS="$(python3 -c "
 import subprocess
 
@@ -2082,7 +2082,7 @@ for f in changed:
 print(('MISMATCH:' + ','.join(mismatches)) if mismatches else 'IDENTICAL')
 " 2>/dev/null || true)"
   if [ "$PHASE_6A_6B1_STATUS" = "IDENTICAL" ]; then
-    pass "15: no file remains in this check's historical byte-diff guard set (cloudwatch-observability-artifact-sync.yaml was legitimately released from it by Phase 11's environment centralization)"
+    pass "15: no file remains in this check's historical byte-diff guard set (90-ops-observability-artifact-sync.yaml was legitimately released from it by Phase 11's environment centralization)"
   else
     fail "15: an unexpected functional change was found in Phase 6A/6B1/6B2A files: ${PHASE_6A_6B1_STATUS:-unknown}"
   fi
@@ -2104,7 +2104,7 @@ print(('MISMATCH:' + ','.join(mismatches)) if mismatches else 'IDENTICAL')
     fail "${PLATFORM_WORKFLOW} not found, or python3 unavailable"
   fi
 
-  # The monitor chart's ConfigMap reads a staged copy of the canonical config from its own files/ directory -- never committed there (see goldengate-monitor.yaml) -- so lint/render stage a throwaway copy here.
+  # The monitor chart's ConfigMap reads a staged copy of the canonical config from its own files/ directory -- never committed there (see 50-sub-monitor.yaml) -- so lint/render stage a throwaway copy here.
   MONITOR_CHART_STAGED="${WORKDIR}/goldengate-monitor"
   cp -a "$MONITOR_CHART" "$MONITOR_CHART_STAGED"
   mkdir -p "${MONITOR_CHART_STAGED}/files"
@@ -2261,9 +2261,9 @@ if [ "$HARDCODE_FOUND" = "false" ]; then
 fi
 
 if grep -qE "pipelines/deployments\.yaml|topologies/dev|files/pipelines|files/topologies" "$MONITOR_WORKFLOW" 2>/dev/null; then
-  fail "goldengate-monitor.yaml still references the removed pipelines/topologies file layout"
+  fail "50-sub-monitor.yaml still references the removed pipelines/topologies file layout"
 else
-  pass "goldengate-monitor.yaml does not reference the removed pipelines/topologies file layout"
+  pass "50-sub-monitor.yaml does not reference the removed pipelines/topologies file layout"
 fi
 
 # 8. No committed generated copies of the canonical config inside charts.
@@ -2591,15 +2591,15 @@ fi
 if grep -q "enable_cloudwatch_publication:" "$MONITOR_WORKFLOW" 2>/dev/null \
     && grep -A3 "enable_cloudwatch_publication:" "$MONITOR_WORKFLOW" | grep -q "type: boolean" \
     && grep -A5 "enable_cloudwatch_publication:" "$MONITOR_WORKFLOW" | grep -q "default: false"; then
-  pass "goldengate-monitor.yaml defines enable_cloudwatch_publication as a required Boolean input defaulting to false"
+  pass "50-sub-monitor.yaml defines enable_cloudwatch_publication as a required Boolean input defaulting to false"
 else
-  fail "goldengate-monitor.yaml is missing the expected enable_cloudwatch_publication Boolean workflow_dispatch input"
+  fail "50-sub-monitor.yaml is missing the expected enable_cloudwatch_publication Boolean workflow_dispatch input"
 fi
 
 if grep -q "name: CloudWatch publication preflight (gate inventory)" "$MONITOR_WORKFLOW" 2>/dev/null; then
-  pass "goldengate-monitor.yaml defines the CloudWatch publication preflight step"
+  pass "50-sub-monitor.yaml defines the CloudWatch publication preflight step"
 else
-  fail "goldengate-monitor.yaml is missing the CloudWatch publication preflight step"
+  fail "50-sub-monitor.yaml is missing the CloudWatch publication preflight step"
 fi
 
 # The preflight uses a gate inventory governed by metrics_gate_expectation (any/all-disabled/all-enabled) rather than requiring every enabled deployment to already have metricsEnabled=true, enabling staged activation (deploy switch closed, enable per-deployment via the config workflow, then verify).
@@ -2608,49 +2608,49 @@ if grep -q "metrics_gate_expectation:" "$MONITOR_WORKFLOW" 2>/dev/null \
     && grep -A10 "metrics_gate_expectation:" "$MONITOR_WORKFLOW" | grep -q -- "- all-disabled" \
     && grep -A10 "metrics_gate_expectation:" "$MONITOR_WORKFLOW" | grep -q -- "- all-enabled" \
     && grep -A10 "metrics_gate_expectation:" "$MONITOR_WORKFLOW" | grep -q "default: any"; then
-  pass "goldengate-monitor.yaml defines metrics_gate_expectation with any/all-disabled/all-enabled, defaulting to any"
+  pass "50-sub-monitor.yaml defines metrics_gate_expectation with any/all-disabled/all-enabled, defaulting to any"
 else
-  fail "goldengate-monitor.yaml is missing the metrics_gate_expectation workflow_dispatch input or its expected options/default"
+  fail "50-sub-monitor.yaml is missing the metrics_gate_expectation workflow_dispatch input or its expected options/default"
 fi
 
 if grep -q 'if \[ "\$GATE_EXPECTATION" = "all-enabled" \]' "$MONITOR_WORKFLOW" 2>/dev/null \
     && grep -q 'if \[ "\$GATE_EXPECTATION" = "all-disabled" \]' "$MONITOR_WORKFLOW" 2>/dev/null; then
-  pass "goldengate-monitor.yaml's preflight only fails a metricsEnabled=false/true deployment when the expectation requires it -- publication is no longer unconditionally gated on every deployment already being enabled"
+  pass "50-sub-monitor.yaml's preflight only fails a metricsEnabled=false/true deployment when the expectation requires it -- publication is no longer unconditionally gated on every deployment already being enabled"
 else
-  fail "goldengate-monitor.yaml's preflight no longer conditions its pass/fail decision on metrics_gate_expectation"
+  fail "50-sub-monitor.yaml's preflight no longer conditions its pass/fail decision on metrics_gate_expectation"
 fi
 
 if grep -q "table.get_item(" "$MONITOR_WORKFLOW" 2>/dev/null \
     && ! grep -qE '\.[Ss]can\(' "$MONITOR_WORKFLOW" 2>/dev/null; then
-  pass "goldengate-monitor.yaml's CloudWatch preflight uses GetItem only, never Scan"
+  pass "50-sub-monitor.yaml's CloudWatch preflight uses GetItem only, never Scan"
 else
-  fail "goldengate-monitor.yaml's CloudWatch preflight no longer uses GetItem-only reads"
+  fail "50-sub-monitor.yaml's CloudWatch preflight no longer uses GetItem-only reads"
 fi
 
 if grep -q "PREREQUISITE NOT MET: no Ready gg-monitor pod found" "$MONITOR_WORKFLOW" 2>/dev/null; then
-  pass "goldengate-monitor.yaml documents the first-deployment prerequisite instead of bypassing the CONFIG check"
+  pass "50-sub-monitor.yaml documents the first-deployment prerequisite instead of bypassing the CONFIG check"
 else
-  fail "goldengate-monitor.yaml is missing the first-deployment prerequisite failure message"
+  fail "50-sub-monitor.yaml is missing the first-deployment prerequisite failure message"
 fi
 
 if grep -q -- "- name: cloudwatch.publishEnabled" "$MONITOR_WORKFLOW" 2>/dev/null \
     && grep -q 'value: "\${CLOUDWATCH_PUBLISH_ENABLED_VALUE}"' "$MONITOR_WORKFLOW" 2>/dev/null; then
-  pass "goldengate-monitor.yaml persists the requested value through the Argo CD Application Helm parameters (same ownership path as image.repository/image.tag)"
+  pass "50-sub-monitor.yaml persists the requested value through the Argo CD Application Helm parameters (same ownership path as image.repository/image.tag)"
 else
-  fail "goldengate-monitor.yaml no longer passes cloudwatch.publishEnabled through the Argo CD Application Helm parameters"
+  fail "50-sub-monitor.yaml no longer passes cloudwatch.publishEnabled through the Argo CD Application Helm parameters"
 fi
 
 if grep -q "cloudwatchPublishEnabled=" "$MONITOR_WORKFLOW" 2>/dev/null; then
-  pass "goldengate-monitor.yaml's runtime verification confirms the deployed CLOUDWATCH_PUBLISH_ENABLED value"
+  pass "50-sub-monitor.yaml's runtime verification confirms the deployed CLOUDWATCH_PUBLISH_ENABLED value"
 else
-  fail "goldengate-monitor.yaml's runtime verification no longer confirms the deployed CLOUDWATCH_PUBLISH_ENABLED value"
+  fail "50-sub-monitor.yaml's runtime verification no longer confirms the deployed CLOUDWATCH_PUBLISH_ENABLED value"
 fi
 
 if grep -q "cloudwatch:ListMetrics" "$MONITOR_WORKFLOW" 2>/dev/null \
     || grep -q "cloudwatch:GetMetricData" "$MONITOR_WORKFLOW" 2>/dev/null; then
-  fail "goldengate-monitor.yaml references a CloudWatch read IAM action -- none should ever be introduced for this phase"
+  fail "50-sub-monitor.yaml references a CloudWatch read IAM action -- none should ever be introduced for this phase"
 else
-  pass "goldengate-monitor.yaml introduces no CloudWatch read IAM action (ListMetrics/GetMetricData)"
+  pass "50-sub-monitor.yaml introduces no CloudWatch read IAM action (ListMetrics/GetMetricData)"
 fi
 
 # 20. Runtime-image hash scoped to Dockerfile inputs only, unit tests unconditional, POSIX-safe discovery, unique per-attempt Helm OCI revision, Ready-pod selection.
@@ -2658,17 +2658,17 @@ echo ""
 echo "--- Phase 4D2 correction: image hash scope, POSIX awk, chart SemVer, Ready-pod selection ---"
 
 if grep -q 'git rev-parse "HEAD:\${MONITOR_SOURCE_PATH}"' "$MONITOR_WORKFLOW" 2>/dev/null; then
-  fail "goldengate-monitor.yaml still hashes the whole monitoring/monitor tree (would include README.md/tests/**)"
+  fail "50-sub-monitor.yaml still hashes the whole monitoring/monitor tree (would include README.md/tests/**)"
 else
-  pass "goldengate-monitor.yaml no longer hashes the whole monitoring/monitor tree"
+  pass "50-sub-monitor.yaml no longer hashes the whole monitoring/monitor tree"
 fi
 
 if grep -q "MONITOR_IMAGE_INPUT_PATHS=(" "$MONITOR_WORKFLOW" 2>/dev/null \
     && grep -q "git ls-tree -r HEAD -- " "$MONITOR_WORKFLOW" 2>/dev/null \
     && grep -q "git hash-object --stdin" "$MONITOR_WORKFLOW" 2>/dev/null; then
-  pass "goldengate-monitor.yaml computes a deterministic Git-based hash over exactly the Dockerfile-copied paths"
+  pass "50-sub-monitor.yaml computes a deterministic Git-based hash over exactly the Dockerfile-copied paths"
 else
-  fail "goldengate-monitor.yaml is missing the scoped Dockerfile-input hash computation"
+  fail "50-sub-monitor.yaml is missing the scoped Dockerfile-input hash computation"
 fi
 
 HASH_INPUT_ARRAY="$(awk '
@@ -2680,9 +2680,9 @@ if grep -q '"\${MONITOR_SOURCE_PATH}/tools"' <<< "$HASH_INPUT_ARRAY" \
     && ! grep -q 'README.md' <<< "$HASH_INPUT_ARRAY" \
     && ! grep -q 'requirements-test.txt' <<< "$HASH_INPUT_ARRAY" \
     && ! grep -q '/tests' <<< "$HASH_INPUT_ARRAY"; then
-  pass "goldengate-monitor.yaml's hash inputs exclude README.md/requirements-test.txt/tests"
+  pass "50-sub-monitor.yaml's hash inputs exclude README.md/requirements-test.txt/tests"
 else
-  fail "goldengate-monitor.yaml's hash inputs unexpectedly include a non-runtime path"
+  fail "50-sub-monitor.yaml's hash inputs unexpectedly include a non-runtime path"
 fi
 
 UNIT_TEST_STEPS_UNCONDITIONAL="true"
@@ -2694,7 +2694,7 @@ for step_name in "Set up Python" "Install monitor runtime and test dependencies"
     found { print }
   ' "$MONITOR_WORKFLOW")"
   if grep -q "if: env.IMAGE_EXISTED" <<< "$STEP_BLOCK"; then
-    fail "goldengate-monitor.yaml step \"${step_name}\" is still conditional on IMAGE_EXISTED"
+    fail "50-sub-monitor.yaml step \"${step_name}\" is still conditional on IMAGE_EXISTED"
     UNIT_TEST_STEPS_UNCONDITIONAL="false"
   fi
 done
@@ -2709,30 +2709,30 @@ for step_name in "Verify Docker binary and daemon are functional" "Login to Amaz
     found { print }
   ' "$MONITOR_WORKFLOW")"
   if ! grep -q "if: env.IMAGE_EXISTED != 'true'" <<< "$STEP_BLOCK"; then
-    fail "goldengate-monitor.yaml step \"${step_name}\" is no longer conditional on IMAGE_EXISTED"
+    fail "50-sub-monitor.yaml step \"${step_name}\" is no longer conditional on IMAGE_EXISTED"
     DOCKER_STEPS_CONDITIONAL="false"
   fi
 done
 [ "$DOCKER_STEPS_CONDITIONAL" = "true" ] && pass "Docker daemon-check/login/build/push steps remain conditional on IMAGE_EXISTED"
 
 if grep -q '\[\[:space:\]\]' "$MONITOR_WORKFLOW" 2>/dev/null; then
-  pass "goldengate-monitor.yaml's CloudWatch deployment-discovery awk uses POSIX [[:space:]], not GNU-only \\s"
+  pass "50-sub-monitor.yaml's CloudWatch deployment-discovery awk uses POSIX [[:space:]], not GNU-only \\s"
 else
-  fail "goldengate-monitor.yaml's CloudWatch deployment-discovery awk does not use POSIX [[:space:]]"
+  fail "50-sub-monitor.yaml's CloudWatch deployment-discovery awk does not use POSIX [[:space:]]"
 fi
 
 # Functional execution of the extracted awk script (proving it returns exactly the two enabled canonical deployments) is covered by the Python suite -- see WorkflowStaticAnalysisTests.test_deployment_discovery_awk_returns_exactly_both_enabled_deployments (section 3 above).
 
 if grep -q 'CHART_VERSION="0.\${{ github.run_number }}.\${{ github.run_attempt }}"' "$MONITOR_WORKFLOW" 2>/dev/null; then
-  pass "goldengate-monitor.yaml's chart version is a SemVer containing both run_number and run_attempt"
+  pass "50-sub-monitor.yaml's chart version is a SemVer containing both run_number and run_attempt"
 else
-  fail "goldengate-monitor.yaml's chart version does not include run_attempt -- reruns would collide on a mutable Helm OCI repository"
+  fail "50-sub-monitor.yaml's chart version does not include run_attempt -- reruns would collide on a mutable Helm OCI repository"
 fi
 
 if grep -q '.items\[0\].metadata.name' "$MONITOR_WORKFLOW" 2>/dev/null; then
-  fail "goldengate-monitor.yaml still blindly selects .items[0] for pod discovery"
+  fail "50-sub-monitor.yaml still blindly selects .items[0] for pod discovery"
 else
-  pass "goldengate-monitor.yaml no longer blindly selects .items[0] -- pod selection filters on Running phase and container readiness"
+  pass "50-sub-monitor.yaml no longer blindly selects .items[0] -- pod selection filters on Running phase and container readiness"
 fi
 
 # 21. .dockerignore participates in the runtime-image hash, the Dockerfile requires an explicitly supplied digest-pinned private base image (no public default), and Ready-pod selection excludes terminating pods.
@@ -2740,9 +2740,9 @@ echo ""
 echo "--- Phase 4D2 correction: .dockerignore hash input, digest-pinned base image, non-terminating Ready pod ---"
 
 if grep -q '"\${MONITOR_SOURCE_PATH}/.dockerignore"' "$MONITOR_WORKFLOW" 2>/dev/null; then
-  pass "goldengate-monitor.yaml includes .dockerignore in the runtime-image hash inputs"
+  pass "50-sub-monitor.yaml includes .dockerignore in the runtime-image hash inputs"
 else
-  fail "goldengate-monitor.yaml's runtime-image hash inputs no longer include .dockerignore"
+  fail "50-sub-monitor.yaml's runtime-image hash inputs no longer include .dockerignore"
 fi
 
 if [ -f "${MONITOR_APP_DIR}/.dockerignore" ]; then
@@ -2761,15 +2761,15 @@ fi
 
 if grep -q "name: Validate approved base image reference" "$MONITOR_WORKFLOW" 2>/dev/null \
     && grep -q "vars.MONITOR_BASE_IMAGE" "$MONITOR_WORKFLOW" 2>/dev/null; then
-  pass "goldengate-monitor.yaml validates an externally supplied MONITOR_BASE_IMAGE (vars.* convention, not hardcoded)"
+  pass "50-sub-monitor.yaml validates an externally supplied MONITOR_BASE_IMAGE (vars.* convention, not hardcoded)"
 else
-  fail "goldengate-monitor.yaml is missing the base-image validation step"
+  fail "50-sub-monitor.yaml is missing the base-image validation step"
 fi
 
 if grep -qE '@sha256:\[0-9a-f\]\{64\}\$' "$MONITOR_WORKFLOW" 2>/dev/null; then
-  pass "goldengate-monitor.yaml requires MONITOR_BASE_IMAGE to be digest-pinned (@sha256:<64 lowercase hex>)"
+  pass "50-sub-monitor.yaml requires MONITOR_BASE_IMAGE to be digest-pinned (@sha256:<64 lowercase hex>)"
 else
-  fail "goldengate-monitor.yaml no longer enforces digest-pinning on MONITOR_BASE_IMAGE"
+  fail "50-sub-monitor.yaml no longer enforces digest-pinning on MONITOR_BASE_IMAGE"
 fi
 
 BASE_IMAGE_STEP="$(awk '
@@ -2780,33 +2780,33 @@ BASE_IMAGE_STEP="$(awk '
 # The value is only ever interpolated on the GITHUB_ENV handoff line; failure/success messages never include it -- proven functionally by MonitorBaseImageValidationTests.test_failure_never_prints_the_raw_malformed_value/.test_success_path_never_prints_the_full_raw_value_either.
 BASE_IMAGE_INTERPOLATIONS="$(grep -c '\${MONITOR_BASE_IMAGE}' <<< "$BASE_IMAGE_STEP" || true)"
 if [ "${BASE_IMAGE_INTERPOLATIONS:-0}" -eq 1 ]; then
-  pass "goldengate-monitor.yaml's base-image validation never prints the raw supplied value (only the GITHUB_ENV handoff interpolates it)"
+  pass "50-sub-monitor.yaml's base-image validation never prints the raw supplied value (only the GITHUB_ENV handoff interpolates it)"
 else
-  fail "goldengate-monitor.yaml's base-image validation interpolates \${MONITOR_BASE_IMAGE} ${BASE_IMAGE_INTERPOLATIONS:-0} times -- expected exactly 1 (GITHUB_ENV handoff only)"
+  fail "50-sub-monitor.yaml's base-image validation interpolates \${MONITOR_BASE_IMAGE} ${BASE_IMAGE_INTERPOLATIONS:-0} times -- expected exactly 1 (GITHUB_ENV handoff only)"
 fi
 
 if grep -q "MONITOR_BASE_IMAGE_INPUT: \${{ vars.MONITOR_BASE_IMAGE }}" "$MONITOR_WORKFLOW" 2>/dev/null; then
-  pass "goldengate-monitor.yaml passes the GitHub expression through step-level env (MONITOR_BASE_IMAGE_INPUT), never direct shell interpolation"
+  pass "50-sub-monitor.yaml passes the GitHub expression through step-level env (MONITOR_BASE_IMAGE_INPUT), never direct shell interpolation"
 else
-  fail "goldengate-monitor.yaml no longer passes vars.MONITOR_BASE_IMAGE through step-level env"
+  fail "50-sub-monitor.yaml no longer passes vars.MONITOR_BASE_IMAGE through step-level env"
 fi
 
 if grep -qF -- '\${{ vars.MONITOR_BASE_IMAGE }}"' <<< "$BASE_IMAGE_STEP"; then
-  fail "goldengate-monitor.yaml's base-image validation run script still directly interpolates \${{ vars.MONITOR_BASE_IMAGE }}"
+  fail "50-sub-monitor.yaml's base-image validation run script still directly interpolates \${{ vars.MONITOR_BASE_IMAGE }}"
 else
-  pass "goldengate-monitor.yaml's base-image validation run script contains no direct \${{ vars.MONITOR_BASE_IMAGE }} interpolation"
+  pass "50-sub-monitor.yaml's base-image validation run script contains no direct \${{ vars.MONITOR_BASE_IMAGE }} interpolation"
 fi
 
 if grep -Fq -- '--build-arg "BASE_IMAGE=${MONITOR_BASE_IMAGE}"' "$MONITOR_WORKFLOW" 2>/dev/null; then
-  pass "goldengate-monitor.yaml passes the validated MONITOR_BASE_IMAGE into docker build via --build-arg"
+  pass "50-sub-monitor.yaml passes the validated MONITOR_BASE_IMAGE into docker build via --build-arg"
 else
-  fail "goldengate-monitor.yaml no longer passes BASE_IMAGE into docker build"
+  fail "50-sub-monitor.yaml no longer passes BASE_IMAGE into docker build"
 fi
 
 if grep -q 'echo "BASE_IMAGE \${MONITOR_BASE_IMAGE}"' "$MONITOR_WORKFLOW" 2>/dev/null; then
-  pass "goldengate-monitor.yaml folds the resolved base-image reference into the same runtime-input hash"
+  pass "50-sub-monitor.yaml folds the resolved base-image reference into the same runtime-input hash"
 else
-  fail "goldengate-monitor.yaml's hash no longer incorporates the resolved base-image reference"
+  fail "50-sub-monitor.yaml's hash no longer incorporates the resolved base-image reference"
 fi
 
 # Preflight pod selection uses a Deployment/ReplicaSet ownership-chain loop excluding terminating pods via `deletionTimestamp // empty` + bash comparison, while post-deployment verification still uses the single-jq-filter `deletionTimestamp == null` style -- one of each pattern is expected, not two of the same.
@@ -2823,16 +2823,16 @@ echo ""
 echo "--- Phase 4D2 correction: safe env passthrough, full ECR grammar, manager critical-service coverage ---"
 
 if grep -qF -- 'MONITOR_BASE_IMAGE="${{ vars.MONITOR_BASE_IMAGE }}"' "$MONITOR_WORKFLOW" 2>/dev/null; then
-  fail "goldengate-monitor.yaml still assigns \${{ vars.MONITOR_BASE_IMAGE }} directly inside a run script"
+  fail "50-sub-monitor.yaml still assigns \${{ vars.MONITOR_BASE_IMAGE }} directly inside a run script"
 else
-  pass "goldengate-monitor.yaml no longer assigns \${{ vars.MONITOR_BASE_IMAGE }} directly inside a run script"
+  pass "50-sub-monitor.yaml no longer assigns \${{ vars.MONITOR_BASE_IMAGE }} directly inside a run script"
 fi
 
 if grep -qE "MONITOR_BASE_IMAGE_PATTERN='\^\[a-z0-9\]\+" "$MONITOR_WORKFLOW" 2>/dev/null \
     && grep -q 'MONITOR_BASE_IMAGE_REMAINDER' "$MONITOR_WORKFLOW" 2>/dev/null; then
-  pass "goldengate-monitor.yaml validates the full post-prefix remainder against an anchored repository+digest grammar (not prefix+suffix only)"
+  pass "50-sub-monitor.yaml validates the full post-prefix remainder against an anchored repository+digest grammar (not prefix+suffix only)"
 else
-  fail "goldengate-monitor.yaml no longer validates the full ECR repository+digest grammar"
+  fail "50-sub-monitor.yaml no longer validates the full ECR repository+digest grammar"
 fi
 
 if grep -q 'RECOGNIZED_CRITICAL_SERVICES = ("adminsrvr", "distsrvr", "recvsrvr")' "${MONITOR_APP_DIR}/health_rules.py" 2>/dev/null; then
@@ -4782,27 +4782,27 @@ else
   skip "collector.py/monitor.py/IAM unchanged checks -- not a git repository"
 fi
 
-# 21. goldengate-monitor-metrics-config.yaml + the piped hack/goldengate-metrics-config.py helper -- the dedicated, controlled workflow for tuning a single deployment's CONFIG.metricsEnabled outside Terraform. Static structural checks only (functional/mocked behavior covered by hack/test-goldengate-metrics-config.py).
+# 21. 80-ops-monitor-metrics-config.yaml + the piped hack/goldengate-metrics-config.py helper -- the dedicated, controlled workflow for tuning a single deployment's CONFIG.metricsEnabled outside Terraform. Static structural checks only (functional/mocked behavior covered by hack/test-goldengate-metrics-config.py).
 echo ""
 echo "--- Phase 6C1: metrics config workflow + helper ---"
 
 if [ -f "$METRICS_CONFIG_WORKFLOW" ]; then
-  pass "21: goldengate-monitor-metrics-config.yaml exists"
+  pass "21: 80-ops-monitor-metrics-config.yaml exists"
 else
-  fail "21: goldengate-monitor-metrics-config.yaml is missing"
+  fail "21: 80-ops-monitor-metrics-config.yaml is missing"
 fi
 
 if python3 -c "import yaml,sys; yaml.safe_load(open(sys.argv[1]))" "$METRICS_CONFIG_WORKFLOW" 2>/dev/null; then
-  pass "21: goldengate-monitor-metrics-config.yaml is valid YAML"
+  pass "21: 80-ops-monitor-metrics-config.yaml is valid YAML"
 else
-  fail "21: goldengate-monitor-metrics-config.yaml is not valid YAML"
+  fail "21: 80-ops-monitor-metrics-config.yaml is not valid YAML"
 fi
 
 if grep -q "workflow_dispatch:" "$METRICS_CONFIG_WORKFLOW" 2>/dev/null \
     && ! grep -qE "^\s*(push|pull_request|schedule):" "$METRICS_CONFIG_WORKFLOW" 2>/dev/null; then
-  pass "21: goldengate-monitor-metrics-config.yaml is workflow_dispatch only, no automatic trigger"
+  pass "21: 80-ops-monitor-metrics-config.yaml is workflow_dispatch only, no automatic trigger"
 else
-  fail "21: goldengate-monitor-metrics-config.yaml has an unexpected trigger"
+  fail "21: 80-ops-monitor-metrics-config.yaml has an unexpected trigger"
 fi
 
 if grep -q "deployment_name:" "$METRICS_CONFIG_WORKFLOW" 2>/dev/null \
@@ -4912,9 +4912,9 @@ for job in doc.get('jobs', {}).values():
 import sys
 sys.exit(1 if bad else 0)
 " 2>/dev/null; then
-  pass "22: goldengate-monitor-metrics-config.yaml never substitutes inputs.deployment_name/inputs.confirmation directly inside a run: block"
+  pass "22: 80-ops-monitor-metrics-config.yaml never substitutes inputs.deployment_name/inputs.confirmation directly inside a run: block"
 else
-  fail "22: goldengate-monitor-metrics-config.yaml still substitutes a user-controlled string input directly inside a run: block"
+  fail "22: 80-ops-monitor-metrics-config.yaml still substitutes a user-controlled string input directly inside a run: block"
 fi
 
 for step_name in "Validate deployment_name against the canonical registry" "Validate the exact confirmation string" \
@@ -4928,9 +4928,9 @@ done
 
 if grep -q 'VALIDATION_START_TS="\$(date -u +%Y-%m-%dT%H:%M:%SZ)"' "$METRICS_CONFIG_WORKFLOW" 2>/dev/null \
     && grep -q 'echo "VALIDATION_START_TS=\${VALIDATION_START_TS}" >> "\$GITHUB_ENV"' "$METRICS_CONFIG_WORKFLOW" 2>/dev/null; then
-  pass "22: goldengate-monitor-metrics-config.yaml captures VALIDATION_START_TS via GITHUB_ENV in the helper-execution step"
+  pass "22: 80-ops-monitor-metrics-config.yaml captures VALIDATION_START_TS via GITHUB_ENV in the helper-execution step"
 else
-  fail "22: goldengate-monitor-metrics-config.yaml no longer captures VALIDATION_START_TS before the helper runs"
+  fail "22: 80-ops-monitor-metrics-config.yaml no longer captures VALIDATION_START_TS before the helper runs"
 fi
 
 if grep -A20 "name: Post-update observation" "$METRICS_CONFIG_WORKFLOW" 2>/dev/null | grep -q "VALIDATION_START_TS:-" \
@@ -4942,9 +4942,9 @@ fi
 
 if grep -q "ACTION_LINE_COUNT" "$METRICS_CONFIG_WORKFLOW" 2>/dev/null \
     && grep -q "none|plan|updated) ;;" "$METRICS_CONFIG_WORKFLOW" 2>/dev/null; then
-  pass "22: goldengate-monitor-metrics-config.yaml requires exactly one action= line in {none,plan,updated}"
+  pass "22: 80-ops-monitor-metrics-config.yaml requires exactly one action= line in {none,plan,updated}"
 else
-  fail "22: goldengate-monitor-metrics-config.yaml no longer validates the helper's action= line"
+  fail "22: 80-ops-monitor-metrics-config.yaml no longer validates the helper's action= line"
 fi
 
 CONSISTENT_READ_COUNT_HELPER="$(grep -c "ConsistentRead=True" "$METRICS_CONFIG_HELPER_SCRIPT" 2>/dev/null || true)"
@@ -4956,9 +4956,9 @@ fi
 
 CONSISTENT_READ_COUNT_MONITOR="$(grep -c "ConsistentRead=True" "$MONITOR_WORKFLOW" 2>/dev/null || true)"
 if [ "${CONSISTENT_READ_COUNT_MONITOR:-0}" -eq 2 ]; then
-  pass "22: goldengate-monitor.yaml's two inline CONFIG-inventory readers both use ConsistentRead=True"
+  pass "22: 50-sub-monitor.yaml's two inline CONFIG-inventory readers both use ConsistentRead=True"
 else
-  fail "22: goldengate-monitor.yaml's inline CONFIG-inventory readers do not both use ConsistentRead=True (found ${CONSISTENT_READ_COUNT_MONITOR:-0}, expected 2)"
+  fail "22: 50-sub-monitor.yaml's inline CONFIG-inventory readers do not both use ConsistentRead=True (found ${CONSISTENT_READ_COUNT_MONITOR:-0}, expected 2)"
 fi
 
 if grep -q 'ReturnValues="ALL_NEW"' "$METRICS_CONFIG_HELPER_SCRIPT" 2>/dev/null \
@@ -4978,9 +4978,9 @@ fi
 if grep -q "DEPLOY_UID=" "$MONITOR_WORKFLOW" 2>/dev/null \
     && grep -q "rs_deploy_uid.*!= .\$DEPLOY_UID" "$MONITOR_WORKFLOW" 2>/dev/null \
     && grep -q 'pod_sa" != "gg-monitor"' "$MONITOR_WORKFLOW" 2>/dev/null; then
-  pass "22: goldengate-monitor.yaml's CloudWatch preflight verifies Deployment/ReplicaSet pod ownership, not just a label match"
+  pass "22: 50-sub-monitor.yaml's CloudWatch preflight verifies Deployment/ReplicaSet pod ownership, not just a label match"
 else
-  fail "22: goldengate-monitor.yaml's CloudWatch preflight no longer verifies pod ownership"
+  fail "22: 50-sub-monitor.yaml's CloudWatch preflight no longer verifies pod ownership"
 fi
 
 # 23. Phase 6C1-UI correction: comment-style checker YAML block-scalar awareness, wired in as the single implementation of the rule.
@@ -5180,12 +5180,13 @@ echo "--- Phase 6C1B: process-discovery status correction ---"
 
 COLLECTOR_PY="monitoring/monitor/collector.py"
 MONITOR_PY="monitoring/monitor/monitor.py"
-MONITOR_WORKFLOW=".github/workflows/goldengate-monitor.yaml"
+MONITOR_WORKFLOW=".github/workflows/50-sub-monitor.yaml"
 
 if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  NEW_WORKFLOW_FILES="$(git status --porcelain=v1 2>/dev/null | grep -E '^\?\? \.github/workflows/.*\.ya?ml$' || true)"
+  # This narrow Phase 6C1B guard originally proved that phase's changes were made in place to the (then single) monitor workflow file, never by adding a parallel duplicate. The workflow naming/operator UX standardization task later legitimately renamed all nine workflow files in place -- each rename is a content move, not a new parallel workflow -- so the nine canonical renamed filenames are expected/allowed here; any other new workflow file remains exactly the violation this check was written to catch. The rename itself is now guarded by the dedicated, more precise "Workflow naming / operator UX standardization" section later in this suite (exactly-one-MAIN, exact SUB/OPS sets, zero stale old-filename references) -- the same supersession pattern already used for cloudwatch-observability-artifact-sync.yaml's release from check 15's byte-diff guard by Phase 11.
+  NEW_WORKFLOW_FILES="$(git status --porcelain=v1 -- .github/workflows/ 2>/dev/null | grep -E '^\?\?' | grep -vE '^\?\? \.github/workflows/(00-main-goldengate-orchestrator|10-sub-iam-secrets|20-sub-argocd|30-sub-platform|40-sub-observability|50-sub-monitor|80-ops-monitor-metrics-config|90-ops-observability-artifact-sync|91-ops-ecr-image-sync)\.yaml$' || true)"
   if [ -z "$NEW_WORKFLOW_FILES" ]; then
-    pass "25: no new workflow file introduced (goldengate-monitor.yaml modified in place)"
+    pass "25: no unexpected new workflow file introduced beyond the sanctioned workflow-naming rename"
   else
     fail "25: an unexpected new workflow file was introduced:"$'\n'"${NEW_WORKFLOW_FILES}"
   fi
@@ -5202,9 +5203,9 @@ else
 fi
 
 if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  # configmap.yaml/values.yaml excluded: Phase 6D0 legitimately touched their explanatory comments, not their logic. efs-storageclass.yaml/goldengate/values.yaml excluded: the Phase 6D1 EFS correction legitimately updated the mode-aware fail-guard wording and added the persistence.efs.mode default, neither a template logic/behavior change. secretproviderclass.yaml excluded: the monitor CSI VDR correction legitimately regrouped the rendered objects by adminSecret (duplicate top-level objectName rejected by the AWS Secrets Store CSI provider), not a Phase 6C1B process-discovery change. runtime-secretproviderclass.yaml excluded: the Fresh-EKS Phase A/Phase 9-carry-forward correction legitimately made runtime.csi.region fail-closed instead of silently rendering an empty region, not a Phase 6C1B process-discovery change.
+  # configmap.yaml/values.yaml excluded: Phase 6D0 legitimately touched their explanatory comments, not their logic. efs-storageclass.yaml/goldengate/values.yaml excluded: the Phase 6D1 EFS correction legitimately updated the mode-aware fail-guard wording and added the persistence.efs.mode default, neither a template logic/behavior change. secretproviderclass.yaml excluded: the monitor CSI VDR correction legitimately regrouped the rendered objects by adminSecret (duplicate top-level objectName rejected by the AWS Secrets Store CSI provider), not a Phase 6C1B process-discovery change. runtime-secretproviderclass.yaml excluded: the Fresh-EKS Phase A/Phase 9-carry-forward correction legitimately made runtime.csi.region fail-closed instead of silently rendering an empty region, not a Phase 6C1B process-discovery change. Dockerfile excluded: the workflow naming/operator UX standardization task legitimately updated its one-line comment's workflow filename reference (goldengate-monitor.yaml -> 50-sub-monitor.yaml), not a build/logic change -- guarded instead by the dedicated workflow naming section's zero-stale-filename sweep, never by this narrow historical byte-diff.
   NOT_PERMITTED_DIFF="$(git diff --stat --ignore-all-space -- \
-    monitoring/monitor/health_rules.py monitoring/monitor/Dockerfile \
+    monitoring/monitor/health_rules.py \
     'helm/goldengate-monitor/**' 'helm/goldengate/**' \
     ':!helm/goldengate-monitor/templates/configmap.yaml' ':!helm/goldengate-monitor/values.yaml' \
     ':!helm/goldengate-monitor/templates/secretproviderclass.yaml' \
@@ -5699,14 +5700,14 @@ else
   pass "26: monitor config.py no longer defines a fixed engine allowlist"
 fi
 
-if grep -qE "ogg-oracle\"|-> *ogg-oracle|oracle.*=>.*ogg-" .github/workflows/goldengate-eks-app.yaml 2>/dev/null; then
+if grep -qE "ogg-oracle\"|-> *ogg-oracle|oracle.*=>.*ogg-" .github/workflows/00-main-goldengate-orchestrator.yaml 2>/dev/null; then
   fail "26: an engine-to-image mapping was introduced in the app workflow"
 else
   pass "26: no engine-to-image mapping exists in the app workflow"
 fi
 
-if grep -q "goldengate-deployment-model.py" .github/workflows/goldengate-monitor.yaml 2>/dev/null \
-    && grep -qF 'registry --output "$GENERATED_REGISTRY_PATH"' .github/workflows/goldengate-monitor.yaml 2>/dev/null; then
+if grep -q "goldengate-deployment-model.py" .github/workflows/50-sub-monitor.yaml 2>/dev/null \
+    && grep -qF 'registry --output "$GENERATED_REGISTRY_PATH"' .github/workflows/50-sub-monitor.yaml 2>/dev/null; then
   pass "26: the monitor workflow generates the registry via the deployment-model tool before chart staging"
 else
   fail "26: the monitor workflow no longer generates the registry via the deployment-model tool"
@@ -6018,7 +6019,7 @@ else
   skip "27: job graph check -- python3/PyYAML unavailable"
 fi
 
-for workflow in .github/workflows/gg-iam-secrets-deployment.yaml .github/workflows/goldengate-platform.yaml .github/workflows/goldengate-monitor.yaml; do
+for workflow in .github/workflows/10-sub-iam-secrets.yaml .github/workflows/30-sub-platform.yaml .github/workflows/50-sub-monitor.yaml; do
   if grep -q "workflow_call:" "$workflow" 2>/dev/null; then
     pass "27: ${workflow} supports workflow_call"
   else
@@ -6453,7 +6454,7 @@ echo "--- Phase 6D0-Final: reusable-workflow secret/permission chain ---"
 
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   set +e
-  WORKFLOW_CHAIN_CHECK="$(python3 - "$EKS_APP_WORKFLOW" ".github/workflows/gg-iam-secrets-deployment.yaml" ".github/workflows/goldengate-platform.yaml" ".github/workflows/goldengate-monitor.yaml" <<'PYEOF'
+  WORKFLOW_CHAIN_CHECK="$(python3 - "$EKS_APP_WORKFLOW" ".github/workflows/10-sub-iam-secrets.yaml" ".github/workflows/30-sub-platform.yaml" ".github/workflows/50-sub-monitor.yaml" <<'PYEOF'
 import sys
 import yaml
 
@@ -6468,7 +6469,7 @@ jobs = eks_app["jobs"]
 terraform_job = jobs["terraform_sync_once"]
 
 if terraform_job.get("secrets") != "inherit":
-    print("FAIL: terraform_sync_once does not forward secrets to gg-iam-secrets-deployment.yaml (secrets: inherit missing)")
+    print("FAIL: terraform_sync_once does not forward secrets to 10-sub-iam-secrets.yaml (secrets: inherit missing)")
     sys.exit(1)
 
 terraform_wf_permissions = terraform_wf.get("permissions") or {}
@@ -6482,7 +6483,7 @@ for scope, level in terraform_wf_permissions.items():
 
 apply_job = terraform_wf["jobs"]["apply"]
 if apply_job.get("secrets") != "inherit":
-    print("FAIL: gg-iam-secrets-deployment.yaml's apply job does not forward secrets to the ADCB reusable workflow")
+    print("FAIL: 10-sub-iam-secrets.yaml's apply job does not forward secrets to the ADCB reusable workflow")
     sys.exit(1)
 
 for name, job in (("platform_sync_once", jobs["platform_sync_once"]), ("monitor_sync_once", jobs["monitor_sync_once"])):
@@ -8323,9 +8324,9 @@ echo "--- VDR correction: structural rendered-image validation (replaces the fra
 
 # Real VDR evidence: deploy=false for gg-oracle-payments-01 correctly resolved IMAGE_REPOSITORY/IMAGE_TAG/IMAGE_DIGEST from ECR, but then failed at the OLD "Verify the rendered StatefulSet uses the selected verified image" step because it did `grep -qF "image: ${EXPECTED_IMAGE}"` against a rendered value that Helm intentionally quotes (`image: "repo:tag"`). The image was correct; only the text check was wrong. Fix: that grep-based step is REMOVED and its assertion is merged into the existing duplicate-key-safe PyYAML structural validator (no second, inconsistent Kubernetes-parsing implementation is introduced).
 
-if ! grep -qF 'grep -qF "image: ${EXPECTED_IMAGE}"' .github/workflows/goldengate-eks-app.yaml 2>/dev/null \
-    && grep -qF 'main_container_image = main_container.get("image")' .github/workflows/goldengate-eks-app.yaml 2>/dev/null \
-    && grep -qF 'if main_container_image != expected_image:' .github/workflows/goldengate-eks-app.yaml 2>/dev/null; then
+if ! grep -qF 'grep -qF "image: ${EXPECTED_IMAGE}"' .github/workflows/00-main-goldengate-orchestrator.yaml 2>/dev/null \
+    && grep -qF 'main_container_image = main_container.get("image")' .github/workflows/00-main-goldengate-orchestrator.yaml 2>/dev/null \
+    && grep -qF 'if main_container_image != expected_image:' .github/workflows/00-main-goldengate-orchestrator.yaml 2>/dev/null; then
   pass "VDR-IMG 1: image validation is now structural YAML field comparison (main_container.get(\"image\") != expected_image), not a grep against the rendered text"
 else
   fail "VDR-IMG 1: structural image-identity comparison is missing, or the obsolete grep-based text check is still present"
@@ -8669,10 +8670,10 @@ else
   fail "VDR-MON 14: monitor_dry_run_validation's deploy=false job-gating if: condition was unexpectedly modified"
 fi
 
-if grep -qF "uses: ./.github/workflows/goldengate-monitor.yaml" "$EKS_APP_WORKFLOW" 2>/dev/null \
+if grep -qF "uses: ./.github/workflows/50-sub-monitor.yaml" "$EKS_APP_WORKFLOW" 2>/dev/null \
     && grep -qF "deploy: true" "$EKS_APP_WORKFLOW" 2>/dev/null \
     && grep -qF "needs.validate_model.outputs.effective_deploy == 'true' && needs.validate_model.outputs.has_active_deployments == 'true' && always() && needs.validate_shared_secrets_once.result == 'success'" "$EKS_APP_WORKFLOW" 2>/dev/null; then
-  pass "VDR-MON 15: monitor_sync_once's deploy=true reusable-workflow call (goldengate-monitor.yaml, deploy: true) is unchanged, and its job-gating if: condition retains every original clause plus the additive has_active_deployments=='true' gate"
+  pass "VDR-MON 15: monitor_sync_once's deploy=true reusable-workflow call (50-sub-monitor.yaml, deploy: true) is unchanged, and its job-gating if: condition retains every original clause plus the additive has_active_deployments=='true' gate"
 else
   fail "VDR-MON 15: monitor_sync_once's deploy=true path appears to have changed"
 fi
@@ -9042,7 +9043,7 @@ fi
 
 # 2: no active workflow independently hardcodes the real current workload/build account ID, ECR registry, or EKS cluster name as runtime identity.
 WORKFLOW_HARDCODE_HITS="$(grep -rlE '668311715351|229410149234|gg-poc-dev|[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com' .github/workflows/*.yaml 2>/dev/null \
-  | grep -vF '.github/workflows/gg-iam-secrets-deployment.yaml' \
+  | grep -vF '.github/workflows/10-sub-iam-secrets.yaml' \
   || true)"
 if [ -z "$WORKFLOW_HARDCODE_HITS" ]; then
   pass "Phase 11 2: no active workflow independently hardcodes the real workload/build account ID, ECR registry, or EKS cluster name -- every reference is loaded from envs/<environment>/environment.yaml via hack/goldengate-environment.py github-env"
@@ -9050,15 +9051,15 @@ else
   fail "Phase 11 2: an active workflow independently hardcodes production account/registry/cluster identity:"$'\n'"${WORKFLOW_HARDCODE_HITS}"
 fi
 
-# 2b: gg-iam-secrets-deployment.yaml itself carries no account/registry/cluster identity literal either.
-GG_IAM_HARDCODE_HITS="$(grep -nE '668311715351|229410149234|gg-poc-dev|[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com' .github/workflows/gg-iam-secrets-deployment.yaml 2>/dev/null || true)"
+# 2b: 10-sub-iam-secrets.yaml itself carries no account/registry/cluster identity literal either.
+GG_IAM_HARDCODE_HITS="$(grep -nE '668311715351|229410149234|gg-poc-dev|[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com' .github/workflows/10-sub-iam-secrets.yaml 2>/dev/null || true)"
 if [ -z "$GG_IAM_HARDCODE_HITS" ]; then
-  pass "Phase 11 2b: gg-iam-secrets-deployment.yaml contains no hardcoded account/registry/cluster-name identity literal"
+  pass "Phase 11 2b: 10-sub-iam-secrets.yaml contains no hardcoded account/registry/cluster-name identity literal"
 else
-  fail "Phase 11 2b: gg-iam-secrets-deployment.yaml unexpectedly hardcodes account/registry/cluster identity:"$'\n'"${GG_IAM_HARDCODE_HITS}"
+  fail "Phase 11 2b: 10-sub-iam-secrets.yaml unexpectedly hardcodes account/registry/cluster identity:"$'\n'"${GG_IAM_HARDCODE_HITS}"
 fi
 
-# 3: since Phase 12, no active workflow references "eu-west-1" as a literal at all -- envs/dev/environment.yaml via the canonical resolver is the sole region source, including for gg-iam-secrets-deployment.yaml (its former independent region bootstrap selector is gone).
+# 3: since Phase 12, no active workflow references "eu-west-1" as a literal at all -- envs/dev/environment.yaml via the canonical resolver is the sole region source, including for 10-sub-iam-secrets.yaml (its former independent region bootstrap selector is gone).
 REGION_LITERAL_HITS="$(grep -rl 'eu-west-1' .github/workflows/*.yaml 2>/dev/null || true)"
 if [ -z "$REGION_LITERAL_HITS" ]; then
   pass "Phase 11 3: no active workflow references 'eu-west-1' as a literal"
@@ -9074,9 +9075,9 @@ else
   fail "Phase 11 4: an active workflow independently hardcodes a full IAM role ARN literal:"$'\n'"${ROLE_ARN_LITERAL_HITS}"
 fi
 
-# 5: every active workflow that needs canonical identity loads it via hack/goldengate-environment.py github-env after its own checkout -- GITHUB_ENV is job-local, so no job may assume another job's load already ran. gg-iam-secrets-deployment.yaml is excluded: by design, it derives its sole canonical value (AWS_REGION) via a plain `get` call, not github-env.
+# 5: every active workflow that needs canonical identity loads it via hack/goldengate-environment.py github-env after its own checkout -- GITHUB_ENV is job-local, so no job may assume another job's load already ran. 10-sub-iam-secrets.yaml is excluded: by design, it derives its sole canonical value (AWS_REGION) via a plain `get` call, not github-env.
 MISSING_LOADER_HITS=""
-for wf in goldengate-eks-app.yaml argocd-eks-deployment.yaml goldengate-platform.yaml goldengate-monitor.yaml goldengate-monitor-metrics-config.yaml goldengate-observability.yaml cloudwatch-observability-artifact-sync.yaml push_docker_images_to_ECR.yaml; do
+for wf in 00-main-goldengate-orchestrator.yaml 20-sub-argocd.yaml 30-sub-platform.yaml 50-sub-monitor.yaml 80-ops-monitor-metrics-config.yaml 40-sub-observability.yaml 90-ops-observability-artifact-sync.yaml 91-ops-ecr-image-sync.yaml; do
   if ! grep -q 'goldengate-environment.py --environment .* github-env' ".github/workflows/${wf}" 2>/dev/null; then
     MISSING_LOADER_HITS="${MISSING_LOADER_HITS}${wf}"$'\n'
   fi
@@ -9096,32 +9097,32 @@ else
   fail "Phase 11 6: an unapproved repository variable remains referenced in active workflows:"$'\n'"${UNAPPROVED_VARS_HITS}"
 fi
 
-# 7: argocd-eks-deployment.yaml's IAM-policy validation step derives its POLICY_FILE path from GG_ENVIRONMENT (the generator's policy_folder = "argocd-ecr-oci-read-<environment>" naming contract), never a second hardcoded envs/dev/... literal.
-if grep -qF 'envs/dev/policies/argocd-ecr-oci-read-dev' .github/workflows/argocd-eks-deployment.yaml 2>/dev/null; then
-  fail "Phase 11 7: argocd-eks-deployment.yaml still hardcodes envs/dev/policies/argocd-ecr-oci-read-dev"
-elif grep -qF 'POLICY_FILE="envs/${GG_ENVIRONMENT}/policies/argocd-ecr-oci-read-${GG_ENVIRONMENT}/policies/policies_1.json"' .github/workflows/argocd-eks-deployment.yaml 2>/dev/null; then
-  pass "Phase 11 7: argocd-eks-deployment.yaml's IAM-policy validation step derives POLICY_FILE from GG_ENVIRONMENT, never a hardcoded envs/dev/... literal"
+# 7: 20-sub-argocd.yaml's IAM-policy validation step derives its POLICY_FILE path from GG_ENVIRONMENT (the generator's policy_folder = "argocd-ecr-oci-read-<environment>" naming contract), never a second hardcoded envs/dev/... literal.
+if grep -qF 'envs/dev/policies/argocd-ecr-oci-read-dev' .github/workflows/20-sub-argocd.yaml 2>/dev/null; then
+  fail "Phase 11 7: 20-sub-argocd.yaml still hardcodes envs/dev/policies/argocd-ecr-oci-read-dev"
+elif grep -qF 'POLICY_FILE="envs/${GG_ENVIRONMENT}/policies/argocd-ecr-oci-read-${GG_ENVIRONMENT}/policies/policies_1.json"' .github/workflows/20-sub-argocd.yaml 2>/dev/null; then
+  pass "Phase 11 7: 20-sub-argocd.yaml's IAM-policy validation step derives POLICY_FILE from GG_ENVIRONMENT, never a hardcoded envs/dev/... literal"
 else
-  fail "Phase 11 7: argocd-eks-deployment.yaml no longer derives POLICY_FILE from GG_ENVIRONMENT as expected"
+  fail "Phase 11 7: 20-sub-argocd.yaml no longer derives POLICY_FILE from GG_ENVIRONMENT as expected"
 fi
 
-# 8: cloudwatch-observability-artifact-sync.yaml's chart-rendering step uses the canonical OBSERVABILITY_NAMESPACE, never a hardcoded amazon-cloudwatch literal.
-if grep -qE -- '--namespace[[:space:]]+amazon-cloudwatch([[:space:]]|$)' .github/workflows/cloudwatch-observability-artifact-sync.yaml 2>/dev/null; then
-  fail "Phase 11 8: cloudwatch-observability-artifact-sync.yaml still renders with a hardcoded --namespace amazon-cloudwatch"
-elif grep -qF -- '--namespace "${OBSERVABILITY_NAMESPACE}"' .github/workflows/cloudwatch-observability-artifact-sync.yaml 2>/dev/null; then
-  pass "Phase 11 8: cloudwatch-observability-artifact-sync.yaml renders with the canonical --namespace \"\${OBSERVABILITY_NAMESPACE}\", never a hardcoded amazon-cloudwatch literal"
+# 8: 90-ops-observability-artifact-sync.yaml's chart-rendering step uses the canonical OBSERVABILITY_NAMESPACE, never a hardcoded amazon-cloudwatch literal.
+if grep -qE -- '--namespace[[:space:]]+amazon-cloudwatch([[:space:]]|$)' .github/workflows/90-ops-observability-artifact-sync.yaml 2>/dev/null; then
+  fail "Phase 11 8: 90-ops-observability-artifact-sync.yaml still renders with a hardcoded --namespace amazon-cloudwatch"
+elif grep -qF -- '--namespace "${OBSERVABILITY_NAMESPACE}"' .github/workflows/90-ops-observability-artifact-sync.yaml 2>/dev/null; then
+  pass "Phase 11 8: 90-ops-observability-artifact-sync.yaml renders with the canonical --namespace \"\${OBSERVABILITY_NAMESPACE}\", never a hardcoded amazon-cloudwatch literal"
 else
-  fail "Phase 11 8: cloudwatch-observability-artifact-sync.yaml no longer renders with --namespace \"\${OBSERVABILITY_NAMESPACE}\" as expected"
+  fail "Phase 11 8: 90-ops-observability-artifact-sync.yaml no longer renders with --namespace \"\${OBSERVABILITY_NAMESPACE}\" as expected"
 fi
 
-# 9: goldengate-observability.yaml's rendered ServiceAccount validation compares against the canonical target namespace (passed in as argv[2]), never the literal "amazon-cloudwatch".
-if grep -qF 'sa["metadata"].get("namespace") == "amazon-cloudwatch"' .github/workflows/goldengate-observability.yaml 2>/dev/null; then
-  fail "Phase 11 9: goldengate-observability.yaml's ServiceAccount validation still compares against the literal \"amazon-cloudwatch\""
-elif grep -qF 'python3 - "$RENDERED" "$TARGET_NAMESPACE" <<'"'"'PYEOF'"'"'' .github/workflows/goldengate-observability.yaml 2>/dev/null \
-    && grep -qF 'sa["metadata"].get("namespace") == expected_namespace' .github/workflows/goldengate-observability.yaml 2>/dev/null; then
-  pass "Phase 11 9: goldengate-observability.yaml's ServiceAccount validation receives \$TARGET_NAMESPACE as argv[2] and compares against expected_namespace, never the literal \"amazon-cloudwatch\""
+# 9: 40-sub-observability.yaml's rendered ServiceAccount validation compares against the canonical target namespace (passed in as argv[2]), never the literal "amazon-cloudwatch".
+if grep -qF 'sa["metadata"].get("namespace") == "amazon-cloudwatch"' .github/workflows/40-sub-observability.yaml 2>/dev/null; then
+  fail "Phase 11 9: 40-sub-observability.yaml's ServiceAccount validation still compares against the literal \"amazon-cloudwatch\""
+elif grep -qF 'python3 - "$RENDERED" "$TARGET_NAMESPACE" <<'"'"'PYEOF'"'"'' .github/workflows/40-sub-observability.yaml 2>/dev/null \
+    && grep -qF 'sa["metadata"].get("namespace") == expected_namespace' .github/workflows/40-sub-observability.yaml 2>/dev/null; then
+  pass "Phase 11 9: 40-sub-observability.yaml's ServiceAccount validation receives \$TARGET_NAMESPACE as argv[2] and compares against expected_namespace, never the literal \"amazon-cloudwatch\""
 else
-  fail "Phase 11 9: goldengate-observability.yaml's ServiceAccount validation no longer passes/uses the canonical target namespace as expected"
+  fail "Phase 11 9: 40-sub-observability.yaml's ServiceAccount validation no longer passes/uses the canonical target namespace as expected"
 fi
 
 # 10: known current environment-derived IAM role NAMES are not independently embedded anywhere in active workflow diagnostics -- every one of these has a canonical *_ROLE_NAME resolver output available wherever it was previously hardcoded.
@@ -9133,7 +9134,7 @@ else
   fail "Phase 11 10: an active workflow independently embeds a stale environment-derived IAM role name literal:"$'\n'"${STALE_ROLE_NAME_HITS}"
 fi
 
-# 11: no active workflow runtime/validation path references envs/dev/policies/ or envs/dev/argocd/ -- the sole approved pre-checkout bootstrap exceptions are goldengate-eks-app.yaml's push trigger path ('envs/dev/**') and its matching run-name/comment.
+# 11: no active workflow runtime/validation path references envs/dev/policies/ or envs/dev/argocd/ -- the sole approved pre-checkout bootstrap exceptions are 00-main-goldengate-orchestrator.yaml's push trigger path ('envs/dev/**') and its matching run-name/comment.
 ENVS_DEV_RUNTIME_HITS="$(grep -rn 'envs/dev/policies/\|envs/dev/argocd/' .github/workflows/*.yaml 2>/dev/null || true)"
 if [ -z "$ENVS_DEV_RUNTIME_HITS" ]; then
   pass "Phase 11 11: no active workflow runtime/validation path references envs/dev/policies/ or envs/dev/argocd/ -- every reference is environment-derived (envs/\${GG_ENVIRONMENT}/... or envs/<environment>/... in comments)"
@@ -9144,7 +9145,7 @@ fi
 echo ""
 echo "--- Phase 12: remove the independent Terraform region input/source ---"
 
-IAM_WORKFLOW=".github/workflows/gg-iam-secrets-deployment.yaml"
+IAM_WORKFLOW=".github/workflows/10-sub-iam-secrets.yaml"
 
 # 1/2/4/5/6/7: structural proof, read directly from the real committed YAML (never a reimplementation) -- workflow_dispatch/workflow_call carry no region input, the old supplied-vs-canonical mismatch step is gone, validate_environment_config exposes an aws_region output derived from a step that calls the canonical resolver's `get AWS_REGION`, and apply forwards exactly that job output to the corporate reusable Terraform workflow.
 if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$IAM_WORKFLOW" ]; then
@@ -9327,7 +9328,7 @@ fi
 echo ""
 echo "--- Phase B1: Argo CD prerequisite classification + conditional automatic bootstrap ---"
 
-# Structural proof, read directly from the real committed YAML of both workflows (never a reimplementation): argocd-eks-deployment.yaml is reusable via workflow_call, and the main orchestrator's argocd_preflight/bootstrap_argocd/validate_argocd_ready/platform_sync_once DAG has exactly the wiring the ownership-aware ABSENT/HEALTHY/BROKEN contract requires -- bootstrap only on ABSENT, never on BROKEN, and platform never reachable without a validated-healthy Argo CD.
+# Structural proof, read directly from the real committed YAML of both workflows (never a reimplementation): 20-sub-argocd.yaml is reusable via workflow_call, and the main orchestrator's argocd_preflight/bootstrap_argocd/validate_argocd_ready/platform_sync_once DAG has exactly the wiring the ownership-aware ABSENT/HEALTHY/BROKEN contract requires -- bootstrap only on ABSENT, never on BROKEN, and platform never reachable without a validated-healthy Argo CD.
 if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$ARGOCD_DEPLOY_WORKFLOW" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
   PHASE_B1_CHECK="$(python3 -c '
 import yaml
@@ -9340,8 +9341,8 @@ with open("'"$EKS_APP_WORKFLOW"'") as f:
 results = []
 
 argocd_on = argocd_doc.get(True, argocd_doc.get("on", {}))
-results.append(("1a: argocd-eks-deployment.yaml retains its manual workflow_dispatch trigger", "workflow_dispatch" in argocd_on))
-results.append(("1b: argocd-eks-deployment.yaml now supports workflow_call", "workflow_call" in argocd_on))
+results.append(("1a: 20-sub-argocd.yaml retains its manual workflow_dispatch trigger", "workflow_dispatch" in argocd_on))
+results.append(("1b: 20-sub-argocd.yaml now supports workflow_call", "workflow_call" in argocd_on))
 wc_inputs = (argocd_on.get("workflow_call") or {}).get("inputs", {}) or {}
 env_input = wc_inputs.get("environment", {})
 results.append(("2: workflow_call accepts a required, canonical string environment input", env_input.get("required") is True and env_input.get("type") == "string"))
@@ -9358,7 +9359,7 @@ results.append(("4c: argocd_preflight exposes a state job output", "state" in (p
 
 results.append(("5: main workflow defines a conditional reusable bootstrap_argocd", "bootstrap_argocd" in jobs))
 bootstrap = jobs.get("bootstrap_argocd", {})
-results.append(("6: bootstrap_argocd calls the reusable argocd-eks-deployment.yaml (never gh workflow run)", bootstrap.get("uses") == "./.github/workflows/argocd-eks-deployment.yaml"))
+results.append(("6: bootstrap_argocd calls the reusable 20-sub-argocd.yaml (never gh workflow run)", bootstrap.get("uses") == "./.github/workflows/20-sub-argocd.yaml"))
 bootstrap_if = bootstrap.get("if", "")
 results.append(("7: bootstrap_argocd runs only when argocd_preflight.outputs.state == ABSENT", "argocd_preflight.outputs.state == \x27ABSENT\x27" in bootstrap_if))
 results.append(("8: bootstrap_argocd condition contains no BROKEN branch -- BROKEN can never enter bootstrap", "BROKEN" not in bootstrap_if))
@@ -9395,12 +9396,12 @@ else
   skip "Phase B1: DAG structural checks -- python3/PyYAML unavailable or a required workflow file is missing"
 fi
 
-# Runtime kept intact: existing defensive `kubectl get crd applications.argoproj.io` checks remain in the callable-standalone workflows, but no longer instruct the engineer to manually run argocd-eks-deployment.yaml as if no owner exists.
-STALE_ARGO_CRD_MSG_HITS="$(grep -rln 'Run the argocd-eks-deployment.yaml workflow first' .github/workflows/*.yaml 2>/dev/null || true)"
+# Runtime kept intact: existing defensive `kubectl get crd applications.argoproj.io` checks remain in the callable-standalone workflows, but no longer instruct the engineer to manually run 20-sub-argocd.yaml as if no owner exists.
+STALE_ARGO_CRD_MSG_HITS="$(grep -rln 'Run the 20-sub-argocd.yaml workflow first' .github/workflows/*.yaml 2>/dev/null || true)"
 if [ -z "$STALE_ARGO_CRD_MSG_HITS" ]; then
-  pass "Phase B1: no active workflow still tells the engineer to \"Run the argocd-eks-deployment.yaml workflow first\" -- the main orchestrator now owns that prerequisite"
+  pass "Phase B1: no active workflow still tells the engineer to \"Run the 20-sub-argocd.yaml workflow first\" -- the main orchestrator now owns that prerequisite"
 else
-  fail "Phase B1: a stale 'Run the argocd-eks-deployment.yaml workflow first' message remains in:"$'\n'"${STALE_ARGO_CRD_MSG_HITS}"
+  fail "Phase B1: a stale 'Run the 20-sub-argocd.yaml workflow first' message remains in:"$'\n'"${STALE_ARGO_CRD_MSG_HITS}"
 fi
 
 # hack/orchestration/argocd_state.py must never construct a mutating kubectl/helm command -- read directly from source, never from the test's own constants.
@@ -9425,6 +9426,108 @@ if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f hack/test-goldengate-argocd-state.py
   fi
 else
   skip "Phase B1: hack/test-goldengate-argocd-state.py -- python3 unavailable or file missing"
+fi
+
+echo ""
+echo "--- Workflow naming / operator UX standardization ---"
+
+WORKFLOWS_DIR=".github/workflows"
+
+# 1: exactly one workflow file matches 00-main-*.yaml, and it is the expected orchestrator.
+MAIN_NAME_MATCHES="$(find "$WORKFLOWS_DIR" -maxdepth 1 -type f -name "00-main-*.yaml" 2>/dev/null | sort)"
+MAIN_NAME_MATCH_COUNT="$(echo "$MAIN_NAME_MATCHES" | grep -c . || true)"
+if [ "$MAIN_NAME_MATCH_COUNT" -eq 1 ] && [ "$MAIN_NAME_MATCHES" = "${WORKFLOWS_DIR}/00-main-goldengate-orchestrator.yaml" ]; then
+  pass "workflow naming: exactly one 00-main-*.yaml workflow exists and it is 00-main-goldengate-orchestrator.yaml"
+else
+  fail "workflow naming: expected exactly one ${WORKFLOWS_DIR}/00-main-goldengate-orchestrator.yaml matching 00-main-*.yaml, found:"$'\n'"${MAIN_NAME_MATCHES}"
+fi
+
+# 2/3: the expected SUB and OPS files physically exist -- one file per workflow, no compatibility duplicates.
+for f in 10-sub-iam-secrets.yaml 20-sub-argocd.yaml 30-sub-platform.yaml 40-sub-observability.yaml 50-sub-monitor.yaml; do
+  if [ -f "${WORKFLOWS_DIR}/${f}" ]; then
+    pass "workflow naming: SUB workflow ${f} exists"
+  else
+    fail "workflow naming: expected SUB workflow ${WORKFLOWS_DIR}/${f} is missing"
+  fi
+done
+for f in 80-ops-monitor-metrics-config.yaml 90-ops-observability-artifact-sync.yaml 91-ops-ecr-image-sync.yaml; do
+  if [ -f "${WORKFLOWS_DIR}/${f}" ]; then
+    pass "workflow naming: OPS workflow ${f} exists"
+  else
+    fail "workflow naming: expected OPS workflow ${WORKFLOWS_DIR}/${f} is missing"
+  fi
+done
+
+# 4: zero references to any retired workflow filename remain anywhere in the repository (code, tests, docs, comments, diagnostics) -- excluding .git/ and this check's own list of retired names below, which must legitimately name them as search targets.
+OLD_WORKFLOW_NAMES="goldengate-eks-app.yaml gg-iam-secrets-deployment.yaml argocd-eks-deployment.yaml goldengate-platform.yaml goldengate-observability.yaml goldengate-monitor.yaml goldengate-monitor-metrics-config.yaml cloudwatch-observability-artifact-sync.yaml push_docker_images_to_ECR.yaml"
+STALE_WORKFLOW_NAME_HITS=""
+for old_name in $OLD_WORKFLOW_NAMES; do
+  OLD_NAME_HITS="$(grep -rl --exclude-dir=.git --exclude="$(basename "$0")" -F -- "$old_name" . 2>/dev/null || true)"
+  if [ -n "$OLD_NAME_HITS" ]; then
+    STALE_WORKFLOW_NAME_HITS="${STALE_WORKFLOW_NAME_HITS}${old_name} still referenced in:"$'\n'"${OLD_NAME_HITS}"$'\n'
+  fi
+done
+if [ -z "$STALE_WORKFLOW_NAME_HITS" ]; then
+  pass "workflow naming: zero references to any retired workflow filename remain anywhere in the repository"
+else
+  fail "workflow naming: stale retired-workflow-filename reference(s) found:"$'\n'"${STALE_WORKFLOW_NAME_HITS}"
+fi
+
+# 5/6: semantic (not whitespace-dependent) proof of each workflow's top-level display name prefix and, for MAIN, its reusable SUB uses: references.
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  WORKFLOW_NAMING_CHECK="$(python3 -c '
+import yaml
+
+workflows_dir = "'"$WORKFLOWS_DIR"'"
+
+expected_name_prefixes = {
+    "00-main-goldengate-orchestrator.yaml": "00 | MAIN |",
+    "10-sub-iam-secrets.yaml": "10 | SUB |",
+    "20-sub-argocd.yaml": "20 | SUB |",
+    "30-sub-platform.yaml": "30 | SUB |",
+    "40-sub-observability.yaml": "40 | SUB |",
+    "50-sub-monitor.yaml": "50 | SUB |",
+    "80-ops-monitor-metrics-config.yaml": "80 | OPS |",
+    "90-ops-observability-artifact-sync.yaml": "90 | OPS |",
+    "91-ops-ecr-image-sync.yaml": "91 | OPS |",
+}
+
+results = []
+docs = {}
+for filename, expected_prefix in expected_name_prefixes.items():
+    path = workflows_dir + "/" + filename
+    try:
+        with open(path) as f:
+            doc = yaml.safe_load(f)
+    except FileNotFoundError:
+        results.append((f"{filename}: file missing, cannot check name: prefix", False))
+        continue
+    docs[filename] = doc
+    actual_name = str(doc.get("name", ""))
+    results.append((f"{filename}: name: starts with \"{expected_prefix}\"", actual_name.startswith(expected_prefix)))
+
+main_doc = docs.get("00-main-goldengate-orchestrator.yaml")
+if main_doc is not None:
+    jobs = main_doc.get("jobs", {}) or {}
+    uses_values = {job_id: (job.get("uses") or "") for job_id, job in jobs.items()}
+    all_uses = set(uses_values.values())
+    for expected_sub in ("10-sub-iam-secrets.yaml", "20-sub-argocd.yaml", "30-sub-platform.yaml", "50-sub-monitor.yaml"):
+        expected_uses = "./.github/workflows/" + expected_sub
+        results.append((f"MAIN uses: a reusable-workflow call targeting {expected_sub}", expected_uses in all_uses))
+    # B2 not started yet: 40-sub-observability.yaml must not already be wired into MAIN.
+    results.append(("MAIN does not yet call 40-sub-observability.yaml (reserved for Phase B2)", "./.github/workflows/40-sub-observability.yaml" not in all_uses))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+' 2>&1)"
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL\ *) fail "workflow naming: ${line#FAIL }" ;;
+      OK\ *) pass "workflow naming: ${line#OK }" ;;
+    esac
+  done <<< "$WORKFLOW_NAMING_CHECK"
+else
+  skip "workflow naming: name:/uses: semantic checks -- python3/PyYAML unavailable"
 fi
 
 echo ""
