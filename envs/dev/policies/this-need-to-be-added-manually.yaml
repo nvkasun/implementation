@@ -21,3 +21,31 @@ For the policy name in engineering account, I'd use:
 AssumeGoldenGateEKSDeployRole-dev
 
 Then create/save it.
+
+---------------
+
+Hi Team,
+
+Thank you for reaching out regarding the CloudTrail events related to the deletion of EFS resources and associated mount targets in the GoldenGate DEV environment.
+
+These activities were part of an authorized infrastructure rebuild for the Oracle GoldenGate on AWS EKS POC environment.
+
+The existing DEV VPC had to be decommissioned following a request from the Network team due to a CIDR address overlap / addressing change identified on the network side. As the EKS cluster, subnets, security groups, EFS filesystems and EFS mount targets were dependent on the original VPC and subnet configuration, those resources could not be retained as-is during the network redesign.
+
+As part of the planned rebuild, the following high-level activities were performed:
+
+Removal of the previous DEV VPC and dependent network resources.
+Removal of the previous EKS environment associated with that VPC.
+Deletion of the EFS filesystems / mount targets associated with the old subnet and VPC configuration.
+Recreation of the VPC and subnets using the updated CIDR allocation.
+Recreation of the EKS environment and its supporting infrastructure in the new network.
+Recreation/reconfiguration of the required storage and access components for the new environment.
+
+The CloudTrail events observed by the Security team therefore correspond to this planned infrastructure decommissioning and recreation activity. The changes were related to the non-production GoldenGate DEV/POC environment and were performed as part of the network remediation and environment rebuild rather than as an unplanned or unauthorized deletion.
+
+We are currently continuing the GoldenGate deployment validation on the newly recreated infrastructure.
+
+Please let me know if you require any additional information such as the affected resource names, approximate change window, associated change/PR reference, or CloudTrail event IDs for correlation.
+
+Regards,
+Kasun Vithanage
