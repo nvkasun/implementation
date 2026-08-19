@@ -1,6 +1,7 @@
 name: "00 | MAIN | GoldenGate EKS End-to-End Deployment"
 
-run-name: "MAIN | GoldenGate Helm build and deploy | ${{ github.event_name == 'workflow_dispatch' && inputs.deployment_id || format('auto: envs/dev changes on {0}', github.sha) }} | ran by ${{ github.actor }}"
+# Live Deploy UX Fix 2: action-aware and neutral -- never claims "deploy" for a validate-only manual run, and never claims a specific deployment ID for an environment-wide run (deployment_id left blank). Destroy is deliberately never named here yet -- the eventual Validate/Deploy/Destroy lifecycle UI is added only once Destroy itself is implemented.
+run-name: "MAIN | GoldenGate EKS | action=${{ github.event_name == 'workflow_dispatch' && inputs.action || 'deploy' }} | ${{ github.event_name == 'workflow_dispatch' && (inputs.deployment_id != '' && inputs.deployment_id || 'environment-wide') || format('auto: envs/dev changes on {0}', github.sha) }} | ran by ${{ github.actor }}"
 
 on:
   workflow_dispatch:
@@ -13,17 +14,20 @@ on:
         options:
           - dev
 
-      deployment_id:
-        description: "Unique GoldenGate deployment ID, example: gg-oracle-payments-01"
+      action:
+        description: "GoldenGate lifecycle action"
         required: true
-        type: string
-        default: gg-oracle-payments-01
+        type: choice
+        default: validate
+        options:
+          - validate
+          - deploy
 
-      deploy:
-        description: "Deploy to EKS after publishing Helm chart"
-        required: true
-        type: boolean
-        default: true
+      deployment_id:
+        description: "Optional GoldenGate runtime deployment ID. Leave blank for an environment-wide run without selected runtime mutation."
+        required: false
+        type: string
+        default: ""
 
   push:
     branches:
@@ -198,15 +202,27 @@ jobs:
         shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
-          INPUT_DEPLOY: ${{ inputs.deploy }}
+          INPUT_ACTION: ${{ inputs.action }}
         run: |
           set -euo pipefail
 
+          # Live Deploy UX Fix 2: the external operator-facing contract is now an explicit action choice (validate/deploy -- Destroy is not exposed yet), but the internal DAG contract (validate_model.outputs.effective_deploy, a boolean string every existing B1/B2/B3A/B3B condition already depends on) is deliberately unchanged and derived here, in exactly one place, never duplicated elsewhere.
           # A push event carries no workflow_dispatch inputs and always implies deploy=true, matching the existing detect-goldengate-deployments.sh push-path contract.
-          if [ "$EVENT_NAME" != "workflow_dispatch" ] || [ "$INPUT_DEPLOY" = "true" ]; then
+          if [ "$EVENT_NAME" != "workflow_dispatch" ]; then
             echo "effective_deploy=true" >> "$GITHUB_OUTPUT"
           else
-            echo "effective_deploy=false" >> "$GITHUB_OUTPUT"
+            case "$INPUT_ACTION" in
+              deploy)
+                echo "effective_deploy=true" >> "$GITHUB_OUTPUT"
+                ;;
+              validate)
+                echo "effective_deploy=false" >> "$GITHUB_OUTPUT"
+                ;;
+              *)
+                echo "FAIL: unrecognized workflow_dispatch action '${INPUT_ACTION}' -- expected exactly 'validate' or 'deploy'. Refusing to guess which lifecycle contract applies."
+                exit 1
+                ;;
+            esac
           fi
 
   eks_oidc_preflight:
@@ -1142,7 +1158,8 @@ jobs:
         env:
           INPUT_ENVIRONMENT: ${{ inputs.environment }}
           INPUT_DEPLOYMENT_ID: ${{ inputs.deployment_id }}
-          INPUT_DEPLOY: ${{ inputs.deploy }}
+          # Live Deploy UX Fix 2: the detector's existing --argjson deploy boolean contract is unchanged -- INPUT_DEPLOY is derived from validate_model's own already-computed effective_deploy (the single place action -> boolean is decided), never re-derived from inputs.action here (which no longer exists as a boolean, and would duplicate the lifecycle mapping).
+          INPUT_DEPLOY: ${{ needs.validate_model.outputs.effective_deploy }}
           EVENT_NAME: ${{ github.event_name }}
           BEFORE_SHA: ${{ github.event.before }}
           AFTER_SHA: ${{ github.sha }}

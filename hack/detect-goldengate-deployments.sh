@@ -335,6 +335,24 @@ if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
   DEPLOYMENT_ID="$INPUT_DEPLOYMENT_ID"
   DEPLOY="$INPUT_DEPLOY"
 
+  # Live Deploy UX Fix 2: an explicit environment-wide manual run -- deployment_id left blank on purpose (never an invented/default runtime ID, never auto-selecting either repltest descriptor). No descriptor validation is attempted. This does NOT mean "there are no active runtimes globally" -- validate_model's own active_runtime_matrix remains the independent, canonical GLOBAL runtime registry; this only means no individual GoldenGate runtime was selected for build/reconciliation in THIS manual invocation.
+  if [ -z "$DEPLOYMENT_ID" ]; then
+    if [ "$DEPLOY" = "true" ]; then
+      ACTION_LABEL="deploy"
+    else
+      ACTION_LABEL="validate"
+    fi
+    echo "Manual environment-wide ${ACTION_LABEL} requested for environment=${ENVIRONMENT}; no individual GoldenGate runtime was selected for build/reconciliation."
+
+    echo "has_changes=false" >> "$GITHUB_OUTPUT"
+    echo "deployment_matrix=[]" >> "$GITHUB_OUTPUT"
+    echo "has_deletions=false" >> "$GITHUB_OUTPUT"
+    echo "deletion_matrix=[]" >> "$GITHUB_OUTPUT"
+    echo "has_storage_transition_violations=false" >> "$GITHUB_OUTPUT"
+    echo "storage_transition_violations=[]" >> "$GITHUB_OUTPUT"
+    exit 0
+  fi
+
   if [[ ! "$DEPLOYMENT_ID" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
     echo "Invalid deployment_id: $DEPLOYMENT_ID"
     echo "Use lowercase letters, numbers, and hyphens only."

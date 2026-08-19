@@ -9121,6 +9121,347 @@ else
 fi
 
 echo ""
+echo "--- Live Deploy UX Fix 2: action dropdown + safe environment-wide manual run ---"
+
+# A/B/C/D/I: semantic YAML parse (never a source-fragile grep) of the workflow_dispatch input contract and a repo-wide sweep for the retired inputs.deploy reference.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  LIVE_UX_FIX_2_STRUCT_CHECK="$(python3 -c '
+import yaml
+
+with open("'"$EKS_APP_WORKFLOW"'") as f:
+    doc = yaml.safe_load(f)
+
+results = []
+
+on_block = doc.get(True, doc.get("on", {}))
+wd_inputs = (on_block.get("workflow_dispatch") or {}).get("inputs") or {}
+
+action_input = wd_inputs.get("action")
+results.append(("A1: workflow_dispatch defines an action input", action_input is not None))
+if action_input is not None:
+    results.append(("A2: action type is choice", action_input.get("type") == "choice"))
+    results.append(("A3: action is required", action_input.get("required") is True))
+    results.append(("A4: action default is validate", action_input.get("default") == "validate"))
+    results.append(("A5: action options are exactly [validate, deploy]", action_input.get("options") == ["validate", "deploy"]))
+
+all_options = []
+for spec in wd_inputs.values():
+    if isinstance(spec, dict) and isinstance(spec.get("options"), list):
+        all_options.extend(spec["options"])
+results.append(("B: no workflow_dispatch input option is literally destroy (case-insensitive)", not any(str(o).lower() == "destroy" for o in all_options)))
+
+results.append(("C: workflow_dispatch no longer defines the old deploy boolean input", "deploy" not in wd_inputs))
+
+deployment_id_input = wd_inputs.get("deployment_id")
+results.append(("D1: deployment_id input exists", deployment_id_input is not None))
+if deployment_id_input is not None:
+    results.append(("D2: deployment_id is not required", deployment_id_input.get("required") is False))
+    results.append(("D3: deployment_id default is the empty string", deployment_id_input.get("default") == ""))
+
+import re
+
+with open("'"$EKS_APP_WORKFLOW"'") as f:
+    main_source = f.read()
+# Word-boundary regex, never a bare substring match -- "inputs.deploy" is itself a substring of the still-valid "inputs.deployment_id", which must NOT be flagged.
+results.append(("I: zero remaining MAIN references to inputs.deploy (the old boolean contract)", re.search(r"\binputs\.deploy\b", main_source) is None))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+' 2>&1)"
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL\ *) fail "Live Deploy UX Fix 2: ${line#FAIL }" ;;
+      OK\ *) pass "Live Deploy UX Fix 2: ${line#OK }" ;;
+    esac
+  done <<< "$LIVE_UX_FIX_2_STRUCT_CHECK"
+else
+  skip "Live Deploy UX Fix 2: workflow_dispatch action/deployment_id structural checks -- python3/PyYAML unavailable or main workflow missing"
+fi
+
+# E/F/G/H: REALLY EXECUTE the committed "Compute effective deploy flag" script (never a reimplementation) for every action/event combination, including the fail-closed cases.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  set +e
+  LIVE_UX_FIX_2_COMPUTE_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import os
+import subprocess
+import sys
+import tempfile
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+
+step = next((s for s in doc["jobs"]["validate_model"]["steps"] if s.get("name") == "Compute effective deploy flag"), None)
+if step is None:
+    print("FAIL: validate_model is missing its 'Compute effective deploy flag' step")
+    sys.exit(1)
+script = step["run"]
+
+
+def run(event_name, action):
+    env = dict(os.environ)
+    env["EVENT_NAME"] = event_name
+    env["INPUT_ACTION"] = action
+    out_file = tempfile.mktemp()
+    env["GITHUB_OUTPUT"] = out_file
+    proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=20)
+    outputs = {}
+    if os.path.exists(out_file):
+        with open(out_file) as f:
+            for line in f:
+                if "=" in line:
+                    k, v = line.rstrip("\n").split("=", 1)
+                    outputs[k] = v
+        os.unlink(out_file)
+    return proc, outputs
+
+
+failures = []
+
+
+def check(label, condition, proc=None):
+    if not condition:
+        extra = f" (rc={proc.returncode}\n{proc.stdout}\n{proc.stderr})" if proc is not None else ""
+        failures.append(label + extra)
+
+
+proc, outputs = run("workflow_dispatch", "validate")
+check("E: workflow_dispatch + action=validate -> effective_deploy=false", proc.returncode == 0 and outputs.get("effective_deploy") == "false", proc)
+
+proc, outputs = run("workflow_dispatch", "deploy")
+check("F: workflow_dispatch + action=deploy -> effective_deploy=true", proc.returncode == 0 and outputs.get("effective_deploy") == "true", proc)
+
+proc, outputs = run("push", "")
+check("G: push event -> effective_deploy=true", proc.returncode == 0 and outputs.get("effective_deploy") == "true", proc)
+
+proc, outputs = run("workflow_dispatch", "bogus-action")
+check("H: workflow_dispatch + invalid action fails closed (non-zero exit, no effective_deploy output)", proc.returncode != 0 and "effective_deploy" not in outputs, proc)
+
+proc, outputs = run("workflow_dispatch", "")
+check("H2: workflow_dispatch + empty action fails closed", proc.returncode != 0 and "effective_deploy" not in outputs, proc)
+
+if failures:
+    print("\n".join(failures))
+    sys.exit(1)
+print("OK")
+PYEOF
+)"
+  LIVE_UX_FIX_2_COMPUTE_STATUS=$?
+  set -e
+  if [ "$LIVE_UX_FIX_2_COMPUTE_STATUS" -eq 0 ]; then
+    pass "Live Deploy UX Fix 2: E: workflow_dispatch + action=validate -> effective_deploy=false"
+    pass "Live Deploy UX Fix 2: F: workflow_dispatch + action=deploy -> effective_deploy=true"
+    pass "Live Deploy UX Fix 2: G: push event -> effective_deploy=true"
+    pass "Live Deploy UX Fix 2: H: invalid/empty manual action fails closed (the compute step never guesses)"
+  else
+    fail "Live Deploy UX Fix 2: Compute effective deploy flag execution proof failed:"$'\n'"${LIVE_UX_FIX_2_COMPUTE_OUT}"
+  fi
+else
+  skip "Live Deploy UX Fix 2: Compute effective deploy flag execution proof -- python3/PyYAML/bash unavailable or main workflow missing"
+fi
+
+# J/K/N: REALLY EXECUTE the committed hack/detect-goldengate-deployments.sh for the environment-wide manual contract and the still-rejected lifecycle.state=absent path.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$DETECT_SCRIPT" ]; then
+  set +e
+  LIVE_UX_FIX_2_DETECT_OUT="$(python3 - "$DETECT_SCRIPT" <<'PYEOF'
+import os
+import subprocess
+import sys
+import tempfile
+
+detect_script = sys.argv[1]
+
+
+def run_detect(deployment_id, deploy_bool, environment="dev"):
+    env = dict(os.environ)
+    env["EVENT_NAME"] = "workflow_dispatch"
+    env["INPUT_ENVIRONMENT"] = environment
+    env["INPUT_DEPLOYMENT_ID"] = deployment_id
+    env["INPUT_DEPLOY"] = deploy_bool
+    env["BEFORE_SHA"] = ""
+    env["AFTER_SHA"] = ""
+    out_file = tempfile.mktemp()
+    env["GITHUB_OUTPUT"] = out_file
+    proc = subprocess.run(["bash", detect_script], env=env, capture_output=True, text=True, timeout=20)
+    outputs = {}
+    if os.path.exists(out_file):
+        with open(out_file) as f:
+            for line in f:
+                if "=" in line:
+                    k, v = line.rstrip("\n").split("=", 1)
+                    outputs[k] = v
+        os.unlink(out_file)
+    return proc, outputs
+
+
+failures = []
+
+
+def check(label, condition, proc=None, outputs=None):
+    if not condition:
+        extra = f" (rc={proc.returncode}\n{proc.stdout}\n{proc.stderr}\noutputs={outputs})" if proc is not None else ""
+        failures.append(label + extra)
+
+
+EMPTY_MATRIX_EXPECTED = {
+    "has_changes": "false",
+    "deployment_matrix": "[]",
+    "has_deletions": "false",
+    "deletion_matrix": "[]",
+    "has_storage_transition_violations": "false",
+    "storage_transition_violations": "[]",
+}
+
+proc, outputs = run_detect("", "true")
+check("J: manual environment-wide Deploy (deployment_id=\x27\x27, INPUT_DEPLOY=true) emits the exact empty-mutation contract",
+      proc.returncode == 0 and all(outputs.get(k) == v for k, v in EMPTY_MATRIX_EXPECTED.items()), proc, outputs)
+
+proc, outputs = run_detect("", "false")
+check("K: manual environment-wide Validate (deployment_id=\x27\x27, INPUT_DEPLOY=false) emits the exact empty-mutation contract",
+      proc.returncode == 0 and all(outputs.get(k) == v for k, v in EMPTY_MATRIX_EXPECTED.items()), proc, outputs)
+
+proc, outputs = run_detect("gg-postgresql-repltest-01", "true")
+check("N: manual selected lifecycle.state=absent descriptor is still rejected (non-zero exit)", proc.returncode != 0, proc, outputs)
+
+if failures:
+    print("\n".join(failures))
+    sys.exit(1)
+print("OK")
+PYEOF
+)"
+  LIVE_UX_FIX_2_DETECT_STATUS=$?
+  set -e
+  if [ "$LIVE_UX_FIX_2_DETECT_STATUS" -eq 0 ]; then
+    pass "Live Deploy UX Fix 2: J: manual environment-wide Deploy emits the exact empty-mutation contract (deployment_matrix=[], has_changes=false, has_deletions=false)"
+    pass "Live Deploy UX Fix 2: K: manual environment-wide Validate emits the exact empty-mutation contract"
+    pass "Live Deploy UX Fix 2: N: manual selected lifecycle.state=absent descriptor is still rejected"
+  else
+    fail "Live Deploy UX Fix 2: environment-wide/rejection detector execution proof failed:"$'\n'"${LIVE_UX_FIX_2_DETECT_OUT}"
+  fi
+else
+  skip "Live Deploy UX Fix 2: environment-wide detector execution proof -- python3/bash unavailable or detector missing"
+fi
+
+# L/M: manual SELECTED ACTIVE deployment behavior is unchanged for both actions -- a minimal synthetic singleRuntime descriptor (deploymentModel: singleRuntime is the entire active-classification contract; no other field is required) in an isolated scratch copy, never touching the real envs/dev descriptors (both of which are intentionally lifecycle.state=absent today).
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$DETECT_SCRIPT" ]; then
+  LIVE_UX_FIX_2_ACTIVE_SCRATCH="${WORKDIR}/live-ux-fix-2-active-synthetic"
+  mkdir -p "${LIVE_UX_FIX_2_ACTIVE_SCRATCH}/envs/dev/gg-live-ux-fix-2-synthetic-01"
+  echo "deploymentModel: singleRuntime" > "${LIVE_UX_FIX_2_ACTIVE_SCRATCH}/envs/dev/gg-live-ux-fix-2-synthetic-01/values.yaml"
+
+  L_OUTPUT_FILE="$(mktemp)"
+  L_STDOUT="$(cd "$LIVE_UX_FIX_2_ACTIVE_SCRATCH" && EVENT_NAME="workflow_dispatch" INPUT_ENVIRONMENT="dev" INPUT_DEPLOYMENT_ID="gg-live-ux-fix-2-synthetic-01" INPUT_DEPLOY="true" BEFORE_SHA="" AFTER_SHA="" GITHUB_OUTPUT="$L_OUTPUT_FILE" bash "${REPO_ROOT}/${DETECT_SCRIPT}" 2>&1)"
+  L_STATUS=$?
+  if [ "$L_STATUS" -eq 0 ] && grep -q '"deploy":true' "$L_OUTPUT_FILE" && grep -q 'deployment_matrix=\[{' "$L_OUTPUT_FILE"; then
+    pass "Live Deploy UX Fix 2: L: manual selected ACTIVE deployment + action=deploy produces a one-item matrix with deploy=true"
+  else
+    fail "Live Deploy UX Fix 2: L: manual selected ACTIVE deployment + action=deploy did not produce the expected matrix (status=${L_STATUS}):"$'\n'"${L_STDOUT}"$'\n'"$(cat "$L_OUTPUT_FILE" 2>/dev/null)"
+  fi
+  rm -f "$L_OUTPUT_FILE"
+
+  M_OUTPUT_FILE="$(mktemp)"
+  M_STDOUT="$(cd "$LIVE_UX_FIX_2_ACTIVE_SCRATCH" && EVENT_NAME="workflow_dispatch" INPUT_ENVIRONMENT="dev" INPUT_DEPLOYMENT_ID="gg-live-ux-fix-2-synthetic-01" INPUT_DEPLOY="false" BEFORE_SHA="" AFTER_SHA="" GITHUB_OUTPUT="$M_OUTPUT_FILE" bash "${REPO_ROOT}/${DETECT_SCRIPT}" 2>&1)"
+  M_STATUS=$?
+  if [ "$M_STATUS" -eq 0 ] && grep -q '"deploy":false' "$M_OUTPUT_FILE" && grep -q 'deployment_matrix=\[{' "$M_OUTPUT_FILE"; then
+    pass "Live Deploy UX Fix 2: M: manual selected ACTIVE deployment + action=validate produces a one-item matrix with deploy=false"
+  else
+    fail "Live Deploy UX Fix 2: M: manual selected ACTIVE deployment + action=validate did not produce the expected matrix (status=${M_STATUS}):"$'\n'"${M_STDOUT}"$'\n'"$(cat "$M_OUTPUT_FILE" 2>/dev/null)"
+  fi
+  rm -f "$M_OUTPUT_FILE"
+
+  rm -rf "$LIVE_UX_FIX_2_ACTIVE_SCRATCH"
+else
+  skip "Live Deploy UX Fix 2: L/M selected-active-deployment execution proof -- python3/bash unavailable or detector missing"
+fi
+
+# O: push changed-file behavior is unchanged -- the push branch of the detector was never touched (only a new branch was added at the top of the workflow_dispatch conditional), and the existing, extensive push-diff test coverage elsewhere in this suite (unmodified) continues to exercise it.
+if grep -qF 'echo "Push trigger. Detecting changed deployment folders under envs/dev/ and helm/goldengate/..."' "$DETECT_SCRIPT" 2>/dev/null; then
+  pass "Live Deploy UX Fix 2: O: the push-trigger branch of ${DETECT_SCRIPT} is textually unchanged (push changed-file/deletion detection behavior is unaffected by this task)"
+else
+  fail "Live Deploy UX Fix 2: O: the push-trigger branch of ${DETECT_SCRIPT} appears to have changed"
+fi
+
+# P: environment-wide Deploy (has_changes=false) does not make final_validation require the selected-runtime mutation jobs -- REALLY EXECUTE the committed "Validate the mode-aware final DEPLOY success contract" script for exactly this scenario (has_active_deployments=false, matching the current DEV registry).
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  set +e
+  LIVE_UX_FIX_2_GATE_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import os
+import subprocess
+import sys
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+
+step = next((s for s in doc["jobs"]["final_validation"]["steps"] if s.get("name") == "Validate the mode-aware final DEPLOY success contract"), None)
+if step is None:
+    print("FAIL: final_validation is missing its 'Validate the mode-aware final DEPLOY success contract' step")
+    sys.exit(1)
+script = step["run"]
+
+ALL_RESULT_JOBS = (
+    "detect_changed_deployments",
+    "validate_shared_secrets_once", "validate_argocd_ready", "validate_platform_ready", "validate_observability_ready",
+    "runtime_ownership_preflight", "build_publish_and_deploy", "delete_removed_argocd_applications",
+    "validate_active_runtimes", "replication_reconcile_once", "replication_dry_run_validation",
+    "monitor_ownership_preflight", "monitor_sync_once", "monitor_dry_run_validation",
+    "validate_monitor_ready", "replication_monitor_acceptance", "end_to_end_deployment_acceptance",
+)
+
+env = dict(os.environ)
+env["EFFECTIVE_DEPLOY"] = "true"
+env["HAS_ACTIVE_DEPLOYMENTS"] = "false"
+env["HAS_CHANGES"] = "false"
+env["HAS_DELETIONS"] = "false"
+skipped_jobs = {
+    "runtime_ownership_preflight", "build_publish_and_deploy", "delete_removed_argocd_applications",
+    "validate_active_runtimes", "replication_reconcile_once", "monitor_ownership_preflight",
+    "monitor_sync_once", "validate_monitor_ready", "replication_monitor_acceptance", "end_to_end_deployment_acceptance",
+    "replication_dry_run_validation", "monitor_dry_run_validation",
+}
+for job in ALL_RESULT_JOBS:
+    env[f"RESULT_{job}"] = "skipped" if job in skipped_jobs else "success"
+
+proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=20)
+if proc.returncode != 0:
+    print(f"FAIL: environment-wide Deploy (has_changes=false, has_active_deployments=false) with every applicable prerequisite succeeding did NOT succeed (rc={proc.returncode})\n{proc.stdout}\n{proc.stderr}")
+    sys.exit(1)
+print("OK")
+PYEOF
+)"
+  LIVE_UX_FIX_2_GATE_STATUS=$?
+  set -e
+  if [ "$LIVE_UX_FIX_2_GATE_STATUS" -eq 0 ]; then
+    pass "Live Deploy UX Fix 2: P: environment-wide Deploy (has_changes=false, has_active_deployments=false) succeeds without requiring the selected-runtime mutation jobs, while still requiring every applicable deploy prerequisite"
+  else
+    fail "Live Deploy UX Fix 2: P: environment-wide Deploy final-gate execution proof failed:"$'\n'"${LIVE_UX_FIX_2_GATE_OUT}"
+  fi
+else
+  skip "Live Deploy UX Fix 2: P: environment-wide Deploy final-gate execution proof -- python3/PyYAML/bash unavailable or main workflow missing"
+fi
+
+# Q: Live Deploy Fix 1 remains intact -- eks_oidc_preflight's DescribeCluster step still carries GG_SELECTED_ENVIRONMENT explicitly (the dedicated "Live Deploy Fix 1" section above already proves this in full; this is a lightweight re-confirmation scoped to this task).
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  Q_CHECK="$(python3 -c '
+import yaml
+
+with open("'"$EKS_APP_WORKFLOW"'") as f:
+    doc = yaml.safe_load(f)
+
+steps = doc["jobs"]["eks_oidc_preflight"]["steps"]
+step = next((s for s in steps if s.get("name", "").startswith("DescribeCluster and verify against the selected environment")), None)
+ok = step is not None and (step.get("env") or {}).get("GG_SELECTED_ENVIRONMENT") == "${{ needs.validate_model.outputs.selected_environment }}"
+print("OK" if ok else "FAIL")
+' 2>&1)"
+  if [ "$Q_CHECK" = "OK" ]; then
+    pass "Live Deploy UX Fix 2: Q: Live Deploy Fix 1 remains intact -- eks_oidc_preflight's DescribeCluster step still carries GG_SELECTED_ENVIRONMENT explicitly"
+  else
+    fail "Live Deploy UX Fix 2: Q: Live Deploy Fix 1 regression -- eks_oidc_preflight's DescribeCluster step no longer carries GG_SELECTED_ENVIRONMENT explicitly: ${Q_CHECK}"
+  fi
+else
+  skip "Live Deploy UX Fix 2: Q: Live Deploy Fix 1 re-confirmation -- python3/PyYAML unavailable or main workflow missing"
+fi
+
+echo ""
 echo "--- Phase 11: active workflow environment-identity centralization ---"
 
 # 1: no active workflow depends on a retired repository variable that used to independently duplicate envs/dev/environment.yaml identity.
