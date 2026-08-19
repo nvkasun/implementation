@@ -1,7 +1,7 @@
 name: "00 | MAIN | GoldenGate EKS End-to-End Deployment"
 
-# Live Deploy UX Fix 2: action-aware and neutral -- never claims "deploy" for a validate-only manual run, and never claims a specific deployment ID for an environment-wide run (deployment_id left blank). Destroy is deliberately never named here yet -- the eventual Validate/Deploy/Destroy lifecycle UI is added only once Destroy itself is implemented.
-run-name: "MAIN | GoldenGate EKS | action=${{ github.event_name == 'workflow_dispatch' && inputs.action || 'deploy' }} | ${{ github.event_name == 'workflow_dispatch' && (inputs.deployment_id != '' && inputs.deployment_id || 'environment-wide') || format('auto: envs/dev changes on {0}', github.sha) }} | ran by ${{ github.actor }}"
+# Live Deploy UX Fix 2: action-aware and neutral -- never claims "deploy" for a validate-only manual run, and never claims a specific deployment ID for an environment-wide run (deployment_id left blank); Destroy is deliberately never named here yet, the eventual Validate/Deploy/Destroy lifecycle UI is added only once Destroy itself is implemented. Live Deploy Fix 5: the governance-override fragment only ever appears (as a bare "governance-override=true" flag, never the written reason -- that stays in the audited workflow inputs/corporate attestation) when this is a manual workflow_dispatch run with the input literally true; every other run's title is byte-for-byte unchanged from before this task.
+run-name: "MAIN | GoldenGate EKS | action=${{ github.event_name == 'workflow_dispatch' && inputs.action || 'deploy' }} | ${{ github.event_name == 'workflow_dispatch' && (inputs.deployment_id != '' && inputs.deployment_id || 'environment-wide') || format('auto: envs/dev changes on {0}', github.sha) }}${{ (github.event_name == 'workflow_dispatch' && inputs.terraform_governance_override == true) && ' | governance-override=true' || '' }} | ran by ${{ github.actor }}"
 
 on:
   workflow_dispatch:
@@ -25,6 +25,22 @@ on:
 
       deployment_id:
         description: "Optional GoldenGate runtime deployment ID. Leave blank for an environment-wide run without selected runtime mutation."
+        required: false
+        type: string
+        default: ""
+
+      terraform_governance_override:
+        description: >
+          Authorized Terraform governance break-glass override for the corporate
+          reusable workflow. Leave false for normal execution.
+        required: false
+        type: boolean
+        default: false
+
+      terraform_governance_override_reason:
+        description: >
+          Required written justification when Terraform governance override is
+          enabled.
         required: false
         type: string
         default: ""
@@ -63,6 +79,9 @@ jobs:
       has_active_deployments: ${{ steps.active_runtime_state.outputs.has_active_deployments }}
       active_runtime_matrix: ${{ steps.active_runtime_state.outputs.active_runtime_matrix }}
       selected_environment: ${{ steps.resolve_environment.outputs.environment }}
+      # Live Deploy Fix 5: the SOLE derivation point for the corporate Terraform reusable workflow's break-glass inputs -- never re-derived downstream.
+      terraform_governance_override: ${{ steps.governance.outputs.override }}
+      terraform_governance_override_reason: ${{ steps.governance.outputs.reason }}
 
     steps:
       - name: Checkout repository
@@ -225,6 +244,53 @@ jobs:
             esac
           fi
 
+      - name: Derive and validate the Terraform governance override (fail closed)
+        id: governance
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_OVERRIDE: ${{ inputs.terraform_governance_override }}
+          INPUT_REASON: ${{ inputs.terraform_governance_override_reason }}
+        run: |
+          set -euo pipefail
+
+          # Live Deploy Fix 5: this is the SOLE source of truth for the corporate Terraform reusable workflow's officially supported break-glass inputs (override_noncompliance/override_reason) -- never re-derived in any other job. A push event carries no workflow_dispatch inputs and must NEVER be able to activate break-glass automatically, so it is resolved unconditionally to false/empty before INPUT_OVERRIDE/INPUT_REASON are even inspected.
+          if [ "$EVENT_NAME" != "workflow_dispatch" ]; then
+            echo "override=false" >> "$GITHUB_OUTPUT"
+            echo "reason=" >> "$GITHUB_OUTPUT"
+            echo "OK: ${EVENT_NAME} event -- Terraform governance override is unconditionally false; break-glass requires an explicit manual workflow_dispatch action."
+            exit 0
+          fi
+
+          if [ "$INPUT_OVERRIDE" != "true" ] && [ "$INPUT_OVERRIDE" != "false" ]; then
+            echo "FAIL: terraform_governance_override resolved to '${INPUT_OVERRIDE}', expected literal 'true' or 'false'."
+            exit 1
+          fi
+
+          TRIMMED_REASON="$(echo "$INPUT_REASON" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+
+          if [ "$INPUT_OVERRIDE" = "true" ]; then
+            if [ -z "$TRIMMED_REASON" ]; then
+              echo "FAIL: terraform_governance_override=true requires a non-empty, non-whitespace terraform_governance_override_reason. Refusing to activate the corporate Terraform governance break-glass without a written justification."
+              exit 1
+            fi
+
+            echo "override=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "reason<<GG_TF_GOVERNANCE_REASON_EOF"
+              echo "$INPUT_REASON"
+              echo "GG_TF_GOVERNANCE_REASON_EOF"
+            } >> "$GITHUB_OUTPUT"
+            echo "Terraform governance override is ENABLED for this manual run -- the corporate reusable workflow will receive override_noncompliance=true with the supplied override_reason. This is not a bypass: non-compliance remains recorded, and manual approval itself cannot be overridden."
+          else
+            if [ -n "$TRIMMED_REASON" ]; then
+              echo "INFO: terraform_governance_override_reason was provided but terraform_governance_override is false -- the reason is ignored; normal corporate PR-governance behavior applies."
+            fi
+            echo "override=false" >> "$GITHUB_OUTPUT"
+            echo "reason=" >> "$GITHUB_OUTPUT"
+            echo "OK: Terraform governance override is disabled -- normal corporate PR-governance/Kosli attestation applies."
+          fi
+
   eks_oidc_preflight:
     name: Verify live EKS cluster + OIDC issuer match the selected environment's environment.yaml (read-only)
 
@@ -339,6 +405,9 @@ jobs:
     secrets: inherit
     with:
       environment: ${{ needs.validate_model.outputs.selected_environment }}
+      # Live Deploy Fix 5: propagates validate_model's single-source-of-truth governance derivation -- never re-derived here.
+      terraform_governance_override: ${{ needs.validate_model.outputs.terraform_governance_override == 'true' }}
+      terraform_governance_override_reason: ${{ needs.validate_model.outputs.terraform_governance_override_reason }}
 
   argocd_preflight:
     name: Classify Argo CD prerequisite state (read-only)

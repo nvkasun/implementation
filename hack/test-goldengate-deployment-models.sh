@@ -9863,6 +9863,379 @@ else
 fi
 
 echo ""
+echo "--- Live Deploy Fix 5: safe Terraform governance override integration ---"
+
+SUB_IAM_SECRETS_WORKFLOW=".github/workflows/10-sub-iam-secrets.yaml"
+
+# A/B: MAIN's workflow_dispatch declares both new governance inputs with the exact required type/default contract.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  FIX5_AB_CHECK="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import sys
+
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+
+on_block = doc.get(True, doc.get("on", {}))
+wd_inputs = (on_block.get("workflow_dispatch") or {}).get("inputs") or {}
+
+results = []
+
+override_input = wd_inputs.get("terraform_governance_override")
+results.append(("A1: MAIN workflow_dispatch defines terraform_governance_override", override_input is not None))
+if override_input is not None:
+    results.append(("A2: terraform_governance_override type is boolean", override_input.get("type") == "boolean"))
+    results.append(("A3: terraform_governance_override default is false", override_input.get("default") is False))
+    results.append(("A4: terraform_governance_override is not required (required: false)", override_input.get("required") is False))
+
+reason_input = wd_inputs.get("terraform_governance_override_reason")
+results.append(("B1: MAIN workflow_dispatch defines terraform_governance_override_reason", reason_input is not None))
+if reason_input is not None:
+    results.append(("B2: terraform_governance_override_reason type is string", reason_input.get("type") == "string"))
+    results.append(("B3: terraform_governance_override_reason default is the empty string", reason_input.get("default") == ""))
+    results.append(("B4: terraform_governance_override_reason is not required (required: false)", reason_input.get("required") is False))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL\ *) fail "Live Deploy Fix 5: ${line#FAIL }" ;;
+      OK\ *) pass "Live Deploy Fix 5: ${line#OK }" ;;
+    esac
+  done <<< "$FIX5_AB_CHECK"
+else
+  skip "Live Deploy Fix 5: A/B: MAIN governance input structural checks -- python3/PyYAML unavailable or main workflow missing"
+fi
+
+# C-H: REALLY EXECUTE the committed "Derive and validate the Terraform governance override (fail closed)" script (never a reimplementation) for every required scenario, including the fail-closed cases and the push-can-never-activate-break-glass case.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  set +e
+  FIX5_GOV_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import os
+import subprocess
+import sys
+import tempfile
+
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+
+step = next((s for s in doc["jobs"]["validate_model"]["steps"] if s.get("name") == "Derive and validate the Terraform governance override (fail closed)"), None)
+if step is None:
+    print("FAIL: validate_model is missing its 'Derive and validate the Terraform governance override (fail closed)' step")
+    sys.exit(0)
+script = step["run"]
+
+
+def parse_github_output(text):
+    result = {}
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if "<<" in line:
+            key, delim = line.split("<<", 1)
+            i += 1
+            buf = []
+            while i < len(lines) and lines[i] != delim:
+                buf.append(lines[i])
+                i += 1
+            result[key] = "\n".join(buf)
+        elif "=" in line:
+            key, val = line.split("=", 1)
+            result[key] = val
+        i += 1
+    return result
+
+
+def run_step(event_name, override, reason):
+    fd, gh_output_path = tempfile.mkstemp()
+    os.close(fd)
+    env = {"PATH": os.environ.get("PATH", ""), "EVENT_NAME": event_name, "INPUT_OVERRIDE": override, "INPUT_REASON": reason, "GITHUB_OUTPUT": gh_output_path}
+    proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=20)
+    with open(gh_output_path) as f:
+        outputs = parse_github_output(f.read())
+    os.unlink(gh_output_path)
+    return proc.returncode, outputs, proc.stdout + proc.stderr
+
+results = []
+
+rc, outputs, log = run_step("push", "", "")
+results.append(("H: push event resolves override=false / reason=empty regardless of input context", rc == 0 and outputs.get("override") == "false" and outputs.get("reason", "") == ""))
+
+rc, outputs, log = run_step("workflow_dispatch", "false", "")
+results.append(("C: manual override=false, reason=empty -> valid, override=false", rc == 0 and outputs.get("override") == "false"))
+
+rc, outputs, log = run_step("workflow_dispatch", "false", "informational text")
+results.append(("D: manual override=false, reason=informational -> valid, override still false (reason ignored)", rc == 0 and outputs.get("override") == "false" and "INFO" in log))
+
+rc, outputs, log = run_step("workflow_dispatch", "true", "")
+results.append(("E: manual override=true, reason=empty -> FAILS CLOSED", rc != 0))
+
+rc, outputs, log = run_step("workflow_dispatch", "true", "   ")
+results.append(("F: manual override=true, reason=whitespace-only -> FAILS CLOSED", rc != 0))
+
+rc, outputs, log = run_step("workflow_dispatch", "true", "Approved DEV POC emergency validation")
+results.append(("G: manual override=true, reason=meaningful text -> valid, override=true with the exact reason preserved", rc == 0 and outputs.get("override") == "true" and outputs.get("reason") == "Approved DEV POC emergency validation"))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  set -e
+  if [ -n "$FIX5_GOV_OUT" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        FAIL\ *) fail "Live Deploy Fix 5: ${line#FAIL }" ;;
+        OK\ *) pass "Live Deploy Fix 5: ${line#OK }" ;;
+      esac
+    done <<< "$FIX5_GOV_OUT"
+  else
+    fail "Live Deploy Fix 5: C-H: governance derivation execution proof produced no output"
+  fi
+else
+  skip "Live Deploy Fix 5: C-H: governance derivation execution proof -- python3/PyYAML/main workflow missing"
+fi
+
+# I: no repository variable / environment variable / secret path can activate the override -- the derivation step's own env: block sources ONLY github.event_name and the two workflow_dispatch inputs, never vars.* or secrets.*.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  FIX5_I_CHECK="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import sys
+
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+
+step = next((s for s in doc["jobs"]["validate_model"]["steps"] if s.get("name") == "Derive and validate the Terraform governance override (fail closed)"), None)
+ok = step is not None
+if ok:
+    step_env = step.get("env") or {}
+    ok = (
+        set(step_env.keys()) == {"EVENT_NAME", "INPUT_OVERRIDE", "INPUT_REASON"}
+        and step_env.get("EVENT_NAME") == "${{ github.event_name }}"
+        and step_env.get("INPUT_OVERRIDE") == "${{ inputs.terraform_governance_override }}"
+        and step_env.get("INPUT_REASON") == "${{ inputs.terraform_governance_override_reason }}"
+        and "vars." not in str(step_env.values())
+        and "secrets." not in str(step_env.values())
+    )
+print("OK" if ok else "FAIL")
+PYEOF
+)"
+  if [ "$FIX5_I_CHECK" = "OK" ]; then
+    pass "Live Deploy Fix 5: I: the governance derivation step sources ONLY github.event_name and the two workflow_dispatch inputs -- no repository variable, environment variable, or secret can activate the override"
+  else
+    fail "Live Deploy Fix 5: I: the governance derivation step's env: block deviates from the expected minimal, input-only source set: ${FIX5_I_CHECK}"
+  fi
+else
+  skip "Live Deploy Fix 5: I: no-automatic-activation-path check -- python3/PyYAML unavailable or main workflow missing"
+fi
+
+# J: MAIN's terraform_sync_once propagates validate_model's single-source-of-truth governance derivation into the SUB workflow call, and Validate mode has no operational effect (terraform_sync_once's own if: is unchanged -- still gated on effective_deploy=='true').
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  FIX5_J_CHECK="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import sys
+
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+
+job = doc["jobs"]["terraform_sync_once"]
+with_block = job.get("with") or {}
+
+results = []
+results.append(("J1: terraform_sync_once passes terraform_governance_override from needs.validate_model.outputs.terraform_governance_override", with_block.get("terraform_governance_override") == "${{ needs.validate_model.outputs.terraform_governance_override == 'true' }}"))
+results.append(("J2: terraform_sync_once passes terraform_governance_override_reason from needs.validate_model.outputs.terraform_governance_override_reason", with_block.get("terraform_governance_override_reason") == "${{ needs.validate_model.outputs.terraform_governance_override_reason }}"))
+results.append(("N: terraform_sync_once's if: still requires effective_deploy == 'true' -- Validate mode never runs Terraform regardless of the override input value", "effective_deploy == 'true'" in str(job.get("if", ""))))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL\ *) fail "Live Deploy Fix 5: ${line#FAIL }" ;;
+      OK\ *) pass "Live Deploy Fix 5: ${line#OK }" ;;
+    esac
+  done <<< "$FIX5_J_CHECK"
+else
+  skip "Live Deploy Fix 5: J/N: MAIN-to-SUB propagation and Validate-mode-non-mutating checks -- python3/PyYAML unavailable or main workflow missing"
+fi
+
+# K/L/M: 10-sub-iam-secrets.yaml's workflow_call input defaults are false/"", and its call to the corporate aws-terraform-apply.yaml maps the received values to the corporate workflow's EXACT input names -- never a hardcoded override_noncompliance: true anywhere.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$SUB_IAM_SECRETS_WORKFLOW" ]; then
+  FIX5_KLM_CHECK="$(python3 - "$SUB_IAM_SECRETS_WORKFLOW" <<'PYEOF'
+import sys
+
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+
+results = []
+
+wc_inputs = (doc.get(True, doc.get("on", {})).get("workflow_call") or {}).get("inputs") or {}
+override_input = wc_inputs.get("terraform_governance_override")
+reason_input = wc_inputs.get("terraform_governance_override_reason")
+results.append(("K1: workflow_call.terraform_governance_override default is false", override_input is not None and override_input.get("default") is False))
+results.append(("K2: workflow_call.terraform_governance_override_reason default is the empty string", reason_input is not None and reason_input.get("default") == ""))
+
+apply_job = doc["jobs"]["apply"]
+results.append(("L0: apply job still calls the corporate aws-terraform-apply.yaml reusable workflow unmodified", apply_job.get("uses") == "AbuDhabiCommercialBank/adcb-reusable-workflows/.github/workflows/aws-terraform-apply.yaml@main"))
+
+with_block = apply_job.get("with") or {}
+results.append(("L1: the corporate call maps to override_noncompliance (the exact corporate input name)", "override_noncompliance" in with_block))
+results.append(("L2: the corporate call maps to override_reason (the exact corporate input name)", "override_reason" in with_block))
+results.append(("M1: override_noncompliance is never a hardcoded true literal -- always a GitHub Actions expression sourced from the validated job output", isinstance(with_block.get("override_noncompliance"), str) and with_block.get("override_noncompliance", "").startswith("${{") and with_block.get("override_noncompliance") != "${{ true }}"))
+results.append(("M2: override_noncompliance references needs.validate_environment_config.outputs.terraform_governance_override", "needs.validate_environment_config.outputs.terraform_governance_override" in str(with_block.get("override_noncompliance", ""))))
+results.append(("L3: override_reason references needs.validate_environment_config.outputs.terraform_governance_override_reason", with_block.get("override_reason") == "${{ needs.validate_environment_config.outputs.terraform_governance_override_reason }}"))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL\ *) fail "Live Deploy Fix 5: ${line#FAIL }" ;;
+      OK\ *) pass "Live Deploy Fix 5: ${line#OK }" ;;
+    esac
+  done <<< "$FIX5_KLM_CHECK"
+else
+  skip "Live Deploy Fix 5: K/L/M: SUB workflow contract and corporate call-mapping checks -- python3/PyYAML unavailable or 10-sub-iam-secrets.yaml missing"
+fi
+
+# M (repo-wide): a hardcoded "override_noncompliance: true" (or "override_noncompliance:true") literal must not exist anywhere in any active workflow file.
+FIX5_M_HITS="$(grep -rniE 'override_noncompliance[[:space:]]*:[[:space:]]*true[[:space:]]*$' .github/workflows/*.yaml 2>/dev/null || true)"
+if [ -z "$FIX5_M_HITS" ]; then
+  pass "Live Deploy Fix 5: M3: no active workflow file contains a hardcoded 'override_noncompliance: true' literal anywhere in the repository"
+else
+  fail "Live Deploy Fix 5: M3: a hardcoded override_noncompliance: true literal was found:"$'\n'"${FIX5_M_HITS}"
+fi
+
+# O/P/Q: SUB's own governance validation step re-derives/re-validates whatever it received (whether from MAIN's workflow_call or a direct standalone workflow_dispatch) -- REALLY EXECUTE it for the normal, authorized-override, and (by construction, since this workflow has no push trigger) never-implicitly-active cases.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$SUB_IAM_SECRETS_WORKFLOW" ]; then
+  set +e
+  FIX5_OPQ_OUT="$(python3 - "$SUB_IAM_SECRETS_WORKFLOW" <<'PYEOF'
+import os
+import subprocess
+import sys
+import tempfile
+
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+
+step = next((s for s in doc["jobs"]["validate_environment_config"]["steps"] if s.get("name") == "Validate the Terraform governance override inputs (fail closed)"), None)
+if step is None:
+    print("FAIL: validate_environment_config is missing its 'Validate the Terraform governance override inputs (fail closed)' step")
+    sys.exit(0)
+script = step["run"]
+
+
+def parse_github_output(text):
+    result = {}
+    for line in text.splitlines():
+        if "<<" in line:
+            continue
+        if "=" in line:
+            key, val = line.split("=", 1)
+            result[key] = val
+    return result
+
+
+def run_step(override, reason):
+    fd, gh_output_path = tempfile.mkstemp()
+    os.close(fd)
+    env = {"PATH": os.environ.get("PATH", ""), "INPUT_OVERRIDE": override, "INPUT_REASON": reason, "GITHUB_OUTPUT": gh_output_path}
+    proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=20)
+    with open(gh_output_path) as f:
+        outputs = parse_github_output(f.read())
+    os.unlink(gh_output_path)
+    return proc.returncode, outputs
+
+results = []
+
+rc, outputs = run_step("false", "")
+results.append(("O: SUB with override=false (the default) -> valid, override=false -- normal corporate governance path is unchanged", rc == 0 and outputs.get("override") == "false"))
+
+rc, outputs = run_step("true", "Approved DEV POC emergency validation")
+results.append(("P: SUB with override=true + a valid written reason -> valid, override=true is forwarded toward the corporate call", rc == 0 and outputs.get("override") == "true"))
+
+rc, outputs = run_step("true", "")
+results.append(("Q: SUB independently refuses override=true with no reason, defense-in-depth even if a caller somehow skipped MAIN's own validation", rc != 0))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  set -e
+  if [ -n "$FIX5_OPQ_OUT" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        FAIL\ *) fail "Live Deploy Fix 5: ${line#FAIL }" ;;
+        OK\ *) pass "Live Deploy Fix 5: ${line#OK }" ;;
+      esac
+    done <<< "$FIX5_OPQ_OUT"
+  else
+    fail "Live Deploy Fix 5: O/P/Q: SUB governance validation execution proof produced no output"
+  fi
+else
+  skip "Live Deploy Fix 5: O/P/Q: SUB governance validation execution proof -- python3/PyYAML/10-sub-iam-secrets.yaml missing"
+fi
+
+# R/S: the previously-established Validate/Deploy dropdown and environment-wide deployment_id semantics remain completely unchanged by this task.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  FIX5_RS_CHECK="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import sys
+
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+
+wd_inputs = (doc.get(True, doc.get("on", {})).get("workflow_dispatch") or {}).get("inputs") or {}
+results = []
+
+action_input = wd_inputs.get("action")
+results.append(("R: the action input is unchanged -- required choice of [validate, deploy] defaulting to validate", action_input is not None and action_input.get("type") == "choice" and action_input.get("required") is True and action_input.get("default") == "validate" and action_input.get("options") == ["validate", "deploy"]))
+
+deployment_id_input = wd_inputs.get("deployment_id")
+results.append(("S: the deployment_id input is unchanged -- optional with an empty default (environment-wide semantics preserved)", deployment_id_input is not None and deployment_id_input.get("required") is False and deployment_id_input.get("default") == ""))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL\ *) fail "Live Deploy Fix 5: ${line#FAIL }" ;;
+      OK\ *) pass "Live Deploy Fix 5: ${line#OK }" ;;
+    esac
+  done <<< "$FIX5_RS_CHECK"
+else
+  skip "Live Deploy Fix 5: R/S: Validate/Deploy dropdown and deployment_id re-confirmation -- python3/PyYAML unavailable or main workflow missing"
+fi
+
+# T: the repo-wide GG_SELECTED_ENVIRONMENT checker (Live Deploy Fix 4) remains green -- this task's edits never reference GG_SELECTED_ENVIRONMENT and must not regress it.
+if [ -f "$ENV_SCOPE_CHECKER" ]; then
+  FIX5_T_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 "$ENV_SCOPE_CHECKER" 2>&1)"
+  FIX5_T_STATUS=$?
+  if [ "$FIX5_T_STATUS" -eq 0 ] && grep -q "^Unsafe jobs: 0$" <<< "$FIX5_T_OUT"; then
+    pass "Live Deploy Fix 5: T: ${ENV_SCOPE_CHECKER} remains green (Unsafe jobs: 0) after this task's edits"
+  else
+    fail "Live Deploy Fix 5: T: ${ENV_SCOPE_CHECKER} regressed after this task's edits (status=${FIX5_T_STATUS}):"$'\n'"${FIX5_T_OUT}"
+  fi
+else
+  skip "Live Deploy Fix 5: T: ${ENV_SCOPE_CHECKER} re-confirmation -- checker missing"
+fi
+
+echo ""
 echo "--- Phase 11: active workflow environment-identity centralization ---"
 
 # 1: no active workflow depends on a retired repository variable that used to independently duplicate envs/dev/environment.yaml identity.
