@@ -9073,6 +9073,54 @@ else
 fi
 
 echo ""
+echo "--- Live Deploy Fix 1: eks_oidc_preflight's DescribeCluster step carries GG_SELECTED_ENVIRONMENT ---"
+
+# Real VDR failure: "Load resolved environment config" sets GG_SELECTED_ENVIRONMENT via step-level env:, but GitHub Actions step-level env values do NOT carry into the next step -- the later "DescribeCluster and verify..." step referenced "$GG_SELECTED_ENVIRONMENT" under `set -euo pipefail` without its own binding, so bash correctly failed with "unbound variable". Semantic YAML parse (never a source-fragile whitespace/grep check): the step's own env: block must supply GG_SELECTED_ENVIRONMENT from the same needs.validate_model.outputs.selected_environment source every other job/step in this workflow already uses -- this must fail if that step ever again references GG_SELECTED_ENVIRONMENT without providing the binding itself.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  LIVE_FIX_1_CHECK="$(python3 -c '
+import yaml
+
+with open("'"$EKS_APP_WORKFLOW"'") as f:
+    doc = yaml.safe_load(f)
+
+results = []
+
+preflight = doc["jobs"].get("eks_oidc_preflight", {})
+steps = preflight.get("steps") or []
+step = next((s for s in steps if s.get("name", "").startswith("DescribeCluster and verify against the selected environment")), None)
+
+results.append(("1: eks_oidc_preflight defines the DescribeCluster verification step", step is not None))
+
+if step is not None:
+    run_text = step.get("run", "")
+    references_var = "$GG_SELECTED_ENVIRONMENT" in run_text or "${GG_SELECTED_ENVIRONMENT}" in run_text
+    results.append(("2: the DescribeCluster step still references GG_SELECTED_ENVIRONMENT in its run: script", references_var))
+
+    step_env = step.get("env") or {}
+    results.append(("3: the DescribeCluster step defines its OWN env: block (never relying on the prior steps env: carrying over -- it does not)", "GG_SELECTED_ENVIRONMENT" in step_env))
+
+    expected_value = "${{ needs.validate_model.outputs.selected_environment }}"
+    actual_value = str(step_env.get("GG_SELECTED_ENVIRONMENT", ""))
+    results.append((f"4: GG_SELECTED_ENVIRONMENT == needs.validate_model.outputs.selected_environment (got {actual_value!r})", actual_value == expected_value))
+
+    # If the step references the variable at all, it MUST be bound in this step -- this is the exact failure mode the live VDR run hit.
+    if references_var:
+        results.append(("5: a step that references GG_SELECTED_ENVIRONMENT always provides its own binding for it (no unbound-variable risk under set -euo pipefail)", "GG_SELECTED_ENVIRONMENT" in step_env))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+' 2>&1)"
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL\ *) fail "Live Deploy Fix 1: ${line#FAIL }" ;;
+      OK\ *) pass "Live Deploy Fix 1: ${line#OK }" ;;
+    esac
+  done <<< "$LIVE_FIX_1_CHECK"
+else
+  skip "Live Deploy Fix 1: eks_oidc_preflight GG_SELECTED_ENVIRONMENT binding check -- python3/PyYAML unavailable or main workflow missing"
+fi
+
+echo ""
 echo "--- Phase 11: active workflow environment-identity centralization ---"
 
 # 1: no active workflow depends on a retired repository variable that used to independently duplicate envs/dev/environment.yaml identity.

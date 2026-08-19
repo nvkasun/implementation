@@ -244,6 +244,8 @@ jobs:
 
       - name: DescribeCluster and verify against the selected environment's environment.yaml (read-only)
         shell: bash
+        env:
+          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
         run: |
           set -euo pipefail
 
