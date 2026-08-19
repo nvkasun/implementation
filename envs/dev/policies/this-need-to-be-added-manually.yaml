@@ -1,0 +1,23 @@
+Add permissions → Create inline policy
+
+AWS supports adding a new inline policy directly to a role through exactly this console path.
+
+Select the JSON editor and use:
+
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowAssumeGoldenGateEKSDeployRole",
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Resource": "arn:aws:iam::668311715351:role/GoldenGateEKSDeployRole-dev"
+    }
+  ]
+}
+
+For the policy name in engineering account, I'd use:
+
+AssumeGoldenGateEKSDeployRole-dev
+
+Then create/save it.
