@@ -3660,14 +3660,16 @@ jobs:
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
+    # Live Validate Fix 3: JOB-LEVEL (not step-level) so every run: step in this job -- not just "Load resolved environment config" itself -- can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail. A step-level env: binding is scoped to that one step only and does not propagate to later steps, which is exactly the "GG_SELECTED_ENVIRONMENT: unbound variable" defect the real VDR Validate run hit here.
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Load resolved environment config
         shell: bash
-        env:
-          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
         run: |
           set -euo pipefail
 
@@ -3861,6 +3863,10 @@ jobs:
     permissions:
       contents: read
 
+    # Live Validate Fix 3: JOB-LEVEL (not step-level) so every run: step in this job -- not just "Load resolved environment config" itself -- can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail. A step-level env: binding is scoped to that one step only and does not propagate to later steps, which is the same "GG_SELECTED_ENVIRONMENT: unbound variable" defect class already hit live in replication_dry_run_validation and hardened here preventatively.
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -3885,8 +3891,6 @@ jobs:
 
       - name: Load resolved environment config
         shell: bash
-        env:
-          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
         run: |
           set -euo pipefail
 
@@ -4540,8 +4544,17 @@ jobs:
             allow_non_failure replication_monitor_acceptance
             allow_non_failure end_to_end_deployment_acceptance
 
+            # Replication dry-run validates the global replication schema/pipeline model and must succeed even with zero active runtimes -- unconditionally required for every dry run.
             require_success replication_dry_run_validation
-            require_success monitor_dry_run_validation
+
+            if [ "$HAS_ACTIVE_DEPLOYMENTS" = "true" ]; then
+              echo "DRY RUN + ACTIVE RUNTIMES: monitor_dry_run_validation's own if: condition makes it applicable -- a SKIPPED value here must fail this gate, not merely pass through as 'not a failure'."
+              require_success monitor_dry_run_validation
+            else
+              # monitor_dry_run_validation's own if: condition never runs it against a deliberately empty active-runtime registry -- a real failure/cancellation (should it somehow still run) must still block MAIN.
+              echo "DRY RUN + NO ACTIVE RUNTIMES: monitor_dry_run_validation is legitimately not applicable and may be cleanly skipped."
+              allow_non_failure monitor_dry_run_validation
+            fi
           fi
 
           if [ "$FAILED" = "true" ]; then

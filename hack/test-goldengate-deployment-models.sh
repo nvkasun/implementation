@@ -9462,6 +9462,218 @@ else
 fi
 
 echo ""
+echo "--- Live Validate Fix 3: dry-run environment scope + zero-runtime final-gate consistency ---"
+
+# 1-5: replication_dry_run_validation and monitor_dry_run_validation carry GG_SELECTED_ENVIRONMENT via a JOB-LEVEL env: block (not merely a step-level one on "Load resolved environment config"), and every run: step in each job that references GG_SELECTED_ENVIRONMENT is safely covered by it -- proven both structurally (semantic YAML parse) and behaviorally (real bash execution of the extracted step scripts with ONLY the job-level binding supplied, exactly as GitHub Actions would provide it, confirming none of them hit the real VDR failure signature "GG_SELECTED_ENVIRONMENT: unbound variable").
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  LIVE_FIX_3_ENV_CHECK="$(python3 -c '
+import os
+import subprocess
+import yaml
+
+with open("'"$EKS_APP_WORKFLOW"'") as f:
+    doc = yaml.safe_load(f)
+
+results = []
+expected = "${{ needs.validate_model.outputs.selected_environment }}"
+
+def check_job(job_name):
+    job = doc["jobs"].get(job_name, {})
+    job_env = job.get("env") or {}
+    results.append((f"{job_name}: job-level env: defines GG_SELECTED_ENVIRONMENT (item 1/4)", "GG_SELECTED_ENVIRONMENT" in job_env))
+    actual = str(job_env.get("GG_SELECTED_ENVIRONMENT", ""))
+    results.append((f"{job_name}: GG_SELECTED_ENVIRONMENT == needs.validate_model.outputs.selected_environment, got {actual!r} (item 2)", actual == expected))
+
+    steps = job.get("steps") or []
+    referencing = [s for s in steps if "$GG_SELECTED_ENVIRONMENT" in (s.get("run") or "") or "${GG_SELECTED_ENVIRONMENT}" in (s.get("run") or "")]
+    results.append((f"{job_name}: at least one run: step still references GG_SELECTED_ENVIRONMENT", len(referencing) > 0))
+
+    for step in referencing:
+        name = step.get("name", "<unnamed>")
+        step_env = step.get("env") or {}
+        covered = ("GG_SELECTED_ENVIRONMENT" in job_env) and (("GG_SELECTED_ENVIRONMENT" not in step_env) or step_env.get("GG_SELECTED_ENVIRONMENT") == expected)
+        results.append((f"{job_name}: step {name!r} referencing GG_SELECTED_ENVIRONMENT is safely covered by the job-level binding (item 3/5)", covered))
+
+        env = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", ""), "GG_SELECTED_ENVIRONMENT": "dev"}
+        proc = subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True, timeout=60)
+        unbound_hit = "GG_SELECTED_ENVIRONMENT: unbound variable" in proc.stderr
+        results.append((f"{job_name}: step {name!r} executes without the real VDR unbound-variable failure signature for GG_SELECTED_ENVIRONMENT", not unbound_hit))
+
+check_job("replication_dry_run_validation")
+check_job("monitor_dry_run_validation")
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+' 2>&1)"
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL\ *) fail "Live Validate Fix 3: ${line#FAIL }" ;;
+      OK\ *) pass "Live Validate Fix 3: ${line#OK }" ;;
+    esac
+  done <<< "$LIVE_FIX_3_ENV_CHECK"
+else
+  skip "Live Validate Fix 3: job-level GG_SELECTED_ENVIRONMENT binding checks -- python3/PyYAML unavailable or main workflow missing"
+fi
+
+# 6-11: the final gate's monitor dry-run applicability contract -- REALLY EXECUTE the committed "Validate the mode-aware final DEPLOY success contract" script (never a reimplementation) for every required Validate-mode scenario, plus a Deploy-mode reconfirmation that this task left the frozen contract unchanged.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  set +e
+  LIVE_FIX_3_GATE_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import os
+import subprocess
+import sys
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+
+step = next((s for s in doc["jobs"]["final_validation"]["steps"] if s.get("name") == "Validate the mode-aware final DEPLOY success contract"), None)
+if step is None:
+    print("FAIL: final_validation is missing its 'Validate the mode-aware final DEPLOY success contract' step")
+    sys.exit(0)
+script = step["run"]
+
+ALL_RESULT_JOBS = (
+    "detect_changed_deployments",
+    "validate_shared_secrets_once", "validate_argocd_ready", "validate_platform_ready", "validate_observability_ready",
+    "runtime_ownership_preflight", "build_publish_and_deploy", "delete_removed_argocd_applications",
+    "validate_active_runtimes", "replication_reconcile_once", "replication_dry_run_validation",
+    "monitor_ownership_preflight", "monitor_sync_once", "monitor_dry_run_validation",
+    "validate_monitor_ready", "replication_monitor_acceptance", "end_to_end_deployment_acceptance",
+)
+# Same default-skipped set the existing Live Deploy UX Fix 2 "P" scenario already uses -- validate_argocd_ready/validate_platform_ready/validate_observability_ready default to "success" so a REAL DEPLOY scenario's unconditional requirement for them is satisfiable without every scenario needing to spell them out.
+DEFAULT_SKIPPED = {
+    "runtime_ownership_preflight", "build_publish_and_deploy", "delete_removed_argocd_applications",
+    "validate_active_runtimes", "replication_reconcile_once", "monitor_ownership_preflight",
+    "monitor_sync_once", "validate_monitor_ready", "replication_monitor_acceptance", "end_to_end_deployment_acceptance",
+    "replication_dry_run_validation", "monitor_dry_run_validation",
+}
+
+def run_gate(effective_deploy, has_active, has_changes, has_deletions, overrides):
+    env = dict(os.environ)
+    env["EFFECTIVE_DEPLOY"] = effective_deploy
+    env["HAS_ACTIVE_DEPLOYMENTS"] = has_active
+    env["HAS_CHANGES"] = has_changes
+    env["HAS_DELETIONS"] = has_deletions
+    for job in ALL_RESULT_JOBS:
+        env[f"RESULT_{job}"] = "skipped" if job in DEFAULT_SKIPPED else "success"
+    for job, result in overrides.items():
+        env[f"RESULT_{job}"] = result
+    return subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=20)
+
+results = []
+
+proc = run_gate("false", "false", "false", "false", {"replication_dry_run_validation": "success", "monitor_dry_run_validation": "skipped"})
+results.append(("6: current DEV Validate contract (replication=success, monitor=skipped, zero active runtimes) PASSES the final gate", proc.returncode == 0))
+
+proc = run_gate("false", "true", "false", "false", {"replication_dry_run_validation": "success", "monitor_dry_run_validation": "skipped"})
+results.append(("7: Validate mode with active runtimes + monitor_dry_run_validation=skipped FAILS the final gate", proc.returncode != 0))
+
+proc = run_gate("false", "true", "false", "false", {"replication_dry_run_validation": "success", "monitor_dry_run_validation": "success"})
+results.append(("8: Validate mode with active runtimes + both dry-run jobs succeeding PASSES the final gate", proc.returncode == 0))
+
+proc = run_gate("false", "false", "false", "false", {"replication_dry_run_validation": "skipped", "monitor_dry_run_validation": "skipped"})
+results.append(("9a: replication_dry_run_validation=skipped (zero active runtimes) FAILS the final gate", proc.returncode != 0))
+
+proc = run_gate("false", "true", "false", "false", {"replication_dry_run_validation": "failure", "monitor_dry_run_validation": "success"})
+results.append(("9b: replication_dry_run_validation=failure (active runtimes) FAILS the final gate", proc.returncode != 0))
+
+proc = run_gate("false", "true", "false", "false", {"replication_dry_run_validation": "success", "monitor_dry_run_validation": "failure"})
+results.append(("10a: monitor_dry_run_validation=failure (active runtimes, applicable) FAILS the final gate", proc.returncode != 0))
+
+proc = run_gate("false", "true", "false", "false", {"replication_dry_run_validation": "success", "monitor_dry_run_validation": "cancelled"})
+results.append(("10b: monitor_dry_run_validation=cancelled (active runtimes, applicable) FAILS the final gate", proc.returncode != 0))
+
+proc = run_gate("false", "false", "false", "false", {"replication_dry_run_validation": "success", "monitor_dry_run_validation": "failure"})
+results.append(("10c: monitor_dry_run_validation=failure (zero active runtimes, should not have run) still FAILS the final gate -- a real failure is never silently accepted", proc.returncode != 0))
+
+proc = run_gate("true", "false", "false", "false", {})
+results.append(("11: existing Deploy-mode contract (environment-wide Deploy, zero active runtimes, no selected mutation) is unchanged and still PASSES", proc.returncode == 0))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  LIVE_FIX_3_GATE_STATUS=$?
+  set -e
+  if [ -n "$LIVE_FIX_3_GATE_OUT" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        FAIL\ *) fail "Live Validate Fix 3: ${line#FAIL }" ;;
+        OK\ *) pass "Live Validate Fix 3: ${line#OK }" ;;
+      esac
+    done <<< "$LIVE_FIX_3_GATE_OUT"
+  else
+    fail "Live Validate Fix 3: final-gate scenario execution proof produced no output (status=${LIVE_FIX_3_GATE_STATUS})"
+  fi
+else
+  skip "Live Validate Fix 3: final-gate scenario execution proof -- python3/PyYAML/bash unavailable or main workflow missing"
+fi
+
+# 12: Live Deploy Fix 1 remains protected -- eks_oidc_preflight's DescribeCluster step still carries its own GG_SELECTED_ENVIRONMENT binding, untouched by this task's job-level env changes to the two dry-run jobs.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  FIX3_PRESERVE_CHECK="$(python3 -c '
+import yaml
+
+with open("'"$EKS_APP_WORKFLOW"'") as f:
+    doc = yaml.safe_load(f)
+
+steps = doc["jobs"]["eks_oidc_preflight"]["steps"]
+step = next((s for s in steps if s.get("name", "").startswith("DescribeCluster and verify against the selected environment")), None)
+ok = step is not None and (step.get("env") or {}).get("GG_SELECTED_ENVIRONMENT") == "${{ needs.validate_model.outputs.selected_environment }}"
+print("OK" if ok else "FAIL")
+' 2>&1)"
+  if [ "$FIX3_PRESERVE_CHECK" = "OK" ]; then
+    pass "Live Validate Fix 3: 12: Live Deploy Fix 1 remains protected -- eks_oidc_preflight's DescribeCluster step still carries its own GG_SELECTED_ENVIRONMENT binding"
+  else
+    fail "Live Validate Fix 3: 12: Live Deploy Fix 1 regression -- eks_oidc_preflight's DescribeCluster step no longer carries GG_SELECTED_ENVIRONMENT: ${FIX3_PRESERVE_CHECK}"
+  fi
+else
+  skip "Live Validate Fix 3: 12: Live Deploy Fix 1 re-confirmation -- python3/PyYAML unavailable or main workflow missing"
+fi
+
+# 13: the Validate/Deploy dropdown and environment-wide detector contract from Live Deploy UX Fix 2 remain untouched by this task's edits.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  FIX3_UX_CHECK="$(python3 -c '
+import yaml
+
+with open("'"$EKS_APP_WORKFLOW"'") as f:
+    doc = yaml.safe_load(f)
+
+results = []
+
+on_block = doc.get(True, doc.get("on", {}))
+wd_inputs = (on_block.get("workflow_dispatch") or {}).get("inputs") or {}
+
+action_input = wd_inputs.get("action")
+results.append(("action input is a required choice of [validate, deploy] defaulting to validate", action_input is not None and action_input.get("type") == "choice" and action_input.get("required") is True and action_input.get("default") == "validate" and action_input.get("options") == ["validate", "deploy"]))
+
+deployment_id_input = wd_inputs.get("deployment_id")
+results.append(("deployment_id input is optional with an empty default", deployment_id_input is not None and deployment_id_input.get("required") is False and deployment_id_input.get("default") == ""))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+' 2>&1)"
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL\ *) fail "Live Validate Fix 3: 13: ${line#FAIL }" ;;
+      OK\ *) pass "Live Validate Fix 3: 13: ${line#OK }" ;;
+    esac
+  done <<< "$FIX3_UX_CHECK"
+else
+  skip "Live Validate Fix 3: 13: workflow_dispatch action/deployment_id re-confirmation -- python3/PyYAML unavailable or main workflow missing"
+fi
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$DETECT_SCRIPT" ]; then
+  if bash -n "$DETECT_SCRIPT"; then
+    pass "Live Validate Fix 3: 13: ${DETECT_SCRIPT} (environment-wide manual detector) still parses cleanly -- untouched by this task's MAIN-workflow-only edits"
+  else
+    fail "Live Validate Fix 3: 13: ${DETECT_SCRIPT} failed bash -n after this task's edits"
+  fi
+else
+  skip "Live Validate Fix 3: 13: ${DETECT_SCRIPT} syntax re-confirmation -- bash/detect script unavailable"
+fi
+
+echo ""
 echo "--- Phase 11: active workflow environment-identity centralization ---"
 
 # 1: no active workflow depends on a retired repository variable that used to independently duplicate envs/dev/environment.yaml identity.

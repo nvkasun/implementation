@@ -1,0 +1,98 @@
+global:
+  environment: ""
+
+image:
+  repository: ""
+  tag: ""
+  pullPolicy: IfNotPresent
+
+namespace:
+  create: true
+  name: ""
+
+replicaCount: 1
+
+aws:
+  region: ""
+
+dynamodb:
+  tableName: gg-eks-pipeline
+
+# The deployment-model-generated registry, staged read-only under this chart's files/ directory (never committed there) and mounted into the pod here.
+canonicalConfig:
+  root: /etc/gg-canonical
+
+staleAfterSeconds: 120
+refreshSeconds: 30
+
+# Hard kill switch, independent of CONFIG.metricsEnabled; publishing requires BOTH to be true (see health_rules.py).
+cloudwatch:
+  publishEnabled: false
+
+serviceAccount:
+  create: true
+  name: gg-monitor
+  # Required whenever serviceAccount.create=true -- IRSA needs the role ARN to annotate the ServiceAccount with.
+  roleArn: ""
+
+service:
+  type: ClusterIP
+  port: 8080
+
+ingress:
+  enabled: false
+  # mode: shared -> join an existing ALB group (app/group-level annotations only); standalone -> owns its own ALB (full annotations).
+  mode: shared
+  className: alb
+  host: ""
+
+  alb:
+    groupName: ""
+    groupOrder: ""
+    targetType: ip
+    # Portal serves plain HTTP on :8080; do not set HTTPS -- the shared ALB terminates HTTPS externally and forwards HTTP to the pod.
+    backendProtocol: HTTP
+    listenPorts: '[{"HTTPS":443}]'
+    certificateArn: ""
+    healthcheckProtocol: HTTP
+    healthcheckPort: traffic-port
+    healthcheckPath: /healthz
+    successCodes: "200"
+    # Standalone-mode-only fields (never emitted in shared mode).
+    scheme: internal
+    sslPolicy: ""
+    sslRedirect: ""
+    subnets: ""
+    securityGroups: ""
+    inboundCidrs: ""
+    loadBalancerAttributes: ""
+
+  annotations: {}
+
+resources:
+  requests:
+    cpu: 25m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 256Mi
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+  seccompProfile:
+    type: RuntimeDefault
+
+networkPolicy:
+  # Kept disabled by default: egress CIDRs (VPC endpoint, DNS, ALB traffic) must be confirmed for this cluster before enabling.
+  enabled: false
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

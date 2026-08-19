@@ -1,0 +1,6 @@
+environment: dev
+runtimeNamespace: goldengate-dev
+monitoringNamespace: goldengate-monitoring
+dnsDomain: goldengate-dev.adcbmis.local
+tlsSecret: dev/goldengate/tls-certificate
+deployments: []
