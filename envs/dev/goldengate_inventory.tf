@@ -145,13 +145,6 @@ locals {
     if local.goldengate_persistence_efs_declared[id] && local.goldengate_persistence_efs_mode_raw[id] == "managed"
   }
 
-  goldengate_existing_efs_deployments = {
-    for id, doc in local.goldengate_runtime_documents : id => {
-      filesystem_id = local.goldengate_persistence_efs_filesystem_id_raw[id]
-    }
-    if local.goldengate_persistence_efs_declared[id] && local.goldengate_persistence_efs_mode_raw[id] == "existing"
-  }
-
   # No filtering here; terraform_data.goldengate_runtime_contract enforces the full contract as a plan-blocking precondition.
   goldengate_runtime_candidates = local.goldengate_runtime_documents
 
@@ -204,32 +197,9 @@ locals {
     ]) > 1
   ])
 
-  # The sole admin-secret derivation rule: deployment.role alone selects the shared environment-level secret.
-  goldengate_admin_secret_names = {
-    for id in local.goldengate_deployment_names : id =>
-    try(local.goldengate_enabled_deployments[id].deployment.role, "") == "source"
-    ? local.gg_env_source_admin_secret_name
-    : local.gg_env_target_admin_secret_name
-  }
-
   goldengate_tls_secret_name = local.gg_env_tls_secret_name
 
-  # Restored shared runtime identity: every singleRuntime deployment resolves the SAME platform-owned ServiceAccount regardless of deploymentType -- deploymentType controls image/product/ports/replication semantics, never AWS runtime identity. Mirrors hack/goldengate-deployment-model.py's resolve_runtime_service_account().
-  goldengate_runtime_service_account_names = {
-    for id in local.goldengate_deployment_names : id => "gg-runtime-sa"
-  }
-
-  # Unique enabled deployment types, sorted deterministically; mirrors hack/goldengate-deployment-model.py's runtime-identities command. No longer drives runtime AWS identity (see goldengate_canonical_runtime_trust_subject below) -- retained as the folder-driven type inventory consumed by DynamoDB CONFIG/dashboard generation.
-  goldengate_enabled_deployment_types = sort(distinct([
-    for id in local.goldengate_deployment_names : local.goldengate_deployment_type_raw[id]
-  ]))
-
-  # Descriptive per-type mirror only, since every type now shares one runtime ServiceAccount; never consumed for IRSA trust.
-  goldengate_runtime_identity_inventory = {
-    for t in local.goldengate_enabled_deployment_types : t => "gg-runtime-sa"
-  }
-
-  # The permanent, stable self-service runtime identity: every singleRuntime deployment of every deploymentType (including future ones) shares this ONE IRSA subject, so onboarding a new engine never requires an IAM trust-policy edit. Never derived from the folder inventory -- it is a platform invariant, not a per-type/per-count value. This is a fresh EKS cluster: there is no migration-compatibility trust to preserve, so this is the ONLY approved runtime trust subject.
+  # The permanent, stable self-service runtime identity: every singleRuntime deployment of every deploymentType (including future ones) shares this ONE IRSA subject, so onboarding a new engine never requires an IAM trust-policy edit -- deploymentType controls image/product/ports/replication semantics, never AWS runtime identity. Never derived from the folder inventory -- it is a platform invariant, not a per-type/per-count value. This is a fresh EKS cluster: there is no migration-compatibility trust to preserve, so this is the ONLY approved runtime trust subject. Mirrors hack/goldengate-deployment-model.py's resolve_runtime_service_account().
   goldengate_canonical_runtime_trust_subject = "system:serviceaccount:${local.goldengate_shared_environment.runtimeNamespace}:gg-runtime-sa"
 
   goldengate_secrets_trust_policy = jsondecode(file("${path.module}/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json"))
@@ -288,7 +258,7 @@ resource "terraform_data" "goldengate_runtime_contract" {
       error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.deploymentType must be a safe lowercase token (letters/digits only, internal hyphens only, no leading/trailing hyphen, max 32 characters)."
     }
     precondition {
-      # Fresh-EKS Phase A/Phase 9: the descriptor owns only the environment-neutral repositoryName; the full private-ECR repository (local.gg_env_ecr_registry/<repositoryName>) is derived once by the workflow/deployment model, never descriptor input.
+      # Fresh-EKS Phase A/Phase 9: the descriptor owns only the environment-neutral repositoryName; the full private-ECR repository (the canonical environment configuration's ECR registry + <repositoryName>) is derived once by the workflow/deployment model, never descriptor input.
       condition = (
         try(each.value.runtime.image.repositoryName, "") != ""
         && can(regex("^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*$", each.value.runtime.image.repositoryName))
@@ -297,7 +267,7 @@ resource "terraform_data" "goldengate_runtime_contract" {
     }
     precondition {
       condition     = try(each.value.runtime.image.repository, null) == null
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.image.repository is a forbidden override -- it is shared environment identity, derived from local.gg_env_ecr_registry + runtime.image.repositoryName, and must not be set in a runtime descriptor."
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.image.repository is a forbidden override -- it is shared environment identity, derived from the canonical environment configuration's ECR registry + runtime.image.repositoryName, and must not be set in a runtime descriptor."
     }
     precondition {
       condition     = try(each.value.runtime.image.tag, "") != "" && try(each.value.runtime.image.tag, "latest") != "latest"
@@ -641,7 +611,7 @@ check "goldengate_at_most_one_target_per_pipeline" {
   }
 }
 
-# Fresh-EKS Phase A/Phase 9: the full repository is always derived as local.gg_env_ecr_registry/repositoryName (never descriptor-asserted), so it is definitionally inside the approved private ECR account/region -- this diagnostic now proves every enabled deployment supplies the one thing it DOES own, a non-empty repositoryName (the plan-blocking grammar/safety check itself lives in the goldengate_runtime_contract precondition above).
+# Fresh-EKS Phase A/Phase 9: the full repository is always derived as the canonical environment configuration's ECR registry + repositoryName (never descriptor-asserted), so it is definitionally inside the approved private ECR account/region -- this diagnostic now proves every enabled deployment supplies the one thing it DOES own, a non-empty repositoryName (the plan-blocking grammar/safety check itself lives in the goldengate_runtime_contract precondition above).
 check "goldengate_image_repository_name_present" {
   assert {
     condition = alltrue([

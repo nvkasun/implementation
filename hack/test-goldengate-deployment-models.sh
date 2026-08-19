@@ -5785,8 +5785,9 @@ if "goldengate_runtime_identity_map" in tf_src:
 if '"gg-${' in tf_src:
     print("FAIL: envs/dev/goldengate_inventory.tf still interpolates a per-type \"gg-${type}-sa\" ServiceAccount name -- every type must share gg-runtime-sa")
     sys.exit(1)
-if 'id => "gg-runtime-sa"' not in tf_src:
-    print("FAIL: envs/dev/goldengate_inventory.tf's goldengate_runtime_service_account_names no longer resolves the constant gg-runtime-sa")
+# Live Deploy Fix 6: goldengate_runtime_service_account_names (a per-deployment map with zero real Terraform consumers) was removed as a dead TFLint-flagged declaration; the actual canonical runtime identity source is, and always was, goldengate_canonical_runtime_trust_subject -- the ONE platform-invariant IRSA trust subject every singleRuntime deployment shares, never a per-deployment/per-type map.
+if not re.search(r'goldengate_canonical_runtime_trust_subject\s*=\s*"[^"]*:gg-runtime-sa"', tf_src):
+    print("FAIL: envs/dev/goldengate_inventory.tf's goldengate_canonical_runtime_trust_subject no longer resolves the constant gg-runtime-sa")
     sys.exit(1)
 
 sys.path.insert(0, tool_path.rsplit("/", 1)[0])
@@ -6267,7 +6268,6 @@ spec.loader.exec_module(ge)
 v = ge.derive_values(ge.load_environment_config('dev'))
 print('locals {')
 print(f'  gg_env_dns_domain               = \"{v[\"DNS_DOMAIN\"]}\"')
-print(f'  gg_env_ecr_registry             = \"{v[\"ECR_REGISTRY\"]}\"')
 print(f'  gg_env_namespaces               = {{ runtime = \"{v[\"RUNTIME_NAMESPACE\"]}\", monitoring = \"{v[\"MONITOR_NAMESPACE\"]}\", argocd = \"{v[\"ARGOCD_NAMESPACE\"]}\", observability = \"{v[\"OBSERVABILITY_NAMESPACE\"]}\" }}')
 print(f'  gg_env_oidc_hostpath            = \"{v[\"EKS_OIDC_HOSTPATH\"]}\"')
 print(f'  gg_env_source_admin_secret_name = \"{v[\"SOURCE_ADMIN_SECRET_NAME\"]}\"')
@@ -10233,6 +10233,140 @@ if [ -f "$ENV_SCOPE_CHECKER" ]; then
   fi
 else
   skip "Live Deploy Fix 5: T: ${ENV_SCOPE_CHECKER} re-confirmation -- checker missing"
+fi
+
+echo ""
+echo "--- Live Deploy Fix 6: Terraform unused-declaration cleanup ---"
+
+# Real VDR failure: TFLint's terraform_unused_declarations rule reported 13 dead locals in envs/dev/environment.tf and envs/dev/goldengate_inventory.tf, blocking the corporate lint-validate-apply-plan stage before Terraform Validate/Plan/apply were ever reached. Fixed at the source (the locals were removed, never suppressed) -- these are the exact removed declaration names (the original 13 TFLint findings plus gg_env_ecr_account_id and goldengate_enabled_deployment_types, both transitively orphaned once their own sole consumers among the 13 were removed) that must never be reintroduced.
+FIX6_REMOVED_LOCAL_NAMES=(
+  gg_env_ecr_registry gg_env_ecr_account_id gg_env_monitor_host gg_env_argocd_host
+  gg_env_alb_group_name gg_env_certificate_arn gg_env_role_arns gg_env_runner_role_arn
+  gg_env_ecr_sync_role_arn gg_env_monitor_dynamodb_kms_key_arn
+  goldengate_existing_efs_deployments goldengate_admin_secret_names
+  goldengate_runtime_service_account_names goldengate_runtime_identity_inventory
+  goldengate_enabled_deployment_types
+)
+FIX6_REINTRODUCED="false"
+for name in "${FIX6_REMOVED_LOCAL_NAMES[@]}"; do
+  if grep -rnE "^\s*${name}\s*=" envs/dev/*.tf 2>/dev/null; then
+    fail "Live Deploy Fix 6: ${name} was reintroduced as a Terraform local declaration in envs/dev/*.tf"
+    FIX6_REINTRODUCED="true"
+  fi
+done
+if [ "$FIX6_REINTRODUCED" = "false" ]; then
+  pass "Live Deploy Fix 6: none of the 15 removed dead Terraform local declarations (13 real VDR TFLint findings + 2 transitively-orphaned) have been reintroduced anywhere in envs/dev/*.tf"
+fi
+
+# General regression guard, never limited to the named list above: a real declared-vs-referenced closure over every envs/dev/*.tf local -- exactly the class of defect TFLint's terraform_unused_declarations rule detects, computed here without needing TFLint installed, so ANY future dead gg_env_*/goldengate_*/gg_dashboard_* local (not just these 15) fails this suite closed before it can reach a real VDR TFLint gate again.
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  FIX6_CLOSURE_CHECK="$(python3 - <<'PYEOF'
+import glob
+import re
+
+decls = {}
+files = {}
+for f in sorted(glob.glob("envs/dev/*.tf")):
+    with open(f) as fh:
+        files[f] = fh.read()
+
+for f, src in files.items():
+    for m in re.finditer(r"^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*=", src, re.MULTILINE):
+        decls.setdefault(m.group(1), []).append(f)
+
+candidate_names = [n for n in decls if n.startswith(("gg_env_", "goldengate_", "gg_dashboard_"))]
+
+
+def strip_comments(src):
+    return "\n".join(line[: line.find("#")] if "#" in line else line for line in src.splitlines())
+
+
+combined = "\n".join(strip_comments(src) for src in files.values())
+
+dead = [n for n in sorted(set(candidate_names)) if not re.search(r"local\." + re.escape(n) + r"\b", combined)]
+
+if dead:
+    print("FAIL: the following envs/dev/*.tf locals have zero real (non-comment) local.<name> references anywhere -- exactly what TFLint's terraform_unused_declarations rule would flag: " + ", ".join(dead))
+else:
+    print(f"OK: every one of the {len(set(candidate_names))} gg_env_*/goldengate_*/gg_dashboard_* locals declared across envs/dev/*.tf has at least one real (non-comment) local.<name> reference -- zero terraform_unused_declarations findings")
+PYEOF
+)"
+  if [[ "$FIX6_CLOSURE_CHECK" == OK:* ]]; then
+    pass "Live Deploy Fix 6: ${FIX6_CLOSURE_CHECK#OK: }"
+  else
+    fail "Live Deploy Fix 6: ${FIX6_CLOSURE_CHECK#FAIL: }"
+  fi
+else
+  skip "Live Deploy Fix 6: declared-vs-referenced Terraform locals closure check -- python3 unavailable"
+fi
+
+# TFLint itself, run exactly against envs/dev, if available locally -- clearly reported (never silently skipped, never a substitute weakened check) when it is not installed.
+if command -v tflint >/dev/null 2>&1; then
+  set +e
+  FIX6_TFLINT_OUT="$(cd envs/dev && tflint --chdir=. 2>&1)"
+  FIX6_TFLINT_STATUS=$?
+  set -e
+  if [ "$FIX6_TFLINT_STATUS" -eq 0 ] && ! grep -q "terraform_unused_declarations" <<< "$FIX6_TFLINT_OUT"; then
+    pass "Live Deploy Fix 6: tflint against envs/dev reports zero terraform_unused_declarations findings"
+  else
+    fail "Live Deploy Fix 6: tflint against envs/dev reported findings:"$'\n'"${FIX6_TFLINT_OUT}"
+  fi
+else
+  skip "Live Deploy Fix 6: tflint is not installed in this local environment -- reporting this fact rather than installing tooling or weakening validation; the declared-vs-referenced closure check above is the offline substitute proof"
+fi
+
+# terraform fmt -check -recursive, if Terraform is available -- proves the edited files remain canonically formatted (never a side effect of removing locals).
+if command -v terraform >/dev/null 2>&1; then
+  if terraform fmt -check -recursive >/dev/null 2>&1; then
+    pass "Live Deploy Fix 6: terraform fmt -check -recursive reports no formatting differences after the cleanup"
+  else
+    fail "Live Deploy Fix 6: terraform fmt -check -recursive found formatting differences after the cleanup"
+  fi
+else
+  skip "Live Deploy Fix 6: terraform fmt -check -recursive -- terraform is not installed in this local environment"
+fi
+
+# envs/dev/environment.tf validates cleanly on its own, offline/backend-disabled (never contacting the real S3 backend or live AWS) -- the existing "30: Terraform cross-pipeline plan-blocking fixtures" section above already re-proves envs/dev/goldengate_inventory.tf's full precondition/check contract via a real terraform plan; this is environment.tf's own dedicated proof.
+if command -v terraform >/dev/null 2>&1 && [ "$PYTHON_AVAILABLE" = "true" ]; then
+  ENV_TF_SCRATCH="$(mktemp -d)"
+  mkdir -p "${ENV_TF_SCRATCH}/envs/dev"
+  cp envs/dev/environment.tf "${ENV_TF_SCRATCH}/envs/dev/environment.tf"
+  cp envs/dev/environment.yaml "${ENV_TF_SCRATCH}/envs/dev/environment.yaml"
+  cat > "${ENV_TF_SCRATCH}/envs/dev/provider.tf" <<'EOF'
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+variable "environment" {
+  type    = string
+  default = "dev"
+}
+EOF
+  set +e
+  (cd "${ENV_TF_SCRATCH}/envs/dev" && terraform init -backend=false) >"${ENV_TF_SCRATCH}/init.log" 2>&1
+  ENV_TF_INIT_STATUS=$?
+  set -e
+  if [ "$ENV_TF_INIT_STATUS" -ne 0 ]; then
+    skip "Live Deploy Fix 6: envs/dev/environment.tf standalone terraform validate -- terraform init failed (no network access to the public provider registry in this environment)"
+  else
+    set +e
+    (cd "${ENV_TF_SCRATCH}/envs/dev" && terraform validate) >"${ENV_TF_SCRATCH}/validate.log" 2>&1
+    ENV_TF_VALIDATE_STATUS=$?
+    set -e
+    if [ "$ENV_TF_VALIDATE_STATUS" -eq 0 ]; then
+      pass "Live Deploy Fix 6: envs/dev/environment.tf validates cleanly (offline, backend-disabled) after removing its 9 dead locals"
+    else
+      fail "Live Deploy Fix 6: envs/dev/environment.tf failed terraform validate after this cleanup"
+      cat "${ENV_TF_SCRATCH}/validate.log"
+    fi
+  fi
+  rm -rf "${ENV_TF_SCRATCH}"
+else
+  skip "Live Deploy Fix 6: envs/dev/environment.tf standalone terraform validate -- terraform/python3 unavailable"
 fi
 
 echo ""

@@ -1,12 +1,10 @@
-# Terraform-side consumption of the canonical envs/dev/environment.yaml environment contract (see hack/goldengate-environment.py for the Python-side equivalent -- both derive the same values from the same file, never a second independent schema). Every other envs/dev/*.tf file must reference these locals instead of re-typing AWS region/account IDs/cluster identity/OIDC/DNS/ALB/certificate/role names literally. This file only CONSUMES the live EKS cluster + its IAM OIDC provider (read-only data sources) -- it never creates/modifies EKS, the OIDC provider, VPC, subnets, or the load balancer; those remain aws-cloud-factory-infra's ownership.
+# Terraform-side consumption of the canonical envs/dev/environment.yaml environment contract (see hack/goldengate-environment.py for the Python-side equivalent -- both derive the same values from the same file, never a second independent schema). Every other envs/dev/*.tf file must reference these locals instead of re-typing AWS region/account IDs/cluster identity/OIDC/DNS/role names literally. Some environment.yaml-derived values (for example the ECR registry, monitor/Argo CD hostnames, ALB group name, ACM certificate ARN, and several IAM role ARNs) have no live Terraform consumer in this root -- they are consumed exclusively through hack/goldengate-environment.py's github-env output by the GitHub Actions workflow/Helm layer, and are deliberately NOT re-declared here as unused Terraform locals (see Live Deploy Fix 6). This file only CONSUMES the live EKS cluster + its IAM OIDC provider (read-only data sources) -- it never creates/modifies EKS, the OIDC provider, VPC, subnets, or the load balancer; those remain aws-cloud-factory-infra's ownership.
 locals {
   gg_env_config = yamldecode(file("${path.module}/environment.yaml"))
 
   gg_env_environment         = local.gg_env_config.environment
   gg_env_region              = local.gg_env_config.aws.region
   gg_env_workload_account_id = local.gg_env_config.aws.workloadAccountId
-  gg_env_ecr_account_id      = local.gg_env_config.aws.buildAccountId
-  gg_env_ecr_registry        = "${local.gg_env_ecr_account_id}.dkr.ecr.${local.gg_env_region}.amazonaws.com"
 
   gg_env_cluster_name = local.gg_env_config.eks.clusterName
   # Derived, never hardcoded -- the sole cluster ARN construction point for this root.
@@ -18,21 +16,9 @@ locals {
 
   gg_env_namespaces = local.gg_env_config.namespaces
 
-  gg_env_dns_domain      = local.gg_env_config.network.dnsDomain
-  gg_env_monitor_host    = "monitor.${local.gg_env_dns_domain}"
-  gg_env_argocd_host     = "argocd.${local.gg_env_dns_domain}"
-  gg_env_alb_group_name  = local.gg_env_config.network.albGroupName
-  gg_env_certificate_arn = local.gg_env_config.network.certificateArn
+  gg_env_dns_domain = local.gg_env_config.network.dnsDomain
 
   gg_env_role_names = local.gg_env_config.iam.roles
-  gg_env_role_arns = {
-    for role_key, role_name in local.gg_env_config.iam.roles :
-    role_key => "arn:aws:iam::${local.gg_env_workload_account_id}:role/${role_name}"
-  }
-  gg_env_runner_role_arn   = "arn:aws:iam::${local.gg_env_ecr_account_id}:role/${local.gg_env_config.iam.runnerRoleName}"
-  gg_env_ecr_sync_role_arn = local.gg_env_config.iam.ecrSyncRoleArn
-
-  gg_env_monitor_dynamodb_kms_key_arn = local.gg_env_config.kms.monitorDynamoDbKeyArn
 
   gg_env_efs_shared_security_group_description = local.gg_env_config.efs.sharedSecurityGroupDescription
 
