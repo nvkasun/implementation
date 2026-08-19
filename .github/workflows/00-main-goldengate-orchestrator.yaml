@@ -239,14 +239,16 @@ jobs:
       id-token: write
       contents: read
 
+    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job -- not just "Load resolved environment config" -- can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail. This is the repository-wide invariant every non-matrix MAIN job that consumes the selected environment now follows.
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Load resolved environment config
         shell: bash
-        env:
-          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
         run: |
           set -euo pipefail
 
@@ -260,8 +262,6 @@ jobs:
 
       - name: DescribeCluster and verify against the selected environment's environment.yaml (read-only)
         shell: bash
-        env:
-          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
         run: |
           set -euo pipefail
 
@@ -354,14 +354,16 @@ jobs:
     outputs:
       state: ${{ steps.classify.outputs.state }}
 
+    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail.
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Load resolved environment config
         shell: bash
-        env:
-          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
         run: |
           set -euo pipefail
 
@@ -421,8 +423,6 @@ jobs:
       - name: Classify Argo CD prerequisite state
         id: classify
         shell: bash
-        env:
-          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
         run: |
           set -euo pipefail
 
@@ -471,14 +471,16 @@ jobs:
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
+    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail.
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Load resolved environment config
         shell: bash
-        env:
-          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
         run: |
           set -euo pipefail
 
@@ -537,8 +539,6 @@ jobs:
 
       - name: Re-classify and require Argo CD to be exactly HEALTHY
         shell: bash
-        env:
-          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
         run: |
           set -euo pipefail
 
@@ -575,14 +575,16 @@ jobs:
     outputs:
       state: ${{ steps.classify.outputs.state }}
 
+    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail.
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Load resolved environment config
         shell: bash
-        env:
-          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
         run: |
           set -euo pipefail
 
@@ -643,7 +645,6 @@ jobs:
         id: classify
         shell: bash
         env:
-          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
           # Read through a step-level environment variable, never interpolated directly into a shell statement or hardcoded here -- the same external-operational-configuration pattern 30-sub-platform.yaml itself already uses for this variable.
           FLUENT_BIT_IMAGE: ${{ vars.FLUENT_BIT_IMAGE }}
         run: |
@@ -687,14 +688,16 @@ jobs:
     outputs:
       state: ${{ steps.classify.outputs.state }}
 
+    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail.
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Load resolved environment config
         shell: bash
-        env:
-          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
         run: |
           set -euo pipefail
 
@@ -754,8 +757,6 @@ jobs:
       - name: Classify Observability prerequisite state
         id: classify
         shell: bash
-        env:
-          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
         run: |
           set -euo pipefail
 
@@ -818,14 +819,16 @@ jobs:
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
+    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail.
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Load resolved environment config
         shell: bash
-        env:
-          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
         run: |
           set -euo pipefail
 
@@ -885,7 +888,6 @@ jobs:
       - name: Re-classify and require GoldenGate Platform to be exactly HEALTHY
         shell: bash
         env:
-          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
           FLUENT_BIT_IMAGE: ${{ vars.FLUENT_BIT_IMAGE }}
         run: |
           set -euo pipefail
@@ -926,14 +928,16 @@ jobs:
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
+    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail.
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Load resolved environment config
         shell: bash
-        env:
-          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
         run: |
           set -euo pipefail
 
@@ -992,8 +996,6 @@ jobs:
 
       - name: Re-classify and require Observability to be exactly HEALTHY
         shell: bash
-        env:
-          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
         run: |
           set -euo pipefail
 
@@ -1031,14 +1033,16 @@ jobs:
 
     environment: ${{ needs.validate_model.outputs.selected_environment }}
 
+    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail -- this is the exact defect class that already hit live in managed_efs_inventory_guard.
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Load resolved environment config
         shell: bash
-        env:
-          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
         run: |
           set -euo pipefail
 
@@ -1270,14 +1274,16 @@ jobs:
 
     environment: ${{ needs.validate_model.outputs.selected_environment }}
 
+    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job -- including "Compute expected managed-EFS inventory from the deployment model" and "Compare expected vs actual managed-EFS inventory", the exact two steps the real VDR run hit -- can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail.
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Load resolved environment config
         shell: bash
-        env:
-          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
         run: |
           set -euo pipefail
 
@@ -1391,14 +1397,16 @@ jobs:
       matrix:
         include: ${{ fromJson(needs.detect_changed_deployments.outputs.deployment_matrix) }}
 
+    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail -- matrix jobs draw the selected environment from their own matrix entry, never needs.validate_model.outputs.selected_environment.
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ matrix.environment }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Load resolved environment config
         shell: bash
-        env:
-          GG_SELECTED_ENVIRONMENT: ${{ matrix.environment }}
         run: |
           set -euo pipefail
 
@@ -1459,7 +1467,6 @@ jobs:
         id: classify
         shell: bash
         env:
-          GG_SELECTED_ENVIRONMENT: ${{ matrix.environment }}
           GG_DEPLOYMENT_ID: ${{ matrix.deployment_id }}
         run: |
           set -euo pipefail
@@ -1509,14 +1516,16 @@ jobs:
       group: goldengate-helm-deploy-${{ github.ref }}-${{ matrix.environment }}-${{ matrix.deployment_id }}
       cancel-in-progress: false
 
+    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail -- matrix jobs draw the selected environment from their own matrix entry, never needs.validate_model.outputs.selected_environment.
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ matrix.environment }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Load resolved environment config
         shell: bash
-        env:
-          GG_SELECTED_ENVIRONMENT: ${{ matrix.environment }}
         run: |
           set -euo pipefail
 
@@ -3132,14 +3141,16 @@ jobs:
       group: goldengate-argocd-delete-${{ github.ref }}-${{ matrix.environment }}-${{ matrix.deployment_id }}
       cancel-in-progress: false
 
+    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail -- matrix jobs draw the selected environment from their own matrix entry, never needs.validate_model.outputs.selected_environment.
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ matrix.environment }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Load resolved environment config
         shell: bash
-        env:
-          GG_SELECTED_ENVIRONMENT: ${{ matrix.environment }}
         run: |
           set -euo pipefail
 
@@ -3360,14 +3371,16 @@ jobs:
       matrix:
         include: ${{ fromJson(needs.validate_model.outputs.active_runtime_matrix) }}
 
+    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail -- matrix jobs draw the selected environment from their own matrix entry, never needs.validate_model.outputs.selected_environment.
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ matrix.environment }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Load resolved environment config
         shell: bash
-        env:
-          GG_SELECTED_ENVIRONMENT: ${{ matrix.environment }}
         run: |
           set -euo pipefail
 
@@ -3428,7 +3441,6 @@ jobs:
         id: resolve_efs
         shell: bash
         env:
-          GG_SELECTED_ENVIRONMENT: ${{ matrix.environment }}
           GG_DEPLOYMENT_ID: ${{ matrix.deployment_id }}
         run: |
           set -euo pipefail
@@ -3506,7 +3518,6 @@ jobs:
         id: classify
         shell: bash
         env:
-          GG_SELECTED_ENVIRONMENT: ${{ matrix.environment }}
           GG_DEPLOYMENT_ID: ${{ matrix.deployment_id }}
           GG_EXPECTED_EFS_ID: ${{ steps.resolve_efs.outputs.expected_efs_id }}
         run: |
@@ -3551,14 +3562,16 @@ jobs:
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
+    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job -- including "List enabled replication pipelines" and "Reconcile each enabled pipeline sequentially", which previously relied on an unbound raw reference -- can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail.
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Load resolved environment config
         shell: bash
-        env:
-          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
         run: |
           set -euo pipefail
 
@@ -3732,14 +3745,16 @@ jobs:
     outputs:
       state: ${{ steps.classify.outputs.state }}
 
+    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail.
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Load resolved environment config
         shell: bash
-        env:
-          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
         run: |
           set -euo pipefail
 
@@ -3799,8 +3814,6 @@ jobs:
       - name: Classify monitor ownership safety
         id: classify
         shell: bash
-        env:
-          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
         run: |
           set -euo pipefail
 
@@ -3962,14 +3975,16 @@ jobs:
       state: ${{ steps.final.outputs.state }}
       ready_pod_name: ${{ steps.structural.outputs.ready_pod_name }}
 
+    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail.
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Load resolved environment config
         shell: bash
-        env:
-          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
         run: |
           set -euo pipefail
 
@@ -4025,8 +4040,6 @@ jobs:
 
       - name: Generate the folder-driven canonical registry (expected state for the ConfigMap/SecretProviderClass comparison)
         shell: bash
-        env:
-          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
         run: |
           set -euo pipefail
 
@@ -4039,7 +4052,6 @@ jobs:
         id: structural
         shell: bash
         env:
-          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
           GG_EXPECTED_IMAGE_REPOSITORY: ${{ needs.monitor_sync_once.outputs.image_repository }}
           GG_EXPECTED_IMAGE_TAG: ${{ needs.monitor_sync_once.outputs.image_tag }}
           GG_EXPECTED_CHART_VERSION: ${{ needs.monitor_sync_once.outputs.chart_version }}
@@ -4112,7 +4124,6 @@ jobs:
         id: final
         shell: bash
         env:
-          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
           GG_EXPECTED_IMAGE_REPOSITORY: ${{ needs.monitor_sync_once.outputs.image_repository }}
           GG_EXPECTED_IMAGE_TAG: ${{ needs.monitor_sync_once.outputs.image_tag }}
           GG_EXPECTED_CHART_VERSION: ${{ needs.monitor_sync_once.outputs.chart_version }}
@@ -4161,14 +4172,16 @@ jobs:
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
+    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job -- including "List enabled replication pipelines" and "Verify replication process acceptance via the monitor API", which previously relied on an unbound raw reference -- can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail.
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Load resolved environment config
         shell: bash
-        env:
-          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
         run: |
           set -euo pipefail
 
@@ -4300,14 +4313,16 @@ jobs:
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
+    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail.
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Load resolved environment config
         shell: bash
-        env:
-          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
         run: |
           set -euo pipefail
 
@@ -4333,7 +4348,6 @@ jobs:
       - name: Poll monitor-to-runtime end-to-end acceptance until convergence (bounded)
         shell: bash
         env:
-          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
           POD_NAME: ${{ needs.validate_monitor_ready.outputs.ready_pod_name }}
         run: |
           set -uo pipefail
@@ -4401,6 +4415,10 @@ jobs:
     if: always()
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job -- including "Re-validate the folder-driven deployment model after rollout" -- can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail.
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
 
     steps:
       - name: Validate the mode-aware final DEPLOY success contract
@@ -4571,8 +4589,6 @@ jobs:
 
       - name: Re-validate the folder-driven deployment model after rollout
         shell: bash
-        env:
-          GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
         run: |
           set -euo pipefail
 

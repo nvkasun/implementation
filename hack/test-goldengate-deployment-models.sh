@@ -22,6 +22,7 @@ METRICS_CONFIG_HELPER_SCRIPT="hack/goldengate-metrics-config.py"
 EKS_APP_WORKFLOW=".github/workflows/00-main-goldengate-orchestrator.yaml"
 PLATFORM_WORKFLOW=".github/workflows/30-sub-platform.yaml"
 DETECT_SCRIPT="hack/detect-goldengate-deployments.sh"
+ENV_SCOPE_CHECKER="hack/check-goldengate-workflow-env-scope.py"
 OBSERVABILITY_VALUES_FILE="platform/dev/goldengate-observability/values.yaml"
 OBSERVABILITY_WORKFLOW=".github/workflows/40-sub-observability.yaml"
 ARGOCD_VALUES_FILE="envs/dev/argocd/values.yaml"
@@ -9075,7 +9076,7 @@ fi
 echo ""
 echo "--- Live Deploy Fix 1: eks_oidc_preflight's DescribeCluster step carries GG_SELECTED_ENVIRONMENT ---"
 
-# Real VDR failure: "Load resolved environment config" sets GG_SELECTED_ENVIRONMENT via step-level env:, but GitHub Actions step-level env values do NOT carry into the next step -- the later "DescribeCluster and verify..." step referenced "$GG_SELECTED_ENVIRONMENT" under `set -euo pipefail` without its own binding, so bash correctly failed with "unbound variable". Semantic YAML parse (never a source-fragile whitespace/grep check): the step's own env: block must supply GG_SELECTED_ENVIRONMENT from the same needs.validate_model.outputs.selected_environment source every other job/step in this workflow already uses -- this must fail if that step ever again references GG_SELECTED_ENVIRONMENT without providing the binding itself.
+# Real VDR failure: "Load resolved environment config" originally set GG_SELECTED_ENVIRONMENT via step-level env:, but GitHub Actions step-level env values do NOT carry into the next step -- the later "DescribeCluster and verify..." step referenced "$GG_SELECTED_ENVIRONMENT" under `set -euo pipefail` without its own binding, so bash correctly failed with "unbound variable". Live Deploy Fix 4 superseded the per-step patch with a JOB-LEVEL binding covering the whole job (the repository-wide invariant every non-matrix MAIN job now follows) -- this check now asserts the step is "safely covered" by either the job-level binding (the current mechanism) or a step-level one, never merely that the step references the variable at all.
 if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
   LIVE_FIX_1_CHECK="$(python3 -c '
 import yaml
@@ -9096,16 +9097,18 @@ if step is not None:
     references_var = "$GG_SELECTED_ENVIRONMENT" in run_text or "${GG_SELECTED_ENVIRONMENT}" in run_text
     results.append(("2: the DescribeCluster step still references GG_SELECTED_ENVIRONMENT in its run: script", references_var))
 
-    step_env = step.get("env") or {}
-    results.append(("3: the DescribeCluster step defines its OWN env: block (never relying on the prior steps env: carrying over -- it does not)", "GG_SELECTED_ENVIRONMENT" in step_env))
-
     expected_value = "${{ needs.validate_model.outputs.selected_environment }}"
-    actual_value = str(step_env.get("GG_SELECTED_ENVIRONMENT", ""))
+    job_env = preflight.get("env") or {}
+    results.append(("3: eks_oidc_preflight defines a JOB-LEVEL GG_SELECTED_ENVIRONMENT binding (the Live Deploy Fix 4 repository-wide invariant)", job_env.get("GG_SELECTED_ENVIRONMENT") == expected_value))
+
+    step_env = step.get("env") or {}
+    actual_value = str(step_env.get("GG_SELECTED_ENVIRONMENT", job_env.get("GG_SELECTED_ENVIRONMENT", "")))
     results.append((f"4: GG_SELECTED_ENVIRONMENT == needs.validate_model.outputs.selected_environment (got {actual_value!r})", actual_value == expected_value))
 
-    # If the step references the variable at all, it MUST be bound in this step -- this is the exact failure mode the live VDR run hit.
+    # If the step references the variable at all, it MUST be safely covered by a job-level or step-level binding -- this is the exact failure mode the live VDR run hit.
     if references_var:
-        results.append(("5: a step that references GG_SELECTED_ENVIRONMENT always provides its own binding for it (no unbound-variable risk under set -euo pipefail)", "GG_SELECTED_ENVIRONMENT" in step_env))
+        covered = "GG_SELECTED_ENVIRONMENT" in job_env or "GG_SELECTED_ENVIRONMENT" in step_env
+        results.append(("5: a step that references GG_SELECTED_ENVIRONMENT is always safely covered by a job-level or step-level binding (no unbound-variable risk under set -euo pipefail)", covered))
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
@@ -9439,7 +9442,7 @@ else
   skip "Live Deploy UX Fix 2: P: environment-wide Deploy final-gate execution proof -- python3/PyYAML/bash unavailable or main workflow missing"
 fi
 
-# Q: Live Deploy Fix 1 remains intact -- eks_oidc_preflight's DescribeCluster step still carries GG_SELECTED_ENVIRONMENT explicitly (the dedicated "Live Deploy Fix 1" section above already proves this in full; this is a lightweight re-confirmation scoped to this task).
+# Q: Live Deploy Fix 1 remains intact -- eks_oidc_preflight's DescribeCluster step is still safely covered for GG_SELECTED_ENVIRONMENT (the dedicated "Live Deploy Fix 1" section above already proves this in full, including Live Deploy Fix 4's job-level-binding mechanism; this is a lightweight re-confirmation scoped to this task).
 if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
   Q_CHECK="$(python3 -c '
 import yaml
@@ -9447,15 +9450,19 @@ import yaml
 with open("'"$EKS_APP_WORKFLOW"'") as f:
     doc = yaml.safe_load(f)
 
-steps = doc["jobs"]["eks_oidc_preflight"]["steps"]
+job = doc["jobs"]["eks_oidc_preflight"]
+steps = job["steps"]
 step = next((s for s in steps if s.get("name", "").startswith("DescribeCluster and verify against the selected environment")), None)
-ok = step is not None and (step.get("env") or {}).get("GG_SELECTED_ENVIRONMENT") == "${{ needs.validate_model.outputs.selected_environment }}"
+expected = "${{ needs.validate_model.outputs.selected_environment }}"
+job_env = job.get("env") or {}
+step_env = (step.get("env") or {}) if step is not None else {}
+ok = step is not None and (job_env.get("GG_SELECTED_ENVIRONMENT") == expected or step_env.get("GG_SELECTED_ENVIRONMENT") == expected)
 print("OK" if ok else "FAIL")
 ' 2>&1)"
   if [ "$Q_CHECK" = "OK" ]; then
-    pass "Live Deploy UX Fix 2: Q: Live Deploy Fix 1 remains intact -- eks_oidc_preflight's DescribeCluster step still carries GG_SELECTED_ENVIRONMENT explicitly"
+    pass "Live Deploy UX Fix 2: Q: Live Deploy Fix 1 remains intact -- eks_oidc_preflight's DescribeCluster step is still safely covered for GG_SELECTED_ENVIRONMENT"
   else
-    fail "Live Deploy UX Fix 2: Q: Live Deploy Fix 1 regression -- eks_oidc_preflight's DescribeCluster step no longer carries GG_SELECTED_ENVIRONMENT explicitly: ${Q_CHECK}"
+    fail "Live Deploy UX Fix 2: Q: Live Deploy Fix 1 regression -- eks_oidc_preflight's DescribeCluster step is no longer safely covered for GG_SELECTED_ENVIRONMENT: ${Q_CHECK}"
   fi
 else
   skip "Live Deploy UX Fix 2: Q: Live Deploy Fix 1 re-confirmation -- python3/PyYAML unavailable or main workflow missing"
@@ -9610,7 +9617,7 @@ else
   skip "Live Validate Fix 3: final-gate scenario execution proof -- python3/PyYAML/bash unavailable or main workflow missing"
 fi
 
-# 12: Live Deploy Fix 1 remains protected -- eks_oidc_preflight's DescribeCluster step still carries its own GG_SELECTED_ENVIRONMENT binding, untouched by this task's job-level env changes to the two dry-run jobs.
+# 12: Live Deploy Fix 1 remains protected -- eks_oidc_preflight's DescribeCluster step is still safely covered for GG_SELECTED_ENVIRONMENT (via Live Deploy Fix 4's job-level binding), untouched by this task's job-level env changes to the two dry-run jobs.
 if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
   FIX3_PRESERVE_CHECK="$(python3 -c '
 import yaml
@@ -9618,15 +9625,19 @@ import yaml
 with open("'"$EKS_APP_WORKFLOW"'") as f:
     doc = yaml.safe_load(f)
 
-steps = doc["jobs"]["eks_oidc_preflight"]["steps"]
+job = doc["jobs"]["eks_oidc_preflight"]
+steps = job["steps"]
 step = next((s for s in steps if s.get("name", "").startswith("DescribeCluster and verify against the selected environment")), None)
-ok = step is not None and (step.get("env") or {}).get("GG_SELECTED_ENVIRONMENT") == "${{ needs.validate_model.outputs.selected_environment }}"
+expected = "${{ needs.validate_model.outputs.selected_environment }}"
+job_env = job.get("env") or {}
+step_env = (step.get("env") or {}) if step is not None else {}
+ok = step is not None and (job_env.get("GG_SELECTED_ENVIRONMENT") == expected or step_env.get("GG_SELECTED_ENVIRONMENT") == expected)
 print("OK" if ok else "FAIL")
 ' 2>&1)"
   if [ "$FIX3_PRESERVE_CHECK" = "OK" ]; then
-    pass "Live Validate Fix 3: 12: Live Deploy Fix 1 remains protected -- eks_oidc_preflight's DescribeCluster step still carries its own GG_SELECTED_ENVIRONMENT binding"
+    pass "Live Validate Fix 3: 12: Live Deploy Fix 1 remains protected -- eks_oidc_preflight's DescribeCluster step is still safely covered for GG_SELECTED_ENVIRONMENT"
   else
-    fail "Live Validate Fix 3: 12: Live Deploy Fix 1 regression -- eks_oidc_preflight's DescribeCluster step no longer carries GG_SELECTED_ENVIRONMENT: ${FIX3_PRESERVE_CHECK}"
+    fail "Live Validate Fix 3: 12: Live Deploy Fix 1 regression -- eks_oidc_preflight's DescribeCluster step is no longer safely covered for GG_SELECTED_ENVIRONMENT: ${FIX3_PRESERVE_CHECK}"
   fi
 else
   skip "Live Validate Fix 3: 12: Live Deploy Fix 1 re-confirmation -- python3/PyYAML unavailable or main workflow missing"
@@ -9671,6 +9682,184 @@ if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$DETECT_SCRIPT" ]; then
   fi
 else
   skip "Live Validate Fix 3: 13: ${DETECT_SCRIPT} syntax re-confirmation -- bash/detect script unavailable"
+fi
+
+echo ""
+echo "--- Live Deploy Fix 4: repository-wide GG_SELECTED_ENVIRONMENT scope hardening ---"
+
+# 1-5, 14: the repo-wide static checker itself, run against the REAL current repository -- proves it reports the expected inventory (9 active workflows, 22 jobs referencing GG_SELECTED_ENVIRONMENT) and, after this task's fix, ZERO unsafe jobs.
+if [ -f "$ENV_SCOPE_CHECKER" ]; then
+  ENV_SCOPE_REAL_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 "$ENV_SCOPE_CHECKER" 2>&1)"
+  ENV_SCOPE_REAL_STATUS=$?
+  if [ "$ENV_SCOPE_REAL_STATUS" -eq 0 ] && grep -q "^Workflows inspected: 9$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^Jobs with GG_SELECTED_ENVIRONMENT run: references: 22$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^Unsafe jobs: 0$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^OK: zero unsafe GG_SELECTED_ENVIRONMENT references" <<< "$ENV_SCOPE_REAL_OUT"; then
+    pass "Live Deploy Fix 4: 1-5,14: ${ENV_SCOPE_CHECKER} reports 9 workflows inspected, 22 jobs referencing GG_SELECTED_ENVIRONMENT, and ZERO unsafe jobs against the real current repository"
+  else
+    fail "Live Deploy Fix 4: 1-5,14: ${ENV_SCOPE_CHECKER} did not report the expected zero-violation inventory against the real repository (status=${ENV_SCOPE_REAL_STATUS}):"$'\n'"${ENV_SCOPE_REAL_OUT}"
+  fi
+else
+  fail "Live Deploy Fix 4: 1-5,14: ${ENV_SCOPE_CHECKER} does not exist"
+fi
+
+# 6-11: mutation-style regression proof -- the checker MUST fail closed the instant a job regresses to the exact live-defect pattern (missing job-level binding, or a step-only binding), and MUST pass once every job is correctly covered. Uses a real temp copy of the actual current main workflow (never a reimplementation/fixture), mutated in memory and written out, then the REAL checker script is invoked against it via subprocess -- exactly the same "real script execution" proof pattern established throughout this suite.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$ENV_SCOPE_CHECKER" ]; then
+  set +e
+  ENV_SCOPE_MUTATION_OUT="$(python3 - "$EKS_APP_WORKFLOW" "$ENV_SCOPE_CHECKER" <<'PYEOF'
+import copy
+import os
+import subprocess
+import sys
+import tempfile
+
+import yaml
+
+workflow_path, checker_path = sys.argv[1], sys.argv[2]
+with open(workflow_path) as f:
+    real_doc = yaml.safe_load(f)
+
+MAIN_NAME = "00-main-goldengate-orchestrator.yaml"
+
+
+def run_checker(doc):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        with open(os.path.join(tmp_dir, MAIN_NAME), "w") as f:
+            yaml.safe_dump(doc, f, sort_keys=False)
+        proc = subprocess.run(
+            [sys.executable, checker_path, "--workflow-dir", tmp_dir],
+            capture_output=True, text=True, timeout=30,
+        )
+        return proc.returncode, proc.stdout + proc.stderr
+
+
+results = []
+
+# 6/9a: baseline -- the real, unmutated document must pass cleanly (zero violations).
+rc, out = run_checker(real_doc)
+results.append(("6: the real unmutated workflow passes the checker cleanly (baseline)", rc == 0 and "Unsafe jobs: 0" in out))
+
+# 7/9b: remove managed_efs_inventory_guard's job-level binding -- the checker MUST fail, and must name that exact job.
+mutated = copy.deepcopy(real_doc)
+del mutated["jobs"]["managed_efs_inventory_guard"]["env"]["GG_SELECTED_ENVIRONMENT"]
+rc, out = run_checker(mutated)
+results.append(("7: removing managed_efs_inventory_guard's job-level binding makes the checker FAIL", rc != 0 and "job=managed_efs_inventory_guard" in out))
+
+# 8: restoring it (the real document again) makes the checker PASS again.
+rc, out = run_checker(real_doc)
+results.append(("8: restoring the job-level binding makes the checker PASS again", rc == 0))
+
+# 9: remove replication_reconcile_once's job-level binding -- the checker MUST fail, and must name that exact job.
+mutated = copy.deepcopy(real_doc)
+del mutated["jobs"]["replication_reconcile_once"]["env"]["GG_SELECTED_ENVIRONMENT"]
+rc, out = run_checker(mutated)
+results.append(("9: removing replication_reconcile_once's job-level binding makes the checker FAIL", rc != 0 and "job=replication_reconcile_once" in out))
+
+# 10: remove replication_monitor_acceptance's job-level binding -- the checker MUST fail, and must name that exact job.
+mutated = copy.deepcopy(real_doc)
+del mutated["jobs"]["replication_monitor_acceptance"]["env"]["GG_SELECTED_ENVIRONMENT"]
+rc, out = run_checker(mutated)
+results.append(("10: removing replication_monitor_acceptance's job-level binding makes the checker FAIL", rc != 0 and "job=replication_monitor_acceptance" in out))
+
+# 11: convert managed_efs_inventory_guard back to a STEP-ONLY binding (the exact real live-defect shape: no job-level env, but the two affected steps each carry their own step-level env) -- the checker MUST still fail, proving step-only coverage is never accepted regardless of how many steps individually carry it.
+mutated = copy.deepcopy(real_doc)
+del mutated["jobs"]["managed_efs_inventory_guard"]["env"]["GG_SELECTED_ENVIRONMENT"]
+target_step_names = (
+    "Compute expected managed-EFS inventory from the deployment model",
+    "Compare expected vs actual managed-EFS inventory (fail closed on any orphan)",
+)
+for step in mutated["jobs"]["managed_efs_inventory_guard"]["steps"]:
+    if step.get("name") in target_step_names:
+        step["env"] = {"GG_SELECTED_ENVIRONMENT": "${{ needs.validate_model.outputs.selected_environment }}"}
+rc, out = run_checker(mutated)
+results.append(("11: converting managed_efs_inventory_guard to a STEP-ONLY binding (no job-level env) still makes the checker FAIL -- step-only coverage is never sufficient", rc != 0 and "job=managed_efs_inventory_guard" in out))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  set -e
+  if [ -n "$ENV_SCOPE_MUTATION_OUT" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        FAIL\ *) fail "Live Deploy Fix 4: ${line#FAIL }" ;;
+        OK\ *) pass "Live Deploy Fix 4: ${line#OK }" ;;
+      esac
+    done <<< "$ENV_SCOPE_MUTATION_OUT"
+  else
+    fail "Live Deploy Fix 4: mutation-style regression proof produced no output"
+  fi
+else
+  skip "Live Deploy Fix 4: mutation-style regression proof -- python3/PyYAML/main workflow/checker unavailable"
+fi
+
+# 12: managed_efs_inventory_guard (the real VDR failure job) has the exact expected job-level binding.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  FIX4_EFS_CHECK="$(python3 -c '
+import yaml
+
+with open("'"$EKS_APP_WORKFLOW"'") as f:
+    doc = yaml.safe_load(f)
+
+job = doc["jobs"]["managed_efs_inventory_guard"]
+expected = "${{ needs.validate_model.outputs.selected_environment }}"
+ok = (job.get("env") or {}).get("GG_SELECTED_ENVIRONMENT") == expected
+print("OK" if ok else "FAIL")
+' 2>&1)"
+  if [ "$FIX4_EFS_CHECK" = "OK" ]; then
+    pass "Live Deploy Fix 4: 12: managed_efs_inventory_guard (the real VDR failure job) has the exact expected job-level GG_SELECTED_ENVIRONMENT binding"
+  else
+    fail "Live Deploy Fix 4: 12: managed_efs_inventory_guard does not have the expected job-level GG_SELECTED_ENVIRONMENT binding: ${FIX4_EFS_CHECK}"
+  fi
+else
+  skip "Live Deploy Fix 4: 12: managed_efs_inventory_guard binding re-confirmation -- python3/PyYAML unavailable or main workflow missing"
+fi
+
+# 13: validate_model remains the sole intentional exception -- no job-level binding, but "Resolve selected environment" persists GG_SELECTED_ENVIRONMENT to $GITHUB_ENV strictly before any later validate_model step references it.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  FIX4_VM_CHECK="$(python3 -c '
+import re
+
+import yaml
+
+with open("'"$EKS_APP_WORKFLOW"'") as f:
+    doc = yaml.safe_load(f)
+
+results = []
+job = doc["jobs"]["validate_model"]
+results.append(("no job-level GG_SELECTED_ENVIRONMENT binding (the sole intentional exception)", "GG_SELECTED_ENVIRONMENT" not in (job.get("env") or {})))
+
+var_re = re.compile(r"\$\{?GG_SELECTED_ENVIRONMENT\}?")
+persist_re = re.compile(r"GG_SELECTED_ENVIRONMENT=.*>>\s*\"?\$GITHUB_ENV\"?")
+persisted = False
+order_ok = True
+for step in job["steps"]:
+    run_text = step.get("run") or ""
+    if var_re.search(run_text) and not persisted:
+        order_ok = False
+    if persist_re.search(run_text):
+        persisted = True
+results.append(("the GITHUB_ENV-persisting step (\"Resolve selected environment\") runs strictly before any step that references GG_SELECTED_ENVIRONMENT", persisted and order_ok))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+' 2>&1)"
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL\ *) fail "Live Deploy Fix 4: 13: ${line#FAIL }" ;;
+      OK\ *) pass "Live Deploy Fix 4: 13: ${line#OK }" ;;
+    esac
+  done <<< "$FIX4_VM_CHECK"
+else
+  skip "Live Deploy Fix 4: 13: validate_model exception re-confirmation -- python3/PyYAML unavailable or main workflow missing"
+fi
+
+# 15: goldengate-environment.py's derive_values()/github-env output was NOT touched by this task -- GG_SELECTED_ENVIRONMENT is never manufactured there, and GG_ENVIRONMENT remains the sole canonical environment.yaml-derived value.
+if [ -f "$ENVIRONMENT_TOOL" ]; then
+  if grep -q "GG_SELECTED_ENVIRONMENT" "$ENVIRONMENT_TOOL"; then
+    fail "Live Deploy Fix 4: 15: ${ENVIRONMENT_TOOL} references GG_SELECTED_ENVIRONMENT -- this must remain workflow-owned, never manufactured by the environment resolver"
+  else
+    pass "Live Deploy Fix 4: 15: ${ENVIRONMENT_TOOL} does not reference GG_SELECTED_ENVIRONMENT -- the environment schema/resolver was not touched by this task"
+  fi
+else
+  skip "Live Deploy Fix 4: 15: ${ENVIRONMENT_TOOL} schema re-confirmation -- tool missing"
 fi
 
 echo ""
