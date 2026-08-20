@@ -215,21 +215,48 @@ class ArgoCdStateClassifierTests(unittest.TestCase):
         self.assertEqual(result["state"], argocd_state.STATE_BROKEN)
         self.assertTrue(any("is suspended" in r for r in result["reasons"]))
 
-    def test_repository_secret_missing_is_broken(self):
+    def test_repository_secret_missing_is_reconcilable(self):
+        # Live Argo Recovery Fix: a single missing repository Secret, with everything else in the cluster structurally healthy, is exactly the class of drift the reusable Argo specialist workflow's own immediate bounded ECR token-sync validation step already safely repairs -- RECONCILABLE, never terminal BROKEN.
         cluster = FakeCluster()
         _populate_healthy_cluster(cluster)
         cluster.objects.pop(("secret", "argocd-ecr-goldengate-platform-oci", NAMESPACE))
         result = _classify(cluster)
-        self.assertEqual(result["state"], argocd_state.STATE_BROKEN)
+        self.assertEqual(result["state"], argocd_state.STATE_RECONCILABLE)
         self.assertTrue(any("Secret argocd-ecr-goldengate-platform-oci does not exist" in r for r in result["reasons"]))
 
-    def test_repository_secret_wrong_url_is_broken(self):
+    def test_repository_secret_wrong_url_is_reconcilable(self):
+        # Live Argo Recovery Fix: a drifted repository Secret URL, with everything else healthy, is the same safely-repairable class as a missing Secret.
         cluster = FakeCluster()
         _populate_healthy_cluster(cluster)
         cluster.put("secret", "argocd-ecr-goldengate-oci", NAMESPACE, _secret_obj("argocd-ecr-goldengate-oci", "helm/goldengate", url_override="oci://wrong.example.com/helm/goldengate"))
         result = _classify(cluster)
-        self.assertEqual(result["state"], argocd_state.STATE_BROKEN)
+        self.assertEqual(result["state"], argocd_state.STATE_RECONCILABLE)
         self.assertTrue(any("url=" in r for r in result["reasons"]))
+
+    def test_real_incident_all_four_repository_secrets_missing_is_reconcilable(self):
+        # Live Argo Recovery Fix: reproduces the actual live incident exactly -- namespace present, CRDs present, core Deployments/StatefulSet ready, Services present, ecr-token-sync ServiceAccount/Role/RoleBinding/CronJob all correct (including IRSA role-arn and non-suspended), ingress correctly absent because disabled, but all four repository Secrets are absent (the earlier STS/regional-endpoint failure meant the token-sync CronJob never ran to create them). Must classify RECONCILABLE, never BROKEN -- this is the minimum required recovery case MAIN must now auto-repair through the reusable Argo specialist workflow instead of dead-ending.
+        cluster = FakeCluster()
+        _populate_healthy_cluster(cluster)
+        for secret_name in argocd_state.REQUIRED_REPO_SECRETS:
+            cluster.objects.pop(("secret", secret_name, NAMESPACE))
+        result = _classify(cluster, ingress_enabled=False)
+        self.assertEqual(result["state"], argocd_state.STATE_RECONCILABLE)
+        self.assertEqual(len(result["reasons"]), 4)
+        for secret_name in argocd_state.REQUIRED_REPO_SECRETS:
+            self.assertTrue(any(f"Secret {secret_name} does not exist" in r for r in result["reasons"]))
+
+    def test_reconcilable_secret_drift_plus_unrelated_broken_component_stays_broken(self):
+        # Live Argo Recovery Fix: RECONCILABLE requires EVERY collected reason to be in the safe repository-Secret-drift subset -- a missing Secret alongside ANY other unsafe drift (here, a not-ready core Deployment) must still classify BROKEN, proving this is not a broader "any drift is fine as long as a Secret is also missing" carve-out.
+        cluster = FakeCluster()
+        _populate_healthy_cluster(cluster)
+        cluster.objects.pop(("secret", "argocd-ecr-goldengate-oci", NAMESPACE))
+        not_ready = _ready_replicaset_like("argocd-server")
+        not_ready["status"]["readyReplicas"] = 0
+        cluster.put("deployment", "argocd-server", NAMESPACE, not_ready)
+        result = _classify(cluster)
+        self.assertEqual(result["state"], argocd_state.STATE_BROKEN)
+        self.assertTrue(any("Secret argocd-ecr-goldengate-oci does not exist" in r for r in result["reasons"]))
+        self.assertTrue(any("deployment/argocd-server not ready" in r for r in result["reasons"]))
 
     def test_all_required_components_healthy(self):
         cluster = FakeCluster()
@@ -288,12 +315,13 @@ class ArgoCdStateClassifierTests(unittest.TestCase):
                 ingress_enabled=False,
             )
 
-    def test_secret_missing_repository_label_is_broken(self):
+    def test_secret_missing_repository_label_is_reconcilable(self):
+        # Live Argo Recovery Fix: a mislabeled repository Secret, with everything else healthy, is the same safely-repairable class as a missing Secret.
         cluster = FakeCluster()
         _populate_healthy_cluster(cluster)
         cluster.put("secret", "argocd-ecr-goldengate-oci", NAMESPACE, _secret_obj("argocd-ecr-goldengate-oci", "helm/goldengate", labeled=False))
         result = _classify(cluster)
-        self.assertEqual(result["state"], argocd_state.STATE_BROKEN)
+        self.assertEqual(result["state"], argocd_state.STATE_RECONCILABLE)
         self.assertTrue(any("secret-type=repository" in r for r in result["reasons"]))
 
 

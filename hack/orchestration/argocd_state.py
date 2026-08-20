@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""hack/orchestration/argocd_state.py: read-only Argo CD prerequisite classifier -- answers exactly one question, "what is the current Argo CD prerequisite state?", as one of ABSENT/HEALTHY/BROKEN. Never mutates the cluster: every kubectl invocation here is a `get` (read-only); no apply/create/delete/patch/annotate/label/helm call exists in this module. Consumes environment identity through hack/goldengate-environment.py, never a second environment parser."""
+"""hack/orchestration/argocd_state.py: read-only Argo CD prerequisite classifier -- answers exactly one question, "what is the current Argo CD prerequisite state?", as one of ABSENT/HEALTHY/RECONCILABLE/BROKEN. RECONCILABLE (Live Argo Recovery Fix) is a narrow, deliberately conservative carve-out: the core Argo footprint and ECR token-sync RBAC/identity are structurally healthy and only the generated repository Secrets are missing/drifted, a class of drift the existing reusable Argo specialist workflow (its idempotent Helm chart reconciliation plus its own immediate bounded ECR token-sync validation step) already safely repairs -- any other drift at all still classifies BROKEN. Never mutates the cluster: every kubectl invocation here is a `get` (read-only); no apply/create/delete/patch/annotate/label/helm call exists in this module. Consumes environment identity through hack/goldengate-environment.py, never a second environment parser."""
 from __future__ import annotations
 
 import argparse
@@ -47,6 +47,7 @@ def ingress_enabled_from_values(environment):
 
 STATE_ABSENT = "ABSENT"
 STATE_HEALTHY = "HEALTHY"
+STATE_RECONCILABLE = "RECONCILABLE"
 STATE_BROKEN = "BROKEN"
 
 # Current chart/values contract (helm/argocd, envs/<environment>/argocd/values.yaml) -- verified against the real vendored chart's rendered output, never guessed.
@@ -144,6 +145,8 @@ def _statefulset_ready(obj):
 def classify(run, environment, namespace, ecr_registry, argocd_ecr_read_role_arn, ingress_enabled):
     """Returns the stable {"state", "environment", "namespace", "reasons", "checks"} shape. Raises ClassifierInspectionError if Kubernetes access itself could not be trusted -- callers must let that propagate as a hard failure, never a downgrade to ABSENT."""
     reasons = []
+    # Subset of `reasons` that is safe to auto-repair via the existing reusable Argo specialist workflow's idempotent Helm chart reconciliation plus its own immediate bounded ECR token-sync validation step (which triggers a one-off Job from the already-correct CronJob and waits for it to (re)create the repository Secrets) -- never a broader "any drift is safe" carve-out. Only a missing/mislabeled/wrong-URL required repository Secret is added here; every other reason (core Argo footprint, ECR token-sync RBAC/identity, ingress) stays exclusively in `reasons` and therefore forces BROKEN below.
+    reconcilable_reasons = []
     checks = {}
 
     ns_found, _ = _get_json(run, "namespace", namespace)
@@ -231,16 +234,22 @@ def classify(run, environment, namespace, ecr_registry, argocd_ecr_read_role_arn
             found, obj = _get_json(run, "secret", secret_name, namespace)
             secret_status[secret_name] = found
             if not found:
-                reasons.append(f"Secret {secret_name} does not exist")
+                reason = f"Secret {secret_name} does not exist"
+                reasons.append(reason)
+                reconcilable_reasons.append(reason)
                 continue
             labels = (obj.get("metadata") or {}).get("labels") or {}
             if labels.get("argocd.argoproj.io/secret-type") != "repository":
-                reasons.append(f"Secret {secret_name} is missing label argocd.argoproj.io/secret-type=repository")
+                reason = f"Secret {secret_name} is missing label argocd.argoproj.io/secret-type=repository"
+                reasons.append(reason)
+                reconcilable_reasons.append(reason)
             url_b64 = (obj.get("data") or {}).get("url")
             actual_url = base64.b64decode(url_b64).decode("utf-8") if url_b64 else None
             expected_url = f"oci://{ecr_registry}/{helm_repo}"
             if actual_url != expected_url:
-                reasons.append(f"Secret {secret_name} url={actual_url!r}, expected {expected_url!r}")
+                reason = f"Secret {secret_name} url={actual_url!r}, expected {expected_url!r}"
+                reasons.append(reason)
+                reconcilable_reasons.append(reason)
             # Password is intentionally never read or included in classifier output.
         checks["repository_secrets"] = secret_status
 
@@ -250,7 +259,13 @@ def classify(run, environment, namespace, ecr_registry, argocd_ecr_read_role_arn
         if ingress_enabled and not ingress_found:
             reasons.append(f"ingress/{INGRESS_NAME} does not exist but argocdServerIngress.enabled=true in envs/{environment}/argocd/values.yaml")
 
-    state = STATE_HEALTHY if not reasons else STATE_BROKEN
+    # RECONCILABLE only when EVERY collected reason is in the reconcilable subset (missing/mislabeled/wrong-URL repository Secrets, with the core Argo footprint, ECR token-sync RBAC/identity, and ingress contract all otherwise clean) -- any other reason at all (foreign/ambiguous ownership, a not-ready core component, a broken ECR token-sync identity) forces BROKEN, never a broader "partial install is fine" default.
+    if not reasons:
+        state = STATE_HEALTHY
+    elif len(reconcilable_reasons) == len(reasons):
+        state = STATE_RECONCILABLE
+    else:
+        state = STATE_BROKEN
     return {"state": state, "environment": environment, "namespace": namespace, "reasons": reasons, "checks": checks}
 
 

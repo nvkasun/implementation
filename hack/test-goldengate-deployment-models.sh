@@ -7907,8 +7907,8 @@ def eval_gha_bool(expr, needs):
     return bool(_Parser(expr, needs).parse())
 
 
-# Phase B1 inserts the Argo CD prerequisite state machine between Terraform and the platform chart; Phase B2 inserts the same ownership-aware state machine, independently in parallel, for the GoldenGate Platform and Observability application prerequisites between validate_argocd_ready and validate_shared_secrets_once; Phase B3A inserts the read-only runtime ownership-safety preflight between validate_shared_secrets_once and build_publish_and_deploy -- simulated in real DAG order like every other job here, off the same real if: expressions.
-JOB_ORDER = ["terraform_sync_once", "argocd_preflight", "bootstrap_argocd", "validate_argocd_ready", "platform_preflight", "observability_preflight", "platform_sync_once", "observability_sync_once", "validate_platform_ready", "validate_observability_ready", "validate_shared_secrets_once", "runtime_ownership_preflight", "build_publish_and_deploy"]
+# Phase B1 inserts the Argo CD prerequisite state machine between Terraform and the platform chart; Live Argo Recovery Fix reworked it into automatic desired-state reconciliation (reconcile_argocd, formerly bootstrap_argocd); Phase B2 inserts the same ownership-aware state machine, independently in parallel, for the GoldenGate Platform and Observability application prerequisites between validate_argocd_ready and validate_shared_secrets_once; Phase B3A inserts the read-only runtime ownership-safety preflight between validate_shared_secrets_once and build_publish_and_deploy -- simulated in real DAG order like every other job here, off the same real if: expressions.
+JOB_ORDER = ["terraform_sync_once", "argocd_preflight", "reconcile_argocd", "validate_argocd_ready", "platform_preflight", "observability_preflight", "platform_sync_once", "observability_sync_once", "validate_platform_ready", "validate_observability_ready", "validate_shared_secrets_once", "runtime_ownership_preflight", "build_publish_and_deploy"]
 IF_EXPRS = {job: _extract_if(job) for job in JOB_ORDER}
 
 
@@ -7965,11 +7965,11 @@ check("2: platform_sync_once must be skipped", r["platform_sync_once"]["result"]
 check("2: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
 check("2: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
 
-# 3: deploy=true + Argo CD already HEALTHY (bootstrap correctly skipped) + platform ABSENT+reconcile failure (observability stays HEALTHY, isolating the failure to platform) -> runtime build/deploy cannot execute.
+# 3: deploy=true + Argo CD already HEALTHY (Live Argo Recovery Fix: reconcile_argocd now RUNS even on HEALTHY -- a DEPLOY converges the live release to current desired state, it never merely skips because a classifier proved runtime health) + platform ABSENT+reconcile failure (observability stays HEALTHY, isolating the failure to platform) -> runtime build/deploy cannot execute.
 ctx = base_context("true")
 r = simulate(ctx, {"platform_sync_once": "failure"}, {"argocd_preflight": {"state": "HEALTHY"}, "platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "HEALTHY"}})
-check("3: bootstrap_argocd must be skipped when Argo CD is already HEALTHY", r["bootstrap_argocd"]["result"] == "skipped")
-check("3: validate_argocd_ready must succeed on the already-HEALTHY path", r["validate_argocd_ready"]["result"] == "success")
+check("3: reconcile_argocd must RUN (and succeed) even when Argo CD is already HEALTHY", r["reconcile_argocd"]["result"] == "success")
+check("3: validate_argocd_ready must succeed on the already-HEALTHY-and-reconciled path", r["validate_argocd_ready"]["result"] == "success")
 check("3: platform_sync_once must report failure", r["platform_sync_once"]["result"] == "failure")
 check("3: validate_platform_ready must be skipped after a failed platform_sync_once", r["validate_platform_ready"]["result"] == "skipped")
 check("3: observability_sync_once must be skipped (observability is already HEALTHY)", r["observability_sync_once"]["result"] == "skipped")
@@ -7990,29 +7990,53 @@ check("4: validate_shared_secrets_once must succeed", r["validate_shared_secrets
 check("4: runtime_ownership_preflight must succeed (OWNED permits reconciliation)", r["runtime_ownership_preflight"]["result"] == "success")
 check("4: build_publish_and_deploy must be eligible to run", r["build_publish_and_deploy"]["result"] == "success")
 
-# 7: deploy=true + Argo CD ABSENT + bootstrap succeeds -> validate_argocd_ready converges to success -> platform/observability preflights run; platform ABSENT+reconcile success, observability already HEALTHY.
+# 7: deploy=true + Argo CD ABSENT + reconcile_argocd succeeds -> validate_argocd_ready converges to success -> platform/observability preflights run; platform ABSENT+reconcile success, observability already HEALTHY.
 ctx = base_context("true")
 r = simulate(ctx, {}, {"argocd_preflight": {"state": "ABSENT"}, "platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "HEALTHY"}})
-check("7: bootstrap_argocd must run when Argo CD is ABSENT", r["bootstrap_argocd"]["result"] == "success")
-check("7: validate_argocd_ready must succeed after a successful bootstrap", r["validate_argocd_ready"]["result"] == "success")
-check("7: platform_sync_once must be eligible to run after bootstrap (platform is ABSENT)", r["platform_sync_once"]["result"] == "success")
+check("7: reconcile_argocd must run when Argo CD is ABSENT", r["reconcile_argocd"]["result"] == "success")
+check("7: validate_argocd_ready must succeed after a successful reconciliation", r["validate_argocd_ready"]["result"] == "success")
+check("7: platform_sync_once must be eligible to run after reconciliation (platform is ABSENT)", r["platform_sync_once"]["result"] == "success")
 check("7: validate_platform_ready must succeed after a successful reconciliation", r["validate_platform_ready"]["result"] == "success")
 check("7: validate_shared_secrets_once must succeed end-to-end", r["validate_shared_secrets_once"]["result"] == "success")
 
-# 8: deploy=true + Argo CD ABSENT + bootstrap FAILS -> validate_argocd_ready must never run -> platform must never run.
+# 8: deploy=true + Argo CD ABSENT + reconcile_argocd FAILS -> validate_argocd_ready must never run -> platform must never run. (Live Argo Recovery Fix required scenario 7: "reconcile failure => downstream platform orchestration cannot continue".)
 ctx = base_context("true")
-r = simulate(ctx, {"bootstrap_argocd": "failure"}, {"argocd_preflight": {"state": "ABSENT"}})
-check("8: bootstrap_argocd must report failure", r["bootstrap_argocd"]["result"] == "failure")
-check("8: validate_argocd_ready must be skipped after a failed bootstrap", r["validate_argocd_ready"]["result"] == "skipped")
-check("8: platform_sync_once must be skipped after a failed bootstrap", r["platform_sync_once"]["result"] == "skipped")
+r = simulate(ctx, {"reconcile_argocd": "failure"}, {"argocd_preflight": {"state": "ABSENT"}})
+check("8: reconcile_argocd must report failure", r["reconcile_argocd"]["result"] == "failure")
+check("8: validate_argocd_ready must be skipped after a failed reconciliation", r["validate_argocd_ready"]["result"] == "skipped")
+check("8: platform_sync_once must be skipped after a failed reconciliation", r["platform_sync_once"]["result"] == "skipped")
 
-# 9: deploy=true + Argo CD BROKEN (argocd_preflight itself fails closed) -> bootstrap_argocd must never even be entered, and platform must never run.
+# 9: deploy=true + Argo CD BROKEN (argocd_preflight itself fails closed) -> reconcile_argocd must never even be entered, and platform must never run. (Live Argo Recovery Fix required scenario 4: "deploy + BROKEN => reconciliation must NOT execute and the path fails closed".)
 ctx = base_context("true")
 r = simulate(ctx, {"argocd_preflight": "failure"})
 check("9: argocd_preflight must report failure on BROKEN", r["argocd_preflight"]["result"] == "failure")
-check("9: bootstrap_argocd must never run on BROKEN", r["bootstrap_argocd"]["result"] == "skipped")
+check("9: reconcile_argocd must never run on BROKEN", r["reconcile_argocd"]["result"] == "skipped")
 check("9: validate_argocd_ready must be skipped on BROKEN", r["validate_argocd_ready"]["result"] == "skipped")
 check("9: platform_sync_once must be skipped on BROKEN", r["platform_sync_once"]["result"] == "skipped")
+
+# 10: deploy=true + Argo CD RECONCILABLE (the real live incident: core Argo + ECR token-sync RBAC/identity healthy, only the generated repository Secrets missing) -> reconcile_argocd must run (Live Argo Recovery Fix required scenario 2), converge to success, and platform/observability/runtime deployment must remain eligible -- this is the exact case that used to dead-end MAIN at BROKEN.
+ctx = base_context("true")
+r = simulate(ctx, {}, {"argocd_preflight": {"state": "RECONCILABLE"}, "platform_preflight": {"state": "HEALTHY"}, "observability_preflight": {"state": "HEALTHY"}, "runtime_ownership_preflight": {"state": "OWNED"}})
+check("10: reconcile_argocd must run (and succeed) when Argo CD is RECONCILABLE", r["reconcile_argocd"]["result"] == "success")
+check("10: validate_argocd_ready must succeed after a successful RECONCILABLE reconciliation", r["validate_argocd_ready"]["result"] == "success")
+check("10: platform_preflight must remain eligible (never dead-ends behind a RECONCILABLE Argo CD)", r["platform_preflight"]["result"] == "success")
+check("10: build_publish_and_deploy must remain eligible to run", r["build_publish_and_deploy"]["result"] == "success")
+
+# 11: action=validate (effective_deploy=false) with an otherwise-reconcilable/absent Argo CD state -> argocd_preflight/reconcile_argocd must both be skipped -- Validate mode never mutates Argo CD regardless of classified state. (Live Argo Recovery Fix required scenario 5.)
+ctx = base_context("false")
+ctx["managed_efs_inventory_guard"] = {"result": "skipped", "outputs": {}}
+r = simulate(ctx, {}, {"argocd_preflight": {"state": "RECONCILABLE"}})
+check("11: argocd_preflight must be skipped in Validate mode regardless of live state", r["argocd_preflight"]["result"] == "skipped")
+check("11: reconcile_argocd must never run in Validate mode (no mutating Argo CD reconciliation)", r["reconcile_argocd"]["result"] == "skipped")
+check("11: validate_argocd_ready must be skipped in Validate mode", r["validate_argocd_ready"]["result"] == "skipped")
+
+# 12: deploy=true + reconcile_argocd itself reports success, but validate_argocd_ready's own post-reconcile re-classification still fails (the cluster converges to something other than exactly HEALTHY -- RECONCILABLE or BROKEN, modeled here as validate_argocd_ready's own result, since that job's internal script is what enforces the strict != "HEALTHY" fail-closed check) -> platform must never run. (Live Argo Recovery Fix required scenario 8: "reconcile success + final RECONCILABLE/BROKEN => downstream platform orchestration cannot continue".)
+ctx = base_context("true")
+r = simulate(ctx, {"validate_argocd_ready": "failure"}, {"argocd_preflight": {"state": "RECONCILABLE"}})
+check("12: reconcile_argocd itself must still report success (the SUB workflow completed)", r["reconcile_argocd"]["result"] == "success")
+check("12: validate_argocd_ready must report failure when final re-classification is not exactly HEALTHY", r["validate_argocd_ready"]["result"] == "failure")
+check("12: platform_preflight must never run when validate_argocd_ready failed post-reconcile", r["platform_preflight"]["result"] == "skipped")
+check("12: build_publish_and_deploy must never run when validate_argocd_ready failed post-reconcile", r["build_publish_and_deploy"]["result"] == "skipped")
 
 # 5: deploy=false -> terraform/platform may be skipped -> read-only/Helm dry-run path still executes.
 ctx = base_context("false")
@@ -8040,18 +8064,21 @@ PYEOF
   if [ "$FAIL_CLOSED_SIM_STATUS" -eq 0 ]; then
     pass "1: deploy=true + managed_efs_inventory_guard failure blocks terraform_sync_once and build_publish_and_deploy (simulated end-to-end against the real if: expressions)"
     pass "2: deploy=true + terraform_sync_once failure blocks platform_sync_once/validate_shared_secrets_once/build_publish_and_deploy"
-    pass "3: deploy=true + Argo CD already HEALTHY (bootstrap skipped) + platform_sync_once failure blocks validate_shared_secrets_once/build_publish_and_deploy"
-    pass "4: deploy=true + all mutation prerequisites succeeding (including Argo CD already HEALTHY) leaves build_publish_and_deploy eligible to run"
+    pass "3 (Live Argo Recovery Fix): deploy=true + Argo CD already HEALTHY still runs reconcile_argocd (a DEPLOY converges the live release to current desired state) + platform_sync_once failure blocks validate_shared_secrets_once/build_publish_and_deploy"
+    pass "4: deploy=true + all mutation prerequisites succeeding (including Argo CD already HEALTHY and reconciled) leaves build_publish_and_deploy eligible to run"
     pass "5: deploy=false correctly skips terraform_sync_once/platform_sync_once while the read-only/dry-run path through validate_shared_secrets_once and build_publish_and_deploy still runs"
     pass "6: build_publish_and_deploy's if: rejects a skipped validate_shared_secrets_once (requires exact 'success', not the old != failure/!= cancelled assertion)"
-    pass "7 (Phase B1): Argo CD ABSENT + successful bootstrap converges validate_argocd_ready to success and leaves platform_sync_once eligible to run"
-    pass "8 (Phase B1): Argo CD ABSENT + failed bootstrap_argocd skips validate_argocd_ready and platform_sync_once (never assumes bootstrap success)"
-    pass "9 (Phase B1): Argo CD BROKEN (argocd_preflight itself fails) never enters bootstrap_argocd and skips validate_argocd_ready/platform_sync_once"
+    pass "7 (Phase B1): Argo CD ABSENT + successful reconcile_argocd converges validate_argocd_ready to success and leaves platform_sync_once eligible to run"
+    pass "8 (Live Argo Recovery Fix): Argo CD ABSENT + failed reconcile_argocd skips validate_argocd_ready and platform_sync_once (never assumes reconciliation success)"
+    pass "9 (Live Argo Recovery Fix): Argo CD BROKEN (argocd_preflight itself fails) never enters reconcile_argocd and skips validate_argocd_ready/platform_sync_once"
+    pass "10 (Live Argo Recovery Fix): Argo CD RECONCILABLE (the real live incident) runs reconcile_argocd, converges to success, and leaves platform/runtime deployment eligible -- MAIN no longer dead-ends at BROKEN for this case"
+    pass "11 (Live Argo Recovery Fix): action=validate never mutates Argo CD regardless of the live classified state (argocd_preflight/reconcile_argocd both skipped)"
+    pass "12 (Live Argo Recovery Fix): reconcile_argocd succeeding does not by itself satisfy the gate -- validate_argocd_ready's own post-reconcile re-classification must still be exactly HEALTHY, or platform/runtime deployment remain ineligible"
   else
     fail "fail-closed job-graph simulation found violation(s): ${FAIL_CLOSED_SIM_OUT}"
   fi
 else
-  skip "1-9: fail-closed job-graph simulation -- python3/PyYAML unavailable"
+  skip "1-12: fail-closed job-graph simulation -- python3/PyYAML unavailable"
 fi
 
 if ! grep -qE "validate_shared_secrets_once\.result\s*!=\s*'failure'" "$EKS_APP_WORKFLOW" 2>/dev/null; then
@@ -10755,9 +10782,9 @@ else
 fi
 
 echo ""
-echo "--- Phase B1: Argo CD prerequisite classification + conditional automatic bootstrap ---"
+echo "--- Phase B1 / Live Argo Recovery Fix: Argo CD prerequisite classification + automatic desired-state reconciliation ---"
 
-# Structural proof, read directly from the real committed YAML of both workflows (never a reimplementation): 20-sub-argocd.yaml is reusable via workflow_call, and the main orchestrator's argocd_preflight/bootstrap_argocd/validate_argocd_ready/platform_sync_once DAG has exactly the wiring the ownership-aware ABSENT/HEALTHY/BROKEN contract requires -- bootstrap only on ABSENT, never on BROKEN, and platform never reachable without a validated-healthy Argo CD.
+# Structural proof, read directly from the real committed YAML of both workflows (never a reimplementation): 20-sub-argocd.yaml is reusable via workflow_call, and the main orchestrator's argocd_preflight/reconcile_argocd/validate_argocd_ready/platform_sync_once DAG has exactly the wiring the ownership-aware ABSENT/RECONCILABLE/HEALTHY/BROKEN contract requires -- reconcile_argocd runs for every non-terminal state (ABSENT/RECONCILABLE/HEALTHY), never on BROKEN, and platform is never reachable without a validated-healthy Argo CD.
 if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$ARGOCD_DEPLOY_WORKFLOW" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
   PHASE_B1_CHECK="$(python3 -c '
 import yaml
@@ -10786,20 +10813,24 @@ results.append(("4a: argocd_preflight runs after terraform_sync_once", "terrafor
 results.append(("4b: argocd_preflight is real-deploy-only (effective_deploy == \x27true\x27)", "effective_deploy" in preflight_if and "== \x27true\x27" in preflight_if))
 results.append(("4c: argocd_preflight exposes a state job output", "state" in (preflight.get("outputs") or {})))
 
-results.append(("5: main workflow defines a conditional reusable bootstrap_argocd", "bootstrap_argocd" in jobs))
-bootstrap = jobs.get("bootstrap_argocd", {})
-results.append(("6: bootstrap_argocd calls the reusable 20-sub-argocd.yaml (never gh workflow run)", bootstrap.get("uses") == "./.github/workflows/20-sub-argocd.yaml"))
-bootstrap_if = bootstrap.get("if", "")
-results.append(("7: bootstrap_argocd runs only when argocd_preflight.outputs.state == ABSENT", "argocd_preflight.outputs.state == \x27ABSENT\x27" in bootstrap_if))
-results.append(("8: bootstrap_argocd condition contains no BROKEN branch -- BROKEN can never enter bootstrap", "BROKEN" not in bootstrap_if))
-results.append(("8b: bootstrap_argocd requires argocd_preflight to have actually succeeded first", "needs.argocd_preflight.result == \x27success\x27" in bootstrap_if))
+results.append(("5: main workflow defines a conditional reusable reconcile_argocd (no dangling reference to the retired bootstrap_argocd name)", "reconcile_argocd" in jobs and "bootstrap_argocd" not in jobs))
+reconcile = jobs.get("reconcile_argocd", {})
+results.append(("6: reconcile_argocd calls the reusable 20-sub-argocd.yaml (never gh workflow run)", reconcile.get("uses") == "./.github/workflows/20-sub-argocd.yaml"))
+reconcile_if = reconcile.get("if", "")
+results.append(("7a: reconcile_argocd runs when argocd_preflight.outputs.state == ABSENT", "argocd_preflight.outputs.state == \x27ABSENT\x27" in reconcile_if))
+results.append(("7b: reconcile_argocd runs when argocd_preflight.outputs.state == RECONCILABLE (the Live Argo Recovery Fix case)", "argocd_preflight.outputs.state == \x27RECONCILABLE\x27" in reconcile_if))
+results.append(("7c: reconcile_argocd runs when argocd_preflight.outputs.state == HEALTHY (a DEPLOY still converges the live release to current desired state)", "argocd_preflight.outputs.state == \x27HEALTHY\x27" in reconcile_if))
+results.append(("8: reconcile_argocd condition contains no BROKEN branch -- BROKEN can never enter reconciliation", "BROKEN" not in reconcile_if))
+results.append(("8b: reconcile_argocd requires argocd_preflight to have actually succeeded first", "needs.argocd_preflight.result == \x27success\x27" in reconcile_if))
 
 results.append(("9: main workflow defines a final validate_argocd_ready convergence job", "validate_argocd_ready" in jobs))
 ready = jobs.get("validate_argocd_ready", {})
+ready_needs = ready.get("needs") or []
 ready_if = ready.get("if", "")
-results.append(("10a: validate_argocd_ready allows the already-HEALTHY (bootstrap-skip) path", "argocd_preflight.outputs.state == \x27HEALTHY\x27" in ready_if))
-results.append(("10b: validate_argocd_ready allows the ABSENT-then-successfully-bootstrapped path", "argocd_preflight.outputs.state == \x27ABSENT\x27" in ready_if and "needs.bootstrap_argocd.result == \x27success\x27" in ready_if))
-results.append(("10c: validate_argocd_ready uses always() to survive bootstrap_argocd legitimately being skipped", "always()" in ready_if))
+results.append(("10a: validate_argocd_ready needs reconcile_argocd (no dangling reference to the retired bootstrap_argocd name)", "reconcile_argocd" in ready_needs and "bootstrap_argocd" not in ready_needs))
+results.append(("10b: validate_argocd_ready is a single unified condition requiring reconcile_argocd to have actually succeeded -- no per-state branching remains, since reconcile_argocd is now applicable to every state argocd_preflight can succeed with", "needs.reconcile_argocd.result == \x27success\x27" in ready_if))
+results.append(("10c: validate_argocd_ready no longer contains a state-specific HEALTHY/ABSENT branch condition (the dual-path logic was retired along with bootstrap_argocd)", "argocd_preflight.outputs.state ==" not in ready_if))
+results.append(("10d: validate_argocd_ready uses always() (defense in depth, matching this workflow'"'"'s established convergence-job pattern)", "always()" in ready_if))
 
 # Phase B2 inserts platform_preflight between validate_argocd_ready and platform_sync_once (see the dedicated "Phase B2" DAG checks elsewhere in this suite) -- platform_sync_once now depends on validate_argocd_ready transitively via platform_preflight, never as a direct edge.
 platform_preflight_b1 = jobs.get("platform_preflight", {})
@@ -10810,7 +10841,7 @@ results.append(("11: platform_preflight (and therefore platform_sync_once transi
 results.append(("12: platform_preflight requires validate_argocd_ready to have actually succeeded (BROKEN/failed Argo can never reach platform)", "needs.validate_argocd_ready.result == \x27success\x27" in platform_preflight_b1.get("if", "")))
 results.append(("12b: platform_sync_once needs platform_preflight (the actual direct edge in the new B2 chain)", "platform_preflight" in platform_needs))
 
-results.append(("13: bootstrap_argocd still gates on effective_deploy == \x27true\x27 -- dry-run can never bootstrap Argo", "effective_deploy == \x27true\x27" in bootstrap_if))
+results.append(("13: reconcile_argocd still gates on effective_deploy == \x27true\x27 -- Validate mode can never mutate Argo CD", "effective_deploy == \x27true\x27" in reconcile_if))
 
 whole_text = str(main_doc) + str(argocd_doc)
 results.append(("14: no gh workflow run / workflow_dispatch-API / repository_dispatch trigger exists anywhere in either workflow", "gh workflow run" not in whole_text and "repository_dispatch" not in whole_text and "/dispatches" not in whole_text))

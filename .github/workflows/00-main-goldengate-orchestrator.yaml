@@ -412,7 +412,7 @@ jobs:
   argocd_preflight:
     name: Classify Argo CD prerequisite state (read-only)
 
-    # First implementation of the ownership-aware application-prerequisite state machine (Phase B1): ABSENT -> bootstrap, HEALTHY -> continue, BROKEN -> fail closed, never auto-repaired. This job never mutates the cluster -- it only runs hack/orchestration/argocd_state.py, which itself issues read-only `kubectl get` calls.
+    # Live Argo Recovery Fix: the ownership-aware application-prerequisite state machine now has four states -- ABSENT/RECONCILABLE/HEALTHY all converge via reconcile_argocd below (a DEPLOY is an end-to-end convergence operation, not merely a bootstrap), BROKEN fails closed right here, never auto-repaired. This job never mutates the cluster -- it only runs hack/orchestration/argocd_state.py, which itself issues read-only `kubectl get` calls.
     needs:
       - validate_model
       - terraform_sync_once
@@ -514,14 +514,14 @@ jobs:
             exit 1
           fi
 
-  bootstrap_argocd:
-    name: Bootstrap Argo CD (only when currently absent)
+  reconcile_argocd:
+    name: Reconcile Argo CD desired state
 
-    # Runs the reusable specialist workflow synchronously as part of this DAG -- never an asynchronous CLI/API dispatch or repository_dispatch trigger. Skipped entirely (not run) whenever Argo CD is already HEALTHY or preflight found it BROKEN.
+    # Live Argo Recovery Fix: MAIN now owns automatic Argo CD desired-state reconciliation for every application-owned state that is not fail-closed BROKEN -- ABSENT (nothing installed yet), RECONCILABLE (core Argo + ECR token-sync RBAC/identity structurally healthy, only the generated repository Secrets missing/drifted -- exactly the real incident this fix addresses), and HEALTHY (a DEPLOY is an end-to-end convergence operation, not only a bootstrap operation: a classifier can prove runtime health but cannot prove the live Helm release already matches the current Git/Helm desired state -- e.g. a healthy-looking CronJob could still be running with a stale rendered template -- so HEALTHY still converges through the same idempotent Helm chart reconciliation). argocd_preflight's own classify step already fails the job closed on BROKEN, so needs.argocd_preflight.result == 'success' alone already guarantees a non-BROKEN state; every applicable state is still listed explicitly below for defense in depth and readability. Runs the reusable specialist workflow synchronously as part of this DAG -- never an asynchronous CLI/API dispatch or repository_dispatch trigger. 20-sub-argocd.yaml itself remains fully usable standalone; MAIN no longer depends on an operator invoking it separately for recoverable drift.
     needs:
       - validate_model
       - argocd_preflight
-    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.argocd_preflight.result == 'success' && needs.argocd_preflight.outputs.state == 'ABSENT' }}
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.argocd_preflight.result == 'success' && (needs.argocd_preflight.outputs.state == 'ABSENT' || needs.argocd_preflight.outputs.state == 'RECONCILABLE' || needs.argocd_preflight.outputs.state == 'HEALTHY') }}
 
     uses: ./.github/workflows/20-sub-argocd.yaml
     secrets: inherit
@@ -529,14 +529,14 @@ jobs:
       environment: ${{ needs.validate_model.outputs.selected_environment }}
 
   validate_argocd_ready:
-    name: Validate Argo CD is healthy (convergence point for the already-healthy and just-bootstrapped paths)
+    name: Validate Argo CD is healthy (final convergence point after reconciliation)
 
-    # always() overrides GitHub's default implicit skip-on-skipped-dependency behavior (bootstrap_argocd is legitimately skipped on the already-HEALTHY path) -- the explicit result/state checks below are what actually keep this fail-closed, exactly like validate_shared_secrets_once's established always()-plus-explicit-result pattern elsewhere in this workflow.
+    # always() overrides GitHub's default implicit skip-on-skipped-dependency behavior -- the explicit result checks below are what actually keep this fail-closed, exactly like validate_shared_secrets_once's established always()-plus-explicit-result pattern elsewhere in this workflow. reconcile_argocd is now applicable for every state argocd_preflight can succeed with (ABSENT/RECONCILABLE/HEALTHY), so a plain needs.reconcile_argocd.result == 'success' is sufficient -- no per-state branching is needed here anymore.
     needs:
       - validate_model
       - argocd_preflight
-      - bootstrap_argocd
-    if: ${{ always() && needs.validate_model.outputs.effective_deploy == 'true' && needs.argocd_preflight.result == 'success' && (needs.argocd_preflight.outputs.state == 'HEALTHY' || (needs.argocd_preflight.outputs.state == 'ABSENT' && needs.bootstrap_argocd.result == 'success')) }}
+      - reconcile_argocd
+    if: ${{ always() && needs.validate_model.outputs.effective_deploy == 'true' && needs.argocd_preflight.result == 'success' && needs.reconcile_argocd.result == 'success' }}
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -613,9 +613,9 @@ jobs:
 
           python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
 
-          # Bootstrap success (the reusable workflow job returning) is never assumed to mean healthy -- the same read-only classifier is re-run here and must independently confirm HEALTHY.
+          # Reconciliation success (the reusable workflow job returning) is never assumed to mean healthy -- the same read-only classifier is re-run here and must independently confirm HEALTHY. Live Argo Recovery Fix: this check is intentionally != "HEALTHY" (not == "BROKEN"), so it already fails closed on RECONCILABLE too -- reconcile_argocd's own successful reconciliation must produce a fully HEALTHY result, never merely "no longer BROKEN".
           if ! CLASSIFIER_OUTPUT="$(python3 hack/orchestration/argocd_state.py --environment "${GG_SELECTED_ENVIRONMENT}")"; then
-            echo "FAIL: the Argo CD classifier could not determine cluster state (inspection error) during post-bootstrap validation."
+            echo "FAIL: the Argo CD classifier could not determine cluster state (inspection error) during post-reconciliation validation."
             exit 1
           fi
 
@@ -624,7 +624,7 @@ jobs:
           STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
 
           if [ "$STATE" != "HEALTHY" ]; then
-            echo "FAIL: Argo CD prerequisite state is ${STATE}, expected HEALTHY after preflight/bootstrap. Refusing to proceed to the platform stage."
+            echo "FAIL: Argo CD prerequisite state is ${STATE}, expected HEALTHY after preflight/reconciliation. Refusing to proceed to the platform stage."
             exit 1
           fi
 
@@ -2874,7 +2874,7 @@ jobs:
           kubectl get crd applications.argoproj.io >/dev/null || {
             echo "CRD applications.argoproj.io not found."
             echo "Argo CD prerequisite is not healthy."
-            echo "This orchestrator's own argocd_preflight/bootstrap_argocd/validate_argocd_ready jobs normally classify and bootstrap-validate Argo CD before this stage runs -- this check is defense in depth, not the primary gate."
+            echo "This orchestrator's own argocd_preflight/reconcile_argocd/validate_argocd_ready jobs normally classify and reconcile Argo CD before this stage runs -- this check is defense in depth, not the primary gate."
             echo "For standalone repair/reconciliation use:"
             echo "  20 | SUB | Argo CD (.github/workflows/20-sub-argocd.yaml)"
             exit 1
