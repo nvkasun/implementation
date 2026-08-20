@@ -523,19 +523,42 @@ jobs:
             exit 1
           fi
 
+  goldengate_deploy_authorization:
+    name: Authorize GoldenGate application deployment
+
+    # Live Deployment Approval Topology Fix: the single, GoldenGate-owned protected-environment approval covering the entire end-to-end Deploy DAG that follows -- Argo CD reconciliation, Platform, Observability, the runtime matrix, and the Monitor all run afterward as MAIN-orchestrated jobs/reusable workflow calls (orchestrated_by_main: true) and never create an approval of their own. Deliberately placed after terraform_sync_once and argocd_preflight so a human is never asked to authorize a deployment that Terraform already failed or that Argo CD classified as unsafe (argocd_preflight's own classify step already fails closed on BROKEN before this job can even be reached). Performs no AWS/Terraform/Kubernetes/Helm/ECR/Argo CD mutation of its own -- ubuntu-latest is sufficient because this job exists purely as a GitHub deployment-protection point, distinct from the corporate Terraform governance approval owned entirely by 10-sub-iam-secrets.yaml.
+    needs:
+      - validate_model
+      - terraform_sync_once
+      - argocd_preflight
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.terraform_sync_once.result == 'success' && needs.argocd_preflight.result == 'success' }}
+
+    runs-on: ubuntu-latest
+    environment: ${{ needs.validate_model.outputs.selected_environment }}
+
+    steps:
+      - name: Record GoldenGate application deployment authorization
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "GoldenGate application deployment authorized for environment ${{ needs.validate_model.outputs.selected_environment }}."
+
   reconcile_argocd:
     name: Reconcile Argo CD desired state
 
-    # Live Argo Recovery Fix: MAIN now owns automatic Argo CD desired-state reconciliation for every application-owned state that is not fail-closed BROKEN -- ABSENT (nothing installed yet), RECONCILABLE (core Argo + ECR token-sync RBAC/identity structurally healthy, only the generated repository Secrets missing/drifted -- exactly the real incident this fix addresses), and HEALTHY (a DEPLOY is an end-to-end convergence operation, not only a bootstrap operation: a classifier can prove runtime health but cannot prove the live Helm release already matches the current Git/Helm desired state -- e.g. a healthy-looking CronJob could still be running with a stale rendered template -- so HEALTHY still converges through the same idempotent Helm chart reconciliation). argocd_preflight's own classify step already fails the job closed on BROKEN, so needs.argocd_preflight.result == 'success' alone already guarantees a non-BROKEN state; every applicable state is still listed explicitly below for defense in depth and readability. Runs the reusable specialist workflow synchronously as part of this DAG -- never an asynchronous CLI/API dispatch or repository_dispatch trigger. 20-sub-argocd.yaml itself remains fully usable standalone; MAIN no longer depends on an operator invoking it separately for recoverable drift.
+    # Live Argo Recovery Fix: MAIN now owns automatic Argo CD desired-state reconciliation for every application-owned state that is not fail-closed BROKEN -- ABSENT (nothing installed yet), RECONCILABLE (core Argo + ECR token-sync RBAC/identity structurally healthy, only the generated repository Secrets missing/drifted -- exactly the real incident this fix addresses), and HEALTHY (a DEPLOY is an end-to-end convergence operation, not only a bootstrap operation: a classifier can prove runtime health but cannot prove the live Helm release already matches the current Git/Helm desired state -- e.g. a healthy-looking CronJob could still be running with a stale rendered template -- so HEALTHY still converges through the same idempotent Helm chart reconciliation). argocd_preflight's own classify step already fails the job closed on BROKEN, so needs.argocd_preflight.result == 'success' alone already guarantees a non-BROKEN state; every applicable state is still listed explicitly below for defense in depth and readability. Runs the reusable specialist workflow synchronously as part of this DAG -- never an asynchronous CLI/API dispatch or repository_dispatch trigger. 20-sub-argocd.yaml itself remains fully usable standalone; MAIN no longer depends on an operator invoking it separately for recoverable drift. Live Deployment Approval Topology Fix: now also requires goldengate_deploy_authorization's own success -- the single GoldenGate application approval above -- so this reusable call runs already-authorized (orchestrated_by_main: true) and never opens a second approval of its own.
     needs:
       - validate_model
       - argocd_preflight
-    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.argocd_preflight.result == 'success' && (needs.argocd_preflight.outputs.state == 'ABSENT' || needs.argocd_preflight.outputs.state == 'RECONCILABLE' || needs.argocd_preflight.outputs.state == 'HEALTHY') }}
+      - goldengate_deploy_authorization
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.argocd_preflight.result == 'success' && needs.goldengate_deploy_authorization.result == 'success' && (needs.argocd_preflight.outputs.state == 'ABSENT' || needs.argocd_preflight.outputs.state == 'RECONCILABLE' || needs.argocd_preflight.outputs.state == 'HEALTHY') }}
 
     uses: ./.github/workflows/20-sub-argocd.yaml
     secrets: inherit
     with:
       environment: ${{ needs.validate_model.outputs.selected_environment }}
+      orchestrated_by_main: true
 
   validate_argocd_ready:
     name: Validate Argo CD is healthy (final convergence point after reconciliation)
@@ -878,6 +901,7 @@ jobs:
     with:
       environment: ${{ needs.validate_model.outputs.selected_environment }}
       deploy: true
+      orchestrated_by_main: true
 
   observability_sync_once:
     name: Reconcile Observability (only when currently absent)
@@ -892,6 +916,7 @@ jobs:
     with:
       environment: ${{ needs.validate_model.outputs.selected_environment }}
       deploy: true
+      orchestrated_by_main: true
 
   validate_platform_ready:
     name: Validate GoldenGate Platform is healthy (convergence point for the already-healthy and just-reconciled paths)
@@ -1117,9 +1142,7 @@ jobs:
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
-    environment: ${{ needs.validate_model.outputs.selected_environment }}
-
-    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail -- this is the exact defect class that already hit live in managed_efs_inventory_guard.
+    # Live Deployment Approval Topology Fix: no job-level environment: here -- this job is read-only (only validates that the three shared secrets already exist, never creates/mutates them), consumes only the proven repository-scoped vars.PROJECT_NAME_DEV, and is already covered end-to-end by the single goldengate_deploy_authorization approval upstream of it in the DAG; JOB-LEVEL (not step-level) so every run: step in this job can still safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail -- this is the exact defect class that already hit live in managed_efs_inventory_guard (Live Deploy Fix 4).
     env:
       GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
 
@@ -1358,9 +1381,7 @@ jobs:
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
-    environment: ${{ needs.validate_model.outputs.selected_environment }}
-
-    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job -- including "Compute expected managed-EFS inventory from the deployment model" and "Compare expected vs actual managed-EFS inventory", the exact two steps the real VDR run hit -- can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail.
+    # Live Deployment Approval Topology Fix: no job-level environment: here -- this job is strictly read-only (a single DescribeFileSystems call, never create/update/delete) and is already covered end-to-end by the single goldengate_deploy_authorization approval upstream of it in the DAG; JOB-LEVEL (not step-level) so every run: step in this job -- including "Compute expected managed-EFS inventory from the deployment model" and "Compare expected vs actual managed-EFS inventory", the exact two steps the real VDR run hit -- can still safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail.
     env:
       GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
 
@@ -1474,8 +1495,7 @@ jobs:
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
-    environment: ${{ matrix.environment }}
-
+    # Live Deployment Approval Topology Fix: no job-level environment: here (and deliberately not per-matrix-entry either) -- this job is read-only ownership classification, never a mutation, and a future multi-runtime matrix must never generate one approval per runtime; it is already covered end-to-end by the single goldengate_deploy_authorization approval upstream of it in the DAG.
     strategy:
       # Same sequential/fail-fast safety posture as the runtime rollout it gates: an ownership conflict on one deployment must not be masked by a concurrently-evaluated sibling.
       fail-fast: true
@@ -1589,8 +1609,7 @@ jobs:
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
-    environment: ${{ matrix.environment }}
-
+    # Live Deployment Approval Topology Fix: no job-level environment: here (and deliberately not per-matrix-entry either) -- this is the direct MAIN runtime deployment job, and a real rollout of N selected runtimes must never generate N approvals; the whole rollout is already authorized end-to-end by the single goldengate_deploy_authorization approval upstream of it in the DAG, fixed now (not deferred to a future runtime-activation phase).
     strategy:
       # Sequential rollout: an existing-runtime migration failure must block the next queued migration; max-parallel alone is not sufficient.
       fail-fast: true
@@ -3446,8 +3465,7 @@ jobs:
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
-    environment: ${{ matrix.environment }}
-
+    # Live Deployment Approval Topology Fix: no job-level environment: here (and deliberately not per-matrix-entry either) -- this job is read-only global acceptance validation, never a mutation, and must never generate one approval per active runtime; it is already covered end-to-end by the single goldengate_deploy_authorization approval upstream of it in the DAG.
     strategy:
       # One matrix item per active deployment in the GLOBAL canonical registry; sequential/fail-fast so a BROKEN runtime is reported clearly rather than racing diagnostics from a concurrently-evaluated sibling.
       fail-fast: true
@@ -3940,6 +3958,7 @@ jobs:
       # The global CloudWatch publisher must never be disabled by this orchestrator; existing gates stay whatever CONFIG already has (metrics_gate_expectation=any). Phase B3B: 50-sub-monitor.yaml itself now implements the Safe Monitor Publication Bootstrap Contract internally (bootstrap/repair path when no Ready monitor exists yet, fast path otherwise) -- this call site is unchanged.
       enable_cloudwatch_publication: true
       metrics_gate_expectation: any
+      orchestrated_by_main: true
 
   monitor_dry_run_validation:
     name: Validate the GoldenGate monitor locally (deploy=false, no publishing)

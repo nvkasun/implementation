@@ -54,6 +54,11 @@ on:
         required: false
         type: string
         default: any
+      # Live Deployment Approval Topology Fix: an internal workflow_call-only caller contract, never a workflow_dispatch input and never operator-facing -- literal boolean true means MAIN already obtained its own single goldengate_deploy_authorization approval and this reusable workflow must not open a second one; missing/false (including every direct standalone workflow_dispatch run, which cannot set this input at all) means standalone and the single approval below still applies to both implementation jobs.
+      orchestrated_by_main:
+        required: false
+        type: boolean
+        default: false
     outputs:
       image_repository:
         description: "Resolved GoldenGate monitor image repository (ensure_monitor_image's own output -- never re-derived independently by the caller)."
@@ -88,13 +93,33 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Live Deployment Approval Topology Fix, MODE B (direct standalone workflow_dispatch): the single protected-environment gate covering BOTH implementation jobs below (ensure_monitor_image and build_publish_and_deploy) -- never one approval per internal job. Skipped entirely when MAIN already authorized this run (orchestrated_by_main: true) -- MAIN's own goldengate_deploy_authorization job is the approval in that case, never this one.
+  standalone_deploy_authorization:
+    name: Authorize standalone GoldenGate monitor deployment
+
+    if: ${{ inputs.orchestrated_by_main != true }}
+
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Record standalone GoldenGate monitor deployment authorization
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Standalone GoldenGate monitor deployment authorized for environment ${{ inputs.environment }}."
+
   # ubuntu-latest only: the CodeBuild runner used elsewhere in this repo has no reachable Docker daemon; this job never touches the private EKS cluster.
   ensure_monitor_image:
     name: Ensure GoldenGate monitor image exists in ECR
 
     runs-on: ubuntu-latest
 
-    environment: ${{ inputs.environment }}
+    # always() lets a deliberately-skipped standalone_deploy_authorization (MAIN-orchestrated run) through without being treated as a failed dependency, while the explicit result check still fails closed on a real standalone run whose authorization failed, was cancelled, or was unexpectedly skipped.
+    needs:
+      - standalone_deploy_authorization
+    if: ${{ always() && (inputs.orchestrated_by_main == true || needs.standalone_deploy_authorization.result == 'success') }}
 
     outputs:
       image_repository: ${{ steps.prep.outputs.image_repository }}
@@ -484,12 +509,13 @@ jobs:
   build_publish_and_deploy:
     name: Build, publish, and deploy the GoldenGate monitor via Argo CD
 
-    needs: ensure_monitor_image
-    if: needs.ensure_monitor_image.result == 'success'
+    # Depends on the SAME standalone_deploy_authorization as ensure_monitor_image above (never a second authorization job) -- always() plus the explicit result check preserves the identical MAIN-orchestrated-vs-standalone gating semantics for this second implementation job.
+    needs:
+      - ensure_monitor_image
+      - standalone_deploy_authorization
+    if: ${{ always() && needs.ensure_monitor_image.result == 'success' && (inputs.orchestrated_by_main == true || needs.standalone_deploy_authorization.result == 'success') }}
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
-
-    environment: ${{ inputs.environment }}
 
     concurrency:
       group: goldengate-monitor-helm-deploy-${{ github.ref }}

@@ -18,6 +18,11 @@ on:
       environment:
         required: true
         type: string
+      # Live Deployment Approval Topology Fix: an internal workflow_call-only caller contract, never a workflow_dispatch input and never operator-facing -- literal boolean true means MAIN already obtained its own single goldengate_deploy_authorization approval and this reusable workflow must not open a second one; missing/false (including every direct standalone workflow_dispatch run, which cannot set this input at all) means standalone and the approval below still applies.
+      orchestrated_by_main:
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   id-token: write
@@ -37,12 +42,32 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Live Deployment Approval Topology Fix, MODE B (direct standalone workflow_dispatch): the one remaining protected-environment gate in this workflow. Skipped entirely when MAIN already authorized this run (orchestrated_by_main: true) -- MAIN's own goldengate_deploy_authorization job is the approval in that case, never this one.
+  standalone_deploy_authorization:
+    name: Authorize standalone Argo CD deployment
+
+    if: ${{ inputs.orchestrated_by_main != true }}
+
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Record standalone Argo CD deployment authorization
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Standalone Argo CD deployment authorized for environment ${{ inputs.environment }}."
+
   build_publish_and_deploy:
     name: Build, publish, and deploy Argo CD Helm chart
 
-    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+    # always() lets a deliberately-skipped standalone_deploy_authorization (MAIN-orchestrated run) through without being treated as a failed dependency, while the explicit result check still fails closed on a real standalone run whose authorization failed, was cancelled, or was unexpectedly skipped.
+    needs:
+      - standalone_deploy_authorization
+    if: ${{ always() && (inputs.orchestrated_by_main == true || needs.standalone_deploy_authorization.result == 'success') }}
 
-    environment: ${{ inputs.environment }}
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
     steps:
       - name: Checkout repository

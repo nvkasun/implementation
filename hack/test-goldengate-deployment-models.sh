@@ -23,6 +23,7 @@ EKS_APP_WORKFLOW=".github/workflows/00-main-goldengate-orchestrator.yaml"
 PLATFORM_WORKFLOW=".github/workflows/30-sub-platform.yaml"
 DETECT_SCRIPT="hack/detect-goldengate-deployments.sh"
 ENV_SCOPE_CHECKER="hack/check-goldengate-workflow-env-scope.py"
+APPROVAL_TOPOLOGY_CHECKER="hack/check-goldengate-approval-topology.py"
 OBSERVABILITY_VALUES_FILE="platform/dev/goldengate-observability/values.yaml"
 OBSERVABILITY_WORKFLOW=".github/workflows/40-sub-observability.yaml"
 ARGOCD_VALUES_FILE="envs/dev/argocd/values.yaml"
@@ -1265,12 +1266,13 @@ steps = job["steps"]
 def get_step(name):
     return next((s for s in steps if s.get("name") == name), None)
 
-# 1-2: exact CodeBuild runner, no ubuntu-latest anywhere in the job.
+# 1-2: exact CodeBuild runner, no ubuntu-latest anywhere in THIS job specifically. Live Deployment Approval Topology Fix added a separate standalone_deploy_authorization job to this same file that legitimately runs on ubuntu-latest (a pure GitHub deployment-protection point, never touching the private EKS API) -- this check is scoped to validate_and_deploy's own dumped text, never the whole file, so that sibling job never false-positives here.
 EXPECTED_RUNNER = "codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}"
 if job.get("runs-on") != EXPECTED_RUNNER:
     results.append(f"runs-on={job.get('runs-on')!r}")
 import re
-if re.search(r'runs-on:\s*ubuntu-latest', text):
+job_text = yaml.dump(job, default_flow_style=False)
+if re.search(r'runs-on:\s*ubuntu-latest', job_text):
     results.append("ubuntu-latest-still-used-as-runs-on")
 
 # 3-4: Helm/kubectl installation supports both amd64 and arm64.
@@ -7907,8 +7909,8 @@ def eval_gha_bool(expr, needs):
     return bool(_Parser(expr, needs).parse())
 
 
-# Phase B1 inserts the Argo CD prerequisite state machine between Terraform and the platform chart; Live Argo Recovery Fix reworked it into automatic desired-state reconciliation (reconcile_argocd, formerly bootstrap_argocd); Phase B2 inserts the same ownership-aware state machine, independently in parallel, for the GoldenGate Platform and Observability application prerequisites between validate_argocd_ready and validate_shared_secrets_once; Phase B3A inserts the read-only runtime ownership-safety preflight between validate_shared_secrets_once and build_publish_and_deploy -- simulated in real DAG order like every other job here, off the same real if: expressions.
-JOB_ORDER = ["terraform_sync_once", "argocd_preflight", "reconcile_argocd", "validate_argocd_ready", "platform_preflight", "observability_preflight", "platform_sync_once", "observability_sync_once", "validate_platform_ready", "validate_observability_ready", "validate_shared_secrets_once", "runtime_ownership_preflight", "build_publish_and_deploy"]
+# Phase B1 inserts the Argo CD prerequisite state machine between Terraform and the platform chart; Live Argo Recovery Fix reworked it into automatic desired-state reconciliation (reconcile_argocd, formerly bootstrap_argocd); Phase B2 inserts the same ownership-aware state machine, independently in parallel, for the GoldenGate Platform and Observability application prerequisites between validate_argocd_ready and validate_shared_secrets_once; Phase B3A inserts the read-only runtime ownership-safety preflight between validate_shared_secrets_once and build_publish_and_deploy; Live Deployment Approval Topology Fix inserts goldengate_deploy_authorization (the single GoldenGate application deployment approval) between argocd_preflight and reconcile_argocd -- all simulated in real DAG order like every other job here, off the same real if: expressions.
+JOB_ORDER = ["terraform_sync_once", "argocd_preflight", "goldengate_deploy_authorization", "reconcile_argocd", "validate_argocd_ready", "platform_preflight", "observability_preflight", "platform_sync_once", "observability_sync_once", "validate_platform_ready", "validate_observability_ready", "validate_shared_secrets_once", "runtime_ownership_preflight", "build_publish_and_deploy"]
 IF_EXPRS = {job: _extract_if(job) for job in JOB_ORDER}
 
 
@@ -11020,6 +11022,629 @@ PYEOF
   fi
 else
   skip "Live Argo Self-Recovery Fix: CLASSIFIER_CONTRACT cross-check -- python3/PyYAML unavailable or a required file is missing"
+fi
+
+echo ""
+echo "--- Live Deployment Approval Topology Fix: MAIN owns a single GoldenGate application deployment authorization ---"
+
+if [ -f "$APPROVAL_TOPOLOGY_CHECKER" ]; then
+  APPROVAL_TOPOLOGY_REAL_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 "$APPROVAL_TOPOLOGY_CHECKER" 2>&1)"
+  APPROVAL_TOPOLOGY_REAL_STATUS=$?
+  if [ "$APPROVAL_TOPOLOGY_REAL_STATUS" -eq 0 ] && echo "$APPROVAL_TOPOLOGY_REAL_OUT" | grep -qE "^Unsafe jobs: 0$"; then
+    pass "Live Deployment Approval Topology Fix: ${APPROVAL_TOPOLOGY_CHECKER} reports 9 workflows inspected and ZERO unsafe jobs against the real current repository"
+  else
+    fail "Live Deployment Approval Topology Fix: ${APPROVAL_TOPOLOGY_CHECKER} did not report the expected zero-violation inventory against the real repository (status=${APPROVAL_TOPOLOGY_REAL_STATUS}):"$'\n'"${APPROVAL_TOPOLOGY_REAL_OUT}"
+  fi
+else
+  fail "Live Deployment Approval Topology Fix: ${APPROVAL_TOPOLOGY_CHECKER} does not exist"
+fi
+
+# The checker's own teeth are proven against fabricated scratch copies of the real workflows -- never trusted as a vacuously-green tool. Three independent, deliberately-introduced violations (a missing orchestrated_by_main passthrough, a re-added duplicate approval on 50-sub-monitor.yaml's second implementation job, and orchestrated_by_main leaking into workflow_dispatch.inputs) are each confirmed caught.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$APPROVAL_TOPOLOGY_CHECKER" ]; then
+  set +e
+  NEG_TEST_OUT="$(python3 - "$REPO_ROOT" "$APPROVAL_TOPOLOGY_CHECKER" <<'PYEOF'
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+repo_root, checker = sys.argv[1], sys.argv[2]
+src_wf_dir = os.path.join(repo_root, ".github", "workflows")
+scratch = tempfile.mkdtemp(prefix="approval-topology-negtest-")
+try:
+    dst_wf_dir = os.path.join(scratch, "workflows")
+    shutil.copytree(src_wf_dir, dst_wf_dir)
+
+    def run_checker():
+        proc = subprocess.run(
+            [sys.executable, os.path.join(repo_root, checker), "--workflow-dir", dst_wf_dir],
+            capture_output=True, text=True,
+        )
+        return proc.returncode, proc.stdout
+
+    # Baseline: an untouched scratch copy must be clean.
+    rc, out = run_checker()
+    if rc != 0:
+        print(f"FAIL baseline scratch copy unexpectedly failed:\n{out}")
+        sys.exit(1)
+
+    # Negative test 1: strip the orchestrated_by_main passthrough from MAIN's reconcile_argocd call.
+    main_path = os.path.join(dst_wf_dir, "00-main-goldengate-orchestrator.yaml")
+    original = open(main_path).read()
+    stripped = original.replace(
+        "      environment: ${{ needs.validate_model.outputs.selected_environment }}\n      orchestrated_by_main: true\n\n  validate_argocd_ready:",
+        "      environment: ${{ needs.validate_model.outputs.selected_environment }}\n\n  validate_argocd_ready:",
+        1,
+    )
+    if stripped == original:
+        print("FAIL negative test 1 substitution did not match the real file")
+        sys.exit(1)
+    open(main_path, "w").write(stripped)
+    rc, out = run_checker()
+    open(main_path, "w").write(original)
+    if rc == 0 or "orchestrated_by_main: true" not in out:
+        print(f"FAIL negative test 1 (missing orchestrated_by_main passthrough) was not caught:\n{out}")
+        sys.exit(1)
+
+    # Negative test 2: re-add a duplicate job-level environment: onto 50-sub-monitor.yaml's second implementation job.
+    monitor_path = os.path.join(dst_wf_dir, "50-sub-monitor.yaml")
+    original = open(monitor_path).read()
+    needle = "    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}\n\n    concurrency:"
+    replacement = "    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}\n\n    environment: ${{ inputs.environment }}\n\n    concurrency:"
+    if needle not in original:
+        print("FAIL negative test 2 substitution anchor not found in the real file")
+        sys.exit(1)
+    open(monitor_path, "w").write(original.replace(needle, replacement, 1))
+    rc, out = run_checker()
+    open(monitor_path, "w").write(original)
+    if rc == 0 or "exactly one job-level environment" not in out:
+        print(f"FAIL negative test 2 (duplicate monitor approval) was not caught:\n{out}")
+        sys.exit(1)
+
+    # Negative test 3: expose orchestrated_by_main as a workflow_dispatch input on 20-sub-argocd.yaml.
+    argocd_path = os.path.join(dst_wf_dir, "20-sub-argocd.yaml")
+    original = open(argocd_path).read()
+    needle = "        options:\n          - dev\n\n  workflow_call:"
+    replacement = "        options:\n          - dev\n      orchestrated_by_main:\n        required: false\n        type: boolean\n        default: false\n\n  workflow_call:"
+    if needle not in original:
+        print("FAIL negative test 3 substitution anchor not found in the real file")
+        sys.exit(1)
+    open(argocd_path, "w").write(original.replace(needle, replacement, 1))
+    rc, out = run_checker()
+    open(argocd_path, "w").write(original)
+    if rc == 0 or "never be a workflow_dispatch input" not in out:
+        print(f"FAIL negative test 3 (orchestrated_by_main leaked into workflow_dispatch) was not caught:\n{out}")
+        sys.exit(1)
+
+    print("OK")
+finally:
+    shutil.rmtree(scratch, ignore_errors=True)
+PYEOF
+)"
+  NEG_TEST_STATUS=$?
+  set -e
+  if [ "$NEG_TEST_STATUS" -eq 0 ] && [ "$NEG_TEST_OUT" = "OK" ]; then
+    pass "Live Deployment Approval Topology Fix: ${APPROVAL_TOPOLOGY_CHECKER} genuinely detects three independently-fabricated violations against scratch copies of the real workflows (never a vacuously-green tool)"
+  else
+    fail "Live Deployment Approval Topology Fix: ${APPROVAL_TOPOLOGY_CHECKER} negative-test proof failed:"$'\n'"${NEG_TEST_OUT}"
+  fi
+else
+  skip "Live Deployment Approval Topology Fix: ${APPROVAL_TOPOLOGY_CHECKER} negative-test proof -- python3 unavailable or checker missing"
+fi
+
+# Scenarios A/B/C/J (MAIN side) are simulated in real DAG order against the SAME goldengate_deploy_authorization-aware JOB_ORDER/simulate/base_context harness proven above for the fail-closed job graph -- this is not a fresh reimplementation, it is the identical real if: expressions, re-invoked with new fixtures.
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  set +e
+  MAIN_SCENARIOS_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import re
+import sys
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+
+jobs = doc["jobs"]
+
+
+def _extract_if(job_name):
+    raw = jobs[job_name].get("if", "true")
+    raw = str(raw).strip()
+    if raw.startswith("${{") and raw.endswith("}}"):
+        raw = raw[3:-2].strip()
+    return raw
+
+
+class _Parser:
+    def __init__(self, expr, needs):
+        self.expr = expr
+        self.needs = needs
+        self.pos = 0
+
+    def _skip_ws(self):
+        while self.pos < len(self.expr) and self.expr[self.pos].isspace():
+            self.pos += 1
+
+    def parse(self):
+        result = self._or()
+        self._skip_ws()
+        if self.pos != len(self.expr):
+            raise ValueError(f"trailing content: {self.expr[self.pos:]!r}")
+        return result
+
+    def _or(self):
+        left = self._and()
+        self._skip_ws()
+        while self.expr[self.pos:self.pos + 2] == "||":
+            self.pos += 2
+            right = self._and()
+            left = left or right
+            self._skip_ws()
+        return left
+
+    def _and(self):
+        left = self._atom()
+        self._skip_ws()
+        while self.expr[self.pos:self.pos + 2] == "&&":
+            self.pos += 2
+            right = self._atom()
+            left = left and right
+            self._skip_ws()
+        return left
+
+    def _atom(self):
+        self._skip_ws()
+        if self.expr[self.pos] == "(":
+            self.pos += 1
+            val = self._or()
+            self._skip_ws()
+            assert self.expr[self.pos] == ")"
+            self.pos += 1
+            return val
+        if self.expr[self.pos:self.pos + 8] == "always()":
+            self.pos += 8
+            return True
+        left_val = self._value()
+        self._skip_ws()
+        op = self.expr[self.pos:self.pos + 2]
+        if op in ("==", "!="):
+            self.pos += 2
+            right_val = self._value()
+            return left_val == right_val if op == "==" else left_val != right_val
+        return bool(left_val)
+
+    def _value(self):
+        self._skip_ws()
+        if self.expr[self.pos] == "'":
+            self.pos += 1
+            start = self.pos
+            while self.expr[self.pos] != "'":
+                self.pos += 1
+            val = self.expr[start:self.pos]
+            self.pos += 1
+            return val
+        m = re.match(r"needs\.([A-Za-z0-9_]+)\.result", self.expr[self.pos:])
+        if m:
+            self.pos += m.end()
+            return self.needs.get(m.group(1), {}).get("result", "")
+        m = re.match(r"needs\.([A-Za-z0-9_]+)\.outputs\.([A-Za-z0-9_]+)", self.expr[self.pos:])
+        if m:
+            self.pos += m.end()
+            return self.needs.get(m.group(1), {}).get("outputs", {}).get(m.group(2), "")
+        raise ValueError(f"cannot parse value at: {self.expr[self.pos:self.pos + 40]!r}")
+
+
+def eval_gha_bool(expr, needs):
+    return bool(_Parser(expr, needs).parse())
+
+
+JOB_ORDER = ["terraform_sync_once", "argocd_preflight", "goldengate_deploy_authorization", "reconcile_argocd", "validate_argocd_ready", "platform_preflight", "observability_preflight", "platform_sync_once", "observability_sync_once", "validate_platform_ready", "validate_observability_ready", "validate_shared_secrets_once", "runtime_ownership_preflight", "build_publish_and_deploy"]
+IF_EXPRS = {job: _extract_if(job) for job in JOB_ORDER}
+
+
+def simulate(initial, outcome_when_run, outputs_when_run=None):
+    results = dict(initial)
+    outputs_when_run = outputs_when_run or {}
+    for job in JOB_ORDER:
+        would_run = eval_gha_bool(IF_EXPRS[job], results)
+        if would_run:
+            results[job] = {"result": outcome_when_run.get(job, "success"), "outputs": outputs_when_run.get(job, {})}
+        else:
+            results[job] = {"result": "skipped", "outputs": {}}
+    return results
+
+
+def base_context(effective_deploy, has_changes="true"):
+    return {
+        "validate_model": {"result": "success", "outputs": {"effective_deploy": effective_deploy}},
+        "eks_oidc_preflight": {"result": "success", "outputs": {}},
+        "detect_changed_deployments": {"result": "success", "outputs": {"has_changes": has_changes}},
+        "managed_efs_deletion_guard": {"result": "success", "outputs": {}},
+        "storage_transition_guard": {"result": "success", "outputs": {}},
+        "managed_efs_inventory_guard": {"result": "success", "outputs": {}},
+    }
+
+
+failures = []
+
+
+def check(label, condition):
+    if not condition:
+        failures.append(label)
+
+
+# Scenario A: action=validate (effective_deploy=false) -> no operator approval is ever created and Argo CD is never mutated. build_publish_and_deploy legitimately still runs its own pre-existing read-only Helm lint/render dry-run path in this mode (proven independently by the existing "5: deploy=false" scenario above) -- that pre-existing dry-run eligibility is not itself a mutation and is out of scope for this fix.
+ctx = base_context("false")
+ctx["managed_efs_inventory_guard"] = {"result": "skipped", "outputs": {}}
+r = simulate(ctx, {})
+check("A: goldengate_deploy_authorization must be skipped in Validate mode (no approval created)", r["goldengate_deploy_authorization"]["result"] == "skipped")
+check("A: reconcile_argocd must be skipped in Validate mode (no Argo CD mutation)", r["reconcile_argocd"]["result"] == "skipped")
+
+# Scenario B: deploy=true + Argo CD RECONCILABLE -- the single authorization runs and succeeds, reconcile_argocd runs, final Argo HEALTHY convergence succeeds, and the whole rollout remains eligible off that ONE approval.
+ctx = base_context("true")
+r = simulate(ctx, {}, {"argocd_preflight": {"state": "RECONCILABLE"}, "platform_preflight": {"state": "HEALTHY"}, "observability_preflight": {"state": "HEALTHY"}, "runtime_ownership_preflight": {"state": "OWNED"}})
+check("B: goldengate_deploy_authorization must run and succeed", r["goldengate_deploy_authorization"]["result"] == "success")
+check("B: reconcile_argocd must run and succeed on RECONCILABLE", r["reconcile_argocd"]["result"] == "success")
+check("B: validate_argocd_ready must converge to success", r["validate_argocd_ready"]["result"] == "success")
+check("B: build_publish_and_deploy must remain eligible after the single authorization", r["build_publish_and_deploy"]["result"] == "success")
+
+# Scenario C: reproduces the real live incident -- Platform ABSENT + Observability ABSENT, both reconciled under the SAME single goldengate_deploy_authorization approval, with no operator interaction required between them.
+ctx = base_context("true")
+r = simulate(ctx, {}, {"argocd_preflight": {"state": "HEALTHY"}, "platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "ABSENT"}})
+check("C: goldengate_deploy_authorization must run and succeed exactly once", r["goldengate_deploy_authorization"]["result"] == "success")
+check("C: platform_sync_once must be eligible to run (ABSENT)", r["platform_sync_once"]["result"] == "success")
+check("C: observability_sync_once must be eligible to run (ABSENT)", r["observability_sync_once"]["result"] == "success")
+check("C: validate_platform_ready must succeed", r["validate_platform_ready"]["result"] == "success")
+check("C: validate_observability_ready must succeed", r["validate_observability_ready"]["result"] == "success")
+
+# Scenario J: the single authorization itself fails or is cancelled -> no application mutation job is eligible anywhere downstream.
+for bad_result in ("failure", "cancelled"):
+    ctx = base_context("true")
+    r = simulate(ctx, {"goldengate_deploy_authorization": bad_result})
+    check(f"J: goldengate_deploy_authorization must report {bad_result}", r["goldengate_deploy_authorization"]["result"] == bad_result)
+    check(f"J: reconcile_argocd must be skipped when authorization is {bad_result}", r["reconcile_argocd"]["result"] == "skipped")
+    check(f"J: validate_argocd_ready must be skipped when authorization is {bad_result}", r["validate_argocd_ready"]["result"] == "skipped")
+    check(f"J: platform_sync_once must be skipped when authorization is {bad_result}", r["platform_sync_once"]["result"] == "skipped")
+    check(f"J: build_publish_and_deploy must be skipped when authorization is {bad_result}", r["build_publish_and_deploy"]["result"] == "skipped")
+
+if failures:
+    print("\n".join(failures))
+    sys.exit(1)
+print("OK")
+PYEOF
+)"
+  MAIN_SCENARIOS_STATUS=$?
+  set -e
+  if [ "$MAIN_SCENARIOS_STATUS" -eq 0 ]; then
+    pass "Scenario A: action=validate never creates the goldengate_deploy_authorization approval and never runs reconcile_argocd/build_publish_and_deploy"
+    pass "Scenario B: deploy=true + Argo CD RECONCILABLE runs the single authorization, reconciles Argo CD, converges to HEALTHY, and leaves the whole rollout eligible"
+    pass "Scenario C: Platform ABSENT + Observability ABSENT (the real live incident) are both covered by the SAME single authorization, with no operator interaction required between them"
+    pass "Scenario J: a failed or cancelled goldengate_deploy_authorization leaves no application mutation job eligible anywhere downstream"
+  else
+    fail "Live Deployment Approval Topology Fix Scenarios A/B/C/J: MAIN-side simulation found violation(s): ${MAIN_SCENARIOS_OUT}"
+  fi
+else
+  skip "Live Deployment Approval Topology Fix Scenarios A/B/C/J: MAIN-side simulation -- python3/PyYAML unavailable"
+fi
+
+# Scenario D: MAIN's runtime deployment matrix (build_publish_and_deploy) and its two supporting matrix jobs (runtime_ownership_preflight, validate_active_runtimes) no longer carry a per-runtime job-level environment: -- a future N-runtime rollout generates ONE approval total (goldengate_deploy_authorization), never N.
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  set +e
+  MAIN_ENV_COUNT_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import sys
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+
+envs = [name for name, job in doc["jobs"].items() if isinstance(job, dict) and job.get("environment") is not None]
+if envs == ["goldengate_deploy_authorization"]:
+    print("OK")
+else:
+    print("FAIL " + repr(envs))
+PYEOF
+)"
+  MAIN_ENV_COUNT_STATUS=$?
+  set -e
+  if [ "$MAIN_ENV_COUNT_STATUS" -eq 0 ] && [ "$MAIN_ENV_COUNT_OUT" = "OK" ]; then
+    pass "Scenario D: MAIN has exactly one job-level environment: key (goldengate_deploy_authorization) -- a future N-runtime matrix rollout generates ONE approval total, never one per runtime"
+  else
+    fail "Scenario D: MAIN's job-level environment: inventory regressed: ${MAIN_ENV_COUNT_OUT}"
+  fi
+else
+  skip "Scenario D: MAIN job-level environment: inventory -- python3/PyYAML unavailable"
+fi
+
+# Scenarios E/F/G/H/I: the four specialist reusable workflows' own if: expressions are simulated directly (a fresh, small parser supporting inputs.<name>/needs.<job>.result/always(), since these workflows' conditions reference inputs.orchestrated_by_main -- a shape the MAIN-side parser above never needs).
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  set +e
+  SPECIALIST_SCENARIOS_OUT="$(python3 - "$REPO_ROOT" <<'PYEOF'
+import os
+import re
+import sys
+import yaml
+
+repo_root = sys.argv[1]
+wf_dir = os.path.join(repo_root, ".github", "workflows")
+
+
+def load_jobs(filename):
+    with open(os.path.join(wf_dir, filename)) as f:
+        doc = yaml.safe_load(f)
+    return doc["jobs"]
+
+
+def extract_if(jobs, job_name):
+    raw = jobs[job_name].get("if", "true")
+    raw = str(raw).strip()
+    if raw.startswith("${{") and raw.endswith("}}"):
+        raw = raw[3:-2].strip()
+    return raw
+
+
+class Parser:
+    """Same tiny GHA expression subset as the MAIN-side parser, extended with inputs.<name> and bare true/false literals -- the two shapes 20/30/40/50-sub-*.yaml's own if: expressions actually use that MAIN's needs.<job>.outputs.<name>-only parser does not."""
+
+    def __init__(self, expr, ctx):
+        self.expr = expr
+        self.ctx = ctx
+        self.pos = 0
+
+    def _skip_ws(self):
+        while self.pos < len(self.expr) and self.expr[self.pos].isspace():
+            self.pos += 1
+
+    def parse(self):
+        result = self._or()
+        self._skip_ws()
+        if self.pos != len(self.expr):
+            raise ValueError(f"trailing content: {self.expr[self.pos:]!r}")
+        return result
+
+    def _or(self):
+        left = self._and()
+        self._skip_ws()
+        while self.expr[self.pos:self.pos + 2] == "||":
+            self.pos += 2
+            right = self._and()
+            left = left or right
+            self._skip_ws()
+        return left
+
+    def _and(self):
+        left = self._atom()
+        self._skip_ws()
+        while self.expr[self.pos:self.pos + 2] == "&&":
+            self.pos += 2
+            right = self._atom()
+            left = left and right
+            self._skip_ws()
+        return left
+
+    def _atom(self):
+        self._skip_ws()
+        if self.expr[self.pos] == "(":
+            self.pos += 1
+            val = self._or()
+            self._skip_ws()
+            assert self.expr[self.pos] == ")"
+            self.pos += 1
+            return val
+        if self.expr[self.pos:self.pos + 8] == "always()":
+            self.pos += 8
+            return True
+        left_val = self._value()
+        self._skip_ws()
+        op = self.expr[self.pos:self.pos + 2]
+        if op in ("==", "!="):
+            self.pos += 2
+            right_val = self._value()
+            return left_val == right_val if op == "==" else left_val != right_val
+        return bool(left_val)
+
+    def _value(self):
+        self._skip_ws()
+        if self.expr[self.pos] == "'":
+            self.pos += 1
+            start = self.pos
+            while self.expr[self.pos] != "'":
+                self.pos += 1
+            val = self.expr[start:self.pos]
+            self.pos += 1
+            return val
+        if self.expr[self.pos:self.pos + 4] == "true" and not (self.expr[self.pos + 4:self.pos + 5] or "").isalnum():
+            self.pos += 4
+            return True
+        if self.expr[self.pos:self.pos + 5] == "false" and not (self.expr[self.pos + 5:self.pos + 6] or "").isalnum():
+            self.pos += 5
+            return False
+        m = re.match(r"needs\.([A-Za-z0-9_]+)\.result", self.expr[self.pos:])
+        if m:
+            self.pos += m.end()
+            return self.ctx.get("needs", {}).get(m.group(1), {}).get("result", "")
+        m = re.match(r"inputs\.([A-Za-z0-9_]+)", self.expr[self.pos:])
+        if m:
+            self.pos += m.end()
+            return self.ctx.get("inputs", {}).get(m.group(1))
+        raise ValueError(f"cannot parse value at: {self.expr[self.pos:self.pos + 40]!r}")
+
+
+def eval_if(expr, ctx):
+    return bool(Parser(expr, ctx).parse())
+
+
+failures = []
+
+
+def check(label, condition):
+    if not condition:
+        failures.append(label)
+
+
+# Scenario E: 50-sub-monitor.yaml called by MAIN (orchestrated_by_main=true) -- neither implementation job depends on the (skipped) standalone gate being success.
+jobs = load_jobs("50-sub-monitor.yaml")
+ctx = {"inputs": {"orchestrated_by_main": True}, "needs": {}}
+would_run_auth = eval_if(extract_if(jobs, "standalone_deploy_authorization"), ctx)
+check("E: standalone_deploy_authorization must be skipped when orchestrated_by_main=true", would_run_auth is False)
+ctx["needs"]["standalone_deploy_authorization"] = {"result": "skipped"}
+would_run_ensure = eval_if(extract_if(jobs, "ensure_monitor_image"), ctx)
+check("E: ensure_monitor_image must still run when orchestrated_by_main=true despite the skipped standalone gate", would_run_ensure is True)
+ctx["needs"]["ensure_monitor_image"] = {"result": "success"}
+would_run_build = eval_if(extract_if(jobs, "build_publish_and_deploy"), ctx)
+check("E: build_publish_and_deploy must still run when orchestrated_by_main=true despite the skipped standalone gate", would_run_build is True)
+
+# Scenarios F/G/H: direct standalone workflow_dispatch runs of 20/30/40 -- orchestrated_by_main is absent (defaults false), the standalone authorization references inputs.environment, and the implementation job cannot run before that authorization succeeds.
+for filename, impl_job in [
+    ("20-sub-argocd.yaml", "build_publish_and_deploy"),
+    ("30-sub-platform.yaml", "package_publish_and_deploy"),
+    ("40-sub-observability.yaml", "validate_and_deploy"),
+]:
+    jobs = load_jobs(filename)
+    auth_job = jobs["standalone_deploy_authorization"]
+    check(f"F/G/H ({filename}): standalone_deploy_authorization references inputs.environment", auth_job.get("environment") == "${{ inputs.environment }}")
+    ctx = {"inputs": {"orchestrated_by_main": False}, "needs": {}}
+    would_run_auth = eval_if(extract_if(jobs, "standalone_deploy_authorization"), ctx)
+    check(f"F/G/H ({filename}): standalone_deploy_authorization must run for a direct standalone dispatch", would_run_auth is True)
+    ctx["needs"]["standalone_deploy_authorization"] = {"result": ""}
+    would_run_impl_pending = eval_if(extract_if(jobs, impl_job), ctx)
+    check(f"F/G/H ({filename}): {impl_job} must not run before standalone authorization succeeds", would_run_impl_pending is False)
+    ctx["needs"]["standalone_deploy_authorization"] = {"result": "success"}
+    would_run_impl_ok = eval_if(extract_if(jobs, impl_job), ctx)
+    check(f"F/G/H ({filename}): {impl_job} becomes eligible once standalone authorization succeeds", would_run_impl_ok is True)
+    for bad_result in ("failure", "cancelled"):
+        ctx["needs"]["standalone_deploy_authorization"] = {"result": bad_result}
+        would_run_impl_bad = eval_if(extract_if(jobs, impl_job), ctx)
+        check(f"F/G/H ({filename}): {impl_job} must not run when standalone authorization is {bad_result}", would_run_impl_bad is False)
+
+# Scenario I: a direct standalone 50-sub-monitor.yaml run -- exactly one standalone approval gate covers BOTH implementation jobs, never one per internal job.
+jobs = load_jobs("50-sub-monitor.yaml")
+ctx = {"inputs": {"orchestrated_by_main": False}, "needs": {"standalone_deploy_authorization": {"result": "failure"}}}
+would_run_ensure = eval_if(extract_if(jobs, "ensure_monitor_image"), ctx)
+check("I: ensure_monitor_image must not run when the single standalone authorization failed", would_run_ensure is False)
+ctx["needs"]["ensure_monitor_image"] = {"result": "skipped"}
+would_run_build = eval_if(extract_if(jobs, "build_publish_and_deploy"), ctx)
+check("I: build_publish_and_deploy must not run when the single standalone authorization failed", would_run_build is False)
+
+ctx = {"inputs": {"orchestrated_by_main": False}, "needs": {"standalone_deploy_authorization": {"result": "success"}}}
+would_run_ensure_ok = eval_if(extract_if(jobs, "ensure_monitor_image"), ctx)
+check("I: ensure_monitor_image becomes eligible once the single standalone authorization succeeds", would_run_ensure_ok is True)
+ctx["needs"]["ensure_monitor_image"] = {"result": "success"}
+would_run_build_ok = eval_if(extract_if(jobs, "build_publish_and_deploy"), ctx)
+check("I: build_publish_and_deploy becomes eligible once the single standalone authorization succeeds (via ensure_monitor_image)", would_run_build_ok is True)
+
+if failures:
+    print("\n".join(failures))
+    sys.exit(1)
+print("OK")
+PYEOF
+)"
+  SPECIALIST_SCENARIOS_STATUS=$?
+  set -e
+  if [ "$SPECIALIST_SCENARIOS_STATUS" -eq 0 ]; then
+    pass "Scenario E: 50-sub-monitor.yaml called with orchestrated_by_main=true runs both implementation jobs without either depending on a second approval"
+    pass "Scenarios F/G/H: standalone 20/30/40-sub-*.yaml dispatch each retain exactly one standalone authorization referencing inputs.environment, and their implementation job cannot run before it succeeds"
+    pass "Scenario I: a direct standalone 50-sub-monitor.yaml run has exactly one standalone approval gate covering both ensure_monitor_image and build_publish_and_deploy"
+  else
+    fail "Live Deployment Approval Topology Fix Scenarios E/F/G/H/I: specialist-side simulation found violation(s): ${SPECIALIST_SCENARIOS_OUT}"
+  fi
+else
+  skip "Live Deployment Approval Topology Fix Scenarios E/F/G/H/I: specialist-side simulation -- python3/PyYAML unavailable"
+fi
+
+# Strict YAML parse (duplicate-key rejection) plus bash -n across every run: block in the five workflow files this fix touched -- never trusting the earlier grep-based proofs alone as the primary semantic evidence.
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  set +e
+  STRICT_PARSE_OUT="$(python3 - "$REPO_ROOT" <<'PYEOF'
+import os
+import subprocess
+import sys
+import yaml
+
+repo_root = sys.argv[1]
+wf_dir = os.path.join(repo_root, ".github", "workflows")
+touched = [
+    "00-main-goldengate-orchestrator.yaml",
+    "20-sub-argocd.yaml",
+    "30-sub-platform.yaml",
+    "40-sub-observability.yaml",
+    "50-sub-monitor.yaml",
+]
+
+
+class DupKeyLoader(yaml.SafeLoader):
+    pass
+
+
+def construct_mapping_no_dup(loader, node, deep=False):
+    mapping = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise yaml.constructor.ConstructorError(None, None, f"found duplicate key {key!r}", key_node.start_mark)
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+DupKeyLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, construct_mapping_no_dup)
+
+problems = []
+for filename in touched:
+    path = os.path.join(wf_dir, filename)
+    with open(path) as f:
+        try:
+            doc = yaml.load(f, Loader=DupKeyLoader)
+        except yaml.YAMLError as e:
+            problems.append(f"{filename}: YAML parse error (possible duplicate key): {e}")
+            continue
+
+    def walk_run_blocks(obj):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k == "run" and isinstance(v, str):
+                    yield v
+                else:
+                    yield from walk_run_blocks(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                yield from walk_run_blocks(item)
+
+    for i, script in enumerate(walk_run_blocks(doc.get("jobs") or {})):
+        proc = subprocess.run(["bash", "-n"], input=script, capture_output=True, text=True)
+        if proc.returncode != 0:
+            problems.append(f"{filename}: run: block #{i} fails bash -n: {proc.stderr.strip()}")
+
+if problems:
+    print("\n".join(problems))
+    sys.exit(1)
+print("OK")
+PYEOF
+)"
+  STRICT_PARSE_STATUS=$?
+  set -e
+  if [ "$STRICT_PARSE_STATUS" -eq 0 ] && [ "$STRICT_PARSE_OUT" = "OK" ]; then
+    pass "Live Deployment Approval Topology Fix: all five touched workflow files parse with strict duplicate-key rejection and every extracted run: block passes bash -n"
+  else
+    fail "Live Deployment Approval Topology Fix: strict YAML/bash -n proof failed:"$'\n'"${STRICT_PARSE_OUT}"
+  fi
+else
+  skip "Live Deployment Approval Topology Fix: strict YAML/bash -n proof -- python3/PyYAML unavailable"
+fi
+
+# The corporate Terraform governance boundary (10-sub-iam-secrets.yaml) is confirmed untouched by this fix -- its own manual approval, override_noncompliance/override_reason break-glass inputs, and the reusable workflow it calls remain exactly as before.
+if grep -qF "uses: AbuDhabiCommercialBank/adcb-reusable-workflows/.github/workflows/aws-terraform-apply.yaml@main" .github/workflows/10-sub-iam-secrets.yaml \
+  && grep -qF "override_noncompliance: \${{ needs.validate_environment_config.outputs.terraform_governance_override == 'true' }}" .github/workflows/10-sub-iam-secrets.yaml \
+  && grep -qF "override_reason: \${{ needs.validate_environment_config.outputs.terraform_governance_override_reason }}" .github/workflows/10-sub-iam-secrets.yaml; then
+  pass "10-sub-iam-secrets.yaml's corporate Terraform governance boundary (manual approval, override_noncompliance/override_reason break-glass) remains present and unchanged"
+else
+  fail "10-sub-iam-secrets.yaml's corporate Terraform governance boundary appears to have changed"
+fi
+
+# The three independent OPS workflows remain outside this fix's application authorization invariant -- MAIN never calls them, and they retain their own independent job-level environment: protection.
+OPS_CALLED_FROM_MAIN="$(grep -c "uses: \./\.github/workflows/\(80-ops\|90-ops\|91-ops\)" "$EKS_APP_WORKFLOW" || true)"
+if [ "${OPS_CALLED_FROM_MAIN:-0}" -eq 0 ]; then
+  pass "MAIN never calls 80-ops-monitor-metrics-config.yaml/90-ops-observability-artifact-sync.yaml/91-ops-ecr-image-sync.yaml -- their own independent environment: protection remains a separate operator action"
+else
+  fail "MAIN unexpectedly calls one or more OPS workflows -- the application authorization invariant may have leaked into them"
 fi
 
 echo ""
