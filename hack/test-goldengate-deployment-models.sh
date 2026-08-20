@@ -4198,6 +4198,94 @@ else
   pass "no redundant helm/argocd/charts/argo-cd-9.3.7.tgz package exists -- only the unpacked vendored directory remains"
 fi
 
+echo ""
+echo "--- Live Network Fix 1: Argo ECR token-sync deterministic regional STS path ---"
+
+# Real VDR failure: the in-cluster argocd-ecr-token-sync Job's `aws sts get-caller-identity` call hung because neither AWS_DEFAULT_REGION nor AWS_STS_REGIONAL_ENDPOINTS was set, so the AWS SDK/CLI fell back to the legacy global sts.amazonaws.com endpoint, which is not reachable from this private network -- the corporate network team confirmed sts.eu-west-1.amazonaws.com IS reachable. REALLY RENDER the real Helm chart (never a reimplementation) with the exact same --set-string overrides 20-sub-argocd.yaml itself uses, resolved through the same canonical environment resolver, then structurally parse the rendered CronJob/ServiceAccount YAML.
+if [ "$HELM_AVAILABLE" = "true" ] && [ "$PYTHON_AVAILABLE" = "true" ] && [ -d "helm/argocd/charts/argo-cd" ]; then
+  ECR_TOKEN_SYNC_ROLE_ARN="$(python3 "$ENVIRONMENT_TOOL" --environment dev get ARGOCD_ECR_READ_ROLE_ARN)"
+  ECR_TOKEN_SYNC_ECR_REGISTRY="$(python3 "$ENVIRONMENT_TOOL" --environment dev get ECR_REGISTRY)"
+
+  set +e
+  helm template argocd-ecr-token-sync-check helm/argocd --namespace argocd \
+    -f envs/dev/argocd/values.yaml \
+    --set-string ecrTokenSync.roleArn="${ECR_TOKEN_SYNC_ROLE_ARN}" \
+    --set-string ecrTokenSync.awsRegion="${RESOLVED_AWS_REGION}" \
+    --set-string ecrTokenSync.ecrRegistry="${ECR_TOKEN_SYNC_ECR_REGISTRY}" \
+    >"${WORKDIR}/ecr-token-sync-render.yaml" 2>"${WORKDIR}/ecr-token-sync-render.err"
+  ECR_TOKEN_SYNC_RENDER_STATUS=$?
+  set -e
+
+  if [ "$ECR_TOKEN_SYNC_RENDER_STATUS" -ne 0 ]; then
+    fail "Live Network Fix 1: helm template of the argocd wrapper chart (ecrTokenSync enabled) failed"
+    cat "${WORKDIR}/ecr-token-sync-render.err"
+  else
+    LIVE_NET_FIX_1_CHECK="$(python3 - "${WORKDIR}/ecr-token-sync-render.yaml" "$RESOLVED_AWS_REGION" "$ECR_TOKEN_SYNC_ROLE_ARN" <<'PYEOF'
+import sys
+
+import yaml
+
+render_path, expected_region, expected_role_arn = sys.argv[1], sys.argv[2], sys.argv[3]
+
+with open(render_path) as f:
+    docs = list(yaml.safe_load_all(f))
+
+results = []
+
+cronjob = next((d for d in docs if d and d.get("kind") == "CronJob" and d.get("metadata", {}).get("name") == "argocd-ecr-token-sync"), None)
+results.append(("1: the rendered manifest set contains the argocd-ecr-token-sync CronJob", cronjob is not None))
+
+if cronjob is not None:
+    pod_spec = cronjob["spec"]["jobTemplate"]["spec"]["template"]["spec"]
+    containers = pod_spec["containers"]
+    ecr_container = next((c for c in containers if c.get("name") == "ecr-token-sync"), None)
+    results.append(("2: the CronJob pod template defines the ecr-token-sync container", ecr_container is not None))
+
+    if ecr_container is not None:
+        env_list = ecr_container.get("env", [])
+        env = {e["name"]: e.get("value") for e in env_list if "value" in e}
+        env_names = [e["name"] for e in env_list]
+        command_text = "\n".join(ecr_container.get("command", []))
+
+        results.append((f"3: AWS_REGION == the configured environment region (got {env.get('AWS_REGION')!r})", env.get("AWS_REGION") == expected_region))
+        results.append((f"4: AWS_DEFAULT_REGION == the configured environment region (got {env.get('AWS_DEFAULT_REGION')!r})", env.get("AWS_DEFAULT_REGION") == expected_region))
+        results.append(("5: AWS_STS_REGIONAL_ENDPOINTS == 'regional'", env.get("AWS_STS_REGIONAL_ENDPOINTS") == "regional"))
+        results.append(("6: AWS_EC2_METADATA_DISABLED == 'true' (unchanged)", env.get("AWS_EC2_METADATA_DISABLED") == "true"))
+
+        endpoint_override_names = [n for n in env_names if n.startswith("AWS_ENDPOINT_URL") or n == "AWS_STS_ENDPOINT"]
+        results.append(("7: no AWS_ENDPOINT_URL*/AWS_STS_ENDPOINT override was introduced", endpoint_override_names == []))
+
+        hardcoded_sts_urls = ["sts.amazonaws.com", f"sts.{expected_region}.amazonaws.com"]
+        hardcoded_hit = any(u in (env.get(n) or "") for n in env_names for u in hardcoded_sts_urls) or any(u in command_text for u in hardcoded_sts_urls)
+        results.append(("8: no literal sts.amazonaws.com / sts.<region>.amazonaws.com URL is hardcoded in the container env values or command script -- regional endpoint selection is the normal AWS SDK/CLI behavior driven only by AWS_REGION/AWS_DEFAULT_REGION/AWS_STS_REGIONAL_ENDPOINTS", not hardcoded_hit))
+
+        forbidden_static_cred_names = {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"}
+        results.append(("9: no static AWS credential environment variable was introduced", not (forbidden_static_cred_names & set(env_names))))
+
+    results.append(("10: the CronJob pod spec still uses serviceAccountName argocd-ecr-token-sync", pod_spec.get("serviceAccountName") == "argocd-ecr-token-sync"))
+
+sa = next((d for d in docs if d and d.get("kind") == "ServiceAccount" and d.get("metadata", {}).get("name") == "argocd-ecr-token-sync"), None)
+results.append(("11: the argocd-ecr-token-sync ServiceAccount is still rendered", sa is not None))
+if sa is not None:
+    annotations = sa.get("metadata", {}).get("annotations") or {}
+    results.append((f"12: the ServiceAccount still carries eks.amazonaws.com/role-arn == {expected_role_arn!r}", annotations.get("eks.amazonaws.com/role-arn") == expected_role_arn))
+    results.append(("13: no eks.amazonaws.com/sts-regional-endpoints annotation or Pod Identity (eks.amazonaws.com/compute-type) annotation was introduced on the ServiceAccount -- the explicit container env vars are the sole, non-duplicated mechanism", "eks.amazonaws.com/sts-regional-endpoints" not in annotations and "eks.amazonaws.com/compute-type" not in annotations))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+    while IFS= read -r line; do
+      case "$line" in
+        FAIL\ *) fail "Live Network Fix 1: ${line#FAIL }" ;;
+        OK\ *) pass "Live Network Fix 1: ${line#OK }" ;;
+      esac
+    done <<< "$LIVE_NET_FIX_1_CHECK"
+  fi
+else
+  skip "Live Network Fix 1: Argo ECR token-sync regional STS structural render check -- helm/python3 unavailable or helm/argocd/charts/argo-cd missing"
+fi
+
 # 26. EFS rendered-resource validation: strict basePath derivation (matching goldengate.efsBasePath), fail-closed YAML parsing, no fragile grep on an optional key under set -euo pipefail.
 echo ""
 echo "--- EFS persistence validation: basePath derivation, strict parsing, StorageClass/PVC checks ---"
@@ -9058,10 +9146,11 @@ else
   fail "13: the EFS decommission hold changed"
 fi
 
-# 14: centralization regression sweep -- outside envs/dev/environment.yaml (canonical) and envs/dev/policies/** (generated), no first-party PRODUCTION .tf/.py source may independently hardcode the real current workload/build account IDs, region, cluster name, or OIDC host. Excludes: .git, vendored Argo CD chart source, every test file (test-*.py/test_*.py/*/tests/* -- synthetic fixture values are explicitly permitted per this repo's own convention, never confused with production hardcoding), and the generated envs/dev/policies/** output itself. hack/goldengate-environment.py (the generator) is deliberately NOT excluded: it builds every generated policy purely from derive_values(doc), so a real account ID appearing in its source would itself be a centralization leak.
+# 14: centralization regression sweep -- outside envs/dev/environment.yaml (canonical) and envs/dev/policies/** (generated), no first-party PRODUCTION .tf/.py source may independently hardcode the real current workload/build account IDs, region, cluster name, or OIDC host. Excludes: .git, vendored Argo CD chart source, Infra-repo/ (a logically independent Cloud Factory infrastructure repository physically nested under this checkout -- its own corporate/screenshot-reconstructed Terraform source is out of this application repo's centralization contract entirely, never something this sweep should "fix"), every test file (test-*.py/test_*.py/*/tests/* -- synthetic fixture values are explicitly permitted per this repo's own convention, never confused with production hardcoding), and the generated envs/dev/policies/** output itself. hack/goldengate-environment.py (the generator) is deliberately NOT excluded: it builds every generated policy purely from derive_values(doc), so a real account ID appearing in its source would itself be a centralization leak.
 CENTRALIZATION_HITS="$(grep -rlE '668311715351|229410149234' --include='*.tf' --include='*.py' . 2>/dev/null \
   | grep -vF '.git/' \
   | grep -vF 'helm/argocd/charts/' \
+  | grep -vF 'Infra-repo/' \
   | grep -vE '(^|/)test[-_][^/]*\.py$' \
   | grep -vF '/tests/' \
   | grep -vF 'envs/dev/environment.tf' \

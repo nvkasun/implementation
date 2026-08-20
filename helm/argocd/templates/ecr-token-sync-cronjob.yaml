@@ -53,6 +53,11 @@ spec:
               env:
                 - name: AWS_REGION
                   value: {{ .Values.ecrTokenSync.awsRegion | quote }}
+                # Deterministic regional STS path (matches goldengate-monitor/fluent-bit's own established pattern): the corporate network provides AWS STS centrally, reachable in-VPC only via the REGIONAL sts.<region>.amazonaws.com endpoint -- the AWS SDK/CLI default to the legacy global sts.amazonaws.com endpoint unless both of these are set, and that global endpoint is not reachable from this private network.
+                - name: AWS_DEFAULT_REGION
+                  value: {{ .Values.ecrTokenSync.awsRegion | quote }}
+                - name: AWS_STS_REGIONAL_ENDPOINTS
+                  value: "regional"
                 - name: ECR_REGISTRY
                   value: {{ .Values.ecrTokenSync.ecrRegistry | quote }}
                 - name: POD_NAMESPACE
