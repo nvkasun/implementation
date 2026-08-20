@@ -505,12 +505,21 @@ jobs:
 
           echo "$CLASSIFIER_OUTPUT"
 
+          # Live Argo Self-Recovery Fix: a stable compatibility marker, checked before the state value is ever trusted -- guards against this orchestrator being paired with a version-skewed hack/orchestration/argocd_state.py (for example an older copy that predates RECONCILABLE), never itself the operational recovery path for repository Secret drift.
+          CONTRACT="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("contract", ""))' <<< "$CLASSIFIER_OUTPUT")"
+          EXPECTED_CONTRACT="argocd-recovery-v1"
+          if [ "$CONTRACT" != "$EXPECTED_CONTRACT" ]; then
+            echo "FAIL: the Argo CD classifier's contract marker is '${CONTRACT}', expected '${EXPECTED_CONTRACT}'. hack/orchestration/argocd_state.py and this orchestrator have drifted out of sync -- fix the version skew, this is never the operational recovery path for repository Secret drift."
+            exit 1
+          fi
+
           STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
           echo "Argo CD prerequisite state: ${STATE}"
           echo "state=${STATE}" >> "$GITHUB_OUTPUT"
 
+          # ABSENT/HEALTHY/RECONCILABLE all succeed here -- MAIN owns automatic reconciliation for every one of them (see reconcile_argocd below). Only BROKEN is not auto-repaired: it fails closed for genuine investigation, never presented as a normal recovery path for deterministic, application-owned repository Secret drift (that case classifies RECONCILABLE, not BROKEN, and is handled automatically).
           if [ "$STATE" = "BROKEN" ]; then
-            echo "FAIL: Argo CD prerequisite state is BROKEN. This is not auto-repaired here -- investigate the diagnostics above and repair Argo CD (or run 20 | SUB | Argo CD -- .github/workflows/20-sub-argocd.yaml -- standalone) before re-running."
+            echo "FAIL: Argo CD prerequisite state is BROKEN -- an unsafe or ambiguous condition that is not auto-repaired. Investigate the diagnostics above before re-running MAIN."
             exit 1
           fi
 
@@ -620,6 +629,14 @@ jobs:
           fi
 
           echo "$CLASSIFIER_OUTPUT"
+
+          # Live Argo Self-Recovery Fix: same compatibility guard as argocd_preflight's own classify step -- checked before the state value is trusted here too.
+          CONTRACT="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("contract", ""))' <<< "$CLASSIFIER_OUTPUT")"
+          EXPECTED_CONTRACT="argocd-recovery-v1"
+          if [ "$CONTRACT" != "$EXPECTED_CONTRACT" ]; then
+            echo "FAIL: the Argo CD classifier's contract marker is '${CONTRACT}', expected '${EXPECTED_CONTRACT}'. hack/orchestration/argocd_state.py and this orchestrator have drifted out of sync -- fix the version skew."
+            exit 1
+          fi
 
           STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
 
@@ -2874,9 +2891,7 @@ jobs:
           kubectl get crd applications.argoproj.io >/dev/null || {
             echo "CRD applications.argoproj.io not found."
             echo "Argo CD prerequisite is not healthy."
-            echo "This orchestrator's own argocd_preflight/reconcile_argocd/validate_argocd_ready jobs normally classify and reconcile Argo CD before this stage runs -- this check is defense in depth, not the primary gate."
-            echo "For standalone repair/reconciliation use:"
-            echo "  20 | SUB | Argo CD (.github/workflows/20-sub-argocd.yaml)"
+            echo "This orchestrator's own argocd_preflight/reconcile_argocd/validate_argocd_ready jobs already classify and automatically reconcile Argo CD, and required validate_argocd_ready to converge to exactly HEALTHY before this stage could ever be reached -- this check is defense in depth against an unexpected mid-DAG loss of the CRD, never the normal recovery path. Re-running 00 | MAIN (.github/workflows/00-main-goldengate-orchestrator.yaml) re-classifies and automatically reconciles Argo CD; it is the operational entry point, not a standalone specialist-workflow dispatch."
             exit 1
           }
 

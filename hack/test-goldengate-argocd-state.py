@@ -258,6 +258,22 @@ class ArgoCdStateClassifierTests(unittest.TestCase):
         self.assertTrue(any("Secret argocd-ecr-goldengate-oci does not exist" in r for r in result["reasons"]))
         self.assertTrue(any("deployment/argocd-server not ready" in r for r in result["reasons"]))
 
+    def test_all_four_repository_secrets_missing_plus_one_unsafe_component_stays_broken(self):
+        # Live Argo Self-Recovery Fix: the exact broader shape called out explicitly -- all four repository Secrets missing (the real incident's own Secret drift) PLUS one unhealthy core component (here, the application-controller StatefulSet) must still classify BROKEN, never RECONCILABLE, no matter how much of the drift is otherwise safe.
+        cluster = FakeCluster()
+        _populate_healthy_cluster(cluster)
+        for secret_name in argocd_state.REQUIRED_REPO_SECRETS:
+            cluster.objects.pop(("secret", secret_name, NAMESPACE))
+        not_ready = _ready_replicaset_like("argocd-application-controller")
+        not_ready["status"]["currentReplicas"] = 0
+        cluster.put("statefulset", "argocd-application-controller", NAMESPACE, not_ready)
+        result = _classify(cluster)
+        self.assertEqual(result["state"], argocd_state.STATE_BROKEN)
+        self.assertEqual(len(result["reasons"]), 5)
+        for secret_name in argocd_state.REQUIRED_REPO_SECRETS:
+            self.assertTrue(any(f"Secret {secret_name} does not exist" in r for r in result["reasons"]))
+        self.assertTrue(any("statefulset/argocd-application-controller not ready" in r for r in result["reasons"]))
+
     def test_all_required_components_healthy(self):
         cluster = FakeCluster()
         _populate_healthy_cluster(cluster)
@@ -323,6 +339,22 @@ class ArgoCdStateClassifierTests(unittest.TestCase):
         result = _classify(cluster)
         self.assertEqual(result["state"], argocd_state.STATE_RECONCILABLE)
         self.assertTrue(any("secret-type=repository" in r for r in result["reasons"]))
+
+    def test_classifier_contract_marker_present_on_every_result(self):
+        # Live Argo Self-Recovery Fix: the classifier always stamps its own stable compatibility marker (CLASSIFIER_CONTRACT) onto every result shape, across every state -- ABSENT (the early-return path), HEALTHY, and RECONCILABLE (the two different late-return paths) -- so a caller can fail closed on a version-skewed classifier before ever trusting its state value. This is a compatibility guard only, never itself the operational recovery mechanism for repository Secret drift.
+        self.assertTrue(argocd_state.CLASSIFIER_CONTRACT)
+        absent_result = _classify(FakeCluster())
+        self.assertEqual(absent_result["contract"], argocd_state.CLASSIFIER_CONTRACT)
+        healthy_cluster = FakeCluster()
+        _populate_healthy_cluster(healthy_cluster)
+        healthy_result = _classify(healthy_cluster)
+        self.assertEqual(healthy_result["contract"], argocd_state.CLASSIFIER_CONTRACT)
+        reconcilable_cluster = FakeCluster()
+        _populate_healthy_cluster(reconcilable_cluster)
+        reconcilable_cluster.objects.pop(("secret", "argocd-ecr-goldengate-oci", NAMESPACE))
+        reconcilable_result = _classify(reconcilable_cluster)
+        self.assertEqual(reconcilable_result["state"], argocd_state.STATE_RECONCILABLE)
+        self.assertEqual(reconcilable_result["contract"], argocd_state.CLASSIFIER_CONTRACT)
 
 
 class ArgoCdStateNoMutationSourceSweepTests(unittest.TestCase):

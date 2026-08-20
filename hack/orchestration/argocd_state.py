@@ -50,6 +50,9 @@ STATE_HEALTHY = "HEALTHY"
 STATE_RECONCILABLE = "RECONCILABLE"
 STATE_BROKEN = "BROKEN"
 
+# Stable compatibility marker, not an operational recovery mechanism: lets a caller (00-main-goldengate-orchestrator.yaml) fail closed if it is ever paired with a classifier source whose state semantics have drifted (e.g. an older copy of this file that predates RECONCILABLE), rather than silently trusting a state value the caller's own if: expressions were never written to understand. Bump only when the {"state", ...} contract itself changes meaning.
+CLASSIFIER_CONTRACT = "argocd-recovery-v1"
+
 # Current chart/values contract (helm/argocd, envs/<environment>/argocd/values.yaml) -- verified against the real vendored chart's rendered output, never guessed.
 REQUIRED_CRDS = (
     "applications.argoproj.io",
@@ -143,7 +146,7 @@ def _statefulset_ready(obj):
 
 
 def classify(run, environment, namespace, ecr_registry, argocd_ecr_read_role_arn, ingress_enabled):
-    """Returns the stable {"state", "environment", "namespace", "reasons", "checks"} shape. Raises ClassifierInspectionError if Kubernetes access itself could not be trusted -- callers must let that propagate as a hard failure, never a downgrade to ABSENT."""
+    """Returns the stable {"contract", "state", "environment", "namespace", "reasons", "checks"} shape (contract == CLASSIFIER_CONTRACT). Raises ClassifierInspectionError if Kubernetes access itself could not be trusted -- callers must let that propagate as a hard failure, never a downgrade to ABSENT."""
     reasons = []
     # Subset of `reasons` that is safe to auto-repair via the existing reusable Argo specialist workflow's idempotent Helm chart reconciliation plus its own immediate bounded ECR token-sync validation step (which triggers a one-off Job from the already-correct CronJob and waits for it to (re)create the repository Secrets) -- never a broader "any drift is safe" carve-out. Only a missing/mislabeled/wrong-URL required repository Secret is added here; every other reason (core Argo footprint, ECR token-sync RBAC/identity, ingress) stays exclusively in `reasons` and therefore forces BROKEN below.
     reconcilable_reasons = []
@@ -159,7 +162,7 @@ def classify(run, environment, namespace, ecr_registry, argocd_ecr_read_role_arn
 
     # ABSENT: no meaningful footprint at all -- no namespace and no cluster-scoped Argo CRD.
     if not ns_found and not any_crd_found:
-        return {"state": STATE_ABSENT, "environment": environment, "namespace": namespace, "reasons": [], "checks": checks}
+        return {"contract": CLASSIFIER_CONTRACT, "state": STATE_ABSENT, "environment": environment, "namespace": namespace, "reasons": [], "checks": checks}
 
     if not ns_found:
         reasons.append(f"namespace {namespace} does not exist but at least one Argo CRD is registered cluster-wide")
@@ -266,7 +269,7 @@ def classify(run, environment, namespace, ecr_registry, argocd_ecr_read_role_arn
         state = STATE_RECONCILABLE
     else:
         state = STATE_BROKEN
-    return {"state": state, "environment": environment, "namespace": namespace, "reasons": reasons, "checks": checks}
+    return {"contract": CLASSIFIER_CONTRACT, "state": state, "environment": environment, "namespace": namespace, "reasons": reasons, "checks": checks}
 
 
 def main(argv=None):

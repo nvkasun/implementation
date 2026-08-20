@@ -10892,6 +10892,137 @@ else
 fi
 
 echo ""
+echo "--- Live Argo Self-Recovery Fix: MAIN preflight/final-convergence script execution + contract marker ---"
+
+# H/I/N: REALLY EXECUTE the committed "Classify Argo CD prerequisite state" (argocd_preflight) and "Re-classify and require Argo CD to be exactly HEALTHY" (validate_argocd_ready) step scripts (never a reimplementation) against a fake hack/orchestration/argocd_state.py stub shadowed via cwd, for every classifier state -- proving argocd_preflight succeeds (and publishes the right state= output) for ABSENT/HEALTHY/RECONCILABLE and fails for BROKEN (H/I), and that validate_argocd_ready's final convergence accepts ONLY exactly HEALTHY -- a reconcile_argocd that "succeeded" while the cluster is still RECONCILABLE (Secrets never actually got created) or BROKEN must still fail closed (N).
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  set +e
+  LIVE_ARGO_SELF_RECOVERY_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import os
+import subprocess
+import sys
+import tempfile
+
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+
+preflight_step = next((s for s in doc["jobs"]["argocd_preflight"]["steps"] if s.get("name") == "Classify Argo CD prerequisite state"), None)
+ready_step = next((s for s in doc["jobs"]["validate_argocd_ready"]["steps"] if s.get("name") == "Re-classify and require Argo CD to be exactly HEALTHY"), None)
+
+results = []
+if preflight_step is None:
+    results.append(("H/I: argocd_preflight defines its 'Classify Argo CD prerequisite state' step", False))
+if ready_step is None:
+    results.append(("N: validate_argocd_ready defines its 'Re-classify and require Argo CD to be exactly HEALTHY' step", False))
+
+STUB_TEMPLATE = '''import argparse, json, sys
+p = argparse.ArgumentParser()
+p.add_argument("--environment", required=True)
+p.add_argument("--kubectl-bin", default="kubectl")
+p.parse_args()
+print(json.dumps({{"contract": {contract!r}, "state": {state!r}, "environment": "dev", "namespace": "argocd", "reasons": [], "checks": {{}}}}))
+sys.exit(0)
+'''
+
+
+def run_step(script, state, contract="argocd-recovery-v1"):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tool_dir = os.path.join(tmp_dir, "hack", "orchestration")
+        os.makedirs(tool_dir)
+        with open(os.path.join(tool_dir, "argocd_state.py"), "w") as f:
+            f.write(STUB_TEMPLATE.format(contract=contract, state=state))
+        fd, gh_output_path = tempfile.mkstemp()
+        os.close(fd)
+        # PIP_BREAK_SYSTEM_PACKAGES=1: this local sandbox's system Python is PEP 668 externally-managed, so the real script's own unmodified "python3 -m pip install ... PyYAML==6.0.1" line (PyYAML is already satisfied here) would otherwise abort the whole extracted script under set -euo pipefail before it ever reaches the classify logic being tested -- never an issue on the real GitHub-hosted/CodeBuild runners this workflow actually targets.
+        env = {"PATH": os.environ.get("PATH", ""), "GG_SELECTED_ENVIRONMENT": "dev", "GITHUB_OUTPUT": gh_output_path, "PIP_BREAK_SYSTEM_PACKAGES": "1"}
+        proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, cwd=tmp_dir, timeout=30)
+        with open(gh_output_path) as f:
+            output_text = f.read()
+        os.unlink(gh_output_path)
+        return proc.returncode, output_text, proc.stdout + proc.stderr
+
+
+if preflight_step is not None:
+    preflight_script = preflight_step["run"]
+    for state in ("ABSENT", "HEALTHY", "RECONCILABLE"):
+        rc, out, log = run_step(preflight_script, state)
+        results.append((f"H: argocd_preflight succeeds for state={state} and publishes state={state} to $GITHUB_OUTPUT", rc == 0 and f"state={state}" in out))
+    rc, out, log = run_step(preflight_script, "BROKEN")
+    results.append(("I: argocd_preflight fails (non-zero exit) for state=BROKEN, never auto-repaired here", rc != 0))
+    rc, out, log = run_step(preflight_script, "HEALTHY", contract="stale-contract-v0")
+    results.append(("source-contract: argocd_preflight fails closed on a mismatched classifier contract marker, even for an otherwise-HEALTHY state", rc != 0 and "contract marker" in log))
+
+if ready_step is not None:
+    ready_script = ready_step["run"]
+    rc, out, log = run_step(ready_script, "HEALTHY")
+    results.append(("M: validate_argocd_ready's final convergence check succeeds for exactly HEALTHY", rc == 0))
+    rc, out, log = run_step(ready_script, "RECONCILABLE")
+    results.append(("N: validate_argocd_ready's final convergence check FAILS when reconcile_argocd \"succeeded\" but the cluster is still RECONCILABLE (repository Secrets never actually got created) -- reconciliation success alone is never trusted as HEALTHY", rc != 0))
+    rc, out, log = run_step(ready_script, "BROKEN")
+    results.append(("N: validate_argocd_ready's final convergence check FAILS for BROKEN too", rc != 0))
+    rc, out, log = run_step(ready_script, "HEALTHY", contract="stale-contract-v0")
+    results.append(("source-contract: validate_argocd_ready fails closed on a mismatched classifier contract marker, even for an otherwise-HEALTHY state", rc != 0 and "contract marker" in log))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  set -e
+  if [ -n "$LIVE_ARGO_SELF_RECOVERY_OUT" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        FAIL\ *) fail "Live Argo Self-Recovery Fix: ${line#FAIL }" ;;
+        OK\ *) pass "Live Argo Self-Recovery Fix: ${line#OK }" ;;
+      esac
+    done <<< "$LIVE_ARGO_SELF_RECOVERY_OUT"
+  else
+    fail "Live Argo Self-Recovery Fix: script-execution proof produced no output"
+  fi
+else
+  skip "Live Argo Self-Recovery Fix: script-execution proof -- python3/PyYAML unavailable or main workflow missing"
+fi
+
+# K/section-9: no active workflow presents standalone specialist-workflow execution as the normal recovery path for Argo CD; MAIN is the sole operational entry point.
+STALE_ARGO_STANDALONE_HITS="$(grep -rlE "20-sub-argocd\.yaml -- standalone|SUB \| Argo CD -- \.github" .github/workflows/*.yaml 2>/dev/null || true)"
+if [ -z "$STALE_ARGO_STANDALONE_HITS" ]; then
+  pass "Live Argo Self-Recovery Fix: K: no active workflow presents standalone execution of 20-sub-argocd.yaml as the normal Argo CD recovery path -- 00 | MAIN is the sole operational entry point"
+else
+  fail "Live Argo Self-Recovery Fix: K: a stale standalone-recovery suggestion remains in:"$'\n'"${STALE_ARGO_STANDALONE_HITS}"
+fi
+
+# Cross-check: the literal contract value MAIN compares against must equal hack/orchestration/argocd_state.py's own CLASSIFIER_CONTRACT constant -- a hardcoded but independently-verified pairing, never silently allowed to drift apart. Both argocd_preflight and validate_argocd_ready must independently pin the exact same literal.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$ARGOCD_STATE_TOOL" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  CONTRACT_CROSSCHECK="$(python3 - "$ARGOCD_STATE_TOOL" "$EKS_APP_WORKFLOW" <<'PYEOF'
+import re
+import sys
+
+tool_path, main_path = sys.argv[1], sys.argv[2]
+
+with open(tool_path) as f:
+    tool_src = f.read()
+match = re.search(r'CLASSIFIER_CONTRACT\s*=\s*"([^"]+)"', tool_src)
+tool_contract = match.group(1) if match else None
+
+with open(main_path) as f:
+    main_text = f.read()
+needle = 'EXPECTED_CONTRACT="' + tool_contract + '"' if tool_contract else None
+occurrences = main_text.count(needle) if needle else 0
+ok = bool(tool_contract) and occurrences >= 2
+print("OK" if ok else "FAIL tool_contract=" + repr(tool_contract))
+PYEOF
+)"
+  if [ "$CONTRACT_CROSSCHECK" = "OK" ]; then
+    pass "Live Argo Self-Recovery Fix: hack/orchestration/argocd_state.py's CLASSIFIER_CONTRACT matches the EXPECTED_CONTRACT literal MAIN compares against in both argocd_preflight and validate_argocd_ready"
+  else
+    fail "Live Argo Self-Recovery Fix: CLASSIFIER_CONTRACT/EXPECTED_CONTRACT mismatch or missing: ${CONTRACT_CROSSCHECK}"
+  fi
+else
+  skip "Live Argo Self-Recovery Fix: CLASSIFIER_CONTRACT cross-check -- python3/PyYAML unavailable or a required file is missing"
+fi
+
+echo ""
 echo "--- Phase B2: GoldenGate Platform + Observability prerequisite classification/conditional reconciliation ---"
 
 # hack/orchestration/platform_state.py and observability_state.py must never construct a mutating kubectl/helm command -- read directly from source, never from the test's own constants. Mirrors the Phase B1 check immediately above for argocd_state.py, plus the shared k8s_common.py helper both new classifiers depend on.
