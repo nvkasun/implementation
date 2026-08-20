@@ -26,14 +26,4 @@ locals {
   #   az2 = 1
   #   az3 = 2
   # }
-
-  # ---- IRSA trust policy for EKS Pod Identity
-  eks_pod_assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { Service = "pods.eks.amazonaws.com" }
-      Action    = ["sts:AssumeRole", "sts:TagSession"]
-    }]
-  })
 }
