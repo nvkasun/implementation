@@ -1,7 +1,7 @@
-# environment/namespaces.runtime.name are shared environment identity, injected by the deploy workflow from envs/dev/environment.yaml.
+# environment/namespaces.runtime.name are shared environment identity, injected by the deploy workflow from envs/dev/environment.yaml. namespaces.runtime.create is deliberately false (the chart's own default, restored here explicitly): the Argo CD Application (.github/workflows/30-sub-platform.yaml) is the single authoritative owner of this shared namespace's metadata via syncOptions CreateNamespace=true + syncPolicy.managedNamespaceMetadata -- a chart-rendered Namespace object (helm/goldengate-platform/templates/runtime-namespace.yaml) would be a second, competing owner whose Helm-standard app.kubernetes.io/managed-by=Helm label always wins over managedNamespaceMetadata's intended app.kubernetes.io/managed-by=argocd, which is exactly the live namespace-label-ownership drift this comment now documents and prevents from recurring.
 namespaces:
   runtime:
-    create: true
+    create: false
 
 # runtimeServiceAccount.roleArn is intentionally absent -- the deploy workflow injects it via --set (RUNTIME_ROLE_ARN), never hand-maintained here. name defaults to the chart's own gg-runtime-sa (the one shared runtime identity for every deploymentType).
 

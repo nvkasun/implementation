@@ -1288,7 +1288,6 @@ jobs:
             host_ip="$(jq -r '.status.hostIP // ""' <<<"$pod_json")"
             node_name="$(jq -r '.spec.nodeName // "<none>"' <<<"$pod_json")"
             pod_sa="$(jq -r '.spec.serviceAccountName // ""' <<<"$pod_json")"
-            env_names="$(jq -r '[.spec.containers[]?.env[]?.name] | .[]' <<<"$pod_json")"
 
             [ "$phase" != "Running" ] && continue
             [ "$ready_status" != "True" ] && continue
@@ -1311,22 +1310,15 @@ jobs:
               echo "FAIL: active scraper pod ${pod_name} serviceAccountName is ${pod_sa}, expected ${CLOUDWATCH_AGENT_SERVICE_ACCOUNT}."
               exit 1
             fi
-            if ! grep -qx "AWS_ROLE_ARN" <<< "$env_names"; then
-              echo "FAIL: active scraper pod ${pod_name} is missing the AWS_ROLE_ARN environment variable."
-              exit 1
-            fi
-            if ! grep -qx "AWS_WEB_IDENTITY_TOKEN_FILE" <<< "$env_names"; then
-              echo "FAIL: active scraper pod ${pod_name} is missing the AWS_WEB_IDENTITY_TOKEN_FILE environment variable."
-              exit 1
-            fi
-            echo "OK: pod/${pod_name} -- IRSA variable names present (values not printed)."
+            # IRSA admission (AWS_ROLE_ARN/AWS_WEB_IDENTITY_TOKEN_FILE) is deliberately NOT checked here: this step runs before "Annotate the CloudWatch Agent ServiceAccount with the dedicated IRSA role" below, so an active pod admitted before that annotation existed legitimately lacks those variables -- the dedicated "Verify IRSA injection on the recreated CloudWatch Agent pods" step later in this job is the sole IRSA admission gate, run only after the ServiceAccount is annotated and every workload has rolled out. Conflating that check into this host-network/identity-only step is exactly the reconciliation-ordering defect this fix corrects.
+            echo "OK: pod/${pod_name} -- host-network isolation and ServiceAccount identity confirmed (IRSA admission is verified separately, after ServiceAccount reconciliation)."
           done < <(jq -r '.items[].metadata.name' <<<"$ALL_SCRAPER_PODS_JSON")
 
           if [ "$ACTIVE_POD_FOUND" != "true" ]; then
             echo "FAIL: no active (Running, Ready, current-ReplicaSet) cluster-scraper pod was found."
             exit 1
           fi
-          echo "OK: every active cluster-scraper pod has hostNetwork=false, a distinct podIP/hostIP, the correct ServiceAccount, and both IRSA environment variable names present."
+          echo "OK: every active cluster-scraper pod has hostNetwork=false, a distinct podIP/hostIP, and the correct ServiceAccount (IRSA admission verified separately, after ServiceAccount reconciliation)."
 
           echo "Cluster-scraper correction summary: $(cat "$CORRECTION_SUMMARY_FILE")"
 

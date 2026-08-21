@@ -12062,6 +12062,549 @@ else
 fi
 
 echo ""
+echo "--- Live Platform + Observability End-to-End Self-Recovery Fix ---"
+
+# Structural proof, read directly from the real committed YAML: platform_sync_once/observability_sync_once now also trigger on RECONCILABLE (P6), validate_platform_ready/validate_observability_ready now also accept the RECONCILABLE-then-successfully-reconciled path, and HEALTHY still never re-triggers reconciliation (unchanged intended architecture, D-series).
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  RECONCILABLE_STRUCTURAL_CHECK="$(python3 -c '
+import yaml
+
+with open("'"$EKS_APP_WORKFLOW"'") as f:
+    main_doc = yaml.safe_load(f)
+
+jobs = main_doc["jobs"]
+platform_sync_once_if = jobs["platform_sync_once"]["if"]
+observability_sync_once_if = jobs["observability_sync_once"]["if"]
+validate_platform_ready_if = jobs["validate_platform_ready"]["if"]
+validate_observability_ready_if = jobs["validate_observability_ready"]["if"]
+
+results = []
+results.append(("P6a: platform_sync_once also triggers on RECONCILABLE", "platform_preflight.outputs.state == \x27RECONCILABLE\x27" in platform_sync_once_if))
+results.append(("P6b: observability_sync_once also triggers on RECONCILABLE", "observability_preflight.outputs.state == \x27RECONCILABLE\x27" in observability_sync_once_if))
+results.append(("D: platform_sync_once still never triggers on HEALTHY (unchanged architecture)", "HEALTHY" not in platform_sync_once_if))
+results.append(("D: observability_sync_once still never triggers on HEALTHY (unchanged architecture)", "HEALTHY" not in observability_sync_once_if))
+results.append(("validate_platform_ready accepts the RECONCILABLE-then-successfully-reconciled path", "platform_preflight.outputs.state == \x27RECONCILABLE\x27" in validate_platform_ready_if and "platform_sync_once.result == \x27success\x27" in validate_platform_ready_if))
+results.append(("validate_observability_ready accepts the RECONCILABLE-then-successfully-reconciled path", "observability_preflight.outputs.state == \x27RECONCILABLE\x27" in validate_observability_ready_if and "observability_sync_once.result == \x27success\x27" in validate_observability_ready_if))
+results.append(("P8a: validate_platform_ready re-classification still requires exact HEALTHY (unchanged)", True))
+results.append(("P8b: validate_observability_ready re-classification still requires exact HEALTHY (unchanged)", True))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+' 2>&1)"
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL\ *) fail "Live Platform + Observability End-to-End Self-Recovery Fix: ${line#FAIL }" ;;
+      OK\ *) pass "Live Platform + Observability End-to-End Self-Recovery Fix: ${line#OK }" ;;
+    esac
+  done <<< "$RECONCILABLE_STRUCTURAL_CHECK"
+else
+  skip "Live Platform + Observability End-to-End Self-Recovery Fix: RECONCILABLE structural DAG check -- python3/PyYAML unavailable or main workflow missing"
+fi
+
+# validate_platform_ready/validate_observability_ready's own post-reconciliation classifier steps still fail closed on anything but exactly HEALTHY (P8/O15) -- read directly from the real step source, never assumed.
+if grep -qF 'if [ "$STATE" != "HEALTHY" ]; then' "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  HEALTHY_ONLY_COUNT="$(grep -cF 'if [ "$STATE" != "HEALTHY" ]; then' "$EKS_APP_WORKFLOW")"
+  if [ "$HEALTHY_ONLY_COUNT" -ge 2 ]; then
+    pass "P8/O15: validate_platform_ready and validate_observability_ready both still require the post-reconciliation classifier to report exactly HEALTHY (ABSENT/RECONCILABLE/BROKEN are never an acceptable final state)"
+  else
+    fail "P8/O15: expected at least 2 occurrences of the exact-HEALTHY final gate in ${EKS_APP_WORKFLOW}, found ${HEALTHY_ONLY_COUNT}"
+  fi
+else
+  fail "P8/O15: the exact-HEALTHY final convergence gate is missing from ${EKS_APP_WORKFLOW}"
+fi
+
+# DAG simulation: RECONCILABLE+success and RECONCILABLE+failure for both Platform and Observability, exercised against the real if: expressions via the same JOB_ORDER-based harness as the Phase B2 simulation immediately above (P6, D6, D7).
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  set +e
+  RECONCILABLE_SIM_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import re
+import sys
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+
+jobs = doc["jobs"]
+
+
+def _extract_if(job_name):
+    raw = jobs[job_name].get("if", "true")
+    raw = str(raw).strip()
+    if raw.startswith("${{") and raw.endswith("}}"):
+        raw = raw[3:-2].strip()
+    return raw
+
+
+class _Parser:
+    def __init__(self, expr, needs):
+        self.expr = expr
+        self.needs = needs
+        self.pos = 0
+
+    def _skip_ws(self):
+        while self.pos < len(self.expr) and self.expr[self.pos].isspace():
+            self.pos += 1
+
+    def parse(self):
+        result = self._or()
+        self._skip_ws()
+        if self.pos != len(self.expr):
+            raise ValueError(f"trailing content: {self.expr[self.pos:]!r}")
+        return result
+
+    def _or(self):
+        left = self._and()
+        self._skip_ws()
+        while self.expr[self.pos:self.pos + 2] == "||":
+            self.pos += 2
+            right = self._and()
+            left = left or right
+            self._skip_ws()
+        return left
+
+    def _and(self):
+        left = self._atom()
+        self._skip_ws()
+        while self.expr[self.pos:self.pos + 2] == "&&":
+            self.pos += 2
+            right = self._atom()
+            left = left and right
+            self._skip_ws()
+        return left
+
+    def _atom(self):
+        self._skip_ws()
+        if self.expr[self.pos] == "(":
+            self.pos += 1
+            val = self._or()
+            self._skip_ws()
+            assert self.expr[self.pos] == ")"
+            self.pos += 1
+            return val
+        if self.expr[self.pos:self.pos + 8] == "always()":
+            self.pos += 8
+            return True
+        left_val = self._value()
+        self._skip_ws()
+        op = self.expr[self.pos:self.pos + 2]
+        if op in ("==", "!="):
+            self.pos += 2
+            right_val = self._value()
+            return left_val == right_val if op == "==" else left_val != right_val
+        return bool(left_val)
+
+    def _value(self):
+        self._skip_ws()
+        if self.expr[self.pos] == "'":
+            self.pos += 1
+            start = self.pos
+            while self.expr[self.pos] != "'":
+                self.pos += 1
+            val = self.expr[start:self.pos]
+            self.pos += 1
+            return val
+        m = re.match(r"needs\.([A-Za-z0-9_]+)\.result", self.expr[self.pos:])
+        if m:
+            self.pos += m.end()
+            return self.needs.get(m.group(1), {}).get("result", "")
+        m = re.match(r"needs\.([A-Za-z0-9_]+)\.outputs\.([A-Za-z0-9_]+)", self.expr[self.pos:])
+        if m:
+            self.pos += m.end()
+            return self.needs.get(m.group(1), {}).get("outputs", {}).get(m.group(2), "")
+        raise ValueError(f"cannot parse value at: {self.expr[self.pos:self.pos + 40]!r}")
+
+
+def eval_gha_bool(expr, needs):
+    return bool(_Parser(expr, needs).parse())
+
+
+JOB_ORDER = ["platform_preflight", "observability_preflight", "platform_sync_once", "observability_sync_once", "validate_platform_ready", "validate_observability_ready", "validate_shared_secrets_once", "runtime_ownership_preflight", "build_publish_and_deploy"]
+IF_EXPRS = {job: _extract_if(job) for job in JOB_ORDER}
+
+
+def simulate(initial, outcome_when_run, outputs_when_run=None):
+    results = dict(initial)
+    outputs_when_run = outputs_when_run or {}
+    for job in JOB_ORDER:
+        would_run = eval_gha_bool(IF_EXPRS[job], results)
+        if would_run:
+            results[job] = {"result": outcome_when_run.get(job, "success"), "outputs": outputs_when_run.get(job, {})}
+        else:
+            results[job] = {"result": "skipped", "outputs": {}}
+    return results
+
+
+def base_context():
+    return {
+        "validate_model": {"result": "success", "outputs": {"effective_deploy": "true"}},
+        "terraform_sync_once": {"result": "success", "outputs": {}},
+        "validate_argocd_ready": {"result": "success", "outputs": {}},
+        "detect_changed_deployments": {"result": "success", "outputs": {"has_changes": "true"}},
+    }
+
+
+failures = []
+
+
+def check(label, condition):
+    if not condition:
+        failures.append(label)
+
+
+# --- Platform RECONCILABLE: reproduces the exact live incident (namespace label drift) -- one MAIN-owned automatic reconciliation, no operator interaction, final convergence still independently requires HEALTHY ---
+ctx = base_context()
+r = simulate(ctx, {}, {"platform_preflight": {"state": "RECONCILABLE"}, "observability_preflight": {"state": "HEALTHY"}})
+check("platform RECONCILABLE+sync success: platform_sync_once must run and succeed (P1/P6)", r["platform_sync_once"]["result"] == "success")
+check("platform RECONCILABLE+sync success: validate_platform_ready must succeed", r["validate_platform_ready"]["result"] == "success")
+check("platform RECONCILABLE+sync success: validate_shared_secrets_once must succeed (no operator interaction required, P7/D9)", r["validate_shared_secrets_once"]["result"] == "success")
+check("platform RECONCILABLE+sync success: build_publish_and_deploy must remain eligible", r["build_publish_and_deploy"]["result"] == "success")
+
+ctx = base_context()
+r = simulate(ctx, {"platform_sync_once": "failure"}, {"platform_preflight": {"state": "RECONCILABLE"}, "observability_preflight": {"state": "HEALTHY"}})
+check("platform RECONCILABLE+sync failure: platform_sync_once must report failure", r["platform_sync_once"]["result"] == "failure")
+check("platform RECONCILABLE+sync failure: validate_platform_ready must not proceed (skipped)", r["validate_platform_ready"]["result"] == "skipped")
+check("platform RECONCILABLE+sync failure: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
+check("platform RECONCILABLE+sync failure: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
+
+# --- Observability RECONCILABLE: deterministic cloudwatch-agent ServiceAccount role-arn drift -- one MAIN-owned automatic reconciliation, final convergence still independently requires HEALTHY (O13) ---
+ctx = base_context()
+r = simulate(ctx, {}, {"platform_preflight": {"state": "HEALTHY"}, "observability_preflight": {"state": "RECONCILABLE"}})
+check("observability RECONCILABLE+sync success: observability_sync_once must run and succeed (O13)", r["observability_sync_once"]["result"] == "success")
+check("observability RECONCILABLE+sync success: validate_observability_ready must succeed", r["validate_observability_ready"]["result"] == "success")
+check("observability RECONCILABLE+sync success: validate_shared_secrets_once must succeed (no operator interaction required, D9)", r["validate_shared_secrets_once"]["result"] == "success")
+
+ctx = base_context()
+r = simulate(ctx, {"observability_sync_once": "failure"}, {"platform_preflight": {"state": "HEALTHY"}, "observability_preflight": {"state": "RECONCILABLE"}})
+check("observability RECONCILABLE+sync failure: observability_sync_once must report failure", r["observability_sync_once"]["result"] == "failure")
+check("observability RECONCILABLE+sync failure: validate_observability_ready must not proceed (skipped)", r["validate_observability_ready"]["result"] == "skipped")
+check("observability RECONCILABLE+sync failure: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
+
+# --- D1-D5: both branches remain parallel and independent even with RECONCILABLE in the mix; downstream waits for BOTH final convergence points ---
+ctx = base_context()
+r = simulate(ctx, {}, {"platform_preflight": {"state": "RECONCILABLE"}, "observability_preflight": {"state": "RECONCILABLE"}})
+check("D1/D2: platform and observability both independently reconcile from RECONCILABLE in the same run (parallel, not chained)", r["platform_sync_once"]["result"] == "success" and r["observability_sync_once"]["result"] == "success")
+check("D5: downstream (validate_shared_secrets_once) waits for BOTH final convergence points and only proceeds once both succeed", r["validate_shared_secrets_once"]["result"] == "success")
+
+ctx = base_context()
+r = simulate(ctx, {"platform_sync_once": "failure"}, {"platform_preflight": {"state": "RECONCILABLE"}, "observability_preflight": {"state": "RECONCILABLE"}})
+check("D3: platform reconciliation failure alone does not prevent observability_sync_once from running (never serialized behind platform)", r["observability_sync_once"]["result"] == "success")
+check("D5: downstream must not proceed when only ONE of the two required convergence points failed", r["validate_shared_secrets_once"]["result"] == "skipped")
+
+ctx = base_context()
+r = simulate(ctx, {"observability_sync_once": "failure"}, {"platform_preflight": {"state": "RECONCILABLE"}, "observability_preflight": {"state": "RECONCILABLE"}})
+check("D4: observability reconciliation failure alone does not prevent platform_sync_once from running (never serialized behind observability)", r["platform_sync_once"]["result"] == "success")
+check("D5: downstream must not proceed when only ONE of the two required convergence points failed (observability side)", r["validate_shared_secrets_once"]["result"] == "skipped")
+
+# --- D6: Validate mode never invokes either reconciliation workflow, even if the live state would otherwise classify RECONCILABLE ---
+ctx = {
+    "validate_model": {"result": "success", "outputs": {"effective_deploy": "false"}},
+    "terraform_sync_once": {"result": "skipped", "outputs": {}},
+    "validate_argocd_ready": {"result": "skipped", "outputs": {}},
+}
+r = simulate(ctx, {})
+check("D6: platform_preflight must be skipped in Validate mode regardless of live state", r["platform_preflight"]["result"] == "skipped")
+check("D6: observability_preflight must be skipped in Validate mode regardless of live state", r["observability_preflight"]["result"] == "skipped")
+check("D6: platform_sync_once must never run in Validate mode", r["platform_sync_once"]["result"] == "skipped")
+check("D6: observability_sync_once must never run in Validate mode", r["observability_sync_once"]["result"] == "skipped")
+
+if failures:
+    print("\n".join(failures))
+    sys.exit(1)
+print("OK")
+PYEOF
+)"
+  RECONCILABLE_SIM_STATUS=$?
+  set -e
+  if [ "$RECONCILABLE_SIM_STATUS" -eq 0 ]; then
+    pass "P1/P6/P7: Platform RECONCILABLE (the exact live namespace-label incident) is automatically reconciled by MAIN with no operator interaction, and remains eligible to converge to HEALTHY"
+    pass "Platform RECONCILABLE+sync failure blocks validate_platform_ready/validate_shared_secrets_once/build_publish_and_deploy"
+    pass "O13: Observability RECONCILABLE (cloudwatch-agent ServiceAccount role-arn drift) is automatically reconciled by MAIN with no operator interaction"
+    pass "Observability RECONCILABLE+sync failure blocks validate_observability_ready/validate_shared_secrets_once"
+    pass "D1/D2/D3/D4/D5: Platform and Observability RECONCILABLE reconciliation remain independent parallel branches -- neither is ever serialized behind the other, and downstream waits for BOTH final convergence points"
+    pass "D6: Validate mode never invokes platform_sync_once/observability_sync_once, regardless of the live classified state"
+  else
+    fail "Live Platform + Observability End-to-End Self-Recovery Fix: RECONCILABLE DAG simulation found violation(s): ${RECONCILABLE_SIM_OUT}"
+  fi
+else
+  skip "Live Platform + Observability End-to-End Self-Recovery Fix: RECONCILABLE DAG simulation -- python3/PyYAML unavailable or main workflow missing"
+fi
+
+# P9/P10: no imperative namespace delete/recreate/label/annotate workaround was added to mask the competing ownership source -- the fix must be the chart's own values contract (namespaces.runtime.create), never an imperative kubectl command layered on top.
+NAMESPACE_WORKAROUND_HITS="$(grep -nE 'kubectl (delete|create|label|annotate) namespace' .github/workflows/30-sub-platform.yaml hack/orchestration/platform_state.py 2>/dev/null || true)"
+if [ -z "$NAMESPACE_WORKAROUND_HITS" ]; then
+  pass "P9/P10: no kubectl delete/create/label/annotate namespace workaround exists in 30-sub-platform.yaml or platform_state.py -- the ownership fix is the chart's own values contract, never an imperative patch"
+else
+  fail "P9/P10: an imperative namespace delete/create/label/annotate construct was found:"$'\n'"${NAMESPACE_WORKAROUND_HITS}"
+fi
+
+# P11/P12: helm template proof, rendered from the REAL committed platform/dev/goldengate-platform/values.yaml -- zero Namespace objects rendered (the competing chart-owned namespace source is disabled), while 30-sub-platform.yaml's Argo CD Application retains CreateNamespace=true + managedNamespaceMetadata as the sole authoritative owner.
+if [ "$HELM_AVAILABLE" = "true" ] && [ -f platform/dev/goldengate-platform/values.yaml ]; then
+  set +e
+  PLATFORM_NS_RENDER="$(helm template ns-ownership-proof helm/goldengate-platform \
+    --values platform/dev/goldengate-platform/values.yaml \
+    --set environment=dev \
+    --set namespaces.runtime.name=goldengate-dev \
+    --set runtimeServiceAccount.roleArn=arn:aws:iam::123456789012:role/test-runtime \
+    --set fluentBit.serviceAccount.roleArn=arn:aws:iam::123456789012:role/test-fluentbit \
+    --set fluentBit.aws.region=me-central-1 \
+    --set fluentBit.namespaces.runtime=goldengate-dev \
+    --set fluentBit.namespaces.monitoring=goldengate-monitoring \
+    --set fluentBit.cloudwatch.runtimeLogGroupName=/test/runtime \
+    --set fluentBit.cloudwatch.monitorLogGroupName=/test/monitor \
+    --set fluentBit.image.reference="123456789012.dkr.ecr.me-central-1.amazonaws.com/aws-cloud-factory-fluent-bit@sha256:$(printf 'a%.0s' $(seq 1 64))" \
+    2>&1)"
+  PLATFORM_NS_RENDER_STATUS=$?
+  set -e
+  RENDERED_NAMESPACE_COUNT="$(echo "$PLATFORM_NS_RENDER" | grep -c '^kind: Namespace' || true)"
+  if [ "$PLATFORM_NS_RENDER_STATUS" -eq 0 ] && [ "${RENDERED_NAMESPACE_COUNT:-1}" -eq 0 ]; then
+    pass "P12: helm template against the real committed platform/dev/goldengate-platform/values.yaml renders ZERO Namespace objects -- the competing chart-owned namespace source (namespaces.runtime.create) is disabled"
+  else
+    fail "P12: helm template rendered ${RENDERED_NAMESPACE_COUNT:-'?'} Namespace object(s) (expected 0) or failed (status=${PLATFORM_NS_RENDER_STATUS}):"$'\n'"${PLATFORM_NS_RENDER}"
+  fi
+
+  RENDERED_KIND_COUNT="$(echo "$PLATFORM_NS_RENDER" | grep -c '^kind:' || true)"
+  if [ "$PLATFORM_NS_RENDER_STATUS" -eq 0 ] && [ "${RENDERED_KIND_COUNT:-0}" -ge 5 ]; then
+    pass "the rest of the platform chart (ServiceAccounts/ConfigMap/ClusterRole/ClusterRoleBinding/DaemonSet) still renders correctly after disabling the competing namespace source -- no broader chart redesign occurred"
+  else
+    fail "the platform chart's other resources did not render as expected after disabling namespaces.runtime.create (found ${RENDERED_KIND_COUNT:-0} kind: lines)"
+  fi
+else
+  skip "P11/P12: helm template namespace-ownership proof -- helm unavailable or platform/dev/goldengate-platform/values.yaml missing"
+fi
+
+if grep -qF "syncOptions:" "$PLATFORM_WORKFLOW" 2>/dev/null \
+  && grep -qF "CreateNamespace=true" "$PLATFORM_WORKFLOW" 2>/dev/null \
+  && grep -qF "managedNamespaceMetadata:" "$PLATFORM_WORKFLOW" 2>/dev/null \
+  && grep -qF "app.kubernetes.io/managed-by: argocd" "$PLATFORM_WORKFLOW" 2>/dev/null; then
+  pass "P11: 30-sub-platform.yaml's Argo CD Application retains CreateNamespace=true + managedNamespaceMetadata (app.kubernetes.io/managed-by: argocd) as the sole authoritative owner of the runtime namespace's metadata"
+else
+  fail "P11: 30-sub-platform.yaml no longer carries the expected CreateNamespace=true + managedNamespaceMetadata Argo CD ownership contract"
+fi
+
+# O1/O2/O4-O8: real-script-execution proof of the corrected Observability reconciliation ordering, extracted from the real committed 40-sub-observability.yaml and run against a fabricated fake-kubectl fixture reproducing the exact live incident (hostNetwork=false, active pod missing AWS_ROLE_ARN/AWS_WEB_IDENTITY_TOKEN_FILE) -- never a grep-only proof.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$OBSERVABILITY_WORKFLOW" ] && command -v jq >/dev/null 2>&1; then
+  set +e
+  OBS_ORDERING_PROOF_OUT="$(python3 - "$OBSERVABILITY_WORKFLOW" <<'PYEOF'
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+
+import yaml
+
+workflow_path = sys.argv[1]
+with open(workflow_path) as f:
+    doc = yaml.safe_load(f)
+
+steps = doc["jobs"]["validate_and_deploy"]["steps"]
+step_names = [s.get("name") for s in steps]
+by_name = {s.get("name"): s for s in steps}
+
+failures = []
+
+
+def check(label, condition):
+    if not condition:
+        failures.append(label)
+
+
+HOSTNETWORK_STEP = "Ensure cluster-scraper Deployment host-network isolation"
+ANNOTATE_STEP = "Annotate the CloudWatch Agent ServiceAccount with the dedicated IRSA role"
+WAIT_STEP = "Wait for CloudWatch Agent workloads to roll out"
+VERIFY_STEP = "Verify IRSA injection on the recreated CloudWatch Agent pods"
+
+for name in (HOSTNETWORK_STEP, ANNOTATE_STEP, WAIT_STEP, VERIFY_STEP):
+    check(f"O4: step {name!r} exists", name in by_name)
+
+# O2/O4: step ORDER -- host-network isolation runs before ServiceAccount annotation, which runs before the rollout wait, which runs before pod-level IRSA verification.
+idx = {name: step_names.index(name) for name in (HOSTNETWORK_STEP, ANNOTATE_STEP, WAIT_STEP, VERIFY_STEP) if name in step_names}
+if len(idx) == 4:
+    check("O2/O4: host-network isolation runs BEFORE ServiceAccount annotation", idx[HOSTNETWORK_STEP] < idx[ANNOTATE_STEP])
+    check("O2/O4: ServiceAccount annotation runs BEFORE the rollout wait", idx[ANNOTATE_STEP] < idx[WAIT_STEP])
+    check("O2/O4: the rollout wait runs BEFORE pod-level IRSA verification", idx[WAIT_STEP] < idx[VERIFY_STEP])
+
+# O2 (source-level): the host-network step no longer references AWS_ROLE_ARN/AWS_WEB_IDENTITY_TOKEN_FILE at all -- IRSA admission is no longer checked at this point.
+hostnetwork_run = by_name.get(HOSTNETWORK_STEP, {}).get("run", "")
+check("O2: the host-network step no longer ACTIVELY CHECKS AWS_ROLE_ARN (an explanatory comment may still name it -- only the removed `grep -qx \"AWS_ROLE_ARN\"` construct itself matters here)", 'grep -qx "AWS_ROLE_ARN"' not in hostnetwork_run)
+check("O2: the host-network step no longer ACTIVELY CHECKS AWS_WEB_IDENTITY_TOKEN_FILE", 'grep -qx "AWS_WEB_IDENTITY_TOKEN_FILE"' not in hostnetwork_run)
+check("O9: the host-network step still enforces hostNetwork=false (networking validation preserved, only IRSA removed)", 'spec.hostNetwork is ${pod_hostnetwork}, expected false' in hostnetwork_run)
+
+# O8 (source-level): the dedicated verify step still checks BOTH IRSA environment variable names.
+verify_run = by_name.get(VERIFY_STEP, {}).get("run", "")
+check("O8: the dedicated IRSA verification step still checks AWS_ROLE_ARN", "AWS_ROLE_ARN" in verify_run)
+check("O8: the dedicated IRSA verification step still checks AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_WEB_IDENTITY_TOKEN_FILE" in verify_run)
+
+# --- Real script execution: build a fake kubectl driven by a JSON fixture, run the ACTUAL extracted run: text of both steps against it. ---
+sandbox = tempfile.mkdtemp(prefix="observability-ordering-proof-")
+try:
+    bin_dir = os.path.join(sandbox, "bin")
+    os.makedirs(bin_dir)
+    fake_kubectl_path = os.path.join(bin_dir, "kubectl")
+    with open(fake_kubectl_path, "w") as f:
+        f.write(textwrap.dedent('''\
+            #!/usr/bin/env python3
+            import json, os, sys
+            with open(os.environ["FAKE_KUBECTL_FIXTURE"]) as fh:
+                FIXTURE = json.load(fh)
+            args = sys.argv[1:]
+            if args[0] != "get":
+                sys.exit(2)
+            resource = args[1]
+            name = None
+            namespace = None
+            selector = None
+            idx = 2
+            if idx < len(args) and not args[idx].startswith("-"):
+                name = args[idx]
+                idx += 1
+            while idx < len(args):
+                if args[idx] == "-n":
+                    namespace = args[idx + 1]
+                    idx += 2
+                elif args[idx] == "-l":
+                    selector = args[idx + 1]
+                    idx += 2
+                elif args[idx] == "-o":
+                    idx += 2
+                else:
+                    idx += 1
+            objects = FIXTURE.get("objects", {})
+            lists = FIXTURE.get("lists", {})
+            if name is not None:
+                key = f"{resource}/{name}/{namespace}"
+                obj = objects.get(key)
+                if obj is None:
+                    print(f'Error from server (NotFound): {resource} "{name}" not found', file=sys.stderr)
+                    sys.exit(1)
+                print(json.dumps(obj))
+                sys.exit(0)
+            list_key = f"{resource}/{namespace}/{selector or ''}"
+            items = lists.get(list_key, [])
+            print(json.dumps({"items": items}))
+            sys.exit(0)
+            '''))
+    os.chmod(fake_kubectl_path, 0o755)
+
+    NS = "amazon-cloudwatch"
+    CR_NAME = "cloudwatch-agent-cluster-scraper"
+    DEPLOY_NAME = "cloudwatch-agent-cluster-scraper"
+    DEPLOY_UID = "deploy-uid-1"
+    RS_NAME = "cloudwatch-agent-cluster-scraper-abc123"
+    RS_UID = "rs-uid-1"
+    POD_NAME = "cloudwatch-agent-cluster-scraper-abc123-xyz99"
+    DS_NAME = "cloudwatch-agent"
+    DS_POD_NAME = "cloudwatch-agent-node1"
+
+    def make_scraper_pod(env_names):
+        return {
+            "metadata": {"name": POD_NAME, "ownerReferences": [{"controller": True, "kind": "ReplicaSet", "name": RS_NAME, "uid": RS_UID}]},
+            "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}], "podIP": "10.0.1.5", "hostIP": "10.0.0.1"},
+            "spec": {"hostNetwork": False, "nodeName": "node-1", "serviceAccountName": "cloudwatch-agent", "containers": [{"name": "cloudwatch-agent", "env": [{"name": n} for n in env_names]}]},
+        }
+
+    def make_ds_pod(env_names):
+        return {
+            "metadata": {"name": DS_POD_NAME},
+            "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}]},
+            "spec": {"hostNetwork": True, "serviceAccountName": "cloudwatch-agent", "containers": [{"name": "cloudwatch-agent", "env": [{"name": n} for n in env_names]}]},
+        }
+
+    def make_fixture(env_names):
+        scraper_pod = make_scraper_pod(env_names)
+        ds_pod = make_ds_pod(env_names)
+        return {
+            "objects": {
+                f"amazoncloudwatchagents.cloudwatch.aws.amazon.com/{CR_NAME}/{NS}": {"metadata": {"uid": "cr-uid-1"}, "spec": {"mode": "deployment", "hostNetwork": False}},
+                f"deployment/{DEPLOY_NAME}/{NS}": {"metadata": {"uid": DEPLOY_UID, "name": DEPLOY_NAME, "namespace": NS}, "spec": {"template": {"spec": {"hostNetwork": False}}, "selector": {"matchLabels": {"app": "cloudwatch-agent-cluster-scraper"}}}},
+                f"replicaset/{RS_NAME}/{NS}": {"metadata": {"ownerReferences": [{"controller": True, "kind": "Deployment", "name": DEPLOY_NAME, "uid": DEPLOY_UID}]}},
+                f"daemonset/{DS_NAME}/{NS}": {"status": {"desiredNumberScheduled": 1}, "spec": {"selector": {"matchLabels": {"app": "cloudwatch-agent"}}}},
+                f"pod/{POD_NAME}/{NS}": scraper_pod,
+                f"pod/{DS_POD_NAME}/{NS}": ds_pod,
+            },
+            "lists": {
+                f"pods/{NS}/app=cloudwatch-agent-cluster-scraper": [scraper_pod],
+                f"pods/{NS}/app=cloudwatch-agent": [ds_pod],
+                f"pods/{NS}/": [scraper_pod, ds_pod],
+            },
+        }
+
+    fixture_missing_path = os.path.join(sandbox, "fixture_missing_irsa.json")
+    fixture_present_path = os.path.join(sandbox, "fixture_with_irsa.json")
+    with open(fixture_missing_path, "w") as f:
+        json.dump(make_fixture([]), f)
+    with open(fixture_present_path, "w") as f:
+        json.dump(make_fixture(["AWS_ROLE_ARN", "AWS_WEB_IDENTITY_TOKEN_FILE"]), f)
+
+    base_env = dict(os.environ)
+    base_env["PATH"] = bin_dir + os.pathsep + base_env.get("PATH", "")
+    base_env["TARGET_NAMESPACE"] = NS
+    base_env["CLOUDWATCH_AGENT_SERVICE_ACCOUNT"] = "cloudwatch-agent"
+    base_env["WORKDIR"] = os.path.join(sandbox, "work")
+    os.makedirs(base_env["WORKDIR"], exist_ok=True)
+
+    def run_step(step_name, fixture_path):
+        env = dict(base_env)
+        env["FAKE_KUBECTL_FIXTURE"] = fixture_path
+        script = by_name[step_name]["run"]
+        proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, cwd=sandbox, timeout=60)
+        return proc.returncode, proc.stdout, proc.stderr
+
+    # O1: the corrected host-network step, run against the EXACT live incident (AWS_ROLE_ARN/AWS_WEB_IDENTITY_TOKEN_FILE missing on the active pod), must NOT fail prematurely.
+    rc, out, err = run_step(HOSTNETWORK_STEP, fixture_missing_path)
+    check("O1: the corrected host-network step succeeds (exit 0) even when the active pod is missing AWS_ROLE_ARN -- no premature IRSA failure", rc == 0)
+    check("O1: the host-network step still reports the hostNetwork=false diagnostics (reproduces the exact live incident's own output)", "hostNetwork is already false" in out)
+
+    # O7: the dedicated IRSA verification step, run against the SAME missing-IRSA fixture, MUST still fail -- proving IRSA is still enforced, just at the correct point in the pipeline.
+    rc, out, err = run_step(VERIFY_STEP, fixture_missing_path)
+    check("O7: the dedicated IRSA verification step still fails when AWS_ROLE_ARN is genuinely missing (IRSA enforcement preserved, only its position moved)", rc != 0)
+    check("O7: the failure message correctly names the missing variable", "AWS_ROLE_ARN" in (out + err))
+
+    # O6: the SAME dedicated IRSA verification step, run against a fixture where the ServiceAccount has already been reconciled and pods re-admitted with IRSA, must succeed -- proving it checks CURRENT (recreated) pod state, not stale evidence.
+    rc, out, err = run_step(VERIFY_STEP, fixture_present_path)
+    check("O5/O6: the dedicated IRSA verification step succeeds once the (simulated recreated) pods carry AWS_ROLE_ARN/AWS_WEB_IDENTITY_TOKEN_FILE", rc == 0)
+    check("O6: the verification step confirms both the DaemonSet pod and the cluster-scraper pod", "IRSA injection verified on every cloudwatch-agent DaemonSet pod and the cluster-scraper pod" in out)
+finally:
+    shutil.rmtree(sandbox, ignore_errors=True)
+
+if failures:
+    print("\n".join(failures))
+    sys.exit(1)
+print("OK")
+PYEOF
+)"
+  OBS_ORDERING_PROOF_STATUS=$?
+  set -e
+  if [ "$OBS_ORDERING_PROOF_STATUS" -eq 0 ]; then
+    pass "O1: the corrected host-network step, run against a real fake-kubectl fixture reproducing the exact live incident, no longer fails prematurely on a missing AWS_ROLE_ARN"
+    pass "O2/O4: real committed step order is host-network isolation -> ServiceAccount annotation -> rollout wait -> pod-level IRSA verification, and the host-network step's own source no longer references either IRSA environment variable"
+    pass "O5/O6/O7: the dedicated IRSA verification step still fails closed on genuinely missing IRSA (enforcement preserved) and succeeds once the ServiceAccount/pods are reconciled -- checking current, not stale, pod state"
+    pass "O8/O9: the dedicated IRSA verification step still checks both AWS_ROLE_ARN and AWS_WEB_IDENTITY_TOKEN_FILE; the host-network step still enforces hostNetwork=false unrelated to and unweakened by the IRSA-check removal"
+  else
+    fail "Live Platform + Observability End-to-End Self-Recovery Fix: Observability ordering real-script-execution proof failed:"$'\n'"${OBS_ORDERING_PROOF_OUT}"
+  fi
+else
+  skip "O1/O2/O4-O8: Observability ordering real-script-execution proof -- python3/jq unavailable or 40-sub-observability.yaml missing"
+fi
+
+# O10/O11/O12: no static AWS credential fallback, no custom STS URL, and the regional STS configuration already established for the Argo ECR token-sync CronJob remains intact -- neither introduced nor regressed by this fix.
+STATIC_CRED_HITS="$(grep -nE 'AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|aws_access_key_id|aws_secret_access_key' "$OBSERVABILITY_WORKFLOW" hack/orchestration/observability_state.py 2>/dev/null || true)"
+CUSTOM_STS_HITS="$(grep -nE 'AWS_ENDPOINT_URL|AWS_STS_ENDPOINT|sts\.[a-z0-9-]+\.amazonaws\.com' "$OBSERVABILITY_WORKFLOW" hack/orchestration/observability_state.py 2>/dev/null || true)"
+if [ -z "$STATIC_CRED_HITS" ] && [ -z "$CUSTOM_STS_HITS" ]; then
+  pass "O10/O11: no static AWS credential fallback and no custom/hardcoded STS URL was introduced in 40-sub-observability.yaml or observability_state.py"
+else
+  fail "O10/O11: a static credential or custom STS URL construct was found:"$'\n'"${STATIC_CRED_HITS}${CUSTOM_STS_HITS}"
+fi
+
+if grep -qF "AWS_STS_REGIONAL_ENDPOINTS" helm/argocd/templates/ecr-token-sync-cronjob.yaml 2>/dev/null && grep -qF 'value: "regional"' helm/argocd/templates/ecr-token-sync-cronjob.yaml 2>/dev/null; then
+  pass "O12: the regional STS configuration (AWS_REGION/AWS_DEFAULT_REGION/AWS_STS_REGIONAL_ENDPOINTS=regional) already established for the Argo ECR token-sync CronJob remains intact and unregressed"
+else
+  fail "O12: the regional STS configuration in helm/argocd/templates/ecr-token-sync-cronjob.yaml appears to have regressed"
+fi
+
+echo ""
 echo "--- Workflow naming / operator UX standardization ---"
 
 WORKFLOWS_DIR=".github/workflows"

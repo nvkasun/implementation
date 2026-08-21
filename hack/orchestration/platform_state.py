@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""hack/orchestration/platform_state.py: read-only GoldenGate Platform prerequisite classifier (Phase B2) -- answers exactly one question, "what is the current GoldenGate Platform prerequisite state?", as one of ABSENT/HEALTHY/BROKEN. Never mutates the cluster: every kubectl invocation here is a `get` (read-only); no apply/create/delete/patch/annotate/label/helm call exists in this module. Consumes environment identity through hack/goldengate-environment.py, never a second environment parser. The desired contract (resource names, Application identity, Fluent Bit shape) is read directly from the vendored helm/goldengate-platform/ chart and .github/workflows/30-sub-platform.yaml, never guessed."""
+"""hack/orchestration/platform_state.py: read-only GoldenGate Platform prerequisite classifier (Phase B2) -- answers exactly one question, "what is the current GoldenGate Platform prerequisite state?", as one of ABSENT/HEALTHY/RECONCILABLE/BROKEN. RECONCILABLE (Live Platform + Observability End-to-End Self-Recovery Fix) is a narrow, deliberately conservative carve-out mirroring hack/orchestration/argocd_state.py's own RECONCILABLE: the runtime namespace's app.kubernetes.io/managed-by label (and any other MANAGED_NAMESPACE_LABELS entry) is the ONLY drift, a class the existing reusable Platform specialist workflow's idempotent Argo CD sync already safely repairs via its own managedNamespaceMetadata contract -- any other drift at all still classifies BROKEN. Never mutates the cluster: every kubectl invocation here is a `get` (read-only); no apply/create/delete/patch/annotate/label/helm call exists in this module. Consumes environment identity through hack/goldengate-environment.py, never a second environment parser. The desired contract (resource names, Application identity, Fluent Bit shape) is read directly from the vendored helm/goldengate-platform/ chart and .github/workflows/30-sub-platform.yaml, never guessed."""
 from __future__ import annotations
 
 import argparse
@@ -53,6 +53,7 @@ def environment_derived_values(environment):
 
 STATE_ABSENT = "ABSENT"
 STATE_HEALTHY = "HEALTHY"
+STATE_RECONCILABLE = "RECONCILABLE"
 STATE_BROKEN = "BROKEN"
 
 # Current chart/workflow contract (helm/goldengate-platform/, .github/workflows/30-sub-platform.yaml) -- verified against the real vendored chart/values.yaml and workflow, never guessed.
@@ -135,6 +136,8 @@ def classify(run, environment, runtime_namespace, argocd_namespace, ecr_registry
     _validate_fluent_bit_image(fluent_bit_image, ecr_registry)
 
     reasons = []
+    # Subset of `reasons` that is safe to auto-repair via the existing reusable Platform specialist workflow's idempotent Argo CD sync (its Application already carries syncOptions CreateNamespace=true + syncPolicy.managedNamespaceMetadata for this exact namespace) -- never a broader "any drift is safe" carve-out. Only a MANAGED_NAMESPACE_LABELS mismatch is added here; every other reason (missing resources, Fluent Bit health, foreign workload ownership, a Terminating namespace) stays exclusively in `reasons` and therefore forces BROKEN below.
+    reconcilable_reasons = []
     checks = {}
 
     release_name, app_name = _release_and_app_name(environment)
@@ -187,11 +190,19 @@ def classify(run, environment, runtime_namespace, argocd_namespace, ecr_registry
     if not ns_found:
         reasons.append(f"namespace {runtime_namespace} does not exist")
     else:
+        # A Terminating namespace is never reconcilable -- appended to `reasons` only (not `reconcilable_reasons`), so its presence alone (or alongside anything else) always forces BROKEN below, never silently mixed into a safe auto-repair.
+        ns_phase = ((ns_obj.get("status") or {}).get("phase"))
+        if ns_phase == "Terminating":
+            reasons.append(f"namespace {runtime_namespace} is Terminating")
+
+        # Namespace label drift alone (Argo CD's own managedNamespaceMetadata correcting a stale app.kubernetes.io/managed-by -- for example left over from a since-disabled competing chart-rendered Namespace resource) is safe/deterministic and auto-repaired by 30-sub-platform.yaml's normal idempotent Argo CD sync, so each such reason is also added to reconcilable_reasons below -- never assumed safe if any other, non-reconcilable reason is also present.
         ns_labels = ((ns_obj.get("metadata") or {}).get("labels")) or {}
         for label_key, expected_value in MANAGED_NAMESPACE_LABELS.items():
             actual_value = ns_labels.get(label_key)
             if actual_value != expected_value:
-                reasons.append(f"namespace {runtime_namespace} label {label_key}={actual_value!r}, expected {expected_value!r} (managedNamespaceMetadata)")
+                reason = f"namespace {runtime_namespace} label {label_key}={actual_value!r}, expected {expected_value!r} (managedNamespaceMetadata)"
+                reasons.append(reason)
+                reconcilable_reasons.append(reason)
 
     if not cr_found:
         reasons.append(f"clusterrole/{FLUENT_BIT_CLUSTERROLE_NAME} does not exist")
@@ -258,7 +269,13 @@ def classify(run, environment, runtime_namespace, argocd_namespace, ecr_registry
             names = sorted([s.get("metadata", {}).get("name") for s in owned_statefulsets] + [d.get("metadata", {}).get("name") for d in owned_deployments])
             reasons.append(f"platform release {release_name} unexpectedly owns StatefulSet/Deployment resource(s): {names!r}")
 
-    state = STATE_HEALTHY if not reasons else STATE_BROKEN
+    # RECONCILABLE only when EVERY collected reason is in the reconcilable subset (namespace label drift only, with the Application, Fluent Bit RBAC/identity/health, and runtime-workload-ownership contract all otherwise clean) -- any other reason at all (missing resources, an unready/misconfigured Fluent Bit, foreign workload ownership, a Terminating namespace) forces BROKEN, never a broader "partial drift is fine" default.
+    if not reasons:
+        state = STATE_HEALTHY
+    elif reconcilable_reasons and len(reconcilable_reasons) == len(reasons):
+        state = STATE_RECONCILABLE
+    else:
+        state = STATE_BROKEN
     return {"state": state, "environment": environment, "namespace": runtime_namespace, "reasons": reasons, "checks": checks}
 
 

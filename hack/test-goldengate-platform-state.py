@@ -94,9 +94,9 @@ def _app_obj(name, healthy=True, repo_url=None, dest_ns=RUNTIME_NAMESPACE, relea
     }
 
 
-def _namespace_obj(name, labeled=True):
+def _namespace_obj(name, labeled=True, phase="Active"):
     labels = dict(platform_state.MANAGED_NAMESPACE_LABELS) if labeled else {}
-    return {"metadata": {"name": name, "labels": labels}}
+    return {"metadata": {"name": name, "labels": labels}, "status": {"phase": phase}}
 
 
 def _clusterrole_obj(name):
@@ -317,11 +317,12 @@ class PlatformStateClassifierTests(unittest.TestCase):
         with self.assertRaises(platform_state.ClassifierInspectionError):
             _classify(cluster)
 
-    def test_managed_namespace_label_wrong_is_broken(self):
+    def test_managed_namespace_label_wrong_alone_is_reconcilable(self):
+        # Live Platform + Observability End-to-End Self-Recovery Fix: the exact live incident -- namespace label drift alone, with every other Platform resource healthy -- is now a safe, deterministic, application-owned RECONCILABLE state (30-sub-platform.yaml's own idempotent Argo CD sync repairs it via managedNamespaceMetadata), never BROKEN.
         cluster = _populate_healthy_cluster(FakeCluster())
         cluster.put("namespace", RUNTIME_NAMESPACE, None, _namespace_obj(RUNTIME_NAMESPACE, labeled=False))
         result = _classify(cluster)
-        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
+        self.assertEqual(result["state"], platform_state.STATE_RECONCILABLE)
         self.assertTrue(any("managedNamespaceMetadata" in r for r in result["reasons"]))
 
     def test_wrong_release_name_is_broken(self):
@@ -485,6 +486,67 @@ class PlatformStateFluentBitShapeArchitecturalRegressionTests(unittest.TestCase)
         # A cluster whose live DaemonSet runs a mutable-tag image would satisfy an "in images" check only if the *expected* value were also mutable -- the real regression this closeout fixes is that the expected FLUENT_BIT_IMAGE itself is now validated up front, so a mutable expected value can never reach the cluster-state comparison at all.
         with self.assertRaises(ValueError):
             _classify(FakeCluster(), fluent_bit_image=f"{ECR_REGISTRY}/aws-cloud-factory-fluent-bit:latest")
+
+
+class PlatformStateReconcilableTests(unittest.TestCase):
+    """Live Platform + Observability End-to-End Self-Recovery Fix: RECONCILABLE is a narrow carve-out for deterministic, application-owned namespace-label drift only -- P1-P5 below (test naming matches the task's own P-numbering for traceability; P6-P12 are DAG/workflow/render-level proofs covered in hack/test-goldengate-deployment-models.sh, not here)."""
+
+    def test_P1_exact_live_incident_managed_by_helm_all_else_healthy_is_reconcilable(self):
+        cluster = _populate_healthy_cluster(FakeCluster())
+        ns = _namespace_obj(RUNTIME_NAMESPACE, labeled=False)
+        ns["metadata"]["labels"]["app.kubernetes.io/managed-by"] = "Helm"
+        cluster.put("namespace", RUNTIME_NAMESPACE, None, ns)
+        result = _classify(cluster)
+        self.assertEqual(result["state"], platform_state.STATE_RECONCILABLE)
+        self.assertTrue(any("app.kubernetes.io/managed-by" in r for r in result["reasons"]))
+
+    def test_P2_expected_managed_by_argocd_with_healthy_components_is_healthy(self):
+        cluster = _populate_healthy_cluster(FakeCluster())
+        result = _classify(cluster)
+        self.assertEqual(result["state"], platform_state.STATE_HEALTHY)
+        self.assertEqual(result["reasons"], [])
+
+    def test_P3_namespace_metadata_drift_plus_one_unsafe_component_is_broken(self):
+        cluster = _populate_healthy_cluster(FakeCluster())
+        cluster.put("namespace", RUNTIME_NAMESPACE, None, _namespace_obj(RUNTIME_NAMESPACE, labeled=False))
+        # The one additional unsafe component: Fluent Bit DaemonSet not fully ready.
+        ds = _daemonset_obj(platform_state.FLUENT_BIT_DAEMONSET_NAME)
+        ds["status"]["numberReady"] = 1
+        cluster.put("daemonset", platform_state.FLUENT_BIT_DAEMONSET_NAME, RUNTIME_NAMESPACE, ds)
+        result = _classify(cluster)
+        self.assertEqual(result["state"], platform_state.STATE_BROKEN, "safe reason + unsafe reason together must never yield partial credit")
+        self.assertTrue(any("managedNamespaceMetadata" in r for r in result["reasons"]))
+        self.assertTrue(any("not ready" in r for r in result["reasons"]))
+
+    def test_P4_clean_namespace_absence_preserves_absent(self):
+        cluster = FakeCluster()
+        result = _classify(cluster)
+        self.assertEqual(result["state"], platform_state.STATE_ABSENT)
+
+    def test_P5_api_inspection_error_fails_closed_never_reconcilable(self):
+        cluster = _populate_healthy_cluster(FakeCluster())
+        cluster.fail("namespace", RUNTIME_NAMESPACE, None, "Error from server (Forbidden): namespaces is forbidden")
+        with self.assertRaises(platform_state.ClassifierInspectionError):
+            _classify(cluster)
+
+    def test_terminating_namespace_alone_is_broken_never_reconcilable(self):
+        cluster = _populate_healthy_cluster(FakeCluster())
+        cluster.put("namespace", RUNTIME_NAMESPACE, None, _namespace_obj(RUNTIME_NAMESPACE, labeled=True, phase="Terminating"))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
+        self.assertTrue(any("Terminating" in r for r in result["reasons"]))
+
+    def test_terminating_namespace_plus_label_drift_is_broken(self):
+        cluster = _populate_healthy_cluster(FakeCluster())
+        cluster.put("namespace", RUNTIME_NAMESPACE, None, _namespace_obj(RUNTIME_NAMESPACE, labeled=False, phase="Terminating"))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
+
+    def test_reconcilable_requires_at_least_one_reconcilable_reason(self):
+        # Defensive proof of the classifier's own len(reconcilable_reasons) == len(reasons) contract: an empty-but-non-None reconcilable_reasons list must never be mistaken for "everything reconcilable".
+        cluster = _populate_healthy_cluster(FakeCluster())
+        result = _classify(cluster)
+        self.assertEqual(result["state"], platform_state.STATE_HEALTHY)
 
 
 class PlatformStateNoMutationSourceSweepTests(unittest.TestCase):

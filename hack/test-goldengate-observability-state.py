@@ -235,11 +235,12 @@ class ObservabilityStateClassifierTests(unittest.TestCase):
         self.assertEqual(result["state"], observability_state.STATE_BROKEN)
         self.assertTrue(any(f"serviceaccount/{observability_state.CLOUDWATCH_AGENT_SA_NAME} does not exist" in r for r in result["reasons"]))
 
-    def test_9_wrong_cloudwatch_metrics_role_is_broken(self):
+    def test_9_wrong_cloudwatch_metrics_role_alone_is_reconcilable(self):
+        # Live Platform + Observability End-to-End Self-Recovery Fix: a cloudwatch-agent ServiceAccount role-arn mismatch alone, with every other Observability resource healthy, is now a safe, deterministic, application-owned RECONCILABLE state (40-sub-observability.yaml's own "Annotate the CloudWatch Agent ServiceAccount" reconciliation step repairs it), never BROKEN -- this is expected precisely because the upstream chart renders this ServiceAccount with no role-arn annotation of its own (see 40-sub-observability.yaml's "Validate the rendered CloudWatch Agent ServiceAccount" step), so the annotation is always applied out-of-band and can always legitimately drift.
         cluster = _populate_healthy_cluster(FakeCluster())
         cluster.put("serviceaccount", observability_state.CLOUDWATCH_AGENT_SA_NAME, OBSERVABILITY_NAMESPACE, _sa_obj(observability_state.CLOUDWATCH_AGENT_SA_NAME, "arn:aws:iam::668311715351:role/SomeOtherRole"))
         result = _classify(cluster)
-        self.assertEqual(result["state"], observability_state.STATE_BROKEN)
+        self.assertEqual(result["state"], observability_state.STATE_RECONCILABLE)
         self.assertTrue(any("eks.amazonaws.com/role-arn" in r for r in result["reasons"]))
 
     def test_10_controller_deployment_not_ready_is_broken(self):
@@ -414,6 +415,43 @@ class ObservabilityStateClassifierTests(unittest.TestCase):
         result = _classify(cluster)
         self.assertEqual(result["state"], observability_state.STATE_BROKEN)
         self.assertTrue(any("source.targetRevision" in r for r in result["reasons"]))
+
+
+class ObservabilityStateReconcilableTests(unittest.TestCase):
+    """Live Platform + Observability End-to-End Self-Recovery Fix: RECONCILABLE is a narrow carve-out for deterministic cloudwatch-agent ServiceAccount role-arn drift only (test naming matches the task's own O-numbering for traceability where applicable; most O-numbered scenarios are workflow-ordering/DAG-level proofs covered in hack/test-goldengate-deployment-models.sh, not here)."""
+
+    def test_O13_sa_role_arn_missing_alone_is_reconcilable(self):
+        cluster = _populate_healthy_cluster(FakeCluster())
+        cluster.put("serviceaccount", observability_state.CLOUDWATCH_AGENT_SA_NAME, OBSERVABILITY_NAMESPACE, {"metadata": {"name": observability_state.CLOUDWATCH_AGENT_SA_NAME, "annotations": {}}})
+        result = _classify(cluster)
+        self.assertEqual(result["state"], observability_state.STATE_RECONCILABLE)
+
+    def test_O14_sa_role_arn_drift_plus_one_unsafe_component_is_broken(self):
+        cluster = _populate_healthy_cluster(FakeCluster())
+        cluster.put("serviceaccount", observability_state.CLOUDWATCH_AGENT_SA_NAME, OBSERVABILITY_NAMESPACE, _sa_obj(observability_state.CLOUDWATCH_AGENT_SA_NAME, "arn:aws:iam::668311715351:role/SomeOtherRole"))
+        # The one additional unsafe component: cloudwatch-agent DaemonSet not fully ready.
+        ds = _daemonset_obj("cloudwatch-agent")
+        ds["status"]["numberReady"] = 0
+        cluster.put("daemonset", "cloudwatch-agent", OBSERVABILITY_NAMESPACE, ds)
+        result = _classify(cluster)
+        self.assertEqual(result["state"], observability_state.STATE_BROKEN, "safe reason + unsafe reason together must never yield partial credit")
+        self.assertTrue(any("eks.amazonaws.com/role-arn" in r for r in result["reasons"]))
+        self.assertTrue(any("not ready" in r for r in result["reasons"]))
+
+    def test_O9_cluster_scraper_hostnetwork_false_contract_still_enforced(self):
+        # Preserves the pre-existing hostNetwork=false contract for the scraper Agent CR -- this classifier check is unrelated to and unweakened by the new RECONCILABLE carve-out.
+        cluster = _populate_healthy_cluster(FakeCluster())
+        cluster.put(observability_state.AGENT_CR_RESOURCE, "cloudwatch-agent-cluster-scraper", OBSERVABILITY_NAMESPACE, _agent_cr_obj("cloudwatch-agent-cluster-scraper", "deployment", True))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], observability_state.STATE_BROKEN)
+        self.assertTrue(any("cloudwatch-agent-cluster-scraper" in r and "spec.hostNetwork" in r for r in result["reasons"]))
+
+    def test_sa_missing_entirely_remains_broken_never_reconcilable(self):
+        # Distinct from an annotation mismatch: the specialist workflow's "Annotate the CloudWatch Agent ServiceAccount" step only ever annotates an EXISTING ServiceAccount (its own `kubectl get serviceaccount ... >/dev/null` guard fails closed first) -- a missing ServiceAccount is never safely auto-repairable by that step, so it must stay exclusively in `reasons`, never `reconcilable_reasons`.
+        cluster = _populate_healthy_cluster(FakeCluster())
+        cluster.objects.pop(("serviceaccount", observability_state.CLOUDWATCH_AGENT_SA_NAME, OBSERVABILITY_NAMESPACE))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], observability_state.STATE_BROKEN)
 
 
 class ObservabilityStateNoMutationSourceSweepTests(unittest.TestCase):

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""hack/orchestration/observability_state.py: read-only Observability (amazon-cloudwatch-observability) prerequisite classifier (Phase B2) -- answers exactly one question, "what is the current Observability prerequisite state?", as one of ABSENT/HEALTHY/BROKEN. Never mutates the cluster: every kubectl invocation here is a `get` (read-only); no apply/create/delete/patch/annotate/label/helm call exists in this module. Consumes environment identity through hack/goldengate-environment.py, never a second environment parser. The desired contract (resource names, Application identity, Agent CR/workload shape, allowed image repositories, forbidden components) is read directly from .github/workflows/40-sub-observability.yaml's own live-validation section, never guessed -- the upstream amazon-cloudwatch-observability chart itself is not vendored as source in this repo."""
+"""hack/orchestration/observability_state.py: read-only Observability (amazon-cloudwatch-observability) prerequisite classifier (Phase B2) -- answers exactly one question, "what is the current Observability prerequisite state?", as one of ABSENT/HEALTHY/RECONCILABLE/BROKEN. RECONCILABLE (Live Platform + Observability End-to-End Self-Recovery Fix) is a narrow, deliberately conservative carve-out mirroring hack/orchestration/argocd_state.py's own RECONCILABLE: the cloudwatch-agent ServiceAccount's eks.amazonaws.com/role-arn annotation is the ONLY drift (the upstream chart renders this ServiceAccount with no role-arn annotation of its own -- see 40-sub-observability.yaml's "Validate the rendered CloudWatch Agent ServiceAccount" step -- so this is expected, deterministic, application-owned drift, never a foreign/ambiguous ownership problem), a class the existing reusable Observability specialist workflow's own "Annotate the CloudWatch Agent ServiceAccount with the dedicated IRSA role" reconciliation step already safely repairs; any other drift at all still classifies BROKEN. Never mutates the cluster: every kubectl invocation here is a `get` (read-only); no apply/create/delete/patch/annotate/label/helm call exists in this module. Consumes environment identity through hack/goldengate-environment.py, never a second environment parser. The desired contract (resource names, Application identity, Agent CR/workload shape, allowed image repositories, forbidden components) is read directly from .github/workflows/40-sub-observability.yaml's own live-validation section, never guessed -- the upstream amazon-cloudwatch-observability chart itself is not vendored as source in this repo."""
 from __future__ import annotations
 
 import argparse
@@ -54,6 +54,7 @@ def environment_derived_values(environment):
 
 STATE_ABSENT = "ABSENT"
 STATE_HEALTHY = "HEALTHY"
+STATE_RECONCILABLE = "RECONCILABLE"
 STATE_BROKEN = "BROKEN"
 
 # Current chart/workflow contract (.github/workflows/40-sub-observability.yaml) -- verified against the real workflow's own Application-manifest generation and live-validation section, never guessed.
@@ -113,6 +114,8 @@ def _image_reasons(resource_label, images, ecr_registry):
 def classify(run, environment, observability_namespace, argocd_namespace, ecr_registry, cloudwatch_metrics_role_arn):
     """Returns the stable {"state", "environment", "namespace", "reasons", "checks"} shape. Raises ClassifierInspectionError if Kubernetes access itself could not be trusted -- callers must let that propagate as a hard failure, never a downgrade to ABSENT."""
     reasons = []
+    # Subset of `reasons` that is safe to auto-repair via the existing reusable Observability specialist workflow's own "Annotate the CloudWatch Agent ServiceAccount with the dedicated IRSA role" reconciliation step -- never a broader "any drift is safe" carve-out. Only a cloudwatch-agent ServiceAccount role-arn mismatch is added here; every other reason (Application health, missing/not-ready workloads, image provenance, Agent CR shape, forbidden components) stays exclusively in `reasons` and therefore forces BROKEN below.
+    reconcilable_reasons = []
     checks = {}
 
     expected_repo_url = f"oci://{ecr_registry}/{HELM_REPO_PATH}"
@@ -171,7 +174,9 @@ def classify(run, environment, observability_namespace, argocd_namespace, ecr_re
         else:
             role_arn = ((sa_obj.get("metadata") or {}).get("annotations") or {}).get("eks.amazonaws.com/role-arn")
             if role_arn != cloudwatch_metrics_role_arn:
-                reasons.append(f"serviceaccount/{CLOUDWATCH_AGENT_SA_NAME} eks.amazonaws.com/role-arn={role_arn!r}, expected {cloudwatch_metrics_role_arn!r}")
+                reason = f"serviceaccount/{CLOUDWATCH_AGENT_SA_NAME} eks.amazonaws.com/role-arn={role_arn!r}, expected {cloudwatch_metrics_role_arn!r}"
+                reasons.append(reason)
+                reconcilable_reasons.append(reason)
 
         deploy_status = {}
         for name in REQUIRED_DEPLOYMENTS:
@@ -239,7 +244,13 @@ def classify(run, environment, observability_namespace, argocd_namespace, ecr_re
                 names = [i.get("metadata", {}).get("name") for i in items]
                 reasons.append(f"forbidden {resource} resource(s) found in {observability_namespace}: {names!r}")
 
-    state = STATE_HEALTHY if not reasons else STATE_BROKEN
+    # RECONCILABLE only when EVERY collected reason is in the reconcilable subset (cloudwatch-agent ServiceAccount role-arn drift only, with the Application, workloads, Agent CR shape, image provenance, and the metrics-only negative-safety contract all otherwise clean) -- any other reason at all (missing/unready workload, foreign ownership, an unapproved image, a forbidden component) forces BROKEN, never a broader "partial drift is fine" default.
+    if not reasons:
+        state = STATE_HEALTHY
+    elif reconcilable_reasons and len(reconcilable_reasons) == len(reasons):
+        state = STATE_RECONCILABLE
+    else:
+        state = STATE_BROKEN
     return {"state": state, "environment": environment, "namespace": observability_namespace, "reasons": reasons, "checks": checks}
 
 

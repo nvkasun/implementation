@@ -673,7 +673,7 @@ jobs:
   platform_preflight:
     name: Classify GoldenGate Platform prerequisite state (read-only)
 
-    # Phase B2: the ownership-aware application-prerequisite state machine extended to the GoldenGate Platform chart -- ABSENT -> reconcile via 30-sub-platform.yaml, HEALTHY -> continue, BROKEN -> fail closed, never auto-repaired. Runs independently of observability_preflight (siblings after Argo, not a chain) so both branches can execute in parallel. This job never mutates the cluster -- it only runs hack/orchestration/platform_state.py, which itself issues read-only `kubectl get` calls.
+    # Phase B2: the ownership-aware application-prerequisite state machine extended to the GoldenGate Platform chart -- ABSENT/RECONCILABLE -> reconcile via 30-sub-platform.yaml (Live Platform + Observability End-to-End Self-Recovery Fix added RECONCILABLE: deterministic, application-owned namespace-label drift only), HEALTHY -> continue, BROKEN -> fail closed, never auto-repaired. Runs independently of observability_preflight (siblings after Argo, not a chain) so both branches can execute in parallel. This job never mutates the cluster -- it only runs hack/orchestration/platform_state.py, which itself issues read-only `kubectl get` calls.
     needs:
       - validate_model
       - validate_argocd_ready
@@ -786,7 +786,7 @@ jobs:
   observability_preflight:
     name: Classify Observability prerequisite state (read-only)
 
-    # Phase B2: the ownership-aware application-prerequisite state machine extended to Observability -- ABSENT -> reconcile via 40-sub-observability.yaml, HEALTHY -> continue, BROKEN -> fail closed, never auto-repaired. Deliberately does NOT depend on platform_preflight -- both are independent application-owned prerequisites after Argo and run in parallel. This job never mutates the cluster -- it only runs hack/orchestration/observability_state.py, which itself issues read-only `kubectl get` calls.
+    # Phase B2: the ownership-aware application-prerequisite state machine extended to Observability -- ABSENT/RECONCILABLE -> reconcile via 40-sub-observability.yaml (Live Platform + Observability End-to-End Self-Recovery Fix added RECONCILABLE: deterministic cloudwatch-agent ServiceAccount role-arn drift only), HEALTHY -> continue, BROKEN -> fail closed, never auto-repaired. Deliberately does NOT depend on platform_preflight -- both are independent application-owned prerequisites after Argo and run in parallel. This job never mutates the cluster -- it only runs hack/orchestration/observability_state.py, which itself issues read-only `kubectl get` calls.
     needs:
       - validate_model
       - validate_argocd_ready
@@ -889,13 +889,13 @@ jobs:
           fi
 
   platform_sync_once:
-    name: Reconcile the GoldenGate platform chart (only when currently absent)
+    name: Reconcile the GoldenGate platform chart (only when currently absent or safely reconcilable)
 
-    # Runs the reusable specialist workflow synchronously as part of this DAG -- never an asynchronous CLI/API dispatch or repository_dispatch trigger. Skipped entirely (not run) whenever the platform is already HEALTHY or preflight found it BROKEN -- MAIN is prerequisite orchestration, not a general upgrade engine; an engineer who intentionally wants to upgrade/reconcile an already-existing platform runs 30-sub-platform.yaml standalone.
+    # Runs the reusable specialist workflow synchronously as part of this DAG -- never an asynchronous CLI/API dispatch or repository_dispatch trigger. Skipped entirely (not run) whenever the platform is already HEALTHY or preflight found it BROKEN -- MAIN is prerequisite orchestration, not a general upgrade engine; an engineer who intentionally wants to upgrade/reconcile an already-existing platform runs 30-sub-platform.yaml standalone. Live Platform + Observability End-to-End Self-Recovery Fix: RECONCILABLE (deterministic, application-owned namespace-label drift that 30-sub-platform.yaml's own idempotent Argo CD sync already safely repairs via managedNamespaceMetadata) now also triggers this same reconciliation, mirroring reconcile_argocd's ABSENT/RECONCILABLE handling for Argo CD -- HEALTHY still does not re-trigger reconciliation here, unchanged from the existing intended architecture.
     needs:
       - validate_model
       - platform_preflight
-    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.platform_preflight.result == 'success' && needs.platform_preflight.outputs.state == 'ABSENT' }}
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.platform_preflight.result == 'success' && (needs.platform_preflight.outputs.state == 'ABSENT' || needs.platform_preflight.outputs.state == 'RECONCILABLE') }}
 
     uses: ./.github/workflows/30-sub-platform.yaml
     with:
@@ -904,13 +904,13 @@ jobs:
       orchestrated_by_main: true
 
   observability_sync_once:
-    name: Reconcile Observability (only when currently absent)
+    name: Reconcile Observability (only when currently absent or safely reconcilable)
 
-    # Runs the reusable specialist workflow synchronously as part of this DAG -- never an asynchronous CLI/API dispatch or repository_dispatch trigger. Skipped entirely (not run) whenever Observability is already HEALTHY or preflight found it BROKEN -- same ABSENT-only reconciliation boundary as platform_sync_once.
+    # Runs the reusable specialist workflow synchronously as part of this DAG -- never an asynchronous CLI/API dispatch or repository_dispatch trigger. Skipped entirely (not run) whenever Observability is already HEALTHY or preflight found it BROKEN -- same ABSENT/RECONCILABLE reconciliation boundary as platform_sync_once. Live Platform + Observability End-to-End Self-Recovery Fix: RECONCILABLE (deterministic cloudwatch-agent ServiceAccount role-arn drift that 40-sub-observability.yaml's own IRSA reconciliation step already safely repairs) now also triggers this same reconciliation -- HEALTHY still does not re-trigger reconciliation here, unchanged from the existing intended architecture.
     needs:
       - validate_model
       - observability_preflight
-    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.observability_preflight.result == 'success' && needs.observability_preflight.outputs.state == 'ABSENT' }}
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.observability_preflight.result == 'success' && (needs.observability_preflight.outputs.state == 'ABSENT' || needs.observability_preflight.outputs.state == 'RECONCILABLE') }}
 
     uses: ./.github/workflows/40-sub-observability.yaml
     with:
@@ -921,12 +921,12 @@ jobs:
   validate_platform_ready:
     name: Validate GoldenGate Platform is healthy (convergence point for the already-healthy and just-reconciled paths)
 
-    # always() overrides GitHub's default implicit skip-on-skipped-dependency behavior (platform_sync_once is legitimately skipped on the already-HEALTHY path) -- the explicit result/state checks below are what actually keep this fail-closed, exactly like validate_argocd_ready's established always()-plus-explicit-result pattern above.
+    # always() overrides GitHub's default implicit skip-on-skipped-dependency behavior (platform_sync_once is legitimately skipped on the already-HEALTHY path) -- the explicit result/state checks below are what actually keep this fail-closed, exactly like validate_argocd_ready's established always()-plus-explicit-result pattern above. Live Platform + Observability End-to-End Self-Recovery Fix: RECONCILABLE now also requires platform_sync_once to have succeeded first, exactly like ABSENT -- this job's own re-classification below still independently requires exactly HEALTHY, regardless of which path was taken.
     needs:
       - validate_model
       - platform_preflight
       - platform_sync_once
-    if: ${{ always() && needs.validate_model.outputs.effective_deploy == 'true' && needs.platform_preflight.result == 'success' && (needs.platform_preflight.outputs.state == 'HEALTHY' || (needs.platform_preflight.outputs.state == 'ABSENT' && needs.platform_sync_once.result == 'success')) }}
+    if: ${{ always() && needs.validate_model.outputs.effective_deploy == 'true' && needs.platform_preflight.result == 'success' && (needs.platform_preflight.outputs.state == 'HEALTHY' || ((needs.platform_preflight.outputs.state == 'ABSENT' || needs.platform_preflight.outputs.state == 'RECONCILABLE') && needs.platform_sync_once.result == 'success')) }}
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -1030,12 +1030,12 @@ jobs:
   validate_observability_ready:
     name: Validate Observability is healthy (convergence point for the already-healthy and just-reconciled paths)
 
-    # always() overrides GitHub's default implicit skip-on-skipped-dependency behavior (observability_sync_once is legitimately skipped on the already-HEALTHY path) -- same always()-plus-explicit-result pattern as validate_platform_ready above.
+    # always() overrides GitHub's default implicit skip-on-skipped-dependency behavior (observability_sync_once is legitimately skipped on the already-HEALTHY path) -- same always()-plus-explicit-result pattern as validate_platform_ready above. Live Platform + Observability End-to-End Self-Recovery Fix: RECONCILABLE now also requires observability_sync_once to have succeeded first, exactly like ABSENT -- this job's own re-classification below still independently requires exactly HEALTHY, regardless of which path was taken.
     needs:
       - validate_model
       - observability_preflight
       - observability_sync_once
-    if: ${{ always() && needs.validate_model.outputs.effective_deploy == 'true' && needs.observability_preflight.result == 'success' && (needs.observability_preflight.outputs.state == 'HEALTHY' || (needs.observability_preflight.outputs.state == 'ABSENT' && needs.observability_sync_once.result == 'success')) }}
+    if: ${{ always() && needs.validate_model.outputs.effective_deploy == 'true' && needs.observability_preflight.result == 'success' && (needs.observability_preflight.outputs.state == 'HEALTHY' || ((needs.observability_preflight.outputs.state == 'ABSENT' || needs.observability_preflight.outputs.state == 'RECONCILABLE') && needs.observability_sync_once.result == 'success')) }}
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
