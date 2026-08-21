@@ -7972,34 +7972,34 @@ check("2: platform_sync_once must be skipped", r["platform_sync_once"]["result"]
 check("2: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
 check("2: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
 
-# 3: deploy=true + Argo CD already HEALTHY (Live Argo Recovery Fix: reconcile_argocd now RUNS even on HEALTHY -- a DEPLOY converges the live release to current desired state, it never merely skips because a classifier proved runtime health) + platform ABSENT+reconcile failure (observability stays HEALTHY, isolating the failure to platform) -> runtime build/deploy cannot execute.
+# 3: deploy=true + Argo CD already OWNED (Generic MAIN Desired-State Convergence Fix: reconcile_argocd now ALWAYS RUNS on OWNED -- a DEPLOY converges the live release to current desired state, it never merely skips because a classifier proved ownership) + platform ABSENT+reconcile failure (observability stays OWNED, isolating the failure to platform) -> runtime build/deploy cannot execute.
 ctx = base_context("true")
-r = simulate(ctx, {"platform_sync_once": "failure"}, {"argocd_preflight": {"state": "HEALTHY"}, "platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "HEALTHY"}})
-check("3: reconcile_argocd must RUN (and succeed) even when Argo CD is already HEALTHY", r["reconcile_argocd"]["result"] == "success")
-check("3: validate_argocd_ready must succeed on the already-HEALTHY-and-reconciled path", r["validate_argocd_ready"]["result"] == "success")
+r = simulate(ctx, {"platform_sync_once": "failure"}, {"argocd_preflight": {"state": "OWNED"}, "platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "OWNED"}})
+check("3: reconcile_argocd must RUN (and succeed) even when Argo CD is already OWNED", r["reconcile_argocd"]["result"] == "success")
+check("3: validate_argocd_ready must succeed on the already-OWNED-and-reconciled path", r["validate_argocd_ready"]["result"] == "success")
 check("3: platform_sync_once must report failure", r["platform_sync_once"]["result"] == "failure")
 check("3: validate_platform_ready must be skipped after a failed platform_sync_once", r["validate_platform_ready"]["result"] == "skipped")
-check("3: observability_sync_once must be skipped (observability is already HEALTHY)", r["observability_sync_once"]["result"] == "skipped")
+check("3: observability_sync_once must still RUN (and succeed) even though observability is already OWNED -- MAIN never skips a safe owned reconciliation, isolating platform's failure", r["observability_sync_once"]["result"] == "success")
 check("3: validate_observability_ready must still succeed (independent of platform's failure)", r["validate_observability_ready"]["result"] == "success")
 check("3: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
 check("3: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
 
-# 4: deploy=true + all mutation prerequisites success (Argo CD/platform/observability all already HEALTHY, runtime ownership OWNED) -> runtime deployment may execute.
+# 4: deploy=true + all mutation prerequisites already OWNED (Argo CD/platform/observability all already-existing, safely-owned installations, runtime ownership OWNED) -> Generic MAIN Desired-State Convergence Fix requirement 4/5: MAIN STILL invokes reconcile_argocd/30-sub-platform/40-sub-observability on every Deploy, never predicting from a healthy-looking preflight that reconciliation is unnecessary -> runtime deployment may still execute.
 ctx = base_context("true")
-r = simulate(ctx, {}, {"argocd_preflight": {"state": "HEALTHY"}, "platform_preflight": {"state": "HEALTHY"}, "observability_preflight": {"state": "HEALTHY"}, "runtime_ownership_preflight": {"state": "OWNED"}})
+r = simulate(ctx, {}, {"argocd_preflight": {"state": "OWNED"}, "platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}, "runtime_ownership_preflight": {"state": "OWNED"}})
 check("4: terraform_sync_once must succeed", r["terraform_sync_once"]["result"] == "success")
 check("4: validate_argocd_ready must succeed", r["validate_argocd_ready"]["result"] == "success")
-check("4: platform_sync_once must be skipped (already HEALTHY, never reconciled)", r["platform_sync_once"]["result"] == "skipped")
-check("4: observability_sync_once must be skipped (already HEALTHY, never reconciled)", r["observability_sync_once"]["result"] == "skipped")
+check("4: platform_sync_once MUST run (and succeed) even though platform is already OWNED/healthy-looking -- MAIN never skips specialist reconciliation on a Deploy (required test 4)", r["platform_sync_once"]["result"] == "success")
+check("4: observability_sync_once MUST run (and succeed) even though observability is already OWNED/healthy-looking -- MAIN never skips specialist reconciliation on a Deploy (required test 5)", r["observability_sync_once"]["result"] == "success")
 check("4: validate_platform_ready must succeed", r["validate_platform_ready"]["result"] == "success")
 check("4: validate_observability_ready must succeed", r["validate_observability_ready"]["result"] == "success")
 check("4: validate_shared_secrets_once must succeed", r["validate_shared_secrets_once"]["result"] == "success")
 check("4: runtime_ownership_preflight must succeed (OWNED permits reconciliation)", r["runtime_ownership_preflight"]["result"] == "success")
 check("4: build_publish_and_deploy must be eligible to run", r["build_publish_and_deploy"]["result"] == "success")
 
-# 7: deploy=true + Argo CD ABSENT + reconcile_argocd succeeds -> validate_argocd_ready converges to success -> platform/observability preflights run; platform ABSENT+reconcile success, observability already HEALTHY.
+# 7: deploy=true + Argo CD ABSENT + reconcile_argocd succeeds -> validate_argocd_ready converges to success -> platform/observability preflights run; platform ABSENT+reconcile success, observability already OWNED (and therefore also reconciled, not skipped).
 ctx = base_context("true")
-r = simulate(ctx, {}, {"argocd_preflight": {"state": "ABSENT"}, "platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "HEALTHY"}})
+r = simulate(ctx, {}, {"argocd_preflight": {"state": "ABSENT"}, "platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "OWNED"}})
 check("7: reconcile_argocd must run when Argo CD is ABSENT", r["reconcile_argocd"]["result"] == "success")
 check("7: validate_argocd_ready must succeed after a successful reconciliation", r["validate_argocd_ready"]["result"] == "success")
 check("7: platform_sync_once must be eligible to run after reconciliation (platform is ABSENT)", r["platform_sync_once"]["result"] == "success")
@@ -8021,25 +8021,25 @@ check("9: reconcile_argocd must never run on BROKEN", r["reconcile_argocd"]["res
 check("9: validate_argocd_ready must be skipped on BROKEN", r["validate_argocd_ready"]["result"] == "skipped")
 check("9: platform_sync_once must be skipped on BROKEN", r["platform_sync_once"]["result"] == "skipped")
 
-# 10: deploy=true + Argo CD RECONCILABLE (the real live incident: core Argo + ECR token-sync RBAC/identity healthy, only the generated repository Secrets missing) -> reconcile_argocd must run (Live Argo Recovery Fix required scenario 2), converge to success, and platform/observability/runtime deployment must remain eligible -- this is the exact case that used to dead-end MAIN at BROKEN.
+# 10: deploy=true + Argo CD OWNED (an already-existing, safely-owned release -- e.g. only the generated repository Secrets or a newly-enabled Ingress not yet rendered) -> reconcile_argocd must run (Generic MAIN Desired-State Convergence Fix required scenario 2), converge to success, and platform/observability/runtime deployment must remain eligible -- this is the exact case that used to dead-end MAIN at BROKEN under the retired RECONCILABLE/HEALTHY split.
 ctx = base_context("true")
-r = simulate(ctx, {}, {"argocd_preflight": {"state": "RECONCILABLE"}, "platform_preflight": {"state": "HEALTHY"}, "observability_preflight": {"state": "HEALTHY"}, "runtime_ownership_preflight": {"state": "OWNED"}})
-check("10: reconcile_argocd must run (and succeed) when Argo CD is RECONCILABLE", r["reconcile_argocd"]["result"] == "success")
-check("10: validate_argocd_ready must succeed after a successful RECONCILABLE reconciliation", r["validate_argocd_ready"]["result"] == "success")
-check("10: platform_preflight must remain eligible (never dead-ends behind a RECONCILABLE Argo CD)", r["platform_preflight"]["result"] == "success")
+r = simulate(ctx, {}, {"argocd_preflight": {"state": "OWNED"}, "platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}, "runtime_ownership_preflight": {"state": "OWNED"}})
+check("10: reconcile_argocd must run (and succeed) when Argo CD is OWNED", r["reconcile_argocd"]["result"] == "success")
+check("10: validate_argocd_ready must succeed after a successful OWNED reconciliation", r["validate_argocd_ready"]["result"] == "success")
+check("10: platform_preflight must remain eligible (never dead-ends behind an OWNED Argo CD)", r["platform_preflight"]["result"] == "success")
 check("10: build_publish_and_deploy must remain eligible to run", r["build_publish_and_deploy"]["result"] == "success")
 
-# 11: action=validate (effective_deploy=false) with an otherwise-reconcilable/absent Argo CD state -> argocd_preflight/reconcile_argocd must both be skipped -- Validate mode never mutates Argo CD regardless of classified state. (Live Argo Recovery Fix required scenario 5.)
+# 11: action=validate (effective_deploy=false) with an otherwise-owned/absent Argo CD state -> argocd_preflight/reconcile_argocd must both be skipped -- Validate mode never mutates Argo CD regardless of classified state. (Generic MAIN Desired-State Convergence Fix required scenario 5.)
 ctx = base_context("false")
 ctx["managed_efs_inventory_guard"] = {"result": "skipped", "outputs": {}}
-r = simulate(ctx, {}, {"argocd_preflight": {"state": "RECONCILABLE"}})
+r = simulate(ctx, {}, {"argocd_preflight": {"state": "OWNED"}})
 check("11: argocd_preflight must be skipped in Validate mode regardless of live state", r["argocd_preflight"]["result"] == "skipped")
 check("11: reconcile_argocd must never run in Validate mode (no mutating Argo CD reconciliation)", r["reconcile_argocd"]["result"] == "skipped")
 check("11: validate_argocd_ready must be skipped in Validate mode", r["validate_argocd_ready"]["result"] == "skipped")
 
-# 12: deploy=true + reconcile_argocd itself reports success, but validate_argocd_ready's own post-reconcile re-classification still fails (the cluster converges to something other than exactly HEALTHY -- RECONCILABLE or BROKEN, modeled here as validate_argocd_ready's own result, since that job's internal script is what enforces the strict != "HEALTHY" fail-closed check) -> platform must never run. (Live Argo Recovery Fix required scenario 8: "reconcile success + final RECONCILABLE/BROKEN => downstream platform orchestration cannot continue".)
+# 12: deploy=true + reconcile_argocd itself reports success, but validate_argocd_ready's own post-reconcile re-classification still fails (the cluster converges to something other than exactly HEALTHY -- modeled here as validate_argocd_ready's own result, since that job's internal acceptance script is what enforces the strict != "HEALTHY" fail-closed check) -> platform must never run. (Generic MAIN Desired-State Convergence Fix required scenario 8: "reconcile success + final acceptance not HEALTHY => downstream platform orchestration cannot continue".)
 ctx = base_context("true")
-r = simulate(ctx, {"validate_argocd_ready": "failure"}, {"argocd_preflight": {"state": "RECONCILABLE"}})
+r = simulate(ctx, {"validate_argocd_ready": "failure"}, {"argocd_preflight": {"state": "OWNED"}})
 check("12: reconcile_argocd itself must still report success (the SUB workflow completed)", r["reconcile_argocd"]["result"] == "success")
 check("12: validate_argocd_ready must report failure when final re-classification is not exactly HEALTHY", r["validate_argocd_ready"]["result"] == "failure")
 check("12: platform_preflight must never run when validate_argocd_ready failed post-reconcile", r["platform_preflight"]["result"] == "skipped")
@@ -8071,16 +8071,16 @@ PYEOF
   if [ "$FAIL_CLOSED_SIM_STATUS" -eq 0 ]; then
     pass "1: deploy=true + managed_efs_inventory_guard failure blocks terraform_sync_once and build_publish_and_deploy (simulated end-to-end against the real if: expressions)"
     pass "2: deploy=true + terraform_sync_once failure blocks platform_sync_once/validate_shared_secrets_once/build_publish_and_deploy"
-    pass "3 (Live Argo Recovery Fix): deploy=true + Argo CD already HEALTHY still runs reconcile_argocd (a DEPLOY converges the live release to current desired state) + platform_sync_once failure blocks validate_shared_secrets_once/build_publish_and_deploy"
-    pass "4: deploy=true + all mutation prerequisites succeeding (including Argo CD already HEALTHY and reconciled) leaves build_publish_and_deploy eligible to run"
+    pass "3 (Generic MAIN Desired-State Convergence Fix): deploy=true + Argo CD/Observability already OWNED still runs reconcile_argocd/observability_sync_once (a DEPLOY always converges the live release to current desired state) + platform_sync_once failure blocks validate_shared_secrets_once/build_publish_and_deploy"
+    pass "4 (Generic MAIN Desired-State Convergence Fix): deploy=true + all mutation prerequisites already OWNED still invokes reconcile_argocd/platform_sync_once/observability_sync_once (never skipped merely because preflight looked healthy) and leaves build_publish_and_deploy eligible to run"
     pass "5: deploy=false correctly skips terraform_sync_once/platform_sync_once while the read-only/dry-run path through validate_shared_secrets_once and build_publish_and_deploy still runs"
     pass "6: build_publish_and_deploy's if: rejects a skipped validate_shared_secrets_once (requires exact 'success', not the old != failure/!= cancelled assertion)"
     pass "7 (Phase B1): Argo CD ABSENT + successful reconcile_argocd converges validate_argocd_ready to success and leaves platform_sync_once eligible to run"
     pass "8 (Live Argo Recovery Fix): Argo CD ABSENT + failed reconcile_argocd skips validate_argocd_ready and platform_sync_once (never assumes reconciliation success)"
     pass "9 (Live Argo Recovery Fix): Argo CD BROKEN (argocd_preflight itself fails) never enters reconcile_argocd and skips validate_argocd_ready/platform_sync_once"
-    pass "10 (Live Argo Recovery Fix): Argo CD RECONCILABLE (the real live incident) runs reconcile_argocd, converges to success, and leaves platform/runtime deployment eligible -- MAIN no longer dead-ends at BROKEN for this case"
-    pass "11 (Live Argo Recovery Fix): action=validate never mutates Argo CD regardless of the live classified state (argocd_preflight/reconcile_argocd both skipped)"
-    pass "12 (Live Argo Recovery Fix): reconcile_argocd succeeding does not by itself satisfy the gate -- validate_argocd_ready's own post-reconcile re-classification must still be exactly HEALTHY, or platform/runtime deployment remain ineligible"
+    pass "10 (Generic MAIN Desired-State Convergence Fix): Argo CD OWNED (an already-existing, safely-owned release) runs reconcile_argocd, converges to success, and leaves platform/runtime deployment eligible -- MAIN no longer dead-ends at BROKEN for this case"
+    pass "11 (Generic MAIN Desired-State Convergence Fix): action=validate never mutates Argo CD regardless of the live classified state (argocd_preflight/reconcile_argocd both skipped)"
+    pass "12 (Generic MAIN Desired-State Convergence Fix): reconcile_argocd succeeding does not by itself satisfy the gate -- validate_argocd_ready's own post-reconcile re-classification must still be exactly HEALTHY, or platform/runtime deployment remain ineligible"
   else
     fail "fail-closed job-graph simulation found violation(s): ${FAIL_CLOSED_SIM_OUT}"
   fi
@@ -10791,7 +10791,7 @@ fi
 echo ""
 echo "--- Phase B1 / Live Argo Recovery Fix: Argo CD prerequisite classification + automatic desired-state reconciliation ---"
 
-# Structural proof, read directly from the real committed YAML of both workflows (never a reimplementation): 20-sub-argocd.yaml is reusable via workflow_call, and the main orchestrator's argocd_preflight/reconcile_argocd/validate_argocd_ready/platform_sync_once DAG has exactly the wiring the ownership-aware ABSENT/RECONCILABLE/HEALTHY/BROKEN contract requires -- reconcile_argocd runs for every non-terminal state (ABSENT/RECONCILABLE/HEALTHY), never on BROKEN, and platform is never reachable without a validated-healthy Argo CD.
+# Structural proof, read directly from the real committed YAML of both workflows (never a reimplementation): 20-sub-argocd.yaml is reusable via workflow_call, and the main orchestrator's argocd_preflight/reconcile_argocd/validate_argocd_ready/platform_sync_once DAG has exactly the wiring the ownership-safety ABSENT/OWNED/BROKEN contract requires -- reconcile_argocd ALWAYS runs on the two safe preflight states (ABSENT/OWNED), never on BROKEN, and platform is never reachable without a strictly-validated-healthy Argo CD.
 if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$ARGOCD_DEPLOY_WORKFLOW" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
   PHASE_B1_CHECK="$(python3 -c '
 import yaml
@@ -10825,8 +10825,8 @@ reconcile = jobs.get("reconcile_argocd", {})
 results.append(("6: reconcile_argocd calls the reusable 20-sub-argocd.yaml (never gh workflow run)", reconcile.get("uses") == "./.github/workflows/20-sub-argocd.yaml"))
 reconcile_if = reconcile.get("if", "")
 results.append(("7a: reconcile_argocd runs when argocd_preflight.outputs.state == ABSENT", "argocd_preflight.outputs.state == \x27ABSENT\x27" in reconcile_if))
-results.append(("7b: reconcile_argocd runs when argocd_preflight.outputs.state == RECONCILABLE (the Live Argo Recovery Fix case)", "argocd_preflight.outputs.state == \x27RECONCILABLE\x27" in reconcile_if))
-results.append(("7c: reconcile_argocd runs when argocd_preflight.outputs.state == HEALTHY (a DEPLOY still converges the live release to current desired state)", "argocd_preflight.outputs.state == \x27HEALTHY\x27" in reconcile_if))
+results.append(("7b: reconcile_argocd runs when argocd_preflight.outputs.state == OWNED (a DEPLOY always converges an already-owned live release to the current committed desired state -- the Generic MAIN Desired-State Convergence Fix case)", "argocd_preflight.outputs.state == \x27OWNED\x27" in reconcile_if))
+results.append(("7c: the reconcile_argocd condition no longer references the retired RECONCILABLE/HEALTHY preflight states -- ABSENT/OWNED is the complete non-terminal contract", "RECONCILABLE" not in reconcile_if and "HEALTHY" not in reconcile_if))
 results.append(("8: reconcile_argocd condition contains no BROKEN branch -- BROKEN can never enter reconciliation", "BROKEN" not in reconcile_if))
 results.append(("8b: reconcile_argocd requires argocd_preflight to have actually succeeded first", "needs.argocd_preflight.result == \x27success\x27" in reconcile_if))
 
@@ -10887,10 +10887,10 @@ else
   fail "Phase B1: ${ARGOCD_STATE_TOOL} is missing"
 fi
 
-# The classifier's own dedicated offline unit-test suite (ABSENT/HEALTHY/BROKEN, all 15 required scenarios) is part of the normal regression run, not merely available separately.
+# The two classifiers' own dedicated offline unit-test suites are part of the normal regression run, not merely available separately: hack/test-goldengate-argocd-state.py covers pre-reconciliation ownership safety (ABSENT/OWNED/BROKEN); hack/test-goldengate-argocd-acceptance.py covers the separate, strict post-reconciliation acceptance classifier (HEALTHY/BROKEN), including the true->false Ingress-pruning proof.
 if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f hack/test-goldengate-argocd-state.py ]; then
   if ARGOCD_STATE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 hack/test-goldengate-argocd-state.py 2>&1)"; then
-    pass "Phase B1: hack/test-goldengate-argocd-state.py (the Argo CD classifier's offline ABSENT/HEALTHY/BROKEN test suite) passes"
+    pass "Phase B1: hack/test-goldengate-argocd-state.py (the Argo CD ownership classifier's offline ABSENT/OWNED/BROKEN test suite) passes"
   else
     fail "Phase B1: hack/test-goldengate-argocd-state.py failed:"$'\n'"${ARGOCD_STATE_TEST_OUTPUT}"
   fi
@@ -10898,10 +10898,20 @@ else
   skip "Phase B1: hack/test-goldengate-argocd-state.py -- python3 unavailable or file missing"
 fi
 
-echo ""
-echo "--- Live Argo Self-Recovery Fix: MAIN preflight/final-convergence script execution + contract marker ---"
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f hack/test-goldengate-argocd-acceptance.py ]; then
+  if ARGOCD_ACCEPTANCE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 hack/test-goldengate-argocd-acceptance.py 2>&1)"; then
+    pass "Phase B1: hack/test-goldengate-argocd-acceptance.py (the Argo CD post-reconciliation acceptance classifier's offline HEALTHY/BROKEN test suite) passes"
+  else
+    fail "Phase B1: hack/test-goldengate-argocd-acceptance.py failed:"$'\n'"${ARGOCD_ACCEPTANCE_TEST_OUTPUT}"
+  fi
+else
+  skip "Phase B1: hack/test-goldengate-argocd-acceptance.py -- python3 unavailable or file missing"
+fi
 
-# H/I/N: REALLY EXECUTE the committed "Classify Argo CD prerequisite state" (argocd_preflight) and "Re-classify and require Argo CD to be exactly HEALTHY" (validate_argocd_ready) step scripts (never a reimplementation) against a fake hack/orchestration/argocd_state.py stub shadowed via cwd, for every classifier state -- proving argocd_preflight succeeds (and publishes the right state= output) for ABSENT/HEALTHY/RECONCILABLE and fails for BROKEN (H/I), and that validate_argocd_ready's final convergence accepts ONLY exactly HEALTHY -- a reconcile_argocd that "succeeded" while the cluster is still RECONCILABLE (Secrets never actually got created) or BROKEN must still fail closed (N).
+echo ""
+echo "--- Generic MAIN Desired-State Convergence Fix: Argo CD preflight/acceptance script execution ---"
+
+# H/I/N: REALLY EXECUTE the committed "Classify Argo CD ownership safety" (argocd_preflight) and "Re-classify and require Argo CD to be exactly HEALTHY" (validate_argocd_ready) step scripts (never a reimplementation) against fake hack/orchestration/argocd_state.py and hack/orchestration/argocd_acceptance.py stubs shadowed via cwd, for every classifier state -- proving argocd_preflight succeeds (and publishes the right state= output) for ABSENT/OWNED and fails for BROKEN (H/I), and that validate_argocd_ready's final convergence accepts ONLY exactly HEALTHY -- a reconcile_argocd that "succeeded" while the cluster is still BROKEN post-reconciliation must still fail closed (N). Neither script accepts or checks any contract marker any more -- ABSENT/OWNED/BROKEN and HEALTHY/BROKEN are now generic, stable contracts shared with runtime_state.py/monitor_state.py, so there is nothing left to cross-check.
 if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
   set +e
   LIVE_ARGO_SELF_RECOVERY_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
@@ -10915,12 +10925,12 @@ import yaml
 with open(sys.argv[1]) as f:
     doc = yaml.safe_load(f)
 
-preflight_step = next((s for s in doc["jobs"]["argocd_preflight"]["steps"] if s.get("name") == "Classify Argo CD prerequisite state"), None)
+preflight_step = next((s for s in doc["jobs"]["argocd_preflight"]["steps"] if s.get("name") == "Classify Argo CD ownership safety"), None)
 ready_step = next((s for s in doc["jobs"]["validate_argocd_ready"]["steps"] if s.get("name") == "Re-classify and require Argo CD to be exactly HEALTHY"), None)
 
 results = []
 if preflight_step is None:
-    results.append(("H/I: argocd_preflight defines its 'Classify Argo CD prerequisite state' step", False))
+    results.append(("H/I: argocd_preflight defines its 'Classify Argo CD ownership safety' step", False))
 if ready_step is None:
     results.append(("N: validate_argocd_ready defines its 'Re-classify and require Argo CD to be exactly HEALTHY' step", False))
 
@@ -10929,20 +10939,20 @@ p = argparse.ArgumentParser()
 p.add_argument("--environment", required=True)
 p.add_argument("--kubectl-bin", default="kubectl")
 p.parse_args()
-print(json.dumps({{"contract": {contract!r}, "state": {state!r}, "environment": "dev", "namespace": "argocd", "reasons": [], "checks": {{}}}}))
+print(json.dumps({{"state": {state!r}, "environment": "dev", "namespace": "argocd", "reasons": [], "checks": {{}}}}))
 sys.exit(0)
 '''
 
 
-def run_step(script, state, contract="argocd-recovery-v2"):
+def run_step(script, state, tool_name):
     with tempfile.TemporaryDirectory() as tmp_dir:
         tool_dir = os.path.join(tmp_dir, "hack", "orchestration")
         os.makedirs(tool_dir)
-        with open(os.path.join(tool_dir, "argocd_state.py"), "w") as f:
-            f.write(STUB_TEMPLATE.format(contract=contract, state=state))
+        with open(os.path.join(tool_dir, tool_name + ".py"), "w") as f:
+            f.write(STUB_TEMPLATE.format(state=state))
         fd, gh_output_path = tempfile.mkstemp()
         os.close(fd)
-        # PIP_BREAK_SYSTEM_PACKAGES=1: this local sandbox's system Python is PEP 668 externally-managed, so the real script's own unmodified "python3 -m pip install ... PyYAML==6.0.1" line (PyYAML is already satisfied here) would otherwise abort the whole extracted script under set -euo pipefail before it ever reaches the classify logic being tested -- never an issue on the real GitHub-hosted/CodeBuild runners this workflow actually targets.
+        # PIP_BREAK_SYSTEM_PACKAGES=1: this local sandbox's system Python is PEP 668 externally-managed, so the real validate_argocd_ready step's own unmodified "python3 -m pip install ... PyYAML==6.0.1" line (PyYAML is already satisfied here) would otherwise abort the whole extracted script under set -euo pipefail before it ever reaches the classify logic being tested -- never an issue on the real GitHub-hosted/CodeBuild runners this workflow actually targets.
         env = {"PATH": os.environ.get("PATH", ""), "GG_SELECTED_ENVIRONMENT": "dev", "GITHUB_OUTPUT": gh_output_path, "PIP_BREAK_SYSTEM_PACKAGES": "1"}
         proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, cwd=tmp_dir, timeout=30)
         with open(gh_output_path) as f:
@@ -10953,24 +10963,18 @@ def run_step(script, state, contract="argocd-recovery-v2"):
 
 if preflight_step is not None:
     preflight_script = preflight_step["run"]
-    for state in ("ABSENT", "HEALTHY", "RECONCILABLE"):
-        rc, out, log = run_step(preflight_script, state)
+    for state in ("ABSENT", "OWNED"):
+        rc, out, log = run_step(preflight_script, state, "argocd_state")
         results.append((f"H: argocd_preflight succeeds for state={state} and publishes state={state} to $GITHUB_OUTPUT", rc == 0 and f"state={state}" in out))
-    rc, out, log = run_step(preflight_script, "BROKEN")
+    rc, out, log = run_step(preflight_script, "BROKEN", "argocd_state")
     results.append(("I: argocd_preflight fails (non-zero exit) for state=BROKEN, never auto-repaired here", rc != 0))
-    rc, out, log = run_step(preflight_script, "HEALTHY", contract="stale-contract-v0")
-    results.append(("source-contract: argocd_preflight fails closed on a mismatched classifier contract marker, even for an otherwise-HEALTHY state", rc != 0 and "contract marker" in log))
 
 if ready_step is not None:
     ready_script = ready_step["run"]
-    rc, out, log = run_step(ready_script, "HEALTHY")
+    rc, out, log = run_step(ready_script, "HEALTHY", "argocd_acceptance")
     results.append(("M: validate_argocd_ready's final convergence check succeeds for exactly HEALTHY", rc == 0))
-    rc, out, log = run_step(ready_script, "RECONCILABLE")
-    results.append(("N: validate_argocd_ready's final convergence check FAILS when reconcile_argocd \"succeeded\" but the cluster is still RECONCILABLE (repository Secrets never actually got created) -- reconciliation success alone is never trusted as HEALTHY", rc != 0))
-    rc, out, log = run_step(ready_script, "BROKEN")
-    results.append(("N: validate_argocd_ready's final convergence check FAILS for BROKEN too", rc != 0))
-    rc, out, log = run_step(ready_script, "HEALTHY", contract="stale-contract-v0")
-    results.append(("source-contract: validate_argocd_ready fails closed on a mismatched classifier contract marker, even for an otherwise-HEALTHY state", rc != 0 and "contract marker" in log))
+    rc, out, log = run_step(ready_script, "BROKEN", "argocd_acceptance")
+    results.append(("N: validate_argocd_ready's final convergence check FAILS when reconcile_argocd \"succeeded\" but post-reconciliation acceptance still classifies BROKEN (e.g. repository Secrets never actually got created, or a newly-disabled Ingress was never pruned) -- reconciliation success alone is never trusted as HEALTHY", rc != 0))
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
@@ -10980,53 +10984,23 @@ PYEOF
   if [ -n "$LIVE_ARGO_SELF_RECOVERY_OUT" ]; then
     while IFS= read -r line; do
       case "$line" in
-        FAIL\ *) fail "Live Argo Self-Recovery Fix: ${line#FAIL }" ;;
-        OK\ *) pass "Live Argo Self-Recovery Fix: ${line#OK }" ;;
+        FAIL\ *) fail "Generic MAIN Desired-State Convergence Fix: ${line#FAIL }" ;;
+        OK\ *) pass "Generic MAIN Desired-State Convergence Fix: ${line#OK }" ;;
       esac
     done <<< "$LIVE_ARGO_SELF_RECOVERY_OUT"
   else
-    fail "Live Argo Self-Recovery Fix: script-execution proof produced no output"
+    fail "Generic MAIN Desired-State Convergence Fix: script-execution proof produced no output"
   fi
 else
-  skip "Live Argo Self-Recovery Fix: script-execution proof -- python3/PyYAML unavailable or main workflow missing"
+  skip "Generic MAIN Desired-State Convergence Fix: script-execution proof -- python3/PyYAML unavailable or main workflow missing"
 fi
 
 # K/section-9: no active workflow presents standalone specialist-workflow execution as the normal recovery path for Argo CD; MAIN is the sole operational entry point.
 STALE_ARGO_STANDALONE_HITS="$(grep -rlE "20-sub-argocd\.yaml -- standalone|SUB \| Argo CD -- \.github" .github/workflows/*.yaml 2>/dev/null || true)"
 if [ -z "$STALE_ARGO_STANDALONE_HITS" ]; then
-  pass "Live Argo Self-Recovery Fix: K: no active workflow presents standalone execution of 20-sub-argocd.yaml as the normal Argo CD recovery path -- 00 | MAIN is the sole operational entry point"
+  pass "Generic MAIN Desired-State Convergence Fix: K: no active workflow presents standalone execution of 20-sub-argocd.yaml as the normal Argo CD recovery path -- 00 | MAIN is the sole operational entry point"
 else
-  fail "Live Argo Self-Recovery Fix: K: a stale standalone-recovery suggestion remains in:"$'\n'"${STALE_ARGO_STANDALONE_HITS}"
-fi
-
-# Cross-check: the literal contract value MAIN compares against must equal hack/orchestration/argocd_state.py's own CLASSIFIER_CONTRACT constant -- a hardcoded but independently-verified pairing, never silently allowed to drift apart. Both argocd_preflight and validate_argocd_ready must independently pin the exact same literal.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$ARGOCD_STATE_TOOL" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
-  CONTRACT_CROSSCHECK="$(python3 - "$ARGOCD_STATE_TOOL" "$EKS_APP_WORKFLOW" <<'PYEOF'
-import re
-import sys
-
-tool_path, main_path = sys.argv[1], sys.argv[2]
-
-with open(tool_path) as f:
-    tool_src = f.read()
-match = re.search(r'CLASSIFIER_CONTRACT\s*=\s*"([^"]+)"', tool_src)
-tool_contract = match.group(1) if match else None
-
-with open(main_path) as f:
-    main_text = f.read()
-needle = 'EXPECTED_CONTRACT="' + tool_contract + '"' if tool_contract else None
-occurrences = main_text.count(needle) if needle else 0
-ok = bool(tool_contract) and occurrences >= 2
-print("OK" if ok else "FAIL tool_contract=" + repr(tool_contract))
-PYEOF
-)"
-  if [ "$CONTRACT_CROSSCHECK" = "OK" ]; then
-    pass "Live Argo Self-Recovery Fix: hack/orchestration/argocd_state.py's CLASSIFIER_CONTRACT matches the EXPECTED_CONTRACT literal MAIN compares against in both argocd_preflight and validate_argocd_ready"
-  else
-    fail "Live Argo Self-Recovery Fix: CLASSIFIER_CONTRACT/EXPECTED_CONTRACT mismatch or missing: ${CONTRACT_CROSSCHECK}"
-  fi
-else
-  skip "Live Argo Self-Recovery Fix: CLASSIFIER_CONTRACT cross-check -- python3/PyYAML unavailable or a required file is missing"
+  fail "Generic MAIN Desired-State Convergence Fix: K: a stale standalone-recovery suggestion remains in:"$'\n'"${STALE_ARGO_STANDALONE_HITS}"
 fi
 
 echo ""
@@ -11285,17 +11259,17 @@ r = simulate(ctx, {})
 check("A: goldengate_deploy_authorization must be skipped in Validate mode (no approval created)", r["goldengate_deploy_authorization"]["result"] == "skipped")
 check("A: reconcile_argocd must be skipped in Validate mode (no Argo CD mutation)", r["reconcile_argocd"]["result"] == "skipped")
 
-# Scenario B: deploy=true + Argo CD RECONCILABLE -- the single authorization runs and succeeds, reconcile_argocd runs, final Argo HEALTHY convergence succeeds, and the whole rollout remains eligible off that ONE approval.
+# Scenario B: deploy=true + Argo CD OWNED (an already-existing, safely-owned release) -- the single authorization runs and succeeds, reconcile_argocd ALWAYS runs, final Argo HEALTHY convergence succeeds, and the whole rollout remains eligible off that ONE approval.
 ctx = base_context("true")
-r = simulate(ctx, {}, {"argocd_preflight": {"state": "RECONCILABLE"}, "platform_preflight": {"state": "HEALTHY"}, "observability_preflight": {"state": "HEALTHY"}, "runtime_ownership_preflight": {"state": "OWNED"}})
+r = simulate(ctx, {}, {"argocd_preflight": {"state": "OWNED"}, "platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}, "runtime_ownership_preflight": {"state": "OWNED"}})
 check("B: goldengate_deploy_authorization must run and succeed", r["goldengate_deploy_authorization"]["result"] == "success")
-check("B: reconcile_argocd must run and succeed on RECONCILABLE", r["reconcile_argocd"]["result"] == "success")
+check("B: reconcile_argocd must run and succeed on OWNED", r["reconcile_argocd"]["result"] == "success")
 check("B: validate_argocd_ready must converge to success", r["validate_argocd_ready"]["result"] == "success")
 check("B: build_publish_and_deploy must remain eligible after the single authorization", r["build_publish_and_deploy"]["result"] == "success")
 
 # Scenario C: reproduces the real live incident -- Platform ABSENT + Observability ABSENT, both reconciled under the SAME single goldengate_deploy_authorization approval, with no operator interaction required between them.
 ctx = base_context("true")
-r = simulate(ctx, {}, {"argocd_preflight": {"state": "HEALTHY"}, "platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "ABSENT"}})
+r = simulate(ctx, {}, {"argocd_preflight": {"state": "OWNED"}, "platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "ABSENT"}})
 check("C: goldengate_deploy_authorization must run and succeed exactly once", r["goldengate_deploy_authorization"]["result"] == "success")
 check("C: platform_sync_once must be eligible to run (ABSENT)", r["platform_sync_once"]["result"] == "success")
 check("C: observability_sync_once must be eligible to run (ABSENT)", r["observability_sync_once"]["result"] == "success")
@@ -11322,7 +11296,7 @@ PYEOF
   set -e
   if [ "$MAIN_SCENARIOS_STATUS" -eq 0 ]; then
     pass "Scenario A: action=validate never creates the goldengate_deploy_authorization approval and never runs reconcile_argocd/build_publish_and_deploy"
-    pass "Scenario B: deploy=true + Argo CD RECONCILABLE runs the single authorization, reconciles Argo CD, converges to HEALTHY, and leaves the whole rollout eligible"
+    pass "Scenario B: deploy=true + Argo CD OWNED runs the single authorization, always reconciles Argo CD, converges to HEALTHY, and leaves the whole rollout eligible"
     pass "Scenario C: Platform ABSENT + Observability ABSENT (the real live incident) are both covered by the SAME single authorization, with no operator interaction required between them"
     pass "Scenario J: a failed or cancelled goldengate_deploy_authorization leaves no application mutation job eligible anywhere downstream"
   else
@@ -11669,10 +11643,10 @@ for B2_TOOL in hack/orchestration/platform_state.py hack/orchestration/observabi
   fi
 done
 
-# Both classifiers' own dedicated offline unit-test suites are part of the normal regression run, not merely available separately.
+# All four classifiers' own dedicated offline unit-test suites are part of the normal regression run, not merely available separately: platform_state.py/observability_state.py cover pre-reconciliation ownership safety (ABSENT/OWNED/BROKEN); platform_acceptance.py/observability_acceptance.py cover the separate, strict post-reconciliation acceptance classifiers (HEALTHY/BROKEN).
 if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f hack/test-goldengate-platform-state.py ]; then
   if PLATFORM_STATE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 hack/test-goldengate-platform-state.py 2>&1)"; then
-    pass "Phase B2: hack/test-goldengate-platform-state.py (the GoldenGate Platform classifier's offline ABSENT/HEALTHY/BROKEN test suite) passes"
+    pass "Phase B2: hack/test-goldengate-platform-state.py (the GoldenGate Platform ownership classifier's offline ABSENT/OWNED/BROKEN test suite) passes"
   else
     fail "Phase B2: hack/test-goldengate-platform-state.py failed:"$'\n'"${PLATFORM_STATE_TEST_OUTPUT}"
   fi
@@ -11680,14 +11654,34 @@ else
   skip "Phase B2: hack/test-goldengate-platform-state.py -- python3 unavailable or file missing"
 fi
 
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f hack/test-goldengate-platform-acceptance.py ]; then
+  if PLATFORM_ACCEPTANCE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 hack/test-goldengate-platform-acceptance.py 2>&1)"; then
+    pass "Phase B2: hack/test-goldengate-platform-acceptance.py (the Platform post-reconciliation acceptance classifier's offline HEALTHY/BROKEN test suite) passes"
+  else
+    fail "Phase B2: hack/test-goldengate-platform-acceptance.py failed:"$'\n'"${PLATFORM_ACCEPTANCE_TEST_OUTPUT}"
+  fi
+else
+  skip "Phase B2: hack/test-goldengate-platform-acceptance.py -- python3 unavailable or file missing"
+fi
+
 if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f hack/test-goldengate-observability-state.py ]; then
   if OBSERVABILITY_STATE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 hack/test-goldengate-observability-state.py 2>&1)"; then
-    pass "Phase B2: hack/test-goldengate-observability-state.py (the Observability classifier's offline ABSENT/HEALTHY/BROKEN test suite) passes"
+    pass "Phase B2: hack/test-goldengate-observability-state.py (the Observability ownership classifier's offline ABSENT/OWNED/BROKEN test suite) passes"
   else
     fail "Phase B2: hack/test-goldengate-observability-state.py failed:"$'\n'"${OBSERVABILITY_STATE_TEST_OUTPUT}"
   fi
 else
   skip "Phase B2: hack/test-goldengate-observability-state.py -- python3 unavailable or file missing"
+fi
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f hack/test-goldengate-observability-acceptance.py ]; then
+  if OBSERVABILITY_ACCEPTANCE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 hack/test-goldengate-observability-acceptance.py 2>&1)"; then
+    pass "Phase B2: hack/test-goldengate-observability-acceptance.py (the Observability post-reconciliation acceptance classifier's offline HEALTHY/BROKEN test suite) passes"
+  else
+    fail "Phase B2: hack/test-goldengate-observability-acceptance.py failed:"$'\n'"${OBSERVABILITY_ACCEPTANCE_TEST_OUTPUT}"
+  fi
+else
+  skip "Phase B2: hack/test-goldengate-observability-acceptance.py -- python3 unavailable or file missing"
 fi
 
 # Structural proof, read directly from the real committed YAML (never a reimplementation): 40-sub-observability.yaml's workflow_call contract, MAIN's platform_preflight/observability_preflight/platform_sync_once/observability_sync_once/validate_platform_ready/validate_observability_ready DAG wiring, and the cross-file CHART_VERSION constant this classifier is tightly tested against.
@@ -11738,8 +11732,9 @@ platform_sync_once = jobs.get("platform_sync_once", {})
 platform_sync_once_needs = platform_sync_once.get("needs") or []
 platform_sync_once_if = platform_sync_once.get("if", "")
 results.append(("7a: platform_sync_once needs platform_preflight", "platform_preflight" in platform_sync_once_needs))
-results.append(("7b: platform_sync_once runs only when platform_preflight.outputs.state == ABSENT", "platform_preflight.outputs.state == \x27ABSENT\x27" in platform_sync_once_if))
-results.append(("8a: platform_sync_once condition contains no HEALTHY branch -- HEALTHY can never re-trigger reconciliation", "HEALTHY" not in platform_sync_once_if))
+results.append(("7b: platform_sync_once runs when platform_preflight.outputs.state == ABSENT", "platform_preflight.outputs.state == \x27ABSENT\x27" in platform_sync_once_if))
+results.append(("7c: platform_sync_once ALWAYS also runs when platform_preflight.outputs.state == OWNED (Generic MAIN Desired-State Convergence Fix -- never skipped merely because the preflight ownership classifier found the installation superficially healthy-looking)", "platform_preflight.outputs.state == \x27OWNED\x27" in platform_sync_once_if))
+results.append(("8a: platform_sync_once condition no longer references the retired RECONCILABLE/HEALTHY preflight states", "RECONCILABLE" not in platform_sync_once_if and "HEALTHY" not in platform_sync_once_if))
 results.append(("8b: platform_sync_once condition contains no BROKEN branch -- BROKEN can never enter reconciliation", "BROKEN" not in platform_sync_once_if))
 results.append(("8c: platform_sync_once requires platform_preflight to have actually succeeded first", "platform_preflight.result == \x27success\x27" in platform_sync_once_if))
 results.append(("10: platform_sync_once calls the reusable 30-sub-platform.yaml (never gh workflow run)", platform_sync_once.get("uses") == "./.github/workflows/30-sub-platform.yaml"))
@@ -11750,8 +11745,9 @@ observability_sync_once_needs = observability_sync_once.get("needs") or []
 observability_sync_once_if = observability_sync_once.get("if", "")
 results.append(("10b: observability_sync_once calls the reusable 40-sub-observability.yaml (never gh workflow run)", observability_sync_once.get("uses") == "./.github/workflows/40-sub-observability.yaml"))
 results.append(("11: observability_sync_once needs observability_preflight", "observability_preflight" in observability_sync_once_needs))
-results.append(("11b: observability_sync_once runs only when observability_preflight.outputs.state == ABSENT", "observability_preflight.outputs.state == \x27ABSENT\x27" in observability_sync_once_if))
-results.append(("12a: observability_sync_once condition contains no HEALTHY branch", "HEALTHY" not in observability_sync_once_if))
+results.append(("11b: observability_sync_once runs when observability_preflight.outputs.state == ABSENT", "observability_preflight.outputs.state == \x27ABSENT\x27" in observability_sync_once_if))
+results.append(("11c: observability_sync_once ALWAYS also runs when observability_preflight.outputs.state == OWNED (Generic MAIN Desired-State Convergence Fix -- never skipped merely because the preflight ownership classifier found the installation superficially healthy-looking)", "observability_preflight.outputs.state == \x27OWNED\x27" in observability_sync_once_if))
+results.append(("12a: observability_sync_once condition no longer references the retired RECONCILABLE/HEALTHY preflight states", "RECONCILABLE" not in observability_sync_once_if and "HEALTHY" not in observability_sync_once_if))
 results.append(("12b: observability_sync_once condition contains no BROKEN branch -- BROKEN can never enter reconciliation", "BROKEN" not in observability_sync_once_if))
 
 results.append(("13a: MAIN defines validate_platform_ready", "validate_platform_ready" in jobs))
@@ -11760,10 +11756,10 @@ validate_platform_ready = jobs.get("validate_platform_ready", {})
 validate_observability_ready = jobs.get("validate_observability_ready", {})
 validate_platform_ready_if = validate_platform_ready.get("if", "")
 validate_observability_ready_if = validate_observability_ready.get("if", "")
-results.append(("14a: validate_platform_ready allows the already-HEALTHY (sync-skip) path", "platform_preflight.outputs.state == \x27HEALTHY\x27" in validate_platform_ready_if))
-results.append(("15a: validate_platform_ready allows the ABSENT-then-successfully-reconciled path", "platform_preflight.outputs.state == \x27ABSENT\x27" in validate_platform_ready_if and "platform_sync_once.result == \x27success\x27" in validate_platform_ready_if))
-results.append(("14b: validate_observability_ready allows the already-HEALTHY (sync-skip) path", "observability_preflight.outputs.state == \x27HEALTHY\x27" in validate_observability_ready_if))
-results.append(("15b: validate_observability_ready allows the ABSENT-then-successfully-reconciled path", "observability_preflight.outputs.state == \x27ABSENT\x27" in validate_observability_ready_if and "observability_sync_once.result == \x27success\x27" in validate_observability_ready_if))
+results.append(("14a: validate_platform_ready no longer branches by preflight state at all -- platform_sync_once now always runs on ABSENT/OWNED, so a single unified condition is sufficient", "platform_preflight.outputs.state ==" not in validate_platform_ready_if))
+results.append(("15a: validate_platform_ready requires platform_sync_once.result == success as its sole reconciliation-success gate", "platform_sync_once.result == \x27success\x27" in validate_platform_ready_if))
+results.append(("14b: validate_observability_ready no longer branches by preflight state at all -- observability_sync_once now always runs on ABSENT/OWNED, so a single unified condition is sufficient", "observability_preflight.outputs.state ==" not in validate_observability_ready_if))
+results.append(("15b: validate_observability_ready requires observability_sync_once.result == success as its sole reconciliation-success gate", "observability_sync_once.result == \x27success\x27" in validate_observability_ready_if))
 results.append(("validate_platform_ready uses always() to survive platform_sync_once legitimately being skipped", "always()" in validate_platform_ready_if))
 results.append(("validate_observability_ready uses always() to survive observability_sync_once legitimately being skipped", "always()" in validate_observability_ready_if))
 
@@ -11796,17 +11792,24 @@ else
   skip "Phase B2: structural DAG/workflow_call checks -- python3/PyYAML unavailable or a required workflow file is missing"
 fi
 
-# CHART_VERSION cross-file consistency: observability_state.py checks Application source.targetRevision against its own CHART_VERSION constant; that constant must stay equal to 40-sub-observability.yaml's own CHART_VERSION env literal, or the classifier would silently diverge from what is actually deployed.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f hack/orchestration/observability_state.py ]; then
+# CHART_VERSION cross-file consistency: Generic MAIN Desired-State Convergence Fix moved the strict chart-version/targetRevision check out of ownership (observability_state.py, which no longer has any CHART_VERSION concept at all) and into observability_acceptance.py, the strict post-reconciliation classifier -- that constant must stay equal to 40-sub-observability.yaml's own CHART_VERSION env literal, or the classifier would silently diverge from what is actually deployed.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f hack/orchestration/observability_acceptance.py ]; then
   WORKFLOW_CHART_VERSION="$(grep -E '^\s*CHART_VERSION:' "$OBSERVABILITY_WORKFLOW" | head -1 | sed -E 's/.*CHART_VERSION:\s*"([^"]+)".*/\1/')"
-  CLASSIFIER_CHART_VERSION="$(python3 -c 'import re; print(re.search(r"^CHART_VERSION = \"([^\"]+)\"", open("hack/orchestration/observability_state.py").read(), re.M).group(1))')"
+  CLASSIFIER_CHART_VERSION="$(python3 -c 'import re; print(re.search(r"^CHART_VERSION = \"([^\"]+)\"", open("hack/orchestration/observability_acceptance.py").read(), re.M).group(1))')"
   if [ -n "$WORKFLOW_CHART_VERSION" ] && [ "$WORKFLOW_CHART_VERSION" = "$CLASSIFIER_CHART_VERSION" ]; then
-    pass "Phase B2: observability_state.py's CHART_VERSION ('${CLASSIFIER_CHART_VERSION}') matches 40-sub-observability.yaml's own CHART_VERSION env literal exactly"
+    pass "Phase B2: observability_acceptance.py's CHART_VERSION ('${CLASSIFIER_CHART_VERSION}') matches 40-sub-observability.yaml's own CHART_VERSION env literal exactly"
   else
     fail "Phase B2: CHART_VERSION drift -- workflow='${WORKFLOW_CHART_VERSION}' classifier='${CLASSIFIER_CHART_VERSION}'"
   fi
+
+  # observability_state.py (ownership) must never define CHART_VERSION at all -- chart-version correctness is a strict desired-state concern, not an ownership-safety concern, matching runtime_state.py/monitor_state.py never checking targetRevision either.
+  if ! grep -qE '^CHART_VERSION' hack/orchestration/observability_state.py 2>/dev/null; then
+    pass "Phase B2: observability_state.py (ownership) never defines CHART_VERSION -- chart-version/targetRevision correctness lives entirely in observability_acceptance.py"
+  else
+    fail "Phase B2: observability_state.py unexpectedly defines CHART_VERSION -- chart-version correctness must live in the acceptance module only"
+  fi
 else
-  skip "Phase B2: CHART_VERSION cross-file consistency -- python3 unavailable or observability_state.py missing"
+  skip "Phase B2: CHART_VERSION cross-file consistency -- python3 unavailable or observability_acceptance.py missing"
 fi
 
 # DAG simulation: the four-scenario matrix (HEALTHY/ABSENT+success/ABSENT+failure/BROKEN) for platform and observability independently, plus cross-component convergence -- exercised against the real if: expressions, never a text/regex match against the workflow author's own wording.
@@ -11950,56 +11953,63 @@ def check(label, condition):
         failures.append(label)
 
 
-# --- Platform: HEALTHY / ABSENT+success / ABSENT+failure / BROKEN (observability held HEALTHY throughout to isolate platform's own effect) ---
+# --- Platform: OWNED / ABSENT+success / ABSENT+failure / BROKEN (observability held OWNED throughout to isolate platform's own effect). Generic MAIN Desired-State Convergence Fix: OWNED is no longer a reconciliation-skip state -- platform_sync_once ALWAYS runs and succeeds on OWNED, exactly like ABSENT (required tests 4/6). ---
 ctx = base_context()
-r = simulate(ctx, {}, {"platform_preflight": {"state": "HEALTHY"}, "observability_preflight": {"state": "HEALTHY"}})
-check("platform HEALTHY: platform_sync_once must be skipped", r["platform_sync_once"]["result"] == "skipped")
-check("platform HEALTHY: validate_platform_ready must succeed", r["validate_platform_ready"]["result"] == "success")
-check("platform HEALTHY: validate_shared_secrets_once must succeed", r["validate_shared_secrets_once"]["result"] == "success")
+r = simulate(ctx, {}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
+check("platform OWNED: platform_sync_once must run and succeed (never skipped merely because preflight found the installation superficially healthy-looking)", r["platform_sync_once"]["result"] == "success")
+check("platform OWNED: validate_platform_ready must succeed", r["validate_platform_ready"]["result"] == "success")
+check("platform OWNED: validate_shared_secrets_once must succeed", r["validate_shared_secrets_once"]["result"] == "success")
 
 ctx = base_context()
-r = simulate(ctx, {}, {"platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "HEALTHY"}})
+r = simulate(ctx, {}, {"platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "OWNED"}})
 check("platform ABSENT+sync success: platform_sync_once must succeed", r["platform_sync_once"]["result"] == "success")
 check("platform ABSENT+sync success: validate_platform_ready must succeed", r["validate_platform_ready"]["result"] == "success")
 check("platform ABSENT+sync success: validate_shared_secrets_once must succeed", r["validate_shared_secrets_once"]["result"] == "success")
 
 ctx = base_context()
-r = simulate(ctx, {"platform_sync_once": "failure"}, {"platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "HEALTHY"}})
+r = simulate(ctx, {"platform_sync_once": "failure"}, {"platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "OWNED"}})
 check("platform ABSENT+sync failure: platform_sync_once must report failure", r["platform_sync_once"]["result"] == "failure")
 check("platform ABSENT+sync failure: validate_platform_ready must not proceed (skipped)", r["validate_platform_ready"]["result"] == "skipped")
 check("platform ABSENT+sync failure: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
 check("platform ABSENT+sync failure: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
 
 ctx = base_context()
-r = simulate(ctx, {"platform_preflight": "failure"}, {"observability_preflight": {"state": "HEALTHY"}})
+r = simulate(ctx, {"platform_sync_once": "failure"}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
+check("platform OWNED+sync failure: platform_sync_once must report failure", r["platform_sync_once"]["result"] == "failure")
+check("platform OWNED+sync failure: validate_platform_ready must not proceed (skipped)", r["validate_platform_ready"]["result"] == "skipped")
+check("platform OWNED+sync failure: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
+check("platform OWNED+sync failure: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
+
+ctx = base_context()
+r = simulate(ctx, {"platform_preflight": "failure"}, {"observability_preflight": {"state": "OWNED"}})
 check("platform BROKEN: platform_preflight must report failure", r["platform_preflight"]["result"] == "failure")
 check("platform BROKEN: platform_sync_once must never run", r["platform_sync_once"]["result"] == "skipped")
 check("platform BROKEN: validate_platform_ready must be skipped", r["validate_platform_ready"]["result"] == "skipped")
 check("platform BROKEN: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
 check("platform BROKEN: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
 
-# --- Observability: HEALTHY / ABSENT+success / ABSENT+failure / BROKEN (platform held HEALTHY throughout to isolate observability's own effect) ---
+# --- Observability: OWNED / ABSENT+success / ABSENT+failure / BROKEN (platform held OWNED throughout to isolate observability's own effect). Generic MAIN Desired-State Convergence Fix: OWNED is no longer a reconciliation-skip state -- observability_sync_once ALWAYS runs and succeeds on OWNED, exactly like ABSENT (required tests 5/6). ---
 ctx = base_context()
-r = simulate(ctx, {}, {"platform_preflight": {"state": "HEALTHY"}, "observability_preflight": {"state": "HEALTHY"}})
-check("observability HEALTHY: observability_sync_once must be skipped", r["observability_sync_once"]["result"] == "skipped")
-check("observability HEALTHY: validate_observability_ready must succeed", r["validate_observability_ready"]["result"] == "success")
-check("observability HEALTHY: validate_shared_secrets_once must succeed", r["validate_shared_secrets_once"]["result"] == "success")
+r = simulate(ctx, {}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
+check("observability OWNED: observability_sync_once must run and succeed (never skipped merely because preflight found the installation superficially healthy-looking)", r["observability_sync_once"]["result"] == "success")
+check("observability OWNED: validate_observability_ready must succeed", r["validate_observability_ready"]["result"] == "success")
+check("observability OWNED: validate_shared_secrets_once must succeed", r["validate_shared_secrets_once"]["result"] == "success")
 
 ctx = base_context()
-r = simulate(ctx, {}, {"platform_preflight": {"state": "HEALTHY"}, "observability_preflight": {"state": "ABSENT"}})
+r = simulate(ctx, {}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "ABSENT"}})
 check("observability ABSENT+sync success: observability_sync_once must succeed", r["observability_sync_once"]["result"] == "success")
 check("observability ABSENT+sync success: validate_observability_ready must succeed", r["validate_observability_ready"]["result"] == "success")
 check("observability ABSENT+sync success: validate_shared_secrets_once must succeed", r["validate_shared_secrets_once"]["result"] == "success")
 
 ctx = base_context()
-r = simulate(ctx, {"observability_sync_once": "failure"}, {"platform_preflight": {"state": "HEALTHY"}, "observability_preflight": {"state": "ABSENT"}})
+r = simulate(ctx, {"observability_sync_once": "failure"}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "ABSENT"}})
 check("observability ABSENT+sync failure: observability_sync_once must report failure", r["observability_sync_once"]["result"] == "failure")
 check("observability ABSENT+sync failure: validate_observability_ready must not proceed (skipped)", r["validate_observability_ready"]["result"] == "skipped")
 check("observability ABSENT+sync failure: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
 check("observability ABSENT+sync failure: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
 
 ctx = base_context()
-r = simulate(ctx, {"observability_preflight": "failure"}, {"platform_preflight": {"state": "HEALTHY"}})
+r = simulate(ctx, {"observability_preflight": "failure"}, {"platform_preflight": {"state": "OWNED"}})
 check("observability BROKEN: observability_preflight must report failure", r["observability_preflight"]["result"] == "failure")
 check("observability BROKEN: observability_sync_once must never run", r["observability_sync_once"]["result"] == "skipped")
 check("observability BROKEN: validate_observability_ready must be skipped", r["validate_observability_ready"]["result"] == "skipped")
@@ -12008,24 +12018,24 @@ check("observability BROKEN: build_publish_and_deploy must be skipped", r["build
 
 # --- Cross-component convergence ---
 ctx = base_context()
-r = simulate(ctx, {}, {"platform_preflight": {"state": "HEALTHY"}, "observability_preflight": {"state": "HEALTHY"}})
-check("cross: platform HEALTHY + observability HEALTHY -> shared secrets continues", r["validate_shared_secrets_once"]["result"] == "success" and r["build_publish_and_deploy"]["result"] == "success")
+r = simulate(ctx, {}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
+check("cross: platform OWNED + observability OWNED -> both always reconcile and shared secrets continues", r["platform_sync_once"]["result"] == "success" and r["observability_sync_once"]["result"] == "success" and r["validate_shared_secrets_once"]["result"] == "success" and r["build_publish_and_deploy"]["result"] == "success")
 
 ctx = base_context()
-r = simulate(ctx, {}, {"platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "HEALTHY"}})
-check("cross: platform ABSENT/reconcile success + observability HEALTHY -> continues", r["validate_shared_secrets_once"]["result"] == "success" and r["build_publish_and_deploy"]["result"] == "success")
+r = simulate(ctx, {}, {"platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "OWNED"}})
+check("cross: platform ABSENT/reconcile success + observability OWNED/reconcile success -> continues", r["validate_shared_secrets_once"]["result"] == "success" and r["build_publish_and_deploy"]["result"] == "success")
 
 ctx = base_context()
-r = simulate(ctx, {}, {"platform_preflight": {"state": "HEALTHY"}, "observability_preflight": {"state": "ABSENT"}})
-check("cross: platform HEALTHY + observability ABSENT/reconcile success -> continues", r["validate_shared_secrets_once"]["result"] == "success" and r["build_publish_and_deploy"]["result"] == "success")
+r = simulate(ctx, {}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "ABSENT"}})
+check("cross: platform OWNED/reconcile success + observability ABSENT/reconcile success -> continues", r["validate_shared_secrets_once"]["result"] == "success" and r["build_publish_and_deploy"]["result"] == "success")
 
 ctx = base_context()
-r = simulate(ctx, {"platform_preflight": "failure"}, {"observability_preflight": {"state": "HEALTHY"}})
-check("cross: platform BROKEN + observability HEALTHY -> shared secrets/runtime does not continue", r["validate_shared_secrets_once"]["result"] == "skipped" and r["build_publish_and_deploy"]["result"] == "skipped")
+r = simulate(ctx, {"platform_preflight": "failure"}, {"observability_preflight": {"state": "OWNED"}})
+check("cross: platform BROKEN + observability OWNED -> shared secrets/runtime does not continue", r["validate_shared_secrets_once"]["result"] == "skipped" and r["build_publish_and_deploy"]["result"] == "skipped")
 
 ctx = base_context()
-r = simulate(ctx, {"observability_preflight": "failure"}, {"platform_preflight": {"state": "HEALTHY"}})
-check("cross: platform HEALTHY + observability BROKEN -> shared secrets/runtime does not continue", r["validate_shared_secrets_once"]["result"] == "skipped" and r["build_publish_and_deploy"]["result"] == "skipped")
+r = simulate(ctx, {"observability_preflight": "failure"}, {"platform_preflight": {"state": "OWNED"}})
+check("cross: platform OWNED + observability BROKEN -> shared secrets/runtime does not continue", r["validate_shared_secrets_once"]["result"] == "skipped" and r["build_publish_and_deploy"]["result"] == "skipped")
 
 # --- Dry-run safety: effective_deploy=false must never invoke either B2 SUB workflow ---
 ctx = {
@@ -12049,15 +12059,15 @@ PYEOF
   PHASE_B2_SIM_STATUS=$?
   set -e
   if [ "$PHASE_B2_SIM_STATUS" -eq 0 ]; then
-    pass "Phase B2: platform HEALTHY skips reconciliation and reaches validate_shared_secrets_once"
+    pass "Phase B2 (Generic MAIN Desired-State Convergence Fix): platform OWNED still runs and succeeds reconciliation (never skipped) and reaches validate_shared_secrets_once"
     pass "Phase B2: platform ABSENT+successful reconciliation reaches validate_shared_secrets_once"
-    pass "Phase B2: platform ABSENT+failed reconciliation blocks validate_platform_ready/validate_shared_secrets_once/build_publish_and_deploy"
+    pass "Phase B2: platform ABSENT/OWNED+failed reconciliation blocks validate_platform_ready/validate_shared_secrets_once/build_publish_and_deploy"
     pass "Phase B2: platform BROKEN fails closed -- reconciliation never runs, downstream blocked"
-    pass "Phase B2: observability HEALTHY skips reconciliation and reaches validate_shared_secrets_once"
+    pass "Phase B2 (Generic MAIN Desired-State Convergence Fix): observability OWNED still runs and succeeds reconciliation (never skipped) and reaches validate_shared_secrets_once"
     pass "Phase B2: observability ABSENT+successful reconciliation reaches validate_shared_secrets_once"
     pass "Phase B2: observability ABSENT+failed reconciliation blocks validate_observability_ready/validate_shared_secrets_once/build_publish_and_deploy"
     pass "Phase B2: observability BROKEN fails closed -- reconciliation never runs, downstream blocked"
-    pass "Phase B2: cross-component convergence -- both HEALTHY, either ABSENT+success, continues; either BROKEN blocks shared secrets/runtime"
+    pass "Phase B2: cross-component convergence -- both OWNED always reconcile in parallel and continue, either ABSENT+success continues; either BROKEN blocks shared secrets/runtime"
     pass "Phase B2: dry-run (effective_deploy=false) never invokes 30-sub-platform.yaml or 40-sub-observability.yaml, and the read-only dry-run path still succeeds"
   else
     fail "Phase B2 DAG simulation failed:"$'\n'"${PHASE_B2_SIM_OUT}"
@@ -12069,9 +12079,9 @@ fi
 echo ""
 echo "--- Live Platform + Observability End-to-End Self-Recovery Fix ---"
 
-# Structural proof, read directly from the real committed YAML: platform_sync_once/observability_sync_once now also trigger on RECONCILABLE (P6), validate_platform_ready/validate_observability_ready now also accept the RECONCILABLE-then-successfully-reconciled path, and HEALTHY still never re-triggers reconciliation (unchanged intended architecture, D-series).
+# Structural proof, read directly from the real committed YAML: platform_sync_once/observability_sync_once ALWAYS trigger on both ABSENT and OWNED (P6 -- the retired RECONCILABLE/HEALTHY split is gone), and validate_platform_ready/validate_observability_ready no longer branch by preflight state at all -- their gating simplifies to "preflight succeeded and sync_once succeeded", since sync_once itself now runs unconditionally for every safe preflight state.
 if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
-  RECONCILABLE_STRUCTURAL_CHECK="$(python3 -c '
+  OWNED_STRUCTURAL_CHECK="$(python3 -c '
 import yaml
 
 with open("'"$EKS_APP_WORKFLOW"'") as f:
@@ -12084,12 +12094,14 @@ validate_platform_ready_if = jobs["validate_platform_ready"]["if"]
 validate_observability_ready_if = jobs["validate_observability_ready"]["if"]
 
 results = []
-results.append(("P6a: platform_sync_once also triggers on RECONCILABLE", "platform_preflight.outputs.state == \x27RECONCILABLE\x27" in platform_sync_once_if))
-results.append(("P6b: observability_sync_once also triggers on RECONCILABLE", "observability_preflight.outputs.state == \x27RECONCILABLE\x27" in observability_sync_once_if))
-results.append(("D: platform_sync_once still never triggers on HEALTHY (unchanged architecture)", "HEALTHY" not in platform_sync_once_if))
-results.append(("D: observability_sync_once still never triggers on HEALTHY (unchanged architecture)", "HEALTHY" not in observability_sync_once_if))
-results.append(("validate_platform_ready accepts the RECONCILABLE-then-successfully-reconciled path", "platform_preflight.outputs.state == \x27RECONCILABLE\x27" in validate_platform_ready_if and "platform_sync_once.result == \x27success\x27" in validate_platform_ready_if))
-results.append(("validate_observability_ready accepts the RECONCILABLE-then-successfully-reconciled path", "observability_preflight.outputs.state == \x27RECONCILABLE\x27" in validate_observability_ready_if and "observability_sync_once.result == \x27success\x27" in validate_observability_ready_if))
+results.append(("P6a: platform_sync_once triggers on ABSENT", "platform_preflight.outputs.state == \x27ABSENT\x27" in platform_sync_once_if))
+results.append(("P6b: platform_sync_once triggers on OWNED (always-reconcile, replacing the retired RECONCILABLE/HEALTHY split)", "platform_preflight.outputs.state == \x27OWNED\x27" in platform_sync_once_if))
+results.append(("P6c: observability_sync_once triggers on ABSENT", "observability_preflight.outputs.state == \x27ABSENT\x27" in observability_sync_once_if))
+results.append(("P6d: observability_sync_once triggers on OWNED (always-reconcile, replacing the retired RECONCILABLE/HEALTHY split)", "observability_preflight.outputs.state == \x27OWNED\x27" in observability_sync_once_if))
+results.append(("D: platform_sync_once condition no longer references the retired RECONCILABLE/HEALTHY preflight states", "RECONCILABLE" not in platform_sync_once_if and "HEALTHY" not in platform_sync_once_if))
+results.append(("D: observability_sync_once condition no longer references the retired RECONCILABLE/HEALTHY preflight states", "RECONCILABLE" not in observability_sync_once_if and "HEALTHY" not in observability_sync_once_if))
+results.append(("validate_platform_ready no longer branches by preflight state -- a plain platform_sync_once.result == success is sufficient now that sync_once always runs on ABSENT/OWNED", "platform_preflight.outputs.state ==" not in validate_platform_ready_if and "platform_sync_once.result == \x27success\x27" in validate_platform_ready_if))
+results.append(("validate_observability_ready no longer branches by preflight state -- a plain observability_sync_once.result == success is sufficient now that sync_once always runs on ABSENT/OWNED", "observability_preflight.outputs.state ==" not in validate_observability_ready_if and "observability_sync_once.result == \x27success\x27" in validate_observability_ready_if))
 results.append(("P8a: validate_platform_ready re-classification still requires exact HEALTHY (unchanged)", True))
 results.append(("P8b: validate_observability_ready re-classification still requires exact HEALTHY (unchanged)", True))
 
@@ -12101,9 +12113,9 @@ for label, ok in results:
       FAIL\ *) fail "Live Platform + Observability End-to-End Self-Recovery Fix: ${line#FAIL }" ;;
       OK\ *) pass "Live Platform + Observability End-to-End Self-Recovery Fix: ${line#OK }" ;;
     esac
-  done <<< "$RECONCILABLE_STRUCTURAL_CHECK"
+  done <<< "$OWNED_STRUCTURAL_CHECK"
 else
-  skip "Live Platform + Observability End-to-End Self-Recovery Fix: RECONCILABLE structural DAG check -- python3/PyYAML unavailable or main workflow missing"
+  skip "Live Platform + Observability End-to-End Self-Recovery Fix: OWNED structural DAG check -- python3/PyYAML unavailable or main workflow missing"
 fi
 
 # validate_platform_ready/validate_observability_ready's own post-reconciliation classifier steps still fail closed on anything but exactly HEALTHY (P8/O15) -- read directly from the real step source, never assumed.
@@ -12118,10 +12130,10 @@ else
   fail "P8/O15: the exact-HEALTHY final convergence gate is missing from ${EKS_APP_WORKFLOW}"
 fi
 
-# DAG simulation: RECONCILABLE+success and RECONCILABLE+failure for both Platform and Observability, exercised against the real if: expressions via the same JOB_ORDER-based harness as the Phase B2 simulation immediately above (P6, D6, D7).
+# DAG simulation: OWNED+success and OWNED+failure for both Platform and Observability, exercised against the real if: expressions via the same JOB_ORDER-based harness as the Phase B2 simulation immediately above (P6, D6, D7).
 if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
   set +e
-  RECONCILABLE_SIM_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+  OWNED_SIM_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
 import re
 import sys
 import yaml
@@ -12256,51 +12268,51 @@ def check(label, condition):
         failures.append(label)
 
 
-# --- Platform RECONCILABLE: reproduces the exact live incident (namespace label drift) -- one MAIN-owned automatic reconciliation, no operator interaction, final convergence still independently requires HEALTHY ---
+# --- Platform OWNED: reproduces the exact live incident (namespace label drift) plus every other already-owned/healthy-looking case -- one MAIN-owned automatic reconciliation, no operator interaction, final convergence still independently requires HEALTHY ---
 ctx = base_context()
-r = simulate(ctx, {}, {"platform_preflight": {"state": "RECONCILABLE"}, "observability_preflight": {"state": "HEALTHY"}})
-check("platform RECONCILABLE+sync success: platform_sync_once must run and succeed (P1/P6)", r["platform_sync_once"]["result"] == "success")
-check("platform RECONCILABLE+sync success: validate_platform_ready must succeed", r["validate_platform_ready"]["result"] == "success")
-check("platform RECONCILABLE+sync success: validate_shared_secrets_once must succeed (no operator interaction required, P7/D9)", r["validate_shared_secrets_once"]["result"] == "success")
-check("platform RECONCILABLE+sync success: build_publish_and_deploy must remain eligible", r["build_publish_and_deploy"]["result"] == "success")
+r = simulate(ctx, {}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
+check("platform OWNED+sync success: platform_sync_once must run and succeed (P1/P6, required test 4)", r["platform_sync_once"]["result"] == "success")
+check("platform OWNED+sync success: validate_platform_ready must succeed", r["validate_platform_ready"]["result"] == "success")
+check("platform OWNED+sync success: validate_shared_secrets_once must succeed (no operator interaction required, P7/D9)", r["validate_shared_secrets_once"]["result"] == "success")
+check("platform OWNED+sync success: build_publish_and_deploy must remain eligible", r["build_publish_and_deploy"]["result"] == "success")
 
 ctx = base_context()
-r = simulate(ctx, {"platform_sync_once": "failure"}, {"platform_preflight": {"state": "RECONCILABLE"}, "observability_preflight": {"state": "HEALTHY"}})
-check("platform RECONCILABLE+sync failure: platform_sync_once must report failure", r["platform_sync_once"]["result"] == "failure")
-check("platform RECONCILABLE+sync failure: validate_platform_ready must not proceed (skipped)", r["validate_platform_ready"]["result"] == "skipped")
-check("platform RECONCILABLE+sync failure: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
-check("platform RECONCILABLE+sync failure: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
+r = simulate(ctx, {"platform_sync_once": "failure"}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
+check("platform OWNED+sync failure: platform_sync_once must report failure", r["platform_sync_once"]["result"] == "failure")
+check("platform OWNED+sync failure: validate_platform_ready must not proceed (skipped)", r["validate_platform_ready"]["result"] == "skipped")
+check("platform OWNED+sync failure: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
+check("platform OWNED+sync failure: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
 
-# --- Observability RECONCILABLE: deterministic cloudwatch-agent ServiceAccount role-arn drift -- one MAIN-owned automatic reconciliation, final convergence still independently requires HEALTHY (O13) ---
+# --- Observability OWNED: deterministic cloudwatch-agent ServiceAccount role-arn drift plus every other already-owned/healthy-looking case -- one MAIN-owned automatic reconciliation, final convergence still independently requires HEALTHY (O13, required test 5) ---
 ctx = base_context()
-r = simulate(ctx, {}, {"platform_preflight": {"state": "HEALTHY"}, "observability_preflight": {"state": "RECONCILABLE"}})
-check("observability RECONCILABLE+sync success: observability_sync_once must run and succeed (O13)", r["observability_sync_once"]["result"] == "success")
-check("observability RECONCILABLE+sync success: validate_observability_ready must succeed", r["validate_observability_ready"]["result"] == "success")
-check("observability RECONCILABLE+sync success: validate_shared_secrets_once must succeed (no operator interaction required, D9)", r["validate_shared_secrets_once"]["result"] == "success")
+r = simulate(ctx, {}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
+check("observability OWNED+sync success: observability_sync_once must run and succeed (O13)", r["observability_sync_once"]["result"] == "success")
+check("observability OWNED+sync success: validate_observability_ready must succeed", r["validate_observability_ready"]["result"] == "success")
+check("observability OWNED+sync success: validate_shared_secrets_once must succeed (no operator interaction required, D9)", r["validate_shared_secrets_once"]["result"] == "success")
 
 ctx = base_context()
-r = simulate(ctx, {"observability_sync_once": "failure"}, {"platform_preflight": {"state": "HEALTHY"}, "observability_preflight": {"state": "RECONCILABLE"}})
-check("observability RECONCILABLE+sync failure: observability_sync_once must report failure", r["observability_sync_once"]["result"] == "failure")
-check("observability RECONCILABLE+sync failure: validate_observability_ready must not proceed (skipped)", r["validate_observability_ready"]["result"] == "skipped")
-check("observability RECONCILABLE+sync failure: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
+r = simulate(ctx, {"observability_sync_once": "failure"}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
+check("observability OWNED+sync failure: observability_sync_once must report failure", r["observability_sync_once"]["result"] == "failure")
+check("observability OWNED+sync failure: validate_observability_ready must not proceed (skipped)", r["validate_observability_ready"]["result"] == "skipped")
+check("observability OWNED+sync failure: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
 
-# --- D1-D5: both branches remain parallel and independent even with RECONCILABLE in the mix; downstream waits for BOTH final convergence points ---
+# --- D1-D5: both branches remain parallel and independent even with OWNED in the mix (required test 10); downstream waits for BOTH final convergence points ---
 ctx = base_context()
-r = simulate(ctx, {}, {"platform_preflight": {"state": "RECONCILABLE"}, "observability_preflight": {"state": "RECONCILABLE"}})
-check("D1/D2: platform and observability both independently reconcile from RECONCILABLE in the same run (parallel, not chained)", r["platform_sync_once"]["result"] == "success" and r["observability_sync_once"]["result"] == "success")
+r = simulate(ctx, {}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
+check("D1/D2: platform and observability both independently reconcile from OWNED in the same run (parallel, not chained)", r["platform_sync_once"]["result"] == "success" and r["observability_sync_once"]["result"] == "success")
 check("D5: downstream (validate_shared_secrets_once) waits for BOTH final convergence points and only proceeds once both succeed", r["validate_shared_secrets_once"]["result"] == "success")
 
 ctx = base_context()
-r = simulate(ctx, {"platform_sync_once": "failure"}, {"platform_preflight": {"state": "RECONCILABLE"}, "observability_preflight": {"state": "RECONCILABLE"}})
+r = simulate(ctx, {"platform_sync_once": "failure"}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
 check("D3: platform reconciliation failure alone does not prevent observability_sync_once from running (never serialized behind platform)", r["observability_sync_once"]["result"] == "success")
 check("D5: downstream must not proceed when only ONE of the two required convergence points failed", r["validate_shared_secrets_once"]["result"] == "skipped")
 
 ctx = base_context()
-r = simulate(ctx, {"observability_sync_once": "failure"}, {"platform_preflight": {"state": "RECONCILABLE"}, "observability_preflight": {"state": "RECONCILABLE"}})
+r = simulate(ctx, {"observability_sync_once": "failure"}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
 check("D4: observability reconciliation failure alone does not prevent platform_sync_once from running (never serialized behind observability)", r["platform_sync_once"]["result"] == "success")
 check("D5: downstream must not proceed when only ONE of the two required convergence points failed (observability side)", r["validate_shared_secrets_once"]["result"] == "skipped")
 
-# --- D6: Validate mode never invokes either reconciliation workflow, even if the live state would otherwise classify RECONCILABLE ---
+# --- D6: Validate mode never invokes either reconciliation workflow, even if the live state would otherwise classify OWNED (required test 9) ---
 ctx = {
     "validate_model": {"result": "success", "outputs": {"effective_deploy": "false"}},
     "terraform_sync_once": {"result": "skipped", "outputs": {}},
@@ -12318,20 +12330,20 @@ if failures:
 print("OK")
 PYEOF
 )"
-  RECONCILABLE_SIM_STATUS=$?
+  OWNED_SIM_STATUS=$?
   set -e
-  if [ "$RECONCILABLE_SIM_STATUS" -eq 0 ]; then
-    pass "P1/P6/P7: Platform RECONCILABLE (the exact live namespace-label incident) is automatically reconciled by MAIN with no operator interaction, and remains eligible to converge to HEALTHY"
-    pass "Platform RECONCILABLE+sync failure blocks validate_platform_ready/validate_shared_secrets_once/build_publish_and_deploy"
-    pass "O13: Observability RECONCILABLE (cloudwatch-agent ServiceAccount role-arn drift) is automatically reconciled by MAIN with no operator interaction"
-    pass "Observability RECONCILABLE+sync failure blocks validate_observability_ready/validate_shared_secrets_once"
-    pass "D1/D2/D3/D4/D5: Platform and Observability RECONCILABLE reconciliation remain independent parallel branches -- neither is ever serialized behind the other, and downstream waits for BOTH final convergence points"
+  if [ "$OWNED_SIM_STATUS" -eq 0 ]; then
+    pass "P1/P6/P7: Platform OWNED (the exact live namespace-label incident, and every other already-owned/healthy-looking case) is automatically reconciled by MAIN with no operator interaction, and remains eligible to converge to HEALTHY"
+    pass "Platform OWNED+sync failure blocks validate_platform_ready/validate_shared_secrets_once/build_publish_and_deploy"
+    pass "O13: Observability OWNED (cloudwatch-agent ServiceAccount role-arn drift, and every other already-owned/healthy-looking case) is automatically reconciled by MAIN with no operator interaction"
+    pass "Observability OWNED+sync failure blocks validate_observability_ready/validate_shared_secrets_once"
+    pass "D1/D2/D3/D4/D5: Platform and Observability OWNED reconciliation remain independent parallel branches -- neither is ever serialized behind the other, and downstream waits for BOTH final convergence points"
     pass "D6: Validate mode never invokes platform_sync_once/observability_sync_once, regardless of the live classified state"
   else
-    fail "Live Platform + Observability End-to-End Self-Recovery Fix: RECONCILABLE DAG simulation found violation(s): ${RECONCILABLE_SIM_OUT}"
+    fail "Live Platform + Observability End-to-End Self-Recovery Fix: OWNED DAG simulation found violation(s): ${OWNED_SIM_OUT}"
   fi
 else
-  skip "Live Platform + Observability End-to-End Self-Recovery Fix: RECONCILABLE DAG simulation -- python3/PyYAML unavailable or main workflow missing"
+  skip "Live Platform + Observability End-to-End Self-Recovery Fix: OWNED DAG simulation -- python3/PyYAML unavailable or main workflow missing"
 fi
 
 # P9/P10: no imperative namespace delete/recreate/label/annotate workaround was added to mask the competing ownership source -- the fix must be the chart's own values contract (namespaces.runtime.create), never an imperative kubectl command layered on top.
@@ -12739,19 +12751,19 @@ else
   fail "P4: 30-sub-platform.yaml no longer carries the expected CreateNamespace=true + managedNamespaceMetadata Argo CD ownership contract"
 fi
 
-# P5/P6/P7: platform_state.py's own offline test suite (already re-run in full as part of the Phase B2 section above) already proves the exact managed-by=Helm RECONCILABLE fixture, the exact HEALTHY convergence requirement, and Terminating/unrelated-structural-drift BROKEN -- confirmed here via direct re-invocation of the three specific tests this fix's own P1/P3/P5/Terminating scenarios map onto, so a regression in just this fix's own contract is caught even if the broader suite is skipped for some other reason.
+# P5/P6/P7: platform_state.py's own offline test suite (already re-run in full as part of the Phase B2 section above) already proves the exact managed-by=Helm OWNED fixture (the exact live incident, now simply OWNED rather than a one-off RECONCILABLE carve-out), a foreign namespace-label BROKEN fixture, and a Terminating-namespace BROKEN fixture -- confirmed here via direct re-invocation of the three specific tests this fix's own P1/P3/Terminating scenarios map onto, so a regression in just this fix's own contract is caught even if the broader suite is skipped for some other reason.
 if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f hack/test-goldengate-platform-state.py ]; then
   if PLATFORM_RECOVERY_TEST_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 hack/test-goldengate-platform-state.py -v \
-      PlatformStateReconcilableTests.test_P1_exact_live_incident_managed_by_helm_all_else_healthy_is_reconcilable \
-      PlatformStateReconcilableTests.test_P3_namespace_metadata_drift_plus_one_unsafe_component_is_broken \
-      PlatformStateReconcilableTests.test_terminating_namespace_alone_is_broken_never_reconcilable \
+      PlatformOwnershipStateTests.test_P1_exact_live_incident_managed_by_helm_is_owned \
+      PlatformOwnershipStateTests.test_namespace_foreign_name_label_is_broken \
+      PlatformOwnershipStateTests.test_terminating_namespace_is_broken \
     2>&1)"; then
-    pass "P5/P7: platform_state.py's managed-by=Helm-alone RECONCILABLE fixture, mixed-drift BROKEN fixture, and Terminating-namespace BROKEN fixture all pass directly (re-confirmed, not merely inherited from the broader Phase B2 run)"
+    pass "P5/P7: platform_state.py's managed-by=Helm-alone OWNED fixture, foreign-namespace-label BROKEN fixture, and Terminating-namespace BROKEN fixture all pass directly (re-confirmed, not merely inherited from the broader Phase B2 run)"
   else
-    fail "P5/P7: direct re-invocation of the platform RECONCILABLE-contract tests failed:"$'\n'"${PLATFORM_RECOVERY_TEST_OUT}"
+    fail "P5/P7: direct re-invocation of the platform ownership-contract tests failed:"$'\n'"${PLATFORM_RECOVERY_TEST_OUT}"
   fi
 else
-  skip "P5/P7: direct platform RECONCILABLE-contract re-invocation -- python3 unavailable or test file missing"
+  skip "P5/P7: direct platform ownership-contract re-invocation -- python3 unavailable or test file missing"
 fi
 
 # --- Argo Ingress: helm lint/template proofs against the real committed envs/dev/argocd/values.yaml, exactly the --set-string values 20-sub-argocd.yaml itself injects. ---
@@ -12794,6 +12806,18 @@ if [ "$HELM_AVAILABLE" = "true" ] && [ -f envs/dev/argocd/values.yaml ]; then
     pass "P9-P13/D-Ingress: real helm template of the real committed envs/dev/argocd/values.yaml (mode=standalone) renders exactly ONE resident argocd-server-ingress with scheme=internal, the canonical host/group/backend contract, and no fabricated subnet/security-group/CIDR identity"
   else
     fail "Argo CD Ingress render did not match the expected resident/anchor contract (status=${ARGO_RENDER_STATUS}, ingress_count=${ARGO_INGRESS_COUNT}):"$'\n'"${ARGO_RENDER_OUT}"
+  fi
+
+  # true->false pruning proof, at the Helm-render level (generic, not Ingress-specific): the exact same committed envs/dev/argocd/values.yaml with only argocdServerIngress.enabled flipped to false renders ZERO Ingress documents -- the resource simply stops being part of desired state, so `helm upgrade --install` in 20-sub-argocd.yaml naturally prunes it on the next reconciliation with no imperative delete command anywhere.
+  set +e
+  ARGO_DISABLED_RENDER_OUT="$(helm template argocd helm/argocd --namespace argocd --values envs/dev/argocd/values.yaml "${ARGO_SET_ARGS[@]}" --set argocdServerIngress.enabled=false 2>&1)"
+  ARGO_DISABLED_RENDER_STATUS=$?
+  set -e
+  ARGO_DISABLED_INGRESS_COUNT="$(awk '/^kind: Ingress$/{c++} END{print c+0}' <<< "$ARGO_DISABLED_RENDER_OUT")"
+  if [ "$ARGO_DISABLED_RENDER_STATUS" -eq 0 ] && [ "$ARGO_DISABLED_INGRESS_COUNT" -eq 0 ]; then
+    pass "true->false proof: argocdServerIngress.enabled=false renders ZERO Ingress documents from the real committed envs/dev/argocd/values.yaml -- Helm's own idempotent reconciliation is what prunes a disabled resource, generically, with no resource-specific MAIN branch"
+  else
+    fail "true->false proof failed: argocdServerIngress.enabled=false still rendered ${ARGO_DISABLED_INGRESS_COUNT} Ingress document(s) (status=${ARGO_DISABLED_RENDER_STATUS})"
   fi
 
   # Proof no subnet/SG/CIDR was fabricated: the rendered manifest carries no subnets/security-groups/inbound-cidrs annotation at all, since envs/dev/argocd/values.yaml deliberately leaves them unset for AWS Load Balancer Controller auto-discovery.
@@ -12934,25 +12958,24 @@ else
   skip "real script-execution proof of 'Validate rendered Argo CD server Ingress' -- python3/helm unavailable or ${ARGOCD_DEPLOY_WORKFLOW} missing"
 fi
 
-# A10/contract: the classifier's CLASSIFIER_CONTRACT and MAIN's two EXPECTED_CONTRACT literals are already dynamically cross-checked for equality above (the pre-existing "Live Argo Self-Recovery Fix" CONTRACT_CROSSCHECK block reads CLASSIFIER_CONTRACT from source, whatever string it currently is, and requires MAIN to contain that exact string at least twice) -- re-confirmed explicitly here as the literal expected v2 string, so a future accidental revert of only one side is caught by name, not merely by cross-file equality.
+# A10/contract: the Generic MAIN Desired-State Convergence Fix retired the CLASSIFIER_CONTRACT/EXPECTED_CONTRACT version-skew marker entirely (argocd_state.py is no longer a special case -- ABSENT/OWNED/BROKEN is now a stable, generic, universally-shared contract with no version marker at all, exactly like runtime_state.py/monitor_state.py always were). Re-confirmed explicitly here that the retired mechanism has actually been removed from BOTH sides, not merely left unused on one side.
 if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f hack/orchestration/argocd_state.py ]; then
-  CLASSIFIER_CONTRACT_LITERAL="$(python3 -c 'import re; print(re.search(r"^CLASSIFIER_CONTRACT = \"([^\"]+)\"", open("hack/orchestration/argocd_state.py").read(), re.M).group(1))')"
-  MAIN_EXPECTED_CONTRACT_COUNT="$(grep -cF 'EXPECTED_CONTRACT="argocd-recovery-v2"' "$EKS_APP_WORKFLOW" 2>/dev/null || true)"
-  if [ "$CLASSIFIER_CONTRACT_LITERAL" = "argocd-recovery-v2" ] && [ "${MAIN_EXPECTED_CONTRACT_COUNT:-0}" -ge 2 ]; then
-    pass "A10: hack/orchestration/argocd_state.py's CLASSIFIER_CONTRACT is exactly 'argocd-recovery-v2', and MAIN's argocd_preflight/validate_argocd_ready both expect it (${MAIN_EXPECTED_CONTRACT_COUNT} occurrences)"
+  A10_RETIREMENT_HITS="$(grep -nE 'CLASSIFIER_CONTRACT|EXPECTED_CONTRACT' hack/orchestration/argocd_state.py hack/orchestration/argocd_acceptance.py "$EKS_APP_WORKFLOW" 2>/dev/null || true)"
+  if [ -z "$A10_RETIREMENT_HITS" ]; then
+    pass "A10: the retired CLASSIFIER_CONTRACT/EXPECTED_CONTRACT version-skew marker no longer appears anywhere in argocd_state.py, argocd_acceptance.py, or ${EKS_APP_WORKFLOW} -- ABSENT/OWNED/BROKEN is a plain, unversioned contract"
   else
-    fail "A10: classifier contract version mismatch -- classifier='${CLASSIFIER_CONTRACT_LITERAL}', MAIN EXPECTED_CONTRACT=\"argocd-recovery-v2\" occurrences=${MAIN_EXPECTED_CONTRACT_COUNT:-0}"
+    fail "A10: a retired CLASSIFIER_CONTRACT/EXPECTED_CONTRACT reference still remains:"$'\n'"${A10_RETIREMENT_HITS}"
   fi
 else
-  skip "A10: classifier contract version re-confirmation -- python3 unavailable or argocd_state.py missing"
+  skip "A10: classifier contract retirement re-confirmation -- python3 unavailable or argocd_state.py missing"
 fi
 
-# D1/D2: MAIN's existing Argo DAG wiring (reconcile_argocd triggers synchronously on ABSENT/RECONCILABLE/HEALTHY via workflow_call) is UNCHANGED by this fix -- re-confirmed structurally rather than re-deriving the full JOB_ORDER simulation already proven (and unaffected, since none of reconcile_argocd/validate_argocd_ready's own if: expressions were touched) in the Phase B1 section above. The absence of any async gh workflow run/repository_dispatch/dispatches construct anywhere in MAIN is already proven elsewhere in this suite (Phase B2 check 21, which strips comments by checking the parsed-YAML structure rather than raw source text -- never re-derived here against raw text, which would false-positive on this very file's own explanatory prose naming "repository_dispatch" while describing what MAIN does NOT do).
-if grep -qF "needs.argocd_preflight.outputs.state == 'RECONCILABLE'" "$EKS_APP_WORKFLOW" 2>/dev/null \
+# D1/D2: MAIN's existing Argo DAG wiring (reconcile_argocd triggers synchronously on ABSENT/OWNED via workflow_call) is UNCHANGED by this fix -- re-confirmed structurally rather than re-deriving the full JOB_ORDER simulation already proven (and unaffected, since none of reconcile_argocd/validate_argocd_ready's own if: expressions were touched again here) in the Phase B1 section above. The absence of any async gh workflow run/repository_dispatch/dispatches construct anywhere in MAIN is already proven elsewhere in this suite (Phase B2 check 21, which strips comments by checking the parsed-YAML structure rather than raw source text -- never re-derived here against raw text, which would false-positive on this very file's own explanatory prose naming "repository_dispatch" while describing what MAIN does NOT do).
+if grep -qF "needs.argocd_preflight.outputs.state == 'OWNED'" "$EKS_APP_WORKFLOW" 2>/dev/null \
   && grep -qF "uses: ./.github/workflows/20-sub-argocd.yaml" "$EKS_APP_WORKFLOW" 2>/dev/null; then
-  pass "D1/D2: MAIN's reconcile_argocd still triggers synchronously (workflow_call) on RECONCILABLE Argo state -- unchanged by this fix, so a missing/drifted Ingress now classified RECONCILABLE is automatically repaired with no manual specialist dispatch"
+  pass "D1/D2: MAIN's reconcile_argocd still triggers synchronously (workflow_call) on OWNED Argo state -- unchanged by this fix, so a missing/drifted Ingress now classified OWNED is automatically repaired with no manual specialist dispatch"
 else
-  fail "D1/D2: MAIN's reconcile_argocd RECONCILABLE trigger or its synchronous workflow_call invocation appears to have regressed"
+  fail "D1/D2: MAIN's reconcile_argocd OWNED trigger or its synchronous workflow_call invocation appears to have regressed"
 fi
 
 if [ -f hack/check-goldengate-approval-topology.py ] && [ "$PYTHON_AVAILABLE" = "true" ]; then

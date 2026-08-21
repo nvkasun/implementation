@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""hack/orchestration/platform_state.py: read-only GoldenGate Platform prerequisite classifier (Phase B2) -- answers exactly one question, "what is the current GoldenGate Platform prerequisite state?", as one of ABSENT/HEALTHY/RECONCILABLE/BROKEN. RECONCILABLE (Live Platform + Observability End-to-End Self-Recovery Fix) is a narrow, deliberately conservative carve-out mirroring hack/orchestration/argocd_state.py's own RECONCILABLE: the runtime namespace's app.kubernetes.io/managed-by label (and any other MANAGED_NAMESPACE_LABELS entry) is the ONLY drift, a class the existing reusable Platform specialist workflow's idempotent Argo CD sync already safely repairs via its own managedNamespaceMetadata contract -- any other drift at all still classifies BROKEN. Never mutates the cluster: every kubectl invocation here is a `get` (read-only); no apply/create/delete/patch/annotate/label/helm call exists in this module. Consumes environment identity through hack/goldengate-environment.py, never a second environment parser. The desired contract (resource names, Application identity, Fluent Bit shape) is read directly from the vendored helm/goldengate-platform/ chart and .github/workflows/30-sub-platform.yaml, never guessed."""
+"""hack/orchestration/platform_state.py: read-only GoldenGate Platform ownership-safety preflight classifier -- answers exactly one question, "is it safe for MAIN to reconcile the GoldenGate Platform installation?", as one of ABSENT/OWNED/BROKEN. This is NOT a HEALTHY-skip prerequisite classifier: the platform's desired state (Fluent Bit image/config, shared ServiceAccount role ARNs, any future values-driven resource) may legitimately change on every run, so OWNED (not HEALTHY) is the "safe to reconcile" state -- readiness/exact-desired-state acceptance is validated separately, post-reconciliation, by hack/orchestration/platform_acceptance.py. Generic by design: this module checks OWNERSHIP LABELS on whatever currently exists, never the correctness/readiness of any individual resource (including the runtime namespace's app.kubernetes.io/managed-by label, which is a desired-state acceptance concern, not an ownership one) -- adding a new values-driven chart resource, or flipping an existing one false<->true, never requires touching this file. Never mutates the cluster: every kubectl invocation here is a `get` (read-only); no apply/create/delete/patch/annotate/label/helm call exists in this module. Consumes environment identity through hack/goldengate-environment.py, never a second environment parser."""
 from __future__ import annotations
 
 import argparse
 import importlib.util
 import json
 import os
-import re
 import sys
 
 
@@ -22,7 +21,6 @@ def _load_sibling_module(name, filename):
 _k8s_common = _load_sibling_module("k8s_common", "k8s_common.py")
 ClassifierInspectionError = _k8s_common.ClassifierInspectionError
 KubectlRunner = _k8s_common.KubectlRunner
-daemonset_ready = _k8s_common.daemonset_ready
 get_json = _k8s_common.get_json
 list_json = _k8s_common.list_json
 
@@ -52,11 +50,10 @@ def environment_derived_values(environment):
 
 
 STATE_ABSENT = "ABSENT"
-STATE_HEALTHY = "HEALTHY"
-STATE_RECONCILABLE = "RECONCILABLE"
+STATE_OWNED = "OWNED"
 STATE_BROKEN = "BROKEN"
 
-# Current chart/workflow contract (helm/goldengate-platform/, .github/workflows/30-sub-platform.yaml) -- verified against the real vendored chart/values.yaml and workflow, never guessed.
+# Current chart/workflow contract (helm/goldengate-platform/, .github/workflows/30-sub-platform.yaml) -- verified against the real vendored chart/values.yaml and workflow, never guessed. Only used here to name the resources this module inspects for OWNERSHIP; individual field correctness (Fluent Bit image/shape, IRSA role-arn, namespace managed-by label, readiness) is deliberately out of scope -- that is platform_acceptance.py's job.
 HELM_REPO_PATH = "helm/goldengate-platform"
 
 RUNTIME_SA_NAME = "gg-runtime-sa"
@@ -66,17 +63,8 @@ FLUENT_BIT_CLUSTERROLEBINDING_NAME = "gg-fluent-bit"
 FLUENT_BIT_CONFIGMAP_NAME = "gg-fluent-bit-config"
 FLUENT_BIT_DAEMONSET_NAME = "gg-fluent-bit"
 
-# The Fluent Bit ECR repository name is an application constant, matching .github/workflows/30-sub-platform.yaml's own FLUENT_BIT_ECR_REPOSITORY_EXPECTED env literal. The registry is never hardcoded here -- it is always the canonical ECR_REGISTRY passed in by the caller.
-FLUENT_BIT_ECR_REPOSITORY = "aws-cloud-factory-fluent-bit"
-
-# helm/goldengate-platform/templates/fluent-bit-daemonset.yaml renders exactly one container (name: fluent-bit) and no initContainers -- never invent a second desired container shape.
-FLUENT_BIT_CONTAINER_NAME = "fluent-bit"
-
-# helm/goldengate-platform's syncPolicy.managedNamespaceMetadata.labels -- applied by Argo CD to RUNTIME_NAMESPACE itself, only once the platform Application has actually synced it.
-MANAGED_NAMESPACE_LABELS = {
-    "app.kubernetes.io/name": "goldengate-platform",
-    "app.kubernetes.io/managed-by": "argocd",
-}
+# helm/goldengate-platform/templates/_helpers.tpl's goldengate-platform.labels/goldengate-platform.fluentBit.labels helpers, rendered on every chart resource except the Namespace (which this chart no longer renders at all -- namespaces.runtime.create stays false) -- app.kubernetes.io/instance == the Helm release name identifies this exact platform release, distinguishing it from any foreign same-name resource.
+NAMESPACE_OWNERSHIP_NAME_LABEL = "goldengate-platform"
 
 
 def _release_and_app_name(environment):
@@ -85,59 +73,26 @@ def _release_and_app_name(environment):
     return name, name
 
 
-def _validate_fluent_bit_image(fluent_bit_image, ecr_registry):
-    """Validates the caller-supplied FLUENT_BIT_IMAGE operational configuration (vars.FLUENT_BIT_IMAGE) against the approved contract -- exactly <ECR_REGISTRY>/aws-cloud-factory-fluent-bit@sha256:<64 lowercase hex characters>, matching .github/workflows/30-sub-platform.yaml's own "Validate FLUENT_BIT_IMAGE format" step -- before it is ever trusted as expected cluster state. This is operational-configuration validation, not cluster inspection: a violation means the caller supplied a bad value, never that the cluster is ABSENT/HEALTHY/BROKEN. Raises ValueError (a configuration error), never ClassifierInspectionError."""
-    expected_prefix = f"{ecr_registry}/{FLUENT_BIT_ECR_REPOSITORY}@sha256:"
-    if not fluent_bit_image.startswith(expected_prefix):
-        raise ValueError(
-            f"FLUENT_BIT_IMAGE {fluent_bit_image!r} is not a valid private, immutable digest reference -- "
-            f"expected exactly {expected_prefix!r} followed by a 64-character lowercase hex digest "
-            "(no mutable tag, no public.ecr.aws, no other registry/repository)."
+def _labels_of(obj):
+    return ((obj.get("metadata") or {}).get("labels")) or {}
+
+
+def _instance_owned_reason(resource_label, obj, release_name, environment):
+    labels = _labels_of(obj)
+    instance = labels.get("app.kubernetes.io/instance")
+    env_label = labels.get("goldengate.adcb/environment")
+    if instance != release_name or env_label != environment:
+        return (
+            f"{resource_label} has incompatible ownership labels (app.kubernetes.io/instance={instance!r}, "
+            f"goldengate.adcb/environment={env_label!r}), expected app.kubernetes.io/instance={release_name!r} "
+            f"goldengate.adcb/environment={environment!r} -- possible foreign/ambiguous ownership"
         )
-    digest = fluent_bit_image[len(expected_prefix):]
-    if not re.fullmatch(r"[0-9a-f]{64}", digest):
-        raise ValueError(
-            f"FLUENT_BIT_IMAGE {fluent_bit_image!r} has an invalid digest {digest!r} -- "
-            "expected exactly 64 lowercase hex characters after @sha256:."
-        )
+    return None
 
 
-def _fluent_bit_container_shape_reasons(daemonset_name, ds_obj, expected_image):
-    """Explicitly inspects spec.template.spec.containers/initContainers (never merely whether expected_image appears "in" some flattened image list) against the exact approved shape rendered by helm/goldengate-platform/templates/fluent-bit-daemonset.yaml: exactly one container, named fluent-bit, using exactly expected_image, and no initContainers at all."""
-    pod_spec = (((ds_obj.get("spec") or {}).get("template") or {}).get("spec")) or {}
-    containers = pod_spec.get("containers") or []
-    init_containers = pod_spec.get("initContainers") or []
-
+def classify(run, environment, runtime_namespace, argocd_namespace, ecr_registry):
+    """Returns the stable {"state", "environment", "namespace", "reasons", "checks"} shape. Raises ClassifierInspectionError if Kubernetes access itself could not be trusted -- callers must let that propagate as a hard failure, never a downgrade to ABSENT."""
     reasons = []
-
-    if init_containers:
-        init_names = [c.get("name") for c in init_containers]
-        reasons.append(f"daemonset/{daemonset_name} has unexpected initContainers {init_names!r}, expected none")
-
-    if len(containers) != 1:
-        container_names = [c.get("name") for c in containers]
-        reasons.append(f"daemonset/{daemonset_name} has {len(containers)} container(s) {container_names!r}, expected exactly 1 (named {FLUENT_BIT_CONTAINER_NAME!r})")
-        return reasons
-
-    container = containers[0]
-    actual_name = container.get("name")
-    if actual_name != FLUENT_BIT_CONTAINER_NAME:
-        reasons.append(f"daemonset/{daemonset_name}'s sole container is named {actual_name!r}, expected {FLUENT_BIT_CONTAINER_NAME!r}")
-
-    actual_image = container.get("image")
-    if actual_image != expected_image:
-        reasons.append(f"daemonset/{daemonset_name} container {FLUENT_BIT_CONTAINER_NAME!r} image={actual_image!r}, expected FLUENT_BIT_IMAGE {expected_image!r}")
-
-    return reasons
-
-
-def classify(run, environment, runtime_namespace, argocd_namespace, ecr_registry, runtime_role_arn, platform_logging_role_arn, fluent_bit_image):
-    """Returns the stable {"state", "environment", "namespace", "reasons", "checks"} shape. Raises ClassifierInspectionError if Kubernetes access itself could not be trusted -- callers must let that propagate as a hard failure, never a downgrade to ABSENT. Raises ValueError if the caller-supplied FLUENT_BIT_IMAGE operational configuration itself is invalid -- a configuration error, never ABSENT/HEALTHY/BROKEN cluster state."""
-    _validate_fluent_bit_image(fluent_bit_image, ecr_registry)
-
-    reasons = []
-    # Subset of `reasons` that is safe to auto-repair via the existing reusable Platform specialist workflow's idempotent Argo CD sync (its Application already carries syncOptions CreateNamespace=true + syncPolicy.managedNamespaceMetadata for this exact namespace) -- never a broader "any drift is safe" carve-out. Only a MANAGED_NAMESPACE_LABELS mismatch is added here; every other reason (missing resources, Fluent Bit health, foreign workload ownership, a Terminating namespace) stays exclusively in `reasons` and therefore forces BROKEN below.
-    reconcilable_reasons = []
     checks = {}
 
     release_name, app_name = _release_and_app_name(environment)
@@ -152,24 +107,14 @@ def classify(run, environment, runtime_namespace, argocd_namespace, ecr_registry
     cr_found, _ = get_json(run, "clusterrole", FLUENT_BIT_CLUSTERROLE_NAME)
     checks["fluent_bit_clusterrole_found"] = cr_found
 
-    crb_found, crb_obj = get_json(run, "clusterrolebinding", FLUENT_BIT_CLUSTERROLEBINDING_NAME)
+    crb_found, _ = get_json(run, "clusterrolebinding", FLUENT_BIT_CLUSTERROLEBINDING_NAME)
     checks["fluent_bit_clusterrolebinding_found"] = crb_found
 
-    # ABSENT: no meaningful footprint at all -- the platform chart is the designated owner of the shared runtime namespace, so any one of these existing without the rest means this classifier does not get to silently take ownership of partial/pre-existing state.
+    # ABSENT: no meaningful footprint at all -- the platform chart is the designated owner of the shared runtime namespace, so any one of these existing without the rest means this classifier does not get to silently take ownership of partial/pre-existing state; it falls through to the ownership-label checks below instead.
     if not app_found and not ns_found and not cr_found and not crb_found:
         return {"state": STATE_ABSENT, "environment": environment, "namespace": runtime_namespace, "reasons": [], "checks": checks}
 
-    if not app_found:
-        reasons.append(f"Application {app_name} does not exist in {argocd_namespace}")
-    else:
-        status = app_obj.get("status") or {}
-        sync_status = ((status.get("sync") or {}).get("status"))
-        health_status = ((status.get("health") or {}).get("status"))
-        if sync_status != "Synced":
-            reasons.append(f"Application {app_name} sync status is {sync_status!r}, expected 'Synced'")
-        if health_status != "Healthy":
-            reasons.append(f"Application {app_name} health status is {health_status!r}, expected 'Healthy'")
-
+    if app_found:
         spec = app_obj.get("spec") or {}
         source = spec.get("source") or {}
         destination = spec.get("destination") or {}
@@ -177,112 +122,77 @@ def classify(run, environment, runtime_namespace, argocd_namespace, ecr_registry
 
         actual_repo_url = source.get("repoURL")
         if actual_repo_url != expected_repo_url:
-            reasons.append(f"Application {app_name} source.repoURL={actual_repo_url!r}, expected {expected_repo_url!r}")
+            reasons.append(f"Application {app_name} source.repoURL={actual_repo_url!r}, expected {expected_repo_url!r} -- possible foreign/ambiguous ownership")
 
         actual_dest_ns = destination.get("namespace")
         if actual_dest_ns != runtime_namespace:
-            reasons.append(f"Application {app_name} destination.namespace={actual_dest_ns!r}, expected {runtime_namespace!r}")
+            reasons.append(f"Application {app_name} destination.namespace={actual_dest_ns!r}, expected {runtime_namespace!r} -- possible foreign/ambiguous ownership")
 
         actual_release_name = helm_source.get("releaseName")
         if actual_release_name != release_name:
-            reasons.append(f"Application {app_name} source.helm.releaseName={actual_release_name!r}, expected {release_name!r}")
+            reasons.append(f"Application {app_name} source.helm.releaseName={actual_release_name!r}, expected {release_name!r} -- possible foreign/ambiguous ownership")
 
-    if not ns_found:
-        reasons.append(f"namespace {runtime_namespace} does not exist")
-    else:
-        # A Terminating namespace is never reconcilable -- appended to `reasons` only (not `reconcilable_reasons`), so its presence alone (or alongside anything else) always forces BROKEN below, never silently mixed into a safe auto-repair.
+        # Deliberately NOT checked here: status.sync.status / status.health.status. This is a pre-reconciliation ownership-safety classifier, not a readiness classifier -- an OutOfSync/Progressing/Degraded Application that otherwise clearly belongs to this platform is exactly what MAIN is about to reconcile, never an ownership conflict. Post-reconciliation health is platform_acceptance.py's job.
+
+    if ns_found:
+        # A Terminating namespace is a genuine safety failure, never merely stale desired state -- applying resources into a namespace mid-deletion is unsafe, so this alone still forces BROKEN (unlike every other check in this module, which only fires on an actual ownership-label mismatch).
         ns_phase = ((ns_obj.get("status") or {}).get("phase"))
         if ns_phase == "Terminating":
-            reasons.append(f"namespace {runtime_namespace} is Terminating")
+            reasons.append(f"namespace {runtime_namespace} is Terminating -- unsafe to reconcile into")
 
-        # Namespace label drift alone (Argo CD's own managedNamespaceMetadata correcting a stale app.kubernetes.io/managed-by -- for example left over from a since-disabled competing chart-rendered Namespace resource) is safe/deterministic and auto-repaired by 30-sub-platform.yaml's normal idempotent Argo CD sync, so each such reason is also added to reconcilable_reasons below -- never assumed safe if any other, non-reconcilable reason is also present.
-        ns_labels = ((ns_obj.get("metadata") or {}).get("labels")) or {}
-        for label_key, expected_value in MANAGED_NAMESPACE_LABELS.items():
-            actual_value = ns_labels.get(label_key)
-            if actual_value != expected_value:
-                reason = f"namespace {runtime_namespace} label {label_key}={actual_value!r}, expected {expected_value!r} (managedNamespaceMetadata)"
-                reasons.append(reason)
-                reconcilable_reasons.append(reason)
+        # app.kubernetes.io/name is the one ownership signal present regardless of which mechanism currently owns this namespace's metadata (this chart's own now-disabled Namespace template, or Argo CD's managedNamespaceMetadata) -- app.kubernetes.io/managed-by is deliberately NOT checked here: it is exactly the kind of desired-state drift (Helm vs argocd) normal reconciliation converges, never an ownership conflict. See platform_acceptance.py for the strict managed-by=argocd post-reconcile check.
+        ns_labels = _labels_of(ns_obj)
+        if ns_labels.get("app.kubernetes.io/name") != NAMESPACE_OWNERSHIP_NAME_LABEL:
+            reasons.append(
+                f"namespace {runtime_namespace} label app.kubernetes.io/name={ns_labels.get('app.kubernetes.io/name')!r}, "
+                f"expected {NAMESPACE_OWNERSHIP_NAME_LABEL!r} -- possible foreign/ambiguous ownership"
+            )
 
-    if not cr_found:
-        reasons.append(f"clusterrole/{FLUENT_BIT_CLUSTERROLE_NAME} does not exist")
-
-    if not crb_found:
-        reasons.append(f"clusterrolebinding/{FLUENT_BIT_CLUSTERROLEBINDING_NAME} does not exist")
-    else:
-        role_ref = crb_obj.get("roleRef") or {}
-        if role_ref.get("kind") != "ClusterRole" or role_ref.get("name") != FLUENT_BIT_CLUSTERROLE_NAME:
-            reasons.append(f"clusterrolebinding/{FLUENT_BIT_CLUSTERROLEBINDING_NAME} roleRef={role_ref!r}, expected kind=ClusterRole name={FLUENT_BIT_CLUSTERROLE_NAME!r}")
-        subjects = crb_obj.get("subjects") or []
-        expected_subject = {"kind": "ServiceAccount", "name": FLUENT_BIT_SA_NAME, "namespace": runtime_namespace}
-        matching = [s for s in subjects if s.get("kind") == expected_subject["kind"] and s.get("name") == expected_subject["name"] and s.get("namespace") == expected_subject["namespace"]]
-        if not matching:
-            reasons.append(f"clusterrolebinding/{FLUENT_BIT_CLUSTERROLEBINDING_NAME} subjects={subjects!r}, expected to contain {expected_subject!r}")
-
-    # The remaining checks only make sense once the runtime namespace exists.
+    # The remaining checks only make sense once the runtime namespace exists. Ownership-label proof on whatever currently exists -- deliberately NOT a completeness/readiness check: a resource that is simply missing is exactly what MAIN is about to reconcile, never itself a reason.
     if ns_found:
         sa_found, sa_obj = get_json(run, "serviceaccount", RUNTIME_SA_NAME, runtime_namespace)
         checks["runtime_serviceaccount_found"] = sa_found
-        if not sa_found:
-            reasons.append(f"serviceaccount/{RUNTIME_SA_NAME} does not exist")
-        else:
-            role_arn = ((sa_obj.get("metadata") or {}).get("annotations") or {}).get("eks.amazonaws.com/role-arn")
-            if role_arn != runtime_role_arn:
-                reasons.append(f"serviceaccount/{RUNTIME_SA_NAME} eks.amazonaws.com/role-arn={role_arn!r}, expected {runtime_role_arn!r}")
+        if sa_found:
+            reason = _instance_owned_reason(f"serviceaccount/{RUNTIME_SA_NAME}", sa_obj, release_name, environment)
+            if reason:
+                reasons.append(reason)
 
         fb_sa_found, fb_sa_obj = get_json(run, "serviceaccount", FLUENT_BIT_SA_NAME, runtime_namespace)
         checks["fluent_bit_serviceaccount_found"] = fb_sa_found
-        if not fb_sa_found:
-            reasons.append(f"serviceaccount/{FLUENT_BIT_SA_NAME} does not exist")
-        else:
-            role_arn = ((fb_sa_obj.get("metadata") or {}).get("annotations") or {}).get("eks.amazonaws.com/role-arn")
-            if role_arn != platform_logging_role_arn:
-                reasons.append(f"serviceaccount/{FLUENT_BIT_SA_NAME} eks.amazonaws.com/role-arn={role_arn!r}, expected {platform_logging_role_arn!r}")
+        if fb_sa_found:
+            reason = _instance_owned_reason(f"serviceaccount/{FLUENT_BIT_SA_NAME}", fb_sa_obj, release_name, environment)
+            if reason:
+                reasons.append(reason)
 
-        cm_found, _ = get_json(run, "configmap", FLUENT_BIT_CONFIGMAP_NAME, runtime_namespace)
+        cm_found, cm_obj = get_json(run, "configmap", FLUENT_BIT_CONFIGMAP_NAME, runtime_namespace)
         checks["fluent_bit_configmap_found"] = cm_found
-        if not cm_found:
-            reasons.append(f"configmap/{FLUENT_BIT_CONFIGMAP_NAME} does not exist")
+        if cm_found:
+            reason = _instance_owned_reason(f"configmap/{FLUENT_BIT_CONFIGMAP_NAME}", cm_obj, release_name, environment)
+            if reason:
+                reasons.append(reason)
 
         ds_found, ds_obj = get_json(run, "daemonset", FLUENT_BIT_DAEMONSET_NAME, runtime_namespace)
         checks["fluent_bit_daemonset_found"] = ds_found
-        if not ds_found:
-            reasons.append(f"daemonset/{FLUENT_BIT_DAEMONSET_NAME} does not exist")
-        else:
-            ready, why = daemonset_ready(ds_obj)
-            checks["fluent_bit_daemonset_ready"] = ready
-            if not ready:
-                reasons.append(f"daemonset/{FLUENT_BIT_DAEMONSET_NAME} not ready: {why}")
+        if ds_found:
+            reason = _instance_owned_reason(f"daemonset/{FLUENT_BIT_DAEMONSET_NAME}", ds_obj, release_name, environment)
+            if reason:
+                reasons.append(reason)
 
-            pod_spec = (((ds_obj.get("spec") or {}).get("template") or {}).get("spec")) or {}
-            actual_sa_name = pod_spec.get("serviceAccountName")
-            if actual_sa_name != FLUENT_BIT_SA_NAME:
-                reasons.append(f"daemonset/{FLUENT_BIT_DAEMONSET_NAME} pod template serviceAccountName={actual_sa_name!r}, expected {FLUENT_BIT_SA_NAME!r}")
-
-            reasons.extend(_fluent_bit_container_shape_reasons(FLUENT_BIT_DAEMONSET_NAME, ds_obj, fluent_bit_image))
-
-        # The platform release intentionally owns shared namespace/identity/logging resources only -- it must never own a GoldenGate runtime StatefulSet/Deployment (see 30-sub-platform.yaml's own "no StatefulSet/Deployment owned by RELEASE_NAME" check, mirrored here read-only).
+        # The platform release intentionally owns shared namespace/identity/logging resources only -- it must never own a GoldenGate runtime StatefulSet/Deployment. This is a genuine ownership-collision check (not a readiness one), so it stays here.
         owned_statefulsets = list_json(run, "statefulset", namespace=runtime_namespace, label_selector=f"app.kubernetes.io/instance={release_name}")
         owned_deployments = list_json(run, "deployment", namespace=runtime_namespace, label_selector=f"app.kubernetes.io/instance={release_name}")
         checks["owned_runtime_workload_count"] = len(owned_statefulsets) + len(owned_deployments)
         if owned_statefulsets or owned_deployments:
             names = sorted([s.get("metadata", {}).get("name") for s in owned_statefulsets] + [d.get("metadata", {}).get("name") for d in owned_deployments])
-            reasons.append(f"platform release {release_name} unexpectedly owns StatefulSet/Deployment resource(s): {names!r}")
+            reasons.append(f"platform release {release_name} unexpectedly owns StatefulSet/Deployment resource(s): {names!r} -- foreign/ambiguous ownership collision")
 
-    # RECONCILABLE only when EVERY collected reason is in the reconcilable subset (namespace label drift only, with the Application, Fluent Bit RBAC/identity/health, and runtime-workload-ownership contract all otherwise clean) -- any other reason at all (missing resources, an unready/misconfigured Fluent Bit, foreign workload ownership, a Terminating namespace) forces BROKEN, never a broader "partial drift is fine" default.
-    if not reasons:
-        state = STATE_HEALTHY
-    elif reconcilable_reasons and len(reconcilable_reasons) == len(reasons):
-        state = STATE_RECONCILABLE
-    else:
-        state = STATE_BROKEN
+    state = STATE_BROKEN if reasons else STATE_OWNED
     return {"state": state, "environment": environment, "namespace": runtime_namespace, "reasons": reasons, "checks": checks}
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--environment", required=True)
-    parser.add_argument("--fluent-bit-image", required=True, help="Expected immutable private-ECR digest reference (vars.FLUENT_BIT_IMAGE), never hardcoded here.")
     parser.add_argument("--kubectl-bin", default="kubectl")
     args = parser.parse_args(argv)
 
@@ -295,21 +205,14 @@ def main(argv=None):
             runtime_namespace=values["RUNTIME_NAMESPACE"],
             argocd_namespace=values["ARGOCD_NAMESPACE"],
             ecr_registry=values["ECR_REGISTRY"],
-            runtime_role_arn=values["RUNTIME_ROLE_ARN"],
-            platform_logging_role_arn=values["PLATFORM_LOGGING_ROLE_ARN"],
-            fluent_bit_image=args.fluent_bit_image,
         )
-    except ValueError as exc:
-        # A bad --fluent-bit-image (or other caller-supplied) value -- a configuration error, distinct from a Kubernetes inspection failure. Never exposes secrets; the value itself is not secret (it is an image reference, already logged verbatim by 30-sub-platform.yaml).
-        print(f"CONFIGURATION ERROR: {exc}", file=sys.stderr)
-        return 1
     except (ClassifierInspectionError, OSError) as exc:
         print(f"INSPECTION ERROR: {exc}", file=sys.stderr)
         return 1
 
     print(json.dumps(result))
     if result["reasons"]:
-        print("GoldenGate Platform prerequisite diagnostics:", file=sys.stderr)
+        print("GoldenGate Platform ownership-safety diagnostics:", file=sys.stderr)
         for reason in result["reasons"]:
             print(f"  - {reason}", file=sys.stderr)
     return 0

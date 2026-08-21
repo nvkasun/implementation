@@ -410,9 +410,9 @@ jobs:
       terraform_governance_override_reason: ${{ needs.validate_model.outputs.terraform_governance_override_reason }}
 
   argocd_preflight:
-    name: Classify Argo CD prerequisite state (read-only)
+    name: Classify Argo CD ownership safety (read-only)
 
-    # Live Argo Recovery Fix: the ownership-aware application-prerequisite state machine now has four states -- ABSENT/RECONCILABLE/HEALTHY all converge via reconcile_argocd below (a DEPLOY is an end-to-end convergence operation, not merely a bootstrap), BROKEN fails closed right here, never auto-repaired. This job never mutates the cluster -- it only runs hack/orchestration/argocd_state.py, which itself issues read-only `kubectl get` calls.
+    # Generic MAIN Desired-State Convergence Fix: hack/orchestration/argocd_state.py is now a pure OWNERSHIP-SAFETY classifier -- ABSENT (nothing installed yet) and OWNED (whatever currently exists is safely this repository's own Argo CD release, regardless of individual readiness/desired-state drift) both converge via reconcile_argocd below; BROKEN (foreign/ambiguous ownership, or a genuine inspection failure) fails closed right here, never auto-repaired. A DEPLOY is an end-to-end convergence operation, not merely a bootstrap: reconcile_argocd's own idempotent Helm reconciliation is what actually applies the current committed desired state (ecrTokenSync repositories, argocdServerIngress.enabled true<->false, image/tag, any future wrapper-chart resource) -- this preflight job never needs to learn a new resource name merely to keep permitting that reconciliation. This job never mutates the cluster -- it only runs hack/orchestration/argocd_state.py, which itself issues read-only `kubectl get` calls.
     needs:
       - validate_model
       - terraform_sync_once
@@ -489,37 +489,27 @@ jobs:
           echo "Current kube context:"
           kubectl config current-context
 
-      - name: Classify Argo CD prerequisite state
+      - name: Classify Argo CD ownership safety
         id: classify
         shell: bash
         run: |
           set -euo pipefail
 
-          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
-
           # A non-zero exit here is a classifier inspection error (API unreachable, permission denied, malformed JSON) -- never treated as ABSENT.
           if ! CLASSIFIER_OUTPUT="$(python3 hack/orchestration/argocd_state.py --environment "${GG_SELECTED_ENVIRONMENT}")"; then
-            echo "FAIL: the Argo CD classifier could not determine cluster state (inspection error, not ABSENT) -- see diagnostics above."
+            echo "FAIL: the Argo CD ownership classifier could not determine cluster state (inspection error, not ABSENT) -- see diagnostics above."
             exit 1
           fi
 
           echo "$CLASSIFIER_OUTPUT"
 
-          # Live Argo Self-Recovery Fix: a stable compatibility marker, checked before the state value is ever trusted -- guards against this orchestrator being paired with a version-skewed hack/orchestration/argocd_state.py (for example an older copy that predates RECONCILABLE), never itself the operational recovery path for repository Secret drift.
-          CONTRACT="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("contract", ""))' <<< "$CLASSIFIER_OUTPUT")"
-          EXPECTED_CONTRACT="argocd-recovery-v2"
-          if [ "$CONTRACT" != "$EXPECTED_CONTRACT" ]; then
-            echo "FAIL: the Argo CD classifier's contract marker is '${CONTRACT}', expected '${EXPECTED_CONTRACT}'. hack/orchestration/argocd_state.py and this orchestrator have drifted out of sync -- fix the version skew, this is never the operational recovery path for repository Secret drift."
-            exit 1
-          fi
-
           STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
-          echo "Argo CD prerequisite state: ${STATE}"
+          echo "Argo CD ownership-safety state: ${STATE}"
           echo "state=${STATE}" >> "$GITHUB_OUTPUT"
 
-          # ABSENT/HEALTHY/RECONCILABLE all succeed here -- MAIN owns automatic reconciliation for every one of them (see reconcile_argocd below). Only BROKEN is not auto-repaired: it fails closed for genuine investigation, never presented as a normal recovery path for deterministic, application-owned repository Secret drift (that case classifies RECONCILABLE, not BROKEN, and is handled automatically).
+          # ABSENT/OWNED both succeed here -- MAIN owns automatic reconciliation for both (see reconcile_argocd below), regardless of what individual desired-state drift 20-sub-argocd.yaml's own idempotent Helm reconciliation is about to converge. Only BROKEN is not auto-repaired: a genuine foreign/ambiguous ownership conflict, or an inspection failure, fails closed for investigation -- never a normal recovery path.
           if [ "$STATE" = "BROKEN" ]; then
-            echo "FAIL: Argo CD prerequisite state is BROKEN -- an unsafe or ambiguous condition that is not auto-repaired. Investigate the diagnostics above before re-running MAIN."
+            echo "FAIL: Argo CD ownership-safety state is BROKEN -- an unsafe or ambiguous condition that is not auto-repaired. Investigate the diagnostics above before re-running MAIN."
             exit 1
           fi
 
@@ -547,12 +537,12 @@ jobs:
   reconcile_argocd:
     name: Reconcile Argo CD desired state
 
-    # Live Argo Recovery Fix: MAIN now owns automatic Argo CD desired-state reconciliation for every application-owned state that is not fail-closed BROKEN -- ABSENT (nothing installed yet), RECONCILABLE (core Argo + ECR token-sync RBAC/identity structurally healthy, only the generated repository Secrets missing/drifted -- exactly the real incident this fix addresses), and HEALTHY (a DEPLOY is an end-to-end convergence operation, not only a bootstrap operation: a classifier can prove runtime health but cannot prove the live Helm release already matches the current Git/Helm desired state -- e.g. a healthy-looking CronJob could still be running with a stale rendered template -- so HEALTHY still converges through the same idempotent Helm chart reconciliation). argocd_preflight's own classify step already fails the job closed on BROKEN, so needs.argocd_preflight.result == 'success' alone already guarantees a non-BROKEN state; every applicable state is still listed explicitly below for defense in depth and readability. Runs the reusable specialist workflow synchronously as part of this DAG -- never an asynchronous CLI/API dispatch or repository_dispatch trigger. 20-sub-argocd.yaml itself remains fully usable standalone; MAIN no longer depends on an operator invoking it separately for recoverable drift. Live Deployment Approval Topology Fix: now also requires goldengate_deploy_authorization's own success -- the single GoldenGate application approval above -- so this reusable call runs already-authorized (orchestrated_by_main: true) and never opens a second approval of its own.
+    # Generic MAIN Desired-State Convergence Fix: MAIN ALWAYS reconciles Argo CD on Deploy whenever the preflight ownership classifier confirms it is safe to do so -- ABSENT (nothing installed yet) or OWNED (whatever currently exists is safely this repository's own release, no matter what individual desired-state drift exists). A DEPLOY is an end-to-end convergence operation, not only a bootstrap operation: 20-sub-argocd.yaml's own idempotent `helm upgrade --install` is what actually applies the current committed desired state, so this job never skips reconciliation merely because the preflight classifier found the installation superficially healthy-looking. argocd_preflight's own classify step already fails the job closed on BROKEN, so needs.argocd_preflight.result == 'success' alone already guarantees a non-BROKEN state; the explicit state check below is still listed for defense in depth and readability. Runs the reusable specialist workflow synchronously as part of this DAG -- never an asynchronous CLI/API dispatch or repository_dispatch trigger. 20-sub-argocd.yaml itself remains fully usable standalone; no standalone specialist workflow is a required recovery/upgrade path -- MAIN never tells an operator to run it separately to apply ordinary desired state. Live Deployment Approval Topology Fix: now also requires goldengate_deploy_authorization's own success -- the single GoldenGate application approval above -- so this reusable call runs already-authorized (orchestrated_by_main: true) and never opens a second approval of its own.
     needs:
       - validate_model
       - argocd_preflight
       - goldengate_deploy_authorization
-    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.argocd_preflight.result == 'success' && needs.goldengate_deploy_authorization.result == 'success' && (needs.argocd_preflight.outputs.state == 'ABSENT' || needs.argocd_preflight.outputs.state == 'RECONCILABLE' || needs.argocd_preflight.outputs.state == 'HEALTHY') }}
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.argocd_preflight.result == 'success' && needs.goldengate_deploy_authorization.result == 'success' && (needs.argocd_preflight.outputs.state == 'ABSENT' || needs.argocd_preflight.outputs.state == 'OWNED') }}
 
     uses: ./.github/workflows/20-sub-argocd.yaml
     secrets: inherit
@@ -561,9 +551,9 @@ jobs:
       orchestrated_by_main: true
 
   validate_argocd_ready:
-    name: Validate Argo CD is healthy (final convergence point after reconciliation)
+    name: Validate Argo CD is healthy (strict post-reconciliation acceptance)
 
-    # always() overrides GitHub's default implicit skip-on-skipped-dependency behavior -- the explicit result checks below are what actually keep this fail-closed, exactly like validate_shared_secrets_once's established always()-plus-explicit-result pattern elsewhere in this workflow. reconcile_argocd is now applicable for every state argocd_preflight can succeed with (ABSENT/RECONCILABLE/HEALTHY), so a plain needs.reconcile_argocd.result == 'success' is sufficient -- no per-state branching is needed here anymore.
+    # always() overrides GitHub's default implicit skip-on-skipped-dependency behavior -- the explicit result checks below are what actually keep this fail-closed, exactly like validate_shared_secrets_once's established always()-plus-explicit-result pattern elsewhere in this workflow. reconcile_argocd is now applicable for every state argocd_preflight can succeed with (ABSENT/OWNED), so a plain needs.reconcile_argocd.result == 'success' is sufficient -- no per-state branching is needed here anymore. Generic MAIN Desired-State Convergence Fix: the strict exact-desired-state check happens entirely in the re-classification step below (hack/orchestration/argocd_acceptance.py), independent of which preflight state was observed.
     needs:
       - validate_model
       - argocd_preflight
@@ -645,35 +635,27 @@ jobs:
 
           python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
 
-          # Reconciliation success (the reusable workflow job returning) is never assumed to mean healthy -- the same read-only classifier is re-run here and must independently confirm HEALTHY. Live Argo Recovery Fix: this check is intentionally != "HEALTHY" (not == "BROKEN"), so it already fails closed on RECONCILABLE too -- reconcile_argocd's own successful reconciliation must produce a fully HEALTHY result, never merely "no longer BROKEN".
-          if ! CLASSIFIER_OUTPUT="$(python3 hack/orchestration/argocd_state.py --environment "${GG_SELECTED_ENVIRONMENT}")"; then
-            echo "FAIL: the Argo CD classifier could not determine cluster state (inspection error) during post-reconciliation validation."
+          # Generic MAIN Desired-State Convergence Fix: post-reconciliation acceptance is now a SEPARATE, strict classifier (hack/orchestration/argocd_acceptance.py) from the pre-reconciliation ownership-safety preflight (hack/orchestration/argocd_state.py) -- reconciliation success (the reusable workflow job returning) is never assumed to mean healthy; this independently re-inspects the live cluster against the full current desired-state contract (core readiness, ecr-token-sync identity, repository Secrets, and -- only when argocdServerIngress.enabled -- the exact Ingress contract, including AWS Load Balancer Controller readiness; symmetrically, a still-present Ingress after argocdServerIngress.enabled=false is itself a failure, proving true->false pruning genuinely completed).
+          if ! CLASSIFIER_OUTPUT="$(python3 hack/orchestration/argocd_acceptance.py --environment "${GG_SELECTED_ENVIRONMENT}")"; then
+            echo "FAIL: the Argo CD acceptance classifier could not determine cluster state (inspection error) during post-reconciliation validation."
             exit 1
           fi
 
           echo "$CLASSIFIER_OUTPUT"
-
-          # Live Argo Self-Recovery Fix: same compatibility guard as argocd_preflight's own classify step -- checked before the state value is trusted here too.
-          CONTRACT="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("contract", ""))' <<< "$CLASSIFIER_OUTPUT")"
-          EXPECTED_CONTRACT="argocd-recovery-v2"
-          if [ "$CONTRACT" != "$EXPECTED_CONTRACT" ]; then
-            echo "FAIL: the Argo CD classifier's contract marker is '${CONTRACT}', expected '${EXPECTED_CONTRACT}'. hack/orchestration/argocd_state.py and this orchestrator have drifted out of sync -- fix the version skew."
-            exit 1
-          fi
 
           STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
 
           if [ "$STATE" != "HEALTHY" ]; then
-            echo "FAIL: Argo CD prerequisite state is ${STATE}, expected HEALTHY after preflight/reconciliation. Refusing to proceed to the platform stage."
+            echo "FAIL: Argo CD acceptance state is ${STATE}, expected HEALTHY after preflight/reconciliation. Refusing to proceed to the platform stage."
             exit 1
           fi
 
-          echo "OK: Argo CD prerequisite state is HEALTHY."
+          echo "OK: Argo CD acceptance state is HEALTHY."
 
   platform_preflight:
-    name: Classify GoldenGate Platform prerequisite state (read-only)
+    name: Classify GoldenGate Platform ownership safety (read-only)
 
-    # Phase B2: the ownership-aware application-prerequisite state machine extended to the GoldenGate Platform chart -- ABSENT/RECONCILABLE -> reconcile via 30-sub-platform.yaml (Live Platform + Observability End-to-End Self-Recovery Fix added RECONCILABLE: deterministic, application-owned namespace-label drift only), HEALTHY -> continue, BROKEN -> fail closed, never auto-repaired. Runs independently of observability_preflight (siblings after Argo, not a chain) so both branches can execute in parallel. This job never mutates the cluster -- it only runs hack/orchestration/platform_state.py, which itself issues read-only `kubectl get` calls.
+    # Generic MAIN Desired-State Convergence Fix: hack/orchestration/platform_state.py is now a pure OWNERSHIP-SAFETY classifier -- ABSENT and OWNED both reconcile via platform_sync_once below on EVERY Deploy, regardless of individual desired-state drift (a Fluent Bit image change, an RBAC change, a future new resource, a namespace metadata change); BROKEN (foreign/ambiguous ownership, a Terminating namespace, or a genuine inspection failure) fails closed right here, never auto-repaired. Runs independently of observability_preflight (siblings after Argo, not a chain) so both branches can execute in parallel. This job never mutates the cluster -- it only runs hack/orchestration/platform_state.py, which itself issues read-only `kubectl get` calls.
     needs:
       - validate_model
       - validate_argocd_ready
@@ -750,43 +732,33 @@ jobs:
           echo "Current kube context:"
           kubectl config current-context
 
-      - name: Classify GoldenGate Platform prerequisite state
+      - name: Classify GoldenGate Platform ownership safety
         id: classify
         shell: bash
-        env:
-          # Read through a step-level environment variable, never interpolated directly into a shell statement or hardcoded here -- the same external-operational-configuration pattern 30-sub-platform.yaml itself already uses for this variable.
-          FLUENT_BIT_IMAGE: ${{ vars.FLUENT_BIT_IMAGE }}
         run: |
           set -euo pipefail
 
-          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
-
-          if [ -z "${FLUENT_BIT_IMAGE:-}" ]; then
-            echo "FAIL: the FLUENT_BIT_IMAGE repository variable is not set."
-            exit 1
-          fi
-
-          # A non-zero exit here is a classifier inspection error (API unreachable, permission denied, malformed JSON) -- never treated as ABSENT.
-          if ! CLASSIFIER_OUTPUT="$(python3 hack/orchestration/platform_state.py --environment "${GG_SELECTED_ENVIRONMENT}" --fluent-bit-image "${FLUENT_BIT_IMAGE}")"; then
-            echo "FAIL: the GoldenGate Platform classifier could not determine cluster state (inspection error, not ABSENT) -- see diagnostics above."
+          # A non-zero exit here is a classifier inspection error (API unreachable, permission denied, malformed JSON) -- never treated as ABSENT. Generic MAIN Desired-State Convergence Fix: ownership safety no longer depends on FLUENT_BIT_IMAGE (or any other desired-state value) at all -- it only inspects OWNERSHIP LABELS on whatever currently exists, so a values-driven Platform change never requires touching this classifier.
+          if ! CLASSIFIER_OUTPUT="$(python3 hack/orchestration/platform_state.py --environment "${GG_SELECTED_ENVIRONMENT}")"; then
+            echo "FAIL: the GoldenGate Platform ownership classifier could not determine cluster state (inspection error, not ABSENT) -- see diagnostics above."
             exit 1
           fi
 
           echo "$CLASSIFIER_OUTPUT"
 
           STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
-          echo "GoldenGate Platform prerequisite state: ${STATE}"
+          echo "GoldenGate Platform ownership-safety state: ${STATE}"
           echo "state=${STATE}" >> "$GITHUB_OUTPUT"
 
           if [ "$STATE" = "BROKEN" ]; then
-            echo "FAIL: GoldenGate Platform prerequisite state is BROKEN. This is not auto-repaired here -- investigate the diagnostics above and repair the platform (or run 30 | SUB | GoldenGate Platform -- .github/workflows/30-sub-platform.yaml -- standalone) before re-running."
+            echo "FAIL: GoldenGate Platform ownership-safety state is BROKEN -- a foreign/ambiguous ownership conflict or genuine inspection failure. This is not auto-repaired here -- investigate the diagnostics above before re-running MAIN."
             exit 1
           fi
 
   observability_preflight:
-    name: Classify Observability prerequisite state (read-only)
+    name: Classify Observability ownership safety (read-only)
 
-    # Phase B2: the ownership-aware application-prerequisite state machine extended to Observability -- ABSENT/RECONCILABLE -> reconcile via 40-sub-observability.yaml (Live Platform + Observability End-to-End Self-Recovery Fix added RECONCILABLE: deterministic cloudwatch-agent ServiceAccount role-arn drift only), HEALTHY -> continue, BROKEN -> fail closed, never auto-repaired. Deliberately does NOT depend on platform_preflight -- both are independent application-owned prerequisites after Argo and run in parallel. This job never mutates the cluster -- it only runs hack/orchestration/observability_state.py, which itself issues read-only `kubectl get` calls.
+    # Generic MAIN Desired-State Convergence Fix: hack/orchestration/observability_state.py is now a pure OWNERSHIP-SAFETY classifier -- ABSENT and OWNED both reconcile via observability_sync_once below on EVERY Deploy, regardless of individual desired-state drift (chart version, image digests, the cloudwatch-agent ServiceAccount role-arn, a future new resource); BROKEN (foreign/ambiguous ownership, or a genuine inspection failure) fails closed right here, never auto-repaired. Deliberately does NOT depend on platform_preflight -- both are independent application-owned prerequisites after Argo and run in parallel. This job never mutates the cluster -- it only runs hack/orchestration/observability_state.py, which itself issues read-only `kubectl get` calls.
     needs:
       - validate_model
       - validate_argocd_ready
@@ -863,39 +835,37 @@ jobs:
           echo "Current kube context:"
           kubectl config current-context
 
-      - name: Classify Observability prerequisite state
+      - name: Classify Observability ownership safety
         id: classify
         shell: bash
         run: |
           set -euo pipefail
 
-          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
-
           # A non-zero exit here is a classifier inspection error (API unreachable, permission denied, malformed JSON) -- never treated as ABSENT.
           if ! CLASSIFIER_OUTPUT="$(python3 hack/orchestration/observability_state.py --environment "${GG_SELECTED_ENVIRONMENT}")"; then
-            echo "FAIL: the Observability classifier could not determine cluster state (inspection error, not ABSENT) -- see diagnostics above."
+            echo "FAIL: the Observability ownership classifier could not determine cluster state (inspection error, not ABSENT) -- see diagnostics above."
             exit 1
           fi
 
           echo "$CLASSIFIER_OUTPUT"
 
           STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
-          echo "Observability prerequisite state: ${STATE}"
+          echo "Observability ownership-safety state: ${STATE}"
           echo "state=${STATE}" >> "$GITHUB_OUTPUT"
 
           if [ "$STATE" = "BROKEN" ]; then
-            echo "FAIL: Observability prerequisite state is BROKEN. This is not auto-repaired here -- investigate the diagnostics above and repair observability (or run 40 | SUB | Observability -- .github/workflows/40-sub-observability.yaml -- standalone) before re-running."
+            echo "FAIL: Observability ownership-safety state is BROKEN -- a foreign/ambiguous ownership conflict or genuine inspection failure. This is not auto-repaired here -- investigate the diagnostics above before re-running MAIN."
             exit 1
           fi
 
   platform_sync_once:
-    name: Reconcile the GoldenGate platform chart (only when currently absent or safely reconcilable)
+    name: Reconcile the GoldenGate platform chart
 
-    # Runs the reusable specialist workflow synchronously as part of this DAG -- never an asynchronous CLI/API dispatch or repository_dispatch trigger. Skipped entirely (not run) whenever the platform is already HEALTHY or preflight found it BROKEN -- MAIN is prerequisite orchestration, not a general upgrade engine; an engineer who intentionally wants to upgrade/reconcile an already-existing platform runs 30-sub-platform.yaml standalone. Live Platform + Observability End-to-End Self-Recovery Fix: RECONCILABLE (deterministic, application-owned namespace-label drift that 30-sub-platform.yaml's own idempotent Argo CD sync already safely repairs via managedNamespaceMetadata) now also triggers this same reconciliation, mirroring reconcile_argocd's ABSENT/RECONCILABLE handling for Argo CD -- HEALTHY still does not re-trigger reconciliation here, unchanged from the existing intended architecture.
+    # Generic MAIN Desired-State Convergence Fix: MAIN ALWAYS reconciles the Platform on Deploy whenever platform_preflight confirms it is safe (ABSENT or OWNED) -- never skipped merely because the preflight ownership classifier found the installation superficially healthy-looking. 30-sub-platform.yaml's own idempotent Argo CD sync is what actually applies the current committed desired state (Fluent Bit image/config, ServiceAccount role ARNs, any future values-driven resource, a Fluent Bit disable/enable toggle) -- this job never needs to learn a new resource name merely to keep permitting that reconciliation. Runs the reusable specialist workflow synchronously as part of this DAG -- never an asynchronous CLI/API dispatch or repository_dispatch trigger. No standalone specialist workflow is a required recovery/upgrade path -- MAIN never tells an operator to run 30-sub-platform.yaml separately to apply ordinary desired state.
     needs:
       - validate_model
       - platform_preflight
-    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.platform_preflight.result == 'success' && (needs.platform_preflight.outputs.state == 'ABSENT' || needs.platform_preflight.outputs.state == 'RECONCILABLE') }}
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.platform_preflight.result == 'success' && (needs.platform_preflight.outputs.state == 'ABSENT' || needs.platform_preflight.outputs.state == 'OWNED') }}
 
     uses: ./.github/workflows/30-sub-platform.yaml
     with:
@@ -904,13 +874,13 @@ jobs:
       orchestrated_by_main: true
 
   observability_sync_once:
-    name: Reconcile Observability (only when currently absent or safely reconcilable)
+    name: Reconcile Observability
 
-    # Runs the reusable specialist workflow synchronously as part of this DAG -- never an asynchronous CLI/API dispatch or repository_dispatch trigger. Skipped entirely (not run) whenever Observability is already HEALTHY or preflight found it BROKEN -- same ABSENT/RECONCILABLE reconciliation boundary as platform_sync_once. Live Platform + Observability End-to-End Self-Recovery Fix: RECONCILABLE (deterministic cloudwatch-agent ServiceAccount role-arn drift that 40-sub-observability.yaml's own IRSA reconciliation step already safely repairs) now also triggers this same reconciliation -- HEALTHY still does not re-trigger reconciliation here, unchanged from the existing intended architecture.
+    # Generic MAIN Desired-State Convergence Fix: MAIN ALWAYS reconciles Observability on Deploy whenever observability_preflight confirms it is safe (ABSENT or OWNED) -- same always-reconcile contract as platform_sync_once. 40-sub-observability.yaml's own idempotent Argo CD sync is what actually applies the current committed desired state (chart version, image digests, the cloudwatch-agent ServiceAccount role-arn, any future values-driven resource) -- this job never needs to learn a new resource name merely to keep permitting that reconciliation. No standalone specialist workflow is a required recovery/upgrade path.
     needs:
       - validate_model
       - observability_preflight
-    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.observability_preflight.result == 'success' && (needs.observability_preflight.outputs.state == 'ABSENT' || needs.observability_preflight.outputs.state == 'RECONCILABLE') }}
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.observability_preflight.result == 'success' && (needs.observability_preflight.outputs.state == 'ABSENT' || needs.observability_preflight.outputs.state == 'OWNED') }}
 
     uses: ./.github/workflows/40-sub-observability.yaml
     with:
@@ -919,14 +889,14 @@ jobs:
       orchestrated_by_main: true
 
   validate_platform_ready:
-    name: Validate GoldenGate Platform is healthy (convergence point for the already-healthy and just-reconciled paths)
+    name: Validate GoldenGate Platform is healthy (strict post-reconciliation acceptance)
 
-    # always() overrides GitHub's default implicit skip-on-skipped-dependency behavior (platform_sync_once is legitimately skipped on the already-HEALTHY path) -- the explicit result/state checks below are what actually keep this fail-closed, exactly like validate_argocd_ready's established always()-plus-explicit-result pattern above. Live Platform + Observability End-to-End Self-Recovery Fix: RECONCILABLE now also requires platform_sync_once to have succeeded first, exactly like ABSENT -- this job's own re-classification below still independently requires exactly HEALTHY, regardless of which path was taken.
+    # always() overrides GitHub's default implicit skip-on-skipped-dependency behavior -- the explicit result check below is what actually keeps this fail-closed. Generic MAIN Desired-State Convergence Fix: platform_sync_once now ALWAYS runs for both ABSENT and OWNED (never skipped on a healthy-looking preflight), so this job's own gating simplifies to "platform_preflight succeeded and platform_sync_once succeeded" -- the strict exact-desired-state check happens entirely in the re-classification step below (hack/orchestration/platform_acceptance.py), independent of which preflight state was observed.
     needs:
       - validate_model
       - platform_preflight
       - platform_sync_once
-    if: ${{ always() && needs.validate_model.outputs.effective_deploy == 'true' && needs.platform_preflight.result == 'success' && (needs.platform_preflight.outputs.state == 'HEALTHY' || ((needs.platform_preflight.outputs.state == 'ABSENT' || needs.platform_preflight.outputs.state == 'RECONCILABLE') && needs.platform_sync_once.result == 'success')) }}
+    if: ${{ always() && needs.validate_model.outputs.effective_deploy == 'true' && needs.platform_preflight.result == 'success' && needs.platform_sync_once.result == 'success' }}
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -999,20 +969,19 @@ jobs:
       - name: Re-classify and require GoldenGate Platform to be exactly HEALTHY
         shell: bash
         env:
+          # Read through a step-level environment variable, never interpolated directly into a shell statement or hardcoded here -- the same external-operational-configuration pattern 30-sub-platform.yaml itself already uses for this variable.
           FLUENT_BIT_IMAGE: ${{ vars.FLUENT_BIT_IMAGE }}
         run: |
           set -euo pipefail
-
-          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
 
           if [ -z "${FLUENT_BIT_IMAGE:-}" ]; then
             echo "FAIL: the FLUENT_BIT_IMAGE repository variable is not set."
             exit 1
           fi
 
-          # Reconciliation success (the reusable workflow job returning) is never assumed to mean healthy -- the same read-only classifier is re-run here and must independently confirm HEALTHY.
-          if ! CLASSIFIER_OUTPUT="$(python3 hack/orchestration/platform_state.py --environment "${GG_SELECTED_ENVIRONMENT}" --fluent-bit-image "${FLUENT_BIT_IMAGE}")"; then
-            echo "FAIL: the GoldenGate Platform classifier could not determine cluster state (inspection error) during post-reconciliation validation."
+          # Generic MAIN Desired-State Convergence Fix: post-reconciliation acceptance is now a SEPARATE, strict classifier (hack/orchestration/platform_acceptance.py) from the pre-reconciliation ownership-safety preflight (hack/orchestration/platform_state.py) -- reconciliation success (the reusable workflow job returning) is never assumed to mean healthy; this independently re-inspects the live cluster against the full current desired-state contract (Fluent Bit image/shape/readiness, IRSA role ARNs, and the exact namespace app.kubernetes.io/managed-by=argocd contract).
+          if ! CLASSIFIER_OUTPUT="$(python3 hack/orchestration/platform_acceptance.py --environment "${GG_SELECTED_ENVIRONMENT}" --fluent-bit-image "${FLUENT_BIT_IMAGE}")"; then
+            echo "FAIL: the GoldenGate Platform acceptance classifier could not determine cluster state (inspection error) during post-reconciliation validation."
             exit 1
           fi
 
@@ -1021,21 +990,21 @@ jobs:
           STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
 
           if [ "$STATE" != "HEALTHY" ]; then
-            echo "FAIL: GoldenGate Platform prerequisite state is ${STATE}, expected HEALTHY after preflight/reconciliation. Refusing to proceed."
+            echo "FAIL: GoldenGate Platform acceptance state is ${STATE}, expected HEALTHY after preflight/reconciliation. Refusing to proceed."
             exit 1
           fi
 
-          echo "OK: GoldenGate Platform prerequisite state is HEALTHY."
+          echo "OK: GoldenGate Platform acceptance state is HEALTHY."
 
   validate_observability_ready:
-    name: Validate Observability is healthy (convergence point for the already-healthy and just-reconciled paths)
+    name: Validate Observability is healthy (strict post-reconciliation acceptance)
 
-    # always() overrides GitHub's default implicit skip-on-skipped-dependency behavior (observability_sync_once is legitimately skipped on the already-HEALTHY path) -- same always()-plus-explicit-result pattern as validate_platform_ready above. Live Platform + Observability End-to-End Self-Recovery Fix: RECONCILABLE now also requires observability_sync_once to have succeeded first, exactly like ABSENT -- this job's own re-classification below still independently requires exactly HEALTHY, regardless of which path was taken.
+    # always() overrides GitHub's default implicit skip-on-skipped-dependency behavior -- the explicit result check below is what actually keeps this fail-closed. Generic MAIN Desired-State Convergence Fix: observability_sync_once now ALWAYS runs for both ABSENT and OWNED (never skipped on a healthy-looking preflight), so this job's own gating simplifies to "observability_preflight succeeded and observability_sync_once succeeded" -- the strict exact-desired-state check happens entirely in the re-classification step below (hack/orchestration/observability_acceptance.py), independent of which preflight state was observed.
     needs:
       - validate_model
       - observability_preflight
       - observability_sync_once
-    if: ${{ always() && needs.validate_model.outputs.effective_deploy == 'true' && needs.observability_preflight.result == 'success' && (needs.observability_preflight.outputs.state == 'HEALTHY' || ((needs.observability_preflight.outputs.state == 'ABSENT' || needs.observability_preflight.outputs.state == 'RECONCILABLE') && needs.observability_sync_once.result == 'success')) }}
+    if: ${{ always() && needs.validate_model.outputs.effective_deploy == 'true' && needs.observability_preflight.result == 'success' && needs.observability_sync_once.result == 'success' }}
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -1110,11 +1079,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
-
-          # Reconciliation success (the reusable workflow job returning) is never assumed to mean healthy -- the same read-only classifier is re-run here and must independently confirm HEALTHY.
-          if ! CLASSIFIER_OUTPUT="$(python3 hack/orchestration/observability_state.py --environment "${GG_SELECTED_ENVIRONMENT}")"; then
-            echo "FAIL: the Observability classifier could not determine cluster state (inspection error) during post-reconciliation validation."
+          # Generic MAIN Desired-State Convergence Fix: post-reconciliation acceptance is now a SEPARATE, strict classifier (hack/orchestration/observability_acceptance.py) from the pre-reconciliation ownership-safety preflight (hack/orchestration/observability_state.py) -- reconciliation success (the reusable workflow job returning) is never assumed to mean healthy; this independently re-inspects the live cluster against the full current desired-state contract (workload readiness, image provenance, Agent CR shape, the cloudwatch-agent ServiceAccount role-arn, chart version, and the metrics-only negative-safety contract).
+          if ! CLASSIFIER_OUTPUT="$(python3 hack/orchestration/observability_acceptance.py --environment "${GG_SELECTED_ENVIRONMENT}")"; then
+            echo "FAIL: the Observability acceptance classifier could not determine cluster state (inspection error) during post-reconciliation validation."
             exit 1
           fi
 
@@ -1123,11 +1090,11 @@ jobs:
           STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
 
           if [ "$STATE" != "HEALTHY" ]; then
-            echo "FAIL: Observability prerequisite state is ${STATE}, expected HEALTHY after preflight/reconciliation. Refusing to proceed."
+            echo "FAIL: Observability acceptance state is ${STATE}, expected HEALTHY after preflight/reconciliation. Refusing to proceed."
             exit 1
           fi
 
-          echo "OK: Observability prerequisite state is HEALTHY."
+          echo "OK: Observability acceptance state is HEALTHY."
 
   validate_shared_secrets_once:
     name: Validate the three shared GoldenGate secrets exist (read-only, once per environment)

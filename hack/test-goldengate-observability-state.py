@@ -1,4 +1,4 @@
-"""Offline tests for hack/orchestration/observability_state.py; run directly via `python3 hack/test-goldengate-observability-state.py`. No live Kubernetes -- every kubectl response is a fake, injected fixture. Exercises the classifier's actual logic (never merely greps its source)."""
+"""Offline tests for hack/orchestration/observability_state.py (ownership-safety preflight: ABSENT/OWNED/BROKEN); run directly via `python3 hack/test-goldengate-observability-state.py`. No live Kubernetes -- every kubectl response is a fake, injected fixture. Exercises the classifier's actual logic (never merely greps its source). Post-reconciliation acceptance (HEALTHY/BROKEN) is a separate module -- see hack/test-goldengate-observability-acceptance.py."""
 from __future__ import annotations
 
 import importlib.util
@@ -23,31 +23,20 @@ ENVIRONMENT = "dev"
 OBSERVABILITY_NAMESPACE = "amazon-cloudwatch"
 ARGOCD_NAMESPACE = "argocd"
 ECR_REGISTRY = "229410149234.dkr.ecr.eu-west-1.amazonaws.com"
-CLOUDWATCH_METRICS_ROLE_ARN = "arn:aws:iam::668311715351:role/GoldenGateCloudWatchMetricsRole-dev"
 
 APP_NAME = observability_state.ARGOCD_APP_NAME
 
 
 class FakeCluster:
-    """Models exactly the subset of `kubectl get <resource> [name] [-n ns] -o json` behavior the classifier depends on -- never a real kubectl process. A single-name get defaults to NotFound when unset; a list (no name) get defaults to an empty items array when unset, matching real kubectl semantics. A resource kind registered in `unknown_kinds` simulates a CRD that was never installed on the cluster ("doesn't have a resource type")."""
-
     def __init__(self):
         self.objects = {}
-        self.lists = {}
         self.force_errors = {}
-        self.unknown_kinds = set()
 
     def put(self, resource, name, namespace, obj):
         self.objects[(resource, name, namespace)] = obj
 
-    def put_list(self, resource, namespace, items):
-        self.lists[(resource, namespace)] = items
-
     def fail(self, resource, name, namespace, stderr):
         self.force_errors[(resource, name, namespace)] = stderr
-
-    def mark_unknown_kind(self, resource, namespace):
-        self.unknown_kinds.add((resource, namespace))
 
     def __call__(self, args):
         assert args[0] == "get", f"classifier issued a non-read-only kubectl verb: {args}"
@@ -68,323 +57,112 @@ class FakeCluster:
         key = (resource, name, namespace)
         if key in self.force_errors:
             return 1, "", self.force_errors[key]
-
-        if name is not None:
-            obj = self.objects.get(key)
-            if obj is None:
-                return 1, "", f'Error from server (NotFound): {resource} "{name}" not found'
-            return 0, json.dumps(obj), ""
-
-        if (resource, namespace) in self.unknown_kinds:
-            return 1, "", f'error: the server doesn\'t have a resource type "{resource}"'
-        items = self.lists.get((resource, namespace), [])
-        return 0, json.dumps({"items": items}), ""
+        obj = self.objects.get(key)
+        if obj is None:
+            return 1, "", f'Error from server (NotFound): {resource} "{name}" not found'
+        return 0, json.dumps(obj), ""
 
 
-def _app_obj(name, healthy=True, repo_url=None, target_revision=None, dest_ns=OBSERVABILITY_NAMESPACE, release_name=observability_state.RELEASE_NAME):
+def _app_obj(repo_url=None, dest_ns=OBSERVABILITY_NAMESPACE, release_name=observability_state.RELEASE_NAME):
     return {
-        "metadata": {"name": name},
-        "status": {
-            "sync": {"status": "Synced" if healthy else "OutOfSync"},
-            "health": {"status": "Healthy" if healthy else "Degraded"},
-        },
         "spec": {
-            "source": {
-                "repoURL": repo_url if repo_url is not None else f"oci://{ECR_REGISTRY}/{observability_state.HELM_REPO_PATH}",
-                "targetRevision": target_revision if target_revision is not None else observability_state.CHART_VERSION,
-                "helm": {"releaseName": release_name},
-            },
+            "source": {"repoURL": repo_url if repo_url is not None else f"oci://{ECR_REGISTRY}/{observability_state.HELM_REPO_PATH}", "helm": {"releaseName": release_name}},
             "destination": {"namespace": dest_ns},
         },
     }
 
 
-def _sa_obj(name, role_arn):
-    return {"metadata": {"name": name, "annotations": {"eks.amazonaws.com/role-arn": role_arn}}}
-
-
-def _image_ref(repo, digest="a" * 64):
-    return f"{ECR_REGISTRY}/{repo}:latest@sha256:{digest}"
-
-
-def _deployment_obj(name, generation=3, desired=1, image_repo="aws-cloud-factory-cloudwatch-agent-operator"):
-    return {
-        "metadata": {"name": name, "generation": generation},
-        "spec": {
-            "replicas": desired,
-            "template": {"spec": {"containers": [{"name": name, "image": _image_ref(image_repo)}]}},
-        },
-        "status": {
-            "observedGeneration": generation,
-            "updatedReplicas": desired,
-            "readyReplicas": desired,
-            "availableReplicas": desired,
-        },
-    }
-
-
-def _daemonset_obj(name, generation=3, desired=2, image_repo="aws-cloud-factory-cloudwatch-agent"):
-    return {
-        "metadata": {"name": name, "generation": generation},
-        "spec": {
-            "template": {"spec": {"containers": [{"name": name, "image": _image_ref(image_repo)}]}},
-        },
-        "status": {
-            "observedGeneration": generation,
-            "desiredNumberScheduled": desired,
-            "currentNumberScheduled": desired,
-            "updatedNumberScheduled": desired,
-            "numberReady": desired,
-            "numberAvailable": desired,
-            "numberUnavailable": 0,
-        },
-    }
-
-
-def _agent_cr_obj(name, mode, host_network):
-    return {"metadata": {"name": name}, "spec": {"mode": mode, "hostNetwork": host_network}}
-
-
-def _populate_healthy_cluster(cluster):
-    cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj(APP_NAME))
-    cluster.put("namespace", OBSERVABILITY_NAMESPACE, None, {"metadata": {"name": OBSERVABILITY_NAMESPACE}})
-    cluster.put("serviceaccount", observability_state.CLOUDWATCH_AGENT_SA_NAME, OBSERVABILITY_NAMESPACE, _sa_obj(observability_state.CLOUDWATCH_AGENT_SA_NAME, CLOUDWATCH_METRICS_ROLE_ARN))
-
-    for name in observability_state.REQUIRED_DEPLOYMENTS:
-        repo = "aws-cloud-factory-cloudwatch-agent-operator" if "controller-manager" in name else ("aws-cloud-factory-cloudwatch-agent" if "scraper" in name else "aws-cloud-factory-kube-state-metrics")
-        cluster.put("deployment", name, OBSERVABILITY_NAMESPACE, _deployment_obj(name, image_repo=repo))
-    for name in observability_state.REQUIRED_DAEMONSETS:
-        repo = "aws-cloud-factory-cloudwatch-agent" if name == "cloudwatch-agent" else "aws-cloud-factory-node-exporter"
-        cluster.put("daemonset", name, OBSERVABILITY_NAMESPACE, _daemonset_obj(name, image_repo=repo))
-    for name, expected in observability_state.AGENT_CR_EXPECTED.items():
-        cluster.put(observability_state.AGENT_CR_RESOURCE, name, OBSERVABILITY_NAMESPACE, _agent_cr_obj(name, expected["mode"], expected["hostNetwork"]))
-
-    cluster.put_list("daemonset", OBSERVABILITY_NAMESPACE, [_daemonset_obj(n) for n in observability_state.REQUIRED_DAEMONSETS])
-    cluster.put_list("pods", OBSERVABILITY_NAMESPACE, [])
-    for resource in observability_state.FORBIDDEN_LIST_RESOURCES:
-        cluster.put_list(resource, OBSERVABILITY_NAMESPACE, [])
+def _populate_owned_cluster(cluster):
+    cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj())
+    cluster.put("namespace", OBSERVABILITY_NAMESPACE, None, {"metadata": {}})
+    for name in observability_state.FOOTPRINT_DEPLOYMENTS:
+        cluster.put("deployment", name, OBSERVABILITY_NAMESPACE, {"metadata": {}})
+    for name in observability_state.FOOTPRINT_DAEMONSETS:
+        cluster.put("daemonset", name, OBSERVABILITY_NAMESPACE, {"metadata": {}})
+    cluster.put("serviceaccount", observability_state.CLOUDWATCH_AGENT_SA_NAME, OBSERVABILITY_NAMESPACE, {"metadata": {}})
     return cluster
 
 
 def _classify(cluster):
-    return observability_state.classify(
-        cluster,
-        environment=ENVIRONMENT,
-        observability_namespace=OBSERVABILITY_NAMESPACE,
-        argocd_namespace=ARGOCD_NAMESPACE,
-        ecr_registry=ECR_REGISTRY,
-        cloudwatch_metrics_role_arn=CLOUDWATCH_METRICS_ROLE_ARN,
-    )
+    return observability_state.classify(cluster, environment=ENVIRONMENT, observability_namespace=OBSERVABILITY_NAMESPACE, argocd_namespace=ARGOCD_NAMESPACE, ecr_registry=ECR_REGISTRY)
 
 
-class ObservabilityStateClassifierTests(unittest.TestCase):
-    def test_1_no_application_no_namespace_is_absent(self):
+class ObservabilityOwnershipStateTests(unittest.TestCase):
+    def test_no_footprint_is_absent(self):
         cluster = FakeCluster()
         result = _classify(cluster)
         self.assertEqual(result["state"], observability_state.STATE_ABSENT)
         self.assertEqual(result["reasons"], [])
 
-    def test_2_namespace_exists_without_application_is_broken(self):
-        cluster = FakeCluster()
-        cluster.put("namespace", OBSERVABILITY_NAMESPACE, None, {"metadata": {"name": OBSERVABILITY_NAMESPACE}})
+    def test_fully_owned_is_owned(self):
+        cluster = _populate_owned_cluster(FakeCluster())
         result = _classify(cluster)
-        self.assertEqual(result["state"], observability_state.STATE_BROKEN)
-        self.assertTrue(any("Application" in r and "does not exist" in r for r in result["reasons"]))
-
-    def test_3_application_exists_without_namespace_is_broken(self):
-        cluster = FakeCluster()
-        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj(APP_NAME))
-        result = _classify(cluster)
-        self.assertEqual(result["state"], observability_state.STATE_BROKEN)
-        self.assertTrue(any("namespace" in r and "does not exist" in r for r in result["reasons"]))
-
-    def test_4_application_not_synced_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj(APP_NAME, healthy=False))
-        result = _classify(cluster)
-        self.assertEqual(result["state"], observability_state.STATE_BROKEN)
-        self.assertTrue(any("sync status" in r for r in result["reasons"]))
-
-    def test_5_application_not_healthy_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        app = _app_obj(APP_NAME)
-        app["status"]["health"]["status"] = "Progressing"
-        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, app)
-        result = _classify(cluster)
-        self.assertEqual(result["state"], observability_state.STATE_BROKEN)
-        self.assertTrue(any("health status" in r for r in result["reasons"]))
-
-    def test_6_wrong_repo_url_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj(APP_NAME, repo_url="oci://wrong.example.com/helm/amazon-cloudwatch-observability"))
-        result = _classify(cluster)
-        self.assertEqual(result["state"], observability_state.STATE_BROKEN)
-        self.assertTrue(any("source.repoURL" in r for r in result["reasons"]))
-
-    def test_7_wrong_destination_namespace_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj(APP_NAME, dest_ns="some-other-namespace"))
-        result = _classify(cluster)
-        self.assertEqual(result["state"], observability_state.STATE_BROKEN)
-        self.assertTrue(any("destination.namespace" in r for r in result["reasons"]))
-
-    def test_8_cloudwatch_agent_sa_missing_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.objects.pop(("serviceaccount", observability_state.CLOUDWATCH_AGENT_SA_NAME, OBSERVABILITY_NAMESPACE))
-        result = _classify(cluster)
-        self.assertEqual(result["state"], observability_state.STATE_BROKEN)
-        self.assertTrue(any(f"serviceaccount/{observability_state.CLOUDWATCH_AGENT_SA_NAME} does not exist" in r for r in result["reasons"]))
-
-    def test_9_wrong_cloudwatch_metrics_role_alone_is_reconcilable(self):
-        # Live Platform + Observability End-to-End Self-Recovery Fix: a cloudwatch-agent ServiceAccount role-arn mismatch alone, with every other Observability resource healthy, is now a safe, deterministic, application-owned RECONCILABLE state (40-sub-observability.yaml's own "Annotate the CloudWatch Agent ServiceAccount" reconciliation step repairs it), never BROKEN -- this is expected precisely because the upstream chart renders this ServiceAccount with no role-arn annotation of its own (see 40-sub-observability.yaml's "Validate the rendered CloudWatch Agent ServiceAccount" step), so the annotation is always applied out-of-band and can always legitimately drift.
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.put("serviceaccount", observability_state.CLOUDWATCH_AGENT_SA_NAME, OBSERVABILITY_NAMESPACE, _sa_obj(observability_state.CLOUDWATCH_AGENT_SA_NAME, "arn:aws:iam::668311715351:role/SomeOtherRole"))
-        result = _classify(cluster)
-        self.assertEqual(result["state"], observability_state.STATE_RECONCILABLE)
-        self.assertTrue(any("eks.amazonaws.com/role-arn" in r for r in result["reasons"]))
-
-    def test_10_controller_deployment_not_ready_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        obj = _deployment_obj("amazon-cloudwatch-observability-controller-manager")
-        obj["status"]["readyReplicas"] = 0
-        cluster.put("deployment", "amazon-cloudwatch-observability-controller-manager", OBSERVABILITY_NAMESPACE, obj)
-        result = _classify(cluster)
-        self.assertEqual(result["state"], observability_state.STATE_BROKEN)
-        self.assertTrue(any("amazon-cloudwatch-observability-controller-manager not ready" in r for r in result["reasons"]))
-
-    def test_11_cloudwatch_agent_daemonset_not_ready_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        obj = _daemonset_obj("cloudwatch-agent")
-        obj["status"]["numberReady"] = 0
-        cluster.put("daemonset", "cloudwatch-agent", OBSERVABILITY_NAMESPACE, obj)
-        result = _classify(cluster)
-        self.assertEqual(result["state"], observability_state.STATE_BROKEN)
-        self.assertTrue(any("daemonset/cloudwatch-agent not ready" in r for r in result["reasons"]))
-
-    def test_12_cluster_scraper_not_ready_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        obj = _deployment_obj("cloudwatch-agent-cluster-scraper")
-        obj["status"]["availableReplicas"] = 0
-        cluster.put("deployment", "cloudwatch-agent-cluster-scraper", OBSERVABILITY_NAMESPACE, obj)
-        result = _classify(cluster)
-        self.assertEqual(result["state"], observability_state.STATE_BROKEN)
-        self.assertTrue(any("cloudwatch-agent-cluster-scraper not ready" in r for r in result["reasons"]))
-
-    def test_13_kube_state_metrics_not_ready_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        obj = _deployment_obj("kube-state-metrics")
-        obj["status"]["updatedReplicas"] = 0
-        cluster.put("deployment", "kube-state-metrics", OBSERVABILITY_NAMESPACE, obj)
-        result = _classify(cluster)
-        self.assertEqual(result["state"], observability_state.STATE_BROKEN)
-        self.assertTrue(any("kube-state-metrics not ready" in r for r in result["reasons"]))
-
-    def test_14_node_exporter_not_ready_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        obj = _daemonset_obj("node-exporter")
-        obj["status"]["numberAvailable"] = 0
-        cluster.put("daemonset", "node-exporter", OBSERVABILITY_NAMESPACE, obj)
-        result = _classify(cluster)
-        self.assertEqual(result["state"], observability_state.STATE_BROKEN)
-        self.assertTrue(any("daemonset/node-exporter not ready" in r for r in result["reasons"]))
-
-    def test_15_required_agent_cr_missing_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.objects.pop((observability_state.AGENT_CR_RESOURCE, "cloudwatch-agent", OBSERVABILITY_NAMESPACE))
-        result = _classify(cluster)
-        self.assertEqual(result["state"], observability_state.STATE_BROKEN)
-        self.assertTrue(any("AmazonCloudWatchAgent/cloudwatch-agent does not exist" in r for r in result["reasons"]))
-
-    def test_16_wrong_cr_mode_hostnetwork_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.put(observability_state.AGENT_CR_RESOURCE, "cloudwatch-agent", OBSERVABILITY_NAMESPACE, _agent_cr_obj("cloudwatch-agent", "deployment", False))
-        result = _classify(cluster)
-        self.assertEqual(result["state"], observability_state.STATE_BROKEN)
-        self.assertTrue(any("spec.mode" in r for r in result["reasons"]))
-        self.assertTrue(any("spec.hostNetwork" in r for r in result["reasons"]))
-
-    def test_17_public_image_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        obj = _deployment_obj("kube-state-metrics")
-        obj["spec"]["template"]["spec"]["containers"][0]["image"] = "public.ecr.aws/some/image:latest@sha256:" + "a" * 64
-        cluster.put("deployment", "kube-state-metrics", OBSERVABILITY_NAMESPACE, obj)
-        result = _classify(cluster)
-        self.assertEqual(result["state"], observability_state.STATE_BROKEN)
-        self.assertTrue(any("not on the private registry" in r for r in result["reasons"]))
-
-    def test_18_non_digest_pinned_image_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        obj = _deployment_obj("kube-state-metrics")
-        obj["spec"]["template"]["spec"]["containers"][0]["image"] = f"{ECR_REGISTRY}/aws-cloud-factory-kube-state-metrics:v2.18.0"
-        cluster.put("deployment", "kube-state-metrics", OBSERVABILITY_NAMESPACE, obj)
-        result = _classify(cluster)
-        self.assertEqual(result["state"], observability_state.STATE_BROKEN)
-        self.assertTrue(any("not digest-pinned" in r for r in result["reasons"]))
-
-    def test_18b_unapproved_repository_image_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        obj = _deployment_obj("kube-state-metrics", image_repo="some-unapproved-repo")
-        cluster.put("deployment", "kube-state-metrics", OBSERVABILITY_NAMESPACE, obj)
-        result = _classify(cluster)
-        self.assertEqual(result["state"], observability_state.STATE_BROKEN)
-        self.assertTrue(any("unapproved repository" in r for r in result["reasons"]))
-
-    def test_19_forbidden_fluent_bit_daemonset_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.put_list("daemonset", OBSERVABILITY_NAMESPACE, [_daemonset_obj(n) for n in observability_state.REQUIRED_DAEMONSETS] + [{"metadata": {"name": "fluent-bit"}}])
-        result = _classify(cluster)
-        self.assertEqual(result["state"], observability_state.STATE_BROKEN)
-        self.assertTrue(any("forbidden Fluent Bit-like DaemonSet" in r for r in result["reasons"]))
-
-    def test_19b_forbidden_target_allocator_pod_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.put_list("pods", OBSERVABILITY_NAMESPACE, [{"metadata": {"name": "otel-target-allocator-abc123"}}])
-        result = _classify(cluster)
-        self.assertEqual(result["state"], observability_state.STATE_BROKEN)
-        self.assertTrue(any("forbidden target-allocator pod" in r for r in result["reasons"]))
-
-    def test_19c_forbidden_instrumentation_resource_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.put_list("instrumentations.cloudwatch.aws.amazon.com", OBSERVABILITY_NAMESPACE, [{"metadata": {"name": "default"}}])
-        result = _classify(cluster)
-        self.assertEqual(result["state"], observability_state.STATE_BROKEN)
-        self.assertTrue(any("instrumentations.cloudwatch.aws.amazon.com" in r for r in result["reasons"]))
-
-    def test_19d_forbidden_dcgm_exporter_resource_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.put_list("dcgmexporters.cloudwatch.aws.amazon.com", OBSERVABILITY_NAMESPACE, [{"metadata": {"name": "default"}}])
-        result = _classify(cluster)
-        self.assertEqual(result["state"], observability_state.STATE_BROKEN)
-        self.assertTrue(any("dcgmexporters.cloudwatch.aws.amazon.com" in r for r in result["reasons"]))
-
-    def test_19e_forbidden_neuron_monitor_resource_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.put_list("neuronmonitors.cloudwatch.aws.amazon.com", OBSERVABILITY_NAMESPACE, [{"metadata": {"name": "default"}}])
-        result = _classify(cluster)
-        self.assertEqual(result["state"], observability_state.STATE_BROKEN)
-        self.assertTrue(any("neuronmonitors.cloudwatch.aws.amazon.com" in r for r in result["reasons"]))
-
-    def test_19f_forbidden_crd_kind_never_installed_does_not_break_healthy(self):
-        # These optional CRD kinds may genuinely never be registered on the cluster at all (dcgmExporter.enabled=false / neuronMonitor.enabled=false permanently) -- that must be treated as zero results, not an inspection error, and must not itself cause BROKEN.
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.mark_unknown_kind("dcgmexporters.cloudwatch.aws.amazon.com", OBSERVABILITY_NAMESPACE)
-        cluster.mark_unknown_kind("neuronmonitors.cloudwatch.aws.amazon.com", OBSERVABILITY_NAMESPACE)
-        result = _classify(cluster)
-        self.assertEqual(result["state"], observability_state.STATE_HEALTHY)
-
-    def test_20_complete_expected_state_is_healthy(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        result = _classify(cluster)
-        self.assertEqual(result["state"], observability_state.STATE_HEALTHY)
+        self.assertEqual(result["state"], observability_state.STATE_OWNED)
         self.assertEqual(result["reasons"], [])
 
-    def test_21a_api_forbidden_raises_inspection_error_not_absent(self):
+    def test_application_only_no_footprint_yet_is_owned(self):
+        # Fresh reconciliation-in-progress shape: Application exists, nothing else rendered yet -- OWNED, not a completeness failure.
+        cluster = FakeCluster()
+        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj())
+        result = _classify(cluster)
+        self.assertEqual(result["state"], observability_state.STATE_OWNED)
+
+    def test_missing_workloads_never_forces_broken(self):
+        cluster = _populate_owned_cluster(FakeCluster())
+        cluster.objects.pop(("deployment", observability_state.FOOTPRINT_DEPLOYMENTS[0], OBSERVABILITY_NAMESPACE))
+        cluster.objects.pop(("daemonset", observability_state.FOOTPRINT_DAEMONSETS[0], OBSERVABILITY_NAMESPACE))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], observability_state.STATE_OWNED)
+
+    def test_wrong_repo_url_is_broken(self):
+        cluster = _populate_owned_cluster(FakeCluster())
+        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj(repo_url="oci://wrong.example.com/helm/amazon-cloudwatch-observability"))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], observability_state.STATE_BROKEN)
+        self.assertTrue(any("foreign/ambiguous ownership" in r for r in result["reasons"]))
+
+    def test_wrong_destination_namespace_is_broken(self):
+        cluster = _populate_owned_cluster(FakeCluster())
+        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj(dest_ns="some-other-namespace"))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], observability_state.STATE_BROKEN)
+
+    def test_wrong_release_name_is_broken(self):
+        cluster = _populate_owned_cluster(FakeCluster())
+        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj(release_name="some-other-release"))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], observability_state.STATE_BROKEN)
+
+    def test_application_absent_but_footprint_present_is_broken(self):
+        cluster = _populate_owned_cluster(FakeCluster())
+        cluster.objects.pop(("application", APP_NAME, ARGOCD_NAMESPACE))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], observability_state.STATE_BROKEN)
+        self.assertTrue(any("foreign/ambiguous ownership" in r for r in result["reasons"]))
+
+    def test_application_out_of_sync_never_forces_broken(self):
+        # Ownership never inspects sync/health status or chart version -- an OutOfSync Application/stale chart version that otherwise clearly belongs here is exactly what MAIN is about to reconcile.
+        cluster = _populate_owned_cluster(FakeCluster())
+        app = _app_obj()
+        app["status"] = {"sync": {"status": "OutOfSync"}, "health": {"status": "Progressing"}}
+        app["spec"]["source"]["targetRevision"] = "1.0.0"
+        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, app)
+        result = _classify(cluster)
+        self.assertEqual(result["state"], observability_state.STATE_OWNED)
+
+    def test_sa_role_arn_never_checked_in_ownership(self):
+        # Structural/behavioral proof: the SA IRSA role-arn correctness is entirely an acceptance concern -- ownership does not even accept a role-arn argument.
+        import inspect
+        params = list(inspect.signature(observability_state.classify).parameters)
+        self.assertEqual(params, ["run", "environment", "observability_namespace", "argocd_namespace", "ecr_registry"])
+
+    def test_forbidden_raises_inspection_error(self):
         cluster = FakeCluster()
         cluster.fail("application", APP_NAME, ARGOCD_NAMESPACE, "Error from server (Forbidden): applications.argoproj.io is forbidden")
         with self.assertRaises(observability_state.ClassifierInspectionError):
             _classify(cluster)
 
-    def test_21b_malformed_json_raises_inspection_error(self):
+    def test_malformed_json_raises_inspection_error(self):
         cluster = FakeCluster()
 
         def bad_run(args):
@@ -393,70 +171,10 @@ class ObservabilityStateClassifierTests(unittest.TestCase):
             return cluster(args)
 
         with self.assertRaises(observability_state.ClassifierInspectionError):
-            observability_state.classify(
-                bad_run,
-                environment=ENVIRONMENT,
-                observability_namespace=OBSERVABILITY_NAMESPACE,
-                argocd_namespace=ARGOCD_NAMESPACE,
-                ecr_registry=ECR_REGISTRY,
-                cloudwatch_metrics_role_arn=CLOUDWATCH_METRICS_ROLE_ARN,
-            )
-
-    def test_wrong_release_name_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj(APP_NAME, release_name="some-other-release"))
-        result = _classify(cluster)
-        self.assertEqual(result["state"], observability_state.STATE_BROKEN)
-        self.assertTrue(any("source.helm.releaseName" in r for r in result["reasons"]))
-
-    def test_wrong_target_revision_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj(APP_NAME, target_revision="5.0.0"))
-        result = _classify(cluster)
-        self.assertEqual(result["state"], observability_state.STATE_BROKEN)
-        self.assertTrue(any("source.targetRevision" in r for r in result["reasons"]))
-
-
-class ObservabilityStateReconcilableTests(unittest.TestCase):
-    """Live Platform + Observability End-to-End Self-Recovery Fix: RECONCILABLE is a narrow carve-out for deterministic cloudwatch-agent ServiceAccount role-arn drift only (test naming matches the task's own O-numbering for traceability where applicable; most O-numbered scenarios are workflow-ordering/DAG-level proofs covered in hack/test-goldengate-deployment-models.sh, not here)."""
-
-    def test_O13_sa_role_arn_missing_alone_is_reconcilable(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.put("serviceaccount", observability_state.CLOUDWATCH_AGENT_SA_NAME, OBSERVABILITY_NAMESPACE, {"metadata": {"name": observability_state.CLOUDWATCH_AGENT_SA_NAME, "annotations": {}}})
-        result = _classify(cluster)
-        self.assertEqual(result["state"], observability_state.STATE_RECONCILABLE)
-
-    def test_O14_sa_role_arn_drift_plus_one_unsafe_component_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.put("serviceaccount", observability_state.CLOUDWATCH_AGENT_SA_NAME, OBSERVABILITY_NAMESPACE, _sa_obj(observability_state.CLOUDWATCH_AGENT_SA_NAME, "arn:aws:iam::668311715351:role/SomeOtherRole"))
-        # The one additional unsafe component: cloudwatch-agent DaemonSet not fully ready.
-        ds = _daemonset_obj("cloudwatch-agent")
-        ds["status"]["numberReady"] = 0
-        cluster.put("daemonset", "cloudwatch-agent", OBSERVABILITY_NAMESPACE, ds)
-        result = _classify(cluster)
-        self.assertEqual(result["state"], observability_state.STATE_BROKEN, "safe reason + unsafe reason together must never yield partial credit")
-        self.assertTrue(any("eks.amazonaws.com/role-arn" in r for r in result["reasons"]))
-        self.assertTrue(any("not ready" in r for r in result["reasons"]))
-
-    def test_O9_cluster_scraper_hostnetwork_false_contract_still_enforced(self):
-        # Preserves the pre-existing hostNetwork=false contract for the scraper Agent CR -- this classifier check is unrelated to and unweakened by the new RECONCILABLE carve-out.
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.put(observability_state.AGENT_CR_RESOURCE, "cloudwatch-agent-cluster-scraper", OBSERVABILITY_NAMESPACE, _agent_cr_obj("cloudwatch-agent-cluster-scraper", "deployment", True))
-        result = _classify(cluster)
-        self.assertEqual(result["state"], observability_state.STATE_BROKEN)
-        self.assertTrue(any("cloudwatch-agent-cluster-scraper" in r and "spec.hostNetwork" in r for r in result["reasons"]))
-
-    def test_sa_missing_entirely_remains_broken_never_reconcilable(self):
-        # Distinct from an annotation mismatch: the specialist workflow's "Annotate the CloudWatch Agent ServiceAccount" step only ever annotates an EXISTING ServiceAccount (its own `kubectl get serviceaccount ... >/dev/null` guard fails closed first) -- a missing ServiceAccount is never safely auto-repairable by that step, so it must stay exclusively in `reasons`, never `reconcilable_reasons`.
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.objects.pop(("serviceaccount", observability_state.CLOUDWATCH_AGENT_SA_NAME, OBSERVABILITY_NAMESPACE))
-        result = _classify(cluster)
-        self.assertEqual(result["state"], observability_state.STATE_BROKEN)
+            observability_state.classify(bad_run, environment=ENVIRONMENT, observability_namespace=OBSERVABILITY_NAMESPACE, argocd_namespace=ARGOCD_NAMESPACE, ecr_registry=ECR_REGISTRY)
 
 
 class ObservabilityStateNoMutationSourceSweepTests(unittest.TestCase):
-    """Static source-safety proof: the classifier module (and its shared k8s_common helper) must never construct a mutating kubectl/helm command."""
-
     FORBIDDEN_SUBSTRINGS = (
         "kubectl apply", "kubectl create", "kubectl delete", "kubectl patch",
         "kubectl annotate", "kubectl label",
@@ -472,7 +190,7 @@ class ObservabilityStateNoMutationSourceSweepTests(unittest.TestCase):
             self.assertEqual(hits, [], f"{path} contains a mutating-looking construct: {hits}")
 
     def test_every_get_json_call_uses_get_verb_only(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
+        cluster = _populate_owned_cluster(FakeCluster())
         _classify(cluster)
 
 

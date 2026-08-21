@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
-"""hack/orchestration/argocd_state.py: read-only Argo CD prerequisite classifier -- answers exactly one question, "what is the current Argo CD prerequisite state?", as one of ABSENT/HEALTHY/RECONCILABLE/BROKEN. RECONCILABLE is a narrow, deliberately conservative carve-out: (1, Live Argo Recovery Fix) the generated repository Secrets are missing/drifted, and (2, Fresh-Cluster Platform + Argo Ingress Self-Recovery Fix) the desired, clearly Argo/Helm-owned argocd-server-ingress is missing or carries safe deterministic spec/annotation drift (including the AWS Load Balancer Controller not yet having published a status.loadBalancer.ingress address) -- both classes of drift the existing reusable Argo specialist workflow (its idempotent Helm chart reconciliation, own immediate bounded ECR token-sync validation step, and own bounded Ingress/ALB readiness wait) already safely repairs. A same-name Ingress with foreign/ambiguous ownership is never taken over -- that stays exclusively in `reasons`, forcing BROKEN. Any other drift at all still classifies BROKEN. Never mutates the cluster: every kubectl invocation here is a `get` (read-only); no apply/create/delete/patch/annotate/label/helm call exists in this module. Consumes environment identity through hack/goldengate-environment.py, never a second environment parser."""
+"""hack/orchestration/argocd_state.py: read-only Argo CD ownership-safety preflight classifier -- answers exactly one question, "is it safe for MAIN to reconcile this Argo CD installation?", as one of ABSENT/OWNED/BROKEN. This is NOT a HEALTHY-skip prerequisite classifier: Argo CD's own desired state (core replicas, ecrTokenSync repositories, argocdServerIngress.enabled, image/tag, any future wrapper-chart resource) may legitimately change on every run, so OWNED (not HEALTHY) is the "safe to reconcile" state -- readiness/exact-desired-state acceptance is validated separately, post-reconciliation, by hack/orchestration/argocd_acceptance.py. Generic by design: this module checks OWNERSHIP LABELS on whatever currently exists, never the correctness/readiness of any individual resource -- adding a new values-driven chart resource, or flipping an existing one false<->true, never requires touching this file. Never mutates the cluster: every kubectl invocation here is a `get` (read-only); no apply/create/delete/patch/annotate/label/helm call exists in this module. Consumes environment identity through hack/goldengate-environment.py, never a second environment parser."""
 from __future__ import annotations
 
 import argparse
-import base64
 import importlib.util
 import json
 import os
 import subprocess
 import sys
-
-import yaml
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -37,30 +34,20 @@ def environment_derived_values(environment):
     return env_module.derive_values(doc)
 
 
-def ingress_config_from_values(environment):
-    """Reads envs/<environment>/argocd/values.yaml's whole argocdServerIngress block -- the actual deployed-chart application-constant contract (enabled, mode, ingressClassName, serviceName, servicePort, groupOrder, targetType, backendProtocol, listenPorts, healthcheck*, scheme), never hardcoded into this classifier. host/groupName/certificateArn are deliberately NOT read from here -- those are shared environment identity, injected at deploy time from envs/<environment>/environment.yaml via the canonical resolver, and are passed into classify() separately (argocd_host/alb_group_name/acm_certificate_arn)."""
-    path = os.path.join(REPO_ROOT, "envs", environment, "argocd", "values.yaml")
-    with open(path) as f:
-        doc = yaml.safe_load(f) or {}
-    return dict(doc.get("argocdServerIngress") or {})
-
-
 STATE_ABSENT = "ABSENT"
-STATE_HEALTHY = "HEALTHY"
-STATE_RECONCILABLE = "RECONCILABLE"
+STATE_OWNED = "OWNED"
 STATE_BROKEN = "BROKEN"
 
-# Stable compatibility marker, not an operational recovery mechanism: lets a caller (00-main-goldengate-orchestrator.yaml) fail closed if it is ever paired with a classifier source whose state semantics have drifted (e.g. an older copy of this file that predates RECONCILABLE), rather than silently trusting a state value the caller's own if: expressions were never written to understand. Bump only when the {"state", ...} contract itself changes meaning.
-CLASSIFIER_CONTRACT = "argocd-recovery-v2"
+# Current chart/naming contract (helm/argocd, its vendored argo-cd/ dependency) -- verified against the real vendored chart's rendered output, never guessed. Only used here to name the resources this module inspects for OWNERSHIP; individual field correctness (readiness, image, IRSA role-arn, Secret URL, Ingress contract) is deliberately out of scope -- that is argocd_acceptance.py's job.
+ARGOCD_RELEASE_NAME = "argocd"
 
-# Current chart/values contract (helm/argocd, envs/<environment>/argocd/values.yaml) -- verified against the real vendored chart's rendered output, never guessed.
 REQUIRED_CRDS = (
     "applications.argoproj.io",
     "appprojects.argoproj.io",
     "applicationsets.argoproj.io",
 )
 
-REQUIRED_DEPLOYMENTS = (
+CORE_DEPLOYMENTS = (
     "argocd-server",
     "argocd-repo-server",
     "argocd-redis",
@@ -68,23 +55,23 @@ REQUIRED_DEPLOYMENTS = (
     "argocd-notifications-controller",
 )
 
-REQUIRED_STATEFULSETS = ("argocd-application-controller",)
+CORE_STATEFULSETS = ("argocd-application-controller",)
 
-REQUIRED_SERVICES = ("argocd-server", "argocd-repo-server", "argocd-redis")
+CORE_SERVICES = ("argocd-server", "argocd-repo-server", "argocd-redis")
 
 ECR_TOKEN_SYNC_NAME = "argocd-ecr-token-sync"
 
-# Repository Secret name -> Helm OCI repository path (relative to ECR_REGISTRY), matching envs/<environment>/argocd/values.yaml ecrTokenSync.repositories exactly.
-REQUIRED_REPO_SECRETS = {
-    "argocd-ecr-goldengate-oci": "helm/goldengate",
-    "argocd-ecr-goldengate-monitor-oci": "helm/goldengate-monitor",
-    "argocd-ecr-goldengate-platform-oci": "helm/goldengate-platform",
-    "argocd-ecr-amazon-cloudwatch-observability-oci": "helm/amazon-cloudwatch-observability",
-}
+# Repository Secret names this CronJob may create -- checked for ownership only if/when they already exist; a missing one is never itself a reason (that is exactly the deterministic drift 20-sub-argocd.yaml's own bounded token-sync validation repairs on every reconcile).
+REPOSITORY_SECRET_NAMES = (
+    "argocd-ecr-goldengate-oci",
+    "argocd-ecr-goldengate-monitor-oci",
+    "argocd-ecr-goldengate-platform-oci",
+    "argocd-ecr-amazon-cloudwatch-observability-oci",
+)
 
 INGRESS_NAME = "argocd-server-ingress"
 
-# Labels rendered by helm/argocd/templates/argocd-server-ingress.yaml itself -- the ownership proof used to decide whether an existing same-name Ingress is safe to treat as Argo/Helm-owned drift (RECONCILABLE-eligible) versus foreign/ambiguous (always BROKEN, never automatically taken over).
+# Labels rendered by helm/argocd/templates/argocd-server-ingress.yaml itself -- the ownership proof used to decide whether an existing same-name Ingress is safe to treat as Argo/Helm-owned (OWNED-eligible) versus foreign/ambiguous (always BROKEN, never automatically taken over). Exact field-level drift (host/group/certificate/scheme/etc.) is checked only in argocd_acceptance.py.
 INGRESS_OWNERSHIP_LABELS = {
     "app.kubernetes.io/name": "argocd-server",
     "app.kubernetes.io/part-of": "argocd",
@@ -125,111 +112,40 @@ def _get_json(run, resource, name=None, namespace=None):
     raise ClassifierInspectionError(f"kubectl get {resource} {name or ''} failed: {err.strip() or out.strip() or 'unknown error'}")
 
 
-def _replicaset_like_ready(obj, ready_fields):
-    """Shared Deployment/StatefulSet readiness check: observedGeneration caught up, and every field in ready_fields equals the desired replica count."""
-    spec = obj.get("spec") or {}
-    status = obj.get("status") or {}
-    metadata = obj.get("metadata") or {}
-    desired = spec.get("replicas")
-    if desired is None:
-        desired = 1
-    if desired <= 0:
-        return False, "spec.replicas is not > 0"
-    if metadata.get("generation") != status.get("observedGeneration"):
-        return False, f"status.observedGeneration={status.get('observedGeneration')!r} does not match metadata.generation={metadata.get('generation')!r}"
-    for field in ready_fields:
-        if status.get(field) != desired:
-            return False, f"status.{field}={status.get(field)!r}, expected desired replicas={desired}"
-    return True, None
+def _labels_of(obj):
+    return ((obj.get("metadata") or {}).get("labels")) or {}
 
 
-def _deployment_ready(obj):
-    return _replicaset_like_ready(obj, ("updatedReplicas", "readyReplicas", "availableReplicas"))
+def _instance_owned_reason(resource_label, obj):
+    """Ownership proof for every resource the argo-cd upstream subchart itself renders (Deployments/StatefulSet/Services): app.kubernetes.io/instance == the Helm release name, exactly like runtime_state.py/monitor_state.py's own per-resource ownership-label pattern."""
+    actual = _labels_of(obj).get("app.kubernetes.io/instance")
+    if actual != ARGOCD_RELEASE_NAME:
+        return f"{resource_label} has incompatible ownership label (app.kubernetes.io/instance={actual!r}), expected {ARGOCD_RELEASE_NAME!r} -- possible foreign/ambiguous ownership"
+    return None
 
 
-def _statefulset_ready(obj):
-    return _replicaset_like_ready(obj, ("updatedReplicas", "readyReplicas", "currentReplicas"))
+def _part_of_owned_reason(resource_label, obj):
+    """Ownership proof for the ecr-token-sync footprint (helm/argocd/templates/ecr-token-sync-*.yaml): app.kubernetes.io/part-of == argocd."""
+    actual = _labels_of(obj).get("app.kubernetes.io/part-of")
+    if actual != "argocd":
+        return f"{resource_label} has incompatible ownership label (app.kubernetes.io/part-of={actual!r}), expected 'argocd' -- possible foreign/ambiguous ownership"
+    return None
 
 
-def _ingress_drift_reasons(ingress_obj, argocd_host, alb_group_name, acm_certificate_arn, ingress_values):
-    """Returns (reasons, reconcilable_reasons) for an EXISTING argocd-server-ingress object. Foreign/ambiguous ownership (labels do not match the expected Argo CD Helm release) is reasons-only, never reconcilable -- this module must never automatically take over an Ingress it cannot prove it owns. Every other field checked below (host, backend Service/port, ALB annotations, and AWS Load Balancer Controller readiness) is safe/deterministic Argo-owned drift, already reconcilable via 20-sub-argocd.yaml's own idempotent Helm reconciliation plus its own bounded Ingress/ALB readiness wait."""
-    reasons = []
-    reconcilable_reasons = []
-
-    labels = (ingress_obj.get("metadata") or {}).get("labels") or {}
+def _ingress_owned_reason(obj):
+    labels = _labels_of(obj)
     owned = all(labels.get(key) == value for key, value in INGRESS_OWNERSHIP_LABELS.items())
     if not owned:
-        reasons.append(
-            f"ingress/{INGRESS_NAME} exists but its ownership labels {labels!r} do not match the expected Argo CD Helm "
-            f"release {INGRESS_OWNERSHIP_LABELS!r} -- possible foreign/ambiguous ownership, never automatically taken over"
+        return (
+            f"ingress/{INGRESS_NAME} has incompatible ownership labels {labels!r}, expected {INGRESS_OWNERSHIP_LABELS!r} "
+            "-- possible foreign/ambiguous ownership, never automatically taken over"
         )
-        return reasons, reconcilable_reasons
-
-    def add(reason):
-        reasons.append(reason)
-        reconcilable_reasons.append(reason)
-
-    annotations = (ingress_obj.get("metadata") or {}).get("annotations") or {}
-    spec = ingress_obj.get("spec") or {}
-    rule = (spec.get("rules") or [{}])[0] or {}
-    path = (((rule.get("http") or {}).get("paths")) or [{}])[0] or {}
-    backend_service = ((path.get("backend") or {}).get("service")) or {}
-
-    expected_ingress_class = ingress_values.get("ingressClassName") or "alb"
-    expected_service_name = ingress_values.get("serviceName") or "argocd-server"
-    expected_service_port = ingress_values.get("servicePort")
-    if expected_service_port is None:
-        expected_service_port = 443
-
-    if spec.get("ingressClassName") != expected_ingress_class:
-        add(f"ingress/{INGRESS_NAME} spec.ingressClassName={spec.get('ingressClassName')!r}, expected {expected_ingress_class!r}")
-    if rule.get("host") != argocd_host:
-        add(f"ingress/{INGRESS_NAME} spec.rules[0].host={rule.get('host')!r}, expected {argocd_host!r}")
-    if backend_service.get("name") != expected_service_name:
-        add(f"ingress/{INGRESS_NAME} backend service name={backend_service.get('name')!r}, expected {expected_service_name!r}")
-    actual_backend_port = ((backend_service.get("port") or {}).get("number"))
-    if actual_backend_port != expected_service_port:
-        add(f"ingress/{INGRESS_NAME} backend service port={actual_backend_port!r}, expected {expected_service_port!r}")
-
-    annotation_checks = (
-        ("alb.ingress.kubernetes.io/group.name", alb_group_name),
-        ("alb.ingress.kubernetes.io/group.order", ingress_values.get("groupOrder")),
-        ("alb.ingress.kubernetes.io/certificate-arn", acm_certificate_arn),
-        ("alb.ingress.kubernetes.io/listen-ports", ingress_values.get("listenPorts")),
-        ("alb.ingress.kubernetes.io/target-type", ingress_values.get("targetType")),
-        ("alb.ingress.kubernetes.io/backend-protocol", ingress_values.get("backendProtocol")),
-        ("alb.ingress.kubernetes.io/healthcheck-protocol", ingress_values.get("healthcheckProtocol")),
-        ("alb.ingress.kubernetes.io/healthcheck-path", ingress_values.get("healthcheckPath")),
-        ("alb.ingress.kubernetes.io/healthcheck-port", ingress_values.get("healthcheckPort")),
-    )
-    for annotation_key, expected_value in annotation_checks:
-        if expected_value is None or expected_value == "":
-            continue
-        actual_value = annotations.get(annotation_key)
-        if actual_value != str(expected_value):
-            add(f"ingress/{INGRESS_NAME} {annotation_key}={actual_value!r}, expected {str(expected_value)!r}")
-
-    # Standalone-only: the resident/anchor Ingress must own the ALB scheme. Never checked in shared mode -- a shared-mode Ingress must NOT carry this annotation at all (repeating it alongside the resident anchor's own value causes an ALB Controller IngressGroup conflicting-attribute error), so absence there is correct, not drift.
-    if ingress_values.get("mode") == "standalone":
-        expected_scheme = ingress_values.get("scheme")
-        if expected_scheme:
-            actual_scheme = annotations.get("alb.ingress.kubernetes.io/scheme")
-            if actual_scheme != expected_scheme:
-                add(f"ingress/{INGRESS_NAME} alb.ingress.kubernetes.io/scheme={actual_scheme!r}, expected {expected_scheme!r} (standalone resident anchor)")
-
-    # AWS Load Balancer Controller readiness: a spec/annotation-correct Ingress with no published address yet is exactly the transient condition 20-sub-argocd.yaml's own bounded post-deploy wait is designed to resolve -- safe/reconcilable here, never itself terminal BROKEN. If that bounded wait itself times out live, 20-sub-argocd.yaml fails closed on its own (reconcile_argocd never reports success), so this classifier is never the sole gate against a permanently-unprovisioned ALB.
-    lb_ingress = ((ingress_obj.get("status") or {}).get("loadBalancer") or {}).get("ingress") or []
-    if not lb_ingress:
-        add(f"ingress/{INGRESS_NAME} status.loadBalancer.ingress is empty -- the AWS Load Balancer Controller has not yet published an address")
-
-    return reasons, reconcilable_reasons
+    return None
 
 
-def classify(run, environment, namespace, ecr_registry, argocd_ecr_read_role_arn, argocd_host, alb_group_name, acm_certificate_arn, ingress_values):
-    """Returns the stable {"contract", "state", "environment", "namespace", "reasons", "checks"} shape (contract == CLASSIFIER_CONTRACT). Raises ClassifierInspectionError if Kubernetes access itself could not be trusted -- callers must let that propagate as a hard failure, never a downgrade to ABSENT."""
+def classify(run, environment, namespace):
+    """Returns the stable {"state", "environment", "namespace", "reasons", "checks"} shape. Raises ClassifierInspectionError if Kubernetes access itself could not be trusted -- callers must let that propagate as a hard failure, never a downgrade to ABSENT. Deliberately takes no ecr_registry/role-arn/host/group/certificate/ingress-values arguments -- ownership never depends on desired-state correctness, only on whether whatever currently exists is safely ours."""
     reasons = []
-    # Subset of `reasons` that is safe to auto-repair via the existing reusable Argo specialist workflow's idempotent Helm chart reconciliation plus its own immediate bounded ECR token-sync validation step (which triggers a one-off Job from the already-correct CronJob and waits for it to (re)create the repository Secrets) -- never a broader "any drift is safe" carve-out. Only a missing/mislabeled/wrong-URL required repository Secret is added here; every other reason (core Argo footprint, ECR token-sync RBAC/identity, ingress) stays exclusively in `reasons` and therefore forces BROKEN below.
-    reconcilable_reasons = []
     checks = {}
 
     ns_found, _ = _get_json(run, "namespace", namespace)
@@ -238,127 +154,89 @@ def classify(run, environment, namespace, ecr_registry, argocd_ecr_read_role_arn
     crd_found = {crd: _get_json(run, "crd", crd)[0] for crd in REQUIRED_CRDS}
     checks["crds"] = crd_found
     any_crd_found = any(crd_found.values())
-    all_crds_found = all(crd_found.values())
 
-    # ABSENT: no meaningful footprint at all -- no namespace and no cluster-scoped Argo CRD.
-    if not ns_found and not any_crd_found:
-        return {"contract": CLASSIFIER_CONTRACT, "state": STATE_ABSENT, "environment": environment, "namespace": namespace, "reasons": [], "checks": checks}
+    deploy_footprint = {}
+    for name in CORE_DEPLOYMENTS:
+        deploy_footprint[name] = _get_json(run, "deployment", name, namespace)
+    checks["deployments_found"] = {name: found for name, (found, _obj) in deploy_footprint.items()}
+
+    sts_footprint = {}
+    for name in CORE_STATEFULSETS:
+        sts_footprint[name] = _get_json(run, "statefulset", name, namespace)
+    checks["statefulsets_found"] = {name: found for name, (found, _obj) in sts_footprint.items()}
+
+    svc_footprint = {}
+    for name in CORE_SERVICES:
+        svc_footprint[name] = _get_json(run, "service", name, namespace)
+    checks["services_found"] = {name: found for name, (found, _obj) in svc_footprint.items()}
+
+    ecr_sync_footprint = {
+        "serviceaccount": _get_json(run, "serviceaccount", ECR_TOKEN_SYNC_NAME, namespace),
+        "role": _get_json(run, "role", ECR_TOKEN_SYNC_NAME, namespace),
+        "rolebinding": _get_json(run, "rolebinding", ECR_TOKEN_SYNC_NAME, namespace),
+        "cronjob": _get_json(run, "cronjob", ECR_TOKEN_SYNC_NAME, namespace),
+    }
+    checks["ecr_token_sync_found"] = {kind: found for kind, (found, _obj) in ecr_sync_footprint.items()}
+
+    secret_found = {name: _get_json(run, "secret", name, namespace)[0] for name in REPOSITORY_SECRET_NAMES}
+    checks["repository_secrets_found"] = secret_found
+
+    ingress_found, ingress_obj = _get_json(run, "ingress", INGRESS_NAME, namespace)
+    checks["ingress_found"] = ingress_found
+
+    any_footprint_found = (
+        any_crd_found
+        or any(found for found, _obj in deploy_footprint.values())
+        or any(found for found, _obj in sts_footprint.values())
+        or any(found for found, _obj in svc_footprint.values())
+        or any(found for found, _obj in ecr_sync_footprint.values())
+        or any(secret_found.values())
+        or ingress_found
+    )
+
+    # ABSENT: no meaningful footprint at all -- no namespace and nothing else either. Any one of these existing without the rest means this classifier must not silently adopt orphaned/partial state; it falls through to the ownership-label checks below instead.
+    if not ns_found and not any_footprint_found:
+        return {"state": STATE_ABSENT, "environment": environment, "namespace": namespace, "reasons": [], "checks": checks}
 
     if not ns_found:
-        reasons.append(f"namespace {namespace} does not exist but at least one Argo CRD is registered cluster-wide")
-    if not all_crds_found:
-        missing = sorted(c for c, found in crd_found.items() if not found)
-        reasons.append(f"missing required CRD(s): {missing}")
+        reasons.append(f"namespace {namespace} does not exist but at least one Argo CD resource is already present -- ownership is ambiguous without the owning namespace")
 
-    # The remaining checks only make sense once the namespace exists.
-    if ns_found:
-        deploy_status = {}
-        for name in REQUIRED_DEPLOYMENTS:
-            found, obj = _get_json(run, "deployment", name, namespace)
-            if not found:
-                reasons.append(f"deployment/{name} does not exist")
-                deploy_status[name] = False
-                continue
-            ready, why = _deployment_ready(obj)
-            deploy_status[name] = ready
-            if not ready:
-                reasons.append(f"deployment/{name} not ready: {why}")
-        checks["deployments"] = deploy_status
+    # Ownership-label proof on whatever currently exists -- deliberately NOT a completeness check: a resource that is simply missing (never rendered yet, or not yet caught up with a partial prior rollout) is exactly what MAIN is about to reconcile, never itself a reason. Only a WRONG ownership label on something that DOES exist is a genuine conflict signal.
+    for name, (found, obj) in deploy_footprint.items():
+        if not found:
+            continue
+        reason = _instance_owned_reason(f"deployment/{name}", obj)
+        if reason:
+            reasons.append(reason)
 
-        sts_status = {}
-        for name in REQUIRED_STATEFULSETS:
-            found, obj = _get_json(run, "statefulset", name, namespace)
-            if not found:
-                reasons.append(f"statefulset/{name} does not exist")
-                sts_status[name] = False
-                continue
-            ready, why = _statefulset_ready(obj)
-            sts_status[name] = ready
-            if not ready:
-                reasons.append(f"statefulset/{name} not ready: {why}")
-        checks["statefulsets"] = sts_status
+    for name, (found, obj) in sts_footprint.items():
+        if not found:
+            continue
+        reason = _instance_owned_reason(f"statefulset/{name}", obj)
+        if reason:
+            reasons.append(reason)
 
-        svc_status = {}
-        for name in REQUIRED_SERVICES:
-            found, _ = _get_json(run, "service", name, namespace)
-            svc_status[name] = found
-            if not found:
-                reasons.append(f"service/{name} does not exist")
-        checks["services"] = svc_status
+    for name, (found, obj) in svc_footprint.items():
+        if not found:
+            continue
+        reason = _instance_owned_reason(f"service/{name}", obj)
+        if reason:
+            reasons.append(reason)
 
-        sa_found, sa_obj = _get_json(run, "serviceaccount", ECR_TOKEN_SYNC_NAME, namespace)
-        checks["ecr_token_sync_serviceaccount"] = sa_found
-        if not sa_found:
-            reasons.append(f"serviceaccount/{ECR_TOKEN_SYNC_NAME} does not exist")
-        else:
-            role_arn = ((sa_obj.get("metadata") or {}).get("annotations") or {}).get("eks.amazonaws.com/role-arn")
-            if role_arn != argocd_ecr_read_role_arn:
-                reasons.append(f"serviceaccount/{ECR_TOKEN_SYNC_NAME} eks.amazonaws.com/role-arn={role_arn!r}, expected {argocd_ecr_read_role_arn!r}")
+    for kind, (found, obj) in ecr_sync_footprint.items():
+        if not found:
+            continue
+        reason = _part_of_owned_reason(f"{kind}/{ECR_TOKEN_SYNC_NAME}", obj)
+        if reason:
+            reasons.append(reason)
 
-        role_found, _ = _get_json(run, "role", ECR_TOKEN_SYNC_NAME, namespace)
-        checks["ecr_token_sync_role"] = role_found
-        if not role_found:
-            reasons.append(f"role/{ECR_TOKEN_SYNC_NAME} does not exist")
+    if ingress_found:
+        reason = _ingress_owned_reason(ingress_obj)
+        if reason:
+            reasons.append(reason)
 
-        rb_found, _ = _get_json(run, "rolebinding", ECR_TOKEN_SYNC_NAME, namespace)
-        checks["ecr_token_sync_rolebinding"] = rb_found
-        if not rb_found:
-            reasons.append(f"rolebinding/{ECR_TOKEN_SYNC_NAME} does not exist")
-
-        cj_found, cj_obj = _get_json(run, "cronjob", ECR_TOKEN_SYNC_NAME, namespace)
-        checks["ecr_token_sync_cronjob"] = cj_found
-        if not cj_found:
-            reasons.append(f"cronjob/{ECR_TOKEN_SYNC_NAME} does not exist")
-        elif (cj_obj.get("spec") or {}).get("suspend"):
-            reasons.append(f"cronjob/{ECR_TOKEN_SYNC_NAME} is suspended")
-
-        secret_status = {}
-        for secret_name, helm_repo in REQUIRED_REPO_SECRETS.items():
-            found, obj = _get_json(run, "secret", secret_name, namespace)
-            secret_status[secret_name] = found
-            if not found:
-                reason = f"Secret {secret_name} does not exist"
-                reasons.append(reason)
-                reconcilable_reasons.append(reason)
-                continue
-            labels = (obj.get("metadata") or {}).get("labels") or {}
-            if labels.get("argocd.argoproj.io/secret-type") != "repository":
-                reason = f"Secret {secret_name} is missing label argocd.argoproj.io/secret-type=repository"
-                reasons.append(reason)
-                reconcilable_reasons.append(reason)
-            url_b64 = (obj.get("data") or {}).get("url")
-            actual_url = base64.b64decode(url_b64).decode("utf-8") if url_b64 else None
-            expected_url = f"oci://{ecr_registry}/{helm_repo}"
-            if actual_url != expected_url:
-                reason = f"Secret {secret_name} url={actual_url!r}, expected {expected_url!r}"
-                reasons.append(reason)
-                reconcilable_reasons.append(reason)
-            # Password is intentionally never read or included in classifier output.
-        checks["repository_secrets"] = secret_status
-
-        ingress_enabled = bool(ingress_values.get("enabled"))
-        ingress_found, ingress_obj = _get_json(run, "ingress", INGRESS_NAME, namespace)
-        checks["ingress_found"] = ingress_found
-        checks["ingress_enabled_in_values"] = ingress_enabled
-        if ingress_enabled:
-            if not ingress_found:
-                # Missing-but-desired is exactly the deterministic, application-owned drift 20-sub-argocd.yaml's own idempotent Helm reconciliation already safely repairs -- reconcilable, mirroring the existing repository-Secret carve-out above.
-                reason = f"ingress/{INGRESS_NAME} does not exist but argocdServerIngress.enabled=true in envs/{environment}/argocd/values.yaml"
-                reasons.append(reason)
-                reconcilable_reasons.append(reason)
-            else:
-                ingress_reasons, ingress_reconcilable_reasons = _ingress_drift_reasons(ingress_obj, argocd_host, alb_group_name, acm_certificate_arn, ingress_values)
-                reasons.extend(ingress_reasons)
-                reconcilable_reasons.extend(ingress_reconcilable_reasons)
-
-    # RECONCILABLE only when EVERY collected reason is in the reconcilable subset (missing/mislabeled/wrong-URL repository Secrets and/or missing/drifted clearly-owned Ingress, with the core Argo footprint, ECR token-sync RBAC/identity, and everything else otherwise clean) -- any other reason at all (foreign/ambiguous Ingress ownership, a not-ready core component, a broken ECR token-sync identity) forces BROKEN, never a broader "partial install is fine" default.
-    if not reasons:
-        state = STATE_HEALTHY
-    elif reconcilable_reasons and len(reconcilable_reasons) == len(reasons):
-        state = STATE_RECONCILABLE
-    else:
-        state = STATE_BROKEN
-    return {"contract": CLASSIFIER_CONTRACT, "state": state, "environment": environment, "namespace": namespace, "reasons": reasons, "checks": checks}
+    state = STATE_BROKEN if reasons else STATE_OWNED
+    return {"state": state, "environment": environment, "namespace": namespace, "reasons": reasons, "checks": checks}
 
 
 def main(argv=None):
@@ -369,18 +247,11 @@ def main(argv=None):
 
     try:
         values = environment_derived_values(args.environment)
-        ingress_values = ingress_config_from_values(args.environment)
         run = KubectlRunner(args.kubectl_bin)
         result = classify(
             run,
             environment=args.environment,
             namespace=values["ARGOCD_NAMESPACE"],
-            ecr_registry=values["ECR_REGISTRY"],
-            argocd_ecr_read_role_arn=values["ARGOCD_ECR_READ_ROLE_ARN"],
-            argocd_host=values["ARGOCD_HOST"],
-            alb_group_name=values["ALB_GROUP_NAME"],
-            acm_certificate_arn=values["ACM_CERTIFICATE_ARN"],
-            ingress_values=ingress_values,
         )
     except (ClassifierInspectionError, ValueError, OSError) as exc:
         print(f"INSPECTION ERROR: {exc}", file=sys.stderr)
@@ -388,7 +259,7 @@ def main(argv=None):
 
     print(json.dumps(result))
     if result["reasons"]:
-        print("Argo CD prerequisite diagnostics:", file=sys.stderr)
+        print("Argo CD ownership-safety diagnostics:", file=sys.stderr)
         for reason in result["reasons"]:
             print(f"  - {reason}", file=sys.stderr)
     return 0

@@ -1,4 +1,4 @@
-"""Offline tests for hack/orchestration/platform_state.py; run directly via `python3 hack/test-goldengate-platform-state.py`. No live Kubernetes -- every kubectl response is a fake, injected fixture. Exercises the classifier's actual logic (never merely greps its source)."""
+"""Offline tests for hack/orchestration/platform_state.py (ownership-safety preflight: ABSENT/OWNED/BROKEN); run directly via `python3 hack/test-goldengate-platform-state.py`. No live Kubernetes -- every kubectl response is a fake, injected fixture. Exercises the classifier's actual logic (never merely greps its source). Post-reconciliation acceptance (HEALTHY/BROKEN) is a separate module -- see hack/test-goldengate-platform-acceptance.py."""
 from __future__ import annotations
 
 import importlib.util
@@ -22,21 +22,18 @@ ENVIRONMENT = "dev"
 RUNTIME_NAMESPACE = "goldengate-dev"
 ARGOCD_NAMESPACE = "argocd"
 ECR_REGISTRY = "229410149234.dkr.ecr.eu-west-1.amazonaws.com"
-RUNTIME_ROLE_ARN = "arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev"
-PLATFORM_LOGGING_ROLE_ARN = "arn:aws:iam::668311715351:role/GoldenGatePlatformLoggingRole-dev"
-FLUENT_BIT_IMAGE = f"{ECR_REGISTRY}/aws-cloud-factory-fluent-bit@sha256:{'a' * 64}"
 
 RELEASE_NAME = f"goldengate-{ENVIRONMENT}-platform"
 APP_NAME = RELEASE_NAME
 
 
 class FakeCluster:
-    """Models exactly the subset of `kubectl get <resource> [name] [-n ns] [-l selector] -o json` behavior the classifier depends on -- never a real kubectl process. A single-name get defaults to NotFound when unset; a list (no name) get defaults to an empty items array when unset, matching real kubectl semantics."""
+    """Models exactly the subset of `kubectl get <resource> [name] [-n ns] [-l selector] -o json` behavior the classifier depends on -- never a real kubectl process."""
 
     def __init__(self):
-        self.objects = {}  # (resource, name, namespace) -> dict
-        self.lists = {}  # (resource, namespace) -> [items...]
-        self.force_errors = {}  # (resource, name, namespace) -> stderr text
+        self.objects = {}
+        self.lists = {}
+        self.force_errors = {}
 
     def put(self, resource, name, namespace, obj):
         self.objects[(resource, name, namespace)] = obj
@@ -77,362 +74,128 @@ class FakeCluster:
         return 0, __import__("json").dumps({"items": items}), ""
 
 
-def _app_obj(name, healthy=True, repo_url=None, dest_ns=RUNTIME_NAMESPACE, release_name=RELEASE_NAME):
+def _app_obj(repo_url=None, dest_ns=RUNTIME_NAMESPACE, release_name=RELEASE_NAME):
     return {
-        "metadata": {"name": name},
-        "status": {
-            "sync": {"status": "Synced" if healthy else "OutOfSync"},
-            "health": {"status": "Healthy" if healthy else "Degraded"},
-        },
         "spec": {
-            "source": {
-                "repoURL": repo_url if repo_url is not None else f"oci://{ECR_REGISTRY}/{platform_state.HELM_REPO_PATH}",
-                "helm": {"releaseName": release_name},
-            },
+            "source": {"repoURL": repo_url if repo_url is not None else f"oci://{ECR_REGISTRY}/{platform_state.HELM_REPO_PATH}", "helm": {"releaseName": release_name}},
             "destination": {"namespace": dest_ns},
         },
     }
 
 
-def _namespace_obj(name, labeled=True, phase="Active"):
-    labels = dict(platform_state.MANAGED_NAMESPACE_LABELS) if labeled else {}
-    return {"metadata": {"name": name, "labels": labels}, "status": {"phase": phase}}
+def _namespace_obj(labeled=True, phase="Active"):
+    labels = {"app.kubernetes.io/name": platform_state.NAMESPACE_OWNERSHIP_NAME_LABEL} if labeled else {}
+    return {"metadata": {"labels": labels}, "status": {"phase": phase}}
 
 
-def _clusterrole_obj(name):
-    return {"metadata": {"name": name}}
+def _owned_labels(extra=None):
+    labels = {"app.kubernetes.io/instance": RELEASE_NAME, "goldengate.adcb/environment": ENVIRONMENT}
+    if extra:
+        labels.update(extra)
+    return labels
 
 
-def _crb_obj(name, role_name=platform_state.FLUENT_BIT_CLUSTERROLE_NAME, sa_name=platform_state.FLUENT_BIT_SA_NAME, sa_namespace=RUNTIME_NAMESPACE):
-    return {
-        "metadata": {"name": name},
-        "roleRef": {"kind": "ClusterRole", "name": role_name},
-        "subjects": [{"kind": "ServiceAccount", "name": sa_name, "namespace": sa_namespace}],
-    }
-
-
-def _sa_obj(name, role_arn):
-    return {"metadata": {"name": name, "annotations": {"eks.amazonaws.com/role-arn": role_arn}}}
-
-
-def _configmap_obj(name):
-    return {"metadata": {"name": name}}
-
-
-def _daemonset_obj(name, generation=3, desired=2, service_account=platform_state.FLUENT_BIT_SA_NAME, image=FLUENT_BIT_IMAGE, container_name="fluent-bit", extra_containers=None, init_containers=None):
-    containers = [{"name": container_name, "image": image}]
-    if extra_containers:
-        containers.extend(extra_containers)
-    pod_spec = {
-        "serviceAccountName": service_account,
-        "containers": containers,
-    }
-    if init_containers:
-        pod_spec["initContainers"] = init_containers
-    return {
-        "metadata": {"name": name, "generation": generation},
-        "spec": {
-            "template": {
-                "spec": pod_spec,
-            },
-        },
-        "status": {
-            "observedGeneration": generation,
-            "desiredNumberScheduled": desired,
-            "currentNumberScheduled": desired,
-            "updatedNumberScheduled": desired,
-            "numberReady": desired,
-            "numberAvailable": desired,
-            "numberUnavailable": 0,
-        },
-    }
-
-
-def _populate_healthy_cluster(cluster):
-    cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj(APP_NAME))
-    cluster.put("namespace", RUNTIME_NAMESPACE, None, _namespace_obj(RUNTIME_NAMESPACE))
-    cluster.put("clusterrole", platform_state.FLUENT_BIT_CLUSTERROLE_NAME, None, _clusterrole_obj(platform_state.FLUENT_BIT_CLUSTERROLE_NAME))
-    cluster.put("clusterrolebinding", platform_state.FLUENT_BIT_CLUSTERROLEBINDING_NAME, None, _crb_obj(platform_state.FLUENT_BIT_CLUSTERROLEBINDING_NAME))
-    cluster.put("serviceaccount", platform_state.RUNTIME_SA_NAME, RUNTIME_NAMESPACE, _sa_obj(platform_state.RUNTIME_SA_NAME, RUNTIME_ROLE_ARN))
-    cluster.put("serviceaccount", platform_state.FLUENT_BIT_SA_NAME, RUNTIME_NAMESPACE, _sa_obj(platform_state.FLUENT_BIT_SA_NAME, PLATFORM_LOGGING_ROLE_ARN))
-    cluster.put("configmap", platform_state.FLUENT_BIT_CONFIGMAP_NAME, RUNTIME_NAMESPACE, _configmap_obj(platform_state.FLUENT_BIT_CONFIGMAP_NAME))
-    cluster.put("daemonset", platform_state.FLUENT_BIT_DAEMONSET_NAME, RUNTIME_NAMESPACE, _daemonset_obj(platform_state.FLUENT_BIT_DAEMONSET_NAME))
+def _populate_owned_cluster(cluster):
+    cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj())
+    cluster.put("namespace", RUNTIME_NAMESPACE, None, _namespace_obj())
+    cluster.put("clusterrole", platform_state.FLUENT_BIT_CLUSTERROLE_NAME, None, {"metadata": {}})
+    cluster.put("clusterrolebinding", platform_state.FLUENT_BIT_CLUSTERROLEBINDING_NAME, None, {"metadata": {}})
+    cluster.put("serviceaccount", platform_state.RUNTIME_SA_NAME, RUNTIME_NAMESPACE, {"metadata": {"labels": _owned_labels()}})
+    cluster.put("serviceaccount", platform_state.FLUENT_BIT_SA_NAME, RUNTIME_NAMESPACE, {"metadata": {"labels": _owned_labels()}})
+    cluster.put("configmap", platform_state.FLUENT_BIT_CONFIGMAP_NAME, RUNTIME_NAMESPACE, {"metadata": {"labels": _owned_labels()}})
+    cluster.put("daemonset", platform_state.FLUENT_BIT_DAEMONSET_NAME, RUNTIME_NAMESPACE, {"metadata": {"labels": _owned_labels()}})
     cluster.put_list("statefulset", RUNTIME_NAMESPACE, [])
     cluster.put_list("deployment", RUNTIME_NAMESPACE, [])
     return cluster
 
 
-def _classify(cluster, fluent_bit_image=FLUENT_BIT_IMAGE, ecr_registry=ECR_REGISTRY):
-    return platform_state.classify(
-        cluster,
-        environment=ENVIRONMENT,
-        runtime_namespace=RUNTIME_NAMESPACE,
-        argocd_namespace=ARGOCD_NAMESPACE,
-        ecr_registry=ecr_registry,
-        runtime_role_arn=RUNTIME_ROLE_ARN,
-        platform_logging_role_arn=PLATFORM_LOGGING_ROLE_ARN,
-        fluent_bit_image=fluent_bit_image,
-    )
+def _classify(cluster):
+    return platform_state.classify(cluster, environment=ENVIRONMENT, runtime_namespace=RUNTIME_NAMESPACE, argocd_namespace=ARGOCD_NAMESPACE, ecr_registry=ECR_REGISTRY)
 
 
-class PlatformStateClassifierTests(unittest.TestCase):
-    def test_1_no_footprint_is_absent(self):
+class PlatformOwnershipStateTests(unittest.TestCase):
+    def test_no_footprint_is_absent(self):
         cluster = FakeCluster()
         result = _classify(cluster)
         self.assertEqual(result["state"], platform_state.STATE_ABSENT)
         self.assertEqual(result["reasons"], [])
 
-    def test_2_runtime_namespace_exists_application_absent_is_broken(self):
-        cluster = FakeCluster()
-        cluster.put("namespace", RUNTIME_NAMESPACE, None, _namespace_obj(RUNTIME_NAMESPACE))
+    def test_fully_owned_is_owned(self):
+        cluster = _populate_owned_cluster(FakeCluster())
         result = _classify(cluster)
-        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
-        self.assertTrue(any("Application" in r and "does not exist" in r for r in result["reasons"]))
+        self.assertEqual(result["state"], platform_state.STATE_OWNED)
+        self.assertEqual(result["reasons"], [])
 
-    def test_3_leftover_clusterrole_only_is_broken(self):
-        cluster = FakeCluster()
-        cluster.put("clusterrole", platform_state.FLUENT_BIT_CLUSTERROLE_NAME, None, _clusterrole_obj(platform_state.FLUENT_BIT_CLUSTERROLE_NAME))
+    def test_P1_exact_live_incident_managed_by_helm_is_owned(self):
+        # The exact live incident this architecture must resolve generically: app.kubernetes.io/managed-by=Helm on the namespace is now NEVER checked in ownership at all -- OWNED regardless, letting normal Argo CD reconciliation (managedNamespaceMetadata) converge it. See hack/test-goldengate-platform-acceptance.py for the strict post-reconcile managed-by=argocd proof.
+        cluster = _populate_owned_cluster(FakeCluster())
+        ns = _namespace_obj(labeled=True)
+        ns["metadata"]["labels"]["app.kubernetes.io/managed-by"] = "Helm"
+        cluster.put("namespace", RUNTIME_NAMESPACE, None, ns)
         result = _classify(cluster)
-        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
+        self.assertEqual(result["state"], platform_state.STATE_OWNED)
 
-    def test_4_application_missing_while_resources_exist_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.objects.pop(("application", APP_NAME, ARGOCD_NAMESPACE))
-        result = _classify(cluster)
-        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
-        self.assertTrue(any("Application" in r and "does not exist" in r for r in result["reasons"]))
-
-    def test_5_application_not_synced_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj(APP_NAME, healthy=False))
-        result = _classify(cluster)
-        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
-        self.assertTrue(any("sync status" in r for r in result["reasons"]))
-
-    def test_6_application_not_healthy_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        app = _app_obj(APP_NAME)
-        app["status"]["health"]["status"] = "Progressing"
-        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, app)
-        result = _classify(cluster)
-        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
-        self.assertTrue(any("health status" in r for r in result["reasons"]))
-
-    def test_7_wrong_application_repo_url_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj(APP_NAME, repo_url="oci://wrong.example.com/helm/goldengate-platform"))
-        result = _classify(cluster)
-        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
-        self.assertTrue(any("source.repoURL" in r for r in result["reasons"]))
-
-    def test_8_wrong_destination_namespace_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj(APP_NAME, dest_ns="some-other-namespace"))
-        result = _classify(cluster)
-        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
-        self.assertTrue(any("destination.namespace" in r for r in result["reasons"]))
-
-    def test_9_runtime_sa_missing_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.objects.pop(("serviceaccount", platform_state.RUNTIME_SA_NAME, RUNTIME_NAMESPACE))
-        result = _classify(cluster)
-        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
-        self.assertTrue(any(f"serviceaccount/{platform_state.RUNTIME_SA_NAME} does not exist" in r for r in result["reasons"]))
-
-    def test_10_runtime_sa_wrong_irsa_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.put("serviceaccount", platform_state.RUNTIME_SA_NAME, RUNTIME_NAMESPACE, _sa_obj(platform_state.RUNTIME_SA_NAME, "arn:aws:iam::668311715351:role/SomeOtherRole"))
-        result = _classify(cluster)
-        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
-        self.assertTrue(any(f"serviceaccount/{platform_state.RUNTIME_SA_NAME} eks.amazonaws.com/role-arn" in r for r in result["reasons"]))
-
-    def test_11_fluent_bit_sa_wrong_irsa_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.put("serviceaccount", platform_state.FLUENT_BIT_SA_NAME, RUNTIME_NAMESPACE, _sa_obj(platform_state.FLUENT_BIT_SA_NAME, "arn:aws:iam::668311715351:role/SomeOtherRole"))
-        result = _classify(cluster)
-        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
-        self.assertTrue(any(f"serviceaccount/{platform_state.FLUENT_BIT_SA_NAME} eks.amazonaws.com/role-arn" in r for r in result["reasons"]))
-
-    def test_12_clusterrolebinding_wrong_subject_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.put("clusterrolebinding", platform_state.FLUENT_BIT_CLUSTERROLEBINDING_NAME, None, _crb_obj(platform_state.FLUENT_BIT_CLUSTERROLEBINDING_NAME, sa_name="some-other-sa"))
-        result = _classify(cluster)
-        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
-        self.assertTrue(any("subjects=" in r for r in result["reasons"]))
-
-    def test_13_configmap_missing_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
+    def test_missing_fluent_bit_resources_never_forces_broken(self):
+        # ConfigMap/DaemonSet/ServiceAccounts simply missing -- exactly what 30-sub-platform.yaml's own reconciliation creates, never itself a reason.
+        cluster = _populate_owned_cluster(FakeCluster())
         cluster.objects.pop(("configmap", platform_state.FLUENT_BIT_CONFIGMAP_NAME, RUNTIME_NAMESPACE))
-        result = _classify(cluster)
-        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
-        self.assertTrue(any(f"configmap/{platform_state.FLUENT_BIT_CONFIGMAP_NAME} does not exist" in r for r in result["reasons"]))
-
-    def test_14_daemonset_missing_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
         cluster.objects.pop(("daemonset", platform_state.FLUENT_BIT_DAEMONSET_NAME, RUNTIME_NAMESPACE))
         result = _classify(cluster)
-        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
-        self.assertTrue(any(f"daemonset/{platform_state.FLUENT_BIT_DAEMONSET_NAME} does not exist" in r for r in result["reasons"]))
+        self.assertEqual(result["state"], platform_state.STATE_OWNED)
 
-    def test_15_daemonset_not_fully_ready_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        ds = _daemonset_obj(platform_state.FLUENT_BIT_DAEMONSET_NAME)
-        ds["status"]["numberReady"] = 1
-        cluster.put("daemonset", platform_state.FLUENT_BIT_DAEMONSET_NAME, RUNTIME_NAMESPACE, ds)
+    def test_namespace_foreign_name_label_is_broken(self):
+        cluster = _populate_owned_cluster(FakeCluster())
+        cluster.put("namespace", RUNTIME_NAMESPACE, None, _namespace_obj(labeled=False))
         result = _classify(cluster)
         self.assertEqual(result["state"], platform_state.STATE_BROKEN)
-        self.assertTrue(any("not ready" in r for r in result["reasons"]))
+        self.assertTrue(any("foreign/ambiguous ownership" in r for r in result["reasons"]))
 
-    def test_16_wrong_fluent_bit_image_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        ds = _daemonset_obj(platform_state.FLUENT_BIT_DAEMONSET_NAME, image=f"{ECR_REGISTRY}/aws-cloud-factory-fluent-bit@sha256:{'b' * 64}")
-        cluster.put("daemonset", platform_state.FLUENT_BIT_DAEMONSET_NAME, RUNTIME_NAMESPACE, ds)
+    def test_terminating_namespace_is_broken(self):
+        cluster = _populate_owned_cluster(FakeCluster())
+        cluster.put("namespace", RUNTIME_NAMESPACE, None, _namespace_obj(labeled=True, phase="Terminating"))
         result = _classify(cluster)
         self.assertEqual(result["state"], platform_state.STATE_BROKEN)
-        self.assertTrue(any("expected FLUENT_BIT_IMAGE" in r for r in result["reasons"]))
+        self.assertTrue(any("Terminating" in r for r in result["reasons"]))
 
-    def test_17_unexpected_platform_owned_deployment_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
+    def test_foreign_serviceaccount_instance_label_is_broken(self):
+        cluster = _populate_owned_cluster(FakeCluster())
+        cluster.put("serviceaccount", platform_state.RUNTIME_SA_NAME, RUNTIME_NAMESPACE, {"metadata": {"labels": {"app.kubernetes.io/instance": "some-other-release"}}})
+        result = _classify(cluster)
+        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
+
+    def test_unexpected_owned_runtime_deployment_is_broken(self):
+        cluster = _populate_owned_cluster(FakeCluster())
         cluster.put_list("deployment", RUNTIME_NAMESPACE, [{"metadata": {"name": "gg-oracle-payments-01"}}])
         result = _classify(cluster)
         self.assertEqual(result["state"], platform_state.STATE_BROKEN)
         self.assertTrue(any("unexpectedly owns" in r for r in result["reasons"]))
 
-    def test_17b_unexpected_platform_owned_statefulset_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.put_list("statefulset", RUNTIME_NAMESPACE, [{"metadata": {"name": "gg-oracle-payments-01"}}])
+    def test_application_repo_url_mismatch_is_broken(self):
+        cluster = _populate_owned_cluster(FakeCluster())
+        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj(repo_url="oci://wrong.example.com/helm/goldengate-platform"))
         result = _classify(cluster)
         self.assertEqual(result["state"], platform_state.STATE_BROKEN)
-        self.assertTrue(any("unexpectedly owns" in r for r in result["reasons"]))
 
-    def test_18_complete_valid_platform_is_healthy(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
+    def test_application_wrong_release_name_is_broken(self):
+        cluster = _populate_owned_cluster(FakeCluster())
+        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj(release_name="some-other-release"))
         result = _classify(cluster)
-        self.assertEqual(result["state"], platform_state.STATE_HEALTHY)
-        self.assertEqual(result["reasons"], [])
+        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
 
-    def test_19_forbidden_or_api_error_raises_inspection_error_not_absent(self):
+    def test_application_out_of_sync_never_forces_broken(self):
+        # Ownership never inspects sync/health status -- an OutOfSync/Degraded Application that otherwise clearly belongs to this platform is exactly what MAIN is about to reconcile.
+        cluster = _populate_owned_cluster(FakeCluster())
+        app = _app_obj()
+        app["status"] = {"sync": {"status": "OutOfSync"}, "health": {"status": "Degraded"}}
+        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, app)
+        result = _classify(cluster)
+        self.assertEqual(result["state"], platform_state.STATE_OWNED)
+
+    def test_forbidden_or_api_error_raises_inspection_error(self):
         cluster = FakeCluster()
         cluster.fail("application", APP_NAME, ARGOCD_NAMESPACE, "Error from server (Forbidden): applications.argoproj.io is forbidden")
         with self.assertRaises(platform_state.ClassifierInspectionError):
             _classify(cluster)
-
-    def test_managed_namespace_label_wrong_alone_is_reconcilable(self):
-        # Live Platform + Observability End-to-End Self-Recovery Fix: the exact live incident -- namespace label drift alone, with every other Platform resource healthy -- is now a safe, deterministic, application-owned RECONCILABLE state (30-sub-platform.yaml's own idempotent Argo CD sync repairs it via managedNamespaceMetadata), never BROKEN.
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.put("namespace", RUNTIME_NAMESPACE, None, _namespace_obj(RUNTIME_NAMESPACE, labeled=False))
-        result = _classify(cluster)
-        self.assertEqual(result["state"], platform_state.STATE_RECONCILABLE)
-        self.assertTrue(any("managedNamespaceMetadata" in r for r in result["reasons"]))
-
-    def test_wrong_release_name_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj(APP_NAME, release_name="some-other-release"))
-        result = _classify(cluster)
-        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
-        self.assertTrue(any("source.helm.releaseName" in r for r in result["reasons"]))
-
-    def test_wrong_daemonset_service_account_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        ds = _daemonset_obj(platform_state.FLUENT_BIT_DAEMONSET_NAME, service_account="wrong-sa")
-        cluster.put("daemonset", platform_state.FLUENT_BIT_DAEMONSET_NAME, RUNTIME_NAMESPACE, ds)
-        result = _classify(cluster)
-        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
-        self.assertTrue(any("serviceAccountName" in r for r in result["reasons"]))
-
-    # --- Fluent Bit image contract: expected FLUENT_BIT_IMAGE operational configuration itself must be an exact, valid, immutable private-ECR digest reference (a caller configuration error, never ABSENT/HEALTHY/BROKEN cluster state) ---
-
-    def test_20_expected_immutable_fluent_bit_image_passes_validation(self):
-        # Validation alone (never touches the cluster); a still-clean cluster classifies ABSENT, proving no exception was raised for a well-formed FLUENT_BIT_IMAGE.
-        result = _classify(FakeCluster(), fluent_bit_image=FLUENT_BIT_IMAGE)
-        self.assertEqual(result["state"], platform_state.STATE_ABSENT)
-
-    def test_21_expected_image_with_latest_tag_is_configuration_error(self):
-        with self.assertRaises(ValueError):
-            _classify(FakeCluster(), fluent_bit_image=f"{ECR_REGISTRY}/aws-cloud-factory-fluent-bit:latest")
-
-    def test_22_expected_image_with_any_tag_is_configuration_error(self):
-        with self.assertRaises(ValueError):
-            _classify(FakeCluster(), fluent_bit_image=f"{ECR_REGISTRY}/aws-cloud-factory-fluent-bit:v1.2.3")
-
-    def test_23_expected_image_wrong_ecr_registry_is_configuration_error(self):
-        with self.assertRaises(ValueError):
-            _classify(FakeCluster(), fluent_bit_image=f"public.ecr.aws/aws-cloud-factory-fluent-bit@sha256:{'a' * 64}")
-
-    def test_23b_expected_image_wrong_private_registry_is_configuration_error(self):
-        with self.assertRaises(ValueError):
-            _classify(FakeCluster(), fluent_bit_image=f"999999999999.dkr.ecr.eu-west-1.amazonaws.com/aws-cloud-factory-fluent-bit@sha256:{'a' * 64}")
-
-    def test_24_expected_image_wrong_repository_is_configuration_error(self):
-        with self.assertRaises(ValueError):
-            _classify(FakeCluster(), fluent_bit_image=f"{ECR_REGISTRY}/some-other-repository@sha256:{'a' * 64}")
-
-    def test_25_expected_image_malformed_short_digest_is_configuration_error(self):
-        with self.assertRaises(ValueError):
-            _classify(FakeCluster(), fluent_bit_image=f"{ECR_REGISTRY}/aws-cloud-factory-fluent-bit@sha256:{'a' * 40}")
-
-    def test_25b_expected_image_uppercase_digest_is_configuration_error(self):
-        with self.assertRaises(ValueError):
-            _classify(FakeCluster(), fluent_bit_image=f"{ECR_REGISTRY}/aws-cloud-factory-fluent-bit@sha256:{'A' * 64}")
-
-    def test_25c_configuration_error_is_never_an_inspection_error(self):
-        # The two error paths must stay distinct -- a bad FLUENT_BIT_IMAGE is a configuration error (ValueError), never a ClassifierInspectionError, and vice versa.
-        with self.assertRaises(ValueError):
-            _classify(FakeCluster(), fluent_bit_image="not-even-a-plausible-image-reference")
-        try:
-            _classify(FakeCluster(), fluent_bit_image="not-even-a-plausible-image-reference")
-        except platform_state.ClassifierInspectionError:
-            self.fail("an invalid FLUENT_BIT_IMAGE must raise ValueError, never ClassifierInspectionError")
-        except ValueError:
-            pass
-
-    # --- Fluent Bit pod-template contract: exactly one container named fluent-bit using exactly FLUENT_BIT_IMAGE, no initContainers -- never merely "expected_image in images" ---
-
-    def test_26_unexpected_normal_sidecar_alongside_correct_fluent_bit_container_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        ds = _daemonset_obj(platform_state.FLUENT_BIT_DAEMONSET_NAME, extra_containers=[{"name": "log-shipper-sidecar", "image": "some/other:image"}])
-        cluster.put("daemonset", platform_state.FLUENT_BIT_DAEMONSET_NAME, RUNTIME_NAMESPACE, ds)
-        result = _classify(cluster)
-        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
-        self.assertTrue(any("expected exactly 1" in r for r in result["reasons"]))
-
-    def test_27_unexpected_init_container_alongside_correct_fluent_bit_container_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        ds = _daemonset_obj(platform_state.FLUENT_BIT_DAEMONSET_NAME, init_containers=[{"name": "wait-for-something", "image": "busybox"}])
-        cluster.put("daemonset", platform_state.FLUENT_BIT_DAEMONSET_NAME, RUNTIME_NAMESPACE, ds)
-        result = _classify(cluster)
-        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
-        self.assertTrue(any("initContainers" in r for r in result["reasons"]))
-
-    def test_28_more_than_one_container_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        ds = _daemonset_obj(platform_state.FLUENT_BIT_DAEMONSET_NAME, extra_containers=[{"name": "another-container", "image": FLUENT_BIT_IMAGE}])
-        cluster.put("daemonset", platform_state.FLUENT_BIT_DAEMONSET_NAME, RUNTIME_NAMESPACE, ds)
-        result = _classify(cluster)
-        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
-        self.assertTrue(any("expected exactly 1" in r for r in result["reasons"]))
-
-    def test_29_sole_container_name_not_fluent_bit_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        ds = _daemonset_obj(platform_state.FLUENT_BIT_DAEMONSET_NAME, container_name="unexpected-container")
-        cluster.put("daemonset", platform_state.FLUENT_BIT_DAEMONSET_NAME, RUNTIME_NAMESPACE, ds)
-        result = _classify(cluster)
-        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
-        self.assertTrue(any("sole container is named" in r for r in result["reasons"]))
-
-    def test_30_exactly_one_fluent_bit_container_wrong_image_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        ds = _daemonset_obj(platform_state.FLUENT_BIT_DAEMONSET_NAME, image=f"{ECR_REGISTRY}/aws-cloud-factory-fluent-bit@sha256:{'b' * 64}")
-        cluster.put("daemonset", platform_state.FLUENT_BIT_DAEMONSET_NAME, RUNTIME_NAMESPACE, ds)
-        result = _classify(cluster)
-        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
-        self.assertTrue(any("image=" in r and FLUENT_BIT_IMAGE in r for r in result["reasons"]))
-
-    def test_31_exact_approved_fluent_bit_shape_is_healthy(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        result = _classify(cluster)
-        self.assertEqual(result["state"], platform_state.STATE_HEALTHY)
-        self.assertEqual(result["reasons"], [])
 
     def test_malformed_json_raises_inspection_error(self):
         cluster = FakeCluster()
@@ -443,115 +206,16 @@ class PlatformStateClassifierTests(unittest.TestCase):
             return cluster(args)
 
         with self.assertRaises(platform_state.ClassifierInspectionError):
-            platform_state.classify(
-                bad_run,
-                environment=ENVIRONMENT,
-                runtime_namespace=RUNTIME_NAMESPACE,
-                argocd_namespace=ARGOCD_NAMESPACE,
-                ecr_registry=ECR_REGISTRY,
-                runtime_role_arn=RUNTIME_ROLE_ARN,
-                platform_logging_role_arn=PLATFORM_LOGGING_ROLE_ARN,
-                fluent_bit_image=FLUENT_BIT_IMAGE,
-            )
+            platform_state.classify(bad_run, environment=ENVIRONMENT, runtime_namespace=RUNTIME_NAMESPACE, argocd_namespace=ARGOCD_NAMESPACE, ecr_registry=ECR_REGISTRY)
 
-
-class PlatformStateFluentBitShapeArchitecturalRegressionTests(unittest.TestCase):
-    """Behavioral proof that the Fluent Bit contract cannot regress back to the old, insufficient `expected_image in images` membership check -- both fixtures below contain FLUENT_BIT_IMAGE somewhere in the pod template (so a membership check would wrongly pass them), yet the real approved shape requires exactly one container named fluent-bit and no initContainers."""
-
-    def test_membership_check_would_have_wrongly_passed_the_sidecar_fixture(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        ds = _daemonset_obj(platform_state.FLUENT_BIT_DAEMONSET_NAME, extra_containers=[{"name": "log-shipper-sidecar", "image": "some/other:image"}])
-        cluster.put("daemonset", platform_state.FLUENT_BIT_DAEMONSET_NAME, RUNTIME_NAMESPACE, ds)
-
-        pod_spec = ds["spec"]["template"]["spec"]
-        naive_images = [c["image"] for c in pod_spec.get("containers", [])] + [c["image"] for c in pod_spec.get("initContainers", [])]
-        self.assertIn(FLUENT_BIT_IMAGE, naive_images, "the old membership check's own precondition must hold for this fixture to be a meaningful regression proof")
-
-        result = _classify(cluster)
-        self.assertEqual(result["state"], platform_state.STATE_BROKEN, "the classifier must reject the extra sidecar even though FLUENT_BIT_IMAGE is present somewhere in the pod template")
-
-    def test_membership_check_would_have_wrongly_passed_the_init_container_fixture(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        ds = _daemonset_obj(platform_state.FLUENT_BIT_DAEMONSET_NAME, init_containers=[{"name": "wait-for-something", "image": "busybox"}])
-        cluster.put("daemonset", platform_state.FLUENT_BIT_DAEMONSET_NAME, RUNTIME_NAMESPACE, ds)
-
-        pod_spec = ds["spec"]["template"]["spec"]
-        naive_images = [c["image"] for c in pod_spec.get("containers", [])] + [c["image"] for c in pod_spec.get("initContainers", [])]
-        self.assertIn(FLUENT_BIT_IMAGE, naive_images, "the old membership check's own precondition must hold for this fixture to be a meaningful regression proof")
-
-        result = _classify(cluster)
-        self.assertEqual(result["state"], platform_state.STATE_BROKEN, "the classifier must reject the unexpected initContainer even though FLUENT_BIT_IMAGE is present somewhere in the pod template")
-
-    def test_membership_check_would_have_wrongly_passed_a_mutable_tag_used_live(self):
-        # A cluster whose live DaemonSet runs a mutable-tag image would satisfy an "in images" check only if the *expected* value were also mutable -- the real regression this closeout fixes is that the expected FLUENT_BIT_IMAGE itself is now validated up front, so a mutable expected value can never reach the cluster-state comparison at all.
-        with self.assertRaises(ValueError):
-            _classify(FakeCluster(), fluent_bit_image=f"{ECR_REGISTRY}/aws-cloud-factory-fluent-bit:latest")
-
-
-class PlatformStateReconcilableTests(unittest.TestCase):
-    """Live Platform + Observability End-to-End Self-Recovery Fix: RECONCILABLE is a narrow carve-out for deterministic, application-owned namespace-label drift only -- P1-P5 below (test naming matches the task's own P-numbering for traceability; P6-P12 are DAG/workflow/render-level proofs covered in hack/test-goldengate-deployment-models.sh, not here)."""
-
-    def test_P1_exact_live_incident_managed_by_helm_all_else_healthy_is_reconcilable(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        ns = _namespace_obj(RUNTIME_NAMESPACE, labeled=False)
-        ns["metadata"]["labels"]["app.kubernetes.io/managed-by"] = "Helm"
-        cluster.put("namespace", RUNTIME_NAMESPACE, None, ns)
-        result = _classify(cluster)
-        self.assertEqual(result["state"], platform_state.STATE_RECONCILABLE)
-        self.assertTrue(any("app.kubernetes.io/managed-by" in r for r in result["reasons"]))
-
-    def test_P2_expected_managed_by_argocd_with_healthy_components_is_healthy(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        result = _classify(cluster)
-        self.assertEqual(result["state"], platform_state.STATE_HEALTHY)
-        self.assertEqual(result["reasons"], [])
-
-    def test_P3_namespace_metadata_drift_plus_one_unsafe_component_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.put("namespace", RUNTIME_NAMESPACE, None, _namespace_obj(RUNTIME_NAMESPACE, labeled=False))
-        # The one additional unsafe component: Fluent Bit DaemonSet not fully ready.
-        ds = _daemonset_obj(platform_state.FLUENT_BIT_DAEMONSET_NAME)
-        ds["status"]["numberReady"] = 1
-        cluster.put("daemonset", platform_state.FLUENT_BIT_DAEMONSET_NAME, RUNTIME_NAMESPACE, ds)
-        result = _classify(cluster)
-        self.assertEqual(result["state"], platform_state.STATE_BROKEN, "safe reason + unsafe reason together must never yield partial credit")
-        self.assertTrue(any("managedNamespaceMetadata" in r for r in result["reasons"]))
-        self.assertTrue(any("not ready" in r for r in result["reasons"]))
-
-    def test_P4_clean_namespace_absence_preserves_absent(self):
-        cluster = FakeCluster()
-        result = _classify(cluster)
-        self.assertEqual(result["state"], platform_state.STATE_ABSENT)
-
-    def test_P5_api_inspection_error_fails_closed_never_reconcilable(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.fail("namespace", RUNTIME_NAMESPACE, None, "Error from server (Forbidden): namespaces is forbidden")
-        with self.assertRaises(platform_state.ClassifierInspectionError):
-            _classify(cluster)
-
-    def test_terminating_namespace_alone_is_broken_never_reconcilable(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.put("namespace", RUNTIME_NAMESPACE, None, _namespace_obj(RUNTIME_NAMESPACE, labeled=True, phase="Terminating"))
-        result = _classify(cluster)
-        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
-        self.assertTrue(any("Terminating" in r for r in result["reasons"]))
-
-    def test_terminating_namespace_plus_label_drift_is_broken(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.put("namespace", RUNTIME_NAMESPACE, None, _namespace_obj(RUNTIME_NAMESPACE, labeled=False, phase="Terminating"))
-        result = _classify(cluster)
-        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
-
-    def test_reconcilable_requires_at_least_one_reconcilable_reason(self):
-        # Defensive proof of the classifier's own len(reconcilable_reasons) == len(reasons) contract: an empty-but-non-None reconcilable_reasons list must never be mistaken for "everything reconcilable".
-        cluster = _populate_healthy_cluster(FakeCluster())
-        result = _classify(cluster)
-        self.assertEqual(result["state"], platform_state.STATE_HEALTHY)
+    def test_classify_signature_takes_no_fluent_bit_image_argument(self):
+        # Structural proof of the generic-architecture goal: ownership classify() no longer takes fluent_bit_image/runtime_role_arn/platform_logging_role_arn -- those are acceptance-only concerns.
+        import inspect
+        params = list(inspect.signature(platform_state.classify).parameters)
+        self.assertEqual(params, ["run", "environment", "runtime_namespace", "argocd_namespace", "ecr_registry"])
 
 
 class PlatformStateNoMutationSourceSweepTests(unittest.TestCase):
-    """Static source-safety proof: the classifier module (and its shared k8s_common helper) must never construct a mutating kubectl/helm command."""
-
     FORBIDDEN_SUBSTRINGS = (
         "kubectl apply", "kubectl create", "kubectl delete", "kubectl patch",
         "kubectl annotate", "kubectl label",
@@ -567,7 +231,7 @@ class PlatformStateNoMutationSourceSweepTests(unittest.TestCase):
             self.assertEqual(hits, [], f"{path} contains a mutating-looking construct: {hits}")
 
     def test_every_get_json_call_uses_get_verb_only(self):
-        cluster = _populate_healthy_cluster(FakeCluster())
+        cluster = _populate_owned_cluster(FakeCluster())
         _classify(cluster)
 
 
