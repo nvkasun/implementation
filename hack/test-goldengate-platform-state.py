@@ -98,8 +98,8 @@ def _owned_labels(extra=None):
 def _populate_owned_cluster(cluster):
     cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj())
     cluster.put("namespace", RUNTIME_NAMESPACE, None, _namespace_obj())
-    cluster.put("clusterrole", platform_state.FLUENT_BIT_CLUSTERROLE_NAME, None, {"metadata": {}})
-    cluster.put("clusterrolebinding", platform_state.FLUENT_BIT_CLUSTERROLEBINDING_NAME, None, {"metadata": {}})
+    cluster.put("clusterrole", platform_state.FLUENT_BIT_CLUSTERROLE_NAME, None, {"metadata": {"labels": _owned_labels()}})
+    cluster.put("clusterrolebinding", platform_state.FLUENT_BIT_CLUSTERROLEBINDING_NAME, None, {"metadata": {"labels": _owned_labels()}})
     cluster.put("serviceaccount", platform_state.RUNTIME_SA_NAME, RUNTIME_NAMESPACE, {"metadata": {"labels": _owned_labels()}})
     cluster.put("serviceaccount", platform_state.FLUENT_BIT_SA_NAME, RUNTIME_NAMESPACE, {"metadata": {"labels": _owned_labels()}})
     cluster.put("configmap", platform_state.FLUENT_BIT_CONFIGMAP_NAME, RUNTIME_NAMESPACE, {"metadata": {"labels": _owned_labels()}})
@@ -142,6 +142,46 @@ class PlatformOwnershipStateTests(unittest.TestCase):
         cluster.objects.pop(("daemonset", platform_state.FLUENT_BIT_DAEMONSET_NAME, RUNTIME_NAMESPACE))
         result = _classify(cluster)
         self.assertEqual(result["state"], platform_state.STATE_OWNED)
+
+    def test_foreign_clusterrole_instance_label_is_broken(self):
+        # Fix 1 (Generic MAIN Desired-State Convergence Safety Correction): a same-name foreign ClusterRole must never silently contribute to an OWNED footprint -- ownership labels are now actually validated, not merely existence.
+        cluster = _populate_owned_cluster(FakeCluster())
+        cluster.put("clusterrole", platform_state.FLUENT_BIT_CLUSTERROLE_NAME, None, {"metadata": {"labels": {"app.kubernetes.io/instance": "some-other-release", "goldengate.adcb/environment": ENVIRONMENT}}})
+        result = _classify(cluster)
+        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
+        self.assertTrue(any("clusterrole" in r and "foreign/ambiguous ownership" in r for r in result["reasons"]))
+
+    def test_foreign_clusterrolebinding_instance_label_is_broken(self):
+        cluster = _populate_owned_cluster(FakeCluster())
+        cluster.put("clusterrolebinding", platform_state.FLUENT_BIT_CLUSTERROLEBINDING_NAME, None, {"metadata": {"labels": {"app.kubernetes.io/instance": "some-other-release", "goldengate.adcb/environment": ENVIRONMENT}}})
+        result = _classify(cluster)
+        self.assertEqual(result["state"], platform_state.STATE_BROKEN)
+        self.assertTrue(any("clusterrolebinding" in r and "foreign/ambiguous ownership" in r for r in result["reasons"]))
+
+    def test_owned_clusterrole_only_partial_footprint_is_owned(self):
+        # A correctly-labeled ClusterRole existing alone (nothing else yet reconciled) is a safe partial footprint, not a completeness failure -- the architecture intentionally permits recovering/continuing a labeled partial Platform footprint.
+        cluster = FakeCluster()
+        cluster.put("clusterrole", platform_state.FLUENT_BIT_CLUSTERROLE_NAME, None, {"metadata": {"labels": _owned_labels()}})
+        result = _classify(cluster)
+        self.assertEqual(result["state"], platform_state.STATE_OWNED)
+        self.assertEqual(result["reasons"], [])
+
+    def test_owned_clusterrole_and_clusterrolebinding_is_owned(self):
+        cluster = FakeCluster()
+        cluster.put("clusterrole", platform_state.FLUENT_BIT_CLUSTERROLE_NAME, None, {"metadata": {"labels": _owned_labels()}})
+        cluster.put("clusterrolebinding", platform_state.FLUENT_BIT_CLUSTERROLEBINDING_NAME, None, {"metadata": {"labels": _owned_labels()}})
+        result = _classify(cluster)
+        self.assertEqual(result["state"], platform_state.STATE_OWNED)
+        self.assertEqual(result["reasons"], [])
+
+    def test_missing_clusterrole_and_clusterrolebinding_with_owned_application_never_forces_broken(self):
+        # Missing owned cluster-scoped RBAC is exactly what 30-sub-platform.yaml's own reconciliation (re)creates -- never itself a reason, mirroring the existing namespaced-resource-missing behavior.
+        cluster = _populate_owned_cluster(FakeCluster())
+        cluster.objects.pop(("clusterrole", platform_state.FLUENT_BIT_CLUSTERROLE_NAME, None))
+        cluster.objects.pop(("clusterrolebinding", platform_state.FLUENT_BIT_CLUSTERROLEBINDING_NAME, None))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], platform_state.STATE_OWNED)
+        self.assertEqual(result["reasons"], [])
 
     def test_namespace_foreign_name_label_is_broken(self):
         cluster = _populate_owned_cluster(FakeCluster())

@@ -12989,6 +12989,149 @@ else
 fi
 
 echo ""
+echo "--- Generic MAIN Desired-State Convergence Safety Correction ---"
+
+# Fix 1: platform_state.py must now actually validate ownership labels on the cluster-scoped Fluent Bit ClusterRole/ClusterRoleBinding, never merely their existence.
+if [ -f hack/orchestration/platform_state.py ]; then
+  if grep -qE 'cr_found, _ = get_json\(run, "clusterrole"' hack/orchestration/platform_state.py || grep -qE 'crb_found, _ = get_json\(run, "clusterrolebinding"' hack/orchestration/platform_state.py; then
+    fail "Fix 1: hack/orchestration/platform_state.py still discards the ClusterRole/ClusterRoleBinding object (cr_found, _ = ... / crb_found, _ = ...) -- ownership labels cannot be validated"
+  else
+    pass "Fix 1: hack/orchestration/platform_state.py captures the ClusterRole/ClusterRoleBinding object (not merely existence) for ownership-label validation"
+  fi
+  if grep -qF '_instance_owned_reason(f"clusterrole/{FLUENT_BIT_CLUSTERROLE_NAME}"' hack/orchestration/platform_state.py && grep -qF '_instance_owned_reason(f"clusterrolebinding/{FLUENT_BIT_CLUSTERROLEBINDING_NAME}"' hack/orchestration/platform_state.py; then
+    pass "Fix 1: hack/orchestration/platform_state.py runs the same _instance_owned_reason ownership check on the ClusterRole/ClusterRoleBinding as on the namespaced Platform resources"
+  else
+    fail "Fix 1: hack/orchestration/platform_state.py does not appear to call _instance_owned_reason on the cluster-scoped ClusterRole/ClusterRoleBinding"
+  fi
+else
+  fail "Fix 1: hack/orchestration/platform_state.py is missing"
+fi
+
+# Fix 1 regression tests: foreign ClusterRole/ClusterRoleBinding -> BROKEN; missing owned RBAC never forces BROKEN. Direct re-invocation of the exact tests added for this fix, not merely inherited from the broader Phase B2 run.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f hack/test-goldengate-platform-state.py ]; then
+  if FIX1_TEST_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 hack/test-goldengate-platform-state.py -v \
+      PlatformOwnershipStateTests.test_foreign_clusterrole_instance_label_is_broken \
+      PlatformOwnershipStateTests.test_foreign_clusterrolebinding_instance_label_is_broken \
+      PlatformOwnershipStateTests.test_owned_clusterrole_only_partial_footprint_is_owned \
+      PlatformOwnershipStateTests.test_owned_clusterrole_and_clusterrolebinding_is_owned \
+      PlatformOwnershipStateTests.test_missing_clusterrole_and_clusterrolebinding_with_owned_application_never_forces_broken \
+    2>&1)"; then
+    pass "Fix 1: foreign ClusterRole/ClusterRoleBinding -> BROKEN, owned partial/complete RBAC footprint -> OWNED, missing owned RBAC never forces BROKEN (all 5 fixtures re-confirmed directly)"
+  else
+    fail "Fix 1: direct re-invocation of the Platform RBAC ownership tests failed:"$'\n'"${FIX1_TEST_OUT}"
+  fi
+else
+  skip "Fix 1: direct Platform RBAC ownership re-invocation -- python3 unavailable or test file missing"
+fi
+
+# Fix 2: observability_state.py must never validate namespace metadata labels (that stays acceptance-only); observability_acceptance.py must strictly validate the managedNamespaceMetadata contract + Terminating.
+if [ -f hack/orchestration/observability_state.py ] && grep -qE 'ns_found, _ = get_json\(run, "namespace"' hack/orchestration/observability_state.py; then
+  pass "Fix 2: hack/orchestration/observability_state.py still never inspects namespace labels -- managedNamespaceMetadata drift remains ordinary owned drift at preflight"
+else
+  fail "Fix 2: hack/orchestration/observability_state.py's namespace check appears to have changed -- namespace metadata correctness must stay an acceptance-only concern"
+fi
+if [ -f hack/orchestration/observability_acceptance.py ] && grep -qF "MANAGED_NAMESPACE_LABELS" hack/orchestration/observability_acceptance.py && grep -qF "is Terminating" hack/orchestration/observability_acceptance.py; then
+  pass "Fix 2: hack/orchestration/observability_acceptance.py now strictly validates the namespace's managedNamespaceMetadata labels and rejects a Terminating namespace"
+else
+  fail "Fix 2: hack/orchestration/observability_acceptance.py does not appear to strictly validate namespace metadata"
+fi
+
+# Fix 2 regression tests: preflight tolerates namespace metadata drift as OWNED; acceptance strictly rejects the same drift; correct metadata + healthy fixtures -> HEALTHY.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f hack/test-goldengate-observability-state.py ] && [ -f hack/test-goldengate-observability-acceptance.py ]; then
+  if FIX2_STATE_TEST_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 hack/test-goldengate-observability-state.py -v \
+      ObservabilityOwnershipStateTests.test_stale_namespace_managed_by_never_forces_broken \
+    2>&1)" && FIX2_ACCEPTANCE_TEST_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 hack/test-goldengate-observability-acceptance.py -v \
+      ObservabilityAcceptanceTests.test_stale_namespace_managed_by_is_broken \
+      ObservabilityAcceptanceTests.test_wrong_namespace_name_label_is_broken \
+      ObservabilityAcceptanceTests.test_terminating_namespace_is_broken \
+      ObservabilityAcceptanceTests.test_complete_expected_state_is_healthy \
+    2>&1)"; then
+    pass "Fix 2: namespace metadata drift -> OWNED at preflight, BROKEN at strict acceptance (managed-by and name both), Terminating -> BROKEN, correct metadata + healthy fixtures -> HEALTHY (all 5 fixtures re-confirmed directly)"
+  else
+    fail "Fix 2: direct re-invocation of the Observability namespace-acceptance tests failed:"$'\n'"${FIX2_STATE_TEST_OUT}${FIX2_ACCEPTANCE_TEST_OUT}"
+  fi
+else
+  skip "Fix 2: direct Observability namespace-acceptance re-invocation -- python3 unavailable or test file missing"
+fi
+
+# Fix 3: three-layer effective-value audit -- BASE CHART VALUE + DEV VALUES OVERRIDE + WORKFLOW input/--set override = ACTUAL DEPLOYED INTENT. Read directly from the real committed sources, never assumed.
+if [ -f helm/argocd/values.yaml ] && [ -f envs/dev/argocd/values.yaml ]; then
+  ARGO_BASE_INGRESS="$(grep -A2 '^argocdServerIngress:' helm/argocd/values.yaml | grep 'enabled:' | head -1 | awk '{print $2}')"
+  ARGO_BASE_ECRSYNC="$(grep -A2 '^ecrTokenSync:' helm/argocd/values.yaml | grep 'enabled:' | head -1 | awk '{print $2}')"
+  if [ "$ARGO_BASE_INGRESS" = "false" ] && [ "$ARGO_BASE_ECRSYNC" = "false" ]; then
+    pass "Fix 3: helm/argocd/values.yaml BASE values are argocdServerIngress.enabled=false, ecrTokenSync.enabled=false -- both are DEV-overridden to true, never n/a"
+  else
+    fail "Fix 3: helm/argocd/values.yaml BASE argocdServerIngress.enabled/ecrTokenSync.enabled changed unexpectedly (ingress=${ARGO_BASE_INGRESS}, ecrTokenSync=${ARGO_BASE_ECRSYNC})"
+  fi
+else
+  fail "Fix 3: helm/argocd/values.yaml or envs/dev/argocd/values.yaml is missing"
+fi
+
+if [ -f helm/goldengate-platform/values.yaml ]; then
+  PLATFORM_BASE_FLUENTBIT="$(grep -A1 '^fluentBit:' helm/goldengate-platform/values.yaml | grep 'create:' | head -1 | awk '{print $2}')"
+  if [ "$PLATFORM_BASE_FLUENTBIT" = "false" ]; then
+    pass "Fix 3: helm/goldengate-platform/values.yaml BASE value is fluentBit.create=false -- DEV-overridden to true"
+  else
+    fail "Fix 3: helm/goldengate-platform/values.yaml BASE fluentBit.create changed unexpectedly (${PLATFORM_BASE_FLUENTBIT})"
+  fi
+else
+  fail "Fix 3: helm/goldengate-platform/values.yaml is missing"
+fi
+
+# ecrTokenSync/fluentBit are REQUIRED ARCHITECTURAL INVARIANTS of their specialist workflows, not supported optional toggles -- proven by the specialist workflow's own unconditional (never enabled-flag-gated) validation of the resources those settings control.
+if grep -qF 'grep -q "kind: CronJob" "$RENDERED"' .github/workflows/20-sub-argocd.yaml && ! grep -qE 'if \[ .*ecrTokenSync\.enabled.* = .*true.* \]' .github/workflows/20-sub-argocd.yaml; then
+  pass "Fix 3: 20-sub-argocd.yaml validates the ECR token-sync CronJob/RBAC/repository Secrets unconditionally -- never gated behind a check of ecrTokenSync.enabled -- confirming it is a required architectural invariant, not an optional toggle"
+else
+  fail "Fix 3: 20-sub-argocd.yaml's ECR token-sync validation no longer matches the expected unconditional (non-toggle) shape"
+fi
+if grep -qF 'FLUENT_BIT_DS_BLOCK="$(select_document "$RENDERED" "DaemonSet" "gg-fluent-bit")"' .github/workflows/30-sub-platform.yaml && ! grep -qE 'if \[ .*fluentBit\.create.* = .*true.* \]' .github/workflows/30-sub-platform.yaml; then
+  pass "Fix 3: 30-sub-platform.yaml validates the rendered gg-fluent-bit DaemonSet/ConfigMap/ServiceAccount unconditionally -- never gated behind a check of fluentBit.create -- confirming it is a required architectural invariant, not an optional toggle"
+else
+  fail "Fix 3: 30-sub-platform.yaml's Fluent Bit validation no longer matches the expected unconditional (non-toggle) shape"
+fi
+
+# MAIN's own platform_sync_once comment must no longer overclaim a generic "Fluent Bit disable/enable toggle" as part of the always-reconcile desired-state contract.
+if grep -qF "a Fluent Bit disable/enable toggle" .github/workflows/00-main-goldengate-orchestrator.yaml; then
+  fail "Fix 3: 00-main-goldengate-orchestrator.yaml still overclaims a generic Fluent Bit disable/enable toggle -- fluentBit.create is a required invariant, not a supported optional toggle"
+else
+  pass "Fix 3: 00-main-goldengate-orchestrator.yaml no longer overclaims fluentBit.create as a generic optional toggle -- the REQUIRED-invariant distinction is now explicit"
+fi
+
+# Monitor: library default vs active-runtime MAIN deployment intent -- three distinct layers, never a plain two-layer merge, and MUST NOT be conflated with the frozen runtime phase.
+if [ -f helm/goldengate-monitor/values.yaml ]; then
+  MONITOR_BASE_PUBLISH="$(grep -A1 '^cloudwatch:' helm/goldengate-monitor/values.yaml | grep 'publishEnabled:' | head -1 | awk '{print $2}')"
+  if [ "$MONITOR_BASE_PUBLISH" = "false" ]; then
+    pass "Fix 3: helm/goldengate-monitor/values.yaml BASE (library default) value is cloudwatch.publishEnabled=false"
+  else
+    fail "Fix 3: helm/goldengate-monitor/values.yaml BASE cloudwatch.publishEnabled changed unexpectedly (${MONITOR_BASE_PUBLISH})"
+  fi
+else
+  fail "Fix 3: helm/goldengate-monitor/values.yaml is missing"
+fi
+if [ -f envs/dev/goldengate-monitor/values.yaml ] && ! grep -q "cloudwatch" envs/dev/goldengate-monitor/values.yaml; then
+  pass "Fix 3: envs/dev/goldengate-monitor/values.yaml carries NO cloudwatch override -- the true/false intent comes entirely from MAIN's own workflow-input override (a third, distinct layer), never from DEV values"
+else
+  fail "Fix 3: envs/dev/goldengate-monitor/values.yaml unexpectedly carries a cloudwatch override, or the file is missing -- the three-layer model assumed by this audit no longer holds"
+fi
+if grep -qF "enable_cloudwatch_publication: true" .github/workflows/00-main-goldengate-orchestrator.yaml; then
+  pass "Fix 3: MAIN's monitor_sync_once WORKFLOW-INPUT override (enable_cloudwatch_publication: true) is the third layer that turns the base-false library default into true ACTIVE-RUNTIME deployment intent -- distinct from, and never substituting for, a DEV values.yaml override"
+else
+  fail "Fix 3: MAIN's monitor_sync_once no longer sets enable_cloudwatch_publication: true -- the three-layer Monitor audit no longer holds"
+fi
+# This MAIN deployment intent is reached only once monitor_sync_once actually runs, which itself requires an active runtime -- currently zero, per the frozen runtime phase. Flipping this MAIN-level intent is not itself a runtime-activation or EFS-hold change, and this task makes no such change.
+FROZEN_LIFECYCLE_OK="true"
+for frozen_descriptor in envs/dev/gg-postgresql-repltest-01/values.yaml envs/dev/gg-mssql-repltest-01/values.yaml; do
+  if ! grep -A1 '^lifecycle:' "$frozen_descriptor" | grep -qF 'state: absent'; then
+    FROZEN_LIFECYCLE_OK="false"
+  fi
+done
+if [ "$FROZEN_LIFECYCLE_OK" = "true" ]; then
+  pass "Fix 3: both frozen runtime descriptors remain lifecycle.state: absent -- Monitor's active-runtime MAIN deployment intent is correctly distinguished from, and does not itself activate, the frozen runtime phase"
+else
+  fail "Fix 3: a frozen runtime descriptor's lifecycle.state no longer reads 'absent' -- this task must never activate a runtime"
+fi
+
+echo ""
 echo "--- Workflow naming / operator UX standardization ---"
 
 WORKFLOWS_DIR=".github/workflows"

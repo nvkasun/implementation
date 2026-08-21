@@ -107,6 +107,13 @@ class ObservabilityOwnershipStateTests(unittest.TestCase):
         result = _classify(cluster)
         self.assertEqual(result["state"], observability_state.STATE_OWNED)
 
+    def test_stale_namespace_managed_by_never_forces_broken(self):
+        # Fix 2 (Generic MAIN Desired-State Convergence Safety Correction): the Application's own managedNamespaceMetadata contract (app.kubernetes.io/name/managed-by) is exact-desired-state, not ownership -- ordinary owned drift here must remain OWNED, converged by 40-sub-observability.yaml's own reconciliation. Strict post-reconcile verification lives in observability_acceptance.py.
+        cluster = _populate_owned_cluster(FakeCluster())
+        cluster.put("namespace", OBSERVABILITY_NAMESPACE, None, {"metadata": {"labels": {"app.kubernetes.io/name": "wrong-name", "app.kubernetes.io/managed-by": "Helm"}}})
+        result = _classify(cluster)
+        self.assertEqual(result["state"], observability_state.STATE_OWNED)
+
     def test_missing_workloads_never_forces_broken(self):
         cluster = _populate_owned_cluster(FakeCluster())
         cluster.objects.pop(("deployment", observability_state.FOOTPRINT_DEPLOYMENTS[0], OBSERVABILITY_NAMESPACE))

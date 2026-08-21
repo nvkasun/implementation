@@ -104,10 +104,10 @@ def classify(run, environment, runtime_namespace, argocd_namespace, ecr_registry
     ns_found, ns_obj = get_json(run, "namespace", runtime_namespace)
     checks["namespace_found"] = ns_found
 
-    cr_found, _ = get_json(run, "clusterrole", FLUENT_BIT_CLUSTERROLE_NAME)
+    cr_found, cr_obj = get_json(run, "clusterrole", FLUENT_BIT_CLUSTERROLE_NAME)
     checks["fluent_bit_clusterrole_found"] = cr_found
 
-    crb_found, _ = get_json(run, "clusterrolebinding", FLUENT_BIT_CLUSTERROLEBINDING_NAME)
+    crb_found, crb_obj = get_json(run, "clusterrolebinding", FLUENT_BIT_CLUSTERROLEBINDING_NAME)
     checks["fluent_bit_clusterrolebinding_found"] = crb_found
 
     # ABSENT: no meaningful footprint at all -- the platform chart is the designated owner of the shared runtime namespace, so any one of these existing without the rest means this classifier does not get to silently take ownership of partial/pre-existing state; it falls through to the ownership-label checks below instead.
@@ -147,6 +147,17 @@ def classify(run, environment, runtime_namespace, argocd_namespace, ecr_registry
                 f"namespace {runtime_namespace} label app.kubernetes.io/name={ns_labels.get('app.kubernetes.io/name')!r}, "
                 f"expected {NAMESPACE_OWNERSHIP_NAME_LABEL!r} -- possible foreign/ambiguous ownership"
             )
+
+    # Cluster-scoped resources (never namespace-gated -- a ClusterRole/ClusterRoleBinding exists independently of the runtime namespace). helm/goldengate-platform/templates/fluent-bit-rbac.yaml renders both with the same goldengate-platform.fluentBit.labels helper as the namespaced Fluent Bit resources below, so the same _instance_owned_reason ownership check applies -- a foreign same-name ClusterRole/ClusterRoleBinding must never silently contribute to an OWNED footprint. Missing is never a reason here either: that is exactly what reconciliation is for.
+    if cr_found:
+        reason = _instance_owned_reason(f"clusterrole/{FLUENT_BIT_CLUSTERROLE_NAME}", cr_obj, release_name, environment)
+        if reason:
+            reasons.append(reason)
+
+    if crb_found:
+        reason = _instance_owned_reason(f"clusterrolebinding/{FLUENT_BIT_CLUSTERROLEBINDING_NAME}", crb_obj, release_name, environment)
+        if reason:
+            reasons.append(reason)
 
     # The remaining checks only make sense once the runtime namespace exists. Ownership-label proof on whatever currently exists -- deliberately NOT a completeness/readiness check: a resource that is simply missing is exactly what MAIN is about to reconcile, never itself a reason.
     if ns_found:

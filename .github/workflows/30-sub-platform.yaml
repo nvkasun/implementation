@@ -587,6 +587,7 @@ jobs:
           done
           echo "OK: no StatefulSet/Deployment/Service/Ingress/PersistentVolumeClaim/SecretProviderClass rendered."
 
+          # fluentBit.create is a REQUIRED architectural invariant of this specialist workflow, not an optional values-driven toggle this validation section supports disabling -- this step unconditionally requires the rendered gg-fluent-bit DaemonSet/ConfigMap/ServiceAccount to exist, so fluentBit.create=false would hard-fail here, not be silently pruned by ordinary reconciliation. Redesigning this workflow to genuinely support fluentBit.create=false is a future architectural change, out of scope for the Generic MAIN Desired-State Convergence Fix/Safety Correction.
           echo "Validating exactly one Fluent Bit DaemonSet document..."
           DAEMONSET_COUNT="$(grep -c '^kind: DaemonSet$' "$RENDERED")"
           if [ "$DAEMONSET_COUNT" -ne 1 ]; then

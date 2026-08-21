@@ -117,9 +117,14 @@ def _agent_cr_obj(mode, host_network):
     return {"spec": {"mode": mode, "hostNetwork": host_network}}
 
 
+def _namespace_obj(labeled=True, phase="Active"):
+    labels = dict(observability_acceptance.MANAGED_NAMESPACE_LABELS) if labeled else {}
+    return {"metadata": {"labels": labels}, "status": {"phase": phase}}
+
+
 def _populate_healthy_cluster(cluster):
     cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj())
-    cluster.put("namespace", OBSERVABILITY_NAMESPACE, None, {"metadata": {}})
+    cluster.put("namespace", OBSERVABILITY_NAMESPACE, None, _namespace_obj())
     cluster.put("serviceaccount", observability_acceptance.CLOUDWATCH_AGENT_SA_NAME, OBSERVABILITY_NAMESPACE, _sa_obj(CLOUDWATCH_METRICS_ROLE_ARN))
     for name in observability_acceptance.REQUIRED_DEPLOYMENTS:
         repo = "aws-cloud-factory-cloudwatch-agent-operator" if "controller-manager" in name else ("aws-cloud-factory-cloudwatch-agent" if "scraper" in name else "aws-cloud-factory-kube-state-metrics")
@@ -153,6 +158,32 @@ class ObservabilityAcceptanceTests(unittest.TestCase):
         cluster.put("serviceaccount", observability_acceptance.CLOUDWATCH_AGENT_SA_NAME, OBSERVABILITY_NAMESPACE, _sa_obj("arn:aws:iam::668311715351:role/SomeOtherRole"))
         result = _classify(cluster)
         self.assertEqual(result["state"], observability_acceptance.STATE_BROKEN)
+
+    def test_stale_namespace_managed_by_is_broken(self):
+        # Fix 2 (Generic MAIN Desired-State Convergence Safety Correction): strict here, unlike ownership -- post-reconciliation the namespace must exactly satisfy the Application's own managedNamespaceMetadata contract.
+        cluster = _populate_healthy_cluster(FakeCluster())
+        ns = _namespace_obj(labeled=True)
+        ns["metadata"]["labels"]["app.kubernetes.io/managed-by"] = "Helm"
+        cluster.put("namespace", OBSERVABILITY_NAMESPACE, None, ns)
+        result = _classify(cluster)
+        self.assertEqual(result["state"], observability_acceptance.STATE_BROKEN)
+        self.assertTrue(any("managed-by" in r and "managedNamespaceMetadata" in r for r in result["reasons"]))
+
+    def test_wrong_namespace_name_label_is_broken(self):
+        cluster = _populate_healthy_cluster(FakeCluster())
+        ns = _namespace_obj(labeled=True)
+        ns["metadata"]["labels"]["app.kubernetes.io/name"] = "some-other-app"
+        cluster.put("namespace", OBSERVABILITY_NAMESPACE, None, ns)
+        result = _classify(cluster)
+        self.assertEqual(result["state"], observability_acceptance.STATE_BROKEN)
+        self.assertTrue(any("app.kubernetes.io/name" in r and "managedNamespaceMetadata" in r for r in result["reasons"]))
+
+    def test_terminating_namespace_is_broken(self):
+        cluster = _populate_healthy_cluster(FakeCluster())
+        cluster.put("namespace", OBSERVABILITY_NAMESPACE, None, _namespace_obj(labeled=True, phase="Terminating"))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], observability_acceptance.STATE_BROKEN)
+        self.assertTrue(any("Terminating" in r for r in result["reasons"]))
 
     def test_missing_serviceaccount_is_broken(self):
         cluster = _populate_healthy_cluster(FakeCluster())

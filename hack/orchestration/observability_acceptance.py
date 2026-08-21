@@ -93,6 +93,12 @@ FORBIDDEN_LIST_RESOURCES = (
     "neuronmonitors.cloudwatch.aws.amazon.com",
 )
 
+# .github/workflows/40-sub-observability.yaml's own Application-manifest generation ("Create or update the Argo CD Application" step) -- syncPolicy.managedNamespaceMetadata.labels, verified against the real workflow source, never guessed. Mirrors platform_acceptance.py's MANAGED_NAMESPACE_LABELS pattern: strict here (unlike observability_state.py's ownership check, which never inspects namespace labels at all), since a stale app.kubernetes.io/name/managed-by value post-reconciliation is a genuine acceptance failure, not tolerated as "safe drift" forever.
+MANAGED_NAMESPACE_LABELS = {
+    "app.kubernetes.io/name": ARGOCD_APP_NAME,
+    "app.kubernetes.io/managed-by": "argocd",
+}
+
 
 def _image_reasons(resource_label, images, ecr_registry):
     reasons = []
@@ -150,10 +156,21 @@ def classify(run, environment, observability_namespace, argocd_namespace, ecr_re
         if actual_release_name != RELEASE_NAME:
             reasons.append(f"Application {ARGOCD_APP_NAME} source.helm.releaseName={actual_release_name!r}, expected {RELEASE_NAME!r}")
 
-    ns_found, _ = get_json(run, "namespace", observability_namespace)
+    ns_found, ns_obj = get_json(run, "namespace", observability_namespace)
     checks["namespace_found"] = ns_found
     if not ns_found:
         reasons.append(f"namespace {observability_namespace} does not exist")
+    else:
+        ns_phase = ((ns_obj.get("status") or {}).get("phase"))
+        if ns_phase == "Terminating":
+            reasons.append(f"namespace {observability_namespace} is Terminating")
+
+        # Strict here (unlike observability_state.py's ownership check, which deliberately never inspects namespace labels): the namespace metadata must exactly match Argo CD's own managedNamespaceMetadata contract post-reconciliation.
+        ns_labels = ((ns_obj.get("metadata") or {}).get("labels")) or {}
+        for label_key, expected_value in MANAGED_NAMESPACE_LABELS.items():
+            actual_value = ns_labels.get(label_key)
+            if actual_value != expected_value:
+                reasons.append(f"namespace {observability_namespace} label {label_key}={actual_value!r}, expected {expected_value!r} (managedNamespaceMetadata)")
 
     # The remaining checks only make sense once the target namespace exists.
     if ns_found:

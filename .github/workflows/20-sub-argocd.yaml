@@ -395,6 +395,7 @@ jobs:
 
           RENDERED="rendered/${ARGOCD_RELEASE_NAME}.yaml"
 
+          # ecrTokenSync.enabled is a REQUIRED architectural invariant of this specialist workflow, not an optional values-driven toggle -- the current private-OCI Argo CD architecture depends on the token-sync ServiceAccount/Role/RoleBinding/CronJob and the repository Secrets it refreshes, and this section (plus the post-deploy verification below) validates that mechanism unconditionally, regardless of what ecrTokenSync.enabled is set to. Redesigning this workflow/acceptance to genuinely support ecrTokenSync.enabled=false is a future architectural change, out of scope for the Generic MAIN Desired-State Convergence Fix/Safety Correction.
           echo "Checking rendered manifest for ECR token sync resources: ${RENDERED}"
 
           ECR_TOKEN_SYNC_TAG="$(python3 -c "import yaml; print(yaml.safe_load(open('${VALUES_FILE}'))['ecrTokenSync']['image']['tag'])")"
