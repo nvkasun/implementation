@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""hack/orchestration/argocd_state.py: read-only Argo CD prerequisite classifier -- answers exactly one question, "what is the current Argo CD prerequisite state?", as one of ABSENT/HEALTHY/RECONCILABLE/BROKEN. RECONCILABLE (Live Argo Recovery Fix) is a narrow, deliberately conservative carve-out: the core Argo footprint and ECR token-sync RBAC/identity are structurally healthy and only the generated repository Secrets are missing/drifted, a class of drift the existing reusable Argo specialist workflow (its idempotent Helm chart reconciliation plus its own immediate bounded ECR token-sync validation step) already safely repairs -- any other drift at all still classifies BROKEN. Never mutates the cluster: every kubectl invocation here is a `get` (read-only); no apply/create/delete/patch/annotate/label/helm call exists in this module. Consumes environment identity through hack/goldengate-environment.py, never a second environment parser."""
+"""hack/orchestration/argocd_state.py: read-only Argo CD prerequisite classifier -- answers exactly one question, "what is the current Argo CD prerequisite state?", as one of ABSENT/HEALTHY/RECONCILABLE/BROKEN. RECONCILABLE is a narrow, deliberately conservative carve-out: (1, Live Argo Recovery Fix) the generated repository Secrets are missing/drifted, and (2, Fresh-Cluster Platform + Argo Ingress Self-Recovery Fix) the desired, clearly Argo/Helm-owned argocd-server-ingress is missing or carries safe deterministic spec/annotation drift (including the AWS Load Balancer Controller not yet having published a status.loadBalancer.ingress address) -- both classes of drift the existing reusable Argo specialist workflow (its idempotent Helm chart reconciliation, own immediate bounded ECR token-sync validation step, and own bounded Ingress/ALB readiness wait) already safely repairs. A same-name Ingress with foreign/ambiguous ownership is never taken over -- that stays exclusively in `reasons`, forcing BROKEN. Any other drift at all still classifies BROKEN. Never mutates the cluster: every kubectl invocation here is a `get` (read-only); no apply/create/delete/patch/annotate/label/helm call exists in this module. Consumes environment identity through hack/goldengate-environment.py, never a second environment parser."""
 from __future__ import annotations
 
 import argparse
@@ -37,12 +37,12 @@ def environment_derived_values(environment):
     return env_module.derive_values(doc)
 
 
-def ingress_enabled_from_values(environment):
-    """Reads envs/<environment>/argocd/values.yaml's argocdServerIngress.enabled -- the actual deployed-chart contract, never hardcoded into this classifier."""
+def ingress_config_from_values(environment):
+    """Reads envs/<environment>/argocd/values.yaml's whole argocdServerIngress block -- the actual deployed-chart application-constant contract (enabled, mode, ingressClassName, serviceName, servicePort, groupOrder, targetType, backendProtocol, listenPorts, healthcheck*, scheme), never hardcoded into this classifier. host/groupName/certificateArn are deliberately NOT read from here -- those are shared environment identity, injected at deploy time from envs/<environment>/environment.yaml via the canonical resolver, and are passed into classify() separately (argocd_host/alb_group_name/acm_certificate_arn)."""
     path = os.path.join(REPO_ROOT, "envs", environment, "argocd", "values.yaml")
     with open(path) as f:
         doc = yaml.safe_load(f) or {}
-    return bool((doc.get("argocdServerIngress") or {}).get("enabled"))
+    return dict(doc.get("argocdServerIngress") or {})
 
 
 STATE_ABSENT = "ABSENT"
@@ -51,7 +51,7 @@ STATE_RECONCILABLE = "RECONCILABLE"
 STATE_BROKEN = "BROKEN"
 
 # Stable compatibility marker, not an operational recovery mechanism: lets a caller (00-main-goldengate-orchestrator.yaml) fail closed if it is ever paired with a classifier source whose state semantics have drifted (e.g. an older copy of this file that predates RECONCILABLE), rather than silently trusting a state value the caller's own if: expressions were never written to understand. Bump only when the {"state", ...} contract itself changes meaning.
-CLASSIFIER_CONTRACT = "argocd-recovery-v1"
+CLASSIFIER_CONTRACT = "argocd-recovery-v2"
 
 # Current chart/values contract (helm/argocd, envs/<environment>/argocd/values.yaml) -- verified against the real vendored chart's rendered output, never guessed.
 REQUIRED_CRDS = (
@@ -83,6 +83,12 @@ REQUIRED_REPO_SECRETS = {
 }
 
 INGRESS_NAME = "argocd-server-ingress"
+
+# Labels rendered by helm/argocd/templates/argocd-server-ingress.yaml itself -- the ownership proof used to decide whether an existing same-name Ingress is safe to treat as Argo/Helm-owned drift (RECONCILABLE-eligible) versus foreign/ambiguous (always BROKEN, never automatically taken over).
+INGRESS_OWNERSHIP_LABELS = {
+    "app.kubernetes.io/name": "argocd-server",
+    "app.kubernetes.io/part-of": "argocd",
+}
 
 
 class ClassifierInspectionError(Exception):
@@ -145,7 +151,81 @@ def _statefulset_ready(obj):
     return _replicaset_like_ready(obj, ("updatedReplicas", "readyReplicas", "currentReplicas"))
 
 
-def classify(run, environment, namespace, ecr_registry, argocd_ecr_read_role_arn, ingress_enabled):
+def _ingress_drift_reasons(ingress_obj, argocd_host, alb_group_name, acm_certificate_arn, ingress_values):
+    """Returns (reasons, reconcilable_reasons) for an EXISTING argocd-server-ingress object. Foreign/ambiguous ownership (labels do not match the expected Argo CD Helm release) is reasons-only, never reconcilable -- this module must never automatically take over an Ingress it cannot prove it owns. Every other field checked below (host, backend Service/port, ALB annotations, and AWS Load Balancer Controller readiness) is safe/deterministic Argo-owned drift, already reconcilable via 20-sub-argocd.yaml's own idempotent Helm reconciliation plus its own bounded Ingress/ALB readiness wait."""
+    reasons = []
+    reconcilable_reasons = []
+
+    labels = (ingress_obj.get("metadata") or {}).get("labels") or {}
+    owned = all(labels.get(key) == value for key, value in INGRESS_OWNERSHIP_LABELS.items())
+    if not owned:
+        reasons.append(
+            f"ingress/{INGRESS_NAME} exists but its ownership labels {labels!r} do not match the expected Argo CD Helm "
+            f"release {INGRESS_OWNERSHIP_LABELS!r} -- possible foreign/ambiguous ownership, never automatically taken over"
+        )
+        return reasons, reconcilable_reasons
+
+    def add(reason):
+        reasons.append(reason)
+        reconcilable_reasons.append(reason)
+
+    annotations = (ingress_obj.get("metadata") or {}).get("annotations") or {}
+    spec = ingress_obj.get("spec") or {}
+    rule = (spec.get("rules") or [{}])[0] or {}
+    path = (((rule.get("http") or {}).get("paths")) or [{}])[0] or {}
+    backend_service = ((path.get("backend") or {}).get("service")) or {}
+
+    expected_ingress_class = ingress_values.get("ingressClassName") or "alb"
+    expected_service_name = ingress_values.get("serviceName") or "argocd-server"
+    expected_service_port = ingress_values.get("servicePort")
+    if expected_service_port is None:
+        expected_service_port = 443
+
+    if spec.get("ingressClassName") != expected_ingress_class:
+        add(f"ingress/{INGRESS_NAME} spec.ingressClassName={spec.get('ingressClassName')!r}, expected {expected_ingress_class!r}")
+    if rule.get("host") != argocd_host:
+        add(f"ingress/{INGRESS_NAME} spec.rules[0].host={rule.get('host')!r}, expected {argocd_host!r}")
+    if backend_service.get("name") != expected_service_name:
+        add(f"ingress/{INGRESS_NAME} backend service name={backend_service.get('name')!r}, expected {expected_service_name!r}")
+    actual_backend_port = ((backend_service.get("port") or {}).get("number"))
+    if actual_backend_port != expected_service_port:
+        add(f"ingress/{INGRESS_NAME} backend service port={actual_backend_port!r}, expected {expected_service_port!r}")
+
+    annotation_checks = (
+        ("alb.ingress.kubernetes.io/group.name", alb_group_name),
+        ("alb.ingress.kubernetes.io/group.order", ingress_values.get("groupOrder")),
+        ("alb.ingress.kubernetes.io/certificate-arn", acm_certificate_arn),
+        ("alb.ingress.kubernetes.io/listen-ports", ingress_values.get("listenPorts")),
+        ("alb.ingress.kubernetes.io/target-type", ingress_values.get("targetType")),
+        ("alb.ingress.kubernetes.io/backend-protocol", ingress_values.get("backendProtocol")),
+        ("alb.ingress.kubernetes.io/healthcheck-protocol", ingress_values.get("healthcheckProtocol")),
+        ("alb.ingress.kubernetes.io/healthcheck-path", ingress_values.get("healthcheckPath")),
+        ("alb.ingress.kubernetes.io/healthcheck-port", ingress_values.get("healthcheckPort")),
+    )
+    for annotation_key, expected_value in annotation_checks:
+        if expected_value is None or expected_value == "":
+            continue
+        actual_value = annotations.get(annotation_key)
+        if actual_value != str(expected_value):
+            add(f"ingress/{INGRESS_NAME} {annotation_key}={actual_value!r}, expected {str(expected_value)!r}")
+
+    # Standalone-only: the resident/anchor Ingress must own the ALB scheme. Never checked in shared mode -- a shared-mode Ingress must NOT carry this annotation at all (repeating it alongside the resident anchor's own value causes an ALB Controller IngressGroup conflicting-attribute error), so absence there is correct, not drift.
+    if ingress_values.get("mode") == "standalone":
+        expected_scheme = ingress_values.get("scheme")
+        if expected_scheme:
+            actual_scheme = annotations.get("alb.ingress.kubernetes.io/scheme")
+            if actual_scheme != expected_scheme:
+                add(f"ingress/{INGRESS_NAME} alb.ingress.kubernetes.io/scheme={actual_scheme!r}, expected {expected_scheme!r} (standalone resident anchor)")
+
+    # AWS Load Balancer Controller readiness: a spec/annotation-correct Ingress with no published address yet is exactly the transient condition 20-sub-argocd.yaml's own bounded post-deploy wait is designed to resolve -- safe/reconcilable here, never itself terminal BROKEN. If that bounded wait itself times out live, 20-sub-argocd.yaml fails closed on its own (reconcile_argocd never reports success), so this classifier is never the sole gate against a permanently-unprovisioned ALB.
+    lb_ingress = ((ingress_obj.get("status") or {}).get("loadBalancer") or {}).get("ingress") or []
+    if not lb_ingress:
+        add(f"ingress/{INGRESS_NAME} status.loadBalancer.ingress is empty -- the AWS Load Balancer Controller has not yet published an address")
+
+    return reasons, reconcilable_reasons
+
+
+def classify(run, environment, namespace, ecr_registry, argocd_ecr_read_role_arn, argocd_host, alb_group_name, acm_certificate_arn, ingress_values):
     """Returns the stable {"contract", "state", "environment", "namespace", "reasons", "checks"} shape (contract == CLASSIFIER_CONTRACT). Raises ClassifierInspectionError if Kubernetes access itself could not be trusted -- callers must let that propagate as a hard failure, never a downgrade to ABSENT."""
     reasons = []
     # Subset of `reasons` that is safe to auto-repair via the existing reusable Argo specialist workflow's idempotent Helm chart reconciliation plus its own immediate bounded ECR token-sync validation step (which triggers a one-off Job from the already-correct CronJob and waits for it to (re)create the repository Secrets) -- never a broader "any drift is safe" carve-out. Only a missing/mislabeled/wrong-URL required repository Secret is added here; every other reason (core Argo footprint, ECR token-sync RBAC/identity, ingress) stays exclusively in `reasons` and therefore forces BROKEN below.
@@ -256,16 +336,25 @@ def classify(run, environment, namespace, ecr_registry, argocd_ecr_read_role_arn
             # Password is intentionally never read or included in classifier output.
         checks["repository_secrets"] = secret_status
 
-        ingress_found, _ = _get_json(run, "ingress", INGRESS_NAME, namespace)
+        ingress_enabled = bool(ingress_values.get("enabled"))
+        ingress_found, ingress_obj = _get_json(run, "ingress", INGRESS_NAME, namespace)
         checks["ingress_found"] = ingress_found
         checks["ingress_enabled_in_values"] = ingress_enabled
-        if ingress_enabled and not ingress_found:
-            reasons.append(f"ingress/{INGRESS_NAME} does not exist but argocdServerIngress.enabled=true in envs/{environment}/argocd/values.yaml")
+        if ingress_enabled:
+            if not ingress_found:
+                # Missing-but-desired is exactly the deterministic, application-owned drift 20-sub-argocd.yaml's own idempotent Helm reconciliation already safely repairs -- reconcilable, mirroring the existing repository-Secret carve-out above.
+                reason = f"ingress/{INGRESS_NAME} does not exist but argocdServerIngress.enabled=true in envs/{environment}/argocd/values.yaml"
+                reasons.append(reason)
+                reconcilable_reasons.append(reason)
+            else:
+                ingress_reasons, ingress_reconcilable_reasons = _ingress_drift_reasons(ingress_obj, argocd_host, alb_group_name, acm_certificate_arn, ingress_values)
+                reasons.extend(ingress_reasons)
+                reconcilable_reasons.extend(ingress_reconcilable_reasons)
 
-    # RECONCILABLE only when EVERY collected reason is in the reconcilable subset (missing/mislabeled/wrong-URL repository Secrets, with the core Argo footprint, ECR token-sync RBAC/identity, and ingress contract all otherwise clean) -- any other reason at all (foreign/ambiguous ownership, a not-ready core component, a broken ECR token-sync identity) forces BROKEN, never a broader "partial install is fine" default.
+    # RECONCILABLE only when EVERY collected reason is in the reconcilable subset (missing/mislabeled/wrong-URL repository Secrets and/or missing/drifted clearly-owned Ingress, with the core Argo footprint, ECR token-sync RBAC/identity, and everything else otherwise clean) -- any other reason at all (foreign/ambiguous Ingress ownership, a not-ready core component, a broken ECR token-sync identity) forces BROKEN, never a broader "partial install is fine" default.
     if not reasons:
         state = STATE_HEALTHY
-    elif len(reconcilable_reasons) == len(reasons):
+    elif reconcilable_reasons and len(reconcilable_reasons) == len(reasons):
         state = STATE_RECONCILABLE
     else:
         state = STATE_BROKEN
@@ -280,7 +369,7 @@ def main(argv=None):
 
     try:
         values = environment_derived_values(args.environment)
-        ingress_enabled = ingress_enabled_from_values(args.environment)
+        ingress_values = ingress_config_from_values(args.environment)
         run = KubectlRunner(args.kubectl_bin)
         result = classify(
             run,
@@ -288,7 +377,10 @@ def main(argv=None):
             namespace=values["ARGOCD_NAMESPACE"],
             ecr_registry=values["ECR_REGISTRY"],
             argocd_ecr_read_role_arn=values["ARGOCD_ECR_READ_ROLE_ARN"],
-            ingress_enabled=ingress_enabled,
+            argocd_host=values["ARGOCD_HOST"],
+            alb_group_name=values["ALB_GROUP_NAME"],
+            acm_certificate_arn=values["ACM_CERTIFICATE_ARN"],
+            ingress_values=ingress_values,
         )
     except (ClassifierInspectionError, ValueError, OSError) as exc:
         print(f"INSPECTION ERROR: {exc}", file=sys.stderr)

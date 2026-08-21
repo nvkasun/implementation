@@ -23,6 +23,29 @@ NAMESPACE = "argocd"
 ECR_REGISTRY = "229410149234.dkr.ecr.eu-west-1.amazonaws.com"
 ARGOCD_ECR_READ_ROLE_ARN = "arn:aws:iam::668311715351:role/GoldenGateArgocdECRRead-dev"
 
+# Fresh-Cluster Platform + Argo Ingress Self-Recovery Fix: environment-specific identity, exactly as it would be resolved from envs/dev/environment.yaml via hack/goldengate-environment.py -- passed into classify() as explicit arguments, never hardcoded inside argocd_state.py itself.
+ARGOCD_HOST = "argocd.goldengate-dev.adcbmis.local"
+ALB_GROUP_NAME = "gg-poc-dev-alb"
+ACM_CERTIFICATE_ARN = "arn:aws:acm:eu-west-1:668311715351:certificate/9e53e28e-3243-47fc-85a1-50f9a94acde7"
+
+# Application-constant contract, exactly as committed in envs/dev/argocd/values.yaml's argocdServerIngress block -- passed into classify() as ingress_values, never hardcoded inside argocd_state.py itself.
+INGRESS_VALUES_DISABLED = {"enabled": False}
+INGRESS_VALUES_ENABLED = {
+    "enabled": True,
+    "mode": "standalone",
+    "ingressClassName": "alb",
+    "serviceName": "argocd-server",
+    "servicePort": 443,
+    "groupOrder": "50",
+    "targetType": "ip",
+    "backendProtocol": "HTTPS",
+    "listenPorts": '[{"HTTPS":443}]',
+    "healthcheckProtocol": "HTTPS",
+    "healthcheckPath": "/healthz",
+    "healthcheckPort": "traffic-port",
+    "scheme": "internal",
+}
+
 
 class FakeCluster:
     """Models exactly the subset of `kubectl get <resource> [name] [-n ns] -o json` behavior the classifier depends on -- never a real kubectl process."""
@@ -112,6 +135,35 @@ def _secret_obj(name, helm_repo, ecr_registry=ECR_REGISTRY, labeled=True, url_ov
     }
 
 
+def _correct_ingress_obj():
+    """The exact shape helm/argocd/templates/argocd-server-ingress.yaml renders for envs/dev/argocd/values.yaml's own committed standalone-mode contract, plus a populated status.loadBalancer.ingress (the AWS Load Balancer Controller has published an address)."""
+    return {
+        "metadata": {
+            "labels": dict(argocd_state.INGRESS_OWNERSHIP_LABELS),
+            "annotations": {
+                "alb.ingress.kubernetes.io/group.name": ALB_GROUP_NAME,
+                "alb.ingress.kubernetes.io/group.order": "50",
+                "alb.ingress.kubernetes.io/certificate-arn": ACM_CERTIFICATE_ARN,
+                "alb.ingress.kubernetes.io/listen-ports": '[{"HTTPS":443}]',
+                "alb.ingress.kubernetes.io/target-type": "ip",
+                "alb.ingress.kubernetes.io/backend-protocol": "HTTPS",
+                "alb.ingress.kubernetes.io/healthcheck-protocol": "HTTPS",
+                "alb.ingress.kubernetes.io/healthcheck-path": "/healthz",
+                "alb.ingress.kubernetes.io/healthcheck-port": "traffic-port",
+                "alb.ingress.kubernetes.io/scheme": "internal",
+            },
+        },
+        "spec": {
+            "ingressClassName": "alb",
+            "rules": [{
+                "host": ARGOCD_HOST,
+                "http": {"paths": [{"backend": {"service": {"name": "argocd-server", "port": {"number": 443}}}}]},
+            }],
+        },
+        "status": {"loadBalancer": {"ingress": [{"hostname": "internal-abc123.eu-west-1.elb.amazonaws.com"}]}},
+    }
+
+
 def _populate_healthy_cluster(cluster):
     cluster.put("namespace", NAMESPACE, None, _namespace_obj(NAMESPACE))
     for crd in argocd_state.REQUIRED_CRDS:
@@ -131,14 +183,17 @@ def _populate_healthy_cluster(cluster):
     return cluster
 
 
-def _classify(cluster, ingress_enabled=False):
+def _classify(cluster, ingress_values=None):
     return argocd_state.classify(
         cluster,
         environment="dev",
         namespace=NAMESPACE,
         ecr_registry=ECR_REGISTRY,
         argocd_ecr_read_role_arn=ARGOCD_ECR_READ_ROLE_ARN,
-        ingress_enabled=ingress_enabled,
+        argocd_host=ARGOCD_HOST,
+        alb_group_name=ALB_GROUP_NAME,
+        acm_certificate_arn=ACM_CERTIFICATE_ARN,
+        ingress_values=ingress_values if ingress_values is not None else INGRESS_VALUES_DISABLED,
     )
 
 
@@ -239,14 +294,14 @@ class ArgoCdStateClassifierTests(unittest.TestCase):
         _populate_healthy_cluster(cluster)
         for secret_name in argocd_state.REQUIRED_REPO_SECRETS:
             cluster.objects.pop(("secret", secret_name, NAMESPACE))
-        result = _classify(cluster, ingress_enabled=False)
+        result = _classify(cluster)
         self.assertEqual(result["state"], argocd_state.STATE_RECONCILABLE)
         self.assertEqual(len(result["reasons"]), 4)
         for secret_name in argocd_state.REQUIRED_REPO_SECRETS:
             self.assertTrue(any(f"Secret {secret_name} does not exist" in r for r in result["reasons"]))
 
     def test_reconcilable_secret_drift_plus_unrelated_broken_component_stays_broken(self):
-        # Live Argo Recovery Fix: RECONCILABLE requires EVERY collected reason to be in the safe repository-Secret-drift subset -- a missing Secret alongside ANY other unsafe drift (here, a not-ready core Deployment) must still classify BROKEN, proving this is not a broader "any drift is fine as long as a Secret is also missing" carve-out.
+        # Live Argo Recovery Fix: RECONCILABLE requires EVERY collected reason to be in the safe subset -- a missing Secret alongside ANY other unsafe drift (here, a not-ready core Deployment) must still classify BROKEN, proving this is not a broader "any drift is fine as long as a Secret is also missing" carve-out.
         cluster = FakeCluster()
         _populate_healthy_cluster(cluster)
         cluster.objects.pop(("secret", "argocd-ecr-goldengate-oci", NAMESPACE))
@@ -277,28 +332,14 @@ class ArgoCdStateClassifierTests(unittest.TestCase):
     def test_all_required_components_healthy(self):
         cluster = FakeCluster()
         _populate_healthy_cluster(cluster)
-        result = _classify(cluster, ingress_enabled=False)
+        result = _classify(cluster)
         self.assertEqual(result["state"], argocd_state.STATE_HEALTHY)
         self.assertEqual(result["reasons"], [])
-
-    def test_ingress_enabled_and_missing_is_broken(self):
-        cluster = FakeCluster()
-        _populate_healthy_cluster(cluster)
-        result = _classify(cluster, ingress_enabled=True)
-        self.assertEqual(result["state"], argocd_state.STATE_BROKEN)
-        self.assertTrue(any("ingress/argocd-server-ingress" in r for r in result["reasons"]))
 
     def test_ingress_disabled_and_absent_is_still_healthy(self):
         cluster = FakeCluster()
         _populate_healthy_cluster(cluster)
-        result = _classify(cluster, ingress_enabled=False)
-        self.assertEqual(result["state"], argocd_state.STATE_HEALTHY)
-
-    def test_ingress_enabled_and_present_is_healthy(self):
-        cluster = FakeCluster()
-        _populate_healthy_cluster(cluster)
-        cluster.put("ingress", argocd_state.INGRESS_NAME, NAMESPACE, {"metadata": {"name": argocd_state.INGRESS_NAME}})
-        result = _classify(cluster, ingress_enabled=True)
+        result = _classify(cluster, ingress_values=INGRESS_VALUES_DISABLED)
         self.assertEqual(result["state"], argocd_state.STATE_HEALTHY)
 
     def test_kubectl_command_error_raises_inspection_error_not_absent(self):
@@ -328,7 +369,10 @@ class ArgoCdStateClassifierTests(unittest.TestCase):
                 namespace=NAMESPACE,
                 ecr_registry=ECR_REGISTRY,
                 argocd_ecr_read_role_arn=ARGOCD_ECR_READ_ROLE_ARN,
-                ingress_enabled=False,
+                argocd_host=ARGOCD_HOST,
+                alb_group_name=ALB_GROUP_NAME,
+                acm_certificate_arn=ACM_CERTIFICATE_ARN,
+                ingress_values=INGRESS_VALUES_DISABLED,
             )
 
     def test_secret_missing_repository_label_is_reconcilable(self):
@@ -341,7 +385,7 @@ class ArgoCdStateClassifierTests(unittest.TestCase):
         self.assertTrue(any("secret-type=repository" in r for r in result["reasons"]))
 
     def test_classifier_contract_marker_present_on_every_result(self):
-        # Live Argo Self-Recovery Fix: the classifier always stamps its own stable compatibility marker (CLASSIFIER_CONTRACT) onto every result shape, across every state -- ABSENT (the early-return path), HEALTHY, and RECONCILABLE (the two different late-return paths) -- so a caller can fail closed on a version-skewed classifier before ever trusting its state value. This is a compatibility guard only, never itself the operational recovery mechanism for repository Secret drift.
+        # Live Argo Self-Recovery Fix: the classifier always stamps its own stable compatibility marker (CLASSIFIER_CONTRACT) onto every result shape, across every state -- ABSENT (the early-return path), HEALTHY, and RECONCILABLE (the two different late-return paths) -- so a caller can fail closed on a version-skewed classifier before ever trusting its state value. This is a compatibility guard only, never itself the operational recovery mechanism for repository Secret/Ingress drift.
         self.assertTrue(argocd_state.CLASSIFIER_CONTRACT)
         absent_result = _classify(FakeCluster())
         self.assertEqual(absent_result["contract"], argocd_state.CLASSIFIER_CONTRACT)
@@ -355,6 +399,172 @@ class ArgoCdStateClassifierTests(unittest.TestCase):
         reconcilable_result = _classify(reconcilable_cluster)
         self.assertEqual(reconcilable_result["state"], argocd_state.STATE_RECONCILABLE)
         self.assertEqual(reconcilable_result["contract"], argocd_state.CLASSIFIER_CONTRACT)
+
+
+class ArgoCdIngressStateClassifierTests(unittest.TestCase):
+    """Fresh-Cluster Platform + Argo Ingress Self-Recovery Fix: the argocd-server-ingress RECONCILABLE/BROKEN contract. Test naming matches the task's own A-numbering (A1-A10) for traceability."""
+
+    def test_A1_healthy_core_plus_correct_ingress_is_healthy(self):
+        cluster = FakeCluster()
+        _populate_healthy_cluster(cluster)
+        cluster.put("ingress", argocd_state.INGRESS_NAME, NAMESPACE, _correct_ingress_obj())
+        result = _classify(cluster, ingress_values=INGRESS_VALUES_ENABLED)
+        self.assertEqual(result["state"], argocd_state.STATE_HEALTHY)
+        self.assertEqual(result["reasons"], [])
+
+    def test_A2_healthy_core_plus_missing_required_ingress_is_reconcilable(self):
+        cluster = FakeCluster()
+        _populate_healthy_cluster(cluster)
+        result = _classify(cluster, ingress_values=INGRESS_VALUES_ENABLED)
+        self.assertEqual(result["state"], argocd_state.STATE_RECONCILABLE)
+        self.assertTrue(any(f"ingress/{argocd_state.INGRESS_NAME}" in r and "does not exist" in r for r in result["reasons"]))
+
+    def test_A3_healthy_core_plus_owned_ingress_safe_drift_is_reconcilable(self):
+        cluster = FakeCluster()
+        _populate_healthy_cluster(cluster)
+        drifted = _correct_ingress_obj()
+        drifted["metadata"]["annotations"]["alb.ingress.kubernetes.io/group.order"] = "99"
+        drifted["spec"]["ingressClassName"] = "nginx"
+        cluster.put("ingress", argocd_state.INGRESS_NAME, NAMESPACE, drifted)
+        result = _classify(cluster, ingress_values=INGRESS_VALUES_ENABLED)
+        self.assertEqual(result["state"], argocd_state.STATE_RECONCILABLE)
+        self.assertTrue(any("group.order" in r for r in result["reasons"]))
+        self.assertTrue(any("ingressClassName" in r for r in result["reasons"]))
+
+    def test_A4_foreign_or_ambiguous_same_name_ingress_is_broken(self):
+        cluster = FakeCluster()
+        _populate_healthy_cluster(cluster)
+        foreign = _correct_ingress_obj()
+        foreign["metadata"]["labels"] = {"app.kubernetes.io/managed-by": "some-other-team"}
+        cluster.put("ingress", argocd_state.INGRESS_NAME, NAMESPACE, foreign)
+        result = _classify(cluster, ingress_values=INGRESS_VALUES_ENABLED)
+        self.assertEqual(result["state"], argocd_state.STATE_BROKEN)
+        self.assertTrue(any("foreign/ambiguous ownership" in r for r in result["reasons"]))
+
+    def test_A4b_foreign_ingress_drift_never_mixed_into_reconcilable_subset(self):
+        # Even though a foreign Ingress ALSO happens to have a "wrong" host (irrelevant once ownership itself is foreign), only the ownership reason is ever recorded -- this module never inspects/reports field-level drift on an object it does not own.
+        cluster = FakeCluster()
+        _populate_healthy_cluster(cluster)
+        foreign = _correct_ingress_obj()
+        foreign["metadata"]["labels"] = {}
+        foreign["spec"]["rules"][0]["host"] = "totally-different.example.com"
+        cluster.put("ingress", argocd_state.INGRESS_NAME, NAMESPACE, foreign)
+        result = _classify(cluster, ingress_values=INGRESS_VALUES_ENABLED)
+        self.assertEqual(result["state"], argocd_state.STATE_BROKEN)
+        self.assertEqual(len(result["reasons"]), 1)
+        self.assertIn("foreign/ambiguous ownership", result["reasons"][0])
+
+    def test_A5_four_missing_repository_secrets_plus_missing_ingress_is_reconcilable(self):
+        cluster = FakeCluster()
+        _populate_healthy_cluster(cluster)
+        for secret_name in argocd_state.REQUIRED_REPO_SECRETS:
+            cluster.objects.pop(("secret", secret_name, NAMESPACE))
+        result = _classify(cluster, ingress_values=INGRESS_VALUES_ENABLED)
+        self.assertEqual(result["state"], argocd_state.STATE_RECONCILABLE)
+        self.assertEqual(len(result["reasons"]), 5)
+        self.assertTrue(any(f"ingress/{argocd_state.INGRESS_NAME}" in r for r in result["reasons"]))
+
+    def test_A6_repository_secret_drift_plus_missing_ingress_plus_unhealthy_core_is_broken(self):
+        cluster = FakeCluster()
+        _populate_healthy_cluster(cluster)
+        cluster.objects.pop(("secret", "argocd-ecr-goldengate-oci", NAMESPACE))
+        not_ready = _ready_replicaset_like("argocd-repo-server")
+        not_ready["status"]["readyReplicas"] = 0
+        cluster.put("deployment", "argocd-repo-server", NAMESPACE, not_ready)
+        result = _classify(cluster, ingress_values=INGRESS_VALUES_ENABLED)
+        self.assertEqual(result["state"], argocd_state.STATE_BROKEN)
+        self.assertTrue(any("deployment/argocd-repo-server not ready" in r for r in result["reasons"]))
+
+    def test_A7_wrong_canonical_host_group_certificate_are_each_detected(self):
+        cluster = FakeCluster()
+        _populate_healthy_cluster(cluster)
+
+        wrong_host = _correct_ingress_obj()
+        wrong_host["spec"]["rules"][0]["host"] = "wrong-host.example.com"
+        cluster.put("ingress", argocd_state.INGRESS_NAME, NAMESPACE, wrong_host)
+        result = _classify(cluster, ingress_values=INGRESS_VALUES_ENABLED)
+        self.assertEqual(result["state"], argocd_state.STATE_RECONCILABLE)
+        self.assertTrue(any("spec.rules[0].host" in r for r in result["reasons"]))
+
+        wrong_group = _correct_ingress_obj()
+        wrong_group["metadata"]["annotations"]["alb.ingress.kubernetes.io/group.name"] = "wrong-group"
+        cluster.put("ingress", argocd_state.INGRESS_NAME, NAMESPACE, wrong_group)
+        result = _classify(cluster, ingress_values=INGRESS_VALUES_ENABLED)
+        self.assertEqual(result["state"], argocd_state.STATE_RECONCILABLE)
+        self.assertTrue(any("group.name" in r for r in result["reasons"]))
+
+        wrong_cert = _correct_ingress_obj()
+        wrong_cert["metadata"]["annotations"]["alb.ingress.kubernetes.io/certificate-arn"] = "arn:aws:acm:eu-west-1:000000000000:certificate/wrong"
+        cluster.put("ingress", argocd_state.INGRESS_NAME, NAMESPACE, wrong_cert)
+        result = _classify(cluster, ingress_values=INGRESS_VALUES_ENABLED)
+        self.assertEqual(result["state"], argocd_state.STATE_RECONCILABLE)
+        self.assertTrue(any("certificate-arn" in r for r in result["reasons"]))
+
+    def test_A8_final_state_cannot_be_healthy_while_desired_ingress_is_missing(self):
+        cluster = FakeCluster()
+        _populate_healthy_cluster(cluster)
+        result = _classify(cluster, ingress_values=INGRESS_VALUES_ENABLED)
+        self.assertNotEqual(result["state"], argocd_state.STATE_HEALTHY)
+
+    def test_A9_no_load_balancer_address_after_reconciliation_window_is_reconcilable_not_healthy(self):
+        # Correct Ingress spec/annotations but the AWS Load Balancer Controller has not yet published status.loadBalancer.ingress -- never falsely reported HEALTHY; classifies RECONCILABLE so 20-sub-argocd.yaml's own bounded wait gets a chance, but MAIN's final validate_argocd_ready step still requires the classifier to independently confirm HEALTHY afterward (never assumed from "reconciliation succeeded").
+        cluster = FakeCluster()
+        _populate_healthy_cluster(cluster)
+        not_provisioned = _correct_ingress_obj()
+        not_provisioned["status"] = {"loadBalancer": {}}
+        cluster.put("ingress", argocd_state.INGRESS_NAME, NAMESPACE, not_provisioned)
+        result = _classify(cluster, ingress_values=INGRESS_VALUES_ENABLED)
+        self.assertEqual(result["state"], argocd_state.STATE_RECONCILABLE)
+        self.assertNotEqual(result["state"], argocd_state.STATE_HEALTHY)
+        self.assertTrue(any("status.loadBalancer.ingress is empty" in r for r in result["reasons"]))
+
+    def test_A9b_missing_load_balancer_status_key_entirely_is_also_reconcilable(self):
+        cluster = FakeCluster()
+        _populate_healthy_cluster(cluster)
+        no_status = _correct_ingress_obj()
+        del no_status["status"]
+        cluster.put("ingress", argocd_state.INGRESS_NAME, NAMESPACE, no_status)
+        result = _classify(cluster, ingress_values=INGRESS_VALUES_ENABLED)
+        self.assertEqual(result["state"], argocd_state.STATE_RECONCILABLE)
+
+    def test_A10_classifier_contract_marker_is_v2(self):
+        self.assertEqual(argocd_state.CLASSIFIER_CONTRACT, "argocd-recovery-v2")
+
+    def test_shared_mode_never_expects_or_flags_absence_of_scheme_annotation(self):
+        # A shared-mode Ingress must NOT carry alb.ingress.kubernetes.io/scheme at all (it would collide with the resident anchor's own value) -- absence there is correct, never drift.
+        cluster = FakeCluster()
+        _populate_healthy_cluster(cluster)
+        shared_ingress = _correct_ingress_obj()
+        del shared_ingress["metadata"]["annotations"]["alb.ingress.kubernetes.io/scheme"]
+        cluster.put("ingress", argocd_state.INGRESS_NAME, NAMESPACE, shared_ingress)
+        shared_values = dict(INGRESS_VALUES_ENABLED)
+        shared_values["mode"] = "shared"
+        result = _classify(cluster, ingress_values=shared_values)
+        self.assertEqual(result["state"], argocd_state.STATE_HEALTHY)
+
+    def test_backend_service_name_and_port_drift_are_each_detected(self):
+        cluster = FakeCluster()
+        _populate_healthy_cluster(cluster)
+        wrong_backend = _correct_ingress_obj()
+        wrong_backend["spec"]["rules"][0]["http"]["paths"][0]["backend"]["service"]["name"] = "some-other-service"
+        cluster.put("ingress", argocd_state.INGRESS_NAME, NAMESPACE, wrong_backend)
+        result = _classify(cluster, ingress_values=INGRESS_VALUES_ENABLED)
+        self.assertEqual(result["state"], argocd_state.STATE_RECONCILABLE)
+        self.assertTrue(any("backend service name" in r for r in result["reasons"]))
+
+        wrong_port = _correct_ingress_obj()
+        wrong_port["spec"]["rules"][0]["http"]["paths"][0]["backend"]["service"]["port"]["number"] = 8080
+        cluster.put("ingress", argocd_state.INGRESS_NAME, NAMESPACE, wrong_port)
+        result = _classify(cluster, ingress_values=INGRESS_VALUES_ENABLED)
+        self.assertEqual(result["state"], argocd_state.STATE_RECONCILABLE)
+        self.assertTrue(any("backend service port" in r for r in result["reasons"]))
+
+    def test_ingress_config_from_values_reads_the_real_committed_dev_file(self):
+        config = argocd_state.ingress_config_from_values("dev")
+        self.assertTrue(config.get("enabled"))
+        self.assertEqual(config.get("mode"), "standalone")
+        self.assertEqual(config.get("scheme"), "internal")
+        self.assertEqual(config.get("groupOrder"), "50")
 
 
 class ArgoCdStateNoMutationSourceSweepTests(unittest.TestCase):
@@ -378,7 +588,8 @@ class ArgoCdStateNoMutationSourceSweepTests(unittest.TestCase):
         # KubectlRunner itself only ever receives ["get", ...] argument lists from _get_json -- proven behaviorally above (FakeCluster asserts args[0] == "get" on every call across all scenarios), not merely by source inspection.
         cluster = FakeCluster()
         _populate_healthy_cluster(cluster)
-        _classify(cluster, ingress_enabled=True)  # exercises every _get_json call site, including ingress
+        cluster.put("ingress", argocd_state.INGRESS_NAME, NAMESPACE, _correct_ingress_obj())
+        _classify(cluster, ingress_values=INGRESS_VALUES_ENABLED)  # exercises every _get_json call site, including ingress
 
 
 if __name__ == "__main__":

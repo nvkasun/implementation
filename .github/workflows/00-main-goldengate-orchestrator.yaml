@@ -507,7 +507,7 @@ jobs:
 
           # Live Argo Self-Recovery Fix: a stable compatibility marker, checked before the state value is ever trusted -- guards against this orchestrator being paired with a version-skewed hack/orchestration/argocd_state.py (for example an older copy that predates RECONCILABLE), never itself the operational recovery path for repository Secret drift.
           CONTRACT="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("contract", ""))' <<< "$CLASSIFIER_OUTPUT")"
-          EXPECTED_CONTRACT="argocd-recovery-v1"
+          EXPECTED_CONTRACT="argocd-recovery-v2"
           if [ "$CONTRACT" != "$EXPECTED_CONTRACT" ]; then
             echo "FAIL: the Argo CD classifier's contract marker is '${CONTRACT}', expected '${EXPECTED_CONTRACT}'. hack/orchestration/argocd_state.py and this orchestrator have drifted out of sync -- fix the version skew, this is never the operational recovery path for repository Secret drift."
             exit 1
@@ -655,7 +655,7 @@ jobs:
 
           # Live Argo Self-Recovery Fix: same compatibility guard as argocd_preflight's own classify step -- checked before the state value is trusted here too.
           CONTRACT="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("contract", ""))' <<< "$CLASSIFIER_OUTPUT")"
-          EXPECTED_CONTRACT="argocd-recovery-v1"
+          EXPECTED_CONTRACT="argocd-recovery-v2"
           if [ "$CONTRACT" != "$EXPECTED_CONTRACT" ]; then
             echo "FAIL: the Argo CD classifier's contract marker is '${CONTRACT}', expected '${EXPECTED_CONTRACT}'. hack/orchestration/argocd_state.py and this orchestrator have drifted out of sync -- fix the version skew."
             exit 1

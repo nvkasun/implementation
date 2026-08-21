@@ -6,6 +6,15 @@ ecrTokenSync:
   enabled: false
   repositories: []
 
-# Structural toggle, disabled by default; environments that need to expose the Argo CD UI on the shared internal ALB enable it and supply hostname/ALB group/certificate in their own values.yaml overlay.
+# Structural toggle, disabled by default; environments that need to expose the Argo CD UI on the shared internal ALB enable it and supply hostname/ALB group/certificate in their own values.yaml overlay. mode: shared -> join an existing ALB group (app/group-level annotations only); standalone -> the resident/anchor Ingress that owns the ALB-level/exclusive configuration (it may still set group.name so future shared GoldenGate runtime/monitor Ingresses can join the same IngressGroup) -- same conceptual mode contract already established by helm/goldengate's ingress.mode and helm/goldengate-monitor's ingress.mode, never a third, unrelated annotation model. Library defaults only, not meant to be deployed as-is: environment values files are expected to fully override this block.
 argocdServerIngress:
   enabled: false
+  mode: shared
+  # Standalone-mode-only fields (never emitted in shared mode). scheme is the one exclusive ALB annotation with a known, safe, corporate-environment-wide constant (internal); the rest are intentionally empty so the AWS Load Balancer Controller continues to auto-discover them per the existing corporate EKS/network setup -- never fabricated subnet/security-group/CIDR identities.
+  scheme: internal
+  sslPolicy: ""
+  sslRedirect: ""
+  subnets: ""
+  securityGroups: ""
+  inboundCidrs: ""
+  loadBalancerAttributes: ""

@@ -1,6 +1,26 @@
 {{- if and .Values.argocdServerIngress .Values.argocdServerIngress.enabled }}
+{{- if not (or (eq .Values.argocdServerIngress.mode "shared") (eq .Values.argocdServerIngress.mode "standalone")) }}
+{{- fail (printf "argocdServerIngress.mode must be either \"shared\" or \"standalone\", got %q" .Values.argocdServerIngress.mode) }}
+{{- end }}
+{{- if not .Values.argocdServerIngress.host }}
+{{- fail "argocdServerIngress.host cannot be empty when argocdServerIngress.enabled=true." }}
+{{- end }}
+{{- if not .Values.argocdServerIngress.groupName }}
+{{- fail "argocdServerIngress.groupName cannot be empty when argocdServerIngress.enabled=true -- every GoldenGate/Argo Ingress in this architecture joins a named ALB IngressGroup, including the resident standalone anchor." }}
+{{- end }}
 {{- if and (contains "HTTPS" (.Values.argocdServerIngress.listenPorts | default "")) (not .Values.argocdServerIngress.certificateArn) }}
 {{- fail "argocdServerIngress.certificateArn is required when the HTTPS listener is enabled (argocdServerIngress.listenPorts contains HTTPS). Even in shared mode, the ALB Controller resolves the certificate per-Ingress via host-based discovery unless certificate-arn is set explicitly." }}
+{{- end }}
+{{- if eq .Values.argocdServerIngress.mode "standalone" }}
+{{- if not .Values.argocdServerIngress.scheme }}
+{{- fail "argocdServerIngress.scheme cannot be empty when argocdServerIngress.mode=standalone -- the resident/anchor Ingress must explicitly own the ALB scheme (internal)." }}
+{{- end }}
+{{- end }}
+{{- if and .Values.argocdServerIngress.ingressClassName (ne .Values.argocdServerIngress.ingressClassName "alb") }}
+{{- fail (printf "argocdServerIngress.ingressClassName must be \"alb\", got %q" .Values.argocdServerIngress.ingressClassName) }}
+{{- end }}
+{{- if and .Values.argocdServerIngress.targetType (ne .Values.argocdServerIngress.targetType "ip") }}
+{{- fail (printf "argocdServerIngress.targetType must be \"ip\" (the argocd-server Service is ClusterIP), got %q" .Values.argocdServerIngress.targetType) }}
 {{- end }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -12,7 +32,7 @@ metadata:
     app.kubernetes.io/part-of: argocd
     app.kubernetes.io/managed-by: {{ .Release.Service }}
   annotations:
-    # This Ingress joins the existing shared GoldenGate ALB group; only per-Ingress/TargetGroup annotations are set here -- ALB-level annotations are intentionally omitted (owned by the resident Ingress; repeating them causes a conflicting-attribute error).
+    # Application/group-level annotations, safe regardless of mode: every Ingress in this ALB IngressGroup must agree on these -- same contract as helm/goldengate/templates/runtime-ingress.yaml and helm/goldengate-monitor/templates/ingress.yaml.
     alb.ingress.kubernetes.io/backend-protocol: {{ .Values.argocdServerIngress.backendProtocol | quote }}
     alb.ingress.kubernetes.io/healthcheck-protocol: {{ .Values.argocdServerIngress.healthcheckProtocol | quote }}
     alb.ingress.kubernetes.io/healthcheck-port: {{ .Values.argocdServerIngress.healthcheckPort | quote }}
@@ -34,6 +54,28 @@ metadata:
 {{- if .Values.argocdServerIngress.targetType }}
     # Required in shared mode too: the argocd-server Service is ClusterIP, so without target-type=ip the controller defaults to instance mode.
     alb.ingress.kubernetes.io/target-type: {{ .Values.argocdServerIngress.targetType | quote }}
+{{- end }}
+{{- if eq .Values.argocdServerIngress.mode "standalone" }}
+    # ALB-level/exclusive annotations, only emitted in standalone mode: a future joining shared-mode Ingress must NOT repeat these or the controller fails IngressGroup model reconciliation. This Ingress is the resident/anchor of the shared GoldenGate internal ALB on a fresh cluster (no runtime/monitor Ingress is resident yet).
+    alb.ingress.kubernetes.io/scheme: {{ .Values.argocdServerIngress.scheme | quote }}
+{{- if .Values.argocdServerIngress.sslPolicy }}
+    alb.ingress.kubernetes.io/ssl-policy: {{ .Values.argocdServerIngress.sslPolicy | quote }}
+{{- end }}
+{{- if .Values.argocdServerIngress.sslRedirect }}
+    alb.ingress.kubernetes.io/ssl-redirect: {{ .Values.argocdServerIngress.sslRedirect | quote }}
+{{- end }}
+{{- if .Values.argocdServerIngress.subnets }}
+    alb.ingress.kubernetes.io/subnets: {{ .Values.argocdServerIngress.subnets | quote }}
+{{- end }}
+{{- if .Values.argocdServerIngress.securityGroups }}
+    alb.ingress.kubernetes.io/security-groups: {{ .Values.argocdServerIngress.securityGroups | quote }}
+{{- end }}
+{{- if .Values.argocdServerIngress.inboundCidrs }}
+    alb.ingress.kubernetes.io/inbound-cidrs: {{ .Values.argocdServerIngress.inboundCidrs | quote }}
+{{- end }}
+{{- if .Values.argocdServerIngress.loadBalancerAttributes }}
+    alb.ingress.kubernetes.io/load-balancer-attributes: {{ .Values.argocdServerIngress.loadBalancerAttributes | quote }}
+{{- end }}
 {{- end }}
 spec:
   ingressClassName: {{ .Values.argocdServerIngress.ingressClassName | default "alb" }}

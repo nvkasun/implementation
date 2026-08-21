@@ -83,9 +83,10 @@ ecrTokenSync:
     tag: "1.33.13"
     pullPolicy: Always # tag was just re-mirrored in ECR; avoid reusing a stale cached image
 
-# Exposes the Argo CD UI on the same shared internal ALB/wildcard DNS as GoldenGate's ingress; listenPorts must match that ALB's existing listener exactly. host/groupName/certificateArn are shared environment identity, injected by the deploy workflow from envs/dev/environment.yaml.
+# Exposes the Argo CD UI on the GoldenGate shared internal ALB/wildcard DNS; listenPorts declares this Ingress's own HTTPS listener. host/groupName/certificateArn are shared environment identity, injected by the deploy workflow from envs/dev/environment.yaml. Fresh-cluster bootstrap: mode=standalone -- Argo CD is the first permanent application-layer service MAIN deploys (runtime lifecycle.state remains absent and the monitor Ingress remains disabled), so no other Ingress yet exists to anchor the shared ALB. Argo CD's own Ingress is therefore the resident/anchor owner of the ALB-level/exclusive configuration (scheme below) until a future GoldenGate runtime or monitor Ingress joins this same groupName in shared mode.
 argocdServerIngress:
-  enabled: false
+  enabled: true
+  mode: standalone
   ingressClassName: alb
   serviceName: argocd-server
   servicePort: 443
@@ -96,3 +97,5 @@ argocdServerIngress:
   healthcheckProtocol: HTTPS
   healthcheckPath: /healthz
   healthcheckPort: traffic-port
+  # standalone-mode-only: scheme is the one exclusive ALB annotation with a known, safe, corporate-environment-wide constant. sslPolicy/subnets/securityGroups/inboundCidrs/loadBalancerAttributes are intentionally NOT set here -- the AWS Load Balancer Controller continues to auto-discover them per the existing corporate EKS/network setup (helm/argocd/values.yaml's own base defaults already leave them empty); never fabricate subnet IDs, security-group IDs, or CIDRs.
+  scheme: internal

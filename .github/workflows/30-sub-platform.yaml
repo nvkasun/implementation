@@ -444,28 +444,16 @@ jobs:
             printf '%s' "$value"
           }
 
-          echo "Validating exactly one Namespace document..."
-          NAMESPACE_COUNT="$(grep -c '^kind: Namespace$' "$RENDERED")"
-          if [ "$NAMESPACE_COUNT" -ne 1 ]; then
-            echo "FAIL: expected exactly 1 rendered Namespace document, found ${NAMESPACE_COUNT}."
+          # Fresh-Cluster Platform + Argo Ingress Self-Recovery Fix: the runtime namespace is owned exclusively by the Argo CD Application's own CreateNamespace=true + syncPolicy.managedNamespaceMetadata (see "Create or update Argo CD Application" below) -- namespaces.runtime.create stays false (helm/goldengate-platform/values.yaml's own default, restored explicitly in platform/dev/goldengate-platform/values.yaml), so this chart must render ZERO Namespace documents, never exactly one. A bare `grep -c` would itself abort this script under set -euo pipefail on the expected zero-match case (grep exits 1 when it finds no match), so the count is taken via awk instead, which always exits 0 and always prints a number.
+          echo "Validating ZERO rendered Namespace documents (namespace metadata ownership belongs exclusively to the Argo CD Application, never to this chart)..."
+          NAMESPACE_COUNT="$(awk '/^kind: Namespace$/{c++} END{print c+0}' "$RENDERED")"
+          if [ "$NAMESPACE_COUNT" -ne 0 ]; then
+            echo "FAIL: expected ZERO rendered Namespace documents (namespaces.runtime.create must stay false), found ${NAMESPACE_COUNT}."
             exit 1
           fi
+          echo "OK: zero Namespace documents rendered -- the Argo CD Application remains the sole namespace-metadata owner."
 
-          RUNTIME_NS_BLOCK="$(select_document "$RENDERED" "Namespace" "${RUNTIME_NAMESPACE}")"
-          if [ -z "$RUNTIME_NS_BLOCK" ]; then
-            echo "FAIL: rendered Namespace ${RUNTIME_NAMESPACE} was not found."
-            exit 1
-          fi
-          echo "OK: exactly 1 Namespace document, ${RUNTIME_NAMESPACE}."
-
-          echo "Validating the shared namespace carries no per-runtime ownership label..."
-          if grep -Fq -- "goldengate.adcb/deployment-id" <<< "$RUNTIME_NS_BLOCK"; then
-            echo "FAIL: Namespace ${RUNTIME_NAMESPACE} carries a per-runtime ownership label (goldengate.adcb/deployment-id)."
-            exit 1
-          fi
-          echo "OK: no per-runtime ownership label on the shared namespace."
-
-          # Shared objects must be protected via Prune=false,Delete=false -- PruneLast=true alone only affects prune *ordering*, it does not make an object unprunable/undeletable.
+          # Shared objects that ARE still rendered (the deletion-protected runtime ServiceAccount below) must be protected via Prune=false,Delete=false -- PruneLast=true alone only affects prune *ordering*, it does not make an object unprunable/undeletable.
           assert_deletion_protected() {
             local kind="$1"
             local block="$2"
@@ -479,8 +467,6 @@ jobs:
             fi
             echo "OK: ${kind} carries sync-options: Prune=false,Delete=false (not merely PruneLast=true)."
           }
-
-          assert_deletion_protected "Namespace ${RUNTIME_NAMESPACE}" "$RUNTIME_NS_BLOCK"
 
           # No fixed total ServiceAccount count: unrelated platform ServiceAccounts may exist; validate each approved identity by expected name and annotation instead.
           count_serviceaccount_documents() {

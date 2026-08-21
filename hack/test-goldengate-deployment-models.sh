@@ -4207,13 +4207,18 @@ echo "--- Live Network Fix 1: Argo ECR token-sync deterministic regional STS pat
 if [ "$HELM_AVAILABLE" = "true" ] && [ "$PYTHON_AVAILABLE" = "true" ] && [ -d "helm/argocd/charts/argo-cd" ]; then
   ECR_TOKEN_SYNC_ROLE_ARN="$(python3 "$ENVIRONMENT_TOOL" --environment dev get ARGOCD_ECR_READ_ROLE_ARN)"
   ECR_TOKEN_SYNC_ECR_REGISTRY="$(python3 "$ENVIRONMENT_TOOL" --environment dev get ECR_REGISTRY)"
+  RESOLVED_ARGOCD_HOST="$(python3 "$ENVIRONMENT_TOOL" --environment dev get ARGOCD_HOST)"
 
   set +e
+  # Fresh-Cluster Platform + Argo Ingress Self-Recovery Fix: envs/dev/argocd/values.yaml now has argocdServerIngress.enabled=true, so this render (which was never about the Ingress) must still supply the same host/group/certificate --set-string overrides 20-sub-argocd.yaml itself provides, or the chart's own fail-closed Ingress template guards correctly refuse to render an incomplete Ingress.
   helm template argocd-ecr-token-sync-check helm/argocd --namespace argocd \
     -f envs/dev/argocd/values.yaml \
     --set-string ecrTokenSync.roleArn="${ECR_TOKEN_SYNC_ROLE_ARN}" \
     --set-string ecrTokenSync.awsRegion="${RESOLVED_AWS_REGION}" \
     --set-string ecrTokenSync.ecrRegistry="${ECR_TOKEN_SYNC_ECR_REGISTRY}" \
+    --set-string argocdServerIngress.host="${RESOLVED_ARGOCD_HOST}" \
+    --set-string argocdServerIngress.groupName="${RESOLVED_ALB_GROUP_NAME}" \
+    --set-string argocdServerIngress.certificateArn="${RESOLVED_CERTIFICATE_ARN}" \
     >"${WORKDIR}/ecr-token-sync-render.yaml" 2>"${WORKDIR}/ecr-token-sync-render.err"
   ECR_TOKEN_SYNC_RENDER_STATUS=$?
   set -e
@@ -10929,7 +10934,7 @@ sys.exit(0)
 '''
 
 
-def run_step(script, state, contract="argocd-recovery-v1"):
+def run_step(script, state, contract="argocd-recovery-v2"):
     with tempfile.TemporaryDirectory() as tmp_dir:
         tool_dir = os.path.join(tmp_dir, "hack", "orchestration")
         os.makedirs(tool_dir)
@@ -12602,6 +12607,362 @@ if grep -qF "AWS_STS_REGIONAL_ENDPOINTS" helm/argocd/templates/ecr-token-sync-cr
   pass "O12: the regional STS configuration (AWS_REGION/AWS_DEFAULT_REGION/AWS_STS_REGIONAL_ENDPOINTS=regional) already established for the Argo ECR token-sync CronJob remains intact and unregressed"
 else
   fail "O12: the regional STS configuration in helm/argocd/templates/ecr-token-sync-cronjob.yaml appears to have regressed"
+fi
+
+echo ""
+echo "--- Fresh-Cluster Platform + Argo Ingress Self-Recovery Fix ---"
+
+# P1/P2/P3: real helm template render (never a fixture), using the ACTUAL committed platform/dev/goldengate-platform/values.yaml, proving ZERO rendered Namespace documents and that gg-runtime-sa/gg-fluent-bit still render correctly.
+if [ "$HELM_AVAILABLE" = "true" ] && [ -f platform/dev/goldengate-platform/values.yaml ]; then
+  set +e
+  PLATFORM_FRESH_RENDER="$(helm template goldengate-dev-platform helm/goldengate-platform \
+    --values platform/dev/goldengate-platform/values.yaml \
+    --set-string environment=dev \
+    --set-string namespaces.runtime.name=goldengate-dev \
+    --set-string runtimeServiceAccount.roleArn=arn:aws:iam::123456789012:role/test-runtime \
+    --set-string fluentBit.serviceAccount.roleArn=arn:aws:iam::123456789012:role/test-fluentbit \
+    --set-string fluentBit.aws.region=me-central-1 \
+    --set-string fluentBit.namespaces.runtime=goldengate-dev \
+    --set-string fluentBit.namespaces.monitoring=goldengate-monitoring \
+    --set-string fluentBit.cloudwatch.runtimeLogGroupName=/test/runtime \
+    --set-string fluentBit.cloudwatch.monitorLogGroupName=/test/monitor \
+    --set-string fluentBit.image.reference="123456789012.dkr.ecr.me-central-1.amazonaws.com/aws-cloud-factory-fluent-bit@sha256:$(printf 'a%.0s' $(seq 1 64))" \
+    2>&1)"
+  PLATFORM_FRESH_RENDER_STATUS=$?
+  set -e
+  # Here-strings (never `echo "$VAR" | grep -q ...`): a large rendered manifest piped into an early-exiting `grep -q` can trigger SIGPIPE against the upstream echo builtin under set -o pipefail, aborting the whole script -- the exact same pipe-safety class of bug this task's own Platform fix corrects for `grep -c`.
+  P_NS_COUNT="$(awk '/^kind: Namespace$/{c++} END{print c+0}' <<< "$PLATFORM_FRESH_RENDER")"
+  P_SA_COUNT="$(awk '/^kind: ServiceAccount$/{c++} END{print c+0}' <<< "$PLATFORM_FRESH_RENDER")"
+  if [ "$PLATFORM_FRESH_RENDER_STATUS" -eq 0 ] && [ "$P_NS_COUNT" -eq 0 ] && [ "$P_SA_COUNT" -eq 2 ] \
+    && grep -qF "name: gg-runtime-sa" <<< "$PLATFORM_FRESH_RENDER" \
+    && grep -qF "name: gg-fluent-bit" <<< "$PLATFORM_FRESH_RENDER"; then
+    pass "P1/P2/P3: real helm template of the real committed platform/dev/goldengate-platform/values.yaml renders ZERO Namespace documents and exactly the two expected ServiceAccounts (gg-runtime-sa, gg-fluent-bit)"
+  else
+    fail "P1/P2/P3: platform chart render did not match expectations (status=${PLATFORM_FRESH_RENDER_STATUS}, namespaces=${P_NS_COUNT}, serviceaccounts=${P_SA_COUNT}):"$'\n'"${PLATFORM_FRESH_RENDER}"
+  fi
+else
+  skip "P1/P2/P3: platform render proof -- helm unavailable or platform/dev/goldengate-platform/values.yaml missing"
+fi
+
+# P1/P2 (workflow-level): REALLY EXECUTE the committed "Validate rendered platform manifest" step (never a reimplementation) against the real render above, proving the ZERO-Namespace count is taken safely under set -euo pipefail (never a bare `grep -c` whose zero-match exit status would abort the script) and that every other existing check (deletion-protected ServiceAccount, Fluent Bit shape/image/ConfigMap routing) still passes end to end.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ "$HELM_AVAILABLE" = "true" ] && [ -f "$PLATFORM_WORKFLOW" ]; then
+  set +e
+  PLATFORM_VALIDATE_SCRIPT_OUT="$(python3 - "$PLATFORM_WORKFLOW" <<'PYEOF'
+import os
+import subprocess
+import sys
+import tempfile
+
+import yaml
+
+workflow_path = sys.argv[1]
+with open(workflow_path) as f:
+    doc = yaml.safe_load(f)
+
+steps = doc["jobs"]["package_publish_and_deploy"]["steps"]
+by_name = {s.get("name"): s for s in steps}
+script = by_name["Validate rendered platform manifest"]["run"]
+
+repo_root = os.getcwd()
+sandbox = tempfile.mkdtemp(prefix="platform-render-proof-")
+try:
+    fluent_bit_image = "123456789012.dkr.ecr.me-central-1.amazonaws.com/aws-cloud-factory-fluent-bit@sha256:" + "a" * 64
+    render_cmd = [
+        "helm", "template", "goldengate-dev-platform", os.path.join(repo_root, "helm", "goldengate-platform"),
+        "--values", os.path.join(repo_root, "platform", "dev", "goldengate-platform", "values.yaml"),
+        "--set-string", "environment=dev",
+        "--set-string", "namespaces.runtime.name=goldengate-dev",
+        "--set-string", "runtimeServiceAccount.roleArn=arn:aws:iam::123456789012:role/test-runtime",
+        "--set-string", "fluentBit.serviceAccount.roleArn=arn:aws:iam::123456789012:role/test-fluentbit",
+        "--set-string", "fluentBit.aws.region=me-central-1",
+        "--set-string", "fluentBit.namespaces.runtime=goldengate-dev",
+        "--set-string", "fluentBit.namespaces.monitoring=goldengate-monitoring",
+        "--set-string", "fluentBit.cloudwatch.runtimeLogGroupName=/test/runtime",
+        "--set-string", "fluentBit.cloudwatch.monitorLogGroupName=/test/monitor",
+        "--set-string", f"fluentBit.image.reference={fluent_bit_image}",
+    ]
+    render_proc = subprocess.run(render_cmd, capture_output=True, text=True, timeout=60)
+    if render_proc.returncode != 0:
+        print(f"FAIL: helm template itself failed: {render_proc.stderr}")
+        sys.exit(1)
+
+    rendered_dir = os.path.join(sandbox, "rendered")
+    os.makedirs(rendered_dir)
+    with open(os.path.join(rendered_dir, "goldengate-dev-platform.yaml"), "w") as f:
+        f.write(render_proc.stdout)
+
+    env = dict(os.environ)
+    env.update({
+        "RELEASE_NAME": "goldengate-dev-platform",
+        "RUNTIME_NAMESPACE": "goldengate-dev",
+        "MONITOR_NAMESPACE": "goldengate-monitoring",
+        "RUNTIME_SA_NAME": "gg-runtime-sa",
+        "FLUENT_BIT_SA_NAME": "gg-fluent-bit",
+        "RUNTIME_ROLE_ARN": "arn:aws:iam::123456789012:role/test-runtime",
+        "PLATFORM_LOGGING_ROLE_ARN": "arn:aws:iam::123456789012:role/test-fluentbit",
+        "FLUENT_BIT_IMAGE": fluent_bit_image,
+        "RUNTIME_LOG_GROUP": "/test/runtime",
+        "MONITOR_LOG_GROUP": "/test/monitor",
+        "HELM_CHART_PATH": os.path.join(repo_root, "helm", "goldengate-platform"),
+    })
+    proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, cwd=sandbox, timeout=60)
+    if proc.returncode != 0:
+        print(f"FAIL: the real 'Validate rendered platform manifest' step exited {proc.returncode} against the real render:\n{proc.stdout}\n{proc.stderr}")
+        sys.exit(1)
+    if "Validating ZERO rendered Namespace documents" not in proc.stdout:
+        print("FAIL: the step's own zero-Namespace validation message was not observed -- possibly the wrong script was extracted.")
+        sys.exit(1)
+    if "OK: rendered platform manifest passed all checks." not in proc.stdout:
+        print(f"FAIL: the step did not reach its own final success line:\n{proc.stdout}")
+        sys.exit(1)
+    print("OK")
+finally:
+    import shutil
+    shutil.rmtree(sandbox, ignore_errors=True)
+PYEOF
+)"
+  PLATFORM_VALIDATE_SCRIPT_STATUS=$?
+  set -e
+  if [ "$PLATFORM_VALIDATE_SCRIPT_STATUS" -eq 0 ] && [ "$PLATFORM_VALIDATE_SCRIPT_OUT" = "OK" ]; then
+    pass "P1/P2: the REAL committed 'Validate rendered platform manifest' step, executed against a real helm template render of the real committed values, safely counts ZERO Namespace documents (never aborting under set -euo pipefail on the expected zero-match case) and passes every other existing check end to end"
+  else
+    fail "P1/P2: real script-execution proof of 'Validate rendered platform manifest' failed:"$'\n'"${PLATFORM_VALIDATE_SCRIPT_OUT}"
+  fi
+else
+  skip "P1/P2: real script-execution proof of 'Validate rendered platform manifest' -- python3/helm unavailable or ${PLATFORM_WORKFLOW} missing"
+fi
+
+# P4: the Argo CD Application in 30-sub-platform.yaml still carries CreateNamespace=true + managedNamespaceMetadata (app.kubernetes.io/managed-by: argocd) as the sole authoritative namespace-metadata owner -- unchanged by this fix.
+if grep -qF "CreateNamespace=true" "$PLATFORM_WORKFLOW" 2>/dev/null && grep -qF "managedNamespaceMetadata:" "$PLATFORM_WORKFLOW" 2>/dev/null && grep -qF "app.kubernetes.io/managed-by: argocd" "$PLATFORM_WORKFLOW" 2>/dev/null; then
+  pass "P4: 30-sub-platform.yaml's Argo CD Application retains CreateNamespace=true + managedNamespaceMetadata (app.kubernetes.io/managed-by: argocd) as the sole authoritative namespace-metadata owner"
+else
+  fail "P4: 30-sub-platform.yaml no longer carries the expected CreateNamespace=true + managedNamespaceMetadata Argo CD ownership contract"
+fi
+
+# P5/P6/P7: platform_state.py's own offline test suite (already re-run in full as part of the Phase B2 section above) already proves the exact managed-by=Helm RECONCILABLE fixture, the exact HEALTHY convergence requirement, and Terminating/unrelated-structural-drift BROKEN -- confirmed here via direct re-invocation of the three specific tests this fix's own P1/P3/P5/Terminating scenarios map onto, so a regression in just this fix's own contract is caught even if the broader suite is skipped for some other reason.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f hack/test-goldengate-platform-state.py ]; then
+  if PLATFORM_RECOVERY_TEST_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 hack/test-goldengate-platform-state.py -v \
+      PlatformStateReconcilableTests.test_P1_exact_live_incident_managed_by_helm_all_else_healthy_is_reconcilable \
+      PlatformStateReconcilableTests.test_P3_namespace_metadata_drift_plus_one_unsafe_component_is_broken \
+      PlatformStateReconcilableTests.test_terminating_namespace_alone_is_broken_never_reconcilable \
+    2>&1)"; then
+    pass "P5/P7: platform_state.py's managed-by=Helm-alone RECONCILABLE fixture, mixed-drift BROKEN fixture, and Terminating-namespace BROKEN fixture all pass directly (re-confirmed, not merely inherited from the broader Phase B2 run)"
+  else
+    fail "P5/P7: direct re-invocation of the platform RECONCILABLE-contract tests failed:"$'\n'"${PLATFORM_RECOVERY_TEST_OUT}"
+  fi
+else
+  skip "P5/P7: direct platform RECONCILABLE-contract re-invocation -- python3 unavailable or test file missing"
+fi
+
+# --- Argo Ingress: helm lint/template proofs against the real committed envs/dev/argocd/values.yaml, exactly the --set-string values 20-sub-argocd.yaml itself injects. ---
+if [ "$HELM_AVAILABLE" = "true" ] && [ -f envs/dev/argocd/values.yaml ]; then
+  ARGO_SET_ARGS=(
+    --set-string argo-cd.global.image.repository=229410149234.dkr.ecr.eu-west-1.amazonaws.com/aws-cloud-factory-infra-argocd
+    --set-string argo-cd.redis.image.repository=229410149234.dkr.ecr.eu-west-1.amazonaws.com/aws-cloud-factory-infra-redis-alpine
+    --set-string ecrTokenSync.roleArn=arn:aws:iam::668311715351:role/GoldenGateArgocdECRRead-dev
+    --set-string ecrTokenSync.awsRegion=eu-west-1
+    --set-string ecrTokenSync.ecrRegistry=229410149234.dkr.ecr.eu-west-1.amazonaws.com
+    --set-string ecrTokenSync.image.repository=229410149234.dkr.ecr.eu-west-1.amazonaws.com/aws-cloud-factory-infra-aws-kubectl
+    --set-string argocdServerIngress.host=argocd.goldengate-dev.adcbmis.local
+    --set-string argocdServerIngress.groupName=gg-poc-dev-alb
+    --set-string argocdServerIngress.certificateArn=arn:aws:acm:eu-west-1:668311715351:certificate/9e53e28e-3243-47fc-85a1-50f9a94acde7
+  )
+
+  set +e
+  ARGO_LINT_OUT="$(helm lint helm/argocd --values envs/dev/argocd/values.yaml "${ARGO_SET_ARGS[@]}" 2>&1)"
+  ARGO_LINT_STATUS=$?
+  set -e
+  if [ "$ARGO_LINT_STATUS" -eq 0 ]; then
+    pass "helm lint helm/argocd passes with the real committed envs/dev/argocd/values.yaml and the real workflow --set-string values"
+  else
+    fail "helm lint helm/argocd failed:"$'\n'"${ARGO_LINT_OUT}"
+  fi
+
+  set +e
+  ARGO_RENDER_OUT="$(helm template argocd helm/argocd --namespace argocd --values envs/dev/argocd/values.yaml "${ARGO_SET_ARGS[@]}" 2>&1)"
+  ARGO_RENDER_STATUS=$?
+  set -e
+  # Here-strings (never `echo "$VAR" | grep -q ...`): a large rendered manifest piped into an early-exiting `grep -q` can trigger SIGPIPE against the upstream echo builtin under set -o pipefail, aborting the whole script.
+  ARGO_INGRESS_COUNT="$(awk '/^kind: Ingress$/{c++} END{print c+0}' <<< "$ARGO_RENDER_OUT")"
+  if [ "$ARGO_RENDER_STATUS" -eq 0 ] && [ "$ARGO_INGRESS_COUNT" -eq 1 ] \
+    && grep -qF 'name: argocd-server-ingress' <<< "$ARGO_RENDER_OUT" \
+    && grep -qF 'alb.ingress.kubernetes.io/scheme: "internal"' <<< "$ARGO_RENDER_OUT" \
+    && grep -qF 'host: "argocd.goldengate-dev.adcbmis.local"' <<< "$ARGO_RENDER_OUT" \
+    && grep -qF 'group.name: "gg-poc-dev-alb"' <<< "$ARGO_RENDER_OUT" \
+    && grep -qF 'name: argocd-server' <<< "$ARGO_RENDER_OUT" \
+    && grep -qF 'number: 443' <<< "$ARGO_RENDER_OUT"; then
+    pass "P9-P13/D-Ingress: real helm template of the real committed envs/dev/argocd/values.yaml (mode=standalone) renders exactly ONE resident argocd-server-ingress with scheme=internal, the canonical host/group/backend contract, and no fabricated subnet/security-group/CIDR identity"
+  else
+    fail "Argo CD Ingress render did not match the expected resident/anchor contract (status=${ARGO_RENDER_STATUS}, ingress_count=${ARGO_INGRESS_COUNT}):"$'\n'"${ARGO_RENDER_OUT}"
+  fi
+
+  # Proof no subnet/SG/CIDR was fabricated: the rendered manifest carries no subnets/security-groups/inbound-cidrs annotation at all, since envs/dev/argocd/values.yaml deliberately leaves them unset for AWS Load Balancer Controller auto-discovery.
+  if ! grep -qE 'alb\.ingress\.kubernetes\.io/(subnets|security-groups|inbound-cidrs):' <<< "$ARGO_RENDER_OUT"; then
+    pass "no fabricated subnet/security-group/CIDR annotation is rendered -- AWS Load Balancer Controller auto-discovery is preserved"
+  else
+    fail "an unexpected subnets/security-groups/inbound-cidrs annotation was rendered -- possible fabricated infrastructure identity"
+  fi
+
+  # Shared mode must never emit the standalone-exclusive scheme annotation (proves the mode contract is a real behavioral fork, not a cosmetic flag).
+  set +e
+  ARGO_SHARED_RENDER_OUT="$(helm template argocd helm/argocd --namespace argocd --values envs/dev/argocd/values.yaml "${ARGO_SET_ARGS[@]}" --set-string argocdServerIngress.mode=shared 2>&1)"
+  ARGO_SHARED_RENDER_STATUS=$?
+  set -e
+  if [ "$ARGO_SHARED_RENDER_STATUS" -eq 0 ] && ! grep -q 'alb.ingress.kubernetes.io/scheme:' <<< "$ARGO_SHARED_RENDER_OUT"; then
+    pass "argocdServerIngress.mode=shared never renders the standalone-exclusive scheme annotation, exactly matching helm/goldengate and helm/goldengate-monitor's own established mode contract"
+  else
+    fail "argocdServerIngress.mode=shared unexpectedly rendered a scheme annotation (status=${ARGO_SHARED_RENDER_STATUS})"
+  fi
+
+  # Fail-closed template validation: each new guard actually fires (never merely present in source but unreachable).
+  ARGO_NEG_BASE=(helm template argocd helm/argocd --namespace argocd --values envs/dev/argocd/values.yaml
+    --set-string argo-cd.global.image.repository=x --set-string argo-cd.redis.image.repository=x
+    --set-string ecrTokenSync.roleArn=x --set-string ecrTokenSync.awsRegion=x --set-string ecrTokenSync.ecrRegistry=x --set-string ecrTokenSync.image.repository=x
+    --set-string argocdServerIngress.host=argocd.example.com --set-string argocdServerIngress.groupName=grp --set-string argocdServerIngress.certificateArn=arn:aws:acm:x)
+
+  declare -a ARGO_NEG_CASES=(
+    "argocdServerIngress.mode=bogus|mode must be either"
+    "argocdServerIngress.host=|host cannot be empty"
+    "argocdServerIngress.groupName=|groupName cannot be empty"
+    "argocdServerIngress.scheme=|scheme cannot be empty"
+    "argocdServerIngress.ingressClassName=nginx|ingressClassName must be"
+    "argocdServerIngress.targetType=instance|targetType must be"
+    "argocdServerIngress.certificateArn=|certificateArn is required"
+  )
+  ARGO_NEG_ALL_OK="true"
+  for case in "${ARGO_NEG_CASES[@]}"; do
+    override="${case%%|*}"
+    expected_substring="${case##*|}"
+    set +e
+    NEG_OUT="$("${ARGO_NEG_BASE[@]}" --set-string "$override" 2>&1)"
+    NEG_STATUS=$?
+    set -e
+    if [ "$NEG_STATUS" -eq 0 ] || ! grep -qF "$expected_substring" <<< "$NEG_OUT"; then
+      ARGO_NEG_ALL_OK="false"
+      fail "Argo Ingress fail-closed guard for '${override}' did not fire as expected (status=${NEG_STATUS}, expected substring '${expected_substring}'):"$'\n'"${NEG_OUT}"
+    fi
+  done
+  if [ "$ARGO_NEG_ALL_OK" = "true" ]; then
+    pass "every new fail-closed argocd-server-ingress.yaml template guard (mode/host/groupName/scheme/ingressClassName/targetType/certificateArn) actually fires on the corresponding invalid value"
+  fi
+else
+  skip "Argo Ingress helm lint/template proofs -- helm unavailable or envs/dev/argocd/values.yaml missing"
+fi
+
+# 20-sub-argocd.yaml render-time Ingress validation: REALLY EXECUTE the committed "Validate rendered Argo CD server Ingress" step (never a reimplementation) against the real render above.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ "$HELM_AVAILABLE" = "true" ] && [ -f "$ARGOCD_DEPLOY_WORKFLOW" ]; then
+  set +e
+  ARGO_INGRESS_VALIDATE_OUT="$(python3 - "$ARGOCD_DEPLOY_WORKFLOW" <<'PYEOF'
+import os
+import subprocess
+import sys
+import tempfile
+
+import yaml
+
+workflow_path = sys.argv[1]
+with open(workflow_path) as f:
+    doc = yaml.safe_load(f)
+
+steps = doc["jobs"]["build_publish_and_deploy"]["steps"]
+by_name = {s.get("name"): s for s in steps}
+script = by_name["Validate rendered Argo CD server Ingress"]["run"]
+
+repo_root = os.getcwd()
+sandbox = tempfile.mkdtemp(prefix="argo-ingress-render-proof-")
+try:
+    set_args = [
+        "--set-string", "argo-cd.global.image.repository=x",
+        "--set-string", "argo-cd.redis.image.repository=x",
+        "--set-string", "ecrTokenSync.roleArn=x",
+        "--set-string", "ecrTokenSync.awsRegion=x",
+        "--set-string", "ecrTokenSync.ecrRegistry=x",
+        "--set-string", "ecrTokenSync.image.repository=x",
+        "--set-string", "argocdServerIngress.host=argocd.goldengate-dev.adcbmis.local",
+        "--set-string", "argocdServerIngress.groupName=gg-poc-dev-alb",
+        "--set-string", "argocdServerIngress.certificateArn=arn:aws:acm:eu-west-1:668311715351:certificate/9e53e28e-3243-47fc-85a1-50f9a94acde7",
+    ]
+    render_cmd = ["helm", "template", "argocd", os.path.join(repo_root, "helm", "argocd"),
+                  "--namespace", "argocd", "--values", os.path.join(repo_root, "envs", "dev", "argocd", "values.yaml")] + set_args
+    render_proc = subprocess.run(render_cmd, capture_output=True, text=True, timeout=60)
+    if render_proc.returncode != 0:
+        print(f"FAIL: helm template itself failed: {render_proc.stderr}")
+        sys.exit(1)
+
+    rendered_dir = os.path.join(sandbox, "rendered")
+    os.makedirs(rendered_dir)
+    with open(os.path.join(rendered_dir, "argocd.yaml"), "w") as f:
+        f.write(render_proc.stdout)
+
+    values_dir = os.path.join(sandbox, "envs", "dev", "argocd")
+    os.makedirs(values_dir)
+    with open(os.path.join(repo_root, "envs", "dev", "argocd", "values.yaml")) as f:
+        values_text = f.read()
+    with open(os.path.join(values_dir, "values.yaml"), "w") as f:
+        f.write(values_text)
+
+    env = dict(os.environ)
+    env.update({
+        "ARGOCD_RELEASE_NAME": "argocd",
+        "VALUES_FILE": "envs/dev/argocd/values.yaml",
+        "ARGOCD_NAMESPACE": "argocd",
+        "ARGOCD_HOST": "argocd.goldengate-dev.adcbmis.local",
+        "ALB_GROUP_NAME": "gg-poc-dev-alb",
+        "ACM_CERTIFICATE_ARN": "arn:aws:acm:eu-west-1:668311715351:certificate/9e53e28e-3243-47fc-85a1-50f9a94acde7",
+    })
+    proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, cwd=sandbox, timeout=60)
+    if proc.returncode != 0:
+        print(f"FAIL: the real 'Validate rendered Argo CD server Ingress' step exited {proc.returncode} against the real render:\n{proc.stdout}\n{proc.stderr}")
+        sys.exit(1)
+    if "OK: rendered Argo CD server Ingress passed every structural/contract check." not in proc.stdout:
+        print(f"FAIL: the step did not reach its own final success line:\n{proc.stdout}")
+        sys.exit(1)
+    print("OK")
+finally:
+    import shutil
+    shutil.rmtree(sandbox, ignore_errors=True)
+PYEOF
+)"
+  ARGO_INGRESS_VALIDATE_STATUS=$?
+  set -e
+  if [ "$ARGO_INGRESS_VALIDATE_STATUS" -eq 0 ] && [ "$ARGO_INGRESS_VALIDATE_OUT" = "OK" ]; then
+    pass "the REAL committed '${ARGOCD_DEPLOY_WORKFLOW} :: Validate rendered Argo CD server Ingress' step, executed against a real helm template render of the real committed values, passes structural validation of every required field end to end"
+  else
+    fail "real script-execution proof of 'Validate rendered Argo CD server Ingress' failed:"$'\n'"${ARGO_INGRESS_VALIDATE_OUT}"
+  fi
+else
+  skip "real script-execution proof of 'Validate rendered Argo CD server Ingress' -- python3/helm unavailable or ${ARGOCD_DEPLOY_WORKFLOW} missing"
+fi
+
+# A10/contract: the classifier's CLASSIFIER_CONTRACT and MAIN's two EXPECTED_CONTRACT literals are already dynamically cross-checked for equality above (the pre-existing "Live Argo Self-Recovery Fix" CONTRACT_CROSSCHECK block reads CLASSIFIER_CONTRACT from source, whatever string it currently is, and requires MAIN to contain that exact string at least twice) -- re-confirmed explicitly here as the literal expected v2 string, so a future accidental revert of only one side is caught by name, not merely by cross-file equality.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f hack/orchestration/argocd_state.py ]; then
+  CLASSIFIER_CONTRACT_LITERAL="$(python3 -c 'import re; print(re.search(r"^CLASSIFIER_CONTRACT = \"([^\"]+)\"", open("hack/orchestration/argocd_state.py").read(), re.M).group(1))')"
+  MAIN_EXPECTED_CONTRACT_COUNT="$(grep -cF 'EXPECTED_CONTRACT="argocd-recovery-v2"' "$EKS_APP_WORKFLOW" 2>/dev/null || true)"
+  if [ "$CLASSIFIER_CONTRACT_LITERAL" = "argocd-recovery-v2" ] && [ "${MAIN_EXPECTED_CONTRACT_COUNT:-0}" -ge 2 ]; then
+    pass "A10: hack/orchestration/argocd_state.py's CLASSIFIER_CONTRACT is exactly 'argocd-recovery-v2', and MAIN's argocd_preflight/validate_argocd_ready both expect it (${MAIN_EXPECTED_CONTRACT_COUNT} occurrences)"
+  else
+    fail "A10: classifier contract version mismatch -- classifier='${CLASSIFIER_CONTRACT_LITERAL}', MAIN EXPECTED_CONTRACT=\"argocd-recovery-v2\" occurrences=${MAIN_EXPECTED_CONTRACT_COUNT:-0}"
+  fi
+else
+  skip "A10: classifier contract version re-confirmation -- python3 unavailable or argocd_state.py missing"
+fi
+
+# D1/D2: MAIN's existing Argo DAG wiring (reconcile_argocd triggers synchronously on ABSENT/RECONCILABLE/HEALTHY via workflow_call) is UNCHANGED by this fix -- re-confirmed structurally rather than re-deriving the full JOB_ORDER simulation already proven (and unaffected, since none of reconcile_argocd/validate_argocd_ready's own if: expressions were touched) in the Phase B1 section above. The absence of any async gh workflow run/repository_dispatch/dispatches construct anywhere in MAIN is already proven elsewhere in this suite (Phase B2 check 21, which strips comments by checking the parsed-YAML structure rather than raw source text -- never re-derived here against raw text, which would false-positive on this very file's own explanatory prose naming "repository_dispatch" while describing what MAIN does NOT do).
+if grep -qF "needs.argocd_preflight.outputs.state == 'RECONCILABLE'" "$EKS_APP_WORKFLOW" 2>/dev/null \
+  && grep -qF "uses: ./.github/workflows/20-sub-argocd.yaml" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "D1/D2: MAIN's reconcile_argocd still triggers synchronously (workflow_call) on RECONCILABLE Argo state -- unchanged by this fix, so a missing/drifted Ingress now classified RECONCILABLE is automatically repaired with no manual specialist dispatch"
+else
+  fail "D1/D2: MAIN's reconcile_argocd RECONCILABLE trigger or its synchronous workflow_call invocation appears to have regressed"
+fi
+
+if [ -f hack/check-goldengate-approval-topology.py ] && [ "$PYTHON_AVAILABLE" = "true" ]; then
+  if D6_APPROVAL_TOPOLOGY_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 hack/check-goldengate-approval-topology.py 2>&1)"; then
+    pass "D6: hack/check-goldengate-approval-topology.py remains green -- this fix introduces no new protected-environment approval anywhere in the Argo/Platform DAG"
+  else
+    fail "D6: hack/check-goldengate-approval-topology.py regressed after this fix:"$'\n'"${D6_APPROVAL_TOPOLOGY_OUT}"
+  fi
+else
+  skip "D6: approval-topology re-confirmation -- python3 unavailable or checker missing"
 fi
 
 echo ""
