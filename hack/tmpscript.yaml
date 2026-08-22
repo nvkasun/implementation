@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+set -u
+
+NS="goldengate-dev"
+DEPLOYMENT="gg-mssql-repltest-01"
+PVC="${DEPLOYMENT}-u02"
+SC="gg-efs-dev-${DEPLOYMENT}"
+
+section() {
+  echo
+  echo "============================================================"
+  echo "$1"
+  echo "============================================================"
+}
+
+section "1. PVC / PV CURRENT STATE"
+
+kubectl get pvc "$PVC" -n "$NS" -o wide 2>&1 || true
+
+echo
+echo "PVC details/events:"
+kubectl describe pvc "$PVC" -n "$NS" 2>&1 || true
+
+echo
+echo "Related PVs:"
+kubectl get pv -o wide 2>&1 || true
+
+
+section "2. EFS STORAGECLASS"
+
+kubectl get storageclass "$SC" -o wide 2>&1 || true
+
+echo
+kubectl get storageclass "$SC" \
+  -o jsonpath='
+Name: {.metadata.name}
+Provisioner: {.provisioner}
+FileSystemId: {.parameters.fileSystemId}
+ProvisioningMode: {.parameters.provisioningMode}
+BasePath: {.parameters.basePath}
+SubPathPattern: {.parameters.subPathPattern}
+EnsureUniqueDirectory: {.parameters.ensureUniqueDirectory}
+ReclaimPolicy: {.reclaimPolicy}
+VolumeBindingMode: {.volumeBindingMode}
+' 2>&1 || true
+echo
+
+
+section "3. EFS CSI DRIVER"
+
+echo "CSI Driver object:"
+kubectl get csidriver efs.csi.aws.com -o wide 2>&1 || true
+
+echo
+echo "EFS CSI workloads:"
+kubectl get deployments,daemonsets,pods -n kube-system -o wide 2>&1 \
+  | grep -Ei 'efs|NAME' || true
+
+echo
+echo "EFS CSI service accounts:"
+kubectl get sa -n kube-system 2>&1 \
+  | grep -Ei 'efs|NAME' || true
+
+echo
+echo "Controller SA identity:"
+kubectl get sa efs-csi-controller-sa -n kube-system \
+  -o jsonpath='Name: {.metadata.name}{"\n"}IRSA Role: {.metadata.annotations.eks\.amazonaws\.com/role-arn}{"\n"}' \
+  2>&1 || true
+
+
+section "4. EFS CSI CONTROLLER ERRORS"
+
+echo "--- csi-provisioner ---"
+kubectl logs deployment/efs-csi-controller \
+  -n kube-system \
+  -c csi-provisioner \
+  --since=20m 2>&1 \
+  | grep -Ei \
+    'error|fail|denied|unauthor|access|provision|volume|claim|efs|timeout|credential|webidentity|sts' \
+  | tail -100 || true
+
+echo
+echo "--- efs-plugin ---"
+kubectl logs deployment/efs-csi-controller \
+  -n kube-system \
+  -c efs-plugin \
+  --since=20m 2>&1 \
+  | grep -Ei \
+    'error|fail|denied|unauthor|access|provision|volume|claim|efs|timeout|credential|webidentity|sts|accesspoint' \
+  | tail -100 || true
+
+
+section "5. PVC / EFS EVENTS"
+
+kubectl get events -n "$NS" --sort-by=.lastTimestamp 2>&1 \
+  | grep -Ei \
+    "${PVC}|${DEPLOYMENT}|persistentvolume|provision|efs|volume|claim|failed" \
+  | tail -80 || true
+
+
+section "6. AWS EFS READ-ONLY CHECK"
+
+FS_ID="$(
+  kubectl get storageclass "$SC" \
+    -o jsonpath='{.parameters.fileSystemId}' \
+    2>/dev/null || true
+)"
+
+echo "Resolved StorageClass EFS ID: ${FS_ID:-<EMPTY>}"
+
+if [[ -n "$FS_ID" ]] && command -v aws >/dev/null 2>&1; then
+  echo
+  echo "Filesystem:"
+  aws efs describe-file-systems \
+    --region eu-west-1 \
+    --file-system-id "$FS_ID" \
+    --query 'FileSystems[].{Id:FileSystemId,State:LifeCycleState,MountTargets:NumberOfMountTargets}' \
+    --output table 2>&1 || true
+
+  echo
+  echo "Mount targets:"
+  aws efs describe-mount-targets \
+    --region eu-west-1 \
+    --file-system-id "$FS_ID" \
+    --query 'MountTargets[].{Id:MountTargetId,Subnet:SubnetId,State:LifeCycleState,IP:IpAddress}' \
+    --output table 2>&1 || true
+
+  echo
+  echo "Dynamic EFS access points:"
+  aws efs describe-access-points \
+    --region eu-west-1 \
+    --file-system-id "$FS_ID" \
+    --query 'AccessPoints[].{Id:AccessPointId,State:LifeCycleState,Path:RootDirectory.Path}' \
+    --output table 2>&1 || true
+else
+  echo "AWS CLI unavailable or filesystem ID empty."
+fi
+
+
+section "7. QUICK SUMMARY"
+
+echo "PVC:"
+kubectl get pvc "$PVC" -n "$NS" \
+  -o custom-columns='NAME:.metadata.name,STATUS:.status.phase,VOLUME:.spec.volumeName,SC:.spec.storageClassName' \
+  2>&1 || true
+
+echo
+echo "EFS CSI controller:"
+kubectl get deployment efs-csi-controller -n kube-system \
+  2>&1 || true
+
+echo
+echo "READ-ONLY diagnostic completed."
