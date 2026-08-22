@@ -1,419 +1,192 @@
 #!/usr/bin/env bash
 
 # ============================================================
-# GoldenGate / Argo CD ALB Diagnostic Collector
-# READ-ONLY
-#
-# Purpose:
-#   Diagnose why argocd-server-ingress exists but does not
-#   receive status.loadBalancer.ingress / an ALB address.
-#
-# This script performs ONLY read operations:
-#   kubectl get
-#   kubectl describe
-#   kubectl logs
-#   kubectl cluster-info
-#
-# No Kubernetes or AWS resources are modified.
+# Argo CD ALB - MINIMAL DIAGNOSTIC
+# READ-ONLY: no resources are modified
 # ============================================================
 
 set -u
 
-ARGO_NAMESPACE="argocd"
-ARGO_INGRESS="argocd-server-ingress"
-ARGO_SERVICE="argocd-server"
-
-TIMESTAMP="$(date '+%Y%m%d-%H%M%S')"
-OUTPUT_FILE="argocd-alb-diagnostics-${TIMESTAMP}.txt"
+NS="argocd"
+INGRESS="argocd-server-ingress"
+SERVICE="argocd-server"
 
 section() {
-    echo ""
-    echo "======================================================================"
-    echo "$1"
-    echo "======================================================================"
+  echo ""
+  echo "============================================================"
+  echo "$1"
+  echo "============================================================"
 }
 
-run() {
-    echo ""
-    echo "+ $*"
-    "$@" 2>&1 || true
-}
-
-# Send everything to terminal + output file.
-exec > >(tee "${OUTPUT_FILE}") 2>&1
-
-section "DIAGNOSTIC START"
-echo "Timestamp: $(date -Is)"
-echo "Hostname:  $(hostname)"
-echo "Output:    ${OUTPUT_FILE}"
-
 # ------------------------------------------------------------
-section "1. KUBECTL / CURRENT CLUSTER CONTEXT"
+section "1. ARGO INGRESS - CURRENT STATE"
 
-run kubectl version
-run kubectl config current-context
-run kubectl cluster-info
+kubectl get ingress "$INGRESS" -n "$NS" -o wide 2>&1 || true
 
 echo ""
-echo "Current context details:"
-run kubectl config view --minify
+echo "Critical ingress configuration:"
+kubectl get ingress "$INGRESS" -n "$NS" \
+  -o jsonpath='
+Name: {.metadata.name}
+Class: {.spec.ingressClassName}
+Host: {.spec.rules[0].host}
+AddressHostname: {.status.loadBalancer.ingress[0].hostname}
+AddressIP: {.status.loadBalancer.ingress[0].ip}
+BackendService: {.spec.rules[0].http.paths[0].backend.service.name}
+BackendPort: {.spec.rules[0].http.paths[0].backend.service.port.number}
+GroupName: {.metadata.annotations.alb\.ingress\.kubernetes\.io/group\.name}
+GroupOrder: {.metadata.annotations.alb\.ingress\.kubernetes\.io/group\.order}
+Scheme: {.metadata.annotations.alb\.ingress\.kubernetes\.io/scheme}
+TargetType: {.metadata.annotations.alb\.ingress\.kubernetes\.io/target-type}
+BackendProtocol: {.metadata.annotations.alb\.ingress\.kubernetes\.io/backend-protocol}
+ListenPorts: {.metadata.annotations.alb\.ingress\.kubernetes\.io/listen-ports}
+CertificateARN: {.metadata.annotations.alb\.ingress\.kubernetes\.io/certificate-arn}
+HealthCheckPath: {.metadata.annotations.alb\.ingress\.kubernetes\.io/healthcheck-path}
+HealthCheckProtocol: {.metadata.annotations.alb\.ingress\.kubernetes\.io/healthcheck-protocol}
+' 2>&1 || true
 
-# ------------------------------------------------------------
-section "2. CLUSTER NODES / AVAILABILITY ZONES"
-
-run kubectl get nodes -o wide
-
-echo ""
-echo "Node topology / provider IDs:"
-run kubectl get nodes \
-    -o custom-columns='NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status,AZ:.metadata.labels.topology\.kubernetes\.io/zone,REGION:.metadata.labels.topology\.kubernetes\.io/region,PROVIDER_ID:.spec.providerID'
-
-# ------------------------------------------------------------
-section "3. CURRENT ARGO CD INGRESS"
-
-run kubectl get ingress "${ARGO_INGRESS}" \
-    -n "${ARGO_NAMESPACE}" \
-    -o wide
-
-echo ""
-echo "Ingress load-balancer status only:"
-run kubectl get ingress "${ARGO_INGRESS}" \
-    -n "${ARGO_NAMESPACE}" \
-    -o jsonpath='{.status.loadBalancer.ingress}'
-
-echo ""
 echo ""
 
 # ------------------------------------------------------------
-section "4. DESCRIBE ARGO CD INGRESS"
+section "2. ALB INGRESS CLASS"
 
-run kubectl describe ingress "${ARGO_INGRESS}" \
-    -n "${ARGO_NAMESPACE}"
-
-# ------------------------------------------------------------
-section "5. FULL ARGO CD INGRESS YAML"
-
-run kubectl get ingress "${ARGO_INGRESS}" \
-    -n "${ARGO_NAMESPACE}" \
-    -o yaml
+kubectl get ingressclass alb \
+  -o jsonpath='Name: {.metadata.name}{"\n"}Controller: {.spec.controller}{"\n"}Parameters: {.spec.parameters.name}{"\n"}' \
+  2>&1 || true
 
 # ------------------------------------------------------------
-section "6. ALB INGRESSCLASS"
+section "3. AWS LOAD BALANCER CONTROLLER"
 
-run kubectl get ingressclass alb -o wide
-run kubectl get ingressclass alb -o yaml
-
-# ------------------------------------------------------------
-section "7. ALL INGRESSCLASSES"
-
-run kubectl get ingressclass -o wide
-
-# ------------------------------------------------------------
-section "8. INGRESSCLASSPARAMS"
-
-run kubectl get ingressclassparams.elbv2.k8s.aws -A -o wide
-run kubectl get ingressclassparams.elbv2.k8s.aws -A -o yaml
-
-# ------------------------------------------------------------
-section "9. AWS LOAD BALANCER CONTROLLER DEPLOYMENTS"
-
-kubectl get deployments -A 2>&1 | \
-    grep -Ei 'aws-load-balancer|load-balancer-controller' || true
-
-# Dynamically find controller deployment(s).
 CONTROLLERS="$(
-    kubectl get deployments -A \
-        -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name' \
-        --no-headers 2>/dev/null |
-    grep -Ei 'aws-load-balancer|load-balancer-controller' || true
+  kubectl get deployments -A \
+    -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name' \
+    --no-headers 2>/dev/null |
+  grep -Ei 'aws-load-balancer|load-balancer-controller' || true
 )"
 
-echo ""
-echo "Discovered controller deployments:"
-if [[ -z "${CONTROLLERS}" ]]; then
-    echo "NONE FOUND"
+if [[ -z "$CONTROLLERS" ]]; then
+  echo "ERROR: AWS Load Balancer Controller deployment NOT FOUND"
 else
-    echo "${CONTROLLERS}"
-fi
+  echo "$CONTROLLERS"
 
-# ------------------------------------------------------------
-section "10. AWS LOAD BALANCER CONTROLLER PODS"
+  while read -r C_NS C_DEPLOY; do
+    [[ -z "${C_NS:-}" || -z "${C_DEPLOY:-}" ]] && continue
 
-kubectl get pods -A -o wide 2>&1 | \
-    grep -Ei 'aws-load-balancer|load-balancer-controller' || true
+    echo ""
+    echo "Deployment status:"
+    kubectl get deployment "$C_DEPLOY" -n "$C_NS" 2>&1 || true
 
-# ------------------------------------------------------------
-section "11. AWS LOAD BALANCER CONTROLLER DEPLOYMENT DETAILS"
+    echo ""
+    echo "Controller pods:"
+    kubectl get pods -n "$C_NS" \
+      -l app.kubernetes.io/name=aws-load-balancer-controller \
+      -o wide 2>&1 || \
+    kubectl get pods -n "$C_NS" | grep -Ei 'load-balancer' || true
 
-if [[ -n "${CONTROLLERS}" ]]; then
-    while read -r NS DEPLOY; do
-        [[ -z "${NS:-}" || -z "${DEPLOY:-}" ]] && continue
-
-        echo ""
-        echo "------------------------------------------------------------------"
-        echo "Controller: ${NS}/${DEPLOY}"
-        echo "------------------------------------------------------------------"
-
-        run kubectl get deployment "${DEPLOY}" -n "${NS}" -o wide
-        run kubectl describe deployment "${DEPLOY}" -n "${NS}"
-
-        echo ""
-        echo "Controller container image:"
-        run kubectl get deployment "${DEPLOY}" -n "${NS}" \
-            -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{" => "}{.image}{"\n"}{end}'
-
-        echo ""
-        echo "Controller arguments:"
-        run kubectl get deployment "${DEPLOY}" -n "${NS}" \
-            -o jsonpath='{range .spec.template.spec.containers[*]}{"CONTAINER: "}{.name}{"\n"}{range .args[*]}{"  "}{.}{"\n"}{end}{end}'
-
-        echo ""
-        echo "Controller ServiceAccount:"
-        run kubectl get deployment "${DEPLOY}" -n "${NS}" \
-            -o jsonpath='{.spec.template.spec.serviceAccountName}'
-
-        echo ""
-        echo ""
-
-        SA="$(
-            kubectl get deployment "${DEPLOY}" -n "${NS}" \
-                -o jsonpath='{.spec.template.spec.serviceAccountName}' \
-                2>/dev/null || true
-        )"
-
-        if [[ -n "${SA}" ]]; then
-            echo "Controller ServiceAccount YAML:"
-            run kubectl get serviceaccount "${SA}" -n "${NS}" -o yaml
-        fi
-    done <<< "${CONTROLLERS}"
-else
-    echo "No AWS Load Balancer Controller deployment found."
-fi
-
-# ------------------------------------------------------------
-section "12. AWS LOAD BALANCER CONTROLLER CRDs"
-
-kubectl get crd 2>&1 | grep -E 'elbv2\.k8s\.aws' || true
-
-echo ""
-echo "Relevant CRD names:"
-run kubectl get crd \
-    -o custom-columns='NAME:.metadata.name' \
-    --no-headers
-
-# ------------------------------------------------------------
-section "13. TARGETGROUPBINDINGS"
-
-run kubectl get targetgroupbindings.elbv2.k8s.aws -A -o wide
-
-echo ""
-echo "Full TargetGroupBinding YAML:"
-run kubectl get targetgroupbindings.elbv2.k8s.aws -A -o yaml
-
-# ------------------------------------------------------------
-section "14. AWS LOAD BALANCER CONTROLLER WEBHOOKS"
-
-echo "Validating webhooks:"
-kubectl get validatingwebhookconfiguration 2>&1 | \
-    grep -Ei 'load-balancer|elbv2' || true
-
-echo ""
-echo "Mutating webhooks:"
-kubectl get mutatingwebhookconfiguration 2>&1 | \
-    grep -Ei 'load-balancer|elbv2' || true
-
-# ------------------------------------------------------------
-section "15. LOAD BALANCER CONTROLLER WEBHOOK SERVICES"
-
-kubectl get services -A 2>&1 | \
-    grep -Ei 'aws-load-balancer|load-balancer-webhook|webhook-service' || true
-
-echo ""
-echo "Webhook endpoints:"
-kubectl get endpoints -A 2>&1 | \
-    grep -Ei 'aws-load-balancer|load-balancer-webhook|webhook-service' || true
-
-# ------------------------------------------------------------
-section "16. ARGO CD SERVER SERVICE"
-
-run kubectl get service "${ARGO_SERVICE}" \
-    -n "${ARGO_NAMESPACE}" \
-    -o wide
-
-run kubectl describe service "${ARGO_SERVICE}" \
-    -n "${ARGO_NAMESPACE}"
-
-run kubectl get service "${ARGO_SERVICE}" \
-    -n "${ARGO_NAMESPACE}" \
-    -o yaml
-
-# ------------------------------------------------------------
-section "17. ARGO CD SERVER ENDPOINTS"
-
-run kubectl get endpoints "${ARGO_SERVICE}" \
-    -n "${ARGO_NAMESPACE}" \
-    -o wide
-
-run kubectl get endpoints "${ARGO_SERVICE}" \
-    -n "${ARGO_NAMESPACE}" \
-    -o yaml
-
-# EndpointSlice is useful on modern Kubernetes.
-echo ""
-echo "EndpointSlices:"
-run kubectl get endpointslices.discovery.k8s.io \
-    -n "${ARGO_NAMESPACE}" \
-    -l "kubernetes.io/service-name=${ARGO_SERVICE}" \
-    -o wide
-
-# ------------------------------------------------------------
-section "18. ARGO CD SERVER PODS"
-
-run kubectl get pods \
-    -n "${ARGO_NAMESPACE}" \
-    -l app.kubernetes.io/name=argocd-server \
-    -o wide
-
-# ------------------------------------------------------------
-section "19. ALL CURRENT INGRESS RESOURCES"
-
-run kubectl get ingress -A -o wide
-
-# ------------------------------------------------------------
-section "20. ALL INGRESS OBJECTS USING ALB CLASS"
-
-kubectl get ingress -A \
-    -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,CLASS:.spec.ingressClassName,HOST:.spec.rules[0].host,GROUP:.metadata.annotations.alb\.ingress\.kubernetes\.io/group\.name,SCHEME:.metadata.annotations.alb\.ingress\.kubernetes\.io/scheme,ADDRESS:.status.loadBalancer.ingress[0].hostname' \
-    2>&1 || true
-
-# ------------------------------------------------------------
-section "21. INGRESS / ALB RELATED EVENTS"
-
-kubectl get events -A --sort-by=.lastTimestamp 2>&1 | \
-    grep -Ei 'argocd-server-ingress|load.?balancer|targetgroup|target.?group|alb|ingress|subnet|security.?group' | \
-    tail -200 || true
-
-# ------------------------------------------------------------
-section "22. ARGO NAMESPACE EVENTS"
-
-run kubectl get events \
-    -n "${ARGO_NAMESPACE}" \
-    --sort-by=.lastTimestamp
-
-# ------------------------------------------------------------
-section "23. AWS LOAD BALANCER CONTROLLER LOGS"
-
-if [[ -n "${CONTROLLERS}" ]]; then
-    while read -r NS DEPLOY; do
-        [[ -z "${NS:-}" || -z "${DEPLOY:-}" ]] && continue
-
-        echo ""
-        echo "##################################################################"
-        echo "Logs: ${NS}/${DEPLOY}"
-        echo "##################################################################"
-
-        # Deployment logs will collect from one controller pod.
-        run kubectl logs \
-            -n "${NS}" \
-            "deployment/${DEPLOY}" \
-            --all-containers=true \
-            --tail=500
-
-        echo ""
-        echo "Filtered error/reconciliation lines:"
-        kubectl logs \
-            -n "${NS}" \
-            "deployment/${DEPLOY}" \
-            --all-containers=true \
-            --tail=1000 2>&1 |
-        grep -Ei \
-            'error|failed|denied|accessdenied|unauthor|subnet|security.?group|ingress|targetgroup|target.?group|certificate|listener|reconcil|credential|sts|web.?identity|throttl' |
-        tail -300 || true
-
-    done <<< "${CONTROLLERS}"
-else
-    echo "No controller deployment exists, therefore no controller logs are available."
-fi
-
-# ------------------------------------------------------------
-section "24. CONTROLLER POD STATUS / RECENT RESTART INFORMATION"
-
-if [[ -n "${CONTROLLERS}" ]]; then
-    while read -r NS DEPLOY; do
-        [[ -z "${NS:-}" || -z "${DEPLOY:-}" ]] && continue
-
-        LABEL_SELECTOR="$(
-            kubectl get deployment "${DEPLOY}" -n "${NS}" \
-                -o jsonpath='{range $k,$v := .spec.selector.matchLabels}{$k}={$v},{end}' \
-                2>/dev/null |
-            sed 's/,$//' || true
-        )"
-
-        if [[ -n "${LABEL_SELECTOR}" ]]; then
-            run kubectl get pods \
-                -n "${NS}" \
-                -l "${LABEL_SELECTOR}" \
-                -o wide
-
-            echo ""
-            echo "Pod details:"
-            PODS="$(
-                kubectl get pods \
-                    -n "${NS}" \
-                    -l "${LABEL_SELECTOR}" \
-                    -o name 2>/dev/null || true
-            )"
-
-            while read -r POD; do
-                [[ -z "${POD:-}" ]] && continue
-                run kubectl describe -n "${NS}" "${POD}"
-            done <<< "${PODS}"
-        fi
-    done <<< "${CONTROLLERS}"
-fi
-
-# ------------------------------------------------------------
-section "25. QUICK ROOT-CAUSE SUMMARY INPUTS"
-
-INGRESS_ADDRESS="$(
-    kubectl get ingress "${ARGO_INGRESS}" \
-        -n "${ARGO_NAMESPACE}" \
-        -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' \
+    echo ""
+    echo "Controller ServiceAccount:"
+    SA="$(
+      kubectl get deployment "$C_DEPLOY" -n "$C_NS" \
+        -o jsonpath='{.spec.template.spec.serviceAccountName}' \
         2>/dev/null || true
-)"
-
-if [[ -z "${INGRESS_ADDRESS}" ]]; then
-    INGRESS_ADDRESS="$(
-        kubectl get ingress "${ARGO_INGRESS}" \
-            -n "${ARGO_NAMESPACE}" \
-            -o jsonpath='{.status.loadBalancer.ingress[0].ip}' \
-            2>/dev/null || true
     )"
+
+    echo "Name: ${SA:-<EMPTY>}"
+
+    if [[ -n "$SA" ]]; then
+      kubectl get sa "$SA" -n "$C_NS" \
+        -o jsonpath='IRSA Role: {.metadata.annotations.eks\.amazonaws\.com/role-arn}{"\n"}' \
+        2>&1 || true
+    fi
+
+    echo ""
+    echo "Important controller arguments:"
+    kubectl get deployment "$C_DEPLOY" -n "$C_NS" \
+      -o jsonpath='{range .spec.template.spec.containers[*].args[*]}{.}{"\n"}{end}' \
+      2>/dev/null |
+      grep -Ei 'cluster-name|ingress-class|aws-region|aws-vpc-id|feature-gates' || true
+
+  done <<< "$CONTROLLERS"
 fi
-
-echo "Argo Ingress present:      $(kubectl get ingress "${ARGO_INGRESS}" -n "${ARGO_NAMESPACE}" >/dev/null 2>&1 && echo YES || echo NO)"
-echo "Argo Ingress ALB address:  ${INGRESS_ADDRESS:-<EMPTY>}"
-echo "ALB IngressClass present:  $(kubectl get ingressclass alb >/dev/null 2>&1 && echo YES || echo NO)"
-
-if [[ -n "${CONTROLLERS}" ]]; then
-    echo "ALB Controller found:      YES"
-    echo "${CONTROLLERS}" | sed 's/^/                           /'
-else
-    echo "ALB Controller found:      NO"
-fi
-
-echo ""
-echo "IMPORTANT:"
-echo "An EMPTY ALB address means the Kubernetes Ingress exists but"
-echo "AWS Load Balancer Controller reconciliation has not successfully"
-echo "published status.loadBalancer.ingress yet."
 
 # ------------------------------------------------------------
-section "DIAGNOSTIC COMPLETE"
+section "4. ARGO SERVER SERVICE + ENDPOINTS"
 
-echo "Finished: $(date -Is)"
+kubectl get service "$SERVICE" -n "$NS" \
+  -o custom-columns='NAME:.metadata.name,TYPE:.spec.type,PORT:.spec.ports[0].port,TARGETPORT:.spec.ports[0].targetPort,SELECTOR:.spec.selector' \
+  2>&1 || true
+
 echo ""
-echo "Diagnostic output saved to:"
-echo "  ${OUTPUT_FILE}"
+echo "Service endpoints:"
+kubectl get endpoints "$SERVICE" -n "$NS" \
+  -o wide 2>&1 || true
+
+# ------------------------------------------------------------
+section "5. TARGET GROUP BINDINGS"
+
+TGB="$(
+  kubectl get targetgroupbindings.elbv2.k8s.aws -A 2>/dev/null || true
+)"
+
+if [[ -z "$TGB" ]]; then
+  echo "No TargetGroupBindings found or CRD unavailable."
+else
+  echo "$TGB"
+fi
+
+# ------------------------------------------------------------
+section "6. IMPORTANT INGRESS / ALB EVENTS ONLY"
+
+kubectl get events -A --sort-by=.lastTimestamp 2>&1 |
+grep -Ei \
+'argocd-server-ingress|failedbuildmodel|load.?balancer|targetgroup|subnet|security.?group|certificate|listener|accessdenied|unauthor|ingress' |
+tail -60 || true
+
+# ------------------------------------------------------------
+section "7. LOAD BALANCER CONTROLLER ERRORS ONLY"
+
+if [[ -n "$CONTROLLERS" ]]; then
+
+  while read -r C_NS C_DEPLOY; do
+    [[ -z "${C_NS:-}" || -z "${C_DEPLOY:-}" ]] && continue
+
+    echo ""
+    echo "--- ${C_NS}/${C_DEPLOY} ---"
+
+    kubectl logs deployment/"$C_DEPLOY" \
+      -n "$C_NS" \
+      --all-containers=true \
+      --since=30m 2>&1 |
+    grep -Ei \
+      'error|failed|failedbuildmodel|accessdenied|unauthor|denied|subnet|security.?group|certificate|listener|targetgroup|target.?group|ingress|argocd|credential|webidentity|sts' |
+    tail -100 || true
+
+  done <<< "$CONTROLLERS"
+
+else
+  echo "Controller deployment not found."
+fi
+
+# ------------------------------------------------------------
+section "8. FINAL QUICK SUMMARY"
+
+ADDRESS="$(
+  kubectl get ingress "$INGRESS" -n "$NS" \
+    -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' \
+    2>/dev/null || true
+)"
+
+if [[ -z "$ADDRESS" ]]; then
+  ADDRESS="$(
+    kubectl get ingress "$INGRESS" -n "$NS" \
+      -o jsonpath='{.status.loadBalancer.ingress[0].ip}' \
+      2>/dev/null || true
+  )"
+fi
+
+echo "Ingress exists : $(kubectl get ingress "$INGRESS" -n "$NS" >/dev/null 2>&1 && echo YES || echo NO)"
+echo "Ingress class  : $(kubectl get ingress "$INGRESS" -n "$NS" -o jsonpath='{.spec.ingressClassName}' 2>/dev/null || echo UNKNOWN)"
+echo "ALB address    : ${ADDRESS:-<EMPTY>}"
+echo "Controller     : $([[ -n "$CONTROLLERS" ]] && echo FOUND || echo NOT_FOUND)"
 echo ""
-echo "No resources were modified."
+echo "READ-ONLY diagnostic completed."
