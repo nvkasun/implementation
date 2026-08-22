@@ -2,7 +2,7 @@
 # Builds deployment_matrix/deletion_matrix step outputs for envs/dev/ GoldenGate deployments; the single implementation wrapped by .github/workflows/00-main-goldengate-orchestrator.yaml.
 set -euo pipefail
 
-# Returns 0/1 (active/inactive) with a one-line reason on stdout; inactive if missing/empty/comment-only/null YAML, or enabled:false/deployment.enabled:false/lifecycle.state:absent; prefers PyYAML, falls back to text patterns.
+# Returns 0/1 (active/inactive) with a one-line reason on stdout; inactive if missing/empty/comment-only/null YAML, or enabled:false/deployment.enabled:false; prefers PyYAML, falls back to text patterns. GoldenGate Runtime Desired-State Simplification: deployment.enabled is the sole runtime-presence control -- lifecycle.state is retired and no longer checked here at all; a descriptor that still carries a stale lifecycle block is not rejected by this cheap git-diff triage heuristic (it never does full descriptor validation for any field), but is fail-closed rejected downstream by hack/goldengate-deployment-model.py's own strict parser the first time this candidate is actually described/built/deployed -- the ONE authoritative source of truth for that rejection, never duplicated here.
 is_active_deployment_values_file() {
   local values_file="$1"
 
@@ -44,9 +44,6 @@ except ImportError:
     if re.search(r'(?ms)^deployment\s*:\s*\n(?:[ \t]+\S.*\n?)*?[ \t]+enabled\s*:\s*false\s*$', raw):
         print("deployment.enabled=false (text fallback, PyYAML unavailable)")
         sys.exit(1)
-    if re.search(r'(?ms)^lifecycle\s*:\s*\n(?:[ \t]+\S.*\n?)*?[ \t]+state\s*:\s*["\']?absent["\']?\s*$', raw):
-        print("lifecycle.state=absent (text fallback, PyYAML unavailable)")
-        sys.exit(1)
     print("active (text fallback, PyYAML unavailable)")
     sys.exit(0)
 
@@ -71,11 +68,6 @@ if data.get("enabled") is False:
 deployment = data.get("deployment")
 if isinstance(deployment, dict) and deployment.get("enabled") is False:
     print("deployment.enabled=false")
-    sys.exit(1)
-
-lifecycle = data.get("lifecycle")
-if isinstance(lifecycle, dict) and lifecycle.get("state") == "absent":
-    print("lifecycle.state=absent")
     sys.exit(1)
 
 print("active")
@@ -105,16 +97,6 @@ PYEOF
     END { exit !found }
   ' "$values_file"; then
     echo "deployment.enabled=false (bash fallback)"
-    return 1
-  fi
-
-  if awk '
-    /^lifecycle:[[:space:]]*$/ { in_block=1; next }
-    in_block && /^[[:space:]]+state:[[:space:]]*"?absent"?[[:space:]]*$/ { found=1; exit }
-    in_block && /^[^[:space:]]/ { in_block=0 }
-    END { exit !found }
-  ' "$values_file"; then
-    echo "lifecycle.state=absent (bash fallback)"
     return 1
   fi
 
@@ -257,7 +239,7 @@ print(json.dumps(summary))
 PYEOF
 }
 
-# STORAGE-TRANSITION-GUARD rules: given $1=historical and $2=current _persistence_efs_summary_json blobs for the SAME still-present descriptor, prints one non-empty violation reason if the transition is unsafe, otherwise prints nothing. Allowed: new deployment (no historical state, never called for that case -- see the caller), managed->managed, existing->existing with an unchanged fileSystemId, and any change unrelated to persistence.efs identity (e.g. lifecycle.state alone). Blocked: managed->existing, existing->managed, managed->persistence disabled, managed->non-EFS provider, existing fileSystemId mutation.
+# STORAGE-TRANSITION-GUARD rules: given $1=historical and $2=current _persistence_efs_summary_json blobs for the SAME still-present descriptor, prints one non-empty violation reason if the transition is unsafe, otherwise prints nothing. Allowed: new deployment (no historical state, never called for that case -- see the caller), managed->managed, existing->existing with an unchanged fileSystemId, and any change unrelated to persistence.efs identity (e.g. deployment.enabled alone). Blocked: managed->existing, existing->managed, managed->persistence disabled, managed->non-EFS provider, existing fileSystemId mutation.
 _check_storage_transition() {
   local historical_json="$1"
   local current_json="$2"
@@ -284,7 +266,7 @@ elif h_mode == "existing":
 ' "$historical_json" "$current_json"
 }
 
-# ACTIVE CONTRACT: qualifies only a non-empty, valid YAML mapping whose deploymentModel is exactly "singleRuntime" (legacyPair and unrecognized values fail closed); content-based only, independent of the enabled/lifecycle check above.
+# ACTIVE CONTRACT: qualifies only a non-empty, valid YAML mapping whose deploymentModel is exactly "singleRuntime" (legacyPair and unrecognized values fail closed); content-based only, independent of the enabled check above.
 is_goldengate_deployment_values_file() {
   local values_file="$1"
 
@@ -572,17 +554,12 @@ for CANDIDATE_ID in $DELETION_CANDIDATE_IDS; do
   set -e
 
   if [ "$STATUS" -ne 0 ]; then
-    # deployment.enabled=false (or top-level enabled=false) is retired-but-retained -- never drives deletion. lifecycle.state=absent decommissions the RUNTIME APPLICATION only, while the descriptor (and any managed durable storage it names) is retained -- it must never be conflated with physical removal of the descriptor itself, which is the only shape that can make Terraform observe a vanished module instance.
+    # GoldenGate Runtime Desired-State Simplification: deployment.enabled=false (or top-level enabled=false) is now a first-class desired-ABSENCE request -- it drives the SAME ownership-safe removal/pruning path (delete_removed_argocd_applications) that a physically-removed descriptor drives, decommissioning the RUNTIME APPLICATION/workload only, while the descriptor (and any managed durable storage it names) is retained. It must never be conflated with physical removal of the descriptor itself, which is the only shape that can make Terraform observe a vanished module instance -- that stays a completely separate reason.
     case "$REASON" in
       deployment.enabled=false*|enabled=false*)
-        echo "Inactive (retained, not deleted): ${CANDIDATE_ID} (${REASON})"
-        INACTIVE_LOG="${INACTIVE_LOG}  - ${CANDIDATE_ID} (${REASON}) [retained -- no deletion request]\n"
-        DELETION_REASON=""
-        ;;
-      lifecycle.state=absent*)
-        echo "Lifecycle absent (application decommission, descriptor and storage retained): ${CANDIDATE_ID} (${REASON})"
-        INACTIVE_LOG="${INACTIVE_LOG}  - ${CANDIDATE_ID} (${REASON}) [lifecycle-absent -- application removed, managed storage retained]\n"
-        DELETION_REASON="lifecycle-absent"
+        echo "Deployment disabled (application decommission, descriptor and storage retained): ${CANDIDATE_ID} (${REASON})"
+        INACTIVE_LOG="${INACTIVE_LOG}  - ${CANDIDATE_ID} (${REASON}) [deployment-disabled -- application removed, managed storage retained]\n"
+        DELETION_REASON="deployment-disabled"
         ;;
       *)
         echo "Inactive/deleted (physical removal): ${CANDIDATE_ID} (${REASON})"
@@ -594,7 +571,7 @@ for CANDIDATE_ID in $DELETION_CANDIDATE_IDS; do
     if [ -n "$DELETION_REASON" ]; then
       echo "  deploymentModel (${GG_SOURCE}): ${CANDIDATE_DEPLOYMENT_MODEL}"
 
-      # Resolve historical persistence.efs.mode from whichever source classified this candidate (working tree if the file still exists there, e.g. lifecycle.state=absent, otherwise its content at BEFORE_SHA) for managed_efs_deletion_guard; never inferred, empty string means EFS/managed was never declared there.
+      # Resolve historical persistence.efs.mode from whichever source classified this candidate (working tree if the file still exists there, e.g. deployment.enabled=false, otherwise its content at BEFORE_SHA) for managed_efs_deletion_guard; never inferred, empty string means EFS/managed was never declared there.
       if [ -f "$VALUES_FILE" ] && [ -s "$VALUES_FILE" ]; then
         CANDIDATE_EFS_MODE="$(_efs_mode_from_yaml "$VALUES_FILE")"
       else

@@ -503,7 +503,7 @@ def _parse_replicat(block):
     }
 
 
-def _parse_replication(deployment_id, environment, role, deployment_type, doc):
+def _parse_replication(deployment_id, environment, role, deployment_type, doc, deployment_enabled):
     """Full Phase 6D1 replication schema; a disabled or absent block always normalizes to {"enabled": False}."""
     replication = doc.get("replication")
     if replication is None:
@@ -514,6 +514,10 @@ def _parse_replication(deployment_id, environment, role, deployment_type, doc):
         raise DescriptorError("invalid replication configuration: replication.enabled must be a literal Boolean")
     if not enabled:
         return {"enabled": False}
+
+    # GoldenGate Runtime Desired-State Simplification: replication can never be desired for a runtime that is itself not desired to exist -- deployment.enabled is the single runtime-presence control, so replication.enabled=true with deployment.enabled=false is an invalid combination, rejected early rather than silently reinterpreted.
+    if not deployment_enabled:
+        raise DescriptorError("invalid deployment/replication combination: replication.enabled=true requires deployment.enabled=true")
 
     if role == "source" and deployment_type != REPLICATION_SUPPORTED_SOURCE_TYPE:
         raise DescriptorError(f"unsupported replication scope: {REPLICATION_SCOPE_MESSAGE}")
@@ -555,15 +559,10 @@ def _parse_replication(deployment_id, environment, role, deployment_type, doc):
     }
 
 
-def _parse_lifecycle(doc):
-    lifecycle = doc.get("lifecycle")
-    if lifecycle is None:
-        return None
-    _require_dict(lifecycle, "invalid lifecycle configuration: lifecycle must be a mapping")
-    state = lifecycle.get("state")
-    if state is not None and state not in ("active", "absent"):
-        raise DescriptorError("invalid lifecycle value: lifecycle.state must be \"active\" or \"absent\"")
-    return state
+def _reject_lifecycle_presence_control(doc):
+    """GoldenGate Runtime Desired-State Simplification: lifecycle.state is retired as a second runtime-presence source of truth -- deployment.enabled is now the ONLY authoritative control over whether a GoldenGate runtime should exist. A descriptor still carrying a lifecycle block (in any shape, valid or not) is rejected outright rather than silently reinterpreted or ignored, so a stale descriptor can never introduce ambiguous or contradictory intent. There is deliberately no replacement lifecycle-shaped field -- do not reintroduce one."""
+    if doc.get("lifecycle") is not None:
+        raise DescriptorError("lifecycle.state is no longer supported for runtime presence; use deployment.enabled only")
 
 
 def _parse_csi_structure(runtime):
@@ -680,8 +679,8 @@ def parse_descriptor(deployment_id, environment, doc, shared=None):
     admin_secret_name = resolve_admin_secret(environment, role)
     tls_secret_name = resolve_tls_secret(environment)
     csi_fields = _parse_csi_structure(runtime)
-    replication = _parse_replication(deployment_id, environment, role, deployment_type, doc)
-    lifecycle_state = _parse_lifecycle(doc)
+    _reject_lifecycle_presence_control(doc)
+    replication = _parse_replication(deployment_id, environment, role, deployment_type, doc, deployment_enabled=enabled)
     efs = _parse_efs(deployment_id, environment, doc)
 
     if _contains_credential_like_key(doc):
@@ -735,7 +734,6 @@ def parse_descriptor(deployment_id, environment, doc, shared=None):
         "pipeline": pipeline,
         "role": role,
         "enabled": enabled,
-        "lifecycleState": lifecycle_state,
         "deploymentType": deployment_type,
         "imageRepository": image["repository"],
         "imageRepositoryName": image["repositoryName"],
@@ -792,7 +790,8 @@ def classify_folder(path, environment, shared):
     except DescriptorError as exc:
         return "invalid", None, exc.reason
 
-    if descriptor["enabled"] is not True or descriptor["lifecycleState"] == "absent":
+    # GoldenGate Runtime Desired-State Simplification: deployment.enabled is the single authoritative runtime-presence control -- active means exactly deployment.enabled=true. lifecycle.state no longer exists as a second source of truth (rejected earlier, in parse_descriptor via _reject_lifecycle_presence_control).
+    if descriptor["enabled"] is not True:
         return "inactive", descriptor, None
     return "active", descriptor, None
 
@@ -1205,7 +1204,7 @@ def cmd_shared_secrets(args):
 
 
 def cmd_managed_efs_inventory(args):
-    """Expected managed-EFS inventory (JSON array of {deploymentId, efsCreationToken}) for the AWS-side managed_efs_inventory_guard; includes lifecycle.state=absent descriptors on purpose -- their EFS is retained, not decommissioned, so they remain part of the expected set."""
+    """Expected managed-EFS inventory (JSON array of {deploymentId, efsCreationToken}) for the AWS-side managed_efs_inventory_guard; includes deployment.enabled=false descriptors on purpose -- their EFS is retained, not decommissioned, so they remain part of the expected set. Only a physically removed descriptor drops out of this inventory."""
     active, inactive, invalid, problems = _run_full_validation(args.environment)
     if invalid or problems:
         _print_reasons(invalid)

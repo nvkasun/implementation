@@ -1,6 +1,6 @@
 # Managed-mode GoldenGate runtime EFS filesystems: one dedicated module instance per managed runtime deployment, keyed by deployment ID, created through the approved corporate Terraform workflow (this file lives in the normal envs/dev root processed by .github/workflows/10-sub-iam-secrets.yaml -> AbuDhabiCommercialBank/adcb-reusable-workflows/aws-terraform-apply.yaml@main) -- one Terraform state does not mean one EFS: each for_each key below is its own dedicated aws_efs_file_system inside the approved module. Existing-mode deployments get no module instance here since their filesystem already exists outside Terraform. Scope boundary: this file owns the EFS filesystem + mount targets only, via the approved ADCB module below -- it does NOT create EFS access points, which remain owned by the EFS CSI driver's dynamic provisioning (helm/goldengate/templates/efs-storageclass.yaml -> StorageClass -> PVC), exactly as today.
 
-# Explicit managed-EFS decommission control -- NEVER derived from lifecycle.state. lifecycle.state=absent by itself always retains managed EFS (see local.goldengate_managed_efs_deployments's own comment); an ID may be added here ONLY after its workload/PVC/access-point cleanup has been independently verified. Removing an ID later makes its managed EFS desired again, so Terraform recreates it in the current environment without reconstructing the runtime descriptor.
+# Explicit managed-EFS decommission control -- NEVER derived from deployment.enabled (or the retired lifecycle.state). deployment.enabled=false by itself always retains managed EFS (see local.goldengate_managed_efs_deployments's own comment); an ID may be added here ONLY after its workload/PVC/access-point cleanup has been independently verified. Removing an ID later makes its managed EFS desired again, so Terraform recreates it in the current environment without reconstructing the runtime descriptor. GoldenGate Runtime Desired-State Simplification: this hold is an intentionally SEPARATE authorization from runtime desired presence -- deployment.enabled=true (activating runtime compute) never by itself clears this hold or authorizes managed-EFS creation for an ID listed here; only an explicit, independently-verified edit to this list does.
 locals {
   goldengate_managed_efs_decommission_ids = toset([
     "gg-postgresql-repltest-01",
@@ -23,7 +23,7 @@ data "aws_security_group" "goldengate_efs_shared" {
   }
 }
 
-# Fail-closed guard for the decommission set above: an ID that isn't a real managed-EFS deployment is very likely a typo about to silently no-op instead of decommissioning the intended filesystem; each decommissioned ID must also be a genuinely retired runtime (lifecycle.state=absent, replication.enabled=false), never an active one.
+# Fail-closed guard for the decommission set above: an ID that isn't a real managed-EFS deployment is very likely a typo about to silently no-op instead of decommissioning the intended filesystem. GoldenGate Runtime Desired-State Simplification: the previous consistency precondition requiring each decommissioned ID's descriptor to independently declare itself inactive (lifecycle.state=absent) is retired along with that field -- deployment.enabled is now the sole runtime-presence control and is deliberately NOT substituted here, since this list is (per its own header comment) an explicit, out-of-band storage-destruction authorization, never derived from -- or coupled to -- any single descriptor field. A deployment.enabled=true runtime (desired compute presence) can legitimately still have its managed-EFS creation held back by this list; that is exactly the "runtime desired presence" vs "persistent storage destruction authorization" separation this task requires.
 resource "terraform_data" "goldengate_managed_efs_decommission_contract" {
   input = local.goldengate_managed_efs_decommission_ids
 
@@ -31,13 +31,6 @@ resource "terraform_data" "goldengate_managed_efs_decommission_contract" {
     precondition {
       condition     = length(setsubtract(local.goldengate_managed_efs_decommission_ids, keys(local.goldengate_managed_efs_deployments))) == 0
       error_message = "envs/dev/efs.tf: goldengate_managed_efs_decommission_ids contains a deployment ID that is not a current managed-EFS deployment -- refusing to silently no-op an intended EFS decommission."
-    }
-    precondition {
-      condition = alltrue([
-        for id in local.goldengate_managed_efs_decommission_ids :
-        try(local.goldengate_runtime_documents[id].lifecycle.state, "active") == "absent"
-      ])
-      error_message = "envs/dev/efs.tf: every deployment ID in goldengate_managed_efs_decommission_ids must have lifecycle.state=absent -- refusing to decommission managed EFS for a deployment that is still active."
     }
     precondition {
       condition = alltrue([

@@ -1276,23 +1276,23 @@ jobs:
           print("\n".join(managed))
           ' "$DELETION_MATRIX")"
 
-          LIFECYCLE_ABSENT_MANAGED="$(python3 -c '
+          DEPLOYMENT_DISABLED_MANAGED="$(python3 -c '
           import json, sys
           items = json.loads(sys.argv[1])
-          managed = [i.get("deployment_id", "?") for i in items if i.get("efs_mode") == "managed" and i.get("reason") == "lifecycle-absent"]
+          managed = [i.get("deployment_id", "?") for i in items if i.get("efs_mode") == "managed" and i.get("reason") == "deployment-disabled"]
           print("\n".join(managed))
           ' "$DELETION_MATRIX")"
 
-          if [ -n "$LIFECYCLE_ABSENT_MANAGED" ]; then
-            echo "ALLOWED (application decommission only, managed storage retained): the following managed-EFS deployment(s) transitioned to lifecycle.state=absent this push -- their descriptor and dedicated EFS filesystem are retained; only application-level resources (Argo CD Application, runtime pod) are affected:"
-            echo "$LIFECYCLE_ABSENT_MANAGED"
+          if [ -n "$DEPLOYMENT_DISABLED_MANAGED" ]; then
+            echo "ALLOWED (application decommission only, managed storage retained): the following managed-EFS deployment(s) transitioned to deployment.enabled=false this push -- their descriptor and dedicated EFS filesystem are retained; only application-level resources (Argo CD Application, runtime pod) are affected:"
+            echo "$DEPLOYMENT_DISABLED_MANAGED"
           fi
 
           if [ -n "$MANAGED_DELETIONS" ]; then
             echo "FAIL: the following deployment descriptor(s) were physically deleted while persistence.efs.mode=managed:"
             echo "$MANAGED_DELETIONS"
             echo ""
-            echo "Managed GoldenGate EFS is durable storage. Physical deletion of the deployment descriptor is blocked. Set lifecycle.state=absent first and use the controlled storage-decommission procedure before removing the descriptor."
+            echo "Managed GoldenGate EFS is durable storage. Physical deletion of the deployment descriptor is blocked. Set deployment.enabled=false first and use the controlled storage-decommission procedure before removing the descriptor."
             exit 1
           fi
 
@@ -1376,7 +1376,7 @@ jobs:
 
           python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
           python3 hack/goldengate-deployment-model.py --environment "${GG_SELECTED_ENVIRONMENT}" managed-efs-inventory > expected-managed-efs.json
-          echo "Expected managed-EFS inventory (includes lifecycle.state=absent descriptors on purpose -- their EFS is retained, not decommissioned):"
+          echo "Expected managed-EFS inventory (includes deployment.enabled=false descriptors on purpose -- their EFS is retained, not decommissioned):"
           cat expected-managed-efs.json
 
       - name: Read the actual AWS-side GoldenGate-managed EFS inventory (read-only)
@@ -3162,7 +3162,7 @@ jobs:
             echo ""
             echo "A values.yaml is inactive (excluded from the build/update matrix) when it is"
             echo "missing, zero-byte, whitespace-only, comment-only, parses to YAML null,"
-            echo "enabled=false, deployment.enabled=false, or lifecycle.state=absent."
+            echo "enabled=false, or deployment.enabled=false."
             echo ""
             echo "Of those, deletion (deletes the Argo CD Application and, if safely"
             echo "identifiable, its namespace) is triggered by:"
@@ -3172,16 +3172,21 @@ jobs:
             echo "- a values file that still exists but is now whitespace-only;"
             echo "- a values file that still exists but is now comment-only;"
             echo "- a values file that still exists but now parses to YAML null;"
-            echo "- an explicit lifecycle.state=absent."
+            echo "- an explicit enabled=false or deployment.enabled=false (descriptor and any"
+            echo "  managed persistent storage it names are retained -- only the Argo CD"
+            echo "  Application/runtime workload are removed)."
             echo "The four \"still exists but emptied\" shapes above only trigger deletion when"
             echo "the previous revision at that path was a valid GoldenGate deployment -- the"
             echo "deployment_model recorded for deletion is always read from that previous,"
             echo "valid revision, never inferred or defaulted."
             echo ""
-            echo "enabled=false and deployment.enabled=false mark a deployment as"
-            echo "retired-but-retained for rollback/reference and never trigger deletion --"
-            echo "the values folder stays in place and is excluded from the build/update"
-            echo "matrix, but no Argo CD Application or namespace is touched."
+            echo "deployment.enabled is the single authoritative runtime-presence control:"
+            echo "enabled=true means the runtime should exist and this workflow reconciles it;"
+            echo "enabled=false means it should not, and this workflow safely removes its Argo"
+            echo "CD Application/workload while the descriptor and any managed persistent"
+            echo "storage it names are retained. lifecycle.state is retired and rejected"
+            echo "outright by the deployment model -- it is never a second source of truth for"
+            echo "runtime presence."
             echo ""
             echo "### Validation commands"
             echo ""

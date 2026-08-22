@@ -83,7 +83,7 @@ ecrTokenSync:
     tag: "1.33.13"
     pullPolicy: Always # tag was just re-mirrored in ECR; avoid reusing a stale cached image
 
-# Exposes the Argo CD UI on the GoldenGate shared internal ALB/wildcard DNS; listenPorts declares this Ingress's own HTTPS listener. host/groupName/certificateArn are shared environment identity, injected by the deploy workflow from envs/dev/environment.yaml. Fresh-cluster bootstrap: mode=standalone -- Argo CD is the first permanent application-layer service MAIN deploys (runtime lifecycle.state remains absent and the monitor Ingress remains disabled), so no other Ingress yet exists to anchor the shared ALB. Argo CD's own Ingress is therefore the resident/anchor owner of the ALB-level/exclusive configuration (scheme below) until a future GoldenGate runtime or monitor Ingress joins this same groupName in shared mode.
+# Exposes the Argo CD UI on the GoldenGate shared internal ALB/wildcard DNS; listenPorts declares this Ingress's own HTTPS listener. host/groupName/certificateArn are shared environment identity, injected by the deploy workflow from envs/dev/environment.yaml. Fresh-cluster bootstrap: mode=standalone -- Argo CD is the first permanent application-layer service MAIN deploys, so no other Ingress has joined the shared ALB group yet at bootstrap time (the monitor Ingress remains disabled; any GoldenGate runtime Ingress joins only once its runtime deployment has actually reconciled). Argo CD's own Ingress is therefore the resident/anchor owner of the ALB-level/exclusive configuration (scheme below) until a future GoldenGate runtime or monitor Ingress joins this same groupName in shared mode.
 argocdServerIngress:
   enabled: true
   mode: standalone

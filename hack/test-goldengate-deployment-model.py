@@ -1002,7 +1002,7 @@ class FullValidationGatingTests(unittest.TestCase):
 
 
 class ManagedEfsInventoryCommandTests(ScratchEnvironmentTestCase):
-    """The managed-efs-inventory command feeds the workflow's managed_efs_inventory_guard; it must include lifecycle.state=absent managed descriptors (their EFS is retained, not decommissioned) and exclude existing-mode descriptors entirely."""
+    """The managed-efs-inventory command feeds the workflow's managed_efs_inventory_guard; it must include deployment.enabled=false managed descriptors (their EFS is retained, not decommissioned) and exclude existing-mode descriptors entirely."""
 
     def _run(self):
         class Args:
@@ -1030,9 +1030,10 @@ class ManagedEfsInventoryCommandTests(ScratchEnvironmentTestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(inventory, [{"deploymentId": "gg-fixture-01", "efsCreationToken": "dev-gg-fixture-01-efs"}])
 
-    def test_lifecycle_absent_managed_descriptor_is_still_included(self):
+    def test_deployment_disabled_managed_descriptor_is_still_included(self):
+        # GoldenGate Runtime Desired-State Simplification: deployment.enabled=false (never the retired lifecycle.state=absent) is now the shape that keeps a managed-EFS descriptor's storage in the expected/protected inventory while excluding it from the active runtime set -- EFS remains retained, not decommissioned, purely because the descriptor is inactive.
         doc = _efs_test_doc(persistence={"enabled": True, "provider": "efs", "efs": {"mode": "managed"}})
-        doc["lifecycle"] = {"state": "absent"}
+        doc["deployment"]["enabled"] = False
         write_doc(self._tmp.name, "dev", "gg-fixture-01", doc)
         exit_code, inventory = self._run()
         self.assertEqual(exit_code, 0)
@@ -1074,8 +1075,8 @@ class SharedSecretsCommandTests(ScratchEnvironmentTestCase):
         ])
 
 
-class LifecycleClassificationTests(ScratchEnvironmentTestCase):
-    """Disabled/absent runtimes validate but are excluded from active inventory."""
+class DeploymentEnabledClassificationTests(ScratchEnvironmentTestCase):
+    """deployment.enabled is the SOLE runtime-presence control (GoldenGate Runtime Desired-State Simplification): a disabled runtime validates but is excluded from active inventory; lifecycle.state is retired and rejected outright as invalid, never treated as a second source of truth."""
 
     def test_disabled_runtime_validates_but_excluded(self):
         write_descriptor(self._tmp.name, "dev", "gg-disabled-fixture-01", enabled=False)
@@ -1084,13 +1085,63 @@ class LifecycleClassificationTests(ScratchEnvironmentTestCase):
         self.assertEqual(active, [])
         self.assertEqual(len(inactive), 1)
 
-    def test_lifecycle_state_absent_validates_but_excluded(self):
-        write_descriptor(self._tmp.name, "dev", "gg-absent-fixture-01",
+    def test_lifecycle_block_is_rejected_never_a_second_presence_control(self):
+        write_descriptor(self._tmp.name, "dev", "gg-stale-lifecycle-fixture-01",
                          extra="\nlifecycle:\n  state: absent\n")
+        active, inactive, invalid = gdm.scan("dev")
+        self.assertEqual(active, [])
+        self.assertEqual(inactive, [])
+        self.assertEqual(len(invalid), 1)
+        _path, reason = invalid[0]
+        self.assertIn("lifecycle.state is no longer supported for runtime presence; use deployment.enabled only", reason)
+
+    def test_lifecycle_block_rejected_even_when_deployment_enabled_true(self):
+        # A stale lifecycle block must be rejected regardless of deployment.enabled's own value -- never silently ignored merely because enabled=true would otherwise mean "active".
+        write_descriptor(self._tmp.name, "dev", "gg-stale-lifecycle-active-fixture-01", enabled=True,
+                         extra="\nlifecycle:\n  state: active\n")
+        active, inactive, invalid = gdm.scan("dev")
+        self.assertEqual(active, [])
+        self.assertEqual(inactive, [])
+        self.assertEqual(len(invalid), 1)
+
+    def test_descriptor_dict_no_longer_carries_a_lifecycle_state_key(self):
+        # Structural proof: the parsed descriptor dict itself no longer has a lifecycleState field at all -- there is no lingering internal second source of truth, even for a caller that bypasses classify_folder's active/inactive decision.
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01")
+        active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        self.assertEqual(len(active), 1)
+        self.assertNotIn("lifecycleState", active[0])
+
+
+class ReplicationRequiresDeploymentEnabledTests(ScratchEnvironmentTestCase):
+    """replication.enabled remains an independent control, but replication can never be desired for a runtime that is itself not desired to exist -- deployment.enabled=false + replication.enabled=true is an invalid combination, rejected early and clearly."""
+
+    def test_disabled_deployment_with_replication_enabled_is_invalid(self):
+        write_descriptor(self._tmp.name, "dev", "gg-disabled-with-replication-fixture-01", enabled=False,
+                         extra="\nreplication:\n  enabled: true\n")
+        active, inactive, invalid = gdm.scan("dev")
+        self.assertEqual(active, [])
+        self.assertEqual(inactive, [])
+        self.assertEqual(len(invalid), 1)
+        _path, reason = invalid[0]
+        self.assertIn("replication.enabled=true requires deployment.enabled=true", reason)
+
+    def test_disabled_deployment_with_replication_disabled_is_valid_and_inactive(self):
+        write_descriptor(self._tmp.name, "dev", "gg-disabled-no-replication-fixture-01", enabled=False,
+                         extra="\nreplication:\n  enabled: false\n")
         active, inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
         self.assertEqual(active, [])
         self.assertEqual(len(inactive), 1)
+
+    def test_enabled_deployment_with_replication_disabled_is_valid_and_active(self):
+        write_descriptor(self._tmp.name, "dev", "gg-enabled-no-replication-fixture-01", enabled=True,
+                         extra="\nreplication:\n  enabled: false\n")
+        active, inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        self.assertEqual(inactive, [])
+        self.assertEqual(len(active), 1)
+        self.assertFalse(active[0]["replicationEnabled"])
 
 
 class FailClosedTests(ScratchEnvironmentTestCase):

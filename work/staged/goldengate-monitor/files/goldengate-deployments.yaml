@@ -3,4 +3,16 @@ runtimeNamespace: goldengate-dev
 monitoringNamespace: goldengate-monitoring
 dnsDomain: goldengate-dev.adcbmis.local
 tlsSecret: dev/goldengate/tls-certificate
-deployments: []
+deployments:
+- name: gg-mssql-repltest-01
+  type: mssql
+  pipeline: repltest-pg-to-mssql-001
+  role: target
+  enabled: true
+  adminSecret: dev/goldengate/target/admin
+- name: gg-postgresql-repltest-01
+  type: postgresql
+  pipeline: repltest-pg-to-mssql-001
+  role: source
+  enabled: true
+  adminSecret: dev/goldengate/source/admin

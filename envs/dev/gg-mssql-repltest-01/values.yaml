@@ -4,9 +4,6 @@ deployment:
   pipeline: repltest-pg-to-mssql-001
   role: target
 
-lifecycle:
-  state: absent
-
 deploymentModel: singleRuntime
 
 replication:

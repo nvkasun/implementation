@@ -3029,10 +3029,10 @@ HARNESS
              "${DELETION_REPO}/envs/dev/case-empty-whitespace" \
              "${DELETION_REPO}/envs/dev/case-empty-null" \
              "${DELETION_REPO}/envs/dev/case3-historical-legacypair-removed" \
-             "${DELETION_REPO}/envs/dev/case8-lifecycle-absent"
+             "${DELETION_REPO}/envs/dev/case8-deployment-disabled"
 
     printf 'deploymentModel: singleRuntime\nrunning: at-base-revision\n' > "${DELETION_REPO}/envs/dev/case2-removed-canonical/values.yaml"
-    printf 'deploymentModel: singleRuntime\ndeployment:\n  enabled: true\npersistence:\n  enabled: true\n  provider: efs\n  efs:\n    mode: managed\n' > "${DELETION_REPO}/envs/dev/case8-lifecycle-absent/values.yaml"
+    printf 'deploymentModel: singleRuntime\ndeployment:\n  enabled: true\npersistence:\n  enabled: true\n  provider: efs\n  efs:\n    mode: managed\n' > "${DELETION_REPO}/envs/dev/case8-deployment-disabled/values.yaml"
     printf 'global:\n  environment: dev\nnamespace:\n  create: true\n' > "${DELETION_REPO}/envs/dev/goldengate-monitor/values.yaml"
     printf 'server:\n  extraArgs: []\n' > "${DELETION_REPO}/envs/dev/argocd/values.yaml"
     printf 'deploymentModel: singleRuntime\n  bad indent: [unterminated\n' > "${DELETION_REPO}/envs/dev/case6-malformed/values.yaml"
@@ -3056,8 +3056,8 @@ HARNESS
     mkdir -p "${DELETION_REPO}/envs/dev/case1-retired-legacypair-retained"
     printf 'deploymentModel: legacyPair\ndeployment:\n  enabled: false\n' > "${DELETION_REPO}/envs/dev/case1-retired-legacypair-retained/values.yaml"
 
-    # case8: the file is NOT removed -- only its content changes to add lifecycle.state=absent, proving the physical-removal/lifecycle-absent distinction (the descriptor and its managed EFS declaration are still physically present).
-    printf 'deploymentModel: singleRuntime\ndeployment:\n  enabled: true\npersistence:\n  enabled: true\n  provider: efs\n  efs:\n    mode: managed\nlifecycle:\n  state: absent\n' > "${DELETION_REPO}/envs/dev/case8-lifecycle-absent/values.yaml"
+    # case8: the file is NOT removed -- only its content changes to deployment.enabled=false, proving the physical-removal/deployment-disabled distinction (the descriptor and its managed EFS declaration are still physically present). GoldenGate Runtime Desired-State Simplification: deployment.enabled=false is now the sole shape that produces this "still present, application decommission" deletion-matrix entry -- lifecycle.state is retired and no longer a second mechanism for it.
+    printf 'deploymentModel: singleRuntime\ndeployment:\n  enabled: false\npersistence:\n  enabled: true\n  provider: efs\n  efs:\n    mode: managed\n' > "${DELETION_REPO}/envs/dev/case8-deployment-disabled/values.yaml"
 
     : > "${DELETION_REPO}/envs/dev/case-empty-zerobyte/values.yaml"
     printf '# retired\n# nothing here\n' > "${DELETION_REPO}/envs/dev/case-empty-comment/values.yaml"
@@ -3080,7 +3080,7 @@ HARNESS
       }
       BEFORE_SHA="'"$DELETION_BEFORE_SHA"'"
 
-      for id in case1-retired-legacypair-retained case2-removed-canonical case3-historical-legacypair-removed goldengate-monitor argocd case6-malformed case7-unknown-model case-empty-zerobyte case-empty-comment case-empty-whitespace case-empty-null case8-lifecycle-absent; do
+      for id in case1-retired-legacypair-retained case2-removed-canonical case3-historical-legacypair-removed goldengate-monitor argocd case6-malformed case7-unknown-model case-empty-zerobyte case-empty-comment case-empty-whitespace case-empty-null case8-deployment-disabled; do
         DELETION_MATRIX_ITEMS="[]"
         INACTIVE_LOG=""
         DELETION_CANDIDATE_IDS="$id"
@@ -3108,7 +3108,7 @@ HARNESS
       fi
     }
 
-    check_deletion_case "retained legacyPair (deployment.enabled=false) produces no deletion entry" \
+    check_deletion_case "1: a still-present legacyPair descriptor (deployment.enabled=false) produces no deletion entry -- legacyPair is retired and rejected outright as 'not a GoldenGate deployment values file' before the deployment.enabled=false/deployment-disabled classification is ever reached, unaffected by the GoldenGate Runtime Desired-State Simplification (proven for the still-eligible singleRuntime shape by case8 below instead)" \
       '^RESULT case1-retired-legacypair-retained => \[\]$'
     check_deletion_case "2: removed canonical GoldenGate values (deploymentModel: singleRuntime) produces a deletion entry with deployment_model=singleRuntime and reason=physical-removal" \
       '^RESULT case2-removed-canonical => \[ADDED id=case2-removed-canonical model=singleRuntime reason=physical-removal\]$'
@@ -3130,8 +3130,8 @@ HARNESS
       '^RESULT case-empty-whitespace => \[ADDED id=case-empty-whitespace model=singleRuntime reason=physical-removal\]$'
     check_deletion_case "9: YAML null creates its deletion entry when the previous file was valid, reason=physical-removal" \
       '^RESULT case-empty-null => \[ADDED id=case-empty-null model=singleRuntime reason=physical-removal\]$'
-    check_deletion_case "11 (Issue 3): lifecycle.state=absent while the descriptor still physically exists produces a deletion-matrix entry classified as reason=lifecycle-absent, never physical-removal" \
-      '^RESULT case8-lifecycle-absent => \[ADDED id=case8-lifecycle-absent model=singleRuntime reason=lifecycle-absent\]$'
+    check_deletion_case "11 (GoldenGate Runtime Desired-State Simplification): deployment.enabled=false while the descriptor still physically exists produces a deletion-matrix entry classified as reason=deployment-disabled, never physical-removal" \
+      '^RESULT case8-deployment-disabled => \[ADDED id=case8-deployment-disabled model=singleRuntime reason=deployment-disabled\]$'
 
     rm -rf "$DELETION_REPO"
   else
@@ -3339,7 +3339,7 @@ else
   skip "static legacyPair/source-target-validation absence checks -- python3 not available"
 fi
 
-# 9: the build job's workflow summary accurately documents every deletion trigger (physical removal, zero-byte, whitespace-only, comment-only, YAML null, lifecycle.state=absent) and describes enabled=false/deployment.enabled=false as retained (non-deleting).
+# 9 (GoldenGate Runtime Desired-State Simplification): the build job's workflow summary accurately documents every deletion trigger (physical removal, zero-byte, whitespace-only, comment-only, YAML null, deployment.enabled=false) and states that lifecycle.state is retired and no longer a second source of truth.
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   BUILD_SUMMARY_TEXT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
 import sys
@@ -3356,14 +3356,18 @@ PYEOF
 )"
 
   SUMMARY_MISSING=""
-  for phrase in "zero-byte" "whitespace-only" "comment-only" "YAML null" "lifecycle.state=absent" "physical removal" "retired-but-retained" "never trigger deletion"; do
+  for phrase in "zero-byte" "whitespace-only" "comment-only" "YAML null" "physical removal" "deployment.enabled=false" "lifecycle.state is retired"; do
     echo "$BUILD_SUMMARY_TEXT" | grep -qF "$phrase" || SUMMARY_MISSING="${SUMMARY_MISSING} [${phrase}]"
   done
+  # lifecycle.state=absent must never reappear as a documented deletion trigger -- it is fully retired, never a second source of truth.
+  if echo "$BUILD_SUMMARY_TEXT" | grep -qF "lifecycle.state=absent"; then
+    SUMMARY_MISSING="${SUMMARY_MISSING} [unexpected: lifecycle.state=absent still documented]"
+  fi
 
   if [ -z "$SUMMARY_MISSING" ]; then
-    pass "9: the workflow summary documents every deletion trigger (physical removal, zero-byte, whitespace-only, comment-only, YAML null, lifecycle.state=absent) and describes enabled=false/deployment.enabled=false as retained, never deleting"
+    pass "9: the workflow summary documents every deletion trigger (physical removal, zero-byte, whitespace-only, comment-only, YAML null, deployment.enabled=false) and states lifecycle.state is retired, never a second source of truth"
   else
-    fail "9: the workflow summary is missing expected deletion-trigger documentation:${SUMMARY_MISSING}"
+    fail "9: the workflow summary is missing expected deletion-trigger documentation, or still documents the retired lifecycle.state=absent shape:${SUMMARY_MISSING}"
   fi
 else
   skip "workflow summary deletion-trigger documentation check -- python3 not available"
@@ -7070,22 +7074,23 @@ check("9: the EFS module for_each no longer references the unfiltered canonical 
 check("10: the corporate EFS module source/version is unchanged", "git::https://github.com/AbuDhabiCommercialBank/aws-tf-module-efs?ref=v1.0.0" in module_body)
 
 check("11: a fail-closed precondition rejects a decommission ID that is not a real managed-EFS deployment", "setsubtract(local.goldengate_managed_efs_decommission_ids, keys(local.goldengate_managed_efs_deployments))" in efs_tf)
-check("12: a fail-closed precondition requires lifecycle.state=absent for every decommissioned ID", "lifecycle.state, \"active\") == \"absent\"" in efs_tf)
+retired_precondition_needle = "lifecycle.state, " + chr(34) + "active" + chr(34) + ") == " + chr(34) + "absent" + chr(34)
+check("12 (GoldenGate Runtime Desired-State Simplification): the retired lifecycle.state=absent precondition is gone -- decommission-set membership is now proven to be an explicit, out-of-band authorization, never re-derived from any single descriptor field (including deployment.enabled)", retired_precondition_needle not in efs_tf and "goldengate_managed_efs_decommission_contract" in efs_tf)
 check("13: a fail-closed precondition requires replication.enabled=false for every decommissioned ID", "replication.enabled, true) == false" in efs_tf)
 
 with open("envs/dev/goldengate_inventory.tf") as f:
     inventory_tf = f.read()
 check("14: goldengate_inventory.tf is untouched -- the canonical local.goldengate_managed_efs_deployments keeps its own lifecycle.state-independent comment", "never disappear from this map merely because a deployment is temporarily disabled" in inventory_tf)
 
-# Empirical, not just structural: cross-check against the REAL live deployment-model output (point 1: lifecycle.state=absent alone still retains EFS in the CANONICAL inventory; point 4: the decommission set matches exactly, never a superset/subset of, the real managed-EFS deployment IDs -- so this can never silently affect an unrelated managed EFS).
+# Empirical, not just structural: cross-check against the REAL live deployment-model output (point 1: deployment.enabled=true/false alone never removes a descriptor from the CANONICAL inventory; point 4: the decommission set matches exactly, never a superset/subset of, the real managed-EFS deployment IDs -- so this can never silently affect an unrelated managed EFS).
 active, inactive, invalid = gdm.scan("dev")
 check("scan(dev): no invalid descriptors", invalid == [])
 canonical_managed_ids = sorted(d["deploymentId"] for d in (active + inactive) if d["efsMode"] == "managed")
-check("15: the canonical (unfiltered) managed-EFS inventory still contains exactly the same two IDs -- lifecycle.state=absent alone never removes a descriptor from it", canonical_managed_ids == ["gg-mssql-repltest-01", "gg-postgresql-repltest-01"])
+check("15: the canonical (unfiltered) managed-EFS inventory still contains exactly the same two IDs -- active/inactive status alone never removes a descriptor from it", canonical_managed_ids == ["gg-mssql-repltest-01", "gg-postgresql-repltest-01"])
 check("16: the explicit decommission set matches the real managed-EFS deployment IDs exactly (never a superset that could silently affect an unrelated managed EFS)", decommission_ids == canonical_managed_ids)
 
 by_id = {d["deploymentId"]: d for d in (active + inactive)}
-check("17: both real decommissioned descriptors currently have lifecycle.state=absent", all(by_id[i]["deploymentId"] not in [x["deploymentId"] for x in active] for i in decommission_ids))
+check("17 (GoldenGate Runtime Desired-State Simplification): both real EFS-hold descriptors are now ACTIVE runtime deployment intents (deployment.enabled=true, lifecycle.state removed) -- the Terraform-side EFS decommission hold remains a SEPARATE, independent authorization from runtime desired presence, proving the required distinction between the two concerns", all(by_id[i]["deploymentId"] in [x["deploymentId"] for x in active] for i in decommission_ids))
 check("18: both real decommissioned descriptors currently have replication.enabled=false", all(by_id[i]["replicationEnabled"] is False for i in decommission_ids))
 
 # Verify the shared EFS SG lookup follows the post-decommission desired-EFS map.
@@ -7361,7 +7366,7 @@ else
 fi
 
 echo ""
-echo "--- Correction pass, Issue 3: physical deletion vs lifecycle.state=absent ---"
+echo "--- Correction pass, Issue 3: physical deletion vs deployment.enabled=false (deployment-disabled) ---"
 
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   python3 - "$EKS_APP_WORKFLOW" > "${WORKDIR}/deletion_guard.sh" <<'PYEOF'
@@ -7392,27 +7397,27 @@ PYEOF
       echo "$PHYSICAL_OUT"
     fi
 
-    LIFECYCLE_ABSENT_MATRIX='[{"deployment_id":"gg-y","efs_mode":"managed","reason":"lifecycle-absent"}]'
+    DEPLOYMENT_DISABLED_MATRIX='[{"deployment_id":"gg-y","efs_mode":"managed","reason":"deployment-disabled"}]'
     set +e
-    LIFECYCLE_OUT="$(DELETION_MATRIX="$LIFECYCLE_ABSENT_MATRIX" bash "${WORKDIR}/deletion_guard.sh" 2>&1)"
-    LIFECYCLE_STATUS=$?
+    DEPLOYMENT_DISABLED_OUT="$(DELETION_MATRIX="$DEPLOYMENT_DISABLED_MATRIX" bash "${WORKDIR}/deletion_guard.sh" 2>&1)"
+    DEPLOYMENT_DISABLED_STATUS=$?
     set -e
-    if [ "$LIFECYCLE_STATUS" -eq 0 ] && echo "$LIFECYCLE_OUT" | grep -qF "ALLOWED (application decommission only, managed storage retained)"; then
-      pass "12: managed + reason=lifecycle-absent does NOT fail the guard (application decommission allowed, EFS retained, no Terraform destroy triggered)"
+    if [ "$DEPLOYMENT_DISABLED_STATUS" -eq 0 ] && echo "$DEPLOYMENT_DISABLED_OUT" | grep -qF "ALLOWED (application decommission only, managed storage retained)"; then
+      pass "12 (GoldenGate Runtime Desired-State Simplification): managed + reason=deployment-disabled does NOT fail the guard (application decommission allowed, EFS retained, no Terraform destroy triggered)"
     else
-      fail "12: managed + reason=lifecycle-absent incorrectly failed the guard (or the allowed-path message is missing)"
-      echo "$LIFECYCLE_OUT"
+      fail "12: managed + reason=deployment-disabled incorrectly failed the guard (or the allowed-path message is missing)"
+      echo "$DEPLOYMENT_DISABLED_OUT"
     fi
 
-    MIXED_MATRIX='[{"deployment_id":"gg-y","efs_mode":"managed","reason":"lifecycle-absent"},{"deployment_id":"gg-x","efs_mode":"managed","reason":"physical-removal"}]'
+    MIXED_MATRIX='[{"deployment_id":"gg-y","efs_mode":"managed","reason":"deployment-disabled"},{"deployment_id":"gg-x","efs_mode":"managed","reason":"physical-removal"}]'
     set +e
     MIXED_OUT="$(DELETION_MATRIX="$MIXED_MATRIX" bash "${WORKDIR}/deletion_guard.sh" 2>&1)"
     MIXED_STATUS=$?
     set -e
     if [ "$MIXED_STATUS" -ne 0 ] && echo "$MIXED_OUT" | grep -qF "gg-x" && ! echo "$MIXED_OUT" | grep -qE "FAIL.*gg-y"; then
-      pass "11: a mixed deletion matrix fails closed only on the physical-removal entry, never conflating it with the lifecycle-absent entry"
+      pass "11: a mixed deletion matrix fails closed only on the physical-removal entry, never conflating it with the deployment-disabled entry"
     else
-      fail "11: mixed physical-removal/lifecycle-absent deletion matrix was not classified independently"
+      fail "11: mixed physical-removal/deployment-disabled deletion matrix was not classified independently"
       echo "$MIXED_OUT"
     fi
 
@@ -9158,12 +9163,14 @@ else
   fail "11: envs/dev/iam.tf's corporate IAM module pin changed, or a raw aws_iam_role resource was introduced"
 fi
 
-# 12/13: current runtime/EFS safety state is unchanged by this phase.
-if grep -A1 '^lifecycle:' envs/dev/gg-postgresql-repltest-01/values.yaml 2>/dev/null | grep -q 'state: absent' \
-    && grep -A1 '^lifecycle:' envs/dev/gg-mssql-repltest-01/values.yaml 2>/dev/null | grep -q 'state: absent'; then
-  pass "12: both runtime descriptors remain lifecycle.state=absent"
+# 12/13 (GoldenGate Runtime Desired-State Simplification): both runtime descriptors no longer carry a lifecycle block at all -- deployment.enabled is the sole runtime-presence control, and both are now enabled=true (active runtime deployment intents).
+if ! grep -q '^lifecycle:' envs/dev/gg-postgresql-repltest-01/values.yaml 2>/dev/null \
+    && ! grep -q '^lifecycle:' envs/dev/gg-mssql-repltest-01/values.yaml 2>/dev/null \
+    && grep -A1 '^deployment:' envs/dev/gg-postgresql-repltest-01/values.yaml 2>/dev/null | grep -q 'enabled: true' \
+    && grep -A1 '^deployment:' envs/dev/gg-mssql-repltest-01/values.yaml 2>/dev/null | grep -q 'enabled: true'; then
+  pass "12: both runtime descriptors carry no lifecycle block and are deployment.enabled=true"
 else
-  fail "12: a runtime descriptor's lifecycle.state is no longer absent"
+  fail "12: a runtime descriptor still carries a lifecycle block, or is no longer deployment.enabled=true"
 fi
 
 if grep -A1 '^replication:' envs/dev/gg-postgresql-repltest-01/values.yaml 2>/dev/null | grep -q 'enabled: false' \
@@ -9386,7 +9393,7 @@ else
   skip "Live Deploy UX Fix 2: Compute effective deploy flag execution proof -- python3/PyYAML/bash unavailable or main workflow missing"
 fi
 
-# J/K/N: REALLY EXECUTE the committed hack/detect-goldengate-deployments.sh for the environment-wide manual contract and the still-rejected lifecycle.state=absent path.
+# J/K: REALLY EXECUTE the committed hack/detect-goldengate-deployments.sh for the environment-wide manual contract. N (GoldenGate Runtime Desired-State Simplification): a manual selected deployment.enabled=false descriptor is still rejected -- re-proven here against a scratch synthetic fixture rather than the real repo descriptors, since both real DEV descriptors are now genuinely active (deployment.enabled=true) and would no longer exercise this rejection path.
 if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$DETECT_SCRIPT" ]; then
   set +e
   LIVE_UX_FIX_2_DETECT_OUT="$(python3 - "$DETECT_SCRIPT" <<'PYEOF'
@@ -9398,7 +9405,7 @@ import tempfile
 detect_script = sys.argv[1]
 
 
-def run_detect(deployment_id, deploy_bool, environment="dev"):
+def run_detect(deployment_id, deploy_bool, environment="dev", cwd=None):
     env = dict(os.environ)
     env["EVENT_NAME"] = "workflow_dispatch"
     env["INPUT_ENVIRONMENT"] = environment
@@ -9408,7 +9415,7 @@ def run_detect(deployment_id, deploy_bool, environment="dev"):
     env["AFTER_SHA"] = ""
     out_file = tempfile.mktemp()
     env["GITHUB_OUTPUT"] = out_file
-    proc = subprocess.run(["bash", detect_script], env=env, capture_output=True, text=True, timeout=20)
+    proc = subprocess.run(["bash", os.path.abspath(detect_script)], env=env, capture_output=True, text=True, timeout=20, cwd=cwd)
     outputs = {}
     if os.path.exists(out_file):
         with open(out_file) as f:
@@ -9446,8 +9453,14 @@ proc, outputs = run_detect("", "false")
 check("K: manual environment-wide Validate (deployment_id=\x27\x27, INPUT_DEPLOY=false) emits the exact empty-mutation contract",
       proc.returncode == 0 and all(outputs.get(k) == v for k, v in EMPTY_MATRIX_EXPECTED.items()), proc, outputs)
 
-proc, outputs = run_detect("gg-postgresql-repltest-01", "true")
-check("N: manual selected lifecycle.state=absent descriptor is still rejected (non-zero exit)", proc.returncode != 0, proc, outputs)
+import tempfile as _tempfile
+scratch_dir = _tempfile.mkdtemp(prefix="detect-manual-disabled-")
+os.makedirs(os.path.join(scratch_dir, "envs", "dev", "gg-manual-disabled-synthetic-01"), exist_ok=True)
+with open(os.path.join(scratch_dir, "envs", "dev", "gg-manual-disabled-synthetic-01", "values.yaml"), "w") as f:
+    f.write("deploymentModel: singleRuntime\ndeployment:\n  enabled: false\n")
+
+proc, outputs = run_detect("gg-manual-disabled-synthetic-01", "true", cwd=scratch_dir)
+check("N: manual selected deployment.enabled=false descriptor is still rejected (non-zero exit)", proc.returncode != 0, proc, outputs)
 
 if failures:
     print("\n".join(failures))
@@ -9460,7 +9473,7 @@ PYEOF
   if [ "$LIVE_UX_FIX_2_DETECT_STATUS" -eq 0 ]; then
     pass "Live Deploy UX Fix 2: J: manual environment-wide Deploy emits the exact empty-mutation contract (deployment_matrix=[], has_changes=false, has_deletions=false)"
     pass "Live Deploy UX Fix 2: K: manual environment-wide Validate emits the exact empty-mutation contract"
-    pass "Live Deploy UX Fix 2: N: manual selected lifecycle.state=absent descriptor is still rejected"
+    pass "Live Deploy UX Fix 2: N: manual selected deployment.enabled=false descriptor is still rejected"
   else
     fail "Live Deploy UX Fix 2: environment-wide/rejection detector execution proof failed:"$'\n'"${LIVE_UX_FIX_2_DETECT_OUT}"
   fi
@@ -9468,7 +9481,24 @@ else
   skip "Live Deploy UX Fix 2: environment-wide detector execution proof -- python3/bash unavailable or detector missing"
 fi
 
-# L/M: manual SELECTED ACTIVE deployment behavior is unchanged for both actions -- a minimal synthetic singleRuntime descriptor (deploymentModel: singleRuntime is the entire active-classification contract; no other field is required) in an isolated scratch copy, never touching the real envs/dev descriptors (both of which are intentionally lifecycle.state=absent today).
+# GoldenGate Runtime Desired-State Simplification: manually selecting either REAL current DEV descriptor now succeeds (they are genuinely active, deployment.enabled=true, no lifecycle block) -- REALLY EXECUTE the committed detector against the real repository working tree, proving the "IMPORTANT CONSEQUENCE" the task itself calls out.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$DETECT_SCRIPT" ]; then
+  for real_id in gg-postgresql-repltest-01 gg-mssql-repltest-01; do
+    REAL_SELECT_OUTPUT_FILE="$(mktemp)"
+    REAL_SELECT_STDOUT="$(EVENT_NAME="workflow_dispatch" INPUT_ENVIRONMENT="dev" INPUT_DEPLOYMENT_ID="$real_id" INPUT_DEPLOY="true" BEFORE_SHA="" AFTER_SHA="" GITHUB_OUTPUT="$REAL_SELECT_OUTPUT_FILE" bash "$DETECT_SCRIPT" 2>&1)"
+    REAL_SELECT_STATUS=$?
+    if [ "$REAL_SELECT_STATUS" -eq 0 ] && grep -q "deployment_matrix=\[{" "$REAL_SELECT_OUTPUT_FILE" && grep -qF "\"deployment_id\":\"${real_id}\"" "$REAL_SELECT_OUTPUT_FILE"; then
+      pass "GoldenGate Runtime Desired-State Simplification: manually selecting the real ${real_id} descriptor now succeeds and produces a one-item matrix (deployment.enabled=true, no lifecycle block)"
+    else
+      fail "GoldenGate Runtime Desired-State Simplification: manually selecting the real ${real_id} descriptor did not succeed as expected (status=${REAL_SELECT_STATUS}):"$'\n'"${REAL_SELECT_STDOUT}"$'\n'"$(cat "$REAL_SELECT_OUTPUT_FILE" 2>/dev/null)"
+    fi
+    rm -f "$REAL_SELECT_OUTPUT_FILE"
+  done
+else
+  skip "GoldenGate Runtime Desired-State Simplification: real-descriptor manual-selection success proof -- python3/bash unavailable or detector missing"
+fi
+
+# L/M: manual SELECTED ACTIVE deployment behavior is unchanged for both actions -- a minimal synthetic singleRuntime descriptor (deploymentModel: singleRuntime is the entire active-classification contract; no other field is required) in an isolated scratch copy, never touching the real envs/dev descriptors (both of which are now genuinely active deployment.enabled=true deployments themselves, proven separately above).
 if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$DETECT_SCRIPT" ]; then
   LIVE_UX_FIX_2_ACTIVE_SCRATCH="${WORKDIR}/live-ux-fix-2-active-synthetic"
   mkdir -p "${LIVE_UX_FIX_2_ACTIVE_SCRATCH}/envs/dev/gg-live-ux-fix-2-synthetic-01"
@@ -9506,7 +9536,7 @@ else
   fail "Live Deploy UX Fix 2: O: the push-trigger branch of ${DETECT_SCRIPT} appears to have changed"
 fi
 
-# P: environment-wide Deploy (has_changes=false) does not make final_validation require the selected-runtime mutation jobs -- REALLY EXECUTE the committed "Validate the mode-aware final DEPLOY success contract" script for exactly this scenario (has_active_deployments=false, matching the current DEV registry).
+# P: environment-wide Deploy (has_changes=false) does not make final_validation require the selected-runtime mutation jobs -- REALLY EXECUTE the committed "Validate the mode-aware final DEPLOY success contract" script for exactly this scenario (has_active_deployments=false, a synthetic fixture exercising the no-active-runtime code path -- the real current DEV registry now has active runtimes, proven separately elsewhere in this suite; this scenario remains a required, independently valid code path regardless).
 if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
   set +e
   LIVE_UX_FIX_2_GATE_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
@@ -13285,17 +13315,17 @@ else
   fail "Live Argo ALB Convergence Timing Fix: the regional STS environment in ${ECR_TOKEN_SYNC_CRONJOB_TEMPLATE}/${ARGOCD_DEPLOY_WORKFLOW} appears to have regressed"
 fi
 
-# Frozen runtime descriptors remain untouched by this fix (defense in depth -- re-confirmed here even though this fix never touches runtime files at all).
+# Runtime descriptors remain untouched by THIS fix (defense in depth -- re-confirmed here even though this fix never touches runtime files at all). GoldenGate Runtime Desired-State Simplification (a later, independent task) legitimately removed lifecycle.state from both descriptors and made them deployment.enabled=true active runtime deployment intents -- the invariant this check re-confirms is now "no lifecycle block, replication remains disabled", never the older lifecycle.state=absent shape.
 FIX_ALB_FROZEN_OK="true"
 for frozen_descriptor in envs/dev/gg-postgresql-repltest-01/values.yaml envs/dev/gg-mssql-repltest-01/values.yaml; do
-  if ! grep -A1 '^lifecycle:' "$frozen_descriptor" | grep -qF 'state: absent'; then
+  if grep -q '^lifecycle:' "$frozen_descriptor" || ! grep -A1 '^replication:' "$frozen_descriptor" | grep -qF 'enabled: false'; then
     FIX_ALB_FROZEN_OK="false"
   fi
 done
 if [ "$FIX_ALB_FROZEN_OK" = "true" ]; then
-  pass "Live Argo ALB Convergence Timing Fix: both frozen runtime descriptors remain lifecycle.state: absent -- no runtime/replication activation occurred"
+  pass "Live Argo ALB Convergence Timing Fix: both runtime descriptors carry no lifecycle block and remain replication.enabled=false -- no replication activation occurred"
 else
-  fail "Live Argo ALB Convergence Timing Fix: a frozen runtime descriptor's lifecycle.state no longer reads 'absent'"
+  fail "Live Argo ALB Convergence Timing Fix: a runtime descriptor still carries a lifecycle block, or replication is no longer disabled"
 fi
 
 # A10/contract: the Generic MAIN Desired-State Convergence Fix retired the CLASSIFIER_CONTRACT/EXPECTED_CONTRACT version-skew marker entirely (argocd_state.py is no longer a special case -- ABSENT/OWNED/BROKEN is now a stable, generic, universally-shared contract with no version marker at all, exactly like runtime_state.py/monitor_state.py always were). Re-confirmed explicitly here that the retired mechanism has actually been removed from BOTH sides, not merely left unused on one side.
@@ -13458,17 +13488,17 @@ if grep -qF "enable_cloudwatch_publication: true" .github/workflows/00-main-gold
 else
   fail "Fix 3: MAIN's monitor_sync_once no longer sets enable_cloudwatch_publication: true -- the three-layer Monitor audit no longer holds"
 fi
-# This MAIN deployment intent is reached only once monitor_sync_once actually runs, which itself requires an active runtime -- currently zero, per the frozen runtime phase. Flipping this MAIN-level intent is not itself a runtime-activation or EFS-hold change, and this task makes no such change.
+# This MAIN deployment intent is reached only once monitor_sync_once actually runs, which itself requires an active runtime. GoldenGate Runtime Desired-State Simplification (a later, independent task) legitimately activated both current runtime descriptors (deployment.enabled=true, lifecycle.state removed) -- this check now re-confirms the still-relevant invariant this Fix 3 originally cared about: flipping the MAIN-level monitor cloudwatch intent is not itself a replication-activation or EFS-hold change, so replication stays disabled and no lifecycle block reappears.
 FROZEN_LIFECYCLE_OK="true"
 for frozen_descriptor in envs/dev/gg-postgresql-repltest-01/values.yaml envs/dev/gg-mssql-repltest-01/values.yaml; do
-  if ! grep -A1 '^lifecycle:' "$frozen_descriptor" | grep -qF 'state: absent'; then
+  if grep -q '^lifecycle:' "$frozen_descriptor" || ! grep -A1 '^replication:' "$frozen_descriptor" | grep -qF 'enabled: false'; then
     FROZEN_LIFECYCLE_OK="false"
   fi
 done
 if [ "$FROZEN_LIFECYCLE_OK" = "true" ]; then
-  pass "Fix 3: both frozen runtime descriptors remain lifecycle.state: absent -- Monitor's active-runtime MAIN deployment intent is correctly distinguished from, and does not itself activate, the frozen runtime phase"
+  pass "Fix 3: both runtime descriptors carry no lifecycle block and remain replication.enabled=false -- Monitor's active-runtime MAIN deployment intent never itself activates replication or clears the EFS decommission hold"
 else
-  fail "Fix 3: a frozen runtime descriptor's lifecycle.state no longer reads 'absent' -- this task must never activate a runtime"
+  fail "Fix 3: a runtime descriptor still carries a lifecycle block, or replication is no longer disabled -- this task must never activate replication"
 fi
 
 echo ""
@@ -13694,7 +13724,7 @@ else
   skip "Phase B3A: structural DAG/workflow checks -- python3/PyYAML unavailable or main workflow missing"
 fi
 
-# 5: current absent descriptors yield [] active_runtime_matrix -- proven directly by running the real folder-driven registry, never asserted as a fixed string.
+# 5 (GoldenGate Runtime Desired-State Simplification): current descriptors yield a two-entry active_runtime_matrix -- proven directly by running the real folder-driven registry, never asserted as a fixed string. Both real DEV descriptors are now genuinely active (deployment.enabled=true, no lifecycle block); replication remains disabled independently.
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   ACTIVE_MATRIX_RESULT="$(python3 -c '
 import json
@@ -13710,18 +13740,20 @@ import yaml
 doc = yaml.safe_load(proc.stdout)
 deployments = doc.get("deployments") or []
 matrix = [{"environment": "dev", "deployment_id": d["name"]} for d in deployments]
-if matrix == []:
+expected_ids = {"gg-postgresql-repltest-01", "gg-mssql-repltest-01"}
+actual_ids = {d["deployment_id"] for d in matrix}
+if actual_ids == expected_ids:
     print("OK")
 else:
-    print(f"FAIL: expected [] active_runtime_matrix with both runtime descriptors currently lifecycle.state=absent, got {matrix!r}")
+    print(f"FAIL: expected active_runtime_matrix to contain exactly {expected_ids!r} (both current DEV descriptors are deployment.enabled=true), got {actual_ids!r}")
 ' 2>&1)"
   if [ "$ACTIVE_MATRIX_RESULT" = "OK" ]; then
-    pass "Phase B3A: 5: current absent descriptors (gg-postgresql-repltest-01/gg-mssql-repltest-01, both lifecycle.state=absent) yield an empty [] active_runtime_matrix"
+    pass "Phase B3A: 5: both current DEV descriptors (gg-postgresql-repltest-01/gg-mssql-repltest-01, deployment.enabled=true, no lifecycle block) yield a two-entry active_runtime_matrix"
   else
     fail "Phase B3A: 5: ${ACTIVE_MATRIX_RESULT}"
   fi
 else
-  skip "Phase B3A: 5: active_runtime_matrix emptiness -- python3 unavailable"
+  skip "Phase B3A: 5: active_runtime_matrix content -- python3 unavailable"
 fi
 
 # DAG simulation: the required real-deploy/dry-run/ABSENT/OWNED/BROKEN/global-active-inventory scenarios, exercised against the real if: expressions, never a text/regex match against the workflow author's own wording.

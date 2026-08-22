@@ -137,7 +137,7 @@ locals {
     for id, doc in local.goldengate_runtime_documents : id => try(doc.runtime.storage.u02.type, "")
   }
 
-  # Keyed by every folder-driven document (not just goldengate_enabled_deployments): storage follows the runtime's Git folder, never deployment.enabled/lifecycle.state. A managed EFS module instance must never disappear from this map merely because a deployment is temporarily disabled -- only physical deletion of the values.yaml file removes an entry here, and that case is guarded upstream by the workflow's managed_efs_deletion_guard job, which must run before any Terraform apply can observe the removal.
+  # Keyed by every folder-driven document (not just goldengate_enabled_deployments): storage follows the runtime's Git folder, never deployment.enabled. A managed EFS module instance must never disappear from this map merely because a deployment is temporarily disabled -- only physical deletion of the values.yaml file removes an entry here, and that case is guarded upstream by the workflow's managed_efs_deletion_guard job, which must run before any Terraform apply can observe the removal.
   goldengate_managed_efs_deployments = {
     for id, doc in local.goldengate_runtime_documents : id => {
       creation_token = "${var.environment}-${id}-efs"
@@ -148,11 +148,10 @@ locals {
   # No filtering here; terraform_data.goldengate_runtime_contract enforces the full contract as a plan-blocking precondition.
   goldengate_runtime_candidates = local.goldengate_runtime_documents
 
-  # try()-guarded so an invalid document fails via the precondition below, not a secondary "unsupported attribute" error.
+  # GoldenGate Runtime Desired-State Simplification: deployment.enabled is the SOLE runtime-presence control (lifecycle.state was retired -- terraform_data.goldengate_runtime_contract's own precondition above now rejects its presence outright). try()-guarded so an invalid document fails via the precondition below, not a secondary "unsupported attribute" error.
   goldengate_enabled_deployments = {
     for id, doc in local.goldengate_runtime_candidates : id => doc
     if try(doc.deployment.enabled, false) == true
-    && try(doc.lifecycle.state, "active") != "absent"
   }
 
   goldengate_deployment_names = sort(keys(local.goldengate_enabled_deployments))
@@ -294,8 +293,9 @@ resource "terraform_data" "goldengate_runtime_contract" {
       error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.csi.serviceAccountRoleArn is a forbidden override -- it is a shared platform invariant."
     }
     precondition {
-      condition     = try(each.value.lifecycle, null) == null || contains(["active", "absent"], try(each.value.lifecycle.state, "active"))
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: lifecycle.state must be \"active\" or \"absent\" when lifecycle is present."
+      # GoldenGate Runtime Desired-State Simplification: lifecycle.state is retired as a second runtime-presence source of truth -- deployment.enabled is now the ONLY authoritative control, so a descriptor still carrying a lifecycle block is rejected outright (mirrors hack/goldengate-deployment-model.py's _reject_lifecycle_presence_control), never silently reinterpreted.
+      condition     = try(each.value.lifecycle, null) == null
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: lifecycle.state is no longer supported for runtime presence; use deployment.enabled only."
     }
     precondition {
       condition = (
@@ -304,6 +304,14 @@ resource "terraform_data" "goldengate_runtime_contract" {
         || local.goldengate_replication_enabled_jsonenc[each.key] == "false"
       )
       error_message = "envs/${var.environment}/${each.key}/values.yaml: replication.enabled must be a literal Boolean, not a Boolean-like string, when replication is present."
+    }
+    precondition {
+      # deployment.enabled is the single runtime-presence control -- replication can never be desired for a runtime that is itself not desired to exist.
+      condition = (
+        !local.goldengate_replication_enabled_raw[each.key]
+        || local.goldengate_enabled_jsonenc[each.key] == "true"
+      )
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: replication.enabled=true requires deployment.enabled=true."
     }
     precondition {
       condition = (
