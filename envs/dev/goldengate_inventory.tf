@@ -298,6 +298,16 @@ resource "terraform_data" "goldengate_runtime_contract" {
       error_message = "envs/${var.environment}/${each.key}/values.yaml: lifecycle.state is no longer supported for runtime presence; use deployment.enabled only."
     }
     precondition {
+      # GoldenGate Runtime Presence Contract Finalization: a legacy descriptor-root `enabled:` key (outside deployment.enabled) is a second, potentially contradictory runtime-presence signal -- rejected outright here too, mirroring hack/goldengate-deployment-model.py's _reject_root_level_enabled. Never fires for nested `enabled` fields belonging to other components (ingress.enabled, persistence.enabled, replication.enabled, etc.) since those are different mapping keys entirely.
+      condition     = try(each.value.enabled, null) == null
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: root-level enabled is no longer supported; use deployment.enabled only."
+    }
+    precondition {
+      # GoldenGate Runtime Presence Contract Finalization: runtime.enabled was a second, chart-level runtime-presence switch that could silently contradict deployment.enabled -- it is no longer part of the schema at all and is rejected outright here too, mirroring hack/goldengate-deployment-model.py's _reject_runtime_enabled_presence_control. Nested feature flags such as runtime.csi.enabled are untouched -- only runtime's own `enabled` key is prohibited.
+      condition     = try(each.value.runtime.enabled, null) == null
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.enabled is no longer supported as a runtime presence control; use deployment.enabled only."
+    }
+    precondition {
       condition = (
         !local.goldengate_replication_declared[each.key]
         || local.goldengate_replication_enabled_jsonenc[each.key] == "true"

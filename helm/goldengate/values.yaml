@@ -32,10 +32,8 @@ podSecurityContext: {}
 
 securityContext: {}
 
-# Generic single-runtime GoldenGate deployment; exactly one container per pod, no observer/utility/Fluent Bit sidecar in this model.
+# Generic single-runtime GoldenGate deployment; exactly one container per pod, no observer/utility/Fluent Bit sidecar in this model. GoldenGate Runtime Presence Contract Finalization: runtime.enabled was retired as a master runtime-presence switch -- the Helm release itself (created only when deployment.enabled=true in the canonical descriptor) is the sole presence boundary; a runtime.enabled key is no longer part of this schema at all.
 runtime:
-  enabled: false
-
   name: ""
   fullnameOverride: ""
 

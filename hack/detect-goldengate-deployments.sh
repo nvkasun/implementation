@@ -2,7 +2,7 @@
 # Builds deployment_matrix/deletion_matrix step outputs for envs/dev/ GoldenGate deployments; the single implementation wrapped by .github/workflows/00-main-goldengate-orchestrator.yaml.
 set -euo pipefail
 
-# Returns 0/1 (active/inactive) with a one-line reason on stdout; inactive if missing/empty/comment-only/null YAML, or enabled:false/deployment.enabled:false; prefers PyYAML, falls back to text patterns. GoldenGate Runtime Desired-State Simplification: deployment.enabled is the sole runtime-presence control -- lifecycle.state is retired and no longer checked here at all; a descriptor that still carries a stale lifecycle block is not rejected by this cheap git-diff triage heuristic (it never does full descriptor validation for any field), but is fail-closed rejected downstream by hack/goldengate-deployment-model.py's own strict parser the first time this candidate is actually described/built/deployed -- the ONE authoritative source of truth for that rejection, never duplicated here.
+# Returns 0/1 (active/inactive) with a one-line reason on stdout; inactive if missing/empty/comment-only/null YAML, or deployment.enabled:false; prefers PyYAML, falls back to text patterns. GoldenGate Runtime Presence Contract Finalization: deployment.enabled is the ONLY runtime-presence control -- lifecycle.state and a legacy descriptor-root `enabled:` key are both retired and no longer checked here at all; a descriptor that still carries either stale shape is not rejected by this cheap git-diff triage heuristic (it never does full descriptor validation for any field), but is fail-closed rejected downstream by hack/goldengate-deployment-model.py's own strict parser the first time this candidate is actually described/built/deployed -- the ONE authoritative source of truth for that rejection, never duplicated here.
 is_active_deployment_values_file() {
   local values_file="$1"
 
@@ -37,10 +37,7 @@ if not non_comment_lines:
 try:
     import yaml
 except ImportError:
-    # Fallback without PyYAML: only recognizes the three documented disable-flag shapes, not arbitrary YAML nesting.
-    if re.search(r'(?m)^\s*enabled\s*:\s*false\s*$', raw):
-        print("enabled=false (text fallback, PyYAML unavailable)")
-        sys.exit(1)
+    # Fallback without PyYAML: only recognizes the one documented disable-flag shape, not arbitrary YAML nesting. A legacy descriptor-root `enabled:` key is deliberately NOT checked here -- deployment.enabled is the only runtime-presence field this heuristic recognizes.
     if re.search(r'(?ms)^deployment\s*:\s*\n(?:[ \t]+\S.*\n?)*?[ \t]+enabled\s*:\s*false\s*$', raw):
         print("deployment.enabled=false (text fallback, PyYAML unavailable)")
         sys.exit(1)
@@ -61,10 +58,7 @@ if not isinstance(data, dict):
     print("parsed YAML is not a mapping")
     sys.exit(1)
 
-if data.get("enabled") is False:
-    print("enabled=false")
-    sys.exit(1)
-
+# A legacy descriptor-root `enabled:` key is deliberately NOT checked here -- deployment.enabled is the only runtime-presence field this heuristic recognizes; a stray root-level enabled is a validation error, not a second presence signal, and is rejected downstream by the strict Python parser.
 deployment = data.get("deployment")
 if isinstance(deployment, dict) and deployment.get("enabled") is False:
     print("deployment.enabled=false")
@@ -85,11 +79,7 @@ PYEOF
     return 1
   fi
 
-  if grep -Eq '^enabled[[:space:]]*:[[:space:]]*false[[:space:]]*$' "$values_file"; then
-    echo "enabled=false (bash fallback)"
-    return 1
-  fi
-
+  # A legacy descriptor-root `enabled:` key is deliberately NOT checked here -- deployment.enabled is the only runtime-presence field this heuristic recognizes.
   if awk '
     /^deployment:[[:space:]]*$/ { in_block=1; next }
     in_block && /^[[:space:]]+enabled:[[:space:]]*false[[:space:]]*$/ { found=1; exit }
@@ -317,19 +307,41 @@ if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
   DEPLOYMENT_ID="$INPUT_DEPLOYMENT_ID"
   DEPLOY="$INPUT_DEPLOY"
 
-  # Live Deploy UX Fix 2: an explicit environment-wide manual run -- deployment_id left blank on purpose (never an invented/default runtime ID, never auto-selecting either repltest descriptor). No descriptor validation is attempted. This does NOT mean "there are no active runtimes globally" -- validate_model's own active_runtime_matrix remains the independent, canonical GLOBAL runtime registry; this only means no individual GoldenGate runtime was selected for build/reconciliation in THIS manual invocation.
+  # GoldenGate Runtime Presence Contract Finalization: an explicit environment-wide manual run -- deployment_id left blank on purpose (never an invented/default runtime ID, never auto-selecting either repltest descriptor). MAIN is an end-to-end desired-state convergence workflow: environment-wide manual Deploy/Validate now converges the COMPLETE environment from the canonical deployment registry (hack/goldengate-deployment-model.py), never from Git diff/change detection -- the operator explicitly requested the whole environment, not "whatever recently changed". Every deployment.enabled=true descriptor enters the runtime reconciliation matrix; every deployment.enabled=false descriptor still physically present enters the safe removal/desired-absence matrix (deploy=true only -- Validate remains strictly non-mutating, so deletion evaluation never runs in Validate mode).
   if [ -z "$DEPLOYMENT_ID" ]; then
     if [ "$DEPLOY" = "true" ]; then
       ACTION_LABEL="deploy"
     else
       ACTION_LABEL="validate"
     fi
-    echo "Manual environment-wide ${ACTION_LABEL} requested for environment=${ENVIRONMENT}; no individual GoldenGate runtime was selected for build/reconciliation."
+    echo "Manual environment-wide ${ACTION_LABEL} requested for environment=${ENVIRONMENT}. Resolving the complete environment from the canonical deployment registry..."
 
-    echo "has_changes=false" >> "$GITHUB_OUTPUT"
-    echo "deployment_matrix=[]" >> "$GITHUB_OUTPUT"
-    echo "has_deletions=false" >> "$GITHUB_OUTPUT"
-    echo "deletion_matrix=[]" >> "$GITHUB_OUTPUT"
+    ENV_MATRIX_JSON="$(python3 hack/goldengate-deployment-model.py --environment "$ENVIRONMENT" environment-matrix --deploy "$DEPLOY")"
+
+    DEPLOYMENT_MATRIX_ITEMS="$(echo "$ENV_MATRIX_JSON" | jq -c '.deployment_matrix')"
+    DELETION_MATRIX_ITEMS="$(echo "$ENV_MATRIX_JSON" | jq -c '.deletion_matrix')"
+    DEPLOYMENT_COUNT="$(echo "$DEPLOYMENT_MATRIX_ITEMS" | jq 'length')"
+    DELETION_COUNT="$(echo "$DELETION_MATRIX_ITEMS" | jq 'length')"
+
+    echo "Environment-wide matrix: ${DEPLOYMENT_COUNT} enabled deployment(s) for reconciliation, ${DELETION_COUNT} disabled-but-present deployment(s) routed to safe removal."
+    echo "Deployment matrix: ${DEPLOYMENT_MATRIX_ITEMS}"
+    echo "Deletion matrix: ${DELETION_MATRIX_ITEMS}"
+
+    if [ "$DEPLOYMENT_COUNT" -eq 0 ]; then
+      echo "has_changes=false" >> "$GITHUB_OUTPUT"
+    else
+      echo "has_changes=true" >> "$GITHUB_OUTPUT"
+    fi
+    echo "deployment_matrix=${DEPLOYMENT_MATRIX_ITEMS}" >> "$GITHUB_OUTPUT"
+
+    if [ "$DELETION_COUNT" -eq 0 ]; then
+      echo "has_deletions=false" >> "$GITHUB_OUTPUT"
+    else
+      echo "has_deletions=true" >> "$GITHUB_OUTPUT"
+    fi
+    echo "deletion_matrix=${DELETION_MATRIX_ITEMS}" >> "$GITHUB_OUTPUT"
+
+    # A manual environment-wide run has no push-diff base to compare against, so the storage-transition guard (which needs BEFORE_SHA content) does not run here; the push path already blocks an unsafe transition before it can be merged.
     echo "has_storage_transition_violations=false" >> "$GITHUB_OUTPUT"
     echo "storage_transition_violations=[]" >> "$GITHUB_OUTPUT"
     exit 0
@@ -368,11 +380,41 @@ if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
   STATUS=$?
   set -e
 
+  # GoldenGate Runtime Presence Contract Finalization: a selected deployment.enabled=false descriptor is a legitimate user-requested desired state (ABSENT), never rejected merely because it is disabled -- it is routed through the SAME safe removal/desired-absence path a push-detected deployment.enabled=false transition uses, only when DEPLOY=true (Validate remains strictly non-mutating; a selected disabled descriptor in Validate mode is a clean no-op, matching the environment-wide Validate contract).
   if [ "$STATUS" -ne 0 ]; then
-    echo "Deployment values file check failed: ${REASON}"
-    echo ""
-    echo "Deployment values file is missing or inactive. Use Git deletion/disable flow for cleanup, or restore active values before manual deploy."
-    exit 1
+    echo "Deployment values file is currently inactive (${REASON})."
+
+    if [ "$DEPLOY" != "true" ]; then
+      echo "Validate mode: the selected descriptor's desired state (ABSENT) is acknowledged read-only; no mutation is requested."
+      echo "has_changes=false" >> "$GITHUB_OUTPUT"
+      echo "deployment_matrix=[]" >> "$GITHUB_OUTPUT"
+      echo "has_deletions=false" >> "$GITHUB_OUTPUT"
+      echo "deletion_matrix=[]" >> "$GITHUB_OUTPUT"
+      echo "has_storage_transition_violations=false" >> "$GITHUB_OUTPUT"
+      echo "storage_transition_violations=[]" >> "$GITHUB_OUTPUT"
+      exit 0
+    fi
+
+    echo "Deploy mode: routing ${DEPLOYMENT_ID} through the safe removal path (application/workload absent, managed storage retained)."
+
+    CANDIDATE_EFS_MODE="$(_efs_mode_from_yaml "$VALUES_FILE")"
+    DELETION_MATRIX_JSON="$(jq -nc \
+      --arg environment "$ENVIRONMENT" \
+      --arg deployment_id "$DEPLOYMENT_ID" \
+      --arg deployment_model "$ACTIVE_DEPLOYMENT_MODEL" \
+      --arg efs_mode "$CANDIDATE_EFS_MODE" \
+      --arg reason "deployment-disabled" \
+      '[{environment: $environment, deployment_id: $deployment_id, deployment_model: $deployment_model, efs_mode: $efs_mode, reason: $reason}]')"
+
+    echo "has_changes=false" >> "$GITHUB_OUTPUT"
+    echo "deployment_matrix=[]" >> "$GITHUB_OUTPUT"
+    echo "has_deletions=true" >> "$GITHUB_OUTPUT"
+    echo "deletion_matrix=${DELETION_MATRIX_JSON}" >> "$GITHUB_OUTPUT"
+    echo "has_storage_transition_violations=false" >> "$GITHUB_OUTPUT"
+    echo "storage_transition_violations=[]" >> "$GITHUB_OUTPUT"
+
+    echo "Deletion matrix: ${DELETION_MATRIX_JSON}"
+    exit 0
   fi
 
   echo "Deployment values file is active (${REASON}). Building single-item matrix."

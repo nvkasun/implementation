@@ -565,6 +565,18 @@ def _reject_lifecycle_presence_control(doc):
         raise DescriptorError("lifecycle.state is no longer supported for runtime presence; use deployment.enabled only")
 
 
+def _reject_root_level_enabled(doc):
+    """GoldenGate Runtime Presence Contract Finalization: a legacy descriptor-root `enabled:` key (outside deployment.enabled) is a second, potentially contradictory runtime-presence signal -- rejected outright, never silently treated as authoritative and never silently ignored. This never fires for nested `enabled` fields belonging to unrelated components (ingress.enabled, persistence.enabled, runtime.csi.enabled, replication.enabled, etc.) since those are different mapping keys entirely, only the descriptor's own top-level `enabled` key."""
+    if "enabled" in doc:
+        raise DescriptorError("root-level enabled is no longer supported; use deployment.enabled only")
+
+
+def _reject_runtime_enabled_presence_control(runtime):
+    """GoldenGate Runtime Presence Contract Finalization: runtime.enabled was a second, chart-level runtime-presence switch that could silently contradict deployment.enabled (deployment.enabled=true + runtime.enabled=false rendered nothing, while the canonical model still reported the runtime ACTIVE). The Helm release itself (created only when deployment.enabled=true) is now the sole presence boundary -- runtime.enabled is no longer part of the schema at all and is rejected outright if a descriptor still supplies it, never silently ignored."""
+    if "enabled" in runtime:
+        raise DescriptorError("runtime.enabled is no longer supported as a runtime presence control; use deployment.enabled only")
+
+
 def _parse_csi_structure(runtime):
     """Validates the CSI block shape and extracts the stable enabled/mountPath fields hack/orchestration/runtime_acceptance.py needs to verify actual pod volume/mount wiring against -- never a second descriptor schema, just a few more fields read from the same validated runtime.csi block. objectName/serviceAccountRoleArn presence is rejected earlier by _reject_forbidden_overrides."""
     csi = _require_dict(runtime.get("csi"), "invalid CSI configuration: runtime.csi must be a mapping")
@@ -657,6 +669,7 @@ def parse_descriptor(deployment_id, environment, doc, shared=None):
         raise DescriptorError("missing or invalid deploymentModel: must be exactly \"singleRuntime\"")
 
     _reject_forbidden_overrides(doc)
+    _reject_root_level_enabled(doc)
 
     deployment = _require_dict(doc.get("deployment"), "invalid deployment metadata: deployment must be a mapping")
     enabled = deployment.get("enabled")
@@ -670,6 +683,7 @@ def parse_descriptor(deployment_id, environment, doc, shared=None):
         raise DescriptorError("invalid deployment metadata: deployment.role must be exactly \"source\" or \"target\"")
 
     runtime = _require_dict(doc.get("runtime"), "invalid deployment metadata: runtime must be a mapping")
+    _reject_runtime_enabled_presence_control(runtime)
     deployment_type = runtime.get("deploymentType")
     if not _safe_token(deployment_type, _MAX_TYPE_LENGTH):
         raise DescriptorError("invalid deployment metadata: runtime.deploymentType must be a safe lowercase token")
@@ -1041,6 +1055,33 @@ def cmd_list(args):
     return 0
 
 
+def cmd_environment_matrix(args):
+    """GoldenGate Runtime Presence Contract Finalization: environment-wide manual MAIN Deploy/Validate matrix -- the canonical registry reshaped into the exact deployment_matrix/deletion_matrix JSON shapes hack/detect-goldengate-deployments.sh's workflow_dispatch (blank deployment_id) branch emits as GitHub Actions step outputs. The SAME single source of truth as the folder-driven registry itself (scan()); never a second parser reimplementing active/inactive classification in Bash. deployment_matrix contains one entry per ACTIVE (deployment.enabled=true) descriptor, carrying the requested --deploy value. deploymentModel is always exactly "singleRuntime" for every active/inactive descriptor -- parse_descriptor() already rejects any other value as invalid before a descriptor can ever reach the active/inactive lists, so this is never re-derived per entry. deletion_matrix contains one entry per INACTIVE (deployment.enabled=false, still physically present) descriptor, reason=deployment-disabled -- mirroring the push-diff path's own classification -- but ONLY when --deploy is true; the caller is responsible for requesting an empty deletion_matrix in Validate mode, since deletion evaluation is a deploy-only, non-mutating-incompatible concern."""
+    active, inactive, invalid, problems = _run_full_validation(args.environment)
+    if invalid or problems:
+        _print_reasons(invalid)
+        _print_problems(problems)
+        print("FAIL: refusing to build the environment-wide matrix while validation problems exist")
+        return 1
+
+    deploy_bool = args.deploy == "true"
+
+    deployment_matrix = [
+        {"environment": args.environment, "deployment_id": d["deploymentId"], "deployment_model": "singleRuntime", "deploy": deploy_bool}
+        for d in sorted(active, key=lambda x: x["deploymentId"])
+    ]
+
+    deletion_matrix = []
+    if deploy_bool:
+        deletion_matrix = [
+            {"environment": args.environment, "deployment_id": d["deploymentId"], "deployment_model": "singleRuntime", "efs_mode": d["efsMode"] or "", "reason": "deployment-disabled"}
+            for d in sorted(inactive, key=lambda x: x["deploymentId"])
+        ]
+
+    print(json.dumps({"deployment_matrix": deployment_matrix, "deletion_matrix": deletion_matrix}))
+    return 0
+
+
 def cmd_describe(args):
     active, inactive, invalid, problems = _run_full_validation(args.environment)
     if invalid or problems:
@@ -1230,6 +1271,10 @@ def main(argv=None):
 
     sub.add_parser("validate").set_defaults(func=cmd_validate)
     sub.add_parser("list").set_defaults(func=cmd_list)
+
+    environment_matrix_parser = sub.add_parser("environment-matrix")
+    environment_matrix_parser.add_argument("--deploy", required=True, choices=("true", "false"))
+    environment_matrix_parser.set_defaults(func=cmd_environment_matrix)
 
     describe_parser = sub.add_parser("describe")
     describe_parser.add_argument("deployment_id")

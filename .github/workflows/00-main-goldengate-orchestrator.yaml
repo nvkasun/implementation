@@ -3202,8 +3202,9 @@ jobs:
   delete_removed_argocd_applications:
     name: Delete removed GoldenGate Argo CD Applications
 
+    # GoldenGate Runtime Presence Contract Finalization: previously push-only. A manual workflow_dispatch Deploy (environment-wide or a specific selected deployment_id) can now also populate deletion_matrix -- deployment.enabled=false is a first-class desired-absence request regardless of trigger type, and detect_changed_deployments' workflow_dispatch branch only ever populates deletion_matrix when the manual action was actually Deploy (never Validate), so has_deletions=='true' alone remains a safe, sufficient mutation gate here.
     needs: detect_changed_deployments
-    if: success() && github.event_name == 'push' && needs.detect_changed_deployments.outputs.has_deletions == 'true'
+    if: success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.detect_changed_deployments.outputs.has_deletions == 'true'
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -3342,8 +3343,49 @@ jobs:
           echo "Current kube context:"
           kubectl config current-context
 
+      - name: Classify runtime ownership safety before removal (read-only)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # GoldenGate Runtime Presence Contract Finalization (Defect 4): read-only ownership classification MUST run and be evaluated BEFORE any Application finalizer patch, Application deletion, workload deletion, or namespace deletion below -- reuses hack/orchestration/runtime_state.py (the SAME canonical ABSENT/OWNED/BROKEN classifier the reconcile-side runtime_ownership_preflight job already relies on), never a second/duplicated ownership mechanism. BROKEN (a foreign/ambiguous/unsafe footprint) fails closed right here, before any mutation -- a foreign same-named Application is never patched or deleted.
+          #
+          # legacyPair is retired and this job only still carries it for a historical leftover (a values.yaml that was legacyPair as of the deleted Git revision); the singleRuntime ownership classifier's Application-naming/namespace convention does not apply to it, so it is intentionally left to the existing namespace ownership-label check in "Clean up remaining GoldenGate namespace if still present" below (unchanged), which already fails closed on a label mismatch for that path.
+          if [ "$DEPLOYMENT_MODEL" != "singleRuntime" ]; then
+            echo "Deployment model is ${DEPLOYMENT_MODEL} -- skipping the singleRuntime ownership classifier (not applicable to this retired historical path)."
+            echo "RUNTIME_OWNERSHIP_STATE=NOT_APPLICABLE" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
+
+          # A non-zero exit here is either a configuration error or a classifier inspection error (API unreachable, permission denied, malformed JSON) -- never silently downgraded to ABSENT/safe.
+          if ! CLASSIFIER_OUTPUT="$(python3 hack/orchestration/runtime_state.py --environment "${ENVIRONMENT}" --deployment-id "${DEPLOYMENT_ID}")"; then
+            echo "FAIL: the GoldenGate runtime ownership classifier could not classify ${DEPLOYMENT_ID} (configuration or inspection error, not ABSENT) -- refusing to proceed with removal. See diagnostics above."
+            exit 1
+          fi
+
+          echo "$CLASSIFIER_OUTPUT"
+
+          STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
+          echo "GoldenGate runtime ownership-safety state for ${DEPLOYMENT_ID}: ${STATE}"
+          echo "RUNTIME_OWNERSHIP_STATE=${STATE}" >> "$GITHUB_ENV"
+
+          if [ "$STATE" = "BROKEN" ]; then
+            echo "FAIL: GoldenGate runtime ownership-safety state for ${DEPLOYMENT_ID} is BROKEN -- an existing Argo CD Application/footprint named ${ARGOCD_APP_NAME} does not clearly belong to this deployment (foreign or ambiguous ownership). Refusing to patch finalizers or delete anything. This is a safety failure, not auto-repaired here -- investigate the diagnostics above before re-running."
+            exit 1
+          fi
+
+          if [ "$STATE" = "ABSENT" ]; then
+            echo "Nothing exists for ${DEPLOYMENT_ID} -- the removal steps below will each independently no-op (Application/namespace already absent)."
+          else
+            echo "${DEPLOYMENT_ID} is OWNED -- safe to proceed with removal."
+          fi
+
       - name: Delete Argo CD Application
         shell: bash
+        # Explicit step-level gate, matching the ABSENT/OWNED/BROKEN contract: BROKEN already exited the job in the classify step above (this condition is defense-in-depth, not the sole gate) -- ABSENT/OWNED/NOT_APPLICABLE (legacyPair) are all safe to enter, since this step itself is a no-op when the Application does not exist.
+        if: env.RUNTIME_OWNERSHIP_STATE == 'OWNED' || env.RUNTIME_OWNERSHIP_STATE == 'ABSENT' || env.RUNTIME_OWNERSHIP_STATE == 'NOT_APPLICABLE'
         run: |
           set -euo pipefail
 

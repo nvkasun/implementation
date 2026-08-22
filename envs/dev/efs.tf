@@ -2,10 +2,8 @@
 
 # Explicit managed-EFS decommission control -- NEVER derived from deployment.enabled (or the retired lifecycle.state). deployment.enabled=false by itself always retains managed EFS (see local.goldengate_managed_efs_deployments's own comment); an ID may be added here ONLY after its workload/PVC/access-point cleanup has been independently verified. Removing an ID later makes its managed EFS desired again, so Terraform recreates it in the current environment without reconstructing the runtime descriptor. GoldenGate Runtime Desired-State Simplification: this hold is an intentionally SEPARATE authorization from runtime desired presence -- deployment.enabled=true (activating runtime compute) never by itself clears this hold or authorizes managed-EFS creation for an ID listed here; only an explicit, independently-verified edit to this list does.
 locals {
-  goldengate_managed_efs_decommission_ids = toset([
-    "gg-postgresql-repltest-01",
-    "gg-mssql-repltest-01",
-  ])
+  # GoldenGate Runtime Presence Contract Finalization: gg-postgresql-repltest-01 and gg-mssql-repltest-01 were held here while their runtimes were intentionally frozen -- that freeze has ended, both are now genuine deployment.enabled=true deployment intents, and this explicit, independently-verified edit removes exactly those two false decommission authorizations (per this file's own header comment: only an explicit edit here clears a hold, never deployment.enabled by itself). Steady state is an empty set unless a genuine, separately-authorized EFS decommission target exists.
+  goldengate_managed_efs_decommission_ids = toset([])
 
   goldengate_managed_efs_desired_deployments = {
     for id, v in local.goldengate_managed_efs_deployments : id => v

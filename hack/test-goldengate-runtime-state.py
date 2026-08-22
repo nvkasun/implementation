@@ -19,7 +19,7 @@ def _load_tool():
 
 runtime_state = _load_tool()
 
-# Uses a real, currently-inactive envs/dev descriptor -- describe_deployment() reads the real repository, never a scratch root (this classifier is not itself a second descriptor parser, so its tests exercise it against the real folder-driven model).
+# Uses a real envs/dev descriptor -- describe_deployment() reads the real repository, never a scratch root (this classifier is not itself a second descriptor parser, so its tests exercise it against the real folder-driven model). Its own deployment.enabled value is irrelevant here: describe_deployment() resolves both active and inactive descriptors identically, and classify() itself never inspects deployment.enabled at all.
 ENVIRONMENT = "dev"
 DEPLOYMENT_ID = "gg-postgresql-repltest-01"
 ARGOCD_NAMESPACE = "argocd"
@@ -286,10 +286,26 @@ class RuntimeStateClassifierTests(unittest.TestCase):
         result = _classify(cluster)
         self.assertEqual(result["state"], runtime_state.STATE_OWNED)
 
-    def test_unknown_deployment_id_is_configuration_error(self):
+    def test_unknown_deployment_id_never_forces_configuration_error(self):
+        # GoldenGate Runtime Presence Contract Finalization: this classifier is reused for a PHYSICALLY REMOVED descriptor too (ownership-safe delete, deletion_matrix reason=physical-removal), where by design no envs/dev/<id>/values.yaml exists any more -- an unknown deployment ID must never itself force a configuration error; it proceeds straight to cluster-based classification (ABSENT here, since nothing exists on the cluster for it either).
         cluster = FakeCluster()
-        with self.assertRaises(ValueError):
-            _classify(cluster, deployment_id="gg-does-not-exist-anywhere")
+        result = _classify(cluster, deployment_id="gg-does-not-exist-anywhere")
+        self.assertEqual(result["state"], runtime_state.STATE_ABSENT)
+
+    def test_genuinely_broken_folder_driven_model_still_raises_configuration_error(self):
+        # The OTHER describe_deployment() failure mode -- the folder-driven model itself is inconsistent (an invalid descriptor or cross-descriptor problem exists elsewhere in the environment) -- must still fail closed, never silently proceed with an untrustworthy model. Monkeypatched here (never a corrupted real repo file) purely to exercise classify()'s own re-raise branch in isolation.
+        original_describe_deployment = runtime_state.describe_deployment
+
+        def _broken_model(environment, deployment_id):
+            raise ValueError(f"the folder-driven deployment model for {environment!r} has validation problems -- refusing to classify runtime ownership against an inconsistent model")
+
+        runtime_state.describe_deployment = _broken_model
+        try:
+            cluster = FakeCluster()
+            with self.assertRaises(ValueError):
+                _classify(cluster)
+        finally:
+            runtime_state.describe_deployment = original_describe_deployment
 
     def test_malformed_json_raises_inspection_error(self):
         cluster = FakeCluster()

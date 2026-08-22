@@ -1,5 +1,4 @@
 {{- include "goldengate.assertSupportedDeploymentModel" . }}
-{{- if .Values.runtime.enabled }}
 {{- if and .Values.runtime.csi.enabled .Values.runtime.csi.admin.enabled (not .Values.runtime.csi.admin.objectName) }}
 {{- fail "runtime.csi.admin.objectName is required when runtime.csi.admin.enabled=true." }}
 {{- end }}
@@ -39,7 +38,7 @@ spec:
 {{- if .Values.runtime.initPermissions.enabled }}
       initContainers:
         - name: prepare-u02-permissions
-          image: "{{ required "runtime.image.repository is required when deploymentModel=singleRuntime and runtime.enabled=true" .Values.runtime.image.repository }}:{{ required "runtime.image.tag is required when deploymentModel=singleRuntime and runtime.enabled=true" .Values.runtime.image.tag }}"
+          image: "{{ required "runtime.image.repository is required when deploymentModel=singleRuntime" .Values.runtime.image.repository }}:{{ required "runtime.image.tag is required when deploymentModel=singleRuntime" .Values.runtime.image.tag }}"
           imagePullPolicy: {{ .Values.runtime.image.pullPolicy | default "IfNotPresent" }}
           command:
             - sh
@@ -98,8 +97,8 @@ spec:
 {{- end }}
 
       containers:
-        - name: {{ required "runtime.containerName is required when deploymentModel=singleRuntime and runtime.enabled=true" .Values.runtime.containerName }}
-          image: "{{ required "runtime.image.repository is required when deploymentModel=singleRuntime and runtime.enabled=true" .Values.runtime.image.repository }}:{{ required "runtime.image.tag is required when deploymentModel=singleRuntime and runtime.enabled=true" .Values.runtime.image.tag }}"
+        - name: {{ required "runtime.containerName is required when deploymentModel=singleRuntime" .Values.runtime.containerName }}
+          image: "{{ required "runtime.image.repository is required when deploymentModel=singleRuntime" .Values.runtime.image.repository }}:{{ required "runtime.image.tag is required when deploymentModel=singleRuntime" .Values.runtime.image.tag }}"
           imagePullPolicy: {{ .Values.runtime.image.pullPolicy | default "IfNotPresent" }}
 
 {{- with .Values.securityContext }}
@@ -255,5 +254,4 @@ spec:
 {{- with .Values.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
-{{- end }}
 {{- end }}

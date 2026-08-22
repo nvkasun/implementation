@@ -149,9 +149,13 @@ def _ownership_reason(resource_label, obj, environment, deployment_id):
 
 
 def classify(run, environment, deployment_id, argocd_namespace, runtime_namespace, ecr_registry):
-    """Returns the stable {"state", "environment", "deployment_id", "namespace", "reasons", "checks"} shape. Raises ClassifierInspectionError if Kubernetes access itself could not be trusted -- callers must let that propagate as a hard failure, never a downgrade to ABSENT. Raises ValueError if the deployment ID/folder-driven model itself is invalid -- a configuration error, never ABSENT/OWNED/BROKEN cluster state."""
-    # Confirms the deployment ID resolves through the canonical descriptor resolver before any cluster call -- fails closed on an unknown/invalid deployment ID as a configuration error.
-    describe_deployment(environment, deployment_id)
+    """Returns the stable {"state", "environment", "deployment_id", "namespace", "reasons", "checks"} shape. Raises ClassifierInspectionError if Kubernetes access itself could not be trusted -- callers must let that propagate as a hard failure, never a downgrade to ABSENT. Raises ValueError if the folder-driven model itself is inconsistent (invalid descriptors/cross-descriptor problems elsewhere) -- a configuration error, never ABSENT/OWNED/BROKEN cluster state."""
+    # Confirms the folder-driven model is internally consistent before any cluster call -- fails closed if ANY descriptor in the environment is invalid, the same guard the reconcile path already relies on. Deliberately does NOT require THIS deployment_id's own descriptor to still be present: this classifier is also reused for a PHYSICALLY REMOVED descriptor's leftover live resources (GoldenGate Runtime Presence Contract Finalization -- ownership-safe delete, deletion_matrix reason=physical-removal), where by design no envs/<environment>/<deployment_id>/values.yaml exists any more; the caller (delete_removed_argocd_applications) already independently proved this ID was a genuine GoldenGate deployment before it ever reached this classifier.
+    try:
+        describe_deployment(environment, deployment_id)
+    except ValueError as exc:
+        if "unknown deployment ID" not in str(exc):
+            raise
 
     app_suffix = _app_suffix(deployment_id)
     app_name = f"goldengate-{environment}-{app_suffix}"

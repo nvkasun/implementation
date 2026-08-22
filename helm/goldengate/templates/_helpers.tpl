@@ -34,12 +34,18 @@ per runtime name).
 {{- /*
 Chart-wide validation: only deploymentModel=singleRuntime is supported.
 Called unconditionally from the very top of runtime-statefulset.yaml (the
-one template guaranteed to be evaluated on every render, ahead of its own
-runtime.enabled guard) so a missing/unsupported deploymentModel is rejected
-with a clear, specific error before any resource-specific enabled-flag
-logic runs -- never a silently empty render. legacyPair rendering (source/
-target StatefulSets, combined Ingress, per-role PVCs, Namespace creation)
-was removed once the retired legacy deployment was fully retired; its
+one template guaranteed to be evaluated on every render) so a missing/
+unsupported deploymentModel is rejected with a clear, specific error before
+any resource-specific enabled-flag logic runs -- never a silently empty
+render. GoldenGate Runtime Presence Contract Finalization: runtime.enabled
+was retired as a master runtime-presence switch -- the Helm release itself
+is now the presence boundary, so every runtime-statefulset.yaml/service/
+serviceaccount/secretproviderclass/pvc/ingress template renders whenever
+this chart is rendered at all, subject only to its own resource-specific
+feature flags (persistence.enabled, ingress.enabled, runtime.csi.enabled,
+etc.), never a second master switch. legacyPair rendering (source/target
+StatefulSets, combined Ingress, per-role PVCs, Namespace creation) was
+removed once the retired legacy deployment was fully retired; its
 implementation remains available through Git history if ever needed.
 */ -}}
 {{- define "goldengate.assertSupportedDeploymentModel" -}}
