@@ -12978,7 +12978,9 @@ results.append(("1: the bounded wait step still exists under its established nam
 results.append(("2: TIMEOUT_SECONDS is exactly 900 (up from the old 300s bound that the live incident proved too short for a fresh internal ALB)", "TIMEOUT_SECONDS=900" in script))
 results.append(("3: TIMEOUT_SECONDS is no longer 300", "TIMEOUT_SECONDS=300" not in script))
 results.append(("4: INTERVAL_SECONDS (poll interval) is exactly 15", "INTERVAL_SECONDS=15" in script))
-results.append(("5: the wait remains a bounded while loop, never an infinite one -- ELAPSED is compared against TIMEOUT_SECONDS every iteration", "while [ \"$ELAPSED\" -lt \"$TIMEOUT_SECONDS\" ]" in script))
+results.append(("5: the wait remains a bounded while loop, never an infinite one -- ELAPSED is compared against TIMEOUT_SECONDS every iteration (-le, so the loop still runs its final iteration exactly at elapsed==TIMEOUT_SECONDS -- the deadline probe -- rather than stopping one interval short)", "while [ \"$ELAPSED\" -le \"$TIMEOUT_SECONDS\" ]" in script))
+results.append(("5b: the old off-by-one -lt bound (which skipped the elapsed==TIMEOUT_SECONDS probe) is gone", "while [ \"$ELAPSED\" -lt \"$TIMEOUT_SECONDS\" ]" not in script))
+results.append(("5c: a guard breaks the loop once elapsed has reached the deadline, so the final (t=TIMEOUT_SECONDS) probe never sleeps again afterward -- no arbitrary sleep past the deadline", "if [ \"$ELAPSED\" -ge \"$TIMEOUT_SECONDS\" ]; then" in script))
 results.append(("6: the loop still increments ELAPSED by INTERVAL_SECONDS every iteration (guarantees eventual termination)", "ELAPSED=$((ELAPSED + INTERVAL_SECONDS))" in script))
 results.append(("7: the existing host-mismatch fail-closed safety check (CASE 4) remains present and unweakened", "This is a live desired-state mismatch, never a transient readiness gap -- refusing to wait further." in script))
 results.append(("8: timeout diagnostics still include a bounded `kubectl get ingress ... -o wide`", "kubectl get ingress argocd-server-ingress -n \"$ARGOCD_NAMESPACE\" -o wide" in script))
@@ -13051,6 +13053,8 @@ COUNT_FILE = os.environ["FAKE_LB_POLL_COUNT_FILE"]
 ARGOCD_HOST = os.environ["ARGOCD_HOST"]
 # FAKE_HOST_OVERRIDE: empty/unset means "report the correct host" (the normal case for every scenario except the CASE 4 host-mismatch proof, which sets this to a deliberately wrong value).
 REPORTED_HOST = os.environ.get("FAKE_HOST_OVERRIDE") or ARGOCD_HOST
+# FAKE_FINAL_POLL_COUNT: the exact 1-based poll number the production loop reaches on its LAST allowed probe (t=TIMEOUT_SECONDS) -- injected by the test harness from the same TIMEOUT_SECONDS/INTERVAL_SECONDS arithmetic it measures against, never a second independently-maintained literal.
+FINAL_POLL_COUNT = int(os.environ["FAKE_FINAL_POLL_COUNT"])
 
 args = sys.argv[1:]
 
@@ -13087,6 +13091,11 @@ if "-o" in args and any("loadBalancer" in a for a in args):
             print("internal-k8s-argocd-delayed.eu-west-1.elb.amazonaws.com", end="")
         else:
             print("", end="")
+    elif MODE == "appears-on-final-poll":
+        if n >= FINAL_POLL_COUNT:
+            print("internal-k8s-argocd-final.eu-west-1.elb.amazonaws.com", end="")
+        else:
+            print("", end="")
     elif MODE == "never-appears":
         print("", end="")
     else:
@@ -13104,10 +13113,28 @@ if args[:2] == ["describe", "ingress"]:
 sys.exit(0)
 '''
 
-FAKE_SLEEP = "#!/usr/bin/env bash\nexit 0\n"
+# FAKE_SLEEP also counts its own invocations (via FAKE_SLEEP_COUNT_FILE) -- this is how the real number of sleeps the production loop actually performed gets MEASURED after the fact, never asserted as a bare placeholder.
+FAKE_SLEEP_TEMPLATE = '''#!/usr/bin/env python3
+import os
+
+COUNT_FILE = os.environ["FAKE_SLEEP_COUNT_FILE"]
+try:
+    with open(COUNT_FILE) as f:
+        n = int(f.read().strip() or "0")
+except FileNotFoundError:
+    n = 0
+with open(COUNT_FILE, "w") as f:
+    f.write(str(n + 1))
+'''
 
 
 VALUES_YAML_LINES = ["argocdServerIngress:", "  enabled: {enabled}"]
+
+# The production loop's own exact bound: TIMEOUT_SECONDS=900 / INTERVAL_SECONDS=15 -> probes at t=0,15,...,885,900 (61 probes total), separated by 60 sleeps of 15s each. Read directly from the constants above, never a second hardcoded 61/60 pair maintained independently of them.
+TIMEOUT_SECONDS = 900
+INTERVAL_SECONDS = 15
+EXPECTED_FINAL_POLL_COUNT = TIMEOUT_SECONDS // INTERVAL_SECONDS + 1
+EXPECTED_FINAL_SLEEP_COUNT = TIMEOUT_SECONDS // INTERVAL_SECONDS
 
 
 def run_scenario(mode, ingress_enabled=True, host_override=None):
@@ -13122,7 +13149,7 @@ def run_scenario(mode, ingress_enabled=True, host_override=None):
 
     sleep_path = os.path.join(bin_dir, "sleep")
     with open(sleep_path, "w") as f:
-        f.write(FAKE_SLEEP)
+        f.write(FAKE_SLEEP_TEMPLATE)
     os.chmod(sleep_path, os.stat(sleep_path).st_mode | stat.S_IEXEC)
 
     values_dir = os.path.join(sandbox, "envs", "dev", "argocd")
@@ -13130,7 +13157,8 @@ def run_scenario(mode, ingress_enabled=True, host_override=None):
     with open(os.path.join(values_dir, "values.yaml"), "w") as f:
         f.write("\n".join(VALUES_YAML_LINES).format(enabled="true" if ingress_enabled else "false") + "\n")
 
-    count_file = os.path.join(sandbox, "lb_poll_count")
+    poll_count_file = os.path.join(sandbox, "lb_poll_count")
+    sleep_count_file = os.path.join(sandbox, "sleep_count")
 
     env = dict(os.environ)
     env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
@@ -13139,38 +13167,59 @@ def run_scenario(mode, ingress_enabled=True, host_override=None):
         "ARGOCD_HOST": "argocd.goldengate-dev.adcbmis.local",
         "VALUES_FILE": "envs/dev/argocd/values.yaml",
         "FAKE_MODE": mode,
-        "FAKE_LB_POLL_COUNT_FILE": count_file,
+        "FAKE_LB_POLL_COUNT_FILE": poll_count_file,
+        "FAKE_SLEEP_COUNT_FILE": sleep_count_file,
+        "FAKE_FINAL_POLL_COUNT": str(EXPECTED_FINAL_POLL_COUNT),
     })
     if host_override:
         env["FAKE_HOST_OVERRIDE"] = host_override
     proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, cwd=sandbox, timeout=60)
-    return proc.returncode, proc.stdout, proc.stderr
+
+    def _read_count(path):
+        try:
+            with open(path) as f:
+                return int(f.read().strip() or "0")
+        except FileNotFoundError:
+            return 0
+
+    return proc.returncode, proc.stdout, proc.stderr, _read_count(poll_count_file), _read_count(sleep_count_file)
 
 
 results = []
 
-# A: address appears immediately -> success, first poll.
-rc, out, err = run_scenario("immediate")
+# A: address appears immediately -> success, first poll, zero sleeps (the loop breaks before ever reaching the sleep line).
+rc, out, err, poll_count, sleep_count = run_scenario("immediate")
 results.append(("A: address appears immediately -> the real step succeeds", rc == 0 and "internal-k8s-argocd-immediate" in out))
+results.append(("A: measured poll count is exactly 1, measured sleep count is exactly 0 (success on the very first probe, never sleeps at all)", poll_count == 1 and sleep_count == 0))
 
 # B: address absent for several polls, then appears -> success (not immediate, not a failure -- proves CASE 1/2 "keep waiting" and CASE 3 "succeed once published").
-rc, out, err = run_scenario("appears-after-3-polls")
+rc, out, err, poll_count, sleep_count = run_scenario("appears-after-3-polls")
 results.append(("B: address absent for several polls then appears -> the real step still succeeds (transient empty status.loadBalancer is tolerated as in-progress, never treated as immediate success or failure)", rc == 0 and "internal-k8s-argocd-delayed" in out and out.count("Not yet ready") >= 3))
+results.append(("B: measured poll count is exactly 4, measured sleep count is exactly 3 (3 empty probes each followed by one sleep, then the 4th probe finds the address)", poll_count == 4 and sleep_count == 3))
 
-# C: address never appears through the full bounded window -> the real 900s/15s loop genuinely runs to completion (60 iterations, sleep stubbed to a no-op) and fails closed with bounded diagnostics.
-rc, out, err = run_scenario("never-appears")
-results.append(("C: address never appears through the full bounded window -> the real step fails closed after the genuine 60-iteration loop (900s/15s), never hangs or silently succeeds", rc != 0 and "FAIL: argocd-server-ingress did not receive a published load-balancer address" in out))
-results.append(("C: timeout failure output includes the bounded `kubectl get ingress ... -o wide` diagnostic", "NAME                   CLASS   HOSTS   ADDRESS   PORTS   AGE" in out))
-results.append(("C: timeout failure output includes the bounded `kubectl describe ingress` diagnostic", "argocd-server-ingress (fake diagnostics)" in out))
-results.append(("C: the real loop is never infinite -- it terminates and returns control after exactly the bounded number of iterations (900/15=60), never re-armed", True))
+# C: address appears exactly on the final allowed poll (t=TIMEOUT_SECONDS=900, the 61st probe) -> success. This is the exact timeout-boundary case: the workflow gets its full budget, including one last readiness evaluation performed AT the deadline, never one interval short of it.
+rc, out, err, poll_count, sleep_count = run_scenario("appears-on-final-poll")
+results.append((f"C: address appears exactly on the final allowed poll (t={TIMEOUT_SECONDS}s) -> the real step still succeeds, never failing merely because the address showed up on the last permitted probe", rc == 0 and "internal-k8s-argocd-final" in out))
+results.append((f"C: measured poll count is exactly {EXPECTED_FINAL_POLL_COUNT} (probes at t=0,15,...,{TIMEOUT_SECONDS - INTERVAL_SECONDS},{TIMEOUT_SECONDS}), measured sleep count is exactly {EXPECTED_FINAL_SLEEP_COUNT} -- the full budget was used, no probe was skipped, no extra sleep past the deadline", poll_count == EXPECTED_FINAL_POLL_COUNT and sleep_count == EXPECTED_FINAL_SLEEP_COUNT))
 
-# D (CASE 4): host mismatch remains an immediate fail-closed safety check, never weakened or delayed by the longer timeout.
-rc, out, err = run_scenario("immediate", host_override="wrong.example.com")
-results.append(("D (CASE 4): a genuinely wrong live host fails closed immediately (never treated as a transient readiness gap), preserving the pre-existing safety check unweakened by this fix", rc != 0 and "live desired-state mismatch, never a transient readiness gap" in out))
+# D: address never appears through the full bounded window -> the real 900s/15s loop genuinely runs to completion and fails closed with bounded diagnostics.
+rc, out, err, poll_count, sleep_count = run_scenario("never-appears")
+results.append(("D: address never appears through the full bounded window -> the real step fails closed, never hangs or silently succeeds", rc != 0 and "FAIL: argocd-server-ingress did not receive a published load-balancer address" in out))
+results.append(("D: timeout failure output includes the bounded `kubectl get ingress ... -o wide` diagnostic", "NAME                   CLASS   HOSTS   ADDRESS   PORTS   AGE" in out))
+results.append(("D: timeout failure output includes the bounded `kubectl describe ingress` diagnostic", "argocd-server-ingress (fake diagnostics)" in out))
 
-# E: argocdServerIngress.enabled=false -> the step exits 0 immediately without waiting at all (unrelated to this fix, but must still hold).
-rc, out, err = run_scenario("never-appears", ingress_enabled=False)
-results.append(("E: argocdServerIngress.enabled=false still skips the wait entirely (unaffected by the timeout change)", rc == 0 and "Skipping Argo CD server Ingress readiness wait" in out))
+# E: the timeout case's poll/sleep counts are MEASURED from the real fake-kubectl/fake-sleep invocation counters (never a hardcoded/placeholder True) and must match the production loop's own exact bound derived above.
+results.append((f"E: measured poll count for the never-appears/timeout case is exactly {EXPECTED_FINAL_POLL_COUNT} (the real loop actually issued this many status.loadBalancer probes -- not merely assumed)", poll_count == EXPECTED_FINAL_POLL_COUNT))
+results.append((f"E: measured sleep count for the never-appears/timeout case is exactly {EXPECTED_FINAL_SLEEP_COUNT} (the real loop actually invoked sleep this many times -- not merely assumed), confirming the real loop is never infinite and terminates after exactly the bounded number of iterations, never re-armed", sleep_count == EXPECTED_FINAL_SLEEP_COUNT))
+
+# F (CASE 4): host mismatch remains an immediate fail-closed safety check, never weakened or delayed by the longer timeout/boundary correction.
+rc, out, err, poll_count, sleep_count = run_scenario("immediate", host_override="wrong.example.com")
+results.append(("F (CASE 4): a genuinely wrong live host fails closed immediately (never treated as a transient readiness gap), preserving the pre-existing safety check unweakened by this fix", rc != 0 and "live desired-state mismatch, never a transient readiness gap" in out))
+results.append(("F: measured load-balancer-status poll count is exactly 0, measured sleep count is exactly 0 -- the host check fails closed before the loop ever reaches the status.loadBalancer probe or a sleep, for a genuine desired-state mismatch", poll_count == 0 and sleep_count == 0))
+
+# G: argocdServerIngress.enabled=false -> the step exits 0 immediately without waiting at all (unrelated to the boundary correction, but must still hold).
+rc, out, err, poll_count, sleep_count = run_scenario("never-appears", ingress_enabled=False)
+results.append(("G: argocdServerIngress.enabled=false still skips the wait entirely (unaffected by the timeout/boundary change)", rc == 0 and "Skipping Argo CD server Ingress readiness wait" in out and poll_count == 0 and sleep_count == 0))
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)

@@ -828,7 +828,8 @@ jobs:
           ELAPSED=0
           LB_ADDRESS=""
 
-          while [ "$ELAPSED" -lt "$TIMEOUT_SECONDS" ]; do
+          # Timeout-boundary correctness: -le (not -lt) plus the guard below give the workflow its full 900s budget INCLUDING one final readiness probe performed exactly at elapsed==TIMEOUT_SECONDS (t=0,15,...,885,900) -- never an extra sleep past the deadline, never a missed final check.
+          while [ "$ELAPSED" -le "$TIMEOUT_SECONDS" ]; do
             if kubectl get ingress argocd-server-ingress -n "$ARGOCD_NAMESPACE" >/dev/null 2>&1; then
               ACTUAL_HOST="$(kubectl get ingress argocd-server-ingress -n "$ARGOCD_NAMESPACE" -o jsonpath='{.spec.rules[0].host}' 2>/dev/null || true)"
               if [ "$ACTUAL_HOST" != "$ARGOCD_HOST" ]; then
@@ -842,6 +843,11 @@ jobs:
                 echo "OK: argocd-server-ingress carries the expected host and has a published load-balancer address: ${LB_ADDRESS}"
                 break
               fi
+            fi
+
+            if [ "$ELAPSED" -ge "$TIMEOUT_SECONDS" ]; then
+              # The final allowed readiness check (elapsed == TIMEOUT_SECONDS) just ran above and still found nothing -- the bound is exhausted; fall through to the fail-closed block below without sleeping past the deadline.
+              break
             fi
 
             echo "Not yet ready (elapsed ${ELAPSED}s/${TIMEOUT_SECONDS}s) -- waiting ${INTERVAL_SECONDS}s..."
