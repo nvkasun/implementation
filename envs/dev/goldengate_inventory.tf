@@ -293,18 +293,18 @@ resource "terraform_data" "goldengate_runtime_contract" {
       error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.csi.serviceAccountRoleArn is a forbidden override -- it is a shared platform invariant."
     }
     precondition {
-      # GoldenGate Runtime Desired-State Simplification: lifecycle.state is retired as a second runtime-presence source of truth -- deployment.enabled is now the ONLY authoritative control, so a descriptor still carrying a lifecycle block is rejected outright (mirrors hack/goldengate-deployment-model.py's _reject_lifecycle_presence_control), never silently reinterpreted.
-      condition     = try(each.value.lifecycle, null) == null
+      # GoldenGate Runtime Desired-State Simplification: lifecycle.state is retired as a second runtime-presence source of truth -- deployment.enabled is now the ONLY authoritative control, so a descriptor still carrying a lifecycle block is rejected outright (mirrors hack/goldengate-deployment-model.py's _reject_lifecycle_presence_control), never silently reinterpreted. GoldenGate Runtime Presence Contract -- Final Safety Correction: key-presence based (contains(keys(...), "lifecycle")), never try(each.value.lifecycle, null) == null -- that null-tolerant form incorrectly treats a PRESENT key with a null value (`lifecycle: null`) as equivalent to the key being absent entirely, since yamldecode() still includes a null-valued key in the decoded object's own keys(). The contract is that the key must not be present at all, present-with-null included.
+      condition     = !try(contains(keys(each.value), "lifecycle"), false)
       error_message = "envs/${var.environment}/${each.key}/values.yaml: lifecycle.state is no longer supported for runtime presence; use deployment.enabled only."
     }
     precondition {
-      # GoldenGate Runtime Presence Contract Finalization: a legacy descriptor-root `enabled:` key (outside deployment.enabled) is a second, potentially contradictory runtime-presence signal -- rejected outright here too, mirroring hack/goldengate-deployment-model.py's _reject_root_level_enabled. Never fires for nested `enabled` fields belonging to other components (ingress.enabled, persistence.enabled, replication.enabled, etc.) since those are different mapping keys entirely.
-      condition     = try(each.value.enabled, null) == null
+      # GoldenGate Runtime Presence Contract Finalization: a legacy descriptor-root `enabled:` key (outside deployment.enabled) is a second, potentially contradictory runtime-presence signal -- rejected outright here too, mirroring hack/goldengate-deployment-model.py's _reject_root_level_enabled. Never fires for nested `enabled` fields belonging to other components (ingress.enabled, persistence.enabled, replication.enabled, etc.) since those are different mapping keys entirely. GoldenGate Runtime Presence Contract -- Final Safety Correction: key-presence based, so `enabled: null` at the descriptor root is rejected exactly like `enabled: true`/`enabled: false` -- see the lifecycle precondition above for why a null-tolerant try(...) == null form is wrong here.
+      condition     = !try(contains(keys(each.value), "enabled"), false)
       error_message = "envs/${var.environment}/${each.key}/values.yaml: root-level enabled is no longer supported; use deployment.enabled only."
     }
     precondition {
-      # GoldenGate Runtime Presence Contract Finalization: runtime.enabled was a second, chart-level runtime-presence switch that could silently contradict deployment.enabled -- it is no longer part of the schema at all and is rejected outright here too, mirroring hack/goldengate-deployment-model.py's _reject_runtime_enabled_presence_control. Nested feature flags such as runtime.csi.enabled are untouched -- only runtime's own `enabled` key is prohibited.
-      condition     = try(each.value.runtime.enabled, null) == null
+      # GoldenGate Runtime Presence Contract Finalization: runtime.enabled was a second, chart-level runtime-presence switch that could silently contradict deployment.enabled -- it is no longer part of the schema at all and is rejected outright here too, mirroring hack/goldengate-deployment-model.py's _reject_runtime_enabled_presence_control. Nested feature flags such as runtime.csi.enabled are untouched -- only runtime's own `enabled` key is prohibited. GoldenGate Runtime Presence Contract -- Final Safety Correction: key-presence based, so `runtime.enabled: null` is rejected exactly like a literal true/false value -- see the lifecycle precondition above for why a null-tolerant try(...) == null form is wrong here.
+      condition     = !try(contains(keys(each.value.runtime), "enabled"), false)
       error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.enabled is no longer supported as a runtime presence control; use deployment.enabled only."
     }
     precondition {

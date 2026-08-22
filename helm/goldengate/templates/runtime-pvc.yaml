@@ -6,6 +6,9 @@ metadata:
   namespace: {{ .Release.Namespace | quote }}
   labels:
     {{- include "goldengate.runtimeLabels" . | nindent 4 }}
+  annotations:
+    # GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 5: this PVC is PERSISTENT DURABLE STORAGE STATE, never runtime compute -- protected via the SAME argocd.argoproj.io/sync-options: Prune=false,Delete=false convention already established and validated elsewhere in this repository for other deletion-protected shared objects (helm/goldengate-platform/templates/runtime-namespace.yaml, runtime-serviceaccounts.yaml, cross-checked by .github/workflows/30-sub-platform.yaml's own assert_deletion_protected helper): Prune=false alone only affects normal auto-sync pruning, while Delete=false is what additionally excludes the resource from cascade deletion via the resources-finalizer.argocd.argoproj.io finalizer when the whole Application is deleted (deployment.enabled=false) -- PruneLast=true is a different, insufficient annotation that only affects prune *ordering*, never resource protection. This is the smallest safe mechanism available: it never touches syncPolicy at the Application level (StatefulSet/Services/Ingress/SecretProviderClasses are still fully pruned/cascade-deleted as normal), and it is what makes a later deployment.enabled=true re-enable reconnect to the SAME /u02 data without any manual PV/PVC surgery -- the EFS CSI driver's subPathPattern="${.PVC.name}" + ensureUniqueDirectory=true dynamic-provisioning behavior ties the access-point directory to THIS SPECIFIC PVC/PV instance, so deleting and recreating a same-named PVC would legitimately provision a DIFFERENT directory even though the name matches; never deleting the PVC object at all is what avoids that, not merely retaining the EFS filesystem itself.
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
 spec:
   accessModes:
     {{- toYaml .Values.runtime.storage.u02.accessModes | nindent 4 }}

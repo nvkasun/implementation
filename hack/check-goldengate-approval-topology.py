@@ -137,6 +137,57 @@ def check_main_reconcile_requires_authorization(doc, findings):
         findings.append(f"MAIN job reconcile_argocd's if: must require needs.{MAIN_AUTHORIZATION_JOB}.result == 'success', found: {_job_if(job)!r}")
 
 
+DELETION_JOB = "delete_removed_argocd_applications"
+
+
+def _needs_graph(jobs):
+    return {name: _job_needs(job) for name, job in jobs.items() if isinstance(job, dict)}
+
+
+def _is_transitively_needed(jobs, start, target):
+    """BFS over the needs: graph starting at `start` -- True if `target` is reachable by walking `start`'s own (recursive) needs: chain, or if start == target itself. A generic reachability check, never hardcoded to one specific intermediate job name, so it stays correct if the DAG is later restructured."""
+    if start == target:
+        return True
+    graph = _needs_graph(jobs)
+    seen = set()
+    queue = list(graph.get(start, []))
+    while queue:
+        current = queue.pop()
+        if current == target:
+            return True
+        if current in seen:
+            continue
+        seen.add(current)
+        queue.extend(graph.get(current, []))
+    return False
+
+
+def check_main_deletion_requires_authorization(doc, findings):
+    """GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 1: runtime removal (delete_removed_argocd_applications performs kubectl patch/delete application and kubectl delete namespace) is exactly as consequential a mutation as runtime creation/update and must never be able to bypass the single MAIN application deployment authorization. This proves the GENERIC invariant rather than hardcoding one acceptable intermediate job name (such as validate_argocd_ready): the deletion job must be transitively downstream of goldengate_deploy_authorization via needs:, AND it must directly need some job on that chain whose result it explicitly requires to be exactly 'success' in its own if: -- merely listing a job in needs: is not sufficient, since GitHub Actions treats a skipped dependency as satisfying a bare needs: reference without an explicit result check, silently letting a cancelled/failed/skipped authorization chain still permit deletion. The still-single-approval invariant (no second job-level environment: was introduced) is independently verified by check_main_single_authorization above, not duplicated here."""
+    jobs = _jobs(doc)
+    job = jobs.get(DELETION_JOB)
+    if not isinstance(job, dict):
+        findings.append(f"MAIN is missing the expected {DELETION_JOB!r} job")
+        return
+
+    if not _is_transitively_needed(jobs, DELETION_JOB, MAIN_AUTHORIZATION_JOB):
+        findings.append(f"MAIN job {DELETION_JOB!r} is not transitively downstream of {MAIN_AUTHORIZATION_JOB!r} (via needs:) -- runtime removal must not be able to bypass the single MAIN application deployment authorization")
+        return
+
+    needs = _job_needs(job)
+    job_if = _job_if(job)
+    gating_dependency = None
+    for dep in needs:
+        if _is_transitively_needed(jobs, dep, MAIN_AUTHORIZATION_JOB) and f"needs.{dep}.result == 'success'" in job_if:
+            gating_dependency = dep
+            break
+
+    if gating_dependency is None:
+        findings.append(
+            f"MAIN job {DELETION_JOB!r} does not directly require (via needs.<job>.result == 'success' in its own if:) any job that is transitively downstream of {MAIN_AUTHORIZATION_JOB!r} -- listing such a job in needs: alone is not sufficient; runtime removal could otherwise still proceed after a cancelled/failed/skipped authorization chain"
+        )
+
+
 def check_specialist_orchestration_contract(filename, doc, findings):
     """Rule 4: orchestrated_by_main is declared under workflow_call.inputs only, defaulting to false, and is never exposed as a workflow_dispatch input."""
     on_block = _on_block(doc)
@@ -287,6 +338,7 @@ def run_checks(workflow_dir):
     check_main_single_authorization(main_doc, findings)
     check_main_calls_pass_orchestrated_by_main(main_doc, findings)
     check_main_reconcile_requires_authorization(main_doc, findings)
+    check_main_deletion_requires_authorization(main_doc, findings)
     check_main_never_calls_ops_workflows(main_doc, findings)
 
     for filename in SPECIALIST_FILENAMES:

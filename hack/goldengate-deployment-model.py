@@ -560,8 +560,8 @@ def _parse_replication(deployment_id, environment, role, deployment_type, doc, d
 
 
 def _reject_lifecycle_presence_control(doc):
-    """GoldenGate Runtime Desired-State Simplification: lifecycle.state is retired as a second runtime-presence source of truth -- deployment.enabled is now the ONLY authoritative control over whether a GoldenGate runtime should exist. A descriptor still carrying a lifecycle block (in any shape, valid or not) is rejected outright rather than silently reinterpreted or ignored, so a stale descriptor can never introduce ambiguous or contradictory intent. There is deliberately no replacement lifecycle-shaped field -- do not reintroduce one."""
-    if doc.get("lifecycle") is not None:
+    """GoldenGate Runtime Desired-State Simplification: lifecycle.state is retired as a second runtime-presence source of truth -- deployment.enabled is now the ONLY authoritative control over whether a GoldenGate runtime should exist. A descriptor still carrying a lifecycle block (in any shape, valid or not -- including a literal `lifecycle: null`) is rejected outright rather than silently reinterpreted or ignored, so a stale descriptor can never introduce ambiguous or contradictory intent. Key-presence based (`"lifecycle" in doc`), never `doc.get("lifecycle") is not None` -- the contract is that the key must not be present at all, and a `.get()`-based check would incorrectly accept `lifecycle: null` (a present key whose value happens to be null is still a present key). There is deliberately no replacement lifecycle-shaped field -- do not reintroduce one."""
+    if "lifecycle" in doc:
         raise DescriptorError("lifecycle.state is no longer supported for runtime presence; use deployment.enabled only")
 
 

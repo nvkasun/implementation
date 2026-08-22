@@ -94,6 +94,9 @@ _STORAGECLASS_KIND = "storageclass"
 # The synced admin Secret is created out-of-band by the Secrets Store CSI driver (mirroring the SecretProviderClass), not directly rendered by this chart -- it carries no goldengate.adcb/* ownership labels to verify. Its exact expected name is itself the only ownership signal available; mere existence under that name is not a conflict.
 _ADMIN_SECRET_KIND = "admin_secret"
 
+# GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 5: the runtime u02 PVC is intentionally retained (helm/goldengate/templates/runtime-pvc.yaml carries argocd.argoproj.io/sync-options: Prune=false) across Application deletion, so it is durable STORAGE STATE, never runtime compute -- it needs special handling below, distinct from every other footprint kind, which all remain pure compute/workload objects.
+_PVC_KIND = "pvc"
+
 
 def _app_suffix(deployment_id):
     """APP_SUFFIX="${DEPLOYMENT_ID#gg-}" -- strips a leading "gg-" only if present, exactly like the real workflow's own bash parameter expansion."""
@@ -151,8 +154,9 @@ def _ownership_reason(resource_label, obj, environment, deployment_id):
 def classify(run, environment, deployment_id, argocd_namespace, runtime_namespace, ecr_registry):
     """Returns the stable {"state", "environment", "deployment_id", "namespace", "reasons", "checks"} shape. Raises ClassifierInspectionError if Kubernetes access itself could not be trusted -- callers must let that propagate as a hard failure, never a downgrade to ABSENT. Raises ValueError if the folder-driven model itself is inconsistent (invalid descriptors/cross-descriptor problems elsewhere) -- a configuration error, never ABSENT/OWNED/BROKEN cluster state."""
     # Confirms the folder-driven model is internally consistent before any cluster call -- fails closed if ANY descriptor in the environment is invalid, the same guard the reconcile path already relies on. Deliberately does NOT require THIS deployment_id's own descriptor to still be present: this classifier is also reused for a PHYSICALLY REMOVED descriptor's leftover live resources (GoldenGate Runtime Presence Contract Finalization -- ownership-safe delete, deletion_matrix reason=physical-removal), where by design no envs/<environment>/<deployment_id>/values.yaml exists any more; the caller (delete_removed_argocd_applications) already independently proved this ID was a genuine GoldenGate deployment before it ever reached this classifier.
+    descriptor = None
     try:
-        describe_deployment(environment, deployment_id)
+        descriptor = describe_deployment(environment, deployment_id)
     except ValueError as exc:
         if "unknown deployment ID" not in str(exc):
             raise
@@ -180,9 +184,18 @@ def classify(run, environment, deployment_id, argocd_namespace, runtime_namespac
     if not app_found and not any_footprint_found:
         return {"state": STATE_ABSENT, "environment": environment, "deployment_id": deployment_id, "namespace": runtime_namespace, "reasons": [], "checks": checks}
 
+    # GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 5: the u02 PVC is intentionally retained across Application deletion (Prune=false, see helm/goldengate/templates/runtime-pvc.yaml) -- "Application absent, ONLY the retained PVC exists" is the expected, SAFE shape of a disabled-then-re-enableable runtime, never an unexplained orphan on its own. Every OTHER compute/workload footprint kind (StatefulSet/Service/headless Service/StorageClass/SecretProviderClasses/admin Secret) is still pruned/cascade-deleted as normal and remains exactly as unsafe as before when found without an owning Application. "Chart-owned" persistence means the descriptor both declares EFS persistence (efsMode is not None) AND the chart actually creates its own PVC rather than referencing a pre-existing one via runtime.storage.u02.existingClaim (pvcClaimName empty) -- the SAME condition helm/goldengate/templates/runtime-pvc.yaml itself renders on.
+    declares_chart_owned_persistence = bool(descriptor and descriptor.get("efsMode") and not descriptor.get("pvcClaimName"))
+    pvc_found, _pvc_obj = footprint[_PVC_KIND]
+    non_pvc_footprint_found = any(found for label, (found, _obj) in footprint.items() if label != _PVC_KIND)
+
     if not app_found:
-        owned_names = [label for label, (found, _obj) in footprint.items() if found]
-        reasons.append(f"Application {app_name} does not exist in {argocd_namespace} but expected-name runtime resource(s) already exist: {owned_names!r}")
+        if non_pvc_footprint_found:
+            owned_names = [label for label, (found, _obj) in footprint.items() if found and label != _PVC_KIND]
+            reasons.append(f"Application {app_name} does not exist in {argocd_namespace} but expected-name runtime resource(s) already exist: {owned_names!r}")
+        elif pvc_found and not declares_chart_owned_persistence:
+            reasons.append(f"Application {app_name} does not exist in {argocd_namespace} but a retained persistence PVC exists although this deployment's descriptor does not declare chart-owned EFS persistence -- not the recognized retained-persistence footprint, treated as an unexplained orphan")
+        # else: Application absent, ONLY the retained PVC exists, and this deployment's descriptor legitimately declares chart-owned EFS persistence -- the recognized "disabled runtime, durable /u02 data retained for a future re-enable" shape. Its own ownership labels are still verified unconditionally below, exactly like every other footprint kind -- a foreign/mislabeled PVC under the expected name is never silently adopted.
     else:
         labels = ((app_obj.get("metadata") or {}).get("labels")) or {}
         actual_env_label = labels.get("goldengate.adcb/environment")

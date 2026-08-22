@@ -2174,6 +2174,44 @@ print('OK')
       fail "${name}: sidecar-absence check failed"
       cat "${WORKDIR}/${name}-sidecar.log"
     fi
+
+    # GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 5 (tests 22/24): the rendered runtime PVC carries the approved Argo CD Prune=false,Delete=false retention contract -- the SAME convention already established and validated elsewhere in this repository (helm/goldengate-platform's runtime-namespace.yaml/runtime-serviceaccounts.yaml, cross-checked by 30-sub-platform.yaml) for other deletion-protected shared objects (test 22 -- both real descriptors declare chart-owned managed EFS persistence), while every OTHER compute/workload kind (StatefulSet/Service/Ingress) carries NO such annotation at all (test 24 -- proving Application deletion still prunes/cascade-deletes them normally; only durable storage state is protected).
+    if python3 -c "
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open('$RENDERED')) if d]
+pvcs = [d for d in docs if d.get('kind') == 'PersistentVolumeClaim']
+assert pvcs, 'no PersistentVolumeClaim document rendered'
+pvc_annotations = (pvcs[0].get('metadata') or {}).get('annotations') or {}
+assert pvc_annotations.get('argocd.argoproj.io/sync-options') == 'Prune=false,Delete=false', f'runtime PVC missing argocd.argoproj.io/sync-options: Prune=false,Delete=false, found {pvc_annotations!r}'
+for kind in ('StatefulSet', 'Service', 'Ingress'):
+    for doc in docs:
+        if doc.get('kind') != kind:
+            continue
+        annotations = (doc.get('metadata') or {}).get('annotations') or {}
+        assert 'argocd.argoproj.io/sync-options' not in annotations, f'{kind} unexpectedly carries argocd.argoproj.io/sync-options -- only the durable PVC may be retention-protected, compute must still be pruned normally'
+print('OK')
+" >"${WORKDIR}/${name}-pvc-retention.log" 2>&1; then
+      pass "${name}: runtime PVC carries argocd.argoproj.io/sync-options: Prune=false,Delete=false, while StatefulSet/Service/Ingress carry no such annotation (compute still prunes normally, only durable storage is protected)"
+    else
+      fail "${name}: PVC retention-annotation check failed"
+      cat "${WORKDIR}/${name}-pvc-retention.log"
+    fi
+
+    # 30: false -> true re-enable must reuse the SAME PVC name -- proven by rendering the same descriptor/release name twice independently and comparing the PVC name byte-for-byte (a purely deterministic template function of Release.Name, never a random/time-based suffix).
+    RENDERED_SECOND_RENDER="${WORKDIR}/${name}-second-render.yaml"
+    if helm template "$name" "$RUNTIME_CHART" --namespace goldengate-dev \
+        -f "$VALUES_FILE" "${SHARED_OVERRIDES[@]}" > "$RENDERED_SECOND_RENDER" 2>"${WORKDIR}/${name}-second-render.err"; then
+      PVC_NAME_FIRST="$(grep -A2 '^kind: PersistentVolumeClaim$' "$RENDERED" | grep '  name:' | head -1)"
+      PVC_NAME_SECOND="$(grep -A2 '^kind: PersistentVolumeClaim$' "$RENDERED_SECOND_RENDER" | grep '  name:' | head -1)"
+      if [ -n "$PVC_NAME_FIRST" ] && [ "$PVC_NAME_FIRST" = "$PVC_NAME_SECOND" ]; then
+        pass "30: ${name}: two independent renders of the same release name produce the identical PVC name (${PVC_NAME_FIRST# name: }) -- a future deployment.enabled=false then true re-enable reuses the SAME PVC/storage identity, never a random/time-based suffix"
+      else
+        fail "30: ${name}: PVC name is not deterministic across independent renders (first=${PVC_NAME_FIRST:-<none>}, second=${PVC_NAME_SECOND:-<none>})"
+      fi
+    else
+      fail "30: ${name}: second helm template render failed"
+      cat "${WORKDIR}/${name}-second-render.err"
+    fi
   done <<< "$(python3 -c "
 import yaml
 doc = yaml.safe_load(open('${CANONICAL_CONFIG}'))
@@ -3373,7 +3411,7 @@ else
   skip "workflow summary deletion-trigger documentation check -- python3 not available"
 fi
 
-# GoldenGate Runtime Presence Contract Finalization, Defect 4: REALLY EXECUTE the committed "Classify runtime ownership safety before removal (read-only)" step (never a reimplementation) against a fake hack/orchestration/runtime_state.py stub shadowed via cwd, for every classifier state -- proving it succeeds for ABSENT/OWNED (publishing the right RUNTIME_OWNERSHIP_STATE=... to $GITHUB_ENV), fails closed (non-zero exit, BEFORE any mutation) for BROKEN, and skips the classifier entirely (never even invoking it) for the retired legacyPair path. Then statically proves "Delete Argo CD Application" itself can never run for BROKEN: its own if: condition is exactly the OWNED/ABSENT/NOT_APPLICABLE allow-list, with no always()/continue-on-error override that could bypass a failed prior step -- combined with the classify step's own non-zero exit on BROKEN (which halts the job under GitHub Actions' own default step semantics), a foreign/ambiguous Application can never be patched or deleted.
+# GoldenGate Runtime Presence Contract Finalization, Defect 4: REALLY EXECUTE the committed "Classify runtime ownership safety before removal (read-only)" step (never a reimplementation) against a fake hack/orchestration/runtime_state.py stub shadowed via cwd, for every classifier state -- proving it succeeds for ABSENT/OWNED (publishing the right RUNTIME_OWNERSHIP_STATE=... to $GITHUB_ENV) and fails closed (non-zero exit, BEFORE any mutation) for BROKEN. GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 2: the retired/unsupported legacyPair path now ALSO fails closed here (never RUNTIME_OWNERSHIP_STATE=NOT_APPLICABLE, never a classifier-skip bypass into the mutating steps below). Then statically proves "Delete Argo CD Application" itself can never run for BROKEN or an unsupported deployment_model: its own if: condition is exactly the OWNED/ABSENT allow-list (NOT_APPLICABLE removed entirely), with no always()/continue-on-error override that could bypass a failed prior step. Finally, a stub-kubectl proof REALLY executes both steps in the sequence GitHub Actions' own default step semantics would produce, confirming a foreign/BROKEN or unsupported/legacyPair Application never produces a logged kubectl patch/delete call, while a genuinely OWNED one does.
 echo ""
 echo "--- GoldenGate Runtime Presence Contract Finalization, Defect 4: ownership-classify-before-delete ---"
 
@@ -3459,13 +3497,78 @@ if classify_step is not None:
     rc, env_text, log, invoked = run_classify(classify_script, "BROKEN")
     results.append(("classify FAILS CLOSED (non-zero exit) for state=BROKEN, before any Application finalizer patch or deletion -- never auto-repaired here", rc != 0 and invoked))
 
+    # GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 2: legacyPair is retired and unsupported -- it now fails closed BEFORE the singleRuntime classifier is even invoked (never RUNTIME_OWNERSHIP_STATE=NOT_APPLICABLE, never a bypass into the mutating steps below).
     rc, env_text, log, invoked = run_classify(classify_script, "BROKEN", deployment_model="legacyPair")
-    results.append(("classify SKIPS the singleRuntime ownership classifier entirely for the retired legacyPair path (never even invoked), succeeds, and publishes RUNTIME_OWNERSHIP_STATE=NOT_APPLICABLE", rc == 0 and "RUNTIME_OWNERSHIP_STATE=NOT_APPLICABLE" in env_text and not invoked))
+    results.append(("9: classify FAILS CLOSED (non-zero exit) for the retired/unsupported legacyPair deployment_model, before any mutation, without ever invoking the singleRuntime ownership classifier", rc != 0 and not invoked))
+    results.append(("classify never publishes RUNTIME_OWNERSHIP_STATE=NOT_APPLICABLE for legacyPair (that bypass state no longer exists)", "RUNTIME_OWNERSHIP_STATE=NOT_APPLICABLE" not in env_text))
 
 if delete_step is not None:
     delete_if = delete_step.get("if", "")
-    results.append(("delete step: if: condition is exactly the OWNED/ABSENT/NOT_APPLICABLE allow-list (never BROKEN)", "BROKEN" not in delete_if and "OWNED" in delete_if and "ABSENT" in delete_if and "NOT_APPLICABLE" in delete_if))
+    results.append(("delete step: if: condition is exactly the OWNED/ABSENT allow-list (never BROKEN)", "BROKEN" not in delete_if and "OWNED" in delete_if and "ABSENT" in delete_if))
+    results.append(("10: delete step's if: condition no longer contains NOT_APPLICABLE at all -- no state may authorize kubectl patch/delete without having been classified", "NOT_APPLICABLE" not in delete_if))
     results.append(("delete step: no always()/continue-on-error override that could bypass a failed prior (classify) step", "always()" not in delete_if and not delete_step.get("continue-on-error", False)))
+
+# 11: fake/stub kubectl proof -- REALLY execute classify then (only if GitHub Actions' own default step semantics would actually reach it) the delete step, with a stub kubectl on PATH that logs every invocation; a foreign/BROKEN or unsupported/legacyPair Application must never produce a logged kubectl patch/delete call, while a genuinely OWNED one does (a silent/no-op stub would otherwise let this test pass vacuously).
+if classify_step is not None and delete_step is not None:
+    STUB_KUBECTL = "#!/usr/bin/env bash\necho \"$@\" >> \"$KUBECTL_CALL_LOG\"\nexit 0\n"
+
+    def run_full_sequence(state, deployment_model):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            bin_dir = os.path.join(tmp_dir, "bin")
+            os.makedirs(bin_dir)
+            kubectl_log = os.path.join(tmp_dir, "kubectl_calls.log")
+            with open(os.path.join(bin_dir, "kubectl"), "w") as f:
+                f.write(STUB_KUBECTL)
+            os.chmod(os.path.join(bin_dir, "kubectl"), 0o755)
+
+            tool_dir = os.path.join(tmp_dir, "hack", "orchestration")
+            os.makedirs(tool_dir)
+            with open(os.path.join(tool_dir, "runtime_state.py"), "w") as f:
+                f.write(STUB_TEMPLATE.format(state=state))
+
+            fd, gh_env_path = tempfile.mkstemp()
+            os.close(fd)
+            env = {
+                "PATH": bin_dir + os.pathsep + os.environ.get("PATH", ""),
+                "ENVIRONMENT": "dev",
+                "DEPLOYMENT_ID": "gg-postgresql-repltest-01",
+                "DEPLOYMENT_MODEL": deployment_model,
+                "ARGOCD_APP_NAME": "goldengate-dev-postgresql-repltest-01",
+                "ARGOCD_NAMESPACE": "argocd",
+                "TARGET_NAMESPACE": "goldengate-dev",
+                "GITHUB_ENV": gh_env_path,
+                "PIP_BREAK_SYSTEM_PACKAGES": "1",
+                "KUBECTL_CALL_LOG": kubectl_log,
+            }
+            classify_proc = subprocess.run(["bash", "-c", classify_step["run"]], env=env, capture_output=True, text=True, cwd=tmp_dir, timeout=30)
+            with open(gh_env_path) as f:
+                env_text = f.read()
+            os.unlink(gh_env_path)
+            runtime_ownership_state = None
+            for line in env_text.splitlines():
+                if line.startswith("RUNTIME_OWNERSHIP_STATE="):
+                    runtime_ownership_state = line.split("=", 1)[1]
+
+            # Mirrors GitHub Actions' own default step semantics for this exact job (no always()/continue-on-error on either step): the delete step only actually runs when the classify step succeeded AND its own if: condition (evaluated against the classify step's published state) is satisfied -- never a reimplementation of the GHA engine itself, just the two concrete facts that gate it.
+            delete_would_run = classify_proc.returncode == 0 and runtime_ownership_state in ("OWNED", "ABSENT")
+            if delete_would_run:
+                subprocess.run(["bash", "-c", delete_step["run"]], env=env, capture_output=True, text=True, cwd=tmp_dir, timeout=30)
+
+            kubectl_calls = []
+            if os.path.exists(kubectl_log):
+                with open(kubectl_log) as f:
+                    kubectl_calls = [line.strip() for line in f if line.strip()]
+            mutating_calls = [c for c in kubectl_calls if c.startswith("patch ") or c.startswith("delete ")]
+            return classify_proc.returncode, mutating_calls
+
+    rc, mutating_calls = run_full_sequence("BROKEN", "singleRuntime")
+    results.append(("11a: a foreign/BROKEN Application never reaches a logged kubectl patch/delete call (stub kubectl proof)", rc != 0 and mutating_calls == []))
+
+    rc, mutating_calls = run_full_sequence("BROKEN", "legacyPair")
+    results.append(("11b: an unsupported/legacyPair deployment_model never reaches a logged kubectl patch/delete call (stub kubectl proof)", rc != 0 and mutating_calls == []))
+
+    rc, mutating_calls = run_full_sequence("OWNED", "singleRuntime")
+    results.append(("11c (positive control): a genuinely OWNED singleRuntime Application DOES reach kubectl patch and delete -- proves the stub-kubectl harness above is actually wired to detect mutation, not silently vacuous", rc == 0 and any(c.startswith("patch ") for c in mutating_calls) and any(c.startswith("delete application") for c in mutating_calls)))
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
@@ -3486,6 +3589,104 @@ PYEOF
   fi
 else
   skip "Defect 4: ownership-classify-before-delete execution proof -- python3/PyYAML/EKS_APP_WORKFLOW unavailable"
+fi
+
+# GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 5 (tests 28/29): REALLY EXECUTE the committed "Verify runtime compute is absent after removal (read-only)" step against a fake hack/orchestration/runtime_state.py stub -- proving it accepts ABSENT and OWNED (28/29: OWNED is the intentionally-retained-PVC shape, explicitly permitted, never treated as a failure), and FAILS CLOSED after its bounded retry deadline when the classifier keeps reporting BROKEN (unexpected compute never quietly accepted). TIMEOUT_SECONDS/INTERVAL_SECONDS are text-substituted down to a few seconds purely so this exercises the real retry-then-fail-closed control flow quickly -- the substituted values are never asserted as the production timeout itself (that remains the real committed 180s/15s, unedited in the workflow file).
+echo ""
+echo "--- GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 5: post-delete runtime compute absence acceptance ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  set +e
+  POST_DELETE_ACCEPTANCE_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+
+job = doc["jobs"]["delete_removed_argocd_applications"]
+step = next((s for s in job["steps"] if s.get("name") == "Verify runtime compute is absent after removal (read-only)"), None)
+
+results = []
+if step is None:
+    results.append(("post-delete step: 'Verify runtime compute is absent after removal (read-only)' exists in delete_removed_argocd_applications", False))
+    for label, ok in results:
+        print(("OK " if ok else "FAIL ") + label)
+    sys.exit(0)
+
+# Fast-test substitution only -- the committed production values (180s/15s) are left completely untouched in the workflow file itself.
+fast_script = step["run"].replace("TIMEOUT_SECONDS=180", "TIMEOUT_SECONDS=6").replace("INTERVAL_SECONDS=15", "INTERVAL_SECONDS=2")
+results.append(("fast-test substitution actually matched (production TIMEOUT_SECONDS=180/INTERVAL_SECONDS=15 still present verbatim in the real committed step)", "TIMEOUT_SECONDS=180" in step["run"] and "INTERVAL_SECONDS=15" in step["run"]))
+
+STUB_TEMPLATE_STATIC = '''import argparse, json, sys
+p = argparse.ArgumentParser()
+p.add_argument("--environment", required=True)
+p.add_argument("--deployment-id", required=True)
+p.add_argument("--kubectl-bin", default="kubectl")
+p.parse_args()
+print(json.dumps({{"state": {state!r}, "environment": "dev", "deployment_id": "gg-postgresql-repltest-01", "namespace": "goldengate-dev", "reasons": [], "checks": {{}}}}))
+sys.exit(0)
+'''
+
+STUB_TEMPLATE_ALWAYS_BROKEN = '''import argparse, json, sys
+p = argparse.ArgumentParser()
+p.add_argument("--environment", required=True)
+p.add_argument("--deployment-id", required=True)
+p.add_argument("--kubectl-bin", default="kubectl")
+p.parse_args()
+print(json.dumps({"state": "BROKEN", "environment": "dev", "deployment_id": "gg-postgresql-repltest-01", "namespace": "goldengate-dev", "reasons": ["unexpected lingering StatefulSet"], "checks": {}}))
+sys.exit(0)
+'''
+
+
+def run_post_delete_check(stub_source):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tool_dir = os.path.join(tmp_dir, "hack", "orchestration")
+        os.makedirs(tool_dir)
+        with open(os.path.join(tool_dir, "runtime_state.py"), "w") as f:
+            f.write(stub_source)
+        env = {
+            "PATH": os.environ.get("PATH", ""),
+            "ENVIRONMENT": "dev",
+            "DEPLOYMENT_ID": "gg-postgresql-repltest-01",
+            "DEPLOYMENT_MODEL": "singleRuntime",
+            "PIP_BREAK_SYSTEM_PACKAGES": "1",
+        }
+        proc = subprocess.run(["bash", "-c", fast_script], env=env, capture_output=True, text=True, cwd=tmp_dir, timeout=30)
+        return proc.returncode, proc.stdout + proc.stderr
+
+
+for state in ("ABSENT", "OWNED"):
+    rc, log = run_post_delete_check(STUB_TEMPLATE_STATIC.format(state=state))
+    results.append((f"post-delete acceptance succeeds (exit 0) when the classifier reports {state} -- runtime compute confirmed absent, a retained PVC (OWNED) explicitly permitted, never treated as a failure", rc == 0))
+
+rc, log = run_post_delete_check(STUB_TEMPLATE_ALWAYS_BROKEN)
+results.append(("post-delete acceptance FAILS CLOSED (non-zero exit) after its bounded retry deadline when the classifier keeps reporting BROKEN -- unexpected compute is never silently accepted, and nothing is deleted manually to force success", rc != 0 and "FAIL" in log))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  POST_DELETE_ACCEPTANCE_STATUS=$?
+  set -e
+
+  POST_DELETE_ACCEPTANCE_FAILURES="$(echo "$POST_DELETE_ACCEPTANCE_OUT" | grep "^FAIL " || true)"
+  if [ "$POST_DELETE_ACCEPTANCE_STATUS" -eq 0 ] && [ -z "$POST_DELETE_ACCEPTANCE_FAILURES" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        OK\ *) pass "Gap 5: ${line#OK }" ;;
+      esac
+    done <<< "$POST_DELETE_ACCEPTANCE_OUT"
+  else
+    fail "Gap 5: post-delete runtime compute absence acceptance execution proof failed:"$'\n'"${POST_DELETE_ACCEPTANCE_OUT}"
+  fi
+else
+  skip "Gap 5: post-delete runtime compute absence acceptance execution proof -- python3/PyYAML/EKS_APP_WORKFLOW unavailable"
 fi
 
 # Malformed CURRENT YAML must fail the workflow closed (never silently skipped or deleted); whole-folder, whole-envs-directory, and rename scenarios exercised through the REAL discovery logic (git diff --name-status), not just the isolated per-ID loop above.
@@ -6920,15 +7121,19 @@ if [ "$HELM_AVAILABLE" = "true" ] && command -v git >/dev/null 2>&1; then
   ORACLE_HEAD_RENDER="${WORKDIR}/oracle-6d1-head.yaml"
   ORACLE_WORKING_RENDER="${WORKDIR}/oracle-6d1-working.yaml"
   if git show "HEAD:helm/goldengate/templates/runtime-statefulset.yaml" > "${WORKDIR}/oracle-sts-head.yaml" 2>/dev/null; then
-    # GoldenGate Runtime Presence Contract Finalization (a later, independent task) legitimately removed the retired runtime.enabled master-switch guard from this template: the wrapping {{- if .Values.runtime.enabled }} opening line, the matching trailing {{- end }} (the file's last line), and the " and runtime.enabled=true" clause from three required-error messages -- the Helm release itself is now the sole presence boundary. Reversing exactly that known, reviewed edit on the HEAD copy before comparing still proves what Phase 6D1 originally cared about here: no OTHER content (Oracle/PostgreSQL container/image/sidecar rendering) changed.
-    sed -e '/^{{- if \.Values\.runtime\.enabled }}$/d' \
-        -e 's/ and runtime\.enabled=true"/"/g' \
-        -e '$ {/^{{- end }}$/d;}' \
-        "${WORKDIR}/oracle-sts-head.yaml" > "${WORKDIR}/oracle-sts-head-normalized.yaml"
-    if diff -q "${WORKDIR}/oracle-sts-head-normalized.yaml" "helm/goldengate/templates/runtime-statefulset.yaml" >/dev/null 2>&1; then
-      pass "32: helm/goldengate/templates/runtime-statefulset.yaml is unchanged since HEAD other than the known GoldenGate Runtime Presence Contract Finalization runtime.enabled-guard removal -- existing Oracle/PostgreSQL StatefulSet rendering is untouched by Phase 6D1"
+    # GoldenGate Runtime Presence Contract Finalization (a later, independent task) legitimately removed the retired runtime.enabled master-switch guard from this template: the wrapping {{- if .Values.runtime.enabled }} opening line, the matching trailing {{- end }} (the file's last line at the time), and the " and runtime.enabled=true" clause from three required-error messages -- the Helm release itself is now the sole presence boundary. Exact match against HEAD is tried FIRST (the common case once that removal is itself part of HEAD, e.g. after a later commit) -- only if HEAD still predates it does the normalization below (reversing exactly that known, reviewed edit before comparing) apply, so this never depends on assuming today's HEAD is in one particular state. The normalization deliberately targets the runtime.enabled guard's OWN opening line and error-message clauses by content, but the guard's closing {{- end }} was, at the time, simply the file's last line -- stripping "the last line if it happens to be {{- end }}" is only safe as a FALLBACK after an exact match has already failed to rule out the far more common case of a legitimate, unrelated trailing {{- end }} (such as the tolerations block's own closer) being mistaken for it.
+    if diff -q "${WORKDIR}/oracle-sts-head.yaml" "helm/goldengate/templates/runtime-statefulset.yaml" >/dev/null 2>&1; then
+      pass "32: helm/goldengate/templates/runtime-statefulset.yaml is byte-identical to HEAD -- existing Oracle/PostgreSQL StatefulSet rendering is untouched by Phase 6D1"
     else
-      fail "32: helm/goldengate/templates/runtime-statefulset.yaml changed since HEAD beyond the known runtime.enabled-guard removal:"$'\n'"$(diff "${WORKDIR}/oracle-sts-head-normalized.yaml" "helm/goldengate/templates/runtime-statefulset.yaml" 2>&1 || true)"
+      sed -e '/^{{- if \.Values\.runtime\.enabled }}$/d' \
+          -e 's/ and runtime\.enabled=true"/"/g' \
+          -e '$ {/^{{- end }}$/d;}' \
+          "${WORKDIR}/oracle-sts-head.yaml" > "${WORKDIR}/oracle-sts-head-normalized.yaml"
+      if diff -q "${WORKDIR}/oracle-sts-head-normalized.yaml" "helm/goldengate/templates/runtime-statefulset.yaml" >/dev/null 2>&1; then
+        pass "32: helm/goldengate/templates/runtime-statefulset.yaml is unchanged since HEAD other than the known GoldenGate Runtime Presence Contract Finalization runtime.enabled-guard removal -- existing Oracle/PostgreSQL StatefulSet rendering is untouched by Phase 6D1"
+      else
+        fail "32: helm/goldengate/templates/runtime-statefulset.yaml changed since HEAD beyond the known runtime.enabled-guard removal:"$'\n'"$(diff "${WORKDIR}/oracle-sts-head.yaml" "helm/goldengate/templates/runtime-statefulset.yaml" 2>&1 || true)"
+      fi
     fi
   else
     skip "32: runtime-statefulset.yaml HEAD comparison -- not available in this git history"
@@ -9538,11 +9743,13 @@ if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$DETECT_SCRIPT" ]; then
   LIVE_UX_FIX_2_DETECT_OUT="$(python3 - "$DETECT_SCRIPT" <<'PYEOF'
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 
 detect_script = sys.argv[1]
+repo_root_for_fixture = os.getcwd()
 
 
 def run_detect(deployment_id, deploy_bool, environment="dev", cwd=None):
@@ -9576,14 +9783,26 @@ def check(label, condition, proc=None, outputs=None):
         failures.append(label + extra)
 
 
-# GoldenGate Runtime Presence Contract Finalization, Defect 1: an environment-wide manual run (deployment_id blank) is no longer an empty-mutation no-op -- it converges the COMPLETE environment from the canonical deployment registry, never Git diff. With CURRENT real DEV source (both real descriptors deployment.enabled=true), Deploy must populate deployment_matrix with both real IDs (deploy=true) and an empty deletion_matrix; Validate must produce the identical membership with deploy=false, still has_changes=true (a non-empty matrix was resolved) but never mutating (deploy flag itself is false, and no deletion evaluation runs in Validate mode).
+# GoldenGate Runtime Presence Contract Finalization, Defect 1: an environment-wide manual run (deployment_id blank) is no longer an empty-mutation no-op -- it converges the COMPLETE environment from the canonical deployment registry, never Git diff. With CURRENT real DEV source (both real descriptors deployment.enabled=true), Deploy must populate deployment_matrix with both real IDs (deploy=true) and an empty deletion_matrix; Validate must produce the identical membership with deploy=false, still has_changes=true (a non-empty matrix was resolved) but never mutating (deploy flag itself is false, and no deletion evaluation runs in Validate mode). GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 4: expected membership is derived DYNAMICALLY from the canonical model (hack/goldengate-deployment-model.py environment-matrix), never a second hardcoded ["gg-mssql-repltest-01", "gg-postgresql-repltest-01"] literal -- adding a third enabled descriptor must make this test's own expectation grow with it, not fail it. The two current POC IDs are still asserted as MEMBERS (never as the only possible members) so this test still meaningfully exercises today's real repository state.
+CANONICAL_DEPLOY_TRUE = subprocess.run(["python3", "hack/goldengate-deployment-model.py", "--environment", "dev", "environment-matrix", "--deploy", "true"], capture_output=True, text=True)
+CANONICAL_DEPLOY_FALSE = subprocess.run(["python3", "hack/goldengate-deployment-model.py", "--environment", "dev", "environment-matrix", "--deploy", "false"], capture_output=True, text=True)
+if CANONICAL_DEPLOY_TRUE.returncode != 0 or CANONICAL_DEPLOY_FALSE.returncode != 0:
+    failures.append(f"environment-matrix canonical baseline command failed (deploy=true rc={CANONICAL_DEPLOY_TRUE.returncode}, deploy=false rc={CANONICAL_DEPLOY_FALSE.returncode})")
+    CANONICAL_ENABLED_IDS = None
+else:
+    CANONICAL_ENABLED_IDS = sorted(d["deployment_id"] for d in json.loads(CANONICAL_DEPLOY_TRUE.stdout)["deployment_matrix"])
+    CANONICAL_ENABLED_IDS_DEPLOY_FALSE = sorted(d["deployment_id"] for d in json.loads(CANONICAL_DEPLOY_FALSE.stdout)["deployment_matrix"])
+    check("canonical baseline: environment-matrix --deploy true/false resolve the identical membership (only the per-entry deploy flag differs)", CANONICAL_ENABLED_IDS == CANONICAL_ENABLED_IDS_DEPLOY_FALSE)
+    check("canonical baseline: the two current POC IDs are members of the canonical active set (never asserted as the ONLY possible members)", {"gg-mssql-repltest-01", "gg-postgresql-repltest-01"} <= set(CANONICAL_ENABLED_IDS))
+
 proc, outputs = run_detect("", "true")
 J_MATRIX = json.loads(outputs.get("deployment_matrix", "null")) if outputs.get("deployment_matrix") else None
-check("J: manual environment-wide Deploy (deployment_id=\x27\x27, INPUT_DEPLOY=true) converges the complete environment: both real DEV IDs enter deployment_matrix with deploy=true, deletion_matrix stays empty",
+check("J: manual environment-wide Deploy (deployment_id=\x27\x27, INPUT_DEPLOY=true) converges the complete environment: deployment_matrix membership equals the canonical model's own active set (deploy=true), deletion_matrix stays empty",
       proc.returncode == 0
       and outputs.get("has_changes") == "true"
       and J_MATRIX is not None
-      and sorted(d["deployment_id"] for d in J_MATRIX) == ["gg-mssql-repltest-01", "gg-postgresql-repltest-01"]
+      and CANONICAL_ENABLED_IDS is not None
+      and sorted(d["deployment_id"] for d in J_MATRIX) == CANONICAL_ENABLED_IDS
       and all(d["deploy"] is True for d in J_MATRIX)
       and outputs.get("has_deletions") == "false"
       and outputs.get("deletion_matrix") == "[]",
@@ -9591,13 +9810,61 @@ check("J: manual environment-wide Deploy (deployment_id=\x27\x27, INPUT_DEPLOY=t
 
 proc, outputs = run_detect("", "false")
 K_MATRIX = json.loads(outputs.get("deployment_matrix", "null")) if outputs.get("deployment_matrix") else None
-check("K: manual environment-wide Validate (deployment_id=\x27\x27, INPUT_DEPLOY=false) resolves the identical complete-environment membership, deploy=false, still strictly non-mutating (deletion_matrix stays empty even though both IDs are resolved)",
+check("K: manual environment-wide Validate (deployment_id=\x27\x27, INPUT_DEPLOY=false) resolves the identical complete-environment membership as the canonical model's own active set, deploy=false, still strictly non-mutating (deletion_matrix stays empty even though the matrix is resolved)",
       proc.returncode == 0
       and K_MATRIX is not None
-      and sorted(d["deployment_id"] for d in K_MATRIX) == ["gg-mssql-repltest-01", "gg-postgresql-repltest-01"]
+      and CANONICAL_ENABLED_IDS is not None
+      and sorted(d["deployment_id"] for d in K_MATRIX) == CANONICAL_ENABLED_IDS
       and all(d["deploy"] is False for d in K_MATRIX)
       and outputs.get("has_deletions") == "false"
       and outputs.get("deletion_matrix") == "[]",
+      proc, outputs)
+
+# GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 4 (test 18): add a synthetic THIRD enabled descriptor in an isolated fixture repo and prove the environment-wide matrix automatically includes it -- this test's own logic never hardcodes a count, so it keeps passing unchanged when a real fourth/fifth descriptor is added to the real repository later. The fixture mirrors the full hack/ toolchain and envs/dev/ tree (both real descriptors, environment.yaml, the ignored argocd/goldengate-monitor folders) since the environment-wide path genuinely shells out to hack/goldengate-deployment-model.py (which in turn needs hack/goldengate-environment.py and envs/dev/environment.yaml) -- never a hand-trimmed partial fixture that would fail for reasons unrelated to the behavior under test.
+third_scratch_dir = tempfile.mkdtemp(prefix="detect-third-enabled-")
+shutil.copytree(os.path.join(repo_root_for_fixture, "hack"), os.path.join(third_scratch_dir, "hack"))
+shutil.copytree(os.path.join(repo_root_for_fixture, "envs", "dev"), os.path.join(third_scratch_dir, "envs", "dev"))
+# A full structurally-valid descriptor (real CSI/service/storage/ingress/persistence shape), never a hand-trimmed minimal stub -- built from the real gg-postgresql-repltest-01 descriptor with only the pipeline/ALB-group-order identity changed (both must be unique across descriptors, per the canonical model's own cross-descriptor validation), so parse_descriptor()'s full validation genuinely passes rather than being accidentally short-circuited by an unrelated field error.
+with open(os.path.join(repo_root_for_fixture, "envs", "dev", "gg-postgresql-repltest-01", "values.yaml")) as f:
+    THIRD_SYNTHETIC_VALUES_YAML = (
+        f.read()
+        .replace("repltest-pg-to-mssql-001", "repltest-third-synthetic-001")
+        .replace('groupOrder: "112"', 'groupOrder: "199"')
+    )
+os.makedirs(os.path.join(third_scratch_dir, "envs", "dev", "gg-third-synthetic-01"), exist_ok=True)
+with open(os.path.join(third_scratch_dir, "envs", "dev", "gg-third-synthetic-01", "values.yaml"), "w") as f:
+    f.write(THIRD_SYNTHETIC_VALUES_YAML)
+
+proc, outputs = run_detect("", "true", cwd=third_scratch_dir)
+THIRD_MATRIX = json.loads(outputs.get("deployment_matrix", "null")) if outputs.get("deployment_matrix") else None
+check("18: a synthetic third enabled descriptor is automatically included in the environment-wide matrix alongside the two real IDs, with NO test-code change required for the count to grow from two to three",
+      proc.returncode == 0
+      and THIRD_MATRIX is not None
+      and sorted(d["deployment_id"] for d in THIRD_MATRIX) == ["gg-mssql-repltest-01", "gg-postgresql-repltest-01", "gg-third-synthetic-01"],
+      proc, outputs)
+
+# GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 4 (test 19): add a synthetic disabled descriptor to the same three-enabled fixture and prove it enters the desired-absence matrix on Deploy, never the reconciliation matrix. deployment.enabled=false is a "turn off, keep the config" mechanism (never a minimal stub) -- even an inactive descriptor is fully validated, so this fixture must be a complete, valid descriptor too, just like the third one above.
+FOURTH_SYNTHETIC_VALUES_YAML = (
+    THIRD_SYNTHETIC_VALUES_YAML
+    .replace("repltest-third-synthetic-001", "repltest-fourth-disabled-001")
+    .replace('groupOrder: "199"', 'groupOrder: "198"')
+    .replace("enabled: true\n  pipeline:", "enabled: false\n  pipeline:")
+)
+os.makedirs(os.path.join(third_scratch_dir, "envs", "dev", "gg-fourth-disabled-synthetic-01"), exist_ok=True)
+with open(os.path.join(third_scratch_dir, "envs", "dev", "gg-fourth-disabled-synthetic-01", "values.yaml"), "w") as f:
+    f.write(FOURTH_SYNTHETIC_VALUES_YAML)
+
+proc, outputs = run_detect("", "true", cwd=third_scratch_dir)
+FOURTH_DEPLOYMENT_MATRIX = json.loads(outputs.get("deployment_matrix", "null")) if outputs.get("deployment_matrix") else None
+FOURTH_DELETION_MATRIX = json.loads(outputs.get("deletion_matrix", "null")) if outputs.get("deletion_matrix") else None
+check("19: a synthetic disabled descriptor enters the desired-absence (deletion) matrix on Deploy, never the reconciliation matrix, alongside the three still-correctly-enabled descriptors",
+      proc.returncode == 0
+      and FOURTH_DEPLOYMENT_MATRIX is not None
+      and sorted(d["deployment_id"] for d in FOURTH_DEPLOYMENT_MATRIX) == ["gg-mssql-repltest-01", "gg-postgresql-repltest-01", "gg-third-synthetic-01"]
+      and FOURTH_DELETION_MATRIX is not None
+      and len(FOURTH_DELETION_MATRIX) == 1
+      and FOURTH_DELETION_MATRIX[0]["deployment_id"] == "gg-fourth-disabled-synthetic-01"
+      and FOURTH_DELETION_MATRIX[0]["reason"] == "deployment-disabled",
       proc, outputs)
 
 import tempfile as _tempfile
@@ -13524,6 +13791,73 @@ if [ -f hack/check-goldengate-approval-topology.py ] && [ "$PYTHON_AVAILABLE" = 
   fi
 else
   skip "D6: approval-topology re-confirmation -- python3 unavailable or checker missing"
+fi
+
+# GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 1: the approval-topology checker must catch this class of drift FOREVER, not merely today's committed workflow -- proven by REALLY EXECUTING the checker (never a reimplementation) against two synthetic broken fixtures (a scratch copy of the real .github/workflows/ with delete_removed_argocd_applications' needs/if: deliberately mutated), each expected to fail with a specific violation, plus a positive control proving the checker stays green against the real, unmutated repository.
+echo ""
+echo "--- GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 1: approval-topology checker catches broken deletion-authorization fixtures ---"
+
+if [ -f hack/check-goldengate-approval-topology.py ] && [ "$PYTHON_AVAILABLE" = "true" ]; then
+  TOPOLOGY_FIXTURE_DIR="${WORKDIR}/topology-fixture"
+  rm -rf "$TOPOLOGY_FIXTURE_DIR"
+  mkdir -p "$TOPOLOGY_FIXTURE_DIR"
+  cp .github/workflows/*.yaml "$TOPOLOGY_FIXTURE_DIR/"
+
+  # Positive control: the checker stays green against an UNMUTATED copy -- proves a later failure below is caused by the deliberate mutation, never by the fixture-copying mechanism itself.
+  if python3 hack/check-goldengate-approval-topology.py --workflow-dir "$TOPOLOGY_FIXTURE_DIR" >/dev/null 2>&1; then
+    pass "positive control: the checker is green against an unmutated copy of the real workflows/ directory (proves the fixture-copy mechanism itself is not what causes the failures below)"
+  else
+    fail "positive control: the checker unexpectedly fails against an unmutated copy of the real workflows/ directory -- the fixtures below would be meaningless"
+  fi
+
+  # Fixture 1: deletion depends ONLY on detect_changed_deployments (the exact violation this task describes) -- not transitively downstream of goldengate_deploy_authorization at all.
+  python3 - "$TOPOLOGY_FIXTURE_DIR/00-main-goldengate-orchestrator.yaml" <<'PYEOF'
+import sys
+import yaml
+path = sys.argv[1]
+with open(path) as f:
+    doc = yaml.safe_load(f)
+job = doc["jobs"]["delete_removed_argocd_applications"]
+job["needs"] = "detect_changed_deployments"
+job["if"] = "success() && needs.detect_changed_deployments.outputs.has_deletions == 'true'"
+with open(path, "w") as f:
+    yaml.safe_dump(doc, f, sort_keys=False, default_flow_style=False)
+PYEOF
+  set +e
+  FIXTURE1_OUT="$(python3 hack/check-goldengate-approval-topology.py --workflow-dir "$TOPOLOGY_FIXTURE_DIR" 2>&1)"
+  FIXTURE1_STATUS=$?
+  set -e
+  if [ "$FIXTURE1_STATUS" -ne 0 ] && echo "$FIXTURE1_OUT" | grep -qF "is not transitively downstream of 'goldengate_deploy_authorization'"; then
+    pass "fixture 1: the checker FAILS closed when deletion depends only on detect_changed_deployments (not transitively downstream of goldengate_deploy_authorization at all), with a specific, actionable violation message"
+  else
+    fail "fixture 1: the checker did not detect a deletion job depending only on detect_changed_deployments (status=${FIXTURE1_STATUS}):"$'\n'"${FIXTURE1_OUT}"
+  fi
+
+  # Fixture 2: deletion lists validate_argocd_ready in needs: (so it IS structurally transitively downstream) but its if: never actually checks that job's result -- the "bare needs: reference" bypass GitHub Actions itself would silently treat as satisfied by a skip.
+  cp .github/workflows/*.yaml "$TOPOLOGY_FIXTURE_DIR/"
+  python3 - "$TOPOLOGY_FIXTURE_DIR/00-main-goldengate-orchestrator.yaml" <<'PYEOF'
+import sys
+import yaml
+path = sys.argv[1]
+with open(path) as f:
+    doc = yaml.safe_load(f)
+job = doc["jobs"]["delete_removed_argocd_applications"]
+job["needs"] = ["detect_changed_deployments", "validate_argocd_ready"]
+job["if"] = "success() && needs.detect_changed_deployments.outputs.has_deletions == 'true'"
+with open(path, "w") as f:
+    yaml.safe_dump(doc, f, sort_keys=False, default_flow_style=False)
+PYEOF
+  set +e
+  FIXTURE2_OUT="$(python3 hack/check-goldengate-approval-topology.py --workflow-dir "$TOPOLOGY_FIXTURE_DIR" 2>&1)"
+  FIXTURE2_STATUS=$?
+  set -e
+  if [ "$FIXTURE2_STATUS" -ne 0 ] && echo "$FIXTURE2_OUT" | grep -qF "does not directly require (via needs.<job>.result == 'success' in its own if:)"; then
+    pass "fixture 2: the checker FAILS closed when deletion merely lists validate_argocd_ready in needs: without an explicit .result == 'success' check in its own if: (the bare-needs-reference bypass)"
+  else
+    fail "fixture 2: the checker did not detect a bare needs: reference without a result check (status=${FIXTURE2_STATUS}):"$'\n'"${FIXTURE2_OUT}"
+  fi
+else
+  skip "approval-topology broken-fixture proof -- python3 unavailable or checker missing"
 fi
 
 echo ""

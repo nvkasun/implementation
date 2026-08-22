@@ -3202,9 +3202,12 @@ jobs:
   delete_removed_argocd_applications:
     name: Delete removed GoldenGate Argo CD Applications
 
-    # GoldenGate Runtime Presence Contract Finalization: previously push-only. A manual workflow_dispatch Deploy (environment-wide or a specific selected deployment_id) can now also populate deletion_matrix -- deployment.enabled=false is a first-class desired-absence request regardless of trigger type, and detect_changed_deployments' workflow_dispatch branch only ever populates deletion_matrix when the manual action was actually Deploy (never Validate), so has_deletions=='true' alone remains a safe, sufficient mutation gate here.
-    needs: detect_changed_deployments
-    if: success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.detect_changed_deployments.outputs.has_deletions == 'true'
+    # GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 1: this job performs the SAME class of consequential Kubernetes mutation (kubectl patch/delete application, kubectl delete namespace) as build_publish_and_deploy, but previously ran the instant detect_changed_deployments alone succeeded with a non-empty deletion_matrix -- entirely bypassing MAIN's single GoldenGate application deployment authorization (goldengate_deploy_authorization) and the post-reconciliation Argo CD HEALTHY acceptance gate (validate_argocd_ready). Runtime removal must not mutate Kubernetes until the normal MAIN deployment authorization has succeeded, exactly like every other mutating job in this DAG. Requiring validate_argocd_ready's own success here proves that chain WITHOUT duplicating it or opening a second environment: approval: validate_argocd_ready is itself transitively downstream of terraform_sync_once -> argocd_preflight -> goldengate_deploy_authorization -> reconcile_argocd -> validate_argocd_ready, and its own if: already fails closed (non-success) whenever any link in that chain failed, was cancelled, or never ran. GoldenGate Runtime Presence Contract Finalization: previously push-only. A manual workflow_dispatch Deploy (environment-wide or a specific selected deployment_id) can now also populate deletion_matrix -- deployment.enabled=false is a first-class desired-absence request regardless of trigger type, and detect_changed_deployments' workflow_dispatch branch only ever populates deletion_matrix when the manual action was actually Deploy (never Validate).
+    needs:
+      - validate_model
+      - detect_changed_deployments
+      - validate_argocd_ready
+    if: success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.validate_model.outputs.effective_deploy == 'true' && needs.detect_changed_deployments.result == 'success' && needs.detect_changed_deployments.outputs.has_deletions == 'true' && needs.validate_argocd_ready.result == 'success'
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -3349,12 +3352,10 @@ jobs:
           set -euo pipefail
 
           # GoldenGate Runtime Presence Contract Finalization (Defect 4): read-only ownership classification MUST run and be evaluated BEFORE any Application finalizer patch, Application deletion, workload deletion, or namespace deletion below -- reuses hack/orchestration/runtime_state.py (the SAME canonical ABSENT/OWNED/BROKEN classifier the reconcile-side runtime_ownership_preflight job already relies on), never a second/duplicated ownership mechanism. BROKEN (a foreign/ambiguous/unsafe footprint) fails closed right here, before any mutation -- a foreign same-named Application is never patched or deleted.
-          #
-          # legacyPair is retired and this job only still carries it for a historical leftover (a values.yaml that was legacyPair as of the deleted Git revision); the singleRuntime ownership classifier's Application-naming/namespace convention does not apply to it, so it is intentionally left to the existing namespace ownership-label check in "Clean up remaining GoldenGate namespace if still present" below (unchanged), which already fails closed on a label mismatch for that path.
+          # GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 2: legacyPair is retired and is not a currently supported deployment model. The singleRuntime ownership classifier's Application-naming/namespace convention does not apply to it, and building a second legacy-specific ownership classifier purely to keep automatic deletion working is out of scope -- so it fails closed HERE, before any mutation is even attempted, rather than proceeding unclassified (the previous RUNTIME_OWNERSHIP_STATE=NOT_APPLICABLE bypass let "Delete Argo CD Application" patch/delete a legacyPair Application without ever proving ownership; the later namespace-label check ran too late to prevent that Application mutation). There is no destructive allow-list state for an unsupported/legacy deployment model: OWNED authorizes mutation, ABSENT is a safe no-op, and everything else -- BROKEN, or an unsupported/unrecognized deployment_model -- fails closed before mutation.
           if [ "$DEPLOYMENT_MODEL" != "singleRuntime" ]; then
-            echo "Deployment model is ${DEPLOYMENT_MODEL} -- skipping the singleRuntime ownership classifier (not applicable to this retired historical path)."
-            echo "RUNTIME_OWNERSHIP_STATE=NOT_APPLICABLE" >> "$GITHUB_ENV"
-            exit 0
+            echo "FAIL: deployment_model=${DEPLOYMENT_MODEL} is not a currently supported runtime deployment model (only singleRuntime is) -- refusing to patch finalizers or delete anything for ${ARGOCD_APP_NAME}. A retired/unsupported deployment model can never be automatically classified as OWNED here; this requires manual, out-of-band investigation and cleanup, never an automatic bypass."
+            exit 1
           fi
 
           python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
@@ -3384,8 +3385,8 @@ jobs:
 
       - name: Delete Argo CD Application
         shell: bash
-        # Explicit step-level gate, matching the ABSENT/OWNED/BROKEN contract: BROKEN already exited the job in the classify step above (this condition is defense-in-depth, not the sole gate) -- ABSENT/OWNED/NOT_APPLICABLE (legacyPair) are all safe to enter, since this step itself is a no-op when the Application does not exist.
-        if: env.RUNTIME_OWNERSHIP_STATE == 'OWNED' || env.RUNTIME_OWNERSHIP_STATE == 'ABSENT' || env.RUNTIME_OWNERSHIP_STATE == 'NOT_APPLICABLE'
+        # Explicit step-level gate, matching the ABSENT/OWNED/BROKEN contract: BROKEN and unsupported/legacy deployment models already exited the job in the classify step above (this condition is defense-in-depth, not the sole gate) -- only OWNED/ABSENT are ever allowed to reach a mutating step. GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 2: NOT_APPLICABLE is removed -- it existed only to bypass ownership classification for legacyPair, which now fails closed instead; there is no remaining state that authorizes mutation without having been classified.
+        if: env.RUNTIME_OWNERSHIP_STATE == 'OWNED' || env.RUNTIME_OWNERSHIP_STATE == 'ABSENT'
         run: |
           set -euo pipefail
 
@@ -3446,6 +3447,45 @@ jobs:
           else
             echo "Namespace ${TARGET_NAMESPACE} already removed."
           fi
+
+      - name: Verify runtime compute is absent after removal (read-only)
+        if: env.RUNTIME_OWNERSHIP_STATE == 'OWNED' || env.RUNTIME_OWNERSHIP_STATE == 'ABSENT'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 5: does not merely trust "kubectl delete application --wait=true" plus a log message claiming Argo cascades resources -- performs a bounded READ-ONLY re-classification proving runtime COMPUTE is actually gone. Reuses hack/orchestration/runtime_state.py (the SAME canonical classifier, never a second/duplicated acceptance implementation): after removal, ABSENT or OWNED both structurally guarantee every compute/workload footprint kind (Application, StatefulSet, runtime Services, headless Service, runtime Ingress, both runtime SecretProviderClasses, StorageClass) is absent -- the classifier's own "non_pvc_footprint_found" check is exactly what would flip the result to BROKEN if any of them were still lingering. The intentionally retained durable PVC (Prune=false), the underlying managed EFS filesystem, the shared runtime namespace, and AWS Secrets Manager secrets are all correctly ALLOWED to remain -- none of them are examined as compute here, and OWNED (retained-persistence-only) is an explicitly accepted outcome, never treated as a failure. If unexpected compute still shows BROKEN after the bounded deadline below, this fails closed rather than silently accepting an incomplete deletion -- and never deletes anything further itself; investigate and re-run instead.
+          if [ "$DEPLOYMENT_MODEL" != "singleRuntime" ]; then
+            echo "Deployment model is ${DEPLOYMENT_MODEL} -- the singleRuntime post-delete compute-absence check does not apply to this retired historical path."
+            exit 0
+          fi
+
+          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
+
+          TIMEOUT_SECONDS=180
+          INTERVAL_SECONDS=15
+          ELAPSED=0
+
+          while true; do
+            if CLASSIFIER_OUTPUT="$(python3 hack/orchestration/runtime_state.py --environment "${ENVIRONMENT}" --deployment-id "${DEPLOYMENT_ID}")"; then
+              STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
+              if [ "$STATE" != "BROKEN" ]; then
+                echo "OK: post-delete runtime compute absence confirmed for ${DEPLOYMENT_ID} (state=${STATE}). Application/StatefulSet/runtime Services/headless Service/runtime Ingress/runtime SecretProviderClasses/StorageClass are all absent. A retained durable PVC (if this deployment declares chart-owned EFS persistence), the underlying managed EFS filesystem, the shared runtime namespace, and AWS Secrets Manager secrets are all allowed to remain."
+                exit 0
+              fi
+              echo "[$(date -u +%H:%M:%S)] post-delete classifier still reports BROKEN for ${DEPLOYMENT_ID} (elapsed ${ELAPSED}s / ${TIMEOUT_SECONDS}s) -- unexpected compute may still be draining; diagnostics:"
+              echo "$CLASSIFIER_OUTPUT"
+            else
+              echo "[$(date -u +%H:%M:%S)] post-delete classifier inspection error for ${DEPLOYMENT_ID} (elapsed ${ELAPSED}s / ${TIMEOUT_SECONDS}s), retrying..."
+            fi
+
+            if [ "$ELAPSED" -ge "$TIMEOUT_SECONDS" ]; then
+              echo "FAIL: runtime compute for ${DEPLOYMENT_ID} was not confirmed absent within ${TIMEOUT_SECONDS}s after removal. Refusing to consider this deletion complete -- investigate the diagnostics above rather than deleting anything else manually."
+              exit 1
+            fi
+            sleep "$INTERVAL_SECONDS"
+            ELAPSED=$((ELAPSED + INTERVAL_SECONDS))
+          done
 
       - name: Workflow summary
         if: always()

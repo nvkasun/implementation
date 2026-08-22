@@ -270,6 +270,75 @@ class RuntimeStateClassifierTests(unittest.TestCase):
         with self.assertRaises(runtime_state.ClassifierInspectionError):
             _classify(cluster)
 
+    # GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 5: DEPLOYMENT_ID (gg-postgresql-repltest-01) is a real descriptor that declares chart-owned managed EFS persistence (persistence.enabled=true, provider=efs, efs.mode=managed, no existingClaim) -- exactly the shape the retained-PVC safe case requires.
+
+    def test_19_app_absent_only_owned_retained_pvc_is_owned(self):
+        # 25: App absent + owned retained PVC only is considered safe for re-enable -- the recognized "disabled runtime, durable /u02 data retained" shape.
+        cluster = FakeCluster()
+        cluster.put("persistentvolumeclaim", f"{DEPLOYMENT_ID}-u02", RUNTIME_NAMESPACE, _named_obj(f"{DEPLOYMENT_ID}-u02", _runtime_labels()))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_state.STATE_OWNED)
+        self.assertEqual(result["reasons"], [])
+
+    def test_20_app_absent_foreign_retained_pvc_is_broken(self):
+        # 26: App absent + a same-named PVC whose ownership labels belong to a DIFFERENT deployment is BROKEN -- retained-persistence recognition never bypasses the ordinary per-resource ownership-label check.
+        cluster = FakeCluster()
+        cluster.put("persistentvolumeclaim", f"{DEPLOYMENT_ID}-u02", RUNTIME_NAMESPACE, _named_obj(f"{DEPLOYMENT_ID}-u02", _runtime_labels(deployment_id="gg-foreign")))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_state.STATE_BROKEN)
+        self.assertTrue(any("pvc" in r and "incompatible ownership" in r for r in result["reasons"]))
+
+    def test_21_app_absent_statefulset_still_running_is_broken_even_with_retained_pvc(self):
+        # 27: App absent + StatefulSet still running is BROKEN -- retained-persistence recognition applies ONLY to the PVC kind; every other compute/workload footprint kind remains exactly as unsafe as before, even alongside a correctly-owned retained PVC.
+        cluster = FakeCluster()
+        cluster.put("persistentvolumeclaim", f"{DEPLOYMENT_ID}-u02", RUNTIME_NAMESPACE, _named_obj(f"{DEPLOYMENT_ID}-u02", _runtime_labels()))
+        cluster.put("statefulset", DEPLOYMENT_ID, RUNTIME_NAMESPACE, _named_obj(DEPLOYMENT_ID, _runtime_labels()))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_state.STATE_BROKEN)
+        self.assertTrue(any("does not exist" in r and "Application" in r for r in result["reasons"]))
+
+    def test_22_app_absent_retained_pvc_without_declared_persistence_is_broken(self):
+        # A deployment that does NOT declare chart-owned EFS persistence has no legitimate reason for a retained PVC to exist under its expected name -- treated as an unexplained orphan, never silently adopted as the recognized retained-persistence shape. Monkeypatched descriptor (never a corrupted real repo file) purely to exercise this one branch in isolation, matching this file's own established describe_deployment monkeypatch convention.
+        original_describe_deployment = runtime_state.describe_deployment
+
+        def _no_persistence_descriptor(environment, deployment_id):
+            return {"deploymentId": deployment_id, "efsMode": None, "pvcClaimName": ""}
+
+        runtime_state.describe_deployment = _no_persistence_descriptor
+        try:
+            cluster = FakeCluster()
+            cluster.put("persistentvolumeclaim", f"{DEPLOYMENT_ID}-u02", RUNTIME_NAMESPACE, _named_obj(f"{DEPLOYMENT_ID}-u02", _runtime_labels()))
+            result = _classify(cluster)
+            self.assertEqual(result["state"], runtime_state.STATE_BROKEN)
+            self.assertTrue(any("does not declare chart-owned EFS persistence" in r for r in result["reasons"]))
+        finally:
+            runtime_state.describe_deployment = original_describe_deployment
+
+    def test_23_app_absent_retained_pvc_with_existing_claim_mode_is_broken(self):
+        # A descriptor that references a pre-existing PVC (runtime.storage.u02.existingClaim set) never owns/creates its own PVC via the chart at all -- pvcClaimName being non-empty must be treated the same as "not chart-owned" here, exactly like the "no persistence declared" case above.
+        original_describe_deployment = runtime_state.describe_deployment
+
+        def _existing_claim_descriptor(environment, deployment_id):
+            return {"deploymentId": deployment_id, "efsMode": "existing", "pvcClaimName": "some-pre-existing-pvc"}
+
+        runtime_state.describe_deployment = _existing_claim_descriptor
+        try:
+            cluster = FakeCluster()
+            cluster.put("persistentvolumeclaim", f"{DEPLOYMENT_ID}-u02", RUNTIME_NAMESPACE, _named_obj(f"{DEPLOYMENT_ID}-u02", _runtime_labels()))
+            result = _classify(cluster)
+            self.assertEqual(result["state"], runtime_state.STATE_BROKEN)
+        finally:
+            runtime_state.describe_deployment = original_describe_deployment
+
+    def test_24_app_found_retained_pvc_owned_is_still_owned(self):
+        # Sanity: the Application-found path is entirely unaffected by the Gap 5 retained-PVC change -- a correctly-owned PVC alongside a correctly-owned Application remains OWNED exactly as before.
+        cluster = FakeCluster()
+        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj())
+        cluster.put("persistentvolumeclaim", f"{DEPLOYMENT_ID}-u02", RUNTIME_NAMESPACE, _named_obj(f"{DEPLOYMENT_ID}-u02", _runtime_labels()))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_state.STATE_OWNED)
+        self.assertEqual(result["reasons"], [])
+
     def test_full_owned_footprint_with_correct_app_is_owned(self):
         cluster = FakeCluster()
         cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj())
