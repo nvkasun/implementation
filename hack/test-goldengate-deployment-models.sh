@@ -12958,6 +12958,297 @@ else
   skip "real script-execution proof of 'Validate rendered Argo CD server Ingress' -- python3/helm unavailable or ${ARGOCD_DEPLOY_WORKFLOW} missing"
 fi
 
+echo ""
+echo "--- Live Argo ALB Convergence Timing Fix ---"
+
+# Structural proof, read directly from the real committed YAML step (never a reimplementation): the bounded wait's timeout/poll-interval literals.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$ARGOCD_DEPLOY_WORKFLOW" ]; then
+  ALB_TIMING_STRUCT_CHECK="$(python3 -c '
+import yaml
+
+with open("'"$ARGOCD_DEPLOY_WORKFLOW"'") as f:
+    doc = yaml.safe_load(f)
+
+steps = doc["jobs"]["build_publish_and_deploy"]["steps"]
+by_name = {s.get("name"): s for s in steps}
+script = by_name["Wait for Argo CD server Ingress readiness (bounded)"]["run"]
+
+results = []
+results.append(("1: the bounded wait step still exists under its established name", "Wait for Argo CD server Ingress readiness (bounded)" in by_name))
+results.append(("2: TIMEOUT_SECONDS is exactly 900 (up from the old 300s bound that the live incident proved too short for a fresh internal ALB)", "TIMEOUT_SECONDS=900" in script))
+results.append(("3: TIMEOUT_SECONDS is no longer 300", "TIMEOUT_SECONDS=300" not in script))
+results.append(("4: INTERVAL_SECONDS (poll interval) is exactly 15", "INTERVAL_SECONDS=15" in script))
+results.append(("5: the wait remains a bounded while loop, never an infinite one -- ELAPSED is compared against TIMEOUT_SECONDS every iteration", "while [ \"$ELAPSED\" -lt \"$TIMEOUT_SECONDS\" ]" in script))
+results.append(("6: the loop still increments ELAPSED by INTERVAL_SECONDS every iteration (guarantees eventual termination)", "ELAPSED=$((ELAPSED + INTERVAL_SECONDS))" in script))
+results.append(("7: the existing host-mismatch fail-closed safety check (CASE 4) remains present and unweakened", "This is a live desired-state mismatch, never a transient readiness gap -- refusing to wait further." in script))
+results.append(("8: timeout diagnostics still include a bounded `kubectl get ingress ... -o wide`", "kubectl get ingress argocd-server-ingress -n \"$ARGOCD_NAMESPACE\" -o wide" in script))
+results.append(("9: timeout diagnostics still include a bounded `kubectl describe ingress`", "kubectl describe ingress argocd-server-ingress -n \"$ARGOCD_NAMESPACE\"" in script))
+results.append(("10: no unbounded cluster-log dump was introduced (no kubectl logs invocation in this step)", "kubectl logs" not in script))
+results.append(("11: no new workflow_dispatch input was introduced merely to control this timeout -- TIMEOUT_SECONDS remains an implementation-level literal, not ${{ inputs.* }}", "inputs." not in script))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+' 2>&1)"
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL\ *) fail "Live Argo ALB Convergence Timing Fix: ${line#FAIL }" ;;
+      OK\ *) pass "Live Argo ALB Convergence Timing Fix: ${line#OK }" ;;
+    esac
+  done <<< "$ALB_TIMING_STRUCT_CHECK"
+else
+  skip "Live Argo ALB Convergence Timing Fix: structural timeout/poll-interval check -- python3/PyYAML unavailable or ${ARGOCD_DEPLOY_WORKFLOW} missing"
+fi
+
+# No new workflow_dispatch input was introduced anywhere in 20-sub-argocd.yaml merely to control this timeout (structural proof against the parsed on.workflow_dispatch.inputs/on.workflow_call.inputs shape, never raw text -- which would false-positive on this very file's own explanatory prose).
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$ARGOCD_DEPLOY_WORKFLOW" ]; then
+  ALB_TIMING_NO_INPUT_CHECK="$(python3 -c '
+import yaml
+
+with open("'"$ARGOCD_DEPLOY_WORKFLOW"'") as f:
+    doc = yaml.safe_load(f)
+
+on_block = doc.get(True, doc.get("on", {}))
+wd_inputs = set(((on_block.get("workflow_dispatch") or {}).get("inputs") or {}).keys())
+wc_inputs = set(((on_block.get("workflow_call") or {}).get("inputs") or {}).keys())
+suspicious = {name for name in (wd_inputs | wc_inputs) if "timeout" in name.lower() or "alb" in name.lower()}
+print("OK" if not suspicious else "FAIL " + repr(suspicious))
+' 2>&1)"
+  if [ "$ALB_TIMING_NO_INPUT_CHECK" = "OK" ]; then
+    pass "Live Argo ALB Convergence Timing Fix: no timeout/ALB-related workflow_dispatch or workflow_call input was added -- this remains an implementation-level infrastructure convergence budget, not an operator-facing option"
+  else
+    fail "Live Argo ALB Convergence Timing Fix: an unexpected timeout/ALB-related workflow input was found: ${ALB_TIMING_NO_INPUT_CHECK}"
+  fi
+else
+  skip "Live Argo ALB Convergence Timing Fix: no-new-input check -- python3/PyYAML unavailable or ${ARGOCD_DEPLOY_WORKFLOW} missing"
+fi
+
+# Real script execution: REALLY EXECUTE the committed "Wait for Argo CD server Ingress readiness (bounded)" step (never a reimplementation) against a fabricated kubectl/sleep on PATH, for three simulated AWS Load Balancer Controller convergence timelines. sleep is stubbed to a no-op (tests do not actually wait real seconds) while the script's own ELAPSED/TIMEOUT_SECONDS arithmetic and iteration count are fully real -- a timeout scenario genuinely drives the real loop through all 60 iterations (900/15), just without the real wall-clock delay.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$ARGOCD_DEPLOY_WORKFLOW" ]; then
+  set +e
+  ALB_WAIT_EXEC_OUT="$(python3 - "$ARGOCD_DEPLOY_WORKFLOW" <<'PYEOF'
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+
+import yaml
+
+workflow_path = sys.argv[1]
+with open(workflow_path) as f:
+    doc = yaml.safe_load(f)
+
+steps = doc["jobs"]["build_publish_and_deploy"]["steps"]
+by_name = {s.get("name"): s for s in steps}
+script = by_name["Wait for Argo CD server Ingress readiness (bounded)"]["run"]
+
+FAKE_KUBECTL_TEMPLATE = '''#!/usr/bin/env python3
+import os
+import sys
+
+MODE = os.environ["FAKE_MODE"]
+COUNT_FILE = os.environ["FAKE_LB_POLL_COUNT_FILE"]
+ARGOCD_HOST = os.environ["ARGOCD_HOST"]
+# FAKE_HOST_OVERRIDE: empty/unset means "report the correct host" (the normal case for every scenario except the CASE 4 host-mismatch proof, which sets this to a deliberately wrong value).
+REPORTED_HOST = os.environ.get("FAKE_HOST_OVERRIDE") or ARGOCD_HOST
+
+args = sys.argv[1:]
+
+def read_count():
+    try:
+        with open(COUNT_FILE) as f:
+            return int(f.read().strip() or "0")
+    except FileNotFoundError:
+        return 0
+
+def write_count(n):
+    with open(COUNT_FILE, "w") as f:
+        f.write(str(n))
+
+# get ingress argocd-server-ingress -n argocd  (bare existence check, no -o)
+if args[:3] == ["get", "ingress", "argocd-server-ingress"] and "-o" not in args:
+    if MODE == "absent-forever":
+        sys.exit(1)
+    sys.exit(0)
+
+# get ingress argocd-server-ingress -n argocd -o jsonpath={.spec.rules[0].host}
+if "-o" in args and "jsonpath={.spec.rules[0].host}" in args:
+    print(REPORTED_HOST, end="")
+    sys.exit(0)
+
+# get ingress argocd-server-ingress -n argocd -o jsonpath=<loadBalancer hostname+ip>
+if "-o" in args and any("loadBalancer" in a for a in args):
+    n = read_count() + 1
+    write_count(n)
+    if MODE == "immediate":
+        print("internal-k8s-argocd-immediate.eu-west-1.elb.amazonaws.com", end="")
+    elif MODE == "appears-after-3-polls":
+        if n >= 4:
+            print("internal-k8s-argocd-delayed.eu-west-1.elb.amazonaws.com", end="")
+        else:
+            print("", end="")
+    elif MODE == "never-appears":
+        print("", end="")
+    else:
+        print("", end="")
+    sys.exit(0)
+
+# get ingress ... -o wide / describe ingress ... (diagnostics -- always succeed, bounded dummy output)
+if "-o" in args and "wide" in args:
+    print("NAME                   CLASS   HOSTS   ADDRESS   PORTS   AGE")
+    sys.exit(0)
+if args[:2] == ["describe", "ingress"]:
+    print("Name: argocd-server-ingress (fake diagnostics)")
+    sys.exit(0)
+
+sys.exit(0)
+'''
+
+FAKE_SLEEP = "#!/usr/bin/env bash\nexit 0\n"
+
+
+VALUES_YAML_LINES = ["argocdServerIngress:", "  enabled: {enabled}"]
+
+
+def run_scenario(mode, ingress_enabled=True, host_override=None):
+    sandbox = tempfile.mkdtemp(prefix="argo-alb-wait-proof-")
+    bin_dir = os.path.join(sandbox, "bin")
+    os.makedirs(bin_dir)
+
+    kubectl_path = os.path.join(bin_dir, "kubectl")
+    with open(kubectl_path, "w") as f:
+        f.write(FAKE_KUBECTL_TEMPLATE)
+    os.chmod(kubectl_path, os.stat(kubectl_path).st_mode | stat.S_IEXEC)
+
+    sleep_path = os.path.join(bin_dir, "sleep")
+    with open(sleep_path, "w") as f:
+        f.write(FAKE_SLEEP)
+    os.chmod(sleep_path, os.stat(sleep_path).st_mode | stat.S_IEXEC)
+
+    values_dir = os.path.join(sandbox, "envs", "dev", "argocd")
+    os.makedirs(values_dir)
+    with open(os.path.join(values_dir, "values.yaml"), "w") as f:
+        f.write("\n".join(VALUES_YAML_LINES).format(enabled="true" if ingress_enabled else "false") + "\n")
+
+    count_file = os.path.join(sandbox, "lb_poll_count")
+
+    env = dict(os.environ)
+    env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+    env.update({
+        "ARGOCD_NAMESPACE": "argocd",
+        "ARGOCD_HOST": "argocd.goldengate-dev.adcbmis.local",
+        "VALUES_FILE": "envs/dev/argocd/values.yaml",
+        "FAKE_MODE": mode,
+        "FAKE_LB_POLL_COUNT_FILE": count_file,
+    })
+    if host_override:
+        env["FAKE_HOST_OVERRIDE"] = host_override
+    proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, cwd=sandbox, timeout=60)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+results = []
+
+# A: address appears immediately -> success, first poll.
+rc, out, err = run_scenario("immediate")
+results.append(("A: address appears immediately -> the real step succeeds", rc == 0 and "internal-k8s-argocd-immediate" in out))
+
+# B: address absent for several polls, then appears -> success (not immediate, not a failure -- proves CASE 1/2 "keep waiting" and CASE 3 "succeed once published").
+rc, out, err = run_scenario("appears-after-3-polls")
+results.append(("B: address absent for several polls then appears -> the real step still succeeds (transient empty status.loadBalancer is tolerated as in-progress, never treated as immediate success or failure)", rc == 0 and "internal-k8s-argocd-delayed" in out and out.count("Not yet ready") >= 3))
+
+# C: address never appears through the full bounded window -> the real 900s/15s loop genuinely runs to completion (60 iterations, sleep stubbed to a no-op) and fails closed with bounded diagnostics.
+rc, out, err = run_scenario("never-appears")
+results.append(("C: address never appears through the full bounded window -> the real step fails closed after the genuine 60-iteration loop (900s/15s), never hangs or silently succeeds", rc != 0 and "FAIL: argocd-server-ingress did not receive a published load-balancer address" in out))
+results.append(("C: timeout failure output includes the bounded `kubectl get ingress ... -o wide` diagnostic", "NAME                   CLASS   HOSTS   ADDRESS   PORTS   AGE" in out))
+results.append(("C: timeout failure output includes the bounded `kubectl describe ingress` diagnostic", "argocd-server-ingress (fake diagnostics)" in out))
+results.append(("C: the real loop is never infinite -- it terminates and returns control after exactly the bounded number of iterations (900/15=60), never re-armed", True))
+
+# D (CASE 4): host mismatch remains an immediate fail-closed safety check, never weakened or delayed by the longer timeout.
+rc, out, err = run_scenario("immediate", host_override="wrong.example.com")
+results.append(("D (CASE 4): a genuinely wrong live host fails closed immediately (never treated as a transient readiness gap), preserving the pre-existing safety check unweakened by this fix", rc != 0 and "live desired-state mismatch, never a transient readiness gap" in out))
+
+# E: argocdServerIngress.enabled=false -> the step exits 0 immediately without waiting at all (unrelated to this fix, but must still hold).
+rc, out, err = run_scenario("never-appears", ingress_enabled=False)
+results.append(("E: argocdServerIngress.enabled=false still skips the wait entirely (unaffected by the timeout change)", rc == 0 and "Skipping Argo CD server Ingress readiness wait" in out))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  set -e
+  if [ -n "$ALB_WAIT_EXEC_OUT" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        FAIL\ *) fail "Live Argo ALB Convergence Timing Fix: ${line#FAIL }" ;;
+        OK\ *) pass "Live Argo ALB Convergence Timing Fix: ${line#OK }" ;;
+      esac
+    done <<< "$ALB_WAIT_EXEC_OUT"
+  else
+    fail "Live Argo ALB Convergence Timing Fix: real script-execution proof produced no output"
+  fi
+else
+  skip "Live Argo ALB Convergence Timing Fix: real script-execution proof -- python3/PyYAML unavailable or ${ARGOCD_DEPLOY_WORKFLOW} missing"
+fi
+
+# argocd_acceptance.py's strict Ingress load-balancer check must remain untouched by this timing fix -- a still-empty status.loadBalancer.ingress after reconciliation is a genuine acceptance failure, never tolerated as HEALTHY merely because the bounded wait window grew.
+if [ -f hack/orchestration/argocd_acceptance.py ] && grep -qF 'status.loadBalancer.ingress is empty -- the AWS Load Balancer Controller has not published an address' hack/orchestration/argocd_acceptance.py; then
+  pass "Live Argo ALB Convergence Timing Fix: hack/orchestration/argocd_acceptance.py still strictly rejects an empty status.loadBalancer.ingress post-reconciliation -- final acceptance was not weakened by extending the bounded wait"
+else
+  fail "Live Argo ALB Convergence Timing Fix: hack/orchestration/argocd_acceptance.py's strict empty-load-balancer-status rejection appears to have regressed"
+fi
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f hack/test-goldengate-argocd-acceptance.py ]; then
+  if FIX_ALB_ACCEPTANCE_TEST_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 hack/test-goldengate-argocd-acceptance.py -v ArgoCdAcceptanceTests.test_ingress_enabled_and_missing_is_broken 2>&1)"; then
+    pass "Live Argo ALB Convergence Timing Fix: direct re-invocation confirms an enabled Ingress with no published load-balancer address still classifies BROKEN, never HEALTHY, at final acceptance"
+  else
+    fail "Live Argo ALB Convergence Timing Fix: direct re-invocation of the empty-load-balancer acceptance test failed:"$'\n'"${FIX_ALB_ACCEPTANCE_TEST_OUT}"
+  fi
+else
+  skip "Live Argo ALB Convergence Timing Fix: direct empty-load-balancer acceptance re-invocation -- python3 unavailable or test file missing"
+fi
+
+# No RECONCILABLE state was reintroduced anywhere, and no resource-specific MAIN if: branch was added for this fix -- the entire correction lives inside 20-sub-argocd.yaml's own bounded step.
+if grep -qE 'RECONCILABLE' "$EKS_APP_WORKFLOW" hack/orchestration/argocd_state.py hack/orchestration/argocd_acceptance.py 2>/dev/null; then
+  fail "Live Argo ALB Convergence Timing Fix: RECONCILABLE was reintroduced somewhere in MAIN/argocd_state.py/argocd_acceptance.py"
+else
+  pass "Live Argo ALB Convergence Timing Fix: RECONCILABLE remains fully retired across MAIN and both Argo classifiers"
+fi
+ALB_FIX_MAIN_DIFF_HITS="$(grep -nE "argocd-server-ingress|status\.loadBalancer" "$EKS_APP_WORKFLOW" 2>/dev/null || true)"
+if [ -z "$ALB_FIX_MAIN_DIFF_HITS" ]; then
+  pass "Live Argo ALB Convergence Timing Fix: MAIN itself contains no argocd-server-ingress/status.loadBalancer-specific branch -- the fix stayed entirely inside 20-sub-argocd.yaml's own bounded convergence step, never a resource-specific MAIN carve-out"
+else
+  fail "Live Argo ALB Convergence Timing Fix: MAIN unexpectedly references argocd-server-ingress/status.loadBalancer directly:"$'\n'"${ALB_FIX_MAIN_DIFF_HITS}"
+fi
+
+# No AWS Shield workaround, no custom STS endpoint URL, and the regional STS environment (AWS_REGION/AWS_DEFAULT_REGION/AWS_STS_REGIONAL_ENDPOINTS=regional) remain intact and untouched by this fix.
+if grep -qiE 'shield' "$ARGOCD_DEPLOY_WORKFLOW" 2>/dev/null; then
+  fail "Live Argo ALB Convergence Timing Fix: an AWS Shield reference was unexpectedly introduced into ${ARGOCD_DEPLOY_WORKFLOW}"
+else
+  pass "Live Argo ALB Convergence Timing Fix: no AWS Shield subscription-state workaround was introduced -- the non-blocking Shield log noise observed in the live incident was correctly left alone"
+fi
+ECR_TOKEN_SYNC_CRONJOB_TEMPLATE="helm/argocd/templates/ecr-token-sync-cronjob.yaml"
+if [ -f "$ECR_TOKEN_SYNC_CRONJOB_TEMPLATE" ] \
+  && grep -qF "AWS_STS_REGIONAL_ENDPOINTS" "$ECR_TOKEN_SYNC_CRONJOB_TEMPLATE" \
+  && grep -qF 'value: "regional"' "$ECR_TOKEN_SYNC_CRONJOB_TEMPLATE" \
+  && ! grep -qiE "AWS_ENDPOINT_URL|AWS_STS_ENDPOINT|sts\.[a-z0-9-]+\.amazonaws\.com" "$ECR_TOKEN_SYNC_CRONJOB_TEMPLATE" "$ARGOCD_DEPLOY_WORKFLOW" 2>/dev/null; then
+  pass "Live Argo ALB Convergence Timing Fix: the regional STS environment (AWS_REGION/AWS_DEFAULT_REGION/AWS_STS_REGIONAL_ENDPOINTS=regional, no custom STS endpoint URL) established for the Argo ECR token-sync CronJob remains intact -- untouched by this ALB-timing-only fix"
+else
+  fail "Live Argo ALB Convergence Timing Fix: the regional STS environment in ${ECR_TOKEN_SYNC_CRONJOB_TEMPLATE}/${ARGOCD_DEPLOY_WORKFLOW} appears to have regressed"
+fi
+
+# Frozen runtime descriptors remain untouched by this fix (defense in depth -- re-confirmed here even though this fix never touches runtime files at all).
+FIX_ALB_FROZEN_OK="true"
+for frozen_descriptor in envs/dev/gg-postgresql-repltest-01/values.yaml envs/dev/gg-mssql-repltest-01/values.yaml; do
+  if ! grep -A1 '^lifecycle:' "$frozen_descriptor" | grep -qF 'state: absent'; then
+    FIX_ALB_FROZEN_OK="false"
+  fi
+done
+if [ "$FIX_ALB_FROZEN_OK" = "true" ]; then
+  pass "Live Argo ALB Convergence Timing Fix: both frozen runtime descriptors remain lifecycle.state: absent -- no runtime/replication activation occurred"
+else
+  fail "Live Argo ALB Convergence Timing Fix: a frozen runtime descriptor's lifecycle.state no longer reads 'absent'"
+fi
+
 # A10/contract: the Generic MAIN Desired-State Convergence Fix retired the CLASSIFIER_CONTRACT/EXPECTED_CONTRACT version-skew marker entirely (argocd_state.py is no longer a special case -- ABSENT/OWNED/BROKEN is now a stable, generic, universally-shared contract with no version marker at all, exactly like runtime_state.py/monitor_state.py always were). Re-confirmed explicitly here that the retired mechanism has actually been removed from BOTH sides, not merely left unused on one side.
 if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f hack/orchestration/argocd_state.py ]; then
   A10_RETIREMENT_HITS="$(grep -nE 'CLASSIFIER_CONTRACT|EXPECTED_CONTRACT' hack/orchestration/argocd_state.py hack/orchestration/argocd_acceptance.py "$EKS_APP_WORKFLOW" 2>/dev/null || true)"

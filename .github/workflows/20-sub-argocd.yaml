@@ -822,7 +822,8 @@ jobs:
 
           echo "argocdServerIngress.enabled is true in ${VALUES_FILE}. Waiting (bounded) for argocd-server-ingress to exist, carry the expected host, and receive a published AWS Load Balancer Controller address..."
 
-          TIMEOUT_SECONDS=300
+          # Live Argo ALB Convergence Timing Fix: a fresh internal ALB creation in this corporate AWS environment (target group, listener, certificate, listener rule, TargetGroupBinding, security-group authorization, target registration) genuinely needs more than 300s of AWS-side asynchronous convergence -- a live incident proved the AWS Load Balancer Controller continued reconciling and successfully published the load-balancer address well after the old 300s bound had already failed the job closed. 900s is still a strictly bounded wait (never infinite); CASE 4's host-mismatch fail-closed check above remains unweakened.
+          TIMEOUT_SECONDS=900
           INTERVAL_SECONDS=15
           ELAPSED=0
           LB_ADDRESS=""
