@@ -1,122 +1,19 @@
-#!/usr/bin/env bash
-set -u
+No more AWS Console screenshots are needed yet, bro.
 
-NS="kube-system"
-CLAIM="gg-mssql-repltest-01-u02"
-SA="efs-csi-controller-sa"
+Run just this:
 
-section() {
-  echo
-  echo "============================================================"
-  echo "$1"
-  echo "============================================================"
-}
+kubectl get deployment efs-csi-controller \
+  -n kube-system \
+  -o jsonpath='{range .spec.template.spec.containers[?(@.name=="efs-plugin")].args[*]}{.}{"\n"}{end}'
 
-section "1. EFS CSI CONTROLLER SERVICE ACCOUNT"
+Also run this if Helm is available:
 
-kubectl get sa "$SA" -n "$NS" -o yaml 2>&1 || true
+helm get values aws-efs-csi-driver \
+  -n kube-system \
+  --all
 
+For the first command I'm specifically looking for something like:
 
-section "2. EFS CSI CONTROLLER PODS + AWS IDENTITY ENV"
+--tags=...
 
-PODS="$(
-  kubectl get pods -n "$NS" \
-    -l app=efs-csi-controller \
-    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' \
-    2>/dev/null
-)"
-
-echo "$PODS"
-
-for POD in $PODS; do
-  echo
-  echo "--- $POD AWS environment ---"
-
-  kubectl exec -n "$NS" "$POD" -c efs-plugin -- \
-    sh -c 'env | grep "^AWS_" | grep -v TOKEN' \
-    2>&1 || true
-done
-
-
-section "3. BOTH EFS-PLUGIN LOGS"
-
-for POD in $PODS; do
-  echo
-  echo "================ $POD / efs-plugin ================"
-
-  kubectl logs -n "$NS" "$POD" \
-    -c efs-plugin \
-    --since=12h 2>&1 |
-  grep -Ei \
-    "${CLAIM}|CreateVolume|CreateAccessPoint|DescribeAccessPoints|DescribeFileSystems|DescribeMountTargets|AccessDenied|Unauthorized|credential|webidentity|AssumeRole|STS|elasticfilesystem|timeout|deadline|connection|error|failed" |
-  tail -120 || true
-done
-
-
-section "4. BOTH CSI-PROVISIONER LOGS"
-
-for POD in $PODS; do
-  echo
-  echo "================ $POD / csi-provisioner ================"
-
-  kubectl logs -n "$NS" "$POD" \
-    -c csi-provisioner \
-    --since=12h 2>&1 |
-  grep -Ei \
-    "${CLAIM}|CreateVolume|Provision|error|failed|timeout|deadline" |
-  tail -120 || true
-done
-
-
-section "5. EFS CSI ROLE POLICIES"
-
-ROLE_ARN="$(
-  kubectl get sa "$SA" -n "$NS" \
-    -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}' \
-    2>/dev/null
-)"
-
-ROLE_NAME="${ROLE_ARN##*/}"
-
-echo "Role ARN : ${ROLE_ARN:-<EMPTY>}"
-echo "Role Name: ${ROLE_NAME:-<EMPTY>}"
-
-if [[ -n "$ROLE_NAME" ]]; then
-  echo
-  echo "Attached managed policies:"
-  aws iam list-attached-role-policies \
-    --role-name "$ROLE_NAME" \
-    --output table 2>&1 || true
-
-  echo
-  echo "Inline policies:"
-  aws iam list-role-policies \
-    --role-name "$ROLE_NAME" \
-    --output table 2>&1 || true
-
-  echo
-  echo "Trust relationship:"
-  aws iam get-role \
-    --role-name "$ROLE_NAME" \
-    --query 'Role.AssumeRolePolicyDocument' \
-    --output json 2>&1 || true
-fi
-
-
-section "6. EKS ADDON IDENTITY"
-
-aws eks describe-addon \
-  --cluster-name gg-poc-dev \
-  --addon-name aws-efs-csi-driver \
-  --query 'addon.{Version:addonVersion,Status:status,ServiceAccountRoleArn:serviceAccountRoleArn,PodIdentityAssociations:podIdentityAssociations}' \
-  --output json 2>&1 || true
-
-
-section "7. QUICK RESULT"
-
-kubectl get pvc "$CLAIM" -n goldengate-dev \
-  -o custom-columns='NAME:.metadata.name,STATUS:.status.phase,VOLUME:.spec.volumeName,SC:.spec.storageClassName' \
-  2>&1 || true
-
-echo
-echo "READ-ONLY diagnostic completed."
+or any custom/corporate tags.
