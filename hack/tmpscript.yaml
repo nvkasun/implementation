@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 set -u
 
-NS="goldengate-dev"
-DEPLOYMENT="gg-mssql-repltest-01"
-PVC="${DEPLOYMENT}-u02"
-SC="gg-efs-dev-${DEPLOYMENT}"
+NS="kube-system"
+CLAIM="gg-mssql-repltest-01-u02"
+SA="efs-csi-controller-sa"
 
 section() {
   echo
@@ -13,140 +12,110 @@ section() {
   echo "============================================================"
 }
 
-section "1. PVC / PV CURRENT STATE"
+section "1. EFS CSI CONTROLLER SERVICE ACCOUNT"
 
-kubectl get pvc "$PVC" -n "$NS" -o wide 2>&1 || true
-
-echo
-echo "PVC details/events:"
-kubectl describe pvc "$PVC" -n "$NS" 2>&1 || true
-
-echo
-echo "Related PVs:"
-kubectl get pv -o wide 2>&1 || true
+kubectl get sa "$SA" -n "$NS" -o yaml 2>&1 || true
 
 
-section "2. EFS STORAGECLASS"
+section "2. EFS CSI CONTROLLER PODS + AWS IDENTITY ENV"
 
-kubectl get storageclass "$SC" -o wide 2>&1 || true
-
-echo
-kubectl get storageclass "$SC" \
-  -o jsonpath='
-Name: {.metadata.name}
-Provisioner: {.provisioner}
-FileSystemId: {.parameters.fileSystemId}
-ProvisioningMode: {.parameters.provisioningMode}
-BasePath: {.parameters.basePath}
-SubPathPattern: {.parameters.subPathPattern}
-EnsureUniqueDirectory: {.parameters.ensureUniqueDirectory}
-ReclaimPolicy: {.reclaimPolicy}
-VolumeBindingMode: {.volumeBindingMode}
-' 2>&1 || true
-echo
-
-
-section "3. EFS CSI DRIVER"
-
-echo "CSI Driver object:"
-kubectl get csidriver efs.csi.aws.com -o wide 2>&1 || true
-
-echo
-echo "EFS CSI workloads:"
-kubectl get deployments,daemonsets,pods -n kube-system -o wide 2>&1 \
-  | grep -Ei 'efs|NAME' || true
-
-echo
-echo "EFS CSI service accounts:"
-kubectl get sa -n kube-system 2>&1 \
-  | grep -Ei 'efs|NAME' || true
-
-echo
-echo "Controller SA identity:"
-kubectl get sa efs-csi-controller-sa -n kube-system \
-  -o jsonpath='Name: {.metadata.name}{"\n"}IRSA Role: {.metadata.annotations.eks\.amazonaws\.com/role-arn}{"\n"}' \
-  2>&1 || true
-
-
-section "4. EFS CSI CONTROLLER ERRORS"
-
-echo "--- csi-provisioner ---"
-kubectl logs deployment/efs-csi-controller \
-  -n kube-system \
-  -c csi-provisioner \
-  --since=20m 2>&1 \
-  | grep -Ei \
-    'error|fail|denied|unauthor|access|provision|volume|claim|efs|timeout|credential|webidentity|sts' \
-  | tail -100 || true
-
-echo
-echo "--- efs-plugin ---"
-kubectl logs deployment/efs-csi-controller \
-  -n kube-system \
-  -c efs-plugin \
-  --since=20m 2>&1 \
-  | grep -Ei \
-    'error|fail|denied|unauthor|access|provision|volume|claim|efs|timeout|credential|webidentity|sts|accesspoint' \
-  | tail -100 || true
-
-
-section "5. PVC / EFS EVENTS"
-
-kubectl get events -n "$NS" --sort-by=.lastTimestamp 2>&1 \
-  | grep -Ei \
-    "${PVC}|${DEPLOYMENT}|persistentvolume|provision|efs|volume|claim|failed" \
-  | tail -80 || true
-
-
-section "6. AWS EFS READ-ONLY CHECK"
-
-FS_ID="$(
-  kubectl get storageclass "$SC" \
-    -o jsonpath='{.parameters.fileSystemId}' \
-    2>/dev/null || true
+PODS="$(
+  kubectl get pods -n "$NS" \
+    -l app=efs-csi-controller \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' \
+    2>/dev/null
 )"
 
-echo "Resolved StorageClass EFS ID: ${FS_ID:-<EMPTY>}"
+echo "$PODS"
 
-if [[ -n "$FS_ID" ]] && command -v aws >/dev/null 2>&1; then
+for POD in $PODS; do
   echo
-  echo "Filesystem:"
-  aws efs describe-file-systems \
-    --region eu-west-1 \
-    --file-system-id "$FS_ID" \
-    --query 'FileSystems[].{Id:FileSystemId,State:LifeCycleState,MountTargets:NumberOfMountTargets}' \
+  echo "--- $POD AWS environment ---"
+
+  kubectl exec -n "$NS" "$POD" -c efs-plugin -- \
+    sh -c 'env | grep "^AWS_" | grep -v TOKEN' \
+    2>&1 || true
+done
+
+
+section "3. BOTH EFS-PLUGIN LOGS"
+
+for POD in $PODS; do
+  echo
+  echo "================ $POD / efs-plugin ================"
+
+  kubectl logs -n "$NS" "$POD" \
+    -c efs-plugin \
+    --since=12h 2>&1 |
+  grep -Ei \
+    "${CLAIM}|CreateVolume|CreateAccessPoint|DescribeAccessPoints|DescribeFileSystems|DescribeMountTargets|AccessDenied|Unauthorized|credential|webidentity|AssumeRole|STS|elasticfilesystem|timeout|deadline|connection|error|failed" |
+  tail -120 || true
+done
+
+
+section "4. BOTH CSI-PROVISIONER LOGS"
+
+for POD in $PODS; do
+  echo
+  echo "================ $POD / csi-provisioner ================"
+
+  kubectl logs -n "$NS" "$POD" \
+    -c csi-provisioner \
+    --since=12h 2>&1 |
+  grep -Ei \
+    "${CLAIM}|CreateVolume|Provision|error|failed|timeout|deadline" |
+  tail -120 || true
+done
+
+
+section "5. EFS CSI ROLE POLICIES"
+
+ROLE_ARN="$(
+  kubectl get sa "$SA" -n "$NS" \
+    -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}' \
+    2>/dev/null
+)"
+
+ROLE_NAME="${ROLE_ARN##*/}"
+
+echo "Role ARN : ${ROLE_ARN:-<EMPTY>}"
+echo "Role Name: ${ROLE_NAME:-<EMPTY>}"
+
+if [[ -n "$ROLE_NAME" ]]; then
+  echo
+  echo "Attached managed policies:"
+  aws iam list-attached-role-policies \
+    --role-name "$ROLE_NAME" \
     --output table 2>&1 || true
 
   echo
-  echo "Mount targets:"
-  aws efs describe-mount-targets \
-    --region eu-west-1 \
-    --file-system-id "$FS_ID" \
-    --query 'MountTargets[].{Id:MountTargetId,Subnet:SubnetId,State:LifeCycleState,IP:IpAddress}' \
+  echo "Inline policies:"
+  aws iam list-role-policies \
+    --role-name "$ROLE_NAME" \
     --output table 2>&1 || true
 
   echo
-  echo "Dynamic EFS access points:"
-  aws efs describe-access-points \
-    --region eu-west-1 \
-    --file-system-id "$FS_ID" \
-    --query 'AccessPoints[].{Id:AccessPointId,State:LifeCycleState,Path:RootDirectory.Path}' \
-    --output table 2>&1 || true
-else
-  echo "AWS CLI unavailable or filesystem ID empty."
+  echo "Trust relationship:"
+  aws iam get-role \
+    --role-name "$ROLE_NAME" \
+    --query 'Role.AssumeRolePolicyDocument' \
+    --output json 2>&1 || true
 fi
 
 
-section "7. QUICK SUMMARY"
+section "6. EKS ADDON IDENTITY"
 
-echo "PVC:"
-kubectl get pvc "$PVC" -n "$NS" \
+aws eks describe-addon \
+  --cluster-name gg-poc-dev \
+  --addon-name aws-efs-csi-driver \
+  --query 'addon.{Version:addonVersion,Status:status,ServiceAccountRoleArn:serviceAccountRoleArn,PodIdentityAssociations:podIdentityAssociations}' \
+  --output json 2>&1 || true
+
+
+section "7. QUICK RESULT"
+
+kubectl get pvc "$CLAIM" -n goldengate-dev \
   -o custom-columns='NAME:.metadata.name,STATUS:.status.phase,VOLUME:.spec.volumeName,SC:.spec.storageClassName' \
-  2>&1 || true
-
-echo
-echo "EFS CSI controller:"
-kubectl get deployment efs-csi-controller -n kube-system \
   2>&1 || true
 
 echo
