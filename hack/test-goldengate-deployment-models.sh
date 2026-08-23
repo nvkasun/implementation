@@ -3377,6 +3377,135 @@ else
   skip "static legacyPair/source-target-validation absence checks -- python3 not available"
 fi
 
+# Secrets Store CSI syncSecret Validation False-Negative Correction: REALLY EXECUTE the committed "Validate Secrets Store CSI configuration" step (never a reimplementation of its logic) against stub kubectl/helm binaries on PATH -- proving the production script now determines syncSecret.enabled STRUCTURALLY from `helm get values --output json` + python3's stdlib json module, never by grep-scraping the human-readable YAML text (the proven live false negative: a real cluster with syncSecret.enabled=true still failed the old grep-based check).
+echo ""
+echo "--- Secrets Store CSI syncSecret Validation False-Negative Correction ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  STEP_RUN_SCRIPT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import sys
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+
+step = next((s for s in doc["jobs"]["build_publish_and_deploy"]["steps"] if s.get("name") == "Validate Secrets Store CSI configuration"), None)
+if step is None:
+    sys.exit("step not found")
+sys.stdout.write(step["run"])
+PYEOF
+)"
+
+  if [ -n "$STEP_RUN_SCRIPT" ]; then
+    # Non-comment content only: this step's own explanatory comment legitimately QUOTES the old grep -A3 -i syncSecret / grep -qi "enabled: true" pattern in prose, to document what it replaced -- the "must be gone" assertions below must inspect actual bash/python code, never that explanatory prose, or they would trivially self-contradict.
+    STEP_RUN_CODE_ONLY="$(echo "$STEP_RUN_SCRIPT" | grep -vE '^[[:space:]]*#')"
+
+    # 10: the production script no longer uses grep to determine the syncSecret boolean, and no longer names the stale ogg-oracle-admin Secret.
+    if echo "$STEP_RUN_CODE_ONLY" | grep -qF 'grep -A3 -i syncSecret'; then
+      fail "Secrets Store CSI syncSecret fix: the production step still contains the old grep -A3 -i syncSecret text-scraping pattern"
+    else
+      pass "10a: the production step no longer uses grep -A3 -i syncSecret to locate the syncSecret block"
+    fi
+    if echo "$STEP_RUN_CODE_ONLY" | grep -qF 'grep -qi "enabled: true"'; then
+      fail "Secrets Store CSI syncSecret fix: the production step still uses grep -qi \"enabled: true\" to determine the boolean"
+    else
+      pass "10b: the production step no longer uses grep -qi \"enabled: true\" to determine the syncSecret boolean"
+    fi
+    if echo "$STEP_RUN_CODE_ONLY" | grep -qF -- '--output json'; then
+      pass "10c: the production step fetches Helm values structurally via --output json"
+    else
+      fail "Secrets Store CSI syncSecret fix: the production step does not fetch Helm values via --output json"
+    fi
+    if echo "$STEP_RUN_CODE_ONLY" | grep -qF 'ogg-oracle-admin'; then
+      fail "11: the stale literal ogg-oracle-admin still remains in the Secrets Store CSI prerequisite diagnostic"
+    else
+      pass "11: the stale literal ogg-oracle-admin no longer appears in the Secrets Store CSI prerequisite diagnostic"
+    fi
+
+    # Preserved prerequisite checks: CSIDriver, SecretProviderClass CRD, both tokenRequests audiences -- this fix touches ONLY the syncSecret Helm-value validation.
+    for needle in 'kubectl get csidriver secrets-store.csi.k8s.io' 'kubectl get crd secretproviderclasses.secrets-store.csi.x-k8s.io' 'sts.amazonaws.com' 'pods.eks.amazonaws.com'; do
+      if echo "$STEP_RUN_CODE_ONLY" | grep -qF "$needle"; then
+        pass "preserved prerequisite: production step still checks for '${needle}'"
+      else
+        fail "Secrets Store CSI syncSecret fix: production step no longer checks for '${needle}' -- an unrelated prerequisite check appears to have regressed"
+      fi
+    done
+
+    STUB_BIN_DIR="${WORKDIR}/syncsecret-stub-bin"
+    mkdir -p "$STUB_BIN_DIR"
+
+    cat > "${STUB_BIN_DIR}/kubectl" <<'KUBECTL_STUB'
+#!/usr/bin/env bash
+if [[ "$*" == *jsonpath* ]]; then
+  echo '[{"audience":"sts.amazonaws.com"},{"audience":"pods.eks.amazonaws.com"}]'
+  exit 0
+fi
+exit 0
+KUBECTL_STUB
+    chmod +x "${STUB_BIN_DIR}/kubectl"
+
+    cat > "${STUB_BIN_DIR}/helm" <<'HELM_STUB'
+#!/usr/bin/env bash
+if [ "$1" = "status" ]; then
+  exit "${STUB_HELM_STATUS_EXIT:-0}"
+fi
+if [ "$1" = "get" ] && [ "$2" = "values" ]; then
+  cat "${STUB_HELM_VALUES_JSON_FILE}"
+  exit 0
+fi
+exit 1
+HELM_STUB
+    chmod +x "${STUB_BIN_DIR}/helm"
+
+    run_syncsecret_case() {
+      local label="$1" values_json="$2" expect_status="$3" helm_status_exit="${4:-0}"
+      local values_file
+      values_file="$(mktemp)"
+      printf '%s' "$values_json" > "$values_file"
+      local out status
+      set +e
+      out="$(PATH="${STUB_BIN_DIR}:${PATH}" STUB_HELM_VALUES_JSON_FILE="$values_file" STUB_HELM_STATUS_EXIT="$helm_status_exit" bash -c "$STEP_RUN_SCRIPT" 2>&1)"
+      status=$?
+      set -e
+      rm -f "$values_file"
+      if [ "$status" -eq 0 ] && [ "$expect_status" = "PASS" ]; then
+        pass "syncSecret case [${label}]: production step succeeds as expected"
+      elif [ "$status" -ne 0 ] && [ "$expect_status" = "FAIL" ]; then
+        pass "syncSecret case [${label}]: production step fails closed as expected"
+      else
+        fail "syncSecret case [${label}]: expected ${expect_status}, got exit=${status}:"$'\n'"${out}"
+      fi
+    }
+
+    # 1: exactly the shape proven live -- syncSecret.enabled literal true -> PASS.
+    run_syncsecret_case "1: syncSecret.enabled=true" '{"syncSecret":{"enabled":true}}' PASS
+    # 2: enabled=false -> FAIL.
+    run_syncsecret_case "2: enabled=false" '{"syncSecret":{"enabled":false}}' FAIL
+    # 3: syncSecret missing entirely -> FAIL.
+    run_syncsecret_case "3: syncSecret missing" '{"tokenRequests":[]}' FAIL
+    # 4: syncSecret present but enabled missing -> FAIL.
+    run_syncsecret_case "4: enabled missing" '{"syncSecret":{}}' FAIL
+    # 5: enabled=null -> FAIL.
+    run_syncsecret_case "5: enabled=null" '{"syncSecret":{"enabled":null}}' FAIL
+    # 6: enabled as the STRING "true" (not a literal JSON boolean) -> FAIL.
+    run_syncsecret_case "6: enabled=\"true\" (string)" '{"syncSecret":{"enabled":"true"}}' FAIL
+    # 7: extra neighboring fields (tokenRequests) alongside a correct syncSecret.enabled=true do not affect the result -> PASS.
+    run_syncsecret_case "7: extra neighboring tokenRequests fields" '{"syncSecret":{"enabled":true},"tokenRequests":[{"audience":"sts.amazonaws.com"},{"audience":"pods.eks.amazonaws.com"}]}' PASS
+    # 8: a large corporate computed-values tree with unrelated enabled=true fields elsewhere must never create a false positive for the CORRECT case (still PASS here since syncSecret.enabled genuinely is true).
+    run_syncsecret_case "8: unrelated enabled=true fields elsewhere, syncSecret genuinely true" '{"enabled":true,"otherFeature":{"enabled":true},"syncSecret":{"enabled":true},"nested":{"deep":{"enabled":true}}}' PASS
+    # 9: syncSecret.enabled=false plus an unrelated enabled=true elsewhere must still FAIL -- the unrelated field must never cause a false positive.
+    run_syncsecret_case "9: syncSecret=false + unrelated enabled=true elsewhere" '{"enabled":true,"syncSecret":{"enabled":false},"otherFeature":{"enabled":true}}' FAIL
+    # Malformed JSON from a broken/truncated helm get values output must fail closed, never crash uncaught.
+    run_syncsecret_case "malformed JSON" 'not valid json{{{' FAIL
+    # Helm release genuinely absent: the existing non-Helm-managed-driver skip path must remain a clean PASS (documented, intentional -- not part of this fix's scope).
+    run_syncsecret_case "Helm release absent (driver managed outside Helm)" '{}' PASS 1
+  else
+    fail "Secrets Store CSI syncSecret fix: could not extract the 'Validate Secrets Store CSI configuration' step from ${EKS_APP_WORKFLOW}"
+  fi
+else
+  skip "Secrets Store CSI syncSecret Validation False-Negative Correction -- python3/PyYAML unavailable or main workflow missing"
+fi
+
 # 9 (GoldenGate Runtime Desired-State Simplification): the build job's workflow summary accurately documents every deletion trigger (physical removal, zero-byte, whitespace-only, comment-only, YAML null, deployment.enabled=false) and states that lifecycle.state is retired and no longer a second source of truth.
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   BUILD_SUMMARY_TEXT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'

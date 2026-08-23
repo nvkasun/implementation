@@ -2849,17 +2849,45 @@ jobs:
 
           echo "Checking Secrets Store CSI Driver Helm release for syncSecret.enabled..."
           if helm status secrets-store-csi-driver -n kube-system >/dev/null 2>&1; then
-            SYNC_SECRET_VALUES="$(helm get values secrets-store-csi-driver -n kube-system -a | grep -A3 -i syncSecret || true)"
+            # Secrets Store CSI syncSecret Validation False-Negative Correction: syncSecret.enabled is now read STRUCTURALLY from Helm's own JSON-rendered computed values (python3's stdlib json module, the same --output json + python3 convention already established elsewhere in this workflow for AWS CLI output) -- never by grep-scraping the human-readable `helm get values` YAML text. That text-scraping approach was a proven live false negative: a real cluster with syncSecret.enabled=true (confirmed in the very same log output) still failed this check, because `grep -A3 -i syncSecret | grep -qi "enabled: true"` is fragile against real-world YAML formatting/ordering and can also false-POSITIVE against an unrelated "enabled: true" field elsewhere in a large corporate Helm release values tree. No PyYAML/yq/jq dependency is introduced. The literal JSON boolean true is the only accepted value -- false, missing syncSecret, missing enabled, null, the string "true", and malformed JSON all fail closed with a concise, specific diagnostic (never a full release-values dump).
+            CSI_VALUES_JSON="$(helm get values secrets-store-csi-driver -n kube-system --all --output json)"
 
-            echo "${SYNC_SECRET_VALUES}"
+            if ! python3 - "$CSI_VALUES_JSON" <<'PYEOF'
+          import json
+          import sys
 
-            echo "${SYNC_SECRET_VALUES}" | grep -qi "enabled: true" || {
-              echo "syncSecret.enabled=true not found in Helm release secrets-store-csi-driver."
-              echo "GoldenGate admin credentials require CSI secretObjects to sync AWS Secrets Manager data into Kubernetes Secret ogg-oracle-admin."
+          raw = sys.argv[1]
+          try:
+              values = json.loads(raw)
+          except json.JSONDecodeError as exc:
+              print(f"FAIL: helm get values --output json produced malformed JSON: {exc}", file=sys.stderr)
+              sys.exit(1)
+
+          if not isinstance(values, dict):
+              print(f"FAIL: helm get values --output json produced a top-level {type(values).__name__}, expected a JSON object.", file=sys.stderr)
+              sys.exit(1)
+
+          sync_secret = values.get("syncSecret")
+          if not isinstance(sync_secret, dict):
+              print(f"FAIL: syncSecret is {sync_secret!r} (missing or not an object) in the computed Helm values for secrets-store-csi-driver.", file=sys.stderr)
+              sys.exit(1)
+
+          if "enabled" not in sync_secret:
+              print("FAIL: syncSecret.enabled is not present in the computed Helm values for secrets-store-csi-driver.", file=sys.stderr)
+              sys.exit(1)
+
+          enabled = sync_secret["enabled"]
+          # Strict identity check (never == ): JSON true decodes to the Python True singleton only -- 1, "true", and every other JSON-boolean-like value must still fail closed.
+          if enabled is not True:
+              print(f"FAIL: syncSecret.enabled is {enabled!r} ({type(enabled).__name__}), expected the literal JSON boolean true.", file=sys.stderr)
+              sys.exit(1)
+
+          print("syncSecret.enabled=true confirmed (structural JSON check).")
+          PYEOF
+            then
+              echo "GoldenGate runtime admin credentials use SecretProviderClass secretObjects and therefore require Secrets Store CSI Driver secret synchronization to be enabled."
               exit 1
-            }
-
-            echo "syncSecret.enabled=true confirmed."
+            fi
           else
             echo "Helm release secrets-store-csi-driver not found in kube-system. Skipping syncSecret check (driver may be managed outside Helm)."
           fi
