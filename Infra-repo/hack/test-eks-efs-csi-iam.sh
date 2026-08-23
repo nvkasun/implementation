@@ -1,12 +1,5 @@
 #!/usr/bin/env bash
-# test-eks-efs-csi-iam.sh: static regression proof for the EFS CSI corporate-tag
-# CreateAccessPoint authorization correction (envs/dev/eks_efs_csi_iam.tf). No live AWS/EKS/
-# Terraform mutation -- every check here is either a plain text/structure inspection of the
-# committed .tf source, or a `terraform init -backend=false` + `terraform plan` against an
-# ISOLATED scratch copy using only the real (public) hashicorp/aws provider schema, never the
-# private corporate modules this repository's own root cannot download locally. Run directly via
-# `bash hack/test-eks-efs-csi-iam.sh` from anywhere; paths below are resolved relative to this
-# script's own location, never the caller's working directory.
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,15 +22,8 @@ if [ ! -f "$IAM_FILE" ]; then
 fi
 
 IAM_CONTENT="$(cat "$IAM_FILE")"
-# Non-comment content only: the header comment deliberately DISCUSSES OIDC/STS/ServiceAccount/the
-# node/GoldenGate/GitHub-Actions/SSM roles/the existing efs-csi-tag-resource policy IN PROSE, to
-# explain what this file does NOT touch -- the "never referenced" assertions below must inspect
-# actual Terraform code, never that explanatory prose, or they would trivially self-contradict.
 IAM_CODE_ONLY="$(grep -vE '^\s*#' "$IAM_FILE")"
 
-# 1: this change is purely additive -- enable_efs_csi (the module flag that makes the module own
-# the EFS CSI role/AmazonEFSCSIDriverPolicy attachment in the first place) is unchanged, and the
-# new file contains no detach/remove/replace of any existing policy attachment.
 if grep -qE '^\s*enable_efs_csi\s*=\s*true\s*$' "$EKS_FILE" \
     && ! echo "$IAM_CODE_ONLY" | grep -qiE 'detach|remove.*polic|aws_iam_role_policy_attachment"\s*"efs_csi_irsa"'; then
   pass "1: enable_efs_csi=true is unchanged in eks.tf and the new file performs no detach/removal of any existing policy -- the EFS CSI controller role retains AmazonEFSCSIDriverPolicy exactly as the module already attaches it"
@@ -64,27 +50,18 @@ else
   fail "5b: tags.tf is missing expected corporate tag key(s):${MISSING_TAG_KEYS}"
 fi
 
-# 6: the existing out-of-band efs-csi-tag-resource TagResource/UntagResource policy is left
-# completely untouched -- the new file never references it by name, and no other file in this
-# repository declares/manages it either (it remains genuinely out-of-band, not adopted here).
 if ! grep -rv -E '^\s*#' "${REPO_ROOT}/envs" --include='*.tf' 2>/dev/null | grep -q "efs-csi-tag-resource"; then
   pass "6: no file in this Terraform root references the existing out-of-band efs-csi-tag-resource policy by name -- it is left completely untouched, so its existing TagResource/UntagResource support remains available exactly as before"
 else
   fail "6: a file references efs-csi-tag-resource -- this task must not adopt/rename/replace the existing out-of-band policy"
 fi
 
-# 7/8/9: the new file never touches OIDC trust, the IRSA subject/ServiceAccount identity, or STS
-# regional endpoint behavior -- it only attaches a policy to an EXISTING role looked up by name.
 if ! echo "$IAM_CODE_ONLY" | grep -qiE 'oidc|assume_role_policy|web_identity|service_account|sts_regional|regional_sts'; then
   pass "7/8/9: the new file contains no OIDC/assume_role_policy/web_identity/service_account/STS-regional construct -- OIDC trust, the kube-system/efs-csi-controller-sa IRSA subject, and regional STS behavior are all left unchanged"
 else
   fail "7/8/9: the new file appears to reference OIDC trust, ServiceAccount identity, or STS regional configuration -- out of scope for this correction"
 fi
 
-# 2/3/4/11: render the actual aws_iam_policy_document this file declares (via an isolated scratch
-# copy using only the real, public hashicorp/aws provider schema -- never this repository's own
-# private corporate modules, which cannot be downloaded in this environment) and inspect the
-# real, provider-validated JSON it produces.
 if command -v terraform >/dev/null 2>&1; then
   SCRATCH_DIR="$(mktemp -d)"
   trap 'rm -rf "$SCRATCH_DIR"' EXIT
@@ -116,7 +93,6 @@ locals {
 resource "null_resource" "eks_stub" {}
 EOF
 
-  # depends_on module.eks -> depends_on the local scratch stub; every other line is copied byte-for-byte.
   sed 's/depends_on = \[module\.eks\]/depends_on = [null_resource.eks_stub]/' "$IAM_FILE" > "${SCRATCH_DIR}/eks_efs_csi_iam.tf"
 
   cat >> "${SCRATCH_DIR}/main.tf" <<'EOF'
