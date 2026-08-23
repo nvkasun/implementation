@@ -14996,6 +14996,307 @@ else
 fi
 
 echo ""
+echo "--- GoldenGate Monitor MAIN DAG Skip-Propagation Correctness Fix: structural always() + implicit-skip-propagation regression ---"
+
+# 1: structural proof that every REQUIRED real-deploy monitor-chain job which must survive a legitimate ancestor skip carries a status-check function in its job-level if:. This is deliberately a DIRECT text/structural assertion (not merely re-exercised through the JOB_ORDER simulator above, which -- like GitHub Actions itself absent always() -- would previously have reported these three jobs as "eligible" purely by evaluating their own explicit clauses, never modeling the implicit default propagation that actually suppressed them live).
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  set +e
+  STATUS_FN_STRUCTURAL_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import re
+import sys
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+jobs = doc["jobs"]
+
+STATUS_FN_RE = re.compile(r"\b(always|success|failure|cancelled)\(\)")
+
+
+def if_text(name):
+    return str(jobs[name].get("if", ""))
+
+
+results = []
+
+# Must now contain a status-check function (the actual fix).
+for name in ("monitor_ownership_preflight", "validate_monitor_ready", "end_to_end_deployment_acceptance"):
+    results.append((f"{name}'s job-level if: contains a status-check function (always()/success()/failure()/cancelled())", bool(STATUS_FN_RE.search(if_text(name)))))
+
+# Already correct beforehand -- re-confirmed, never re-derived from scratch.
+for name in ("monitor_sync_once", "replication_monitor_acceptance"):
+    results.append((f"{name}'s job-level if: still contains always() (already correct, unchanged by this fix)", "always()" in if_text(name)))
+
+results.append(("final_validation's job-level if: is exactly always() (unchanged, still the sole authority for the mode-aware required-success contract)", jobs["final_validation"].get("if") == "always()" or str(jobs["final_validation"].get("if")).strip() == "always()"))
+
+# The fix must be ADDITIVE only -- every explicit clause that existed before must still be present verbatim, never replaced by a weaker check such as != 'failure' for one of these three specific jobs.
+mop_if = if_text("monitor_ownership_preflight")
+results.append(("monitor_ownership_preflight still requires validate_shared_secrets_once.result == 'success' (exact, not merely != 'failure')", "needs.validate_shared_secrets_once.result == 'success'" in mop_if))
+results.append(("monitor_ownership_preflight still requires replication_reconcile_once.result == 'success' (exact, not merely != 'failure')", "needs.replication_reconcile_once.result == 'success'" in mop_if))
+results.append(("monitor_ownership_preflight still requires effective_deploy == 'true' and has_active_deployments == 'true'", "effective_deploy == 'true'" in mop_if and "has_active_deployments == 'true'" in mop_if))
+
+vmr_if = if_text("validate_monitor_ready")
+results.append(("validate_monitor_ready still requires validate_shared_secrets_once.result == 'success' (exact, not merely != 'failure')", "needs.validate_shared_secrets_once.result == 'success'" in vmr_if))
+results.append(("validate_monitor_ready still requires monitor_sync_once.result == 'success' (exact, not merely != 'failure')", "needs.monitor_sync_once.result == 'success'" in vmr_if))
+
+e2e_if = if_text("end_to_end_deployment_acceptance")
+for dep in ("validate_argocd_ready", "validate_platform_ready", "validate_observability_ready", "validate_active_runtimes", "replication_reconcile_once", "validate_monitor_ready", "replication_monitor_acceptance"):
+    results.append((f"end_to_end_deployment_acceptance still requires {dep}.result == 'success' (exact, not merely != 'failure'/!= 'cancelled')", f"needs.{dep}.result == 'success'" in e2e_if))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  STATUS_FN_STRUCTURAL_STATUS=$?
+  set -e
+  STATUS_FN_STRUCTURAL_FAILURES="$(echo "$STATUS_FN_STRUCTURAL_OUT" | grep "^FAIL " || true)"
+  if [ "$STATUS_FN_STRUCTURAL_STATUS" -eq 0 ] && [ -z "$STATUS_FN_STRUCTURAL_FAILURES" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        OK\ *) pass "Skip-propagation fix: ${line#OK }" ;;
+      esac
+    done <<< "$STATUS_FN_STRUCTURAL_OUT"
+  else
+    fail "Skip-propagation fix: structural always()/explicit-clause proof failed:"$'\n'"${STATUS_FN_STRUCTURAL_OUT}"
+  fi
+else
+  skip "Skip-propagation fix: structural always()/explicit-clause proof -- python3/PyYAML unavailable or main workflow missing"
+fi
+
+# 2/3: a small, targeted model of GitHub Actions' REAL default job-continuation semantics -- deliberately NOT a general GitHub Actions engine (no runner emulation, no step execution, no matrix expansion): it implements exactly the one rule this whole fix is about. A job whose own if: contains a status-check function is evaluated purely by that expression (exactly like the JOB_ORDER simulator above). A job whose own if: contains NO status-check function additionally requires its ENTIRE transitive needs-closure (not merely its direct needs) to have concluded with exactly 'success' -- an intermediate ancestor's own always()-driven success does not, by itself, satisfy this for a job further downstream that itself lacks a status function. This is exactly the mechanism the live run exposed: delete_removed_argocd_applications is legitimately skipped (has_deletions=false); replication_reconcile_once survives it via its own always(); but monitor_ownership_preflight (before this fix) still defaulted to skipped because delete_removed_argocd_applications remained "skipped" somewhere in its full transitive closure, regardless of replication_reconcile_once's own reported success.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  set +e
+  SKIP_PROPAGATION_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import re
+import sys
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+jobs = doc["jobs"]
+
+STATUS_FN_RE = re.compile(r"\b(always|success|failure|cancelled)\(\)")
+
+
+def has_status_fn(expr):
+    return bool(STATUS_FN_RE.search(expr))
+
+
+def job_needs(name):
+    n = jobs[name].get("needs")
+    if n is None:
+        return []
+    if isinstance(n, str):
+        return [n]
+    return list(n)
+
+
+def extract_if(name):
+    raw = str(jobs[name].get("if", "true")).strip()
+    if raw.startswith("${{") and raw.endswith("}}"):
+        raw = raw[3:-2].strip()
+    return raw
+
+
+class _Parser:
+    """The SAME tiny bespoke && || == != () always() needs.<job>.result/outputs.* evaluator already used by the Phase B3B JOB_ORDER simulator above -- copied here (never imported/shared, matching this suite's own established per-section convention) rather than a general GHA expression engine."""
+
+    def __init__(self, expr, needs):
+        self.expr = expr
+        self.needs = needs
+        self.pos = 0
+
+    def _skip_ws(self):
+        while self.pos < len(self.expr) and self.expr[self.pos] == " ":
+            self.pos += 1
+
+    def parse(self):
+        result = self._or()
+        self._skip_ws()
+        if self.pos != len(self.expr):
+            raise ValueError(f"trailing content: {self.expr[self.pos:]!r}")
+        return result
+
+    def _or(self):
+        left = self._and()
+        self._skip_ws()
+        while self.expr[self.pos:self.pos + 2] == "||":
+            self.pos += 2
+            right = self._and()
+            left = left or right
+            self._skip_ws()
+        return left
+
+    def _and(self):
+        left = self._atom()
+        self._skip_ws()
+        while self.expr[self.pos:self.pos + 2] == "&&":
+            self.pos += 2
+            right = self._atom()
+            left = left and right
+            self._skip_ws()
+        return left
+
+    def _atom(self):
+        self._skip_ws()
+        if self.expr[self.pos] == "(":
+            self.pos += 1
+            val = self._or()
+            self._skip_ws()
+            assert self.expr[self.pos] == ")"
+            self.pos += 1
+            return val
+        if self.expr[self.pos:self.pos + 8] == "always()":
+            self.pos += 8
+            return True
+        left_val = self._value()
+        self._skip_ws()
+        op = self.expr[self.pos:self.pos + 2]
+        if op in ("==", "!="):
+            self.pos += 2
+            right_val = self._value()
+            return left_val == right_val if op == "==" else left_val != right_val
+        return bool(left_val)
+
+    def _value(self):
+        self._skip_ws()
+        if self.expr[self.pos] == "'":
+            self.pos += 1
+            start = self.pos
+            while self.expr[self.pos] != "'":
+                self.pos += 1
+            val = self.expr[start:self.pos]
+            self.pos += 1
+            return val
+        m = re.match(r"needs\.([A-Za-z0-9_]+)\.result", self.expr[self.pos:])
+        if m:
+            self.pos += m.end()
+            return self.needs.get(m.group(1), {}).get("result", "")
+        m = re.match(r"needs\.([A-Za-z0-9_]+)\.outputs\.([A-Za-z0-9_]+)", self.expr[self.pos:])
+        if m:
+            self.pos += m.end()
+            return self.needs.get(m.group(1), {}).get("outputs", {}).get(m.group(2), "")
+        raise ValueError(f"cannot parse value at: {self.expr[self.pos:self.pos + 40]!r}")
+
+
+def eval_gha_bool(expr, needs):
+    return bool(_Parser(expr, needs).parse())
+
+
+def transitive_ancestors_all_success(name, results, seen=None):
+    if seen is None:
+        seen = set()
+    for dep in job_needs(name):
+        if dep in seen:
+            continue
+        seen.add(dep)
+        dep_result = results.get(dep, {"result": "success"})["result"]
+        if dep_result != "success":
+            return False
+        if not transitive_ancestors_all_success(dep, results, seen):
+            return False
+    return True
+
+
+def would_run(name, results, if_override=None):
+    expr = if_override if if_override is not None else extract_if(name)
+    if not has_status_fn(expr):
+        if not transitive_ancestors_all_success(name, results):
+            return False
+    return eval_gha_bool(expr, results)
+
+
+# Real-deploy + active-runtime background: every genuinely required runtime/foundation prerequisite has already succeeded -- the ONE legitimate optional skip under test is delete_removed_argocd_applications (has_deletions=false), never anything else.
+BASE_BACKGROUND = {
+    "validate_model": {"result": "success", "outputs": {"effective_deploy": "true", "has_active_deployments": "true"}},
+    "validate_shared_secrets_once": {"result": "success", "outputs": {}},
+    "build_publish_and_deploy": {"result": "success", "outputs": {}},
+    "validate_active_runtimes": {"result": "success", "outputs": {}},
+    "validate_argocd_ready": {"result": "success", "outputs": {}},
+    "validate_platform_ready": {"result": "success", "outputs": {}},
+    "validate_observability_ready": {"result": "success", "outputs": {}},
+    "delete_removed_argocd_applications": {"result": "skipped", "outputs": {}},
+}
+
+CHAIN = [
+    "replication_reconcile_once",
+    "monitor_ownership_preflight",
+    "monitor_sync_once",
+    "validate_monitor_ready",
+    "replication_monitor_acceptance",
+    "end_to_end_deployment_acceptance",
+]
+FORCED_OUTPUTS = {"monitor_ownership_preflight": {"state": "OWNED"}}
+
+results = []
+
+
+def check(label, ok):
+    results.append((label, ok))
+
+
+# 2: the exact live scenario -- delete_removed_argocd_applications legitimately skipped, every genuinely required prerequisite otherwise succeeds. Against the CURRENT (fixed) if: expressions, every job in the required monitor chain must be eligible ("would run", concluding success) -- never silently suppressed by the legitimate optional ancestor skip.
+ctx = dict(BASE_BACKGROUND)
+for name in CHAIN:
+    ok = would_run(name, ctx)
+    ctx[name] = {"result": "success" if ok else "skipped", "outputs": FORCED_OUTPUTS.get(name, {})}
+    check(f"2: legitimate delete_removed_argocd_applications=skipped does NOT suppress {name} (eligible, concludes success)", ok)
+
+# Meta-proof that this model would actually have caught the historical bug: re-run the identical scenario with monitor_ownership_preflight's OWN if: text reverted (always() stripped) to what it was before this fix -- a fixture MUTATION of the extracted text, never a second real file -- and confirm the model correctly predicts it would have been skipped, exactly matching the live-observed defect.
+PRE_FIX_MOP_IF = extract_if("monitor_ownership_preflight").replace("always() && ", "").replace(" && always()", "")
+ctx2 = dict(BASE_BACKGROUND)
+ctx2["replication_reconcile_once"] = {"result": "success" if would_run("replication_reconcile_once", ctx2) else "skipped", "outputs": {}}
+pre_fix_would_run = would_run("monitor_ownership_preflight", ctx2, if_override=PRE_FIX_MOP_IF)
+check("meta-proof: replaying the SAME scenario against the PRE-FIX monitor_ownership_preflight if: text (always() stripped) correctly predicts it would have been skipped -- confirming this model actually reproduces the historical live defect, not merely a model that always reports success", pre_fix_would_run is False)
+
+# 3: failure cases proving always() does NOT weaken safety -- a genuine failure of a REQUIRED prerequisite still blocks every downstream job in the chain, exactly as before.
+def run_chain_with_failure(failing_job):
+    ctx = dict(BASE_BACKGROUND)
+    for name in CHAIN:
+        if name == failing_job:
+            ctx[name] = {"result": "failure", "outputs": FORCED_OUTPUTS.get(name, {})}
+            continue
+        ok = would_run(name, ctx)
+        ctx[name] = {"result": "success" if ok else "skipped", "outputs": FORCED_OUTPUTS.get(name, {})}
+    return ctx
+
+r = run_chain_with_failure("replication_reconcile_once")
+check("3a: replication_reconcile_once=failure -> monitor_ownership_preflight does NOT execute successfully (blocked)", r["monitor_ownership_preflight"]["result"] != "success")
+
+r = run_chain_with_failure("monitor_ownership_preflight")
+check("3b: monitor_ownership_preflight=failure (BROKEN) -> monitor_sync_once is blocked", r["monitor_sync_once"]["result"] != "success")
+
+r = run_chain_with_failure("monitor_sync_once")
+check("3c: monitor_sync_once=failure -> validate_monitor_ready is blocked", r["validate_monitor_ready"]["result"] != "success")
+
+r = run_chain_with_failure("validate_monitor_ready")
+check("3d: validate_monitor_ready=failure -> replication_monitor_acceptance is blocked", r["replication_monitor_acceptance"]["result"] != "success")
+check("3d: validate_monitor_ready=failure -> end_to_end_deployment_acceptance is blocked", r["end_to_end_deployment_acceptance"]["result"] != "success")
+
+r = run_chain_with_failure("replication_monitor_acceptance")
+check("3e: replication_monitor_acceptance=failure -> end_to_end_deployment_acceptance is blocked", r["end_to_end_deployment_acceptance"]["result"] != "success")
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  SKIP_PROPAGATION_STATUS=$?
+  set -e
+  SKIP_PROPAGATION_FAILURES="$(echo "$SKIP_PROPAGATION_OUT" | grep "^FAIL " || true)"
+  if [ "$SKIP_PROPAGATION_STATUS" -eq 0 ] && [ -z "$SKIP_PROPAGATION_FAILURES" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        OK\ *) pass "Skip-propagation fix: ${line#OK }" ;;
+      esac
+    done <<< "$SKIP_PROPAGATION_OUT"
+  else
+    fail "Skip-propagation fix: legitimate-skip/failure-blocking regression failed:"$'\n'"${SKIP_PROPAGATION_OUT}"
+  fi
+else
+  skip "Skip-propagation fix: legitimate-skip/failure-blocking regression -- python3/PyYAML unavailable or main workflow missing"
+fi
+
+echo ""
 echo "--- Phase B3B closeout: mode-aware final DEPLOY success contract (final_validation actually executed) ---"
 
 # Unlike the JOB_ORDER if:-expression simulator above (which cannot express the bash program logic now living inside final_validation's own step), this extracts and REALLY EXECUTES the committed "Validate the mode-aware final DEPLOY success contract" script via bash for each required scenario -- genuine proof of behavior, never a re-implementation of the same logic inside this test suite.
