@@ -1,4 +1,4 @@
-"""Offline tests for hack/orchestration/monitor_acceptance.py; run directly via `python3 hack/test-goldengate-monitor-acceptance.py`. No live Kubernetes -- every kubectl response is a fake, injected fixture. The canonical monitor values (helm/goldengate-monitor/values.yaml merged with envs/dev/goldengate-monitor/values.yaml) are the real, currently-committed files -- this tool never re-implements that merge as a second schema -- EXCEPT the dedicated MonitorAcceptanceIngressAndNetworkPolicyEnabledTests class, which monkeypatches _load_monitor_values to exercise the ingress.enabled=true / networkPolicy.enabled=true branches those real dev files do not currently take. Exercises the classifier's actual logic (never merely greps its source)."""
+"""Offline tests for hack/orchestration/monitor_acceptance.py; run directly via `python3 hack/test-goldengate-monitor-acceptance.py`. No live Kubernetes -- every kubectl response is a fake, injected fixture. The canonical monitor values (helm/goldengate-monitor/values.yaml merged with envs/dev/goldengate-monitor/values.yaml) are the real, currently-committed files -- this tool never re-implements that merge as a second schema. Current intentional architecture change: the real dev files now have ingress.enabled=true (networkPolicy.enabled remains false), so _populate_healthy_cluster()'s "fully healthy" baseline fixture includes a matching Ingress object by default. MonitorAcceptanceIngressAndNetworkPolicyEnabledTests mostly monkeypatches _load_monitor_values to an explicit, self-contained values shape instead of relying on today's real committed file, so those specific tests stay correct and meaningful regardless of future ingress.enabled/networkPolicy.enabled flips. Exercises the classifier's actual logic (never merely greps its source)."""
 from __future__ import annotations
 
 import importlib.util
@@ -280,6 +280,24 @@ def _replicaset_and_pod(rs_name=RS_NAME, rs_uid=RS_UID, deploy_owner_name="gg-mo
     return rs_obj, pod_obj
 
 
+def _ingress_obj(host=MONITOR_HOST, class_name="alb", group_order="120"):
+    return {
+        "spec": {
+            "ingressClassName": class_name,
+            "rules": [{"host": host, "http": {"paths": [{"backend": {"service": {"name": "gg-monitor", "port": {"name": "http"}}}}]}}],
+        },
+        "metadata": {"annotations": {
+            "alb.ingress.kubernetes.io/group.name": ALB_GROUP_NAME,
+            "alb.ingress.kubernetes.io/certificate-arn": ACM_CERTIFICATE_ARN,
+            "alb.ingress.kubernetes.io/target-type": "ip",
+            "alb.ingress.kubernetes.io/backend-protocol": "HTTP",
+            "alb.ingress.kubernetes.io/healthcheck-protocol": "HTTP",
+            "alb.ingress.kubernetes.io/healthcheck-path": "/healthz",
+            "alb.ingress.kubernetes.io/group.order": group_order,
+        }},
+    }
+
+
 def _populate_healthy_cluster(cluster, registry=None, app_kwargs=None, deployment_kwargs=None):
     reg = registry if registry is not None else REGISTRY
     cluster.put("application", monitor_acceptance.ARGOCD_APP_NAME, ARGOCD_NAMESPACE, _app_obj(**(app_kwargs or {})))
@@ -293,6 +311,8 @@ def _populate_healthy_cluster(cluster, registry=None, app_kwargs=None, deploymen
     rs_obj, pod_obj = _replicaset_and_pod()
     cluster.put("replicaset", "gg-monitor-rs1", MONITOR_NAMESPACE, rs_obj)
     cluster.put_list("pods", MONITOR_NAMESPACE, [pod_obj])
+    # Current intentional architecture change: the REAL, unpatched envs/dev/goldengate-monitor/values.yaml now commits ingress.enabled=true -- every test in this module that uses the real (unpatched) _load_monitor_values must therefore also see a correctly-shaped Ingress object in an otherwise-"fully healthy" fixture, or the classifier correctly reports BROKEN (ingress/gg-monitor does not exist). networkPolicy.enabled remains false in the real committed values (unchanged), so no matching NetworkPolicy object is added here.
+    cluster.put("ingress", monitor_acceptance.INGRESS_NAME, MONITOR_NAMESPACE, _ingress_obj())
     return cluster
 
 
@@ -817,7 +837,7 @@ class MonitorAcceptanceClassifierTests(unittest.TestCase):
 
 
 class MonitorAcceptanceIngressAndNetworkPolicyEnabledTests(unittest.TestCase):
-    """The real envs/dev/goldengate-monitor/values.yaml currently has ingress.enabled=false and networkPolicy.enabled=false -- these tests monkeypatch _load_monitor_values to exercise the enabled branches without touching the real committed files."""
+    """Current intentional architecture change: the real envs/dev/goldengate-monitor/values.yaml now has ingress.enabled=true (networkPolicy.enabled remains false) -- most tests below still monkeypatch _load_monitor_values to an explicit, self-contained values shape so they stay correct and meaningful regardless of what today's real committed file happens to say (exactly the fragility that made this real-file-dependent test module drift out of sync with the live ingress.enabled flip in the first place). Reuses the SAME module-level _ingress_obj()/_populate_healthy_cluster() every other class in this file uses -- never a second, independent Ingress-object schema."""
 
     def _enabled_values(self):
         base = monitor_acceptance._load_monitor_values(ENVIRONMENT)
@@ -825,25 +845,8 @@ class MonitorAcceptanceIngressAndNetworkPolicyEnabledTests(unittest.TestCase):
         base["ingress"]["enabled"] = True
         base["ingress"]["host"] = MONITOR_HOST
         base["ingress"]["alb"]["groupOrder"] = "120"
-        base["networkPolicy"]["enabled"] = True
+        base.setdefault("networkPolicy", {})["enabled"] = True
         return base
-
-    def _ingress_obj(self, host=MONITOR_HOST, class_name="alb", group_order="120"):
-        return {
-            "spec": {
-                "ingressClassName": class_name,
-                "rules": [{"host": host, "http": {"paths": [{"backend": {"service": {"name": "gg-monitor", "port": {"name": "http"}}}}]}}],
-            },
-            "metadata": {"annotations": {
-                "alb.ingress.kubernetes.io/group.name": ALB_GROUP_NAME,
-                "alb.ingress.kubernetes.io/certificate-arn": ACM_CERTIFICATE_ARN,
-                "alb.ingress.kubernetes.io/target-type": "ip",
-                "alb.ingress.kubernetes.io/backend-protocol": "HTTP",
-                "alb.ingress.kubernetes.io/healthcheck-protocol": "HTTP",
-                "alb.ingress.kubernetes.io/healthcheck-path": "/healthz",
-                "alb.ingress.kubernetes.io/group.order": group_order,
-            }},
-        }
 
     def _networkpolicy_obj(self, port=SERVICE_PORT):
         return {
@@ -856,14 +859,15 @@ class MonitorAcceptanceIngressAndNetworkPolicyEnabledTests(unittest.TestCase):
 
     def test_ingress_enabled_and_correctly_shaped_is_healthy(self):
         cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.put("ingress", "gg-monitor", MONITOR_NAMESPACE, self._ingress_obj())
         cluster.put("networkpolicy", "gg-monitor", MONITOR_NAMESPACE, self._networkpolicy_obj())
         with mock.patch.object(monitor_acceptance, "_load_monitor_values", return_value=self._enabled_values()):
             result = _classify(cluster)
         self.assertEqual(result["state"], monitor_acceptance.STATE_HEALTHY, result["reasons"])
 
     def test_ingress_enabled_but_absent_is_broken(self):
+        # _populate_healthy_cluster() now puts a correctly-shaped ingress by default (the real committed values.yaml has ingress.enabled=true) -- removed here explicitly to exercise the genuinely-absent case.
         cluster = _populate_healthy_cluster(FakeCluster())
+        cluster.objects.pop(("ingress", monitor_acceptance.INGRESS_NAME, MONITOR_NAMESPACE))
         cluster.put("networkpolicy", "gg-monitor", MONITOR_NAMESPACE, self._networkpolicy_obj())
         with mock.patch.object(monitor_acceptance, "_load_monitor_values", return_value=self._enabled_values()):
             result = _classify(cluster)
@@ -871,7 +875,7 @@ class MonitorAcceptanceIngressAndNetworkPolicyEnabledTests(unittest.TestCase):
 
     def test_ingress_enabled_wrong_host_is_broken(self):
         cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.put("ingress", "gg-monitor", MONITOR_NAMESPACE, self._ingress_obj(host="wrong.example.com"))
+        cluster.put("ingress", monitor_acceptance.INGRESS_NAME, MONITOR_NAMESPACE, _ingress_obj(host="wrong.example.com"))
         cluster.put("networkpolicy", "gg-monitor", MONITOR_NAMESPACE, self._networkpolicy_obj())
         with mock.patch.object(monitor_acceptance, "_load_monitor_values", return_value=self._enabled_values()):
             result = _classify(cluster)
@@ -879,24 +883,24 @@ class MonitorAcceptanceIngressAndNetworkPolicyEnabledTests(unittest.TestCase):
 
     def test_networkpolicy_enabled_but_absent_is_broken(self):
         cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.put("ingress", "gg-monitor", MONITOR_NAMESPACE, self._ingress_obj())
         with mock.patch.object(monitor_acceptance, "_load_monitor_values", return_value=self._enabled_values()):
             result = _classify(cluster)
         _assert_broken(self, result, "networkpolicy/gg-monitor does not exist")
 
     def test_networkpolicy_enabled_wrong_port_is_broken(self):
         cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.put("ingress", "gg-monitor", MONITOR_NAMESPACE, self._ingress_obj())
         cluster.put("networkpolicy", "gg-monitor", MONITOR_NAMESPACE, self._networkpolicy_obj(port=9999))
         with mock.patch.object(monitor_acceptance, "_load_monitor_values", return_value=self._enabled_values()):
             result = _classify(cluster)
         _assert_broken(self, result, "does not allow ingress TCP")
 
     def test_ingress_disabled_but_present_is_broken(self):
-        # Real dev values keep ingress.enabled=false -- an ingress object existing anyway must never silently pass.
+        # Deliberately forces ingress.enabled=false via monkeypatch -- independent of whatever the REAL committed envs/dev/goldengate-monitor/values.yaml currently says -- an ingress object existing anyway must never silently pass, regardless of today's real committed ingress.enabled value.
         cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.put("ingress", "gg-monitor", MONITOR_NAMESPACE, self._ingress_obj())
-        result = _classify(cluster)
+        disabled_values = json.loads(json.dumps(monitor_acceptance._load_monitor_values(ENVIRONMENT)))
+        disabled_values.setdefault("ingress", {})["enabled"] = False
+        with mock.patch.object(monitor_acceptance, "_load_monitor_values", return_value=disabled_values):
+            result = _classify(cluster)
         _assert_broken(self, result, "must be absent")
 
 

@@ -1865,6 +1865,60 @@ def _extract_step_if_condition(workflow_text, step_name):
 
 MONITOR_CHART_PATH = os.path.join(REPO_ROOT, "helm", "goldengate-monitor")
 
+_MONITOR_RENDER_IDENTITY_CACHE = None
+
+_MONITOR_RENDER_IDENTITY_REQUIRED_KEYS = (
+    "GG_ENVIRONMENT", "MONITOR_NAMESPACE", "AWS_REGION", "MONITOR_ROLE_ARN",
+    "MONITOR_HOST", "ALB_GROUP_NAME", "ACM_CERTIFICATE_ARN",
+)
+
+
+def _monitor_render_identity():
+    """The SAME canonical shared-environment identity the real deploy workflow (.github/workflows/50-sub-monitor.yaml) injects via --set-string, resolved from the ONE canonical source (hack/goldengate-environment.py --environment dev github-env) -- never a second independent derivation of envs/dev/environment.yaml, and never a hardcoded DEV literal committed here. Every real monitor-chart Helm render in this module (envs/dev/goldengate-monitor/values.yaml now commits ingress.enabled=true) must supply this identity or the chart's own fail-closed ingress.host/ingress.alb.certificateArn guards correctly abort rendering. Cached per test process: the resolver's output is a pure function of the committed envs/dev/environment.yaml, so re-invoking it for every render is unnecessary."""
+    global _MONITOR_RENDER_IDENTITY_CACHE
+    if _MONITOR_RENDER_IDENTITY_CACHE is not None:
+        return _MONITOR_RENDER_IDENTITY_CACHE
+
+    resolver_script = os.path.join(REPO_ROOT, "hack", "goldengate-environment.py")
+    proc = subprocess.run(
+        [sys.executable, resolver_script, "--environment", "dev", "github-env"],
+        capture_output=True, text=True, cwd=REPO_ROOT,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(
+            f"hack/goldengate-environment.py --environment dev github-env failed (rc={proc.returncode}):\n{proc.stdout}\n{proc.stderr}"
+        )
+
+    resolved = {}
+    for line in proc.stdout.splitlines():
+        if not line or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        resolved[key] = value
+
+    missing = [key for key in _MONITOR_RENDER_IDENTITY_REQUIRED_KEYS if key not in resolved]
+    if missing:
+        raise AssertionError(
+            f"hack/goldengate-environment.py --environment dev github-env output is missing required key(s) {missing!r}; full output:\n{proc.stdout}"
+        )
+
+    _MONITOR_RENDER_IDENTITY_CACHE = resolved
+    return resolved
+
+
+def _monitor_render_identity_helm_args():
+    """The exact shared-environment/Ingress --set-string arguments the real 50-sub-monitor.yaml Helm lint/template invocation uses, built once from _monitor_render_identity() -- never duplicated per test class/function."""
+    identity = _monitor_render_identity()
+    return [
+        "--set-string", f"global.environment={identity['GG_ENVIRONMENT']}",
+        "--set-string", f"namespace.name={identity['MONITOR_NAMESPACE']}",
+        "--set-string", f"aws.region={identity['AWS_REGION']}",
+        "--set-string", f"serviceAccount.roleArn={identity['MONITOR_ROLE_ARN']}",
+        "--set-string", f"ingress.host={identity['MONITOR_HOST']}",
+        "--set-string", f"ingress.alb.groupName={identity['ALB_GROUP_NAME']}",
+        "--set-string", f"ingress.alb.certificateArn={identity['ACM_CERTIFICATE_ARN']}",
+    ]
+
 
 def _render_monitor_chart(registry_yaml=None):
     """Renders the real monitor chart via `helm template`, staged either with the real generated registry (mirrors the workflow's staging step) or a given synthetic registry YAML string. Returns the completed subprocess.CompletedProcess (never raises on a nonzero exit -- callers decide whether that's expected)."""
@@ -1881,15 +1935,14 @@ def _render_monitor_chart(registry_yaml=None):
         with open(os.path.join(files_dir, "goldengate-deployments.yaml"), "w") as f:
             f.write(registry_yaml)
 
+    identity = _monitor_render_identity()
     return subprocess.run(
         ["helm", "template", "gg-monitor", staged_chart,
-         "--namespace", "goldengate-monitoring",
+         "--namespace", identity["MONITOR_NAMESPACE"],
          "-f", os.path.join(REPO_ROOT, "envs", "dev", "goldengate-monitor", "values.yaml"),
          "--set", "image.repository=example.invalid/goldengate-monitor",
          "--set", "image.tag=test",
-         "--set", "namespace.name=goldengate-monitoring",
-         "--set", "aws.region=eu-west-1",
-         "--set", "serviceAccount.roleArn=arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev"],
+         *_monitor_render_identity_helm_args()],
         capture_output=True, text=True, cwd=REPO_ROOT,
     )
 
@@ -1932,15 +1985,14 @@ class SecretProviderClassRenderTests(unittest.TestCase):
         shutil.copytree(MONITOR_CHART_PATH, staged_chart)
         _stage_generated_registry(os.path.join(staged_chart, "files"))
 
+        identity = _monitor_render_identity()
         proc = subprocess.run(
             ["helm", "template", "gg-monitor", staged_chart,
-             "--namespace", "goldengate-monitoring",
+             "--namespace", identity["MONITOR_NAMESPACE"],
              "-f", os.path.join(REPO_ROOT, "envs", "dev", "goldengate-monitor", "values.yaml"),
              "--set", "image.repository=example.invalid/goldengate-monitor",
              "--set", "image.tag=test",
-             "--set", "namespace.name=goldengate-monitoring",
-             "--set", "aws.region=eu-west-1",
-             "--set", "serviceAccount.roleArn=arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev"],
+             *_monitor_render_identity_helm_args()],
             capture_output=True, text=True, cwd=REPO_ROOT,
         )
         if proc.returncode != 0:
@@ -1990,6 +2042,40 @@ class SecretProviderClassRenderTests(unittest.TestCase):
             monitor_values = yaml.safe_load(f)
         expected_ingress_count = 1 if (monitor_values.get("ingress") or {}).get("enabled") else 0
         self.assertEqual(self.rendered.count("kind: Ingress\n"), expected_ingress_count)
+
+
+class MonitorIngressResolverIdentityRenderTests(unittest.TestCase):
+    """Regression for the monitor unit-test Helm rendering fix: envs/dev/goldengate-monitor/values.yaml intentionally commits ingress.enabled=true and deliberately does NOT duplicate shared environment identity (ingress.host/ingress.alb.groupName/ingress.alb.certificateArn) -- that identity must come from the SAME canonical resolver (hack/goldengate-environment.py) the real deploy workflow uses. Consumes _monitor_render_identity()/_render_monitor_chart() directly -- never a second independent derivation or a hardcoded expected literal -- so this test can never silently drift from the real render inputs it is proving."""
+
+    @classmethod
+    def setUpClass(cls):
+        proc = _render_monitor_chart()
+        if proc.returncode != 0:
+            raise AssertionError(f"helm template failed: {proc.stdout}\n{proc.stderr}")
+        cls.rendered = proc.stdout
+        cls.identity = _monitor_render_identity()
+
+    def test_committed_dev_values_declare_ingress_enabled(self):
+        # Guards the premise of this whole test class: if envs/dev/goldengate-monitor/values.yaml ever legitimately flips back to ingress.enabled=false, this class's own remaining assertions would no longer apply -- fail loudly here rather than have every other assertion below silently pass against an absent Ingress.
+        with open(os.path.join(REPO_ROOT, "envs", "dev", "goldengate-monitor", "values.yaml")) as f:
+            monitor_values = yaml.safe_load(f)
+        self.assertTrue((monitor_values.get("ingress") or {}).get("enabled"), "envs/dev/goldengate-monitor/values.yaml no longer has ingress.enabled=true -- this regression's premise no longer holds")
+
+    def test_exactly_one_ingress_named_gg_monitor_using_resolved_identity(self):
+        docs = [d for d in yaml.safe_load_all(self.rendered) if d]
+        ingresses = [d for d in docs if d.get("kind") == "Ingress"]
+        self.assertEqual(len(ingresses), 1, f"expected exactly one Ingress document, found {len(ingresses)}")
+        ingress = ingresses[0]
+
+        self.assertEqual(ingress["metadata"]["name"], "gg-monitor")
+
+        rules = ingress["spec"]["rules"]
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0]["host"], self.identity["MONITOR_HOST"])
+
+        annotations = ingress["metadata"]["annotations"]
+        self.assertEqual(annotations["alb.ingress.kubernetes.io/group.name"], self.identity["ALB_GROUP_NAME"])
+        self.assertEqual(annotations["alb.ingress.kubernetes.io/certificate-arn"], self.identity["ACM_CERTIFICATE_ARN"])
 
 
 SYNTHETIC_SHARED_SECRET_REGISTRY = """\
@@ -2273,15 +2359,15 @@ class CloudWatchActivationHelmRenderTests(unittest.TestCase):
         shutil.copytree(MONITOR_CHART_PATH, staged_chart)
         _stage_generated_registry(os.path.join(staged_chart, "files"))
 
+        identity = _monitor_render_identity()
         proc = subprocess.run(
             ["helm", "template", "gg-monitor", staged_chart,
-             "--namespace", "goldengate-monitoring",
+             "--namespace", identity["MONITOR_NAMESPACE"],
              "-f", os.path.join(REPO_ROOT, "envs", "dev", "goldengate-monitor", "values.yaml"),
              "--set", "image.repository=example.invalid/goldengate-monitor",
              "--set", "image.tag=test",
-             "--set", "namespace.name=goldengate-monitoring",
-             "--set", "aws.region=eu-west-1",
-             "--set", "serviceAccount.roleArn=arn:aws:iam::668311715351:role/GoldenGateMonitorReadRole-dev",
+             *_monitor_render_identity_helm_args(),
+             # Deliberately --set (never --set-string): these tests specifically validate Helm's own boolean type-inference/rendering semantics for cloudwatch.publishEnabled, not a passthrough string.
              "--set", f"cloudwatch.publishEnabled={publish_enabled}"],
             capture_output=True, text=True, cwd=REPO_ROOT,
         )

@@ -40,10 +40,12 @@ SHARED_INGRESS_OVERRIDES=(--set-string ingress.hostDomain="$RESOLVED_DNS_DOMAIN"
 RESOLVED_MONITOR_NAMESPACE="$(python3 "$ENVIRONMENT_TOOL" --environment dev get MONITOR_NAMESPACE)"
 RESOLVED_MONITOR_ROLE_ARN="$(python3 "$ENVIRONMENT_TOOL" --environment dev get MONITOR_ROLE_ARN)"
 RESOLVED_MONITOR_HOST="$(python3 "$ENVIRONMENT_TOOL" --environment dev get MONITOR_HOST)"
-MONITOR_SHARED_OVERRIDES=(--set-string namespace.name="$RESOLVED_MONITOR_NAMESPACE" --set-string aws.region="$RESOLVED_AWS_REGION" --set-string serviceAccount.roleArn="$RESOLVED_MONITOR_ROLE_ARN")
+# Resolved here (rather than down in the Phase 10C block below) because MONITOR_SHARED_OVERRIDES needs it immediately below; still the single resolution point RESOLVED_GG_ENVIRONMENT is used from throughout this file.
+RESOLVED_GG_ENVIRONMENT="$(python3 "$ENVIRONMENT_TOOL" --environment dev get GG_ENVIRONMENT)"
+# envs/dev/goldengate-monitor/values.yaml now commits ingress.enabled=true (Current intentional architecture change) but deliberately does not duplicate shared Ingress identity -- global.environment/ingress.host/ingress.alb.groupName/ingress.alb.certificateArn must be supplied here too, exactly like 50-sub-monitor.yaml's own real --set-string invocation, or the chart's own fail-closed ingress.host/certificateArn guards correctly abort every render below (RESOLVED_ALB_GROUP_NAME/RESOLVED_CERTIFICATE_ARN are already resolved above, shared with the runtime chart's own SHARED_INGRESS_OVERRIDES).
+MONITOR_SHARED_OVERRIDES=(--set-string global.environment="$RESOLVED_GG_ENVIRONMENT" --set-string namespace.name="$RESOLVED_MONITOR_NAMESPACE" --set-string aws.region="$RESOLVED_AWS_REGION" --set-string serviceAccount.roleArn="$RESOLVED_MONITOR_ROLE_ARN" --set-string ingress.host="$RESOLVED_MONITOR_HOST" --set-string ingress.alb.groupName="$RESOLVED_ALB_GROUP_NAME" --set-string ingress.alb.certificateArn="$RESOLVED_CERTIFICATE_ARN")
 
 # Phase 10C: platform/dev/goldengate-platform/values.yaml no longer carries environment/namespaces.runtime.name/fluentBit.namespaces.*/fluentBit.cloudwatch.* -- resolved here the same way the platform deploy workflow does.
-RESOLVED_GG_ENVIRONMENT="$(python3 "$ENVIRONMENT_TOOL" --environment dev get GG_ENVIRONMENT)"
 RESOLVED_RUNTIME_NAMESPACE="$(python3 "$ENVIRONMENT_TOOL" --environment dev get RUNTIME_NAMESPACE)"
 RESOLVED_RUNTIME_LOG_GROUP="$(python3 "$ENVIRONMENT_TOOL" --environment dev get RUNTIME_LOG_GROUP)"
 RESOLVED_MONITOR_LOG_GROUP="$(python3 "$ENVIRONMENT_TOOL" --environment dev get MONITOR_LOG_GROUP)"
