@@ -17,7 +17,7 @@ serviceAccount:
   name: gg-monitor
 
 ingress:
-  enabled: false
+  enabled: true
   mode: shared
   className: alb
   alb:
