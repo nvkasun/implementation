@@ -51,12 +51,16 @@ deployments:
     role: source
     enabled: true
     adminSecret: dev/goldengate/source/admin
+    ingressEnabled: true
+    ingressHost: gg-oracle-payments-01.goldengate-dev.adcbmis.local
   - name: gg-postgresql-payments-01
     type: postgresql
     pipeline: payments-ora-to-pg-001
     role: target
     enabled: true
     adminSecret: dev/goldengate/target/admin
+    ingressEnabled: true
+    ingressHost: gg-postgresql-payments-01.goldengate-dev.adcbmis.local
 """
 
 
@@ -118,10 +122,14 @@ deployments:
     type: oracle
     pipeline: p1
     role: source
+    ingressEnabled: true
+    ingressHost: gg-dup.goldengate-dev.adcbmis.local
   - name: gg-dup
     type: oracle
     pipeline: p1
     role: target
+    ingressEnabled: true
+    ingressHost: gg-dup.goldengate-dev.adcbmis.local
 """)
             with self.assertRaises(cfgmod.ConfigError):
                 cfgmod.load_deployments(tmp)
@@ -138,6 +146,8 @@ deployments:
     type: oracle
     pipeline: p1
     role: middleman
+    ingressEnabled: true
+    ingressHost: gg-x.goldengate-dev.adcbmis.local
 """)
             with self.assertRaises(cfgmod.ConfigError):
                 cfgmod.load_deployments(tmp)
@@ -156,6 +166,8 @@ deployments:
     role: source
     adminPort: 9443
     metricsPort: 9999
+    ingressEnabled: true
+    ingressHost: gg-x.goldengate-dev.adcbmis.local
 """)
             doc = cfgmod.load_deployments(tmp)
         self.assertEqual(doc["deployments"][0]["adminPort"], 9443)

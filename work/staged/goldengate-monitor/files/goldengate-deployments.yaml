@@ -11,6 +11,7 @@ deployments:
   enabled: true
   adminSecret: dev/goldengate/target/admin
   ingressEnabled: true
+  ingressHost: gg-mssql-repltest-01.goldengate-dev.adcbmis.local
 - name: gg-postgresql-repltest-01
   type: postgresql
   pipeline: repltest-pg-to-mssql-001
@@ -18,3 +19,4 @@ deployments:
   enabled: true
   adminSecret: dev/goldengate/source/admin
   ingressEnabled: true
+  ingressHost: gg-postgresql-repltest-01.goldengate-dev.adcbmis.local

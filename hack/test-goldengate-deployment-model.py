@@ -335,6 +335,24 @@ class RealRepositoryDescriptorTests(unittest.TestCase):
         actual_registry_ids = sorted(d["name"] for d in registry["deployments"])
         self.assertEqual(actual_registry_ids, expected_active_ids)
 
+    def test_registry_carries_ingressEnabled_and_the_canonical_resolved_ingressHost(self):
+        # Real generated monitor registry (never a hand-built dict): both current DEV runtimes must have ingressEnabled=true and an ingressHost matching the same "<deploymentId>.<dnsDomain>" precedence helm/goldengate.runtimeIngressHost implements -- the expected hostname is derived from the real environment.yaml, never hardcoded.
+        active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        dns_domain = gdm._environment_derived_values("dev")["DNS_DOMAIN"]
+
+        registry = gdm.build_registry("dev")
+        by_name = {d["name"]: d for d in registry["deployments"]}
+        for d in active:
+            entry = by_name[d["deploymentId"]]
+            self.assertIs(entry["ingressEnabled"], True)
+            self.assertEqual(entry["ingressHost"], f"{d['deploymentId']}.{dns_domain}")
+
+        self.assertIn("gg-postgresql-repltest-01", by_name)
+        self.assertIn("gg-mssql-repltest-01", by_name)
+        self.assertNotEqual(by_name["gg-postgresql-repltest-01"]["ingressHost"],
+                            by_name["gg-mssql-repltest-01"]["ingressHost"])
+
     def test_managed_efs_inventory_matches_dynamically_derived_managed_set(self):
         # Self-service: never asserts today's managed count is any particular fixed number -- compares the real cmd_managed_efs_inventory JSON output against a set derived independently from the same scan (efsMode == "managed"), including lifecycle.state=absent descriptors (inactive), exactly like the real command.
         active, inactive, invalid = gdm.scan("dev")
@@ -1559,6 +1577,41 @@ class ExtendedRuntimeShapeFieldsTests(ScratchEnvironmentTestCase):
         self.assertFalse(d["initPermissionsEnabled"])
         self.assertTrue(d["ingressEnabled"])
         self.assertEqual(d["ingressClassName"], "alb")
+        # A: default hostname resolution -- no explicit ingress.host, so "<deploymentId>.<dnsDomain>" (the SAME precedence helm/goldengate.runtimeIngressHost implements), derived from the scratch environment's own dnsDomain rather than hardcoded.
+        dns_domain = gdm._environment_derived_values("dev")["DNS_DOMAIN"]
+        self.assertEqual(d["runtimeIngressHost"], f"gg-shape-01.{dns_domain}")
+
+    def test_explicit_ingress_host_override_is_used_verbatim(self):
+        # B: an explicit ingress.host wins outright -- the default "<deploymentId>.<dnsDomain>" hostname must NOT be used.
+        doc = _minimal_shape_doc(ingress_overrides={"host": "custom-runtime.example.internal"})
+        d = self._describe("gg-shape-07", doc)
+        self.assertEqual(d["runtimeIngressHost"], "custom-runtime.example.internal")
+        dns_domain = gdm._environment_derived_values("dev")["DNS_DOMAIN"]
+        self.assertNotEqual(d["runtimeIngressHost"], f"gg-shape-07.{dns_domain}")
+
+    def test_empty_string_ingress_host_falls_back_to_the_default(self):
+        # Matches Helm's own {{ if .Values.ingress.host }} truthiness -- an empty string is treated exactly like an absent key, never as "explicitly set to empty".
+        doc = _minimal_shape_doc(ingress_overrides={"host": ""})
+        d = self._describe("gg-shape-08", doc)
+        dns_domain = gdm._environment_derived_values("dev")["DNS_DOMAIN"]
+        self.assertEqual(d["runtimeIngressHost"], f"gg-shape-08.{dns_domain}")
+
+    def test_invalid_ingress_host_shape_is_rejected(self):
+        # J: a malformed ingress.host (whitespace, no dot, uppercase) must fail closed -- never silently coerced or defaulted.
+        for bad_host in ("not a valid host", "nohostdotatall", "Custom-Runtime.Example.Internal"):
+            with self.subTest(bad_host=bad_host):
+                doc = _minimal_shape_doc(ingress_overrides={"host": bad_host})
+                write_doc(self._tmp.name, "dev", "gg-shape-09", doc)
+                active, inactive, invalid = gdm.scan("dev")
+                self.assertEqual(len(invalid), 1)
+
+    def test_non_string_ingress_host_is_rejected(self):
+        for bad_host in (123, True, ["custom-runtime.example.internal"], {"host": "x"}):
+            with self.subTest(bad_host=bad_host):
+                doc = _minimal_shape_doc(ingress_overrides={"host": bad_host})
+                write_doc(self._tmp.name, "dev", "gg-shape-10", doc)
+                active, inactive, invalid = gdm.scan("dev")
+                self.assertEqual(len(invalid), 1)
 
     def test_explicit_values_are_reflected_exactly(self):
         doc = _minimal_shape_doc(
@@ -1605,6 +1658,7 @@ class ExtendedRuntimeShapeFieldsTests(ScratchEnvironmentTestCase):
         gdm.REPO_ROOT = self._original_root
         active, inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
+        dns_domain = gdm._environment_derived_values("dev")["DNS_DOMAIN"]
         for d in active + inactive:
             self.assertIsInstance(d["replicas"], int)
             self.assertGreaterEqual(d["replicas"], 1)
@@ -1612,6 +1666,8 @@ class ExtendedRuntimeShapeFieldsTests(ScratchEnvironmentTestCase):
             self.assertIsInstance(d["initPermissionsEnabled"], bool)
             self.assertIsInstance(d["ingressEnabled"], bool)
             self.assertTrue(d["ingressClassName"])
+            # Neither real DEV descriptor declares an explicit ingress.host, so both resolve to the default "<deploymentId>.<dnsDomain>" -- derived from the real environment.yaml, never hardcoded.
+            self.assertEqual(d["runtimeIngressHost"], f"{d['deploymentId']}.{dns_domain}")
             self.assertEqual(d["u02Type"], "efs")
             self.assertTrue(d["csiEnabled"])
             self.assertTrue(d["csiAdminEnabled"])

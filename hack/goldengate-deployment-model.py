@@ -48,6 +48,9 @@ IGNORED_NON_RUNTIME_FOLDER_NAMES = ("argocd", "goldengate-monitor")
 
 _TOKEN_RE = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*\Z")
 _MAX_ID_LENGTH = 63
+
+# Mirrors hack/goldengate-environment.py's own _DNS_DOMAIN_RE -- used to validate an explicit descriptor-declared ingress.host override (see parse_descriptor below), never imported cross-module.
+_INGRESS_HOST_RE = re.compile(r"^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\Z")
 _MAX_TYPE_LENGTH = 32
 _MAX_PIPELINE_LENGTH = 63
 
@@ -737,6 +740,15 @@ def parse_descriptor(deployment_id, environment, doc, shared=None):
     if not isinstance(ingress_class_name, str) or not ingress_class_name:
         raise DescriptorError("invalid deployment metadata: ingress.className must be a non-empty string")
 
+    # Resolves the SAME precedence helm/goldengate.runtimeIngressHost implements: an explicit, non-empty ingress.host wins outright, otherwise "<deploymentId>.<sharedDnsDomain>" -- the single canonical place this runtime's own resolved Ingress hostname is derived, so the monitor topology (build_registry below) never has to reconstruct this rule independently.
+    ingress_host_override = ingress.get("host")
+    if ingress_host_override not in (None, ""):
+        if not isinstance(ingress_host_override, str) or not _INGRESS_HOST_RE.match(ingress_host_override):
+            raise DescriptorError("invalid deployment metadata: ingress.host, when set, must be a valid DNS hostname")
+        resolved_ingress_host = ingress_host_override
+    else:
+        resolved_ingress_host = f"{deployment_id}.{shared['dnsDomain']}"
+
     # Phase B3A closeout: u02Type is the chart's own volume-source discriminator (helm/goldengate/templates/runtime-statefulset.yaml branches on it directly: efs/existingClaim/emptyDir) -- read through, never re-derived. extraVolume(Mount)Names are name-only allow-lists (the chart passes runtime.extraVolumes/extraVolumeMounts through verbatim via `toYaml`) so the acceptance classifier's exact-volume-set check never falsely rejects a descriptor that legitimately uses that chart escape hatch, without inventing a second desired shape for volumes this repository does not itself validate in detail.
     u02_type = ((runtime.get("storage") or {}).get("u02") or {}).get("type")
     extra_volume_names = sorted({v.get("name") for v in (runtime.get("extraVolumes") or []) if isinstance(v, dict) and v.get("name")})
@@ -772,6 +784,8 @@ def parse_descriptor(deployment_id, environment, doc, shared=None):
         "initPermissionsEnabled": init_permissions_enabled,
         "ingressEnabled": ingress_enabled,
         "ingressClassName": ingress_class_name,
+        # The runtime's own resolved Ingress hostname (ingress.host override, or the "<deploymentId>.<dnsDomain>" default) -- distinct from the "ingressHost" key above, which is this document's own legacy name for the SHARED dnsDomain consumed by build_replication_plan()'s TLS SNI derivation; never renamed/repurposed here to avoid silently changing that unrelated contract.
+        "runtimeIngressHost": resolved_ingress_host,
         "u02Type": u02_type,
         "csiEnabled": csi_fields["csiEnabled"],
         "csiAdminEnabled": csi_fields["csiAdminEnabled"],
@@ -973,8 +987,9 @@ def build_registry(environment, platform_values_path=None, monitor_values_path=N
             "role": d["role"],
             "enabled": True,
             "adminSecret": d["adminSecretName"],
-            # Monitoring portal "Open GoldenGate UI" external link: the runtime's own canonical hostname is d["deploymentId"] + this document's own top-level dnsDomain below (the SAME derivation helm/goldengate.runtimeIngressHost defaults to and build_replication_plan() already uses, never a duplicated hostname field); ingressEnabled is the one piece of information genuinely missing until now -- whether this runtime's own Ingress is actually enabled, so the monitor can decide whether to show that link at all.
+            # Monitoring portal "Open GoldenGate UI" external link: ingressHost is this runtime's own resolved Ingress hostname (parse_descriptor's runtimeIngressHost -- explicit ingress.host override, or the "<deploymentId>.<dnsDomain>" default; the SAME precedence helm/goldengate.runtimeIngressHost implements, never a duplicated rule). Always present regardless of ingressEnabled (a hostname string is not sensitive and is cheap to derive) -- ingressEnabled alone is the single gate the monitor uses to decide whether to render a clickable link at all.
             "ingressEnabled": d["ingressEnabled"],
+            "ingressHost": d["runtimeIngressHost"],
         }
         for d in active_sorted
     ]

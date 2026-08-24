@@ -17,8 +17,7 @@ DEFAULT_METRICS_PORT = 9015
 MAX_DEPLOYMENT_TYPE_LENGTH = 32
 _DEPLOYMENT_TYPE_RE = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*\Z")
 
-# Mirrors hack/goldengate-deployment-model.py's own _TOKEN_RE (deployment IDs) and hack/goldengate-environment.py's own _DNS_DOMAIN_RE (network.dnsDomain) -- re-validated here, defensively, rather than trusted blindly from the staged registry file (see _console_url below).
-_HOST_LABEL_RE = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*\Z")
+# Mirrors hack/goldengate-deployment-model.py's own _INGRESS_HOST_RE / hack/goldengate-environment.py's own _DNS_DOMAIN_RE -- re-validates the registry's already-canonically-resolved ingressHost here, defensively, rather than trusting it blindly (see _is_valid_ingress_host below); never re-derives it from name+dnsDomain (that rule now lives solely in hack/goldengate-deployment-model.py).
 _DNS_DOMAIN_RE = re.compile(r"^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\Z")
 
 
@@ -27,6 +26,16 @@ def is_safe_deployment_type(value):
     if not isinstance(value, str) or not value or len(value) > MAX_DEPLOYMENT_TYPE_LENGTH:
         return False
     return bool(_DEPLOYMENT_TYPE_RE.match(value))
+
+
+def _is_literal_bool(value):
+    """True only for the literal Python bool type -- mirrors hack/goldengate-deployment-model.py's own _is_literal_bool; YAML 1.1 "yes"/"no"/"true"/"false" strings and 0/1 integers must never pass (bool is a subclass of int in Python, but isinstance(1, bool) is still False -- only True/False themselves satisfy this)."""
+    return isinstance(value, bool)
+
+
+def _is_valid_ingress_host(value):
+    """Structural re-validation of the registry's already-canonical ingressHost -- never a second hostname-derivation rule, only a shape check on the value hack/goldengate-deployment-model.py already resolved."""
+    return isinstance(value, str) and bool(_DNS_DOMAIN_RE.match(value))
 
 DEFAULTS = {
     "PORT": "8080",
@@ -100,13 +109,9 @@ def _tls_server_name(name, dns_domain):
     return f"{name}.{dns_domain}"
 
 
-def _console_url(name, dns_domain):
-    """The runtime's own canonical GoldenGate UI URL: https://<name>.<dnsDomain>/ -- the SAME hostname convention already used by _tls_server_name above, helm/goldengate's goldengate.runtimeIngressHost default, and hack/goldengate-deployment-model.py's build_replication_plan() (never a second, independently invented hostname rule); re-validates both components against the same shape every producer of this staged file already enforces before constructing anything, returning None (never a partial/fabricated URL) if either fails."""
-    if not (isinstance(name, str) and _HOST_LABEL_RE.match(name)):
-        return None
-    if not (isinstance(dns_domain, str) and _DNS_DOMAIN_RE.match(dns_domain)):
-        return None
-    return f"https://{name}.{dns_domain}/"
+def _console_url(ingress_host):
+    """The runtime's own canonical GoldenGate UI URL: https://<ingressHost>/ -- ingress_host is ALWAYS the registry's already-canonically-resolved ingressHost (hack/goldengate-deployment-model.py's runtimeIngressHost: an explicit ingress.host override, or the "<deploymentId>.<dnsDomain>" default), never independently reconstructed here. Callers must validate ingress_host with _is_valid_ingress_host before calling this -- this function performs no validation of its own."""
+    return f"https://{ingress_host}/"
 
 
 def credential_paths(name, mount_root="/mnt/secrets-store"):
@@ -153,7 +158,19 @@ def load_deployments(repo_root=None):
         seen.add(name)
         if entry["role"] not in ("source", "target"):
             raise ConfigError(f"{name}: role must be 'source' or 'target', got {entry['role']!r}")
-        ingress_enabled = bool(entry.get("ingressEnabled", False))
+
+        # ingressEnabled is a REQUIRED, literal Boolean field of the generated registry (hack/goldengate-deployment-model.py's build_registry() always sets it) -- no truthy/falsy coercion of a string/int/null is ever accepted, so a malformed value such as "false" (a truthy Python string) can never be silently treated as enabled.
+        raw_ingress_enabled = entry.get("ingressEnabled")
+        if not _is_literal_bool(raw_ingress_enabled):
+            raise ConfigError(f"{name}: ingressEnabled must be a literal Boolean, got {raw_ingress_enabled!r}")
+        ingress_enabled = raw_ingress_enabled
+
+        # ingressHost is likewise REQUIRED and must already be a validly-shaped hostname -- the registry's own canonically-resolved value (see hack/goldengate-deployment-model.py's runtimeIngressHost), never reconstructed here from name+dnsDomain. Malformed canonical topology fails the whole config load closed rather than silently producing no link for one runtime.
+        raw_ingress_host = entry.get("ingressHost")
+        if not _is_valid_ingress_host(raw_ingress_host):
+            raise ConfigError(f"{name}: ingressHost must be a valid hostname, got {raw_ingress_host!r}")
+        ingress_host = raw_ingress_host
+
         deployments.append({
             "name": name,
             "type": entry["type"],
@@ -165,9 +182,10 @@ def load_deployments(repo_root=None):
             "adminPort": int(entry.get("adminPort", DEFAULT_ADMIN_PORT)),
             "tlsServerName": _tls_server_name(name, dns_domain),
             "metricsPort": int(entry.get("metricsPort", DEFAULT_METRICS_PORT)),
-            # "Open GoldenGate UI" portal link -- None (never a fabricated URL) whenever the runtime's own Ingress is disabled, or the registry's name/dnsDomain fail the same safe-token/DNS-domain shape check every other consumer of this document requires.
             "ingressEnabled": ingress_enabled,
-            "consoleUrl": _console_url(name, dns_domain) if ingress_enabled else None,
+            "ingressHost": ingress_host,
+            # "Open GoldenGate UI" portal link -- None (never a fabricated URL) whenever the runtime's own Ingress is disabled; ingressHost itself is already validated above regardless of ingressEnabled.
+            "consoleUrl": _console_url(ingress_host) if ingress_enabled else None,
         })
 
     return {

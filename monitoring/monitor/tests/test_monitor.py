@@ -402,29 +402,57 @@ class BuildStatusPayloadTests(unittest.TestCase):
             self.assertEqual(runtimes_by_pipeline[pipeline_id], len(roles))
 
 
+def _registry_doc(deployments, dns_domain="goldengate-dev.adcbmis.local"):
+    return {
+        "environment": "dev", "runtimeNamespace": "goldengate-dev", "monitoringNamespace": "goldengate-monitoring",
+        "dnsDomain": dns_domain, "deployments": deployments,
+    }
+
+
+def _stage_doc(doc):
+    """Writes a hand-built registry document to a fresh temp dir, mirroring _stage_generated_registry's on-disk shape."""
+    target_dir = tempfile.mkdtemp()
+    with open(os.path.join(target_dir, "goldengate-deployments.yaml"), "w") as f:
+        yaml.safe_dump(doc, f)
+    return target_dir
+
+
+def _entry(**overrides):
+    entry = {
+        "name": "gg-example-01", "type": "oracle", "pipeline": "p1", "role": "source",
+        "enabled": True, "adminSecret": "s",
+        "ingressEnabled": True, "ingressHost": "gg-example-01.goldengate-dev.adcbmis.local",
+    }
+    entry.update(overrides)
+    return entry
+
+
 class RuntimeConsoleUrlTopologyTests(unittest.TestCase):
-    """"Open GoldenGate UI" data path: config.load_deployments()'s ingressEnabled/consoleUrl derivation, proven against the REAL generated registry (hack/goldengate-deployment-model.py), never a handwritten duplicate hostname rule."""
+    """"Open GoldenGate UI" data path: config.load_deployments()'s ingressEnabled/ingressHost/consoleUrl derivation, proven against the REAL generated registry (hack/goldengate-deployment-model.py) -- config.py consumes the registry's own canonically-resolved ingressHost verbatim, it never reconstructs "<name>.<dnsDomain>" itself."""
 
     @classmethod
     def setUpClass(cls):
         cls.doc = cfgmod.load_deployments(_stage_generated_registry_dir())
         cls.by_name = {d["name"]: d for d in cls.doc["deployments"]}
 
-    def test_real_postgresql_and_mssql_runtimes_have_ingress_enabled_and_distinct_console_urls(self):
+    def test_real_postgresql_and_mssql_runtimes_have_ingress_enabled_and_canonical_resolved_hosts(self):
+        # A/Section 8: proven against the REAL generated registry, never a hand-built dictionary; neither real DEV descriptor declares an explicit ingress.host, so both resolve to the "<deploymentId>.<dnsDomain>" default.
         pg = self.by_name["gg-postgresql-repltest-01"]
         mssql = self.by_name["gg-mssql-repltest-01"]
-        self.assertTrue(pg["ingressEnabled"])
-        self.assertTrue(mssql["ingressEnabled"])
+        self.assertIs(pg["ingressEnabled"], True)
+        self.assertIs(mssql["ingressEnabled"], True)
+        self.assertEqual(pg["ingressHost"], f"gg-postgresql-repltest-01.{self.doc['dnsDomain']}")
+        self.assertEqual(mssql["ingressHost"], f"gg-mssql-repltest-01.{self.doc['dnsDomain']}")
         self.assertEqual(pg["consoleUrl"], f"https://gg-postgresql-repltest-01.{self.doc['dnsDomain']}/")
         self.assertEqual(mssql["consoleUrl"], f"https://gg-mssql-repltest-01.{self.doc['dnsDomain']}/")
+
+    def test_l_two_real_runtimes_resolve_to_different_urls_automatically(self):
+        pg = self.by_name["gg-postgresql-repltest-01"]
+        mssql = self.by_name["gg-mssql-repltest-01"]
+        self.assertNotEqual(pg["ingressHost"], mssql["ingressHost"])
         self.assertNotEqual(pg["consoleUrl"], mssql["consoleUrl"])
 
-    def test_console_url_uses_the_same_hostname_as_the_pre_existing_tlsServerName_convention(self):
-        # config.py's own pre-existing _tls_server_name() convention -- never a second, independently invented rule.
-        for entry in self.doc["deployments"]:
-            self.assertTrue(entry["consoleUrl"].startswith(f"https://{entry['tlsServerName']}/"))
-
-    def test_no_deployment_hostname_or_domain_literal_hardcoded_in_ui_module(self):
+    def test_m_no_deployment_hostname_or_domain_literal_hardcoded_in_ui_module(self):
         ui_source = inspect.getsource(ui)
         for literal in (self.doc["dnsDomain"], "gg-postgresql-repltest-01", "gg-mssql-repltest-01"):
             self.assertNotIn(literal, ui_source)
@@ -437,40 +465,88 @@ class RuntimeConsoleUrlTopologyTests(unittest.TestCase):
         for literal in (self.doc["dnsDomain"], "gg-postgresql-repltest-01", "gg-mssql-repltest-01"):
             self.assertNotIn(literal, dockerfile_text)
 
-    def test_ingress_disabled_yields_no_console_url(self):
-        doc = {
-            "environment": "dev", "runtimeNamespace": "goldengate-dev", "monitoringNamespace": "goldengate-monitoring",
-            "dnsDomain": "goldengate-dev.adcbmis.local", "deployments": [
-                {"name": "gg-example-01", "type": "oracle", "pipeline": "p1", "role": "source",
-                 "enabled": True, "adminSecret": "s", "ingressEnabled": False},
-            ]}
-        with tempfile.TemporaryDirectory() as d:
-            with open(os.path.join(d, "goldengate-deployments.yaml"), "w") as f:
-                yaml.safe_dump(doc, f)
-            loaded = cfgmod.load_deployments(d)
-        self.assertFalse(loaded["deployments"][0]["ingressEnabled"])
+    def test_c_ingress_disabled_yields_no_console_url(self):
+        d = _stage_doc(_registry_doc([_entry(ingressEnabled=False)]))
+        loaded = cfgmod.load_deployments(d)
+        self.assertIs(loaded["deployments"][0]["ingressEnabled"], False)
+        self.assertIsNone(loaded["deployments"][0]["consoleUrl"])
+        # ingressHost itself is still carried through (harmless, non-sensitive) -- only consoleUrl/the UI link is gated on ingressEnabled.
+        self.assertEqual(loaded["deployments"][0]["ingressHost"], "gg-example-01.goldengate-dev.adcbmis.local")
+
+    def test_d_literal_boolean_true_allows_the_link_when_host_valid(self):
+        d = _stage_doc(_registry_doc([_entry(ingressEnabled=True)]))
+        loaded = cfgmod.load_deployments(d)
+        self.assertEqual(loaded["deployments"][0]["consoleUrl"], "https://gg-example-01.goldengate-dev.adcbmis.local/")
+
+    def test_e_literal_boolean_false_yields_no_link(self):
+        d = _stage_doc(_registry_doc([_entry(ingressEnabled=False)]))
+        loaded = cfgmod.load_deployments(d)
         self.assertIsNone(loaded["deployments"][0]["consoleUrl"])
 
-    def test_missing_ingress_enabled_field_defaults_to_no_link_never_crashes(self):
-        # Backward compatibility: an older-shaped registry document (pre-dating this field) must never crash startup and must never fabricate a link.
-        doc = {
-            "environment": "dev", "runtimeNamespace": "goldengate-dev", "monitoringNamespace": "goldengate-monitoring",
-            "dnsDomain": "goldengate-dev.adcbmis.local", "deployments": [
-                {"name": "gg-example-01", "type": "oracle", "pipeline": "p1", "role": "source",
-                 "enabled": True, "adminSecret": "s"},
-            ]}
-        with tempfile.TemporaryDirectory() as d:
-            with open(os.path.join(d, "goldengate-deployments.yaml"), "w") as f:
-                yaml.safe_dump(doc, f)
-            loaded = cfgmod.load_deployments(d)
-        self.assertIsNone(loaded["deployments"][0]["consoleUrl"])
+    def test_f_string_false_fails_configuration_validation_never_treated_as_enabled(self):
+        d = _stage_doc(_registry_doc([_entry(ingressEnabled="false")]))
+        with self.assertRaises(cfgmod.ConfigError):
+            cfgmod.load_deployments(d)
 
-    def test_invalid_name_or_dns_domain_never_produces_a_console_url(self):
-        self.assertIsNone(cfgmod._console_url("gg-example-01", "not a domain"))
-        self.assertIsNone(cfgmod._console_url("gg-example-01", "javascript:alert(1)"))
-        self.assertIsNone(cfgmod._console_url("gg example 01", "goldengate-dev.adcbmis.local"))
-        self.assertIsNone(cfgmod._console_url("", "goldengate-dev.adcbmis.local"))
-        self.assertIsNone(cfgmod._console_url("gg-example-01", ""))
+    def test_g_string_true_fails_configuration_validation(self):
+        d = _stage_doc(_registry_doc([_entry(ingressEnabled="true")]))
+        with self.assertRaises(cfgmod.ConfigError):
+            cfgmod.load_deployments(d)
+
+    def test_h_numeric_one_and_zero_fail_configuration_validation(self):
+        for numeric in (1, 0):
+            with self.subTest(numeric=numeric):
+                d = _stage_doc(_registry_doc([_entry(ingressEnabled=numeric)]))
+                with self.assertRaises(cfgmod.ConfigError):
+                    cfgmod.load_deployments(d)
+
+    def test_i_missing_ingressEnabled_fails_configuration_validation(self):
+        # The generated registry now guarantees ingressEnabled is always present (hack/goldengate-deployment-model.py's build_registry()) -- a missing key is therefore treated as malformed canonical topology and fails closed, never silently defaulted to False.
+        entry = _entry()
+        del entry["ingressEnabled"]
+        d = _stage_doc(_registry_doc([entry]))
+        with self.assertRaises(cfgmod.ConfigError):
+            cfgmod.load_deployments(d)
+
+    def test_null_ingressEnabled_fails_configuration_validation(self):
+        d = _stage_doc(_registry_doc([_entry(ingressEnabled=None)]))
+        with self.assertRaises(cfgmod.ConfigError):
+            cfgmod.load_deployments(d)
+
+    def test_object_and_array_ingressEnabled_are_rejected(self):
+        for bad in ({"enabled": True}, [True]):
+            with self.subTest(bad=bad):
+                d = _stage_doc(_registry_doc([_entry(ingressEnabled=bad)]))
+                with self.assertRaises(cfgmod.ConfigError):
+                    cfgmod.load_deployments(d)
+
+    def test_b_explicit_hostname_override_is_carried_through_verbatim(self):
+        # config.py never reconstructs the hostname -- it only consumes whatever ingressHost the registry already carries, whether that is the "<name>.<dnsDomain>" default or an explicit hack/goldengate-deployment-model.py-resolved override.
+        d = _stage_doc(_registry_doc([_entry(ingressHost="custom-runtime.example.internal")]))
+        loaded = cfgmod.load_deployments(d)
+        self.assertEqual(loaded["deployments"][0]["ingressHost"], "custom-runtime.example.internal")
+        self.assertEqual(loaded["deployments"][0]["consoleUrl"], "https://custom-runtime.example.internal/")
+        self.assertNotEqual(loaded["deployments"][0]["consoleUrl"], "https://gg-example-01.goldengate-dev.adcbmis.local/")
+
+    def test_j_invalid_ingressHost_fails_configuration_validation(self):
+        for bad_host in ("not a domain", "javascript:alert(1)", "", None, 123, ["example.com"]):
+            with self.subTest(bad_host=bad_host):
+                d = _stage_doc(_registry_doc([_entry(ingressHost=bad_host)]))
+                with self.assertRaises(cfgmod.ConfigError):
+                    cfgmod.load_deployments(d)
+
+    def test_missing_ingressHost_fails_configuration_validation(self):
+        entry = _entry()
+        del entry["ingressHost"]
+        d = _stage_doc(_registry_doc([entry]))
+        with self.assertRaises(cfgmod.ConfigError):
+            cfgmod.load_deployments(d)
+
+    def test_console_url_helper_no_longer_accepts_name_plus_dns_domain(self):
+        # Section 1C: config.py must not independently reconstruct "<name>.<dnsDomain>" -- _console_url now takes exactly one already-resolved ingress_host argument.
+        self.assertEqual(cfgmod._console_url("custom-runtime.example.internal"), "https://custom-runtime.example.internal/")
+        with self.assertRaises(TypeError):
+            cfgmod._console_url("gg-example-01", "goldengate-dev.adcbmis.local")
 
 
 class DecimalConversionTests(unittest.TestCase):
