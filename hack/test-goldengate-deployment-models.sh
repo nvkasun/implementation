@@ -10121,7 +10121,8 @@ if step is None:
 script = step["run"]
 
 ALL_RESULT_JOBS = (
-    "detect_changed_deployments",
+    # MAIN prerequisite fail-fast hardening: eks_oidc_preflight/managed_efs_deletion_guard/storage_transition_guard/managed_efs_inventory_guard/terraform_sync_once are now direct needs of final_validation, each with its own RESULT_ env reference in the real script -- must be present here so every run_gate() call below always binds them (the script's own set -u would otherwise abort on an unset variable for any scenario that does not explicitly override one of these five).
+    "eks_oidc_preflight", "detect_changed_deployments", "managed_efs_deletion_guard", "storage_transition_guard", "managed_efs_inventory_guard", "terraform_sync_once",
     "validate_shared_secrets_once", "validate_argocd_ready", "validate_platform_ready", "validate_observability_ready",
     "runtime_ownership_preflight", "build_publish_and_deploy", "delete_removed_argocd_applications",
     "validate_active_runtimes", "replication_reconcile_once", "replication_dry_run_validation",
@@ -10260,7 +10261,8 @@ if step is None:
 script = step["run"]
 
 ALL_RESULT_JOBS = (
-    "detect_changed_deployments",
+    # MAIN prerequisite fail-fast hardening: eks_oidc_preflight/managed_efs_deletion_guard/storage_transition_guard/managed_efs_inventory_guard/terraform_sync_once are now direct needs of final_validation, each with its own RESULT_ env reference in the real script -- must be present here so every run_gate() call below always binds them (the script's own set -u would otherwise abort on an unset variable for any scenario that does not explicitly override one of these five).
+    "eks_oidc_preflight", "detect_changed_deployments", "managed_efs_deletion_guard", "storage_transition_guard", "managed_efs_inventory_guard", "terraform_sync_once",
     "validate_shared_secrets_once", "validate_argocd_ready", "validate_platform_ready", "validate_observability_ready",
     "runtime_ownership_preflight", "build_publish_and_deploy", "delete_removed_argocd_applications",
     "validate_active_runtimes", "replication_reconcile_once", "replication_dry_run_validation",
@@ -15428,6 +15430,322 @@ else
 fi
 
 echo ""
+echo "--- MAIN prerequisite fail-fast + Kubernetes-access preflight: detect_changed_deployments mode-aware gating (real if: expressions) ---"
+
+# A/B/C/D: a small, targeted model of GitHub Actions' real default job-continuation semantics -- deliberately duplicated locally (never imported/shared, matching this suite's own established per-section convention) rather than reusing the Skip-Propagation Correctness Fix section's copy above. Extends that model with the ONE additional rule this fix needs: a job whose if: is the bare literal "success()" (GitHub's own implicit-default-equivalent, distinct from a job with no status function that this suite already models via the full transitive closure) checks only that job's OWN direct needs -- this is exactly how managed_efs_deletion_guard/storage_transition_guard ("if: success()", needs: [detect_changed_deployments] only) actually behave.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  set +e
+  PREREQ_GATING_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import re
+import sys
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+jobs = doc["jobs"]
+
+STATUS_FN_RE = re.compile(r"\b(always|success|failure|cancelled)\(\)")
+
+
+def has_status_fn(expr):
+    return bool(STATUS_FN_RE.search(expr))
+
+
+def job_needs(name):
+    n = jobs[name].get("needs")
+    if n is None:
+        return []
+    if isinstance(n, str):
+        return [n]
+    return list(n)
+
+
+def extract_if(name):
+    raw = str(jobs[name].get("if", "true")).strip()
+    if raw.startswith("${{") and raw.endswith("}}"):
+        raw = raw[3:-2].strip()
+    return raw
+
+
+class _Parser:
+    """The SAME tiny bespoke && || == != () always() needs.<job>.result/outputs.* evaluator already used elsewhere in this suite -- copied here (never imported/shared) rather than a general GHA expression engine."""
+
+    def __init__(self, expr, needs):
+        self.expr = expr
+        self.needs = needs
+        self.pos = 0
+
+    def _skip_ws(self):
+        while self.pos < len(self.expr) and self.expr[self.pos] == " ":
+            self.pos += 1
+
+    def parse(self):
+        result = self._or()
+        self._skip_ws()
+        if self.pos != len(self.expr):
+            raise ValueError(f"trailing content: {self.expr[self.pos:]!r}")
+        return result
+
+    def _or(self):
+        left = self._and()
+        self._skip_ws()
+        while self.expr[self.pos:self.pos + 2] == "||":
+            self.pos += 2
+            right = self._and()
+            left = left or right
+            self._skip_ws()
+        return left
+
+    def _and(self):
+        left = self._atom()
+        self._skip_ws()
+        while self.expr[self.pos:self.pos + 2] == "&&":
+            self.pos += 2
+            right = self._atom()
+            left = left and right
+            self._skip_ws()
+        return left
+
+    def _atom(self):
+        self._skip_ws()
+        if self.expr[self.pos] == "(":
+            self.pos += 1
+            val = self._or()
+            self._skip_ws()
+            assert self.expr[self.pos] == ")"
+            self.pos += 1
+            return val
+        if self.expr[self.pos:self.pos + 8] == "always()":
+            self.pos += 8
+            return True
+        left_val = self._value()
+        self._skip_ws()
+        op = self.expr[self.pos:self.pos + 2]
+        if op in ("==", "!="):
+            self.pos += 2
+            right_val = self._value()
+            return left_val == right_val if op == "==" else left_val != right_val
+        return bool(left_val)
+
+    def _value(self):
+        self._skip_ws()
+        if self.expr[self.pos] == "'":
+            self.pos += 1
+            start = self.pos
+            while self.expr[self.pos] != "'":
+                self.pos += 1
+            val = self.expr[start:self.pos]
+            self.pos += 1
+            return val
+        m = re.match(r"needs\.([A-Za-z0-9_]+)\.result", self.expr[self.pos:])
+        if m:
+            self.pos += m.end()
+            return self.needs.get(m.group(1), {}).get("result", "")
+        m = re.match(r"needs\.([A-Za-z0-9_]+)\.outputs\.([A-Za-z0-9_]+)", self.expr[self.pos:])
+        if m:
+            self.pos += m.end()
+            return self.needs.get(m.group(1), {}).get("outputs", {}).get(m.group(2), "")
+        raise ValueError(f"cannot parse value at: {self.expr[self.pos:self.pos + 40]!r}")
+
+
+def eval_gha_bool(expr, needs):
+    return bool(_Parser(expr, needs).parse())
+
+
+def transitive_ancestors_all_success(name, results, seen=None):
+    if seen is None:
+        seen = set()
+    for dep in job_needs(name):
+        if dep in seen:
+            continue
+        seen.add(dep)
+        dep_result = results.get(dep, {"result": "success"})["result"]
+        if dep_result != "success":
+            return False
+        if not transitive_ancestors_all_success(dep, results, seen):
+            return False
+    return True
+
+
+def would_run(name, results):
+    expr = extract_if(name)
+    # A bare "success()" if: (GitHub's own implicit-default-equivalent literal) checks only this job's OWN direct needs -- distinct from the stricter full-transitive-closure rule reserved for a job with NO status function at all.
+    if expr == "success()":
+        return all(results.get(dep, {"result": "success"})["result"] == "success" for dep in job_needs(name))
+    if not has_status_fn(expr):
+        if not transitive_ancestors_all_success(name, results):
+            return False
+    return eval_gha_bool(expr, results)
+
+
+results = []
+
+
+def check(label, ok):
+    results.append((label, ok))
+
+
+# A: REAL DEPLOY + eks_oidc_preflight SUCCESS -> detect_changed_deployments runs.
+ctx = {
+    "validate_model": {"result": "success", "outputs": {"effective_deploy": "true"}},
+    "eks_oidc_preflight": {"result": "success", "outputs": {}},
+}
+check("A: REAL DEPLOY + eks_oidc_preflight=success -> detect_changed_deployments runs", would_run("detect_changed_deployments", ctx) is True)
+
+# B: REAL DEPLOY + eks_oidc_preflight FAILURE -> detect_changed_deployments and every downstream storage/Terraform guard is skipped; runtime/platform/monitor mutation paths cannot execute (terraform_sync_once itself gating build_publish_and_deploy/platform_sync_once/observability_sync_once is proven separately elsewhere in this suite -- "1b (Fresh-EKS Phase A)" above -- not re-proved here).
+ctx = {
+    "validate_model": {"result": "success", "outputs": {"effective_deploy": "true"}},
+    "eks_oidc_preflight": {"result": "failure", "outputs": {}},
+}
+detect_ok = would_run("detect_changed_deployments", ctx)
+check("B: REAL DEPLOY + eks_oidc_preflight=failure -> detect_changed_deployments is skipped", detect_ok is False)
+ctx["detect_changed_deployments"] = {"result": "success" if detect_ok else "skipped", "outputs": {}}
+for guard in ("managed_efs_deletion_guard", "storage_transition_guard"):
+    guard_ok = would_run(guard, ctx)
+    check(f"B: REAL DEPLOY + eks_oidc_preflight=failure -> {guard} is skipped", guard_ok is False)
+    ctx[guard] = {"result": "success" if guard_ok else "skipped", "outputs": {}}
+inventory_ok = would_run("managed_efs_inventory_guard", ctx)
+check("B: REAL DEPLOY + eks_oidc_preflight=failure -> managed_efs_inventory_guard is skipped", inventory_ok is False)
+ctx["managed_efs_inventory_guard"] = {"result": "success" if inventory_ok else "skipped", "outputs": {}}
+terraform_ok = would_run("terraform_sync_once", ctx)
+check("B: REAL DEPLOY + eks_oidc_preflight=failure -> terraform_sync_once is skipped", terraform_ok is False)
+
+# C: REAL DEPLOY + eks_oidc_preflight CANCELLED -> identical fail-closed detection behavior as failure.
+ctx = {
+    "validate_model": {"result": "success", "outputs": {"effective_deploy": "true"}},
+    "eks_oidc_preflight": {"result": "cancelled", "outputs": {}},
+}
+detect_ok = would_run("detect_changed_deployments", ctx)
+check("C: REAL DEPLOY + eks_oidc_preflight=cancelled -> detect_changed_deployments is skipped", detect_ok is False)
+ctx["detect_changed_deployments"] = {"result": "success" if detect_ok else "skipped", "outputs": {}}
+for guard in ("managed_efs_deletion_guard", "storage_transition_guard"):
+    guard_ok = would_run(guard, ctx)
+    check(f"C: REAL DEPLOY + eks_oidc_preflight=cancelled -> {guard} is skipped", guard_ok is False)
+    ctx[guard] = {"result": "success" if guard_ok else "skipped", "outputs": {}}
+inventory_ok = would_run("managed_efs_inventory_guard", ctx)
+check("C: REAL DEPLOY + eks_oidc_preflight=cancelled -> managed_efs_inventory_guard is skipped", inventory_ok is False)
+ctx["managed_efs_inventory_guard"] = {"result": "success" if inventory_ok else "skipped", "outputs": {}}
+terraform_ok = would_run("terraform_sync_once", ctx)
+check("C: REAL DEPLOY + eks_oidc_preflight=cancelled -> terraform_sync_once is skipped", terraform_ok is False)
+
+# D: VALIDATE / effective_deploy=false -> eks_oidc_preflight is legitimately skipped (its own if: only ever runs it for effective_deploy=='true'), but detect_changed_deployments MUST STILL RUN, and local descriptor/storage validation continues; live EFS inventory and Terraform remain skipped per existing mode behavior.
+ctx = {
+    "validate_model": {"result": "success", "outputs": {"effective_deploy": "false"}},
+    "eks_oidc_preflight": {"result": "skipped", "outputs": {}},
+}
+check("D: VALIDATE mode -> eks_oidc_preflight's own if: legitimately evaluates to skip (effective_deploy != 'true')", would_run("eks_oidc_preflight", ctx) is False)
+detect_ok = would_run("detect_changed_deployments", ctx)
+check("D: VALIDATE mode + eks_oidc_preflight legitimately skipped -> detect_changed_deployments STILL RUNS", detect_ok is True)
+ctx["detect_changed_deployments"] = {"result": "success", "outputs": {}}
+for guard in ("managed_efs_deletion_guard", "storage_transition_guard"):
+    guard_ok = would_run(guard, ctx)
+    check(f"D: VALIDATE mode -> {guard} still runs (local descriptor/storage validation continues)", guard_ok is True)
+    ctx[guard] = {"result": "success", "outputs": {}}
+inventory_ok = would_run("managed_efs_inventory_guard", ctx)
+check("D: VALIDATE mode -> managed_efs_inventory_guard remains skipped (live EFS inventory stays offline)", inventory_ok is False)
+ctx["managed_efs_inventory_guard"] = {"result": "success" if inventory_ok else "skipped", "outputs": {}}
+terraform_ok = would_run("terraform_sync_once", ctx)
+check("D: VALIDATE mode -> terraform_sync_once remains skipped (Terraform stays offline)", terraform_ok is False)
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  PREREQ_GATING_STATUS=$?
+  set -e
+  PREREQ_GATING_FAILURES="$(echo "$PREREQ_GATING_OUT" | grep "^FAIL " || true)"
+  if [ "$PREREQ_GATING_STATUS" -eq 0 ] && [ -z "$PREREQ_GATING_FAILURES" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        OK\ *) pass "MAIN prerequisite fail-fast: ${line#OK }" ;;
+      esac
+    done <<< "$PREREQ_GATING_OUT"
+  else
+    fail "MAIN prerequisite fail-fast: detect_changed_deployments mode-aware gating proof failed:"$'\n'"${PREREQ_GATING_OUT}"
+  fi
+else
+  skip "MAIN prerequisite fail-fast: detect_changed_deployments mode-aware gating proof -- python3/PyYAML unavailable or main workflow missing"
+fi
+
+echo ""
+echo "--- MAIN prerequisite fail-fast + Kubernetes-access preflight: structural proofs (eks_oidc_preflight scope, final_validation direct needs, deployment_id description, orchestrator summary) ---"
+
+# E: eks_oidc_preflight structure -- the pre-existing DescribeCluster/ACTIVE/ARN/OIDC checks remain intact, kubectl availability/aws eks update-kubeconfig reuse the exact already-live-proven Argo preflight pattern (EKS_DEPLOY_ROLE_ARN for both --role-arn and --assume-role-arn), a read-only Kubernetes API request is added, and no mutation command (kubectl apply/create/patch/delete, helm install/upgrade, terraform apply) is present anywhere in this job. F: final_validation directly needs eks_oidc_preflight/managed_efs_deletion_guard/storage_transition_guard/managed_efs_inventory_guard/terraform_sync_once, and its gate step's RESULT_ env + require_success/allow_non_failure calls expose each of their results into the mode-aware contract. H: the workflow_dispatch deployment_id input description accurately describes environment-wide convergence of all enabled runtimes, never "without selected runtime mutation". I: the orchestrator summary concisely reflects EKS/OIDC/Kubernetes prerequisites, storage safety, Terraform, Argo CD, platform/observability, runtime, monitor/E2E, and final validation.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  STRUCTURAL_PREREQ_CHECK="$(python3 -c '
+import yaml
+
+with open("'"$EKS_APP_WORKFLOW"'") as f:
+    doc = yaml.safe_load(f)
+jobs = doc["jobs"]
+results = []
+
+# E.
+preflight = jobs["eks_oidc_preflight"]
+preflight_run_text = "\n".join(s.get("run", "") for s in preflight.get("steps", []) if isinstance(s.get("run"), str))
+for fragment, label in (
+    ("cluster.get(\"status\") != \"ACTIVE\"", "cluster status == ACTIVE check"),
+    ("cluster.get(\"arn\") != expected_arn", "cluster ARN match check"),
+    ("live_oidc_issuer != expected_oidc_issuer", "live EKS OIDC issuer match check"),
+    ("aws eks describe-cluster", "DescribeCluster call"),
+    ("command -v kubectl", "kubectl availability check"),
+    ("aws eks update-kubeconfig", "aws eks update-kubeconfig call"),
+    ("--role-arn \"${EKS_DEPLOY_ROLE_ARN}\"", "update-kubeconfig --role-arn EKS_DEPLOY_ROLE_ARN"),
+    ("--assume-role-arn \"${EKS_DEPLOY_ROLE_ARN}\"", "update-kubeconfig --assume-role-arn EKS_DEPLOY_ROLE_ARN"),
+    ("kubectl get namespace kube-system -o name", "read-only Kubernetes API access check (kube-system, never a GoldenGate namespace)"),
+):
+    results.append((f"E: eks_oidc_preflight retains/adds {label}", fragment in preflight_run_text))
+
+# Comment lines legitimately quote "kubectl apply/create/patch/delete" in prose (this job explanatory comment about what it never does) -- excluded here exactly like the established grep -vE convention (comment-line exclusion) elsewhere in this suite, so the forbidden-command check only inspects actual executable text.
+preflight_code_lines = "\n".join(line for line in preflight_run_text.splitlines() if not line.strip().startswith("#"))
+for forbidden in ("kubectl apply", "kubectl create", "kubectl patch", "kubectl delete", "helm install", "helm upgrade", "terraform apply"):
+    results.append((f"E: eks_oidc_preflight never issues {forbidden!r}", forbidden not in preflight_code_lines))
+
+# F.
+final_val = jobs["final_validation"]
+final_val_needs = final_val.get("needs") or []
+gate_step = next((s for s in final_val.get("steps", []) if s.get("name") == "Validate the mode-aware final DEPLOY success contract"), None)
+gate_run = (gate_step or {}).get("run", "")
+gate_env = (gate_step or {}).get("env") or {}
+for extra_job in ("eks_oidc_preflight", "managed_efs_deletion_guard", "storage_transition_guard", "managed_efs_inventory_guard", "terraform_sync_once"):
+    results.append((f"F: final_validation needs {extra_job} directly", extra_job in final_val_needs))
+    results.append((f"F: final_validation gate step exposes RESULT_{extra_job}", f"RESULT_{extra_job}" in gate_env))
+results.append(("F: final_validation gate step requires success for managed_efs_deletion_guard unconditionally (foundational, every mode)", "require_success managed_efs_deletion_guard" in gate_run))
+results.append(("F: final_validation gate step requires success for storage_transition_guard unconditionally (foundational, every mode)", "require_success storage_transition_guard" in gate_run))
+results.append(("F: final_validation gate step requires success for eks_oidc_preflight/managed_efs_inventory_guard/terraform_sync_once on a REAL DEPLOY", all(f"require_success {j}" in gate_run for j in ("eks_oidc_preflight", "managed_efs_inventory_guard", "terraform_sync_once"))))
+results.append(("F: final_validation gate step allows eks_oidc_preflight/managed_efs_inventory_guard/terraform_sync_once to be legitimately skipped in Validate mode", all(f"allow_non_failure {j}" in gate_run for j in ("eks_oidc_preflight", "managed_efs_inventory_guard", "terraform_sync_once"))))
+# The diagnostic ordering claim is about the two DECISION points (the EKS-prerequisite fail-closed check vs. the HAS_CHANGES literal-value check), never the first informational echo line (which harmlessly logs ${HAS_CHANGES} for visibility before either decision point is reached).
+eks_check_pos = gate_run.find("$RESULT_eks_oidc_preflight\x22 != \x22success\x22")
+has_changes_check_pos = gate_run.find("\x22$HAS_CHANGES\x22 != \x22true\x22")
+results.append(("F: final_validation gate step checks the EKS prerequisite before relying on HAS_CHANGES/HAS_DELETIONS (diagnostic ordering)", eks_check_pos != -1 and has_changes_check_pos != -1 and eks_check_pos < has_changes_check_pos))
+results.append(("F: final_validation gate step names the EKS prerequisite explicitly on failure (never a misleading empty-has_changes message as the root cause)", "required prerequisite \x27eks_oidc_preflight\x27" in gate_run))
+
+# H. PyYAML parses the bare top-level "on:" key as the boolean True (YAML 1.1), never the string "on" -- the same doc.get(True, doc.get("on", {})) fallback already used elsewhere in this suite.
+on_block = doc.get(True, doc.get("on", {}))
+deployment_id_desc = (on_block.get("workflow_dispatch") or {}).get("inputs", {}).get("deployment_id", {}).get("description", "")
+results.append(("H: deployment_id description describes environment-wide convergence of all enabled runtimes", "converge" in deployment_id_desc.lower() and "environment" in deployment_id_desc.lower()))
+results.append(("H: deployment_id description no longer claims blank means \x27without selected runtime mutation\x27", "without selected runtime mutation" not in deployment_id_desc))
+
+# I.
+summary_step = next((s for s in final_val.get("steps", []) if s.get("name") == "Orchestrator summary"), None)
+summary_run = (summary_step or {}).get("run", "")
+for fragment in ("EKS/OIDC/Kubernetes", "Storage Safety", "Terraform", "Argo CD", "Platform", "Observability", "Shared Secrets", "Runtime Reconciliation", "Replication", "Shared Monitor", "E2E", "Final Validation"):
+    results.append((f"I: orchestrator summary mentions {fragment!r}", fragment in summary_run))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+' 2>&1)"
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL\ *) fail "MAIN prerequisite fail-fast: ${line#FAIL }" ;;
+      OK\ *) pass "MAIN prerequisite fail-fast: ${line#OK }" ;;
+    esac
+  done <<< "$STRUCTURAL_PREREQ_CHECK"
+else
+  skip "MAIN prerequisite fail-fast: structural proofs -- python3/PyYAML unavailable or main workflow missing"
+fi
+
+echo ""
 echo "--- Phase B3B closeout: mode-aware final DEPLOY success contract (final_validation actually executed) ---"
 
 # Unlike the JOB_ORDER if:-expression simulator above (which cannot express the bash program logic now living inside final_validation's own step), this extracts and REALLY EXECUTES the committed "Validate the mode-aware final DEPLOY success contract" script via bash for each required scenario -- genuine proof of behavior, never a re-implementation of the same logic inside this test suite.
@@ -15449,7 +15767,8 @@ if gate_step is None:
 script = gate_step["run"]
 
 ALL_RESULT_JOBS = (
-    "detect_changed_deployments",
+    # MAIN prerequisite fail-fast hardening: eks_oidc_preflight/managed_efs_deletion_guard/storage_transition_guard/managed_efs_inventory_guard/terraform_sync_once are now direct needs of final_validation, each with its own RESULT_ env reference in the real script -- must be present here so every run_gate() call below always binds them (the script's own set -u would otherwise abort on an unset variable for any scenario that does not explicitly override one of these five).
+    "eks_oidc_preflight", "detect_changed_deployments", "managed_efs_deletion_guard", "storage_transition_guard", "managed_efs_inventory_guard", "terraform_sync_once",
     "validate_shared_secrets_once", "validate_argocd_ready", "validate_platform_ready", "validate_observability_ready",
     "runtime_ownership_preflight", "build_publish_and_deploy", "delete_removed_argocd_applications",
     "validate_active_runtimes", "replication_reconcile_once", "replication_dry_run_validation",
@@ -15565,6 +15884,45 @@ check("FREEZE: manual deploy=false validation (has_changes=true) -> ownership pr
 proc = run_gate("false", "false", {"detect_changed_deployments": "failure"})
 check("FREEZE: detect_changed_deployments=failure fails the gate", proc.returncode != 0, proc)
 
+# MAIN prerequisite fail-fast hardening (G): REAL DEPLOY + eks_oidc_preflight failure/cancelled, with detect_changed_deployments and every downstream storage/Terraform guard legitimately skipped as a CONSEQUENCE -- the gate must fail for the EKS prerequisite root cause itself, and must never primarily report the misleading "detect_changed_deployments.outputs.has_changes is '', expected literal..." diagnostic (HAS_CHANGES/HAS_DELETIONS are deliberately left empty here, exactly as a real skipped detect_changed_deployments would produce them).
+for eks_result in ("failure", "cancelled"):
+    proc = run_gate("true", "false", {
+        "eks_oidc_preflight": eks_result, "detect_changed_deployments": "skipped",
+        "managed_efs_deletion_guard": "skipped", "storage_transition_guard": "skipped",
+        "managed_efs_inventory_guard": "skipped", "terraform_sync_once": "skipped",
+    }, has_changes="", has_deletions="")
+    check(f"G: REAL DEPLOY + eks_oidc_preflight={eks_result} -> final gate fails", proc.returncode != 0, proc)
+    check(f"G: REAL DEPLOY + eks_oidc_preflight={eks_result} -> failure diagnostic explicitly names the EKS prerequisite root cause", "required prerequisite 'eks_oidc_preflight'" in proc.stdout, proc)
+    check(f"G: REAL DEPLOY + eks_oidc_preflight={eks_result} -> the misleading empty-has_changes diagnostic is never the reported cause", "detect_changed_deployments.outputs.has_changes is ''" not in proc.stdout, proc)
+
+# G: REAL DEPLOY + every foundation gate (including the five new direct needs) succeeds, with active runtimes -> the existing successful Deploy contract remains valid, unchanged by this fix.
+proc = run_gate("true", "true", {}, has_changes="true", has_deletions="false")
+check("G: REAL DEPLOY + all foundation/runtime/monitor gates succeed -> final gate succeeds", proc.returncode == 0, proc)
+
+# G: VALIDATE mode + eks_oidc_preflight/managed_efs_inventory_guard/terraform_sync_once legitimately skipped -> the gate accepts these as intentionally non-applicable while still requiring the local validation chain (managed_efs_deletion_guard/storage_transition_guard/detect_changed_deployments) to succeed.
+proc = run_gate("false", "false", {
+    "eks_oidc_preflight": "skipped", "managed_efs_inventory_guard": "skipped", "terraform_sync_once": "skipped",
+    "validate_argocd_ready": "skipped", "validate_platform_ready": "skipped", "validate_observability_ready": "skipped",
+    "runtime_ownership_preflight": "skipped", "delete_removed_argocd_applications": "skipped",
+    "validate_active_runtimes": "skipped", "replication_reconcile_once": "skipped",
+    "monitor_ownership_preflight": "skipped", "monitor_sync_once": "skipped",
+    "validate_monitor_ready": "skipped", "replication_monitor_acceptance": "skipped",
+    "end_to_end_deployment_acceptance": "skipped",
+})
+check("G: VALIDATE mode + eks_oidc_preflight/managed_efs_inventory_guard/terraform_sync_once legitimately skipped -> final gate succeeds", proc.returncode == 0, proc)
+
+# G: managed_efs_deletion_guard/storage_transition_guard are foundational (required in every mode, unlike eks_oidc_preflight/managed_efs_inventory_guard/terraform_sync_once) -- a genuine failure of either must block the gate even in Validate mode.
+proc = run_gate("false", "false", {"managed_efs_deletion_guard": "failure"})
+check("G: VALIDATE mode + managed_efs_deletion_guard=failure fails the gate (foundational, required in every mode)", proc.returncode != 0, proc)
+proc = run_gate("false", "false", {"storage_transition_guard": "failure"})
+check("G: VALIDATE mode + storage_transition_guard=failure fails the gate (foundational, required in every mode)", proc.returncode != 0, proc)
+
+# G: REAL DEPLOY + managed_efs_inventory_guard or terraform_sync_once unexpectedly skipped (should never legitimately happen once eks_oidc_preflight succeeds, but must still fail closed) -> FAIL.
+proc = run_gate("true", "false", {"managed_efs_inventory_guard": "skipped"}, has_changes="false", has_deletions="false")
+check("G: REAL DEPLOY + managed_efs_inventory_guard unexpectedly skipped fails the gate", proc.returncode != 0, proc)
+proc = run_gate("true", "false", {"terraform_sync_once": "skipped"}, has_changes="false", has_deletions="false")
+check("G: REAL DEPLOY + terraform_sync_once unexpectedly skipped fails the gate", proc.returncode != 0, proc)
+
 if failures:
     print("\n".join(failures))
     sys.exit(1)
@@ -15592,6 +15950,12 @@ PYEOF
     pass "FINAL DEPLOY freeze: manual Deploy (has_changes=true, has_deletions=false) with everything applicable succeeding -> gate succeeds"
     pass "FINAL DEPLOY freeze: manual deploy=false validation (has_changes=true) -> ownership preflight may skip, build/lint/render still required -> gate succeeds"
     pass "FINAL DEPLOY freeze: detect_changed_deployments=failure fails the gate"
+    pass "MAIN prerequisite fail-fast (G): REAL DEPLOY + eks_oidc_preflight=failure -> final gate fails for the EKS prerequisite root cause, never the misleading empty-has_changes diagnostic"
+    pass "MAIN prerequisite fail-fast (G): REAL DEPLOY + eks_oidc_preflight=cancelled -> final gate fails for the same EKS prerequisite root cause"
+    pass "MAIN prerequisite fail-fast (G): REAL DEPLOY + all foundation/runtime/monitor gates succeed -> final gate succeeds (existing successful Deploy contract unchanged)"
+    pass "MAIN prerequisite fail-fast (G): VALIDATE mode + eks_oidc_preflight/managed_efs_inventory_guard/terraform_sync_once legitimately skipped -> final gate succeeds"
+    pass "MAIN prerequisite fail-fast (G): VALIDATE mode + managed_efs_deletion_guard/storage_transition_guard failure still fails the gate (foundational, required in every mode)"
+    pass "MAIN prerequisite fail-fast (G): REAL DEPLOY + managed_efs_inventory_guard/terraform_sync_once unexpectedly skipped fails the gate"
   else
     fail "Phase B3B closeout final-gate execution proof failed:"$'\n'"${PHASE_B3B_FINAL_GATE_OUT}"
   fi

@@ -24,7 +24,7 @@ on:
           - deploy
 
       deployment_id:
-        description: "Optional GoldenGate runtime deployment ID. Leave blank for an environment-wide run without selected runtime mutation."
+        description: "Optional GoldenGate runtime deployment ID. Leave blank to converge the complete selected environment and all enabled GoldenGate runtimes."
         required: false
         type: string
         default: ""
@@ -292,9 +292,9 @@ jobs:
           fi
 
   eks_oidc_preflight:
-    name: Verify live EKS cluster + OIDC issuer match the selected environment's environment.yaml (read-only)
+    name: Verify live EKS cluster + OIDC + Kubernetes API access (read-only)
 
-    # Read-only DescribeCluster preflight only -- never creates/modifies EKS, the IAM OIDC provider, or any AWS resource. Skipped for deploy=false (a purely local/offline validation run) so an existing intentionally-offline dry-run path never starts requiring live AWS access. This is the critical safety gate for cluster recreation: a recreated EKS cluster keeps the SAME name but gets a DIFFERENT OIDC issuer, and every generated IRSA trust policy in envs/<environment>/policies/** is only valid for the issuer envs/<environment>/environment.yaml declares -- so this must run, and must succeed, before Terraform (which owns applying those trust policies) or any deployment can proceed.
+    # Read-only DescribeCluster + Kubernetes API connectivity preflight only -- never creates/modifies EKS, the IAM OIDC provider, or any AWS/Kubernetes resource. Skipped for deploy=false (a purely local/offline validation run) so an existing intentionally-offline dry-run path never starts requiring live AWS/Kubernetes access. This is the critical safety gate for cluster recreation: a recreated EKS cluster keeps the SAME name but gets a DIFFERENT OIDC issuer, and every generated IRSA trust policy in envs/<environment>/policies/** is only valid for the issuer envs/<environment>/environment.yaml declares -- so this must run, and must succeed, before Terraform (which owns applying those trust policies) or any deployment can proceed. MAIN prerequisite fail-fast hardening: this job also proves the pipeline can actually authenticate to and read from the live Kubernetes API -- not merely that EKS itself is ACTIVE -- since the first real kubectl connectivity previously happened much later, inside the Argo path, after Terraform and local deployment detection had already run. IAM OIDC-provider EXISTENCE is deliberately NOT checked here: Terraform continues to independently validate that (its own data source / fail-closed configuration) -- adding that check to this pre-Terraform preflight would require a new IAM permission on the same Terraform-managed role and create a bootstrap dependency on the first run of this change.
     needs:
       - validate_model
     if: ${{ needs.validate_model.outputs.effective_deploy == 'true' }}
@@ -380,6 +380,59 @@ jobs:
               sys.exit(1)
           print(f"OK: live EKS cluster {cluster.get('name')!r} is ACTIVE, ARN and OIDC issuer match {environment_yaml_path}.")
           PYEOF
+
+      - name: Install kubectl if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking/installing kubectl..."
+
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KUBECTL_VERSION="v1.35.0"
+
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64)
+                KUBECTL_ARCH="amd64"
+                ;;
+              aarch64|arm64)
+                KUBECTL_ARCH="arm64"
+                ;;
+              *)
+                echo "Unsupported architecture for kubectl: $ARCH"
+                exit 1
+                ;;
+            esac
+
+            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+            sudo chmod +x /usr/local/bin/kubectl
+          fi
+
+          kubectl version --client=true
+
+      - name: Connect to EKS cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}" \
+            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
+            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
+
+          echo "Current kube context:"
+          kubectl config current-context
+
+      - name: Verify read-only Kubernetes API access (no GoldenGate namespace dependency)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # kube-system is a built-in namespace guaranteed to exist on every EKS cluster -- unlike any GoldenGate-owned namespace, which may legitimately not exist yet ahead of a first application deployment. A single read-only `get` proves API connectivity plus sufficient authentication/authorization for the role this pipeline actually deploys with; no kubectl apply/create/patch/delete or any other mutation is ever issued from this preflight.
+          kubectl get namespace kube-system -o name
 
   terraform_sync_once:
     name: Synchronize Terraform (once per environment)
@@ -1194,9 +1247,11 @@ jobs:
   detect_changed_deployments:
     name: Detect changed GoldenGate deployments
 
+    # MAIN prerequisite fail-fast hardening: for a real Deploy (effective_deploy=='true'), local deployment/storage detection must never run ahead of -- or in parallel with -- proof that the live EKS cluster and its Kubernetes API are actually reachable, since a downstream storage/Terraform mutation path must not do unnecessary work once that prerequisite has failed. eks_oidc_preflight is legitimately skipped in Validate/offline mode (effective_deploy=='false'), so a plain needs.eks_oidc_preflight.result == 'success' would incorrectly block local validation in that mode -- always() plus this explicit mode-aware branch is what keeps deploy=false fully offline while still fail-fasting a real Deploy on a failed/cancelled/unexpectedly-skipped EKS prerequisite.
     needs:
       - validate_model
-    if: success()
+      - eks_oidc_preflight
+    if: ${{ always() && needs.validate_model.result == 'success' && (needs.validate_model.outputs.effective_deploy != 'true' || needs.eks_oidc_preflight.result == 'success') }}
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -1341,10 +1396,12 @@ jobs:
     # Persistent safety net beyond the Git-diff-only guards above: if a managed descriptor's physical removal or an unsafe storage-mode transition somehow still reaches this point on a later, unrelated commit (where the change is no longer visible in that commit's own diff), this job independently re-derives the CURRENT expected managed-EFS inventory from the deployment model and compares it against what AWS actually has tagged as GoldenGate-managed in this environment, failing closed on any orphan (or creation-token collision) before terraform_sync_once can observe (and potentially destroy) it. Strictly read-only: a single DescribeFileSystems call only (its FileSystemDescription already carries CreationToken/LifeCycleState/Tags, so list-tags-for-resource is never called), never create/update/delete.
     needs:
       - validate_model
+      - eks_oidc_preflight
       - detect_changed_deployments
       - managed_efs_deletion_guard
       - storage_transition_guard
-    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.detect_changed_deployments.result == 'success' && needs.managed_efs_deletion_guard.result == 'success' && needs.storage_transition_guard.result == 'success' }}
+    # MAIN prerequisite fail-fast hardening: eks_oidc_preflight is now a direct, explicitly-checked dependency (not merely relied on transitively via detect_changed_deployments) -- the live EKS/OIDC/Kubernetes-API prerequisite is the entry gate to every real-Deploy AWS-side check, this one included.
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.eks_oidc_preflight.result == 'success' && needs.detect_changed_deployments.result == 'success' && needs.managed_efs_deletion_guard.result == 'success' && needs.storage_transition_guard.result == 'success' }}
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -4579,7 +4636,12 @@ jobs:
 
     needs:
       - validate_model
+      - eks_oidc_preflight
       - detect_changed_deployments
+      - managed_efs_deletion_guard
+      - storage_transition_guard
+      - managed_efs_inventory_guard
+      - terraform_sync_once
       - validate_shared_secrets_once
       - validate_argocd_ready
       - validate_platform_ready
@@ -4596,7 +4658,7 @@ jobs:
       - validate_monitor_ready
       - replication_monitor_acceptance
       - end_to_end_deployment_acceptance
-    # Phase B3B closeout: final_validation now ALWAYS runs (never itself conditionally skipped by GitHub's default implicit "all needs succeeded" behavior) so it can fail CLOSED -- with useful diagnostics -- when a REQUIRED job was unexpectedly skipped, rather than the job itself silently disappearing. The prior single "!= failure && != cancelled" expression here let a SKIPPED required gate through undetected (skipped is neither failure nor cancelled); the actual mode-aware pass/fail contract now lives entirely in the "Validate the mode-aware final DEPLOY success contract" step below -- one small, explicit, readable branch per resolved mode, never one giant accidental-truth if: expression. Final DEPLOY freeze closeout: detect_changed_deployments is added here directly (never merely relied on transitively) so its own has_changes/has_deletions applicability outputs -- and its own result -- can gate the selected-mutation dimension of this same contract.
+    # Phase B3B closeout: final_validation now ALWAYS runs (never itself conditionally skipped by GitHub's default implicit "all needs succeeded" behavior) so it can fail CLOSED -- with useful diagnostics -- when a REQUIRED job was unexpectedly skipped, rather than the job itself silently disappearing. The prior single "!= failure && != cancelled" expression here let a SKIPPED required gate through undetected (skipped is neither failure nor cancelled); the actual mode-aware pass/fail contract now lives entirely in the "Validate the mode-aware final DEPLOY success contract" step below -- one small, explicit, readable branch per resolved mode, never one giant accidental-truth if: expression. Final DEPLOY freeze closeout: detect_changed_deployments is added here directly (never merely relied on transitively) so its own has_changes/has_deletions applicability outputs -- and its own result -- can gate the selected-mutation dimension of this same contract. MAIN prerequisite fail-fast hardening: eks_oidc_preflight, managed_efs_deletion_guard, storage_transition_guard, managed_efs_inventory_guard, and terraform_sync_once are now also added here directly (never merely relied on transitively through detect_changed_deployments/argocd_preflight) so this gate can distinguish a genuine EKS/storage/Terraform prerequisite failure from a merely-empty downstream applicability output.
     if: always()
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -4613,7 +4675,12 @@ jobs:
           HAS_ACTIVE_DEPLOYMENTS: ${{ needs.validate_model.outputs.has_active_deployments }}
           HAS_CHANGES: ${{ needs.detect_changed_deployments.outputs.has_changes }}
           HAS_DELETIONS: ${{ needs.detect_changed_deployments.outputs.has_deletions }}
+          RESULT_eks_oidc_preflight: ${{ needs.eks_oidc_preflight.result }}
           RESULT_detect_changed_deployments: ${{ needs.detect_changed_deployments.result }}
+          RESULT_managed_efs_deletion_guard: ${{ needs.managed_efs_deletion_guard.result }}
+          RESULT_storage_transition_guard: ${{ needs.storage_transition_guard.result }}
+          RESULT_managed_efs_inventory_guard: ${{ needs.managed_efs_inventory_guard.result }}
+          RESULT_terraform_sync_once: ${{ needs.terraform_sync_once.result }}
           RESULT_validate_shared_secrets_once: ${{ needs.validate_shared_secrets_once.result }}
           RESULT_validate_argocd_ready: ${{ needs.validate_argocd_ready.result }}
           RESULT_validate_platform_ready: ${{ needs.validate_platform_ready.result }}
@@ -4638,6 +4705,12 @@ jobs:
           # Every boolean mode/applicability output this gate branches on must be a literal 'true' or 'false' -- empty, null, or unexpected text means the producing job did not resolve a usable outcome, and this gate can never guess which branch of the contract applies. Checked up front, before any require_success/allow_non_failure call, since an unresolved guard makes the rest of this script's branching meaningless.
           if [ "$EFFECTIVE_DEPLOY" != "true" ] && [ "$EFFECTIVE_DEPLOY" != "false" ]; then
             echo "FAIL: validate_model.outputs.effective_deploy is '${EFFECTIVE_DEPLOY}', expected literal 'true' or 'false' -- validate_model itself did not produce a usable outcome, so MAIN cannot resolve which mode-aware contract applies."
+            exit 1
+          fi
+
+          # CRITICAL DIAGNOSTIC ORDERING: on a real Deploy, eks_oidc_preflight is the entry gate to detect_changed_deployments (and therefore to storage/Terraform/Argo/runtime/monitor mutation). A failed/cancelled/unexpectedly-skipped EKS prerequisite makes detect_changed_deployments -- and its has_changes/has_deletions outputs -- legitimately skip/empty as a CONSEQUENCE, not a separate root cause. This check runs before any HAS_CHANGES/HAS_DELETIONS literal check below specifically so a real EKS/OIDC/Kubernetes-API failure is reported as itself, never masked behind a misleading "detect_changed_deployments.outputs.has_changes is '', expected literal..." message.
+          if [ "$EFFECTIVE_DEPLOY" = "true" ] && [ "$RESULT_eks_oidc_preflight" != "success" ]; then
+            echo "FAIL: required prerequisite 'eks_oidc_preflight' has result '${RESULT_eks_oidc_preflight}'; deployment detection and all mutation stages are blocked."
             exit 1
           fi
 
@@ -4682,9 +4755,11 @@ jobs:
             fi
           }
 
-          # Foundational -- required in every mode.
+          # Foundational -- required in every mode. managed_efs_deletion_guard/storage_transition_guard run in both modes (they only need detect_changed_deployments to have succeeded, which is true for both a real Deploy with a successful eks_oidc_preflight and a Validate/offline run).
           require_success validate_shared_secrets_once
           require_success detect_changed_deployments
+          require_success managed_efs_deletion_guard
+          require_success storage_transition_guard
 
           # Mutation-aware contract: applicability of the selected-deployment build/reconcile, ownership preflight, and deletion stages is already known from detect_changed_deployments' own outputs -- never inferred only from other jobs' transitive downstream behavior. has_changes/has_deletions are orthogonal to the effective_deploy/has_active_deployments mode contract below.
           if [ "$HAS_CHANGES" = "true" ]; then
@@ -4710,7 +4785,11 @@ jobs:
           fi
 
           if [ "$EFFECTIVE_DEPLOY" = "true" ]; then
-            echo "REAL DEPLOY: Argo CD / Platform / Observability readiness are unconditionally required."
+            # Already fail-closed above (the CRITICAL DIAGNOSTIC ORDERING check) if eks_oidc_preflight did not succeed -- checked again here, purely for readability/defense-in-depth, matching the established require_success-per-gate style the rest of this contract already uses.
+            echo "REAL DEPLOY: EKS/OIDC/Kubernetes-API prerequisite, Terraform, live EFS inventory, and Argo CD / Platform / Observability readiness are unconditionally required."
+            require_success eks_oidc_preflight
+            require_success managed_efs_inventory_guard
+            require_success terraform_sync_once
             require_success validate_argocd_ready
             require_success validate_platform_ready
             require_success validate_observability_ready
@@ -4735,7 +4814,10 @@ jobs:
               allow_non_failure end_to_end_deployment_acceptance
             fi
           else
-            echo "DRY RUN: live Argo CD / Platform / Observability / runtime / monitor deployment gates are legitimately skipped -- the existing dry-run validation path governs success instead."
+            echo "DRY RUN: live EKS/OIDC/Kubernetes-API prerequisite, Terraform, live EFS inventory, and Argo CD / Platform / Observability / runtime / monitor deployment gates are legitimately skipped -- the existing dry-run validation path governs success instead."
+            allow_non_failure eks_oidc_preflight
+            allow_non_failure managed_efs_inventory_guard
+            allow_non_failure terraform_sync_once
             allow_non_failure validate_argocd_ready
             allow_non_failure validate_platform_ready
             allow_non_failure validate_observability_ready
@@ -4788,7 +4870,7 @@ jobs:
           {
             echo "### GoldenGate onboarding orchestrator summary"
             echo ""
-            echo "validate-model -> terraform-sync-once -> platform-sync-once -> validate-shared-secrets-once -> runtime-deployment -> replication-reconcile-once -> monitor-ownership-preflight -> monitor-sync-once (or monitor-dry-run-validation) -> validate-monitor-ready -> replication-monitor-acceptance -> end-to-end-deployment-acceptance -> final-validation"
+            echo "Model & Environment Validation -> EKS/OIDC/Kubernetes Prerequisites -> Deployment & Storage Safety -> Terraform Prerequisites -> Argo CD Reconciliation & Acceptance -> Platform + Observability -> Shared Secrets -> Runtime Reconciliation & Acceptance -> Replication Reconciliation -> Shared Monitor Reconciliation & Acceptance -> Monitor-to-Runtime E2E Acceptance -> Final Validation"
             echo ""
             echo "All required stages completed successfully."
           } >> "$GITHUB_STEP_SUMMARY"
