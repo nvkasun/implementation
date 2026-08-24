@@ -402,6 +402,77 @@ class BuildStatusPayloadTests(unittest.TestCase):
             self.assertEqual(runtimes_by_pipeline[pipeline_id], len(roles))
 
 
+class RuntimeConsoleUrlTopologyTests(unittest.TestCase):
+    """"Open GoldenGate UI" data path: config.load_deployments()'s ingressEnabled/consoleUrl derivation, proven against the REAL generated registry (hack/goldengate-deployment-model.py), never a handwritten duplicate hostname rule."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.doc = cfgmod.load_deployments(_stage_generated_registry_dir())
+        cls.by_name = {d["name"]: d for d in cls.doc["deployments"]}
+
+    def test_real_postgresql_and_mssql_runtimes_have_ingress_enabled_and_distinct_console_urls(self):
+        pg = self.by_name["gg-postgresql-repltest-01"]
+        mssql = self.by_name["gg-mssql-repltest-01"]
+        self.assertTrue(pg["ingressEnabled"])
+        self.assertTrue(mssql["ingressEnabled"])
+        self.assertEqual(pg["consoleUrl"], f"https://gg-postgresql-repltest-01.{self.doc['dnsDomain']}/")
+        self.assertEqual(mssql["consoleUrl"], f"https://gg-mssql-repltest-01.{self.doc['dnsDomain']}/")
+        self.assertNotEqual(pg["consoleUrl"], mssql["consoleUrl"])
+
+    def test_console_url_uses_the_same_hostname_as_the_pre_existing_tlsServerName_convention(self):
+        # config.py's own pre-existing _tls_server_name() convention -- never a second, independently invented rule.
+        for entry in self.doc["deployments"]:
+            self.assertTrue(entry["consoleUrl"].startswith(f"https://{entry['tlsServerName']}/"))
+
+    def test_no_deployment_hostname_or_domain_literal_hardcoded_in_ui_module(self):
+        ui_source = inspect.getsource(ui)
+        for literal in (self.doc["dnsDomain"], "gg-postgresql-repltest-01", "gg-mssql-repltest-01"):
+            self.assertNotIn(literal, ui_source)
+
+    def test_no_deployment_hostname_or_domain_literal_in_monitor_image_build_files(self):
+        # Generic image contract: the monitor image must remain environment-independent -- no deployment hostname/domain is ever baked into the Docker build.
+        dockerfile_path = os.path.join(REPO_ROOT, "monitoring", "monitor", "Dockerfile")
+        with open(dockerfile_path) as f:
+            dockerfile_text = f.read()
+        for literal in (self.doc["dnsDomain"], "gg-postgresql-repltest-01", "gg-mssql-repltest-01"):
+            self.assertNotIn(literal, dockerfile_text)
+
+    def test_ingress_disabled_yields_no_console_url(self):
+        doc = {
+            "environment": "dev", "runtimeNamespace": "goldengate-dev", "monitoringNamespace": "goldengate-monitoring",
+            "dnsDomain": "goldengate-dev.adcbmis.local", "deployments": [
+                {"name": "gg-example-01", "type": "oracle", "pipeline": "p1", "role": "source",
+                 "enabled": True, "adminSecret": "s", "ingressEnabled": False},
+            ]}
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "goldengate-deployments.yaml"), "w") as f:
+                yaml.safe_dump(doc, f)
+            loaded = cfgmod.load_deployments(d)
+        self.assertFalse(loaded["deployments"][0]["ingressEnabled"])
+        self.assertIsNone(loaded["deployments"][0]["consoleUrl"])
+
+    def test_missing_ingress_enabled_field_defaults_to_no_link_never_crashes(self):
+        # Backward compatibility: an older-shaped registry document (pre-dating this field) must never crash startup and must never fabricate a link.
+        doc = {
+            "environment": "dev", "runtimeNamespace": "goldengate-dev", "monitoringNamespace": "goldengate-monitoring",
+            "dnsDomain": "goldengate-dev.adcbmis.local", "deployments": [
+                {"name": "gg-example-01", "type": "oracle", "pipeline": "p1", "role": "source",
+                 "enabled": True, "adminSecret": "s"},
+            ]}
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "goldengate-deployments.yaml"), "w") as f:
+                yaml.safe_dump(doc, f)
+            loaded = cfgmod.load_deployments(d)
+        self.assertIsNone(loaded["deployments"][0]["consoleUrl"])
+
+    def test_invalid_name_or_dns_domain_never_produces_a_console_url(self):
+        self.assertIsNone(cfgmod._console_url("gg-example-01", "not a domain"))
+        self.assertIsNone(cfgmod._console_url("gg-example-01", "javascript:alert(1)"))
+        self.assertIsNone(cfgmod._console_url("gg example 01", "goldengate-dev.adcbmis.local"))
+        self.assertIsNone(cfgmod._console_url("", "goldengate-dev.adcbmis.local"))
+        self.assertIsNone(cfgmod._console_url("gg-example-01", ""))
+
+
 class DecimalConversionTests(unittest.TestCase):
     def test_integral_decimal_becomes_int(self):
         self.assertEqual(monitor.decimal_to_jsonsafe(Decimal("500000")), 500000)
@@ -1112,6 +1183,88 @@ class PortalHtmlManagerParityTests(unittest.TestCase):
         self.assertNotIn(malicious_holder, rendered)
         self.assertNotIn("&amp;amp;", rendered)
         self.assertIn(html_module.escape(malicious_holder), rendered)
+
+
+class RuntimeConsoleLinkRenderTests(unittest.TestCase):
+    """Deployment-card "Open GoldenGate UI" external-link action."""
+
+    def _payload(self, console_url="https://gg-oracle-payments-01.example.local/", **overrides):
+        runtime = {
+            "role": "source", "deploymentName": "gg-oracle-payments-01", "deploymentType": "oracle",
+            "effectiveStatus": "UP", "fresh": True, "dataSource": "canonical-monitor",
+            "alertsEnabled": True, "metricsEnabled": True, "ageSeconds": 3, "recordedAt": 1780000007,
+            "lease": None, "criticalServices": {}, "processes": [], "consoleUrl": console_url,
+        }
+        runtime.update(overrides)
+        return {"generatedAt": 1780000010, "logicalPipelines": [
+            {"pipelineId": "payments-ora-to-pg-001", "runtimes": [runtime]}]}
+
+    def test_ingress_enabled_card_renders_exactly_one_external_link_with_correct_href(self):
+        rendered = monitor.render_html(self._payload(), make_config())
+        self.assertEqual(rendered.count('class="card-link-external"'), 1)
+        self.assertIn('href="https://gg-oracle-payments-01.example.local/"', rendered)
+
+    def test_link_uses_safe_new_tab_semantics(self):
+        rendered = monitor.render_html(self._payload(), make_config())
+        self.assertIn('target="_blank"', rendered)
+        self.assertIn('rel="noopener noreferrer"', rendered)
+
+    def test_link_carries_accessible_label_and_title(self):
+        rendered = monitor.render_html(self._payload(), make_config())
+        self.assertIn('aria-label="Open GoldenGate UI for gg-oracle-payments-01"', rendered)
+        self.assertIn('title="Open GoldenGate UI"', rendered)
+
+    def test_two_deployments_resolve_to_different_urls_neither_hardcoded_in_ui(self):
+        payload = self._payload(console_url="https://gg-postgresql-repltest-01.goldengate-dev.adcbmis.local/")
+        second = dict(payload["logicalPipelines"][0]["runtimes"][0])
+        second.update(deploymentName="gg-mssql-repltest-01", role="target",
+                      consoleUrl="https://gg-mssql-repltest-01.goldengate-dev.adcbmis.local/")
+        payload["logicalPipelines"][0]["runtimes"].append(second)
+        rendered = monitor.render_html(payload, make_config())
+        self.assertIn('href="https://gg-postgresql-repltest-01.goldengate-dev.adcbmis.local/"', rendered)
+        self.assertIn('href="https://gg-mssql-repltest-01.goldengate-dev.adcbmis.local/"', rendered)
+        self.assertEqual(rendered.count('class="card-link-external"'), 2)
+        self.assertNotIn("goldengate-dev.adcbmis.local", inspect.getsource(ui))
+
+    def test_ingress_disabled_fixture_renders_no_external_link(self):
+        rendered = monitor.render_html(self._payload(console_url=None), make_config())
+        self.assertNotIn('class="card-link-external"', rendered)
+
+    def test_missing_console_url_key_renders_no_link_and_does_not_crash(self):
+        payload = self._payload()
+        del payload["logicalPipelines"][0]["runtimes"][0]["consoleUrl"]
+        try:
+            rendered = monitor.render_html(payload, make_config())
+        except Exception as e:  # pragma: no cover
+            self.fail(f"render_html raised on missing consoleUrl: {e!r}")
+        self.assertNotIn('class="card-link-external"', rendered)
+
+    def test_invalid_scheme_console_url_never_rendered_as_a_clickable_href(self):
+        for malicious in ("javascript:alert(1)", "data:text/html,<script>alert(1)</script>",
+                          "http://insecure.example/"):
+            with self.subTest(malicious=malicious):
+                rendered = monitor.render_html(self._payload(console_url=malicious), make_config())
+                self.assertNotIn('class="card-link-external"', rendered)
+                self.assertNotIn(malicious, rendered)
+
+    def test_empty_string_console_url_renders_no_link(self):
+        rendered = monitor.render_html(self._payload(console_url=""), make_config())
+        self.assertNotIn('class="card-link-external"', rendered)
+
+    def test_malicious_deployment_name_in_accessible_label_is_escaped(self):
+        malicious = '"><script>alert(1)</script>'
+        rendered = monitor.render_html(self._payload(deploymentName=malicious), make_config())
+        self.assertNotIn("<script>alert(1)</script>", rendered)
+
+    def test_existing_status_and_freshness_rendering_unaffected_by_console_link(self):
+        rendered = monitor.render_html(self._payload(), make_config())
+        self.assertIn("UP", rendered)
+        self.assertIn("Fresh", rendered)
+
+    def test_card_itself_is_not_a_link_only_the_icon_is(self):
+        rendered = monitor.render_html(self._payload(), make_config())
+        self.assertIn('<article class="card">', rendered)
+        self.assertNotIn('<article class="card" href', rendered)
 
 
 def _ui_payload(**overrides):

@@ -320,6 +320,8 @@ def read_runtime_view(table, role, deployment_name, deployment_meta,
         "deploymentName": deployment_name,
         "deploymentType": deployment_type,
         "enabled": bool(deployment_meta.get("enabled", False)),
+        # "Open GoldenGate UI" portal link -- passed through verbatim from config.load_deployments() (already None whenever ingress is disabled or the canonical host is invalid); never recomputed here.
+        "consoleUrl": deployment_meta.get("consoleUrl"),
         "dataSource": data_source,
         "alertsEnabled": bool(config_item.get("alertsEnabled")) if config_item else None,
         "metricsEnabled": bool(config_item.get("metricsEnabled")) if config_item else None,

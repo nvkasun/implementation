@@ -973,6 +973,8 @@ def build_registry(environment, platform_values_path=None, monitor_values_path=N
             "role": d["role"],
             "enabled": True,
             "adminSecret": d["adminSecretName"],
+            # Monitoring portal "Open GoldenGate UI" external link: the runtime's own canonical hostname is d["deploymentId"] + this document's own top-level dnsDomain below (the SAME derivation helm/goldengate.runtimeIngressHost defaults to and build_replication_plan() already uses, never a duplicated hostname field); ingressEnabled is the one piece of information genuinely missing until now -- whether this runtime's own Ingress is actually enabled, so the monitor can decide whether to show that link at all.
+            "ingressEnabled": d["ingressEnabled"],
         }
         for d in active_sorted
     ]

@@ -17,6 +17,10 @@ DEFAULT_METRICS_PORT = 9015
 MAX_DEPLOYMENT_TYPE_LENGTH = 32
 _DEPLOYMENT_TYPE_RE = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*\Z")
 
+# Mirrors hack/goldengate-deployment-model.py's own _TOKEN_RE (deployment IDs) and hack/goldengate-environment.py's own _DNS_DOMAIN_RE (network.dnsDomain) -- re-validated here, defensively, rather than trusted blindly from the staged registry file (see _console_url below).
+_HOST_LABEL_RE = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*\Z")
+_DNS_DOMAIN_RE = re.compile(r"^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\Z")
+
 
 def is_safe_deployment_type(value):
     """Generic safe-token check, never a fixed engine allowlist; oracle/postgresql/sqlserver/mysql/distributed and future types are all accepted equally."""
@@ -96,6 +100,15 @@ def _tls_server_name(name, dns_domain):
     return f"{name}.{dns_domain}"
 
 
+def _console_url(name, dns_domain):
+    """The runtime's own canonical GoldenGate UI URL: https://<name>.<dnsDomain>/ -- the SAME hostname convention already used by _tls_server_name above, helm/goldengate's goldengate.runtimeIngressHost default, and hack/goldengate-deployment-model.py's build_replication_plan() (never a second, independently invented hostname rule); re-validates both components against the same shape every producer of this staged file already enforces before constructing anything, returning None (never a partial/fabricated URL) if either fails."""
+    if not (isinstance(name, str) and _HOST_LABEL_RE.match(name)):
+        return None
+    if not (isinstance(dns_domain, str) and _DNS_DOMAIN_RE.match(dns_domain)):
+        return None
+    return f"https://{name}.{dns_domain}/"
+
+
 def credential_paths(name, mount_root="/mnt/secrets-store"):
     """CSI-mounted credential file paths, derived from the canonical deployment name."""
     return f"{mount_root}/{name}-admin-user", f"{mount_root}/{name}-admin-password"
@@ -140,6 +153,7 @@ def load_deployments(repo_root=None):
         seen.add(name)
         if entry["role"] not in ("source", "target"):
             raise ConfigError(f"{name}: role must be 'source' or 'target', got {entry['role']!r}")
+        ingress_enabled = bool(entry.get("ingressEnabled", False))
         deployments.append({
             "name": name,
             "type": entry["type"],
@@ -151,6 +165,9 @@ def load_deployments(repo_root=None):
             "adminPort": int(entry.get("adminPort", DEFAULT_ADMIN_PORT)),
             "tlsServerName": _tls_server_name(name, dns_domain),
             "metricsPort": int(entry.get("metricsPort", DEFAULT_METRICS_PORT)),
+            # "Open GoldenGate UI" portal link -- None (never a fabricated URL) whenever the runtime's own Ingress is disabled, or the registry's name/dnsDomain fail the same safe-token/DNS-domain shape check every other consumer of this document requires.
+            "ingressEnabled": ingress_enabled,
+            "consoleUrl": _console_url(name, dns_domain) if ingress_enabled else None,
         })
 
     return {

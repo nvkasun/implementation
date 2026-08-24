@@ -10,9 +10,11 @@ deployments:
   role: target
   enabled: true
   adminSecret: dev/goldengate/target/admin
+  ingressEnabled: true
 - name: gg-postgresql-repltest-01
   type: postgresql
   pipeline: repltest-pg-to-mssql-001
   role: source
   enabled: true
   adminSecret: dev/goldengate/source/admin
+  ingressEnabled: true

@@ -210,7 +210,20 @@ main { max-width: 1400px; margin: 0 auto; padding: 20px; }
   border-radius: 8px;
   padding: 14px 16px 16px;
 }
+.card-title-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
 .card-title { font-size: 1.05rem; font-weight: 700; }
+.card-link-external {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  border-radius: 4px;
+  color: var(--gg-text-muted);
+  text-decoration: none;
+}
+.card-link-external:hover { color: var(--gg-blue); background: var(--gg-gray-bg); }
 .card-chips { margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap; }
 .field-grid {
   display: grid;
@@ -433,6 +446,29 @@ def _field(label, value_html):
             f'<div class="field-value">{value_html}</div></div>')
 
 
+# Minimal inline "open in new tab" SVG (no new frontend dependency) -- aria-hidden since the surrounding <a> itself already carries the accessible name via aria-label.
+_EXTERNAL_LINK_ICON_SVG = (
+    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+    'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" '
+    'focusable="false"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6">'
+    '</path><polyline points="15 3 21 3 21 9"></polyline>'
+    '<line x1="10" y1="14" x2="21" y2="3"></line></svg>'
+)
+
+
+def _runtime_console_link_html(deployment_name, console_url):
+    """The per-card "Open GoldenGate UI" external-link action -- rendered only when the canonical topology already provides a real, https-scheme runtime URL (config.load_deployments() returns None whenever ingress is disabled or the host is invalid, and never fabricates one); the scheme is re-checked here too, defensively, so a rendered href can never become a javascript:/data:/other executable scheme even if this function is ever called with an unexpected value. The card itself never becomes a link -- only this small icon is clickable."""
+    if not (isinstance(console_url, str) and console_url.startswith("https://")):
+        return ""
+    escaped_url = html.escape(console_url, quote=True)
+    escaped_label = html.escape(f"Open GoldenGate UI for {deployment_name}", quote=True)
+    return (
+        f'<a class="card-link-external" href="{escaped_url}" target="_blank" '
+        f'rel="noopener noreferrer" aria-label="{escaped_label}" title="Open GoldenGate UI">'
+        f'{_EXTERNAL_LINK_ICON_SVG}</a>'
+    )
+
+
 def _render_process_section(processes, discovery):
     """Empty processes with a reported discovery status defer to that status's own explanation block."""
     if not processes and discovery:
@@ -509,10 +545,14 @@ def _render_deployment_card(r):
     chips = f'{_status_chip(r.get("effectiveStatus"))}{_fresh_chip(fresh)}'
     services_html = _critical_services_html(r.get("criticalServices"))
     discovery_explanation_html = _render_discovery_explanation(r.get("processDiscovery"))
+    console_link_html = _runtime_console_link_html(r.get("deploymentName"), r.get("consoleUrl"))
 
     return (
         '<article class="card">'
+        '<div class="card-title-row">'
         f'<div class="card-title">{_esc(r.get("deploymentName"))}</div>'
+        f'{console_link_html}'
+        '</div>'
         f'<div class="card-chips">{chips}</div>'
         f'<div class="field-grid">{fields}</div>'
         f'<div class="services-row"><span class="field-label">Critical services</span> {services_html}</div>'
