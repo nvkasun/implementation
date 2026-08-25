@@ -15313,27 +15313,71 @@ check("MAIN: phase_3_argocd=cancelled -> final gate fails", proc.returncode != 0
 # ===== Phase 1 own phase_contract: foundational-every-mode vs. mode-aware optional jobs =====
 p1_run_gate, _ = build_run_gate("phase_contract__01")
 
-proc = p1_run_gate({"EFFECTIVE_DEPLOY": "true"})
+# build_run_gate defaults every env key the real step declares (including the OUT_has_active_deployments/OUT_has_changes/OUT_has_deletions relay values) to the empty string before applying a scenario's own overrides -- a valid literal baseline is supplied here so every "contract succeeds" scenario below fails only for the ONE reason it is actually testing, never incidentally through an unrelated, defaulted-empty relay value.
+P1_VALID_OUTPUTS = {"OUT_has_active_deployments": "true", "OUT_has_changes": "true", "OUT_has_deletions": "false"}
+
+proc = p1_run_gate({"EFFECTIVE_DEPLOY": "true", **P1_VALID_OUTPUTS})
 check("Phase 1: DEPLOY + everything succeeds -> contract succeeds", proc.returncode == 0, proc)
 
 for eks_result in ("failure", "cancelled"):
-    proc = p1_run_gate({"EFFECTIVE_DEPLOY": "true", "RESULT_eks_oidc_preflight": eks_result})
+    proc = p1_run_gate({"EFFECTIVE_DEPLOY": "true", "RESULT_eks_oidc_preflight": eks_result, **P1_VALID_OUTPUTS})
     check(f"Phase 1: DEPLOY + eks_oidc_preflight={eks_result} -> contract fails", proc.returncode != 0, proc)
 
-proc = p1_run_gate({"EFFECTIVE_DEPLOY": "true", "RESULT_managed_efs_inventory_guard": "skipped"})
+proc = p1_run_gate({"EFFECTIVE_DEPLOY": "true", "RESULT_managed_efs_inventory_guard": "skipped", **P1_VALID_OUTPUTS})
 check("Phase 1: DEPLOY + managed_efs_inventory_guard unexpectedly skipped -> contract fails", proc.returncode != 0, proc)
 
-proc = p1_run_gate({"EFFECTIVE_DEPLOY": "false", "RESULT_eks_oidc_preflight": "skipped", "RESULT_managed_efs_inventory_guard": "skipped"})
+proc = p1_run_gate({"EFFECTIVE_DEPLOY": "false", "RESULT_eks_oidc_preflight": "skipped", "RESULT_managed_efs_inventory_guard": "skipped", **P1_VALID_OUTPUTS})
 check("Phase 1: VALIDATE + eks_oidc_preflight/managed_efs_inventory_guard legitimately skipped -> contract succeeds", proc.returncode == 0, proc)
 
-proc = p1_run_gate({"EFFECTIVE_DEPLOY": "false", "RESULT_managed_efs_deletion_guard": "failure"})
+proc = p1_run_gate({"EFFECTIVE_DEPLOY": "false", "RESULT_managed_efs_deletion_guard": "failure", **P1_VALID_OUTPUTS})
 check("Phase 1: VALIDATE + managed_efs_deletion_guard=failure -> contract fails (foundational, required in every mode)", proc.returncode != 0, proc)
-proc = p1_run_gate({"EFFECTIVE_DEPLOY": "false", "RESULT_storage_transition_guard": "failure"})
+proc = p1_run_gate({"EFFECTIVE_DEPLOY": "false", "RESULT_storage_transition_guard": "failure", **P1_VALID_OUTPUTS})
 check("Phase 1: VALIDATE + storage_transition_guard=failure -> contract fails (foundational, required in every mode)", proc.returncode != 0, proc)
-proc = p1_run_gate({"EFFECTIVE_DEPLOY": "false", "RESULT_detect_changed_deployments": "failure"})
+proc = p1_run_gate({"EFFECTIVE_DEPLOY": "false", "RESULT_detect_changed_deployments": "failure", **P1_VALID_OUTPUTS})
 check("Phase 1: VALIDATE + detect_changed_deployments=failure -> contract fails (foundational, required in every mode)", proc.returncode != 0, proc)
-proc = p1_run_gate({"EFFECTIVE_DEPLOY": "false", "RESULT_validate_model": "failure"})
+proc = p1_run_gate({"EFFECTIVE_DEPLOY": "false", "RESULT_validate_model": "failure", **P1_VALID_OUTPUTS})
 check("Phase 1: VALIDATE + validate_model=failure -> contract fails (foundational, required in every mode)", proc.returncode != 0, proc)
+
+# Fail-closed regression correction: has_active_deployments/has_changes/has_deletions must each be validated as an exact literal 'true'/'false' before crossing this phase boundary -- an empty/missing/malformed value must fail Phase 1 closed, never silently read downstream as the false/not-applicable branch.
+proc = p1_run_gate({"EFFECTIVE_DEPLOY": "true", **P1_VALID_OUTPUTS, "OUT_has_active_deployments": "true"})
+check("Phase 1: has_active_deployments=true is accepted", proc.returncode == 0, proc)
+proc = p1_run_gate({"EFFECTIVE_DEPLOY": "true", **P1_VALID_OUTPUTS, "OUT_has_active_deployments": "false"})
+check("Phase 1: has_active_deployments=false is accepted", proc.returncode == 0, proc)
+proc = p1_run_gate({"EFFECTIVE_DEPLOY": "true", **P1_VALID_OUTPUTS, "OUT_has_active_deployments": ""})
+check("Phase 1: has_active_deployments='' fails closed", proc.returncode != 0, proc)
+check("Phase 1: has_active_deployments='' failure diagnostic explicitly names validate_model.outputs.has_active_deployments", "validate_model.outputs.has_active_deployments is ''" in proc.stdout, proc)
+proc = p1_run_gate({"EFFECTIVE_DEPLOY": "true", **P1_VALID_OUTPUTS, "OUT_has_active_deployments": "invalid"})
+check("Phase 1: has_active_deployments='invalid' fails closed", proc.returncode != 0, proc)
+
+proc = p1_run_gate({"EFFECTIVE_DEPLOY": "true", **P1_VALID_OUTPUTS, "OUT_has_changes": "true"})
+check("Phase 1: has_changes=true is accepted", proc.returncode == 0, proc)
+proc = p1_run_gate({"EFFECTIVE_DEPLOY": "true", **P1_VALID_OUTPUTS, "OUT_has_changes": "false"})
+check("Phase 1: has_changes=false is accepted", proc.returncode == 0, proc)
+proc = p1_run_gate({"EFFECTIVE_DEPLOY": "true", **P1_VALID_OUTPUTS, "OUT_has_changes": ""})
+check("Phase 1: has_changes='' fails closed when detect_changed_deployments succeeded", proc.returncode != 0, proc)
+check("Phase 1: has_changes='' failure diagnostic explicitly names detect_changed_deployments.outputs.has_changes", "detect_changed_deployments.outputs.has_changes is ''" in proc.stdout, proc)
+proc = p1_run_gate({"EFFECTIVE_DEPLOY": "true", **P1_VALID_OUTPUTS, "OUT_has_changes": "invalid"})
+check("Phase 1: has_changes='invalid' fails closed when detect_changed_deployments succeeded", proc.returncode != 0, proc)
+
+proc = p1_run_gate({"EFFECTIVE_DEPLOY": "true", **P1_VALID_OUTPUTS, "OUT_has_deletions": "true"})
+check("Phase 1: has_deletions=true is accepted", proc.returncode == 0, proc)
+proc = p1_run_gate({"EFFECTIVE_DEPLOY": "true", **P1_VALID_OUTPUTS, "OUT_has_deletions": "false"})
+check("Phase 1: has_deletions=false is accepted", proc.returncode == 0, proc)
+proc = p1_run_gate({"EFFECTIVE_DEPLOY": "true", **P1_VALID_OUTPUTS, "OUT_has_deletions": ""})
+check("Phase 1: has_deletions='' fails closed when detect_changed_deployments succeeded", proc.returncode != 0, proc)
+check("Phase 1: has_deletions='' failure diagnostic explicitly names detect_changed_deployments.outputs.has_deletions", "detect_changed_deployments.outputs.has_deletions is ''" in proc.stdout, proc)
+proc = p1_run_gate({"EFFECTIVE_DEPLOY": "true", **P1_VALID_OUTPUTS, "OUT_has_deletions": "invalid"})
+check("Phase 1: has_deletions='invalid' fails closed when detect_changed_deployments succeeded", proc.returncode != 0, proc)
+
+# An eks_oidc_preflight failure on a real Deploy legitimately skips detect_changed_deployments (empty has_changes/has_deletions as a direct consequence) -- Phase 1 must still block closed AND must report the EKS prerequisite itself as the root cause, never a confusing "has_changes is ''" complaint that would make it look like an ordinary zero-change run.
+proc = p1_run_gate({
+    "EFFECTIVE_DEPLOY": "true", **P1_VALID_OUTPUTS,
+    "RESULT_eks_oidc_preflight": "failure", "RESULT_detect_changed_deployments": "skipped", "RESULT_managed_efs_inventory_guard": "skipped",
+    "OUT_has_changes": "", "OUT_has_deletions": "", "OUT_deployment_matrix": "", "OUT_deletion_matrix": "",
+})
+check("Phase 1: DEPLOY + eks_oidc_preflight failure (detect_changed_deployments legitimately skipped) -> contract fails", proc.returncode != 0, proc)
+check("Phase 1: DEPLOY + eks_oidc_preflight failure -> failure diagnostic explicitly names eks_oidc_preflight as the root cause", "required job 'eks_oidc_preflight' has result 'failure'" in proc.stdout, proc)
+check("Phase 1: DEPLOY + eks_oidc_preflight failure -> never masked as an ordinary zero-change run (no has_changes/has_deletions literal-bool complaint)", "detect_changed_deployments.outputs.has_changes is ''" not in proc.stdout and "detect_changed_deployments.outputs.has_deletions is ''" not in proc.stdout, proc)
 
 # ===== Phase 2 own phase_contract: terraform_sync_once, mode-aware =====
 p2_run_gate, _ = build_run_gate("phase_contract__02")
@@ -15404,6 +15448,7 @@ PYEOF
   if [ "$PHASE_B3B_FINAL_GATE_STATUS" -eq 0 ]; then
     pass "Phase B3B closeout: MAIN final_validation gate succeeds when all seven phases succeed, and fails (never accepting a mere skip/cancel as success) when any single phase does not conclude exact success, correctly naming which phase failed"
     pass "Phase B3B closeout: Phase 1 own phase_contract correctly distinguishes foundational-every-mode jobs (managed_efs_deletion_guard/storage_transition_guard/detect_changed_deployments/validate_model) from Deploy-only jobs (eks_oidc_preflight/managed_efs_inventory_guard)"
+    pass "Phase B3B closeout: Phase 1 own phase_contract fails closed on has_active_deployments/has_changes/has_deletions unless each is exactly the literal 'true' or 'false' (empty/malformed rejected, true/false accepted), and an eks_oidc_preflight failure on a real Deploy is still reported as that exact root cause rather than masked by the resulting empty has_changes/has_deletions"
     pass "Phase B3B closeout: Phase 2 own phase_contract requires terraform_sync_once success on Deploy and legitimately allows it to skip on Validate"
     pass "Phase B3B closeout: Phase 5 own phase_contract independently, exactly enforces the has_changes/has_deletions/has_active_deployments dimensions (the FREEZE-D..I equivalent, now at its correct phase-relocated location)"
     pass "Phase B3B closeout: Phase 7 own phase_contract reproduces scenarios A-E (end_to_end_deployment_acceptance/validate_monitor_ready/monitor_sync_once skip fails on Deploy+active; zero-active-runtime all-skip succeeds; dry-run requires monitor_dry_run_validation success whenever active runtimes exist)"

@@ -761,7 +761,26 @@ jobs:
             fi
           }
 
+          # Fail-closed regression correction: a canonical orchestration boolean relayed onward to every later phase must never cross this phase boundary as anything other than the literal string 'true' or 'false' -- an empty/missing/null/unexpected value must fail Phase 1 closed here, rather than silently reading as the false/not-applicable branch in a later phase's string comparison.
+          require_literal_bool() {
+            local name="$1"
+            local value="$2"
+
+            if [ "$value" != "true" ] && [ "$value" != "false" ]; then
+              echo "FAIL: ${name} is '${value}', expected literal 'true' or 'false'."
+              FAILED="true"
+            else
+              echo "OK: ${name} is a literal boolean ('${value}')."
+            fi
+          }
+
           require_success validate_model
+
+          # has_active_deployments is only meaningfully checkable once validate_model itself actually succeeded -- checking it against a failed validate_model would produce a second, confusing FAIL that masks the real root cause already reported above.
+          if [ "$RESULT_validate_model" = "success" ]; then
+            require_literal_bool "validate_model.outputs.has_active_deployments" "$OUT_has_active_deployments"
+          fi
+
           require_success detect_changed_deployments
           require_success managed_efs_deletion_guard
           require_success storage_transition_guard
@@ -772,6 +791,12 @@ jobs:
           else
             allow_non_failure eks_oidc_preflight
             allow_non_failure managed_efs_inventory_guard
+          fi
+
+          # has_changes/has_deletions are only meaningfully checkable once detect_changed_deployments itself actually succeeded -- on a real Deploy, an eks_oidc_preflight failure legitimately skips detect_changed_deployments (empty has_changes/has_deletions as a direct consequence), and require_success detect_changed_deployments plus the eks_oidc_preflight check above already report that exact root cause; gating this check here means an empty value from a legitimately-skipped detect_changed_deployments is never additionally, confusingly reported as its own literal-boolean failure.
+          if [ "$RESULT_detect_changed_deployments" = "success" ]; then
+            require_literal_bool "detect_changed_deployments.outputs.has_changes" "$OUT_has_changes"
+            require_literal_bool "detect_changed_deployments.outputs.has_deletions" "$OUT_has_deletions"
           fi
 
           if [ "$FAILED" = "true" ]; then
