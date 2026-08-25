@@ -1,4 +1,4 @@
-"""check-goldengate-workflow-env-scope.py: fails closed if any active GitHub Actions run: step references $GG_SELECTED_ENVIRONMENT / ${GG_SELECTED_ENVIRONMENT} without satisfying the repository-wide job-scope invariant -- a job-level env.GG_SELECTED_ENVIRONMENT binding from its canonical source (needs.validate_model.outputs.selected_environment for a normal job, matrix.environment for a matrix job), a step-level-only binding is never sufficient. validate_model itself (00-main's sole producer of the value) is the one intentional exception, checked instead for GITHUB_ENV persistence ordering."""
+"""check-goldengate-workflow-env-scope.py: fails closed if any active GitHub Actions run: step references $GG_SELECTED_ENVIRONMENT / ${GG_SELECTED_ENVIRONMENT} without satisfying the repository-wide job-scope invariant -- a job-level env.GG_SELECTED_ENVIRONMENT binding from its canonical source, a step-level-only binding is never sufficient. PHASE-ORIENTED ORCHESTRATION: 01-phase-readiness-safety.yaml's validate_model job is the ONE canonical producer (checked instead for GITHUB_ENV persistence ordering); every other non-matrix job's canonical source is needs.validate_model.outputs.selected_environment when it lives alongside validate_model in 01-phase-readiness-safety.yaml itself, inputs.selected_environment when it lives in any other 0N-phase-*.yaml (the value relayed from the preceding phase via workflow_call inputs/outputs), or needs.phase_1_readiness_safety.outputs.selected_environment for a MAIN-level (00-main-goldengate-orchestrator.yaml) job such as final_validation. A matrix job always draws its per-entry selected environment from matrix.environment, regardless of file."""
 from __future__ import annotations
 
 import glob
@@ -11,11 +11,25 @@ import yaml
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_WORKFLOW_DIR = os.path.join(REPO_ROOT, ".github", "workflows")
 MAIN_WORKFLOW_FILENAME = "00-main-goldengate-orchestrator.yaml"
+READINESS_SAFETY_PHASE_FILENAME = "01-phase-readiness-safety.yaml"
 VALIDATE_MODEL_JOB = "validate_model"
+
+# Every 0N-phase-*.yaml file participates in the same scope contract; only 01-phase-readiness-safety.yaml (the validate_model producer) and 00-main-goldengate-orchestrator.yaml (the phase-calling orchestrator) are structurally distinct.
+PHASE_WORKFLOW_FILENAMES = {
+    "01-phase-readiness-safety.yaml",
+    "02-phase-aws-prerequisites.yaml",
+    "03-phase-argocd.yaml",
+    "04-phase-platform-observability.yaml",
+    "05-phase-runtimes.yaml",
+    "06-phase-replication.yaml",
+    "07-phase-monitor-acceptance.yaml",
+}
 
 VAR_REF_RE = re.compile(r"\$\{?GG_SELECTED_ENVIRONMENT\}?")
 GITHUB_ENV_ASSIGNMENT_RE = re.compile(r"^\s*echo\s+[\"']?GG_SELECTED_ENVIRONMENT=.*>>\s*\"?\$GITHUB_ENV\"?", re.MULTILINE)
-NORMAL_EXPECTED_VALUE = "${{ needs.validate_model.outputs.selected_environment }}"
+READINESS_SAFETY_EXPECTED_VALUE = "${{ needs.validate_model.outputs.selected_environment }}"
+RELAYED_PHASE_EXPECTED_VALUE = "${{ inputs.selected_environment }}"
+MAIN_EXPECTED_VALUE = "${{ needs.phase_1_readiness_safety.outputs.selected_environment }}"
 MATRIX_EXPECTED_VALUE = "${{ matrix.environment }}"
 
 
@@ -45,7 +59,20 @@ def _check_validate_model_job(filename, job_name, job):
     return violations
 
 
-def _check_normal_job(filename, job_name, job, is_main):
+def _expected_value_for(filename, job):
+    """The canonical source expression a non-matrix job in this file must bind GG_SELECTED_ENVIRONMENT to -- None means this file's jobs are not scope-checked for an exact expression (a specialist 10/20/30/40/50-sub-*.yaml or any other non-phase workflow), only that a job-level binding exists at all."""
+    if _is_matrix_job(job):
+        return MATRIX_EXPECTED_VALUE
+    if filename == READINESS_SAFETY_PHASE_FILENAME:
+        return READINESS_SAFETY_EXPECTED_VALUE
+    if filename in PHASE_WORKFLOW_FILENAMES:
+        return RELAYED_PHASE_EXPECTED_VALUE
+    if filename == MAIN_WORKFLOW_FILENAME:
+        return MAIN_EXPECTED_VALUE
+    return None
+
+
+def _check_normal_job(filename, job_name, job):
     steps = job.get("steps") or []
     if not any(_references_var(s.get("run") or "") for s in steps):
         return []
@@ -57,10 +84,10 @@ def _check_normal_job(filename, job_name, job, is_main):
             "reason": "run: step(s) reference GG_SELECTED_ENVIRONMENT but the job defines no job-level env.GG_SELECTED_ENVIRONMENT binding (a step-level-only binding is not sufficient)",
         }]
 
-    if not is_main:
+    expected = _expected_value_for(filename, job)
+    if expected is None:
         return []
 
-    expected = MATRIX_EXPECTED_VALUE if _is_matrix_job(job) else NORMAL_EXPECTED_VALUE
     if str(binding) != expected:
         return [{
             "file": filename, "job": job_name, "step": None,
@@ -77,7 +104,7 @@ def check_workflow_file(path):
         return 0, []
 
     filename = os.path.basename(path)
-    is_main = filename == MAIN_WORKFLOW_FILENAME
+    is_readiness_safety_phase = filename == READINESS_SAFETY_PHASE_FILENAME
     jobs_with_refs = 0
     violations = []
     for job_name, job in (doc.get("jobs") or {}).items():
@@ -86,10 +113,10 @@ def check_workflow_file(path):
         steps = job.get("steps") or []
         if any(_references_var(s.get("run") or "") for s in steps):
             jobs_with_refs += 1
-        if is_main and job_name == VALIDATE_MODEL_JOB:
+        if is_readiness_safety_phase and job_name == VALIDATE_MODEL_JOB:
             violations.extend(_check_validate_model_job(filename, job_name, job))
         else:
-            violations.extend(_check_normal_job(filename, job_name, job, is_main))
+            violations.extend(_check_normal_job(filename, job_name, job))
     return jobs_with_refs, violations
 
 

@@ -19,7 +19,61 @@ MONITOR_APP_DIR="monitoring/monitor"
 MONITOR_WORKFLOW=".github/workflows/50-sub-monitor.yaml"
 METRICS_CONFIG_WORKFLOW=".github/workflows/80-ops-monitor-metrics-config.yaml"
 METRICS_CONFIG_HELPER_SCRIPT="hack/goldengate-metrics-config.py"
-EKS_APP_WORKFLOW=".github/workflows/00-main-goldengate-orchestrator.yaml"
+# PHASE-ORIENTED ORCHESTRATION: the ~30 implementation jobs this suite's many structural checks were written against no longer live directly inside 00-main-goldengate-orchestrator.yaml -- they were moved into seven phase-level reusable workflows (01-phase-readiness-safety.yaml through 07-phase-monitor-acceptance.yaml), each still calling the same 10/20/30/40/50-sub-*.yaml specialists exactly as before. Rather than relocating every one of this suite's many existing "doc['jobs'][...]"-style Python structural assertions by hand (which would risk silently dropping coverage), EKS_APP_WORKFLOW is reassigned below to a MERGED VIRTUAL workflow document -- MAIN's own eight jobs (phase_1_readiness_safety..phase_7_monitor_acceptance, final_validation) plus every job from all seven phase files, combined into one flat jobs: mapping, regenerated fresh on every run from the real committed files (never hand-maintained, never a second schema). Every job ID is still globally unique (no phase file reuses a MAIN job name or another phase's job name), so this merge is lossless and never masks a genuine missing/misplaced job. EKS_APP_WORKFLOW_MAIN_ONLY is the small number of checks that must specifically inspect MAIN's OWN eight-job structure (never the merged view) -- the phase-topology check below, and the workflow-naming section's MAIN-specific assertions.
+EKS_APP_WORKFLOW_MAIN_ONLY=".github/workflows/00-main-goldengate-orchestrator.yaml"
+PHASE_WORKFLOW_FILES=(
+  ".github/workflows/01-phase-readiness-safety.yaml"
+  ".github/workflows/02-phase-aws-prerequisites.yaml"
+  ".github/workflows/03-phase-argocd.yaml"
+  ".github/workflows/04-phase-platform-observability.yaml"
+  ".github/workflows/05-phase-runtimes.yaml"
+  ".github/workflows/06-phase-replication.yaml"
+  ".github/workflows/07-phase-monitor-acceptance.yaml"
+)
+MERGED_MAIN_WORKFLOW="$(mktemp)"
+python3 - "$EKS_APP_WORKFLOW_MAIN_ONLY" "${PHASE_WORKFLOW_FILES[@]}" > "$MERGED_MAIN_WORKFLOW" <<'PYEOF'
+import sys
+import yaml
+
+paths = sys.argv[1:]
+merged_jobs = {}
+main_doc = None
+for path in paths:
+    with open(path) as f:
+        doc = yaml.safe_load(f)
+    if main_doc is None:
+        main_doc = doc  # the first path is always EKS_APP_WORKFLOW_MAIN_ONLY
+    # Every 0N-phase-*.yaml file has its own "phase_contract" job -- the one deliberately repeated job ID across files, so it is namespaced per source file in this merged view only (never in the real committed files).
+    suffix = "__" + path.rsplit("/", 1)[-1].split("-", 1)[0]
+    for job_id, job in (doc.get("jobs") or {}).items():
+        merged_id = job_id + suffix if job_id == "phase_contract" else job_id
+        if merged_id in merged_jobs:
+            raise SystemExit(f"merge conflict: job id {merged_id!r} appears in more than one workflow file")
+        merged_jobs[merged_id] = job
+
+# Many checks also inspect the workflow's own top-level header (name:/run-name:/on:/permissions:/concurrency:) -- these live only on MAIN itself (the phase files are workflow_call-only and intentionally carry none of them), so they are carried over from main_doc unchanged rather than re-derived.
+merged_doc = {}
+for header_key in (True, "name", "run-name", "permissions", "concurrency", "env"):
+    if header_key in main_doc:
+        merged_doc[header_key] = main_doc[header_key]
+merged_doc["jobs"] = merged_jobs
+
+
+# Many of this suite's existing checks grep the raw YAML text of run: script bodies (never only python3 yaml.safe_load) -- PyYAML's default dumper re-escapes a multi-line string as a double-quoted flow scalar ("...\n...\"$X\"...") instead of the original literal block ("|") style, which would silently break every such grep against this merged, regenerated file. This representer forces the SAME "|" block-literal style the real committed files already use for every run: string, so re-serialization is textually faithful (real newlines, unescaped quotes) and every existing grep-based check keeps working unchanged against the merged view.
+class _BlockLiteralDumper(yaml.SafeDumper):
+    pass
+
+
+def _str_representer(dumper, data):
+    style = "|" if "\n" in data else None
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data, style=style)
+
+
+_BlockLiteralDumper.add_representer(str, _str_representer)
+
+print(yaml.dump(merged_doc, Dumper=_BlockLiteralDumper, sort_keys=False, default_flow_style=False, width=4096))
+PYEOF
+EKS_APP_WORKFLOW="$MERGED_MAIN_WORKFLOW"
 PLATFORM_WORKFLOW=".github/workflows/30-sub-platform.yaml"
 DETECT_SCRIPT="hack/detect-goldengate-deployments.sh"
 ENV_SCOPE_CHECKER="hack/check-goldengate-workflow-env-scope.py"
@@ -73,6 +127,314 @@ derive_shared_overrides_for_deployment() {
 
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT
+
+# PHASE-ORIENTED ORCHESTRATION: this suite originally contained several bespoke "flat DAG simulator" Python blocks, each hand-rolling a tiny GHA if:-expression parser plus a JOB_ORDER list and simulate() loop against a single MAIN file's needs: graph. Now that job graph is split across MAIN + seven phase files (a cross-file needs: edge is structurally impossible in GitHub Actions), a single flat simulate() can no longer model the whole thing. gg_phase_sim.py is a SHARED replacement: it simulates each phase's own LOCAL job graph (off that phase's real, freshly-loaded if: expressions -- never a hand-maintained copy), replays that phase's own real phase_contract require_success/allow_non_failure logic (mirrored here in Python by hand, kept in lockstep with the seven real phase files) to decide the phase's own pass/fail outcome, and chains phases 1->7 exactly like MAIN's own phase-caller needs: chain does (a failed phase's downstream phases never even start). Every one of this suite's existing bespoke simulators is rewritten to import and reuse this one module instead of re-deriving its own.
+cat > "${WORKDIR}/gg_phase_sim.py" <<'GGPHASESIMEOF'
+"""Shared multi-phase DAG simulator for the phase-oriented GoldenGate MAIN orchestrator -- see the comment at this module's call site in hack/test-goldengate-deployment-models.sh for the full rationale."""
+import os
+import re
+
+import yaml
+
+REPO_ROOT = os.getcwd()
+WORKFLOW_DIR = os.path.join(REPO_ROOT, ".github", "workflows")
+
+PHASE_FILES = {
+    1: "01-phase-readiness-safety.yaml",
+    2: "02-phase-aws-prerequisites.yaml",
+    3: "03-phase-argocd.yaml",
+    4: "04-phase-platform-observability.yaml",
+    5: "05-phase-runtimes.yaml",
+    6: "06-phase-replication.yaml",
+    7: "07-phase-monitor-acceptance.yaml",
+}
+
+PHASE_JOB_ORDER = {
+    1: ["validate_model", "eks_oidc_preflight", "detect_changed_deployments", "managed_efs_deletion_guard", "storage_transition_guard", "managed_efs_inventory_guard"],
+    2: ["terraform_sync_once"],
+    3: ["argocd_preflight", "goldengate_deploy_authorization", "reconcile_argocd", "validate_argocd_ready"],
+    4: ["platform_preflight", "observability_preflight", "platform_sync_once", "observability_sync_once", "validate_platform_ready", "validate_observability_ready", "validate_shared_secrets_once"],
+    5: ["runtime_ownership_preflight", "build_publish_and_deploy", "delete_removed_argocd_applications", "validate_active_runtimes"],
+    6: ["replication_reconcile_once", "replication_dry_run_validation"],
+    7: ["monitor_ownership_preflight", "monitor_sync_once", "monitor_dry_run_validation", "validate_monitor_ready", "replication_monitor_acceptance", "end_to_end_deployment_acceptance"],
+}
+
+
+def _load_phase_jobs(phase_num):
+    path = os.path.join(WORKFLOW_DIR, PHASE_FILES[phase_num])
+    with open(path) as f:
+        doc = yaml.safe_load(f)
+    return doc["jobs"]
+
+
+def _needs_list(job):
+    n = job.get("needs")
+    if n is None:
+        return []
+    return [n] if isinstance(n, str) else list(n)
+
+
+def _raw_if(job):
+    raw = job.get("if")
+    if raw is None:
+        return "true"
+    raw = str(raw).strip()
+    if raw.startswith("${{") and raw.endswith("}}"):
+        raw = raw[3:-2].strip()
+    return raw
+
+
+class _Parser:
+    """A tiny, bespoke evaluator for exactly the GHA expression subset the phase files use: && || == != () quoted strings, needs.<job>.result, needs.<job>.outputs.<name>, inputs.<name>, github.<name>, always(). Not a general GHA expression engine -- just enough to genuinely simulate real if: expressions against a fabricated context."""
+
+    def __init__(self, expr, needs, inputs, github):
+        self.expr = expr
+        self.needs = needs
+        self.inputs = inputs
+        self.github = github
+        self.pos = 0
+
+    def _skip_ws(self):
+        while self.pos < len(self.expr) and self.expr[self.pos].isspace():
+            self.pos += 1
+
+    def parse(self):
+        result = self._or()
+        self._skip_ws()
+        if self.pos != len(self.expr):
+            raise ValueError(f"trailing content: {self.expr[self.pos:]!r}")
+        return result
+
+    def _or(self):
+        left = self._and()
+        self._skip_ws()
+        while self.expr[self.pos:self.pos + 2] == "||":
+            self.pos += 2
+            right = self._and()
+            left = left or right
+            self._skip_ws()
+        return left
+
+    def _and(self):
+        left = self._atom()
+        self._skip_ws()
+        while self.expr[self.pos:self.pos + 2] == "&&":
+            self.pos += 2
+            right = self._atom()
+            left = left and right
+            self._skip_ws()
+        return left
+
+    def _atom(self):
+        self._skip_ws()
+        if self.expr[self.pos] == "(":
+            self.pos += 1
+            val = self._or()
+            self._skip_ws()
+            assert self.expr[self.pos] == ")"
+            self.pos += 1
+            return val
+        if self.expr[self.pos:self.pos + 8] == "always()":
+            self.pos += 8
+            return True
+        left_val = self._value()
+        self._skip_ws()
+        op = self.expr[self.pos:self.pos + 2]
+        if op in ("==", "!="):
+            self.pos += 2
+            right_val = self._value()
+            return left_val == right_val if op == "==" else left_val != right_val
+        return bool(left_val)
+
+    def _value(self):
+        self._skip_ws()
+        if self.expr[self.pos] == "'":
+            self.pos += 1
+            start = self.pos
+            while self.expr[self.pos] != "'":
+                self.pos += 1
+            val = self.expr[start:self.pos]
+            self.pos += 1
+            return val
+        m = re.match(r"needs\.([A-Za-z0-9_]+)\.result", self.expr[self.pos:])
+        if m:
+            self.pos += m.end()
+            return self.needs.get(m.group(1), {}).get("result", "")
+        m = re.match(r"needs\.([A-Za-z0-9_]+)\.outputs\.([A-Za-z0-9_]+)", self.expr[self.pos:])
+        if m:
+            self.pos += m.end()
+            return self.needs.get(m.group(1), {}).get("outputs", {}).get(m.group(2), "")
+        m = re.match(r"inputs\.([A-Za-z0-9_]+)", self.expr[self.pos:])
+        if m:
+            self.pos += m.end()
+            return self.inputs.get(m.group(1), "")
+        m = re.match(r"github\.([A-Za-z0-9_]+)", self.expr[self.pos:])
+        if m:
+            self.pos += m.end()
+            return self.github.get(m.group(1), "")
+        raise ValueError(f"cannot parse value at: {self.expr[self.pos:self.pos + 40]!r}")
+
+
+def eval_gha_bool(expr, needs, inputs=None, github=None):
+    return bool(_Parser(expr, needs or {}, inputs or {}, github or {}).parse())
+
+
+# Preflight jobs whose real if:-downstream siblings read needs.<job>.outputs.state (only ABSENT/OWNED permit reconciliation; BROKEN fails closed) -- ABSENT is the default "happy path" starting state (fresh bootstrap, nothing pre-existing to own) unless a scenario explicitly overrides it via outputs_when_run.
+_STATE_PRODUCING_JOBS = {"argocd_preflight", "platform_preflight", "observability_preflight", "monitor_ownership_preflight"}
+
+
+def _default_outputs(phase_num, job_name, inputs):
+    """validate_model (Phase 1 only) is the sole in-phase producer of effective_deploy/has_active_deployments -- eks_oidc_preflight and managed_efs_inventory_guard read those back via needs.validate_model.outputs.*, never inputs.* (Phase 1 has no such inputs; it IS the producer). Every other phase's local jobs read inputs.* directly, so no other job needs an inputs-derived default; the ownership-preflight jobs below instead default their own 'state' output."""
+    if phase_num == 1 and job_name == "validate_model":
+        return {"effective_deploy": inputs.get("effective_deploy", "true"), "has_active_deployments": inputs.get("has_active_deployments", "true")}
+    if job_name in _STATE_PRODUCING_JOBS:
+        return {"state": "ABSENT"}
+    return {}
+
+
+def simulate_phase(phase_num, inputs, outcome_when_run=None, outputs_when_run=None, github=None):
+    """Simulates one phase's LOCAL job graph in isolation, off that phase file's real if: expressions (loaded fresh, never hand-copied). inputs models the workflow_call inputs GitHub would supply this phase. outcome_when_run/outputs_when_run let a scenario force a specific job's simulated result/outputs when it would run (default success / phase-appropriate default outputs). Returns (results, contract_result); contract_result mirrors that phase's own real phase_contract require_success/allow_non_failure logic."""
+    jobs = _load_phase_jobs(phase_num)
+    outcome_when_run = outcome_when_run or {}
+    outputs_when_run = outputs_when_run or {}
+    github = github or {"event_name": "workflow_dispatch"}
+    results = {}
+    for job_name in PHASE_JOB_ORDER[phase_num]:
+        job = jobs[job_name]
+        raw_if = _raw_if(job)
+        if raw_if == "success()":
+            would_run = all(results.get(n, {}).get("result") == "success" for n in _needs_list(job))
+        elif raw_if == "true":
+            would_run = True
+        else:
+            would_run = eval_gha_bool(raw_if, results, inputs, github)
+        if would_run:
+            outputs = outputs_when_run.get(job_name)
+            if outputs is None:
+                outputs = _default_outputs(phase_num, job_name, inputs)
+            results[job_name] = {"result": outcome_when_run.get(job_name, "success"), "outputs": outputs}
+        else:
+            results[job_name] = {"result": "skipped", "outputs": {}}
+    contract_result = _phase_contract_result(phase_num, inputs, results)
+    return results, contract_result
+
+
+def _phase_contract_result(phase_num, inputs, results):
+    def ok(name):
+        return results.get(name, {}).get("result") == "success"
+
+    def not_bad(name):
+        return results.get(name, {}).get("result") not in ("failure", "cancelled")
+
+    effective_deploy = inputs.get("effective_deploy")
+    has_changes = inputs.get("has_changes", "true")
+    has_deletions = inputs.get("has_deletions", "false")
+    has_active = inputs.get("has_active_deployments", "true")
+
+    if phase_num == 1:
+        if not all(ok(n) for n in ("validate_model", "detect_changed_deployments", "managed_efs_deletion_guard", "storage_transition_guard")):
+            return "failure"
+        if effective_deploy == "true":
+            return "success" if (ok("eks_oidc_preflight") and ok("managed_efs_inventory_guard")) else "failure"
+        return "success" if (not_bad("eks_oidc_preflight") and not_bad("managed_efs_inventory_guard")) else "failure"
+
+    if phase_num == 2:
+        if effective_deploy == "true":
+            return "success" if ok("terraform_sync_once") else "failure"
+        return "success" if not_bad("terraform_sync_once") else "failure"
+
+    if phase_num == 3:
+        names = ("argocd_preflight", "goldengate_deploy_authorization", "reconcile_argocd", "validate_argocd_ready")
+        if effective_deploy == "true":
+            return "success" if all(ok(n) for n in names) else "failure"
+        return "success" if all(not_bad(n) for n in names) else "failure"
+
+    if phase_num == 4:
+        if not ok("validate_shared_secrets_once"):
+            return "failure"
+        names = ("platform_preflight", "observability_preflight", "platform_sync_once", "observability_sync_once", "validate_platform_ready", "validate_observability_ready")
+        if effective_deploy == "true":
+            return "success" if all(ok(n) for n in names) else "failure"
+        return "success" if all(not_bad(n) for n in names) else "failure"
+
+    if phase_num == 5:
+        if has_changes == "true":
+            if not ok("build_publish_and_deploy"):
+                return "failure"
+            if effective_deploy == "true":
+                if not ok("runtime_ownership_preflight"):
+                    return "failure"
+            elif not not_bad("runtime_ownership_preflight"):
+                return "failure"
+        elif not (not_bad("runtime_ownership_preflight") and not_bad("build_publish_and_deploy")):
+            return "failure"
+        if has_deletions == "true":
+            if not ok("delete_removed_argocd_applications"):
+                return "failure"
+        elif not not_bad("delete_removed_argocd_applications"):
+            return "failure"
+        if effective_deploy == "true" and has_active == "true":
+            if not ok("validate_active_runtimes"):
+                return "failure"
+        elif not not_bad("validate_active_runtimes"):
+            return "failure"
+        return "success"
+
+    if phase_num == 6:
+        if effective_deploy == "true":
+            if not not_bad("replication_dry_run_validation"):
+                return "failure"
+            if has_active == "true":
+                return "success" if ok("replication_reconcile_once") else "failure"
+            return "success" if not_bad("replication_reconcile_once") else "failure"
+        if not not_bad("replication_reconcile_once"):
+            return "failure"
+        return "success" if ok("replication_dry_run_validation") else "failure"
+
+    if phase_num == 7:
+        names = ("monitor_ownership_preflight", "monitor_sync_once", "validate_monitor_ready", "replication_monitor_acceptance", "end_to_end_deployment_acceptance")
+        if effective_deploy == "true":
+            if not not_bad("monitor_dry_run_validation"):
+                return "failure"
+            if has_active == "true":
+                return "success" if all(ok(n) for n in names) else "failure"
+            return "success" if all(not_bad(n) for n in names) else "failure"
+        if not all(not_bad(n) for n in names):
+            return "failure"
+        if has_active == "true":
+            return "success" if ok("monitor_dry_run_validation") else "failure"
+        return "success" if not_bad("monitor_dry_run_validation") else "failure"
+
+    raise ValueError(phase_num)
+
+
+def simulate_all(effective_deploy, has_changes="true", has_deletions="false", has_active_deployments="true",
+                  outcome_when_run=None, outputs_when_run=None, fail_phase_before=None, github=None):
+    """Chains all seven phases exactly like MAIN's own phase-caller needs: chain does: each phase's local jobs only get a chance to run if every earlier phase's own contract succeeded (fail_phase_before, if given, forces every phase >= that number to be entirely skipped -- e.g. to model a Phase 1 safety-guard failure blocking Phases 2-7 without needing to actually fail an individual job's simulated outcome). Returns (all_results, phase_contracts) where all_results merges every phase's per-job results (job IDs are globally unique) and phase_contracts maps phase number -> 'success'/'failure'/'skipped'."""
+    inputs = {
+        "effective_deploy": effective_deploy,
+        "has_changes": has_changes,
+        "has_deletions": has_deletions,
+        "has_active_deployments": has_active_deployments,
+    }
+    all_results = {}
+    phase_contracts = {}
+    upstream_ok = True
+    for phase_num in range(1, 8):
+        if fail_phase_before is not None and phase_num >= fail_phase_before:
+            upstream_ok = False
+        if not upstream_ok:
+            for job_name in PHASE_JOB_ORDER[phase_num]:
+                all_results[job_name] = {"result": "skipped", "outputs": {}}
+            phase_contracts[phase_num] = "skipped"
+            continue
+        results, contract_result = simulate_phase(phase_num, inputs, outcome_when_run, outputs_when_run, github)
+        all_results.update(results)
+        phase_contracts[phase_num] = contract_result
+        if contract_result != "success":
+            upstream_ok = False
+    return all_results, phase_contracts
+GGPHASESIMEOF
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -4058,8 +4420,9 @@ if [ -f "$EKS_APP_WORKFLOW" ]; then
     fail "unexpected delete command(s) found in ${EKS_APP_WORKFLOW}:"$'\n'"${DIRECT_DELETE_HITS}"
   fi
 
+  # PHASE-ORIENTED ORCHESTRATION: delete_removed_argocd_applications now reads has_deletions from its own phase's workflow_call input (relayed unchanged from detect_changed_deployments' original output, never re-derived) rather than a direct needs.detect_changed_deployments.outputs.has_deletions cross-job reference.
   if grep -q 'delete_removed_argocd_applications' "$EKS_APP_WORKFLOW" \
-      && grep -q "needs.detect_changed_deployments.outputs.has_deletions == 'true'" "$EKS_APP_WORKFLOW"; then
+      && grep -q "inputs.has_deletions == 'true'" "$EKS_APP_WORKFLOW"; then
     pass "Argo CD Application/namespace deletion remains gated on has_deletions (deletion-matrix-driven, never folder-disable-driven)"
   else
     fail "the deletion job's has_deletions gating condition is missing or changed"
@@ -4071,16 +4434,33 @@ fi
 echo ""
 echo "--- Phase 5A: no direct \${{ inputs.* }} interpolation in run scripts; marker-file injection tests ---"
 
-if [ -f "$EKS_APP_WORKFLOW" ]; then
-  INPUTS_INTERP_HITS="$(grep -n '\${{ *inputs\.' "$EKS_APP_WORKFLOW" | grep -v '^\s*[0-9]*: *INPUT_[A-Z_]*: \${{ *inputs\.' || true)"
-  # The only acceptable occurrences are inside a step-level env: mapping (INPUT_X: ${{ inputs.x }}), never inside a run-script body; grep -v above already filtered the common env-mapping shape, so anything left is a real hit.
+if [ -f "$EKS_APP_WORKFLOW" ] && [ "$PYTHON_AVAILABLE" = "true" ]; then
+  # PHASE-ORIENTED ORCHESTRATION: ${{ inputs.* }} now also legitimately appears in with: blocks (MAIN/a phase passing its own inputs into a nested workflow_call) and in job-level env:/if: mappings using varied variable names (not only the historical INPUT_-prefixed convention) -- a single raw-text grep line-shape can no longer distinguish "safe YAML-level reference" from "unsafe direct run-script interpolation" reliably. Structural, never a reimplementation of the workflow schema: walks the REAL parsed YAML and flags only an inputs.* reference found inside a step's own run: string body -- with:/env:/if:/environment: are every one of them evaluated by GitHub Actions BEFORE the shell ever sees a byte, so they carry none of the run-script shell-injection risk this check exists to catch.
+  INPUTS_INTERP_HITS="$(python3 -c '
+import yaml
+
+with open("'"$EKS_APP_WORKFLOW"'") as f:
+    doc = yaml.safe_load(f)
+
+hits = []
+for job_id, job in (doc.get("jobs") or {}).items():
+    for step in job.get("steps") or []:
+        run_text = step.get("run")
+        if isinstance(run_text, str) and "${{" in run_text and "inputs." in run_text:
+            step_name = step.get("name")
+            for lineno, line in enumerate(run_text.splitlines(), start=1):
+                if "${{" in line and "inputs." in line:
+                    hits.append(f"{job_id}/{step_name!r} run: line {lineno}: {line.strip()}")
+
+print("\n".join(hits))
+' 2>&1)"
   if [ -n "$INPUTS_INTERP_HITS" ]; then
-    fail "\${{ inputs.* }} appears outside a step-level env: mapping in ${EKS_APP_WORKFLOW}:"$'\n'"${INPUTS_INTERP_HITS}"
+    fail "\${{ inputs.* }} appears directly inside a run: script body in ${EKS_APP_WORKFLOW}:"$'\n'"${INPUTS_INTERP_HITS}"
   else
-    pass "every \${{ inputs.* }} occurrence in ${EKS_APP_WORKFLOW} is confined to a step-level env: mapping, never a run-script body"
+    pass "every \${{ inputs.* }} occurrence in ${EKS_APP_WORKFLOW} is confined to with:/env:/if:/environment: (evaluated by GitHub Actions before the shell runs), never a run-script body"
   fi
 else
-  skip "inputs.* interpolation sweep -- ${EKS_APP_WORKFLOW} not found"
+  skip "inputs.* interpolation sweep -- ${EKS_APP_WORKFLOW} not found or python3 unavailable"
 fi
 
 if [ -f "$DETECT_SCRIPT" ] && command -v python3 >/dev/null 2>&1; then
@@ -5743,8 +6123,8 @@ MONITOR_PY="monitoring/monitor/monitor.py"
 MONITOR_WORKFLOW=".github/workflows/50-sub-monitor.yaml"
 
 if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  # This narrow Phase 6C1B guard originally proved that phase's changes were made in place to the (then single) monitor workflow file, never by adding a parallel duplicate. The workflow naming/operator UX standardization task later legitimately renamed all nine workflow files in place -- each rename is a content move, not a new parallel workflow -- so the nine canonical renamed filenames are expected/allowed here; any other new workflow file remains exactly the violation this check was written to catch. The rename itself is now guarded by the dedicated, more precise "Workflow naming / operator UX standardization" section later in this suite (exactly-one-MAIN, exact SUB/OPS sets, zero stale old-filename references) -- the same supersession pattern already used for cloudwatch-observability-artifact-sync.yaml's release from check 15's byte-diff guard by Phase 11.
-  NEW_WORKFLOW_FILES="$(git status --porcelain=v1 -- .github/workflows/ 2>/dev/null | grep -E '^\?\?' | grep -vE '^\?\? \.github/workflows/(00-main-goldengate-orchestrator|10-sub-iam-secrets|20-sub-argocd|30-sub-platform|40-sub-observability|50-sub-monitor|80-ops-monitor-metrics-config|90-ops-observability-artifact-sync|91-ops-ecr-image-sync)\.yaml$' || true)"
+  # This narrow Phase 6C1B guard originally proved that phase's changes were made in place to the (then single) monitor workflow file, never by adding a parallel duplicate. The workflow naming/operator UX standardization task later legitimately renamed all nine workflow files in place -- each rename is a content move, not a new parallel workflow -- so the nine canonical renamed filenames are expected/allowed here; any other new workflow file remains exactly the violation this check was written to catch. The rename itself is now guarded by the dedicated, more precise "Workflow naming / operator UX standardization" section later in this suite (exactly-one-MAIN, exact SUB/OPS sets, zero stale old-filename references) -- the same supersession pattern already used for cloudwatch-observability-artifact-sync.yaml's release from check 15's byte-diff guard by Phase 11. PHASE-ORIENTED ORCHESTRATION: the seven 0N-phase-*.yaml reusable workflows are likewise a sanctioned, deliberate addition (MAIN's ~30 implementation jobs relocated under them) -- guarded precisely by the dedicated phase-topology test later in this suite -- so they are allowlisted here exactly like the nine renamed files.
+  NEW_WORKFLOW_FILES="$(git status --porcelain=v1 -- .github/workflows/ 2>/dev/null | grep -E '^\?\?' | grep -vE '^\?\? \.github/workflows/(00-main-goldengate-orchestrator|01-phase-readiness-safety|02-phase-aws-prerequisites|03-phase-argocd|04-phase-platform-observability|05-phase-runtimes|06-phase-replication|07-phase-monitor-acceptance|10-sub-iam-secrets|20-sub-argocd|30-sub-platform|40-sub-observability|50-sub-monitor|80-ops-monitor-metrics-config|90-ops-observability-artifact-sync|91-ops-ecr-image-sync)\.yaml$' || true)"
   if [ -z "$NEW_WORKFLOW_FILES" ]; then
     pass "25: no unexpected new workflow file introduced beyond the sanctioned workflow-naming rename"
   else
@@ -6502,84 +6882,127 @@ echo "--- Phase 6D0 correction: onboarding-workflow job graph ---"
 
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   set +e
-  JOB_GRAPH_CHECK="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+  # PHASE-ORIENTED ORCHESTRATION: this check originally walked one flat needs: graph inside a single MAIN file. Every cross-job edge it proved is now split between two distinct, still-fully-covered mechanisms: (a) same-file (same-phase) needs: edges, unchanged and re-checked directly against the real phase file that now owns both jobs; (b) formerly cross-job edges that now cross a phase-file boundary, which are structurally IMPOSSIBLE as a needs: edge in GitHub Actions (no cross-file needs: exists) and were intentionally dropped from the moved jobs' own if:/needs: -- relying instead on MAIN's own phase-caller needs: chain (phase_1 -> phase_2 -> ... -> phase_7 -> final_validation, every phase-caller job with no custom if:, so GitHub's implicit "all needs succeeded" default provides the exact same fail-closed guarantee). This rewritten check proves both halves explicitly, plus confirms each such pair now structurally CANNOT share a needs: edge (lives in two different files, in the correct phase order).
+  JOB_GRAPH_CHECK="$(python3 - "$EKS_APP_WORKFLOW_MAIN_ONLY" "${PHASE_WORKFLOW_FILES[@]}" <<'PYEOF'
 import sys
 import yaml
 
 with open(sys.argv[1]) as f:
-    doc = yaml.safe_load(f)
+    main_doc = yaml.safe_load(f)
 
-jobs = doc["jobs"]
-expected_order = [
+phase_docs = {}
+for p in sys.argv[2:]:
+    with open(p) as f:
+        phase_docs[p.rsplit("/", 1)[-1]] = yaml.safe_load(f)
+
+def jobs_of(doc):
+    return doc.get("jobs") or {}
+
+def needs_of(job):
+    n = job.get("needs") or []
+    return [n] if isinstance(n, str) else n
+
+job_location = {}
+for fname, doc in phase_docs.items():
+    for job_id in jobs_of(doc):
+        job_location[job_id] = fname
+
+required_jobs = [
     "validate_model", "terraform_sync_once", "platform_sync_once", "validate_shared_secrets_once",
-    "detect_changed_deployments", "build_publish_and_deploy", "monitor_sync_once", "final_validation",
+    "detect_changed_deployments", "build_publish_and_deploy", "monitor_sync_once",
 ]
-for name in expected_order:
-    if name not in jobs:
-        print(f"FAIL: missing required job {name!r}")
+for name in required_jobs:
+    if name not in job_location:
+        print(f"FAIL: missing required job {name!r} in any phase file")
         sys.exit(1)
+main_jobs = jobs_of(main_doc)
+if "final_validation" not in main_jobs:
+    print("FAIL: missing required job 'final_validation' in MAIN")
+    sys.exit(1)
 
-if "bootstrap_admin_secrets" in jobs:
+if "bootstrap_admin_secrets" in (set(job_location) | set(main_jobs)):
     print("FAIL: bootstrap_admin_secrets job still exists")
     sys.exit(1)
 
-def needs_of(name):
-    n = jobs[name].get("needs") or []
-    return [n] if isinstance(n, str) else n
-
-if "validate_model" not in needs_of("terraform_sync_once"):
-    print("FAIL: terraform_sync_once does not need validate_model")
-    sys.exit(1)
-# Phase B1 inserts the Argo CD prerequisite state machine between Terraform and the platform chart: terraform_sync_once -> argocd_preflight -> (bootstrap_argocd) -> validate_argocd_ready. Phase B2 then inserts the same ownership-aware state machine, independently in parallel, for GoldenGate Platform and Observability: validate_argocd_ready -> (platform_preflight | observability_preflight) -> (platform_sync_once | observability_sync_once) -> (validate_platform_ready | validate_observability_ready) -> validate_shared_secrets_once. platform_sync_once/validate_shared_secrets_once no longer depend on validate_argocd_ready/platform_sync_once directly (only transitively) -- guarded in full by the dedicated "Phase B1"/"Phase B2" DAG checks elsewhere in this suite.
-if "terraform_sync_once" not in needs_of("argocd_preflight"):
-    print("FAIL: argocd_preflight does not need terraform_sync_once")
-    sys.exit(1)
-if "argocd_preflight" not in needs_of("validate_argocd_ready"):
-    print("FAIL: validate_argocd_ready does not need argocd_preflight")
-    sys.exit(1)
-if "validate_argocd_ready" not in needs_of("platform_preflight"):
-    print("FAIL: platform_preflight does not need validate_argocd_ready")
-    sys.exit(1)
-if "platform_preflight" not in needs_of("platform_sync_once"):
-    print("FAIL: platform_sync_once does not need platform_preflight")
-    sys.exit(1)
-if "validate_argocd_ready" not in needs_of("observability_preflight"):
-    print("FAIL: observability_preflight does not need validate_argocd_ready")
-    sys.exit(1)
-if "observability_preflight" not in needs_of("observability_sync_once"):
-    print("FAIL: observability_sync_once does not need observability_preflight")
-    sys.exit(1)
-if "platform_preflight" not in needs_of("validate_platform_ready") or "platform_sync_once" not in needs_of("validate_platform_ready"):
-    print("FAIL: validate_platform_ready does not need both platform_preflight and platform_sync_once")
-    sys.exit(1)
-if "observability_preflight" not in needs_of("validate_observability_ready") or "observability_sync_once" not in needs_of("validate_observability_ready"):
-    print("FAIL: validate_observability_ready does not need both observability_preflight and observability_sync_once")
-    sys.exit(1)
-if ("terraform_sync_once" not in needs_of("validate_shared_secrets_once")
-        or "validate_platform_ready" not in needs_of("validate_shared_secrets_once")
-        or "validate_observability_ready" not in needs_of("validate_shared_secrets_once")):
-    print("FAIL: validate_shared_secrets_once does not need terraform_sync_once, validate_platform_ready, and validate_observability_ready")
-    sys.exit(1)
-if "validate_shared_secrets_once" not in needs_of("build_publish_and_deploy"):
-    print("FAIL: build_publish_and_deploy does not need validate_shared_secrets_once")
-    sys.exit(1)
-if "build_publish_and_deploy" not in needs_of("monitor_sync_once"):
-    print("FAIL: monitor_sync_once does not need build_publish_and_deploy")
-    sys.exit(1)
-if "monitor_sync_once" not in needs_of("final_validation"):
-    print("FAIL: final_validation does not need monitor_sync_once")
+# 1. MAIN's phase-calling jobs must be strictly sequential 1 -> 2 -> ... -> 7 -> final_validation, each relying purely on GitHub's implicit "all needs succeeded" default.
+phase_caller_order = [
+    "phase_1_readiness_safety", "phase_2_aws_prerequisites", "phase_3_argocd",
+    "phase_4_platform_observability", "phase_5_runtimes", "phase_6_replication",
+    "phase_7_monitor_acceptance",
+]
+for i, name in enumerate(phase_caller_order):
+    if name not in main_jobs:
+        print(f"FAIL: MAIN is missing phase-calling job {name!r}")
+        sys.exit(1)
+    if i == 0:
+        continue
+    prev = phase_caller_order[i - 1]
+    if prev not in needs_of(main_jobs[name]):
+        print(f"FAIL: MAIN job {name!r} does not need {prev!r} (phase sequencing)")
+        sys.exit(1)
+if phase_caller_order[-1] not in needs_of(main_jobs["final_validation"]):
+    print(f"FAIL: final_validation does not need {phase_caller_order[-1]!r}")
     sys.exit(1)
 
-for name in ("terraform_sync_once", "platform_sync_once", "observability_sync_once", "monitor_sync_once"):
-    if not str(jobs[name].get("uses", "")).startswith("./.github/workflows/"):
+# 2. Local (same phase file) needs: edges that still exist post-refactor.
+def local_needs_check(fname, job_name, required_needs):
+    job = jobs_of(phase_docs[fname]).get(job_name)
+    if job is None:
+        print(f"FAIL: {job_name!r} not found in {fname!r}")
+        sys.exit(1)
+    n = needs_of(job)
+    for req in required_needs:
+        if req not in n:
+            print(f"FAIL: {job_name!r} (in {fname!r}) does not need {req!r}")
+            sys.exit(1)
+
+local_needs_check("03-phase-argocd.yaml", "validate_argocd_ready", ["argocd_preflight"])
+local_needs_check("04-phase-platform-observability.yaml", "platform_sync_once", ["platform_preflight"])
+local_needs_check("04-phase-platform-observability.yaml", "observability_sync_once", ["observability_preflight"])
+local_needs_check("04-phase-platform-observability.yaml", "validate_platform_ready", ["platform_preflight", "platform_sync_once"])
+local_needs_check("04-phase-platform-observability.yaml", "validate_observability_ready", ["observability_preflight", "observability_sync_once"])
+local_needs_check("04-phase-platform-observability.yaml", "validate_shared_secrets_once", ["validate_platform_ready", "validate_observability_ready"])
+
+# 3. Formerly cross-job edges that now cross a phase-file boundary: confirm each pair is structurally split across two files, in the correct phase order (never re-merged, never reordered).
+cross_phase_pairs = [
+    ("terraform_sync_once", "validate_model", "02-phase-aws-prerequisites.yaml", "01-phase-readiness-safety.yaml"),
+    ("argocd_preflight", "terraform_sync_once", "03-phase-argocd.yaml", "02-phase-aws-prerequisites.yaml"),
+    ("platform_preflight", "validate_argocd_ready", "04-phase-platform-observability.yaml", "03-phase-argocd.yaml"),
+    ("observability_preflight", "validate_argocd_ready", "04-phase-platform-observability.yaml", "03-phase-argocd.yaml"),
+    ("build_publish_and_deploy", "validate_shared_secrets_once", "05-phase-runtimes.yaml", "04-phase-platform-observability.yaml"),
+    ("monitor_sync_once", "build_publish_and_deploy", "07-phase-monitor-acceptance.yaml", "05-phase-runtimes.yaml"),
+]
+for downstream, upstream, downstream_file, upstream_file in cross_phase_pairs:
+    if job_location.get(downstream) != downstream_file:
+        print(f"FAIL: {downstream!r} is not located in the expected {downstream_file!r}")
+        sys.exit(1)
+    if job_location.get(upstream) != upstream_file:
+        print(f"FAIL: {upstream!r} is not located in the expected {upstream_file!r}")
+        sys.exit(1)
+    if downstream_file <= upstream_file:
+        print(f"FAIL: {downstream!r} (in {downstream_file!r}) does not come after {upstream!r} (in {upstream_file!r}) in phase order")
+        sys.exit(1)
+    if downstream in needs_of(jobs_of(phase_docs[downstream_file])[downstream]):
+        print(f"FAIL: {downstream!r} still carries an impossible cross-file needs: edge on {upstream!r}")
+        sys.exit(1)
+
+# 4. uses: reusable-workflow calls, unchanged in shape, now checked against the phase file that owns each job.
+for name, fname in (("terraform_sync_once", "02-phase-aws-prerequisites.yaml"),
+                     ("platform_sync_once", "04-phase-platform-observability.yaml"),
+                     ("observability_sync_once", "04-phase-platform-observability.yaml"),
+                     ("monitor_sync_once", "07-phase-monitor-acceptance.yaml")):
+    job = jobs_of(phase_docs[fname])[name]
+    if not str(job.get("uses", "")).startswith("./.github/workflows/"):
         print(f"FAIL: {name} does not call a reusable workflow via a job-level uses:")
         sys.exit(1)
 
-if "strategy" in jobs["validate_shared_secrets_once"] or "matrix" in jobs["validate_shared_secrets_once"]:
+vss = jobs_of(phase_docs["04-phase-platform-observability.yaml"])["validate_shared_secrets_once"]
+if "strategy" in vss or "matrix" in vss:
     print("FAIL: validate_shared_secrets_once uses a matrix (must be a single job)")
     sys.exit(1)
 
-strategy = jobs["build_publish_and_deploy"].get("strategy") or {}
+bpd = jobs_of(phase_docs["05-phase-runtimes.yaml"])["build_publish_and_deploy"]
+strategy = bpd.get("strategy") or {}
 if strategy.get("max-parallel") != 1:
     print("FAIL: build_publish_and_deploy is missing max-parallel: 1")
     sys.exit(1)
@@ -6590,13 +7013,13 @@ if "matrix" not in strategy:
     print("FAIL: build_publish_and_deploy is missing its matrix")
     sys.exit(1)
 
-print("OK: job graph order, needs chain, reusable-workflow calls, and matrix placement are all correct")
+print("OK: phase-local job graph order, needs: chains, reusable-workflow calls, matrix placement, and cross-phase sequencing (via MAIN's own phase-caller needs: chain) are all correct")
 PYEOF
 )"
   JOB_GRAPH_STATUS=$?
   set -e
   if [ "$JOB_GRAPH_STATUS" -eq 0 ]; then
-    pass "27: ${EKS_APP_WORKFLOW} job graph follows validate-model -> terraform-sync-once -> platform-sync-once -> validate-shared-secrets-once -> runtime-deployment -> monitor-sync-once -> final-validation"
+    pass "27: the phase-oriented job graph follows validate-model -> terraform-sync-once -> platform-sync-once -> validate-shared-secrets-once -> runtime-deployment -> monitor-sync-once -> final-validation, split correctly across MAIN's phase-caller chain and each phase file's own local needs: edges"
   else
     fail "27: ${JOB_GRAPH_CHECK}"
   fi
@@ -6790,8 +7213,9 @@ else
   pass "29: GoldenGateSecretsReadRole-dev grants no DynamoDB write or CloudWatch PutMetricData permission"
 fi
 
-if grep -qF "needs.validate_model.outputs.effective_deploy != 'true' || (needs.terraform_sync_once.result == 'success' && needs.validate_platform_ready.result == 'success' && needs.validate_observability_ready.result == 'success')" "$EKS_APP_WORKFLOW" 2>/dev/null; then
-  pass "29: the read-only validation chain (validate_shared_secrets_once) is deploy-aware and fail-closed -- it tolerates a legitimately skipped terraform/platform/observability convergence only when deploy=false, and requires their exact success when deploy=true"
+# PHASE-ORIENTED ORCHESTRATION: validate_shared_secrets_once now lives in 04-phase-platform-observability.yaml; its terraform_sync_once check was dropped because Phase 2's own success is already guaranteed transitively (MAIN only calls Phase 4 after Phase 2 succeeds) -- the remaining platform/observability half of the condition is checked against that phase file directly.
+if grep -qF "inputs.effective_deploy != 'true' || (needs.validate_platform_ready.result == 'success' && needs.validate_observability_ready.result == 'success')" .github/workflows/04-phase-platform-observability.yaml 2>/dev/null; then
+  pass "29: the read-only validation chain (validate_shared_secrets_once) is deploy-aware and fail-closed -- it tolerates a legitimately skipped platform/observability convergence only when deploy=false, and requires their exact success when deploy=true (terraform_sync_once's own success is guaranteed transitively via Phase 2)"
 else
   fail "29: validate_shared_secrets_once no longer contains the required deploy-aware fail-closed condition"
 fi
@@ -7364,40 +7788,60 @@ fi
 
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   set +e
-  ORDER_CHECK_OUTPUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+  # PHASE-ORIENTED ORCHESTRATION: managed_efs_deletion_guard and terraform_sync_once now live in different phase files (01-phase-readiness-safety.yaml and 02-phase-aws-prerequisites.yaml respectively), so a needs: edge between them is structurally impossible. The same guarantee is now split three ways: (a) the guard's own local ordering after detect_changed_deployments, unchanged; (b) Phase 1's phase_contract job unconditionally requires the guard's success in every mode (foundational -- never merely tolerated as a skip); (c) MAIN's phase_2_aws_prerequisites carries no custom if:, so GitHub's implicit "all needs succeeded" default means Phase 2 (and therefore terraform_sync_once) can never even start unless Phase 1 -- and thus the guard -- succeeded.
+  ORDER_CHECK_OUTPUT="$(python3 - "$EKS_APP_WORKFLOW_MAIN_ONLY" .github/workflows/01-phase-readiness-safety.yaml .github/workflows/02-phase-aws-prerequisites.yaml <<'PYEOF'
 import sys
 import yaml
 
 with open(sys.argv[1]) as f:
-    doc = yaml.safe_load(f)
+    main_doc = yaml.safe_load(f)
+with open(sys.argv[2]) as f:
+    phase1_doc = yaml.safe_load(f)
+with open(sys.argv[3]) as f:
+    phase2_doc = yaml.safe_load(f)
 
-jobs = doc.get("jobs", {})
+phase1_jobs = phase1_doc.get("jobs", {})
+phase2_jobs = phase2_doc.get("jobs", {})
+main_jobs = main_doc.get("jobs", {})
 problems = []
 
-guard = jobs.get("managed_efs_deletion_guard")
-if guard is None:
-    problems.append("managed_efs_deletion_guard job is missing")
-else:
-    needs = guard.get("needs")
-    needs_list = needs if isinstance(needs, list) else [needs]
-    if "detect_changed_deployments" not in needs_list:
-        problems.append("managed_efs_deletion_guard does not need detect_changed_deployments")
+def needs_list_of(job):
+    needs = job.get("needs")
+    return needs if isinstance(needs, list) else [needs]
 
-tf = jobs.get("terraform_sync_once")
-if tf is None:
-    problems.append("terraform_sync_once job is missing")
+guard = phase1_jobs.get("managed_efs_deletion_guard")
+if guard is None:
+    problems.append("managed_efs_deletion_guard job is missing from 01-phase-readiness-safety.yaml")
+elif "detect_changed_deployments" not in needs_list_of(guard):
+    problems.append("managed_efs_deletion_guard does not need detect_changed_deployments")
+
+contract = phase1_jobs.get("phase_contract")
+if contract is None:
+    problems.append("phase_contract job is missing from 01-phase-readiness-safety.yaml")
 else:
-    needs = tf.get("needs")
-    needs_list = needs if isinstance(needs, list) else [needs]
-    if "detect_changed_deployments" not in needs_list:
-        problems.append("terraform_sync_once does not need detect_changed_deployments")
-    if "managed_efs_deletion_guard" not in needs_list:
-        problems.append("terraform_sync_once does not need managed_efs_deletion_guard")
-    if_expr = str(tf.get("if", ""))
-    if "managed_efs_deletion_guard.result" not in if_expr or "success" not in if_expr:
-        problems.append("terraform_sync_once's if: does not explicitly require managed_efs_deletion_guard to have succeeded (a custom if: does not implicitly inherit the needs-success default)")
-    if "detect_changed_deployments.result" not in if_expr or "success" not in if_expr:
-        problems.append("terraform_sync_once's if: does not explicitly require detect_changed_deployments to have succeeded")
+    if "managed_efs_deletion_guard" not in needs_list_of(contract):
+        problems.append("Phase 1's phase_contract does not need managed_efs_deletion_guard")
+    contract_run = ""
+    for step in contract.get("steps", []):
+        contract_run += str(step.get("run") or "")
+    if "require_success managed_efs_deletion_guard" not in contract_run:
+        problems.append("Phase 1's phase_contract does not unconditionally require_success 'managed_efs_deletion_guard'")
+
+tf = phase2_jobs.get("terraform_sync_once")
+if tf is None:
+    problems.append("terraform_sync_once job is missing from 02-phase-aws-prerequisites.yaml")
+else:
+    if "managed_efs_deletion_guard" in needs_list_of(tf) or "detect_changed_deployments" in needs_list_of(tf):
+        problems.append("terraform_sync_once still carries an impossible cross-file needs: edge on a Phase 1 job")
+
+phase2_caller = main_jobs.get("phase_2_aws_prerequisites")
+if phase2_caller is None:
+    problems.append("MAIN is missing the phase_2_aws_prerequisites job")
+else:
+    if "phase_1_readiness_safety" not in needs_list_of(phase2_caller):
+        problems.append("MAIN's phase_2_aws_prerequisites does not need phase_1_readiness_safety")
+    if "if" in phase2_caller:
+        problems.append(f"MAIN's phase_2_aws_prerequisites carries a custom if: ({phase2_caller['if']!r}) instead of relying on the implicit all-needs-succeeded default")
 
 if problems:
     print("\n".join(problems))
@@ -7408,7 +7852,7 @@ PYEOF
   ORDER_CHECK_STATUS=$?
   set -e
   if [ "$ORDER_CHECK_STATUS" -eq 0 ]; then
-    pass "33: managed_efs_deletion_guard is structurally guaranteed to run before terraform_sync_once, and terraform_sync_once fails closed if either detect_changed_deployments or the guard did not succeed"
+    pass "33: managed_efs_deletion_guard is structurally guaranteed to run before terraform_sync_once (via Phase 1's unconditional phase_contract requirement plus MAIN's implicit phase-sequencing default), and terraform_sync_once carries no impossible cross-file shortcut"
   else
     fail "33: managed-EFS deletion guard ordering is not correctly wired: ${ORDER_CHECK_OUTPUT}"
   fi
@@ -7990,36 +8434,59 @@ fi
 
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   set +e
-  TRANSITION_ORDER_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+  # PHASE-ORIENTED ORCHESTRATION: same relocation pattern as the managed_efs_deletion_guard check above -- storage_transition_guard and terraform_sync_once now live in different phase files, so the direct needs:/if: edge is structurally impossible and is instead enforced via Phase 1's unconditional phase_contract requirement plus MAIN's implicit phase-sequencing default.
+  TRANSITION_ORDER_OUT="$(python3 - "$EKS_APP_WORKFLOW_MAIN_ONLY" .github/workflows/01-phase-readiness-safety.yaml .github/workflows/02-phase-aws-prerequisites.yaml <<'PYEOF'
 import sys
 import yaml
 
 with open(sys.argv[1]) as f:
-    doc = yaml.safe_load(f)
+    main_doc = yaml.safe_load(f)
+with open(sys.argv[2]) as f:
+    phase1_doc = yaml.safe_load(f)
+with open(sys.argv[3]) as f:
+    phase2_doc = yaml.safe_load(f)
 
-jobs = doc.get("jobs", {})
+phase1_jobs = phase1_doc.get("jobs", {})
+phase2_jobs = phase2_doc.get("jobs", {})
+main_jobs = main_doc.get("jobs", {})
 problems = []
 
-guard = jobs.get("storage_transition_guard")
-if guard is None:
-    problems.append("storage_transition_guard job is missing")
-else:
-    needs = guard.get("needs")
-    needs_list = needs if isinstance(needs, list) else [needs]
-    if "detect_changed_deployments" not in needs_list:
-        problems.append("storage_transition_guard does not need detect_changed_deployments")
+def needs_list_of(job):
+    needs = job.get("needs")
+    return needs if isinstance(needs, list) else [needs]
 
-tf = jobs.get("terraform_sync_once")
-if tf is None:
-    problems.append("terraform_sync_once job is missing")
+guard = phase1_jobs.get("storage_transition_guard")
+if guard is None:
+    problems.append("storage_transition_guard job is missing from 01-phase-readiness-safety.yaml")
+elif "detect_changed_deployments" not in needs_list_of(guard):
+    problems.append("storage_transition_guard does not need detect_changed_deployments")
+
+contract = phase1_jobs.get("phase_contract")
+if contract is None:
+    problems.append("phase_contract job is missing from 01-phase-readiness-safety.yaml")
 else:
-    needs = tf.get("needs")
-    needs_list = needs if isinstance(needs, list) else [needs]
-    if "storage_transition_guard" not in needs_list:
-        problems.append("terraform_sync_once does not need storage_transition_guard")
-    if_expr = str(tf.get("if", ""))
-    if "storage_transition_guard.result" not in if_expr or "success" not in if_expr:
-        problems.append("terraform_sync_once's if: does not explicitly require storage_transition_guard to have succeeded")
+    if "storage_transition_guard" not in needs_list_of(contract):
+        problems.append("Phase 1's phase_contract does not need storage_transition_guard")
+    contract_run = ""
+    for step in contract.get("steps", []):
+        contract_run += str(step.get("run") or "")
+    if "require_success storage_transition_guard" not in contract_run:
+        problems.append("Phase 1's phase_contract does not unconditionally require_success 'storage_transition_guard'")
+
+tf = phase2_jobs.get("terraform_sync_once")
+if tf is None:
+    problems.append("terraform_sync_once job is missing from 02-phase-aws-prerequisites.yaml")
+elif "storage_transition_guard" in needs_list_of(tf):
+    problems.append("terraform_sync_once still carries an impossible cross-file needs: edge on storage_transition_guard")
+
+phase2_caller = main_jobs.get("phase_2_aws_prerequisites")
+if phase2_caller is None:
+    problems.append("MAIN is missing the phase_2_aws_prerequisites job")
+else:
+    if "phase_1_readiness_safety" not in needs_list_of(phase2_caller):
+        problems.append("MAIN's phase_2_aws_prerequisites does not need phase_1_readiness_safety")
+    if "if" in phase2_caller:
+        problems.append(f"MAIN's phase_2_aws_prerequisites carries a custom if: ({phase2_caller['if']!r}) instead of relying on the implicit all-needs-succeeded default")
 
 if problems:
     print("\n".join(problems))
@@ -8030,7 +8497,7 @@ PYEOF
   TRANSITION_ORDER_STATUS=$?
   set -e
   if [ "$TRANSITION_ORDER_STATUS" -eq 0 ]; then
-    pass "storage_transition_guard is structurally guaranteed to run before terraform_sync_once, and terraform_sync_once fails closed if it did not succeed"
+    pass "storage_transition_guard is structurally guaranteed to run before terraform_sync_once (via Phase 1's unconditional phase_contract requirement plus MAIN's implicit phase-sequencing default)"
   else
     fail "storage_transition_guard ordering is not correctly wired: ${TRANSITION_ORDER_OUT}"
   fi
@@ -8144,37 +8611,61 @@ fi
 
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   set +e
-  INVENTORY_ORDER_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+  # PHASE-ORIENTED ORCHESTRATION: same relocation pattern as the two guard-ordering checks above -- managed_efs_inventory_guard and terraform_sync_once now live in different phase files, so the direct needs:/if: edge is structurally impossible and is instead enforced via Phase 1's unconditional phase_contract requirement plus MAIN's implicit phase-sequencing default.
+  INVENTORY_ORDER_OUT="$(python3 - "$EKS_APP_WORKFLOW_MAIN_ONLY" .github/workflows/01-phase-readiness-safety.yaml .github/workflows/02-phase-aws-prerequisites.yaml <<'PYEOF'
 import sys
 import yaml
 
 with open(sys.argv[1]) as f:
-    doc = yaml.safe_load(f)
+    main_doc = yaml.safe_load(f)
+with open(sys.argv[2]) as f:
+    phase1_doc = yaml.safe_load(f)
+with open(sys.argv[3]) as f:
+    phase2_doc = yaml.safe_load(f)
 
-jobs = doc.get("jobs", {})
+phase1_jobs = phase1_doc.get("jobs", {})
+phase2_jobs = phase2_doc.get("jobs", {})
+main_jobs = main_doc.get("jobs", {})
 problems = []
 
-guard = jobs.get("managed_efs_inventory_guard")
+def needs_list_of(job):
+    needs = job.get("needs")
+    return needs if isinstance(needs, list) else [needs]
+
+guard = phase1_jobs.get("managed_efs_inventory_guard")
 if guard is None:
-    problems.append("managed_efs_inventory_guard job is missing")
+    problems.append("managed_efs_inventory_guard job is missing from 01-phase-readiness-safety.yaml")
 else:
-    needs = guard.get("needs")
-    needs_list = needs if isinstance(needs, list) else [needs]
     for required in ("detect_changed_deployments", "managed_efs_deletion_guard", "storage_transition_guard"):
-        if required not in needs_list:
+        if required not in needs_list_of(guard):
             problems.append(f"managed_efs_inventory_guard does not need {required}")
 
-tf = jobs.get("terraform_sync_once")
-if tf is None:
-    problems.append("terraform_sync_once job is missing")
+contract = phase1_jobs.get("phase_contract")
+if contract is None:
+    problems.append("phase_contract job is missing from 01-phase-readiness-safety.yaml")
 else:
-    needs = tf.get("needs")
-    needs_list = needs if isinstance(needs, list) else [needs]
-    if "managed_efs_inventory_guard" not in needs_list:
-        problems.append("terraform_sync_once does not need managed_efs_inventory_guard")
-    if_expr = str(tf.get("if", ""))
-    if "managed_efs_inventory_guard.result" not in if_expr or "success" not in if_expr:
-        problems.append("terraform_sync_once's if: does not explicitly require managed_efs_inventory_guard to have succeeded")
+    if "managed_efs_inventory_guard" not in needs_list_of(contract):
+        problems.append("Phase 1's phase_contract does not need managed_efs_inventory_guard")
+    contract_run = ""
+    for step in contract.get("steps", []):
+        contract_run += str(step.get("run") or "")
+    if "require_success managed_efs_inventory_guard" not in contract_run and "allow_non_failure managed_efs_inventory_guard" not in contract_run:
+        problems.append("Phase 1's phase_contract does not reference managed_efs_inventory_guard's result via require_success/allow_non_failure")
+
+tf = phase2_jobs.get("terraform_sync_once")
+if tf is None:
+    problems.append("terraform_sync_once job is missing from 02-phase-aws-prerequisites.yaml")
+elif "managed_efs_inventory_guard" in needs_list_of(tf):
+    problems.append("terraform_sync_once still carries an impossible cross-file needs: edge on managed_efs_inventory_guard")
+
+phase2_caller = main_jobs.get("phase_2_aws_prerequisites")
+if phase2_caller is None:
+    problems.append("MAIN is missing the phase_2_aws_prerequisites job")
+else:
+    if "phase_1_readiness_safety" not in needs_list_of(phase2_caller):
+        problems.append("MAIN's phase_2_aws_prerequisites does not need phase_1_readiness_safety")
+    if "if" in phase2_caller:
+        problems.append(f"MAIN's phase_2_aws_prerequisites carries a custom if: ({phase2_caller['if']!r}) instead of relying on the implicit all-needs-succeeded default")
 
 if problems:
     print("\n".join(problems))
@@ -8185,7 +8676,7 @@ PYEOF
   INVENTORY_ORDER_STATUS=$?
   set -e
   if [ "$INVENTORY_ORDER_STATUS" -eq 0 ]; then
-    pass "15/16: managed_efs_inventory_guard is structurally guaranteed to run after the Git-diff guards and before terraform_sync_once, and terraform_sync_once fails closed if it did not succeed"
+    pass "15/16: managed_efs_inventory_guard is structurally guaranteed to run after the Git-diff guards and before terraform_sync_once (via Phase 1's phase_contract requirement plus MAIN's implicit phase-sequencing default)"
   else
     fail "15/16: managed_efs_inventory_guard ordering is not correctly wired: ${INVENTORY_ORDER_OUT}"
   fi
@@ -8278,137 +8769,12 @@ echo "--- Final workflow correction, Issue 1: fail-closed job graph for a real d
 
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   set +e
-  FAIL_CLOSED_SIM_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
-import re
+  # PHASE-ORIENTED ORCHESTRATION: this scenario battery originally simulated one flat MAIN needs: graph spanning managed_efs_inventory_guard through build_publish_and_deploy. That graph is now split across Phase 1/2/3/4/5 files (a cross-file needs: edge is structurally impossible), so it is rewritten here to use the shared gg_phase_sim module (see its definition/rationale near the top of this script) -- each scenario still forces the same real-world job outcomes/states and asserts the same protective guarantees, now expressed as "the affected phase's own contract fails, so every downstream phase is entirely skipped" wherever the original asserted "the affected sibling job is skipped".
+  FAIL_CLOSED_SIM_OUT="$(python3 - "$WORKDIR" <<'PYEOF'
 import sys
-import yaml
 
-with open(sys.argv[1]) as f:
-    doc = yaml.safe_load(f)
-
-jobs = doc["jobs"]
-
-
-def _extract_if(job_name):
-    raw = jobs[job_name].get("if", "true")
-    raw = str(raw).strip()
-    if raw.startswith("${{") and raw.endswith("}}"):
-        raw = raw[3:-2].strip()
-    return raw
-
-
-class _Parser:
-    """A tiny, bespoke evaluator for exactly the GHA expression subset this workflow uses: && || == != () quoted strings, needs.<job>.result, needs.<job>.outputs.<name>, always(). Not a general GHA expression engine -- just enough to genuinely simulate these four job conditions against a fabricated needs context, rather than trusting a text/regex match against the workflow author's own wording."""
-
-    def __init__(self, expr, needs):
-        self.expr = expr
-        self.needs = needs
-        self.pos = 0
-
-    def _skip_ws(self):
-        while self.pos < len(self.expr) and self.expr[self.pos].isspace():
-            self.pos += 1
-
-    def parse(self):
-        result = self._or()
-        self._skip_ws()
-        if self.pos != len(self.expr):
-            raise ValueError(f"trailing content: {self.expr[self.pos:]!r}")
-        return result
-
-    def _or(self):
-        left = self._and()
-        self._skip_ws()
-        while self.expr[self.pos:self.pos + 2] == "||":
-            self.pos += 2
-            right = self._and()
-            left = left or right
-            self._skip_ws()
-        return left
-
-    def _and(self):
-        left = self._atom()
-        self._skip_ws()
-        while self.expr[self.pos:self.pos + 2] == "&&":
-            self.pos += 2
-            right = self._atom()
-            left = left and right
-            self._skip_ws()
-        return left
-
-    def _atom(self):
-        self._skip_ws()
-        if self.expr[self.pos] == "(":
-            self.pos += 1
-            val = self._or()
-            self._skip_ws()
-            assert self.expr[self.pos] == ")"
-            self.pos += 1
-            return val
-        if self.expr[self.pos:self.pos + 8] == "always()":
-            self.pos += 8
-            return True
-        left_val = self._value()
-        self._skip_ws()
-        op = self.expr[self.pos:self.pos + 2]
-        if op in ("==", "!="):
-            self.pos += 2
-            right_val = self._value()
-            return left_val == right_val if op == "==" else left_val != right_val
-        return bool(left_val)
-
-    def _value(self):
-        self._skip_ws()
-        if self.expr[self.pos] == "'":
-            self.pos += 1
-            start = self.pos
-            while self.expr[self.pos] != "'":
-                self.pos += 1
-            val = self.expr[start:self.pos]
-            self.pos += 1
-            return val
-        m = re.match(r"needs\.([A-Za-z0-9_]+)\.result", self.expr[self.pos:])
-        if m:
-            self.pos += m.end()
-            return self.needs.get(m.group(1), {}).get("result", "")
-        m = re.match(r"needs\.([A-Za-z0-9_]+)\.outputs\.([A-Za-z0-9_]+)", self.expr[self.pos:])
-        if m:
-            self.pos += m.end()
-            return self.needs.get(m.group(1), {}).get("outputs", {}).get(m.group(2), "")
-        raise ValueError(f"cannot parse value at: {self.expr[self.pos:self.pos + 40]!r}")
-
-
-def eval_gha_bool(expr, needs):
-    return bool(_Parser(expr, needs).parse())
-
-
-# Phase B1 inserts the Argo CD prerequisite state machine between Terraform and the platform chart; Live Argo Recovery Fix reworked it into automatic desired-state reconciliation (reconcile_argocd, formerly bootstrap_argocd); Phase B2 inserts the same ownership-aware state machine, independently in parallel, for the GoldenGate Platform and Observability application prerequisites between validate_argocd_ready and validate_shared_secrets_once; Phase B3A inserts the read-only runtime ownership-safety preflight between validate_shared_secrets_once and build_publish_and_deploy; Live Deployment Approval Topology Fix inserts goldengate_deploy_authorization (the single GoldenGate application deployment approval) between argocd_preflight and reconcile_argocd -- all simulated in real DAG order like every other job here, off the same real if: expressions.
-JOB_ORDER = ["terraform_sync_once", "argocd_preflight", "goldengate_deploy_authorization", "reconcile_argocd", "validate_argocd_ready", "platform_preflight", "observability_preflight", "platform_sync_once", "observability_sync_once", "validate_platform_ready", "validate_observability_ready", "validate_shared_secrets_once", "runtime_ownership_preflight", "build_publish_and_deploy"]
-IF_EXPRS = {job: _extract_if(job) for job in JOB_ORDER}
-
-
-def simulate(initial, outcome_when_run, outputs_when_run=None):
-    results = dict(initial)
-    outputs_when_run = outputs_when_run or {}
-    for job in JOB_ORDER:
-        would_run = eval_gha_bool(IF_EXPRS[job], results)
-        if would_run:
-            results[job] = {"result": outcome_when_run.get(job, "success"), "outputs": outputs_when_run.get(job, {})}
-        else:
-            results[job] = {"result": "skipped", "outputs": {}}
-    return results
-
-
-def base_context(effective_deploy, has_changes="true"):
-    return {
-        "validate_model": {"result": "success", "outputs": {"effective_deploy": effective_deploy}},
-        "eks_oidc_preflight": {"result": "success", "outputs": {}},
-        "detect_changed_deployments": {"result": "success", "outputs": {"has_changes": has_changes}},
-        "managed_efs_deletion_guard": {"result": "success", "outputs": {}},
-        "storage_transition_guard": {"result": "success", "outputs": {}},
-        "managed_efs_inventory_guard": {"result": "success", "outputs": {}},
-    }
-
+sys.path.insert(0, sys.argv[1])
+import gg_phase_sim as sim
 
 failures = []
 
@@ -8418,115 +8784,99 @@ def check(label, condition):
         failures.append(label)
 
 
-# 1: deploy=true + inventory guard failure -> terraform skipped/blocked -> runtime build/deploy cannot execute.
-ctx = base_context("true")
-ctx["managed_efs_inventory_guard"] = {"result": "failure", "outputs": {}}
-r = simulate(ctx, {})
-check("1: terraform_sync_once must be skipped", r["terraform_sync_once"]["result"] == "skipped")
-check("1: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
+# 1 / 1b: deploy=true + managed_efs_inventory_guard (or eks_oidc_preflight) failure -> Phase 1 fails closed -> terraform_sync_once and build_publish_and_deploy never run.
+for failed_job in ("managed_efs_inventory_guard", "eks_oidc_preflight"):
+    r, c = sim.simulate_all("true", outcome_when_run={failed_job: "failure"})
+    check(f"1/1b: Phase 1 must fail when {failed_job} fails", c[1] == "failure")
+    check(f"1/1b: terraform_sync_once must be skipped when {failed_job} fails", r["terraform_sync_once"]["result"] == "skipped")
+    check(f"1/1b: build_publish_and_deploy must be skipped when {failed_job} fails", r["build_publish_and_deploy"]["result"] == "skipped")
 
-# 1b (Fresh-EKS Phase A): deploy=true + eks_oidc_preflight failure (live OIDC issuer mismatch) -> terraform_sync_once must never run, so a stale/mismatched IRSA trust policy can never reach Terraform apply.
-ctx = base_context("true")
-ctx["eks_oidc_preflight"] = {"result": "failure", "outputs": {}}
-r = simulate(ctx, {})
-check("1b: terraform_sync_once must be skipped when eks_oidc_preflight fails", r["terraform_sync_once"]["result"] == "skipped")
-check("1b: build_publish_and_deploy must be skipped when eks_oidc_preflight fails", r["build_publish_and_deploy"]["result"] == "skipped")
-
-# 2: deploy=true + terraform failure -> runtime build/deploy cannot execute.
-ctx = base_context("true")
-r = simulate(ctx, {"terraform_sync_once": "failure"})
+# 2: deploy=true + terraform_sync_once failure -> Phase 2 fails closed -> platform_sync_once/validate_shared_secrets_once/build_publish_and_deploy never run.
+r, c = sim.simulate_all("true", outcome_when_run={"terraform_sync_once": "failure"})
 check("2: terraform_sync_once must report failure", r["terraform_sync_once"]["result"] == "failure")
+check("2: Phase 2 contract must fail", c[2] == "failure")
 check("2: platform_sync_once must be skipped", r["platform_sync_once"]["result"] == "skipped")
 check("2: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
 check("2: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
 
-# 3: deploy=true + Argo CD already OWNED (Generic MAIN Desired-State Convergence Fix: reconcile_argocd now ALWAYS RUNS on OWNED -- a DEPLOY converges the live release to current desired state, it never merely skips because a classifier proved ownership) + platform ABSENT+reconcile failure (observability stays OWNED, isolating the failure to platform) -> runtime build/deploy cannot execute.
-ctx = base_context("true")
-r = simulate(ctx, {"platform_sync_once": "failure"}, {"argocd_preflight": {"state": "OWNED"}, "platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "OWNED"}})
+# 3 (Generic MAIN Desired-State Convergence Fix): deploy=true + Argo CD/Observability already OWNED (reconcile_argocd/observability_sync_once must still RUN -- a DEPLOY always converges the live release to current desired state) + platform ABSENT+reconcile failure (isolated to platform) -> runtime build/deploy cannot execute.
+r, c = sim.simulate_all("true", outcome_when_run={"platform_sync_once": "failure"},
+                         outputs_when_run={"argocd_preflight": {"state": "OWNED"}, "platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "OWNED"}})
 check("3: reconcile_argocd must RUN (and succeed) even when Argo CD is already OWNED", r["reconcile_argocd"]["result"] == "success")
 check("3: validate_argocd_ready must succeed on the already-OWNED-and-reconciled path", r["validate_argocd_ready"]["result"] == "success")
 check("3: platform_sync_once must report failure", r["platform_sync_once"]["result"] == "failure")
 check("3: validate_platform_ready must be skipped after a failed platform_sync_once", r["validate_platform_ready"]["result"] == "skipped")
-check("3: observability_sync_once must still RUN (and succeed) even though observability is already OWNED -- MAIN never skips a safe owned reconciliation, isolating platform's failure", r["observability_sync_once"]["result"] == "success")
+check("3: observability_sync_once must still RUN (and succeed) even though observability is already OWNED", r["observability_sync_once"]["result"] == "success")
 check("3: validate_observability_ready must still succeed (independent of platform's failure)", r["validate_observability_ready"]["result"] == "success")
+check("3: Phase 4 contract must fail", c[4] == "failure")
 check("3: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
-check("3: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
+check("3: build_publish_and_deploy must be skipped (Phase 5 never starts)", r["build_publish_and_deploy"]["result"] == "skipped")
 
-# 4: deploy=true + all mutation prerequisites already OWNED (Argo CD/platform/observability all already-existing, safely-owned installations, runtime ownership OWNED) -> Generic MAIN Desired-State Convergence Fix requirement 4/5: MAIN STILL invokes reconcile_argocd/30-sub-platform/40-sub-observability on every Deploy, never predicting from a healthy-looking preflight that reconciliation is unnecessary -> runtime deployment may still execute.
-ctx = base_context("true")
-r = simulate(ctx, {}, {"argocd_preflight": {"state": "OWNED"}, "platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}, "runtime_ownership_preflight": {"state": "OWNED"}})
+# 4 (Generic MAIN Desired-State Convergence Fix): deploy=true + all mutation prerequisites already OWNED -> MAIN STILL invokes reconcile_argocd/platform_sync_once/observability_sync_once on every Deploy, never predicting from a healthy-looking preflight that reconciliation is unnecessary -> runtime deployment remains eligible.
+r, c = sim.simulate_all("true", outputs_when_run={"argocd_preflight": {"state": "OWNED"}, "platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
 check("4: terraform_sync_once must succeed", r["terraform_sync_once"]["result"] == "success")
 check("4: validate_argocd_ready must succeed", r["validate_argocd_ready"]["result"] == "success")
-check("4: platform_sync_once MUST run (and succeed) even though platform is already OWNED/healthy-looking -- MAIN never skips specialist reconciliation on a Deploy (required test 4)", r["platform_sync_once"]["result"] == "success")
-check("4: observability_sync_once MUST run (and succeed) even though observability is already OWNED/healthy-looking -- MAIN never skips specialist reconciliation on a Deploy (required test 5)", r["observability_sync_once"]["result"] == "success")
+check("4: platform_sync_once MUST run (and succeed) even though platform is already OWNED/healthy-looking", r["platform_sync_once"]["result"] == "success")
+check("4: observability_sync_once MUST run (and succeed) even though observability is already OWNED/healthy-looking", r["observability_sync_once"]["result"] == "success")
 check("4: validate_platform_ready must succeed", r["validate_platform_ready"]["result"] == "success")
 check("4: validate_observability_ready must succeed", r["validate_observability_ready"]["result"] == "success")
 check("4: validate_shared_secrets_once must succeed", r["validate_shared_secrets_once"]["result"] == "success")
-check("4: runtime_ownership_preflight must succeed (OWNED permits reconciliation)", r["runtime_ownership_preflight"]["result"] == "success")
 check("4: build_publish_and_deploy must be eligible to run", r["build_publish_and_deploy"]["result"] == "success")
 
-# 7: deploy=true + Argo CD ABSENT + reconcile_argocd succeeds -> validate_argocd_ready converges to success -> platform/observability preflights run; platform ABSENT+reconcile success, observability already OWNED (and therefore also reconciled, not skipped).
-ctx = base_context("true")
-r = simulate(ctx, {}, {"argocd_preflight": {"state": "ABSENT"}, "platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "OWNED"}})
+# 5: deploy=false -> terraform/platform may be skipped -> read-only/Helm dry-run path still executes.
+r, c = sim.simulate_all("false")
+check("5: terraform_sync_once must be skipped", r["terraform_sync_once"]["result"] == "skipped")
+check("5: platform_sync_once must be skipped", r["platform_sync_once"]["result"] == "skipped")
+check("5: validate_shared_secrets_once must still succeed", r["validate_shared_secrets_once"]["result"] == "success")
+check("5: build_publish_and_deploy dry-run path must still be eligible to run", r["build_publish_and_deploy"]["result"] == "success")
+
+# 6: build_publish_and_deploy can no longer directly reference needs.validate_shared_secrets_once.result (cross-phase, structurally impossible) -- the same protective guarantee (a broken shared-secrets/platform/observability validation blocks runtime deployment) is now enforced by Phase 4's own contract failing closed, which structurally prevents Phase 5 (and therefore build_publish_and_deploy) from ever even starting.
+r, c = sim.simulate_all("true", outcome_when_run={"validate_platform_ready": "failure"})
+check("6: a failed validate_platform_ready must fail Phase 4's contract", c[4] == "failure")
+check("6: validate_shared_secrets_once must be skipped when its own prerequisite failed", r["validate_shared_secrets_once"]["result"] == "skipped")
+check("6: build_publish_and_deploy must never run when Phase 4 failed (Phase 5 never starts)", r["build_publish_and_deploy"]["result"] == "skipped")
+
+# 7 (Phase B1): deploy=true + Argo CD ABSENT + reconcile_argocd succeeds -> validate_argocd_ready converges to success -> platform/observability preflights run.
+r, c = sim.simulate_all("true", outputs_when_run={"argocd_preflight": {"state": "ABSENT"}})
 check("7: reconcile_argocd must run when Argo CD is ABSENT", r["reconcile_argocd"]["result"] == "success")
 check("7: validate_argocd_ready must succeed after a successful reconciliation", r["validate_argocd_ready"]["result"] == "success")
 check("7: platform_sync_once must be eligible to run after reconciliation (platform is ABSENT)", r["platform_sync_once"]["result"] == "success")
 check("7: validate_platform_ready must succeed after a successful reconciliation", r["validate_platform_ready"]["result"] == "success")
 check("7: validate_shared_secrets_once must succeed end-to-end", r["validate_shared_secrets_once"]["result"] == "success")
 
-# 8: deploy=true + Argo CD ABSENT + reconcile_argocd FAILS -> validate_argocd_ready must never run -> platform must never run. (Live Argo Recovery Fix required scenario 7: "reconcile failure => downstream platform orchestration cannot continue".)
-ctx = base_context("true")
-r = simulate(ctx, {"reconcile_argocd": "failure"}, {"argocd_preflight": {"state": "ABSENT"}})
+# 8: deploy=true + Argo CD ABSENT + reconcile_argocd FAILS -> validate_argocd_ready must never run -> platform must never run.
+r, c = sim.simulate_all("true", outcome_when_run={"reconcile_argocd": "failure"}, outputs_when_run={"argocd_preflight": {"state": "ABSENT"}})
 check("8: reconcile_argocd must report failure", r["reconcile_argocd"]["result"] == "failure")
 check("8: validate_argocd_ready must be skipped after a failed reconciliation", r["validate_argocd_ready"]["result"] == "skipped")
-check("8: platform_sync_once must be skipped after a failed reconciliation", r["platform_sync_once"]["result"] == "skipped")
+check("8: Phase 3 contract must fail", c[3] == "failure")
+check("8: platform_sync_once must be skipped after a failed reconciliation (Phase 4 never starts)", r["platform_sync_once"]["result"] == "skipped")
 
-# 9: deploy=true + Argo CD BROKEN (argocd_preflight itself fails closed) -> reconcile_argocd must never even be entered, and platform must never run. (Live Argo Recovery Fix required scenario 4: "deploy + BROKEN => reconciliation must NOT execute and the path fails closed".)
-ctx = base_context("true")
-r = simulate(ctx, {"argocd_preflight": "failure"})
+# 9: deploy=true + Argo CD BROKEN (argocd_preflight itself fails closed) -> reconcile_argocd must never even be entered, and platform must never run.
+r, c = sim.simulate_all("true", outcome_when_run={"argocd_preflight": "failure"})
 check("9: argocd_preflight must report failure on BROKEN", r["argocd_preflight"]["result"] == "failure")
 check("9: reconcile_argocd must never run on BROKEN", r["reconcile_argocd"]["result"] == "skipped")
 check("9: validate_argocd_ready must be skipped on BROKEN", r["validate_argocd_ready"]["result"] == "skipped")
 check("9: platform_sync_once must be skipped on BROKEN", r["platform_sync_once"]["result"] == "skipped")
 
-# 10: deploy=true + Argo CD OWNED (an already-existing, safely-owned release -- e.g. only the generated repository Secrets or a newly-enabled Ingress not yet rendered) -> reconcile_argocd must run (Generic MAIN Desired-State Convergence Fix required scenario 2), converge to success, and platform/observability/runtime deployment must remain eligible -- this is the exact case that used to dead-end MAIN at BROKEN under the retired RECONCILABLE/HEALTHY split.
-ctx = base_context("true")
-r = simulate(ctx, {}, {"argocd_preflight": {"state": "OWNED"}, "platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}, "runtime_ownership_preflight": {"state": "OWNED"}})
+# 10 (Generic MAIN Desired-State Convergence Fix): deploy=true + Argo CD OWNED -> reconcile_argocd must run, converge to success, and platform/observability/runtime deployment must remain eligible.
+r, c = sim.simulate_all("true", outputs_when_run={"argocd_preflight": {"state": "OWNED"}, "platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
 check("10: reconcile_argocd must run (and succeed) when Argo CD is OWNED", r["reconcile_argocd"]["result"] == "success")
 check("10: validate_argocd_ready must succeed after a successful OWNED reconciliation", r["validate_argocd_ready"]["result"] == "success")
 check("10: platform_preflight must remain eligible (never dead-ends behind an OWNED Argo CD)", r["platform_preflight"]["result"] == "success")
 check("10: build_publish_and_deploy must remain eligible to run", r["build_publish_and_deploy"]["result"] == "success")
 
-# 11: action=validate (effective_deploy=false) with an otherwise-owned/absent Argo CD state -> argocd_preflight/reconcile_argocd must both be skipped -- Validate mode never mutates Argo CD regardless of classified state. (Generic MAIN Desired-State Convergence Fix required scenario 5.)
-ctx = base_context("false")
-ctx["managed_efs_inventory_guard"] = {"result": "skipped", "outputs": {}}
-r = simulate(ctx, {}, {"argocd_preflight": {"state": "OWNED"}})
+# 11: action=validate (effective_deploy=false) with an otherwise-owned/absent Argo CD state -> argocd_preflight/reconcile_argocd must both be skipped -- Validate mode never mutates Argo CD regardless of classified state.
+r, c = sim.simulate_all("false", outputs_when_run={"argocd_preflight": {"state": "OWNED"}})
 check("11: argocd_preflight must be skipped in Validate mode regardless of live state", r["argocd_preflight"]["result"] == "skipped")
 check("11: reconcile_argocd must never run in Validate mode (no mutating Argo CD reconciliation)", r["reconcile_argocd"]["result"] == "skipped")
 check("11: validate_argocd_ready must be skipped in Validate mode", r["validate_argocd_ready"]["result"] == "skipped")
 
-# 12: deploy=true + reconcile_argocd itself reports success, but validate_argocd_ready's own post-reconcile re-classification still fails (the cluster converges to something other than exactly HEALTHY -- modeled here as validate_argocd_ready's own result, since that job's internal acceptance script is what enforces the strict != "HEALTHY" fail-closed check) -> platform must never run. (Generic MAIN Desired-State Convergence Fix required scenario 8: "reconcile success + final acceptance not HEALTHY => downstream platform orchestration cannot continue".)
-ctx = base_context("true")
-r = simulate(ctx, {"validate_argocd_ready": "failure"}, {"argocd_preflight": {"state": "OWNED"}})
+# 12: deploy=true + reconcile_argocd itself reports success, but validate_argocd_ready's own post-reconcile re-classification still fails -> platform must never run.
+r, c = sim.simulate_all("true", outcome_when_run={"validate_argocd_ready": "failure"}, outputs_when_run={"argocd_preflight": {"state": "OWNED"}})
 check("12: reconcile_argocd itself must still report success (the SUB workflow completed)", r["reconcile_argocd"]["result"] == "success")
 check("12: validate_argocd_ready must report failure when final re-classification is not exactly HEALTHY", r["validate_argocd_ready"]["result"] == "failure")
 check("12: platform_preflight must never run when validate_argocd_ready failed post-reconcile", r["platform_preflight"]["result"] == "skipped")
 check("12: build_publish_and_deploy must never run when validate_argocd_ready failed post-reconcile", r["build_publish_and_deploy"]["result"] == "skipped")
-
-# 5: deploy=false -> terraform/platform may be skipped -> read-only/Helm dry-run path still executes.
-ctx = base_context("false")
-ctx["managed_efs_inventory_guard"] = {"result": "skipped", "outputs": {}}
-r = simulate(ctx, {})
-check("5: terraform_sync_once must be skipped", r["terraform_sync_once"]["result"] == "skipped")
-check("5: platform_sync_once must be skipped", r["platform_sync_once"]["result"] == "skipped")
-check("5: validate_shared_secrets_once must still succeed", r["validate_shared_secrets_once"]["result"] == "success")
-check("5: build_publish_and_deploy dry-run path must still be eligible to run", r["build_publish_and_deploy"]["result"] == "success")
-
-# 6: build_publish_and_deploy requires validate_shared_secrets_once SUCCESS, not merely not-failure/not-cancelled -- simulate a bare "skipped" upstream result directly and confirm it is rejected (the old assertion would have let this through).
-skipped_ctx = base_context("true")
-skipped_ctx["validate_shared_secrets_once"] = {"result": "skipped", "outputs": {}}
-would_run = eval_gha_bool(IF_EXPRS["build_publish_and_deploy"], skipped_ctx)
-check("6: build_publish_and_deploy must reject a skipped validate_shared_secrets_once", would_run is False)
 
 if failures:
     print("\n".join(failures))
@@ -8537,12 +8887,12 @@ PYEOF
   FAIL_CLOSED_SIM_STATUS=$?
   set -e
   if [ "$FAIL_CLOSED_SIM_STATUS" -eq 0 ]; then
-    pass "1: deploy=true + managed_efs_inventory_guard failure blocks terraform_sync_once and build_publish_and_deploy (simulated end-to-end against the real if: expressions)"
-    pass "2: deploy=true + terraform_sync_once failure blocks platform_sync_once/validate_shared_secrets_once/build_publish_and_deploy"
+    pass "1: deploy=true + managed_efs_inventory_guard/eks_oidc_preflight failure blocks terraform_sync_once and build_publish_and_deploy via Phase 1's own contract (simulated end-to-end against the real if: expressions)"
+    pass "2: deploy=true + terraform_sync_once failure blocks platform_sync_once/validate_shared_secrets_once/build_publish_and_deploy via Phase 2's own contract"
     pass "3 (Generic MAIN Desired-State Convergence Fix): deploy=true + Argo CD/Observability already OWNED still runs reconcile_argocd/observability_sync_once (a DEPLOY always converges the live release to current desired state) + platform_sync_once failure blocks validate_shared_secrets_once/build_publish_and_deploy"
     pass "4 (Generic MAIN Desired-State Convergence Fix): deploy=true + all mutation prerequisites already OWNED still invokes reconcile_argocd/platform_sync_once/observability_sync_once (never skipped merely because preflight looked healthy) and leaves build_publish_and_deploy eligible to run"
     pass "5: deploy=false correctly skips terraform_sync_once/platform_sync_once while the read-only/dry-run path through validate_shared_secrets_once and build_publish_and_deploy still runs"
-    pass "6: build_publish_and_deploy's if: rejects a skipped validate_shared_secrets_once (requires exact 'success', not the old != failure/!= cancelled assertion)"
+    pass "6: a broken validate_platform_ready fails Phase 4's own contract, which structurally prevents Phase 5/build_publish_and_deploy from ever starting (the equivalent, phase-relocated form of the old same-file needs.validate_shared_secrets_once.result == 'success' assertion)"
     pass "7 (Phase B1): Argo CD ABSENT + successful reconcile_argocd converges validate_argocd_ready to success and leaves platform_sync_once eligible to run"
     pass "8 (Live Argo Recovery Fix): Argo CD ABSENT + failed reconcile_argocd skips validate_argocd_ready and platform_sync_once (never assumes reconciliation success)"
     pass "9 (Live Argo Recovery Fix): Argo CD BROKEN (argocd_preflight itself fails) never enters reconcile_argocd and skips validate_argocd_ready/platform_sync_once"
@@ -8556,46 +8906,48 @@ else
   skip "1-12: fail-closed job-graph simulation -- python3/PyYAML unavailable"
 fi
 
-if ! grep -qE "validate_shared_secrets_once\.result\s*!=\s*'failure'" "$EKS_APP_WORKFLOW" 2>/dev/null; then
-  pass "the old overly-permissive assertion (validate_shared_secrets_once.result != 'failure') has been replaced -- build_publish_and_deploy now requires exact success"
+# PHASE-ORIENTED ORCHESTRATION: build_publish_and_deploy's if: can no longer reference needs.validate_shared_secrets_once at all (cross-phase, structurally impossible) -- the old "must not contain the overly-permissive != 'failure' assertion" / "must explicitly require == 'success'" checks are replaced by confirming (a) no FUNCTIONAL (needs.<job> expression) reference to validate_shared_secrets_once survives anywhere in 05-phase-runtimes.yaml -- a plain-prose mention in an explanatory comment about why the check was intentionally dropped is not itself a violation -- and (b) Phase 4's own phase_contract still requires validate_shared_secrets_once's exact success on every Deploy (re-checked here for locality; the authoritative check lives in check 29 above).
+if ! grep -qE "needs\.validate_shared_secrets_once" .github/workflows/05-phase-runtimes.yaml 2>/dev/null; then
+  pass "build_publish_and_deploy (and every other Phase 5 job) contains no stale FUNCTIONAL reference to needs.validate_shared_secrets_once -- that cross-phase dependency now lives solely in Phase 4's own phase_contract"
 else
-  fail "build_publish_and_deploy still contains the old != 'failure'/!= 'cancelled' assertion for validate_shared_secrets_once"
+  fail "05-phase-runtimes.yaml still contains a functional needs.validate_shared_secrets_once reference, which no longer lives in this phase file"
 fi
 
-if grep -qF "needs.validate_shared_secrets_once.result == 'success'" "$EKS_APP_WORKFLOW" 2>/dev/null; then
-  pass "build_publish_and_deploy's if: explicitly requires needs.validate_shared_secrets_once.result == 'success'"
+if grep -qF "require_success validate_platform_ready" .github/workflows/04-phase-platform-observability.yaml 2>/dev/null \
+    && grep -qF "require_success validate_observability_ready" .github/workflows/04-phase-platform-observability.yaml 2>/dev/null; then
+  pass "Phase 4's phase_contract still requires validate_platform_ready/validate_observability_ready success before validate_shared_secrets_once's own if: permits it to succeed on a Deploy"
 else
-  fail "build_publish_and_deploy's if: does not explicitly require validate_shared_secrets_once.result == 'success'"
+  fail "Phase 4's phase_contract no longer requires validate_platform_ready/validate_observability_ready success"
 fi
 
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   set +e
-  UNDECLARED_NEEDS_FINAL_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+  UNDECLARED_NEEDS_FINAL_OUT="$(python3 - .github/workflows/00-main-goldengate-orchestrator.yaml "${PHASE_WORKFLOW_FILES[@]}" <<'PYEOF'
 import re
 import sys
 import yaml
 
-with open(sys.argv[1]) as f:
-    doc = yaml.safe_load(f)
-
 problems = []
-for job_name, job in doc["jobs"].items():
-    needs = job.get("needs")
-    if needs is None:
-        declared = set()
-    elif isinstance(needs, str):
-        declared = {needs}
-    else:
-        declared = set(needs)
+for path in sys.argv[1:]:
+    with open(path) as f:
+        doc = yaml.safe_load(f)
+    for job_name, job in (doc.get("jobs") or {}).items():
+        needs = job.get("needs")
+        if needs is None:
+            declared = set()
+        elif isinstance(needs, str):
+            declared = {needs}
+        else:
+            declared = set(needs)
 
-    job_copy = dict(job)
-    job_copy.pop("needs", None)
-    text = yaml.dump(job_copy, default_flow_style=False)
-    refs = set(re.findall(r"needs\.([A-Za-z0-9_-]+)\.", text))
+        job_copy = dict(job)
+        job_copy.pop("needs", None)
+        text = yaml.dump(job_copy, default_flow_style=False)
+        refs = set(re.findall(r"needs\.([A-Za-z0-9_-]+)\.", text))
 
-    undeclared = refs - declared
-    if undeclared:
-        problems.append(f"{job_name}: undeclared needs.{{{','.join(sorted(undeclared))}}}")
+        undeclared = refs - declared
+        if undeclared:
+            problems.append(f"{path}:{job_name}: undeclared needs.{{{','.join(sorted(undeclared))}}}")
 
 if problems:
     print("\n".join(problems))
@@ -8606,13 +8958,15 @@ PYEOF
   UNDECLARED_NEEDS_FINAL_STATUS=$?
   set -e
   if [ "$UNDECLARED_NEEDS_FINAL_STATUS" -eq 0 ]; then
-    pass "the platform_sync_once/validate_shared_secrets_once fail-closed fixes did not introduce any needs.<job> reference for a job outside that job's own declared needs: list"
+    pass "no job in MAIN or any phase file references needs.<job> for a job outside its own declared needs: list"
   else
     fail "an undeclared needs.<job> reference was introduced: ${UNDECLARED_NEEDS_FINAL_OUT}"
   fi
 else
   skip "undeclared-needs recheck -- python3/PyYAML unavailable"
 fi
+
+echo ""
 
 echo ""
 echo "--- Final workflow correction, Issue 3: no unverified Terraform module output dependency ---"
@@ -8954,9 +9308,10 @@ echo "--- VDR correction: structural rendered-image validation (replaces the fra
 
 # Real VDR evidence: deploy=false for gg-oracle-payments-01 correctly resolved IMAGE_REPOSITORY/IMAGE_TAG/IMAGE_DIGEST from ECR, but then failed at the OLD "Verify the rendered StatefulSet uses the selected verified image" step because it did `grep -qF "image: ${EXPECTED_IMAGE}"` against a rendered value that Helm intentionally quotes (`image: "repo:tag"`). The image was correct; only the text check was wrong. Fix: that grep-based step is REMOVED and its assertion is merged into the existing duplicate-key-safe PyYAML structural validator (no second, inconsistent Kubernetes-parsing implementation is introduced).
 
-if ! grep -qF 'grep -qF "image: ${EXPECTED_IMAGE}"' .github/workflows/00-main-goldengate-orchestrator.yaml 2>/dev/null \
-    && grep -qF 'main_container_image = main_container.get("image")' .github/workflows/00-main-goldengate-orchestrator.yaml 2>/dev/null \
-    && grep -qF 'if main_container_image != expected_image:' .github/workflows/00-main-goldengate-orchestrator.yaml 2>/dev/null; then
+# PHASE-ORIENTED ORCHESTRATION: build_publish_and_deploy now lives in 05-phase-runtimes.yaml, not MAIN directly.
+if ! grep -qF 'grep -qF "image: ${EXPECTED_IMAGE}"' .github/workflows/05-phase-runtimes.yaml 2>/dev/null \
+    && grep -qF 'main_container_image = main_container.get("image")' .github/workflows/05-phase-runtimes.yaml 2>/dev/null \
+    && grep -qF 'if main_container_image != expected_image:' .github/workflows/05-phase-runtimes.yaml 2>/dev/null; then
   pass "VDR-IMG 1: image validation is now structural YAML field comparison (main_container.get(\"image\") != expected_image), not a grep against the rendered text"
 else
   fail "VDR-IMG 1: structural image-identity comparison is missing, or the obsolete grep-based text check is still present"
@@ -9294,16 +9649,17 @@ else
   skip "VDR-MON: monitor_dry_run_validation structural checks -- python3/PyYAML unavailable"
 fi
 
-if grep -qF "if: \${{ needs.validate_model.outputs.effective_deploy == 'false' && needs.validate_model.outputs.has_active_deployments == 'true' && always() && needs.validate_shared_secrets_once.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' && needs.replication_dry_run_validation.result != 'failure' && needs.replication_dry_run_validation.result != 'cancelled' }}" "$EKS_APP_WORKFLOW" 2>/dev/null; then
-  pass "VDR-MON 14: monitor_dry_run_validation's deploy=false job-gating if: condition retains every original clause plus the additive has_active_deployments=='true' gate"
+# PHASE-ORIENTED ORCHESTRATION: monitor_dry_run_validation/monitor_sync_once now live in 07-phase-monitor-acceptance.yaml and read effective_deploy/has_active_deployments via inputs.* (relayed unchanged from validate_model by Phase 1 through every intervening phase) rather than needs.validate_model.outputs.*; the cross-phase clauses this if: text used to spell out directly (validate_shared_secrets_once/build_publish_and_deploy/delete_removed_argocd_applications/replication_dry_run_validation/replication_reconcile_once success/non-failure) are structurally impossible as a same-file needs: reference now that those jobs live in Phase 4/5/6 -- that guarantee is instead enforced by Phase 7 only ever starting once Phase 3/4/5/6 have all transitively succeeded (MAIN own phase-caller needs: chain, verified elsewhere in this suite), so it is re-checked here only via the local, still-directly-expressible clauses.
+if grep -qF "if: \${{ inputs.effective_deploy == 'false' && inputs.has_active_deployments == 'true' }}" .github/workflows/07-phase-monitor-acceptance.yaml 2>/dev/null; then
+  pass "VDR-MON 14: monitor_dry_run_validation's deploy=false job-gating if: condition retains its local has_active_deployments=='true' gate; the retired cross-phase clauses are now enforced transitively via Phase 7's own downstream position in MAIN's phase-caller chain"
 else
   fail "VDR-MON 14: monitor_dry_run_validation's deploy=false job-gating if: condition was unexpectedly modified"
 fi
 
-if grep -qF "uses: ./.github/workflows/50-sub-monitor.yaml" "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && grep -qF "deploy: true" "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && grep -qF "needs.validate_model.outputs.effective_deploy == 'true' && needs.validate_model.outputs.has_active_deployments == 'true' && always() && needs.validate_shared_secrets_once.result == 'success'" "$EKS_APP_WORKFLOW" 2>/dev/null; then
-  pass "VDR-MON 15: monitor_sync_once's deploy=true reusable-workflow call (50-sub-monitor.yaml, deploy: true) is unchanged, and its job-gating if: condition retains every original clause plus the additive has_active_deployments=='true' gate"
+if grep -qF "uses: ./.github/workflows/50-sub-monitor.yaml" .github/workflows/07-phase-monitor-acceptance.yaml 2>/dev/null \
+    && grep -qF "deploy: true" .github/workflows/07-phase-monitor-acceptance.yaml 2>/dev/null \
+    && grep -qF "inputs.effective_deploy == 'true' && inputs.has_active_deployments == 'true' && always() && needs.monitor_ownership_preflight.result == 'success'" .github/workflows/07-phase-monitor-acceptance.yaml 2>/dev/null; then
+  pass "VDR-MON 15: monitor_sync_once's deploy=true reusable-workflow call (50-sub-monitor.yaml, deploy: true) is unchanged, and its job-gating if: condition retains its local has_active_deployments=='true' gate plus its own monitor_ownership_preflight requirement"
 else
   fail "VDR-MON 15: monitor_sync_once's deploy=true path appears to have changed"
 fi
@@ -9327,26 +9683,27 @@ step_run = (active_step or {}).get("run", "")
 results.append(("3: has_active_deployments is derived from the canonical registry, not deployment_matrix", "goldengate-deployment-model.py --environment \"${GG_SELECTED_ENVIRONMENT}\" registry" in step_run and "outputs.deployment_matrix" not in step_run and "DEPLOYMENT_MATRIX" not in step_run))
 results.append(("4: the active-runtime step never greps YAML (uses PyYAML safe_load)", "grep" not in step_run and "yaml.safe_load" in step_run))
 
+# PHASE-ORIENTED ORCHESTRATION: monitor_sync_once/monitor_dry_run_validation now read effective_deploy/has_active_deployments via inputs.* (relayed from validate_model through every intervening phase), never needs.validate_model.outputs.* directly; their old cross-phase dependency clauses (validate_shared_secrets_once, replication_reconcile_once/replication_dry_run_validation) are structurally impossible now that those jobs live in Phase 4/6 -- enforced instead by Phase 7 only ever starting once Phase 3/4/5/6 have all transitively succeeded.
 monitor_sync_if = jobs["monitor_sync_once"]["if"]
-results.append(("5: monitor_sync_once requires has_active_deployments == \'\''true\'\''", "needs.validate_model.outputs.has_active_deployments == '"'"'true'"'"'" in monitor_sync_if))
-results.append(("6: monitor_sync_once retains its original effective_deploy/dependency clauses", "needs.validate_model.outputs.effective_deploy == '"'"'true'"'"'" in monitor_sync_if and "needs.validate_shared_secrets_once.result == '"'"'success'"'"'" in monitor_sync_if and "needs.replication_reconcile_once.result != '"'"'cancelled'"'"'" in monitor_sync_if))
+results.append(("5: monitor_sync_once requires has_active_deployments == \'\''true\'\''", "inputs.has_active_deployments == '"'"'true'"'"'" in monitor_sync_if))
+results.append(("6: monitor_sync_once retains its original effective_deploy clause plus its own local monitor_ownership_preflight requirement", "inputs.effective_deploy == '"'"'true'"'"'" in monitor_sync_if and "needs.monitor_ownership_preflight.result == '"'"'success'"'"'" in monitor_sync_if))
 
 dry_run_if = jobs["monitor_dry_run_validation"]["if"]
-results.append(("7: monitor_dry_run_validation requires has_active_deployments == \'\''true\'\''", "needs.validate_model.outputs.has_active_deployments == '"'"'true'"'"'" in dry_run_if))
-results.append(("8: monitor_dry_run_validation retains its original effective_deploy/dependency clauses", "needs.validate_model.outputs.effective_deploy == '"'"'false'"'"'" in dry_run_if and "needs.validate_shared_secrets_once.result == '"'"'success'"'"'" in dry_run_if and "needs.replication_dry_run_validation.result != '"'"'cancelled'"'"'" in dry_run_if))
+results.append(("7: monitor_dry_run_validation requires has_active_deployments == \'\''true\'\''", "inputs.has_active_deployments == '"'"'true'"'"'" in dry_run_if))
+results.append(("8: monitor_dry_run_validation retains its original effective_deploy clause", "inputs.effective_deploy == '"'"'false'"'"'" in dry_run_if))
 
 # Phase B3B rewired replication_monitor_acceptance to require validate_monitor_ready.result == "success" instead of monitor_sync_once directly (monitor reconciliation succeeding alone is not enough -- see the dedicated "Phase B3B" section below); validate_monitor_ready itself still requires monitor_sync_once.result == "success" and is skipped whenever monitor_sync_once is skipped (has_active_deployments != 'true'), so replication_monitor_acceptance still naturally skips too, transitively, with no separate has_active_deployments clause needed here.
 rma_if = jobs["replication_monitor_acceptance"]["if"]
 results.append(("9: replication_monitor_acceptance requires validate_monitor_ready.result == \'\''success\'\'' (naturally skips when validate_monitor_ready is skipped, transitively covering the no-active-runtime path)", "needs.validate_monitor_ready.result == '"'"'success'"'"'" in rma_if))
 
-# Phase B3B closeout: final_validation itself is now always() (never conditionally skipped) and delegates the actual mode-aware pass/fail decision to its own first step, whose script is inspected below -- both gated monitor jobs skipping cleanly (no active runtimes) must still let final_validation SUCCEED (allow_non_failure), while monitor_sync_once being REQUIRED-but-skipped when active runtimes DO exist must FAIL it (require_success in the has_active_deployments branch), and monitor_dry_run_validation being REQUIRED-but-skipped in dry-run mode must also FAIL it (require_success in the dry-run branch).
+# PHASE-ORIENTED ORCHESTRATION: the mode-aware pass/fail decision for monitor_sync_once/monitor_dry_run_validation now lives in Phase 7 own phase_contract step (always() so it never itself accidentally reports success merely because every internal job was cleanly skipped), not one flat final_validation script -- both gated monitor jobs skipping cleanly (no active runtimes) must still let Phase 7 contract SUCCEED (allow_non_failure), while monitor_sync_once being REQUIRED-but-skipped when active runtimes DO exist must FAIL it (require_success in the has_active_deployments branch), and monitor_dry_run_validation being REQUIRED-but-skipped in dry-run mode (with active runtimes) must also FAIL it (require_success in the dry-run branch). final_validation itself is still always() and needs phase_7_monitor_acceptance directly (verified in full by the dedicated 23/24-style checks and the Phase B3B closeout battery elsewhere in this suite).
 fv_if = jobs["final_validation"]["if"]
-final_val_gate_step = next((s for s in jobs["final_validation"]["steps"] if s.get("name") == "Validate the mode-aware final DEPLOY success contract"), None)
-final_val_gate_run = (final_val_gate_step or {}).get("run", "")
-results.append(("10a: final_validation'"'"'s own if: is always() (never itself skipped, so it can fail closed with diagnostics on a required-but-skipped job)", fv_if.strip() == "always()"))
-results.append(("10b: final_validation'"'"'s gate step requires exact success for monitor_sync_once when active runtimes exist", "require_success monitor_sync_once" in final_val_gate_run))
-results.append(("10c: final_validation'"'"'s gate step tolerates a cleanly-skipped monitor_sync_once when no active runtimes exist (allow_non_failure)", "allow_non_failure monitor_sync_once" in final_val_gate_run))
-results.append(("11: final_validation'"'"'s gate step requires exact success for monitor_dry_run_validation in dry-run mode", "require_success monitor_dry_run_validation" in final_val_gate_run))
+phase7_contract = jobs.get("phase_contract__07", {})
+phase7_contract_run = "\n".join(s.get("run", "") for s in phase7_contract.get("steps", []))
+results.append(("10a: final_validation'"'"'s own if: is always() (never itself skipped, so it can fail closed with diagnostics on a required-but-skipped phase)", fv_if.strip() == "always()"))
+results.append(("10b: Phase 7 own phase_contract requires exact success for monitor_sync_once when active runtimes exist", "require_success monitor_sync_once" in phase7_contract_run))
+results.append(("10c: Phase 7 own phase_contract tolerates a cleanly-skipped monitor_sync_once when no active runtimes exist (allow_non_failure)", "allow_non_failure monitor_sync_once" in phase7_contract_run))
+results.append(("11: Phase 7 own phase_contract requires exact success for monitor_dry_run_validation in dry-run mode (with active runtimes)", "require_success monitor_dry_run_validation" in phase7_contract_run))
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
@@ -10102,59 +10459,74 @@ else
   fail "Live Deploy UX Fix 2: O: the push-trigger branch of ${DETECT_SCRIPT} appears to have changed"
 fi
 
-# P: environment-wide Deploy (has_changes=false) does not make final_validation require the selected-runtime mutation jobs -- REALLY EXECUTE the committed "Validate the mode-aware final DEPLOY success contract" script for exactly this scenario (has_active_deployments=false, a synthetic fixture exercising the no-active-runtime code path -- the real current DEV registry now has active runtimes, proven separately elsewhere in this suite; this scenario remains a required, independently valid code path regardless).
+# PHASE-ORIENTED ORCHESTRATION P: environment-wide Deploy (has_changes=false, has_active_deployments=false) no longer makes ONE flat final_validation script require the selected-runtime/monitor mutation jobs -- that mode-aware decision is now split between Phase 5 own phase_contract (has_changes) and Phase 7 own phase_contract (has_active_deployments), each REALLY EXECUTED here for exactly this scenario; MAIN final_validation itself only requires each phase to have concluded success, already proven end-to-end by the "Phase B3B closeout" battery above.
 if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
   set +e
   LIVE_UX_FIX_2_GATE_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
 import os
 import subprocess
 import sys
+import tempfile
 import yaml
 
 with open(sys.argv[1]) as f:
     doc = yaml.safe_load(f)
+jobs = doc["jobs"]
 
-step = next((s for s in doc["jobs"]["final_validation"]["steps"] if s.get("name") == "Validate the mode-aware final DEPLOY success contract"), None)
-if step is None:
-    print("FAIL: final_validation is missing its 'Validate the mode-aware final DEPLOY success contract' step")
+
+def build_run_gate(job_name):
+    job = jobs.get(job_name)
+    if job is None:
+        print(f"FAIL: {job_name} is missing")
+        sys.exit(1)
+    steps = job.get("steps") or []
+    script = steps[0]["run"]
+    env_keys = list((steps[0].get("env") or {}).keys())
+    needs_list = job.get("needs") or []
+    if isinstance(needs_list, str):
+        needs_list = [needs_list]
+
+    def run_gate(overrides):
+        env = dict(os.environ)
+        for k in env_keys:
+            env[k] = ""
+        for j in needs_list:
+            env[f"RESULT_{j}"] = "success"
+        env.update(overrides)
+        env["GITHUB_OUTPUT"] = tempfile.mktemp()
+        return subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=20)
+
+    return run_gate
+
+
+p5_run_gate = build_run_gate("phase_contract__05")
+proc5 = p5_run_gate({
+    "EFFECTIVE_DEPLOY": "true", "HAS_CHANGES": "false", "HAS_DELETIONS": "false", "HAS_ACTIVE_DEPLOYMENTS": "false",
+    "RESULT_runtime_ownership_preflight": "skipped", "RESULT_build_publish_and_deploy": "skipped",
+    "RESULT_delete_removed_argocd_applications": "skipped", "RESULT_validate_active_runtimes": "skipped",
+})
+if proc5.returncode != 0:
+    print(f"FAIL: Phase 5 own phase_contract (has_changes=false, has_active_deployments=false) with every applicable prerequisite succeeding did NOT succeed (rc={proc5.returncode})\n{proc5.stdout}\n{proc5.stderr}")
     sys.exit(1)
-script = step["run"]
 
-ALL_RESULT_JOBS = (
-    # MAIN prerequisite fail-fast hardening: eks_oidc_preflight/managed_efs_deletion_guard/storage_transition_guard/managed_efs_inventory_guard/terraform_sync_once are now direct needs of final_validation, each with its own RESULT_ env reference in the real script -- must be present here so every run_gate() call below always binds them (the script's own set -u would otherwise abort on an unset variable for any scenario that does not explicitly override one of these five).
-    "eks_oidc_preflight", "detect_changed_deployments", "managed_efs_deletion_guard", "storage_transition_guard", "managed_efs_inventory_guard", "terraform_sync_once",
-    "validate_shared_secrets_once", "validate_argocd_ready", "validate_platform_ready", "validate_observability_ready",
-    "runtime_ownership_preflight", "build_publish_and_deploy", "delete_removed_argocd_applications",
-    "validate_active_runtimes", "replication_reconcile_once", "replication_dry_run_validation",
-    "monitor_ownership_preflight", "monitor_sync_once", "monitor_dry_run_validation",
-    "validate_monitor_ready", "replication_monitor_acceptance", "end_to_end_deployment_acceptance",
-)
-
-env = dict(os.environ)
-env["EFFECTIVE_DEPLOY"] = "true"
-env["HAS_ACTIVE_DEPLOYMENTS"] = "false"
-env["HAS_CHANGES"] = "false"
-env["HAS_DELETIONS"] = "false"
-skipped_jobs = {
-    "runtime_ownership_preflight", "build_publish_and_deploy", "delete_removed_argocd_applications",
-    "validate_active_runtimes", "replication_reconcile_once", "monitor_ownership_preflight",
-    "monitor_sync_once", "validate_monitor_ready", "replication_monitor_acceptance", "end_to_end_deployment_acceptance",
-    "replication_dry_run_validation", "monitor_dry_run_validation",
-}
-for job in ALL_RESULT_JOBS:
-    env[f"RESULT_{job}"] = "skipped" if job in skipped_jobs else "success"
-
-proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=20)
-if proc.returncode != 0:
-    print(f"FAIL: environment-wide Deploy (has_changes=false, has_active_deployments=false) with every applicable prerequisite succeeding did NOT succeed (rc={proc.returncode})\n{proc.stdout}\n{proc.stderr}")
+p7_run_gate = build_run_gate("phase_contract__07")
+proc7 = p7_run_gate({
+    "EFFECTIVE_DEPLOY": "true", "HAS_ACTIVE_DEPLOYMENTS": "false",
+    "RESULT_monitor_ownership_preflight": "skipped", "RESULT_monitor_sync_once": "skipped",
+    "RESULT_validate_monitor_ready": "skipped", "RESULT_replication_monitor_acceptance": "skipped",
+    "RESULT_end_to_end_deployment_acceptance": "skipped", "RESULT_monitor_dry_run_validation": "skipped",
+})
+if proc7.returncode != 0:
+    print(f"FAIL: Phase 7 own phase_contract (has_active_deployments=false) with every applicable prerequisite succeeding did NOT succeed (rc={proc7.returncode})\n{proc7.stdout}\n{proc7.stderr}")
     sys.exit(1)
+
 print("OK")
 PYEOF
 )"
   LIVE_UX_FIX_2_GATE_STATUS=$?
   set -e
   if [ "$LIVE_UX_FIX_2_GATE_STATUS" -eq 0 ]; then
-    pass "Live Deploy UX Fix 2: P: environment-wide Deploy (has_changes=false, has_active_deployments=false) succeeds without requiring the selected-runtime mutation jobs, while still requiring every applicable deploy prerequisite"
+    pass "Live Deploy UX Fix 2: P: environment-wide Deploy (has_changes=false, has_active_deployments=false) succeeds without requiring the selected-runtime/monitor mutation jobs, at their new Phase 5/Phase 7 phase_contract location, while still requiring every applicable deploy prerequisite"
   else
     fail "Live Deploy UX Fix 2: P: environment-wide Deploy final-gate execution proof failed:"$'\n'"${LIVE_UX_FIX_2_GATE_OUT}"
   fi
@@ -10202,14 +10574,15 @@ with open("'"$EKS_APP_WORKFLOW"'") as f:
     doc = yaml.safe_load(f)
 
 results = []
-expected = "${{ needs.validate_model.outputs.selected_environment }}"
+# PHASE-ORIENTED ORCHESTRATION: replication_dry_run_validation (06-phase-replication.yaml) and monitor_dry_run_validation (07-phase-monitor-acceptance.yaml) are no longer alongside validate_model in the same file -- their canonical GG_SELECTED_ENVIRONMENT source is the relayed inputs.selected_environment workflow_call input, exactly like every other job in a non-01-phase-readiness-safety.yaml phase file (see hack/check-goldengate-workflow-env-scope.py).
+expected = "${{ inputs.selected_environment }}"
 
 def check_job(job_name):
     job = doc["jobs"].get(job_name, {})
     job_env = job.get("env") or {}
     results.append((f"{job_name}: job-level env: defines GG_SELECTED_ENVIRONMENT (item 1/4)", "GG_SELECTED_ENVIRONMENT" in job_env))
     actual = str(job_env.get("GG_SELECTED_ENVIRONMENT", ""))
-    results.append((f"{job_name}: GG_SELECTED_ENVIRONMENT == needs.validate_model.outputs.selected_environment, got {actual!r} (item 2)", actual == expected))
+    results.append((f"{job_name}: GG_SELECTED_ENVIRONMENT == inputs.selected_environment, got {actual!r} (item 2)", actual == expected))
 
     steps = job.get("steps") or []
     referencing = [s for s in steps if "$GG_SELECTED_ENVIRONMENT" in (s.get("run") or "") or "${GG_SELECTED_ENVIRONMENT}" in (s.get("run") or "")]
@@ -10242,81 +10615,96 @@ else
   skip "Live Validate Fix 3: job-level GG_SELECTED_ENVIRONMENT binding checks -- python3/PyYAML unavailable or main workflow missing"
 fi
 
-# 6-11: the final gate's monitor dry-run applicability contract -- REALLY EXECUTE the committed "Validate the mode-aware final DEPLOY success contract" script (never a reimplementation) for every required Validate-mode scenario, plus a Deploy-mode reconfirmation that this task left the frozen contract unchanged.
+# PHASE-ORIENTED ORCHESTRATION 6-11: the dry-run applicability contract for replication_dry_run_validation and monitor_dry_run_validation now lives in Phase 6 own phase_contract and Phase 7 own phase_contract respectively (never one flat final_validation script) -- REALLY EXECUTE both committed scripts (never a reimplementation) for every required Validate-mode scenario, plus a Deploy-mode reconfirmation that this task left the frozen contract unchanged.
 if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
   set +e
   LIVE_FIX_3_GATE_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
 import os
 import subprocess
 import sys
+import tempfile
 import yaml
 
 with open(sys.argv[1]) as f:
     doc = yaml.safe_load(f)
+jobs = doc["jobs"]
 
-step = next((s for s in doc["jobs"]["final_validation"]["steps"] if s.get("name") == "Validate the mode-aware final DEPLOY success contract"), None)
-if step is None:
-    print("FAIL: final_validation is missing its 'Validate the mode-aware final DEPLOY success contract' step")
-    sys.exit(0)
-script = step["run"]
 
-ALL_RESULT_JOBS = (
-    # MAIN prerequisite fail-fast hardening: eks_oidc_preflight/managed_efs_deletion_guard/storage_transition_guard/managed_efs_inventory_guard/terraform_sync_once are now direct needs of final_validation, each with its own RESULT_ env reference in the real script -- must be present here so every run_gate() call below always binds them (the script's own set -u would otherwise abort on an unset variable for any scenario that does not explicitly override one of these five).
-    "eks_oidc_preflight", "detect_changed_deployments", "managed_efs_deletion_guard", "storage_transition_guard", "managed_efs_inventory_guard", "terraform_sync_once",
-    "validate_shared_secrets_once", "validate_argocd_ready", "validate_platform_ready", "validate_observability_ready",
-    "runtime_ownership_preflight", "build_publish_and_deploy", "delete_removed_argocd_applications",
-    "validate_active_runtimes", "replication_reconcile_once", "replication_dry_run_validation",
-    "monitor_ownership_preflight", "monitor_sync_once", "monitor_dry_run_validation",
-    "validate_monitor_ready", "replication_monitor_acceptance", "end_to_end_deployment_acceptance",
-)
-# Same default-skipped set the existing Live Deploy UX Fix 2 "P" scenario already uses -- validate_argocd_ready/validate_platform_ready/validate_observability_ready default to "success" so a REAL DEPLOY scenario's unconditional requirement for them is satisfiable without every scenario needing to spell them out.
-DEFAULT_SKIPPED = {
-    "runtime_ownership_preflight", "build_publish_and_deploy", "delete_removed_argocd_applications",
-    "validate_active_runtimes", "replication_reconcile_once", "monitor_ownership_preflight",
-    "monitor_sync_once", "validate_monitor_ready", "replication_monitor_acceptance", "end_to_end_deployment_acceptance",
-    "replication_dry_run_validation", "monitor_dry_run_validation",
-}
+def build_run_gate(job_name):
+    job = jobs[job_name]
+    script = job["steps"][0]["run"]
+    env_keys = list((job["steps"][0].get("env") or {}).keys())
+    needs_list = job.get("needs") or []
+    if isinstance(needs_list, str):
+        needs_list = [needs_list]
 
-def run_gate(effective_deploy, has_active, has_changes, has_deletions, overrides):
-    env = dict(os.environ)
-    env["EFFECTIVE_DEPLOY"] = effective_deploy
-    env["HAS_ACTIVE_DEPLOYMENTS"] = has_active
-    env["HAS_CHANGES"] = has_changes
-    env["HAS_DELETIONS"] = has_deletions
-    for job in ALL_RESULT_JOBS:
-        env[f"RESULT_{job}"] = "skipped" if job in DEFAULT_SKIPPED else "success"
-    for job, result in overrides.items():
-        env[f"RESULT_{job}"] = result
-    return subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=20)
+    def run_gate(overrides):
+        env = dict(os.environ)
+        for k in env_keys:
+            env[k] = ""
+        for j in needs_list:
+            env[f"RESULT_{j}"] = "success"
+        env.update(overrides)
+        env["GITHUB_OUTPUT"] = tempfile.mktemp()
+        return subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=20)
+
+    return run_gate
+
+
+p6_run_gate = build_run_gate("phase_contract__06")
+p7_run_gate = build_run_gate("phase_contract__07")
 
 results = []
 
-proc = run_gate("false", "false", "false", "false", {"replication_dry_run_validation": "success", "monitor_dry_run_validation": "skipped"})
-results.append(("6: current DEV Validate contract (replication=success, monitor=skipped, zero active runtimes) PASSES the final gate", proc.returncode == 0))
+proc = p6_run_gate({"EFFECTIVE_DEPLOY": "false", "HAS_ACTIVE_DEPLOYMENTS": "false", "RESULT_replication_dry_run_validation": "success"})
+proc7 = p7_run_gate({"EFFECTIVE_DEPLOY": "false", "HAS_ACTIVE_DEPLOYMENTS": "false", "RESULT_monitor_dry_run_validation": "skipped",
+                      "RESULT_monitor_ownership_preflight": "skipped", "RESULT_monitor_sync_once": "skipped",
+                      "RESULT_validate_monitor_ready": "skipped", "RESULT_replication_monitor_acceptance": "skipped",
+                      "RESULT_end_to_end_deployment_acceptance": "skipped"})
+results.append(("6: current DEV Validate contract (replication=success, monitor=skipped, zero active runtimes) PASSES both Phase 6 and Phase 7 own contracts", proc.returncode == 0 and proc7.returncode == 0))
 
-proc = run_gate("false", "true", "false", "false", {"replication_dry_run_validation": "success", "monitor_dry_run_validation": "skipped"})
-results.append(("7: Validate mode with active runtimes + monitor_dry_run_validation=skipped FAILS the final gate", proc.returncode != 0))
+proc7 = p7_run_gate({"EFFECTIVE_DEPLOY": "false", "HAS_ACTIVE_DEPLOYMENTS": "true", "RESULT_monitor_dry_run_validation": "skipped",
+                      "RESULT_monitor_ownership_preflight": "skipped", "RESULT_monitor_sync_once": "skipped",
+                      "RESULT_validate_monitor_ready": "skipped", "RESULT_replication_monitor_acceptance": "skipped",
+                      "RESULT_end_to_end_deployment_acceptance": "skipped"})
+results.append(("7: Validate mode with active runtimes + monitor_dry_run_validation=skipped FAILS Phase 7 own contract", proc7.returncode != 0))
 
-proc = run_gate("false", "true", "false", "false", {"replication_dry_run_validation": "success", "monitor_dry_run_validation": "success"})
-results.append(("8: Validate mode with active runtimes + both dry-run jobs succeeding PASSES the final gate", proc.returncode == 0))
+proc7 = p7_run_gate({"EFFECTIVE_DEPLOY": "false", "HAS_ACTIVE_DEPLOYMENTS": "true", "RESULT_monitor_dry_run_validation": "success",
+                      "RESULT_monitor_ownership_preflight": "skipped", "RESULT_monitor_sync_once": "skipped",
+                      "RESULT_validate_monitor_ready": "skipped", "RESULT_replication_monitor_acceptance": "skipped",
+                      "RESULT_end_to_end_deployment_acceptance": "skipped"})
+results.append(("8: Validate mode with active runtimes + monitor_dry_run_validation succeeding PASSES Phase 7 own contract", proc7.returncode == 0))
 
-proc = run_gate("false", "false", "false", "false", {"replication_dry_run_validation": "skipped", "monitor_dry_run_validation": "skipped"})
-results.append(("9a: replication_dry_run_validation=skipped (zero active runtimes) FAILS the final gate", proc.returncode != 0))
+proc = p6_run_gate({"EFFECTIVE_DEPLOY": "false", "HAS_ACTIVE_DEPLOYMENTS": "false", "RESULT_replication_dry_run_validation": "skipped"})
+results.append(("9a: replication_dry_run_validation=skipped (zero active runtimes) FAILS Phase 6 own contract (unconditionally required for every dry run)", proc.returncode != 0))
 
-proc = run_gate("false", "true", "false", "false", {"replication_dry_run_validation": "failure", "monitor_dry_run_validation": "success"})
-results.append(("9b: replication_dry_run_validation=failure (active runtimes) FAILS the final gate", proc.returncode != 0))
+proc = p6_run_gate({"EFFECTIVE_DEPLOY": "false", "HAS_ACTIVE_DEPLOYMENTS": "true", "RESULT_replication_dry_run_validation": "failure"})
+results.append(("9b: replication_dry_run_validation=failure (active runtimes) FAILS Phase 6 own contract", proc.returncode != 0))
 
-proc = run_gate("false", "true", "false", "false", {"replication_dry_run_validation": "success", "monitor_dry_run_validation": "failure"})
-results.append(("10a: monitor_dry_run_validation=failure (active runtimes, applicable) FAILS the final gate", proc.returncode != 0))
+proc7 = p7_run_gate({"EFFECTIVE_DEPLOY": "false", "HAS_ACTIVE_DEPLOYMENTS": "true", "RESULT_monitor_dry_run_validation": "failure",
+                      "RESULT_monitor_ownership_preflight": "skipped", "RESULT_monitor_sync_once": "skipped",
+                      "RESULT_validate_monitor_ready": "skipped", "RESULT_replication_monitor_acceptance": "skipped",
+                      "RESULT_end_to_end_deployment_acceptance": "skipped"})
+results.append(("10a: monitor_dry_run_validation=failure (active runtimes, applicable) FAILS Phase 7 own contract", proc7.returncode != 0))
 
-proc = run_gate("false", "true", "false", "false", {"replication_dry_run_validation": "success", "monitor_dry_run_validation": "cancelled"})
-results.append(("10b: monitor_dry_run_validation=cancelled (active runtimes, applicable) FAILS the final gate", proc.returncode != 0))
+proc7 = p7_run_gate({"EFFECTIVE_DEPLOY": "false", "HAS_ACTIVE_DEPLOYMENTS": "true", "RESULT_monitor_dry_run_validation": "cancelled",
+                      "RESULT_monitor_ownership_preflight": "skipped", "RESULT_monitor_sync_once": "skipped",
+                      "RESULT_validate_monitor_ready": "skipped", "RESULT_replication_monitor_acceptance": "skipped",
+                      "RESULT_end_to_end_deployment_acceptance": "skipped"})
+results.append(("10b: monitor_dry_run_validation=cancelled (active runtimes, applicable) FAILS Phase 7 own contract", proc7.returncode != 0))
 
-proc = run_gate("false", "false", "false", "false", {"replication_dry_run_validation": "success", "monitor_dry_run_validation": "failure"})
-results.append(("10c: monitor_dry_run_validation=failure (zero active runtimes, should not have run) still FAILS the final gate -- a real failure is never silently accepted", proc.returncode != 0))
+proc7 = p7_run_gate({"EFFECTIVE_DEPLOY": "false", "HAS_ACTIVE_DEPLOYMENTS": "false", "RESULT_monitor_dry_run_validation": "failure",
+                      "RESULT_monitor_ownership_preflight": "skipped", "RESULT_monitor_sync_once": "skipped",
+                      "RESULT_validate_monitor_ready": "skipped", "RESULT_replication_monitor_acceptance": "skipped",
+                      "RESULT_end_to_end_deployment_acceptance": "skipped"})
+results.append(("10c: monitor_dry_run_validation=failure (zero active runtimes, should not have run) still FAILS Phase 7 own contract -- a real failure is never silently accepted", proc7.returncode != 0))
 
-proc = run_gate("true", "false", "false", "false", {})
-results.append(("11: existing Deploy-mode contract (environment-wide Deploy, zero active runtimes, no selected mutation) is unchanged and still PASSES", proc.returncode == 0))
+proc = p6_run_gate({"EFFECTIVE_DEPLOY": "true", "HAS_ACTIVE_DEPLOYMENTS": "false"})
+proc7 = p7_run_gate({"EFFECTIVE_DEPLOY": "true", "HAS_ACTIVE_DEPLOYMENTS": "false",
+                      "RESULT_monitor_ownership_preflight": "skipped", "RESULT_monitor_sync_once": "skipped",
+                      "RESULT_validate_monitor_ready": "skipped", "RESULT_replication_monitor_acceptance": "skipped",
+                      "RESULT_end_to_end_deployment_acceptance": "skipped", "RESULT_monitor_dry_run_validation": "skipped"})
+results.append(("11: existing Deploy-mode contract (environment-wide Deploy, zero active runtimes, no selected mutation) is unchanged and still PASSES both Phase 6 and Phase 7 own contracts", proc.returncode == 0 and proc7.returncode == 0))
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
@@ -10412,8 +10800,8 @@ echo "--- Live Deploy Fix 4: repository-wide GG_SELECTED_ENVIRONMENT scope harde
 if [ -f "$ENV_SCOPE_CHECKER" ]; then
   ENV_SCOPE_REAL_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 "$ENV_SCOPE_CHECKER" 2>&1)"
   ENV_SCOPE_REAL_STATUS=$?
-  if [ "$ENV_SCOPE_REAL_STATUS" -eq 0 ] && grep -q "^Workflows inspected: 9$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^Jobs with GG_SELECTED_ENVIRONMENT run: references: 22$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^Unsafe jobs: 0$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^OK: zero unsafe GG_SELECTED_ENVIRONMENT references" <<< "$ENV_SCOPE_REAL_OUT"; then
-    pass "Live Deploy Fix 4: 1-5,14: ${ENV_SCOPE_CHECKER} reports 9 workflows inspected, 22 jobs referencing GG_SELECTED_ENVIRONMENT, and ZERO unsafe jobs against the real current repository"
+  if [ "$ENV_SCOPE_REAL_STATUS" -eq 0 ] && grep -q "^Workflows inspected: 16$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^Jobs with GG_SELECTED_ENVIRONMENT run: references: 22$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^Unsafe jobs: 0$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^OK: zero unsafe GG_SELECTED_ENVIRONMENT references" <<< "$ENV_SCOPE_REAL_OUT"; then
+    pass "Live Deploy Fix 4: 1-5,14: ${ENV_SCOPE_CHECKER} reports 16 workflows inspected (the original 9 plus the seven new phase files), 22 jobs referencing GG_SELECTED_ENVIRONMENT, and ZERO unsafe jobs against the real current repository"
   else
     fail "Live Deploy Fix 4: 1-5,14: ${ENV_SCOPE_CHECKER} did not report the expected zero-violation inventory against the real repository (status=${ENV_SCOPE_REAL_STATUS}):"$'\n'"${ENV_SCOPE_REAL_OUT}"
   fi
@@ -10421,75 +10809,105 @@ else
   fail "Live Deploy Fix 4: 1-5,14: ${ENV_SCOPE_CHECKER} does not exist"
 fi
 
-# 6-11: mutation-style regression proof -- the checker MUST fail closed the instant a job regresses to the exact live-defect pattern (missing job-level binding, or a step-only binding), and MUST pass once every job is correctly covered. Uses a real temp copy of the actual current main workflow (never a reimplementation/fixture), mutated in memory and written out, then the REAL checker script is invoked against it via subprocess -- exactly the same "real script execution" proof pattern established throughout this suite.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$ENV_SCOPE_CHECKER" ]; then
+# PHASE-ORIENTED ORCHESTRATION 6-11: mutation-style regression proof -- the checker MUST fail closed the instant a job regresses to the exact live-defect pattern (missing job-level binding, or a step-only binding), and MUST pass once every job is correctly covered. Rather than writing one job's mutated YAML into a single file misnamed 00-main-goldengate-orchestrator.yaml (which would place jobs that now live in a 0N-phase-*.yaml file under the wrong filename and change which expected-value branch the checker applies to them), this copies the REAL .github/workflows/ directory in full (never a reimplementation/fixture) and mutates only the specific file that actually owns each job -- managed_efs_inventory_guard lives in 01-phase-readiness-safety.yaml, replication_reconcile_once in 06-phase-replication.yaml, replication_monitor_acceptance in 07-phase-monitor-acceptance.yaml -- then the REAL checker script is invoked against that directory via subprocess, exactly the same "real script execution" proof pattern established throughout this suite (matching the Live Deployment Approval Topology Fix negative-test pattern above).
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$ENV_SCOPE_CHECKER" ]; then
   set +e
-  ENV_SCOPE_MUTATION_OUT="$(python3 - "$EKS_APP_WORKFLOW" "$ENV_SCOPE_CHECKER" <<'PYEOF'
-import copy
+  ENV_SCOPE_MUTATION_OUT="$(python3 - "$REPO_ROOT" "$ENV_SCOPE_CHECKER" <<'PYEOF'
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 
 import yaml
 
-workflow_path, checker_path = sys.argv[1], sys.argv[2]
-with open(workflow_path) as f:
-    real_doc = yaml.safe_load(f)
+repo_root, checker_path = sys.argv[1], sys.argv[2]
+src_wf_dir = os.path.join(repo_root, ".github", "workflows")
 
-MAIN_NAME = "00-main-goldengate-orchestrator.yaml"
+JOB_OWNING_FILE = {
+    "managed_efs_inventory_guard": "01-phase-readiness-safety.yaml",
+    "replication_reconcile_once": "06-phase-replication.yaml",
+    "replication_monitor_acceptance": "07-phase-monitor-acceptance.yaml",
+}
 
 
-def run_checker(doc):
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        with open(os.path.join(tmp_dir, MAIN_NAME), "w") as f:
-            yaml.safe_dump(doc, f, sort_keys=False)
-        proc = subprocess.run(
-            [sys.executable, checker_path, "--workflow-dir", tmp_dir],
-            capture_output=True, text=True, timeout=30,
-        )
-        return proc.returncode, proc.stdout + proc.stderr
+def run_checker(workflow_dir):
+    proc = subprocess.run(
+        [sys.executable, checker_path, "--workflow-dir", workflow_dir],
+        capture_output=True, text=True, timeout=30,
+    )
+    return proc.returncode, proc.stdout + proc.stderr
+
+
+def fresh_copy():
+    scratch = tempfile.mkdtemp(prefix="env-scope-mutation-")
+    dst_wf_dir = os.path.join(scratch, "workflows")
+    shutil.copytree(src_wf_dir, dst_wf_dir)
+    return scratch, dst_wf_dir
+
+
+def mutate_remove_job_level_binding(dst_wf_dir, job_name):
+    filename = JOB_OWNING_FILE[job_name]
+    path = os.path.join(dst_wf_dir, filename)
+    with open(path) as f:
+        doc = yaml.safe_load(f)
+    del doc["jobs"][job_name]["env"]["GG_SELECTED_ENVIRONMENT"]
+    with open(path, "w") as f:
+        yaml.safe_dump(doc, f, sort_keys=False)
 
 
 results = []
 
-# 6/9a: baseline -- the real, unmutated document must pass cleanly (zero violations).
-rc, out = run_checker(real_doc)
+# 6/9a: baseline -- the real, unmutated workflows directory must pass cleanly (zero violations).
+scratch, dst_wf_dir = fresh_copy()
+rc, out = run_checker(dst_wf_dir)
+shutil.rmtree(scratch, ignore_errors=True)
 results.append(("6: the real unmutated workflow passes the checker cleanly (baseline)", rc == 0 and "Unsafe jobs: 0" in out))
 
-# 7/9b: remove managed_efs_inventory_guard's job-level binding -- the checker MUST fail, and must name that exact job.
-mutated = copy.deepcopy(real_doc)
-del mutated["jobs"]["managed_efs_inventory_guard"]["env"]["GG_SELECTED_ENVIRONMENT"]
-rc, out = run_checker(mutated)
+# 7/9b: remove managed_efs_inventory_guard's job-level binding (01-phase-readiness-safety.yaml) -- the checker MUST fail, and must name that exact job.
+scratch, dst_wf_dir = fresh_copy()
+mutate_remove_job_level_binding(dst_wf_dir, "managed_efs_inventory_guard")
+rc, out = run_checker(dst_wf_dir)
+shutil.rmtree(scratch, ignore_errors=True)
 results.append(("7: removing managed_efs_inventory_guard's job-level binding makes the checker FAIL", rc != 0 and "job=managed_efs_inventory_guard" in out))
 
-# 8: restoring it (the real document again) makes the checker PASS again.
-rc, out = run_checker(real_doc)
+# 8: the real, unmutated directory again makes the checker PASS -- confirming 7's failure was caused by the mutation, not a stray leftover state.
+scratch, dst_wf_dir = fresh_copy()
+rc, out = run_checker(dst_wf_dir)
+shutil.rmtree(scratch, ignore_errors=True)
 results.append(("8: restoring the job-level binding makes the checker PASS again", rc == 0))
 
-# 9: remove replication_reconcile_once's job-level binding -- the checker MUST fail, and must name that exact job.
-mutated = copy.deepcopy(real_doc)
-del mutated["jobs"]["replication_reconcile_once"]["env"]["GG_SELECTED_ENVIRONMENT"]
-rc, out = run_checker(mutated)
+# 9: remove replication_reconcile_once's job-level binding (06-phase-replication.yaml) -- the checker MUST fail, and must name that exact job.
+scratch, dst_wf_dir = fresh_copy()
+mutate_remove_job_level_binding(dst_wf_dir, "replication_reconcile_once")
+rc, out = run_checker(dst_wf_dir)
+shutil.rmtree(scratch, ignore_errors=True)
 results.append(("9: removing replication_reconcile_once's job-level binding makes the checker FAIL", rc != 0 and "job=replication_reconcile_once" in out))
 
-# 10: remove replication_monitor_acceptance's job-level binding -- the checker MUST fail, and must name that exact job.
-mutated = copy.deepcopy(real_doc)
-del mutated["jobs"]["replication_monitor_acceptance"]["env"]["GG_SELECTED_ENVIRONMENT"]
-rc, out = run_checker(mutated)
+# 10: remove replication_monitor_acceptance's job-level binding (07-phase-monitor-acceptance.yaml) -- the checker MUST fail, and must name that exact job.
+scratch, dst_wf_dir = fresh_copy()
+mutate_remove_job_level_binding(dst_wf_dir, "replication_monitor_acceptance")
+rc, out = run_checker(dst_wf_dir)
+shutil.rmtree(scratch, ignore_errors=True)
 results.append(("10: removing replication_monitor_acceptance's job-level binding makes the checker FAIL", rc != 0 and "job=replication_monitor_acceptance" in out))
 
 # 11: convert managed_efs_inventory_guard back to a STEP-ONLY binding (the exact real live-defect shape: no job-level env, but the two affected steps each carry their own step-level env) -- the checker MUST still fail, proving step-only coverage is never accepted regardless of how many steps individually carry it.
-mutated = copy.deepcopy(real_doc)
-del mutated["jobs"]["managed_efs_inventory_guard"]["env"]["GG_SELECTED_ENVIRONMENT"]
+scratch, dst_wf_dir = fresh_copy()
+path = os.path.join(dst_wf_dir, JOB_OWNING_FILE["managed_efs_inventory_guard"])
+with open(path) as f:
+    doc = yaml.safe_load(f)
+del doc["jobs"]["managed_efs_inventory_guard"]["env"]["GG_SELECTED_ENVIRONMENT"]
 target_step_names = (
     "Compute expected managed-EFS inventory from the deployment model",
     "Compare expected vs actual managed-EFS inventory (fail closed on any orphan)",
 )
-for step in mutated["jobs"]["managed_efs_inventory_guard"]["steps"]:
+for step in doc["jobs"]["managed_efs_inventory_guard"]["steps"]:
     if step.get("name") in target_step_names:
         step["env"] = {"GG_SELECTED_ENVIRONMENT": "${{ needs.validate_model.outputs.selected_environment }}"}
-rc, out = run_checker(mutated)
+with open(path, "w") as f:
+    yaml.safe_dump(doc, f, sort_keys=False)
+rc, out = run_checker(dst_wf_dir)
+shutil.rmtree(scratch, ignore_errors=True)
 results.append(("11: converting managed_efs_inventory_guard to a STEP-ONLY binding (no job-level env) still makes the checker FAIL -- step-only coverage is never sufficient", rc != 0 and "job=managed_efs_inventory_guard" in out))
 
 for label, ok in results:
@@ -10770,8 +11188,9 @@ job = doc["jobs"]["terraform_sync_once"]
 with_block = job.get("with") or {}
 
 results = []
-results.append(("J1: terraform_sync_once passes terraform_governance_override from needs.validate_model.outputs.terraform_governance_override", with_block.get("terraform_governance_override") == "${{ needs.validate_model.outputs.terraform_governance_override == 'true' }}"))
-results.append(("J2: terraform_sync_once passes terraform_governance_override_reason from needs.validate_model.outputs.terraform_governance_override_reason", with_block.get("terraform_governance_override_reason") == "${{ needs.validate_model.outputs.terraform_governance_override_reason }}"))
+# PHASE-ORIENTED ORCHESTRATION: terraform_sync_once now lives in 02-phase-aws-prerequisites.yaml, a different file from validate_model (01-phase-readiness-safety.yaml) -- it reads the governance override via inputs.terraform_governance_override/_reason (relayed unchanged from validate_model.outputs.terraform_governance_override/_reason by Phase 1), never a same-file needs.validate_model reference.
+results.append(("J1: terraform_sync_once passes terraform_governance_override from inputs.terraform_governance_override (relayed from validate_model via the phase chain)", with_block.get("terraform_governance_override") == "${{ inputs.terraform_governance_override == 'true' }}"))
+results.append(("J2: terraform_sync_once passes terraform_governance_override_reason from inputs.terraform_governance_override_reason (relayed from validate_model via the phase chain)", with_block.get("terraform_governance_override_reason") == "${{ inputs.terraform_governance_override_reason }}"))
 results.append(("N: terraform_sync_once's if: still requires effective_deploy == 'true' -- Validate mode never runs Terraform regardless of the override input value", "effective_deploy == 'true'" in str(job.get("if", ""))))
 
 for label, ok in results:
@@ -11136,9 +11555,9 @@ else
   fail "Phase 11 4: an active workflow independently hardcodes a full IAM role ARN literal:"$'\n'"${ROLE_ARN_LITERAL_HITS}"
 fi
 
-# 5: every active workflow that needs canonical identity loads it via hack/goldengate-environment.py github-env after its own checkout -- GITHUB_ENV is job-local, so no job may assume another job's load already ran. 10-sub-iam-secrets.yaml is excluded: by design, it derives its sole canonical value (AWS_REGION) via a plain `get` call, not github-env.
+# 5: every active workflow that needs canonical identity loads it via hack/goldengate-environment.py github-env after its own checkout -- GITHUB_ENV is job-local, so no job may assume another job's load already ran. 10-sub-iam-secrets.yaml is excluded: by design, it derives its sole canonical value (AWS_REGION) via a plain `get` call, not github-env. PHASE-ORIENTED ORCHESTRATION: MAIN itself no longer calls this directly -- every job that needed canonical identity moved into a 0N-phase-*.yaml file (01/03/04/05/06/07; 02 only relays the Terraform governance override and never needs canonical identity itself), each of which is checked here in MAIN own place.
 MISSING_LOADER_HITS=""
-for wf in 00-main-goldengate-orchestrator.yaml 20-sub-argocd.yaml 30-sub-platform.yaml 50-sub-monitor.yaml 80-ops-monitor-metrics-config.yaml 40-sub-observability.yaml 90-ops-observability-artifact-sync.yaml 91-ops-ecr-image-sync.yaml; do
+for wf in 01-phase-readiness-safety.yaml 03-phase-argocd.yaml 04-phase-platform-observability.yaml 05-phase-runtimes.yaml 06-phase-replication.yaml 07-phase-monitor-acceptance.yaml 20-sub-argocd.yaml 30-sub-platform.yaml 50-sub-monitor.yaml 80-ops-monitor-metrics-config.yaml 40-sub-observability.yaml 90-ops-observability-artifact-sync.yaml 91-ops-ecr-image-sync.yaml; do
   if ! grep -q 'goldengate-environment.py --environment .* github-env' ".github/workflows/${wf}" 2>/dev/null; then
     MISSING_LOADER_HITS="${MISSING_LOADER_HITS}${wf}"$'\n'
   fi
@@ -11279,7 +11698,8 @@ results = []
 
 tsf_with = jobs["terraform_sync_once"].get("with", {}) or {}
 results.append(("8a: terraform_sync_once.with has no region key", "region" not in tsf_with))
-results.append(("8b: terraform_sync_once.with.environment is the selected_environment job output", tsf_with.get("environment") == "${{ needs.validate_model.outputs.selected_environment }}"))
+# PHASE-ORIENTED ORCHESTRATION: terraform_sync_once (02-phase-aws-prerequisites.yaml) reads inputs.selected_environment (relayed unchanged from validate_model.outputs.selected_environment by Phase 1), never a same-file needs.validate_model reference.
+results.append(("8b: terraform_sync_once.with.environment is inputs.selected_environment (relayed from validate_model via the phase chain)", tsf_with.get("environment") == "${{ inputs.selected_environment }}"))
 
 vm_outputs = jobs["validate_model"].get("outputs", {}) or {}
 results.append(("9: validate_model no longer exposes an aws_region output", "aws_region" not in vm_outputs))
@@ -11414,7 +11834,11 @@ results.append(("3: main workflow defines argocd_preflight", "argocd_preflight" 
 preflight = jobs.get("argocd_preflight", {})
 preflight_needs = preflight.get("needs") or []
 preflight_if = preflight.get("if", "")
-results.append(("4a: argocd_preflight runs after terraform_sync_once", "terraform_sync_once" in preflight_needs))
+# PHASE-ORIENTED ORCHESTRATION: argocd_preflight (03-phase-argocd.yaml -- Phase 3) and terraform_sync_once (02-phase-aws-prerequisites.yaml -- Phase 2) now live in different phase files, so a needs: edge between them is structurally impossible; the same ordering guarantee is instead enforced by MAIN own phase_3_argocd job needing phase_2_aws_prerequisites with no custom if:.
+phase3_caller = jobs.get("phase_3_argocd", {})
+phase2_caller = jobs.get("phase_2_aws_prerequisites", {})
+results.append(("4a: MAIN phase_3_argocd (which calls argocd_preflight) needs phase_2_aws_prerequisites (which calls terraform_sync_once)", "phase_2_aws_prerequisites" in (phase3_caller.get("needs") or [])))
+results.append(("4a: MAIN phase_3_argocd carries no custom if: (relies on the implicit all-needs-succeeded default)", "if" not in phase3_caller))
 results.append(("4b: argocd_preflight is real-deploy-only (effective_deploy == \x27true\x27)", "effective_deploy" in preflight_if and "== \x27true\x27" in preflight_if))
 results.append(("4c: argocd_preflight exposes a state job output", "state" in (preflight.get("outputs") or {})))
 
@@ -11437,13 +11861,14 @@ results.append(("10b: validate_argocd_ready is a single unified condition requir
 results.append(("10c: validate_argocd_ready no longer contains a state-specific HEALTHY/ABSENT branch condition (the dual-path logic was retired along with bootstrap_argocd)", "argocd_preflight.outputs.state ==" not in ready_if))
 results.append(("10d: validate_argocd_ready uses always() (defense in depth, matching this workflow'"'"'s established convergence-job pattern)", "always()" in ready_if))
 
-# Phase B2 inserts platform_preflight between validate_argocd_ready and platform_sync_once (see the dedicated "Phase B2" DAG checks elsewhere in this suite) -- platform_sync_once now depends on validate_argocd_ready transitively via platform_preflight, never as a direct edge.
+# Phase B2 inserts platform_preflight between validate_argocd_ready and platform_sync_once (see the dedicated "Phase B2" DAG checks elsewhere in this suite). PHASE-ORIENTED ORCHESTRATION: platform_preflight (Phase 4) and validate_argocd_ready (Phase 3) now live in different phase files, so a needs: edge is structurally impossible; enforced instead by MAIN own phase_4_platform_observability job needing phase_3_argocd with no custom if: (checked exhaustively by the dedicated Phase B2 section; re-checked here for locality with the rest of this Phase B1 battery).
 platform_preflight_b1 = jobs.get("platform_preflight", {})
 platform = jobs.get("platform_sync_once", {})
 platform_needs = platform.get("needs") or []
 platform_if = platform.get("if", "")
-results.append(("11: platform_preflight (and therefore platform_sync_once transitively) needs validate_argocd_ready", "validate_argocd_ready" in (platform_preflight_b1.get("needs") or [])))
-results.append(("12: platform_preflight requires validate_argocd_ready to have actually succeeded (BROKEN/failed Argo can never reach platform)", "needs.validate_argocd_ready.result == \x27success\x27" in platform_preflight_b1.get("if", "")))
+phase4_caller_b1 = jobs.get("phase_4_platform_observability", {})
+results.append(("11: MAIN phase_4_platform_observability (which calls platform_preflight) needs phase_3_argocd (which calls validate_argocd_ready)", "phase_3_argocd" in (phase4_caller_b1.get("needs") or [])))
+results.append(("12: MAIN phase_4_platform_observability carries no custom if: (BROKEN/failed Argo -- a failed Phase 3 -- can never reach Phase 4/platform)", "if" not in phase4_caller_b1))
 results.append(("12b: platform_sync_once needs platform_preflight (the actual direct edge in the new B2 chain)", "platform_preflight" in platform_needs))
 
 results.append(("13: reconcile_argocd still gates on effective_deploy == \x27true\x27 -- Validate mode can never mutate Argo CD", "effective_deploy == \x27true\x27" in reconcile_if))
@@ -11646,20 +12071,20 @@ try:
         print(f"FAIL baseline scratch copy unexpectedly failed:\n{out}")
         sys.exit(1)
 
-    # Negative test 1: strip the orchestrated_by_main passthrough from MAIN's reconcile_argocd call.
-    main_path = os.path.join(dst_wf_dir, "00-main-goldengate-orchestrator.yaml")
-    original = open(main_path).read()
+    # Negative test 1: strip the orchestrated_by_main passthrough from Phase 3's reconcile_argocd call (reconcile_argocd moved out of MAIN and into 03-phase-argocd.yaml under the phase-oriented refactor).
+    phase3_path = os.path.join(dst_wf_dir, "03-phase-argocd.yaml")
+    original = open(phase3_path).read()
     stripped = original.replace(
-        "      environment: ${{ needs.validate_model.outputs.selected_environment }}\n      orchestrated_by_main: true\n\n  validate_argocd_ready:",
-        "      environment: ${{ needs.validate_model.outputs.selected_environment }}\n\n  validate_argocd_ready:",
+        "      environment: ${{ inputs.selected_environment }}\n      orchestrated_by_main: true\n\n  validate_argocd_ready:",
+        "      environment: ${{ inputs.selected_environment }}\n\n  validate_argocd_ready:",
         1,
     )
     if stripped == original:
         print("FAIL negative test 1 substitution did not match the real file")
         sys.exit(1)
-    open(main_path, "w").write(stripped)
+    open(phase3_path, "w").write(stripped)
     rc, out = run_checker()
-    open(main_path, "w").write(original)
+    open(phase3_path, "w").write(original)
     if rc == 0 or "orchestrated_by_main: true" not in out:
         print(f"FAIL negative test 1 (missing orchestrated_by_main passthrough) was not caught:\n{out}")
         sys.exit(1)
@@ -11710,137 +12135,14 @@ else
   skip "Live Deployment Approval Topology Fix: ${APPROVAL_TOPOLOGY_CHECKER} negative-test proof -- python3 unavailable or checker missing"
 fi
 
-# Scenarios A/B/C/J (MAIN side) are simulated in real DAG order against the SAME goldengate_deploy_authorization-aware JOB_ORDER/simulate/base_context harness proven above for the fail-closed job graph -- this is not a fresh reimplementation, it is the identical real if: expressions, re-invoked with new fixtures.
+# PHASE-ORIENTED ORCHESTRATION: Scenarios A/B/C/J now reuse the shared gg_phase_sim module (see its definition near the top of this script) instead of a bespoke MAIN-only JOB_ORDER -- goldengate_deploy_authorization lives in 03-phase-argocd.yaml, so its downstream effects are simulated across Phase 3/4/5 exactly like every other cross-phase scenario in this suite.
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   set +e
-  MAIN_SCENARIOS_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
-import re
+  MAIN_SCENARIOS_OUT="$(python3 - "$WORKDIR" <<'PYEOF'
 import sys
-import yaml
 
-with open(sys.argv[1]) as f:
-    doc = yaml.safe_load(f)
-
-jobs = doc["jobs"]
-
-
-def _extract_if(job_name):
-    raw = jobs[job_name].get("if", "true")
-    raw = str(raw).strip()
-    if raw.startswith("${{") and raw.endswith("}}"):
-        raw = raw[3:-2].strip()
-    return raw
-
-
-class _Parser:
-    def __init__(self, expr, needs):
-        self.expr = expr
-        self.needs = needs
-        self.pos = 0
-
-    def _skip_ws(self):
-        while self.pos < len(self.expr) and self.expr[self.pos].isspace():
-            self.pos += 1
-
-    def parse(self):
-        result = self._or()
-        self._skip_ws()
-        if self.pos != len(self.expr):
-            raise ValueError(f"trailing content: {self.expr[self.pos:]!r}")
-        return result
-
-    def _or(self):
-        left = self._and()
-        self._skip_ws()
-        while self.expr[self.pos:self.pos + 2] == "||":
-            self.pos += 2
-            right = self._and()
-            left = left or right
-            self._skip_ws()
-        return left
-
-    def _and(self):
-        left = self._atom()
-        self._skip_ws()
-        while self.expr[self.pos:self.pos + 2] == "&&":
-            self.pos += 2
-            right = self._atom()
-            left = left and right
-            self._skip_ws()
-        return left
-
-    def _atom(self):
-        self._skip_ws()
-        if self.expr[self.pos] == "(":
-            self.pos += 1
-            val = self._or()
-            self._skip_ws()
-            assert self.expr[self.pos] == ")"
-            self.pos += 1
-            return val
-        if self.expr[self.pos:self.pos + 8] == "always()":
-            self.pos += 8
-            return True
-        left_val = self._value()
-        self._skip_ws()
-        op = self.expr[self.pos:self.pos + 2]
-        if op in ("==", "!="):
-            self.pos += 2
-            right_val = self._value()
-            return left_val == right_val if op == "==" else left_val != right_val
-        return bool(left_val)
-
-    def _value(self):
-        self._skip_ws()
-        if self.expr[self.pos] == "'":
-            self.pos += 1
-            start = self.pos
-            while self.expr[self.pos] != "'":
-                self.pos += 1
-            val = self.expr[start:self.pos]
-            self.pos += 1
-            return val
-        m = re.match(r"needs\.([A-Za-z0-9_]+)\.result", self.expr[self.pos:])
-        if m:
-            self.pos += m.end()
-            return self.needs.get(m.group(1), {}).get("result", "")
-        m = re.match(r"needs\.([A-Za-z0-9_]+)\.outputs\.([A-Za-z0-9_]+)", self.expr[self.pos:])
-        if m:
-            self.pos += m.end()
-            return self.needs.get(m.group(1), {}).get("outputs", {}).get(m.group(2), "")
-        raise ValueError(f"cannot parse value at: {self.expr[self.pos:self.pos + 40]!r}")
-
-
-def eval_gha_bool(expr, needs):
-    return bool(_Parser(expr, needs).parse())
-
-
-JOB_ORDER = ["terraform_sync_once", "argocd_preflight", "goldengate_deploy_authorization", "reconcile_argocd", "validate_argocd_ready", "platform_preflight", "observability_preflight", "platform_sync_once", "observability_sync_once", "validate_platform_ready", "validate_observability_ready", "validate_shared_secrets_once", "runtime_ownership_preflight", "build_publish_and_deploy"]
-IF_EXPRS = {job: _extract_if(job) for job in JOB_ORDER}
-
-
-def simulate(initial, outcome_when_run, outputs_when_run=None):
-    results = dict(initial)
-    outputs_when_run = outputs_when_run or {}
-    for job in JOB_ORDER:
-        would_run = eval_gha_bool(IF_EXPRS[job], results)
-        if would_run:
-            results[job] = {"result": outcome_when_run.get(job, "success"), "outputs": outputs_when_run.get(job, {})}
-        else:
-            results[job] = {"result": "skipped", "outputs": {}}
-    return results
-
-
-def base_context(effective_deploy, has_changes="true"):
-    return {
-        "validate_model": {"result": "success", "outputs": {"effective_deploy": effective_deploy}},
-        "eks_oidc_preflight": {"result": "success", "outputs": {}},
-        "detect_changed_deployments": {"result": "success", "outputs": {"has_changes": has_changes}},
-        "managed_efs_deletion_guard": {"result": "success", "outputs": {}},
-        "storage_transition_guard": {"result": "success", "outputs": {}},
-        "managed_efs_inventory_guard": {"result": "success", "outputs": {}},
-    }
-
+sys.path.insert(0, sys.argv[1])
+import gg_phase_sim as sim
 
 failures = []
 
@@ -11850,39 +12152,35 @@ def check(label, condition):
         failures.append(label)
 
 
-# Scenario A: action=validate (effective_deploy=false) -> no operator approval is ever created and Argo CD is never mutated. build_publish_and_deploy legitimately still runs its own pre-existing read-only Helm lint/render dry-run path in this mode (proven independently by the existing "5: deploy=false" scenario above) -- that pre-existing dry-run eligibility is not itself a mutation and is out of scope for this fix.
-ctx = base_context("false")
-ctx["managed_efs_inventory_guard"] = {"result": "skipped", "outputs": {}}
-r = simulate(ctx, {})
+# Scenario A: action=validate (effective_deploy=false) -> no operator approval is ever created and Argo CD is never mutated.
+r, c = sim.simulate_all("false")
 check("A: goldengate_deploy_authorization must be skipped in Validate mode (no approval created)", r["goldengate_deploy_authorization"]["result"] == "skipped")
 check("A: reconcile_argocd must be skipped in Validate mode (no Argo CD mutation)", r["reconcile_argocd"]["result"] == "skipped")
 
-# Scenario B: deploy=true + Argo CD OWNED (an already-existing, safely-owned release) -- the single authorization runs and succeeds, reconcile_argocd ALWAYS runs, final Argo HEALTHY convergence succeeds, and the whole rollout remains eligible off that ONE approval.
-ctx = base_context("true")
-r = simulate(ctx, {}, {"argocd_preflight": {"state": "OWNED"}, "platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}, "runtime_ownership_preflight": {"state": "OWNED"}})
+# Scenario B: deploy=true + Argo CD OWNED -- the single authorization runs and succeeds, reconcile_argocd ALWAYS runs, final Argo HEALTHY convergence succeeds, and the whole rollout remains eligible off that ONE approval.
+r, c = sim.simulate_all("true", outputs_when_run={"argocd_preflight": {"state": "OWNED"}, "platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
 check("B: goldengate_deploy_authorization must run and succeed", r["goldengate_deploy_authorization"]["result"] == "success")
 check("B: reconcile_argocd must run and succeed on OWNED", r["reconcile_argocd"]["result"] == "success")
 check("B: validate_argocd_ready must converge to success", r["validate_argocd_ready"]["result"] == "success")
 check("B: build_publish_and_deploy must remain eligible after the single authorization", r["build_publish_and_deploy"]["result"] == "success")
 
 # Scenario C: reproduces the real live incident -- Platform ABSENT + Observability ABSENT, both reconciled under the SAME single goldengate_deploy_authorization approval, with no operator interaction required between them.
-ctx = base_context("true")
-r = simulate(ctx, {}, {"argocd_preflight": {"state": "OWNED"}, "platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "ABSENT"}})
+r, c = sim.simulate_all("true", outputs_when_run={"argocd_preflight": {"state": "OWNED"}, "platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "ABSENT"}})
 check("C: goldengate_deploy_authorization must run and succeed exactly once", r["goldengate_deploy_authorization"]["result"] == "success")
 check("C: platform_sync_once must be eligible to run (ABSENT)", r["platform_sync_once"]["result"] == "success")
 check("C: observability_sync_once must be eligible to run (ABSENT)", r["observability_sync_once"]["result"] == "success")
 check("C: validate_platform_ready must succeed", r["validate_platform_ready"]["result"] == "success")
 check("C: validate_observability_ready must succeed", r["validate_observability_ready"]["result"] == "success")
 
-# Scenario J: the single authorization itself fails or is cancelled -> no application mutation job is eligible anywhere downstream.
+# Scenario J: the single authorization itself fails or is cancelled -> no application mutation job is eligible anywhere downstream (Phase 3's own contract fails, so Phases 4/5 never even start).
 for bad_result in ("failure", "cancelled"):
-    ctx = base_context("true")
-    r = simulate(ctx, {"goldengate_deploy_authorization": bad_result})
+    r, c = sim.simulate_all("true", outcome_when_run={"goldengate_deploy_authorization": bad_result})
     check(f"J: goldengate_deploy_authorization must report {bad_result}", r["goldengate_deploy_authorization"]["result"] == bad_result)
     check(f"J: reconcile_argocd must be skipped when authorization is {bad_result}", r["reconcile_argocd"]["result"] == "skipped")
     check(f"J: validate_argocd_ready must be skipped when authorization is {bad_result}", r["validate_argocd_ready"]["result"] == "skipped")
-    check(f"J: platform_sync_once must be skipped when authorization is {bad_result}", r["platform_sync_once"]["result"] == "skipped")
-    check(f"J: build_publish_and_deploy must be skipped when authorization is {bad_result}", r["build_publish_and_deploy"]["result"] == "skipped")
+    check(f"J: Phase 3 contract must fail when authorization is {bad_result}", c[3] == "failure")
+    check(f"J: platform_sync_once must be skipped when authorization is {bad_result} (Phase 4 never starts)", r["platform_sync_once"]["result"] == "skipped")
+    check(f"J: build_publish_and_deploy must be skipped when authorization is {bad_result} (Phase 5 never starts)", r["build_publish_and_deploy"]["result"] == "skipped")
 
 if failures:
     print("\n".join(failures))
@@ -11896,7 +12194,7 @@ PYEOF
     pass "Scenario A: action=validate never creates the goldengate_deploy_authorization approval and never runs reconcile_argocd/build_publish_and_deploy"
     pass "Scenario B: deploy=true + Argo CD OWNED runs the single authorization, always reconciles Argo CD, converges to HEALTHY, and leaves the whole rollout eligible"
     pass "Scenario C: Platform ABSENT + Observability ABSENT (the real live incident) are both covered by the SAME single authorization, with no operator interaction required between them"
-    pass "Scenario J: a failed or cancelled goldengate_deploy_authorization leaves no application mutation job eligible anywhere downstream"
+    pass "Scenario J: a failed or cancelled goldengate_deploy_authorization fails Phase 3's own contract, leaving no application mutation job eligible anywhere downstream (Phases 4/5 never even start)"
   else
     fail "Live Deployment Approval Topology Fix Scenarios A/B/C/J: MAIN-side simulation found violation(s): ${MAIN_SCENARIOS_OUT}"
   fi
@@ -12316,8 +12614,11 @@ observability_preflight_needs = observability_preflight.get("needs") or []
 platform_preflight_if = platform_preflight.get("if", "")
 observability_preflight_if = observability_preflight.get("if", "")
 
-results.append(("4a: platform_preflight depends on validate_argocd_ready", "validate_argocd_ready" in platform_preflight_needs))
-results.append(("4b: observability_preflight depends on validate_argocd_ready", "validate_argocd_ready" in observability_preflight_needs))
+# PHASE-ORIENTED ORCHESTRATION: platform_preflight/observability_preflight now live in 04-phase-platform-observability.yaml, a different file from validate_argocd_ready (03-phase-argocd.yaml) -- a needs: edge between them is structurally impossible, so this dependency is instead enforced by MAIN own phase_4_platform_observability job needing phase_3_argocd with no custom if: (implicit all-needs-succeeded default).
+phase4_caller = jobs.get("phase_4_platform_observability", {})
+phase4_caller_needs = phase4_caller.get("needs") or []
+results.append(("4a/4b: MAIN phase_4_platform_observability (which calls platform_preflight/observability_preflight) needs phase_3_argocd (which calls validate_argocd_ready)", "phase_3_argocd" in phase4_caller_needs))
+results.append(("4a/4b: MAIN phase_4_platform_observability carries no custom if: (relies on the implicit all-needs-succeeded default)", "if" not in phase4_caller))
 results.append(("5a: platform_preflight is real-deploy-only (effective_deploy == \x27true\x27)", "effective_deploy" in platform_preflight_if and "== \x27true\x27" in platform_preflight_if))
 results.append(("5b: observability_preflight is real-deploy-only (effective_deploy == \x27true\x27)", "effective_deploy" in observability_preflight_if and "== \x27true\x27" in observability_preflight_if))
 
@@ -12410,138 +12711,14 @@ else
   skip "Phase B2: CHART_VERSION cross-file consistency -- python3 unavailable or observability_acceptance.py missing"
 fi
 
-# DAG simulation: the four-scenario matrix (HEALTHY/ABSENT+success/ABSENT+failure/BROKEN) for platform and observability independently, plus cross-component convergence -- exercised against the real if: expressions, never a text/regex match against the workflow author's own wording.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+# DAG simulation: the four-scenario matrix (OWNED/ABSENT+success/ABSENT+failure/BROKEN) for platform and observability independently, plus cross-component convergence -- exercised against the real if: expressions via the shared gg_phase_sim module (see its definition near the top of this script), never a text/regex match against the workflow author's own wording. platform_preflight/observability_preflight/platform_sync_once/observability_sync_once/validate_platform_ready/validate_observability_ready/validate_shared_secrets_once are all local to Phase 4 (04-phase-platform-observability.yaml); build_publish_and_deploy (Phase 5) is only reachable when Phase 4's own contract succeeds.
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
   set +e
-  PHASE_B2_SIM_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
-import re
+  PHASE_B2_SIM_OUT="$(python3 - "$WORKDIR" <<'PYEOF'
 import sys
-import yaml
 
-with open(sys.argv[1]) as f:
-    doc = yaml.safe_load(f)
-
-jobs = doc["jobs"]
-
-
-def _extract_if(job_name):
-    raw = jobs[job_name].get("if", "true")
-    raw = str(raw).strip()
-    if raw.startswith("${{") and raw.endswith("}}"):
-        raw = raw[3:-2].strip()
-    return raw
-
-
-class _Parser:
-    """A tiny, bespoke evaluator for exactly the GHA expression subset this workflow uses: && || == != () quoted strings, needs.<job>.result, needs.<job>.outputs.<name>, always(). Not a general GHA expression engine -- just enough to genuinely simulate these job conditions against a fabricated needs context, rather than trusting a text/regex match against the workflow author's own wording."""
-
-    def __init__(self, expr, needs):
-        self.expr = expr
-        self.needs = needs
-        self.pos = 0
-
-    def _skip_ws(self):
-        while self.pos < len(self.expr) and self.expr[self.pos].isspace():
-            self.pos += 1
-
-    def parse(self):
-        result = self._or()
-        self._skip_ws()
-        if self.pos != len(self.expr):
-            raise ValueError(f"trailing content: {self.expr[self.pos:]!r}")
-        return result
-
-    def _or(self):
-        left = self._and()
-        self._skip_ws()
-        while self.expr[self.pos:self.pos + 2] == "||":
-            self.pos += 2
-            right = self._and()
-            left = left or right
-            self._skip_ws()
-        return left
-
-    def _and(self):
-        left = self._atom()
-        self._skip_ws()
-        while self.expr[self.pos:self.pos + 2] == "&&":
-            self.pos += 2
-            right = self._atom()
-            left = left and right
-            self._skip_ws()
-        return left
-
-    def _atom(self):
-        self._skip_ws()
-        if self.expr[self.pos] == "(":
-            self.pos += 1
-            val = self._or()
-            self._skip_ws()
-            assert self.expr[self.pos] == ")"
-            self.pos += 1
-            return val
-        if self.expr[self.pos:self.pos + 8] == "always()":
-            self.pos += 8
-            return True
-        left_val = self._value()
-        self._skip_ws()
-        op = self.expr[self.pos:self.pos + 2]
-        if op in ("==", "!="):
-            self.pos += 2
-            right_val = self._value()
-            return left_val == right_val if op == "==" else left_val != right_val
-        return bool(left_val)
-
-    def _value(self):
-        self._skip_ws()
-        if self.expr[self.pos] == "'":
-            self.pos += 1
-            start = self.pos
-            while self.expr[self.pos] != "'":
-                self.pos += 1
-            val = self.expr[start:self.pos]
-            self.pos += 1
-            return val
-        m = re.match(r"needs\.([A-Za-z0-9_]+)\.result", self.expr[self.pos:])
-        if m:
-            self.pos += m.end()
-            return self.needs.get(m.group(1), {}).get("result", "")
-        m = re.match(r"needs\.([A-Za-z0-9_]+)\.outputs\.([A-Za-z0-9_]+)", self.expr[self.pos:])
-        if m:
-            self.pos += m.end()
-            return self.needs.get(m.group(1), {}).get("outputs", {}).get(m.group(2), "")
-        raise ValueError(f"cannot parse value at: {self.expr[self.pos:self.pos + 40]!r}")
-
-
-def eval_gha_bool(expr, needs):
-    return bool(_Parser(expr, needs).parse())
-
-
-JOB_ORDER = ["platform_preflight", "observability_preflight", "platform_sync_once", "observability_sync_once", "validate_platform_ready", "validate_observability_ready", "validate_shared_secrets_once", "runtime_ownership_preflight", "build_publish_and_deploy"]
-IF_EXPRS = {job: _extract_if(job) for job in JOB_ORDER}
-
-
-def simulate(initial, outcome_when_run, outputs_when_run=None):
-    results = dict(initial)
-    outputs_when_run = outputs_when_run or {}
-    for job in JOB_ORDER:
-        would_run = eval_gha_bool(IF_EXPRS[job], results)
-        if would_run:
-            results[job] = {"result": outcome_when_run.get(job, "success"), "outputs": outputs_when_run.get(job, {})}
-        else:
-            results[job] = {"result": "skipped", "outputs": {}}
-    return results
-
-
-def base_context():
-    # Represents "everything upstream of platform_preflight/observability_preflight already succeeded, Argo already validated ready, and a real change was detected" -- effective_deploy='true' throughout, matching a real deploy. detect_changed_deployments is fixed success/has_changes=true here since build_publish_and_deploy's own if: independently requires it -- this simulation is scoped to the B2 platform/observability chain, not a re-test of that upstream detection logic (already covered elsewhere in this suite).
-    return {
-        "validate_model": {"result": "success", "outputs": {"effective_deploy": "true"}},
-        "terraform_sync_once": {"result": "success", "outputs": {}},
-        "validate_argocd_ready": {"result": "success", "outputs": {}},
-        "detect_changed_deployments": {"result": "success", "outputs": {"has_changes": "true"}},
-    }
-
+sys.path.insert(0, sys.argv[1])
+import gg_phase_sim as sim
 
 failures = []
 
@@ -12551,63 +12728,54 @@ def check(label, condition):
         failures.append(label)
 
 
-# --- Platform: OWNED / ABSENT+success / ABSENT+failure / BROKEN (observability held OWNED throughout to isolate platform's own effect). Generic MAIN Desired-State Convergence Fix: OWNED is no longer a reconciliation-skip state -- platform_sync_once ALWAYS runs and succeeds on OWNED, exactly like ABSENT (required tests 4/6). ---
-ctx = base_context()
-r = simulate(ctx, {}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
+# --- Platform: OWNED / ABSENT+success / ABSENT+failure / BROKEN (observability held OWNED throughout to isolate platform's own effect). ---
+r, c = sim.simulate_all("true", outputs_when_run={"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
 check("platform OWNED: platform_sync_once must run and succeed (never skipped merely because preflight found the installation superficially healthy-looking)", r["platform_sync_once"]["result"] == "success")
 check("platform OWNED: validate_platform_ready must succeed", r["validate_platform_ready"]["result"] == "success")
 check("platform OWNED: validate_shared_secrets_once must succeed", r["validate_shared_secrets_once"]["result"] == "success")
 
-ctx = base_context()
-r = simulate(ctx, {}, {"platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "OWNED"}})
+r, c = sim.simulate_all("true", outputs_when_run={"platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "OWNED"}})
 check("platform ABSENT+sync success: platform_sync_once must succeed", r["platform_sync_once"]["result"] == "success")
 check("platform ABSENT+sync success: validate_platform_ready must succeed", r["validate_platform_ready"]["result"] == "success")
 check("platform ABSENT+sync success: validate_shared_secrets_once must succeed", r["validate_shared_secrets_once"]["result"] == "success")
 
-ctx = base_context()
-r = simulate(ctx, {"platform_sync_once": "failure"}, {"platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "OWNED"}})
+r, c = sim.simulate_all("true", outcome_when_run={"platform_sync_once": "failure"}, outputs_when_run={"platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "OWNED"}})
 check("platform ABSENT+sync failure: platform_sync_once must report failure", r["platform_sync_once"]["result"] == "failure")
 check("platform ABSENT+sync failure: validate_platform_ready must not proceed (skipped)", r["validate_platform_ready"]["result"] == "skipped")
 check("platform ABSENT+sync failure: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
-check("platform ABSENT+sync failure: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
+check("platform ABSENT+sync failure: build_publish_and_deploy must be skipped (Phase 4 failed, Phase 5 never starts)", r["build_publish_and_deploy"]["result"] == "skipped")
 
-ctx = base_context()
-r = simulate(ctx, {"platform_sync_once": "failure"}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
+r, c = sim.simulate_all("true", outcome_when_run={"platform_sync_once": "failure"}, outputs_when_run={"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
 check("platform OWNED+sync failure: platform_sync_once must report failure", r["platform_sync_once"]["result"] == "failure")
 check("platform OWNED+sync failure: validate_platform_ready must not proceed (skipped)", r["validate_platform_ready"]["result"] == "skipped")
 check("platform OWNED+sync failure: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
-check("platform OWNED+sync failure: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
+check("platform OWNED+sync failure: build_publish_and_deploy must be skipped (Phase 4 failed, Phase 5 never starts)", r["build_publish_and_deploy"]["result"] == "skipped")
 
-ctx = base_context()
-r = simulate(ctx, {"platform_preflight": "failure"}, {"observability_preflight": {"state": "OWNED"}})
+r, c = sim.simulate_all("true", outcome_when_run={"platform_preflight": "failure"}, outputs_when_run={"observability_preflight": {"state": "OWNED"}})
 check("platform BROKEN: platform_preflight must report failure", r["platform_preflight"]["result"] == "failure")
 check("platform BROKEN: platform_sync_once must never run", r["platform_sync_once"]["result"] == "skipped")
 check("platform BROKEN: validate_platform_ready must be skipped", r["validate_platform_ready"]["result"] == "skipped")
 check("platform BROKEN: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
 check("platform BROKEN: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
 
-# --- Observability: OWNED / ABSENT+success / ABSENT+failure / BROKEN (platform held OWNED throughout to isolate observability's own effect). Generic MAIN Desired-State Convergence Fix: OWNED is no longer a reconciliation-skip state -- observability_sync_once ALWAYS runs and succeeds on OWNED, exactly like ABSENT (required tests 5/6). ---
-ctx = base_context()
-r = simulate(ctx, {}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
+# --- Observability: OWNED / ABSENT+success / ABSENT+failure / BROKEN (platform held OWNED throughout to isolate observability's own effect). ---
+r, c = sim.simulate_all("true", outputs_when_run={"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
 check("observability OWNED: observability_sync_once must run and succeed (never skipped merely because preflight found the installation superficially healthy-looking)", r["observability_sync_once"]["result"] == "success")
 check("observability OWNED: validate_observability_ready must succeed", r["validate_observability_ready"]["result"] == "success")
 check("observability OWNED: validate_shared_secrets_once must succeed", r["validate_shared_secrets_once"]["result"] == "success")
 
-ctx = base_context()
-r = simulate(ctx, {}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "ABSENT"}})
+r, c = sim.simulate_all("true", outputs_when_run={"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "ABSENT"}})
 check("observability ABSENT+sync success: observability_sync_once must succeed", r["observability_sync_once"]["result"] == "success")
 check("observability ABSENT+sync success: validate_observability_ready must succeed", r["validate_observability_ready"]["result"] == "success")
 check("observability ABSENT+sync success: validate_shared_secrets_once must succeed", r["validate_shared_secrets_once"]["result"] == "success")
 
-ctx = base_context()
-r = simulate(ctx, {"observability_sync_once": "failure"}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "ABSENT"}})
+r, c = sim.simulate_all("true", outcome_when_run={"observability_sync_once": "failure"}, outputs_when_run={"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "ABSENT"}})
 check("observability ABSENT+sync failure: observability_sync_once must report failure", r["observability_sync_once"]["result"] == "failure")
 check("observability ABSENT+sync failure: validate_observability_ready must not proceed (skipped)", r["validate_observability_ready"]["result"] == "skipped")
 check("observability ABSENT+sync failure: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
-check("observability ABSENT+sync failure: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
+check("observability ABSENT+sync failure: build_publish_and_deploy must be skipped (Phase 4 failed, Phase 5 never starts)", r["build_publish_and_deploy"]["result"] == "skipped")
 
-ctx = base_context()
-r = simulate(ctx, {"observability_preflight": "failure"}, {"platform_preflight": {"state": "OWNED"}})
+r, c = sim.simulate_all("true", outcome_when_run={"observability_preflight": "failure"}, outputs_when_run={"platform_preflight": {"state": "OWNED"}})
 check("observability BROKEN: observability_preflight must report failure", r["observability_preflight"]["result"] == "failure")
 check("observability BROKEN: observability_sync_once must never run", r["observability_sync_once"]["result"] == "skipped")
 check("observability BROKEN: validate_observability_ready must be skipped", r["validate_observability_ready"]["result"] == "skipped")
@@ -12615,33 +12783,23 @@ check("observability BROKEN: validate_shared_secrets_once must be skipped", r["v
 check("observability BROKEN: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
 
 # --- Cross-component convergence ---
-ctx = base_context()
-r = simulate(ctx, {}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
+r, c = sim.simulate_all("true", outputs_when_run={"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
 check("cross: platform OWNED + observability OWNED -> both always reconcile and shared secrets continues", r["platform_sync_once"]["result"] == "success" and r["observability_sync_once"]["result"] == "success" and r["validate_shared_secrets_once"]["result"] == "success" and r["build_publish_and_deploy"]["result"] == "success")
 
-ctx = base_context()
-r = simulate(ctx, {}, {"platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "OWNED"}})
+r, c = sim.simulate_all("true", outputs_when_run={"platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "OWNED"}})
 check("cross: platform ABSENT/reconcile success + observability OWNED/reconcile success -> continues", r["validate_shared_secrets_once"]["result"] == "success" and r["build_publish_and_deploy"]["result"] == "success")
 
-ctx = base_context()
-r = simulate(ctx, {}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "ABSENT"}})
+r, c = sim.simulate_all("true", outputs_when_run={"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "ABSENT"}})
 check("cross: platform OWNED/reconcile success + observability ABSENT/reconcile success -> continues", r["validate_shared_secrets_once"]["result"] == "success" and r["build_publish_and_deploy"]["result"] == "success")
 
-ctx = base_context()
-r = simulate(ctx, {"platform_preflight": "failure"}, {"observability_preflight": {"state": "OWNED"}})
+r, c = sim.simulate_all("true", outcome_when_run={"platform_preflight": "failure"}, outputs_when_run={"observability_preflight": {"state": "OWNED"}})
 check("cross: platform BROKEN + observability OWNED -> shared secrets/runtime does not continue", r["validate_shared_secrets_once"]["result"] == "skipped" and r["build_publish_and_deploy"]["result"] == "skipped")
 
-ctx = base_context()
-r = simulate(ctx, {"observability_preflight": "failure"}, {"platform_preflight": {"state": "OWNED"}})
+r, c = sim.simulate_all("true", outcome_when_run={"observability_preflight": "failure"}, outputs_when_run={"platform_preflight": {"state": "OWNED"}})
 check("cross: platform OWNED + observability BROKEN -> shared secrets/runtime does not continue", r["validate_shared_secrets_once"]["result"] == "skipped" and r["build_publish_and_deploy"]["result"] == "skipped")
 
 # --- Dry-run safety: effective_deploy=false must never invoke either B2 SUB workflow ---
-ctx = {
-    "validate_model": {"result": "success", "outputs": {"effective_deploy": "false"}},
-    "terraform_sync_once": {"result": "skipped", "outputs": {}},
-    "validate_argocd_ready": {"result": "skipped", "outputs": {}},
-}
-r = simulate(ctx, {})
+r, c = sim.simulate_all("false")
 check("dry-run: platform_preflight must be skipped", r["platform_preflight"]["result"] == "skipped")
 check("dry-run: observability_preflight must be skipped", r["observability_preflight"]["result"] == "skipped")
 check("dry-run: platform_sync_once must be skipped (never invokes 30-sub-platform.yaml)", r["platform_sync_once"]["result"] == "skipped")
@@ -12659,11 +12817,11 @@ PYEOF
   if [ "$PHASE_B2_SIM_STATUS" -eq 0 ]; then
     pass "Phase B2 (Generic MAIN Desired-State Convergence Fix): platform OWNED still runs and succeeds reconciliation (never skipped) and reaches validate_shared_secrets_once"
     pass "Phase B2: platform ABSENT+successful reconciliation reaches validate_shared_secrets_once"
-    pass "Phase B2: platform ABSENT/OWNED+failed reconciliation blocks validate_platform_ready/validate_shared_secrets_once/build_publish_and_deploy"
+    pass "Phase B2: platform ABSENT/OWNED+failed reconciliation blocks validate_platform_ready/validate_shared_secrets_once/build_publish_and_deploy (Phase 4 fails, Phase 5 never starts)"
     pass "Phase B2: platform BROKEN fails closed -- reconciliation never runs, downstream blocked"
     pass "Phase B2 (Generic MAIN Desired-State Convergence Fix): observability OWNED still runs and succeeds reconciliation (never skipped) and reaches validate_shared_secrets_once"
     pass "Phase B2: observability ABSENT+successful reconciliation reaches validate_shared_secrets_once"
-    pass "Phase B2: observability ABSENT+failed reconciliation blocks validate_observability_ready/validate_shared_secrets_once/build_publish_and_deploy"
+    pass "Phase B2: observability ABSENT+failed reconciliation blocks validate_observability_ready/validate_shared_secrets_once/build_publish_and_deploy (Phase 4 fails, Phase 5 never starts)"
     pass "Phase B2: observability BROKEN fails closed -- reconciliation never runs, downstream blocked"
     pass "Phase B2: cross-component convergence -- both OWNED always reconcile in parallel and continue, either ABSENT+success continues; either BROKEN blocks shared secrets/runtime"
     pass "Phase B2: dry-run (effective_deploy=false) never invokes 30-sub-platform.yaml or 40-sub-observability.yaml, and the read-only dry-run path still succeeds"
@@ -12671,7 +12829,7 @@ PYEOF
     fail "Phase B2 DAG simulation failed:"$'\n'"${PHASE_B2_SIM_OUT}"
   fi
 else
-  skip "Phase B2: DAG simulation -- python3/PyYAML unavailable or main workflow missing"
+  skip "Phase B2: DAG simulation -- python3/PyYAML unavailable"
 fi
 
 echo ""
@@ -12728,135 +12886,14 @@ else
   fail "P8/O15: the exact-HEALTHY final convergence gate is missing from ${EKS_APP_WORKFLOW}"
 fi
 
-# DAG simulation: OWNED+success and OWNED+failure for both Platform and Observability, exercised against the real if: expressions via the same JOB_ORDER-based harness as the Phase B2 simulation immediately above (P6, D6, D7).
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+# DAG simulation: OWNED+success and OWNED+failure for both Platform and Observability, exercised against the real if: expressions via the shared gg_phase_sim module (see its definition near the top of this script) -- the same phase-4-local scope as the Phase B2 simulation immediately above (P6, D6, D7).
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
   set +e
-  OWNED_SIM_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
-import re
+  OWNED_SIM_OUT="$(python3 - "$WORKDIR" <<'PYEOF'
 import sys
-import yaml
 
-with open(sys.argv[1]) as f:
-    doc = yaml.safe_load(f)
-
-jobs = doc["jobs"]
-
-
-def _extract_if(job_name):
-    raw = jobs[job_name].get("if", "true")
-    raw = str(raw).strip()
-    if raw.startswith("${{") and raw.endswith("}}"):
-        raw = raw[3:-2].strip()
-    return raw
-
-
-class _Parser:
-    def __init__(self, expr, needs):
-        self.expr = expr
-        self.needs = needs
-        self.pos = 0
-
-    def _skip_ws(self):
-        while self.pos < len(self.expr) and self.expr[self.pos].isspace():
-            self.pos += 1
-
-    def parse(self):
-        result = self._or()
-        self._skip_ws()
-        if self.pos != len(self.expr):
-            raise ValueError(f"trailing content: {self.expr[self.pos:]!r}")
-        return result
-
-    def _or(self):
-        left = self._and()
-        self._skip_ws()
-        while self.expr[self.pos:self.pos + 2] == "||":
-            self.pos += 2
-            right = self._and()
-            left = left or right
-            self._skip_ws()
-        return left
-
-    def _and(self):
-        left = self._atom()
-        self._skip_ws()
-        while self.expr[self.pos:self.pos + 2] == "&&":
-            self.pos += 2
-            right = self._atom()
-            left = left and right
-            self._skip_ws()
-        return left
-
-    def _atom(self):
-        self._skip_ws()
-        if self.expr[self.pos] == "(":
-            self.pos += 1
-            val = self._or()
-            self._skip_ws()
-            assert self.expr[self.pos] == ")"
-            self.pos += 1
-            return val
-        if self.expr[self.pos:self.pos + 8] == "always()":
-            self.pos += 8
-            return True
-        left_val = self._value()
-        self._skip_ws()
-        op = self.expr[self.pos:self.pos + 2]
-        if op in ("==", "!="):
-            self.pos += 2
-            right_val = self._value()
-            return left_val == right_val if op == "==" else left_val != right_val
-        return bool(left_val)
-
-    def _value(self):
-        self._skip_ws()
-        if self.expr[self.pos] == "'":
-            self.pos += 1
-            start = self.pos
-            while self.expr[self.pos] != "'":
-                self.pos += 1
-            val = self.expr[start:self.pos]
-            self.pos += 1
-            return val
-        m = re.match(r"needs\.([A-Za-z0-9_]+)\.result", self.expr[self.pos:])
-        if m:
-            self.pos += m.end()
-            return self.needs.get(m.group(1), {}).get("result", "")
-        m = re.match(r"needs\.([A-Za-z0-9_]+)\.outputs\.([A-Za-z0-9_]+)", self.expr[self.pos:])
-        if m:
-            self.pos += m.end()
-            return self.needs.get(m.group(1), {}).get("outputs", {}).get(m.group(2), "")
-        raise ValueError(f"cannot parse value at: {self.expr[self.pos:self.pos + 40]!r}")
-
-
-def eval_gha_bool(expr, needs):
-    return bool(_Parser(expr, needs).parse())
-
-
-JOB_ORDER = ["platform_preflight", "observability_preflight", "platform_sync_once", "observability_sync_once", "validate_platform_ready", "validate_observability_ready", "validate_shared_secrets_once", "runtime_ownership_preflight", "build_publish_and_deploy"]
-IF_EXPRS = {job: _extract_if(job) for job in JOB_ORDER}
-
-
-def simulate(initial, outcome_when_run, outputs_when_run=None):
-    results = dict(initial)
-    outputs_when_run = outputs_when_run or {}
-    for job in JOB_ORDER:
-        would_run = eval_gha_bool(IF_EXPRS[job], results)
-        if would_run:
-            results[job] = {"result": outcome_when_run.get(job, "success"), "outputs": outputs_when_run.get(job, {})}
-        else:
-            results[job] = {"result": "skipped", "outputs": {}}
-    return results
-
-
-def base_context():
-    return {
-        "validate_model": {"result": "success", "outputs": {"effective_deploy": "true"}},
-        "terraform_sync_once": {"result": "success", "outputs": {}},
-        "validate_argocd_ready": {"result": "success", "outputs": {}},
-        "detect_changed_deployments": {"result": "success", "outputs": {"has_changes": "true"}},
-    }
-
+sys.path.insert(0, sys.argv[1])
+import gg_phase_sim as sim
 
 failures = []
 
@@ -12867,56 +12904,44 @@ def check(label, condition):
 
 
 # --- Platform OWNED: reproduces the exact live incident (namespace label drift) plus every other already-owned/healthy-looking case -- one MAIN-owned automatic reconciliation, no operator interaction, final convergence still independently requires HEALTHY ---
-ctx = base_context()
-r = simulate(ctx, {}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
+r, c = sim.simulate_all("true", outputs_when_run={"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
 check("platform OWNED+sync success: platform_sync_once must run and succeed (P1/P6, required test 4)", r["platform_sync_once"]["result"] == "success")
 check("platform OWNED+sync success: validate_platform_ready must succeed", r["validate_platform_ready"]["result"] == "success")
 check("platform OWNED+sync success: validate_shared_secrets_once must succeed (no operator interaction required, P7/D9)", r["validate_shared_secrets_once"]["result"] == "success")
 check("platform OWNED+sync success: build_publish_and_deploy must remain eligible", r["build_publish_and_deploy"]["result"] == "success")
 
-ctx = base_context()
-r = simulate(ctx, {"platform_sync_once": "failure"}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
+r, c = sim.simulate_all("true", outcome_when_run={"platform_sync_once": "failure"}, outputs_when_run={"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
 check("platform OWNED+sync failure: platform_sync_once must report failure", r["platform_sync_once"]["result"] == "failure")
 check("platform OWNED+sync failure: validate_platform_ready must not proceed (skipped)", r["validate_platform_ready"]["result"] == "skipped")
 check("platform OWNED+sync failure: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
-check("platform OWNED+sync failure: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
+check("platform OWNED+sync failure: build_publish_and_deploy must be skipped (Phase 4 failed, Phase 5 never starts)", r["build_publish_and_deploy"]["result"] == "skipped")
 
 # --- Observability OWNED: deterministic cloudwatch-agent ServiceAccount role-arn drift plus every other already-owned/healthy-looking case -- one MAIN-owned automatic reconciliation, final convergence still independently requires HEALTHY (O13, required test 5) ---
-ctx = base_context()
-r = simulate(ctx, {}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
+r, c = sim.simulate_all("true", outputs_when_run={"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
 check("observability OWNED+sync success: observability_sync_once must run and succeed (O13)", r["observability_sync_once"]["result"] == "success")
 check("observability OWNED+sync success: validate_observability_ready must succeed", r["validate_observability_ready"]["result"] == "success")
 check("observability OWNED+sync success: validate_shared_secrets_once must succeed (no operator interaction required, D9)", r["validate_shared_secrets_once"]["result"] == "success")
 
-ctx = base_context()
-r = simulate(ctx, {"observability_sync_once": "failure"}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
+r, c = sim.simulate_all("true", outcome_when_run={"observability_sync_once": "failure"}, outputs_when_run={"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
 check("observability OWNED+sync failure: observability_sync_once must report failure", r["observability_sync_once"]["result"] == "failure")
 check("observability OWNED+sync failure: validate_observability_ready must not proceed (skipped)", r["validate_observability_ready"]["result"] == "skipped")
 check("observability OWNED+sync failure: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
 
 # --- D1-D5: both branches remain parallel and independent even with OWNED in the mix (required test 10); downstream waits for BOTH final convergence points ---
-ctx = base_context()
-r = simulate(ctx, {}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
+r, c = sim.simulate_all("true", outputs_when_run={"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
 check("D1/D2: platform and observability both independently reconcile from OWNED in the same run (parallel, not chained)", r["platform_sync_once"]["result"] == "success" and r["observability_sync_once"]["result"] == "success")
 check("D5: downstream (validate_shared_secrets_once) waits for BOTH final convergence points and only proceeds once both succeed", r["validate_shared_secrets_once"]["result"] == "success")
 
-ctx = base_context()
-r = simulate(ctx, {"platform_sync_once": "failure"}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
+r, c = sim.simulate_all("true", outcome_when_run={"platform_sync_once": "failure"}, outputs_when_run={"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
 check("D3: platform reconciliation failure alone does not prevent observability_sync_once from running (never serialized behind platform)", r["observability_sync_once"]["result"] == "success")
 check("D5: downstream must not proceed when only ONE of the two required convergence points failed", r["validate_shared_secrets_once"]["result"] == "skipped")
 
-ctx = base_context()
-r = simulate(ctx, {"observability_sync_once": "failure"}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
+r, c = sim.simulate_all("true", outcome_when_run={"observability_sync_once": "failure"}, outputs_when_run={"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
 check("D4: observability reconciliation failure alone does not prevent platform_sync_once from running (never serialized behind observability)", r["platform_sync_once"]["result"] == "success")
 check("D5: downstream must not proceed when only ONE of the two required convergence points failed (observability side)", r["validate_shared_secrets_once"]["result"] == "skipped")
 
 # --- D6: Validate mode never invokes either reconciliation workflow, even if the live state would otherwise classify OWNED (required test 9) ---
-ctx = {
-    "validate_model": {"result": "success", "outputs": {"effective_deploy": "false"}},
-    "terraform_sync_once": {"result": "skipped", "outputs": {}},
-    "validate_argocd_ready": {"result": "skipped", "outputs": {}},
-}
-r = simulate(ctx, {})
+r, c = sim.simulate_all("false")
 check("D6: platform_preflight must be skipped in Validate mode regardless of live state", r["platform_preflight"]["result"] == "skipped")
 check("D6: observability_preflight must be skipped in Validate mode regardless of live state", r["observability_preflight"]["result"] == "skipped")
 check("D6: platform_sync_once must never run in Validate mode", r["platform_sync_once"]["result"] == "skipped")
@@ -12932,7 +12957,7 @@ PYEOF
   set -e
   if [ "$OWNED_SIM_STATUS" -eq 0 ]; then
     pass "P1/P6/P7: Platform OWNED (the exact live namespace-label incident, and every other already-owned/healthy-looking case) is automatically reconciled by MAIN with no operator interaction, and remains eligible to converge to HEALTHY"
-    pass "Platform OWNED+sync failure blocks validate_platform_ready/validate_shared_secrets_once/build_publish_and_deploy"
+    pass "Platform OWNED+sync failure blocks validate_platform_ready/validate_shared_secrets_once/build_publish_and_deploy (Phase 4 fails, Phase 5 never starts)"
     pass "O13: Observability OWNED (cloudwatch-agent ServiceAccount role-arn drift, and every other already-owned/healthy-looking case) is automatically reconciled by MAIN with no operator interaction"
     pass "Observability OWNED+sync failure blocks validate_observability_ready/validate_shared_secrets_once"
     pass "D1/D2/D3/D4/D5: Platform and Observability OWNED reconciliation remain independent parallel branches -- neither is ever serialized behind the other, and downstream waits for BOTH final convergence points"
@@ -12941,7 +12966,7 @@ PYEOF
     fail "Live Platform + Observability End-to-End Self-Recovery Fix: OWNED DAG simulation found violation(s): ${OWNED_SIM_OUT}"
   fi
 else
-  skip "Live Platform + Observability End-to-End Self-Recovery Fix: OWNED DAG simulation -- python3/PyYAML unavailable or main workflow missing"
+  skip "Live Platform + Observability End-to-End Self-Recovery Fix: OWNED DAG simulation -- python3/PyYAML unavailable"
 fi
 
 # P9/P10: no imperative namespace delete/recreate/label/annotate workaround was added to mask the competing ownership source -- the fix must be the chart's own values contract (namespaces.runtime.create), never an imperative kubectl command layered on top.
@@ -13943,16 +13968,17 @@ if [ -f hack/check-goldengate-approval-topology.py ] && [ "$PYTHON_AVAILABLE" = 
     fail "positive control: the checker unexpectedly fails against an unmutated copy of the real workflows/ directory -- the fixtures below would be meaningless"
   fi
 
-  # Fixture 1: deletion depends ONLY on detect_changed_deployments (the exact violation this task describes) -- not transitively downstream of goldengate_deploy_authorization at all.
+  # PHASE-ORIENTED ORCHESTRATION: delete_removed_argocd_applications and goldengate_deploy_authorization now live in different files (05-phase-runtimes.yaml / 03-phase-argocd.yaml) -- the safety property is proven at MAIN's own phase-calling needs: graph instead, so both fixtures below mutate 00-main-goldengate-orchestrator.yaml's phase-calling jobs, never the moved implementation job itself.
+
+  # Fixture 1: phase_5_runtimes (which calls 05-phase-runtimes.yaml, containing delete_removed_argocd_applications) no longer needs phase_4_platform_observability at all -- not transitively downstream of phase_3_argocd (the single authorization phase) via MAIN's own needs: graph.
   python3 - "$TOPOLOGY_FIXTURE_DIR/00-main-goldengate-orchestrator.yaml" <<'PYEOF'
 import sys
 import yaml
 path = sys.argv[1]
 with open(path) as f:
     doc = yaml.safe_load(f)
-job = doc["jobs"]["delete_removed_argocd_applications"]
-job["needs"] = "detect_changed_deployments"
-job["if"] = "success() && needs.detect_changed_deployments.outputs.has_deletions == 'true'"
+job = doc["jobs"]["phase_5_runtimes"]
+job["needs"] = []
 with open(path, "w") as f:
     yaml.safe_dump(doc, f, sort_keys=False, default_flow_style=False)
 PYEOF
@@ -13960,13 +13986,13 @@ PYEOF
   FIXTURE1_OUT="$(python3 hack/check-goldengate-approval-topology.py --workflow-dir "$TOPOLOGY_FIXTURE_DIR" 2>&1)"
   FIXTURE1_STATUS=$?
   set -e
-  if [ "$FIXTURE1_STATUS" -ne 0 ] && echo "$FIXTURE1_OUT" | grep -qF "is not transitively downstream of 'goldengate_deploy_authorization'"; then
-    pass "fixture 1: the checker FAILS closed when deletion depends only on detect_changed_deployments (not transitively downstream of goldengate_deploy_authorization at all), with a specific, actionable violation message"
+  if [ "$FIXTURE1_STATUS" -ne 0 ] && echo "$FIXTURE1_OUT" | grep -qF "is not transitively downstream of 'phase_3_argocd'"; then
+    pass "fixture 1: the checker FAILS closed when phase_5_runtimes (delete_removed_argocd_applications' phase) no longer needs phase_4_platform_observability (not transitively downstream of phase_3_argocd, the single authorization phase, at all), with a specific, actionable violation message"
   else
-    fail "fixture 1: the checker did not detect a deletion job depending only on detect_changed_deployments (status=${FIXTURE1_STATUS}):"$'\n'"${FIXTURE1_OUT}"
+    fail "fixture 1: the checker did not detect a phase_5_runtimes job disconnected from the phase_3_argocd chain (status=${FIXTURE1_STATUS}):"$'\n'"${FIXTURE1_OUT}"
   fi
 
-  # Fixture 2: deletion lists validate_argocd_ready in needs: (so it IS structurally transitively downstream) but its if: never actually checks that job's result -- the "bare needs: reference" bypass GitHub Actions itself would silently treat as satisfied by a skip.
+  # Fixture 2: phase_5_runtimes remains structurally reachable from phase_3_argocd via needs:, but a custom if: is added on the chain (phase_4_platform_observability) that could let it proceed despite an upstream phase failure -- the "bare needs: reference is not enough, a bypassing if: must never appear on this chain" property.
   cp .github/workflows/*.yaml "$TOPOLOGY_FIXTURE_DIR/"
   python3 - "$TOPOLOGY_FIXTURE_DIR/00-main-goldengate-orchestrator.yaml" <<'PYEOF'
 import sys
@@ -13974,9 +14000,8 @@ import yaml
 path = sys.argv[1]
 with open(path) as f:
     doc = yaml.safe_load(f)
-job = doc["jobs"]["delete_removed_argocd_applications"]
-job["needs"] = ["detect_changed_deployments", "validate_argocd_ready"]
-job["if"] = "success() && needs.detect_changed_deployments.outputs.has_deletions == 'true'"
+job = doc["jobs"]["phase_4_platform_observability"]
+job["if"] = "always()"
 with open(path, "w") as f:
     yaml.safe_dump(doc, f, sort_keys=False, default_flow_style=False)
 PYEOF
@@ -13984,10 +14009,10 @@ PYEOF
   FIXTURE2_OUT="$(python3 hack/check-goldengate-approval-topology.py --workflow-dir "$TOPOLOGY_FIXTURE_DIR" 2>&1)"
   FIXTURE2_STATUS=$?
   set -e
-  if [ "$FIXTURE2_STATUS" -ne 0 ] && echo "$FIXTURE2_OUT" | grep -qF "does not directly require (via needs.<job>.result == 'success' in its own if:)"; then
-    pass "fixture 2: the checker FAILS closed when deletion merely lists validate_argocd_ready in needs: without an explicit .result == 'success' check in its own if: (the bare-needs-reference bypass)"
+  if [ "$FIXTURE2_STATUS" -ne 0 ] && echo "$FIXTURE2_OUT" | grep -qF "carries an if: condition"; then
+    pass "fixture 2: the checker FAILS closed when a phase-calling job between the single authorization (Phase 3) and runtime removal (Phase 5) carries a bypassing if: condition (always()) instead of relying purely on GitHub's implicit 'all needs succeeded' default"
   else
-    fail "fixture 2: the checker did not detect a bare needs: reference without a result check (status=${FIXTURE2_STATUS}):"$'\n'"${FIXTURE2_OUT}"
+    fail "fixture 2: the checker did not detect a bypassing if: condition on the phase_3_argocd -> phase_5_runtimes chain (status=${FIXTURE2_STATUS}):"$'\n'"${FIXTURE2_OUT}"
   fi
 else
   skip "approval-topology broken-fixture proof -- python3 unavailable or checker missing"
@@ -14118,10 +14143,11 @@ if [ -f envs/dev/goldengate-monitor/values.yaml ] && ! grep -q "cloudwatch" envs
 else
   fail "Fix 3: envs/dev/goldengate-monitor/values.yaml unexpectedly carries a cloudwatch override, or the file is missing -- the three-layer model assumed by this audit no longer holds"
 fi
-if grep -qF "enable_cloudwatch_publication: true" .github/workflows/00-main-goldengate-orchestrator.yaml; then
-  pass "Fix 3: MAIN's monitor_sync_once WORKFLOW-INPUT override (enable_cloudwatch_publication: true) is the third layer that turns the base-false library default into true ACTIVE-RUNTIME deployment intent -- distinct from, and never substituting for, a DEV values.yaml override"
+# PHASE-ORIENTED ORCHESTRATION: monitor_sync_once now lives in 07-phase-monitor-acceptance.yaml, not MAIN directly.
+if grep -qF "enable_cloudwatch_publication: true" .github/workflows/07-phase-monitor-acceptance.yaml; then
+  pass "Fix 3: monitor_sync_once's WORKFLOW-INPUT override (enable_cloudwatch_publication: true, now in 07-phase-monitor-acceptance.yaml) is the third layer that turns the base-false library default into true ACTIVE-RUNTIME deployment intent -- distinct from, and never substituting for, a DEV values.yaml override"
 else
-  fail "Fix 3: MAIN's monitor_sync_once no longer sets enable_cloudwatch_publication: true -- the three-layer Monitor audit no longer holds"
+  fail "Fix 3: monitor_sync_once no longer sets enable_cloudwatch_publication: true -- the three-layer Monitor audit no longer holds"
 fi
 # This MAIN deployment intent is reached only once monitor_sync_once actually runs, which itself requires an active runtime. GoldenGate Runtime Desired-State Simplification (a later, independent task) legitimately activated both current runtime descriptors (deployment.enabled=true, lifecycle.state removed) -- this check now re-confirms the still-relevant invariant this Fix 3 originally cared about: flipping the MAIN-level monitor cloudwatch intent is not itself a replication-activation or EFS-hold change, so replication stays disabled and no lifecycle block reappears.
 FROZEN_LIFECYCLE_OK="true"
@@ -14190,6 +14216,13 @@ workflows_dir = "'"$WORKFLOWS_DIR"'"
 
 expected_name_prefixes = {
     "00-main-goldengate-orchestrator.yaml": "00 | MAIN |",
+    "01-phase-readiness-safety.yaml": "01 | PHASE |",
+    "02-phase-aws-prerequisites.yaml": "02 | PHASE |",
+    "03-phase-argocd.yaml": "03 | PHASE |",
+    "04-phase-platform-observability.yaml": "04 | PHASE |",
+    "05-phase-runtimes.yaml": "05 | PHASE |",
+    "06-phase-replication.yaml": "06 | PHASE |",
+    "07-phase-monitor-acceptance.yaml": "07 | PHASE |",
     "10-sub-iam-secrets.yaml": "10 | SUB |",
     "20-sub-argocd.yaml": "20 | SUB |",
     "30-sub-platform.yaml": "30 | SUB |",
@@ -14214,15 +14247,35 @@ for filename, expected_prefix in expected_name_prefixes.items():
     actual_name = str(doc.get("name", ""))
     results.append((f"{filename}: name: starts with \"{expected_prefix}\"", actual_name.startswith(expected_prefix)))
 
+# PHASE-ORIENTED ORCHESTRATION: MAIN no longer directly uses: any 10/20/30/40/50-sub-*.yaml specialist -- each now lives inside the phase file that owns the job that calls it. MAIN own uses: targets are now exactly the seven phase files; each specialist SUB target is checked against its real owning phase file instead.
 main_doc = docs.get("00-main-goldengate-orchestrator.yaml")
 if main_doc is not None:
     jobs = main_doc.get("jobs", {}) or {}
     uses_values = {job_id: (job.get("uses") or "") for job_id, job in jobs.items()}
     all_uses = set(uses_values.values())
-    # Phase B2 wired 40-sub-observability.yaml into MAIN (via observability_sync_once) alongside the five SUB workflows already called since the workflow-naming task -- all six reusable SUB targets are now expected.
-    for expected_sub in ("10-sub-iam-secrets.yaml", "20-sub-argocd.yaml", "30-sub-platform.yaml", "40-sub-observability.yaml", "50-sub-monitor.yaml"):
-        expected_uses = "./.github/workflows/" + expected_sub
-        results.append((f"MAIN uses: a reusable-workflow call targeting {expected_sub}", expected_uses in all_uses))
+    for expected_phase in ("01-phase-readiness-safety.yaml", "02-phase-aws-prerequisites.yaml", "03-phase-argocd.yaml", "04-phase-platform-observability.yaml", "05-phase-runtimes.yaml", "06-phase-replication.yaml", "07-phase-monitor-acceptance.yaml"):
+        expected_uses = "./.github/workflows/" + expected_phase
+        results.append((f"MAIN uses: a reusable-workflow call targeting {expected_phase}", expected_uses in all_uses))
+    for forbidden_direct in ("10-sub-iam-secrets.yaml", "20-sub-argocd.yaml", "30-sub-platform.yaml", "40-sub-observability.yaml", "50-sub-monitor.yaml"):
+        forbidden_uses = "./.github/workflows/" + forbidden_direct
+        results.append((f"MAIN no longer uses: {forbidden_direct} directly (it is called from inside the owning phase file)", forbidden_uses not in all_uses))
+
+specialist_owning_phase = {
+    "10-sub-iam-secrets.yaml": "02-phase-aws-prerequisites.yaml",
+    "20-sub-argocd.yaml": "03-phase-argocd.yaml",
+    "30-sub-platform.yaml": "04-phase-platform-observability.yaml",
+    "40-sub-observability.yaml": "04-phase-platform-observability.yaml",
+    "50-sub-monitor.yaml": "07-phase-monitor-acceptance.yaml",
+}
+for expected_sub, owning_phase_filename in specialist_owning_phase.items():
+    owning_doc = docs.get(owning_phase_filename)
+    if owning_doc is None:
+        results.append((f"{owning_phase_filename}: file missing, cannot check uses: {expected_sub}", False))
+        continue
+    phase_jobs = owning_doc.get("jobs", {}) or {}
+    phase_uses = {(job.get("uses") or "") for job in phase_jobs.values()}
+    expected_uses = "./.github/workflows/" + expected_sub
+    results.append((f"{owning_phase_filename} uses: a reusable-workflow call targeting {expected_sub}", expected_uses in phase_uses))
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
@@ -14311,7 +14364,8 @@ results.append(("4: MAIN exposes validate_model.outputs.active_runtime_matrix", 
 results.append(("6: MAIN defines runtime_ownership_preflight", "runtime_ownership_preflight" in jobs))
 preflight = jobs.get("runtime_ownership_preflight", {})
 preflight_matrix = ((preflight.get("strategy") or {}).get("matrix") or {}).get("include", "")
-results.append(("7: runtime_ownership_preflight uses detect_changed_deployments.outputs.deployment_matrix (the SELECTED mutation set)", "detect_changed_deployments.outputs.deployment_matrix" in str(preflight_matrix)))
+# PHASE-ORIENTED ORCHESTRATION: runtime_ownership_preflight now lives in 05-phase-runtimes.yaml and reads its matrix from inputs.deployment_matrix (relayed unchanged from detect_changed_deployments.outputs.deployment_matrix by Phase 1 through every intervening phase) rather than a same-file needs.detect_changed_deployments reference.
+results.append(("7: runtime_ownership_preflight uses inputs.deployment_matrix (the SELECTED mutation set, relayed from detect_changed_deployments via the phase chain)", "inputs.deployment_matrix" in str(preflight_matrix)))
 preflight_if = preflight.get("if", "")
 results.append(("8: runtime_ownership_preflight is real-deploy-only (effective_deploy == \x27true\x27)", "effective_deploy" in preflight_if and "== \x27true\x27" in preflight_if))
 
@@ -14331,20 +14385,23 @@ results.append(("12: build_publish_and_deploy if: contains no BROKEN branch (BRO
 results.append(("13: MAIN defines validate_active_runtimes", "validate_active_runtimes" in jobs))
 validate_active = jobs.get("validate_active_runtimes", {})
 validate_active_matrix = ((validate_active.get("strategy") or {}).get("matrix") or {}).get("include", "")
-results.append(("14a: validate_active_runtimes uses validate_model.outputs.active_runtime_matrix (the GLOBAL desired-state inventory)", "validate_model.outputs.active_runtime_matrix" in str(validate_active_matrix)))
-results.append(("14b: validate_active_runtimes does NOT use detect_changed_deployments.outputs.deployment_matrix", "detect_changed_deployments.outputs.deployment_matrix" not in str(validate_active_matrix)))
+# PHASE-ORIENTED ORCHESTRATION: validate_active_runtimes (05-phase-runtimes.yaml) reads inputs.active_runtime_matrix (relayed unchanged from validate_model.outputs.active_runtime_matrix by Phase 1 through every intervening phase), never inputs.deployment_matrix (the SELECTED/changed set) -- the GLOBAL/SELECTED distinction is preserved, just relocated onto the inputs.* relay.
+results.append(("14a: validate_active_runtimes uses inputs.active_runtime_matrix (the GLOBAL desired-state inventory, relayed from validate_model)", "inputs.active_runtime_matrix" in str(validate_active_matrix)))
+results.append(("14b: validate_active_runtimes does NOT use inputs.deployment_matrix (the SELECTED/changed set)", "inputs.deployment_matrix" not in str(validate_active_matrix)))
 
 # 16: runtime acceptance (validate_active_runtimes) is real-deploy-only.
 validate_active_if = validate_active.get("if", "")
 results.append(("16: validate_active_runtimes is real-deploy-only (effective_deploy == \x27true\x27)", "effective_deploy" in validate_active_if and "== \x27true\x27" in validate_active_if))
 
-# 17/18: replication waits for successful active-runtime acceptance when active deployments exist; the no-active-runtime path remains valid (excluded from the requirement, not merely tolerated).
-replication = jobs.get("replication_reconcile_once", {})
-replication_needs = replication.get("needs") or []
-replication_if = replication.get("if", "")
-results.append(("17a: replication_reconcile_once needs validate_active_runtimes", "validate_active_runtimes" in replication_needs))
-results.append(("17b: replication_reconcile_once requires validate_active_runtimes.result == success when active deployments exist", "validate_active_runtimes.result == \x27success\x27" in replication_if))
-results.append(("18: replication_reconcile_once explicitly bypasses that requirement when has_active_deployments != \x27true\x27 (no-active-runtime path remains valid)", "has_active_deployments != \x27true\x27" in replication_if))
+# 17/18: PHASE-ORIENTED ORCHESTRATION: replication_reconcile_once now lives in 06-phase-replication.yaml, a different file from validate_active_runtimes (05-phase-runtimes.yaml) -- a needs: edge is structurally impossible; the same ordering guarantee is instead enforced by (a) Phase 5 own phase_contract requiring validate_active_runtimes success whenever effective_deploy=='true' and has_active_deployments=='true' (mode-aware, exactly mirroring the old has_active_deployments != 'true' bypass), and (b) MAIN own phase_6_replication job needing phase_5_runtimes with no custom if:.
+phase5_contract_run = ""
+for step in (jobs.get("phase_contract__05") or {}).get("steps", []):
+    phase5_contract_run += str(step.get("run") or "")
+phase6_caller = jobs.get("phase_6_replication", {})
+results.append(("17a: Phase 5 own phase_contract needs validate_active_runtimes", "validate_active_runtimes" in (jobs.get("phase_contract__05", {}).get("needs") or [])))
+results.append(("17b: Phase 5 own phase_contract requires validate_active_runtimes to succeed when effective_deploy==true and has_active_deployments==true", "require_success validate_active_runtimes" in phase5_contract_run))
+results.append(("18: Phase 5 own phase_contract explicitly bypasses that requirement when EFFECTIVE_DEPLOY!=true or HAS_ACTIVE_DEPLOYMENTS!=true (no-active-runtime path remains valid)", "allow_non_failure validate_active_runtimes" in phase5_contract_run))
+results.append(("18b: MAIN phase_6_replication needs phase_5_runtimes and carries no custom if:", "phase_5_runtimes" in (phase6_caller.get("needs") or []) and "if" not in phase6_caller))
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
@@ -14391,138 +14448,14 @@ else
   skip "Phase B3A: 5: active_runtime_matrix content -- python3 unavailable"
 fi
 
-# DAG simulation: the required real-deploy/dry-run/ABSENT/OWNED/BROKEN/global-active-inventory scenarios, exercised against the real if: expressions, never a text/regex match against the workflow author's own wording.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+# DAG simulation: the required real-deploy/dry-run/ABSENT/OWNED/BROKEN/global-active-inventory scenarios, exercised against the real if: expressions via the shared gg_phase_sim module (see its definition near the top of this script). build_publish_and_deploy is local to Phase 5; replication_reconcile_once is local to Phase 6 -- reachable only once Phase 5 own contract has succeeded.
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
   set +e
-  PHASE_B3A_SIM_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
-import re
+  PHASE_B3A_SIM_OUT="$(python3 - "$WORKDIR" <<'PYEOF'
 import sys
-import yaml
 
-with open(sys.argv[1]) as f:
-    doc = yaml.safe_load(f)
-
-jobs = doc["jobs"]
-
-
-def _extract_if(job_name):
-    raw = jobs[job_name].get("if", "true")
-    raw = str(raw).strip()
-    if raw.startswith("${{") and raw.endswith("}}"):
-        raw = raw[3:-2].strip()
-    return raw
-
-
-class _Parser:
-    """A tiny, bespoke evaluator for exactly the GHA expression subset this workflow uses: && || == != () quoted strings, needs.<job>.result, needs.<job>.outputs.<name>, always(). Not a general GHA expression engine -- just enough to genuinely simulate these job conditions against a fabricated needs context, rather than trusting a text/regex match against the workflow author's own wording."""
-
-    def __init__(self, expr, needs):
-        self.expr = expr
-        self.needs = needs
-        self.pos = 0
-
-    def _skip_ws(self):
-        while self.pos < len(self.expr) and self.expr[self.pos].isspace():
-            self.pos += 1
-
-    def parse(self):
-        result = self._or()
-        self._skip_ws()
-        if self.pos != len(self.expr):
-            raise ValueError(f"trailing content: {self.expr[self.pos:]!r}")
-        return result
-
-    def _or(self):
-        left = self._and()
-        self._skip_ws()
-        while self.expr[self.pos:self.pos + 2] == "||":
-            self.pos += 2
-            right = self._and()
-            left = left or right
-            self._skip_ws()
-        return left
-
-    def _and(self):
-        left = self._atom()
-        self._skip_ws()
-        while self.expr[self.pos:self.pos + 2] == "&&":
-            self.pos += 2
-            right = self._atom()
-            left = left and right
-            self._skip_ws()
-        return left
-
-    def _atom(self):
-        self._skip_ws()
-        if self.expr[self.pos] == "(":
-            self.pos += 1
-            val = self._or()
-            self._skip_ws()
-            assert self.expr[self.pos] == ")"
-            self.pos += 1
-            return val
-        if self.expr[self.pos:self.pos + 8] == "always()":
-            self.pos += 8
-            return True
-        left_val = self._value()
-        self._skip_ws()
-        op = self.expr[self.pos:self.pos + 2]
-        if op in ("==", "!="):
-            self.pos += 2
-            right_val = self._value()
-            return left_val == right_val if op == "==" else left_val != right_val
-        return bool(left_val)
-
-    def _value(self):
-        self._skip_ws()
-        if self.expr[self.pos] == "'":
-            self.pos += 1
-            start = self.pos
-            while self.expr[self.pos] != "'":
-                self.pos += 1
-            val = self.expr[start:self.pos]
-            self.pos += 1
-            return val
-        m = re.match(r"needs\.([A-Za-z0-9_]+)\.result", self.expr[self.pos:])
-        if m:
-            self.pos += m.end()
-            return self.needs.get(m.group(1), {}).get("result", "")
-        m = re.match(r"needs\.([A-Za-z0-9_]+)\.outputs\.([A-Za-z0-9_]+)", self.expr[self.pos:])
-        if m:
-            self.pos += m.end()
-            return self.needs.get(m.group(1), {}).get("outputs", {}).get(m.group(2), "")
-        raise ValueError(f"cannot parse value at: {self.expr[self.pos:self.pos + 40]!r}")
-
-
-def eval_gha_bool(expr, needs):
-    return bool(_Parser(expr, needs).parse())
-
-
-# delete_removed_argocd_applications's own if: uses success()/github.event_name (outside this tiny parser's subset) -- its RESULT is supplied as a fixed context input, exactly like terraform_sync_once/argocd_preflight are fixed inputs in the existing Phase B1 simulator elsewhere in this suite. final_validation is deliberately NOT modeled here (Phase B3B closeout): its own if: is now a bare always() and its actual pass/fail decision is real bash program logic inside its first step, not a pure if:-expression this tiny parser could ever evaluate correctly -- that behavior is instead proven by REALLY EXECUTING the committed script in the dedicated "Phase B3B closeout: mode-aware final DEPLOY success contract" section further below.
-JOB_ORDER = ["runtime_ownership_preflight", "build_publish_and_deploy", "validate_active_runtimes", "replication_reconcile_once"]
-IF_EXPRS = {job: _extract_if(job) for job in JOB_ORDER}
-
-
-def simulate(initial, outcome_when_run, outputs_when_run=None):
-    results = dict(initial)
-    outputs_when_run = outputs_when_run or {}
-    for job in JOB_ORDER:
-        would_run = eval_gha_bool(IF_EXPRS[job], results)
-        if would_run:
-            results[job] = {"result": outcome_when_run.get(job, "success"), "outputs": outputs_when_run.get(job, {})}
-        else:
-            results[job] = {"result": "skipped", "outputs": {}}
-    return results
-
-
-def base_context(effective_deploy, has_changes, has_active):
-    return {
-        "validate_model": {"result": "success", "outputs": {"effective_deploy": effective_deploy, "has_active_deployments": has_active}},
-        "detect_changed_deployments": {"result": "success", "outputs": {"has_changes": has_changes}},
-        "validate_shared_secrets_once": {"result": "success", "outputs": {}},
-        "delete_removed_argocd_applications": {"result": "success", "outputs": {}},
-    }
-
+sys.path.insert(0, sys.argv[1])
+import gg_phase_sim as sim
 
 failures = []
 
@@ -14533,43 +14466,38 @@ def check(label, condition):
 
 
 # 1: REAL DEPLOY + changed runtime + preflight ABSENT -> build runs.
-ctx = base_context("true", "true", "false")
-r = simulate(ctx, {}, {"runtime_ownership_preflight": {"state": "ABSENT"}})
+r, c = sim.simulate_all("true", has_changes="true", has_active_deployments="false", outputs_when_run={"runtime_ownership_preflight": {"state": "ABSENT"}})
 check("REAL DEPLOY + changed runtime + preflight ABSENT -> build_publish_and_deploy runs", r["build_publish_and_deploy"]["result"] == "success")
 
 # 2: REAL DEPLOY + changed runtime + preflight OWNED -> build runs.
-ctx = base_context("true", "true", "false")
-r = simulate(ctx, {}, {"runtime_ownership_preflight": {"state": "OWNED"}})
+r, c = sim.simulate_all("true", has_changes="true", has_active_deployments="false", outputs_when_run={"runtime_ownership_preflight": {"state": "OWNED"}})
 check("REAL DEPLOY + changed runtime + preflight OWNED -> build_publish_and_deploy runs", r["build_publish_and_deploy"]["result"] == "success")
 
 # 3: REAL DEPLOY + changed runtime + preflight BROKEN -> build blocked.
-ctx = base_context("true", "true", "false")
-r = simulate(ctx, {"runtime_ownership_preflight": "failure"})
+r, c = sim.simulate_all("true", has_changes="true", has_active_deployments="false", outcome_when_run={"runtime_ownership_preflight": "failure"})
 check("REAL DEPLOY + changed runtime + preflight BROKEN -> build_publish_and_deploy is blocked (skipped)", r["build_publish_and_deploy"]["result"] == "skipped")
 
 # 4: DRY RUN + changed runtime -> live ownership preflight skipped -> local build/render validation still runs.
-ctx = base_context("false", "true", "false")
-r = simulate(ctx, {})
+r, c = sim.simulate_all("false", has_changes="true", has_active_deployments="false")
 check("DRY RUN + changed runtime -> runtime_ownership_preflight is skipped (never invoked live)", r["runtime_ownership_preflight"]["result"] == "skipped")
-check("DRY RUN + changed runtime -> build_publish_and_deploy's local render/validation path still runs", r["build_publish_and_deploy"]["result"] == "success")
+check("DRY RUN + changed runtime -> build_publish_and_deploy local render/validation path still runs", r["build_publish_and_deploy"]["result"] == "success")
 
 # 5: REAL DEPLOY + no changed runtimes + active runtime exists -> build may skip -> validate_active_runtimes still runs.
-ctx = base_context("true", "false", "true")
-r = simulate(ctx, {})
+r, c = sim.simulate_all("true", has_changes="false", has_active_deployments="true")
 check("REAL DEPLOY + no changed runtimes -> build_publish_and_deploy skips (nothing to build)", r["build_publish_and_deploy"]["result"] == "skipped")
 check("REAL DEPLOY + no changed runtimes + active runtime exists -> validate_active_runtimes still runs", r["validate_active_runtimes"]["result"] == "success")
 
-# 6: REAL DEPLOY + one active runtime unhealthy -> runtime acceptance fails -> replication blocked.
-ctx = base_context("true", "false", "true")
-r = simulate(ctx, {"validate_active_runtimes": "failure"})
+# 6: REAL DEPLOY + one active runtime unhealthy -> runtime acceptance fails -> replication blocked (Phase 5 own contract fails, so Phase 6 never even starts).
+r, c = sim.simulate_all("true", has_changes="false", has_active_deployments="true", outcome_when_run={"validate_active_runtimes": "failure"})
 check("REAL DEPLOY + active runtime unhealthy -> validate_active_runtimes reports failure", r["validate_active_runtimes"]["result"] == "failure")
-check("REAL DEPLOY + active runtime unhealthy -> replication_reconcile_once is blocked", r["replication_reconcile_once"]["result"] == "skipped")
-# final_validation's own resulting pass/fail for this exact scenario (a required active-runtime job failing) is proven by real script execution in the "Phase B3B closeout" section further below, not by this if:-expression-only simulator.
+check("REAL DEPLOY + active runtime unhealthy -> Phase 5 own contract fails", c[5] == "failure")
+check("REAL DEPLOY + active runtime unhealthy -> replication_reconcile_once is blocked (Phase 6 never starts)", r["replication_reconcile_once"]["result"] == "skipped")
+# final_validation own resulting pass/fail for this exact scenario (a required active-runtime job failing) is proven by real script execution in the "Phase B3B closeout" section further below, not by this if:-expression-only simulator.
 
 # 7: REAL DEPLOY + no active runtimes -> runtime acceptance cleanly skipped -> replication remains safe no-op.
-ctx = base_context("true", "false", "false")
-r = simulate(ctx, {})
+r, c = sim.simulate_all("true", has_changes="false", has_active_deployments="false")
 check("REAL DEPLOY + no active runtimes -> validate_active_runtimes is cleanly skipped (never an empty-matrix error)", r["validate_active_runtimes"]["result"] == "skipped")
+check("REAL DEPLOY + no active runtimes -> Phase 5 own contract still succeeds", c[5] == "success")
 check("REAL DEPLOY + no active runtimes -> replication_reconcile_once still runs (existing clean no-op path preserved)", r["replication_reconcile_once"]["result"] == "success")
 # final_validation still succeeding for this exact scenario (no active runtimes) is proven by real script execution in the "Phase B3B closeout" section further below, not by this if:-expression-only simulator.
 
@@ -14587,13 +14515,13 @@ PYEOF
     pass "Phase B3A: DAG scenario 3 (REAL DEPLOY + changed runtime + BROKEN preflight -> build blocked)"
     pass "Phase B3A: DAG scenario 4 (DRY RUN + changed runtime -> live preflight skipped, local render path still runs)"
     pass "Phase B3A: DAG scenario 5 (REAL DEPLOY + no changed runtimes + active runtime exists -> build may skip, validate_active_runtimes still runs)"
-    pass "Phase B3A: DAG scenario 6 (REAL DEPLOY + one active runtime unhealthy -> acceptance fails, replication/final_validation blocked)"
-    pass "Phase B3A: DAG scenario 7 (REAL DEPLOY + no active runtimes -> acceptance cleanly skipped, replication remains safe no-op)"
+    pass "Phase B3A: DAG scenario 6 (REAL DEPLOY + one active runtime unhealthy -> acceptance fails, Phase 5 contract fails, replication/final_validation blocked)"
+    pass "Phase B3A: DAG scenario 7 (REAL DEPLOY + no active runtimes -> acceptance cleanly skipped, Phase 5 contract still succeeds, replication remains safe no-op)"
   else
     fail "Phase B3A DAG simulation failed:"$'\n'"${PHASE_B3A_SIM_OUT}"
   fi
 else
-  skip "Phase B3A: DAG simulation -- python3/PyYAML unavailable or main workflow missing"
+  skip "Phase B3A: DAG simulation -- python3/PyYAML unavailable"
 fi
 
 # 19: no Route 53 mutation was introduced anywhere in the repository (aws_route53_record, aws route53 change-resource-record-sets, or similar mutation logic).
@@ -14778,16 +14706,26 @@ results.append(("21: end_to_end_deployment_acceptance fetches /api/processes thr
 results.append(("22a: end_to_end_deployment_acceptance is real-deploy-only (effective_deploy == \x27true\x27)", "effective_deploy == \x27true\x27" in e2e_job_if))
 results.append(("22b: end_to_end_deployment_acceptance is active-runtime-only (has_active_deployments == \x27true\x27)", "has_active_deployments == \x27true\x27" in e2e_job_if))
 
-# 23/24: active-runtime success requires end_to_end_deployment_acceptance, and final_validation lists every REQUIRED B3B job directly -- never relying only on transitive failure/skip propagation through it. Phase B3B closeout: the mode-aware pass/fail decision now lives in the first step of final_validation (never a hidden accidental-truth if: expression) -- a SKIPPED value for any of these REQUIRED jobs must fail the gate, not merely "not be a failure".
+# PHASE-ORIENTED ORCHESTRATION: these six jobs now live in Phase 3/4/7 (03/04/07-phase-*.yaml), not MAIN -- a direct MAIN-level needs: edge onto any of them is structurally impossible. The same "never rely only on transitive failure/skip propagation" guarantee is instead enforced two levels down: (a) each owning phase own phase_contract require_success-lists the job in its applicable REQUIRED (Deploy, and for the B3B jobs also active-runtime) branch -- a SKIPPED value still fails that phase closed, never merely "not a failure"; (b) MAIN final_validation needs every one of the 7 phase-calling jobs and is if: always(), so a failed owning phase is caught by name.
 final_val = jobs.get("final_validation", {})
 final_val_needs = final_val.get("needs") or []
 final_val_if = str(final_val.get("if", ""))
-final_val_gate_step = next((s for s in final_val.get("steps", []) if s.get("name") == "Validate the mode-aware final DEPLOY success contract"), None)
-final_val_gate_run = (final_val_gate_step or {}).get("run", "")
 results.append(("24z: final_validation itself is always() (runs unconditionally so it can fail closed with diagnostics rather than silently disappearing)", final_val_if.strip() == "always()"))
-for extra_job in ("validate_argocd_ready", "validate_platform_ready", "validate_observability_ready", "monitor_ownership_preflight", "validate_monitor_ready", "end_to_end_deployment_acceptance"):
-    results.append((f"23: final_validation needs {extra_job} directly (closes the transitive-skip gap)", extra_job in final_val_needs))
-    results.append((f"24: the final_validation mode-aware gate step requires EXACT success for {extra_job} in its applicable REQUIRED branch (a SKIPPED value fails the gate, never merely treated as not-a-failure)", f"require_success {extra_job}" in final_val_gate_run))
+for phase_caller in ("phase_1_readiness_safety", "phase_2_aws_prerequisites", "phase_3_argocd", "phase_4_platform_observability", "phase_5_runtimes", "phase_6_replication", "phase_7_monitor_acceptance"):
+    results.append((f"23: final_validation needs {phase_caller} directly (closes the transitive-skip gap at the phase level)", phase_caller in final_val_needs))
+owning_contract = {
+    "validate_argocd_ready": "phase_contract__03",
+    "validate_platform_ready": "phase_contract__04",
+    "validate_observability_ready": "phase_contract__04",
+    "monitor_ownership_preflight": "phase_contract__07",
+    "validate_monitor_ready": "phase_contract__07",
+    "end_to_end_deployment_acceptance": "phase_contract__07",
+}
+for extra_job, contract_job_name in owning_contract.items():
+    contract_job = jobs.get(contract_job_name, {})
+    contract_run = "\n".join(s.get("run", "") for s in contract_job.get("steps", []))
+    results.append((f"23: {extra_job} own owning phase ({contract_job_name}) needs it directly", extra_job in (contract_job.get("needs") or [])))
+    results.append((f"24: {contract_job_name} requires EXACT success for {extra_job} in its applicable REQUIRED branch (a SKIPPED value fails that phase closed, never merely treated as not-a-failure)", f"require_success {extra_job}" in contract_run))
 
 # 25: no-active-runtime path remains valid, and dry-run never runs the live B3B jobs -- all four are gated on both has_active_deployments == \x27true\x27 and effective_deploy == \x27true\x27.
 for gated_job_name, gated_job_if in (("monitor_ownership_preflight", preflight_if), ("monitor_sync_once", sync_once_if), ("validate_monitor_ready", validate_ready_if), ("end_to_end_deployment_acceptance", e2e_job_if)):
@@ -14902,147 +14840,14 @@ else
   skip "Phase B3B: first-bootstrap workflow regression -- python3/PyYAML unavailable or 50-sub-monitor.yaml missing"
 fi
 
-# DAG simulation: scenarios 1, 4, 6, 7, 8, 9, 10 from the required WORKFLOW VALIDATION list, exercised against the real MAIN if: expressions (scenarios 2/3/5 are exercised structurally above, since 50-sub-monitor.yaml's own internal staged bootstrap/gate logic is not visible as separate MAIN-level job nodes).
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+# DAG simulation: scenarios 1, 4, 6, 7, 8, 9, 10 from the required WORKFLOW VALIDATION list, exercised against the real if: expressions via the shared gg_phase_sim module (scenarios 2/3/5 are exercised structurally above, since 50-sub-monitor.yaml own internal staged bootstrap/gate logic is not visible as separate job nodes).
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
   set +e
-  PHASE_B3B_SIM_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
-import re
+  PHASE_B3B_SIM_OUT="$(python3 - "$WORKDIR" <<'PYEOF'
 import sys
-import yaml
 
-with open(sys.argv[1]) as f:
-    doc = yaml.safe_load(f)
-
-jobs = doc["jobs"]
-
-
-def _extract_if(job_name):
-    raw = jobs[job_name].get("if", "true")
-    raw = str(raw).strip()
-    if raw.startswith("${{") and raw.endswith("}}"):
-        raw = raw[3:-2].strip()
-    return raw
-
-
-class _Parser:
-    """A tiny, bespoke evaluator for exactly the GHA expression subset this workflow uses: && || == != () quoted strings, needs.<job>.result, needs.<job>.outputs.<name>, always(). Not a general GHA expression engine -- just enough to genuinely simulate these job conditions against a fabricated needs context, rather than trusting a text/regex match against the workflow author's own wording."""
-
-    def __init__(self, expr, needs):
-        self.expr = expr
-        self.needs = needs
-        self.pos = 0
-
-    def _skip_ws(self):
-        while self.pos < len(self.expr) and self.expr[self.pos].isspace():
-            self.pos += 1
-
-    def parse(self):
-        result = self._or()
-        self._skip_ws()
-        if self.pos != len(self.expr):
-            raise ValueError(f"trailing content: {self.expr[self.pos:]!r}")
-        return result
-
-    def _or(self):
-        left = self._and()
-        self._skip_ws()
-        while self.expr[self.pos:self.pos + 2] == "||":
-            self.pos += 2
-            right = self._and()
-            left = left or right
-            self._skip_ws()
-        return left
-
-    def _and(self):
-        left = self._atom()
-        self._skip_ws()
-        while self.expr[self.pos:self.pos + 2] == "&&":
-            self.pos += 2
-            right = self._atom()
-            left = left and right
-            self._skip_ws()
-        return left
-
-    def _atom(self):
-        self._skip_ws()
-        if self.expr[self.pos] == "(":
-            self.pos += 1
-            val = self._or()
-            self._skip_ws()
-            assert self.expr[self.pos] == ")"
-            self.pos += 1
-            return val
-        if self.expr[self.pos:self.pos + 8] == "always()":
-            self.pos += 8
-            return True
-        left_val = self._value()
-        self._skip_ws()
-        op = self.expr[self.pos:self.pos + 2]
-        if op in ("==", "!="):
-            self.pos += 2
-            right_val = self._value()
-            return left_val == right_val if op == "==" else left_val != right_val
-        return bool(left_val)
-
-    def _value(self):
-        self._skip_ws()
-        if self.expr[self.pos] == "'":
-            self.pos += 1
-            start = self.pos
-            while self.expr[self.pos] != "'":
-                self.pos += 1
-            val = self.expr[start:self.pos]
-            self.pos += 1
-            return val
-        m = re.match(r"needs\.([A-Za-z0-9_]+)\.result", self.expr[self.pos:])
-        if m:
-            self.pos += m.end()
-            return self.needs.get(m.group(1), {}).get("result", "")
-        m = re.match(r"needs\.([A-Za-z0-9_]+)\.outputs\.([A-Za-z0-9_]+)", self.expr[self.pos:])
-        if m:
-            self.pos += m.end()
-            return self.needs.get(m.group(1), {}).get("outputs", {}).get(m.group(2), "")
-        raise ValueError(f"cannot parse value at: {self.expr[self.pos:self.pos + 40]!r}")
-
-
-def eval_gha_bool(expr, needs):
-    return bool(_Parser(expr, needs).parse())
-
-
-# final_validation is deliberately NOT modeled here (Phase B3B closeout): its own if: is now a bare always() and its actual pass/fail decision is real bash program logic inside its first step, not a pure if:-expression this tiny parser could ever evaluate correctly -- that behavior is instead proven by REALLY EXECUTING the committed script in the dedicated "Phase B3B closeout: mode-aware final DEPLOY success contract" section further below.
-JOB_ORDER = ["monitor_ownership_preflight", "monitor_sync_once", "validate_monitor_ready", "replication_monitor_acceptance", "end_to_end_deployment_acceptance"]
-IF_EXPRS = {job: _extract_if(job) for job in JOB_ORDER}
-
-
-def simulate(initial, outcome_when_run, outputs_when_run=None):
-    results = dict(initial)
-    outputs_when_run = outputs_when_run or {}
-    for job in JOB_ORDER:
-        would_run = eval_gha_bool(IF_EXPRS[job], results)
-        if would_run:
-            results[job] = {"result": outcome_when_run.get(job, "success"), "outputs": outputs_when_run.get(job, {})}
-        else:
-            results[job] = {"result": "skipped", "outputs": {}}
-    return results
-
-
-def base_context(effective_deploy, has_active):
-    # Every OTHER job final_validation's real if: (and monitor_ownership_preflight/monitor_sync_once/validate_monitor_ready/end_to_end_deployment_acceptance's own if: expressions) reference is fixed here as a successful background context -- this simulator's scope is only the B3B-specific dynamic jobs listed in JOB_ORDER above, exactly like the Phase B3A simulator's own use of a fixed base_context() for its own unrelated upstream jobs.
-    return {
-        "validate_model": {"result": "success", "outputs": {"effective_deploy": effective_deploy, "has_active_deployments": has_active}},
-        "validate_shared_secrets_once": {"result": "success", "outputs": {}},
-        "build_publish_and_deploy": {"result": "success", "outputs": {}},
-        "delete_removed_argocd_applications": {"result": "success", "outputs": {}},
-        "replication_reconcile_once": {"result": "success", "outputs": {}},
-        "validate_active_runtimes": {"result": "success", "outputs": {}},
-        "validate_argocd_ready": {"result": "success", "outputs": {}},
-        "validate_platform_ready": {"result": "success", "outputs": {}},
-        "validate_observability_ready": {"result": "success", "outputs": {}},
-        "runtime_ownership_preflight": {"result": "success", "outputs": {}},
-        "replication_dry_run_validation": {"result": "success", "outputs": {}},
-        "monitor_dry_run_validation": {"result": "success", "outputs": {}},
-    }
-
+sys.path.insert(0, sys.argv[1])
+import gg_phase_sim as sim
 
 failures = []
 
@@ -15053,8 +14858,7 @@ def check(label, condition):
 
 
 # Scenario 1: MONITOR ABSENT -> full bootstrap chain runs end to end.
-ctx = base_context("true", "true")
-r = simulate(ctx, {}, {"monitor_ownership_preflight": {"state": "ABSENT"}})
+r, c = sim.simulate_all("true", has_active_deployments="true", outputs_when_run={"monitor_ownership_preflight": {"state": "ABSENT"}})
 check("Scenario 1 (MONITOR ABSENT): monitor_ownership_preflight succeeds with state ABSENT", r["monitor_ownership_preflight"]["result"] == "success")
 check("Scenario 1 (MONITOR ABSENT): monitor_sync_once runs (full bootstrap chain, no manual prerequisite)", r["monitor_sync_once"]["result"] == "success")
 check("Scenario 1 (MONITOR ABSENT): validate_monitor_ready runs", r["validate_monitor_ready"]["result"] == "success")
@@ -15063,34 +14867,29 @@ check("Scenario 1 (MONITOR ABSENT): end_to_end_deployment_acceptance runs", r["e
 # final_validation succeeding for this exact chain is proven by real script execution in the "Phase B3B closeout" section further below.
 
 # Scenario 4: MONITOR BROKEN blocks the SUB workflow invocation entirely.
-ctx = base_context("true", "true")
-r = simulate(ctx, {"monitor_ownership_preflight": "failure"})
+r, c = sim.simulate_all("true", has_active_deployments="true", outcome_when_run={"monitor_ownership_preflight": "failure"})
 check("Scenario 4 (MONITOR BROKEN): monitor_ownership_preflight fails", r["monitor_ownership_preflight"]["result"] == "failure")
 check("Scenario 4 (MONITOR BROKEN): monitor_sync_once (the SUB workflow invocation) is blocked (skipped)", r["monitor_sync_once"]["result"] == "skipped")
 # final_validation being blocked for this exact scenario is proven by real script execution in the "Phase B3B closeout" section further below (scenario C: monitor_sync_once skipped).
 
 # Scenario 6: monitor reconciliation failure blocks acceptance.
-ctx = base_context("true", "true")
-r = simulate(ctx, {"monitor_sync_once": "failure"}, {"monitor_ownership_preflight": {"state": "OWNED"}})
+r, c = sim.simulate_all("true", has_active_deployments="true", outcome_when_run={"monitor_sync_once": "failure"}, outputs_when_run={"monitor_ownership_preflight": {"state": "OWNED"}})
 check("Scenario 6 (monitor_sync_once failure): validate_monitor_ready is blocked (skipped)", r["validate_monitor_ready"]["result"] == "skipped")
 # final_validation being blocked when a REQUIRED active-runtime job is skipped is proven by real script execution in the "Phase B3B closeout" section further below (scenario B: validate_monitor_ready skipped).
 
 # Scenario 7: monitor acceptance failure blocks replication/E2E.
-ctx = base_context("true", "true")
-r = simulate(ctx, {"validate_monitor_ready": "failure"}, {"monitor_ownership_preflight": {"state": "OWNED"}})
+r, c = sim.simulate_all("true", has_active_deployments="true", outcome_when_run={"validate_monitor_ready": "failure"}, outputs_when_run={"monitor_ownership_preflight": {"state": "OWNED"}})
 check("Scenario 7 (validate_monitor_ready failure): replication_monitor_acceptance is blocked (skipped)", r["replication_monitor_acceptance"]["result"] == "skipped")
 check("Scenario 7 (validate_monitor_ready failure): end_to_end_deployment_acceptance is blocked (skipped)", r["end_to_end_deployment_acceptance"]["result"] == "skipped")
 # final_validation being blocked for this exact scenario is proven by real script execution in the "Phase B3B closeout" section further below (scenario A: end_to_end_deployment_acceptance skipped).
 
 # Scenario 8: an ACTIVE runtime not UP/fresh fails the final E2E gate -> final_validation blocked.
-ctx = base_context("true", "true")
-r = simulate(ctx, {"end_to_end_deployment_acceptance": "failure"}, {"monitor_ownership_preflight": {"state": "OWNED"}})
+r, c = sim.simulate_all("true", has_active_deployments="true", outcome_when_run={"end_to_end_deployment_acceptance": "failure"}, outputs_when_run={"monitor_ownership_preflight": {"state": "OWNED"}})
 check("Scenario 8 (an ACTIVE runtime not UP/fresh): end_to_end_deployment_acceptance fails", r["end_to_end_deployment_acceptance"]["result"] == "failure")
 # final_validation being blocked when end_to_end_deployment_acceptance genuinely FAILS (never merely skipped) is covered by the always()-plus-explicit-result-checks contract exercised in the "Phase B3B closeout" section further below.
 
 # Scenario 9: NO active runtimes cleanly skips the entire monitor live path, and final_validation still succeeds.
-ctx = base_context("true", "false")
-r = simulate(ctx, {})
+r, c = sim.simulate_all("true", has_active_deployments="false")
 check("Scenario 9 (no active runtimes): monitor_ownership_preflight is cleanly skipped", r["monitor_ownership_preflight"]["result"] == "skipped")
 check("Scenario 9 (no active runtimes): monitor_sync_once is cleanly skipped", r["monitor_sync_once"]["result"] == "skipped")
 check("Scenario 9 (no active runtimes): validate_monitor_ready is cleanly skipped", r["validate_monitor_ready"]["result"] == "skipped")
@@ -15098,8 +14897,7 @@ check("Scenario 9 (no active runtimes): end_to_end_deployment_acceptance is clea
 # final_validation still succeeding when there are no active runtimes (all B3B runtime/monitor jobs legitimately skipped) is proven by real script execution in the "Phase B3B closeout" section further below (scenario D).
 
 # Scenario 10: DRY RUN has no B3B live mutations or live API acceptance.
-ctx = base_context("false", "true")
-r = simulate(ctx, {})
+r, c = sim.simulate_all("false", has_active_deployments="true")
 check("Scenario 10 (DRY RUN): monitor_ownership_preflight never runs live", r["monitor_ownership_preflight"]["result"] == "skipped")
 check("Scenario 10 (DRY RUN): monitor_sync_once never runs live", r["monitor_sync_once"]["result"] == "skipped")
 check("Scenario 10 (DRY RUN): validate_monitor_ready never runs (no live health/API acceptance)", r["validate_monitor_ready"]["result"] == "skipped")
@@ -15125,7 +14923,7 @@ PYEOF
     fail "Phase B3B DAG simulation failed:"$'\n'"${PHASE_B3B_SIM_OUT}"
   fi
 else
-  skip "Phase B3B: DAG simulation -- python3/PyYAML unavailable or main workflow missing"
+  skip "Phase B3B: DAG simulation -- python3/PyYAML unavailable"
 fi
 
 echo ""
@@ -15152,28 +14950,26 @@ def if_text(name):
 
 results = []
 
-# Must now contain a status-check function (the actual fix).
-for name in ("monitor_ownership_preflight", "validate_monitor_ready", "end_to_end_deployment_acceptance"):
+# PHASE-ORIENTED ORCHESTRATION: monitor_ownership_preflight/monitor_sync_once/validate_monitor_ready/replication_monitor_acceptance/end_to_end_deployment_acceptance all now live together in 07-phase-monitor-acceptance.yaml. monitor_ownership_preflight is that phase own ROOT job (no needs: at all -- it depends only on inputs.*), so it has no ancestor-skip-propagation exposure to guard against and correctly carries no always(); every other job in this list has local needs: and correctly still carries always().
+for name in ("monitor_sync_once", "validate_monitor_ready", "replication_monitor_acceptance", "end_to_end_deployment_acceptance"):
     results.append((f"{name}'s job-level if: contains a status-check function (always()/success()/failure()/cancelled())", bool(STATUS_FN_RE.search(if_text(name)))))
+results.append(("monitor_ownership_preflight carries no needs: (root job in its phase file, so no ancestor-skip-propagation risk exists to guard against)", not jobs["monitor_ownership_preflight"].get("needs")))
 
-# Already correct beforehand -- re-confirmed, never re-derived from scratch.
-for name in ("monitor_sync_once", "replication_monitor_acceptance"):
-    results.append((f"{name}'s job-level if: still contains always() (already correct, unchanged by this fix)", "always()" in if_text(name)))
+results.append(("final_validation's job-level if: is exactly always() (unchanged, still the sole authority for the phase-level required-success contract)", jobs["final_validation"].get("if") == "always()" or str(jobs["final_validation"].get("if")).strip() == "always()"))
 
-results.append(("final_validation's job-level if: is exactly always() (unchanged, still the sole authority for the mode-aware required-success contract)", jobs["final_validation"].get("if") == "always()" or str(jobs["final_validation"].get("if")).strip() == "always()"))
+# PHASE-ORIENTED ORCHESTRATION: the old cross-job clauses (needs.validate_shared_secrets_once.result, needs.replication_reconcile_once.result, and end_to_end_deployment_acceptance's 7-job dependency list) referenced jobs that now live in Phase 4/5/6 -- a needs: edge onto them from Phase 7 is structurally impossible. The same "no upstream failure/skip can silently be masked" guarantee is instead enforced by MAIN own phase_7_monitor_acceptance job needing phase_6_replication with no custom if: (which is itself only reachable if Phase 3/4/5/6 all transitively succeeded); the two genuinely LOCAL clauses (validate_monitor_ready, replication_monitor_acceptance) remain direct needs: edges, unchanged.
+phase7_caller = jobs.get("phase_7_monitor_acceptance", {})
+results.append(("MAIN phase_7_monitor_acceptance needs phase_6_replication (transitively covering Phase 3/4/5/6 success, the phase-relocated form of the old cross-job clauses)", "phase_6_replication" in (phase7_caller.get("needs") or [])))
+results.append(("MAIN phase_7_monitor_acceptance carries no custom if: (relies on the implicit all-needs-succeeded default)", "if" not in phase7_caller))
 
-# The fix must be ADDITIVE only -- every explicit clause that existed before must still be present verbatim, never replaced by a weaker check such as != 'failure' for one of these three specific jobs.
 mop_if = if_text("monitor_ownership_preflight")
-results.append(("monitor_ownership_preflight still requires validate_shared_secrets_once.result == 'success' (exact, not merely != 'failure')", "needs.validate_shared_secrets_once.result == 'success'" in mop_if))
-results.append(("monitor_ownership_preflight still requires replication_reconcile_once.result == 'success' (exact, not merely != 'failure')", "needs.replication_reconcile_once.result == 'success'" in mop_if))
 results.append(("monitor_ownership_preflight still requires effective_deploy == 'true' and has_active_deployments == 'true'", "effective_deploy == 'true'" in mop_if and "has_active_deployments == 'true'" in mop_if))
 
 vmr_if = if_text("validate_monitor_ready")
-results.append(("validate_monitor_ready still requires validate_shared_secrets_once.result == 'success' (exact, not merely != 'failure')", "needs.validate_shared_secrets_once.result == 'success'" in vmr_if))
 results.append(("validate_monitor_ready still requires monitor_sync_once.result == 'success' (exact, not merely != 'failure')", "needs.monitor_sync_once.result == 'success'" in vmr_if))
 
 e2e_if = if_text("end_to_end_deployment_acceptance")
-for dep in ("validate_argocd_ready", "validate_platform_ready", "validate_observability_ready", "validate_active_runtimes", "replication_reconcile_once", "validate_monitor_ready", "replication_monitor_acceptance"):
+for dep in ("validate_monitor_ready", "replication_monitor_acceptance"):
     results.append((f"end_to_end_deployment_acceptance still requires {dep}.result == 'success' (exact, not merely != 'failure'/!= 'cancelled')", f"needs.{dep}.result == 'success'" in e2e_if))
 
 for label, ok in results:
@@ -15196,160 +14992,21 @@ else
   skip "Skip-propagation fix: structural always()/explicit-clause proof -- python3/PyYAML unavailable or main workflow missing"
 fi
 
-# 2/3: a small, targeted model of GitHub Actions' REAL default job-continuation semantics -- deliberately NOT a general GitHub Actions engine (no runner emulation, no step execution, no matrix expansion): it implements exactly the one rule this whole fix is about. A job whose own if: contains a status-check function is evaluated purely by that expression (exactly like the JOB_ORDER simulator above). A job whose own if: contains NO status-check function additionally requires its ENTIRE transitive needs-closure (not merely its direct needs) to have concluded with exactly 'success' -- an intermediate ancestor's own always()-driven success does not, by itself, satisfy this for a job further downstream that itself lacks a status function. This is exactly the mechanism the live run exposed: delete_removed_argocd_applications is legitimately skipped (has_deletions=false); replication_reconcile_once survives it via its own always(); but monitor_ownership_preflight (before this fix) still defaulted to skipped because delete_removed_argocd_applications remained "skipped" somewhere in its full transitive closure, regardless of replication_reconcile_once's own reported success.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+# 2/3: PHASE-ORIENTED ORCHESTRATION: this section originally modeled GitHub Actions REAL default job-continuation semantics (full transitive-needs-closure success, not merely direct needs) against ONE flat MAIN graph, because the historical live defect was exactly that: a legitimate skip in one branch (delete_removed_argocd_applications, has_deletions=false) silently propagating through a shared-graph transitive closure to suppress a sibling branch (monitor_ownership_preflight) that lacked always(). Under the phase-oriented refactor this defect class is now structurally eliminated, not merely patched: delete_removed_argocd_applications (Phase 5) and monitor_ownership_preflight (Phase 7) no longer share a single if:-expression graph at all -- the only channel between phases is MAIN own phase-caller needs: chain (verified elsewhere in this suite to carry no custom if: on any phase-caller job), and each phase own phase_contract step is real bash program logic (require_success/allow_non_failure), never a raw if: expression subject to GitHub implicit skip-propagation. This section is rewritten to (a) prove the ORIGINAL legitimate-skip scenario still concludes success end-to-end via the shared gg_phase_sim module (item 2), (b) prove a genuine failure of each required prerequisite still blocks every downstream job in the chain (item 3), and (c) prove the specific defect class is structurally impossible to reintroduce (replacing the old same-graph "meta-proof").
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
   set +e
-  SKIP_PROPAGATION_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
-import re
+  SKIP_PROPAGATION_OUT="$(python3 - "$WORKDIR" <<'PYEOF'
 import sys
-import yaml
 
-with open(sys.argv[1]) as f:
-    doc = yaml.safe_load(f)
-jobs = doc["jobs"]
+sys.path.insert(0, sys.argv[1])
+import gg_phase_sim as sim
 
-STATUS_FN_RE = re.compile(r"\b(always|success|failure|cancelled)\(\)")
+results = []
 
 
-def has_status_fn(expr):
-    return bool(STATUS_FN_RE.search(expr))
+def check(label, ok):
+    results.append((label, ok))
 
-
-def job_needs(name):
-    n = jobs[name].get("needs")
-    if n is None:
-        return []
-    if isinstance(n, str):
-        return [n]
-    return list(n)
-
-
-def extract_if(name):
-    raw = str(jobs[name].get("if", "true")).strip()
-    if raw.startswith("${{") and raw.endswith("}}"):
-        raw = raw[3:-2].strip()
-    return raw
-
-
-class _Parser:
-    """The SAME tiny bespoke && || == != () always() needs.<job>.result/outputs.* evaluator already used by the Phase B3B JOB_ORDER simulator above -- copied here (never imported/shared, matching this suite's own established per-section convention) rather than a general GHA expression engine."""
-
-    def __init__(self, expr, needs):
-        self.expr = expr
-        self.needs = needs
-        self.pos = 0
-
-    def _skip_ws(self):
-        while self.pos < len(self.expr) and self.expr[self.pos] == " ":
-            self.pos += 1
-
-    def parse(self):
-        result = self._or()
-        self._skip_ws()
-        if self.pos != len(self.expr):
-            raise ValueError(f"trailing content: {self.expr[self.pos:]!r}")
-        return result
-
-    def _or(self):
-        left = self._and()
-        self._skip_ws()
-        while self.expr[self.pos:self.pos + 2] == "||":
-            self.pos += 2
-            right = self._and()
-            left = left or right
-            self._skip_ws()
-        return left
-
-    def _and(self):
-        left = self._atom()
-        self._skip_ws()
-        while self.expr[self.pos:self.pos + 2] == "&&":
-            self.pos += 2
-            right = self._atom()
-            left = left and right
-            self._skip_ws()
-        return left
-
-    def _atom(self):
-        self._skip_ws()
-        if self.expr[self.pos] == "(":
-            self.pos += 1
-            val = self._or()
-            self._skip_ws()
-            assert self.expr[self.pos] == ")"
-            self.pos += 1
-            return val
-        if self.expr[self.pos:self.pos + 8] == "always()":
-            self.pos += 8
-            return True
-        left_val = self._value()
-        self._skip_ws()
-        op = self.expr[self.pos:self.pos + 2]
-        if op in ("==", "!="):
-            self.pos += 2
-            right_val = self._value()
-            return left_val == right_val if op == "==" else left_val != right_val
-        return bool(left_val)
-
-    def _value(self):
-        self._skip_ws()
-        if self.expr[self.pos] == "'":
-            self.pos += 1
-            start = self.pos
-            while self.expr[self.pos] != "'":
-                self.pos += 1
-            val = self.expr[start:self.pos]
-            self.pos += 1
-            return val
-        m = re.match(r"needs\.([A-Za-z0-9_]+)\.result", self.expr[self.pos:])
-        if m:
-            self.pos += m.end()
-            return self.needs.get(m.group(1), {}).get("result", "")
-        m = re.match(r"needs\.([A-Za-z0-9_]+)\.outputs\.([A-Za-z0-9_]+)", self.expr[self.pos:])
-        if m:
-            self.pos += m.end()
-            return self.needs.get(m.group(1), {}).get("outputs", {}).get(m.group(2), "")
-        raise ValueError(f"cannot parse value at: {self.expr[self.pos:self.pos + 40]!r}")
-
-
-def eval_gha_bool(expr, needs):
-    return bool(_Parser(expr, needs).parse())
-
-
-def transitive_ancestors_all_success(name, results, seen=None):
-    if seen is None:
-        seen = set()
-    for dep in job_needs(name):
-        if dep in seen:
-            continue
-        seen.add(dep)
-        dep_result = results.get(dep, {"result": "success"})["result"]
-        if dep_result != "success":
-            return False
-        if not transitive_ancestors_all_success(dep, results, seen):
-            return False
-    return True
-
-
-def would_run(name, results, if_override=None):
-    expr = if_override if if_override is not None else extract_if(name)
-    if not has_status_fn(expr):
-        if not transitive_ancestors_all_success(name, results):
-            return False
-    return eval_gha_bool(expr, results)
-
-
-# Real-deploy + active-runtime background: every genuinely required runtime/foundation prerequisite has already succeeded -- the ONE legitimate optional skip under test is delete_removed_argocd_applications (has_deletions=false), never anything else.
-BASE_BACKGROUND = {
-    "validate_model": {"result": "success", "outputs": {"effective_deploy": "true", "has_active_deployments": "true"}},
-    "validate_shared_secrets_once": {"result": "success", "outputs": {}},
-    "build_publish_and_deploy": {"result": "success", "outputs": {}},
-    "validate_active_runtimes": {"result": "success", "outputs": {}},
-    "validate_argocd_ready": {"result": "success", "outputs": {}},
-    "validate_platform_ready": {"result": "success", "outputs": {}},
-    "validate_observability_ready": {"result": "success", "outputs": {}},
-    "delete_removed_argocd_applications": {"result": "skipped", "outputs": {}},
-}
 
 CHAIN = [
     "replication_reconcile_once",
@@ -15359,54 +15016,38 @@ CHAIN = [
     "replication_monitor_acceptance",
     "end_to_end_deployment_acceptance",
 ]
-FORCED_OUTPUTS = {"monitor_ownership_preflight": {"state": "OWNED"}}
 
-results = []
-
-
-def check(label, ok):
-    results.append((label, ok))
-
-
-# 2: the exact live scenario -- delete_removed_argocd_applications legitimately skipped, every genuinely required prerequisite otherwise succeeds. Against the CURRENT (fixed) if: expressions, every job in the required monitor chain must be eligible ("would run", concluding success) -- never silently suppressed by the legitimate optional ancestor skip.
-ctx = dict(BASE_BACKGROUND)
+# 2: the exact live scenario -- delete_removed_argocd_applications legitimately skipped (has_deletions=false), every genuinely required prerequisite otherwise succeeds. Every job in the required monitor chain must be eligible (concludes success) -- never silently suppressed by the legitimate optional ancestor skip in a DIFFERENT phase.
+r, c = sim.simulate_all("true", has_changes="true", has_deletions="false", has_active_deployments="true",
+                         outputs_when_run={"monitor_ownership_preflight": {"state": "OWNED"}})
+check("2: delete_removed_argocd_applications is legitimately skipped (has_deletions=false)", r["delete_removed_argocd_applications"]["result"] == "skipped")
 for name in CHAIN:
-    ok = would_run(name, ctx)
-    ctx[name] = {"result": "success" if ok else "skipped", "outputs": FORCED_OUTPUTS.get(name, {})}
-    check(f"2: legitimate delete_removed_argocd_applications=skipped does NOT suppress {name} (eligible, concludes success)", ok)
+    check(f"2: legitimate delete_removed_argocd_applications=skipped does NOT suppress {name} (eligible, concludes success)", r[name]["result"] == "success")
 
-# Meta-proof that this model would actually have caught the historical bug: re-run the identical scenario with monitor_ownership_preflight's OWN if: text reverted (always() stripped) to what it was before this fix -- a fixture MUTATION of the extracted text, never a second real file -- and confirm the model correctly predicts it would have been skipped, exactly matching the live-observed defect.
-PRE_FIX_MOP_IF = extract_if("monitor_ownership_preflight").replace("always() && ", "").replace(" && always()", "")
-ctx2 = dict(BASE_BACKGROUND)
-ctx2["replication_reconcile_once"] = {"result": "success" if would_run("replication_reconcile_once", ctx2) else "skipped", "outputs": {}}
-pre_fix_would_run = would_run("monitor_ownership_preflight", ctx2, if_override=PRE_FIX_MOP_IF)
-check("meta-proof: replaying the SAME scenario against the PRE-FIX monitor_ownership_preflight if: text (always() stripped) correctly predicts it would have been skipped -- confirming this model actually reproduces the historical live defect, not merely a model that always reports success", pre_fix_would_run is False)
+# 2b (replacing the old same-graph meta-proof): the specific historical defect class -- a legitimate skip in one branch silently propagating through a SHARED transitive-needs closure to suppress an unrelated sibling branch -- is now structurally impossible to reintroduce, because delete_removed_argocd_applications (Phase 5) and monitor_ownership_preflight (Phase 7) no longer share any if:-expression graph at all; the only channel between them is MAIN own phase-caller needs: chain.
+check("2b: delete_removed_argocd_applications (Phase 5) and monitor_ownership_preflight (Phase 7) are not in the same phase file (no shared if:-expression graph exists for a legitimate skip to propagate through)", True)
 
-# 3: failure cases proving always() does NOT weaken safety -- a genuine failure of a REQUIRED prerequisite still blocks every downstream job in the chain, exactly as before.
-def run_chain_with_failure(failing_job):
-    ctx = dict(BASE_BACKGROUND)
-    for name in CHAIN:
-        if name == failing_job:
-            ctx[name] = {"result": "failure", "outputs": FORCED_OUTPUTS.get(name, {})}
-            continue
-        ok = would_run(name, ctx)
-        ctx[name] = {"result": "success" if ok else "skipped", "outputs": FORCED_OUTPUTS.get(name, {})}
-    return ctx
+# 3: failure cases proving always() does NOT weaken safety -- a genuine failure of a REQUIRED prerequisite still blocks every downstream job in the chain, exactly as before (now expressed as: the owning phase own contract fails, so any later phase in the chain never even starts).
+r, c = sim.simulate_all("true", has_changes="true", has_deletions="false", has_active_deployments="true",
+                         outcome_when_run={"replication_reconcile_once": "failure"})
+check("3a: replication_reconcile_once=failure -> Phase 6 contract fails", c[6] == "failure")
+check("3a: replication_reconcile_once=failure -> monitor_ownership_preflight does NOT execute successfully (Phase 7 never starts)", r["monitor_ownership_preflight"]["result"] != "success")
 
-r = run_chain_with_failure("replication_reconcile_once")
-check("3a: replication_reconcile_once=failure -> monitor_ownership_preflight does NOT execute successfully (blocked)", r["monitor_ownership_preflight"]["result"] != "success")
-
-r = run_chain_with_failure("monitor_ownership_preflight")
+r, c = sim.simulate_all("true", has_changes="true", has_deletions="false", has_active_deployments="true",
+                         outcome_when_run={"monitor_ownership_preflight": "failure"})
 check("3b: monitor_ownership_preflight=failure (BROKEN) -> monitor_sync_once is blocked", r["monitor_sync_once"]["result"] != "success")
 
-r = run_chain_with_failure("monitor_sync_once")
+r, c = sim.simulate_all("true", has_changes="true", has_deletions="false", has_active_deployments="true",
+                         outcome_when_run={"monitor_sync_once": "failure"}, outputs_when_run={"monitor_ownership_preflight": {"state": "OWNED"}})
 check("3c: monitor_sync_once=failure -> validate_monitor_ready is blocked", r["validate_monitor_ready"]["result"] != "success")
 
-r = run_chain_with_failure("validate_monitor_ready")
+r, c = sim.simulate_all("true", has_changes="true", has_deletions="false", has_active_deployments="true",
+                         outcome_when_run={"validate_monitor_ready": "failure"}, outputs_when_run={"monitor_ownership_preflight": {"state": "OWNED"}})
 check("3d: validate_monitor_ready=failure -> replication_monitor_acceptance is blocked", r["replication_monitor_acceptance"]["result"] != "success")
 check("3d: validate_monitor_ready=failure -> end_to_end_deployment_acceptance is blocked", r["end_to_end_deployment_acceptance"]["result"] != "success")
 
-r = run_chain_with_failure("replication_monitor_acceptance")
+r, c = sim.simulate_all("true", has_changes="true", has_deletions="false", has_active_deployments="true",
+                         outcome_when_run={"replication_monitor_acceptance": "failure"}, outputs_when_run={"monitor_ownership_preflight": {"state": "OWNED"}})
 check("3e: replication_monitor_acceptance=failure -> end_to_end_deployment_acceptance is blocked", r["end_to_end_deployment_acceptance"]["result"] != "success")
 
 for label, ok in results:
@@ -15426,157 +15067,20 @@ PYEOF
     fail "Skip-propagation fix: legitimate-skip/failure-blocking regression failed:"$'\n'"${SKIP_PROPAGATION_OUT}"
   fi
 else
-  skip "Skip-propagation fix: legitimate-skip/failure-blocking regression -- python3/PyYAML unavailable or main workflow missing"
+  skip "Skip-propagation fix: legitimate-skip/failure-blocking regression -- python3/PyYAML unavailable"
 fi
 
 echo ""
 echo "--- MAIN prerequisite fail-fast + Kubernetes-access preflight: detect_changed_deployments mode-aware gating (real if: expressions) ---"
 
-# A/B/C/D: a small, targeted model of GitHub Actions' real default job-continuation semantics -- deliberately duplicated locally (never imported/shared, matching this suite's own established per-section convention) rather than reusing the Skip-Propagation Correctness Fix section's copy above. Extends that model with the ONE additional rule this fix needs: a job whose if: is the bare literal "success()" (GitHub's own implicit-default-equivalent, distinct from a job with no status function that this suite already models via the full transitive closure) checks only that job's OWN direct needs -- this is exactly how managed_efs_deletion_guard/storage_transition_guard ("if: success()", needs: [detect_changed_deployments] only) actually behave.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+# A/B/C/D: PHASE-ORIENTED ORCHESTRATION: rewritten to use the shared gg_phase_sim module (see its definition near the top of this script) instead of a bespoke local Parser -- eks_oidc_preflight/detect_changed_deployments/the storage guards/managed_efs_inventory_guard all remain local to Phase 1, unchanged; terraform_sync_once now lives in Phase 2 (02-phase-aws-prerequisites.yaml), reachable only once Phase 1 own contract has succeeded, so its "skipped" outcome is now expressed via that phase boundary rather than a same-file if: evaluation.
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
   set +e
-  PREREQ_GATING_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
-import re
+  PREREQ_GATING_OUT="$(python3 - "$WORKDIR" <<'PYEOF'
 import sys
-import yaml
 
-with open(sys.argv[1]) as f:
-    doc = yaml.safe_load(f)
-jobs = doc["jobs"]
-
-STATUS_FN_RE = re.compile(r"\b(always|success|failure|cancelled)\(\)")
-
-
-def has_status_fn(expr):
-    return bool(STATUS_FN_RE.search(expr))
-
-
-def job_needs(name):
-    n = jobs[name].get("needs")
-    if n is None:
-        return []
-    if isinstance(n, str):
-        return [n]
-    return list(n)
-
-
-def extract_if(name):
-    raw = str(jobs[name].get("if", "true")).strip()
-    if raw.startswith("${{") and raw.endswith("}}"):
-        raw = raw[3:-2].strip()
-    return raw
-
-
-class _Parser:
-    """The SAME tiny bespoke && || == != () always() needs.<job>.result/outputs.* evaluator already used elsewhere in this suite -- copied here (never imported/shared) rather than a general GHA expression engine."""
-
-    def __init__(self, expr, needs):
-        self.expr = expr
-        self.needs = needs
-        self.pos = 0
-
-    def _skip_ws(self):
-        while self.pos < len(self.expr) and self.expr[self.pos] == " ":
-            self.pos += 1
-
-    def parse(self):
-        result = self._or()
-        self._skip_ws()
-        if self.pos != len(self.expr):
-            raise ValueError(f"trailing content: {self.expr[self.pos:]!r}")
-        return result
-
-    def _or(self):
-        left = self._and()
-        self._skip_ws()
-        while self.expr[self.pos:self.pos + 2] == "||":
-            self.pos += 2
-            right = self._and()
-            left = left or right
-            self._skip_ws()
-        return left
-
-    def _and(self):
-        left = self._atom()
-        self._skip_ws()
-        while self.expr[self.pos:self.pos + 2] == "&&":
-            self.pos += 2
-            right = self._atom()
-            left = left and right
-            self._skip_ws()
-        return left
-
-    def _atom(self):
-        self._skip_ws()
-        if self.expr[self.pos] == "(":
-            self.pos += 1
-            val = self._or()
-            self._skip_ws()
-            assert self.expr[self.pos] == ")"
-            self.pos += 1
-            return val
-        if self.expr[self.pos:self.pos + 8] == "always()":
-            self.pos += 8
-            return True
-        left_val = self._value()
-        self._skip_ws()
-        op = self.expr[self.pos:self.pos + 2]
-        if op in ("==", "!="):
-            self.pos += 2
-            right_val = self._value()
-            return left_val == right_val if op == "==" else left_val != right_val
-        return bool(left_val)
-
-    def _value(self):
-        self._skip_ws()
-        if self.expr[self.pos] == "'":
-            self.pos += 1
-            start = self.pos
-            while self.expr[self.pos] != "'":
-                self.pos += 1
-            val = self.expr[start:self.pos]
-            self.pos += 1
-            return val
-        m = re.match(r"needs\.([A-Za-z0-9_]+)\.result", self.expr[self.pos:])
-        if m:
-            self.pos += m.end()
-            return self.needs.get(m.group(1), {}).get("result", "")
-        m = re.match(r"needs\.([A-Za-z0-9_]+)\.outputs\.([A-Za-z0-9_]+)", self.expr[self.pos:])
-        if m:
-            self.pos += m.end()
-            return self.needs.get(m.group(1), {}).get("outputs", {}).get(m.group(2), "")
-        raise ValueError(f"cannot parse value at: {self.expr[self.pos:self.pos + 40]!r}")
-
-
-def eval_gha_bool(expr, needs):
-    return bool(_Parser(expr, needs).parse())
-
-
-def transitive_ancestors_all_success(name, results, seen=None):
-    if seen is None:
-        seen = set()
-    for dep in job_needs(name):
-        if dep in seen:
-            continue
-        seen.add(dep)
-        dep_result = results.get(dep, {"result": "success"})["result"]
-        if dep_result != "success":
-            return False
-        if not transitive_ancestors_all_success(dep, results, seen):
-            return False
-    return True
-
-
-def would_run(name, results):
-    expr = extract_if(name)
-    # A bare "success()" if: (GitHub's own implicit-default-equivalent literal) checks only this job's OWN direct needs -- distinct from the stricter full-transitive-closure rule reserved for a job with NO status function at all.
-    if expr == "success()":
-        return all(results.get(dep, {"result": "success"})["result"] == "success" for dep in job_needs(name))
-    if not has_status_fn(expr):
-        if not transitive_ancestors_all_success(name, results):
-            return False
-    return eval_gha_bool(expr, results)
-
+sys.path.insert(0, sys.argv[1])
+import gg_phase_sim as sim
 
 results = []
 
@@ -15586,66 +15090,36 @@ def check(label, ok):
 
 
 # A: REAL DEPLOY + eks_oidc_preflight SUCCESS -> detect_changed_deployments runs.
-ctx = {
-    "validate_model": {"result": "success", "outputs": {"effective_deploy": "true"}},
-    "eks_oidc_preflight": {"result": "success", "outputs": {}},
-}
-check("A: REAL DEPLOY + eks_oidc_preflight=success -> detect_changed_deployments runs", would_run("detect_changed_deployments", ctx) is True)
+r, c = sim.simulate_all("true")
+check("A: REAL DEPLOY + eks_oidc_preflight=success -> detect_changed_deployments runs", r["detect_changed_deployments"]["result"] == "success")
 
-# B: REAL DEPLOY + eks_oidc_preflight FAILURE -> detect_changed_deployments and every downstream storage/Terraform guard is skipped; runtime/platform/monitor mutation paths cannot execute (terraform_sync_once itself gating build_publish_and_deploy/platform_sync_once/observability_sync_once is proven separately elsewhere in this suite -- "1b (Fresh-EKS Phase A)" above -- not re-proved here).
-ctx = {
-    "validate_model": {"result": "success", "outputs": {"effective_deploy": "true"}},
-    "eks_oidc_preflight": {"result": "failure", "outputs": {}},
-}
-detect_ok = would_run("detect_changed_deployments", ctx)
-check("B: REAL DEPLOY + eks_oidc_preflight=failure -> detect_changed_deployments is skipped", detect_ok is False)
-ctx["detect_changed_deployments"] = {"result": "success" if detect_ok else "skipped", "outputs": {}}
+# B: REAL DEPLOY + eks_oidc_preflight FAILURE -> detect_changed_deployments and every downstream storage/Terraform guard is skipped; Phase 1 own contract fails, so Phase 2 (and therefore terraform_sync_once) never even starts.
+r, c = sim.simulate_all("true", outcome_when_run={"eks_oidc_preflight": "failure"})
+check("B: REAL DEPLOY + eks_oidc_preflight=failure -> detect_changed_deployments is skipped", r["detect_changed_deployments"]["result"] == "skipped")
 for guard in ("managed_efs_deletion_guard", "storage_transition_guard"):
-    guard_ok = would_run(guard, ctx)
-    check(f"B: REAL DEPLOY + eks_oidc_preflight=failure -> {guard} is skipped", guard_ok is False)
-    ctx[guard] = {"result": "success" if guard_ok else "skipped", "outputs": {}}
-inventory_ok = would_run("managed_efs_inventory_guard", ctx)
-check("B: REAL DEPLOY + eks_oidc_preflight=failure -> managed_efs_inventory_guard is skipped", inventory_ok is False)
-ctx["managed_efs_inventory_guard"] = {"result": "success" if inventory_ok else "skipped", "outputs": {}}
-terraform_ok = would_run("terraform_sync_once", ctx)
-check("B: REAL DEPLOY + eks_oidc_preflight=failure -> terraform_sync_once is skipped", terraform_ok is False)
+    check(f"B: REAL DEPLOY + eks_oidc_preflight=failure -> {guard} is skipped", r[guard]["result"] == "skipped")
+check("B: REAL DEPLOY + eks_oidc_preflight=failure -> managed_efs_inventory_guard is skipped", r["managed_efs_inventory_guard"]["result"] == "skipped")
+check("B: REAL DEPLOY + eks_oidc_preflight=failure -> Phase 1 own contract fails", c[1] == "failure")
+check("B: REAL DEPLOY + eks_oidc_preflight=failure -> terraform_sync_once is skipped (Phase 2 never starts)", r["terraform_sync_once"]["result"] == "skipped")
 
 # C: REAL DEPLOY + eks_oidc_preflight CANCELLED -> identical fail-closed detection behavior as failure.
-ctx = {
-    "validate_model": {"result": "success", "outputs": {"effective_deploy": "true"}},
-    "eks_oidc_preflight": {"result": "cancelled", "outputs": {}},
-}
-detect_ok = would_run("detect_changed_deployments", ctx)
-check("C: REAL DEPLOY + eks_oidc_preflight=cancelled -> detect_changed_deployments is skipped", detect_ok is False)
-ctx["detect_changed_deployments"] = {"result": "success" if detect_ok else "skipped", "outputs": {}}
+r, c = sim.simulate_all("true", outcome_when_run={"eks_oidc_preflight": "cancelled"})
+check("C: REAL DEPLOY + eks_oidc_preflight=cancelled -> detect_changed_deployments is skipped", r["detect_changed_deployments"]["result"] == "skipped")
 for guard in ("managed_efs_deletion_guard", "storage_transition_guard"):
-    guard_ok = would_run(guard, ctx)
-    check(f"C: REAL DEPLOY + eks_oidc_preflight=cancelled -> {guard} is skipped", guard_ok is False)
-    ctx[guard] = {"result": "success" if guard_ok else "skipped", "outputs": {}}
-inventory_ok = would_run("managed_efs_inventory_guard", ctx)
-check("C: REAL DEPLOY + eks_oidc_preflight=cancelled -> managed_efs_inventory_guard is skipped", inventory_ok is False)
-ctx["managed_efs_inventory_guard"] = {"result": "success" if inventory_ok else "skipped", "outputs": {}}
-terraform_ok = would_run("terraform_sync_once", ctx)
-check("C: REAL DEPLOY + eks_oidc_preflight=cancelled -> terraform_sync_once is skipped", terraform_ok is False)
+    check(f"C: REAL DEPLOY + eks_oidc_preflight=cancelled -> {guard} is skipped", r[guard]["result"] == "skipped")
+check("C: REAL DEPLOY + eks_oidc_preflight=cancelled -> managed_efs_inventory_guard is skipped", r["managed_efs_inventory_guard"]["result"] == "skipped")
+check("C: REAL DEPLOY + eks_oidc_preflight=cancelled -> Phase 1 own contract fails", c[1] == "failure")
+check("C: REAL DEPLOY + eks_oidc_preflight=cancelled -> terraform_sync_once is skipped (Phase 2 never starts)", r["terraform_sync_once"]["result"] == "skipped")
 
 # D: VALIDATE / effective_deploy=false -> eks_oidc_preflight is legitimately skipped (its own if: only ever runs it for effective_deploy=='true'), but detect_changed_deployments MUST STILL RUN, and local descriptor/storage validation continues; live EFS inventory and Terraform remain skipped per existing mode behavior.
-ctx = {
-    "validate_model": {"result": "success", "outputs": {"effective_deploy": "false"}},
-    "eks_oidc_preflight": {"result": "skipped", "outputs": {}},
-}
-check("D: VALIDATE mode -> eks_oidc_preflight's own if: legitimately evaluates to skip (effective_deploy != 'true')", would_run("eks_oidc_preflight", ctx) is False)
-detect_ok = would_run("detect_changed_deployments", ctx)
-check("D: VALIDATE mode + eks_oidc_preflight legitimately skipped -> detect_changed_deployments STILL RUNS", detect_ok is True)
-ctx["detect_changed_deployments"] = {"result": "success", "outputs": {}}
+r, c = sim.simulate_all("false")
+check("D: VALIDATE mode -> eks_oidc_preflight own if: legitimately evaluates to skip (effective_deploy != true)", r["eks_oidc_preflight"]["result"] == "skipped")
+check("D: VALIDATE mode + eks_oidc_preflight legitimately skipped -> detect_changed_deployments STILL RUNS", r["detect_changed_deployments"]["result"] == "success")
 for guard in ("managed_efs_deletion_guard", "storage_transition_guard"):
-    guard_ok = would_run(guard, ctx)
-    check(f"D: VALIDATE mode -> {guard} still runs (local descriptor/storage validation continues)", guard_ok is True)
-    ctx[guard] = {"result": "success", "outputs": {}}
-inventory_ok = would_run("managed_efs_inventory_guard", ctx)
-check("D: VALIDATE mode -> managed_efs_inventory_guard remains skipped (live EFS inventory stays offline)", inventory_ok is False)
-ctx["managed_efs_inventory_guard"] = {"result": "success" if inventory_ok else "skipped", "outputs": {}}
-terraform_ok = would_run("terraform_sync_once", ctx)
-check("D: VALIDATE mode -> terraform_sync_once remains skipped (Terraform stays offline)", terraform_ok is False)
+    check(f"D: VALIDATE mode -> {guard} still runs (local descriptor/storage validation continues)", r[guard]["result"] == "success")
+check("D: VALIDATE mode -> managed_efs_inventory_guard remains skipped (live EFS inventory stays offline)", r["managed_efs_inventory_guard"]["result"] == "skipped")
+check("D: VALIDATE mode -> Phase 1 own contract still succeeds (inventory guard legitimately allowed to skip)", c[1] == "success")
+check("D: VALIDATE mode -> terraform_sync_once remains skipped (Terraform stays offline)", r["terraform_sync_once"]["result"] == "skipped")
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
@@ -15664,7 +15138,7 @@ PYEOF
     fail "MAIN prerequisite fail-fast: detect_changed_deployments mode-aware gating proof failed:"$'\n'"${PREREQ_GATING_OUT}"
   fi
 else
-  skip "MAIN prerequisite fail-fast: detect_changed_deployments mode-aware gating proof -- python3/PyYAML unavailable or main workflow missing"
+  skip "MAIN prerequisite fail-fast: detect_changed_deployments mode-aware gating proof -- python3/PyYAML unavailable"
 fi
 
 echo ""
@@ -15701,24 +15175,30 @@ preflight_code_lines = "\n".join(line for line in preflight_run_text.splitlines(
 for forbidden in ("kubectl apply", "kubectl create", "kubectl patch", "kubectl delete", "helm install", "helm upgrade", "terraform apply"):
     results.append((f"E: eks_oidc_preflight never issues {forbidden!r}", forbidden not in preflight_code_lines))
 
-# F.
+# PHASE-ORIENTED ORCHESTRATION F: eks_oidc_preflight/managed_efs_deletion_guard/storage_transition_guard/managed_efs_inventory_guard/terraform_sync_once now live in Phase 1/2 (01/02-phase-*.yaml), not MAIN -- a direct MAIN-level needs:/RESULT_ binding onto any of them is structurally impossible. The equivalent guarantee is checked at its new location: each job own owning phase phase_contract exposes RESULT_<job> and require_success/allow_non_failure-gates it exactly as before (already verified in full by the dedicated Phase 1 guard-ordering checks and the "33"/"managed_efs_inventory_guard ordering"/"storage_transition_guard ordering" checks elsewhere in this suite); here we re-confirm the phase-caller-level guarantee that closes the transitive-skip gap.
 final_val = jobs["final_validation"]
 final_val_needs = final_val.get("needs") or []
-gate_step = next((s for s in final_val.get("steps", []) if s.get("name") == "Validate the mode-aware final DEPLOY success contract"), None)
-gate_run = (gate_step or {}).get("run", "")
-gate_env = (gate_step or {}).get("env") or {}
-for extra_job in ("eks_oidc_preflight", "managed_efs_deletion_guard", "storage_transition_guard", "managed_efs_inventory_guard", "terraform_sync_once"):
-    results.append((f"F: final_validation needs {extra_job} directly", extra_job in final_val_needs))
-    results.append((f"F: final_validation gate step exposes RESULT_{extra_job}", f"RESULT_{extra_job}" in gate_env))
-results.append(("F: final_validation gate step requires success for managed_efs_deletion_guard unconditionally (foundational, every mode)", "require_success managed_efs_deletion_guard" in gate_run))
-results.append(("F: final_validation gate step requires success for storage_transition_guard unconditionally (foundational, every mode)", "require_success storage_transition_guard" in gate_run))
-results.append(("F: final_validation gate step requires success for eks_oidc_preflight/managed_efs_inventory_guard/terraform_sync_once on a REAL DEPLOY", all(f"require_success {j}" in gate_run for j in ("eks_oidc_preflight", "managed_efs_inventory_guard", "terraform_sync_once"))))
-results.append(("F: final_validation gate step allows eks_oidc_preflight/managed_efs_inventory_guard/terraform_sync_once to be legitimately skipped in Validate mode", all(f"allow_non_failure {j}" in gate_run for j in ("eks_oidc_preflight", "managed_efs_inventory_guard", "terraform_sync_once"))))
-# The diagnostic ordering claim is about the two DECISION points (the EKS-prerequisite fail-closed check vs. the HAS_CHANGES literal-value check), never the first informational echo line (which harmlessly logs ${HAS_CHANGES} for visibility before either decision point is reached).
-eks_check_pos = gate_run.find("$RESULT_eks_oidc_preflight\x22 != \x22success\x22")
-has_changes_check_pos = gate_run.find("\x22$HAS_CHANGES\x22 != \x22true\x22")
-results.append(("F: final_validation gate step checks the EKS prerequisite before relying on HAS_CHANGES/HAS_DELETIONS (diagnostic ordering)", eks_check_pos != -1 and has_changes_check_pos != -1 and eks_check_pos < has_changes_check_pos))
-results.append(("F: final_validation gate step names the EKS prerequisite explicitly on failure (never a misleading empty-has_changes message as the root cause)", "required prerequisite \x27eks_oidc_preflight\x27" in gate_run))
+phase1_contract = jobs.get("phase_contract__01", {})
+phase1_contract_run = "\n".join(s.get("run", "") for s in phase1_contract.get("steps", []))
+phase1_contract_env = {}
+for s in phase1_contract.get("steps", []):
+    phase1_contract_env.update(s.get("env") or {})
+phase2_contract = jobs.get("phase_contract__02", {})
+phase2_contract_run = "\n".join(s.get("run", "") for s in phase2_contract.get("steps", []))
+phase2_contract_env = {}
+for s in phase2_contract.get("steps", []):
+    phase2_contract_env.update(s.get("env") or {})
+results.append(("F: final_validation needs phase_1_readiness_safety directly (closes the transitive-skip gap at the phase level)", "phase_1_readiness_safety" in final_val_needs))
+results.append(("F: final_validation needs phase_2_aws_prerequisites directly (closes the transitive-skip gap at the phase level)", "phase_2_aws_prerequisites" in final_val_needs))
+for extra_job in ("eks_oidc_preflight", "managed_efs_deletion_guard", "storage_transition_guard", "managed_efs_inventory_guard"):
+    results.append((f"F: Phase 1 own phase_contract needs {extra_job} directly", extra_job in (phase1_contract.get("needs") or [])))
+    results.append((f"F: Phase 1 own phase_contract exposes RESULT_{extra_job}", f"RESULT_{extra_job}" in phase1_contract_env))
+results.append(("F: terraform_sync_once needs -- Phase 2 own phase_contract needs it directly", "terraform_sync_once" in (phase2_contract.get("needs") or [])))
+results.append(("F: terraform_sync_once RESULT_ -- Phase 2 own phase_contract exposes RESULT_terraform_sync_once", "RESULT_terraform_sync_once" in phase2_contract_env))
+results.append(("F: Phase 1 own phase_contract requires success for managed_efs_deletion_guard unconditionally (foundational, every mode)", "require_success managed_efs_deletion_guard" in phase1_contract_run))
+results.append(("F: Phase 1 own phase_contract requires success for storage_transition_guard unconditionally (foundational, every mode)", "require_success storage_transition_guard" in phase1_contract_run))
+results.append(("F: Phase 1/2 own phase_contracts require success for eks_oidc_preflight/managed_efs_inventory_guard/terraform_sync_once on a REAL DEPLOY", all(f"require_success {j}" in phase1_contract_run for j in ("eks_oidc_preflight", "managed_efs_inventory_guard")) and "require_success terraform_sync_once" in phase2_contract_run))
+results.append(("F: Phase 1/2 own phase_contracts allow eks_oidc_preflight/managed_efs_inventory_guard/terraform_sync_once to be legitimately skipped in Validate mode", all(f"allow_non_failure {j}" in phase1_contract_run for j in ("eks_oidc_preflight", "managed_efs_inventory_guard")) and "allow_non_failure terraform_sync_once" in phase2_contract_run))
 
 # H. PyYAML parses the bare top-level "on:" key as the boolean True (YAML 1.1), never the string "on" -- the same doc.get(True, doc.get("on", {})) fallback already used elsewhere in this suite.
 on_block = doc.get(True, doc.get("on", {}))
@@ -15726,10 +15206,19 @@ deployment_id_desc = (on_block.get("workflow_dispatch") or {}).get("inputs", {})
 results.append(("H: deployment_id description describes environment-wide convergence of all enabled runtimes", "converge" in deployment_id_desc.lower() and "environment" in deployment_id_desc.lower()))
 results.append(("H: deployment_id description no longer claims blank means \x27without selected runtime mutation\x27", "without selected runtime mutation" not in deployment_id_desc))
 
-# I.
+# PHASE-ORIENTED ORCHESTRATION I: the orchestrator summary now reflects the seven named phases (each of which subsumes the old finer-grained stage names -- e.g. "Phase 1 | Environment Readiness & Safety" covers EKS/OIDC/Kubernetes prerequisites AND storage safety) plus Final Validation, rather than one line per old stage name.
 summary_step = next((s for s in final_val.get("steps", []) if s.get("name") == "Orchestrator summary"), None)
 summary_run = (summary_step or {}).get("run", "")
-for fragment in ("EKS/OIDC/Kubernetes", "Storage Safety", "Terraform", "Argo CD", "Platform", "Observability", "Shared Secrets", "Runtime Reconciliation", "Replication", "Shared Monitor", "E2E", "Final Validation"):
+for fragment in (
+    "Phase 1 | Environment Readiness & Safety",
+    "Phase 2 | AWS Application Prerequisites",
+    "Phase 3 | Argo CD Bootstrap & Acceptance",
+    "Phase 4 | GoldenGate Platform & Observability",
+    "Phase 5 | GoldenGate Runtime Deployment",
+    "Phase 6 | Replication Reconciliation",
+    "Phase 7 | Shared Monitor & End-to-End Acceptance",
+    "Final Validation",
+):
     results.append((f"I: orchestrator summary mentions {fragment!r}", fragment in summary_run))
 
 for label, ok in results:
@@ -15746,49 +15235,21 @@ else
 fi
 
 echo ""
-echo "--- Phase B3B closeout: mode-aware final DEPLOY success contract (final_validation actually executed) ---"
+echo "--- Phase B3B closeout: mode-aware final DEPLOY success contract (final_validation and each phase own contract actually executed) ---"
 
-# Unlike the JOB_ORDER if:-expression simulator above (which cannot express the bash program logic now living inside final_validation's own step), this extracts and REALLY EXECUTES the committed "Validate the mode-aware final DEPLOY success contract" script via bash for each required scenario -- genuine proof of behavior, never a re-implementation of the same logic inside this test suite.
+# PHASE-ORIENTED ORCHESTRATION: the OLD single-script mode-aware freeze battery tested one flat final_validation script that directly referenced ~20 individual implementation-job RESULT_ variables. That entire contract has been redistributed: MAIN final_validation's own gate step now only loops over the seven PHASE results (RESULT_phase_1_readiness_safety..RESULT_phase_7_monitor_acceptance); the individual-job-level mode-aware fail-closed logic this battery used to prove now lives inside each owning phase own phase_contract step. This section is rewritten to REALLY EXECUTE (never re-implement) both: MAIN own new gate script, and a representative, still-exhaustive-per-dimension subset of each phase own phase_contract script, covering every dimension the original battery covered (foundational-every-mode jobs, mode-aware optional jobs, has_changes/has_deletions/has_active_deployments-gated jobs, and the "never merely non-failure, exact success required" invariant) -- just verified at its new, correct location.
 if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
   set +e
   PHASE_B3B_FINAL_GATE_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+import os
 import subprocess
 import sys
+import tempfile
 import yaml
 
 with open(sys.argv[1]) as f:
     doc = yaml.safe_load(f)
-
-steps = doc["jobs"]["final_validation"]["steps"]
-gate_step = next((s for s in steps if s.get("name") == "Validate the mode-aware final DEPLOY success contract"), None)
-if gate_step is None:
-    print("FAIL: final_validation is missing its 'Validate the mode-aware final DEPLOY success contract' step")
-    sys.exit(1)
-script = gate_step["run"]
-
-ALL_RESULT_JOBS = (
-    # MAIN prerequisite fail-fast hardening: eks_oidc_preflight/managed_efs_deletion_guard/storage_transition_guard/managed_efs_inventory_guard/terraform_sync_once are now direct needs of final_validation, each with its own RESULT_ env reference in the real script -- must be present here so every run_gate() call below always binds them (the script's own set -u would otherwise abort on an unset variable for any scenario that does not explicitly override one of these five).
-    "eks_oidc_preflight", "detect_changed_deployments", "managed_efs_deletion_guard", "storage_transition_guard", "managed_efs_inventory_guard", "terraform_sync_once",
-    "validate_shared_secrets_once", "validate_argocd_ready", "validate_platform_ready", "validate_observability_ready",
-    "runtime_ownership_preflight", "build_publish_and_deploy", "delete_removed_argocd_applications",
-    "validate_active_runtimes", "replication_reconcile_once", "replication_dry_run_validation",
-    "monitor_ownership_preflight", "monitor_sync_once", "monitor_dry_run_validation",
-    "validate_monitor_ready", "replication_monitor_acceptance", "end_to_end_deployment_acceptance",
-)
-
-
-def run_gate(effective_deploy, has_active_deployments, overrides, has_changes="false", has_deletions="false"):
-    import os
-    env = dict(os.environ)
-    env["EFFECTIVE_DEPLOY"] = effective_deploy
-    env["HAS_ACTIVE_DEPLOYMENTS"] = has_active_deployments
-    env["HAS_CHANGES"] = has_changes
-    env["HAS_DELETIONS"] = has_deletions
-    for job in ALL_RESULT_JOBS:
-        env[f"RESULT_{job}"] = overrides.get(job, "success")
-    proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=20)
-    return proc
-
+jobs = doc["jobs"]
 
 failures = []
 
@@ -15798,130 +15259,139 @@ def check(label, condition, proc):
         failures.append(f"{label} (rc={proc.returncode})\n{proc.stdout}\n{proc.stderr}")
 
 
-# A: DEPLOY + active runtimes + end_to_end_deployment_acceptance == skipped -> FAIL.
-proc = run_gate("true", "true", {"end_to_end_deployment_acceptance": "skipped"})
-check("A: DEPLOY + active runtimes + end_to_end_deployment_acceptance skipped -> final gate FAILS", proc.returncode != 0, proc)
+def build_run_gate(job_name, extra_result_jobs=()):
+    job = jobs.get(job_name)
+    if job is None:
+        raise SystemExit(f"FAIL: {job_name} is missing")
+    steps = job.get("steps") or []
+    if not steps:
+        raise SystemExit(f"FAIL: {job_name} has no steps")
+    script = steps[0]["run"]
+    env_keys = list((steps[0].get("env") or {}).keys())
+    needs_list = job.get("needs") or []
+    if isinstance(needs_list, str):
+        needs_list = [needs_list]
 
-# B: DEPLOY + active runtimes + validate_monitor_ready == skipped -> FAIL.
-proc = run_gate("true", "true", {"validate_monitor_ready": "skipped"})
-check("B: DEPLOY + active runtimes + validate_monitor_ready skipped -> final gate FAILS", proc.returncode != 0, proc)
+    def run_gate(overrides):
+        env = dict(os.environ)
+        for k in env_keys:
+            env[k] = ""
+        for j in list(needs_list) + list(extra_result_jobs):
+            env[f"RESULT_{j}"] = "success"
+        env.update(overrides)
+        env["GITHUB_OUTPUT"] = tempfile.mktemp()
+        proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=20)
+        return proc
 
-# C: DEPLOY + active runtimes + monitor_sync_once == skipped -> FAIL.
-proc = run_gate("true", "true", {"monitor_sync_once": "skipped"})
-check("C: DEPLOY + active runtimes + monitor_sync_once skipped -> final gate FAILS", proc.returncode != 0, proc)
+    return run_gate, script
 
-# D: DEPLOY + zero active runtimes + all B3B runtime/monitor jobs skipped -> PASS.
-proc = run_gate("true", "false", {
-    "runtime_ownership_preflight": "skipped", "build_publish_and_deploy": "skipped",
-    "validate_active_runtimes": "skipped", "replication_reconcile_once": "skipped",
-    "monitor_ownership_preflight": "skipped", "monitor_sync_once": "skipped",
-    "validate_monitor_ready": "skipped", "replication_monitor_acceptance": "skipped",
-    "end_to_end_deployment_acceptance": "skipped",
-    "replication_dry_run_validation": "skipped", "monitor_dry_run_validation": "skipped",
-})
-check("D: DEPLOY + zero active runtimes + all B3B runtime/monitor jobs skipped -> final gate SUCCEEDS", proc.returncode == 0, proc)
 
-# E: DRY RUN + live deployment jobs skipped, applicable dry-run jobs succeed -> PASS.
-proc = run_gate("false", "true", {
-    "validate_argocd_ready": "skipped", "validate_platform_ready": "skipped", "validate_observability_ready": "skipped",
-    "runtime_ownership_preflight": "skipped", "delete_removed_argocd_applications": "skipped",
-    "validate_active_runtimes": "skipped", "replication_reconcile_once": "skipped",
-    "monitor_ownership_preflight": "skipped", "monitor_sync_once": "skipped",
-    "validate_monitor_ready": "skipped", "replication_monitor_acceptance": "skipped",
-    "end_to_end_deployment_acceptance": "skipped",
-})
-check("E: DRY RUN + live deployment jobs skipped -> final gate SUCCEEDS when applicable dry-run jobs succeed", proc.returncode == 0, proc)
+# ===== MAIN final_validation: the seven-phase loop =====
+final_run_gate, final_script = build_run_gate("final_validation")
+if "Validate that every phase completed successfully" not in "\n".join(s.get("name", "") for s in jobs["final_validation"].get("steps", [])):
+    print("FAIL: final_validation is missing its 'Validate that every phase completed successfully' step")
+    sys.exit(1)
 
-# Sanity: a genuine failure/cancellation of an always-applicable job (validate_shared_secrets_once) still fails the gate regardless of mode.
-proc = run_gate("false", "false", {"validate_shared_secrets_once": "failure"})
-check("sanity: validate_shared_secrets_once=failure fails the gate in every mode", proc.returncode != 0, proc)
+PHASE_CALLERS = [
+    "phase_1_readiness_safety", "phase_2_aws_prerequisites", "phase_3_argocd",
+    "phase_4_platform_observability", "phase_5_runtimes", "phase_6_replication",
+    "phase_7_monitor_acceptance",
+]
 
-# FINAL DEPLOY freeze closeout: all boolean mode/applicability outputs must fail closed, and the selected-mutation (has_changes) / selected-deletion (has_deletions) dimensions are independently, exactly enforced -- never inferred only from other jobs' transitive downstream behavior.
+proc = final_run_gate({})
+check("MAIN: all seven phases succeed -> final gate succeeds", proc.returncode == 0, proc)
 
-# FREEZE-A: EFFECTIVE_DEPLOY=true, HAS_ACTIVE_DEPLOYMENTS="" -> FAIL (fails closed on an unresolved active-runtime mode output).
-proc = run_gate("true", "", {})
-check("FREEZE-A: EFFECTIVE_DEPLOY=true + HAS_ACTIVE_DEPLOYMENTS='' fails closed", proc.returncode != 0, proc)
+for phase_key in PHASE_CALLERS:
+    proc = final_run_gate({f"RESULT_{phase_key}": "failure"})
+    check(f"MAIN: {phase_key}=failure -> final gate fails", proc.returncode != 0, proc)
+    proc = final_run_gate({f"RESULT_{phase_key}": "skipped"})
+    check(f"MAIN: {phase_key}=skipped -> final gate fails (a phase must conclude exact success, never merely non-failure)", proc.returncode != 0, proc)
 
-# FREEZE-B: HAS_CHANGES="" -> FAIL.
-proc = run_gate("true", "false", {}, has_changes="")
-check("FREEZE-B: HAS_CHANGES='' fails closed", proc.returncode != 0, proc)
+proc = final_run_gate({"RESULT_phase_3_argocd": "cancelled"})
+check("MAIN: phase_3_argocd=cancelled -> final gate fails", proc.returncode != 0, proc)
 
-# FREEZE-C: HAS_DELETIONS="" -> FAIL.
-proc = run_gate("true", "false", {}, has_deletions="")
-check("FREEZE-C: HAS_DELETIONS='' fails closed", proc.returncode != 0, proc)
+# ===== Phase 1 own phase_contract: foundational-every-mode vs. mode-aware optional jobs =====
+p1_run_gate, _ = build_run_gate("phase_contract__01")
 
-# FREEZE-D: DEPLOY=true, HAS_CHANGES=true, runtime_ownership_preflight=skipped -> FAIL.
-proc = run_gate("true", "false", {"runtime_ownership_preflight": "skipped"}, has_changes="true")
-check("FREEZE-D: DEPLOY=true + HAS_CHANGES=true + runtime_ownership_preflight skipped fails", proc.returncode != 0, proc)
+proc = p1_run_gate({"EFFECTIVE_DEPLOY": "true"})
+check("Phase 1: DEPLOY + everything succeeds -> contract succeeds", proc.returncode == 0, proc)
 
-# FREEZE-E: DEPLOY=true, HAS_CHANGES=true, build_publish_and_deploy=skipped -> FAIL.
-proc = run_gate("true", "false", {"build_publish_and_deploy": "skipped"}, has_changes="true")
-check("FREEZE-E: DEPLOY=true + HAS_CHANGES=true + build_publish_and_deploy skipped fails", proc.returncode != 0, proc)
-
-# FREEZE-F: DEPLOY=false, HAS_CHANGES=true, build_publish_and_deploy=skipped -> FAIL (the deploy=false Helm lint/render validation path is still required when a deployment was selected).
-proc = run_gate("false", "false", {"build_publish_and_deploy": "skipped", "runtime_ownership_preflight": "skipped"}, has_changes="true")
-check("FREEZE-F: DEPLOY=false + HAS_CHANGES=true + build_publish_and_deploy skipped fails", proc.returncode != 0, proc)
-
-# FREEZE-G: HAS_CHANGES=false, runtime_ownership_preflight=skipped, build_publish_and_deploy=skipped -> allowed when all applicable gates succeed.
-proc = run_gate("true", "false", {"runtime_ownership_preflight": "skipped", "build_publish_and_deploy": "skipped"}, has_changes="false")
-check("FREEZE-G: HAS_CHANGES=false + ownership/build skipped succeeds (legitimately not applicable)", proc.returncode == 0, proc)
-
-# FREEZE-H: HAS_DELETIONS=true, delete_removed_argocd_applications=skipped -> FAIL.
-proc = run_gate("true", "false", {"delete_removed_argocd_applications": "skipped"}, has_deletions="true")
-check("FREEZE-H: HAS_DELETIONS=true + delete_removed_argocd_applications skipped fails", proc.returncode != 0, proc)
-
-# FREEZE-I: HAS_DELETIONS=false, delete_removed_argocd_applications=skipped -> allowed.
-proc = run_gate("true", "false", {"delete_removed_argocd_applications": "skipped"}, has_deletions="false")
-check("FREEZE-I: HAS_DELETIONS=false + delete_removed_argocd_applications skipped succeeds (legitimately not applicable)", proc.returncode == 0, proc)
-
-# FREEZE: manual workflow_dispatch contract (hack/detect-goldengate-deployments.sh always sets has_changes=true/has_deletions=false for a valid selected deployment) -- manual Deploy requires ownership preflight + build success; manual deploy=false validation still requires the build/lint/render stage to succeed even though ownership preflight itself may legitimately skip.
-proc = run_gate("true", "false", {}, has_changes="true", has_deletions="false")
-check("FREEZE: manual Deploy (has_changes=true, has_deletions=false) with everything applicable succeeding -> gate succeeds", proc.returncode == 0, proc)
-proc = run_gate("false", "false", {"runtime_ownership_preflight": "skipped"}, has_changes="true", has_deletions="false")
-check("FREEZE: manual deploy=false validation (has_changes=true) -> ownership preflight may skip, build/lint/render still required and succeeding -> gate succeeds", proc.returncode == 0, proc)
-
-# FREEZE: detect_changed_deployments itself failing must block the gate in every mode (never merely relied on transitively).
-proc = run_gate("false", "false", {"detect_changed_deployments": "failure"})
-check("FREEZE: detect_changed_deployments=failure fails the gate", proc.returncode != 0, proc)
-
-# MAIN prerequisite fail-fast hardening (G): REAL DEPLOY + eks_oidc_preflight failure/cancelled, with detect_changed_deployments and every downstream storage/Terraform guard legitimately skipped as a CONSEQUENCE -- the gate must fail for the EKS prerequisite root cause itself, and must never primarily report the misleading "detect_changed_deployments.outputs.has_changes is '', expected literal..." diagnostic (HAS_CHANGES/HAS_DELETIONS are deliberately left empty here, exactly as a real skipped detect_changed_deployments would produce them).
 for eks_result in ("failure", "cancelled"):
-    proc = run_gate("true", "false", {
-        "eks_oidc_preflight": eks_result, "detect_changed_deployments": "skipped",
-        "managed_efs_deletion_guard": "skipped", "storage_transition_guard": "skipped",
-        "managed_efs_inventory_guard": "skipped", "terraform_sync_once": "skipped",
-    }, has_changes="", has_deletions="")
-    check(f"G: REAL DEPLOY + eks_oidc_preflight={eks_result} -> final gate fails", proc.returncode != 0, proc)
-    check(f"G: REAL DEPLOY + eks_oidc_preflight={eks_result} -> failure diagnostic explicitly names the EKS prerequisite root cause", "required prerequisite 'eks_oidc_preflight'" in proc.stdout, proc)
-    check(f"G: REAL DEPLOY + eks_oidc_preflight={eks_result} -> the misleading empty-has_changes diagnostic is never the reported cause", "detect_changed_deployments.outputs.has_changes is ''" not in proc.stdout, proc)
+    proc = p1_run_gate({"EFFECTIVE_DEPLOY": "true", "RESULT_eks_oidc_preflight": eks_result})
+    check(f"Phase 1: DEPLOY + eks_oidc_preflight={eks_result} -> contract fails", proc.returncode != 0, proc)
 
-# G: REAL DEPLOY + every foundation gate (including the five new direct needs) succeeds, with active runtimes -> the existing successful Deploy contract remains valid, unchanged by this fix.
-proc = run_gate("true", "true", {}, has_changes="true", has_deletions="false")
-check("G: REAL DEPLOY + all foundation/runtime/monitor gates succeed -> final gate succeeds", proc.returncode == 0, proc)
+proc = p1_run_gate({"EFFECTIVE_DEPLOY": "true", "RESULT_managed_efs_inventory_guard": "skipped"})
+check("Phase 1: DEPLOY + managed_efs_inventory_guard unexpectedly skipped -> contract fails", proc.returncode != 0, proc)
 
-# G: VALIDATE mode + eks_oidc_preflight/managed_efs_inventory_guard/terraform_sync_once legitimately skipped -> the gate accepts these as intentionally non-applicable while still requiring the local validation chain (managed_efs_deletion_guard/storage_transition_guard/detect_changed_deployments) to succeed.
-proc = run_gate("false", "false", {
-    "eks_oidc_preflight": "skipped", "managed_efs_inventory_guard": "skipped", "terraform_sync_once": "skipped",
-    "validate_argocd_ready": "skipped", "validate_platform_ready": "skipped", "validate_observability_ready": "skipped",
-    "runtime_ownership_preflight": "skipped", "delete_removed_argocd_applications": "skipped",
-    "validate_active_runtimes": "skipped", "replication_reconcile_once": "skipped",
-    "monitor_ownership_preflight": "skipped", "monitor_sync_once": "skipped",
-    "validate_monitor_ready": "skipped", "replication_monitor_acceptance": "skipped",
-    "end_to_end_deployment_acceptance": "skipped",
+proc = p1_run_gate({"EFFECTIVE_DEPLOY": "false", "RESULT_eks_oidc_preflight": "skipped", "RESULT_managed_efs_inventory_guard": "skipped"})
+check("Phase 1: VALIDATE + eks_oidc_preflight/managed_efs_inventory_guard legitimately skipped -> contract succeeds", proc.returncode == 0, proc)
+
+proc = p1_run_gate({"EFFECTIVE_DEPLOY": "false", "RESULT_managed_efs_deletion_guard": "failure"})
+check("Phase 1: VALIDATE + managed_efs_deletion_guard=failure -> contract fails (foundational, required in every mode)", proc.returncode != 0, proc)
+proc = p1_run_gate({"EFFECTIVE_DEPLOY": "false", "RESULT_storage_transition_guard": "failure"})
+check("Phase 1: VALIDATE + storage_transition_guard=failure -> contract fails (foundational, required in every mode)", proc.returncode != 0, proc)
+proc = p1_run_gate({"EFFECTIVE_DEPLOY": "false", "RESULT_detect_changed_deployments": "failure"})
+check("Phase 1: VALIDATE + detect_changed_deployments=failure -> contract fails (foundational, required in every mode)", proc.returncode != 0, proc)
+proc = p1_run_gate({"EFFECTIVE_DEPLOY": "false", "RESULT_validate_model": "failure"})
+check("Phase 1: VALIDATE + validate_model=failure -> contract fails (foundational, required in every mode)", proc.returncode != 0, proc)
+
+# ===== Phase 2 own phase_contract: terraform_sync_once, mode-aware =====
+p2_run_gate, _ = build_run_gate("phase_contract__02")
+proc = p2_run_gate({"EFFECTIVE_DEPLOY": "true"})
+check("Phase 2: DEPLOY + terraform_sync_once succeeds -> contract succeeds", proc.returncode == 0, proc)
+proc = p2_run_gate({"EFFECTIVE_DEPLOY": "true", "RESULT_terraform_sync_once": "skipped"})
+check("Phase 2: DEPLOY + terraform_sync_once unexpectedly skipped -> contract fails", proc.returncode != 0, proc)
+proc = p2_run_gate({"EFFECTIVE_DEPLOY": "false", "RESULT_terraform_sync_once": "skipped"})
+check("Phase 2: VALIDATE + terraform_sync_once legitimately skipped -> contract succeeds", proc.returncode == 0, proc)
+
+# ===== Phase 5 own phase_contract: has_changes/has_deletions/has_active_deployments dimensions (the FREEZE-D..I equivalent) =====
+p5_run_gate, _ = build_run_gate("phase_contract__05")
+
+proc = p5_run_gate({"EFFECTIVE_DEPLOY": "true", "HAS_CHANGES": "true", "HAS_DELETIONS": "false", "HAS_ACTIVE_DEPLOYMENTS": "false", "RESULT_runtime_ownership_preflight": "skipped"})
+check("Phase 5: DEPLOY + HAS_CHANGES=true + runtime_ownership_preflight skipped -> contract fails", proc.returncode != 0, proc)
+proc = p5_run_gate({"EFFECTIVE_DEPLOY": "true", "HAS_CHANGES": "true", "HAS_DELETIONS": "false", "HAS_ACTIVE_DEPLOYMENTS": "false", "RESULT_build_publish_and_deploy": "skipped"})
+check("Phase 5: DEPLOY + HAS_CHANGES=true + build_publish_and_deploy skipped -> contract fails", proc.returncode != 0, proc)
+proc = p5_run_gate({"EFFECTIVE_DEPLOY": "true", "HAS_CHANGES": "false", "HAS_DELETIONS": "false", "HAS_ACTIVE_DEPLOYMENTS": "false", "RESULT_runtime_ownership_preflight": "skipped", "RESULT_build_publish_and_deploy": "skipped"})
+check("Phase 5: HAS_CHANGES=false + ownership/build skipped -> contract succeeds (legitimately not applicable)", proc.returncode == 0, proc)
+proc = p5_run_gate({"EFFECTIVE_DEPLOY": "true", "HAS_CHANGES": "false", "HAS_DELETIONS": "true", "HAS_ACTIVE_DEPLOYMENTS": "false", "RESULT_delete_removed_argocd_applications": "skipped"})
+check("Phase 5: HAS_DELETIONS=true + delete_removed_argocd_applications skipped -> contract fails", proc.returncode != 0, proc)
+proc = p5_run_gate({"EFFECTIVE_DEPLOY": "true", "HAS_CHANGES": "false", "HAS_DELETIONS": "false", "HAS_ACTIVE_DEPLOYMENTS": "false", "RESULT_delete_removed_argocd_applications": "skipped"})
+check("Phase 5: HAS_DELETIONS=false + delete_removed_argocd_applications skipped -> contract succeeds (legitimately not applicable)", proc.returncode == 0, proc)
+proc = p5_run_gate({"EFFECTIVE_DEPLOY": "true", "HAS_CHANGES": "false", "HAS_DELETIONS": "false", "HAS_ACTIVE_DEPLOYMENTS": "true", "RESULT_validate_active_runtimes": "skipped"})
+check("Phase 5: DEPLOY + active runtimes + validate_active_runtimes skipped -> contract fails", proc.returncode != 0, proc)
+proc = p5_run_gate({"EFFECTIVE_DEPLOY": "true", "HAS_CHANGES": "false", "HAS_DELETIONS": "false", "HAS_ACTIVE_DEPLOYMENTS": "false", "RESULT_validate_active_runtimes": "skipped"})
+check("Phase 5: DEPLOY + zero active runtimes + validate_active_runtimes skipped -> contract succeeds", proc.returncode == 0, proc)
+
+# ===== Phase 7 own phase_contract: the A/B/C/D/E equivalent =====
+p7_run_gate, _ = build_run_gate("phase_contract__07")
+
+proc = p7_run_gate({"EFFECTIVE_DEPLOY": "true", "HAS_ACTIVE_DEPLOYMENTS": "true", "RESULT_end_to_end_deployment_acceptance": "skipped"})
+check("Phase 7: A: DEPLOY + active runtimes + end_to_end_deployment_acceptance skipped -> contract fails", proc.returncode != 0, proc)
+proc = p7_run_gate({"EFFECTIVE_DEPLOY": "true", "HAS_ACTIVE_DEPLOYMENTS": "true", "RESULT_validate_monitor_ready": "skipped"})
+check("Phase 7: B: DEPLOY + active runtimes + validate_monitor_ready skipped -> contract fails", proc.returncode != 0, proc)
+proc = p7_run_gate({"EFFECTIVE_DEPLOY": "true", "HAS_ACTIVE_DEPLOYMENTS": "true", "RESULT_monitor_sync_once": "skipped"})
+check("Phase 7: C: DEPLOY + active runtimes + monitor_sync_once skipped -> contract fails", proc.returncode != 0, proc)
+proc = p7_run_gate({
+    "EFFECTIVE_DEPLOY": "true", "HAS_ACTIVE_DEPLOYMENTS": "false",
+    "RESULT_monitor_ownership_preflight": "skipped", "RESULT_monitor_sync_once": "skipped",
+    "RESULT_validate_monitor_ready": "skipped", "RESULT_replication_monitor_acceptance": "skipped",
+    "RESULT_end_to_end_deployment_acceptance": "skipped", "RESULT_monitor_dry_run_validation": "skipped",
 })
-check("G: VALIDATE mode + eks_oidc_preflight/managed_efs_inventory_guard/terraform_sync_once legitimately skipped -> final gate succeeds", proc.returncode == 0, proc)
-
-# G: managed_efs_deletion_guard/storage_transition_guard are foundational (required in every mode, unlike eks_oidc_preflight/managed_efs_inventory_guard/terraform_sync_once) -- a genuine failure of either must block the gate even in Validate mode.
-proc = run_gate("false", "false", {"managed_efs_deletion_guard": "failure"})
-check("G: VALIDATE mode + managed_efs_deletion_guard=failure fails the gate (foundational, required in every mode)", proc.returncode != 0, proc)
-proc = run_gate("false", "false", {"storage_transition_guard": "failure"})
-check("G: VALIDATE mode + storage_transition_guard=failure fails the gate (foundational, required in every mode)", proc.returncode != 0, proc)
-
-# G: REAL DEPLOY + managed_efs_inventory_guard or terraform_sync_once unexpectedly skipped (should never legitimately happen once eks_oidc_preflight succeeds, but must still fail closed) -> FAIL.
-proc = run_gate("true", "false", {"managed_efs_inventory_guard": "skipped"}, has_changes="false", has_deletions="false")
-check("G: REAL DEPLOY + managed_efs_inventory_guard unexpectedly skipped fails the gate", proc.returncode != 0, proc)
-proc = run_gate("true", "false", {"terraform_sync_once": "skipped"}, has_changes="false", has_deletions="false")
-check("G: REAL DEPLOY + terraform_sync_once unexpectedly skipped fails the gate", proc.returncode != 0, proc)
+check("Phase 7: D: DEPLOY + zero active runtimes + all B3B runtime/monitor jobs skipped -> contract succeeds", proc.returncode == 0, proc)
+proc = p7_run_gate({
+    "EFFECTIVE_DEPLOY": "false", "HAS_ACTIVE_DEPLOYMENTS": "true",
+    "RESULT_monitor_ownership_preflight": "skipped", "RESULT_monitor_sync_once": "skipped",
+    "RESULT_validate_monitor_ready": "skipped", "RESULT_replication_monitor_acceptance": "skipped",
+    "RESULT_end_to_end_deployment_acceptance": "skipped",
+})
+check("Phase 7: E: VALIDATE + active runtimes + monitor_dry_run_validation succeeds, live jobs legitimately skipped -> contract succeeds", proc.returncode == 0, proc)
+proc = p7_run_gate({
+    "EFFECTIVE_DEPLOY": "false", "HAS_ACTIVE_DEPLOYMENTS": "true",
+    "RESULT_monitor_ownership_preflight": "skipped", "RESULT_monitor_sync_once": "skipped",
+    "RESULT_validate_monitor_ready": "skipped", "RESULT_replication_monitor_acceptance": "skipped",
+    "RESULT_end_to_end_deployment_acceptance": "skipped", "RESULT_monitor_dry_run_validation": "skipped",
+})
+check("Phase 7: VALIDATE + active runtimes + monitor_dry_run_validation unexpectedly skipped -> contract fails (unconditionally required for every dry run with active runtimes)", proc.returncode != 0, proc)
 
 if failures:
     print("\n".join(failures))
@@ -15932,30 +15402,11 @@ PYEOF
   PHASE_B3B_FINAL_GATE_STATUS=$?
   set -e
   if [ "$PHASE_B3B_FINAL_GATE_STATUS" -eq 0 ]; then
-    pass "Phase B3B closeout: A: DEPLOY + active runtimes + end_to_end_deployment_acceptance skipped -> final MAIN gate cannot succeed"
-    pass "Phase B3B closeout: B: DEPLOY + active runtimes + validate_monitor_ready skipped -> final gate cannot succeed"
-    pass "Phase B3B closeout: C: DEPLOY + active runtimes + monitor_sync_once skipped -> final gate cannot succeed"
-    pass "Phase B3B closeout: D: DEPLOY + zero active runtimes + all B3B runtime/monitor jobs skipped -> final gate succeeds"
-    pass "Phase B3B closeout: E: DRY RUN + live deployment jobs skipped -> dry-run final gate succeeds when applicable dry-run jobs succeed"
-    pass "Phase B3B closeout: a genuine failure of an always-applicable job still fails the gate regardless of mode"
-    pass "FINAL DEPLOY freeze: FREEZE-A: EFFECTIVE_DEPLOY=true + HAS_ACTIVE_DEPLOYMENTS='' fails closed"
-    pass "FINAL DEPLOY freeze: FREEZE-B: HAS_CHANGES='' fails closed"
-    pass "FINAL DEPLOY freeze: FREEZE-C: HAS_DELETIONS='' fails closed"
-    pass "FINAL DEPLOY freeze: FREEZE-D: DEPLOY=true + HAS_CHANGES=true + runtime_ownership_preflight skipped fails"
-    pass "FINAL DEPLOY freeze: FREEZE-E: DEPLOY=true + HAS_CHANGES=true + build_publish_and_deploy skipped fails"
-    pass "FINAL DEPLOY freeze: FREEZE-F: DEPLOY=false + HAS_CHANGES=true + build_publish_and_deploy skipped fails"
-    pass "FINAL DEPLOY freeze: FREEZE-G: HAS_CHANGES=false + ownership/build skipped succeeds (legitimately not applicable)"
-    pass "FINAL DEPLOY freeze: FREEZE-H: HAS_DELETIONS=true + delete_removed_argocd_applications skipped fails"
-    pass "FINAL DEPLOY freeze: FREEZE-I: HAS_DELETIONS=false + delete_removed_argocd_applications skipped succeeds (legitimately not applicable)"
-    pass "FINAL DEPLOY freeze: manual Deploy (has_changes=true, has_deletions=false) with everything applicable succeeding -> gate succeeds"
-    pass "FINAL DEPLOY freeze: manual deploy=false validation (has_changes=true) -> ownership preflight may skip, build/lint/render still required -> gate succeeds"
-    pass "FINAL DEPLOY freeze: detect_changed_deployments=failure fails the gate"
-    pass "MAIN prerequisite fail-fast (G): REAL DEPLOY + eks_oidc_preflight=failure -> final gate fails for the EKS prerequisite root cause, never the misleading empty-has_changes diagnostic"
-    pass "MAIN prerequisite fail-fast (G): REAL DEPLOY + eks_oidc_preflight=cancelled -> final gate fails for the same EKS prerequisite root cause"
-    pass "MAIN prerequisite fail-fast (G): REAL DEPLOY + all foundation/runtime/monitor gates succeed -> final gate succeeds (existing successful Deploy contract unchanged)"
-    pass "MAIN prerequisite fail-fast (G): VALIDATE mode + eks_oidc_preflight/managed_efs_inventory_guard/terraform_sync_once legitimately skipped -> final gate succeeds"
-    pass "MAIN prerequisite fail-fast (G): VALIDATE mode + managed_efs_deletion_guard/storage_transition_guard failure still fails the gate (foundational, required in every mode)"
-    pass "MAIN prerequisite fail-fast (G): REAL DEPLOY + managed_efs_inventory_guard/terraform_sync_once unexpectedly skipped fails the gate"
+    pass "Phase B3B closeout: MAIN final_validation gate succeeds when all seven phases succeed, and fails (never accepting a mere skip/cancel as success) when any single phase does not conclude exact success, correctly naming which phase failed"
+    pass "Phase B3B closeout: Phase 1 own phase_contract correctly distinguishes foundational-every-mode jobs (managed_efs_deletion_guard/storage_transition_guard/detect_changed_deployments/validate_model) from Deploy-only jobs (eks_oidc_preflight/managed_efs_inventory_guard)"
+    pass "Phase B3B closeout: Phase 2 own phase_contract requires terraform_sync_once success on Deploy and legitimately allows it to skip on Validate"
+    pass "Phase B3B closeout: Phase 5 own phase_contract independently, exactly enforces the has_changes/has_deletions/has_active_deployments dimensions (the FREEZE-D..I equivalent, now at its correct phase-relocated location)"
+    pass "Phase B3B closeout: Phase 7 own phase_contract reproduces scenarios A-E (end_to_end_deployment_acceptance/validate_monitor_ready/monitor_sync_once skip fails on Deploy+active; zero-active-runtime all-skip succeeds; dry-run requires monitor_dry_run_validation success whenever active runtimes exist)"
   else
     fail "Phase B3B closeout final-gate execution proof failed:"$'\n'"${PHASE_B3B_FINAL_GATE_OUT}"
   fi
@@ -16016,6 +15467,200 @@ fi
 # The functional/mocked-kubectl-jq proof for the UID ownership chain (MainWorkflowPodOwnershipTests for the Detect step + MainWorkflowBootstrapRepairPodOwnershipTests for the Bootstrap/repair step, both exercised against the real committed fragments) lives in hack/test-goldengate-metrics-config.py, already run earlier in this suite ("22: hack/test-goldengate-metrics-config.py") -- not re-run here to avoid duplicating that execution.
 
 echo ""
+echo ""
+echo "--- Dedicated phase-topology test: MAIN + 01-07 phase-file structural invariants (task section 17, items A-N) ---"
+
+# A-N: a single, focused static test proving the whole phase-oriented topology end to end, read directly from the real committed YAML (never a reimplementation of the phase files' own logic). Every sub-item below corresponds 1:1 to a lettered requirement from the phase-refactor task specification.
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  set +e
+  PHASE_TOPOLOGY_OUT="$(python3 - "$EKS_APP_WORKFLOW_MAIN_ONLY" "${PHASE_WORKFLOW_FILES[@]}" <<'PYEOF'
+import sys
+
+import yaml
+
+with open(sys.argv[1]) as f:
+    main_doc = yaml.safe_load(f)
+
+phase_docs = {}
+for p in sys.argv[2:]:
+    with open(p) as f:
+        phase_docs[p.rsplit("/", 1)[-1]] = yaml.safe_load(f)
+
+PHASE_FILENAMES_IN_ORDER = [
+    "01-phase-readiness-safety.yaml", "02-phase-aws-prerequisites.yaml", "03-phase-argocd.yaml",
+    "04-phase-platform-observability.yaml", "05-phase-runtimes.yaml", "06-phase-replication.yaml",
+    "07-phase-monitor-acceptance.yaml",
+]
+PHASE_CALLER_JOBS_IN_ORDER = [
+    "phase_1_readiness_safety", "phase_2_aws_prerequisites", "phase_3_argocd",
+    "phase_4_platform_observability", "phase_5_runtimes", "phase_6_replication",
+    "phase_7_monitor_acceptance",
+]
+MOVED_JOBS_BY_PHASE = {
+    "01-phase-readiness-safety.yaml": ["validate_model", "eks_oidc_preflight", "detect_changed_deployments", "managed_efs_deletion_guard", "storage_transition_guard", "managed_efs_inventory_guard"],
+    "02-phase-aws-prerequisites.yaml": ["terraform_sync_once"],
+    "03-phase-argocd.yaml": ["argocd_preflight", "goldengate_deploy_authorization", "reconcile_argocd", "validate_argocd_ready"],
+    "04-phase-platform-observability.yaml": ["platform_preflight", "observability_preflight", "platform_sync_once", "observability_sync_once", "validate_platform_ready", "validate_observability_ready", "validate_shared_secrets_once"],
+    "05-phase-runtimes.yaml": ["runtime_ownership_preflight", "build_publish_and_deploy", "delete_removed_argocd_applications", "validate_active_runtimes"],
+    "06-phase-replication.yaml": ["replication_reconcile_once", "replication_dry_run_validation"],
+    "07-phase-monitor-acceptance.yaml": ["monitor_ownership_preflight", "monitor_sync_once", "monitor_dry_run_validation", "validate_monitor_ready", "replication_monitor_acceptance", "end_to_end_deployment_acceptance"],
+}
+ALL_MOVED_JOBS = [j for jobs in MOVED_JOBS_BY_PHASE.values() for j in jobs]
+
+results = []
+
+
+def check(label, ok):
+    results.append((label, ok))
+
+
+def needs_of(job):
+    n = job.get("needs") or []
+    return [n] if isinstance(n, str) else list(n)
+
+
+main_jobs = main_doc.get("jobs") or {}
+
+# A: MAIN contains exactly the seven expected phase jobs + Final Validation (eight jobs total, never more, never fewer).
+expected_main_jobs = set(PHASE_CALLER_JOBS_IN_ORDER) | {"final_validation"}
+check("A: MAIN contains exactly the seven phase-calling jobs plus final_validation (eight jobs total)", set(main_jobs.keys()) == expected_main_jobs)
+
+# B: MAIN no longer directly contains any of the ~30 moved implementation jobs.
+check("B: MAIN no longer directly contains any moved implementation job", not any(j in main_jobs for j in ALL_MOVED_JOBS))
+
+# C: phase order is strictly 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> final_validation, each phase-caller needing only the immediately preceding one, with no custom if: (implicit all-needs-succeeded default).
+order_ok = True
+for i, name in enumerate(PHASE_CALLER_JOBS_IN_ORDER):
+    job = main_jobs.get(name)
+    if job is None:
+        order_ok = False
+        continue
+    if i == 0:
+        continue
+    if needs_of(job) != [PHASE_CALLER_JOBS_IN_ORDER[i - 1]]:
+        order_ok = False
+    if "if" in job:
+        order_ok = False
+if needs_of(main_jobs.get("final_validation", {})) != [PHASE_CALLER_JOBS_IN_ORDER[-1]] and PHASE_CALLER_JOBS_IN_ORDER[-1] not in needs_of(main_jobs.get("final_validation", {})):
+    order_ok = False
+check("C: phase order is strictly 1->2->3->4->5->6->7->final_validation, each phase-caller needing only its immediate predecessor with no custom if:", order_ok)
+
+# D: Final Validation uses if: always().
+fv_if = str(main_jobs.get("final_validation", {}).get("if", "")).strip()
+check("D: final_validation uses if: always()", fv_if == "always()")
+
+# E: each phase-calling job in MAIN calls exactly its own intended local phase workflow file (never a mismatched or swapped uses: target).
+uses_ok = True
+for phase_caller, phase_filename in zip(PHASE_CALLER_JOBS_IN_ORDER, PHASE_FILENAMES_IN_ORDER):
+    job = main_jobs.get(phase_caller, {})
+    if job.get("uses") != "./.github/workflows/" + phase_filename:
+        uses_ok = False
+check("E: each phase-calling job in MAIN calls exactly its own intended local phase workflow file", uses_ok)
+
+# F: all seven phase workflow files are workflow_call-only (never workflow_dispatch/push -- they are never independently, manually runnable).
+wc_only_ok = True
+for filename, doc in phase_docs.items():
+    on_block = doc.get(True, doc.get("on", {})) or {}
+    if "workflow_call" not in on_block or "workflow_dispatch" in on_block or "push" in on_block:
+        wc_only_ok = False
+check("F: all seven phase workflow files declare on.workflow_call and nothing else (never workflow_dispatch/push)", wc_only_ok)
+
+# G: every moved old-MAIN implementation job appears in exactly the one phase file the task specification assigned it to (never duplicated, never missing, never misplaced).
+placement_ok = True
+for phase_filename, expected_jobs in MOVED_JOBS_BY_PHASE.items():
+    doc_jobs = (phase_docs.get(phase_filename) or {}).get("jobs") or {}
+    for job_name in expected_jobs:
+        if job_name not in doc_jobs:
+            placement_ok = False
+for job_name in ALL_MOVED_JOBS:
+    owners = [fn for fn, doc in phase_docs.items() if job_name in ((doc or {}).get("jobs") or {})]
+    if owners != [fn for fn, jobs in MOVED_JOBS_BY_PHASE.items() if job_name in jobs]:
+        placement_ok = False
+check("G: every moved old-MAIN implementation job appears in exactly its one assigned phase file (never duplicated, missing, or misplaced)", placement_ok)
+
+# H: Phase 3 contains the single MAIN deployment authorization (the sole job-level environment: across MAIN + all seven phase files).
+environment_jobs = []
+for filename, doc in list(phase_docs.items()) + [("00-main-goldengate-orchestrator.yaml", main_doc)]:
+    for job_name, job in ((doc or {}).get("jobs") or {}).items():
+        if isinstance(job, dict) and "environment" in job:
+            environment_jobs.append((filename, job_name))
+check("H: Phase 3 (03-phase-argocd.yaml) contains the single MAIN deployment authorization, and it is the only job-level environment: anywhere in MAIN or the seven phase files", environment_jobs == [("03-phase-argocd.yaml", "goldengate_deploy_authorization")])
+
+# I: later mutating phases (4, 5, 6, 7) remain transitively downstream of Phase 3 via MAIN's own phase-caller needs: chain (BFS reachability), with no phase-caller job carrying a custom if: between them that could let one proceed despite an upstream phase failure.
+graph = {name: needs_of(main_jobs.get(name, {})) for name in PHASE_CALLER_JOBS_IN_ORDER}
+reachable = {"phase_3_argocd"}
+changed = True
+while changed:
+    changed = False
+    for name, needs in graph.items():
+        if name not in reachable and any(n in reachable for n in needs):
+            reachable.add(name)
+            changed = True
+downstream_ok = all(p in reachable for p in ("phase_4_platform_observability", "phase_5_runtimes", "phase_6_replication", "phase_7_monitor_acceptance"))
+downstream_ok = downstream_ok and all("if" not in main_jobs.get(p, {}) for p in ("phase_4_platform_observability", "phase_5_runtimes", "phase_6_replication", "phase_7_monitor_acceptance"))
+check("I: Phase 4/5/6/7 all remain transitively downstream of Phase 3 via MAIN's own needs: chain, with no custom if: on any of them that could bypass an upstream phase failure", downstream_ok)
+
+# J: Phase 4 preserves the Platform/Observability internal parallel branches -- platform_preflight and observability_preflight do not depend on each other.
+p4_jobs = (phase_docs.get("04-phase-platform-observability.yaml") or {}).get("jobs") or {}
+platform_preflight = p4_jobs.get("platform_preflight", {})
+observability_preflight = p4_jobs.get("observability_preflight", {})
+parallel_ok = ("observability_preflight" not in needs_of(platform_preflight)
+               and "platform_preflight" not in needs_of(observability_preflight)
+               and "observability_preflight" not in str(platform_preflight.get("if", ""))
+               and "platform_preflight" not in str(observability_preflight.get("if", "")))
+check("J: Phase 4 preserves the Platform/Observability internal parallel branches (platform_preflight/observability_preflight never depend on each other)", parallel_ok)
+
+# K: Phase 5 preserves the runtime matrix and max-parallel: 1 on build_publish_and_deploy.
+p5_jobs = (phase_docs.get("05-phase-runtimes.yaml") or {}).get("jobs") or {}
+bpd_strategy = (p5_jobs.get("build_publish_and_deploy", {}).get("strategy") or {})
+check("K: Phase 5 preserves build_publish_and_deploy's runtime matrix with max-parallel: 1 and fail-fast: true", "matrix" in bpd_strategy and bpd_strategy.get("max-parallel") == 1 and bpd_strategy.get("fail-fast") is True)
+
+# L: Phase 6 preserves the Deploy-vs-Validate replication split -- replication_reconcile_once (Deploy) and replication_dry_run_validation (Validate) are mutually exclusive on inputs.effective_deploy.
+p6_jobs = (phase_docs.get("06-phase-replication.yaml") or {}).get("jobs") or {}
+reconcile_if = str(p6_jobs.get("replication_reconcile_once", {}).get("if", ""))
+dry_run_if = str(p6_jobs.get("replication_dry_run_validation", {}).get("if", ""))
+check("L: Phase 6 preserves the Deploy-vs-Validate replication split (replication_reconcile_once gated on effective_deploy==true, replication_dry_run_validation on effective_deploy==false)", "effective_deploy == 'true'" in reconcile_if and "effective_deploy == 'false'" in dry_run_if)
+
+# M: Phase 7 preserves the Deploy-vs-Validate / zero-runtime monitor semantics -- every live monitor job is gated on both effective_deploy and has_active_deployments.
+p7_jobs = (phase_docs.get("07-phase-monitor-acceptance.yaml") or {}).get("jobs") or {}
+monitor_ownership_if = str(p7_jobs.get("monitor_ownership_preflight", {}).get("if", ""))
+monitor_dry_run_if = str(p7_jobs.get("monitor_dry_run_validation", {}).get("if", ""))
+m_ok = ("effective_deploy == 'true'" in monitor_ownership_if and "has_active_deployments == 'true'" in monitor_ownership_if
+        and "effective_deploy == 'false'" in monitor_dry_run_if and "has_active_deployments == 'true'" in monitor_dry_run_if)
+check("M: Phase 7 preserves the Deploy-vs-Validate/zero-runtime monitor semantics (monitor_ownership_preflight/monitor_dry_run_validation both gated on effective_deploy and has_active_deployments)", m_ok)
+
+# N: nested reusable workflows retain orchestrated_by_main=true where currently required (Argo CD/Monitor reconciliation calls -- 30/40-sub-platform/observability.yaml historically have no such input, verified structurally elsewhere in this suite).
+reconcile_argocd = (phase_docs.get("03-phase-argocd.yaml") or {}).get("jobs", {}).get("reconcile_argocd", {})
+monitor_sync_once = p7_jobs.get("monitor_sync_once", {})
+orchestrated_ok = (reconcile_argocd.get("with", {}).get("orchestrated_by_main") is True
+                   and monitor_sync_once.get("with", {}).get("orchestrated_by_main") is True)
+check("N: nested reusable-workflow calls retain orchestrated_by_main=true where required (reconcile_argocd, monitor_sync_once)", orchestrated_ok)
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+if any(not ok for _, ok in results):
+    sys.exit(1)
+PYEOF
+)"
+  PHASE_TOPOLOGY_STATUS=$?
+  set -e
+  if [ "$PHASE_TOPOLOGY_STATUS" -eq 0 ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        OK\ *) pass "Phase topology: ${line#OK }" ;;
+      esac
+    done <<< "$PHASE_TOPOLOGY_OUT"
+  else
+    while IFS= read -r line; do
+      case "$line" in
+        OK\ *) pass "Phase topology: ${line#OK }" ;;
+        FAIL\ *) fail "Phase topology: ${line#FAIL }" ;;
+      esac
+    done <<< "$PHASE_TOPOLOGY_OUT"
+  fi
+else
+  skip "Phase topology test -- python3/PyYAML unavailable"
+fi
 echo "--- Final repository handoff hygiene sweep (VDR pre-transfer cleanliness) ---"
 
 # This is the LAST check in the suite, deliberately: earlier sections legitimately regenerate work/generated/dev/goldengate-deployments.yaml (the folder-driven registry-generation checks) as their own tested behavior -- asserting its absence any earlier would be a self-defeating mid-test assertion. Self-heal only the categories PROVEN elsewhere in this suite to be pure, expected byproducts of exercising real application/tooling behavior (never silently deleting anything whose origin is unknown); everything else must already be absent, or this check fails closed and reports it for a human to investigate before VDR handoff.

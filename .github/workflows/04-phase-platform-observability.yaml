@@ -1,0 +1,695 @@
+name: "04 | PHASE | GoldenGate Platform & Observability"
+
+# Called exclusively by 00-main-goldengate-orchestrator.yaml -- workflow_call only. Platform and Observability are independent application-owned prerequisites after Argo CD and run in parallel (siblings, never serialized).
+on:
+  workflow_call:
+    inputs:
+      selected_environment:
+        required: true
+        type: string
+      effective_deploy:
+        required: true
+        type: string
+      has_active_deployments:
+        required: true
+        type: string
+      active_runtime_matrix:
+        required: true
+        type: string
+      has_changes:
+        required: true
+        type: string
+      deployment_matrix:
+        required: true
+        type: string
+      has_deletions:
+        required: true
+        type: string
+      deletion_matrix:
+        required: true
+        type: string
+    outputs:
+      selected_environment:
+        value: ${{ jobs.phase_contract.outputs.selected_environment }}
+      effective_deploy:
+        value: ${{ jobs.phase_contract.outputs.effective_deploy }}
+      has_active_deployments:
+        value: ${{ jobs.phase_contract.outputs.has_active_deployments }}
+      active_runtime_matrix:
+        value: ${{ jobs.phase_contract.outputs.active_runtime_matrix }}
+      has_changes:
+        value: ${{ jobs.phase_contract.outputs.has_changes }}
+      deployment_matrix:
+        value: ${{ jobs.phase_contract.outputs.deployment_matrix }}
+      has_deletions:
+        value: ${{ jobs.phase_contract.outputs.has_deletions }}
+      deletion_matrix:
+        value: ${{ jobs.phase_contract.outputs.deletion_matrix }}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  platform_preflight:
+    name: Classify GoldenGate Platform ownership safety (read-only)
+
+    # Generic MAIN Desired-State Convergence Fix: hack/orchestration/platform_state.py is now a pure OWNERSHIP-SAFETY classifier -- ABSENT and OWNED both reconcile via platform_sync_once below on EVERY Deploy, regardless of individual desired-state drift (a Fluent Bit image change, an RBAC change, a future new resource, a namespace metadata change); BROKEN (foreign/ambiguous ownership, a Terminating namespace, or a genuine inspection failure) fails closed right here, never auto-repaired. Runs independently of observability_preflight (siblings after Argo, not a chain) so both branches can execute in parallel. This job never mutates the cluster -- it only runs hack/orchestration/platform_state.py, which itself issues read-only `kubectl get` calls. Phase 3's own success (including validate_argocd_ready) is already guaranteed transitively by MAIN only calling Phase 4 after Phase 3 succeeds.
+    if: ${{ inputs.effective_deploy == 'true' }}
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    outputs:
+      state: ${{ steps.classify.outputs.state }}
+
+    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail.
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ inputs.selected_environment }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Load resolved environment config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
+
+      - name: Install kubectl if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking/installing kubectl..."
+
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KUBECTL_VERSION="v1.35.0"
+
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64)
+                KUBECTL_ARCH="amd64"
+                ;;
+              aarch64|arm64)
+                KUBECTL_ARCH="arm64"
+                ;;
+              *)
+                echo "Unsupported architecture for kubectl: $ARCH"
+                exit 1
+                ;;
+            esac
+
+            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+            sudo chmod +x /usr/local/bin/kubectl
+          fi
+
+          kubectl version --client=true
+
+      - name: Connect to EKS cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}" \
+            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
+            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
+
+          echo "Current kube context:"
+          kubectl config current-context
+
+      - name: Classify GoldenGate Platform ownership safety
+        id: classify
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # A non-zero exit here is a classifier inspection error (API unreachable, permission denied, malformed JSON) -- never treated as ABSENT. Generic MAIN Desired-State Convergence Fix: ownership safety no longer depends on FLUENT_BIT_IMAGE (or any other desired-state value) at all -- it only inspects OWNERSHIP LABELS on whatever currently exists, so a values-driven Platform change never requires touching this classifier.
+          if ! CLASSIFIER_OUTPUT="$(python3 hack/orchestration/platform_state.py --environment "${GG_SELECTED_ENVIRONMENT}")"; then
+            echo "FAIL: the GoldenGate Platform ownership classifier could not determine cluster state (inspection error, not ABSENT) -- see diagnostics above."
+            exit 1
+          fi
+
+          echo "$CLASSIFIER_OUTPUT"
+
+          STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
+          echo "GoldenGate Platform ownership-safety state: ${STATE}"
+          echo "state=${STATE}" >> "$GITHUB_OUTPUT"
+
+          if [ "$STATE" = "BROKEN" ]; then
+            echo "FAIL: GoldenGate Platform ownership-safety state is BROKEN -- a foreign/ambiguous ownership conflict or genuine inspection failure. This is not auto-repaired here -- investigate the diagnostics above before re-running MAIN."
+            exit 1
+          fi
+
+  observability_preflight:
+    name: Classify Observability ownership safety (read-only)
+
+    # Generic MAIN Desired-State Convergence Fix: hack/orchestration/observability_state.py is now a pure OWNERSHIP-SAFETY classifier -- ABSENT and OWNED both reconcile via observability_sync_once below on EVERY Deploy, regardless of individual desired-state drift (chart version, image digests, the cloudwatch-agent ServiceAccount role-arn, a future new resource); BROKEN (foreign/ambiguous ownership, or a genuine inspection failure) fails closed right here, never auto-repaired. Deliberately does NOT depend on platform_preflight -- both are independent application-owned prerequisites after Argo and run in parallel. This job never mutates the cluster -- it only runs hack/orchestration/observability_state.py, which itself issues read-only `kubectl get` calls.
+    if: ${{ inputs.effective_deploy == 'true' }}
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    outputs:
+      state: ${{ steps.classify.outputs.state }}
+
+    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail.
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ inputs.selected_environment }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Load resolved environment config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
+
+      - name: Install kubectl if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking/installing kubectl..."
+
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KUBECTL_VERSION="v1.35.0"
+
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64)
+                KUBECTL_ARCH="amd64"
+                ;;
+              aarch64|arm64)
+                KUBECTL_ARCH="arm64"
+                ;;
+              *)
+                echo "Unsupported architecture for kubectl: $ARCH"
+                exit 1
+                ;;
+            esac
+
+            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+            sudo chmod +x /usr/local/bin/kubectl
+          fi
+
+          kubectl version --client=true
+
+      - name: Connect to EKS cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}" \
+            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
+            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
+
+          echo "Current kube context:"
+          kubectl config current-context
+
+      - name: Classify Observability ownership safety
+        id: classify
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # A non-zero exit here is a classifier inspection error (API unreachable, permission denied, malformed JSON) -- never treated as ABSENT.
+          if ! CLASSIFIER_OUTPUT="$(python3 hack/orchestration/observability_state.py --environment "${GG_SELECTED_ENVIRONMENT}")"; then
+            echo "FAIL: the Observability ownership classifier could not determine cluster state (inspection error, not ABSENT) -- see diagnostics above."
+            exit 1
+          fi
+
+          echo "$CLASSIFIER_OUTPUT"
+
+          STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
+          echo "Observability ownership-safety state: ${STATE}"
+          echo "state=${STATE}" >> "$GITHUB_OUTPUT"
+
+          if [ "$STATE" = "BROKEN" ]; then
+            echo "FAIL: Observability ownership-safety state is BROKEN -- a foreign/ambiguous ownership conflict or genuine inspection failure. This is not auto-repaired here -- investigate the diagnostics above before re-running MAIN."
+            exit 1
+          fi
+
+  platform_sync_once:
+    name: Reconcile the GoldenGate platform chart
+
+    # Generic MAIN Desired-State Convergence Fix: MAIN ALWAYS reconciles the Platform on Deploy whenever platform_preflight confirms it is safe (ABSENT or OWNED) -- never skipped merely because the preflight ownership classifier found the installation superficially healthy-looking. 30-sub-platform.yaml's own idempotent Argo CD sync is what actually applies the current committed desired state (Fluent Bit image/config, ServiceAccount role ARNs, any future OPTIONAL values-driven resource) -- this job never needs to learn a new resource name merely to keep permitting that reconciliation. fluentBit.create is a REQUIRED architectural invariant, not a supported optional toggle: 30-sub-platform.yaml's own post-deploy validation unconditionally requires the rendered gg-fluent-bit DaemonSet/ConfigMap/ServiceAccount to exist, so flipping fluentBit.create=false would fail that validation, not be silently pruned -- generic MAIN reconciliation does not, by itself, make every values.yaml boolean an equally supported false<->true toggle; see Fix 3 (Generic MAIN Desired-State Convergence Safety Correction) for the full optional-toggle-vs-required-invariant distinction. Runs the reusable specialist workflow synchronously as part of this DAG -- never an asynchronous CLI/API dispatch or repository_dispatch trigger. No standalone specialist workflow is a required recovery/upgrade path -- MAIN never tells an operator to run 30-sub-platform.yaml separately to apply ordinary desired state.
+    needs:
+      - platform_preflight
+    if: ${{ inputs.effective_deploy == 'true' && needs.platform_preflight.result == 'success' && (needs.platform_preflight.outputs.state == 'ABSENT' || needs.platform_preflight.outputs.state == 'OWNED') }}
+
+    uses: ./.github/workflows/30-sub-platform.yaml
+    with:
+      environment: ${{ inputs.selected_environment }}
+      deploy: true
+      orchestrated_by_main: true
+
+  observability_sync_once:
+    name: Reconcile Observability
+
+    # Generic MAIN Desired-State Convergence Fix: MAIN ALWAYS reconciles Observability on Deploy whenever observability_preflight confirms it is safe (ABSENT or OWNED) -- same always-reconcile contract as platform_sync_once. 40-sub-observability.yaml's own idempotent Argo CD sync is what actually applies the current committed desired state (chart version, image digests, the cloudwatch-agent ServiceAccount role-arn, any future values-driven resource) -- this job never needs to learn a new resource name merely to keep permitting that reconciliation. No standalone specialist workflow is a required recovery/upgrade path.
+    needs:
+      - observability_preflight
+    if: ${{ inputs.effective_deploy == 'true' && needs.observability_preflight.result == 'success' && (needs.observability_preflight.outputs.state == 'ABSENT' || needs.observability_preflight.outputs.state == 'OWNED') }}
+
+    uses: ./.github/workflows/40-sub-observability.yaml
+    with:
+      environment: ${{ inputs.selected_environment }}
+      deploy: true
+      orchestrated_by_main: true
+
+  validate_platform_ready:
+    name: Validate GoldenGate Platform is healthy (strict post-reconciliation acceptance)
+
+    # always() overrides GitHub's default implicit skip-on-skipped-dependency behavior -- the explicit result check below is what actually keeps this fail-closed. Generic MAIN Desired-State Convergence Fix: platform_sync_once now ALWAYS runs for both ABSENT and OWNED (never skipped on a healthy-looking preflight), so this job's own gating simplifies to "platform_preflight succeeded and platform_sync_once succeeded" -- the strict exact-desired-state check happens entirely in the re-classification step below (hack/orchestration/platform_acceptance.py), independent of which preflight state was observed.
+    needs:
+      - platform_preflight
+      - platform_sync_once
+    if: ${{ always() && inputs.effective_deploy == 'true' && needs.platform_preflight.result == 'success' && needs.platform_sync_once.result == 'success' }}
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail.
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ inputs.selected_environment }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Load resolved environment config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
+
+      - name: Install kubectl if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking/installing kubectl..."
+
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KUBECTL_VERSION="v1.35.0"
+
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64)
+                KUBECTL_ARCH="amd64"
+                ;;
+              aarch64|arm64)
+                KUBECTL_ARCH="arm64"
+                ;;
+              *)
+                echo "Unsupported architecture for kubectl: $ARCH"
+                exit 1
+                ;;
+            esac
+
+            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+            sudo chmod +x /usr/local/bin/kubectl
+          fi
+
+          kubectl version --client=true
+
+      - name: Connect to EKS cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}" \
+            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
+            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
+
+          echo "Current kube context:"
+          kubectl config current-context
+
+      - name: Re-classify and require GoldenGate Platform to be exactly HEALTHY
+        shell: bash
+        env:
+          # Read through a step-level environment variable, never interpolated directly into a shell statement or hardcoded here -- the same external-operational-configuration pattern 30-sub-platform.yaml itself already uses for this variable.
+          FLUENT_BIT_IMAGE: ${{ vars.FLUENT_BIT_IMAGE }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${FLUENT_BIT_IMAGE:-}" ]; then
+            echo "FAIL: the FLUENT_BIT_IMAGE repository variable is not set."
+            exit 1
+          fi
+
+          # Generic MAIN Desired-State Convergence Fix: post-reconciliation acceptance is now a SEPARATE, strict classifier (hack/orchestration/platform_acceptance.py) from the pre-reconciliation ownership-safety preflight (hack/orchestration/platform_state.py) -- reconciliation success (the reusable workflow job returning) is never assumed to mean healthy; this independently re-inspects the live cluster against the full current desired-state contract (Fluent Bit image/shape/readiness, IRSA role ARNs, and the exact namespace app.kubernetes.io/managed-by=argocd contract).
+          if ! CLASSIFIER_OUTPUT="$(python3 hack/orchestration/platform_acceptance.py --environment "${GG_SELECTED_ENVIRONMENT}" --fluent-bit-image "${FLUENT_BIT_IMAGE}")"; then
+            echo "FAIL: the GoldenGate Platform acceptance classifier could not determine cluster state (inspection error) during post-reconciliation validation."
+            exit 1
+          fi
+
+          echo "$CLASSIFIER_OUTPUT"
+
+          STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
+
+          if [ "$STATE" != "HEALTHY" ]; then
+            echo "FAIL: GoldenGate Platform acceptance state is ${STATE}, expected HEALTHY after preflight/reconciliation. Refusing to proceed."
+            exit 1
+          fi
+
+          echo "OK: GoldenGate Platform acceptance state is HEALTHY."
+
+  validate_observability_ready:
+    name: Validate Observability is healthy (strict post-reconciliation acceptance)
+
+    # always() overrides GitHub's default implicit skip-on-skipped-dependency behavior -- the explicit result check below is what actually keeps this fail-closed. Generic MAIN Desired-State Convergence Fix: observability_sync_once now ALWAYS runs for both ABSENT and OWNED (never skipped on a healthy-looking preflight), so this job's own gating simplifies to "observability_preflight succeeded and observability_sync_once succeeded" -- the strict exact-desired-state check happens entirely in the re-classification step below (hack/orchestration/observability_acceptance.py), independent of which preflight state was observed.
+    needs:
+      - observability_preflight
+      - observability_sync_once
+    if: ${{ always() && inputs.effective_deploy == 'true' && needs.observability_preflight.result == 'success' && needs.observability_sync_once.result == 'success' }}
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail.
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ inputs.selected_environment }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Load resolved environment config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
+
+      - name: Install kubectl if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking/installing kubectl..."
+
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KUBECTL_VERSION="v1.35.0"
+
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64)
+                KUBECTL_ARCH="amd64"
+                ;;
+              aarch64|arm64)
+                KUBECTL_ARCH="arm64"
+                ;;
+              *)
+                echo "Unsupported architecture for kubectl: $ARCH"
+                exit 1
+                ;;
+            esac
+
+            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+            sudo chmod +x /usr/local/bin/kubectl
+          fi
+
+          kubectl version --client=true
+
+      - name: Connect to EKS cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}" \
+            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
+            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
+
+          echo "Current kube context:"
+          kubectl config current-context
+
+      - name: Re-classify and require Observability to be exactly HEALTHY
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Generic MAIN Desired-State Convergence Fix: post-reconciliation acceptance is now a SEPARATE, strict classifier (hack/orchestration/observability_acceptance.py) from the pre-reconciliation ownership-safety preflight (hack/orchestration/observability_state.py) -- reconciliation success (the reusable workflow job returning) is never assumed to mean healthy; this independently re-inspects the live cluster against the full current desired-state contract (workload readiness, image provenance, Agent CR shape, the cloudwatch-agent ServiceAccount role-arn, chart version, and the metrics-only negative-safety contract).
+          if ! CLASSIFIER_OUTPUT="$(python3 hack/orchestration/observability_acceptance.py --environment "${GG_SELECTED_ENVIRONMENT}")"; then
+            echo "FAIL: the Observability acceptance classifier could not determine cluster state (inspection error) during post-reconciliation validation."
+            exit 1
+          fi
+
+          echo "$CLASSIFIER_OUTPUT"
+
+          STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
+
+          if [ "$STATE" != "HEALTHY" ]; then
+            echo "FAIL: Observability acceptance state is ${STATE}, expected HEALTHY after preflight/reconciliation. Refusing to proceed."
+            exit 1
+          fi
+
+          echo "OK: Observability acceptance state is HEALTHY."
+
+  validate_shared_secrets_once:
+    name: Validate the three shared GoldenGate secrets exist (read-only, once per environment)
+
+    needs:
+      - validate_platform_ready
+      - validate_observability_ready
+    # Runs when platform/observability were legitimately skipped (deploy=false) -- but for a real deploy (effective_deploy=='true'), "skipped" is NOT success: this job must not run unless validate_platform_ready AND validate_observability_ready both actually succeeded. Phase 2's own Terraform success is already guaranteed transitively (MAIN only calls this phase after Phase 2 succeeds).
+    if: ${{ always() && (inputs.effective_deploy != 'true' || (needs.validate_platform_ready.result == 'success' && needs.validate_observability_ready.result == 'success')) }}
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    # Live Deployment Approval Topology Fix: no job-level environment: here -- this job is read-only (only validates that the three shared secrets already exist, never creates/mutates them), consumes only the proven repository-scoped vars.PROJECT_NAME_DEV, and is already covered end-to-end by the single goldengate_deploy_authorization approval upstream of it in the DAG; JOB-LEVEL (not step-level) so every run: step in this job can still safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail -- this is the exact defect class that already hit live in managed_efs_inventory_guard (Live Deploy Fix 4).
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ inputs.selected_environment }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Load resolved environment config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
+
+      - name: Verify each shared secret exists with an AWSCURRENT version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
+
+          # The three shared GoldenGate secrets live in the workload account, not the engineering/runner account this job started in (RUNNER_ROLE_ARN above) -- same cross-account pattern as managed_efs_inventory_guard: assume EKS_DEPLOY_ROLE_ARN, verify the assumed identity's own account before any Secrets Manager call, and never let the unverified job-level credentials touch Secrets Manager.
+          EXPECTED_WORKLOAD_ACCOUNT_ID="$(echo "$EKS_DEPLOY_ROLE_ARN" | sed -nE 's#^arn:aws:iam::([0-9]{12}):role/.*$#\1#p')"
+          if [ -z "$EXPECTED_WORKLOAD_ACCOUNT_ID" ]; then
+            echo "FAIL: could not extract a 12-digit account ID from EKS_DEPLOY_ROLE_ARN; refusing to validate shared secrets without a provable expected workload account."
+            exit 1
+          fi
+
+          echo "Assuming ${EKS_DEPLOY_ROLE_ARN} for read-only secretsmanager:DescribeSecret/ListSecretVersionIds calls..."
+
+          ASSUME_JSON="$(aws sts assume-role --role-arn "$EKS_DEPLOY_ROLE_ARN" --role-session-name "gg-shared-secrets-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --duration-seconds 900 --output json)"
+          SEC_TMP_KEY_ID="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["Credentials"]["AccessKeyId"])' <<< "$ASSUME_JSON")"
+          SEC_TMP_SECRET="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["Credentials"]["SecretAccessKey"])' <<< "$ASSUME_JSON")"
+          SEC_TMP_TOKEN="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["Credentials"]["SessionToken"])' <<< "$ASSUME_JSON")"
+          unset ASSUME_JSON
+          echo "::add-mask::${SEC_TMP_KEY_ID}"
+          echo "::add-mask::${SEC_TMP_SECRET}"
+          echo "::add-mask::${SEC_TMP_TOKEN}"
+
+          # Confined to this one step's subshells only -- never written to $GITHUB_ENV, so the job-level engineering-account credentials configured above stay untouched once this step ends.
+          ACTUAL_ACCOUNT="$(AWS_ACCESS_KEY_ID="$SEC_TMP_KEY_ID" AWS_SECRET_ACCESS_KEY="$SEC_TMP_SECRET" AWS_SESSION_TOKEN="$SEC_TMP_TOKEN" aws sts get-caller-identity --query Account --output text --region "$AWS_REGION")"
+          if [ -z "$ACTUAL_ACCOUNT" ] || [ "$ACTUAL_ACCOUNT" != "$EXPECTED_WORKLOAD_ACCOUNT_ID" ]; then
+            echo "FAIL: assumed role resolved to caller account '${ACTUAL_ACCOUNT}', expected the GoldenGate workload account ${EXPECTED_WORKLOAD_ACCOUNT_ID}. Refusing to call Secrets Manager."
+            unset SEC_TMP_KEY_ID SEC_TMP_SECRET SEC_TMP_TOKEN
+            exit 1
+          fi
+          echo "OK: assumed-role caller identity is account ${ACTUAL_ACCOUNT} in region ${AWS_REGION}, matching the expected GoldenGate workload account."
+
+          # DescribeSecret/ListSecretVersionIds only -- never GetSecretValue. No secret is created, mutated, or rotated here. Every call below runs under the assumed workload-account credentials only, never the job's base engineering-account credentials.
+          FAILED=0
+          while IFS= read -r secret_name; do
+            [ -z "$secret_name" ] && continue
+            echo "Checking ${secret_name}..."
+            if ! AWS_ACCESS_KEY_ID="$SEC_TMP_KEY_ID" AWS_SECRET_ACCESS_KEY="$SEC_TMP_SECRET" AWS_SESSION_TOKEN="$SEC_TMP_TOKEN" aws secretsmanager describe-secret --secret-id "$secret_name" --region "$AWS_REGION" >/dev/null; then
+              echo "FAIL: ${secret_name} does not exist or is not accessible."
+              FAILED=1
+              continue
+            fi
+            STAGES_JSON="$(AWS_ACCESS_KEY_ID="$SEC_TMP_KEY_ID" AWS_SECRET_ACCESS_KEY="$SEC_TMP_SECRET" AWS_SESSION_TOKEN="$SEC_TMP_TOKEN" aws secretsmanager list-secret-version-ids --secret-id "$secret_name" --region "$AWS_REGION" --include-deprecated --output json)"
+            if ! python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if any("AWSCURRENT" in v.get("VersionStages", []) for v in d.get("Versions", [])) else 1)' <<< "$STAGES_JSON"; then
+              echo "FAIL: ${secret_name} has no AWSCURRENT version."
+              FAILED=1
+              continue
+            fi
+            echo "OK: ${secret_name} exists with an AWSCURRENT version."
+          done < <(python3 hack/goldengate-deployment-model.py --environment "${GG_SELECTED_ENVIRONMENT}" shared-secrets)
+
+          unset SEC_TMP_KEY_ID SEC_TMP_SECRET SEC_TMP_TOKEN
+
+          if [ "$FAILED" -ne 0 ]; then
+            exit 1
+          fi
+
+          echo "OK: all three shared GoldenGate secrets exist with an AWSCURRENT version."
+
+  phase_contract:
+    name: "Phase 4 contract"
+
+    # Reproduces the Phase 4 slice of MAIN final_validation's mode-aware contract -- if: always() so this phase never accidentally reports success merely because every internal job was cleanly skipped (Validate mode). validate_shared_secrets_once is foundational (required every mode); Platform/Observability readiness is Deploy-only.
+    needs:
+      - platform_preflight
+      - observability_preflight
+      - platform_sync_once
+      - observability_sync_once
+      - validate_platform_ready
+      - validate_observability_ready
+      - validate_shared_secrets_once
+    if: always()
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    outputs:
+      selected_environment: ${{ steps.contract.outputs.selected_environment }}
+      effective_deploy: ${{ steps.contract.outputs.effective_deploy }}
+      has_active_deployments: ${{ steps.contract.outputs.has_active_deployments }}
+      active_runtime_matrix: ${{ steps.contract.outputs.active_runtime_matrix }}
+      has_changes: ${{ steps.contract.outputs.has_changes }}
+      deployment_matrix: ${{ steps.contract.outputs.deployment_matrix }}
+      has_deletions: ${{ steps.contract.outputs.has_deletions }}
+      deletion_matrix: ${{ steps.contract.outputs.deletion_matrix }}
+
+    steps:
+      - name: Validate the mode-aware Phase 4 success contract and relay outputs
+        id: contract
+        shell: bash
+        env:
+          EFFECTIVE_DEPLOY: ${{ inputs.effective_deploy }}
+          RESULT_platform_preflight: ${{ needs.platform_preflight.result }}
+          RESULT_observability_preflight: ${{ needs.observability_preflight.result }}
+          RESULT_platform_sync_once: ${{ needs.platform_sync_once.result }}
+          RESULT_observability_sync_once: ${{ needs.observability_sync_once.result }}
+          RESULT_validate_platform_ready: ${{ needs.validate_platform_ready.result }}
+          RESULT_validate_observability_ready: ${{ needs.validate_observability_ready.result }}
+          RESULT_validate_shared_secrets_once: ${{ needs.validate_shared_secrets_once.result }}
+          OUT_selected_environment: ${{ inputs.selected_environment }}
+          OUT_has_active_deployments: ${{ inputs.has_active_deployments }}
+          OUT_active_runtime_matrix: ${{ inputs.active_runtime_matrix }}
+          OUT_has_changes: ${{ inputs.has_changes }}
+          OUT_deployment_matrix: ${{ inputs.deployment_matrix }}
+          OUT_has_deletions: ${{ inputs.has_deletions }}
+          OUT_deletion_matrix: ${{ inputs.deletion_matrix }}
+        run: |
+          set -euo pipefail
+
+          echo "Resolved mode: effective_deploy=${EFFECTIVE_DEPLOY}"
+
+          FAILED="false"
+
+          require_success() {
+            local job_name="$1"
+            local result_var="RESULT_${job_name}"
+            local result="${!result_var}"
+            if [ "$result" != "success" ]; then
+              echo "FAIL: required job '${job_name}' has result '${result}', expected 'success'."
+              FAILED="true"
+            else
+              echo "OK: required job '${job_name}' succeeded."
+            fi
+          }
+
+          allow_non_failure() {
+            local job_name="$1"
+            local result_var="RESULT_${job_name}"
+            local result="${!result_var}"
+            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+              echo "FAIL: job '${job_name}' has result '${result}' -- not required in this mode, but a real failure/cancellation still blocks Phase 4."
+              FAILED="true"
+            else
+              echo "OK: job '${job_name}' result '${result}' is acceptable in this mode."
+            fi
+          }
+
+          # Foundational -- required in every mode.
+          require_success validate_shared_secrets_once
+
+          if [ "$EFFECTIVE_DEPLOY" = "true" ]; then
+            require_success platform_preflight
+            require_success observability_preflight
+            require_success platform_sync_once
+            require_success observability_sync_once
+            require_success validate_platform_ready
+            require_success validate_observability_ready
+          else
+            allow_non_failure platform_preflight
+            allow_non_failure observability_preflight
+            allow_non_failure platform_sync_once
+            allow_non_failure observability_sync_once
+            allow_non_failure validate_platform_ready
+            allow_non_failure validate_observability_ready
+          fi
+
+          if [ "$FAILED" = "true" ]; then
+            echo ""
+            echo "FAIL: Phase 4 | GoldenGate Platform & Observability did not complete successfully."
+            exit 1
+          fi
+
+          echo ""
+          echo "OK: Phase 4 | GoldenGate Platform & Observability succeeded."
+
+          {
+            echo "selected_environment=${OUT_selected_environment}"
+            echo "effective_deploy=${EFFECTIVE_DEPLOY}"
+            echo "has_active_deployments=${OUT_has_active_deployments}"
+            echo "active_runtime_matrix=${OUT_active_runtime_matrix}"
+            echo "has_changes=${OUT_has_changes}"
+            echo "deployment_matrix=${OUT_deployment_matrix}"
+            echo "has_deletions=${OUT_has_deletions}"
+            echo "deletion_matrix=${OUT_deletion_matrix}"
+          } >> "$GITHUB_OUTPUT"

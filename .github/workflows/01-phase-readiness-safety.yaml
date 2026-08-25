@@ -1,0 +1,802 @@
+name: "01 | PHASE | Environment Readiness & Safety"
+
+# Called exclusively by 00-main-goldengate-orchestrator.yaml (phase-oriented orchestration refactor) -- never a second entry point. workflow_call only: no workflow_dispatch/push triggers of its own.
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      action:
+        required: true
+        type: string
+      deployment_id:
+        required: false
+        type: string
+        default: ""
+      terraform_governance_override:
+        required: false
+        type: boolean
+        default: false
+      terraform_governance_override_reason:
+        required: false
+        type: string
+        default: ""
+    outputs:
+      selected_environment:
+        value: ${{ jobs.phase_contract.outputs.selected_environment }}
+      effective_deploy:
+        value: ${{ jobs.phase_contract.outputs.effective_deploy }}
+      has_active_deployments:
+        value: ${{ jobs.phase_contract.outputs.has_active_deployments }}
+      active_runtime_matrix:
+        value: ${{ jobs.phase_contract.outputs.active_runtime_matrix }}
+      terraform_governance_override:
+        value: ${{ jobs.phase_contract.outputs.terraform_governance_override }}
+      terraform_governance_override_reason:
+        value: ${{ jobs.phase_contract.outputs.terraform_governance_override_reason }}
+      has_changes:
+        value: ${{ jobs.phase_contract.outputs.has_changes }}
+      deployment_matrix:
+        value: ${{ jobs.phase_contract.outputs.deployment_matrix }}
+      has_deletions:
+        value: ${{ jobs.phase_contract.outputs.has_deletions }}
+      deletion_matrix:
+        value: ${{ jobs.phase_contract.outputs.deletion_matrix }}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  validate_model:
+    name: Validate the folder-driven deployment model
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    outputs:
+      effective_deploy: ${{ steps.compute.outputs.effective_deploy }}
+      has_active_deployments: ${{ steps.active_runtime_state.outputs.has_active_deployments }}
+      active_runtime_matrix: ${{ steps.active_runtime_state.outputs.active_runtime_matrix }}
+      selected_environment: ${{ steps.resolve_environment.outputs.environment }}
+      # Live Deploy Fix 5: the SOLE derivation point for the corporate Terraform reusable workflow's break-glass inputs -- never re-derived downstream.
+      terraform_governance_override: ${{ steps.governance.outputs.override }}
+      terraform_governance_override_reason: ${{ steps.governance.outputs.reason }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify Python and PyYAML prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! command -v python3 >/dev/null 2>&1; then
+            echo "FAIL: python3 is required and is not available on this runner."
+            exit 1
+          fi
+
+          if ! python3 -c "import yaml" >/dev/null 2>&1; then
+            echo "FAIL: PyYAML is required and is not available on this runner."
+            exit 1
+          fi
+
+          echo "OK: python3 and PyYAML are available."
+
+      - name: Resolve selected environment
+        id: resolve_environment
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+
+          # workflow_dispatch carries an explicit choice; the push trigger is scoped to envs/dev/** only, so the trigger itself selects dev -- never a second independent environment source.
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            SELECTED_ENVIRONMENT="$INPUT_ENVIRONMENT"
+          else
+            SELECTED_ENVIRONMENT="dev"
+          fi
+
+          echo "GG_SELECTED_ENVIRONMENT=${SELECTED_ENVIRONMENT}" >> "$GITHUB_ENV"
+          echo "environment=${SELECTED_ENVIRONMENT}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate the folder-driven deployment model
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Fail-closed gate: no downstream job runs while any envs/<environment>/*/values.yaml descriptor is invalid.
+          python3 hack/goldengate-deployment-model.py --environment "${GG_SELECTED_ENVIRONMENT}" validate
+
+      - name: Validate and load the selected environment configuration
+        id: load_environment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" validate
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+
+      - name: Verify generated IAM policies are in sync with environment.yaml
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Fails closed if envs/<environment>/policies/**/assume_role_policy/sts.json or policies_1.json were hand-edited out of step with environment.yaml (for example, after eks.oidcIssuer changed) -- the fix is `render-iam-policies --write`, never a manual JSON edit.
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" render-iam-policies --check
+
+      - name: Determine active GoldenGate runtime state
+        id: active_runtime_state
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # GLOBAL folder-driven desired state (not deployment_matrix, which only reflects deployments selected by this push's changed files) -- the canonical registry is the single source of truth monitor_sync_once/monitor_dry_run_validation gate on below.
+          TMP="$(mktemp)"
+          trap 'rm -f "$TMP"' EXIT
+
+          python3 hack/goldengate-deployment-model.py --environment "${GG_SELECTED_ENVIRONMENT}" registry --output "$TMP"
+
+          ACTIVE_COUNT="$(python3 - "$TMP" <<'PY'
+          import sys
+
+          import yaml
+
+          with open(sys.argv[1]) as f:
+              doc = yaml.safe_load(f)
+
+          if not isinstance(doc, dict):
+              raise SystemExit("registry document is not a mapping")
+
+          deployments = doc.get("deployments")
+          if not isinstance(deployments, list):
+              raise SystemExit("registry deployments is not a list")
+
+          print(len(deployments))
+          PY
+          )"
+
+          if ! [[ "$ACTIVE_COUNT" =~ ^[0-9]+$ ]]; then
+            echo "FAIL: could not determine a numeric active GoldenGate runtime count from the generated registry."
+            exit 1
+          fi
+
+          echo "Active GoldenGate runtime count: ${ACTIVE_COUNT}"
+
+          if [ "$ACTIVE_COUNT" -gt 0 ]; then
+            echo "has_active_deployments=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No active GoldenGate runtimes remain; runtime-dependent monitor stages will be skipped."
+            echo "has_active_deployments=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Phase B3A: active_runtime_matrix -- the SAME canonical registry, reshaped into {environment, deployment_id} entries -- is the GLOBAL active-runtime inventory validate_active_runtimes (post-reconciliation acceptance) consumes below. Deliberately NOT re-scanned independently: derived from the identical "$TMP" registry file has_active_deployments above already validated.
+          ACTIVE_RUNTIME_MATRIX="$(python3 - "$TMP" "$GG_SELECTED_ENVIRONMENT" <<'PY'
+          import json
+          import sys
+
+          import yaml
+
+          with open(sys.argv[1]) as f:
+              doc = yaml.safe_load(f)
+          environment = sys.argv[2]
+
+          deployments = doc.get("deployments")
+          if not isinstance(deployments, list):
+              raise SystemExit("registry deployments is not a list")
+
+          matrix = [{"environment": environment, "deployment_id": d["name"]} for d in deployments]
+          print(json.dumps(matrix, sort_keys=True))
+          PY
+          )"
+
+          echo "Active GoldenGate runtime matrix: ${ACTIVE_RUNTIME_MATRIX}"
+          echo "active_runtime_matrix=${ACTIVE_RUNTIME_MATRIX}" >> "$GITHUB_OUTPUT"
+
+      - name: Compute effective deploy flag
+        id: compute
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_ACTION: ${{ inputs.action }}
+        run: |
+          set -euo pipefail
+
+          # Live Deploy UX Fix 2: the external operator-facing contract is now an explicit action choice (validate/deploy -- Destroy is not exposed yet), but the internal DAG contract (validate_model.outputs.effective_deploy, a boolean string every existing B1/B2/B3A/B3B condition already depends on) is deliberately unchanged and derived here, in exactly one place, never duplicated elsewhere.
+          # A push event carries no workflow_dispatch inputs and always implies deploy=true, matching the existing detect-goldengate-deployments.sh push-path contract.
+          if [ "$EVENT_NAME" != "workflow_dispatch" ]; then
+            echo "effective_deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            case "$INPUT_ACTION" in
+              deploy)
+                echo "effective_deploy=true" >> "$GITHUB_OUTPUT"
+                ;;
+              validate)
+                echo "effective_deploy=false" >> "$GITHUB_OUTPUT"
+                ;;
+              *)
+                echo "FAIL: unrecognized workflow_dispatch action '${INPUT_ACTION}' -- expected exactly 'validate' or 'deploy'. Refusing to guess which lifecycle contract applies."
+                exit 1
+                ;;
+            esac
+          fi
+
+      - name: Derive and validate the Terraform governance override (fail closed)
+        id: governance
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_OVERRIDE: ${{ inputs.terraform_governance_override }}
+          INPUT_REASON: ${{ inputs.terraform_governance_override_reason }}
+        run: |
+          set -euo pipefail
+
+          # Live Deploy Fix 5: this is the SOLE source of truth for the corporate Terraform reusable workflow's officially supported break-glass inputs (override_noncompliance/override_reason) -- never re-derived in any other job. A push event carries no workflow_dispatch inputs and must NEVER be able to activate break-glass automatically, so it is resolved unconditionally to false/empty before INPUT_OVERRIDE/INPUT_REASON are even inspected.
+          if [ "$EVENT_NAME" != "workflow_dispatch" ]; then
+            echo "override=false" >> "$GITHUB_OUTPUT"
+            echo "reason=" >> "$GITHUB_OUTPUT"
+            echo "OK: ${EVENT_NAME} event -- Terraform governance override is unconditionally false; break-glass requires an explicit manual workflow_dispatch action."
+            exit 0
+          fi
+
+          if [ "$INPUT_OVERRIDE" != "true" ] && [ "$INPUT_OVERRIDE" != "false" ]; then
+            echo "FAIL: terraform_governance_override resolved to '${INPUT_OVERRIDE}', expected literal 'true' or 'false'."
+            exit 1
+          fi
+
+          TRIMMED_REASON="$(echo "$INPUT_REASON" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+
+          if [ "$INPUT_OVERRIDE" = "true" ]; then
+            if [ -z "$TRIMMED_REASON" ]; then
+              echo "FAIL: terraform_governance_override=true requires a non-empty, non-whitespace terraform_governance_override_reason. Refusing to activate the corporate Terraform governance break-glass without a written justification."
+              exit 1
+            fi
+
+            echo "override=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "reason<<GG_TF_GOVERNANCE_REASON_EOF"
+              echo "$INPUT_REASON"
+              echo "GG_TF_GOVERNANCE_REASON_EOF"
+            } >> "$GITHUB_OUTPUT"
+            echo "Terraform governance override is ENABLED for this manual run -- the corporate reusable workflow will receive override_noncompliance=true with the supplied override_reason. This is not a bypass: non-compliance remains recorded, and manual approval itself cannot be overridden."
+          else
+            if [ -n "$TRIMMED_REASON" ]; then
+              echo "INFO: terraform_governance_override_reason was provided but terraform_governance_override is false -- the reason is ignored; normal corporate PR-governance behavior applies."
+            fi
+            echo "override=false" >> "$GITHUB_OUTPUT"
+            echo "reason=" >> "$GITHUB_OUTPUT"
+            echo "OK: Terraform governance override is disabled -- normal corporate PR-governance/Kosli attestation applies."
+          fi
+
+  eks_oidc_preflight:
+    name: Verify live EKS cluster + OIDC + Kubernetes API access (read-only)
+
+    # Read-only DescribeCluster + Kubernetes API connectivity preflight only -- never creates/modifies EKS, the IAM OIDC provider, or any AWS/Kubernetes resource. Skipped for deploy=false (a purely local/offline validation run) so an existing intentionally-offline dry-run path never starts requiring live AWS/Kubernetes access. This is the critical safety gate for cluster recreation: a recreated EKS cluster keeps the SAME name but gets a DIFFERENT OIDC issuer, and every generated IRSA trust policy in envs/<environment>/policies/** is only valid for the issuer envs/<environment>/environment.yaml declares -- so this must run, and must succeed, before Terraform (which owns applying those trust policies) or any deployment can proceed. MAIN prerequisite fail-fast hardening: this job also proves the pipeline can actually authenticate to and read from the live Kubernetes API -- not merely that EKS itself is ACTIVE -- since the first real kubectl connectivity previously happened much later, inside the Argo path, after Terraform and local deployment detection had already run. IAM OIDC-provider EXISTENCE is deliberately NOT checked here: Terraform continues to independently validate that (its own data source / fail-closed configuration) -- adding that check to this pre-Terraform preflight would require a new IAM permission on the same Terraform-managed role and create a bootstrap dependency on the first run of this change.
+    needs:
+      - validate_model
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' }}
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    permissions:
+      id-token: write
+      contents: read
+
+    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job -- not just "Load resolved environment config" -- can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail. This is the repository-wide invariant every non-matrix MAIN job that consumes the selected environment now follows.
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Load resolved environment config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials (build account)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
+
+      - name: DescribeCluster and verify against the selected environment's environment.yaml (read-only)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Same cross-account pattern as validate_shared_secrets_once/managed_efs_inventory_guard: assume EKS_DEPLOY_ROLE_ARN, verify the assumed identity's own account, and never let the unverified job-level credentials touch EKS. Confined to this step's subshells only -- never written to $GITHUB_ENV.
+          ASSUME_JSON="$(aws sts assume-role --role-arn "$EKS_DEPLOY_ROLE_ARN" --role-session-name "gg-eks-oidc-preflight-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --duration-seconds 900 --output json)"
+          PRE_TMP_KEY_ID="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["Credentials"]["AccessKeyId"])' <<< "$ASSUME_JSON")"
+          PRE_TMP_SECRET="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["Credentials"]["SecretAccessKey"])' <<< "$ASSUME_JSON")"
+          PRE_TMP_TOKEN="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["Credentials"]["SessionToken"])' <<< "$ASSUME_JSON")"
+          unset ASSUME_JSON
+          echo "::add-mask::${PRE_TMP_KEY_ID}"
+          echo "::add-mask::${PRE_TMP_SECRET}"
+          echo "::add-mask::${PRE_TMP_TOKEN}"
+
+          ACTUAL_ACCOUNT="$(AWS_ACCESS_KEY_ID="$PRE_TMP_KEY_ID" AWS_SECRET_ACCESS_KEY="$PRE_TMP_SECRET" AWS_SESSION_TOKEN="$PRE_TMP_TOKEN" aws sts get-caller-identity --query Account --output text --region "$AWS_REGION")"
+          if [ -z "$ACTUAL_ACCOUNT" ] || [ "$ACTUAL_ACCOUNT" != "$WORKLOAD_ACCOUNT_ID" ]; then
+            echo "FAIL: assumed role resolved to caller account '${ACTUAL_ACCOUNT}', expected the GoldenGate workload account ${WORKLOAD_ACCOUNT_ID}. Refusing to call DescribeCluster."
+            unset PRE_TMP_KEY_ID PRE_TMP_SECRET PRE_TMP_TOKEN
+            exit 1
+          fi
+
+          CLUSTER_JSON="$(AWS_ACCESS_KEY_ID="$PRE_TMP_KEY_ID" AWS_SECRET_ACCESS_KEY="$PRE_TMP_SECRET" AWS_SESSION_TOKEN="$PRE_TMP_TOKEN" aws eks describe-cluster --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION" --output json)"
+          unset PRE_TMP_KEY_ID PRE_TMP_SECRET PRE_TMP_TOKEN
+          export CLUSTER_JSON
+
+          python3 - "$EKS_CLUSTER_ARN" "$EKS_OIDC_ISSUER" "$GG_SELECTED_ENVIRONMENT" <<'PYEOF'
+          import json
+          import os
+          import sys
+
+          expected_arn, expected_oidc_issuer, selected_environment = sys.argv[1], sys.argv[2], sys.argv[3]
+          environment_yaml_path = f"envs/{selected_environment}/environment.yaml"
+          cluster = json.loads(os.environ["CLUSTER_JSON"])["cluster"]
+
+          problems = []
+          if cluster.get("status") != "ACTIVE":
+              problems.append(f"cluster status is {cluster.get('status')!r}, expected ACTIVE")
+          if cluster.get("arn") != expected_arn:
+              problems.append(f"live cluster ARN {cluster.get('arn')!r} does not match {environment_yaml_path}-derived ARN {expected_arn!r}")
+          live_oidc_issuer = cluster.get("identity", {}).get("oidc", {}).get("issuer")
+          if live_oidc_issuer != expected_oidc_issuer:
+              problems.append(
+                  "Configured EKS OIDC issuer does not match the live cluster. "
+                  f"Update {environment_yaml_path} to the current EKS issuer and regenerate IAM policies before deployment. "
+                  f"(live={live_oidc_issuer!r}, configured={expected_oidc_issuer!r})"
+              )
+
+          if problems:
+              for p in problems:
+                  print(f"FAIL: {p}")
+              sys.exit(1)
+          print(f"OK: live EKS cluster {cluster.get('name')!r} is ACTIVE, ARN and OIDC issuer match {environment_yaml_path}.")
+          PYEOF
+
+      - name: Install kubectl if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking/installing kubectl..."
+
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KUBECTL_VERSION="v1.35.0"
+
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64)
+                KUBECTL_ARCH="amd64"
+                ;;
+              aarch64|arm64)
+                KUBECTL_ARCH="arm64"
+                ;;
+              *)
+                echo "Unsupported architecture for kubectl: $ARCH"
+                exit 1
+                ;;
+            esac
+
+            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+            sudo chmod +x /usr/local/bin/kubectl
+          fi
+
+          kubectl version --client=true
+
+      - name: Connect to EKS cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}" \
+            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
+            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
+
+          echo "Current kube context:"
+          kubectl config current-context
+
+      - name: Verify read-only Kubernetes API access (no GoldenGate namespace dependency)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # kube-system is a built-in namespace guaranteed to exist on every EKS cluster -- unlike any GoldenGate-owned namespace, which may legitimately not exist yet ahead of a first application deployment. A single read-only `get` proves API connectivity plus sufficient authentication/authorization for the role this pipeline actually deploys with; no kubectl apply/create/patch/delete or any other mutation is ever issued from this preflight.
+          kubectl get namespace kube-system -o name
+
+  detect_changed_deployments:
+    name: Detect changed GoldenGate deployments
+
+    # MAIN prerequisite fail-fast hardening: for a real Deploy (effective_deploy=='true'), local deployment/storage detection must never run ahead of -- or in parallel with -- proof that the live EKS cluster and its Kubernetes API are actually reachable, since a downstream storage/Terraform mutation path must not do unnecessary work once that prerequisite has failed. eks_oidc_preflight is legitimately skipped in Validate/offline mode (effective_deploy=='false'), so a plain needs.eks_oidc_preflight.result == 'success' would incorrectly block local validation in that mode -- always() plus this explicit mode-aware branch is what keeps deploy=false fully offline while still fail-fasting a real Deploy on a failed/cancelled/unexpectedly-skipped EKS prerequisite.
+    needs:
+      - validate_model
+      - eks_oidc_preflight
+    if: ${{ always() && needs.validate_model.result == 'success' && (needs.validate_model.outputs.effective_deploy != 'true' || needs.eks_oidc_preflight.result == 'success') }}
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    outputs:
+      has_changes: ${{ steps.detect.outputs.has_changes }}
+      deployment_matrix: ${{ steps.detect.outputs.deployment_matrix }}
+      has_deletions: ${{ steps.detect.outputs.has_deletions }}
+      deletion_matrix: ${{ steps.detect.outputs.deletion_matrix }}
+      has_storage_transition_violations: ${{ steps.detect.outputs.has_storage_transition_violations }}
+      storage_transition_violations: ${{ steps.detect.outputs.storage_transition_violations }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify Python and PyYAML prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Deployment classification requires real YAML parsing (no regex/text fallback); fail closed if unavailable.
+          if ! command -v python3 >/dev/null 2>&1; then
+            echo "FAIL: python3 is required to classify GoldenGate deployment values files and is not available on this runner."
+            exit 1
+          fi
+
+          if ! python3 -c "import yaml" >/dev/null 2>&1; then
+            echo "FAIL: PyYAML is required to classify GoldenGate deployment values files and is not available on this runner."
+            exit 1
+          fi
+
+          echo "OK: python3 and PyYAML are available."
+
+      - name: Detect changed deployments
+        id: detect
+        shell: bash
+        env:
+          INPUT_ENVIRONMENT: ${{ inputs.environment }}
+          INPUT_DEPLOYMENT_ID: ${{ inputs.deployment_id }}
+          # Live Deploy UX Fix 2: the detector's existing --argjson deploy boolean contract is unchanged -- INPUT_DEPLOY is derived from validate_model's own already-computed effective_deploy (the single place action -> boolean is decided), never re-derived from inputs.action here (which no longer exists as a boolean, and would duplicate the lifecycle mapping).
+          INPUT_DEPLOY: ${{ needs.validate_model.outputs.effective_deploy }}
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # Implementation lives in hack/detect-goldengate-deployments.sh (keeps this run: block under GitHub's ~21,000 char limit); inputs arrive via env: above, never interpolated directly.
+          bash hack/detect-goldengate-deployments.sh
+
+  managed_efs_deletion_guard:
+    name: Guard against destroying a managed GoldenGate EFS filesystem
+
+    # /u02 is durable state: a managed EFS filesystem (persistence.efs.mode=managed) must never be destroyed merely because its deployment descriptor was physically deleted from Git, so this job inspects detect_changed_deployments' deletion_matrix (which carries the HISTORICAL efs_mode read from the deleted descriptor's last content) and fails the whole workflow closed before terraform_sync_once can run; no repository checkout or AWS access is needed since the matrix already carries everything this check requires.
+    needs:
+      - detect_changed_deployments
+    if: success()
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Fail closed if any deleted descriptor declared persistence.efs.mode=managed
+        shell: bash
+        env:
+          DELETION_MATRIX: ${{ needs.detect_changed_deployments.outputs.deletion_matrix }}
+        run: |
+          set -euo pipefail
+
+          echo "Deletion matrix: ${DELETION_MATRIX}"
+
+          MANAGED_DELETIONS="$(python3 -c '
+          import json, sys
+          items = json.loads(sys.argv[1])
+          managed = [i.get("deployment_id", "?") for i in items if i.get("efs_mode") == "managed" and i.get("reason") == "physical-removal"]
+          print("\n".join(managed))
+          ' "$DELETION_MATRIX")"
+
+          DEPLOYMENT_DISABLED_MANAGED="$(python3 -c '
+          import json, sys
+          items = json.loads(sys.argv[1])
+          managed = [i.get("deployment_id", "?") for i in items if i.get("efs_mode") == "managed" and i.get("reason") == "deployment-disabled"]
+          print("\n".join(managed))
+          ' "$DELETION_MATRIX")"
+
+          if [ -n "$DEPLOYMENT_DISABLED_MANAGED" ]; then
+            echo "ALLOWED (application decommission only, managed storage retained): the following managed-EFS deployment(s) transitioned to deployment.enabled=false this push -- their descriptor and dedicated EFS filesystem are retained; only application-level resources (Argo CD Application, runtime pod) are affected:"
+            echo "$DEPLOYMENT_DISABLED_MANAGED"
+          fi
+
+          if [ -n "$MANAGED_DELETIONS" ]; then
+            echo "FAIL: the following deployment descriptor(s) were physically deleted while persistence.efs.mode=managed:"
+            echo "$MANAGED_DELETIONS"
+            echo ""
+            echo "Managed GoldenGate EFS is durable storage. Physical deletion of the deployment descriptor is blocked. Set deployment.enabled=false first and use the controlled storage-decommission procedure before removing the descriptor."
+            exit 1
+          fi
+
+          echo "OK: no deleted descriptor declared persistence.efs.mode=managed. Terraform sync may proceed."
+
+  storage_transition_guard:
+    name: Guard against unsafe persistence.efs storage-identity transitions
+
+    # A changed-but-still-present descriptor can silently repoint a runtime's StorageClass at a different filesystem (managed<->existing, a mutated existing fileSystemId) or stop declaring EFS at all (managed->disabled/non-EFS) -- each of these is a storage MIGRATION, not an ordinary config edit, and none of them are safe to let reach Terraform/Helm/Argo without an explicit, separate decommission process. This job fails the whole workflow closed before terraform_sync_once can run; no repository checkout or AWS access is needed since detect_changed_deployments already computed the violation list from historical vs current descriptor content.
+    needs:
+      - detect_changed_deployments
+    if: success()
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Fail closed if any changed descriptor made an unsafe storage-identity transition
+        shell: bash
+        env:
+          TRANSITION_VIOLATIONS: ${{ needs.detect_changed_deployments.outputs.storage_transition_violations }}
+        run: |
+          set -euo pipefail
+
+          echo "Storage transition violations: ${TRANSITION_VIOLATIONS}"
+
+          VIOLATION_COUNT="$(python3 -c 'import json, sys; print(len(json.loads(sys.argv[1])))' "$TRANSITION_VIOLATIONS")"
+
+          if [ "$VIOLATION_COUNT" -ne 0 ]; then
+            echo "FAIL: one or more changed deployment descriptors made an unsafe persistence.efs storage-identity transition:"
+            python3 -c '
+          import json, sys
+          for item in json.loads(sys.argv[1]):
+              dep_id, violation = item.get("deployment_id", "?"), item.get("violation", "?")
+              print(f"  {dep_id}: {violation}")
+          ' "$TRANSITION_VIOLATIONS"
+            echo ""
+            echo "managed<->existing, managed->persistence-disabled, managed->non-EFS-provider, and a mutated existing fileSystemId are storage migrations, not ordinary deployment updates. They require a separate, explicit migration/decommission process -- revert the persistence.efs change in this push before it can proceed."
+            exit 1
+          fi
+
+          echo "OK: no unsafe storage-identity transition detected. Terraform sync may proceed."
+
+  managed_efs_inventory_guard:
+    name: Guard against orphaned AWS-side managed GoldenGate EFS filesystems (read-only)
+
+    # Persistent safety net beyond the Git-diff-only guards above: if a managed descriptor's physical removal or an unsafe storage-mode transition somehow still reaches this point on a later, unrelated commit (where the change is no longer visible in that commit's own diff), this job independently re-derives the CURRENT expected managed-EFS inventory from the deployment model and compares it against what AWS actually has tagged as GoldenGate-managed in this environment, failing closed on any orphan (or creation-token collision) before terraform_sync_once can observe (and potentially destroy) it. Strictly read-only: a single DescribeFileSystems call only (its FileSystemDescription already carries CreationToken/LifeCycleState/Tags, so list-tags-for-resource is never called), never create/update/delete.
+    needs:
+      - validate_model
+      - eks_oidc_preflight
+      - detect_changed_deployments
+      - managed_efs_deletion_guard
+      - storage_transition_guard
+    # MAIN prerequisite fail-fast hardening: eks_oidc_preflight is now a direct, explicitly-checked dependency (not merely relied on transitively via detect_changed_deployments) -- the live EKS/OIDC/Kubernetes-API prerequisite is the entry gate to every real-Deploy AWS-side check, this one included.
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.eks_oidc_preflight.result == 'success' && needs.detect_changed_deployments.result == 'success' && needs.managed_efs_deletion_guard.result == 'success' && needs.storage_transition_guard.result == 'success' }}
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    # Live Deployment Approval Topology Fix: no job-level environment: here -- this job is strictly read-only (a single DescribeFileSystems call, never create/update/delete) and is already covered end-to-end by the single goldengate_deploy_authorization approval upstream of it in the DAG; JOB-LEVEL (not step-level) so every run: step in this job -- including "Compute expected managed-EFS inventory from the deployment model" and "Compare expected vs actual managed-EFS inventory", the exact two steps the real VDR run hit -- can still safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail.
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Load resolved environment config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
+
+      - name: Compute expected managed-EFS inventory from the deployment model
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
+          python3 hack/goldengate-deployment-model.py --environment "${GG_SELECTED_ENVIRONMENT}" managed-efs-inventory > expected-managed-efs.json
+          echo "Expected managed-EFS inventory (includes deployment.enabled=false descriptors on purpose -- their EFS is retained, not decommissioned):"
+          cat expected-managed-efs.json
+
+      - name: Read the actual AWS-side GoldenGate-managed EFS inventory (read-only)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EXPECTED_WORKLOAD_ACCOUNT_ID="$(echo "$EKS_DEPLOY_ROLE_ARN" | sed -nE 's#^arn:aws:iam::([0-9]{12}):role/.*$#\1#p')"
+          if [ -z "$EXPECTED_WORKLOAD_ACCOUNT_ID" ]; then
+            echo "FAIL: could not extract a 12-digit account ID from EKS_DEPLOY_ROLE_ARN; refusing to read the managed-EFS inventory without a provable expected workload account."
+            exit 1
+          fi
+
+          echo "Assuming ${EKS_DEPLOY_ROLE_ARN} for a read-only elasticfilesystem:DescribeFileSystems inventory scan (a single call -- FileSystemDescription already carries CreationToken/LifeCycleState/Tags, so no separate list-tags-for-resource call is made; this role is never granted EFS create/update/delete permissions, and the runtime deployment role is never extended for this guard either)..."
+
+          ASSUME_JSON="$(aws sts assume-role --role-arn "$EKS_DEPLOY_ROLE_ARN" --role-session-name "gg-efs-inventory-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --duration-seconds 900 --output json)"
+          INV_TMP_KEY_ID="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["Credentials"]["AccessKeyId"])' <<< "$ASSUME_JSON")"
+          INV_TMP_SECRET="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["Credentials"]["SecretAccessKey"])' <<< "$ASSUME_JSON")"
+          INV_TMP_TOKEN="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["Credentials"]["SessionToken"])' <<< "$ASSUME_JSON")"
+          unset ASSUME_JSON
+          echo "::add-mask::${INV_TMP_KEY_ID}"
+          echo "::add-mask::${INV_TMP_SECRET}"
+          echo "::add-mask::${INV_TMP_TOKEN}"
+
+          # Confined to this one step's subshells only -- never written to $GITHUB_ENV, so the job-level build-account credentials are untouched once this step ends.
+          ACTUAL_ACCOUNT="$(AWS_ACCESS_KEY_ID="$INV_TMP_KEY_ID" AWS_SECRET_ACCESS_KEY="$INV_TMP_SECRET" AWS_SESSION_TOKEN="$INV_TMP_TOKEN" aws sts get-caller-identity --query Account --output text --region "$AWS_REGION")"
+          if [ "$ACTUAL_ACCOUNT" != "$EXPECTED_WORKLOAD_ACCOUNT_ID" ]; then
+            echo "FAIL: assumed role resolved to account ${ACTUAL_ACCOUNT}, expected the GoldenGate workload account ${EXPECTED_WORKLOAD_ACCOUNT_ID}."
+            unset INV_TMP_KEY_ID INV_TMP_SECRET INV_TMP_TOKEN
+            exit 1
+          fi
+
+          # The sanitizer script is written to a temp file first (never fed to python3's own stdin) specifically so stdin stays free for the streamed AWS response below -- `python3 - <<EOF` would consume the heredoc as the script itself, leaving no way to also pipe runtime data into the same process.
+          EFS_SANITIZER_SCRIPT="$(mktemp)"
+          cat > "$EFS_SANITIZER_SCRIPT" <<'PYEOF'
+          import json, sys
+
+          ALLOWED_TAG_KEYS = ("ManagedBy", "GoldenGateDeploymentId", "GoldenGateEnvironment", "GoldenGateStorage")
+
+          data = json.load(sys.stdin)
+          sanitized = []
+          for fs in data.get("FileSystems", []):
+              tags = [{"Key": t.get("Key"), "Value": t.get("Value")} for t in fs.get("Tags", []) if t.get("Key") in ALLOWED_TAG_KEYS]
+              sanitized.append({
+                  "FileSystemId": fs.get("FileSystemId"),
+                  "CreationToken": fs.get("CreationToken"),
+                  "LifeCycleState": fs.get("LifeCycleState"),
+                  "Tags": tags,
+              })
+          print(json.dumps(sanitized))
+          PYEOF
+
+          # Streamed directly from the AWS CLI into the sanitizer's stdin -- the complete account-wide DescribeFileSystems response is never captured into a shell variable or passed as a Python argv argument (which would otherwise transiently hold every filesystem's full raw metadata, unrelated tags included, in process argv/shell memory). set -o pipefail (part of set -euo pipefail above) still fails this step closed if the aws call itself fails.
+          AWS_ACCESS_KEY_ID="$INV_TMP_KEY_ID" AWS_SECRET_ACCESS_KEY="$INV_TMP_SECRET" AWS_SESSION_TOKEN="$INV_TMP_TOKEN" aws efs describe-file-systems --region "$AWS_REGION" --output json | python3 "$EFS_SANITIZER_SCRIPT" > actual-managed-efs.json
+
+          rm -f "$EFS_SANITIZER_SCRIPT"
+          unset INV_TMP_KEY_ID INV_TMP_SECRET INV_TMP_TOKEN
+
+          IN_SCOPE_COUNT="$(python3 -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          count = sum(1 for fs in data if any(t.get("Key") == "ManagedBy" and t.get("Value") == "goldengate-eks-app" for t in fs.get("Tags", [])))
+          print(count)
+          ' < actual-managed-efs.json)"
+          echo "Actual AWS-side EFS scan (region ${AWS_REGION}): ${IN_SCOPE_COUNT} GoldenGate-managed-tagged filesystem(s) found in scope. Unrelated EFS filesystems and any non-GoldenGate tags are never logged."
+
+      - name: Compare expected vs actual managed-EFS inventory (fail closed on any orphan)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-managed-efs-inventory-guard.py "${GG_SELECTED_ENVIRONMENT}" expected-managed-efs.json actual-managed-efs.json
+
+  phase_contract:
+    name: "Phase 1 contract"
+
+    # Reproduces the Phase 1 slice of MAIN final_validation's mode-aware require_success/allow_non_failure contract -- if: always() so a reusable workflow never accidentally reports success merely because every internal job was cleanly skipped. Also the single relay point exposing this phase's canonical outputs to later phases (never re-derived independently downstream).
+    needs:
+      - validate_model
+      - eks_oidc_preflight
+      - detect_changed_deployments
+      - managed_efs_deletion_guard
+      - storage_transition_guard
+      - managed_efs_inventory_guard
+    if: always()
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    outputs:
+      selected_environment: ${{ steps.contract.outputs.selected_environment }}
+      effective_deploy: ${{ steps.contract.outputs.effective_deploy }}
+      has_active_deployments: ${{ steps.contract.outputs.has_active_deployments }}
+      active_runtime_matrix: ${{ steps.contract.outputs.active_runtime_matrix }}
+      terraform_governance_override: ${{ steps.contract.outputs.terraform_governance_override }}
+      terraform_governance_override_reason: ${{ steps.contract.outputs.terraform_governance_override_reason }}
+      has_changes: ${{ steps.contract.outputs.has_changes }}
+      deployment_matrix: ${{ steps.contract.outputs.deployment_matrix }}
+      has_deletions: ${{ steps.contract.outputs.has_deletions }}
+      deletion_matrix: ${{ steps.contract.outputs.deletion_matrix }}
+
+    steps:
+      - name: Validate the mode-aware Phase 1 success contract and relay outputs
+        id: contract
+        shell: bash
+        env:
+          EFFECTIVE_DEPLOY: ${{ needs.validate_model.outputs.effective_deploy }}
+          RESULT_validate_model: ${{ needs.validate_model.result }}
+          RESULT_eks_oidc_preflight: ${{ needs.eks_oidc_preflight.result }}
+          RESULT_detect_changed_deployments: ${{ needs.detect_changed_deployments.result }}
+          RESULT_managed_efs_deletion_guard: ${{ needs.managed_efs_deletion_guard.result }}
+          RESULT_storage_transition_guard: ${{ needs.storage_transition_guard.result }}
+          RESULT_managed_efs_inventory_guard: ${{ needs.managed_efs_inventory_guard.result }}
+          OUT_selected_environment: ${{ needs.validate_model.outputs.selected_environment }}
+          OUT_has_active_deployments: ${{ needs.validate_model.outputs.has_active_deployments }}
+          OUT_active_runtime_matrix: ${{ needs.validate_model.outputs.active_runtime_matrix }}
+          OUT_terraform_governance_override: ${{ needs.validate_model.outputs.terraform_governance_override }}
+          OUT_terraform_governance_override_reason: ${{ needs.validate_model.outputs.terraform_governance_override_reason }}
+          OUT_has_changes: ${{ needs.detect_changed_deployments.outputs.has_changes }}
+          OUT_deployment_matrix: ${{ needs.detect_changed_deployments.outputs.deployment_matrix }}
+          OUT_has_deletions: ${{ needs.detect_changed_deployments.outputs.has_deletions }}
+          OUT_deletion_matrix: ${{ needs.detect_changed_deployments.outputs.deletion_matrix }}
+        run: |
+          set -euo pipefail
+
+          echo "Resolved mode: effective_deploy=${EFFECTIVE_DEPLOY}"
+
+          if [ "$EFFECTIVE_DEPLOY" != "true" ] && [ "$EFFECTIVE_DEPLOY" != "false" ]; then
+            echo "FAIL: validate_model.outputs.effective_deploy is '${EFFECTIVE_DEPLOY}', expected literal 'true' or 'false' -- validate_model itself did not produce a usable outcome."
+            exit 1
+          fi
+
+          FAILED="false"
+
+          require_success() {
+            local job_name="$1"
+            local result_var="RESULT_${job_name}"
+            local result="${!result_var}"
+            if [ "$result" != "success" ]; then
+              echo "FAIL: required job '${job_name}' has result '${result}', expected 'success'."
+              FAILED="true"
+            else
+              echo "OK: required job '${job_name}' succeeded."
+            fi
+          }
+
+          allow_non_failure() {
+            local job_name="$1"
+            local result_var="RESULT_${job_name}"
+            local result="${!result_var}"
+            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+              echo "FAIL: job '${job_name}' has result '${result}' -- not required in this mode, but a real failure/cancellation still blocks Phase 1."
+              FAILED="true"
+            else
+              echo "OK: job '${job_name}' result '${result}' is acceptable in this mode."
+            fi
+          }
+
+          require_success validate_model
+          require_success detect_changed_deployments
+          require_success managed_efs_deletion_guard
+          require_success storage_transition_guard
+
+          if [ "$EFFECTIVE_DEPLOY" = "true" ]; then
+            require_success eks_oidc_preflight
+            require_success managed_efs_inventory_guard
+          else
+            allow_non_failure eks_oidc_preflight
+            allow_non_failure managed_efs_inventory_guard
+          fi
+
+          if [ "$FAILED" = "true" ]; then
+            echo ""
+            echo "FAIL: Phase 1 | Environment Readiness & Safety did not complete successfully."
+            exit 1
+          fi
+
+          echo ""
+          echo "OK: Phase 1 | Environment Readiness & Safety succeeded."
+
+          {
+            echo "selected_environment=${OUT_selected_environment}"
+            echo "effective_deploy=${EFFECTIVE_DEPLOY}"
+            echo "has_active_deployments=${OUT_has_active_deployments}"
+            echo "active_runtime_matrix=${OUT_active_runtime_matrix}"
+            echo "terraform_governance_override=${OUT_terraform_governance_override}"
+            echo "has_changes=${OUT_has_changes}"
+            echo "deployment_matrix=${OUT_deployment_matrix}"
+            echo "has_deletions=${OUT_has_deletions}"
+            echo "deletion_matrix=${OUT_deletion_matrix}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "terraform_governance_override_reason<<GG_PHASE1_REASON_EOF"
+            echo "${OUT_terraform_governance_override_reason}"
+            echo "GG_PHASE1_REASON_EOF"
+          } >> "$GITHUB_OUTPUT"

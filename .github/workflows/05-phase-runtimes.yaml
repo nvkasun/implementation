@@ -1,0 +1,2422 @@
+name: "05 | PHASE | GoldenGate Runtime Deployment"
+
+# Called exclusively by 00-main-goldengate-orchestrator.yaml -- workflow_call only. The runtime matrix (PostgreSQL/MSSQL, and any future folder-driven runtime) remains a single matrix inside this one phase -- never merged into one runtime, never split into per-runtime phase files.
+on:
+  workflow_call:
+    inputs:
+      selected_environment:
+        required: true
+        type: string
+      effective_deploy:
+        required: true
+        type: string
+      has_active_deployments:
+        required: true
+        type: string
+      active_runtime_matrix:
+        required: true
+        type: string
+      has_changes:
+        required: true
+        type: string
+      deployment_matrix:
+        required: true
+        type: string
+      has_deletions:
+        required: true
+        type: string
+      deletion_matrix:
+        required: true
+        type: string
+    outputs:
+      selected_environment:
+        value: ${{ jobs.phase_contract.outputs.selected_environment }}
+      effective_deploy:
+        value: ${{ jobs.phase_contract.outputs.effective_deploy }}
+      has_active_deployments:
+        value: ${{ jobs.phase_contract.outputs.has_active_deployments }}
+
+permissions:
+  id-token: write
+  contents: read
+
+# Environment identity is loaded per-job via hack/goldengate-environment.py github-env after checkout (GITHUB_ENV is job-local), never duplicated here. Only build_publish_and_deploy in this phase consumes these Helm/OCI constants.
+env:
+  HELM_OCI_NAMESPACE: helm
+  CHART_NAME: goldengate
+  HELM_CHART_PATH: helm/goldengate
+  ENVS_ROOT: envs
+
+jobs:
+  runtime_ownership_preflight:
+    name: Classify GoldenGate runtime ownership safety (read-only, per selected deployment)
+
+    # Phase B3A: read-only pre-reconciliation ownership-safety classifier for the deployment(s) THIS RUN is about to reconcile -- ABSENT (safe to create) / OWNED (safe to reconcile, even if currently unhealthy/out of date) / BROKEN (ownership/collision conflict, fail closed). This is deliberately NOT a HEALTHY-skip prerequisite: a GoldenGate runtime is an actual desired deployment target whose descriptor/image/chart may intentionally change on every run, so OWNED (not HEALTHY) is the "proceed" state here. This job never mutates the cluster -- it only runs hack/orchestration/runtime_state.py, which itself issues read-only `kubectl get` calls.
+    if: ${{ inputs.effective_deploy == 'true' && inputs.has_changes == 'true' }}
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    # Live Deployment Approval Topology Fix: no job-level environment: here (and deliberately not per-matrix-entry either) -- this job is read-only ownership classification, never a mutation, and a future multi-runtime matrix must never generate one approval per runtime; it is already covered end-to-end by the single goldengate_deploy_authorization approval upstream of it in the DAG.
+    strategy:
+      # Same sequential/fail-fast safety posture as the runtime rollout it gates: an ownership conflict on one deployment must not be masked by a concurrently-evaluated sibling.
+      fail-fast: true
+      max-parallel: 1
+      matrix:
+        include: ${{ fromJson(inputs.deployment_matrix) }}
+
+    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail -- matrix jobs draw the selected environment from their own matrix entry, never needs.validate_model.outputs.selected_environment.
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ matrix.environment }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Load resolved environment config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
+
+      - name: Install kubectl if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking/installing kubectl..."
+
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KUBECTL_VERSION="v1.35.0"
+
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64)
+                KUBECTL_ARCH="amd64"
+                ;;
+              aarch64|arm64)
+                KUBECTL_ARCH="arm64"
+                ;;
+              *)
+                echo "Unsupported architecture for kubectl: $ARCH"
+                exit 1
+                ;;
+            esac
+
+            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+            sudo chmod +x /usr/local/bin/kubectl
+          fi
+
+          kubectl version --client=true
+
+      - name: Connect to EKS cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}" \
+            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
+            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
+
+          echo "Current kube context:"
+          kubectl config current-context
+
+      - name: Classify runtime ownership safety
+        id: classify
+        shell: bash
+        env:
+          GG_DEPLOYMENT_ID: ${{ matrix.deployment_id }}
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
+
+          # A non-zero exit here is either a configuration error (invalid/unknown deployment ID) or a classifier inspection error (API unreachable, permission denied, malformed JSON) -- never treated as ABSENT.
+          if ! CLASSIFIER_OUTPUT="$(python3 hack/orchestration/runtime_state.py --environment "${GG_SELECTED_ENVIRONMENT}" --deployment-id "${GG_DEPLOYMENT_ID}")"; then
+            echo "FAIL: the GoldenGate runtime ownership classifier could not classify ${GG_DEPLOYMENT_ID} (configuration or inspection error, not ABSENT) -- see diagnostics above."
+            exit 1
+          fi
+
+          echo "$CLASSIFIER_OUTPUT"
+
+          STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
+          echo "GoldenGate runtime ownership-safety state for ${GG_DEPLOYMENT_ID}: ${STATE}"
+          echo "state=${STATE}" >> "$GITHUB_OUTPUT"
+
+          if [ "$STATE" = "BROKEN" ]; then
+            echo "FAIL: GoldenGate runtime ownership-safety state for ${GG_DEPLOYMENT_ID} is BROKEN -- an existing footprint does not clearly belong to this deployment. This is not auto-repaired here -- investigate the diagnostics above before re-running."
+            exit 1
+          fi
+
+  build_publish_and_deploy:
+    name: Build, publish, and deploy GoldenGate Helm chart via Argo CD
+
+    needs:
+      - runtime_ownership_preflight
+    # Phase 1/4's own success (detect_changed_deployments/validate_shared_secrets_once) is already guaranteed transitively -- MAIN only calls Phase 5 after Phase 1-4 succeed. Phase B3A: the live runtime_ownership_preflight is required ONLY on a real deploy (it never even runs on deploy=false, since its own if: is effective_deploy-gated) -- the `effective_deploy != 'true' || runtime_ownership_preflight.result == 'success'` clause below is what keeps the existing offline Helm lint/render dry-run path completely unaffected by it, while a real deploy is blocked whenever ownership safety was not confirmed ABSENT/OWNED.
+    if: ${{ always() && inputs.has_changes == 'true' && (inputs.effective_deploy != 'true' || needs.runtime_ownership_preflight.result == 'success') }}
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    # Live Deployment Approval Topology Fix: no job-level environment: here (and deliberately not per-matrix-entry either) -- this is the direct MAIN runtime deployment job, and a real rollout of N selected runtimes must never generate N approvals; the whole rollout is already authorized end-to-end by the single goldengate_deploy_authorization approval upstream of it in the DAG, fixed now (not deferred to a future runtime-activation phase).
+    strategy:
+      # Sequential rollout: an existing-runtime migration failure must block the next queued migration; max-parallel alone is not sufficient.
+      fail-fast: true
+      max-parallel: 1
+      matrix:
+        include: ${{ fromJson(inputs.deployment_matrix) }}
+
+    concurrency:
+      group: goldengate-helm-deploy-${{ github.ref }}-${{ matrix.environment }}-${{ matrix.deployment_id }}
+      cancel-in-progress: false
+
+    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail -- matrix jobs draw the selected environment from their own matrix entry, never needs.validate_model.outputs.selected_environment.
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ matrix.environment }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Load resolved environment config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
+
+      - name: Install Helm and kubectl if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking/installing Helm..."
+
+          if ! command -v helm >/dev/null 2>&1; then
+            HELM_VERSION="v3.15.4"
+
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64)
+                HELM_ARCH="amd64"
+                ;;
+              aarch64|arm64)
+                HELM_ARCH="arm64"
+                ;;
+              *)
+                echo "Unsupported architecture for Helm: $ARCH"
+                exit 1
+                ;;
+            esac
+
+            curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-${HELM_ARCH}.tar.gz" -o /tmp/helm.tar.gz
+            tar -zxvf /tmp/helm.tar.gz -C /tmp
+            sudo mv "/tmp/linux-${HELM_ARCH}/helm" /usr/local/bin/helm
+            sudo chmod +x /usr/local/bin/helm
+          fi
+
+          helm version --short
+
+          echo "Checking/installing kubectl..."
+
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KUBECTL_VERSION="v1.35.0"
+
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64)
+                KUBECTL_ARCH="amd64"
+                ;;
+              aarch64|arm64)
+                KUBECTL_ARCH="arm64"
+                ;;
+              *)
+                echo "Unsupported architecture for kubectl: $ARCH"
+                exit 1
+                ;;
+            esac
+
+            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+            sudo chmod +x /usr/local/bin/kubectl
+          fi
+
+          kubectl version --client=true
+
+      - name: Verify runner tools and AWS identity
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking AWS identity..."
+          aws sts get-caller-identity
+
+          echo "Checking required tools..."
+          aws --version
+          helm version --short
+          kubectl version --client=true
+
+          echo "Resolved environment identity summary:"
+          echo "AWS_REGION=${AWS_REGION}"
+          echo "ECR_ACCOUNT_ID=${ECR_ACCOUNT_ID}"
+          echo "ECR_REGISTRY=${ECR_REGISTRY}"
+          echo "WORKLOAD_ACCOUNT_ID=${WORKLOAD_ACCOUNT_ID}"
+          echo "EKS_CLUSTER_NAME=${EKS_CLUSTER_NAME}"
+          echo "EKS_CLUSTER_ARN=${EKS_CLUSTER_ARN}"
+
+      - name: Prepare deployment variables
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ENVIRONMENT="${{ matrix.environment }}"
+          DEPLOYMENT_ID="${{ matrix.deployment_id }}"
+
+          if [[ ! "$DEPLOYMENT_ID" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
+            echo "Invalid deployment_id: $DEPLOYMENT_ID"
+            echo "Use lowercase letters, numbers, and hyphens only."
+            echo "Example: gg-oracle-payments-01"
+            exit 1
+          fi
+
+          VALUES_FILE="${ENVS_ROOT}/${ENVIRONMENT}/${DEPLOYMENT_ID}/values.yaml"
+
+          # deploymentModel comes straight from the validated active matrix (never inferred/defaulted); any other value reaching here is an upstream bug.
+          DEPLOYMENT_MODEL="${{ matrix.deployment_model }}"
+
+          if [ "$DEPLOYMENT_MODEL" != "singleRuntime" ]; then
+            echo "FAIL: matrix.deployment_model is '${DEPLOYMENT_MODEL}', expected exactly 'singleRuntime'."
+            echo "The active build/deploy path only ever supports deploymentModel=singleRuntime -- legacyPair is retired and is never deployed by this job. This indicates the upstream active matrix admitted an unexpected value; refusing to guess or default."
+            exit 1
+          fi
+
+          echo "deploymentModel: ${DEPLOYMENT_MODEL} (from the validated active matrix, deployment_id=${DEPLOYMENT_ID})"
+
+          # RUNTIME_NAMESPACE is already loaded (canonical, from envs/${ENVIRONMENT}/environment.yaml) by the "Load resolved environment config" step above -- never reconstructed here.
+          TARGET_NAMESPACE="${RUNTIME_NAMESPACE}"
+          RELEASE_NAME="${DEPLOYMENT_ID}"
+          # Strip leading "gg-" for the Argo CD Application name suffix, e.g. gg-oracle-payments-01 -> goldengate-dev-oracle-payments-01.
+          APP_SUFFIX="${DEPLOYMENT_ID#gg-}"
+          ARGOCD_APP_NAME="goldengate-${ENVIRONMENT}-${APP_SUFFIX}"
+
+          TEMP_CHART_PATH="work/charts/${DEPLOYMENT_ID}/goldengate"
+
+          echo "DEPLOYMENT_MODEL=${DEPLOYMENT_MODEL}" >> "$GITHUB_ENV"
+          echo "deployment_model=${DEPLOYMENT_MODEL}" >> "$GITHUB_OUTPUT"
+
+          if [ ${#TARGET_NAMESPACE} -gt 63 ]; then
+            echo "Namespace is too long: $TARGET_NAMESPACE"
+            echo "Kubernetes namespace names must be 63 characters or less."
+            echo "Please shorten deployment_id."
+            exit 1
+          fi
+
+          if [ ${#RELEASE_NAME} -gt 53 ]; then
+            echo "Helm release name is too long: $RELEASE_NAME"
+            echo "Please shorten deployment_id because resource names add suffixes."
+            exit 1
+          fi
+
+          # Includes deployment_id because matrix jobs share the same run_number and would otherwise collide.
+          CHART_VERSION="0.1.${{ github.run_number }}-${DEPLOYMENT_ID}"
+          HELM_ECR_REPOSITORY="${HELM_OCI_NAMESPACE}/${CHART_NAME}"
+          HELM_PUSH_URL="oci://${ECR_REGISTRY}/${HELM_OCI_NAMESPACE}"
+          HELM_CHART_REF="oci://${ECR_REGISTRY}/${HELM_ECR_REPOSITORY}"
+
+          echo "ENVIRONMENT=${ENVIRONMENT}" >> "$GITHUB_ENV"
+          echo "DEPLOYMENT_ID=${DEPLOYMENT_ID}" >> "$GITHUB_ENV"
+          echo "TARGET_NAMESPACE=${TARGET_NAMESPACE}" >> "$GITHUB_ENV"
+          echo "RELEASE_NAME=${RELEASE_NAME}" >> "$GITHUB_ENV"
+          echo "VALUES_FILE=${VALUES_FILE}" >> "$GITHUB_ENV"
+          echo "TEMP_CHART_PATH=${TEMP_CHART_PATH}" >> "$GITHUB_ENV"
+          echo "ARGOCD_APP_NAME=${ARGOCD_APP_NAME}" >> "$GITHUB_ENV"
+          echo "CHART_VERSION=${CHART_VERSION}" >> "$GITHUB_ENV"
+          echo "HELM_ECR_REPOSITORY=${HELM_ECR_REPOSITORY}" >> "$GITHUB_ENV"
+          echo "HELM_PUSH_URL=${HELM_PUSH_URL}" >> "$GITHUB_ENV"
+          echo "HELM_CHART_REF=${HELM_CHART_REF}" >> "$GITHUB_ENV"
+
+          echo "environment=${ENVIRONMENT}" >> "$GITHUB_OUTPUT"
+          echo "deployment_id=${DEPLOYMENT_ID}" >> "$GITHUB_OUTPUT"
+          echo "target_namespace=${TARGET_NAMESPACE}" >> "$GITHUB_OUTPUT"
+          echo "release_name=${RELEASE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "values_file=${VALUES_FILE}" >> "$GITHUB_OUTPUT"
+          echo "chart_version=${CHART_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "helm_chart_ref=${HELM_CHART_REF}" >> "$GITHUB_OUTPUT"
+          echo "argocd_app_name=${ARGOCD_APP_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve deployment identity via the deployment model
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
+
+          # Single describe call, positional deployment_id (the CLI takes no --deployment-id flag). Every
+          # identity below is resolved once here and injected as an exact Helm/Argo CD value override, the
+          # single source of truth also used by the monitor registry and Terraform/IAM -- never re-derived.
+          DESCRIBE_JSON="$(python3 hack/goldengate-deployment-model.py --environment "$ENVIRONMENT" describe "$DEPLOYMENT_ID")"
+
+          RESOLVED_ADMIN_SECRET_NAME="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["adminSecretName"])' <<< "$DESCRIBE_JSON")"
+          RESOLVED_TLS_SECRET_NAME="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["tlsSecretName"])' <<< "$DESCRIBE_JSON")"
+          RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["runtimeServiceAccountName"])' <<< "$DESCRIBE_JSON")"
+          IMAGE_REPOSITORY="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["imageRepository"])' <<< "$DESCRIBE_JSON")"
+          IMAGE_TAG="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["imageTag"])' <<< "$DESCRIBE_JSON")"
+
+          # EFS storage identity (Phase 6D1 EFS correction); efsMode is null/absent, empty here, when persistence.efs is not in use for this deployment.
+          EFS_MODE="$(python3 -c 'import json, sys; print(json.load(sys.stdin).get("efsMode") or "")' <<< "$DESCRIBE_JSON")"
+          EFS_FILE_SYSTEM_ID_DECLARED="$(python3 -c 'import json, sys; print(json.load(sys.stdin).get("efsFileSystemId") or "")' <<< "$DESCRIBE_JSON")"
+          EFS_CREATION_TOKEN="$(python3 -c 'import json, sys; print(json.load(sys.stdin).get("efsCreationToken") or "")' <<< "$DESCRIBE_JSON")"
+
+          # Fresh-EKS Phase A/Phase 9: shared ingress identity, removed from runtime descriptors, resolved once from the canonical environment config -- the single source of truth also used by Terraform/IAM, never re-derived or hand-maintained per deployment.
+          RESOLVED_DNS_DOMAIN="$(python3 hack/goldengate-environment.py --environment "$ENVIRONMENT" get DNS_DOMAIN)"
+          RESOLVED_ALB_GROUP_NAME="$(python3 hack/goldengate-environment.py --environment "$ENVIRONMENT" get ALB_GROUP_NAME)"
+          RESOLVED_CERTIFICATE_ARN="$(python3 hack/goldengate-environment.py --environment "$ENVIRONMENT" get ACM_CERTIFICATE_ARN)"
+
+          if [ -z "$RESOLVED_ADMIN_SECRET_NAME" ] || [ -z "$RESOLVED_TLS_SECRET_NAME" ] || [ -z "$RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME" ]; then
+            echo "FAIL: could not resolve deployment identity for ${DEPLOYMENT_ID}."
+            exit 1
+          fi
+
+          if [ -z "$RESOLVED_DNS_DOMAIN" ] || [ -z "$RESOLVED_ALB_GROUP_NAME" ] || [ -z "$RESOLVED_CERTIFICATE_ARN" ]; then
+            echo "FAIL: could not resolve shared ingress identity (DNS_DOMAIN/ALB_GROUP_NAME/ACM_CERTIFICATE_ARN) from envs/${ENVIRONMENT}/environment.yaml."
+            exit 1
+          fi
+
+          echo "Resolved admin secret: ${RESOLVED_ADMIN_SECRET_NAME}"
+          echo "Resolved TLS secret: ${RESOLVED_TLS_SECRET_NAME}"
+          echo "Resolved ServiceAccount: ${RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME}"
+          echo "Resolved image repository: ${IMAGE_REPOSITORY}"
+          echo "Resolved ingress hostDomain: ${RESOLVED_DNS_DOMAIN}"
+          echo "Resolved ALB group: ${RESOLVED_ALB_GROUP_NAME}"
+          echo "Resolved persistence.efs.mode: ${EFS_MODE:-<not in use>}"
+          echo "RESOLVED_ADMIN_SECRET_NAME=${RESOLVED_ADMIN_SECRET_NAME}" >> "$GITHUB_ENV"
+          echo "RESOLVED_TLS_SECRET_NAME=${RESOLVED_TLS_SECRET_NAME}" >> "$GITHUB_ENV"
+          echo "RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME=${RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME}" >> "$GITHUB_ENV"
+          echo "IMAGE_REPOSITORY=${IMAGE_REPOSITORY}" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> "$GITHUB_ENV"
+          echo "RESOLVED_DNS_DOMAIN=${RESOLVED_DNS_DOMAIN}" >> "$GITHUB_ENV"
+          echo "RESOLVED_ALB_GROUP_NAME=${RESOLVED_ALB_GROUP_NAME}" >> "$GITHUB_ENV"
+          echo "RESOLVED_CERTIFICATE_ARN=${RESOLVED_CERTIFICATE_ARN}" >> "$GITHUB_ENV"
+          echo "EFS_MODE=${EFS_MODE}" >> "$GITHUB_ENV"
+          echo "EFS_FILE_SYSTEM_ID_DECLARED=${EFS_FILE_SYSTEM_ID_DECLARED}" >> "$GITHUB_ENV"
+          echo "EFS_CREATION_TOKEN=${EFS_CREATION_TOKEN}" >> "$GITHUB_ENV"
+
+      - name: Resolve EFS filesystem ID
+        shell: bash
+        env:
+          # matrix.deploy (not needs.validate_model.outputs.effective_deploy) is the correct source here: validate_model is not declared in this job's own needs, so that needs reference would silently resolve empty/undefined and could misclassify a real deploy as dry-run. matrix.deploy already carries this exact per-runtime deploy intent (see the deployment_matrix built by hack/detect-goldengate-deployments.sh) and gates every other deploy-only step in this job.
+          EFFECTIVE_DEPLOY: ${{ matrix.deploy }}
+        run: |
+          set -euo pipefail
+
+          # Three mutually exclusive resolution paths, each disclosed via an "EFS ID source:" log line: existing (Git-committed passthrough), managed (deploy=true only), and dry-run (deploy=false; a syntactically-valid placeholder that is never committed, never sent to Argo CD/AWS). DESIGN NOTE: the managed path resolves via AWS DescribeFileSystems-by-exact-creation-token rather than a Terraform child output on purpose -- the approved corporate reusable workflow (AbuDhabiCommercialBank/adcb-reusable-workflows/aws-terraform-apply.yaml@main) does not expose arbitrary child Terraform outputs back to this orchestrator, so the creation-token contract (verified in the approved ADCB EFS module v1.0.0: `creation_token = var.name`) is the permanent resolution mechanism, not an interim one.
+          if [ -z "$EFS_MODE" ]; then
+            echo "EFS ID source: not applicable (persistence.efs is not in use for this deployment)."
+            echo "RESOLVED_EFS_ID=" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          if [ "$EFS_MODE" = "existing" ]; then
+            echo "EFS ID source: existing descriptor."
+            echo "Resolved EFS filesystem ID: ${EFS_FILE_SYSTEM_ID_DECLARED}"
+            echo "RESOLVED_EFS_ID=${EFS_FILE_SYSTEM_ID_DECLARED}" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          if [ "$EFFECTIVE_DEPLOY" != "true" ]; then
+            echo "EFS ID source: dry-run placeholder (deploy=false; not a real AWS resource, never committed, never sent to Argo CD)."
+            echo "RESOLVED_EFS_ID=fs-0dead0000000beef0" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          if [ -z "$EFS_CREATION_TOKEN" ]; then
+            echo "FAIL: persistence.efs.mode=managed but no EFS creation token was resolved from the deployment model."
+            exit 1
+          fi
+
+          # The expected workload account is proven directly from the role ARN this step is about to assume, never a separately hardcoded/guessed account number.
+          EXPECTED_WORKLOAD_ACCOUNT_ID="$(echo "$EKS_DEPLOY_ROLE_ARN" | sed -nE 's#^arn:aws:iam::([0-9]{12}):role/.*$#\1#p')"
+          if [ -z "$EXPECTED_WORKLOAD_ACCOUNT_ID" ]; then
+            echo "FAIL: could not extract a 12-digit account ID from EKS_DEPLOY_ROLE_ARN; refusing to resolve an EFS filesystem ID without a provable expected workload account."
+            exit 1
+          fi
+
+          echo "Assuming ${EKS_DEPLOY_ROLE_ARN} for a read-only elasticfilesystem:DescribeFileSystems lookup (this role is never granted EFS creation permissions; creation belongs solely to Terraform)..."
+
+          ASSUME_JSON="$(aws sts assume-role --role-arn "$EKS_DEPLOY_ROLE_ARN" --role-session-name "gg-efs-resolve-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --duration-seconds 900 --output json)"
+          EFS_TMP_KEY_ID="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["Credentials"]["AccessKeyId"])' <<< "$ASSUME_JSON")"
+          EFS_TMP_SECRET="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["Credentials"]["SecretAccessKey"])' <<< "$ASSUME_JSON")"
+          EFS_TMP_TOKEN="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["Credentials"]["SessionToken"])' <<< "$ASSUME_JSON")"
+          unset ASSUME_JSON
+          echo "::add-mask::${EFS_TMP_KEY_ID}"
+          echo "::add-mask::${EFS_TMP_SECRET}"
+          echo "::add-mask::${EFS_TMP_TOKEN}"
+
+          # Confined to this one step's subshells only -- never written to $GITHUB_ENV, so the job-level build-account credentials used for later ECR calls are untouched once this step ends.
+          ACTUAL_ACCOUNT="$(AWS_ACCESS_KEY_ID="$EFS_TMP_KEY_ID" AWS_SECRET_ACCESS_KEY="$EFS_TMP_SECRET" AWS_SESSION_TOKEN="$EFS_TMP_TOKEN" aws sts get-caller-identity --query Account --output text --region "$AWS_REGION")"
+          if [ "$ACTUAL_ACCOUNT" != "$EXPECTED_WORKLOAD_ACCOUNT_ID" ]; then
+            echo "FAIL: assumed role resolved to account ${ACTUAL_ACCOUNT}, expected the GoldenGate workload account ${EXPECTED_WORKLOAD_ACCOUNT_ID}."
+            unset EFS_TMP_KEY_ID EFS_TMP_SECRET EFS_TMP_TOKEN
+            exit 1
+          fi
+
+          DESCRIBE_EFS_JSON="$(AWS_ACCESS_KEY_ID="$EFS_TMP_KEY_ID" AWS_SECRET_ACCESS_KEY="$EFS_TMP_SECRET" AWS_SESSION_TOKEN="$EFS_TMP_TOKEN" aws efs describe-file-systems --creation-token "$EFS_CREATION_TOKEN" --region "$AWS_REGION" --output json)"
+
+          MATCH_COUNT="$(python3 -c 'import json, sys; print(len(json.load(sys.stdin)["FileSystems"]))' <<< "$DESCRIBE_EFS_JSON")"
+          if [ "$MATCH_COUNT" -ne 1 ]; then
+            echo "FAIL: expected exactly one EFS filesystem for creation token ${EFS_CREATION_TOKEN}, found ${MATCH_COUNT}. Refusing to list-and-guess."
+            unset EFS_TMP_KEY_ID EFS_TMP_SECRET EFS_TMP_TOKEN
+            exit 1
+          fi
+
+          LIFECYCLE_STATE="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["FileSystems"][0]["LifeCycleState"])' <<< "$DESCRIBE_EFS_JSON")"
+          if [ "$LIFECYCLE_STATE" != "available" ]; then
+            echo "FAIL: the managed EFS filesystem for creation token ${EFS_CREATION_TOKEN} is in lifecycle state ${LIFECYCLE_STATE}, not available."
+            unset EFS_TMP_KEY_ID EFS_TMP_SECRET EFS_TMP_TOKEN
+            exit 1
+          fi
+
+          RESOLVED_EFS_ID="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["FileSystems"][0]["FileSystemId"])' <<< "$DESCRIBE_EFS_JSON")"
+          unset EFS_TMP_KEY_ID EFS_TMP_SECRET EFS_TMP_TOKEN
+
+          # Defense in depth: cross-check the resolved filesystem's ownership tags, already present on this same DescribeFileSystems response (FileSystemDescription.Tags) -- no second list-tags-for-resource call. Catches a creation-token collision with an untagged/mistagged filesystem before it ever reaches Helm/Argo.
+          TAGS_OK="$(python3 -c 'import json, sys; tags = {t["Key"]: t["Value"] for t in json.load(sys.stdin)["FileSystems"][0].get("Tags", [])}; print("true" if tags.get("ManagedBy") == "goldengate-eks-app" and tags.get("GoldenGateDeploymentId") == sys.argv[1] and tags.get("GoldenGateEnvironment") == sys.argv[2] and tags.get("GoldenGateStorage") == "u02" else "false")' "$DEPLOYMENT_ID" "$ENVIRONMENT" <<< "$DESCRIBE_EFS_JSON")"
+          if [ "$TAGS_OK" != "true" ]; then
+            echo "FAIL: the EFS filesystem resolved for creation token ${EFS_CREATION_TOKEN} (${RESOLVED_EFS_ID}) does not carry the expected ManagedBy/GoldenGateDeploymentId/GoldenGateEnvironment/GoldenGateStorage ownership tags."
+            exit 1
+          fi
+
+          echo "EFS ID source: managed Terraform/AWS resolution (creation token ${EFS_CREATION_TOKEN})."
+          echo "Resolved EFS filesystem ID: ${RESOLVED_EFS_ID}"
+          echo "RESOLVED_EFS_ID=${RESOLVED_EFS_ID}" >> "$GITHUB_ENV"
+
+      - name: Verify the selected image exists in the approved private ECR
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Read-only describe-images call; no engine-to-image mapping and no public-image fallback -- the
+          # repository/tag come only from this deployment's own descriptor, already resolved above. The
+          # expected registry is the canonical ECR_REGISTRY, never reconstructed from account/region.
+          EXPECTED_PREFIX="${ECR_REGISTRY}/"
+          if [[ "$IMAGE_REPOSITORY" != "${EXPECTED_PREFIX}"* ]]; then
+            echo "FAIL: image repository is not the approved private ECR account/region: ${IMAGE_REPOSITORY}"
+            exit 1
+          fi
+
+          ECR_REPO_NAME="${IMAGE_REPOSITORY#"$EXPECTED_PREFIX"}"
+
+          IMAGE_DETAIL_JSON="$(aws ecr describe-images \
+            --region "$AWS_REGION" \
+            --repository-name "$ECR_REPO_NAME" \
+            --image-ids imageTag="$IMAGE_TAG" \
+            --output json)"
+
+          IMAGE_DIGEST="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["imageDetails"][0]["imageDigest"])' <<< "$IMAGE_DETAIL_JSON")"
+
+          if [ -z "$IMAGE_DIGEST" ]; then
+            echo "FAIL: could not resolve a digest for ${IMAGE_REPOSITORY}:${IMAGE_TAG}."
+            exit 1
+          fi
+
+          echo "Verified image exists: ${IMAGE_REPOSITORY}:${IMAGE_TAG} (digest ${IMAGE_DIGEST})"
+          echo "IMAGE_DIGEST=${IMAGE_DIGEST}" >> "$GITHUB_ENV"
+
+      - name: Validate required files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "$HELM_CHART_PATH/Chart.yaml" ]; then
+            echo "Missing Helm Chart.yaml: $HELM_CHART_PATH/Chart.yaml"
+            exit 1
+          fi
+
+          if [ ! -f "$HELM_CHART_PATH/values.yaml" ]; then
+            echo "Missing Helm values.yaml: $HELM_CHART_PATH/values.yaml"
+            exit 1
+          fi
+
+          if [ ! -f "$VALUES_FILE" ]; then
+            echo "Missing deployment values file: $VALUES_FILE"
+            echo "Create: envs/${ENVIRONMENT}/${DEPLOYMENT_ID}/values.yaml"
+            exit 1
+          fi
+
+          echo "Required files are present."
+          echo "Helm chart path: $HELM_CHART_PATH"
+          echo "Deployment values: $VALUES_FILE"
+
+      - name: Login Helm to Amazon ECR
+        if: ${{ matrix.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | helm registry login --username AWS --password-stdin "$ECR_REGISTRY"
+
+      - name: Ensure Helm ECR repository exists
+        if: ${{ matrix.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if aws ecr describe-repositories \
+            --region "$AWS_REGION" \
+            --repository-names "$HELM_ECR_REPOSITORY" >/dev/null 2>&1; then
+            echo "ECR repository already exists: $HELM_ECR_REPOSITORY"
+          else
+            echo "Creating ECR repository: $HELM_ECR_REPOSITORY"
+
+            aws ecr create-repository \
+              --region "$AWS_REGION" \
+              --repository-name "$HELM_ECR_REPOSITORY" \
+              --tags Key=ApplicationName,Value=CloudFactory Key=DataClassification,Value=General Key=BusinessCriticality,Value=Low Key=BusinessUnit,Value=TechnologyPlatform Key=CostCenter,Value=219 \
+              --image-scanning-configuration scanOnPush=true \
+              --image-tag-mutability MUTABLE >/dev/null
+
+            echo "Created ECR repository: $HELM_ECR_REPOSITORY"
+          fi
+
+      - name: Ensure Helm ECR repository policy allows Argo CD pull
+        if: ${{ matrix.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Runs every time (new or existing repo) so Argo CD's IRSA role keeps pull access, without clobbering other statements.
+          ARGOCD_ECR_STATEMENT_SID="AllowArgocdEksRolePullGoldengateHelmChart"
+
+          echo "Fetching existing ECR repository policy for ${HELM_ECR_REPOSITORY}..."
+
+          EXISTING_POLICY="$(aws ecr get-repository-policy \
+            --region "$AWS_REGION" \
+            --repository-name "$HELM_ECR_REPOSITORY" \
+            --query policyText \
+            --output text 2>/tmp/ecr-get-policy-error.txt)" || {
+              if grep -q "RepositoryPolicyNotFoundException" /tmp/ecr-get-policy-error.txt; then
+                echo "No existing repository policy found. Starting from an empty policy."
+                EXISTING_POLICY='{"Version":"2012-10-17","Statement":[]}'
+              else
+                echo "Failed to read the existing ECR repository policy:"
+                cat /tmp/ecr-get-policy-error.txt
+                echo ""
+                echo "The workflow role must have ecr:GetRepositoryPolicy and ecr:SetRepositoryPolicy"
+                echo "on this repository. Grant those permissions and re-run."
+                exit 1
+              fi
+            }
+
+          echo "Merging in Sid ${ARGOCD_ECR_STATEMENT_SID} (existing statements are preserved)..."
+
+          echo "$EXISTING_POLICY" | jq \
+            --arg sid "$ARGOCD_ECR_STATEMENT_SID" \
+            --arg roleArn "$ARGOCD_ECR_READ_ROLE_ARN" \
+            '
+            .Statement = ([.Statement[] | select(.Sid != $sid)]
+              + [{
+                  Sid: $sid,
+                  Effect: "Allow",
+                  Principal: { AWS: $roleArn },
+                  Action: [
+                    "ecr:BatchCheckLayerAvailability",
+                    "ecr:BatchGetImage",
+                    "ecr:GetDownloadUrlForLayer",
+                    "ecr:DescribeImages",
+                    "ecr:DescribeRepositories"
+                  ]
+                }])
+            ' > /tmp/ecr-repository-policy.json
+
+          echo "Applying merged ECR repository policy to ${HELM_ECR_REPOSITORY}..."
+
+          aws ecr set-repository-policy \
+            --region "$AWS_REGION" \
+            --repository-name "$HELM_ECR_REPOSITORY" \
+            --policy-text file:///tmp/ecr-repository-policy.json >/dev/null
+
+          echo "ECR repository policy on ${HELM_ECR_REPOSITORY} now allows pull from ${ARGOCD_ECR_READ_ROLE_ARN}."
+
+      - name: Build Helm dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          helm dependency build "$HELM_CHART_PATH" || true
+
+      - name: Helm lint deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # global.deploymentId/deploymentModel are intentionally not passed via --set; the chart derives runtime name from Release.Name and reads deploymentModel from $VALUES_FILE itself. persistence.efs.fileSystemId always comes from RESOLVED_EFS_ID, never from $VALUES_FILE -- required for managed mode (never committed to Git) and harmless for existing/not-in-use. Fresh-EKS Phase A/Phase 9: runtime.image.repository/ingress.hostDomain/ingress.alb.groupName/ingress.alb.certificateArn are shared environment identity, removed from $VALUES_FILE -- always injected here from the same resolved values used by Terraform/IAM, via --set-string so a hostname/ARN is never coerced by Helm's own value-type inference.
+          helm lint "$HELM_CHART_PATH" \
+            --values "$VALUES_FILE" \
+            --set global.environment="$ENVIRONMENT" \
+            --set-string runtime.image.repository="$IMAGE_REPOSITORY" \
+            --set-string ingress.hostDomain="$RESOLVED_DNS_DOMAIN" \
+            --set-string ingress.alb.groupName="$RESOLVED_ALB_GROUP_NAME" \
+            --set-string ingress.alb.certificateArn="$RESOLVED_CERTIFICATE_ARN" \
+            --set runtime.csi.admin.objectName="$RESOLVED_ADMIN_SECRET_NAME" \
+            --set runtime.csi.certificate.objectName="$RESOLVED_TLS_SECRET_NAME" \
+            --set-string runtime.csi.region="$AWS_REGION" \
+            --set runtime.serviceAccount.create=false \
+            --set runtime.serviceAccount.name="$RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME" \
+            --set persistence.efs.fileSystemId="$RESOLVED_EFS_ID"
+
+      - name: Render manifest for validation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p rendered
+
+          helm template "$RELEASE_NAME" "$HELM_CHART_PATH" \
+            --namespace "$TARGET_NAMESPACE" \
+            --values "$VALUES_FILE" \
+            --set global.environment="$ENVIRONMENT" \
+            --set-string runtime.image.repository="$IMAGE_REPOSITORY" \
+            --set-string ingress.hostDomain="$RESOLVED_DNS_DOMAIN" \
+            --set-string ingress.alb.groupName="$RESOLVED_ALB_GROUP_NAME" \
+            --set-string ingress.alb.certificateArn="$RESOLVED_CERTIFICATE_ARN" \
+            --set runtime.csi.admin.objectName="$RESOLVED_ADMIN_SECRET_NAME" \
+            --set runtime.csi.certificate.objectName="$RESOLVED_TLS_SECRET_NAME" \
+            --set-string runtime.csi.region="$AWS_REGION" \
+            --set runtime.serviceAccount.create=false \
+            --set runtime.serviceAccount.name="$RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME" \
+            --set persistence.efs.fileSystemId="$RESOLVED_EFS_ID" \
+            > "rendered/${RELEASE_NAME}.yaml"
+
+          echo "Rendered manifest: rendered/${RELEASE_NAME}.yaml"
+
+      - name: Verify the rendered StatefulSet uses the shared runtime ServiceAccount
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RENDERED="rendered/${RELEASE_NAME}.yaml"
+
+          if ! grep -qF "serviceAccountName: ${RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME}" "$RENDERED"; then
+            echo "FAIL: rendered StatefulSet does not use serviceAccountName: ${RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME}."
+            exit 1
+          fi
+
+          echo "OK: rendered StatefulSet uses serviceAccountName: ${RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME}."
+
+      - name: Verify the rendered CSI SecretProviderClass selects only this deployment's own admin secret
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RENDERED="rendered/${RELEASE_NAME}.yaml"
+          OTHER_ROLE_ADMIN_SECRET="${ENVIRONMENT}/goldengate/target/admin"
+          if [ "$RESOLVED_ADMIN_SECRET_NAME" = "${ENVIRONMENT}/goldengate/target/admin" ]; then
+            OTHER_ROLE_ADMIN_SECRET="${ENVIRONMENT}/goldengate/source/admin"
+          fi
+
+          if ! grep -qF "objectName: \"${RESOLVED_ADMIN_SECRET_NAME}\"" "$RENDERED"; then
+            echo "FAIL: rendered SecretProviderClass does not select this deployment's own admin secret (${RESOLVED_ADMIN_SECRET_NAME})."
+            exit 1
+          fi
+          if grep -qF "objectName: \"${OTHER_ROLE_ADMIN_SECRET}\"" "$RENDERED"; then
+            echo "FAIL: rendered SecretProviderClass mounts the opposite-role admin secret (${OTHER_ROLE_ADMIN_SECRET})."
+            exit 1
+          fi
+
+          echo "OK: rendered SecretProviderClass mounts only ${RESOLVED_ADMIN_SECRET_NAME}."
+
+      - name: Validate GoldenGate namespace is rendered
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RENDERED="rendered/${RELEASE_NAME}.yaml"
+
+          echo "deploymentModel=singleRuntime: checking that NO Namespace document is rendered from this release: ${RENDERED}"
+
+          # singleRuntime releases must never render a Namespace -- they deploy into the shared goldengate-<environment> namespace, which they don't own.
+          if grep -qE '^kind: Namespace$' "$RENDERED"; then
+            echo "FAIL: a Namespace document was rendered for a singleRuntime release. This must never happen -- singleRuntime releases must not create or own the shared namespace."
+            exit 1
+          fi
+
+          echo "OK: no Namespace document rendered, as expected for deploymentModel=singleRuntime."
+
+      - name: Validate EFS persistence resources are rendered
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RENDERED="rendered/${RELEASE_NAME}.yaml"
+
+          if ! command -v python3 >/dev/null 2>&1; then
+            echo "FAIL: python3 is required to validate EFS persistence configuration and is not available on this runner."
+            exit 1
+          fi
+
+          if ! python3 -c "import yaml" >/dev/null 2>&1; then
+            echo "FAIL: PyYAML is required to validate EFS persistence configuration and is not available on this runner."
+            exit 1
+          fi
+
+          # Strict PyYAML parsing; default path mirrors _helpers.tpl's goldengate.efsBasePath.
+          set +e
+          EFS_FACTS="$(python3 - "$VALUES_FILE" "$DEPLOYMENT_ID" "$DEPLOYMENT_MODEL" <<'PYEOF'
+          import sys
+
+          import yaml
+
+          values_path, deployment_id, deployment_model = sys.argv[1:4]
+
+          # Defense in depth: deployment_model was already validated as singleRuntime upstream; re-check here rather than trust it blindly.
+          if deployment_model != "singleRuntime":
+              print(f"FAIL: unexpected deploymentModel {deployment_model!r} reached EFS validation -- only singleRuntime is supported for active deployments.")
+              sys.exit(1)
+
+          with open(values_path) as f:
+              raw = f.read()
+
+          try:
+              data = yaml.safe_load(raw)
+          except yaml.YAMLError as exc:
+              print(f"FAIL: {values_path} is not valid YAML: {exc}")
+              sys.exit(1)
+
+          if not data or not isinstance(data, dict):
+              print(f"FAIL: {values_path} root must be a non-empty YAML mapping.")
+              sys.exit(1)
+
+          persistence = data.get("persistence")
+          if persistence is not None and not isinstance(persistence, dict):
+              print(f"FAIL: {values_path} persistence must be a mapping, got {type(persistence).__name__}.")
+              sys.exit(1)
+
+          persistence = persistence or {}
+          efs_enabled = persistence.get("enabled") is True and persistence.get("provider") == "efs"
+
+          if not efs_enabled:
+              print("PERSISTENCE_EFS_ENABLED=false")
+              sys.exit(0)
+
+          efs = persistence.get("efs")
+          if not isinstance(efs, dict):
+              print(f"FAIL: {values_path} persistence.efs must be a mapping when persistence.enabled=true and provider=efs.")
+              sys.exit(1)
+
+          # Defense in depth: mode was already validated upstream by hack/goldengate-deployment-model.py; re-checked here rather than trusted blindly. The expected fileSystemId itself never comes from this file -- it always comes from the workflow's own RESOLVED_EFS_ID (existing: Git-committed passthrough; managed: real Terraform/AWS resolution; deploy=false: dry-run placeholder).
+          mode = efs.get("mode")
+          if mode not in ("existing", "managed"):
+              print(f"FAIL: {values_path} persistence.efs.mode must be exactly 'existing' or 'managed', got {mode!r}.")
+              sys.exit(1)
+
+          declared_file_system_id = efs.get("fileSystemId")
+          if mode == "existing" and (not isinstance(declared_file_system_id, str) or not declared_file_system_id.strip()):
+              print(f"FAIL: {values_path} persistence.efs.fileSystemId must be a non-empty string when persistence.efs.mode=existing.")
+              sys.exit(1)
+          if mode == "managed" and declared_file_system_id not in (None, ""):
+              print(f"FAIL: {values_path} persistence.efs.fileSystemId must not be set when persistence.efs.mode=managed -- Terraform provisions and resolves it.")
+              sys.exit(1)
+
+          storage_class = efs.get("storageClass")
+          if storage_class is not None and not isinstance(storage_class, dict):
+              print(f"FAIL: {values_path} persistence.efs.storageClass must be a mapping when present, got {type(storage_class).__name__}.")
+              sys.exit(1)
+
+          explicit_base_path = (storage_class or {}).get("basePath")
+          if explicit_base_path is not None and not isinstance(explicit_base_path, str):
+              print(f"FAIL: {values_path} persistence.efs.storageClass.basePath must be a string when present, got {type(explicit_base_path).__name__}.")
+              sys.exit(1)
+
+          if isinstance(explicit_base_path, str) and explicit_base_path.strip():
+              base_path = explicit_base_path
+          else:
+              # Mirrors goldengate.efsBasePath: falls back to fullnameOverride, then name, then deployment_id.
+              runtime = data.get("runtime") or {}
+              runtime_name = runtime.get("fullnameOverride") or runtime.get("name") or deployment_id
+              if not isinstance(runtime_name, str) or not runtime_name.strip():
+                  print(f"FAIL: {values_path} could not resolve a runtime name for the default EFS basePath.")
+                  sys.exit(1)
+              base_path = f"/{runtime_name}"
+
+          print("PERSISTENCE_EFS_ENABLED=true")
+          print(f"EFS_BASE_PATH={base_path}")
+          PYEOF
+          )"
+          EFS_FACTS_STATUS=$?
+          set -e
+
+          if [ "$EFS_FACTS_STATUS" -ne 0 ]; then
+            echo "$EFS_FACTS"
+            exit 1
+          fi
+
+          source <(printf '%s\n' "$EFS_FACTS")
+
+          if [ "${PERSISTENCE_EFS_ENABLED:-false}" != "true" ]; then
+            echo "persistence.enabled/provider=efs not set in ${VALUES_FILE}. Skipping EFS persistence render checks."
+            exit 0
+          fi
+
+          # The expected fileSystemId never comes from $VALUES_FILE -- it is always $RESOLVED_EFS_ID, the single value already wired into helm lint/template above (existing: Git-committed passthrough; managed: real Terraform/AWS resolution; deploy=false: dry-run placeholder). For existing mode this must also equal the declared Git value, as a defense-in-depth check that the earlier resolution step did not silently diverge.
+          if [ -z "$RESOLVED_EFS_ID" ]; then
+            echo "FAIL: persistence.enabled=true and provider=efs in ${VALUES_FILE}, but RESOLVED_EFS_ID is empty. The EFS resolution step must run before this validation."
+            exit 1
+          fi
+          if [ "$EFS_MODE" = "existing" ] && [ "$RESOLVED_EFS_ID" != "$EFS_FILE_SYSTEM_ID_DECLARED" ]; then
+            echo "FAIL: RESOLVED_EFS_ID (${RESOLVED_EFS_ID}) does not match the declared persistence.efs.fileSystemId (${EFS_FILE_SYSTEM_ID_DECLARED}) in ${VALUES_FILE} for mode=existing."
+            exit 1
+          fi
+
+          echo "persistence.enabled=true and provider=efs in ${VALUES_FILE}. Checking rendered manifest: ${RENDERED}"
+          echo "Expected EFS fileSystemId (RESOLVED_EFS_ID): ${RESOLVED_EFS_ID}"
+          echo "Expected EFS basePath: ${EFS_BASE_PATH}"
+
+          python3 - "$RENDERED" "$VALUES_FILE" "$DEPLOYMENT_ID" "$DEPLOYMENT_MODEL" "$ENVIRONMENT" "$RESOLVED_EFS_ID" "$EFS_BASE_PATH" <<'PYEOF'
+          import re
+          import sys
+
+          import yaml
+
+
+          class DuplicateKeyError(Exception):
+              pass
+
+
+          class StrictSafeLoader(yaml.SafeLoader):
+              pass
+
+
+          def _no_duplicates_constructor(loader, node, deep=False):
+              mapping = {}
+              for key_node, value_node in node.value:
+                  key = loader.construct_object(key_node, deep=deep)
+                  if key in mapping:
+                      raise DuplicateKeyError(
+                          f"duplicate mapping key {key!r} at line {key_node.start_mark.line + 1}"
+                      )
+                  value = loader.construct_object(value_node, deep=deep)
+                  mapping[key] = value
+              return mapping
+
+
+          StrictSafeLoader.add_constructor(
+              yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _no_duplicates_constructor
+          )
+
+          (rendered_path, values_path, deployment_id, deployment_model,
+           environment, expected_file_system_id, expected_base_path) = sys.argv[1:8]
+
+          with open(rendered_path) as f:
+              raw = f.read()
+
+          # Attribute each document to its template via Helm's own leading "# Source: <path>" comment.
+          documents = []
+          for chunk in re.split(r"(?m)^---$", raw):
+              chunk = chunk.strip("\n")
+              if not chunk.strip():
+                  continue
+              source_template = None
+              for line in chunk.splitlines():
+                  line = line.strip()
+                  if not line:
+                      continue
+                  if line.startswith("# Source:"):
+                      source_template = line[len("# Source:"):].strip()
+                  break
+              try:
+                  doc = yaml.load(chunk, Loader=StrictSafeLoader)
+              except DuplicateKeyError as exc:
+                  print(f"FAIL: duplicate YAML mapping key in rendered manifest ({source_template}): {exc}")
+                  sys.exit(1)
+              except yaml.YAMLError as exc:
+                  print(f"FAIL: rendered manifest document is not valid YAML ({source_template}): {exc}")
+                  sys.exit(1)
+              if doc:
+                  documents.append((source_template, doc))
+
+          expected_storage_class_name = f"gg-efs-{environment}-{deployment_id}"
+
+          storage_classes = [
+              doc for _, doc in documents
+              if doc.get("kind") == "StorageClass"
+              and (doc.get("metadata") or {}).get("name") == expected_storage_class_name
+          ]
+          if len(storage_classes) != 1:
+              all_names = [(doc.get("metadata") or {}).get("name") for _, doc in documents if doc.get("kind") == "StorageClass"]
+              print(f"FAIL: expected exactly one StorageClass named {expected_storage_class_name!r}, found {len(storage_classes)} (all rendered StorageClass names: {all_names}).")
+              sys.exit(1)
+
+          sc = storage_classes[0]
+          parameters = sc.get("parameters") or {}
+
+          checks = [
+              (sc.get("provisioner") == "efs.csi.aws.com",
+               f"provisioner (expected 'efs.csi.aws.com', got {sc.get('provisioner')!r})"),
+              (parameters.get("provisioningMode") == "efs-ap",
+               f"parameters.provisioningMode (expected 'efs-ap', got {parameters.get('provisioningMode')!r})"),
+              (parameters.get("fileSystemId") == expected_file_system_id,
+               f"parameters.fileSystemId (expected {expected_file_system_id!r}, got {parameters.get('fileSystemId')!r})"),
+              (parameters.get("basePath") == expected_base_path,
+               f"parameters.basePath (expected {expected_base_path!r}, got {parameters.get('basePath')!r})"),
+              (parameters.get("subPathPattern") == "${.PVC.name}",
+               f"parameters.subPathPattern (expected '\x24{{.PVC.name}}', got {parameters.get('subPathPattern')!r})"),
+              (parameters.get("ensureUniqueDirectory") == "true",
+               f"parameters.ensureUniqueDirectory (expected 'true', got {parameters.get('ensureUniqueDirectory')!r})"),
+              (sc.get("reclaimPolicy") == "Retain",
+               f"reclaimPolicy (expected 'Retain', got {sc.get('reclaimPolicy')!r})"),
+          ]
+          failed = [msg for ok, msg in checks if not ok]
+          if failed:
+              print(f"FAIL: rendered StorageClass {expected_storage_class_name!r} does not match the expected configuration:")
+              for msg in failed:
+                  print(f"  - {msg}")
+              sys.exit(1)
+
+          print(f"OK: StorageClass {expected_storage_class_name!r} matches the expected configuration (provisioner, provisioningMode, fileSystemId, basePath={expected_base_path!r}, subPathPattern, ensureUniqueDirectory, reclaimPolicy).")
+
+          def _volume(sts_doc, name):
+              volumes = ((sts_doc.get("spec") or {}).get("template") or {}).get("spec", {}).get("volumes") or []
+              for v in volumes:
+                  if v.get("name") == name:
+                      return v
+              return None
+
+          def _check_u02_u03(label, sts_doc, expected_pvc_name):
+              u02 = _volume(sts_doc, "u02")
+              if not u02 or (u02.get("persistentVolumeClaim") or {}).get("claimName") != expected_pvc_name:
+                  print(f"FAIL: {label} StatefulSet u02 volume does not use persistentVolumeClaim.claimName={expected_pvc_name!r} (found: {u02!r}).")
+                  sys.exit(1)
+              u03 = _volume(sts_doc, "u03")
+              if not u03 or "emptyDir" not in u03:
+                  print(f"FAIL: {label} StatefulSet u03 volume is not emptyDir (found: {u03!r}).")
+                  sys.exit(1)
+
+          # Defense in depth: only singleRuntime is validated here (matches the assertion above).
+          if deployment_model != "singleRuntime":
+              print(f"FAIL: unexpected deploymentModel {deployment_model!r} reached EFS rendered-resource validation -- only singleRuntime is supported for active deployments.")
+              sys.exit(1)
+
+          expected_pvc_name = f"{deployment_id}-u02"
+
+          pvcs = [
+              doc for _, doc in documents
+              if doc.get("kind") == "PersistentVolumeClaim"
+              and (doc.get("metadata") or {}).get("name") == expected_pvc_name
+          ]
+          if len(pvcs) != 1:
+              print(f"FAIL: expected exactly one PersistentVolumeClaim named {expected_pvc_name!r}, found {len(pvcs)}.")
+              sys.exit(1)
+
+          statefulsets = [doc for _, doc in documents if doc.get("kind") == "StatefulSet"]
+          if len(statefulsets) != 1:
+              print(f"FAIL: expected exactly one StatefulSet, found {len(statefulsets)}.")
+              sys.exit(1)
+
+          _check_u02_u03("runtime", statefulsets[0], expected_pvc_name)
+
+          print("OK: EFS StorageClass, runtime PVC, and StatefulSet u02/u03 volumes all match the expected persistence configuration.")
+          PYEOF
+
+      - name: Validate rendered singleRuntime manifest structure, verified image identity, and no observer sidecar
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RENDERED="rendered/${RELEASE_NAME}.yaml"
+
+          echo "deploymentModel=singleRuntime: validating the generic runtime resource contract, including verified-image identity, with Python/PyYAML -- never indentation-based grep for Kubernetes object structure or field values."
+
+          if ! command -v python3 >/dev/null 2>&1; then
+            echo "FAIL: python3 is required to validate singleRuntime rendered manifests and is not available on this runner."
+            exit 1
+          fi
+
+          if ! python3 -c "import yaml" >/dev/null 2>&1; then
+            echo "FAIL: PyYAML is required to validate singleRuntime rendered manifests and is not available on this runner."
+            exit 1
+          fi
+
+          python3 - "$RENDERED" "$VALUES_FILE" "$DEPLOYMENT_ID" "$TARGET_NAMESPACE" "$IMAGE_REPOSITORY" "$IMAGE_TAG" "$IMAGE_DIGEST" <<'PYEOF'
+          import sys
+          import yaml
+
+
+          class DuplicateKeyError(Exception):
+              pass
+
+
+          class StrictSafeLoader(yaml.SafeLoader):
+              pass
+
+
+          def _no_duplicates_constructor(loader, node, deep=False):
+              mapping = {}
+              for key_node, value_node in node.value:
+                  key = loader.construct_object(key_node, deep=deep)
+                  if key in mapping:
+                      raise DuplicateKeyError(
+                          f"duplicate mapping key {key!r} at line {key_node.start_mark.line + 1}"
+                      )
+                  value = loader.construct_object(value_node, deep=deep)
+                  mapping[key] = value
+              return mapping
+
+
+          StrictSafeLoader.add_constructor(
+              yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _no_duplicates_constructor
+          )
+
+          FORBIDDEN_CONTAINER_SUBSTRINGS = (
+              "goldengate-observer",
+              "utility-sidecar",
+              "fluent-bit",
+              "fluentbit",
+          )
+
+          rendered_path, values_path, deployment_id, target_namespace, image_repository, image_tag, image_digest = sys.argv[1:8]
+          expected_image = f"{image_repository}:{image_tag}"
+
+          with open(rendered_path) as f:
+              raw = f.read()
+
+          try:
+              documents = [d for d in yaml.load_all(raw, Loader=StrictSafeLoader) if d]
+          except DuplicateKeyError as exc:
+              print(f"FAIL: duplicate YAML mapping key in rendered manifest: {exc}")
+              sys.exit(1)
+          except yaml.YAMLError as exc:
+              print(f"FAIL: rendered manifest is not valid YAML: {exc}")
+              sys.exit(1)
+
+          print(f"OK: rendered manifest parsed as {len(documents)} document(s) with no duplicate mapping keys.")
+
+          with open(values_path) as f:
+              values = yaml.safe_load(f) or {}
+
+          runtime_values = values.get("runtime") or {}
+          expected_container_name = runtime_values.get("containerName")
+          if not expected_container_name:
+              print(f"FAIL: runtime.containerName not found in {values_path}.")
+              sys.exit(1)
+
+          # --- exactly one StatefulSet, exactly one regular container --------------
+          statefulsets = [d for d in documents if d.get("kind") == "StatefulSet"]
+          if len(statefulsets) != 1:
+              print(f"FAIL: expected exactly one StatefulSet, found {len(statefulsets)}.")
+              sys.exit(1)
+
+          sts = statefulsets[0]
+          pod_spec = (sts.get("spec") or {}).get("template", {}).get("spec", {}) or {}
+
+          containers = pod_spec.get("containers") or []
+          if len(containers) != 1:
+              names = [c.get("name") for c in containers]
+              print(
+                  "FAIL: expected exactly one regular application container in "
+                  f"spec.template.spec.containers, found {len(containers)}: {names}"
+              )
+              sys.exit(1)
+
+          main_container = containers[0]
+          main_container_name = main_container.get("name")
+          if main_container_name != expected_container_name:
+              print(
+                  f"FAIL: expected main container name {expected_container_name!r}, "
+                  f"found {main_container_name!r}."
+              )
+              sys.exit(1)
+          print(
+              "OK: exactly one regular application container "
+              f"(spec.template.spec.containers), name={main_container_name!r}."
+          )
+
+          # Structural image-identity check (never grep on the rendered text): the Helm template quotes image: "repo:tag", which a plain `grep -qF "image: repo:tag"` (without quotes) never matches -- comparing the PARSED scalar sidesteps that YAML-quoting mismatch entirely, whether the rendered value happens to be quoted or not.
+          main_container_image = main_container.get("image")
+          if main_container_image != expected_image:
+              print(
+                  f"FAIL: rendered StatefulSet main container {main_container_name!r} does not reference "
+                  f"the verified image {expected_image!r} (found {main_container_image!r})."
+              )
+              sys.exit(1)
+          print(
+              f"OK: rendered StatefulSet main container {main_container_name!r} references verified image "
+              f"{expected_image} (verified ECR digest {image_digest})."
+          )
+
+          name_lower = (main_container_name or "").lower()
+          image_lower = (main_container.get("image") or "").lower()
+          for substring in FORBIDDEN_CONTAINER_SUBSTRINGS:
+              if substring in name_lower or substring in image_lower:
+                  print(
+                      "FAIL: the regular container unexpectedly references "
+                      f"{substring!r} (name={main_container_name!r}, image={main_container.get('image')!r})."
+                  )
+                  sys.exit(1)
+          print("OK: no observer/utility-sidecar/Fluent Bit reference in the regular container.")
+
+          # initContainers must be exactly [prepare-u02-permissions] -- an empty list must fail here, not pass vacuously.
+          init_containers = pod_spec.get("initContainers") or []
+          init_names = [c.get("name") for c in init_containers]
+
+          if init_names != ["prepare-u02-permissions"]:
+              print(
+                  "FAIL: expected exactly one init container named "
+                  f"'prepare-u02-permissions', found {init_names}."
+              )
+              sys.exit(1)
+
+          init_container = init_containers[0]
+
+          # prepare-u02-permissions intentionally uses the same runtime image as the main container (current chart contract, helm/goldengate/templates/runtime-statefulset.yaml) -- checked here too so a drift between the two image references is caught, without ever mistaking this initContainer for the regular application container checked above.
+          init_container_image = init_container.get("image")
+          if init_container_image != expected_image:
+              print(
+                  "FAIL: prepare-u02-permissions init container does not reference the verified image "
+                  f"{expected_image!r} (found {init_container_image!r})."
+              )
+              sys.exit(1)
+          print(f"OK: prepare-u02-permissions init container also references verified image {expected_image}.")
+
+          def _init_script_text(container):
+              # Tolerate non-string command/args entries (e.g. Helm-rendered numbers) instead of crashing.
+              parts = []
+              for item in list(container.get("command") or []) + list(container.get("args") or []):
+                  if isinstance(item, str):
+                      parts.append(item)
+              return "\n".join(parts)
+
+          init_script_text = _init_script_text(init_container)
+
+          if "ServiceManager.pid" not in init_script_text:
+              print(
+                  "FAIL: the prepare-u02-permissions init container does not reference "
+                  "ServiceManager.pid -- the stale GoldenGate Service Manager PID "
+                  "safeguard is missing."
+              )
+              sys.exit(1)
+
+          if 'rm -f -- "$SERVICE_MANAGER_PID_FILE"' not in init_script_text:
+              print(
+                  "FAIL: the prepare-u02-permissions init container does not contain "
+                  "the expected stale-PID removal command "
+                  '(rm -f -- "$SERVICE_MANAGER_PID_FILE").'
+              )
+              sys.exit(1)
+
+          print(
+              "OK: required prepare-u02-permissions init container and stale "
+              "ServiceManager.pid cleanup are present."
+          )
+
+          # --- Services: exactly one ClusterIP + one headless, partitioned strictly by clusterIP/type ---
+          services = [d for d in documents if d.get("kind") == "Service"]
+          if len(services) != 2:
+              print(f"FAIL: expected exactly 2 Service documents (one ClusterIP, one headless), found {len(services)}.")
+              sys.exit(1)
+
+          headless_services = [
+              s for s in services
+              if (s.get("spec") or {}).get("clusterIP") == "None"
+          ]
+          normal_services = [
+              s for s in services
+              if (s.get("spec") or {}).get("clusterIP") != "None"
+              and (s.get("spec") or {}).get("type") in (None, "ClusterIP")
+          ]
+
+          if len(headless_services) != 1:
+              print(
+                  "FAIL: expected exactly one headless Service (spec.clusterIP == 'None'), "
+                  f"found {len(headless_services)}."
+              )
+              sys.exit(1)
+
+          if len(normal_services) != 1:
+              print(
+                  "FAIL: expected exactly one normal ClusterIP Service "
+                  "(spec.clusterIP != 'None' and type ClusterIP or omitted/defaulted), "
+                  f"found {len(normal_services)}."
+              )
+              sys.exit(1)
+          print("OK: exactly one ClusterIP Service and one headless Service.")
+
+          # --- Ingress: exactly one, with exactly one host, when enabled -----------
+          ingress_enabled = bool((values.get("ingress") or {}).get("enabled"))
+          ingresses = [d for d in documents if d.get("kind") == "Ingress"]
+          if ingress_enabled:
+              if len(ingresses) != 1:
+                  print(f"FAIL: expected exactly one rendered Ingress, found {len(ingresses)}.")
+                  sys.exit(1)
+              rules = (ingresses[0].get("spec") or {}).get("rules") or []
+              if len(rules) != 1:
+                  print(f"FAIL: expected exactly one Ingress host rule, found {len(rules)}.")
+                  sys.exit(1)
+              print("OK: exactly one Ingress with one host.")
+          else:
+              print("ingress.enabled is not true. Skipping Ingress checks.")
+
+          # --- runtime-qualified resource names + shared namespace -----------------
+          expected_names = {deployment_id, f"{deployment_id}-headless"}
+          found_names = {
+              (doc.get("metadata") or {}).get("name")
+              for doc in documents
+              if (doc.get("metadata") or {}).get("name") in expected_names
+          }
+          missing_names = expected_names - found_names
+          if missing_names:
+              print(f"FAIL: expected resource name(s) not found in the rendered manifest: {sorted(missing_names)}")
+              sys.exit(1)
+
+          spcs = [d for d in documents if d.get("kind") == "SecretProviderClass"]
+          for spc in spcs:
+              name = (spc.get("metadata") or {}).get("name", "")
+              if not name.startswith(f"{deployment_id}-"):
+                  print(f"FAIL: SecretProviderClass name {name!r} is not qualified by the runtime name {deployment_id!r}.")
+                  sys.exit(1)
+          if spcs:
+              print(f"OK: {len(spcs)} SecretProviderClass name(s) are runtime-qualified.")
+
+          # --- namespaced resources reference the shared namespace -----------------
+          namespace_found = False
+          for doc in documents:
+              if doc.get("kind") == "Namespace":
+                  print("FAIL: a Namespace document was rendered for a singleRuntime release.")
+                  sys.exit(1)
+              metadata = doc.get("metadata") or {}
+              ns = metadata.get("namespace")
+              if ns is not None:
+                  namespace_found = True
+                  if ns != target_namespace:
+                      print(
+                          f"FAIL: {doc.get('kind')} {(doc.get('metadata') or {}).get('name')} uses "
+                          f"unexpected namespace {ns!r}, expected {target_namespace!r}."
+                      )
+                      sys.exit(1)
+          if not namespace_found:
+              print(f"FAIL: no namespaced resource references the expected shared namespace {target_namespace!r}.")
+              sys.exit(1)
+          print(f"OK: namespaced resources reference the shared namespace {target_namespace!r}.")
+
+          print("OK: singleRuntime rendered manifest passed all generic runtime contract checks (Python/PyYAML, duplicate-key-safe).")
+          PYEOF
+
+      - name: Package deployment-specific Helm chart
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p packaged
+          rm -rf "$TEMP_CHART_PATH"
+          mkdir -p "$TEMP_CHART_PATH"
+
+          # Argo CD can't reach envs/<environment>/<id>/values.yaml directly, so bake it into a self-contained chart copy before packaging.
+          echo "Copying base chart from $HELM_CHART_PATH into $TEMP_CHART_PATH..."
+          cp -a "$HELM_CHART_PATH/." "$TEMP_CHART_PATH/"
+
+          echo "Copying deployment values file $VALUES_FILE into $TEMP_CHART_PATH/values-deployment.yaml..."
+          cp "$VALUES_FILE" "$TEMP_CHART_PATH/values-deployment.yaml"
+
+          helm package "$TEMP_CHART_PATH" \
+            --version "$CHART_VERSION" \
+            --app-version "$CHART_VERSION" \
+            --destination packaged
+
+          ls -lrt packaged
+
+      - name: Push Helm chart to ECR as OCI artifact
+        if: ${{ matrix.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          helm push "packaged/${CHART_NAME}-${CHART_VERSION}.tgz" "$HELM_PUSH_URL"
+
+          echo "Published Helm chart:"
+          echo "$HELM_CHART_REF:$CHART_VERSION"
+
+      - name: Verify Helm chart can be pulled from ECR
+        if: ${{ matrix.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p pulled
+
+          helm pull "$HELM_CHART_REF" \
+            --version "$CHART_VERSION" \
+            --destination pulled
+
+          ls -lrt pulled
+
+      - name: Connect to EKS cluster
+        if: ${{ matrix.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Target EKS cluster name: ${EKS_CLUSTER_NAME}"
+          echo "Target EKS cluster ARN: ${EKS_CLUSTER_ARN}"
+          echo "Target EKS account ID: ${WORKLOAD_ACCOUNT_ID}"
+          echo "Current AWS identity:"
+          aws sts get-caller-identity
+
+          echo "Connecting to EKS using cross-account EKS deploy role:"
+          echo "${EKS_DEPLOY_ROLE_ARN}"
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}" \
+            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
+            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
+
+          echo "Current kube context:"
+          kubectl config current-context
+          kubectl version --client=true
+
+          echo "Verifying EKS access..."
+
+          echo "Checking permission to read CSIDriver..."
+          kubectl auth can-i get csidrivers.storage.k8s.io || true
+
+          echo "Checking permission to read SecretProviderClass..."
+          kubectl auth can-i get secretproviderclasses.secrets-store.csi.x-k8s.io --all-namespaces || true
+
+          echo "Checking permission to manage Argo CD Applications..."
+          kubectl auth can-i create applications.argoproj.io -n "${ARGOCD_NAMESPACE}" || true
+
+      - name: Validate Secrets Store CSI configuration
+        if: ${{ matrix.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking Secrets Store CSI Driver prerequisites..."
+
+          echo "Checking CSIDriver secrets-store.csi.k8s.io exists..."
+          kubectl get csidriver secrets-store.csi.k8s.io >/dev/null || {
+            echo "CSIDriver secrets-store.csi.k8s.io not found. Secrets Store CSI Driver is not installed on this cluster."
+            exit 1
+          }
+
+          echo "Checking SecretProviderClass CRD exists..."
+          kubectl get crd secretproviderclasses.secrets-store.csi.x-k8s.io >/dev/null || {
+            echo "CRD secretproviderclasses.secrets-store.csi.x-k8s.io not found."
+            exit 1
+          }
+
+          echo "Checking CSIDriver tokenRequests audiences..."
+          TOKEN_REQUESTS="$(kubectl get csidriver secrets-store.csi.k8s.io -o jsonpath='{.spec.tokenRequests}')"
+
+          echo "${TOKEN_REQUESTS}" | grep -q "sts.amazonaws.com" || {
+            echo "CSIDriver secrets-store.csi.k8s.io is missing tokenRequests audience sts.amazonaws.com."
+            echo "Current tokenRequests: ${TOKEN_REQUESTS}"
+            exit 1
+          }
+
+          echo "${TOKEN_REQUESTS}" | grep -q "pods.eks.amazonaws.com" || {
+            echo "CSIDriver secrets-store.csi.k8s.io is missing tokenRequests audience pods.eks.amazonaws.com."
+            echo "Current tokenRequests: ${TOKEN_REQUESTS}"
+            exit 1
+          }
+
+          echo "tokenRequests OK: ${TOKEN_REQUESTS}"
+
+          echo "Checking Secrets Store CSI Driver Helm release for syncSecret.enabled..."
+          if helm status secrets-store-csi-driver -n kube-system >/dev/null 2>&1; then
+            # Secrets Store CSI syncSecret Validation False-Negative Correction: syncSecret.enabled is now read STRUCTURALLY from Helm's own JSON-rendered computed values (python3's stdlib json module, the same --output json + python3 convention already established elsewhere in this workflow for AWS CLI output) -- never by grep-scraping the human-readable `helm get values` YAML text. That text-scraping approach was a proven live false negative: a real cluster with syncSecret.enabled=true (confirmed in the very same log output) still failed this check, because `grep -A3 -i syncSecret | grep -qi "enabled: true"` is fragile against real-world YAML formatting/ordering and can also false-POSITIVE against an unrelated "enabled: true" field elsewhere in a large corporate Helm release values tree. No PyYAML/yq/jq dependency is introduced. The literal JSON boolean true is the only accepted value -- false, missing syncSecret, missing enabled, null, the string "true", and malformed JSON all fail closed with a concise, specific diagnostic (never a full release-values dump).
+            CSI_VALUES_JSON="$(helm get values secrets-store-csi-driver -n kube-system --all --output json)"
+
+            if ! python3 - "$CSI_VALUES_JSON" <<'PYEOF'
+          import json
+          import sys
+
+          raw = sys.argv[1]
+          try:
+              values = json.loads(raw)
+          except json.JSONDecodeError as exc:
+              print(f"FAIL: helm get values --output json produced malformed JSON: {exc}", file=sys.stderr)
+              sys.exit(1)
+
+          if not isinstance(values, dict):
+              print(f"FAIL: helm get values --output json produced a top-level {type(values).__name__}, expected a JSON object.", file=sys.stderr)
+              sys.exit(1)
+
+          sync_secret = values.get("syncSecret")
+          if not isinstance(sync_secret, dict):
+              print(f"FAIL: syncSecret is {sync_secret!r} (missing or not an object) in the computed Helm values for secrets-store-csi-driver.", file=sys.stderr)
+              sys.exit(1)
+
+          if "enabled" not in sync_secret:
+              print("FAIL: syncSecret.enabled is not present in the computed Helm values for secrets-store-csi-driver.", file=sys.stderr)
+              sys.exit(1)
+
+          enabled = sync_secret["enabled"]
+          # Strict identity check (never == ): JSON true decodes to the Python True singleton only -- 1, "true", and every other JSON-boolean-like value must still fail closed.
+          if enabled is not True:
+              print(f"FAIL: syncSecret.enabled is {enabled!r} ({type(enabled).__name__}), expected the literal JSON boolean true.", file=sys.stderr)
+              sys.exit(1)
+
+          print("syncSecret.enabled=true confirmed (structural JSON check).")
+          PYEOF
+            then
+              echo "GoldenGate runtime admin credentials use SecretProviderClass secretObjects and therefore require Secrets Store CSI Driver secret synchronization to be enabled."
+              exit 1
+            fi
+          else
+            echo "Helm release secrets-store-csi-driver not found in kube-system. Skipping syncSecret check (driver may be managed outside Helm)."
+          fi
+
+          echo "Secrets Store CSI Driver prerequisites validated."
+
+      - name: Ensure Argo CD Application CRD exists
+        if: ${{ matrix.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking Argo CD Application CRD..."
+
+          kubectl get crd applications.argoproj.io >/dev/null || {
+            echo "CRD applications.argoproj.io not found."
+            echo "Argo CD prerequisite is not healthy."
+            echo "This orchestrator's own argocd_preflight/reconcile_argocd/validate_argocd_ready jobs already classify and automatically reconcile Argo CD, and required validate_argocd_ready to converge to exactly HEALTHY before this stage could ever be reached -- this check is defense in depth against an unexpected mid-DAG loss of the CRD, never the normal recovery path. Re-running 00 | MAIN (.github/workflows/00-main-goldengate-orchestrator.yaml) re-classifies and automatically reconciles Argo CD; it is the operational entry point, not a standalone specialist-workflow dispatch."
+            exit 1
+          }
+
+          echo "Argo CD Application CRD is present."
+
+      - name: (Emergency fallback only) Refresh temporary Argo CD ECR OCI password
+        # Emergency fallback only; long-term auth is handled in-cluster by argocd-ecr-token-sync (IRSA role ARGOCD_ECR_READ_ROLE_ARN).
+        if: ${{ matrix.deploy && vars.ENABLE_TEMP_ARGOCD_ECR_PASSWORD_INJECTION == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "EMERGENCY FALLBACK: injecting a short-lived ECR password into Argo CD."
+          echo "This is not the long-term auth path -- disable ENABLE_TEMP_ARGOCD_ECR_PASSWORD_INJECTION"
+          echo "once the in-cluster argocd-ecr-token-sync (IRSA role ${ARGOCD_ECR_READ_ROLE_ARN}) is live."
+
+          ECR_PASSWORD="$(aws ecr get-login-password --region "$AWS_REGION")"
+
+          cat <<EOF | kubectl apply -f - >/dev/null
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: argocd-ecr-goldengate-oci
+            namespace: ${ARGOCD_NAMESPACE}
+            labels:
+              argocd.argoproj.io/secret-type: repository
+          stringData:
+            type: helm
+            enableOCI: "true"
+            url: ${ECR_REGISTRY}/${HELM_OCI_NAMESPACE}/${CHART_NAME}
+            username: AWS
+            password: "${ECR_PASSWORD}"
+          EOF
+
+          unset ECR_PASSWORD
+
+          echo "Argo CD repository credentials Secret applied: argocd-ecr-goldengate-oci"
+
+      - name: Create or update Argo CD Application
+        if: ${{ matrix.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Applying Argo CD Application: ${ARGOCD_APP_NAME} (deploymentModel=${DEPLOYMENT_MODEL})"
+
+          # singleRuntime deploys into the shared goldengate-<environment> namespace (no CreateNamespace/managedNamespaceMetadata); no observer or global.deploymentId parameters needed.
+          cat <<EOF | kubectl apply -f -
+          apiVersion: argoproj.io/v1alpha1
+          kind: Application
+          metadata:
+            name: ${ARGOCD_APP_NAME}
+            namespace: ${ARGOCD_NAMESPACE}
+            finalizers:
+              - resources-finalizer.argocd.argoproj.io
+            labels:
+              app.kubernetes.io/name: goldengate
+              app.kubernetes.io/managed-by: argocd
+              goldengate.adcb/environment: ${ENVIRONMENT}
+              goldengate.adcb/deployment-id: ${DEPLOYMENT_ID}
+          spec:
+            project: default
+            source:
+              repoURL: ${HELM_CHART_REF}
+              targetRevision: ${CHART_VERSION}
+              path: .
+              helm:
+                releaseName: ${RELEASE_NAME}
+                valueFiles:
+                  - values-deployment.yaml
+                parameters:
+                  - name: global.environment
+                    value: ${ENVIRONMENT}
+                  - name: runtime.image.repository
+                    value: ${IMAGE_REPOSITORY}
+                  - name: ingress.hostDomain
+                    value: ${RESOLVED_DNS_DOMAIN}
+                  - name: ingress.alb.groupName
+                    value: ${RESOLVED_ALB_GROUP_NAME}
+                  - name: ingress.alb.certificateArn
+                    value: ${RESOLVED_CERTIFICATE_ARN}
+                  - name: runtime.csi.admin.objectName
+                    value: ${RESOLVED_ADMIN_SECRET_NAME}
+                  - name: runtime.csi.certificate.objectName
+                    value: ${RESOLVED_TLS_SECRET_NAME}
+                  - name: runtime.csi.region
+                    value: ${AWS_REGION}
+                  - name: runtime.serviceAccount.create
+                    value: "false"
+                  - name: runtime.serviceAccount.name
+                    value: ${RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME}
+                  - name: persistence.efs.fileSystemId
+                    value: ${RESOLVED_EFS_ID}
+            destination:
+              server: https://kubernetes.default.svc
+              namespace: ${TARGET_NAMESPACE}
+            syncPolicy:
+              automated:
+                prune: true
+                selfHeal: true
+            revisionHistoryLimit: 10
+          EOF
+
+          echo "Forcing Argo CD refresh for ${ARGOCD_APP_NAME}..."
+
+          kubectl annotate application "${ARGOCD_APP_NAME}" \
+            -n "${ARGOCD_NAMESPACE}" \
+            argocd.argoproj.io/refresh=hard \
+            --overwrite
+
+      - name: Wait for Argo CD sync and health
+        if: ${{ matrix.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Waiting for Argo CD Application ${ARGOCD_APP_NAME} to become Synced and Healthy..."
+
+          TIMEOUT_SECONDS=1200
+          INTERVAL_SECONDS=30
+          ELAPSED=0
+
+          while true; do
+            if kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" >/dev/null 2>&1; then
+              SYNC_STATUS="$(kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" -o jsonpath='{.status.sync.status}' 2>/dev/null || echo "Unknown")"
+              HEALTH_STATUS="$(kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" -o jsonpath='{.status.health.status}' 2>/dev/null || echo "Unknown")"
+              OPERATION_PHASE="$(kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" -o jsonpath='{.status.operationState.phase}' 2>/dev/null || echo "")"
+
+              echo "[$(date -u +%H:%M:%S)] sync=${SYNC_STATUS} health=${HEALTH_STATUS} operation=${OPERATION_PHASE:-none} (elapsed ${ELAPSED}s / ${TIMEOUT_SECONDS}s)"
+
+              if [ "${HEALTH_STATUS}" = "Degraded" ]; then
+                echo "Argo CD Application ${ARGOCD_APP_NAME} is Degraded."
+                kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" -o wide
+                exit 1
+              fi
+
+              if [ "${OPERATION_PHASE}" = "Failed" ] || [ "${OPERATION_PHASE}" = "Error" ]; then
+                echo "Argo CD sync operation for ${ARGOCD_APP_NAME} ${OPERATION_PHASE}."
+                kubectl describe application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}"
+                exit 1
+              fi
+
+              if [ "${SYNC_STATUS}" = "Synced" ] && [ "${HEALTH_STATUS}" = "Healthy" ]; then
+                echo "Argo CD Application ${ARGOCD_APP_NAME} is Synced and Healthy."
+                break
+              fi
+            else
+              echo "[$(date -u +%H:%M:%S)] Argo CD Application ${ARGOCD_APP_NAME} not found yet (elapsed ${ELAPSED}s / ${TIMEOUT_SECONDS}s)."
+            fi
+
+            if [ "${ELAPSED}" -ge "${TIMEOUT_SECONDS}" ]; then
+              echo "Timed out after ${TIMEOUT_SECONDS}s waiting for ${ARGOCD_APP_NAME} to become Synced and Healthy."
+              kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" -o wide || true
+              kubectl describe application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" || true
+              exit 1
+            fi
+
+            sleep "${INTERVAL_SECONDS}"
+            ELAPSED=$((ELAPSED + INTERVAL_SECONDS))
+          done
+
+          echo "Final Argo CD Application status:"
+          kubectl get application "${ARGOCD_APP_NAME}" -n "${ARGOCD_NAMESPACE}" -o wide
+
+      - name: Verify Argo CD deployment
+        if: ${{ matrix.deploy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Argo CD Application:"
+          kubectl get application "$ARGOCD_APP_NAME" -n "$ARGOCD_NAMESPACE" -o wide
+
+          echo ""
+          echo "Argo CD Application details:"
+          kubectl describe application "$ARGOCD_APP_NAME" -n "$ARGOCD_NAMESPACE"
+
+          echo ""
+          echo "Kubernetes resources in target namespace:"
+          kubectl get all -n "$TARGET_NAMESPACE" || true
+
+          echo ""
+          echo "Ingress:"
+          kubectl get ingress -n "$TARGET_NAMESPACE" || true
+
+          echo ""
+          echo "PVCs:"
+          kubectl get pvc -n "$TARGET_NAMESPACE" || true
+
+          echo ""
+          echo "EFS StorageClass for this deployment:"
+          # Not fatal: grep exiting non-zero here just means "not found".
+          kubectl get storageclass | grep "gg-efs-${ENVIRONMENT}-${DEPLOYMENT_ID}" || true
+
+          echo ""
+          echo "PersistentVolumes (cluster-scoped; PV output may not show namespace"
+          echo "depending on -o format, so this is informational, not filtered):"
+          kubectl get pv || true
+
+          echo ""
+          echo "PVC details:"
+          kubectl describe pvc -n "$TARGET_NAMESPACE" || true
+
+      - name: Upload rendered manifests and chart package
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: goldengate-helm-artifacts-${{ matrix.environment }}-${{ matrix.deployment_id }}
+          path: |
+            rendered/
+            packaged/
+            pulled/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Workflow summary
+        if: always()
+        shell: bash
+        env:
+          DEPLOYMENT_MATRIX: ${{ inputs.deployment_matrix }}
+        run: |
+          {
+            echo "## GoldenGate EKS Argo CD-based Deploy Summary"
+            echo ""
+            echo "### Deployment details"
+            echo ""
+            echo "- Environment: \`${ENVIRONMENT}\`"
+            echo "- Deployment ID: \`${DEPLOYMENT_ID}\`"
+            echo "- Target namespace: \`${TARGET_NAMESPACE}\`"
+            echo "- Argo CD Application: \`${ARGOCD_APP_NAME}\` (namespace: \`${ARGOCD_NAMESPACE}\`)"
+            echo "- Helm releaseName (used by Argo CD): \`${RELEASE_NAME}\`"
+            echo "- Values file: \`${VALUES_FILE}\`"
+            echo "- Deploy enabled: \`${{ matrix.deploy }}\`"
+            echo ""
+            echo "### AWS / EKS details"
+            echo ""
+            echo "- AWS region: \`${AWS_REGION}\`"
+            echo "- ECR registry: \`${ECR_REGISTRY}\`"
+            echo "- EKS account ID: \`${WORKLOAD_ACCOUNT_ID}\`"
+            echo "- EKS cluster name: \`${EKS_CLUSTER_NAME}\`"
+            echo "- EKS cluster ARN: \`${EKS_CLUSTER_ARN}\`"
+            echo ""
+            echo "### Published Helm OCI chart"
+            echo ""
+            echo "- Chart ref: \`${HELM_CHART_REF}\`"
+            echo "- Chart version: \`${CHART_VERSION}\`"
+            echo "- ECR OCI repo: \`${HELM_ECR_REPOSITORY}\`"
+            echo ""
+            echo "- Selected deployments this run: \`${DEPLOYMENT_MATRIX}\`"
+            echo ""
+            echo "Observer sidecar support has been retired (Phase 5A). No observer image is"
+            echo "built, and no goldengate-observer container is rendered for any deployment"
+            echo "model. Shared GoldenGate monitoring is performed by the shared gg-monitor"
+            echo "Deployment (\`${MONITOR_NAMESPACE}\` namespace) polling Admin REST/PMS and"
+            echo "publishing manager-compatible CloudWatch metrics under the GoldenGate/Pipelines"
+            echo "namespace."
+            echo ""
+            echo "Independent CloudWatch verification (read-capable identity required):"
+            echo ""
+            echo "\`\`\`bash"
+            echo "aws cloudwatch list-metrics --namespace GoldenGate/Pipelines --region ${AWS_REGION}"
+            echo "\`\`\`"
+            echo ""
+            echo "### ECR repository policy prerequisites"
+            echo ""
+            echo "The \"Ensure Helm ECR repository policy allows Argo CD pull\" step requires the"
+            echo "GitHub Actions workflow role (\`${RUNNER_ROLE_ARN}\`) to have \`ecr:GetRepositoryPolicy\`"
+            echo "and \`ecr:SetRepositoryPolicy\` on \`${HELM_ECR_REPOSITORY}\`. If that step failed"
+            echo "above with an access-denied error, grant those two actions to the role before"
+            echo "re-running."
+            echo ""
+            echo "### Ownership"
+            echo ""
+            echo "Argo CD owns create/update/delete of this GoldenGate deployment's Kubernetes"
+            echo "resources. GitHub Actions only packages/publishes the Helm OCI chart and"
+            echo "creates/updates the Argo CD Application resource -- it does not run"
+            echo "\`helm upgrade --install\` or \`helm uninstall\` against the cluster."
+            echo ""
+            echo "Argo CD ECR OCI repository credentials are expected to be maintained by the"
+            echo "in-cluster token refresh component using IRSA role \`${ARGOCD_ECR_READ_ROLE_ARN}\`."
+            echo "GitHub Actions ensures the helm/goldengate ECR repository policy grants that"
+            echo "role pull access on every run, but is not the long-term source of Argo CD's"
+            echo "ECR credentials."
+            echo ""
+            echo "A values.yaml is inactive (excluded from the build/update matrix) when it is"
+            echo "missing, zero-byte, whitespace-only, comment-only, parses to YAML null,"
+            echo "enabled=false, or deployment.enabled=false."
+            echo ""
+            echo "Of those, deletion (deletes the Argo CD Application and, if safely"
+            echo "identifiable, its namespace) is triggered by:"
+            echo "- physical removal of the values file or its whole deployment folder"
+            echo "  (including removal of the entire envs/${ENVIRONMENT}/ directory);"
+            echo "- a values file that still exists but is now zero-byte;"
+            echo "- a values file that still exists but is now whitespace-only;"
+            echo "- a values file that still exists but is now comment-only;"
+            echo "- a values file that still exists but now parses to YAML null;"
+            echo "- an explicit enabled=false or deployment.enabled=false (descriptor and any"
+            echo "  managed persistent storage it names are retained -- only the Argo CD"
+            echo "  Application/runtime workload are removed)."
+            echo "The four \"still exists but emptied\" shapes above only trigger deletion when"
+            echo "the previous revision at that path was a valid GoldenGate deployment -- the"
+            echo "deployment_model recorded for deletion is always read from that previous,"
+            echo "valid revision, never inferred or defaulted."
+            echo ""
+            echo "deployment.enabled is the single authoritative runtime-presence control:"
+            echo "enabled=true means the runtime should exist and this workflow reconciles it;"
+            echo "enabled=false means it should not, and this workflow safely removes its Argo"
+            echo "CD Application/workload while the descriptor and any managed persistent"
+            echo "storage it names are retained. lifecycle.state is retired and rejected"
+            echo "outright by the deployment model -- it is never a second source of truth for"
+            echo "runtime presence."
+            echo ""
+            echo "### Validation commands"
+            echo ""
+            echo "\`\`\`bash"
+            echo "kubectl get application ${ARGOCD_APP_NAME} -n ${ARGOCD_NAMESPACE} -o wide"
+            echo "kubectl describe application ${ARGOCD_APP_NAME} -n ${ARGOCD_NAMESPACE}"
+            echo "kubectl get all -n ${TARGET_NAMESPACE}"
+            echo "kubectl get pvc -n ${TARGET_NAMESPACE}"
+            echo "kubectl get ingress -n ${TARGET_NAMESPACE}"
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  delete_removed_argocd_applications:
+    name: Delete removed GoldenGate Argo CD Applications
+
+    # GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 1: this job performs the SAME class of consequential Kubernetes mutation (kubectl patch/delete application, kubectl delete namespace) as build_publish_and_deploy, but previously ran the instant detect_changed_deployments alone succeeded with a non-empty deletion_matrix -- entirely bypassing MAIN's single GoldenGate application deployment authorization (goldengate_deploy_authorization) and the post-reconciliation Argo CD HEALTHY acceptance gate (validate_argocd_ready). Runtime removal must not mutate Kubernetes until the normal MAIN deployment authorization has succeeded, exactly like every other mutating job in this DAG. Requiring validate_argocd_ready's own success here proves that chain WITHOUT duplicating it or opening a second environment: approval: validate_argocd_ready is itself transitively downstream of terraform_sync_once -> argocd_preflight -> goldengate_deploy_authorization -> reconcile_argocd -> validate_argocd_ready, and its own if: already fails closed (non-success) whenever any link in that chain failed, was cancelled, or never ran. GoldenGate Runtime Presence Contract Finalization: previously push-only. A manual workflow_dispatch Deploy (environment-wide or a specific selected deployment_id) can now also populate deletion_matrix -- deployment.enabled=false is a first-class desired-absence request regardless of trigger type, and detect_changed_deployments' workflow_dispatch branch only ever populates deletion_matrix when the manual action was actually Deploy (never Validate).
+    if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && inputs.effective_deploy == 'true' && inputs.has_deletions == 'true' }}
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(inputs.deletion_matrix) }}
+
+    concurrency:
+      group: goldengate-argocd-delete-${{ github.ref }}-${{ matrix.environment }}-${{ matrix.deployment_id }}
+      cancel-in-progress: false
+
+    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail -- matrix jobs draw the selected environment from their own matrix entry, never needs.validate_model.outputs.selected_environment.
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ matrix.environment }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Load resolved environment config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
+
+      - name: Install kubectl if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking/installing kubectl..."
+
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KUBECTL_VERSION="v1.35.0"
+
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64)
+                KUBECTL_ARCH="amd64"
+                ;;
+              aarch64|arm64)
+                KUBECTL_ARCH="arm64"
+                ;;
+              *)
+                echo "Unsupported architecture for kubectl: $ARCH"
+                exit 1
+                ;;
+            esac
+
+            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+            sudo chmod +x /usr/local/bin/kubectl
+          fi
+
+          kubectl version --client=true
+
+      - name: Verify AWS identity and kubectl
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking AWS identity..."
+          aws sts get-caller-identity
+
+          echo "Checking kubectl..."
+          kubectl version --client=true
+
+      - name: Prepare deletion variables
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ENVIRONMENT="${{ matrix.environment }}"
+          DEPLOYMENT_ID="${{ matrix.deployment_id }}"
+          DEPLOYMENT_MODEL="${{ matrix.deployment_model }}"
+
+          if [[ ! "$DEPLOYMENT_ID" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
+            echo "Invalid deployment_id: $DEPLOYMENT_ID"
+            echo "Use lowercase letters, numbers, and hyphens only."
+            exit 1
+          fi
+
+          # deployment_model must be exactly "singleRuntime" or "legacyPair" from the deletion matrix; it directly controls namespace deletion safety below, so fail closed on anything else.
+          if [ "$DEPLOYMENT_MODEL" != "legacyPair" ] && [ "$DEPLOYMENT_MODEL" != "singleRuntime" ]; then
+            echo "FAIL: unrecognized deployment_model '${DEPLOYMENT_MODEL}' from the deletion matrix (expected exactly 'singleRuntime' or 'legacyPair')."
+            echo "Refusing to guess or default this value -- it directly controls which namespace/Application this job targets for deletion. This indicates a bug in the upstream deletion matrix; investigate detect_changed_deployments before re-running."
+            exit 1
+          fi
+
+          # ARGOCD_NAMESPACE/RUNTIME_NAMESPACE are already loaded (canonical) by the "Load resolved environment config" step above -- never reconstructed here.
+          # legacyPair naming (kept only here, for deleting historical resources): Application=goldengate-<deployment-id>, namespace=gg-<environment>-<deployment-id>.
+          if [ "$DEPLOYMENT_MODEL" = "singleRuntime" ]; then
+            TARGET_NAMESPACE="${RUNTIME_NAMESPACE}"
+            APP_SUFFIX="${DEPLOYMENT_ID#gg-}"
+            ARGOCD_APP_NAME="goldengate-${ENVIRONMENT}-${APP_SUFFIX}"
+          else
+            TARGET_NAMESPACE="gg-${ENVIRONMENT}-${DEPLOYMENT_ID}"
+            ARGOCD_APP_NAME="goldengate-${DEPLOYMENT_ID}"
+          fi
+
+          echo "ENVIRONMENT=${ENVIRONMENT}" >> "$GITHUB_ENV"
+          echo "DEPLOYMENT_ID=${DEPLOYMENT_ID}" >> "$GITHUB_ENV"
+          echo "DEPLOYMENT_MODEL=${DEPLOYMENT_MODEL}" >> "$GITHUB_ENV"
+          echo "ARGOCD_APP_NAME=${ARGOCD_APP_NAME}" >> "$GITHUB_ENV"
+          echo "TARGET_NAMESPACE=${TARGET_NAMESPACE}" >> "$GITHUB_ENV"
+
+          echo "Deletion target:"
+          echo "Environment: ${ENVIRONMENT}"
+          echo "Deployment ID: ${DEPLOYMENT_ID}"
+          echo "Deployment model: ${DEPLOYMENT_MODEL}"
+          echo "Argo CD Application: ${ARGOCD_APP_NAME}"
+          echo "Target namespace: ${TARGET_NAMESPACE}"
+
+      - name: Connect to EKS cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Connecting to EKS using cross-account EKS deploy role:"
+          echo "${EKS_DEPLOY_ROLE_ARN}"
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}" \
+            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
+            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
+
+          echo "Current kube context:"
+          kubectl config current-context
+
+      - name: Classify runtime ownership safety before removal (read-only)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # GoldenGate Runtime Presence Contract Finalization (Defect 4): read-only ownership classification MUST run and be evaluated BEFORE any Application finalizer patch, Application deletion, workload deletion, or namespace deletion below -- reuses hack/orchestration/runtime_state.py (the SAME canonical ABSENT/OWNED/BROKEN classifier the reconcile-side runtime_ownership_preflight job already relies on), never a second/duplicated ownership mechanism. BROKEN (a foreign/ambiguous/unsafe footprint) fails closed right here, before any mutation -- a foreign same-named Application is never patched or deleted.
+          # GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 2: legacyPair is retired and is not a currently supported deployment model. The singleRuntime ownership classifier's Application-naming/namespace convention does not apply to it, and building a second legacy-specific ownership classifier purely to keep automatic deletion working is out of scope -- so it fails closed HERE, before any mutation is even attempted, rather than proceeding unclassified (the previous RUNTIME_OWNERSHIP_STATE=NOT_APPLICABLE bypass let "Delete Argo CD Application" patch/delete a legacyPair Application without ever proving ownership; the later namespace-label check ran too late to prevent that Application mutation). There is no destructive allow-list state for an unsupported/legacy deployment model: OWNED authorizes mutation, ABSENT is a safe no-op, and everything else -- BROKEN, or an unsupported/unrecognized deployment_model -- fails closed before mutation.
+          if [ "$DEPLOYMENT_MODEL" != "singleRuntime" ]; then
+            echo "FAIL: deployment_model=${DEPLOYMENT_MODEL} is not a currently supported runtime deployment model (only singleRuntime is) -- refusing to patch finalizers or delete anything for ${ARGOCD_APP_NAME}. A retired/unsupported deployment model can never be automatically classified as OWNED here; this requires manual, out-of-band investigation and cleanup, never an automatic bypass."
+            exit 1
+          fi
+
+          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
+
+          # A non-zero exit here is either a configuration error or a classifier inspection error (API unreachable, permission denied, malformed JSON) -- never silently downgraded to ABSENT/safe.
+          if ! CLASSIFIER_OUTPUT="$(python3 hack/orchestration/runtime_state.py --environment "${ENVIRONMENT}" --deployment-id "${DEPLOYMENT_ID}")"; then
+            echo "FAIL: the GoldenGate runtime ownership classifier could not classify ${DEPLOYMENT_ID} (configuration or inspection error, not ABSENT) -- refusing to proceed with removal. See diagnostics above."
+            exit 1
+          fi
+
+          echo "$CLASSIFIER_OUTPUT"
+
+          STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
+          echo "GoldenGate runtime ownership-safety state for ${DEPLOYMENT_ID}: ${STATE}"
+          echo "RUNTIME_OWNERSHIP_STATE=${STATE}" >> "$GITHUB_ENV"
+
+          if [ "$STATE" = "BROKEN" ]; then
+            echo "FAIL: GoldenGate runtime ownership-safety state for ${DEPLOYMENT_ID} is BROKEN -- an existing Argo CD Application/footprint named ${ARGOCD_APP_NAME} does not clearly belong to this deployment (foreign or ambiguous ownership). Refusing to patch finalizers or delete anything. This is a safety failure, not auto-repaired here -- investigate the diagnostics above before re-running."
+            exit 1
+          fi
+
+          if [ "$STATE" = "ABSENT" ]; then
+            echo "Nothing exists for ${DEPLOYMENT_ID} -- the removal steps below will each independently no-op (Application/namespace already absent)."
+          else
+            echo "${DEPLOYMENT_ID} is OWNED -- safe to proceed with removal."
+          fi
+
+      - name: Delete Argo CD Application
+        shell: bash
+        # Explicit step-level gate, matching the ABSENT/OWNED/BROKEN contract: BROKEN and unsupported/legacy deployment models already exited the job in the classify step above (this condition is defense-in-depth, not the sole gate) -- only OWNED/ABSENT are ever allowed to reach a mutating step. GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 2: NOT_APPLICABLE is removed -- it existed only to bypass ownership classification for legacyPair, which now fails closed instead; there is no remaining state that authorizes mutation without having been classified.
+        if: env.RUNTIME_OWNERSHIP_STATE == 'OWNED' || env.RUNTIME_OWNERSHIP_STATE == 'ABSENT'
+        run: |
+          set -euo pipefail
+
+          if kubectl get application "$ARGOCD_APP_NAME" -n "$ARGOCD_NAMESPACE" >/dev/null 2>&1; then
+            echo "Argo CD Application ${ARGOCD_APP_NAME} found. Deleting..."
+
+            kubectl patch application "$ARGOCD_APP_NAME" \
+              -n "$ARGOCD_NAMESPACE" \
+              --type merge \
+              -p '{"metadata":{"finalizers":["resources-finalizer.argocd.argoproj.io"]}}'
+
+            kubectl delete application "$ARGOCD_APP_NAME" \
+              -n "$ARGOCD_NAMESPACE" \
+              --wait=true \
+              --timeout=10m
+
+            echo "Argo CD Application ${ARGOCD_APP_NAME} deleted."
+            echo "Argo CD will cascade-delete its managed resources in ${TARGET_NAMESPACE}."
+          else
+            echo "Argo CD Application ${ARGOCD_APP_NAME} not found in namespace ${ARGOCD_NAMESPACE}. Nothing to delete."
+          fi
+
+      - name: Clean up remaining GoldenGate namespace if still present
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # HARD FAIL-SAFE: never delete the shared runtime namespace (canonical RUNTIME_NAMESPACE), regardless of deployment_model or labels -- checked on the namespace value itself, the same canonical value used to set TARGET_NAMESPACE above.
+          if [ "$TARGET_NAMESPACE" = "${RUNTIME_NAMESPACE}" ]; then
+            echo "Refusing to delete namespace ${TARGET_NAMESPACE}: this is the shared ${RUNTIME_NAMESPACE} namespace, never owned by an individual deployment/Application. Namespace deletion is unconditionally skipped for singleRuntime deployments."
+            exit 0
+          fi
+
+          # Guarded fallback: only deletes the namespace if it still exists AND carries exactly this deployment's ownership labels.
+          if kubectl get namespace "$TARGET_NAMESPACE" >/dev/null 2>&1; then
+            echo "Namespace ${TARGET_NAMESPACE} still exists after Argo CD Application deletion. Verifying ownership labels before cleanup..."
+
+            APP_NAME_LABEL="$(kubectl get namespace "$TARGET_NAMESPACE" -o jsonpath='{.metadata.labels.app\.kubernetes\.io/name}' 2>/dev/null || true)"
+            MANAGED_BY_LABEL="$(kubectl get namespace "$TARGET_NAMESPACE" -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}' 2>/dev/null || true)"
+            ENV_LABEL="$(kubectl get namespace "$TARGET_NAMESPACE" -o jsonpath='{.metadata.labels.goldengate\.adcb/environment}' 2>/dev/null || true)"
+            DEPLOYMENT_LABEL="$(kubectl get namespace "$TARGET_NAMESPACE" -o jsonpath='{.metadata.labels.goldengate\.adcb/deployment-id}' 2>/dev/null || true)"
+
+            if [ "$APP_NAME_LABEL" = "goldengate" ] &&
+               [ "$MANAGED_BY_LABEL" = "argocd" ] &&
+               [ "$ENV_LABEL" = "$ENVIRONMENT" ] &&
+               [ "$DEPLOYMENT_LABEL" = "$DEPLOYMENT_ID" ]; then
+              echo "Namespace labels match expected GoldenGate ownership. Deleting namespace ${TARGET_NAMESPACE}..."
+              kubectl delete namespace "$TARGET_NAMESPACE" --wait=true --timeout=10m
+            else
+              echo "Namespace ${TARGET_NAMESPACE} still exists but ownership labels do not match expected values."
+              echo "app.kubernetes.io/name=${APP_NAME_LABEL}"
+              echo "app.kubernetes.io/managed-by=${MANAGED_BY_LABEL}"
+              echo "goldengate.adcb/environment=${ENV_LABEL}"
+              echo "goldengate.adcb/deployment-id=${DEPLOYMENT_LABEL}"
+              echo "Refusing to delete namespace automatically."
+              exit 1
+            fi
+          else
+            echo "Namespace ${TARGET_NAMESPACE} already removed."
+          fi
+
+      - name: Verify runtime compute is absent after removal (read-only)
+        if: env.RUNTIME_OWNERSHIP_STATE == 'OWNED' || env.RUNTIME_OWNERSHIP_STATE == 'ABSENT'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 5: does not merely trust "kubectl delete application --wait=true" plus a log message claiming Argo cascades resources -- performs a bounded READ-ONLY re-classification proving runtime COMPUTE is actually gone. Reuses hack/orchestration/runtime_state.py (the SAME canonical classifier, never a second/duplicated acceptance implementation): after removal, ABSENT or OWNED both structurally guarantee every compute/workload footprint kind (Application, StatefulSet, runtime Services, headless Service, runtime Ingress, both runtime SecretProviderClasses, StorageClass) is absent -- the classifier's own "non_pvc_footprint_found" check is exactly what would flip the result to BROKEN if any of them were still lingering. The intentionally retained durable PVC (Prune=false), the underlying managed EFS filesystem, the shared runtime namespace, and AWS Secrets Manager secrets are all correctly ALLOWED to remain -- none of them are examined as compute here, and OWNED (retained-persistence-only) is an explicitly accepted outcome, never treated as a failure. If unexpected compute still shows BROKEN after the bounded deadline below, this fails closed rather than silently accepting an incomplete deletion -- and never deletes anything further itself; investigate and re-run instead.
+          if [ "$DEPLOYMENT_MODEL" != "singleRuntime" ]; then
+            echo "Deployment model is ${DEPLOYMENT_MODEL} -- the singleRuntime post-delete compute-absence check does not apply to this retired historical path."
+            exit 0
+          fi
+
+          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
+
+          TIMEOUT_SECONDS=180
+          INTERVAL_SECONDS=15
+          ELAPSED=0
+
+          while true; do
+            if CLASSIFIER_OUTPUT="$(python3 hack/orchestration/runtime_state.py --environment "${ENVIRONMENT}" --deployment-id "${DEPLOYMENT_ID}")"; then
+              STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
+              if [ "$STATE" != "BROKEN" ]; then
+                echo "OK: post-delete runtime compute absence confirmed for ${DEPLOYMENT_ID} (state=${STATE}). Application/StatefulSet/runtime Services/headless Service/runtime Ingress/runtime SecretProviderClasses/StorageClass are all absent. A retained durable PVC (if this deployment declares chart-owned EFS persistence), the underlying managed EFS filesystem, the shared runtime namespace, and AWS Secrets Manager secrets are all allowed to remain."
+                exit 0
+              fi
+              echo "[$(date -u +%H:%M:%S)] post-delete classifier still reports BROKEN for ${DEPLOYMENT_ID} (elapsed ${ELAPSED}s / ${TIMEOUT_SECONDS}s) -- unexpected compute may still be draining; diagnostics:"
+              echo "$CLASSIFIER_OUTPUT"
+            else
+              echo "[$(date -u +%H:%M:%S)] post-delete classifier inspection error for ${DEPLOYMENT_ID} (elapsed ${ELAPSED}s / ${TIMEOUT_SECONDS}s), retrying..."
+            fi
+
+            if [ "$ELAPSED" -ge "$TIMEOUT_SECONDS" ]; then
+              echo "FAIL: runtime compute for ${DEPLOYMENT_ID} was not confirmed absent within ${TIMEOUT_SECONDS}s after removal. Refusing to consider this deletion complete -- investigate the diagnostics above rather than deleting anything else manually."
+              exit 1
+            fi
+            sleep "$INTERVAL_SECONDS"
+            ELAPSED=$((ELAPSED + INTERVAL_SECONDS))
+          done
+
+      - name: Workflow summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## GoldenGate Argo CD Application Deletion Summary"
+            echo ""
+            echo "- Environment: \`${ENVIRONMENT}\`"
+            echo "- Deployment ID: \`${DEPLOYMENT_ID}\`"
+            echo "- Argo CD Application: \`${ARGOCD_APP_NAME}\` (namespace: \`${ARGOCD_NAMESPACE}\`)"
+            echo "- Target namespace: \`${TARGET_NAMESPACE}\`"
+            echo "- Delete requested: \`true\`"
+            echo ""
+            echo "Argo CD cascade deletion removes the Application-managed resources. The"
+            echo "workflow also performs a guarded namespace cleanup only when the remaining"
+            echo "namespace has the expected GoldenGate ownership labels."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  validate_active_runtimes:
+    name: Validate every ACTIVE GoldenGate runtime (read-only, global desired-state acceptance)
+
+    # Phase B3A: post-reconciliation runtime acceptance -- HEALTHY/BROKEN only (never ABSENT: an active desired runtime that is missing IS BROKEN). Deliberately uses inputs.active_runtime_matrix (Phase 1's GLOBAL canonical registry, relayed through Phase 2-4 unchanged), never inputs.deployment_matrix (only the deployments THIS RUN selected) -- an unchanged active runtime must be validated too, or MAIN could claim end-to-end success while a previously-deployed runtime silently degraded. This job never mutates the cluster or AWS -- runtime_acceptance.py's Kubernetes calls are read-only `kubectl get`, and any managed-EFS filesystem ID is resolved here via a single read-only elasticfilesystem:DescribeFileSystems call (identical contract to build_publish_and_deploy's own "Resolve EFS filesystem ID" step), never inside the Python tool itself.
+    needs:
+      - build_publish_and_deploy
+      - delete_removed_argocd_applications
+    # always() so a legitimately-skipped build_publish_and_deploy (nothing changed this run) does not itself suppress acceptance of the OTHER active runtimes -- only an actual build failure/cancellation blocks this job. has_active_deployments=='false' cleanly skips the whole job rather than attempting an empty matrix. Phase 1/4's own success (validate_shared_secrets_once) is already guaranteed transitively.
+    if: ${{ always() && inputs.effective_deploy == 'true' && inputs.has_active_deployments == 'true' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' }}
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    # Live Deployment Approval Topology Fix: no job-level environment: here (and deliberately not per-matrix-entry either) -- this job is read-only global acceptance validation, never a mutation, and must never generate one approval per active runtime; it is already covered end-to-end by the single goldengate_deploy_authorization approval upstream of it in the DAG.
+    strategy:
+      # One matrix item per active deployment in the GLOBAL canonical registry; sequential/fail-fast so a BROKEN runtime is reported clearly rather than racing diagnostics from a concurrently-evaluated sibling.
+      fail-fast: true
+      max-parallel: 1
+      matrix:
+        include: ${{ fromJson(inputs.active_runtime_matrix) }}
+
+    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail -- matrix jobs draw the selected environment from their own matrix entry, never needs.validate_model.outputs.selected_environment.
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ matrix.environment }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Load resolved environment config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 hack/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
+
+      - name: Install kubectl if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking/installing kubectl..."
+
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KUBECTL_VERSION="v1.35.0"
+
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64)
+                KUBECTL_ARCH="amd64"
+                ;;
+              aarch64|arm64)
+                KUBECTL_ARCH="arm64"
+                ;;
+              *)
+                echo "Unsupported architecture for kubectl: $ARCH"
+                exit 1
+                ;;
+            esac
+
+            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+            sudo chmod +x /usr/local/bin/kubectl
+          fi
+
+          kubectl version --client=true
+
+      - name: Connect to EKS cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}" \
+            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
+            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
+
+          echo "Current kube context:"
+          kubectl config current-context
+
+      - name: Resolve expected managed-EFS filesystem ID (read-only, when applicable)
+        id: resolve_efs
+        shell: bash
+        env:
+          GG_DEPLOYMENT_ID: ${{ matrix.deployment_id }}
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
+
+          DESCRIBE_JSON="$(python3 hack/goldengate-deployment-model.py --environment "${GG_SELECTED_ENVIRONMENT}" describe "${GG_DEPLOYMENT_ID}")"
+          EFS_MODE="$(python3 -c 'import json, sys; print(json.load(sys.stdin).get("efsMode") or "")' <<< "$DESCRIBE_JSON")"
+
+          if [ -z "$EFS_MODE" ]; then
+            echo "EFS ID source: not applicable (persistence.efs is not in use for ${GG_DEPLOYMENT_ID})."
+            echo "expected_efs_id=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$EFS_MODE" = "existing" ]; then
+            EFS_FILE_SYSTEM_ID_DECLARED="$(python3 -c 'import json, sys; print(json.load(sys.stdin).get("efsFileSystemId") or "")' <<< "$DESCRIBE_JSON")"
+            echo "EFS ID source: existing descriptor."
+            echo "expected_efs_id=${EFS_FILE_SYSTEM_ID_DECLARED}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          EFS_CREATION_TOKEN="$(python3 -c 'import json, sys; print(json.load(sys.stdin).get("efsCreationToken") or "")' <<< "$DESCRIBE_JSON")"
+          if [ -z "$EFS_CREATION_TOKEN" ]; then
+            echo "FAIL: persistence.efs.mode=managed but no EFS creation token was resolved from the deployment model."
+            exit 1
+          fi
+
+          # The expected workload account is proven directly from the role ARN this step is about to assume, never a separately hardcoded/guessed account number. Identical read-only elasticfilesystem:DescribeFileSystems contract as build_publish_and_deploy's own "Resolve EFS filesystem ID" step -- this role is never granted EFS create/update/delete permissions.
+          EXPECTED_WORKLOAD_ACCOUNT_ID="$(echo "$EKS_DEPLOY_ROLE_ARN" | sed -nE 's#^arn:aws:iam::([0-9]{12}):role/.*$#\1#p')"
+          if [ -z "$EXPECTED_WORKLOAD_ACCOUNT_ID" ]; then
+            echo "FAIL: could not extract a 12-digit account ID from EKS_DEPLOY_ROLE_ARN; refusing to resolve an EFS filesystem ID without a provable expected workload account."
+            exit 1
+          fi
+
+          ASSUME_JSON="$(aws sts assume-role --role-arn "$EKS_DEPLOY_ROLE_ARN" --role-session-name "gg-runtime-acceptance-efs-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --duration-seconds 900 --output json)"
+          EFS_TMP_KEY_ID="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["Credentials"]["AccessKeyId"])' <<< "$ASSUME_JSON")"
+          EFS_TMP_SECRET="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["Credentials"]["SecretAccessKey"])' <<< "$ASSUME_JSON")"
+          EFS_TMP_TOKEN="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["Credentials"]["SessionToken"])' <<< "$ASSUME_JSON")"
+          unset ASSUME_JSON
+          echo "::add-mask::${EFS_TMP_KEY_ID}"
+          echo "::add-mask::${EFS_TMP_SECRET}"
+          echo "::add-mask::${EFS_TMP_TOKEN}"
+
+          ACTUAL_ACCOUNT="$(AWS_ACCESS_KEY_ID="$EFS_TMP_KEY_ID" AWS_SECRET_ACCESS_KEY="$EFS_TMP_SECRET" AWS_SESSION_TOKEN="$EFS_TMP_TOKEN" aws sts get-caller-identity --query Account --output text --region "$AWS_REGION")"
+          if [ "$ACTUAL_ACCOUNT" != "$EXPECTED_WORKLOAD_ACCOUNT_ID" ]; then
+            echo "FAIL: assumed role resolved to account ${ACTUAL_ACCOUNT}, expected the GoldenGate workload account ${EXPECTED_WORKLOAD_ACCOUNT_ID}."
+            unset EFS_TMP_KEY_ID EFS_TMP_SECRET EFS_TMP_TOKEN
+            exit 1
+          fi
+
+          DESCRIBE_EFS_JSON="$(AWS_ACCESS_KEY_ID="$EFS_TMP_KEY_ID" AWS_SECRET_ACCESS_KEY="$EFS_TMP_SECRET" AWS_SESSION_TOKEN="$EFS_TMP_TOKEN" aws efs describe-file-systems --creation-token "$EFS_CREATION_TOKEN" --region "$AWS_REGION" --output json)"
+
+          MATCH_COUNT="$(python3 -c 'import json, sys; print(len(json.load(sys.stdin)["FileSystems"]))' <<< "$DESCRIBE_EFS_JSON")"
+          if [ "$MATCH_COUNT" -ne 1 ]; then
+            echo "FAIL: expected exactly one EFS filesystem for creation token ${EFS_CREATION_TOKEN}, found ${MATCH_COUNT}. Refusing to list-and-guess."
+            unset EFS_TMP_KEY_ID EFS_TMP_SECRET EFS_TMP_TOKEN
+            exit 1
+          fi
+
+          RESOLVED_EFS_ID="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["FileSystems"][0]["FileSystemId"])' <<< "$DESCRIBE_EFS_JSON")"
+
+          # Defense in depth: cross-check the resolved filesystem's ownership tags, already present on this same DescribeFileSystems response -- no second list-tags-for-resource call.
+          TAGS_OK="$(python3 -c 'import json, sys; tags = {t["Key"]: t["Value"] for t in json.load(sys.stdin)["FileSystems"][0].get("Tags", [])}; print("true" if tags.get("ManagedBy") == "goldengate-eks-app" and tags.get("GoldenGateDeploymentId") == sys.argv[1] and tags.get("GoldenGateEnvironment") == sys.argv[2] and tags.get("GoldenGateStorage") == "u02" else "false")' "$GG_DEPLOYMENT_ID" "$GG_SELECTED_ENVIRONMENT" <<< "$DESCRIBE_EFS_JSON")"
+          unset EFS_TMP_KEY_ID EFS_TMP_SECRET EFS_TMP_TOKEN
+          if [ "$TAGS_OK" != "true" ]; then
+            echo "FAIL: the EFS filesystem resolved for creation token ${EFS_CREATION_TOKEN} (${RESOLVED_EFS_ID}) does not carry the expected ManagedBy/GoldenGateDeploymentId/GoldenGateEnvironment/GoldenGateStorage ownership tags."
+            exit 1
+          fi
+
+          echo "EFS ID source: managed Terraform/AWS resolution (creation token ${EFS_CREATION_TOKEN})."
+          echo "expected_efs_id=${RESOLVED_EFS_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate runtime acceptance
+        id: classify
+        shell: bash
+        env:
+          GG_DEPLOYMENT_ID: ${{ matrix.deployment_id }}
+          GG_EXPECTED_EFS_ID: ${{ steps.resolve_efs.outputs.expected_efs_id }}
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
+
+          EFS_ARGS=()
+          if [ -n "$GG_EXPECTED_EFS_ID" ]; then
+            EFS_ARGS=(--expected-efs-file-system-id "$GG_EXPECTED_EFS_ID")
+          fi
+
+          # A non-zero exit here is either a configuration error or a classifier inspection error (API unreachable, permission denied, malformed JSON) -- never a normal BROKEN state.
+          if ! CLASSIFIER_OUTPUT="$(python3 hack/orchestration/runtime_acceptance.py --environment "${GG_SELECTED_ENVIRONMENT}" --deployment-id "${GG_DEPLOYMENT_ID}" "${EFS_ARGS[@]}")"; then
+            echo "FAIL: the GoldenGate runtime acceptance classifier could not evaluate ${GG_DEPLOYMENT_ID} (configuration or inspection error) -- see diagnostics above."
+            exit 1
+          fi
+
+          echo "$CLASSIFIER_OUTPUT"
+
+          STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
+          echo "GoldenGate runtime acceptance state for ${GG_DEPLOYMENT_ID}: ${STATE}"
+
+          if [ "$STATE" != "HEALTHY" ]; then
+            echo "FAIL: GoldenGate runtime acceptance state for ${GG_DEPLOYMENT_ID} is ${STATE}, expected HEALTHY. MAIN cannot claim end-to-end success while an active runtime is unhealthy."
+            exit 1
+          fi
+
+          echo "OK: GoldenGate runtime ${GG_DEPLOYMENT_ID} is HEALTHY."
+
+  phase_contract:
+    name: "Phase 5 contract"
+
+    # Reproduces the Phase 5 slice of MAIN final_validation's mode-aware contract (mutation-aware: applicability is already known from has_changes/has_deletions/has_active_deployments, never inferred only from other jobs' transitive downstream behavior) -- if: always() so this phase never accidentally reports success merely because every internal job was cleanly skipped.
+    needs:
+      - runtime_ownership_preflight
+      - build_publish_and_deploy
+      - delete_removed_argocd_applications
+      - validate_active_runtimes
+    if: always()
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    outputs:
+      selected_environment: ${{ steps.contract.outputs.selected_environment }}
+      effective_deploy: ${{ steps.contract.outputs.effective_deploy }}
+      has_active_deployments: ${{ steps.contract.outputs.has_active_deployments }}
+
+    steps:
+      - name: Validate the mode-aware Phase 5 success contract and relay outputs
+        id: contract
+        shell: bash
+        env:
+          EFFECTIVE_DEPLOY: ${{ inputs.effective_deploy }}
+          HAS_ACTIVE_DEPLOYMENTS: ${{ inputs.has_active_deployments }}
+          HAS_CHANGES: ${{ inputs.has_changes }}
+          HAS_DELETIONS: ${{ inputs.has_deletions }}
+          RESULT_runtime_ownership_preflight: ${{ needs.runtime_ownership_preflight.result }}
+          RESULT_build_publish_and_deploy: ${{ needs.build_publish_and_deploy.result }}
+          RESULT_delete_removed_argocd_applications: ${{ needs.delete_removed_argocd_applications.result }}
+          RESULT_validate_active_runtimes: ${{ needs.validate_active_runtimes.result }}
+          OUT_selected_environment: ${{ inputs.selected_environment }}
+        run: |
+          set -euo pipefail
+
+          echo "Resolved mode: effective_deploy=${EFFECTIVE_DEPLOY} has_active_deployments=${HAS_ACTIVE_DEPLOYMENTS} has_changes=${HAS_CHANGES} has_deletions=${HAS_DELETIONS}"
+
+          FAILED="false"
+
+          require_success() {
+            local job_name="$1"
+            local result_var="RESULT_${job_name}"
+            local result="${!result_var}"
+            if [ "$result" != "success" ]; then
+              echo "FAIL: required job '${job_name}' has result '${result}', expected 'success'."
+              FAILED="true"
+            else
+              echo "OK: required job '${job_name}' succeeded."
+            fi
+          }
+
+          allow_non_failure() {
+            local job_name="$1"
+            local result_var="RESULT_${job_name}"
+            local result="${!result_var}"
+            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+              echo "FAIL: job '${job_name}' has result '${result}' -- not required in this mode, but a real failure/cancellation still blocks Phase 5."
+              FAILED="true"
+            else
+              echo "OK: job '${job_name}' result '${result}' is acceptable in this mode."
+            fi
+          }
+
+          if [ "$HAS_CHANGES" = "true" ]; then
+            require_success build_publish_and_deploy
+            if [ "$EFFECTIVE_DEPLOY" = "true" ]; then
+              require_success runtime_ownership_preflight
+            else
+              allow_non_failure runtime_ownership_preflight
+            fi
+          else
+            allow_non_failure runtime_ownership_preflight
+            allow_non_failure build_publish_and_deploy
+          fi
+
+          if [ "$HAS_DELETIONS" = "true" ]; then
+            require_success delete_removed_argocd_applications
+          else
+            allow_non_failure delete_removed_argocd_applications
+          fi
+
+          if [ "$EFFECTIVE_DEPLOY" = "true" ] && [ "$HAS_ACTIVE_DEPLOYMENTS" = "true" ]; then
+            require_success validate_active_runtimes
+          else
+            allow_non_failure validate_active_runtimes
+          fi
+
+          if [ "$FAILED" = "true" ]; then
+            echo ""
+            echo "FAIL: Phase 5 | GoldenGate Runtime Deployment did not complete successfully."
+            exit 1
+          fi
+
+          echo ""
+          echo "OK: Phase 5 | GoldenGate Runtime Deployment succeeded."
+
+          {
+            echo "selected_environment=${OUT_selected_environment}"
+            echo "effective_deploy=${EFFECTIVE_DEPLOY}"
+            echo "has_active_deployments=${HAS_ACTIVE_DEPLOYMENTS}"
+          } >> "$GITHUB_OUTPUT"
