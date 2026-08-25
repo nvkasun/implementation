@@ -302,9 +302,8 @@ def simulate_phase(phase_num, inputs, outcome_when_run=None, outputs_when_run=No
     for job_name in PHASE_JOB_ORDER[phase_num]:
         job = jobs[job_name]
         raw_if = _raw_if(job)
-        if raw_if == "success()":
-            would_run = all(results.get(n, {}).get("result") == "success" for n in _needs_list(job))
-        elif raw_if == "true":
+        # A bare `if: success()` is deliberately NOT special-cased here as "this job's own direct needs succeeded" -- a live GoldenGate Validate-mode run proved that GitHub Actions actually evaluates it against the job's entire TRANSITIVE dependency chain (managed_efs_deletion_guard/storage_transition_guard, whose only direct need is detect_changed_deployments, were still incorrectly skipped when eks_oidc_preflight -- a transitive ancestor -- was itself legitimately skipped). No job in this repository uses a bare `if: success()` any more (both real occurrences were replaced with an explicit needs.<job>.result == 'success' check after that incident); if one is ever reintroduced, letting it fall through to the generic eval_gha_bool() branch below (which raises on the unparseable bare literal) fails LOUD rather than silently modeling the wrong, already-disproven semantics.
+        if raw_if == "true":
             would_run = True
         else:
             would_run = eval_gha_bool(raw_if, results, inputs, github)
@@ -15139,6 +15138,99 @@ PYEOF
   fi
 else
   skip "MAIN prerequisite fail-fast: detect_changed_deployments mode-aware gating proof -- python3/PyYAML unavailable"
+fi
+
+echo ""
+echo "--- Live Validate-mode fix: managed_efs_deletion_guard/storage_transition_guard applicability contract (bare if: success() proven live to check the TRANSITIVE dependency chain, not the direct need only) ---"
+
+# A live GitHub Actions workflow_dispatch run (action=validate) proved that a bare `if: success()` on these two jobs -- whose only direct need is detect_changed_deployments -- was actually evaluated against the job's entire TRANSITIVE dependency chain (including eks_oidc_preflight, a same-phase ancestor of detect_changed_deployments, intentionally skipped in Validate mode), incorrectly skipping both jobs even though detect_changed_deployments itself had already succeeded. This section proves the fix both structurally (A/B/C: the exact needs:/if: text) and behaviorally (D/E/F: the real if: expressions, real-executed via the shared gg_phase_sim module -- see its definition near the top of this script -- never a re-simulation of only final job-result values).
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  set +e
+  GUARD_APPLICABILITY_OUT="$(python3 - "$WORKDIR" <<'PYEOF'
+import sys
+
+import yaml
+
+sys.path.insert(0, sys.argv[1])
+import gg_phase_sim as sim
+
+failures = []
+
+
+def check(label, ok):
+    if not ok:
+        failures.append(label)
+
+
+with open(".github/workflows/01-phase-readiness-safety.yaml") as f:
+    doc = yaml.safe_load(f)
+jobs = doc["jobs"]
+
+# A/B: managed_efs_deletion_guard/storage_transition_guard each need exactly detect_changed_deployments for this applicability rule, and their if: is the exact explicit direct dependency-result contract (never the bare if: success() literal that was proven live to check the transitive chain instead).
+for job_name in ("managed_efs_deletion_guard", "storage_transition_guard"):
+    job = jobs[job_name]
+    needs = job.get("needs") or []
+    if isinstance(needs, str):
+        needs = [needs]
+    check(f"A/B: {job_name} needs exactly [detect_changed_deployments] for this applicability rule", needs == ["detect_changed_deployments"])
+    if_text = str(job.get("if", "")).strip()
+    check(f"A/B: {job_name} if: runs iff detect_changed_deployments.result == 'success' (the exact explicit direct dependency-result contract)", if_text == "${{ needs.detect_changed_deployments.result == 'success' }}")
+    check(f"A/B: {job_name} no longer uses the bare if: success() literal proven live to evaluate the transitive dependency chain instead of the direct need", if_text != "success()")
+    # C: neither job's applicability is directly dependent on eks_oidc_preflight's result -- only via detect_changed_deployments' own already-mode-aware fail-fast contract.
+    check(f"C: {job_name} if: never references eks_oidc_preflight directly (applicability depends only on detect_changed_deployments' own result)", "eks_oidc_preflight" not in if_text)
+
+# D: Validate scenario -- effective_deploy=false, eks_oidc_preflight=skipped, detect_changed_deployments=success -> both local guards MUST RUN/succeed, managed_efs_inventory_guard may skip, Phase 1 contract succeeds.
+r, contract = sim.simulate_phase(1, {"effective_deploy": "false"})
+check("D: Validate mode -- eks_oidc_preflight is (legitimately) skipped", r["eks_oidc_preflight"]["result"] == "skipped")
+check("D: Validate mode -- detect_changed_deployments succeeds", r["detect_changed_deployments"]["result"] == "success")
+check("D: Validate mode -- managed_efs_deletion_guard RUNS and succeeds despite the skipped EKS prerequisite", r["managed_efs_deletion_guard"]["result"] == "success")
+check("D: Validate mode -- storage_transition_guard RUNS and succeeds despite the skipped EKS prerequisite", r["storage_transition_guard"]["result"] == "success")
+check("D: Validate mode -- managed_efs_inventory_guard legitimately skips (Deploy-only, AWS-side check)", r["managed_efs_inventory_guard"]["result"] == "skipped")
+check("D: Validate mode -- Phase 1 own phase_contract succeeds", contract == "success")
+
+# E: Deploy + EKS failure -- detect_changed_deployments skips per its own current fail-fast contract; both local guards must NOT run; Phase 1 fails closed; no later phase can execute.
+r, contract = sim.simulate_phase(1, {"effective_deploy": "true"}, outcome_when_run={"eks_oidc_preflight": "failure"})
+check("E: Deploy + EKS failure -- detect_changed_deployments is skipped (its own existing fail-fast contract)", r["detect_changed_deployments"]["result"] == "skipped")
+check("E: Deploy + EKS failure -- managed_efs_deletion_guard does NOT run", r["managed_efs_deletion_guard"]["result"] == "skipped")
+check("E: Deploy + EKS failure -- storage_transition_guard does NOT run", r["storage_transition_guard"]["result"] == "skipped")
+check("E: Deploy + EKS failure -- Phase 1 own phase_contract fails closed", contract == "failure")
+full_r, full_contracts = sim.simulate_all("true", outcome_when_run={"eks_oidc_preflight": "failure"})
+check("E: Deploy + EKS failure -- no later phase can execute (Phase 2-7 all remain skipped)", all(full_contracts[p] == "skipped" for p in (2, 3, 4, 5, 6, 7)))
+
+# F: Deploy normal (EKS success) -- all three storage safety gates retain existing behavior.
+r, contract = sim.simulate_phase(1, {"effective_deploy": "true"})
+check("F: Deploy normal -- managed_efs_deletion_guard runs and succeeds (existing behavior preserved)", r["managed_efs_deletion_guard"]["result"] == "success")
+check("F: Deploy normal -- storage_transition_guard runs and succeeds (existing behavior preserved)", r["storage_transition_guard"]["result"] == "success")
+check("F: Deploy normal -- managed_efs_inventory_guard runs and succeeds (existing behavior preserved)", r["managed_efs_inventory_guard"]["result"] == "success")
+check("F: Deploy normal -- Phase 1 own phase_contract succeeds", contract == "success")
+
+# detect_changed_deployments itself failing (never merely skipped) -- both guards must not run; Phase 1 contract reports the failed required detection path; no downstream mutation.
+r, contract = sim.simulate_phase(1, {"effective_deploy": "true"}, outcome_when_run={"detect_changed_deployments": "failure"})
+check("detect_changed_deployments failure -- managed_efs_deletion_guard does NOT run", r["managed_efs_deletion_guard"]["result"] == "skipped")
+check("detect_changed_deployments failure -- storage_transition_guard does NOT run", r["storage_transition_guard"]["result"] == "skipped")
+check("detect_changed_deployments failure -- Phase 1 own phase_contract fails closed (reports the failed required detection path)", contract == "failure")
+
+for label in failures:
+    print("FAIL " + label)
+if failures:
+    sys.exit(1)
+print("OK")
+PYEOF
+)"
+  GUARD_APPLICABILITY_STATUS=$?
+  set -e
+  if [ "$GUARD_APPLICABILITY_STATUS" -eq 0 ]; then
+    pass "Live Validate-mode fix A/B: managed_efs_deletion_guard/storage_transition_guard each need exactly detect_changed_deployments and run iff its result == success (never the bare if: success() literal proven live to check the transitive chain instead)"
+    pass "Live Validate-mode fix C: neither guard's applicability directly references eks_oidc_preflight's result"
+    pass "Live Validate-mode fix D: Validate mode (eks_oidc_preflight skipped, detect_changed_deployments success) -- both local storage guards now correctly RUN and succeed; managed_efs_inventory_guard still legitimately skips; Phase 1 succeeds"
+    pass "Live Validate-mode fix E: Deploy + EKS failure -- detect_changed_deployments skips, both local guards do not run, Phase 1 fails closed, and no later phase can execute"
+    pass "Live Validate-mode fix F: Deploy normal (EKS success) -- all three storage safety gates retain their existing run-and-succeed behavior"
+    pass "Live Validate-mode fix: a genuine detect_changed_deployments failure (not merely a legitimate skip) still blocks both local guards and fails Phase 1 closed"
+  else
+    fail "Live Validate-mode fix: managed_efs_deletion_guard/storage_transition_guard applicability proof failed:"$'\n'"${GUARD_APPLICABILITY_OUT}"
+  fi
+else
+  skip "Live Validate-mode fix: managed_efs_deletion_guard/storage_transition_guard applicability proof -- python3/PyYAML unavailable"
 fi
 
 echo ""

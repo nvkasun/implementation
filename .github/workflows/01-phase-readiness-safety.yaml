@@ -477,10 +477,10 @@ jobs:
   managed_efs_deletion_guard:
     name: Guard against destroying a managed GoldenGate EFS filesystem
 
-    # /u02 is durable state: a managed EFS filesystem (persistence.efs.mode=managed) must never be destroyed merely because its deployment descriptor was physically deleted from Git, so this job inspects detect_changed_deployments' deletion_matrix (which carries the HISTORICAL efs_mode read from the deleted descriptor's last content) and fails the whole workflow closed before terraform_sync_once can run; no repository checkout or AWS access is needed since the matrix already carries everything this check requires.
+    # /u02 is durable state: a managed EFS filesystem (persistence.efs.mode=managed) must never be destroyed merely because its deployment descriptor was physically deleted from Git, so this job inspects detect_changed_deployments' deletion_matrix (which carries the HISTORICAL efs_mode read from the deleted descriptor's last content) and fails the whole workflow closed before terraform_sync_once can run; no repository checkout or AWS access is needed since the matrix already carries everything this check requires. Live Validate-mode fix: a bare `if: success()` was proven live to evaluate against this job's entire TRANSITIVE dependency chain (including eks_oidc_preflight, a same-phase ancestor of detect_changed_deployments), not merely its own direct need -- so it incorrectly skipped this job in Validate mode, where eks_oidc_preflight is intentionally skipped; this is a purely local/Git safety gate that must run in both Deploy and Validate whenever detect_changed_deployments itself actually succeeded, so the condition is now an explicit direct dependency-result check instead.
     needs:
       - detect_changed_deployments
-    if: success()
+    if: ${{ needs.detect_changed_deployments.result == 'success' }}
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -526,10 +526,10 @@ jobs:
   storage_transition_guard:
     name: Guard against unsafe persistence.efs storage-identity transitions
 
-    # A changed-but-still-present descriptor can silently repoint a runtime's StorageClass at a different filesystem (managed<->existing, a mutated existing fileSystemId) or stop declaring EFS at all (managed->disabled/non-EFS) -- each of these is a storage MIGRATION, not an ordinary config edit, and none of them are safe to let reach Terraform/Helm/Argo without an explicit, separate decommission process. This job fails the whole workflow closed before terraform_sync_once can run; no repository checkout or AWS access is needed since detect_changed_deployments already computed the violation list from historical vs current descriptor content.
+    # A changed-but-still-present descriptor can silently repoint a runtime's StorageClass at a different filesystem (managed<->existing, a mutated existing fileSystemId) or stop declaring EFS at all (managed->disabled/non-EFS) -- each of these is a storage MIGRATION, not an ordinary config edit, and none of them are safe to let reach Terraform/Helm/Argo without an explicit, separate decommission process. This job fails the whole workflow closed before terraform_sync_once can run; no repository checkout or AWS access is needed since detect_changed_deployments already computed the violation list from historical vs current descriptor content. Live Validate-mode fix: a bare `if: success()` was proven live to evaluate against this job's entire TRANSITIVE dependency chain (including eks_oidc_preflight, a same-phase ancestor of detect_changed_deployments), not merely its own direct need -- so it incorrectly skipped this job in Validate mode, where eks_oidc_preflight is intentionally skipped; this is a purely local/Git safety gate that must run in both Deploy and Validate whenever detect_changed_deployments itself actually succeeded, so the condition is now an explicit direct dependency-result check instead.
     needs:
       - detect_changed_deployments
-    if: success()
+    if: ${{ needs.detect_changed_deployments.result == 'success' }}
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
