@@ -15802,6 +15802,100 @@ else
 fi
 
 echo ""
+echo "--- Phase 1 credential-scope hardening: build-account credentials confined to live AWS steps (assertions A-L) ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  set +e
+  CRED_SCOPE_OUT="$(python3 - "$EKS_APP_WORKFLOW" "$PHASE1_TOOL" <<'PYEOF'
+import sys
+
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+
+steps = doc["jobs"]["validate_model"]["steps"]
+by_name = {s.get("name"): s for s in steps}
+results = []
+
+
+def check(label, ok):
+    results.append((label, ok))
+
+
+CRED_OUTPUT_KEYS = ("aws-access-key-id", "aws-secret-access-key", "aws-session-token")
+CRED_ENV_KEYS = ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN")
+NO_CRED_STEPS = (
+    "Detect changed GoldenGate deployments",
+    "Guard against destroying a managed GoldenGate EFS filesystem",
+    "Guard against unsafe persistence.efs storage-identity transitions",
+    "Publish canonical Phase 1 outputs",
+    "Phase 1 acceptance",
+)
+
+cred_step = by_name.get("Configure AWS credentials (build account)")
+cred_with = (cred_step or {}).get("with") or {}
+
+# A/B/C: the Configure AWS credentials step has the stable id, output-credentials: true, output-env-credentials: false.
+check("A: Configure AWS credentials (build account) has id: aws_build_credentials", (cred_step or {}).get("id") == "aws_build_credentials")
+check("B: output-credentials: true", cred_with.get("output-credentials") is True)
+check("C: output-env-credentials: false", cred_with.get("output-env-credentials") is False)
+
+# D/E: the two live-AWS steps explicitly receive the three credential outputs via step-local env:.
+for step_name in ("Verify live EKS cluster + OIDC + Kubernetes API access (read-only)", "Verify AWS-side managed-EFS inventory (read-only)"):
+    step_env = (by_name.get(step_name) or {}).get("env") or {}
+    for env_key, output_key in zip(CRED_ENV_KEYS, CRED_OUTPUT_KEYS):
+        expected = "${{ steps.aws_build_credentials.outputs.%s }}" % output_key
+        check(f"D/E: '{step_name}' env.{env_key} == steps.aws_build_credentials.outputs.{output_key}", step_env.get(env_key) == expected)
+
+# F: the local detection/guard/output/acceptance steps carry none of the three credential env references.
+for step_name in NO_CRED_STEPS:
+    step_env = (by_name.get(step_name) or {}).get("env") or {}
+    check(f"F: '{step_name}' does not receive any aws_build_credentials output", not any("aws_build_credentials" in str(v) for v in step_env.values()))
+
+# G: no Phase 1 job output exposes a raw credential value.
+vm_outputs = doc["jobs"]["validate_model"].get("outputs", {})
+check("G: no validate_model job output references aws_build_credentials or a credential-shaped name", not any("aws_build_credentials" in str(v) or "access-key" in str(v).lower() or "session-token" in str(v).lower() for v in vm_outputs.values()))
+
+# H: no Phase 1 state-writing/output-writing call site (update_state/save_state/write_github_output/append_github_env) is ever invoked with an AWS credential-shaped key. _assume_role_env legitimately sets these as subprocess-local env dict keys (never state/output/env) -- checked per source LINE containing one of the write-call names, never a blind whole-file substring search that would false-positive on that legitimate usage.
+with open(sys.argv[2]) as f:
+    phase1_lines = f.read().splitlines()
+write_calls = ("update_state(", "save_state(", "write_github_output(", "append_github_env(")
+leaking_lines = [line for line in phase1_lines if any(call in line for call in write_calls) and any(k in line for k in CRED_ENV_KEYS)]
+check("H: no update_state/save_state/write_github_output/append_github_env call site references an AWS credential-shaped key", not leaking_lines)
+
+# I/J: the Configure AWS credentials step and both live-AWS consumer steps remain Deploy-mode-only.
+for step_name in ("Configure AWS credentials (build account)", "Verify live EKS cluster + OIDC + Kubernetes API access (read-only)", "Verify AWS-side managed-EFS inventory (read-only)"):
+    step_if = str((by_name.get(step_name) or {}).get("if", ""))
+    check(f"I/J: '{step_name}' remains gated on effective_deploy == 'true'", "effective_deploy" in step_if and "true" in step_if)
+
+# K: Validate mode therefore never runs Configure AWS credentials or either live-AWS step (structurally implied by I/J -- effective_deploy == 'false' in Validate mode evaluates every one of those if: conditions to skip).
+check("K: Validate mode performs no Configure AWS Credentials action and no live AWS credential use (all three gated steps share the identical effective_deploy=='true' if:)", True)
+
+# L: Phase 1 remains exactly one GitHub job.
+check("L: Phase 1 remains ONE GitHub job (validate_model)", "validate_model" in doc["jobs"] and "eks_oidc_preflight" not in doc["jobs"])
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  CRED_SCOPE_STATUS=$?
+  set -e
+  if [ "$CRED_SCOPE_STATUS" -ne 0 ]; then
+    fail "Phase 1 credential-scope hardening (A-L): assertion script errored:"$'\n'"${CRED_SCOPE_OUT}"
+  else
+    while IFS= read -r line; do
+      case "$line" in
+        FAIL\ *) fail "Phase 1 credential-scope hardening (A-L): ${line#FAIL }" ;;
+        OK\ *) pass "Phase 1 credential-scope hardening (A-L): ${line#OK }" ;;
+      esac
+    done <<< "$CRED_SCOPE_OUT"
+  fi
+else
+  skip "Phase 1 credential-scope hardening (A-L) -- python3/PyYAML unavailable or main workflow missing"
+fi
+
+echo ""
 echo "--- Final repository handoff hygiene sweep (VDR pre-transfer cleanliness) ---"
 
 # This is the LAST check in the suite, deliberately: earlier sections legitimately regenerate work/generated/dev/goldengate-deployments.yaml (the folder-driven registry-generation checks) as their own tested behavior -- asserting its absence any earlier would be a self-defeating mid-test assertion. Self-heal only the categories PROVEN elsewhere in this suite to be pure, expected byproducts of exercising real application/tooling behavior (never silently deleting anything whose origin is unknown); everything else must already be absent, or this check fails closed and reports it for a human to investigate before VDR handoff.

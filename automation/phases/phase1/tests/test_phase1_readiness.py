@@ -310,6 +310,93 @@ class TestStateFileSecrecy(Phase1TestCase):
                 self.assertNotIn(forbidden, key.lower(), msg=key)
 
 
+class TestBuildAccountCredentialScope(Phase1TestCase):
+    """Since the Configure AWS credentials step now injects the build-account credentials only as step-local env: (never job-wide), these tests prove that ambient AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_SESSION_TOKEN values -- however they reach os.environ -- are used by _assume_role_env purely as the source identity for sts:AssumeRole and never echoed into the Phase 1 state file, GITHUB_OUTPUT, or GITHUB_ENV."""
+
+    BUILD_ACCESS_KEY_ID = "BUILD_ACCOUNT_ACCESS_KEY_ID"
+    BUILD_SECRET_ACCESS_KEY = "BUILD_ACCOUNT_SECRET_ACCESS_KEY"
+    BUILD_SESSION_TOKEN = "BUILD_ACCOUNT_SESSION_TOKEN"
+
+    def _assert_no_credential_leak(self):
+        for path in (self.state_path, self.github_output, self.github_env):
+            if not path.exists():
+                continue
+            text = path.read_text(encoding="utf-8")
+            for secret in (self.BUILD_ACCESS_KEY_ID, self.BUILD_SECRET_ACCESS_KEY, self.BUILD_SESSION_TOKEN, "FAKE_ACCESS_KEY_ID", "FAKE_SECRET_ACCESS_KEY", "FAKE_SESSION_TOKEN"):
+                self.assertNotIn(secret, text, msg=f"{secret!r} leaked into {path}")
+
+    def test_eks_preflight_never_leaks_build_or_workload_credentials(self):
+        p1.update_state(self.state_path, {"effective_deploy": "true", "selected_environment": "dev"})
+        cluster = {"cluster": {"name": "gg-poc-dev", "status": "ACTIVE", "arn": "arn:aws:eks:eu-west-1:123456789012:cluster/gg-poc-dev", "identity": {"oidc": {"issuer": "https://oidc.example/id/ABC"}}}}
+        scripted = (
+            ScriptedSubprocess()
+            .on(lambda argv: argv[:3] == ["aws", "sts", "assume-role"], _assume_role_ok())
+            .on(lambda argv: argv[:3] == ["aws", "sts", "get-caller-identity"], _ok(WORKLOAD_ACCOUNT_ID + "\n"))
+            .on(lambda argv: argv[:3] == ["aws", "eks", "describe-cluster"], _ok(json.dumps(cluster)))
+            .on(lambda argv: argv == ["bash", "-c", "command -v kubectl"], _ok(""))
+            .on(lambda argv: argv[:2] == ["kubectl", "version"], _ok(""))
+            .on(lambda argv: argv[:3] == ["aws", "eks", "update-kubeconfig"], _ok(""))
+            .on(lambda argv: argv == ["kubectl", "config", "current-context"], _ok("fake-context\n"))
+            .on(lambda argv: argv[:3] == ["kubectl", "get", "namespace"], _ok(""))
+        )
+        env_overrides = {
+            "AWS_REGION": "eu-west-1",
+            "EKS_CLUSTER_NAME": "gg-poc-dev",
+            "EKS_CLUSTER_ARN": cluster["cluster"]["arn"],
+            "EKS_OIDC_ISSUER": cluster["cluster"]["identity"]["oidc"]["issuer"],
+            "EKS_DEPLOY_ROLE_ARN": EKS_DEPLOY_ROLE_ARN,
+            "WORKLOAD_ACCOUNT_ID": WORKLOAD_ACCOUNT_ID,
+            # Simulates the step-local env: this step now receives from steps.aws_build_credentials.outputs.* -- present in os.environ exactly as GitHub Actions would inject it, never routed through GITHUB_ENV or the state file.
+            "AWS_ACCESS_KEY_ID": self.BUILD_ACCESS_KEY_ID,
+            "AWS_SECRET_ACCESS_KEY": self.BUILD_SECRET_ACCESS_KEY,
+            "AWS_SESSION_TOKEN": self.BUILD_SESSION_TOKEN,
+        }
+        self.run_subcommand(p1.cmd_eks_preflight, scripted=scripted, env_overrides=env_overrides)
+        self.assertEqual(self.read_state()["eks_preflight_completed"], "true")
+        self._assert_no_credential_leak()
+
+    def test_managed_efs_inventory_never_leaks_build_or_workload_credentials(self):
+        p1.update_state(self.state_path, {"effective_deploy": "true", "selected_environment": "dev"})
+        scripted = (
+            ScriptedSubprocess()
+            .on(lambda argv: "managed-efs-inventory" in argv, _ok("[]"))
+            .on(lambda argv: argv[:3] == ["aws", "sts", "assume-role"], _assume_role_ok())
+            .on(lambda argv: argv[:3] == ["aws", "sts", "get-caller-identity"], _ok(WORKLOAD_ACCOUNT_ID + "\n"))
+            .on(lambda argv: argv[:3] == ["aws", "efs", "describe-file-systems"], _ok(json.dumps({"FileSystems": []})))
+            .on(lambda argv: str(p1.EFS_INVENTORY_GUARD_TOOL) in argv, _ok("OK: no orphan detected."))
+        )
+        env_overrides = {
+            "AWS_REGION": "eu-west-1",
+            "EKS_DEPLOY_ROLE_ARN": EKS_DEPLOY_ROLE_ARN,
+            "AWS_ACCESS_KEY_ID": self.BUILD_ACCESS_KEY_ID,
+            "AWS_SECRET_ACCESS_KEY": self.BUILD_SECRET_ACCESS_KEY,
+            "AWS_SESSION_TOKEN": self.BUILD_SESSION_TOKEN,
+        }
+        self.run_subcommand(p1.cmd_managed_efs_inventory, scripted=scripted, env_overrides=env_overrides)
+        self.assertEqual(self.read_state()["managed_efs_inventory_completed"], "true")
+        self._assert_no_credential_leak()
+
+    def test_assume_role_env_keeps_workload_credentials_subprocess_local(self):
+        os.environ["AWS_ACCESS_KEY_ID"] = self.BUILD_ACCESS_KEY_ID
+        try:
+            with mock.patch.object(p1, "run", return_value=subprocess.CompletedProcess([], 0, json.dumps({"Credentials": {"AccessKeyId": "WORKLOAD_KEY", "SecretAccessKey": "WORKLOAD_SECRET", "SessionToken": "WORKLOAD_TOKEN"}}), "")):
+                role_env = p1._assume_role_env(EKS_DEPLOY_ROLE_ARN, "test-session")
+            self.assertEqual(role_env["AWS_ACCESS_KEY_ID"], "WORKLOAD_KEY")
+            self.assertEqual(role_env["AWS_SECRET_ACCESS_KEY"], "WORKLOAD_SECRET")
+            self.assertEqual(role_env["AWS_SESSION_TOKEN"], "WORKLOAD_TOKEN")
+            self.assertNotIn("WORKLOAD_KEY", os.environ.get("AWS_ACCESS_KEY_ID", ""))
+        finally:
+            del os.environ["AWS_ACCESS_KEY_ID"]
+
+    def test_write_github_output_and_append_github_env_never_called_with_credential_shaped_keys(self):
+        with open(TOOL_PATH, encoding="utf-8") as f:
+            source = f.read()
+        self.assertNotIn('write_github_output([("aws', source.lower())
+        self.assertNotIn("append_github_env([(\"aws_access", source.lower())
+        self.assertNotIn("append_github_env([(\"aws_secret", source.lower())
+        self.assertNotIn("append_github_env([(\"aws_session", source.lower())
+
+
 class TestOutputWriterFidelity(Phase1TestCase):
     def test_write_github_output_preserves_json_without_shell_mangling(self):
         tricky_value = json.dumps([{"deployment_id": "gg-x", "note": "quote\" dollar$ backtick` semicolon;"}])

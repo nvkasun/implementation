@@ -158,17 +158,24 @@ jobs:
           set -euo pipefail
           python3 automation/phases/phase1/phase1_readiness.py terraform-governance
 
-      # Deploy-mode-only from here: a recreated EKS cluster keeps the SAME name but gets a DIFFERENT OIDC issuer, and every generated IRSA trust policy in envs/<environment>/policies/** is only valid for the issuer envs/<environment>/environment.yaml declares -- this must run, and must succeed, before Terraform (which owns applying those trust policies) or any deployment can proceed. Skipped entirely for Validate mode so that purely local/offline run never requires live AWS/Kubernetes access.
+      # Deploy-mode-only from here: a recreated EKS cluster keeps the SAME name but gets a DIFFERENT OIDC issuer, and every generated IRSA trust policy in envs/<environment>/policies/** is only valid for the issuer envs/<environment>/environment.yaml declares -- this must run, and must succeed, before Terraform (which owns applying those trust policies) or any deployment can proceed. Skipped entirely for Validate mode so that purely local/offline run never requires live AWS/Kubernetes access. id-token: write assumes RUNNER_ROLE_ARN once here; output-env-credentials: false keeps the assumed build-account credentials off this job's process-wide environment -- output-credentials: true exposes them ONLY as this step's own outputs, explicitly passed via step-local env: to the two steps that genuinely need live AWS access below, never to the local detection/guard steps that share this one visible job.
       - name: Configure AWS credentials (build account)
+        id: aws_build_credentials
         if: ${{ steps.compute_effective_deploy.outputs.effective_deploy == 'true' }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
           role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
+          output-credentials: true
+          output-env-credentials: false
 
       - name: Verify live EKS cluster + OIDC + Kubernetes API access (read-only)
         if: ${{ steps.compute_effective_deploy.outputs.effective_deploy == 'true' }}
         shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ steps.aws_build_credentials.outputs.aws-access-key-id }}
+          AWS_SECRET_ACCESS_KEY: ${{ steps.aws_build_credentials.outputs.aws-secret-access-key }}
+          AWS_SESSION_TOKEN: ${{ steps.aws_build_credentials.outputs.aws-session-token }}
         run: |
           set -euo pipefail
           python3 automation/phases/phase1/phase1_readiness.py eks-preflight
@@ -201,6 +208,10 @@ jobs:
       - name: Verify AWS-side managed-EFS inventory (read-only)
         if: ${{ steps.compute_effective_deploy.outputs.effective_deploy == 'true' }}
         shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ steps.aws_build_credentials.outputs.aws-access-key-id }}
+          AWS_SECRET_ACCESS_KEY: ${{ steps.aws_build_credentials.outputs.aws-secret-access-key }}
+          AWS_SESSION_TOKEN: ${{ steps.aws_build_credentials.outputs.aws-session-token }}
         run: |
           set -euo pipefail
           python3 automation/phases/phase1/phase1_readiness.py managed-efs-inventory
