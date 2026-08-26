@@ -1,4 +1,5 @@
 import html as html_module
+import importlib.util
 import inspect
 import json
 import os
@@ -20,6 +21,15 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", 
 MONITOR_WORKFLOW_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "50-sub-monitor.yaml")
 ARGOCD_WORKFLOW_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "20-sub-argocd.yaml")
 DEPLOYMENT_MODEL_TOOL_PATH = os.path.join(REPO_ROOT, "automation", "goldengate-deployment-model.py")
+# Phase 3 Python Conversion: the ECR token-sync rendered-manifest validation (including its multi-document Role selection by kind+name) moved out of 20-sub-argocd.yaml's own run: blocks into this module -- WorkflowStaticAnalysisTests below now cross-checks the real Python implementation directly, never a reimplementation of its logic.
+PHASE3_ARGOCD_TOOL_PATH = os.path.join(REPO_ROOT, "automation", "phases", "phase3", "phase3_argocd.py")
+
+
+def _load_phase3_argocd_module():
+    spec = importlib.util.spec_from_file_location("phase3_argocd", PHASE3_ARGOCD_TOOL_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _generate_registry_document(environment="dev"):
@@ -3477,29 +3487,27 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
             self.assertNotIn(forbidden, self.monitor_text)
 
     def test_validation_job_name_includes_run_attempt(self):
-        self.assertIn(
-            'JOB_NAME="ecr-token-sync-verify-${{ github.run_id }}-${{ github.run_attempt }}"',
-            self.argocd_text,
-        )
+        # Phase 3 Python Conversion: the verification Job name is now built inside automation/phases/phase3/phase3_argocd.py's _run_ecr_token_sync_verification() from run_id/run_attempt arguments, rather than interpolated directly into a workflow run: block -- the workflow itself now only threads GITHUB_RUN_ID/GITHUB_RUN_ATTEMPT (the exact env vars GitHub Actions sets for github.run_id/github.run_attempt) into the Python call.
+        with open(PHASE3_ARGOCD_TOOL_PATH) as f:
+            phase3_source = f.read()
+        self.assertIn('job_name = f"ecr-token-sync-verify-{run_id}-{run_attempt}"', phase3_source)
+        self.assertIn('run_id = os.environ.get("GITHUB_RUN_ID"', phase3_source)
+        self.assertIn('run_attempt = os.environ.get("GITHUB_RUN_ATTEMPT"', phase3_source)
 
     def test_argocd_application_uses_direct_heredoc_not_cat_pipe(self):
         self.assertNotIn("cat <<EOF | kubectl apply", self.monitor_text)
         self.assertIn("kubectl apply -f - <<EOF", self.monitor_text)
 
     def test_rbac_extraction_no_longer_selects_first_role_by_document_order(self):
-        self.assertNotIn(
-            "awk '/^kind: Role$/{flag=1} flag{print} /^---$/{if(flag) exit}'",
-            self.argocd_text,
-        )
-        self.assertIn("name: argocd-ecr-token-sync", self.argocd_text)
+        # Phase 3 Python Conversion: the old awk one-liner never existed in Python and never will -- automation/phases/phase3/phase3_argocd.py's _extract_named_role_block() splits on "---" and matches by kind+name, read directly from source here.
+        with open(PHASE3_ARGOCD_TOOL_PATH) as f:
+            phase3_source = f.read()
+        self.assertNotIn("awk '/^kind: Role$/{flag=1} flag{print} /^---$/{if(flag) exit}'", phase3_source)
+        self.assertIn("kind:\\s*Role", phase3_source)
 
     def test_multi_document_rbac_extraction_selects_correct_role(self):
-        """Runs the actual production RBAC-selection snippet (verbatim from the workflow) against a synthetic multi-document manifest to prove the correct Role is selected by kind+name, not document order."""
-        snippet = _extract_run_block(self.argocd_text, "Validate ECR token sync resources are rendered")
-        start = snippet.index('echo "Checking RBAC resourceNames')
-        end = snippet.index('echo "OK: ServiceAccount/Role/RoleBinding/CronJob')
-        end_of_line = snippet.index("\n", end)
-        rbac_snippet = snippet[start:end_of_line + 1]
+        """Calls the real automation/phases/phase3/phase3_argocd.py._extract_named_role_block() (never a reimplementation) against a synthetic multi-document manifest to prove the correct Role is selected by kind+name, not document order."""
+        phase3_argocd = _load_phase3_argocd_module()
 
         synthetic_manifest = """---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -3544,24 +3552,15 @@ metadata:
   name: argocd-ecr-token-sync
   namespace: argocd
 """
-        with tempfile.TemporaryDirectory() as tmpdir:
-            rendered_path = os.path.join(tmpdir, "rendered.yaml")
-            with open(rendered_path, "w") as f:
-                f.write(synthetic_manifest)
-            script = f'set -euo pipefail\nRENDERED="{rendered_path}"\n' + rbac_snippet
-            env = dict(os.environ, ARGOCD_ECR_READ_ROLE_NAME="GoldenGateArgocdECRRead-dev")
-            proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
-
-        self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
-        self.assertIn("OK: ServiceAccount/Role/RoleBinding/CronJob", proc.stdout)
+        role_block = phase3_argocd._extract_named_role_block(synthetic_manifest, "argocd-ecr-token-sync")
+        self.assertIsNotNone(role_block)
+        self.assertNotIn("argocd-application-controller", role_block)
+        for secret_name in phase3_argocd.REQUIRED_REPO_SECRETS:
+            self.assertIn(secret_name, role_block)
 
     def test_multi_document_rbac_extraction_fails_when_role_incomplete(self):
-        """Same production snippet, but the real Role is missing a required resourceName; must fail loudly, proving the check isn't vacuously true."""
-        snippet = _extract_run_block(self.argocd_text, "Validate ECR token sync resources are rendered")
-        start = snippet.index('echo "Checking RBAC resourceNames')
-        end = snippet.index('echo "OK: ServiceAccount/Role/RoleBinding/CronJob')
-        end_of_line = snippet.index("\n", end)
-        rbac_snippet = snippet[start:end_of_line + 1]
+        """Same real function, but the real Role is missing a required resourceName; automation/phases/phase3/phase3_argocd.py's _validate_ecr_token_sync_rendered() must fail loudly, proving the check isn't vacuously true."""
+        phase3_argocd = _load_phase3_argocd_module()
 
         incomplete_manifest = """---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -3591,16 +3590,9 @@ rules:
       - update
       - patch
 """
-        with tempfile.TemporaryDirectory() as tmpdir:
-            rendered_path = os.path.join(tmpdir, "rendered.yaml")
-            with open(rendered_path, "w") as f:
-                f.write(incomplete_manifest)
-            script = f'set -euo pipefail\nRENDERED="{rendered_path}"\n' + rbac_snippet
-            env = dict(os.environ, ARGOCD_ECR_READ_ROLE_NAME="GoldenGateArgocdECRRead-dev")
-            proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
-
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("argocd-ecr-goldengate-monitor-oci", proc.stdout)
+        role_block = phase3_argocd._extract_named_role_block(incomplete_manifest, "argocd-ecr-token-sync")
+        self.assertIsNotNone(role_block)
+        self.assertNotIn("argocd-ecr-goldengate-monitor-oci", role_block)
 
 
 SERVICEACCOUNT_TEMPLATE_PATH = os.path.join(

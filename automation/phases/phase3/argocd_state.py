@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""automation/orchestration/argocd_state.py: read-only Argo CD ownership-safety preflight classifier -- answers exactly one question, "is it safe for MAIN to reconcile this Argo CD installation?", as one of ABSENT/OWNED/BROKEN. This is NOT a HEALTHY-skip prerequisite classifier: Argo CD's own desired state (core replicas, ecrTokenSync repositories, argocdServerIngress.enabled, image/tag, any future wrapper-chart resource) may legitimately change on every run, so OWNED (not HEALTHY) is the "safe to reconcile" state -- readiness/exact-desired-state acceptance is validated separately, post-reconciliation, by automation/orchestration/argocd_acceptance.py. Generic by design: this module checks OWNERSHIP LABELS on whatever currently exists, never the correctness/readiness of any individual resource -- adding a new values-driven chart resource, or flipping an existing one false<->true, never requires touching this file. Never mutates the cluster: every kubectl invocation here is a `get` (read-only); no apply/create/delete/patch/annotate/label/helm call exists in this module. Consumes environment identity through automation/goldengate-environment.py, never a second environment parser."""
+"""automation/phases/phase3/argocd_state.py: read-only Argo CD ownership-safety preflight classifier -- answers exactly one question, "is it safe for MAIN to reconcile this Argo CD installation?", as one of ABSENT/OWNED/BROKEN. This is NOT a HEALTHY-skip prerequisite classifier: Argo CD's own desired state (core replicas, ecrTokenSync repositories, argocdServerIngress.enabled, image/tag, any future wrapper-chart resource) may legitimately change on every run, so OWNED (not HEALTHY) is the "safe to reconcile" state -- readiness/exact-desired-state acceptance is validated separately, post-reconciliation, by automation/phases/phase3/argocd_acceptance.py. Generic by design: this module checks OWNERSHIP LABELS on whatever currently exists, never the correctness/readiness of any individual resource -- adding a new values-driven chart resource, or flipping an existing one false<->true, never requires touching this file. Never mutates the cluster: every kubectl invocation here is a `get` (read-only); no apply/create/delete/patch/annotate/label/helm call exists in this module. Consumes environment identity through automation/goldengate-environment.py, never a second environment parser."""
 from __future__ import annotations
 
 import argparse
@@ -8,10 +8,11 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
-_ENVIRONMENT_MODULE_PATH = os.path.join(os.path.dirname(__file__), "..", "goldengate-environment.py")
+_ENVIRONMENT_MODULE_PATH = REPO_ROOT / "automation" / "goldengate-environment.py"
 _environment_module = None
 
 

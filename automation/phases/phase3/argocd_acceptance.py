@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""automation/orchestration/argocd_acceptance.py: read-only Argo CD post-reconciliation acceptance classifier -- answers exactly one question, "does the live Argo CD installation exactly match the current committed desired state right now?", as one of HEALTHY/BROKEN. Unlike automation/orchestration/argocd_state.py (a pre-reconciliation ownership-safety preflight that only checks OWNERSHIP LABELS), this tool DOES require full readiness and exact desired-state correctness: a missing/unready core component, an incomplete CRD set, a misconfigured ecr-token-sync identity, an incorrect/missing repository Secret, or (when argocdServerIngress.enabled=true) a missing/incorrect/not-yet-provisioned Ingress are all BROKEN here. Symmetrically, when argocdServerIngress.enabled=false the Ingress must be ABSENT -- a still-present, no-longer-desired Ingress is exactly as BROKEN as a missing desired one, proving true->false pruning genuinely completed. Never mutates the cluster: every kubectl invocation here is a `get` (read-only); no apply/create/delete/patch/annotate/label/helm call exists in this module. Consumes environment identity through automation/goldengate-environment.py, never a second environment parser."""
+"""automation/phases/phase3/argocd_acceptance.py: read-only Argo CD post-reconciliation acceptance classifier -- answers exactly one question, "does the live Argo CD installation exactly match the current committed desired state right now?", as one of HEALTHY/BROKEN. Unlike automation/phases/phase3/argocd_state.py (a pre-reconciliation ownership-safety preflight that only checks OWNERSHIP LABELS), this tool DOES require full readiness and exact desired-state correctness: a missing/unready core component, an incomplete CRD set, a misconfigured ecr-token-sync identity, an incorrect/missing repository Secret, or (when argocdServerIngress.enabled=true) a missing/incorrect/not-yet-provisioned Ingress are all BROKEN here. Symmetrically, when argocdServerIngress.enabled=false the Ingress must be ABSENT -- a still-present, no-longer-desired Ingress is exactly as BROKEN as a missing desired one, proving true->false pruning genuinely completed. Never mutates the cluster: every kubectl invocation here is a `get` (read-only); no apply/create/delete/patch/annotate/label/helm call exists in this module. Consumes environment identity through automation/goldengate-environment.py, never a second environment parser."""
 from __future__ import annotations
 
 import argparse
@@ -9,12 +9,13 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import yaml
 
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
-_ENVIRONMENT_MODULE_PATH = os.path.join(os.path.dirname(__file__), "..", "goldengate-environment.py")
+_ENVIRONMENT_MODULE_PATH = REPO_ROOT / "automation" / "goldengate-environment.py"
 _environment_module = None
 
 

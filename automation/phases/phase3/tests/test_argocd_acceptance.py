@@ -1,13 +1,14 @@
-"""Offline tests for automation/orchestration/argocd_acceptance.py (post-reconciliation acceptance: HEALTHY/BROKEN); run directly via `python3 automation/test-goldengate-argocd-acceptance.py`. No live Kubernetes -- every kubectl response is a fake, injected fixture. Exercises the classifier's actual logic (never merely greps its source). Pre-reconciliation ownership safety (ABSENT/OWNED/BROKEN) is a separate module -- see automation/test-goldengate-argocd-state.py."""
+"""Offline tests for automation/phases/phase3/argocd_acceptance.py (post-reconciliation acceptance: HEALTHY/BROKEN); run directly via `python3 automation/phases/phase3/tests/test_argocd_acceptance.py`. No live Kubernetes -- every kubectl response is a fake, injected fixture. Exercises the classifier's actual logic (never merely greps its source). Pre-reconciliation ownership safety (ABSENT/OWNED/BROKEN) is a separate module -- see automation/phases/phase3/tests/test_argocd_state.py."""
 from __future__ import annotations
 
 import importlib.util
 import json
 import os
 import unittest
+from pathlib import Path
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TOOL_PATH = os.path.join(REPO_ROOT, "automation", "orchestration", "argocd_acceptance.py")
+REPO_ROOT = Path(__file__).resolve().parents[4]
+TOOL_PATH = REPO_ROOT / "automation" / "phases" / "phase3" / "argocd_acceptance.py"
 
 
 def _load_tool():

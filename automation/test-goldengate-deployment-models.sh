@@ -31,6 +31,7 @@ OBSERVABILITY_VALUES_FILE="platform/dev/goldengate-observability/values.yaml"
 OBSERVABILITY_WORKFLOW=".github/workflows/40-sub-observability.yaml"
 ARGOCD_VALUES_FILE="envs/dev/argocd/values.yaml"
 ARGOCD_DEPLOY_WORKFLOW=".github/workflows/20-sub-argocd.yaml"
+PHASE3_TOOL="automation/phases/phase3/phase3_argocd.py"
 
 # runtime.image.repository/ingress.hostDomain/ingress.alb.groupName/ingress.alb.certificateArn/runtime.csi.region are shared environment configuration -- resolved once here via the same resolver the deploy workflow uses, never an independently maintained literal.
 RESOLVED_DNS_DOMAIN="$(python3 "$ENVIRONMENT_TOOL" --environment dev get DNS_DOMAIN)"
@@ -1014,21 +1015,21 @@ assert not (names & forbidden), names & forbidden
       fail "11a: ${ARGOCD_DEPLOY_WORKFLOW} does not parse as strict YAML"
     fi
 
-    if grep -q 'argocd-ecr-amazon-cloudwatch-observability-oci' "${REPO_ROOT}/${ARGOCD_DEPLOY_WORKFLOW}" \
-        && grep -q 'helm/amazon-cloudwatch-observability' "${REPO_ROOT}/${ARGOCD_DEPLOY_WORKFLOW}" \
-        && grep -qi 'all four' "${REPO_ROOT}/${ARGOCD_DEPLOY_WORKFLOW}" \
-        && ! grep -qi 'all three' "${REPO_ROOT}/${ARGOCD_DEPLOY_WORKFLOW}"; then
-      pass "11b: ${ARGOCD_DEPLOY_WORKFLOW} references the fourth repository/Secret and its exact-count checks/comments were updated from three to four (no stale 'all three' text remains)"
+    # Phase 3 Python Conversion: this content now lives in automation/phases/phase3/phase3_argocd.py (the Python-backed ECR token-sync/IAM-policy validation implementation), not inline in the reusable workflow's own run: blocks -- checked across both files, since either location satisfies the underlying "the fourth repository/Secret is genuinely covered" property.
+  if grep -q 'argocd-ecr-amazon-cloudwatch-observability-oci' "${REPO_ROOT}/${ARGOCD_DEPLOY_WORKFLOW}" "${REPO_ROOT}/${PHASE3_TOOL}" \
+        && grep -q 'helm/amazon-cloudwatch-observability' "${REPO_ROOT}/${ARGOCD_DEPLOY_WORKFLOW}" "${REPO_ROOT}/${PHASE3_TOOL}" \
+        && ! grep -qi 'all three' "${REPO_ROOT}/${ARGOCD_DEPLOY_WORKFLOW}" "${REPO_ROOT}/${PHASE3_TOOL}"; then
+      pass "11b: ${ARGOCD_DEPLOY_WORKFLOW}/${PHASE3_TOOL} reference the fourth repository/Secret and no stale 'all three' text remains"
     else
-      fail "11b: ${ARGOCD_DEPLOY_WORKFLOW} does not fully reference the fourth repository, or a stale 'all three' comment/echo remains"
+      fail "11b: ${ARGOCD_DEPLOY_WORKFLOW}/${PHASE3_TOOL} do not fully reference the fourth repository, or a stale 'all three' comment/echo remains"
     fi
 
-    # The IAM-policy static-validation step's expected_repos dict must include the fourth repository name, deriving its ARN from the canonical AWS_REGION/ECR_ACCOUNT_ID (never a second hardcoded account/region).
-    if grep -q '"helm/amazon-cloudwatch-observability"' "${REPO_ROOT}/${ARGOCD_DEPLOY_WORKFLOW}" \
-        && grep -qF 'f"arn:aws:ecr:{region}:{ecr_account_id}:repository/{name}"' "${REPO_ROOT}/${ARGOCD_DEPLOY_WORKFLOW}"; then
-      pass "11c: ${ARGOCD_DEPLOY_WORKFLOW}'s IAM-policy validation step expects the amazon-cloudwatch-observability repository ARN, derived from the canonical AWS_REGION/ECR_ACCOUNT_ID"
+    # The IAM-policy static-validation function's expected_repos dict (now in phase3_argocd.py, never reimplemented inline in the workflow) must include the fourth repository name, deriving its ARN from the canonical AWS_REGION/ECR_ACCOUNT_ID (never a second hardcoded account/region).
+    if grep -q '"helm/amazon-cloudwatch-observability"' "${REPO_ROOT}/${PHASE3_TOOL}" \
+        && grep -qF 'f"arn:aws:ecr:{region}:{ecr_account_id}:repository/{name}"' "${REPO_ROOT}/${PHASE3_TOOL}"; then
+      pass "11c: ${PHASE3_TOOL}'s IAM-policy validation function expects the amazon-cloudwatch-observability repository ARN, derived from the canonical AWS_REGION/ECR_ACCOUNT_ID"
     else
-      fail "11c: ${ARGOCD_DEPLOY_WORKFLOW}'s IAM-policy validation step does not reference the amazon-cloudwatch-observability repository ARN"
+      fail "11c: ${PHASE3_TOOL}'s IAM-policy validation function does not reference the amazon-cloudwatch-observability repository ARN"
     fi
   else
     fail "${ARGOCD_DEPLOY_WORKFLOW} not found"
@@ -10217,12 +10218,12 @@ fi
 echo ""
 echo "--- Live Deploy Fix 4: repository-wide GG_SELECTED_ENVIRONMENT scope hardening ---"
 
-# 1-5, 14: the repo-wide static checker itself, run against the REAL current repository -- proves it reports the expected inventory (9 active workflows, 19 jobs referencing GG_SELECTED_ENVIRONMENT -- down from 22 before the Phase 1 single-job consolidation, since eks_oidc_preflight/managed_efs_inventory_guard/detect_changed_deployments no longer exist as separate jobs with their own job-level bindings) and ZERO unsafe jobs.
+# 1-5, 14: the repo-wide static checker itself, run against the REAL current repository -- proves it reports the expected inventory (9 active workflows, 17 jobs referencing GG_SELECTED_ENVIRONMENT -- down from 19 before the Phase 3 Python Conversion, since argocd_preflight/validate_argocd_ready no longer thread a job-level GG_SELECTED_ENVIRONMENT shell variable through their run: blocks at all -- they interpolate needs.validate_model.outputs.selected_environment directly as a GitHub Actions expression into each phase3_argocd.py --environment argument, eliminating the unbound-shell-variable risk class entirely rather than merely covering it) and ZERO unsafe jobs.
 if [ -f "$ENV_SCOPE_CHECKER" ]; then
   ENV_SCOPE_REAL_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 "$ENV_SCOPE_CHECKER" 2>&1)"
   ENV_SCOPE_REAL_STATUS=$?
-  if [ "$ENV_SCOPE_REAL_STATUS" -eq 0 ] && grep -q "^Workflows inspected: 9$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^Jobs with GG_SELECTED_ENVIRONMENT run: references: 19$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^Unsafe jobs: 0$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^OK: zero unsafe GG_SELECTED_ENVIRONMENT references" <<< "$ENV_SCOPE_REAL_OUT"; then
-    pass "Live Deploy Fix 4: 1-5,14: ${ENV_SCOPE_CHECKER} reports 9 workflows inspected, 19 jobs referencing GG_SELECTED_ENVIRONMENT (down from 22 pre-Phase-1-consolidation), and ZERO unsafe jobs against the real current repository"
+  if [ "$ENV_SCOPE_REAL_STATUS" -eq 0 ] && grep -q "^Workflows inspected: 9$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^Jobs with GG_SELECTED_ENVIRONMENT run: references: 17$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^Unsafe jobs: 0$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^OK: zero unsafe GG_SELECTED_ENVIRONMENT references" <<< "$ENV_SCOPE_REAL_OUT"; then
+    pass "Live Deploy Fix 4: 1-5,14: ${ENV_SCOPE_CHECKER} reports 9 workflows inspected, 17 jobs referencing GG_SELECTED_ENVIRONMENT (down from 19 pre-Phase-3-conversion), and ZERO unsafe jobs against the real current repository"
   else
     fail "Live Deploy Fix 4: 1-5,14: ${ENV_SCOPE_CHECKER} did not report the expected zero-violation inventory against the real repository (status=${ENV_SCOPE_REAL_STATUS}):"$'\n'"${ENV_SCOPE_REAL_OUT}"
   fi
@@ -10965,13 +10966,13 @@ else
   fail "Phase 11 6: an unapproved repository variable remains referenced in active workflows:"$'\n'"${UNAPPROVED_VARS_HITS}"
 fi
 
-# 7: 20-sub-argocd.yaml's IAM-policy validation step derives its POLICY_FILE path from GG_ENVIRONMENT (the generator's policy_folder = "argocd-ecr-oci-read-<environment>" naming contract), never a second hardcoded envs/dev/... literal.
-if grep -qF 'envs/dev/policies/argocd-ecr-oci-read-dev' .github/workflows/20-sub-argocd.yaml 2>/dev/null; then
-  fail "Phase 11 7: 20-sub-argocd.yaml still hardcodes envs/dev/policies/argocd-ecr-oci-read-dev"
-elif grep -qF 'POLICY_FILE="envs/${GG_ENVIRONMENT}/policies/argocd-ecr-oci-read-${GG_ENVIRONMENT}/policies/policies_1.json"' .github/workflows/20-sub-argocd.yaml 2>/dev/null; then
-  pass "Phase 11 7: 20-sub-argocd.yaml's IAM-policy validation step derives POLICY_FILE from GG_ENVIRONMENT, never a hardcoded envs/dev/... literal"
+# 7 (translated for the Phase 3 Python Conversion): the IAM-policy validation logic (including its POLICY_FILE path derivation) moved from a 20-sub-argocd.yaml run: block into automation/phases/phase3/phase3_argocd.py's _validate_ecr_iam_policy(environment) -- still derived from the environment argument (the generator's policy_folder = "argocd-ecr-oci-read-<environment>" naming contract), never a second hardcoded envs/dev/... literal, in either file.
+if grep -qF 'envs/dev/policies/argocd-ecr-oci-read-dev' .github/workflows/20-sub-argocd.yaml "$PHASE3_TOOL" 2>/dev/null; then
+  fail "Phase 11 7: 20-sub-argocd.yaml/${PHASE3_TOOL} still hardcode envs/dev/policies/argocd-ecr-oci-read-dev"
+elif grep -qF 'policy_path = REPO_ROOT / "envs" / environment / "policies" / f"argocd-ecr-oci-read-{environment}" / "policies" / "policies_1.json"' "$PHASE3_TOOL" 2>/dev/null; then
+  pass "Phase 11 7: automation/phases/phase3/phase3_argocd.py's IAM-policy validation function derives POLICY_FILE from its environment argument, never a hardcoded envs/dev/... literal"
 else
-  fail "Phase 11 7: 20-sub-argocd.yaml no longer derives POLICY_FILE from GG_ENVIRONMENT as expected"
+  fail "Phase 11 7: automation/phases/phase3/phase3_argocd.py no longer derives POLICY_FILE from its environment argument as expected"
 fi
 
 # 8: 90-ops-observability-artifact-sync.yaml's chart-rendering step uses the canonical OBSERVABILITY_NAMESPACE, never a hardcoded amazon-cloudwatch literal.
@@ -11269,8 +11270,8 @@ else
   fail "Phase B1: a stale 'Run the 20-sub-argocd.yaml workflow first' message remains in:"$'\n'"${STALE_ARGO_CRD_MSG_HITS}"
 fi
 
-# automation/orchestration/argocd_state.py must never construct a mutating kubectl/helm command -- read directly from source, never from the test's own constants.
-ARGOCD_STATE_TOOL="automation/orchestration/argocd_state.py"
+# automation/phases/phase3/argocd_state.py must never construct a mutating kubectl/helm command -- read directly from source, never from the test's own constants.
+ARGOCD_STATE_TOOL="automation/phases/phase3/argocd_state.py"
 if [ -f "$ARGOCD_STATE_TOOL" ]; then
   MUTATING_HITS="$(grep -nE 'kubectl apply|kubectl create|kubectl delete|kubectl patch|kubectl annotate|kubectl label|helm install|helm upgrade|helm uninstall|"apply"|'"'"'apply'"'"'|"create"|'"'"'create'"'"'|"delete"|'"'"'delete'"'"'|"patch"|'"'"'patch'"'"'|"annotate"|'"'"'annotate'"'"'|"label"|'"'"'label'"'"'' "$ARGOCD_STATE_TOOL" 2>/dev/null || true)"
   if [ -z "$MUTATING_HITS" ]; then
@@ -11282,112 +11283,72 @@ else
   fail "Phase B1: ${ARGOCD_STATE_TOOL} is missing"
 fi
 
-# The two classifiers' own dedicated offline unit-test suites are part of the normal regression run, not merely available separately: automation/test-goldengate-argocd-state.py covers pre-reconciliation ownership safety (ABSENT/OWNED/BROKEN); automation/test-goldengate-argocd-acceptance.py covers the separate, strict post-reconciliation acceptance classifier (HEALTHY/BROKEN), including the true->false Ingress-pruning proof.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/test-goldengate-argocd-state.py ]; then
-  if ARGOCD_STATE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/test-goldengate-argocd-state.py 2>&1)"; then
-    pass "Phase B1: automation/test-goldengate-argocd-state.py (the Argo CD ownership classifier's offline ABSENT/OWNED/BROKEN test suite) passes"
+# The two classifiers' own dedicated offline unit-test suites are part of the normal regression run, not merely available separately: automation/phases/phase3/tests/test_argocd_state.py covers pre-reconciliation ownership safety (ABSENT/OWNED/BROKEN); automation/phases/phase3/tests/test_argocd_acceptance.py covers the separate, strict post-reconciliation acceptance classifier (HEALTHY/BROKEN), including the true->false Ingress-pruning proof.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/phases/phase3/tests/test_argocd_state.py ]; then
+  if ARGOCD_STATE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/phases/phase3/tests/test_argocd_state.py 2>&1)"; then
+    pass "Phase B1: automation/phases/phase3/tests/test_argocd_state.py (the Argo CD ownership classifier's offline ABSENT/OWNED/BROKEN test suite) passes"
   else
-    fail "Phase B1: automation/test-goldengate-argocd-state.py failed:"$'\n'"${ARGOCD_STATE_TEST_OUTPUT}"
+    fail "Phase B1: automation/phases/phase3/tests/test_argocd_state.py failed:"$'\n'"${ARGOCD_STATE_TEST_OUTPUT}"
   fi
 else
-  skip "Phase B1: automation/test-goldengate-argocd-state.py -- python3 unavailable or file missing"
+  skip "Phase B1: automation/phases/phase3/tests/test_argocd_state.py -- python3 unavailable or file missing"
 fi
 
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/test-goldengate-argocd-acceptance.py ]; then
-  if ARGOCD_ACCEPTANCE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/test-goldengate-argocd-acceptance.py 2>&1)"; then
-    pass "Phase B1: automation/test-goldengate-argocd-acceptance.py (the Argo CD post-reconciliation acceptance classifier's offline HEALTHY/BROKEN test suite) passes"
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/phases/phase3/tests/test_argocd_acceptance.py ]; then
+  if ARGOCD_ACCEPTANCE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/phases/phase3/tests/test_argocd_acceptance.py 2>&1)"; then
+    pass "Phase B1: automation/phases/phase3/tests/test_argocd_acceptance.py (the Argo CD post-reconciliation acceptance classifier's offline HEALTHY/BROKEN test suite) passes"
   else
-    fail "Phase B1: automation/test-goldengate-argocd-acceptance.py failed:"$'\n'"${ARGOCD_ACCEPTANCE_TEST_OUTPUT}"
+    fail "Phase B1: automation/phases/phase3/tests/test_argocd_acceptance.py failed:"$'\n'"${ARGOCD_ACCEPTANCE_TEST_OUTPUT}"
   fi
 else
-  skip "Phase B1: automation/test-goldengate-argocd-acceptance.py -- python3 unavailable or file missing"
+  skip "Phase B1: automation/phases/phase3/tests/test_argocd_acceptance.py -- python3 unavailable or file missing"
+fi
+
+# Phase 3 Python Conversion: phase3_argocd.py's own dedicated offline unit-test suite (ownership-preflight/prepare-deployment/validate-local/publish-chart/reconcile-cluster/post-deploy-validation/strict-acceptance/summary), no live AWS/Kubernetes/ECR.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/phases/phase3/tests/test_phase3_argocd.py ]; then
+  if PHASE3_ARGOCD_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/phases/phase3/tests/test_phase3_argocd.py 2>&1)"; then
+    pass "Phase 3 Python Conversion: automation/phases/phase3/tests/test_phase3_argocd.py (the Phase 3 Argo CD orchestrator's offline test suite) passes"
+  else
+    fail "Phase 3 Python Conversion: automation/phases/phase3/tests/test_phase3_argocd.py failed:"$'\n'"${PHASE3_ARGOCD_TEST_OUTPUT}"
+  fi
+else
+  skip "Phase 3 Python Conversion: automation/phases/phase3/tests/test_phase3_argocd.py -- python3 unavailable or file missing"
 fi
 
 echo ""
-echo "--- Generic MAIN Desired-State Convergence Fix: Argo CD preflight/acceptance script execution ---"
+echo "--- Phase 3 Python Conversion: Argo CD preflight/acceptance delegate to phase3_argocd.py, never reimplement inline ---"
 
-# H/I/N: REALLY EXECUTE the committed "Classify Argo CD ownership safety" (argocd_preflight) and "Re-classify and require Argo CD to be exactly HEALTHY" (validate_argocd_ready) step scripts (never a reimplementation) against fake automation/orchestration/argocd_state.py and automation/orchestration/argocd_acceptance.py stubs shadowed via cwd, for every classifier state -- proving argocd_preflight succeeds (and publishes the right state= output) for ABSENT/OWNED and fails for BROKEN (H/I), and that validate_argocd_ready's final convergence accepts ONLY exactly HEALTHY -- a reconcile_argocd that "succeeded" while the cluster is still BROKEN post-reconciliation must still fail closed (N). Neither script accepts or checks any contract marker any more -- ABSENT/OWNED/BROKEN and HEALTHY/BROKEN are now generic, stable contracts shared with runtime_state.py/monitor_state.py, so there is nothing left to cross-check.
+# H/I/M/N (translated for the Phase 3 Python Conversion): argocd_preflight's "Classify Argo CD ownership safety" step and validate_argocd_ready's "Re-classify and require Argo CD to be exactly HEALTHY" step must delegate to phase3_argocd.py's own ownership-preflight/strict-acceptance subcommands rather than reimplementing classify/parse logic inline in bash -- the actual ABSENT/OWNED/BROKEN and HEALTHY/BROKEN state-handling behavioral proof (equivalent to the former H/I/M/N scenarios) now lives in automation/phases/phase3/tests/test_phase3_argocd.py's TestOwnershipPreflight/TestStrictAcceptance classes, run as part of this same regression below -- never re-derived a second time here against extracted bash text.
 if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
-  set +e
-  LIVE_ARGO_SELF_RECOVERY_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
-import os
-import subprocess
-import sys
-import tempfile
-
+  PHASE3_DELEGATION_CHECK="$(python3 -c '
 import yaml
 
-with open(sys.argv[1]) as f:
+with open("'"$EKS_APP_WORKFLOW"'") as f:
     doc = yaml.safe_load(f)
 
 preflight_step = next((s for s in doc["jobs"]["argocd_preflight"]["steps"] if s.get("name") == "Classify Argo CD ownership safety"), None)
 ready_step = next((s for s in doc["jobs"]["validate_argocd_ready"]["steps"] if s.get("name") == "Re-classify and require Argo CD to be exactly HEALTHY"), None)
 
 results = []
-if preflight_step is None:
-    results.append(("H/I: argocd_preflight defines its 'Classify Argo CD ownership safety' step", False))
-if ready_step is None:
-    results.append(("N: validate_argocd_ready defines its 'Re-classify and require Argo CD to be exactly HEALTHY' step", False))
-
-STUB_TEMPLATE = '''import argparse, json, sys
-p = argparse.ArgumentParser()
-p.add_argument("--environment", required=True)
-p.add_argument("--kubectl-bin", default="kubectl")
-p.parse_args()
-print(json.dumps({{"state": {state!r}, "environment": "dev", "namespace": "argocd", "reasons": [], "checks": {{}}}}))
-sys.exit(0)
-'''
-
-
-def run_step(script, state, tool_name):
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        tool_dir = os.path.join(tmp_dir, "automation", "orchestration")
-        os.makedirs(tool_dir)
-        with open(os.path.join(tool_dir, tool_name + ".py"), "w") as f:
-            f.write(STUB_TEMPLATE.format(state=state))
-        fd, gh_output_path = tempfile.mkstemp()
-        os.close(fd)
-        # PIP_BREAK_SYSTEM_PACKAGES=1: this local sandbox's system Python is PEP 668 externally-managed, so the real validate_argocd_ready step's own unmodified "python3 -m pip install ... PyYAML==6.0.1" line (PyYAML is already satisfied here) would otherwise abort the whole extracted script under set -euo pipefail before it ever reaches the classify logic being tested -- never an issue on the real GitHub-hosted/CodeBuild runners this workflow actually targets.
-        env = {"PATH": os.environ.get("PATH", ""), "GG_SELECTED_ENVIRONMENT": "dev", "GITHUB_OUTPUT": gh_output_path, "PIP_BREAK_SYSTEM_PACKAGES": "1"}
-        proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, cwd=tmp_dir, timeout=30)
-        with open(gh_output_path) as f:
-            output_text = f.read()
-        os.unlink(gh_output_path)
-        return proc.returncode, output_text, proc.stdout + proc.stderr
-
-
+results.append(("H/I: argocd_preflight defines its \x27Classify Argo CD ownership safety\x27 step", preflight_step is not None))
+results.append(("M/N: validate_argocd_ready defines its \x27Re-classify and require Argo CD to be exactly HEALTHY\x27 step", ready_step is not None))
 if preflight_step is not None:
-    preflight_script = preflight_step["run"]
-    for state in ("ABSENT", "OWNED"):
-        rc, out, log = run_step(preflight_script, state, "argocd_state")
-        results.append((f"H: argocd_preflight succeeds for state={state} and publishes state={state} to $GITHUB_OUTPUT", rc == 0 and f"state={state}" in out))
-    rc, out, log = run_step(preflight_script, "BROKEN", "argocd_state")
-    results.append(("I: argocd_preflight fails (non-zero exit) for state=BROKEN, never auto-repaired here", rc != 0))
-
+    results.append(("H/I: the preflight step delegates to phase3_argocd.py ownership-preflight, never a reimplementation", "phase3_argocd.py" in preflight_step.get("run", "") and "ownership-preflight" in preflight_step.get("run", "")))
+    results.append(("H/I: the preflight step has id: ownership_preflight (so argocd_preflight can expose its state output)", preflight_step.get("id") == "ownership_preflight"))
 if ready_step is not None:
-    ready_script = ready_step["run"]
-    rc, out, log = run_step(ready_script, "HEALTHY", "argocd_acceptance")
-    results.append(("M: validate_argocd_ready's final convergence check succeeds for exactly HEALTHY", rc == 0))
-    rc, out, log = run_step(ready_script, "BROKEN", "argocd_acceptance")
-    results.append(("N: validate_argocd_ready's final convergence check FAILS when reconcile_argocd \"succeeded\" but post-reconciliation acceptance still classifies BROKEN (e.g. repository Secrets never actually got created, or a newly-disabled Ingress was never pruned) -- reconciliation success alone is never trusted as HEALTHY", rc != 0))
+    results.append(("M/N: the acceptance step delegates to phase3_argocd.py strict-acceptance, never a reimplementation", "phase3_argocd.py" in ready_step.get("run", "") and "strict-acceptance" in ready_step.get("run", "")))
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
-PYEOF
-)"
-  set -e
-  if [ -n "$LIVE_ARGO_SELF_RECOVERY_OUT" ]; then
-    while IFS= read -r line; do
-      case "$line" in
-        FAIL\ *) fail "Generic MAIN Desired-State Convergence Fix: ${line#FAIL }" ;;
-        OK\ *) pass "Generic MAIN Desired-State Convergence Fix: ${line#OK }" ;;
-      esac
-    done <<< "$LIVE_ARGO_SELF_RECOVERY_OUT"
-  else
-    fail "Generic MAIN Desired-State Convergence Fix: script-execution proof produced no output"
-  fi
+' 2>&1)"
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL\ *) fail "Phase 3 Python Conversion: ${line#FAIL }" ;;
+      OK\ *) pass "Phase 3 Python Conversion: ${line#OK }" ;;
+    esac
+  done <<< "$PHASE3_DELEGATION_CHECK"
 else
-  skip "Generic MAIN Desired-State Convergence Fix: script-execution proof -- python3/PyYAML unavailable or main workflow missing"
+  skip "Phase 3 Python Conversion: preflight/acceptance delegation check -- python3/PyYAML unavailable or main workflow missing"
 fi
 
 # K/section-9: no active workflow presents standalone specialist-workflow execution as the normal recovery path for Argo CD; MAIN is the sole operational entry point.
@@ -11447,8 +11408,8 @@ try:
     main_path = os.path.join(dst_wf_dir, "00-main-goldengate-orchestrator.yaml")
     original = open(main_path).read()
     stripped = original.replace(
-        "      environment: ${{ needs.validate_model.outputs.selected_environment }}\n      orchestrated_by_main: true\n\n  validate_argocd_ready:",
-        "      environment: ${{ needs.validate_model.outputs.selected_environment }}\n\n  validate_argocd_ready:",
+        "      environment: ${{ needs.validate_model.outputs.selected_environment }}\n      orchestrated_by_main: true\n\n  # Phase 3D",
+        "      environment: ${{ needs.validate_model.outputs.selected_environment }}\n\n  # Phase 3D",
         1,
     )
     if stripped == original:
@@ -13260,97 +13221,9 @@ else
   skip "Argo Ingress helm lint/template proofs -- helm unavailable or envs/dev/argocd/values.yaml missing"
 fi
 
-# 20-sub-argocd.yaml render-time Ingress validation: REALLY EXECUTE the committed "Validate rendered Argo CD server Ingress" step (never a reimplementation) against the real render above.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ "$HELM_AVAILABLE" = "true" ] && [ -f "$ARGOCD_DEPLOY_WORKFLOW" ]; then
-  set +e
-  ARGO_INGRESS_VALIDATE_OUT="$(python3 - "$ARGOCD_DEPLOY_WORKFLOW" <<'PYEOF'
-import os
-import subprocess
-import sys
-import tempfile
-
-import yaml
-
-workflow_path = sys.argv[1]
-with open(workflow_path) as f:
-    doc = yaml.safe_load(f)
-
-steps = doc["jobs"]["build_publish_and_deploy"]["steps"]
-by_name = {s.get("name"): s for s in steps}
-script = by_name["Validate rendered Argo CD server Ingress"]["run"]
-
-repo_root = os.getcwd()
-sandbox = tempfile.mkdtemp(prefix="argo-ingress-render-proof-")
-try:
-    set_args = [
-        "--set-string", "argo-cd.global.image.repository=x",
-        "--set-string", "argo-cd.redis.image.repository=x",
-        "--set-string", "ecrTokenSync.roleArn=x",
-        "--set-string", "ecrTokenSync.awsRegion=x",
-        "--set-string", "ecrTokenSync.ecrRegistry=x",
-        "--set-string", "ecrTokenSync.image.repository=x",
-        "--set-string", "argocdServerIngress.host=argocd.goldengate-dev.adcbmis.local",
-        "--set-string", "argocdServerIngress.groupName=gg-poc-dev-alb",
-        "--set-string", "argocdServerIngress.certificateArn=arn:aws:acm:eu-west-1:668311715351:certificate/9e53e28e-3243-47fc-85a1-50f9a94acde7",
-    ]
-    render_cmd = ["helm", "template", "argocd", os.path.join(repo_root, "helm", "argocd"),
-                  "--namespace", "argocd", "--values", os.path.join(repo_root, "envs", "dev", "argocd", "values.yaml")] + set_args
-    render_proc = subprocess.run(render_cmd, capture_output=True, text=True, timeout=60)
-    if render_proc.returncode != 0:
-        print(f"FAIL: helm template itself failed: {render_proc.stderr}")
-        sys.exit(1)
-
-    rendered_dir = os.path.join(sandbox, "rendered")
-    os.makedirs(rendered_dir)
-    with open(os.path.join(rendered_dir, "argocd.yaml"), "w") as f:
-        f.write(render_proc.stdout)
-
-    values_dir = os.path.join(sandbox, "envs", "dev", "argocd")
-    os.makedirs(values_dir)
-    with open(os.path.join(repo_root, "envs", "dev", "argocd", "values.yaml")) as f:
-        values_text = f.read()
-    with open(os.path.join(values_dir, "values.yaml"), "w") as f:
-        f.write(values_text)
-
-    env = dict(os.environ)
-    env.update({
-        "ARGOCD_RELEASE_NAME": "argocd",
-        "VALUES_FILE": "envs/dev/argocd/values.yaml",
-        "ARGOCD_NAMESPACE": "argocd",
-        "ARGOCD_HOST": "argocd.goldengate-dev.adcbmis.local",
-        "ALB_GROUP_NAME": "gg-poc-dev-alb",
-        "ACM_CERTIFICATE_ARN": "arn:aws:acm:eu-west-1:668311715351:certificate/9e53e28e-3243-47fc-85a1-50f9a94acde7",
-    })
-    proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, cwd=sandbox, timeout=60)
-    if proc.returncode != 0:
-        print(f"FAIL: the real 'Validate rendered Argo CD server Ingress' step exited {proc.returncode} against the real render:\n{proc.stdout}\n{proc.stderr}")
-        sys.exit(1)
-    if "OK: rendered Argo CD server Ingress passed every structural/contract check." not in proc.stdout:
-        print(f"FAIL: the step did not reach its own final success line:\n{proc.stdout}")
-        sys.exit(1)
-    print("OK")
-finally:
-    import shutil
-    shutil.rmtree(sandbox, ignore_errors=True)
-PYEOF
-)"
-  ARGO_INGRESS_VALIDATE_STATUS=$?
-  set -e
-  if [ "$ARGO_INGRESS_VALIDATE_STATUS" -eq 0 ] && [ "$ARGO_INGRESS_VALIDATE_OUT" = "OK" ]; then
-    pass "the REAL committed '${ARGOCD_DEPLOY_WORKFLOW} :: Validate rendered Argo CD server Ingress' step, executed against a real helm template render of the real committed values, passes structural validation of every required field end to end"
-  else
-    fail "real script-execution proof of 'Validate rendered Argo CD server Ingress' failed:"$'\n'"${ARGO_INGRESS_VALIDATE_OUT}"
-  fi
-else
-  skip "real script-execution proof of 'Validate rendered Argo CD server Ingress' -- python3/helm unavailable or ${ARGOCD_DEPLOY_WORKFLOW} missing"
-fi
-
-echo ""
-echo "--- Live Argo ALB Convergence Timing Fix ---"
-
-# Structural proof, read directly from the real committed YAML step (never a reimplementation): the bounded wait's timeout/poll-interval literals.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$ARGOCD_DEPLOY_WORKFLOW" ]; then
-  ALB_TIMING_STRUCT_CHECK="$(python3 -c '
+# Phase 3 Python Conversion: the render-time Ingress validation and the bounded ALB-wait loop moved from inline `run:` bash in 20-sub-argocd.yaml into automation/phases/phase3/phase3_argocd.py's own _validate_rendered_ingress()/_wait_for_ingress_ready() functions -- extracting and executing a step's `run:` text (the technique this section used before the Python conversion) no longer applies, since that text is now a single-line `phase3_argocd.py` invocation, never inline logic. The full real-execution behavioral proof this section used to carry (render-time Ingress structural validation against a real helm template; the bounded-wait A-G scenarios: immediate success, delayed success, exact-timeout-boundary success, full-timeout failure, measured poll/sleep counts, CASE 4 host-mismatch immediate fail-closed, and argocdServerIngress.enabled=false skip) now lives in automation/phases/phase3/tests/test_phase3_argocd.py's TestValidateRenderedIngress/TestWaitForIngressReady classes, which call the real functions directly (never a reimplementation) with a scripted subprocess.run and a fast fake time.sleep -- run as part of this same regression via the "test_phase3_argocd.py" invocation above. This section is retained only to prove the delegation itself actually happened and the preserved constants were not silently weakened during the move.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$ARGOCD_DEPLOY_WORKFLOW" ] && [ -f "$PHASE3_TOOL" ]; then
+  PHASE3_INGRESS_DELEGATION_CHECK="$(python3 -c '
 import yaml
 
 with open("'"$ARGOCD_DEPLOY_WORKFLOW"'") as f:
@@ -13358,283 +13231,46 @@ with open("'"$ARGOCD_DEPLOY_WORKFLOW"'") as f:
 
 steps = doc["jobs"]["build_publish_and_deploy"]["steps"]
 by_name = {s.get("name"): s for s in steps}
-script = by_name["Wait for Argo CD server Ingress readiness (bounded)"]["run"]
 
 results = []
-results.append(("1: the bounded wait step still exists under its established name", "Wait for Argo CD server Ingress readiness (bounded)" in by_name))
-results.append(("2: TIMEOUT_SECONDS is exactly 900 (up from the old 300s bound that the live incident proved too short for a fresh internal ALB)", "TIMEOUT_SECONDS=900" in script))
-results.append(("3: TIMEOUT_SECONDS is no longer 300", "TIMEOUT_SECONDS=300" not in script))
-results.append(("4: INTERVAL_SECONDS (poll interval) is exactly 15", "INTERVAL_SECONDS=15" in script))
-results.append(("5: the wait remains a bounded while loop, never an infinite one -- ELAPSED is compared against TIMEOUT_SECONDS every iteration (-le, so the loop still runs its final iteration exactly at elapsed==TIMEOUT_SECONDS -- the deadline probe -- rather than stopping one interval short)", "while [ \"$ELAPSED\" -le \"$TIMEOUT_SECONDS\" ]" in script))
-results.append(("5b: the old off-by-one -lt bound (which skipped the elapsed==TIMEOUT_SECONDS probe) is gone", "while [ \"$ELAPSED\" -lt \"$TIMEOUT_SECONDS\" ]" not in script))
-results.append(("5c: a guard breaks the loop once elapsed has reached the deadline, so the final (t=TIMEOUT_SECONDS) probe never sleeps again afterward -- no arbitrary sleep past the deadline", "if [ \"$ELAPSED\" -ge \"$TIMEOUT_SECONDS\" ]; then" in script))
-results.append(("6: the loop still increments ELAPSED by INTERVAL_SECONDS every iteration (guarantees eventual termination)", "ELAPSED=$((ELAPSED + INTERVAL_SECONDS))" in script))
-results.append(("7: the existing host-mismatch fail-closed safety check (CASE 4) remains present and unweakened", "This is a live desired-state mismatch, never a transient readiness gap -- refusing to wait further." in script))
-results.append(("8: timeout diagnostics still include a bounded `kubectl get ingress ... -o wide`", "kubectl get ingress argocd-server-ingress -n \"$ARGOCD_NAMESPACE\" -o wide" in script))
-results.append(("9: timeout diagnostics still include a bounded `kubectl describe ingress`", "kubectl describe ingress argocd-server-ingress -n \"$ARGOCD_NAMESPACE\"" in script))
-results.append(("10: no unbounded cluster-log dump was introduced (no kubectl logs invocation in this step)", "kubectl logs" not in script))
-results.append(("11: no new workflow_dispatch input was introduced merely to control this timeout -- TIMEOUT_SECONDS remains an implementation-level literal, not ${{ inputs.* }}", "inputs." not in script))
+
+validate_local_step = next((s for s in steps if "validate-local" in s.get("run", "")), None)
+results.append(("20-sub-argocd.yaml delegates local chart validation/packaging (including rendered-Ingress validation) to phase3_argocd.py validate-local, never reimplementing it inline", validate_local_step is not None))
+
+post_deploy_step = next((s for s in steps if "post-deploy-validation" in s.get("run", "")), None)
+results.append(("20-sub-argocd.yaml delegates bounded post-deployment validation (including the ALB Ingress wait) to phase3_argocd.py post-deploy-validation, never reimplementing it inline", post_deploy_step is not None))
+
+with open("'"$PHASE3_TOOL"'") as f:
+    tool_source = f.read()
+
+results.append(("phase3_argocd.py preserves the exact TIMEOUT_SECONDS=900 bound for the Argo CD server Ingress readiness wait (up from the old 300s bound a live incident proved too short for a fresh internal ALB)", "timeout_seconds = 900" in tool_source))
+results.append(("phase3_argocd.py preserves the exact INTERVAL_SECONDS=15 poll interval for the Ingress readiness wait", "interval_seconds = 15" in tool_source))
+results.append(("phase3_argocd.py preserves the timeout-boundary correctness (elapsed <= timeout_seconds, so the loop still runs its final probe exactly at elapsed==TIMEOUT_SECONDS)", "elapsed <= timeout_seconds" in tool_source))
+results.append(("phase3_argocd.py preserves the CASE 4 host-mismatch immediate fail-closed safety check, unweakened by the move", "live desired-state mismatch, never a transient readiness gap" in tool_source))
+results.append(("phase3_argocd.py preserves the bounded (never unbounded) ECR token-sync verification Job wait at TIMEOUT_SECONDS=180 / INTERVAL_SECONDS=10", "timeout_seconds = 180" in tool_source and "interval_seconds = 10" in tool_source))
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
 ' 2>&1)"
   while IFS= read -r line; do
     case "$line" in
-      FAIL\ *) fail "Live Argo ALB Convergence Timing Fix: ${line#FAIL }" ;;
-      OK\ *) pass "Live Argo ALB Convergence Timing Fix: ${line#OK }" ;;
+      FAIL\ *) fail "Phase 3 Python Conversion: ${line#FAIL }" ;;
+      OK\ *) pass "Phase 3 Python Conversion: ${line#OK }" ;;
     esac
-  done <<< "$ALB_TIMING_STRUCT_CHECK"
+  done <<< "$PHASE3_INGRESS_DELEGATION_CHECK"
 else
-  skip "Live Argo ALB Convergence Timing Fix: structural timeout/poll-interval check -- python3/PyYAML unavailable or ${ARGOCD_DEPLOY_WORKFLOW} missing"
+  skip "Phase 3 Python Conversion: Ingress-wait/token-sync-wait delegation and constant-preservation check -- python3/PyYAML unavailable or a required file is missing"
 fi
 
-# No new workflow_dispatch input was introduced anywhere in 20-sub-argocd.yaml merely to control this timeout (structural proof against the parsed on.workflow_dispatch.inputs/on.workflow_call.inputs shape, never raw text -- which would false-positive on this very file's own explanatory prose).
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$ARGOCD_DEPLOY_WORKFLOW" ]; then
-  ALB_TIMING_NO_INPUT_CHECK="$(python3 -c '
-import yaml
-
-with open("'"$ARGOCD_DEPLOY_WORKFLOW"'") as f:
-    doc = yaml.safe_load(f)
-
-on_block = doc.get(True, doc.get("on", {}))
-wd_inputs = set(((on_block.get("workflow_dispatch") or {}).get("inputs") or {}).keys())
-wc_inputs = set(((on_block.get("workflow_call") or {}).get("inputs") or {}).keys())
-suspicious = {name for name in (wd_inputs | wc_inputs) if "timeout" in name.lower() or "alb" in name.lower()}
-print("OK" if not suspicious else "FAIL " + repr(suspicious))
-' 2>&1)"
-  if [ "$ALB_TIMING_NO_INPUT_CHECK" = "OK" ]; then
-    pass "Live Argo ALB Convergence Timing Fix: no timeout/ALB-related workflow_dispatch or workflow_call input was added -- this remains an implementation-level infrastructure convergence budget, not an operator-facing option"
-  else
-    fail "Live Argo ALB Convergence Timing Fix: an unexpected timeout/ALB-related workflow input was found: ${ALB_TIMING_NO_INPUT_CHECK}"
-  fi
-else
-  skip "Live Argo ALB Convergence Timing Fix: no-new-input check -- python3/PyYAML unavailable or ${ARGOCD_DEPLOY_WORKFLOW} missing"
-fi
-
-# Real script execution: REALLY EXECUTE the committed "Wait for Argo CD server Ingress readiness (bounded)" step (never a reimplementation) against a fabricated kubectl/sleep on PATH, for three simulated AWS Load Balancer Controller convergence timelines. sleep is stubbed to a no-op (tests do not actually wait real seconds) while the script's own ELAPSED/TIMEOUT_SECONDS arithmetic and iteration count are fully real -- a timeout scenario genuinely drives the real loop through all 60 iterations (900/15), just without the real wall-clock delay.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$ARGOCD_DEPLOY_WORKFLOW" ]; then
-  set +e
-  ALB_WAIT_EXEC_OUT="$(python3 - "$ARGOCD_DEPLOY_WORKFLOW" <<'PYEOF'
-import os
-import stat
-import subprocess
-import sys
-import tempfile
-
-import yaml
-
-workflow_path = sys.argv[1]
-with open(workflow_path) as f:
-    doc = yaml.safe_load(f)
-
-steps = doc["jobs"]["build_publish_and_deploy"]["steps"]
-by_name = {s.get("name"): s for s in steps}
-script = by_name["Wait for Argo CD server Ingress readiness (bounded)"]["run"]
-
-FAKE_KUBECTL_TEMPLATE = '''#!/usr/bin/env python3
-import os
-import sys
-
-MODE = os.environ["FAKE_MODE"]
-COUNT_FILE = os.environ["FAKE_LB_POLL_COUNT_FILE"]
-ARGOCD_HOST = os.environ["ARGOCD_HOST"]
-# FAKE_HOST_OVERRIDE: empty/unset means "report the correct host" (the normal case for every scenario except the CASE 4 host-mismatch proof, which sets this to a deliberately wrong value).
-REPORTED_HOST = os.environ.get("FAKE_HOST_OVERRIDE") or ARGOCD_HOST
-# FAKE_FINAL_POLL_COUNT: the exact 1-based poll number the production loop reaches on its LAST allowed probe (t=TIMEOUT_SECONDS) -- injected by the test harness from the same TIMEOUT_SECONDS/INTERVAL_SECONDS arithmetic it measures against, never a second independently-maintained literal.
-FINAL_POLL_COUNT = int(os.environ["FAKE_FINAL_POLL_COUNT"])
-
-args = sys.argv[1:]
-
-def read_count():
-    try:
-        with open(COUNT_FILE) as f:
-            return int(f.read().strip() or "0")
-    except FileNotFoundError:
-        return 0
-
-def write_count(n):
-    with open(COUNT_FILE, "w") as f:
-        f.write(str(n))
-
-# get ingress argocd-server-ingress -n argocd  (bare existence check, no -o)
-if args[:3] == ["get", "ingress", "argocd-server-ingress"] and "-o" not in args:
-    if MODE == "absent-forever":
-        sys.exit(1)
-    sys.exit(0)
-
-# get ingress argocd-server-ingress -n argocd -o jsonpath={.spec.rules[0].host}
-if "-o" in args and "jsonpath={.spec.rules[0].host}" in args:
-    print(REPORTED_HOST, end="")
-    sys.exit(0)
-
-# get ingress argocd-server-ingress -n argocd -o jsonpath=<loadBalancer hostname+ip>
-if "-o" in args and any("loadBalancer" in a for a in args):
-    n = read_count() + 1
-    write_count(n)
-    if MODE == "immediate":
-        print("internal-k8s-argocd-immediate.eu-west-1.elb.amazonaws.com", end="")
-    elif MODE == "appears-after-3-polls":
-        if n >= 4:
-            print("internal-k8s-argocd-delayed.eu-west-1.elb.amazonaws.com", end="")
-        else:
-            print("", end="")
-    elif MODE == "appears-on-final-poll":
-        if n >= FINAL_POLL_COUNT:
-            print("internal-k8s-argocd-final.eu-west-1.elb.amazonaws.com", end="")
-        else:
-            print("", end="")
-    elif MODE == "never-appears":
-        print("", end="")
-    else:
-        print("", end="")
-    sys.exit(0)
-
-# get ingress ... -o wide / describe ingress ... (diagnostics -- always succeed, bounded dummy output)
-if "-o" in args and "wide" in args:
-    print("NAME                   CLASS   HOSTS   ADDRESS   PORTS   AGE")
-    sys.exit(0)
-if args[:2] == ["describe", "ingress"]:
-    print("Name: argocd-server-ingress (fake diagnostics)")
-    sys.exit(0)
-
-sys.exit(0)
-'''
-
-# FAKE_SLEEP also counts its own invocations (via FAKE_SLEEP_COUNT_FILE) -- this is how the real number of sleeps the production loop actually performed gets MEASURED after the fact, never asserted as a bare placeholder.
-FAKE_SLEEP_TEMPLATE = '''#!/usr/bin/env python3
-import os
-
-COUNT_FILE = os.environ["FAKE_SLEEP_COUNT_FILE"]
-try:
-    with open(COUNT_FILE) as f:
-        n = int(f.read().strip() or "0")
-except FileNotFoundError:
-    n = 0
-with open(COUNT_FILE, "w") as f:
-    f.write(str(n + 1))
-'''
-
-
-VALUES_YAML_LINES = ["argocdServerIngress:", "  enabled: {enabled}"]
-
-# The production loop's own exact bound: TIMEOUT_SECONDS=900 / INTERVAL_SECONDS=15 -> probes at t=0,15,...,885,900 (61 probes total), separated by 60 sleeps of 15s each. Read directly from the constants above, never a second hardcoded 61/60 pair maintained independently of them.
-TIMEOUT_SECONDS = 900
-INTERVAL_SECONDS = 15
-EXPECTED_FINAL_POLL_COUNT = TIMEOUT_SECONDS // INTERVAL_SECONDS + 1
-EXPECTED_FINAL_SLEEP_COUNT = TIMEOUT_SECONDS // INTERVAL_SECONDS
-
-
-def run_scenario(mode, ingress_enabled=True, host_override=None):
-    sandbox = tempfile.mkdtemp(prefix="argo-alb-wait-proof-")
-    bin_dir = os.path.join(sandbox, "bin")
-    os.makedirs(bin_dir)
-
-    kubectl_path = os.path.join(bin_dir, "kubectl")
-    with open(kubectl_path, "w") as f:
-        f.write(FAKE_KUBECTL_TEMPLATE)
-    os.chmod(kubectl_path, os.stat(kubectl_path).st_mode | stat.S_IEXEC)
-
-    sleep_path = os.path.join(bin_dir, "sleep")
-    with open(sleep_path, "w") as f:
-        f.write(FAKE_SLEEP_TEMPLATE)
-    os.chmod(sleep_path, os.stat(sleep_path).st_mode | stat.S_IEXEC)
-
-    values_dir = os.path.join(sandbox, "envs", "dev", "argocd")
-    os.makedirs(values_dir)
-    with open(os.path.join(values_dir, "values.yaml"), "w") as f:
-        f.write("\n".join(VALUES_YAML_LINES).format(enabled="true" if ingress_enabled else "false") + "\n")
-
-    poll_count_file = os.path.join(sandbox, "lb_poll_count")
-    sleep_count_file = os.path.join(sandbox, "sleep_count")
-
-    env = dict(os.environ)
-    env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
-    env.update({
-        "ARGOCD_NAMESPACE": "argocd",
-        "ARGOCD_HOST": "argocd.goldengate-dev.adcbmis.local",
-        "VALUES_FILE": "envs/dev/argocd/values.yaml",
-        "FAKE_MODE": mode,
-        "FAKE_LB_POLL_COUNT_FILE": poll_count_file,
-        "FAKE_SLEEP_COUNT_FILE": sleep_count_file,
-        "FAKE_FINAL_POLL_COUNT": str(EXPECTED_FINAL_POLL_COUNT),
-    })
-    if host_override:
-        env["FAKE_HOST_OVERRIDE"] = host_override
-    proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, cwd=sandbox, timeout=60)
-
-    def _read_count(path):
-        try:
-            with open(path) as f:
-                return int(f.read().strip() or "0")
-        except FileNotFoundError:
-            return 0
-
-    return proc.returncode, proc.stdout, proc.stderr, _read_count(poll_count_file), _read_count(sleep_count_file)
-
-
-results = []
-
-# A: address appears immediately -> success, first poll, zero sleeps (the loop breaks before ever reaching the sleep line).
-rc, out, err, poll_count, sleep_count = run_scenario("immediate")
-results.append(("A: address appears immediately -> the real step succeeds", rc == 0 and "internal-k8s-argocd-immediate" in out))
-results.append(("A: measured poll count is exactly 1, measured sleep count is exactly 0 (success on the very first probe, never sleeps at all)", poll_count == 1 and sleep_count == 0))
-
-# B: address absent for several polls, then appears -> success (not immediate, not a failure -- proves CASE 1/2 "keep waiting" and CASE 3 "succeed once published").
-rc, out, err, poll_count, sleep_count = run_scenario("appears-after-3-polls")
-results.append(("B: address absent for several polls then appears -> the real step still succeeds (transient empty status.loadBalancer is tolerated as in-progress, never treated as immediate success or failure)", rc == 0 and "internal-k8s-argocd-delayed" in out and out.count("Not yet ready") >= 3))
-results.append(("B: measured poll count is exactly 4, measured sleep count is exactly 3 (3 empty probes each followed by one sleep, then the 4th probe finds the address)", poll_count == 4 and sleep_count == 3))
-
-# C: address appears exactly on the final allowed poll (t=TIMEOUT_SECONDS=900, the 61st probe) -> success. This is the exact timeout-boundary case: the workflow gets its full budget, including one last readiness evaluation performed AT the deadline, never one interval short of it.
-rc, out, err, poll_count, sleep_count = run_scenario("appears-on-final-poll")
-results.append((f"C: address appears exactly on the final allowed poll (t={TIMEOUT_SECONDS}s) -> the real step still succeeds, never failing merely because the address showed up on the last permitted probe", rc == 0 and "internal-k8s-argocd-final" in out))
-results.append((f"C: measured poll count is exactly {EXPECTED_FINAL_POLL_COUNT} (probes at t=0,15,...,{TIMEOUT_SECONDS - INTERVAL_SECONDS},{TIMEOUT_SECONDS}), measured sleep count is exactly {EXPECTED_FINAL_SLEEP_COUNT} -- the full budget was used, no probe was skipped, no extra sleep past the deadline", poll_count == EXPECTED_FINAL_POLL_COUNT and sleep_count == EXPECTED_FINAL_SLEEP_COUNT))
-
-# D: address never appears through the full bounded window -> the real 900s/15s loop genuinely runs to completion and fails closed with bounded diagnostics.
-rc, out, err, poll_count, sleep_count = run_scenario("never-appears")
-results.append(("D: address never appears through the full bounded window -> the real step fails closed, never hangs or silently succeeds", rc != 0 and "FAIL: argocd-server-ingress did not receive a published load-balancer address" in out))
-results.append(("D: timeout failure output includes the bounded `kubectl get ingress ... -o wide` diagnostic", "NAME                   CLASS   HOSTS   ADDRESS   PORTS   AGE" in out))
-results.append(("D: timeout failure output includes the bounded `kubectl describe ingress` diagnostic", "argocd-server-ingress (fake diagnostics)" in out))
-
-# E: the timeout case's poll/sleep counts are MEASURED from the real fake-kubectl/fake-sleep invocation counters (never a hardcoded/placeholder True) and must match the production loop's own exact bound derived above.
-results.append((f"E: measured poll count for the never-appears/timeout case is exactly {EXPECTED_FINAL_POLL_COUNT} (the real loop actually issued this many status.loadBalancer probes -- not merely assumed)", poll_count == EXPECTED_FINAL_POLL_COUNT))
-results.append((f"E: measured sleep count for the never-appears/timeout case is exactly {EXPECTED_FINAL_SLEEP_COUNT} (the real loop actually invoked sleep this many times -- not merely assumed), confirming the real loop is never infinite and terminates after exactly the bounded number of iterations, never re-armed", sleep_count == EXPECTED_FINAL_SLEEP_COUNT))
-
-# F (CASE 4): host mismatch remains an immediate fail-closed safety check, never weakened or delayed by the longer timeout/boundary correction.
-rc, out, err, poll_count, sleep_count = run_scenario("immediate", host_override="wrong.example.com")
-results.append(("F (CASE 4): a genuinely wrong live host fails closed immediately (never treated as a transient readiness gap), preserving the pre-existing safety check unweakened by this fix", rc != 0 and "live desired-state mismatch, never a transient readiness gap" in out))
-results.append(("F: measured load-balancer-status poll count is exactly 0, measured sleep count is exactly 0 -- the host check fails closed before the loop ever reaches the status.loadBalancer probe or a sleep, for a genuine desired-state mismatch", poll_count == 0 and sleep_count == 0))
-
-# G: argocdServerIngress.enabled=false -> the step exits 0 immediately without waiting at all (unrelated to the boundary correction, but must still hold).
-rc, out, err, poll_count, sleep_count = run_scenario("never-appears", ingress_enabled=False)
-results.append(("G: argocdServerIngress.enabled=false still skips the wait entirely (unaffected by the timeout/boundary change)", rc == 0 and "Skipping Argo CD server Ingress readiness wait" in out and poll_count == 0 and sleep_count == 0))
-
-for label, ok in results:
-    print(("OK " if ok else "FAIL ") + label)
-PYEOF
-)"
-  set -e
-  if [ -n "$ALB_WAIT_EXEC_OUT" ]; then
-    while IFS= read -r line; do
-      case "$line" in
-        FAIL\ *) fail "Live Argo ALB Convergence Timing Fix: ${line#FAIL }" ;;
-        OK\ *) pass "Live Argo ALB Convergence Timing Fix: ${line#OK }" ;;
-      esac
-    done <<< "$ALB_WAIT_EXEC_OUT"
-  else
-    fail "Live Argo ALB Convergence Timing Fix: real script-execution proof produced no output"
-  fi
-else
-  skip "Live Argo ALB Convergence Timing Fix: real script-execution proof -- python3/PyYAML unavailable or ${ARGOCD_DEPLOY_WORKFLOW} missing"
-fi
 
 # argocd_acceptance.py's strict Ingress load-balancer check must remain untouched by this timing fix -- a still-empty status.loadBalancer.ingress after reconciliation is a genuine acceptance failure, never tolerated as HEALTHY merely because the bounded wait window grew.
-if [ -f automation/orchestration/argocd_acceptance.py ] && grep -qF 'status.loadBalancer.ingress is empty -- the AWS Load Balancer Controller has not published an address' automation/orchestration/argocd_acceptance.py; then
-  pass "Live Argo ALB Convergence Timing Fix: automation/orchestration/argocd_acceptance.py still strictly rejects an empty status.loadBalancer.ingress post-reconciliation -- final acceptance was not weakened by extending the bounded wait"
+if [ -f automation/phases/phase3/argocd_acceptance.py ] && grep -qF 'status.loadBalancer.ingress is empty -- the AWS Load Balancer Controller has not published an address' automation/phases/phase3/argocd_acceptance.py; then
+  pass "Live Argo ALB Convergence Timing Fix: automation/phases/phase3/argocd_acceptance.py still strictly rejects an empty status.loadBalancer.ingress post-reconciliation -- final acceptance was not weakened by extending the bounded wait"
 else
-  fail "Live Argo ALB Convergence Timing Fix: automation/orchestration/argocd_acceptance.py's strict empty-load-balancer-status rejection appears to have regressed"
+  fail "Live Argo ALB Convergence Timing Fix: automation/phases/phase3/argocd_acceptance.py's strict empty-load-balancer-status rejection appears to have regressed"
 fi
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/test-goldengate-argocd-acceptance.py ]; then
-  if FIX_ALB_ACCEPTANCE_TEST_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/test-goldengate-argocd-acceptance.py -v ArgoCdAcceptanceTests.test_ingress_enabled_and_missing_is_broken 2>&1)"; then
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/phases/phase3/tests/test_argocd_acceptance.py ]; then
+  if FIX_ALB_ACCEPTANCE_TEST_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/phases/phase3/tests/test_argocd_acceptance.py -v ArgoCdAcceptanceTests.test_ingress_enabled_and_missing_is_broken 2>&1)"; then
     pass "Live Argo ALB Convergence Timing Fix: direct re-invocation confirms an enabled Ingress with no published load-balancer address still classifies BROKEN, never HEALTHY, at final acceptance"
   else
     fail "Live Argo ALB Convergence Timing Fix: direct re-invocation of the empty-load-balancer acceptance test failed:"$'\n'"${FIX_ALB_ACCEPTANCE_TEST_OUT}"
@@ -13644,7 +13280,7 @@ else
 fi
 
 # No RECONCILABLE state was reintroduced anywhere, and no resource-specific MAIN if: branch was added for this fix -- the entire correction lives inside 20-sub-argocd.yaml's own bounded step.
-if grep -qE 'RECONCILABLE' "$EKS_APP_WORKFLOW" automation/orchestration/argocd_state.py automation/orchestration/argocd_acceptance.py 2>/dev/null; then
+if grep -qE 'RECONCILABLE' "$EKS_APP_WORKFLOW" automation/phases/phase3/argocd_state.py automation/phases/phase3/argocd_acceptance.py 2>/dev/null; then
   fail "Live Argo ALB Convergence Timing Fix: RECONCILABLE was reintroduced somewhere in MAIN/argocd_state.py/argocd_acceptance.py"
 else
   pass "Live Argo ALB Convergence Timing Fix: RECONCILABLE remains fully retired across MAIN and both Argo classifiers"
@@ -13686,8 +13322,8 @@ else
 fi
 
 # A10/contract: the Generic MAIN Desired-State Convergence Fix retired the CLASSIFIER_CONTRACT/EXPECTED_CONTRACT version-skew marker entirely (argocd_state.py is no longer a special case -- ABSENT/OWNED/BROKEN is now a stable, generic, universally-shared contract with no version marker at all, exactly like runtime_state.py/monitor_state.py always were). Re-confirmed explicitly here that the retired mechanism has actually been removed from BOTH sides, not merely left unused on one side.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/orchestration/argocd_state.py ]; then
-  A10_RETIREMENT_HITS="$(grep -nE 'CLASSIFIER_CONTRACT|EXPECTED_CONTRACT' automation/orchestration/argocd_state.py automation/orchestration/argocd_acceptance.py "$EKS_APP_WORKFLOW" 2>/dev/null || true)"
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/phases/phase3/argocd_state.py ]; then
+  A10_RETIREMENT_HITS="$(grep -nE 'CLASSIFIER_CONTRACT|EXPECTED_CONTRACT' automation/phases/phase3/argocd_state.py automation/phases/phase3/argocd_acceptance.py "$EKS_APP_WORKFLOW" 2>/dev/null || true)"
   if [ -z "$A10_RETIREMENT_HITS" ]; then
     pass "A10: the retired CLASSIFIER_CONTRACT/EXPECTED_CONTRACT version-skew marker no longer appears anywhere in argocd_state.py, argocd_acceptance.py, or ${EKS_APP_WORKFLOW} -- ABSENT/OWNED/BROKEN is a plain, unversioned contract"
   else
@@ -13872,11 +13508,11 @@ else
   fail "Fix 3: helm/goldengate-platform/values.yaml is missing"
 fi
 
-# ecrTokenSync/fluentBit are REQUIRED ARCHITECTURAL INVARIANTS of their specialist workflows, not supported optional toggles -- proven by the specialist workflow's own unconditional (never enabled-flag-gated) validation of the resources those settings control.
-if grep -qF 'grep -q "kind: CronJob" "$RENDERED"' .github/workflows/20-sub-argocd.yaml && ! grep -qE 'if \[ .*ecrTokenSync\.enabled.* = .*true.* \]' .github/workflows/20-sub-argocd.yaml; then
-  pass "Fix 3: 20-sub-argocd.yaml validates the ECR token-sync CronJob/RBAC/repository Secrets unconditionally -- never gated behind a check of ecrTokenSync.enabled -- confirming it is a required architectural invariant, not an optional toggle"
+# ecrTokenSync/fluentBit are REQUIRED ARCHITECTURAL INVARIANTS of their specialist workflows, not supported optional toggles -- proven by the specialist implementation's own unconditional (never enabled-flag-gated) validation of the resources those settings control. Phase 3 Python Conversion: this validation now lives in automation/phases/phase3/phase3_argocd.py's _validate_ecr_token_sync_rendered(), never a 20-sub-argocd.yaml run: block.
+if grep -qF '"kind: CronJob",' "$PHASE3_TOOL" && ! grep -qE 'ecrTokenSync\.get\("enabled"\)|ecrTokenSync\["enabled"\]' "$PHASE3_TOOL"; then
+  pass "Fix 3: automation/phases/phase3/phase3_argocd.py validates the ECR token-sync CronJob/RBAC/repository Secrets unconditionally -- never gated behind a check of ecrTokenSync.enabled -- confirming it is a required architectural invariant, not an optional toggle"
 else
-  fail "Fix 3: 20-sub-argocd.yaml's ECR token-sync validation no longer matches the expected unconditional (non-toggle) shape"
+  fail "Fix 3: automation/phases/phase3/phase3_argocd.py's ECR token-sync validation no longer matches the expected unconditional (non-toggle) shape"
 fi
 if grep -qF 'FLUENT_BIT_DS_BLOCK="$(select_document "$RENDERED" "DaemonSet" "gg-fluent-bit")"' .github/workflows/30-sub-platform.yaml && ! grep -qE 'if \[ .*fluentBit\.create.* = .*true.* \]' .github/workflows/30-sub-platform.yaml; then
   pass "Fix 3: 30-sub-platform.yaml validates the rendered gg-fluent-bit DaemonSet/ConfigMap/ServiceAccount unconditionally -- never gated behind a check of fluentBit.create -- confirming it is a required architectural invariant, not an optional toggle"
@@ -15767,10 +15403,10 @@ for job_name, output_key in (
     job_text = yaml.dump(jobs.get(job_name, {}), default_flow_style=False)
     check(f"Q: {job_name} reads needs.validate_model.outputs.{output_key} (the canonical value, never re-derived)", f"needs.validate_model.outputs.{output_key}" in job_text)
 
-# R: no phase3/etc. placeholder directory or job was introduced -- exactly Phase 1 (and, since the Phase 2 Python extraction, Phase 2) were converted, nothing else pre-created.
+# R: no phase4/etc. placeholder directory or job was introduced -- exactly Phase 1, Phase 2, and (since the Phase 3 Argo CD Python Conversion) Phase 3 were converted, nothing else pre-created.
 import os
 phase_dirs = sorted(d for d in os.listdir("automation/phases") if os.path.isdir(os.path.join("automation/phases", d))) if os.path.isdir("automation/phases") else []
-check("R: automation/phases/ contains only phase1 and phase2 (no phase3/etc. placeholder directories)", phase_dirs == ["phase1", "phase2"])
+check("R: automation/phases/ contains only phase1, phase2, and phase3 (no phase4/etc. placeholder directories)", phase_dirs == ["phase1", "phase2", "phase3"])
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
@@ -16025,6 +15661,251 @@ PYEOF
   fi
 else
   skip "Phase 2 Python extraction (A-W) -- python3/PyYAML unavailable or workflow/tool files missing"
+fi
+
+echo ""
+echo "--- Phase 3 Python Conversion: Argo CD ownership/reconciliation/acceptance stay four visible jobs behind the mandatory approval/reusable-workflow/fresh-acceptance boundaries (assertions A-AJ) ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$ARGOCD_DEPLOY_WORKFLOW" ] && [ -f "$PHASE3_TOOL" ]; then
+  set +e
+  PHASE3_ARCHITECTURE_OUT="$(python3 - "$EKS_APP_WORKFLOW" "$ARGOCD_DEPLOY_WORKFLOW" "$PHASE3_TOOL" <<'PYEOF'
+import re
+import sys
+
+import yaml
+
+main_path, argocd_path, phase3_tool_path = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(main_path) as f:
+    main_doc = yaml.safe_load(f)
+with open(argocd_path) as f:
+    argocd_doc = yaml.safe_load(f)
+with open(phase3_tool_path) as f:
+    phase3_source = f.read()
+
+results = []
+
+
+def check(label, ok):
+    results.append((label, ok))
+
+
+main_jobs = main_doc["jobs"]
+argocd_jobs = argocd_doc["jobs"]
+
+# A: the four MAIN Phase 3 job IDs exist, deliberately never collapsed into one or two.
+check("A: MAIN defines all four Phase 3 job IDs (argocd_preflight, goldengate_deploy_authorization, reconcile_argocd, validate_argocd_ready)", {"argocd_preflight", "goldengate_deploy_authorization", "reconcile_argocd", "validate_argocd_ready"} <= set(main_jobs.keys()))
+
+preflight = main_jobs.get("argocd_preflight", {})
+auth = main_jobs.get("goldengate_deploy_authorization", {})
+reconcile = main_jobs.get("reconcile_argocd", {})
+ready = main_jobs.get("validate_argocd_ready", {})
+
+# B/C/D/E: exact display names for the four unavoidable Phase 3 boundaries.
+check("B: argocd_preflight display name is 'Phase 3A | Argo CD Ownership Preflight'", preflight.get("name") == "Phase 3A | Argo CD Ownership Preflight")
+check("C: goldengate_deploy_authorization display name is 'Phase 3B | Authorize Argo CD Deployment'", auth.get("name") == "Phase 3B | Authorize Argo CD Deployment")
+check("D: reconcile_argocd display name is 'Phase 3C | Reconcile Argo CD Desired State'", reconcile.get("name") == "Phase 3C | Reconcile Argo CD Desired State")
+check("E: validate_argocd_ready display name is 'Phase 3D | Validate Argo CD Healthy'", ready.get("name") == "Phase 3D | Validate Argo CD Healthy")
+
+# F: argocd_preflight runs downstream of Terraform and is Deploy-only.
+preflight_needs = preflight.get("needs") or []
+preflight_if = str(preflight.get("if", ""))
+check("F: argocd_preflight needs terraform_sync_once", "terraform_sync_once" in preflight_needs)
+check("F: argocd_preflight is Deploy-only (effective_deploy == true) and requires terraform_sync_once success", "effective_deploy == \x27true\x27" in preflight_if and "needs.terraform_sync_once.result == \x27success\x27" in preflight_if)
+
+# G: argocd_preflight exposes its state output from the ownership_preflight step.
+check("G: argocd_preflight.outputs.state reads steps.ownership_preflight.outputs.state", (preflight.get("outputs") or {}).get("state") == "${{ steps.ownership_preflight.outputs.state }}")
+
+# H: argocd_preflight's classification step has id: ownership_preflight and invokes phase3_argocd.py ownership-preflight, never a reimplementation.
+preflight_steps = preflight.get("steps", [])
+ownership_step = next((s for s in preflight_steps if s.get("id") == "ownership_preflight"), None)
+check("H: argocd_preflight defines a step with id: ownership_preflight", ownership_step is not None)
+check("H: the ownership_preflight step invokes phase3_argocd.py ownership-preflight", ownership_step is not None and "phase3_argocd.py ownership-preflight" in (ownership_step.get("run") or ""))
+
+# I: argocd_preflight's Configure AWS credentials step is output-scoped (never job-wide env-credentials).
+cred_step = next((s for s in preflight_steps if s.get("uses") == "aws-actions/configure-aws-credentials@v4"), None)
+check("I: argocd_preflight's Configure AWS credentials step exists with id: aws_build_credentials", cred_step is not None and cred_step.get("id") == "aws_build_credentials")
+cred_with = (cred_step or {}).get("with", {}) or {}
+check("I: argocd_preflight's Configure AWS credentials step sets output-credentials: true and output-env-credentials: false", cred_with.get("output-credentials") is True and cred_with.get("output-env-credentials") is False)
+
+# J: only the ownership_preflight step (never Checkout/Load-environment/Ensure-kubectl) consumes the scoped AWS credentials.
+steps_with_creds = [s for s in preflight_steps if "aws_build_credentials.outputs" in str(s.get("env", ""))]
+check("J: exactly one argocd_preflight step consumes the scoped AWS credentials (the ownership_preflight classification step)", steps_with_creds == [ownership_step] if ownership_step is not None else False)
+
+# K: goldengate_deploy_authorization is the sole GoldenGate approval, ubuntu-latest, no AWS/kubectl/Python infra step.
+check("K: goldengate_deploy_authorization runs on ubuntu-latest", auth.get("runs-on") == "ubuntu-latest")
+check("K: goldengate_deploy_authorization needs argocd_preflight and requires its success", "argocd_preflight" in (auth.get("needs") or []) and "needs.argocd_preflight.result == \x27success\x27" in str(auth.get("if", "")))
+auth_text = yaml.dump(auth, default_flow_style=False)
+check("K: goldengate_deploy_authorization never configures AWS credentials, never invokes kubectl/helm/phase3_argocd.py", "configure-aws-credentials" not in auth_text and "kubectl" not in auth_text and "helm" not in auth_text and "phase3_argocd.py" not in auth_text)
+
+# L: reconcile_argocd requires the single authorization plus a non-BROKEN preflight state, and never has a BROKEN recovery branch.
+reconcile_if = str(reconcile.get("if", ""))
+check("L: reconcile_argocd requires goldengate_deploy_authorization success", "needs.goldengate_deploy_authorization.result == \x27success\x27" in reconcile_if)
+check("L: reconcile_argocd only proceeds on preflight state ABSENT or OWNED", "argocd_preflight.outputs.state == \x27ABSENT\x27" in reconcile_if and "argocd_preflight.outputs.state == \x27OWNED\x27" in reconcile_if)
+check("L: reconcile_argocd's if: condition contains no BROKEN branch", "BROKEN" not in reconcile_if)
+
+# M: reconcile_argocd calls 20-sub-argocd.yaml with orchestrated_by_main: true and secrets: inherit.
+check("M: reconcile_argocd uses ./.github/workflows/20-sub-argocd.yaml", reconcile.get("uses") == "./.github/workflows/20-sub-argocd.yaml")
+check("M: reconcile_argocd passes orchestrated_by_main: true", (reconcile.get("with") or {}).get("orchestrated_by_main") is True)
+check("M: reconcile_argocd uses secrets: inherit", reconcile.get("secrets") == "inherit")
+
+# N: validate_argocd_ready is always()-aware and requires a successful reconciliation plus a non-BROKEN preflight.
+ready_if = str(ready.get("if", ""))
+check("N: validate_argocd_ready's if: begins with always()", ready_if.strip().startswith("${{ always()"))
+check("N: validate_argocd_ready requires reconcile_argocd and argocd_preflight to have succeeded", "needs.reconcile_argocd.result == \x27success\x27" in ready_if and "needs.argocd_preflight.result == \x27success\x27" in ready_if)
+
+# O: validate_argocd_ready invokes phase3_argocd.py strict-acceptance, never a reimplementation, and is credential-scoped identically to argocd_preflight.
+ready_steps = ready.get("steps", [])
+acceptance_step = next((s for s in ready_steps if "strict-acceptance" in (s.get("run") or "")), None)
+check("O: validate_argocd_ready invokes phase3_argocd.py strict-acceptance", acceptance_step is not None)
+ready_cred_step = next((s for s in ready_steps if s.get("uses") == "aws-actions/configure-aws-credentials@v4"), None)
+ready_cred_with = (ready_cred_step or {}).get("with", {}) or {}
+check("O: validate_argocd_ready's Configure AWS credentials step is output-scoped (output-credentials: true, output-env-credentials: false)", ready_cred_with.get("output-credentials") is True and ready_cred_with.get("output-env-credentials") is False)
+ready_steps_with_creds = [s for s in ready_steps if "aws_build_credentials.outputs" in str(s.get("env", ""))]
+check("O: only the strict-acceptance step consumes validate_argocd_ready's scoped AWS credentials", ready_steps_with_creds == [acceptance_step] if acceptance_step is not None else False)
+
+# P: Phase 4 (platform_preflight) remains downstream of validate_argocd_ready, never reconcile_argocd -- reconciliation success alone is never treated as proof of health.
+platform_preflight = main_jobs.get("platform_preflight", {})
+check("P: platform_preflight needs validate_argocd_ready", "validate_argocd_ready" in (platform_preflight.get("needs") or []))
+check("P: platform_preflight requires needs.validate_argocd_ready.result == success", "needs.validate_argocd_ready.result == \x27success\x27" in str(platform_preflight.get("if", "")))
+
+# Q: 20-sub-argocd.yaml retains both workflow_dispatch and workflow_call entry modes.
+argocd_on = argocd_doc.get(True, argocd_doc.get("on", {}))
+check("Q: 20-sub-argocd.yaml retains workflow_dispatch", "workflow_dispatch" in argocd_on)
+check("Q: 20-sub-argocd.yaml retains workflow_call", "workflow_call" in argocd_on)
+
+# R: orchestrated_by_main is workflow_call-only, boolean, default false, never exposed as a workflow_dispatch input.
+wc_inputs = (argocd_on.get("workflow_call") or {}).get("inputs") or {}
+wd_inputs = (argocd_on.get("workflow_dispatch") or {}).get("inputs") or {}
+check("R: orchestrated_by_main is a workflow_call input (type boolean, default false)", wc_inputs.get("orchestrated_by_main", {}).get("type") == "boolean" and wc_inputs.get("orchestrated_by_main", {}).get("default") is False)
+check("R: orchestrated_by_main is never a workflow_dispatch input", "orchestrated_by_main" not in wd_inputs)
+
+# S: 20-sub-argocd.yaml retains exactly one standalone approval path.
+check("S: 20-sub-argocd.yaml defines exactly standalone_deploy_authorization and build_publish_and_deploy jobs", set(argocd_jobs.keys()) == {"standalone_deploy_authorization", "build_publish_and_deploy"})
+standalone = argocd_jobs.get("standalone_deploy_authorization", {})
+check("S: standalone_deploy_authorization is skipped when orchestrated_by_main is true", standalone.get("if") == "${{ inputs.orchestrated_by_main != true }}")
+
+# T: build_publish_and_deploy's authorization gating is unweakened (always() plus explicit orchestrated_by_main/standalone-result check).
+build = argocd_jobs.get("build_publish_and_deploy", {})
+build_if = str(build.get("if", ""))
+check("T: build_publish_and_deploy display name is 'Phase 3C | Build, Publish & Deploy Argo CD'", build.get("name") == "Phase 3C | Build, Publish & Deploy Argo CD")
+check("T: build_publish_and_deploy's if: still requires always() plus (orchestrated_by_main == true OR standalone success)", "always()" in build_if and "inputs.orchestrated_by_main == true" in build_if and "needs.standalone_deploy_authorization.result == \x27success\x27" in build_if)
+
+# U: every implementation step in build_publish_and_deploy is Python-backed (calls phase3_argocd.py) or a first-party action -- no giant inline run: block remains.
+build_steps = build.get("steps", [])
+python_backed_names = {
+    "Ensure Helm and kubectl prerequisites", "Prepare Argo CD deployment state", "Validate and package Argo CD locally",
+    "Publish Argo CD chart to private ECR", "Reconcile Argo CD release in EKS", "Run bounded post-deployment validation",
+    "Workflow summary",
+}
+check("U: every expected Python-backed step name exists in build_publish_and_deploy", python_backed_names <= {s.get("name") for s in build_steps})
+check("U: every python-backed step's run: body invokes phase3_argocd.py, never a large inline implementation", all("phase3_argocd.py" in (s.get("run") or "") for s in build_steps if s.get("name") in python_backed_names))
+check("U2: no build_publish_and_deploy run: step body exceeds 5 non-empty lines -- business logic lives in Python, not YAML", all(len([line for line in (s.get("run") or "").splitlines() if line.strip()]) <= 5 for s in build_steps if s.get("run")))
+
+# V: local validation (Checkout/Load-environment/Ensure-tools/Prepare-state/Validate-local) all occur strictly before Configure AWS credentials.
+step_names_in_order = [s.get("name") for s in build_steps]
+cred_index = step_names_in_order.index("Configure AWS credentials")
+local_steps = ("Checkout repository", "Load canonical environment configuration", "Ensure Helm and kubectl prerequisites", "Prepare Argo CD deployment state", "Validate and package Argo CD locally")
+check("V: every local-validation step occurs strictly before Configure AWS credentials", all(step_names_in_order.index(name) < cred_index for name in local_steps))
+
+# W: build_publish_and_deploy's Configure AWS credentials step is output-scoped, and only the three live-mutation steps consume the scoped credentials.
+build_cred_step = build_steps[cred_index]
+build_cred_with = build_cred_step.get("with", {}) or {}
+check("W: build_publish_and_deploy's Configure AWS credentials step has id: aws_build_credentials, output-credentials: true, output-env-credentials: false", build_cred_step.get("id") == "aws_build_credentials" and build_cred_with.get("output-credentials") is True and build_cred_with.get("output-env-credentials") is False)
+live_cred_names = {"Publish Argo CD chart to private ECR", "Reconcile Argo CD release in EKS", "Run bounded post-deployment validation"}
+steps_consuming_creds = {s.get("name") for s in build_steps if "aws_build_credentials.outputs" in str(s.get("env", ""))}
+check("W: exactly the three live-mutation steps (publish/reconcile/post-deploy-validation) consume the scoped AWS credentials", steps_consuming_creds == live_cred_names)
+
+# X: actions/upload-artifact@v4 is retained, always(), with the exact preserved artifact contract.
+upload_step = next((s for s in build_steps if s.get("uses") == "actions/upload-artifact@v4"), None)
+check("X: actions/upload-artifact@v4 is retained with if: always()", upload_step is not None and upload_step.get("if") == "always()")
+upload_with = (upload_step or {}).get("with", {}) or {}
+upload_paths = {p.strip() for p in (upload_with.get("path") or "").splitlines() if p.strip()}
+check("X: upload-artifact preserves name/paths/if-no-files-found/retention-days exactly", upload_with.get("name") == "argocd-helm-artifacts-${{ inputs.environment }}" and upload_paths == {"rendered/", "packaged/", "pulled/"} and upload_with.get("if-no-files-found") == "warn" and upload_with.get("retention-days") == 7)
+
+# Y: the workflow summary step is if: always() and Python-backed.
+summary_step = next((s for s in build_steps if s.get("name") == "Workflow summary"), None)
+check("Y: the Workflow summary step is if: always() and invokes phase3_argocd.py summary", summary_step is not None and summary_step.get("if") == "always()" and "phase3_argocd.py summary" in (summary_step.get("run") or ""))
+
+# Z: no Terraform execution exists anywhere in phase3_argocd.py.
+check("Z: phase3_argocd.py never references a quoted \x27terraform\x27 subprocess token", not re.search(r'[\'"]terraform[\'"]', phase3_source))
+check("Z: phase3_argocd.py never invokes terraform init/plan/apply/destroy", not any(f"terraform {verb}" in phase3_source for verb in ("init", "plan", "apply", "destroy")))
+
+# AA: no Argo CD classifier remains under automation/orchestration/ -- both classifiers now live exclusively under automation/phases/phase3/.
+import os
+check("AA: automation/orchestration/argocd_state.py no longer exists", not os.path.exists("automation/orchestration/argocd_state.py"))
+check("AA: automation/orchestration/argocd_acceptance.py no longer exists", not os.path.exists("automation/orchestration/argocd_acceptance.py"))
+check("AA: automation/phases/phase3/argocd_state.py exists", os.path.isfile("automation/phases/phase3/argocd_state.py"))
+check("AA: automation/phases/phase3/argocd_acceptance.py exists", os.path.isfile("automation/phases/phase3/argocd_acceptance.py"))
+
+# AB: phase3_argocd.py's own canonical tool paths point at automation/phases/phase3/, never automation/orchestration/.
+check("AB: phase3_argocd.py's ARGOCD_STATE_TOOL/ARGOCD_ACCEPTANCE_TOOL constants are derived under automation/phases/phase3/, never automation/orchestration/", '"phases" / "phase3" / "argocd_state.py"' in phase3_source and '"phases" / "phase3" / "argocd_acceptance.py"' in phase3_source and '"orchestration"' not in phase3_source)
+
+# AC: no repository reference to the retired automation/orchestration/argocd_(state|acceptance).py paths remains anywhere, excluding this very assertion's own prose (which deliberately names the retired path to prove its absence -- never a false-positive on itself).
+import subprocess as _subprocess
+retired_grep = _subprocess.run(["grep", "-rn", "-E", r"automation/orchestration/argocd_(state|acceptance)\.py", "--include=*.py", "--include=*.sh", "--include=*.yaml", "--include=*.yml", "--exclude=test-goldengate-deployment-models.sh", "."], capture_output=True, text=True)
+check("AC: zero remaining references to automation/orchestration/argocd_state.py or argocd_acceptance.py anywhere in the repository", retired_grep.stdout.strip() == "")
+
+# AD: the moved classifier test files exist at their new canonical path, and the old ones are gone.
+check("AD: automation/phases/phase3/tests/test_argocd_state.py exists (moved from automation/test-goldengate-argocd-state.py)", os.path.isfile("automation/phases/phase3/tests/test_argocd_state.py"))
+check("AD: automation/phases/phase3/tests/test_argocd_acceptance.py exists (moved from automation/test-goldengate-argocd-acceptance.py)", os.path.isfile("automation/phases/phase3/tests/test_argocd_acceptance.py"))
+check("AD: automation/test-goldengate-argocd-state.py no longer exists", not os.path.exists("automation/test-goldengate-argocd-state.py"))
+check("AD: automation/test-goldengate-argocd-acceptance.py no longer exists", not os.path.exists("automation/test-goldengate-argocd-acceptance.py"))
+
+# AE: automation/phases/phase3/tests/test_phase3_argocd.py exists as the new dedicated Phase 3 orchestrator test suite.
+check("AE: automation/phases/phase3/tests/test_phase3_argocd.py exists", os.path.isfile("automation/phases/phase3/tests/test_phase3_argocd.py"))
+
+# AF: phase3_argocd.py never uses shell=True and never builds a shell pipeline for the ECR login.
+check("AF: phase3_argocd.py never passes shell=True to subprocess.run", "shell=True)" not in phase3_source and "shell=True," not in phase3_source)
+check("AF: phase3_argocd.py's ECR login never shells out through a pipe (helm registry login receives the password via stdin only)", "| helm registry login" not in phase3_source)
+
+# AG: phase3_argocd.py's Phase 3 state file never accepts a credential-shaped key -- ALLOWED_STATE_KEYS is an explicit allow-list.
+check("AG: phase3_argocd.py defines ALLOWED_STATE_KEYS as an explicit non-secret allow-list", "ALLOWED_STATE_KEYS = frozenset(" in phase3_source)
+check("AG: update_state() enforces the ALLOWED_STATE_KEYS allow-list before ever writing", "disallowed = sorted(set(updates) - ALLOWED_STATE_KEYS)" in phase3_source)
+
+# AH: phase3_argocd.py preserves the exact four Helm OCI/ECR repository names and the exact five required IAM policy actions.
+for repo in ("helm/goldengate", "helm/goldengate-monitor", "helm/goldengate-platform", "helm/amazon-cloudwatch-observability"):
+    check(f"AH: phase3_argocd.py's REQUIRED_ECR_POLICY_REPOS includes {repo!r}", f'"{repo}"' in phase3_source)
+for action in ("ecr:BatchCheckLayerAvailability", "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer", "ecr:DescribeImages", "ecr:DescribeRepositories"):
+    check(f"AH: phase3_argocd.py's REQUIRED_ECR_POLICY_ACTIONS includes {action!r}", f'"{action}"' in phase3_source)
+
+# AI: phase3_argocd.py preserves the exact four repository Secret names and rejects the same seven public registries.
+for secret_name in ("argocd-ecr-goldengate-oci", "argocd-ecr-goldengate-monitor-oci", "argocd-ecr-goldengate-platform-oci", "argocd-ecr-amazon-cloudwatch-observability-oci"):
+    check(f"AI: phase3_argocd.py's REQUIRED_REPO_SECRETS includes {secret_name!r}", f'"{secret_name}"' in phase3_source)
+for registry in ("quay.io", "ghcr.io", "docker.io", "public.ecr.aws", "registry.k8s.io", "gcr.io", "k8s.gcr.io"):
+    check(f"AI: phase3_argocd.py's PUBLIC_REGISTRIES rejects {registry!r}", f'"{registry}"' in phase3_source)
+
+# AJ: the runtime/replication architecture remains untouched by this Phase 3 task -- both frozen runtime descriptors still carry no lifecycle block and remain replication.enabled=false.
+runtime_check_ok = True
+for frozen_descriptor in ("envs/dev/gg-postgresql-repltest-01/values.yaml", "envs/dev/gg-mssql-repltest-01/values.yaml"):
+    with open(frozen_descriptor) as f:
+        descriptor_text = f.read()
+    descriptor_doc = yaml.safe_load(descriptor_text)
+    if "lifecycle" in descriptor_doc:
+        runtime_check_ok = False
+    if (descriptor_doc.get("replication") or {}).get("enabled") is not False:
+        runtime_check_ok = False
+    if (descriptor_doc.get("deployment") or {}).get("enabled") is not True:
+        runtime_check_ok = False
+check("AJ: both frozen runtime descriptors remain deployment.enabled=true/replication.enabled=false with no lifecycle block -- unchanged by this Phase 3 task", runtime_check_ok)
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  PHASE3_ARCHITECTURE_STATUS=$?
+  set -e
+  if [ "$PHASE3_ARCHITECTURE_STATUS" -ne 0 ]; then
+    fail "Phase 3 Python Conversion (A-AJ): assertion script errored:"$'\n'"${PHASE3_ARCHITECTURE_OUT}"
+  else
+    while IFS= read -r line; do
+      case "$line" in
+        FAIL\ *) fail "Phase 3 Python Conversion (A-AJ): ${line#FAIL }" ;;
+        OK\ *) pass "Phase 3 Python Conversion (A-AJ): ${line#OK }" ;;
+      esac
+    done <<< "$PHASE3_ARCHITECTURE_OUT"
+  fi
+else
+  skip "Phase 3 Python Conversion (A-AJ) -- python3/PyYAML unavailable or workflow/tool files missing"
 fi
 
 echo ""

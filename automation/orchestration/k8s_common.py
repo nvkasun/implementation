@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""automation/orchestration/k8s_common.py: shared read-only Kubernetes inspection primitives for the Phase B2 classifiers (platform_state.py, observability_state.py). Never mutates the cluster: every helper here issues only `kubectl get` (read-only). This module is new and independent of automation/orchestration/argocd_state.py -- Phase B1's classifier/tests are byte-for-byte untouched by its existence."""
+"""automation/orchestration/k8s_common.py: shared read-only Kubernetes inspection primitives for the Phase B2 classifiers (platform_state.py, observability_state.py). Never mutates the cluster: every helper here issues only `kubectl get` (read-only). This module is new and independent of automation/phases/phase3/argocd_state.py -- Phase B1's classifier/tests are byte-for-byte untouched by its existence."""
 from __future__ import annotations
 
 import json

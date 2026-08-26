@@ -254,10 +254,10 @@ jobs:
       terraform_governance_override: ${{ needs.validate_model.outputs.terraform_governance_override == 'true' }}
       terraform_governance_override_reason: ${{ needs.validate_model.outputs.terraform_governance_override_reason }}
 
+  # Phase 3A | Argo CD Ownership Preflight -- Phase 3 Python Conversion: automation/phases/phase3/argocd_state.py remains a pure OWNERSHIP-SAFETY classifier -- ABSENT (nothing installed yet) and OWNED (whatever currently exists is safely this repository's own Argo CD release, regardless of individual readiness/desired-state drift) both converge via reconcile_argocd below; BROKEN (foreign/ambiguous ownership, or a genuine inspection failure) fails closed right here, never auto-repaired. A DEPLOY is an end-to-end convergence operation, not merely a bootstrap: reconcile_argocd's own idempotent Helm reconciliation is what actually applies the current committed desired state -- this preflight job never needs to learn a new resource name merely to keep permitting that reconciliation. This job never mutates the cluster -- automation/phases/phase3/phase3_argocd.py ownership-preflight only runs the read-only classifier.
   argocd_preflight:
-    name: Classify Argo CD ownership safety (read-only)
+    name: "Phase 3A | Argo CD Ownership Preflight"
 
-    # Generic MAIN Desired-State Convergence Fix: automation/orchestration/argocd_state.py is now a pure OWNERSHIP-SAFETY classifier -- ABSENT (nothing installed yet) and OWNED (whatever currently exists is safely this repository's own Argo CD release, regardless of individual readiness/desired-state drift) both converge via reconcile_argocd below; BROKEN (foreign/ambiguous ownership, or a genuine inspection failure) fails closed right here, never auto-repaired. A DEPLOY is an end-to-end convergence operation, not merely a bootstrap: reconcile_argocd's own idempotent Helm reconciliation is what actually applies the current committed desired state (ecrTokenSync repositories, argocdServerIngress.enabled true<->false, image/tag, any future wrapper-chart resource) -- this preflight job never needs to learn a new resource name merely to keep permitting that reconciliation. This job never mutates the cluster -- it only runs automation/orchestration/argocd_state.py, which itself issues read-only `kubectl get` calls.
     needs:
       - validate_model
       - terraform_sync_once
@@ -266,102 +266,53 @@ jobs:
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
     outputs:
-      state: ${{ steps.classify.outputs.state }}
-
-    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail.
-    env:
-      GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
+      state: ${{ steps.ownership_preflight.outputs.state }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Load resolved environment config
+      - name: Load canonical environment configuration
         shell: bash
         run: |
           set -euo pipefail
 
-          python3 automation/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+          python3 automation/goldengate-environment.py --environment "${{ needs.validate_model.outputs.selected_environment }}" validate
+          python3 automation/goldengate-environment.py --environment "${{ needs.validate_model.outputs.selected_environment }}" github-env >> "$GITHUB_ENV"
 
+      - name: Ensure kubectl prerequisite
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 automation/phases/phase3/phase3_argocd.py ensure-kubectl
+
+      # AWS Credential Isolation: output-credentials/output-env-credentials scoping matches the established Phase 1/2 pattern -- these temporary credentials are consumed ONLY by the ownership-preflight step below (via steps.aws_build_credentials.outputs.* in that step's own env:), never job-wide, never written to $GITHUB_ENV, never written to any state file.
       - name: Configure AWS credentials
+        id: aws_build_credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
           role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
-
-      - name: Install kubectl if missing
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "Checking/installing kubectl..."
-
-          if ! command -v kubectl >/dev/null 2>&1; then
-            KUBECTL_VERSION="v1.35.0"
-
-            ARCH="$(uname -m)"
-            case "$ARCH" in
-              x86_64)
-                KUBECTL_ARCH="amd64"
-                ;;
-              aarch64|arm64)
-                KUBECTL_ARCH="arm64"
-                ;;
-              *)
-                echo "Unsupported architecture for kubectl: $ARCH"
-                exit 1
-                ;;
-            esac
-
-            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /tmp/kubectl
-            sudo mv /tmp/kubectl /usr/local/bin/kubectl
-            sudo chmod +x /usr/local/bin/kubectl
-          fi
-
-          kubectl version --client=true
-
-      - name: Connect to EKS cluster
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          aws eks update-kubeconfig \
-            --region "${AWS_REGION}" \
-            --name "${EKS_CLUSTER_NAME}" \
-            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
-            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
-
-          echo "Current kube context:"
-          kubectl config current-context
+          output-credentials: true
+          output-env-credentials: false
 
       - name: Classify Argo CD ownership safety
-        id: classify
+        id: ownership_preflight
         shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ steps.aws_build_credentials.outputs.aws-access-key-id }}
+          AWS_SECRET_ACCESS_KEY: ${{ steps.aws_build_credentials.outputs.aws-secret-access-key }}
+          AWS_SESSION_TOKEN: ${{ steps.aws_build_credentials.outputs.aws-session-token }}
         run: |
           set -euo pipefail
 
-          # A non-zero exit here is a classifier inspection error (API unreachable, permission denied, malformed JSON) -- never treated as ABSENT.
-          if ! CLASSIFIER_OUTPUT="$(python3 automation/orchestration/argocd_state.py --environment "${GG_SELECTED_ENVIRONMENT}")"; then
-            echo "FAIL: the Argo CD ownership classifier could not determine cluster state (inspection error, not ABSENT) -- see diagnostics above."
-            exit 1
-          fi
+          python3 automation/phases/phase3/phase3_argocd.py ownership-preflight --environment "${{ needs.validate_model.outputs.selected_environment }}"
 
-          echo "$CLASSIFIER_OUTPUT"
-
-          STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
-          echo "Argo CD ownership-safety state: ${STATE}"
-          echo "state=${STATE}" >> "$GITHUB_OUTPUT"
-
-          # ABSENT/OWNED both succeed here -- MAIN owns automatic reconciliation for both (see reconcile_argocd below), regardless of what individual desired-state drift 20-sub-argocd.yaml's own idempotent Helm reconciliation is about to converge. Only BROKEN is not auto-repaired: a genuine foreign/ambiguous ownership conflict, or an inspection failure, fails closed for investigation -- never a normal recovery path.
-          if [ "$STATE" = "BROKEN" ]; then
-            echo "FAIL: Argo CD ownership-safety state is BROKEN -- an unsafe or ambiguous condition that is not auto-repaired. Investigate the diagnostics above before re-running MAIN."
-            exit 1
-          fi
-
+  # Phase 3B | Authorize Argo CD Deployment -- Live Deployment Approval Topology Fix: the single, GoldenGate-owned protected-environment approval covering the entire end-to-end Deploy DAG that follows -- Argo CD reconciliation, Platform, Observability, the runtime matrix, and the Monitor all run afterward as MAIN-orchestrated jobs/reusable workflow calls (orchestrated_by_main: true) and never create an approval of their own. Deliberately placed after terraform_sync_once and argocd_preflight so a human is never asked to authorize a deployment that Terraform already failed or that Argo CD classified as unsafe (argocd_preflight's own ownership_preflight step already fails closed on BROKEN before this job can even be reached). Performs no AWS/Terraform/Kubernetes/Helm/ECR/Argo CD mutation of its own -- ubuntu-latest is sufficient because this job exists purely as a GitHub deployment-protection point, distinct from the corporate Terraform governance approval owned entirely by 10-sub-iam-secrets.yaml.
   goldengate_deploy_authorization:
-    name: Authorize GoldenGate application deployment
+    name: "Phase 3B | Authorize Argo CD Deployment"
 
-    # Live Deployment Approval Topology Fix: the single, GoldenGate-owned protected-environment approval covering the entire end-to-end Deploy DAG that follows -- Argo CD reconciliation, Platform, Observability, the runtime matrix, and the Monitor all run afterward as MAIN-orchestrated jobs/reusable workflow calls (orchestrated_by_main: true) and never create an approval of their own. Deliberately placed after terraform_sync_once and argocd_preflight so a human is never asked to authorize a deployment that Terraform already failed or that Argo CD classified as unsafe (argocd_preflight's own classify step already fails closed on BROKEN before this job can even be reached). Performs no AWS/Terraform/Kubernetes/Helm/ECR/Argo CD mutation of its own -- ubuntu-latest is sufficient because this job exists purely as a GitHub deployment-protection point, distinct from the corporate Terraform governance approval owned entirely by 10-sub-iam-secrets.yaml.
     needs:
       - validate_model
       - terraform_sync_once
@@ -379,10 +330,10 @@ jobs:
 
           echo "GoldenGate application deployment authorized for environment ${{ needs.validate_model.outputs.selected_environment }}."
 
+  # Phase 3C | Reconcile Argo CD Desired State -- Phase 3 Python Conversion: MAIN ALWAYS reconciles Argo CD on Deploy whenever the preflight ownership classifier confirms it is safe to do so -- ABSENT (nothing installed yet) or OWNED (whatever currently exists is safely this repository's own release, no matter what individual desired-state drift exists). A DEPLOY is an end-to-end convergence operation, not only a bootstrap operation: 20-sub-argocd.yaml's own idempotent `helm upgrade --install` is what actually applies the current committed desired state, so this job never skips reconciliation merely because the preflight classifier found the installation superficially healthy-looking. argocd_preflight's own ownership_preflight step already fails the job closed on BROKEN, so needs.argocd_preflight.result == 'success' alone already guarantees a non-BROKEN state; the explicit state check below is still listed for defense in depth and readability. Runs the reusable specialist workflow synchronously as part of this DAG -- never an asynchronous CLI/API dispatch or repository_dispatch trigger. 20-sub-argocd.yaml itself remains fully usable standalone; no standalone specialist workflow is a required recovery/upgrade path -- MAIN never tells an operator to run it separately to apply ordinary desired state. Live Deployment Approval Topology Fix: now also requires goldengate_deploy_authorization's own success -- the single GoldenGate application approval above -- so this reusable call runs already-authorized (orchestrated_by_main: true) and never opens a second approval of its own.
   reconcile_argocd:
-    name: Reconcile Argo CD desired state
+    name: "Phase 3C | Reconcile Argo CD Desired State"
 
-    # Generic MAIN Desired-State Convergence Fix: MAIN ALWAYS reconciles Argo CD on Deploy whenever the preflight ownership classifier confirms it is safe to do so -- ABSENT (nothing installed yet) or OWNED (whatever currently exists is safely this repository's own release, no matter what individual desired-state drift exists). A DEPLOY is an end-to-end convergence operation, not only a bootstrap operation: 20-sub-argocd.yaml's own idempotent `helm upgrade --install` is what actually applies the current committed desired state, so this job never skips reconciliation merely because the preflight classifier found the installation superficially healthy-looking. argocd_preflight's own classify step already fails the job closed on BROKEN, so needs.argocd_preflight.result == 'success' alone already guarantees a non-BROKEN state; the explicit state check below is still listed for defense in depth and readability. Runs the reusable specialist workflow synchronously as part of this DAG -- never an asynchronous CLI/API dispatch or repository_dispatch trigger. 20-sub-argocd.yaml itself remains fully usable standalone; no standalone specialist workflow is a required recovery/upgrade path -- MAIN never tells an operator to run it separately to apply ordinary desired state. Live Deployment Approval Topology Fix: now also requires goldengate_deploy_authorization's own success -- the single GoldenGate application approval above -- so this reusable call runs already-authorized (orchestrated_by_main: true) and never opens a second approval of its own.
     needs:
       - validate_model
       - argocd_preflight
@@ -395,10 +346,10 @@ jobs:
       environment: ${{ needs.validate_model.outputs.selected_environment }}
       orchestrated_by_main: true
 
+  # Phase 3D | Validate Argo CD Healthy -- always() overrides GitHub's default implicit skip-on-skipped-dependency behavior -- the explicit result checks below are what actually keep this fail-closed, exactly like validate_shared_secrets_once's established always()-plus-explicit-result pattern elsewhere in this workflow. reconcile_argocd is applicable for every state argocd_preflight can succeed with (ABSENT/OWNED), so a plain needs.reconcile_argocd.result == 'success' is sufficient -- no per-state branching is needed here. Phase 3 Python Conversion: the strict exact-desired-state check happens entirely inside automation/phases/phase3/phase3_argocd.py strict-acceptance (which itself calls automation/phases/phase3/argocd_acceptance.py), independent of which preflight state was observed -- this is an independent, fresh re-inspection: reconcile_argocd's own success is never itself treated as proof that Argo CD is healthy.
   validate_argocd_ready:
-    name: Validate Argo CD is healthy (strict post-reconciliation acceptance)
+    name: "Phase 3D | Validate Argo CD Healthy"
 
-    # always() overrides GitHub's default implicit skip-on-skipped-dependency behavior -- the explicit result checks below are what actually keep this fail-closed, exactly like validate_shared_secrets_once's established always()-plus-explicit-result pattern elsewhere in this workflow. reconcile_argocd is now applicable for every state argocd_preflight can succeed with (ABSENT/OWNED), so a plain needs.reconcile_argocd.result == 'success' is sufficient -- no per-state branching is needed here anymore. Generic MAIN Desired-State Convergence Fix: the strict exact-desired-state check happens entirely in the re-classification step below (automation/orchestration/argocd_acceptance.py), independent of which preflight state was observed.
     needs:
       - validate_model
       - argocd_preflight
@@ -407,95 +358,45 @@ jobs:
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
-    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail.
-    env:
-      GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Load resolved environment config
+      - name: Load canonical environment configuration
         shell: bash
         run: |
           set -euo pipefail
 
-          python3 automation/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+          python3 automation/goldengate-environment.py --environment "${{ needs.validate_model.outputs.selected_environment }}" validate
+          python3 automation/goldengate-environment.py --environment "${{ needs.validate_model.outputs.selected_environment }}" github-env >> "$GITHUB_ENV"
 
+      - name: Ensure kubectl prerequisite
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 automation/phases/phase3/phase3_argocd.py ensure-kubectl
+
+      # AWS Credential Isolation: output-credentials/output-env-credentials scoping matches the established Phase 1/2 pattern -- these temporary credentials are consumed ONLY by the strict-acceptance step below, never job-wide, never written to $GITHUB_ENV, never written to any state file.
       - name: Configure AWS credentials
+        id: aws_build_credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
           role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
-
-      - name: Install kubectl if missing
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "Checking/installing kubectl..."
-
-          if ! command -v kubectl >/dev/null 2>&1; then
-            KUBECTL_VERSION="v1.35.0"
-
-            ARCH="$(uname -m)"
-            case "$ARCH" in
-              x86_64)
-                KUBECTL_ARCH="amd64"
-                ;;
-              aarch64|arm64)
-                KUBECTL_ARCH="arm64"
-                ;;
-              *)
-                echo "Unsupported architecture for kubectl: $ARCH"
-                exit 1
-                ;;
-            esac
-
-            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /tmp/kubectl
-            sudo mv /tmp/kubectl /usr/local/bin/kubectl
-            sudo chmod +x /usr/local/bin/kubectl
-          fi
-
-          kubectl version --client=true
-
-      - name: Connect to EKS cluster
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          aws eks update-kubeconfig \
-            --region "${AWS_REGION}" \
-            --name "${EKS_CLUSTER_NAME}" \
-            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
-            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
-
-          echo "Current kube context:"
-          kubectl config current-context
+          output-credentials: true
+          output-env-credentials: false
 
       - name: Re-classify and require Argo CD to be exactly HEALTHY
         shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ steps.aws_build_credentials.outputs.aws-access-key-id }}
+          AWS_SECRET_ACCESS_KEY: ${{ steps.aws_build_credentials.outputs.aws-secret-access-key }}
+          AWS_SESSION_TOKEN: ${{ steps.aws_build_credentials.outputs.aws-session-token }}
         run: |
           set -euo pipefail
 
-          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
-
-          # Generic MAIN Desired-State Convergence Fix: post-reconciliation acceptance is now a SEPARATE, strict classifier (automation/orchestration/argocd_acceptance.py) from the pre-reconciliation ownership-safety preflight (automation/orchestration/argocd_state.py) -- reconciliation success (the reusable workflow job returning) is never assumed to mean healthy; this independently re-inspects the live cluster against the full current desired-state contract (core readiness, ecr-token-sync identity, repository Secrets, and -- only when argocdServerIngress.enabled -- the exact Ingress contract, including AWS Load Balancer Controller readiness; symmetrically, a still-present Ingress after argocdServerIngress.enabled=false is itself a failure, proving true->false pruning genuinely completed).
-          if ! CLASSIFIER_OUTPUT="$(python3 automation/orchestration/argocd_acceptance.py --environment "${GG_SELECTED_ENVIRONMENT}")"; then
-            echo "FAIL: the Argo CD acceptance classifier could not determine cluster state (inspection error) during post-reconciliation validation."
-            exit 1
-          fi
-
-          echo "$CLASSIFIER_OUTPUT"
-
-          STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
-
-          if [ "$STATE" != "HEALTHY" ]; then
-            echo "FAIL: Argo CD acceptance state is ${STATE}, expected HEALTHY after preflight/reconciliation. Refusing to proceed to the platform stage."
-            exit 1
-          fi
-
-          echo "OK: Argo CD acceptance state is HEALTHY."
+          python3 automation/phases/phase3/phase3_argocd.py strict-acceptance --environment "${{ needs.validate_model.outputs.selected_environment }}"
 
   platform_preflight:
     name: Classify GoldenGate Platform ownership safety (read-only)
