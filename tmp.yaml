@@ -1,0 +1,24 @@
+echo "=== SSH SERVICE ==="
+systemctl status sshd --no-pager
+
+echo
+echo "=== PORT 22 LISTENING ==="
+ss -lntp | grep ':22'
+
+echo
+echo "=== PASSWORD AUTH ==="
+sshd -T | grep -i passwordauthentication
+
+echo
+echo "=== SSH CONFIG ==="
+grep -RniE '^(PasswordAuthentication|AllowUsers|DenyUsers|PermitRootLogin)' \
+  /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ 2>/dev/null
+
+echo
+echo "=== FIREWALL ==="
+firewall-cmd --state 2>/dev/null || true
+firewall-cmd --list-all 2>/dev/null || true
+
+echo
+echo "=== SSH RECENT LOGS ==="
+journalctl -u sshd --no-pager -n 50
