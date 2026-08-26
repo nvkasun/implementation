@@ -232,7 +232,7 @@ jobs:
           python3 automation/phases/phase1/phase1_readiness.py acceptance
 
   terraform_sync_once:
-    name: Synchronize Terraform (once per environment)
+    name: Phase 2 | AWS Application Prerequisites
 
     # Phase 1 (validate_model) now owns the deletion_matrix/storage_transition_violations guards, the persistent AWS-side managed-EFS orphan check, and the live EKS/OIDC preflight internally -- a successful validate_model already proves the entire Phase 1 contract, so this job depends only on it. This job's `if:` is a custom expression, so validate_model's own success is checked explicitly below since GitHub Actions does not implicitly require needs to have succeeded once a custom if: is present.
     needs:

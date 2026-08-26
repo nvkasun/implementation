@@ -24,6 +24,7 @@ PLATFORM_WORKFLOW=".github/workflows/30-sub-platform.yaml"
 DETECT_SCRIPT="automation/phases/phase1/detect-goldengate-deployments.sh"
 PHASE1_TOOL="automation/phases/phase1/phase1_readiness.py"
 EFS_INVENTORY_GUARD_TOOL="automation/phases/phase1/managed_efs_inventory_guard.py"
+PHASE2_TOOL="automation/phases/phase2/phase2_prerequisites.py"
 ENV_SCOPE_CHECKER="automation/check-goldengate-workflow-env-scope.py"
 APPROVAL_TOPOLOGY_CHECKER="automation/check-goldengate-approval-topology.py"
 OBSERVABILITY_VALUES_FILE="platform/dev/goldengate-observability/values.yaml"
@@ -10644,25 +10645,16 @@ else
   fail "Live Deploy Fix 5: M3: a hardcoded override_noncompliance: true literal was found:"$'\n'"${FIX5_M_HITS}"
 fi
 
-# O/P/Q: SUB's own governance validation step re-derives/re-validates whatever it received (whether from MAIN's workflow_call or a direct standalone workflow_dispatch) -- REALLY EXECUTE it for the normal, authorized-override, and (by construction, since this workflow has no push trigger) never-implicitly-active cases.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$SUB_IAM_SECRETS_WORKFLOW" ]; then
+# O/P/Q: SUB's own governance validation re-derives/re-validates whatever it received (whether from MAIN's workflow_call or a direct standalone workflow_dispatch) -- REALLY EXECUTE the canonical phase2_prerequisites.py validate-governance CLI (never a reimplementation, and since the Phase 2 Python extraction never an extract-and-execute-bash-from-YAML fragment either) for the normal, authorized-override, and (by construction, since this workflow has no push trigger) never-implicitly-active cases.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$PHASE2_TOOL" ]; then
   set +e
-  FIX5_OPQ_OUT="$(python3 - "$SUB_IAM_SECRETS_WORKFLOW" <<'PYEOF'
+  FIX5_OPQ_OUT="$(python3 - "$PHASE2_TOOL" <<'PYEOF'
 import os
 import subprocess
 import sys
 import tempfile
 
-import yaml
-
-with open(sys.argv[1]) as f:
-    doc = yaml.safe_load(f)
-
-step = next((s for s in doc["jobs"]["validate_environment_config"]["steps"] if s.get("name") == "Validate the Terraform governance override inputs (fail closed)"), None)
-if step is None:
-    print("FAIL: validate_environment_config is missing its 'Validate the Terraform governance override inputs (fail closed)' step")
-    sys.exit(0)
-script = step["run"]
+phase2_tool = sys.argv[1]
 
 
 def parse_github_output(text):
@@ -10679,20 +10671,29 @@ def parse_github_output(text):
 def run_step(override, reason):
     fd, gh_output_path = tempfile.mkstemp()
     os.close(fd)
-    env = {"PATH": os.environ.get("PATH", ""), "INPUT_OVERRIDE": override, "INPUT_REASON": reason, "GITHUB_OUTPUT": gh_output_path}
-    proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=20)
+    fd2, state_path = tempfile.mkstemp()
+    os.close(fd2)
+    os.unlink(state_path)
+    env = dict(os.environ)
+    env["INPUT_OVERRIDE"] = override
+    env["INPUT_REASON"] = reason
+    env["GITHUB_OUTPUT"] = gh_output_path
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    proc = subprocess.run([sys.executable, phase2_tool, "--state-file", state_path, "validate-governance"], env=env, capture_output=True, text=True, timeout=20)
     with open(gh_output_path) as f:
         outputs = parse_github_output(f.read())
     os.unlink(gh_output_path)
+    if os.path.exists(state_path):
+        os.unlink(state_path)
     return proc.returncode, outputs
 
 results = []
 
 rc, outputs = run_step("false", "")
-results.append(("O: SUB with override=false (the default) -> valid, override=false -- normal corporate governance path is unchanged", rc == 0 and outputs.get("override") == "false"))
+results.append(("O: SUB with override=false (the default) -> valid, override=false -- normal corporate governance path is unchanged", rc == 0 and outputs.get("terraform_governance_override") == "false"))
 
 rc, outputs = run_step("true", "Approved DEV POC emergency validation")
-results.append(("P: SUB with override=true + a valid written reason -> valid, override=true is forwarded toward the corporate call", rc == 0 and outputs.get("override") == "true"))
+results.append(("P: SUB with override=true + a valid written reason -> valid, override=true is forwarded toward the corporate call", rc == 0 and outputs.get("terraform_governance_override") == "true"))
 
 rc, outputs = run_step("true", "")
 results.append(("Q: SUB independently refuses override=true with no reason, defense-in-depth even if a caller somehow skipped MAIN's own validation", rc != 0))
@@ -10713,7 +10714,7 @@ PYEOF
     fail "Live Deploy Fix 5: O/P/Q: SUB governance validation execution proof produced no output"
   fi
 else
-  skip "Live Deploy Fix 5: O/P/Q: SUB governance validation execution proof -- python3/PyYAML/10-sub-iam-secrets.yaml missing"
+  skip "Live Deploy Fix 5: O/P/Q: SUB governance validation execution proof -- python3/${PHASE2_TOOL} missing"
 fi
 
 # R/S: the previously-established Validate/Deploy dropdown and environment-wide deployment_id semantics remain completely unchanged by this task.
@@ -11036,11 +11037,15 @@ step_names = [s.get("name", "") for s in steps]
 results.append(("4: the old supplied-vs-canonical region mismatch step is gone", "Verify supplied region matches the canonical environment region" not in step_names))
 results.append(("5: validate_environment_config exposes a canonical aws_region job output", "aws_region" in (vec.get("outputs") or {})))
 
-resolve_step = next((s for s in steps if s.get("id") == "resolve_environment"), None)
-results.append(("6a: a step with id=resolve_environment exists", resolve_step is not None))
+# 6a/6b/6c: since the Phase 2 Python extraction, this logic lives in phase2_prerequisites.py cmd_resolve_region -- the workflow step itself is a thin wrapper invoking it, so these fragments are checked against the real Python source.
+resolve_step = next((s for s in steps if s.get("name") == "Resolve canonical Terraform region"), None)
+results.append(("6a: the \x27Resolve canonical Terraform region\x27 step exists", resolve_step is not None))
 run_text = (resolve_step or {}).get("run", "")
-results.append(("6b: that step derives AWS_REGION via goldengate-environment.py ... get AWS_REGION", "goldengate-environment.py" in run_text and "get AWS_REGION" in run_text))
-results.append(("6c: that step fails closed on an empty AWS_REGION (no eu-west-1 fallback)", "-z \"${AWS_REGION}\"" in run_text and "eu-west-1" not in run_text))
+results.append(("6a2: that step invokes phase2_prerequisites.py resolve-region", "phase2_prerequisites.py resolve-region" in run_text))
+with open("'"$PHASE2_TOOL"'") as f:
+    phase2_source = f.read()
+results.append(("6b: cmd_resolve_region derives AWS_REGION via goldengate-environment.py ... get AWS_REGION", "ENVIRONMENT_TOOL" in phase2_source and "\"get\", \"AWS_REGION\"" in phase2_source))
+results.append(("6c: cmd_resolve_region fails closed on an empty AWS_REGION (no eu-west-1 fallback)", "if not aws_region:" in phase2_source and "eu-west-1" not in phase2_source))
 
 apply_job = jobs["apply"]
 results.append(("7a: apply.needs == validate_environment_config", apply_job.get("needs") == "validate_environment_config"))
@@ -11123,39 +11128,25 @@ else
   fail "Phase 12 10: an active workflow still contains a region literal/choice option:"$'\n'"${PHASE12_REGION_LITERAL_HITS}"
 fi
 
-# Direct-call static regression: extract the REAL, unmodified resolve_environment step and execute it with only TARGET_ENVIRONMENT=dev set (exactly what a direct manual workflow_dispatch run supplies) -- proves the workflow derives its own region with zero other caller participation, never contacting AWS or the corporate reusable workflow.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$IAM_WORKFLOW" ]; then
-  python3 - "$IAM_WORKFLOW" > "${WORKDIR}/resolve_environment_step.sh" <<'PYEOF'
-import sys
-import yaml
-with open(sys.argv[1]) as f:
-    doc = yaml.safe_load(f)
-for step in doc["jobs"]["validate_environment_config"]["steps"]:
-    if step.get("id") == "resolve_environment":
-        sys.stdout.write(step["run"])
-        break
-else:
-    sys.exit("step not found")
-PYEOF
+# Direct-call static regression: since the Phase 2 Python extraction, invoke the REAL, unmodified phase2_prerequisites.py CLI (validate-environment then resolve-region, exactly the workflow's own step order) with only TARGET_ENVIRONMENT=dev set (exactly what a direct manual workflow_dispatch run supplies) -- proves the workflow derives its own region with zero other caller participation, never contacting AWS or the corporate reusable workflow.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$PHASE2_TOOL" ]; then
+  DIRECT_CALL_STATE="$(mktemp)"
+  rm -f "$DIRECT_CALL_STATE"
+  DIRECT_CALL_OUTPUT="$(mktemp)"
+  set +e
+  DIRECT_CALL_LOG="$(TARGET_ENVIRONMENT="dev" PYTHONDONTWRITEBYTECODE=1 python3 "$PHASE2_TOOL" --state-file "$DIRECT_CALL_STATE" validate-environment 2>&1 \
+    && GITHUB_OUTPUT="$DIRECT_CALL_OUTPUT" PYTHONDONTWRITEBYTECODE=1 python3 "$PHASE2_TOOL" --state-file "$DIRECT_CALL_STATE" resolve-region 2>&1)"
+  DIRECT_CALL_STATUS=$?
+  set -e
 
-  if [ ! -s "${WORKDIR}/resolve_environment_step.sh" ]; then
-    fail "Phase 12 direct-call: could not extract the resolve_environment step from ${IAM_WORKFLOW}"
+  if [ "$DIRECT_CALL_STATUS" -eq 0 ] && grep -qF "aws_region=eu-west-1" "$DIRECT_CALL_OUTPUT"; then
+    pass "Phase 12 direct-call: given only TARGET_ENVIRONMENT=dev (exactly a direct manual run's inputs.environment), the real phase2_prerequisites.py validate-environment -> resolve-region sequence derives aws_region=eu-west-1 from envs/dev/environment.yaml with no other caller participation"
   else
-    DIRECT_CALL_OUTPUT="$(mktemp)"
-    set +e
-    DIRECT_CALL_LOG="$(TARGET_ENVIRONMENT="dev" GITHUB_OUTPUT="$DIRECT_CALL_OUTPUT" bash "${WORKDIR}/resolve_environment_step.sh" 2>&1)"
-    DIRECT_CALL_STATUS=$?
-    set -e
-
-    if [ "$DIRECT_CALL_STATUS" -eq 0 ] && grep -qF "aws_region=eu-west-1" "$DIRECT_CALL_OUTPUT"; then
-      pass "Phase 12 direct-call: given only TARGET_ENVIRONMENT=dev (exactly a direct manual run's inputs.environment), the real resolve_environment step derives aws_region=eu-west-1 from envs/dev/environment.yaml with no other caller participation"
-    else
-      fail "Phase 12 direct-call: the real resolve_environment step did not derive the canonical region from environment=dev alone (status=${DIRECT_CALL_STATUS}):"$'\n'"${DIRECT_CALL_LOG}"
-    fi
-    rm -f "$DIRECT_CALL_OUTPUT"
+    fail "Phase 12 direct-call: the real phase2_prerequisites.py sequence did not derive the canonical region from environment=dev alone (status=${DIRECT_CALL_STATUS}):"$'\n'"${DIRECT_CALL_LOG}"
   fi
+  rm -f "$DIRECT_CALL_OUTPUT" "$DIRECT_CALL_STATE"
 else
-  skip "Phase 12 direct-call: python3/PyYAML unavailable or ${IAM_WORKFLOW} missing"
+  skip "Phase 12 direct-call: python3 or ${PHASE2_TOOL} missing"
 fi
 
 # Region-change regression: two synthetic, fully valid, temporary environment.yaml fixtures (isolated copy of the resolver, never touching envs/dev/) with two different syntactically-valid AWS regions prove the resolver -- and therefore the workflow step above -- is genuinely environment-derived, never a hardcoded eu-west-1 fallback.
@@ -15776,10 +15767,10 @@ for job_name, output_key in (
     job_text = yaml.dump(jobs.get(job_name, {}), default_flow_style=False)
     check(f"Q: {job_name} reads needs.validate_model.outputs.{output_key} (the canonical value, never re-derived)", f"needs.validate_model.outputs.{output_key}" in job_text)
 
-# R: no phase2/phase3/etc. placeholder directory or job was introduced -- exactly Phase 1 was converted, nothing else.
+# R: no phase3/etc. placeholder directory or job was introduced -- exactly Phase 1 (and, since the Phase 2 Python extraction, Phase 2) were converted, nothing else pre-created.
 import os
 phase_dirs = sorted(d for d in os.listdir("automation/phases") if os.path.isdir(os.path.join("automation/phases", d))) if os.path.isdir("automation/phases") else []
-check("R: automation/phases/ contains only phase1 (no phase2/phase3/etc. placeholder directories)", phase_dirs == ["phase1"])
+check("R: automation/phases/ contains only phase1 and phase2 (no phase3/etc. placeholder directories)", phase_dirs == ["phase1", "phase2"])
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
@@ -15893,6 +15884,147 @@ PYEOF
   fi
 else
   skip "Phase 1 credential-scope hardening (A-L) -- python3/PyYAML unavailable or main workflow missing"
+fi
+
+echo ""
+echo "--- Phase 2 Python extraction: validate_environment_config/apply (10-sub-iam-secrets.yaml) stay two visible jobs behind the corporate Terraform reusable-workflow boundary (assertions A-W) ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$SUB_IAM_SECRETS_WORKFLOW" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE2_TOOL" ]; then
+  set +e
+  PHASE2_ARCHITECTURE_OUT="$(python3 - "$SUB_IAM_SECRETS_WORKFLOW" "$EKS_APP_WORKFLOW" "$PHASE2_TOOL" <<'PYEOF'
+import re
+import sys
+
+import yaml
+
+sub_path, main_path, phase2_tool_path = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(sub_path) as f:
+    sub_doc = yaml.safe_load(f)
+with open(main_path) as f:
+    main_doc = yaml.safe_load(f)
+with open(phase2_tool_path) as f:
+    phase2_source = f.read()
+
+results = []
+
+
+def check(label, ok):
+    results.append((label, ok))
+
+
+sub_jobs = sub_doc["jobs"]
+main_jobs = main_doc["jobs"]
+
+# A: 10-sub-iam-secrets.yaml still contains exactly the expected jobs.
+check("A: 10-sub-iam-secrets.yaml contains exactly the expected jobs (validate_environment_config, apply)", set(sub_jobs.keys()) == {"validate_environment_config", "apply"})
+
+vec = sub_jobs.get("validate_environment_config", {})
+apply_job = sub_jobs.get("apply", {})
+
+# B/C: display names.
+check("B: validate_environment_config display name is 'Phase 2A | Validate AWS Application Prerequisites'", vec.get("name") == "Phase 2A | Validate AWS Application Prerequisites")
+check("C: apply display name is 'Phase 2B | Corporate Terraform Apply'", apply_job.get("name") == "Phase 2B | Corporate Terraform Apply")
+
+steps = vec.get("steps", [])
+run_steps = [s for s in steps if s.get("run") is not None]
+
+# D: Phase 2A steps invoke automation/phases/phase2/phase2_prerequisites.py.
+check("D: every validate_environment_config run: step invokes phase2_prerequisites.py", len(run_steps) > 0 and all("phase2_prerequisites.py" in s["run"] for s in run_steps))
+
+# E: large inline governance/environment shell implementations have been removed from 10-sub -- every run: step is now a short wrapper (well under the old ~30-line inline bash bodies), with the real conditionals/sed/heredoc logic gone from the YAML.
+inline_logic_fragments = ("sed -e", "TRIMMED_REASON", "GG_TF_GOVERNANCE_REASON_EOF", 'if [ "$INPUT_OVERRIDE" != "true" ]', 'if [ -z "${AWS_REGION}" ]')
+check("E: no large inline governance/environment shell implementation remains in 10-sub-iam-secrets.yaml (moved into phase2_prerequisites.py)", not any(fragment in (s.get("run") or "") for s in steps for fragment in inline_logic_fragments))
+check("E2: every validate_environment_config run: step body is short (<= 5 non-empty lines) -- business logic lives in Python, not YAML", all(len([line for line in (s.get("run") or "").splitlines() if line.strip()]) <= 5 for s in run_steps))
+
+# F: Phase 2A remains local/read-only -- no AWS credential action, no live aws CLI call, no terraform apply anywhere in the job.
+vec_text = yaml.dump(vec, default_flow_style=False)
+check("F: validate_environment_config never configures AWS credentials (no aws-actions/configure-aws-credentials)", "configure-aws-credentials" not in vec_text)
+check("F: validate_environment_config never invokes the aws CLI", not re.search(r'[\'"]aws[\'"]', vec_text))
+check("F: validate_environment_config never invokes terraform apply", "terraform apply" not in vec_text and not re.search(r'[\'"]terraform[\'"]', vec_text))
+
+# G/H/I: apply needs validate_environment_config, still calls the exact corporate reusable workflow, and forwards secrets: inherit.
+check("G: apply needs validate_environment_config", apply_job.get("needs") == "validate_environment_config")
+check("H: apply uses exactly the ADCB corporate reusable workflow", apply_job.get("uses") == "AbuDhabiCommercialBank/adcb-reusable-workflows/.github/workflows/aws-terraform-apply.yaml@main")
+check("I: apply has secrets: inherit", apply_job.get("secrets") == "inherit")
+
+apply_with = apply_job.get("with", {}) or {}
+# J/K/L/M: exact corporate input mappings, unchanged.
+check("J: region comes exactly from needs.validate_environment_config.outputs.aws_region", apply_with.get("region") == "${{ needs.validate_environment_config.outputs.aws_region }}")
+check("K: override_noncompliance comes exactly from needs.validate_environment_config.outputs.terraform_governance_override == 'true'", apply_with.get("override_noncompliance") == "${{ needs.validate_environment_config.outputs.terraform_governance_override == 'true' }}")
+check("L: override_reason comes exactly from needs.validate_environment_config.outputs.terraform_governance_override_reason", apply_with.get("override_reason") == "${{ needs.validate_environment_config.outputs.terraform_governance_override_reason }}")
+check("M: terraform_version remains passed from inputs.terraform_version", apply_with.get("terraform_version") == "${{ inputs.terraform_version }}")
+
+# N/O/P: workflow_dispatch/workflow_call inputs remain supported, terraform_version default remains 1.7.2.
+sub_on = sub_doc.get(True, sub_doc.get("on", {}))
+wd_inputs = (sub_on.get("workflow_dispatch") or {}).get("inputs") or {}
+wc_inputs = (sub_on.get("workflow_call") or {}).get("inputs") or {}
+check("N: workflow_dispatch inputs remain supported (environment/terraform_version/terraform_governance_override/terraform_governance_override_reason)", {"environment", "terraform_version", "terraform_governance_override", "terraform_governance_override_reason"} <= set(wd_inputs.keys()))
+check("O: workflow_call inputs remain supported (environment/terraform_version/terraform_governance_override/terraform_governance_override_reason)", {"environment", "terraform_version", "terraform_governance_override", "terraform_governance_override_reason"} <= set(wc_inputs.keys()))
+check("P: terraform_version default remains '1.7.2' for both entrypoints", wd_inputs.get("terraform_version", {}).get("default") == "1.7.2" and wc_inputs.get("terraform_version", {}).get("default") == "1.7.2")
+
+# Q: required permissions remain exactly id-token write, contents read, packages write, pull-requests read.
+sub_permissions = sub_doc.get("permissions") or {}
+check("Q: 10-sub-iam-secrets.yaml permissions remain exactly id-token/contents/packages/pull-requests as before", sub_permissions == {"id-token": "write", "contents": "read", "packages": "write", "pull-requests": "read"})
+
+# R: MAIN terraform_sync_once still needs only validate_model, requires Phase 1 success + effective_deploy, calls 10-sub, secrets: inherit.
+tsf = main_jobs.get("terraform_sync_once", {})
+tsf_needs = tsf.get("needs")
+tsf_needs_list = tsf_needs if isinstance(tsf_needs, list) else [tsf_needs]
+check("R: terraform_sync_once needs only validate_model", tsf_needs_list == ["validate_model"])
+tsf_if = str(tsf.get("if", ""))
+check("R: terraform_sync_once requires validate_model.result == success and effective_deploy == true", "needs.validate_model.result == 'success'" in tsf_if and "needs.validate_model.outputs.effective_deploy == 'true'" in tsf_if)
+check("R: terraform_sync_once calls 10-sub-iam-secrets.yaml", str(tsf.get("uses", "")).endswith(".github/workflows/10-sub-iam-secrets.yaml"))
+check("R: terraform_sync_once uses secrets: inherit", tsf.get("secrets") == "inherit")
+
+# S: MAIN Phase 2 display name.
+check("S: MAIN terraform_sync_once display name is 'Phase 2 | AWS Application Prerequisites'", tsf.get("name") == "Phase 2 | AWS Application Prerequisites")
+
+# T: argocd_preflight still cannot run unless terraform_sync_once succeeded.
+preflight = main_jobs.get("argocd_preflight", {})
+preflight_needs = preflight.get("needs") or []
+preflight_if = str(preflight.get("if", ""))
+check("T: argocd_preflight needs terraform_sync_once", "terraform_sync_once" in preflight_needs)
+check("T: argocd_preflight's if: requires terraform_sync_once.result == success", "needs.terraform_sync_once.result == \x27success\x27" in preflight_if)
+
+# U: final_validation still requires terraform_sync_once success on Deploy and permits the intentional skip in Validate mode.
+final_val = main_jobs.get("final_validation", {})
+gate_step = next((s for s in final_val.get("steps", []) if s.get("name") == "Validate the mode-aware final DEPLOY success contract"), None)
+gate_run = (gate_step or {}).get("run", "")
+check("U: final_validation gate step requires success for terraform_sync_once on a REAL DEPLOY", "require_success terraform_sync_once" in gate_run)
+check("U: final_validation gate step allows terraform_sync_once to be legitimately skipped in Validate mode", "allow_non_failure terraform_sync_once" in gate_run)
+
+# V: no direct Terraform apply implementation exists anywhere under automation/phases/phase2/ -- checked as a quoted "terraform" token (a real subprocess argv element), never the terraform_governance_override identifier which legitimately contains the substring "terraform".
+check("V: phase2_prerequisites.py never references a quoted \x27terraform\x27 subprocess token (no direct apply implementation)", not re.search(r'[\'"]terraform[\'"]', phase2_source))
+check("V: phase2_prerequisites.py never invokes terraform init/plan/apply/destroy", not any(f"terraform {verb}" in phase2_source for verb in ("init", "plan", "apply", "destroy")))
+
+# W: Phase 1 implementation and outputs are unchanged.
+vm = main_jobs.get("validate_model", {})
+check("W: validate_model still exposes all 12 canonical Phase 1 outputs", set((vm.get("outputs") or {}).keys()) == {
+    "selected_environment", "effective_deploy", "has_active_deployments", "active_runtime_matrix",
+    "terraform_governance_override", "terraform_governance_override_reason", "has_changes",
+    "deployment_matrix", "has_deletions", "deletion_matrix", "has_storage_transition_violations",
+    "storage_transition_violations",
+})
+check("W: validate_model display name is unchanged", vm.get("name") == "Phase 1 | Validate Folder-Driven Deployment Model")
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  PHASE2_ARCHITECTURE_STATUS=$?
+  set -e
+  if [ "$PHASE2_ARCHITECTURE_STATUS" -ne 0 ]; then
+    fail "Phase 2 Python extraction (A-W): assertion script errored:"$'\n'"${PHASE2_ARCHITECTURE_OUT}"
+  else
+    while IFS= read -r line; do
+      case "$line" in
+        FAIL\ *) fail "Phase 2 Python extraction (A-W): ${line#FAIL }" ;;
+        OK\ *) pass "Phase 2 Python extraction (A-W): ${line#OK }" ;;
+      esac
+    done <<< "$PHASE2_ARCHITECTURE_OUT"
+  fi
+else
+  skip "Phase 2 Python extraction (A-W) -- python3/PyYAML unavailable or workflow/tool files missing"
 fi
 
 echo ""
