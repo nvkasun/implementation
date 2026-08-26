@@ -1,100 +1,43 @@
-First test from your Windows machine
+ince you're currently in CMD, run this exact command:
 
-Run this in PowerShell:
+powershell -NoProfile -Command "Test-NetConnection 10.114.80.10 -Port 22 | Format-List ComputerName,RemoteAddress,RemotePort,SourceAddress,TcpTestSucceeded"
 
-Test-NetConnection 10.114.80.10 -Port 22
-
-Send me the complete output.
-
-I'm especially interested in:
+Send me that output, especially:
 
 SourceAddress
 TcpTestSucceeded
 
-Then run:
+I expect TcpTestSucceeded : True, because SSH already says Connection established.
 
-ssh -vvv azureuser@10.114.80.10
+Now let's prove whether your connection actually reaches this VM
 
-The -vvv gives us detailed SSH negotiation output.
+Your previous:
 
-Send me the last ~20 lines where it fails.
+journalctl -u sshd --since "5 minutes ago"
 
-There is another excellent test
+returned:
 
-Try SSH once:
+-- No entries --
+
+That's suspicious, but on RHEL we should also check /var/log/secure, because that's commonly where SSH authentication/session messages are recorded.
+
+First attempt SSH once again from your PC:
 
 ssh azureuser@10.114.80.10
 
-wait until you get:
+After it fails, immediately run this through Azure VM → Run command → RunShellScript:
 
-kex_exchange_identification: Connection closed by remote host
+echo "=== SSH LOG ==="
+grep -i sshd /var/log/secure | tail -50
 
-Then immediately go back to:
+echo
+echo "=== LOCAL SSH TEST ==="
+timeout 5 bash -c 'exec 3<>/dev/tcp/127.0.0.1/22; head -n 1 <&3'
 
-Azure VM → Run command → RunShellScript
+For the second test I expect something similar to:
 
-and run:
+SSH-2.0-OpenSSH_8.x
 
-journalctl -u sshd --since "5 minutes ago" --no-pager
+or:
 
-If there is nothing corresponding to your SSH attempt, we can be almost certain the connection never reaches the VM's sshd.
-
-If it does show something like:
-
-Connection from x.x.x.x port xxxxx
-
-then we investigate SSH itself.
-
-Also check the subnet
-
-Remember your VM is connected to:
-
-vnet-cibg-dev-uan
-└── snet-aks-node-pools-cibg-uaenorth-001
-
-That is still suspicious because it appears to be an AKS node-pool subnet.
-
-Go to:
-
-VM → Networking → Network settings
-
-Then click the network interface and look for Effective security rules.
-
-We need to determine whether inbound TCP/22 from your corporate source network is actually permitted.
-
-Don't create:
-
-0.0.0.0/0 → TCP 22
-
-and don't give the VM a public IP just to solve this.
-
-The correct rule, if an NSG rule is required, would look more like:
-
-Source:
-Corporate management CIDR
-         │
-         │ TCP/22
-         ▼
-10.114.80.10
-Oracle VM
-Your VM itself currently looks good
-
-Based on the screenshots:
-
-OS-level SSH configuration is not the problem so far.
-
-RHEL
-├── sshd running                 ✅
-├── TCP/22 listening             ✅
-├── PasswordAuthentication yes   ✅
-└── firewalld allows ssh         ✅
-
-So bro, don't reset SSH and don't edit /etc/ssh/sshd_config yet.
-
-Run these two from your PC first:
-
-Test-NetConnection 10.114.80.10 -Port 22
-
-and:
-
-ssh -vvv azureuser@10.114.80.10
+SSH-2.0-OpenSSH_9.x
