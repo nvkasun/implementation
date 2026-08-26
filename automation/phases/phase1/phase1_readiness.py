@@ -140,11 +140,31 @@ def append_github_env(pairs, env_path=None):
                 f.write(f"{name}={value}\n")
 
 
+_GITHUB_ENV_RAW_LINE_RE = re.compile(r"^[A-Z_][A-Z0-9_]*=.*\Z")
+
+
+def _validate_github_env_raw_text(text):
+    """Defense-in-depth check on automation/goldengate-environment.py's own github-env stdout: the canonical producer now rejects CR/LF/NUL inside any value and only ever emits simple one-record-per-LF-line NAME=value text, so anything else here (a bare CR, a NUL byte, heredoc "<<" syntax, an unsafe/empty variable name, or a malformed line) means the received text does not match that contract -- fail closed rather than trust it. Never echoes the offending line content."""
+    if "\x00" in text:
+        raise Phase1Error("append_github_env_raw refused text containing a NUL byte.")
+    if "\r" in text:
+        raise Phase1Error("append_github_env_raw refused text containing a bare carriage return -- the canonical environment tool never emits one.")
+    if "<<" in text:
+        raise Phase1Error("append_github_env_raw refused text containing '<<' -- no heredoc syntax is expected from the canonical environment tool.")
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines = lines[:-1]
+    for line in lines:
+        if not line or not _GITHUB_ENV_RAW_LINE_RE.match(line):
+            raise Phase1Error("append_github_env_raw refused a malformed or unsafe NAME=value line.")
+
+
 def append_github_env_raw(text, env_path=None):
-    """Appends pre-formatted NAME=value lines (as already emitted by an external tool's own github-env output) verbatim to $GITHUB_ENV. No-op when GITHUB_ENV is unset or text is empty."""
+    """Appends pre-formatted NAME=value lines (as already emitted by an external tool's own github-env output) verbatim to $GITHUB_ENV, after validating the complete text is a sequence of safe, simple NAME=value records. Fails closed (raises Phase1Error, appends zero bytes) on any bare CR/NUL/heredoc syntax/malformed line. No-op when GITHUB_ENV is unset or text is empty."""
     path = env_path if env_path is not None else os.environ.get("GITHUB_ENV")
     if not path or not text:
         return
+    _validate_github_env_raw_text(text)
     with open(path, "a", encoding="utf-8") as f:
         f.write(text)
         if not text.endswith("\n"):

@@ -511,6 +511,61 @@ class TestGithubSpecialFileInjectionHardening(Phase1TestCase):
         self.assertFalse(p1._requires_heredoc("a b"))
 
 
+class TestAppendGithubEnvRawHardening(Phase1TestCase):
+    """append_github_env_raw() is defense-in-depth behind the now-hardened canonical automation/goldengate-environment.py github-env producer -- it must accept the real simple multi-record NAME=value payload that tool emits, and fail closed (writing zero bytes) on anything that does not match that simple-line contract."""
+
+    def test_accepts_a_normal_multi_record_canonical_payload(self):
+        payload = "AWS_REGION=eu-west-1\nGG_ENVIRONMENT=dev\n"
+        p1.append_github_env_raw(payload)
+        self.assertEqual(self.github_env.read_text(encoding="utf-8"), payload)
+
+    def test_rejects_bare_cr(self):
+        payload = "AWS_REGION=eu-west-1\rGG_ENVIRONMENT=dev\n"
+        with self.assertRaises(p1.Phase1Error):
+            p1.append_github_env_raw(payload)
+        self.assertFalse(self.github_env.exists())
+
+    def test_rejects_nul(self):
+        payload = "AWS_REGION=eu-west-1\x00\n"
+        with self.assertRaises(p1.Phase1Error):
+            p1.append_github_env_raw(payload)
+        self.assertFalse(self.github_env.exists())
+
+    def test_rejects_unsafe_variable_names(self):
+        for bad_payload in ("aws_region=eu-west-1\n", "1AWS_REGION=eu-west-1\n", "=eu-west-1\n", "AWS REGION=eu-west-1\n"):
+            with self.assertRaises(p1.Phase1Error, msg=repr(bad_payload)):
+                p1.append_github_env_raw(bad_payload)
+            self.assertFalse(self.github_env.exists(), msg=repr(bad_payload))
+
+    def test_rejects_malformed_lines_and_embedded_blank_lines(self):
+        for bad_payload in ("not a valid line at all\n", "AWS_REGION=eu-west-1\n\nGG_ENVIRONMENT=dev\n", "AWS_REGION\n"):
+            with self.assertRaises(p1.Phase1Error, msg=repr(bad_payload)):
+                p1.append_github_env_raw(bad_payload)
+            self.assertFalse(self.github_env.exists(), msg=repr(bad_payload))
+
+    def test_rejects_heredoc_syntax(self):
+        payload = "AWS_REGION<<GG_EOF\neu-west-1\nGG_EOF\n"
+        with self.assertRaises(p1.Phase1Error):
+            p1.append_github_env_raw(payload)
+        self.assertFalse(self.github_env.exists())
+
+    def test_writes_zero_bytes_when_validation_fails(self):
+        p1.append_github_env_raw("AWS_REGION=eu-west-1\n")
+        before = self.github_env.read_text(encoding="utf-8")
+        with self.assertRaises(p1.Phase1Error):
+            p1.append_github_env_raw("AWS_REGION=eu-west-1\rROGUE=injected\n")
+        after = self.github_env.read_text(encoding="utf-8")
+        self.assertEqual(before, after, "a failed append must not add any bytes to an already-existing file")
+
+    def test_accepts_the_real_canonical_environment_tool_output(self):
+        import subprocess
+
+        environment_tool = p1.REPO_ROOT / "automation" / "goldengate-environment.py"
+        proc = subprocess.run([sys.executable, str(environment_tool), "--environment", "dev", "github-env"], capture_output=True, text=True, check=True)
+        p1.append_github_env_raw(proc.stdout)
+        self.assertIn("AWS_REGION=", self.github_env.read_text(encoding="utf-8"))
+
+
 class TestAcceptance(Phase1TestCase):
     def _base_state(self, effective_deploy):
         return {

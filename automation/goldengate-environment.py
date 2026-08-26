@@ -37,6 +37,9 @@ _KMS_ARN_RE = re.compile(
     r"^arn:aws:kms:(?P<region>[a-z0-9-]+):(?P<account>\d{12}):key/[0-9a-fA-F-]+\Z"
 )
 
+_GITHUB_ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*\Z")
+_GITHUB_ENV_FORBIDDEN_VALUE_CHARS = ("\n", "\r", "\x00")
+
 _REQUIRED_TAG_KEYS = (
     "applicationName", "businessCriticality", "businessUnit", "businessUnitOwner",
     "costCenter", "mapMigrated", "requestReference", "dataClassification",
@@ -348,6 +351,23 @@ def derive_values(doc):
         "TAG_DATA_CLASSIFICATION": tags["dataClassification"],
     }
     return values
+
+
+def format_github_env(values):
+    """The single trust boundary between derive_values() and any GITHUB_ENV consumer: validates every name/value pair BEFORE returning anything, so a single unsafe derived value can never manufacture a second, independent GITHUB_ENV record via an embedded line break -- these are single-line infrastructure identity values, never multiline documents, so a bare CR/LF/NUL is rejected outright rather than stripped or normalized. Raises ValueError (never partially formats) naming only the offending KEY, never its value. Returns deterministic 'KEY=value' lines sorted by key -- byte-for-byte identical to the prior unvalidated output for every currently valid environment.yaml."""
+    problems = []
+    for key, value in values.items():
+        if not isinstance(key, str) or not _GITHUB_ENV_NAME_RE.match(key):
+            problems.append(f"{key!r} is not a safe GITHUB_ENV variable name")
+            continue
+        if not isinstance(value, str):
+            problems.append(f"{key!r} value is not a string (got {type(value).__name__})")
+            continue
+        if any(forbidden in value for forbidden in _GITHUB_ENV_FORBIDDEN_VALUE_CHARS):
+            problems.append(f"{key!r} contains a forbidden line-break/control character")
+    if problems:
+        raise ValueError("; ".join(problems))
+    return [f"{key}={values[key]}" for key in sorted(values)]
 
 
 # --- IAM policy generation (Phase 4/16): environment.yaml -> generated policy_folder JSON artifacts. ---
@@ -705,12 +725,13 @@ def cmd_get(args):
 def cmd_github_env(args):
     try:
         doc = load_environment_config(args.environment)
+        values = derive_values(doc)
+        lines = format_github_env(values)
     except ValueError as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1
-    values = derive_values(doc)
-    for key in sorted(values):
-        print(f"{key}={values[key]}")
+    for line in lines:
+        print(line)
     return 0
 
 

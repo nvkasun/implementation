@@ -16141,6 +16141,135 @@ else
 fi
 
 echo ""
+echo "--- Canonical github-env producer hardening: automation/goldengate-environment.py fails closed on CR/LF/NUL before any GITHUB_ENV emission (assertions A-J) ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$ENVIRONMENT_TOOL" ] && [ -f "$PHASE1_TOOL" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$SUB_IAM_SECRETS_WORKFLOW" ]; then
+  set +e
+  GITHUB_ENV_PRODUCER_OUT="$(python3 - "$ENVIRONMENT_TOOL" "$PHASE1_TOOL" "$EKS_APP_WORKFLOW" "$SUB_IAM_SECRETS_WORKFLOW" <<'PYEOF'
+import glob
+import importlib.util
+import inspect
+import re
+import sys
+
+import yaml
+
+environment_tool_path, phase1_tool_path, main_path, sub_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+
+
+def load_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+ge = load_module("goldengate_environment_static_check", environment_tool_path)
+p1 = load_module("phase1_readiness_env_static_check", phase1_tool_path)
+
+results = []
+
+
+def check(label, ok):
+    results.append((label, ok))
+
+
+cmd_github_env_src = inspect.getsource(ge.cmd_github_env)
+
+# A: cmd_github_env no longer directly does an unvalidated print(f"{key}={values[key]}") loop.
+check("A: cmd_github_env no longer contains an unvalidated print(f\"{key}=...\") loop", 'print(f"{key}={values[key]}")' not in cmd_github_env_src)
+
+# B: every github-env value passes through one central serializer/validator (format_github_env), called exactly once from cmd_github_env.
+check("B: cmd_github_env calls the central format_github_env() serializer", "format_github_env(" in cmd_github_env_src)
+check("B: format_github_env exists as a real, callable function", callable(getattr(ge, "format_github_env", None)))
+
+# C/D: the serializer rejects CR, LF, and NUL (behavioral, not textual).
+for bad_char, label in (("\n", "LF"), ("\r", "CR"), ("\x00", "NUL")):
+    rejected = False
+    try:
+        ge.format_github_env({"SAMPLE_KEY": f"a{bad_char}b"})
+    except ValueError:
+        rejected = True
+    check(f"C/D: format_github_env rejects a value containing {label}", rejected)
+
+# E: the serializer validates output names against the safe pattern.
+name_rejected = False
+try:
+    ge.format_github_env({"not a safe name!": "value"})
+except ValueError:
+    name_rejected = True
+check("E: format_github_env rejects an unsafe output variable name", name_rejected)
+check("E: format_github_env accepts the canonical safe-name pattern", ge.format_github_env({"SAFE_NAME_1": "value"}) == ["SAFE_NAME_1=value"])
+
+# F: validation happens before stdout emission -- an unsafe key sorted AFTER a safe one must still suppress the safe one too.
+partial_leak = False
+try:
+    ge.format_github_env({"AAAA_SAFE": "ok", "ZZZZ_UNSAFE": "bad\nvalue"})
+except ValueError:
+    partial_leak = False
+else:
+    partial_leak = True
+check("F: format_github_env validates every pair before returning anything (no partial emission)", not partial_leak)
+
+# G: no active workflow has introduced an independent environment.yaml parser -- specifically, no open(...)/yaml.load(...) call whose OWN argument names an environment.yaml path (a mere prose comment mentioning "envs/<environment>/environment.yaml" as the origin of an already-resolved value, e.g. 40-sub-observability.yaml's Helm-values generator, is not a second parser and must not false-positive here).
+independent_parser_re = re.compile(r"(?:open|yaml\.(?:safe_load|load))\([^)]*environment\.yaml")
+independent_parser_hits = []
+for wf_path in sorted(glob.glob(".github/workflows/*.yaml")):
+    with open(wf_path) as f:
+        wf_doc = yaml.safe_load(f)
+    for job in (wf_doc.get("jobs") or {}).values():
+        if not isinstance(job, dict):
+            continue
+        for step in job.get("steps", []) or []:
+            run_text = step.get("run")
+            if isinstance(run_text, str) and independent_parser_re.search(run_text):
+                independent_parser_hits.append(wf_path)
+check("G: no active workflow run: block opens/parses an environment.yaml path independently of automation/goldengate-environment.py", not independent_parser_hits)
+
+# H: every active workflow github-env call site still points at automation/goldengate-environment.py.
+stray_github_env_hits = []
+for wf_path in sorted(glob.glob(".github/workflows/*.yaml")):
+    with open(wf_path) as f:
+        wf_text = f.read()
+    for line in wf_text.splitlines():
+        if "github-env" in line and "goldengate-environment.py" not in line:
+            stray_github_env_hits.append((wf_path, line.strip()))
+check("H: every active workflow github-env call site still invokes automation/goldengate-environment.py", not stray_github_env_hits)
+
+# I: Phase 1 append_github_env_raw validates the raw canonical payload before writing (structural: calls its own validator before ever opening the file).
+append_raw_src = inspect.getsource(p1.append_github_env_raw)
+check("I: append_github_env_raw calls its validator before opening the GITHUB_ENV file", append_raw_src.index("_validate_github_env_raw_text(") < append_raw_src.index('open(path'))
+
+# J: workflow topology is unchanged (job counts/ids untouched by this producer-level fix).
+with open(main_path) as f:
+    main_doc = yaml.safe_load(f)
+with open(sub_path) as f:
+    sub_doc = yaml.safe_load(f)
+check("J: MAIN still has exactly 26 jobs", len(main_doc.get("jobs", {})) == 26)
+check("J: MAIN still defines validate_model and terraform_sync_once", {"validate_model", "terraform_sync_once"} <= set(main_doc.get("jobs", {}).keys()))
+check("J: 10-sub-iam-secrets.yaml still defines exactly validate_environment_config and apply", set(sub_doc.get("jobs", {}).keys()) == {"validate_environment_config", "apply"})
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  GITHUB_ENV_PRODUCER_STATUS=$?
+  set -e
+  if [ "$GITHUB_ENV_PRODUCER_STATUS" -ne 0 ]; then
+    fail "Canonical github-env producer hardening (A-J): assertion script errored:"$'\n'"${GITHUB_ENV_PRODUCER_OUT}"
+  else
+    while IFS= read -r line; do
+      case "$line" in
+        FAIL\ *) fail "Canonical github-env producer hardening (A-J): ${line#FAIL }" ;;
+        OK\ *) pass "Canonical github-env producer hardening (A-J): ${line#OK }" ;;
+      esac
+    done <<< "$GITHUB_ENV_PRODUCER_OUT"
+  fi
+else
+  skip "Canonical github-env producer hardening (A-J) -- python3/PyYAML unavailable or tool/workflow files missing"
+fi
+
+echo ""
 echo "--- Final repository handoff hygiene sweep (VDR pre-transfer cleanliness) ---"
 
 # This is the LAST check in the suite, deliberately: earlier sections legitimately regenerate work/generated/dev/goldengate-deployments.yaml (the folder-driven registry-generation checks) as their own tested behavior -- asserting its absence any earlier would be a self-defeating mid-test assertion. Self-heal only the categories PROVEN elsewhere in this suite to be pure, expected byproducts of exercising real application/tooling behavior (never silently deleting anything whose origin is unknown); everything else must already be absent, or this check fails closed and reports it for a human to investigate before VDR handoff.
