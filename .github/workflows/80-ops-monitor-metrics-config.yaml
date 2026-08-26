@@ -40,10 +40,10 @@ permissions:
   id-token: write
   contents: read
 
-# Environment identity is loaded via hack/goldengate-environment.py github-env after checkout, strictly before AWS credentials are configured.
+# Environment identity is loaded via automation/goldengate-environment.py github-env after checkout, strictly before AWS credentials are configured.
 env:
   MONITOR_SERVICE_ACCOUNT: gg-monitor
-  METRICS_CONFIG_HELPER: hack/goldengate-metrics-config.py
+  METRICS_CONFIG_HELPER: automation/goldengate-metrics-config.py
 
 concurrency:
   group: goldengate-monitor-metrics-config-${{ github.ref }}-${{ inputs.deployment_name }}
@@ -66,11 +66,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" validate
-          python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" github-env >> "$GITHUB_ENV"
+          python3 automation/goldengate-environment.py --environment "${{ inputs.environment }}" validate
+          python3 automation/goldengate-environment.py --environment "${{ inputs.environment }}" github-env >> "$GITHUB_ENV"
 
           # TARGET_NAMESPACE/CANONICAL_REGISTRY are derived from the canonical GG_ENVIRONMENT/MONITOR_NAMESPACE, never independent literals.
-          echo "TARGET_NAMESPACE=$(python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" get MONITOR_NAMESPACE)" >> "$GITHUB_ENV"
+          echo "TARGET_NAMESPACE=$(python3 automation/goldengate-environment.py --environment "${{ inputs.environment }}" get MONITOR_NAMESPACE)" >> "$GITHUB_ENV"
           echo "CANONICAL_REGISTRY=work/generated/${{ inputs.environment }}/goldengate-deployments.yaml" >> "$GITHUB_ENV"
 
       - name: Configure AWS credentials
@@ -99,7 +99,7 @@ jobs:
           python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
 
           mkdir -p "$(dirname "$CANONICAL_REGISTRY")"
-          python3 hack/goldengate-deployment-model.py --environment "${{ inputs.environment }}" registry --output "$CANONICAL_REGISTRY"
+          python3 automation/goldengate-deployment-model.py --environment "${{ inputs.environment }}" registry --output "$CANONICAL_REGISTRY"
           echo "Generated registry:"
           cat "$CANONICAL_REGISTRY"
 

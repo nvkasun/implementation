@@ -28,7 +28,7 @@ permissions:
   id-token: write
   contents: read
 
-# Environment identity is loaded via hack/goldengate-environment.py github-env after checkout, never duplicated here.
+# Environment identity is loaded via automation/goldengate-environment.py github-env after checkout, never duplicated here.
 env:
   HELM_OCI_NAMESPACE: helm
   CHART_NAME: argocd
@@ -78,8 +78,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" validate
-          python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" github-env >> "$GITHUB_ENV"
+          python3 automation/goldengate-environment.py --environment "${{ inputs.environment }}" validate
+          python3 automation/goldengate-environment.py --environment "${{ inputs.environment }}" github-env >> "$GITHUB_ENV"
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -253,7 +253,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Static check (no AWS calls) that the ECR read policy grants pull access via an exact ARN match per repository, not a wildcard. Folder name follows the generator's policy_folder = "argocd-ecr-oci-read-<environment>" naming contract (hack/goldengate-environment.py _IRSA_ROLE_FOLDERS) -- never a second hardcoded environment literal.
+          # Static check (no AWS calls) that the ECR read policy grants pull access via an exact ARN match per repository, not a wildcard. Folder name follows the generator's policy_folder = "argocd-ecr-oci-read-<environment>" naming contract (automation/goldengate-environment.py _IRSA_ROLE_FOLDERS) -- never a second hardcoded environment literal.
           POLICY_FILE="envs/${GG_ENVIRONMENT}/policies/argocd-ecr-oci-read-${GG_ENVIRONMENT}/policies/policies_1.json"
 
           if [ ! -f "$POLICY_FILE" ]; then

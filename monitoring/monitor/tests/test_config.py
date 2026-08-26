@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config as cfgmod
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-DEPLOYMENT_MODEL_TOOL_PATH = os.path.join(REPO_ROOT, "hack", "goldengate-deployment-model.py")
+DEPLOYMENT_MODEL_TOOL_PATH = os.path.join(REPO_ROOT, "automation", "goldengate-deployment-model.py")
 
 
 def write_deployments_yaml(root, content):

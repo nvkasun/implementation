@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 MONITOR_WORKFLOW_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "50-sub-monitor.yaml")
 ARGOCD_WORKFLOW_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "20-sub-argocd.yaml")
-DEPLOYMENT_MODEL_TOOL_PATH = os.path.join(REPO_ROOT, "hack", "goldengate-deployment-model.py")
+DEPLOYMENT_MODEL_TOOL_PATH = os.path.join(REPO_ROOT, "automation", "goldengate-deployment-model.py")
 
 
 def _generate_registry_document(environment="dev"):
@@ -428,7 +428,7 @@ def _entry(**overrides):
 
 
 class RuntimeConsoleUrlTopologyTests(unittest.TestCase):
-    """"Open GoldenGate UI" data path: config.load_deployments()'s ingressEnabled/ingressHost/consoleUrl derivation, proven against the REAL generated registry (hack/goldengate-deployment-model.py) -- config.py consumes the registry's own canonically-resolved ingressHost verbatim, it never reconstructs "<name>.<dnsDomain>" itself."""
+    """"Open GoldenGate UI" data path: config.load_deployments()'s ingressEnabled/ingressHost/consoleUrl derivation, proven against the REAL generated registry (automation/goldengate-deployment-model.py) -- config.py consumes the registry's own canonically-resolved ingressHost verbatim, it never reconstructs "<name>.<dnsDomain>" itself."""
 
     @classmethod
     def setUpClass(cls):
@@ -501,7 +501,7 @@ class RuntimeConsoleUrlTopologyTests(unittest.TestCase):
                     cfgmod.load_deployments(d)
 
     def test_i_missing_ingressEnabled_fails_configuration_validation(self):
-        # The generated registry now guarantees ingressEnabled is always present (hack/goldengate-deployment-model.py's build_registry()) -- a missing key is therefore treated as malformed canonical topology and fails closed, never silently defaulted to False.
+        # The generated registry now guarantees ingressEnabled is always present (automation/goldengate-deployment-model.py's build_registry()) -- a missing key is therefore treated as malformed canonical topology and fails closed, never silently defaulted to False.
         entry = _entry()
         del entry["ingressEnabled"]
         d = _stage_doc(_registry_doc([entry]))
@@ -521,7 +521,7 @@ class RuntimeConsoleUrlTopologyTests(unittest.TestCase):
                     cfgmod.load_deployments(d)
 
     def test_b_explicit_hostname_override_is_carried_through_verbatim(self):
-        # config.py never reconstructs the hostname -- it only consumes whatever ingressHost the registry already carries, whether that is the "<name>.<dnsDomain>" default or an explicit hack/goldengate-deployment-model.py-resolved override.
+        # config.py never reconstructs the hostname -- it only consumes whatever ingressHost the registry already carries, whether that is the "<name>.<dnsDomain>" default or an explicit automation/goldengate-deployment-model.py-resolved override.
         d = _stage_doc(_registry_doc([_entry(ingressHost="custom-runtime.example.internal")]))
         loaded = cfgmod.load_deployments(d)
         self.assertEqual(loaded["deployments"][0]["ingressHost"], "custom-runtime.example.internal")
@@ -2103,19 +2103,19 @@ _MONITOR_RENDER_IDENTITY_REQUIRED_KEYS = (
 
 
 def _monitor_render_identity():
-    """The SAME canonical shared-environment identity the real deploy workflow (.github/workflows/50-sub-monitor.yaml) injects via --set-string, resolved from the ONE canonical source (hack/goldengate-environment.py --environment dev github-env) -- never a second independent derivation of envs/dev/environment.yaml, and never a hardcoded DEV literal committed here. Every real monitor-chart Helm render in this module (envs/dev/goldengate-monitor/values.yaml now commits ingress.enabled=true) must supply this identity or the chart's own fail-closed ingress.host/ingress.alb.certificateArn guards correctly abort rendering. Cached per test process: the resolver's output is a pure function of the committed envs/dev/environment.yaml, so re-invoking it for every render is unnecessary."""
+    """The SAME canonical shared-environment identity the real deploy workflow (.github/workflows/50-sub-monitor.yaml) injects via --set-string, resolved from the ONE canonical source (automation/goldengate-environment.py --environment dev github-env) -- never a second independent derivation of envs/dev/environment.yaml, and never a hardcoded DEV literal committed here. Every real monitor-chart Helm render in this module (envs/dev/goldengate-monitor/values.yaml now commits ingress.enabled=true) must supply this identity or the chart's own fail-closed ingress.host/ingress.alb.certificateArn guards correctly abort rendering. Cached per test process: the resolver's output is a pure function of the committed envs/dev/environment.yaml, so re-invoking it for every render is unnecessary."""
     global _MONITOR_RENDER_IDENTITY_CACHE
     if _MONITOR_RENDER_IDENTITY_CACHE is not None:
         return _MONITOR_RENDER_IDENTITY_CACHE
 
-    resolver_script = os.path.join(REPO_ROOT, "hack", "goldengate-environment.py")
+    resolver_script = os.path.join(REPO_ROOT, "automation", "goldengate-environment.py")
     proc = subprocess.run(
         [sys.executable, resolver_script, "--environment", "dev", "github-env"],
         capture_output=True, text=True, cwd=REPO_ROOT,
     )
     if proc.returncode != 0:
         raise AssertionError(
-            f"hack/goldengate-environment.py --environment dev github-env failed (rc={proc.returncode}):\n{proc.stdout}\n{proc.stderr}"
+            f"automation/goldengate-environment.py --environment dev github-env failed (rc={proc.returncode}):\n{proc.stdout}\n{proc.stderr}"
         )
 
     resolved = {}
@@ -2128,7 +2128,7 @@ def _monitor_render_identity():
     missing = [key for key in _MONITOR_RENDER_IDENTITY_REQUIRED_KEYS if key not in resolved]
     if missing:
         raise AssertionError(
-            f"hack/goldengate-environment.py --environment dev github-env output is missing required key(s) {missing!r}; full output:\n{proc.stdout}"
+            f"automation/goldengate-environment.py --environment dev github-env output is missing required key(s) {missing!r}; full output:\n{proc.stdout}"
         )
 
     _MONITOR_RENDER_IDENTITY_CACHE = resolved
@@ -2274,7 +2274,7 @@ class SecretProviderClassRenderTests(unittest.TestCase):
 
 
 class MonitorIngressResolverIdentityRenderTests(unittest.TestCase):
-    """Regression for the monitor unit-test Helm rendering fix: envs/dev/goldengate-monitor/values.yaml intentionally commits ingress.enabled=true and deliberately does NOT duplicate shared environment identity (ingress.host/ingress.alb.groupName/ingress.alb.certificateArn) -- that identity must come from the SAME canonical resolver (hack/goldengate-environment.py) the real deploy workflow uses. Consumes _monitor_render_identity()/_render_monitor_chart() directly -- never a second independent derivation or a hardcoded expected literal -- so this test can never silently drift from the real render inputs it is proving."""
+    """Regression for the monitor unit-test Helm rendering fix: envs/dev/goldengate-monitor/values.yaml intentionally commits ingress.enabled=true and deliberately does NOT duplicate shared environment identity (ingress.host/ingress.alb.groupName/ingress.alb.certificateArn) -- that identity must come from the SAME canonical resolver (automation/goldengate-environment.py) the real deploy workflow uses. Consumes _monitor_render_identity()/_render_monitor_chart() directly -- never a second independent derivation or a hardcoded expected literal -- so this test can never silently drift from the real render inputs it is proving."""
 
     @classmethod
     def setUpClass(cls):
@@ -3241,7 +3241,7 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         self.assertNotIn("echo \"$POD_NAME\" -o json", detect_step_text)
 
     def test_preflight_pod_selection_verifies_ownership_chain(self):
-        # This only proves the Deployment/ReplicaSet ownership-chain properties are textually present (static analysis); the full functional proof (mocked kubectl/jq scenarios) lives in hack/test-goldengate-metrics-config.py::MainWorkflowPodOwnershipTests. Phase B3B moved this logic into its own "Detect an existing Ready gg-monitor pod (bootstrap-safe)" step (and it is reused, byte-for-byte, in the "Bootstrap/repair path" step further down).
+        # This only proves the Deployment/ReplicaSet ownership-chain properties are textually present (static analysis); the full functional proof (mocked kubectl/jq scenarios) lives in automation/test-goldengate-metrics-config.py::MainWorkflowPodOwnershipTests. Phase B3B moved this logic into its own "Detect an existing Ready gg-monitor pod (bootstrap-safe)" step (and it is reused, byte-for-byte, in the "Bootstrap/repair path" step further down).
         detect_step_text = self.monitor_text[
             self.monitor_text.index("- name: Detect an existing Ready gg-monitor pod (bootstrap-safe)"):
             self.monitor_text.index("- name: Fast-path CloudWatch publication preflight")]

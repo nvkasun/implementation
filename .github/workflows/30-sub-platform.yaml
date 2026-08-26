@@ -39,7 +39,7 @@ permissions:
   id-token: write
   contents: read
 
-# Environment identity is loaded via hack/goldengate-environment.py github-env after checkout, never duplicated here.
+# Environment identity is loaded via automation/goldengate-environment.py github-env after checkout, never duplicated here.
 env:
   HELM_OCI_NAMESPACE: helm
   CHART_NAME: goldengate-platform
@@ -96,8 +96,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" validate
-          python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" github-env >> "$GITHUB_ENV"
+          python3 automation/goldengate-environment.py --environment "${{ inputs.environment }}" validate
+          python3 automation/goldengate-environment.py --environment "${{ inputs.environment }}" github-env >> "$GITHUB_ENV"
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4

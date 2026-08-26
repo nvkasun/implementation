@@ -1,4 +1,4 @@
-# Folder-driven GoldenGate deployment inventory (mirrors hack/goldengate-deployment-model.py); every consumer reads these locals, never the folder tree directly.
+# Folder-driven GoldenGate deployment inventory (mirrors automation/goldengate-deployment-model.py); every consumer reads these locals, never the folder tree directly.
 
 variable "environment" {
   description = "GoldenGate environment identifier for this root module; must match the envs/<environment> folder this file lives in."
@@ -55,7 +55,7 @@ locals {
     for id, doc in local.goldengate_runtime_documents : id => try(doc.runtime.deploymentType, "")
   }
 
-  # Phase 6D1 replication contract: structural gates only, mirroring hack/goldengate-deployment-model.py; never REST reconciliation logic.
+  # Phase 6D1 replication contract: structural gates only, mirroring automation/goldengate-deployment-model.py; never REST reconciliation logic.
   goldengate_replication_enabled_raw = {
     for id, doc in local.goldengate_runtime_documents : id => try(doc.replication.enabled, false) == true
   }
@@ -105,7 +105,7 @@ locals {
   goldengate_replication_distribution_target_raw    = { for id, doc in local.goldengate_runtime_documents : id => try(doc.replication.distribution.targetDeployment, "") }
   goldengate_replication_checkpoint_table_raw       = { for id, doc in local.goldengate_runtime_documents : id => try(doc.replication.checkpoint.table, "") }
 
-  # EFS storage cardinality contract: one runtime deployment = one dedicated EFS filesystem, never one shared between source/target. Mirrors hack/goldengate-deployment-model.py's _parse_efs; never a second inventory implementation, only its Terraform-side precondition mirror.
+  # EFS storage cardinality contract: one runtime deployment = one dedicated EFS filesystem, never one shared between source/target. Mirrors automation/goldengate-deployment-model.py's _parse_efs; never a second inventory implementation, only its Terraform-side precondition mirror.
   goldengate_persistence_declared = {
     for id, doc in local.goldengate_runtime_documents : id => try(doc.persistence, null) != null
   }
@@ -198,7 +198,7 @@ locals {
 
   goldengate_tls_secret_name = local.gg_env_tls_secret_name
 
-  # The permanent, stable self-service runtime identity: every singleRuntime deployment of every deploymentType (including future ones) shares this ONE IRSA subject, so onboarding a new engine never requires an IAM trust-policy edit -- deploymentType controls image/product/ports/replication semantics, never AWS runtime identity. Never derived from the folder inventory -- it is a platform invariant, not a per-type/per-count value. This is a fresh EKS cluster: there is no migration-compatibility trust to preserve, so this is the ONLY approved runtime trust subject. Mirrors hack/goldengate-deployment-model.py's resolve_runtime_service_account().
+  # The permanent, stable self-service runtime identity: every singleRuntime deployment of every deploymentType (including future ones) shares this ONE IRSA subject, so onboarding a new engine never requires an IAM trust-policy edit -- deploymentType controls image/product/ports/replication semantics, never AWS runtime identity. Never derived from the folder inventory -- it is a platform invariant, not a per-type/per-count value. This is a fresh EKS cluster: there is no migration-compatibility trust to preserve, so this is the ONLY approved runtime trust subject. Mirrors automation/goldengate-deployment-model.py's resolve_runtime_service_account().
   goldengate_canonical_runtime_trust_subject = "system:serviceaccount:${local.goldengate_shared_environment.runtimeNamespace}:gg-runtime-sa"
 
   goldengate_secrets_trust_policy = jsondecode(file("${path.module}/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json"))
@@ -293,17 +293,17 @@ resource "terraform_data" "goldengate_runtime_contract" {
       error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.csi.serviceAccountRoleArn is a forbidden override -- it is a shared platform invariant."
     }
     precondition {
-      # GoldenGate Runtime Desired-State Simplification: lifecycle.state is retired as a second runtime-presence source of truth -- deployment.enabled is now the ONLY authoritative control, so a descriptor still carrying a lifecycle block is rejected outright (mirrors hack/goldengate-deployment-model.py's _reject_lifecycle_presence_control), never silently reinterpreted. GoldenGate Runtime Presence Contract -- Final Safety Correction: key-presence based (contains(keys(...), "lifecycle")), never try(each.value.lifecycle, null) == null -- that null-tolerant form incorrectly treats a PRESENT key with a null value (`lifecycle: null`) as equivalent to the key being absent entirely, since yamldecode() still includes a null-valued key in the decoded object's own keys(). The contract is that the key must not be present at all, present-with-null included.
+      # GoldenGate Runtime Desired-State Simplification: lifecycle.state is retired as a second runtime-presence source of truth -- deployment.enabled is now the ONLY authoritative control, so a descriptor still carrying a lifecycle block is rejected outright (mirrors automation/goldengate-deployment-model.py's _reject_lifecycle_presence_control), never silently reinterpreted. GoldenGate Runtime Presence Contract -- Final Safety Correction: key-presence based (contains(keys(...), "lifecycle")), never try(each.value.lifecycle, null) == null -- that null-tolerant form incorrectly treats a PRESENT key with a null value (`lifecycle: null`) as equivalent to the key being absent entirely, since yamldecode() still includes a null-valued key in the decoded object's own keys(). The contract is that the key must not be present at all, present-with-null included.
       condition     = !try(contains(keys(each.value), "lifecycle"), false)
       error_message = "envs/${var.environment}/${each.key}/values.yaml: lifecycle.state is no longer supported for runtime presence; use deployment.enabled only."
     }
     precondition {
-      # GoldenGate Runtime Presence Contract Finalization: a legacy descriptor-root `enabled:` key (outside deployment.enabled) is a second, potentially contradictory runtime-presence signal -- rejected outright here too, mirroring hack/goldengate-deployment-model.py's _reject_root_level_enabled. Never fires for nested `enabled` fields belonging to other components (ingress.enabled, persistence.enabled, replication.enabled, etc.) since those are different mapping keys entirely. GoldenGate Runtime Presence Contract -- Final Safety Correction: key-presence based, so `enabled: null` at the descriptor root is rejected exactly like `enabled: true`/`enabled: false` -- see the lifecycle precondition above for why a null-tolerant try(...) == null form is wrong here.
+      # GoldenGate Runtime Presence Contract Finalization: a legacy descriptor-root `enabled:` key (outside deployment.enabled) is a second, potentially contradictory runtime-presence signal -- rejected outright here too, mirroring automation/goldengate-deployment-model.py's _reject_root_level_enabled. Never fires for nested `enabled` fields belonging to other components (ingress.enabled, persistence.enabled, replication.enabled, etc.) since those are different mapping keys entirely. GoldenGate Runtime Presence Contract -- Final Safety Correction: key-presence based, so `enabled: null` at the descriptor root is rejected exactly like `enabled: true`/`enabled: false` -- see the lifecycle precondition above for why a null-tolerant try(...) == null form is wrong here.
       condition     = !try(contains(keys(each.value), "enabled"), false)
       error_message = "envs/${var.environment}/${each.key}/values.yaml: root-level enabled is no longer supported; use deployment.enabled only."
     }
     precondition {
-      # GoldenGate Runtime Presence Contract Finalization: runtime.enabled was a second, chart-level runtime-presence switch that could silently contradict deployment.enabled -- it is no longer part of the schema at all and is rejected outright here too, mirroring hack/goldengate-deployment-model.py's _reject_runtime_enabled_presence_control. Nested feature flags such as runtime.csi.enabled are untouched -- only runtime's own `enabled` key is prohibited. GoldenGate Runtime Presence Contract -- Final Safety Correction: key-presence based, so `runtime.enabled: null` is rejected exactly like a literal true/false value -- see the lifecycle precondition above for why a null-tolerant try(...) == null form is wrong here.
+      # GoldenGate Runtime Presence Contract Finalization: runtime.enabled was a second, chart-level runtime-presence switch that could silently contradict deployment.enabled -- it is no longer part of the schema at all and is rejected outright here too, mirroring automation/goldengate-deployment-model.py's _reject_runtime_enabled_presence_control. Nested feature flags such as runtime.csi.enabled are untouched -- only runtime's own `enabled` key is prohibited. GoldenGate Runtime Presence Contract -- Final Safety Correction: key-presence based, so `runtime.enabled: null` is rejected exactly like a literal true/false value -- see the lifecycle precondition above for why a null-tolerant try(...) == null form is wrong here.
       condition     = !try(contains(keys(each.value.runtime), "enabled"), false)
       error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.enabled is no longer supported as a runtime presence control; use deployment.enabled only."
     }

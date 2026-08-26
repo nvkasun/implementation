@@ -18,7 +18,7 @@ permissions:
   id-token: write
   contents: read
 
-# Environment identity is loaded via hack/goldengate-environment.py github-env after checkout, never duplicated here.
+# Environment identity is loaded via automation/goldengate-environment.py github-env after checkout, never duplicated here.
 env:
   UPSTREAM_CHART_REPO_NAME: aws-observability  # pinned version below; never "latest"
   UPSTREAM_CHART_REPO_URL: https://aws-observability.github.io/helm-charts
@@ -52,8 +52,8 @@ jobs:
 
           # ubuntu-latest does not guarantee PyYAML; install it explicitly rather than assume it, same as elsewhere in this repo.
           python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
-          python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" validate
-          python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" github-env >> "$GITHUB_ENV"
+          python3 automation/goldengate-environment.py --environment "${{ inputs.environment }}" validate
+          python3 automation/goldengate-environment.py --environment "${{ inputs.environment }}" github-env >> "$GITHUB_ENV"
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4

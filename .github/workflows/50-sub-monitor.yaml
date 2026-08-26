@@ -74,7 +74,7 @@ permissions:
   id-token: write
   contents: read
 
-# Environment identity is loaded per-job via hack/goldengate-environment.py github-env after checkout (GITHUB_ENV is job-local: ensure_monitor_image and build_publish_and_deploy each load it independently), never duplicated here.
+# Environment identity is loaded per-job via automation/goldengate-environment.py github-env after checkout (GITHUB_ENV is job-local: ensure_monitor_image and build_publish_and_deploy each load it independently), never duplicated here.
 env:
   MONITOR_SOURCE_PATH: monitoring/monitor
   MONITOR_ECR_REPOSITORY: goldengate-monitor
@@ -142,8 +142,8 @@ jobs:
 
           # ubuntu-latest does not guarantee PyYAML; install it explicitly rather than assume it, same as elsewhere in this repo.
           python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
-          python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" validate
-          python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" github-env >> "$GITHUB_ENV"
+          python3 automation/goldengate-environment.py --environment "${{ inputs.environment }}" validate
+          python3 automation/goldengate-environment.py --environment "${{ inputs.environment }}" github-env >> "$GITHUB_ENV"
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -533,11 +533,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" validate
-          python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" github-env >> "$GITHUB_ENV"
+          python3 automation/goldengate-environment.py --environment "${{ inputs.environment }}" validate
+          python3 automation/goldengate-environment.py --environment "${{ inputs.environment }}" github-env >> "$GITHUB_ENV"
 
           # TARGET_NAMESPACE is the render/deploy path's namespace identity; it must resolve to the canonical MONITOR_NAMESPACE, never an independent workflow-level literal.
-          echo "TARGET_NAMESPACE=$(python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" get MONITOR_NAMESPACE)" >> "$GITHUB_ENV"
+          echo "TARGET_NAMESPACE=$(python3 automation/goldengate-environment.py --environment "${{ inputs.environment }}" get MONITOR_NAMESPACE)" >> "$GITHUB_ENV"
 
           # VALUES_FILE/GENERATED_REGISTRY_PATH are derived from the canonical GG_ENVIRONMENT, never independently maintained per-environment literals.
           echo "VALUES_FILE=envs/${{ inputs.environment }}/goldengate-monitor/values.yaml" >> "$GITHUB_ENV"
@@ -660,7 +660,7 @@ jobs:
           python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
 
           mkdir -p "$(dirname "$GENERATED_REGISTRY_PATH")"
-          python3 hack/goldengate-deployment-model.py --environment "${{ inputs.environment }}" registry --output "$GENERATED_REGISTRY_PATH"
+          python3 automation/goldengate-deployment-model.py --environment "${{ inputs.environment }}" registry --output "$GENERATED_REGISTRY_PATH"
           echo "Generated registry:"
           cat "$GENERATED_REGISTRY_PATH"
 

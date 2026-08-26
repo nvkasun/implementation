@@ -39,7 +39,7 @@ permissions:
   id-token: write
   contents: read
 
-# Environment identity is loaded via hack/goldengate-environment.py github-env after checkout, never duplicated here.
+# Environment identity is loaded via automation/goldengate-environment.py github-env after checkout, never duplicated here.
 env:
   # Pinned private chart (Phase 6B1). Never the public chart, never "latest".
   HELM_OCI_NAMESPACE: helm
@@ -98,12 +98,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" validate
-          python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" github-env >> "$GITHUB_ENV"
+          python3 automation/goldengate-environment.py --environment "${{ inputs.environment }}" validate
+          python3 automation/goldengate-environment.py --environment "${{ inputs.environment }}" github-env >> "$GITHUB_ENV"
 
           # VALUES_FILE/TARGET_NAMESPACE are derived from the canonical GG_ENVIRONMENT/OBSERVABILITY_NAMESPACE, never independent literals.
           echo "VALUES_FILE=platform/${{ inputs.environment }}/goldengate-observability/values.yaml" >> "$GITHUB_ENV"
-          echo "TARGET_NAMESPACE=$(python3 hack/goldengate-environment.py --environment "${{ inputs.environment }}" get OBSERVABILITY_NAMESPACE)" >> "$GITHUB_ENV"
+          echo "TARGET_NAMESPACE=$(python3 automation/goldengate-environment.py --environment "${{ inputs.environment }}" get OBSERVABILITY_NAMESPACE)" >> "$GITHUB_ENV"
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
