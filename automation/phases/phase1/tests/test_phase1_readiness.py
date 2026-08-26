@@ -61,6 +61,31 @@ def _assume_role_ok(access_key="FAKE_ACCESS_KEY_ID", secret_key="FAKE_SECRET_ACC
     return _ok(json.dumps(creds))
 
 
+def _parse_github_special_file(path):
+    """Parses a GITHUB_OUTPUT/GITHUB_ENV-shaped file, heredoc form included, using splitlines() -- which (unlike plain "\\n"-only splitting) recognizes LF, CRLF, and bare CR as line breaks, exactly like GitHub's own line-oriented special-file parser. Using anything narrower here would hide the bare-CR injection this suite specifically guards against."""
+    if not Path(path).exists():
+        return {}
+    text = Path(path).read_text(encoding="utf-8")
+    lines = text.splitlines()
+    pairs = {}
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if "<<" in line:
+            key, delimiter = line.split("<<", 1)
+            i += 1
+            buf = []
+            while i < len(lines) and lines[i] != delimiter:
+                buf.append(lines[i])
+                i += 1
+            pairs[key] = "\n".join(buf)
+        elif "=" in line:
+            key, _, value = line.partition("=")
+            pairs[key] = value
+        i += 1
+    return pairs
+
+
 class Phase1TestCase(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -93,7 +118,10 @@ class Phase1TestCase(unittest.TestCase):
         return p1.load_state(self.state_path)
 
     def read_outputs(self):
-        return p1.read_output_file(self.github_output)
+        return _parse_github_special_file(self.github_output)
+
+    def read_env(self):
+        return _parse_github_special_file(self.github_env)
 
 
 class TestEnvironmentResolution(Phase1TestCase):
@@ -404,6 +432,83 @@ class TestOutputWriterFidelity(Phase1TestCase):
         outputs = self.read_outputs()
         self.assertEqual(outputs["deployment_matrix"], tricky_value)
         self.assertEqual(json.loads(outputs["deployment_matrix"]), json.loads(tricky_value))
+
+
+class TestGithubSpecialFileInjectionHardening(Phase1TestCase):
+    """Reproduces and guards against the bare-CR and fixed-delimiter special-file injection findings for write_github_output()/append_github_env() -- a caller-supplied value (e.g. the manual workflow_dispatch governance reason) must never be able to smuggle a second, independent NAME=value output/env fragment."""
+
+    def test_write_github_output_bare_cr_cannot_inject_a_second_output(self):
+        malicious = "approved\rrogue_output=injected"
+        p1.write_github_output([("terraform_governance_override_reason", malicious)])
+        outputs = self.read_outputs()
+        self.assertNotIn("rogue_output", outputs)
+        self.assertEqual(set(outputs.keys()), {"terraform_governance_override_reason"})
+
+    def test_write_github_output_crlf_cannot_inject_a_second_output(self):
+        malicious = "line one\r\nrogue_output=injected"
+        p1.write_github_output([("terraform_governance_override_reason", malicious)])
+        outputs = self.read_outputs()
+        self.assertNotIn("rogue_output", outputs)
+        self.assertEqual(set(outputs.keys()), {"terraform_governance_override_reason"})
+
+    def test_write_github_output_lf_cannot_inject_a_second_output(self):
+        malicious = "line one\nrogue_output=injected"
+        p1.write_github_output([("terraform_governance_override_reason", malicious)])
+        outputs = self.read_outputs()
+        self.assertNotIn("rogue_output", outputs)
+        self.assertEqual(set(outputs.keys()), {"terraform_governance_override_reason"})
+
+    def test_write_github_output_fixed_delimiter_collision_attack_is_defeated(self):
+        old_deterministic_delimiter = "GG_EOF_terraform_governance_override_reason"
+        attack = f"line1\n{old_deterministic_delimiter}\nrogue_output=injected\nline4"
+        p1.write_github_output([("terraform_governance_override_reason", attack)])
+        outputs = self.read_outputs()
+        self.assertNotIn("rogue_output", outputs)
+        self.assertEqual(outputs["terraform_governance_override_reason"], attack)
+
+    def test_write_github_output_retries_on_forced_random_delimiter_collision(self):
+        value = "line1\nggPhase1Delim_aaaa\nline3"
+        with mock.patch.object(p1.secrets, "token_hex", side_effect=["aaaa", "bbbb"]):
+            delimiter = p1._github_file_delimiter(value)
+        self.assertNotIn(delimiter, value)
+        self.assertEqual(delimiter, "ggPhase1Delim_bbbb")
+
+    def test_write_github_output_normal_single_line_value_is_unaffected(self):
+        p1.write_github_output([("effective_deploy", "true")])
+        raw = self.github_output.read_text(encoding="utf-8")
+        self.assertEqual(raw, "effective_deploy=true\n")
+
+    def test_append_github_env_bare_cr_cannot_inject_a_second_variable(self):
+        malicious = "approved\rROGUE_VAR=injected"
+        p1.append_github_env([("GG_SELECTED_ENVIRONMENT", malicious)])
+        env = self.read_env()
+        self.assertNotIn("ROGUE_VAR", env)
+        self.assertEqual(set(env.keys()), {"GG_SELECTED_ENVIRONMENT"})
+
+    def test_append_github_env_crlf_cannot_inject_a_second_variable(self):
+        malicious = "line one\r\nROGUE_VAR=injected"
+        p1.append_github_env([("GG_SELECTED_ENVIRONMENT", malicious)])
+        env = self.read_env()
+        self.assertNotIn("ROGUE_VAR", env)
+
+    def test_append_github_env_fixed_delimiter_collision_attack_is_defeated(self):
+        old_deterministic_delimiter = "GG_EOF_GG_SELECTED_ENVIRONMENT"
+        attack = f"line1\n{old_deterministic_delimiter}\nROGUE_VAR=injected\nline4"
+        p1.append_github_env([("GG_SELECTED_ENVIRONMENT", attack)])
+        env = self.read_env()
+        self.assertNotIn("ROGUE_VAR", env)
+        self.assertEqual(env["GG_SELECTED_ENVIRONMENT"], attack)
+
+    def test_append_github_env_normal_single_line_value_is_unaffected(self):
+        p1.append_github_env([("GG_SELECTED_ENVIRONMENT", "dev")])
+        raw = self.github_env.read_text(encoding="utf-8")
+        self.assertEqual(raw, "GG_SELECTED_ENVIRONMENT=dev\n")
+
+    def test_requires_heredoc_recognizes_lf_cr_and_crlf(self):
+        self.assertTrue(p1._requires_heredoc("a\nb"))
+        self.assertTrue(p1._requires_heredoc("a\rb"))
+        self.assertTrue(p1._requires_heredoc("a\r\nb"))
+        self.assertFalse(p1._requires_heredoc("a b"))
 
 
 class TestAcceptance(Phase1TestCase):

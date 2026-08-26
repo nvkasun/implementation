@@ -91,14 +91,19 @@ def _github_output_delimiter(value):
             return delimiter
 
 
+def _requires_heredoc(value):
+    """True if value contains any line-break character (LF, CR, or CRLF) a line-oriented GITHUB_OUTPUT/GITHUB_ENV parser could treat as a record separator -- a bare "\\r" alone is just as capable of smuggling a second NAME=value fragment as "\\n" is."""
+    return "\n" in value or "\r" in value
+
+
 def write_github_output(pairs, output_path=None):
-    """Appends name=value lines to $GITHUB_OUTPUT. Output names are always fixed literals supplied by this module's own code, never caller-controlled. Multiline values use the heredoc form with a fresh, collision-checked random delimiter per call -- never a constant string a caller-supplied value could spoof to inject extra output fragments. No-op (never raises) when GITHUB_OUTPUT is unset."""
+    """Appends name=value lines to $GITHUB_OUTPUT. Output names are always fixed literals supplied by this module's own code, never caller-controlled. Any value containing a line-break character (LF, CR, or CRLF) uses the heredoc form with a fresh, collision-checked random delimiter per call -- never a constant string a caller-supplied value could spoof to inject extra output fragments. No-op (never raises) when GITHUB_OUTPUT is unset."""
     path = output_path if output_path is not None else os.environ.get("GITHUB_OUTPUT")
     if not path:
         return
     with open(path, "a", encoding="utf-8") as f:
         for name, value in pairs:
-            if "\n" in value:
+            if _requires_heredoc(value):
                 delimiter = _github_output_delimiter(value)
                 f.write(f"{name}<<{delimiter}\n{value}\n{delimiter}\n")
             else:

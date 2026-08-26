@@ -16028,6 +16028,119 @@ else
 fi
 
 echo ""
+echo "--- GitHub Actions special-file output-injection hardening: bare-CR and fixed-delimiter findings (assertions A-H) ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$PHASE1_TOOL" ] && [ -f "$PHASE2_TOOL" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$SUB_IAM_SECRETS_WORKFLOW" ]; then
+  set +e
+  CR_HARDENING_OUT="$(python3 - "$PHASE1_TOOL" "$PHASE2_TOOL" "$EKS_APP_WORKFLOW" "$SUB_IAM_SECRETS_WORKFLOW" <<'PYEOF'
+import importlib.util
+import inspect
+import sys
+
+import yaml
+
+phase1_path, phase2_path, main_path, sub_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+
+
+def load_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+p1 = load_module("phase1_readiness_static_check", phase1_path)
+p2 = load_module("phase2_prerequisites_static_check", phase2_path)
+
+results = []
+
+
+def check(label, ok):
+    results.append((label, ok))
+
+
+write_output_src = inspect.getsource(p1.write_github_output)
+append_env_src = inspect.getsource(p1.append_github_env)
+
+# A: Phase 1 no longer builds a GG_EOF_<output-name> deterministic delimiter in either pair-based writer.
+check("A: write_github_output no longer builds a GG_EOF_<name> deterministic delimiter", "GG_EOF_" not in write_output_src)
+check("A: append_github_env no longer builds a GG_EOF_<name> deterministic delimiter", "GG_EOF_" not in append_env_src)
+
+# B: Phase 1 imports the stdlib secrets module and its delimiter helper uses a collision-retry loop over secrets.token_hex.
+check("B: phase1_readiness.py imports the stdlib secrets module", hasattr(p1, "secrets") and p1.secrets.__name__ == "secrets")
+delimiter_helper_src = inspect.getsource(p1._github_file_delimiter)
+check("B: the Phase 1 delimiter helper uses secrets.token_hex inside a collision-retry loop", "secrets.token_hex" in delimiter_helper_src and "while True" in delimiter_helper_src)
+
+# C: Phase 1 write_github_output treats both LF and bare CR as multiline (behavioral, not textual).
+check("C: write_github_output's multiline decision recognizes a bare LF value", p1._requires_heredoc("a\nb") is True)
+check("C: write_github_output's multiline decision recognizes a bare CR value", p1._requires_heredoc("a\rb") is True)
+check("C: write_github_output's multiline decision recognizes a CRLF value", p1._requires_heredoc("a\r\nb") is True)
+
+# D: Phase 1 append_github_env shares the same multiline decision (same _requires_heredoc predicate, verified by source reference rather than duplicated logic).
+check("D: append_github_env uses the shared _requires_heredoc predicate (not a separate \\n-only check)", "_requires_heredoc" in append_env_src)
+
+# E: Phase 2 write_github_output treats both LF and bare CR as multiline.
+check("E: Phase 2 write_github_output's multiline decision recognizes a bare LF value", p2._requires_heredoc("a\nb") is True)
+check("E: Phase 2 write_github_output's multiline decision recognizes a bare CR value", p2._requires_heredoc("a\rb") is True)
+check("E: Phase 2 write_github_output's multiline decision recognizes a CRLF value", p2._requires_heredoc("a\r\nb") is True)
+
+# F: Phase 2 retains its collision-resistant random delimiter generator (never reverted to a fixed/name-derived delimiter).
+p2_delimiter_src = inspect.getsource(p2._github_output_delimiter)
+check("F: Phase 2's delimiter helper uses secrets.token_hex inside a collision-retry loop", "secrets.token_hex" in p2_delimiter_src and "while True" in p2_delimiter_src)
+check("F: Phase 2's delimiter helper checks the candidate delimiter against the value before returning it", "not in value" in p2_delimiter_src)
+
+# G: no governance reason is directly interpolated into a workflow shell run: body -- it only ever flows through a step-level env: mapping (the established safe pattern), never pasted into run: text.
+with open(main_path) as f:
+    main_doc = yaml.safe_load(f)
+with open(sub_path) as f:
+    sub_doc = yaml.safe_load(f)
+
+
+def run_texts(doc):
+    texts = []
+    for job in doc.get("jobs", {}).values():
+        if not isinstance(job, dict):
+            continue
+        for step in job.get("steps", []) or []:
+            run_text = step.get("run")
+            if isinstance(run_text, str):
+                texts.append(run_text)
+    return texts
+
+
+direct_interpolation_hits = [t for t in run_texts(main_doc) + run_texts(sub_doc) if "inputs.terraform_governance_override_reason" in t or "needs." in t and "terraform_governance_override_reason" in t]
+check("G: no run: body directly interpolates terraform_governance_override_reason (only step-level env: mappings do)", not direct_interpolation_hits)
+
+# H: canonical output names are unchanged for both phases.
+check("H: Phase 1 canonical output keys are unchanged", set(p1.CANONICAL_OUTPUT_KEYS) == {
+    "selected_environment", "effective_deploy", "has_active_deployments", "active_runtime_matrix",
+    "terraform_governance_override", "terraform_governance_override_reason", "has_changes",
+    "deployment_matrix", "has_deletions", "deletion_matrix", "has_storage_transition_violations",
+    "storage_transition_violations",
+})
+check("H: Phase 2 canonical output keys are unchanged", set(p2.CANONICAL_OUTPUT_KEYS) == {"aws_region", "terraform_governance_override", "terraform_governance_override_reason"})
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  CR_HARDENING_STATUS=$?
+  set -e
+  if [ "$CR_HARDENING_STATUS" -ne 0 ]; then
+    fail "GitHub special-file output-injection hardening (A-H): assertion script errored:"$'\n'"${CR_HARDENING_OUT}"
+  else
+    while IFS= read -r line; do
+      case "$line" in
+        FAIL\ *) fail "GitHub special-file output-injection hardening (A-H): ${line#FAIL }" ;;
+        OK\ *) pass "GitHub special-file output-injection hardening (A-H): ${line#OK }" ;;
+      esac
+    done <<< "$CR_HARDENING_OUT"
+  fi
+else
+  skip "GitHub special-file output-injection hardening (A-H) -- python3/PyYAML unavailable or tool/workflow files missing"
+fi
+
+echo ""
 echo "--- Final repository handoff hygiene sweep (VDR pre-transfer cleanliness) ---"
 
 # This is the LAST check in the suite, deliberately: earlier sections legitimately regenerate work/generated/dev/goldengate-deployments.yaml (the folder-driven registry-generation checks) as their own tested behavior -- asserting its absence any earlier would be a self-defeating mid-test assertion. Self-heal only the categories PROVEN elsewhere in this suite to be pure, expected byproducts of exercising real application/tooling behavior (never silently deleting anything whose origin is unknown); everything else must already be absent, or this check fails closed and reports it for a human to investigate before VDR handoff.

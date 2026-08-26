@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 from pathlib import Path
@@ -112,15 +113,28 @@ def require_state_value(state, key):
 
 # GitHub Actions special-file helpers
 
+def _requires_heredoc(value):
+    """True if value contains any line-break character (LF, CR, or CRLF) a line-oriented GITHUB_OUTPUT/GITHUB_ENV parser could treat as a record separator -- a bare "\\r" alone is just as capable of smuggling a second NAME=value fragment as "\\n" is."""
+    return "\n" in value or "\r" in value
+
+
+def _github_file_delimiter(value):
+    """Generates a random heredoc delimiter for a GITHUB_OUTPUT/GITHUB_ENV multiline value and verifies it does not occur inside that value -- a constant name-derived delimiter (e.g. GG_EOF_<name>) could be spoofed by a caller-supplied value to terminate the heredoc early and inject additional NAME=value fragments."""
+    while True:
+        delimiter = f"ggPhase1Delim_{secrets.token_hex(16)}"
+        if delimiter not in value:
+            return delimiter
+
+
 def append_github_env(pairs, env_path=None):
-    """Appends NAME=value lines to $GITHUB_ENV. No-op (never raises) when GITHUB_ENV is unset, so offline/unit-test invocations never require a real GitHub Actions runner."""
+    """Appends NAME=value lines to $GITHUB_ENV. No-op (never raises) when GITHUB_ENV is unset, so offline/unit-test invocations never require a real GitHub Actions runner. Any value containing a line-break character (LF, CR, or CRLF) uses the heredoc form with a fresh, collision-checked random delimiter per call -- never a constant name-derived string a caller-supplied value could spoof."""
     path = env_path if env_path is not None else os.environ.get("GITHUB_ENV")
     if not path:
         return
     with open(path, "a", encoding="utf-8") as f:
         for name, value in pairs:
-            if "\n" in value:
-                delimiter = f"GG_EOF_{name}"
+            if _requires_heredoc(value):
+                delimiter = _github_file_delimiter(value)
                 f.write(f"{name}<<{delimiter}\n{value}\n{delimiter}\n")
             else:
                 f.write(f"{name}={value}\n")
@@ -138,14 +152,14 @@ def append_github_env_raw(text, env_path=None):
 
 
 def write_github_output(pairs, output_path=None):
-    """Appends name=value lines to $GITHUB_OUTPUT (multi-line values use the heredoc form). No-op (never raises) when GITHUB_OUTPUT is unset."""
+    """Appends name=value lines to $GITHUB_OUTPUT. Any value containing a line-break character (LF, CR, or CRLF) uses the heredoc form with a fresh, collision-checked random delimiter per call -- never a constant name-derived string a caller-supplied value could spoof to inject extra output fragments. No-op (never raises) when GITHUB_OUTPUT is unset."""
     path = output_path if output_path is not None else os.environ.get("GITHUB_OUTPUT")
     if not path:
         return
     with open(path, "a", encoding="utf-8") as f:
         for name, value in pairs:
-            if "\n" in value:
-                delimiter = f"GG_EOF_{name}"
+            if _requires_heredoc(value):
+                delimiter = _github_file_delimiter(value)
                 f.write(f"{name}<<{delimiter}\n{value}\n{delimiter}\n")
             else:
                 f.write(f"{name}={value}\n")

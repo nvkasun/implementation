@@ -222,12 +222,36 @@ class TestGithubOutputSafety(Phase2TestCase):
         self.assertEqual(outputs["terraform_governance_override_reason"], malicious_reason)
         self.assertNotIn("rogue_output", outputs)
 
+    def test_bare_cr_reason_cannot_inject_a_second_output(self):
+        malicious_reason = "approved\rrogue_output=injected"
+        self.run_subcommand(p2.cmd_validate_governance, env_overrides={"INPUT_OVERRIDE": "true", "INPUT_REASON": malicious_reason})
+        outputs = self.read_outputs()
+        self.assertNotIn("rogue_output", outputs)
+        self.assertEqual(set(outputs.keys()), {"terraform_governance_override", "terraform_governance_override_reason"})
+
+    def test_crlf_reason_cannot_inject_a_second_output(self):
+        malicious_reason = "line one\r\nline two"
+        self.run_subcommand(p2.cmd_validate_governance, env_overrides={"INPUT_OVERRIDE": "true", "INPUT_REASON": malicious_reason})
+        outputs = self.read_outputs()
+        self.assertEqual(set(outputs.keys()), {"terraform_governance_override", "terraform_governance_override_reason"})
+
     def test_delimiter_collision_is_safely_handled(self):
         colliding_value = "line1\nggPhase2Delim_AAAA\nline3"
         with mock.patch.object(p2.secrets, "token_hex", side_effect=["AAAA", "BBBB"]):
             delimiter = p2._github_output_delimiter(colliding_value)
         self.assertNotIn(delimiter, colliding_value)
         self.assertEqual(delimiter, "ggPhase2Delim_BBBB")
+
+    def test_normal_single_line_output_uses_simple_name_equals_value_form(self):
+        p2.write_github_output([("aws_region", "eu-west-1")])
+        raw = self.github_output.read_text(encoding="utf-8")
+        self.assertEqual(raw, "aws_region=eu-west-1\n")
+
+    def test_requires_heredoc_recognizes_lf_cr_and_crlf(self):
+        self.assertTrue(p2._requires_heredoc("a\nb"))
+        self.assertTrue(p2._requires_heredoc("a\rb"))
+        self.assertTrue(p2._requires_heredoc("a\r\nb"))
+        self.assertFalse(p2._requires_heredoc("a b"))
 
     def test_output_names_are_fixed_literals_never_caller_controlled(self):
         with open(TOOL_PATH, encoding="utf-8") as f:
