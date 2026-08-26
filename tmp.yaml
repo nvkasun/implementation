@@ -1,24 +1,100 @@
-echo "=== SSH SERVICE ==="
-systemctl status sshd --no-pager
+First test from your Windows machine
 
-echo
-echo "=== PORT 22 LISTENING ==="
-ss -lntp | grep ':22'
+Run this in PowerShell:
 
-echo
-echo "=== PASSWORD AUTH ==="
-sshd -T | grep -i passwordauthentication
+Test-NetConnection 10.114.80.10 -Port 22
 
-echo
-echo "=== SSH CONFIG ==="
-grep -RniE '^(PasswordAuthentication|AllowUsers|DenyUsers|PermitRootLogin)' \
-  /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ 2>/dev/null
+Send me the complete output.
 
-echo
-echo "=== FIREWALL ==="
-firewall-cmd --state 2>/dev/null || true
-firewall-cmd --list-all 2>/dev/null || true
+I'm especially interested in:
 
-echo
-echo "=== SSH RECENT LOGS ==="
-journalctl -u sshd --no-pager -n 50
+SourceAddress
+TcpTestSucceeded
+
+Then run:
+
+ssh -vvv azureuser@10.114.80.10
+
+The -vvv gives us detailed SSH negotiation output.
+
+Send me the last ~20 lines where it fails.
+
+There is another excellent test
+
+Try SSH once:
+
+ssh azureuser@10.114.80.10
+
+wait until you get:
+
+kex_exchange_identification: Connection closed by remote host
+
+Then immediately go back to:
+
+Azure VM → Run command → RunShellScript
+
+and run:
+
+journalctl -u sshd --since "5 minutes ago" --no-pager
+
+If there is nothing corresponding to your SSH attempt, we can be almost certain the connection never reaches the VM's sshd.
+
+If it does show something like:
+
+Connection from x.x.x.x port xxxxx
+
+then we investigate SSH itself.
+
+Also check the subnet
+
+Remember your VM is connected to:
+
+vnet-cibg-dev-uan
+└── snet-aks-node-pools-cibg-uaenorth-001
+
+That is still suspicious because it appears to be an AKS node-pool subnet.
+
+Go to:
+
+VM → Networking → Network settings
+
+Then click the network interface and look for Effective security rules.
+
+We need to determine whether inbound TCP/22 from your corporate source network is actually permitted.
+
+Don't create:
+
+0.0.0.0/0 → TCP 22
+
+and don't give the VM a public IP just to solve this.
+
+The correct rule, if an NSG rule is required, would look more like:
+
+Source:
+Corporate management CIDR
+         │
+         │ TCP/22
+         ▼
+10.114.80.10
+Oracle VM
+Your VM itself currently looks good
+
+Based on the screenshots:
+
+OS-level SSH configuration is not the problem so far.
+
+RHEL
+├── sshd running                 ✅
+├── TCP/22 listening             ✅
+├── PasswordAuthentication yes   ✅
+└── firewalld allows ssh         ✅
+
+So bro, don't reset SSH and don't edit /etc/ssh/sshd_config yet.
+
+Run these two from your PC first:
+
+Test-NetConnection 10.114.80.10 -Port 22
+
+and:
+
+ssh -vvv azureuser@10.114.80.10
