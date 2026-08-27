@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""automation/orchestration/runtime_acceptance.py: read-only GoldenGate runtime post-reconciliation acceptance classifier (Phase B3A) -- answers exactly one question, "is this active GoldenGate runtime deployment fully healthy right now?", as one of HEALTHY/BROKEN. Unlike automation/orchestration/runtime_state.py (a pre-reconciliation ownership-safety preflight), this tool DOES require full readiness/health: an active desired runtime that is missing, unhealthy, or shaped incorrectly is BROKEN. Never mutates the cluster: every kubectl invocation here is a `get` (read-only); no apply/create/delete/patch/annotate/label/helm call exists in this module, and it never calls AWS directly -- the expected managed-EFS filesystem ID (when applicable) is resolved read-only by the calling workflow and passed in via --expected-efs-file-system-id. Consumes deployment identity through automation/goldengate-deployment-model.py's `describe` output, never a second descriptor schema."""
+"""automation/phases/phase5/runtime_acceptance.py: read-only GoldenGate runtime post-reconciliation acceptance classifier (Phase 5D) -- answers exactly one question, "is this active GoldenGate runtime deployment fully healthy right now?", as one of HEALTHY/BROKEN. Unlike automation/phases/phase5/runtime_state.py (a pre-reconciliation ownership-safety preflight), this tool DOES require full readiness/health: an active desired runtime that is missing, unhealthy, or shaped incorrectly is BROKEN. Never mutates the cluster: every kubectl invocation here is a `get` (read-only); no apply/create/delete/patch/annotate/label/helm call exists in this module, and it never calls AWS directly -- the expected managed-EFS filesystem ID (when applicable) is resolved read-only by the calling workflow and passed in via --expected-efs-file-system-id. Consumes deployment identity through automation/goldengate-deployment-model.py's `describe` output, never a second descriptor schema."""
 from __future__ import annotations
 
 import argparse
@@ -7,30 +7,31 @@ import importlib.util
 import json
 import os
 import sys
+from pathlib import Path
 
 import yaml
 
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
-def _load_sibling_module(name, filename):
-    """Lazy import of a same-directory automation/orchestration/ module by explicit file path -- the same importlib.util convention this repo already uses for automation/goldengate-environment.py, so this module never depends on sys.path/CWD."""
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+
+def _load_module(name, path):
+    """Lazy import of a repo module by explicit path (pathlib-based, never fragile ".." string arithmetic) -- the same importlib.util convention this repo already uses for automation/goldengate-environment.py, so this module never depends on sys.path/CWD."""
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-_k8s_common = _load_sibling_module("k8s_common", "k8s_common.py")
+# k8s_common.py is genuinely cross-phase (shared by the Phase 4 Platform/Observability classifiers too) and stays under automation/orchestration/ -- never moved, never duplicated here.
+_k8s_common = _load_module("k8s_common", REPO_ROOT / "automation" / "orchestration" / "k8s_common.py")
 ClassifierInspectionError = _k8s_common.ClassifierInspectionError
 KubectlRunner = _k8s_common.KubectlRunner
 get_json = _k8s_common.get_json
 list_json = _k8s_common.list_json
 statefulset_ready = _k8s_common.statefulset_ready
 
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-
-_ENVIRONMENT_MODULE_PATH = os.path.join(os.path.dirname(__file__), "..", "goldengate-environment.py")
-_DEPLOYMENT_MODEL_MODULE_PATH = os.path.join(os.path.dirname(__file__), "..", "goldengate-deployment-model.py")
+_ENVIRONMENT_MODULE_PATH = REPO_ROOT / "automation" / "goldengate-environment.py"
+_DEPLOYMENT_MODEL_MODULE_PATH = REPO_ROOT / "automation" / "goldengate-deployment-model.py"
 _environment_module = None
 _deployment_model_module = None
 
@@ -39,10 +40,7 @@ def _load_environment_module():
     """Lazy import of automation/goldengate-environment.py -- the single canonical environment-config parser/deriver. Never a second independent schema implementation."""
     global _environment_module
     if _environment_module is None:
-        spec = importlib.util.spec_from_file_location("goldengate_environment", _ENVIRONMENT_MODULE_PATH)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        _environment_module = module
+        _environment_module = _load_module("goldengate_environment", _ENVIRONMENT_MODULE_PATH)
     return _environment_module
 
 
@@ -50,10 +48,7 @@ def _load_deployment_model_module():
     """Lazy import of automation/goldengate-deployment-model.py -- the single canonical folder-driven descriptor resolver. Never a second independent descriptor schema."""
     global _deployment_model_module
     if _deployment_model_module is None:
-        spec = importlib.util.spec_from_file_location("goldengate_deployment_model", _DEPLOYMENT_MODEL_MODULE_PATH)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        _deployment_model_module = module
+        _deployment_model_module = _load_module("goldengate_deployment_model", _DEPLOYMENT_MODEL_MODULE_PATH)
     return _deployment_model_module
 
 

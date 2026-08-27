@@ -1,4 +1,4 @@
-"""Offline tests for automation/orchestration/runtime_acceptance.py; run directly via `python3 automation/test-goldengate-runtime-acceptance.py`. No live Kubernetes/AWS -- every kubectl response is a fake, injected fixture, and the expected EFS filesystem ID is passed in exactly as the real workflow would after its own read-only AWS resolution. Exercises the classifier's actual logic (never merely greps its source). Fixtures are shaped after the real, currently-inactive envs/dev/gg-postgresql-repltest-01 descriptor (source role, managed EFS, ingress enabled) -- describe_deployment() reads the real repository, never a scratch root, EXCEPT the dedicated RuntimeAcceptanceExternalClaimTests class below, which uses an isolated scratch environment to exercise the supported explicit-existingClaim shape those real descriptors do not use."""
+"""Offline tests for automation/phases/phase5/runtime_acceptance.py; run directly via `python3 automation/phases/phase5/tests/test_runtime_acceptance.py`. No live Kubernetes/AWS -- every kubectl response is a fake, injected fixture, and the expected EFS filesystem ID is passed in exactly as the real workflow would after its own read-only AWS resolution. Exercises the classifier's actual logic (never merely greps its source). Fixtures are shaped after the real, currently-inactive envs/dev/gg-postgresql-repltest-01 descriptor (source role, managed EFS, ingress enabled) -- describe_deployment() reads the real repository, never a scratch root, EXCEPT the dedicated RuntimeAcceptanceExternalClaimTests class below, which uses an isolated scratch environment to exercise the supported explicit-existingClaim shape those real descriptors do not use."""
 from __future__ import annotations
 
 import importlib.util
@@ -6,11 +6,12 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 
 import yaml
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TOOL_PATH = os.path.join(REPO_ROOT, "automation", "orchestration", "runtime_acceptance.py")
+REPO_ROOT = str(Path(__file__).resolve().parents[4])
+TOOL_PATH = os.path.join(REPO_ROOT, "automation", "phases", "phase5", "runtime_acceptance.py")
 
 
 def _load_tool():

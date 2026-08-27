@@ -1,13 +1,14 @@
-"""Offline tests for automation/orchestration/runtime_state.py; run directly via `python3 automation/test-goldengate-runtime-state.py`. No live Kubernetes -- every kubectl response is a fake, injected fixture. Exercises the classifier's actual logic (never merely greps its source)."""
+"""Offline tests for automation/phases/phase5/runtime_state.py; run directly via `python3 automation/phases/phase5/tests/test_runtime_state.py`. No live Kubernetes -- every kubectl response is a fake, injected fixture. Exercises the classifier's actual logic (never merely greps its source)."""
 from __future__ import annotations
 
 import importlib.util
 import json
 import os
 import unittest
+from pathlib import Path
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TOOL_PATH = os.path.join(REPO_ROOT, "automation", "orchestration", "runtime_state.py")
+REPO_ROOT = str(Path(__file__).resolve().parents[4])
+TOOL_PATH = os.path.join(REPO_ROOT, "automation", "phases", "phase5", "runtime_state.py")
 
 
 def _load_tool():
@@ -329,6 +330,84 @@ class RuntimeStateClassifierTests(unittest.TestCase):
             self.assertEqual(result["state"], runtime_state.STATE_BROKEN)
         finally:
             runtime_state.describe_deployment = original_describe_deployment
+
+    def test_25_physical_removal_no_hint_retained_pvc_reproduces_broken_bug(self):
+        # Confirmed reproduction of the physical-removal retained-PVC bug: the descriptor was physically removed (describe_deployment raises "unknown deployment ID"), so declares_chart_owned_persistence can never be computed -- without the explicit hint, a legitimately retained PVC is misclassified BROKEN, which would falsely fail idempotent physical-removal cleanup.
+        original_describe_deployment = runtime_state.describe_deployment
+        runtime_state.describe_deployment = lambda environment, deployment_id: (_ for _ in ()).throw(ValueError(f"unknown deployment ID {deployment_id!r}"))
+        try:
+            cluster = FakeCluster()
+            cluster.put("persistentvolumeclaim", f"{DEPLOYMENT_ID}-u02", RUNTIME_NAMESPACE, _named_obj(f"{DEPLOYMENT_ID}-u02", _runtime_labels()))
+            result = _classify(cluster)
+            self.assertEqual(result["state"], runtime_state.STATE_BROKEN)
+        finally:
+            runtime_state.describe_deployment = original_describe_deployment
+
+    def test_26_physical_removal_with_hint_retained_pvc_is_owned(self):
+        # The fix: passing retained_pvc_expected=True lets the classifier recognize the same "Application absent, only the correctly-owned expected-name PVC exists" shape as safe even when the descriptor itself was physically removed.
+        original_describe_deployment = runtime_state.describe_deployment
+        runtime_state.describe_deployment = lambda environment, deployment_id: (_ for _ in ()).throw(ValueError(f"unknown deployment ID {deployment_id!r}"))
+        try:
+            cluster = FakeCluster()
+            cluster.put("persistentvolumeclaim", f"{DEPLOYMENT_ID}-u02", RUNTIME_NAMESPACE, _named_obj(f"{DEPLOYMENT_ID}-u02", _runtime_labels()))
+            result = runtime_state.classify(
+                cluster, environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, argocd_namespace=ARGOCD_NAMESPACE,
+                runtime_namespace=RUNTIME_NAMESPACE, ecr_registry=ECR_REGISTRY, retained_pvc_expected=True,
+            )
+            self.assertEqual(result["state"], runtime_state.STATE_OWNED)
+            self.assertEqual(result["reasons"], [])
+        finally:
+            runtime_state.describe_deployment = original_describe_deployment
+
+    def test_27_physical_removal_with_hint_foreign_pvc_still_broken(self):
+        # The hint never bypasses the ordinary per-resource ownership-label check -- a foreign/mislabeled PVC under the expected name is still BROKEN even with retained_pvc_expected=True. Never auto-adopt arbitrary PVCs.
+        original_describe_deployment = runtime_state.describe_deployment
+        runtime_state.describe_deployment = lambda environment, deployment_id: (_ for _ in ()).throw(ValueError(f"unknown deployment ID {deployment_id!r}"))
+        try:
+            cluster = FakeCluster()
+            cluster.put("persistentvolumeclaim", f"{DEPLOYMENT_ID}-u02", RUNTIME_NAMESPACE, _named_obj(f"{DEPLOYMENT_ID}-u02", _runtime_labels(deployment_id="gg-foreign")))
+            result = runtime_state.classify(
+                cluster, environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, argocd_namespace=ARGOCD_NAMESPACE,
+                runtime_namespace=RUNTIME_NAMESPACE, ecr_registry=ECR_REGISTRY, retained_pvc_expected=True,
+            )
+            self.assertEqual(result["state"], runtime_state.STATE_BROKEN)
+            self.assertTrue(any("incompatible ownership" in r for r in result["reasons"]))
+        finally:
+            runtime_state.describe_deployment = original_describe_deployment
+
+    def test_28_physical_removal_with_hint_but_empty_efs_mode_reason_no_pvc_present(self):
+        # retained_pvc_expected=True with no PVC at all, and no other footprint, is simply the ordinary ABSENT case (nothing to retain, nothing owned) -- the hint must never manufacture a footprint that was never there.
+        original_describe_deployment = runtime_state.describe_deployment
+        runtime_state.describe_deployment = lambda environment, deployment_id: (_ for _ in ()).throw(ValueError(f"unknown deployment ID {deployment_id!r}"))
+        try:
+            cluster = FakeCluster()
+            result = runtime_state.classify(
+                cluster, environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, argocd_namespace=ARGOCD_NAMESPACE,
+                runtime_namespace=RUNTIME_NAMESPACE, ecr_registry=ECR_REGISTRY, retained_pvc_expected=True,
+            )
+            self.assertEqual(result["state"], runtime_state.STATE_ABSENT)
+        finally:
+            runtime_state.describe_deployment = original_describe_deployment
+
+    def test_29_physical_removal_with_hint_non_pvc_footprint_still_broken(self):
+        # The hint applies ONLY to the PVC kind -- a StatefulSet still running (physically-removed descriptor, no Application) remains exactly as unsafe as before, hint or not.
+        original_describe_deployment = runtime_state.describe_deployment
+        runtime_state.describe_deployment = lambda environment, deployment_id: (_ for _ in ()).throw(ValueError(f"unknown deployment ID {deployment_id!r}"))
+        try:
+            cluster = FakeCluster()
+            cluster.put("persistentvolumeclaim", f"{DEPLOYMENT_ID}-u02", RUNTIME_NAMESPACE, _named_obj(f"{DEPLOYMENT_ID}-u02", _runtime_labels()))
+            cluster.put("statefulset", DEPLOYMENT_ID, RUNTIME_NAMESPACE, _named_obj(DEPLOYMENT_ID, _runtime_labels()))
+            result = runtime_state.classify(
+                cluster, environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, argocd_namespace=ARGOCD_NAMESPACE,
+                runtime_namespace=RUNTIME_NAMESPACE, ecr_registry=ECR_REGISTRY, retained_pvc_expected=True,
+            )
+            self.assertEqual(result["state"], runtime_state.STATE_BROKEN)
+        finally:
+            runtime_state.describe_deployment = original_describe_deployment
+
+    def test_30_default_classify_call_sites_unaffected_by_new_parameter(self):
+        # Defense-in-depth: every OTHER existing test in this file calls classify() via _classify() (which never passes retained_pvc_expected), and the new parameter defaults to False -- confirms the default keyword value itself, not merely test behavior.
+        self.assertEqual(runtime_state.classify.__defaults__[-1], False)
 
     def test_24_app_found_retained_pvc_owned_is_still_owned(self):
         # Sanity: the Application-found path is entirely unaffected by the Gap 5 retained-PVC change -- a correctly-owned PVC alongside a correctly-owned Application remains OWNED exactly as before.

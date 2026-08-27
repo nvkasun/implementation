@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""automation/orchestration/runtime_state.py: read-only GoldenGate runtime ownership-safety preflight classifier (Phase B3A) -- answers exactly one question, "is it safe for MAIN to reconcile this GoldenGate runtime deployment?", as one of ABSENT/OWNED/BROKEN. This is NOT a HEALTHY-skip prerequisite classifier: a GoldenGate runtime is an actual desired deployment target whose descriptor/image/chart may intentionally change on every run, so OWNED (not HEALTHY) is the "safe to reconcile" state -- readiness/health is validated separately, post-reconciliation, by automation/orchestration/runtime_acceptance.py. Never mutates the cluster: every kubectl invocation here is a `get` (read-only); no apply/create/delete/patch/annotate/label/helm call exists in this module. Consumes deployment identity through automation/goldengate-deployment-model.py's `describe` output (the same canonical folder-driven descriptor resolver used everywhere else), never a second descriptor schema."""
+"""automation/phases/phase5/runtime_state.py: read-only GoldenGate runtime ownership-safety preflight classifier (Phase 5A) -- answers exactly one question, "is it safe for MAIN to reconcile this GoldenGate runtime deployment?", as one of ABSENT/OWNED/BROKEN. This is NOT a HEALTHY-skip prerequisite classifier: a GoldenGate runtime is an actual desired deployment target whose descriptor/image/chart may intentionally change on every run, so OWNED (not HEALTHY) is the "safe to reconcile" state -- readiness/health is validated separately, post-reconciliation, by automation/phases/phase5/runtime_acceptance.py. Never mutates the cluster: every kubectl invocation here is a `get` (read-only); no apply/create/delete/patch/annotate/label/helm call exists in this module. Consumes deployment identity through automation/goldengate-deployment-model.py's `describe` output (the same canonical folder-driven descriptor resolver used everywhere else), never a second descriptor schema."""
 from __future__ import annotations
 
 import argparse
@@ -7,26 +7,31 @@ import importlib.util
 import json
 import os
 import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
-def _load_sibling_module(name, filename):
-    """Lazy import of a same-directory automation/orchestration/ module by explicit file path -- the same importlib.util convention this repo already uses for automation/goldengate-environment.py, so this module never depends on sys.path/CWD."""
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+def _load_module(name, path):
+    """Lazy import of a repo module by explicit path (pathlib-based, never fragile ".." string arithmetic) -- the same importlib.util convention this repo already uses for automation/goldengate-environment.py, so this module never depends on sys.path/CWD."""
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-_k8s_common = _load_sibling_module("k8s_common", "k8s_common.py")
+# k8s_common.py is genuinely cross-phase (shared by the Phase 4 Platform/Observability classifiers too) and stays under automation/orchestration/ -- never moved, never duplicated here.
+_k8s_common = _load_module("k8s_common", REPO_ROOT / "automation" / "orchestration" / "k8s_common.py")
 ClassifierInspectionError = _k8s_common.ClassifierInspectionError
 KubectlRunner = _k8s_common.KubectlRunner
 get_json = _k8s_common.get_json
 
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_ENVIRONMENT_MODULE_PATH = REPO_ROOT / "automation" / "goldengate-environment.py"
+_DEPLOYMENT_MODEL_MODULE_PATH = REPO_ROOT / "automation" / "goldengate-deployment-model.py"
+_environment_module = None
+_deployment_model_module = None
 
-_ENVIRONMENT_MODULE_PATH = os.path.join(os.path.dirname(__file__), "..", "goldengate-environment.py")
-_DEPLOYMENT_MODEL_MODULE_PATH = os.path.join(os.path.dirname(__file__), "..", "goldengate-deployment-model.py")
+
 _environment_module = None
 _deployment_model_module = None
 
@@ -35,10 +40,7 @@ def _load_environment_module():
     """Lazy import of automation/goldengate-environment.py -- the single canonical environment-config parser/deriver. Never a second independent schema implementation."""
     global _environment_module
     if _environment_module is None:
-        spec = importlib.util.spec_from_file_location("goldengate_environment", _ENVIRONMENT_MODULE_PATH)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        _environment_module = module
+        _environment_module = _load_module("goldengate_environment", _ENVIRONMENT_MODULE_PATH)
     return _environment_module
 
 
@@ -46,10 +48,7 @@ def _load_deployment_model_module():
     """Lazy import of automation/goldengate-deployment-model.py -- the single canonical folder-driven descriptor resolver. Never a second independent descriptor schema."""
     global _deployment_model_module
     if _deployment_model_module is None:
-        spec = importlib.util.spec_from_file_location("goldengate_deployment_model", _DEPLOYMENT_MODEL_MODULE_PATH)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        _deployment_model_module = module
+        _deployment_model_module = _load_module("goldengate_deployment_model", _DEPLOYMENT_MODEL_MODULE_PATH)
     return _deployment_model_module
 
 
@@ -151,8 +150,8 @@ def _ownership_reason(resource_label, obj, environment, deployment_id):
     return None
 
 
-def classify(run, environment, deployment_id, argocd_namespace, runtime_namespace, ecr_registry):
-    """Returns the stable {"state", "environment", "deployment_id", "namespace", "reasons", "checks"} shape. Raises ClassifierInspectionError if Kubernetes access itself could not be trusted -- callers must let that propagate as a hard failure, never a downgrade to ABSENT. Raises ValueError if the folder-driven model itself is inconsistent (invalid descriptors/cross-descriptor problems elsewhere) -- a configuration error, never ABSENT/OWNED/BROKEN cluster state."""
+def classify(run, environment, deployment_id, argocd_namespace, runtime_namespace, ecr_registry, retained_pvc_expected=False):
+    """Returns the stable {"state", "environment", "deployment_id", "namespace", "reasons", "checks"} shape. Raises ClassifierInspectionError if Kubernetes access itself could not be trusted -- callers must let that propagate as a hard failure, never a downgrade to ABSENT. Raises ValueError if the folder-driven model itself is inconsistent (invalid descriptors/cross-descriptor problems elsewhere) -- a configuration error, never ABSENT/OWNED/BROKEN cluster state. retained_pvc_expected (default False, byte-for-byte unchanged default behavior) is an OPTIONAL, EXPLICIT deletion-context hint for Phase 5C removal callers only: when the deployment's own descriptor still exists, "Application absent + only the retained PVC" is already recognized as safe via declares_chart_owned_persistence below and this hint changes nothing; it matters only for a PHYSICALLY REMOVED descriptor (no envs/<environment>/<deployment_id>/values.yaml exists any more), where declares_chart_owned_persistence can never be computed -- when the caller has independently validated (from a Phase 1 deletion_matrix entry) that the prior valid descriptor declared EFS persistence, passing retained_pvc_expected=True lets this classifier recognize the same "Application absent, ONLY the retained PVC exists" shape as safe, while the PVC's own ownership labels are still verified unconditionally below regardless of this hint -- a foreign/mislabeled PVC under the expected name is never silently adopted."""
     # Confirms the folder-driven model is internally consistent before any cluster call -- fails closed if ANY descriptor in the environment is invalid, the same guard the reconcile path already relies on. Deliberately does NOT require THIS deployment_id's own descriptor to still be present: this classifier is also reused for a PHYSICALLY REMOVED descriptor's leftover live resources (GoldenGate Runtime Presence Contract Finalization -- ownership-safe delete, deletion_matrix reason=physical-removal), where by design no envs/<environment>/<deployment_id>/values.yaml exists any more; the caller (delete_removed_argocd_applications) already independently proved this ID was a genuine GoldenGate deployment before it ever reached this classifier.
     descriptor = None
     try:
@@ -193,9 +192,9 @@ def classify(run, environment, deployment_id, argocd_namespace, runtime_namespac
         if non_pvc_footprint_found:
             owned_names = [label for label, (found, _obj) in footprint.items() if found and label != _PVC_KIND]
             reasons.append(f"Application {app_name} does not exist in {argocd_namespace} but expected-name runtime resource(s) already exist: {owned_names!r}")
-        elif pvc_found and not declares_chart_owned_persistence:
+        elif pvc_found and not declares_chart_owned_persistence and not retained_pvc_expected:
             reasons.append(f"Application {app_name} does not exist in {argocd_namespace} but a retained persistence PVC exists although this deployment's descriptor does not declare chart-owned EFS persistence -- not the recognized retained-persistence footprint, treated as an unexplained orphan")
-        # else: Application absent, ONLY the retained PVC exists, and this deployment's descriptor legitimately declares chart-owned EFS persistence -- the recognized "disabled runtime, durable /u02 data retained for a future re-enable" shape. Its own ownership labels are still verified unconditionally below, exactly like every other footprint kind -- a foreign/mislabeled PVC under the expected name is never silently adopted.
+        # else: Application absent, ONLY the retained PVC exists, and either this deployment's descriptor legitimately declares chart-owned EFS persistence OR the caller passed the explicit retained_pvc_expected hint (a physically-removed descriptor whose prior valid revision declared EFS persistence, per a validated Phase 1 deletion_matrix entry) -- the recognized "disabled/removed runtime, durable /u02 data retained for a future re-enable" shape. Its own ownership labels are still verified unconditionally below, exactly like every other footprint kind -- a foreign/mislabeled PVC under the expected name is never silently adopted.
     else:
         labels = ((app_obj.get("metadata") or {}).get("labels")) or {}
         actual_env_label = labels.get("goldengate.adcb/environment")
@@ -241,6 +240,7 @@ def main(argv=None):
     parser.add_argument("--environment", required=True)
     parser.add_argument("--deployment-id", required=True)
     parser.add_argument("--kubectl-bin", default="kubectl")
+    parser.add_argument("--retained-pvc-expected", action="store_true", default=False, help="Explicit Phase 5C removal-only hint: recognize 'Application absent, only the expected-name retained PVC exists' as safe even when the descriptor itself was physically removed. Default behavior (omitted) is byte-for-byte unchanged.")
     args = parser.parse_args(argv)
 
     try:
@@ -253,6 +253,7 @@ def main(argv=None):
             argocd_namespace=values["ARGOCD_NAMESPACE"],
             runtime_namespace=values["RUNTIME_NAMESPACE"],
             ecr_registry=values["ECR_REGISTRY"],
+            retained_pvc_expected=args.retained_pvc_expected,
         )
     except ValueError as exc:
         print(f"CONFIGURATION ERROR: {exc}", file=sys.stderr)

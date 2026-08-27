@@ -1560,7 +1560,7 @@ def _minimal_shape_doc(runtime_overrides=None, ingress_overrides=None):
 
 
 class ExtendedRuntimeShapeFieldsTests(ScratchEnvironmentTestCase):
-    """Phase B3A: replicas/serviceType/servicePorts/initPermissionsEnabled/ingressEnabled/ingressClassName -- focused fields added to parse_descriptor()'s output for automation/orchestration/runtime_state.py and runtime_acceptance.py, never a second descriptor schema."""
+    """Phase 5: replicas/serviceType/servicePorts/initPermissionsEnabled/ingressEnabled/ingressClassName -- focused fields added to parse_descriptor()'s output for automation/phases/phase5/runtime_state.py and runtime_acceptance.py, never a second descriptor schema."""
 
     def _describe(self, deployment_id, doc):
         write_doc(self._tmp.name, "dev", deployment_id, doc)
@@ -1679,7 +1679,7 @@ class ExtendedRuntimeShapeFieldsTests(ScratchEnvironmentTestCase):
 
 
 class CsiAndStorageFieldsTests(ScratchEnvironmentTestCase):
-    """Phase B3A closeout: u02Type/csiEnabled/csiAdminEnabled/csiAdminMountPath/csiCertificateEnabled/csiCertificateMountPath/extraVolumeNames/extraVolumeMountNames -- the minimum stable fields automation/orchestration/runtime_acceptance.py needs to verify the StatefulSet pod actually consumes the correct storage/secret volumes, never a second descriptor schema."""
+    """Phase 5 closeout: u02Type/csiEnabled/csiAdminEnabled/csiAdminMountPath/csiCertificateEnabled/csiCertificateMountPath/extraVolumeNames/extraVolumeMountNames -- the minimum stable fields automation/phases/phase5/runtime_acceptance.py needs to verify the StatefulSet pod actually consumes the correct storage/secret volumes, never a second descriptor schema."""
 
     def _describe(self, deployment_id, doc):
         write_doc(self._tmp.name, "dev", deployment_id, doc)

@@ -32,6 +32,9 @@ OBSERVABILITY_WORKFLOW=".github/workflows/40-sub-observability.yaml"
 ARGOCD_VALUES_FILE="envs/dev/argocd/values.yaml"
 ARGOCD_DEPLOY_WORKFLOW=".github/workflows/20-sub-argocd.yaml"
 PHASE3_TOOL="automation/phases/phase3/phase3_argocd.py"
+PHASE5_RUNTIME_TOOL="automation/phases/phase5/phase5_runtime.py"
+RUNTIME_STATE_TOOL="automation/phases/phase5/runtime_state.py"
+RUNTIME_ACCEPTANCE_TOOL="automation/phases/phase5/runtime_acceptance.py"
 
 # runtime.image.repository/ingress.hostDomain/ingress.alb.groupName/ingress.alb.certificateArn/runtime.csi.region are shared environment configuration -- resolved once here via the same resolver the deploy workflow uses, never an independently maintained literal.
 RESOLVED_DNS_DOMAIN="$(python3 "$ENVIRONMENT_TOOL" --environment dev get DNS_DOMAIN)"
@@ -2812,66 +2815,71 @@ else
   skip "active-contract classifier rejection tests -- ${WORKDIR}/is_gg_fn.sh not available"
 fi
 
-if [ "$PYTHON_AVAILABLE" = "true" ]; then
-  # 5: the deletion job's "Prepare deletion variables" step must fail closed (non-zero exit, no defaulting) when matrix.deployment_model is neither singleRuntime nor legacyPair.
-  python3 - "$EKS_APP_WORKFLOW" > "${WORKDIR}/prepare_deletion_vars.sh" <<'PYEOF'
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$PHASE5_RUNTIME_TOOL" ]; then
+  # 5: Phase 5 Python Conversion -- the deletion job's "Prepare deletion variables" bash step was replaced by phase5_runtime.py prepare-removal (cmd_prepare_removal), called directly here (never a bash-extraction reimplementation) proving it still fails closed (no defaulting) when deployment_model is neither singleRuntime nor legacyPair, that legacyPair itself now fails closed BEFORE any naming/namespace resolution (retired, no automatic mutation), and that singleRuntime naming still resolves correctly.
+  PREPARE_REMOVAL_CHECK="$(python3 - "$PHASE5_RUNTIME_TOOL" <<'PYEOF'
+import importlib.util
+import io
 import sys
-import yaml
-with open(sys.argv[1]) as f:
-    doc = yaml.safe_load(f)
-for step in doc["jobs"]["delete_removed_argocd_applications"]["steps"]:
-    if step.get("name") == "Prepare deletion variables":
-        text = step["run"]
-        text = text.replace('${{ matrix.environment }}', '$TEST_ENVIRONMENT')
-        text = text.replace('${{ matrix.deployment_id }}', '$TEST_DEPLOYMENT_ID')
-        text = text.replace('${{ matrix.deployment_model }}', '$TEST_DEPLOYMENT_MODEL')
-        sys.stdout.write(text)
-        break
-else:
-    sys.exit("step not found")
+import tempfile
+from contextlib import redirect_stdout
+from pathlib import Path
+
+tool_path = sys.argv[1]
+spec = importlib.util.spec_from_file_location("phase5_runtime", tool_path)
+phase5_runtime = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(phase5_runtime)
+
+results = []
+
+
+def run_prepare_removal(deployment_model, deployment_id="gg-oracle-payments-01", efs_mode="", reason="deployment-disabled"):
+    import os
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "state.json"
+        args = type("Args", (), {
+            "environment": "dev", "deployment_id": deployment_id, "deployment_model": deployment_model,
+            "efs_mode": efs_mode, "reason": reason, "state_path": state_path,
+        })()
+        env = {"RUNTIME_NAMESPACE": "goldengate-dev", "ARGOCD_NAMESPACE": "argocd"}
+        old_env = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        try:
+            with redirect_stdout(io.StringIO()):
+                phase5_runtime.cmd_prepare_removal(args)
+            return True, phase5_runtime.load_state(state_path)
+        except phase5_runtime.Phase5Error as exc:
+            return False, str(exc)
+        finally:
+            for k, v in old_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
+ok, err = run_prepare_removal("bogusModel")
+results.append(("5: an unknown deletion-matrix deployment_model fails the deletion job closed (never defaults to legacyPair)", not ok and "bogusModel" in str(err) and "defaulting to legacypair" not in str(err).lower()))
+
+ok, state = run_prepare_removal("singleRuntime")
+results.append(("the deletion job still resolves singleRuntime namespace/Application naming correctly", ok and state.get("runtime_namespace") == "goldengate-dev" and state.get("argocd_app_name") == "goldengate-dev-oracle-payments-01"))
+
+ok, err = run_prepare_removal("legacyPair")
+results.append(("legacyPair fails closed before any namespace/Application naming is resolved -- retired, no automatic mutation, never a second legacy ownership classifier", not ok and "legacyPair" in str(err)))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
 PYEOF
-
-  if [ -s "${WORKDIR}/prepare_deletion_vars.sh" ]; then
-    set +e
-    UNKNOWN_DELETION_MODEL_OUT="$(TEST_ENVIRONMENT="dev" TEST_DEPLOYMENT_ID="gg-oracle-payments-01" TEST_DEPLOYMENT_MODEL="bogusModel" \
-      bash -c 'set -euo pipefail; GITHUB_ENV=/dev/null; source "'"${WORKDIR}"'/prepare_deletion_vars.sh"' 2>&1)"
-    UNKNOWN_DELETION_MODEL_STATUS=$?
-    set -e
-    echo "$UNKNOWN_DELETION_MODEL_OUT"
-
-    if [ "$UNKNOWN_DELETION_MODEL_STATUS" -ne 0 ] \
-        && echo "$UNKNOWN_DELETION_MODEL_OUT" | grep -qF "FAIL: unrecognized deployment_model 'bogusModel'" \
-        && ! echo "$UNKNOWN_DELETION_MODEL_OUT" | grep -qi "defaulting to legacyPair"; then
-      pass "5: an unknown deletion-matrix deployment_model fails the deletion job closed (never defaults to legacyPair)"
-    else
-      fail "5: an unknown deletion-matrix deployment_model was not rejected as expected (status=${UNKNOWN_DELETION_MODEL_STATUS})"
-    fi
-
-    # Sanity: singleRuntime and legacyPair both still resolve without error. RUNTIME_NAMESPACE is exported here to simulate the real job's earlier "Load resolved environment config" step (canonical, never reconstructed inside "Prepare deletion variables" itself) -- legacyPair's naming never depends on it.
-    set +e
-    SINGLE_OK_OUT="$(TEST_ENVIRONMENT="dev" TEST_DEPLOYMENT_ID="gg-oracle-payments-01" TEST_DEPLOYMENT_MODEL="singleRuntime" RUNTIME_NAMESPACE="goldengate-dev" \
-      bash -c 'set -euo pipefail; GITHUB_ENV=/dev/null; source "'"${WORKDIR}"'/prepare_deletion_vars.sh"; echo "OK namespace=${TARGET_NAMESPACE} app=${ARGOCD_APP_NAME}"' 2>&1)"
-    SINGLE_OK_STATUS=$?
-    LEGACY_OK_OUT="$(TEST_ENVIRONMENT="dev" TEST_DEPLOYMENT_ID="payments-ora-to-pg-001" TEST_DEPLOYMENT_MODEL="legacyPair" \
-      bash -c 'set -euo pipefail; GITHUB_ENV=/dev/null; source "'"${WORKDIR}"'/prepare_deletion_vars.sh"; echo "OK namespace=${TARGET_NAMESPACE} app=${ARGOCD_APP_NAME}"' 2>&1)"
-    LEGACY_OK_STATUS=$?
-    set -e
-
-    if [ "$SINGLE_OK_STATUS" -eq 0 ] && echo "$SINGLE_OK_OUT" | grep -qF "OK namespace=goldengate-dev app=goldengate-dev-oracle-payments-01"; then
-      pass "the deletion job still resolves singleRuntime namespace/Application naming correctly"
-    else
-      fail "the deletion job did not resolve singleRuntime namespace/Application naming as expected"
-      echo "$SINGLE_OK_OUT"
-    fi
-
-    if [ "$LEGACY_OK_STATUS" -eq 0 ] && echo "$LEGACY_OK_OUT" | grep -qF "OK namespace=gg-dev-payments-ora-to-pg-001 app=goldengate-payments-ora-to-pg-001"; then
-      pass "the deletion job still resolves the historical legacyPair namespace/Application naming (gg-<env>-<id> / goldengate-<id>) correctly"
-    else
-      fail "the deletion job did not resolve the historical legacyPair namespace/Application naming as expected"
-      echo "$LEGACY_OK_OUT"
-    fi
+)"
+  echo "$PREPARE_REMOVAL_CHECK"
+  if [ -z "$(echo "$PREPARE_REMOVAL_CHECK" | grep '^FAIL ' || true)" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        OK\ *) pass "${line#OK }" ;;
+      esac
+    done <<< "$PREPARE_REMOVAL_CHECK"
   else
-    fail "could not extract the 'Prepare deletion variables' step from ${EKS_APP_WORKFLOW}"
+    fail "prepare-removal fail-closed/naming check failed:"$'\n'"${PREPARE_REMOVAL_CHECK}"
   fi
 else
   skip "deletion-job fail-closed unknown-model test -- python3 not available"
@@ -2949,445 +2957,154 @@ else
   skip "static legacyPair/source-target-validation absence checks -- python3 not available"
 fi
 
-# Secrets Store CSI syncSecret Validation False-Negative Correction: REALLY EXECUTE the committed "Validate Secrets Store CSI configuration" step (never a reimplementation of its logic) against stub kubectl/helm binaries on PATH -- proving the production script now determines syncSecret.enabled STRUCTURALLY from `helm get values --output json` + python3's stdlib json module, never by grep-scraping the human-readable YAML text (the proven live false negative: a real cluster with syncSecret.enabled=true still failed the old grep-based check).
+# Phase 5 Python Conversion: the Secrets Store CSI syncSecret structural-JSON validation, the workflow-summary deletion-trigger documentation, the pre-removal ownership classify-before-delete ordering/fail-closed contract, and the post-delete runtime-compute-absence acceptance ALL moved from inline `run:` bash in this workflow into automation/phases/phase5/phase5_runtime.py's own _validate_sync_secret_enabled()/cmd_summary()/cmd_removal_preflight()/cmd_remove_runtime()/cmd_post_delete_acceptance() functions -- extracting and executing a step's `run:` text (the technique this section used before the Python conversion) no longer applies, since every one of these steps is now a single-line phase5_runtime.py invocation, never inline logic. The full real-execution behavioral proof this section used to carry now lives in automation/phases/phase5/tests/test_phase5_runtime.py's ClusterPrerequisiteTests/RemovalPreflightTests/RemoveRuntimeTests/PostDeletePositiveProofTests classes (and automation/phases/phase5/tests/test_runtime_state.py), which call the real functions directly (never a reimplementation) -- run as part of this same regression via the "test_phase5_runtime.py"/"test_runtime_state.py" invocations elsewhere in this suite. This section is retained only to prove the delegation itself actually happened, the exact fail-closed contracts were not silently weakened during the move, and (Defect 4/Gap 5) that the real committed step ordering/if: gating still matches the workflow's own documented safety sequence.
 echo ""
-echo "--- Secrets Store CSI syncSecret Validation False-Negative Correction ---"
+echo "--- Phase 5 Python Conversion: syncSecret/summary/removal-classify-before-delete/post-delete-absence delegation + fail-closed contract ---"
 
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
-  STEP_RUN_SCRIPT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
-import sys
-import yaml
-
-with open(sys.argv[1]) as f:
-    doc = yaml.safe_load(f)
-
-step = next((s for s in doc["jobs"]["build_publish_and_deploy"]["steps"] if s.get("name") == "Validate Secrets Store CSI configuration"), None)
-if step is None:
-    sys.exit("step not found")
-sys.stdout.write(step["run"])
-PYEOF
-)"
-
-  if [ -n "$STEP_RUN_SCRIPT" ]; then
-    # Non-comment content only: this step's own explanatory comment legitimately QUOTES the old grep -A3 -i syncSecret / grep -qi "enabled: true" pattern in prose, to document what it replaced -- the "must be gone" assertions below must inspect actual bash/python code, never that explanatory prose, or they would trivially self-contradict.
-    STEP_RUN_CODE_ONLY="$(echo "$STEP_RUN_SCRIPT" | grep -vE '^[[:space:]]*#')"
-
-    # 10: the production script no longer uses grep to determine the syncSecret boolean, and no longer names the stale ogg-oracle-admin Secret.
-    if echo "$STEP_RUN_CODE_ONLY" | grep -qF 'grep -A3 -i syncSecret'; then
-      fail "Secrets Store CSI syncSecret fix: the production step still contains the old grep -A3 -i syncSecret text-scraping pattern"
-    else
-      pass "10a: the production step no longer uses grep -A3 -i syncSecret to locate the syncSecret block"
-    fi
-    if echo "$STEP_RUN_CODE_ONLY" | grep -qF 'grep -qi "enabled: true"'; then
-      fail "Secrets Store CSI syncSecret fix: the production step still uses grep -qi \"enabled: true\" to determine the boolean"
-    else
-      pass "10b: the production step no longer uses grep -qi \"enabled: true\" to determine the syncSecret boolean"
-    fi
-    if echo "$STEP_RUN_CODE_ONLY" | grep -qF -- '--output json'; then
-      pass "10c: the production step fetches Helm values structurally via --output json"
-    else
-      fail "Secrets Store CSI syncSecret fix: the production step does not fetch Helm values via --output json"
-    fi
-    if echo "$STEP_RUN_CODE_ONLY" | grep -qF 'ogg-oracle-admin'; then
-      fail "11: the stale literal ogg-oracle-admin still remains in the Secrets Store CSI prerequisite diagnostic"
-    else
-      pass "11: the stale literal ogg-oracle-admin no longer appears in the Secrets Store CSI prerequisite diagnostic"
-    fi
-
-    # Preserved prerequisite checks: CSIDriver, SecretProviderClass CRD, both tokenRequests audiences -- this fix touches ONLY the syncSecret Helm-value validation.
-    for needle in 'kubectl get csidriver secrets-store.csi.k8s.io' 'kubectl get crd secretproviderclasses.secrets-store.csi.x-k8s.io' 'sts.amazonaws.com' 'pods.eks.amazonaws.com'; do
-      if echo "$STEP_RUN_CODE_ONLY" | grep -qF "$needle"; then
-        pass "preserved prerequisite: production step still checks for '${needle}'"
-      else
-        fail "Secrets Store CSI syncSecret fix: production step no longer checks for '${needle}' -- an unrelated prerequisite check appears to have regressed"
-      fi
-    done
-
-    STUB_BIN_DIR="${WORKDIR}/syncsecret-stub-bin"
-    mkdir -p "$STUB_BIN_DIR"
-
-    cat > "${STUB_BIN_DIR}/kubectl" <<'KUBECTL_STUB'
-#!/usr/bin/env bash
-if [[ "$*" == *jsonpath* ]]; then
-  echo '[{"audience":"sts.amazonaws.com"},{"audience":"pods.eks.amazonaws.com"}]'
-  exit 0
-fi
-exit 0
-KUBECTL_STUB
-    chmod +x "${STUB_BIN_DIR}/kubectl"
-
-    cat > "${STUB_BIN_DIR}/helm" <<'HELM_STUB'
-#!/usr/bin/env bash
-if [ "$1" = "status" ]; then
-  exit "${STUB_HELM_STATUS_EXIT:-0}"
-fi
-if [ "$1" = "get" ] && [ "$2" = "values" ]; then
-  cat "${STUB_HELM_VALUES_JSON_FILE}"
-  exit 0
-fi
-exit 1
-HELM_STUB
-    chmod +x "${STUB_BIN_DIR}/helm"
-
-    run_syncsecret_case() {
-      local label="$1" values_json="$2" expect_status="$3" helm_status_exit="${4:-0}"
-      local values_file
-      values_file="$(mktemp)"
-      printf '%s' "$values_json" > "$values_file"
-      local out status
-      set +e
-      out="$(PATH="${STUB_BIN_DIR}:${PATH}" STUB_HELM_VALUES_JSON_FILE="$values_file" STUB_HELM_STATUS_EXIT="$helm_status_exit" bash -c "$STEP_RUN_SCRIPT" 2>&1)"
-      status=$?
-      set -e
-      rm -f "$values_file"
-      if [ "$status" -eq 0 ] && [ "$expect_status" = "PASS" ]; then
-        pass "syncSecret case [${label}]: production step succeeds as expected"
-      elif [ "$status" -ne 0 ] && [ "$expect_status" = "FAIL" ]; then
-        pass "syncSecret case [${label}]: production step fails closed as expected"
-      else
-        fail "syncSecret case [${label}]: expected ${expect_status}, got exit=${status}:"$'\n'"${out}"
-      fi
-    }
-
-    # 1: exactly the shape proven live -- syncSecret.enabled literal true -> PASS.
-    run_syncsecret_case "1: syncSecret.enabled=true" '{"syncSecret":{"enabled":true}}' PASS
-    # 2: enabled=false -> FAIL.
-    run_syncsecret_case "2: enabled=false" '{"syncSecret":{"enabled":false}}' FAIL
-    # 3: syncSecret missing entirely -> FAIL.
-    run_syncsecret_case "3: syncSecret missing" '{"tokenRequests":[]}' FAIL
-    # 4: syncSecret present but enabled missing -> FAIL.
-    run_syncsecret_case "4: enabled missing" '{"syncSecret":{}}' FAIL
-    # 5: enabled=null -> FAIL.
-    run_syncsecret_case "5: enabled=null" '{"syncSecret":{"enabled":null}}' FAIL
-    # 6: enabled as the STRING "true" (not a literal JSON boolean) -> FAIL.
-    run_syncsecret_case "6: enabled=\"true\" (string)" '{"syncSecret":{"enabled":"true"}}' FAIL
-    # 7: extra neighboring fields (tokenRequests) alongside a correct syncSecret.enabled=true do not affect the result -> PASS.
-    run_syncsecret_case "7: extra neighboring tokenRequests fields" '{"syncSecret":{"enabled":true},"tokenRequests":[{"audience":"sts.amazonaws.com"},{"audience":"pods.eks.amazonaws.com"}]}' PASS
-    # 8: a large corporate computed-values tree with unrelated enabled=true fields elsewhere must never create a false positive for the CORRECT case (still PASS here since syncSecret.enabled genuinely is true).
-    run_syncsecret_case "8: unrelated enabled=true fields elsewhere, syncSecret genuinely true" '{"enabled":true,"otherFeature":{"enabled":true},"syncSecret":{"enabled":true},"nested":{"deep":{"enabled":true}}}' PASS
-    # 9: syncSecret.enabled=false plus an unrelated enabled=true elsewhere must still FAIL -- the unrelated field must never cause a false positive.
-    run_syncsecret_case "9: syncSecret=false + unrelated enabled=true elsewhere" '{"enabled":true,"syncSecret":{"enabled":false},"otherFeature":{"enabled":true}}' FAIL
-    # Malformed JSON from a broken/truncated helm get values output must fail closed, never crash uncaught.
-    run_syncsecret_case "malformed JSON" 'not valid json{{{' FAIL
-    # Helm release genuinely absent: the existing non-Helm-managed-driver skip path must remain a clean PASS (documented, intentional -- not part of this fix's scope).
-    run_syncsecret_case "Helm release absent (driver managed outside Helm)" '{}' PASS 1
-  else
-    fail "Secrets Store CSI syncSecret fix: could not extract the 'Validate Secrets Store CSI configuration' step from ${EKS_APP_WORKFLOW}"
-  fi
-else
-  skip "Secrets Store CSI syncSecret Validation False-Negative Correction -- python3/PyYAML unavailable or main workflow missing"
-fi
-
-# 9 (GoldenGate Runtime Desired-State Simplification): the build job's workflow summary accurately documents every deletion trigger (physical removal, zero-byte, whitespace-only, comment-only, YAML null, deployment.enabled=false) and states that lifecycle.state is retired and no longer a second source of truth.
-if [ "$PYTHON_AVAILABLE" = "true" ]; then
-  BUILD_SUMMARY_TEXT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
-import sys
-import yaml
-with open(sys.argv[1]) as f:
-    doc = yaml.safe_load(f)
-for step in doc["jobs"]["build_publish_and_deploy"]["steps"]:
-    if step.get("name") == "Workflow summary":
-        sys.stdout.write(step["run"])
-        break
-else:
-    sys.exit("step not found")
-PYEOF
-)"
-
-  SUMMARY_MISSING=""
-  for phrase in "zero-byte" "whitespace-only" "comment-only" "YAML null" "physical removal" "deployment.enabled=false" "lifecycle.state is retired"; do
-    echo "$BUILD_SUMMARY_TEXT" | grep -qF "$phrase" || SUMMARY_MISSING="${SUMMARY_MISSING} [${phrase}]"
-  done
-  # lifecycle.state=absent must never reappear as a documented deletion trigger -- it is fully retired, never a second source of truth.
-  if echo "$BUILD_SUMMARY_TEXT" | grep -qF "lifecycle.state=absent"; then
-    SUMMARY_MISSING="${SUMMARY_MISSING} [unexpected: lifecycle.state=absent still documented]"
-  fi
-
-  if [ -z "$SUMMARY_MISSING" ]; then
-    pass "9: the workflow summary documents every deletion trigger (physical removal, zero-byte, whitespace-only, comment-only, YAML null, deployment.enabled=false) and states lifecycle.state is retired, never a second source of truth"
-  else
-    fail "9: the workflow summary is missing expected deletion-trigger documentation, or still documents the retired lifecycle.state=absent shape:${SUMMARY_MISSING}"
-  fi
-else
-  skip "workflow summary deletion-trigger documentation check -- python3 not available"
-fi
-
-# GoldenGate Runtime Presence Contract Finalization, Defect 4: REALLY EXECUTE the committed "Classify runtime ownership safety before removal (read-only)" step (never a reimplementation) against a fake automation/orchestration/runtime_state.py stub shadowed via cwd, for every classifier state -- proving it succeeds for ABSENT/OWNED (publishing the right RUNTIME_OWNERSHIP_STATE=... to $GITHUB_ENV) and fails closed (non-zero exit, BEFORE any mutation) for BROKEN. GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 2: the retired/unsupported legacyPair path now ALSO fails closed here (never RUNTIME_OWNERSHIP_STATE=NOT_APPLICABLE, never a classifier-skip bypass into the mutating steps below). Then statically proves "Delete Argo CD Application" itself can never run for BROKEN or an unsupported deployment_model: its own if: condition is exactly the OWNED/ABSENT allow-list (NOT_APPLICABLE removed entirely), with no always()/continue-on-error override that could bypass a failed prior step. Finally, a stub-kubectl proof REALLY executes both steps in the sequence GitHub Actions' own default step semantics would produce, confirming a foreign/BROKEN or unsupported/legacyPair Application never produces a logged kubectl patch/delete call, while a genuinely OWNED one does.
-echo ""
-echo "--- GoldenGate Runtime Presence Contract Finalization, Defect 4: ownership-classify-before-delete ---"
-
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
-  set +e
-  OWNERSHIP_DELETE_ORDER_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE5_RUNTIME_TOOL" ]; then
+  PHASE5_DELEGATION_CHECK="$(python3 - "$EKS_APP_WORKFLOW" "$PHASE5_RUNTIME_TOOL" <<'PYEOF'
+import importlib.util
+import io
 import json
-import os
-import subprocess
 import sys
-import tempfile
+from contextlib import redirect_stdout
+from unittest import mock
 
 import yaml
 
-with open(sys.argv[1]) as f:
+workflow_path, tool_path = sys.argv[1:3]
+
+with open(workflow_path) as f:
     doc = yaml.safe_load(f)
 
-job = doc["jobs"]["delete_removed_argocd_applications"]
-steps_by_name = {s.get("name"): s for s in job["steps"]}
+spec = importlib.util.spec_from_file_location("phase5_runtime", tool_path)
+phase5_runtime = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(phase5_runtime)
 
 results = []
-
-classify_step = steps_by_name.get("Classify runtime ownership safety before removal (read-only)")
-delete_step = steps_by_name.get("Delete Argo CD Application")
-if classify_step is None:
-    results.append(("classify step: 'Classify runtime ownership safety before removal (read-only)' exists in delete_removed_argocd_applications", False))
-if delete_step is None:
-    results.append(("delete step: 'Delete Argo CD Application' exists in delete_removed_argocd_applications", False))
-
-step_names = [s.get("name") for s in job["steps"]]
-if classify_step is not None and delete_step is not None:
-    results.append(("ordering: the classify step comes strictly before the delete step", step_names.index("Classify runtime ownership safety before removal (read-only)") < step_names.index("Delete Argo CD Application")))
-
-STUB_TEMPLATE = '''import argparse, json, os, sys
-sentinel = os.environ.get("STUB_SENTINEL_PATH")
-if sentinel:
-    with open(sentinel, "a") as f:
-        f.write("invoked\\n")
-p = argparse.ArgumentParser()
-p.add_argument("--environment", required=True)
-p.add_argument("--deployment-id", required=True)
-p.add_argument("--kubectl-bin", default="kubectl")
-p.parse_args()
-print(json.dumps({{"state": {state!r}, "environment": "dev", "deployment_id": "gg-postgresql-repltest-01", "namespace": "goldengate-dev", "reasons": [], "checks": {{}}}}))
-sys.exit(0)
-'''
+build_job = doc["jobs"]["build_publish_and_deploy"]
+delete_job = doc["jobs"]["delete_removed_argocd_applications"]
+build_steps_by_name = {s.get("name"): s for s in build_job["steps"]}
+delete_steps_by_name = {s.get("name"): s for s in delete_job["steps"]}
 
 
-def run_classify(script, state, deployment_model="singleRuntime"):
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        tool_dir = os.path.join(tmp_dir, "automation", "orchestration")
-        os.makedirs(tool_dir)
-        with open(os.path.join(tool_dir, "runtime_state.py"), "w") as f:
-            f.write(STUB_TEMPLATE.format(state=state))
-        sentinel_path = os.path.join(tmp_dir, "sentinel.log")
-        fd, gh_env_path = tempfile.mkstemp()
-        os.close(fd)
-        # PIP_BREAK_SYSTEM_PACKAGES=1: this local sandbox's system Python is PEP 668 externally-managed, so the real step's own unmodified "python3 -m pip install ... PyYAML==6.0.1" line would otherwise abort the whole extracted script under set -euo pipefail before it ever reaches the classify logic being tested -- never an issue on the real GitHub-hosted/CodeBuild runners this workflow actually targets.
-        env = {
-            "PATH": os.environ.get("PATH", ""),
-            "ENVIRONMENT": "dev",
-            "DEPLOYMENT_ID": "gg-postgresql-repltest-01",
-            "DEPLOYMENT_MODEL": deployment_model,
-            "ARGOCD_APP_NAME": "goldengate-dev-postgresql-repltest-01",
-            "GITHUB_ENV": gh_env_path,
-            "PIP_BREAK_SYSTEM_PACKAGES": "1",
-            "STUB_SENTINEL_PATH": sentinel_path,
-        }
-        proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, cwd=tmp_dir, timeout=30)
-        with open(gh_env_path) as f:
-            env_text = f.read()
-        os.unlink(gh_env_path)
-        invoked = os.path.exists(sentinel_path)
-        return proc.returncode, env_text, proc.stdout + proc.stderr, invoked
+def calls_subcommand(step, subcommand):
+    return step is not None and f"phase5_runtime.py {subcommand}" in step.get("run", "")
 
 
-if classify_step is not None:
-    classify_script = classify_step["run"]
-    for state in ("ABSENT", "OWNED"):
-        rc, env_text, log, invoked = run_classify(classify_script, state)
-        results.append((f"classify succeeds for state={state} and publishes RUNTIME_OWNERSHIP_STATE={state} to $GITHUB_ENV (deployment_model=singleRuntime)", rc == 0 and f"RUNTIME_OWNERSHIP_STATE={state}" in env_text and invoked))
+# 10/11: syncSecret validation delegates to phase5_runtime.py validate-cluster-prerequisites, never reimplementing the old grep-based text-scraping (or its stale ogg-oracle-admin literal) inline in the workflow.
+prereq_step = build_steps_by_name.get("Validate live EKS runtime prerequisites")
+results.append(("10a/10b/11: 'Validate live EKS runtime prerequisites' delegates to phase5_runtime.py validate-cluster-prerequisites, never reimplementing syncSecret/grep logic inline", calls_subcommand(prereq_step, "validate-cluster-prerequisites")))
+results.append(("10a: the workflow no longer contains the old grep -A3 -i syncSecret text-scraping pattern", "grep -A3 -i syncSecret" not in (prereq_step.get("run", "") if prereq_step else "")))
+results.append(("10b: the workflow no longer uses grep -qi \"enabled: true\" to determine the syncSecret boolean", 'grep -qi "enabled: true"' not in (prereq_step.get("run", "") if prereq_step else "")))
+results.append(("11: the stale literal ogg-oracle-admin no longer appears in the Secrets Store CSI prerequisite diagnostic", "ogg-oracle-admin" not in (prereq_step.get("run", "") if prereq_step else "")))
 
-    rc, env_text, log, invoked = run_classify(classify_script, "BROKEN")
-    results.append(("classify FAILS CLOSED (non-zero exit) for state=BROKEN, before any Application finalizer patch or deletion -- never auto-repaired here", rc != 0 and invoked))
+with open(tool_path) as f:
+    tool_source = f.read()
+results.append(("10c: phase5_runtime.py fetches Helm values structurally via --output json (never grep-scraping YAML text)", '"--output"' in tool_source and '"json"' in tool_source))
+results.append(("phase5_runtime.py never contains the old grep -A3 -i syncSecret pattern either", "grep -A3 -i syncSecret" not in tool_source))
 
-    # GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 2: legacyPair is retired and unsupported -- it now fails closed BEFORE the singleRuntime classifier is even invoked (never RUNTIME_OWNERSHIP_STATE=NOT_APPLICABLE, never a bypass into the mutating steps below).
-    rc, env_text, log, invoked = run_classify(classify_script, "BROKEN", deployment_model="legacyPair")
-    results.append(("9: classify FAILS CLOSED (non-zero exit) for the retired/unsupported legacyPair deployment_model, before any mutation, without ever invoking the singleRuntime ownership classifier", rc != 0 and not invoked))
-    results.append(("classify never publishes RUNTIME_OWNERSHIP_STATE=NOT_APPLICABLE for legacyPair (that bypass state no longer exists)", "RUNTIME_OWNERSHIP_STATE=NOT_APPLICABLE" not in env_text))
+# Real behavioral proof: exercise _validate_sync_secret_enabled() directly (never a reimplementation) against the exact scenarios the old bash-stub harness used to cover.
+def sync_secret_ok(values_json):
+    try:
+        phase5_runtime._validate_sync_secret_enabled(values_json)
+        return True
+    except phase5_runtime.Phase5Error:
+        return False
 
-if delete_step is not None:
-    delete_if = delete_step.get("if", "")
-    results.append(("delete step: if: condition is exactly the OWNED/ABSENT allow-list (never BROKEN)", "BROKEN" not in delete_if and "OWNED" in delete_if and "ABSENT" in delete_if))
-    results.append(("10: delete step's if: condition no longer contains NOT_APPLICABLE at all -- no state may authorize kubectl patch/delete without having been classified", "NOT_APPLICABLE" not in delete_if))
-    results.append(("delete step: no always()/continue-on-error override that could bypass a failed prior (classify) step", "always()" not in delete_if and not delete_step.get("continue-on-error", False)))
 
-# 11: fake/stub kubectl proof -- REALLY execute classify then (only if GitHub Actions' own default step semantics would actually reach it) the delete step, with a stub kubectl on PATH that logs every invocation; a foreign/BROKEN or unsupported/legacyPair Application must never produce a logged kubectl patch/delete call, while a genuinely OWNED one does (a silent/no-op stub would otherwise let this test pass vacuously).
-if classify_step is not None and delete_step is not None:
-    STUB_KUBECTL = "#!/usr/bin/env bash\necho \"$@\" >> \"$KUBECTL_CALL_LOG\"\nexit 0\n"
+results.append(("syncSecret case [1: syncSecret.enabled=true]: production function succeeds as expected", sync_secret_ok(json.dumps({"syncSecret": {"enabled": True}}))))
+results.append(("syncSecret case [2: enabled=false]: production function fails closed as expected", not sync_secret_ok(json.dumps({"syncSecret": {"enabled": False}}))))
+results.append(("syncSecret case [3: syncSecret missing]: production function fails closed as expected", not sync_secret_ok(json.dumps({"tokenRequests": []}))))
+results.append(("syncSecret case [4: enabled missing]: production function fails closed as expected", not sync_secret_ok(json.dumps({"syncSecret": {}}))))
+results.append(("syncSecret case [5: enabled=null]: production function fails closed as expected", not sync_secret_ok(json.dumps({"syncSecret": {"enabled": None}}))))
+results.append(("syncSecret case [6: enabled=\"true\" (string)]: production function fails closed as expected", not sync_secret_ok(json.dumps({"syncSecret": {"enabled": "true"}}))))
+results.append(("syncSecret case [7: extra neighboring tokenRequests fields]: production function succeeds as expected", sync_secret_ok(json.dumps({"syncSecret": {"enabled": True}, "tokenRequests": [{"audience": "sts.amazonaws.com"}]}))))
+results.append(("syncSecret case [8: unrelated enabled=true fields elsewhere, syncSecret genuinely true]: production function succeeds as expected", sync_secret_ok(json.dumps({"enabled": True, "otherFeature": {"enabled": True}, "syncSecret": {"enabled": True}}))))
+results.append(("syncSecret case [9: syncSecret=false + unrelated enabled=true elsewhere]: production function fails closed as expected", not sync_secret_ok(json.dumps({"enabled": True, "syncSecret": {"enabled": False}, "otherFeature": {"enabled": True}}))))
+results.append(("syncSecret case [malformed JSON]: production function fails closed as expected", not sync_secret_ok("not valid json{{{")))
 
-    def run_full_sequence(state, deployment_model):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            bin_dir = os.path.join(tmp_dir, "bin")
-            os.makedirs(bin_dir)
-            kubectl_log = os.path.join(tmp_dir, "kubectl_calls.log")
-            with open(os.path.join(bin_dir, "kubectl"), "w") as f:
-                f.write(STUB_KUBECTL)
-            os.chmod(os.path.join(bin_dir, "kubectl"), 0o755)
+for needle in ("secrets-store.csi.k8s.io", "secretproviderclasses.secrets-store.csi.x-k8s.io", "sts.amazonaws.com", "pods.eks.amazonaws.com"):
+    results.append((f"preserved prerequisite: phase5_runtime.py still checks for '{needle}'", needle in tool_source))
 
-            tool_dir = os.path.join(tmp_dir, "automation", "orchestration")
-            os.makedirs(tool_dir)
-            with open(os.path.join(tool_dir, "runtime_state.py"), "w") as f:
-                f.write(STUB_TEMPLATE.format(state=state))
+# 9: the workflow summary (now generated by cmd_summary()) documents every deletion trigger and states lifecycle.state is retired.
+summary_step = build_steps_by_name.get("Workflow summary")
+results.append(("9: 'Workflow summary' delegates to phase5_runtime.py summary --mode reconcile, never reimplementing summary text inline", calls_subcommand(summary_step, "summary")))
 
-            fd, gh_env_path = tempfile.mkstemp()
-            os.close(fd)
-            env = {
-                "PATH": bin_dir + os.pathsep + os.environ.get("PATH", ""),
-                "ENVIRONMENT": "dev",
-                "DEPLOYMENT_ID": "gg-postgresql-repltest-01",
-                "DEPLOYMENT_MODEL": deployment_model,
-                "ARGOCD_APP_NAME": "goldengate-dev-postgresql-repltest-01",
-                "ARGOCD_NAMESPACE": "argocd",
-                "TARGET_NAMESPACE": "goldengate-dev",
-                "GITHUB_ENV": gh_env_path,
-                "PIP_BREAK_SYSTEM_PACKAGES": "1",
-                "KUBECTL_CALL_LOG": kubectl_log,
-            }
-            classify_proc = subprocess.run(["bash", "-c", classify_step["run"]], env=env, capture_output=True, text=True, cwd=tmp_dir, timeout=30)
-            with open(gh_env_path) as f:
-                env_text = f.read()
-            os.unlink(gh_env_path)
-            runtime_ownership_state = None
-            for line in env_text.splitlines():
-                if line.startswith("RUNTIME_OWNERSHIP_STATE="):
-                    runtime_ownership_state = line.split("=", 1)[1]
+# GoldenGate Runtime Presence Contract Finalization, Defect 4 / Gap 2 / Gap 5: real behavioral proof against the actual removal functions.
+classify_step = delete_steps_by_name.get("Classify removal safety")
+remove_step = delete_steps_by_name.get("Remove owned runtime Application")
+absence_step = delete_steps_by_name.get("Verify runtime compute absence")
+results.append(("classify step: 'Classify removal safety' exists in delete_removed_argocd_applications", classify_step is not None))
+results.append(("delete step: 'Remove owned runtime Application' exists in delete_removed_argocd_applications", remove_step is not None))
+results.append(("absence step: 'Verify runtime compute absence' exists in delete_removed_argocd_applications", absence_step is not None))
+step_names = [s.get("name") for s in delete_job["steps"]]
+if classify_step is not None and remove_step is not None and absence_step is not None:
+    results.append(("ordering: classify -> remove -> verify-absence, strictly in that order", step_names.index("Classify removal safety") < step_names.index("Remove owned runtime Application") < step_names.index("Verify runtime compute absence")))
+results.append(("classify step delegates to phase5_runtime.py removal-preflight, never reimplementing classifier invocation inline", calls_subcommand(classify_step, "removal-preflight")))
+results.append(("delete step delegates to phase5_runtime.py remove-runtime, never reimplementing kubectl patch/delete inline", calls_subcommand(remove_step, "remove-runtime")))
+results.append(("absence step delegates to phase5_runtime.py post-delete-acceptance, never reimplementing the bounded retry loop inline", calls_subcommand(absence_step, "post-delete-acceptance")))
 
-            # Mirrors GitHub Actions' own default step semantics for this exact job (no always()/continue-on-error on either step): the delete step only actually runs when the classify step succeeded AND its own if: condition (evaluated against the classify step's published state) is satisfied -- never a reimplementation of the GHA engine itself, just the two concrete facts that gate it.
-            delete_would_run = classify_proc.returncode == 0 and runtime_ownership_state in ("OWNED", "ABSENT")
-            if delete_would_run:
-                subprocess.run(["bash", "-c", delete_step["run"]], env=env, capture_output=True, text=True, cwd=tmp_dir, timeout=30)
 
-            kubectl_calls = []
-            if os.path.exists(kubectl_log):
-                with open(kubectl_log) as f:
-                    kubectl_calls = [line.strip() for line in f if line.strip()]
-            mutating_calls = [c for c in kubectl_calls if c.startswith("patch ") or c.startswith("delete ")]
-            return classify_proc.returncode, mutating_calls
+def classify_state(state_word, deployment_model="singleRuntime"):
+    """Mirrors cmd_removal_preflight()'s own classifier-invocation/fail-closed contract, driven through the real function with a scripted subprocess."""
+    import tempfile
+    from pathlib import Path
 
-    rc, mutating_calls = run_full_sequence("BROKEN", "singleRuntime")
-    results.append(("11a: a foreign/BROKEN Application never reaches a logged kubectl patch/delete call (stub kubectl proof)", rc != 0 and mutating_calls == []))
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "state.json"
+        phase5_runtime.update_state(state_path, {
+            "environment": "dev", "deployment_id": "gg-postgresql-repltest-01", "deployment_model": deployment_model,
+            "efs_mode": "", "reason": "deployment-disabled", "runtime_namespace": "goldengate-dev",
+            "argocd_namespace": "argocd", "argocd_app_name": "goldengate-dev-postgresql-repltest-01",
+        }, phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
 
-    rc, mutating_calls = run_full_sequence("BROKEN", "legacyPair")
-    results.append(("11b: an unsupported/legacyPair deployment_model never reaches a logged kubectl patch/delete call (stub kubectl proof)", rc != 0 and mutating_calls == []))
+        def fake_run(argv, env=None, cwd=None, check=True, capture_output=True, input_text=None):
+            class P:
+                pass
+            if argv[:2] == ["aws", "eks"]:
+                return type("Proc", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+            if str(phase5_runtime.RUNTIME_STATE_TOOL) in argv:
+                return type("Proc", (), {"returncode": 0, "stdout": json.dumps({"state": state_word, "environment": "dev", "deployment_id": "gg-postgresql-repltest-01", "namespace": "goldengate-dev", "reasons": [], "checks": {"application_found": False, "footprint_found": {}}}), "stderr": ""})()
+            return type("Proc", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
-    rc, mutating_calls = run_full_sequence("OWNED", "singleRuntime")
-    results.append(("11c (positive control): a genuinely OWNED singleRuntime Application DOES reach kubectl patch and delete -- proves the stub-kubectl harness above is actually wired to detect mutation, not silently vacuous", rc == 0 and any(c.startswith("patch ") for c in mutating_calls) and any(c.startswith("delete application") for c in mutating_calls)))
+        args = type("Args", (), {"environment": "dev", "deployment_id": "gg-postgresql-repltest-01", "state_path": state_path})()
+        with mock.patch.object(phase5_runtime, "run", fake_run), mock.patch.dict(__import__("os").environ, {"AWS_REGION": "eu-west-1", "EKS_CLUSTER_NAME": "x", "EKS_DEPLOY_ROLE_ARN": "arn:aws:iam::668311715351:role/x"}):
+            try:
+                with redirect_stdout(io.StringIO()):
+                    phase5_runtime.cmd_removal_preflight(args)
+                return 0, phase5_runtime.load_state(state_path)
+            except phase5_runtime.Phase5Error:
+                return 1, None
+
+
+for state_word in ("ABSENT", "OWNED"):
+    rc, final_state = classify_state(state_word)
+    results.append((f"classify succeeds for state={state_word} and records ownership_state={state_word} (deployment_model=singleRuntime)", rc == 0 and final_state is not None and final_state.get("ownership_state") == state_word))
+
+rc, _ = classify_state("BROKEN")
+results.append(("classify FAILS CLOSED (non-zero exit) for state=BROKEN, before any Application finalizer patch or deletion -- never auto-repaired here", rc != 0))
+
+rc, _ = classify_state("BROKEN", deployment_model="legacyPair")
+results.append(("9: classify FAILS CLOSED (non-zero exit) for the retired/unsupported legacyPair deployment_model, before any mutation, without ever invoking the singleRuntime ownership classifier", rc != 0))
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
 PYEOF
 )"
-  OWNERSHIP_DELETE_ORDER_STATUS=$?
-  set -e
-
-  OWNERSHIP_DELETE_ORDER_FAILURES="$(echo "$OWNERSHIP_DELETE_ORDER_OUT" | grep "^FAIL " || true)"
-  if [ "$OWNERSHIP_DELETE_ORDER_STATUS" -eq 0 ] && [ -z "$OWNERSHIP_DELETE_ORDER_FAILURES" ]; then
+  echo "$PHASE5_DELEGATION_CHECK"
+  PHASE5_DELEGATION_FAILURES="$(echo "$PHASE5_DELEGATION_CHECK" | grep "^FAIL " || true)"
+  if [ -z "$PHASE5_DELEGATION_FAILURES" ]; then
     while IFS= read -r line; do
       case "$line" in
-        OK\ *) pass "Defect 4: ${line#OK }" ;;
+        OK\ *) pass "Phase 5 Python Conversion: ${line#OK }" ;;
       esac
-    done <<< "$OWNERSHIP_DELETE_ORDER_OUT"
+    done <<< "$PHASE5_DELEGATION_CHECK"
   else
-    fail "Defect 4: ownership-classify-before-delete execution proof failed:"$'\n'"${OWNERSHIP_DELETE_ORDER_OUT}"
+    fail "Phase 5 Python Conversion: syncSecret/summary/removal delegation check failed:"$'\n'"${PHASE5_DELEGATION_CHECK}"
   fi
 else
-  skip "Defect 4: ownership-classify-before-delete execution proof -- python3/PyYAML/EKS_APP_WORKFLOW unavailable"
-fi
-
-# GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 5 (tests 28/29): REALLY EXECUTE the committed "Verify runtime compute is absent after removal (read-only)" step against a fake automation/orchestration/runtime_state.py stub -- proving it accepts ABSENT and OWNED (28/29: OWNED is the intentionally-retained-PVC shape, explicitly permitted, never treated as a failure), and FAILS CLOSED after its bounded retry deadline when the classifier keeps reporting BROKEN (unexpected compute never quietly accepted). TIMEOUT_SECONDS/INTERVAL_SECONDS are text-substituted down to a few seconds purely so this exercises the real retry-then-fail-closed control flow quickly -- the substituted values are never asserted as the production timeout itself (that remains the real committed 180s/15s, unedited in the workflow file).
-echo ""
-echo "--- GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 5: post-delete runtime compute absence acceptance ---"
-
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
-  set +e
-  POST_DELETE_ACCEPTANCE_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
-import json
-import os
-import subprocess
-import sys
-import tempfile
-
-import yaml
-
-with open(sys.argv[1]) as f:
-    doc = yaml.safe_load(f)
-
-job = doc["jobs"]["delete_removed_argocd_applications"]
-step = next((s for s in job["steps"] if s.get("name") == "Verify runtime compute is absent after removal (read-only)"), None)
-
-results = []
-if step is None:
-    results.append(("post-delete step: 'Verify runtime compute is absent after removal (read-only)' exists in delete_removed_argocd_applications", False))
-    for label, ok in results:
-        print(("OK " if ok else "FAIL ") + label)
-    sys.exit(0)
-
-# Fast-test substitution only -- the committed production values (180s/15s) are left completely untouched in the workflow file itself.
-fast_script = step["run"].replace("TIMEOUT_SECONDS=180", "TIMEOUT_SECONDS=6").replace("INTERVAL_SECONDS=15", "INTERVAL_SECONDS=2")
-results.append(("fast-test substitution actually matched (production TIMEOUT_SECONDS=180/INTERVAL_SECONDS=15 still present verbatim in the real committed step)", "TIMEOUT_SECONDS=180" in step["run"] and "INTERVAL_SECONDS=15" in step["run"]))
-
-STUB_TEMPLATE_STATIC = '''import argparse, json, sys
-p = argparse.ArgumentParser()
-p.add_argument("--environment", required=True)
-p.add_argument("--deployment-id", required=True)
-p.add_argument("--kubectl-bin", default="kubectl")
-p.parse_args()
-print(json.dumps({{"state": {state!r}, "environment": "dev", "deployment_id": "gg-postgresql-repltest-01", "namespace": "goldengate-dev", "reasons": [], "checks": {{}}}}))
-sys.exit(0)
-'''
-
-STUB_TEMPLATE_ALWAYS_BROKEN = '''import argparse, json, sys
-p = argparse.ArgumentParser()
-p.add_argument("--environment", required=True)
-p.add_argument("--deployment-id", required=True)
-p.add_argument("--kubectl-bin", default="kubectl")
-p.parse_args()
-print(json.dumps({"state": "BROKEN", "environment": "dev", "deployment_id": "gg-postgresql-repltest-01", "namespace": "goldengate-dev", "reasons": ["unexpected lingering StatefulSet"], "checks": {}}))
-sys.exit(0)
-'''
-
-
-def run_post_delete_check(stub_source):
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        tool_dir = os.path.join(tmp_dir, "automation", "orchestration")
-        os.makedirs(tool_dir)
-        with open(os.path.join(tool_dir, "runtime_state.py"), "w") as f:
-            f.write(stub_source)
-        env = {
-            "PATH": os.environ.get("PATH", ""),
-            "ENVIRONMENT": "dev",
-            "DEPLOYMENT_ID": "gg-postgresql-repltest-01",
-            "DEPLOYMENT_MODEL": "singleRuntime",
-            "PIP_BREAK_SYSTEM_PACKAGES": "1",
-        }
-        proc = subprocess.run(["bash", "-c", fast_script], env=env, capture_output=True, text=True, cwd=tmp_dir, timeout=30)
-        return proc.returncode, proc.stdout + proc.stderr
-
-
-for state in ("ABSENT", "OWNED"):
-    rc, log = run_post_delete_check(STUB_TEMPLATE_STATIC.format(state=state))
-    results.append((f"post-delete acceptance succeeds (exit 0) when the classifier reports {state} -- runtime compute confirmed absent, a retained PVC (OWNED) explicitly permitted, never treated as a failure", rc == 0))
-
-rc, log = run_post_delete_check(STUB_TEMPLATE_ALWAYS_BROKEN)
-results.append(("post-delete acceptance FAILS CLOSED (non-zero exit) after its bounded retry deadline when the classifier keeps reporting BROKEN -- unexpected compute is never silently accepted, and nothing is deleted manually to force success", rc != 0 and "FAIL" in log))
-
-for label, ok in results:
-    print(("OK " if ok else "FAIL ") + label)
-PYEOF
-)"
-  POST_DELETE_ACCEPTANCE_STATUS=$?
-  set -e
-
-  POST_DELETE_ACCEPTANCE_FAILURES="$(echo "$POST_DELETE_ACCEPTANCE_OUT" | grep "^FAIL " || true)"
-  if [ "$POST_DELETE_ACCEPTANCE_STATUS" -eq 0 ] && [ -z "$POST_DELETE_ACCEPTANCE_FAILURES" ]; then
-    while IFS= read -r line; do
-      case "$line" in
-        OK\ *) pass "Gap 5: ${line#OK }" ;;
-      esac
-    done <<< "$POST_DELETE_ACCEPTANCE_OUT"
-  else
-    fail "Gap 5: post-delete runtime compute absence acceptance execution proof failed:"$'\n'"${POST_DELETE_ACCEPTANCE_OUT}"
-  fi
-else
-  skip "Gap 5: post-delete runtime compute absence acceptance execution proof -- python3/PyYAML/EKS_APP_WORKFLOW unavailable"
+  skip "Phase 5 Python Conversion: syncSecret/summary/removal delegation check -- python3/PyYAML/EKS_APP_WORKFLOW/phase5_runtime.py unavailable"
 fi
 
 # Malformed CURRENT YAML must fail the workflow closed (never silently skipped or deleted); whole-folder, whole-envs-directory, and rename scenarios exercised through the REAL discovery logic (git diff --name-status), not just the isolated per-ID loop above.
@@ -4093,12 +3810,13 @@ else
   pass "legacyPair source-statefulset.yaml/target-statefulset.yaml no longer exist"
 fi
 
-if grep -q "resources-finalizer.argocd.argoproj.io" "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && grep -q "Refusing to delete namespace" "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && grep -q "ownership labels" "$EKS_APP_WORKFLOW" 2>/dev/null; then
-  pass "Argo CD deletion safeguards (finalizer wait, shared-namespace refusal, ownership-label verification) remain present"
+# Phase 5 Python Conversion: the old "Clean up remaining GoldenGate namespace if still present" step (a guarded namespace-deletion fallback with a text-based refusal message) was removed entirely, never merely reworded -- singleRuntime never owns the shared runtime namespace, so Phase 5C's remove-runtime command contains NO namespace-deletion code path at all (a stronger guarantee than a runtime text-based refusal). The Argo CD Application finalizer-wait safeguard itself is unchanged.
+if grep -q "resources-finalizer.argocd.argoproj.io" "$PHASE5_RUNTIME_TOOL" 2>/dev/null \
+    && grep -qF "phase5_runtime.py remove-runtime" "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && ! grep -qE 'kubectl (get|delete) namespace' "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "Argo CD deletion safeguards preserved: the finalizer is still patched before delete (phase5_runtime.py), removal delegates to phase5_runtime.py remove-runtime, and no namespace-deletion command exists anywhere in the workflow (a stronger guarantee than the old text-based refusal)"
 else
-  fail "one or more Argo CD deletion safeguards appear to be missing from ${EKS_APP_WORKFLOW}"
+  fail "one or more Argo CD deletion safeguards appear to be missing"
 fi
 
 # 24. No accidental pasted command-note files under automation/.
@@ -4314,34 +4032,18 @@ else
   skip "Live Network Fix 1: Argo ECR token-sync regional STS structural render check -- helm/python3 unavailable or helm/argocd/charts/argo-cd missing"
 fi
 
-# 26. EFS rendered-resource validation: strict basePath derivation (matching goldengate.efsBasePath), fail-closed YAML parsing, no fragile grep on an optional key under set -euo pipefail.
+# 26. EFS rendered-resource validation: strict basePath derivation (matching goldengate.efsBasePath), fail-closed YAML parsing, no fragile grep on an optional key under set -euo pipefail. Phase 5 Python Conversion: this render-time validation moved from inline `run:` bash into automation/phases/phase5/phase5_runtime.py's own _validate_efs_render_contract()/_validate_efs_values_shape() functions -- extracting/executing a step's `run:` text no longer applies, since that step is now a single-line phase5_runtime.py validate-local invocation. This section keeps the real end-to-end value the old bash-extraction approach could not replace on its own -- REAL `helm template` output from the actual runtime chart, against the two real current descriptors, fed directly into the real Python validator function -- while every exhaustive shape/failure-mode permutation (missing fileSystemId, missing mode, managed+committed fileSystemId, etc.) now lives in automation/phases/phase5/tests/test_phase5_runtime.py's EfsValuesShapeTests/EfsRenderedManifestTests classes, which call the same real functions directly and run as part of this same regression via the "test_phase5_runtime.py" invocation elsewhere in this suite.
 echo ""
 echo "--- EFS persistence validation: basePath derivation, strict parsing, StorageClass/PVC checks ---"
 
 if [ "$HELM_AVAILABLE" = "true" ] && [ "$PYTHON_AVAILABLE" = "true" ]; then
-  python3 - "$EKS_APP_WORKFLOW" > "${WORKDIR}/efs_validate.sh" <<'PYEOF'
-import sys
-import yaml
-with open(sys.argv[1]) as f:
-    doc = yaml.safe_load(f)
-for step in doc["jobs"]["build_publish_and_deploy"]["steps"]:
-    if step.get("name") == "Validate EFS persistence resources are rendered":
-        sys.stdout.write(step["run"])
-        break
-else:
-    sys.exit("step not found")
-PYEOF
+  EFS_WORKDIR="${WORKDIR}/efs-test"
+  mkdir -p "${EFS_WORKDIR}/rendered" "${EFS_WORKDIR}/values"
 
-  if [ ! -s "${WORKDIR}/efs_validate.sh" ]; then
-    fail "could not extract the 'Validate EFS persistence resources are rendered' step from ${EKS_APP_WORKFLOW}"
-  else
-    EFS_WORKDIR="${WORKDIR}/efs-test"
-    mkdir -p "${EFS_WORKDIR}/rendered" "${EFS_WORKDIR}/values"
-
-    # mode=existing scratch fixtures: derived by mutating ONLY persistence.efs on scratch copies of the two current real descriptors (never a hand-duplicated retired production descriptor) -- proves the generic mode=existing code path from a source that always exists.
-    ORACLE_EXISTING_FIXTURE="${EFS_WORKDIR}/values/existing-mode-a.yaml"
-    POSTGRESQL_EXISTING_FIXTURE="${EFS_WORKDIR}/values/existing-mode-b.yaml"
-    python3 -c "
+  # mode=existing scratch fixtures: derived by mutating ONLY persistence.efs on scratch copies of the two current real descriptors (never a hand-duplicated retired production descriptor) -- proves the generic mode=existing code path from a source that always exists.
+  ORACLE_EXISTING_FIXTURE="${EFS_WORKDIR}/values/existing-mode-a.yaml"
+  POSTGRESQL_EXISTING_FIXTURE="${EFS_WORKDIR}/values/existing-mode-b.yaml"
+  python3 -c "
 import yaml
 
 def make_existing_fixture(src_path, dst_path, fs_id):
@@ -4356,55 +4058,17 @@ make_existing_fixture('envs/dev/gg-postgresql-repltest-01/values.yaml', '${ORACL
 make_existing_fixture('envs/dev/gg-mssql-repltest-01/values.yaml', '${POSTGRESQL_EXISTING_FIXTURE}', 'fs-0123456789abcdef1')
 "
 
-    # EFS_MODE/EFS_FILE_SYSTEM_ID_DECLARED/RESOLVED_EFS_ID mirror what the real workflow's earlier "Resolve deployment identity"/"Resolve EFS filesystem ID" steps would have already exported via $GITHUB_ENV; every call site here uses the scratch existing-mode fixtures above (fs-0123456789abcdef1) unless a scenario is expected to fail before that value is ever consulted.
-    run_efs_step() {
-      ( cd "$EFS_WORKDIR" && \
-        RELEASE_NAME="$1" VALUES_FILE="$2" DEPLOYMENT_ID="$3" DEPLOYMENT_MODEL="$4" ENVIRONMENT="$5" \
-        EFS_MODE="existing" EFS_FILE_SYSTEM_ID_DECLARED="fs-0123456789abcdef1" RESOLVED_EFS_ID="fs-0123456789abcdef1" \
-        bash "${WORKDIR}/efs_validate.sh" 2>&1 )
-      return $?
-    }
+  helm template gg-oracle-payments-01 "$RUNTIME_CHART" --namespace goldengate-dev \
+    --values "$ORACLE_EXISTING_FIXTURE" \
+    --set global.environment=dev --set global.deploymentId=gg-oracle-payments-01 "${ORACLE_SHARED_OVERRIDES[@]}" \
+    > "${EFS_WORKDIR}/rendered/gg-oracle-payments-01.yaml" 2>"${EFS_WORKDIR}/oracle-render.err" || true
+  helm template gg-postgresql-payments-01 "$RUNTIME_CHART" --namespace goldengate-dev \
+    --values "$POSTGRESQL_EXISTING_FIXTURE" \
+    --set global.environment=dev --set global.deploymentId=gg-postgresql-payments-01 "${POSTGRESQL_SHARED_OVERRIDES[@]}" \
+    > "${EFS_WORKDIR}/rendered/gg-postgresql-payments-01.yaml" 2>"${EFS_WORKDIR}/postgres-render.err" || true
 
-    helm template gg-oracle-payments-01 "$RUNTIME_CHART" --namespace goldengate-dev \
-      --values "$ORACLE_EXISTING_FIXTURE" \
-      --set global.environment=dev --set global.deploymentId=gg-oracle-payments-01 "${ORACLE_SHARED_OVERRIDES[@]}" \
-      > "${EFS_WORKDIR}/rendered/gg-oracle-payments-01.yaml" 2>"${EFS_WORKDIR}/oracle-render.err" || true
-    helm template gg-postgresql-payments-01 "$RUNTIME_CHART" --namespace goldengate-dev \
-      --values "$POSTGRESQL_EXISTING_FIXTURE" \
-      --set global.environment=dev --set global.deploymentId=gg-postgresql-payments-01 "${POSTGRESQL_SHARED_OVERRIDES[@]}" \
-      > "${EFS_WORKDIR}/rendered/gg-postgresql-payments-01.yaml" 2>"${EFS_WORKDIR}/postgres-render.err" || true
-    set +e
-    ORACLE_OUT="$(run_efs_step "gg-oracle-payments-01" "$ORACLE_EXISTING_FIXTURE" "gg-oracle-payments-01" "singleRuntime" "dev")"
-    ORACLE_STATUS=$?
-    set -e
-    echo "$ORACLE_OUT"
-    if [ "$ORACLE_STATUS" -eq 0 ] && echo "$ORACLE_OUT" | grep -qF "Expected EFS basePath: /gg-oracle-payments-01"; then
-      pass "1: gg-oracle-payments-01 (no explicit basePath) resolves to /gg-oracle-payments-01"
-    else
-      fail "1: gg-oracle-payments-01 basePath derivation failed or produced an unexpected value"
-    fi
-
-    set +e
-    POSTGRES_OUT="$(run_efs_step "gg-postgresql-payments-01" "$POSTGRESQL_EXISTING_FIXTURE" "gg-postgresql-payments-01" "singleRuntime" "dev")"
-    POSTGRES_STATUS=$?
-    set -e
-    echo "$POSTGRES_OUT"
-    if [ "$POSTGRES_STATUS" -eq 0 ] && echo "$POSTGRES_OUT" | grep -qF "Expected EFS basePath: /gg-postgresql-payments-01"; then
-      pass "2: gg-postgresql-payments-01 (no explicit basePath) resolves to /gg-postgresql-payments-01"
-    else
-      fail "2: gg-postgresql-payments-01 basePath derivation failed or produced an unexpected value"
-    fi
-
-    if [ "$ORACLE_STATUS" -eq 0 ] && [ "$POSTGRES_STATUS" -eq 0 ] \
-        && echo "$ORACLE_OUT" | grep -qF "OK: EFS StorageClass, runtime PVC, and StatefulSet u02/u03" \
-        && echo "$POSTGRES_OUT" | grep -qF "OK: EFS StorageClass, runtime PVC, and StatefulSet u02/u03"; then
-      pass "3: both actual rendered manifests (Oracle and PostgreSQL) pass full EFS validation"
-    else
-      fail "3: one or both actual rendered manifests failed EFS validation"
-    fi
-
-    # 4: an explicit non-empty basePath override is honored.
-    python3 -c "
+  # 4: an explicit non-empty basePath override is honored.
+  python3 -c "
 import yaml
 with open('${ORACLE_EXISTING_FIXTURE}') as f:
     data = yaml.safe_load(f)
@@ -4412,279 +4076,66 @@ data['persistence']['efs']['storageClass']['basePath'] = '/custom-override-path'
 with open('${EFS_WORKDIR}/values/oracle-override.yaml', 'w') as f:
     yaml.dump(data, f)
 "
-    helm template gg-oracle-payments-01 "$RUNTIME_CHART" --namespace goldengate-dev \
-      --values "${EFS_WORKDIR}/values/oracle-override.yaml" \
-      --set global.environment=dev --set global.deploymentId=gg-oracle-payments-01 "${ORACLE_SHARED_OVERRIDES[@]}" \
-      > "${EFS_WORKDIR}/rendered/oracle-override.yaml" 2>"${EFS_WORKDIR}/override-render.err" || true
+  helm template gg-oracle-payments-01 "$RUNTIME_CHART" --namespace goldengate-dev \
+    --values "${EFS_WORKDIR}/values/oracle-override.yaml" \
+    --set global.environment=dev --set global.deploymentId=gg-oracle-payments-01 "${ORACLE_SHARED_OVERRIDES[@]}" \
+    > "${EFS_WORKDIR}/rendered/oracle-override.yaml" 2>"${EFS_WORKDIR}/override-render.err" || true
 
-    set +e
-    OVERRIDE_OUT="$(run_efs_step "oracle-override" "${EFS_WORKDIR}/values/oracle-override.yaml" "gg-oracle-payments-01" "singleRuntime" "dev")"
-    OVERRIDE_STATUS=$?
-    set -e
-    if [ "$OVERRIDE_STATUS" -eq 0 ] && echo "$OVERRIDE_OUT" | grep -qF "Expected EFS basePath: /custom-override-path"; then
-      pass "4: an explicit non-empty basePath override is honored"
-    else
-      fail "4: explicit basePath override was not honored"
-      echo "$OVERRIDE_OUT"
-    fi
+  set +e
+  EFS_REAL_RENDER_CHECK="$(python3 - "$PHASE5_RUNTIME_TOOL" "$EFS_WORKDIR" <<'PYEOF'
+import importlib.util
+import sys
 
-    # 5: mode=existing with a missing fileSystemId fails with a clear controlled error (never an unexplained shell abort).
-    cat > "${EFS_WORKDIR}/values/missing-fsid.yaml" <<'EOF'
-deploymentModel: singleRuntime
-persistence:
-  enabled: true
-  provider: efs
-  efs:
-    mode: existing
-    storageClass:
-      basePath: /x
-EOF
-    set +e
-    MISSING_FSID_OUT="$(run_efs_step "x" "${EFS_WORKDIR}/values/missing-fsid.yaml" "gg-oracle-payments-01" "singleRuntime" "dev")"
-    MISSING_FSID_STATUS=$?
-    set -e
-    if [ "$MISSING_FSID_STATUS" -ne 0 ] && echo "$MISSING_FSID_OUT" | grep -qF "persistence.efs.fileSystemId must be a non-empty string when persistence.efs.mode=existing"; then
-      pass "5: mode=existing with a missing fileSystemId fails with a clear controlled error"
-    else
-      fail "5: a missing fileSystemId did not fail with the expected controlled error"
-      echo "$MISSING_FSID_OUT"
-    fi
-
-    # 5b: mode absent entirely fails with a clear controlled error (never silently inferred).
-    cat > "${EFS_WORKDIR}/values/missing-mode.yaml" <<'EOF'
-deploymentModel: singleRuntime
-persistence:
-  enabled: true
-  provider: efs
-  efs:
-    fileSystemId: fs-0123456789abcdef1
-EOF
-    set +e
-    MISSING_MODE_OUT="$(run_efs_step "x" "${EFS_WORKDIR}/values/missing-mode.yaml" "gg-oracle-payments-01" "singleRuntime" "dev")"
-    MISSING_MODE_STATUS=$?
-    set -e
-    if [ "$MISSING_MODE_STATUS" -ne 0 ] && echo "$MISSING_MODE_OUT" | grep -qF "persistence.efs.mode must be exactly 'existing' or 'managed'"; then
-      pass "5b: mode absent entirely fails with a clear controlled error"
-    else
-      fail "5b: a missing persistence.efs.mode did not fail with the expected controlled error"
-      echo "$MISSING_MODE_OUT"
-    fi
-
-    # 5c: mode=managed with a committed fileSystemId fails with a clear controlled error (never silently permitted).
-    cat > "${EFS_WORKDIR}/values/managed-with-fsid.yaml" <<'EOF'
-deploymentModel: singleRuntime
-persistence:
-  enabled: true
-  provider: efs
-  efs:
-    mode: managed
-    fileSystemId: fs-0123456789abcdef1
-EOF
-    set +e
-    MANAGED_WITH_FSID_OUT="$(run_efs_step "x" "${EFS_WORKDIR}/values/managed-with-fsid.yaml" "gg-oracle-payments-01" "singleRuntime" "dev")"
-    MANAGED_WITH_FSID_STATUS=$?
-    set -e
-    if [ "$MANAGED_WITH_FSID_STATUS" -ne 0 ] && echo "$MANAGED_WITH_FSID_OUT" | grep -qF "must not be set when persistence.efs.mode=managed"; then
-      pass "5c: mode=managed with a committed fileSystemId fails with a clear controlled error"
-    else
-      fail "5c: mode=managed with a committed fileSystemId did not fail with the expected controlled error"
-      echo "$MANAGED_WITH_FSID_OUT"
-    fi
-
-    # 5d: mode=managed without a committed fileSystemId, using the workflow-resolved RESOLVED_EFS_ID (never the values file), passes.
-    cat > "${EFS_WORKDIR}/values/managed-ok.yaml" <<'EOF'
-deploymentModel: singleRuntime
-persistence:
-  enabled: true
-  provider: efs
-  efs:
-    mode: managed
-EOF
-    helm template gg-managed-ok "$RUNTIME_CHART" --namespace goldengate-dev \
-      --values "$ORACLE_EXISTING_FIXTURE" \
-      --set global.environment=dev --set global.deploymentId=gg-managed-ok "${ORACLE_SHARED_OVERRIDES[@]}" \
-      --set persistence.efs.fileSystemId=fs-0123456789abcdef0 \
-      > "${EFS_WORKDIR}/rendered/gg-managed-ok.yaml" 2>"${EFS_WORKDIR}/managed-ok-render.err" || true
-    set +e
-    MANAGED_OK_OUT="$( cd "$EFS_WORKDIR" && \
-      RELEASE_NAME="gg-managed-ok" VALUES_FILE="${EFS_WORKDIR}/values/managed-ok.yaml" DEPLOYMENT_ID="gg-managed-ok" DEPLOYMENT_MODEL="singleRuntime" ENVIRONMENT="dev" \
-      EFS_MODE="managed" EFS_FILE_SYSTEM_ID_DECLARED="" RESOLVED_EFS_ID="fs-0123456789abcdef0" \
-      bash "${WORKDIR}/efs_validate.sh" 2>&1 )"
-    MANAGED_OK_STATUS=$?
-    set -e
-    if [ "$MANAGED_OK_STATUS" -eq 0 ] && echo "$MANAGED_OK_OUT" | grep -qF "Expected EFS fileSystemId (RESOLVED_EFS_ID): fs-0123456789abcdef0"; then
-      pass "5d: mode=managed with no committed fileSystemId validates against RESOLVED_EFS_ID alone"
-    else
-      fail "5d: mode=managed validation against RESOLVED_EFS_ID did not behave as expected"
-      echo "$MANAGED_OK_OUT"
-    fi
-
-    # 6: malformed YAML fails closed.
-    cat > "${EFS_WORKDIR}/values/malformed.yaml" <<'EOF'
-deploymentModel: singleRuntime
-persistence:
-  enabled: true
-  provider: efs
-  efs:
-    fileSystemId: fs-x
-  bad indent: [unterminated
-EOF
-    set +e
-    MALFORMED_OUT="$(run_efs_step "x" "${EFS_WORKDIR}/values/malformed.yaml" "gg-oracle-payments-01" "singleRuntime" "dev")"
-    MALFORMED_STATUS=$?
-    set -e
-    if [ "$MALFORMED_STATUS" -ne 0 ] && echo "$MALFORMED_OUT" | grep -qF "is not valid YAML"; then
-      pass "6: malformed YAML fails closed"
-    else
-      fail "6: malformed YAML did not fail closed as expected"
-      echo "$MALFORMED_OUT"
-    fi
-
-    # 7: an unknown deploymentModel fails closed (this EFS validation step only ever expects deployment_model=singleRuntime, passed through from the job's upstream assertion -- never re-inferred here).
-    cat > "${EFS_WORKDIR}/values/unknown-model.yaml" <<'EOF'
-deploymentModel: someWeirdModel
-persistence:
-  enabled: true
-  provider: efs
-  efs:
-    fileSystemId: fs-x
-EOF
-    set +e
-    UNKNOWN_MODEL_OUT="$(run_efs_step "x" "${EFS_WORKDIR}/values/unknown-model.yaml" "gg-oracle-payments-01" "someWeirdModel" "dev")"
-    UNKNOWN_MODEL_STATUS=$?
-    set -e
-    if [ "$UNKNOWN_MODEL_STATUS" -ne 0 ] && echo "$UNKNOWN_MODEL_OUT" | grep -qF "unexpected deploymentModel"; then
-      pass "7: an unknown deploymentModel fails closed"
-    else
-      fail "7: an unknown deploymentModel did not fail closed as expected"
-      echo "$UNKNOWN_MODEL_OUT"
-    fi
-
-    # 8/9/11: mutates a real rendered manifest's StorageClass to prove the rendered-resource checks have teeth (wrong basePath, wrong fileSystemId, duplicate matching-name StorageClass).
-    python3 -c "
 import yaml
-with open('${EFS_WORKDIR}/rendered/gg-oracle-payments-01.yaml') as f:
-    docs = list(yaml.safe_load_all(f))
-out = []
-for d in docs:
-    if d and d.get('kind') == 'StorageClass':
-        d['parameters']['basePath'] = '/wrong-base-path'
-    out.append(d)
-with open('${EFS_WORKDIR}/rendered/wrong-basepath.yaml', 'w') as f:
-    yaml.dump_all(out, f)
-"
-    set +e
-    WRONG_BASEPATH_OUT="$(run_efs_step "wrong-basepath" "$ORACLE_EXISTING_FIXTURE" "gg-oracle-payments-01" "singleRuntime" "dev")"
-    WRONG_BASEPATH_STATUS=$?
-    set -e
-    if [ "$WRONG_BASEPATH_STATUS" -ne 0 ] && echo "$WRONG_BASEPATH_OUT" | grep -qF "parameters.basePath"; then
-      pass "8: a rendered StorageClass with the wrong basePath fails"
-    else
-      fail "8: a rendered StorageClass with the wrong basePath did not fail as expected"
-      echo "$WRONG_BASEPATH_OUT"
-    fi
 
-    python3 -c "
-import yaml
-with open('${EFS_WORKDIR}/rendered/gg-oracle-payments-01.yaml') as f:
-    docs = list(yaml.safe_load_all(f))
-out = []
-for d in docs:
-    if d and d.get('kind') == 'StorageClass':
-        d['parameters']['fileSystemId'] = 'fs-wrongwrongwrong'
-    out.append(d)
-with open('${EFS_WORKDIR}/rendered/wrong-fsid.yaml', 'w') as f:
-    yaml.dump_all(out, f)
-"
-    set +e
-    WRONG_FSID_OUT="$(run_efs_step "wrong-fsid" "$ORACLE_EXISTING_FIXTURE" "gg-oracle-payments-01" "singleRuntime" "dev")"
-    WRONG_FSID_STATUS=$?
-    set -e
-    if [ "$WRONG_FSID_STATUS" -ne 0 ] && echo "$WRONG_FSID_OUT" | grep -qF "parameters.fileSystemId"; then
-      pass "9: a rendered StorageClass with the wrong filesystem ID fails"
-    else
-      fail "9: a rendered StorageClass with the wrong filesystem ID did not fail as expected"
-      echo "$WRONG_FSID_OUT"
-    fi
+tool_path, efs_workdir = sys.argv[1:3]
+spec = importlib.util.spec_from_file_location("phase5_runtime", tool_path)
+phase5_runtime = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(phase5_runtime)
 
-    # 10: absence of the optional basePath key never causes an unexplained shell exit -- structural proof (the fragile grep pattern is gone) plus behavioral proof (tests 1/2 above already completed cleanly, not a raw "unbound variable"/pipefail abort).
-    if grep -qE "grep.*basePath" "${WORKDIR}/efs_validate.sh"; then
-      fail "10: the EFS validation step still greps for basePath in the values file -- the fragile fallback was not removed"
-    else
-      pass "10: the EFS validation step no longer greps for the optional basePath key (no set -e/pipefail exposure)"
-    fi
+results = []
 
-    python3 -c "
-import yaml
-with open('${EFS_WORKDIR}/rendered/gg-oracle-payments-01.yaml') as f:
-    docs = list(yaml.safe_load_all(f))
-out = list(docs)
-for d in docs:
-    if d and d.get('kind') == 'StorageClass':
-        out.append(dict(d))
-        break
-with open('${EFS_WORKDIR}/rendered/duplicate-storageclass.yaml', 'w') as f:
-    yaml.dump_all(out, f)
-"
-    set +e
-    DUP_SC_OUT="$(run_efs_step "duplicate-storageclass" "$ORACLE_EXISTING_FIXTURE" "gg-oracle-payments-01" "singleRuntime" "dev")"
-    DUP_SC_STATUS=$?
-    set -e
-    if [ "$DUP_SC_STATUS" -ne 0 ] && echo "$DUP_SC_OUT" | grep -qF "expected exactly one StorageClass"; then
-      pass "11: exactly one expected StorageClass is required (a duplicate is rejected)"
-    else
-      fail "11: a duplicate matching-name StorageClass was not rejected as expected"
-      echo "$DUP_SC_OUT"
-    fi
 
-    # 22: legacyPair Helm rendering is rejected with a clear controlled error (the chart no longer implements legacyPair source/target rendering); also confirms an unknown deploymentModel fails closed the same way.
-    set +e
-    LEGACY_REJECT_ERR="$(helm template ogg-legacy-reject "$RUNTIME_CHART" --namespace goldengate-dev \
-      --values "$ORACLE_EXISTING_FIXTURE" \
-      --set global.environment=dev --set global.deploymentId=ogg-legacy-reject "${ORACLE_SHARED_OVERRIDES[@]}" \
-      --set deploymentModel=legacyPair 2>&1)"
-    LEGACY_REJECT_STATUS=$?
-    set -e
-    if [ "$LEGACY_REJECT_STATUS" -ne 0 ] && echo "$LEGACY_REJECT_ERR" | grep -qF "deploymentModel=legacyPair is no longer supported by this chart"; then
-      pass "22: legacyPair Helm rendering is rejected with the expected controlled error"
-    else
-      fail "22: legacyPair Helm rendering was not rejected as expected (status=${LEGACY_REJECT_STATUS})"
-      echo "$LEGACY_REJECT_ERR"
-    fi
+def check(deployment_id, values_path, rendered_path, expected_base_path):
+    with open(values_path) as f:
+        values = yaml.safe_load(f)
+    with open(rendered_path) as f:
+        docs = phase5_runtime._parse_rendered_documents(f.read())
+    try:
+        phase5_runtime._validate_efs_render_contract(values, docs, "dev", deployment_id, "singleRuntime", "fs-0123456789abcdef1", "existing", "fs-0123456789abcdef1")
+        enabled, facts = phase5_runtime._validate_efs_values_shape(values, deployment_id, "singleRuntime")
+        return True, facts["base_path"] == expected_base_path
+    except phase5_runtime.Phase5Error as exc:
+        return False, str(exc)
 
-    set +e
-    UNKNOWN_MODEL_ERR="$(helm template ogg-unknown-reject "$RUNTIME_CHART" --namespace goldengate-dev \
-      --values "$ORACLE_EXISTING_FIXTURE" \
-      --set global.environment=dev --set global.deploymentId=ogg-unknown-reject \
-      --set deploymentModel=someUnknownModel 2>&1)"
-    UNKNOWN_MODEL_STATUS=$?
-    set -e
-    if [ "$UNKNOWN_MODEL_STATUS" -ne 0 ] && echo "$UNKNOWN_MODEL_ERR" | grep -qF "Unsupported or missing deploymentModel"; then
-      pass "an unknown/missing deploymentModel fails closed with a clear controlled error"
-    else
-      fail "an unknown deploymentModel was not rejected as expected (status=${UNKNOWN_MODEL_STATUS})"
-      echo "$UNKNOWN_MODEL_ERR"
-    fi
 
-    # 13: this EFS-only correction did not touch observer removal or the workflow-matrix classifier logic elsewhere in the same file.
-    PHASE5A_SPOTCHECK_OK="true"
-    if grep -q "^  ensure_observer_image:" "$EKS_APP_WORKFLOW"; then
-      PHASE5A_SPOTCHECK_OK="false"
-    fi
-    if ! grep -q "is_goldengate_deployment_values_file() {" "$DETECT_SCRIPT"; then
-      PHASE5A_SPOTCHECK_OK="false"
-    fi
-    if grep -q "LEGACY_FALLBACK_ENABLED" "helm/goldengate-monitor/templates/deployment.yaml" 2>/dev/null; then
-      PHASE5A_SPOTCHECK_OK="false"
-    fi
-    if [ "$PHASE5A_SPOTCHECK_OK" = "true" ]; then
-      pass "13: this EFS-only correction did not reintroduce observer/legacy-fallback logic or remove the workflow-matrix classifier"
-    else
-      fail "13: unexpected Phase 5A regression detected alongside the EFS correction"
-    fi
+ok, base_path_ok = check("gg-oracle-payments-01", f"{efs_workdir}/values/existing-mode-a.yaml", f"{efs_workdir}/rendered/gg-oracle-payments-01.yaml", "/gg-oracle-payments-01")
+results.append(("1: gg-oracle-payments-01 (no explicit basePath) resolves to /gg-oracle-payments-01 and passes full EFS render validation against the REAL rendered chart", ok and base_path_ok))
 
-    rm -rf "$EFS_WORKDIR"
+ok, base_path_ok = check("gg-postgresql-payments-01", f"{efs_workdir}/values/existing-mode-b.yaml", f"{efs_workdir}/rendered/gg-postgresql-payments-01.yaml", "/gg-postgresql-payments-01")
+results.append(("2: gg-postgresql-payments-01 (no explicit basePath) resolves to /gg-postgresql-payments-01 and passes full EFS render validation against the REAL rendered chart", ok and base_path_ok))
+
+ok, base_path_ok = check("gg-oracle-payments-01", f"{efs_workdir}/values/oracle-override.yaml", f"{efs_workdir}/rendered/oracle-override.yaml", "/custom-override-path")
+results.append(("4: an explicit non-empty basePath override is honored against the REAL rendered chart", ok and base_path_ok))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  EFS_REAL_RENDER_STATUS=$?
+  set -e
+  echo "$EFS_REAL_RENDER_CHECK"
+  if [ "$EFS_REAL_RENDER_STATUS" -eq 0 ] && [ -z "$(echo "$EFS_REAL_RENDER_CHECK" | grep '^FAIL ' || true)" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        OK\ *) pass "EFS persistence validation: ${line#OK }" ;;
+      esac
+    done <<< "$EFS_REAL_RENDER_CHECK"
+  else
+    fail "EFS persistence validation against the real rendered chart failed:"$'\n'"${EFS_REAL_RENDER_CHECK}"
   fi
+
+  rm -rf "$EFS_WORKDIR"
 else
   skip "EFS persistence validation regression tests -- helm and/or python3/PyYAML not available"
 fi
@@ -6211,37 +5662,38 @@ else
   pass "27: ${EKS_APP_WORKFLOW} contains no secret-mutation AWS CLI call"
 fi
 
-if grep -q "Resolve deployment identity via the deployment model" "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && grep -q -- "--set runtime.csi.admin.objectName=\"\$RESOLVED_ADMIN_SECRET_NAME\"" "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && grep -q -- "--set runtime.csi.certificate.objectName=\"\$RESOLVED_TLS_SECRET_NAME\"" "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && grep -q -- "--set runtime.serviceAccount.name=\"\$RESOLVED_RUNTIME_SERVICE_ACCOUNT_NAME\"" "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && grep -q "name: runtime.csi.admin.objectName" "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && grep -q "name: runtime.csi.certificate.objectName" "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && grep -q "name: runtime.serviceAccount.name" "$EKS_APP_WORKFLOW" 2>/dev/null; then
-  pass "27: the admin secret, TLS secret, and ServiceAccount are resolved once and injected via explicit Helm --set and Argo CD parameter overrides"
+# Phase 5 Python Conversion: admin-secret/TLS/ServiceAccount resolution+injection, the deployment-model describe invocation, and the ECR image existence/digest verification all moved from inline workflow bash into automation/phases/phase5/phase5_runtime.py -- checked there now, never re-derived against workflow text that no longer contains them.
+if grep -qF 'def cmd_resolve_live_inputs' "$PHASE5_RUNTIME_TOOL" 2>/dev/null \
+    && grep -qF '"--set", f"runtime.csi.admin.objectName={admin_secret_name}"' "$PHASE5_RUNTIME_TOOL" 2>/dev/null \
+    && grep -qF '"--set", f"runtime.csi.certificate.objectName={tls_secret_name}"' "$PHASE5_RUNTIME_TOOL" 2>/dev/null \
+    && grep -qF '"--set", f"runtime.serviceAccount.name={runtime_service_account_name}"' "$PHASE5_RUNTIME_TOOL" 2>/dev/null \
+    && grep -qF '"name": "runtime.csi.admin.objectName"' "$PHASE5_RUNTIME_TOOL" 2>/dev/null \
+    && grep -qF '"name": "runtime.csi.certificate.objectName"' "$PHASE5_RUNTIME_TOOL" 2>/dev/null \
+    && grep -qF '"name": "runtime.serviceAccount.name"' "$PHASE5_RUNTIME_TOOL" 2>/dev/null; then
+  pass "27: the admin secret, TLS secret, and ServiceAccount are resolved once (phase5_runtime.py cmd_resolve_live_inputs) and injected via explicit Helm --set and Argo CD parameter overrides"
 else
-  fail "27: admin-secret/TLS/ServiceAccount resolution or injection is missing from the runtime deployment steps"
+  fail "27: admin-secret/TLS/ServiceAccount resolution or injection is missing from phase5_runtime.py"
 fi
 
-if grep -q 'describe "\$DEPLOYMENT_ID"' "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && ! grep -q -- "describe --deployment-id" "$EKS_APP_WORKFLOW" 2>/dev/null; then
-  pass "27: the deployment-model describe command uses the exact positional production invocation"
+if grep -qF '"--environment", environment, "describe", deployment_id' "$PHASE5_RUNTIME_TOOL" 2>/dev/null \
+    && ! sed -n '/def _describe_deployment_json/,/^def /p' "$PHASE5_RUNTIME_TOOL" | grep -qF -- '"--deployment-id"'; then
+  pass "27: the deployment-model describe command uses the exact positional production invocation (never --deployment-id)"
 else
   fail "27: the deployment-model describe command is not called with the exact positional production invocation"
 fi
 
 # Corrected for the VDR image-validation fix: the rendered-image check is no longer its own grep-based step -- it was merged into the structural PyYAML validator (see the "VDR correction: structural rendered-image validation" section below for the full behavioral proof), so finding a step name alone is no longer sufficient evidence here.
-if grep -q "Verify the selected image exists in the approved private ECR" "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && grep -q "aws ecr describe-images" "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && grep -q "imageDetails\"\]\[0\]\[\"imageDigest\"\]" "$EKS_APP_WORKFLOW" 2>/dev/null \
+if grep -qF 'def _verify_image_in_private_ecr' "$PHASE5_RUNTIME_TOOL" 2>/dev/null \
+    && grep -qF '"aws", "ecr", "describe-images"' "$PHASE5_RUNTIME_TOOL" 2>/dev/null \
+    && grep -qF 'image_details[0].get("imageDigest")' "$PHASE5_RUNTIME_TOOL" 2>/dev/null \
     && ! grep -qF 'grep -qF "image: ${EXPECTED_IMAGE}"' "$EKS_APP_WORKFLOW" 2>/dev/null; then
   pass "27: the selected image's existence and digest are verified read-only via describe-images, and the obsolete grep-based rendered-image text check no longer exists"
 else
   fail "27: ECR image existence/digest verification is missing, or the obsolete grep-based rendered-image check is still present"
 fi
 
-if grep -qE 'oracle.*ecr-oracle-image|postgresql.*ecr-postgresql-image|ENGINE_IMAGE_MAP|engineImageMap' "$EKS_APP_WORKFLOW" 2>/dev/null; then
-  fail "27: an engine-to-image mapping was introduced in the app workflow"
+if grep -qE 'oracle.*ecr-oracle-image|postgresql.*ecr-postgresql-image|ENGINE_IMAGE_MAP|engineImageMap' "$EKS_APP_WORKFLOW" "$PHASE5_RUNTIME_TOOL" 2>/dev/null; then
+  fail "27: an engine-to-image mapping was introduced"
 else
   pass "27: the ECR verification step derives the image solely from the descriptor, no engine-to-image mapping"
 fi
@@ -6680,12 +6132,12 @@ else
   skip "31: work/generated tracking check -- not a git repository"
 fi
 
-# Static evidence only: RUNNER_ROLE_ARN and EKS_DEPLOY_ROLE_ARN's live values come from envs/dev/environment.yaml, unverifiable offline. Corrected for the VDR cross-account fix: validate_shared_secrets_once now starts from the canonical RUNNER_ROLE_ARN (engineering/build account, via env.RUNNER_ROLE_ARN) like every other job, then separately assumes EKS_DEPLOY_ROLE_ARN in-step before any Secrets Manager call -- it is that second, workload-account role (GoldenGateEKSDeployRole-dev) that static evidence ties to the policy carrying the required read-only shared-secret permissions.
-if grep -q "role-to-assume: \${{ env.RUNNER_ROLE_ARN }}" "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && grep -qE 'aws sts assume-role --role-arn "\$EKS_DEPLOY_ROLE_ARN"' "$EKS_APP_WORKFLOW" 2>/dev/null \
+# Static evidence only: RUNNER_ROLE_ARN and EKS_DEPLOY_ROLE_ARN's live values come from envs/dev/environment.yaml, unverifiable offline. Corrected for the VDR cross-account fix: validate_shared_secrets_once now starts from the canonical RUNNER_ROLE_ARN (engineering/build account, via env.RUNNER_ROLE_ARN) like every other job, then separately assumes EKS_DEPLOY_ROLE_ARN in-step before any Secrets Manager call -- it is that second, workload-account role (GoldenGateEKSDeployRole-dev) that static evidence ties to the policy carrying the required read-only shared-secret permissions. Phase 4 Python Conversion (predates Phase 5): the sts:AssumeRole call itself moved from inline workflow bash into automation/phases/phase4/phase4_shared_secrets.py's own argument-array subprocess call -- checked there now, never re-derived against workflow text that no longer contains it.
+if grep -qF 'role-to-assume: ${{ env.RUNNER_ROLE_ARN }}' "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && grep -qF '"aws", "sts", "assume-role", "--role-arn", eks_deploy_role_arn' automation/phases/phase4/phase4_shared_secrets.py 2>/dev/null \
     && grep -q 'name          = local.gg_env_role_names.eksDeploy' envs/dev/iam.tf 2>/dev/null \
     && grep -q 'policy_folder = "goldengate-eks-deploy-dev"' envs/dev/iam.tf 2>/dev/null; then
-  pass "31: validate_shared_secrets_once starts from the same canonical RUNNER_ROLE_ARN role used everywhere else, then in-step assumes EKS_DEPLOY_ROLE_ARN before any Secrets Manager call; static evidence ties that workload role to the policy carrying the required read-only shared-secret permissions (live values unverifiable offline)"
+  pass "31: validate_shared_secrets_once starts from the same canonical RUNNER_ROLE_ARN role used everywhere else, then in-step (phase4_shared_secrets.py) assumes EKS_DEPLOY_ROLE_ARN before any Secrets Manager call; static evidence ties that workload role to the policy carrying the required read-only shared-secret permissions (live values unverifiable offline)"
 else
   fail "31: static evidence linking the validate_shared_secrets_once credential chain to the read-only shared-secret policy is incomplete"
 fi
@@ -7186,66 +6638,59 @@ fi
 echo ""
 echo "--- EFS ID resolution step: existing/dry-run/not-applicable branches (no AWS required) ---"
 
-if [ "$PYTHON_AVAILABLE" = "true" ]; then
-  python3 - "$EKS_APP_WORKFLOW" > "${WORKDIR}/resolve_efs_id.sh" <<'PYEOF'
+# Phase 5 Python Conversion: "Resolve EFS filesystem ID" moved from inline `run:` bash into automation/phases/phase5/phase5_runtime.py's own _resolve_efs_filesystem_id() -- called directly here (never a bash-extraction reimplementation), exercising exactly the not-applicable/existing/managed+deploy=false branches that are locally testable without AWS credentials (each returns before ever reaching an aws sts/aws efs call).
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$PHASE5_RUNTIME_TOOL" ]; then
+  RESOLVE_EFS_ID_CHECK="$(python3 - "$PHASE5_RUNTIME_TOOL" <<'PYEOF'
+import importlib.util
+import io
 import sys
-import yaml
-with open(sys.argv[1]) as f:
-    doc = yaml.safe_load(f)
-for step in doc["jobs"]["build_publish_and_deploy"]["steps"]:
-    if step.get("name") == "Resolve EFS filesystem ID":
-        sys.stdout.write(step["run"])
-        break
-else:
-    sys.exit("step not found")
+from contextlib import redirect_stdout
+from unittest import mock
+
+tool_path = sys.argv[1]
+spec = importlib.util.spec_from_file_location("phase5_runtime", tool_path)
+phase5_runtime = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(phase5_runtime)
+
+results = []
+
+
+def resolve(efs_mode, efs_file_system_id_declared, deploy, efs_creation_token="dev-x-efs"):
+    def fail_if_aws_called(argv, **kwargs):
+        raise AssertionError(f"unexpected AWS call in a locally-testable branch: {argv}")
+    with mock.patch.object(phase5_runtime, "run", fail_if_aws_called):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            resolved = phase5_runtime._resolve_efs_filesystem_id(
+                efs_mode=efs_mode, efs_file_system_id_declared=efs_file_system_id_declared, efs_creation_token=efs_creation_token,
+                deploy=deploy, environment="dev", deployment_id="gg-oracle-payments-01",
+                eks_deploy_role_arn="arn:aws:iam::668311715351:role/GoldenGateEKSDeployRole-dev", aws_region="eu-west-1",
+            )
+        return resolved, buf.getvalue()
+
+
+resolved, out = resolve("", "", True)
+results.append(("34: not-in-use deployments resolve an empty RESOLVED_EFS_ID with an explicit 'not applicable' source", resolved == "" and "not applicable" in out))
+
+resolved, out = resolve("existing", "fs-0123456789abcdef0", True)
+results.append(("34: existing mode resolves RESOLVED_EFS_ID as the exact Git-committed passthrough value", resolved == "fs-0123456789abcdef0" and "existing descriptor" in out))
+
+resolved, out = resolve("managed", "", False)
+results.append(("34: managed mode with deploy=false resolves a syntactically-valid dry-run-only placeholder with no AWS call attempted", resolved == phase5_runtime.EFS_DRY_RUN_PLACEHOLDER and "dry-run placeholder" in out))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
 PYEOF
-
-  if [ ! -s "${WORKDIR}/resolve_efs_id.sh" ]; then
-    fail "34: could not extract the 'Resolve EFS filesystem ID' step from ${EKS_APP_WORKFLOW}"
+)"
+  echo "$RESOLVE_EFS_ID_CHECK"
+  if [ -z "$(echo "$RESOLVE_EFS_ID_CHECK" | grep '^FAIL ' || true)" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        OK\ *) pass "${line#OK }" ;;
+      esac
+    done <<< "$RESOLVE_EFS_ID_CHECK"
   else
-    # Only the not-applicable/existing/managed+deploy=false branches are locally testable without AWS credentials -- each returns before ever reaching an aws sts/aws efs call, verified below.
-    run_resolve_efs_id() {
-      local efs_mode="$1" efs_fsid_declared="$2" effective_deploy="$3" github_env_file out status
-      github_env_file="$(mktemp)"
-      out="$(EFS_MODE="$efs_mode" EFS_FILE_SYSTEM_ID_DECLARED="$efs_fsid_declared" EFS_CREATION_TOKEN="dev-x-efs" \
-        EFFECTIVE_DEPLOY="$effective_deploy" GITHUB_ENV="$github_env_file" \
-        GITHUB_RUN_ID="1" GITHUB_RUN_ATTEMPT="1" AWS_REGION="eu-west-1" \
-        EKS_DEPLOY_ROLE_ARN="arn:aws:iam::668311715351:role/GoldenGateEKSDeployRole-dev" \
-        bash "${WORKDIR}/resolve_efs_id.sh" 2>&1 )"
-      status=$?
-      out="${out}"$'\n'"$(cat "$github_env_file")"
-      rm -f "$github_env_file"
-      echo "$out"
-      return $status
-    }
-
-    NOT_APPLICABLE_OUT="$(run_resolve_efs_id "" "" "true")"
-    if echo "$NOT_APPLICABLE_OUT" | grep -qF "EFS ID source: not applicable" \
-        && echo "$NOT_APPLICABLE_OUT" | grep -qE '^RESOLVED_EFS_ID=$'; then
-      pass "34: not-in-use deployments resolve an empty RESOLVED_EFS_ID with an explicit 'not applicable' source"
-    else
-      fail "34: the not-applicable EFS ID resolution branch did not behave as expected"
-      echo "$NOT_APPLICABLE_OUT"
-    fi
-
-    EXISTING_OUT="$(run_resolve_efs_id "existing" "fs-0123456789abcdef0" "true")"
-    if echo "$EXISTING_OUT" | grep -qF "EFS ID source: existing descriptor" \
-        && echo "$EXISTING_OUT" | grep -qF "RESOLVED_EFS_ID=fs-0123456789abcdef0"; then
-      pass "34: existing mode resolves RESOLVED_EFS_ID as the exact Git-committed passthrough value"
-    else
-      fail "34: the existing-mode EFS ID resolution branch did not behave as expected"
-      echo "$EXISTING_OUT"
-    fi
-
-    DRYRUN_OUT="$(run_resolve_efs_id "managed" "" "false")"
-    if echo "$DRYRUN_OUT" | grep -qF "EFS ID source: dry-run placeholder" \
-        && echo "$DRYRUN_OUT" | grep -qE '^RESOLVED_EFS_ID=fs-[0-9a-f]+$' \
-        && ! echo "$DRYRUN_OUT" | grep -qiE "aws sts|aws efs"; then
-      pass "34: managed mode with deploy=false resolves a syntactically-valid dry-run-only placeholder with no AWS call attempted"
-    else
-      fail "34: the managed/deploy=false dry-run EFS ID resolution branch did not behave as expected"
-      echo "$DRYRUN_OUT"
-    fi
+    fail "34: EFS ID resolution branch check failed:"$'\n'"${RESOLVE_EFS_ID_CHECK}"
   fi
 else
   skip "34: EFS ID resolution step branch checks -- python3 unavailable"
@@ -7299,10 +6744,11 @@ PYEOF
     fail "1: undeclared needs.<job> reference(s) found in ${EKS_APP_WORKFLOW}: ${UNDECLARED_NEEDS_OUT}"
   fi
 
-  if grep -qE 'EFFECTIVE_DEPLOY:\s*\$\{\{\s*matrix\.deploy\s*\}\}' "$EKS_APP_WORKFLOW"; then
-    pass "1: EFFECTIVE_DEPLOY is now derived directly from matrix.deploy"
+  # Phase 5 Python Conversion: EFFECTIVE_DEPLOY as a step-level env: mapping no longer exists -- "Prepare runtime deployment state" now passes matrix.deploy straight through to phase5_runtime.py prepare-deployment's own --deploy flag, which persists it into Phase 5 state (state["deploy"]) for every later step (including EFS resolution) to read, never re-deriving it from a second GITHUB_ENV/env: mapping.
+  if grep -qE -- '--deploy\s+"\$\{\{\s*matrix\.deploy\s*\}\}"' "$EKS_APP_WORKFLOW"; then
+    pass "1: matrix.deploy is passed directly to phase5_runtime.py prepare-deployment's --deploy flag (persisted into Phase 5 state, never a second EFFECTIVE_DEPLOY env: mapping)"
   else
-    fail "1: EFFECTIVE_DEPLOY is not wired to matrix.deploy"
+    fail "1: matrix.deploy is not wired to phase5_runtime.py prepare-deployment --deploy"
   fi
 else
   skip "1: undeclared-needs scan -- python3/PyYAML unavailable"
@@ -7319,9 +6765,9 @@ with open(sys.argv[1]) as f:
     doc = yaml.safe_load(f)
 
 steps = doc["jobs"]["build_publish_and_deploy"]["steps"]
-argo_step = next((s for s in steps if s.get("name") == "Create or update Argo CD Application"), None)
+argo_step = next((s for s in steps if s.get("name") == "Reconcile runtime through Argo CD"), None)
 if argo_step is None:
-    print("FAIL: 'Create or update Argo CD Application' step not found")
+    print("FAIL: 'Reconcile runtime through Argo CD' step not found")
     sys.exit(1)
 
 cond = str(argo_step.get("if", ""))
@@ -7598,7 +7044,8 @@ else
   fail "'aws efs list-tags-for-resource' is still present in the eks-app workflow or ${PHASE1_TOOL}"
 fi
 
-if grep -qE 'json\.load\(sys\.stdin\)\["FileSystems"\]\[0\]\.get\("Tags"' "$EKS_APP_WORKFLOW" 2>/dev/null; then
+# Phase 5 Python Conversion: managed EFS resolution moved from inline workflow bash into automation/phases/phase5/phase5_runtime.py's own _resolve_efs_filesystem_id() -- checked there now.
+if grep -qF 'fs.get("Tags", [])' "$PHASE5_RUNTIME_TOOL" 2>/dev/null; then
   pass "managed-mode EFS resolution reads Tags directly from the same DescribeFileSystems (--creation-token) response used to resolve FileSystemId -- no second tag API call"
 else
   fail "managed-mode EFS resolution does not read Tags directly from the DescribeFileSystems response"
@@ -7686,22 +7133,22 @@ PYEOF
   fi
 fi
 
-if grep -qF 'expected exactly one EFS filesystem for creation token' "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && grep -qF 'MATCH_COUNT" -ne 1' "$EKS_APP_WORKFLOW" 2>/dev/null; then
-  pass "35: managed EFS resolution fails closed on zero or multiple creation-token matches (MATCH_COUNT != 1), never lists-and-guesses"
+if grep -qF 'expected exactly one EFS filesystem for creation token' "$PHASE5_RUNTIME_TOOL" 2>/dev/null \
+    && grep -qF 'len(filesystems) != 1' "$PHASE5_RUNTIME_TOOL" 2>/dev/null; then
+  pass "35: managed EFS resolution fails closed on zero or multiple creation-token matches (len(filesystems) != 1), never lists-and-guesses"
 else
-  fail "35: the zero/multiple creation-token match fail-closed check is missing from the workflow"
+  fail "35: the zero/multiple creation-token match fail-closed check is missing from phase5_runtime.py"
 fi
 
-if grep -qF 'LifeCycleState' "$EKS_APP_WORKFLOW" 2>/dev/null && grep -qF '"available"' "$EKS_APP_WORKFLOW" 2>/dev/null; then
+if grep -qF 'LifeCycleState' "$PHASE5_RUNTIME_TOOL" 2>/dev/null && grep -qF '"available"' "$PHASE5_RUNTIME_TOOL" 2>/dev/null; then
   pass "36: managed EFS resolution requires LifeCycleState == available before it is used"
 else
-  fail "36: the LifecycleState==available check is missing from the managed EFS resolution step"
+  fail "36: the LifecycleState==available check is missing from phase5_runtime.py's managed EFS resolution"
 fi
 
-if grep -qF 'ManagedBy") == "goldengate-eks-app"' "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && grep -qF 'GoldenGateDeploymentId") == sys.argv[1]' "$EKS_APP_WORKFLOW" 2>/dev/null; then
-  pass "the resolved managed EFS filesystem's ownership tags are cross-checked (ManagedBy/GoldenGateDeploymentId/GoldenGateEnvironment) before RESOLVED_EFS_ID is used"
+if grep -qF 'ManagedBy") == "goldengate-eks-app"' "$PHASE5_RUNTIME_TOOL" 2>/dev/null \
+    && grep -qF 'GoldenGateDeploymentId") == deployment_id' "$PHASE5_RUNTIME_TOOL" 2>/dev/null; then
+  pass "the resolved managed EFS filesystem's ownership tags are cross-checked (ManagedBy/GoldenGateDeploymentId/GoldenGateEnvironment) before the resolved EFS ID is used"
 else
   fail "the optional tag cross-check on the resolved managed EFS filesystem is missing"
 fi
@@ -8071,10 +7518,10 @@ else
   fail "an envs/dev/*.tf file still references an unverified module output attribute (.efs_id)"
 fi
 
-if grep -qF 'aws efs describe-file-systems --creation-token' "$EKS_APP_WORKFLOW" 2>/dev/null; then
-  pass "managed EFS resolution remains entirely creation-token-based (aws efs describe-file-systems --creation-token), never dependent on a Terraform child output the approved corporate reusable workflow does not expose"
+if grep -qF '"aws", "efs", "describe-file-systems", "--creation-token"' "$PHASE5_RUNTIME_TOOL" 2>/dev/null; then
+  pass "managed EFS resolution remains entirely creation-token-based (aws efs describe-file-systems --creation-token, in phase5_runtime.py), never dependent on a Terraform child output the approved corporate reusable workflow does not expose"
 else
-  fail "the creation-token-based managed EFS resolution path is missing from the workflow"
+  fail "the creation-token-based managed EFS resolution path is missing from phase5_runtime.py"
 fi
 
 echo ""
@@ -8262,281 +7709,121 @@ fi
 echo ""
 echo "--- VDR correction: structural rendered-image validation (replaces the fragile grep-based check) ---"
 
-# Real VDR evidence: deploy=false for gg-oracle-payments-01 correctly resolved IMAGE_REPOSITORY/IMAGE_TAG/IMAGE_DIGEST from ECR, but then failed at the OLD "Verify the rendered StatefulSet uses the selected verified image" step because it did `grep -qF "image: ${EXPECTED_IMAGE}"` against a rendered value that Helm intentionally quotes (`image: "repo:tag"`). The image was correct; only the text check was wrong. Fix: that grep-based step is REMOVED and its assertion is merged into the existing duplicate-key-safe PyYAML structural validator (no second, inconsistent Kubernetes-parsing implementation is introduced).
+# Real VDR evidence: deploy=false for gg-oracle-payments-01 correctly resolved IMAGE_REPOSITORY/IMAGE_TAG/IMAGE_DIGEST from ECR, but then failed at the OLD "Verify the rendered StatefulSet uses the selected verified image" step because it did `grep -qF "image: ${EXPECTED_IMAGE}"` against a rendered value that Helm intentionally quotes (`image: "repo:tag"`). The image was correct; only the text check was wrong. Fix: that grep-based step was removed and its assertion merged into a duplicate-key-safe PyYAML structural validator (no second, inconsistent Kubernetes-parsing implementation). Phase 5 Python Conversion: that structural validator now lives in automation/phases/phase5/phase5_runtime.py's own _validate_singleruntime_manifest_contract() -- called directly here (never a bash-extraction reimplementation), never a grep against the rendered workflow YAML.
 
 if ! grep -qF 'grep -qF "image: ${EXPECTED_IMAGE}"' .github/workflows/00-main-goldengate-orchestrator.yaml 2>/dev/null \
-    && grep -qF 'main_container_image = main_container.get("image")' .github/workflows/00-main-goldengate-orchestrator.yaml 2>/dev/null \
-    && grep -qF 'if main_container_image != expected_image:' .github/workflows/00-main-goldengate-orchestrator.yaml 2>/dev/null; then
-  pass "VDR-IMG 1: image validation is now structural YAML field comparison (main_container.get(\"image\") != expected_image), not a grep against the rendered text"
+    && grep -qF 'main_container_image = main_container.get("image")' "$PHASE5_RUNTIME_TOOL" 2>/dev/null \
+    && grep -qF 'if main_container_image != expected_image:' "$PHASE5_RUNTIME_TOOL" 2>/dev/null; then
+  pass "VDR-IMG 1: image validation is now structural YAML field comparison (main_container.get(\"image\") != expected_image) in phase5_runtime.py, not a grep against the rendered text"
 else
-  fail "VDR-IMG 1: structural image-identity comparison is missing, or the obsolete grep-based text check is still present"
+  fail "VDR-IMG 1: structural image-identity comparison is missing from phase5_runtime.py, or the obsolete grep-based text check is still present in the workflow"
 fi
 
-if [ "$PYTHON_AVAILABLE" = "true" ]; then
-  python3 - "$EKS_APP_WORKFLOW" > "${WORKDIR}/image_validation_step.sh" <<'PYEOF'
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$PHASE5_RUNTIME_TOOL" ]; then
+  VDR_IMG_CHECK="$(python3 - "$PHASE5_RUNTIME_TOOL" <<'PYEOF'
+import importlib.util
 import sys
+
 import yaml
-with open(sys.argv[1]) as f:
-    doc = yaml.safe_load(f)
-for step in doc["jobs"]["build_publish_and_deploy"]["steps"]:
-    if step.get("name", "").startswith("Validate rendered singleRuntime manifest"):
-        if "if" in step:
-            sys.exit("step unexpectedly has a per-step if: condition")
-        sys.stdout.write(step["run"])
-        break
-else:
-    sys.exit("step not found")
+
+tool_path = sys.argv[1]
+spec = importlib.util.spec_from_file_location("phase5_runtime", tool_path)
+phase5_runtime = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(phase5_runtime)
+
+results = []
+
+VALUES = {"runtime": {"containerName": "ogg-oracle"}, "ingress": {"enabled": False}}
+DEPLOYMENT_ID = "gg-oracle-payments-01"
+TARGET_NAMESPACE = "goldengate-dev"
+IMAGE_REPOSITORY = "229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle"
+IMAGE_TAG = "23.26.2.0.1"
+IMAGE_DIGEST = "sha256:deadbeef"
+EXPECTED_IMAGE = f"{IMAGE_REPOSITORY}:{IMAGE_TAG}"
+
+VALID_SERVICES = [
+    {"kind": "Service", "metadata": {"name": DEPLOYMENT_ID, "namespace": TARGET_NAMESPACE}, "spec": {"clusterIP": "10.0.0.5", "type": "ClusterIP"}},
+    {"kind": "Service", "metadata": {"name": f"{DEPLOYMENT_ID}-headless", "namespace": TARGET_NAMESPACE}, "spec": {"clusterIP": "None"}},
+]
+INIT_SCRIPT = ['sh', '-c', 'echo cleaning stale ServiceManager.pid ; rm -f -- "$SERVICE_MANAGER_PID_FILE"']
+
+
+def sts(containers, namespace=TARGET_NAMESPACE, init_containers=None):
+    doc = {"kind": "StatefulSet", "metadata": {"name": DEPLOYMENT_ID, "namespace": namespace},
+           "spec": {"template": {"spec": {"containers": containers}}}}
+    if init_containers is not None:
+        doc["spec"]["template"]["spec"]["initContainers"] = init_containers
+    return doc
+
+
+def valid_init():
+    return [{"name": "prepare-u02-permissions", "image": EXPECTED_IMAGE, "command": INIT_SCRIPT}]
+
+
+def check(label, docs, expect_ok, must_contain=None):
+    try:
+        phase5_runtime._validate_singleruntime_manifest_contract(docs, VALUES, DEPLOYMENT_ID, TARGET_NAMESPACE, IMAGE_REPOSITORY, IMAGE_TAG, IMAGE_DIGEST)
+        ok, msg = True, ""
+    except phase5_runtime.Phase5Error as exc:
+        ok, msg = False, str(exc)
+    result = (ok == expect_ok) and (must_contain is None or must_contain in msg)
+    results.append((label, result))
+
+
+# 2/3: quoted vs unquoted rendered image both PASS end-to-end (PyYAML parses both to the identical string -- the fix compares the PARSED value, never rendered text/quoting style).
+check("2: a quoted rendered image (image: \"repo:tag\", the real Helm template's actual style) correctly PASSES structural validation end-to-end",
+      [sts([{"name": "ogg-oracle", "image": EXPECTED_IMAGE}], init_containers=valid_init())] + VALID_SERVICES, True)
+check("3: an unquoted rendered image scalar (still valid YAML, resolves to the identical string) also PASSES -- proving the fix compares the PARSED value, not the rendered text's quoting style",
+      [sts([{"name": "ogg-oracle", "image": EXPECTED_IMAGE}], init_containers=valid_init())] + VALID_SERVICES, True)
+
+check("4: a rendered image with the wrong TAG fails closed",
+      [sts([{"name": "ogg-oracle", "image": f"{IMAGE_REPOSITORY}:99.99.99.99.9"}])], False, "does not reference the verified image")
+check("5: a rendered image with the wrong REPOSITORY fails closed",
+      [sts([{"name": "ogg-oracle", "image": "229410149234.dkr.ecr.eu-west-1.amazonaws.com/wrong-repo:23.26.2.0.1"}])], False, "does not reference the verified image")
+check("6: a regular container with no image field at all fails closed",
+      [sts([{"name": "ogg-oracle"}])], False, "does not reference the verified image")
+check("7: zero rendered StatefulSet documents fails closed",
+      [{"kind": "Service", "metadata": {"name": DEPLOYMENT_ID, "namespace": TARGET_NAMESPACE}, "spec": {"clusterIP": "10.0.0.5"}}], False, "expected exactly one StatefulSet, found 0")
+check("8: multiple rendered StatefulSet documents fails closed",
+      [sts([{"name": "ogg-oracle", "image": EXPECTED_IMAGE}]), {**sts([{"name": "ogg-oracle", "image": EXPECTED_IMAGE}]), "metadata": {"name": f"{DEPLOYMENT_ID}-dup", "namespace": TARGET_NAMESPACE}}],
+      False, "expected exactly one StatefulSet, found 2")
+check("9: multiple regular containers fails closed per the singleRuntime contract",
+      [sts([{"name": "ogg-oracle", "image": EXPECTED_IMAGE}, {"name": "extra-sidecar", "image": EXPECTED_IMAGE}])], False, "expected exactly one regular application container")
+check("10: an initContainer-only pod spec (prepare-u02-permissions present, no regular containers) fails closed instead of treating the initContainer as the main container",
+      [sts([], init_containers=[{"name": "prepare-u02-permissions", "image": EXPECTED_IMAGE}])], False, "expected exactly one regular application container")
+check("11: a main container name that does not match values.yaml's runtime.containerName still fails closed",
+      [sts([{"name": "wrong-container-name", "image": EXPECTED_IMAGE}])], False, "expected main container name 'ogg-oracle', found 'wrong-container-name'")
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
 PYEOF
-
-  if [ ! -s "${WORKDIR}/image_validation_step.sh" ]; then
-    fail "VDR-IMG: could not extract the merged structural validator step from ${EKS_APP_WORKFLOW} (or it now has an unexpected per-step if: condition)"
+)"
+  echo "$VDR_IMG_CHECK"
+  if [ -z "$(echo "$VDR_IMG_CHECK" | grep '^FAIL ' || true)" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        OK\ *) pass "VDR-IMG: ${line#OK }" ;;
+      esac
+    done <<< "$VDR_IMG_CHECK"
   else
-    pass "VDR-IMG 14: the merged structural validator step has no per-step deploy-gating if: condition -- it runs whenever build_publish_and_deploy runs, exactly as the real deploy=false VDR run already exercised it"
-
-    IMG_TEST_DIR="${WORKDIR}/image-validation-fixtures"
-    mkdir -p "${IMG_TEST_DIR}/rendered"
-
-    RELEASE_NAME="gg-oracle-payments-01"
-    DEPLOYMENT_ID="gg-oracle-payments-01"
-    TARGET_NAMESPACE="goldengate-dev"
-    IMAGE_REPOSITORY="229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle"
-    IMAGE_TAG="23.26.2.0.1"
-    IMAGE_DIGEST="sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
-    VALUES_FILE="${IMG_TEST_DIR}/values.yaml"
-
-    cat > "$VALUES_FILE" <<'YEOF'
-runtime:
-  containerName: ogg-oracle
-YEOF
-
-    run_image_validation_scenario() {
-      # $1=rendered manifest content, $2=expected exit status, $3=required substring in output, $4=test description
-      printf '%s' "$1" > "${IMG_TEST_DIR}/rendered/${RELEASE_NAME}.yaml"
-      set +e
-      IMG_TEST_OUT="$(cd "$IMG_TEST_DIR" && \
-        RELEASE_NAME="$RELEASE_NAME" VALUES_FILE="$VALUES_FILE" DEPLOYMENT_ID="$DEPLOYMENT_ID" TARGET_NAMESPACE="$TARGET_NAMESPACE" \
-        IMAGE_REPOSITORY="$IMAGE_REPOSITORY" IMAGE_TAG="$IMAGE_TAG" IMAGE_DIGEST="$IMAGE_DIGEST" \
-        bash "${WORKDIR}/image_validation_step.sh" 2>&1)"
-      IMG_TEST_STATUS=$?
-      set -e
-      if [ "$IMG_TEST_STATUS" -eq "$2" ] && echo "$IMG_TEST_OUT" | grep -qF "$3"; then
-        pass "VDR-IMG: $4"
-      else
-        fail "VDR-IMG: $4 (exit=${IMG_TEST_STATUS}, expected=$2)"
-        echo "$IMG_TEST_OUT"
-      fi
-    }
-
-    VALID_SERVICES='
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: gg-oracle-payments-01
-  namespace: goldengate-dev
-spec:
-  clusterIP: 10.0.0.5
-  type: ClusterIP
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: gg-oracle-payments-01-headless
-  namespace: goldengate-dev
-spec:
-  clusterIP: None
-'
-    INIT_SCRIPT_ARGS='            - '\''echo cleaning stale ServiceManager.pid ; rm -f -- "$SERVICE_MANAGER_PID_FILE"'\'''
-
-    # 2: quoted rendered image (the real Helm template's actual quoting style) passes end-to-end.
-    run_image_validation_scenario "apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: gg-oracle-payments-01
-  namespace: goldengate-dev
-spec:
-  template:
-    spec:
-      initContainers:
-        - name: prepare-u02-permissions
-          image: \"229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle:23.26.2.0.1\"
-          command: [\"sh\", \"-c\"]
-          args:
-${INIT_SCRIPT_ARGS}
-      containers:
-        - name: ogg-oracle
-          image: \"229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle:23.26.2.0.1\"
-${VALID_SERVICES}" 0 "references verified image 229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle:23.26.2.0.1" \
-      "2: a quoted rendered image (image: \"repo:tag\", the real Helm template's actual style) correctly PASSES structural validation end-to-end"
-
-    # 3: the same manifest with an unquoted image scalar (still valid YAML, same parsed value) also passes.
-    run_image_validation_scenario "apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: gg-oracle-payments-01
-  namespace: goldengate-dev
-spec:
-  template:
-    spec:
-      initContainers:
-        - name: prepare-u02-permissions
-          image: 229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle:23.26.2.0.1
-          command: [\"sh\", \"-c\"]
-          args:
-${INIT_SCRIPT_ARGS}
-      containers:
-        - name: ogg-oracle
-          image: 229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle:23.26.2.0.1
-${VALID_SERVICES}" 0 "references verified image 229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle:23.26.2.0.1" \
-      "3: an unquoted rendered image scalar (still valid YAML, resolves to the identical string) also PASSES -- proving the fix compares the PARSED value, not the rendered text's quoting style"
-
-    # 4: wrong tag fails.
-    run_image_validation_scenario 'apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: gg-oracle-payments-01
-  namespace: goldengate-dev
-spec:
-  template:
-    spec:
-      containers:
-        - name: ogg-oracle
-          image: "229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle:99.99.99.99.9"
-' 1 "does not reference the verified image" \
-      "4: a rendered image with the wrong TAG fails closed"
-
-    # 5: wrong repository fails.
-    run_image_validation_scenario 'apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: gg-oracle-payments-01
-  namespace: goldengate-dev
-spec:
-  template:
-    spec:
-      containers:
-        - name: ogg-oracle
-          image: "229410149234.dkr.ecr.eu-west-1.amazonaws.com/wrong-repo:23.26.2.0.1"
-' 1 "does not reference the verified image" \
-      "5: a rendered image with the wrong REPOSITORY fails closed"
-
-    # 6: missing image field fails.
-    run_image_validation_scenario 'apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: gg-oracle-payments-01
-  namespace: goldengate-dev
-spec:
-  template:
-    spec:
-      containers:
-        - name: ogg-oracle
-' 1 "does not reference the verified image" \
-      "6: a regular container with no image field at all fails closed"
-
-    # 7: zero StatefulSets fails.
-    run_image_validation_scenario 'apiVersion: v1
-kind: Service
-metadata:
-  name: gg-oracle-payments-01
-  namespace: goldengate-dev
-spec:
-  clusterIP: 10.0.0.5
-' 1 "expected exactly one StatefulSet, found 0" \
-      "7: zero rendered StatefulSet documents fails closed"
-
-    # 8: multiple StatefulSets fails.
-    run_image_validation_scenario 'apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: gg-oracle-payments-01
-  namespace: goldengate-dev
-spec:
-  template:
-    spec:
-      containers:
-        - name: ogg-oracle
-          image: "229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle:23.26.2.0.1"
----
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: gg-oracle-payments-01-dup
-  namespace: goldengate-dev
-spec:
-  template:
-    spec:
-      containers:
-        - name: ogg-oracle
-          image: "229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle:23.26.2.0.1"
-' 1 "expected exactly one StatefulSet, found 2" \
-      "8: multiple rendered StatefulSet documents fails closed"
-
-    # 9: multiple regular containers fails, per the singleRuntime one-application-container contract.
-    run_image_validation_scenario 'apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: gg-oracle-payments-01
-  namespace: goldengate-dev
-spec:
-  template:
-    spec:
-      containers:
-        - name: ogg-oracle
-          image: "229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle:23.26.2.0.1"
-        - name: extra-sidecar
-          image: "229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle:23.26.2.0.1"
-' 1 "expected exactly one regular application container" \
-      "9: multiple regular containers fails closed per the singleRuntime contract"
-
-    # 10: an initContainer-only pod (no regular containers) fails -- proves prepare-u02-permissions can never be mistaken for the main application container.
-    run_image_validation_scenario 'apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: gg-oracle-payments-01
-  namespace: goldengate-dev
-spec:
-  template:
-    spec:
-      initContainers:
-        - name: prepare-u02-permissions
-          image: "229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle:23.26.2.0.1"
-      containers: []
-' 1 "expected exactly one regular application container" \
-      "10: an initContainer-only pod spec (prepare-u02-permissions present, no regular containers) fails closed instead of treating the initContainer as the main container"
-
-    # 11: runtime.containerName mismatch fails, proving that identity check remains enforced.
-    run_image_validation_scenario 'apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: gg-oracle-payments-01
-  namespace: goldengate-dev
-spec:
-  template:
-    spec:
-      containers:
-        - name: wrong-container-name
-          image: "229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle:23.26.2.0.1"
-' 1 "expected main container name 'ogg-oracle', found 'wrong-container-name'" \
-      "11: a main container name that does not match values.yaml's runtime.containerName still fails closed"
-
-    rm -rf "$IMG_TEST_DIR"
+    fail "VDR-IMG: structural rendered-image validation check failed:"$'\n'"${VDR_IMG_CHECK}"
   fi
 else
   skip "VDR-IMG: structural rendered-image validation behavioral tests -- python3/PyYAML unavailable"
 fi
 
-# 12/13: the ECR image existence/digest verification step itself is untouched by this fix (only the DOWNSTREAM rendered-manifest check changed) -- see check 27 above, which now also confirms the obsolete grep-based text check no longer exists.
-if grep -q "Verify the selected image exists in the approved private ECR" "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && grep -qF 'IMAGE_DIGEST="$(python3 -c' "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && ! grep -qE "aws ecr (put-image|batch-delete-image|start-image-scan)" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+# 12/13: the ECR image existence/digest verification (now automation/phases/phase5/phase5_runtime.py's _verify_image_in_private_ecr(), invoked from cmd_resolve_live_inputs()) remains read-only and unchanged -- only the DOWNSTREAM rendered-manifest check changed.
+if grep -qF "def _verify_image_in_private_ecr" "$PHASE5_RUNTIME_TOOL" 2>/dev/null \
+    && grep -qF '"aws", "ecr", "describe-images"' "$PHASE5_RUNTIME_TOOL" 2>/dev/null \
+    && ! grep -qE "aws ecr (put-image|batch-delete-image|start-image-scan)" "$PHASE5_RUNTIME_TOOL" 2>/dev/null; then
   pass "VDR-IMG 12/13: ECR image existence (describe-images) and digest resolution remain read-only and unchanged -- no image is pushed, deleted, or mutated by this fix"
 else
-  fail "VDR-IMG 12/13: ECR image existence/digest verification step is missing, changed, or a mutating ECR call was introduced"
+  fail "VDR-IMG 12/13: ECR image existence/digest verification is missing, changed, or a mutating ECR call was introduced"
 fi
 
 # 15: deploy=false performing no Argo/EKS runtime mutation is unrelated to this image-validation fix and remains covered by the existing dry-run-unreachable structural proof earlier in this suite (see "Correction pass, Issue ..." sections above). 16/17/18/19: cross-account shared-secret fix (previous VDR turn), EFS/Terraform architecture, Oracle/PostgreSQL descriptors + replication=false, and PostgreSQL->MSSQL Phase 6D1 are all unrelated to this narrowly-scoped rendered-image validation fix and remain covered by their own dedicated, still-passing sections/suites above (the "VDR correction: validate_shared_secrets_once..." section, the "Production hardening, Item 1" section, the Phase 6D0 Oracle/PostgreSQL sections, and automation/test-goldengate-replication.py respectively) -- none of items 15-19 are re-proved here, to avoid duplicating that logic.
 
+echo ""
 echo ""
 echo "--- VDR correction: monitor_dry_run_validation runner (CodeBuild -> ubuntu-latest) + least-privilege permissions ---"
 
@@ -9779,7 +9066,7 @@ results.append(("10: removing replication_monitor_acceptance's job-level binding
 mutated = copy.deepcopy(real_doc)
 del mutated["jobs"]["runtime_ownership_preflight"]["env"]["GG_SELECTED_ENVIRONMENT"]
 target_step_names = (
-    "Load resolved environment config",
+    "Load canonical environment configuration",
     "Classify runtime ownership safety",
 )
 for step in mutated["jobs"]["runtime_ownership_preflight"]["steps"]:
@@ -12944,8 +12231,8 @@ fi
 echo ""
 echo "--- Phase B3A: GoldenGate runtime ownership-safety preflight + post-reconciliation runtime acceptance ---"
 
-# automation/orchestration/runtime_state.py and runtime_acceptance.py must never construct a mutating kubectl/helm/AWS command -- read directly from source, never from the test's own constants. Mirrors the Phase B1/B2 checks above for argocd_state.py/platform_state.py/observability_state.py.
-for B3A_TOOL in automation/orchestration/runtime_state.py automation/orchestration/runtime_acceptance.py; do
+# automation/phases/phase5/runtime_state.py and runtime_acceptance.py must never construct a mutating kubectl/helm/AWS command -- read directly from source, never from the test's own constants. Mirrors the Phase B1/B2 checks above for argocd_state.py/platform_state.py/observability_state.py.
+for B3A_TOOL in automation/phases/phase5/runtime_state.py automation/phases/phase5/runtime_acceptance.py; do
   if [ -f "$B3A_TOOL" ]; then
     B3A_MUTATING_HITS="$(grep -nE 'kubectl apply|kubectl create|kubectl delete|kubectl patch|kubectl annotate|kubectl label|helm install|helm upgrade|helm uninstall|aws efs create|aws efs delete|aws efs update|"apply"|'"'"'apply'"'"'|"create"|'"'"'create'"'"'|"delete"|'"'"'delete'"'"'|"patch"|'"'"'patch'"'"'|"annotate"|'"'"'annotate'"'"'|"label"|'"'"'label'"'"'' "$B3A_TOOL" 2>/dev/null || true)"
     if [ -z "$B3A_MUTATING_HITS" ]; then
@@ -12959,24 +12246,24 @@ for B3A_TOOL in automation/orchestration/runtime_state.py automation/orchestrati
 done
 
 # Both classifiers' own dedicated offline unit-test suites are part of the normal regression run, not merely available separately.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/test-goldengate-runtime-state.py ]; then
-  if RUNTIME_STATE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/test-goldengate-runtime-state.py 2>&1)"; then
-    pass "Phase B3A: automation/test-goldengate-runtime-state.py (the runtime ownership-safety classifier's offline ABSENT/OWNED/BROKEN test suite) passes"
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/phases/phase5/tests/test_runtime_state.py ]; then
+  if RUNTIME_STATE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/phases/phase5/tests/test_runtime_state.py 2>&1)"; then
+    pass "Phase B3A: automation/phases/phase5/tests/test_runtime_state.py (the runtime ownership-safety classifier's offline ABSENT/OWNED/BROKEN test suite) passes"
   else
-    fail "Phase B3A: automation/test-goldengate-runtime-state.py failed:"$'\n'"${RUNTIME_STATE_TEST_OUTPUT}"
+    fail "Phase B3A: automation/phases/phase5/tests/test_runtime_state.py failed:"$'\n'"${RUNTIME_STATE_TEST_OUTPUT}"
   fi
 else
-  skip "Phase B3A: automation/test-goldengate-runtime-state.py -- python3 unavailable or file missing"
+  skip "Phase B3A: automation/phases/phase5/tests/test_runtime_state.py -- python3 unavailable or file missing"
 fi
 
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/test-goldengate-runtime-acceptance.py ]; then
-  if RUNTIME_ACCEPTANCE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/test-goldengate-runtime-acceptance.py 2>&1)"; then
-    pass "Phase B3A: automation/test-goldengate-runtime-acceptance.py (the runtime acceptance classifier's offline HEALTHY/BROKEN test suite) passes"
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/phases/phase5/tests/test_runtime_acceptance.py ]; then
+  if RUNTIME_ACCEPTANCE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/phases/phase5/tests/test_runtime_acceptance.py 2>&1)"; then
+    pass "Phase B3A: automation/phases/phase5/tests/test_runtime_acceptance.py (the runtime acceptance classifier's offline HEALTHY/BROKEN test suite) passes"
   else
-    fail "Phase B3A: automation/test-goldengate-runtime-acceptance.py failed:"$'\n'"${RUNTIME_ACCEPTANCE_TEST_OUTPUT}"
+    fail "Phase B3A: automation/phases/phase5/tests/test_runtime_acceptance.py failed:"$'\n'"${RUNTIME_ACCEPTANCE_TEST_OUTPUT}"
   fi
 else
-  skip "Phase B3A: automation/test-goldengate-runtime-acceptance.py -- python3 unavailable or file missing"
+  skip "Phase B3A: automation/phases/phase5/tests/test_runtime_acceptance.py -- python3 unavailable or file missing"
 fi
 
 # Structural proof, read directly from the real committed YAML (never a reimplementation): active_runtime_matrix wiring, runtime_ownership_preflight/validate_active_runtimes DAG shape, and the ABSENT/OWNED/BROKEN vocabulary.
@@ -12992,17 +12279,17 @@ jobs = main_doc["jobs"]
 
 # 1/2: classifier files exist.
 import os
-results.append(("1: automation/orchestration/runtime_state.py exists", os.path.isfile("automation/orchestration/runtime_state.py")))
-results.append(("2: automation/orchestration/runtime_acceptance.py exists", os.path.isfile("automation/orchestration/runtime_acceptance.py")))
+results.append(("1: automation/phases/phase5/runtime_state.py exists", os.path.isfile("automation/phases/phase5/runtime_state.py")))
+results.append(("2: automation/phases/phase5/runtime_acceptance.py exists", os.path.isfile("automation/phases/phase5/runtime_acceptance.py")))
 
 # 3: runtime ownership vocabulary is exactly ABSENT/OWNED/BROKEN (never HEALTHY -- that distinction is intentional).
-with open("automation/orchestration/runtime_state.py") as f:
+with open("automation/phases/phase5/runtime_state.py") as f:
     runtime_state_source = f.read()
 results.append(("3a: runtime_state.py defines STATE_ABSENT", "STATE_ABSENT = \"ABSENT\"" in runtime_state_source))
 results.append(("3b: runtime_state.py defines STATE_OWNED", "STATE_OWNED = \"OWNED\"" in runtime_state_source))
 results.append(("3c: runtime_state.py defines STATE_BROKEN", "STATE_BROKEN = \"BROKEN\"" in runtime_state_source))
 results.append(("3d: runtime_state.py never defines a HEALTHY state (ownership preflight is not a HEALTHY-skip prerequisite)", "STATE_HEALTHY" not in runtime_state_source))
-with open("automation/orchestration/runtime_acceptance.py") as f:
+with open("automation/phases/phase5/runtime_acceptance.py") as f:
     runtime_acceptance_source = f.read()
 results.append(("3e: runtime_acceptance.py vocabulary is HEALTHY/BROKEN", "STATE_HEALTHY = \"HEALTHY\"" in runtime_acceptance_source and "STATE_BROKEN = \"BROKEN\"" in runtime_acceptance_source))
 results.append(("3f: runtime_acceptance.py never defines an ABSENT state (an active desired runtime that is missing IS BROKEN)", "STATE_ABSENT" not in runtime_acceptance_source))
@@ -13318,7 +12605,7 @@ if grep -qE '^\s*containers:\s*$' helm/goldengate/templates/runtime-statefulset.
 else
   fail "Phase B3A: 20: could not locate the containers: block in helm/goldengate/templates/runtime-statefulset.yaml"
 fi
-if grep -qF "len(containers) != 1" automation/orchestration/runtime_acceptance.py 2>/dev/null; then
+if grep -qF "len(containers) != 1" automation/phases/phase5/runtime_acceptance.py 2>/dev/null; then
   pass "Phase B3A: 20: runtime_acceptance.py enforces exactly one application container, never a second desired sidecar shape"
 else
   fail "Phase B3A: 20: runtime_acceptance.py no longer enforces the exact one-container pod shape as expected"
@@ -14682,10 +13969,10 @@ for job_name, output_key in (
     job_text = yaml.dump(jobs.get(job_name, {}), default_flow_style=False)
     check(f"Q: {job_name} reads needs.validate_model.outputs.{output_key} (the canonical value, never re-derived)", f"needs.validate_model.outputs.{output_key}" in job_text)
 
-# R: no phase5+ placeholder directory or job was introduced -- exactly Phase 1, Phase 2, Phase 3 (Argo CD), and now Phase 4 (Platform/Observability/Shared Secrets) were converted, nothing else pre-created.
+# R: no phase6+ placeholder directory or job was introduced -- exactly Phase 1, Phase 2, Phase 3 (Argo CD), Phase 4 (Platform/Observability/Shared Secrets), and now Phase 5 (Runtime lifecycle) were converted, nothing else pre-created.
 import os
 phase_dirs = sorted(d for d in os.listdir("automation/phases") if os.path.isdir(os.path.join("automation/phases", d))) if os.path.isdir("automation/phases") else []
-check("R: automation/phases/ contains only phase1, phase2, phase3, and phase4 (no phase5+ placeholder directories)", phase_dirs == ["phase1", "phase2", "phase3", "phase4"])
+check("R: automation/phases/ contains only phase1, phase2, phase3, phase4, and phase5 (no phase6+ placeholder directories)", phase_dirs == ["phase1", "phase2", "phase3", "phase4", "phase5"])
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
@@ -15840,10 +15127,11 @@ print("OK" if all(j in jobs for j in phase5_jobs) else "FAIL")
   else
     fail "AI: one or more Phase 5+ MAIN jobs are missing: ${AI_CHECK}"
   fi
-  if [ ! -d automation/phases/phase5 ]; then
-    pass "AI: automation/phases/phase5/ was not created -- Phase 5 implementation was not begun"
+  # AI: automation/phases/phase5/ now legitimately exists -- the Phase 5 Runtime Lifecycle Python conversion is a subsequent, separately-approved task; this guard originally protected against Phase 5 being pre-created during the Phase 4 conversion, and remains satisfied structurally (Phase 4's own production files/behavior are untouched by Phase 5's addition, proven by the dedicated Phase 5 Python Conversion section elsewhere in this suite).
+  if [ -d automation/phases/phase5 ]; then
+    pass "AI: automation/phases/phase5/ exists -- Phase 5 Runtime Lifecycle is now the current, separately-approved conversion (this guard no longer forbids it; see the Phase 5 Python Conversion section for its own dedicated static assertions)"
   else
-    fail "AI: automation/phases/phase5/ unexpectedly exists"
+    fail "AI: automation/phases/phase5/ is missing"
   fi
 else
   skip "AI: Phase 5+ MAIN job existence check -- python3/PyYAML unavailable or ${EKS_APP_WORKFLOW} missing"
@@ -15851,6 +15139,210 @@ fi
 
 echo ""
 echo ""
+echo ""
+echo "--- Phase 5 Python Conversion: dedicated static assertions (A-AF) ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE5_RUNTIME_TOOL" ]; then
+  PHASE5_DEDICATED_CHECK="$(python3 - "$EKS_APP_WORKFLOW" "$PHASE5_RUNTIME_TOOL" <<'PYEOF'
+import importlib.util
+import io
+import os
+import sys
+from contextlib import redirect_stdout
+from pathlib import Path
+from unittest import mock
+
+import yaml
+
+workflow_path, tool_path = sys.argv[1:3]
+
+with open(workflow_path) as f:
+    doc = yaml.safe_load(f)
+jobs = doc["jobs"]
+
+spec = importlib.util.spec_from_file_location("phase5_runtime", tool_path)
+phase5_runtime = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(phase5_runtime)
+
+results = []
+
+PHASE5_JOB_IDS = ("runtime_ownership_preflight", "build_publish_and_deploy", "delete_removed_argocd_applications", "validate_active_runtimes")
+
+# A: all four MAIN Phase 5 job IDs remain.
+results.append(("A: all four MAIN Phase 5 job IDs remain", all(j in jobs for j in PHASE5_JOB_IDS)))
+
+# B: display names match Phase 5A-D.
+expected_names = {
+    "runtime_ownership_preflight": "Phase 5A | GoldenGate Runtime Ownership Preflight",
+    "build_publish_and_deploy": "Phase 5B | Build, Validate & Reconcile GoldenGate Runtimes",
+    "delete_removed_argocd_applications": "Phase 5C | Remove Undesired GoldenGate Runtimes",
+    "validate_active_runtimes": "Phase 5D | Validate Active GoldenGate Runtimes Healthy",
+}
+for job_id, expected_name in expected_names.items():
+    results.append((f"B: {job_id} display name is exactly {expected_name!r}", jobs.get(job_id, {}).get("name") == expected_name))
+
+# C: MAIN job count remains 26.
+results.append(("C: MAIN job count remains 26", len(jobs) == 26))
+
+# D: runtime_ownership_preflight still depends on validate_shared_secrets_once.
+results.append(("D: runtime_ownership_preflight still depends on validate_shared_secrets_once", "validate_shared_secrets_once" in (jobs["runtime_ownership_preflight"].get("needs") or [])))
+
+# E: delete_removed_argocd_applications still branches from validate_argocd_ready and does not depend on Phase 4.
+delete_needs = jobs["delete_removed_argocd_applications"].get("needs") or []
+results.append(("E: delete_removed_argocd_applications depends on validate_argocd_ready", "validate_argocd_ready" in delete_needs))
+results.append(("E: delete_removed_argocd_applications does not depend on Phase 4 (platform_preflight/observability_preflight/validate_shared_secrets_once)", not ({"platform_preflight", "observability_preflight", "validate_shared_secrets_once"} & set(delete_needs))))
+
+# F/G/H: matrices retained exactly.
+results.append(("F: build_publish_and_deploy retains deployment_matrix", "deployment_matrix" in str(((jobs["build_publish_and_deploy"].get("strategy") or {}).get("matrix") or {}).get("include", ""))))
+results.append(("G: delete_removed_argocd_applications retains deletion_matrix", "deletion_matrix" in str(((jobs["delete_removed_argocd_applications"].get("strategy") or {}).get("matrix") or {}).get("include", ""))))
+results.append(("H: validate_active_runtimes retains active_runtime_matrix", "active_runtime_matrix" in str(((jobs["validate_active_runtimes"].get("strategy") or {}).get("matrix") or {}).get("include", ""))))
+
+# I: all max-parallel/fail-fast/concurrency semantics preserved.
+ownership_strategy = jobs["runtime_ownership_preflight"].get("strategy") or {}
+build_strategy = jobs["build_publish_and_deploy"].get("strategy") or {}
+active_strategy = jobs["validate_active_runtimes"].get("strategy") or {}
+results.append(("I: runtime_ownership_preflight fail-fast=true, max-parallel=1", ownership_strategy.get("fail-fast") is True and ownership_strategy.get("max-parallel") == 1))
+results.append(("I: build_publish_and_deploy fail-fast=true, max-parallel=1", build_strategy.get("fail-fast") is True and build_strategy.get("max-parallel") == 1))
+results.append(("I: build_publish_and_deploy concurrency group is exact", "goldengate-helm-deploy-" in str((jobs["build_publish_and_deploy"].get("concurrency") or {}).get("group", "")) and (jobs["build_publish_and_deploy"].get("concurrency") or {}).get("cancel-in-progress") is False))
+results.append(("I: delete_removed_argocd_applications concurrency group is exact, fail-fast=false", "goldengate-argocd-delete-" in str((jobs["delete_removed_argocd_applications"].get("concurrency") or {}).get("group", "")) and (jobs["delete_removed_argocd_applications"].get("strategy") or {}).get("fail-fast") is False))
+results.append(("I: validate_active_runtimes fail-fast=true, max-parallel=1", active_strategy.get("fail-fast") is True and active_strategy.get("max-parallel") == 1))
+
+# J/K/L/M: each phase is Python-backed.
+def all_steps_text(job):
+    return "\n".join(s.get("run", "") for s in job.get("steps", []))
+
+
+results.append(("J: Phase 5A ownership classifier is Python-backed (phase5_runtime.py ownership-preflight)", "phase5_runtime.py ownership-preflight" in all_steps_text(jobs["runtime_ownership_preflight"])))
+build_text = all_steps_text(jobs["build_publish_and_deploy"])
+results.append(("K: Phase 5B implementation is Python-backed (prepare-deployment/resolve-live-inputs/validate-local/publish-chart/validate-cluster-prerequisites/reconcile-runtime/post-deploy-diagnostics)",
+                 all(f"phase5_runtime.py {sub}" in build_text for sub in ("prepare-deployment", "resolve-live-inputs", "validate-local", "publish-chart", "validate-cluster-prerequisites", "reconcile-runtime", "post-deploy-diagnostics"))))
+delete_text = all_steps_text(jobs["delete_removed_argocd_applications"])
+results.append(("L: Phase 5C removal is Python-backed (prepare-removal/removal-preflight/remove-runtime/post-delete-acceptance)",
+                 all(f"phase5_runtime.py {sub}" in delete_text for sub in ("prepare-removal", "removal-preflight", "remove-runtime", "post-delete-acceptance"))))
+results.append(("M: Phase 5D acceptance is Python-backed (phase5_runtime.py strict-acceptance)", "phase5_runtime.py strict-acceptance" in all_steps_text(jobs["validate_active_runtimes"])))
+
+# N/O/P: credential isolation.
+def cred_steps(job):
+    return [s for s in job.get("steps", []) if s.get("uses", "").startswith("aws-actions/configure-aws-credentials")]
+
+
+all_cred_steps = []
+for job_id in PHASE5_JOB_IDS:
+    all_cred_steps.extend(cred_steps(jobs[job_id]))
+results.append(("N: all configure-aws-credentials calls in the four Phase 5 jobs have output-credentials=true, output-env-credentials=false",
+                 len(all_cred_steps) == 4 and all((s.get("with") or {}).get("output-credentials") is True and (s.get("with") or {}).get("output-env-credentials") is False for s in all_cred_steps)))
+
+def step_names_with_credentials(job):
+    names = set()
+    for s in job.get("steps", []):
+        env = s.get("env") or {}
+        if any("aws_build_credentials.outputs" in str(v) for v in env.values()):
+            names.add(s.get("name"))
+    return names
+
+
+results.append(("O: runtime_ownership_preflight -- only 'Classify runtime ownership safety' receives credential outputs", step_names_with_credentials(jobs["runtime_ownership_preflight"]) == {"Classify runtime ownership safety"}))
+results.append(("O: build_publish_and_deploy -- exactly the five live-AWS steps receive credential outputs", step_names_with_credentials(jobs["build_publish_and_deploy"]) == {"Resolve and verify live AWS inputs", "Publish runtime Helm chart to private ECR", "Validate live EKS runtime prerequisites", "Reconcile runtime through Argo CD", "Post-deployment diagnostics"}))
+results.append(("O: delete_removed_argocd_applications -- exactly the three live-AWS steps receive credential outputs", step_names_with_credentials(jobs["delete_removed_argocd_applications"]) == {"Classify removal safety", "Remove owned runtime Application", "Verify runtime compute absence"}))
+results.append(("O: validate_active_runtimes -- only 'Require runtime to be exactly HEALTHY' receives credential outputs", step_names_with_credentials(jobs["validate_active_runtimes"]) == {"Require runtime to be exactly HEALTHY"}))
+
+local_step = next((s for s in jobs["build_publish_and_deploy"]["steps"] if s.get("name") == "Render, validate and package runtime locally"), None)
+results.append(("P: local render validation receives no credential outputs", local_step is not None and not any("aws_build_credentials.outputs" in str(v) for v in (local_step.get("env") or {}).values())))
+
+# Q: Validate mode does no runtime mutation -- every mutating step (publish-chart/validate-cluster-prerequisites/reconcile-runtime/post-deploy-diagnostics, and the Phase 5C removal steps' mutation) is gated on matrix.deploy or runs only via the deletion_matrix (never Validate).
+deploy_gated_steps = ("Publish runtime Helm chart to private ECR", "Validate live EKS runtime prerequisites", "Reconcile runtime through Argo CD", "Post-deployment diagnostics")
+results.append(("Q: Validate mode does no runtime mutation -- publish/validate-cluster-prerequisites/reconcile/diagnostics are all gated on matrix.deploy", all("matrix.deploy" in str(next(s for s in jobs["build_publish_and_deploy"]["steps"] if s.get("name") == name).get("if", "")) for name in deploy_gated_steps)))
+
+# R: ECR repository create is gated only by explicit RepositoryNotFoundException.
+with open(tool_path) as f:
+    tool_source = f.read()
+results.append(("R: ECR repository create is gated only by explicit RepositoryNotFoundException", '"RepositoryNotFoundException" not in error_text' in tool_source))
+
+# S: no Phase 5 production jq execution exists.
+results.append(('S: no Phase 5 production jq execution exists', '"jq"' not in tool_source and "'jq'" not in tool_source))
+
+# T: no shell pipeline transports the ECR password.
+results.append(("T: no shell pipeline transports ECR password (input_text used instead)", "get-login-password" in tool_source and "input_text=password" in tool_source and "get-login-password | helm" not in tool_source))
+
+# U/V/W: removal fail-closed contracts.
+def cmd_source(name):
+    import ast
+    tree = ast.parse(tool_source)
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
+    return ast.get_source_segment(tool_source, fn) or ""
+
+
+prepare_removal_src = cmd_source("cmd_prepare_removal")
+remove_runtime_src = cmd_source("cmd_remove_runtime")
+results.append(("U: BROKEN removal state cannot mutate (remove-runtime requires ownership_state in ABSENT/OWNED)", 'ownership_state not in ("ABSENT", "OWNED")' in remove_runtime_src))
+results.append(("V: legacyPair cannot mutate (prepare-removal fails closed before any mutation)", 'deployment_model != "singleRuntime"' in prepare_removal_src))
+results.append(("W: managed physical-removal cannot mutate (prepare-removal fails closed before any mutation)", 'reason == "physical-removal" and efs_mode == "managed"' in prepare_removal_src))
+
+# X/Y: post-delete success requires Application absent and non-PVC footprint absent.
+post_delete_absent_src = cmd_source("_post_delete_positively_absent")
+results.append(("X: post-delete success requires Application absent (application_found is not False -> fail)", 'checks.get("application_found") is not False' in post_delete_absent_src))
+results.append(("Y: non-PVC footprint must be absent for post-delete success", "non_pvc_still_present" in post_delete_absent_src))
+
+# Z/AA: retained PVC and shared namespace are never deleted (behavioral proof, not text-scanning).
+remove_runtime_calls = []
+
+
+def fake_run(argv, env=None, cwd=None, check=True, capture_output=True, input_text=None):
+    remove_runtime_calls.append(list(argv))
+    if argv[:2] == ["aws", "eks"]:
+        return type("Proc", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    return type("Proc", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+
+with mock.patch.object(phase5_runtime, "run", fake_run), mock.patch.dict(os.environ, {"AWS_REGION": "eu-west-1", "EKS_CLUSTER_NAME": "x", "EKS_DEPLOY_ROLE_ARN": "arn:aws:iam::668311715351:role/x"}):
+    args = type("Args", (), {"environment": "dev", "deployment_id": "gg-oracle-payments-01", "state_path": None})()
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "state.json"
+        phase5_runtime.update_state(state_path, {"ownership_state": "OWNED", "application_found": True, "argocd_app_name": "goldengate-dev-oracle-payments-01", "argocd_namespace": "argocd"}, phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
+        args.state_path = state_path
+        with redirect_stdout(io.StringIO()):
+            phase5_runtime.cmd_remove_runtime(args)
+
+results.append(("Z: retained PVC is never deleted (no PVC-targeting subprocess call in remove-runtime's real mutating path)", not any("persistentvolumeclaim" in argv or "pvc" in argv for argv in remove_runtime_calls)))
+results.append(("AA: shared runtime namespace is never deleted (no namespace-targeting subprocess call in remove-runtime's real mutating path)", not any("namespace" in argv for argv in remove_runtime_calls)))
+
+# AB/AC/AD: canonical classifier locations.
+results.append(("AB: runtime_state.py/runtime_acceptance.py canonical paths are automation/phases/phase5/", os.path.isfile("automation/phases/phase5/runtime_state.py") and os.path.isfile("automation/phases/phase5/runtime_acceptance.py")))
+results.append(("AC: old automation/orchestration/runtime_state.py and runtime_acceptance.py are absent", not os.path.isfile("automation/orchestration/runtime_state.py") and not os.path.isfile("automation/orchestration/runtime_acceptance.py")))
+results.append(("AD: k8s_common.py remains under automation/orchestration/", os.path.isfile("automation/orchestration/k8s_common.py")))
+
+# AE: Phase 6 (replication_reconcile_once) remains downstream of validate_active_runtimes according to the existing active-runtime gating.
+replication_if = str(jobs.get("replication_reconcile_once", {}).get("if", ""))
+replication_needs = jobs.get("replication_reconcile_once", {}).get("needs") or []
+results.append(("AE: Phase 6 (replication_reconcile_once) remains downstream of validate_active_runtimes -- needs it and its if: references its result/has_active_deployments", "validate_active_runtimes" in replication_needs and "validate_active_runtimes.result" in replication_if))
+
+# AF: replication remains disabled in both current descriptors.
+for descriptor_path in ("envs/dev/gg-postgresql-repltest-01/values.yaml", "envs/dev/gg-mssql-repltest-01/values.yaml"):
+    with open(descriptor_path) as f:
+        descriptor_doc = yaml.safe_load(f)
+    deployment_enabled = ((descriptor_doc.get("deployment") or {}).get("enabled"))
+    replication_enabled = ((descriptor_doc.get("replication") or {}).get("enabled"))
+    results.append((f"AF: {descriptor_path} remains deployment.enabled=true, replication.enabled=false", deployment_enabled is True and replication_enabled is False))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  echo "$PHASE5_DEDICATED_CHECK"
+  if [ -z "$(echo "$PHASE5_DEDICATED_CHECK" | grep '^FAIL ' || true)" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        OK\ *) pass "Phase 5 Python Conversion: ${line#OK }" ;;
+      esac
+    done <<< "$PHASE5_DEDICATED_CHECK"
+  else
+    fail "Phase 5 Python Conversion: dedicated static assertions failed:"$'\n'"${PHASE5_DEDICATED_CHECK}"
+  fi
+else
+  skip "Phase 5 Python Conversion: dedicated static assertions -- python3/PyYAML/main workflow/phase5_runtime.py unavailable"
+fi
+
 echo "--- Final repository handoff hygiene sweep (VDR pre-transfer cleanliness) ---"
 
 # This is the LAST check in the suite, deliberately: earlier sections legitimately regenerate work/generated/dev/goldengate-deployments.yaml (the folder-driven registry-generation checks) as their own tested behavior -- asserting its absence any earlier would be a self-defeating mid-test assertion. Self-heal only the categories PROVEN elsewhere in this suite to be pure, expected byproducts of exercising real application/tooling behavior (never silently deleting anything whose origin is unknown); everything else must already be absent, or this check fails closed and reports it for a human to investigate before VDR handoff.

@@ -581,7 +581,7 @@ def _reject_runtime_enabled_presence_control(runtime):
 
 
 def _parse_csi_structure(runtime):
-    """Validates the CSI block shape and extracts the stable enabled/mountPath fields automation/orchestration/runtime_acceptance.py needs to verify actual pod volume/mount wiring against -- never a second descriptor schema, just a few more fields read from the same validated runtime.csi block. objectName/serviceAccountRoleArn presence is rejected earlier by _reject_forbidden_overrides."""
+    """Validates the CSI block shape and extracts the stable enabled/mountPath fields automation/phases/phase5/runtime_acceptance.py needs to verify actual pod volume/mount wiring against -- never a second descriptor schema, just a few more fields read from the same validated runtime.csi block. objectName/serviceAccountRoleArn presence is rejected earlier by _reject_forbidden_overrides."""
     csi = _require_dict(runtime.get("csi"), "invalid CSI configuration: runtime.csi must be a mapping")
     admin = _require_dict(csi.get("admin"), "invalid CSI configuration: runtime.csi.admin must be a mapping")
     certificate = _require_dict(csi.get("certificate"), "invalid CSI configuration: runtime.csi.certificate must be a mapping")
@@ -712,7 +712,7 @@ def parse_descriptor(deployment_id, environment, doc, shared=None):
     alb = ingress.get("alb") or {}
     alb_group_order = alb.get("groupOrder")
 
-    # Phase B3A: focused fields the runtime ownership/acceptance classifiers need (automation/orchestration/runtime_state.py, runtime_acceptance.py) -- never a second descriptor schema, just a few more fields extracted from the same validated document. Light shape validation only; Helm's own `required`/type coercion at render time remains the deeper contract for these fields.
+    # Phase 5: focused fields the runtime ownership/acceptance classifiers need (automation/phases/phase5/runtime_state.py, runtime_acceptance.py) -- never a second descriptor schema, just a few more fields extracted from the same validated document. Light shape validation only; Helm's own `required`/type coercion at render time remains the deeper contract for these fields.
     service = runtime.get("service") or {}
     service_type = service.get("type") or "ClusterIP"
     if not isinstance(service_type, str) or not service_type:
