@@ -185,8 +185,8 @@ def _pods_for_selector(namespace, selector):
     return (json.loads(proc.stdout) or {}).get("items") or []
 
 
-def _replicaset_owner_deployment_uid(namespace, replicaset_name):
-    """Fail-closed ReplicaSet ownership inspection for the canonical current-revision pod resolver below. Returns the ReplicaSet's own controller Deployment UID (or None if the ReplicaSet itself has no single Deployment controller -- it cannot then certify any pod as current for any Deployment). A genuine Kubernetes NotFound (the ReplicaSet has already disappeared, e.g. a fully-scaled-down stale revision) also returns None -- that pod is correctly excluded from the current-revision set, never treated as current. Every OTHER inspection failure (Forbidden, network/API failure, malformed JSON, unknown error) raises Phase4Error: an RBAC/API failure must never silently shrink the authoritative pod set into a false pass."""
+def _replicaset_identity(namespace, replicaset_name):
+    """Fail-closed ReplicaSet identity inspection for the canonical current-revision pod resolver below. Returns {"uid": <non-empty ReplicaSet metadata.uid>, "deployment_uid": <controller Deployment uid, or None if the ReplicaSet has no single Deployment controller>} on success -- both halves of the identity chain a pod's own ownerReference must be checked against, since a same-name ReplicaSet with a different UID is a genuinely different Kubernetes object. A genuine Kubernetes NotFound (the ReplicaSet has already disappeared, e.g. a fully-scaled-down stale revision) returns None -- the pod referencing it is excluded, never treated as current. Every OTHER inspection failure (Forbidden, network/API failure, malformed JSON, or a fetched ReplicaSet with no/empty metadata.uid) raises Phase4Error: an RBAC/API failure or a malformed live object must never silently shrink the authoritative pod set into a false pass."""
     proc = run(["kubectl", "get", "replicaset", replicaset_name, "-n", namespace, "-o", "json"], check=False)
     if proc.returncode != 0:
         error_text = (proc.stderr or "") + (proc.stdout or "")
@@ -197,14 +197,16 @@ def _replicaset_owner_deployment_uid(namespace, replicaset_name):
         replicaset = json.loads(proc.stdout)
     except json.JSONDecodeError as exc:
         raise Phase4Error(f"ReplicaSet {replicaset_name} in {namespace} returned malformed JSON: {exc}") from exc
+    replicaset_uid = (replicaset.get("metadata") or {}).get("uid")
+    if not replicaset_uid:
+        raise Phase4Error(f"ReplicaSet {replicaset_name} in {namespace} was returned with no metadata.uid -- refusing to classify it as stale or current.")
     owner_refs = [o for o in ((replicaset.get("metadata") or {}).get("ownerReferences") or []) if o.get("controller") is True]
-    if len(owner_refs) != 1 or owner_refs[0].get("kind") != "Deployment":
-        return None
-    return owner_refs[0].get("uid")
+    deployment_uid = owner_refs[0].get("uid") if len(owner_refs) == 1 and owner_refs[0].get("kind") == "Deployment" else None
+    return {"uid": replicaset_uid, "deployment_uid": deployment_uid}
 
 
 def _current_deployment_pods(namespace, deployment_name, *, running_only=False, ready_only=False):
-    """The one canonical current-revision pod resolver for every Observability acceptance/diagnostic path that must never certify a stale-ReplicaSet pod (cluster-scraper's Deployment is recreated in place by _ensure_cluster_scraper_host_network_isolated(), so a stale ReplicaSet's pod can still be Running/Ready for a time after a new revision is live). Resolves the live Deployment's own metadata.uid, derives its pod selector via _label_selector(), then for every non-terminating candidate pod walks Pod -> controller ReplicaSet -> controller Deployment UID and requires an exact match before classifying the pod as CURRENT REVISION. Fails closed (Phase4Error) on a missing Deployment UID, an empty selector, or any ReplicaSet inspection failure other than a genuine NotFound -- callers never see a silently-narrowed pod set."""
+    """The one canonical current-revision pod resolver for every Observability acceptance/diagnostic path that must never certify a stale-ReplicaSet pod (cluster-scraper's Deployment is recreated in place by _ensure_cluster_scraper_host_network_isolated(), so a stale ReplicaSet's pod can still be Running/Ready for a time after a new revision is live). Resolves the live Deployment's own metadata.uid, derives its pod selector via _label_selector(), then for every non-terminating candidate pod verifies the COMPLETE identity chain -- pod controller ownerReference.uid must equal the fetched ReplicaSet's own metadata.uid (a same-name ReplicaSet with a different UID is a different object and never certifies the pod), and that ReplicaSet's own controller ownerReference.uid must equal the current Deployment's metadata.uid -- before classifying the pod as CURRENT REVISION. A pod with an ambiguous/malformed controller reference (missing kind/name/uid) is excluded, never certified, without raising. Fails closed (Phase4Error) on a missing Deployment UID, an empty selector, a ReplicaSet returned with no metadata.uid, or any ReplicaSet inspection failure other than a genuine NotFound -- callers never see a silently-narrowed pod set from an inspection error."""
     deploy = _kubectl_get_json("deployment", deployment_name, namespace)
     deploy_uid = (deploy.get("metadata") or {}).get("uid")
     if not deploy_uid:
@@ -214,7 +216,7 @@ def _current_deployment_pods(namespace, deployment_name, *, running_only=False, 
     if not selector:
         raise Phase4Error(f"Deployment/{deployment_name} in {namespace} has an empty pod selector -- refusing to resolve current-revision pods.")
 
-    replicaset_uid_cache = {}
+    replicaset_identity_cache = {}
     current_pods = []
     for pod in _pods_for_selector(namespace, selector):
         metadata = pod.get("metadata") or {}
@@ -224,10 +226,20 @@ def _current_deployment_pods(namespace, deployment_name, *, running_only=False, 
         if len(owner_refs) != 1 or owner_refs[0].get("kind") != "ReplicaSet":
             continue
         replicaset_name = owner_refs[0].get("name")
-        if replicaset_name not in replicaset_uid_cache:
-            replicaset_uid_cache[replicaset_name] = _replicaset_owner_deployment_uid(namespace, replicaset_name)
-        if replicaset_uid_cache[replicaset_name] != deploy_uid:
-            continue
+        pod_replicaset_uid = owner_refs[0].get("uid")
+        if not replicaset_name or not pod_replicaset_uid:
+            continue  # Ambiguous/malformed controller identity -- never certified as current, but this is a pod-shape issue, not an inspection failure, so it is excluded rather than raised.
+
+        if replicaset_name not in replicaset_identity_cache:
+            replicaset_identity_cache[replicaset_name] = _replicaset_identity(namespace, replicaset_name)
+        identity = replicaset_identity_cache[replicaset_name]
+        if identity is None:
+            continue  # ReplicaSet genuinely NotFound -- the pod cannot be current.
+        if identity["uid"] != pod_replicaset_uid:
+            continue  # The pod's own ownerReference names a ReplicaSet that no longer exists under that UID -- a same-name object with a different UID is a different object, never the pod's real owner.
+        if identity["deployment_uid"] != deploy_uid:
+            continue  # Only reached once the pod's ReplicaSet identity itself is proven current -- now check that ReplicaSet's own Deployment owner.
+
         if running_only and (pod.get("status") or {}).get("phase") != "Running":
             continue
         if ready_only:
@@ -1195,17 +1207,17 @@ def _live_kubernetes_validation(namespace, cloudwatch_metrics_role_arn, ecr_regi
     for pod in _pods_for_selector(namespace, _label_selector(cw_ds)):
         if (pod.get("spec") or {}).get("hostNetwork") is not True:
             raise Phase4Error(f"node-agent pod {(pod.get('metadata') or {}).get('name')} spec.hostNetwork is not true.")
-    running_scraper_pods = [p for p in _pods_for_selector(namespace, _label_selector(scraper_deploy)) if (p.get("status") or {}).get("phase") == "Running"]
-    if not running_scraper_pods:
-        raise Phase4Error("no active (Running) cluster-scraper pods found.")
-    for pod in running_scraper_pods:
+
+    # Current-revision only for the scraper side of this final acceptance: a stale ReplicaSet's pod (still Running for a time after a new revision is live) must never be authoritative for either the hostNetwork check or the port-collision log scan below. Resolved exactly ONCE and reused for both checks, so this single acceptance operation never risks a first read considering a pod current and a second read observing a different rollout state.
+    current_running_scraper_pods = _current_deployment_pods(namespace, "cloudwatch-agent-cluster-scraper", running_only=True)
+    if not current_running_scraper_pods:
+        raise Phase4Error("no active current-revision (Running) cluster-scraper pods found.")
+    for pod in current_running_scraper_pods:
         if (pod.get("spec") or {}).get("hostNetwork") is not False:
             raise Phase4Error(f"cluster-scraper pod {(pod.get('metadata') or {}).get('name')} spec.hostNetwork is not false.")
 
-    # Current-revision only for the scraper side of this final bounded log scan: a stale ReplicaSet's pod (still Running for a time after a new revision is live) must never be able to fail the current deployment on its own historical crash symptom.
     crash_pattern = re.compile(r"bind: address already in use|binding address localhost:8888|listen tcp 127\.0\.0\.1:8888|failed to create SDK", re.IGNORECASE)
-    current_scraper_pods_for_logs = _current_deployment_pods(namespace, "cloudwatch-agent-cluster-scraper", running_only=True)
-    for pod in _pods_for_selector(namespace, _label_selector(cw_ds)) + current_scraper_pods_for_logs:
+    for pod in _pods_for_selector(namespace, _label_selector(cw_ds)) + current_running_scraper_pods:
         if (pod.get("metadata") or {}).get("deletionTimestamp"):
             continue
         proc = run(["kubectl", "logs", (pod.get("metadata") or {}).get("name"), "-n", namespace, "--tail=80"], check=False)

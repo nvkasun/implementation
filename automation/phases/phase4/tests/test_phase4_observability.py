@@ -127,11 +127,15 @@ def _scraper_deployment(namespace="amazon-cloudwatch", uid=CURRENT_DEPLOY_UID, s
     }
 
 
-def _scraper_pod(name, replicaset_name, phase="Running", ready=True, deletion_timestamp=None,
+def _scraper_pod(name, replicaset_name, replicaset_uid=None, phase="Running", ready=True, deletion_timestamp=None,
                   host_network=False, pod_ip="10.0.0.5", host_ip="10.0.1.9",
                   service_account="cloudwatch-agent", env_names=("AWS_ROLE_ARN", "AWS_WEB_IDENTITY_TOKEN_FILE"),
                   container_name="cloudwatch-agent"):
-    metadata = {"name": name, "ownerReferences": [{"controller": True, "kind": "ReplicaSet", "name": replicaset_name}]}
+    # replicaset_uid defaults to "<replicaset_name>-uid" -- a real Kubernetes ownerReference always carries a UID, and this deterministic default matches _replicaset_fake_run()'s own auto-derived ReplicaSet metadata.uid below, so ordinary "this pod belongs to this ReplicaSet" fixtures need not repeat the UID explicitly. Pass replicaset_uid="" explicitly to model a malformed/missing pod ownerReference.uid, or a distinct string to model a same-name/different-UID stale reference.
+    if replicaset_uid is None:
+        replicaset_uid = f"{replicaset_name}-uid"
+    owner_ref = {"controller": True, "kind": "ReplicaSet", "name": replicaset_name, "uid": replicaset_uid}
+    metadata = {"name": name, "ownerReferences": [owner_ref]}
     if deletion_timestamp:
         metadata["deletionTimestamp"] = deletion_timestamp
     return {
@@ -144,8 +148,12 @@ def _scraper_pod(name, replicaset_name, phase="Running", ready=True, deletion_ti
     }
 
 
-def _replicaset_owned_by_deployment(deploy_uid):
-    return {"metadata": {"ownerReferences": [{"controller": True, "kind": "Deployment", "uid": deploy_uid}]}}
+def _replicaset_owned_by_deployment(deploy_uid, uid=None):
+    """uid, if given, is this ReplicaSet's OWN metadata.uid (explicit override for a same-name/different-UID stale-reference test); otherwise _replicaset_fake_run() auto-derives "<name>-uid" from the ReplicaSet's own map key, matching _scraper_pod()'s own default ownerReference.uid."""
+    metadata = {"ownerReferences": [{"controller": True, "kind": "Deployment", "uid": deploy_uid}]}
+    if uid is not None:
+        metadata["uid"] = uid
+    return {"metadata": metadata}
 
 
 def _replicaset_fake_run(replicaset_map, fallback=None):
@@ -160,7 +168,11 @@ def _replicaset_fake_run(replicaset_map, fallback=None):
                 if check and entry.returncode != 0:
                     raise phase4_observability.Phase4Error(f"replicaset {name} lookup failed: {entry.stderr}")
                 return entry
-            return FakeProc(0, json.dumps(entry))
+            metadata = dict(entry.get("metadata") or {})
+            metadata.setdefault("uid", f"{name}-uid")
+            responded = dict(entry)
+            responded["metadata"] = metadata
+            return FakeProc(0, json.dumps(responded))
         if fallback is not None:
             return fallback(argv, env=env, cwd=cwd, check=check, capture_output=capture_output, input_text=input_text)
         return FakeProc(0, "")
@@ -824,6 +836,92 @@ class CurrentRevisionPodResolverTests(unittest.TestCase):
         self.assertEqual(result, [])
 
 
+class ReplicaSetIdentityChainTests(unittest.TestCase):
+    """automation/phases/phase4/phase4_observability.py::_current_deployment_pods()/_replicaset_identity() -- the complete Pod.ownerRef.uid == ReplicaSet.metadata.uid AND ReplicaSet.ownerRef.uid == Deployment.metadata.uid identity chain. A same-name ReplicaSet with a different UID is a genuinely different Kubernetes object and must never certify a pod as current."""
+
+    NAMESPACE = "amazon-cloudwatch"
+
+    def _resolve(self, pod, replicaset_map):
+        deploy = _scraper_deployment()
+        with mock.patch.object(phase4_observability, "_kubectl_get_json", return_value=deploy), \
+             mock.patch.object(phase4_observability, "_pods_for_selector", return_value=[pod]), \
+             mock.patch.object(phase4_observability, "run", _replicaset_fake_run(replicaset_map)):
+            return phase4_observability._current_deployment_pods(self.NAMESPACE, SCRAPER_DEPLOYMENT_NAME)
+
+    def test_matching_pod_replicaset_uid_and_deployment_uid_selected(self):
+        """Item 1: pod ReplicaSet owner UID == fetched ReplicaSet metadata.uid AND ReplicaSet's own Deployment owner UID == current Deployment UID -> selected."""
+        pod = _scraper_pod("orphan-old", "rs-same", replicaset_uid="rs-same-uid")
+        result = self._resolve(pod, {"rs-same": _replicaset_owned_by_deployment(CURRENT_DEPLOY_UID, uid="rs-same-uid")})
+        self.assertEqual([p["metadata"]["name"] for p in result], ["orphan-old"])
+
+    def test_same_name_different_uid_replicaset_excludes_orphan_pod(self):
+        """Item 2: the exact confirmed reproduction -- a pod's ownerReference still names 'rs-same' with the OLD ReplicaSet UID, but the live ReplicaSet object 'rs-same' now returned by the API has a NEW UID (a different Kubernetes object recreated under the same name, owned by the current Deployment). The old resolver (pre-fix) compared only names and the ReplicaSet's own Deployment-owner UID, incorrectly including this pod. The fixed resolver must additionally require pod.ownerRef.uid == replicaset.metadata.uid, which fails here, so the pod is excluded."""
+        orphan_pod = _scraper_pod("orphan-old", "rs-same", replicaset_uid="rs-OLD-uid")
+        result = self._resolve(orphan_pod, {"rs-same": _replicaset_owned_by_deployment(CURRENT_DEPLOY_UID, uid="rs-NEW-uid")})
+        self.assertEqual(result, [])
+
+    def test_missing_pod_replicaset_ownerreference_uid_excluded(self):
+        """Item 3: a pod whose controller ownerReference has no (empty) uid has malformed/ambiguous controller identity and can never be certified as current -- fails closed by exclusion, never raises, matching how the existing kind/count ambiguity checks already behave."""
+        pod = _scraper_pod("scraper-malformed", "rs-current", replicaset_uid="")
+        result = self._resolve(pod, {"rs-current": _replicaset_owned_by_deployment(CURRENT_DEPLOY_UID, uid="rs-current-uid")})
+        self.assertEqual(result, [])
+
+    def test_missing_fetched_replicaset_uid_fails_closed(self):
+        """Item 4: a ReplicaSet returned successfully (rc=0, valid JSON) but with no metadata.uid is a malformed live object -- fails closed with Phase4Error, never silently treated as stale or current."""
+        pod = _scraper_pod("scraper-current", "rs-current")
+
+        def fake_run(argv, env=None, cwd=None, check=True, capture_output=True, input_text=None):
+            if argv[:3] == ["kubectl", "get", "replicaset"]:
+                return FakeProc(0, json.dumps({"metadata": {"ownerReferences": [{"controller": True, "kind": "Deployment", "uid": CURRENT_DEPLOY_UID}]}}))
+            return FakeProc(0, "")
+
+        deploy = _scraper_deployment()
+        with mock.patch.object(phase4_observability, "_kubectl_get_json", return_value=deploy), \
+             mock.patch.object(phase4_observability, "_pods_for_selector", return_value=[pod]), \
+             mock.patch.object(phase4_observability, "run", fake_run):
+            with self.assertRaises(phase4_observability.Phase4Error) as ctx:
+                phase4_observability._current_deployment_pods(self.NAMESPACE, SCRAPER_DEPLOYMENT_NAME)
+        self.assertIn("no metadata.uid", str(ctx.exception))
+
+    def test_replicaset_deployment_owner_matches_but_pod_replicaset_uid_mismatches_excluded(self):
+        """Item 5: even though the fetched ReplicaSet's own Deployment-owner UID correctly matches the current Deployment, the pod's ownerReference still names a DIFFERENT ReplicaSet UID -- still excluded, since the pod->ReplicaSet link itself is broken."""
+        pod = _scraper_pod("scraper-stale-link", "rs-current", replicaset_uid="rs-current-STALE-uid")
+        result = self._resolve(pod, {"rs-current": _replicaset_owned_by_deployment(CURRENT_DEPLOY_UID, uid="rs-current-uid")})
+        self.assertEqual(result, [])
+
+    def test_pod_replicaset_uid_matches_but_replicaset_deployment_uid_stale_excluded(self):
+        """Item 6: the pod's own ownerReference.uid correctly matches the fetched ReplicaSet's metadata.uid, but that ReplicaSet's own Deployment-owner UID is stale (belongs to a prior Deployment incarnation) -- still excluded."""
+        pod = _scraper_pod("scraper-old-deploy-link", "rs-current", replicaset_uid="rs-current-uid")
+        result = self._resolve(pod, {"rs-current": _replicaset_owned_by_deployment(STALE_DEPLOY_UID, uid="rs-current-uid")})
+        self.assertEqual(result, [])
+
+    def test_both_uid_links_match_current(self):
+        """Item 7: both halves of the identity chain match -- current."""
+        pod = _scraper_pod("scraper-current", "rs-current", replicaset_uid="rs-current-uid")
+        result = self._resolve(pod, {"rs-current": _replicaset_owned_by_deployment(CURRENT_DEPLOY_UID, uid="rs-current-uid")})
+        self.assertEqual([p["metadata"]["name"] for p in result], ["scraper-current"])
+
+    def test_replicaset_forbidden_remains_fail_closed(self):
+        """Item 8: unchanged by this identity-chain fix -- an inspection failure is never treated as stale/absent."""
+        pod = _scraper_pod("scraper-current", "rs-current")
+        with self.assertRaises(phase4_observability.Phase4Error) as ctx:
+            self._resolve(pod, {"rs-current": FakeProc(1, "", "Error from server (Forbidden): replicasets.apps is forbidden")})
+        self.assertIn("could not inspect ReplicaSet", str(ctx.exception))
+
+    def test_replicaset_notfound_remains_excluded(self):
+        """Item 9: unchanged by this identity-chain fix -- a genuinely disappeared ReplicaSet excludes the pod without raising."""
+        pod = _scraper_pod("scraper-vanishing", "rs-gone")
+        result = self._resolve(pod, {"rs-gone": FakeProc(1, "", 'Error from server (NotFound): replicasets.apps "rs-gone" not found')})
+        self.assertEqual(result, [])
+
+    def test_malformed_replicaset_json_remains_fail_closed(self):
+        """Item 10: unchanged by this identity-chain fix."""
+        pod = _scraper_pod("scraper-current", "rs-current")
+        with self.assertRaises(phase4_observability.Phase4Error) as ctx:
+            self._resolve(pod, {"rs-current": FakeProc(0, "not valid json{{{")})
+        self.assertIn("malformed JSON", str(ctx.exception))
+
+
 class PreIrsaActiveScraperPodTests(unittest.TestCase):
     """automation/phases/phase4/phase4_observability.py::_validate_active_cluster_scraper_pods_pre_irsa() -- runs strictly BEFORE the ServiceAccount IRSA annotation/rollout-restart, so it never inspects AWS_ROLE_ARN/AWS_WEB_IDENTITY_TOKEN_FILE."""
 
@@ -1217,7 +1315,7 @@ class ExportErrorObservationTests(unittest.TestCase):
                 checked_pods.append(argv[2])
                 return FakeProc(0, "no errors here")
             if argv[:3] == ["kubectl", "get", "replicaset"]:
-                return FakeProc(0, json.dumps(_replicaset_owned_by_deployment(CURRENT_DEPLOY_UID)))
+                return FakeProc(0, json.dumps(_replicaset_owned_by_deployment(CURRENT_DEPLOY_UID, uid="rs-current-uid")))
             return FakeProc(0, "")
 
         with mock.patch.object(phase4_observability, "_kubectl_get_json", side_effect=fake_get), \
@@ -1244,7 +1342,7 @@ class ExportErrorObservationTests(unittest.TestCase):
             if argv[:2] == ["kubectl", "logs"] and "agent-1" in argv:
                 return FakeProc(0, "AccessDenied: not authorized to perform: cloudwatch:PutMetricData")
             if argv[:3] == ["kubectl", "get", "replicaset"]:
-                return FakeProc(0, json.dumps(_replicaset_owned_by_deployment(CURRENT_DEPLOY_UID)))
+                return FakeProc(0, json.dumps(_replicaset_owned_by_deployment(CURRENT_DEPLOY_UID, uid="rs-current-uid")))
             return FakeProc(0, "")
 
         with mock.patch.object(phase4_observability, "_kubectl_get_json", side_effect=fake_get), \
@@ -1271,10 +1369,7 @@ class ScraperExportErrorObservationTests(unittest.TestCase):
         def fake_pods(namespace, selector):
             return [agent_pod] if "k8s-app" in selector else scraper_pods
 
-        def fake_run(argv, env=None, cwd=None, check=True, capture_output=True, input_text=None):
-            if argv[:3] == ["kubectl", "get", "replicaset"]:
-                name = argv[3]
-                return FakeProc(0, json.dumps(replicaset_map[name]))
+        def fallback(argv, env=None, cwd=None, check=True, capture_output=True, input_text=None):
             if argv[:2] == ["kubectl", "logs"]:
                 pod_name = argv[2]
                 return FakeProc(0, pod_logs.get(pod_name, ""))
@@ -1282,7 +1377,7 @@ class ScraperExportErrorObservationTests(unittest.TestCase):
 
         with mock.patch.object(phase4_observability, "_kubectl_get_json", side_effect=fake_get), \
              mock.patch.object(phase4_observability, "_pods_for_selector", side_effect=fake_pods), \
-             mock.patch.object(phase4_observability, "run", fake_run), \
+             mock.patch.object(phase4_observability, "run", _replicaset_fake_run(replicaset_map, fallback=fallback)), \
              mock.patch.object(phase4_observability.time, "sleep") as sleep_mock:
             _run_quiet(phase4_observability._validate_no_recent_cloudwatch_export_errors, self.NAMESPACE)
         return sleep_mock
@@ -1413,7 +1508,11 @@ class FinalLiveValidationLogTests(unittest.TestCase):
                 rs_name = argv[3]
                 if rs_name not in replicaset_map:
                     raise AssertionError(f"unexpected replicaset lookup {rs_name!r}")
-                return FakeProc(0, json.dumps(replicaset_map[rs_name]))
+                metadata = dict(replicaset_map[rs_name].get("metadata") or {})
+                metadata.setdefault("uid", f"{rs_name}-uid")
+                responded = dict(replicaset_map[rs_name])
+                responded["metadata"] = metadata
+                return FakeProc(0, json.dumps(responded))
             if argv[:2] == ["kubectl", "logs"]:
                 pod_name = argv[2]
                 return FakeProc(0, pod_logs.get(pod_name, ""))
@@ -1452,6 +1551,57 @@ class FinalLiveValidationLogTests(unittest.TestCase):
             {"rs-current": _replicaset_owned_by_deployment(CURRENT_DEPLOY_UID)},
             {"scraper-terminating": "listen tcp 127.0.0.1:8888: bind: address already in use", "scraper-current": "clean", "node-agent-1": "clean"},
         )
+
+    def test_stale_running_hostnetwork_true_ignored_current_hostnetwork_false_passes(self):
+        """Item 11: the stale pod's hostNetwork=true must never be authoritative for the final hostNetwork validation -- it is never even resolved into the current-revision set."""
+        stale_pod = _scraper_pod("scraper-stale", "rs-stale", host_network=True)
+        current_pod = _scraper_pod("scraper-current", "rs-current", host_network=False)
+        self._run_with(
+            [stale_pod, current_pod],
+            {"rs-stale": _replicaset_owned_by_deployment(STALE_DEPLOY_UID), "rs-current": _replicaset_owned_by_deployment(CURRENT_DEPLOY_UID)},
+            {"scraper-stale": "clean", "scraper-current": "clean", "node-agent-1": "clean"},
+        )
+
+    def test_current_running_hostnetwork_true_fails(self):
+        """Item 12."""
+        current_pod = _scraper_pod("scraper-current", "rs-current", host_network=True)
+        with self.assertRaises(phase4_observability.Phase4Error) as ctx:
+            self._run_with(
+                [current_pod],
+                {"rs-current": _replicaset_owned_by_deployment(CURRENT_DEPLOY_UID)},
+                {"scraper-current": "clean", "node-agent-1": "clean"},
+            )
+        self.assertIn("hostNetwork", str(ctx.exception))
+
+    def test_only_stale_running_pod_fails_zero_authoritative_current_pods(self):
+        """Item 13: a stale pod alone can never satisfy the minimum-one-current-Running-pod requirement."""
+        stale_pod = _scraper_pod("scraper-stale", "rs-stale", host_network=False)
+        with self.assertRaises(phase4_observability.Phase4Error) as ctx:
+            self._run_with(
+                [stale_pod],
+                {"rs-stale": _replicaset_owned_by_deployment(STALE_DEPLOY_UID)},
+                {"scraper-stale": "clean", "node-agent-1": "clean"},
+            )
+        self.assertIn("no active current-revision", str(ctx.exception))
+
+    def test_resolves_current_scraper_pod_set_once_and_reuses_it(self):
+        """Item 16: _live_kubernetes_validation must resolve the canonical current-revision cluster-scraper pod set exactly ONCE and reuse that same snapshot for both the hostNetwork check and the port-collision log scan -- never a second, independently-resolved read that could observe a different rollout state within the same acceptance operation."""
+        current_pod = _scraper_pod("scraper-current", "rs-current")
+        call_count = {"n": 0}
+        original = phase4_observability._current_deployment_pods
+
+        def counting_resolver(namespace, deployment_name, **kwargs):
+            if deployment_name == SCRAPER_DEPLOYMENT_NAME:
+                call_count["n"] += 1
+            return original(namespace, deployment_name, **kwargs)
+
+        with mock.patch.object(phase4_observability, "_current_deployment_pods", side_effect=counting_resolver):
+            self._run_with(
+                [current_pod],
+                {"rs-current": _replicaset_owned_by_deployment(CURRENT_DEPLOY_UID)},
+                {"scraper-current": "clean", "node-agent-1": "clean"},
+            )
+        self.assertEqual(call_count["n"], 1, "the canonical scraper pod set must be resolved exactly once per _live_kubernetes_validation() call")
 
 
 class OwnershipPreflightAndAcceptanceTests(TempStateCase):

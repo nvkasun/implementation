@@ -1128,7 +1128,7 @@ def calls(fn_name, target_name):
 # A: one canonical current-Deployment/current-ReplicaSet pod resolver exists.
 results.append(("A: _current_deployment_pods() (the canonical current-revision pod resolver) is defined", "_current_deployment_pods" in functions))
 results.append(("A: the resolver derives its selector via the existing _label_selector()", calls("_current_deployment_pods", "_label_selector")))
-results.append(("A: the resolver classifies ReplicaSet ownership via a dedicated fail-closed helper, never inline ad-hoc logic", "_replicaset_owner_deployment_uid" in functions and calls("_current_deployment_pods", "_replicaset_owner_deployment_uid")))
+results.append(("A: the resolver classifies ReplicaSet identity via a dedicated fail-closed helper, never inline ad-hoc logic", "_replicaset_identity" in functions and calls("_current_deployment_pods", "_replicaset_identity")))
 
 # B/C/D: every scraper-facing caller uses the canonical resolver, never a bespoke selector-only pod list for the scraper side.
 results.append(("B: _verify_irsa_injection uses the canonical resolver for cluster-scraper", calls("_verify_irsa_injection", "_current_deployment_pods")))
@@ -1156,7 +1156,7 @@ results.append(("F: pre-IRSA validation's executable body never references AWS_R
 
 # G: no stale ReplicaSet pod can ever be authoritative -- the resolver fails closed on every ReplicaSet inspection failure except a genuine NotFound, and excludes non-matching/terminating pods before returning.
 resolver_src = ast.get_source_segment(source, functions["_current_deployment_pods"]) or ""
-replicaset_helper_src = ast.get_source_segment(source, functions["_replicaset_owner_deployment_uid"]) or ""
+replicaset_helper_src = ast.get_source_segment(source, functions["_replicaset_identity"]) or ""
 results.append(("G: the resolver excludes deletionTimestamp (terminating) pods", "deletionTimestamp" in resolver_src))
 results.append(("G: the resolver excludes pods whose ReplicaSet does not match the current Deployment UID", "deploy_uid" in resolver_src and "continue" in resolver_src))
 results.append(("G: ReplicaSet inspection fails closed (Forbidden/network/malformed JSON raise Phase4Error; only genuine NotFound is excluded)", "NotFound" in replicaset_helper_src and "Phase4Error" in replicaset_helper_src))
@@ -1181,6 +1181,121 @@ PYEOF
     pass "H: no ReplicaSet-ownership/current-revision implementation was added back into 40-sub-observability.yaml -- it remains a thin Python-backed workflow"
   else
     fail "H: 40-sub-observability.yaml unexpectedly contains ReplicaSet/current-revision implementation text:"$'\n'"${WORKFLOW_YAML_LEAK_HITS}"
+  fi
+
+  # Pod->ReplicaSet->Deployment complete UID identity chain correction (focused, static/offline only): real behavioral proof via direct invocation of the actual resolver against fabricated ownership chains (never a comment/text grep), plus AST-based structural proof that the final live-validation function eliminated its raw-selector scraper hostNetwork check and resolves the canonical current-revision pod set exactly once.
+  if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/phases/phase4/phase4_observability.py ]; then
+    UID_IDENTITY_CHAIN_CHECK="$(python3 - <<'PYEOF'
+import ast
+import importlib.util
+import json
+from unittest import mock
+
+spec = importlib.util.spec_from_file_location("phase4_observability", "automation/phases/phase4/phase4_observability.py")
+phase4_observability = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(phase4_observability)
+
+results = []
+NAMESPACE = "amazon-cloudwatch"
+DEPLOYMENT_NAME = "cloudwatch-agent-cluster-scraper"
+CURRENT_DEPLOY_UID = "deploy-uid-current"
+
+
+def deployment(uid=CURRENT_DEPLOY_UID):
+    return {"metadata": {"uid": uid}, "spec": {"selector": {"matchLabels": {"app": "cluster-scraper"}}}}
+
+
+def pod(name, replicaset_name, replicaset_uid):
+    owner = {"controller": True, "kind": "ReplicaSet", "name": replicaset_name}
+    if replicaset_uid is not None:
+        owner["uid"] = replicaset_uid
+    return {"metadata": {"name": name, "ownerReferences": [owner]}, "status": {"phase": "Running"}, "spec": {}}
+
+
+def replicaset_run(replicaset_map):
+    def fake_run(argv, env=None, cwd=None, check=True, capture_output=True, input_text=None):
+        if argv[:3] == ["kubectl", "get", "replicaset"]:
+            name = argv[3]
+            entry = replicaset_map[name]
+            return type("P", (), {"returncode": 0, "stdout": json.dumps(entry), "stderr": ""})()
+        return type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    return fake_run
+
+
+def resolve(pods, replicaset_map, deploy_uid=CURRENT_DEPLOY_UID):
+    with mock.patch.object(phase4_observability, "_kubectl_get_json", return_value=deployment(deploy_uid)), \
+         mock.patch.object(phase4_observability, "_pods_for_selector", return_value=pods), \
+         mock.patch.object(phase4_observability, "run", replicaset_run(replicaset_map)):
+        return phase4_observability._current_deployment_pods(NAMESPACE, DEPLOYMENT_NAME)
+
+
+# A/C: pod ReplicaSet ownerReference.uid is validated -- a matching UID selects the pod, a same-name/different-UID reference excludes it (the exact confirmed reproduction).
+matching = resolve([pod("p1", "rs-x", "rs-x-OLD")], {"rs-x": {"metadata": {"uid": "rs-x-OLD", "ownerReferences": [{"controller": True, "kind": "Deployment", "uid": CURRENT_DEPLOY_UID}]}}})
+results.append(("A/C: matching pod ownerReference.uid == fetched ReplicaSet metadata.uid selects the pod", [p["metadata"]["name"] for p in matching] == ["p1"]))
+
+orphan = resolve([pod("orphan-old", "rs-same", "rs-OLD-uid")], {"rs-same": {"metadata": {"uid": "rs-NEW-uid", "ownerReferences": [{"controller": True, "kind": "Deployment", "uid": CURRENT_DEPLOY_UID}]}}})
+results.append(("A/C: same-name/different-UID ReplicaSet excludes the orphan pod (reproduces the confirmed bug, then proves the fix)", orphan == []))
+
+# B: fetched ReplicaSet with no metadata.uid fails closed.
+try:
+    resolve([pod("p1", "rs-x", "rs-x-uid")], {"rs-x": {"metadata": {"ownerReferences": [{"controller": True, "kind": "Deployment", "uid": CURRENT_DEPLOY_UID}]}}})
+    results.append(("B: a fetched ReplicaSet with no metadata.uid raises Phase4Error", False))
+except phase4_observability.Phase4Error:
+    results.append(("B: a fetched ReplicaSet with no metadata.uid raises Phase4Error", True))
+
+# D: ReplicaSet->Deployment UID is still checked even when the pod->ReplicaSet UID link is intact.
+stale_deploy_link = resolve([pod("p1", "rs-x", "rs-x-uid")], {"rs-x": {"metadata": {"uid": "rs-x-uid", "ownerReferences": [{"controller": True, "kind": "Deployment", "uid": "deploy-uid-OLD"}]}}})
+results.append(("D: matching pod->ReplicaSet UID but stale ReplicaSet->Deployment UID still excludes the pod", stale_deploy_link == []))
+
+# E/F: _live_kubernetes_validation source-level proof -- the raw-selector scraper hostNetwork check was eliminated, and the canonical resolver is invoked exactly once for the scraper Deployment (so the same pod-list object is necessarily reused for both the hostNetwork check and the log scan).
+with open("automation/phases/phase4/phase4_observability.py") as f:
+    source = f.read()
+tree = ast.parse(source)
+live_validation_fn = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "_live_kubernetes_validation")
+
+current_deployment_pods_calls = [
+    n for n in ast.walk(live_validation_fn)
+    if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "_current_deployment_pods"
+]
+results.append(("F: _current_deployment_pods() is called exactly once inside _live_kubernetes_validation() (one snapshot, reused for both checks)", len(current_deployment_pods_calls) == 1))
+
+pods_for_selector_calls = [
+    n for n in ast.walk(live_validation_fn)
+    if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "_pods_for_selector"
+]
+
+
+def calls_label_selector_on(call_node, var_name):
+    for arg in call_node.args:
+        if isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name) and arg.func.id == "_label_selector":
+            if arg.args and isinstance(arg.args[0], ast.Name) and arg.args[0].id == var_name:
+                return True
+    return False
+
+
+raw_scraper_selector_calls = [c for c in pods_for_selector_calls if calls_label_selector_on(c, "scraper_deploy")]
+results.append(("E: _live_kubernetes_validation() no longer calls _pods_for_selector(_label_selector(scraper_deploy)) directly -- the raw-selector scraper hostNetwork check was eliminated", len(raw_scraper_selector_calls) == 0))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+    while IFS= read -r line; do
+      case "$line" in
+        FAIL\ *) fail "Pod->ReplicaSet->Deployment UID identity chain correction: ${line#FAIL }" ;;
+        OK\ *) pass "Pod->ReplicaSet->Deployment UID identity chain correction: ${line#OK }" ;;
+      esac
+    done <<< "$UID_IDENTITY_CHAIN_CHECK"
+  else
+    skip "Pod->ReplicaSet->Deployment UID identity chain correction -- python3 unavailable or phase4_observability.py missing"
+  fi
+
+  # G: zero workflow YAML implementation was reintroduced for the UID identity-chain correction either.
+  UID_CHAIN_WORKFLOW_YAML_LEAK_HITS="$(grep -nE 'metadata\.uid|ownerReferences|ReplicaSet' .github/workflows/40-sub-observability.yaml 2>/dev/null || true)"
+  if [ -z "$UID_CHAIN_WORKFLOW_YAML_LEAK_HITS" ]; then
+    pass "G: no ReplicaSet/UID-identity implementation was added to 40-sub-observability.yaml for this correction either"
+  else
+    fail "G: 40-sub-observability.yaml unexpectedly contains ReplicaSet/UID implementation text:"$'\n'"${UID_CHAIN_WORKFLOW_YAML_LEAK_HITS}"
   fi
 
   # Host-network isolation correction (focused, static/offline only) -- values.yaml-side checks.
