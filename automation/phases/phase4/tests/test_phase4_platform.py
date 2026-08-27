@@ -718,28 +718,175 @@ class PostDeployValidationTests(TempStateCase):
         super().setUp()
         phase4_platform.update_state(self.state_path, {"namespace": "goldengate-dev", "release_name": "goldengate-dev-platform"})
 
-    def test_required_live_resources_verified(self):
+    def _scripted(self, statefulset_proc, deployment_proc, daemonset_items_proc=None, daemonset_name_proc=None):
+        """Builds the full ScriptedRun needed for cmd_post_deploy_validation, with the namespace/ServiceAccount/IRSA-annotation preamble fixed and only the workload-inventory/DaemonSet responses varying per test."""
         scripted = ScriptedRun()
         scripted.when(_starts_with("kubectl", "get", "namespace"), FakeProc(0, ""))
         scripted.when(lambda argv: argv[:4] == ["kubectl", "get", "serviceaccount", phase4_platform.RUNTIME_SA_NAME] and "-o" not in argv, FakeProc(0, ""))
         scripted.when(lambda argv: "jsonpath={.metadata.annotations.eks\\.amazonaws\\.com/role-arn}" in argv, FakeProc(0, RUNTIME_ROLE_ARN))
-        scripted.when(_starts_with("kubectl", "get", "statefulset"), FakeProc(0, json.dumps({"items": []})))
-        scripted.when(_starts_with("kubectl", "get", "deployment"), FakeProc(0, json.dumps({"items": []})))
-        scripted.when(lambda argv: argv[:3] == ["kubectl", "get", "daemonset"] and "-l" in argv, FakeProc(0, json.dumps({"items": [{"metadata": {"name": "gg-fluent-bit"}}]})))
-        scripted.when(lambda argv: argv[:3] == ["kubectl", "get", "daemonset"] and "-l" not in argv, FakeProc(0, ""))
+        scripted.when(_starts_with("kubectl", "get", "statefulset"), statefulset_proc)
+        scripted.when(_starts_with("kubectl", "get", "deployment"), deployment_proc)
+        scripted.when(lambda argv: argv[:3] == ["kubectl", "get", "daemonset"] and "-l" in argv,
+                      daemonset_items_proc or FakeProc(0, json.dumps({"items": [{"metadata": {"name": "gg-fluent-bit"}}]})))
+        scripted.when(lambda argv: argv[:3] == ["kubectl", "get", "daemonset"] and "-l" not in argv, daemonset_name_proc or FakeProc(0, ""))
+        return scripted
+
+    def test_required_live_resources_verified(self):
+        scripted = self._scripted(FakeProc(0, json.dumps({"items": []})), FakeProc(0, json.dumps({"items": []})))
         with mock.patch.object(phase4_platform, "run", scripted), _env_patch():
             _run_quiet(phase4_platform.cmd_post_deploy_validation, self.args)
 
     def test_unexpected_owned_workload_fails(self):
-        scripted = ScriptedRun()
-        scripted.when(_starts_with("kubectl", "get", "namespace"), FakeProc(0, ""))
-        scripted.when(lambda argv: argv[:4] == ["kubectl", "get", "serviceaccount", phase4_platform.RUNTIME_SA_NAME] and "-o" not in argv, FakeProc(0, ""))
-        scripted.when(lambda argv: "jsonpath={.metadata.annotations.eks\\.amazonaws\\.com/role-arn}" in argv, FakeProc(0, RUNTIME_ROLE_ARN))
-        scripted.when(_starts_with("kubectl", "get", "statefulset"), FakeProc(0, json.dumps({"items": [{"metadata": {"name": "gg-oracle-01"}}]})))
-        scripted.when(_starts_with("kubectl", "get", "deployment"), FakeProc(0, json.dumps({"items": []})))
+        scripted = self._scripted(FakeProc(0, json.dumps({"items": [{"metadata": {"name": "gg-oracle-01"}}]})), FakeProc(0, json.dumps({"items": []})))
         with mock.patch.object(phase4_platform, "run", scripted), _env_patch():
             with self.assertRaises(phase4_platform.Phase4Error):
                 _run_quiet(phase4_platform.cmd_post_deploy_validation, self.args)
+
+    # 1. successful empty StatefulSet+Deployment queries passing is already covered by test_required_live_resources_verified above.
+
+    # 2. owned StatefulSet still fails -- already covered by test_unexpected_owned_workload_fails above.
+
+    def test_owned_deployment_still_fails(self):
+        scripted = self._scripted(FakeProc(0, json.dumps({"items": []})), FakeProc(0, json.dumps({"items": [{"metadata": {"name": "gg-oracle-runtime"}}]})))
+        with mock.patch.object(phase4_platform, "run", scripted), _env_patch():
+            with self.assertRaises(phase4_platform.Phase4Error):
+                _run_quiet(phase4_platform.cmd_post_deploy_validation, self.args)
+
+    def test_statefulset_forbidden_fails_closed(self):
+        scripted = self._scripted(FakeProc(1, "", "Error from server (Forbidden): statefulsets.apps is forbidden: User cannot list resource"), FakeProc(0, json.dumps({"items": []})))
+        with mock.patch.object(phase4_platform, "run", scripted), _env_patch():
+            with self.assertRaises(phase4_platform.Phase4Error):
+                _run_quiet(phase4_platform.cmd_post_deploy_validation, self.args)
+
+    def test_deployment_forbidden_fails_closed(self):
+        scripted = self._scripted(FakeProc(0, json.dumps({"items": []})), FakeProc(1, "", "Error from server (Forbidden): deployments.apps is forbidden: User cannot list resource"))
+        with mock.patch.object(phase4_platform, "run", scripted), _env_patch():
+            with self.assertRaises(phase4_platform.Phase4Error):
+                _run_quiet(phase4_platform.cmd_post_deploy_validation, self.args)
+
+    def test_unauthorized_fails_closed(self):
+        scripted = self._scripted(FakeProc(1, "", "error: You must be logged in to the server (Unauthorized)"), FakeProc(0, json.dumps({"items": []})))
+        with mock.patch.object(phase4_platform, "run", scripted), _env_patch():
+            with self.assertRaises(phase4_platform.Phase4Error):
+                _run_quiet(phase4_platform.cmd_post_deploy_validation, self.args)
+
+    def test_connection_network_failure_fails_closed(self):
+        scripted = self._scripted(FakeProc(1, "", "Unable to connect to the server: dial tcp: connection refused"), FakeProc(0, json.dumps({"items": []})))
+        with mock.patch.object(phase4_platform, "run", scripted), _env_patch():
+            with self.assertRaises(phase4_platform.Phase4Error):
+                _run_quiet(phase4_platform.cmd_post_deploy_validation, self.args)
+
+    def test_api_timeout_unknown_error_fails_closed(self):
+        scripted = self._scripted(FakeProc(0, json.dumps({"items": []})), FakeProc(1, "", "error: the server was unable to return a response in the time allotted"))
+        with mock.patch.object(phase4_platform, "run", scripted), _env_patch():
+            with self.assertRaises(phase4_platform.Phase4Error):
+                _run_quiet(phase4_platform.cmd_post_deploy_validation, self.args)
+
+    def test_malformed_statefulset_json_fails_closed(self):
+        scripted = self._scripted(FakeProc(0, "{not valid json"), FakeProc(0, json.dumps({"items": []})))
+        with mock.patch.object(phase4_platform, "run", scripted), _env_patch():
+            with self.assertRaises(phase4_platform.Phase4Error):
+                _run_quiet(phase4_platform.cmd_post_deploy_validation, self.args)
+
+    def test_malformed_deployment_json_fails_closed(self):
+        scripted = self._scripted(FakeProc(0, json.dumps({"items": []})), FakeProc(0, "{not valid json"))
+        with mock.patch.object(phase4_platform, "run", scripted), _env_patch():
+            with self.assertRaises(phase4_platform.Phase4Error):
+                _run_quiet(phase4_platform.cmd_post_deploy_validation, self.args)
+
+    def test_missing_items_key_fails_closed(self):
+        scripted = self._scripted(FakeProc(0, json.dumps({"kind": "StatefulSetList"})), FakeProc(0, json.dumps({"items": []})))
+        with mock.patch.object(phase4_platform, "run", scripted), _env_patch():
+            with self.assertRaises(phase4_platform.Phase4Error):
+                _run_quiet(phase4_platform.cmd_post_deploy_validation, self.args)
+
+    def test_items_not_a_list_fails_closed(self):
+        scripted = self._scripted(FakeProc(0, json.dumps({"items": []})), FakeProc(0, json.dumps({"items": "not-a-list"})))
+        with mock.patch.object(phase4_platform, "run", scripted), _env_patch():
+            with self.assertRaises(phase4_platform.Phase4Error):
+                _run_quiet(phase4_platform.cmd_post_deploy_validation, self.args)
+
+    def test_reproduces_pre_fix_false_success_before_fix(self):
+        """Confirmed reproduction of the Phase 4 Python-extraction regression: StatefulSet lookup returns Forbidden, Deployment lookup returns a network/API failure, and DaemonSet lookup returns a valid one-item result. The pre-fix implementation (`if proc.returncode == 0: workload_count += ...`, called with check=False) silently treated both inspection failures as zero items and printed a false 'OK: no StatefulSet/Deployment resources are owned' -- exactly the false-success condition this correction closes. First mechanically replay the retired algorithm to confirm it really would have reported success for this input, then assert the current, fixed cmd_post_deploy_validation raises Phase4Error for the identical input instead."""
+        statefulset_proc = FakeProc(1, "", "Error from server (Forbidden): statefulsets.apps is forbidden")
+        deployment_proc = FakeProc(1, "", "Unable to connect to the server: dial tcp: connection refused")
+
+        def retired_algorithm(procs):
+            workload_count = 0
+            for proc in procs:
+                if proc.returncode == 0:
+                    workload_count += len((json.loads(proc.stdout) or {}).get("items") or [])
+            return workload_count == 0  # True means the retired algorithm would have (incorrectly) reported success.
+
+        self.assertTrue(
+            retired_algorithm([statefulset_proc, deployment_proc]),
+            "the retired algorithm must be confirmed to falsely report zero workloads for this exact input before trusting that the new assertion below proves a real fix",
+        )
+
+        scripted = self._scripted(statefulset_proc, deployment_proc)
+        with mock.patch.object(phase4_platform, "run", scripted), _env_patch():
+            with self.assertRaises(phase4_platform.Phase4Error) as ctx:
+                _run_quiet(phase4_platform.cmd_post_deploy_validation, self.args)
+        self.assertNotIn("no StatefulSet/Deployment resources are owned", str(ctx.exception))
+
+    def test_first_kind_failure_does_not_produce_false_zero_success(self):
+        """The StatefulSet lookup (inspected first) fails; the Deployment lookup is never reached because run()'s own fail-closed check=True raises immediately -- proving a failure of the FIRST inspected kind alone is sufficient to fail the whole step closed, never silently treated as '0 StatefulSets, proceed to check Deployments, maybe pass'."""
+        scripted = self._scripted(FakeProc(1, "", "Error from server (Forbidden): statefulsets.apps is forbidden"), FakeProc(0, json.dumps({"items": []})))
+        with mock.patch.object(phase4_platform, "run", scripted), _env_patch():
+            with self.assertRaises(phase4_platform.Phase4Error):
+                _run_quiet(phase4_platform.cmd_post_deploy_validation, self.args)
+        deployment_calls = [c for c in scripted.calls if c["argv"][:3] == ["kubectl", "get", "deployment"]]
+        self.assertEqual(deployment_calls, [], "the Deployment kind must never be queried once the StatefulSet kind has already failed closed")
+
+    def test_exact_one_daemonset_contract_remains_green(self):
+        """The pre-existing exactly-one-DaemonSet-owned-by-the-release contract, and the DaemonSet/gg-fluent-bit existence check, must remain unweakened by this correction."""
+        scripted = self._scripted(
+            FakeProc(0, json.dumps({"items": []})),
+            FakeProc(0, json.dumps({"items": []})),
+            daemonset_items_proc=FakeProc(0, json.dumps({"items": [{"metadata": {"name": "gg-fluent-bit"}}, {"metadata": {"name": "gg-extra-daemonset"}}]})),
+        )
+        with mock.patch.object(phase4_platform, "run", scripted), _env_patch():
+            with self.assertRaises(phase4_platform.Phase4Error) as ctx:
+                _run_quiet(phase4_platform.cmd_post_deploy_validation, self.args)
+        self.assertIn("expected exactly 1 DaemonSet", str(ctx.exception))
+
+
+class ListOwnedWorkloadsTests(unittest.TestCase):
+    """Direct unit coverage of the new _list_owned_workloads() helper, isolated from the rest of cmd_post_deploy_validation."""
+
+    def test_successful_empty_result_returns_empty_list(self):
+        with mock.patch.object(phase4_platform, "run", return_value=FakeProc(0, json.dumps({"items": []}))):
+            self.assertEqual(phase4_platform._list_owned_workloads("statefulset", "goldengate-dev", "goldengate-dev-platform"), [])
+
+    def test_successful_nonempty_result_returns_items(self):
+        items = [{"metadata": {"name": "gg-oracle-01"}}]
+        with mock.patch.object(phase4_platform, "run", return_value=FakeProc(0, json.dumps({"items": items}))):
+            self.assertEqual(phase4_platform._list_owned_workloads("deployment", "goldengate-dev", "goldengate-dev-platform"), items)
+
+    def test_malformed_json_fails_closed(self):
+        with mock.patch.object(phase4_platform, "run", return_value=FakeProc(0, "{not valid json")):
+            with self.assertRaises(phase4_platform.Phase4Error):
+                phase4_platform._list_owned_workloads("statefulset", "goldengate-dev", "goldengate-dev-platform")
+
+    def test_non_object_top_level_fails_closed(self):
+        with mock.patch.object(phase4_platform, "run", return_value=FakeProc(0, json.dumps(["not", "an", "object"]))):
+            with self.assertRaises(phase4_platform.Phase4Error):
+                phase4_platform._list_owned_workloads("statefulset", "goldengate-dev", "goldengate-dev-platform")
+
+    def test_missing_items_key_fails_closed(self):
+        with mock.patch.object(phase4_platform, "run", return_value=FakeProc(0, json.dumps({"kind": "DeploymentList"}))):
+            with self.assertRaises(phase4_platform.Phase4Error):
+                phase4_platform._list_owned_workloads("deployment", "goldengate-dev", "goldengate-dev-platform")
+
+    def test_items_not_a_list_fails_closed(self):
+        with mock.patch.object(phase4_platform, "run", return_value=FakeProc(0, json.dumps({"items": {"not": "a list"}}))):
+            with self.assertRaises(phase4_platform.Phase4Error):
+                phase4_platform._list_owned_workloads("statefulset", "goldengate-dev", "goldengate-dev-platform")
+
+    def test_null_items_fails_closed(self):
+        with mock.patch.object(phase4_platform, "run", return_value=FakeProc(0, json.dumps({"items": None}))):
+            with self.assertRaises(phase4_platform.Phase4Error):
+                phase4_platform._list_owned_workloads("statefulset", "goldengate-dev", "goldengate-dev-platform")
 
 
 class OwnershipPreflightAndAcceptanceTests(TempStateCase):

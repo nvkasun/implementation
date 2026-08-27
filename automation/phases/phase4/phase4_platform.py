@@ -910,6 +910,23 @@ def cmd_reconcile_cluster(args):
     print("OK: GoldenGate Platform Argo CD Application reconciled.")
 
 
+def _list_owned_workloads(kind, namespace, release_name):
+    """Positively proves how many <kind> (StatefulSet/Deployment) resources are owned by the given Platform release. Kubernetes supports both resource kinds on the target EKS cluster, so there is no valid "resource kind absent" outcome here -- a successful query returning items=[] is the only way absence is ever represented. run()'s default check=True fails closed (raises Phase4Error) on any kubectl inspection failure -- Forbidden, Unauthorized, a connection/network failure, a timeout, or any other non-zero exit -- so an inspection failure can never be silently treated as zero owned workloads. Also fails closed if the successful response is not well-formed JSON shaped as {"items": [...]}."""
+    proc = run(["kubectl", "get", kind, "-n", namespace, "-l", f"app.kubernetes.io/instance={release_name}", "-o", "json"])
+    try:
+        parsed = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise Phase4Error(f"kubectl get {kind} -n {namespace} -l app.kubernetes.io/instance={release_name} returned malformed JSON -- refusing to treat this as an empty workload list: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise Phase4Error(f"kubectl get {kind} -n {namespace} -l app.kubernetes.io/instance={release_name} returned a non-object top-level JSON result -- refusing to treat this as an empty workload list.")
+    if "items" not in parsed:
+        raise Phase4Error(f"kubectl get {kind} -n {namespace} -l app.kubernetes.io/instance={release_name} response has no 'items' key -- refusing to treat this as an empty workload list.")
+    items = parsed["items"]
+    if not isinstance(items, list):
+        raise Phase4Error(f"kubectl get {kind} -n {namespace} -l app.kubernetes.io/instance={release_name} 'items' is a {type(items).__name__}, not a list -- refusing to treat this as an empty workload list.")
+    return items
+
+
 # 30-sub-platform.yaml: post-deployment validation (AWS credentials required, inputs.deploy only)
 
 def cmd_post_deploy_validation(args):
@@ -927,13 +944,10 @@ def cmd_post_deploy_validation(args):
         raise Phase4Error(f"unexpected IRSA role annotation on ServiceAccount {RUNTIME_SA_NAME}: {actual_role_annotation}")
     print(f"OK: {RUNTIME_SA_NAME} IRSA role annotation matches {runtime_role_arn}.")
 
-    workload_count = 0
-    for kind in ("statefulset", "deployment"):
-        proc = run(["kubectl", "get", kind, "-n", runtime_namespace, "-l", f"app.kubernetes.io/instance={release_name}", "-o", "json"], check=False)
-        if proc.returncode == 0:
-            workload_count += len((json.loads(proc.stdout) or {}).get("items") or [])
-    if workload_count != 0:
-        raise Phase4Error(f"found {workload_count} StatefulSet/Deployment resource(s) owned by {release_name} -- the platform release must never own a GoldenGate runtime workload.")
+    owned_statefulsets = _list_owned_workloads("statefulset", runtime_namespace, release_name)
+    owned_deployments = _list_owned_workloads("deployment", runtime_namespace, release_name)
+    if len(owned_statefulsets) != 0 or len(owned_deployments) != 0:
+        raise Phase4Error(f"found {len(owned_statefulsets)} StatefulSet(s) and {len(owned_deployments)} Deployment(s) owned by {release_name} -- the platform release must never own a GoldenGate runtime workload.")
     print(f"OK: no StatefulSet/Deployment resources are owned by {release_name}.")
 
     ds_proc = run(["kubectl", "get", "daemonset", "-n", runtime_namespace, "-l", f"app.kubernetes.io/instance={release_name}", "-o", "json"])

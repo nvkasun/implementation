@@ -185,6 +185,103 @@ class SafeTokenTests(unittest.TestCase):
             phase4_observability.require_environment_arg("dev; rm -rf /")
 
 
+class EnsureToolsTests(unittest.TestCase):
+    """cmd_ensure_tools() must require only Helm (>=3.9) and kubectl -- the obsolete jq prerequisite (a rephase portability regression: the Python conversion parses JSON via the json module and never shells out to jq) must be fully removed, not merely skipped."""
+
+    def _scripted_tools_present(self):
+        scripted = ScriptedRun()
+        scripted.when(lambda argv: argv == ["bash", "-c", "command -v helm"], FakeProc(0, "/usr/local/bin/helm"))
+        scripted.when(lambda argv: argv == ["helm", "version", "--short"], FakeProc(0, "v3.15.4+g1234567"))
+        scripted.when(lambda argv: argv == ["bash", "-c", "command -v kubectl"], FakeProc(0, "/usr/local/bin/kubectl"))
+        scripted.when(lambda argv: argv == ["kubectl", "version", "--client=true"], FakeProc(0, "Client Version: v1.35.0"))
+        return scripted
+
+    def _run_ensure_tools(self, scripted):
+        with mock.patch.object(phase4_observability, "run", scripted):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                phase4_observability.cmd_ensure_tools(argparse_namespace())
+            return buf.getvalue()
+
+    def test_ensure_tools_never_invokes_or_inspects_jq(self):
+        scripted = self._scripted_tools_present()
+        self._run_ensure_tools(scripted)
+        jq_calls = [
+            c["argv"] for c in scripted.calls
+            if "jq" in c["argv"]
+            or (len(c["argv"]) >= 3 and c["argv"][:2] == ["bash", "-c"] and "jq" in c["argv"][2])
+        ]
+        self.assertEqual(jq_calls, [], f"cmd_ensure_tools must never inspect or invoke jq, but observed: {jq_calls}")
+
+    def test_ensure_jq_helper_fully_removed(self):
+        self.assertFalse(hasattr(phase4_observability, "_ensure_jq"), "the obsolete _ensure_jq() helper must be fully removed, not merely uncalled")
+
+    def test_absence_of_jq_cannot_fail_ensure_tools(self):
+        """The scripted fake registers no jq-shaped responder at all (no "command -v jq", no "jq --version"); cmd_ensure_tools must still succeed end-to-end with jq completely absent from the environment."""
+        scripted = self._scripted_tools_present()
+        output = self._run_ensure_tools(scripted)
+        self.assertIn("OK:", output)
+
+    def test_helm_still_required(self):
+        scripted = ScriptedRun()
+        scripted.when(lambda argv: argv == ["bash", "-c", "command -v helm"], FakeProc(1, "", "not found"))
+        scripted.when(lambda argv: argv == ["uname", "-m"], FakeProc(0, "x86_64"))
+        scripted.when(lambda argv: argv == ["helm", "version", "--short"], FakeProc(0, "v3.15.4+g1234567"))
+        scripted.when(lambda argv: argv == ["bash", "-c", "command -v kubectl"], FakeProc(0, ""))
+        scripted.when(lambda argv: argv == ["kubectl", "version", "--client=true"], FakeProc(0, ""))
+        self._run_ensure_tools(scripted)
+        install_calls = [c["argv"] for c in scripted.calls if c["argv"][:1] == ["curl"] and "helm" in c["argv"][2]]
+        self.assertTrue(install_calls, "Helm must still be installed when absent")
+
+    def test_kubectl_still_required(self):
+        scripted = ScriptedRun()
+        scripted.when(lambda argv: argv == ["bash", "-c", "command -v helm"], FakeProc(0, ""))
+        scripted.when(lambda argv: argv == ["helm", "version", "--short"], FakeProc(0, "v3.15.4+g1234567"))
+        scripted.when(lambda argv: argv == ["bash", "-c", "command -v kubectl"], FakeProc(1, "", "not found"))
+        scripted.when(lambda argv: argv == ["uname", "-m"], FakeProc(0, "x86_64"))
+        scripted.when(lambda argv: argv == ["kubectl", "version", "--client=true"], FakeProc(0, ""))
+        self._run_ensure_tools(scripted)
+        install_calls = [c["argv"] for c in scripted.calls if c["argv"][:1] == ["curl"] and "kubectl" in c["argv"][2]]
+        self.assertTrue(install_calls, "kubectl must still be installed when absent")
+
+    def test_helm_below_3_9_fails_closed(self):
+        scripted = ScriptedRun()
+        scripted.when(lambda argv: argv == ["bash", "-c", "command -v helm"], FakeProc(0, ""))
+        scripted.when(lambda argv: argv == ["helm", "version", "--short"], FakeProc(0, "v3.8.2+g1234567"))
+        with mock.patch.object(phase4_observability, "run", scripted):
+            with self.assertRaises(phase4_observability.Phase4Error):
+                with redirect_stdout(io.StringIO()):
+                    phase4_observability._ensure_helm()
+
+    def test_unsupported_architecture_fails_closed_for_helm(self):
+        scripted = ScriptedRun()
+        scripted.when(lambda argv: argv == ["bash", "-c", "command -v helm"], FakeProc(1, "", "not found"))
+        scripted.when(lambda argv: argv == ["uname", "-m"], FakeProc(0, "riscv64"))
+        with mock.patch.object(phase4_observability, "run", scripted):
+            with self.assertRaises(phase4_observability.Phase4Error):
+                phase4_observability._ensure_helm()
+
+    def test_unsupported_architecture_fails_closed_for_kubectl(self):
+        scripted = ScriptedRun()
+        scripted.when(lambda argv: argv == ["bash", "-c", "command -v kubectl"], FakeProc(1, "", "not found"))
+        scripted.when(lambda argv: argv == ["uname", "-m"], FakeProc(0, "riscv64"))
+        with mock.patch.object(phase4_observability, "run", scripted):
+            with self.assertRaises(phase4_observability.Phase4Error):
+                phase4_observability._ensure_kubectl()
+
+    def test_success_message_names_only_helm_and_kubectl(self):
+        output = self._run_ensure_tools(self._scripted_tools_present())
+        self.assertIn("Helm (>=3.9)", output)
+        self.assertIn("kubectl", output)
+        self.assertNotIn("jq", output)
+
+    def test_no_production_subprocess_command_invokes_jq(self):
+        with open(TOOL_PATH) as f:
+            source = f.read()
+        self.assertNotIn('"jq"', source)
+        self.assertNotIn("'jq'", source)
+
+
 class ImageInventoryTests(unittest.TestCase):
     def test_exact_image_inventory(self):
         expected = (

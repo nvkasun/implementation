@@ -1298,6 +1298,220 @@ PYEOF
     fail "G: 40-sub-observability.yaml unexpectedly contains ReplicaSet/UID implementation text:"$'\n'"${UID_CHAIN_WORKFLOW_YAML_LEAK_HITS}"
   fi
 
+  # Platform post-deploy workload-inventory fail-closed correction (focused, static/offline only): real behavioral proof (never a comment/text grep) that a genuine kubectl inspection failure (Forbidden/network/malformed JSON) for either StatefulSet or Deployment can never be silently classified as "zero owned workloads", and that a zero-workload success requires a positively successful inspection of BOTH resource kinds.
+  if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/phases/phase4/phase4_platform.py ]; then
+    PLATFORM_WORKLOAD_INVENTORY_CHECK="$(python3 - <<'PYEOF'
+import importlib.util
+import json
+import os
+import tempfile
+from pathlib import Path
+from unittest import mock
+
+spec = importlib.util.spec_from_file_location("phase4_platform", "automation/phases/phase4/phase4_platform.py")
+phase4_platform = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(phase4_platform)
+
+results = []
+
+
+class FakeProc:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class ScriptedRun:
+    def __init__(self):
+        self.rules = []
+        self.calls = []
+
+    def when(self, predicate, proc):
+        self.rules.append((predicate, proc))
+        return self
+
+    def __call__(self, argv, env=None, cwd=None, check=True, capture_output=True, input_text=None):
+        self.calls.append(list(argv))
+        for predicate, proc in reversed(self.rules):
+            if predicate(argv):
+                if check and proc.returncode != 0:
+                    raise phase4_platform.Phase4Error(f"{' '.join(str(a) for a in argv)} failed: {proc.stdout}\n{proc.stderr}")
+                return proc
+        raise AssertionError(f"unscripted call in the Platform workload-inventory static regression: {argv}")
+
+
+def starts_with(*prefix):
+    return lambda argv: list(argv[:len(prefix)]) == list(prefix)
+
+
+# A: _list_owned_workloads() fails closed (Phase4Error) on a genuine kubectl inspection failure (Forbidden) -- never treated as an empty workload list.
+def forbidden_fails_closed():
+    scripted = ScriptedRun()
+    scripted.when(starts_with("kubectl", "get", "statefulset"), FakeProc(1, "", "Error from server (Forbidden): statefulsets.apps is forbidden"))
+    with mock.patch.object(phase4_platform, "run", scripted):
+        try:
+            phase4_platform._list_owned_workloads("statefulset", "goldengate-dev", "goldengate-dev-platform")
+            return False
+        except phase4_platform.Phase4Error:
+            return True
+
+
+results.append(("A: _list_owned_workloads() fails closed (Phase4Error) on a Forbidden kubectl inspection failure -- never classified as an empty workload list", forbidden_fails_closed()))
+
+# D: malformed JSON on an otherwise-successful response cannot silently become an empty list.
+def malformed_json_fails_closed():
+    scripted = ScriptedRun()
+    scripted.when(starts_with("kubectl", "get", "deployment"), FakeProc(0, "{not valid json"))
+    with mock.patch.object(phase4_platform, "run", scripted):
+        try:
+            phase4_platform._list_owned_workloads("deployment", "goldengate-dev", "goldengate-dev-platform")
+            return False
+        except phase4_platform.Phase4Error:
+            return True
+
+
+results.append(("D: _list_owned_workloads() fails closed on malformed JSON rather than defaulting to an empty list", malformed_json_fails_closed()))
+
+
+def run_post_deploy(statefulset_proc, deployment_proc):
+    tmpdir = tempfile.mkdtemp()
+    state_path = Path(tmpdir) / "state.json"
+    phase4_platform.update_state(state_path, {"namespace": "goldengate-dev", "release_name": "goldengate-dev-platform"})
+    scripted = ScriptedRun()
+    scripted.when(starts_with("kubectl", "get", "namespace"), FakeProc(0, ""))
+    scripted.when(lambda argv: argv[:4] == ["kubectl", "get", "serviceaccount", phase4_platform.RUNTIME_SA_NAME] and "-o" not in argv, FakeProc(0, ""))
+    scripted.when(lambda argv: "jsonpath={.metadata.annotations.eks\\.amazonaws\\.com/role-arn}" in argv, FakeProc(0, "arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev"))
+    scripted.when(starts_with("kubectl", "get", "statefulset"), statefulset_proc)
+    scripted.when(starts_with("kubectl", "get", "deployment"), deployment_proc)
+    scripted.when(lambda argv: argv[:3] == ["kubectl", "get", "daemonset"] and "-l" in argv, FakeProc(0, json.dumps({"items": [{"metadata": {"name": "gg-fluent-bit"}}]})))
+    scripted.when(lambda argv: argv[:3] == ["kubectl", "get", "daemonset"] and "-l" not in argv, FakeProc(0, ""))
+    args = type("Args", (), {"environment": "dev", "state_path": state_path})()
+    env = {"AWS_REGION": "eu-west-1", "RUNTIME_ROLE_ARN": "arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev"}
+    with mock.patch.object(phase4_platform, "run", scripted), mock.patch.dict(os.environ, env, clear=False):
+        try:
+            phase4_platform.cmd_post_deploy_validation(args)
+            succeeded = True
+        except phase4_platform.Phase4Error:
+            succeeded = False
+    return succeeded, scripted.calls
+
+
+# B: a nonzero StatefulSet result cannot be ignored.
+b_succeeded, _ = run_post_deploy(FakeProc(0, json.dumps({"items": [{"metadata": {"name": "gg-oracle-01"}}]})), FakeProc(0, json.dumps({"items": []})))
+results.append(("B: a nonzero kubectl get statefulset result fails cmd_post_deploy_validation closed -- never ignored", b_succeeded is False))
+
+# C: both resource kinds are positively inspected (not skipped) on the way to a zero-workload success.
+c_succeeded, c_calls = run_post_deploy(FakeProc(0, json.dumps({"items": []})), FakeProc(0, json.dumps({"items": []})))
+c_statefulset_calls = [c for c in c_calls if c[:3] == ["kubectl", "get", "statefulset"]]
+c_deployment_calls = [c for c in c_calls if c[:3] == ["kubectl", "get", "deployment"]]
+results.append(("C: both StatefulSet and Deployment kinds are positively inspected exactly once before a zero-workload success is reported", c_succeeded is True and len(c_statefulset_calls) == 1 and len(c_deployment_calls) == 1))
+
+# E: zero-workload success requires a SUCCESSFUL inspection of BOTH kinds -- a Deployment-only inspection failure still fails closed even though StatefulSet came back empty.
+e_succeeded, _ = run_post_deploy(FakeProc(0, json.dumps({"items": []})), FakeProc(1, "", "Error from server (Forbidden): deployments.apps is forbidden"))
+results.append(("E: zero-workload success requires successful inspection of BOTH kinds -- a Deployment-only Forbidden failure still fails the step closed", e_succeeded is False))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+    while IFS= read -r line; do
+      case "$line" in
+        FAIL\ *) fail "Platform post-deploy workload-inventory fail-closed correction: ${line#FAIL }" ;;
+        OK\ *) pass "Platform post-deploy workload-inventory fail-closed correction: ${line#OK }" ;;
+      esac
+    done <<< "$PLATFORM_WORKLOAD_INVENTORY_CHECK"
+  else
+    skip "Platform post-deploy workload-inventory fail-closed correction -- python3 unavailable or phase4_platform.py missing"
+  fi
+
+  # Observability obsolete jq prerequisite removal correction (focused, static/offline only): real behavioral proof that cmd_ensure_tools() no longer inspects/invokes jq and succeeds with jq entirely absent from the environment, plus a structural (AST) proof that the obsolete _ensure_jq() helper and its call site are both fully removed rather than merely skipped.
+  if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/phases/phase4/phase4_observability.py ]; then
+    JQ_REMOVAL_CHECK="$(python3 - <<'PYEOF'
+import ast
+import importlib.util
+import io
+from contextlib import redirect_stdout
+from unittest import mock
+
+spec = importlib.util.spec_from_file_location("phase4_observability", "automation/phases/phase4/phase4_observability.py")
+phase4_observability = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(phase4_observability)
+
+results = []
+
+with open("automation/phases/phase4/phase4_observability.py") as f:
+    source = f.read()
+tree = ast.parse(source)
+functions = {node.name: node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
+
+results.append(("the obsolete _ensure_jq() helper no longer exists", "_ensure_jq" not in functions))
+
+ensure_tools_fn = functions.get("cmd_ensure_tools")
+ensure_tools_calls = {n.func.id for n in ast.walk(ensure_tools_fn) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)} if ensure_tools_fn else set()
+results.append(("cmd_ensure_tools() no longer calls _ensure_jq()", "_ensure_jq" not in ensure_tools_calls))
+results.append(("cmd_ensure_tools() still calls _ensure_helm() and _ensure_kubectl()", {"_ensure_helm", "_ensure_kubectl"} <= ensure_tools_calls))
+
+
+class FakeProc:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def fake_run(argv, env=None, cwd=None, check=True, capture_output=True, input_text=None):
+    if argv == ["bash", "-c", "command -v helm"]:
+        return FakeProc(0, "/usr/local/bin/helm")
+    if argv == ["helm", "version", "--short"]:
+        return FakeProc(0, "v3.15.4+g1234567")
+    if argv == ["bash", "-c", "command -v kubectl"]:
+        return FakeProc(0, "/usr/local/bin/kubectl")
+    if argv == ["kubectl", "version", "--client=true"]:
+        return FakeProc(0, "Client Version: v1.35.0")
+    raise AssertionError(f"unexpected call in a jq-free environment (no jq responder was registered at all): {argv}")
+
+
+class Args:
+    pass
+
+
+with mock.patch.object(phase4_observability, "run", fake_run):
+    try:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            phase4_observability.cmd_ensure_tools(Args())
+        tools_succeeded = True
+        tools_output = buf.getvalue()
+    except Exception:
+        tools_succeeded = False
+        tools_output = ""
+
+results.append(("cmd_ensure_tools() succeeds with jq entirely absent from the environment (no jq responder registered, no jq-shaped call ever attempted)", tools_succeeded))
+results.append(("the success message no longer mentions jq", tools_succeeded and "jq" not in tools_output.lower()))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+    while IFS= read -r line; do
+      case "$line" in
+        FAIL\ *) fail "Observability obsolete jq prerequisite removal correction: ${line#FAIL }" ;;
+        OK\ *) pass "Observability obsolete jq prerequisite removal correction: ${line#OK }" ;;
+      esac
+    done <<< "$JQ_REMOVAL_CHECK"
+  else
+    skip "Observability obsolete jq prerequisite removal correction -- python3 unavailable or phase4_observability.py missing"
+  fi
+
+  # F: no workflow YAML jq implementation exists for the Phase 4 Observability sub-workflow either (thin Python-backed workflow, unaffected by this correction).
+  JQ_WORKFLOW_YAML_HITS="$(grep -nE '\bjq\b' .github/workflows/40-sub-observability.yaml 2>/dev/null || true)"
+  if [ -z "$JQ_WORKFLOW_YAML_HITS" ]; then
+    pass "F: 40-sub-observability.yaml contains no jq reference -- it remains a thin Python-backed workflow"
+  else
+    fail "F: 40-sub-observability.yaml unexpectedly references jq:"$'\n'"${JQ_WORKFLOW_YAML_HITS}"
+  fi
+
   # Host-network isolation correction (focused, static/offline only) -- values.yaml-side checks.
   if [ -f "${REPO_ROOT}/${OBSERVABILITY_VALUES_FILE}" ] && command -v python3 >/dev/null 2>&1; then
     HOSTNETWORK_VALUES_CHECK="$(python3 - "${REPO_ROOT}/${OBSERVABILITY_VALUES_FILE}" <<'PYEOF'

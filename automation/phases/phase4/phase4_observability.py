@@ -288,17 +288,10 @@ def _ensure_helm():
     print(f"Helm version: {version_text} (required: 3.9 or later)")
 
 
-def _ensure_jq():
-    if run(["bash", "-c", "command -v jq"], check=False).returncode != 0:
-        raise Phase4Error("jq is not installed and this tool does not install system packages -- provision jq on the runner image.")
-    run(["jq", "--version"])
-
-
 def cmd_ensure_tools(args):
     _ensure_helm()
     _ensure_kubectl()
-    _ensure_jq()
-    print("OK: Helm (>=3.9), kubectl, and jq are available.")
+    print("OK: Helm (>=3.9) and kubectl are available.")
 
 
 # automation/phases/phase4/observability_acceptance.py reuse (never a second independent envs/<environment>/argocd/values.yaml parser is needed here; this module has no equivalent shared logic to reuse beyond the classifiers themselves, invoked as subprocesses below)
