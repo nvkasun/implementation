@@ -185,6 +185,59 @@ def _pods_for_selector(namespace, selector):
     return (json.loads(proc.stdout) or {}).get("items") or []
 
 
+def _replicaset_owner_deployment_uid(namespace, replicaset_name):
+    """Fail-closed ReplicaSet ownership inspection for the canonical current-revision pod resolver below. Returns the ReplicaSet's own controller Deployment UID (or None if the ReplicaSet itself has no single Deployment controller -- it cannot then certify any pod as current for any Deployment). A genuine Kubernetes NotFound (the ReplicaSet has already disappeared, e.g. a fully-scaled-down stale revision) also returns None -- that pod is correctly excluded from the current-revision set, never treated as current. Every OTHER inspection failure (Forbidden, network/API failure, malformed JSON, unknown error) raises Phase4Error: an RBAC/API failure must never silently shrink the authoritative pod set into a false pass."""
+    proc = run(["kubectl", "get", "replicaset", replicaset_name, "-n", namespace, "-o", "json"], check=False)
+    if proc.returncode != 0:
+        error_text = (proc.stderr or "") + (proc.stdout or "")
+        if re.search(r"NotFound", error_text, re.IGNORECASE):
+            return None
+        raise Phase4Error(f"could not inspect ReplicaSet {replicaset_name} in {namespace} (fail-closed -- an inspection failure is never treated as a stale/absent ReplicaSet): {error_text.strip() or '(no output)'}")
+    try:
+        replicaset = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise Phase4Error(f"ReplicaSet {replicaset_name} in {namespace} returned malformed JSON: {exc}") from exc
+    owner_refs = [o for o in ((replicaset.get("metadata") or {}).get("ownerReferences") or []) if o.get("controller") is True]
+    if len(owner_refs) != 1 or owner_refs[0].get("kind") != "Deployment":
+        return None
+    return owner_refs[0].get("uid")
+
+
+def _current_deployment_pods(namespace, deployment_name, *, running_only=False, ready_only=False):
+    """The one canonical current-revision pod resolver for every Observability acceptance/diagnostic path that must never certify a stale-ReplicaSet pod (cluster-scraper's Deployment is recreated in place by _ensure_cluster_scraper_host_network_isolated(), so a stale ReplicaSet's pod can still be Running/Ready for a time after a new revision is live). Resolves the live Deployment's own metadata.uid, derives its pod selector via _label_selector(), then for every non-terminating candidate pod walks Pod -> controller ReplicaSet -> controller Deployment UID and requires an exact match before classifying the pod as CURRENT REVISION. Fails closed (Phase4Error) on a missing Deployment UID, an empty selector, or any ReplicaSet inspection failure other than a genuine NotFound -- callers never see a silently-narrowed pod set."""
+    deploy = _kubectl_get_json("deployment", deployment_name, namespace)
+    deploy_uid = (deploy.get("metadata") or {}).get("uid")
+    if not deploy_uid:
+        raise Phase4Error(f"Deployment/{deployment_name} in {namespace} has no metadata.uid -- refusing to resolve current-revision pods.")
+
+    selector = _label_selector(deploy)
+    if not selector:
+        raise Phase4Error(f"Deployment/{deployment_name} in {namespace} has an empty pod selector -- refusing to resolve current-revision pods.")
+
+    replicaset_uid_cache = {}
+    current_pods = []
+    for pod in _pods_for_selector(namespace, selector):
+        metadata = pod.get("metadata") or {}
+        if metadata.get("deletionTimestamp"):
+            continue
+        owner_refs = [o for o in (metadata.get("ownerReferences") or []) if o.get("controller") is True]
+        if len(owner_refs) != 1 or owner_refs[0].get("kind") != "ReplicaSet":
+            continue
+        replicaset_name = owner_refs[0].get("name")
+        if replicaset_name not in replicaset_uid_cache:
+            replicaset_uid_cache[replicaset_name] = _replicaset_owner_deployment_uid(namespace, replicaset_name)
+        if replicaset_uid_cache[replicaset_name] != deploy_uid:
+            continue
+        if running_only and (pod.get("status") or {}).get("phase") != "Running":
+            continue
+        if ready_only:
+            ready = next((c.get("status") for c in ((pod.get("status") or {}).get("conditions") or []) if c.get("type") == "Ready"), "Unknown")
+            if ready != "True":
+                continue
+        current_pods.append(pod)
+    return current_pods
+
+
 # Tool installation (never requires AWS credentials)
 
 def _ensure_kubectl():
@@ -899,6 +952,32 @@ def _ensure_cluster_scraper_host_network_isolated(namespace):
     return "recreated_once"
 
 
+def _validate_active_cluster_scraper_pods_pre_irsa(namespace):
+    """Pre-IRSA active-pod safety proof, restored from the old workflow: runs immediately after the host-network correction and strictly BEFORE the ServiceAccount IRSA annotation/rollout-restart, so it intentionally never inspects AWS_ROLE_ARN/AWS_WEB_IDENTITY_TOKEN_FILE -- those only become meaningful once the annotation exists and pods have rolled. Uses the canonical current-revision pod resolver, so a stale ReplicaSet's pod can never satisfy this gate. Requires at least one current-revision, non-terminating, Running, Ready=True cluster-scraper pod, and validates hostNetwork/podIP/hostIP/serviceAccountName on every one of them."""
+    current_pods = _current_deployment_pods(namespace, "cloudwatch-agent-cluster-scraper", running_only=True, ready_only=True)
+    if not current_pods:
+        raise Phase4Error("no current-revision, Running, Ready cloudwatch-agent-cluster-scraper pod found before IRSA annotation -- refusing to proceed.")
+
+    for pod in current_pods:
+        pod_name = (pod.get("metadata") or {}).get("name")
+        spec = pod.get("spec") or {}
+        status = pod.get("status") or {}
+        if spec.get("hostNetwork") is not False:
+            raise Phase4Error(f"cluster-scraper pod {pod_name} spec.hostNetwork is {spec.get('hostNetwork')!r}, expected literal false.")
+        pod_ip = status.get("podIP")
+        host_ip = status.get("hostIP")
+        if not pod_ip:
+            raise Phase4Error(f"cluster-scraper pod {pod_name} has an empty podIP.")
+        if not host_ip:
+            raise Phase4Error(f"cluster-scraper pod {pod_name} has an empty hostIP.")
+        if pod_ip == host_ip:
+            raise Phase4Error(f"cluster-scraper pod {pod_name} podIP equals hostIP ({pod_ip}) -- host networking leaked through.")
+        if spec.get("serviceAccountName") != CLOUDWATCH_AGENT_SERVICE_ACCOUNT:
+            raise Phase4Error(f"cluster-scraper pod {pod_name} uses serviceAccountName={spec.get('serviceAccountName')!r}, expected {CLOUDWATCH_AGENT_SERVICE_ACCOUNT!r}.")
+        print(f"OK: cluster-scraper pod {pod_name} -- current revision, Running, Ready, hostNetwork=false, podIP != hostIP, serviceAccountName correct.")
+    print(f"OK: {len(current_pods)} active current-revision cluster-scraper pod(s) pass pre-IRSA safety validation.")
+
+
 def _annotate_cloudwatch_agent_service_account_and_restart(namespace, cloudwatch_metrics_role_arn):
     run(["kubectl", "get", "serviceaccount", CLOUDWATCH_AGENT_SERVICE_ACCOUNT, "-n", namespace])
     run(["kubectl", "annotate", "serviceaccount", CLOUDWATCH_AGENT_SERVICE_ACCOUNT, "-n", namespace,
@@ -973,13 +1052,13 @@ def _verify_irsa_injection(namespace):
     for pod in pods:
         _verify_pod_irsa("cloudwatch-agent DaemonSet", pod)
 
-    scraper_deploy = _kubectl_get_json("deployment", "cloudwatch-agent-cluster-scraper", namespace)
-    scraper_selector = _label_selector(scraper_deploy)
-    scraper_pods = [p for p in _pods_for_selector(namespace, scraper_selector) if (p.get("status") or {}).get("phase") == "Running"]
+    # Current-revision only: cloudwatch-agent-cluster-scraper's Deployment is recreated in place by _ensure_cluster_scraper_host_network_isolated(), so a stale ReplicaSet's pod can still be Running/Ready for a time after a new revision is live -- a stale pod's IRSA env vars must never certify the current Deployment.
+    scraper_pods = _current_deployment_pods(namespace, "cloudwatch-agent-cluster-scraper", running_only=True, ready_only=True)
     if not scraper_pods:
-        raise Phase4Error("no active cloudwatch-agent-cluster-scraper pod found for IRSA verification.")
-    _verify_pod_irsa("cloudwatch-agent-cluster-scraper Deployment", scraper_pods[0])
-    print("OK: IRSA injection verified on every cloudwatch-agent DaemonSet pod and the cluster-scraper pod.")
+        raise Phase4Error("no active current-revision cloudwatch-agent-cluster-scraper pod found for IRSA verification.")
+    for pod in scraper_pods:
+        _verify_pod_irsa("cloudwatch-agent-cluster-scraper Deployment", pod)
+    print("OK: IRSA injection verified on every cloudwatch-agent DaemonSet pod and every current-revision cluster-scraper pod.")
 
 
 _AUTH_ERROR_PATTERN = re.compile(r"PermissionDenied|HTTP Status Code 403|not authorized to perform: cloudwatch:PutMetricData|no identity-based policy allows|Exporting failed\. Dropping data\.|error exporting items|resource: arn:aws:cloudwatch:|dataset/default", re.IGNORECASE)
@@ -1026,12 +1105,9 @@ def _validate_no_recent_cloudwatch_export_errors(namespace):
     if checked != desired:
         raise Phase4Error(f"checked {checked} active node-agent pods, expected exactly desiredNumberScheduled={desired}.")
 
-    scraper_deploy = _kubectl_get_json("deployment", "cloudwatch-agent-cluster-scraper", namespace)
-    scraper_uid = (scraper_deploy.get("metadata") or {}).get("uid")
+    # Current-revision only (mirrors the DaemonSet owner-UID filtering above): a stale ReplicaSet's scraper pod must never be inspected here -- its logs belong to a superseded revision, not the current deployment under observation.
     checked_scraper = 0
-    for pod in _pods_for_selector(namespace, _label_selector(scraper_deploy)):
-        if (pod.get("metadata") or {}).get("deletionTimestamp"):
-            continue
+    for pod in _current_deployment_pods(namespace, "cloudwatch-agent-cluster-scraper"):
         containers = [c.get("name") for c in ((pod.get("spec") or {}).get("containers") or [])]
         if _check_pod_logs_for_errors((pod.get("metadata") or {}).get("name"), namespace, containers, validation_start_ts):
             any_error = True
@@ -1126,8 +1202,10 @@ def _live_kubernetes_validation(namespace, cloudwatch_metrics_role_arn, ecr_regi
         if (pod.get("spec") or {}).get("hostNetwork") is not False:
             raise Phase4Error(f"cluster-scraper pod {(pod.get('metadata') or {}).get('name')} spec.hostNetwork is not false.")
 
+    # Current-revision only for the scraper side of this final bounded log scan: a stale ReplicaSet's pod (still Running for a time after a new revision is live) must never be able to fail the current deployment on its own historical crash symptom.
     crash_pattern = re.compile(r"bind: address already in use|binding address localhost:8888|listen tcp 127\.0\.0\.1:8888|failed to create SDK", re.IGNORECASE)
-    for pod in _pods_for_selector(namespace, _label_selector(cw_ds)) + running_scraper_pods:
+    current_scraper_pods_for_logs = _current_deployment_pods(namespace, "cloudwatch-agent-cluster-scraper", running_only=True)
+    for pod in _pods_for_selector(namespace, _label_selector(cw_ds)) + current_scraper_pods_for_logs:
         if (pod.get("metadata") or {}).get("deletionTimestamp"):
             continue
         proc = run(["kubectl", "logs", (pod.get("metadata") or {}).get("name"), "-n", namespace, "--tail=80"], check=False)
@@ -1146,6 +1224,8 @@ def cmd_post_deploy_validation(args):
 
     correction_result = _ensure_cluster_scraper_host_network_isolated(namespace)
     update_state(args.state_path, {"cluster_scraper_correction": correction_result})
+
+    _validate_active_cluster_scraper_pods_pre_irsa(namespace)
 
     _annotate_cloudwatch_agent_service_account_and_restart(namespace, cloudwatch_metrics_role_arn)
     _wait_for_cloudwatch_agent_workloads(namespace)

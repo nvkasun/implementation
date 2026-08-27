@@ -1106,6 +1106,83 @@ for label, ok in results:
     skip "Phase 4 Python Conversion: Observability delegation check -- python3/PyYAML unavailable or ${OBSERVABILITY_WORKFLOW} missing"
   fi
 
+  # Current-revision cluster-scraper pod safety correction (focused, static/offline only): proves the canonical current-revision pod resolver exists and is the SOLE mechanism every scraper-facing acceptance/diagnostic path uses -- never four independent ReplicaSet-ownership reimplementations, and never a workflow YAML change (this is a pure Python source-level correction).
+  if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/phases/phase4/phase4_observability.py ]; then
+    SCRAPER_RESOLVER_CHECK="$(python3 - <<'PYEOF'
+import ast
+
+with open("automation/phases/phase4/phase4_observability.py") as f:
+    source = f.read()
+tree = ast.parse(source)
+functions = {node.name: node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
+results = []
+
+
+def calls(fn_name, target_name):
+    fn = functions.get(fn_name)
+    if fn is None:
+        return False
+    return any(isinstance(n, ast.Name) and n.id == target_name for n in ast.walk(fn))
+
+
+# A: one canonical current-Deployment/current-ReplicaSet pod resolver exists.
+results.append(("A: _current_deployment_pods() (the canonical current-revision pod resolver) is defined", "_current_deployment_pods" in functions))
+results.append(("A: the resolver derives its selector via the existing _label_selector()", calls("_current_deployment_pods", "_label_selector")))
+results.append(("A: the resolver classifies ReplicaSet ownership via a dedicated fail-closed helper, never inline ad-hoc logic", "_replicaset_owner_deployment_uid" in functions and calls("_current_deployment_pods", "_replicaset_owner_deployment_uid")))
+
+# B/C/D: every scraper-facing caller uses the canonical resolver, never a bespoke selector-only pod list for the scraper side.
+results.append(("B: _verify_irsa_injection uses the canonical resolver for cluster-scraper", calls("_verify_irsa_injection", "_current_deployment_pods")))
+results.append(("C: _validate_no_recent_cloudwatch_export_errors uses the canonical resolver for cluster-scraper", calls("_validate_no_recent_cloudwatch_export_errors", "_current_deployment_pods")))
+results.append(("D: _live_kubernetes_validation uses the canonical resolver for the scraper log-scan authority", calls("_live_kubernetes_validation", "_current_deployment_pods")))
+
+# E: the pre-IRSA active scraper pod proof is invoked between host-network correction and ServiceAccount annotation/restart, in that exact order.
+post_deploy_src = ast.get_source_segment(source, functions["cmd_post_deploy_validation"]) or ""
+host_network_idx = post_deploy_src.find("_ensure_cluster_scraper_host_network_isolated(")
+pre_irsa_idx = post_deploy_src.find("_validate_active_cluster_scraper_pods_pre_irsa(")
+annotate_idx = post_deploy_src.find("_annotate_cloudwatch_agent_service_account_and_restart(")
+results.append(("E: cmd_post_deploy_validation() calls _validate_active_cluster_scraper_pods_pre_irsa() AFTER host-network correction and BEFORE ServiceAccount annotation/restart",
+                 -1 not in (host_network_idx, pre_irsa_idx, annotate_idx) and host_network_idx < pre_irsa_idx < annotate_idx))
+
+# F: the pre-IRSA validation checks the exact restored invariant set, and explicitly does NOT check IRSA env vars (those are checked later, after annotation).
+pre_irsa_fn = functions["_validate_active_cluster_scraper_pods_pre_irsa"]
+pre_irsa_src = ast.get_source_segment(source, pre_irsa_fn) or ""
+# The function's own docstring may legitimately NAME these env vars to explain why they are intentionally not checked here -- the real assertion is that the executable BODY (docstring excluded) never references them.
+pre_irsa_body_src = "\n".join(ast.get_source_segment(source, stmt) or "" for stmt in pre_irsa_fn.body if not (isinstance(stmt, ast.Expr) and isinstance(getattr(stmt, "value", None), ast.Constant) and isinstance(stmt.value.value, str)))
+results.append(("F: pre-IRSA validation requires Running+Ready via the canonical resolver", "running_only=True" in pre_irsa_src and "ready_only=True" in pre_irsa_src))
+results.append(("F: pre-IRSA validation requires hostNetwork is exactly false", "hostNetwork" in pre_irsa_src and "is not False" in pre_irsa_src))
+results.append(("F: pre-IRSA validation requires podIP != hostIP (and both non-empty)", "pod_ip == host_ip" in pre_irsa_src and "not pod_ip" in pre_irsa_src and "not host_ip" in pre_irsa_src))
+results.append(("F: pre-IRSA validation requires serviceAccountName == cloudwatch-agent", "serviceAccountName" in pre_irsa_src and "CLOUDWATCH_AGENT_SERVICE_ACCOUNT" in pre_irsa_src))
+results.append(("F: pre-IRSA validation's executable body never references AWS_ROLE_ARN/AWS_WEB_IDENTITY_TOKEN_FILE (checked only after annotation)", "AWS_ROLE_ARN" not in pre_irsa_body_src and "AWS_WEB_IDENTITY_TOKEN_FILE" not in pre_irsa_body_src))
+
+# G: no stale ReplicaSet pod can ever be authoritative -- the resolver fails closed on every ReplicaSet inspection failure except a genuine NotFound, and excludes non-matching/terminating pods before returning.
+resolver_src = ast.get_source_segment(source, functions["_current_deployment_pods"]) or ""
+replicaset_helper_src = ast.get_source_segment(source, functions["_replicaset_owner_deployment_uid"]) or ""
+results.append(("G: the resolver excludes deletionTimestamp (terminating) pods", "deletionTimestamp" in resolver_src))
+results.append(("G: the resolver excludes pods whose ReplicaSet does not match the current Deployment UID", "deploy_uid" in resolver_src and "continue" in resolver_src))
+results.append(("G: ReplicaSet inspection fails closed (Forbidden/network/malformed JSON raise Phase4Error; only genuine NotFound is excluded)", "NotFound" in replicaset_helper_src and "Phase4Error" in replicaset_helper_src))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+    while IFS= read -r line; do
+      case "$line" in
+        FAIL\ *) fail "Cluster-scraper current-revision pod safety correction: ${line#FAIL }" ;;
+        OK\ *) pass "Cluster-scraper current-revision pod safety correction: ${line#OK }" ;;
+      esac
+    done <<< "$SCRAPER_RESOLVER_CHECK"
+  else
+    skip "Cluster-scraper current-revision pod safety correction -- python3 unavailable or phase4_observability.py missing"
+  fi
+
+  # H: this is a pure Python correction -- no workflow YAML implementation was added back for any of the restored current-revision safety behavior.
+  WORKFLOW_YAML_LEAK_HITS="$(grep -nE 'ownerReferences|ReplicaSet|current-revision|current_deployment_pods' .github/workflows/40-sub-observability.yaml 2>/dev/null || true)"
+  if [ -z "$WORKFLOW_YAML_LEAK_HITS" ]; then
+    pass "H: no ReplicaSet-ownership/current-revision implementation was added back into 40-sub-observability.yaml -- it remains a thin Python-backed workflow"
+  else
+    fail "H: 40-sub-observability.yaml unexpectedly contains ReplicaSet/current-revision implementation text:"$'\n'"${WORKFLOW_YAML_LEAK_HITS}"
+  fi
+
   # Host-network isolation correction (focused, static/offline only) -- values.yaml-side checks.
   if [ -f "${REPO_ROOT}/${OBSERVABILITY_VALUES_FILE}" ] && command -v python3 >/dev/null 2>&1; then
     HOSTNETWORK_VALUES_CHECK="$(python3 - "${REPO_ROOT}/${OBSERVABILITY_VALUES_FILE}" <<'PYEOF'
