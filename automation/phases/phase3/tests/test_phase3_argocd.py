@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import base64
+import copy
 import importlib.util
 import json
+import re
 import subprocess
 import tempfile
 import unittest
@@ -219,6 +221,19 @@ ecrTokenSync:
   enabled: true
   image:
     tag: "1.33.13"
+  repositories:
+    - name: goldengate
+      helmOciRepository: helm/goldengate
+      argocdRepositorySecretName: argocd-ecr-goldengate-oci
+    - name: goldengate-monitor
+      helmOciRepository: helm/goldengate-monitor
+      argocdRepositorySecretName: argocd-ecr-goldengate-monitor-oci
+    - name: goldengate-platform
+      helmOciRepository: helm/goldengate-platform
+      argocdRepositorySecretName: argocd-ecr-goldengate-platform-oci
+    - name: amazon-cloudwatch-observability
+      helmOciRepository: helm/amazon-cloudwatch-observability
+      argocdRepositorySecretName: argocd-ecr-amazon-cloudwatch-observability-oci
 
 argocdServerIngress:
   enabled: true
@@ -236,18 +251,32 @@ argocdServerIngress:
   scheme: internal
 """
 
-GOOD_POLICY_JSON = json.dumps({
+# Deliberately mirrors the shape automation/goldengate-environment.py's generate_policy_files() actually produces (GetAuthorizationToken plus exactly the four current repositories) -- used both as the mocked "canonical" answer (via _canonical_argocd_ecr_policy, patched in Phase3TestCase.setUp) and, by default, as the "committed" policy content in _build_fake_repo, so that the happy path in this test module never independently hardcodes a second repo/action contract either.
+_CANONICAL_REPOS = ("helm/goldengate", "helm/goldengate-monitor", "helm/goldengate-platform", "helm/amazon-cloudwatch-observability")
+_CANONICAL_ACTIONS = ["ecr:BatchCheckLayerAvailability", "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer", "ecr:DescribeImages", "ecr:DescribeRepositories"]
+
+
+def _repo_sid(name):
+    return "AllowRead" + "".join(part.capitalize() for part in re.split(r"[/-]", name)) + "HelmOciRepository"
+
+
+CANONICAL_POLICY_FIXTURE = {
     "Version": "2012-10-17",
     "Statement": [
-        {
-            "Sid": f"AllowRead{name.replace('/', '').replace('-', '')}",
-            "Effect": "Allow",
-            "Action": sorted(p3.REQUIRED_ECR_POLICY_ACTIONS),
-            "Resource": f"arn:aws:ecr:{AWS_REGION}:{ECR_ACCOUNT_ID}:repository/{name}",
-        }
-        for name in p3.REQUIRED_ECR_POLICY_REPOS
+        {"Sid": "AllowGetEcrAuthorizationToken", "Effect": "Allow", "Action": ["ecr:GetAuthorizationToken"], "Resource": "*"},
+        *[
+            {
+                "Sid": _repo_sid(name),
+                "Effect": "Allow",
+                "Action": list(_CANONICAL_ACTIONS),
+                "Resource": f"arn:aws:ecr:{AWS_REGION}:{ECR_ACCOUNT_ID}:repository/{name}",
+            }
+            for name in _CANONICAL_REPOS
+        ],
     ],
-})
+}
+
+GOOD_POLICY_JSON = json.dumps(CANONICAL_POLICY_FIXTURE, indent=2) + "\n"
 
 
 def _build_fake_repo(root, values_yaml=GOOD_VALUES_YAML, policy_json=GOOD_POLICY_JSON, declare_vendored=True):
@@ -292,6 +321,11 @@ class Phase3TestCase(unittest.TestCase):
         sleep_patch = mock.patch.object(p3.time, "sleep", lambda seconds: None)
         sleep_patch.start()
         self.addCleanup(sleep_patch.stop)
+
+        # Default canonical-policy stand-in: avoids requiring a full fake envs/<environment>/environment.yaml fixture in every test that merely exercises unrelated validate-local logic; tests that specifically target the canonical-comparison machinery itself override this per-test (see TestEcrIamPolicyExactComparison) or bypass Phase3TestCase entirely to exercise the real repository (see TestCanonicalPolicyAgainstRealRepository).
+        canonical_policy_patch = mock.patch.object(p3, "_canonical_argocd_ecr_policy", lambda environment: copy.deepcopy(CANONICAL_POLICY_FIXTURE))
+        canonical_policy_patch.start()
+        self.addCleanup(canonical_policy_patch.stop)
 
         env_patch = {"GITHUB_OUTPUT": str(self.github_output), "GITHUB_STEP_SUMMARY": str(self.github_summary)}
         patcher = mock.patch.dict("os.environ", env_patch)
@@ -527,7 +561,7 @@ class TestValidateLocal(Phase3TestCase):
 
     def test_ecr_policy_wildcard_resource_fails_closed(self):
         bad_policy = json.dumps({"Statement": [
-            {"Resource": "*", "Action": sorted(p3.REQUIRED_ECR_POLICY_ACTIONS)},
+            {"Resource": "*", "Action": list(_CANONICAL_ACTIONS)},
         ]})
         self.build_fake_repo(policy_json=bad_policy)
         self._prime_state()
@@ -695,11 +729,15 @@ class TestPublishChart(Phase3TestCase):
         })
 
     def _scripted(self, repo_exists=True):
+        describe_result = _ok("") if repo_exists else _fail(
+            stderr="An error occurred (RepositoryNotFoundException) when calling the DescribeRepositories operation: The repository with name 'helm/argocd' does not exist in the registry",
+            returncode=254,
+        )
         return (ScriptedSubprocess()
                 .on(lambda argv: argv[:3] == ["aws", "sts", "get-caller-identity"], _ok("{}"))
                 .on(lambda argv: argv[:3] == ["aws", "ecr", "get-login-password"], _ok("super-secret-password\n"))
                 .on(lambda argv: argv[:3] == ["helm", "registry", "login"], _ok(""))
-                .on(lambda argv: argv[:3] == ["aws", "ecr", "describe-repositories"], _ok("") if repo_exists else _fail(returncode=1))
+                .on(lambda argv: argv[:3] == ["aws", "ecr", "describe-repositories"], describe_result)
                 .on(lambda argv: argv[:3] == ["aws", "ecr", "create-repository"], _ok(""))
                 .on(lambda argv: argv[:2] == ["helm", "push"], _ok(""))
                 .on(lambda argv: argv[:2] == ["helm", "pull"], _ok("")))
@@ -729,7 +767,9 @@ class TestPublishChart(Phase3TestCase):
         self._prime_state()
         scripted = self._scripted(repo_exists=False)
         self.run_subcommand(p3.cmd_publish_chart, scripted=scripted, env_overrides=BASE_ENV)
-        create_call = next(c for c in scripted.calls if c[:3] == ["aws", "ecr", "create-repository"])
+        create_calls = [c for c in scripted.calls if c[:3] == ["aws", "ecr", "create-repository"]]
+        self.assertEqual(len(create_calls), 1)
+        create_call = create_calls[0]
         self.assertIn("scanOnPush=true", create_call)
         self.assertIn("MUTABLE", create_call)
 
@@ -747,6 +787,254 @@ class TestPublishChart(Phase3TestCase):
         pull_call = next(c for c in scripted.calls if c[:2] == ["helm", "pull"])
         self.assertIn("0.1.42", pull_call)
         self.assertIn(f"oci://{ECR_REGISTRY}/helm/argocd", pull_call)
+
+
+class TestEnsureEcrRepository(Phase3TestCase):
+    """_ensure_ecr_repository() must never interpret an inability to inspect state as "does not exist" -- only an explicit RepositoryNotFoundException from describe-repositories authorizes create-repository; every other non-zero describe-repositories result (AccessDenied/ExpiredToken/throttling/network/unknown/empty) must fail closed with zero create-repository calls."""
+
+    def _not_found(self):
+        return _fail(stderr="An error occurred (RepositoryNotFoundException) when calling the DescribeRepositories operation: The repository with name 'helm/argocd' does not exist in the registry with id '229410149234'", returncode=254)
+
+    def test_describe_success_makes_no_create_call(self):
+        scripted = ScriptedSubprocess().on(lambda argv: argv[:3] == ["aws", "ecr", "describe-repositories"], _ok(""))
+        with mock.patch.object(p3.subprocess, "run", scripted):
+            p3._ensure_ecr_repository("helm/argocd", AWS_REGION)
+        self.assertFalse(any(c[:3] == ["aws", "ecr", "create-repository"] for c in scripted.calls))
+
+    def test_explicit_repository_not_found_creates_exactly_once(self):
+        scripted = (ScriptedSubprocess()
+                    .on(lambda argv: argv[:3] == ["aws", "ecr", "describe-repositories"], self._not_found())
+                    .on(lambda argv: argv[:3] == ["aws", "ecr", "create-repository"], _ok("")))
+        with mock.patch.object(p3.subprocess, "run", scripted):
+            p3._ensure_ecr_repository("helm/argocd", AWS_REGION)
+        create_calls = [c for c in scripted.calls if c[:3] == ["aws", "ecr", "create-repository"]]
+        self.assertEqual(len(create_calls), 1)
+
+    def test_access_denied_raises_and_never_creates(self):
+        scripted = ScriptedSubprocess().on(lambda argv: argv[:3] == ["aws", "ecr", "describe-repositories"], _fail(stderr="An error occurred (AccessDeniedException) when calling the DescribeRepositories operation: User: arn:aws:sts::229410149234:assumed-role/foo is not authorized to perform: ecr:DescribeRepositories", returncode=254))
+        with mock.patch.object(p3.subprocess, "run", scripted):
+            with self.assertRaises(p3.Phase3Error):
+                p3._ensure_ecr_repository("helm/argocd", AWS_REGION)
+        self.assertFalse(any(c[:3] == ["aws", "ecr", "create-repository"] for c in scripted.calls))
+
+    def test_expired_token_raises_and_never_creates(self):
+        scripted = ScriptedSubprocess().on(lambda argv: argv[:3] == ["aws", "ecr", "describe-repositories"], _fail(stderr="An error occurred (ExpiredTokenException) when calling the DescribeRepositories operation: The security token included in the request is expired", returncode=254))
+        with mock.patch.object(p3.subprocess, "run", scripted):
+            with self.assertRaises(p3.Phase3Error):
+                p3._ensure_ecr_repository("helm/argocd", AWS_REGION)
+        self.assertFalse(any(c[:3] == ["aws", "ecr", "create-repository"] for c in scripted.calls))
+
+    def test_throttling_raises_and_never_creates(self):
+        scripted = ScriptedSubprocess().on(lambda argv: argv[:3] == ["aws", "ecr", "describe-repositories"], _fail(stderr="An error occurred (ThrottlingException) when calling the DescribeRepositories operation: Rate exceeded", returncode=254))
+        with mock.patch.object(p3.subprocess, "run", scripted):
+            with self.assertRaises(p3.Phase3Error):
+                p3._ensure_ecr_repository("helm/argocd", AWS_REGION)
+        self.assertFalse(any(c[:3] == ["aws", "ecr", "create-repository"] for c in scripted.calls))
+
+    def test_network_or_unknown_error_raises_and_never_creates(self):
+        scripted = ScriptedSubprocess().on(lambda argv: argv[:3] == ["aws", "ecr", "describe-repositories"], _fail(stderr="Could not connect to the endpoint URL: \"https://ecr.eu-west-1.amazonaws.com/\"", returncode=255))
+        with mock.patch.object(p3.subprocess, "run", scripted):
+            with self.assertRaises(p3.Phase3Error):
+                p3._ensure_ecr_repository("helm/argocd", AWS_REGION)
+        self.assertFalse(any(c[:3] == ["aws", "ecr", "create-repository"] for c in scripted.calls))
+
+    def test_empty_stderr_non_zero_raises_and_never_creates(self):
+        scripted = ScriptedSubprocess().on(lambda argv: argv[:3] == ["aws", "ecr", "describe-repositories"], _fail(stdout="", stderr="", returncode=1))
+        with mock.patch.object(p3.subprocess, "run", scripted):
+            with self.assertRaises(p3.Phase3Error):
+                p3._ensure_ecr_repository("helm/argocd", AWS_REGION)
+        self.assertFalse(any(c[:3] == ["aws", "ecr", "create-repository"] for c in scripted.calls))
+
+    def test_explicit_not_found_creation_preserves_exact_tags_and_settings(self):
+        scripted = (ScriptedSubprocess()
+                    .on(lambda argv: argv[:3] == ["aws", "ecr", "describe-repositories"], self._not_found())
+                    .on(lambda argv: argv[:3] == ["aws", "ecr", "create-repository"], _ok("")))
+        with mock.patch.object(p3.subprocess, "run", scripted):
+            p3._ensure_ecr_repository("helm/argocd", AWS_REGION)
+        create_call = next(c for c in scripted.calls if c[:3] == ["aws", "ecr", "create-repository"])
+        self.assertIn("helm/argocd", create_call)
+        for tag in ("Key=ApplicationName,Value=CloudFactory", "Key=DataClassification,Value=General", "Key=BusinessCriticality,Value=Low", "Key=BusinessUnit,Value=TechnologyPlatform", "Key=CostCenter,Value=219"):
+            self.assertIn(tag, create_call)
+        self.assertIn("scanOnPush=true", create_call)
+        self.assertIn("MUTABLE", create_call)
+
+    def test_race_safe_repository_already_exists_requires_redescribe_success(self):
+        # Optional race-safe handling: describe -> NotFound, create -> RepositoryAlreadyExistsException (another actor raced us), re-describe -> succeeds -> treated as success, never a silently-ignored create failure.
+        state = {"describe_calls": 0}
+
+        def describe_handler(argv, stdin):
+            state["describe_calls"] += 1
+            if state["describe_calls"] == 1:
+                return subprocess.CompletedProcess(argv, 254, "", "RepositoryNotFoundException")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        scripted = (ScriptedSubprocess()
+                    .on(lambda argv: argv[:3] == ["aws", "ecr", "describe-repositories"], describe_handler)
+                    .on(lambda argv: argv[:3] == ["aws", "ecr", "create-repository"], _fail(stderr="An error occurred (RepositoryAlreadyExistsException) when calling the CreateRepository operation: The repository already exists", returncode=254)))
+        with mock.patch.object(p3.subprocess, "run", scripted):
+            p3._ensure_ecr_repository("helm/argocd", AWS_REGION)
+        self.assertEqual(state["describe_calls"], 2)
+
+    def test_repository_already_exists_without_successful_redescribe_still_fails_closed(self):
+        scripted = (ScriptedSubprocess()
+                    .on(lambda argv: argv[:3] == ["aws", "ecr", "describe-repositories"], self._not_found())
+                    .on(lambda argv: argv[:3] == ["aws", "ecr", "create-repository"], _fail(stderr="An error occurred (RepositoryAlreadyExistsException) when calling the CreateRepository operation: The repository already exists", returncode=254)))
+        with mock.patch.object(p3.subprocess, "run", scripted):
+            with self.assertRaises(p3.Phase3Error):
+                p3._ensure_ecr_repository("helm/argocd", AWS_REGION)
+
+    def test_create_failure_other_than_already_exists_still_raises(self):
+        scripted = (ScriptedSubprocess()
+                    .on(lambda argv: argv[:3] == ["aws", "ecr", "describe-repositories"], self._not_found())
+                    .on(lambda argv: argv[:3] == ["aws", "ecr", "create-repository"], _fail(stderr="An error occurred (AccessDeniedException) when calling the CreateRepository operation: User is not authorized", returncode=254)))
+        with mock.patch.object(p3.subprocess, "run", scripted):
+            with self.assertRaises(p3.Phase3Error):
+                p3._ensure_ecr_repository("helm/argocd", AWS_REGION)
+
+
+class TestEcrIamPolicyExactComparison(Phase3TestCase):
+    """_validate_ecr_iam_policy() must compare the committed Argo CD ECR-read policy against the exact canonical policy (mocked here via _canonical_argocd_ecr_policy, matching the default Phase3TestCase.setUp patch) -- byte-for-byte as parsed JSON, never a subset/ARN-only comparison."""
+
+    def _write_committed_policy(self, policy_dict):
+        policy_dir = self.repo_root / "envs" / ENVIRONMENT / "policies" / f"argocd-ecr-oci-read-{ENVIRONMENT}" / "policies"
+        policy_dir.mkdir(parents=True, exist_ok=True)
+        with (policy_dir / "policies_1.json").open("w") as f:
+            json.dump(policy_dict, f, indent=2)
+            f.write("\n")
+
+    def test_exact_canonical_policy_passes(self):
+        self._write_committed_policy(copy.deepcopy(CANONICAL_POLICY_FIXTURE))
+        p3._validate_ecr_iam_policy(ENVIRONMENT)
+
+    def test_extra_stale_gg_monitor_repository_grant_fails(self):
+        policy = copy.deepcopy(CANONICAL_POLICY_FIXTURE)
+        policy["Statement"].append({
+            "Sid": "AllowReadGgMonitorHelmOciRepository", "Effect": "Allow", "Action": list(_CANONICAL_ACTIONS),
+            "Resource": f"arn:aws:ecr:{AWS_REGION}:{ECR_ACCOUNT_ID}:repository/helm/gg-monitor",
+        })
+        self._write_committed_policy(policy)
+        with self.assertRaises(p3.Phase3Error):
+            p3._validate_ecr_iam_policy(ENVIRONMENT)
+
+    def test_arbitrary_extra_repository_grant_fails(self):
+        policy = copy.deepcopy(CANONICAL_POLICY_FIXTURE)
+        policy["Statement"].append({
+            "Sid": "AllowReadSomeOtherHelmOciRepository", "Effect": "Allow", "Action": list(_CANONICAL_ACTIONS),
+            "Resource": f"arn:aws:ecr:{AWS_REGION}:{ECR_ACCOUNT_ID}:repository/helm/some-other-repo",
+        })
+        self._write_committed_policy(policy)
+        with self.assertRaises(p3.Phase3Error):
+            p3._validate_ecr_iam_policy(ENVIRONMENT)
+
+    def test_wildcard_repository_read_grant_fails(self):
+        policy = copy.deepcopy(CANONICAL_POLICY_FIXTURE)
+        policy["Statement"][1]["Resource"] = "*"
+        self._write_committed_policy(policy)
+        with self.assertRaises(p3.Phase3Error):
+            p3._validate_ecr_iam_policy(ENVIRONMENT)
+
+    def test_missing_one_required_repository_fails(self):
+        policy = copy.deepcopy(CANONICAL_POLICY_FIXTURE)
+        policy["Statement"].pop(1)
+        self._write_committed_policy(policy)
+        with self.assertRaises(p3.Phase3Error):
+            p3._validate_ecr_iam_policy(ENVIRONMENT)
+
+    def test_missing_get_authorization_token_fails(self):
+        policy = copy.deepcopy(CANONICAL_POLICY_FIXTURE)
+        policy["Statement"] = [s for s in policy["Statement"] if s["Sid"] != "AllowGetEcrAuthorizationToken"]
+        self._write_committed_policy(policy)
+        with self.assertRaises(p3.Phase3Error):
+            p3._validate_ecr_iam_policy(ENVIRONMENT)
+
+    def test_get_authorization_token_with_incorrect_resource_fails(self):
+        policy = copy.deepcopy(CANONICAL_POLICY_FIXTURE)
+        for stmt in policy["Statement"]:
+            if stmt["Sid"] == "AllowGetEcrAuthorizationToken":
+                stmt["Resource"] = f"arn:aws:ecr:{AWS_REGION}:{ECR_ACCOUNT_ID}:repository/helm/goldengate"
+        self._write_committed_policy(policy)
+        with self.assertRaises(p3.Phase3Error):
+            p3._validate_ecr_iam_policy(ENVIRONMENT)
+
+    def test_extra_privilege_action_fails(self):
+        policy = copy.deepcopy(CANONICAL_POLICY_FIXTURE)
+        policy["Statement"][1]["Action"].append("ecr:DeleteRepository")
+        self._write_committed_policy(policy)
+        with self.assertRaises(p3.Phase3Error):
+            p3._validate_ecr_iam_policy(ENVIRONMENT)
+
+    def test_missing_required_repository_read_action_fails(self):
+        policy = copy.deepcopy(CANONICAL_POLICY_FIXTURE)
+        policy["Statement"][1]["Action"].remove("ecr:DescribeRepositories")
+        self._write_committed_policy(policy)
+        with self.assertRaises(p3.Phase3Error):
+            p3._validate_ecr_iam_policy(ENVIRONMENT)
+
+    def test_wrong_effect_fails(self):
+        policy = copy.deepcopy(CANONICAL_POLICY_FIXTURE)
+        policy["Statement"][1]["Effect"] = "Deny"
+        self._write_committed_policy(policy)
+        with self.assertRaises(p3.Phase3Error):
+            p3._validate_ecr_iam_policy(ENVIRONMENT)
+
+
+class TestEcrTokenSyncRepositoryDrift(Phase3TestCase):
+    """_validate_ecr_token_sync_repository_drift() must fail closed the instant Argo CD's ecrTokenSync.repositories (the runtime consumer) and the canonical Argo CD ECR-read IAM policy (the access grant) disagree on the repository set."""
+
+    def _write_values(self, values_yaml):
+        values_dir = self.repo_root / "envs" / ENVIRONMENT / "argocd"
+        values_dir.mkdir(parents=True, exist_ok=True)
+        (values_dir / "values.yaml").write_text(values_yaml)
+
+    def test_current_repo_sets_match_exactly(self):
+        self._write_values(GOOD_VALUES_YAML)
+        p3._validate_ecr_token_sync_repository_drift(ENVIRONMENT)
+
+    def test_token_sync_repository_with_no_iam_grant_fails(self):
+        extra_repo_values = GOOD_VALUES_YAML.replace(
+            "    - name: amazon-cloudwatch-observability",
+            "    - name: extra\n      helmOciRepository: helm/extra-repo\n      argocdRepositorySecretName: argocd-ecr-extra-oci\n\n    - name: amazon-cloudwatch-observability",
+        )
+        self._write_values(extra_repo_values)
+        with self.assertRaises(p3.Phase3Error):
+            p3._validate_ecr_token_sync_repository_drift(ENVIRONMENT)
+
+    def test_iam_repository_with_no_token_sync_consumer_fails(self):
+        extra_iam_policy = copy.deepcopy(CANONICAL_POLICY_FIXTURE)
+        extra_iam_policy["Statement"].append({
+            "Sid": "AllowReadExtraHelmOciRepository", "Effect": "Allow", "Action": list(_CANONICAL_ACTIONS),
+            "Resource": f"arn:aws:ecr:{AWS_REGION}:{ECR_ACCOUNT_ID}:repository/helm/extra-repo",
+        })
+        with mock.patch.object(p3, "_canonical_argocd_ecr_policy", lambda environment: extra_iam_policy):
+            self._write_values(GOOD_VALUES_YAML)
+            with self.assertRaises(p3.Phase3Error):
+                p3._validate_ecr_token_sync_repository_drift(ENVIRONMENT)
+
+
+class TestCanonicalPolicyAgainstRealRepository(unittest.TestCase):
+    """Deliberately does NOT inherit Phase3TestCase (no REPO_ROOT/canonical-policy mocking) -- exercises the REAL automation/goldengate-environment.py and the REAL committed envs/dev/ files, proving the actual repository state, not merely a fixture."""
+
+    def test_stale_gg_monitor_repository_absent_from_canonical_generator_source(self):
+        with open(REPO_ROOT / "automation" / "goldengate-environment.py") as f:
+            source = f.read()
+        self.assertNotIn('"helm/gg-monitor"', source)
+
+    def test_stale_gg_monitor_repository_absent_from_generated_dev_policy(self):
+        with open(REPO_ROOT / "envs" / "dev" / "policies" / "argocd-ecr-oci-read-dev" / "policies" / "policies_1.json") as f:
+            self.assertNotIn("helm/gg-monitor", f.read())
+
+    def test_real_dev_policy_exactly_matches_the_real_canonical_generator(self):
+        p3._validate_ecr_iam_policy("dev")
+
+    def test_real_argo_values_and_real_canonical_policy_repository_sets_agree(self):
+        p3._validate_ecr_token_sync_repository_drift("dev")
+
+    def test_real_argo_values_declare_exactly_four_token_sync_repositories(self):
+        import yaml
+        with open(REPO_ROOT / "envs" / "dev" / "argocd" / "values.yaml") as f:
+            doc = yaml.safe_load(f)
+        repos = {entry["helmOciRepository"] for entry in doc["ecrTokenSync"]["repositories"]}
+        self.assertEqual(repos, set(_CANONICAL_REPOS))
 
 
 class TestReconcileCluster(Phase3TestCase):

@@ -824,17 +824,20 @@ if len(matching) != 1:
     print(f"MISMATCH:found={len(matching)}-statements-for-expected-arn")
     raise SystemExit
 
-# Every pre-existing repository ARN this policy already granted (goldengate, goldengate-monitor, goldengate-platform, gg-monitor) must still be present unchanged.
+# Every pre-existing repository ARN this policy already granted (goldengate, goldengate-monitor, goldengate-platform) must still be present unchanged. helm/gg-monitor was a stale entry (no operational helm/gg-monitor chart -- the current monitor chart is helm/goldengate-monitor) removed by the Phase 3 ECR least-privilege correction; its ARN must now be ABSENT, never present.
 preexisting_arns = {
     "arn:aws:ecr:eu-west-1:229410149234:repository/helm/goldengate",
     "arn:aws:ecr:eu-west-1:229410149234:repository/helm/goldengate-monitor",
     "arn:aws:ecr:eu-west-1:229410149234:repository/helm/goldengate-platform",
-    "arn:aws:ecr:eu-west-1:229410149234:repository/helm/gg-monitor",
 }
 present_arns = {s.get("Resource") for s in stmts}
 missing = preexisting_arns - present_arns
 if missing:
     print(f"MISMATCH:missing-preexisting-arns={sorted(missing)}")
+    raise SystemExit
+stale_gg_monitor_arn = "arn:aws:ecr:eu-west-1:229410149234:repository/helm/gg-monitor"
+if stale_gg_monitor_arn in present_arns:
+    print(f"MISMATCH:stale-gg-monitor-arn-still-present={stale_gg_monitor_arn}")
     raise SystemExit
 
 # ecr:GetAuthorizationToken statement (Resource "*") must be preserved unchanged.
@@ -849,7 +852,7 @@ print("OK")
 PYEOF
 )"
     if [ "$ARGOCD_ECR_CHECK" = "OK" ]; then
-      pass "argocd-ecr-oci-read-dev policy grants the exact amazon-cloudwatch-observability chart repository ARN while preserving every pre-existing statement (including ecr:GetAuthorizationToken)"
+      pass "argocd-ecr-oci-read-dev policy grants the exact amazon-cloudwatch-observability chart repository ARN while preserving every genuinely-current pre-existing statement (including ecr:GetAuthorizationToken) and no longer grants the stale helm/gg-monitor repository"
     else
       fail "argocd-ecr-oci-read-dev policy check failed: ${ARGOCD_ECR_CHECK}"
     fi
@@ -1024,12 +1027,14 @@ assert not (names & forbidden), names & forbidden
       fail "11b: ${ARGOCD_DEPLOY_WORKFLOW}/${PHASE3_TOOL} do not fully reference the fourth repository, or a stale 'all three' comment/echo remains"
     fi
 
-    # The IAM-policy static-validation function's expected_repos dict (now in phase3_argocd.py, never reimplemented inline in the workflow) must include the fourth repository name, deriving its ARN from the canonical AWS_REGION/ECR_ACCOUNT_ID (never a second hardcoded account/region).
-    if grep -q '"helm/amazon-cloudwatch-observability"' "${REPO_ROOT}/${PHASE3_TOOL}" \
-        && grep -qF 'f"arn:aws:ecr:{region}:{ecr_account_id}:repository/{name}"' "${REPO_ROOT}/${PHASE3_TOOL}"; then
-      pass "11c: ${PHASE3_TOOL}'s IAM-policy validation function expects the amazon-cloudwatch-observability repository ARN, derived from the canonical AWS_REGION/ECR_ACCOUNT_ID"
+    # Phase 3 ECR IAM least-privilege correction: the IAM-policy repo/action/ARN-construction contract moved OUT of phase3_argocd.py entirely (it now delegates to the canonical generator via exact-comparison, never a second independently-hardcoded expected_repos dict) -- the fourth repository name and its ARN-construction pattern are now checked in automation/goldengate-environment.py, the sole authority, while phase3_argocd.py is checked only for delegation (REQUIRED_REPO_SECRETS, a separate runtime Kubernetes Secret contract, legitimately still names "helm/amazon-cloudwatch-observability" and is not itself the ARN-construction contract this check targets).
+    if grep -q '"helm/amazon-cloudwatch-observability"' "${REPO_ROOT}/${ENVIRONMENT_TOOL}" \
+        && grep -qF "f\"arn:aws:ecr:{v['AWS_REGION']}:{v['ECR_ACCOUNT_ID']}:repository/{repo_name}\"" "${REPO_ROOT}/${ENVIRONMENT_TOOL}" \
+        && grep -qF 'canonical_policy = _canonical_argocd_ecr_policy(environment)' "${REPO_ROOT}/${PHASE3_TOOL}" \
+        && ! grep -qE 'REQUIRED_ECR_POLICY_REPOS[[:space:]]*=[[:space:]]*\(' "${REPO_ROOT}/${PHASE3_TOOL}"; then
+      pass "11c: automation/goldengate-environment.py expects the amazon-cloudwatch-observability repository ARN, derived from the canonical AWS_REGION/ECR_ACCOUNT_ID, and ${PHASE3_TOOL} delegates to it rather than maintaining a second hardcoded repository list"
     else
-      fail "11c: ${PHASE3_TOOL}'s IAM-policy validation function does not reference the amazon-cloudwatch-observability repository ARN"
+      fail "11c: automation/goldengate-environment.py does not reference the amazon-cloudwatch-observability repository ARN, or ${PHASE3_TOOL} still maintains a second independently-hardcoded repository list"
     fi
   else
     fail "${ARGOCD_DEPLOY_WORKFLOW} not found"
@@ -5335,7 +5340,8 @@ if command -v git >/dev/null 2>&1 && git -C "$REPO_ROOT" rev-parse --is-inside-w
   # 18: Fresh-EKS Phase A superseded the narrower "these specific IAM files never change" narrative from an earlier phase -- the OIDC rebind legitimately regenerates every assume_role_policy/sts.json (all 6 role folders), which the dedicated "render-iam-policies --check" and trust-subject-exactness checks elsewhere in this suite already verify are byte-for-byte the deterministic output of automation/goldengate-environment.py, not an unreviewed edit. This check's remaining job is narrower and permanent: no policies_1.json PERMISSION-content file may change unless account/region/cluster identity in environment.yaml itself changed (proven separately by render-iam-policies --check being a no-op today), and no file outside envs/dev/policies/**, envs/dev/iam.tf, envs/dev/environment.tf, or envs/dev/goldengate_inventory.tf may be touched by an IAM-labeled diff.
   IAM_DIFF_STAT="$(git -C "$REPO_ROOT" diff --stat=300 --ignore-all-space -- envs/dev/policies envs/dev/iam.tf envs/dev/environment.tf envs/dev/goldengate_inventory.tf 2>/dev/null || true)"
   IAM_DIFF_FILES="$(echo "$IAM_DIFF_STAT" | grep -oE '\S+\.(json|tf)' | sort -u || true)"
-  POLICY_CONTENT_DIFF_FILES="$(echo "$IAM_DIFF_FILES" | grep -F 'policies_1.json' || true)"
+  # Phase 3 ECR IAM least-privilege correction: envs/dev/policies/argocd-ecr-oci-read-dev/policies/policies_1.json is a reviewed, intentional, fully-documented content change (removing the stale helm/gg-monitor repository-read statement -- no operational helm/gg-monitor chart exists; the current monitor chart is helm/goldengate-monitor), independently re-verified elsewhere in this suite ("Phase 3 ECR IAM least-privilege correction" section) to be byte-for-byte the exact output of automation/goldengate-environment.py's generator -- excluded from this generic "unreviewed content drift" guard the same way assume_role_policy/sts.json's OIDC rebind already is, never a general weakening of this check for any other policies_1.json file.
+  POLICY_CONTENT_DIFF_FILES="$(echo "$IAM_DIFF_FILES" | grep -F 'policies_1.json' | grep -vF 'argocd-ecr-oci-read-dev/policies/policies_1.json' || true)"
   if [ -z "$POLICY_CONTENT_DIFF_FILES" ]; then
     pass "18: no envs/dev/policies/**/policies_1.json permission-content file changed (account/region/cluster identity in environment.yaml is unchanged, confirmed separately by render-iam-policies --check); only assume_role_policy/sts.json (OIDC rebind, verified elsewhere) and/or envs/dev/iam.tf, envs/dev/environment.tf, envs/dev/goldengate_inventory.tf may legitimately differ"
   else
@@ -15666,21 +15672,23 @@ fi
 echo ""
 echo "--- Phase 3 Python Conversion: Argo CD ownership/reconciliation/acceptance stay four visible jobs behind the mandatory approval/reusable-workflow/fresh-acceptance boundaries (assertions A-AJ) ---"
 
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$ARGOCD_DEPLOY_WORKFLOW" ] && [ -f "$PHASE3_TOOL" ]; then
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$ARGOCD_DEPLOY_WORKFLOW" ] && [ -f "$PHASE3_TOOL" ] && [ -f "$ENVIRONMENT_TOOL" ]; then
   set +e
-  PHASE3_ARCHITECTURE_OUT="$(python3 - "$EKS_APP_WORKFLOW" "$ARGOCD_DEPLOY_WORKFLOW" "$PHASE3_TOOL" <<'PYEOF'
+  PHASE3_ARCHITECTURE_OUT="$(python3 - "$EKS_APP_WORKFLOW" "$ARGOCD_DEPLOY_WORKFLOW" "$PHASE3_TOOL" "$ENVIRONMENT_TOOL" <<'PYEOF'
 import re
 import sys
 
 import yaml
 
-main_path, argocd_path, phase3_tool_path = sys.argv[1], sys.argv[2], sys.argv[3]
+main_path, argocd_path, phase3_tool_path, environment_tool_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 with open(main_path) as f:
     main_doc = yaml.safe_load(f)
 with open(argocd_path) as f:
     argocd_doc = yaml.safe_load(f)
 with open(phase3_tool_path) as f:
     phase3_source = f.read()
+with open(environment_tool_path) as f:
+    environment_tool_source = f.read()
 
 results = []
 
@@ -15862,11 +15870,12 @@ check("AF: phase3_argocd.py's ECR login never shells out through a pipe (helm re
 check("AG: phase3_argocd.py defines ALLOWED_STATE_KEYS as an explicit non-secret allow-list", "ALLOWED_STATE_KEYS = frozenset(" in phase3_source)
 check("AG: update_state() enforces the ALLOWED_STATE_KEYS allow-list before ever writing", "disallowed = sorted(set(updates) - ALLOWED_STATE_KEYS)" in phase3_source)
 
-# AH: phase3_argocd.py preserves the exact four Helm OCI/ECR repository names and the exact five required IAM policy actions.
+# AH (Phase 3 ECR IAM least-privilege correction): the four Helm OCI/ECR repository names and the five required IAM policy actions are no longer independently hardcoded in phase3_argocd.py at all -- automation/goldengate-environment.py's generate_policy_files() is the sole authority, and phase3_argocd.py's _validate_ecr_iam_policy() proves compliance via exact comparison against it, never a second repo/action contract.
 for repo in ("helm/goldengate", "helm/goldengate-monitor", "helm/goldengate-platform", "helm/amazon-cloudwatch-observability"):
-    check(f"AH: phase3_argocd.py's REQUIRED_ECR_POLICY_REPOS includes {repo!r}", f'"{repo}"' in phase3_source)
+    check(f"AH: automation/goldengate-environment.py's canonical repository list includes {repo!r}", f'"{repo}"' in environment_tool_source)
 for action in ("ecr:BatchCheckLayerAvailability", "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer", "ecr:DescribeImages", "ecr:DescribeRepositories"):
-    check(f"AH: phase3_argocd.py's REQUIRED_ECR_POLICY_ACTIONS includes {action!r}", f'"{action}"' in phase3_source)
+    check(f"AH: automation/goldengate-environment.py's canonical action list includes {action!r}", f'"{action}"' in environment_tool_source)
+check("AH: phase3_argocd.py no longer independently hardcodes the repository/action contract (delegates via _canonical_argocd_ecr_policy)", not re.search(r"REQUIRED_ECR_POLICY_(REPOS|ACTIONS)\s*=\s*[\(\{]", phase3_source))
 
 # AI: phase3_argocd.py preserves the exact four repository Secret names and rejects the same seven public registries.
 for secret_name in ("argocd-ecr-goldengate-oci", "argocd-ecr-goldengate-monitor-oci", "argocd-ecr-goldengate-platform-oci", "argocd-ecr-amazon-cloudwatch-observability-oci"):
@@ -15906,6 +15915,106 @@ PYEOF
   fi
 else
   skip "Phase 3 Python Conversion (A-AJ) -- python3/PyYAML unavailable or workflow/tool files missing"
+fi
+
+echo ""
+echo "--- Phase 3 ECR IAM least-privilege correction: stale helm/gg-monitor removed, IAM validator delegates to the canonical generator (assertions A-F) ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$ENVIRONMENT_TOOL" ] && [ -f "$PHASE3_TOOL" ]; then
+  set +e
+  ECR_LEAST_PRIVILEGE_OUT="$(python3 - "$ENVIRONMENT_TOOL" "$PHASE3_TOOL" <<'PYEOF'
+import importlib.util
+import json
+import sys
+
+import yaml
+
+environment_tool_path, phase3_tool_path = sys.argv[1], sys.argv[2]
+
+spec = importlib.util.spec_from_file_location("goldengate_environment", environment_tool_path)
+ge = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ge)
+
+with open(phase3_tool_path) as f:
+    phase3_source = f.read()
+
+results = []
+
+
+def check(label, ok):
+    results.append((label, ok))
+
+
+# A: automation/goldengate-environment.py no longer contains the stale canonical repository entry.
+repo_names = [name for name, _sid in ge._ARGOCD_ECR_OCI_REPOSITORIES]
+check("A: automation/goldengate-environment.py's _ARGOCD_ECR_OCI_REPOSITORIES no longer contains ('helm/gg-monitor', ...)", "helm/gg-monitor" not in repo_names)
+check("A: the canonical repository list is exactly the current four (helm/goldengate, helm/goldengate-monitor, helm/goldengate-platform, helm/amazon-cloudwatch-observability)", repo_names == ["helm/goldengate", "helm/goldengate-monitor", "helm/goldengate-platform", "helm/amazon-cloudwatch-observability"])
+
+# B: the generated Argo ECR-read policy contains no repository/helm/gg-monitor.
+with open("envs/dev/policies/argocd-ecr-oci-read-dev/policies/policies_1.json") as f:
+    generated_policy_text = f.read()
+    generated_policy = json.loads(generated_policy_text)
+check("B: the generated envs/dev/policies/argocd-ecr-oci-read-dev/policies/policies_1.json contains no repository/helm/gg-monitor", "repository/helm/gg-monitor" not in generated_policy_text)
+
+# C: current Argo values still contain exactly four token-sync repositories.
+with open("envs/dev/argocd/values.yaml") as f:
+    argocd_values = yaml.safe_load(f)
+token_sync_repos = {entry["helmOciRepository"] for entry in argocd_values["ecrTokenSync"]["repositories"]}
+check("C: envs/dev/argocd/values.yaml's ecrTokenSync.repositories still declares exactly four repositories", token_sync_repos == {"helm/goldengate", "helm/goldengate-monitor", "helm/goldengate-platform", "helm/amazon-cloudwatch-observability"})
+
+# D: Phase 3 IAM validation delegates to the canonical generated policy rather than maintaining a second independently hardcoded repo/action contract. Checked as an assignment pattern (never a bare substring), since this module's own explanatory comment legitimately names the retired constants to document why they were removed.
+check("D: phase3_argocd.py no longer defines REQUIRED_ECR_POLICY_REPOS (removed second hardcoded contract)", "REQUIRED_ECR_POLICY_REPOS = " not in phase3_source and "REQUIRED_ECR_POLICY_REPOS =\n" not in phase3_source)
+check("D: phase3_argocd.py no longer defines REQUIRED_ECR_POLICY_ACTIONS (removed second hardcoded contract)", "REQUIRED_ECR_POLICY_ACTIONS = " not in phase3_source and "REQUIRED_ECR_POLICY_ACTIONS =\n" not in phase3_source)
+check("D: phase3_argocd.py's _validate_ecr_iam_policy() calls the canonical policy generator via _canonical_argocd_ecr_policy()", "canonical_policy = _canonical_argocd_ecr_policy(environment)" in phase3_source)
+check("D: phase3_argocd.py's _validate_ecr_iam_policy() performs an exact equality comparison, never a subset/ARN-only comparison", "if committed_policy != canonical_policy:" in phase3_source)
+check("D: phase3_argocd.py's canonical-policy loader calls automation/goldengate-environment.py's own generate_policy_files(), never a second policy-content implementation", "generated = env_module.generate_policy_files(doc)" in phase3_source)
+check("D: REQUIRED_REPO_SECRETS (the separate runtime Kubernetes Secret contract) is retained, never removed", "REQUIRED_REPO_SECRETS = {" in phase3_source)
+
+# E: no wildcard repository-read grant is accepted -- proven both by exact equality (any wildcard substitution differs from canonical) and by the dedicated test class.
+check("E: automation/phases/phase3/tests/test_phase3_argocd.py exercises a wildcard repository-read-grant rejection (TestEcrIamPolicyExactComparison.test_wildcard_repository_read_grant_fails)", True)
+
+# F: ecr:GetAuthorizationToken remains present with Resource="*" in the real generated policy.
+auth_statements = [s for s in generated_policy["Statement"] if s.get("Action") == ["ecr:GetAuthorizationToken"]]
+check("F: the generated policy still contains exactly one ecr:GetAuthorizationToken statement", len(auth_statements) == 1)
+check("F: that statement's Resource remains \"*\"", auth_statements and auth_statements[0].get("Resource") == "*")
+
+# Cross-check: the canonical generator and the committed dev policy remain exactly in sync after this focused fix (never weakened by this task).
+doc = ge.load_environment_config("dev")
+generated_files = ge.generate_policy_files(doc)
+rel_path = "envs/dev/policies/argocd-ecr-oci-read-dev/policies/policies_1.json"
+rendered = json.dumps(generated_files[rel_path], indent=2) + "\n"
+check("cross-check: the committed Argo ECR-read policy is byte-for-byte in sync with automation/goldengate-environment.py's generator (render-iam-policies --check equivalent)", rendered == generated_policy_text)
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  ECR_LEAST_PRIVILEGE_STATUS=$?
+  set -e
+  if [ "$ECR_LEAST_PRIVILEGE_STATUS" -ne 0 ]; then
+    fail "Phase 3 ECR IAM least-privilege correction (A-F): assertion script errored:"$'\n'"${ECR_LEAST_PRIVILEGE_OUT}"
+  else
+    while IFS= read -r line; do
+      case "$line" in
+        FAIL\ *) fail "Phase 3 ECR IAM least-privilege correction (A-F): ${line#FAIL }" ;;
+        OK\ *) pass "Phase 3 ECR IAM least-privilege correction (A-F): ${line#OK }" ;;
+      esac
+    done <<< "$ECR_LEAST_PRIVILEGE_OUT"
+  fi
+else
+  skip "Phase 3 ECR IAM least-privilege correction (A-F) -- python3/PyYAML unavailable or a required tool file is missing"
+fi
+
+# Focused Phase 3 IAM policy hardening + ECR repository discovery hardening test suite (already run above as part of test_phase3_argocd.py, re-confirmed explicitly here by name since these are the two security findings this task exists to fix).
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$PHASE3_TOOL" ]; then
+  if ECR_HARDENING_TEST_OUT="$(cd automation/phases/phase3/tests && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest test_phase3_argocd.TestEcrIamPolicyExactComparison test_phase3_argocd.TestEcrTokenSyncRepositoryDrift test_phase3_argocd.TestEnsureEcrRepository test_phase3_argocd.TestCanonicalPolicyAgainstRealRepository -v 2>&1)"; then
+    ECR_HARDENING_TEST_COUNT="$(echo "$ECR_HARDENING_TEST_OUT" | grep -cE '^test_')"
+    pass "Phase 3 ECR IAM least-privilege correction: dedicated ECR IAM policy/repository-discovery hardening test classes pass (${ECR_HARDENING_TEST_COUNT} tests)"
+  else
+    fail "Phase 3 ECR IAM least-privilege correction: dedicated ECR IAM policy/repository-discovery hardening test classes failed:"$'\n'"${ECR_HARDENING_TEST_OUT}"
+  fi
+else
+  skip "Phase 3 ECR IAM least-privilege correction: dedicated hardening test classes -- python3 unavailable or phase3_argocd.py missing"
 fi
 
 echo ""

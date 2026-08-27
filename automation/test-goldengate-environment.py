@@ -200,6 +200,36 @@ class CurrentDevEnvironmentSemanticEquivalenceTests(unittest.TestCase):
         self.assertEqual(mismatches, [], "the real committed envs/dev policy files must already be in sync with envs/dev/environment.yaml")
 
 
+class ArgoCdEcrOciReadPolicyLeastPrivilegeTests(unittest.TestCase):
+    """helm/gg-monitor was a stale canonical repository entry (no operational helm/gg-monitor chart -- the current monitor chart is helm/goldengate-monitor); this class proves it was actually removed from the canonical generator, never merely from the generated file on disk."""
+
+    def test_canonical_repository_list_is_exactly_the_current_four(self):
+        self.assertEqual(
+            [name for name, _sid in ge._ARGOCD_ECR_OCI_REPOSITORIES],
+            ["helm/goldengate", "helm/goldengate-monitor", "helm/goldengate-platform", "helm/amazon-cloudwatch-observability"],
+        )
+
+    def test_stale_gg_monitor_repository_is_absent_from_the_canonical_generator(self):
+        repo_names = [name for name, _sid in ge._ARGOCD_ECR_OCI_REPOSITORIES]
+        self.assertNotIn("helm/gg-monitor", repo_names)
+
+    def test_generated_argocd_ecr_read_policy_has_exactly_one_authorization_statement_and_four_repository_statements(self):
+        doc = ge.load_environment_config("dev")
+        v = ge.derive_values(doc)
+        policy = ge._argocd_ecr_oci_read_policy(v)
+        self.assertEqual(len(policy["Statement"]), 5)
+        auth_statements = [s for s in policy["Statement"] if s["Action"] == ["ecr:GetAuthorizationToken"]]
+        self.assertEqual(len(auth_statements), 1)
+        self.assertEqual(auth_statements[0]["Resource"], "*")
+
+    def test_get_authorization_token_action_is_never_removed_by_this_correction(self):
+        doc = ge.load_environment_config("dev")
+        v = ge.derive_values(doc)
+        policy = ge._argocd_ecr_oci_read_policy(v)
+        all_actions = {action for stmt in policy["Statement"] for action in (stmt["Action"] if isinstance(stmt["Action"], list) else [stmt["Action"]])}
+        self.assertIn("ecr:GetAuthorizationToken", all_actions)
+
+
 class GithubEnvSerializerSecurityTests(unittest.TestCase):
     """automation/goldengate-environment.py's github-env command is a GitHub Actions special-file producer: format_github_env() is the trust boundary that must fail closed before any value reaches $GITHUB_ENV via a caller's `>> "$GITHUB_ENV"` redirection. Uses fabricated derived-value dicts and a deep-copied synthetic document -- never edits or reads the committed DEV environment.yaml for the attack cases."""
 

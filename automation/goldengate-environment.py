@@ -460,12 +460,11 @@ _ECR_OCI_READ_ACTIONS = [
     "ecr:DescribeRepositories",
 ]
 
-# (repository name, Sid) for every approved Helm OCI repository the argocd-ecr-token-sync CronJob reads -- application constants, never per-environment.
+# (repository name, Sid) for every approved Helm OCI repository the argocd-ecr-token-sync CronJob reads -- application constants, never per-environment. Must stay exactly in sync with envs/<environment>/argocd/values.yaml's ecrTokenSync.repositories[*].helmOciRepository (validated by automation/phases/phase3/phase3_argocd.py's cross-contract drift check) -- helm/gg-monitor was a stale entry (no operational helm/gg-monitor chart; the current monitor chart is helm/goldengate-monitor) and was removed rather than left as unused-but-harmless privilege.
 _ARGOCD_ECR_OCI_REPOSITORIES = [
     ("helm/goldengate", "AllowReadGoldengateHelmOciRepository"),
     ("helm/goldengate-monitor", "AllowReadGoldengateMonitorHelmOciRepository"),
     ("helm/goldengate-platform", "AllowReadGoldengatePlatformHelmOciRepository"),
-    ("helm/gg-monitor", "AllowReadGgMonitorHelmOciRepository"),
     ("helm/amazon-cloudwatch-observability", "AllowReadAmazonCloudWatchObservabilityHelmOciRepository"),
 ]
 

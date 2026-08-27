@@ -30,21 +30,7 @@ HELM_CHART_PATH = "helm/argocd"
 ENVS_ROOT = "envs"
 ARGOCD_RELEASE_NAME = "argocd"
 
-REQUIRED_ECR_POLICY_ACTIONS = frozenset({
-    "ecr:BatchCheckLayerAvailability",
-    "ecr:BatchGetImage",
-    "ecr:GetDownloadUrlForLayer",
-    "ecr:DescribeImages",
-    "ecr:DescribeRepositories",
-})
-
-# All four Helm OCI repositories the Argo CD ECR read IAM policy must grant pull access to -- exact ARN match per repository, never a wildcard.
-REQUIRED_ECR_POLICY_REPOS = (
-    "helm/goldengate",
-    "helm/goldengate-monitor",
-    "helm/goldengate-platform",
-    "helm/amazon-cloudwatch-observability",
-)
+# Deliberately no REQUIRED_ECR_POLICY_ACTIONS/REQUIRED_ECR_POLICY_REPOS here -- a second, independently-hardcoded repository/action contract previously let a stale IAM grant (helm/gg-monitor) pass validation via subset matching. automation/goldengate-environment.py's generate_policy_files() is the sole authority; _validate_ecr_iam_policy() below compares the committed policy against it byte-for-byte.
 
 # Mirrors automation/phases/phase3/argocd_acceptance.py's own REQUIRED_REPO_SECRETS -- intentionally a local copy (this repository's established convention for small literal mappings), never a cross-module import.
 REQUIRED_REPO_SECRETS = {
@@ -240,6 +226,35 @@ def cmd_ensure_deploy_tools(args):
     print("OK: Helm and kubectl are available.")
 
 
+# automation/goldengate-environment.py reuse (never a second independent IAM-policy specification)
+
+_environment_module = None
+
+
+def _load_environment_module():
+    """Lazy import of automation/goldengate-environment.py -- the single canonical environment-config parser/deriver/IAM-policy generator. Never a second independent schema or policy-content implementation."""
+    import importlib.util
+    global _environment_module
+    if _environment_module is None:
+        spec = importlib.util.spec_from_file_location("goldengate_environment", ENVIRONMENT_TOOL)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _environment_module = module
+    return _environment_module
+
+
+def _canonical_argocd_ecr_policy(environment):
+    """Returns the exact canonical Argo CD ECR-read policy dict for `environment`, generated live from environment.yaml via automation/goldengate-environment.py's own generate_policy_files() -- never a second, independently-maintained repo/action contract."""
+    env_module = _load_environment_module()
+    env_module.REPO_ROOT = REPO_ROOT
+    doc = env_module.load_environment_config(environment)
+    generated = env_module.generate_policy_files(doc)
+    rel_path = f"envs/{environment}/policies/argocd-ecr-oci-read-{environment}/policies/policies_1.json"
+    if rel_path not in generated:
+        raise Phase3Error(f"canonical environment generator did not produce {rel_path!r}; automation/goldengate-environment.py's _PERMISSION_POLICY_BUILDERS may have changed.")
+    return generated[rel_path]
+
+
 # argocd_acceptance.py reuse (never a second independent envs/<environment>/argocd/values.yaml parser)
 
 _argocd_acceptance_module = None
@@ -375,39 +390,88 @@ def _validate_required_files(values_file):
     print(f"Required files are present. Helm chart path: {HELM_CHART_PATH}. Environment values: {values_file}")
 
 
+def _describe_policy_mismatch(committed_policy, canonical_policy):
+    """Best-effort human-readable summary of why committed_policy != canonical_policy -- diagnostic only; the actual pass/fail decision is the exact equality check in _validate_ecr_iam_policy(), never a partial/subset comparison of this summary."""
+    details = []
+    if committed_policy.get("Version") != canonical_policy.get("Version"):
+        details.append(f"Version mismatch: committed={committed_policy.get('Version')!r}, canonical={canonical_policy.get('Version')!r}")
+    committed_sids = [stmt.get("Sid") for stmt in committed_policy.get("Statement", [])]
+    canonical_sids = [stmt.get("Sid") for stmt in canonical_policy.get("Statement", [])]
+    extra_sids = sorted(set(committed_sids) - set(canonical_sids))
+    missing_sids = sorted(set(canonical_sids) - set(committed_sids))
+    if extra_sids:
+        details.append(f"unexpected statement Sid(s) present in the committed policy: {extra_sids}")
+    if missing_sids:
+        details.append(f"required statement Sid(s) missing from the committed policy: {missing_sids}")
+    if not extra_sids and not missing_sids and committed_sids == canonical_sids:
+        details.append("statement Sids match, but at least one statement's Effect/Action/Resource content differs")
+    return "; ".join(details) if details else "policies differ in a way not covered by the summary above"
+
+
 def _validate_ecr_iam_policy(environment):
-    region = require_env("AWS_REGION")
-    ecr_account_id = require_env("ECR_ACCOUNT_ID")
+    """Fails closed unless the committed Argo CD ECR-read policy is byte-for-byte (as parsed JSON) identical to the canonical policy automation/goldengate-environment.py's generate_policy_files() would produce right now -- never a subset/ARN-only comparison. This single exact-equality check is what proves GetAuthorizationToken exists with Resource="*", the repository list is exact (no extra grant, no stale grant, no wildcard repository-read grant), every required action is present with no additional privilege action, and every Effect/Sid/Resource matches -- all without maintaining a second, independently-hardcoded repo/action contract in this module."""
     policy_path = REPO_ROOT / "envs" / environment / "policies" / f"argocd-ecr-oci-read-{environment}" / "policies" / "policies_1.json"
     if not policy_path.is_file():
         raise Phase3Error(f"missing IAM policy file: {policy_path}")
     with policy_path.open() as f:
-        policy = json.load(f)
+        committed_policy = json.load(f)
 
-    expected_repos = {name: f"arn:aws:ecr:{region}:{ecr_account_id}:repository/{name}" for name in REQUIRED_ECR_POLICY_REPOS}
-    statements = policy.get("Statement", [])
-    found_arns = set()
-    for stmt in statements:
+    canonical_policy = _canonical_argocd_ecr_policy(environment)
+
+    if committed_policy != canonical_policy:
+        raise Phase3Error(
+            f"{policy_path} does not exactly match the canonical Argo CD ECR-read policy generated live from environment.yaml "
+            f"({_describe_policy_mismatch(committed_policy, canonical_policy)}). Regenerate it with: "
+            f"python3 automation/goldengate-environment.py --environment {environment} render-iam-policies --write"
+        )
+
+    print(f"OK: {policy_path} exactly matches the canonical policy generated by automation/goldengate-environment.py -- no extra/stale/wildcard repository grant, no extra privilege action, GetAuthorizationToken present with Resource=\"*\".")
+
+
+def _canonical_argocd_ecr_repository_names(environment):
+    """Extracts the exact set of repository names granted read access by the canonical Argo CD ECR-read IAM policy, excluding the ecr:GetAuthorizationToken Resource="*" statement (that statement is authentication, not a repository-scoped grant, and is deliberately out of scope for the repository-set comparison below)."""
+    policy = _canonical_argocd_ecr_policy(environment)
+    names = set()
+    for stmt in policy.get("Statement", []):
         resource = stmt.get("Resource")
         resources = resource if isinstance(resource, list) else [resource]
-        actions = stmt.get("Action")
-        actions = set(actions if isinstance(actions, list) else [actions])
         for r in resources:
-            if r in expected_repos.values():
-                found_arns.add(r)
-                if not REQUIRED_ECR_POLICY_ACTIONS.issubset(actions):
-                    missing = REQUIRED_ECR_POLICY_ACTIONS - actions
-                    raise Phase3Error(f"statement for {r} is missing actions: {sorted(missing)}")
-                if r == "*" or r.endswith("/*"):
-                    raise Phase3Error(f"statement for {r} uses a wildcard resource -- must be an exact repository ARN.")
+            if r == "*":
+                continue
+            match = re.match(r"^arn:aws:ecr:[^:]+:[^:]+:repository/(.+)$", r)
+            if match:
+                names.add(match.group(1))
+    return names
 
-    missing_repos = set(expected_repos.values()) - found_arns
-    if missing_repos:
-        raise Phase3Error(f"IAM policy is missing a statement for: {sorted(missing_repos)}")
 
-    for repo, arn in expected_repos.items():
-        print(f"OK: {repo} -> {arn} present with required actions.")
-    print(f"OK: {policy_path} grants exactly the four expected repository ARNs, no wildcards.")
+def _validate_ecr_token_sync_repository_drift(environment):
+    """Cross-contract drift check: Argo CD's ecrTokenSync.repositories (the runtime consumer, read structurally via PyYAML) and the canonical Argo CD ECR-read IAM policy (the access grant) must name exactly the same repository set -- a token-sync repository with no IAM grant would fail closed at runtime, while an IAM-granted repository with no token-sync consumer is unused privilege that should never have been requested."""
+    values_path = REPO_ROOT / "envs" / environment / "argocd" / "values.yaml"
+    if not values_path.is_file():
+        raise Phase3Error(f"missing Argo CD values file: {values_path}")
+    with values_path.open() as f:
+        values_doc = yaml.safe_load(f) or {}
+    token_sync_repos = {
+        entry.get("helmOciRepository")
+        for entry in ((values_doc.get("ecrTokenSync") or {}).get("repositories") or [])
+        if entry.get("helmOciRepository")
+    }
+    if not token_sync_repos:
+        raise Phase3Error(f"{values_path} declares no ecrTokenSync.repositories -- refusing to validate an empty runtime consumer set.")
+
+    iam_repos = _canonical_argocd_ecr_repository_names(environment)
+
+    missing_iam_grant = sorted(token_sync_repos - iam_repos)
+    unused_iam_grant = sorted(iam_repos - token_sync_repos)
+    if missing_iam_grant or unused_iam_grant:
+        problems = []
+        if missing_iam_grant:
+            problems.append(f"ecrTokenSync.repositories entr(y/ies) with no IAM grant: {missing_iam_grant}")
+        if unused_iam_grant:
+            problems.append(f"IAM-granted repositor(y/ies) with no ecrTokenSync.repositories consumer: {unused_iam_grant}")
+        raise Phase3Error(f"{values_path}'s ecrTokenSync.repositories and the canonical Argo CD ECR-read IAM policy have drifted apart -- " + "; ".join(problems))
+
+    print(f"OK: ecrTokenSync.repositories and the canonical ECR-read IAM policy agree on exactly {sorted(token_sync_repos)}.")
 
 
 def _helm_set_string_overrides():
@@ -618,6 +682,7 @@ def cmd_validate_local(args):
     _validate_vendored_dependency()
     _validate_required_files(values_file)
     _validate_ecr_iam_policy(environment)
+    _validate_ecr_token_sync_repository_drift(environment)
     _helm_dependency_build()
     _helm_lint(values_file)
     rendered_path = _helm_template(values_file, namespace)
@@ -638,10 +703,7 @@ def cmd_validate_local(args):
 
 # 20-sub-argocd.yaml: publish chart to private ECR (AWS credentials required)
 
-def _ensure_ecr_repository(repository_name, aws_region):
-    exists = run(["aws", "ecr", "describe-repositories", "--region", aws_region, "--repository-names", repository_name], check=False)
-    if exists.returncode == 0:
-        return
+def _create_ecr_repository(repository_name, aws_region):
     run([
         "aws", "ecr", "create-repository",
         "--region", aws_region,
@@ -655,6 +717,34 @@ def _ensure_ecr_repository(repository_name, aws_region):
         "--image-scanning-configuration", "scanOnPush=true",
         "--image-tag-mutability", "MUTABLE",
     ])
+
+
+def _describe_ecr_repository(repository_name, aws_region):
+    return run(["aws", "ecr", "describe-repositories", "--region", aws_region, "--repository-names", repository_name], check=False)
+
+
+def _ensure_ecr_repository(repository_name, aws_region):
+    """Fail-closed repository-existence classification: an inability to inspect state (AccessDenied/ExpiredToken/throttling/network/unknown error) must never be interpreted as "does not exist" -- only an explicit RepositoryNotFoundException from describe-repositories authorizes create-repository."""
+    exists = _describe_ecr_repository(repository_name, aws_region)
+    if exists.returncode == 0:
+        return
+
+    error_text = (exists.stderr or "") + (exists.stdout or "")
+    if "RepositoryNotFoundException" not in error_text:
+        raise Phase3Error(
+            f"could not determine whether ECR repository {repository_name!r} exists (describe-repositories exited {exists.returncode} without an explicit RepositoryNotFoundException) -- "
+            f"refusing to guess and refusing to create it. Failing closed:\n{error_text.strip() or '(no output)'}"
+        )
+
+    try:
+        _create_ecr_repository(repository_name, aws_region)
+    except Phase3Error as exc:
+        # Race-safe handling: another actor may have created the repository between our describe and our create. RepositoryAlreadyExistsException is the ONLY create failure tolerated here, and only after confirming via a fresh describe-repositories that the repository now genuinely exists -- any other create failure (or a re-describe that still does not succeed) still fails closed.
+        if "RepositoryAlreadyExistsException" not in str(exc):
+            raise
+        recheck = _describe_ecr_repository(repository_name, aws_region)
+        if recheck.returncode != 0:
+            raise Phase3Error(f"ECR repository {repository_name!r} creation raced with another actor (RepositoryAlreadyExistsException), but the required re-describe still did not succeed -- refusing to assume the repository is usable:\n{((recheck.stderr or '') + (recheck.stdout or '')).strip() or '(no output)'}") from exc
 
 
 def cmd_publish_chart(args):
