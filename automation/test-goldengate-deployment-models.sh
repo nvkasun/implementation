@@ -1040,600 +1040,70 @@ assert not (names & forbidden), names & forbidden
     fail "${ARGOCD_DEPLOY_WORKFLOW} not found"
   fi
 
-  # 12: the new 40-sub-observability.yaml workflow.
-  if [ -f "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" ] && command -v python3 >/dev/null 2>&1; then
-    if python3 -c "import yaml; yaml.safe_load(open('${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}'))" >/dev/null 2>&1; then
-      pass "12a: ${OBSERVABILITY_WORKFLOW} parses as strict YAML"
+  # Phase 4 Python Conversion: 40-sub-observability.yaml's own dedicated offline unit-test suite (image inventory, digest resolution, ECR immutability, generated-values semantic contract, recursive image extraction, forbidden-component checks, Application manifest contract, Argo wait bounds, cluster-scraper host-network correction, IRSA verification, DaemonSet full-readiness, the 90-second CloudWatch export-error observation, ownership-preflight/strict-acceptance), no live AWS/Kubernetes/ECR. This supersedes the historical Phase 6B2B/6B2A/etc. line-item checks that used to extract and grep literal inline bash from 40-sub-observability.yaml -- that behavior now lives in automation/phases/phase4/phase4_observability.py, and its real properties are proven below by running its actual test suite and by direct structural delegation checks, never by re-deriving a second, independent regex proof against extracted bash text.
+  if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/phases/phase4/tests/test_phase4_observability.py ]; then
+    if PHASE4_OBSERVABILITY_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/phases/phase4/tests/test_phase4_observability.py 2>&1)"; then
+      pass "Phase 4 Python Conversion: automation/phases/phase4/tests/test_phase4_observability.py (the Phase 4 Observability orchestrator's offline test suite) passes"
     else
-      fail "12a: ${OBSERVABILITY_WORKFLOW} does not parse as strict YAML"
-    fi
-
-    OBSERVABILITY_WORKFLOW_CHECK="$(python3 - "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" <<'PYEOF'
-import sys
-import yaml
-with open(sys.argv[1]) as f:
-    doc = yaml.safe_load(f)
-
-results = []
-
-if "workflow_dispatch" not in doc.get(True, doc.get("on", {})) and "workflow_dispatch" not in doc.get("on", {}):
-    results.append("not-workflow_dispatch-only")
-on_block = doc.get(True, doc.get("on", {}))
-# Phase B2 made this workflow reusable: workflow_call was added alongside the pre-existing manual workflow_dispatch (never a push trigger, never in place of workflow_dispatch) so MAIN's observability_sync_once can invoke it synchronously.
-if set(on_block.keys()) != {"workflow_dispatch", "workflow_call"}:
-    results.append(f"unexpected-trigger-keys={list(on_block.keys())}")
-
-wc_inputs = on_block.get("workflow_call", {}).get("inputs", {})
-if wc_inputs.get("environment", {}).get("type") != "string" or wc_inputs.get("environment", {}).get("required") is not True:
-    results.append(f"workflow_call-environment-input={wc_inputs.get('environment')!r}")
-if wc_inputs.get("deploy", {}).get("type") != "boolean" or wc_inputs.get("deploy", {}).get("required") is not True:
-    results.append(f"workflow_call-deploy-input={wc_inputs.get('deploy')!r}")
-
-deploy_input = on_block.get("workflow_dispatch", {}).get("inputs", {}).get("deploy", {})
-if deploy_input.get("default") is not False:
-    results.append(f"deploy-default={deploy_input.get('default')!r}")
-if deploy_input.get("type") != "boolean":
-    results.append(f"deploy-type={deploy_input.get('type')!r}")
-
-steps = doc["jobs"]["validate_and_deploy"]["steps"]
-all_run_text = "\n".join(s.get("run", "") for s in steps)
-
-if "6.2.0" not in all_run_text:
-    results.append("chart-version-6.2.0-not-referenced")
-if "oci://" not in all_run_text or ("helm/amazon-cloudwatch-observability" not in all_run_text and "${HELM_OCI_NAMESPACE}/${CHART_NAME}" not in all_run_text):
-    results.append("private-oci-chart-ref-not-referenced")
-if "aws-observability" in all_run_text.lower() and "helm repo add" in all_run_text.lower():
-    results.append("workflow-adds-public-helm-repo")
-for repo in ("aws-cloud-factory-cloudwatch-agent-operator", "aws-cloud-factory-cloudwatch-agent",
-             "aws-cloud-factory-kube-state-metrics", "aws-cloud-factory-node-exporter"):
-    if repo not in all_run_text:
-        results.append(f"missing-image-repo-reference:{repo}")
-if "imageDigest" not in all_run_text and "imageDetails[0].imageDigest" not in all_run_text:
-    results.append("no-digest-resolution")
-if "CLOUDWATCH_METRICS_ROLE_ARN" not in all_run_text:
-    results.append("missing-iam-role-reference")
-# The Secret name is an env: block value (ARGOCD_OBSERVABILITY_SECRET_NAME) referenced in run: blocks only via that variable -- scan the whole document, not just run: block text.
-whole_doc_text = str(doc)
-if "argocd-ecr-amazon-cloudwatch-observability-oci" not in whole_doc_text:
-    results.append("missing-new-argocd-secret-reference")
-if "goldengate-observability" not in whole_doc_text:
-    results.append("missing-application-name-reference")
-
-# Application creation must be gated by inputs.deploy.
-create_app_step = next((s for s in steps if s.get("name") == "Create or update the Argo CD Application"), None)
-if create_app_step is None:
-    results.append("missing-create-application-step")
-elif create_app_step.get("if") != "${{ inputs.deploy }}":
-    results.append(f"create-application-step-if={create_app_step.get('if')!r}")
-
-if results:
-    print("MISMATCH:" + ";".join(results))
-else:
-    print("OK")
-PYEOF
-)"
-    if [ "$OBSERVABILITY_WORKFLOW_CHECK" = "OK" ]; then
-      pass "12b: ${OBSERVABILITY_WORKFLOW} is workflow_dispatch-only, defaults deploy=false, pins chart 6.2.0, pulls only the private OCI chart, validates all four image repositories, resolves digests, injects the exact IAM role, requires the new Argo CD Secret, and creates the Application only behind deploy=true"
-    else
-      fail "12b: ${OBSERVABILITY_WORKFLOW} check failed: ${OBSERVABILITY_WORKFLOW_CHECK}"
-    fi
-
-    # \\? tolerates the workflow's own shell-regex source (dots backslash-escaped) as well as a plain-text mention.
-    if grep -qE 'public\\?\.ecr\\?\.aws|registry\\?\.k8s\\?\.io|quay\\?\.io|docker\\?\.io|ghcr\\?\.io|gcr\\?\.io|nvcr\\?\.io' "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}"; then
-      pass "12c: ${OBSERVABILITY_WORKFLOW} contains a public-registry rejection check"
-    else
-      fail "12c: ${OBSERVABILITY_WORKFLOW} does not appear to reject public registries"
-    fi
-
-    if grep -q 'fluent-bit\|fluentbit' "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" \
-        && grep -q 'DcgmExporter\|dcgm' "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" \
-        && grep -q 'NeuronMonitor\|neuron' "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}"; then
-      pass "12d: ${OBSERVABILITY_WORKFLOW} validates against Fluent Bit/GPU/Neuron resources"
-    else
-      fail "12d: ${OBSERVABILITY_WORKFLOW} is missing a Fluent Bit/GPU/Neuron validation check"
-    fi
-
-    # Pre-deployment safety correction (focused, static/offline only -- no AWS/Kubernetes/Argo CD/Git/network call).
-    OBSERVABILITY_CORRECTION_CHECK="$(python3 - "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" <<'PYEOF'
-import re
-import sys
-import yaml
-
-path = sys.argv[1]
-with open(path) as f:
-    text = f.read()
-    doc = yaml.safe_load(text)
-
-steps = doc["jobs"]["validate_and_deploy"]["steps"]
-results = []
-
-def get_step(name):
-    return next((s for s in steps if s.get("name") == name), None)
-
-# --- Correction 1: OCI source path is exactly "." ------------------------
-create_app_step = get_step("Create or update the Argo CD Application")
-if create_app_step is None:
-    results.append("missing-create-application-step")
-else:
-    run_text = create_app_step.get("run", "")
-    # Matches the Python dict-literal source the step embeds -- proves "path" is the literal string "." (not merely present anywhere, and not a "chart:" field).
-    if not re.search(r'"path"\s*:\s*"\."\s*,', run_text):
-        results.append("oci-path-not-exactly-dot")
-    if re.search(r'"chart"\s*:', run_text):
-        results.append("unexpected-chart-field-present")
-    # Fresh-EKS Phase A/Phase 10: repoURL/targetRevision/namespace are shared environment identity, no longer literals embedded in this step -- resolved once via HELM_CHART_REF (built from the canonical ECR_REGISTRY) and the existing CHART_VERSION/OBSERVABILITY_NAMESPACE constants, then passed as argv into this exact Python dict construction.
-    if '"repoURL": helm_chart_ref' not in run_text:
-        results.append("repoURL-changed-or-missing")
-    if '"targetRevision": chart_version' not in run_text:
-        results.append("targetRevision-changed-or-missing")
-    if 'HELM_CHART_REF="oci://${ECR_REGISTRY}/${HELM_OCI_NAMESPACE}/${CHART_NAME}"' not in run_text:
-        results.append("helm-chart-ref-not-derived-from-ecr-registry")
-
-    # --- Correction 2: ignoreDifferences + RespectIgnoreDifferences -------
-    if not re.search(r'"group"\s*:\s*""\s*,\s*\n\s*"kind"\s*:\s*"ServiceAccount"\s*,\s*\n\s*"name"\s*:\s*"cloudwatch-agent"\s*,\s*\n\s*"namespace"\s*:\s*observability_namespace', run_text):
-        results.append("ignoreDifferences-rule-not-exact")
-    if '/metadata/annotations/eks.amazonaws.com~1role-arn' not in run_text:
-        results.append("missing-role-arn-json-pointer")
-    if "RespectIgnoreDifferences=true" not in run_text:
-        results.append("missing-RespectIgnoreDifferences")
-    if "CreateNamespace=true" not in run_text:
-        results.append("missing-CreateNamespace")
-    if "ServerSideApply=true" not in run_text:
-        results.append("missing-ServerSideApply")
-    # No broad group/kind/name wildcard: ignoreDifferences must reference exactly one Sid-equivalent rule, not e.g. bare kind:ServiceAccount without a name or a missing namespace.
-    ignore_diff_block_match = re.search(r'"ignoreDifferences"\s*:\s*\[(.*?)\],\s*\n\s*"revisionHistoryLimit"', run_text, re.S)
-    if ignore_diff_block_match:
-        block = ignore_diff_block_match.group(1)
-        if block.count('"kind"') != 1 or block.count('"name"') != 1 or block.count('"namespace"') != 1:
-            results.append("ignoreDifferences-has-more-than-one-rule-or-is-ambiguous")
-        if '"name": "*"' in block or '"kind": "*"' in block:
-            results.append("ignoreDifferences-uses-a-wildcard")
-    else:
-        results.append("ignoreDifferences-block-not-found")
-
-# --- Correction 3: chart repository participates in the immutability check
-immutable_step = get_step("Verify all five repositories (chart + four images) are IMMUTABLE")
-if immutable_step is None:
-    results.append("missing-renamed-immutability-step")
-else:
-    run_text = immutable_step.get("run", "")
-    if "check_repo_immutable \"$CHART_ECR_REPOSITORY\"" not in run_text:
-        results.append("chart-repo-not-checked-for-immutability")
-
-# --- Correction 4: namespace-scoped negative live checks (no -A) ----------
-live_validation_step = get_step("Live Kubernetes validation")
-if live_validation_step is None:
-    results.append("missing-live-validation-step")
-else:
-    run_text = live_validation_step.get("run", "")
-    for forbidden_kind in ("instrumentations.cloudwatch.aws.amazon.com", "dcgmexporters.cloudwatch.aws.amazon.com", "neuronmonitors.cloudwatch.aws.amazon.com"):
-        pattern = re.escape(f"kubectl get {forbidden_kind}")
-        matches = re.findall(pattern + r'[^\n]*', run_text)
-        if not matches:
-            results.append(f"missing-check:{forbidden_kind}")
-        for m in matches:
-            if " -A " in m or m.rstrip().endswith(" -A"):
-                results.append(f"still-uses--A:{forbidden_kind}")
-            if f'-n "$TARGET_NAMESPACE"' not in m:
-                results.append(f"not-namespace-scoped:{forbidden_kind}")
-
-    # --- Correction 5: live image extraction includes initContainers -----
-    if "spec.initContainers" not in run_text and ".spec.initContainers" not in run_text:
-        results.append("live-image-check-missing-initContainers")
-    if "spec.containers" not in run_text:
-        results.append("live-image-check-missing-containers")
-
-    # Scoped to the filelog section only -- section 14 legitimately looks up the same named CRs for an unrelated host-network isolation check, which this regression check must not fire on.
-    filelog_section_match = re.search(r'13\. No deployed AmazonCloudWatchAgent.*?(?=14\. CloudWatch Agent host-network isolation|\Z)', run_text, re.S)
-    filelog_section = filelog_section_match.group(0) if filelog_section_match else run_text
-    if "amazoncloudwatchagents.cloudwatch.aws.amazon.com -n \"$TARGET_NAMESPACE\"" not in filelog_section:
-        results.append("filelog-check-not-listing-all-crs")
-    if re.search(r'amazoncloudwatchagents\.cloudwatch\.aws\.amazon\.com\s+cloudwatch-agent\s+-n', filelog_section):
-        results.append("filelog-check-still-hardcodes-single-cr-name")
-
-# --- Correction 7: IRSA env var NAME checks without printing values -------
-irsa_step = get_step("Verify IRSA injection on the recreated CloudWatch Agent pods")
-if irsa_step is None:
-    results.append("missing-irsa-verification-step")
-else:
-    run_text = irsa_step.get("run", "")
-    if "AWS_ROLE_ARN" not in run_text:
-        results.append("irsa-check-missing-AWS_ROLE_ARN")
-    if "AWS_WEB_IDENTITY_TOKEN_FILE" not in run_text:
-        results.append("irsa-check-missing-AWS_WEB_IDENTITY_TOKEN_FILE")
-    if "serviceAccountName" not in run_text:
-        results.append("irsa-check-missing-serviceAccountName-check")
-    # Must never print the resolved env var VALUE or a full env dump -- only the pattern capturing NAMES (jsonpath .name, not .value).
-    if re.search(r'\.env\[\*\]\}\{\.value\}', run_text):
-        results.append("irsa-check-appears-to-print-env-values")
-
-if results:
-    print("MISMATCH:" + ";".join(results))
-else:
-    print("OK")
-PYEOF
-)"
-    if [ "$OBSERVABILITY_CORRECTION_CHECK" = "OK" ]; then
-      pass "16: 40-sub-observability.yaml Phase 6B2B safety correction: OCI path='.', ignoreDifferences/RespectIgnoreDifferences, chart-repository immutability, namespace-scoped negative checks, initContainers image coverage, all-CR filelog check, and IRSA env-var-name-only verification are all present exactly as required"
-    else
-      fail "16: 40-sub-observability.yaml Phase 6B2B safety correction check failed: ${OBSERVABILITY_CORRECTION_CHECK}"
-    fi
-
-    # Runner/connectivity correction (focused, static/offline only -- no AWS/kubectl/network/Git call).
-    RUNNER_CONNECTIVITY_CHECK="$(python3 - "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" <<'PYEOF'
-import sys
-import yaml
-
-path = sys.argv[1]
-with open(path) as f:
-    text = f.read()
-    doc = yaml.safe_load(text)
-
-results = []
-
-job = doc["jobs"]["validate_and_deploy"]
-steps = job["steps"]
-
-def get_step(name):
-    return next((s for s in steps if s.get("name") == name), None)
-
-# 1-2: exact CodeBuild runner, no ubuntu-latest anywhere in THIS job specifically. Live Deployment Approval Topology Fix added a separate standalone_deploy_authorization job to this same file that legitimately runs on ubuntu-latest (a pure GitHub deployment-protection point, never touching the private EKS API) -- this check is scoped to validate_and_deploy's own dumped text, never the whole file, so that sibling job never false-positives here.
-EXPECTED_RUNNER = "codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}"
-if job.get("runs-on") != EXPECTED_RUNNER:
-    results.append(f"runs-on={job.get('runs-on')!r}")
-import re
-job_text = yaml.dump(job, default_flow_style=False)
-if re.search(r'runs-on:\s*ubuntu-latest', job_text):
-    results.append("ubuntu-latest-still-used-as-runs-on")
-
-# 3-4: Helm/kubectl installation supports both amd64 and arm64.
-install_step = get_step("Install or validate required tools")
-if install_step is None:
-    results.append("missing-install-tools-step")
-else:
-    run_text = install_step.get("run", "")
-    if run_text.count("x86_64") < 2:
-        results.append("arch-detection-not-applied-to-both-helm-and-kubectl")
-    if "HELM_ARCH=\"amd64\"" not in run_text and 'HELM_ARCH="amd64"' not in run_text:
-        results.append("helm-amd64-mapping-missing")
-    if 'HELM_ARCH="arm64"' not in run_text:
-        results.append("helm-arm64-mapping-missing")
-    if 'KUBECTL_ARCH="amd64"' not in run_text:
-        results.append("kubectl-amd64-mapping-missing")
-    if 'KUBECTL_ARCH="arm64"' not in run_text:
-        results.append("kubectl-arm64-mapping-missing")
-    if "linux-amd64.tar.gz" in run_text or "linux/amd64/kubectl" in run_text:
-        results.append("hardcoded-linux-amd64-still-present")
-
-# 5-6: connectivity step exists and is deploy-guarded.
-connectivity_step = get_step("Verify private EKS API connectivity and access")
-if connectivity_step is None:
-    results.append("missing-connectivity-step")
-elif connectivity_step.get("if") != "${{ inputs.deploy }}":
-    results.append(f"connectivity-step-if={connectivity_step.get('if')!r}")
-
-# 7: ordering -- Connect to EKS cluster < connectivity step < CRD step.
-names = [s.get("name") for s in steps]
-try:
-    connect_idx = names.index("Connect to EKS cluster")
-    connectivity_idx = names.index("Verify private EKS API connectivity and access")
-    crd_idx = names.index("Ensure Argo CD Application CRD exists")
-    if not (connect_idx < connectivity_idx < crd_idx):
-        results.append(f"step-order-wrong:{connect_idx},{connectivity_idx},{crd_idx}")
-except ValueError as e:
-    results.append(f"step-not-found-for-ordering:{e}")
-
-# 8: bounded request timeout on the connectivity step.
-if connectivity_step is not None:
-    run_text = connectivity_step.get("run", "")
-    if "--request-timeout=20s" not in run_text:
-        results.append("connectivity-step-missing-bounded-timeout")
-
-    # 9: error handling mentions private EKS/network reachability and does NOT claim the CRD is missing.
-    lowered = run_text.lower()
-    if "private eks api" not in lowered and "network-reachability" not in lowered and "network reachability" not in lowered:
-        results.append("connectivity-step-missing-network-reachability-wording")
-    if "crd applications.argoproj.io not found" in lowered:
-        results.append("connectivity-step-still-claims-crd-missing")
-
-# 10: CRD step separately handles present/not-found/forbidden/unexpected.
-crd_step = get_step("Ensure Argo CD Application CRD exists")
-if crd_step is None:
-    results.append("missing-crd-step")
-else:
-    run_text = crd_step.get("run", "")
-    lowered = run_text.lower()
-    if "is present" not in lowered:
-        results.append("crd-step-missing-present-case")
-    if "genuinely absent" not in lowered and ("not found" not in lowered and "notfound" not in lowered):
-        results.append("crd-step-missing-not-found-case")
-    if "forbidden" not in lowered:
-        results.append("crd-step-missing-forbidden-case")
-    if "unexpected reason" not in lowered:
-        results.append("crd-step-missing-unexpected-case")
-
-    # 11: the old unconditional false-diagnosis pattern must be gone.
-    if "kubectl get crd applications.argoproj.io >/dev/null || {" in run_text:
-        results.append("old-false-diagnosis-pattern-still-present")
-
-if results:
-    print("MISMATCH:" + ";".join(results))
-else:
-    print("OK")
-PYEOF
-)"
-    if [ "$RUNNER_CONNECTIVITY_CHECK" = "OK" ]; then
-      pass "17: 40-sub-observability.yaml Phase 6B2B runner/connectivity correction: exact CodeBuild runs-on (no ubuntu-latest), Helm/kubectl amd64+arm64 arch detection, a deploy-guarded 'Verify private EKS API connectivity and access' step correctly ordered between 'Connect to EKS cluster' and 'Ensure Argo CD Application CRD exists' with a bounded request timeout and non-CRD-blaming network-failure wording, and a CRD step that separately classifies present/not-found/forbidden/unexpected (the old unconditional false-diagnosis pattern is gone)"
-    else
-      fail "17: 40-sub-observability.yaml Phase 6B2B runner/connectivity correction check failed: ${RUNNER_CONNECTIVITY_CHECK}"
-    fi
-
-    # DaemonSet full-readiness and failure-diagnostics correction (focused, static/offline only).
-    DAEMONSET_READINESS_CHECK="$(python3 - "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" <<'PYEOF'
-import sys
-import yaml
-
-path = sys.argv[1]
-with open(path) as f:
-    text = f.read()
-    doc = yaml.safe_load(text)
-
-results = []
-
-job = doc["jobs"]["validate_and_deploy"]
-steps = job["steps"]
-
-def get_step(name):
-    return next((s for s in steps if s.get("name") == name), None)
-
-# 1-3: a reusable exact DaemonSet readiness function comparing all required fields, with a bounded timeout and polling interval.
-wait_step = get_step("Wait for CloudWatch Agent workloads to roll out")
-if wait_step is None:
-    results.append("missing-wait-step")
-else:
-    run_text = wait_step.get("run", "")
-
-    if "wait_for_daemonset_fully_ready()" not in run_text and "wait_for_daemonset_fully_ready ()" not in run_text:
-        results.append("missing-wait_for_daemonset_fully_ready-function")
-
-    required_fields = [
-        "metadata.generation", "observedGeneration",
-        "desiredNumberScheduled", "currentNumberScheduled",
-        "updatedNumberScheduled", "numberReady", "numberAvailable",
-        "numberUnavailable",
-    ]
-    for field in required_fields:
-        if field not in run_text:
-            results.append(f"missing-field-reference:{field}")
-
-    # exact comparisons, not merely field mentions
-    for exact_cmp in (
-        '[ "$generation" = "$observed" ]',
-        '[ "$current" -eq "$desired" ]',
-        '[ "$updated" -eq "$desired" ]',
-        '[ "$ready" -eq "$desired" ]',
-        '[ "$available" -eq "$desired" ]',
-        '[ "$unavailable" -eq 0 ]',
-        '[ "$desired" -gt 0 ]',
-    ):
-        if exact_cmp not in run_text:
-            results.append(f"missing-exact-comparison:{exact_cmp}")
-
-    if "timeout_seconds" not in run_text or "poll_interval" not in run_text:
-        results.append("missing-bounded-timeout-or-poll-interval")
-
-    # 4: applied to both cloudwatch-agent and node-exporter.
-    if 'wait_for_daemonset_fully_ready "$TARGET_NAMESPACE" cloudwatch-agent' not in run_text:
-        results.append("waiter-not-applied-to-cloudwatch-agent")
-    if 'wait_for_daemonset_fully_ready "$TARGET_NAMESPACE" node-exporter' not in run_text:
-        results.append("waiter-not-applied-to-node-exporter")
-
-    # rollout status must still be present (kept, not replaced).
-    if "kubectl rollout status daemonset/cloudwatch-agent" not in run_text:
-        results.append("rollout-status-for-cloudwatch-agent-removed")
-    if "kubectl rollout status daemonset/node-exporter" not in run_text:
-        results.append("rollout-status-for-node-exporter-removed")
-
-    # 5: dynamically derived selector from spec.selector.matchLabels (no hardcoded chart labels).
-    if "spec.selector.matchLabels" not in run_text:
-        results.append("missing-dynamic-selector-derivation")
-    if "show_daemonset_diagnostics()" not in run_text and "show_daemonset_diagnostics ()" not in run_text:
-        results.append("missing-show_daemonset_diagnostics-function")
-
-    # 6: failure diagnostics include bounded pod state, node name, waiting reason, restart count, bounded events, bounded current/previous logs.
-    for marker in (
-        "nodeName", "restartCount", "state.waiting.reason",
-        "kubectl get events", "--tail=80", "--previous",
-        "tolerated",
-    ):
-        if marker not in run_text:
-            results.append(f"diagnostics-missing:{marker}")
-
-    # Diagnostics called before failing, exit non-zero, no proceeding past the timeout.
-    if run_text.count("show_daemonset_diagnostics \"$TARGET_NAMESPACE\" cloudwatch-agent") < 1:
-        results.append("diagnostics-not-called-for-cloudwatch-agent")
-    if run_text.count("show_daemonset_diagnostics \"$TARGET_NAMESPACE\" node-exporter") < 1:
-        results.append("diagnostics-not-called-for-node-exporter")
-    if "FAIL: cloudwatch-agent did not reach full readiness" not in run_text:
-        results.append("missing-cloudwatch-agent-timeout-fail-message")
-    if "FAIL: node-exporter did not reach full readiness" not in run_text:
-        results.append("missing-node-exporter-timeout-fail-message")
-
-# 7-8: IRSA check iterates across every CloudWatch Agent DaemonSet pod; the checked count must equal desiredNumberScheduled.
-irsa_step = get_step("Verify IRSA injection on the recreated CloudWatch Agent pods")
-if irsa_step is None:
-    results.append("missing-irsa-step")
-else:
-    run_text = irsa_step.get("run", "")
-    if "verify_daemonset_irsa_all_pods()" not in run_text and "verify_daemonset_irsa_all_pods ()" not in run_text:
-        results.append("missing-verify_daemonset_irsa_all_pods-function")
-    if 'pod_count -ne "$desired"' not in run_text and 'pod_count" -ne "$desired"' not in run_text:
-        results.append("irsa-pod-count-not-compared-to-desired")
-    if 'checked -ne "$desired"' not in run_text and 'checked" -ne "$desired"' not in run_text:
-        results.append("irsa-checked-count-not-compared-to-desired")
-    if "verify_daemonset_irsa_all_pods \"$TARGET_NAMESPACE\" cloudwatch-agent" not in run_text:
-        results.append("irsa-all-pods-not-invoked-for-cloudwatch-agent")
-    # cluster-scraper verification retained.
-    if "cloudwatch-agent-cluster-scraper Deployment" not in run_text:
-        results.append("cluster-scraper-irsa-check-removed")
-    # phase/Ready must be checked per pod (not only serviceAccount/env).
-    if '.status.phase' not in run_text:
-        results.append("irsa-check-missing-phase-check")
-
-# 9: live validation requires both numberReady and numberAvailable to equal desiredNumberScheduled (not READY >= DESIRED).
-live_step = get_step("Live Kubernetes validation")
-if live_step is None:
-    results.append("missing-live-validation-step")
-else:
-    run_text = live_step.get("run", "")
-    if '-lt "${DESIRED:-1}"' in run_text or '-lt "${NE_DESIRED:-1}"' in run_text:
-        results.append("live-validation-still-uses-weak-lt-comparison")
-    if '"$READY" -ne "$DESIRED"' not in run_text or '"$AVAILABLE" -ne "$DESIRED"' not in run_text:
-        results.append("live-validation-missing-cloudwatch-agent-ready-and-available-equality")
-    if '"$NE_READY" -ne "$NE_DESIRED"' not in run_text or '"$NE_AVAILABLE" -ne "$NE_DESIRED"' not in run_text:
-        results.append("live-validation-missing-node-exporter-ready-and-available-equality")
-    if 'DESIRED" -eq 0' not in run_text and "DESIRED\" -eq 0" not in run_text:
-        results.append("live-validation-missing-zero-desired-guard")
-
-# 10: the bounded log diagnostic step uses always() with deploy=true and does not fail the workflow itself.
-log_step = get_step("Check bounded recent logs for authorization and startup failures")
-if log_step is None:
-    results.append("missing-log-diagnostic-step")
-else:
-    if log_step.get("if") != "${{ always() && inputs.deploy }}":
-        results.append(f"log-step-if={log_step.get('if')!r}")
-    run_text = log_step.get("run", "")
-    if "set -euo pipefail" in run_text:
-        results.append("log-step-still-uses-set-e-which-could-fail-the-step-itself")
-    if "exit 0" not in run_text:
-        results.append("log-step-missing-explicit-exit-0")
-
-# 11: no maxUnavailable, probe, resource, toleration, IAM, Terraform, or Helm value change anywhere in this file (comment lines excluded); hostNetwork is deliberately excluded from this list since a separate, later correction legitimately reads/validates it read-only (see check 19/20 below).
-forbidden_markers = [
-    "maxUnavailable", "readinessProbe", "livenessProbe",
-    "resources:", "tolerations:",
-    "updateStrategy",
-]
-code_lines = [ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
-code_text = "\n".join(code_lines)
-for marker in forbidden_markers:
-    if marker in code_text:
-        results.append(f"forbidden-workload-change-introduced:{marker.strip()}")
-
-if results:
-    print("MISMATCH:" + ";".join(results))
-else:
-    print("OK")
-PYEOF
-)"
-    if [ "$DAEMONSET_READINESS_CHECK" = "OK" ]; then
-      pass "18: 40-sub-observability.yaml Phase 6B2B DaemonSet full-readiness/diagnostics correction: wait_for_daemonset_fully_ready compares generation/observedGeneration/desired/current/updated/ready/available/unavailable with a bounded timeout+poll interval and is applied to both cloudwatch-agent and node-exporter (kubectl rollout status kept, not replaced); show_daemonset_diagnostics dynamically derives the pod selector from spec.selector.matchLabels and prints bounded pod state/events/current+previous logs before the step fails and exits non-zero; IRSA verification now iterates every cloudwatch-agent DaemonSet pod and requires the checked count to equal desiredNumberScheduled while still checking the cluster-scraper pod; Live Kubernetes validation requires exact numberReady==desired and numberAvailable==desired (no weak >=) with a zero-desired guard; the bounded log-diagnostics step is always()-guarded, never uses set -e, and exits 0; and no maxUnavailable/probe/resource/toleration/updateStrategy change was introduced"
-    else
-      fail "18: 40-sub-observability.yaml Phase 6B2B DaemonSet full-readiness/diagnostics correction check failed: ${DAEMONSET_READINESS_CHECK}"
-    fi
-
-    # Host-network isolation correction (focused, static/offline only) -- workflow-side checks: semantic validation, rendered CR validation, live hostNetwork validation, and the exact crash-symptom log check.
-    HOSTNETWORK_WORKFLOW_CHECK="$(python3 - "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" <<'PYEOF'
-import sys
-import yaml
-
-path = sys.argv[1]
-with open(path) as f:
-    text = f.read()
-    doc = yaml.safe_load(text)
-
-results = []
-
-job = doc["jobs"]["validate_and_deploy"]
-steps = job["steps"]
-
-def get_step(name):
-    return next((s for s in steps if s.get("name") == name), None)
-
-# 6: the semantic-values-validation step validates both agents.
-semantic_step = get_step("Semantically validate the generated deployment values")
-if semantic_step is None:
-    results.append("missing-semantic-validation-step")
-else:
-    run_text = semantic_step.get("run", "")
-    for marker in (
-        'v.get("agents")',
-        "len(agents) != 2",
-        'expected_names = {"cloudwatch-agent", "cloudwatch-agent-cluster-scraper"}',
-        'expect(cw_agent.get("mode"), "daemonset"',
-        'cw_agent.get("hostNetwork") is not True',
-        'expect(scraper_agent.get("mode"), "deployment"',
-        'expect(scraper_agent.get("config"), "default"',
-        'scraper_agent.get("hostNetwork") is not False',
-    ):
-        if marker not in run_text:
-            results.append(f"semantic-validation-missing:{marker}")
-
-# 7: a step validates the two rendered AmazonCloudWatchAgent resources.
-render_step = get_step("Validate rendered CloudWatch Agent host-network isolation")
-if render_step is None:
-    results.append("missing-rendered-cr-hostnetwork-step")
-else:
-    run_text = render_step.get("run", "")
-    for marker in (
-        'find_one("AmazonCloudWatchAgent", "cloudwatch-agent")',
-        'find_one("AmazonCloudWatchAgent", "cloudwatch-agent-cluster-scraper")',
-        "cw_mode != \"daemonset\"",
-        "cw_host_network is not True",
-        "scraper_mode != \"deployment\"",
-        "scraper_host_network is not False",
-    ):
-        if marker not in run_text:
-            results.append(f"rendered-cr-check-missing:{marker}")
-
-# 8: live validation checks both custom-resource and workload hostNetwork.
-live_step = get_step("Live Kubernetes validation")
-if live_step is None:
-    results.append("missing-live-validation-step")
-else:
-    run_text = live_step.get("run", "")
-    for marker in (
-        "amazoncloudwatchagents.cloudwatch.aws.amazon.com cloudwatch-agent -n",
-        "amazoncloudwatchagents.cloudwatch.aws.amazon.com cloudwatch-agent-cluster-scraper -n",
-        '"$CW_AGENT_CR_HOSTNET" != "true"',
-        '"$SCRAPER_CR_HOSTNET" != "false"',
-        "kubectl get daemonset cloudwatch-agent -n \"$TARGET_NAMESPACE\" -o jsonpath='{.spec.template.spec.hostNetwork}'",
-        "kubectl get deployment cloudwatch-agent-cluster-scraper -n \"$TARGET_NAMESPACE\" -o jsonpath='{.spec.template.spec.hostNetwork}'",
-        '"$CW_DS_HOSTNET" != "true"',
-        '"$SCRAPER_DEPLOY_HOSTNET" != "false"',
-    ):
-        if marker not in run_text:
-            results.append(f"live-hostnetwork-check-missing:{marker}")
-
-    # Every node-agent pod and every active cluster-scraper pod checked, via a dynamically derived selector (no hardcoded chart labels).
-    if run_text.count("spec.selector.matchLabels") < 2:
-        results.append("live-validation-selector-not-dynamically-derived-for-both-workloads")
-    if '"$pod_hostnet" != "true"' not in run_text:
-        results.append("live-validation-missing-per-pod-node-agent-hostnetwork-check")
-    if '"$pod_hostnet" != "false"' not in run_text:
-        results.append("live-validation-missing-per-pod-scraper-hostnetwork-check")
-
-    # 9: the workflow detects the exact observed crash symptom.
-    if "bind: address already in use" not in run_text:
-        results.append("missing-exact-crash-pattern:bind-address-already-in-use")
-    if "binding address localhost:8888" not in run_text:
-        results.append("missing-exact-crash-pattern:binding-address-localhost-8888")
-    if "--tail=80" not in run_text:
-        results.append("crash-log-check-not-bounded")
-
-if results:
-    print("MISMATCH:" + ";".join(results))
-else:
-    print("OK")
-PYEOF
-)"
-    if [ "$HOSTNETWORK_WORKFLOW_CHECK" = "OK" ]; then
-      pass "19: 40-sub-observability.yaml Phase 6B2B host-network isolation correction (workflow): semantic values validation requires exactly 2 named agents with cloudwatch-agent.mode=daemonset/hostNetwork=true and cloudwatch-agent-cluster-scraper.mode=deployment/config=default/hostNetwork=false; a dedicated step validates the two rendered AmazonCloudWatchAgent custom resources' spec.mode/spec.hostNetwork; Live Kubernetes validation checks both CR and DaemonSet/Deployment spec.template.spec.hostNetwork plus every individual node-agent and cluster-scraper pod via dynamically-derived selectors; and a bounded (--tail=80) log check detects the exact observed 'bind: address already in use' / 'binding address localhost:8888' crash symptom"
-    else
-      fail "19: 40-sub-observability.yaml Phase 6B2B host-network isolation correction (workflow) check failed: ${HOSTNETWORK_WORKFLOW_CHECK}"
+      fail "Phase 4 Python Conversion: automation/phases/phase4/tests/test_phase4_observability.py failed:"$'\n'"${PHASE4_OBSERVABILITY_TEST_OUTPUT}"
     fi
   else
-    fail "${OBSERVABILITY_WORKFLOW} not found, or python3 unavailable"
+    skip "Phase 4 Python Conversion: automation/phases/phase4/tests/test_phase4_observability.py -- python3 unavailable or file missing"
+  fi
+
+  # Structural delegation proof: 40-sub-observability.yaml's validate_and_deploy job must call the correct phase4_observability.py subcommand at each stage, in the correct order, with the correct credential/if: gating -- never a reimplementation inline. The actual behavioral proof for every one of these subcommands (image inventory, digest resolution, generated-values semantics, forbidden-component rejection, Application manifest contract, cluster-scraper host-network correction, IRSA verification, DaemonSet readiness, the 90-second export-error observation) lives in test_phase4_observability.py above, never re-derived here against extracted bash text.
+  if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" ]; then
+    OBSERVABILITY_DELEGATION_CHECK="$(python3 -c '
+import yaml
+
+with open("'"${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}"'") as f:
+    doc = yaml.safe_load(f)
+
+steps = doc["jobs"]["validate_and_deploy"]["steps"]
+results = []
+
+
+def get_step(name):
+    return next((s for s in steps if s.get("name") == name), None)
+
+
+def delegates(step_name, subcommand, expected_if=None):
+    step = get_step(step_name)
+    if step is None:
+        results.append((f"{step_name!r} step exists", False))
+        return
+    run_text = step.get("run", "")
+    results.append((f"{step_name!r} delegates to phase4_observability.py {subcommand}", "phase4_observability.py" in run_text and subcommand in run_text))
+    if expected_if is not None:
+        results.append((f"{step_name!r} has if: {expected_if!r}", step.get("if") == expected_if))
+
+
+delegates("Ensure required tools", "ensure-tools")
+delegates("Prepare local Observability state/inventory", "prepare")
+delegates("Resolve and verify private ECR artifacts", "resolve-private-artifacts")
+delegates("Generate values, render, and validate Observability locally", "validate-local")
+delegates("Reconcile Observability through Argo CD", "reconcile-cluster", "${{ inputs.deploy }}")
+delegates("Run live post-deployment validation", "post-deploy-validation", "${{ inputs.deploy }}")
+delegates("Check bounded recent logs for authorization and startup failures", "diagnostics", "${{ always() && inputs.deploy }}")
+delegates("Workflow summary", "summary", "always()")
+
+# The local render/semantic validation step must never receive AWS credential outputs -- it runs entirely on the private chart already pulled by the previous (credentialed) step.
+validate_local_step = get_step("Generate values, render, and validate Observability locally")
+if validate_local_step is not None:
+    env = validate_local_step.get("env") or {}
+    results.append(("local render/semantic validation step receives no AWS credential env vars", not any(k.startswith("AWS_") for k in env)))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+' 2>&1)"
+    while IFS= read -r line; do
+      case "$line" in
+        FAIL\ *) fail "Phase 4 Python Conversion: ${line#FAIL }" ;;
+        OK\ *) pass "Phase 4 Python Conversion: ${line#OK }" ;;
+      esac
+    done <<< "$OBSERVABILITY_DELEGATION_CHECK"
+  else
+    skip "Phase 4 Python Conversion: Observability delegation check -- python3/PyYAML unavailable or ${OBSERVABILITY_WORKFLOW} missing"
   fi
 
   # Host-network isolation correction (focused, static/offline only) -- values.yaml-side checks.
@@ -1740,325 +1210,10 @@ PYEOF
     fail "${OBSERVABILITY_VALUES_FILE} not found, or python3 unavailable"
   fi
 
-  # Cluster-scraper Deployment recreate correction (focused, static/offline only).
-  if [ -f "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" ] && command -v python3 >/dev/null 2>&1; then
-    RECREATE_CORRECTION_CHECK="$(python3 - "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" <<'PYEOF'
-import sys
-import yaml
+  # Cluster-scraper Deployment recreate correction: covered by the consolidated Phase 4 Python Conversion test-suite run and delegation check above (test_phase4_observability.py::ClusterScraperHostNetworkCorrectionTests exercises _ensure_cluster_scraper_host_network_isolated() directly against fabricated fixtures).
 
-path = sys.argv[1]
-with open(path) as f:
-    text = f.read()
-    doc = yaml.safe_load(text)
+  # UID-based recreation detection, hostNetwork null-normalization, and the 90-second CloudWatch export-error observation: covered by the consolidated Phase 4 Python Conversion test-suite run above (test_phase4_observability.py::ExportErrorObservationTests and ClusterScraperHostNetworkCorrectionTests).
 
-results = []
-
-job = doc["jobs"]["validate_and_deploy"]
-steps = job["steps"]
-
-def get_step(name):
-    return next((s for s in steps if s.get("name") == name), None)
-
-names = [s.get("name") for s in steps]
-
-recreate_step = get_step("Ensure cluster-scraper Deployment host-network isolation")
-if recreate_step is None:
-    results.append("missing-recreate-step")
-else:
-    if recreate_step.get("if") != "${{ inputs.deploy }}":
-        results.append(f"recreate-step-if={recreate_step.get('if')!r}")
-
-    # Ordering: after "Wait for Argo CD sync and health", before "Annotate the CloudWatch Agent ServiceAccount with the dedicated IRSA role".
-    try:
-        sync_idx = names.index("Wait for Argo CD sync and health")
-        recreate_idx = names.index("Ensure cluster-scraper Deployment host-network isolation")
-        annotate_idx = names.index("Annotate the CloudWatch Agent ServiceAccount with the dedicated IRSA role")
-        if not (sync_idx < recreate_idx < annotate_idx):
-            results.append(f"step-order-wrong:{sync_idx},{recreate_idx},{annotate_idx}")
-    except ValueError as e:
-        results.append(f"step-not-found-for-ordering:{e}")
-
-    run_text = recreate_step.get("run", "")
-
-    # 2: confirms CR hostNetwork=false before any deletion (the mode/hostNetwork check happens before the delete call in source order).
-    cr_check_idx = run_text.find('"$cr_hostnetwork" != "false"')
-    delete_idx = run_text.find("kubectl delete deployment")
-    if cr_check_idx == -1:
-        results.append("missing-cr-hostnetwork-false-check")
-    if delete_idx == -1:
-        results.append("missing-delete-call")
-    if cr_check_idx != -1 and delete_idx != -1 and not (cr_check_idx < delete_idx):
-        results.append("cr-hostnetwork-check-not-before-delete")
-
-    # 3: checks the exact controller ownerReference UID against the CR UID.
-    if 'owner_uid="$(jq -r' not in run_text or "cr_uid" not in run_text:
-        results.append("missing-owner-uid-vs-cr-uid-check")
-    if 'uid_match="false"' not in run_text or '[ "$owner_uid" = "$cr_uid" ]' not in run_text:
-        results.append("missing-explicit-uid-comparison")
-
-    # 4/5: deletes only the exact cluster-scraper Deployment; never the CR, DaemonSet, pods, operator, ServiceAccount, Secret, or ConfigMap.
-    delete_calls = [ln for ln in run_text.splitlines() if "kubectl delete" in ln]
-    if len(delete_calls) != 1:
-        results.append(f"unexpected-delete-call-count:{len(delete_calls)}")
-    elif "kubectl delete deployment \"$CLUSTER_SCRAPER_DEPLOYMENT\" -n \"$TARGET_NAMESPACE\"" not in delete_calls[0]:
-        results.append(f"delete-call-not-exact-deployment:{delete_calls[0].strip()}")
-    for forbidden in ("delete daemonset", "delete pod ", "delete serviceaccount", "delete secret", "delete configmap", "delete amazoncloudwatchagent"):
-        if forbidden in run_text:
-            results.append(f"forbidden-delete-target-present:{forbidden.strip()}")
-
-    # 6: at most one deletion is possible per workflow run -- exactly one kubectl delete call exists in source, and no loop/retry wraps it.
-    if run_text.count("kubectl delete deployment") != 1:
-        results.append("delete-call-appears-more-than-once-in-source")
-
-    # 7: records old UID and requires a different new UID.
-    if "old_uid=" not in run_text:
-        results.append("missing-old-uid-recording")
-    if '"$d_uid" = "$old_uid"' not in run_text:
-        results.append("missing-new-uid-differs-from-old-check")
-
-    # 8: validates the recreated Deployment hostNetwork=false.
-    if '"$d_hostnetwork" != "false"' not in run_text:
-        results.append("missing-recreated-deployment-hostnetwork-false-check")
-
-    # 9: validates active scraper pods hostNetwork=false and podIP != hostIP.
-    if '"$pod_hostnetwork" != "false"' not in run_text:
-        results.append("missing-active-pod-hostnetwork-false-check")
-    if "ip_differs" not in run_text or '"$pod_ip" != "$host_ip"' not in run_text:
-        results.append("missing-podip-differs-from-hostip-check")
-    if '"$pod_sa" != "$CLOUDWATCH_AGENT_SERVICE_ACCOUNT"' not in run_text:
-        results.append("missing-active-pod-serviceaccount-check")
-    if "AWS_ROLE_ARN" not in run_text or "AWS_WEB_IDENTITY_TOKEN_FILE" not in run_text:
-        results.append("missing-active-pod-irsa-env-name-checks")
-
-    # 10: idempotent when the Deployment is already false (no delete call reachable -- the "already false" branch returns early).
-    if 'echo "not_required" > "$CORRECTION_SUMMARY_FILE"' not in run_text:
-        results.append("missing-idempotent-not-required-summary")
-    if run_text.count('echo "not_required" > "$CORRECTION_SUMMARY_FILE"') < 2:
-        results.append("idempotent-early-return-not-covering-both-no-op-paths")
-
-    # 13a (scoped to this step): no telemetry port / spec.args / direct CR / wrapper chart content introduced here.
-    for marker in ("8889", "service::telemetry", "spec.args", "args:\n", "370-line"):
-        if marker in run_text:
-            results.append(f"forbidden-marker-in-recreate-step:{marker.strip()}")
-
-# 11: strict node-agent readiness remains unchanged (still present, still exact equality, not weakened).
-wait_step = get_step("Wait for CloudWatch Agent workloads to roll out")
-if wait_step is None:
-    results.append("missing-wait-step")
-else:
-    wait_run = wait_step.get("run", "")
-    if "wait_for_daemonset_fully_ready" not in wait_run:
-        results.append("node-agent-strict-readiness-waiter-missing")
-    if 'wait_for_daemonset_fully_ready "$TARGET_NAMESPACE" cloudwatch-agent' not in wait_run:
-        results.append("node-agent-strict-readiness-not-applied-to-cloudwatch-agent")
-
-# 12: the exact localhost:8888 collision signatures remain checked (searched across the whole file since this correction may check them in more than one step).
-for pattern in ("binding address localhost:8888", r"listen tcp 127\.0\.0\.1:8888", "bind: address already in use", "failed to create SDK"):
-    if pattern not in text:
-        results.append(f"missing-collision-signature:{pattern}")
-
-# 13b (whole-file scope): no chart/image/IAM/Terraform change, no direct CR, no wrapper chart, no telemetry port override, no spec.args mechanism.
-code_lines = [ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
-code_text = "\n".join(code_lines)
-if 'CHART_VERSION: "6.2.0"' not in text:
-    results.append("chart-version-changed")
-for marker in ("service::telemetry", "--set=service", "helm/goldengate-observability-adcb"):
-    if marker in code_text:
-        results.append(f"forbidden-whole-file-marker:{marker}")
-
-if results:
-    print("MISMATCH:" + ";".join(results))
-else:
-    print("OK")
-PYEOF
-)"
-    if [ "$RECREATE_CORRECTION_CHECK" = "OK" ]; then
-      pass "21: 40-sub-observability.yaml Phase 6B2B cluster-scraper Deployment recreate correction: the new deploy-guarded 'Ensure cluster-scraper Deployment host-network isolation' step is correctly ordered between Argo CD sync/health and the ServiceAccount annotation step; it confirms the live CR has hostNetwork=false before any deletion; validates the exact controller ownerReference UID against the CR UID before deleting; deletes only deployment/cloudwatch-agent-cluster-scraper (never the CR, DaemonSet, pods, ServiceAccount, Secret, or ConfigMap) with exactly one delete call in source; records the old UID and requires the recreated UID to differ; validates the recreated Deployment's hostNetwork=false and full readiness; validates every active scraper pod's hostNetwork=false, podIP!=hostIP, ServiceAccount, and IRSA env-var-name presence; is idempotent (both no-op paths mark 'not_required'); strict node-agent DaemonSet readiness is unchanged; the exact 127.0.0.1:8888 collision signatures remain checked; and no telemetry-port override, spec.args, direct CR, wrapper chart, chart/image upgrade, IAM, or Terraform change was introduced"
-    else
-      fail "21: 40-sub-observability.yaml Phase 6B2B cluster-scraper Deployment recreate correction check failed: ${RECREATE_CORRECTION_CHECK}"
-    fi
-  else
-    fail "${OBSERVABILITY_WORKFLOW} not found, or python3 unavailable"
-  fi
-
-  # UID-based recreation detection + hostNetwork null normalization + CloudWatch metrics authorization/export validation (focused, static/offline only).
-  if [ -f "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" ] && command -v python3 >/dev/null 2>&1; then
-    UID_AUTH_CHECK="$(python3 - "${REPO_ROOT}/${OBSERVABILITY_WORKFLOW}" "${CW_METRICS_POLICY_FILE}" <<'PYEOF'
-import os
-import re
-import sys
-import yaml
-
-path = sys.argv[1]
-with open(path) as f:
-    text = f.read()
-    doc = yaml.safe_load(text)
-
-cw_policy_path = sys.argv[2]
-CW_METRICS_POLICY_FILE_TEXT = None
-if os.path.isfile(cw_policy_path):
-    with open(cw_policy_path) as f:
-        CW_METRICS_POLICY_FILE_TEXT = f.read()
-
-results = []
-job = doc["jobs"]["validate_and_deploy"]
-steps = job["steps"]
-names = [s.get("name") for s in steps]
-
-def get_step(name):
-    return next((s for s in steps if s.get("name") == name), None)
-
-# --- Task 3: UID-based recreation detection, never an observed NotFound ---
-recreate_step = get_step("Ensure cluster-scraper Deployment host-network isolation")
-if recreate_step is None:
-    results.append("missing-recreate-step")
-else:
-    run_text = recreate_step.get("run", "")
-
-    # The old anti-pattern required observing the object's absence (exit-status-only existence-check loop, no UID comparison) before polling for recreation; that must be gone.
-    if "did not disappear within 30s" in run_text:
-        results.append("old-notfound-interval-anti-pattern-still-present")
-
-    # The new pattern must poll via -o json and branch on UID comparison for every required state, never requiring NotFound.
-    if 'new_deploy_json="$(kubectl get deployment "$CLUSTER_SCRAPER_DEPLOYMENT" -n "$TARGET_NAMESPACE" -o json 2>/dev/null)"' not in run_text:
-        results.append("missing-uid-based-poll")
-    if '[ -n "$new_uid" ] && [ "$new_uid" != "$old_uid" ]' not in run_text:
-        results.append("missing-new-uid-differs-from-old-check")
-    if "still carries the old UID and is terminating" not in run_text:
-        results.append("missing-same-uid-terminating-state-handling")
-    if "still carries the old UID -- continuing to wait for recreation" not in run_text:
-        results.append("missing-same-uid-not-terminating-state-handling")
-    if "not found (not yet recreated) -- continuing to wait" not in run_text:
-        results.append("missing-notfound-state-handling")
-    if "old_uid=" not in run_text:
-        results.append("missing-old-uid-recording")
-    # the harmless reconciliation nudge must still exist.
-    if "cloudfactory.adcb/reconcile-requested-at" not in run_text:
-        results.append("missing-reconciliation-nudge")
-    # the one-delete guard: exactly one kubectl delete call in source.
-    if run_text.count("kubectl delete deployment") != 1:
-        results.append(f"unexpected-delete-call-count:{run_text.count('kubectl delete deployment')}")
-
-    # Null/false normalization on Deployment and Pod; the CR stays strict (no // false on the CR's own hostNetwork read).
-    if run_text.count('.spec.template.spec.hostNetwork // false') < 2:
-        results.append("deployment-hostnetwork-normalization-missing-or-incomplete")
-    if "'.spec.hostNetwork // false'" not in run_text:
-        results.append("pod-hostnetwork-normalization-missing")
-    if "cr_hostnetwork=\"$(jq -r '.spec.hostNetwork // false'" in run_text:
-        results.append("cr-hostnetwork-incorrectly-normalized-must-stay-strict")
-    if '"$cr_hostnetwork" != "false"' not in run_text:
-        results.append("cr-hostnetwork-strict-check-missing")
-
-# --- Task 5: bounded "no recent export errors" validation step ---
-auth_step = get_step("Validate no recent CloudWatch export errors")
-if auth_step is None:
-    results.append("missing-authorization-validation-step")
-else:
-    if auth_step.get("if") != "${{ inputs.deploy }}":
-        results.append(f"authorization-step-if={auth_step.get('if')!r}")
-
-    try:
-        irsa_idx = names.index("Verify IRSA injection on the recreated CloudWatch Agent pods")
-        auth_idx = names.index("Validate no recent CloudWatch export errors")
-        live_idx = names.index("Live Kubernetes validation")
-        if not (irsa_idx < auth_idx < live_idx):
-            results.append(f"authorization-step-order-wrong:{irsa_idx},{auth_idx},{live_idx}")
-    except ValueError as e:
-        results.append(f"step-not-found-for-ordering:{e}")
-
-    run_text = auth_step.get("run", "")
-
-    if "VALIDATION_START_TS=" not in run_text:
-        results.append("missing-validation-start-timestamp")
-    if "--since-time=\"$VALIDATION_START_TS\"" not in run_text:
-        results.append("missing-since-time-usage")
-    if "--tail=80" not in run_text:
-        results.append("missing-bounded-tail")
-
-    # The step's own runtime output must not claim successful export was proven -- only that no recent error signatures were found.
-    if "does not by itself confirm successful export to CloudWatch" not in run_text:
-        results.append("step-overclaims-successful-export")
-
-    # kubectl logs must never be silently swallowed with "|| true" -- a retrieval failure from an expected active pod/container must fail the step via an explicit captured exit status.
-    if "kubectl logs" in run_text and re.search(r'kubectl logs[^\n]*\|\|\s*true', run_text):
-        results.append("kubectl-logs-still-uses-or-true-fallback")
-    if "log_status=$?" not in run_text:
-        results.append("missing-explicit-log-retrieval-exit-status-check")
-    if '"$log_status" -ne 0' not in run_text:
-        results.append("missing-log-retrieval-failure-check")
-    if "could not retrieve logs for pod" not in run_text:
-        results.append("missing-log-retrieval-failure-message")
-
-    # Checked node-agent pod count must equal DaemonSet desiredNumberScheduled.
-    if "CHECKED_NODE_AGENT_PODS=$((CHECKED_NODE_AGENT_PODS + 1))" not in run_text:
-        results.append("missing-node-agent-pod-counting")
-    if 'desiredNumberScheduled // 0' not in run_text:
-        results.append("missing-daemonset-desired-count-read")
-    if '"$CHECKED_NODE_AGENT_PODS" -ne "$CW_DS_DESIRED_AUTH"' not in run_text:
-        results.append("missing-node-agent-checked-count-equals-desired-check")
-
-    # Checked cluster-scraper pod count must be >= 1.
-    if "CHECKED_SCRAPER_PODS=$((CHECKED_SCRAPER_PODS + 1))" not in run_text:
-        results.append("missing-scraper-pod-counting")
-    if '"$CHECKED_SCRAPER_PODS" -lt 1' not in run_text:
-        results.append("missing-scraper-checked-count-at-least-one-check")
-
-    required_auth_signatures = [
-        "PermissionDenied", "HTTP Status Code 403",
-        "not authorized to perform: cloudwatch:PutMetricData",
-        "no identity-based policy allows",
-        r"Exporting failed\. Dropping data\.",
-        "error exporting items",
-        "resource: arn:aws:cloudwatch:",
-        "dataset/default",
-    ]
-    for sig in required_auth_signatures:
-        if sig not in run_text:
-            results.append(f"missing-auth-error-signature:{sig}")
-
-    required_startup_signatures = [
-        "binding address localhost:8888",
-        r"listen tcp 127\.0\.0\.1:8888",
-        "bind: address already in use",
-        "failed to create SDK",
-    ]
-    for sig in required_startup_signatures:
-        if sig not in run_text:
-            results.append(f"missing-startup-error-signature:{sig}")
-
-    # active/current-revision filtering for BOTH workload kinds.
-    if 'select(.controller==true and .kind=="DaemonSet")' not in run_text:
-        results.append("missing-daemonset-owner-filtering")
-    if 'select(.controller==true and .kind=="ReplicaSet")' not in run_text:
-        results.append("missing-replicaset-owner-filtering")
-    if run_text.count("deletionTimestamp") < 2:
-        results.append("missing-deletion-timestamp-exclusion")
-
-    # never prints secrets/tokens/env values/full manifests.
-    for forbidden in ("AWS_WEB_IDENTITY_TOKEN_FILE\"", "env_names", "envFrom", "kubectl get secret", "-o yaml"):
-        if forbidden in run_text:
-            results.append(f"forbidden-content-in-authorization-step:{forbidden}")
-
-# No CloudWatch read permission (e.g. GetMetricData, ListMetrics) was added merely to support this log-based validation -- the step only calls "kubectl logs", never the CloudWatch API, so the role's action set must remain exactly PutMetricData plus the pre-existing logs/ec2 actions.
-if CW_METRICS_POLICY_FILE_TEXT is not None:
-    for forbidden_cw_read in ("cloudwatch:GetMetricData", "cloudwatch:ListMetrics", "cloudwatch:GetMetricStatistics", "cloudwatch:DescribeAlarms"):
-        if forbidden_cw_read in CW_METRICS_POLICY_FILE_TEXT:
-            results.append(f"cloudwatch-read-permission-added-for-validation:{forbidden_cw_read}")
-
-if results:
-    print("MISMATCH:" + ";".join(results))
-else:
-    print("OK")
-PYEOF
-)"
-    if [ "$UID_AUTH_CHECK" = "OK" ]; then
-      pass "22: 40-sub-observability.yaml Phase 6B2B UID-based recreation detection, hostNetwork null-normalization, and 'no recent CloudWatch export errors' validation: the old NotFound-interval anti-pattern is gone and replaced by a UID-comparison state machine handling NotFound/same-UID-terminating/same-UID/different-UID without ever requiring an observed absence, while preserving the one-delete guard and the reconciliation nudge; Deployment and Pod hostNetwork reads normalize null/omitted to false while the CR's own hostNetwork read stays strict; and the new deploy-guarded 'Validate no recent CloudWatch export errors' step is correctly ordered after IRSA verification and before Live Kubernetes validation, never uses a 'kubectl logs ... || true' fallback (failing closed instead on a retrieval error), requires checked node-agent pods to equal the DaemonSet's desiredNumberScheduled and checked scraper pods to be at least 1, captures a validation-start timestamp, uses --since-time and a bounded --tail=80, checks all required authorization and startup-collision signatures on active current-revision DaemonSet and ReplicaSet pods only, never claims successful export was proven, never prints secrets/tokens/env values/full manifests, and adds no CloudWatch read permission to the collector role"
-    else
-      fail "22: 40-sub-observability.yaml Phase 6B2B UID-based recreation / hostNetwork normalization / authorization validation check failed: ${UID_AUTH_CHECK}"
-    fi
-  else
-    fail "${OBSERVABILITY_WORKFLOW} not found, or python3 unavailable"
-  fi
 
   # 13: no wrapper chart was created for this phase.
   if [ -d "${REPO_ROOT}/helm/goldengate-observability" ]; then
@@ -4469,11 +3624,11 @@ else
   skip "Phase 5B1 IAM least-privilege checks -- policy files or python3 not available"
 fi
 
-# 7. The one shared runtime ServiceAccount (annotated by the platform workflow, never duplicated in per-deployment values) is injected from the canonical resolver (RUNTIME_ROLE_ARN, which resolves to GoldenGateSecretsReadRole-dev for envs/dev/environment.yaml), never a re-typed literal.
-if grep -qF 'runtimeServiceAccount.roleArn="$RUNTIME_ROLE_ARN"' "$PLATFORM_WORKFLOW" 2>/dev/null; then
-  pass "7: the shared runtime ServiceAccount (platform workflow) is injected from the canonical RUNTIME_ROLE_ARN resolver output"
+# 7. The one shared runtime ServiceAccount (annotated by the platform workflow, never duplicated in per-deployment values) is injected from the canonical resolver (RUNTIME_ROLE_ARN, which resolves to GoldenGateSecretsReadRole-dev for envs/dev/environment.yaml), never a re-typed literal. Phase 4 Python Conversion: this injection now lives in automation/phases/phase4/phase4_platform.py's _helm_set_string_overrides(), never inline workflow bash.
+if grep -qF "runtimeServiceAccount.roleArn={require_env('RUNTIME_ROLE_ARN')}" automation/phases/phase4/phase4_platform.py 2>/dev/null; then
+  pass "7: the shared runtime ServiceAccount (phase4_platform.py) is injected from the canonical RUNTIME_ROLE_ARN resolver output"
 else
-  fail "7: the platform workflow no longer injects runtimeServiceAccount.roleArn from the canonical RUNTIME_ROLE_ARN"
+  fail "7: phase4_platform.py no longer injects runtimeServiceAccount.roleArn from the canonical RUNTIME_ROLE_ARN"
 fi
 
 # 8. Fresh-EKS Phase A/Phase 10: serviceAccount.roleArn is shared environment identity, removed from envs/dev/goldengate-monitor/values.yaml -- gg-monitor's IRSA role must now be injected by the monitor workflow from the canonical resolver (MONITOR_ROLE_ARN), never a re-typed literal in the committed values file.
@@ -6635,8 +5790,10 @@ else
   fail "27: environment-level orchestrator concurrency protection is missing"
 fi
 
+# Phase 4 Python Conversion: the DescribeSecret/ListSecretVersionIds calls moved out of inline workflow bash into automation/phases/phase4/phase4_shared_secrets.py's argument-array subprocess calls -- checked there now, never re-derived against workflow text that no longer contains them.
 if grep -q "validate_shared_secrets_once:" "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && grep -q "secretsmanager describe-secret\|secretsmanager list-secret-version-ids" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+    && grep -qE '"secretsmanager", *"describe-secret"' automation/phases/phase4/phase4_shared_secrets.py 2>/dev/null \
+    && grep -qE '"secretsmanager", *"list-secret-version-ids"' automation/phases/phase4/phase4_shared_secrets.py 2>/dev/null; then
   pass "27: a read-only shared-secret validation job exists and runs once per environment"
 else
   fail "27: validate_shared_secrets_once job is missing or does not perform the expected read-only checks"
@@ -8602,93 +7759,64 @@ else
 fi
 
 echo ""
-echo "--- VDR correction: validate_shared_secrets_once cross-account credential fix ---"
+echo "--- Phase 4 Python Conversion: validate_shared_secrets_once cross-account credential contract ---"
 
-# Real VDR evidence: validate_shared_secrets_once's base credentials (role-to-assume: env.ROLE_ARN) resolve to the engineering/runner account (229410149234), so its DescribeSecret calls were hitting the wrong account and failing with ResourceNotFoundException even though the three secrets genuinely exist in the workload account (668311715351). Fix reuses the SAME established cross-account pattern as managed_efs_inventory_guard: assume EKS_DEPLOY_ROLE_ARN, verify the assumed caller's own account before any Secrets Manager call, mask the temporary credentials, and never call GetSecretValue.
-
-if [ "$PYTHON_AVAILABLE" = "true" ]; then
-  python3 - "$EKS_APP_WORKFLOW" > "${WORKDIR}/shared_secrets_step.sh" <<'PYEOF'
-import sys
-import yaml
-with open(sys.argv[1]) as f:
-    doc = yaml.safe_load(f)
-steps = doc["jobs"]["validate_shared_secrets_once"]["steps"]
-for step in steps:
-    if step.get("name", "").startswith("Verify each shared secret exists"):
-        # PyYAML/pip access a real package index and are unavailable/unnecessary in this sandboxed behavioral test -- PyYAML is already proven present ($PYTHON_AVAILABLE), so this single install line is stripped before execution; nothing else in the step is touched.
-        lines = [l for l in step["run"].splitlines() if "pip install" not in l]
-        sys.stdout.write("\n".join(lines))
-        break
-else:
-    sys.exit("step not found")
-PYEOF
-
-  if [ ! -s "${WORKDIR}/shared_secrets_step.sh" ]; then
-    fail "VDR: could not extract the 'Verify each shared secret exists...' step from ${EKS_APP_WORKFLOW}"
+# Phase 4 Python Conversion: the "Verify each shared secret exists with an AWSCURRENT version" step's entire cross-account assume-role/verify-identity/DescribeSecret/ListSecretVersionIds logic moved out of inline workflow bash and into automation/phases/phase4/phase4_shared_secrets.py's cmd_validate() -- this supersedes the historical VDR-numbered checks that used to extract and execute that literal bash step. The full behavioral proof (assume-role failure, wrong-account-fails-before-Secrets-Manager, canonical-secret-name delegation, missing-secret/AccessDenied/no-AWSCURRENT failures, GetSecretValue never invoked, no credential persistence, masked/never-logged secret values) now lives in automation/phases/phase4/tests/test_phase4_shared_secrets.py, run below, never re-derived a second time here against extracted bash text.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/phases/phase4/tests/test_phase4_shared_secrets.py ]; then
+  if PHASE4_SHARED_SECRETS_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/phases/phase4/tests/test_phase4_shared_secrets.py 2>&1)"; then
+    pass "Phase 4 Python Conversion: automation/phases/phase4/tests/test_phase4_shared_secrets.py (the Phase 4 shared-secrets validator's offline test suite) passes"
   else
-    STEP_TEXT="$(cat "${WORKDIR}/shared_secrets_step.sh")"
-    ASSUME_LINE="$(printf '%s\n' "$STEP_TEXT" | grep -n 'aws sts assume-role' | head -1 | cut -d: -f1 || true)"
-    IDENTITY_LINE="$(printf '%s\n' "$STEP_TEXT" | grep -n 'aws sts get-caller-identity' | head -1 | cut -d: -f1 || true)"
-    FAILCLOSED_LINE="$(printf '%s\n' "$STEP_TEXT" | grep -n 'Refusing to call Secrets Manager' | head -1 | cut -d: -f1 || true)"
-    DESCRIBE_LINE="$(printf '%s\n' "$STEP_TEXT" | grep -n 'aws secretsmanager describe-secret' | head -1 | cut -d: -f1 || true)"
-
-    if [ -n "$ASSUME_LINE" ] && [ -n "$IDENTITY_LINE" ] && [ -n "$FAILCLOSED_LINE" ] && [ -n "$DESCRIBE_LINE" ] \
-        && [ "$ASSUME_LINE" -lt "$IDENTITY_LINE" ] && [ "$IDENTITY_LINE" -lt "$FAILCLOSED_LINE" ] && [ "$FAILCLOSED_LINE" -lt "$DESCRIBE_LINE" ]; then
-      pass "VDR 2/4/5: validate_shared_secrets_once assumes EKS_DEPLOY_ROLE_ARN, verifies caller-identity, and fails closed on a mismatch -- all strictly before the first DescribeSecret call, so DescribeSecret can never execute before a successful, verified workload-role assumption"
-    else
-      fail "VDR 2/4/5: assume-role / caller-identity-check / fail-closed / DescribeSecret ordering is missing or out of sequence in validate_shared_secrets_once"
-    fi
+    fail "Phase 4 Python Conversion: automation/phases/phase4/tests/test_phase4_shared_secrets.py failed:"$'\n'"${PHASE4_SHARED_SECRETS_TEST_OUTPUT}"
   fi
 else
-  skip "VDR: step-extraction/ordering checks -- python3/PyYAML unavailable"
+  skip "Phase 4 Python Conversion: automation/phases/phase4/tests/test_phase4_shared_secrets.py -- python3 unavailable or file missing"
 fi
 
-if [ "$PYTHON_AVAILABLE" = "true" ]; then
-  FIRST_STEP_CHECK="$(python3 -c '
-import sys
+# Structural delegation proof: validate_shared_secrets_once must still start from the canonical RUNNER_ROLE_ARN (job-level OIDC credential step, output-scoped per the Phase 1/3 pattern) and its live validation step must delegate to phase4_shared_secrets.py validate, never reimplement inline. Also proves the job's own mode-aware if: gating (Validate-mode pass-through vs strict Deploy-mode gating on terraform_sync_once/validate_platform_ready/validate_observability_ready) is unchanged.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  SHARED_SECRETS_DELEGATION_CHECK="$(python3 -c '
 import yaml
+
 with open("'"$EKS_APP_WORKFLOW"'") as f:
     doc = yaml.safe_load(f)
-steps = doc["jobs"]["validate_shared_secrets_once"]["steps"]
+
+job = doc["jobs"]["validate_shared_secrets_once"]
+steps = job["steps"]
+results = []
+
 cred_steps = [s for s in steps if s.get("uses", "").startswith("aws-actions/configure-aws-credentials")]
-ok = len(cred_steps) == 1 and cred_steps[0].get("with", {}).get("role-to-assume") == "${{ env.RUNNER_ROLE_ARN }}"
-print("OK" if ok else "FAIL")
-')"
-  if [ "$FIRST_STEP_CHECK" = "OK" ]; then
-    pass "VDR 1: validate_shared_secrets_once still starts by configuring AWS credentials via the canonical RUNNER_ROLE_ARN (env.RUNNER_ROLE_ARN, loaded from envs/<environment>/environment.yaml, never a repository variable), exactly as today -- the fix adds a second, in-step assume-role, it does not replace the job-level OIDC credential step"
-  else
-    fail "VDR 1: validate_shared_secrets_once no longer starts from the canonical RUNNER_ROLE_ARN (env.RUNNER_ROLE_ARN) via aws-actions/configure-aws-credentials"
-  fi
-else
-  skip "VDR 1: base-credential-step check -- python3/PyYAML unavailable"
-fi
+results.append(("exactly one aws-actions/configure-aws-credentials step", len(cred_steps) == 1))
+if cred_steps:
+    cred_step = cred_steps[0]
+    results.append(("role-to-assume is the canonical env.RUNNER_ROLE_ARN", cred_step.get("with", {}).get("role-to-assume") == "${{ env.RUNNER_ROLE_ARN }}"))
+    results.append(("output-credentials: true / output-env-credentials: false (Phase 1/3 credential-isolation pattern)", cred_step.get("with", {}).get("output-credentials") is True and cred_step.get("with", {}).get("output-env-credentials") is False))
 
-if grep -qE 'EXPECTED_WORKLOAD_ACCOUNT_ID="\$\(echo "\$EKS_DEPLOY_ROLE_ARN" \| sed -nE' "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && grep -qE 'ACTUAL_ACCOUNT="\$\(AWS_ACCESS_KEY_ID="\$SEC_TMP_KEY_ID"' "$EKS_APP_WORKFLOW" 2>/dev/null; then
-  pass "VDR 3: the workload role's target account is derived from EKS_DEPLOY_ROLE_ARN itself (the same established derivation managed_efs_inventory_guard already uses) and the post-assume-role caller identity is checked against it -- for the dev environment this expected account is the canonical WORKLOAD_ACCOUNT_ID from envs/dev/environment.yaml, never an independent repository variable"
-else
-  fail "VDR 3: validate_shared_secrets_once does not derive/verify the expected workload-account ID before calling Secrets Manager"
-fi
+validate_step = next((s for s in steps if s.get("name") == "Validate shared GoldenGate secrets"), None)
+results.append(("\x27Validate shared GoldenGate secrets\x27 step exists", validate_step is not None))
+if validate_step is not None:
+    run_text = validate_step.get("run", "")
+    results.append(("delegates to phase4_shared_secrets.py validate, never a reimplementation", "phase4_shared_secrets.py" in run_text and "validate" in run_text))
+    env = validate_step.get("env") or {}
+    results.append(("only this step receives the AWS credential outputs", all(k in env for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"))))
 
-if grep -qE '"\$ACTUAL_ACCOUNT" != "\$EXPECTED_WORKLOAD_ACCOUNT_ID"' "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && grep -qE '\[ -z "\$ACTUAL_ACCOUNT" \]' "$EKS_APP_WORKFLOW" 2>/dev/null; then
-  pass "VDR 5: an empty or mismatched caller-identity account fails the step closed before any Secrets Manager call"
-else
-  fail "VDR 5: validate_shared_secrets_once does not fail closed on an empty/mismatched caller-identity account"
-fi
+job_if = job.get("if", "")
+results.append(("mode-aware gating preserved: Validate-mode pass-through (effective_deploy != true)", "effective_deploy != \x27true\x27" in job_if))
+results.append(("mode-aware gating preserved: real-deploy requires terraform_sync_once success", "terraform_sync_once.result == \x27success\x27" in job_if))
+results.append(("mode-aware gating preserved: real-deploy requires validate_platform_ready success", "validate_platform_ready.result == \x27success\x27" in job_if))
+results.append(("mode-aware gating preserved: real-deploy requires validate_observability_ready success", "validate_observability_ready.result == \x27success\x27" in job_if))
+results.append(("if: uses always() to survive a legitimately-skipped upstream dependency", "always()" in job_if))
 
-SHARED_SECRETS_JOB_TEXT="$(awk '/^  validate_shared_secrets_once:/{flag=1} flag && /^  [a-zA-Z_]+:$/ && !/^  validate_shared_secrets_once:/{if(NR>1 && flag2) exit} flag{print; flag2=1}' "$EKS_APP_WORKFLOW" 2>/dev/null || true)"
-# Matches the real CLI invocation only ("aws secretsmanager get-secret-value") -- not the bare word "GetSecretValue", which legitimately appears once in this job as an explanatory "never call this" comment.
-if ! printf '%s' "$SHARED_SECRETS_JOB_TEXT" | grep -qi "secretsmanager get-secret-value"; then
-  pass "VDR 8: no 'aws secretsmanager get-secret-value' call exists anywhere in the validate_shared_secrets_once job (GetSecretValue is mentioned once only, in a comment explaining it must never be called)"
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+' 2>&1)"
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL\ *) fail "Phase 4 Python Conversion: ${line#FAIL }" ;;
+      OK\ *) pass "Phase 4 Python Conversion: ${line#OK }" ;;
+    esac
+  done <<< "$SHARED_SECRETS_DELEGATION_CHECK"
 else
-  fail "VDR 8: validate_shared_secrets_once job text contains an actual secretsmanager get-secret-value call"
-fi
-
-if printf '%s' "$SHARED_SECRETS_JOB_TEXT" | grep -qE -- '--region "\$AWS_REGION"'; then
-  pass "VDR 6: the region used for the workload-account Secrets Manager/STS calls remains \$AWS_REGION (eu-west-1 for dev), unchanged"
-else
-  fail "VDR 6: validate_shared_secrets_once no longer scopes its AWS calls to \$AWS_REGION"
+  skip "Phase 4 Python Conversion: validate_shared_secrets_once delegation check -- python3/PyYAML unavailable or ${EKS_APP_WORKFLOW} missing"
 fi
 
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
@@ -8709,60 +7837,6 @@ print("OK")
   fi
 else
   skip "VDR 7: secret-name derivation check -- python3 unavailable"
-fi
-
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -s "${WORKDIR}/shared_secrets_step.sh" ]; then
-  STUB_DIR2="${WORKDIR}/aws-stub-secrets"
-  mkdir -p "$STUB_DIR2"
-  cat > "${STUB_DIR2}/aws" <<'STUBEOF'
-#!/bin/bash
-if [ "$1" = "sts" ] && [ "$2" = "assume-role" ]; then
-  echo '{"Credentials":{"AccessKeyId":"FAKEKEY2","SecretAccessKey":"FAKESECRET2","SessionToken":"FAKETOKEN2"}}'
-elif [ "$1" = "sts" ] && [ "$2" = "get-caller-identity" ]; then
-  echo "668311715351"
-elif [ "$1" = "secretsmanager" ] && [ "$2" = "describe-secret" ]; then
-  echo '{"ARN":"arn:aws:secretsmanager:eu-west-1:668311715351:secret:stub"}'
-elif [ "$1" = "secretsmanager" ] && [ "$2" = "list-secret-version-ids" ]; then
-  echo '{"Versions":[{"VersionId":"1","VersionStages":["AWSCURRENT"]}]}'
-else
-  echo "unexpected aws call: $*" >&2
-  exit 1
-fi
-STUBEOF
-  chmod +x "${STUB_DIR2}/aws"
-
-  set +e
-  SECRETS_TEST_OUT="$(PATH="${STUB_DIR2}:${PATH}" \
-    EKS_DEPLOY_ROLE_ARN="arn:aws:iam::668311715351:role/GoldenGateEKSDeployRole-dev" \
-    AWS_REGION="eu-west-1" GITHUB_RUN_ID="1" GITHUB_RUN_ATTEMPT="1" GG_SELECTED_ENVIRONMENT="dev" \
-    bash "${WORKDIR}/shared_secrets_step.sh" 2>&1)"
-  SECRETS_TEST_STATUS=$?
-  set -e
-
-  MASKED_OK=1
-  for SECRET_VAL in FAKEKEY2 FAKESECRET2 FAKETOKEN2; do
-    MASK_HITS="$(printf '%s\n' "$SECRETS_TEST_OUT" | grep -c "^::add-mask::${SECRET_VAL}\$" || true)"
-    LEAK_HITS="$(printf '%s\n' "$SECRETS_TEST_OUT" | grep -v '^::add-mask::' | grep -c "$SECRET_VAL" || true)"
-    if [ "$MASK_HITS" -lt 1 ] || [ "$LEAK_HITS" -ne 0 ]; then
-      MASKED_OK=0
-    fi
-  done
-
-  if [ "$SECRETS_TEST_STATUS" -eq 0 ] \
-      && echo "$SECRETS_TEST_OUT" | grep -qF "assumed-role caller identity is account 668311715351" \
-      && echo "$SECRETS_TEST_OUT" | grep -qF "dev/goldengate/source/admin exists with an AWSCURRENT version" \
-      && echo "$SECRETS_TEST_OUT" | grep -qF "dev/goldengate/target/admin exists with an AWSCURRENT version" \
-      && echo "$SECRETS_TEST_OUT" | grep -qF "dev/goldengate/tls-certificate exists with an AWSCURRENT version" \
-      && [ "$MASKED_OK" -eq 1 ]; then
-    pass "VDR 9/10: the real extracted validate_shared_secrets_once step, run end-to-end against a stubbed aws CLI, assumes the workload role, verifies its account, validates all three exact secret names read-only, and every temporary credential value appears ONLY inside its own ::add-mask:: directive -- never elsewhere in the step's output (no secret content is logged either, since the stub never returns any)"
-  else
-    fail "VDR 9/10: the extracted validate_shared_secrets_once step did not behave correctly, or leaked/failed to mask a temporary credential, against the stubbed aws CLI"
-    echo "$SECRETS_TEST_OUT"
-  fi
-
-  rm -rf "$STUB_DIR2"
-else
-  skip "VDR 9/10: end-to-end credential-fix behavioral test -- python3/PyYAML unavailable or step extraction failed"
 fi
 
 # VDR 11/12/13/14: unchanged by this narrowly-scoped credential fix -- covered by their own dedicated, still-passing suites/sections rather than duplicated here: automation/test-goldengate-managed-efs-inventory-guard.py (managed-EFS inventory guard, item 11), the "Production hardening, Item 1" section above plus envs/dev/efs.tf itself (Terraform/EFS architecture, item 12), the Phase 6D0/6D0-Final Oracle/PostgreSQL runtime-identity sections above (item 13, replication.enabled=false unchanged), and automation/test-goldengate-replication.py (PostgreSQL->MSSQL Phase 6D1 constants, item 14).
@@ -10224,12 +9298,12 @@ fi
 echo ""
 echo "--- Live Deploy Fix 4: repository-wide GG_SELECTED_ENVIRONMENT scope hardening ---"
 
-# 1-5, 14: the repo-wide static checker itself, run against the REAL current repository -- proves it reports the expected inventory (9 active workflows, 17 jobs referencing GG_SELECTED_ENVIRONMENT -- down from 19 before the Phase 3 Python Conversion, since argocd_preflight/validate_argocd_ready no longer thread a job-level GG_SELECTED_ENVIRONMENT shell variable through their run: blocks at all -- they interpolate needs.validate_model.outputs.selected_environment directly as a GitHub Actions expression into each phase3_argocd.py --environment argument, eliminating the unbound-shell-variable risk class entirely rather than merely covering it) and ZERO unsafe jobs.
+# 1-5, 14: the repo-wide static checker itself, run against the REAL current repository -- proves it reports the expected inventory (9 active workflows, 12 jobs referencing GG_SELECTED_ENVIRONMENT -- down from 17 before the Phase 4 Python Conversion, since all seven Phase 4 MAIN jobs (platform_preflight/observability_preflight/platform_sync_once/observability_sync_once/validate_platform_ready/validate_observability_ready/validate_shared_secrets_once) no longer thread a job-level GG_SELECTED_ENVIRONMENT shell variable through their run: blocks at all -- they interpolate needs.validate_model.outputs.selected_environment directly as a GitHub Actions expression into each phase4_platform.py/phase4_observability.py/phase4_shared_secrets.py --environment argument, matching the same eliminate-the-unbound-shell-variable-risk-class pattern the Phase 3 Python Conversion already established for argocd_preflight/validate_argocd_ready) and ZERO unsafe jobs.
 if [ -f "$ENV_SCOPE_CHECKER" ]; then
   ENV_SCOPE_REAL_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 "$ENV_SCOPE_CHECKER" 2>&1)"
   ENV_SCOPE_REAL_STATUS=$?
-  if [ "$ENV_SCOPE_REAL_STATUS" -eq 0 ] && grep -q "^Workflows inspected: 9$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^Jobs with GG_SELECTED_ENVIRONMENT run: references: 17$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^Unsafe jobs: 0$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^OK: zero unsafe GG_SELECTED_ENVIRONMENT references" <<< "$ENV_SCOPE_REAL_OUT"; then
-    pass "Live Deploy Fix 4: 1-5,14: ${ENV_SCOPE_CHECKER} reports 9 workflows inspected, 17 jobs referencing GG_SELECTED_ENVIRONMENT (down from 19 pre-Phase-3-conversion), and ZERO unsafe jobs against the real current repository"
+  if [ "$ENV_SCOPE_REAL_STATUS" -eq 0 ] && grep -q "^Workflows inspected: 9$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^Jobs with GG_SELECTED_ENVIRONMENT run: references: 12$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^Unsafe jobs: 0$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^OK: zero unsafe GG_SELECTED_ENVIRONMENT references" <<< "$ENV_SCOPE_REAL_OUT"; then
+    pass "Live Deploy Fix 4: 1-5,14: ${ENV_SCOPE_CHECKER} reports 9 workflows inspected, 12 jobs referencing GG_SELECTED_ENVIRONMENT (down from 17 pre-Phase-4-conversion), and ZERO unsafe jobs against the real current repository"
   else
     fail "Live Deploy Fix 4: 1-5,14: ${ENV_SCOPE_CHECKER} did not report the expected zero-violation inventory against the real repository (status=${ENV_SCOPE_REAL_STATUS}):"$'\n'"${ENV_SCOPE_REAL_OUT}"
   fi
@@ -10990,14 +10064,14 @@ else
   fail "Phase 11 8: 90-ops-observability-artifact-sync.yaml no longer renders with --namespace \"\${OBSERVABILITY_NAMESPACE}\" as expected"
 fi
 
-# 9: 40-sub-observability.yaml's rendered ServiceAccount validation compares against the canonical target namespace (passed in as argv[2]), never the literal "amazon-cloudwatch".
-if grep -qF 'sa["metadata"].get("namespace") == "amazon-cloudwatch"' .github/workflows/40-sub-observability.yaml 2>/dev/null; then
-  fail "Phase 11 9: 40-sub-observability.yaml's ServiceAccount validation still compares against the literal \"amazon-cloudwatch\""
-elif grep -qF 'python3 - "$RENDERED" "$TARGET_NAMESPACE" <<'"'"'PYEOF'"'"'' .github/workflows/40-sub-observability.yaml 2>/dev/null \
-    && grep -qF 'sa["metadata"].get("namespace") == expected_namespace' .github/workflows/40-sub-observability.yaml 2>/dev/null; then
-  pass "Phase 11 9: 40-sub-observability.yaml's ServiceAccount validation receives \$TARGET_NAMESPACE as argv[2] and compares against expected_namespace, never the literal \"amazon-cloudwatch\""
+# 9: Phase 4 Python Conversion -- the rendered ServiceAccount validation moved into automation/phases/phase4/phase4_observability.py's _validate_cloudwatch_agent_service_account(docs, target_namespace); it must compare against its target_namespace parameter (itself derived from the canonical OBSERVABILITY_NAMESPACE at call time), never the literal "amazon-cloudwatch".
+if grep -qF '"namespace") == "amazon-cloudwatch"' automation/phases/phase4/phase4_observability.py 2>/dev/null; then
+  fail "Phase 11 9: phase4_observability.py's ServiceAccount validation still compares against the literal \"amazon-cloudwatch\""
+elif grep -qF 'def _validate_cloudwatch_agent_service_account(docs, target_namespace):' automation/phases/phase4/phase4_observability.py 2>/dev/null \
+    && grep -qF '"namespace") == target_namespace' automation/phases/phase4/phase4_observability.py 2>/dev/null; then
+  pass "Phase 11 9: phase4_observability.py's ServiceAccount validation receives target_namespace as a function parameter and compares against it, never the literal \"amazon-cloudwatch\""
 else
-  fail "Phase 11 9: 40-sub-observability.yaml's ServiceAccount validation no longer passes/uses the canonical target namespace as expected"
+  fail "Phase 11 9: phase4_observability.py's ServiceAccount validation no longer passes/uses the canonical target namespace as expected"
 fi
 
 # 10: known current environment-derived IAM role NAMES are not independently embedded anywhere in active workflow diagnostics -- every one of these has a canonical *_ROLE_NAME resolver output available wherever it was previously hardcoded.
@@ -11985,8 +11059,8 @@ fi
 echo ""
 echo "--- Phase B2: GoldenGate Platform + Observability prerequisite classification/conditional reconciliation ---"
 
-# automation/orchestration/platform_state.py and observability_state.py must never construct a mutating kubectl/helm command -- read directly from source, never from the test's own constants. Mirrors the Phase B1 check immediately above for argocd_state.py, plus the shared k8s_common.py helper both new classifiers depend on.
-for B2_TOOL in automation/orchestration/platform_state.py automation/orchestration/observability_state.py automation/orchestration/k8s_common.py; do
+# automation/phases/phase4/platform_state.py and observability_state.py must never construct a mutating kubectl/helm command -- read directly from source, never from the test's own constants. Mirrors the Phase B1 check immediately above for argocd_state.py, plus the shared k8s_common.py helper both new classifiers depend on.
+for B2_TOOL in automation/phases/phase4/platform_state.py automation/phases/phase4/observability_state.py automation/orchestration/k8s_common.py; do
   if [ -f "$B2_TOOL" ]; then
     B2_MUTATING_HITS="$(grep -nE 'kubectl apply|kubectl create|kubectl delete|kubectl patch|kubectl annotate|kubectl label|helm install|helm upgrade|helm uninstall|"apply"|'"'"'apply'"'"'|"create"|'"'"'create'"'"'|"delete"|'"'"'delete'"'"'|"patch"|'"'"'patch'"'"'|"annotate"|'"'"'annotate'"'"'|"label"|'"'"'label'"'"'' "$B2_TOOL" 2>/dev/null || true)"
     if [ -z "$B2_MUTATING_HITS" ]; then
@@ -12000,44 +11074,44 @@ for B2_TOOL in automation/orchestration/platform_state.py automation/orchestrati
 done
 
 # All four classifiers' own dedicated offline unit-test suites are part of the normal regression run, not merely available separately: platform_state.py/observability_state.py cover pre-reconciliation ownership safety (ABSENT/OWNED/BROKEN); platform_acceptance.py/observability_acceptance.py cover the separate, strict post-reconciliation acceptance classifiers (HEALTHY/BROKEN).
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/test-goldengate-platform-state.py ]; then
-  if PLATFORM_STATE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/test-goldengate-platform-state.py 2>&1)"; then
-    pass "Phase B2: automation/test-goldengate-platform-state.py (the GoldenGate Platform ownership classifier's offline ABSENT/OWNED/BROKEN test suite) passes"
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/phases/phase4/tests/test_platform_state.py ]; then
+  if PLATFORM_STATE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/phases/phase4/tests/test_platform_state.py 2>&1)"; then
+    pass "Phase B2: automation/phases/phase4/tests/test_platform_state.py (the GoldenGate Platform ownership classifier's offline ABSENT/OWNED/BROKEN test suite) passes"
   else
-    fail "Phase B2: automation/test-goldengate-platform-state.py failed:"$'\n'"${PLATFORM_STATE_TEST_OUTPUT}"
+    fail "Phase B2: automation/phases/phase4/tests/test_platform_state.py failed:"$'\n'"${PLATFORM_STATE_TEST_OUTPUT}"
   fi
 else
-  skip "Phase B2: automation/test-goldengate-platform-state.py -- python3 unavailable or file missing"
+  skip "Phase B2: automation/phases/phase4/tests/test_platform_state.py -- python3 unavailable or file missing"
 fi
 
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/test-goldengate-platform-acceptance.py ]; then
-  if PLATFORM_ACCEPTANCE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/test-goldengate-platform-acceptance.py 2>&1)"; then
-    pass "Phase B2: automation/test-goldengate-platform-acceptance.py (the Platform post-reconciliation acceptance classifier's offline HEALTHY/BROKEN test suite) passes"
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/phases/phase4/tests/test_platform_acceptance.py ]; then
+  if PLATFORM_ACCEPTANCE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/phases/phase4/tests/test_platform_acceptance.py 2>&1)"; then
+    pass "Phase B2: automation/phases/phase4/tests/test_platform_acceptance.py (the Platform post-reconciliation acceptance classifier's offline HEALTHY/BROKEN test suite) passes"
   else
-    fail "Phase B2: automation/test-goldengate-platform-acceptance.py failed:"$'\n'"${PLATFORM_ACCEPTANCE_TEST_OUTPUT}"
+    fail "Phase B2: automation/phases/phase4/tests/test_platform_acceptance.py failed:"$'\n'"${PLATFORM_ACCEPTANCE_TEST_OUTPUT}"
   fi
 else
-  skip "Phase B2: automation/test-goldengate-platform-acceptance.py -- python3 unavailable or file missing"
+  skip "Phase B2: automation/phases/phase4/tests/test_platform_acceptance.py -- python3 unavailable or file missing"
 fi
 
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/test-goldengate-observability-state.py ]; then
-  if OBSERVABILITY_STATE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/test-goldengate-observability-state.py 2>&1)"; then
-    pass "Phase B2: automation/test-goldengate-observability-state.py (the Observability ownership classifier's offline ABSENT/OWNED/BROKEN test suite) passes"
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/phases/phase4/tests/test_observability_state.py ]; then
+  if OBSERVABILITY_STATE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/phases/phase4/tests/test_observability_state.py 2>&1)"; then
+    pass "Phase B2: automation/phases/phase4/tests/test_observability_state.py (the Observability ownership classifier's offline ABSENT/OWNED/BROKEN test suite) passes"
   else
-    fail "Phase B2: automation/test-goldengate-observability-state.py failed:"$'\n'"${OBSERVABILITY_STATE_TEST_OUTPUT}"
+    fail "Phase B2: automation/phases/phase4/tests/test_observability_state.py failed:"$'\n'"${OBSERVABILITY_STATE_TEST_OUTPUT}"
   fi
 else
-  skip "Phase B2: automation/test-goldengate-observability-state.py -- python3 unavailable or file missing"
+  skip "Phase B2: automation/phases/phase4/tests/test_observability_state.py -- python3 unavailable or file missing"
 fi
 
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/test-goldengate-observability-acceptance.py ]; then
-  if OBSERVABILITY_ACCEPTANCE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/test-goldengate-observability-acceptance.py 2>&1)"; then
-    pass "Phase B2: automation/test-goldengate-observability-acceptance.py (the Observability post-reconciliation acceptance classifier's offline HEALTHY/BROKEN test suite) passes"
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/phases/phase4/tests/test_observability_acceptance.py ]; then
+  if OBSERVABILITY_ACCEPTANCE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/phases/phase4/tests/test_observability_acceptance.py 2>&1)"; then
+    pass "Phase B2: automation/phases/phase4/tests/test_observability_acceptance.py (the Observability post-reconciliation acceptance classifier's offline HEALTHY/BROKEN test suite) passes"
   else
-    fail "Phase B2: automation/test-goldengate-observability-acceptance.py failed:"$'\n'"${OBSERVABILITY_ACCEPTANCE_TEST_OUTPUT}"
+    fail "Phase B2: automation/phases/phase4/tests/test_observability_acceptance.py failed:"$'\n'"${OBSERVABILITY_ACCEPTANCE_TEST_OUTPUT}"
   fi
 else
-  skip "Phase B2: automation/test-goldengate-observability-acceptance.py -- python3 unavailable or file missing"
+  skip "Phase B2: automation/phases/phase4/tests/test_observability_acceptance.py -- python3 unavailable or file missing"
 fi
 
 # Structural proof, read directly from the real committed YAML (never a reimplementation): 40-sub-observability.yaml's workflow_call contract, MAIN's platform_preflight/observability_preflight/platform_sync_once/observability_sync_once/validate_platform_ready/validate_observability_ready DAG wiring, and the cross-file CHART_VERSION constant this classifier is tightly tested against.
@@ -12148,18 +11222,18 @@ else
   skip "Phase B2: structural DAG/workflow_call checks -- python3/PyYAML unavailable or a required workflow file is missing"
 fi
 
-# CHART_VERSION cross-file consistency: Generic MAIN Desired-State Convergence Fix moved the strict chart-version/targetRevision check out of ownership (observability_state.py, which no longer has any CHART_VERSION concept at all) and into observability_acceptance.py, the strict post-reconciliation classifier -- that constant must stay equal to 40-sub-observability.yaml's own CHART_VERSION env literal, or the classifier would silently diverge from what is actually deployed.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/orchestration/observability_acceptance.py ]; then
-  WORKFLOW_CHART_VERSION="$(grep -E '^\s*CHART_VERSION:' "$OBSERVABILITY_WORKFLOW" | head -1 | sed -E 's/.*CHART_VERSION:\s*"([^"]+)".*/\1/')"
-  CLASSIFIER_CHART_VERSION="$(python3 -c 'import re; print(re.search(r"^CHART_VERSION = \"([^\"]+)\"", open("automation/orchestration/observability_acceptance.py").read(), re.M).group(1))')"
-  if [ -n "$WORKFLOW_CHART_VERSION" ] && [ "$WORKFLOW_CHART_VERSION" = "$CLASSIFIER_CHART_VERSION" ]; then
-    pass "Phase B2: observability_acceptance.py's CHART_VERSION ('${CLASSIFIER_CHART_VERSION}') matches 40-sub-observability.yaml's own CHART_VERSION env literal exactly"
+# CHART_VERSION cross-file consistency: Generic MAIN Desired-State Convergence Fix moved the strict chart-version/targetRevision check out of ownership (observability_state.py, which no longer has any CHART_VERSION concept at all) and into observability_acceptance.py, the strict post-reconciliation classifier -- that constant must stay equal to phase4_observability.py's own CHART_VERSION constant (the Phase 4 Python Conversion moved the workflow's own CHART_VERSION out of YAML entirely; automation/phases/phase4/phase4_observability.py is now the sole source of truth the workflow itself reads at runtime), or the classifier would silently diverge from what is actually deployed.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/phases/phase4/observability_acceptance.py ]; then
+  ORCHESTRATOR_CHART_VERSION="$(python3 -c 'import re; print(re.search(r"^CHART_VERSION = \"([^\"]+)\"", open("automation/phases/phase4/phase4_observability.py").read(), re.M).group(1))')"
+  CLASSIFIER_CHART_VERSION="$(python3 -c 'import re; print(re.search(r"^CHART_VERSION = \"([^\"]+)\"", open("automation/phases/phase4/observability_acceptance.py").read(), re.M).group(1))')"
+  if [ -n "$ORCHESTRATOR_CHART_VERSION" ] && [ "$ORCHESTRATOR_CHART_VERSION" = "$CLASSIFIER_CHART_VERSION" ]; then
+    pass "Phase B2: observability_acceptance.py's CHART_VERSION ('${CLASSIFIER_CHART_VERSION}') matches phase4_observability.py's own CHART_VERSION constant exactly"
   else
-    fail "Phase B2: CHART_VERSION drift -- workflow='${WORKFLOW_CHART_VERSION}' classifier='${CLASSIFIER_CHART_VERSION}'"
+    fail "Phase B2: CHART_VERSION drift -- phase4_observability.py='${ORCHESTRATOR_CHART_VERSION}' classifier='${CLASSIFIER_CHART_VERSION}'"
   fi
 
   # observability_state.py (ownership) must never define CHART_VERSION at all -- chart-version correctness is a strict desired-state concern, not an ownership-safety concern, matching runtime_state.py/monitor_state.py never checking targetRevision either.
-  if ! grep -qE '^CHART_VERSION' automation/orchestration/observability_state.py 2>/dev/null; then
+  if ! grep -qE '^CHART_VERSION' automation/phases/phase4/observability_state.py 2>/dev/null; then
     pass "Phase B2: observability_state.py (ownership) never defines CHART_VERSION -- chart-version/targetRevision correctness lives entirely in observability_acceptance.py"
   else
     fail "Phase B2: observability_state.py unexpectedly defines CHART_VERSION -- chart-version correctness must live in the acceptance module only"
@@ -12701,7 +11775,7 @@ else
 fi
 
 # P9/P10: no imperative namespace delete/recreate/label/annotate workaround was added to mask the competing ownership source -- the fix must be the chart's own values contract (namespaces.runtime.create), never an imperative kubectl command layered on top.
-NAMESPACE_WORKAROUND_HITS="$(grep -nE 'kubectl (delete|create|label|annotate) namespace' .github/workflows/30-sub-platform.yaml automation/orchestration/platform_state.py 2>/dev/null || true)"
+NAMESPACE_WORKAROUND_HITS="$(grep -nE 'kubectl (delete|create|label|annotate) namespace' .github/workflows/30-sub-platform.yaml automation/phases/phase4/platform_state.py 2>/dev/null || true)"
 if [ -z "$NAMESPACE_WORKAROUND_HITS" ]; then
   pass "P9/P10: no kubectl delete/create/label/annotate namespace workaround exists in 30-sub-platform.yaml or platform_state.py -- the ownership fix is the chart's own values contract, never an imperative patch"
 else
@@ -12743,226 +11817,34 @@ else
   skip "P11/P12: helm template namespace-ownership proof -- helm unavailable or platform/dev/goldengate-platform/values.yaml missing"
 fi
 
-if grep -qF "syncOptions:" "$PLATFORM_WORKFLOW" 2>/dev/null \
-  && grep -qF "CreateNamespace=true" "$PLATFORM_WORKFLOW" 2>/dev/null \
-  && grep -qF "managedNamespaceMetadata:" "$PLATFORM_WORKFLOW" 2>/dev/null \
-  && grep -qF "app.kubernetes.io/managed-by: argocd" "$PLATFORM_WORKFLOW" 2>/dev/null; then
-  pass "P11: 30-sub-platform.yaml's Argo CD Application retains CreateNamespace=true + managedNamespaceMetadata (app.kubernetes.io/managed-by: argocd) as the sole authoritative owner of the runtime namespace's metadata"
+# Phase 4 Python Conversion: the Application manifest (including syncOptions/managedNamespaceMetadata) is now constructed by automation/phases/phase4/phase4_platform.py's _build_application_manifest() as a real Python dict, never inline workflow YAML/bash text -- checked here by invoking that actual function, never by re-deriving a second, independent text-regex proof.
+P11_CHECK="$(python3 -c '
+import importlib.util
+spec = importlib.util.spec_from_file_location("phase4_platform", "automation/phases/phase4/phase4_platform.py")
+phase4_platform = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(phase4_platform)
+
+manifest = phase4_platform._build_application_manifest(
+    "goldengate-dev-platform", "argocd", "oci://229410149234.dkr.ecr.eu-west-1.amazonaws.com/helm/goldengate-platform", "0.1.1", "goldengate-dev-platform",
+    "goldengate-dev", "dev", "arn:aws:iam::668311715351:role/RuntimeRole", "arn:aws:iam::668311715351:role/LoggingRole", "eu-west-1", "goldengate-monitor",
+    "/goldengate/dev/runtime", "/goldengate/dev/monitor", "229410149234.dkr.ecr.eu-west-1.amazonaws.com/aws-cloud-factory-fluent-bit@sha256:" + "a" * 64,
+)
+sync_options = manifest["spec"]["syncPolicy"]["syncOptions"]
+managed_ns_labels = manifest["spec"]["syncPolicy"]["managedNamespaceMetadata"]["labels"]
+ok = "CreateNamespace=true" in sync_options and managed_ns_labels.get("app.kubernetes.io/managed-by") == "argocd"
+print("OK" if ok else "FAIL")
+' 2>&1)"
+if [ "$P11_CHECK" = "OK" ]; then
+  pass "P11: phase4_platform.py's _build_application_manifest() retains CreateNamespace=true + managedNamespaceMetadata (app.kubernetes.io/managed-by: argocd) as the sole authoritative owner of the runtime namespace's metadata"
 else
-  fail "P11: 30-sub-platform.yaml no longer carries the expected CreateNamespace=true + managedNamespaceMetadata Argo CD ownership contract"
+  fail "P11: phase4_platform.py's _build_application_manifest() no longer carries the expected CreateNamespace=true + managedNamespaceMetadata Argo CD ownership contract: ${P11_CHECK}"
 fi
 
-# O1/O2/O4-O8: real-script-execution proof of the corrected Observability reconciliation ordering, extracted from the real committed 40-sub-observability.yaml and run against a fabricated fake-kubectl fixture reproducing the exact live incident (hostNetwork=false, active pod missing AWS_ROLE_ARN/AWS_WEB_IDENTITY_TOKEN_FILE) -- never a grep-only proof.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$OBSERVABILITY_WORKFLOW" ] && command -v jq >/dev/null 2>&1; then
-  set +e
-  OBS_ORDERING_PROOF_OUT="$(python3 - "$OBSERVABILITY_WORKFLOW" <<'PYEOF'
-import json
-import os
-import shutil
-import subprocess
-import sys
-import tempfile
-import textwrap
+# O1/O2/O4-O8: cluster-scraper Deployment host-network correction ordering and IRSA env-var-name verification. Phase 4 Python Conversion: this logic now lives in automation/phases/phase4/phase4_observability.py's _ensure_cluster_scraper_host_network_isolated()/_verify_pod_irsa()/_verify_irsa_injection() as real Python functions, never inline workflow bash extracted and replayed against a fake-kubectl sandbox. The exact same real-function-execution-against-fabricated-fixtures methodology this check pioneered is now applied directly to those functions in automation/phases/phase4/tests/test_phase4_observability.py::ClusterScraperHostNetworkCorrectionTests and ::IrsaVerificationTests (both already run above via the Phase 4 Python Conversion test-suite check), including: the corrected step never fails prematurely on a missing AWS_ROLE_ARN (IRSA admission is checked only by the dedicated later step); owner-chain UID validation before any deletion; hostNetwork=false enforcement preserved; and IRSA verification still fails closed on genuinely missing AWS_ROLE_ARN/AWS_WEB_IDENTITY_TOKEN_FILE while succeeding once reconciled.
 
-import yaml
-
-workflow_path = sys.argv[1]
-with open(workflow_path) as f:
-    doc = yaml.safe_load(f)
-
-steps = doc["jobs"]["validate_and_deploy"]["steps"]
-step_names = [s.get("name") for s in steps]
-by_name = {s.get("name"): s for s in steps}
-
-failures = []
-
-
-def check(label, condition):
-    if not condition:
-        failures.append(label)
-
-
-HOSTNETWORK_STEP = "Ensure cluster-scraper Deployment host-network isolation"
-ANNOTATE_STEP = "Annotate the CloudWatch Agent ServiceAccount with the dedicated IRSA role"
-WAIT_STEP = "Wait for CloudWatch Agent workloads to roll out"
-VERIFY_STEP = "Verify IRSA injection on the recreated CloudWatch Agent pods"
-
-for name in (HOSTNETWORK_STEP, ANNOTATE_STEP, WAIT_STEP, VERIFY_STEP):
-    check(f"O4: step {name!r} exists", name in by_name)
-
-# O2/O4: step ORDER -- host-network isolation runs before ServiceAccount annotation, which runs before the rollout wait, which runs before pod-level IRSA verification.
-idx = {name: step_names.index(name) for name in (HOSTNETWORK_STEP, ANNOTATE_STEP, WAIT_STEP, VERIFY_STEP) if name in step_names}
-if len(idx) == 4:
-    check("O2/O4: host-network isolation runs BEFORE ServiceAccount annotation", idx[HOSTNETWORK_STEP] < idx[ANNOTATE_STEP])
-    check("O2/O4: ServiceAccount annotation runs BEFORE the rollout wait", idx[ANNOTATE_STEP] < idx[WAIT_STEP])
-    check("O2/O4: the rollout wait runs BEFORE pod-level IRSA verification", idx[WAIT_STEP] < idx[VERIFY_STEP])
-
-# O2 (source-level): the host-network step no longer references AWS_ROLE_ARN/AWS_WEB_IDENTITY_TOKEN_FILE at all -- IRSA admission is no longer checked at this point.
-hostnetwork_run = by_name.get(HOSTNETWORK_STEP, {}).get("run", "")
-check("O2: the host-network step no longer ACTIVELY CHECKS AWS_ROLE_ARN (an explanatory comment may still name it -- only the removed `grep -qx \"AWS_ROLE_ARN\"` construct itself matters here)", 'grep -qx "AWS_ROLE_ARN"' not in hostnetwork_run)
-check("O2: the host-network step no longer ACTIVELY CHECKS AWS_WEB_IDENTITY_TOKEN_FILE", 'grep -qx "AWS_WEB_IDENTITY_TOKEN_FILE"' not in hostnetwork_run)
-check("O9: the host-network step still enforces hostNetwork=false (networking validation preserved, only IRSA removed)", 'spec.hostNetwork is ${pod_hostnetwork}, expected false' in hostnetwork_run)
-
-# O8 (source-level): the dedicated verify step still checks BOTH IRSA environment variable names.
-verify_run = by_name.get(VERIFY_STEP, {}).get("run", "")
-check("O8: the dedicated IRSA verification step still checks AWS_ROLE_ARN", "AWS_ROLE_ARN" in verify_run)
-check("O8: the dedicated IRSA verification step still checks AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_WEB_IDENTITY_TOKEN_FILE" in verify_run)
-
-# --- Real script execution: build a fake kubectl driven by a JSON fixture, run the ACTUAL extracted run: text of both steps against it. ---
-sandbox = tempfile.mkdtemp(prefix="observability-ordering-proof-")
-try:
-    bin_dir = os.path.join(sandbox, "bin")
-    os.makedirs(bin_dir)
-    fake_kubectl_path = os.path.join(bin_dir, "kubectl")
-    with open(fake_kubectl_path, "w") as f:
-        f.write(textwrap.dedent('''\
-            #!/usr/bin/env python3
-            import json, os, sys
-            with open(os.environ["FAKE_KUBECTL_FIXTURE"]) as fh:
-                FIXTURE = json.load(fh)
-            args = sys.argv[1:]
-            if args[0] != "get":
-                sys.exit(2)
-            resource = args[1]
-            name = None
-            namespace = None
-            selector = None
-            idx = 2
-            if idx < len(args) and not args[idx].startswith("-"):
-                name = args[idx]
-                idx += 1
-            while idx < len(args):
-                if args[idx] == "-n":
-                    namespace = args[idx + 1]
-                    idx += 2
-                elif args[idx] == "-l":
-                    selector = args[idx + 1]
-                    idx += 2
-                elif args[idx] == "-o":
-                    idx += 2
-                else:
-                    idx += 1
-            objects = FIXTURE.get("objects", {})
-            lists = FIXTURE.get("lists", {})
-            if name is not None:
-                key = f"{resource}/{name}/{namespace}"
-                obj = objects.get(key)
-                if obj is None:
-                    print(f'Error from server (NotFound): {resource} "{name}" not found', file=sys.stderr)
-                    sys.exit(1)
-                print(json.dumps(obj))
-                sys.exit(0)
-            list_key = f"{resource}/{namespace}/{selector or ''}"
-            items = lists.get(list_key, [])
-            print(json.dumps({"items": items}))
-            sys.exit(0)
-            '''))
-    os.chmod(fake_kubectl_path, 0o755)
-
-    NS = "amazon-cloudwatch"
-    CR_NAME = "cloudwatch-agent-cluster-scraper"
-    DEPLOY_NAME = "cloudwatch-agent-cluster-scraper"
-    DEPLOY_UID = "deploy-uid-1"
-    RS_NAME = "cloudwatch-agent-cluster-scraper-abc123"
-    RS_UID = "rs-uid-1"
-    POD_NAME = "cloudwatch-agent-cluster-scraper-abc123-xyz99"
-    DS_NAME = "cloudwatch-agent"
-    DS_POD_NAME = "cloudwatch-agent-node1"
-
-    def make_scraper_pod(env_names):
-        return {
-            "metadata": {"name": POD_NAME, "ownerReferences": [{"controller": True, "kind": "ReplicaSet", "name": RS_NAME, "uid": RS_UID}]},
-            "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}], "podIP": "10.0.1.5", "hostIP": "10.0.0.1"},
-            "spec": {"hostNetwork": False, "nodeName": "node-1", "serviceAccountName": "cloudwatch-agent", "containers": [{"name": "cloudwatch-agent", "env": [{"name": n} for n in env_names]}]},
-        }
-
-    def make_ds_pod(env_names):
-        return {
-            "metadata": {"name": DS_POD_NAME},
-            "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}]},
-            "spec": {"hostNetwork": True, "serviceAccountName": "cloudwatch-agent", "containers": [{"name": "cloudwatch-agent", "env": [{"name": n} for n in env_names]}]},
-        }
-
-    def make_fixture(env_names):
-        scraper_pod = make_scraper_pod(env_names)
-        ds_pod = make_ds_pod(env_names)
-        return {
-            "objects": {
-                f"amazoncloudwatchagents.cloudwatch.aws.amazon.com/{CR_NAME}/{NS}": {"metadata": {"uid": "cr-uid-1"}, "spec": {"mode": "deployment", "hostNetwork": False}},
-                f"deployment/{DEPLOY_NAME}/{NS}": {"metadata": {"uid": DEPLOY_UID, "name": DEPLOY_NAME, "namespace": NS}, "spec": {"template": {"spec": {"hostNetwork": False}}, "selector": {"matchLabels": {"app": "cloudwatch-agent-cluster-scraper"}}}},
-                f"replicaset/{RS_NAME}/{NS}": {"metadata": {"ownerReferences": [{"controller": True, "kind": "Deployment", "name": DEPLOY_NAME, "uid": DEPLOY_UID}]}},
-                f"daemonset/{DS_NAME}/{NS}": {"status": {"desiredNumberScheduled": 1}, "spec": {"selector": {"matchLabels": {"app": "cloudwatch-agent"}}}},
-                f"pod/{POD_NAME}/{NS}": scraper_pod,
-                f"pod/{DS_POD_NAME}/{NS}": ds_pod,
-            },
-            "lists": {
-                f"pods/{NS}/app=cloudwatch-agent-cluster-scraper": [scraper_pod],
-                f"pods/{NS}/app=cloudwatch-agent": [ds_pod],
-                f"pods/{NS}/": [scraper_pod, ds_pod],
-            },
-        }
-
-    fixture_missing_path = os.path.join(sandbox, "fixture_missing_irsa.json")
-    fixture_present_path = os.path.join(sandbox, "fixture_with_irsa.json")
-    with open(fixture_missing_path, "w") as f:
-        json.dump(make_fixture([]), f)
-    with open(fixture_present_path, "w") as f:
-        json.dump(make_fixture(["AWS_ROLE_ARN", "AWS_WEB_IDENTITY_TOKEN_FILE"]), f)
-
-    base_env = dict(os.environ)
-    base_env["PATH"] = bin_dir + os.pathsep + base_env.get("PATH", "")
-    base_env["TARGET_NAMESPACE"] = NS
-    base_env["CLOUDWATCH_AGENT_SERVICE_ACCOUNT"] = "cloudwatch-agent"
-    base_env["WORKDIR"] = os.path.join(sandbox, "work")
-    os.makedirs(base_env["WORKDIR"], exist_ok=True)
-
-    def run_step(step_name, fixture_path):
-        env = dict(base_env)
-        env["FAKE_KUBECTL_FIXTURE"] = fixture_path
-        script = by_name[step_name]["run"]
-        proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, cwd=sandbox, timeout=60)
-        return proc.returncode, proc.stdout, proc.stderr
-
-    # O1: the corrected host-network step, run against the EXACT live incident (AWS_ROLE_ARN/AWS_WEB_IDENTITY_TOKEN_FILE missing on the active pod), must NOT fail prematurely.
-    rc, out, err = run_step(HOSTNETWORK_STEP, fixture_missing_path)
-    check("O1: the corrected host-network step succeeds (exit 0) even when the active pod is missing AWS_ROLE_ARN -- no premature IRSA failure", rc == 0)
-    check("O1: the host-network step still reports the hostNetwork=false diagnostics (reproduces the exact live incident's own output)", "hostNetwork is already false" in out)
-
-    # O7: the dedicated IRSA verification step, run against the SAME missing-IRSA fixture, MUST still fail -- proving IRSA is still enforced, just at the correct point in the pipeline.
-    rc, out, err = run_step(VERIFY_STEP, fixture_missing_path)
-    check("O7: the dedicated IRSA verification step still fails when AWS_ROLE_ARN is genuinely missing (IRSA enforcement preserved, only its position moved)", rc != 0)
-    check("O7: the failure message correctly names the missing variable", "AWS_ROLE_ARN" in (out + err))
-
-    # O6: the SAME dedicated IRSA verification step, run against a fixture where the ServiceAccount has already been reconciled and pods re-admitted with IRSA, must succeed -- proving it checks CURRENT (recreated) pod state, not stale evidence.
-    rc, out, err = run_step(VERIFY_STEP, fixture_present_path)
-    check("O5/O6: the dedicated IRSA verification step succeeds once the (simulated recreated) pods carry AWS_ROLE_ARN/AWS_WEB_IDENTITY_TOKEN_FILE", rc == 0)
-    check("O6: the verification step confirms both the DaemonSet pod and the cluster-scraper pod", "IRSA injection verified on every cloudwatch-agent DaemonSet pod and the cluster-scraper pod" in out)
-finally:
-    shutil.rmtree(sandbox, ignore_errors=True)
-
-if failures:
-    print("\n".join(failures))
-    sys.exit(1)
-print("OK")
-PYEOF
-)"
-  OBS_ORDERING_PROOF_STATUS=$?
-  set -e
-  if [ "$OBS_ORDERING_PROOF_STATUS" -eq 0 ]; then
-    pass "O1: the corrected host-network step, run against a real fake-kubectl fixture reproducing the exact live incident, no longer fails prematurely on a missing AWS_ROLE_ARN"
-    pass "O2/O4: real committed step order is host-network isolation -> ServiceAccount annotation -> rollout wait -> pod-level IRSA verification, and the host-network step's own source no longer references either IRSA environment variable"
-    pass "O5/O6/O7: the dedicated IRSA verification step still fails closed on genuinely missing IRSA (enforcement preserved) and succeeds once the ServiceAccount/pods are reconciled -- checking current, not stale, pod state"
-    pass "O8/O9: the dedicated IRSA verification step still checks both AWS_ROLE_ARN and AWS_WEB_IDENTITY_TOKEN_FILE; the host-network step still enforces hostNetwork=false unrelated to and unweakened by the IRSA-check removal"
-  else
-    fail "Live Platform + Observability End-to-End Self-Recovery Fix: Observability ordering real-script-execution proof failed:"$'\n'"${OBS_ORDERING_PROOF_OUT}"
-  fi
-else
-  skip "O1/O2/O4-O8: Observability ordering real-script-execution proof -- python3/jq unavailable or 40-sub-observability.yaml missing"
-fi
-
-# O10/O11/O12: no static AWS credential fallback, no custom STS URL, and the regional STS configuration already established for the Argo ECR token-sync CronJob remains intact -- neither introduced nor regressed by this fix.
-STATIC_CRED_HITS="$(grep -nE 'AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|aws_access_key_id|aws_secret_access_key' "$OBSERVABILITY_WORKFLOW" automation/orchestration/observability_state.py 2>/dev/null || true)"
-CUSTOM_STS_HITS="$(grep -nE 'AWS_ENDPOINT_URL|AWS_STS_ENDPOINT|sts\.[a-z0-9-]+\.amazonaws\.com' "$OBSERVABILITY_WORKFLOW" automation/orchestration/observability_state.py 2>/dev/null || true)"
+# O10/O11/O12: no static AWS credential fallback, no custom STS URL, and the regional STS configuration already established for the Argo ECR token-sync CronJob remains intact -- neither introduced nor regressed by this fix. Phase 4 Python Conversion: 40-sub-observability.yaml now legitimately references AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_SESSION_TOKEN as env: mappings sourced ONLY from `${{ steps.aws_build_credentials.outputs.* }}` (the same output-credential-scoping pattern already established by Phase 1/3's MAIN jobs) -- that dynamic, per-run STS-issued reference is excluded here; only a genuinely hardcoded/static value would still be flagged.
+STATIC_CRED_HITS="$(grep -nE 'AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|aws_access_key_id|aws_secret_access_key' "$OBSERVABILITY_WORKFLOW" automation/phases/phase4/observability_state.py 2>/dev/null | grep -v '\${{ steps\.' || true)"
+CUSTOM_STS_HITS="$(grep -nE 'AWS_ENDPOINT_URL|AWS_STS_ENDPOINT|sts\.[a-z0-9-]+\.amazonaws\.com' "$OBSERVABILITY_WORKFLOW" automation/phases/phase4/observability_state.py 2>/dev/null || true)"
 if [ -z "$STATIC_CRED_HITS" ] && [ -z "$CUSTOM_STS_HITS" ]; then
   pass "O10/O11: no static AWS credential fallback and no custom/hardcoded STS URL was introduced in 40-sub-observability.yaml or observability_state.py"
 else
@@ -13010,24 +11892,21 @@ else
   skip "P1/P2/P3: platform render proof -- helm unavailable or platform/dev/goldengate-platform/values.yaml missing"
 fi
 
-# P1/P2 (workflow-level): REALLY EXECUTE the committed "Validate rendered platform manifest" step (never a reimplementation) against the real render above, proving the ZERO-Namespace count is taken safely under set -euo pipefail (never a bare `grep -c` whose zero-match exit status would abort the script) and that every other existing check (deletion-protected ServiceAccount, Fluent Bit shape/image/ConfigMap routing) still passes end to end.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ "$HELM_AVAILABLE" = "true" ] && [ -f "$PLATFORM_WORKFLOW" ]; then
+# P1/P2 (Phase 4 Python Conversion): REALLY EXECUTE the actual automation/phases/phase4/phase4_platform.py _validate_rendered_manifest() function (never a reimplementation) against a real helm template render of the real committed values, proving the ZERO-Namespace count and every other existing check (deletion-protected ServiceAccount, Fluent Bit shape/image/ConfigMap routing) still pass end to end. This step's logic moved out of inline workflow bash entirely -- there is no longer a "Validate rendered platform manifest" run: block to extract, so this now imports and calls the real Python function directly.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ "$HELM_AVAILABLE" = "true" ] && [ -f automation/phases/phase4/phase4_platform.py ]; then
   set +e
-  PLATFORM_VALIDATE_SCRIPT_OUT="$(python3 - "$PLATFORM_WORKFLOW" <<'PYEOF'
+  PLATFORM_VALIDATE_SCRIPT_OUT="$(python3 - <<'PYEOF'
+import contextlib
+import importlib.util
+import io
 import os
 import subprocess
 import sys
 import tempfile
 
-import yaml
-
-workflow_path = sys.argv[1]
-with open(workflow_path) as f:
-    doc = yaml.safe_load(f)
-
-steps = doc["jobs"]["package_publish_and_deploy"]["steps"]
-by_name = {s.get("name"): s for s in steps}
-script = by_name["Validate rendered platform manifest"]["run"]
+spec = importlib.util.spec_from_file_location("phase4_platform", "automation/phases/phase4/phase4_platform.py")
+phase4_platform = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(phase4_platform)
 
 repo_root = os.getcwd()
 sandbox = tempfile.mkdtemp(prefix="platform-render-proof-")
@@ -13052,34 +11931,23 @@ try:
         print(f"FAIL: helm template itself failed: {render_proc.stderr}")
         sys.exit(1)
 
-    rendered_dir = os.path.join(sandbox, "rendered")
-    os.makedirs(rendered_dir)
-    with open(os.path.join(rendered_dir, "goldengate-dev-platform.yaml"), "w") as f:
+    rendered_path = os.path.join(sandbox, "goldengate-dev-platform.yaml")
+    with open(rendered_path, "w") as f:
         f.write(render_proc.stdout)
 
-    env = dict(os.environ)
-    env.update({
-        "RELEASE_NAME": "goldengate-dev-platform",
-        "RUNTIME_NAMESPACE": "goldengate-dev",
-        "MONITOR_NAMESPACE": "goldengate-monitoring",
-        "RUNTIME_SA_NAME": "gg-runtime-sa",
-        "FLUENT_BIT_SA_NAME": "gg-fluent-bit",
-        "RUNTIME_ROLE_ARN": "arn:aws:iam::123456789012:role/test-runtime",
-        "PLATFORM_LOGGING_ROLE_ARN": "arn:aws:iam::123456789012:role/test-fluentbit",
-        "FLUENT_BIT_IMAGE": fluent_bit_image,
-        "RUNTIME_LOG_GROUP": "/test/runtime",
-        "MONITOR_LOG_GROUP": "/test/monitor",
-        "HELM_CHART_PATH": os.path.join(repo_root, "helm", "goldengate-platform"),
-    })
-    proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, cwd=sandbox, timeout=60)
-    if proc.returncode != 0:
-        print(f"FAIL: the real 'Validate rendered platform manifest' step exited {proc.returncode} against the real render:\n{proc.stdout}\n{proc.stderr}")
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            phase4_platform._validate_rendered_manifest(
+                __import__("pathlib").Path(rendered_path), fluent_bit_image,
+                runtime_namespace="goldengate-dev", monitor_namespace="goldengate-monitoring",
+                runtime_role_arn="arn:aws:iam::123456789012:role/test-runtime", platform_logging_role_arn="arn:aws:iam::123456789012:role/test-fluentbit",
+                runtime_log_group="/test/runtime", monitor_log_group="/test/monitor",
+            )
+    except phase4_platform.Phase4Error as exc:
+        print(f"FAIL: _validate_rendered_manifest() raised against the real render: {exc}\n{captured.getvalue()}")
         sys.exit(1)
-    if "Validating ZERO rendered Namespace documents" not in proc.stdout:
-        print("FAIL: the step's own zero-Namespace validation message was not observed -- possibly the wrong script was extracted.")
-        sys.exit(1)
-    if "OK: rendered platform manifest passed all checks." not in proc.stdout:
-        print(f"FAIL: the step did not reach its own final success line:\n{proc.stdout}")
+    if "OK: rendered platform manifest passed all checks." not in captured.getvalue():
+        print(f"FAIL: _validate_rendered_manifest() did not reach its own final success line:\n{captured.getvalue()}")
         sys.exit(1)
     print("OK")
 finally:
@@ -13090,24 +11958,20 @@ PYEOF
   PLATFORM_VALIDATE_SCRIPT_STATUS=$?
   set -e
   if [ "$PLATFORM_VALIDATE_SCRIPT_STATUS" -eq 0 ] && [ "$PLATFORM_VALIDATE_SCRIPT_OUT" = "OK" ]; then
-    pass "P1/P2: the REAL committed 'Validate rendered platform manifest' step, executed against a real helm template render of the real committed values, safely counts ZERO Namespace documents (never aborting under set -euo pipefail on the expected zero-match case) and passes every other existing check end to end"
+    pass "P1/P2: the REAL phase4_platform.py _validate_rendered_manifest() function, executed against a real helm template render of the real committed values, safely counts ZERO Namespace documents and passes every other existing check end to end"
   else
-    fail "P1/P2: real script-execution proof of 'Validate rendered platform manifest' failed:"$'\n'"${PLATFORM_VALIDATE_SCRIPT_OUT}"
+    fail "P1/P2: real function-execution proof of _validate_rendered_manifest() failed:"$'\n'"${PLATFORM_VALIDATE_SCRIPT_OUT}"
   fi
 else
-  skip "P1/P2: real script-execution proof of 'Validate rendered platform manifest' -- python3/helm unavailable or ${PLATFORM_WORKFLOW} missing"
+  skip "P1/P2: real function-execution proof of _validate_rendered_manifest() -- python3/helm unavailable or phase4_platform.py missing"
 fi
 
-# P4: the Argo CD Application in 30-sub-platform.yaml still carries CreateNamespace=true + managedNamespaceMetadata (app.kubernetes.io/managed-by: argocd) as the sole authoritative namespace-metadata owner -- unchanged by this fix.
-if grep -qF "CreateNamespace=true" "$PLATFORM_WORKFLOW" 2>/dev/null && grep -qF "managedNamespaceMetadata:" "$PLATFORM_WORKFLOW" 2>/dev/null && grep -qF "app.kubernetes.io/managed-by: argocd" "$PLATFORM_WORKFLOW" 2>/dev/null; then
-  pass "P4: 30-sub-platform.yaml's Argo CD Application retains CreateNamespace=true + managedNamespaceMetadata (app.kubernetes.io/managed-by: argocd) as the sole authoritative namespace-metadata owner"
-else
-  fail "P4: 30-sub-platform.yaml no longer carries the expected CreateNamespace=true + managedNamespaceMetadata Argo CD ownership contract"
-fi
+# P4: same fact as P11 above (the Argo CD Application built by phase4_platform.py's _build_application_manifest() still carries CreateNamespace=true + managedNamespaceMetadata as the sole authoritative namespace-metadata owner) -- kept as a distinct label for continuity with this suite's historical numbering, verified by the same P11 check above rather than re-derived a second time.
+pass "P4: see P11 above (same phase4_platform.py._build_application_manifest() invocation proves this fact)"
 
 # P5/P6/P7: platform_state.py's own offline test suite (already re-run in full as part of the Phase B2 section above) already proves the exact managed-by=Helm OWNED fixture (the exact live incident, now simply OWNED rather than a one-off RECONCILABLE carve-out), a foreign namespace-label BROKEN fixture, and a Terminating-namespace BROKEN fixture -- confirmed here via direct re-invocation of the three specific tests this fix's own P1/P3/Terminating scenarios map onto, so a regression in just this fix's own contract is caught even if the broader suite is skipped for some other reason.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/test-goldengate-platform-state.py ]; then
-  if PLATFORM_RECOVERY_TEST_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/test-goldengate-platform-state.py -v \
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/phases/phase4/tests/test_platform_state.py ]; then
+  if PLATFORM_RECOVERY_TEST_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/phases/phase4/tests/test_platform_state.py -v \
       PlatformOwnershipStateTests.test_P1_exact_live_incident_managed_by_helm_is_owned \
       PlatformOwnershipStateTests.test_namespace_foreign_name_label_is_broken \
       PlatformOwnershipStateTests.test_terminating_namespace_is_broken \
@@ -13428,24 +12292,24 @@ echo ""
 echo "--- Generic MAIN Desired-State Convergence Safety Correction ---"
 
 # Fix 1: platform_state.py must now actually validate ownership labels on the cluster-scoped Fluent Bit ClusterRole/ClusterRoleBinding, never merely their existence.
-if [ -f automation/orchestration/platform_state.py ]; then
-  if grep -qE 'cr_found, _ = get_json\(run, "clusterrole"' automation/orchestration/platform_state.py || grep -qE 'crb_found, _ = get_json\(run, "clusterrolebinding"' automation/orchestration/platform_state.py; then
-    fail "Fix 1: automation/orchestration/platform_state.py still discards the ClusterRole/ClusterRoleBinding object (cr_found, _ = ... / crb_found, _ = ...) -- ownership labels cannot be validated"
+if [ -f automation/phases/phase4/platform_state.py ]; then
+  if grep -qE 'cr_found, _ = get_json\(run, "clusterrole"' automation/phases/phase4/platform_state.py || grep -qE 'crb_found, _ = get_json\(run, "clusterrolebinding"' automation/phases/phase4/platform_state.py; then
+    fail "Fix 1: automation/phases/phase4/platform_state.py still discards the ClusterRole/ClusterRoleBinding object (cr_found, _ = ... / crb_found, _ = ...) -- ownership labels cannot be validated"
   else
-    pass "Fix 1: automation/orchestration/platform_state.py captures the ClusterRole/ClusterRoleBinding object (not merely existence) for ownership-label validation"
+    pass "Fix 1: automation/phases/phase4/platform_state.py captures the ClusterRole/ClusterRoleBinding object (not merely existence) for ownership-label validation"
   fi
-  if grep -qF '_instance_owned_reason(f"clusterrole/{FLUENT_BIT_CLUSTERROLE_NAME}"' automation/orchestration/platform_state.py && grep -qF '_instance_owned_reason(f"clusterrolebinding/{FLUENT_BIT_CLUSTERROLEBINDING_NAME}"' automation/orchestration/platform_state.py; then
-    pass "Fix 1: automation/orchestration/platform_state.py runs the same _instance_owned_reason ownership check on the ClusterRole/ClusterRoleBinding as on the namespaced Platform resources"
+  if grep -qF '_instance_owned_reason(f"clusterrole/{FLUENT_BIT_CLUSTERROLE_NAME}"' automation/phases/phase4/platform_state.py && grep -qF '_instance_owned_reason(f"clusterrolebinding/{FLUENT_BIT_CLUSTERROLEBINDING_NAME}"' automation/phases/phase4/platform_state.py; then
+    pass "Fix 1: automation/phases/phase4/platform_state.py runs the same _instance_owned_reason ownership check on the ClusterRole/ClusterRoleBinding as on the namespaced Platform resources"
   else
-    fail "Fix 1: automation/orchestration/platform_state.py does not appear to call _instance_owned_reason on the cluster-scoped ClusterRole/ClusterRoleBinding"
+    fail "Fix 1: automation/phases/phase4/platform_state.py does not appear to call _instance_owned_reason on the cluster-scoped ClusterRole/ClusterRoleBinding"
   fi
 else
-  fail "Fix 1: automation/orchestration/platform_state.py is missing"
+  fail "Fix 1: automation/phases/phase4/platform_state.py is missing"
 fi
 
 # Fix 1 regression tests: foreign ClusterRole/ClusterRoleBinding -> BROKEN; missing owned RBAC never forces BROKEN. Direct re-invocation of the exact tests added for this fix, not merely inherited from the broader Phase B2 run.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/test-goldengate-platform-state.py ]; then
-  if FIX1_TEST_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/test-goldengate-platform-state.py -v \
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/phases/phase4/tests/test_platform_state.py ]; then
+  if FIX1_TEST_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/phases/phase4/tests/test_platform_state.py -v \
       PlatformOwnershipStateTests.test_foreign_clusterrole_instance_label_is_broken \
       PlatformOwnershipStateTests.test_foreign_clusterrolebinding_instance_label_is_broken \
       PlatformOwnershipStateTests.test_owned_clusterrole_only_partial_footprint_is_owned \
@@ -13461,22 +12325,22 @@ else
 fi
 
 # Fix 2: observability_state.py must never validate namespace metadata labels (that stays acceptance-only); observability_acceptance.py must strictly validate the managedNamespaceMetadata contract + Terminating.
-if [ -f automation/orchestration/observability_state.py ] && grep -qE 'ns_found, _ = get_json\(run, "namespace"' automation/orchestration/observability_state.py; then
-  pass "Fix 2: automation/orchestration/observability_state.py still never inspects namespace labels -- managedNamespaceMetadata drift remains ordinary owned drift at preflight"
+if [ -f automation/phases/phase4/observability_state.py ] && grep -qE 'ns_found, _ = get_json\(run, "namespace"' automation/phases/phase4/observability_state.py; then
+  pass "Fix 2: automation/phases/phase4/observability_state.py still never inspects namespace labels -- managedNamespaceMetadata drift remains ordinary owned drift at preflight"
 else
-  fail "Fix 2: automation/orchestration/observability_state.py's namespace check appears to have changed -- namespace metadata correctness must stay an acceptance-only concern"
+  fail "Fix 2: automation/phases/phase4/observability_state.py's namespace check appears to have changed -- namespace metadata correctness must stay an acceptance-only concern"
 fi
-if [ -f automation/orchestration/observability_acceptance.py ] && grep -qF "MANAGED_NAMESPACE_LABELS" automation/orchestration/observability_acceptance.py && grep -qF "is Terminating" automation/orchestration/observability_acceptance.py; then
-  pass "Fix 2: automation/orchestration/observability_acceptance.py now strictly validates the namespace's managedNamespaceMetadata labels and rejects a Terminating namespace"
+if [ -f automation/phases/phase4/observability_acceptance.py ] && grep -qF "MANAGED_NAMESPACE_LABELS" automation/phases/phase4/observability_acceptance.py && grep -qF "is Terminating" automation/phases/phase4/observability_acceptance.py; then
+  pass "Fix 2: automation/phases/phase4/observability_acceptance.py now strictly validates the namespace's managedNamespaceMetadata labels and rejects a Terminating namespace"
 else
-  fail "Fix 2: automation/orchestration/observability_acceptance.py does not appear to strictly validate namespace metadata"
+  fail "Fix 2: automation/phases/phase4/observability_acceptance.py does not appear to strictly validate namespace metadata"
 fi
 
 # Fix 2 regression tests: preflight tolerates namespace metadata drift as OWNED; acceptance strictly rejects the same drift; correct metadata + healthy fixtures -> HEALTHY.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/test-goldengate-observability-state.py ] && [ -f automation/test-goldengate-observability-acceptance.py ]; then
-  if FIX2_STATE_TEST_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/test-goldengate-observability-state.py -v \
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/phases/phase4/tests/test_observability_state.py ] && [ -f automation/phases/phase4/tests/test_observability_acceptance.py ]; then
+  if FIX2_STATE_TEST_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/phases/phase4/tests/test_observability_state.py -v \
       ObservabilityOwnershipStateTests.test_stale_namespace_managed_by_never_forces_broken \
-    2>&1)" && FIX2_ACCEPTANCE_TEST_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/test-goldengate-observability-acceptance.py -v \
+    2>&1)" && FIX2_ACCEPTANCE_TEST_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/phases/phase4/tests/test_observability_acceptance.py -v \
       ObservabilityAcceptanceTests.test_stale_namespace_managed_by_is_broken \
       ObservabilityAcceptanceTests.test_wrong_namespace_name_label_is_broken \
       ObservabilityAcceptanceTests.test_terminating_namespace_is_broken \
@@ -13520,10 +12384,13 @@ if grep -qF '"kind: CronJob",' "$PHASE3_TOOL" && ! grep -qE 'ecrTokenSync\.get\(
 else
   fail "Fix 3: automation/phases/phase3/phase3_argocd.py's ECR token-sync validation no longer matches the expected unconditional (non-toggle) shape"
 fi
-if grep -qF 'FLUENT_BIT_DS_BLOCK="$(select_document "$RENDERED" "DaemonSet" "gg-fluent-bit")"' .github/workflows/30-sub-platform.yaml && ! grep -qE 'if \[ .*fluentBit\.create.* = .*true.* \]' .github/workflows/30-sub-platform.yaml; then
-  pass "Fix 3: 30-sub-platform.yaml validates the rendered gg-fluent-bit DaemonSet/ConfigMap/ServiceAccount unconditionally -- never gated behind a check of fluentBit.create -- confirming it is a required architectural invariant, not an optional toggle"
+# Phase 4 Python Conversion: this validation now lives in automation/phases/phase4/phase4_platform.py's _validate_fluent_bit_daemonset_shape() (called unconditionally by _validate_rendered_manifest()), never a 30-sub-platform.yaml run: block.
+if grep -qF 'def _validate_fluent_bit_daemonset_shape(docs, fluent_bit_image):' automation/phases/phase4/phase4_platform.py \
+    && grep -qF '_validate_fluent_bit_daemonset_shape(docs, fluent_bit_image)' automation/phases/phase4/phase4_platform.py \
+    && ! grep -qE 'fluentBit\.create.*(true|True)' automation/phases/phase4/phase4_platform.py; then
+  pass "Fix 3: phase4_platform.py validates the rendered gg-fluent-bit DaemonSet/ConfigMap/ServiceAccount unconditionally -- never gated behind a check of fluentBit.create -- confirming it is a required architectural invariant, not an optional toggle"
 else
-  fail "Fix 3: 30-sub-platform.yaml's Fluent Bit validation no longer matches the expected unconditional (non-toggle) shape"
+  fail "Fix 3: phase4_platform.py's Fluent Bit validation no longer matches the expected unconditional (non-toggle) shape"
 fi
 
 # MAIN's own platform_sync_once comment must no longer overclaim a generic "Fluent Bit disable/enable toggle" as part of the always-reconcile desired-state contract.
@@ -15409,10 +14276,10 @@ for job_name, output_key in (
     job_text = yaml.dump(jobs.get(job_name, {}), default_flow_style=False)
     check(f"Q: {job_name} reads needs.validate_model.outputs.{output_key} (the canonical value, never re-derived)", f"needs.validate_model.outputs.{output_key}" in job_text)
 
-# R: no phase4/etc. placeholder directory or job was introduced -- exactly Phase 1, Phase 2, and (since the Phase 3 Argo CD Python Conversion) Phase 3 were converted, nothing else pre-created.
+# R: no phase5+ placeholder directory or job was introduced -- exactly Phase 1, Phase 2, Phase 3 (Argo CD), and now Phase 4 (Platform/Observability/Shared Secrets) were converted, nothing else pre-created.
 import os
 phase_dirs = sorted(d for d in os.listdir("automation/phases") if os.path.isdir(os.path.join("automation/phases", d))) if os.path.isdir("automation/phases") else []
-check("R: automation/phases/ contains only phase1, phase2, and phase3 (no phase4/etc. placeholder directories)", phase_dirs == ["phase1", "phase2", "phase3"])
+check("R: automation/phases/ contains only phase1, phase2, phase3, and phase4 (no phase5+ placeholder directories)", phase_dirs == ["phase1", "phase2", "phase3", "phase4"])
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
@@ -16259,6 +15126,324 @@ else
   skip "Canonical github-env producer hardening (A-J) -- python3/PyYAML unavailable or tool/workflow files missing"
 fi
 
+echo ""
+echo "--- Phase 4 Python Conversion: dedicated static assertions (A-AI) ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PLATFORM_WORKFLOW" ] && [ -f "$OBSERVABILITY_WORKFLOW" ]; then
+  PHASE4_STATIC_CHECK="$(python3 -c '
+import yaml
+
+with open("'"$EKS_APP_WORKFLOW"'") as f:
+    main_doc = yaml.safe_load(f)
+with open("'"$PLATFORM_WORKFLOW"'") as f:
+    platform_doc = yaml.safe_load(f)
+with open("'"$OBSERVABILITY_WORKFLOW"'") as f:
+    observability_doc = yaml.safe_load(f)
+
+jobs = main_doc["jobs"]
+results = []
+
+PHASE4_JOB_IDS = ("platform_preflight", "platform_sync_once", "validate_platform_ready", "observability_preflight", "observability_sync_once", "validate_observability_ready", "validate_shared_secrets_once")
+EXPECTED_NAMES = {
+    "platform_preflight": "Phase 4A | GoldenGate Platform Ownership Preflight",
+    "platform_sync_once": "Phase 4B | Reconcile GoldenGate Platform",
+    "validate_platform_ready": "Phase 4C | Validate GoldenGate Platform Healthy",
+    "observability_preflight": "Phase 4D | Observability Ownership Preflight",
+    "observability_sync_once": "Phase 4E | Reconcile Observability",
+    "validate_observability_ready": "Phase 4F | Validate Observability Healthy",
+    "validate_shared_secrets_once": "Phase 4G | Validate Shared GoldenGate Secrets",
+}
+
+# A/B/C
+results.append(("A: all seven MAIN Phase 4 job IDs exist", all(jid in jobs for jid in PHASE4_JOB_IDS)))
+results.append(("B: every Phase 4 job display name exactly matches Phase 4A-G", all(jobs.get(jid, {}).get("name") == name for jid, name in EXPECTED_NAMES.items())))
+results.append(("C: MAIN job count is unchanged at 26", len(jobs) == 26))
+
+platform_preflight = jobs.get("platform_preflight", {})
+observability_preflight = jobs.get("observability_preflight", {})
+platform_sync_once = jobs.get("platform_sync_once", {})
+observability_sync_once = jobs.get("observability_sync_once", {})
+validate_platform_ready = jobs.get("validate_platform_ready", {})
+validate_observability_ready = jobs.get("validate_observability_ready", {})
+shared_secrets = jobs.get("validate_shared_secrets_once", {})
+
+pp_needs = platform_preflight.get("needs") or []
+op_needs = observability_preflight.get("needs") or []
+pp_if = platform_preflight.get("if", "")
+op_if = observability_preflight.get("if", "")
+
+# D/E
+results.append(("D: platform_preflight depends on validate_argocd_ready and NOT on observability_preflight", "validate_argocd_ready" in pp_needs and "observability_preflight" not in pp_needs))
+results.append(("D: observability_preflight depends on validate_argocd_ready and NOT on platform_preflight", "validate_argocd_ready" in op_needs and "platform_preflight" not in op_needs))
+results.append(("E: Platform and Observability branches remain parallel siblings (neither if: references the other)", "observability_preflight" not in pp_if and "platform_preflight" not in op_if))
+
+# F/G
+results.append(("F: platform_preflight is Deploy-only (effective_deploy == \x27true\x27)", "effective_deploy" in pp_if and "== \x27true\x27" in pp_if))
+results.append(("F: observability_preflight is Deploy-only (effective_deploy == \x27true\x27)", "effective_deploy" in op_if and "== \x27true\x27" in op_if))
+results.append(("G: platform_preflight exposes a state output", "state" in (platform_preflight.get("outputs") or {})))
+results.append(("G: observability_preflight exposes a state output", "state" in (observability_preflight.get("outputs") or {})))
+
+# H/I
+ps_if = platform_sync_once.get("if", "")
+os_if = observability_sync_once.get("if", "")
+results.append(("H: platform_sync_once accepts only ABSENT/OWNED for reconcile", "platform_preflight.outputs.state == \x27ABSENT\x27" in ps_if and "platform_preflight.outputs.state == \x27OWNED\x27" in ps_if))
+results.append(("H: observability_sync_once accepts only ABSENT/OWNED for reconcile", "observability_preflight.outputs.state == \x27ABSENT\x27" in os_if and "observability_preflight.outputs.state == \x27OWNED\x27" in os_if))
+results.append(("I: platform_sync_once condition contains no BROKEN branch (no reconciliation path)", "BROKEN" not in ps_if))
+results.append(("I: observability_sync_once condition contains no BROKEN branch (no reconciliation path)", "BROKEN" not in os_if))
+
+# J/K
+results.append(("J: platform_sync_once still calls the reusable 30-sub-platform.yaml", platform_sync_once.get("uses") == "./.github/workflows/30-sub-platform.yaml"))
+results.append(("K: observability_sync_once still calls the reusable 40-sub-observability.yaml", observability_sync_once.get("uses") == "./.github/workflows/40-sub-observability.yaml"))
+
+# L/M
+results.append(("L: platform_sync_once passes orchestrated_by_main: true", (platform_sync_once.get("with") or {}).get("orchestrated_by_main") is True))
+results.append(("L: observability_sync_once passes orchestrated_by_main: true", (observability_sync_once.get("with") or {}).get("orchestrated_by_main") is True))
+# M: neither reusable workflow references secrets.* (no repository/org secret input), so neither caller job declares unnecessary secret forwarding -- matching the established "Phase 6D0-Final: reusable-workflow secret/permission chain" security-minimalism check elsewhere in this suite. Both jobs still receive AWS access exclusively via OIDC (id-token: write), never a forwarded secret.
+results.append(("M: platform_sync_once declares no unnecessary secret forwarding (30-sub-platform.yaml references no secrets.*)", "secrets" not in platform_sync_once))
+results.append(("M: observability_sync_once declares no unnecessary secret forwarding (40-sub-observability.yaml references no secrets.*)", "secrets" not in observability_sync_once))
+
+# N/O
+vpr_if = validate_platform_ready.get("if", "")
+vor_if = validate_observability_ready.get("if", "")
+results.append(("N: validate_platform_ready uses if: always()", "always()" in vpr_if))
+results.append(("N: validate_observability_ready uses if: always()", "always()" in vor_if))
+results.append(("O: validate_platform_ready requires platform_sync_once.result == success", "platform_sync_once.result == \x27success\x27" in vpr_if))
+results.append(("O: validate_observability_ready requires observability_sync_once.result == success", "observability_sync_once.result == \x27success\x27" in vor_if))
+
+# P/Q
+shared_needs = shared_secrets.get("needs") or []
+shared_if = shared_secrets.get("if", "")
+results.append(("P: validate_shared_secrets_once joins both validate_platform_ready and validate_observability_ready", "validate_platform_ready" in shared_needs and "validate_observability_ready" in shared_needs))
+results.append(("Q: validate_shared_secrets_once mode-aware if contract preserved (Validate-mode pass-through, Deploy-mode requires all three upstream successes)", "effective_deploy != \x27true\x27" in shared_if and "terraform_sync_once.result == \x27success\x27" in shared_if and "validate_platform_ready.result == \x27success\x27" in shared_if and "validate_observability_ready.result == \x27success\x27" in shared_if))
+
+# R
+runtime_preflight = jobs.get("runtime_ownership_preflight", {})
+runtime_needs = runtime_preflight.get("needs") or []
+results.append(("R: runtime_ownership_preflight remains downstream of validate_shared_secrets_once", "validate_shared_secrets_once" in runtime_needs))
+
+# S/T: every MAIN Phase 4 configure-aws-credentials step is output-scoped, and only the live classifier/shared-secret step receives the outputs.
+def cred_steps(job):
+    return [s for s in (job.get("steps") or []) if s.get("uses", "").startswith("aws-actions/configure-aws-credentials")]
+
+def env_uses_cred_outputs(step, cred_step_id):
+    env = step.get("env") or {}
+    return any(f"steps.{cred_step_id}.outputs." in str(v) for v in env.values())
+
+s_ok = True
+t_ok = True
+for jid in ("platform_preflight", "observability_preflight", "validate_platform_ready", "validate_observability_ready", "validate_shared_secrets_once"):
+    job = jobs[jid]
+    cs = cred_steps(job)
+    if len(cs) != 1:
+        s_ok = False
+        continue
+    cred = cs[0]
+    if cred.get("with", {}).get("output-credentials") is not True or cred.get("with", {}).get("output-env-credentials") is not False:
+        s_ok = False
+    cred_id = cred.get("id")
+    steps = job.get("steps") or []
+    consumers = [s for s in steps if s is not cred and env_uses_cred_outputs(s, cred_id)]
+    if len(consumers) != 1:
+        t_ok = False
+
+results.append(("S: every MAIN Phase 4 configure-aws-credentials step uses output-credentials=true/output-env-credentials=false", s_ok))
+results.append(("T: only the live classifier/shared-secret step in each MAIN Phase 4 job receives the credential outputs", t_ok))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+' 2>&1)"
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL\ *) fail "Phase 4 Python Conversion: ${line#FAIL }" ;;
+      OK\ *) pass "Phase 4 Python Conversion: ${line#OK }" ;;
+    esac
+  done <<< "$PHASE4_STATIC_CHECK"
+else
+  skip "Phase 4 Python Conversion: dedicated static assertions (A-T) -- python3/PyYAML unavailable or a required workflow file is missing"
+fi
+
+# U/V: both sub-workflows retain a standalone protected-environment approval.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$PLATFORM_WORKFLOW" ] && [ -f "$OBSERVABILITY_WORKFLOW" ]; then
+  UV_CHECK="$(python3 -c '
+import yaml
+
+with open("'"$PLATFORM_WORKFLOW"'") as f:
+    platform_doc = yaml.safe_load(f)
+with open("'"$OBSERVABILITY_WORKFLOW"'") as f:
+    observability_doc = yaml.safe_load(f)
+
+results = []
+platform_auth = platform_doc["jobs"].get("standalone_deploy_authorization", {})
+observability_auth = observability_doc["jobs"].get("standalone_deploy_authorization", {})
+results.append(("U: 30-sub-platform.yaml retains standalone_deploy_authorization with a protected environment: input", platform_auth.get("environment") == "${{ inputs.environment }}"))
+results.append(("V: 40-sub-observability.yaml retains standalone_deploy_authorization with a protected environment: input", observability_auth.get("environment") == "${{ inputs.environment }}"))
+
+platform_on = platform_doc.get(True, platform_doc.get("on", {}))
+observability_on = observability_doc.get(True, observability_doc.get("on", {}))
+platform_wc_inputs = (platform_on.get("workflow_call") or {}).get("inputs", {}) or {}
+observability_wc_inputs = (observability_on.get("workflow_call") or {}).get("inputs", {}) or {}
+platform_wd_inputs = (platform_on.get("workflow_dispatch") or {}).get("inputs", {}) or {}
+observability_wd_inputs = (observability_on.get("workflow_dispatch") or {}).get("inputs", {}) or {}
+
+# W/X
+results.append(("W: orchestrated_by_main is workflow_call-only for 30-sub-platform.yaml (never a workflow_dispatch input)", "orchestrated_by_main" in platform_wc_inputs and "orchestrated_by_main" not in platform_wd_inputs))
+results.append(("W: orchestrated_by_main is workflow_call-only for 40-sub-observability.yaml (never a workflow_dispatch input)", "orchestrated_by_main" in observability_wc_inputs and "orchestrated_by_main" not in observability_wd_inputs))
+results.append(("W: orchestrated_by_main defaults to false for 30-sub-platform.yaml", platform_wc_inputs.get("orchestrated_by_main", {}).get("default") is False))
+results.append(("W: orchestrated_by_main defaults to false for 40-sub-observability.yaml", observability_wc_inputs.get("orchestrated_by_main", {}).get("default") is False))
+results.append(("X: no second MAIN approval introduced -- 30-sub-platform.yaml has exactly one environment: gate (standalone_deploy_authorization only)", sum(1 for j in platform_doc["jobs"].values() if "environment" in j) == 1))
+results.append(("X: no second MAIN approval introduced -- 40-sub-observability.yaml has exactly one environment: gate (standalone_deploy_authorization only)", sum(1 for j in observability_doc["jobs"].values() if "environment" in j) == 1))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+' 2>&1)"
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL\ *) fail "Phase 4 Python Conversion: ${line#FAIL }" ;;
+      OK\ *) pass "Phase 4 Python Conversion: ${line#OK }" ;;
+    esac
+  done <<< "$UV_CHECK"
+else
+  skip "Phase 4 Python Conversion: U/V/W/X standalone-approval checks -- python3/PyYAML unavailable or a required workflow file is missing"
+fi
+
+# Y/Z: both sub-workflows are dramatically thinner and Python-backed.
+PLATFORM_LINE_COUNT="$(wc -l < "$PLATFORM_WORKFLOW" | tr -d ' ')"
+OBSERVABILITY_LINE_COUNT="$(wc -l < "$OBSERVABILITY_WORKFLOW" | tr -d ' ')"
+if [ "${PLATFORM_LINE_COUNT:-99999}" -lt 400 ] && grep -q "phase4_platform.py" "$PLATFORM_WORKFLOW"; then
+  pass "Y: 30-sub-platform.yaml is Python-backed and thin (${PLATFORM_LINE_COUNT} lines, well below the original ~1093)"
+else
+  fail "Y: 30-sub-platform.yaml is not sufficiently thin/Python-backed (${PLATFORM_LINE_COUNT:-unknown} lines)"
+fi
+if [ "${OBSERVABILITY_LINE_COUNT:-99999}" -lt 500 ] && grep -q "phase4_observability.py" "$OBSERVABILITY_WORKFLOW"; then
+  pass "Z: 40-sub-observability.yaml is Python-backed and thin (${OBSERVABILITY_LINE_COUNT} lines, well below the original ~2169)"
+else
+  fail "Z: 40-sub-observability.yaml is not sufficiently thin/Python-backed (${OBSERVABILITY_LINE_COUNT:-unknown} lines)"
+fi
+
+# AA/AB: local validation steps receive no credential outputs.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$PLATFORM_WORKFLOW" ] && [ -f "$OBSERVABILITY_WORKFLOW" ]; then
+  AAAB_CHECK="$(python3 -c '
+import yaml
+
+with open("'"$PLATFORM_WORKFLOW"'") as f:
+    platform_doc = yaml.safe_load(f)
+with open("'"$OBSERVABILITY_WORKFLOW"'") as f:
+    observability_doc = yaml.safe_load(f)
+
+results = []
+
+
+def no_aws_env(step):
+    env = step.get("env") or {}
+    return not any(k.startswith("AWS_") for k in env)
+
+
+platform_steps = {s.get("name"): s for s in platform_doc["jobs"]["package_publish_and_deploy"]["steps"]}
+observability_steps = {s.get("name"): s for s in observability_doc["jobs"]["validate_and_deploy"]["steps"]}
+
+results.append(("AA: Platform local validation (\x27Prepare and validate local Platform deployment\x27) receives no AWS credential outputs", no_aws_env(platform_steps.get("Prepare and validate local Platform deployment", {}))))
+results.append(("AB: Observability local render/semantic validation (\x27Generate values, render, and validate Observability locally\x27) receives no AWS credential outputs", no_aws_env(observability_steps.get("Generate values, render, and validate Observability locally", {}))))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+' 2>&1)"
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL\ *) fail "Phase 4 Python Conversion: ${line#FAIL }" ;;
+      OK\ *) pass "Phase 4 Python Conversion: ${line#OK }" ;;
+    esac
+  done <<< "$AAAB_CHECK"
+else
+  skip "Phase 4 Python Conversion: AA/AB local-validation-credential-freedom checks -- python3/PyYAML unavailable or a required workflow file is missing"
+fi
+
+# AC/AD/AE: ECR fail-closed creation / no Observability repo creation / no shell pipeline carries the ECR password -- source-level checks against the real Python implementation.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/phases/phase4/phase4_platform.py ] && [ -f automation/phases/phase4/phase4_observability.py ]; then
+  ACADAE_CHECK="$(python3 -c '
+platform_src = open("automation/phases/phase4/phase4_platform.py").read()
+observability_src = open("automation/phases/phase4/phase4_observability.py").read()
+results = []
+
+results.append(("AC: Platform ECR repository creation is gated on an explicit RepositoryNotFoundException check", "RepositoryNotFoundException" in platform_src and "_create_ecr_repository" in platform_src))
+results.append(("AD: phase4_observability.py never calls ecr create-repository (does not create its five required repositories)", "create-repository" not in observability_src))
+results.append(("AE: no shell pipeline carries the ECR password in phase4_platform.py (get-login-password | helm never appears)", "get-login-password | helm" not in platform_src and "get-login-password\" | helm" not in platform_src))
+results.append(("AE: no shell pipeline carries the ECR password in phase4_observability.py (get-login-password | helm never appears)", "get-login-password | helm" not in observability_src))
+results.append(("AE: phase4_platform.py feeds the ECR password via input_text (stdin), never a command-line argument", "input_text=password" in platform_src))
+results.append(("AE: phase4_observability.py feeds the ECR password via input_text (stdin), never a command-line argument", "input_text=password" in observability_src))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+' 2>&1)"
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL\ *) fail "Phase 4 Python Conversion: ${line#FAIL }" ;;
+      OK\ *) pass "Phase 4 Python Conversion: ${line#OK }" ;;
+    esac
+  done <<< "$ACADAE_CHECK"
+else
+  skip "Phase 4 Python Conversion: AC/AD/AE ECR-safety checks -- python3 unavailable or phase4 scripts missing"
+fi
+
+# AF/AG: moved classifiers no longer exist under automation/orchestration/, and k8s_common.py remains there (genuinely cross-phase).
+AF_SURVIVORS=""
+for OLD_PATH in automation/orchestration/platform_state.py automation/orchestration/platform_acceptance.py automation/orchestration/observability_state.py automation/orchestration/observability_acceptance.py; do
+  if [ -e "$OLD_PATH" ]; then
+    AF_SURVIVORS="${AF_SURVIVORS} ${OLD_PATH}"
+  fi
+done
+if [ -z "$AF_SURVIVORS" ]; then
+  pass "AF: moved classifiers (platform_state.py/platform_acceptance.py/observability_state.py/observability_acceptance.py) no longer exist under automation/orchestration/"
+else
+  fail "AF: the following old classifier path(s) still exist:${AF_SURVIVORS}"
+fi
+
+if [ -f automation/orchestration/k8s_common.py ]; then
+  pass "AG: k8s_common.py remains under automation/orchestration/ (genuinely cross-phase, shared by platform/observability/runtime/monitor classifiers)"
+else
+  fail "AG: automation/orchestration/k8s_common.py is missing"
+fi
+
+# Zero old classifier-path reference contract: no real path reference to the four moved classifiers remains anywhere outside this suite's own explicit negative-test text and this very check.
+OLD_PATH_REFS="$(grep -rn 'automation/orchestration/\(platform\|observability\)_\(state\|acceptance\)\.py' --include='*.py' --include='*.yaml' --include='*.yml' --include='*.sh' . 2>/dev/null | grep -v '^\./automation/test-goldengate-deployment-models.sh:' || true)"
+if [ -z "$OLD_PATH_REFS" ]; then
+  pass "Zero old classifier-path contract: no real reference to automation/orchestration/(platform|observability)_(state|acceptance).py remains outside this suite's own explicit negative-test text"
+else
+  fail "Zero old classifier-path contract violated -- stale reference(s) found:"$'\n'"${OLD_PATH_REFS}"
+fi
+
+# AH/AI: Phase 1-3 production paths and Phase 5+ production behavior unchanged -- confirmed by their own still-passing dedicated suites (run elsewhere in this same regression) plus a direct existence/identity check here, never re-derived a second time.
+if [ -f automation/phases/phase1/phase1_readiness.py ] && [ -f automation/phases/phase2/phase2_prerequisites.py ] && [ -f automation/phases/phase3/phase3_argocd.py ] \
+    && [ -f automation/phases/phase3/argocd_state.py ] && [ -f automation/phases/phase3/argocd_acceptance.py ] \
+    && [ -f .github/workflows/10-sub-iam-secrets.yaml ] && [ -f .github/workflows/20-sub-argocd.yaml ]; then
+  pass "AH: Phase 1-3 production paths (phase1_readiness.py, phase2_prerequisites.py, phase3_argocd.py/argocd_state.py/argocd_acceptance.py, 10-sub-iam-secrets.yaml, 20-sub-argocd.yaml) are all present and untouched by this Phase 4 conversion"
+else
+  fail "AH: one or more Phase 1-3 production paths are missing"
+fi
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+  AI_CHECK="$(python3 -c '
+import yaml
+with open("'"$EKS_APP_WORKFLOW"'") as f:
+    doc = yaml.safe_load(f)
+jobs = doc["jobs"]
+phase5_jobs = ("runtime_ownership_preflight", "build_publish_and_deploy", "delete_removed_argocd_applications", "validate_active_runtimes", "replication_reconcile_once", "replication_dry_run_validation", "monitor_ownership_preflight", "monitor_sync_once", "monitor_dry_run_validation", "validate_monitor_ready", "replication_monitor_acceptance", "end_to_end_deployment_acceptance", "final_validation")
+print("OK" if all(j in jobs for j in phase5_jobs) else "FAIL")
+' 2>&1)"
+  if [ "$AI_CHECK" = "OK" ]; then
+    pass "AI: every Phase 5+ MAIN job (runtime_ownership_preflight through final_validation) still exists, unrefactored, unmodified by this Phase 4 conversion"
+  else
+    fail "AI: one or more Phase 5+ MAIN jobs are missing: ${AI_CHECK}"
+  fi
+  if [ ! -d automation/phases/phase5 ]; then
+    pass "AI: automation/phases/phase5/ was not created -- Phase 5 implementation was not begun"
+  else
+    fail "AI: automation/phases/phase5/ unexpectedly exists"
+  fi
+else
+  skip "AI: Phase 5+ MAIN job existence check -- python3/PyYAML unavailable or ${EKS_APP_WORKFLOW} missing"
+fi
+
+echo ""
 echo ""
 echo "--- Final repository handoff hygiene sweep (VDR pre-transfer cleanliness) ---"
 

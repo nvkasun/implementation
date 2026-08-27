@@ -1,12 +1,12 @@
-"""Offline tests for automation/orchestration/platform_state.py (ownership-safety preflight: ABSENT/OWNED/BROKEN); run directly via `python3 automation/test-goldengate-platform-state.py`. No live Kubernetes -- every kubectl response is a fake, injected fixture. Exercises the classifier's actual logic (never merely greps its source). Post-reconciliation acceptance (HEALTHY/BROKEN) is a separate module -- see automation/test-goldengate-platform-acceptance.py."""
+"""Offline tests for automation/phases/phase4/platform_state.py (ownership-safety preflight: ABSENT/OWNED/BROKEN); run directly via `python3 automation/phases/phase4/tests/test_platform_state.py`. No live Kubernetes -- every kubectl response is a fake, injected fixture. Exercises the classifier's actual logic (never merely greps its source). Post-reconciliation acceptance (HEALTHY/BROKEN) is a separate module -- see automation/phases/phase4/tests/test_platform_acceptance.py."""
 from __future__ import annotations
 
 import importlib.util
-import os
 import unittest
+from pathlib import Path
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TOOL_PATH = os.path.join(REPO_ROOT, "automation", "orchestration", "platform_state.py")
+REPO_ROOT = Path(__file__).resolve().parents[4]
+TOOL_PATH = REPO_ROOT / "automation" / "phases" / "phase4" / "platform_state.py"
 
 
 def _load_tool():
@@ -127,7 +127,7 @@ class PlatformOwnershipStateTests(unittest.TestCase):
         self.assertEqual(result["reasons"], [])
 
     def test_P1_exact_live_incident_managed_by_helm_is_owned(self):
-        # The exact live incident this architecture must resolve generically: app.kubernetes.io/managed-by=Helm on the namespace is now NEVER checked in ownership at all -- OWNED regardless, letting normal Argo CD reconciliation (managedNamespaceMetadata) converge it. See automation/test-goldengate-platform-acceptance.py for the strict post-reconcile managed-by=argocd proof.
+        # The exact live incident this architecture must resolve generically: app.kubernetes.io/managed-by=Helm on the namespace is now NEVER checked in ownership at all -- OWNED regardless, letting normal Argo CD reconciliation (managedNamespaceMetadata) converge it. See test_platform_acceptance.py for the strict post-reconcile managed-by=argocd proof.
         cluster = _populate_owned_cluster(FakeCluster())
         ns = _namespace_obj(labeled=True)
         ns["metadata"]["labels"]["app.kubernetes.io/managed-by"] = "Helm"
@@ -263,7 +263,7 @@ class PlatformStateNoMutationSourceSweepTests(unittest.TestCase):
     )
 
     def test_source_contains_no_mutating_command(self):
-        k8s_common_path = os.path.join(REPO_ROOT, "automation", "orchestration", "k8s_common.py")
+        k8s_common_path = REPO_ROOT / "automation" / "orchestration" / "k8s_common.py"
         for path in (TOOL_PATH, k8s_common_path):
             with open(path) as f:
                 source = f.read()

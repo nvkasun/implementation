@@ -1,32 +1,32 @@
 #!/usr/bin/env python3
-"""automation/orchestration/platform_state.py: read-only GoldenGate Platform ownership-safety preflight classifier -- answers exactly one question, "is it safe for MAIN to reconcile the GoldenGate Platform installation?", as one of ABSENT/OWNED/BROKEN. This is NOT a HEALTHY-skip prerequisite classifier: the platform's desired state (Fluent Bit image/config, shared ServiceAccount role ARNs, any future values-driven resource) may legitimately change on every run, so OWNED (not HEALTHY) is the "safe to reconcile" state -- readiness/exact-desired-state acceptance is validated separately, post-reconciliation, by automation/orchestration/platform_acceptance.py. Generic by design: this module checks OWNERSHIP LABELS on whatever currently exists, never the correctness/readiness of any individual resource (including the runtime namespace's app.kubernetes.io/managed-by label, which is a desired-state acceptance concern, not an ownership one) -- adding a new values-driven chart resource, or flipping an existing one false<->true, never requires touching this file. Never mutates the cluster: every kubectl invocation here is a `get` (read-only); no apply/create/delete/patch/annotate/label/helm call exists in this module. Consumes environment identity through automation/goldengate-environment.py, never a second environment parser."""
+"""automation/phases/phase4/platform_state.py: read-only GoldenGate Platform ownership-safety preflight classifier -- answers exactly one question, "is it safe for MAIN to reconcile the GoldenGate Platform installation?", as one of ABSENT/OWNED/BROKEN. This is NOT a HEALTHY-skip prerequisite classifier: the platform's desired state (Fluent Bit image/config, shared ServiceAccount role ARNs, any future values-driven resource) may legitimately change on every run, so OWNED (not HEALTHY) is the "safe to reconcile" state -- readiness/exact-desired-state acceptance is validated separately, post-reconciliation, by automation/phases/phase4/platform_acceptance.py. Generic by design: this module checks OWNERSHIP LABELS on whatever currently exists, never the correctness/readiness of any individual resource (including the runtime namespace's app.kubernetes.io/managed-by label, which is a desired-state acceptance concern, not an ownership one) -- adding a new values-driven chart resource, or flipping an existing one false<->true, never requires touching this file. Never mutates the cluster: every kubectl invocation here is a `get` (read-only); no apply/create/delete/patch/annotate/label/helm call exists in this module. Consumes environment identity through automation/goldengate-environment.py, never a second environment parser."""
 from __future__ import annotations
 
 import argparse
 import importlib.util
 import json
-import os
 import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
-def _load_sibling_module(name, filename):
-    """Lazy import of a same-directory automation/orchestration/ module by explicit file path -- the same importlib.util convention this repo already uses for automation/goldengate-environment.py, so this module never depends on sys.path/CWD."""
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+def _load_module(name, path):
+    """Lazy import of a repository module by explicit absolute file path -- the same importlib.util convention this repo already uses for automation/goldengate-environment.py, so this module never depends on sys.path/CWD."""
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-_k8s_common = _load_sibling_module("k8s_common", "k8s_common.py")
+# k8s_common.py is genuinely cross-phase (shared by platform/observability/runtime/monitor classifiers) and stays under automation/orchestration/ -- never copied into automation/phases/phase4/.
+_k8s_common = _load_module("k8s_common", REPO_ROOT / "automation" / "orchestration" / "k8s_common.py")
 ClassifierInspectionError = _k8s_common.ClassifierInspectionError
 KubectlRunner = _k8s_common.KubectlRunner
 get_json = _k8s_common.get_json
 list_json = _k8s_common.list_json
 
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-
-_ENVIRONMENT_MODULE_PATH = os.path.join(os.path.dirname(__file__), "..", "goldengate-environment.py")
+_ENVIRONMENT_MODULE_PATH = REPO_ROOT / "automation" / "goldengate-environment.py"
 _environment_module = None
 
 

@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
-"""automation/orchestration/observability_acceptance.py: read-only Observability (amazon-cloudwatch-observability) post-reconciliation acceptance classifier -- answers exactly one question, "does the live Observability installation exactly match the current committed desired state right now?", as one of HEALTHY/BROKEN. Unlike automation/orchestration/observability_state.py (a pre-reconciliation ownership-safety preflight that only checks Application identity), this tool DOES require full readiness and exact desired-state correctness: a missing/unready workload, an unapproved/non-digest-pinned image, a wrong Agent CR mode/hostNetwork, a wrong cloudwatch-agent ServiceAccount role-arn, a stale chart version, or any forbidden component (Fluent Bit-like DaemonSet, target-allocator pod, Application Signals/DCGM/Neuron CRD) are all BROKEN here. Never mutates the cluster: every kubectl invocation here is a `get` (read-only); no apply/create/delete/patch/annotate/label/helm call exists in this module. Consumes environment identity through automation/goldengate-environment.py, never a second environment parser. The desired contract (resource names, Application identity, Agent CR/workload shape, allowed image repositories, forbidden components) is read directly from .github/workflows/40-sub-observability.yaml's own live-validation section, never guessed -- the upstream amazon-cloudwatch-observability chart itself is not vendored as source in this repo."""
+"""automation/phases/phase4/observability_acceptance.py: read-only Observability (amazon-cloudwatch-observability) post-reconciliation acceptance classifier -- answers exactly one question, "does the live Observability installation exactly match the current committed desired state right now?", as one of HEALTHY/BROKEN. Unlike automation/phases/phase4/observability_state.py (a pre-reconciliation ownership-safety preflight that only checks Application identity), this tool DOES require full readiness and exact desired-state correctness: a missing/unready workload, an unapproved/non-digest-pinned image, a wrong Agent CR mode/hostNetwork, a wrong cloudwatch-agent ServiceAccount role-arn, a stale chart version, or any forbidden component (Fluent Bit-like DaemonSet, target-allocator pod, Application Signals/DCGM/Neuron CRD) are all BROKEN here. Never mutates the cluster: every kubectl invocation here is a `get` (read-only); no apply/create/delete/patch/annotate/label/helm call exists in this module. Consumes environment identity through automation/goldengate-environment.py, never a second environment parser. The desired contract (resource names, Application identity, Agent CR/workload shape, allowed image repositories, forbidden components) is read directly from .github/workflows/40-sub-observability.yaml's own live-validation section, never guessed -- the upstream amazon-cloudwatch-observability chart itself is not vendored as source in this repo."""
 from __future__ import annotations
 
 import argparse
 import importlib.util
 import json
-import os
 import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
-def _load_sibling_module(name, filename):
-    """Lazy import of a same-directory automation/orchestration/ module by explicit file path -- the same importlib.util convention this repo already uses for automation/goldengate-environment.py, so this module never depends on sys.path/CWD."""
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+def _load_module(name, path):
+    """Lazy import of a repository module by explicit absolute file path -- the same importlib.util convention this repo already uses for automation/goldengate-environment.py, so this module never depends on sys.path/CWD."""
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-_k8s_common = _load_sibling_module("k8s_common", "k8s_common.py")
+# k8s_common.py is genuinely cross-phase (shared by platform/observability/runtime/monitor classifiers) and stays under automation/orchestration/ -- never copied into automation/phases/phase4/.
+_k8s_common = _load_module("k8s_common", REPO_ROOT / "automation" / "orchestration" / "k8s_common.py")
 ClassifierInspectionError = _k8s_common.ClassifierInspectionError
 KubectlRunner = _k8s_common.KubectlRunner
 daemonset_ready = _k8s_common.daemonset_ready
@@ -27,9 +29,7 @@ get_json = _k8s_common.get_json
 list_json = _k8s_common.list_json
 pod_template_images = _k8s_common.pod_template_images
 
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-
-_ENVIRONMENT_MODULE_PATH = os.path.join(os.path.dirname(__file__), "..", "goldengate-environment.py")
+_ENVIRONMENT_MODULE_PATH = REPO_ROOT / "automation" / "goldengate-environment.py"
 _environment_module = None
 
 

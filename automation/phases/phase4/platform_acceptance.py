@@ -1,34 +1,34 @@
 #!/usr/bin/env python3
-"""automation/orchestration/platform_acceptance.py: read-only GoldenGate Platform post-reconciliation acceptance classifier -- answers exactly one question, "does the live GoldenGate Platform installation exactly match the current committed desired state right now?", as one of HEALTHY/BROKEN. Unlike automation/orchestration/platform_state.py (a pre-reconciliation ownership-safety preflight that only checks OWNERSHIP LABELS), this tool DOES require full readiness and exact desired-state correctness: a missing/unready Fluent Bit DaemonSet, a wrong IRSA role-arn, a stale namespace app.kubernetes.io/managed-by label, an incorrect Fluent Bit image/shape, or a non-Synced/non-Healthy Application are all BROKEN here. Never mutates the cluster: every kubectl invocation here is a `get` (read-only); no apply/create/delete/patch/annotate/label/helm call exists in this module. Consumes environment identity through automation/goldengate-environment.py, never a second environment parser."""
+"""automation/phases/phase4/platform_acceptance.py: read-only GoldenGate Platform post-reconciliation acceptance classifier -- answers exactly one question, "does the live GoldenGate Platform installation exactly match the current committed desired state right now?", as one of HEALTHY/BROKEN. Unlike automation/phases/phase4/platform_state.py (a pre-reconciliation ownership-safety preflight that only checks OWNERSHIP LABELS), this tool DOES require full readiness and exact desired-state correctness: a missing/unready Fluent Bit DaemonSet, a wrong IRSA role-arn, a stale namespace app.kubernetes.io/managed-by label, an incorrect Fluent Bit image/shape, or a non-Synced/non-Healthy Application are all BROKEN here. Never mutates the cluster: every kubectl invocation here is a `get` (read-only); no apply/create/delete/patch/annotate/label/helm call exists in this module. Consumes environment identity through automation/goldengate-environment.py, never a second environment parser."""
 from __future__ import annotations
 
 import argparse
 import importlib.util
 import json
-import os
 import re
 import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
-def _load_sibling_module(name, filename):
-    """Lazy import of a same-directory automation/orchestration/ module by explicit file path -- the same importlib.util convention this repo already uses for automation/goldengate-environment.py, so this module never depends on sys.path/CWD."""
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+def _load_module(name, path):
+    """Lazy import of a repository module by explicit absolute file path -- the same importlib.util convention this repo already uses for automation/goldengate-environment.py, so this module never depends on sys.path/CWD."""
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-_k8s_common = _load_sibling_module("k8s_common", "k8s_common.py")
+# k8s_common.py is genuinely cross-phase (shared by platform/observability/runtime/monitor classifiers) and stays under automation/orchestration/ -- never copied into automation/phases/phase4/.
+_k8s_common = _load_module("k8s_common", REPO_ROOT / "automation" / "orchestration" / "k8s_common.py")
 ClassifierInspectionError = _k8s_common.ClassifierInspectionError
 KubectlRunner = _k8s_common.KubectlRunner
 daemonset_ready = _k8s_common.daemonset_ready
 get_json = _k8s_common.get_json
 list_json = _k8s_common.list_json
 
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-
-_ENVIRONMENT_MODULE_PATH = os.path.join(os.path.dirname(__file__), "..", "goldengate-environment.py")
+_ENVIRONMENT_MODULE_PATH = REPO_ROOT / "automation" / "goldengate-environment.py"
 _environment_module = None
 
 
