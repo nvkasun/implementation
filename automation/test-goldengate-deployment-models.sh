@@ -3065,7 +3065,8 @@ def classify_state(state_word, deployment_model="singleRuntime"):
             if argv[:2] == ["aws", "eks"]:
                 return type("Proc", (), {"returncode": 0, "stdout": "", "stderr": ""})()
             if str(phase5_runtime.RUNTIME_STATE_TOOL) in argv:
-                return type("Proc", (), {"returncode": 0, "stdout": json.dumps({"state": state_word, "environment": "dev", "deployment_id": "gg-postgresql-repltest-01", "namespace": "goldengate-dev", "reasons": [], "checks": {"application_found": False, "footprint_found": {}}}), "stderr": ""})()
+                complete_footprint = {k: False for k in phase5_runtime._load_runtime_state_module().RUNTIME_FOOTPRINT_KEYS}
+                return type("Proc", (), {"returncode": 0, "stdout": json.dumps({"state": state_word, "environment": "dev", "deployment_id": "gg-postgresql-repltest-01", "namespace": "goldengate-dev", "reasons": [], "checks": {"application_found": False, "footprint_found": complete_footprint}}), "stderr": ""})()
             return type("Proc", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
         args = type("Args", (), {"environment": "dev", "deployment_id": "gg-postgresql-repltest-01", "state_path": state_path})()
@@ -15280,7 +15281,7 @@ results.append(("W: managed physical-removal cannot mutate (prepare-removal fail
 
 # X/Y: post-delete success requires Application absent and non-PVC footprint absent.
 post_delete_absent_src = cmd_source("_post_delete_positively_absent")
-results.append(("X: post-delete success requires Application absent (application_found is not False -> fail)", 'checks.get("application_found") is not False' in post_delete_absent_src))
+results.append(("X: post-delete success requires Application absent (application_found is not False -> fail)", "application_found is not False" in post_delete_absent_src))
 results.append(("Y: non-PVC footprint must be absent for post-delete success", "non_pvc_still_present" in post_delete_absent_src))
 
 # Z/AA: retained PVC and shared namespace are never deleted (behavioral proof, not text-scanning).
@@ -15341,6 +15342,194 @@ PYEOF
   fi
 else
   skip "Phase 5 Python Conversion: dedicated static assertions -- python3/PyYAML/main workflow/phase5_runtime.py unavailable"
+fi
+
+echo ""
+echo "--- Phase 5 Python Conversion: CSI Helm-status fail-closed correction + post-delete classifier schema hardening ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$PHASE5_RUNTIME_TOOL" ]; then
+  PHASE5_TWO_GAPS_CHECK="$(python3 - "$PHASE5_RUNTIME_TOOL" <<'PYEOF'
+import importlib.util
+import io
+import json
+import sys
+from contextlib import redirect_stdout
+from unittest import mock
+
+tool_path = sys.argv[1]
+spec = importlib.util.spec_from_file_location("phase5_runtime", tool_path)
+phase5_runtime = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(phase5_runtime)
+
+runtime_state = phase5_runtime._load_runtime_state_module()
+
+results = []
+
+
+class FakeProc:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+# --- Issue 1: CSI Helm-status classification must never infer absence from a generic non-zero exit. ---
+
+def classify_status(status_proc):
+    def fake_run(argv, **kwargs):
+        if argv[:2] == ["helm", "status"]:
+            return status_proc
+        return FakeProc(0, "")
+    with mock.patch.object(phase5_runtime, "run", fake_run):
+        return phase5_runtime._classify_helm_release_status("secrets-store-csi-driver", "kube-system")
+
+
+# Confirmed reproduction: cluster unreachable must NOT classify as "not-found".
+try:
+    classify_status(FakeProc(1, "", "Error: Kubernetes cluster unreachable: context deadline exceeded"))
+    results.append(("confirmed reproduction: cluster-unreachable Helm status failure no longer misclassified as release-absent", False))
+except phase5_runtime.Phase5Error:
+    results.append(("confirmed reproduction: cluster-unreachable Helm status failure no longer misclassified as release-absent", True))
+
+results.append(("explicit 'release: not found' classifies as not-found", classify_status(FakeProc(1, "", "Error: release: not found")) == "not-found"))
+results.append(("Helm status success classifies as present", classify_status(FakeProc(0, "STATUS: deployed")) == "present"))
+
+for label, stderr_text in (
+    ("Forbidden", "Error: secrets is forbidden: User cannot list resource"),
+    ("Unauthorized", "error: You must be logged in to the server (Unauthorized)"),
+    ("timeout/context deadline", "Error: context deadline exceeded"),
+    ("network failure", "Error: dial tcp: connection refused"),
+    ("unknown error", "Error: some completely unrecognized failure mode"),
+    ("empty stderr/stdout", ""),
+):
+    try:
+        classify_status(FakeProc(1, "", stderr_text))
+        results.append((f"{label} fails closed (Phase5Error)", False))
+    except phase5_runtime.Phase5Error:
+        results.append((f"{label} fails closed (Phase5Error)", True))
+
+# A CSI status failure must never let helm get values run.
+get_values_calls = []
+
+
+def fake_run_full(argv, **kwargs):
+    if argv[:3] == ["helm", "get", "values"]:
+        get_values_calls.append(list(argv))
+    if argv[:2] == ["kubectl", "get"] and "csidriver" in argv:
+        return FakeProc(0, "")
+    if argv[:2] == ["kubectl", "get"] and "crd" in argv:
+        return FakeProc(0, "")
+    if argv[:4] == ["kubectl", "get", "csidriver", "secrets-store.csi.k8s.io"]:
+        return FakeProc(0, '["sts.amazonaws.com","pods.eks.amazonaws.com"]')
+    if argv[:2] == ["helm", "status"]:
+        return FakeProc(1, "", "Error: Kubernetes cluster unreachable: context deadline exceeded")
+    return FakeProc(0, "")
+
+
+try:
+    with mock.patch.object(phase5_runtime, "run", fake_run_full):
+        with redirect_stdout(io.StringIO()):
+            phase5_runtime._validate_csi_prerequisites()
+except phase5_runtime.Phase5Error:
+    pass
+results.append(("a CSI Helm-status failure never invokes helm get values", get_values_calls == []))
+
+# syncSecret strictness itself remains byte-for-byte the same contract.
+def sync_ok(payload):
+    try:
+        phase5_runtime._validate_sync_secret_enabled(json.dumps(payload))
+        return True
+    except phase5_runtime.Phase5Error:
+        return False
+
+
+results.append(("syncSecret strict boolean validation unchanged: true passes", sync_ok({"syncSecret": {"enabled": True}})))
+results.append(("syncSecret strict boolean validation unchanged: false/null/string/missing/malformed all fail", not sync_ok({"syncSecret": {"enabled": False}}) and not sync_ok({"syncSecret": {"enabled": None}}) and not sync_ok({"syncSecret": {"enabled": "true"}}) and not sync_ok({}) ))
+
+# --- Issue 2: post-delete positive-absence proof must require the complete canonical footprint schema. ---
+
+FOOTPRINT_KEYS = set(runtime_state.RUNTIME_FOOTPRINT_KEYS)
+
+
+def complete_footprint(**overrides):
+    footprint = {k: False for k in FOOTPRINT_KEYS}
+    footprint.update(overrides)
+    return footprint
+
+
+def classifier_result(state, application_found, **footprint_overrides):
+    return {"state": state, "checks": {"application_found": application_found, "footprint_found": complete_footprint(**footprint_overrides)}}
+
+
+# Confirmed reproduction: old malformed examples that incorrectly returned success.
+old_bug_1 = {"state": "ABSENT", "checks": {"application_found": False}}  # missing footprint_found entirely
+old_bug_2 = {"state": "SOMETHING_ELSE", "checks": {"application_found": False, "footprint_found": {}}}  # unknown state + empty footprint
+
+ok1, _ = phase5_runtime._post_delete_positively_absent(old_bug_1, retained_pvc_expected=False)
+results.append(("confirmed reproduction: missing footprint_found no longer certifies deletion complete", ok1 is False))
+
+ok2, _ = phase5_runtime._post_delete_positively_absent(old_bug_2, retained_pvc_expected=False)
+results.append(("confirmed reproduction: unknown/malformed state no longer certifies deletion complete", ok2 is False))
+
+# Canonical footprint key set exactly matches runtime_state.py's own RUNTIME_FOOTPRINT_KEYS (no independently-drifting duplicate list).
+expected_keys = {"statefulset", "service", "headless_service", "pvc", "storageclass", "admin_secretproviderclass", "certificate_secretproviderclass", "ingress", "admin_secret"}
+results.append(("canonical runtime footprint key set matches runtime_state.RUNTIME_FOOTPRINT_KEYS exactly", FOOTPRINT_KEYS == expected_keys))
+
+# Complete ABSENT shape passes.
+ok, why = phase5_runtime._post_delete_positively_absent(classifier_result("ABSENT", False), retained_pvc_expected=False)
+results.append(("complete ABSENT shape (every footprint key literal False) passes", ok is True))
+
+# Complete retained-PVC-only OWNED shape passes ONLY with the explicit retained-PVC context.
+ok, why = phase5_runtime._post_delete_positively_absent(classifier_result("OWNED", False, pvc=True), retained_pvc_expected=True)
+results.append(("complete retained-PVC-only OWNED shape passes with retained_pvc_expected=True", ok is True))
+ok, why = phase5_runtime._post_delete_positively_absent(classifier_result("OWNED", False, pvc=True), retained_pvc_expected=False)
+results.append(("the same retained-PVC-only OWNED shape fails without the explicit retained-PVC context", ok is False))
+
+# Any non-PVC footprint still blocks completion, even with the hint.
+any_non_pvc_blocks = all(
+    phase5_runtime._post_delete_positively_absent(classifier_result("OWNED", False, **{key: True}), retained_pvc_expected=True)[0] is False
+    for key in FOOTPRINT_KEYS - {"pvc"}
+)
+results.append(("any non-PVC footprint entry (still True) blocks completion regardless of retained_pvc_expected", any_non_pvc_blocks))
+
+# application_found must be a literal bool -- string/int values fail closed, never truthiness-coerced.
+try:
+    phase5_runtime._validate_runtime_state_classifier_output({"state": "ABSENT", "checks": {"application_found": "false", "footprint_found": complete_footprint()}})
+    results.append(("application_found='false' (string) fails closed rather than being truthiness-coerced to True", False))
+except phase5_runtime.Phase5Error:
+    results.append(("application_found='false' (string) fails closed rather than being truthiness-coerced to True", True))
+
+# cmd_removal_preflight no longer uses truthiness coercion -- verified via AST (real source, never a reimplementation text match).
+import ast
+with open(tool_path) as f:
+    tool_source = f.read()
+tree = ast.parse(tool_source)
+removal_preflight_fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "cmd_removal_preflight")
+removal_preflight_src = ast.get_source_segment(tool_source, removal_preflight_fn) or ""
+results.append(("cmd_removal_preflight no longer calls bool(checks.get(...)) (truthiness coercion removed)", "bool(checks.get(" not in removal_preflight_src))
+results.append(("cmd_removal_preflight now delegates to _validate_runtime_state_classifier_output", "_validate_runtime_state_classifier_output" in removal_preflight_src))
+
+# 180s/15s bounded post-delete wait remains unchanged.
+post_delete_fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "cmd_post_delete_acceptance")
+post_delete_src = ast.get_source_segment(tool_source, post_delete_fn) or ""
+results.append(("post-delete bounded wait remains 180s/15s", "timeout_seconds, interval_seconds, elapsed = 180, 15, 0" in post_delete_src))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  echo "$PHASE5_TWO_GAPS_CHECK"
+  if [ -z "$(echo "$PHASE5_TWO_GAPS_CHECK" | grep '^FAIL ' || true)" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        OK\ *) pass "Phase 5 CSI/post-delete correction: ${line#OK }" ;;
+      esac
+    done <<< "$PHASE5_TWO_GAPS_CHECK"
+  else
+    fail "Phase 5 CSI/post-delete correction: dedicated static assertions failed:"$'\n'"${PHASE5_TWO_GAPS_CHECK}"
+  fi
+else
+  skip "Phase 5 CSI/post-delete correction: dedicated static assertions -- python3/phase5_runtime.py unavailable"
 fi
 
 echo "--- Final repository handoff hygiene sweep (VDR pre-transfer cleanliness) ---"

@@ -136,6 +136,24 @@ def _descriptor(**overrides):
     return d
 
 
+RUNTIME_FOOTPRINT_KEYS = frozenset({
+    "statefulset", "service", "headless_service", "pvc", "storageclass",
+    "admin_secretproviderclass", "certificate_secretproviderclass", "ingress", "admin_secret",
+})
+
+
+def _complete_footprint(**overrides):
+    """A complete, schema-valid checks.footprint_found mapping -- every canonical key present as a literal bool, defaulting to False, with explicit overrides."""
+    footprint = {key: False for key in RUNTIME_FOOTPRINT_KEYS}
+    footprint.update(overrides)
+    return footprint
+
+
+def _classifier_result(state, application_found, **footprint_overrides):
+    """A complete, schema-valid runtime_state.py classifier result shape."""
+    return {"state": state, "checks": {"application_found": application_found, "footprint_found": _complete_footprint(**footprint_overrides)}}
+
+
 # ==== PREPARATION TESTS ====
 
 class InputValidationTests(unittest.TestCase):
@@ -1018,7 +1036,7 @@ def _base_prereq_scripted():
     scripted.when(_starts_with("kubectl", "get", "crd", "secretproviderclasses.secrets-store.csi.x-k8s.io"), FakeProc(0, ""))
     scripted.when(lambda argv: argv[:4] == ["kubectl", "get", "csidriver", "secrets-store.csi.k8s.io"] and "-o" in argv,
                   FakeProc(0, '["sts.amazonaws.com","pods.eks.amazonaws.com"]'))
-    scripted.when(_starts_with("helm", "status", "secrets-store-csi-driver"), FakeProc(1, "", "not found"))
+    scripted.when(_starts_with("helm", "status", "secrets-store-csi-driver"), FakeProc(1, "", "Error: release: not found"))
     scripted.when(_starts_with("kubectl", "get", "crd", "applications.argoproj.io"), FakeProc(0, ""))
     return scripted
 
@@ -1103,6 +1121,70 @@ class ClusterPrerequisiteTests(unittest.TestCase):
         with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
             with self.assertRaises(phase5_runtime.Phase5Error):
                 _run_quiet(phase5_runtime.cmd_validate_cluster_prerequisites, args)
+
+
+class HelmReleaseStatusClassificationTests(unittest.TestCase):
+    """Issue 1: _classify_helm_release_status()/_validate_csi_prerequisites() must never infer Helm release absence from a generic non-zero exit code -- only an EXPLICIT 'release: not found' authorizes skipping the syncSecret Helm-values check."""
+
+    def _classify(self, status_proc):
+        scripted = ScriptedRun()
+        scripted.when(_starts_with("helm", "status", "secrets-store-csi-driver"), status_proc)
+        with mock.patch.object(phase5_runtime, "run", scripted):
+            return phase5_runtime._classify_helm_release_status("secrets-store-csi-driver", "kube-system"), scripted
+
+    def test_1_helm_release_exists_syncsecret_true_passes(self):
+        scripted = _base_prereq_scripted()
+        scripted.when(_starts_with("helm", "status", "secrets-store-csi-driver"), FakeProc(0, "STATUS: deployed"))
+        scripted.when(_starts_with("helm", "get", "values", "secrets-store-csi-driver"), FakeProc(0, json.dumps({"syncSecret": {"enabled": True}})))
+        args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID)
+        with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+            _run_quiet(phase5_runtime.cmd_validate_cluster_prerequisites, args)
+        values_calls = [c for c in scripted.calls if c["argv"][:3] == ["helm", "get", "values"]]
+        self.assertEqual(len(values_calls), 1)
+
+    def test_2_explicit_release_not_found_skips_helm_values_check_safely(self):
+        status, scripted = self._classify(FakeProc(1, "", "Error: release: not found"))
+        self.assertEqual(status, "not-found")
+
+    def test_3_kubernetes_cluster_unreachable_fails_closed(self):
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            self._classify(FakeProc(1, "", "Error: Kubernetes cluster unreachable: context deadline exceeded"))
+
+    def test_4_forbidden_fails_closed(self):
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            self._classify(FakeProc(1, "", "Error: secrets is forbidden: User cannot list resource"))
+
+    def test_5_unauthorized_fails_closed(self):
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            self._classify(FakeProc(1, "", "error: You must be logged in to the server (Unauthorized)"))
+
+    def test_6_timeout_context_deadline_fails_closed(self):
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            self._classify(FakeProc(1, "", "Error: context deadline exceeded"))
+
+    def test_7_network_tls_failure_fails_closed(self):
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            self._classify(FakeProc(1, "", "Error: Get \"https://x\": dial tcp: connection refused"))
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            self._classify(FakeProc(1, "", "Error: tls: handshake failure"))
+
+    def test_8_unknown_error_fails_closed(self):
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            self._classify(FakeProc(1, "", "Error: some completely unrecognized failure mode"))
+
+    def test_9_empty_error_with_nonzero_fails_closed(self):
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            self._classify(FakeProc(1, "", ""))
+
+    def test_10_error_failure_never_invokes_helm_get_values(self):
+        scripted = _base_prereq_scripted()
+        scripted.when(_starts_with("helm", "status", "secrets-store-csi-driver"), FakeProc(1, "", "Error: Kubernetes cluster unreachable: context deadline exceeded"))
+        args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID)
+        with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+            with self.assertRaises(phase5_runtime.Phase5Error):
+                _run_quiet(phase5_runtime.cmd_validate_cluster_prerequisites, args)
+        values_calls = [c for c in scripted.calls if c["argv"][:3] == ["helm", "get", "values"]]
+        self.assertEqual(values_calls, [])
 
 
 # ==== ARGO RECONCILIATION TESTS ====
@@ -1386,22 +1468,55 @@ class RemovalPreflightTests(TempStateCase):
                 _run_quiet(phase5_runtime.cmd_removal_preflight, self.args)
 
     def test_absent_preflight_captures_checks(self):
-        self._run_preflight({"state": "ABSENT", "checks": {"application_found": False, "footprint_found": {}}})
+        self._run_preflight(_classifier_result("ABSENT", False))
         state = phase5_runtime.load_state(self.state_path)
         self.assertEqual(state["ownership_state"], "ABSENT")
         self.assertIs(state["application_found"], False)
 
     def test_owned_preflight_captures_checks(self):
-        self._run_preflight({"state": "OWNED", "checks": {"application_found": True, "footprint_found": {"statefulset": True}}})
+        self._run_preflight(_classifier_result("OWNED", True, statefulset=True))
         state = phase5_runtime.load_state(self.state_path)
         self.assertEqual(state["ownership_state"], "OWNED")
         self.assertIs(state["application_found"], True)
 
     def test_retained_pvc_expected_flag_passed_when_efs_mode_set(self):
         phase5_runtime.update_state(self.state_path, {"efs_mode": "existing"}, phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
-        scripted = self._run_preflight({"state": "OWNED", "checks": {"application_found": False, "footprint_found": {"pvc": True}}})
+        scripted = self._run_preflight(_classifier_result("OWNED", False, pvc=True))
         classifier_call = next(c["argv"] for c in scripted.calls if str(phase5_runtime.RUNTIME_STATE_TOOL) in c["argv"])
         self.assertIn("--retained-pvc-expected", classifier_call)
+
+    def test_29_malformed_classifier_checks_fails_before_removal_state_persisted(self):
+        scripted = ScriptedRun()
+        scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
+        scripted.when(_starts_with(sys.executable, str(phase5_runtime.RUNTIME_STATE_TOOL)), FakeProc(0, json.dumps({"state": "ABSENT", "checks": {"application_found": False}})))
+        with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+            with self.assertRaises(phase5_runtime.Phase5Error):
+                _run_quiet(phase5_runtime.cmd_removal_preflight, self.args)
+        self.assertNotIn("ownership_state", phase5_runtime.load_state(self.state_path))
+
+    def test_30_application_found_string_false_is_rejected(self):
+        scripted = ScriptedRun()
+        scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
+        scripted.when(_starts_with(sys.executable, str(phase5_runtime.RUNTIME_STATE_TOOL)), FakeProc(0, json.dumps({"state": "ABSENT", "checks": {"application_found": "false", "footprint_found": _complete_footprint()}})))
+        with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+            with self.assertRaises(phase5_runtime.Phase5Error):
+                _run_quiet(phase5_runtime.cmd_removal_preflight, self.args)
+
+    def test_31_incomplete_footprint_mapping_fails_before_mutation(self):
+        scripted = ScriptedRun()
+        scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
+        scripted.when(_starts_with(sys.executable, str(phase5_runtime.RUNTIME_STATE_TOOL)), FakeProc(0, json.dumps({"state": "ABSENT", "checks": {"application_found": False, "footprint_found": {"statefulset": False}}})))
+        with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+            with self.assertRaises(phase5_runtime.Phase5Error):
+                _run_quiet(phase5_runtime.cmd_removal_preflight, self.args)
+
+    def test_32_valid_complete_owned_classifier_result_persisted_exactly(self):
+        result = _classifier_result("OWNED", True, statefulset=True, service=True)
+        self._run_preflight(result)
+        state = phase5_runtime.load_state(self.state_path)
+        self.assertEqual(state["ownership_state"], "OWNED")
+        self.assertIs(state["application_found"], True)
+        self.assertEqual(state["footprint_found"], result["checks"]["footprint_found"])
 
 
 class RemoveRuntimeTests(TempStateCase):
@@ -1490,6 +1605,99 @@ class RemoveRuntimeTests(TempStateCase):
 
 # ==== CRITICAL DELETE FALSE-SUCCESS REGRESSION TESTS ====
 
+class ClassifierOutputSchemaTests(unittest.TestCase):
+    """Issue 2: _validate_runtime_state_classifier_output() must never let a malformed/incomplete classifier shape be silently treated as "everything reads as absent"."""
+
+    def test_11_complete_absent_classifier_result_passes_structural_schema(self):
+        state, application_found, footprint_found = phase5_runtime._validate_runtime_state_classifier_output(_classifier_result("ABSENT", False))
+        self.assertEqual(state, "ABSENT")
+        self.assertIs(application_found, False)
+        self.assertEqual(set(footprint_found), RUNTIME_FOOTPRINT_KEYS)
+
+    def test_12_missing_checks_fails(self):
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            phase5_runtime._validate_runtime_state_classifier_output({"state": "ABSENT"})
+
+    def test_13_missing_application_found_fails(self):
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            phase5_runtime._validate_runtime_state_classifier_output({"state": "ABSENT", "checks": {"footprint_found": _complete_footprint()}})
+
+    def test_14_application_found_string_false_fails(self):
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            phase5_runtime._validate_runtime_state_classifier_output({"state": "ABSENT", "checks": {"application_found": "false", "footprint_found": _complete_footprint()}})
+
+    def test_15_application_found_zero_fails(self):
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            phase5_runtime._validate_runtime_state_classifier_output({"state": "ABSENT", "checks": {"application_found": 0, "footprint_found": _complete_footprint()}})
+
+    def test_16_missing_footprint_found_fails(self):
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            phase5_runtime._validate_runtime_state_classifier_output({"state": "ABSENT", "checks": {"application_found": False}})
+
+    def test_17_empty_footprint_found_fails(self):
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            phase5_runtime._validate_runtime_state_classifier_output({"state": "ABSENT", "checks": {"application_found": False, "footprint_found": {}}})
+
+    def test_18_one_missing_expected_footprint_key_fails(self):
+        incomplete = _complete_footprint()
+        del incomplete["ingress"]
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            phase5_runtime._validate_runtime_state_classifier_output({"state": "ABSENT", "checks": {"application_found": False, "footprint_found": incomplete}})
+
+    def test_19_partial_footprint_cannot_certify_deletion_complete(self):
+        result = {"state": "ABSENT", "checks": {"application_found": False, "footprint_found": {"statefulset": False}}}
+        ok, why = phase5_runtime._post_delete_positively_absent(result, retained_pvc_expected=False)
+        self.assertFalse(ok)
+
+    def test_20_footprint_value_string_false_fails(self):
+        bad = _complete_footprint()
+        bad["statefulset"] = "false"
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            phase5_runtime._validate_runtime_state_classifier_output({"state": "ABSENT", "checks": {"application_found": False, "footprint_found": bad}})
+
+    def test_21_footprint_value_zero_fails(self):
+        bad = _complete_footprint()
+        bad["service"] = 0
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            phase5_runtime._validate_runtime_state_classifier_output({"state": "ABSENT", "checks": {"application_found": False, "footprint_found": bad}})
+
+    def test_22_unknown_state_fails(self):
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            phase5_runtime._validate_runtime_state_classifier_output(_classifier_result("SOMETHING_ELSE", False))
+
+    def test_23_missing_state_fails(self):
+        result = _classifier_result("ABSENT", False)
+        del result["state"]
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            phase5_runtime._validate_runtime_state_classifier_output(result)
+
+    def test_24_broken_remains_not_complete(self):
+        ok, why = phase5_runtime._post_delete_positively_absent(_classifier_result("BROKEN", False), retained_pvc_expected=False)
+        self.assertFalse(ok)
+
+    def test_25_complete_absent_every_footprint_false_passes(self):
+        ok, why = phase5_runtime._post_delete_positively_absent(_classifier_result("ABSENT", False), retained_pvc_expected=False)
+        self.assertTrue(ok, why)
+
+    def test_26_complete_owned_retained_pvc_only_passes_with_hint(self):
+        ok, why = phase5_runtime._post_delete_positively_absent(_classifier_result("OWNED", False, pvc=True), retained_pvc_expected=True)
+        self.assertTrue(ok, why)
+
+    def test_27_same_owned_retained_pvc_shape_without_hint_fails(self):
+        ok, why = phase5_runtime._post_delete_positively_absent(_classifier_result("OWNED", False, pvc=True), retained_pvc_expected=False)
+        self.assertFalse(ok)
+
+    def test_28_any_non_pvc_footprint_true_fails(self):
+        for key in RUNTIME_FOOTPRINT_KEYS - {"pvc"}:
+            ok, why = phase5_runtime._post_delete_positively_absent(_classifier_result("OWNED", False, **{key: True}), retained_pvc_expected=True)
+            self.assertFalse(ok, f"footprint key {key!r} unexpectedly allowed completion")
+
+    def test_footprint_key_schema_matches_runtime_state_module(self):
+        """Synchronization proof: this test file's own RUNTIME_FOOTPRINT_KEYS constant (used to build fixtures) must never independently drift from the real runtime_state.py classifier's own canonical key set."""
+        runtime_state = phase5_runtime._load_runtime_state_module()
+        self.assertEqual(RUNTIME_FOOTPRINT_KEYS, set(runtime_state.RUNTIME_FOOTPRINT_KEYS))
+
+
 class PostDeletePositiveProofTests(unittest.TestCase):
     def test_140_application_still_exists_state_owned_must_not_pass(self):
         """Confirmed reproduction of the current bug: Application exists, labels/destination/repoURL/releaseName all correct, classifier state=OWNED. `state != BROKEN` would incorrectly pass this -- the fixed positive-proof check must not."""
@@ -1504,29 +1712,34 @@ class PostDeletePositiveProofTests(unittest.TestCase):
         self.assertTrue(ok, why)
 
     def test_142_statefulset_still_present_fails(self):
-        result = {"state": "BROKEN", "checks": {"application_found": False, "footprint_found": {"statefulset": True}}}
+        result = _classifier_result("BROKEN", False, statefulset=True)
         ok, why = phase5_runtime._post_delete_positively_absent(result, retained_pvc_expected=False)
         self.assertFalse(ok)
+        self.assertIn("statefulset", why)
 
     def test_143_service_still_present_fails(self):
-        result = {"state": "BROKEN", "checks": {"application_found": False, "footprint_found": {"service": True}}}
+        result = _classifier_result("BROKEN", False, service=True)
         ok, why = phase5_runtime._post_delete_positively_absent(result, retained_pvc_expected=False)
         self.assertFalse(ok)
+        self.assertIn("service", why)
 
     def test_144_storageclass_still_present_fails(self):
-        result = {"state": "BROKEN", "checks": {"application_found": False, "footprint_found": {"storageclass": True}}}
+        result = _classifier_result("BROKEN", False, storageclass=True)
         ok, why = phase5_runtime._post_delete_positively_absent(result, retained_pvc_expected=False)
         self.assertFalse(ok)
+        self.assertIn("storageclass", why)
 
     def test_145_secretproviderclass_still_present_fails(self):
-        result = {"state": "BROKEN", "checks": {"application_found": False, "footprint_found": {"admin_secretproviderclass": True}}}
+        result = _classifier_result("BROKEN", False, admin_secretproviderclass=True)
         ok, why = phase5_runtime._post_delete_positively_absent(result, retained_pvc_expected=False)
         self.assertFalse(ok)
+        self.assertIn("admin_secretproviderclass", why)
 
     def test_146_admin_synced_secret_still_present_fails(self):
-        result = {"state": "BROKEN", "checks": {"application_found": False, "footprint_found": {"admin_secret": True}}}
+        result = _classifier_result("BROKEN", False, admin_secret=True)
         ok, why = phase5_runtime._post_delete_positively_absent(result, retained_pvc_expected=False)
         self.assertFalse(ok)
+        self.assertIn("admin_secret", why)
 
     def test_147_inspection_errors_never_count_as_absence(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1547,7 +1760,7 @@ class PostDeletePositiveProofTests(unittest.TestCase):
             args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
             scripted = ScriptedRun()
             scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
-            scripted.when(_starts_with(sys.executable, str(phase5_runtime.RUNTIME_STATE_TOOL)), FakeProc(0, json.dumps({"state": "OWNED", "checks": {"application_found": True, "footprint_found": {}}})))
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.RUNTIME_STATE_TOOL)), FakeProc(0, json.dumps(_classifier_result("OWNED", True, statefulset=True))))
             with mock.patch.object(phase5_runtime, "run", scripted), mock.patch.object(phase5_runtime.time, "sleep") as sleep_mock, _env_patch():
                 with self.assertRaises(phase5_runtime.Phase5Error) as ctx:
                     _run_quiet(phase5_runtime.cmd_post_delete_acceptance, args)
@@ -1564,7 +1777,7 @@ class PostDeletePositiveProofTests(unittest.TestCase):
             args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
             scripted = ScriptedRun()
             scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
-            scripted.when(_starts_with(sys.executable, str(phase5_runtime.RUNTIME_STATE_TOOL)), FakeProc(0, json.dumps({"state": "OWNED", "checks": {"application_found": True, "footprint_found": {}}})))
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.RUNTIME_STATE_TOOL)), FakeProc(0, json.dumps(_classifier_result("OWNED", True, statefulset=True))))
             with mock.patch.object(phase5_runtime, "run", scripted), mock.patch.object(phase5_runtime.time, "sleep"), _env_patch():
                 with self.assertRaises(phase5_runtime.Phase5Error):
                     _run_quiet(phase5_runtime.cmd_post_delete_acceptance, args)
@@ -1576,27 +1789,29 @@ class PostDeletePositiveProofTests(unittest.TestCase):
 
 class RetainedPvcOrchestrationTests(unittest.TestCase):
     def test_150_deployment_disabled_retained_pvc_safe(self):
-        result = {"state": "OWNED", "checks": {"application_found": False, "footprint_found": {"pvc": True, "statefulset": False}}}
+        result = _classifier_result("OWNED", False, pvc=True)
         ok, why = phase5_runtime._post_delete_positively_absent(result, retained_pvc_expected=phase5_runtime._retained_pvc_expected_for_removal("existing"))
         self.assertTrue(ok, why)
 
     def test_151_physical_removal_existing_retained_pvc_safe(self):
         self.assertTrue(phase5_runtime._retained_pvc_expected_for_removal("existing"))
-        result = {"state": "OWNED", "checks": {"application_found": False, "footprint_found": {"pvc": True}}}
+        result = _classifier_result("OWNED", False, pvc=True)
         ok, why = phase5_runtime._post_delete_positively_absent(result, retained_pvc_expected=True)
         self.assertTrue(ok, why)
 
     def test_152_physical_removal_foreign_mislabeled_pvc_fails(self):
         # The classifier itself (runtime_state.py) already returns BROKEN for a foreign/mislabeled PVC -- the orchestration layer must not override that.
-        result = {"state": "BROKEN", "checks": {"application_found": False, "footprint_found": {"pvc": True}}}
+        result = _classifier_result("BROKEN", False, pvc=True)
         ok, why = phase5_runtime._post_delete_positively_absent(result, retained_pvc_expected=True)
         self.assertFalse(ok)
+        self.assertIn("BROKEN", why)
 
     def test_153_physical_removal_efs_mode_empty_with_pvc_fails(self):
         self.assertFalse(phase5_runtime._retained_pvc_expected_for_removal(""))
-        result = {"state": "OWNED", "checks": {"application_found": False, "footprint_found": {"pvc": True}}}
+        result = _classifier_result("OWNED", False, pvc=True)
         ok, why = phase5_runtime._post_delete_positively_absent(result, retained_pvc_expected=phase5_runtime._retained_pvc_expected_for_removal(""))
         self.assertFalse(ok)
+        self.assertIn("retained PVC is present", why)
 
     def test_154_physical_removal_managed_fails_before_mutation(self):
         with tempfile.TemporaryDirectory() as tmp:

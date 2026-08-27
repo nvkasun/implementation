@@ -130,6 +130,9 @@ _K8S_RESOURCE_TYPE = {
     _ADMIN_SECRET_KIND: "secret",
 }
 
+# The single canonical footprint-key set this classifier ever reports in checks["footprint_found"] -- exposed here so callers (Phase 5C post-delete acceptance) can validate they received the complete expected schema without maintaining a second, independently-drifting key list. Always exactly the key set of _K8S_RESOURCE_TYPE (itself equal to _expected_footprint_names()'s own keys).
+RUNTIME_FOOTPRINT_KEYS = frozenset(_K8S_RESOURCE_TYPE)
+
 
 def _ownership_reason(resource_label, obj, environment, deployment_id):
     """Returns a reason string if the given already-fetched resource's ownership labels do not clearly belong to this exact deployment, else None. The admin Secret is exempt (see _ADMIN_SECRET_KIND docstring above) -- its mere existence under the expected name is never itself a conflict."""

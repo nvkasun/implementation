@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import re
@@ -1073,6 +1074,21 @@ def _validate_sync_secret_enabled(raw_json):
     print("syncSecret.enabled=true confirmed (structural JSON check).")
 
 
+def _classify_helm_release_status(release_name, namespace):
+    """Fail-closed Helm release-existence classification: "present" when `helm status` succeeds, "not-found" ONLY when the failure is an EXPLICIT Helm release-not-found result (the release may genuinely be managed outside Helm) -- every other failure (cluster unreachable, Forbidden, Unauthorized, timeout/context deadline, network/TLS failure, malformed/unknown/empty error) raises Phase5Error. A generic non-zero exit code is never, by itself, inferred as absence."""
+    proc = run(["helm", "status", release_name, "-n", namespace], check=False)
+    if proc.returncode == 0:
+        return "present"
+    error_text = ((proc.stderr or "") + (proc.stdout or "")).strip()
+    if "release: not found" in error_text.lower():
+        return "not-found"
+    raise Phase5Error(
+        f"could not determine whether Helm release {release_name!r} exists in namespace {namespace!r} "
+        f"(helm status exited {proc.returncode} without an explicit 'release: not found') -- refusing to guess absence. "
+        f"Failing closed:\n{error_text or '(no output)'}"
+    )
+
+
 def _validate_csi_prerequisites():
     if run(["kubectl", "get", "csidriver", "secrets-store.csi.k8s.io"], check=False).returncode != 0:
         raise Phase5Error("CSIDriver secrets-store.csi.k8s.io not found. Secrets Store CSI Driver is not installed on this cluster.")
@@ -1086,12 +1102,12 @@ def _validate_csi_prerequisites():
         raise Phase5Error(f"CSIDriver secrets-store.csi.k8s.io is missing tokenRequests audience pods.eks.amazonaws.com. Current tokenRequests: {token_requests}")
     print(f"tokenRequests OK: {token_requests}")
 
-    status_proc = run(["helm", "status", "secrets-store-csi-driver", "-n", "kube-system"], check=False)
-    if status_proc.returncode == 0:
+    release_status = _classify_helm_release_status("secrets-store-csi-driver", "kube-system")
+    if release_status == "present":
         values_proc = run(["helm", "get", "values", "secrets-store-csi-driver", "-n", "kube-system", "--all", "--output", "json"])
         _validate_sync_secret_enabled(values_proc.stdout)
     else:
-        print("Helm release secrets-store-csi-driver not found in kube-system. Skipping syncSecret check (driver may be managed outside Helm).")
+        print("Helm release secrets-store-csi-driver not found in kube-system (explicit 'release: not found'). Skipping syncSecret check (driver may be managed outside Helm).")
     print("Secrets Store CSI Driver prerequisites validated.")
 
 
@@ -1318,6 +1334,55 @@ def _retained_pvc_expected_for_removal(efs_mode):
     return efs_mode in ("existing", "managed")
 
 
+_runtime_state_module = None
+
+
+def _load_runtime_state_module():
+    """Lazy import of automation/phases/phase5/runtime_state.py -- the single canonical owner of the runtime footprint-key schema (RUNTIME_FOOTPRINT_KEYS). Never a second, independently-maintained footprint-key list here."""
+    global _runtime_state_module
+    if _runtime_state_module is None:
+        spec = importlib.util.spec_from_file_location("runtime_state", RUNTIME_STATE_TOOL)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _runtime_state_module = module
+    return _runtime_state_module
+
+
+def _validate_runtime_state_classifier_output(result):
+    """Strict schema validation of a runtime_state.py classifier result -- used BEFORE it is trusted for any removal-preflight or post-delete-acceptance decision. Requires: result is a JSON object; state is exactly one of ABSENT/OWNED/BROKEN; checks is a JSON object; checks.application_found is a literal JSON boolean (never a truthiness-coerced string/int -- bool("false") is True in Python, so this is checked with isinstance, never bool(...)); checks.footprint_found is a JSON object containing EXACTLY the canonical runtime_state.RUNTIME_FOOTPRINT_KEYS key set, every value a literal JSON boolean. Raises Phase5Error on any deviation -- a malformed/incomplete classifier shape must never be silently treated as "everything reads as absent". Returns (state, application_found, footprint_found) only once every check has passed."""
+    if not isinstance(result, dict):
+        raise Phase5Error(f"runtime ownership classifier output is a {type(result).__name__}, expected a JSON object.")
+
+    state = result.get("state")
+    if state not in ("ABSENT", "OWNED", "BROKEN"):
+        raise Phase5Error(f"runtime ownership classifier produced an unrecognized or missing state {state!r}; refusing to proceed.")
+
+    checks = result.get("checks")
+    if not isinstance(checks, dict):
+        raise Phase5Error(f"runtime ownership classifier output is missing a 'checks' object (got {checks!r}).")
+
+    application_found = checks.get("application_found")
+    if not isinstance(application_found, bool):
+        raise Phase5Error(f"runtime ownership classifier checks.application_found is {application_found!r} ({type(application_found).__name__}), expected a literal JSON boolean.")
+
+    footprint_found = checks.get("footprint_found")
+    if not isinstance(footprint_found, dict):
+        raise Phase5Error(f"runtime ownership classifier checks.footprint_found is {footprint_found!r}, expected a JSON object.")
+
+    expected_keys = set(_load_runtime_state_module().RUNTIME_FOOTPRINT_KEYS)
+    actual_keys = set(footprint_found)
+    if actual_keys != expected_keys:
+        missing = sorted(expected_keys - actual_keys)
+        unexpected = sorted(actual_keys - expected_keys)
+        raise Phase5Error(f"runtime ownership classifier checks.footprint_found does not match the canonical footprint schema (missing: {missing}, unexpected: {unexpected}).")
+
+    for key, value in footprint_found.items():
+        if not isinstance(value, bool):
+            raise Phase5Error(f"runtime ownership classifier checks.footprint_found[{key!r}] is {value!r} ({type(value).__name__}), expected a literal JSON boolean.")
+
+    return state, application_found, footprint_found
+
+
 # Phase 5C, step 2: removal-preflight (AWS credentials required)
 
 def cmd_removal_preflight(args):
@@ -1343,17 +1408,15 @@ def cmd_removal_preflight(args):
     except json.JSONDecodeError as exc:
         raise Phase5Error(f"the GoldenGate runtime ownership classifier produced unparseable output: {exc}") from exc
 
-    ownership_state = result.get("state")
-    if ownership_state not in ("ABSENT", "OWNED", "BROKEN"):
-        raise Phase5Error(f"the GoldenGate runtime ownership classifier produced an unrecognized state {ownership_state!r}; refusing to proceed.")
+    # Strict schema validation BEFORE anything is persisted -- application_found/footprint_found are never truthiness-coerced (bool("false") is True in Python), and an incomplete footprint_found can never be silently treated as "everything absent".
+    ownership_state, application_found, footprint_found = _validate_runtime_state_classifier_output(result)
     if ownership_state == "BROKEN":
         raise Phase5Error(f"GoldenGate runtime ownership-safety state for {deployment_id} is BROKEN -- an existing Argo CD Application/footprint does not clearly belong to this deployment (foreign or ambiguous ownership). Refusing to patch finalizers or delete anything.")
 
-    checks = result.get("checks") or {}
     update_state(args.state_path, {
         "ownership_state": ownership_state,
-        "application_found": bool(checks.get("application_found")),
-        "footprint_found": checks.get("footprint_found") or {},
+        "application_found": application_found,
+        "footprint_found": footprint_found,
     }, REMOVAL_ALLOWED_STATE_KEYS)
     if ownership_state == "ABSENT":
         print(f"Nothing exists for {deployment_id} -- the removal steps below will each independently no-op.")
@@ -1402,17 +1465,24 @@ def cmd_remove_runtime(args):
 # Phase 5C, step 4: post-delete-acceptance (AWS credentials required)
 
 def _post_delete_positively_absent(result, retained_pvc_expected):
-    """Positive structural proof of runtime-compute absence -- NEVER merely `state != BROKEN` (an OWNED state can legitimately mean the Application still exists and is correctly owned, which must NOT be accepted as deletion-complete)."""
-    checks = result.get("checks") or {}
-    if checks.get("application_found") is not False:
+    """Positive structural proof of runtime-compute absence -- NEVER merely `state != BROKEN` (an OWNED state can legitimately mean the Application still exists and is correctly owned, which must NOT be accepted as deletion-complete), and NEVER inferred from a malformed/incomplete classifier shape (a missing footprint_found key, or a non-boolean checks value, must never be silently read as "false" -- see _validate_runtime_state_classifier_output)."""
+    try:
+        state, application_found, footprint_found = _validate_runtime_state_classifier_output(result)
+    except Phase5Error as exc:
+        return False, str(exc)
+
+    if application_found is not False:
         return False, "application_found is not confirmed false"
-    footprint_found = checks.get("footprint_found") or {}
-    non_pvc_still_present = [label for label, found in footprint_found.items() if label != "pvc" and found]
+
+    non_pvc_still_present = [label for label in footprint_found if label != "pvc" and footprint_found[label]]
     if non_pvc_still_present:
         return False, f"non-PVC footprint still present: {non_pvc_still_present}"
-    if footprint_found.get("pvc") and not retained_pvc_expected:
+
+    if footprint_found["pvc"] and not retained_pvc_expected:
         return False, "a retained PVC is present but this deletion context does not expect one"
-    if result.get("state") == "BROKEN":
+
+    # Reached only once every non-PVC footprint entry is positively proven false and any retained PVC is an expected shape -- state==BROKEN remains the final safety net for a retained PVC that IS expected here but whose own ownership labels the classifier itself did not accept (runtime_state.py's _ownership_reason check applies to every found resource, including a retained PVC).
+    if state == "BROKEN":
         return False, "classifier state is BROKEN"
     return True, None
 
