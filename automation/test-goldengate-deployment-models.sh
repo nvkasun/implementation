@@ -16429,9 +16429,9 @@ def fn_source(name):
     return ast.get_source_segment(tool_source, fn) or ""
 
 
-# A: package validator derives expected regular files from HELM_CHART_PATH rather than a manually duplicated template list.
+# A: package validator derives expected regular files from HELM_CHART_PATH rather than a manually duplicated template list -- now via the shared canonical chart-source-TREE validator (which itself validates the root then walks the tree), never a second independent .rglob(...) implementation inside this function.
 expected_members_src = fn_source("_expected_chart_package_members")
-results.append(("A: _expected_chart_package_members() validates the canonical chart root then walks it with .rglob(...) (never a hard-coded template filename list)", "_validate_canonical_chart_source_root()" in expected_members_src and ".rglob(" in expected_members_src))
+results.append(("A: _expected_chart_package_members() derives its member set via _validate_canonical_chart_source_tree() (never a hard-coded template filename list, never a second independent .rglob(...) walk)", "_validate_canonical_chart_source_tree()" in expected_members_src))
 results.append(("A: production code contains no independent hard-coded 'runtime-statefulset.yaml' template list outside the real chart source/tests", tool_source.count("runtime-statefulset.yaml") == 0))
 real_expected = phase5_runtime._expected_chart_package_members()
 results.append(("A: the derived expected set currently matches the real helm/goldengate/ source tree contents (10 chart files + values-deployment.yaml)", real_expected == {
@@ -16657,11 +16657,10 @@ with tempfile.TemporaryDirectory() as tmp:
             c_ok = True
     results.append(("C: HELM_CHART_PATH pointed at a different (non-symlink, non-canonical) directory is rejected", c_ok))
 
-# D: _expected_chart_package_members invokes it before rglob traversal.
+# D: _expected_chart_package_members invokes the chart-root validator (now transitively, via the shared canonical chart-source-TREE validator, which itself calls the root validator before ever walking the tree -- see the dedicated "chart-source-TREE symlink/special-object protection" section for that inner contract).
 expected_members_src = fn_source("_expected_chart_package_members")
-root_call_index = expected_members_src.find(f"{root_validator_name}(")
-rglob_index = expected_members_src.find(".rglob(")
-results.append(("D: _expected_chart_package_members() calls the chart-root validator strictly BEFORE .rglob(...) traversal", -1 not in (root_call_index, rglob_index) and root_call_index < rglob_index))
+tree_call_in_members_index = expected_members_src.find("_validate_canonical_chart_source_tree(")
+results.append(("D: _expected_chart_package_members() derives its member set via _validate_canonical_chart_source_tree() (which validates the root, then the full tree, before any member is derived -- never a second independent .rglob(...) walk)", tree_call_in_members_index != -1))
 
 with tempfile.TemporaryDirectory() as tmp:
     repo_root = Path(tmp) / "repo"
@@ -16685,11 +16684,11 @@ with tempfile.TemporaryDirectory() as tmp:
                 d_ok = poison_name not in str(exc)
     results.append(("D: a symlinked chart root fails before any descendant (including a harmless extra file) is ever discovered by rglob", d_ok))
 
-# E: _package_runtime_chart invokes it before copytree.
+# E: _package_runtime_chart invokes the chart-root validator (now transitively, via the shared canonical chart-source-TREE validator) before copytree.
 package_runtime_chart_src = fn_source("_package_runtime_chart")
 copytree_index = package_runtime_chart_src.find("shutil.copytree(")
-root_call_in_package_index = package_runtime_chart_src.find(f"{root_validator_name}(")
-results.append(("E: _package_runtime_chart() calls the chart-root validator strictly BEFORE shutil.copytree(...)", -1 not in (root_call_in_package_index, copytree_index) and root_call_in_package_index < copytree_index))
+root_call_in_package_index = package_runtime_chart_src.find("_validate_canonical_chart_source_tree(")
+results.append(("E: _package_runtime_chart() calls _validate_canonical_chart_source_tree() (which itself calls the root validator first) strictly BEFORE shutil.copytree(...)", -1 not in (root_call_in_package_index, copytree_index) and root_call_in_package_index < copytree_index))
 
 with tempfile.TemporaryDirectory() as tmp:
     repo_root = Path(tmp) / "repo"
@@ -16715,8 +16714,9 @@ with tempfile.TemporaryDirectory() as tmp:
                 e_ok = not temp_chart_marker.exists()
     results.append(("E: confirmed reproduction -- _package_runtime_chart() refuses a symlinked chart root before any shutil.copytree() ever runs", e_ok))
 
-# F: existing descendant-symlink rejection remains.
-results.append(("F: the existing descendant-symlink rejection (every path under the validated root) remains present", "path.is_symlink()" in expected_members_src))
+# F: existing descendant-symlink rejection remains -- now inside the shared _require_symlink_free_tree() helper, reused by _validate_canonical_chart_source_tree() (which _expected_chart_package_members() itself calls, per assertion D above), never a second independently-drifting descendant check.
+symlink_free_helper_src = fn_source("_require_symlink_free_tree")
+results.append(("F: the existing descendant-symlink rejection (every path under the validated tree) remains present, now inside the shared _require_symlink_free_tree() helper", "path.is_symlink()" in symlink_free_helper_src))
 with tempfile.TemporaryDirectory() as tmp:
     repo_root = Path(tmp)
     chart_path = repo_root / "helm" / "goldengate"
@@ -16878,17 +16878,17 @@ def fn_source(name):
     return ast.get_source_segment(tool_source, fn) or ""
 
 
-# A: cmd_validate_local validates canonical chart root before _validate_required_files.
+# A: cmd_validate_local validates the canonical chart root (now subsumed by the FULL chart-source-tree validator, which itself calls the root validator first -- see the dedicated "chart-source-TREE symlink/special-object protection" section's own assertion B for that inner contract) before _validate_required_files.
 validate_local_src = fn_source("cmd_validate_local")
-root_index = validate_local_src.find("_validate_canonical_chart_source_root()")
+root_index = validate_local_src.find("_validate_canonical_chart_source_tree()")
 required_files_index = validate_local_src.find("_validate_required_files(")
-results.append(("A: cmd_validate_local() calls _validate_canonical_chart_source_root() strictly BEFORE _validate_required_files(...)", -1 not in (root_index, required_files_index) and root_index < required_files_index))
+results.append(("A: cmd_validate_local() calls _validate_canonical_chart_source_tree() (which itself calls the root validator first) strictly BEFORE _validate_required_files(...)", -1 not in (root_index, required_files_index) and root_index < required_files_index))
 
-# B: chart-root validation precedes helm dependency build / helm lint / helm template.
+# B: chart-root/tree validation precedes helm dependency build / helm lint / helm template.
 dep_index = validate_local_src.find('"dependency"')
 lint_index = validate_local_src.find('"lint"')
 template_index = validate_local_src.find('"template"')
-results.append(("B: cmd_validate_local() validates the chart root strictly BEFORE helm dependency build/lint/template", root_index != -1 and all(root_index < i for i in (dep_index, lint_index, template_index) if i != -1)))
+results.append(("B: cmd_validate_local() validates the chart source tree strictly BEFORE helm dependency build/lint/template", root_index != -1 and all(root_index < i for i in (dep_index, lint_index, template_index) if i != -1)))
 
 # C: all validate-local Helm chart arguments use the validated chart_root (never a second independent HELM_CHART_PATH read).
 results.append(("C: cmd_validate_local() passes str(chart_root) to helm dependency build/lint/template (never re-reads HELM_CHART_PATH directly)", validate_local_src.count("str(chart_root)") >= 3 and "str(HELM_CHART_PATH)" not in validate_local_src))
@@ -16924,11 +16924,11 @@ if a_ok is None:
 results.append(("A/B: confirmed reproduction -- a symlinked HELM_CHART_PATH fails cmd_validate_local() with ZERO helm dependency-build/lint/template calls", a_ok))
 tmp.cleanup()
 
-# D: _package_runtime_chart retains its own chart-root revalidation before copytree (defense in depth, independent of validate-local's earlier check).
+# D: _package_runtime_chart retains its own chart-source-tree revalidation (now the FULL tree, which itself calls the root validator first) before copytree (defense in depth, independent of validate-local's earlier check).
 package_runtime_chart_src = fn_source("_package_runtime_chart")
-root_call_in_package_index = package_runtime_chart_src.find("_validate_canonical_chart_source_root()")
+root_call_in_package_index = package_runtime_chart_src.find("_validate_canonical_chart_source_tree()")
 copytree_index = package_runtime_chart_src.find("shutil.copytree(")
-results.append(("D: _package_runtime_chart() still calls _validate_canonical_chart_source_root() strictly BEFORE shutil.copytree(...)", -1 not in (root_call_in_package_index, copytree_index) and root_call_in_package_index < copytree_index))
+results.append(("D: _package_runtime_chart() still calls _validate_canonical_chart_source_tree() (which itself calls the root validator first) strictly BEFORE shutil.copytree(...)", -1 not in (root_call_in_package_index, copytree_index) and root_call_in_package_index < copytree_index))
 
 # E: one canonical packaged-output-root helper exists.
 output_root_defs = [n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and "canonical_packaged_output_root" in n.name]
@@ -17002,6 +17002,251 @@ PYEOF
   fi
 else
   skip "Phase 5 chart-root/packaged-output-root trust ordering: dedicated static assertions -- python3/PyYAML/EKS_APP_WORKFLOW/phase5_runtime.py unavailable"
+fi
+
+echo "--- Phase 5 Python Conversion: chart-source-TREE symlink/special-object protection (A-L) ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE5_RUNTIME_TOOL" ]; then
+  PHASE5_CHART_TREE_CHECK="$(python3 - "$EKS_APP_WORKFLOW" "$PHASE5_RUNTIME_TOOL" <<'PYEOF'
+import ast
+import importlib.util
+import json
+import os
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+from unittest import mock
+
+import yaml
+
+workflow_path, tool_path = sys.argv[1:3]
+
+with open(workflow_path) as f:
+    jobs = yaml.safe_load(f)["jobs"]
+
+spec = importlib.util.spec_from_file_location("phase5_runtime", tool_path)
+phase5_runtime = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(phase5_runtime)
+
+results = []
+
+ENVIRONMENT_VALUE = "dev"
+DEPLOYMENT_ID_VALUE = "gg-oracle-payments-01"
+ECR_REGISTRY_VALUE = "229410149234.dkr.ecr.eu-west-1.amazonaws.com"
+GITHUB_RUN_NUMBER_VALUE = "42"
+CHART_VERSION_VALUE = f"0.1.{GITHUB_RUN_NUMBER_VALUE}-{DEPLOYMENT_ID_VALUE}"
+
+RECONCILE_ENV = {
+    "AWS_REGION": "eu-west-1", "EKS_CLUSTER_NAME": "gg-dev-cluster",
+    "EKS_DEPLOY_ROLE_ARN": "arn:aws:iam::668311715351:role/GoldenGateEksDeployRole-dev",
+    "RUNTIME_NAMESPACE": "goldengate-dev", "ARGOCD_NAMESPACE": "argocd", "ECR_REGISTRY": ECR_REGISTRY_VALUE,
+    "ARGOCD_ECR_READ_ROLE_ARN": "arn:aws:iam::229410149234:role/ArgoCdEcrReadRole", "GITHUB_RUN_NUMBER": GITHUB_RUN_NUMBER_VALUE,
+    "DNS_DOMAIN": "goldengate-dev.adcbmis.local", "ALB_GROUP_NAME": "goldengate-dev-shared",
+    "ACM_CERTIFICATE_ARN": "arn:aws:acm:eu-west-1:668311715351:certificate/abc-123",
+}
+
+DESCRIPTOR = {
+    "deploymentId": DEPLOYMENT_ID_VALUE, "adminSecretName": "dev/goldengate/source/admin",
+    "tlsSecretName": "dev/goldengate/tls-certificate", "runtimeServiceAccountName": "gg-runtime-sa",
+    "imageRepository": f"{ECR_REGISTRY_VALUE}/aws-cloud-factory-goldengate-oracle",
+    "imageRepositoryName": "aws-cloud-factory-goldengate-oracle", "imageTag": "23.4.0.0",
+    "efsMode": None, "efsFileSystemId": None, "efsCreationToken": None,
+}
+
+
+def reconcile_state_fixture(**overrides):
+    base = {
+        "environment": ENVIRONMENT_VALUE, "deployment_id": DEPLOYMENT_ID_VALUE, "deployment_model": "singleRuntime",
+        "deploy": True, "values_file": f"envs/{ENVIRONMENT_VALUE}/{DEPLOYMENT_ID_VALUE}/values.yaml",
+        "target_namespace": "goldengate-dev", "release_name": DEPLOYMENT_ID_VALUE,
+        "argocd_app_name": phase5_runtime._canonical_argocd_app_name(ENVIRONMENT_VALUE, DEPLOYMENT_ID_VALUE),
+        "helm_ecr_repository": "helm/goldengate", "helm_push_url": f"oci://{ECR_REGISTRY_VALUE}/helm",
+        "helm_chart_ref": f"oci://{ECR_REGISTRY_VALUE}/helm/goldengate",
+        "chart_version": CHART_VERSION_VALUE, "temp_chart_path": f"work/charts/{DEPLOYMENT_ID_VALUE}/goldengate",
+    }
+    base.update(overrides)
+    return base
+
+
+def resolved_state_fixture(**overrides):
+    base = {
+        **reconcile_state_fixture(),
+        "image_repository": DESCRIPTOR["imageRepository"], "image_repository_name": DESCRIPTOR["imageRepositoryName"],
+        "image_tag": DESCRIPTOR["imageTag"], "image_digest": "sha256:" + "ab" * 32,
+        "dns_domain": "goldengate-dev.adcbmis.local", "alb_group_name": "goldengate-dev-shared",
+        "certificate_arn": "arn:aws:acm:eu-west-1:668311715351:certificate/abc-123",
+        "admin_secret_name": DESCRIPTOR["adminSecretName"], "tls_secret_name": DESCRIPTOR["tlsSecretName"],
+        "runtime_service_account_name": DESCRIPTOR["runtimeServiceAccountName"], "resolved_efs_id": "",
+        "efs_mode": "", "efs_file_system_id_declared": "", "efs_creation_token": "",
+    }
+    base.update(overrides)
+    return base
+
+
+def mock_repo_root_with_real_chart(repo_root):
+    chart_path = repo_root / "helm" / "goldengate"
+    if not chart_path.exists():
+        chart_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(phase5_runtime.HELM_CHART_PATH, chart_path)
+    return mock.patch.multiple(phase5_runtime, REPO_ROOT=repo_root, HELM_CHART_PATH=chart_path)
+
+
+def args_for(state_path):
+    return type("Args", (), {"environment": ENVIRONMENT_VALUE, "deployment_id": DEPLOYMENT_ID_VALUE, "state_path": state_path})()
+
+
+class Recorder:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        if argv[:1] == [sys.executable] and str(phase5_runtime.DEPLOYMENT_MODEL_TOOL) in argv:
+            return type("Proc", (), {"returncode": 0, "stdout": json.dumps(DESCRIPTOR), "stderr": ""})()
+        return type("Proc", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+
+with open(tool_path) as f:
+    tool_source = f.read()
+tree = ast.parse(tool_source)
+
+
+def fn_source(name):
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
+    return ast.get_source_segment(tool_source, fn) or ""
+
+
+def real_chart_with_descendant_file_symlink(repo_root, relative="templates/runtime-statefulset.yaml"):
+    """Test-side mirror of the confirmed-bug fixture -- a REAL, non-symlink chart root whose descendant at `relative` is a symlink to an external file. Returns (chart_path, external_file) or (None, None) if symlinks are unsupported here."""
+    chart_path = repo_root / "helm" / "goldengate"
+    chart_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(phase5_runtime.HELM_CHART_PATH, chart_path)
+    target = chart_path / relative
+    target.unlink()
+    external_file = repo_root.parent / f"external-{Path(relative).name}"
+    external_file.write_bytes(b"TOP-SECRET-EXTERNAL-CONTENT\n")
+    try:
+        target.symlink_to(external_file)
+    except (OSError, NotImplementedError):
+        return None, None
+    return chart_path, external_file
+
+
+# A: exactly one canonical FULL chart-source-tree validator exists.
+tree_validator_defs = [n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_validate_canonical_chart_source_tree"]
+results.append(("A: exactly one canonical FULL chart-source-tree validator (_validate_canonical_chart_source_tree) is defined", len(tree_validator_defs) == 1))
+tree_validator_src = fn_source("_validate_canonical_chart_source_tree") if tree_validator_defs else ""
+
+# B: it invokes the already-approved chart-root validator first (the first statement after the def line and its one-line docstring).
+tree_validator_body_lines = [line for line in tree_validator_src.strip().split("\n") if line.strip() and not line.strip().startswith("def ") and not line.strip().startswith('"""')]
+results.append(("B: _validate_canonical_chart_source_tree() calls _validate_canonical_chart_source_root() (the already-approved root contract) first", bool(tree_validator_body_lines) and tree_validator_body_lines[0].strip() == "chart_root = _validate_canonical_chart_source_root()"))
+
+# C/D: confirmed reproduction -- a real root with a descendant FILE symlink is rejected by the tree validator, BEFORE any helm command via cmd_validate_local.
+tmp = tempfile.TemporaryDirectory()
+repo_root = Path(tmp.name) / "repo"
+repo_root.mkdir()
+chart_path, external_file = real_chart_with_descendant_file_symlink(repo_root)
+cd_ok = None
+if chart_path is None:
+    cd_ok = True  # symlinks unsupported on this platform/filesystem -- cannot reproduce, but not a production defect
+else:
+    values_rel = f"envs/{ENVIRONMENT_VALUE}/{DEPLOYMENT_ID_VALUE}/values.yaml"
+    (repo_root / values_rel).parent.mkdir(parents=True)
+    (repo_root / values_rel).write_text("runtime:\n  containerName: goldengate\n")
+    state_path = repo_root / "state.json"
+    phase5_runtime.update_state(state_path, resolved_state_fixture(), phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+    recorder = Recorder()
+    with mock.patch.multiple(phase5_runtime, REPO_ROOT=repo_root, HELM_CHART_PATH=chart_path), \
+         mock.patch.object(phase5_runtime, "run", recorder), mock.patch.dict(os.environ, RECONCILE_ENV):
+        try:
+            phase5_runtime.cmd_validate_local(args_for(state_path))
+            cd_ok = False
+        except phase5_runtime.Phase5Error:
+            cd_ok = not any(c[:1] == ["helm"] for c in recorder.calls)
+results.append(("C/D: confirmed reproduction -- REPO_ROOT/helm/goldengate is real, but templates/runtime-statefulset.yaml is a descendant symlink; cmd_validate_local() fails with ZERO helm calls", cd_ok))
+tmp.cleanup()
+
+# D (continued): non-regular/non-directory source objects (FIFO) are rejected by the tree validator itself, independent of cmd_validate_local.
+tmp = tempfile.TemporaryDirectory()
+repo_root = Path(tmp.name) / "repo"
+repo_root.mkdir()
+chart_path = repo_root / "helm" / "goldengate"
+chart_path.parent.mkdir(parents=True)
+shutil.copytree(phase5_runtime.HELM_CHART_PATH, chart_path)
+d_ok = None
+try:
+    os.mkfifo(chart_path / "templates" / "special-fifo")
+except (AttributeError, OSError, NotImplementedError):
+    d_ok = True  # FIFOs unsupported on this platform/filesystem -- cannot reproduce, but not a production defect
+if d_ok is None:
+    with mock.patch.multiple(phase5_runtime, REPO_ROOT=repo_root, HELM_CHART_PATH=chart_path):
+        try:
+            phase5_runtime._validate_canonical_chart_source_tree()
+            d_ok = False
+        except phase5_runtime.Phase5Error:
+            d_ok = True
+results.append(("D: _validate_canonical_chart_source_tree() rejects a non-regular/non-directory source object (FIFO) under the chart tree", d_ok))
+tmp.cleanup()
+
+# E: cmd_validate_local uses FULL tree validation (not merely the root) before _validate_required_files.
+validate_local_src = fn_source("cmd_validate_local")
+tree_call_index = validate_local_src.find("_validate_canonical_chart_source_tree()")
+required_files_index = validate_local_src.find("_validate_required_files(")
+results.append(("E: cmd_validate_local() calls _validate_canonical_chart_source_tree() (FULL tree, not merely the root) strictly BEFORE _validate_required_files(...)", -1 not in (tree_call_index, required_files_index) and tree_call_index < required_files_index))
+
+# F: FULL tree validation precedes helm dependency build/lint/template.
+dep_index = validate_local_src.find('"dependency"')
+lint_index = validate_local_src.find('"lint"')
+template_index = validate_local_src.find('"template"')
+results.append(("F: cmd_validate_local() validates the FULL chart tree strictly BEFORE helm dependency build/lint/template", tree_call_index != -1 and all(tree_call_index < i for i in (dep_index, lint_index, template_index) if i != -1)))
+
+# G: _package_runtime_chart revalidates the FULL tree before copytree.
+package_runtime_chart_src = fn_source("_package_runtime_chart")
+package_tree_call_index = package_runtime_chart_src.find("_validate_canonical_chart_source_tree()")
+copytree_index = package_runtime_chart_src.find("shutil.copytree(")
+results.append(("G: _package_runtime_chart() calls _validate_canonical_chart_source_tree() (FULL tree) strictly BEFORE shutil.copytree(...)", -1 not in (package_tree_call_index, copytree_index) and package_tree_call_index < copytree_index))
+
+# H: copytree does not silently dereference source symlinks (symlinks=True).
+results.append(("H: _package_runtime_chart()'s shutil.copytree(...) call passes symlinks=True (never silently dereferences a chart-source symlink)", "symlinks=True" in package_runtime_chart_src))
+
+# I: the temporary copied chart is checked for symlinks (via the shared generic helper) AFTER copytree, BEFORE helm package.
+symlink_free_helper_defs = [n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_require_symlink_free_tree"]
+results.append(("I: a reusable generic symlink-free-tree helper (_require_symlink_free_tree) exists", len(symlink_free_helper_defs) == 1))
+temp_check_index = package_runtime_chart_src.find("_require_symlink_free_tree(")
+package_call_index = package_runtime_chart_src.find('"helm", "package"')
+results.append(("I: _package_runtime_chart() checks the temporary copied chart for symlinks/special objects strictly AFTER copytree and BEFORE helm package", -1 not in (copytree_index, temp_check_index, package_call_index) and copytree_index < temp_check_index < package_call_index))
+
+# J: _expected_chart_package_members reuses the canonical source-tree validation rather than owning an independent drifting descendant contract.
+expected_members_src = fn_source("_expected_chart_package_members")
+results.append(("J: _expected_chart_package_members() reuses _validate_canonical_chart_source_tree() (never a second, independently-drifting descendant-symlink walk)", "_validate_canonical_chart_source_tree()" in expected_members_src and "rglob(" not in expected_members_src))
+
+# K: confirmed reproduction (already proven above under C/D) produces zero Helm calls -- restated as its own named assertion for direct traceability to the task's required letter K.
+results.append(("K: the confirmed runtime-statefulset.yaml descendant-symlink reproduction produces ZERO helm dependency-build/lint/template/package calls", cd_ok))
+
+# L: no workflow YAML implementation was reintroduced.
+build_job = jobs["build_publish_and_deploy"]
+validate_local_step = next((s for s in build_job["steps"] if s.get("name") == "Render, validate and package runtime locally"), None)
+publish_step = next((s for s in build_job["steps"] if s.get("name") == "Publish runtime Helm chart to private ECR"), None)
+results.append(("L: the 'Render, validate and package runtime locally' step still only invokes phase5_runtime.py validate-local (no reintroduced inline chart-tree logic)", validate_local_step is not None and "phase5_runtime.py validate-local" in validate_local_step.get("run", "")))
+results.append(("L: the 'Publish runtime Helm chart to private ECR' step still only invokes phase5_runtime.py publish-chart", publish_step is not None and "phase5_runtime.py publish-chart" in publish_step.get("run", "")))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  echo "$PHASE5_CHART_TREE_CHECK"
+  if [ -z "$(echo "$PHASE5_CHART_TREE_CHECK" | grep '^FAIL ' || true)" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        OK\ *) pass "Phase 5 chart-source-tree symlink/special-object protection: ${line#OK }" ;;
+      esac
+    done <<< "$PHASE5_CHART_TREE_CHECK"
+  else
+    fail "Phase 5 chart-source-tree symlink/special-object protection: dedicated static assertions failed:"$'\n'"${PHASE5_CHART_TREE_CHECK}"
+  fi
+else
+  skip "Phase 5 chart-source-tree symlink/special-object protection: dedicated static assertions -- python3/PyYAML/EKS_APP_WORKFLOW/phase5_runtime.py unavailable"
 fi
 
 echo "--- Final repository handoff hygiene sweep (VDR pre-transfer cleanliness) ---"

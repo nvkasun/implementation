@@ -685,19 +685,27 @@ def _validate_canonical_chart_source_root():
     return HELM_CHART_PATH
 
 
-def _expected_chart_package_members():
-    """Recursively derives the expected canonical archive regular-file member set from the CURRENT helm/goldengate/ source tree -- never a second, manually-maintained template list; if the canonical chart source gains/removes a legitimate file, this set follows automatically. Validates the chart root itself via _validate_canonical_chart_source_root() BEFORE ever walking it (an untrusted symlinked root must fail before rglob, not be discovered afterward), then fails closed if any DESCENDANT under that root is a symlink or anything other than a regular file/directory -- keeps the canonical source unambiguous end to end. The one deployment-specific addition (goldengate/values-deployment.yaml, produced by _package_runtime_chart() copying the current deployment values file) is added last."""
-    chart_root = _validate_canonical_chart_source_root()
-    members = set()
-    for path in sorted(chart_root.rglob("*")):
+def _require_symlink_free_tree(root, label):
+    """Generic filesystem-tree fail-closed check, reused for BOTH the canonical chart source tree (via _validate_canonical_chart_source_tree()) and the temporary copied chart tree (_package_runtime_chart(), immediately before helm package) -- never a second, independently-drifting tree-walk implementation. Every descendant under root must be a real directory or a real regular file; a symlink (file or directory) or any other special filesystem object (FIFO/device/socket) is rejected."""
+    for path in sorted(root.rglob("*")):
         if path.is_symlink():
-            raise Phase5Error(f"canonical chart source {path} is a symlink -- the canonical helm/goldengate/ source tree must contain only regular files/directories.")
-        if path.is_dir():
-            continue
-        if not path.is_file():
-            raise Phase5Error(f"canonical chart source {path} is neither a regular file nor a directory -- refusing to derive a package contract from an ambiguous source tree.")
-        relative = path.relative_to(chart_root).as_posix()
-        members.add(f"{CHART_NAME}/{relative}")
+            raise Phase5Error(f"{label} {path} is a symlink -- refusing to trust it.")
+        if not (path.is_dir() or path.is_file()):
+            raise Phase5Error(f"{label} {path} is neither a regular file nor a directory -- refusing to trust an ambiguous/special filesystem object.")
+
+
+def _validate_canonical_chart_source_tree():
+    """The COMPLETE canonical helm/goldengate/ source tree -- not merely its root -- must be proven free of symlinks/special objects BEFORE any Helm command, copy, or file read ever consumes it (a descendant symlink must never be dereferenced by Helm, or silently copied into work/charts/, before rejection). Calls _validate_canonical_chart_source_root() first (the already-approved root-identity/symlink/resolved-location contract), then _require_symlink_free_tree() for every descendant. Returns (chart_root, source_files) where source_files is the canonical set of chart-relative (POSIX) regular-file paths, derived dynamically from the real tree -- never a manually-maintained template list. cmd_validate_local()/_package_runtime_chart()/_expected_chart_package_members() all reuse this single contract; none independently re-walks the tree."""
+    chart_root = _validate_canonical_chart_source_root()
+    _require_symlink_free_tree(chart_root, "canonical chart source")
+    source_files = {path.relative_to(chart_root).as_posix() for path in chart_root.rglob("*") if path.is_file()}
+    return chart_root, source_files
+
+
+def _expected_chart_package_members():
+    """Derives the expected canonical archive regular-file member set from the CURRENT, already-validated (symlink-free, via _validate_canonical_chart_source_tree()) helm/goldengate/ source tree -- never a second, manually-maintained template list, and never an independent descendant-symlink check duplicating the one canonical tree-validation contract. The one deployment-specific addition (goldengate/values-deployment.yaml, produced by _package_runtime_chart() copying the current deployment values file) is added last."""
+    _chart_root, source_files = _validate_canonical_chart_source_tree()
+    members = {f"{CHART_NAME}/{relative}" for relative in source_files}
     members.add(f"{CHART_NAME}/values-deployment.yaml")
     return members
 
@@ -1234,18 +1242,21 @@ def _validate_efs_render_contract(values, docs, environment, deployment_id, depl
 
 
 def _package_runtime_chart(deployment_id, values_file, chart_version):
-    # 1. Refuses to build/package from an untrusted symlinked chart root -- validated BEFORE copytree ever reads from HELM_CHART_PATH.
-    chart_root = _validate_canonical_chart_source_root()
+    # 1. Refuses to build/package from an untrusted chart source tree -- FULL tree (root AND every descendant), independently re-validated here (defense in depth, never merely trusting an earlier cmd_validate_local() check from a different call frame) BEFORE copytree ever reads from it.
+    chart_root, _source_files = _validate_canonical_chart_source_tree()
     # 2. Refuses to write into a symlinked packaged/ output directory -- validated/created BEFORE copytree or helm package ever runs, so a symlinked packaged/ receives ZERO generated files on failure.
     packaged_dir = _prepare_canonical_packaged_output_root()
 
-    # 3. Only now does the temporary chart get constructed/copied.
+    # 3. Only now does the temporary chart get constructed/copied -- symlinks=True so copytree can never silently dereference a chart-source symlink (e.g. one introduced between the tree scan above and this copy) into copied regular content.
     temp_chart_path = REPO_ROOT / _canonical_temp_chart_path(deployment_id)
     if temp_chart_path.exists():
         shutil.rmtree(temp_chart_path)
     temp_chart_path.mkdir(parents=True)
-    shutil.copytree(chart_root, temp_chart_path, dirs_exist_ok=True)
+    shutil.copytree(chart_root, temp_chart_path, dirs_exist_ok=True, symlinks=True)
     shutil.copy(REPO_ROOT / values_file, temp_chart_path / "values-deployment.yaml")
+
+    # Defense in depth: the copied TEMPORARY chart must independently be proven symlink-free too, BEFORE helm package ever runs -- catches a symlink that copytree above preserved as a symlink (per symlinks=True) rather than ever letting it reach helm package as an unvalidated object.
+    _require_symlink_free_tree(temp_chart_path, "temporary copied chart")
 
     # 4. Only now does helm package run, writing into the validated ABSOLUTE packaged directory -- never a bare "packaged" relative literal at this filesystem trust boundary.
     run(["helm", "package", str(temp_chart_path), "--version", chart_version, "--app-version", chart_version, "--destination", str(packaged_dir)])
@@ -1265,8 +1276,8 @@ def cmd_validate_local(args):
     _validate_reconcile_state_identity(state, environment, deployment_id)
     resolved = _validate_resolved_runtime_inputs(state, environment, deployment_id, verify_managed_efs_live=False)
 
-    # Canonical chart-root trust boundary -- validated BEFORE any required-file read or Helm command ever inspects/executes the chart. helm dependency build in particular may perform remote dependency access and/or filesystem writes driven by an untrusted Chart.yaml -- the root must be proven canonical first, never trusted-then-checked. The returned chart_root is used for every chart operation below; HELM_CHART_PATH is never read independently again in this function.
-    chart_root = _validate_canonical_chart_source_root()
+    # Canonical FULL chart-source-TREE trust boundary -- not merely the root -- validated BEFORE any required-file read, rendered-output write, or Helm command ever inspects/executes the chart. helm dependency build in particular may perform remote dependency access and/or filesystem writes driven by an untrusted Chart.yaml -- every descendant (a symlinked template, a symlinked nested directory, etc.) must be proven a real regular file/directory first, never trusted-then-checked or discovered only later by package-publication validation. The returned chart_root is used for every chart operation below; HELM_CHART_PATH is never read independently again in this function.
+    chart_root, _source_files = _validate_canonical_chart_source_tree()
 
     values_file = require_state_value(state, "values_file")
     release_name = require_state_value(state, "release_name")

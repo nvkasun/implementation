@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -3801,6 +3802,317 @@ class PackagedOutputRootTests(unittest.TestCase):
             self.assertTrue(package_path.is_file())
             self.assertEqual(package_path.name, f"{phase5_runtime.CHART_NAME}-{CHART_VERSION}.tgz")
             self.assertTrue(temp_chart_path.is_dir())
+
+
+EXTERNAL_DESCENDANT_SYMLINK_CONTENT = b"TOP-SECRET-EXTERNAL-CONTENT-OUTSIDE-CHART\n"
+
+
+def _real_chart_with_descendant_file_symlink(test_case, repo_root, relative="templates/runtime-statefulset.yaml", content=EXTERNAL_DESCENDANT_SYMLINK_CONTENT):
+    """Builds a REAL, non-symlink chart root (a genuine mirrored copy of the current helm/goldengate/ tree, via _mock_repo_root_with_real_chart()) whose single descendant at `relative` has been replaced by a symlink to an external file OUTSIDE the chart tree entirely -- the exact confirmed-bug shape: the chart ROOT itself passes _validate_canonical_chart_source_root(), but a DESCENDANT does not. Returns (patcher, chart_path, external_file) -- patcher is the still-unentered mock.patch.multiple(...) context manager from _mock_repo_root_with_real_chart(); the caller enters it only after this helper has already mutated the filesystem, since REPO_ROOT/HELM_CHART_PATH must point at the real (unpatched) production chart while the mirrored copy is built."""
+    patcher = _mock_repo_root_with_real_chart(repo_root)
+    chart_path = repo_root / "helm" / phase5_runtime.CHART_NAME
+    target = chart_path / relative
+    target.unlink()
+    external_file = repo_root.parent / f"external-{Path(relative).name}"
+    external_file.write_bytes(content)
+    try:
+        target.symlink_to(external_file)
+    except (OSError, NotImplementedError):
+        test_case.skipTest("symlinks are not supported on this platform/filesystem")
+    return patcher, chart_path, external_file
+
+
+def _real_chart_with_descendant_dir_symlink(test_case, repo_root, relative="templates/linked-dir"):
+    """Directory-symlink counterpart to _real_chart_with_descendant_file_symlink() -- a REAL, non-symlink chart root whose descendant at `relative` is a symlink to an external DIRECTORY (never created inside the chart tree itself). Returns (patcher, chart_path, external_dir)."""
+    patcher = _mock_repo_root_with_real_chart(repo_root)
+    chart_path = repo_root / "helm" / phase5_runtime.CHART_NAME
+    external_dir = repo_root.parent / "external-linked-dir"
+    external_dir.mkdir()
+    (external_dir / "poison.yaml").write_text("poison: true\n")
+    target = chart_path / relative
+    try:
+        target.symlink_to(external_dir, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        test_case.skipTest("symlinks are not supported on this platform/filesystem")
+    return patcher, chart_path, external_dir
+
+
+class ChartSourceTreeIntegrityTests(unittest.TestCase):
+    """Confirmed reproduction target: REPO_ROOT/helm/goldengate is a REAL, non-symlink directory, but a DESCENDANT (e.g. templates/runtime-statefulset.yaml) is a symlink to an external file -- the chart root passed _validate_canonical_chart_source_root(), yet cmd_validate_local() ran helm dependency build/lint/template, and _package_runtime_chart()'s shutil.copytree() silently dereferenced the symlink into a regular copied file, entirely BEFORE the only existing descendant-symlink check (inside _expected_chart_package_members(), reached only during later package-publication validation) ever fired. _validate_canonical_chart_source_tree() closes this gap by proving the COMPLETE tree -- not merely the root -- before any Helm command, copy, or file read ever trusts it."""
+
+    def _validate_local_fixture_with_descendant_file_symlink(self, tmp, relative="templates/runtime-statefulset.yaml"):
+        repo_root = Path(tmp) / "repo"
+        repo_root.mkdir()
+        patcher, chart_path, external_file = _real_chart_with_descendant_file_symlink(self, repo_root, relative=relative)
+        values_rel = f"envs/{ENVIRONMENT}/{DEPLOYMENT_ID}/values.yaml"
+        (repo_root / values_rel).parent.mkdir(parents=True)
+        (repo_root / values_rel).write_text("runtime:\n  containerName: goldengate\n")
+        state_path = repo_root / "state.json"
+        phase5_runtime.update_state(state_path, _resolved_state_fixture(), phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+        args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+        return repo_root, chart_path, patcher, args, external_file
+
+    def _run_validate_local_with_descendant_symlink(self, tmp):
+        repo_root, _chart_path, patcher, args, _external_file = self._validate_local_fixture_with_descendant_file_symlink(tmp)
+        scripted = ScriptedRun()
+        scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
+        with patcher, mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+            with self.assertRaises(phase5_runtime.Phase5Error):
+                _run_quiet(phase5_runtime.cmd_validate_local, args)
+        return repo_root, scripted
+
+    def test_1_normal_canonical_chart_tree_passes(self):
+        chart_root, source_files = phase5_runtime._validate_canonical_chart_source_tree()
+        self.assertEqual(chart_root, phase5_runtime.HELM_CHART_PATH)
+        self.assertIn("Chart.yaml", source_files)
+        self.assertIn("values.yaml", source_files)
+        self.assertIn("templates/runtime-statefulset.yaml", source_files)
+
+    def test_2_descendant_file_symlink_to_external_file_fails(self):
+        """Confirmed reproduction of the current bug before the fix -- the exact scenario reported: REPO_ROOT/helm/goldengate is real, templates/runtime-statefulset.yaml is a descendant symlink."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            patcher, chart_path, _external_file = _real_chart_with_descendant_file_symlink(self, repo_root)
+            self.assertFalse(chart_path.is_symlink(), "the chart ROOT itself must remain a real, non-symlink directory for this to be the confirmed-bug shape")
+            self.assertTrue((chart_path / "templates" / "runtime-statefulset.yaml").is_symlink())
+            with patcher:
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    phase5_runtime._validate_canonical_chart_source_tree()
+
+    def test_3_cmd_validate_local_zero_helm_calls_for_descendant_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _repo_root, scripted = self._run_validate_local_with_descendant_symlink(tmp)
+        self.assertEqual([c for c in scripted.calls if c["argv"][:1] == ["helm"]], [])
+
+    def test_4_cmd_validate_local_no_rendered_manifest_for_descendant_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root, _scripted = self._run_validate_local_with_descendant_symlink(tmp)
+            rendered_marker = repo_root / phase5_runtime._canonical_rendered_manifest_path(DEPLOYMENT_ID)
+            self.assertFalse(rendered_marker.exists())
+
+    def test_5_cmd_validate_local_no_package_archive_for_descendant_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root, _scripted = self._run_validate_local_with_descendant_symlink(tmp)
+            self.assertFalse((repo_root / "packaged").exists())
+
+    def test_6_descendant_directory_symlink_fails_before_helm(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            patcher, chart_path, _external_dir = _real_chart_with_descendant_dir_symlink(self, repo_root)
+            self.assertFalse(chart_path.is_symlink())
+            self.assertTrue((chart_path / "templates" / "linked-dir").is_symlink())
+            with patcher:
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    phase5_runtime._validate_canonical_chart_source_tree()
+
+        with tempfile.TemporaryDirectory() as tmp2:
+            repo_root2 = Path(tmp2) / "repo"
+            repo_root2.mkdir()
+            patcher2, chart_path2, _external_dir2 = _real_chart_with_descendant_dir_symlink(self, repo_root2)
+            values_rel = f"envs/{ENVIRONMENT}/{DEPLOYMENT_ID}/values.yaml"
+            (repo_root2 / values_rel).parent.mkdir(parents=True)
+            (repo_root2 / values_rel).write_text("runtime:\n  containerName: goldengate\n")
+            state_path = repo_root2 / "state.json"
+            phase5_runtime.update_state(state_path, _resolved_state_fixture(), phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = ScriptedRun()
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
+            with patcher2, mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    _run_quiet(phase5_runtime.cmd_validate_local, args)
+            self.assertEqual([c for c in scripted.calls if c["argv"][:1] == ["helm"]], [])
+
+    def test_7_chart_yaml_itself_symlink_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            patcher, _chart_path, _external_file = _real_chart_with_descendant_file_symlink(self, repo_root, relative="Chart.yaml")
+            with patcher:
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    phase5_runtime._validate_canonical_chart_source_tree()
+
+    def test_8_values_yaml_itself_symlink_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            patcher, _chart_path, _external_file = _real_chart_with_descendant_file_symlink(self, repo_root, relative="values.yaml")
+            with patcher:
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    phase5_runtime._validate_canonical_chart_source_tree()
+
+    def test_9_nested_template_symlink_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            patcher, _chart_path, _external_file = _real_chart_with_descendant_file_symlink(self, repo_root, relative="templates/_helpers.tpl")
+            with patcher:
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    phase5_runtime._validate_canonical_chart_source_tree()
+
+    def test_10_fifo_special_object_under_chart_tree_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            patcher = _mock_repo_root_with_real_chart(repo_root)
+            chart_path = repo_root / "helm" / phase5_runtime.CHART_NAME
+            fifo_path = chart_path / "templates" / "special-fifo"
+            try:
+                os.mkfifo(fifo_path)
+            except (AttributeError, OSError, NotImplementedError):
+                self.skipTest("FIFOs are not supported on this platform/filesystem")
+            with patcher:
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    phase5_runtime._validate_canonical_chart_source_tree()
+
+    def test_11_package_runtime_chart_refuses_descendant_symlink_zero_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            patcher, _chart_path, _external_file = _real_chart_with_descendant_file_symlink(self, repo_root)
+            values_rel = f"envs/{ENVIRONMENT}/{DEPLOYMENT_ID}/values.yaml"
+            (repo_root / values_rel).parent.mkdir(parents=True)
+            (repo_root / values_rel).write_text("runtime:\n  containerName: goldengate\n")
+            temp_chart_marker = repo_root / phase5_runtime._canonical_temp_chart_path(DEPLOYMENT_ID)
+            scripted = ScriptedRun()
+            with patcher, mock.patch.object(phase5_runtime, "run", scripted):
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    phase5_runtime._package_runtime_chart(DEPLOYMENT_ID, values_rel, CHART_VERSION)
+            self.assertFalse(temp_chart_marker.exists(), "copytree must never run when a descendant chart-source symlink is present")
+            self.assertEqual(scripted.calls, [], "helm package must never run when a descendant chart-source symlink is present")
+            self.assertFalse((repo_root / "packaged").exists())
+
+    def test_12_retired_copytree_behavior_would_dereference_but_current_code_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # Reproduce the RETIRED (pre-fix) copytree behavior in an isolated fixture -- proves what the confirmed bug actually did to a source symlink.
+            old_src = Path(tmp) / "old-src"
+            old_src.mkdir()
+            (old_src / "Chart.yaml").write_text("apiVersion: v2\nname: goldengate\nversion: 0.0.0\n")
+            external_target = Path(tmp) / "external-target.yaml"
+            external_target.write_bytes(b"TOP-SECRET-EXTERNAL-CONTENT\n")
+            try:
+                (old_src / "linked.yaml").symlink_to(external_target)
+            except (OSError, NotImplementedError):
+                self.skipTest("symlinks are not supported on this platform/filesystem")
+            old_dst = Path(tmp) / "old-dst"
+            shutil.copytree(old_src, old_dst, dirs_exist_ok=True)  # retired: default (dereferencing) semantics, as _package_runtime_chart() used before this fix
+            self.assertFalse((old_dst / "linked.yaml").is_symlink(), "retired copytree default silently dereferences a source symlink into a regular copied file")
+            self.assertEqual((old_dst / "linked.yaml").read_bytes(), b"TOP-SECRET-EXTERNAL-CONTENT\n")
+
+            # Now prove the CURRENT _package_runtime_chart() refuses the same shape instead of ever reaching copytree.
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            patcher, _chart_path, _external_file = _real_chart_with_descendant_file_symlink(self, repo_root)
+            values_rel = f"envs/{ENVIRONMENT}/{DEPLOYMENT_ID}/values.yaml"
+            (repo_root / values_rel).parent.mkdir(parents=True)
+            (repo_root / values_rel).write_text("runtime:\n  containerName: goldengate\n")
+            temp_chart_marker = repo_root / phase5_runtime._canonical_temp_chart_path(DEPLOYMENT_ID)
+            with patcher:
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    phase5_runtime._package_runtime_chart(DEPLOYMENT_ID, values_rel, CHART_VERSION)
+            self.assertFalse(temp_chart_marker.exists())
+
+    def test_13_copytree_uses_non_dereferencing_symlink_semantics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            values_rel = f"envs/{ENVIRONMENT}/{DEPLOYMENT_ID}/values.yaml"
+            (repo_root / values_rel).parent.mkdir(parents=True)
+            (repo_root / values_rel).write_text("runtime:\n  containerName: goldengate\n")
+
+            def fake_helm_package(argv, **kwargs):
+                dest = Path(argv[argv.index("--destination") + 1])
+                dest.mkdir(parents=True, exist_ok=True)
+                (dest / f"{phase5_runtime.CHART_NAME}-{CHART_VERSION}.tgz").write_bytes(b"fake")
+                return FakeProc(0, "")
+
+            with _mock_repo_root_with_real_chart(repo_root), \
+                 mock.patch.object(phase5_runtime, "run") as run_mock, \
+                 mock.patch.object(phase5_runtime.shutil, "copytree", wraps=phase5_runtime.shutil.copytree) as copytree_mock:
+                run_mock.side_effect = lambda argv, **kwargs: fake_helm_package(argv, **kwargs) if argv[:2] == ["helm", "package"] else FakeProc(0, "")
+                phase5_runtime._package_runtime_chart(DEPLOYMENT_ID, values_rel, CHART_VERSION)
+            # copytree recurses into subdirectories through the same (wrapped) global name, so call_args_list[0] -- the OUTERMOST, top-level call made directly by _package_runtime_chart() -- is the one that must carry symlinks=True; later entries are copytree's own internal per-subdirectory recursion.
+            _outer_args, outer_kwargs = copytree_mock.call_args_list[0]
+            self.assertTrue(outer_kwargs.get("symlinks"), "copytree must be called with symlinks=True so it never silently dereferences a chart-source symlink")
+
+    def test_14_temporary_chart_unexpected_symlink_before_helm_package_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            values_rel = f"envs/{ENVIRONMENT}/{DEPLOYMENT_ID}/values.yaml"
+            (repo_root / values_rel).parent.mkdir(parents=True)
+            (repo_root / values_rel).write_text("runtime:\n  containerName: goldengate\n")
+
+            real_copy = phase5_runtime.shutil.copy
+
+            def poisoning_copy(src, dst, *args, **kwargs):
+                # shutil.copy (used ONLY for values-deployment.yaml, never recursively) is the injection point here -- simulates a symlink appearing in the TEMPORARY copied chart between copytree and helm package (e.g. a race/change), never something the real copytree(symlinks=True) call itself would introduce.
+                result = real_copy(src, dst, *args, **kwargs)
+                external = Path(tmp) / "external-race-target.yaml"
+                external.write_bytes(b"RACE-CONDITION-CONTENT\n")
+                try:
+                    (Path(dst).parent / "templates" / "race-symlink.yaml").symlink_to(external)
+                except (OSError, NotImplementedError):
+                    self.skipTest("symlinks are not supported on this platform/filesystem")
+                return result
+
+            scripted = ScriptedRun()
+            with _mock_repo_root_with_real_chart(repo_root), \
+                 mock.patch.object(phase5_runtime, "run", scripted), \
+                 mock.patch.object(phase5_runtime.shutil, "copy", side_effect=poisoning_copy):
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    phase5_runtime._package_runtime_chart(DEPLOYMENT_ID, values_rel, CHART_VERSION)
+            self.assertEqual(scripted.calls, [], "helm package must never run against a temporary chart tree that gained a symlink after copytree")
+
+    def test_15_temporary_chart_special_object_before_helm_package_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            values_rel = f"envs/{ENVIRONMENT}/{DEPLOYMENT_ID}/values.yaml"
+            (repo_root / values_rel).parent.mkdir(parents=True)
+            (repo_root / values_rel).write_text("runtime:\n  containerName: goldengate\n")
+
+            real_copy = phase5_runtime.shutil.copy
+
+            def poisoning_copy(src, dst, *args, **kwargs):
+                result = real_copy(src, dst, *args, **kwargs)
+                try:
+                    os.mkfifo(Path(dst).parent / "templates" / "race-fifo")
+                except (AttributeError, OSError, NotImplementedError):
+                    self.skipTest("FIFOs are not supported on this platform/filesystem")
+                return result
+
+            scripted = ScriptedRun()
+            with _mock_repo_root_with_real_chart(repo_root), \
+                 mock.patch.object(phase5_runtime, "run", scripted), \
+                 mock.patch.object(phase5_runtime.shutil, "copy", side_effect=poisoning_copy):
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    phase5_runtime._package_runtime_chart(DEPLOYMENT_ID, values_rel, CHART_VERSION)
+            self.assertEqual(scripted.calls, [])
+
+    def test_16_normal_canonical_source_still_packages_successfully(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            values_rel = f"envs/{ENVIRONMENT}/{DEPLOYMENT_ID}/values.yaml"
+            (repo_root / values_rel).parent.mkdir(parents=True)
+            (repo_root / values_rel).write_text("runtime:\n  containerName: goldengate\n")
+
+            def fake_helm_package(argv, **kwargs):
+                dest = Path(argv[argv.index("--destination") + 1])
+                dest.mkdir(parents=True, exist_ok=True)
+                (dest / f"{phase5_runtime.CHART_NAME}-{CHART_VERSION}.tgz").write_bytes(b"fake")
+                return FakeProc(0, "")
+
+            with _mock_repo_root_with_real_chart(repo_root), mock.patch.object(phase5_runtime, "run") as run_mock:
+                run_mock.side_effect = lambda argv, **kwargs: fake_helm_package(argv, **kwargs) if argv[:2] == ["helm", "package"] else FakeProc(0, "")
+                temp_chart_path, package_path = phase5_runtime._package_runtime_chart(DEPLOYMENT_ID, values_rel, CHART_VERSION)
+            self.assertTrue(package_path.is_file())
+            self.assertTrue(temp_chart_path.is_dir())
+            self.assertFalse((temp_chart_path / "templates" / "runtime-statefulset.yaml").is_symlink())
+
+    def test_17_expected_chart_package_members_still_dynamically_derived(self):
+        members = phase5_runtime._expected_chart_package_members()
+        expected = {f"goldengate/{name.split('goldengate/', 1)[1]}" for name, _content in _canonical_chart_file_members(CHART_VERSION)}
+        expected.add("goldengate/values-deployment.yaml")
+        self.assertEqual(members, expected)
 
 
 if __name__ == "__main__":
