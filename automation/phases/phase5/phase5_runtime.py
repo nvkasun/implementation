@@ -87,6 +87,22 @@ def require_env(name):
     return value
 
 
+def _canonical_argocd_app_name(environment, deployment_id):
+    """ONE canonical derivation of the runtime Argo CD Application name -- reused by prepare-deployment, prepare-removal, and both the reconcile-state/removal-state identity validators below; never independently duplicated. Strips exactly one leading "gg-" from deployment_id (if present) before composing goldengate-<environment>-<suffix>, e.g. gg-postgresql-repltest-01 -> goldengate-dev-postgresql-repltest-01, gg-gg-test -> goldengate-dev-gg-test."""
+    app_suffix = deployment_id[len("gg-"):] if deployment_id.startswith("gg-") else deployment_id
+    return f"goldengate-{environment}-{app_suffix}"
+
+
+def _require_literal_bool_state_value(state, key):
+    """Never bool(state.get(key)) -- bool("false")/bool(0 or non-empty string) all coerce unpredictably in Python. Requires the persisted JSON value to already be a literal boolean; anything else (string, int, None, missing) fails closed."""
+    if key not in state:
+        raise Phase5Error(f"Phase 5 state is missing required literal-boolean key {key!r}.")
+    value = state[key]
+    if not isinstance(value, bool):
+        raise Phase5Error(f"Phase 5 state key {key!r} is {value!r} ({type(value).__name__}), expected a literal boolean.")
+    return value
+
+
 def _parse_bool_arg(value, name):
     if value in ("true", "True"):
         return True
@@ -139,6 +155,72 @@ def require_state_value(state, key):
     if key not in state or state[key] in (None, ""):
         raise Phase5Error(f"Phase 5 state is missing required key {key!r}; an earlier step did not complete.")
     return state[key]
+
+
+def _validate_reconcile_state_identity(state, environment, deployment_id):
+    """Binds a persisted reconcile-state JSON document back to the CURRENT CLI environment/deployment_id plus canonical Phase 5 naming/config rules -- applied BEFORE any AWS/Kubernetes mutation from a reconcile-state consumer (resolve-live-inputs, publish-chart, reconcile-runtime), so a state file left over from (or substituted from) a different matrix runtime can never control this runtime's mutation. Deliberately never compares mutable runtime RESULTS (image_digest, resolved_efs_id) against independently reconstructed values -- those already have their own authoritative resolution/verification checks. Returns the validated literal `deploy` boolean."""
+    if not isinstance(state, dict):
+        raise Phase5Error(f"Phase 5 reconcile state is a {type(state).__name__}, expected a JSON object.")
+
+    def _require_exact(key, expected):
+        actual = state.get(key)
+        if actual != expected:
+            raise Phase5Error(f"Phase 5 reconcile state {key}={actual!r} does not match the current matrix runtime (expected {expected!r} for environment={environment!r}, deployment_id={deployment_id!r}) -- refusing to let a mismatched/stale state file control this mutation.")
+        return actual
+
+    _require_exact("environment", environment)
+    _require_exact("deployment_id", deployment_id)
+    _require_exact("deployment_model", "singleRuntime")
+
+    deploy = _require_literal_bool_state_value(state, "deploy")
+
+    _require_exact("release_name", deployment_id)
+    _require_exact("argocd_app_name", _canonical_argocd_app_name(environment, deployment_id))
+    _require_exact("target_namespace", require_env("RUNTIME_NAMESPACE"))
+    _require_exact("values_file", f"envs/{environment}/{deployment_id}/values.yaml")
+    _require_exact("helm_ecr_repository", HELM_ECR_REPOSITORY)
+
+    ecr_registry = require_env("ECR_REGISTRY")
+    _require_exact("helm_push_url", f"oci://{ecr_registry}/{HELM_OCI_NAMESPACE}")
+    _require_exact("helm_chart_ref", f"oci://{ecr_registry}/{HELM_ECR_REPOSITORY}")
+
+    if "temp_chart_path" in state:
+        _require_exact("temp_chart_path", f"work/charts/{deployment_id}/goldengate")
+
+    return deploy
+
+
+def _validate_removal_state_identity(state, environment, deployment_id):
+    """Binds a persisted removal-state JSON document back to the CURRENT CLI environment/deployment_id plus canonical Phase 5 naming/config rules -- applied BEFORE any cluster connection or mutating call from a removal-state consumer (removal-preflight, remove-runtime, post-delete-acceptance), so a stale/cross-runtime removal state file can never control this runtime's deletion. Returns the validated efs_mode (never a corrupted one) for retained-PVC-hint decisions."""
+    if not isinstance(state, dict):
+        raise Phase5Error(f"Phase 5 removal state is a {type(state).__name__}, expected a JSON object.")
+
+    def _require_exact(key, expected):
+        actual = state.get(key)
+        if actual != expected:
+            raise Phase5Error(f"Phase 5 removal state {key}={actual!r} does not match the current matrix runtime (expected {expected!r} for environment={environment!r}, deployment_id={deployment_id!r}) -- refusing to let a mismatched/stale state file control this mutation.")
+        return actual
+
+    _require_exact("environment", environment)
+    _require_exact("deployment_id", deployment_id)
+    _require_exact("deployment_model", "singleRuntime")
+
+    reason = state.get("reason")
+    if reason not in ("deployment-disabled", "physical-removal"):
+        raise Phase5Error(f"Phase 5 removal state reason is {reason!r}, expected 'deployment-disabled' or 'physical-removal'.")
+
+    efs_mode = state.get("efs_mode")
+    if efs_mode not in ("", "existing", "managed"):
+        raise Phase5Error(f"Phase 5 removal state efs_mode is {efs_mode!r}, expected '', 'existing', or 'managed'.")
+
+    if reason == "physical-removal" and efs_mode == "managed":
+        raise Phase5Error(f"Phase 5 removal state is reason=physical-removal with efs_mode=managed for {deployment_id} -- refusing before any cluster connection/mutation. Physically removing the descriptor for a MANAGED durable EFS filesystem is unsafe; Terraform remains the sole managed-EFS lifecycle owner.")
+
+    _require_exact("runtime_namespace", require_env("RUNTIME_NAMESPACE"))
+    _require_exact("argocd_namespace", require_env("ARGOCD_NAMESPACE"))
+    _require_exact("argocd_app_name", _canonical_argocd_app_name(environment, deployment_id))
+
+    return efs_mode
 
 
 RECONCILE_COMMANDS = frozenset({
@@ -425,9 +507,7 @@ def cmd_prepare_deployment(args):
     if len(release_name) > 53:
         raise Phase5Error(f"Helm release name is too long: {release_name}. Please shorten deployment_id because resource names add suffixes.")
 
-    # Strip leading "gg-" for the Argo CD Application name suffix, e.g. gg-oracle-payments-01 -> goldengate-dev-oracle-payments-01.
-    app_suffix = deployment_id[len("gg-"):] if deployment_id.startswith("gg-") else deployment_id
-    argocd_app_name = f"goldengate-{environment}-{app_suffix}"
+    argocd_app_name = _canonical_argocd_app_name(environment, deployment_id)
 
     values_file = f"envs/{environment}/{deployment_id}/values.yaml"
 
@@ -454,7 +534,9 @@ def cmd_resolve_live_inputs(args):
     environment = require_environment_arg(args.environment)
     deployment_id = require_deployment_id_arg(args.deployment_id)
     state = load_state(args.state_path)
-    deploy = bool(state.get("deploy"))
+
+    # State identity/deploy-boolean binding BEFORE any EFS resolution or ECR image verification -- a state file left over from (or substituted from) a different matrix runtime, or a non-literal deploy value, must never control this mutation-adjacent read.
+    deploy = _validate_reconcile_state_identity(state, environment, deployment_id)
 
     descriptor = _describe_deployment_json(environment, deployment_id)
     admin_secret_name = descriptor.get("adminSecretName")
@@ -1021,8 +1103,15 @@ def _ensure_ecr_repository_policy(repository_name, aws_region, argocd_ecr_read_r
 
 
 def cmd_publish_chart(args):
-    require_environment_arg(args.environment)
+    environment = require_environment_arg(args.environment)
+    deployment_id = require_deployment_id_arg(args.deployment_id)
     state = load_state(args.state_path)
+
+    # Mutation boundary, independent of the workflow's own matrix.deploy gate: proves this state genuinely belongs to the current matrix runtime AND is a Deploy (not Validate) state BEFORE any AWS/ECR credential use or mutation, even if this subcommand is ever invoked directly.
+    deploy = _validate_reconcile_state_identity(state, environment, deployment_id)
+    if not deploy:
+        raise Phase5Error(f"Phase 5 reconcile state for {deployment_id} has deploy=false (Validate-mode) -- publish-chart is a Deploy-only AWS/ECR mutation boundary and refuses to run against a Validate state, even when invoked directly. This is defense in depth; the workflow itself already gates this step with matrix.deploy.")
+
     chart_version = require_state_value(state, "chart_version")
     package_path_rel = require_state_value(state, "package_path")
     helm_push_url = require_state_value(state, "helm_push_url")
@@ -1213,11 +1302,21 @@ def cmd_reconcile_runtime(args):
     environment = require_environment_arg(args.environment)
     deployment_id = require_deployment_id_arg(args.deployment_id)
     state = load_state(args.state_path)
-    argocd_app_name = require_state_value(state, "argocd_app_name")
-    helm_chart_ref = require_state_value(state, "helm_chart_ref")
+
+    # State identity/deploy-boolean binding BEFORE _connect_to_eks(), the emergency credential Secret, kubectl apply, or kubectl annotate -- a malformed/cross-runtime state file must result in ZERO Kubernetes calls.
+    deploy = _validate_reconcile_state_identity(state, environment, deployment_id)
+    if not deploy:
+        raise Phase5Error(f"Phase 5 reconcile state for {deployment_id} has deploy=false (Validate-mode) -- reconcile-runtime is a Deploy-only Kubernetes mutation boundary and refuses to run against a Validate state, even when invoked directly.")
+
+    # Only the freshly-recomputed canonical values are ever used for the mutation target itself -- never merely the (already-proven-matching) state-sourced copies.
+    argocd_app_name = _canonical_argocd_app_name(environment, deployment_id)
+    release_name = deployment_id
+    target_namespace = require_env("RUNTIME_NAMESPACE")
+    ecr_registry = require_env("ECR_REGISTRY")
+    helm_chart_ref = f"oci://{ecr_registry}/{HELM_ECR_REPOSITORY}"
+
+    # Mutable runtime results/descriptor-derived values -- never re-derived here; each already has its own authoritative resolution/verification check upstream (resolve-live-inputs/validate-local).
     chart_version = require_state_value(state, "chart_version")
-    release_name = require_state_value(state, "release_name")
-    target_namespace = require_state_value(state, "target_namespace")
     image_repository = require_state_value(state, "image_repository")
     dns_domain = require_state_value(state, "dns_domain")
     alb_group_name = require_state_value(state, "alb_group_name")
@@ -1318,8 +1417,7 @@ def cmd_prepare_removal(args):
 
     runtime_namespace = require_env("RUNTIME_NAMESPACE")
     argocd_namespace = require_env("ARGOCD_NAMESPACE")
-    app_suffix = deployment_id[len("gg-"):] if deployment_id.startswith("gg-") else deployment_id
-    argocd_app_name = f"goldengate-{environment}-{app_suffix}"
+    argocd_app_name = _canonical_argocd_app_name(environment, deployment_id)
 
     update_state(args.state_path, {
         "environment": environment, "deployment_id": deployment_id, "deployment_model": deployment_model,
@@ -1389,7 +1487,9 @@ def cmd_removal_preflight(args):
     environment = require_environment_arg(args.environment)
     deployment_id = require_deployment_id_arg(args.deployment_id)
     state = load_state(args.state_path)
-    efs_mode = state.get("efs_mode") or ""
+
+    # Static removal-state identity binding BEFORE _connect_to_eks() -- never trust a corrupted efs_mode to decide retained_pvc_expected; only the validated value is ever used.
+    efs_mode = _validate_removal_state_identity(state, environment, deployment_id)
 
     _connect_to_eks()
 
@@ -1466,12 +1566,17 @@ def _validate_removal_mutation_state(state):
 
 
 def cmd_remove_runtime(args):
-    require_environment_arg(args.environment)
-    require_deployment_id_arg(args.deployment_id)
+    environment = require_environment_arg(args.environment)
+    deployment_id = require_deployment_id_arg(args.deployment_id)
     state = load_state(args.state_path)
 
-    # Validated BEFORE any cluster connection or mutating call is ever issued -- a malformed state file results in ZERO Kubernetes calls.
-    ownership_state, application_found, argocd_app_name, argocd_namespace = _validate_removal_mutation_state(state)
+    # Both validated BEFORE any cluster connection or mutating call is ever issued -- a malformed OR cross-runtime state file results in ZERO Kubernetes calls: static identity binding (environment/deployment_id/canonical Application name/canonical Argo+runtime namespaces/deployment model/reason/efs_mode), extended (never replaced) by the already-approved ownership/application_found/footprint schema check.
+    _validate_removal_state_identity(state, environment, deployment_id)
+    ownership_state, application_found, _state_argocd_app_name, _state_argocd_namespace = _validate_removal_mutation_state(state)
+
+    # Only the freshly-recomputed canonical values are ever used for the mutation target itself -- never merely the (already-proven-matching) state-sourced copies.
+    argocd_app_name = _canonical_argocd_app_name(environment, deployment_id)
+    argocd_namespace = require_env("ARGOCD_NAMESPACE")
 
     # Uses removal-preflight's own already-authoritative checks.application_found -- never a second, redundant "kubectl get application" to decide absence. If preflight already proved the Application absent, this step no-ops without touching the cluster at all.
     if not application_found:
@@ -1536,7 +1641,8 @@ def cmd_post_delete_acceptance(args):
         print(f"Deployment model is {deployment_model} -- the singleRuntime post-delete compute-absence check does not apply to this retired historical path.")
         return
 
-    efs_mode = state.get("efs_mode") or ""
+    # Static removal-state identity binding BEFORE using efs_mode to decide retained_pvc_expected -- corrupted state must never change PVC-retention acceptance semantics.
+    efs_mode = _validate_removal_state_identity(state, environment, deployment_id)
     retained_pvc_expected = _retained_pvc_expected_for_removal(efs_mode)
 
     _connect_to_eks()

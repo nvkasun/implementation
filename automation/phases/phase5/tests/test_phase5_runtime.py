@@ -154,6 +154,34 @@ def _classifier_result(state, application_found, **footprint_overrides):
     return {"state": state, "checks": {"application_found": application_found, "footprint_found": _complete_footprint(**footprint_overrides)}}
 
 
+def _canonical_argocd_app_name(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID):
+    return phase5_runtime._canonical_argocd_app_name(environment, deployment_id)
+
+
+def _reconcile_state_fixture(**overrides):
+    """A complete, canonical, schema-valid reconcile-state JSON document -- everything _validate_reconcile_state_identity requires, so a test exercising unrelated behavior does not incidentally also fail identity binding. Override individual fields (including deliberately-wrong ones, for the cross-runtime regression tests) via keyword arguments."""
+    base = {
+        "environment": ENVIRONMENT, "deployment_id": DEPLOYMENT_ID, "deployment_model": "singleRuntime",
+        "deploy": True, "values_file": f"envs/{ENVIRONMENT}/{DEPLOYMENT_ID}/values.yaml",
+        "target_namespace": "goldengate-dev", "release_name": DEPLOYMENT_ID,
+        "argocd_app_name": _canonical_argocd_app_name(), "helm_ecr_repository": "helm/goldengate",
+        "helm_push_url": f"oci://{ECR_REGISTRY}/helm", "helm_chart_ref": f"oci://{ECR_REGISTRY}/helm/goldengate",
+    }
+    base.update(overrides)
+    return base
+
+
+def _removal_state_fixture(**overrides):
+    """A complete, canonical, schema-valid removal-state JSON document -- everything _validate_removal_state_identity requires. Override individual fields (including deliberately-wrong ones, for the cross-runtime regression tests) via keyword arguments."""
+    base = {
+        "environment": ENVIRONMENT, "deployment_id": DEPLOYMENT_ID, "deployment_model": "singleRuntime",
+        "efs_mode": "", "reason": "deployment-disabled", "runtime_namespace": "goldengate-dev",
+        "argocd_namespace": "argocd", "argocd_app_name": _canonical_argocd_app_name(),
+    }
+    base.update(overrides)
+    return base
+
+
 # ==== PREPARATION TESTS ====
 
 class InputValidationTests(unittest.TestCase):
@@ -930,8 +958,7 @@ class EcrRepositoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"
             phase5_runtime.update_state(state_path, {
-                "chart_version": "0.1.1-gg-x", "package_path": "packaged/goldengate-0.1.1-gg-x.tgz",
-                "helm_push_url": f"oci://{ECR_REGISTRY}/helm", "helm_chart_ref": f"oci://{ECR_REGISTRY}/helm/goldengate",
+                **_reconcile_state_fixture(), "chart_version": "0.1.1-gg-x", "package_path": "packaged/goldengate-0.1.1-gg-x.tgz",
             }, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
             (Path(tmp) / "packaged").mkdir()
             (Path(tmp) / "packaged" / "goldengate-0.1.1-gg-x.tgz").write_bytes(b"fake-chart")
@@ -944,7 +971,7 @@ class EcrRepositoryTests(unittest.TestCase):
             scripted.when(_starts_with("aws", "ecr", "set-repository-policy"), FakeProc(0, ""))
             scripted.when(_starts_with("helm", "push"), FakeProc(0, ""))
             scripted.when(_starts_with("helm", "pull"), FakeProc(0, ""))
-            args = argparse_namespace(environment=ENVIRONMENT, state_path=state_path)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
             with mock.patch.object(phase5_runtime, "REPO_ROOT", Path(tmp)), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
                 _run_quiet(phase5_runtime.cmd_publish_chart, args)
 
@@ -958,8 +985,7 @@ class EcrRepositoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"
             phase5_runtime.update_state(state_path, {
-                "chart_version": "0.1.1-gg-x", "package_path": "packaged/goldengate-0.1.1-gg-x.tgz",
-                "helm_push_url": f"oci://{ECR_REGISTRY}/helm", "helm_chart_ref": f"oci://{ECR_REGISTRY}/helm/goldengate",
+                **_reconcile_state_fixture(), "chart_version": "0.1.1-gg-x", "package_path": "packaged/goldengate-0.1.1-gg-x.tgz",
             }, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
             (Path(tmp) / "packaged").mkdir()
             (Path(tmp) / "packaged" / "goldengate-0.1.1-gg-x.tgz").write_bytes(b"fake-chart")
@@ -972,7 +998,7 @@ class EcrRepositoryTests(unittest.TestCase):
             scripted.when(_starts_with("aws", "ecr", "set-repository-policy"), FakeProc(0, ""))
             scripted.when(_starts_with("helm", "push"), FakeProc(0, ""))
             scripted.when(_starts_with("helm", "pull"), FakeProc(0, ""))
-            args = argparse_namespace(environment=ENVIRONMENT, state_path=state_path)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
             buf = io.StringIO()
             with mock.patch.object(phase5_runtime, "REPO_ROOT", Path(tmp)), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
                 with redirect_stdout(buf):
@@ -984,8 +1010,7 @@ class EcrRepositoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"
             phase5_runtime.update_state(state_path, {
-                "chart_version": "0.1.1-gg-x", "package_path": "packaged/goldengate-0.1.1-gg-x.tgz",
-                "helm_push_url": f"oci://{ECR_REGISTRY}/helm", "helm_chart_ref": f"oci://{ECR_REGISTRY}/helm/goldengate",
+                **_reconcile_state_fixture(), "chart_version": "0.1.1-gg-x", "package_path": "packaged/goldengate-0.1.1-gg-x.tgz",
             }, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
             (Path(tmp) / "packaged").mkdir()
             (Path(tmp) / "packaged" / "goldengate-0.1.1-gg-x.tgz").write_bytes(b"fake-chart")
@@ -997,7 +1022,7 @@ class EcrRepositoryTests(unittest.TestCase):
             scripted.when(_starts_with("aws", "ecr", "get-repository-policy"), FakeProc(1, "", "RepositoryPolicyNotFoundException"))
             scripted.when(_starts_with("aws", "ecr", "set-repository-policy"), FakeProc(0, ""))
             scripted.when(_starts_with("helm", "push"), FakeProc(1, "", "push failed"))
-            args = argparse_namespace(environment=ENVIRONMENT, state_path=state_path)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
             with mock.patch.object(phase5_runtime, "REPO_ROOT", Path(tmp)), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
                 with self.assertRaises(phase5_runtime.Phase5Error):
                     _run_quiet(phase5_runtime.cmd_publish_chart, args)
@@ -1006,8 +1031,7 @@ class EcrRepositoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"
             phase5_runtime.update_state(state_path, {
-                "chart_version": "0.1.1-gg-x", "package_path": "packaged/goldengate-0.1.1-gg-x.tgz",
-                "helm_push_url": f"oci://{ECR_REGISTRY}/helm", "helm_chart_ref": f"oci://{ECR_REGISTRY}/helm/goldengate",
+                **_reconcile_state_fixture(), "chart_version": "0.1.1-gg-x", "package_path": "packaged/goldengate-0.1.1-gg-x.tgz",
             }, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
             (Path(tmp) / "packaged").mkdir()
             (Path(tmp) / "packaged" / "goldengate-0.1.1-gg-x.tgz").write_bytes(b"fake-chart")
@@ -1020,7 +1044,7 @@ class EcrRepositoryTests(unittest.TestCase):
             scripted.when(_starts_with("aws", "ecr", "set-repository-policy"), FakeProc(0, ""))
             scripted.when(_starts_with("helm", "push"), FakeProc(0, ""))
             scripted.when(_starts_with("helm", "pull"), FakeProc(1, "", "pull failed"))
-            args = argparse_namespace(environment=ENVIRONMENT, state_path=state_path)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
             with mock.patch.object(phase5_runtime, "REPO_ROOT", Path(tmp)), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
                 with self.assertRaises(phase5_runtime.Phase5Error):
                     _run_quiet(phase5_runtime.cmd_publish_chart, args)
@@ -1321,9 +1345,8 @@ class ArgoWaitTests(unittest.TestCase):
 
 def _full_reconcile_state(state_path):
     phase5_runtime.update_state(state_path, {
-        "environment": ENVIRONMENT, "deployment_id": DEPLOYMENT_ID, "argocd_app_name": "goldengate-dev-oracle-payments-01",
-        "helm_chart_ref": f"oci://{ECR_REGISTRY}/helm/goldengate", "chart_version": "0.1.1-gg-x", "release_name": DEPLOYMENT_ID,
-        "target_namespace": "goldengate-dev", "image_repository": IMAGE_REPOSITORY, "dns_domain": "goldengate-dev.adcbmis.local",
+        **_reconcile_state_fixture(), "chart_version": "0.1.1-gg-x",
+        "image_repository": IMAGE_REPOSITORY, "dns_domain": "goldengate-dev.adcbmis.local",
         "alb_group_name": "goldengate-dev-shared", "certificate_arn": "arn:aws:acm:eu-west-1:668311715351:certificate/abc",
         "admin_secret_name": "dev/goldengate/source/admin", "tls_secret_name": "dev/goldengate/tls-certificate",
         "runtime_service_account_name": "gg-runtime-sa", "resolved_efs_id": "",
@@ -1522,9 +1545,9 @@ class RemovalPreflightTests(TempStateCase):
 class RemoveRuntimeTests(TempStateCase):
     def _set_state(self, ownership_state, application_found, footprint_found=None):
         phase5_runtime.update_state(self.state_path, {
+            **_removal_state_fixture(),
             "ownership_state": ownership_state, "application_found": application_found,
             "footprint_found": _complete_footprint() if footprint_found is None else footprint_found,
-            "argocd_app_name": "goldengate-dev-oracle-payments-01", "argocd_namespace": "argocd",
         }, phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
 
     def test_broken_cannot_mutate(self):
@@ -1535,14 +1558,14 @@ class RemoveRuntimeTests(TempStateCase):
     def test_absent_performs_no_application_mutation(self):
         self._set_state("ABSENT", False)
         scripted = ScriptedRun()
-        with mock.patch.object(phase5_runtime, "run", scripted):
+        with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
             _run_quiet(phase5_runtime.cmd_remove_runtime, self.args)
         self.assertEqual(scripted.calls, [])
 
     def test_owned_application_found_false_no_redundant_get_no_mutation(self):
         self._set_state("OWNED", False)
         scripted = ScriptedRun()
-        with mock.patch.object(phase5_runtime, "run", scripted):
+        with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
             _run_quiet(phase5_runtime.cmd_remove_runtime, self.args)
         self.assertEqual(scripted.calls, [], "no kubectl get/patch/delete calls at all -- preflight's own application_found is authoritative")
 
@@ -1745,7 +1768,7 @@ class PostDeletePositiveProofTests(unittest.TestCase):
     def test_147_inspection_errors_never_count_as_absence(self):
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"
-            phase5_runtime.update_state(state_path, {"deployment_model": "singleRuntime", "efs_mode": ""}, phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
+            phase5_runtime.update_state(state_path, _removal_state_fixture(), phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
             args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
             scripted = ScriptedRun()
             scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
@@ -1757,7 +1780,7 @@ class PostDeletePositiveProofTests(unittest.TestCase):
     def test_148_post_delete_bound_remains_180s_15s(self):
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"
-            phase5_runtime.update_state(state_path, {"deployment_model": "singleRuntime", "efs_mode": ""}, phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
+            phase5_runtime.update_state(state_path, _removal_state_fixture(), phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
             args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
             scripted = ScriptedRun()
             scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
@@ -1774,7 +1797,7 @@ class PostDeletePositiveProofTests(unittest.TestCase):
     def test_149_final_boundary_probe_preserved(self):
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"
-            phase5_runtime.update_state(state_path, {"deployment_model": "singleRuntime", "efs_mode": ""}, phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
+            phase5_runtime.update_state(state_path, _removal_state_fixture(), phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
             args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
             scripted = ScriptedRun()
             scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
@@ -1890,7 +1913,7 @@ class StrictAcceptanceTests(TempStateCase):
 
 class ResolveLiveInputsIntegrationTests(TempStateCase):
     def test_full_resolve_live_inputs_flow(self):
-        phase5_runtime.update_state(self.state_path, {"deploy": False}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+        phase5_runtime.update_state(self.state_path, _reconcile_state_fixture(deploy=False), phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
         scripted = ScriptedRun()
         scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
         scripted.when(_starts_with("aws", "ecr", "describe-images"), FakeProc(0, json.dumps({"imageDetails": [{"imageDigest": "sha256:deadbeef"}]})))
@@ -1902,7 +1925,7 @@ class ResolveLiveInputsIntegrationTests(TempStateCase):
         self.assertEqual(state["resolved_efs_id"], "")
 
     def test_resolve_live_inputs_missing_identity_fails(self):
-        phase5_runtime.update_state(self.state_path, {"deploy": False}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+        phase5_runtime.update_state(self.state_path, _reconcile_state_fixture(deploy=False), phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
         scripted = ScriptedRun()
         scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor(adminSecretName=None))))
         with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
@@ -2014,15 +2037,15 @@ class RemovalMutationStateTests(TempStateCase):
 
     def _persist(self, **fields):
         base = {
+            **_removal_state_fixture(),
             "ownership_state": "OWNED", "application_found": True, "footprint_found": _complete_footprint(),
-            "argocd_app_name": "goldengate-dev-oracle-payments-01", "argocd_namespace": "argocd",
         }
         base.update(fields)
         phase5_runtime.update_state(self.state_path, base, phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
 
     def _assert_fails_before_any_mutation(self):
         scripted = ScriptedRun()
-        with mock.patch.object(phase5_runtime, "run", scripted):
+        with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
             with self.assertRaises(phase5_runtime.Phase5Error):
                 _run_quiet(phase5_runtime.cmd_remove_runtime, self.args)
         self.assertEqual(scripted.calls, [], "a malformed removal state must result in ZERO subprocess calls (no _connect_to_eks, no kubectl patch/delete)")
@@ -2041,18 +2064,12 @@ class RemovalMutationStateTests(TempStateCase):
         self._assert_fails_before_any_mutation()
 
     def test_14_application_found_missing_fails_before_mutation(self):
-        state = {
-            "ownership_state": "OWNED", "footprint_found": _complete_footprint(),
-            "argocd_app_name": "goldengate-dev-oracle-payments-01", "argocd_namespace": "argocd",
-        }
+        state = {**_removal_state_fixture(), "ownership_state": "OWNED", "footprint_found": _complete_footprint()}
         phase5_runtime.update_state(self.state_path, state, phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
         self._assert_fails_before_any_mutation()
 
     def test_15_footprint_found_missing_fails_before_mutation(self):
-        state = {
-            "ownership_state": "OWNED", "application_found": True,
-            "argocd_app_name": "goldengate-dev-oracle-payments-01", "argocd_namespace": "argocd",
-        }
+        state = {**_removal_state_fixture(), "ownership_state": "OWNED", "application_found": True}
         phase5_runtime.update_state(self.state_path, state, phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
         self._assert_fails_before_any_mutation()
 
@@ -2076,14 +2093,14 @@ class RemovalMutationStateTests(TempStateCase):
     def test_20_valid_absent_application_false_performs_no_mutation(self):
         self._persist(ownership_state="ABSENT", application_found=False)
         scripted = ScriptedRun()
-        with mock.patch.object(phase5_runtime, "run", scripted):
+        with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
             _run_quiet(phase5_runtime.cmd_remove_runtime, self.args)
         self.assertEqual(scripted.calls, [])
 
     def test_21_valid_owned_application_false_performs_no_application_mutation(self):
         self._persist(ownership_state="OWNED", application_found=False)
         scripted = ScriptedRun()
-        with mock.patch.object(phase5_runtime, "run", scripted):
+        with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
             _run_quiet(phase5_runtime.cmd_remove_runtime, self.args)
         self.assertEqual(scripted.calls, [])
 
@@ -2101,6 +2118,272 @@ class RemovalMutationStateTests(TempStateCase):
         self.assertEqual(len(delete_calls), 1)
         self.assertIn("--wait=true", delete_calls[0]["argv"])
         self.assertIn("--timeout=10m", delete_calls[0]["argv"])
+
+
+class LiteralDeployBooleanTests(unittest.TestCase):
+    """Issue 3: cmd_resolve_live_inputs() no longer contains `deploy = bool(state.get("deploy"))` -- bool("false") == True in Python. _validate_reconcile_state_identity() now requires state["deploy"] to already be a literal JSON boolean."""
+
+    def _validate(self, deploy_value):
+        state = _reconcile_state_fixture(deploy=deploy_value)
+        with _env_patch():
+            return phase5_runtime._validate_reconcile_state_identity(state, ENVIRONMENT, DEPLOYMENT_ID)
+
+    def test_1_deploy_false_accepted_as_literal_false(self):
+        self.assertIs(self._validate(False), False)
+
+    def test_2_deploy_true_accepted_as_literal_true(self):
+        self.assertIs(self._validate(True), True)
+
+    def test_3_deploy_string_false_rejected(self):
+        """Confirmed reproduction of the historical bug: bool("false") == True in Python -- the OLD cmd_resolve_live_inputs code would have silently treated this Validate-mode state as deploy=True."""
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            self._validate("false")
+
+    def test_4_deploy_string_true_rejected(self):
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            self._validate("true")
+
+    def test_5_deploy_zero_rejected(self):
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            self._validate(0)
+
+    def test_6_deploy_one_rejected(self):
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            self._validate(1)
+
+    def test_7_deploy_none_rejected(self):
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            self._validate(None)
+
+    def test_8_deploy_missing_rejected(self):
+        state = _reconcile_state_fixture()
+        del state["deploy"]
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            with _env_patch():
+                phase5_runtime._validate_reconcile_state_identity(state, ENVIRONMENT, DEPLOYMENT_ID)
+
+    def test_9_managed_efs_deploy_false_uses_synthetic_placeholder_zero_live_calls(self):
+        """Integration-level proof via cmd_resolve_live_inputs: deploy=false + managed EFS mode must reach the dry-run placeholder with ZERO sts:AssumeRole/efs:DescribeFileSystems calls."""
+        state = _reconcile_state_fixture(deploy=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            phase5_runtime.update_state(state_path, state, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = ScriptedRun()
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)),
+                          FakeProc(0, json.dumps(_descriptor(efsMode="managed", efsFileSystemId=None, efsCreationToken="gg-dev-oracle-01-u02"))))
+            scripted.when(_starts_with("aws", "ecr", "describe-images"), FakeProc(0, json.dumps({"imageDetails": [{"imageDigest": "sha256:deadbeef"}]})))
+            with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+                _run_quiet(phase5_runtime.cmd_resolve_live_inputs, args)
+            result_state = phase5_runtime.load_state(state_path)
+            self.assertEqual(result_state["resolved_efs_id"], phase5_runtime.EFS_DRY_RUN_PLACEHOLDER)
+            self.assertEqual([c for c in scripted.calls if c["argv"][:3] == ["aws", "sts", "assume-role"]], [])
+            self.assertEqual([c for c in scripted.calls if c["argv"][:3] == ["aws", "efs", "describe-file-systems"]], [])
+
+
+class CrossRuntimeReconcileStateTests(unittest.TestCase):
+    """State identity/target binding: a reconcile-state JSON document whose mutation-target fields do not match the CURRENT matrix environment/deployment_id (or the canonical Phase 5 naming/config rules) must never be trusted by resolve-live-inputs/publish-chart/reconcile-runtime -- each must fail BEFORE any AWS/Kubernetes call."""
+
+    def _resolve_live_inputs_fails_zero_calls(self, **state_overrides):
+        state = _reconcile_state_fixture(**state_overrides)
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            phase5_runtime.update_state(state_path, state, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = ScriptedRun()
+            with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    _run_quiet(phase5_runtime.cmd_resolve_live_inputs, args)
+            self.assertEqual(scripted.calls, [], "a cross-runtime/malformed reconcile state must result in ZERO calls (no deployment-model describe, no ECR describe-images)")
+
+    def test_10_environment_mismatch_fails_before_mutation(self):
+        self._resolve_live_inputs_fails_zero_calls(environment="staging")
+
+    def test_11_deployment_id_mismatch_fails_before_mutation(self):
+        self._resolve_live_inputs_fails_zero_calls(deployment_id="gg-mssql-repltest-01")
+
+    def test_12_wrong_release_name_fails(self):
+        self._resolve_live_inputs_fails_zero_calls(release_name="totally-unrelated-release")
+
+    def _reconcile_runtime_fails_zero_kubernetes_calls(self, **state_overrides):
+        state = {
+            **_reconcile_state_fixture(**state_overrides), "chart_version": "0.1.1-gg-x",
+            "image_repository": IMAGE_REPOSITORY, "dns_domain": "goldengate-dev.adcbmis.local",
+            "alb_group_name": "goldengate-dev-shared", "certificate_arn": "arn:aws:acm:eu-west-1:668311715351:certificate/abc",
+            "admin_secret_name": "dev/goldengate/source/admin", "tls_secret_name": "dev/goldengate/tls-certificate",
+            "runtime_service_account_name": "gg-runtime-sa", "resolved_efs_id": "",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            phase5_runtime.update_state(state_path, state, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = ScriptedRun()
+            with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+                with self.assertRaises(phase5_runtime.Phase5Error) as ctx:
+                    _run_quiet(phase5_runtime.cmd_reconcile_runtime, args)
+            self.assertEqual(scripted.calls, [], "a cross-runtime/malformed reconcile state must result in ZERO Kubernetes calls (no _connect_to_eks, no kubectl apply/annotate)")
+            return str(ctx.exception)
+
+    def test_13_wrong_argocd_app_name_fails_before_connect_to_eks(self):
+        """Confirmed reproduction: state.argocd_app_name="totally-unrelated-app" from the confirmed current bug must now fail closed before any Kubernetes call."""
+        message = self._reconcile_runtime_fails_zero_kubernetes_calls(argocd_app_name="totally-unrelated-app")
+        self.assertIn("totally-unrelated-app", message)
+
+    def test_14_wrong_target_namespace_fails_before_connect_to_eks(self):
+        """Confirmed reproduction: state.target_namespace="some-other-runtime-ns" from the confirmed current bug must now fail closed before any Kubernetes call."""
+        message = self._reconcile_runtime_fails_zero_kubernetes_calls(target_namespace="some-other-runtime-ns")
+        self.assertIn("some-other-runtime-ns", message)
+
+    def test_15_wrong_helm_chart_ref_fails(self):
+        self._reconcile_runtime_fails_zero_kubernetes_calls(helm_chart_ref="oci://evil-registry.example.com/helm/goldengate")
+
+    def _publish_chart_fails_zero_aws_calls(self, **state_overrides):
+        state = {**_reconcile_state_fixture(**state_overrides), "chart_version": "0.1.1-gg-x", "package_path": "packaged/goldengate-0.1.1-gg-x.tgz"}
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            phase5_runtime.update_state(state_path, state, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = ScriptedRun()
+            with mock.patch.object(phase5_runtime, "REPO_ROOT", Path(tmp)), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    _run_quiet(phase5_runtime.cmd_publish_chart, args)
+            self.assertEqual(scripted.calls, [], "a cross-runtime/malformed reconcile state must result in ZERO AWS/ECR calls")
+
+    def test_16_wrong_helm_push_url_fails_before_ecr_publish(self):
+        self._publish_chart_fails_zero_aws_calls(helm_push_url="oci://evil-registry.example.com/helm")
+
+    def test_17_wrong_helm_ecr_repository_fails(self):
+        self._publish_chart_fails_zero_aws_calls(helm_ecr_repository="helm/some-other-chart")
+
+    def test_18_wrong_values_file_fails(self):
+        self._resolve_live_inputs_fails_zero_calls(values_file="envs/dev/some-other-deployment/values.yaml")
+
+    def test_19_deploy_false_direct_publish_chart_invocation_fails_before_any_aws_call(self):
+        self._publish_chart_fails_zero_aws_calls(deploy=False)
+
+    def test_20_deploy_string_false_direct_publish_chart_invocation_fails_before_any_aws_call(self):
+        self._publish_chart_fails_zero_aws_calls(deploy="false")
+
+    def test_21_deploy_false_direct_reconcile_runtime_invocation_fails_before_any_kubernetes_call(self):
+        self._reconcile_runtime_fails_zero_kubernetes_calls(deploy=False)
+
+    def test_22_valid_canonical_reconcile_state_still_performs_exact_application_reconciliation_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            _full_reconcile_state(state_path)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = _reconcile_scripted_ok()
+            with mock.patch.object(phase5_runtime, "run", scripted), _env_patch(ENABLE_TEMP_ARGOCD_ECR_PASSWORD_INJECTION="false"):
+                _run_quiet(phase5_runtime.cmd_reconcile_runtime, args)
+            apply_calls = [c for c in scripted.calls if c["argv"][:3] == ["kubectl", "apply", "-f"]]
+            annotate_calls = [c for c in scripted.calls if c["argv"][:2] == ["kubectl", "annotate"]]
+            self.assertEqual(len(apply_calls), 1)
+            self.assertEqual(len(annotate_calls), 1)
+            import yaml as _yaml
+            manifest = _yaml.safe_load(apply_calls[0]["input_text"])
+            self.assertEqual(manifest["metadata"]["name"], _canonical_argocd_app_name())
+
+
+class CrossRuntimeRemovalStateTests(unittest.TestCase):
+    """State identity/target binding: a removal-state JSON document whose mutation-target fields do not match the CURRENT matrix environment/deployment_id (or the canonical Phase 5 naming/config rules) must never be trusted by removal-preflight/remove-runtime/post-delete-acceptance -- each must fail BEFORE any cluster connection or mutating call."""
+
+    def _removal_preflight_fails_zero_calls(self, **state_overrides):
+        state = _removal_state_fixture(**state_overrides)
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            phase5_runtime.update_state(state_path, state, phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = ScriptedRun()
+            with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    _run_quiet(phase5_runtime.cmd_removal_preflight, args)
+            self.assertEqual(scripted.calls, [], "a cross-runtime/malformed removal state must result in ZERO calls (no _connect_to_eks, no ownership classifier invocation)")
+
+    def test_23_environment_mismatch_fails_before_cluster_connection(self):
+        self._removal_preflight_fails_zero_calls(environment="staging")
+
+    def test_24_deployment_id_mismatch_fails(self):
+        self._removal_preflight_fails_zero_calls(deployment_id="gg-mssql-repltest-01")
+
+    def _remove_runtime_fails_zero_calls(self, **state_overrides):
+        state = {**_removal_state_fixture(**state_overrides), "ownership_state": "OWNED", "application_found": True, "footprint_found": _complete_footprint()}
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            phase5_runtime.update_state(state_path, state, phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = ScriptedRun()
+            with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+                with self.assertRaises(phase5_runtime.Phase5Error) as ctx:
+                    _run_quiet(phase5_runtime.cmd_remove_runtime, args)
+            self.assertEqual(scripted.calls, [], "a cross-runtime/malformed removal state must result in ZERO kubectl patch/delete calls")
+            return str(ctx.exception)
+
+    def test_25_wrong_argocd_app_name_fails_zero_patch_delete(self):
+        """Confirmed reproduction: state.argocd_app_name="totally-unrelated-app" from the confirmed current bug must now fail closed before any kubectl patch/delete."""
+        message = self._remove_runtime_fails_zero_calls(argocd_app_name="totally-unrelated-app")
+        self.assertIn("totally-unrelated-app", message)
+
+    def test_26_wrong_argocd_namespace_fails_zero_kubernetes_calls(self):
+        """Confirmed reproduction: state.argocd_namespace="other-namespace" from the confirmed current bug must now fail closed before any Kubernetes call."""
+        message = self._remove_runtime_fails_zero_calls(argocd_namespace="other-namespace")
+        self.assertIn("other-namespace", message)
+
+    def test_27_wrong_runtime_namespace_fails(self):
+        self._removal_preflight_fails_zero_calls(runtime_namespace="some-other-ns")
+
+    def test_28_wrong_deployment_model_fails(self):
+        self._removal_preflight_fails_zero_calls(deployment_model="legacyPair")
+
+    def test_29_invalid_reason_fails(self):
+        self._removal_preflight_fails_zero_calls(reason="bogus-reason")
+
+    def test_30_invalid_efs_mode_fails(self):
+        self._removal_preflight_fails_zero_calls(efs_mode="bogus")
+
+    def test_31_physical_removal_plus_managed_fails_before_cluster_connection(self):
+        self._removal_preflight_fails_zero_calls(reason="physical-removal", efs_mode="managed")
+
+    def test_32_valid_canonical_owned_application_true_exact_patch_delete_still_occurs(self):
+        state = {**_removal_state_fixture(), "ownership_state": "OWNED", "application_found": True, "footprint_found": _complete_footprint()}
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            phase5_runtime.update_state(state_path, state, phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = ScriptedRun()
+            scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
+            scripted.when(_starts_with("kubectl", "patch", "application"), FakeProc(0, ""))
+            scripted.when(_starts_with("kubectl", "delete", "application"), FakeProc(0, ""))
+            with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+                _run_quiet(phase5_runtime.cmd_remove_runtime, args)
+            patch_calls = [c for c in scripted.calls if c["argv"][:2] == ["kubectl", "patch"]]
+            delete_calls = [c for c in scripted.calls if c["argv"][:2] == ["kubectl", "delete"]]
+            self.assertEqual(len(patch_calls), 1)
+            self.assertEqual(len(delete_calls), 1)
+
+    def test_33_valid_canonical_absent_application_false_no_application_mutation(self):
+        state = {**_removal_state_fixture(), "ownership_state": "ABSENT", "application_found": False, "footprint_found": _complete_footprint()}
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            phase5_runtime.update_state(state_path, state, phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = ScriptedRun()
+            with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+                _run_quiet(phase5_runtime.cmd_remove_runtime, args)
+            self.assertEqual(scripted.calls, [])
+
+    def test_34_valid_canonical_retained_pvc_removal_state_post_delete_behavior_unchanged(self):
+        state = _removal_state_fixture(efs_mode="existing")
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            phase5_runtime.update_state(state_path, state, phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = ScriptedRun()
+            scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.RUNTIME_STATE_TOOL)), FakeProc(0, json.dumps(_classifier_result("OWNED", False, pvc=True))))
+            with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+                _run_quiet(phase5_runtime.cmd_post_delete_acceptance, args)
+            classifier_call = next(c["argv"] for c in scripted.calls if str(phase5_runtime.RUNTIME_STATE_TOOL) in c["argv"])
+            self.assertIn("--retained-pvc-expected", classifier_call)
 
 
 if __name__ == "__main__":

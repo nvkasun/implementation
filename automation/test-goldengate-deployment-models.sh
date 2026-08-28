@@ -3070,7 +3070,10 @@ def classify_state(state_word, deployment_model="singleRuntime"):
             return type("Proc", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
         args = type("Args", (), {"environment": "dev", "deployment_id": "gg-postgresql-repltest-01", "state_path": state_path})()
-        with mock.patch.object(phase5_runtime, "run", fake_run), mock.patch.dict(__import__("os").environ, {"AWS_REGION": "eu-west-1", "EKS_CLUSTER_NAME": "x", "EKS_DEPLOY_ROLE_ARN": "arn:aws:iam::668311715351:role/x"}):
+        with mock.patch.object(phase5_runtime, "run", fake_run), mock.patch.dict(__import__("os").environ, {
+            "AWS_REGION": "eu-west-1", "EKS_CLUSTER_NAME": "x", "EKS_DEPLOY_ROLE_ARN": "arn:aws:iam::668311715351:role/x",
+            "RUNTIME_NAMESPACE": "goldengate-dev", "ARGOCD_NAMESPACE": "argocd",
+        }):
             try:
                 with redirect_stdout(io.StringIO()):
                     phase5_runtime.cmd_removal_preflight(args)
@@ -15299,12 +15302,20 @@ def fake_run(argv, env=None, cwd=None, check=True, capture_output=True, input_te
 runtime_state_module = phase5_runtime._load_runtime_state_module()
 complete_footprint_for_removal = {k: False for k in runtime_state_module.RUNTIME_FOOTPRINT_KEYS}
 
-with mock.patch.object(phase5_runtime, "run", fake_run), mock.patch.dict(os.environ, {"AWS_REGION": "eu-west-1", "EKS_CLUSTER_NAME": "x", "EKS_DEPLOY_ROLE_ARN": "arn:aws:iam::668311715351:role/x"}):
+with mock.patch.object(phase5_runtime, "run", fake_run), mock.patch.dict(os.environ, {
+    "AWS_REGION": "eu-west-1", "EKS_CLUSTER_NAME": "x", "EKS_DEPLOY_ROLE_ARN": "arn:aws:iam::668311715351:role/x",
+    "RUNTIME_NAMESPACE": "goldengate-dev", "ARGOCD_NAMESPACE": "argocd",
+}):
     args = type("Args", (), {"environment": "dev", "deployment_id": "gg-oracle-payments-01", "state_path": None})()
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
         state_path = Path(tmp) / "state.json"
-        phase5_runtime.update_state(state_path, {"ownership_state": "OWNED", "application_found": True, "footprint_found": complete_footprint_for_removal, "argocd_app_name": "goldengate-dev-oracle-payments-01", "argocd_namespace": "argocd"}, phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
+        phase5_runtime.update_state(state_path, {
+            "environment": "dev", "deployment_id": "gg-oracle-payments-01", "deployment_model": "singleRuntime",
+            "efs_mode": "", "reason": "deployment-disabled", "runtime_namespace": "goldengate-dev",
+            "ownership_state": "OWNED", "application_found": True, "footprint_found": complete_footprint_for_removal,
+            "argocd_app_name": "goldengate-dev-oracle-payments-01", "argocd_namespace": "argocd",
+        }, phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
         args.state_path = state_path
         with redirect_stdout(io.StringIO()):
             phase5_runtime.cmd_remove_runtime(args)
@@ -15626,13 +15637,16 @@ import os
 REMOVE_RUNTIME_ENV = {
     "AWS_REGION": "eu-west-1", "EKS_CLUSTER_NAME": "gg-dev-cluster",
     "EKS_DEPLOY_ROLE_ARN": "arn:aws:iam::229410149234:role/gg-dev-eks-deploy",
+    "RUNTIME_NAMESPACE": "goldengate-dev", "ARGOCD_NAMESPACE": "argocd",
 }
 
 
 def remove_runtime_with_state(state_overrides):
     base_state = {
+        "environment": "dev", "deployment_id": "gg-oracle-payments-01", "deployment_model": "singleRuntime",
+        "efs_mode": "", "reason": "deployment-disabled", "runtime_namespace": "goldengate-dev",
         "ownership_state": "OWNED", "application_found": True, "footprint_found": complete_footprint(),
-        "argocd_app_name": "goldengate-dev-x", "argocd_namespace": "argocd",
+        "argocd_app_name": "goldengate-dev-oracle-payments-01", "argocd_namespace": "argocd",
     }
     base_state.update(state_overrides)
     recorder = Recorder()
@@ -15654,10 +15668,15 @@ results.append(("application_found=0 fails before any mutation", exc is not None
 exc, calls = remove_runtime_with_state({"application_found": None})
 results.append(("application_found=null fails before any mutation", exc is not None and calls == []))
 
-state_missing_app_found = {"ownership_state": "OWNED", "footprint_found": complete_footprint(), "argocd_app_name": "goldengate-dev-x", "argocd_namespace": "argocd"}
+state_missing_app_found = {
+    "environment": "dev", "deployment_id": "gg-oracle-payments-01", "deployment_model": "singleRuntime",
+    "efs_mode": "", "reason": "deployment-disabled", "runtime_namespace": "goldengate-dev",
+    "ownership_state": "OWNED", "footprint_found": complete_footprint(),
+    "argocd_app_name": "goldengate-dev-oracle-payments-01", "argocd_namespace": "argocd",
+}
 recorder = Recorder()
 args = type("Args", (), {"environment": "dev", "deployment_id": "gg-oracle-payments-01", "state_path": None})()
-with mock.patch.object(phase5_runtime, "load_state", lambda _path: state_missing_app_found), mock.patch.object(phase5_runtime, "run", recorder):
+with mock.patch.object(phase5_runtime, "load_state", lambda _path: state_missing_app_found), mock.patch.object(phase5_runtime, "run", recorder), mock.patch.dict(os.environ, REMOVE_RUNTIME_ENV):
     try:
         phase5_runtime.cmd_remove_runtime(args)
         results.append(("application_found missing fails before any mutation", False))
@@ -15705,6 +15724,238 @@ PYEOF
   fi
 else
   skip "Phase 5 post-delete/removal-mutation correction: dedicated static assertions -- python3/phase5_runtime.py unavailable"
+fi
+
+echo ""
+echo "--- Phase 5 Python Conversion: persisted-state identity/target binding (A-J) ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE5_RUNTIME_TOOL" ]; then
+  PHASE5_STATE_IDENTITY_CHECK="$(python3 - "$EKS_APP_WORKFLOW" "$PHASE5_RUNTIME_TOOL" <<'PYEOF'
+import ast
+import importlib.util
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+from unittest import mock
+
+import yaml
+
+workflow_path, tool_path = sys.argv[1:3]
+
+with open(workflow_path) as f:
+    jobs = yaml.safe_load(f)["jobs"]
+
+spec = importlib.util.spec_from_file_location("phase5_runtime", tool_path)
+phase5_runtime = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(phase5_runtime)
+
+runtime_state = phase5_runtime._load_runtime_state_module()
+FOOTPRINT_KEYS = set(runtime_state.RUNTIME_FOOTPRINT_KEYS)
+
+results = []
+
+ENVIRONMENT_VALUE = "dev"
+DEPLOYMENT_ID_VALUE = "gg-oracle-payments-01"
+ECR_REGISTRY_VALUE = "229410149234.dkr.ecr.eu-west-1.amazonaws.com"
+
+RECONCILE_ENV = {
+    "AWS_REGION": "eu-west-1", "EKS_CLUSTER_NAME": "gg-dev-cluster",
+    "EKS_DEPLOY_ROLE_ARN": "arn:aws:iam::668311715351:role/GoldenGateEksDeployRole-dev",
+    "RUNTIME_NAMESPACE": "goldengate-dev", "ARGOCD_NAMESPACE": "argocd", "ECR_REGISTRY": ECR_REGISTRY_VALUE,
+    "ARGOCD_ECR_READ_ROLE_ARN": "arn:aws:iam::229410149234:role/ArgoCdEcrReadRole",
+}
+
+
+def complete_footprint(**overrides):
+    footprint = {k: False for k in FOOTPRINT_KEYS}
+    footprint.update(overrides)
+    return footprint
+
+
+def reconcile_state_fixture(**overrides):
+    base = {
+        "environment": ENVIRONMENT_VALUE, "deployment_id": DEPLOYMENT_ID_VALUE, "deployment_model": "singleRuntime",
+        "deploy": True, "values_file": f"envs/{ENVIRONMENT_VALUE}/{DEPLOYMENT_ID_VALUE}/values.yaml",
+        "target_namespace": "goldengate-dev", "release_name": DEPLOYMENT_ID_VALUE,
+        "argocd_app_name": phase5_runtime._canonical_argocd_app_name(ENVIRONMENT_VALUE, DEPLOYMENT_ID_VALUE),
+        "helm_ecr_repository": "helm/goldengate", "helm_push_url": f"oci://{ECR_REGISTRY_VALUE}/helm",
+        "helm_chart_ref": f"oci://{ECR_REGISTRY_VALUE}/helm/goldengate",
+    }
+    base.update(overrides)
+    return base
+
+
+def removal_state_fixture(**overrides):
+    base = {
+        "environment": ENVIRONMENT_VALUE, "deployment_id": DEPLOYMENT_ID_VALUE, "deployment_model": "singleRuntime",
+        "efs_mode": "", "reason": "deployment-disabled", "runtime_namespace": "goldengate-dev",
+        "argocd_namespace": "argocd", "argocd_app_name": phase5_runtime._canonical_argocd_app_name(ENVIRONMENT_VALUE, DEPLOYMENT_ID_VALUE),
+    }
+    base.update(overrides)
+    return base
+
+
+class Recorder:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        return type("Proc", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+
+def args_for(state_path):
+    return type("Args", (), {"environment": ENVIRONMENT_VALUE, "deployment_id": DEPLOYMENT_ID_VALUE, "state_path": state_path})()
+
+
+def with_state(fixture, allowed_keys):
+    tmp = tempfile.TemporaryDirectory()
+    state_path = Path(tmp.name) / "state.json"
+    phase5_runtime.update_state(state_path, fixture, allowed_keys)
+    return tmp, state_path
+
+
+with open(tool_path) as f:
+    tool_source = f.read()
+tree = ast.parse(tool_source)
+
+
+def fn_source(name):
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
+    return ast.get_source_segment(tool_source, fn) or ""
+
+
+# A: no bool(state.get("deploy")) truthiness coercion remains anywhere in Phase 5 production.
+results.append(('A: no bool(state.get("deploy")) truthiness coercion remains anywhere in phase5_runtime.py', 'bool(state.get("deploy"))' not in tool_source))
+
+# B: reconcile state environment/deployment ID are bound to the current CLI identity -- behavioral proof via cmd_resolve_live_inputs with a mismatched environment.
+tmp, state_path = with_state(reconcile_state_fixture(environment="staging"), phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+recorder = Recorder()
+with mock.patch.object(phase5_runtime, "run", recorder), mock.patch.dict(os.environ, RECONCILE_ENV):
+    try:
+        phase5_runtime.cmd_resolve_live_inputs(args_for(state_path))
+        b_ok = False
+    except phase5_runtime.Phase5Error:
+        b_ok = recorder.calls == []
+tmp.cleanup()
+results.append(("B: reconcile state environment mismatch fails cmd_resolve_live_inputs before any call, binding state to the current CLI identity", b_ok))
+
+# C: the runtime Application name is derived from ONE canonical helper -- reused by prepare-deployment, prepare-removal, and both identity validators (never independently duplicated).
+results.append(("C: _canonical_argocd_app_name() produces the documented gg- stripping contract", phase5_runtime._canonical_argocd_app_name("dev", "gg-postgresql-repltest-01") == "goldengate-dev-postgresql-repltest-01" and phase5_runtime._canonical_argocd_app_name("dev", "gg-gg-test") == "goldengate-dev-gg-test"))
+for fn_name in ("cmd_prepare_deployment", "cmd_prepare_removal", "_validate_reconcile_state_identity", "_validate_removal_state_identity"):
+    results.append((f"C: {fn_name}() calls the single canonical _canonical_argocd_app_name() helper (never a second, independently-duplicated derivation)", "_canonical_argocd_app_name(" in fn_source(fn_name)))
+
+# D: reconcile-runtime rejects a non-canonical Application target BEFORE any mutation (confirmed reproduction: "totally-unrelated-app").
+tmp, state_path = with_state({
+    **reconcile_state_fixture(argocd_app_name="totally-unrelated-app"), "chart_version": "0.1.1-gg-x",
+    "image_repository": f"{ECR_REGISTRY_VALUE}/aws-cloud-factory-goldengate-oracle", "dns_domain": "goldengate-dev.adcbmis.local",
+    "alb_group_name": "goldengate-dev-shared", "certificate_arn": "arn:aws:acm:eu-west-1:668311715351:certificate/abc",
+    "admin_secret_name": "dev/goldengate/source/admin", "tls_secret_name": "dev/goldengate/tls-certificate",
+    "runtime_service_account_name": "gg-runtime-sa", "resolved_efs_id": "",
+}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+recorder = Recorder()
+with mock.patch.object(phase5_runtime, "run", recorder), mock.patch.dict(os.environ, RECONCILE_ENV):
+    try:
+        phase5_runtime.cmd_reconcile_runtime(args_for(state_path))
+        d_ok = False
+    except phase5_runtime.Phase5Error as exc:
+        d_ok = recorder.calls == [] and "totally-unrelated-app" in str(exc)
+tmp.cleanup()
+results.append(('D: confirmed reproduction -- reconcile-runtime rejects argocd_app_name="totally-unrelated-app" with ZERO Kubernetes calls before _connect_to_eks()', d_ok))
+
+# E: reconcile-runtime rejects a non-canonical runtime namespace BEFORE any mutation.
+tmp, state_path = with_state({
+    **reconcile_state_fixture(target_namespace="some-other-runtime-ns"), "chart_version": "0.1.1-gg-x",
+    "image_repository": f"{ECR_REGISTRY_VALUE}/aws-cloud-factory-goldengate-oracle", "dns_domain": "goldengate-dev.adcbmis.local",
+    "alb_group_name": "goldengate-dev-shared", "certificate_arn": "arn:aws:acm:eu-west-1:668311715351:certificate/abc",
+    "admin_secret_name": "dev/goldengate/source/admin", "tls_secret_name": "dev/goldengate/tls-certificate",
+    "runtime_service_account_name": "gg-runtime-sa", "resolved_efs_id": "",
+}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+recorder = Recorder()
+with mock.patch.object(phase5_runtime, "run", recorder), mock.patch.dict(os.environ, RECONCILE_ENV):
+    try:
+        phase5_runtime.cmd_reconcile_runtime(args_for(state_path))
+        e_ok = False
+    except phase5_runtime.Phase5Error as exc:
+        e_ok = recorder.calls == [] and "some-other-runtime-ns" in str(exc)
+tmp.cleanup()
+results.append(('E: confirmed reproduction -- reconcile-runtime rejects target_namespace="some-other-runtime-ns" with ZERO Kubernetes calls before _connect_to_eks()', e_ok))
+
+# F: publish-chart requires deploy == literal true, independent of the workflow's own matrix.deploy gate.
+publish_chart_src = fn_source("cmd_publish_chart")
+results.append(("F: cmd_publish_chart() delegates to _validate_reconcile_state_identity and independently checks deploy before any AWS/ECR call", "_validate_reconcile_state_identity" in publish_chart_src and "if not deploy" in publish_chart_src))
+tmp, state_path = with_state({**reconcile_state_fixture(deploy=False), "chart_version": "0.1.1-gg-x", "package_path": "packaged/goldengate-0.1.1-gg-x.tgz"}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+recorder = Recorder()
+with mock.patch.object(phase5_runtime, "run", recorder), mock.patch.dict(os.environ, RECONCILE_ENV):
+    try:
+        phase5_runtime.cmd_publish_chart(args_for(state_path))
+        f_ok = False
+    except phase5_runtime.Phase5Error:
+        f_ok = recorder.calls == []
+tmp.cleanup()
+results.append(("F: publish-chart with deploy=false fails closed with ZERO AWS/ECR calls, even when invoked directly", f_ok))
+
+# G: remove-runtime rejects a non-canonical Application name/namespace (confirmed reproduction: "totally-unrelated-app" / "other-namespace").
+for label, override, needle in (
+    ("Application name", {"argocd_app_name": "totally-unrelated-app"}, "totally-unrelated-app"),
+    ("Argo namespace", {"argocd_namespace": "other-namespace"}, "other-namespace"),
+):
+    tmp, state_path = with_state({
+        **removal_state_fixture(**override), "ownership_state": "OWNED", "application_found": True, "footprint_found": complete_footprint(),
+    }, phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
+    recorder = Recorder()
+    with mock.patch.object(phase5_runtime, "run", recorder), mock.patch.dict(os.environ, RECONCILE_ENV):
+        try:
+            phase5_runtime.cmd_remove_runtime(args_for(state_path))
+            g_ok = False
+        except phase5_runtime.Phase5Error as exc:
+            g_ok = recorder.calls == [] and needle in str(exc)
+    tmp.cleanup()
+    results.append((f"G: confirmed reproduction -- remove-runtime rejects a non-canonical {label} ({needle!r}) with ZERO kubectl patch/delete calls", g_ok))
+
+# H: removal-preflight validates removal state identity BEFORE any cluster inspection (a mismatched environment must never even reach _connect_to_eks()).
+tmp, state_path = with_state(removal_state_fixture(environment="staging"), phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
+recorder = Recorder()
+with mock.patch.object(phase5_runtime, "run", recorder), mock.patch.dict(os.environ, RECONCILE_ENV):
+    try:
+        phase5_runtime.cmd_removal_preflight(args_for(state_path))
+        h_ok = False
+    except phase5_runtime.Phase5Error:
+        h_ok = recorder.calls == []
+tmp.cleanup()
+results.append(("H: removal-preflight validates removal-state identity before any cluster inspection (ZERO calls -- not even aws eks update-kubeconfig -- for a mismatched environment)", h_ok))
+
+# I: post-delete acceptance validates removal state identity BEFORE using efs_mode as a retained-PVC hint -- source-order proof (never a reimplementation text match).
+post_delete_acceptance_src = fn_source("cmd_post_delete_acceptance")
+identity_call_index = post_delete_acceptance_src.find("_validate_removal_state_identity")
+retained_pvc_hint_index = post_delete_acceptance_src.find("_retained_pvc_expected_for_removal(")
+results.append(("I: cmd_post_delete_acceptance() calls _validate_removal_state_identity() strictly BEFORE computing retained_pvc_expected from efs_mode", identity_call_index != -1 and retained_pvc_hint_index != -1 and identity_call_index < retained_pvc_hint_index))
+
+# J: Phase 5 DAG (job IDs, needs, if-gating) remains unchanged by this state-identity-only production correction.
+PHASE5_JOB_IDS = ("runtime_ownership_preflight", "build_publish_and_deploy", "delete_removed_argocd_applications", "validate_active_runtimes")
+results.append(("J: all four MAIN Phase 5 job IDs remain, unrefactored, in the workflow DAG", all(j in jobs for j in PHASE5_JOB_IDS)))
+replication_needs = jobs.get("replication_reconcile_once", {}).get("needs") or []
+replication_if = str(jobs.get("replication_reconcile_once", {}).get("if", ""))
+results.append(("J: Phase 6 (replication_reconcile_once) remains downstream of validate_active_runtimes, unchanged", "validate_active_runtimes" in replication_needs and "validate_active_runtimes.result" in replication_if))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  echo "$PHASE5_STATE_IDENTITY_CHECK"
+  if [ -z "$(echo "$PHASE5_STATE_IDENTITY_CHECK" | grep '^FAIL ' || true)" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        OK\ *) pass "Phase 5 state identity/target binding: ${line#OK }" ;;
+      esac
+    done <<< "$PHASE5_STATE_IDENTITY_CHECK"
+  else
+    fail "Phase 5 state identity/target binding: dedicated static assertions failed:"$'\n'"${PHASE5_STATE_IDENTITY_CHECK}"
+  fi
+else
+  skip "Phase 5 state identity/target binding: dedicated static assertions -- python3/PyYAML/EKS_APP_WORKFLOW/phase5_runtime.py unavailable"
 fi
 
 echo "--- Final repository handoff hygiene sweep (VDR pre-transfer cleanliness) ---"
