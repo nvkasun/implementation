@@ -643,17 +643,40 @@ def _require_safe_archive_member_name(name, resolved_package_path):
         raise Phase5Error(f"packaged chart archive {resolved_package_path} contains a member {name!r} outside the canonical archive root {CHART_NAME!r}/ -- refusing to trust a non-canonical package root.")
 
 
+def _validate_canonical_chart_source_root():
+    """The authoritative chart source must be the physical repository-owned directory REPO_ROOT/helm/goldengate -- never an arbitrary filesystem target reachable through a directory-level symlink (the same protection already applied to REPO_ROOT/packaged in _validate_package_path_and_containment()). MUST be called BEFORE any recursive traversal (_expected_chart_package_members()'s rglob) or copy (_package_runtime_chart()'s copytree) ever trusts HELM_CHART_PATH -- an untrusted symlinked chart root must never even be walked. Returns HELM_CHART_PATH once every check has passed, so callers never need to separately re-trust it at another artifact-trust boundary."""
+    expected_chart_path = REPO_ROOT / "helm" / CHART_NAME
+    if HELM_CHART_PATH != expected_chart_path:
+        raise Phase5Error(f"HELM_CHART_PATH={HELM_CHART_PATH} does not refer to the expected canonical chart source path {expected_chart_path} -- refusing to trust an unexpected chart-source constant.")
+
+    if HELM_CHART_PATH.is_symlink():
+        raise Phase5Error(f"{HELM_CHART_PATH} is a symlink -- the canonical chart source root must be a real, repository-owned directory, never a symlink (possible directory-level escape) -- refusing to trust anything under it.")
+    if not HELM_CHART_PATH.exists():
+        raise Phase5Error(f"expected canonical chart source directory does not exist: {HELM_CHART_PATH}")
+    if not HELM_CHART_PATH.is_dir():
+        raise Phase5Error(f"expected canonical chart source path {HELM_CHART_PATH} is not a directory.")
+
+    repo_root_resolved = REPO_ROOT.resolve()
+    chart_root_resolved = HELM_CHART_PATH.resolve()
+    if chart_root_resolved != repo_root_resolved / "helm" / CHART_NAME:
+        raise Phase5Error(f"{HELM_CHART_PATH} resolves to {chart_root_resolved}, which is not the expected {repo_root_resolved / 'helm' / CHART_NAME} -- refusing to trust an unexpected chart-source location.")
+    if repo_root_resolved not in chart_root_resolved.parents:
+        raise Phase5Error(f"{HELM_CHART_PATH} resolves to {chart_root_resolved}, which is outside the repository root {repo_root_resolved} -- refusing to trust it.")
+    return HELM_CHART_PATH
+
+
 def _expected_chart_package_members():
-    """Recursively derives the expected canonical archive regular-file member set from the CURRENT helm/goldengate/ source tree -- never a second, manually-maintained template list; if the canonical chart source gains/removes a legitimate file, this set follows automatically. Fails closed if the canonical source tree itself contains a symlink or anything other than a regular file/directory -- keeps the canonical source unambiguous. The one deployment-specific addition (goldengate/values-deployment.yaml, produced by _package_runtime_chart() copying the current deployment values file) is added last."""
+    """Recursively derives the expected canonical archive regular-file member set from the CURRENT helm/goldengate/ source tree -- never a second, manually-maintained template list; if the canonical chart source gains/removes a legitimate file, this set follows automatically. Validates the chart root itself via _validate_canonical_chart_source_root() BEFORE ever walking it (an untrusted symlinked root must fail before rglob, not be discovered afterward), then fails closed if any DESCENDANT under that root is a symlink or anything other than a regular file/directory -- keeps the canonical source unambiguous end to end. The one deployment-specific addition (goldengate/values-deployment.yaml, produced by _package_runtime_chart() copying the current deployment values file) is added last."""
+    chart_root = _validate_canonical_chart_source_root()
     members = set()
-    for path in sorted(HELM_CHART_PATH.rglob("*")):
+    for path in sorted(chart_root.rglob("*")):
         if path.is_symlink():
             raise Phase5Error(f"canonical chart source {path} is a symlink -- the canonical helm/goldengate/ source tree must contain only regular files/directories.")
         if path.is_dir():
             continue
         if not path.is_file():
             raise Phase5Error(f"canonical chart source {path} is neither a regular file nor a directory -- refusing to derive a package contract from an ambiguous source tree.")
-        relative = path.relative_to(HELM_CHART_PATH).as_posix()
+        relative = path.relative_to(chart_root).as_posix()
         members.add(f"{CHART_NAME}/{relative}")
     members.add(f"{CHART_NAME}/values-deployment.yaml")
     return members
@@ -1190,11 +1213,13 @@ def _validate_efs_render_contract(values, docs, environment, deployment_id, depl
 
 
 def _package_runtime_chart(deployment_id, values_file, chart_version):
+    # Refuses to build/package from an untrusted symlinked chart root -- validated BEFORE copytree ever reads from HELM_CHART_PATH.
+    chart_root = _validate_canonical_chart_source_root()
     temp_chart_path = REPO_ROOT / _canonical_temp_chart_path(deployment_id)
     if temp_chart_path.exists():
         shutil.rmtree(temp_chart_path)
     temp_chart_path.mkdir(parents=True)
-    shutil.copytree(HELM_CHART_PATH, temp_chart_path, dirs_exist_ok=True)
+    shutil.copytree(chart_root, temp_chart_path, dirs_exist_ok=True)
     shutil.copy(REPO_ROOT / values_file, temp_chart_path / "values-deployment.yaml")
 
     packaged_dir = REPO_ROOT / "packaged"

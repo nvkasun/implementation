@@ -16291,6 +16291,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import sys
 import tarfile
 import tempfile
@@ -16389,6 +16390,15 @@ def build_package(repo_root, chart_version, member_overrides=None, omit_members=
     return f"packaged/{package_path.name}"
 
 
+def mock_repo_root_with_real_chart(repo_root):
+    """Consistently mocks BOTH phase5_runtime.REPO_ROOT and phase5_runtime.HELM_CHART_PATH at repo_root/helm/goldengate -- required by _validate_canonical_chart_source_root()'s HELM_CHART_PATH == REPO_ROOT/helm/goldengate identity contract. Physically copies the REAL current chart tree into that location first (a genuine directory, never a symlink) if not already present."""
+    chart_path = repo_root / "helm" / "goldengate"
+    if not chart_path.exists():
+        chart_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(phase5_runtime.HELM_CHART_PATH, chart_path)
+    return mock.patch.multiple(phase5_runtime, REPO_ROOT=repo_root, HELM_CHART_PATH=chart_path)
+
+
 def publish_zero_network(repo_root, package_path_rel):
     """Runs cmd_publish_chart() with a call-recording stub -- returns (raised_exception_or_None, calls)."""
     state_path = repo_root / "state.json"
@@ -16401,7 +16411,7 @@ def publish_zero_network(repo_root, package_path_rel):
         calls.append(list(argv))
         return type("Proc", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
-    with mock.patch.object(phase5_runtime, "REPO_ROOT", repo_root), mock.patch.object(phase5_runtime, "run", recorder), mock.patch.dict(os.environ, RECONCILE_ENV):
+    with mock_repo_root_with_real_chart(repo_root), mock.patch.object(phase5_runtime, "run", recorder), mock.patch.dict(os.environ, RECONCILE_ENV):
         try:
             phase5_runtime.cmd_publish_chart(args)
             return None, calls
@@ -16421,7 +16431,7 @@ def fn_source(name):
 
 # A: package validator derives expected regular files from HELM_CHART_PATH rather than a manually duplicated template list.
 expected_members_src = fn_source("_expected_chart_package_members")
-results.append(("A: _expected_chart_package_members() walks HELM_CHART_PATH.rglob(...) (never a hard-coded template filename list)", "HELM_CHART_PATH.rglob(" in expected_members_src))
+results.append(("A: _expected_chart_package_members() validates the canonical chart root then walks it with .rglob(...) (never a hard-coded template filename list)", "_validate_canonical_chart_source_root()" in expected_members_src and ".rglob(" in expected_members_src))
 results.append(("A: production code contains no independent hard-coded 'runtime-statefulset.yaml' template list outside the real chart source/tests", tool_source.count("runtime-statefulset.yaml") == 0))
 real_expected = phase5_runtime._expected_chart_package_members()
 results.append(("A: the derived expected set currently matches the real helm/goldengate/ source tree contents (10 chart files + values-deployment.yaml)", real_expected == {
@@ -16561,6 +16571,197 @@ PYEOF
   fi
 else
   skip "Phase 5 archive-tree integrity: dedicated static assertions -- python3/PyYAML/EKS_APP_WORKFLOW/phase5_runtime.py unavailable"
+fi
+
+echo ""
+echo "--- Phase 5 Python Conversion: canonical chart-source-root symlink protection (A-G) ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE5_RUNTIME_TOOL" ]; then
+  PHASE5_CHART_ROOT_CHECK="$(python3 - "$EKS_APP_WORKFLOW" "$PHASE5_RUNTIME_TOOL" <<'PYEOF'
+import ast
+import importlib.util
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+from unittest import mock
+
+import yaml
+
+workflow_path, tool_path = sys.argv[1:3]
+
+with open(workflow_path) as f:
+    jobs = yaml.safe_load(f)["jobs"]
+
+spec = importlib.util.spec_from_file_location("phase5_runtime", tool_path)
+phase5_runtime = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(phase5_runtime)
+
+results = []
+
+with open(tool_path) as f:
+    tool_source = f.read()
+tree = ast.parse(tool_source)
+
+
+def fn_source(name):
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
+    return ast.get_source_segment(tool_source, fn) or ""
+
+
+def fn_defs(name):
+    return [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name]
+
+
+# A: one canonical chart-root validator exists.
+root_validator_names = [n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and "canonical_chart_source_root" in n.name]
+results.append(("A: exactly one canonical chart-source-root validator is defined in phase5_runtime.py", len(root_validator_names) == 1))
+root_validator_name = root_validator_names[0] if root_validator_names else "_validate_canonical_chart_source_root"
+root_validator_src = fn_source(root_validator_name)
+
+# B: it rejects HELM_CHART_PATH itself being a symlink.
+results.append(("B: the chart-root validator rejects HELM_CHART_PATH itself being a symlink", "HELM_CHART_PATH.is_symlink()" in root_validator_src))
+with tempfile.TemporaryDirectory() as tmp:
+    repo_root = Path(tmp) / "repo"
+    repo_root.mkdir()
+    external_chart = Path(tmp) / "external-chart"
+    shutil.copytree(phase5_runtime.HELM_CHART_PATH, external_chart)
+    (repo_root / "helm").mkdir()
+    b_ok = None
+    try:
+        (repo_root / "helm" / "goldengate").symlink_to(external_chart, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        b_ok = True  # symlinks unsupported on this platform/filesystem -- cannot reproduce, but not a production defect
+    if b_ok is None:
+        with mock.patch.multiple(phase5_runtime, REPO_ROOT=repo_root, HELM_CHART_PATH=repo_root / "helm" / "goldengate"):
+            try:
+                getattr(phase5_runtime, root_validator_name)()
+                b_ok = False
+            except phase5_runtime.Phase5Error:
+                b_ok = True
+    results.append(("B: confirmed reproduction -- HELM_CHART_PATH symlinked to an external directory (perfectly canonical chart content) is rejected", b_ok))
+
+# C: it requires the resolved root to equal REPO_ROOT.resolve()/helm/goldengate.
+results.append(("C: the chart-root validator requires chart_root_resolved == repo_root_resolved / 'helm' / CHART_NAME", "repo_root_resolved / \"helm\"" in root_validator_src or 'repo_root_resolved / "helm" / CHART_NAME' in root_validator_src))
+with tempfile.TemporaryDirectory() as tmp:
+    repo_root = Path(tmp) / "repo"
+    repo_root.mkdir()
+    other_dir = Path(tmp) / "other-chart-dir"
+    other_dir.mkdir()
+    with mock.patch.multiple(phase5_runtime, REPO_ROOT=repo_root, HELM_CHART_PATH=other_dir):
+        try:
+            getattr(phase5_runtime, root_validator_name)()
+            c_ok = False
+        except phase5_runtime.Phase5Error:
+            c_ok = True
+    results.append(("C: HELM_CHART_PATH pointed at a different (non-symlink, non-canonical) directory is rejected", c_ok))
+
+# D: _expected_chart_package_members invokes it before rglob traversal.
+expected_members_src = fn_source("_expected_chart_package_members")
+root_call_index = expected_members_src.find(f"{root_validator_name}(")
+rglob_index = expected_members_src.find(".rglob(")
+results.append(("D: _expected_chart_package_members() calls the chart-root validator strictly BEFORE .rglob(...) traversal", -1 not in (root_call_index, rglob_index) and root_call_index < rglob_index))
+
+with tempfile.TemporaryDirectory() as tmp:
+    repo_root = Path(tmp) / "repo"
+    repo_root.mkdir()
+    external_chart = Path(tmp) / "external-chart"
+    shutil.copytree(phase5_runtime.HELM_CHART_PATH, external_chart)
+    poison_name = "poison-should-never-be-reached.yaml"
+    (external_chart / poison_name).write_text("harmless real file used only to prove traversal never reaches it")
+    (repo_root / "helm").mkdir()
+    d_ok = None
+    try:
+        (repo_root / "helm" / "goldengate").symlink_to(external_chart, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        d_ok = True
+    if d_ok is None:
+        with mock.patch.multiple(phase5_runtime, REPO_ROOT=repo_root, HELM_CHART_PATH=repo_root / "helm" / "goldengate"):
+            try:
+                phase5_runtime._expected_chart_package_members()
+                d_ok = False
+            except phase5_runtime.Phase5Error as exc:
+                d_ok = poison_name not in str(exc)
+    results.append(("D: a symlinked chart root fails before any descendant (including a harmless extra file) is ever discovered by rglob", d_ok))
+
+# E: _package_runtime_chart invokes it before copytree.
+package_runtime_chart_src = fn_source("_package_runtime_chart")
+copytree_index = package_runtime_chart_src.find("shutil.copytree(")
+root_call_in_package_index = package_runtime_chart_src.find(f"{root_validator_name}(")
+results.append(("E: _package_runtime_chart() calls the chart-root validator strictly BEFORE shutil.copytree(...)", -1 not in (root_call_in_package_index, copytree_index) and root_call_in_package_index < copytree_index))
+
+with tempfile.TemporaryDirectory() as tmp:
+    repo_root = Path(tmp) / "repo"
+    repo_root.mkdir()
+    external_chart = Path(tmp) / "external-chart"
+    shutil.copytree(phase5_runtime.HELM_CHART_PATH, external_chart)
+    (repo_root / "helm").mkdir()
+    e_ok = None
+    try:
+        (repo_root / "helm" / "goldengate").symlink_to(external_chart, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        e_ok = True
+    if e_ok is None:
+        values_rel = "envs/dev/gg-oracle-payments-01/values.yaml"
+        (repo_root / values_rel).parent.mkdir(parents=True)
+        (repo_root / values_rel).write_text("runtime:\n  containerName: goldengate\n")
+        temp_chart_marker = repo_root / phase5_runtime._canonical_temp_chart_path("gg-oracle-payments-01")
+        with mock.patch.multiple(phase5_runtime, REPO_ROOT=repo_root, HELM_CHART_PATH=repo_root / "helm" / "goldengate"):
+            try:
+                phase5_runtime._package_runtime_chart("gg-oracle-payments-01", values_rel, "0.1.1-gg-oracle-payments-01")
+                e_ok = False
+            except phase5_runtime.Phase5Error:
+                e_ok = not temp_chart_marker.exists()
+    results.append(("E: confirmed reproduction -- _package_runtime_chart() refuses a symlinked chart root before any shutil.copytree() ever runs", e_ok))
+
+# F: existing descendant-symlink rejection remains.
+results.append(("F: the existing descendant-symlink rejection (every path under the validated root) remains present", "path.is_symlink()" in expected_members_src))
+with tempfile.TemporaryDirectory() as tmp:
+    repo_root = Path(tmp)
+    chart_path = repo_root / "helm" / "goldengate"
+    chart_path.mkdir(parents=True)
+    (chart_path / "Chart.yaml").write_text("apiVersion: v2\nname: goldengate\nversion: 0.0.0\n")
+    f_ok = None
+    try:
+        (chart_path / "evil.yaml").symlink_to(chart_path / "Chart.yaml")
+    except (OSError, NotImplementedError):
+        f_ok = True
+    if f_ok is None:
+        with mock.patch.multiple(phase5_runtime, REPO_ROOT=repo_root, HELM_CHART_PATH=chart_path):
+            try:
+                phase5_runtime._expected_chart_package_members()
+                f_ok = False
+            except phase5_runtime.Phase5Error as exc:
+                f_ok = "evil.yaml" in str(exc)
+    results.append(("F: a normal (non-symlinked) canonical chart root with a descendant symlink still fails, unweakened", f_ok))
+
+# G: package artifact validation still occurs before AWS/ECR/network calls.
+publish_chart_src = fn_source("cmd_publish_chart")
+containment_call_index = publish_chart_src.find("_validate_package_path_and_containment(")
+contents_call_index = publish_chart_src.find("_validate_packaged_chart_contents(")
+first_network_index = publish_chart_src.find("get-login-password")
+results.append(("G: cmd_publish_chart() still validates package path/containment and packaged-chart contents strictly BEFORE the first AWS ECR call", -1 not in (containment_call_index, contents_call_index, first_network_index) and containment_call_index < first_network_index and contents_call_index < first_network_index))
+
+build_job = jobs["build_publish_and_deploy"]
+publish_step = next((s for s in build_job["steps"] if s.get("name") == "Publish runtime Helm chart to private ECR"), None)
+results.append(("G: the 'Publish runtime Helm chart to private ECR' workflow step still only invokes phase5_runtime.py publish-chart (no reintroduced inline logic)", publish_step is not None and "phase5_runtime.py publish-chart" in publish_step.get("run", "")))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  echo "$PHASE5_CHART_ROOT_CHECK"
+  if [ -z "$(echo "$PHASE5_CHART_ROOT_CHECK" | grep '^FAIL ' || true)" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        OK\ *) pass "Phase 5 chart-source-root symlink protection: ${line#OK }" ;;
+      esac
+    done <<< "$PHASE5_CHART_ROOT_CHECK"
+  else
+    fail "Phase 5 chart-source-root symlink protection: dedicated static assertions failed:"$'\n'"${PHASE5_CHART_ROOT_CHECK}"
+  fi
+else
+  skip "Phase 5 chart-source-root symlink protection: dedicated static assertions -- python3/PyYAML/EKS_APP_WORKFLOW/phase5_runtime.py unavailable"
 fi
 
 echo "--- Final repository handoff hygiene sweep (VDR pre-transfer cleanliness) ---"
