@@ -539,22 +539,20 @@ def _minimal_docs(admin_secret_name="dev/goldengate/source/admin"):
 
 class RequiredFilesTests(unittest.TestCase):
     def test_missing_chart_yaml_fails(self):
-        with mock.patch.object(phase5_runtime, "HELM_CHART_PATH", Path("/nonexistent/chart")):
-            with self.assertRaises(phase5_runtime.Phase5Error):
-                phase5_runtime._validate_required_files("envs/dev/gg-oracle-payments-01/values.yaml")
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            phase5_runtime._validate_required_files("envs/dev/gg-oracle-payments-01/values.yaml", Path("/nonexistent/chart"))
 
     def test_missing_base_values_yaml_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             chart_dir = Path(tmp) / "chart"
             chart_dir.mkdir()
             (chart_dir / "Chart.yaml").write_text("apiVersion: v2\n")
-            with mock.patch.object(phase5_runtime, "HELM_CHART_PATH", chart_dir):
-                with self.assertRaises(phase5_runtime.Phase5Error):
-                    phase5_runtime._validate_required_files("envs/dev/gg-oracle-payments-01/values.yaml")
+            with self.assertRaises(phase5_runtime.Phase5Error):
+                phase5_runtime._validate_required_files("envs/dev/gg-oracle-payments-01/values.yaml", chart_dir)
 
     def test_missing_deployment_values_fails(self):
         with self.assertRaises(phase5_runtime.Phase5Error):
-            phase5_runtime._validate_required_files("envs/dev/does-not-exist/values.yaml")
+            phase5_runtime._validate_required_files("envs/dev/does-not-exist/values.yaml", phase5_runtime.HELM_CHART_PATH)
 
 
 class HelmDependencyToleranceTests(unittest.TestCase):
@@ -3462,6 +3460,347 @@ class ChartSourceRootIntegrityTests(unittest.TestCase):
                 with self.assertRaises(phase5_runtime.Phase5Error):
                     _run_quiet(phase5_runtime.cmd_publish_chart, args)
             self.assertEqual(scripted.calls, [])
+
+
+class ValidateLocalChartRootOrderingTests(unittest.TestCase):
+    """Confirmed reproduction target: cmd_validate_local() previously ran helm dependency build/lint/template against HELM_CHART_PATH BEFORE the canonical chart-root check (previously only inside _package_runtime_chart) ever fired -- an untrusted symlinked chart root was inspected/executed by Helm before the filesystem trust boundary ran."""
+
+    def _symlinked_root_fixture(self, tmp):
+        repo_root = Path(tmp) / "repo"
+        repo_root.mkdir()
+        external_chart = Path(tmp) / "external-chart"
+        external_chart.mkdir()
+        (external_chart / "Chart.yaml").write_text("apiVersion: v2\nname: goldengate\nversion: 0.0.0\n")
+        (external_chart / "values.yaml").write_text("runtime:\n  containerName: goldengate\n")
+        (repo_root / "helm").mkdir()
+        try:
+            (repo_root / "helm" / "goldengate").symlink_to(external_chart, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are not supported on this platform/filesystem")
+
+        values_rel = f"envs/{ENVIRONMENT}/{DEPLOYMENT_ID}/values.yaml"
+        (repo_root / values_rel).parent.mkdir(parents=True)
+        (repo_root / values_rel).write_text("runtime:\n  containerName: goldengate\n")
+
+        state_path = repo_root / "state.json"
+        phase5_runtime.update_state(state_path, _resolved_state_fixture(), phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+        args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+        return repo_root, args
+
+    def _run_with_symlinked_root(self, tmp):
+        repo_root, args = self._symlinked_root_fixture(tmp)
+        scripted = ScriptedRun()
+        scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
+        chart_path = repo_root / "helm" / "goldengate"
+        with mock.patch.multiple(phase5_runtime, REPO_ROOT=repo_root, HELM_CHART_PATH=chart_path), \
+             mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+            with self.assertRaises(phase5_runtime.Phase5Error):
+                _run_quiet(phase5_runtime.cmd_validate_local, args)
+        return repo_root, scripted
+
+    def test_1_normal_canonical_chart_root_still_resolves(self):
+        """Confirms the fix does not regress the happy path -- see ValidateLocalIntegrationTests.test_full_validate_local_flow for the full end-to-end contract."""
+        chart_root = phase5_runtime._validate_canonical_chart_source_root()
+        self.assertEqual(chart_root, phase5_runtime.HELM_CHART_PATH)
+
+    def test_2_symlinked_chart_root_fails_before_any_helm_command(self):
+        """Confirmed reproduction of the current gap before the fix."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _repo_root, scripted = self._run_with_symlinked_root(tmp)
+            self.assertEqual([c for c in scripted.calls if c["argv"][:1] == ["helm"]], [])
+
+    def test_3_symlinked_chart_root_writes_no_rendered_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root, _scripted = self._run_with_symlinked_root(tmp)
+            rendered_marker = repo_root / phase5_runtime._canonical_rendered_manifest_path(DEPLOYMENT_ID)
+            self.assertFalse(rendered_marker.exists())
+
+    def test_4_validate_required_files_never_reached_for_symlinked_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root, args = self._symlinked_root_fixture(tmp)
+            scripted = ScriptedRun()
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
+            chart_path = repo_root / "helm" / "goldengate"
+            with mock.patch.multiple(phase5_runtime, REPO_ROOT=repo_root, HELM_CHART_PATH=chart_path), \
+                 mock.patch.object(phase5_runtime, "run", scripted), \
+                 mock.patch.object(phase5_runtime, "_validate_required_files") as required_files_mock, \
+                 _env_patch():
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    _run_quiet(phase5_runtime.cmd_validate_local, args)
+            required_files_mock.assert_not_called()
+
+    def _normal_root_fixture(self, tmp):
+        repo_root = Path(tmp)
+        chart_dir = repo_root / "helm" / "goldengate"
+        chart_dir.mkdir(parents=True)
+        (chart_dir / "Chart.yaml").write_text("apiVersion: v2\nname: goldengate\n")
+        (chart_dir / "values.yaml").write_text("runtime:\n  containerName: goldengate\n")
+
+        values_rel = f"envs/{ENVIRONMENT}/{DEPLOYMENT_ID}/values.yaml"
+        values_path = repo_root / values_rel
+        values_path.parent.mkdir(parents=True)
+        values_path.write_text("runtime:\n  containerName: goldengate\n  name: " + DEPLOYMENT_ID + "\ningress:\n  enabled: false\n")
+
+        state_path = repo_root / "state.json"
+        phase5_runtime.update_state(state_path, {
+            **_reconcile_state_fixture(), "target_namespace": TARGET_NAMESPACE,
+            "admin_secret_name": "dev/goldengate/source/admin", "tls_secret_name": "dev/goldengate/tls-certificate",
+            "runtime_service_account_name": "gg-runtime-sa", "image_repository": IMAGE_REPOSITORY,
+            "image_repository_name": "aws-cloud-factory-goldengate-oracle", "image_tag": IMAGE_TAG,
+            "image_digest": "sha256:" + "ab" * 32, "dns_domain": "goldengate-dev.adcbmis.local",
+            "alb_group_name": "goldengate-dev-shared", "certificate_arn": f"arn:aws:acm:eu-west-1:{WORKLOAD_ACCOUNT_ID}:certificate/abc-123",
+            "resolved_efs_id": "", "efs_mode": "", "efs_file_system_id_declared": "", "efs_creation_token": "",
+        }, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+        args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+        return repo_root, chart_dir, args
+
+    def test_5_normal_chart_root_tolerates_only_dependency_build_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root, chart_dir, args = self._normal_root_fixture(tmp)
+            import yaml as _yaml
+            rendered_yaml = "\n---\n".join(_yaml.safe_dump(d) for d in (
+                _statefulset(), _service(DEPLOYMENT_ID), _service(f"{DEPLOYMENT_ID}-headless", headless=True), _admin_spc("dev/goldengate/source/admin"),
+            ))
+            package_dir = repo_root / "packaged"
+            scripted = ScriptedRun()
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
+            scripted.when(_starts_with("helm", "dependency", "build"), FakeProc(1, "", "Error: no repositories configured"))
+            scripted.when(_starts_with("helm", "lint"), FakeProc(0, ""))
+            scripted.when(_starts_with("helm", "template"), FakeProc(0, rendered_yaml))
+
+            def fake_helm_package(argv, **kwargs):
+                package_dir.mkdir(parents=True, exist_ok=True)
+                (package_dir / f"{phase5_runtime.CHART_NAME}-{CHART_VERSION}.tgz").write_bytes(b"fake")
+                return FakeProc(0, "")
+
+            with mock.patch.object(phase5_runtime, "REPO_ROOT", repo_root), \
+                 mock.patch.object(phase5_runtime, "HELM_CHART_PATH", chart_dir), \
+                 mock.patch.object(phase5_runtime, "run") as run_mock, _env_patch():
+                def route(argv, **kwargs):
+                    if argv[:2] == ["helm", "package"]:
+                        return fake_helm_package(argv, **kwargs)
+                    return scripted(argv, **kwargs)
+                run_mock.side_effect = route
+                _run_quiet(phase5_runtime.cmd_validate_local, args)  # must NOT raise -- dependency-build failure remains tolerated
+
+            dep_calls = [c["argv"] for c in scripted.calls if c["argv"][:3] == ["helm", "dependency", "build"]]
+            lint_calls = [c["argv"] for c in scripted.calls if c["argv"][:2] == ["helm", "lint"]]
+            self.assertEqual(len(dep_calls), 1)
+            self.assertEqual(len(lint_calls), 1, "lint must still run and remain authoritative despite the tolerated dependency-build failure")
+
+    def test_6_normal_chart_root_lint_and_template_use_validated_chart_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root, chart_dir, args = self._normal_root_fixture(tmp)
+            import yaml as _yaml
+            rendered_yaml = "\n---\n".join(_yaml.safe_dump(d) for d in (
+                _statefulset(), _service(DEPLOYMENT_ID), _service(f"{DEPLOYMENT_ID}-headless", headless=True), _admin_spc("dev/goldengate/source/admin"),
+            ))
+            package_dir = repo_root / "packaged"
+            scripted = ScriptedRun()
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
+            scripted.when(_starts_with("helm", "dependency", "build"), FakeProc(0, ""))
+            scripted.when(_starts_with("helm", "lint"), FakeProc(0, ""))
+            scripted.when(_starts_with("helm", "template"), FakeProc(0, rendered_yaml))
+
+            def fake_helm_package(argv, **kwargs):
+                package_dir.mkdir(parents=True, exist_ok=True)
+                (package_dir / f"{phase5_runtime.CHART_NAME}-{CHART_VERSION}.tgz").write_bytes(b"fake")
+                return FakeProc(0, "")
+
+            with mock.patch.object(phase5_runtime, "REPO_ROOT", repo_root), \
+                 mock.patch.object(phase5_runtime, "HELM_CHART_PATH", chart_dir), \
+                 mock.patch.object(phase5_runtime, "run") as run_mock, _env_patch():
+                def route(argv, **kwargs):
+                    if argv[:2] == ["helm", "package"]:
+                        return fake_helm_package(argv, **kwargs)
+                    return scripted(argv, **kwargs)
+                run_mock.side_effect = route
+                _run_quiet(phase5_runtime.cmd_validate_local, args)
+
+            lint_call = next(c["argv"] for c in scripted.calls if c["argv"][:2] == ["helm", "lint"])
+            template_call = next(c["argv"] for c in scripted.calls if c["argv"][:2] == ["helm", "template"])
+            self.assertIn(str(chart_dir), lint_call)
+            self.assertIn(str(chart_dir), template_call)
+
+
+class PackagedOutputRootTests(unittest.TestCase):
+    """Confirmed reproduction target: REPO_ROOT/packaged symlinked to an external directory let helm package's generated archive land entirely outside the repository, only discovered (if at all) by the LATER publish-time containment check -- _prepare_canonical_packaged_output_root() must validate/create the canonical packaged/ directory BEFORE helm package (or even copytree) ever runs."""
+
+    def test_7_packaged_absent_helper_creates_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            with mock.patch.object(phase5_runtime, "REPO_ROOT", repo_root):
+                result = phase5_runtime._prepare_canonical_packaged_output_root()
+            self.assertEqual(result, repo_root / "packaged")
+            self.assertTrue(result.is_dir())
+            self.assertFalse(result.is_symlink())
+
+    def test_8_packaged_existing_real_directory_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "packaged").mkdir()
+            with mock.patch.object(phase5_runtime, "REPO_ROOT", repo_root):
+                result = phase5_runtime._prepare_canonical_packaged_output_root()
+            self.assertEqual(result, repo_root / "packaged")
+
+    def test_9_packaged_symlink_to_external_directory_fails(self):
+        """Confirmed reproduction of the current gap before the fix."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            external_dir = Path(tmp) / "external"
+            external_dir.mkdir()
+            try:
+                (repo_root / "packaged").symlink_to(external_dir, target_is_directory=True)
+            except (OSError, NotImplementedError):
+                self.skipTest("symlinks are not supported on this platform/filesystem")
+            with mock.patch.object(phase5_runtime, "REPO_ROOT", repo_root):
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    phase5_runtime._prepare_canonical_packaged_output_root()
+
+    def test_10_packaged_exists_as_regular_file_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "packaged").write_text("not a directory")
+            with mock.patch.object(phase5_runtime, "REPO_ROOT", repo_root):
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    phase5_runtime._prepare_canonical_packaged_output_root()
+
+    def test_11_packaged_resolves_elsewhere_fails(self):
+        """Defense-in-depth proof for the resolved-equality requirement, independent of platform symlink support: Path.resolve() is monkeypatched (scoped to this test only) to make packaged/ resolve somewhere unexpected even though it is not itself a symlink."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "packaged").mkdir()
+            elsewhere = Path(tmp) / "elsewhere"
+            original_resolve = Path.resolve
+
+            def fake_resolve(self, *a, **kw):
+                if self == repo_root / "packaged":
+                    return elsewhere
+                return original_resolve(self, *a, **kw)
+
+            with mock.patch.object(phase5_runtime, "REPO_ROOT", repo_root), mock.patch.object(Path, "resolve", fake_resolve):
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    phase5_runtime._prepare_canonical_packaged_output_root()
+
+    def test_12_package_runtime_chart_with_packaged_symlink_zero_helm_package_calls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            external_dir = Path(tmp) / "external"
+            external_dir.mkdir()
+            try:
+                (repo_root / "packaged").symlink_to(external_dir, target_is_directory=True)
+            except (OSError, NotImplementedError):
+                self.skipTest("symlinks are not supported on this platform/filesystem")
+            values_rel = f"envs/{ENVIRONMENT}/{DEPLOYMENT_ID}/values.yaml"
+            (repo_root / values_rel).parent.mkdir(parents=True)
+            (repo_root / values_rel).write_text("runtime:\n  containerName: goldengate\n")
+            scripted = ScriptedRun()
+            with _mock_repo_root_with_real_chart(repo_root), mock.patch.object(phase5_runtime, "run", scripted):
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    phase5_runtime._package_runtime_chart(DEPLOYMENT_ID, values_rel, CHART_VERSION)
+            self.assertEqual([c for c in scripted.calls if c["argv"][:2] == ["helm", "package"]], [])
+
+    def test_13_package_runtime_chart_with_packaged_symlink_writes_nothing_externally(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            external_dir = Path(tmp) / "external"
+            external_dir.mkdir()
+            try:
+                (repo_root / "packaged").symlink_to(external_dir, target_is_directory=True)
+            except (OSError, NotImplementedError):
+                self.skipTest("symlinks are not supported on this platform/filesystem")
+            values_rel = f"envs/{ENVIRONMENT}/{DEPLOYMENT_ID}/values.yaml"
+            (repo_root / values_rel).parent.mkdir(parents=True)
+            (repo_root / values_rel).write_text("runtime:\n  containerName: goldengate\n")
+            scripted = ScriptedRun()
+            with _mock_repo_root_with_real_chart(repo_root), mock.patch.object(phase5_runtime, "run", scripted):
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    phase5_runtime._package_runtime_chart(DEPLOYMENT_ID, values_rel, CHART_VERSION)
+            self.assertEqual(list(external_dir.iterdir()), [])
+
+    def test_14_package_runtime_chart_uses_validated_absolute_destination(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            values_rel = f"envs/{ENVIRONMENT}/{DEPLOYMENT_ID}/values.yaml"
+            (repo_root / values_rel).parent.mkdir(parents=True)
+            (repo_root / values_rel).write_text("runtime:\n  containerName: goldengate\n")
+
+            def fake_helm_package(argv, **kwargs):
+                dest_index = argv.index("--destination")
+                dest = Path(argv[dest_index + 1])
+                self.assertTrue(dest.is_absolute(), "helm package --destination must be the validated ABSOLUTE packaged directory, never a bare 'packaged' literal")
+                self.assertEqual(dest, (repo_root / "packaged").resolve())
+                dest.mkdir(parents=True, exist_ok=True)
+                (dest / f"{phase5_runtime.CHART_NAME}-{CHART_VERSION}.tgz").write_bytes(b"fake")
+                return FakeProc(0, "")
+
+            with _mock_repo_root_with_real_chart(repo_root), mock.patch.object(phase5_runtime, "run") as run_mock:
+                run_mock.side_effect = lambda argv, **kwargs: fake_helm_package(argv, **kwargs) if argv[:2] == ["helm", "package"] else FakeProc(0, "")
+                phase5_runtime._package_runtime_chart(DEPLOYMENT_ID, values_rel, CHART_VERSION)
+
+    def test_15_post_package_containment_revalidated(self):
+        """Even if helm package itself produced a symlink as the output file (a compromised/buggy helm), _package_runtime_chart() must still reject it -- proving genuine defense in depth, not blind trust of a successful helm package exit code."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            values_rel = f"envs/{ENVIRONMENT}/{DEPLOYMENT_ID}/values.yaml"
+            (repo_root / values_rel).parent.mkdir(parents=True)
+            (repo_root / values_rel).write_text("runtime:\n  containerName: goldengate\n")
+            outside_evil = Path(tmp) / "evil-package.tgz"
+            outside_evil.write_bytes(b"evil")
+
+            def fake_helm_package(argv, **kwargs):
+                dest = Path(argv[argv.index("--destination") + 1])
+                dest.mkdir(parents=True, exist_ok=True)
+                target = dest / f"{phase5_runtime.CHART_NAME}-{CHART_VERSION}.tgz"
+                try:
+                    target.symlink_to(outside_evil)
+                except (OSError, NotImplementedError):
+                    self.skipTest("symlinks are not supported on this platform/filesystem")
+                return FakeProc(0, "")
+
+            with _mock_repo_root_with_real_chart(repo_root), mock.patch.object(phase5_runtime, "run") as run_mock:
+                run_mock.side_effect = lambda argv, **kwargs: fake_helm_package(argv, **kwargs) if argv[:2] == ["helm", "package"] else FakeProc(0, "")
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    phase5_runtime._package_runtime_chart(DEPLOYMENT_ID, values_rel, CHART_VERSION)
+
+    def test_16_package_file_symlink_defense_remains(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "packaged").mkdir()
+            outside_evil = Path(tmp).parent / f"outside-{os.getpid()}-defense.tgz"
+            outside_evil.write_bytes(b"evil")
+            package_path_rel = f"packaged/goldengate-{CHART_VERSION}.tgz"
+            try:
+                (repo_root / package_path_rel).symlink_to(outside_evil)
+            except (OSError, NotImplementedError):
+                self.skipTest("symlinks are not supported on this platform/filesystem")
+            with mock.patch.object(phase5_runtime, "REPO_ROOT", repo_root):
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    phase5_runtime._validate_package_path_and_containment(package_path_rel, CHART_VERSION)
+            outside_evil.unlink(missing_ok=True)
+
+    def test_17_normal_package_runtime_chart_still_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            values_rel = f"envs/{ENVIRONMENT}/{DEPLOYMENT_ID}/values.yaml"
+            (repo_root / values_rel).parent.mkdir(parents=True)
+            (repo_root / values_rel).write_text("runtime:\n  containerName: goldengate\n")
+
+            def fake_helm_package(argv, **kwargs):
+                dest = Path(argv[argv.index("--destination") + 1])
+                dest.mkdir(parents=True, exist_ok=True)
+                (dest / f"{phase5_runtime.CHART_NAME}-{CHART_VERSION}.tgz").write_bytes(b"fake")
+                return FakeProc(0, "")
+
+            with _mock_repo_root_with_real_chart(repo_root), mock.patch.object(phase5_runtime, "run") as run_mock:
+                run_mock.side_effect = lambda argv, **kwargs: fake_helm_package(argv, **kwargs) if argv[:2] == ["helm", "package"] else FakeProc(0, "")
+                temp_chart_path, package_path = phase5_runtime._package_runtime_chart(DEPLOYMENT_ID, values_rel, CHART_VERSION)
+            self.assertTrue(package_path.is_file())
+            self.assertEqual(package_path.name, f"{phase5_runtime.CHART_NAME}-{CHART_VERSION}.tgz")
+            self.assertTrue(temp_chart_path.is_dir())
 
 
 if __name__ == "__main__":

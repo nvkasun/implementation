@@ -583,6 +583,33 @@ def _validate_resolved_runtime_inputs(state, environment, deployment_id, *, veri
     }
 
 
+def _prepare_canonical_packaged_output_root():
+    """The repository-owned packaged/ OUTPUT directory must never be a symlink -- validated/created BEFORE helm package ever writes into it (a symlinked packaged/ would let helm package's generated archive land entirely outside the repository, invisible to any containment check performed only afterward). Reused identically by _package_runtime_chart() (before helm package runs) and _validate_package_path_and_containment() (before trusting a persisted package_path at publish time) -- never two independently-drifting packaged-directory contracts. Never follows/creates through a symlink. Returns the validated physical packaged/ directory Path."""
+    repo_root_resolved = REPO_ROOT.resolve()
+    packaged_path = REPO_ROOT / "packaged"
+
+    if packaged_path.is_symlink():
+        raise Phase5Error(f"{packaged_path} is a symlink -- the repository-owned packaged/ directory must be a real directory, never a symlink (possible directory-level escape) -- refusing to use it.")
+    if packaged_path.exists():
+        if not packaged_path.is_dir():
+            raise Phase5Error(f"expected packaged/ path {packaged_path} is not a directory.")
+    else:
+        packaged_path.mkdir(parents=True, exist_ok=False)
+
+    # Re-checked after creation/existence -- defends the same TOCTOU window _validate_canonical_chart_source_root() defends for HELM_CHART_PATH.
+    if packaged_path.is_symlink():
+        raise Phase5Error(f"{packaged_path} is a symlink -- the repository-owned packaged/ directory must be a real directory, never a symlink (possible directory-level escape) -- refusing to use it.")
+    if not packaged_path.is_dir():
+        raise Phase5Error(f"expected packaged/ path {packaged_path} is not a directory.")
+
+    packaged_dir_resolved = packaged_path.resolve()
+    if packaged_dir_resolved != repo_root_resolved / "packaged":
+        raise Phase5Error(f"{packaged_path} resolves to {packaged_dir_resolved}, which is not the expected {repo_root_resolved / 'packaged'} -- refusing to use it.")
+    if repo_root_resolved not in packaged_dir_resolved.parents:
+        raise Phase5Error(f"{packaged_path} resolves to {packaged_dir_resolved}, which is outside the repository root {repo_root_resolved} -- refusing to use it.")
+    return packaged_path
+
+
 def _validate_package_path_and_containment(package_path_rel, chart_version):
     """Rejects any package_path that is not EXACTLY the canonical packaged/<chart>-<version>.tgz path -- never an arbitrary state-controlled filesystem path. The repository-owned packaged/ directory itself, AND the package file itself, must each be a real (non-symlink) filesystem object genuinely contained under REPO_ROOT -- checked and resolved SEPARATELY and in that order, so a symlinked packaged/ directory can never make an otherwise-correct-looking containment comparison pass merely because both sides resolve to the same (entirely external) location."""
     expected_rel = _canonical_package_path(chart_version)
@@ -590,14 +617,7 @@ def _validate_package_path_and_containment(package_path_rel, chart_version):
         raise Phase5Error(f"Phase 5 reconcile state package_path={package_path_rel!r} is not the canonical path {expected_rel!r} for chart_version={chart_version!r} -- refusing to publish an arbitrary/relocated package.")
 
     repo_root_resolved = REPO_ROOT.resolve()
-    packaged_path = REPO_ROOT / "packaged"
-    if packaged_path.is_symlink():
-        raise Phase5Error(f"{packaged_path} is a symlink -- the repository-owned packaged/ directory must be a real directory, never a symlink (possible directory-level escape) -- refusing to publish anything from it.")
-    if not packaged_path.is_dir():
-        raise Phase5Error(f"expected packaged/ directory does not exist: {packaged_path}")
-    packaged_dir_resolved = packaged_path.resolve()
-    if packaged_dir_resolved != repo_root_resolved / "packaged":
-        raise Phase5Error(f"{packaged_path} resolves to {packaged_dir_resolved}, which is not the expected {repo_root_resolved / 'packaged'} -- refusing to publish from an unexpected location.")
+    packaged_dir_resolved = _prepare_canonical_packaged_output_root().resolve()
 
     candidate_package_path = REPO_ROOT / package_path_rel
     if candidate_package_path.is_symlink():
@@ -860,9 +880,10 @@ def cmd_resolve_live_inputs(args):
 
 # Phase 5B, step 3: validate-local (no AWS credentials -- pure local Helm lint/template/package)
 
-def _validate_required_files(values_file):
-    chart_yaml = HELM_CHART_PATH / "Chart.yaml"
-    values_yaml = HELM_CHART_PATH / "values.yaml"
+def _validate_required_files(values_file, chart_root):
+    """chart_root must already be the validated result of _validate_canonical_chart_source_root() -- this helper never independently trusts HELM_CHART_PATH itself, so it can never establish trust in an untrusted chart root on its own."""
+    chart_yaml = chart_root / "Chart.yaml"
+    values_yaml = chart_root / "values.yaml"
     env_values_path = REPO_ROOT / values_file
     for path in (chart_yaml, values_yaml, env_values_path):
         if not path.is_file():
@@ -1213,8 +1234,12 @@ def _validate_efs_render_contract(values, docs, environment, deployment_id, depl
 
 
 def _package_runtime_chart(deployment_id, values_file, chart_version):
-    # Refuses to build/package from an untrusted symlinked chart root -- validated BEFORE copytree ever reads from HELM_CHART_PATH.
+    # 1. Refuses to build/package from an untrusted symlinked chart root -- validated BEFORE copytree ever reads from HELM_CHART_PATH.
     chart_root = _validate_canonical_chart_source_root()
+    # 2. Refuses to write into a symlinked packaged/ output directory -- validated/created BEFORE copytree or helm package ever runs, so a symlinked packaged/ receives ZERO generated files on failure.
+    packaged_dir = _prepare_canonical_packaged_output_root()
+
+    # 3. Only now does the temporary chart get constructed/copied.
     temp_chart_path = REPO_ROOT / _canonical_temp_chart_path(deployment_id)
     if temp_chart_path.exists():
         shutil.rmtree(temp_chart_path)
@@ -1222,13 +1247,13 @@ def _package_runtime_chart(deployment_id, values_file, chart_version):
     shutil.copytree(chart_root, temp_chart_path, dirs_exist_ok=True)
     shutil.copy(REPO_ROOT / values_file, temp_chart_path / "values-deployment.yaml")
 
-    packaged_dir = REPO_ROOT / "packaged"
-    packaged_dir.mkdir(parents=True, exist_ok=True)
-    run(["helm", "package", str(temp_chart_path), "--version", chart_version, "--app-version", chart_version, "--destination", "packaged"])
-    package_path = REPO_ROOT / _canonical_package_path(chart_version)
-    if not package_path.is_file():
-        raise Phase5Error(f"helm package did not produce the expected archive: {package_path}")
-    return temp_chart_path, package_path
+    # 4. Only now does helm package run, writing into the validated ABSOLUTE packaged directory -- never a bare "packaged" relative literal at this filesystem trust boundary.
+    run(["helm", "package", str(temp_chart_path), "--version", chart_version, "--app-version", chart_version, "--destination", str(packaged_dir)])
+
+    # Post-package defense in depth: re-derives and re-validates the canonical package path/containment (never merely package_path.is_file()) -- proves packaged/ is still canonical, the archive is a real regular file, not a symlink, and resolves inside the canonical packaged directory.
+    package_path_rel = _canonical_package_path(chart_version)
+    resolved_package_path = _validate_package_path_and_containment(package_path_rel, chart_version)
+    return temp_chart_path, resolved_package_path
 
 
 def cmd_validate_local(args):
@@ -1239,6 +1264,9 @@ def cmd_validate_local(args):
     # Static reconcile-state identity binding FIRST -- before any values-file read, Helm command, rendered-output write, or packaging -- so a stale/cross-runtime state can never cause this step to read/render/package another deployment's files. verify_managed_efs_live=False because this step deliberately receives NO AWS credentials.
     _validate_reconcile_state_identity(state, environment, deployment_id)
     resolved = _validate_resolved_runtime_inputs(state, environment, deployment_id, verify_managed_efs_live=False)
+
+    # Canonical chart-root trust boundary -- validated BEFORE any required-file read or Helm command ever inspects/executes the chart. helm dependency build in particular may perform remote dependency access and/or filesystem writes driven by an untrusted Chart.yaml -- the root must be proven canonical first, never trusted-then-checked. The returned chart_root is used for every chart operation below; HELM_CHART_PATH is never read independently again in this function.
+    chart_root = _validate_canonical_chart_source_root()
 
     values_file = require_state_value(state, "values_file")
     release_name = require_state_value(state, "release_name")
@@ -1259,22 +1287,22 @@ def cmd_validate_local(args):
     chart_version = require_state_value(state, "chart_version")
     aws_region = require_env("AWS_REGION")
 
-    _validate_required_files(values_file)
+    _validate_required_files(values_file, chart_root)
 
     overrides = _helm_set_overrides(environment, image_repository, dns_domain, alb_group_name, certificate_arn,
                                      admin_secret_name, tls_secret_name, aws_region, runtime_service_account_name, resolved_efs_id)
 
     # Current source deliberately tolerates a Helm dependency-build failure here (never generalized to any other Helm command) -- subsequent lint/template checks are authoritative.
-    dep_proc = run(["helm", "dependency", "build", str(HELM_CHART_PATH)], check=False)
+    dep_proc = run(["helm", "dependency", "build", str(chart_root)], check=False)
     if dep_proc.returncode != 0:
         print(f"WARNING: helm dependency build exited {dep_proc.returncode} (tolerated -- subsequent lint/template checks are authoritative):\n{dep_proc.stdout}\n{dep_proc.stderr}")
 
-    run(["helm", "lint", str(HELM_CHART_PATH), "--values", values_file, *overrides])
+    run(["helm", "lint", str(chart_root), "--values", values_file, *overrides])
     print("OK: helm lint passed.")
 
     rendered_path = REPO_ROOT / _canonical_rendered_manifest_path(deployment_id)
     rendered_path.parent.mkdir(parents=True, exist_ok=True)
-    template_proc = run(["helm", "template", release_name, str(HELM_CHART_PATH), "--namespace", target_namespace, "--values", values_file, *overrides])
+    template_proc = run(["helm", "template", release_name, str(chart_root), "--namespace", target_namespace, "--values", values_file, *overrides])
     rendered_path.write_text(template_proc.stdout)
     print(f"Rendered manifest: {rendered_path.relative_to(REPO_ROOT)}")
 

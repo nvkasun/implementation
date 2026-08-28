@@ -16513,7 +16513,8 @@ tmp.cleanup()
 
 # H: packaged/ directory itself cannot be a symlink -- confirmed reproduction of the newly-confirmed gap.
 containment_src = fn_source("_validate_package_path_and_containment")
-results.append(("H: _validate_package_path_and_containment() rejects a symlinked packaged/ directory before resolving anything", 'packaged_path.is_symlink()' in containment_src))
+output_root_src = fn_source("_prepare_canonical_packaged_output_root")
+results.append(("H: _validate_package_path_and_containment() reuses the canonical packaged-output-root helper, which itself rejects a symlinked packaged/ directory before resolving anything", "_prepare_canonical_packaged_output_root()" in containment_src and "packaged_path.is_symlink()" in output_root_src))
 outer = tempfile.TemporaryDirectory()
 outer_path = Path(outer.name)
 build_root = outer_path / "build"
@@ -16762,6 +16763,245 @@ PYEOF
   fi
 else
   skip "Phase 5 chart-source-root symlink protection: dedicated static assertions -- python3/PyYAML/EKS_APP_WORKFLOW/phase5_runtime.py unavailable"
+fi
+
+echo ""
+echo "--- Phase 5 Python Conversion: chart-root/packaged-output-root trust ORDERING (A-K) ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE5_RUNTIME_TOOL" ]; then
+  PHASE5_TRUST_ORDERING_CHECK="$(python3 - "$EKS_APP_WORKFLOW" "$PHASE5_RUNTIME_TOOL" <<'PYEOF'
+import ast
+import importlib.util
+import json
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+from unittest import mock
+
+import yaml
+
+workflow_path, tool_path = sys.argv[1:3]
+
+with open(workflow_path) as f:
+    jobs = yaml.safe_load(f)["jobs"]
+
+spec = importlib.util.spec_from_file_location("phase5_runtime", tool_path)
+phase5_runtime = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(phase5_runtime)
+
+results = []
+
+ENVIRONMENT_VALUE = "dev"
+DEPLOYMENT_ID_VALUE = "gg-oracle-payments-01"
+ECR_REGISTRY_VALUE = "229410149234.dkr.ecr.eu-west-1.amazonaws.com"
+GITHUB_RUN_NUMBER_VALUE = "42"
+CHART_VERSION_VALUE = f"0.1.{GITHUB_RUN_NUMBER_VALUE}-{DEPLOYMENT_ID_VALUE}"
+
+RECONCILE_ENV = {
+    "AWS_REGION": "eu-west-1", "EKS_CLUSTER_NAME": "gg-dev-cluster",
+    "EKS_DEPLOY_ROLE_ARN": "arn:aws:iam::668311715351:role/GoldenGateEksDeployRole-dev",
+    "RUNTIME_NAMESPACE": "goldengate-dev", "ARGOCD_NAMESPACE": "argocd", "ECR_REGISTRY": ECR_REGISTRY_VALUE,
+    "ARGOCD_ECR_READ_ROLE_ARN": "arn:aws:iam::229410149234:role/ArgoCdEcrReadRole", "GITHUB_RUN_NUMBER": GITHUB_RUN_NUMBER_VALUE,
+    "DNS_DOMAIN": "goldengate-dev.adcbmis.local", "ALB_GROUP_NAME": "goldengate-dev-shared",
+    "ACM_CERTIFICATE_ARN": "arn:aws:acm:eu-west-1:668311715351:certificate/abc-123",
+}
+
+DESCRIPTOR = {
+    "deploymentId": DEPLOYMENT_ID_VALUE, "adminSecretName": "dev/goldengate/source/admin",
+    "tlsSecretName": "dev/goldengate/tls-certificate", "runtimeServiceAccountName": "gg-runtime-sa",
+    "imageRepository": f"{ECR_REGISTRY_VALUE}/aws-cloud-factory-goldengate-oracle",
+    "imageRepositoryName": "aws-cloud-factory-goldengate-oracle", "imageTag": "23.4.0.0",
+    "efsMode": None, "efsFileSystemId": None, "efsCreationToken": None,
+}
+
+
+def reconcile_state_fixture(**overrides):
+    base = {
+        "environment": ENVIRONMENT_VALUE, "deployment_id": DEPLOYMENT_ID_VALUE, "deployment_model": "singleRuntime",
+        "deploy": True, "values_file": f"envs/{ENVIRONMENT_VALUE}/{DEPLOYMENT_ID_VALUE}/values.yaml",
+        "target_namespace": "goldengate-dev", "release_name": DEPLOYMENT_ID_VALUE,
+        "argocd_app_name": phase5_runtime._canonical_argocd_app_name(ENVIRONMENT_VALUE, DEPLOYMENT_ID_VALUE),
+        "helm_ecr_repository": "helm/goldengate", "helm_push_url": f"oci://{ECR_REGISTRY_VALUE}/helm",
+        "helm_chart_ref": f"oci://{ECR_REGISTRY_VALUE}/helm/goldengate",
+        "chart_version": CHART_VERSION_VALUE, "temp_chart_path": f"work/charts/{DEPLOYMENT_ID_VALUE}/goldengate",
+    }
+    base.update(overrides)
+    return base
+
+
+def resolved_state_fixture(**overrides):
+    base = {
+        **reconcile_state_fixture(),
+        "image_repository": DESCRIPTOR["imageRepository"], "image_repository_name": DESCRIPTOR["imageRepositoryName"],
+        "image_tag": DESCRIPTOR["imageTag"], "image_digest": "sha256:" + "ab" * 32,
+        "dns_domain": "goldengate-dev.adcbmis.local", "alb_group_name": "goldengate-dev-shared",
+        "certificate_arn": "arn:aws:acm:eu-west-1:668311715351:certificate/abc-123",
+        "admin_secret_name": DESCRIPTOR["adminSecretName"], "tls_secret_name": DESCRIPTOR["tlsSecretName"],
+        "runtime_service_account_name": DESCRIPTOR["runtimeServiceAccountName"], "resolved_efs_id": "",
+        "efs_mode": "", "efs_file_system_id_declared": "", "efs_creation_token": "",
+    }
+    base.update(overrides)
+    return base
+
+
+def mock_repo_root_with_real_chart(repo_root):
+    chart_path = repo_root / "helm" / "goldengate"
+    if not chart_path.exists():
+        chart_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(phase5_runtime.HELM_CHART_PATH, chart_path)
+    return mock.patch.multiple(phase5_runtime, REPO_ROOT=repo_root, HELM_CHART_PATH=chart_path)
+
+
+def args_for(state_path):
+    return type("Args", (), {"environment": ENVIRONMENT_VALUE, "deployment_id": DEPLOYMENT_ID_VALUE, "state_path": state_path})()
+
+
+class Recorder:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        if argv[:1] == [sys.executable] and str(phase5_runtime.DEPLOYMENT_MODEL_TOOL) in argv:
+            return type("Proc", (), {"returncode": 0, "stdout": json.dumps(DESCRIPTOR), "stderr": ""})()
+        return type("Proc", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+
+with open(tool_path) as f:
+    tool_source = f.read()
+tree = ast.parse(tool_source)
+
+
+def fn_source(name):
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
+    return ast.get_source_segment(tool_source, fn) or ""
+
+
+# A: cmd_validate_local validates canonical chart root before _validate_required_files.
+validate_local_src = fn_source("cmd_validate_local")
+root_index = validate_local_src.find("_validate_canonical_chart_source_root()")
+required_files_index = validate_local_src.find("_validate_required_files(")
+results.append(("A: cmd_validate_local() calls _validate_canonical_chart_source_root() strictly BEFORE _validate_required_files(...)", -1 not in (root_index, required_files_index) and root_index < required_files_index))
+
+# B: chart-root validation precedes helm dependency build / helm lint / helm template.
+dep_index = validate_local_src.find('"dependency"')
+lint_index = validate_local_src.find('"lint"')
+template_index = validate_local_src.find('"template"')
+results.append(("B: cmd_validate_local() validates the chart root strictly BEFORE helm dependency build/lint/template", root_index != -1 and all(root_index < i for i in (dep_index, lint_index, template_index) if i != -1)))
+
+# C: all validate-local Helm chart arguments use the validated chart_root (never a second independent HELM_CHART_PATH read).
+results.append(("C: cmd_validate_local() passes str(chart_root) to helm dependency build/lint/template (never re-reads HELM_CHART_PATH directly)", validate_local_src.count("str(chart_root)") >= 3 and "str(HELM_CHART_PATH)" not in validate_local_src))
+
+# Behavioral reproduction: a symlinked HELM_CHART_PATH must fail cmd_validate_local() with ZERO helm calls.
+tmp = tempfile.TemporaryDirectory()
+repo_root = Path(tmp.name) / "repo"
+repo_root.mkdir()
+external_chart = Path(tmp.name) / "external-chart"
+external_chart.mkdir()
+(external_chart / "Chart.yaml").write_text("apiVersion: v2\nname: goldengate\nversion: 0.0.0\n")
+(external_chart / "values.yaml").write_text("runtime:\n  containerName: goldengate\n")
+(repo_root / "helm").mkdir()
+a_ok = None
+try:
+    (repo_root / "helm" / "goldengate").symlink_to(external_chart, target_is_directory=True)
+except (OSError, NotImplementedError):
+    a_ok = True  # symlinks unsupported on this platform/filesystem -- cannot reproduce, but not a production defect
+if a_ok is None:
+    values_rel = f"envs/{ENVIRONMENT_VALUE}/{DEPLOYMENT_ID_VALUE}/values.yaml"
+    (repo_root / values_rel).parent.mkdir(parents=True)
+    (repo_root / values_rel).write_text("runtime:\n  containerName: goldengate\n")
+    state_path = repo_root / "state.json"
+    phase5_runtime.update_state(state_path, resolved_state_fixture(), phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+    recorder = Recorder()
+    with mock.patch.multiple(phase5_runtime, REPO_ROOT=repo_root, HELM_CHART_PATH=repo_root / "helm" / "goldengate"), \
+         mock.patch.object(phase5_runtime, "run", recorder), mock.patch.dict(__import__("os").environ, RECONCILE_ENV):
+        try:
+            phase5_runtime.cmd_validate_local(args_for(state_path))
+            a_ok = False
+        except phase5_runtime.Phase5Error:
+            a_ok = not any(c[:1] == ["helm"] for c in recorder.calls)
+results.append(("A/B: confirmed reproduction -- a symlinked HELM_CHART_PATH fails cmd_validate_local() with ZERO helm dependency-build/lint/template calls", a_ok))
+tmp.cleanup()
+
+# D: _package_runtime_chart retains its own chart-root revalidation before copytree (defense in depth, independent of validate-local's earlier check).
+package_runtime_chart_src = fn_source("_package_runtime_chart")
+root_call_in_package_index = package_runtime_chart_src.find("_validate_canonical_chart_source_root()")
+copytree_index = package_runtime_chart_src.find("shutil.copytree(")
+results.append(("D: _package_runtime_chart() still calls _validate_canonical_chart_source_root() strictly BEFORE shutil.copytree(...)", -1 not in (root_call_in_package_index, copytree_index) and root_call_in_package_index < copytree_index))
+
+# E: one canonical packaged-output-root helper exists.
+output_root_defs = [n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and "canonical_packaged_output_root" in n.name]
+results.append(("E: exactly one canonical packaged-output-root helper is defined in phase5_runtime.py", len(output_root_defs) == 1))
+output_root_name = output_root_defs[0] if output_root_defs else "_prepare_canonical_packaged_output_root"
+output_root_src = fn_source(output_root_name)
+
+# F: package creation calls it before helm package.
+output_root_call_in_package_index = package_runtime_chart_src.find(f"{output_root_name}(")
+package_call_index = package_runtime_chart_src.find('"helm", "package"')
+results.append(("F: _package_runtime_chart() calls the packaged-output-root helper strictly BEFORE helm package runs", -1 not in (output_root_call_in_package_index, package_call_index) and output_root_call_in_package_index < package_call_index))
+results.append(("F: the packaged-output-root helper is also called BEFORE the temporary chart is even copied (shutil.copytree)", output_root_call_in_package_index != -1 and copytree_index != -1 and output_root_call_in_package_index < copytree_index))
+
+# G: _validate_package_path_and_containment reuses the same packaged-root contract (never a second independent version).
+containment_src = fn_source("_validate_package_path_and_containment")
+results.append(("G: _validate_package_path_and_containment() reuses the SAME packaged-output-root helper (never a second independent packaged/ contract)", f"{output_root_name}()" in containment_src))
+
+# H: packaged/ symlink causes zero helm-package execution -- confirmed reproduction, with proof the external directory receives nothing.
+tmp = tempfile.TemporaryDirectory()
+build_root = Path(tmp.name) / "build"
+build_root.mkdir()
+repo_root = Path(tmp.name) / "repo"
+repo_root.mkdir()
+external_dir = Path(tmp.name) / "external"
+external_dir.mkdir()
+h_ok = None
+try:
+    (repo_root / "packaged").symlink_to(external_dir, target_is_directory=True)
+except (OSError, NotImplementedError):
+    h_ok = True
+if h_ok is None:
+    values_rel = f"envs/{ENVIRONMENT_VALUE}/{DEPLOYMENT_ID_VALUE}/values.yaml"
+    (repo_root / values_rel).parent.mkdir(parents=True)
+    (repo_root / values_rel).write_text("runtime:\n  containerName: goldengate\n")
+    recorder = Recorder()
+    with mock_repo_root_with_real_chart(repo_root), mock.patch.object(phase5_runtime, "run", recorder):
+        try:
+            phase5_runtime._package_runtime_chart(DEPLOYMENT_ID_VALUE, values_rel, CHART_VERSION_VALUE)
+            h_ok = False
+        except phase5_runtime.Phase5Error:
+            h_ok = not any(c[:2] == ["helm", "package"] for c in recorder.calls) and list(external_dir.iterdir()) == []
+results.append(("H: confirmed reproduction -- a symlinked packaged/ directory is rejected with ZERO helm package calls, and the external target receives NO generated package files", h_ok))
+tmp.cleanup()
+
+# I: helm package destination uses the validated packaged directory (an absolute path, never a bare 'packaged' literal at this trust boundary).
+results.append(("I: _package_runtime_chart() passes helm package --destination str(packaged_dir) (the validated absolute directory), never a bare 'packaged' literal", 'str(packaged_dir)' in package_runtime_chart_src and '"--destination", "packaged"' not in package_runtime_chart_src))
+
+# J: post-package package-file containment remains enforced -- never merely package_path.is_file().
+results.append(("J: _package_runtime_chart() re-derives and re-validates the canonical package path/containment after helm package (never merely an `if not package_path.is_file():` existence check)", "_validate_package_path_and_containment(" in package_runtime_chart_src and "if not package_path.is_file():" not in package_runtime_chart_src))
+
+# K: no workflow YAML implementation was reintroduced.
+build_job = jobs["build_publish_and_deploy"]
+validate_local_step = next((s for s in build_job["steps"] if s.get("name") == "Render, validate and package runtime locally"), None)
+publish_step = next((s for s in build_job["steps"] if s.get("name") == "Publish runtime Helm chart to private ECR"), None)
+results.append(("K: the 'Render, validate and package runtime locally' step still only invokes phase5_runtime.py validate-local (no reintroduced inline chart-root/ordering logic)", validate_local_step is not None and "phase5_runtime.py validate-local" in validate_local_step.get("run", "")))
+results.append(("K: the 'Publish runtime Helm chart to private ECR' step still only invokes phase5_runtime.py publish-chart", publish_step is not None and "phase5_runtime.py publish-chart" in publish_step.get("run", "")))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  echo "$PHASE5_TRUST_ORDERING_CHECK"
+  if [ -z "$(echo "$PHASE5_TRUST_ORDERING_CHECK" | grep '^FAIL ' || true)" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        OK\ *) pass "Phase 5 chart-root/packaged-output-root trust ordering: ${line#OK }" ;;
+      esac
+    done <<< "$PHASE5_TRUST_ORDERING_CHECK"
+  else
+    fail "Phase 5 chart-root/packaged-output-root trust ordering: dedicated static assertions failed:"$'\n'"${PHASE5_TRUST_ORDERING_CHECK}"
+  fi
+else
+  skip "Phase 5 chart-root/packaged-output-root trust ordering: dedicated static assertions -- python3/PyYAML/EKS_APP_WORKFLOW/phase5_runtime.py unavailable"
 fi
 
 echo "--- Final repository handoff hygiene sweep (VDR pre-transfer cleanliness) ---"
