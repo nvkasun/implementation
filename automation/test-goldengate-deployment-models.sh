@@ -35,6 +35,7 @@ PHASE3_TOOL="automation/phases/phase3/phase3_argocd.py"
 PHASE5_RUNTIME_TOOL="automation/phases/phase5/phase5_runtime.py"
 RUNTIME_STATE_TOOL="automation/phases/phase5/runtime_state.py"
 RUNTIME_ACCEPTANCE_TOOL="automation/phases/phase5/runtime_acceptance.py"
+PHASE6_REPLICATION_TOOL="automation/phases/phase6/phase6_replication.py"
 
 # runtime.image.repository/ingress.hostDomain/ingress.alb.groupName/ingress.alb.certificateArn/runtime.csi.region are shared environment configuration -- resolved once here via the same resolver the deploy workflow uses, never an independently maintained literal.
 RESOLVED_DNS_DOMAIN="$(python3 "$ENVIRONMENT_TOOL" --environment dev get DNS_DOMAIN)"
@@ -6326,19 +6327,21 @@ else
   fail "32: the replication-specific monitor acceptance job is missing"
 fi
 
-if grep -q "\-\-execution-id" "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && grep -q "github.run_id.*github.run_attempt" "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && grep -q "\-\-execution-id \"dry-run\"" "$EKS_APP_WORKFLOW" 2>/dev/null; then
-  pass "32: render-job is invoked with a rerun-safe --execution-id (real runs) and a deterministic dry-run token"
+# Phase 6 Python Conversion: --execution-id wiring/dry-run token and the secret-leak scan both moved from inline workflow bash into automation/phases/phase6/phase6_replication.py -- checked there now, never re-derived against workflow text that no longer contains them.
+if grep -q '\-\-execution-id' "$PHASE6_REPLICATION_TOOL" 2>/dev/null \
+    && grep -q 'DRY_RUN_EXECUTION_ID = "dry-run"' "$PHASE6_REPLICATION_TOOL" 2>/dev/null \
+    && grep -q 'github.run_id' "$EKS_APP_WORKFLOW" 2>/dev/null \
+    && grep -q 'github.run_attempt' "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "32: render-job is invoked with a rerun-safe --execution-id (\${{ github.run_id }}-\${{ github.run_attempt }}, passed from the workflow into phase6_replication.py reconcile) and a deterministic dry-run token (phase6_replication.py's own DRY_RUN_EXECUTION_ID)"
 else
-  fail "32: --execution-id wiring is missing from one or both replication workflow jobs"
+  fail "32: --execution-id wiring is missing from the Phase 6 replication workflow/orchestrator"
 fi
 
-if grep -qE "\^\[\[:space:\]\]\*\(aws_secret_access_key\|password\)\[\[:space:\]\]\*:" "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && ! grep -qE '\^\\s\*\(aws_secret_access_key\|password\)\\s\*:' "$EKS_APP_WORKFLOW" 2>/dev/null; then
-  pass "32: the replication dry-run secret-leak scan uses portable [[:space:]], not GNU-only \\s"
+if grep -q '_assert_no_secret_values' "$PHASE6_REPLICATION_TOOL" 2>/dev/null \
+    && grep -q 'FORBIDDEN_SECRET_VALUE_KEYS' "$PHASE6_REPLICATION_TOOL" 2>/dev/null; then
+  pass "32: the replication dry-run secret-leak scan is now a structural Python mapping-key walk (_assert_no_secret_values over parsed YAML), never a portable-vs-GNU grep regex over raw manifest text"
 else
-  fail "32: the replication dry-run secret-leak scan still uses non-portable \\s"
+  fail "32: the replication dry-run secret-leak scan implementation is missing from phase6_replication.py"
 fi
 
 if grep -q "def ensure_database_credential" "$REPLICATION_TOOL" 2>/dev/null \
@@ -13973,10 +13976,10 @@ for job_name, output_key in (
     job_text = yaml.dump(jobs.get(job_name, {}), default_flow_style=False)
     check(f"Q: {job_name} reads needs.validate_model.outputs.{output_key} (the canonical value, never re-derived)", f"needs.validate_model.outputs.{output_key}" in job_text)
 
-# R: no phase6+ placeholder directory or job was introduced -- exactly Phase 1, Phase 2, Phase 3 (Argo CD), Phase 4 (Platform/Observability/Shared Secrets), and now Phase 5 (Runtime lifecycle) were converted, nothing else pre-created.
+# R: no phase7+ placeholder directory or job was introduced -- exactly Phase 1, Phase 2, Phase 3 (Argo CD), Phase 4 (Platform/Observability/Shared Secrets), Phase 5 (Runtime lifecycle), and now Phase 6 (Replication orchestration) were converted, nothing else pre-created. Phase 6 Python Conversion: automation/phases/phase6/ now legitimately exists -- this guard originally protected against Phase 6+ being pre-created before its own separately-approved conversion task; it remains satisfied structurally (Phase 1-5's own production files/behavior are untouched by Phase 6's addition, proven by the dedicated "Phase 6 Python Conversion" section elsewhere in this suite) and now additionally forbids a Phase 7+ placeholder the same way.
 import os
 phase_dirs = sorted(d for d in os.listdir("automation/phases") if os.path.isdir(os.path.join("automation/phases", d))) if os.path.isdir("automation/phases") else []
-check("R: automation/phases/ contains only phase1, phase2, phase3, phase4, and phase5 (no phase6+ placeholder directories)", phase_dirs == ["phase1", "phase2", "phase3", "phase4", "phase5"])
+check("R: automation/phases/ contains only phase1 through phase6 (no phase7+ placeholder directories)", phase_dirs == ["phase1", "phase2", "phase3", "phase4", "phase5", "phase6"])
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
@@ -17247,6 +17250,195 @@ PYEOF
   fi
 else
   skip "Phase 5 chart-source-tree symlink/special-object protection: dedicated static assertions -- python3/PyYAML/EKS_APP_WORKFLOW/phase5_runtime.py unavailable"
+fi
+
+echo "--- Phase 6 Python Conversion: replication orchestration (A-V) ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE6_REPLICATION_TOOL" ]; then
+  PHASE6_CONVERSION_CHECK="$(python3 - "$EKS_APP_WORKFLOW" "$PHASE6_REPLICATION_TOOL" "$REPLICATION_TOOL" <<'PYEOF'
+import importlib.util
+import json
+import sys
+from pathlib import Path
+from unittest import mock
+
+import yaml
+
+workflow_path, tool_path, engine_path = sys.argv[1:4]
+
+with open(workflow_path) as f:
+    doc = yaml.safe_load(f)
+jobs = doc["jobs"]
+
+spec = importlib.util.spec_from_file_location("phase6_replication", tool_path)
+phase6 = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(phase6)
+
+results = []
+
+
+def check(label, ok):
+    results.append((label, ok))
+
+
+# A: both MAIN job IDs remain (KEEP both, never collapsed into one).
+check("A: replication_reconcile_once job ID remains", "replication_reconcile_once" in jobs)
+check("A: replication_dry_run_validation job ID remains", "replication_dry_run_validation" in jobs)
+
+# B: MAIN total job count remains 26 (Phase 6 is an in-place conversion of two EXISTING jobs, never a new job).
+check("B: MAIN total job count remains 26", len(jobs) == 26)
+
+# C/D: needs/if contract preserved exactly.
+reconcile_job = jobs["replication_reconcile_once"]
+validate_job = jobs["replication_dry_run_validation"]
+check("C: replication_reconcile_once needs are unchanged (validate_model, validate_shared_secrets_once, build_publish_and_deploy, delete_removed_argocd_applications, validate_active_runtimes)",
+      reconcile_job.get("needs") == ["validate_model", "validate_shared_secrets_once", "build_publish_and_deploy", "delete_removed_argocd_applications", "validate_active_runtimes"])
+reconcile_if = str(reconcile_job.get("if", ""))
+check("C: replication_reconcile_once if: still requires effective_deploy == 'true', always(), shared-secrets success, build/delete not failed/cancelled, and validate_active_runtimes when active deployments exist",
+      "effective_deploy == 'true'" in reconcile_if and "always()" in reconcile_if
+      and "needs.validate_shared_secrets_once.result == 'success'" in reconcile_if
+      and "needs.build_publish_and_deploy.result != 'failure'" in reconcile_if and "needs.build_publish_and_deploy.result != 'cancelled'" in reconcile_if
+      and "needs.delete_removed_argocd_applications.result != 'failure'" in reconcile_if and "needs.delete_removed_argocd_applications.result != 'cancelled'" in reconcile_if
+      and "has_active_deployments != 'true'" in reconcile_if and "needs.validate_active_runtimes.result == 'success'" in reconcile_if)
+check("D: replication_dry_run_validation needs are unchanged (validate_model, validate_shared_secrets_once, build_publish_and_deploy, delete_removed_argocd_applications)",
+      validate_job.get("needs") == ["validate_model", "validate_shared_secrets_once", "build_publish_and_deploy", "delete_removed_argocd_applications"])
+validate_if = str(validate_job.get("if", ""))
+check("D: replication_dry_run_validation if: still requires effective_deploy == 'false', always(), shared-secrets success, build/delete not failed/cancelled",
+      "effective_deploy == 'false'" in validate_if and "always()" in validate_if
+      and "needs.validate_shared_secrets_once.result == 'success'" in validate_if
+      and "needs.build_publish_and_deploy.result != 'failure'" in validate_if and "needs.build_publish_and_deploy.result != 'cancelled'" in validate_if
+      and "needs.delete_removed_argocd_applications.result != 'failure'" in validate_if and "needs.delete_removed_argocd_applications.result != 'cancelled'" in validate_if)
+
+# Display names.
+check("display name: replication_reconcile_once == 'Phase 6A | Reconcile GoldenGate Replication Pipelines'", reconcile_job.get("name") == "Phase 6A | Reconcile GoldenGate Replication Pipelines")
+check("display name: replication_dry_run_validation == 'Phase 6B | Validate GoldenGate Replication Manifests'", validate_job.get("name") == "Phase 6B | Validate GoldenGate Replication Manifests")
+
+# E/F: Deploy and Validate both delegate to phase6_replication.py, never a reintroduced inline implementation.
+reconcile_run_text = "\n".join(s.get("run", "") for s in reconcile_job["steps"])
+validate_run_text = "\n".join(s.get("run", "") for s in validate_job["steps"])
+check("E: replication_reconcile_once invokes phase6_replication.py discover", "phase6_replication.py discover" in reconcile_run_text)
+check("E: replication_reconcile_once invokes phase6_replication.py reconcile", "phase6_replication.py reconcile" in reconcile_run_text)
+check("E: replication_reconcile_once no longer contains inline kubectl apply/wait/delete Bash", "kubectl apply" not in reconcile_run_text and "kubectl wait" not in reconcile_run_text and "kubectl delete" not in reconcile_run_text)
+check("F: replication_dry_run_validation invokes phase6_replication.py validate-local", "phase6_replication.py validate-local" in validate_run_text)
+check("F: replication_dry_run_validation no longer contains an inline render/validate Bash loop", "render-job" not in validate_run_text and "while IFS=" not in validate_run_text)
+
+# G: the business engine remains automation/goldengate-replication.py, completely untouched by this conversion.
+check("G: automation/goldengate-replication.py remains the business engine (render-job/worker/verify all still present)", Path(engine_path).is_file())
+with open(engine_path) as f:
+    engine_source = f.read()
+check("G: the engine still defines render-job/worker/verify subcommands", "cmd_render_job" in engine_source and "cmd_worker" in engine_source and "cmd_verify" in engine_source)
+
+# H: no automation/phases/phase7/ directory was created.
+check("H: automation/phases/phase7/ does not exist", not (Path(tool_path).resolve().parents[1] / "phase7").exists())
+
+# I/V: current descriptors remain replication.enabled=false (checked both structurally here and against the REAL live model).
+gdm_spec = importlib.util.spec_from_file_location("goldengate_deployment_model", str(Path(tool_path).resolve().parents[2] / "goldengate-deployment-model.py"))
+gdm = importlib.util.module_from_spec(gdm_spec)
+gdm_spec.loader.exec_module(gdm)
+active, inactive, invalid = gdm.scan("dev")
+check("I/V: scan(dev) has no invalid descriptors", invalid == [])
+by_id = {d["deploymentId"]: d for d in active + inactive}
+check("I/V: gg-postgresql-repltest-01 remains replication.enabled=false", by_id.get("gg-postgresql-repltest-01", {}).get("replicationEnabled") is False)
+check("I/V: gg-mssql-repltest-01 remains replication.enabled=false", by_id.get("gg-mssql-repltest-01", {}).get("replicationEnabled") is False)
+check("I/V: the canonical replication-pipelines list is currently empty", gdm.replication_pipeline_ids(active) == [])
+
+# J: pipeline discovery occurs strictly before AWS credential configuration -- the workflow's own step order.
+reconcile_step_names = [s.get("name") for s in reconcile_job["steps"]]
+discovery_index = reconcile_step_names.index("Discover enabled replication pipelines")
+aws_index = reconcile_step_names.index("Configure AWS credentials")
+check("J: 'Discover enabled replication pipelines' precedes 'Configure AWS credentials' in replication_reconcile_once", discovery_index < aws_index)
+
+# K/L/M: AWS credentials are output-scoped, gated on has_pipelines=='true', and passed ONLY to the live reconciliation step.
+aws_step = reconcile_job["steps"][aws_index]
+check("K: Configure AWS credentials uses id: aws_build_credentials", aws_step.get("id") == "aws_build_credentials")
+check("K: output-credentials: true", aws_step.get("with", {}).get("output-credentials") is True)
+check("K: output-env-credentials: false", aws_step.get("with", {}).get("output-env-credentials") is False)
+check("L: Configure AWS credentials is gated on has_pipelines == 'true'", aws_step.get("if") == "steps.replication_discovery.outputs.has_pipelines == 'true'")
+reconcile_step = next(s for s in reconcile_job["steps"] if s.get("name") == "Reconcile enabled replication pipelines sequentially")
+reconcile_env = reconcile_step.get("env", {})
+check("M: only the reconciliation step's env references aws_build_credentials outputs", all("aws_build_credentials" in str(v) for v in reconcile_env.values()) and len(reconcile_env) == 3)
+other_steps_env_text = json.dumps([s.get("env", {}) for s in reconcile_job["steps"] if s.get("name") != "Reconcile enabled replication pipelines sequentially"])
+check("M: no OTHER step in replication_reconcile_once references aws_build_credentials outputs", "aws_build_credentials" not in other_steps_env_text)
+
+# N: a zero-pipeline Deploy path never calls AWS/EKS/kubectl -- behavioral proof via a scripted run() recorder.
+class _Proc:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
+
+class _Recorder:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        if argv[-1] == "validate":
+            return _Proc(0, "OK")
+        if argv[-1] == "replication-pipelines":
+            return _Proc(0, "")
+        return _Proc(0, "")
+
+
+recorder = _Recorder()
+with mock.patch.object(phase6, "run", recorder):
+    result = phase6.cmd_reconcile(type("Args", (), {"environment": "dev", "execution_id": "1-1"})())
+check("N: cmd_reconcile() returns 0 for a zero-pipeline run", result == 0)
+check("N: zero-pipeline cmd_reconcile() never calls aws", not any(c[:1] == ["aws"] for c in recorder.calls))
+check("N: zero-pipeline cmd_reconcile() never calls kubectl", not any(c[:1] == ["kubectl"] for c in recorder.calls))
+
+# O: Validate mode has zero AWS/kubectl mutation -- source-text proof (no aws/kubectl invocation anywhere in cmd_validate_local's own body).
+with open(tool_path) as f:
+    phase6_source = f.read()
+import ast as _ast
+phase6_tree = _ast.parse(phase6_source)
+cmd_validate_local_fn = next(n for n in _ast.walk(phase6_tree) if isinstance(n, _ast.FunctionDef) and n.name == "cmd_validate_local")
+cmd_validate_local_src = _ast.get_source_segment(phase6_source, cmd_validate_local_fn) or ""
+check("O: cmd_validate_local() never references 'aws' or 'kubectl' argv literals", '"aws"' not in cmd_validate_local_src and '"kubectl"' not in cmd_validate_local_src)
+
+# P: pipeline reconciliation remains sequential/fail-fast -- a plain Python for-loop with no threading/multiprocessing/asyncio.
+cmd_reconcile_fn = next(n for n in _ast.walk(phase6_tree) if isinstance(n, _ast.FunctionDef) and n.name == "cmd_reconcile")
+cmd_reconcile_src = _ast.get_source_segment(phase6_source, cmd_reconcile_fn) or ""
+check("P: cmd_reconcile() uses a plain sequential for-loop over pipelines, never threading/multiprocessing/asyncio", "for pipeline_id in pipelines" in cmd_reconcile_src
+      and "threading" not in phase6_source and "multiprocessing" not in phase6_source and "asyncio" not in phase6_source and "concurrent.futures" not in phase6_source)
+
+# Q: the Job wait remains exactly 600 seconds.
+check("Q: JOB_WAIT_TIMEOUT is exactly '600s'", phase6.JOB_WAIT_TIMEOUT == "600s")
+
+# R: failures retain execution evidence -- _reconcile_one_pipeline's timeout branch prints retained evidence and raises, never deletes.
+reconcile_one_fn = next(n for n in _ast.walk(phase6_tree) if isinstance(n, _ast.FunctionDef) and n.name == "_reconcile_one_pipeline")
+reconcile_one_src = _ast.get_source_segment(phase6_source, reconcile_one_fn) or ""
+check("R: _reconcile_one_pipeline() prints retained evidence and raises on a Job wait failure, before any delete", "evidence retained for diagnosis" in reconcile_one_src)
+
+# S: success cleans up exactly Job/ConfigMap/SecretProviderClass -- never a fourth resource kind.
+check("S: cleanup deletes exactly job/configmap/secretproviderclass with --ignore-not-found", reconcile_one_src.count('"kubectl", "delete"') == 3
+      and all(kind in reconcile_one_src for kind in ('"job", execution_name', '"configmap", execution_name', '"secretproviderclass", execution_name'))
+      and reconcile_one_src.count("--ignore-not-found") == 3)
+
+# T: no runtime/EFS/PVC deletion was introduced anywhere in the module.
+for forbidden in ("delete pvc", "delete pv ", "delete storageclass", "delete application", "delete namespace", "delete secret ", "delete ingress", "delete statefulset"):
+    check(f"T: phase6_replication.py contains no {forbidden!r} command", forbidden not in phase6_source)
+
+# U: no business-engine REST semantics changed -- the engine's own render/reconcile functions are still the ones this module calls (never a duplicated/rewritten copy of them).
+check("U: phase6_replication.py never redefines build_replication_plan/render_secret_provider_class/render_config_map/render_job", not any(
+    f"def {name}(" in phase6_source for name in ("build_replication_plan", "render_secret_provider_class", "render_config_map", "render_job", "reconcile_pipeline", "ensure_extract", "ensure_replicat", "ensure_distribution_path")))
+check("U: phase6_replication.py invokes the engine only via its render-job CLI subcommand", "render-job" in phase6_source and 'REPLICATION_ENGINE_TOOL' in phase6_source)
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  echo "$PHASE6_CONVERSION_CHECK"
+  if [ -z "$(echo "$PHASE6_CONVERSION_CHECK" | grep '^FAIL ' || true)" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        OK\ *) pass "Phase 6 Python Conversion: ${line#OK }" ;;
+      esac
+    done <<< "$PHASE6_CONVERSION_CHECK"
+  else
+    fail "Phase 6 Python Conversion: dedicated static assertions failed:"$'\n'"${PHASE6_CONVERSION_CHECK}"
+  fi
+else
+  skip "Phase 6 Python Conversion: dedicated static assertions -- python3/PyYAML/EKS_APP_WORKFLOW/phase6_replication.py unavailable"
 fi
 
 echo "--- Final repository handoff hygiene sweep (VDR pre-transfer cleanliness) ---"
