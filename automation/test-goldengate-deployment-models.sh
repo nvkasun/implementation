@@ -15958,6 +15958,329 @@ else
   skip "Phase 5 state identity/target binding: dedicated static assertions -- python3/PyYAML/EKS_APP_WORKFLOW/phase5_runtime.py unavailable"
 fi
 
+echo ""
+echo "--- Phase 5 Python Conversion: resolved runtime payload / artifact binding (A-M) ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE5_RUNTIME_TOOL" ]; then
+  PHASE5_ARTIFACT_BINDING_CHECK="$(python3 - "$EKS_APP_WORKFLOW" "$PHASE5_RUNTIME_TOOL" <<'PYEOF'
+import ast
+import importlib.util
+import json
+import os
+import sys
+import tarfile
+import tempfile
+from io import BytesIO
+from pathlib import Path
+from unittest import mock
+
+import yaml
+
+workflow_path, tool_path = sys.argv[1:3]
+
+with open(workflow_path) as f:
+    doc = yaml.safe_load(f)
+jobs = doc["jobs"]
+
+spec = importlib.util.spec_from_file_location("phase5_runtime", tool_path)
+phase5_runtime = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(phase5_runtime)
+
+results = []
+
+ENVIRONMENT_VALUE = "dev"
+DEPLOYMENT_ID_VALUE = "gg-oracle-payments-01"
+ECR_REGISTRY_VALUE = "229410149234.dkr.ecr.eu-west-1.amazonaws.com"
+GITHUB_RUN_NUMBER_VALUE = "42"
+CHART_VERSION_VALUE = f"0.1.{GITHUB_RUN_NUMBER_VALUE}-{DEPLOYMENT_ID_VALUE}"
+
+RECONCILE_ENV = {
+    "AWS_REGION": "eu-west-1", "EKS_CLUSTER_NAME": "gg-dev-cluster",
+    "EKS_DEPLOY_ROLE_ARN": "arn:aws:iam::668311715351:role/GoldenGateEksDeployRole-dev",
+    "RUNTIME_NAMESPACE": "goldengate-dev", "ARGOCD_NAMESPACE": "argocd", "ECR_REGISTRY": ECR_REGISTRY_VALUE,
+    "ARGOCD_ECR_READ_ROLE_ARN": "arn:aws:iam::229410149234:role/ArgoCdEcrReadRole", "GITHUB_RUN_NUMBER": GITHUB_RUN_NUMBER_VALUE,
+    "DNS_DOMAIN": "goldengate-dev.adcbmis.local", "ALB_GROUP_NAME": "goldengate-dev-shared",
+    "ACM_CERTIFICATE_ARN": "arn:aws:acm:eu-west-1:668311715351:certificate/abc-123",
+}
+
+DESCRIPTOR = {
+    "deploymentId": DEPLOYMENT_ID_VALUE, "adminSecretName": "dev/goldengate/source/admin",
+    "tlsSecretName": "dev/goldengate/tls-certificate", "runtimeServiceAccountName": "gg-runtime-sa",
+    "imageRepository": f"{ECR_REGISTRY_VALUE}/aws-cloud-factory-goldengate-oracle",
+    "imageRepositoryName": "aws-cloud-factory-goldengate-oracle", "imageTag": "23.4.0.0",
+    "efsMode": None, "efsFileSystemId": None, "efsCreationToken": None,
+}
+
+
+def reconcile_state_fixture(**overrides):
+    base = {
+        "environment": ENVIRONMENT_VALUE, "deployment_id": DEPLOYMENT_ID_VALUE, "deployment_model": "singleRuntime",
+        "deploy": True, "values_file": f"envs/{ENVIRONMENT_VALUE}/{DEPLOYMENT_ID_VALUE}/values.yaml",
+        "target_namespace": "goldengate-dev", "release_name": DEPLOYMENT_ID_VALUE,
+        "argocd_app_name": phase5_runtime._canonical_argocd_app_name(ENVIRONMENT_VALUE, DEPLOYMENT_ID_VALUE),
+        "helm_ecr_repository": "helm/goldengate", "helm_push_url": f"oci://{ECR_REGISTRY_VALUE}/helm",
+        "helm_chart_ref": f"oci://{ECR_REGISTRY_VALUE}/helm/goldengate",
+        "chart_version": CHART_VERSION_VALUE, "temp_chart_path": f"work/charts/{DEPLOYMENT_ID_VALUE}/goldengate",
+    }
+    base.update(overrides)
+    return base
+
+
+def resolved_state_fixture(**overrides):
+    base = {
+        **reconcile_state_fixture(),
+        "image_repository": DESCRIPTOR["imageRepository"], "image_repository_name": DESCRIPTOR["imageRepositoryName"],
+        "image_tag": DESCRIPTOR["imageTag"], "image_digest": "sha256:" + "ab" * 32,
+        "dns_domain": "goldengate-dev.adcbmis.local", "alb_group_name": "goldengate-dev-shared",
+        "certificate_arn": "arn:aws:acm:eu-west-1:668311715351:certificate/abc-123",
+        "admin_secret_name": DESCRIPTOR["adminSecretName"], "tls_secret_name": DESCRIPTOR["tlsSecretName"],
+        "runtime_service_account_name": DESCRIPTOR["runtimeServiceAccountName"], "resolved_efs_id": "",
+        "efs_mode": "", "efs_file_system_id_declared": "", "efs_creation_token": "",
+    }
+    base.update(overrides)
+    return base
+
+
+class Recorder:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        if argv[:1] == [sys.executable] and str(phase5_runtime.DEPLOYMENT_MODEL_TOOL) in argv:
+            return type("Proc", (), {"returncode": 0, "stdout": json.dumps(DESCRIPTOR), "stderr": ""})()
+        return type("Proc", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+
+def args_for(state_path):
+    return type("Args", (), {"environment": ENVIRONMENT_VALUE, "deployment_id": DEPLOYMENT_ID_VALUE, "state_path": state_path})()
+
+
+def with_state(fixture, allowed_keys):
+    tmp = tempfile.TemporaryDirectory()
+    state_path = Path(tmp.name) / "state.json"
+    phase5_runtime.update_state(state_path, fixture, allowed_keys)
+    return tmp, state_path
+
+
+def build_fake_package(repo_root, chart_version, chart_yaml_name="goldengate", chart_yaml_version=None, values_deployment_bytes=None):
+    values_bytes = b"runtime:\n  containerName: goldengate\n"
+    values_path = repo_root / "envs" / ENVIRONMENT_VALUE / DEPLOYMENT_ID_VALUE / "values.yaml"
+    values_path.parent.mkdir(parents=True, exist_ok=True)
+    values_path.write_bytes(values_bytes)
+    chart_yaml_version = chart_version if chart_yaml_version is None else chart_yaml_version
+    values_deployment_bytes = values_bytes if values_deployment_bytes is None else values_deployment_bytes
+    chart_yaml_bytes = f"apiVersion: v2\nname: {chart_yaml_name}\nversion: {chart_yaml_version}\nappVersion: {chart_yaml_version}\n".encode()
+    packaged_dir = repo_root / "packaged"
+    packaged_dir.mkdir(parents=True, exist_ok=True)
+    package_path = packaged_dir / f"goldengate-{chart_version}.tgz"
+    with tarfile.open(package_path, mode="w:gz") as tar:
+        for member_name, content_bytes in (("goldengate/Chart.yaml", chart_yaml_bytes), ("goldengate/values-deployment.yaml", values_deployment_bytes)):
+            info = tarfile.TarInfo(name=member_name)
+            info.size = len(content_bytes)
+            tar.addfile(info, BytesIO(content_bytes))
+    return f"packaged/{package_path.name}"
+
+
+with open(tool_path) as f:
+    tool_source = f.read()
+tree = ast.parse(tool_source)
+
+
+def fn_source(name):
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
+    return ast.get_source_segment(tool_source, fn) or ""
+
+
+def fn_defs(name):
+    return [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name]
+
+
+# A: one canonical chart-version helper exists (and only one).
+results.append(("A: exactly one _canonical_chart_version() helper is defined in phase5_runtime.py", len(fn_defs("_canonical_chart_version")) == 1))
+with mock.patch.dict(os.environ, {"GITHUB_RUN_NUMBER": "777"}):
+    results.append(("A: _canonical_chart_version() produces 0.1.<GITHUB_RUN_NUMBER>-<deployment_id>", phase5_runtime._canonical_chart_version(DEPLOYMENT_ID_VALUE) == f"0.1.777-{DEPLOYMENT_ID_VALUE}"))
+
+# B: prepare-deployment and mutation consumers (reconcile-state identity validation) reuse the single helper -- never re-derive the version string independently.
+for fn_name in ("cmd_prepare_deployment", "_validate_reconcile_state_identity"):
+    results.append((f"B: {fn_name}() reuses _canonical_chart_version() (never re-derives '0.1.' + run_number inline)", "_canonical_chart_version(" in fn_source(fn_name)))
+results.append(("B: no independent chart-version string construction (f\"0.1.{...}-{...}\") remains outside _canonical_chart_version()", tool_source.count('f"0.1.{') == 1))
+
+# C: publish-chart cannot use an arbitrary package_path -- confirmed reproduction of the original bug (package_path=packaged/totally-unrelated-chart.tgz, otherwise-canonical identity).
+tmp, state_path = with_state({**reconcile_state_fixture(), "package_path": "packaged/totally-unrelated-chart.tgz"}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+(Path(tmp.name) / "packaged").mkdir()
+(Path(tmp.name) / "packaged" / "totally-unrelated-chart.tgz").write_bytes(b"unrelated")
+recorder = Recorder()
+with mock.patch.object(phase5_runtime, "REPO_ROOT", Path(tmp.name)), mock.patch.object(phase5_runtime, "run", recorder), mock.patch.dict(os.environ, RECONCILE_ENV):
+    try:
+        phase5_runtime.cmd_publish_chart(args_for(state_path))
+        c_ok = False
+    except phase5_runtime.Phase5Error as exc:
+        c_ok = recorder.calls == [] and "totally-unrelated-chart.tgz" in str(exc)
+tmp.cleanup()
+results.append(("C: confirmed reproduction -- publish-chart rejects package_path=packaged/totally-unrelated-chart.tgz with ZERO AWS/ECR calls", c_ok))
+
+# D: publish-chart validates the packaged Chart.yaml (name/version/appVersion) via stdlib tarfile.
+tmp = tempfile.TemporaryDirectory()
+package_path_rel = build_fake_package(Path(tmp.name), CHART_VERSION_VALUE, chart_yaml_version="9.9.9-EVIL")
+_, state_path = with_state({**reconcile_state_fixture(), "package_path": package_path_rel}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+recorder = Recorder()
+with mock.patch.object(phase5_runtime, "REPO_ROOT", Path(tmp.name)), mock.patch.object(phase5_runtime, "run", recorder), mock.patch.dict(os.environ, RECONCILE_ENV):
+    try:
+        phase5_runtime.cmd_publish_chart(args_for(state_path))
+        d_ok = False
+    except phase5_runtime.Phase5Error:
+        d_ok = recorder.calls == []
+tmp.cleanup()
+results.append(("D: publish-chart rejects a packaged Chart.yaml whose version does not match the canonical chart version, with ZERO AWS/ECR calls", d_ok))
+package_contents_src = fn_source("_validate_packaged_chart_contents")
+results.append(("D: package inspection uses stdlib tarfile.open() (never a shelled-out tar command) -- the only 'tar' CLI usage anywhere in production code is the unrelated, pre-existing Helm-binary-install helper", "import tarfile" in package_contents_src and "tarfile.open" in package_contents_src and '"tar"' not in package_contents_src))
+
+# E: publish-chart validates the packaged values-deployment.yaml against the CURRENT envs/<environment>/<deployment_id>/values.yaml.
+tmp = tempfile.TemporaryDirectory()
+package_path_rel = build_fake_package(Path(tmp.name), CHART_VERSION_VALUE, values_deployment_bytes=b"runtime:\n  containerName: totally-different\n")
+_, state_path = with_state({**reconcile_state_fixture(), "package_path": package_path_rel}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+recorder = Recorder()
+with mock.patch.object(phase5_runtime, "REPO_ROOT", Path(tmp.name)), mock.patch.object(phase5_runtime, "run", recorder), mock.patch.dict(os.environ, RECONCILE_ENV):
+    try:
+        phase5_runtime.cmd_publish_chart(args_for(state_path))
+        e_ok = False
+    except phase5_runtime.Phase5Error:
+        e_ok = recorder.calls == []
+tmp.cleanup()
+results.append(("E: publish-chart rejects a packaged values-deployment.yaml that does not byte-for-byte match the current deployment values file, with ZERO AWS/ECR calls", e_ok))
+
+# F: ALL package/artifact validation occurs strictly before any AWS ECR login/mutation call -- source-order proof.
+publish_chart_src = fn_source("cmd_publish_chart")
+package_check_index = publish_chart_src.find("_validate_package_path_and_containment")
+chart_contents_check_index = publish_chart_src.find("_validate_packaged_chart_contents")
+first_ecr_call_index = publish_chart_src.find("get-login-password")
+results.append(("F: cmd_publish_chart() calls package-path/containment and packaged-Chart.yaml/values validation strictly BEFORE the first AWS ECR call", -1 not in (package_check_index, chart_contents_check_index, first_ecr_call_index) and package_check_index < first_ecr_call_index and chart_contents_check_index < first_ecr_call_index))
+
+# G: resolved runtime inputs are compared with the canonical deployment-model descriptor (never a second descriptor parser).
+resolved_inputs_src = fn_source("_validate_resolved_runtime_inputs")
+results.append(("G: _validate_resolved_runtime_inputs() calls the canonical _describe_deployment_json() (never a second descriptor parser)", "_describe_deployment_json(" in resolved_inputs_src))
+for label in ("admin_secret_name", "tls_secret_name", "runtime_service_account_name", "image_repository", "image_tag", "efs_mode", "efs_file_system_id_declared", "efs_creation_token"):
+    results.append((f"G: _validate_resolved_runtime_inputs() cross-checks state.{label} against the descriptor", f'"{label}"' in resolved_inputs_src))
+
+# H: source/target admin-secret isolation is revalidated before runtime reconciliation -- confirmed reproduction (source descriptor + target-role state).
+tmp = tempfile.TemporaryDirectory()
+_, state_path = with_state({**resolved_state_fixture(admin_secret_name="dev/goldengate/target/admin")}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+recorder = Recorder()
+with mock.patch.object(phase5_runtime, "run", recorder), mock.patch.dict(os.environ, RECONCILE_ENV):
+    try:
+        phase5_runtime.cmd_reconcile_runtime(args_for(state_path))
+        h_ok = False
+    except phase5_runtime.Phase5Error as exc:
+        h_ok = ("target/admin" in str(exc)) and not any(argv[:1] == ["kubectl"] for argv in recorder.calls)
+tmp.cleanup()
+results.append(("H: confirmed reproduction -- reconcile-runtime rejects a source-role state claiming dev/goldengate/target/admin, with ZERO kubectl calls", h_ok))
+
+# I: environment ingress identity (dns_domain/alb_group_name/certificate_arn) is revalidated before reconciliation.
+tmp = tempfile.TemporaryDirectory()
+_, state_path = with_state({**resolved_state_fixture(dns_domain="wrong.example.internal")}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+recorder = Recorder()
+with mock.patch.object(phase5_runtime, "run", recorder), mock.patch.dict(os.environ, RECONCILE_ENV):
+    try:
+        phase5_runtime.cmd_reconcile_runtime(args_for(state_path))
+        i_ok = False
+    except phase5_runtime.Phase5Error:
+        i_ok = not any(argv[:1] == ["kubectl"] for argv in recorder.calls)
+tmp.cleanup()
+results.append(("I: confirmed reproduction -- reconcile-runtime rejects a mismatched environment ingress identity (dns_domain), with ZERO kubectl calls", i_ok))
+
+# J: managed EFS ID is freshly re-resolved (read-only) before Kubernetes mutation -- confirmed reproduction of a fresh/stale mismatch.
+descriptor_managed = {**DESCRIPTOR, "efsMode": "managed", "efsCreationToken": "gg-dev-oracle-01-u02"}
+tmp = tempfile.TemporaryDirectory()
+_, state_path = with_state({**resolved_state_fixture(deploy=True, efs_mode="managed", efs_creation_token="gg-dev-oracle-01-u02", resolved_efs_id="fs-0wrongwrongwrong")}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+
+
+def fake_run_managed_efs(argv, **kwargs):
+    if argv[:1] == [sys.executable] and str(phase5_runtime.DEPLOYMENT_MODEL_TOOL) in argv:
+        return type("Proc", (), {"returncode": 0, "stdout": json.dumps(descriptor_managed), "stderr": ""})()
+    if argv[:3] == ["aws", "sts", "assume-role"]:
+        return type("Proc", (), {"returncode": 0, "stdout": json.dumps({"Credentials": {"AccessKeyId": "AKIA", "SecretAccessKey": "s", "SessionToken": "t"}}), "stderr": ""})()
+    if "get-caller-identity" in argv:
+        return type("Proc", (), {"returncode": 0, "stdout": "668311715351", "stderr": ""})()
+    if argv[:3] == ["aws", "efs", "describe-file-systems"]:
+        return type("Proc", (), {"returncode": 0, "stdout": json.dumps({"FileSystems": [{"FileSystemId": "fs-managed42", "LifeCycleState": "available", "Tags": [
+            {"Key": "ManagedBy", "Value": "goldengate-eks-app"}, {"Key": "GoldenGateDeploymentId", "Value": DEPLOYMENT_ID_VALUE},
+            {"Key": "GoldenGateEnvironment", "Value": ENVIRONMENT_VALUE}, {"Key": "GoldenGateStorage", "Value": "u02"},
+        ]}]}), "stderr": ""})()
+    return type("Proc", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+
+managed_efs_calls = []
+
+
+def recording_fake_run_managed_efs(argv, **kwargs):
+    managed_efs_calls.append(list(argv))
+    return fake_run_managed_efs(argv, **kwargs)
+
+
+with mock.patch.object(phase5_runtime, "run", recording_fake_run_managed_efs), mock.patch.dict(os.environ, RECONCILE_ENV):
+    try:
+        phase5_runtime.cmd_reconcile_runtime(args_for(state_path))
+        j_ok = False
+    except phase5_runtime.Phase5Error:
+        describe_calls = [a for a in managed_efs_calls if a[:3] == ["aws", "efs", "describe-file-systems"]]
+        kubectl_calls = [a for a in managed_efs_calls if a[:1] == ["kubectl"]]
+        j_ok = len(describe_calls) == 1 and kubectl_calls == []
+tmp.cleanup()
+results.append(("J: confirmed reproduction -- a freshly re-resolved managed EFS ID that mismatches the persisted resolved_efs_id fails BEFORE any kubectl call (fresh read-only re-resolution genuinely occurred)", j_ok))
+results.append(("J: cmd_reconcile_runtime() calls _validate_resolved_runtime_inputs() with verify_managed_efs_live=True", "verify_managed_efs_live=True" in fn_source("cmd_reconcile_runtime")))
+
+# K: reconcile-runtime no longer blindly trusts state admin_secret_name/tls_secret_name/runtime_service_account_name/ingress identity/resolved_efs_id -- source-text proof against the real function.
+reconcile_runtime_src = fn_source("cmd_reconcile_runtime")
+for label in ('"admin_secret_name"', '"tls_secret_name"', '"runtime_service_account_name"', '"dns_domain"', '"alb_group_name"', '"certificate_arn"'):
+    results.append((f"K: cmd_reconcile_runtime() no longer calls require_state_value(state, {label}) directly (sourced from the validated resolved[...] dict instead)", f"require_state_value(state, {label})" not in reconcile_runtime_src))
+results.append(('K: cmd_reconcile_runtime() no longer reads resolved_efs_id via state.get("resolved_efs_id") directly (sourced from the validated resolved[...] dict instead)', 'resolved_efs_id = state.get("resolved_efs_id")' not in reconcile_runtime_src))
+results.append(("K: cmd_reconcile_runtime() sources its mutation payload from the resolved[...] dict returned by _validate_resolved_runtime_inputs()", 'resolved["admin_secret_name"]' in reconcile_runtime_src and 'resolved["resolved_efs_id"]' in reconcile_runtime_src))
+
+# L: post-deploy diagnostics performs state identity binding before _connect_to_eks().
+post_deploy_diagnostics_src = fn_source("cmd_post_deploy_diagnostics")
+identity_index = post_deploy_diagnostics_src.find("_validate_reconcile_state_identity")
+connect_index = post_deploy_diagnostics_src.find("_connect_to_eks()", identity_index + 1)  # skip past this same comment's own prose mention of _connect_to_eks() -- find the real call after the identity check
+results.append(("L: cmd_post_deploy_diagnostics() calls _validate_reconcile_state_identity() strictly BEFORE _connect_to_eks()", identity_index != -1 and connect_index != -1 and identity_index < connect_index))
+tmp = tempfile.TemporaryDirectory()
+_, state_path = with_state({**reconcile_state_fixture(argocd_app_name="totally-unrelated-app")}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+recorder = Recorder()
+with mock.patch.object(phase5_runtime, "run", recorder), mock.patch.dict(os.environ, RECONCILE_ENV):
+    try:
+        phase5_runtime.cmd_post_deploy_diagnostics(args_for(state_path))
+        l_ok = False
+    except phase5_runtime.Phase5Error:
+        l_ok = recorder.calls == []
+tmp.cleanup()
+results.append(("L: confirmed reproduction -- post-deploy-diagnostics rejects a cross-runtime Application state with ZERO calls (never queries/logs a different runtime)", l_ok))
+
+# M: no workflow YAML implementation was reintroduced -- every affected step remains a single-line phase5_runtime.py invocation, never inline Python/tarfile/bash reimplementing this logic.
+build_job = jobs["build_publish_and_deploy"]
+build_steps_by_name = {s.get("name"): s for s in build_job["steps"]}
+publish_step = build_steps_by_name.get("Publish runtime Helm chart to private ECR")
+reconcile_step = build_steps_by_name.get("Reconcile runtime through Argo CD")
+results.append(("M: the 'Publish runtime Helm chart to private ECR' step still only invokes phase5_runtime.py publish-chart (no reintroduced inline package/tarfile logic)", publish_step is not None and "phase5_runtime.py publish-chart" in publish_step.get("run", "") and "tarfile" not in publish_step.get("run", "")))
+if reconcile_step is not None:
+    results.append(("M: the runtime-reconciliation step still only invokes phase5_runtime.py reconcile-runtime (no reintroduced inline EFS/descriptor logic)", "phase5_runtime.py reconcile-runtime" in reconcile_step.get("run", "")))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  echo "$PHASE5_ARTIFACT_BINDING_CHECK"
+  if [ -z "$(echo "$PHASE5_ARTIFACT_BINDING_CHECK" | grep '^FAIL ' || true)" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        OK\ *) pass "Phase 5 resolved-runtime/artifact binding: ${line#OK }" ;;
+      esac
+    done <<< "$PHASE5_ARTIFACT_BINDING_CHECK"
+  else
+    fail "Phase 5 resolved-runtime/artifact binding: dedicated static assertions failed:"$'\n'"${PHASE5_ARTIFACT_BINDING_CHECK}"
+  fi
+else
+  skip "Phase 5 resolved-runtime/artifact binding: dedicated static assertions -- python3/PyYAML/EKS_APP_WORKFLOW/phase5_runtime.py unavailable"
+fi
+
 echo "--- Final repository handoff hygiene sweep (VDR pre-transfer cleanliness) ---"
 
 # This is the LAST check in the suite, deliberately: earlier sections legitimately regenerate work/generated/dev/goldengate-deployments.yaml (the folder-driven registry-generation checks) as their own tested behavior -- asserting its absence any earlier would be a self-defeating mid-test assertion. Self-heal only the categories PROVEN elsewhere in this suite to be pure, expected byproducts of exercising real application/tooling behavior (never silently deleting anything whose origin is unknown); everything else must already be absent, or this check fails closed and reports it for a human to investigate before VDR handoff.

@@ -158,6 +158,12 @@ def _canonical_argocd_app_name(environment=ENVIRONMENT, deployment_id=DEPLOYMENT
     return phase5_runtime._canonical_argocd_app_name(environment, deployment_id)
 
 
+GITHUB_RUN_NUMBER = "42"  # must match _env_patch()'s own GITHUB_RUN_NUMBER default below
+CHART_VERSION = f"0.1.{GITHUB_RUN_NUMBER}-{DEPLOYMENT_ID}"
+TEMP_CHART_PATH = f"work/charts/{DEPLOYMENT_ID}/goldengate"
+SAMPLE_IMAGE_DIGEST = "sha256:" + "ab" * 32
+
+
 def _reconcile_state_fixture(**overrides):
     """A complete, canonical, schema-valid reconcile-state JSON document -- everything _validate_reconcile_state_identity requires, so a test exercising unrelated behavior does not incidentally also fail identity binding. Override individual fields (including deliberately-wrong ones, for the cross-runtime regression tests) via keyword arguments."""
     base = {
@@ -166,6 +172,7 @@ def _reconcile_state_fixture(**overrides):
         "target_namespace": "goldengate-dev", "release_name": DEPLOYMENT_ID,
         "argocd_app_name": _canonical_argocd_app_name(), "helm_ecr_repository": "helm/goldengate",
         "helm_push_url": f"oci://{ECR_REGISTRY}/helm", "helm_chart_ref": f"oci://{ECR_REGISTRY}/helm/goldengate",
+        "chart_version": CHART_VERSION, "temp_chart_path": TEMP_CHART_PATH,
     }
     base.update(overrides)
     return base
@@ -180,6 +187,29 @@ def _removal_state_fixture(**overrides):
     }
     base.update(overrides)
     return base
+
+
+def _resolved_state_fixture(**overrides):
+    """A complete, canonical reconcile-state document that also satisfies _validate_resolved_runtime_inputs() against the default _descriptor()/canonical environment fixtures -- i.e. everything _full_reconcile_state() persists, as a plain dict for direct unit-level use. Override individual fields (including deliberately-wrong ones) via keyword arguments."""
+    base = {
+        **_reconcile_state_fixture(),
+        "image_repository": IMAGE_REPOSITORY, "image_repository_name": "aws-cloud-factory-goldengate-oracle", "image_tag": "23.4.0.0",
+        "image_digest": SAMPLE_IMAGE_DIGEST, "dns_domain": "goldengate-dev.adcbmis.local", "alb_group_name": "goldengate-dev-shared",
+        "certificate_arn": f"arn:aws:acm:eu-west-1:{WORKLOAD_ACCOUNT_ID}:certificate/abc-123",
+        "admin_secret_name": "dev/goldengate/source/admin", "tls_secret_name": "dev/goldengate/tls-certificate",
+        "runtime_service_account_name": "gg-runtime-sa", "resolved_efs_id": "",
+        "efs_mode": "", "efs_file_system_id_declared": "", "efs_creation_token": "",
+    }
+    base.update(overrides)
+    return base
+
+
+def _resolved_inputs(state, verify_managed_efs_live=False, descriptor=None):
+    """Calls the real _validate_resolved_runtime_inputs() with a scripted deployment-model describe() response (default: the matching _descriptor()) -- never a reimplementation."""
+    scripted = ScriptedRun()
+    scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(descriptor if descriptor is not None else _descriptor())))
+    with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+        return phase5_runtime._validate_resolved_runtime_inputs(state, ENVIRONMENT, DEPLOYMENT_ID, verify_managed_efs_live=verify_managed_efs_live)
 
 
 # ==== PREPARATION TESTS ====
@@ -825,6 +855,35 @@ class EfsRenderedManifestTests(unittest.TestCase):
 
 # ==== ECR HELM REPO TESTS ====
 
+def _build_fake_chart_package(repo_root, chart_version, environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, values_bytes=b"runtime:\n  containerName: goldengate\n",
+                               chart_yaml_name="goldengate", chart_yaml_version=None, chart_yaml_app_version=None,
+                               include_values_deployment=True, values_deployment_bytes=None):
+    """Builds a REAL .tgz via stdlib tarfile -- matching the on-disk layout _package_runtime_chart()/helm package actually produce (<chart_name>/Chart.yaml, <chart_name>/values-deployment.yaml) -- plus the CURRENT envs/<environment>/<deployment_id>/values.yaml it must byte-for-byte match. repo_root must already be the mocked phase5_runtime.REPO_ROOT. The archive is always named packaged/goldengate-<chart_version>.tgz (the canonical outer package path), but chart_yaml_name/chart_yaml_version/chart_yaml_app_version/values_deployment_bytes let a test independently corrupt the INSIDE metadata to prove the contents, not just the outer path, are verified. Returns the package's canonical relative path string."""
+    import tarfile
+
+    values_path = repo_root / "envs" / environment / deployment_id / "values.yaml"
+    values_path.parent.mkdir(parents=True, exist_ok=True)
+    values_path.write_bytes(values_bytes)
+
+    chart_yaml_version = chart_version if chart_yaml_version is None else chart_yaml_version
+    chart_yaml_app_version = chart_version if chart_yaml_app_version is None else chart_yaml_app_version
+    values_deployment_bytes = values_bytes if values_deployment_bytes is None else values_deployment_bytes
+    chart_yaml_bytes = f"apiVersion: v2\nname: {chart_yaml_name}\nversion: {chart_yaml_version}\nappVersion: {chart_yaml_app_version}\n".encode()
+
+    packaged_dir = repo_root / "packaged"
+    packaged_dir.mkdir(parents=True, exist_ok=True)
+    package_path = packaged_dir / f"goldengate-{chart_version}.tgz"
+    members = [("goldengate/Chart.yaml", chart_yaml_bytes)]
+    if include_values_deployment:
+        members.append(("goldengate/values-deployment.yaml", values_deployment_bytes))
+    with tarfile.open(package_path, mode="w:gz") as tar:
+        for member_name, content_bytes in members:
+            info = tarfile.TarInfo(name=member_name)
+            info.size = len(content_bytes)
+            tar.addfile(info, io.BytesIO(content_bytes))
+    return f"packaged/{package_path.name}"
+
+
 class EcrRepositoryTests(unittest.TestCase):
     def test_describe_success_no_create(self):
         scripted = ScriptedRun()
@@ -957,11 +1016,10 @@ class EcrRepositoryTests(unittest.TestCase):
     def test_ecr_password_passes_through_stdin_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"
+            package_path_rel = _build_fake_chart_package(Path(tmp), CHART_VERSION)
             phase5_runtime.update_state(state_path, {
-                **_reconcile_state_fixture(), "chart_version": "0.1.1-gg-x", "package_path": "packaged/goldengate-0.1.1-gg-x.tgz",
+                **_reconcile_state_fixture(), "package_path": package_path_rel,
             }, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
-            (Path(tmp) / "packaged").mkdir()
-            (Path(tmp) / "packaged" / "goldengate-0.1.1-gg-x.tgz").write_bytes(b"fake-chart")
 
             scripted = ScriptedRun()
             scripted.when(_starts_with("aws", "ecr", "get-login-password"), FakeProc(0, "SECRET_PASSWORD_VALUE\n"))
@@ -984,11 +1042,10 @@ class EcrRepositoryTests(unittest.TestCase):
     def test_password_never_stored_or_logged(self):
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"
+            package_path_rel = _build_fake_chart_package(Path(tmp), CHART_VERSION)
             phase5_runtime.update_state(state_path, {
-                **_reconcile_state_fixture(), "chart_version": "0.1.1-gg-x", "package_path": "packaged/goldengate-0.1.1-gg-x.tgz",
+                **_reconcile_state_fixture(), "package_path": package_path_rel,
             }, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
-            (Path(tmp) / "packaged").mkdir()
-            (Path(tmp) / "packaged" / "goldengate-0.1.1-gg-x.tgz").write_bytes(b"fake-chart")
 
             scripted = ScriptedRun()
             scripted.when(_starts_with("aws", "ecr", "get-login-password"), FakeProc(0, "SECRET_PASSWORD_VALUE\n"))
@@ -1009,11 +1066,10 @@ class EcrRepositoryTests(unittest.TestCase):
     def test_chart_push_failure_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"
+            package_path_rel = _build_fake_chart_package(Path(tmp), CHART_VERSION)
             phase5_runtime.update_state(state_path, {
-                **_reconcile_state_fixture(), "chart_version": "0.1.1-gg-x", "package_path": "packaged/goldengate-0.1.1-gg-x.tgz",
+                **_reconcile_state_fixture(), "package_path": package_path_rel,
             }, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
-            (Path(tmp) / "packaged").mkdir()
-            (Path(tmp) / "packaged" / "goldengate-0.1.1-gg-x.tgz").write_bytes(b"fake-chart")
 
             scripted = ScriptedRun()
             scripted.when(_starts_with("aws", "ecr", "get-login-password"), FakeProc(0, "pw"))
@@ -1030,11 +1086,10 @@ class EcrRepositoryTests(unittest.TestCase):
     def test_version_pullback_failure_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"
+            package_path_rel = _build_fake_chart_package(Path(tmp), CHART_VERSION)
             phase5_runtime.update_state(state_path, {
-                **_reconcile_state_fixture(), "chart_version": "0.1.1-gg-x", "package_path": "packaged/goldengate-0.1.1-gg-x.tgz",
+                **_reconcile_state_fixture(), "package_path": package_path_rel,
             }, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
-            (Path(tmp) / "packaged").mkdir()
-            (Path(tmp) / "packaged" / "goldengate-0.1.1-gg-x.tgz").write_bytes(b"fake-chart")
 
             scripted = ScriptedRun()
             scripted.when(_starts_with("aws", "ecr", "get-login-password"), FakeProc(0, "pw"))
@@ -1344,17 +1399,21 @@ class ArgoWaitTests(unittest.TestCase):
 # ==== EMERGENCY FALLBACK TESTS (part of reconcile-runtime) ====
 
 def _full_reconcile_state(state_path):
+    """Includes every field _validate_resolved_runtime_inputs() cross-checks against a FRESH deployment-model descriptor -- see _reconcile_scripted_ok(), which scripts that describe call to return the matching DESCRIPTOR/_descriptor() fixture."""
     phase5_runtime.update_state(state_path, {
-        **_reconcile_state_fixture(), "chart_version": "0.1.1-gg-x",
-        "image_repository": IMAGE_REPOSITORY, "dns_domain": "goldengate-dev.adcbmis.local",
-        "alb_group_name": "goldengate-dev-shared", "certificate_arn": "arn:aws:acm:eu-west-1:668311715351:certificate/abc",
+        **_reconcile_state_fixture(),
+        "image_repository": IMAGE_REPOSITORY, "image_repository_name": "aws-cloud-factory-goldengate-oracle", "image_tag": "23.4.0.0",
+        "dns_domain": "goldengate-dev.adcbmis.local", "alb_group_name": "goldengate-dev-shared",
+        "certificate_arn": f"arn:aws:acm:eu-west-1:{WORKLOAD_ACCOUNT_ID}:certificate/abc-123",
         "admin_secret_name": "dev/goldengate/source/admin", "tls_secret_name": "dev/goldengate/tls-certificate",
-        "runtime_service_account_name": "gg-runtime-sa", "resolved_efs_id": "",
+        "runtime_service_account_name": "gg-runtime-sa", "resolved_efs_id": "", "image_digest": SAMPLE_IMAGE_DIGEST,
+        "efs_mode": "", "efs_file_system_id_declared": "", "efs_creation_token": "",
     }, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
 
 
 def _reconcile_scripted_ok():
     scripted = ScriptedRun()
+    scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
     scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
     scripted.when(_starts_with("kubectl", "get", "crd", "applications.argoproj.io"), FakeProc(0, ""))
     scripted.when(_starts_with("kubectl", "apply", "-f", "-"), FakeProc(0, ""))
@@ -1949,13 +2008,13 @@ class ValidateLocalIntegrationTests(unittest.TestCase):
 
             state_path = repo_root / "state.json"
             phase5_runtime.update_state(state_path, {
-                "values_file": values_rel, "release_name": DEPLOYMENT_ID, "target_namespace": TARGET_NAMESPACE,
-                "deployment_model": "singleRuntime", "admin_secret_name": "dev/goldengate/source/admin",
-                "tls_secret_name": "dev/goldengate/tls-certificate", "runtime_service_account_name": "gg-runtime-sa",
-                "image_repository": IMAGE_REPOSITORY, "image_tag": IMAGE_TAG, "image_digest": IMAGE_DIGEST,
-                "dns_domain": "goldengate-dev.adcbmis.local", "alb_group_name": "goldengate-dev-shared",
-                "certificate_arn": "arn:aws:acm:eu-west-1:668311715351:certificate/abc", "resolved_efs_id": "",
-                "efs_mode": "", "efs_file_system_id_declared": "", "chart_version": "0.1.1-gg-x",
+                **_reconcile_state_fixture(), "target_namespace": TARGET_NAMESPACE,
+                "admin_secret_name": "dev/goldengate/source/admin", "tls_secret_name": "dev/goldengate/tls-certificate",
+                "runtime_service_account_name": "gg-runtime-sa", "image_repository": IMAGE_REPOSITORY,
+                "image_repository_name": "aws-cloud-factory-goldengate-oracle", "image_tag": IMAGE_TAG,
+                "image_digest": "sha256:" + "ab" * 32, "dns_domain": "goldengate-dev.adcbmis.local",
+                "alb_group_name": "goldengate-dev-shared", "certificate_arn": f"arn:aws:acm:eu-west-1:{WORKLOAD_ACCOUNT_ID}:certificate/abc-123",
+                "resolved_efs_id": "", "efs_mode": "", "efs_file_system_id_declared": "", "efs_creation_token": "",
             }, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
 
             import yaml as _yaml
@@ -1966,6 +2025,7 @@ class ValidateLocalIntegrationTests(unittest.TestCase):
             package_dir = repo_root / "packaged"
 
             scripted = ScriptedRun()
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
             scripted.when(_starts_with("helm", "dependency", "build"), FakeProc(0, ""))
             scripted.when(_starts_with("helm", "lint"), FakeProc(0, ""))
             scripted.when(_starts_with("helm", "template"), FakeProc(0, rendered_yaml))
@@ -1973,7 +2033,7 @@ class ValidateLocalIntegrationTests(unittest.TestCase):
             def fake_helm_package(argv, **kwargs):
                 # helm package must actually create the archive on disk for _package_runtime_chart's own existence check.
                 package_dir.mkdir(parents=True, exist_ok=True)
-                (package_dir / f"{phase5_runtime.CHART_NAME}-0.1.1-gg-x.tgz").write_bytes(b"fake")
+                (package_dir / f"{phase5_runtime.CHART_NAME}-{CHART_VERSION}.tgz").write_bytes(b"fake")
                 return FakeProc(0, "")
 
             args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
@@ -2384,6 +2444,465 @@ class CrossRuntimeRemovalStateTests(unittest.TestCase):
                 _run_quiet(phase5_runtime.cmd_post_delete_acceptance, args)
             classifier_call = next(c["argv"] for c in scripted.calls if str(phase5_runtime.RUNTIME_STATE_TOOL) in c["argv"])
             self.assertIn("--retained-pvc-expected", classifier_call)
+
+
+class ChartVersionAndPackageBindingTests(unittest.TestCase):
+    """The Python state file is a transport/cache, never a second mutable source of truth for the chart version or the local package it publishes -- see _canonical_chart_version()/_validate_package_path_and_containment()/_validate_packaged_chart_contents()."""
+
+    def test_1_canonical_chart_version_helper(self):
+        with _env_patch(GITHUB_RUN_NUMBER="777"):
+            self.assertEqual(phase5_runtime._canonical_chart_version(DEPLOYMENT_ID), f"0.1.777-{DEPLOYMENT_ID}")
+
+    def test_2_wrong_chart_version_fails_static_identity(self):
+        state = _reconcile_state_fixture(chart_version="9.9.9-EVIL")
+        with _env_patch():
+            with self.assertRaises(phase5_runtime.Phase5Error):
+                phase5_runtime._validate_reconcile_state_identity(state, ENVIRONMENT, DEPLOYMENT_ID)
+
+    def test_3_missing_chart_version_fails(self):
+        state = _reconcile_state_fixture()
+        del state["chart_version"]
+        with _env_patch():
+            with self.assertRaises(phase5_runtime.Phase5Error):
+                phase5_runtime._validate_reconcile_state_identity(state, ENVIRONMENT, DEPLOYMENT_ID)
+
+    def test_4_wrong_package_path_fails_before_any_aws_call(self):
+        """Confirmed reproduction of the current bug: a canonical reconcile identity with package_path=packaged/totally-unrelated-chart.tgz previously reached helm push/aws ecr calls."""
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            (Path(tmp) / "packaged").mkdir()
+            (Path(tmp) / "packaged" / "totally-unrelated-chart.tgz").write_bytes(b"unrelated")
+            phase5_runtime.update_state(state_path, {**_reconcile_state_fixture(), "package_path": "packaged/totally-unrelated-chart.tgz"}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = ScriptedRun()
+            with mock.patch.object(phase5_runtime, "REPO_ROOT", Path(tmp)), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+                with self.assertRaises(phase5_runtime.Phase5Error) as ctx:
+                    _run_quiet(phase5_runtime.cmd_publish_chart, args)
+            self.assertEqual(scripted.calls, [])
+            self.assertIn("totally-unrelated-chart.tgz", str(ctx.exception))
+
+    def test_5_package_path_traversal_escape_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            phase5_runtime.update_state(state_path, {**_reconcile_state_fixture(), "package_path": f"packaged/../../etc/goldengate-{CHART_VERSION}.tgz"}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = ScriptedRun()
+            with mock.patch.object(phase5_runtime, "REPO_ROOT", Path(tmp)), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    _run_quiet(phase5_runtime.cmd_publish_chart, args)
+            self.assertEqual(scripted.calls, [])
+
+    def test_6_absolute_package_path_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            phase5_runtime.update_state(state_path, {**_reconcile_state_fixture(), "package_path": "/etc/passwd"}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = ScriptedRun()
+            with mock.patch.object(phase5_runtime, "REPO_ROOT", Path(tmp)), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    _run_quiet(phase5_runtime.cmd_publish_chart, args)
+            self.assertEqual(scripted.calls, [])
+
+    def test_7_symlink_escaping_packaged_dir_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outside_dir = Path(tmp) / "outside"
+            outside_dir.mkdir()
+            evil_target = outside_dir / "evil.tgz"
+            evil_target.write_bytes(b"evil")
+
+            repo_root = Path(tmp) / "repo"
+            (repo_root / "packaged").mkdir(parents=True)
+            package_path_rel = f"packaged/goldengate-{CHART_VERSION}.tgz"
+            try:
+                (repo_root / package_path_rel).symlink_to(evil_target)
+            except (OSError, NotImplementedError):
+                self.skipTest("symlinks are not supported on this platform/filesystem")
+
+            state_path = repo_root / "state.json"
+            phase5_runtime.update_state(state_path, {**_reconcile_state_fixture(), "package_path": package_path_rel}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = ScriptedRun()
+            with mock.patch.object(phase5_runtime, "REPO_ROOT", repo_root), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    _run_quiet(phase5_runtime.cmd_publish_chart, args)
+            self.assertEqual(scripted.calls, [])
+
+    def test_8_missing_expected_package_fails_before_aws(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            phase5_runtime.update_state(state_path, {**_reconcile_state_fixture(), "package_path": f"packaged/goldengate-{CHART_VERSION}.tgz"}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = ScriptedRun()
+            with mock.patch.object(phase5_runtime, "REPO_ROOT", Path(tmp)), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    _run_quiet(phase5_runtime.cmd_publish_chart, args)
+            self.assertEqual(scripted.calls, [])
+
+    def _publish_with_package(self, **package_overrides):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            package_path_rel = _build_fake_chart_package(Path(tmp), CHART_VERSION, **package_overrides)
+            phase5_runtime.update_state(state_path, {**_reconcile_state_fixture(), "package_path": package_path_rel}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = ScriptedRun()
+            scripted.when(_starts_with("aws", "ecr", "get-login-password"), FakeProc(0, "pw"))
+            scripted.when(_starts_with("helm", "registry", "login"), FakeProc(0, ""))
+            scripted.when(_starts_with("aws", "ecr", "describe-repositories"), FakeProc(0, ""))
+            scripted.when(_starts_with("aws", "ecr", "get-repository-policy"), FakeProc(1, "", "RepositoryPolicyNotFoundException"))
+            scripted.when(_starts_with("aws", "ecr", "set-repository-policy"), FakeProc(0, ""))
+            scripted.when(_starts_with("helm", "push"), FakeProc(0, ""))
+            scripted.when(_starts_with("helm", "pull"), FakeProc(0, ""))
+            with mock.patch.object(phase5_runtime, "REPO_ROOT", Path(tmp)), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+                _run_quiet(phase5_runtime.cmd_publish_chart, args)
+            return scripted
+
+    def test_9_packaged_chart_yaml_wrong_name_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            package_path_rel = _build_fake_chart_package(Path(tmp), CHART_VERSION, chart_yaml_name="not-goldengate")
+            phase5_runtime.update_state(state_path, {**_reconcile_state_fixture(), "package_path": package_path_rel}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = ScriptedRun()
+            with mock.patch.object(phase5_runtime, "REPO_ROOT", Path(tmp)), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    _run_quiet(phase5_runtime.cmd_publish_chart, args)
+            self.assertEqual(scripted.calls, [])
+
+    def test_10_packaged_chart_yaml_wrong_version_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            package_path_rel = _build_fake_chart_package(Path(tmp), CHART_VERSION, chart_yaml_version="9.9.9-EVIL")
+            phase5_runtime.update_state(state_path, {**_reconcile_state_fixture(), "package_path": package_path_rel}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = ScriptedRun()
+            with mock.patch.object(phase5_runtime, "REPO_ROOT", Path(tmp)), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    _run_quiet(phase5_runtime.cmd_publish_chart, args)
+            self.assertEqual(scripted.calls, [])
+
+    def test_11_packaged_chart_yaml_wrong_app_version_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            package_path_rel = _build_fake_chart_package(Path(tmp), CHART_VERSION, chart_yaml_app_version="9.9.9-EVIL")
+            phase5_runtime.update_state(state_path, {**_reconcile_state_fixture(), "package_path": package_path_rel}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = ScriptedRun()
+            with mock.patch.object(phase5_runtime, "REPO_ROOT", Path(tmp)), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    _run_quiet(phase5_runtime.cmd_publish_chart, args)
+            self.assertEqual(scripted.calls, [])
+
+    def test_12_packaged_missing_values_deployment_yaml_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            package_path_rel = _build_fake_chart_package(Path(tmp), CHART_VERSION, include_values_deployment=False)
+            phase5_runtime.update_state(state_path, {**_reconcile_state_fixture(), "package_path": package_path_rel}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = ScriptedRun()
+            with mock.patch.object(phase5_runtime, "REPO_ROOT", Path(tmp)), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    _run_quiet(phase5_runtime.cmd_publish_chart, args)
+            self.assertEqual(scripted.calls, [])
+
+    def test_13_packaged_values_deployment_belongs_to_another_deployment_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            package_path_rel = _build_fake_chart_package(Path(tmp), CHART_VERSION, values_deployment_bytes=b"runtime:\n  containerName: totally-different\n")
+            phase5_runtime.update_state(state_path, {**_reconcile_state_fixture(), "package_path": package_path_rel}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = ScriptedRun()
+            with mock.patch.object(phase5_runtime, "REPO_ROOT", Path(tmp)), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    _run_quiet(phase5_runtime.cmd_publish_chart, args)
+            self.assertEqual(scripted.calls, [])
+
+    def test_14_canonical_package_containing_exact_current_values_passes(self):
+        scripted = self._publish_with_package()
+        push_calls = [c for c in scripted.calls if c["argv"][:2] == ["helm", "push"]]
+        self.assertEqual(len(push_calls), 1)
+
+
+class ResolvedDescriptorBindingTests(unittest.TestCase):
+    """A source runtime must never accept a target admin secret (or vice versa); every resolve-live-inputs RESULT cached in state must be re-bound to a FRESH deployment-model descriptor before it can influence a mutation -- see _validate_resolved_runtime_inputs()."""
+
+    def _assert_field_mismatch_fails(self, **override):
+        state = _resolved_state_fixture(**override)
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            _resolved_inputs(state)
+
+    def test_15_wrong_admin_secret_name_fails(self):
+        self._assert_field_mismatch_fails(admin_secret_name="dev/goldengate/other/admin")
+
+    def test_16_source_runtime_with_target_admin_secret_fails_before_kubernetes_mutation(self):
+        """Mandatory regression: the real canonical descriptor for a source runtime (e.g. gg-postgresql-repltest-01) declares adminSecretName=dev/goldengate/source/admin -- a state claiming dev/goldengate/target/admin must fail before any Kubernetes mutation."""
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            state = _resolved_state_fixture(admin_secret_name="dev/goldengate/target/admin")
+            phase5_runtime.update_state(state_path, state, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = ScriptedRun()
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
+            with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+                with self.assertRaises(phase5_runtime.Phase5Error) as ctx:
+                    _run_quiet(phase5_runtime.cmd_reconcile_runtime, args)
+            self.assertIn("target/admin", str(ctx.exception))
+            self.assertEqual([c for c in scripted.calls if c["argv"][:1] == ["kubectl"]], [])
+
+    def test_17_target_runtime_with_source_admin_secret_fails(self):
+        target_descriptor = _descriptor(adminSecretName="dev/goldengate/target/admin")
+        state = _resolved_state_fixture(admin_secret_name="dev/goldengate/source/admin")
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            _resolved_inputs(state, descriptor=target_descriptor)
+
+    def test_18_wrong_tls_secret_name_fails(self):
+        self._assert_field_mismatch_fails(tls_secret_name="dev/goldengate/other-cert")
+
+    def test_19_wrong_runtime_service_account_name_fails(self):
+        self._assert_field_mismatch_fails(runtime_service_account_name="other-sa")
+
+    def test_20_wrong_image_repository_fails(self):
+        self._assert_field_mismatch_fails(image_repository=f"{ECR_REGISTRY}/some-other-repo")
+
+    def test_21_wrong_image_repository_name_fails(self):
+        self._assert_field_mismatch_fails(image_repository_name="some-other-repo")
+
+    def test_22_wrong_image_tag_fails(self):
+        self._assert_field_mismatch_fails(image_tag="99.99.99")
+
+    def test_23_wrong_dns_domain_fails(self):
+        self._assert_field_mismatch_fails(dns_domain="wrong.example.internal")
+
+    def test_24_wrong_alb_group_name_fails(self):
+        self._assert_field_mismatch_fails(alb_group_name="wrong-group")
+
+    def test_25_wrong_certificate_arn_fails(self):
+        self._assert_field_mismatch_fails(certificate_arn=f"arn:aws:acm:eu-west-1:{WORKLOAD_ACCOUNT_ID}:certificate/different")
+
+    def test_26_wrong_efs_mode_fails(self):
+        self._assert_field_mismatch_fails(efs_mode="managed")
+
+    def test_27_wrong_declared_existing_efs_id_fails(self):
+        descriptor = _descriptor(efsMode="existing", efsFileSystemId="fs-real12345")
+        state = _resolved_state_fixture(efs_mode="existing", efs_file_system_id_declared="fs-WRONG00000", resolved_efs_id="fs-WRONG00000")
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            _resolved_inputs(state, descriptor=descriptor)
+
+    def test_28_wrong_efs_creation_token_fails(self):
+        descriptor = _descriptor(efsMode="managed", efsCreationToken="gg-dev-oracle-01-u02")
+        state = _resolved_state_fixture(deploy=False, efs_mode="managed", efs_creation_token="gg-dev-WRONG-TOKEN", resolved_efs_id=phase5_runtime.EFS_DRY_RUN_PLACEHOLDER)
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            _resolved_inputs(state, descriptor=descriptor)
+
+    def test_29_malformed_image_digest_fails(self):
+        for bad_digest in ("", "sha256:short", "not-a-digest", "SHA256:" + "a" * 64):
+            state = _resolved_state_fixture(image_digest=bad_digest)
+            with self.assertRaises(phase5_runtime.Phase5Error, msg=bad_digest):
+                _resolved_inputs(state)
+
+
+class ResolvedEfsBindingTests(unittest.TestCase):
+    """Deterministic per-mode resolved_efs_id contract (CASE 1-5) -- see _validate_resolved_runtime_inputs()."""
+
+    _MANAGED_TAGS = [
+        {"Key": "ManagedBy", "Value": "goldengate-eks-app"}, {"Key": "GoldenGateDeploymentId", "Value": DEPLOYMENT_ID},
+        {"Key": "GoldenGateEnvironment", "Value": ENVIRONMENT}, {"Key": "GoldenGateStorage", "Value": "u02"},
+    ]
+
+    def test_30_no_efs_empty_resolved_id_passes(self):
+        state = _resolved_state_fixture(efs_mode="", resolved_efs_id="")
+        _resolved_inputs(state)
+
+    def test_31_no_efs_nonempty_resolved_id_fails(self):
+        state = _resolved_state_fixture(efs_mode="", resolved_efs_id="fs-shouldnotbehere")
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            _resolved_inputs(state)
+
+    def test_32_existing_efs_exact_descriptor_id_passes(self):
+        descriptor = _descriptor(efsMode="existing", efsFileSystemId="fs-real12345")
+        state = _resolved_state_fixture(efs_mode="existing", efs_file_system_id_declared="fs-real12345", resolved_efs_id="fs-real12345")
+        _resolved_inputs(state, descriptor=descriptor)
+
+    def test_33_existing_efs_different_state_id_fails(self):
+        descriptor = _descriptor(efsMode="existing", efsFileSystemId="fs-real12345")
+        state = _resolved_state_fixture(efs_mode="existing", efs_file_system_id_declared="fs-real12345", resolved_efs_id="fs-DIFFERENT")
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            _resolved_inputs(state, descriptor=descriptor)
+
+    def test_34_managed_validate_placeholder_passes(self):
+        descriptor = _descriptor(efsMode="managed", efsCreationToken="gg-dev-oracle-01-u02")
+        state = _resolved_state_fixture(deploy=False, efs_mode="managed", efs_creation_token="gg-dev-oracle-01-u02", resolved_efs_id=phase5_runtime.EFS_DRY_RUN_PLACEHOLDER)
+        _resolved_inputs(state, descriptor=descriptor)
+
+    def test_35_managed_validate_real_fs_id_fails(self):
+        descriptor = _descriptor(efsMode="managed", efsCreationToken="gg-dev-oracle-01-u02")
+        state = _resolved_state_fixture(deploy=False, efs_mode="managed", efs_creation_token="gg-dev-oracle-01-u02", resolved_efs_id="fs-managed42")
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            _resolved_inputs(state, descriptor=descriptor)
+
+    def test_36_managed_deploy_local_validation_accepts_shape_zero_aws_calls(self):
+        descriptor = _descriptor(efsMode="managed", efsCreationToken="gg-dev-oracle-01-u02")
+        state = _resolved_state_fixture(deploy=True, efs_mode="managed", efs_creation_token="gg-dev-oracle-01-u02", resolved_efs_id="fs-managed42")
+        scripted = ScriptedRun()
+        scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(descriptor)))
+        with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+            phase5_runtime._validate_resolved_runtime_inputs(state, ENVIRONMENT, DEPLOYMENT_ID, verify_managed_efs_live=False)
+        self.assertEqual([c for c in scripted.calls if c["argv"][:1] == ["aws"]], [])
+
+    def _managed_live_scripted(self, descriptor, fs_id="fs-managed42"):
+        scripted = ScriptedRun()
+        scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(descriptor)))
+        scripted.when(_starts_with("aws", "sts", "assume-role"), FakeProc(0, json.dumps({"Credentials": {"AccessKeyId": "AKIA", "SecretAccessKey": "s", "SessionToken": "t"}})))
+        scripted.when(_contains("sts", "get-caller-identity"), FakeProc(0, WORKLOAD_ACCOUNT_ID))
+        scripted.when(_starts_with("aws", "efs", "describe-file-systems"), FakeProc(0, json.dumps({"FileSystems": [{"FileSystemId": fs_id, "LifeCycleState": "available", "Tags": self._MANAGED_TAGS}]})))
+        return scripted
+
+    def test_37_managed_deploy_reconciliation_performs_fresh_live_resolution(self):
+        descriptor = _descriptor(efsMode="managed", efsCreationToken="gg-dev-oracle-01-u02")
+        state = _resolved_state_fixture(deploy=True, efs_mode="managed", efs_creation_token="gg-dev-oracle-01-u02", resolved_efs_id="fs-managed42")
+        scripted = self._managed_live_scripted(descriptor)
+        with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+            phase5_runtime._validate_resolved_runtime_inputs(state, ENVIRONMENT, DEPLOYMENT_ID, verify_managed_efs_live=True)
+        self.assertEqual(len([c for c in scripted.calls if c["argv"][:3] == ["aws", "efs", "describe-file-systems"]]), 1)
+
+    def test_38_fresh_managed_efs_id_mismatch_fails_before_kubernetes(self):
+        descriptor = _descriptor(efsMode="managed", efsCreationToken="gg-dev-oracle-01-u02")
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            state = _resolved_state_fixture(deploy=True, efs_mode="managed", efs_creation_token="gg-dev-oracle-01-u02", resolved_efs_id="fs-0wrongwrongwrong")
+            phase5_runtime.update_state(state_path, state, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = self._managed_live_scripted(descriptor)
+            with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    _run_quiet(phase5_runtime.cmd_reconcile_runtime, args)
+            self.assertEqual([c for c in scripted.calls if c["argv"][:1] == ["kubectl"]], [])
+
+    def test_39_fresh_managed_efs_id_match_continues_reconciliation(self):
+        descriptor = _descriptor(efsMode="managed", efsCreationToken="gg-dev-oracle-01-u02")
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            state = _resolved_state_fixture(deploy=True, efs_mode="managed", efs_creation_token="gg-dev-oracle-01-u02", resolved_efs_id="fs-managed42")
+            phase5_runtime.update_state(state_path, state, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = _reconcile_scripted_ok()
+            for predicate, proc in self._managed_live_scripted(descriptor).rules:
+                scripted.when(predicate, proc)
+            with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+                _run_quiet(phase5_runtime.cmd_reconcile_runtime, args)
+            self.assertEqual(len([c for c in scripted.calls if c["argv"][:3] == ["kubectl", "apply", "-f"]]), 1)
+
+
+class ReconcileMutationPayloadTests(unittest.TestCase):
+    """cmd_reconcile_runtime() must build its Application payload from freshly-validated canonical values -- never unvalidated state copies -- and must fail before any cluster access/kubectl call when those values do not match canonical sources."""
+
+    def _run_reconcile(self, state_overrides=None, descriptor=None, expect_error=True):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            state = _resolved_state_fixture(**(state_overrides or {}))
+            phase5_runtime.update_state(state_path, state, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = _reconcile_scripted_ok()
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(descriptor if descriptor is not None else _descriptor())))
+            with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+                if expect_error:
+                    with self.assertRaises(phase5_runtime.Phase5Error):
+                        _run_quiet(phase5_runtime.cmd_reconcile_runtime, args)
+                else:
+                    _run_quiet(phase5_runtime.cmd_reconcile_runtime, args)
+            return scripted
+
+    def test_40_wrong_chart_version_fails_before_cluster_access(self):
+        scripted = self._run_reconcile(state_overrides={"chart_version": "9.9.9-EVIL"})
+        self.assertEqual(scripted.calls, [])
+
+    def test_41_wrong_admin_secret_fails_before_cluster_access(self):
+        scripted = self._run_reconcile(state_overrides={"admin_secret_name": "dev/goldengate/target/admin"})
+        self.assertEqual([c for c in scripted.calls if c["argv"][:1] == ["kubectl"]], [])
+        self.assertEqual([c for c in scripted.calls if c["argv"][:2] == ["aws", "eks"]], [])
+
+    def test_42_wrong_efs_id_fails_before_kubectl_apply(self):
+        scripted = self._run_reconcile(
+            state_overrides={"efs_mode": "existing", "efs_file_system_id_declared": "fs-real12345", "resolved_efs_id": "fs-0wrongwrongwrong"},
+            descriptor=_descriptor(efsMode="existing", efsFileSystemId="fs-real12345"),
+        )
+        self.assertEqual([c for c in scripted.calls if c["argv"][:3] == ["kubectl", "apply", "-f"]], [])
+
+    def test_43_wrong_environment_ingress_identity_fails_before_kubectl_apply(self):
+        scripted = self._run_reconcile(state_overrides={"dns_domain": "wrong.example.internal"})
+        self.assertEqual([c for c in scripted.calls if c["argv"][:3] == ["kubectl", "apply", "-f"]], [])
+
+    def test_44_valid_canonical_state_builds_exact_application(self):
+        scripted = self._run_reconcile(expect_error=False)
+        apply_calls = [c for c in scripted.calls if c["argv"][:3] == ["kubectl", "apply", "-f"]]
+        self.assertEqual(len(apply_calls), 1)
+        import yaml as _yaml
+        manifest = _yaml.safe_load(apply_calls[0]["input_text"])
+        self.assertEqual(manifest["metadata"]["name"], _canonical_argocd_app_name())
+        self.assertEqual(manifest["spec"]["source"]["targetRevision"], CHART_VERSION)
+
+    def test_45_application_uses_freshly_canonical_values_not_unvalidated_state_copies(self):
+        scripted = self._run_reconcile(expect_error=False)
+        apply_calls = [c for c in scripted.calls if c["argv"][:3] == ["kubectl", "apply", "-f"]]
+        import yaml as _yaml
+        manifest = _yaml.safe_load(apply_calls[0]["input_text"])
+        params = {p["name"]: p["value"] for p in manifest["spec"]["source"]["helm"]["parameters"]}
+        self.assertEqual(params["runtime.csi.admin.objectName"], "dev/goldengate/source/admin")
+        self.assertEqual(params["ingress.hostDomain"], "goldengate-dev.adcbmis.local")
+        self.assertEqual(params["ingress.alb.certificateArn"], f"arn:aws:acm:eu-west-1:{WORKLOAD_ACCOUNT_ID}:certificate/abc-123")
+
+
+class ValidateLocalDiagnosticsTests(unittest.TestCase):
+    def test_46_validate_local_mismatched_identity_fails_before_helm_or_file_writes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            state_path = repo_root / "state.json"
+            state = _resolved_state_fixture(deployment_id="gg-mssql-repltest-01")
+            phase5_runtime.update_state(state_path, state, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = ScriptedRun()
+            rendered_marker = repo_root / "rendered" / f"{DEPLOYMENT_ID}.yaml"
+            with mock.patch.object(phase5_runtime, "REPO_ROOT", repo_root), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    _run_quiet(phase5_runtime.cmd_validate_local, args)
+            self.assertEqual(scripted.calls, [])
+            self.assertFalse(rendered_marker.exists(), "no rendered output must ever be written for a mismatched-identity state")
+
+    def test_47_validate_local_wrong_descriptor_admin_secret_fails_before_helm_render(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            state_path = repo_root / "state.json"
+            state = _resolved_state_fixture(admin_secret_name="dev/goldengate/target/admin")
+            phase5_runtime.update_state(state_path, state, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = ScriptedRun()
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
+            with mock.patch.object(phase5_runtime, "REPO_ROOT", repo_root), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    _run_quiet(phase5_runtime.cmd_validate_local, args)
+            self.assertEqual([c for c in scripted.calls if c["argv"][:1] == ["helm"]], [])
+
+    def test_48_post_deploy_diagnostics_cross_runtime_fails_before_eks_connection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            state = _reconcile_state_fixture(argocd_app_name="totally-unrelated-app")
+            phase5_runtime.update_state(state_path, state, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = ScriptedRun()
+            with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    _run_quiet(phase5_runtime.cmd_post_deploy_diagnostics, args)
+            self.assertEqual(scripted.calls, [])
+
+    def test_49_valid_post_deploy_diagnostics_non_authoritative_check_false(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            state = _reconcile_state_fixture()
+            phase5_runtime.update_state(state_path, state, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = ScriptedRun(default=FakeProc(1, "", "not found"))
+            scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
+            with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+                _run_quiet(phase5_runtime.cmd_post_deploy_diagnostics, args)
 
 
 if __name__ == "__main__":

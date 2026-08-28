@@ -93,6 +93,30 @@ def _canonical_argocd_app_name(environment, deployment_id):
     return f"goldengate-{environment}-{app_suffix}"
 
 
+def _canonical_chart_version(deployment_id):
+    """ONE canonical chart-version derivation -- reused by prepare-deployment, reconcile-state identity validation, package/artifact validation, publish-chart, and reconcile-runtime; never independently duplicated. deployment_id is included because matrix jobs share the same GITHUB_RUN_NUMBER and would otherwise collide. Deliberately excludes github.run_attempt (out of scope for this task) -- preserves the current chart-version contract exactly."""
+    run_number = require_env("GITHUB_RUN_NUMBER")
+    return f"0.1.{run_number}-{deployment_id}"
+
+
+def _canonical_temp_chart_path(deployment_id):
+    """ONE canonical local temp-chart-directory derivation, relative to REPO_ROOT -- reused by prepare-deployment, reconcile-state identity validation, and packaging."""
+    return f"work/charts/{deployment_id}/goldengate"
+
+
+def _canonical_rendered_manifest_path(deployment_id):
+    """ONE canonical local rendered-manifest-file derivation, relative to REPO_ROOT."""
+    return f"rendered/{deployment_id}.yaml"
+
+
+def _canonical_package_path(chart_version):
+    """ONE canonical local packaged-chart-archive derivation, relative to REPO_ROOT -- reused by packaging and by publish-chart's own package-path/containment validation. Never an arbitrary state-controlled filesystem path."""
+    return f"packaged/{CHART_NAME}-{chart_version}.tgz"
+
+
+PULLED_DIRECTORY = "pulled"
+
+
 def _require_literal_bool_state_value(state, key):
     """Never bool(state.get(key)) -- bool("false")/bool(0 or non-empty string) all coerce unpredictably in Python. Requires the persisted JSON value to already be a literal boolean; anything else (string, int, None, missing) fails closed."""
     if key not in state:
@@ -184,8 +208,9 @@ def _validate_reconcile_state_identity(state, environment, deployment_id):
     _require_exact("helm_push_url", f"oci://{ecr_registry}/{HELM_OCI_NAMESPACE}")
     _require_exact("helm_chart_ref", f"oci://{ecr_registry}/{HELM_ECR_REPOSITORY}")
 
-    if "temp_chart_path" in state:
-        _require_exact("temp_chart_path", f"work/charts/{deployment_id}/goldengate")
+    # Both are written by prepare-deployment and are therefore part of the canonical static state contract from that point on -- never left optional. The chart-version/local-path artifact contract these feed is enforced separately by _validate_package_path_and_containment()/_validate_packaged_chart_contents().
+    _require_exact("chart_version", _canonical_chart_version(deployment_id))
+    _require_exact("temp_chart_path", _canonical_temp_chart_path(deployment_id))
 
     return deploy
 
@@ -487,6 +512,143 @@ def _verify_image_in_private_ecr(image_repository, image_tag, ecr_registry, aws_
     return image_digest
 
 
+_EXPECTED_IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}\Z")
+_EFS_ID_SHAPE_RE = re.compile(r"^fs-[0-9a-zA-Z]+\Z")
+
+
+def _validate_resolved_runtime_inputs(state, environment, deployment_id, *, verify_managed_efs_live=False):
+    """Rebinds every resolve-live-inputs RESULT cached in reconcile state back to its own canonical, independently-verifiable source -- the state file is a cache/transport, never a second mutable source of truth. Never overloads _validate_reconcile_state_identity() (which only binds STATIC target identity); this is a separate second layer for values a stale/substituted state could otherwise use to control the Argo CD Application payload. Descriptor-derived fields (admin/tls secret names, ServiceAccount, image repository/tag, EFS mode/declared-ID/creation-token) are compared against a FRESH automation/goldengate-deployment-model.py describe() call (never a second descriptor parser) -- this is what prevents a source runtime from ever accepting a target admin secret, or vice versa. Environment-derived ingress fields (dns_domain/alb_group_name/certificate_arn) are compared against the already-hardened canonical environment producer (DNS_DOMAIN/ALB_GROUP_NAME/ACM_CERTIFICATE_ARN). image_digest is only shape-validated (sha256:<64 lowercase hex>) -- its repository/tag are already bound to the descriptor above, and a live ECR resolution result is never independently reinvented here. resolved_efs_id is validated per the deterministic 5-case contract: no-EFS requires empty; existing requires exact descriptor equality (no AWS call); managed+deploy=false requires exactly EFS_DRY_RUN_PLACEHOLDER (no AWS call); managed+deploy=true+verify_managed_efs_live=false requires only a valid fs-... shape (suitable for local validation deliberately given no AWS credentials); managed+deploy=true+verify_managed_efs_live=true freshly re-resolves the filesystem ID read-only via the existing canonical _resolve_efs_filesystem_id() (workload-account/lifecycle/ownership-tag verified) and requires it to exactly match the persisted resolved_efs_id before any Kubernetes mutation. Returns a dict of the canonical (descriptor/environment-sourced, never unvalidated state copies) resolved values for the caller to build its mutation payload from."""
+    deploy = _require_literal_bool_state_value(state, "deploy")
+    descriptor = _describe_deployment_json(environment, deployment_id)
+
+    def _require_equals(label, actual, expected):
+        if actual != expected:
+            raise Phase5Error(f"Phase 5 reconcile state {label}={actual!r} does not match the current canonical source (expected {expected!r}) for {deployment_id!r} -- refusing to let a stale/mismatched resolved value control this mutation.")
+        return expected
+
+    admin_secret_name = _require_equals("admin_secret_name", state.get("admin_secret_name"), descriptor.get("adminSecretName"))
+    tls_secret_name = _require_equals("tls_secret_name", state.get("tls_secret_name"), descriptor.get("tlsSecretName"))
+    runtime_service_account_name = _require_equals("runtime_service_account_name", state.get("runtime_service_account_name"), descriptor.get("runtimeServiceAccountName"))
+    image_repository = _require_equals("image_repository", state.get("image_repository"), descriptor.get("imageRepository"))
+    image_repository_name = _require_equals("image_repository_name", state.get("image_repository_name"), descriptor.get("imageRepositoryName"))
+    image_tag = _require_equals("image_tag", state.get("image_tag"), descriptor.get("imageTag"))
+    efs_mode = _require_equals("efs_mode", state.get("efs_mode"), descriptor.get("efsMode") or "")
+    efs_file_system_id_declared = _require_equals("efs_file_system_id_declared", state.get("efs_file_system_id_declared"), descriptor.get("efsFileSystemId") or "")
+    efs_creation_token = _require_equals("efs_creation_token", state.get("efs_creation_token"), descriptor.get("efsCreationToken") or "")
+
+    dns_domain = require_env("DNS_DOMAIN")
+    alb_group_name = require_env("ALB_GROUP_NAME")
+    certificate_arn = require_env("ACM_CERTIFICATE_ARN")
+    _require_equals("dns_domain", state.get("dns_domain"), dns_domain)
+    _require_equals("alb_group_name", state.get("alb_group_name"), alb_group_name)
+    _require_equals("certificate_arn", state.get("certificate_arn"), certificate_arn)
+
+    image_digest = state.get("image_digest")
+    if not isinstance(image_digest, str) or not _EXPECTED_IMAGE_DIGEST_RE.match(image_digest):
+        raise Phase5Error(f"Phase 5 reconcile state image_digest={image_digest!r} does not match the expected ECR digest shape sha256:<64 lowercase hex> -- refusing to treat it as a resolved live ECR result.")
+
+    resolved_efs_id = state.get("resolved_efs_id") or ""
+    if not efs_mode:
+        if resolved_efs_id != "":
+            raise Phase5Error(f"Phase 5 reconcile state resolved_efs_id={resolved_efs_id!r} is non-empty, but the current canonical descriptor for {deployment_id!r} does not use EFS.")
+    elif efs_mode == "existing":
+        if resolved_efs_id != efs_file_system_id_declared:
+            raise Phase5Error(f"Phase 5 reconcile state resolved_efs_id={resolved_efs_id!r} does not match the current canonical descriptor's declared efsFileSystemId={efs_file_system_id_declared!r} for efsMode=existing.")
+    elif efs_mode == "managed":
+        if not deploy:
+            if resolved_efs_id != EFS_DRY_RUN_PLACEHOLDER:
+                raise Phase5Error(f"Phase 5 reconcile state resolved_efs_id={resolved_efs_id!r} is not the dry-run placeholder {EFS_DRY_RUN_PLACEHOLDER!r} expected for a managed-EFS Validate (deploy=false) state.")
+        else:
+            if not isinstance(resolved_efs_id, str) or not _EFS_ID_SHAPE_RE.match(resolved_efs_id):
+                raise Phase5Error(f"Phase 5 reconcile state resolved_efs_id={resolved_efs_id!r} is not a valid EFS filesystem ID shape (fs-...) for a managed-EFS Deploy state.")
+            if verify_managed_efs_live:
+                aws_region = require_env("AWS_REGION")
+                eks_deploy_role_arn = require_env("EKS_DEPLOY_ROLE_ARN")
+                fresh_resolved_efs_id = _resolve_efs_filesystem_id(
+                    efs_mode=efs_mode, efs_file_system_id_declared=efs_file_system_id_declared, efs_creation_token=efs_creation_token,
+                    deploy=True, environment=environment, deployment_id=deployment_id,
+                    eks_deploy_role_arn=eks_deploy_role_arn, aws_region=aws_region,
+                )
+                if fresh_resolved_efs_id != resolved_efs_id:
+                    raise Phase5Error(f"freshly re-resolved managed EFS filesystem ID {fresh_resolved_efs_id!r} does not match the persisted resolved_efs_id={resolved_efs_id!r} -- refusing to reconcile with a stale/mismatched EFS filesystem ID.")
+                resolved_efs_id = fresh_resolved_efs_id
+
+    return {
+        "admin_secret_name": admin_secret_name, "tls_secret_name": tls_secret_name,
+        "runtime_service_account_name": runtime_service_account_name, "image_repository": image_repository,
+        "image_repository_name": image_repository_name, "image_tag": image_tag, "image_digest": image_digest,
+        "efs_mode": efs_mode, "efs_file_system_id_declared": efs_file_system_id_declared, "efs_creation_token": efs_creation_token,
+        "dns_domain": dns_domain, "alb_group_name": alb_group_name, "certificate_arn": certificate_arn,
+        "resolved_efs_id": resolved_efs_id,
+    }
+
+
+def _validate_package_path_and_containment(package_path_rel, chart_version):
+    """Rejects any package_path that is not EXACTLY the canonical packaged/<chart>-<version>.tgz path -- never an arbitrary state-controlled filesystem path. Resolves the path with pathlib.resolve() and proves it is still contained directly under REPO_ROOT/packaged (defeats a symlink-escape even when the string itself looks canonical) before the archive is ever opened."""
+    expected_rel = _canonical_package_path(chart_version)
+    if package_path_rel != expected_rel:
+        raise Phase5Error(f"Phase 5 reconcile state package_path={package_path_rel!r} is not the canonical path {expected_rel!r} for chart_version={chart_version!r} -- refusing to publish an arbitrary/relocated package.")
+
+    packaged_dir = (REPO_ROOT / "packaged").resolve()
+    resolved_package_path = (REPO_ROOT / package_path_rel).resolve()
+    if resolved_package_path.parent != packaged_dir:
+        raise Phase5Error(f"Phase 5 package path {package_path_rel!r} resolves to {resolved_package_path}, which escapes the expected packaged/ directory {packaged_dir} (possible symlink escape) -- refusing to publish it.")
+    if not resolved_package_path.is_file():
+        raise Phase5Error(f"expected packaged chart archive does not exist: {resolved_package_path}")
+    return resolved_package_path
+
+
+def _read_tar_member_bytes(tar, member_name):
+    member = tar.getmember(member_name)
+    if not member.isfile():
+        raise Phase5Error(f"packaged chart member {member_name!r} is not a regular file.")
+    extracted = tar.extractfile(member)
+    if extracted is None:
+        raise Phase5Error(f"packaged chart member {member_name!r} could not be read.")
+    return extracted.read()
+
+
+def _validate_packaged_chart_contents(resolved_package_path, chart_version, environment, deployment_id):
+    """Inspects the .tgz using Python's stdlib tarfile module ONLY (never shells out to tar) to prove the package genuinely belongs to THIS runtime before it is ever published -- a package built for another chart/version/deployment must not be publishable merely because the surrounding reconcile-state identity fields look correct. Requires exactly one top-level Chart.yaml with name=goldengate and version=appVersion=the canonical chart version, and exactly one top-level values-deployment.yaml whose bytes exactly match the CURRENT envs/<environment>/<deployment_id>/values.yaml (_package_runtime_chart() copies that file without transformation, so this must always hold for a package genuinely built from this runtime's current values)."""
+    import tarfile
+
+    try:
+        tar = tarfile.open(resolved_package_path, mode="r:gz")
+    except tarfile.TarError as exc:
+        raise Phase5Error(f"packaged chart archive {resolved_package_path} is not a valid gzip tar archive: {exc}") from exc
+
+    with tar:
+        names = tar.getnames()
+        chart_yaml_candidates = [n for n in names if n.endswith("/Chart.yaml") and n.count("/") == 1]
+        if len(chart_yaml_candidates) != 1:
+            raise Phase5Error(f"packaged chart archive {resolved_package_path} does not contain exactly one top-level Chart.yaml (found: {chart_yaml_candidates}). Rejecting an ambiguous/unexpected package structure.")
+        try:
+            chart_yaml = yaml.safe_load(_read_tar_member_bytes(tar, chart_yaml_candidates[0])) or {}
+        except yaml.YAMLError as exc:
+            raise Phase5Error(f"packaged Chart.yaml is not valid YAML: {exc}") from exc
+
+        if chart_yaml.get("name") != CHART_NAME:
+            raise Phase5Error(f"packaged Chart.yaml name={chart_yaml.get('name')!r}, expected {CHART_NAME!r}.")
+        if chart_yaml.get("version") != chart_version:
+            raise Phase5Error(f"packaged Chart.yaml version={chart_yaml.get('version')!r}, expected the canonical chart version {chart_version!r}.")
+        if chart_yaml.get("appVersion") != chart_version:
+            raise Phase5Error(f"packaged Chart.yaml appVersion={chart_yaml.get('appVersion')!r}, expected the canonical chart version {chart_version!r}.")
+
+        values_deployment_candidates = [n for n in names if n.endswith("/values-deployment.yaml") and n.count("/") == 1]
+        if len(values_deployment_candidates) != 1:
+            raise Phase5Error(f"packaged chart archive {resolved_package_path} does not contain exactly one top-level values-deployment.yaml (found: {values_deployment_candidates}). Rejecting an ambiguous/unexpected package structure.")
+        packaged_values_bytes = _read_tar_member_bytes(tar, values_deployment_candidates[0])
+
+    expected_values_path = REPO_ROOT / "envs" / environment / deployment_id / "values.yaml"
+    if not expected_values_path.is_file():
+        raise Phase5Error(f"expected current deployment values file does not exist: {expected_values_path}")
+    expected_values_bytes = expected_values_path.read_bytes()
+    if packaged_values_bytes != expected_values_bytes:
+        raise Phase5Error(f"packaged values-deployment.yaml does not byte-for-byte match the CURRENT {expected_values_path.relative_to(REPO_ROOT)} -- this package was not built from the current deployment's values file.")
+
+    print(f"OK: packaged chart archive {resolved_package_path.name} verified (Chart.yaml name={CHART_NAME!r}/version={chart_version!r}/appVersion={chart_version!r}, values-deployment.yaml matches current {expected_values_path.relative_to(REPO_ROOT)} byte-for-byte).")
+
+
 # Phase 5B, step 1: prepare-deployment (no AWS credentials)
 
 def cmd_prepare_deployment(args):
@@ -511,9 +673,7 @@ def cmd_prepare_deployment(args):
 
     values_file = f"envs/{environment}/{deployment_id}/values.yaml"
 
-    run_number = require_env("GITHUB_RUN_NUMBER")
-    # Includes deployment_id because matrix jobs share the same run_number and would otherwise collide.
-    chart_version = f"0.1.{run_number}-{deployment_id}"
+    chart_version = _canonical_chart_version(deployment_id)
     ecr_registry = require_env("ECR_REGISTRY")
     helm_push_url = f"oci://{ecr_registry}/{HELM_OCI_NAMESPACE}"
     helm_chart_ref = f"oci://{ecr_registry}/{HELM_ECR_REPOSITORY}"
@@ -522,7 +682,7 @@ def cmd_prepare_deployment(args):
         "environment": environment, "deployment_id": deployment_id, "deployment_model": deployment_model,
         "deploy": deploy, "values_file": values_file, "target_namespace": runtime_namespace,
         "release_name": release_name, "argocd_app_name": argocd_app_name,
-        "temp_chart_path": f"work/charts/{deployment_id}/goldengate", "chart_version": chart_version,
+        "temp_chart_path": _canonical_temp_chart_path(deployment_id), "chart_version": chart_version,
         "helm_ecr_repository": HELM_ECR_REPOSITORY, "helm_push_url": helm_push_url, "helm_chart_ref": helm_chart_ref,
     }, RECONCILE_ALLOWED_STATE_KEYS)
     print(f"OK: prepared deployment state for {deployment_id} (deploymentModel={deployment_model}, deploy={deploy}).")
@@ -942,7 +1102,7 @@ def _validate_efs_render_contract(values, docs, environment, deployment_id, depl
 
 
 def _package_runtime_chart(deployment_id, values_file, chart_version):
-    temp_chart_path = REPO_ROOT / "work" / "charts" / deployment_id / "goldengate"
+    temp_chart_path = REPO_ROOT / _canonical_temp_chart_path(deployment_id)
     if temp_chart_path.exists():
         shutil.rmtree(temp_chart_path)
     temp_chart_path.mkdir(parents=True)
@@ -952,7 +1112,7 @@ def _package_runtime_chart(deployment_id, values_file, chart_version):
     packaged_dir = REPO_ROOT / "packaged"
     packaged_dir.mkdir(parents=True, exist_ok=True)
     run(["helm", "package", str(temp_chart_path), "--version", chart_version, "--app-version", chart_version, "--destination", "packaged"])
-    package_path = packaged_dir / f"{CHART_NAME}-{chart_version}.tgz"
+    package_path = REPO_ROOT / _canonical_package_path(chart_version)
     if not package_path.is_file():
         raise Phase5Error(f"helm package did not produce the expected archive: {package_path}")
     return temp_chart_path, package_path
@@ -962,22 +1122,27 @@ def cmd_validate_local(args):
     environment = require_environment_arg(args.environment)
     deployment_id = require_deployment_id_arg(args.deployment_id)
     state = load_state(args.state_path)
+
+    # Static reconcile-state identity binding FIRST -- before any values-file read, Helm command, rendered-output write, or packaging -- so a stale/cross-runtime state can never cause this step to read/render/package another deployment's files. verify_managed_efs_live=False because this step deliberately receives NO AWS credentials.
+    _validate_reconcile_state_identity(state, environment, deployment_id)
+    resolved = _validate_resolved_runtime_inputs(state, environment, deployment_id, verify_managed_efs_live=False)
+
     values_file = require_state_value(state, "values_file")
     release_name = require_state_value(state, "release_name")
     target_namespace = require_state_value(state, "target_namespace")
     deployment_model = require_state_value(state, "deployment_model")
-    admin_secret_name = require_state_value(state, "admin_secret_name")
-    tls_secret_name = require_state_value(state, "tls_secret_name")
-    runtime_service_account_name = require_state_value(state, "runtime_service_account_name")
-    image_repository = require_state_value(state, "image_repository")
-    image_tag = require_state_value(state, "image_tag")
+    admin_secret_name = resolved["admin_secret_name"]
+    tls_secret_name = resolved["tls_secret_name"]
+    runtime_service_account_name = resolved["runtime_service_account_name"]
+    image_repository = resolved["image_repository"]
+    image_tag = resolved["image_tag"]
     image_digest = require_state_value(state, "image_digest")
-    dns_domain = require_state_value(state, "dns_domain")
-    alb_group_name = require_state_value(state, "alb_group_name")
-    certificate_arn = require_state_value(state, "certificate_arn")
-    resolved_efs_id = state.get("resolved_efs_id") or ""
-    efs_mode = state.get("efs_mode") or ""
-    efs_file_system_id_declared = state.get("efs_file_system_id_declared") or ""
+    dns_domain = resolved["dns_domain"]
+    alb_group_name = resolved["alb_group_name"]
+    certificate_arn = resolved["certificate_arn"]
+    resolved_efs_id = resolved["resolved_efs_id"]
+    efs_mode = resolved["efs_mode"]
+    efs_file_system_id_declared = resolved["efs_file_system_id_declared"]
     chart_version = require_state_value(state, "chart_version")
     aws_region = require_env("AWS_REGION")
 
@@ -994,9 +1159,8 @@ def cmd_validate_local(args):
     run(["helm", "lint", str(HELM_CHART_PATH), "--values", values_file, *overrides])
     print("OK: helm lint passed.")
 
-    rendered_dir = REPO_ROOT / "rendered"
-    rendered_dir.mkdir(parents=True, exist_ok=True)
-    rendered_path = rendered_dir / f"{release_name}.yaml"
+    rendered_path = REPO_ROOT / _canonical_rendered_manifest_path(deployment_id)
+    rendered_path.parent.mkdir(parents=True, exist_ok=True)
     template_proc = run(["helm", "template", release_name, str(HELM_CHART_PATH), "--namespace", target_namespace, "--values", values_file, *overrides])
     rendered_path.write_text(template_proc.stdout)
     print(f"Rendered manifest: {rendered_path.relative_to(REPO_ROOT)}")
@@ -1112,10 +1276,14 @@ def cmd_publish_chart(args):
     if not deploy:
         raise Phase5Error(f"Phase 5 reconcile state for {deployment_id} has deploy=false (Validate-mode) -- publish-chart is a Deploy-only AWS/ECR mutation boundary and refuses to run against a Validate state, even when invoked directly. This is defense in depth; the workflow itself already gates this step with matrix.deploy.")
 
-    chart_version = require_state_value(state, "chart_version")
+    chart_version = require_state_value(state, "chart_version")  # already proven canonical by _validate_reconcile_state_identity above
     package_path_rel = require_state_value(state, "package_path")
     helm_push_url = require_state_value(state, "helm_push_url")
     helm_chart_ref = require_state_value(state, "helm_chart_ref")
+
+    # Package/artifact binding -- ALL of this happens BEFORE any AWS/ECR call: exact canonical package path + containment (defeats ../, absolute-path substitution, and symlink escape), then the packaged Chart.yaml/values-deployment.yaml are inspected via stdlib tarfile (never a shell tar) to prove the archive genuinely belongs to THIS runtime's current chart version and values file -- a state file cannot point this job at a different local chart package/version merely by looking otherwise-canonical.
+    resolved_package_path = _validate_package_path_and_containment(package_path_rel, chart_version)
+    _validate_packaged_chart_contents(resolved_package_path, chart_version, environment, deployment_id)
 
     aws_region = require_env("AWS_REGION")
     ecr_registry = require_env("ECR_REGISTRY")
@@ -1130,15 +1298,14 @@ def cmd_publish_chart(args):
     _ensure_ecr_repository(HELM_ECR_REPOSITORY, aws_region)
     _ensure_ecr_repository_policy(HELM_ECR_REPOSITORY, aws_region, argocd_ecr_read_role_arn)
 
-    package_path = REPO_ROOT / package_path_rel
-    run(["helm", "push", str(package_path), helm_push_url])
+    run(["helm", "push", str(resolved_package_path), helm_push_url])
     print(f"Published Helm chart: {helm_chart_ref}:{chart_version}")
 
-    pulled_dir = REPO_ROOT / "pulled"
+    pulled_dir = REPO_ROOT / PULLED_DIRECTORY
     pulled_dir.mkdir(parents=True, exist_ok=True)
-    run(["helm", "pull", helm_chart_ref, "--version", chart_version, "--destination", "pulled"])
+    run(["helm", "pull", helm_chart_ref, "--version", chart_version, "--destination", PULLED_DIRECTORY])
 
-    update_state(args.state_path, {"pulled_directory": "pulled"}, RECONCILE_ALLOWED_STATE_KEYS)
+    update_state(args.state_path, {"pulled_directory": PULLED_DIRECTORY}, RECONCILE_ALLOWED_STATE_KEYS)
     print("OK: GoldenGate runtime Helm chart published to private ECR and verified pullable.")
 
 
@@ -1303,28 +1470,29 @@ def cmd_reconcile_runtime(args):
     deployment_id = require_deployment_id_arg(args.deployment_id)
     state = load_state(args.state_path)
 
-    # State identity/deploy-boolean binding BEFORE _connect_to_eks(), the emergency credential Secret, kubectl apply, or kubectl annotate -- a malformed/cross-runtime state file must result in ZERO Kubernetes calls.
+    # State identity/deploy-boolean binding BEFORE resolved-input validation, _connect_to_eks(), the emergency credential Secret, kubectl apply, or kubectl annotate -- a malformed/cross-runtime state file must result in ZERO Kubernetes calls.
     deploy = _validate_reconcile_state_identity(state, environment, deployment_id)
     if not deploy:
         raise Phase5Error(f"Phase 5 reconcile state for {deployment_id} has deploy=false (Validate-mode) -- reconcile-runtime is a Deploy-only Kubernetes mutation boundary and refuses to run against a Validate state, even when invoked directly.")
 
-    # Only the freshly-recomputed canonical values are ever used for the mutation target itself -- never merely the (already-proven-matching) state-sourced copies.
+    # Resolved-input validation with verify_managed_efs_live=True -- for managed EFS this performs a fresh, read-only STS/EFS re-resolution and requires it to exactly match the persisted resolved_efs_id BEFORE any Kubernetes mutation. Still before _connect_to_eks(): this uses AWS credentials directly, never kubectl.
+    resolved = _validate_resolved_runtime_inputs(state, environment, deployment_id, verify_managed_efs_live=True)
+
+    # Only the freshly-recomputed canonical values are ever used for the mutation target/payload -- never merely the (already-proven-matching) state-sourced copies.
     argocd_app_name = _canonical_argocd_app_name(environment, deployment_id)
     release_name = deployment_id
     target_namespace = require_env("RUNTIME_NAMESPACE")
     ecr_registry = require_env("ECR_REGISTRY")
     helm_chart_ref = f"oci://{ecr_registry}/{HELM_ECR_REPOSITORY}"
-
-    # Mutable runtime results/descriptor-derived values -- never re-derived here; each already has its own authoritative resolution/verification check upstream (resolve-live-inputs/validate-local).
-    chart_version = require_state_value(state, "chart_version")
-    image_repository = require_state_value(state, "image_repository")
-    dns_domain = require_state_value(state, "dns_domain")
-    alb_group_name = require_state_value(state, "alb_group_name")
-    certificate_arn = require_state_value(state, "certificate_arn")
-    admin_secret_name = require_state_value(state, "admin_secret_name")
-    tls_secret_name = require_state_value(state, "tls_secret_name")
-    runtime_service_account_name = require_state_value(state, "runtime_service_account_name")
-    resolved_efs_id = state.get("resolved_efs_id") or ""
+    chart_version = require_state_value(state, "chart_version")  # already proven canonical by _validate_reconcile_state_identity above
+    image_repository = resolved["image_repository"]
+    dns_domain = resolved["dns_domain"]
+    alb_group_name = resolved["alb_group_name"]
+    certificate_arn = resolved["certificate_arn"]
+    admin_secret_name = resolved["admin_secret_name"]
+    tls_secret_name = resolved["tls_secret_name"]
+    runtime_service_account_name = resolved["runtime_service_account_name"]
+    resolved_efs_id = resolved["resolved_efs_id"]
 
     aws_region, _ = _connect_to_eks()
     argocd_namespace = require_env("ARGOCD_NAMESPACE")
@@ -1366,13 +1534,14 @@ def cmd_reconcile_runtime(args):
 # Phase 5B, step 7: post-deploy-diagnostics (AWS credentials required, Deploy only, non-authoritative)
 
 def cmd_post_deploy_diagnostics(args):
-    require_environment_arg(args.environment)
-    require_deployment_id_arg(args.deployment_id)
+    environment = require_environment_arg(args.environment)
+    deployment_id = require_deployment_id_arg(args.deployment_id)
     state = load_state(args.state_path)
-    argocd_app_name = require_state_value(state, "argocd_app_name")
-    target_namespace = require_state_value(state, "target_namespace")
-    environment = require_state_value(state, "environment")
-    deployment_id = require_state_value(state, "deployment_id")
+
+    # Static reconcile-state identity binding BEFORE _connect_to_eks() -- non-authoritative diagnostics must never query/log a different runtime's Application/namespace due to a stale/cross-runtime state file. Only the freshly-recomputed canonical values are used below, never state-sourced copies.
+    _validate_reconcile_state_identity(state, environment, deployment_id)
+    argocd_app_name = _canonical_argocd_app_name(environment, deployment_id)
+    target_namespace = require_env("RUNTIME_NAMESPACE")
 
     _connect_to_eks()
     argocd_namespace = require_env("ARGOCD_NAMESPACE")
