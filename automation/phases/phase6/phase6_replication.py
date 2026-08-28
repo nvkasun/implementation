@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import yaml
@@ -126,9 +127,12 @@ def _render_pipeline(environment, pipeline_id, execution_id, region, namespace, 
 # Rendered-manifest structural validation -- the SAME helper used by both Deploy (before kubectl apply) and Validate (read-only, no cluster access).
 
 def _load_manifest_strict(path):
-    """Loads exactly one YAML mapping document from path via a duplicate-key-rejecting loader -- a rendered manifest containing zero, two, or more documents (an adversarial/malformed render) fails closed here, before any structural field is ever inspected."""
-    with open(path, "rb") as f:
-        raw = f.read()
+    """Loads exactly one YAML mapping document from path via a duplicate-key-rejecting loader -- a rendered manifest containing zero, two, or more documents (an adversarial/malformed render) fails closed here, before any structural field is ever inspected. A missing/unreadable file (e.g. an engine render that silently omitted one of the three expected manifests) fails closed as Phase6Error too, never an uncaught OSError."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError as exc:
+        raise Phase6Error(f"{path} could not be read: {exc}") from exc
     try:
         docs = [d for d in yaml.load_all(raw, Loader=_StrictSafeLoader) if d is not None]
     except _DuplicateKeyError as exc:
@@ -229,8 +233,19 @@ _EXPECTED_VOLUME_MOUNT_PATHS = {"reconciler-script": "/mnt/reconciler", "replica
 _EXPECTED_CONFIGMAP_DATA_KEYS = frozenset({"goldengate-replication.py", "plan.json"})
 
 
+def _render_expected_manifests_for_validation(environment, pipeline_id, execution_id, namespace, region):
+    """Independently re-renders the EXPECTED replication manifests through the SAME current trusted engine CLI (`goldengate-replication.py render-job`) -- never a second reimplementation of job_resource_name()/plan_checksum()/render_job()/render_config_map()/render_secret_provider_class() inside this module -- into a FRESH tempfile.TemporaryDirectory(), never the actual output_dir under validation, so this expected render can never overwrite the evidence being validated. Strict-parses the three expected manifests via the SAME duplicate-key-rejecting _load_manifest_strict() used for the actual manifests, keyed by kind. This is the authoritative proof that NO engine-owned field (execution resource name, plan-checksum annotation, TTL, labels, or any future engine-owned field) has drifted from what the current trusted engine would generate for this EXACT environment/pipeline_id/namespace/region/execution_id -- entirely local; no AWS/kubectl/GoldenGate REST/DB access occurs."""
+    with tempfile.TemporaryDirectory(prefix="phase6-expected-render-") as expected_dir:
+        _render_pipeline(environment, pipeline_id, execution_id, region, namespace, expected_dir)
+        return {
+            "SecretProviderClass": _load_manifest_strict(os.path.join(expected_dir, "secretproviderclass.yaml")),
+            "ConfigMap": _load_manifest_strict(os.path.join(expected_dir, "configmap.yaml")),
+            "Job": _load_manifest_strict(os.path.join(expected_dir, "job.yaml")),
+        }
+
+
 def _validate_rendered_manifests(output_dir, environment, pipeline_id, execution_id, expected_namespace, expected_region):
-    """Structurally validates the three rendered replication reconciliation manifests BEFORE any kubectl apply (Deploy) or as the sole check (Validate). Beyond kind/namespace/shared-name structure, this is now STRONGLY bound to the canonical current replication plan (automation/goldengate-deployment-model.py replication-plan) and the canonical current reconciler source (automation/goldengate-replication.py) -- never inferring trust solely from the rendered files themselves: ConfigMap.data key set is exactly {goldengate-replication.py, plan.json} with plan.json exactly equal to the canonical plan and goldengate-replication.py exactly equal to the current trusted engine source; the SecretProviderClass forbids spec.secretObjects entirely (file-mount-only, never synced into a Kubernetes Secret) and its object/alias list must exactly equal the canonical-plan-derived expectation; the Job forbids env/envFrom entirely and requires the exact fixed worker command, one reconciler container, canonical image/ServiceAccount, and the exact two read-only volumeMounts/volumes. The generic _assert_no_secret_values() scan remains only as defense in depth, never the primary proof. Returns the shared execution resource name. Never re-implements the engine's own render functions -- reads only the files render-job already wrote to output_dir. execution_id is accepted for canonical-context symmetry with the caller's own render invocation, even though this function does not itself need to re-derive the execution name from it."""
+    """Structurally validates the three rendered replication reconciliation manifests BEFORE any kubectl apply (Deploy) or as the sole check (Validate). Beyond kind/namespace/shared-name structure, this is STRONGLY bound to the canonical current replication plan (automation/goldengate-deployment-model.py replication-plan) and the canonical current reconciler source (automation/goldengate-replication.py) -- never inferring trust solely from the rendered files themselves: ConfigMap.data key set is exactly {goldengate-replication.py, plan.json} with plan.json exactly equal to the canonical plan and goldengate-replication.py exactly equal to the current trusted engine source; the SecretProviderClass forbids spec.secretObjects entirely (file-mount-only, never synced into a Kubernetes Secret) and its object/alias list must exactly equal the canonical-plan-derived expectation; the Job forbids env/envFrom entirely and requires the exact fixed worker command, one reconciler container, canonical image/ServiceAccount, and the exact two read-only volumeMounts/volumes. FINAL authoritative proof: environment/pipeline_id/execution_id/expected_namespace/expected_region are used to independently re-render EXPECTED manifests through the SAME current trusted engine CLI (_render_expected_manifests_for_validation()), and each ACTUAL parsed manifest must be exactly dict-equal to its EXPECTED counterpart -- this covers every engine-owned field (execution resource name, plan-checksum annotation, ttlSecondsAfterFinished, labels, and any future field) without Phase 6 ever manually reconstructing job_resource_name()/plan_checksum()'s algorithm. The generic _assert_no_secret_values() scan and the explicit checks above remain defense in depth with clear security-specific error messages; the expected-manifest equality is the FINAL guarantee that no engine-owned field has drifted. Returns the shared execution resource name -- by the time this returns, it has already been proven identical to the current trusted engine's own expected name for this exact pipeline/plan/execution_id. Never re-implements the engine's own render functions -- reads only the files render-job already wrote to output_dir (actual) or to its own fresh temporary directory (expected)."""
     canonical_plan = _load_canonical_replication_plan(environment, pipeline_id)
 
     spc_path = os.path.join(output_dir, "secretproviderclass.yaml")
@@ -368,10 +383,20 @@ def _validate_rendered_manifests(output_dir, environment, pipeline_id, execution
     if (csi.get("volumeAttributes") or {}).get("secretProviderClass") != execution_name:
         raise Phase6Error("Job replication-secrets CSI volume does not reference the execution SecretProviderClass name.")
 
-    # Generic secret-value scan remains only as defense in depth -- the schema/binding checks above are now the authoritative guarantee.
+    # Generic secret-value scan remains only as defense in depth -- the schema/binding checks above are the authoritative guarantee for secret-value injection specifically.
     for doc, doc_path in ((spc, spc_path), (configmap, configmap_path), (job, job_path)):
         _assert_no_secret_values(doc, doc_path)
 
+    # FINAL authoritative proof: an independently, freshly re-rendered EXPECTED manifest set from the SAME current trusted engine, for this EXACT environment/pipeline_id/execution_id/namespace/region -- covers every engine-owned field (execution resource name, plan-checksum annotation, ttlSecondsAfterFinished, labels, and any future field) that the explicit checks above do not individually enumerate, without ever manually reconstructing the engine's own naming/checksum algorithm. Parsed-dictionary equality, never raw-YAML-byte comparison (harmless serialization formatting must never fail this) and never a subset/selected-field comparison.
+    expected = _render_expected_manifests_for_validation(environment, pipeline_id, execution_id, expected_namespace, expected_region)
+    if spc != expected["SecretProviderClass"]:
+        raise Phase6Error(f"{spc_path}: rendered SecretProviderClass is not semantically identical to a fresh render from the current trusted engine for environment={environment!r} pipeline_id={pipeline_id!r} execution_id={execution_id!r} -- refusing to trust a drifted manifest.")
+    if configmap != expected["ConfigMap"]:
+        raise Phase6Error(f"{configmap_path}: rendered ConfigMap is not semantically identical to a fresh render from the current trusted engine for environment={environment!r} pipeline_id={pipeline_id!r} execution_id={execution_id!r} -- refusing to trust a drifted manifest.")
+    if job != expected["Job"]:
+        raise Phase6Error(f"{job_path}: rendered Job is not semantically identical to a fresh render from the current trusted engine for environment={environment!r} pipeline_id={pipeline_id!r} execution_id={execution_id!r} -- refusing to trust a drifted manifest.")
+
+    # execution_name has now been proven identical to the current trusted engine's own expected name (metadata.name is part of the exact Job/ConfigMap/SecretProviderClass equality just enforced above) -- never independently re-derived here.
     return execution_name
 
 

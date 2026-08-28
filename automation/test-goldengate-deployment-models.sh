@@ -17649,6 +17649,221 @@ else
   skip "Phase 6 collision fail-closed + manifest trust-binding: dedicated static assertions -- python3/PyYAML/phase6_replication.py/goldengate-replication.py/goldengate-deployment-model.py unavailable"
 fi
 
+echo "--- Phase 6 Python Conversion: engine-authoritative expected-manifest equality (A-O) ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$PHASE6_REPLICATION_TOOL" ] && [ -f "$REPLICATION_TOOL" ] && [ -f "$DEPLOYMENT_MODEL_TOOL" ]; then
+  PHASE6_EXPECTED_RENDER_CHECK="$(python3 - "$PHASE6_REPLICATION_TOOL" "$REPLICATION_TOOL" "$DEPLOYMENT_MODEL_TOOL" <<'PYEOF'
+import ast
+import importlib.util
+import json
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from unittest import mock
+
+import yaml
+
+tool_path, engine_path, gdm_path = sys.argv[1:4]
+
+spec = importlib.util.spec_from_file_location("phase6_replication", tool_path)
+phase6 = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(phase6)
+
+engine_spec = importlib.util.spec_from_file_location("goldengate_replication", engine_path)
+engine = importlib.util.module_from_spec(engine_spec)
+engine_spec.loader.exec_module(engine)
+
+gdm_spec = importlib.util.spec_from_file_location("goldengate_deployment_model", gdm_path)
+gdm = importlib.util.module_from_spec(gdm_spec)
+gdm_spec.loader.exec_module(gdm)
+
+results = []
+
+
+def check(label, ok):
+    results.append((label, ok))
+
+
+with open(engine_path, "r", encoding="utf-8") as f:
+    REAL_ENGINE_SOURCE = f.read()
+
+PLAN = {
+    "pipelineId": "static-check-pipeline-002", "tlsSecret": "dev/goldengate/tls-certificate",
+    "networkCredentialDomain": "Network", "networkCredentialAlias": "NET_TEST",
+    "source": {
+        "deploymentId": "gg-pg-src-fixture-01", "deploymentType": "postgresql",
+        "runtimeHost": "gg-pg-src-fixture-01.goldengate-dev.adcbmis.local", "serviceAccount": "gg-runtime-sa",
+        "image": "229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-postgresql:23.26.2.0.1",
+        "adminSecret": "dev/goldengate/source/admin", "databaseSecret": "dev/goldengate/databases/static-check-pipeline-002/source",
+        "databaseCredentialAlias": "SRC_ALIAS", "databaseCredentialDomain": "OracleGoldenGate",
+    },
+    "target": {
+        "deploymentId": "gg-mssql-tgt-fixture-01", "deploymentType": "mssql",
+        "runtimeHost": "gg-mssql-tgt-fixture-01.goldengate-dev.adcbmis.local", "serviceAccount": "gg-runtime-sa",
+        "image": "229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-sqlserver:23.26.2.0.1",
+        "adminSecret": "dev/goldengate/target/admin", "databaseSecret": "dev/goldengate/databases/static-check-pipeline-002/target",
+        "databaseCredentialAlias": "TGT_ALIAS", "databaseCredentialDomain": "OracleGoldenGate",
+    },
+    "checkpoint": {"enabled": True, "table": "dbo.gg_checkpoint", "createIfMissing": True},
+    "replicat": {"name": "MSTGT01", "sourceTrailName": "ma", "begin": "now", "startOnCreate": True,
+                 "mappings": [{"source": "public.payments", "target": "dbo.payments"}]},
+    "supplementalLogging": {"objects": ["public.payments"]},
+    "extract": {"name": "PGSRC01", "pluginType": "pgoutput", "begin": "now", "startOnCreate": True,
+                "trail": {"name": "pa", "sizeMB": 500}, "tables": ["public.payments"]},
+    "distribution": {"pathName": "PG2MS01", "sourceTrailName": "pa", "targetTrailName": "ma", "protocol": "wss", "port": 443, "startOnCreate": True},
+}
+
+with open(tool_path) as f:
+    tool_source = f.read()
+tree = ast.parse(tool_source)
+
+
+def fn_source(name):
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
+    return ast.get_source_segment(tool_source, fn) or ""
+
+
+validate_manifests_src = fn_source("_validate_rendered_manifests")
+expected_render_defs = [n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_render_expected_manifests_for_validation"]
+check("A: _validate_rendered_manifests() no longer stops at proving the three resource names merely equal EACH OTHER (also compares against an independently re-rendered expected manifest)", "_render_expected_manifests_for_validation(" in validate_manifests_src)
+
+# B: a fresh trusted engine render is the complete expected-manifest authority -- exactly one such helper, invoking the engine's own render-job CLI, never job_resource_name()/plan_checksum()/render_job()/render_config_map()/render_secret_provider_class() reimplemented locally.
+check("B: exactly one _render_expected_manifests_for_validation() helper is defined", len(expected_render_defs) == 1)
+expected_render_src = fn_source("_render_expected_manifests_for_validation") if expected_render_defs else ""
+check("B: _render_expected_manifests_for_validation() invokes the engine only via _render_pipeline() (its own render-job CLI wrapper), never a locally reimplemented naming/checksum/render algorithm", "_render_pipeline(" in expected_render_src)
+for forbidden in ("def job_resource_name", "def desired_state_name", "def plan_checksum", "def render_job", "def render_secret_provider_class", "def render_config_map"):
+    check(f"B: phase6_replication.py never redefines {forbidden.split()[-1]}(...)", forbidden not in tool_source)
+
+# C: expected render uses a distinct temporary directory, never the actual output_dir under validation.
+expected_render_fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_render_expected_manifests_for_validation")
+expected_render_params = [a.arg for a in expected_render_fn.args.args]
+check("C: _render_expected_manifests_for_validation() uses tempfile.TemporaryDirectory(), never the actual output_dir parameter", "tempfile.TemporaryDirectory(" in expected_render_src and "output_dir" not in expected_render_params)
+
+# D/E/F: actual and expected SPC/ConfigMap/Job are compared by exact parsed-dictionary equality (never subset/selected-field).
+check("D: actual/expected SecretProviderClass compared by exact (!=) dict equality", 'spc != expected["SecretProviderClass"]' in validate_manifests_src)
+check("E: actual/expected ConfigMap compared by exact (!=) dict equality", 'configmap != expected["ConfigMap"]' in validate_manifests_src)
+check("F: actual/expected Job compared by exact (!=) dict equality", 'job != expected["Job"]' in validate_manifests_src)
+
+# G: execution_id is materially consumed by _render_expected_manifests_for_validation(), not merely accepted for symmetry.
+validate_manifests_fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_validate_rendered_manifests")
+validate_manifests_args = [a.arg for a in validate_manifests_fn.args.args]
+check("G: _validate_rendered_manifests() still accepts execution_id as a parameter", "execution_id" in validate_manifests_args)
+check("G: execution_id is passed into _render_expected_manifests_for_validation(...)", "_render_expected_manifests_for_validation(environment, pipeline_id, execution_id" in validate_manifests_src)
+
+# H: an arbitrary shared execution name cannot pass -- confirmed reproduction, behavioral.
+with tempfile.TemporaryDirectory() as tmp:
+    manifests = engine.render_manifests(PLAN, "goldengate-dev", "eu-west-1", REAL_ENGINE_SOURCE, "static-check-exec-2")
+    fake_name = "totally-unrelated-exec"
+    for kind, doc in manifests.items():
+        doc["metadata"]["name"] = fake_name
+    for v in manifests["Job"]["spec"]["template"]["spec"]["volumes"]:
+        if v["name"] == "reconciler-script":
+            v["configMap"]["name"] = fake_name
+        if v["name"] == "replication-secrets":
+            v["csi"]["volumeAttributes"]["secretProviderClass"] = fake_name
+    for kind, doc in manifests.items():
+        with open(f"{tmp}/{kind.lower()}.yaml", "w") as f:
+            yaml.safe_dump(doc, f, sort_keys=False, default_flow_style=False)
+    expected = engine.render_manifests(PLAN, "goldengate-dev", "eu-west-1", REAL_ENGINE_SOURCE, "static-check-exec-2")
+    with mock.patch.object(phase6, "_load_canonical_replication_plan", return_value=PLAN), \
+         mock.patch.object(phase6, "_render_expected_manifests_for_validation", return_value=expected):
+        try:
+            phase6._validate_rendered_manifests(tmp, "dev", PLAN["pipelineId"], "static-check-exec-2", "goldengate-dev", "eu-west-1")
+            arbitrary_name_ok = False
+        except phase6.Phase6Error:
+            arbitrary_name_ok = True
+check("H: confirmed reproduction -- an arbitrary shared execution name ('totally-unrelated-exec') consistently applied to all three resources (and the Job's own ConfigMap/SecretProviderClass references) now fails", arbitrary_name_ok)
+
+# I: Job TTL drift cannot pass -- confirmed reproduction.
+with tempfile.TemporaryDirectory() as tmp:
+    manifests = engine.render_manifests(PLAN, "goldengate-dev", "eu-west-1", REAL_ENGINE_SOURCE, "static-check-exec-3")
+    manifests["Job"]["spec"]["ttlSecondsAfterFinished"] = 0
+    for kind, doc in manifests.items():
+        with open(f"{tmp}/{kind.lower()}.yaml", "w") as f:
+            yaml.safe_dump(doc, f, sort_keys=False, default_flow_style=False)
+    expected = engine.render_manifests(PLAN, "goldengate-dev", "eu-west-1", REAL_ENGINE_SOURCE, "static-check-exec-3")
+    with mock.patch.object(phase6, "_load_canonical_replication_plan", return_value=PLAN), \
+         mock.patch.object(phase6, "_render_expected_manifests_for_validation", return_value=expected):
+        try:
+            phase6._validate_rendered_manifests(tmp, "dev", PLAN["pipelineId"], "static-check-exec-3", "goldengate-dev", "eu-west-1")
+            ttl_ok = False
+        except phase6.Phase6Error:
+            ttl_ok = True
+check("I: confirmed reproduction -- Job spec.ttlSecondsAfterFinished changed to 0 now fails", ttl_ok)
+
+# J: plan-checksum annotation drift cannot pass -- confirmed reproduction.
+with tempfile.TemporaryDirectory() as tmp:
+    manifests = engine.render_manifests(PLAN, "goldengate-dev", "eu-west-1", REAL_ENGINE_SOURCE, "static-check-exec-4")
+    manifests["Job"]["metadata"]["annotations"]["goldengate.adcb/plan-checksum"] = "deadbeef"
+    for kind, doc in manifests.items():
+        with open(f"{tmp}/{kind.lower()}.yaml", "w") as f:
+            yaml.safe_dump(doc, f, sort_keys=False, default_flow_style=False)
+    expected = engine.render_manifests(PLAN, "goldengate-dev", "eu-west-1", REAL_ENGINE_SOURCE, "static-check-exec-4")
+    with mock.patch.object(phase6, "_load_canonical_replication_plan", return_value=PLAN), \
+         mock.patch.object(phase6, "_render_expected_manifests_for_validation", return_value=expected):
+        try:
+            phase6._validate_rendered_manifests(tmp, "dev", PLAN["pipelineId"], "static-check-exec-4", "goldengate-dev", "eu-west-1")
+            checksum_ok = False
+        except phase6.Phase6Error:
+            checksum_ok = True
+check("J: confirmed reproduction -- Job metadata.annotations['goldengate.adcb/plan-checksum'] changed to 'deadbeef' now fails", checksum_ok)
+
+# K: Job/pod label drift cannot pass.
+with tempfile.TemporaryDirectory() as tmp:
+    manifests = engine.render_manifests(PLAN, "goldengate-dev", "eu-west-1", REAL_ENGINE_SOURCE, "static-check-exec-5")
+    manifests["Job"]["spec"]["template"]["metadata"]["labels"]["app.kubernetes.io/component"] = "something-else"
+    for kind, doc in manifests.items():
+        with open(f"{tmp}/{kind.lower()}.yaml", "w") as f:
+            yaml.safe_dump(doc, f, sort_keys=False, default_flow_style=False)
+    expected = engine.render_manifests(PLAN, "goldengate-dev", "eu-west-1", REAL_ENGINE_SOURCE, "static-check-exec-5")
+    with mock.patch.object(phase6, "_load_canonical_replication_plan", return_value=PLAN), \
+         mock.patch.object(phase6, "_render_expected_manifests_for_validation", return_value=expected):
+        try:
+            phase6._validate_rendered_manifests(tmp, "dev", PLAN["pipelineId"], "static-check-exec-5", "goldengate-dev", "eu-west-1")
+            label_ok = False
+        except phase6.Phase6Error:
+            label_ok = True
+check("K: confirmed reproduction -- Job pod-template metadata.labels drift now fails", label_ok)
+
+# L: exact comparison completes before collision preflight (_reconcile_one_pipeline() ordering).
+reconcile_one_src = fn_source("_reconcile_one_pipeline")
+validate_call_index = reconcile_one_src.find("_validate_rendered_manifests(")
+collision_call_index = reconcile_one_src.find("_collision_preflight(")
+check("L: _reconcile_one_pipeline() still calls _validate_rendered_manifests() (now including the expected-render equality proof) strictly BEFORE _collision_preflight()", -1 not in (validate_call_index, collision_call_index) and validate_call_index < collision_call_index)
+
+# M: manifest mismatch produces zero Kubernetes mutation -- confirmed via the arbitrary-name reproduction above extended through the real _collision_preflight()/_apply_manifest() call chain (already proven behaviorally by the H/I/J/K reproductions never reaching the collision/apply code path at all, since _validate_rendered_manifests() raises first).
+check("M: manifest mismatch (H/I/J/K reproductions) never reaches _collision_preflight()/_apply_manifest() -- validated by construction, since Phase6Error is raised entirely inside _validate_rendered_manifests() before either is ever called", validate_call_index < collision_call_index)
+
+# N: goldengate-replication.py remains unchanged by this correction.
+git_diff = subprocess.run(["git", "diff", "--quiet", "--", engine_path], cwd=Path(tool_path).resolve().parents[3])
+check("N: automation/goldengate-replication.py has no working-tree diff (byte-for-byte unchanged by this correction)", git_diff.returncode == 0)
+
+# O: current descriptors remain replication.enabled=false.
+active, inactive, invalid = gdm.scan("dev")
+check("O: scan(dev) has no invalid descriptors", invalid == [])
+by_id = {d["deploymentId"]: d for d in active + inactive}
+check("O: gg-postgresql-repltest-01 remains replication.enabled=false", by_id.get("gg-postgresql-repltest-01", {}).get("replicationEnabled") is False)
+check("O: gg-mssql-repltest-01 remains replication.enabled=false", by_id.get("gg-mssql-repltest-01", {}).get("replicationEnabled") is False)
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  echo "$PHASE6_EXPECTED_RENDER_CHECK"
+  if [ -z "$(echo "$PHASE6_EXPECTED_RENDER_CHECK" | grep '^FAIL ' || true)" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        OK\ *) pass "Phase 6 engine-authoritative expected-manifest equality: ${line#OK }" ;;
+      esac
+    done <<< "$PHASE6_EXPECTED_RENDER_CHECK"
+  else
+    fail "Phase 6 engine-authoritative expected-manifest equality: dedicated static assertions failed:"$'\n'"${PHASE6_EXPECTED_RENDER_CHECK}"
+  fi
+else
+  skip "Phase 6 engine-authoritative expected-manifest equality: dedicated static assertions -- python3/PyYAML/phase6_replication.py/goldengate-replication.py/goldengate-deployment-model.py unavailable"
+fi
+
 echo "--- Final repository handoff hygiene sweep (VDR pre-transfer cleanliness) ---"
 
 # This is the LAST check in the suite, deliberately: earlier sections legitimately regenerate work/generated/dev/goldengate-deployments.yaml (the folder-driven registry-generation checks) as their own tested behavior -- asserting its absence any earlier would be a self-defeating mid-test assertion. Self-heal only the categories PROVEN elsewhere in this suite to be pure, expected byproducts of exercising real application/tooling behavior (never silently deleting anything whose origin is unknown); everything else must already be absent, or this check fails closed and reports it for a human to investigate before VDR handoff.

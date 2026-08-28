@@ -140,6 +140,16 @@ def _extract_arg(argv, flag):
     return argv[argv.index(flag) + 1]
 
 
+def _is_expected_render_call(argv):
+    """_validate_rendered_manifests() now independently re-renders EXPECTED manifests (via _render_expected_manifests_for_validation()) into its own tempfile.TemporaryDirectory() -- distinguishable from the ACTUAL render's --output-dir (always REPO_ROOT/work/replication/<pipeline>/<execution>) by its "phase6-expected-render-" tempdir prefix."""
+    return _is_render_job_call(argv) and "phase6-expected-render-" in _extract_arg(argv, "--output-dir")
+
+
+def _is_actual_render_call(argv):
+    """The render-job call for the manifests actually being reconciled/applied -- as opposed to the SECOND, independent 'expected' re-render _validate_rendered_manifests() now performs as its final authoritative proof (see _is_expected_render_call())."""
+    return _is_render_job_call(argv) and not _is_expected_render_call(argv)
+
+
 def _validate_ok(_argv):
     return FakeProc(0, f"OK: {ENVIRONMENT} deployment descriptors are valid")
 
@@ -237,11 +247,19 @@ def _dump_yaml(path, doc):
         yaml.safe_dump(doc, f, sort_keys=False, default_flow_style=False)
 
 
-def _validate_with_canonical_plan(output_dir, environment=ENVIRONMENT, pipeline_id=None, execution_id="test-exec-1", namespace=NAMESPACE, region=AWS_REGION_VALUE, plan=None):
-    """Calls phase6._validate_rendered_manifests() with _load_canonical_replication_plan() mocked to return the given (or PLAN's own) canonical plan directly -- avoids re-scripting a full goldengate-deployment-model.py replication-plan subprocess call for every structural-validation test; the dedicated CanonicalPlanBindingTests class below exercises that subprocess contract directly."""
+def _expected_manifests_fixture(plan=None, namespace=NAMESPACE, region=AWS_REGION_VALUE, execution_id="test-exec-1"):
+    """Renders a FRESH manifest set via the REAL engine -- mirroring exactly what phase6._render_expected_manifests_for_validation() would independently re-render for these inputs -- for use as its mocked return value. Deliberately a SEPARATE engine.render_manifests() call (never the same in-memory object the actual manifests came from), so a test that mutates only the ACTUAL on-disk files still exercises a genuinely independent expected comparison."""
+    plan = plan or PLAN
+    return engine.render_manifests(plan, namespace, region, REAL_ENGINE_SOURCE, execution_id)
+
+
+def _validate_with_canonical_plan(output_dir, environment=ENVIRONMENT, pipeline_id=None, execution_id="test-exec-1", namespace=NAMESPACE, region=AWS_REGION_VALUE, plan=None, expected_plan=None):
+    """Calls phase6._validate_rendered_manifests() with _load_canonical_replication_plan() mocked to return the given (or PLAN's own) canonical plan directly, and _render_expected_manifests_for_validation() mocked to a FRESH engine render using expected_plan (defaults to the SAME plan) -- avoids re-scripting a full goldengate-deployment-model.py replication-plan / goldengate-replication.py render-job subprocess call for every structural-validation test. The dedicated CanonicalPlanBindingTests class below exercises the plan subprocess contract directly; ExpectedManifestAuthorityTests exercises the expected-render contract directly."""
     plan = plan or PLAN
     pipeline_id = pipeline_id or plan["pipelineId"]
-    with mock.patch.object(phase6, "_load_canonical_replication_plan", return_value=plan):
+    expected = _expected_manifests_fixture(plan=expected_plan or plan, namespace=namespace, region=region, execution_id=execution_id)
+    with mock.patch.object(phase6, "_load_canonical_replication_plan", return_value=plan), \
+         mock.patch.object(phase6, "_render_expected_manifests_for_validation", return_value=expected):
         return phase6._validate_rendered_manifests(output_dir, environment, pipeline_id, execution_id, namespace, region)
 
 
@@ -645,9 +663,10 @@ class WaitFailureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(phase6.Phase6Error):
                 self._run_reconcile(tmp, scripted, pipeline_ids=("pipeline-a", "pipeline-b"))
-        render_calls = [c for c in scripted.calls if _is_render_job_call(c["argv"])]
+        render_calls = [c for c in scripted.calls if _is_actual_render_call(c["argv"])]
         self.assertEqual(len(render_calls), 1, "pipeline-b must never be rendered once pipeline-a's Job wait times out")
         self.assertIn("pipeline-a", render_calls[0]["argv"])
+        self.assertTrue(all("pipeline-a" in c["argv"] for c in scripted.calls if _is_render_job_call(c["argv"])), "pipeline-b must never be rendered (actual OR expected) once pipeline-a's Job wait times out")
 
 
 class SuccessCleanupTests(unittest.TestCase):
@@ -698,12 +717,13 @@ class SequentialOrderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.object(phase6, "REPO_ROOT", Path(tmp)), mock.patch.object(phase6, "run", scripted), _env_patch():
                 _run_quiet(phase6.cmd_reconcile, argparse_namespace(environment=ENVIRONMENT, execution_id="1-1"))
-        render_calls = [c["argv"] for c in scripted.calls if _is_render_job_call(c["argv"])]
+        render_calls = [c["argv"] for c in scripted.calls if _is_actual_render_call(c["argv"])]
         self.assertEqual(len(render_calls), 2)
         self.assertIn("pipeline-a", render_calls[0])
         self.assertIn("pipeline-b", render_calls[1])
-        # pipeline-a's own full cleanup (its three delete calls) must precede pipeline-b's render call -- never interleaved/parallel.
-        b_render_index = next(i for i, c in enumerate(scripted.calls) if _is_render_job_call(c["argv"]) and "pipeline-b" in c["argv"])
+        self.assertEqual(len([c for c in scripted.calls if _is_render_job_call(c["argv"])]), 4, "each pipeline now renders twice: once actual, once as the final expected-manifest authority")
+        # pipeline-a's own full cleanup (its three delete calls) must precede pipeline-b's ACTUAL render call -- never interleaved/parallel.
+        b_render_index = next(i for i, c in enumerate(scripted.calls) if _is_actual_render_call(c["argv"]) and "pipeline-b" in c["argv"])
         delete_indexes_before_b = [i for i, c in enumerate(scripted.calls) if c["argv"][:2] == ["kubectl", "delete"] and i < b_render_index]
         self.assertEqual(len(delete_indexes_before_b), 3, "pipeline-a's full cleanup (3 deletes) must complete before pipeline-b is ever rendered")
 
@@ -714,9 +734,10 @@ class SequentialOrderTests(unittest.TestCase):
             with mock.patch.object(phase6, "REPO_ROOT", Path(tmp)), mock.patch.object(phase6, "run", scripted), _env_patch():
                 with self.assertRaises(phase6.Phase6Error):
                     _run_quiet(phase6.cmd_reconcile, argparse_namespace(environment=ENVIRONMENT, execution_id="1-1"))
-        render_calls = [c["argv"] for c in scripted.calls if _is_render_job_call(c["argv"])]
+        render_calls = [c["argv"] for c in scripted.calls if _is_actual_render_call(c["argv"])]
         self.assertEqual(len(render_calls), 1)
         self.assertIn("pipeline-a", render_calls[0])
+        self.assertTrue(all("pipeline-a" in c["argv"] for c in scripted.calls if _is_render_job_call(c["argv"])), "pipeline-b must never be rendered (actual OR expected) once pipeline-a's collision preflight fails")
 
 
 class ValidateModeTests(unittest.TestCase):
@@ -738,8 +759,9 @@ class ValidateModeTests(unittest.TestCase):
             with mock.patch.object(phase6, "REPO_ROOT", Path(tmp)), mock.patch.object(phase6, "run", scripted), _env_patch():
                 result = _run_quiet(phase6.cmd_validate_local, argparse_namespace(environment=ENVIRONMENT))
         self.assertEqual(result, 0)
-        render_calls = [c["argv"] for c in scripted.calls if _is_render_job_call(c["argv"])]
+        render_calls = [c["argv"] for c in scripted.calls if _is_actual_render_call(c["argv"])]
         self.assertEqual(len(render_calls), 1)
+        self.assertEqual(len([c for c in scripted.calls if _is_render_job_call(c["argv"])]), 2, "the actual dry-run render plus the final expected-manifest authority render")
 
     def test_51_dry_run_uses_deterministic_execution_id(self):
         scripted = _standard_deploy_scripted(pipeline_ids=("fabricated-pipeline-001",))
@@ -928,7 +950,9 @@ class CanonicalPlanBindingTests(unittest.TestCase):
     def _validate_against_canonical(self, tmp, canonical_plan, rendered_plan=None):
         rendered_plan = rendered_plan if rendered_plan is not None else canonical_plan
         _write_manifests(plan=rendered_plan, tmp_dir=tmp, execution_id="test-exec-1")
-        with mock.patch.object(phase6, "_load_canonical_replication_plan", return_value=canonical_plan):
+        expected = _expected_manifests_fixture(plan=canonical_plan, execution_id="test-exec-1")
+        with mock.patch.object(phase6, "_load_canonical_replication_plan", return_value=canonical_plan), \
+             mock.patch.object(phase6, "_render_expected_manifests_for_validation", return_value=expected):
             return phase6._validate_rendered_manifests(tmp, ENVIRONMENT, canonical_plan["pipelineId"], "test-exec-1", NAMESPACE, AWS_REGION_VALUE)
 
     def test_74_valid_configmap_plan_json_equals_canonical_plan_passes(self):
@@ -1009,7 +1033,9 @@ class ConfigMapContractTests(unittest.TestCase):
 
     def _validate(self, tmp, plan=None):
         plan = plan or PLAN
-        with mock.patch.object(phase6, "_load_canonical_replication_plan", return_value=plan):
+        expected = _expected_manifests_fixture(plan=plan, execution_id="test-exec-1")
+        with mock.patch.object(phase6, "_load_canonical_replication_plan", return_value=plan), \
+             mock.patch.object(phase6, "_render_expected_manifests_for_validation", return_value=expected):
             return phase6._validate_rendered_manifests(tmp, ENVIRONMENT, plan["pipelineId"], "test-exec-1", NAMESPACE, AWS_REGION_VALUE)
 
     def test_84_exact_two_configmap_keys_passes(self):
@@ -1073,7 +1099,9 @@ class SecretProviderClassContractTests(unittest.TestCase):
             spc = _load_yaml(spc_path)
             mutate_spc(spc)
             _dump_yaml(spc_path, spc)
-        with mock.patch.object(phase6, "_load_canonical_replication_plan", return_value=plan):
+        expected = _expected_manifests_fixture(plan=plan, execution_id="test-exec-1")
+        with mock.patch.object(phase6, "_load_canonical_replication_plan", return_value=plan), \
+             mock.patch.object(phase6, "_render_expected_manifests_for_validation", return_value=expected):
             return phase6._validate_rendered_manifests(tmp, ENVIRONMENT, plan["pipelineId"], "test-exec-1", NAMESPACE, AWS_REGION_VALUE)
 
     @staticmethod
@@ -1200,7 +1228,9 @@ class JobExactContractTests(unittest.TestCase):
             job = _load_yaml(job_path)
             mutate_job(job)
             _dump_yaml(job_path, job)
-        with mock.patch.object(phase6, "_load_canonical_replication_plan", return_value=plan):
+        expected = _expected_manifests_fixture(plan=plan, execution_id="test-exec-1")
+        with mock.patch.object(phase6, "_load_canonical_replication_plan", return_value=plan), \
+             mock.patch.object(phase6, "_render_expected_manifests_for_validation", return_value=expected):
             return phase6._validate_rendered_manifests(tmp, ENVIRONMENT, plan["pipelineId"], "test-exec-1", NAMESPACE, AWS_REGION_VALUE)
 
     def test_105_canonical_command_passes(self):
@@ -1221,11 +1251,13 @@ class JobExactContractTests(unittest.TestCase):
             with self.assertRaises(phase6.Phase6Error):
                 self._render_and_validate(tmp, mutate_job=_mutate)
 
-    def test_108_empty_args_still_passes(self):
+    def test_108_an_added_empty_args_field_now_fails_the_final_expected_manifest_equality(self):
+        """The specific 'container.args must be absent or empty' business check tolerates an empty list on its own, but the current trusted engine's render never adds an args key at all -- the FINAL expected-manifest equality check (the authoritative proof introduced by this task) is stricter than any single field check and rejects this deviation too, exactly as intended: the trusted engine, not a per-field allowlist, decides the complete expected manifest."""
         def _mutate(job):
             job["spec"]["template"]["spec"]["containers"][0]["args"] = []
         with tempfile.TemporaryDirectory() as tmp:
-            self._render_and_validate(tmp, mutate_job=_mutate)
+            with self.assertRaises(phase6.Phase6Error):
+                self._render_and_validate(tmp, mutate_job=_mutate)
 
     def test_109_confirmed_reproduction_literal_env_db_password_fails(self):
         """Confirmed reproduction: a Job container env entry {name: DB_PASSWORD, value: hunter2-actual-secret} previously returned SUCCESS (its mapping keys are name/value, not "password") -- now env is forbidden entirely, regardless of key naming."""
@@ -1358,6 +1390,273 @@ class DeployValidateParityTests(unittest.TestCase):
                 with self.assertRaises(phase6.Phase6Error):
                     _run_quiet(phase6.cmd_reconcile, argparse_namespace(environment=ENVIRONMENT, execution_id="1-1"))
         self.assertEqual([c for c in scripted.calls if c["argv"][:2] == ["kubectl", "apply"]], [])
+
+
+class ExpectedManifestAuthorityTests(unittest.TestCase):
+    """The FINAL authoritative proof this task adds: actual rendered manifests must be exactly semantically identical (parsed-dict equality, never a selected-field/subset comparison) to a FRESH re-render from the current trusted engine for the SAME environment/pipeline_id/execution_id/namespace/region -- covers execution resource naming, plan-checksum annotation, ttlSecondsAfterFinished, labels, and any future engine-owned field, without Phase 6 ever manually reconstructing job_resource_name()/plan_checksum()."""
+
+    def _missing_expected_file_scripted(self, missing_kind):
+        def _fn(argv):
+            output_dir = _extract_arg(argv, "--output-dir")
+            if "phase6-expected-render-" in output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+                effective_plan = _plan_for_pipeline_id(PLAN, argv[-1])
+                manifests = engine.render_manifests(effective_plan, _extract_arg(argv, "--namespace"), _extract_arg(argv, "--region"), REAL_ENGINE_SOURCE, _extract_arg(argv, "--execution-id"))
+                for kind, doc in manifests.items():
+                    if kind.lower() == missing_kind:
+                        continue
+                    with open(os.path.join(output_dir, f"{kind.lower()}.yaml"), "w") as f:
+                        yaml.safe_dump(doc, f, sort_keys=False, default_flow_style=False)
+                return FakeProc(0, "")
+            return _render_job_side_effect(PLAN)(argv)
+
+        scripted = ScriptedRun()
+        scripted.when(_is_validate_call, _validate_ok)
+        scripted.when(_is_pipelines_call, _pipelines_response(["fabricated-pipeline-001"]))
+        scripted.when(_is_replication_plan_call, _replication_plan_response(PLAN))
+        scripted.when(_is_render_job_call, _fn)
+        return scripted
+
+    def test_122_actual_equals_fresh_expected_render_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_manifests(tmp_dir=tmp, execution_id="test-exec-1")
+            execution_name = _validate_with_canonical_plan(tmp, execution_id="test-exec-1")
+        self.assertTrue(execution_name)
+
+    def test_123_confirmed_reproduction_arbitrary_shared_execution_name_fails(self):
+        """Confirmed reproduction: all three actual resource names consistently renamed to "totally-unrelated-exec" (with the Job's own ConfigMap/SecretProviderClass volume references updated to match) previously returned SUCCESS from the retired name-only-shared-with-itself check -- now fails because that name no longer matches the engine-authoritative expected render."""
+        fake_name = "totally-unrelated-exec"
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_manifests(tmp_dir=tmp, execution_id="test-exec-1")
+            for kind in ("secretproviderclass", "configmap", "job"):
+                path = os.path.join(tmp, f"{kind}.yaml")
+                doc = _load_yaml(path)
+                doc["metadata"]["name"] = fake_name
+                _dump_yaml(path, doc)
+            job_path = os.path.join(tmp, "job.yaml")
+            job = _load_yaml(job_path)
+            for v in job["spec"]["template"]["spec"]["volumes"]:
+                if v["name"] == "reconciler-script":
+                    v["configMap"]["name"] = fake_name
+                if v["name"] == "replication-secrets":
+                    v["csi"]["volumeAttributes"]["secretProviderClass"] = fake_name
+            _dump_yaml(job_path, job)
+            with self.assertRaises(phase6.Phase6Error):
+                _validate_with_canonical_plan(tmp, execution_id="test-exec-1")
+
+    def test_124_arbitrary_shared_execution_name_zero_kubectl_through_full_reconcile(self):
+        fake_name = "totally-unrelated-exec"
+
+        def _renamed_render(argv):
+            result = _render_job_side_effect(PLAN)(argv)
+            output_dir = _extract_arg(argv, "--output-dir")
+            if "phase6-expected-render-" not in output_dir:
+                for kind in ("secretproviderclass", "configmap", "job"):
+                    path = os.path.join(output_dir, f"{kind}.yaml")
+                    doc = _load_yaml(path)
+                    doc["metadata"]["name"] = fake_name
+                    _dump_yaml(path, doc)
+                job_path = os.path.join(output_dir, "job.yaml")
+                job = _load_yaml(job_path)
+                for v in job["spec"]["template"]["spec"]["volumes"]:
+                    if v["name"] == "reconciler-script":
+                        v["configMap"]["name"] = fake_name
+                    if v["name"] == "replication-secrets":
+                        v["csi"]["volumeAttributes"]["secretProviderClass"] = fake_name
+                _dump_yaml(job_path, job)
+            return result
+
+        scripted = _standard_deploy_scripted(pipeline_ids=("fabricated-pipeline-001",))
+        scripted.when(_is_render_job_call, _renamed_render)
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(phase6, "REPO_ROOT", Path(tmp)), mock.patch.object(phase6, "run", scripted), _env_patch():
+                with self.assertRaises(phase6.Phase6Error):
+                    _run_quiet(phase6.cmd_reconcile, argparse_namespace(environment=ENVIRONMENT, execution_id="1-1"))
+        self.assertEqual([c for c in scripted.calls if c["argv"][:1] == ["kubectl"]], [])
+
+    def test_125_different_execution_id_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_manifests(tmp_dir=tmp, execution_id="111-1")
+            with self.assertRaises(phase6.Phase6Error):
+                _validate_with_canonical_plan(tmp, execution_id="222-1")
+
+    def test_126_different_run_attempt_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_manifests(tmp_dir=tmp, execution_id="12345-1")
+            with self.assertRaises(phase6.Phase6Error):
+                _validate_with_canonical_plan(tmp, execution_id="12345-2")
+
+    def test_127_dry_run_manifest_with_live_run_name_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_manifests(tmp_dir=tmp, execution_id=phase6.DRY_RUN_EXECUTION_ID)
+            with self.assertRaises(phase6.Phase6Error):
+                _validate_with_canonical_plan(tmp, execution_id="12345-1")
+
+    def test_128_live_run_manifest_with_dry_run_name_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_manifests(tmp_dir=tmp, execution_id="12345-1")
+            with self.assertRaises(phase6.Phase6Error):
+                _validate_with_canonical_plan(tmp, execution_id=phase6.DRY_RUN_EXECUTION_ID)
+
+    def test_129_confirmed_reproduction_ttl_seconds_after_finished_drift_fails(self):
+        """Confirmed reproduction: Job spec.ttlSecondsAfterFinished changed to 0 previously returned SUCCESS -- now fails via the final expected-manifest equality."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_manifests(tmp_dir=tmp, execution_id="test-exec-1")
+            job_path = os.path.join(tmp, "job.yaml")
+            job = _load_yaml(job_path)
+            job["spec"]["ttlSecondsAfterFinished"] = 0
+            _dump_yaml(job_path, job)
+            with self.assertRaises(phase6.Phase6Error):
+                _validate_with_canonical_plan(tmp, execution_id="test-exec-1")
+
+    def test_130_confirmed_reproduction_plan_checksum_annotation_drift_fails(self):
+        """Confirmed reproduction: Job metadata.annotations["goldengate.adcb/plan-checksum"] changed to "deadbeef" previously returned SUCCESS -- now fails via the final expected-manifest equality."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_manifests(tmp_dir=tmp, execution_id="test-exec-1")
+            job_path = os.path.join(tmp, "job.yaml")
+            job = _load_yaml(job_path)
+            job["metadata"]["annotations"]["goldengate.adcb/plan-checksum"] = "deadbeef"
+            _dump_yaml(job_path, job)
+            with self.assertRaises(phase6.Phase6Error):
+                _validate_with_canonical_plan(tmp, execution_id="test-exec-1")
+
+    def test_131_job_metadata_labels_drift_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_manifests(tmp_dir=tmp, execution_id="test-exec-1")
+            job_path = os.path.join(tmp, "job.yaml")
+            job = _load_yaml(job_path)
+            job["metadata"]["labels"]["app.kubernetes.io/component"] = "something-else"
+            _dump_yaml(job_path, job)
+            with self.assertRaises(phase6.Phase6Error):
+                _validate_with_canonical_plan(tmp, execution_id="test-exec-1")
+
+    def test_132_job_pod_template_labels_drift_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_manifests(tmp_dir=tmp, execution_id="test-exec-1")
+            job_path = os.path.join(tmp, "job.yaml")
+            job = _load_yaml(job_path)
+            job["spec"]["template"]["metadata"]["labels"]["app.kubernetes.io/component"] = "something-else"
+            _dump_yaml(job_path, job)
+            with self.assertRaises(phase6.Phase6Error):
+                _validate_with_canonical_plan(tmp, execution_id="test-exec-1")
+
+    def test_133_extra_job_metadata_annotation_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_manifests(tmp_dir=tmp, execution_id="test-exec-1")
+            job_path = os.path.join(tmp, "job.yaml")
+            job = _load_yaml(job_path)
+            job["metadata"]["annotations"]["harmless-looking/note"] = "just a note"
+            _dump_yaml(job_path, job)
+            with self.assertRaises(phase6.Phase6Error):
+                _validate_with_canonical_plan(tmp, execution_id="test-exec-1")
+
+    def test_134_extra_configmap_metadata_label_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_manifests(tmp_dir=tmp, execution_id="test-exec-1")
+            configmap_path = os.path.join(tmp, "configmap.yaml")
+            configmap = _load_yaml(configmap_path)
+            configmap["metadata"].setdefault("labels", {})["harmless-looking-label"] = "value"
+            _dump_yaml(configmap_path, configmap)
+            with self.assertRaises(phase6.Phase6Error):
+                _validate_with_canonical_plan(tmp, execution_id="test-exec-1")
+
+    def test_135_extra_spc_metadata_label_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_manifests(tmp_dir=tmp, execution_id="test-exec-1")
+            spc_path = os.path.join(tmp, "secretproviderclass.yaml")
+            spc = _load_yaml(spc_path)
+            spc["metadata"].setdefault("labels", {})["harmless-looking-label"] = "value"
+            _dump_yaml(spc_path, spc)
+            with self.assertRaises(phase6.Phase6Error):
+                _validate_with_canonical_plan(tmp, execution_id="test-exec-1")
+
+    def test_136_future_engine_owned_field_automatically_enforced_without_phase6_change(self):
+        """Demonstrates that Phase 6 never needs a manually-added field-specific check for a NEW engine-owned field -- a fabricated 'expected' render carrying an extra hypothetical future field the actual manifest lacks is enough, on its own, to fail the final equality check."""
+        with tempfile.TemporaryDirectory() as tmp:
+            manifests = _write_manifests(tmp_dir=tmp, execution_id="test-exec-1")
+            fabricated_expected = {kind: json.loads(json.dumps(doc)) for kind, doc in manifests.items()}
+            fabricated_expected["Job"]["metadata"].setdefault("labels", {})["future.engine.owned/field"] = "some-future-value"
+            with mock.patch.object(phase6, "_load_canonical_replication_plan", return_value=PLAN), \
+                 mock.patch.object(phase6, "_render_expected_manifests_for_validation", return_value=fabricated_expected):
+                with self.assertRaises(phase6.Phase6Error):
+                    phase6._validate_rendered_manifests(tmp, ENVIRONMENT, PLAN["pipelineId"], "test-exec-1", NAMESPACE, AWS_REGION_VALUE)
+
+    def test_137_expected_render_subprocess_failure_fails_closed_zero_kubectl(self):
+        def _fail_expected_render(argv):
+            output_dir = _extract_arg(argv, "--output-dir")
+            if "phase6-expected-render-" in output_dir:
+                return FakeProc(1, "", "engine render-job failed")
+            return _render_job_side_effect(PLAN)(argv)
+
+        scripted = _standard_deploy_scripted(pipeline_ids=("fabricated-pipeline-001",))
+        scripted.when(_is_render_job_call, _fail_expected_render)
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(phase6, "REPO_ROOT", Path(tmp)), mock.patch.object(phase6, "run", scripted), _env_patch():
+                with self.assertRaises(phase6.Phase6Error):
+                    _run_quiet(phase6.cmd_reconcile, argparse_namespace(environment=ENVIRONMENT, execution_id="1-1"))
+        self.assertEqual([c for c in scripted.calls if c["argv"][:1] == ["kubectl"]], [])
+
+    def test_138_expected_render_malformed_yaml_fails(self):
+        def _malformed_expected_render(argv):
+            output_dir = _extract_arg(argv, "--output-dir")
+            if "phase6-expected-render-" in output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+                for kind in ("secretproviderclass", "configmap", "job"):
+                    with open(os.path.join(output_dir, f"{kind}.yaml"), "w") as f:
+                        f.write("kind: X\nkind: X\n")
+                return FakeProc(0, "")
+            return _render_job_side_effect(PLAN)(argv)
+
+        scripted = ScriptedRun()
+        scripted.when(_is_validate_call, _validate_ok)
+        scripted.when(_is_pipelines_call, _pipelines_response(["fabricated-pipeline-001"]))
+        scripted.when(_is_replication_plan_call, _replication_plan_response(PLAN))
+        scripted.when(_is_render_job_call, _malformed_expected_render)
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(phase6, "REPO_ROOT", Path(tmp)), mock.patch.object(phase6, "run", scripted), _env_patch():
+                with self.assertRaises(phase6.Phase6Error):
+                    _run_quiet(phase6.cmd_validate_local, argparse_namespace(environment=ENVIRONMENT))
+
+    def test_139_expected_render_missing_spc_fails(self):
+        scripted = self._missing_expected_file_scripted("secretproviderclass")
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(phase6, "REPO_ROOT", Path(tmp)), mock.patch.object(phase6, "run", scripted), _env_patch():
+                with self.assertRaises(phase6.Phase6Error):
+                    _run_quiet(phase6.cmd_validate_local, argparse_namespace(environment=ENVIRONMENT))
+
+    def test_140_expected_render_missing_configmap_fails(self):
+        scripted = self._missing_expected_file_scripted("configmap")
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(phase6, "REPO_ROOT", Path(tmp)), mock.patch.object(phase6, "run", scripted), _env_patch():
+                with self.assertRaises(phase6.Phase6Error):
+                    _run_quiet(phase6.cmd_validate_local, argparse_namespace(environment=ENVIRONMENT))
+
+    def test_141_expected_render_missing_job_fails(self):
+        scripted = self._missing_expected_file_scripted("job")
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(phase6, "REPO_ROOT", Path(tmp)), mock.patch.object(phase6, "run", scripted), _env_patch():
+                with self.assertRaises(phase6.Phase6Error):
+                    _run_quiet(phase6.cmd_validate_local, argparse_namespace(environment=ENVIRONMENT))
+
+    def test_142_deploy_and_validate_share_the_same_final_validator_with_expected_render(self):
+        import ast as _ast
+        with open(TOOL_PATH) as f:
+            source = f.read()
+        tree = _ast.parse(source)
+        validate_fn = next(n for n in _ast.walk(tree) if isinstance(n, _ast.FunctionDef) and n.name == "_validate_rendered_manifests")
+        validate_src = _ast.get_source_segment(source, validate_fn)
+        self.assertIn("_render_expected_manifests_for_validation(", validate_src)
+        reconcile_one = next(n for n in _ast.walk(tree) if isinstance(n, _ast.FunctionDef) and n.name == "_reconcile_one_pipeline")
+        validate_local = next(n for n in _ast.walk(tree) if isinstance(n, _ast.FunctionDef) and n.name == "cmd_validate_local")
+        self.assertIn("_validate_rendered_manifests(", _ast.get_source_segment(source, reconcile_one))
+        self.assertIn("_validate_rendered_manifests(", _ast.get_source_segment(source, validate_local))
+
+    def test_143_validate_expected_rerender_performs_zero_aws_kubectl(self):
+        scripted = _standard_deploy_scripted(pipeline_ids=("fabricated-pipeline-001",))
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(phase6, "REPO_ROOT", Path(tmp)), mock.patch.object(phase6, "run", scripted), _env_patch():
+                _run_quiet(phase6.cmd_validate_local, argparse_namespace(environment=ENVIRONMENT))
+        self.assertEqual([c for c in scripted.calls if c["argv"][:1] in (["aws"], ["kubectl"])], [])
 
 
 if __name__ == "__main__":
