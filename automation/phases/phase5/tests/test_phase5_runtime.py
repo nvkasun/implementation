@@ -855,32 +855,72 @@ class EfsRenderedManifestTests(unittest.TestCase):
 
 # ==== ECR HELM REPO TESTS ====
 
-def _build_fake_chart_package(repo_root, chart_version, environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, values_bytes=b"runtime:\n  containerName: goldengate\n",
-                               chart_yaml_name="goldengate", chart_yaml_version=None, chart_yaml_app_version=None,
-                               include_values_deployment=True, values_deployment_bytes=None):
-    """Builds a REAL .tgz via stdlib tarfile -- matching the on-disk layout _package_runtime_chart()/helm package actually produce (<chart_name>/Chart.yaml, <chart_name>/values-deployment.yaml) -- plus the CURRENT envs/<environment>/<deployment_id>/values.yaml it must byte-for-byte match. repo_root must already be the mocked phase5_runtime.REPO_ROOT. The archive is always named packaged/goldengate-<chart_version>.tgz (the canonical outer package path), but chart_yaml_name/chart_yaml_version/chart_yaml_app_version/values_deployment_bytes let a test independently corrupt the INSIDE metadata to prove the contents, not just the outer path, are verified. Returns the package's canonical relative path string."""
+def _canonical_chart_file_members(chart_version):
+    """Test-side mirror of the CURRENT real helm/goldengate/ source tree, as a list of (goldengate/<relative-path>, bytes) pairs -- with Chart.yaml's version/appVersion overridden to chart_version, exactly what a genuine `helm package --version X --app-version X` invocation of the current chart produces. Reads the real tree at test time -- never a manually-maintained list -- the same non-hardcoded principle as the production _expected_chart_package_members() this exercises."""
+    import yaml as _yaml
+    members = []
+    for path in sorted(phase5_runtime.HELM_CHART_PATH.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(phase5_runtime.HELM_CHART_PATH).as_posix()
+        content = path.read_bytes()
+        if relative == "Chart.yaml":
+            chart_dict = _yaml.safe_load(content)
+            chart_dict["version"] = chart_version
+            chart_dict["appVersion"] = chart_version
+            content = _yaml.safe_dump(chart_dict, default_flow_style=False).encode()
+        members.append((f"goldengate/{relative}", content))
+    return members
+
+
+def _write_chart_tar(package_path, file_members, raw_infos=None):
+    """Low-level tar builder for test fixtures: file_members is a list of (name, content_bytes) pairs for regular files (a name may legitimately repeat, to construct a duplicate-member test fixture); raw_infos is an optional list of ready-made tarfile.TarInfo objects (symlink/hardlink/device/FIFO/any type) appended as-is, since the regular file_members API cannot express those types."""
     import tarfile
+    package_path.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(package_path, mode="w:gz") as tar:
+        for member_name, content_bytes in file_members:
+            info = tarfile.TarInfo(name=member_name)
+            info.size = len(content_bytes)
+            tar.addfile(info, io.BytesIO(content_bytes))
+        for info in (raw_infos or []):
+            tar.addfile(info)
+
+
+def _build_fake_chart_package(repo_root, chart_version, environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, values_bytes=b"runtime:\n  containerName: goldengate\n",
+                               chart_yaml_name=None, chart_yaml_version=None, chart_yaml_app_version=None,
+                               include_values_deployment=True, values_deployment_bytes=None,
+                               member_overrides=None, omit_members=(), extra_file_members=(), raw_infos=None):
+    """Builds a REAL .tgz that, by default, mirrors the CURRENT real helm/goldengate/ source tree exactly (via _canonical_chart_file_members()) plus goldengate/values-deployment.yaml -- matching the on-disk layout _package_runtime_chart()/helm package actually produce -- plus the CURRENT envs/<environment>/<deployment_id>/values.yaml it must byte-for-byte match. repo_root must already be the mocked phase5_runtime.REPO_ROOT. chart_yaml_name/chart_yaml_version/chart_yaml_app_version independently corrupt ONLY the packaged Chart.yaml's own fields (re-serialized); member_overrides/omit_members/extra_file_members let a test corrupt/omit/add specific archive members (e.g. a modified template, a missing template, an extra file, a non-canonical root) to prove the COMPLETE archive -- not merely Chart.yaml/values-deployment.yaml -- is verified against the current chart source. Returns the package's canonical relative path string."""
+    import yaml as _yaml
 
     values_path = repo_root / "envs" / environment / deployment_id / "values.yaml"
     values_path.parent.mkdir(parents=True, exist_ok=True)
     values_path.write_bytes(values_bytes)
 
-    chart_yaml_version = chart_version if chart_yaml_version is None else chart_yaml_version
-    chart_yaml_app_version = chart_version if chart_yaml_app_version is None else chart_yaml_app_version
     values_deployment_bytes = values_bytes if values_deployment_bytes is None else values_deployment_bytes
-    chart_yaml_bytes = f"apiVersion: v2\nname: {chart_yaml_name}\nversion: {chart_yaml_version}\nappVersion: {chart_yaml_app_version}\n".encode()
+    file_members = _canonical_chart_file_members(chart_version)
 
-    packaged_dir = repo_root / "packaged"
-    packaged_dir.mkdir(parents=True, exist_ok=True)
-    package_path = packaged_dir / f"goldengate-{chart_version}.tgz"
-    members = [("goldengate/Chart.yaml", chart_yaml_bytes)]
+    if chart_yaml_name is not None or chart_yaml_version is not None or chart_yaml_app_version is not None:
+        current_chart_dict = _yaml.safe_load((phase5_runtime.HELM_CHART_PATH / "Chart.yaml").read_bytes())
+        current_chart_dict["name"] = chart_yaml_name if chart_yaml_name is not None else current_chart_dict["name"]
+        current_chart_dict["version"] = chart_yaml_version if chart_yaml_version is not None else chart_version
+        current_chart_dict["appVersion"] = chart_yaml_app_version if chart_yaml_app_version is not None else chart_version
+        corrupted_chart_yaml_bytes = _yaml.safe_dump(current_chart_dict, default_flow_style=False).encode()
+        file_members = [(name, corrupted_chart_yaml_bytes if name == "goldengate/Chart.yaml" else content) for name, content in file_members]
+
     if include_values_deployment:
-        members.append(("goldengate/values-deployment.yaml", values_deployment_bytes))
-    with tarfile.open(package_path, mode="w:gz") as tar:
-        for member_name, content_bytes in members:
-            info = tarfile.TarInfo(name=member_name)
-            info.size = len(content_bytes)
-            tar.addfile(info, io.BytesIO(content_bytes))
+        file_members.append(("goldengate/values-deployment.yaml", values_deployment_bytes))
+
+    if member_overrides:
+        overridden = dict(member_overrides)
+        file_members = [(name, overridden.pop(name, content)) for name, content in file_members]
+        file_members.extend(overridden.items())
+    if omit_members:
+        file_members = [(name, content) for name, content in file_members if name not in omit_members]
+    file_members = list(file_members) + list(extra_file_members)
+
+    package_path = repo_root / "packaged" / f"goldengate-{chart_version}.tgz"
+    _write_chart_tar(package_path, file_members, raw_infos=raw_infos)
     return f"packaged/{package_path.name}"
 
 
@@ -1082,6 +1122,7 @@ class EcrRepositoryTests(unittest.TestCase):
             with mock.patch.object(phase5_runtime, "REPO_ROOT", Path(tmp)), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
                 with self.assertRaises(phase5_runtime.Phase5Error):
                     _run_quiet(phase5_runtime.cmd_publish_chart, args)
+            self.assertEqual(len([c for c in scripted.calls if c["argv"][:2] == ["helm", "push"]]), 1, "the canonical package must pass all artifact validation and genuinely reach helm push before this scripted failure")
 
     def test_version_pullback_failure_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1103,6 +1144,7 @@ class EcrRepositoryTests(unittest.TestCase):
             with mock.patch.object(phase5_runtime, "REPO_ROOT", Path(tmp)), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
                 with self.assertRaises(phase5_runtime.Phase5Error):
                     _run_quiet(phase5_runtime.cmd_publish_chart, args)
+            self.assertEqual(len([c for c in scripted.calls if c["argv"][:2] == ["helm", "pull"]]), 1, "the canonical package must pass all artifact validation and genuinely reach helm pull before this scripted failure")
 
 
 # ==== CLUSTER PREREQUISITE TESTS ====
@@ -2903,6 +2945,311 @@ class ValidateLocalDiagnosticsTests(unittest.TestCase):
             scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
             with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
                 _run_quiet(phase5_runtime.cmd_post_deploy_diagnostics, args)
+
+
+class PackagedChartIntegrityTests(unittest.TestCase):
+    """Confirmed reproduction target: the package validator must prove the COMPLETE archive -- exact canonical root, exact regular-file member set, every non-Chart.yaml/values-deployment.yaml member byte-identical to the current helm/goldengate/ source -- not merely Chart.yaml + values-deployment.yaml in isolation."""
+
+    def _publish_with_package(self, repo_root, package_path_rel, expect_error=True):
+        state_path = repo_root / "state.json"
+        phase5_runtime.update_state(state_path, {**_reconcile_state_fixture(), "package_path": package_path_rel}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+        args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+        scripted = ScriptedRun()
+        scripted.when(_starts_with("aws", "ecr", "get-login-password"), FakeProc(0, "pw"))
+        scripted.when(_starts_with("helm", "registry", "login"), FakeProc(0, ""))
+        scripted.when(_starts_with("aws", "ecr", "describe-repositories"), FakeProc(0, ""))
+        scripted.when(_starts_with("aws", "ecr", "get-repository-policy"), FakeProc(1, "", "RepositoryPolicyNotFoundException"))
+        scripted.when(_starts_with("aws", "ecr", "set-repository-policy"), FakeProc(0, ""))
+        scripted.when(_starts_with("helm", "push"), FakeProc(0, ""))
+        scripted.when(_starts_with("helm", "pull"), FakeProc(0, ""))
+        with mock.patch.object(phase5_runtime, "REPO_ROOT", repo_root), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+            if expect_error:
+                with self.assertRaises(phase5_runtime.Phase5Error) as ctx:
+                    _run_quiet(phase5_runtime.cmd_publish_chart, args)
+                return scripted, ctx.exception
+            _run_quiet(phase5_runtime.cmd_publish_chart, args)
+            return scripted, None
+
+    def _assert_zero_network(self, scripted):
+        self.assertEqual([c for c in scripted.calls if c["argv"][:1] in (["aws"], ["helm"])], [], "package/artifact mismatch must produce ZERO AWS/ECR/Helm-network calls")
+
+    def test_1_canonical_full_package_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            package_path_rel = _build_fake_chart_package(repo_root, CHART_VERSION)
+            scripted, _ = self._publish_with_package(repo_root, package_path_rel, expect_error=False)
+            self.assertEqual(len([c for c in scripted.calls if c["argv"][:2] == ["helm", "push"]]), 1)
+
+    def test_2_modified_runtime_statefulset_fails(self):
+        """Confirmed reproduction of the current bug: a canonical package with a genuine Chart.yaml/values-deployment.yaml but a replaced runtime-statefulset.yaml previously reached aws ecr/helm registry login/helm push/helm pull."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            malicious = b"apiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: malicious-replacement\n"
+            package_path_rel = _build_fake_chart_package(repo_root, CHART_VERSION, member_overrides={"goldengate/templates/runtime-statefulset.yaml": malicious})
+            scripted, _ = self._publish_with_package(repo_root, package_path_rel)
+            self._assert_zero_network(scripted)
+
+    def test_3_modified_runtime_service_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            package_path_rel = _build_fake_chart_package(repo_root, CHART_VERSION, member_overrides={"goldengate/templates/runtime-service.yaml": b"kind: Service\nmetadata:\n  name: different\n"})
+            scripted, _ = self._publish_with_package(repo_root, package_path_rel)
+            self._assert_zero_network(scripted)
+
+    def test_4_extra_template_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            package_path_rel = _build_fake_chart_package(repo_root, CHART_VERSION, extra_file_members=[("goldengate/templates/evil.yaml", b"evil: true\n")])
+            scripted, _ = self._publish_with_package(repo_root, package_path_rel)
+            self._assert_zero_network(scripted)
+
+    def test_5_missing_canonical_template_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            package_path_rel = _build_fake_chart_package(repo_root, CHART_VERSION, omit_members=["goldengate/templates/runtime-statefulset.yaml"])
+            scripted, _ = self._publish_with_package(repo_root, package_path_rel)
+            self._assert_zero_network(scripted)
+
+    def test_6_chart_yaml_under_evilroot_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            canonical = dict(_canonical_chart_file_members(CHART_VERSION))
+            package_path_rel = _build_fake_chart_package(repo_root, CHART_VERSION, omit_members=["goldengate/Chart.yaml"], extra_file_members=[("evilroot/Chart.yaml", canonical["goldengate/Chart.yaml"])])
+            scripted, _ = self._publish_with_package(repo_root, package_path_rel)
+            self._assert_zero_network(scripted)
+
+    def test_7_values_deployment_under_differentroot_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            values_bytes = b"runtime:\n  containerName: goldengate\n"
+            package_path_rel = _build_fake_chart_package(repo_root, CHART_VERSION, values_bytes=values_bytes, omit_members=["goldengate/values-deployment.yaml"], extra_file_members=[("differentroot/values-deployment.yaml", values_bytes)])
+            scripted, _ = self._publish_with_package(repo_root, package_path_rel)
+            self._assert_zero_network(scripted)
+
+    def test_8_different_roots_for_chart_yaml_and_values_deployment_fails(self):
+        """Confirmed reproduction of the current root bug: evilroot/Chart.yaml + differentroot/values-deployment.yaml, otherwise-valid metadata/bytes."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            values_bytes = b"runtime:\n  containerName: goldengate\n"
+            canonical = dict(_canonical_chart_file_members(CHART_VERSION))
+            package_path_rel = _build_fake_chart_package(
+                repo_root, CHART_VERSION, values_bytes=values_bytes,
+                omit_members=["goldengate/Chart.yaml", "goldengate/values-deployment.yaml"],
+                extra_file_members=[("evilroot/Chart.yaml", canonical["goldengate/Chart.yaml"]), ("differentroot/values-deployment.yaml", values_bytes)],
+            )
+            scripted, _ = self._publish_with_package(repo_root, package_path_rel)
+            self._assert_zero_network(scripted)
+
+    def test_9_path_traversal_member_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            package_path_rel = _build_fake_chart_package(repo_root, CHART_VERSION, extra_file_members=[("goldengate/../evil.yaml", b"evil\n")])
+            scripted, _ = self._publish_with_package(repo_root, package_path_rel)
+            self._assert_zero_network(scripted)
+
+    def test_10_absolute_member_name_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            package_path_rel = _build_fake_chart_package(repo_root, CHART_VERSION, extra_file_members=[("/etc/passwd", b"evil\n")])
+            scripted, _ = self._publish_with_package(repo_root, package_path_rel)
+            self._assert_zero_network(scripted)
+
+    def _link_style_package(self, repo_root, tarinfo_type, linkname=None):
+        import tarfile
+        file_members = [(n, c) for n, c in _canonical_chart_file_members(CHART_VERSION) if n != "goldengate/templates/runtime-statefulset.yaml"]
+        info = tarfile.TarInfo(name="goldengate/templates/runtime-statefulset.yaml")
+        info.type = tarinfo_type
+        if linkname is not None:
+            info.linkname = linkname
+        values_bytes = b"runtime:\n  containerName: goldengate\n"
+        values_path = repo_root / "envs" / ENVIRONMENT / DEPLOYMENT_ID / "values.yaml"
+        values_path.parent.mkdir(parents=True, exist_ok=True)
+        values_path.write_bytes(values_bytes)
+        file_members.append(("goldengate/values-deployment.yaml", values_bytes))
+        package_path = repo_root / "packaged" / f"goldengate-{CHART_VERSION}.tgz"
+        _write_chart_tar(package_path, file_members, raw_infos=[info])
+        return f"packaged/{package_path.name}"
+
+    def test_11_archive_symlink_member_fails(self):
+        import tarfile
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            package_path_rel = self._link_style_package(repo_root, tarfile.SYMTYPE, linkname="/etc/passwd")
+            scripted, _ = self._publish_with_package(repo_root, package_path_rel)
+            self._assert_zero_network(scripted)
+
+    def test_12_archive_hardlink_member_fails(self):
+        import tarfile
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            package_path_rel = self._link_style_package(repo_root, tarfile.LNKTYPE, linkname="goldengate/Chart.yaml")
+            scripted, _ = self._publish_with_package(repo_root, package_path_rel)
+            self._assert_zero_network(scripted)
+
+    def test_13_archive_fifo_device_member_fails(self):
+        import tarfile
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            package_path_rel = self._link_style_package(repo_root, tarfile.FIFOTYPE)
+            scripted, _ = self._publish_with_package(repo_root, package_path_rel)
+            self._assert_zero_network(scripted)
+
+    def test_14_duplicate_canonical_member_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            canonical = dict(_canonical_chart_file_members(CHART_VERSION))
+            package_path_rel = _build_fake_chart_package(repo_root, CHART_VERSION, extra_file_members=[("goldengate/Chart.yaml", canonical["goldengate/Chart.yaml"])])
+            scripted, _ = self._publish_with_package(repo_root, package_path_rel)
+            self._assert_zero_network(scripted)
+
+    def test_15_packaged_chart_yaml_duplicate_key_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            duplicate_key_chart_yaml = f"apiVersion: v2\nname: goldengate\nversion: {CHART_VERSION}\nversion: {CHART_VERSION}\nappVersion: {CHART_VERSION}\n".encode()
+            package_path_rel = _build_fake_chart_package(repo_root, CHART_VERSION, member_overrides={"goldengate/Chart.yaml": duplicate_key_chart_yaml})
+            scripted, exc = self._publish_with_package(repo_root, package_path_rel)
+            self.assertIn("duplicate", str(exc).lower())
+            self._assert_zero_network(scripted)
+
+    def test_16_packaged_chart_yaml_description_type_apiversion_changed_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            import yaml as _yaml
+            current = _yaml.safe_load(phase5_runtime.HELM_CHART_PATH.joinpath("Chart.yaml").read_bytes())
+            current["version"] = CHART_VERSION
+            current["appVersion"] = CHART_VERSION
+            current["description"] = "a completely different description"
+            corrupted_bytes = _yaml.safe_dump(current, default_flow_style=False).encode()
+            package_path_rel = _build_fake_chart_package(repo_root, CHART_VERSION, member_overrides={"goldengate/Chart.yaml": corrupted_bytes})
+            scripted, _ = self._publish_with_package(repo_root, package_path_rel)
+            self._assert_zero_network(scripted)
+
+    def test_17_chart_yaml_adjusted_only_for_version_app_version_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            package_path_rel = _build_fake_chart_package(repo_root, CHART_VERSION)
+            scripted, _ = self._publish_with_package(repo_root, package_path_rel, expect_error=False)
+            self.assertEqual(len([c for c in scripted.calls if c["argv"][:2] == ["helm", "push"]]), 1)
+
+    def test_18_packaged_values_yaml_differs_from_current_chart_source_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            package_path_rel = _build_fake_chart_package(repo_root, CHART_VERSION, member_overrides={"goldengate/values.yaml": b"totally: different\n"})
+            scripted, _ = self._publish_with_package(repo_root, package_path_rel)
+            self._assert_zero_network(scripted)
+
+    def test_19_any_current_template_differs_byte_wise_fails(self):
+        canonical_names = [n for n, _ in _canonical_chart_file_members(CHART_VERSION) if n not in ("goldengate/Chart.yaml",)]
+        for member_name in canonical_names:
+            with tempfile.TemporaryDirectory() as tmp:
+                repo_root = Path(tmp)
+                package_path_rel = _build_fake_chart_package(repo_root, CHART_VERSION, member_overrides={member_name: b"corrupted content that does not match the current source\n"})
+                scripted, _ = self._publish_with_package(repo_root, package_path_rel)
+                self._assert_zero_network(scripted)
+
+    def test_20_every_regular_canonical_chart_file_represented_exactly_once(self):
+        expected = phase5_runtime._expected_chart_package_members()
+        listed = {
+            "goldengate/Chart.yaml", "goldengate/values.yaml", "goldengate/values-deployment.yaml",
+            "goldengate/templates/_helpers.tpl", "goldengate/templates/efs-storageclass.yaml",
+            "goldengate/templates/runtime-headless-service.yaml", "goldengate/templates/runtime-ingress.yaml",
+            "goldengate/templates/runtime-pvc.yaml", "goldengate/templates/runtime-secretproviderclass.yaml",
+            "goldengate/templates/runtime-service.yaml", "goldengate/templates/runtime-serviceaccount.yaml",
+            "goldengate/templates/runtime-statefulset.yaml",
+        }
+        self.assertEqual(expected, listed)
+
+    def test_source_side_symlink_under_chart_path_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_chart_path = Path(tmp) / "goldengate"
+            fake_chart_path.mkdir()
+            (fake_chart_path / "Chart.yaml").write_text("apiVersion: v2\nname: goldengate\nversion: 0.0.0\n")
+            try:
+                (fake_chart_path / "evil-symlink.yaml").symlink_to(fake_chart_path / "Chart.yaml")
+            except (OSError, NotImplementedError):
+                self.skipTest("symlinks are not supported on this platform/filesystem")
+            with mock.patch.object(phase5_runtime, "HELM_CHART_PATH", fake_chart_path):
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    phase5_runtime._expected_chart_package_members()
+
+
+class PackageDirectoryContainmentTests(unittest.TestCase):
+    def test_21_normal_real_packaged_dir_canonical_package_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "packaged").mkdir()
+            package_path_rel = f"packaged/goldengate-{CHART_VERSION}.tgz"
+            (repo_root / package_path_rel).write_bytes(b"fake")
+            with mock.patch.object(phase5_runtime, "REPO_ROOT", repo_root):
+                resolved = phase5_runtime._validate_package_path_and_containment(package_path_rel, CHART_VERSION)
+            self.assertEqual(resolved, (repo_root / package_path_rel).resolve())
+
+    def test_23_packaged_directory_itself_symlinked_outside_fails_zero_network(self):
+        """Confirmed reproduction of the newly-confirmed gap: REPO_ROOT/packaged -> an external directory, with the exact canonical package placed inside it. Proven end-to-end via cmd_publish_chart with a call-recording stub."""
+        with tempfile.TemporaryDirectory() as outer:
+            outer_path = Path(outer)
+            build_root = outer_path / "build"
+            build_root.mkdir()
+            package_path_rel = _build_fake_chart_package(build_root, CHART_VERSION)
+            built_package = build_root / package_path_rel
+
+            repo_root = outer_path / "repo"
+            repo_root.mkdir()
+            values_src = build_root / "envs" / ENVIRONMENT / DEPLOYMENT_ID / "values.yaml"
+            values_dst = repo_root / "envs" / ENVIRONMENT / DEPLOYMENT_ID / "values.yaml"
+            values_dst.parent.mkdir(parents=True)
+            values_dst.write_bytes(values_src.read_bytes())
+
+            external_dir = outer_path / "external"
+            external_dir.mkdir()
+            (external_dir / built_package.name).write_bytes(built_package.read_bytes())
+            try:
+                (repo_root / "packaged").symlink_to(external_dir, target_is_directory=True)
+            except (OSError, NotImplementedError):
+                self.skipTest("symlinks are not supported on this platform/filesystem")
+
+            state_path = repo_root / "state.json"
+            phase5_runtime.update_state(state_path, {**_reconcile_state_fixture(), "package_path": package_path_rel}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = ScriptedRun()
+            with mock.patch.object(phase5_runtime, "REPO_ROOT", repo_root), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    _run_quiet(phase5_runtime.cmd_publish_chart, args)
+            self.assertEqual(scripted.calls, [])
+
+    def test_24_canonical_package_path_missing_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "packaged").mkdir()
+            package_path_rel = f"packaged/goldengate-{CHART_VERSION}.tgz"
+            with mock.patch.object(phase5_runtime, "REPO_ROOT", repo_root):
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    phase5_runtime._validate_package_path_and_containment(package_path_rel, CHART_VERSION)
+
+    def test_25_canonical_package_path_is_directory_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            package_path_rel = f"packaged/goldengate-{CHART_VERSION}.tgz"
+            (repo_root / package_path_rel).mkdir(parents=True)
+            with mock.patch.object(phase5_runtime, "REPO_ROOT", repo_root):
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    phase5_runtime._validate_package_path_and_containment(package_path_rel, CHART_VERSION)
+
+    def test_26_package_path_traversal_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "packaged").mkdir()
+            with mock.patch.object(phase5_runtime, "REPO_ROOT", repo_root):
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    phase5_runtime._validate_package_path_and_containment(f"packaged/../../etc/goldengate-{CHART_VERSION}.tgz", CHART_VERSION)
+
+    def test_27_absolute_package_path_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "packaged").mkdir()
+            with mock.patch.object(phase5_runtime, "REPO_ROOT", repo_root):
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    phase5_runtime._validate_package_path_and_containment("/etc/passwd", CHART_VERSION)
 
 
 if __name__ == "__main__":

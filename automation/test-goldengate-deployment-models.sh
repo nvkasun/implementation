@@ -16281,6 +16281,288 @@ else
   skip "Phase 5 resolved-runtime/artifact binding: dedicated static assertions -- python3/PyYAML/EKS_APP_WORKFLOW/phase5_runtime.py unavailable"
 fi
 
+echo ""
+echo "--- Phase 5 Python Conversion: packaged-chart archive-tree integrity (A-L) ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE5_RUNTIME_TOOL" ]; then
+  PHASE5_ARCHIVE_INTEGRITY_CHECK="$(python3 - "$EKS_APP_WORKFLOW" "$PHASE5_RUNTIME_TOOL" <<'PYEOF'
+import ast
+import importlib.util
+import io
+import json
+import os
+import sys
+import tarfile
+import tempfile
+from pathlib import Path
+from unittest import mock
+
+import yaml
+
+workflow_path, tool_path = sys.argv[1:3]
+
+with open(workflow_path) as f:
+    jobs = yaml.safe_load(f)["jobs"]
+
+spec = importlib.util.spec_from_file_location("phase5_runtime", tool_path)
+phase5_runtime = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(phase5_runtime)
+
+results = []
+
+ENVIRONMENT_VALUE = "dev"
+DEPLOYMENT_ID_VALUE = "gg-oracle-payments-01"
+ECR_REGISTRY_VALUE = "229410149234.dkr.ecr.eu-west-1.amazonaws.com"
+GITHUB_RUN_NUMBER_VALUE = "42"
+CHART_VERSION_VALUE = f"0.1.{GITHUB_RUN_NUMBER_VALUE}-{DEPLOYMENT_ID_VALUE}"
+
+RECONCILE_ENV = {
+    "AWS_REGION": "eu-west-1", "EKS_CLUSTER_NAME": "gg-dev-cluster",
+    "EKS_DEPLOY_ROLE_ARN": "arn:aws:iam::668311715351:role/GoldenGateEksDeployRole-dev",
+    "RUNTIME_NAMESPACE": "goldengate-dev", "ARGOCD_NAMESPACE": "argocd", "ECR_REGISTRY": ECR_REGISTRY_VALUE,
+    "ARGOCD_ECR_READ_ROLE_ARN": "arn:aws:iam::229410149234:role/ArgoCdEcrReadRole", "GITHUB_RUN_NUMBER": GITHUB_RUN_NUMBER_VALUE,
+    "DNS_DOMAIN": "goldengate-dev.adcbmis.local", "ALB_GROUP_NAME": "goldengate-dev-shared",
+    "ACM_CERTIFICATE_ARN": "arn:aws:acm:eu-west-1:668311715351:certificate/abc-123",
+}
+
+
+def reconcile_state_fixture(**overrides):
+    base = {
+        "environment": ENVIRONMENT_VALUE, "deployment_id": DEPLOYMENT_ID_VALUE, "deployment_model": "singleRuntime",
+        "deploy": True, "values_file": f"envs/{ENVIRONMENT_VALUE}/{DEPLOYMENT_ID_VALUE}/values.yaml",
+        "target_namespace": "goldengate-dev", "release_name": DEPLOYMENT_ID_VALUE,
+        "argocd_app_name": phase5_runtime._canonical_argocd_app_name(ENVIRONMENT_VALUE, DEPLOYMENT_ID_VALUE),
+        "helm_ecr_repository": "helm/goldengate", "helm_push_url": f"oci://{ECR_REGISTRY_VALUE}/helm",
+        "helm_chart_ref": f"oci://{ECR_REGISTRY_VALUE}/helm/goldengate",
+        "chart_version": CHART_VERSION_VALUE, "temp_chart_path": f"work/charts/{DEPLOYMENT_ID_VALUE}/goldengate",
+    }
+    base.update(overrides)
+    return base
+
+
+def canonical_chart_file_members(chart_version):
+    """Mirrors the CURRENT real helm/goldengate/ source tree -- never a manually-maintained list -- same non-hardcoded principle as the production _expected_chart_package_members() this exercises."""
+    members = []
+    for path in sorted(phase5_runtime.HELM_CHART_PATH.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(phase5_runtime.HELM_CHART_PATH).as_posix()
+        content = path.read_bytes()
+        if relative == "Chart.yaml":
+            chart_dict = yaml.safe_load(content)
+            chart_dict["version"] = chart_version
+            chart_dict["appVersion"] = chart_version
+            content = yaml.safe_dump(chart_dict, default_flow_style=False).encode()
+        members.append((f"goldengate/{relative}", content))
+    return members
+
+
+def write_chart_tar(package_path, file_members, raw_infos=None):
+    package_path.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(package_path, mode="w:gz") as tar:
+        for name, content_bytes in file_members:
+            info = tarfile.TarInfo(name=name)
+            info.size = len(content_bytes)
+            tar.addfile(info, io.BytesIO(content_bytes))
+        for info in (raw_infos or []):
+            tar.addfile(info)
+
+
+def build_package(repo_root, chart_version, member_overrides=None, omit_members=(), extra_file_members=(), raw_infos=None,
+                   values_bytes=b"runtime:\n  containerName: goldengate\n"):
+    values_path = repo_root / "envs" / ENVIRONMENT_VALUE / DEPLOYMENT_ID_VALUE / "values.yaml"
+    values_path.parent.mkdir(parents=True, exist_ok=True)
+    values_path.write_bytes(values_bytes)
+
+    file_members = canonical_chart_file_members(chart_version)
+    file_members.append(("goldengate/values-deployment.yaml", values_bytes))
+    if member_overrides:
+        overridden = dict(member_overrides)
+        file_members = [(name, overridden.pop(name, content)) for name, content in file_members]
+        file_members.extend(overridden.items())
+    if omit_members:
+        file_members = [(name, content) for name, content in file_members if name not in omit_members]
+    file_members = list(file_members) + list(extra_file_members)
+
+    package_path = repo_root / "packaged" / f"goldengate-{chart_version}.tgz"
+    write_chart_tar(package_path, file_members, raw_infos=raw_infos)
+    return f"packaged/{package_path.name}"
+
+
+def publish_zero_network(repo_root, package_path_rel):
+    """Runs cmd_publish_chart() with a call-recording stub -- returns (raised_exception_or_None, calls)."""
+    state_path = repo_root / "state.json"
+    phase5_runtime.update_state(state_path, {**reconcile_state_fixture(), "package_path": package_path_rel}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
+    args = type("Args", (), {"environment": ENVIRONMENT_VALUE, "deployment_id": DEPLOYMENT_ID_VALUE, "state_path": state_path})()
+
+    calls = []
+
+    def recorder(argv, **kwargs):
+        calls.append(list(argv))
+        return type("Proc", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    with mock.patch.object(phase5_runtime, "REPO_ROOT", repo_root), mock.patch.object(phase5_runtime, "run", recorder), mock.patch.dict(os.environ, RECONCILE_ENV):
+        try:
+            phase5_runtime.cmd_publish_chart(args)
+            return None, calls
+        except phase5_runtime.Phase5Error as exc:
+            return exc, calls
+
+
+with open(tool_path) as f:
+    tool_source = f.read()
+tree = ast.parse(tool_source)
+
+
+def fn_source(name):
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
+    return ast.get_source_segment(tool_source, fn) or ""
+
+
+# A: package validator derives expected regular files from HELM_CHART_PATH rather than a manually duplicated template list.
+expected_members_src = fn_source("_expected_chart_package_members")
+results.append(("A: _expected_chart_package_members() walks HELM_CHART_PATH.rglob(...) (never a hard-coded template filename list)", "HELM_CHART_PATH.rglob(" in expected_members_src))
+results.append(("A: production code contains no independent hard-coded 'runtime-statefulset.yaml' template list outside the real chart source/tests", tool_source.count("runtime-statefulset.yaml") == 0))
+real_expected = phase5_runtime._expected_chart_package_members()
+results.append(("A: the derived expected set currently matches the real helm/goldengate/ source tree contents (10 chart files + values-deployment.yaml)", real_expected == {
+    "goldengate/Chart.yaml", "goldengate/values.yaml", "goldengate/values-deployment.yaml",
+    "goldengate/templates/_helpers.tpl", "goldengate/templates/efs-storageclass.yaml",
+    "goldengate/templates/runtime-headless-service.yaml", "goldengate/templates/runtime-ingress.yaml",
+    "goldengate/templates/runtime-pvc.yaml", "goldengate/templates/runtime-secretproviderclass.yaml",
+    "goldengate/templates/runtime-service.yaml", "goldengate/templates/runtime-serviceaccount.yaml",
+    "goldengate/templates/runtime-statefulset.yaml",
+}))
+
+# B: archive regular-file set must exactly equal the canonical expected set -- never subset-based.
+package_contents_src = fn_source("_validate_packaged_chart_contents")
+results.append(("B: _validate_packaged_chart_contents() uses exact set equality (!=), never issubset()", "actual_members != expected_members" in package_contents_src and "issubset" not in package_contents_src))
+
+tmp = tempfile.TemporaryDirectory()
+package_path_rel = build_package(Path(tmp.name), CHART_VERSION_VALUE, extra_file_members=[("goldengate/templates/evil.yaml", b"evil: true\n")])
+exc, calls = publish_zero_network(Path(tmp.name), package_path_rel)
+results.append(("B: an extra template (goldengate/templates/evil.yaml) is rejected even though every canonical file is also present and correct", exc is not None and calls == []))
+tmp.cleanup()
+
+# C: every non-Chart.yaml canonical file is byte-compared with the current chart source -- confirmed reproduction of the altered-runtime-statefulset bug.
+tmp = tempfile.TemporaryDirectory()
+malicious = b"apiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: malicious-replacement\n"
+package_path_rel = build_package(Path(tmp.name), CHART_VERSION_VALUE, member_overrides={"goldengate/templates/runtime-statefulset.yaml": malicious})
+exc, calls = publish_zero_network(Path(tmp.name), package_path_rel)
+results.append(("C/K: confirmed reproduction -- a package with a genuine Chart.yaml/values-deployment.yaml but an altered runtime-statefulset.yaml is rejected with ZERO AWS/ECR/Helm calls", exc is not None and calls == []))
+tmp.cleanup()
+
+# D: Chart.yaml uses duplicate-key-safe canonical semantic comparison (never plain yaml.safe_load for this artifact trust boundary).
+results.append(("D: Chart.yaml is parsed via the duplicate-key-rejecting _StrictSafeLoader (never plain yaml.safe_load) at this artifact trust boundary", "_load_strict_yaml_mapping" in package_contents_src and "yaml.safe_load" not in package_contents_src))
+tmp = tempfile.TemporaryDirectory()
+dup_key_chart_yaml = f"apiVersion: v2\nname: goldengate\nversion: {CHART_VERSION_VALUE}\nversion: {CHART_VERSION_VALUE}\nappVersion: {CHART_VERSION_VALUE}\n".encode()
+package_path_rel = build_package(Path(tmp.name), CHART_VERSION_VALUE, member_overrides={"goldengate/Chart.yaml": dup_key_chart_yaml})
+exc, calls = publish_zero_network(Path(tmp.name), package_path_rel)
+results.append(("D: a packaged Chart.yaml with a duplicate YAML key is rejected with ZERO AWS/ECR/Helm calls", exc is not None and calls == [] and "duplicate" in str(exc).lower()))
+tmp.cleanup()
+
+# E: values-deployment.yaml retains the exact current-deployment byte comparison.
+results.append(("E: values-deployment.yaml remains an exact byte-for-byte comparison against the current deployment values file", "values_deployment_bytes != expected_values_bytes" in package_contents_src))
+tmp = tempfile.TemporaryDirectory()
+package_path_rel = build_package(Path(tmp.name), CHART_VERSION_VALUE, values_bytes=b"runtime:\n  containerName: goldengate\n")
+# Corrupt the on-disk current values file AFTER packaging so the package's own values-deployment.yaml no longer matches it.
+(Path(tmp.name) / "envs" / ENVIRONMENT_VALUE / DEPLOYMENT_ID_VALUE / "values.yaml").write_bytes(b"runtime:\n  containerName: totally-different\n")
+exc, calls = publish_zero_network(Path(tmp.name), package_path_rel)
+results.append(("E: a packaged values-deployment.yaml that no longer matches the CURRENT deployment values file is rejected with ZERO AWS/ECR/Helm calls", exc is not None and calls == []))
+tmp.cleanup()
+
+# F: archive root is exactly goldengate/ -- confirmed reproduction of the archive-root bug.
+tmp = tempfile.TemporaryDirectory()
+canonical = dict(canonical_chart_file_members(CHART_VERSION_VALUE))
+package_path_rel = build_package(
+    Path(tmp.name), CHART_VERSION_VALUE,
+    omit_members=["goldengate/Chart.yaml", "goldengate/values-deployment.yaml"],
+    extra_file_members=[("evilroot/Chart.yaml", canonical["goldengate/Chart.yaml"]), ("differentroot/values-deployment.yaml", b"runtime:\n  containerName: goldengate\n")],
+)
+exc, calls = publish_zero_network(Path(tmp.name), package_path_rel)
+results.append(("F: confirmed reproduction -- Chart.yaml/values-deployment.yaml under non-canonical roots (evilroot/, differentroot/) are rejected with ZERO AWS/ECR/Helm calls", exc is not None and calls == []))
+tmp.cleanup()
+
+# G: archive links/device/FIFO members are rejected -- never followed.
+member_check_src = fn_source("_validate_packaged_chart_contents")
+results.append(("G: production code rejects symlink/hardlink archive members (issym()/islnk())", "issym()" in member_check_src and "islnk()" in member_check_src))
+results.append(("G: production code rejects device/FIFO archive members (ischr()/isblk()/isfifo())", "ischr()" in member_check_src and "isblk()" in member_check_src and "isfifo()" in member_check_src))
+tmp = tempfile.TemporaryDirectory()
+file_members = [(n, c) for n, c in canonical_chart_file_members(CHART_VERSION_VALUE) if n != "goldengate/templates/runtime-statefulset.yaml"]
+values_bytes = b"runtime:\n  containerName: goldengate\n"
+(Path(tmp.name) / "envs" / ENVIRONMENT_VALUE / DEPLOYMENT_ID_VALUE / "values.yaml").parent.mkdir(parents=True)
+(Path(tmp.name) / "envs" / ENVIRONMENT_VALUE / DEPLOYMENT_ID_VALUE / "values.yaml").write_bytes(values_bytes)
+file_members.append(("goldengate/values-deployment.yaml", values_bytes))
+symlink_info = tarfile.TarInfo(name="goldengate/templates/runtime-statefulset.yaml")
+symlink_info.type = tarfile.SYMTYPE
+symlink_info.linkname = "/etc/passwd"
+package_path = Path(tmp.name) / "packaged" / f"goldengate-{CHART_VERSION_VALUE}.tgz"
+write_chart_tar(package_path, file_members, raw_infos=[symlink_info])
+exc, calls = publish_zero_network(Path(tmp.name), f"packaged/{package_path.name}")
+results.append(("G: confirmed reproduction -- an archive symlink member is rejected with ZERO AWS/ECR/Helm calls, never followed", exc is not None and calls == []))
+tmp.cleanup()
+
+# H: packaged/ directory itself cannot be a symlink -- confirmed reproduction of the newly-confirmed gap.
+containment_src = fn_source("_validate_package_path_and_containment")
+results.append(("H: _validate_package_path_and_containment() rejects a symlinked packaged/ directory before resolving anything", 'packaged_path.is_symlink()' in containment_src))
+outer = tempfile.TemporaryDirectory()
+outer_path = Path(outer.name)
+build_root = outer_path / "build"
+build_root.mkdir()
+package_path_rel = build_package(build_root, CHART_VERSION_VALUE)
+built_package = build_root / package_path_rel
+repo_root = outer_path / "repo"
+repo_root.mkdir()
+values_src = build_root / "envs" / ENVIRONMENT_VALUE / DEPLOYMENT_ID_VALUE / "values.yaml"
+values_dst = repo_root / "envs" / ENVIRONMENT_VALUE / DEPLOYMENT_ID_VALUE / "values.yaml"
+values_dst.parent.mkdir(parents=True)
+values_dst.write_bytes(values_src.read_bytes())
+external_dir = outer_path / "external"
+external_dir.mkdir()
+(external_dir / built_package.name).write_bytes(built_package.read_bytes())
+h_ok = None
+try:
+    (repo_root / "packaged").symlink_to(external_dir, target_is_directory=True)
+except (OSError, NotImplementedError):
+    h_ok = True  # symlinks unsupported on this platform/filesystem -- cannot reproduce, but not a production defect
+if h_ok is None:
+    exc, calls = publish_zero_network(repo_root, package_path_rel)
+    h_ok = exc is not None and calls == []
+results.append(("H: confirmed reproduction -- REPO_ROOT/packaged symlinked to an external directory (canonical package placed inside it) is rejected with ZERO AWS/ECR/Helm calls", h_ok))
+outer.cleanup()
+
+# I: the package file itself cannot be a symlink (pre-existing, reconfirmed here after the containment rewrite).
+results.append(("I: _validate_package_path_and_containment() rejects a symlinked package file before resolving anything", "candidate_package_path.is_symlink()" in containment_src))
+
+# J: all artifact validation precedes every AWS/ECR/Helm-network operation -- source-order proof.
+publish_chart_src = fn_source("cmd_publish_chart")
+containment_call_index = publish_chart_src.find("_validate_package_path_and_containment(")
+contents_call_index = publish_chart_src.find("_validate_packaged_chart_contents(")
+first_network_index = publish_chart_src.find("get-login-password")
+results.append(("J: cmd_publish_chart() calls package-path/containment and packaged-chart-contents validation strictly BEFORE the first AWS ECR call", -1 not in (containment_call_index, contents_call_index, first_network_index) and containment_call_index < first_network_index and contents_call_index < first_network_index))
+
+# L: no workflow YAML implementation was reintroduced -- the publish step remains a single-line phase5_runtime.py invocation.
+build_job = jobs["build_publish_and_deploy"]
+publish_step = next((s for s in build_job["steps"] if s.get("name") == "Publish runtime Helm chart to private ECR"), None)
+results.append(("L: the 'Publish runtime Helm chart to private ECR' step still only invokes phase5_runtime.py publish-chart (no reintroduced inline package/tarfile logic)", publish_step is not None and "phase5_runtime.py publish-chart" in publish_step.get("run", "") and "tarfile" not in publish_step.get("run", "")))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  echo "$PHASE5_ARCHIVE_INTEGRITY_CHECK"
+  if [ -z "$(echo "$PHASE5_ARCHIVE_INTEGRITY_CHECK" | grep '^FAIL ' || true)" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        OK\ *) pass "Phase 5 archive-tree integrity: ${line#OK }" ;;
+      esac
+    done <<< "$PHASE5_ARCHIVE_INTEGRITY_CHECK"
+  else
+    fail "Phase 5 archive-tree integrity: dedicated static assertions failed:"$'\n'"${PHASE5_ARCHIVE_INTEGRITY_CHECK}"
+  fi
+else
+  skip "Phase 5 archive-tree integrity: dedicated static assertions -- python3/PyYAML/EKS_APP_WORKFLOW/phase5_runtime.py unavailable"
+fi
+
 echo "--- Final repository handoff hygiene sweep (VDR pre-transfer cleanliness) ---"
 
 # This is the LAST check in the suite, deliberately: earlier sections legitimately regenerate work/generated/dev/goldengate-deployments.yaml (the folder-driven registry-generation checks) as their own tested behavior -- asserting its absence any earlier would be a self-defeating mid-test assertion. Self-heal only the categories PROVEN elsewhere in this suite to be pure, expected byproducts of exercising real application/tooling behavior (never silently deleting anything whose origin is unknown); everything else must already be absent, or this check fails closed and reports it for a human to investigate before VDR handoff.

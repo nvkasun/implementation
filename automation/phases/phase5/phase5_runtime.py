@@ -584,17 +584,34 @@ def _validate_resolved_runtime_inputs(state, environment, deployment_id, *, veri
 
 
 def _validate_package_path_and_containment(package_path_rel, chart_version):
-    """Rejects any package_path that is not EXACTLY the canonical packaged/<chart>-<version>.tgz path -- never an arbitrary state-controlled filesystem path. Resolves the path with pathlib.resolve() and proves it is still contained directly under REPO_ROOT/packaged (defeats a symlink-escape even when the string itself looks canonical) before the archive is ever opened."""
+    """Rejects any package_path that is not EXACTLY the canonical packaged/<chart>-<version>.tgz path -- never an arbitrary state-controlled filesystem path. The repository-owned packaged/ directory itself, AND the package file itself, must each be a real (non-symlink) filesystem object genuinely contained under REPO_ROOT -- checked and resolved SEPARATELY and in that order, so a symlinked packaged/ directory can never make an otherwise-correct-looking containment comparison pass merely because both sides resolve to the same (entirely external) location."""
     expected_rel = _canonical_package_path(chart_version)
     if package_path_rel != expected_rel:
         raise Phase5Error(f"Phase 5 reconcile state package_path={package_path_rel!r} is not the canonical path {expected_rel!r} for chart_version={chart_version!r} -- refusing to publish an arbitrary/relocated package.")
 
-    packaged_dir = (REPO_ROOT / "packaged").resolve()
-    resolved_package_path = (REPO_ROOT / package_path_rel).resolve()
-    if resolved_package_path.parent != packaged_dir:
-        raise Phase5Error(f"Phase 5 package path {package_path_rel!r} resolves to {resolved_package_path}, which escapes the expected packaged/ directory {packaged_dir} (possible symlink escape) -- refusing to publish it.")
-    if not resolved_package_path.is_file():
-        raise Phase5Error(f"expected packaged chart archive does not exist: {resolved_package_path}")
+    repo_root_resolved = REPO_ROOT.resolve()
+    packaged_path = REPO_ROOT / "packaged"
+    if packaged_path.is_symlink():
+        raise Phase5Error(f"{packaged_path} is a symlink -- the repository-owned packaged/ directory must be a real directory, never a symlink (possible directory-level escape) -- refusing to publish anything from it.")
+    if not packaged_path.is_dir():
+        raise Phase5Error(f"expected packaged/ directory does not exist: {packaged_path}")
+    packaged_dir_resolved = packaged_path.resolve()
+    if packaged_dir_resolved != repo_root_resolved / "packaged":
+        raise Phase5Error(f"{packaged_path} resolves to {packaged_dir_resolved}, which is not the expected {repo_root_resolved / 'packaged'} -- refusing to publish from an unexpected location.")
+
+    candidate_package_path = REPO_ROOT / package_path_rel
+    if candidate_package_path.is_symlink():
+        raise Phase5Error(f"{candidate_package_path} is a symlink -- the packaged chart archive must be a real regular file, never a symlink (possible file-level escape) -- refusing to publish it.")
+    if not candidate_package_path.exists():
+        raise Phase5Error(f"expected packaged chart archive does not exist: {candidate_package_path}")
+    if not candidate_package_path.is_file():
+        raise Phase5Error(f"expected packaged chart archive path {candidate_package_path} is not a regular file (found a directory or other filesystem object).")
+
+    resolved_package_path = candidate_package_path.resolve()
+    if resolved_package_path.parent != packaged_dir_resolved:
+        raise Phase5Error(f"Phase 5 package path {package_path_rel!r} resolves to {resolved_package_path}, which escapes the expected packaged/ directory {packaged_dir_resolved} -- refusing to publish it.")
+    if repo_root_resolved not in resolved_package_path.parents:
+        raise Phase5Error(f"Phase 5 package path {package_path_rel!r} resolves to {resolved_package_path}, which is outside the repository root {repo_root_resolved} -- refusing to publish it.")
     return resolved_package_path
 
 
@@ -608,9 +625,60 @@ def _read_tar_member_bytes(tar, member_name):
     return extracted.read()
 
 
+_WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def _require_safe_archive_member_name(name, resolved_package_path):
+    """The canonical Helm package root is EXACTLY 'goldengate/' -- every archive member must live under it, using only safe relative path segments. Inspects the member NAME string only (tarfile inspection, never extraction) -- rejects empty names, absolute paths (POSIX or Windows-style), '..' traversal segments, and any non-canonical top-level root (e.g. evilroot/..., differentroot/...)."""
+    if not name or name in (".", "./"):
+        raise Phase5Error(f"packaged chart archive {resolved_package_path} contains an unsafe/empty member name {name!r}.")
+    if name.startswith("/") or name.startswith("\\"):
+        raise Phase5Error(f"packaged chart archive {resolved_package_path} contains an absolute member path {name!r} -- refusing to trust it.")
+    if _WINDOWS_ABSOLUTE_PATH_RE.match(name):
+        raise Phase5Error(f"packaged chart archive {resolved_package_path} contains a Windows-style absolute member path {name!r} -- refusing to trust it.")
+    segments = name.replace("\\", "/").split("/")
+    if any(seg in ("..", "") for seg in segments[:-1]) or segments[-1] == "..":
+        raise Phase5Error(f"packaged chart archive {resolved_package_path} contains an unsafe path-traversal member name {name!r}.")
+    if segments[0] != CHART_NAME:
+        raise Phase5Error(f"packaged chart archive {resolved_package_path} contains a member {name!r} outside the canonical archive root {CHART_NAME!r}/ -- refusing to trust a non-canonical package root.")
+
+
+def _expected_chart_package_members():
+    """Recursively derives the expected canonical archive regular-file member set from the CURRENT helm/goldengate/ source tree -- never a second, manually-maintained template list; if the canonical chart source gains/removes a legitimate file, this set follows automatically. Fails closed if the canonical source tree itself contains a symlink or anything other than a regular file/directory -- keeps the canonical source unambiguous. The one deployment-specific addition (goldengate/values-deployment.yaml, produced by _package_runtime_chart() copying the current deployment values file) is added last."""
+    members = set()
+    for path in sorted(HELM_CHART_PATH.rglob("*")):
+        if path.is_symlink():
+            raise Phase5Error(f"canonical chart source {path} is a symlink -- the canonical helm/goldengate/ source tree must contain only regular files/directories.")
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise Phase5Error(f"canonical chart source {path} is neither a regular file nor a directory -- refusing to derive a package contract from an ambiguous source tree.")
+        relative = path.relative_to(HELM_CHART_PATH).as_posix()
+        members.add(f"{CHART_NAME}/{relative}")
+    members.add(f"{CHART_NAME}/values-deployment.yaml")
+    return members
+
+
+def _load_strict_yaml_mapping(raw_bytes, source_label):
+    """Parses YAML using the same duplicate-key-rejecting loader used for rendered manifests -- an artifact trust boundary (packaged Chart.yaml) must never silently accept a duplicate key via plain yaml.safe_load's last-value-wins semantics."""
+    try:
+        loaded = yaml.load(raw_bytes, Loader=_StrictSafeLoader)
+    except _DuplicateKeyError as exc:
+        raise Phase5Error(f"{source_label} contains a duplicate YAML mapping key: {exc}") from exc
+    except yaml.YAMLError as exc:
+        raise Phase5Error(f"{source_label} is not valid YAML: {exc}") from exc
+    if not isinstance(loaded, dict):
+        raise Phase5Error(f"{source_label} is a {type(loaded).__name__}, expected a YAML mapping.")
+    return loaded
+
+
 def _validate_packaged_chart_contents(resolved_package_path, chart_version, environment, deployment_id):
-    """Inspects the .tgz using Python's stdlib tarfile module ONLY (never shells out to tar) to prove the package genuinely belongs to THIS runtime before it is ever published -- a package built for another chart/version/deployment must not be publishable merely because the surrounding reconcile-state identity fields look correct. Requires exactly one top-level Chart.yaml with name=goldengate and version=appVersion=the canonical chart version, and exactly one top-level values-deployment.yaml whose bytes exactly match the CURRENT envs/<environment>/<deployment_id>/values.yaml (_package_runtime_chart() copies that file without transformation, so this must always hold for a package genuinely built from this runtime's current values)."""
+    """Inspects the .tgz using Python's stdlib tarfile module ONLY (never shells out to tar, never extracts) to prove the package genuinely belongs to THIS runtime, from THIS current chart source, before it is ever published -- validate-local proved that helm/goldengate/ + the current deployment values render into the approved manifest; this proves the .tgz about to be pushed IS that same chart source plus that same deployment values, not an independently-mutated package. Every archive member must live under the canonical root goldengate/ with a safe relative path; only regular files and directories are accepted (no symlink/hardlink/device/FIFO); the archive's regular-file member set must EXACTLY equal the set derived from the current helm/goldengate/ source tree plus goldengate/values-deployment.yaml (missing/extra/duplicate members all fail); every member other than Chart.yaml/values-deployment.yaml must be byte-for-byte identical to its current source-tree counterpart; Chart.yaml is compared via the duplicate-key-rejecting loader against the current canonical Chart.yaml with ONLY version/appVersion overridden to the canonical chart version; values-deployment.yaml remains the exact byte-for-byte comparison against the CURRENT envs/<environment>/<deployment_id>/values.yaml."""
     import tarfile
+
+    expected_members = _expected_chart_package_members()
+    chart_yaml_member = f"{CHART_NAME}/Chart.yaml"
+    values_deployment_member = f"{CHART_NAME}/values-deployment.yaml"
 
     try:
         tar = tarfile.open(resolved_package_path, mode="r:gz")
@@ -618,35 +686,55 @@ def _validate_packaged_chart_contents(resolved_package_path, chart_version, envi
         raise Phase5Error(f"packaged chart archive {resolved_package_path} is not a valid gzip tar archive: {exc}") from exc
 
     with tar:
-        names = tar.getnames()
-        chart_yaml_candidates = [n for n in names if n.endswith("/Chart.yaml") and n.count("/") == 1]
-        if len(chart_yaml_candidates) != 1:
-            raise Phase5Error(f"packaged chart archive {resolved_package_path} does not contain exactly one top-level Chart.yaml (found: {chart_yaml_candidates}). Rejecting an ambiguous/unexpected package structure.")
-        try:
-            chart_yaml = yaml.safe_load(_read_tar_member_bytes(tar, chart_yaml_candidates[0])) or {}
-        except yaml.YAMLError as exc:
-            raise Phase5Error(f"packaged Chart.yaml is not valid YAML: {exc}") from exc
+        regular_file_names = []
+        for member in tar.getmembers():
+            _require_safe_archive_member_name(member.name, resolved_package_path)
+            if member.isdir():
+                continue
+            if member.issym() or member.islnk():
+                raise Phase5Error(f"packaged chart archive {resolved_package_path} contains a link member {member.name!r} (symbolic or hard link) -- refusing to trust any link member in a Helm runtime chart package.")
+            if member.ischr() or member.isblk() or member.isfifo():
+                raise Phase5Error(f"packaged chart archive {resolved_package_path} contains a device/FIFO member {member.name!r} -- refusing to trust any non-regular-file member in a Helm runtime chart package.")
+            if not member.isfile():
+                raise Phase5Error(f"packaged chart archive {resolved_package_path} contains a member {member.name!r} of unexpected/unsafe type -- only regular files and directories are accepted.")
+            regular_file_names.append(member.name)
 
-        if chart_yaml.get("name") != CHART_NAME:
-            raise Phase5Error(f"packaged Chart.yaml name={chart_yaml.get('name')!r}, expected {CHART_NAME!r}.")
-        if chart_yaml.get("version") != chart_version:
-            raise Phase5Error(f"packaged Chart.yaml version={chart_yaml.get('version')!r}, expected the canonical chart version {chart_version!r}.")
-        if chart_yaml.get("appVersion") != chart_version:
-            raise Phase5Error(f"packaged Chart.yaml appVersion={chart_yaml.get('appVersion')!r}, expected the canonical chart version {chart_version!r}.")
+        if len(regular_file_names) != len(set(regular_file_names)):
+            duplicates = sorted({n for n in regular_file_names if regular_file_names.count(n) > 1})
+            raise Phase5Error(f"packaged chart archive {resolved_package_path} contains duplicate/ambiguous member name(s): {duplicates}.")
 
-        values_deployment_candidates = [n for n in names if n.endswith("/values-deployment.yaml") and n.count("/") == 1]
-        if len(values_deployment_candidates) != 1:
-            raise Phase5Error(f"packaged chart archive {resolved_package_path} does not contain exactly one top-level values-deployment.yaml (found: {values_deployment_candidates}). Rejecting an ambiguous/unexpected package structure.")
-        packaged_values_bytes = _read_tar_member_bytes(tar, values_deployment_candidates[0])
+        actual_members = set(regular_file_names)
+        if actual_members != expected_members:
+            missing = sorted(expected_members - actual_members)
+            unexpected = sorted(actual_members - expected_members)
+            raise Phase5Error(f"packaged chart archive {resolved_package_path} regular-file member set does not exactly match the canonical helm/goldengate/ source (missing: {missing}, unexpected: {unexpected}).")
+
+        chart_yaml_bytes = _read_tar_member_bytes(tar, chart_yaml_member)
+        values_deployment_bytes = _read_tar_member_bytes(tar, values_deployment_member)
+
+        for member_name in sorted(expected_members - {chart_yaml_member, values_deployment_member}):
+            packaged_bytes = _read_tar_member_bytes(tar, member_name)
+            relative_path = member_name[len(CHART_NAME) + 1:]
+            current_bytes = (HELM_CHART_PATH / relative_path).read_bytes()
+            if packaged_bytes != current_bytes:
+                raise Phase5Error(f"packaged chart archive {resolved_package_path} member {member_name!r} does not byte-for-byte match the CURRENT helm/goldengate/{relative_path} -- this package was not built from the current chart source.")
+
+    current_chart_yaml = _load_strict_yaml_mapping((HELM_CHART_PATH / "Chart.yaml").read_bytes(), "helm/goldengate/Chart.yaml")
+    expected_chart_yaml = dict(current_chart_yaml)
+    expected_chart_yaml["version"] = chart_version
+    expected_chart_yaml["appVersion"] = chart_version
+    packaged_chart_yaml = _load_strict_yaml_mapping(chart_yaml_bytes, f"packaged {chart_yaml_member}")
+    if packaged_chart_yaml != expected_chart_yaml:
+        raise Phase5Error(f"packaged {chart_yaml_member} {packaged_chart_yaml!r} does not match the expected canonical Chart.yaml (current helm/goldengate/Chart.yaml with only version/appVersion set to the canonical chart version {chart_version!r}): expected {expected_chart_yaml!r}.")
 
     expected_values_path = REPO_ROOT / "envs" / environment / deployment_id / "values.yaml"
     if not expected_values_path.is_file():
         raise Phase5Error(f"expected current deployment values file does not exist: {expected_values_path}")
     expected_values_bytes = expected_values_path.read_bytes()
-    if packaged_values_bytes != expected_values_bytes:
-        raise Phase5Error(f"packaged values-deployment.yaml does not byte-for-byte match the CURRENT {expected_values_path.relative_to(REPO_ROOT)} -- this package was not built from the current deployment's values file.")
+    if values_deployment_bytes != expected_values_bytes:
+        raise Phase5Error(f"packaged {values_deployment_member} does not byte-for-byte match the CURRENT {expected_values_path.relative_to(REPO_ROOT)} -- this package was not built from the current deployment's values file.")
 
-    print(f"OK: packaged chart archive {resolved_package_path.name} verified (Chart.yaml name={CHART_NAME!r}/version={chart_version!r}/appVersion={chart_version!r}, values-deployment.yaml matches current {expected_values_path.relative_to(REPO_ROOT)} byte-for-byte).")
+    print(f"OK: packaged chart archive {resolved_package_path.name} verified against the CURRENT helm/goldengate/ source tree ({len(expected_members)} regular files, exact member-set + byte match) and CURRENT {expected_values_path.relative_to(REPO_ROOT)}.")
 
 
 # Phase 5B, step 1: prepare-deployment (no AWS credentials)
