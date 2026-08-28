@@ -30,6 +30,10 @@ def _load_tool(path, name):
 phase6 = _load_tool(TOOL_PATH, "phase6_replication")
 engine = _load_tool(ENGINE_TOOL_PATH, "goldengate_replication")
 
+# The REAL current trusted reconciler source -- fixtures use this (never a hand-rolled placeholder string) as the ConfigMap's embedded goldengate-replication.py, so every happy-path test satisfies the exact byte/text-equivalence contract _validate_rendered_manifests() now enforces against this SAME file.
+with open(ENGINE_TOOL_PATH, "r", encoding="utf-8") as _f:
+    REAL_ENGINE_SOURCE = _f.read()
+
 ENVIRONMENT = "dev"
 NAMESPACE = "goldengate-dev"
 AWS_REGION_VALUE = "eu-west-1"
@@ -128,6 +132,10 @@ def _is_render_job_call(argv):
     return len(argv) >= 2 and argv[1] == str(phase6.REPLICATION_ENGINE_TOOL) and "render-job" in argv
 
 
+def _is_replication_plan_call(argv):
+    return len(argv) >= 2 and argv[1] == str(phase6.DEPLOYMENT_MODEL_TOOL) and "replication-plan" in argv
+
+
 def _extract_arg(argv, flag):
     return argv[argv.index(flag) + 1]
 
@@ -141,16 +149,31 @@ def _pipelines_response(pipeline_ids):
     return lambda _argv: FakeProc(0, text)
 
 
+def _plan_for_pipeline_id(base_plan, pipeline_id):
+    """Overrides base_plan's own pipelineId field to exactly the requested pipeline_id -- lets fixtures discover/render a pipeline ID that differs from PLAN's own literal pipelineId (e.g. "fabricated-pipeline-001") while keeping the FAKE render-job output and the FAKE canonical replication-plan lookup mutually self-consistent, exactly as the real system always is (both are derived from the same real descriptor for a given pipeline_id)."""
+    overridden = dict(base_plan)
+    overridden["pipelineId"] = pipeline_id
+    return overridden
+
+
+def _replication_plan_response(plan):
+    """Fakes automation/goldengate-deployment-model.py's own `replication-plan <pipeline_id>` CLI -- returns `plan` with pipelineId overridden to the REQUESTED pipeline_id (argv[-1]), kept in lockstep with _render_job_side_effect()'s own override below. _load_canonical_replication_plan() now shells out to this for EVERY manifest validation, so every full-flow scripted test must supply it (see _standard_deploy_scripted())."""
+    def _fn(argv):
+        return FakeProc(0, json.dumps(_plan_for_pipeline_id(plan, argv[-1])))
+    return _fn
+
+
 def _render_job_side_effect(plan=None):
-    """Fakes automation/goldengate-replication.py's own render-job CLI: derives the same three manifests the REAL engine would (via engine.render_manifests(), never a hand-rolled approximation), then writes them exactly where the real CLI writes them -- so _validate_rendered_manifests() downstream reads genuine engine output."""
-    plan = plan or PLAN
+    """Fakes automation/goldengate-replication.py's own render-job CLI: derives the same three manifests the REAL engine would (via engine.render_manifests(), never a hand-rolled approximation) using the REAL current trusted reconciler source (REAL_ENGINE_SOURCE, never a placeholder string) and a plan whose pipelineId is overridden to the REQUESTED pipeline_id (argv[-1], kept in lockstep with _replication_plan_response() above), then writes them exactly where the real CLI writes them -- so _validate_rendered_manifests() downstream reads genuine engine output that satisfies both the exact-reconciler-source and exact-canonical-plan equivalence contracts."""
+    base_plan = plan or PLAN
 
     def _fn(argv):
         output_dir = _extract_arg(argv, "--output-dir")
         namespace = _extract_arg(argv, "--namespace")
         region = _extract_arg(argv, "--region")
         execution_id = _extract_arg(argv, "--execution-id")
-        manifests = engine.render_manifests(plan, namespace, region, "# reconciler source", execution_id)
+        effective_plan = _plan_for_pipeline_id(base_plan, argv[-1])
+        manifests = engine.render_manifests(effective_plan, namespace, region, REAL_ENGINE_SOURCE, execution_id)
         os.makedirs(output_dir, exist_ok=True)
         for kind, doc in manifests.items():
             with open(os.path.join(output_dir, f"{kind.lower()}.yaml"), "w") as f:
@@ -160,13 +183,14 @@ def _render_job_side_effect(plan=None):
 
 
 def _standard_deploy_scripted(pipeline_ids=("payments-pg-to-mssql-001",), plan=None):
-    """The happy-path scripted responder every Deploy-mode reconciliation test starts from -- collision preflight absent (kubectl get -> not found), apply/wait/logs/delete all succeed. Individual tests register additional .when() rules AFTERWARD to inject a specific failure at a specific point (later registrations take precedence)."""
+    """The happy-path scripted responder every Deploy-mode reconciliation test starts from -- collision preflight absent (kubectl get --ignore-not-found -o name -> rc=0, empty stdout, the TRUE absence shape), canonical replication-plan lookup returns the SAME plan fixture the render used, apply/wait/logs/delete all succeed. Individual tests register additional .when() rules AFTERWARD to inject a specific failure at a specific point (later registrations take precedence)."""
     scripted = ScriptedRun()
     scripted.when(_is_validate_call, _validate_ok)
     scripted.when(_is_pipelines_call, _pipelines_response(list(pipeline_ids)))
+    scripted.when(_is_replication_plan_call, _replication_plan_response(plan or PLAN))
     scripted.when(_is_render_job_call, _render_job_side_effect(plan))
     scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
-    scripted.when(_starts_with("kubectl", "get"), FakeProc(1, "", "NotFound"))
+    scripted.when(_starts_with("kubectl", "get"), FakeProc(0, "", ""))
     scripted.when(_starts_with("kubectl", "apply"), FakeProc(0, ""))
     scripted.when(_starts_with("kubectl", "wait"), FakeProc(0, ""))
     scripted.when(_starts_with("kubectl", "logs"), FakeProc(0, "sanitized log line"))
@@ -194,9 +218,9 @@ class argparse_namespace:
 
 
 def _write_manifests(plan=None, namespace=NAMESPACE, region=AWS_REGION_VALUE, execution_id="test-exec-1", tmp_dir=None):
-    """Renders the three REAL engine manifests directly (bypassing the render-job subprocess entirely) into tmp_dir -- used by the RenderStructureTests below to feed genuine-shaped input into _validate_rendered_manifests() and then corrupt one specific field per test."""
+    """Renders the three REAL engine manifests directly (bypassing the render-job subprocess entirely) into tmp_dir, using the REAL current trusted reconciler source (REAL_ENGINE_SOURCE) -- used by the RenderStructureTests below to feed genuine-shaped input into _validate_rendered_manifests() and then corrupt one specific field per test."""
     plan = plan or PLAN
-    manifests = engine.render_manifests(plan, namespace, region, "# reconciler source", execution_id)
+    manifests = engine.render_manifests(plan, namespace, region, REAL_ENGINE_SOURCE, execution_id)
     for kind, doc in manifests.items():
         with open(os.path.join(tmp_dir, f"{kind.lower()}.yaml"), "w") as f:
             yaml.safe_dump(doc, f, sort_keys=False, default_flow_style=False)
@@ -211,6 +235,14 @@ def _load_yaml(path):
 def _dump_yaml(path, doc):
     with open(path, "w") as f:
         yaml.safe_dump(doc, f, sort_keys=False, default_flow_style=False)
+
+
+def _validate_with_canonical_plan(output_dir, environment=ENVIRONMENT, pipeline_id=None, execution_id="test-exec-1", namespace=NAMESPACE, region=AWS_REGION_VALUE, plan=None):
+    """Calls phase6._validate_rendered_manifests() with _load_canonical_replication_plan() mocked to return the given (or PLAN's own) canonical plan directly -- avoids re-scripting a full goldengate-deployment-model.py replication-plan subprocess call for every structural-validation test; the dedicated CanonicalPlanBindingTests class below exercises that subprocess contract directly."""
+    plan = plan or PLAN
+    pipeline_id = pipeline_id or plan["pipelineId"]
+    with mock.patch.object(phase6, "_load_canonical_replication_plan", return_value=plan):
+        return phase6._validate_rendered_manifests(output_dir, environment, pipeline_id, execution_id, namespace, region)
 
 
 class DiscoveryTests(unittest.TestCase):
@@ -323,7 +355,7 @@ class RenderStructureTests(unittest.TestCase):
     """13-27: exact structural validation of the three rendered manifests -- kinds, namespace, shared execution name, one-container Job contract, volume read-only mounts, no Secret document, ConfigMap contents, malformed/mismatched inputs fail closed."""
 
     def _validate(self, tmp):
-        return phase6._validate_rendered_manifests(tmp, NAMESPACE)
+        return _validate_with_canonical_plan(tmp)
 
     def test_13_exact_three_manifest_kinds(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -478,13 +510,13 @@ class CollisionPreflightTests(unittest.TestCase):
 
     def test_28_all_absent_apply_allowed(self):
         scripted = ScriptedRun()
-        scripted.when(_starts_with("kubectl", "get"), FakeProc(1, "", "NotFound"))
+        scripted.when(_starts_with("kubectl", "get"), FakeProc(0, "", ""))
         with mock.patch.object(phase6, "run", scripted):
             phase6._collision_preflight("gg-repl-x-abc12345-1-1", NAMESPACE)
 
     def test_29_pre_existing_job_fails(self):
         scripted = ScriptedRun()
-        scripted.when(_starts_with("kubectl", "get"), FakeProc(1, "", "NotFound"))
+        scripted.when(_starts_with("kubectl", "get"), FakeProc(0, "", ""))
         scripted.when(_starts_with("kubectl", "get", "job"), FakeProc(0, "job/x found"))
         with mock.patch.object(phase6, "run", scripted):
             with self.assertRaises(phase6.Phase6Error):
@@ -492,7 +524,7 @@ class CollisionPreflightTests(unittest.TestCase):
 
     def test_30_pre_existing_configmap_fails(self):
         scripted = ScriptedRun()
-        scripted.when(_starts_with("kubectl", "get"), FakeProc(1, "", "NotFound"))
+        scripted.when(_starts_with("kubectl", "get"), FakeProc(0, "", ""))
         scripted.when(_starts_with("kubectl", "get", "configmap"), FakeProc(0, "configmap/x found"))
         with mock.patch.object(phase6, "run", scripted):
             with self.assertRaises(phase6.Phase6Error):
@@ -500,7 +532,7 @@ class CollisionPreflightTests(unittest.TestCase):
 
     def test_31_pre_existing_spc_fails(self):
         scripted = ScriptedRun()
-        scripted.when(_starts_with("kubectl", "get"), FakeProc(1, "", "NotFound"))
+        scripted.when(_starts_with("kubectl", "get"), FakeProc(0, "", ""))
         scripted.when(_starts_with("kubectl", "get", "secretproviderclass"), FakeProc(0, "secretproviderclass/x found"))
         with mock.patch.object(phase6, "run", scripted):
             with self.assertRaises(phase6.Phase6Error):
@@ -749,7 +781,8 @@ class ValidateModeTests(unittest.TestCase):
             namespace = _extract_arg(argv, "--namespace")
             region = _extract_arg(argv, "--region")
             execution_id = _extract_arg(argv, "--execution-id")
-            manifests = engine.render_manifests(PLAN, namespace, region, "# reconciler source", execution_id)
+            effective_plan = _plan_for_pipeline_id(PLAN, argv[-1])
+            manifests = engine.render_manifests(effective_plan, namespace, region, REAL_ENGINE_SOURCE, execution_id)
             manifests["ConfigMap"]["data"]["password"] = "hunter2-actual-literal-secret-value"
             os.makedirs(output_dir, exist_ok=True)
             for kind, doc in manifests.items():
@@ -760,6 +793,7 @@ class ValidateModeTests(unittest.TestCase):
         scripted = ScriptedRun()
         scripted.when(_is_validate_call, _validate_ok)
         scripted.when(_is_pipelines_call, _pipelines_response(["fabricated-pipeline-001"]))
+        scripted.when(_is_replication_plan_call, _replication_plan_response(PLAN))
         scripted.when(_is_render_job_call, _poisoned_render)
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.object(phase6, "REPO_ROOT", Path(tmp)), mock.patch.object(phase6, "run", scripted), _env_patch():
@@ -767,13 +801,13 @@ class ValidateModeTests(unittest.TestCase):
                     _run_quiet(phase6.cmd_validate_local, argparse_namespace(environment=ENVIRONMENT))
 
     def test_56_legitimate_ogg_db_password_jmes_selector_does_not_falsely_fail(self):
-        manifests = engine.render_manifests(PLAN, NAMESPACE, AWS_REGION_VALUE, "# reconciler source", "dry-run")
+        manifests = engine.render_manifests(PLAN, NAMESPACE, AWS_REGION_VALUE, REAL_ENGINE_SOURCE, "dry-run")
         objects_text = manifests["SecretProviderClass"]["spec"]["parameters"]["objects"]
         self.assertIn("OGG_DB_PASSWORD", objects_text)
         with tempfile.TemporaryDirectory() as tmp:
             for kind, doc in manifests.items():
                 _dump_yaml(os.path.join(tmp, f"{kind.lower()}.yaml"), doc)
-            execution_name = phase6._validate_rendered_manifests(tmp, NAMESPACE)
+            execution_name = _validate_with_canonical_plan(tmp, execution_id="dry-run")
         self.assertTrue(execution_name)
 
 
@@ -815,6 +849,515 @@ class WorkflowCredentialScopeTests(unittest.TestCase):
     def test_62_no_pipeline_step_gated_by_has_pipelines_false(self):
         step = self.steps["No replication pipeline enabled"]
         self.assertEqual(step.get("if"), "steps.replication_discovery.outputs.has_pipelines == 'false'")
+
+
+class CollisionErrorClassificationTests(unittest.TestCase):
+    """Fix 1 regression: kubectl inspection now uses --ignore-not-found -o name with authoritative command success (run()'s own check=True) -- a Forbidden/Unauthorized/timeout/network/cluster-unreachable/TLS/unknown/empty-error kubectl failure is NEVER interpreted as absence; only a successful command with empty stdout proves absence."""
+
+    def _assert_inspection_error_fails_closed(self, returncode, stderr):
+        scripted = ScriptedRun()
+        scripted.when(_starts_with("kubectl", "get"), FakeProc(returncode, "", stderr))
+        with mock.patch.object(phase6, "run", scripted):
+            with self.assertRaises(phase6.Phase6Error):
+                phase6._collision_preflight("gg-repl-x-abc12345-1-1", NAMESPACE)
+
+    def test_63_confirmed_reproduction_forbidden_error_now_fails_closed(self):
+        """Confirmed reproduction: `kubectl get secretproviderclass ...` returncode=1, stderr="Error from server (Forbidden): secretproviderclasses.secrets-store.csi.x-k8s.io is forbidden" previously returned SUCCESS (interpreted as absence) from the retired _collision_preflight() -- now fails closed."""
+        self._assert_inspection_error_fails_closed(1, "Error from server (Forbidden): secretproviderclasses.secrets-store.csi.x-k8s.io is forbidden")
+
+    def test_64_unauthorized_fails_closed(self):
+        self._assert_inspection_error_fails_closed(1, "error: You must be logged in to the server (Unauthorized)")
+
+    def test_65_context_deadline_exceeded_timeout_fails_closed(self):
+        self._assert_inspection_error_fails_closed(1, "Unable to connect to the server: context deadline exceeded")
+
+    def test_66_cluster_unreachable_connection_refused_fails_closed(self):
+        self._assert_inspection_error_fails_closed(1, "The connection to the server 127.0.0.1:6443 was refused")
+
+    def test_67_tls_network_failure_fails_closed(self):
+        self._assert_inspection_error_fails_closed(1, "Unable to connect to the server: x509: certificate signed by unknown authority")
+
+    def test_68_unknown_error_fails_closed(self):
+        self._assert_inspection_error_fails_closed(17, "some completely unrecognized error text")
+
+    def test_69_nonzero_with_empty_stdout_and_stderr_fails_closed(self):
+        self._assert_inspection_error_fails_closed(1, "")
+
+    def test_70_ignore_not_found_absent_path_returns_rc0_empty_is_safe(self):
+        scripted = ScriptedRun()
+        scripted.when(_starts_with("kubectl", "get"), FakeProc(0, "", ""))
+        with mock.patch.object(phase6, "run", scripted):
+            phase6._collision_preflight("gg-repl-x-abc12345-1-1", NAMESPACE)  # must not raise
+
+    def test_71_every_collision_get_command_uses_ignore_not_found_and_o_name(self):
+        scripted = ScriptedRun()
+        scripted.when(_starts_with("kubectl", "get"), FakeProc(0, "", ""))
+        with mock.patch.object(phase6, "run", scripted):
+            phase6._collision_preflight("gg-repl-x-abc12345-1-1", NAMESPACE)
+        get_calls = [c["argv"] for c in scripted.calls if c["argv"][:2] == ["kubectl", "get"]]
+        self.assertEqual(len(get_calls), 3)
+        for call in get_calls:
+            self.assertIn("--ignore-not-found", call)
+            self.assertIn("-o", call)
+            self.assertIn("name", call)
+
+    def test_72_inspection_error_on_first_resource_zero_subsequent_kubectl_mutation(self):
+        scripted = ScriptedRun()
+        scripted.when(_starts_with("kubectl", "get"), FakeProc(0, "", ""))
+        scripted.when(_starts_with("kubectl", "get", "secretproviderclass"), FakeProc(1, "", "Error from server (Forbidden)"))
+        with mock.patch.object(phase6, "run", scripted):
+            with self.assertRaises(phase6.Phase6Error):
+                phase6._collision_preflight("gg-repl-x-abc12345-1-1", NAMESPACE)
+        self.assertEqual([c for c in scripted.calls if c["argv"][:2] in (["kubectl", "apply"], ["kubectl", "wait"], ["kubectl", "delete"])], [])
+        get_calls = [c["argv"] for c in scripted.calls if c["argv"][:2] == ["kubectl", "get"]]
+        self.assertEqual(len(get_calls), 1, "ConfigMap/Job inspection must never even start once the first (SecretProviderClass) inspection has already failed closed")
+
+    def test_73_inspection_failure_inside_full_cmd_reconcile_zero_apply_calls(self):
+        scripted = _standard_deploy_scripted(pipeline_ids=("fabricated-pipeline-001",))
+        scripted.when(_starts_with("kubectl", "get", "secretproviderclass"), FakeProc(1, "", "Error from server (Forbidden)"))
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(phase6, "REPO_ROOT", Path(tmp)), mock.patch.object(phase6, "run", scripted), _env_patch():
+                with self.assertRaises(phase6.Phase6Error):
+                    _run_quiet(phase6.cmd_reconcile, argparse_namespace(environment=ENVIRONMENT, execution_id="1-1"))
+        self.assertEqual([c for c in scripted.calls if c["argv"][:2] == ["kubectl", "apply"]], [])
+
+
+class CanonicalPlanBindingTests(unittest.TestCase):
+    """Fix 2 regression: ConfigMap.data['plan.json'] must exactly equal the CURRENT canonical replication plan obtained via `automation/goldengate-deployment-model.py replication-plan` -- any drift (pipelineId, secret names, image, ServiceAccount, process configuration) fails, never normalized away."""
+
+    def _validate_against_canonical(self, tmp, canonical_plan, rendered_plan=None):
+        rendered_plan = rendered_plan if rendered_plan is not None else canonical_plan
+        _write_manifests(plan=rendered_plan, tmp_dir=tmp, execution_id="test-exec-1")
+        with mock.patch.object(phase6, "_load_canonical_replication_plan", return_value=canonical_plan):
+            return phase6._validate_rendered_manifests(tmp, ENVIRONMENT, canonical_plan["pipelineId"], "test-exec-1", NAMESPACE, AWS_REGION_VALUE)
+
+    def test_74_valid_configmap_plan_json_equals_canonical_plan_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._validate_against_canonical(tmp, PLAN)
+
+    def test_75_plan_pipeline_id_mismatch_fails(self):
+        drifted = json.loads(json.dumps(PLAN))
+        drifted["pipelineId"] = "different-pipeline-id"
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(phase6.Phase6Error):
+                self._validate_against_canonical(tmp, PLAN, rendered_plan=drifted)
+
+    def test_76_source_admin_secret_mismatch_fails(self):
+        drifted = json.loads(json.dumps(PLAN))
+        drifted["source"]["adminSecret"] = "dev/goldengate/UNRELATED/admin"
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(phase6.Phase6Error):
+                self._validate_against_canonical(tmp, PLAN, rendered_plan=drifted)
+
+    def test_77_target_admin_secret_mismatch_fails(self):
+        drifted = json.loads(json.dumps(PLAN))
+        drifted["target"]["adminSecret"] = "dev/goldengate/UNRELATED/admin"
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(phase6.Phase6Error):
+                self._validate_against_canonical(tmp, PLAN, rendered_plan=drifted)
+
+    def test_78_source_db_secret_mismatch_fails(self):
+        drifted = json.loads(json.dumps(PLAN))
+        drifted["source"]["databaseSecret"] = "dev/goldengate/UNRELATED/source-db"
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(phase6.Phase6Error):
+                self._validate_against_canonical(tmp, PLAN, rendered_plan=drifted)
+
+    def test_79_target_db_secret_mismatch_fails(self):
+        drifted = json.loads(json.dumps(PLAN))
+        drifted["target"]["databaseSecret"] = "dev/goldengate/UNRELATED/target-db"
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(phase6.Phase6Error):
+                self._validate_against_canonical(tmp, PLAN, rendered_plan=drifted)
+
+    def test_80_tls_secret_mismatch_fails(self):
+        drifted = json.loads(json.dumps(PLAN))
+        drifted["tlsSecret"] = "dev/goldengate/UNRELATED/tls"
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(phase6.Phase6Error):
+                self._validate_against_canonical(tmp, PLAN, rendered_plan=drifted)
+
+    def test_81_source_image_mismatch_fails(self):
+        drifted = json.loads(json.dumps(PLAN))
+        drifted["source"]["image"] = "229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-postgresql:99.99.99"
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(phase6.Phase6Error):
+                self._validate_against_canonical(tmp, PLAN, rendered_plan=drifted)
+
+    def test_82_source_service_account_mismatch_fails(self):
+        drifted = json.loads(json.dumps(PLAN))
+        drifted["source"]["serviceAccount"] = "some-other-sa"
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(phase6.Phase6Error):
+                self._validate_against_canonical(tmp, PLAN, rendered_plan=drifted)
+
+    def test_83_extract_configuration_mismatch_fails(self):
+        drifted = json.loads(json.dumps(PLAN))
+        drifted["extract"]["name"] = "DIFFERENT_EXTRACT_NAME"
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(phase6.Phase6Error):
+                self._validate_against_canonical(tmp, PLAN, rendered_plan=drifted)
+
+
+class ConfigMapContractTests(unittest.TestCase):
+    """Fix 2 regression: ConfigMap.data key set must be exactly {goldengate-replication.py, plan.json}; the embedded reconciler program must exactly equal the CURRENT automation/goldengate-replication.py; a replaced/malicious reconciler program must fail before kubectl apply."""
+
+    def _render_and_get_path(self, tmp, plan=None):
+        plan = plan or PLAN
+        _write_manifests(plan=plan, tmp_dir=tmp, execution_id="test-exec-1")
+        return os.path.join(tmp, "configmap.yaml")
+
+    def _validate(self, tmp, plan=None):
+        plan = plan or PLAN
+        with mock.patch.object(phase6, "_load_canonical_replication_plan", return_value=plan):
+            return phase6._validate_rendered_manifests(tmp, ENVIRONMENT, plan["pipelineId"], "test-exec-1", NAMESPACE, AWS_REGION_VALUE)
+
+    def test_84_exact_two_configmap_keys_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._render_and_get_path(tmp)
+            self._validate(tmp)
+
+    def test_85_confirmed_reproduction_extra_configmap_data_key_leaked_fails(self):
+        """Confirmed reproduction: ConfigMap.data gaining a "leaked" key with a literal secret value previously returned SUCCESS -- now fails via the exact-key-set contract regardless of the key's name."""
+        with tempfile.TemporaryDirectory() as tmp:
+            configmap_path = self._render_and_get_path(tmp)
+            configmap = _load_yaml(configmap_path)
+            configmap["data"]["leaked"] = "hunter2-actual-secret-value"
+            _dump_yaml(configmap_path, configmap)
+            with self.assertRaises(phase6.Phase6Error):
+                self._validate(tmp)
+
+    def test_86_missing_reconciler_source_key_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            configmap_path = self._render_and_get_path(tmp)
+            configmap = _load_yaml(configmap_path)
+            del configmap["data"]["goldengate-replication.py"]
+            _dump_yaml(configmap_path, configmap)
+            with self.assertRaises(phase6.Phase6Error):
+                self._validate(tmp)
+
+    def test_87_missing_plan_json_key_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            configmap_path = self._render_and_get_path(tmp)
+            configmap = _load_yaml(configmap_path)
+            del configmap["data"]["plan.json"]
+            _dump_yaml(configmap_path, configmap)
+            with self.assertRaises(phase6.Phase6Error):
+                self._validate(tmp)
+
+    def test_88_confirmed_reproduction_replaced_reconciler_source_fails(self):
+        """Confirmed reproduction: ConfigMap.data['goldengate-replication.py'] replaced with print("malicious replacement") previously returned SUCCESS -- now fails via exact byte/text equivalence to the CURRENT trusted engine source."""
+        with tempfile.TemporaryDirectory() as tmp:
+            configmap_path = self._render_and_get_path(tmp)
+            configmap = _load_yaml(configmap_path)
+            configmap["data"]["goldengate-replication.py"] = 'print("malicious replacement")\n'
+            _dump_yaml(configmap_path, configmap)
+            with self.assertRaises(phase6.Phase6Error):
+                self._validate(tmp)
+
+    def test_89_reconciler_source_must_exactly_equal_current_engine_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            configmap_path = self._render_and_get_path(tmp)
+            configmap = _load_yaml(configmap_path)
+            self.assertEqual(configmap["data"]["goldengate-replication.py"], REAL_ENGINE_SOURCE)
+
+
+class SecretProviderClassContractTests(unittest.TestCase):
+    """Fix 2 regression: the replication SecretProviderClass is file-mount-only (spec.secretObjects entirely forbidden) and its object/alias list is bound EXACTLY to the canonical plan -- never read from the SPC being validated."""
+
+    def _render_and_validate(self, tmp, mutate_spc=None, plan=None):
+        plan = plan or PLAN
+        _write_manifests(plan=plan, tmp_dir=tmp, execution_id="test-exec-1")
+        if mutate_spc:
+            spc_path = os.path.join(tmp, "secretproviderclass.yaml")
+            spc = _load_yaml(spc_path)
+            mutate_spc(spc)
+            _dump_yaml(spc_path, spc)
+        with mock.patch.object(phase6, "_load_canonical_replication_plan", return_value=plan):
+            return phase6._validate_rendered_manifests(tmp, ENVIRONMENT, plan["pipelineId"], "test-exec-1", NAMESPACE, AWS_REGION_VALUE)
+
+    @staticmethod
+    def _mutate_objects(spc, fn):
+        objects = yaml.safe_load(spc["spec"]["parameters"]["objects"])
+        fn(objects)
+        spc["spec"]["parameters"]["objects"] = yaml.safe_dump(objects, sort_keys=False, default_flow_style=False)
+
+    def test_90_correct_canonical_objects_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._render_and_validate(tmp)
+
+    def test_91_confirmed_reproduction_secretobjects_added_fails(self):
+        """Confirmed reproduction: spec.secretObjects (a Kubernetes-Secret-sync directive) added to an otherwise-valid SPC previously returned SUCCESS -- now forbidden entirely."""
+        def _mutate(spc):
+            spc["spec"]["secretObjects"] = [{"secretName": "replication-creds", "type": "Opaque",
+                                             "data": [{"objectName": "source-db-password", "key": "password"}]}]
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(phase6.Phase6Error):
+                self._render_and_validate(tmp, mutate_spc=_mutate)
+
+    def test_92_secretobjects_empty_list_still_fails(self):
+        def _mutate(spc):
+            spc["spec"]["secretObjects"] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(phase6.Phase6Error):
+                self._render_and_validate(tmp, mutate_spc=_mutate)
+
+    def test_93_secretobjects_null_still_fails(self):
+        def _mutate(spc):
+            spc["spec"]["secretObjects"] = None
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(phase6.Phase6Error):
+                self._render_and_validate(tmp, mutate_spc=_mutate)
+
+    def test_94_confirmed_reproduction_unrelated_source_admin_objectname_fails(self):
+        """Confirmed reproduction: the source-admin SecretProviderClass objectName changed from the canonical replication plan value to dev/goldengate/UNRELATED/admin previously returned SUCCESS -- now bound exactly to the canonical plan."""
+        def _mutate(spc):
+            self._mutate_objects(spc, lambda objs: objs.__setitem__(0, {**objs[0], "objectName": "dev/goldengate/UNRELATED/admin"}))
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(phase6.Phase6Error):
+                self._render_and_validate(tmp, mutate_spc=_mutate)
+
+    def test_95_wrong_target_admin_secret_fails(self):
+        def _mutate(spc):
+            self._mutate_objects(spc, lambda objs: objs.__setitem__(1, {**objs[1], "objectName": "dev/goldengate/UNRELATED/target-admin"}))
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(phase6.Phase6Error):
+                self._render_and_validate(tmp, mutate_spc=_mutate)
+
+    def test_96_wrong_source_db_secret_fails(self):
+        def _mutate(spc):
+            self._mutate_objects(spc, lambda objs: objs.__setitem__(2, {**objs[2], "objectName": "dev/goldengate/UNRELATED/source-db"}))
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(phase6.Phase6Error):
+                self._render_and_validate(tmp, mutate_spc=_mutate)
+
+    def test_97_wrong_target_db_secret_fails(self):
+        def _mutate(spc):
+            self._mutate_objects(spc, lambda objs: objs.__setitem__(3, {**objs[3], "objectName": "dev/goldengate/UNRELATED/target-db"}))
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(phase6.Phase6Error):
+                self._render_and_validate(tmp, mutate_spc=_mutate)
+
+    def test_98_wrong_tls_secret_fails(self):
+        def _mutate(spc):
+            self._mutate_objects(spc, lambda objs: objs.__setitem__(4, {**objs[4], "objectName": "dev/goldengate/UNRELATED/tls"}))
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(phase6.Phase6Error):
+                self._render_and_validate(tmp, mutate_spc=_mutate)
+
+    def test_99_extra_spc_object_fails(self):
+        def _mutate(spc):
+            self._mutate_objects(spc, lambda objs: objs.append({"objectName": "dev/goldengate/UNRELATED/extra", "objectType": "secretsmanager",
+                                                                 "jmesPath": [{"path": "X", "objectAlias": "extra-alias"}]}))
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(phase6.Phase6Error):
+                self._render_and_validate(tmp, mutate_spc=_mutate)
+
+    def test_100_missing_spc_object_fails(self):
+        def _mutate(spc):
+            self._mutate_objects(spc, lambda objs: objs.pop())
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(phase6.Phase6Error):
+                self._render_and_validate(tmp, mutate_spc=_mutate)
+
+    def test_101_wrong_jmes_alias_fails(self):
+        def _mutate(spc):
+            self._mutate_objects(spc, lambda objs: objs[0]["jmesPath"][0].__setitem__("objectAlias", "wrong-alias"))
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(phase6.Phase6Error):
+                self._render_and_validate(tmp, mutate_spc=_mutate)
+
+    def test_102_wrong_object_type_fails(self):
+        def _mutate(spc):
+            self._mutate_objects(spc, lambda objs: objs[0].__setitem__("objectType", "someOtherType"))
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(phase6.Phase6Error):
+                self._render_and_validate(tmp, mutate_spc=_mutate)
+
+    def test_103_wrong_region_fails(self):
+        def _mutate(spc):
+            spc["spec"]["parameters"]["region"] = "us-east-1"
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(phase6.Phase6Error):
+                self._render_and_validate(tmp, mutate_spc=_mutate)
+
+    def test_104_duplicate_embedded_yaml_key_fails(self):
+        def _mutate(spc):
+            spc["spec"]["parameters"]["objects"] = "- objectName: dup\n  objectType: secretsmanager\n  objectType: secretsmanager\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(phase6.Phase6Error):
+                self._render_and_validate(tmp, mutate_spc=_mutate)
+
+
+class JobExactContractTests(unittest.TestCase):
+    """Fix 2 regression: the Job must run the EXACT fixed worker command, forbid env/envFrom entirely (credentials remain mounted files only), and mount exactly the two expected read-only volumes referencing the execution ConfigMap/SecretProviderClass."""
+
+    def _render_and_validate(self, tmp, mutate_job=None, plan=None):
+        plan = plan or PLAN
+        _write_manifests(plan=plan, tmp_dir=tmp, execution_id="test-exec-1")
+        if mutate_job:
+            job_path = os.path.join(tmp, "job.yaml")
+            job = _load_yaml(job_path)
+            mutate_job(job)
+            _dump_yaml(job_path, job)
+        with mock.patch.object(phase6, "_load_canonical_replication_plan", return_value=plan):
+            return phase6._validate_rendered_manifests(tmp, ENVIRONMENT, plan["pipelineId"], "test-exec-1", NAMESPACE, AWS_REGION_VALUE)
+
+    def test_105_canonical_command_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._render_and_validate(tmp)
+
+    def test_106_changed_command_fails(self):
+        def _mutate(job):
+            job["spec"]["template"]["spec"]["containers"][0]["command"] = ["python3", "-c", "print('hi')"]
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(phase6.Phase6Error):
+                self._render_and_validate(tmp, mutate_job=_mutate)
+
+    def test_107_added_nonempty_args_fails(self):
+        def _mutate(job):
+            job["spec"]["template"]["spec"]["containers"][0]["args"] = ["--verbose"]
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(phase6.Phase6Error):
+                self._render_and_validate(tmp, mutate_job=_mutate)
+
+    def test_108_empty_args_still_passes(self):
+        def _mutate(job):
+            job["spec"]["template"]["spec"]["containers"][0]["args"] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            self._render_and_validate(tmp, mutate_job=_mutate)
+
+    def test_109_confirmed_reproduction_literal_env_db_password_fails(self):
+        """Confirmed reproduction: a Job container env entry {name: DB_PASSWORD, value: hunter2-actual-secret} previously returned SUCCESS (its mapping keys are name/value, not "password") -- now env is forbidden entirely, regardless of key naming."""
+        def _mutate(job):
+            job["spec"]["template"]["spec"]["containers"][0]["env"] = [{"name": "DB_PASSWORD", "value": "hunter2-actual-secret"}]
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(phase6.Phase6Error):
+                self._render_and_validate(tmp, mutate_job=_mutate)
+
+    def test_110_envfrom_fails(self):
+        def _mutate(job):
+            job["spec"]["template"]["spec"]["containers"][0]["envFrom"] = [{"secretRef": {"name": "some-secret"}}]
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(phase6.Phase6Error):
+                self._render_and_validate(tmp, mutate_job=_mutate)
+
+    def test_111_wrong_reconciler_mount_path_fails(self):
+        def _mutate(job):
+            for vm in job["spec"]["template"]["spec"]["containers"][0]["volumeMounts"]:
+                if vm["name"] == "reconciler-script":
+                    vm["mountPath"] = "/some/other/path"
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(phase6.Phase6Error):
+                self._render_and_validate(tmp, mutate_job=_mutate)
+
+    def test_112_wrong_secret_mount_path_fails(self):
+        def _mutate(job):
+            for vm in job["spec"]["template"]["spec"]["containers"][0]["volumeMounts"]:
+                if vm["name"] == "replication-secrets":
+                    vm["mountPath"] = "/some/other/secret/path"
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(phase6.Phase6Error):
+                self._render_and_validate(tmp, mutate_job=_mutate)
+
+    def test_113_extra_volumemount_fails(self):
+        def _mutate(job):
+            job["spec"]["template"]["spec"]["containers"][0]["volumeMounts"].append({"name": "extra-mount", "mountPath": "/mnt/extra", "readOnly": True})
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(phase6.Phase6Error):
+                self._render_and_validate(tmp, mutate_job=_mutate)
+
+    def test_114_wrong_configmap_volume_reference_fails(self):
+        def _mutate(job):
+            for v in job["spec"]["template"]["spec"]["volumes"]:
+                if v["name"] == "reconciler-script":
+                    v["configMap"]["name"] = "some-other-configmap"
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(phase6.Phase6Error):
+                self._render_and_validate(tmp, mutate_job=_mutate)
+
+    def test_115_wrong_csi_driver_fails(self):
+        def _mutate(job):
+            for v in job["spec"]["template"]["spec"]["volumes"]:
+                if v["name"] == "replication-secrets":
+                    v["csi"]["driver"] = "some.other.csi.driver"
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(phase6.Phase6Error):
+                self._render_and_validate(tmp, mutate_job=_mutate)
+
+    def test_116_extra_volume_fails(self):
+        def _mutate(job):
+            job["spec"]["template"]["spec"]["volumes"].append({"name": "extra-volume", "emptyDir": {}})
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(phase6.Phase6Error):
+                self._render_and_validate(tmp, mutate_job=_mutate)
+
+    def test_117_canonical_job_remains_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            execution_name = self._render_and_validate(tmp)
+            self.assertTrue(execution_name)
+
+
+class DeployValidateParityTests(unittest.TestCase):
+    """53-56: Deploy and Validate still use the SAME manifest validator; Validate remains zero aws/kubectl; a local manifest validation failure occurs before collision preflight and performs zero kubectl apply."""
+
+    @staticmethod
+    def _poisoned_render_with_leaked_key(argv):
+        output_dir = _extract_arg(argv, "--output-dir")
+        namespace = _extract_arg(argv, "--namespace")
+        region = _extract_arg(argv, "--region")
+        execution_id = _extract_arg(argv, "--execution-id")
+        effective_plan = _plan_for_pipeline_id(PLAN, argv[-1])
+        manifests = engine.render_manifests(effective_plan, namespace, region, REAL_ENGINE_SOURCE, execution_id)
+        manifests["ConfigMap"]["data"]["leaked"] = "hunter2-actual-secret-value"
+        os.makedirs(output_dir, exist_ok=True)
+        for kind, doc in manifests.items():
+            with open(os.path.join(output_dir, f"{kind.lower()}.yaml"), "w") as f:
+                yaml.safe_dump(doc, f, sort_keys=False, default_flow_style=False)
+        return FakeProc(0, "")
+
+    def _poisoned_scripted(self):
+        scripted = ScriptedRun()
+        scripted.when(_is_validate_call, _validate_ok)
+        scripted.when(_is_pipelines_call, _pipelines_response([PLAN["pipelineId"]]))
+        scripted.when(_is_replication_plan_call, _replication_plan_response(PLAN))
+        scripted.when(_is_render_job_call, self._poisoned_render_with_leaked_key)
+        scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
+        scripted.when(_starts_with("kubectl", "get"), FakeProc(0, "", ""))
+        return scripted
+
+    def test_118_deploy_and_validate_use_the_same_validator(self):
+        import ast as _ast
+        with open(TOOL_PATH) as f:
+            source = f.read()
+        tree = _ast.parse(source)
+        reconcile_one = next(n for n in _ast.walk(tree) if isinstance(n, _ast.FunctionDef) and n.name == "_reconcile_one_pipeline")
+        validate_local = next(n for n in _ast.walk(tree) if isinstance(n, _ast.FunctionDef) and n.name == "cmd_validate_local")
+        self.assertIn("_validate_rendered_manifests(", _ast.get_source_segment(source, reconcile_one))
+        self.assertIn("_validate_rendered_manifests(", _ast.get_source_segment(source, validate_local))
+
+    def test_119_validate_remains_zero_aws_kubectl(self):
+        scripted = _standard_deploy_scripted(pipeline_ids=("fabricated-pipeline-001",))
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(phase6, "REPO_ROOT", Path(tmp)), mock.patch.object(phase6, "run", scripted), _env_patch():
+                _run_quiet(phase6.cmd_validate_local, argparse_namespace(environment=ENVIRONMENT))
+        self.assertEqual([c for c in scripted.calls if c["argv"][:1] in (["aws"], ["kubectl"])], [])
+
+    def test_120_local_manifest_validation_failure_occurs_before_collision_preflight(self):
+        scripted = self._poisoned_scripted()
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(phase6, "REPO_ROOT", Path(tmp)), mock.patch.object(phase6, "run", scripted), _env_patch():
+                with self.assertRaises(phase6.Phase6Error):
+                    _run_quiet(phase6.cmd_reconcile, argparse_namespace(environment=ENVIRONMENT, execution_id="1-1"))
+        self.assertEqual([c for c in scripted.calls if c["argv"][:2] == ["kubectl", "get"]], [], "collision preflight must never run once local manifest validation already failed")
+
+    def test_121_local_manifest_validation_failure_performs_zero_kubectl_apply(self):
+        scripted = self._poisoned_scripted()
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(phase6, "REPO_ROOT", Path(tmp)), mock.patch.object(phase6, "run", scripted), _env_patch():
+                with self.assertRaises(phase6.Phase6Error):
+                    _run_quiet(phase6.cmd_reconcile, argparse_namespace(environment=ENVIRONMENT, execution_id="1-1"))
+        self.assertEqual([c for c in scripted.calls if c["argv"][:2] == ["kubectl", "apply"]], [])
 
 
 if __name__ == "__main__":

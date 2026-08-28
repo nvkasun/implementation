@@ -170,8 +170,69 @@ def _assert_no_secret_values(obj, path_label):
             _assert_no_secret_values(nested, path_label)
 
 
-def _validate_rendered_manifests(output_dir, expected_namespace):
-    """Structurally validates the three rendered replication reconciliation manifests BEFORE any kubectl apply (Deploy) or as the sole check (Validate) -- exactly one SecretProviderClass/ConfigMap/Job, all three sharing the SAME canonical RUNTIME_NAMESPACE and the SAME engine-derived execution resource name, the Job matching the fixed one-container reconciler contract (image/ServiceAccount cross-checked against the SAME plan.json embedded in the ConfigMap, never a second independently-maintained expectation), and no secret VALUE anywhere across all three documents. Returns the shared execution resource name. Never re-implements the engine's own render functions -- reads only the files render-job already wrote to output_dir."""
+def _load_canonical_replication_plan(environment, pipeline_id):
+    """Obtains the CURRENT canonical replication plan through the ONE existing deployment-model CLI (automation/goldengate-deployment-model.py replication-plan <pipeline_id>) -- never an independent descriptor YAML parser. Requires the command to succeed (via run()'s own check=True), stdout to be valid JSON, the result to be a dict, and plan.pipelineId to equal the requested pipeline_id -- defense against a caller passing a pipeline_id that silently resolves to a different plan."""
+    proc = run([sys.executable, str(DEPLOYMENT_MODEL_TOOL), "--environment", environment, "replication-plan", pipeline_id])
+    try:
+        plan = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise Phase6Error(f"canonical replication-plan output for pipeline {pipeline_id!r} is not valid JSON: {exc}") from exc
+    if not isinstance(plan, dict):
+        raise Phase6Error(f"canonical replication-plan output for pipeline {pipeline_id!r} is a {type(plan).__name__}, expected a JSON object.")
+    if plan.get("pipelineId") != pipeline_id:
+        raise Phase6Error(f"canonical replication-plan pipelineId {plan.get('pipelineId')!r} does not match the requested pipeline_id {pipeline_id!r}.")
+    return plan
+
+
+def _expected_spc_objects(canonical_plan):
+    """Builds the EXPECTED SecretProviderClass object list FROM THE CANONICAL PLAN -- never read from the actual rendered SecretProviderClass -- so a tampered SPC (wrong objectName, extra/missing object, changed alias/JMES path/objectType) can never validate against itself. Mirrors the CURRENT engine's own render_secret_provider_class() object/alias contract exactly: source admin, target admin, source DB, target DB, and TLS -- five objects, in this fixed order."""
+    src, tgt = canonical_plan["source"], canonical_plan["target"]
+    return [
+        {
+            "objectName": src["adminSecret"], "objectType": "secretsmanager",
+            "jmesPath": [
+                {"path": "OGG_ADMIN", "objectAlias": "source-admin-username"},
+                {"path": "OGG_ADMIN_PWD", "objectAlias": "source-admin-password"},
+            ],
+        },
+        {
+            "objectName": tgt["adminSecret"], "objectType": "secretsmanager",
+            "jmesPath": [
+                {"path": "OGG_ADMIN", "objectAlias": "target-admin-username"},
+                {"path": "OGG_ADMIN_PWD", "objectAlias": "target-admin-password"},
+            ],
+        },
+        {
+            "objectName": src["databaseSecret"], "objectType": "secretsmanager",
+            "jmesPath": [
+                {"path": "OGG_DB_USERID", "objectAlias": "source-db-userid"},
+                {"path": "OGG_DB_PASSWORD", "objectAlias": "source-db-password"},
+            ],
+        },
+        {
+            "objectName": tgt["databaseSecret"], "objectType": "secretsmanager",
+            "jmesPath": [
+                {"path": "OGG_DB_USERID", "objectAlias": "target-db-userid"},
+                {"path": "OGG_DB_PASSWORD", "objectAlias": "target-db-password"},
+            ],
+        },
+        {
+            "objectName": canonical_plan["tlsSecret"], "objectType": "secretsmanager",
+            "jmesPath": [{"path": '"ca-chain.pem"', "objectAlias": "tls-ca-chain.pem"}],
+        },
+    ]
+
+
+_EXPECTED_JOB_COMMAND = ["python3", "/mnt/reconciler/goldengate-replication.py", "worker",
+                         "--plan", "/mnt/reconciler/plan.json", "--secrets-root", "/mnt/replication-secrets"]
+_EXPECTED_VOLUME_MOUNT_PATHS = {"reconciler-script": "/mnt/reconciler", "replication-secrets": "/mnt/replication-secrets"}
+_EXPECTED_CONFIGMAP_DATA_KEYS = frozenset({"goldengate-replication.py", "plan.json"})
+
+
+def _validate_rendered_manifests(output_dir, environment, pipeline_id, execution_id, expected_namespace, expected_region):
+    """Structurally validates the three rendered replication reconciliation manifests BEFORE any kubectl apply (Deploy) or as the sole check (Validate). Beyond kind/namespace/shared-name structure, this is now STRONGLY bound to the canonical current replication plan (automation/goldengate-deployment-model.py replication-plan) and the canonical current reconciler source (automation/goldengate-replication.py) -- never inferring trust solely from the rendered files themselves: ConfigMap.data key set is exactly {goldengate-replication.py, plan.json} with plan.json exactly equal to the canonical plan and goldengate-replication.py exactly equal to the current trusted engine source; the SecretProviderClass forbids spec.secretObjects entirely (file-mount-only, never synced into a Kubernetes Secret) and its object/alias list must exactly equal the canonical-plan-derived expectation; the Job forbids env/envFrom entirely and requires the exact fixed worker command, one reconciler container, canonical image/ServiceAccount, and the exact two read-only volumeMounts/volumes. The generic _assert_no_secret_values() scan remains only as defense in depth, never the primary proof. Returns the shared execution resource name. Never re-implements the engine's own render functions -- reads only the files render-job already wrote to output_dir. execution_id is accepted for canonical-context symmetry with the caller's own render invocation, even though this function does not itself need to re-derive the execution name from it."""
+    canonical_plan = _load_canonical_replication_plan(environment, pipeline_id)
+
     spc_path = os.path.join(output_dir, "secretproviderclass.yaml")
     configmap_path = os.path.join(output_dir, "configmap.yaml")
     job_path = os.path.join(output_dir, "job.yaml")
@@ -180,10 +241,10 @@ def _validate_rendered_manifests(output_dir, expected_namespace):
     configmap = _load_manifest_strict(configmap_path)
     job = _load_manifest_strict(job_path)
 
-    if spc.get("kind") != "SecretProviderClass":
-        raise Phase6Error(f"{spc_path}: expected kind=SecretProviderClass, found {spc.get('kind')!r}")
-    if configmap.get("kind") != "ConfigMap":
-        raise Phase6Error(f"{configmap_path}: expected kind=ConfigMap, found {configmap.get('kind')!r}")
+    if spc.get("apiVersion") != "secrets-store.csi.x-k8s.io/v1" or spc.get("kind") != "SecretProviderClass":
+        raise Phase6Error(f"{spc_path}: expected apiVersion=secrets-store.csi.x-k8s.io/v1 kind=SecretProviderClass, found apiVersion={spc.get('apiVersion')!r} kind={spc.get('kind')!r}")
+    if configmap.get("apiVersion") != "v1" or configmap.get("kind") != "ConfigMap":
+        raise Phase6Error(f"{configmap_path}: expected apiVersion=v1 kind=ConfigMap, found apiVersion={configmap.get('apiVersion')!r} kind={configmap.get('kind')!r}")
     if job.get("kind") != "Job" or job.get("apiVersion") != "batch/v1":
         raise Phase6Error(f"{job_path}: expected apiVersion=batch/v1 kind=Job, found apiVersion={job.get('apiVersion')!r} kind={job.get('kind')!r}")
 
@@ -201,6 +262,51 @@ def _validate_rendered_manifests(output_dir, expected_namespace):
         raise Phase6Error(f"SecretProviderClass/ConfigMap/Job do not share the same execution resource name: {sorted(names)}")
     execution_name = next(iter(names))
 
+    # ConfigMap contract: exact key set (no fourth "leaked"/"password"/"secret" data key can exist regardless of naming), the embedded reconciler program byte-exact to the CURRENT trusted engine source, and plan.json byte-exact (via parsed dict equality) to the canonical current plan -- never a second, independently mutable source of truth.
+    configmap_data = configmap.get("data")
+    if not isinstance(configmap_data, dict):
+        raise Phase6Error(f"{configmap_path}: ConfigMap data must be a mapping.")
+    if set(configmap_data.keys()) != _EXPECTED_CONFIGMAP_DATA_KEYS:
+        raise Phase6Error(f"{configmap_path}: ConfigMap data key set must be exactly {sorted(_EXPECTED_CONFIGMAP_DATA_KEYS)}, found {sorted(configmap_data.keys())}.")
+
+    with open(REPLICATION_ENGINE_TOOL, "r", encoding="utf-8") as f:
+        trusted_engine_source = f.read()
+    if configmap_data["goldengate-replication.py"] != trusted_engine_source:
+        raise Phase6Error(f"{configmap_path}: ConfigMap's embedded goldengate-replication.py does not exactly match the current trusted {REPLICATION_ENGINE_TOOL} -- refusing to run an unverified reconciler program while GoldenGate/database credentials are mounted.")
+
+    try:
+        rendered_plan = json.loads(configmap_data["plan.json"])
+    except json.JSONDecodeError as exc:
+        raise Phase6Error(f"{configmap_path}: plan.json is not valid JSON: {exc}") from exc
+    if rendered_plan != canonical_plan:
+        raise Phase6Error(f"{configmap_path}: plan.json does not exactly match the canonical current replication plan for pipeline {pipeline_id!r} -- refusing to trust a rendered plan that has drifted from `automation/goldengate-deployment-model.py replication-plan`.")
+
+    # SecretProviderClass contract: file-mount-only (spec.secretObjects entirely forbidden), and its object/alias list bound EXACTLY to the canonical plan -- never read from the SPC being validated.
+    spc_spec = spc.get("spec")
+    if not isinstance(spc_spec, dict):
+        raise Phase6Error(f"{spc_path}: spec must be a mapping.")
+    if spc_spec.get("provider") != "aws":
+        raise Phase6Error(f"{spc_path}: spec.provider must be exactly 'aws', found {spc_spec.get('provider')!r}.")
+    if "secretObjects" in spc_spec:
+        raise Phase6Error(f"{spc_path}: spec.secretObjects is forbidden -- the replication SecretProviderClass is file-mount-only and must never synchronize a credential into a Kubernetes Secret.")
+    parameters = spc_spec.get("parameters")
+    if not isinstance(parameters, dict):
+        raise Phase6Error(f"{spc_path}: spec.parameters must be a mapping.")
+    if parameters.get("region") != expected_region:
+        raise Phase6Error(f"{spc_path}: spec.parameters.region {parameters.get('region')!r} does not match the canonical region {expected_region!r}.")
+    objects_text = parameters.get("objects")
+    if not isinstance(objects_text, str):
+        raise Phase6Error(f"{spc_path}: spec.parameters.objects must be a YAML-encoded string.")
+    try:
+        rendered_objects = yaml.load(objects_text, Loader=_StrictSafeLoader)
+    except _DuplicateKeyError as exc:
+        raise Phase6Error(f"{spc_path}: spec.parameters.objects contains a duplicate YAML mapping key: {exc}") from exc
+    except yaml.YAMLError as exc:
+        raise Phase6Error(f"{spc_path}: spec.parameters.objects is not valid YAML: {exc}") from exc
+    if rendered_objects != _expected_spc_objects(canonical_plan):
+        raise Phase6Error(f"{spc_path}: spec.parameters.objects does not exactly match the canonical-plan-bound expected object list -- refusing an extra/missing secret object, unrelated objectName, or changed alias/JMES path/objectType.")
+
+    # Job contract: exact one-container reconciler shape, canonical image/ServiceAccount, the EXACT fixed worker command (never a different program while credentials are mounted), env/envFrom entirely forbidden (credentials remain mounted files only), and exactly the two expected read-only volumeMounts/volumes.
     job_spec = job.get("spec") or {}
     if job_spec.get("backoffLimit") != 0:
         raise Phase6Error(f"Job backoffLimit must be exactly 0, found {job_spec.get('backoffLimit')!r}")
@@ -214,42 +320,55 @@ def _validate_rendered_manifests(output_dir, expected_namespace):
     if container.get("name") != "reconciler":
         raise Phase6Error(f"Job container name must be exactly 'reconciler', found {container.get('name')!r}")
 
-    configmap_data = configmap.get("data") or {}
-    if "goldengate-replication.py" not in configmap_data:
-        raise Phase6Error(f"{configmap_path}: ConfigMap data is missing goldengate-replication.py")
-    plan_json_text = configmap_data.get("plan.json")
-    if not plan_json_text:
-        raise Phase6Error(f"{configmap_path}: ConfigMap data is missing plan.json")
-    try:
-        plan = json.loads(plan_json_text)
-    except json.JSONDecodeError as exc:
-        raise Phase6Error(f"{configmap_path}: plan.json is not valid JSON: {exc}") from exc
-
-    expected_image = (plan.get("source") or {}).get("image")
-    expected_service_account = (plan.get("source") or {}).get("serviceAccount")
+    expected_image = (canonical_plan.get("source") or {}).get("image")
+    expected_service_account = (canonical_plan.get("source") or {}).get("serviceAccount")
     if container.get("image") != expected_image:
         raise Phase6Error(f"Job container image {container.get('image')!r} does not match the canonical replication plan's source image {expected_image!r}")
     if pod_spec.get("serviceAccountName") != expected_service_account:
         raise Phase6Error(f"Job serviceAccountName {pod_spec.get('serviceAccountName')!r} does not match the canonical replication plan's source ServiceAccount {expected_service_account!r}")
 
-    volume_mounts = {vm.get("name"): vm for vm in (container.get("volumeMounts") or [])}
-    for mount_name in ("reconciler-script", "replication-secrets"):
-        vm = volume_mounts.get(mount_name)
-        if vm is None:
-            raise Phase6Error(f"Job container is missing the required volumeMount {mount_name!r}")
+    if container.get("command") != _EXPECTED_JOB_COMMAND:
+        raise Phase6Error(f"Job container command must be exactly {_EXPECTED_JOB_COMMAND}, found {container.get('command')!r} -- refusing to run a different program while credentials are mounted.")
+    if container.get("args"):
+        raise Phase6Error(f"Job container args must be absent or empty, found {container.get('args')!r}.")
+    if container.get("env"):
+        raise Phase6Error(f"Job container env must be absent or empty -- credentials remain mounted files only, found {container.get('env')!r}.")
+    if container.get("envFrom"):
+        raise Phase6Error(f"Job container envFrom must be absent or empty -- credentials remain mounted files only, found {container.get('envFrom')!r}.")
+
+    volume_mounts = container.get("volumeMounts") or []
+    mounts_by_name = {vm.get("name"): vm for vm in volume_mounts}
+    if set(mounts_by_name) != set(_EXPECTED_VOLUME_MOUNT_PATHS) or len(volume_mounts) != len(_EXPECTED_VOLUME_MOUNT_PATHS):
+        raise Phase6Error(f"Job container volumeMounts must be exactly {sorted(_EXPECTED_VOLUME_MOUNT_PATHS)}, found {sorted(mounts_by_name)}.")
+    for mount_name, expected_path in _EXPECTED_VOLUME_MOUNT_PATHS.items():
+        vm = mounts_by_name[mount_name]
+        if vm.get("mountPath") != expected_path:
+            raise Phase6Error(f"Job volumeMount {mount_name!r} must mount at {expected_path!r}, found {vm.get('mountPath')!r}.")
         if vm.get("readOnly") is not True:
-            raise Phase6Error(f"Job volumeMount {mount_name!r} must be readOnly=true")
+            raise Phase6Error(f"Job volumeMount {mount_name!r} must be readOnly=true.")
 
-    volumes = {v.get("name"): v for v in (pod_spec.get("volumes") or [])}
-    csi_volume = volumes.get("replication-secrets") or {}
-    csi = csi_volume.get("csi")
-    if not csi:
-        raise Phase6Error("Job is missing the replication-secrets CSI volume")
+    volumes = pod_spec.get("volumes") or []
+    volumes_by_name = {v.get("name"): v for v in volumes}
+    if set(volumes_by_name) != {"reconciler-script", "replication-secrets"} or len(volumes) != 2:
+        raise Phase6Error(f"Job volumes must be exactly ['reconciler-script', 'replication-secrets'], found {sorted(volumes_by_name)}.")
+
+    reconciler_volume = volumes_by_name["reconciler-script"]
+    config_map_ref = reconciler_volume.get("configMap")
+    if not isinstance(config_map_ref, dict) or config_map_ref.get("name") != execution_name:
+        raise Phase6Error(f"Job volume 'reconciler-script' must be ConfigMap-backed by the execution ConfigMap {execution_name!r}, found {reconciler_volume!r}.")
+
+    secrets_volume = volumes_by_name["replication-secrets"]
+    csi = secrets_volume.get("csi")
+    if not isinstance(csi, dict):
+        raise Phase6Error("Job volume 'replication-secrets' must be CSI-backed.")
+    if csi.get("driver") != "secrets-store.csi.k8s.io":
+        raise Phase6Error(f"Job replication-secrets CSI volume driver must be exactly 'secrets-store.csi.k8s.io', found {csi.get('driver')!r}.")
     if csi.get("readOnly") is not True:
-        raise Phase6Error("Job replication-secrets CSI volume must be readOnly=true")
+        raise Phase6Error("Job replication-secrets CSI volume must be readOnly=true.")
     if (csi.get("volumeAttributes") or {}).get("secretProviderClass") != execution_name:
-        raise Phase6Error("Job replication-secrets CSI volume does not reference the execution SecretProviderClass name")
+        raise Phase6Error("Job replication-secrets CSI volume does not reference the execution SecretProviderClass name.")
 
+    # Generic secret-value scan remains only as defense in depth -- the schema/binding checks above are now the authoritative guarantee.
     for doc, doc_path in ((spc, spc_path), (configmap, configmap_path), (job, job_path)):
         _assert_no_secret_values(doc, doc_path)
 
@@ -258,12 +377,17 @@ def _validate_rendered_manifests(output_dir, expected_namespace):
 
 # Deploy-mode (live cluster) reconciliation -- collision preflight, apply order, wait contract, success cleanup / failure evidence retention.
 
+def _require_execution_resource_absent(resource, display_kind, execution_name, namespace):
+    """Authoritative existence check for ONE execution-scoped resource: `kubectl get <resource> <execution_name> -n <namespace> --ignore-not-found -o name`, run with check=True -- --ignore-not-found guarantees a genuinely-absent resource always yields exit 0 with EMPTY stdout, so the kubectl command itself failing for ANY reason (Forbidden, Unauthorized, timeout, network/cluster-unreachable, TLS failure, or any other error) is never interpreted as absence -- it fails closed via run()'s own check=True, exactly like a real collision. Only a successful command with empty stdout proves absence; a successful command with non-empty stdout is a genuine pre-existing collision. Prints only the resource kind/name -- never the kubectl get output (no -o yaml, no resource dump)."""
+    proc = run(["kubectl", "get", resource, execution_name, "-n", namespace, "--ignore-not-found", "-o", "name"])
+    if proc.stdout.strip():
+        raise Phase6Error(f"refusing to reconcile: {display_kind}/{execution_name} already exists in namespace {namespace} -- expected all three execution-scoped resources to be absent before this reconciliation attempt.")
+
+
 def _collision_preflight(execution_name, namespace):
-    """Read-only pre-mutation existence check for the three execution-scoped resources -- fails closed if ANY already exists, since the execution identity (pipeline + plan checksum + run/run-attempt) is expected to be unique for this workflow execution; a pre-existing same-name object is treated as a foreign/accidental collision, never silently overwritten. Prints only the resource kind/name -- never the kubectl get output (no -o yaml, no resource dump)."""
-    for kind, resource in (("SecretProviderClass", "secretproviderclass"), ("ConfigMap", "configmap"), ("Job", "job")):
-        proc = run(["kubectl", "get", resource, execution_name, "-n", namespace], check=False)
-        if proc.returncode == 0:
-            raise Phase6Error(f"refusing to reconcile: {kind}/{execution_name} already exists in namespace {namespace} -- expected all three execution-scoped resources to be absent before this reconciliation attempt.")
+    """Read-only pre-mutation existence check for the three execution-scoped resources -- fails closed (Phase6Error) if ANY already exists, OR if the kubectl inspection command itself fails for any reason; a Kubernetes API inspection error is NEVER treated as proof of absence (see _require_execution_resource_absent())."""
+    for display_kind, resource in (("SecretProviderClass", "secretproviderclass"), ("ConfigMap", "configmap"), ("Job", "job")):
+        _require_execution_resource_absent(resource, display_kind, execution_name, namespace)
 
 
 def _apply_manifest(kind_label, path):
@@ -279,7 +403,7 @@ def _wait_for_job(execution_name, namespace):
 def _reconcile_one_pipeline(environment, pipeline_id, execution_id, region, namespace):
     output_dir = _pipeline_output_dir(pipeline_id, execution_id)
     _render_pipeline(environment, pipeline_id, execution_id, region, namespace, output_dir)
-    execution_name = _validate_rendered_manifests(output_dir, namespace)
+    execution_name = _validate_rendered_manifests(output_dir, environment, pipeline_id, execution_id, namespace, region)
 
     _collision_preflight(execution_name, namespace)
 
@@ -347,7 +471,7 @@ def cmd_validate_local(args):
         print(f"::group::Validating {pipeline_id}")
         output_dir = _pipeline_output_dir(pipeline_id, DRY_RUN_EXECUTION_ID)
         _render_pipeline(args.environment, pipeline_id, DRY_RUN_EXECUTION_ID, aws_region, namespace, output_dir)
-        _validate_rendered_manifests(output_dir, namespace)
+        _validate_rendered_manifests(output_dir, args.environment, pipeline_id, DRY_RUN_EXECUTION_ID, namespace, aws_region)
         print(f"OK: {pipeline_id} replication manifests render and validate cleanly (no secret value, no cluster mutation).")
         print("::endgroup::")
     return 0

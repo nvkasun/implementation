@@ -17441,6 +17441,214 @@ else
   skip "Phase 6 Python Conversion: dedicated static assertions -- python3/PyYAML/EKS_APP_WORKFLOW/phase6_replication.py unavailable"
 fi
 
+echo "--- Phase 6 Python Conversion: collision fail-closed + manifest trust-binding correction (A-O) ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$PHASE6_REPLICATION_TOOL" ] && [ -f "$REPLICATION_TOOL" ] && [ -f "$DEPLOYMENT_MODEL_TOOL" ]; then
+  PHASE6_TRUST_CHECK="$(python3 - "$PHASE6_REPLICATION_TOOL" "$REPLICATION_TOOL" "$DEPLOYMENT_MODEL_TOOL" <<'PYEOF'
+import ast
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+import yaml
+
+tool_path, engine_path, gdm_path = sys.argv[1:4]
+
+spec = importlib.util.spec_from_file_location("phase6_replication", tool_path)
+phase6 = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(phase6)
+
+engine_spec = importlib.util.spec_from_file_location("goldengate_replication", engine_path)
+engine = importlib.util.module_from_spec(engine_spec)
+engine_spec.loader.exec_module(engine)
+
+gdm_spec = importlib.util.spec_from_file_location("goldengate_deployment_model", gdm_path)
+gdm = importlib.util.module_from_spec(gdm_spec)
+gdm_spec.loader.exec_module(gdm)
+
+results = []
+
+
+def check(label, ok):
+    results.append((label, ok))
+
+
+with open(engine_path, "r", encoding="utf-8") as f:
+    REAL_ENGINE_SOURCE = f.read()
+
+PLAN = {
+    "pipelineId": "static-check-pipeline-001", "tlsSecret": "dev/goldengate/tls-certificate",
+    "networkCredentialDomain": "Network", "networkCredentialAlias": "NET_TEST",
+    "source": {
+        "deploymentId": "gg-pg-src-fixture-01", "deploymentType": "postgresql",
+        "runtimeHost": "gg-pg-src-fixture-01.goldengate-dev.adcbmis.local", "serviceAccount": "gg-runtime-sa",
+        "image": "229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-postgresql:23.26.2.0.1",
+        "adminSecret": "dev/goldengate/source/admin", "databaseSecret": "dev/goldengate/databases/static-check-pipeline-001/source",
+        "databaseCredentialAlias": "SRC_ALIAS", "databaseCredentialDomain": "OracleGoldenGate",
+    },
+    "target": {
+        "deploymentId": "gg-mssql-tgt-fixture-01", "deploymentType": "mssql",
+        "runtimeHost": "gg-mssql-tgt-fixture-01.goldengate-dev.adcbmis.local", "serviceAccount": "gg-runtime-sa",
+        "image": "229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-sqlserver:23.26.2.0.1",
+        "adminSecret": "dev/goldengate/target/admin", "databaseSecret": "dev/goldengate/databases/static-check-pipeline-001/target",
+        "databaseCredentialAlias": "TGT_ALIAS", "databaseCredentialDomain": "OracleGoldenGate",
+    },
+    "checkpoint": {"enabled": True, "table": "dbo.gg_checkpoint", "createIfMissing": True},
+    "replicat": {"name": "MSTGT01", "sourceTrailName": "ma", "begin": "now", "startOnCreate": True,
+                 "mappings": [{"source": "public.payments", "target": "dbo.payments"}]},
+    "supplementalLogging": {"objects": ["public.payments"]},
+    "extract": {"name": "PGSRC01", "pluginType": "pgoutput", "begin": "now", "startOnCreate": True,
+                "trail": {"name": "pa", "sizeMB": 500}, "tables": ["public.payments"]},
+    "distribution": {"pathName": "PG2MS01", "sourceTrailName": "pa", "targetTrailName": "ma", "protocol": "wss", "port": 443, "startOnCreate": True},
+}
+
+
+class _Proc:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
+
+class _Recorder:
+    def __init__(self, get_returncode=0, get_stdout=""):
+        self.calls = []
+        self.get_returncode = get_returncode
+        self.get_stdout = get_stdout
+
+    def __call__(self, argv, env=None, cwd=None, check=True, capture_output=True, input_text=None):
+        self.calls.append(list(argv))
+        if argv[:2] == ["kubectl", "get"]:
+            proc = _Proc(self.get_returncode, self.get_stdout, "" if self.get_returncode == 0 else "Error from server (Forbidden)")
+            if check and proc.returncode != 0:
+                raise phase6.Phase6Error("kubectl get failed")
+            return proc
+        return _Proc(0, "", "")
+
+
+with open(tool_path) as f:
+    tool_source = f.read()
+tree = ast.parse(tool_source)
+
+
+def fn_source(name):
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
+    return ast.get_source_segment(tool_source, fn) or ""
+
+
+collision_helper_src = fn_source("_require_execution_resource_absent")
+collision_preflight_src = fn_source("_collision_preflight")
+validate_manifests_src = fn_source("_validate_rendered_manifests")
+
+# A: collision preflight no longer uses a generic check=False + returncode==0-means-absent pattern.
+check("A: _collision_preflight()/_require_execution_resource_absent() no longer treats any nonzero kubectl get as absence (no check=False + `.returncode == 0` absence inference remains)",
+      "check=False" not in collision_helper_src and "check=False" not in collision_preflight_src
+      and "proc.returncode == 0" not in collision_helper_src and "proc.returncode == 0" not in collision_preflight_src)
+
+# B: collision inspection uses --ignore-not-found and -o name, with authoritative command success (run()'s own check=True -- no check=False anywhere in the helper).
+check("B: _require_execution_resource_absent() uses kubectl get ... --ignore-not-found -o name", '"--ignore-not-found"' in collision_helper_src and '"-o", "name"' in collision_helper_src)
+check("B: _require_execution_resource_absent() relies on run()'s own check=True (never overrides it to check=False)", "check=False" not in collision_helper_src)
+
+# C: confirmed reproduction -- a Forbidden kubectl get error can never authorize apply; zero apply/wait/delete mutation follows.
+import unittest.mock as _mock
+recorder = _Recorder(get_returncode=1)
+c_ok = None
+with _mock.patch.object(phase6, "run", recorder):
+    try:
+        phase6._collision_preflight("gg-repl-static-check", "goldengate-dev")
+        c_ok = False
+    except phase6.Phase6Error:
+        c_ok = not any(c[:2] in (["kubectl", "apply"], ["kubectl", "wait"], ["kubectl", "delete"]) for c in recorder.calls)
+check("C: confirmed reproduction -- a Forbidden kubectl get error fails closed (Phase6Error) with zero apply/wait/delete mutation, never authorizing apply as if the resource were absent", c_ok)
+
+# D: ConfigMap data key set is exact.
+check("D: _EXPECTED_CONFIGMAP_DATA_KEYS is exactly {goldengate-replication.py, plan.json}", phase6._EXPECTED_CONFIGMAP_DATA_KEYS == frozenset({"goldengate-replication.py", "plan.json"}))
+check("D: _validate_rendered_manifests() enforces an EXACT ConfigMap data key-set equality (never a subset/superset check)", "set(configmap_data.keys()) != _EXPECTED_CONFIGMAP_DATA_KEYS" in validate_manifests_src)
+
+# E: embedded reconciler source is compared to the CURRENT automation/goldengate-replication.py by exact equality (never contains/startswith/a supplied hash).
+check("E: _validate_rendered_manifests() reads REPLICATION_ENGINE_TOOL and compares by exact (!=) equality, never contains/startswith", "REPLICATION_ENGINE_TOOL" in validate_manifests_src and 'configmap_data["goldengate-replication.py"] != trusted_engine_source' in validate_manifests_src
+      and ".startswith(" not in validate_manifests_src and " in trusted_engine_source" not in validate_manifests_src)
+
+# F: embedded plan.json is compared to the canonical plan obtained via goldengate-deployment-model.py replication-plan.
+load_plan_src = fn_source("_load_canonical_replication_plan")
+check("F: _load_canonical_replication_plan() invokes `goldengate-deployment-model.py --environment <env> replication-plan <pipeline_id>`", '"replication-plan"' in load_plan_src and "DEPLOYMENT_MODEL_TOOL" in load_plan_src)
+check("F: _validate_rendered_manifests() requires exact (!=) equality between plan.json and the canonical plan, never normalized", "rendered_plan != canonical_plan" in validate_manifests_src)
+
+# G: SecretProviderClass secretObjects is forbidden entirely (key presence alone fails, regardless of value).
+check("G: _validate_rendered_manifests() rejects ANY presence of spec.secretObjects (`\"secretObjects\" in spc_spec`)", '"secretObjects" in spc_spec' in validate_manifests_src)
+
+# H: SPC objectNames/JMES aliases are bound to the canonical plan, never read from the SPC being validated.
+expected_spc_src = fn_source("_expected_spc_objects")
+check("H: _expected_spc_objects() derives the expected object list FROM canonical_plan's own source/target/tlsSecret fields", all(f'canonical_plan["{name}"]' in expected_spc_src or f"src[\"{name}\"]" in expected_spc_src or f"tgt[\"{name}\"]" in expected_spc_src for name in ("tlsSecret",)) or "src, tgt = canonical_plan" in expected_spc_src)
+check("H: _validate_rendered_manifests() compares the rendered SPC objects against _expected_spc_objects(canonical_plan) by exact equality", "rendered_objects != _expected_spc_objects(canonical_plan)" in validate_manifests_src)
+
+# I: Job env/envFrom injection is forbidden entirely.
+check("I: _validate_rendered_manifests() rejects any non-empty container.env", 'container.get("env")' in validate_manifests_src)
+check("I: _validate_rendered_manifests() rejects any non-empty container.envFrom", 'container.get("envFrom")' in validate_manifests_src)
+
+# J: Job command is exact.
+check("J: _EXPECTED_JOB_COMMAND is the exact fixed worker invocation", phase6._EXPECTED_JOB_COMMAND == [
+    "python3", "/mnt/reconciler/goldengate-replication.py", "worker", "--plan", "/mnt/reconciler/plan.json", "--secrets-root", "/mnt/replication-secrets"])
+check("J: _validate_rendered_manifests() requires container.command == _EXPECTED_JOB_COMMAND exactly", "container.get(\"command\") != _EXPECTED_JOB_COMMAND" in validate_manifests_src)
+
+# K: ConfigMap volume references the execution ConfigMap by name.
+check("K: _validate_rendered_manifests() requires the reconciler-script volume's configMap.name to equal the execution resource name", 'config_map_ref.get("name") != execution_name' in validate_manifests_src)
+
+# L: CSI volume references the exact execution SecretProviderClass (preserved from the prior correction).
+check("L: _validate_rendered_manifests() requires the replication-secrets CSI volume's secretProviderClass to equal the execution resource name", 'volumeAttributes") or {}).get("secretProviderClass") != execution_name' in validate_manifests_src)
+
+# M: all local validation occurs before collision/apply -- _reconcile_one_pipeline() calls _validate_rendered_manifests() strictly before _collision_preflight() and before any kubectl apply.
+reconcile_one_src = fn_source("_reconcile_one_pipeline")
+validate_call_index = reconcile_one_src.find("_validate_rendered_manifests(")
+collision_call_index = reconcile_one_src.find("_collision_preflight(")
+apply_call_index = reconcile_one_src.find("_apply_manifest(")
+check("M: _reconcile_one_pipeline() calls _validate_rendered_manifests() strictly BEFORE _collision_preflight() and BEFORE any _apply_manifest() call", -1 not in (validate_call_index, collision_call_index, apply_call_index) and validate_call_index < collision_call_index < apply_call_index)
+
+# N: automation/goldengate-replication.py remains unchanged by this correction (git-tracked, no working-tree diff introduced here).
+import subprocess
+git_diff = subprocess.run(["git", "diff", "--quiet", "--", engine_path], cwd=Path(tool_path).resolve().parents[3])
+check("N: automation/goldengate-replication.py has no working-tree diff (byte-for-byte unchanged by this correction)", git_diff.returncode == 0)
+
+# O: current descriptors remain replication.enabled=false.
+active, inactive, invalid = gdm.scan("dev")
+check("O: scan(dev) has no invalid descriptors", invalid == [])
+by_id = {d["deploymentId"]: d for d in active + inactive}
+check("O: gg-postgresql-repltest-01 remains replication.enabled=false", by_id.get("gg-postgresql-repltest-01", {}).get("replicationEnabled") is False)
+check("O: gg-mssql-repltest-01 remains replication.enabled=false", by_id.get("gg-mssql-repltest-01", {}).get("replicationEnabled") is False)
+
+# Behavioral confirmed reproduction: an SPC with an added spec.secretObjects now fails _validate_rendered_manifests(), reproducing then fixing Confirmed Reproduction A from this task.
+import tempfile
+with tempfile.TemporaryDirectory() as tmp:
+    manifests = engine.render_manifests(PLAN, "goldengate-dev", "eu-west-1", REAL_ENGINE_SOURCE, "static-check-exec-1")
+    manifests["SecretProviderClass"]["spec"]["secretObjects"] = [{"secretName": "replication-creds", "type": "Opaque", "data": [{"objectName": "source-db-password", "key": "password"}]}]
+    for kind, doc in manifests.items():
+        with open(f"{tmp}/{kind.lower()}.yaml", "w") as f:
+            yaml.safe_dump(doc, f, sort_keys=False, default_flow_style=False)
+    with _mock.patch.object(phase6, "_load_canonical_replication_plan", return_value=PLAN):
+        try:
+            phase6._validate_rendered_manifests(tmp, "dev", PLAN["pipelineId"], "static-check-exec-1", "goldengate-dev", "eu-west-1")
+            secretobjects_ok = False
+        except phase6.Phase6Error:
+            secretobjects_ok = True
+check("confirmed reproduction: SecretProviderClass spec.secretObjects addition (Kubernetes-Secret sync) now fails _validate_rendered_manifests()", secretobjects_ok)
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  echo "$PHASE6_TRUST_CHECK"
+  if [ -z "$(echo "$PHASE6_TRUST_CHECK" | grep '^FAIL ' || true)" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        OK\ *) pass "Phase 6 collision fail-closed + manifest trust-binding: ${line#OK }" ;;
+      esac
+    done <<< "$PHASE6_TRUST_CHECK"
+  else
+    fail "Phase 6 collision fail-closed + manifest trust-binding: dedicated static assertions failed:"$'\n'"${PHASE6_TRUST_CHECK}"
+  fi
+else
+  skip "Phase 6 collision fail-closed + manifest trust-binding: dedicated static assertions -- python3/PyYAML/phase6_replication.py/goldengate-replication.py/goldengate-deployment-model.py unavailable"
+fi
+
 echo "--- Final repository handoff hygiene sweep (VDR pre-transfer cleanliness) ---"
 
 # This is the LAST check in the suite, deliberately: earlier sections legitimately regenerate work/generated/dev/goldengate-deployments.yaml (the folder-driven registry-generation checks) as their own tested behavior -- asserting its absence any earlier would be a self-defeating mid-test assertion. Self-heal only the categories PROVEN elsewhere in this suite to be pure, expected byproducts of exercising real application/tooling behavior (never silently deleting anything whose origin is unknown); everything else must already be absent, or this check fails closed and reports it for a human to investigate before VDR handoff.
