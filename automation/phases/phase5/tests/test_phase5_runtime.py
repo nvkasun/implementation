@@ -1520,9 +1520,10 @@ class RemovalPreflightTests(TempStateCase):
 
 
 class RemoveRuntimeTests(TempStateCase):
-    def _set_state(self, ownership_state, application_found):
+    def _set_state(self, ownership_state, application_found, footprint_found=None):
         phase5_runtime.update_state(self.state_path, {
             "ownership_state": ownership_state, "application_found": application_found,
+            "footprint_found": _complete_footprint() if footprint_found is None else footprint_found,
             "argocd_app_name": "goldengate-dev-oracle-payments-01", "argocd_namespace": "argocd",
         }, phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
 
@@ -1811,7 +1812,7 @@ class RetainedPvcOrchestrationTests(unittest.TestCase):
         result = _classifier_result("OWNED", False, pvc=True)
         ok, why = phase5_runtime._post_delete_positively_absent(result, retained_pvc_expected=phase5_runtime._retained_pvc_expected_for_removal(""))
         self.assertFalse(ok)
-        self.assertIn("retained PVC is present", why)
+        self.assertIn("retained PVC is expected", why)
 
     def test_154_physical_removal_managed_fails_before_mutation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1967,6 +1968,139 @@ class ValidateLocalIntegrationTests(unittest.TestCase):
             state = phase5_runtime.load_state(state_path)
             self.assertIn("rendered_manifest", state)
             self.assertIn("package_path", state)
+
+
+class PostDeleteSemanticShapeRegressionTests(unittest.TestCase):
+    """Confirmed reproductions of the OWNED-with-zero-footprint and ABSENT-with-retained-PVC false-success gaps: the structural schema validator alone accepted these shapes, so _post_delete_positively_absent() must apply a second, state-specific semantic layer on top of it."""
+
+    def test_161_owned_all_footprint_false_without_hint_fails(self):
+        """Case A: OWNED + application_found=false + every footprint key false + retained_pvc_expected=false previously returned (True, None) -- an OWNED state with literally nothing found is not one of the two canonical deletion-complete shapes."""
+        ok, why = phase5_runtime._post_delete_positively_absent(_classifier_result("OWNED", False), retained_pvc_expected=False)
+        self.assertFalse(ok, why)
+
+    def test_162_owned_all_footprint_false_with_hint_fails(self):
+        """Case B: identical shape to Case A but with retained_pvc_expected=true -- still fails because footprint["pvc"] itself is false, so there is no retained PVC to justify accepting an OWNED state as deletion-complete."""
+        ok, why = phase5_runtime._post_delete_positively_absent(_classifier_result("OWNED", False), retained_pvc_expected=True)
+        self.assertFalse(ok, why)
+
+    def test_163_absent_with_retained_pvc_hint_and_pvc_present_fails(self):
+        """Case C: ABSENT + pvc=true + retained_pvc_expected=true previously returned (True, None) -- the ABSENT shape requires EVERY footprint key false, including pvc; a retained PVC is only ever acceptable under the distinct OWNED shape."""
+        ok, why = phase5_runtime._post_delete_positively_absent(_classifier_result("ABSENT", False, pvc=True), retained_pvc_expected=True)
+        self.assertFalse(ok, why)
+
+    def test_164_absent_with_any_footprint_key_true_fails(self):
+        for key in RUNTIME_FOOTPRINT_KEYS:
+            ok, why = phase5_runtime._post_delete_positively_absent(_classifier_result("ABSENT", False, **{key: True}), retained_pvc_expected=True)
+            self.assertFalse(ok, f"ABSENT with footprint key {key!r} true unexpectedly allowed completion")
+
+    def test_165_application_found_true_never_completes_regardless_of_state(self):
+        for state in ("ABSENT", "OWNED", "BROKEN"):
+            ok, why = phase5_runtime._post_delete_positively_absent({"state": state, "checks": {"application_found": True, "footprint_found": _complete_footprint()}}, retained_pvc_expected=True)
+            self.assertFalse(ok, f"state={state} with application_found=true unexpectedly allowed completion")
+
+    def test_166_complete_absent_still_passes_after_fix(self):
+        """Confirms the legitimate SHAPE 1 (complete absence) still succeeds -- this fix must not regress the already-correct case."""
+        ok, why = phase5_runtime._post_delete_positively_absent(_classifier_result("ABSENT", False), retained_pvc_expected=False)
+        self.assertTrue(ok, why)
+
+    def test_167_complete_retained_pvc_owned_still_passes_after_fix(self):
+        """Confirms the legitimate SHAPE 2 (retained-PVC-only OWNED, explicit hint) still succeeds -- this fix must not regress the already-correct case."""
+        ok, why = phase5_runtime._post_delete_positively_absent(_classifier_result("OWNED", False, pvc=True), retained_pvc_expected=True)
+        self.assertTrue(ok, why)
+
+
+class RemovalMutationStateTests(TempStateCase):
+    """Issue 2: cmd_remove_runtime() must never truthiness-coerce a persisted state value (bool("false") is True in Python) into removal-mutation authorization, and must validate the ENTIRE removal state before any cluster connection or mutating kubectl call."""
+
+    def _persist(self, **fields):
+        base = {
+            "ownership_state": "OWNED", "application_found": True, "footprint_found": _complete_footprint(),
+            "argocd_app_name": "goldengate-dev-oracle-payments-01", "argocd_namespace": "argocd",
+        }
+        base.update(fields)
+        phase5_runtime.update_state(self.state_path, base, phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
+
+    def _assert_fails_before_any_mutation(self):
+        scripted = ScriptedRun()
+        with mock.patch.object(phase5_runtime, "run", scripted):
+            with self.assertRaises(phase5_runtime.Phase5Error):
+                _run_quiet(phase5_runtime.cmd_remove_runtime, self.args)
+        self.assertEqual(scripted.calls, [], "a malformed removal state must result in ZERO subprocess calls (no _connect_to_eks, no kubectl patch/delete)")
+
+    def test_11_application_found_string_false_reproduces_confirmed_mutation_bug(self):
+        """Confirmed reproduction of the current bug before the fix: bool("false") == True in Python, so a string "false" application_found value previously authorized kubectl patch + kubectl delete against the cluster."""
+        self._persist(application_found="false")
+        self._assert_fails_before_any_mutation()
+
+    def test_12_application_found_zero_fails_before_mutation(self):
+        self._persist(application_found=0)
+        self._assert_fails_before_any_mutation()
+
+    def test_13_application_found_null_fails_before_mutation(self):
+        self._persist(application_found=None)
+        self._assert_fails_before_any_mutation()
+
+    def test_14_application_found_missing_fails_before_mutation(self):
+        state = {
+            "ownership_state": "OWNED", "footprint_found": _complete_footprint(),
+            "argocd_app_name": "goldengate-dev-oracle-payments-01", "argocd_namespace": "argocd",
+        }
+        phase5_runtime.update_state(self.state_path, state, phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
+        self._assert_fails_before_any_mutation()
+
+    def test_15_footprint_found_missing_fails_before_mutation(self):
+        state = {
+            "ownership_state": "OWNED", "application_found": True,
+            "argocd_app_name": "goldengate-dev-oracle-payments-01", "argocd_namespace": "argocd",
+        }
+        phase5_runtime.update_state(self.state_path, state, phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
+        self._assert_fails_before_any_mutation()
+
+    def test_16_footprint_found_partial_fails_before_mutation(self):
+        self._persist(footprint_found={"statefulset": False})
+        self._assert_fails_before_any_mutation()
+
+    def test_17_footprint_value_string_false_fails_before_mutation(self):
+        self._persist(footprint_found=_complete_footprint(statefulset="false"))
+        self._assert_fails_before_any_mutation()
+
+    def test_18_ownership_state_unknown_fails_before_mutation(self):
+        self._persist(ownership_state="SOMETHING_ELSE")
+        self._assert_fails_before_any_mutation()
+
+    def test_19_absent_with_application_found_true_fails_before_mutation(self):
+        """Internally inconsistent shape: ABSENT means the classifier itself found no Application, so application_found=true for the same result can never be legitimate -- must fail closed rather than mutate anything."""
+        self._persist(ownership_state="ABSENT", application_found=True)
+        self._assert_fails_before_any_mutation()
+
+    def test_20_valid_absent_application_false_performs_no_mutation(self):
+        self._persist(ownership_state="ABSENT", application_found=False)
+        scripted = ScriptedRun()
+        with mock.patch.object(phase5_runtime, "run", scripted):
+            _run_quiet(phase5_runtime.cmd_remove_runtime, self.args)
+        self.assertEqual(scripted.calls, [])
+
+    def test_21_valid_owned_application_false_performs_no_application_mutation(self):
+        self._persist(ownership_state="OWNED", application_found=False)
+        scripted = ScriptedRun()
+        with mock.patch.object(phase5_runtime, "run", scripted):
+            _run_quiet(phase5_runtime.cmd_remove_runtime, self.args)
+        self.assertEqual(scripted.calls, [])
+
+    def test_22_valid_owned_application_true_still_executes_exact_patch_delete_contract(self):
+        self._persist(ownership_state="OWNED", application_found=True)
+        scripted = ScriptedRun()
+        scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
+        scripted.when(_starts_with("kubectl", "patch", "application"), FakeProc(0, ""))
+        scripted.when(_starts_with("kubectl", "delete", "application"), FakeProc(0, ""))
+        with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+            _run_quiet(phase5_runtime.cmd_remove_runtime, self.args)
+        patch_calls = [c for c in scripted.calls if c["argv"][:2] == ["kubectl", "patch"]]
+        delete_calls = [c for c in scripted.calls if c["argv"][:2] == ["kubectl", "delete"]]
+        self.assertEqual(len(patch_calls), 1)
+        self.assertEqual(len(delete_calls), 1)
+        self.assertIn("--wait=true", delete_calls[0]["argv"])
+        self.assertIn("--timeout=10m", delete_calls[0]["argv"])
 
 
 if __name__ == "__main__":

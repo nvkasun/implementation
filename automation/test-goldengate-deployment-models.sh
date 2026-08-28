@@ -15275,14 +15275,15 @@ def cmd_source(name):
 
 prepare_removal_src = cmd_source("cmd_prepare_removal")
 remove_runtime_src = cmd_source("cmd_remove_runtime")
-results.append(("U: BROKEN removal state cannot mutate (remove-runtime requires ownership_state in ABSENT/OWNED)", 'ownership_state not in ("ABSENT", "OWNED")' in remove_runtime_src))
+mutation_state_src = cmd_source("_validate_removal_mutation_state")
+results.append(("U: BROKEN removal state cannot mutate (mutation-boundary validation requires ownership_state in ABSENT/OWNED before remove-runtime ever mutates)", 'ownership_state not in ("ABSENT", "OWNED")' in mutation_state_src and "_validate_removal_mutation_state" in remove_runtime_src))
 results.append(("V: legacyPair cannot mutate (prepare-removal fails closed before any mutation)", 'deployment_model != "singleRuntime"' in prepare_removal_src))
 results.append(("W: managed physical-removal cannot mutate (prepare-removal fails closed before any mutation)", 'reason == "physical-removal" and efs_mode == "managed"' in prepare_removal_src))
 
 # X/Y: post-delete success requires Application absent and non-PVC footprint absent.
 post_delete_absent_src = cmd_source("_post_delete_positively_absent")
-results.append(("X: post-delete success requires Application absent (application_found is not False -> fail)", "application_found is not False" in post_delete_absent_src))
-results.append(("Y: non-PVC footprint must be absent for post-delete success", "non_pvc_still_present" in post_delete_absent_src))
+results.append(("X: post-delete success requires Application absent (application_found truthy -> fail)", "if application_found:" in post_delete_absent_src and "application_found is not confirmed false" in post_delete_absent_src))
+results.append(("Y: non-PVC footprint must be absent for post-delete success", "non_pvc_present" in post_delete_absent_src))
 
 # Z/AA: retained PVC and shared namespace are never deleted (behavioral proof, not text-scanning).
 remove_runtime_calls = []
@@ -15295,12 +15296,15 @@ def fake_run(argv, env=None, cwd=None, check=True, capture_output=True, input_te
     return type("Proc", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
 
+runtime_state_module = phase5_runtime._load_runtime_state_module()
+complete_footprint_for_removal = {k: False for k in runtime_state_module.RUNTIME_FOOTPRINT_KEYS}
+
 with mock.patch.object(phase5_runtime, "run", fake_run), mock.patch.dict(os.environ, {"AWS_REGION": "eu-west-1", "EKS_CLUSTER_NAME": "x", "EKS_DEPLOY_ROLE_ARN": "arn:aws:iam::668311715351:role/x"}):
     args = type("Args", (), {"environment": "dev", "deployment_id": "gg-oracle-payments-01", "state_path": None})()
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
         state_path = Path(tmp) / "state.json"
-        phase5_runtime.update_state(state_path, {"ownership_state": "OWNED", "application_found": True, "argocd_app_name": "goldengate-dev-oracle-payments-01", "argocd_namespace": "argocd"}, phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
+        phase5_runtime.update_state(state_path, {"ownership_state": "OWNED", "application_found": True, "footprint_found": complete_footprint_for_removal, "argocd_app_name": "goldengate-dev-oracle-payments-01", "argocd_namespace": "argocd"}, phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
         args.state_path = state_path
         with redirect_stdout(io.StringIO()):
             phase5_runtime.cmd_remove_runtime(args)
@@ -15530,6 +15534,177 @@ PYEOF
   fi
 else
   skip "Phase 5 CSI/post-delete correction: dedicated static assertions -- python3/phase5_runtime.py unavailable"
+fi
+
+echo ""
+echo "--- Phase 5 Python Conversion: post-delete semantic-shape hardening + removal-mutation truthiness-coercion fix ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$PHASE5_RUNTIME_TOOL" ]; then
+  PHASE5_SEMANTIC_MUTATION_CHECK="$(python3 - "$PHASE5_RUNTIME_TOOL" <<'PYEOF'
+import ast
+import importlib.util
+import sys
+from unittest import mock
+
+tool_path = sys.argv[1]
+spec = importlib.util.spec_from_file_location("phase5_runtime", tool_path)
+phase5_runtime = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(phase5_runtime)
+
+runtime_state = phase5_runtime._load_runtime_state_module()
+FOOTPRINT_KEYS = set(runtime_state.RUNTIME_FOOTPRINT_KEYS)
+
+results = []
+
+
+class FakeProc:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class Recorder:
+    """Records every subprocess argv actually issued -- proves a malformed/rejected state resulted in ZERO Kubernetes calls, not merely that an exception text was raised."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        return FakeProc(0, "")
+
+
+def complete_footprint(**overrides):
+    footprint = {k: False for k in FOOTPRINT_KEYS}
+    footprint.update(overrides)
+    return footprint
+
+
+def classifier_result(state, application_found, **footprint_overrides):
+    return {"state": state, "checks": {"application_found": application_found, "footprint_found": complete_footprint(**footprint_overrides)}}
+
+
+# --- A/C: post-delete ABSENT success requires every footprint value false; OWNED with zero footprint is never accepted. ---
+ok, why = phase5_runtime._post_delete_positively_absent(classifier_result("ABSENT", False), retained_pvc_expected=False)
+results.append(("post-delete: complete ABSENT (every footprint false) succeeds", ok is True))
+
+ok, why = phase5_runtime._post_delete_positively_absent(classifier_result("OWNED", False), retained_pvc_expected=False)
+results.append(("confirmed reproduction: OWNED with zero footprint no longer certifies deletion complete (retained_pvc_expected=false)", ok is False))
+
+ok, why = phase5_runtime._post_delete_positively_absent(classifier_result("OWNED", False), retained_pvc_expected=True)
+results.append(("confirmed reproduction: OWNED with zero footprint no longer certifies deletion complete (retained_pvc_expected=true)", ok is False))
+
+# --- B: post-delete OWNED success is restricted to retained-PVC-only + the explicit hint. ---
+ok, why = phase5_runtime._post_delete_positively_absent(classifier_result("OWNED", False, pvc=True), retained_pvc_expected=True)
+results.append(("post-delete: OWNED retained-PVC-only shape succeeds only with the explicit retained_pvc_expected hint", ok is True))
+
+ok, why = phase5_runtime._post_delete_positively_absent(classifier_result("OWNED", False, pvc=True), retained_pvc_expected=False)
+results.append(("the same OWNED retained-PVC-only shape fails without the explicit hint", ok is False))
+
+# --- D: ABSENT + PVC cannot be accepted, even with the retained-PVC hint set. ---
+ok, why = phase5_runtime._post_delete_positively_absent(classifier_result("ABSENT", False, pvc=True), retained_pvc_expected=True)
+results.append(("confirmed reproduction: ABSENT with a PVC present no longer certifies deletion complete, even with retained_pvc_expected=true", ok is False))
+
+# --- E: cmd_remove_runtime / _validate_removal_mutation_state contain no truthiness-coercion of a persisted state value. ---
+with open(tool_path) as f:
+    tool_source = f.read()
+tree = ast.parse(tool_source)
+remove_runtime_fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "cmd_remove_runtime")
+remove_runtime_src = ast.get_source_segment(tool_source, remove_runtime_fn) or ""
+mutation_state_fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_validate_removal_mutation_state")
+mutation_state_src = ast.get_source_segment(tool_source, mutation_state_fn) or ""
+
+results.append(("cmd_remove_runtime no longer contains bool(state.get(...)) truthiness coercion", "bool(state.get(" not in remove_runtime_src))
+results.append(("cmd_remove_runtime delegates to _validate_removal_mutation_state before any mutating call", "_validate_removal_mutation_state" in remove_runtime_src))
+results.append(("_validate_removal_mutation_state checks application_found via isinstance(..., bool), never bool(...)", "isinstance(application_found, bool)" in mutation_state_src and "bool(application_found)" not in mutation_state_src))
+results.append(("_validate_removal_mutation_state reuses the canonical RUNTIME_FOOTPRINT_KEYS schema (no independent duplicate key list)", "RUNTIME_FOOTPRINT_KEYS" in mutation_state_src))
+
+# --- F/G: malformed removal state (application_found not a literal bool, or footprint_found missing/partial) causes ZERO Kubernetes calls. ---
+import os
+
+REMOVE_RUNTIME_ENV = {
+    "AWS_REGION": "eu-west-1", "EKS_CLUSTER_NAME": "gg-dev-cluster",
+    "EKS_DEPLOY_ROLE_ARN": "arn:aws:iam::229410149234:role/gg-dev-eks-deploy",
+}
+
+
+def remove_runtime_with_state(state_overrides):
+    base_state = {
+        "ownership_state": "OWNED", "application_found": True, "footprint_found": complete_footprint(),
+        "argocd_app_name": "goldengate-dev-x", "argocd_namespace": "argocd",
+    }
+    base_state.update(state_overrides)
+    recorder = Recorder()
+    args = type("Args", (), {"environment": "dev", "deployment_id": "gg-oracle-payments-01", "state_path": None})()
+    with mock.patch.object(phase5_runtime, "load_state", lambda _path: base_state), mock.patch.object(phase5_runtime, "run", recorder), mock.patch.dict(os.environ, REMOVE_RUNTIME_ENV):
+        try:
+            phase5_runtime.cmd_remove_runtime(args)
+            return None, recorder.calls
+        except phase5_runtime.Phase5Error as exc:
+            return exc, recorder.calls
+
+
+exc, calls = remove_runtime_with_state({"application_found": "false"})
+results.append(("confirmed reproduction: application_found='false' (string) now fails closed instead of authorizing a mutation (bool('false') is True in Python)", exc is not None and calls == []))
+
+exc, calls = remove_runtime_with_state({"application_found": 0})
+results.append(("application_found=0 fails before any mutation", exc is not None and calls == []))
+
+exc, calls = remove_runtime_with_state({"application_found": None})
+results.append(("application_found=null fails before any mutation", exc is not None and calls == []))
+
+state_missing_app_found = {"ownership_state": "OWNED", "footprint_found": complete_footprint(), "argocd_app_name": "goldengate-dev-x", "argocd_namespace": "argocd"}
+recorder = Recorder()
+args = type("Args", (), {"environment": "dev", "deployment_id": "gg-oracle-payments-01", "state_path": None})()
+with mock.patch.object(phase5_runtime, "load_state", lambda _path: state_missing_app_found), mock.patch.object(phase5_runtime, "run", recorder):
+    try:
+        phase5_runtime.cmd_remove_runtime(args)
+        results.append(("application_found missing fails before any mutation", False))
+    except phase5_runtime.Phase5Error:
+        results.append(("application_found missing fails before any mutation", recorder.calls == []))
+
+exc, calls = remove_runtime_with_state({"footprint_found": {"statefulset": False}})
+results.append(("malformed removal state (partial footprint_found) causes zero Kubernetes mutation", exc is not None and calls == []))
+
+exc, calls = remove_runtime_with_state({"footprint_found": complete_footprint(statefulset="false")})
+results.append(("malformed removal state (footprint value string 'false') causes zero Kubernetes mutation", exc is not None and calls == []))
+
+exc, calls = remove_runtime_with_state({"ownership_state": "SOMETHING_ELSE"})
+results.append(("malformed removal state (unknown ownership_state) causes zero Kubernetes mutation", exc is not None and calls == []))
+
+# --- H: ABSENT + application_found=true is internally inconsistent and must be rejected before any mutation. ---
+exc, calls = remove_runtime_with_state({"ownership_state": "ABSENT", "application_found": True})
+results.append(("ABSENT + application_found=true is rejected before any mutation", exc is not None and calls == []))
+
+# --- Confirms the legitimate, unchanged mutation paths still work exactly as before. ---
+exc, calls = remove_runtime_with_state({"ownership_state": "ABSENT", "application_found": False})
+results.append(("valid ABSENT + application_found=false performs no mutation (and does not raise)", exc is None and calls == []))
+
+exc, calls = remove_runtime_with_state({"ownership_state": "OWNED", "application_found": False})
+results.append(("valid OWNED + application_found=false performs no Application mutation", exc is None and calls == []))
+
+exc, calls = remove_runtime_with_state({"ownership_state": "OWNED", "application_found": True})
+patch_calls = [c for c in calls if c[:2] == ["kubectl", "patch"]]
+delete_calls = [c for c in calls if c[:2] == ["kubectl", "delete"]]
+results.append(("valid OWNED + application_found=true still executes exactly one kubectl patch and one kubectl delete", exc is None and len(patch_calls) == 1 and len(delete_calls) == 1))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  echo "$PHASE5_SEMANTIC_MUTATION_CHECK"
+  if [ -z "$(echo "$PHASE5_SEMANTIC_MUTATION_CHECK" | grep '^FAIL ' || true)" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        OK\ *) pass "Phase 5 post-delete/removal-mutation correction: ${line#OK }" ;;
+      esac
+    done <<< "$PHASE5_SEMANTIC_MUTATION_CHECK"
+  else
+    fail "Phase 5 post-delete/removal-mutation correction: dedicated static assertions failed:"$'\n'"${PHASE5_SEMANTIC_MUTATION_CHECK}"
+  fi
+else
+  skip "Phase 5 post-delete/removal-mutation correction: dedicated static assertions -- python3/phase5_runtime.py unavailable"
 fi
 
 echo "--- Final repository handoff hygiene sweep (VDR pre-transfer cleanliness) ---"

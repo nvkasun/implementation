@@ -1426,26 +1426,57 @@ def cmd_removal_preflight(args):
 
 # Phase 5C, step 3: remove-runtime (AWS credentials required)
 
+def _validate_removal_mutation_state(state):
+    """Mutation-boundary defense in depth, applied BEFORE any cluster connection or mutating kubectl call: strict schema+semantic validation of the persisted removal state, so state-file corruption, an unexpected future producer regression, or a manually edited/malformed state file can never fall back on truthiness coercion (bool("false") is True in Python) to authorize an Argo CD Application patch/delete. Reuses the same canonical runtime_state.RUNTIME_FOOTPRINT_KEYS schema removal-preflight already enforces -- never a second, independently-drifting key list. Returns (ownership_state, application_found, argocd_app_name, argocd_namespace) only once every check has passed."""
+    ownership_state = state.get("ownership_state")
+    if ownership_state not in ("ABSENT", "OWNED"):
+        raise Phase5Error(f"removal state ownership_state is {ownership_state!r}, expected ABSENT or OWNED -- refusing to mutate anything.")
+
+    application_found = state.get("application_found")
+    if not isinstance(application_found, bool):
+        raise Phase5Error(f"removal state application_found is {application_found!r} ({type(application_found).__name__}), expected a literal boolean -- refusing to mutate anything.")
+
+    footprint_found = state.get("footprint_found")
+    if not isinstance(footprint_found, dict):
+        raise Phase5Error(f"removal state footprint_found is {footprint_found!r}, expected a JSON object -- refusing to mutate anything.")
+
+    expected_keys = set(_load_runtime_state_module().RUNTIME_FOOTPRINT_KEYS)
+    actual_keys = set(footprint_found)
+    if actual_keys != expected_keys:
+        missing = sorted(expected_keys - actual_keys)
+        unexpected = sorted(actual_keys - expected_keys)
+        raise Phase5Error(f"removal state footprint_found does not match the canonical footprint schema (missing: {missing}, unexpected: {unexpected}) -- refusing to mutate anything.")
+
+    for key, value in footprint_found.items():
+        if not isinstance(value, bool):
+            raise Phase5Error(f"removal state footprint_found[{key!r}] is {value!r} ({type(value).__name__}), expected a literal boolean -- refusing to mutate anything.")
+
+    if ownership_state == "ABSENT" and application_found:
+        raise Phase5Error("removal state is internally inconsistent (ownership_state=ABSENT but application_found=true) -- refusing to mutate anything.")
+
+    argocd_app_name = state.get("argocd_app_name")
+    if not isinstance(argocd_app_name, str) or not argocd_app_name:
+        raise Phase5Error(f"removal state argocd_app_name is {argocd_app_name!r}, expected a non-empty string -- refusing to mutate anything.")
+
+    argocd_namespace = state.get("argocd_namespace")
+    if not isinstance(argocd_namespace, str) or not argocd_namespace:
+        raise Phase5Error(f"removal state argocd_namespace is {argocd_namespace!r}, expected a non-empty string -- refusing to mutate anything.")
+
+    return ownership_state, application_found, argocd_app_name, argocd_namespace
+
+
 def cmd_remove_runtime(args):
     require_environment_arg(args.environment)
     require_deployment_id_arg(args.deployment_id)
     state = load_state(args.state_path)
-    ownership_state = require_state_value(state, "ownership_state")
-    application_found = bool(state.get("application_found"))
-    argocd_app_name = require_state_value(state, "argocd_app_name")
-    argocd_namespace = require_state_value(state, "argocd_namespace")
 
-    # Defense in depth: BROKEN/unrecognized states already exited the job at removal-preflight -- only OWNED/ABSENT are ever allowed to reach a mutating step.
-    if ownership_state not in ("ABSENT", "OWNED"):
-        raise Phase5Error(f"refusing to mutate: ownership_state={ownership_state!r} is not ABSENT/OWNED.")
+    # Validated BEFORE any cluster connection or mutating call is ever issued -- a malformed state file results in ZERO Kubernetes calls.
+    ownership_state, application_found, argocd_app_name, argocd_namespace = _validate_removal_mutation_state(state)
 
     # Uses removal-preflight's own already-authoritative checks.application_found -- never a second, redundant "kubectl get application" to decide absence. If preflight already proved the Application absent, this step no-ops without touching the cluster at all.
     if not application_found:
         print(f"Argo CD Application {argocd_app_name} was not found by the removal-preflight classifier -- nothing to delete (no redundant re-inspection performed).")
         return
-
-    if ownership_state != "OWNED":
-        raise Phase5Error(f"application_found=true but ownership_state={ownership_state!r} (expected OWNED) -- refusing to mutate an ambiguous state.")
 
     _connect_to_eks()
 
@@ -1465,26 +1496,34 @@ def cmd_remove_runtime(args):
 # Phase 5C, step 4: post-delete-acceptance (AWS credentials required)
 
 def _post_delete_positively_absent(result, retained_pvc_expected):
-    """Positive structural proof of runtime-compute absence -- NEVER merely `state != BROKEN` (an OWNED state can legitimately mean the Application still exists and is correctly owned, which must NOT be accepted as deletion-complete), and NEVER inferred from a malformed/incomplete classifier shape (a missing footprint_found key, or a non-boolean checks value, must never be silently read as "false" -- see _validate_runtime_state_classifier_output)."""
+    """Positive structural AND semantic proof of runtime-compute absence -- NEVER merely `state != BROKEN` (an OWNED state can legitimately mean the Application still exists and is correctly owned, which must NOT be accepted as deletion-complete), and NEVER inferred from a malformed/incomplete classifier shape (see _validate_runtime_state_classifier_output, the structural layer this function builds on). After structural validation, exactly two semantic shapes are ever accepted as deletion-complete: (1) state=ABSENT with every canonical footprint key false, or (2) state=OWNED with application_found=false, retained_pvc_expected=true, footprint["pvc"]=true, and every other footprint key false (the classifier has already proven the retained PVC belongs to this exact deployment) -- every other shape, including OWNED with zero footprint and ABSENT with any footprint present, fails."""
     try:
         state, application_found, footprint_found = _validate_runtime_state_classifier_output(result)
     except Phase5Error as exc:
         return False, str(exc)
 
-    if application_found is not False:
+    if application_found:
         return False, "application_found is not confirmed false"
 
-    non_pvc_still_present = [label for label in footprint_found if label != "pvc" and footprint_found[label]]
-    if non_pvc_still_present:
-        return False, f"non-PVC footprint still present: {non_pvc_still_present}"
+    if state == "ABSENT":
+        present = sorted(key for key, value in footprint_found.items() if value)
+        if present:
+            return False, f"footprint still present: {present}"
+        return True, None
 
-    if footprint_found["pvc"] and not retained_pvc_expected:
-        return False, "a retained PVC is present but this deletion context does not expect one"
+    if state == "OWNED":
+        non_pvc_present = sorted(key for key in footprint_found if key != "pvc" and footprint_found[key])
+        if non_pvc_present:
+            return False, f"non-PVC footprint still present: {non_pvc_present}"
+        if not retained_pvc_expected:
+            return False, "OWNED state is only acceptable as deletion-complete when a retained PVC is expected for this deletion context"
+        if not footprint_found["pvc"]:
+            return False, "OWNED state without a retained PVC present is not a recognized deletion-complete shape"
+        return True, None
 
-    # Reached only once every non-PVC footprint entry is positively proven false and any retained PVC is an expected shape -- state==BROKEN remains the final safety net for a retained PVC that IS expected here but whose own ownership labels the classifier itself did not accept (runtime_state.py's _ownership_reason check applies to every found resource, including a retained PVC).
-    if state == "BROKEN":
-        return False, "classifier state is BROKEN"
-    return True, None
+    # state == "BROKEN" -- the only remaining value the structural validator allows -- is never a recognized deletion-complete shape, regardless of footprint content.
+    present = sorted(key for key, value in footprint_found.items() if value)
+    return (False, f"classifier state is BROKEN (footprint still present: {present})") if present else (False, "classifier state is BROKEN")
 
 
 def cmd_post_delete_acceptance(args):
