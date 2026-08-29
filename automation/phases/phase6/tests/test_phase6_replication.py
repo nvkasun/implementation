@@ -253,6 +253,18 @@ def _run_quiet(func, *args, **kwargs):
         return func(*args, **kwargs)
 
 
+def _run_capturing(func, *args, **kwargs):
+    """Like _run_quiet() but returns (captured_stdout, raised_exception_or_None) instead of discarding the output -- needed to prove ACTUAL emitted log content, not merely that a `kubectl logs` command was attempted (the retired code attempted the call and then discarded its CompletedProcess, which is exactly the bug this proves is fixed)."""
+    buf = io.StringIO()
+    exc = None
+    with redirect_stdout(buf):
+        try:
+            func(*args, **kwargs)
+        except Exception as caught:
+            exc = caught
+    return buf.getvalue(), exc
+
+
 class argparse_namespace:
     def __init__(self, **kwargs):
         self.__dict__.update(kwargs)
@@ -1934,6 +1946,54 @@ class ExecutionIdDefenseTests(unittest.TestCase):
             with self.assertRaises(phase6.Phase6Error):
                 _run_quiet(phase6.cmd_reconcile, argparse_namespace(environment=ENVIRONMENT, execution_id="bad/id"))
         self.assertEqual(scripted.calls, [], "a malformed execution_id must fail before even canonical pipeline discovery runs")
+
+
+class FailureLogVisibilityTests(unittest.TestCase):
+    """Failure-diagnostics parity correction: the Job-wait-failure branch previously discarded the CompletedProcess returned from its own best-effort `kubectl logs` call -- run()'s default capture_output=True meant that stdout was captured and then silently thrown away, so no failed-Job log content ever reached the workflow output. Now the CompletedProcess is captured and its sanitized stdout is actually emitted; a log-retrieval failure itself never masks the primary reconciliation failure, never triggers cleanup, and never blindly prints raw kubectl stderr."""
+
+    def test_174_confirmed_reproduction_failure_log_content_is_actually_emitted(self):
+        """Confirmed reproduction: kubectl logs was invoked on a Job wait failure but its return value was never assigned to a variable -- the retired call site was `run([...], check=False)` with no capture at all, so a real failed Job's sanitized log content never appeared anywhere. Now it must."""
+        scripted = _standard_deploy_scripted(pipeline_ids=("fabricated-pipeline-001",))
+        scripted.when(_starts_with("kubectl", "wait"), FakeProc(1, "", "timed out"))
+        scripted.when(_starts_with("kubectl", "logs"), FakeProc(0, "SANITIZED-FAILURE-LOG-LINE\n"))
+        with mock.patch.object(phase6, "run", scripted), _env_patch():
+            output, exc = _run_capturing(phase6.cmd_reconcile, argparse_namespace(environment=ENVIRONMENT, execution_id="1-1"))
+        self.assertIsInstance(exc, phase6.Phase6Error)
+        self.assertIn("SANITIZED-FAILURE-LOG-LINE", output)
+        self.assertEqual([c for c in scripted.calls if c["argv"][:2] == ["kubectl", "delete"]], [])
+
+    def test_175_log_retrieval_failure_does_not_mask_primary_failure(self):
+        scripted = _standard_deploy_scripted(pipeline_ids=("fabricated-pipeline-001",))
+        scripted.when(_starts_with("kubectl", "wait"), FakeProc(1, "", "timed out"))
+        scripted.when(_starts_with("kubectl", "logs"), FakeProc(1, "", "RAW-STDERR-MUST-NOT-BE-PRINTED"))
+        with mock.patch.object(phase6, "run", scripted), _env_patch():
+            output, exc = _run_capturing(phase6.cmd_reconcile, argparse_namespace(environment=ENVIRONMENT, execution_id="1-1"))
+        self.assertIsInstance(exc, phase6.Phase6Error)
+        self.assertIn("reconciliation Job", str(exc))
+        self.assertIn("WARN: unable to retrieve complete sanitized Job logs", output)
+        self.assertIn("kubectl exit 1", output)
+        self.assertNotIn("RAW-STDERR-MUST-NOT-BE-PRINTED", output)
+        self.assertEqual([c for c in scripted.calls if c["argv"][:2] == ["kubectl", "delete"]], [], "resources must remain retained -- a log-retrieval failure must never trigger cleanup")
+
+    def test_176_fail_fast_remains_after_log_visibility_correction(self):
+        scripted = _standard_deploy_scripted(pipeline_ids=("pipeline-a", "pipeline-b"))
+        scripted.when(_starts_with("kubectl", "wait"), FakeProc(1, "", "timed out"))
+        with mock.patch.object(phase6, "run", scripted), _env_patch():
+            _output, exc = _run_capturing(phase6.cmd_reconcile, argparse_namespace(environment=ENVIRONMENT, execution_id="1-1"))
+        self.assertIsInstance(exc, phase6.Phase6Error)
+        render_calls = [c for c in scripted.calls if _is_actual_render_call(c["argv"])]
+        self.assertEqual(len(render_calls), 1, "pipeline-b must never be processed once pipeline-a's Job wait fails")
+        self.assertIn("pipeline-a", render_calls[0]["argv"])
+
+    def test_177_success_path_logs_and_cleanup_unchanged(self):
+        scripted = _standard_deploy_scripted(pipeline_ids=("fabricated-pipeline-001",))
+        with mock.patch.object(phase6, "run", scripted), _env_patch():
+            output, exc = _run_capturing(phase6.cmd_reconcile, argparse_namespace(environment=ENVIRONMENT, execution_id="1-1"))
+        self.assertIsNone(exc)
+        self.assertIn("sanitized log line", output)
+        deletes = [c["argv"] for c in scripted.calls if c["argv"][:2] == ["kubectl", "delete"]]
+        self.assertEqual([d[2] for d in deletes], ["job", "configmap", "secretproviderclass"])
+        self.assertTrue(all("--ignore-not-found" in d for d in deletes))
 
 
 if __name__ == "__main__":

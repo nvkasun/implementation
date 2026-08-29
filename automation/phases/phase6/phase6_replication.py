@@ -459,7 +459,14 @@ def _reconcile_one_pipeline(environment, pipeline_id, execution_id, region, name
     if not _wait_for_job(execution_name, namespace):
         print(f"FAIL: reconciliation Job {execution_name} for {pipeline_id} did not complete successfully.")
         print("Sanitized Job logs (the worker never prints a mounted secret file):")
-        run(["kubectl", "logs", f"job/{execution_name}", "-n", namespace, "--all-containers"], check=False)
+        # Best-effort (check=False) -- a log-retrieval failure here must never replace/mask the primary reconciliation failure below, never trigger cleanup, and never leave the ephemeral resources any less retained than they already are. The CompletedProcess is captured (unlike the previous discarded call) so its stdout can actually be emitted -- run()'s default capture_output=True means a fire-and-forget call here silently swallows the very log content this step exists to surface.
+        log_proc = run(["kubectl", "logs", f"job/{execution_name}", "-n", namespace, "--all-containers"], check=False)
+        if log_proc.returncode == 0:
+            if log_proc.stdout:
+                print(log_proc.stdout, end="" if log_proc.stdout.endswith("\n") else "\n")
+        else:
+            # Deliberately NEVER prints log_proc.stderr here -- an unsanitized kubectl error (API server detail, transient cluster message, etc.) is not the same sanitized-by-construction contract the worker's own stdout carries, so only a fixed, safe-identifier-only warning is emitted.
+            print(f"WARN: unable to retrieve complete sanitized Job logs for job/{execution_name} (kubectl exit {log_proc.returncode}); retained Kubernetes resources remain available for diagnosis.")
         print(f"Job evidence retained for diagnosis: job/{execution_name}, configmap/{execution_name}, secretproviderclass/{execution_name} in {namespace}.")
         raise Phase6Error(f"reconciliation Job {execution_name} for pipeline {pipeline_id} did not complete successfully.")
 
