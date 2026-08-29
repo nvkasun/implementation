@@ -71,8 +71,8 @@ class ScriptedRun:
     def _resolve(self, proc_or_fn, argv):
         return proc_or_fn(argv) if callable(proc_or_fn) and not isinstance(proc_or_fn, FakeProc) else proc_or_fn
 
-    def __call__(self, argv, env=None, cwd=None, check=True, capture_output=True, input_text=None):
-        self.calls.append({"argv": list(argv), "input_text": input_text})
+    def __call__(self, argv, env=None, cwd=None, check=True, capture_output=True, input_text=None, timeout_seconds=None):
+        self.calls.append({"argv": list(argv), "input_text": input_text, "timeout_seconds": timeout_seconds})
         for predicate, proc_or_fn in reversed(self.rules):
             if predicate(argv):
                 proc = self._resolve(proc_or_fn, argv)
@@ -345,6 +345,22 @@ class StrictAcceptanceTests(unittest.TestCase):
                 self._run(scripted, output_path)
             self.assertEqual(_github_output_pairs(output_path), {})
 
+    # J: a kubectl exec WALL-CLOCK TIMEOUT on /healthz or /readyz (simulating Kubernetes API/auth/SPDY negotiation stalling before the in-pod urllib timeout is ever reached) must fail closed with a controlled Phase7MonitorError -- never an uncontrolled subprocess.TimeoutExpired traceback, never treated as HTTP 0 success.
+    def test_kubectl_health_exec_timeout_fails_closed_without_traceback(self):
+        scripted = _base_scripted()
+        scripted.when(_is_registry_call, _write_registry_fixture)
+        scripted.when(_is_monitor_acceptance_call, FakeProc(0, json.dumps({"state": "HEALTHY", "reasons": [], "checks": {"ready_pod_name": "gg-monitor-x"}})))
+        scripted.when(_is_kubectl_exec_call, FakeProc(124, "", "TIMEOUT: command exceeded 18s and was terminated"))
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = os.path.join(tmp, "gh_output")
+            open(output_path, "w").close()
+            try:
+                self._run(scripted, output_path)
+                self.fail("expected Phase7MonitorError")
+            except phase7_monitor.Phase7MonitorError as exc:
+                self.assertIn("failed", str(exc))
+            self.assertEqual(_github_output_pairs(output_path), {})
+
     def test_malformed_health_status_fails(self):
         scripted = _base_scripted()
         scripted.when(_is_registry_call, _write_registry_fixture)
@@ -519,6 +535,67 @@ class ReplicationMonitorAcceptanceTests(unittest.TestCase):
             with self.assertRaises(phase7_monitor.Phase7MonitorError):
                 phase7_monitor.cmd_replication_monitor_acceptance(args)
 
+    def _assert_inventory_fails(self, doc):
+        scripted = self._scripted_with_pipelines(["payments-pg-to-mssql-001"], doc)
+        args = argparse_namespace(environment=ENVIRONMENT, pod_name="gg-monitor-verified")
+        with _env_patch(), mock.patch.object(phase7_monitor, "run", scripted):
+            with self.assertRaises(phase7_monitor.Phase7MonitorError):
+                phase7_monitor.cmd_replication_monitor_acceptance(args)
+
+    # A: a malformed process row must fail closed even when every expected valid Extract/Distribution/Replicat row is ALSO present -- this is the exact defect: the old `isinstance(p, dict)` filter silently dropped "MALFORMED_ROW" while still finding and accepting the three valid rows.
+    def test_malformed_process_row_fails_even_with_all_valid_expected_rows_present(self):
+        doc = self._healthy_api_processes()
+        doc["deployments"][0]["processes"].insert(1, "MALFORMED_ROW")
+        self._assert_inventory_fails(doc)
+
+    # B: representative non-object process row variants (null/list/number/bool) must all fail closed -- never silently filtered out of the inventory.
+    def test_process_row_non_object_variants_fail(self):
+        for bad_row in (None, [], ["nested", "list"], 123, 1.5, True, False):
+            with self.subTest(bad_row=bad_row):
+                doc = self._healthy_api_processes()
+                doc["deployments"][0]["processes"].append(bad_row)
+                self._assert_inventory_fails(doc)
+
+    # C: missing/empty/non-string process identity must fail closed.
+    def test_missing_or_non_string_process_name_fails(self):
+        for bad_row in ({}, {"process": ""}, {"process": 123}, {"process": None}, {"status": "RUNNING"}):
+            with self.subTest(bad_row=bad_row):
+                doc = self._healthy_api_processes()
+                doc["deployments"][0]["processes"].append(bad_row)
+                self._assert_inventory_fails(doc)
+
+    # D: a non-list `processes` value must fail closed -- never silently coerced to an empty inventory via `x or []`.
+    def test_non_list_processes_fails(self):
+        for bad_processes in ({}, "bad", 123, True):
+            with self.subTest(bad_processes=bad_processes):
+                doc = self._healthy_api_processes()
+                doc["deployments"][0]["processes"] = bad_processes
+                self._assert_inventory_fails(doc)
+
+    # E: duplicate process identities within one deployment make the inventory ambiguous -- must fail closed, never silently resolved by keeping rows[0].
+    def test_duplicate_process_name_fails(self):
+        doc = self._healthy_api_processes()
+        doc["deployments"][0]["processes"].append({"process": "PGSRC01", "status": "STOPPED", "stale": False})
+        self._assert_inventory_fails(doc)
+
+    # F: a non-object processDiscovery value must fail with a controlled Phase7MonitorError, never an uncontrolled AttributeError/traceback from a bare `.get()` call.
+    def test_malformed_process_discovery_fails_with_controlled_error(self):
+        for bad_discovery in ("OK", ["OK"], 1, True, "OK"):
+            with self.subTest(bad_discovery=bad_discovery):
+                doc = self._healthy_api_processes()
+                doc["deployments"][0]["processDiscovery"] = bad_discovery
+                self._assert_inventory_fails(doc)
+
+    # K: a kubectl exec wall-clock timeout while fetching /api/processes for replication-monitor acceptance is a HARD failure -- never tolerated, never retried.
+    def test_api_processes_kubectl_exec_timeout_fails_hard(self):
+        scripted = _base_scripted()
+        scripted.when(_is_pipelines_call, FakeProc(0, "payments-pg-to-mssql-001\n"))
+        scripted.when(_is_kubectl_exec_call, FakeProc(124, "", "TIMEOUT: command exceeded 20s and was terminated"))
+        args = argparse_namespace(environment=ENVIRONMENT, pod_name="gg-monitor-verified")
+        with _env_patch(), mock.patch.object(phase7_monitor, "run", scripted):
+            with self.assertRaises(phase7_monitor.Phase7MonitorError):
+                phase7_monitor.cmd_replication_monitor_acceptance(args)
+
 
 class ListReplicationPipelinesTests(unittest.TestCase):
     def test_writes_has_pipelines_false_with_no_aws(self):
@@ -649,6 +726,83 @@ class EndToEndAcceptanceTests(unittest.TestCase):
             with self.assertRaises(phase7_monitor.Phase7MonitorError):
                 phase7_monitor.cmd_end_to_end_acceptance(args)
         self.assertEqual(scripted.calls, [])
+
+    # G: interval_seconds=0 must fail BEFORE any polling -- this is the exact defect: `elapsed += interval_seconds` never advances elapsed when interval_seconds is 0, producing a loop that cannot naturally terminate.
+    def test_zero_interval_fails_before_polling(self):
+        scripted = ScriptedRun()
+        args = argparse_namespace(environment=ENVIRONMENT, pod_name="gg-monitor-x", timeout_seconds=30, interval_seconds=0)
+        with _env_patch(), mock.patch.object(phase7_monitor, "run", scripted), mock.patch.object(phase7_monitor.time, "sleep") as sleep_mock:
+            with self.assertRaises(phase7_monitor.Phase7MonitorError):
+                phase7_monitor.cmd_end_to_end_acceptance(args)
+        self.assertEqual(scripted.calls, [])
+        sleep_mock.assert_not_called()
+
+    # H: a negative interval must fail the same way as zero.
+    def test_negative_interval_fails_before_polling(self):
+        scripted = ScriptedRun()
+        args = argparse_namespace(environment=ENVIRONMENT, pod_name="gg-monitor-x", timeout_seconds=30, interval_seconds=-1)
+        with _env_patch(), mock.patch.object(phase7_monitor, "run", scripted), mock.patch.object(phase7_monitor.time, "sleep") as sleep_mock:
+            with self.assertRaises(phase7_monitor.Phase7MonitorError):
+                phase7_monitor.cmd_end_to_end_acceptance(args)
+        self.assertEqual(scripted.calls, [])
+        sleep_mock.assert_not_called()
+
+    # I: a zero or negative timeout must also fail before any polling.
+    def test_zero_or_negative_timeout_fails_before_polling(self):
+        for bad_timeout in (0, -1):
+            with self.subTest(bad_timeout=bad_timeout):
+                scripted = ScriptedRun()
+                args = argparse_namespace(environment=ENVIRONMENT, pod_name="gg-monitor-x", timeout_seconds=bad_timeout, interval_seconds=15)
+                with _env_patch(), mock.patch.object(phase7_monitor, "run", scripted), mock.patch.object(phase7_monitor.time, "sleep") as sleep_mock:
+                    with self.assertRaises(phase7_monitor.Phase7MonitorError):
+                        phase7_monitor.cmd_end_to_end_acceptance(args)
+                self.assertEqual(scripted.calls, [])
+                sleep_mock.assert_not_called()
+
+    # I (continued): non-integer bounds (defense in depth -- never rely on argparse's own type=int alone) must also fail closed, including bool (a subclass of int in Python that must never be silently accepted as a duration).
+    def test_non_integer_bounds_fail_before_polling(self):
+        for bad_value in (True, False, "30", 30.5, None):
+            with self.subTest(bad_value=bad_value):
+                scripted = ScriptedRun()
+                args = argparse_namespace(environment=ENVIRONMENT, pod_name="gg-monitor-x", timeout_seconds=bad_value, interval_seconds=15)
+                with _env_patch(), mock.patch.object(phase7_monitor, "run", scripted), mock.patch.object(phase7_monitor.time, "sleep") as sleep_mock:
+                    with self.assertRaises(phase7_monitor.Phase7MonitorError):
+                        phase7_monitor.cmd_end_to_end_acceptance(args)
+                self.assertEqual(scripted.calls, [])
+                sleep_mock.assert_not_called()
+
+    # L: a kubectl exec wall-clock timeout while fetching /api/processes during E2E convergence is a TRANSIENT, RETRYABLE fetch failure -- never an unbounded loop, never immediately fatal. It must be retried within the existing bounded window, succeeding once a later fetch succeeds, or failing at the bound if it never does.
+    def test_api_processes_kubectl_exec_timeout_is_retried_and_can_still_succeed(self):
+        scripted = ScriptedRun()
+        attempts = {"n": 0}
+
+        def _kubectl_responder(argv):
+            attempts["n"] += 1
+            if attempts["n"] < 2:
+                return FakeProc(124, "", "TIMEOUT: command exceeded 20s and was terminated")
+            return FakeProc(0, json.dumps({"deployments": []}))
+
+        scripted.when(_is_kubectl_exec_call, _kubectl_responder)
+        scripted.when(_is_end_to_end_call, FakeProc(0, json.dumps({"state": "HEALTHY"})))
+        args = argparse_namespace(environment=ENVIRONMENT, pod_name="gg-monitor-x", timeout_seconds=600, interval_seconds=15)
+        with _env_patch(), mock.patch.object(phase7_monitor, "run", scripted), mock.patch.object(phase7_monitor.time, "sleep") as sleep_mock:
+            phase7_monitor.cmd_end_to_end_acceptance(args)
+        self.assertEqual(attempts["n"], 2)
+        self.assertEqual(sleep_mock.call_count, 1)
+        # A timed-out fetch must never even reach the classifier -- it is a fetch failure, not a HEALTHY/BROKEN classification.
+        self.assertEqual(len([c for c in scripted.calls if _is_end_to_end_call(c["argv"])]), 1)
+
+    def test_api_processes_kubectl_exec_timeout_persistent_fails_at_bound_never_unbounded(self):
+        scripted = ScriptedRun()
+        scripted.when(_is_kubectl_exec_call, FakeProc(124, "", "TIMEOUT: command exceeded 20s and was terminated"))
+        args = argparse_namespace(environment=ENVIRONMENT, pod_name="gg-monitor-x", timeout_seconds=30, interval_seconds=15)
+        with _env_patch(), mock.patch.object(phase7_monitor, "run", scripted), mock.patch.object(phase7_monitor.time, "sleep") as sleep_mock:
+            with self.assertRaises(phase7_monitor.Phase7MonitorError):
+                phase7_monitor.cmd_end_to_end_acceptance(args)
+        # elapsed sequence 0, 15, 30 -> exactly 3 fetch attempts for a 30s/15s bound, never more -- a persistently timing-out fetch must still terminate at the bound.
+        exec_calls = [c for c in scripted.calls if _is_kubectl_exec_call(c["argv"])]
+        self.assertEqual(len(exec_calls), 3)
+        self.assertEqual(sleep_mock.call_count, 2)
 
 
 class SanitizedDiagnosticTests(unittest.TestCase):

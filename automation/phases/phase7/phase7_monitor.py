@@ -27,6 +27,9 @@ DEFAULT_END_TO_END_INTERVAL_SECONDS = 15
 # Bounds how much of a raw kubectl/API stderr diagnostic may ever be surfaced -- never the full unbounded text (matches the existing sanitized-diagnostic idiom already used elsewhere in this workflow, e.g. end_to_end_deployment_acceptance's own `tail -c 500`).
 _SANITIZED_ERROR_TAIL_CHARS = 500
 
+# Outer kubectl-exec wall-clock bound = the in-pod HTTP request's own timeout_seconds + this buffer -- covers Kubernetes API/auth/SPDY-WebSocket negotiation and kubectl startup overhead that happens BEFORE the in-pod urllib call is even reached, while remaining tightly bounded (never unbounded, never open-ended).
+_KUBECTL_EXEC_OUTER_TIMEOUT_BUFFER_SECONDS = 15
+
 
 class Phase7MonitorError(Exception):
     """A fail-closed Phase 7 monitor orchestration error; main() reports it and exits non-zero."""
@@ -71,16 +74,25 @@ def _sanitize_tail(text):
 
 # Safe subprocess execution -- argument arrays only, never shell=True, never a shell pipeline, never a caller-constructed shell command string.
 
-def run(argv, env=None, cwd=None, check=True, capture_output=True, input_text=None):
-    """Runs argv as an argument array. Fails closed with the tool's own stdout/stderr on a non-zero exit when check=True."""
-    proc = subprocess.run(
-        argv,
-        cwd=cwd or REPO_ROOT,
-        env=env,
-        capture_output=capture_output,
-        text=True,
-        input=input_text,
-    )
+def run(argv, env=None, cwd=None, check=True, capture_output=True, input_text=None, timeout_seconds=None):
+    """Runs argv as an argument array. Fails closed with the tool's own stdout/stderr on a non-zero exit when check=True. If timeout_seconds is given and the command exceeds it, subprocess.TimeoutExpired is caught here and converted into a normal-shaped CompletedProcess with a fixed non-zero returncode (124, matching the conventional shell `timeout` exit code) and a short, bounded diagnostic -- never an uncontrolled traceback, never any (possibly unbounded) partial command output. Every existing caller that already checks proc.returncode/raises on non-zero therefore fails closed on a timeout automatically, with no further per-call-site special-casing required."""
+    try:
+        proc = subprocess.run(
+            argv,
+            cwd=cwd or REPO_ROOT,
+            env=env,
+            capture_output=capture_output,
+            text=True,
+            input=input_text,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        proc = subprocess.CompletedProcess(
+            args=argv,
+            returncode=124,
+            stdout="",
+            stderr=f"TIMEOUT: command exceeded {timeout_seconds}s and was terminated (argv: {' '.join(str(a) for a in argv)}).",
+        )
     if check and proc.returncode != 0:
         raise Phase7MonitorError(f"{' '.join(str(a) for a in argv)} failed (exit {proc.returncode}):\n{proc.stdout}\n{proc.stderr}")
     return proc
@@ -200,7 +212,7 @@ def cmd_validate_local(args):
 # Bounded, read-only kubectl exec HTTP helpers -- never shell=True, never blindly print raw stderr/response bodies.
 
 def _kubectl_exec_http_status(pod_name, namespace, path, timeout_seconds):
-    """Bounded in-pod HTTP GET via `kubectl exec ... -- python3 -c <program>` (argument array only). A kubectl-level failure (Forbidden/Unauthorized/pod gone/timeout) is NEVER treated as HTTP 0 success -- it fails this command closed immediately with a sanitized (bounded) diagnostic. A successful kubectl exec must yield EXACTLY one integer output line (the embedded program either prints the real HTTP status, an HTTPError's status code, or 0 for any other in-pod request failure) -- malformed/non-integer/multi-line output fails closed too, never silently coerced to a default status."""
+    """Bounded in-pod HTTP GET via `kubectl exec ... -- python3 -c <program>` (argument array only). A kubectl-level failure (Forbidden/Unauthorized/pod gone/timeout) is NEVER treated as HTTP 0 success -- it fails this command closed immediately with a sanitized (bounded) diagnostic. A successful kubectl exec must yield EXACTLY one integer output line (the embedded program either prints the real HTTP status, an HTTPError's status code, or 0 for any other in-pod request failure) -- malformed/non-integer/multi-line output fails closed too, never silently coerced to a default status. The OUTER kubectl exec call itself is wall-clock bounded (timeout_seconds + _KUBECTL_EXEC_OUTER_TIMEOUT_BUFFER_SECONDS) so Kubernetes API/auth/SPDY-WebSocket negotiation stalling BEFORE the in-pod urllib timeout is ever reached cannot hang this call indefinitely -- an outer timeout is treated exactly like any other kubectl exec failure (non-zero returncode) and raises Phase7MonitorError here, never a bare subprocess.TimeoutExpired traceback."""
     program = (
         "import urllib.request, urllib.error\n"
         "try:\n"
@@ -210,7 +222,8 @@ def _kubectl_exec_http_status(pod_name, namespace, path, timeout_seconds):
         "except Exception:\n"
         "    print(0)\n"
     )
-    proc = run(["kubectl", "exec", pod_name, "-n", namespace, "--", "python3", "-c", program], check=False)
+    proc = run(["kubectl", "exec", pod_name, "-n", namespace, "--", "python3", "-c", program], check=False,
+               timeout_seconds=timeout_seconds + _KUBECTL_EXEC_OUTER_TIMEOUT_BUFFER_SECONDS)
     if proc.returncode != 0:
         raise Phase7MonitorError(f"kubectl exec into pod {pod_name} in namespace {namespace} for GET {path} failed (exit {proc.returncode}); sanitized diagnostic: {_sanitize_tail(proc.stderr)}")
     lines = [line for line in proc.stdout.splitlines() if line.strip() != ""]
@@ -223,9 +236,10 @@ def _kubectl_exec_http_status(pod_name, namespace, path, timeout_seconds):
 
 
 def _try_fetch_api_processes(pod_name, namespace, timeout_seconds=5):
-    """Bounded, read-only fetch of GET /api/processes through pod_name (kubectl exec). Returns (True, parsed_json_doc) on success, or (False, sanitized_error_text) on ANY failure (kubectl exec failure, non-JSON output) -- never raises, so a bounded-retry caller can distinguish 'transient fetch failure, keep polling' from a hard failure elsewhere. The sanitized_error_text is bounded/truncated -- never a raw unbounded kubectl/API server diagnostic."""
+    """Bounded, read-only fetch of GET /api/processes through pod_name (kubectl exec). Returns (True, parsed_json_doc) on success, or (False, sanitized_error_text) on ANY failure (kubectl exec failure, non-JSON output) -- never raises, so a bounded-retry caller can distinguish 'transient fetch failure, keep polling' from a hard failure elsewhere. The sanitized_error_text is bounded/truncated -- never a raw unbounded kubectl/API server diagnostic. The OUTER kubectl exec call itself is wall-clock bounded (timeout_seconds + _KUBECTL_EXEC_OUTER_TIMEOUT_BUFFER_SECONDS) -- a stall before the in-pod urllib timeout is ever reached (API/auth/SPDY negotiation, kubectl itself hanging) surfaces as an ordinary non-zero kubectl exec failure here, never an unbounded hang or a bare traceback; callers that hard-fail on this (replication-monitor acceptance) or bounded-retry it (end-to-end acceptance) both get correct behavior automatically."""
     program = f"import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8080/api/processes', timeout={timeout_seconds}).read().decode('utf-8'))"
-    proc = run(["kubectl", "exec", pod_name, "-n", namespace, "--", "python3", "-c", program], check=False)
+    proc = run(["kubectl", "exec", pod_name, "-n", namespace, "--", "python3", "-c", program], check=False,
+               timeout_seconds=timeout_seconds + _KUBECTL_EXEC_OUTER_TIMEOUT_BUFFER_SECONDS)
     if proc.returncode != 0:
         return False, f"kubectl exec exit {proc.returncode}; sanitized diagnostic: {_sanitize_tail(proc.stderr)}"
     try:
@@ -358,18 +372,44 @@ def _api_processes_deployments_by_name(api_doc):
     return deployments_by_name
 
 
+def _validate_process_inventory(dep, deployment_name, pipeline_id):
+    """Strictly validates ONE deployment's process inventory BEFORE any expected-process matching is attempted -- a JSON response that is coherent at the top level but carries a malformed processDiscovery/processes/row anywhere is a HARD failure here, never a silently-filtered/emptied inventory. Required contract: (1) processDiscovery, if present, must be a JSON object -- a truthy string/list/number is never allowed to reach a bare .get() call and raise an uncontrolled AttributeError; (2) processes, if present, must be a JSON array -- never coerced to an empty inventory via `x or []`, which would silently accept a malformed non-list value; (3) every process row must itself be a JSON object -- a stray string/number/null/list anywhere in the array fails the WHOLE deployment's inventory, it is never dropped as though it simply were not there; (4) every row's `process` identity must be a non-empty string -- missing/empty/non-string identity fails closed; (5) process identities must be unique within the deployment -- a duplicate identity makes the inventory ambiguous and is rejected outright, never resolved by arbitrarily keeping the first occurrence. Returns (discovery_or_None, {process_name: row}) for the caller's exact-match lookup."""
+    discovery = dep.get("processDiscovery")
+    if discovery is not None and not isinstance(discovery, dict):
+        raise Phase7MonitorError(f"{pipeline_id}: {deployment_name} processDiscovery is a {type(discovery).__name__}, expected a JSON object: {discovery!r}")
+
+    raw_processes = dep.get("processes")
+    if raw_processes is None:
+        raw_processes = []
+    elif not isinstance(raw_processes, list):
+        raise Phase7MonitorError(f"{pipeline_id}: {deployment_name} processes is a {type(raw_processes).__name__}, expected a JSON array: {raw_processes!r}")
+
+    rows_by_name = {}
+    for index, row in enumerate(raw_processes):
+        if not isinstance(row, dict):
+            raise Phase7MonitorError(f"{pipeline_id}: {deployment_name} process row #{index} is not an object: {row!r}")
+        process_name = row.get("process")
+        if not isinstance(process_name, str) or not process_name:
+            raise Phase7MonitorError(f"{pipeline_id}: {deployment_name} process row #{index} has a missing/empty/non-string process identity: {process_name!r}")
+        if process_name in rows_by_name:
+            raise Phase7MonitorError(f"{pipeline_id}: {deployment_name} has duplicate process identity {process_name!r} -- an ambiguous inventory is never resolved by arbitrarily keeping the first occurrence")
+        rows_by_name[process_name] = row
+
+    return discovery, rows_by_name
+
+
 def _require_process(deployments_by_name, deployment_name, process_name, expect_running, pipeline_id):
-    """Mirrors the original per-pipeline check's exact fail-fast semantics: the first violated rule raises immediately (a pipeline's Extract/Distribution/Replicat checks stop at the first failure, and no later pipeline is evaluated once one has failed) -- never an aggregate-and-report-all pass."""
+    """Mirrors the original per-pipeline check's exact fail-fast semantics: the first violated rule raises immediately (a pipeline's Extract/Distribution/Replicat checks stop at the first failure, and no later pipeline is evaluated once one has failed) -- never an aggregate-and-report-all pass. The entire process inventory is strictly validated (see _validate_process_inventory()) before any expected-row matching is attempted."""
     dep = deployments_by_name.get(deployment_name)
     if dep is None:
         raise Phase7MonitorError(f"{pipeline_id}: monitor has no entry for deployment {deployment_name}")
-    discovery = dep.get("processDiscovery") or {}
-    if discovery.get("status") != "OK":
-        raise Phase7MonitorError(f"{pipeline_id}: {deployment_name} processDiscovery.status is {discovery.get('status')!r}, expected OK")
-    rows = [p for p in (dep.get("processes") or []) if isinstance(p, dict) and p.get("process") == process_name]
-    if not rows:
+    discovery, rows_by_name = _validate_process_inventory(dep, deployment_name, pipeline_id)
+    effective_discovery = discovery if discovery is not None else {}
+    if effective_discovery.get("status") != "OK":
+        raise Phase7MonitorError(f"{pipeline_id}: {deployment_name} processDiscovery.status is {effective_discovery.get('status')!r}, expected OK")
+    row = rows_by_name.get(process_name)
+    if row is None:
         raise Phase7MonitorError(f"{pipeline_id}: {deployment_name} has no real process row named {process_name!r}")
-    row = rows[0]
     if row.get("stale"):
         raise Phase7MonitorError(f"{pipeline_id}: {deployment_name} process {process_name!r} is stale")
     if row.get("status") == "ABENDED":
@@ -409,12 +449,20 @@ def cmd_replication_monitor_acceptance(args):
 
 # Phase 7F: monitor-to-runtime end-to-end acceptance (end_to_end_deployment_acceptance) -- bounded poll, reuses automation/orchestration/end_to_end_acceptance.py as the sole authoritative classifier, reuses the SAME verified Ready pod.
 
+def _require_positive_int(label, value):
+    """Semantic range validation, deliberately never relying on argparse's own `type=int` alone (a test or a future caller may construct/override these values directly, bypassing argparse entirely). Rejects non-int types (including bool, which is a subclass of int in Python and must never be silently accepted as a duration), and any value <= 0 -- zero or negative would make the elapsed/timeout bookkeeping in the polling loop below meaningless (a zero interval never advances elapsed, producing an unbounded loop; a zero/negative timeout is immediately-or-already exceeded in a way that defeats the bound's purpose)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise Phase7MonitorError(f"{label} must be a positive integer, got {value!r}.")
+    return value
+
+
 def cmd_end_to_end_acceptance(args):
     environment = require_environment_arg(args.environment)
     pod_name = require_pod_name_arg(args.pod_name)
     monitor_namespace = require_env("MONITOR_NAMESPACE")
-    timeout_seconds = args.timeout_seconds
-    interval_seconds = args.interval_seconds
+    # Bound validation happens BEFORE any kubectl/sleep/polling/classifier call below -- an invalid bound must never reach the loop, let alone create one that cannot naturally terminate (e.g. interval_seconds=0 would make `elapsed += interval_seconds` never advance).
+    timeout_seconds = _require_positive_int("--timeout-seconds", args.timeout_seconds)
+    interval_seconds = _require_positive_int("--interval-seconds", args.interval_seconds)
     elapsed = 0
 
     while True:

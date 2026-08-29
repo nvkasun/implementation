@@ -18595,6 +18595,137 @@ else
   skip "Monitor runtime-log acceptance fail-closed classification: dedicated behavioral assertions -- python3/PyYAML/${MONITOR_WORKFLOW} unavailable"
 fi
 
+echo "--- Phase 7 focused suites (executed as part of this same repository regression) ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/phases/phase7/tests/test_phase7_monitor.py ]; then
+  if PHASE7_MONITOR_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/phases/phase7/tests/test_phase7_monitor.py 2>&1)"; then
+    pass "Phase 7: automation/phases/phase7/tests/test_phase7_monitor.py (ownership/dry-run/strict-acceptance/replication-acceptance/end-to-end-acceptance orchestration test suite) passes"
+  else
+    fail "Phase 7: automation/phases/phase7/tests/test_phase7_monitor.py failed:"$'\n'"${PHASE7_MONITOR_TEST_OUTPUT}"
+  fi
+else
+  skip "Phase 7: automation/phases/phase7/tests/test_phase7_monitor.py -- python3 unavailable or file missing"
+fi
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/phases/phase7/tests/test_phase7_final.py ]; then
+  if PHASE7_FINAL_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/phases/phase7/tests/test_phase7_final.py 2>&1)"; then
+    pass "Phase 7: automation/phases/phase7/tests/test_phase7_final.py (mode-aware final DEPLOY success contract truth-table suite) passes"
+  else
+    fail "Phase 7: automation/phases/phase7/tests/test_phase7_final.py failed:"$'\n'"${PHASE7_FINAL_TEST_OUTPUT}"
+  fi
+else
+  skip "Phase 7: automation/phases/phase7/tests/test_phase7_final.py -- python3 unavailable or file missing"
+fi
+
+echo "--- Phase 7 final correction: strict process-inventory validation (Defect 1) + bounded E2E polling (Defect 2) ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/phases/phase7/phase7_monitor.py ]; then
+  PHASE7_FINAL_CORRECTION_CHECK="$(python3 -c '
+import importlib.util
+from unittest import mock
+
+spec = importlib.util.spec_from_file_location("phase7_monitor", "automation/phases/phase7/phase7_monitor.py")
+phase7_monitor = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(phase7_monitor)
+
+results = []
+
+
+def check(label, ok):
+    results.append((label, ok))
+
+
+with open("automation/phases/phase7/phase7_monitor.py") as f:
+    source_text = f.read()
+
+# 1: the exact dangerous pattern this defect was built from ("if isinstance(p, dict)" silently filtering a malformed row out of a process-row list comprehension) must never reappear.
+check("1: the old silently-filtering isinstance(p, dict) row-comprehension pattern is gone from the source", "if isinstance(p, dict) and p.get" not in source_text)
+
+# 2: REAL committed function, malformed row + all valid expected rows present -- must fail closed (never the old defect where valid rows were still found and accepted).
+deployments_by_name = {
+    "gg-pg-src-01": {
+        "processDiscovery": {"status": "OK"},
+        "processes": [
+            {"process": "PGSRC01", "status": "RUNNING", "stale": False},
+            "MALFORMED_ROW",
+            {"process": "PG2MS01", "status": "RUNNING", "stale": False},
+        ],
+    }
+}
+try:
+    phase7_monitor._require_process(deployments_by_name, "gg-pg-src-01", "PGSRC01", True, "test-pipeline")
+    check("2: malformed process row (with valid expected rows also present) fails closed via the real _require_process()", False)
+except phase7_monitor.Phase7MonitorError:
+    check("2: malformed process row (with valid expected rows also present) fails closed via the real _require_process()", True)
+
+# 3: the healthy/normal case must still be accepted (the fix must not overcorrect into rejecting valid inventories).
+healthy = {"gg-pg-src-01": {"processDiscovery": {"status": "OK"}, "processes": [{"process": "PGSRC01", "status": "RUNNING", "stale": False}]}}
+try:
+    phase7_monitor._require_process(healthy, "gg-pg-src-01", "PGSRC01", True, "test-pipeline")
+    check("3: a healthy, well-formed process inventory is still accepted", True)
+except phase7_monitor.Phase7MonitorError:
+    check("3: a healthy, well-formed process inventory is still accepted", False)
+
+# 4: production E2E defaults remain exactly 600/15 -- this correction must never change approved business semantics.
+check("4: DEFAULT_END_TO_END_TIMEOUT_SECONDS remains exactly 600", phase7_monitor.DEFAULT_END_TO_END_TIMEOUT_SECONDS == 600)
+check("5: DEFAULT_END_TO_END_INTERVAL_SECONDS remains exactly 15", phase7_monitor.DEFAULT_END_TO_END_INTERVAL_SECONDS == 15)
+
+# 6: the REAL committed end-to-end command rejects interval_seconds=0 before any kubectl/sleep call -- proves the exact unbounded-loop defect is closed, executed against the real function, never a reimplemented copy.
+calls = {"kubectl": 0, "sleep": 0}
+
+
+def fake_run(argv, env=None, cwd=None, check=True, capture_output=True, input_text=None, timeout_seconds=None):
+    calls["kubectl"] += 1
+    class P:
+        returncode = 1
+        stdout = ""
+        stderr = ""
+    return P()
+
+
+def fake_sleep(seconds):
+    calls["sleep"] += 1
+
+
+import os
+os.environ.setdefault("MONITOR_NAMESPACE", "goldengate-monitoring")
+
+with mock.patch.object(phase7_monitor, "run", fake_run), mock.patch.object(phase7_monitor.time, "sleep", fake_sleep):
+    args = type("Args", (), {"environment": "dev", "pod_name": "gg-monitor-x", "timeout_seconds": 30, "interval_seconds": 0})()
+    try:
+        phase7_monitor.cmd_end_to_end_acceptance(args)
+        check("6: interval_seconds=0 raises Phase7MonitorError before any kubectl/sleep call (real cmd_end_to_end_acceptance)", False)
+    except phase7_monitor.Phase7MonitorError:
+        check("6: interval_seconds=0 raises Phase7MonitorError before any kubectl/sleep call (real cmd_end_to_end_acceptance)", calls["kubectl"] == 0 and calls["sleep"] == 0)
+
+# 7: run() itself now accepts an explicit timeout_seconds keyword and translates subprocess.TimeoutExpired into a controlled, non-zero-returncode result -- never a bare traceback.
+import subprocess as _subprocess
+
+def _raising_subprocess_run(argv, **kwargs):
+    raise _subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout"))
+
+with mock.patch("subprocess.run", _raising_subprocess_run):
+    proc = phase7_monitor.run(["kubectl", "exec", "pod", "-n", "ns", "--", "true"], check=False, timeout_seconds=5)
+    check("7: run() converts subprocess.TimeoutExpired into a non-zero-returncode result, never an uncaught exception", proc.returncode != 0)
+    check("7b: the timeout diagnostic is bounded/fixed text, never raw unbounded partial output", "TIMEOUT" in proc.stderr and len(proc.stderr) < 500)
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+' 2>&1)"
+  echo "$PHASE7_FINAL_CORRECTION_CHECK"
+  if [ -z "$(echo "$PHASE7_FINAL_CORRECTION_CHECK" | grep '^FAIL ' || true)" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        OK\ *) pass "Phase 7 final correction: ${line#OK }" ;;
+      esac
+    done <<< "$PHASE7_FINAL_CORRECTION_CHECK"
+  else
+    fail "Phase 7 final correction: dedicated regression assertions failed:"$'\n'"${PHASE7_FINAL_CORRECTION_CHECK}"
+  fi
+else
+  skip "Phase 7 final correction: dedicated regression assertions -- python3/phase7_monitor.py unavailable"
+fi
+
 echo "--- Phase 7: general Python-first orchestration conversion (monitor jobs + final_validation) ---"
 
 if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
