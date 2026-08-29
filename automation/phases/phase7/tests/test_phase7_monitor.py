@@ -719,6 +719,127 @@ class EndToEndAcceptanceTests(unittest.TestCase):
         for c in exec_calls:
             self.assertIn(pod_name, c["argv"])
 
+    # A: the canonical EKS connection must happen before the FIRST /api/processes fetch, and exactly once, for a valid end-to-end-acceptance invocation.
+    def test_connects_to_eks_before_first_fetch_exactly_once(self):
+        call_order = []
+
+        def fake_connect():
+            call_order.append("connect")
+
+        def fake_fetch(pod_name, namespace, timeout_seconds=5):
+            call_order.append("fetch")
+            return True, {"deployments": []}
+
+        scripted = ScriptedRun()
+        scripted.when(_is_end_to_end_call, FakeProc(0, json.dumps({"state": "HEALTHY"})))
+        args = argparse_namespace(environment=ENVIRONMENT, pod_name="gg-monitor-x", timeout_seconds=600, interval_seconds=15)
+        with _env_patch(), mock.patch.object(phase7_monitor, "_connect_to_eks", fake_connect), \
+                mock.patch.object(phase7_monitor, "_try_fetch_api_processes", fake_fetch), \
+                mock.patch.object(phase7_monitor, "run", scripted), \
+                mock.patch.object(phase7_monitor.time, "sleep"):
+            phase7_monitor.cmd_end_to_end_acceptance(args)
+        self.assertEqual(call_order, ["connect", "fetch"])
+
+    # B: an EKS connection failure is a SETUP failure, not a monitor-health state -- it must stop everything before any polling: no fetch, no sleep, no classifier execution.
+    def test_eks_connection_failure_stops_before_any_polling(self):
+        def fake_connect():
+            raise phase7_monitor.Phase7MonitorError("simulated EKS connection failure (AccessDenied/expired credentials/cluster not found/network failure)")
+
+        fetch_mock = mock.Mock()
+        run_mock = mock.Mock()
+        args = argparse_namespace(environment=ENVIRONMENT, pod_name="gg-monitor-x", timeout_seconds=600, interval_seconds=15)
+        with _env_patch(), mock.patch.object(phase7_monitor, "_connect_to_eks", fake_connect), \
+                mock.patch.object(phase7_monitor, "_try_fetch_api_processes", fetch_mock), \
+                mock.patch.object(phase7_monitor, "run", run_mock), \
+                mock.patch.object(phase7_monitor.time, "sleep") as sleep_mock:
+            with self.assertRaises(phase7_monitor.Phase7MonitorError):
+                phase7_monitor.cmd_end_to_end_acceptance(args)
+        fetch_mock.assert_not_called()
+        run_mock.assert_not_called()
+        sleep_mock.assert_not_called()
+
+    # C: a transient /api/processes fetch failure that is later retried successfully must NEVER trigger a second EKS connection -- the kubeconfig binding is one-time command setup, not convergence-loop business logic.
+    def test_transient_fetch_retry_does_not_reconnect_to_eks(self):
+        connect_mock = mock.Mock()
+        scripted = ScriptedRun()
+        attempts = {"n": 0}
+
+        def _kubectl_responder(argv):
+            attempts["n"] += 1
+            if attempts["n"] < 2:
+                return FakeProc(1, "", "Error from server (Forbidden)")
+            return FakeProc(0, json.dumps({"deployments": []}))
+
+        scripted.when(_is_kubectl_exec_call, _kubectl_responder)
+        scripted.when(_is_end_to_end_call, FakeProc(0, json.dumps({"state": "HEALTHY"})))
+        args = argparse_namespace(environment=ENVIRONMENT, pod_name="gg-monitor-x", timeout_seconds=600, interval_seconds=15)
+        with _env_patch(), mock.patch.object(phase7_monitor, "_connect_to_eks", connect_mock), \
+                mock.patch.object(phase7_monitor, "run", scripted), \
+                mock.patch.object(phase7_monitor.time, "sleep"):
+            phase7_monitor.cmd_end_to_end_acceptance(args)
+        self.assertEqual(connect_mock.call_count, 1)
+
+    # D: a persistent bounded BROKEN/timeout sequence must also never reconnect -- the existing 30s/15s bound (3 attempts) is preserved exactly, and EKS is connected exactly once for the whole command.
+    def test_persistent_bounded_failure_does_not_reconnect_to_eks(self):
+        connect_mock = mock.Mock()
+        scripted = ScriptedRun()
+        scripted.when(_is_kubectl_exec_call, self._kubectl_exec_json_shim({"deployments": []}))
+        scripted.when(_is_end_to_end_call, FakeProc(1, json.dumps({"state": "BROKEN"})))
+        args = argparse_namespace(environment=ENVIRONMENT, pod_name="gg-monitor-x", timeout_seconds=30, interval_seconds=15)
+        with _env_patch(), mock.patch.object(phase7_monitor, "_connect_to_eks", connect_mock), \
+                mock.patch.object(phase7_monitor, "run", scripted), \
+                mock.patch.object(phase7_monitor.time, "sleep") as sleep_mock:
+            with self.assertRaises(phase7_monitor.Phase7MonitorError):
+                phase7_monitor.cmd_end_to_end_acceptance(args)
+        e2e_calls = [c for c in scripted.calls if _is_end_to_end_call(c["argv"])]
+        self.assertEqual(len(e2e_calls), 3)
+        self.assertEqual(connect_mock.call_count, 1)
+        self.assertEqual(sleep_mock.call_count, 2)
+
+    # E: invalid polling bounds must still fail BEFORE any EKS connection -- the just-approved bound-validation-first contract is not weakened by adding the EKS connection.
+    def test_invalid_bounds_never_call_connect_to_eks(self):
+        for kwargs in (
+            dict(timeout_seconds=30, interval_seconds=0),
+            dict(timeout_seconds=30, interval_seconds=-1),
+            dict(timeout_seconds=0, interval_seconds=15),
+            dict(timeout_seconds=-1, interval_seconds=15),
+        ):
+            with self.subTest(**kwargs):
+                connect_mock = mock.Mock()
+                scripted = ScriptedRun()
+                args = argparse_namespace(environment=ENVIRONMENT, pod_name="gg-monitor-x", **kwargs)
+                with _env_patch(), mock.patch.object(phase7_monitor, "_connect_to_eks", connect_mock), \
+                        mock.patch.object(phase7_monitor, "run", scripted), \
+                        mock.patch.object(phase7_monitor.time, "sleep") as sleep_mock:
+                    with self.assertRaises(phase7_monitor.Phase7MonitorError):
+                        phase7_monitor.cmd_end_to_end_acceptance(args)
+                self.assertEqual(connect_mock.call_count, 0)
+                self.assertEqual(scripted.calls, [])
+                sleep_mock.assert_not_called()
+
+    # F: the canonical _connect_to_eks() command shape/values are reused exactly -- no duplicated/hardcoded EKS logic is introduced inside cmd_end_to_end_acceptance itself.
+    def test_e2e_connect_uses_canonical_eks_command_and_values(self):
+        scripted = ScriptedRun()
+        scripted.when(_is_kubectl_exec_call, self._kubectl_exec_json_shim({"deployments": []}))
+        scripted.when(_is_end_to_end_call, FakeProc(0, json.dumps({"state": "HEALTHY"})))
+        args = argparse_namespace(environment=ENVIRONMENT, pod_name="gg-monitor-x", timeout_seconds=600, interval_seconds=15)
+        with _env_patch(), mock.patch.object(phase7_monitor, "run", scripted), mock.patch.object(phase7_monitor.time, "sleep"):
+            phase7_monitor.cmd_end_to_end_acceptance(args)
+        eks_calls = [c for c in scripted.calls if _starts_with("aws", "eks", "update-kubeconfig")(c["argv"])]
+        self.assertEqual(len(eks_calls), 1)
+        self.assertEqual(eks_calls[0]["argv"], [
+            "aws", "eks", "update-kubeconfig",
+            "--region", AWS_REGION_VALUE,
+            "--name", EKS_CLUSTER_NAME_VALUE,
+            "--role-arn", EKS_DEPLOY_ROLE_ARN_VALUE,
+            "--assume-role-arn", EKS_DEPLOY_ROLE_ARN_VALUE,
+        ])
+        import inspect
+        source = inspect.getsource(phase7_monitor.cmd_end_to_end_acceptance)
+        self.assertIn("_connect_to_eks()", source)
+        # No duplicated argv construction -- cmd_end_to_end_acceptance must delegate to the shared helper, never build its own "aws", "eks", "update-kubeconfig" argument array (an explanatory comment may legitimately mention the words; only the literal argv-construction pattern is forbidden here).
+        self.assertNotIn('"aws", "eks", "update-kubeconfig"', source)
+
     def test_empty_pod_name_fails_closed_before_any_fetch(self):
         scripted = ScriptedRun()
         args = argparse_namespace(environment=ENVIRONMENT, pod_name="", timeout_seconds=600, interval_seconds=15)

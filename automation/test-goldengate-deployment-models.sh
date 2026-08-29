@@ -18726,6 +18726,165 @@ else
   skip "Phase 7 final correction: dedicated regression assertions -- python3/phase7_monitor.py unavailable"
 fi
 
+echo "--- Phase 7F parity correction: canonical EKS connection restored before monitor fetching ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/phases/phase7/phase7_monitor.py ]; then
+  PHASE7F_EKS_PARITY_CHECK="$(python3 -c '
+import importlib.util
+from unittest import mock
+
+spec = importlib.util.spec_from_file_location("phase7_monitor", "automation/phases/phase7/phase7_monitor.py")
+phase7_monitor = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(phase7_monitor)
+
+results = []
+
+
+def check(label, ok):
+    results.append((label, ok))
+
+
+import os
+os.environ.setdefault("MONITOR_NAMESPACE", "goldengate-monitoring")
+os.environ.setdefault("AWS_REGION", "eu-west-1")
+os.environ.setdefault("EKS_CLUSTER_NAME", "gg-dev-cluster")
+os.environ.setdefault("EKS_DEPLOY_ROLE_ARN", "arn:aws:iam::123456789012:role/GoldenGateEksDeployRole-dev")
+
+
+class FakeProc:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+# 1: REAL committed cmd_end_to_end_acceptance() calls the shared, canonical _connect_to_eks() helper exactly once, BEFORE the first kubectl exec /api/processes fetch and before the classifier ever runs -- a future regression that removes this call (the exact defect this correction fixes) must fail this check.
+call_order = []
+
+
+def fake_connect():
+    call_order.append("connect")
+
+
+def fake_fetch(pod_name, namespace, timeout_seconds=5):
+    call_order.append("fetch")
+    return True, {"deployments": []}
+
+
+def fake_run(argv, env=None, cwd=None, check=True, capture_output=True, input_text=None, timeout_seconds=None):
+    call_order.append("classifier")
+    return FakeProc(0, "{\"state\": \"HEALTHY\"}")
+
+
+with mock.patch.object(phase7_monitor, "_connect_to_eks", fake_connect), \
+     mock.patch.object(phase7_monitor, "_try_fetch_api_processes", fake_fetch), \
+     mock.patch.object(phase7_monitor, "run", fake_run), \
+     mock.patch.object(phase7_monitor.time, "sleep"):
+    args = type("Args", (), {"environment": "dev", "pod_name": "gg-monitor-x", "timeout_seconds": 600, "interval_seconds": 15})()
+    phase7_monitor.cmd_end_to_end_acceptance(args)
+
+check("1: cmd_end_to_end_acceptance() connects to EKS exactly once, strictly before the first fetch and before the classifier ever runs", call_order == ["connect", "fetch", "classifier"])
+
+# 2: an EKS connection failure is a hard setup failure -- zero fetch, zero classifier execution, zero sleep.
+fetch_calls = []
+run_calls = []
+sleep_calls = []
+
+
+def failing_connect():
+    raise phase7_monitor.Phase7MonitorError("simulated EKS connection failure")
+
+
+def tracking_fetch(pod_name, namespace, timeout_seconds=5):
+    fetch_calls.append(1)
+    return True, {"deployments": []}
+
+
+def tracking_run(argv, **kwargs):
+    run_calls.append(list(argv))
+    return FakeProc(0, "{\"state\": \"HEALTHY\"}")
+
+
+def tracking_sleep(seconds):
+    sleep_calls.append(seconds)
+
+
+with mock.patch.object(phase7_monitor, "_connect_to_eks", failing_connect), \
+     mock.patch.object(phase7_monitor, "_try_fetch_api_processes", tracking_fetch), \
+     mock.patch.object(phase7_monitor, "run", tracking_run), \
+     mock.patch.object(phase7_monitor.time, "sleep", tracking_sleep):
+    args = type("Args", (), {"environment": "dev", "pod_name": "gg-monitor-x", "timeout_seconds": 600, "interval_seconds": 15})()
+    try:
+        phase7_monitor.cmd_end_to_end_acceptance(args)
+        check("2: an EKS connection failure stops end-to-end-acceptance before any polling", False)
+    except phase7_monitor.Phase7MonitorError:
+        check("2: an EKS connection failure stops end-to-end-acceptance before any polling (zero fetch/classifier/sleep calls)", not fetch_calls and not run_calls and not sleep_calls)
+
+# 3: invalid polling bounds still fail BEFORE any EKS connection is attempted -- the just-approved bound-validation-first contract is not weakened by restoring the EKS connection.
+connect_call_count = {"n": 0}
+
+
+def counting_connect():
+    connect_call_count["n"] += 1
+
+
+for bad_kwargs in ({"timeout_seconds": 30, "interval_seconds": 0}, {"timeout_seconds": 0, "interval_seconds": 15}):
+    connect_call_count["n"] = 0
+    with mock.patch.object(phase7_monitor, "_connect_to_eks", counting_connect), mock.patch.object(phase7_monitor.time, "sleep"):
+        args = type("Args", (), {"environment": "dev", "pod_name": "gg-monitor-x", **bad_kwargs})()
+        try:
+            phase7_monitor.cmd_end_to_end_acceptance(args)
+        except phase7_monitor.Phase7MonitorError:
+            pass
+    check(f"3: invalid bounds {bad_kwargs!r} never call _connect_to_eks", connect_call_count["n"] == 0)
+
+# 4: the canonical _connect_to_eks() helper itself is reused unchanged -- exact aws eks update-kubeconfig argv using AWS_REGION/EKS_CLUSTER_NAME/EKS_DEPLOY_ROLE_ARN, never a duplicated/hardcoded construction inside cmd_end_to_end_acceptance.
+eks_argv_calls = []
+
+
+def capturing_run(argv, env=None, cwd=None, check=True, capture_output=True, input_text=None, timeout_seconds=None):
+    if list(argv[:2]) == ["aws", "eks"]:
+        eks_argv_calls.append(list(argv))
+    return FakeProc(0, "{\"state\": \"HEALTHY\"}")
+
+
+with mock.patch.object(phase7_monitor, "run", capturing_run), \
+     mock.patch.object(phase7_monitor, "_try_fetch_api_processes", lambda pod_name, namespace, timeout_seconds=5: (True, {"deployments": []})), \
+     mock.patch.object(phase7_monitor.time, "sleep"):
+    args = type("Args", (), {"environment": "dev", "pod_name": "gg-monitor-x", "timeout_seconds": 600, "interval_seconds": 15})()
+    phase7_monitor.cmd_end_to_end_acceptance(args)
+
+check("4: exactly one canonical aws eks update-kubeconfig call, using AWS_REGION/EKS_CLUSTER_NAME/EKS_DEPLOY_ROLE_ARN", eks_argv_calls == [[
+    "aws", "eks", "update-kubeconfig",
+    "--region", os.environ["AWS_REGION"],
+    "--name", os.environ["EKS_CLUSTER_NAME"],
+    "--role-arn", os.environ["EKS_DEPLOY_ROLE_ARN"],
+    "--assume-role-arn", os.environ["EKS_DEPLOY_ROLE_ARN"],
+]])
+
+with open("automation/phases/phase7/phase7_monitor.py") as f:
+    source_text = f.read()
+import inspect
+e2e_source = inspect.getsource(phase7_monitor.cmd_end_to_end_acceptance)
+check("4b: cmd_end_to_end_acceptance itself never constructs its own aws/eks/update-kubeconfig argv (delegates to the shared _connect_to_eks() helper only)", "_connect_to_eks()" in e2e_source and "\"aws\", \"eks\", \"update-kubeconfig\"" not in e2e_source)
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+' 2>&1)"
+  echo "$PHASE7F_EKS_PARITY_CHECK"
+  if [ -z "$(echo "$PHASE7F_EKS_PARITY_CHECK" | grep '^FAIL ' || true)" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        OK\ *) pass "Phase 7F EKS parity: ${line#OK }" ;;
+      esac
+    done <<< "$PHASE7F_EKS_PARITY_CHECK"
+  else
+    fail "Phase 7F EKS parity: dedicated regression assertions failed:"$'\n'"${PHASE7F_EKS_PARITY_CHECK}"
+  fi
+else
+  skip "Phase 7F EKS parity: dedicated regression assertions -- python3/phase7_monitor.py unavailable"
+fi
+
 echo "--- Phase 7: general Python-first orchestration conversion (monitor jobs + final_validation) ---"
 
 if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then

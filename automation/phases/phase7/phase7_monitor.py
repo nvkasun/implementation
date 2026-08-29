@@ -460,9 +460,13 @@ def cmd_end_to_end_acceptance(args):
     environment = require_environment_arg(args.environment)
     pod_name = require_pod_name_arg(args.pod_name)
     monitor_namespace = require_env("MONITOR_NAMESPACE")
-    # Bound validation happens BEFORE any kubectl/sleep/polling/classifier call below -- an invalid bound must never reach the loop, let alone create one that cannot naturally terminate (e.g. interval_seconds=0 would make `elapsed += interval_seconds` never advance).
+    # Bound validation happens BEFORE any AWS/EKS/kubectl/sleep/polling/classifier call below -- an invalid bound must never reach the loop, let alone create one that cannot naturally terminate (e.g. interval_seconds=0 would make `elapsed += interval_seconds` never advance).
     timeout_seconds = _require_positive_int("--timeout-seconds", args.timeout_seconds)
     interval_seconds = _require_positive_int("--interval-seconds", args.interval_seconds)
+
+    # Canonical EKS connection, established exactly ONCE for this command invocation -- command setup, never convergence-loop business logic. Preserves the exact pre-Phase-7-conversion contract (aws eks update-kubeconfig using AWS_REGION/EKS_CLUSTER_NAME/EKS_DEPLOY_ROLE_ARN) that this command must never depend on an ambient/pre-existing kubeconfig. Fails closed (via _connect_to_eks()'s own run() check=True) before the polling loop ever starts -- a canonical EKS connection failure (AccessDenied, expired credentials, cluster not found, network/API failure) is a setup failure, never a transient monitor-health state to retry/sleep through.
+    _connect_to_eks()
+
     elapsed = 0
 
     while True:
