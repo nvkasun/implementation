@@ -12860,7 +12860,7 @@ if all_present:
 
 detect_run = by_name.get("Detect an existing Ready gg-monitor pod (bootstrap-safe)", {}).get("run", "")
 results.append(("the bootstrap-detection step never hard-fails merely because no old Ready monitor pod exists (the old blocking prerequisite message is gone)", "Prerequisite: first deploy the monitor with enable_cloudwatch_publication=false" not in detect_run))
-results.append(("the bootstrap-detection step contains no exit 1 (detection only, never fatal)", "exit 1" not in detect_run))
+results.append(("the bootstrap-detection step now fails closed (exit 1) on genuine Kubernetes inspection failures -- Forbidden/Unauthorized/API/timeout/malformed JSON -- while STILL never hard-failing merely because no suitable Ready monitor exists or the Deployment genuinely does not exist (preliminary Phase 7 safety correction; see the dedicated fail-closed Kubernetes inspection behavioral section for exhaustive proof of both sides of this contract)", "exit 1" in detect_run and "Bootstrap selection is refused because state could not be determined" in detect_run))
 
 apply_run = by_name.get("Create or update Argo CD Application", {}).get("run", "")
 results.append(("Create or update Argo CD Application computes a safe interim cloudwatch.publishEnabled=false value for the bootstrap/repair path", "APPLY_CLOUDWATCH_VALUE=\"false\"" in apply_run))
@@ -13793,6 +13793,7 @@ with open("'"$MONITOR_WORKFLOW"'") as f:
 by_name = {s.get("name"): s for s in sub_doc["jobs"]["build_publish_and_deploy"]["steps"]}
 results = []
 
+# Shared by both steps, unaffected by the preliminary Phase 7 fail-closed Kubernetes inspection correction (which touched ONLY the "Detect..." step, and only its handling of an EMPTY/malformed rs_metadata_uid -- see below).
 required_fragments = (
     "rs_owner_uid=",
     "rs_metadata_uid=",
@@ -13802,7 +13803,6 @@ required_fragments = (
     "[ \"$rs_deploy_name\" != \"gg-monitor\" ] && continue",
     "[ \"$rs_deploy_uid\" != \"$DEPLOY_UID\" ] && continue",
     "[ -z \"$rs_owner_uid\" ] && continue",
-    "[ -z \"$rs_metadata_uid\" ] && continue",
     "[ -z \"$rs_deploy_name\" ] && continue",
     "[ -z \"$rs_deploy_uid\" ] && continue",
 )
@@ -13815,6 +13815,14 @@ for step_name in ("Detect an existing Ready gg-monitor pod (bootstrap-safe)", "B
     run_text = step.get("run", "")
     for fragment in required_fragments:
         results.append((f"{step_name}: contains {fragment!r} (full UID/name ownership chain, never a name-only match)", fragment in run_text))
+
+# "Bootstrap/repair path" is untouched by the preliminary Phase 7 correction (out of scope for this fix) and must still silently skip a candidate whose ReplicaSet JSON lacks a usable metadata.uid.
+bootstrap_run_text = (by_name.get("Bootstrap/repair path -- CONFIG gate via newly Ready pod, then finalize CloudWatch publication") or {}).get("run", "")
+results.append(("Bootstrap/repair path -- CONFIG gate via newly Ready pod, then finalize CloudWatch publication: contains \x27[ -z \"$rs_metadata_uid\" ] && continue\x27 (full UID/name ownership chain, never a name-only match; unchanged by the preliminary Phase 7 correction, which is scoped to the Detect step only)", "[ -z \"$rs_metadata_uid\" ] && continue" in bootstrap_run_text))
+
+# "Detect..." was corrected by the preliminary Phase 7 safety correction: a ReplicaSet get that succeeds (exit 0) but returns JSON with no usable metadata.uid is now FAIL-CLOSED (never silently downgraded to "this candidate is stale, keep looking") -- see the dedicated fail-closed Kubernetes inspection behavioral section for exhaustive proof.
+detect_run_text = (by_name.get("Detect an existing Ready gg-monitor pod (bootstrap-safe)") or {}).get("run", "")
+results.append(("Detect an existing Ready gg-monitor pod (bootstrap-safe): a successful ReplicaSet get with no usable metadata.uid fails the step closed (exit 1), rather than silently treating the candidate as stale via \x27continue\x27 (preliminary Phase 7 safety correction)", "[ -z \"$rs_metadata_uid\" ] && continue" not in detect_run_text and "malformed/unusable ReplicaSet state" in detect_run_text))
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
@@ -18227,6 +18235,214 @@ PYEOF
   fi
 else
   skip "Monitor ECR repository-existence fail-closed classification: dedicated behavioral assertions -- python3/PyYAML/${MONITOR_WORKFLOW} unavailable"
+fi
+
+echo "--- Preliminary Phase 7 safety correction: fail-closed Ready-monitor detection Kubernetes inspection in 50-sub-monitor.yaml ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$MONITOR_WORKFLOW" ]; then
+  MONITOR_READY_POD_CLASSIFICATION_CHECK="$(python3 - "$MONITOR_WORKFLOW" <<'PYEOF'
+import json
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+
+import yaml
+
+workflow_path = sys.argv[1]
+with open(workflow_path) as f:
+    doc = yaml.safe_load(f)
+
+results = []
+
+
+def check(label, ok):
+    results.append((label, ok))
+
+
+def find_step(job_name, step_name):
+    for step in doc["jobs"][job_name]["steps"]:
+        if step.get("name") == step_name:
+            return step["run"]
+    raise SystemExit(f"step not found: {job_name}/{step_name}")
+
+
+STEP = find_step("build_publish_and_deploy", "Detect an existing Ready gg-monitor pod (bootstrap-safe)")
+
+
+def _resp_block(behavior):
+    """behavior is None (unhandled invocation -> fail loudly), ("json", obj) (valid JSON success), ("raw", text) (exit-0 but non-JSON/malformed stdout), or ("fail", rc, stderr_text_or_None)."""
+    if behavior is None:
+        return 'echo "unhandled kubectl invocation in this scenario" >&2\nexit 1'
+    kind = behavior[0]
+    if kind == "json":
+        payload = json.dumps(behavior[1])
+        return f"cat <<'KUBECTL_JSON_EOF'\n{payload}\nKUBECTL_JSON_EOF\nexit 0"
+    if kind == "raw":
+        return f"cat <<'KUBECTL_RAW_EOF'\n{behavior[1]}\nKUBECTL_RAW_EOF\nexit 0"
+    if kind == "fail":
+        rc, err = behavior[1], behavior[2]
+        err_line = f"echo {json.dumps(err)} >&2\n" if err else ""
+        return f"{err_line}exit {rc}"
+    raise ValueError(behavior)
+
+
+def make_kubectl_shim(deploy_behavior, pods_behavior=None, rs_behaviors=None, default_rs_behavior=None):
+    """Fake `kubectl` CLI dispatching on `get deployment`/`get pods`/`get replicaset <name>`. Every AWS^H^HKubernetes error shape (NotFound, Forbidden, Unauthorized, timeout/unknown, malformed JSON) is reproduced as literal, inert TEXT on a real subprocess -- never executed, never treated as shell source."""
+    rs_behaviors = rs_behaviors or {}
+    lines = ["#!/usr/bin/env bash"]
+    lines.append('if [ "$1" = "get" ] && [ "$2" = "deployment" ]; then')
+    lines.append(_resp_block(deploy_behavior))
+    lines.append("fi")
+    lines.append('if [ "$1" = "get" ] && [ "$2" = "pods" ]; then')
+    lines.append(_resp_block(pods_behavior))
+    lines.append("fi")
+    lines.append('if [ "$1" = "get" ] && [ "$2" = "replicaset" ]; then')
+    lines.append('RS_NAME="$3"')
+    lines.append('case "$RS_NAME" in')
+    for name, behavior in rs_behaviors.items():
+        lines.append(f"{name})")
+        lines.append(_resp_block(behavior))
+        lines.append(";;")
+    lines.append("*)")
+    lines.append(_resp_block(default_rs_behavior))
+    lines.append(";;")
+    lines.append("esac")
+    lines.append("fi")
+    lines.append('echo "unhandled kubectl invocation: $*" >&2')
+    lines.append("exit 1")
+    return "\n".join(lines) + "\n"
+
+
+def run_step(step_run_text, shim_script, extra_env):
+    """Executes the REAL extracted workflow step `run:` text (never a reimplemented copy) with a fake `kubectl` prepended to PATH and a scratch GITHUB_ENV file, proving the actual committed bash, not a parallel Python re-derivation of what it is supposed to do."""
+    with tempfile.TemporaryDirectory() as tmp:
+        kubectl_path = os.path.join(tmp, "kubectl")
+        with open(kubectl_path, "w") as f:
+            f.write(shim_script)
+        os.chmod(kubectl_path, stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)
+        github_env_path = os.path.join(tmp, "github_env.txt")
+        open(github_env_path, "w").close()
+        env = dict(os.environ)
+        env["PATH"] = tmp + ":" + env.get("PATH", "")
+        env["GITHUB_ENV"] = github_env_path
+        env.update(extra_env)
+        proc = subprocess.run(["bash", "-c", step_run_text], env=env, capture_output=True, text=True, timeout=20)
+        with open(github_env_path) as f:
+            github_env_content = f.read()
+        return proc, github_env_content
+
+
+ENV = {"TARGET_NAMESPACE": "goldengate-monitoring"}
+
+GOOD_DEPLOY = {"metadata": {"uid": "deploy-uid-1"}, "spec": {"selector": {"matchLabels": {"app": "gg-monitor"}}}}
+EMPTY_PODS = {"items": []}
+GOOD_RS = {
+    "metadata": {
+        "uid": "rs-uid-1",
+        "ownerReferences": [{"controller": True, "kind": "Deployment", "name": "gg-monitor", "uid": "deploy-uid-1"}],
+    }
+}
+RS_WRONG_DEPLOY_UID = {
+    "metadata": {
+        "uid": "rs-uid-1",
+        "ownerReferences": [{"controller": True, "kind": "Deployment", "name": "gg-monitor", "uid": "deploy-uid-DIFFERENT"}],
+    }
+}
+
+
+def pod_fixture(name, *, running=True, ready=True, sa="gg-monitor", terminating=False, rs_name="gg-monitor-rs1", rs_uid="rs-uid-1", owner_ref=True):
+    metadata = {"name": name}
+    if terminating:
+        metadata["deletionTimestamp"] = "2026-01-01T00:00:00Z"
+    if owner_ref:
+        metadata["ownerReferences"] = [{"controller": True, "kind": "ReplicaSet", "name": rs_name, "uid": rs_uid}]
+    status = {"phase": "Running" if running else "Pending", "conditions": [{"type": "Ready", "status": "True" if ready else "False"}]}
+    spec = {"serviceAccountName": sa}
+    return {"metadata": metadata, "status": status, "spec": spec}
+
+
+def pods_list(*pods):
+    return {"items": list(pods)}
+
+
+NOT_FOUND_DEPLOY = ("fail", 1, 'Error from server (NotFound): deployments.apps "gg-monitor" not found')
+FORBIDDEN_DEPLOY = ("fail", 1, 'Error from server (Forbidden): deployments.apps "gg-monitor" is forbidden: User "system:serviceaccount:x:y" cannot get resource "deployments" in API group "apps"')
+UNAUTHORIZED_DEPLOY = ("fail", 1, "error: You must be logged in to the server (Unauthorized)")
+TIMEOUT_DEPLOY = ("fail", 1, "Unable to connect to the server: dial tcp 10.0.0.1:443: i/o timeout")
+MALFORMED_DEPLOY = ("raw", "not valid json{{{")
+
+# 1: genuine Deployment NotFound -> bootstrap allowed.
+proc, genv = run_step(STEP, make_kubectl_shim(NOT_FOUND_DEPLOY), ENV)
+check("Deployment genuine (NotFound) -> exit 0, BOOTSTRAP/REPAIR selected, empty EXISTING_READY_MONITOR_POD_NAME", proc.returncode == 0 and "BOOTSTRAP/REPAIR PATH" in proc.stdout and genv.strip().endswith("EXISTING_READY_MONITOR_POD_NAME="))
+
+# 2: confirmed reproduction -- Deployment Forbidden must NEVER be treated as absence.
+proc, genv = run_step(STEP, make_kubectl_shim(FORBIDDEN_DEPLOY), ENV)
+check("confirmed reproduction -- Deployment Forbidden fails closed, non-zero exit, no bootstrap value ever written (previously exited 0 with BOOTSTRAP/REPAIR selected)", proc.returncode != 0 and "EXISTING_READY_MONITOR_POD_NAME" not in genv)
+
+# 3: Deployment Unauthorized / generic authentication failure must fail closed.
+proc, genv = run_step(STEP, make_kubectl_shim(UNAUTHORIZED_DEPLOY), ENV)
+check("Deployment Unauthorized fails closed, non-zero exit, no bootstrap value written", proc.returncode != 0 and "EXISTING_READY_MONITOR_POD_NAME" not in genv)
+
+# 4: Deployment API/network/timeout/unknown failure must fail closed.
+proc, genv = run_step(STEP, make_kubectl_shim(TIMEOUT_DEPLOY), ENV)
+check("Deployment API/network/timeout failure fails closed, non-zero exit, no bootstrap value written", proc.returncode != 0 and "EXISTING_READY_MONITOR_POD_NAME" not in genv)
+
+# 5: Deployment get succeeds (exit 0) but stdout is malformed/unparseable JSON -> fail closed.
+proc, genv = run_step(STEP, make_kubectl_shim(MALFORMED_DEPLOY), ENV)
+check("Deployment successful but malformed JSON fails closed, non-zero exit, no bootstrap value written", proc.returncode != 0 and "EXISTING_READY_MONITOR_POD_NAME" not in genv)
+
+# 6: valid Deployment, but the pod list call itself fails (e.g. Forbidden) -> fail closed, never bootstrap.
+proc, genv = run_step(STEP, make_kubectl_shim(("json", GOOD_DEPLOY), pods_behavior=("fail", 1, 'Error from server (Forbidden): pods is forbidden')), ENV)
+check("valid Deployment + pod-list Forbidden fails closed, non-zero exit, never selects bootstrap", proc.returncode != 0 and "EXISTING_READY_MONITOR_POD_NAME" not in genv)
+
+# 7: valid Deployment, successful EMPTY pod list -> legitimate bootstrap.
+proc, genv = run_step(STEP, make_kubectl_shim(("json", GOOD_DEPLOY), pods_behavior=("json", EMPTY_PODS)), ENV)
+check("valid Deployment + successful empty pod list -> exit 0, BOOTSTRAP/REPAIR legitimately selected", proc.returncode == 0 and "BOOTSTRAP/REPAIR PATH" in proc.stdout and genv.strip().endswith("EXISTING_READY_MONITOR_POD_NAME="))
+
+# 8: valid Deployment, pod list contains only terminating/unready pods -> legitimate bootstrap.
+unready_pods = pods_list(pod_fixture("gg-monitor-notready", running=False), pod_fixture("gg-monitor-terminating", terminating=True))
+proc, genv = run_step(STEP, make_kubectl_shim(("json", GOOD_DEPLOY), pods_behavior=("json", unready_pods)), ENV)
+check("valid Deployment + only terminating/unready pods -> exit 0, BOOTSTRAP/REPAIR legitimately selected", proc.returncode == 0 and "BOOTSTRAP/REPAIR PATH" in proc.stdout and genv.strip().endswith("EXISTING_READY_MONITOR_POD_NAME="))
+
+# 9: a Ready, correctly-owned-looking candidate exists, but inspecting its ReplicaSet is Forbidden -> FAIL THE ENTIRE STEP, never silently `continue` past it.
+ready_pods = pods_list(pod_fixture("gg-monitor-good"))
+proc, genv = run_step(STEP, make_kubectl_shim(("json", GOOD_DEPLOY), pods_behavior=("json", ready_pods), rs_behaviors={"gg-monitor-rs1": ("fail", 1, 'Error from server (Forbidden): replicasets.apps "gg-monitor-rs1" is forbidden')}), ENV)
+check("Ready candidate + ReplicaSet Forbidden fails the ENTIRE step closed (not silently skipped), non-zero exit, no bootstrap value written", proc.returncode != 0 and "EXISTING_READY_MONITOR_POD_NAME" not in genv)
+
+# 10: a Ready candidate's ReplicaSet genuinely no longer exists (NotFound) -> that candidate is stale, evaluation continues; with no other candidate, a clean bootstrap decision follows.
+proc, genv = run_step(STEP, make_kubectl_shim(("json", GOOD_DEPLOY), pods_behavior=("json", ready_pods), rs_behaviors={"gg-monitor-rs1": ("fail", 1, 'Error from server (NotFound): replicasets.apps "gg-monitor-rs1" not found')}), ENV)
+check("Ready candidate + ReplicaSet genuine (NotFound) treats candidate as stale and still reaches a clean BOOTSTRAP/REPAIR decision (exit 0)", proc.returncode == 0 and "BOOTSTRAP/REPAIR PATH" in proc.stdout and genv.strip().endswith("EXISTING_READY_MONITOR_POD_NAME="))
+
+# 11: a fully valid, fully-owned Ready pod -> FAST PATH selects it by name.
+proc, genv = run_step(STEP, make_kubectl_shim(("json", GOOD_DEPLOY), pods_behavior=("json", ready_pods), rs_behaviors={"gg-monitor-rs1": ("json", GOOD_RS)}), ENV)
+check("fully valid, fully-owned Ready pod -> exit 0, FAST PATH selected, EXISTING_READY_MONITOR_POD_NAME=gg-monitor-good", proc.returncode == 0 and "FAST PATH" in proc.stdout and "EXISTING_READY_MONITOR_POD_NAME=gg-monitor-good" in genv)
+
+# 12: the ReplicaSet get succeeds (exit 0) but returns malformed/non-JSON stdout -> fail closed.
+proc, genv = run_step(STEP, make_kubectl_shim(("json", GOOD_DEPLOY), pods_behavior=("json", ready_pods), rs_behaviors={"gg-monitor-rs1": ("raw", "not valid json{{{")}), ENV)
+check("ReplicaSet successful but malformed JSON fails closed, non-zero exit, no bootstrap value written", proc.returncode != 0 and "EXISTING_READY_MONITOR_POD_NAME" not in genv)
+
+# 13: the ReplicaSet's own Deployment-owner uid does not match the current Deployment's uid -> candidate rejected, never accepted as FAST PATH (and never a hard failure -- it is a legitimate rejection, not an inspection error).
+proc, genv = run_step(STEP, make_kubectl_shim(("json", GOOD_DEPLOY), pods_behavior=("json", ready_pods), rs_behaviors={"gg-monitor-rs1": ("json", RS_WRONG_DEPLOY_UID)}), ENV)
+check("ReplicaSet Deployment-owner uid mismatch -> candidate rejected, never FAST PATH, clean BOOTSTRAP/REPAIR decision (exit 0)", proc.returncode == 0 and "FAST PATH" not in proc.stdout and "BOOTSTRAP/REPAIR PATH" in proc.stdout and genv.strip().endswith("EXISTING_READY_MONITOR_POD_NAME="))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  echo "$MONITOR_READY_POD_CLASSIFICATION_CHECK"
+  if [ -z "$(echo "$MONITOR_READY_POD_CLASSIFICATION_CHECK" | grep '^FAIL ' || true)" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        OK\ *) pass "Monitor Ready-pod detection fail-closed Kubernetes inspection: ${line#OK }" ;;
+      esac
+    done <<< "$MONITOR_READY_POD_CLASSIFICATION_CHECK"
+  else
+    fail "Monitor Ready-pod detection fail-closed Kubernetes inspection: dedicated behavioral assertions failed:"$'\n'"${MONITOR_READY_POD_CLASSIFICATION_CHECK}"
+  fi
+else
+  skip "Monitor Ready-pod detection fail-closed Kubernetes inspection: dedicated behavioral assertions -- python3/PyYAML/${MONITOR_WORKFLOW} unavailable"
 fi
 
 echo "--- Final repository handoff hygiene sweep (VDR pre-transfer cleanliness) ---"

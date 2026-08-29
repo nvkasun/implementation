@@ -1353,54 +1353,108 @@ jobs:
           echo "enable_cloudwatch_publication=true requested -- checking whether a suitable Ready gg-monitor pod already exists before choosing the safe rollout path. This never fails merely because no monitor exists yet or the existing one is unhealthy: that case takes the BOOTSTRAP/REPAIR path below instead of a hard failure."
 
           # Deployment/ReplicaSet ownership-chain pod selection (never a blind ".items[0]" or a bare label selector): pod must be Running, Ready, use serviceAccountName=gg-monitor, and be owned by a ReplicaSet owned by the current gg-monitor Deployment.
+          #
+          # Fail-closed Kubernetes inspection classification: "could not determine" must never be conflated with "confirmed absent/not ready". Only an explicit kubectl (NotFound) on a `get <resource> <name>` call is treated as genuine absence (same convention as automation/orchestration/k8s_common.py); every other kubectl failure (Forbidden, Unauthorized, API/network/timeout, or any other unclassified error) fails this step closed immediately, before EXISTING_READY_MONITOR_POD_NAME is ever written -- so the next step can never mistake "inspection failed" for "safe to bootstrap". Stderr is captured to inert text files for classification only, never suppressed with 2>/dev/null, never treated as shell source.
           POD_NAME=""
-          DEPLOY_JSON="$(kubectl get deployment gg-monitor -n "$TARGET_NAMESPACE" -o json 2>/dev/null || true)"
-          if [ -n "$DEPLOY_JSON" ]; then
-            DEPLOY_UID="$(jq -r '.metadata.uid' <<<"$DEPLOY_JSON")"
-            SELECTOR="$(jq -r '(.spec.selector.matchLabels // {}) | to_entries | map("\(.key)=\(.value)") | join(",")' <<<"$DEPLOY_JSON")"
+          DEPLOYMENT_EXISTS="false"
 
-            if [ -n "$SELECTOR" ] && [ "$SELECTOR" != "null" ]; then
-              PODS_JSON="$(kubectl get pods -n "$TARGET_NAMESPACE" -l "$SELECTOR" -o json 2>/dev/null || true)"
+          set +e
+          DEPLOY_JSON="$(kubectl get deployment gg-monitor -n "$TARGET_NAMESPACE" -o json 2>/tmp/gg-monitor-deploy-error.txt)"
+          DEPLOY_RC=$?
+          set -e
 
-              if [ -n "$PODS_JSON" ]; then
-                while IFS= read -r candidate; do
-                  [ -z "$candidate" ] && continue
-                  pod_json="$(jq -c --arg n "$candidate" '.items[] | select(.metadata.name==$n)' <<<"$PODS_JSON")"
+          if [ "$DEPLOY_RC" -eq 0 ]; then
+            DEPLOYMENT_EXISTS="true"
+          elif grep -q "(NotFound)" /tmp/gg-monitor-deploy-error.txt; then
+            DEPLOYMENT_EXISTS="false"
+          else
+            echo "FAIL: could not determine whether Deployment gg-monitor exists in namespace ${TARGET_NAMESPACE} -- kubectl get deployment failed without a confirmed (NotFound). Bootstrap selection is refused because state could not be determined. Diagnostic (kubectl stderr):"
+            cat /tmp/gg-monitor-deploy-error.txt
+            exit 1
+          fi
 
-                  deletion_ts="$(jq -r '.metadata.deletionTimestamp // empty' <<<"$pod_json")"
-                  [ -n "$deletion_ts" ] && continue
-
-                  phase="$(jq -r '.status.phase // ""' <<<"$pod_json")"
-                  [ "$phase" != "Running" ] && continue
-
-                  ready_status="$(jq -r '([.status.conditions[]? | select(.type=="Ready")] | first | .status) // "Unknown"' <<<"$pod_json")"
-                  [ "$ready_status" != "True" ] && continue
-
-                  pod_sa="$(jq -r '.spec.serviceAccountName // ""' <<<"$pod_json")"
-                  [ "$pod_sa" != "gg-monitor" ] && continue
-
-                  rs_owner_name="$(jq -r '[.metadata.ownerReferences[]? | select(.controller==true and .kind=="ReplicaSet")][0].name // empty' <<<"$pod_json")"
-                  rs_owner_uid="$(jq -r '[.metadata.ownerReferences[]? | select(.controller==true and .kind=="ReplicaSet")][0].uid // empty' <<<"$pod_json")"
-                  [ -z "$rs_owner_name" ] && continue
-                  [ -z "$rs_owner_uid" ] && continue
-                  rs_json="$(kubectl get replicaset "$rs_owner_name" -n "$TARGET_NAMESPACE" -o json 2>/dev/null || true)"
-                  [ -z "$rs_json" ] && continue
-                  # The pod's OWN claimed ReplicaSet uid must match the ACTUAL fetched ReplicaSet's uid -- a name match alone does not prove the pod is owned by the CURRENT ReplicaSet object (a stale/recreated ReplicaSet can share a name with a different uid).
-                  rs_metadata_uid="$(jq -r '.metadata.uid // empty' <<<"$rs_json")"
-                  [ -z "$rs_metadata_uid" ] && continue
-                  [ "$rs_owner_uid" != "$rs_metadata_uid" ] && continue
-                  rs_deploy_name="$(jq -r '[.metadata.ownerReferences[]? | select(.controller==true and .kind=="Deployment")][0].name // empty' <<<"$rs_json")"
-                  rs_deploy_uid="$(jq -r '[.metadata.ownerReferences[]? | select(.controller==true and .kind=="Deployment")][0].uid // empty' <<<"$rs_json")"
-                  [ -z "$rs_deploy_name" ] && continue
-                  [ -z "$rs_deploy_uid" ] && continue
-                  [ "$rs_deploy_name" != "gg-monitor" ] && continue
-                  [ "$rs_deploy_uid" != "$DEPLOY_UID" ] && continue
-
-                  POD_NAME="$candidate"
-                  break
-                done < <(jq -r '.items[].metadata.name' <<<"$PODS_JSON")
-              fi
+          if [ "$DEPLOYMENT_EXISTS" = "true" ]; then
+            DEPLOY_UID="$(jq -r '.metadata.uid // empty' <<<"$DEPLOY_JSON" 2>/dev/null || true)"
+            if [ -z "$DEPLOY_UID" ]; then
+              echo "FAIL: kubectl get deployment gg-monitor in namespace ${TARGET_NAMESPACE} succeeded but returned JSON without a usable metadata.uid (malformed/unusable Deployment state). Bootstrap selection is refused because state could not be determined."
+              exit 1
             fi
+
+            SELECTOR="$(jq -r '(.spec.selector.matchLabels // {}) | to_entries | map("\(.key)=\(.value)") | join(",")' <<<"$DEPLOY_JSON" 2>/dev/null || true)"
+            if [ -z "$SELECTOR" ] || [ "$SELECTOR" = "null" ]; then
+              echo "FAIL: kubectl get deployment gg-monitor in namespace ${TARGET_NAMESPACE} succeeded but its selector could not be resolved to a valid, non-empty label selector (malformed/unusable Deployment state). Bootstrap selection is refused because state could not be determined."
+              exit 1
+            fi
+
+            set +e
+            PODS_JSON="$(kubectl get pods -n "$TARGET_NAMESPACE" -l "$SELECTOR" -o json 2>/tmp/gg-monitor-pods-error.txt)"
+            PODS_RC=$?
+            set -e
+
+            if [ "$PODS_RC" -ne 0 ]; then
+              echo "FAIL: could not list gg-monitor pods in namespace ${TARGET_NAMESPACE} (selector ${SELECTOR}) -- kubectl get pods failed. Bootstrap selection is refused because state could not be determined. Diagnostic (kubectl stderr):"
+              cat /tmp/gg-monitor-pods-error.txt
+              exit 1
+            fi
+
+            if ! jq -e '(.items | type) == "array"' >/dev/null 2>&1 <<<"$PODS_JSON"; then
+              echo "FAIL: kubectl get pods for gg-monitor in namespace ${TARGET_NAMESPACE} succeeded but returned malformed/unusable JSON (no usable .items array). Bootstrap selection is refused because state could not be determined."
+              exit 1
+            fi
+
+            while IFS= read -r candidate; do
+              [ -z "$candidate" ] && continue
+              pod_json="$(jq -c --arg n "$candidate" '.items[] | select(.metadata.name==$n)' <<<"$PODS_JSON")"
+
+              deletion_ts="$(jq -r '.metadata.deletionTimestamp // empty' <<<"$pod_json")"
+              [ -n "$deletion_ts" ] && continue
+
+              phase="$(jq -r '.status.phase // ""' <<<"$pod_json")"
+              [ "$phase" != "Running" ] && continue
+
+              ready_status="$(jq -r '([.status.conditions[]? | select(.type=="Ready")] | first | .status) // "Unknown"' <<<"$pod_json")"
+              [ "$ready_status" != "True" ] && continue
+
+              pod_sa="$(jq -r '.spec.serviceAccountName // ""' <<<"$pod_json")"
+              [ "$pod_sa" != "gg-monitor" ] && continue
+
+              rs_owner_name="$(jq -r '[.metadata.ownerReferences[]? | select(.controller==true and .kind=="ReplicaSet")][0].name // empty' <<<"$pod_json")"
+              rs_owner_uid="$(jq -r '[.metadata.ownerReferences[]? | select(.controller==true and .kind=="ReplicaSet")][0].uid // empty' <<<"$pod_json")"
+              [ -z "$rs_owner_name" ] && continue
+              [ -z "$rs_owner_uid" ] && continue
+
+              set +e
+              rs_json="$(kubectl get replicaset "$rs_owner_name" -n "$TARGET_NAMESPACE" -o json 2>/tmp/gg-monitor-rs-error.txt)"
+              RS_RC=$?
+              set -e
+
+              if [ "$RS_RC" -ne 0 ]; then
+                if grep -q "(NotFound)" /tmp/gg-monitor-rs-error.txt; then
+                  # Genuinely stale candidate: the pod's claimed ReplicaSet owner no longer exists. Only a confirmed (NotFound) may downgrade this candidate to "stale" -- any other failure must fail the whole step closed, never merely `continue`.
+                  continue
+                fi
+                echo "FAIL: could not inspect ReplicaSet ${rs_owner_name} in namespace ${TARGET_NAMESPACE} (owner of candidate pod ${candidate}) -- kubectl get replicaset failed without a confirmed (NotFound). Bootstrap selection is refused because state could not be determined. Diagnostic (kubectl stderr):"
+                cat /tmp/gg-monitor-rs-error.txt
+                exit 1
+              fi
+
+              # The pod's OWN claimed ReplicaSet uid must match the ACTUAL fetched ReplicaSet's uid -- a name match alone does not prove the pod is owned by the CURRENT ReplicaSet object (a stale/recreated ReplicaSet can share a name with a different uid).
+              rs_metadata_uid="$(jq -r '.metadata.uid // empty' <<<"$rs_json" 2>/dev/null || true)"
+              if [ -z "$rs_metadata_uid" ]; then
+                echo "FAIL: kubectl get replicaset ${rs_owner_name} in namespace ${TARGET_NAMESPACE} succeeded but returned JSON without a usable metadata.uid (malformed/unusable ReplicaSet state). Bootstrap selection is refused because state could not be determined."
+                exit 1
+              fi
+              [ "$rs_owner_uid" != "$rs_metadata_uid" ] && continue
+              rs_deploy_name="$(jq -r '[.metadata.ownerReferences[]? | select(.controller==true and .kind=="Deployment")][0].name // empty' <<<"$rs_json")"
+              rs_deploy_uid="$(jq -r '[.metadata.ownerReferences[]? | select(.controller==true and .kind=="Deployment")][0].uid // empty' <<<"$rs_json")"
+              [ -z "$rs_deploy_name" ] && continue
+              [ -z "$rs_deploy_uid" ] && continue
+              [ "$rs_deploy_name" != "gg-monitor" ] && continue
+              [ "$rs_deploy_uid" != "$DEPLOY_UID" ] && continue
+
+              POD_NAME="$candidate"
+              break
+            done < <(jq -r '.items[].metadata.name' <<<"$PODS_JSON")
           fi
 
           if [ -n "$POD_NAME" ]; then

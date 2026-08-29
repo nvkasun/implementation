@@ -933,14 +933,15 @@ exit 1
         self.assertIn("BOOTSTRAP/REPAIR PATH: no suitable existing Ready gg-monitor pod found", proc.stdout)
 
     def test_replicaset_metadata_uid_missing_is_rejected(self):
+        # Preliminary Phase 7 safety correction: for the Detect step specifically, a ReplicaSet get that succeeds (exit 0) but returns JSON with no usable metadata.uid is now FAIL-CLOSED -- never silently downgraded to "this candidate is stale, keep looking" the way a genuine kubectl (NotFound) is; a malformed/unusable successful response must never be reinterpreted as absence.
         self._write_fixtures(
             pods=[self._pod("gg-monitor-abc")],
             rs_owner_uid_by_name={"gg-monitor-rs-current": self.DEPLOY_UID},
             rs_metadata_uid_by_name={"gg-monitor-rs-current": None},
         )
         proc = self._run_fragment()
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("BOOTSTRAP/REPAIR PATH: no suitable existing Ready gg-monitor pod found", proc.stdout)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("malformed/unusable ReplicaSet state", proc.stdout + proc.stderr)
 
     def test_replicaset_deployment_owner_name_wrong_is_rejected(self):
         self._write_fixtures(

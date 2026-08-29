@@ -3441,7 +3441,9 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
             self.monitor_text.index("- name: Detect an existing Ready gg-monitor pod (bootstrap-safe)"):
             self.monitor_text.index("- name: Fast-path CloudWatch publication preflight")]
         self.assertNotIn("PREREQUISITE NOT MET", detect_step_text)
-        self.assertNotIn("exit 1", detect_step_text)
+        # Preliminary Phase 7 safety correction: the step now fails closed (exit 1) on a genuine Kubernetes inspection failure (Forbidden/Unauthorized/API/timeout/malformed JSON), so "no exit 1 at all" is no longer the right assertion -- it would make a fail-open regression (treating an inconclusive describe as "no monitor exists") pass silently. What must still hold is that the OLD unconditional first-deployment prerequisite failure is gone (already asserted above) and that every exit 1 in this step occurs only inside a "state could not be determined" diagnostic.
+        self.assertIn("exit 1", detect_step_text)
+        self.assertIn("Bootstrap selection is refused because state could not be determined", detect_step_text)
 
         bootstrap_step_text = self.monitor_text[
             self.monitor_text.index("- name: Bootstrap/repair path"):
