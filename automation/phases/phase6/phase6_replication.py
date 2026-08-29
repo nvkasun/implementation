@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -27,6 +28,9 @@ FORBIDDEN_SECRET_VALUE_KEYS = frozenset({
     "password", "aws_secret_access_key", "aws_session_token", "secret_access_key",
     "session_token", "client_secret", "private_key", "databasecredentialpassword",
 })
+
+# Defense-in-depth execution_id shape -- bounded, DNS/label-friendly characters only; rejects "/", "\\", "..", and any embedded CR/LF/NUL by construction (none of those characters are in the accepted character class). This never decides a local filesystem destination (actual/expected renders always use their own private tempfile.TemporaryDirectory(), never an execution_id-derived path component) -- it only prevents a malformed execution_id from ever reaching the trusted engine's own render-job/resource-name derivation. "dry-run" (Validate's own deterministic token) matches this pattern too.
+_EXECUTION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 
 
 class Phase6Error(Exception):
@@ -112,9 +116,11 @@ def _discover_pipelines(environment):
     return [line.strip() for line in pipelines_proc.stdout.splitlines() if line.strip()]
 
 
-def _pipeline_output_dir(pipeline_id, execution_id):
-    """ONE canonical local render-output-directory derivation, relative to REPO_ROOT, keyed by both pipeline_id and execution_id -- a live reconcile (<run-id>-<run-attempt>) and a local dry-run validation ("dry-run") never share or collide over the same on-disk directory, even within the same working tree."""
-    return REPO_ROOT / "work" / "replication" / pipeline_id / execution_id
+def _require_safe_execution_id(execution_id):
+    """Defense-in-depth validation for a CLI-supplied execution_id BEFORE it is ever used as replication-engine input -- rejects '/', '\\\\', '..', and any embedded CR/LF/NUL by construction (none of those characters are in the accepted character class), bounded to 128 characters. This is defense in depth ONLY: it never decides a local filesystem destination -- both the actual and expected renders always use their own private tempfile.TemporaryDirectory(), never an execution_id-derived path component -- and it never re-implements or bypasses the engine's own job_resource_name()/sanitize_execution_id() algorithm."""
+    if not isinstance(execution_id, str) or not _EXECUTION_ID_RE.match(execution_id):
+        raise Phase6Error(f"execution_id {execution_id!r} is not a safe identifier (expected pattern {_EXECUTION_ID_RE.pattern!r}) -- refusing to use it.")
+    return execution_id
 
 
 def _render_pipeline(environment, pipeline_id, execution_id, region, namespace, output_dir):
@@ -124,7 +130,7 @@ def _render_pipeline(environment, pipeline_id, execution_id, region, namespace, 
          "--execution-id", execution_id, "--output-dir", str(output_dir), pipeline_id])
 
 
-# Rendered-manifest structural validation -- the SAME helper used by both Deploy (before kubectl apply) and Validate (read-only, no cluster access).
+# Rendered-manifest structural validation -- the SAME helper used by both Deploy (before any kubectl create) and Validate (read-only, no cluster access).
 
 def _load_manifest_strict(path):
     """Loads exactly one YAML mapping document from path via a duplicate-key-rejecting loader -- a rendered manifest containing zero, two, or more documents (an adversarial/malformed render) fails closed here, before any structural field is ever inspected. A missing/unreadable file (e.g. an engine render that silently omitted one of the three expected manifests) fails closed as Phase6Error too, never an uncaught OSError."""
@@ -245,7 +251,7 @@ def _render_expected_manifests_for_validation(environment, pipeline_id, executio
 
 
 def _validate_rendered_manifests(output_dir, environment, pipeline_id, execution_id, expected_namespace, expected_region):
-    """Structurally validates the three rendered replication reconciliation manifests BEFORE any kubectl apply (Deploy) or as the sole check (Validate). Beyond kind/namespace/shared-name structure, this is STRONGLY bound to the canonical current replication plan (automation/goldengate-deployment-model.py replication-plan) and the canonical current reconciler source (automation/goldengate-replication.py) -- never inferring trust solely from the rendered files themselves: ConfigMap.data key set is exactly {goldengate-replication.py, plan.json} with plan.json exactly equal to the canonical plan and goldengate-replication.py exactly equal to the current trusted engine source; the SecretProviderClass forbids spec.secretObjects entirely (file-mount-only, never synced into a Kubernetes Secret) and its object/alias list must exactly equal the canonical-plan-derived expectation; the Job forbids env/envFrom entirely and requires the exact fixed worker command, one reconciler container, canonical image/ServiceAccount, and the exact two read-only volumeMounts/volumes. FINAL authoritative proof: environment/pipeline_id/execution_id/expected_namespace/expected_region are used to independently re-render EXPECTED manifests through the SAME current trusted engine CLI (_render_expected_manifests_for_validation()), and each ACTUAL parsed manifest must be exactly dict-equal to its EXPECTED counterpart -- this covers every engine-owned field (execution resource name, plan-checksum annotation, ttlSecondsAfterFinished, labels, and any future field) without Phase 6 ever manually reconstructing job_resource_name()/plan_checksum()'s algorithm. The generic _assert_no_secret_values() scan and the explicit checks above remain defense in depth with clear security-specific error messages; the expected-manifest equality is the FINAL guarantee that no engine-owned field has drifted. Returns the shared execution resource name -- by the time this returns, it has already been proven identical to the current trusted engine's own expected name for this exact pipeline/plan/execution_id. Never re-implements the engine's own render functions -- reads only the files render-job already wrote to output_dir (actual) or to its own fresh temporary directory (expected)."""
+    """Structurally validates the three rendered replication reconciliation manifests BEFORE any Kubernetes mutation (Deploy) or as the sole check (Validate). Beyond kind/namespace/shared-name structure, this is STRONGLY bound to the canonical current replication plan (automation/goldengate-deployment-model.py replication-plan) and the canonical current reconciler source (automation/goldengate-replication.py) -- never inferring trust solely from the rendered files themselves: ConfigMap.data key set is exactly {goldengate-replication.py, plan.json} with plan.json exactly equal to the canonical plan and goldengate-replication.py exactly equal to the current trusted engine source; the SecretProviderClass forbids spec.secretObjects entirely (file-mount-only, never synced into a Kubernetes Secret) and its object/alias list must exactly equal the canonical-plan-derived expectation; the Job forbids env/envFrom entirely and requires the exact fixed worker command, one reconciler container, canonical image/ServiceAccount, and the exact two read-only volumeMounts/volumes. FINAL authoritative proof: environment/pipeline_id/execution_id/expected_namespace/expected_region are used to independently re-render EXPECTED manifests through the SAME current trusted engine CLI (_render_expected_manifests_for_validation()), and each ACTUAL parsed manifest must be exactly dict-equal to its EXPECTED counterpart -- this covers every engine-owned field (execution resource name, plan-checksum annotation, ttlSecondsAfterFinished, labels, and any future field) without Phase 6 ever manually reconstructing job_resource_name()/plan_checksum()'s algorithm. The generic _assert_no_secret_values() scan and the explicit checks above remain defense in depth with clear security-specific error messages; the expected-manifest equality is the FINAL guarantee that no engine-owned field has drifted. Returns {"execution_name": ..., "manifests": {"SecretProviderClass": ..., "ConfigMap": ..., "Job": ...}} -- the MANIFESTS VALUE IS THE FRESH EXPECTED MAPPING, never the actual parsed-from-disk one, so a post-validation on-disk mutation of the actual output_dir files (a TOCTOU attack) can never reach a later Kubernetes mutation step: by the time this returns, actual == expected has already been proven, so the expected in-memory mapping becomes the sole trusted mutation payload the caller may use -- callers must never re-open secretproviderclass.yaml/configmap.yaml/job.yaml for mutation after this returns. Never re-implements the engine's own render functions -- reads only the files render-job already wrote to output_dir (actual) or to its own fresh temporary directory (expected)."""
     canonical_plan = _load_canonical_replication_plan(environment, pipeline_id)
 
     spc_path = os.path.join(output_dir, "secretproviderclass.yaml")
@@ -396,11 +402,18 @@ def _validate_rendered_manifests(output_dir, environment, pipeline_id, execution
     if job != expected["Job"]:
         raise Phase6Error(f"{job_path}: rendered Job is not semantically identical to a fresh render from the current trusted engine for environment={environment!r} pipeline_id={pipeline_id!r} execution_id={execution_id!r} -- refusing to trust a drifted manifest.")
 
-    # execution_name has now been proven identical to the current trusted engine's own expected name (metadata.name is part of the exact Job/ConfigMap/SecretProviderClass equality just enforced above) -- never independently re-derived here.
-    return execution_name
+    # execution_name has now been proven identical to the current trusted engine's own expected name (metadata.name is part of the exact Job/ConfigMap/SecretProviderClass equality just enforced above) -- never independently re-derived here. The returned "manifests" are the FRESH expected mappings (never the actual, disk-derived ones) -- the sole trusted in-memory mutation payload; a post-validation on-disk mutation of the actual output_dir files can never reach this return value.
+    return {
+        "execution_name": execution_name,
+        "manifests": {
+            "SecretProviderClass": expected["SecretProviderClass"],
+            "ConfigMap": expected["ConfigMap"],
+            "Job": expected["Job"],
+        },
+    }
 
 
-# Deploy-mode (live cluster) reconciliation -- collision preflight, apply order, wait contract, success cleanup / failure evidence retention.
+# Deploy-mode (live cluster) reconciliation -- collision preflight, atomic create order, wait contract, success cleanup / failure evidence retention.
 
 def _require_execution_resource_absent(resource, display_kind, execution_name, namespace):
     """Authoritative existence check for ONE execution-scoped resource: `kubectl get <resource> <execution_name> -n <namespace> --ignore-not-found -o name`, run with check=True -- --ignore-not-found guarantees a genuinely-absent resource always yields exit 0 with EMPTY stdout, so the kubectl command itself failing for ANY reason (Forbidden, Unauthorized, timeout, network/cluster-unreachable, TLS failure, or any other error) is never interpreted as absence -- it fails closed via run()'s own check=True, exactly like a real collision. Only a successful command with empty stdout proves absence; a successful command with non-empty stdout is a genuine pre-existing collision. Prints only the resource kind/name -- never the kubectl get output (no -o yaml, no resource dump)."""
@@ -415,9 +428,11 @@ def _collision_preflight(execution_name, namespace):
         _require_execution_resource_absent(resource, display_kind, execution_name, namespace)
 
 
-def _apply_manifest(kind_label, path):
-    run(["kubectl", "apply", "-f", str(path)])
-    print(f"Applied {kind_label}: {path}")
+def _create_validated_manifest(kind_label, manifest):
+    """Atomically creates ONE validated, in-memory manifest mapping via `kubectl create -f -` (stdin) -- never `kubectl apply`, never a re-opened on-disk file, never shell=True, never an intermediate file. create-only semantics are the FINAL atomic ownership guarantee for these unique/execution-scoped/ephemeral resources: if the resource was created by another actor between _collision_preflight()'s read and this call, `kubectl create` itself fails (AlreadyExists) and run()'s own check=True raises Phase6Error -- this NEVER silently updates/adopts the existing object, NEVER falls back to apply, NEVER patches it. This closes the collision-preflight-to-mutation race: preflight remains for early, clear diagnostics, but create is the authoritative guarantee."""
+    payload = yaml.safe_dump(manifest, sort_keys=False, default_flow_style=False)
+    run(["kubectl", "create", "-f", "-"], input_text=payload)
+    print(f"Created {kind_label}")
 
 
 def _wait_for_job(execution_name, namespace):
@@ -426,15 +441,20 @@ def _wait_for_job(execution_name, namespace):
 
 
 def _reconcile_one_pipeline(environment, pipeline_id, execution_id, region, namespace):
-    output_dir = _pipeline_output_dir(pipeline_id, execution_id)
-    _render_pipeline(environment, pipeline_id, execution_id, region, namespace, output_dir)
-    execution_name = _validate_rendered_manifests(output_dir, environment, pipeline_id, execution_id, namespace, region)
+    # Actual render uses a PRIVATE temporary directory -- never a raw execution_id-derived filesystem path (an absolute-path/"../" execution_id can no longer select/escape any fixed on-disk location) -- and is discarded immediately after validation returns; only Kubernetes cluster state is retained as failure evidence.
+    with tempfile.TemporaryDirectory(prefix="phase6-actual-render-") as output_dir:
+        _render_pipeline(environment, pipeline_id, execution_id, region, namespace, output_dir)
+        validation_result = _validate_rendered_manifests(output_dir, environment, pipeline_id, execution_id, namespace, region)
+
+    execution_name = validation_result["execution_name"]
+    manifests = validation_result["manifests"]
 
     _collision_preflight(execution_name, namespace)
 
-    _apply_manifest("SecretProviderClass", os.path.join(output_dir, "secretproviderclass.yaml"))
-    _apply_manifest("ConfigMap", os.path.join(output_dir, "configmap.yaml"))
-    _apply_manifest("Job", os.path.join(output_dir, "job.yaml"))
+    # Mutation consumes ONLY the validated in-memory EXPECTED mappings returned above -- never re-opens secretproviderclass.yaml/configmap.yaml/job.yaml (already gone: the actual-render temporary directory was removed the instant the `with` block above exited), so a post-validation on-disk file mutation (TOCTOU) can never reach kubectl.
+    _create_validated_manifest("SecretProviderClass", manifests["SecretProviderClass"])
+    _create_validated_manifest("ConfigMap", manifests["ConfigMap"])
+    _create_validated_manifest("Job", manifests["Job"])
 
     if not _wait_for_job(execution_name, namespace):
         print(f"FAIL: reconciliation Job {execution_name} for {pipeline_id} did not complete successfully.")
@@ -468,7 +488,8 @@ def cmd_discover(args):
 
 
 def cmd_reconcile(args):
-    """Deterministically recomputes the enabled pipeline list from the same checkout/model (never accepts it as a caller-supplied argument); a true zero-pipeline no-op returns before ANY AWS credential use / EKS connection / kubectl call. Otherwise connects to EKS once, then reconciles each enabled pipeline deterministically/sequentially/fail-fast -- a failure on one pipeline stops all later pipelines, never runs pipelines in parallel."""
+    """Deterministically recomputes the enabled pipeline list from the same checkout/model (never accepts it as a caller-supplied argument); a true zero-pipeline no-op returns before ANY AWS credential use / EKS connection / kubectl call. Otherwise connects to EKS once, then reconciles each enabled pipeline deterministically/sequentially/fail-fast -- a failure on one pipeline stops all later pipelines, never runs pipelines in parallel. Validates the caller-supplied execution_id shape (defense in depth only -- see _require_safe_execution_id()) before anything else."""
+    _require_safe_execution_id(args.execution_id)
     pipelines = _discover_pipelines(args.environment)
     if not pipelines:
         print("No enabled replication pipeline -- clean no-op: no Job created, no existing runtime changed.")
@@ -484,7 +505,8 @@ def cmd_reconcile(args):
 
 
 def cmd_validate_local(args):
-    """Validate-mode: local/read-only, zero cluster mutation. 1) runs full canonical deployment-model validation; 2) lists canonical enabled replication pipelines; 3) clean no-op when there are none; 4) for each enabled pipeline sequentially, renders via the SAME engine render-job with execution-id=dry-run; 5) structurally validates the exact three rendered manifests using the SAME _validate_rendered_manifests() helper Deploy uses; 6) proves no secret VALUE is embedded; 7) performs ZERO mutation -- no aws command, no kubectl command, no cluster dependency."""
+    """Validate-mode: local/read-only, zero cluster mutation. 1) runs full canonical deployment-model validation; 2) lists canonical enabled replication pipelines; 3) clean no-op when there are none; 4) for each enabled pipeline sequentially, renders via the SAME engine render-job with execution-id=dry-run into a fresh PRIVATE temporary directory (never a persistent work/replication/.../dry-run tree, never an execution_id-derived path); 5) structurally validates the exact three rendered manifests using the SAME _validate_rendered_manifests() helper Deploy uses; 6) proves no secret VALUE is embedded; 7) performs ZERO mutation -- no aws command, no kubectl command, no cluster dependency."""
+    _require_safe_execution_id(DRY_RUN_EXECUTION_ID)
     pipelines = _discover_pipelines(args.environment)
     if not pipelines:
         print("No enabled replication pipelines -- clean no-op.")
@@ -494,9 +516,9 @@ def cmd_validate_local(args):
     aws_region = require_env("AWS_REGION")
     for pipeline_id in pipelines:
         print(f"::group::Validating {pipeline_id}")
-        output_dir = _pipeline_output_dir(pipeline_id, DRY_RUN_EXECUTION_ID)
-        _render_pipeline(args.environment, pipeline_id, DRY_RUN_EXECUTION_ID, aws_region, namespace, output_dir)
-        _validate_rendered_manifests(output_dir, args.environment, pipeline_id, DRY_RUN_EXECUTION_ID, namespace, aws_region)
+        with tempfile.TemporaryDirectory(prefix="phase6-actual-render-") as output_dir:
+            _render_pipeline(args.environment, pipeline_id, DRY_RUN_EXECUTION_ID, aws_region, namespace, output_dir)
+            _validate_rendered_manifests(output_dir, args.environment, pipeline_id, DRY_RUN_EXECUTION_ID, namespace, aws_region)
         print(f"OK: {pipeline_id} replication manifests render and validate cleanly (no secret value, no cluster mutation).")
         print("::endgroup::")
     return 0

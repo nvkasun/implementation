@@ -17557,8 +17557,8 @@ with _mock.patch.object(phase6, "run", recorder):
         phase6._collision_preflight("gg-repl-static-check", "goldengate-dev")
         c_ok = False
     except phase6.Phase6Error:
-        c_ok = not any(c[:2] in (["kubectl", "apply"], ["kubectl", "wait"], ["kubectl", "delete"]) for c in recorder.calls)
-check("C: confirmed reproduction -- a Forbidden kubectl get error fails closed (Phase6Error) with zero apply/wait/delete mutation, never authorizing apply as if the resource were absent", c_ok)
+        c_ok = not any(c[:2] in (["kubectl", "create"], ["kubectl", "wait"], ["kubectl", "delete"]) for c in recorder.calls)
+check("C: confirmed reproduction -- a Forbidden kubectl get error fails closed (Phase6Error) with zero create/wait/delete mutation, never authorizing creation as if the resource were absent", c_ok)
 
 # D: ConfigMap data key set is exact.
 check("D: _EXPECTED_CONFIGMAP_DATA_KEYS is exactly {goldengate-replication.py, plan.json}", phase6._EXPECTED_CONFIGMAP_DATA_KEYS == frozenset({"goldengate-replication.py", "plan.json"}))
@@ -17596,12 +17596,12 @@ check("K: _validate_rendered_manifests() requires the reconciler-script volume's
 # L: CSI volume references the exact execution SecretProviderClass (preserved from the prior correction).
 check("L: _validate_rendered_manifests() requires the replication-secrets CSI volume's secretProviderClass to equal the execution resource name", 'volumeAttributes") or {}).get("secretProviderClass") != execution_name' in validate_manifests_src)
 
-# M: all local validation occurs before collision/apply -- _reconcile_one_pipeline() calls _validate_rendered_manifests() strictly before _collision_preflight() and before any kubectl apply.
+# M: all local validation occurs before collision/mutation -- _reconcile_one_pipeline() calls _validate_rendered_manifests() strictly before _collision_preflight() and before any kubectl create. Phase 6 Python Conversion (validated-manifest -> atomic creation handoff): _apply_manifest() was retired and replaced by _create_validated_manifest() -- checked here by its current name so this assertion tracks the live call site rather than a retired one.
 reconcile_one_src = fn_source("_reconcile_one_pipeline")
 validate_call_index = reconcile_one_src.find("_validate_rendered_manifests(")
 collision_call_index = reconcile_one_src.find("_collision_preflight(")
-apply_call_index = reconcile_one_src.find("_apply_manifest(")
-check("M: _reconcile_one_pipeline() calls _validate_rendered_manifests() strictly BEFORE _collision_preflight() and BEFORE any _apply_manifest() call", -1 not in (validate_call_index, collision_call_index, apply_call_index) and validate_call_index < collision_call_index < apply_call_index)
+apply_call_index = reconcile_one_src.find("_create_validated_manifest(")
+check("M: _reconcile_one_pipeline() calls _validate_rendered_manifests() strictly BEFORE _collision_preflight() and BEFORE any _create_validated_manifest() call", -1 not in (validate_call_index, collision_call_index, apply_call_index) and validate_call_index < collision_call_index < apply_call_index)
 
 # N: automation/goldengate-replication.py remains unchanged by this correction (git-tracked, no working-tree diff introduced here).
 import subprocess
@@ -17832,8 +17832,8 @@ validate_call_index = reconcile_one_src.find("_validate_rendered_manifests(")
 collision_call_index = reconcile_one_src.find("_collision_preflight(")
 check("L: _reconcile_one_pipeline() still calls _validate_rendered_manifests() (now including the expected-render equality proof) strictly BEFORE _collision_preflight()", -1 not in (validate_call_index, collision_call_index) and validate_call_index < collision_call_index)
 
-# M: manifest mismatch produces zero Kubernetes mutation -- confirmed via the arbitrary-name reproduction above extended through the real _collision_preflight()/_apply_manifest() call chain (already proven behaviorally by the H/I/J/K reproductions never reaching the collision/apply code path at all, since _validate_rendered_manifests() raises first).
-check("M: manifest mismatch (H/I/J/K reproductions) never reaches _collision_preflight()/_apply_manifest() -- validated by construction, since Phase6Error is raised entirely inside _validate_rendered_manifests() before either is ever called", validate_call_index < collision_call_index)
+# M: manifest mismatch produces zero Kubernetes mutation -- confirmed via the arbitrary-name reproduction above extended through the real _collision_preflight()/_create_validated_manifest() call chain (already proven behaviorally by the H/I/J/K reproductions never reaching the collision/create code path at all, since _validate_rendered_manifests() raises first).
+check("M: manifest mismatch (H/I/J/K reproductions) never reaches _collision_preflight()/_create_validated_manifest() -- validated by construction, since Phase6Error is raised entirely inside _validate_rendered_manifests() before either is ever called", validate_call_index < collision_call_index)
 
 # N: goldengate-replication.py remains unchanged by this correction.
 git_diff = subprocess.run(["git", "diff", "--quiet", "--", engine_path], cwd=Path(tool_path).resolve().parents[3])
@@ -17862,6 +17862,222 @@ PYEOF
   fi
 else
   skip "Phase 6 engine-authoritative expected-manifest equality: dedicated static assertions -- python3/PyYAML/phase6_replication.py/goldengate-replication.py/goldengate-deployment-model.py unavailable"
+fi
+
+echo "--- Phase 6 Python Conversion: validated-manifest to atomic Kubernetes creation handoff (A-O) ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$PHASE6_REPLICATION_TOOL" ] && [ -f "$REPLICATION_TOOL" ] && [ -f "$DEPLOYMENT_MODEL_TOOL" ]; then
+  PHASE6_ATOMIC_HANDOFF_CHECK="$(python3 - "$PHASE6_REPLICATION_TOOL" "$REPLICATION_TOOL" "$DEPLOYMENT_MODEL_TOOL" <<'PYEOF'
+import ast
+import importlib.util
+import json
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from unittest import mock
+
+import yaml
+
+tool_path, engine_path, gdm_path = sys.argv[1:4]
+
+spec = importlib.util.spec_from_file_location("phase6_replication", tool_path)
+phase6 = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(phase6)
+
+engine_spec = importlib.util.spec_from_file_location("goldengate_replication", engine_path)
+engine = importlib.util.module_from_spec(engine_spec)
+engine_spec.loader.exec_module(engine)
+
+gdm_spec = importlib.util.spec_from_file_location("goldengate_deployment_model", gdm_path)
+gdm = importlib.util.module_from_spec(gdm_spec)
+gdm_spec.loader.exec_module(gdm)
+
+results = []
+
+
+def check(label, ok):
+    results.append((label, ok))
+
+
+with open(engine_path, "r", encoding="utf-8") as f:
+    REAL_ENGINE_SOURCE = f.read()
+
+PLAN = {
+    "pipelineId": "static-check-pipeline-003", "tlsSecret": "dev/goldengate/tls-certificate",
+    "networkCredentialDomain": "Network", "networkCredentialAlias": "NET_TEST",
+    "source": {
+        "deploymentId": "gg-pg-src-fixture-01", "deploymentType": "postgresql",
+        "runtimeHost": "gg-pg-src-fixture-01.goldengate-dev.adcbmis.local", "serviceAccount": "gg-runtime-sa",
+        "image": "229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-postgresql:23.26.2.0.1",
+        "adminSecret": "dev/goldengate/source/admin", "databaseSecret": "dev/goldengate/databases/static-check-pipeline-003/source",
+        "databaseCredentialAlias": "SRC_ALIAS", "databaseCredentialDomain": "OracleGoldenGate",
+    },
+    "target": {
+        "deploymentId": "gg-mssql-tgt-fixture-01", "deploymentType": "mssql",
+        "runtimeHost": "gg-mssql-tgt-fixture-01.goldengate-dev.adcbmis.local", "serviceAccount": "gg-runtime-sa",
+        "image": "229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-sqlserver:23.26.2.0.1",
+        "adminSecret": "dev/goldengate/target/admin", "databaseSecret": "dev/goldengate/databases/static-check-pipeline-003/target",
+        "databaseCredentialAlias": "TGT_ALIAS", "databaseCredentialDomain": "OracleGoldenGate",
+    },
+    "checkpoint": {"enabled": True, "table": "dbo.gg_checkpoint", "createIfMissing": True},
+    "replicat": {"name": "MSTGT01", "sourceTrailName": "ma", "begin": "now", "startOnCreate": True,
+                 "mappings": [{"source": "public.payments", "target": "dbo.payments"}]},
+    "supplementalLogging": {"objects": ["public.payments"]},
+    "extract": {"name": "PGSRC01", "pluginType": "pgoutput", "begin": "now", "startOnCreate": True,
+                "trail": {"name": "pa", "sizeMB": 500}, "tables": ["public.payments"]},
+    "distribution": {"pathName": "PG2MS01", "sourceTrailName": "pa", "targetTrailName": "ma", "protocol": "wss", "port": 443, "startOnCreate": True},
+}
+
+with open(tool_path) as f:
+    tool_source = f.read()
+tree = ast.parse(tool_source)
+
+
+def fn_source(name):
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
+    return ast.get_source_segment(tool_source, fn) or ""
+
+
+validate_manifests_src = fn_source("_validate_rendered_manifests")
+reconcile_one_src = fn_source("_reconcile_one_pipeline")
+cmd_validate_local_src = fn_source("cmd_validate_local")
+
+# A: _validate_rendered_manifests returns trusted validated mappings, not only an execution name/path.
+check("A: _validate_rendered_manifests() returns a dict containing BOTH execution_name and manifests (SecretProviderClass/ConfigMap/Job), never a bare name/path", '"execution_name": execution_name' in validate_manifests_src and '"manifests": {' in validate_manifests_src)
+check("A: the returned manifests are the FRESH EXPECTED mappings, never the actual parsed-from-disk ones", 'expected["SecretProviderClass"]' in validate_manifests_src and 'expected["ConfigMap"]' in validate_manifests_src and 'expected["Job"]' in validate_manifests_src)
+
+# B/C: mutation consumes in-memory mappings, never re-opens the rendered YAML paths.
+check("B: _reconcile_one_pipeline() extracts execution_name/manifests from the validation result dict", 'validation_result["execution_name"]' in reconcile_one_src and 'validation_result["manifests"]' in reconcile_one_src)
+check("C: _reconcile_one_pipeline() passes manifests[...] (in-memory) to the create helper, never a path", 'manifests["SecretProviderClass"]' in reconcile_one_src and 'manifests["ConfigMap"]' in reconcile_one_src and 'manifests["Job"]' in reconcile_one_src)
+create_fn_src = fn_source("_create_validated_manifest")
+check("C: _create_validated_manifest() never opens a file (no open() call) -- the manifest argument is already an in-memory mapping", "open(" not in create_fn_src)
+
+# D: production Phase 6 uses `kubectl create -f -`, never `kubectl apply`.
+check("D: _create_validated_manifest() issues exactly `kubectl create -f -` with input_text stdin, never apply", '"kubectl", "create", "-f", "-"' in create_fn_src and "input_text=payload" in create_fn_src)
+check("D: zero `kubectl apply` argv construction anywhere in production Phase 6 source", '"kubectl", "apply"' not in tool_source and '"apply"' not in tool_source)
+
+# E: collision preflight remains.
+check("E: _collision_preflight() still exists and is still called from _reconcile_one_pipeline() before any create", "_collision_preflight(" in reconcile_one_src)
+
+# F: create is authoritative if a race causes AlreadyExists after preflight -- confirmed reproduction.
+class _Proc:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
+
+class _Recorder:
+    def __init__(self):
+        self.calls = []
+        self.get_count = 0
+
+    def __call__(self, argv, env=None, cwd=None, check=True, capture_output=True, input_text=None):
+        self.calls.append({"argv": list(argv), "input_text": input_text})
+        if argv[:2] == ["kubectl", "get"]:
+            self.get_count += 1
+            return _Proc(0, "", "")
+        if argv[:2] == ["kubectl", "create"]:
+            manifest = yaml.safe_load(input_text) if input_text else {}
+            if manifest.get("kind") == "SecretProviderClass":
+                proc = _Proc(1, "", "Error from server (AlreadyExists): secretproviderclasses \"x\" already exists")
+                if check:
+                    raise phase6.Phase6Error("kubectl create failed: AlreadyExists")
+                return proc
+            return _Proc(0, "")
+        return _Proc(0, "")
+
+
+recorder = _Recorder()
+with mock.patch.object(phase6, "run", recorder):
+    try:
+        phase6._collision_preflight("gg-repl-static-check", "goldengate-dev")
+        preflight_ok = True
+    except phase6.Phase6Error:
+        preflight_ok = False
+    race_ok = None
+    if preflight_ok:
+        try:
+            phase6._create_validated_manifest("SecretProviderClass", {"kind": "SecretProviderClass", "metadata": {"name": "gg-repl-static-check"}})
+            race_ok = False
+        except phase6.Phase6Error:
+            race_ok = True
+check("F: confirmed race reproduction -- a successful absence preflight followed by an AlreadyExists on kubectl create still fails closed (Phase6Error), never silently succeeds", preflight_ok and race_ok)
+
+# G: SPC -> ConfigMap -> Job order preserved.
+spc_call_index = reconcile_one_src.find('_create_validated_manifest("SecretProviderClass"')
+configmap_call_index = reconcile_one_src.find('_create_validated_manifest("ConfigMap"')
+job_call_index = reconcile_one_src.find('_create_validated_manifest("Job"')
+check("G: create order is SecretProviderClass -> ConfigMap -> Job", -1 not in (spc_call_index, configmap_call_index, job_call_index) and spc_call_index < configmap_call_index < job_call_index)
+
+# H: failure evidence retention unchanged -- no automatic delete/rollback code path exists on a create/wait failure.
+check("H: _reconcile_one_pipeline() still retains evidence on Job wait failure (prints retained job/configmap/secretproviderclass, no delete before the raise)", "evidence retained for diagnosis" in reconcile_one_src)
+wait_failure_block = reconcile_one_src.split("if not _wait_for_job", 1)[-1].split("# Success cleanup", 1)[0]
+check("H: no kubectl delete occurs in the Job-wait-failure branch", '"kubectl", "delete"' not in wait_failure_block)
+
+# I: actual render uses a private TemporaryDirectory.
+check("I: _reconcile_one_pipeline() renders the actual manifests into tempfile.TemporaryDirectory(prefix=\"phase6-actual-render-\")", 'tempfile.TemporaryDirectory(prefix="phase6-actual-render-")' in reconcile_one_src)
+check("I: cmd_validate_local() renders the actual manifests into the SAME private temporary-directory contract", 'tempfile.TemporaryDirectory(prefix="phase6-actual-render-")' in cmd_validate_local_src)
+
+# J: expected render still uses its own distinct TemporaryDirectory.
+expected_render_src = fn_source("_render_expected_manifests_for_validation")
+check("J: _render_expected_manifests_for_validation() still uses its OWN distinct tempfile.TemporaryDirectory(prefix=\"phase6-expected-render-\")", 'tempfile.TemporaryDirectory(prefix="phase6-expected-render-")' in expected_render_src)
+
+# K: execution_id is not appended to an output filesystem path -- the retired _pipeline_output_dir() helper no longer exists.
+check("K: _pipeline_output_dir() no longer exists anywhere in production Phase 6 source", "_pipeline_output_dir" not in tool_source)
+check("K: neither the actual nor the expected render directory derivation concatenates pipeline_id/execution_id into a path", "/ pipeline_id / execution_id" not in tool_source)
+
+# L: Validate remains zero aws/kubectl -- behavioral confirmation.
+class _ZeroMutationRecorder:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, argv, env=None, cwd=None, check=True, capture_output=True, input_text=None):
+        self.calls.append(list(argv))
+        if argv[-1] == "validate":
+            return _Proc(0, "OK")
+        if argv[-1] == "replication-pipelines":
+            return _Proc(0, "")
+        return _Proc(0, "")
+
+
+zero_recorder = _ZeroMutationRecorder()
+with mock.patch.object(phase6, "run", zero_recorder):
+    validate_local_result = phase6.cmd_validate_local(type("Args", (), {"environment": "dev"})())
+check("L: cmd_validate_local() zero-pipeline path returns 0 with zero aws/kubectl calls", validate_local_result == 0 and not any(c[:1] in (["aws"], ["kubectl"]) for c in zero_recorder.calls))
+
+# M: existing engine-authoritative exact equality remains before mutation.
+check("M: _validate_rendered_manifests() still requires exact (!=) equality of actual vs expected for all three manifests", "spc != expected[" in validate_manifests_src and "configmap != expected[" in validate_manifests_src and "job != expected[" in validate_manifests_src)
+validate_call_index = reconcile_one_src.find("_validate_rendered_manifests(")
+collision_call_index = reconcile_one_src.find("_collision_preflight(")
+check("M: exact equality (inside _validate_rendered_manifests) completes strictly BEFORE collision preflight", -1 not in (validate_call_index, collision_call_index) and validate_call_index < collision_call_index)
+
+# N: goldengate-replication.py remains unchanged by this correction.
+git_diff = subprocess.run(["git", "diff", "--quiet", "--", engine_path], cwd=Path(tool_path).resolve().parents[3])
+check("N: automation/goldengate-replication.py has no working-tree diff (byte-for-byte unchanged by this correction)", git_diff.returncode == 0)
+
+# O: current descriptors remain replication.enabled=false.
+active, inactive, invalid = gdm.scan("dev")
+check("O: scan(dev) has no invalid descriptors", invalid == [])
+by_id = {d["deploymentId"]: d for d in active + inactive}
+check("O: gg-postgresql-repltest-01 remains replication.enabled=false", by_id.get("gg-postgresql-repltest-01", {}).get("replicationEnabled") is False)
+check("O: gg-mssql-repltest-01 remains replication.enabled=false", by_id.get("gg-mssql-repltest-01", {}).get("replicationEnabled") is False)
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  echo "$PHASE6_ATOMIC_HANDOFF_CHECK"
+  if [ -z "$(echo "$PHASE6_ATOMIC_HANDOFF_CHECK" | grep '^FAIL ' || true)" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        OK\ *) pass "Phase 6 validated-manifest to atomic creation handoff: ${line#OK }" ;;
+      esac
+    done <<< "$PHASE6_ATOMIC_HANDOFF_CHECK"
+  else
+    fail "Phase 6 validated-manifest to atomic creation handoff: dedicated static assertions failed:"$'\n'"${PHASE6_ATOMIC_HANDOFF_CHECK}"
+  fi
+else
+  skip "Phase 6 validated-manifest to atomic creation handoff: dedicated static assertions -- python3/PyYAML/phase6_replication.py/goldengate-replication.py/goldengate-deployment-model.py unavailable"
 fi
 
 echo "--- Final repository handoff hygiene sweep (VDR pre-transfer cleanliness) ---"
