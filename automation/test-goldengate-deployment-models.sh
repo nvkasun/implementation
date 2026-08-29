@@ -19088,6 +19088,44 @@ else
   skip "Phase 7 conversion: dedicated regression assertions -- python3/PyYAML/${EKS_APP_WORKFLOW} unavailable"
 fi
 
+echo "--- VDR compile-fix: GitHub expression-preprocessing placeholder guard (no literal ellipsis-only \${{ ... }} expression in any workflow YAML) ---"
+
+# GitHub Actions expands/evaluates every ${{ ... }} expression BEFORE the surrounding run:/env:/if: scalar is handed to Bash -- this happens even when the expression text sits inside what looks like a shell comment, since GitHub's expression preprocessor has no concept of Bash comment syntax. A literal ellipsis-placeholder expression such as "${{ ... }}" left behind from documentation/example prose is therefore not inert text: GitHub attempts to parse "..." as a real expression and rejects the ENTIRE workflow at compile time with "Unexpected symbol: '...'" -- a failure PyYAML and bash -n can never reproduce, since both only ever see the raw scalar text, never GitHub's own expression grammar. This exact defect broke .github/workflows/00-main-goldengate-orchestrator.yaml's VDR compilation.
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  PLACEHOLDER_EXPR_CHECK="$(python3 - <<'PYEOF'
+import glob
+import re
+
+# Every real GitHub expression (needs.*, github.*, vars.*, secrets.*, always(), literals, operators, ...) contains at least one non-dot character -- an expression body consisting ENTIRELY of one or more literal dots is never valid GitHub syntax and can only be a leftover documentation/example placeholder.
+EXPR_RE = re.compile(r"\$\{\{\s*(.*?)\s*\}\}")
+ELLIPSIS_ONLY_RE = re.compile(r"\.+")
+
+files = sorted(glob.glob(".github/workflows/*.yaml") + glob.glob(".github/workflows/*.yml"))
+unsafe = []
+for path in files:
+    with open(path, encoding="utf-8") as f:
+        for lineno, line in enumerate(f, start=1):
+            for match in EXPR_RE.finditer(line):
+                inner = match.group(1)
+                if inner and ELLIPSIS_ONLY_RE.fullmatch(inner):
+                    unsafe.append(f"{path}:{lineno}: {line.strip()}")
+
+if unsafe:
+    for u in unsafe:
+        print("FAIL " + u)
+else:
+    print("OK zero literal ellipsis-placeholder GitHub expressions across " + str(len(files)) + " workflow file(s)")
+PYEOF
+)"
+  if echo "$PLACEHOLDER_EXPR_CHECK" | grep -q "^FAIL"; then
+    fail "VDR compile-fix: GitHub expression-preprocessing placeholder guard found literal ellipsis-only expression(s) (these fail GitHub's own expression compiler, not merely YAML/bash):"$'\n'"${PLACEHOLDER_EXPR_CHECK}"
+  else
+    pass "VDR compile-fix: GitHub expression-preprocessing placeholder guard: ${PLACEHOLDER_EXPR_CHECK#OK }"
+  fi
+else
+  skip "VDR compile-fix: GitHub expression-preprocessing placeholder guard -- python3 unavailable"
+fi
+
 echo "--- Final repository handoff hygiene sweep (VDR pre-transfer cleanliness) ---"
 
 # This is the LAST check in the suite, deliberately: earlier sections legitimately regenerate work/generated/dev/goldengate-deployments.yaml (the folder-driven registry-generation checks) as their own tested behavior -- asserting its absence any earlier would be a self-defeating mid-test assertion. Self-heal only the categories PROVEN elsewhere in this suite to be pure, expected byproducts of exercising real application/tooling behavior (never silently deleting anything whose origin is unknown); everything else must already be absent, or this check fails closed and reports it for a human to investigate before VDR handoff.

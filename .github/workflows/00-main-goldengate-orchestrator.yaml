@@ -1614,7 +1614,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # GitHub's needs.*.result/needs.*.outputs.* expressions are resolved into plain env: values ABOVE, at YAML-evaluation time -- phase7_final.py itself is never aware of `${{ ... }}` syntax, it only ever reads plain os.environ strings.
+          # GitHub needs.* result/output expressions above are resolved into plain env values before phase7_final.py runs; the Python module only reads plain os.environ strings.
           python3 automation/phases/phase7/phase7_final.py validate
 
       - name: Re-validate the folder-driven deployment model after rollout
