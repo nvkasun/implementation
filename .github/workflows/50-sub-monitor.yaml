@@ -2284,7 +2284,17 @@ jobs:
           echo "OK: processDiscovery is OK or EMPTY for every enabled deployment, alertsEnabled remains false, and no process has an empty or synthetic name. A zero process count is not required."
 
           echo "Checking collector and portal logs for forbidden patterns..."
-          POD_LOGS="$(kubectl logs "$POD_NAME" -n "$TARGET_NAMESPACE" --since=10m 2>/dev/null || true)"
+
+          # kubectl logs is being used as acceptance EVIDENCE here: a retrieval failure (Forbidden/Unauthorized/API/network/timeout/unknown) must never be silently converted into an empty log window and treated as "logs proved clean". Only a genuinely successful retrieval (exit 0) authorizes the forbidden-pattern checks below; any other outcome fails this step closed before those checks ever run.
+          set +e
+          POD_LOGS="$(kubectl logs "$POD_NAME" -n "$TARGET_NAMESPACE" --since=10m 2>/tmp/gg-monitor-logs-error.txt)"
+          LOG_RC=$?
+          set -e
+
+          if [ "$LOG_RC" -ne 0 ]; then
+            echo "FAIL: runtime log acceptance could not be completed -- recent monitor logs could not be retrieved for pod ${POD_NAME} in namespace ${TARGET_NAMESPACE} (kubectl logs exit code ${LOG_RC}). An inspection failure is never treated as \"logs proved clean\"; the raw kubectl diagnostic is intentionally not printed here (it is not required workflow acceptance output and may contain unexpected cluster/server information)."
+            exit 1
+          fi
 
           if grep -qi "AccessDeniedException" <<< "$POD_LOGS"; then
             echo "FAIL: AccessDeniedException found in gg-monitor logs."

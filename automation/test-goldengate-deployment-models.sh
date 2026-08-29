@@ -18445,6 +18445,128 @@ else
   skip "Monitor Ready-pod detection fail-closed Kubernetes inspection: dedicated behavioral assertions -- python3/PyYAML/${MONITOR_WORKFLOW} unavailable"
 fi
 
+echo "--- Preliminary Phase 7 safety correction: fail-closed runtime-log acceptance (kubectl logs) in 50-sub-monitor.yaml ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$MONITOR_WORKFLOW" ]; then
+  MONITOR_LOG_ACCEPTANCE_CHECK="$(python3 - "$MONITOR_WORKFLOW" <<'PYEOF'
+import json
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+
+import yaml
+
+workflow_path = sys.argv[1]
+with open(workflow_path) as f:
+    doc = yaml.safe_load(f)
+
+results = []
+
+
+def check(label, ok):
+    results.append((label, ok))
+
+
+def find_step(job_name, step_name):
+    for step in doc["jobs"][job_name]["steps"]:
+        if step.get("name") == step_name:
+            return step["run"]
+    raise SystemExit(f"step not found: {job_name}/{step_name}")
+
+
+VERIFY_RUN = find_step("build_publish_and_deploy", "Verify GoldenGate monitor runtime state")
+
+START_MARKER = 'echo "Checking collector and portal logs for forbidden patterns..."'
+END_MARKER = 'if [ "$CLOUDWATCH_PUBLISH_ENABLED_VALUE" = "true" ]; then'
+start = VERIFY_RUN.index(START_MARKER)
+end = VERIFY_RUN.index(END_MARKER, start)
+FRAGMENT = "set -euo pipefail\n" + VERIFY_RUN[start:end]
+
+
+def make_kubectl_shim(behavior):
+    """Fake `kubectl` CLI handling only `kubectl logs ...` (the sole kubectl invocation inside this bounded fragment). behavior is ("ok", stdout_text) for a successful retrieval, or ("fail", rc, stderr_text) for a failed one. Every real kubectl error shape (Forbidden, Unauthorized, timeout/unknown) is reproduced as literal, inert stderr TEXT on a real subprocess -- never executed, never treated as shell source."""
+    kind = behavior[0]
+    if kind == "ok":
+        stdout_text = behavior[1]
+        return f"#!/usr/bin/env bash\nif [ \"$1\" = \"logs\" ]; then\n  cat <<'KUBECTL_LOGS_EOF'\n{stdout_text}\nKUBECTL_LOGS_EOF\n  exit 0\nfi\necho \"unhandled kubectl invocation: $*\" >&2\nexit 1\n"
+    if kind == "fail":
+        rc, err = behavior[1], behavior[2]
+        err_line = f"echo {json.dumps(err)} >&2\n  " if err else ""
+        return f"#!/usr/bin/env bash\nif [ \"$1\" = \"logs\" ]; then\n  {err_line}exit {rc}\nfi\necho \"unhandled kubectl invocation: $*\" >&2\nexit 1\n"
+    raise ValueError(behavior)
+
+
+def run_fragment(fragment_text, shim_script, extra_env):
+    """Executes the REAL extracted workflow fragment (never a reimplemented copy) with a fake `kubectl` prepended to PATH, proving the actual committed bash, not a parallel Python re-derivation of what it is supposed to do."""
+    with tempfile.TemporaryDirectory() as tmp:
+        kubectl_path = os.path.join(tmp, "kubectl")
+        with open(kubectl_path, "w") as f:
+            f.write(shim_script)
+        os.chmod(kubectl_path, stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)
+        env = dict(os.environ)
+        env["PATH"] = tmp + ":" + env.get("PATH", "")
+        env.update(extra_env)
+        proc = subprocess.run(["bash", "-c", fragment_text], env=env, capture_output=True, text=True, timeout=20)
+        return proc
+
+
+ENV = {"POD_NAME": "gg-monitor-abc123", "TARGET_NAMESPACE": "goldengate-monitoring"}
+CLEAN_OK_MESSAGE = "OK: no AccessDeniedException or missing-region error found in recent logs."
+SENTINEL = "RAW-KUBECTL-STDERR-MUST-NOT-BE-PRINTED"
+
+# 1: log retrieval success + clean, ordinary log lines -> exit 0, clean-log OK message present.
+proc = run_fragment(FRAGMENT, make_kubectl_shim(("ok", "2026-01-01T00:00:00Z INFO polling loop started for gg-oracle-payments-01")), ENV)
+check("log retrieval success + ordinary clean log lines -> exit 0, clean-log OK message present", proc.returncode == 0 and CLEAN_OK_MESSAGE in proc.stdout)
+
+# 2: log retrieval success + empty stdout -> exit 0, clean-log OK message present (a successful empty log window is not itself an error).
+proc = run_fragment(FRAGMENT, make_kubectl_shim(("ok", "")), ENV)
+check("log retrieval success + empty stdout -> exit 0, clean-log OK message present", proc.returncode == 0 and CLEAN_OK_MESSAGE in proc.stdout)
+
+# 3: log retrieval success + AccessDeniedException present in the retrieved logs -> must still fail (existing pattern rule preserved).
+proc = run_fragment(FRAGMENT, make_kubectl_shim(("ok", "some log line\nAccessDeniedException: User is not authorized\nanother line")), ENV)
+check("log retrieval success + AccessDeniedException in logs -> non-zero exit, AccessDenied failure message, clean-log OK message absent", proc.returncode != 0 and "FAIL: AccessDeniedException found in gg-monitor logs." in proc.stdout and CLEAN_OK_MESSAGE not in proc.stdout)
+
+# 4: log retrieval success + missing-region text present (case-insensitive, per existing logic) -> must still fail.
+proc = run_fragment(FRAGMENT, make_kubectl_shim(("ok", "some log line\nYou must specify a region.\nanother line")), ENV)
+check("log retrieval success + missing-region text in logs -> non-zero exit, clean-log OK message absent", proc.returncode != 0 and "FAIL: a missing-AWS-region error was found in gg-monitor logs." in proc.stdout and CLEAN_OK_MESSAGE not in proc.stdout)
+
+# 5: confirmed reproduction -- kubectl logs Forbidden must NEVER be treated as "logs proved clean".
+proc = run_fragment(FRAGMENT, make_kubectl_shim(("fail", 1, 'Error from server (Forbidden): pods "gg-monitor-abc123" is forbidden')), ENV)
+check("confirmed reproduction -- kubectl logs Forbidden fails closed, non-zero exit, clean-log OK message absent (previously exited 0 with the false clean-log success message)", proc.returncode != 0 and CLEAN_OK_MESSAGE not in proc.stdout)
+
+# 6: kubectl logs Unauthorized must fail closed.
+proc = run_fragment(FRAGMENT, make_kubectl_shim(("fail", 1, "error: You must be logged in to the server (Unauthorized)")), ENV)
+check("kubectl logs Unauthorized fails closed, non-zero exit, clean-log OK message absent", proc.returncode != 0 and CLEAN_OK_MESSAGE not in proc.stdout)
+
+# 7: kubectl logs API/network/timeout/unknown failure must fail closed.
+proc = run_fragment(FRAGMENT, make_kubectl_shim(("fail", 1, "Unable to connect to the server: dial tcp 10.0.0.1:443: i/o timeout")), ENV)
+check("kubectl logs API/network/timeout failure fails closed, non-zero exit, clean-log OK message absent", proc.returncode != 0 and CLEAN_OK_MESSAGE not in proc.stdout)
+
+# 8: raw kubectl stderr must never be blindly printed on a log-retrieval failure -- only the fixed, safe diagnostic (pod name/namespace/exit code) may appear.
+proc = run_fragment(FRAGMENT, make_kubectl_shim(("fail", 1, f"Error from server (Forbidden): {SENTINEL}")), ENV)
+combined = proc.stdout + proc.stderr
+check("raw kubectl stderr sentinel is never printed on log-retrieval failure -- only the fixed safe diagnostic is emitted", proc.returncode != 0 and SENTINEL not in combined and "runtime log acceptance could not be completed" in combined and ENV["POD_NAME"] in combined and ENV["TARGET_NAMESPACE"] in combined)
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  echo "$MONITOR_LOG_ACCEPTANCE_CHECK"
+  if [ -z "$(echo "$MONITOR_LOG_ACCEPTANCE_CHECK" | grep '^FAIL ' || true)" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        OK\ *) pass "Monitor runtime-log acceptance fail-closed classification: ${line#OK }" ;;
+      esac
+    done <<< "$MONITOR_LOG_ACCEPTANCE_CHECK"
+  else
+    fail "Monitor runtime-log acceptance fail-closed classification: dedicated behavioral assertions failed:"$'\n'"${MONITOR_LOG_ACCEPTANCE_CHECK}"
+  fi
+else
+  skip "Monitor runtime-log acceptance fail-closed classification: dedicated behavioral assertions -- python3/PyYAML/${MONITOR_WORKFLOW} unavailable"
+fi
+
 echo "--- Final repository handoff hygiene sweep (VDR pre-transfer cleanliness) ---"
 
 # This is the LAST check in the suite, deliberately: earlier sections legitimately regenerate work/generated/dev/goldengate-deployments.yaml (the folder-driven registry-generation checks) as their own tested behavior -- asserting its absence any earlier would be a self-defeating mid-test assertion. Self-heal only the categories PROVEN elsewhere in this suite to be pure, expected byproducts of exercising real application/tooling behavior (never silently deleting anything whose origin is unknown); everything else must already be absent, or this check fails closed and reports it for a human to investigate before VDR handoff.
