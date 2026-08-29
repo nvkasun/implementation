@@ -1211,7 +1211,7 @@ jobs:
           python3 automation/phases/phase6/phase6_replication.py validate-local --environment "${GG_SELECTED_ENVIRONMENT}"
 
   monitor_ownership_preflight:
-    name: Classify GoldenGate monitor ownership safety (read-only, singleton)
+    name: "Phase 7A | GoldenGate Monitor Ownership Preflight"
 
     # Phase B3B: read-only pre-reconciliation ownership-safety classifier for the shared gg-monitor deployment -- ABSENT (safe to create) / OWNED (safe to reconcile, even if currently unhealthy/out of date) / BROKEN (ownership/collision conflict, fail closed). Like a GoldenGate runtime (never like a static prerequisite), the monitor's canonical registry input changes whenever the GLOBAL active runtime inventory changes -- OWNED (not HEALTHY) is the "safe to reconcile" state. This job never mutates the cluster -- it only runs automation/orchestration/monitor_state.py, which itself issues read-only `kubectl get` calls. GoldenGate Monitor MAIN DAG Skip-Propagation Correctness Fix: this if: previously contained no status-check function (always()/success()/failure()/cancelled()) anywhere, so GitHub Actions' own implicit default continuation check applied on top of it -- a legitimately-skipped OPTIONAL job elsewhere in the ancestor graph (e.g. delete_removed_argocd_applications, correctly skipped when has_deletions=false) silently propagated a SKIP to this job too, even though replication_reconcile_once (this job's own direct, explicitly-checked prerequisite) itself already tolerates that exact skip via its own always() and reports 'success'. always() here overrides ONLY that implicit default propagation -- it does not weaken or replace a single one of the explicit requirements below; every one of them is still checked exactly as before, and a genuine failure/cancellation/skip of an ACTUALLY required prerequisite still prevents this job from running.
     needs:
@@ -1240,81 +1240,36 @@ jobs:
 
           python3 automation/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
 
+      - name: Ensure kubectl prerequisite
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 automation/phases/phase7/phase7_monitor.py ensure-kubectl
+
+      # AWS Credential Isolation: output-credentials/output-env-credentials scoping matches the established Phase 1/5/6 pattern -- these temporary credentials are consumed ONLY by the classify step below, never job-wide, never written to $GITHUB_ENV, never written to any state file.
       - name: Configure AWS credentials
+        id: aws_build_credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
           role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
-
-      - name: Install kubectl if missing
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "Checking/installing kubectl..."
-
-          if ! command -v kubectl >/dev/null 2>&1; then
-            KUBECTL_VERSION="v1.35.0"
-
-            ARCH="$(uname -m)"
-            case "$ARCH" in
-              x86_64)
-                KUBECTL_ARCH="amd64"
-                ;;
-              aarch64|arm64)
-                KUBECTL_ARCH="arm64"
-                ;;
-              *)
-                echo "Unsupported architecture for kubectl: $ARCH"
-                exit 1
-                ;;
-            esac
-
-            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /tmp/kubectl
-            sudo mv /tmp/kubectl /usr/local/bin/kubectl
-            sudo chmod +x /usr/local/bin/kubectl
-          fi
-
-          kubectl version --client=true
-
-      - name: Connect to EKS cluster
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          aws eks update-kubeconfig \
-            --region "${AWS_REGION}" \
-            --name "${EKS_CLUSTER_NAME}" \
-            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
-            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
-
-          echo "Current kube context:"
-          kubectl config current-context
+          output-credentials: true
+          output-env-credentials: false
 
       - name: Classify monitor ownership safety
         id: classify
         shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ steps.aws_build_credentials.outputs.aws-access-key-id }}
+          AWS_SECRET_ACCESS_KEY: ${{ steps.aws_build_credentials.outputs.aws-secret-access-key }}
+          AWS_SESSION_TOKEN: ${{ steps.aws_build_credentials.outputs.aws-session-token }}
         run: |
           set -euo pipefail
 
           python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
 
-          # A non-zero exit here is either a configuration error (invalid environment config) or a classifier inspection error (API unreachable, permission denied, malformed JSON) -- never treated as ABSENT.
-          if ! CLASSIFIER_OUTPUT="$(python3 automation/orchestration/monitor_state.py --environment "${GG_SELECTED_ENVIRONMENT}")"; then
-            echo "FAIL: the GoldenGate monitor ownership classifier could not classify the shared monitor (configuration or inspection error, not ABSENT) -- see diagnostics above."
-            exit 1
-          fi
-
-          echo "$CLASSIFIER_OUTPUT"
-
-          STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
-          echo "GoldenGate monitor ownership-safety state: ${STATE}"
-          echo "state=${STATE}" >> "$GITHUB_OUTPUT"
-
-          if [ "$STATE" = "BROKEN" ]; then
-            echo "FAIL: GoldenGate monitor ownership-safety state is BROKEN -- an existing footprint does not clearly belong to the shared monitor. This is not auto-repaired here -- investigate the diagnostics above before re-running."
-            exit 1
-          fi
+          python3 automation/phases/phase7/phase7_monitor.py ownership-preflight --environment "${GG_SELECTED_ENVIRONMENT}"
 
   monitor_sync_once:
     name: Synchronize the GoldenGate monitor (once, after all runtimes)
@@ -1339,7 +1294,7 @@ jobs:
       orchestrated_by_main: true
 
   monitor_dry_run_validation:
-    name: Validate the GoldenGate monitor locally (deploy=false, no publishing)
+    name: "Phase 7C | Validate GoldenGate Monitor Locally"
 
     needs:
       - validate_model
@@ -1391,57 +1346,15 @@ jobs:
           # Local/read-only: this job never authenticates to AWS, but the resolver itself is a pure envs/<environment>/environment.yaml reader and needs no AWS credentials to run.
           python3 automation/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
 
-      - name: Run monitor unit tests
+      - name: Validate the GoldenGate monitor locally (unit tests, canonical registry, Helm lint/template)
         shell: bash
         run: |
           set -euo pipefail
 
-          python3 -m unittest discover -s monitoring/monitor/tests -p "test_*.py" -v
-
-      - name: Generate and validate the folder-driven registry (no publish)
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p "work/generated/${GG_SELECTED_ENVIRONMENT}"
-          python3 automation/goldengate-deployment-model.py --environment "${GG_SELECTED_ENVIRONMENT}" registry --output "work/generated/${GG_SELECTED_ENVIRONMENT}/goldengate-deployments.yaml"
-          echo "Generated registry:"
-          cat "work/generated/${GG_SELECTED_ENVIRONMENT}/goldengate-deployments.yaml"
-
-      - name: Helm lint and template the monitor chart locally
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if ! command -v helm >/dev/null 2>&1; then
-            echo "FAIL: helm is required for local monitor chart validation and is not available on this runner."
-            exit 1
-          fi
-
-          STAGED_CHART="work/staged/goldengate-monitor"
-          rm -rf "$STAGED_CHART"
-          mkdir -p "$STAGED_CHART" "$STAGED_CHART/files"
-          cp -a helm/goldengate-monitor/. "$STAGED_CHART/"
-          cp "work/generated/${GG_SELECTED_ENVIRONMENT}/goldengate-deployments.yaml" "$STAGED_CHART/files/goldengate-deployments.yaml"
-
-          helm lint "$STAGED_CHART" \
-            --set image.repository=example.invalid/goldengate-monitor \
-            --set image.tag=dry-run \
-            --set serviceAccount.roleArn="${MONITOR_ROLE_ARN}"
-
-          mkdir -p rendered
-          helm template gg-monitor "$STAGED_CHART" \
-            --namespace "${MONITOR_NAMESPACE}" \
-            -f "envs/${GG_SELECTED_ENVIRONMENT}/goldengate-monitor/values.yaml" \
-            --set image.repository=example.invalid/goldengate-monitor \
-            --set image.tag=dry-run \
-            --set serviceAccount.roleArn="${MONITOR_ROLE_ARN}" \
-            > rendered/gg-monitor-dry-run.yaml
-
-          echo "OK: monitor chart lints and renders cleanly (no image build, no ECR push, no Argo CD/Kubernetes mutation)."
+          python3 automation/phases/phase7/phase7_monitor.py validate-local --environment "${GG_SELECTED_ENVIRONMENT}"
 
   validate_monitor_ready:
-    name: Validate the shared GoldenGate monitor is fully healthy (read-only, singleton)
+    name: "Phase 7D | Validate GoldenGate Monitor Healthy"
 
     # Phase B3B: post-reconciliation monitor acceptance -- HEALTHY/BROKEN only (never ABSENT: an expected monitor that is missing after reconciliation IS BROKEN). Runs in two passes through automation/orchestration/monitor_acceptance.py: (1) structural-only, to prove and select a real Ready pod via the Deployment->ReplicaSet->Pod ownership chain; (2) with that EXACT verified pod's own bounded in-pod /healthz and /readyz results folded in. monitor_sync_once succeeding is not enough on its own -- this is the independent structural+health acceptance gate that replication_monitor_acceptance and end_to_end_deployment_acceptance both require before trusting the monitor. GoldenGate Monitor MAIN DAG Skip-Propagation Correctness Fix: always() added for the SAME reason as monitor_ownership_preflight above -- this if: had no status-check function, so a legitimately-skipped OPTIONAL ancestor elsewhere in the graph (e.g. delete_removed_argocd_applications) could silently propagate a SKIP here too, even though monitor_sync_once (this job's own direct, explicitly-checked prerequisite) already tolerates that exact skip and reports 'success'. Every explicit requirement below is unchanged -- always() only removes the implicit default propagation, it does not accept a genuinely failed/cancelled/skipped required prerequisite.
     needs:
@@ -1453,8 +1366,8 @@ jobs:
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
     outputs:
-      state: ${{ steps.final.outputs.state }}
-      ready_pod_name: ${{ steps.structural.outputs.ready_pod_name }}
+      state: ${{ steps.strict.outputs.state }}
+      ready_pod_name: ${{ steps.strict.outputs.ready_pod_name }}
 
     # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail.
     env:
@@ -1471,68 +1384,30 @@ jobs:
 
           python3 automation/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
 
+      - name: Ensure kubectl prerequisite
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 automation/phases/phase7/phase7_monitor.py ensure-kubectl
+
+      # AWS Credential Isolation: output-credentials/output-env-credentials scoping matches the established Phase 1/5/6 pattern -- these temporary credentials are consumed ONLY by the strict-acceptance step below, never job-wide, never written to $GITHUB_ENV, never written to any state file.
       - name: Configure AWS credentials
+        id: aws_build_credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
           role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
+          output-credentials: true
+          output-env-credentials: false
 
-      - name: Install kubectl if missing
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "Checking/installing kubectl..."
-
-          if ! command -v kubectl >/dev/null 2>&1; then
-            KUBECTL_VERSION="v1.35.0"
-
-            ARCH="$(uname -m)"
-            case "$ARCH" in
-              x86_64)
-                KUBECTL_ARCH="amd64"
-                ;;
-              aarch64|arm64)
-                KUBECTL_ARCH="arm64"
-                ;;
-              *)
-                echo "Unsupported architecture for kubectl: $ARCH"
-                exit 1
-                ;;
-            esac
-
-            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /tmp/kubectl
-            sudo mv /tmp/kubectl /usr/local/bin/kubectl
-            sudo chmod +x /usr/local/bin/kubectl
-          fi
-
-          kubectl version --client=true
-
-      - name: Connect to EKS cluster
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          aws eks update-kubeconfig \
-            --region "${AWS_REGION}" \
-            --name "${EKS_CLUSTER_NAME}" \
-            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
-            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
-
-      - name: Generate the folder-driven canonical registry (expected state for the ConfigMap/SecretProviderClass comparison)
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
-
-          mkdir -p "work/generated/${GG_SELECTED_ENVIRONMENT}"
-          python3 automation/goldengate-deployment-model.py --environment "${GG_SELECTED_ENVIRONMENT}" registry --output "work/generated/${GG_SELECTED_ENVIRONMENT}/goldengate-deployments.yaml"
-
-      - name: Structural monitor acceptance (select the verified Ready pod)
-        id: structural
+      - name: Strict monitor acceptance (structural selection + bounded /healthz + /readyz + final acceptance)
+        id: strict
         shell: bash
         env:
+          AWS_ACCESS_KEY_ID: ${{ steps.aws_build_credentials.outputs.aws-access-key-id }}
+          AWS_SECRET_ACCESS_KEY: ${{ steps.aws_build_credentials.outputs.aws-secret-access-key }}
+          AWS_SESSION_TOKEN: ${{ steps.aws_build_credentials.outputs.aws-session-token }}
           GG_EXPECTED_IMAGE_REPOSITORY: ${{ needs.monitor_sync_once.outputs.image_repository }}
           GG_EXPECTED_IMAGE_TAG: ${{ needs.monitor_sync_once.outputs.image_tag }}
           GG_EXPECTED_CHART_VERSION: ${{ needs.monitor_sync_once.outputs.chart_version }}
@@ -1542,107 +1417,15 @@ jobs:
           python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
 
           # enable_cloudwatch_publication is always literally true in monitor_sync_once's own `with:` block -- mirrored here as the expected final value, never re-derived from a second source.
-          if ! CLASSIFIER_OUTPUT="$(python3 automation/orchestration/monitor_acceptance.py \
-              --environment "${GG_SELECTED_ENVIRONMENT}" \
-              --expected-image-repository "${GG_EXPECTED_IMAGE_REPOSITORY}" \
-              --expected-image-tag "${GG_EXPECTED_IMAGE_TAG}" \
-              --expected-chart-version "${GG_EXPECTED_CHART_VERSION}" \
-              --expected-cloudwatch-publish-enabled true \
-              --registry-file "work/generated/${GG_SELECTED_ENVIRONMENT}/goldengate-deployments.yaml")"; then
-            echo "FAIL: the GoldenGate monitor acceptance classifier could not evaluate the shared monitor (configuration or inspection error) -- see diagnostics above."
-            exit 1
-          fi
-
-          echo "$CLASSIFIER_OUTPUT"
-
-          STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
-          READY_POD_NAME="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["checks"].get("ready_pod_name") or "")' <<< "$CLASSIFIER_OUTPUT")"
-          echo "GoldenGate monitor structural acceptance state: ${STATE}"
-          echo "ready_pod_name=${READY_POD_NAME}" >> "$GITHUB_OUTPUT"
-
-          if [ "$STATE" != "HEALTHY" ]; then
-            echo "FAIL: GoldenGate monitor structural acceptance state is ${STATE}, expected HEALTHY. Never proceeding to /healthz or /readyz checks against an unverified/absent pod."
-            exit 1
-          fi
-
-      - name: Check /healthz and /readyz on the verified Ready pod (bounded, read-only)
-        id: health
-        shell: bash
-        env:
-          POD_NAME: ${{ steps.structural.outputs.ready_pod_name }}
-        run: |
-          set -euo pipefail
-
-          if [ -z "$POD_NAME" ]; then
-            echo "FAIL: no verified Ready pod name was returned by structural acceptance."
-            exit 1
-          fi
-
-          HEALTHZ_STATUS="$(kubectl exec "$POD_NAME" -n "${MONITOR_NAMESPACE}" -- python3 -c "
-          import urllib.request, urllib.error
-          try:
-              print(urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).status)
-          except urllib.error.HTTPError as exc:
-              print(exc.code)
-          except Exception:
-              print(0)
-          ")"
-          READYZ_STATUS="$(kubectl exec "$POD_NAME" -n "${MONITOR_NAMESPACE}" -- python3 -c "
-          import urllib.request, urllib.error
-          try:
-              print(urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=5).status)
-          except urllib.error.HTTPError as exc:
-              print(exc.code)
-          except Exception:
-              print(0)
-          ")"
-
-          echo "pod/${POD_NAME} /healthz -> ${HEALTHZ_STATUS}, /readyz -> ${READYZ_STATUS}"
-          echo "healthz_status=${HEALTHZ_STATUS}" >> "$GITHUB_OUTPUT"
-          echo "readyz_status=${READYZ_STATUS}" >> "$GITHUB_OUTPUT"
-
-      - name: Final monitor acceptance (structural + /healthz + /readyz)
-        id: final
-        shell: bash
-        env:
-          GG_EXPECTED_IMAGE_REPOSITORY: ${{ needs.monitor_sync_once.outputs.image_repository }}
-          GG_EXPECTED_IMAGE_TAG: ${{ needs.monitor_sync_once.outputs.image_tag }}
-          GG_EXPECTED_CHART_VERSION: ${{ needs.monitor_sync_once.outputs.chart_version }}
-          GG_HEALTHZ_STATUS: ${{ steps.health.outputs.healthz_status }}
-          GG_READYZ_STATUS: ${{ steps.health.outputs.readyz_status }}
-        run: |
-          set -euo pipefail
-
-          python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
-
-          if ! CLASSIFIER_OUTPUT="$(python3 automation/orchestration/monitor_acceptance.py \
-              --environment "${GG_SELECTED_ENVIRONMENT}" \
-              --expected-image-repository "${GG_EXPECTED_IMAGE_REPOSITORY}" \
-              --expected-image-tag "${GG_EXPECTED_IMAGE_TAG}" \
-              --expected-chart-version "${GG_EXPECTED_CHART_VERSION}" \
-              --expected-cloudwatch-publish-enabled true \
-              --registry-file "work/generated/${GG_SELECTED_ENVIRONMENT}/goldengate-deployments.yaml" \
-              --healthz-status "${GG_HEALTHZ_STATUS}" \
-              --readyz-status "${GG_READYZ_STATUS}")"; then
-            echo "FAIL: the GoldenGate monitor acceptance classifier could not evaluate the shared monitor on the final pass (configuration or inspection error) -- see diagnostics above."
-            exit 1
-          fi
-
-          echo "$CLASSIFIER_OUTPUT"
-
-          STATE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$CLASSIFIER_OUTPUT")"
-          echo "GoldenGate monitor final acceptance state: ${STATE}"
-          echo "state=${STATE}" >> "$GITHUB_OUTPUT"
-
-          if [ "$STATE" != "HEALTHY" ]; then
-            echo "FAIL: GoldenGate monitor final acceptance state is ${STATE}, expected HEALTHY. MAIN cannot claim the monitor is ready while it is not fully healthy (structural shape, canonical registry equality, /healthz, and /readyz all gate this)."
-            exit 1
-          fi
-
-          echo "OK: the shared GoldenGate monitor is HEALTHY (structural acceptance + /healthz + /readyz)."
+          python3 automation/phases/phase7/phase7_monitor.py strict-acceptance \
+            --environment "${GG_SELECTED_ENVIRONMENT}" \
+            --expected-image-repository "${GG_EXPECTED_IMAGE_REPOSITORY}" \
+            --expected-image-tag "${GG_EXPECTED_IMAGE_TAG}" \
+            --expected-chart-version "${GG_EXPECTED_CHART_VERSION}" \
+            --expected-cloudwatch-publish-enabled true
 
   replication_monitor_acceptance:
-    name: Replication-specific monitor acceptance (real process names, current, not ABENDED)
+    name: "Phase 7E | Validate Replication Monitor State"
 
     needs:
       - validate_model
@@ -1668,108 +1451,41 @@ jobs:
 
           python3 automation/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-region: ${{ env.AWS_REGION }}
-          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
-
-      - name: Connect to EKS cluster
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          aws eks update-kubeconfig \
-            --region "${AWS_REGION}" \
-            --name "${EKS_CLUSTER_NAME}" \
-            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
-            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
-
+      # Local canonical-deployment-model pipeline discovery ONLY -- no AWS/EKS/kubectl access here, so a zero-pipeline run never configures a credential, matching the established Phase 6 zero-pipeline credential-gating philosophy.
       - name: List enabled replication pipelines
         id: pipelines
         shell: bash
         run: |
           set -euo pipefail
 
-          PIPELINES="$(python3 automation/goldengate-deployment-model.py --environment "${GG_SELECTED_ENVIRONMENT}" replication-pipelines)"
-          if [ -z "$PIPELINES" ]; then
-            echo "has_pipelines=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_pipelines=true" >> "$GITHUB_OUTPUT"
-          fi
-          {
-            echo "pipelines<<REPL_MON_EOF"
-            echo "$PIPELINES"
-            echo "REPL_MON_EOF"
-          } >> "$GITHUB_OUTPUT"
+          python3 automation/phases/phase7/phase7_monitor.py list-replication-pipelines --environment "${GG_SELECTED_ENVIRONMENT}"
+
+      # AWS Credential Isolation: output-credentials/output-env-credentials scoping matches the established Phase 1/5/6 pattern -- gated on has_pipelines=true so a zero-pipeline run never configures a credential; these temporary credentials are consumed ONLY by the step below, never job-wide, never written to $GITHUB_ENV, never written to any state file.
+      - name: Configure AWS credentials
+        id: aws_build_credentials
+        if: steps.pipelines.outputs.has_pipelines == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
+          output-credentials: true
+          output-env-credentials: false
 
       - name: Verify replication process acceptance via the monitor API (read-only)
         if: steps.pipelines.outputs.has_pipelines == 'true'
         shell: bash
         env:
+          AWS_ACCESS_KEY_ID: ${{ steps.aws_build_credentials.outputs.aws-access-key-id }}
+          AWS_SECRET_ACCESS_KEY: ${{ steps.aws_build_credentials.outputs.aws-secret-access-key }}
+          AWS_SESSION_TOKEN: ${{ steps.aws_build_credentials.outputs.aws-session-token }}
           POD_NAME: ${{ needs.validate_monitor_ready.outputs.ready_pod_name }}
         run: |
           set -euo pipefail
 
           # Reuses the SAME ownership-chain-verified Ready pod validate_monitor_ready already selected and health-checked -- never a second, independent pod-selection here.
-          if [ -z "$POD_NAME" ]; then
-            echo "FAIL: no verified Ready gg-monitor pod name was provided by validate_monitor_ready."
-            exit 1
-          fi
-
-          kubectl exec "$POD_NAME" -n "${MONITOR_NAMESPACE}" -- \
-            python3 -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8080/api/processes', timeout=5).read().decode('utf-8'))" \
-            > /tmp/api-processes.json
-
-          while IFS= read -r pipeline_id; do
-            [ -z "$pipeline_id" ] && continue
-            echo "::group::Verifying ${pipeline_id}"
-
-            python3 automation/goldengate-deployment-model.py --environment "${GG_SELECTED_ENVIRONMENT}" replication-plan "$pipeline_id" > /tmp/plan.json
-
-            python3 - "$pipeline_id" <<'PYEOF'
-          import json, sys
-
-          pipeline_id = sys.argv[1]
-          with open("/tmp/plan.json") as f:
-              plan = json.load(f)
-          with open("/tmp/api-processes.json") as f:
-              api = json.load(f)
-
-          deployments = {d["deploymentName"]: d for d in api.get("deployments", [])}
-
-          def require_process(deployment_name, process_name, expect_running):
-              dep = deployments.get(deployment_name)
-              if dep is None:
-                  print(f"FAIL: {pipeline_id}: monitor has no entry for deployment {deployment_name}")
-                  sys.exit(1)
-              discovery = dep.get("processDiscovery") or {}
-              if discovery.get("status") != "OK":
-                  print(f"FAIL: {pipeline_id}: {deployment_name} processDiscovery.status is {discovery.get('status')!r}, expected OK")
-                  sys.exit(1)
-              rows = [p for p in dep.get("processes", []) if p.get("process") == process_name]
-              if not rows:
-                  print(f"FAIL: {pipeline_id}: {deployment_name} has no real process row named {process_name!r}")
-                  sys.exit(1)
-              row = rows[0]
-              if row.get("stale"):
-                  print(f"FAIL: {pipeline_id}: {deployment_name} process {process_name!r} is stale")
-                  sys.exit(1)
-              if row.get("status") == "ABENDED":
-                  print(f"FAIL: {pipeline_id}: {deployment_name} process {process_name!r} is ABENDED")
-                  sys.exit(1)
-              if expect_running and row.get("status") != "RUNNING":
-                  print(f"FAIL: {pipeline_id}: {deployment_name} process {process_name!r} expected RUNNING, found {row.get('status')!r}")
-                  sys.exit(1)
-              print(f"OK: {pipeline_id}: {deployment_name} process {process_name!r} status={row.get('status')} stale={row.get('stale')}")
-
-          require_process(plan["source"]["deploymentId"], plan["extract"]["name"], plan["extract"]["startOnCreate"])
-          require_process(plan["source"]["deploymentId"], plan["distribution"]["pathName"], plan["distribution"]["startOnCreate"])
-          require_process(plan["target"]["deploymentId"], plan["replicat"]["name"], plan["replicat"]["startOnCreate"])
-          print(f"OK: {pipeline_id}: all expected replication process rows are present, current, and not ABENDED")
-          PYEOF
-            echo "::endgroup::"
-          done <<< "${{ steps.pipelines.outputs.pipelines }}"
+          python3 automation/phases/phase7/phase7_monitor.py replication-monitor-acceptance \
+            --environment "${GG_SELECTED_ENVIRONMENT}" \
+            --pod-name "${POD_NAME}"
 
       - name: No replication pipeline enabled
         if: steps.pipelines.outputs.has_pipelines == 'false'
@@ -1778,7 +1494,7 @@ jobs:
           echo "No enabled replication pipeline -- clean no-op: replication-specific monitor acceptance skipped."
 
   end_to_end_deployment_acceptance:
-    name: Monitor-to-runtime end-to-end deployment acceptance (real deploy, active runtimes only)
+    name: "Phase 7F | End-to-End Runtime Acceptance"
 
     # Phase B3B: the final gate of the DEPLOY success contract -- fetches /api/processes through the SAME verified monitor pod validate_monitor_ready already selected and health-checked, then runs the offline/pure automation/orchestration/end_to_end_acceptance.py against it (deployment inventory equality, UP/fresh/lease/critical-service health, replication-aware process discovery, per-process stale/ABENDED safety). Polls boundedly (never a single instant check) since STATE# records may briefly read MISSING/STARTING immediately after a rollout. Real-deploy + active-runtime only; every job listed in `needs` below is required at .result == 'success' (strict, not merely "not failure") so this can never quietly evaluate against a partially-validated stack. GoldenGate Monitor MAIN DAG Skip-Propagation Correctness Fix: always() added for the SAME reason as monitor_ownership_preflight/validate_monitor_ready above -- this if: had no status-check function, so a legitimately-skipped OPTIONAL ancestor elsewhere in the graph (e.g. delete_removed_argocd_applications) could silently propagate a SKIP through validate_active_runtimes/replication_reconcile_once/validate_monitor_ready's own dependency edges into this job too, even though each of those direct prerequisites already tolerates that exact skip via its own always() and reports 'success'. Every .result == 'success' requirement below remains EXACT -- never relaxed to != 'failure'/!= 'cancelled' -- so a genuinely skipped mandatory prerequisite still blocks this job exactly as before.
     needs:
@@ -1809,69 +1525,34 @@ jobs:
 
           python3 automation/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
 
+      # AWS Credential Isolation: output-credentials/output-env-credentials scoping matches the established Phase 1/5/6 pattern -- these temporary credentials are consumed ONLY by the poll step below, never job-wide, never written to $GITHUB_ENV, never written to any state file.
       - name: Configure AWS credentials
+        id: aws_build_credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
           role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
-
-      - name: Connect to EKS cluster
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          aws eks update-kubeconfig \
-            --region "${AWS_REGION}" \
-            --name "${EKS_CLUSTER_NAME}" \
-            --role-arn "${EKS_DEPLOY_ROLE_ARN}" \
-            --assume-role-arn "${EKS_DEPLOY_ROLE_ARN}"
+          output-credentials: true
+          output-env-credentials: false
 
       - name: Poll monitor-to-runtime end-to-end acceptance until convergence (bounded)
         shell: bash
         env:
+          AWS_ACCESS_KEY_ID: ${{ steps.aws_build_credentials.outputs.aws-access-key-id }}
+          AWS_SECRET_ACCESS_KEY: ${{ steps.aws_build_credentials.outputs.aws-secret-access-key }}
+          AWS_SESSION_TOKEN: ${{ steps.aws_build_credentials.outputs.aws-session-token }}
           POD_NAME: ${{ needs.validate_monitor_ready.outputs.ready_pod_name }}
         run: |
-          set -uo pipefail
+          set -euo pipefail
+
           python3 -m pip install --disable-pip-version-check --quiet "PyYAML==6.0.1"
 
-          if [ -z "$POD_NAME" ]; then
-            echo "FAIL: no verified Ready gg-monitor pod name was provided by validate_monitor_ready."
-            exit 1
-          fi
-
-          # Bounded, matching the established startup/CONFIG-gate observation windows elsewhere in this workflow -- never a single instant check, never an unbounded retry.
-          TIMEOUT_SECONDS=600
-          INTERVAL_SECONDS=15
-          ELAPSED=0
-
-          while true; do
-            if kubectl exec "$POD_NAME" -n "${MONITOR_NAMESPACE}" -- \
-                python3 -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8080/api/processes', timeout=5).read().decode('utf-8'))" \
-                > /tmp/api-processes.json 2>/tmp/api-processes.err; then
-              if OUTPUT="$(python3 automation/orchestration/end_to_end_acceptance.py --environment "${GG_SELECTED_ENVIRONMENT}" --api-processes-file /tmp/api-processes.json 2>&1)"; then
-                echo "$OUTPUT"
-                echo "OK: GoldenGate monitor-to-runtime end-to-end acceptance is HEALTHY."
-                break
-              fi
-              echo "Not yet HEALTHY (elapsed ${ELAPSED}s / ${TIMEOUT_SECONDS}s):"
-              echo "$OUTPUT"
-            else
-              echo "Could not fetch /api/processes from pod ${POD_NAME} this iteration (elapsed ${ELAPSED}s / ${TIMEOUT_SECONDS}s); sanitized error:"
-              tail -c 500 /tmp/api-processes.err || true
-            fi
-
-            if [ "$ELAPSED" -ge "$TIMEOUT_SECONDS" ]; then
-              echo ""
-              echo "FAIL: timed out after ${TIMEOUT_SECONDS}s waiting for GoldenGate monitor-to-runtime end-to-end acceptance to become HEALTHY. This is never suppressed -- a persistent problem must surface as a failed workflow."
-              exit 1
-            fi
-
-            sleep "$INTERVAL_SECONDS"
-            ELAPSED=$((ELAPSED + INTERVAL_SECONDS))
-          done
+          python3 automation/phases/phase7/phase7_monitor.py end-to-end-acceptance \
+            --environment "${GG_SELECTED_ENVIRONMENT}" \
+            --pod-name "${POD_NAME}"
 
   final_validation:
-    name: Final validation
+    name: "Phase 7G | Final Validation"
 
     needs:
       - validate_model
@@ -1902,6 +1583,9 @@ jobs:
       GG_SELECTED_ENVIRONMENT: ${{ needs.validate_model.outputs.selected_environment }}
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Validate the mode-aware final DEPLOY success contract
         shell: bash
         env:
@@ -1930,159 +1614,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Resolved mode: effective_deploy=${EFFECTIVE_DEPLOY} has_active_deployments=${HAS_ACTIVE_DEPLOYMENTS} has_changes=${HAS_CHANGES} has_deletions=${HAS_DELETIONS}"
-
-          FAILED="false"
-
-          require_success() {
-            local job_name="$1"
-            local result_var="RESULT_${job_name}"
-            local result="${!result_var}"
-            if [ "$result" != "success" ]; then
-              echo "FAIL: required job '${job_name}' has result '${result}', expected 'success'. A SKIPPED (or failed/cancelled) REQUIRED gate must prevent MAIN from claiming deployment success."
-              FAILED="true"
-            else
-              echo "OK: required job '${job_name}' succeeded."
-            fi
-          }
-
-          allow_non_failure() {
-            local job_name="$1"
-            local result_var="RESULT_${job_name}"
-            local result="${!result_var}"
-            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
-              echo "FAIL: job '${job_name}' has result '${result}' -- this job is not required to run in the current resolved mode, but a real failure/cancellation must still block MAIN."
-              FAILED="true"
-            else
-              echo "OK: job '${job_name}' result '${result}' is acceptable in the current resolved mode (not a real failure/cancellation)."
-            fi
-          }
-
-          # Phase 1 (validate_model) now owns the ENTIRE mode-aware EKS/OIDC/Kubernetes-API prerequisite, local
-          # deployment/storage-safety, and AWS-side managed-EFS inventory contract internally -- a SKIPPED/failed/
-          # cancelled Phase 1 result is reported here directly, before any of its own canonical output values are
-          # trusted, so a genuine Phase 1 failure (whatever its internal root cause) is never masked behind a
-          # confusing empty-output literal-boolean message below. This is the mode-aware final gate's only
-          # dependency on Phase 1's own internal step results -- it is not Final Validation's job to reconstruct
-          # every internal Phase 1 step result.
-          require_success validate_model
-          if [ "$FAILED" = "true" ]; then
-            echo ""
-            echo "FAIL: Phase 1 | Validate Folder-Driven Deployment Model did not succeed -- see its own job diagnostics above. MAIN cannot claim deployment success."
-            exit 1
-          fi
-
-          # Every boolean mode/applicability output this gate branches on must be a literal 'true' or 'false' -- empty, null, or unexpected text means validate_model did not produce a usable outcome (already ruled out above), or produced one this gate cannot resolve which branch of the contract applies for.
-          if [ "$EFFECTIVE_DEPLOY" != "true" ] && [ "$EFFECTIVE_DEPLOY" != "false" ]; then
-            echo "FAIL: validate_model.outputs.effective_deploy is '${EFFECTIVE_DEPLOY}', expected literal 'true' or 'false'."
-            exit 1
-          fi
-
-          if [ "$HAS_ACTIVE_DEPLOYMENTS" != "true" ] && [ "$HAS_ACTIVE_DEPLOYMENTS" != "false" ]; then
-            echo "FAIL: validate_model.outputs.has_active_deployments is '${HAS_ACTIVE_DEPLOYMENTS}', expected literal 'true' or 'false' -- MAIN cannot resolve which active-runtime branch of the mode-aware contract applies."
-            exit 1
-          fi
-
-          if [ "$HAS_CHANGES" != "true" ] && [ "$HAS_CHANGES" != "false" ]; then
-            echo "FAIL: validate_model.outputs.has_changes is '${HAS_CHANGES}', expected literal 'true' or 'false' -- MAIN cannot resolve which selected-mutation branch of the final contract applies."
-            exit 1
-          fi
-
-          if [ "$HAS_DELETIONS" != "true" ] && [ "$HAS_DELETIONS" != "false" ]; then
-            echo "FAIL: validate_model.outputs.has_deletions is '${HAS_DELETIONS}', expected literal 'true' or 'false' -- MAIN cannot resolve which selected-deletion branch of the final contract applies."
-            exit 1
-          fi
-
-          # Foundational -- required in every mode.
-          require_success validate_shared_secrets_once
-
-          # Mutation-aware contract: applicability of the selected-deployment build/reconcile, ownership preflight, and deletion stages is already known from validate_model's own outputs -- never inferred only from other jobs' transitive downstream behavior. has_changes/has_deletions are orthogonal to the effective_deploy/has_active_deployments mode contract below.
-          if [ "$HAS_CHANGES" = "true" ]; then
-            echo "SELECTED MUTATION: has_changes=true -- the selected-deployment build/reconcile stage is unconditionally required (real deploy: runtime reconciliation; deploy=false: Helm lint/render validation)."
-            require_success build_publish_and_deploy
-            if [ "$EFFECTIVE_DEPLOY" = "true" ]; then
-              require_success runtime_ownership_preflight
-            else
-              # runtime_ownership_preflight's own if: never runs it on deploy=false regardless of has_changes -- a real deploy=false Helm lint/render run legitimately skips it.
-              allow_non_failure runtime_ownership_preflight
-            fi
-          else
-            echo "NO SELECTED MUTATION: has_changes=false -- the selected-deployment build/reconcile and ownership preflight stages are legitimately not applicable and may be cleanly skipped, but a real failure/cancellation still blocks MAIN."
-            allow_non_failure runtime_ownership_preflight
-            allow_non_failure build_publish_and_deploy
-          fi
-
-          if [ "$HAS_DELETIONS" = "true" ]; then
-            echo "SELECTED DELETION: has_deletions=true -- the removed-Application deletion stage is unconditionally required."
-            require_success delete_removed_argocd_applications
-          else
-            allow_non_failure delete_removed_argocd_applications
-          fi
-
-          if [ "$EFFECTIVE_DEPLOY" = "true" ]; then
-            echo "REAL DEPLOY: Terraform, Argo CD / Platform / Observability readiness are unconditionally required."
-            require_success terraform_sync_once
-            require_success validate_argocd_ready
-            require_success validate_platform_ready
-            require_success validate_observability_ready
-
-            if [ "$HAS_ACTIVE_DEPLOYMENTS" = "true" ]; then
-              echo "REAL DEPLOY + ACTIVE RUNTIMES: the full runtime/replication/monitor/E2E acceptance chain is unconditionally required -- a SKIPPED value for any of these must fail this gate, not merely pass through as 'not a failure'."
-              require_success validate_active_runtimes
-              require_success replication_reconcile_once
-              require_success monitor_ownership_preflight
-              require_success monitor_sync_once
-              require_success validate_monitor_ready
-              require_success replication_monitor_acceptance
-              require_success end_to_end_deployment_acceptance
-            else
-              echo "REAL DEPLOY + NO ACTIVE RUNTIMES: the runtime/replication/monitor/E2E acceptance chain is legitimately not applicable and may be cleanly skipped -- only a real failure/cancellation blocks MAIN."
-              allow_non_failure validate_active_runtimes
-              allow_non_failure replication_reconcile_once
-              allow_non_failure monitor_ownership_preflight
-              allow_non_failure monitor_sync_once
-              allow_non_failure validate_monitor_ready
-              allow_non_failure replication_monitor_acceptance
-              allow_non_failure end_to_end_deployment_acceptance
-            fi
-          else
-            echo "DRY RUN: live EKS/OIDC/Kubernetes-API prerequisite, Terraform, live EFS inventory, and Argo CD / Platform / Observability / runtime / monitor deployment gates are legitimately skipped -- the existing dry-run validation path governs success instead."
-            allow_non_failure terraform_sync_once
-            allow_non_failure validate_argocd_ready
-            allow_non_failure validate_platform_ready
-            allow_non_failure validate_observability_ready
-            allow_non_failure validate_active_runtimes
-            allow_non_failure replication_reconcile_once
-            allow_non_failure monitor_ownership_preflight
-            allow_non_failure monitor_sync_once
-            allow_non_failure validate_monitor_ready
-            allow_non_failure replication_monitor_acceptance
-            allow_non_failure end_to_end_deployment_acceptance
-
-            # Replication dry-run validates the global replication schema/pipeline model and must succeed even with zero active runtimes -- unconditionally required for every dry run.
-            require_success replication_dry_run_validation
-
-            if [ "$HAS_ACTIVE_DEPLOYMENTS" = "true" ]; then
-              echo "DRY RUN + ACTIVE RUNTIMES: monitor_dry_run_validation's own if: condition makes it applicable -- a SKIPPED value here must fail this gate, not merely pass through as 'not a failure'."
-              require_success monitor_dry_run_validation
-            else
-              # monitor_dry_run_validation's own if: condition never runs it against a deliberately empty active-runtime registry -- a real failure/cancellation (should it somehow still run) must still block MAIN.
-              echo "DRY RUN + NO ACTIVE RUNTIMES: monitor_dry_run_validation is legitimately not applicable and may be cleanly skipped."
-              allow_non_failure monitor_dry_run_validation
-            fi
-          fi
-
-          if [ "$FAILED" = "true" ]; then
-            echo ""
-            echo "FAIL: the mode-aware final DEPLOY success contract was not satisfied -- see diagnostics above. MAIN cannot claim deployment success."
-            exit 1
-          fi
-
-          echo ""
-          echo "OK: every REQUIRED gate for the resolved mode (effective_deploy=${EFFECTIVE_DEPLOY}, has_active_deployments=${HAS_ACTIVE_DEPLOYMENTS}) succeeded."
-
-      - name: Checkout repository
-        uses: actions/checkout@v4
+          # GitHub's needs.*.result/needs.*.outputs.* expressions are resolved into plain env: values ABOVE, at YAML-evaluation time -- phase7_final.py itself is never aware of `${{ ... }}` syntax, it only ever reads plain os.environ strings.
+          python3 automation/phases/phase7/phase7_final.py validate
 
       - name: Re-validate the folder-driven deployment model after rollout
         shell: bash
