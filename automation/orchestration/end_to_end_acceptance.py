@@ -42,6 +42,16 @@ STATE_BROKEN = "BROKEN"
 _NON_REPLICATION_ALLOWED_DISCOVERY_STATUSES = (None, "EMPTY", "OK")
 
 
+def _describe_malformed_value(value, max_repr_len=48):
+    """Bounded, non-dumping diagnostic description of a possibly-malformed API value: 'TypeName=repr' for a short scalar (str/int/float/bool/None), or just 'TypeName' for any container or oversized scalar -- a malformed field can never inject a large/raw payload into acceptance diagnostics."""
+    type_name = type(value).__name__
+    if value is None or isinstance(value, (str, int, float, bool)):
+        text = repr(value)
+        if len(text) <= max_repr_len:
+            return f"{type_name}={text}"
+    return type_name
+
+
 def classify(environment, active_deployments, api_processes_doc):
     """Returns the stable {"state", "environment", "reasons", "checks"} shape (state is HEALTHY or BROKEN only). Pure function: no I/O, no Kubernetes/AWS access -- everything it needs is already in its arguments."""
     reasons = []
@@ -130,24 +140,57 @@ def classify(environment, active_deployments, api_processes_doc):
 
         replication_enabled = bool(expected.get("replicationEnabled"))
         process_discovery = entry.get("processDiscovery")
-        discovery_status = process_discovery.get("status") if isinstance(process_discovery, dict) else None
-        if replication_enabled:
-            # The existing replication_monitor_acceptance job remains authoritative for exact expected process names/startOnCreate -- this only proves discovery itself succeeded.
-            if discovery_status != "OK":
-                reasons.append(f"deployment {name!r}: participates in enabled replication but processDiscovery.status={discovery_status!r}, expected 'OK'")
+        # The monitor API contract (normalize_process_discovery()) only ever emits null or an object -- a non-dict, non-null value (a string/list/number/bool) is itself a malformed-schema condition and must never be silently coerced into "absent" (None), or a malformed value would be indistinguishable from a legitimately absent discovery result for a replication-disabled deployment.
+        discovery_shape_valid = process_discovery is None or isinstance(process_discovery, dict)
+        if not discovery_shape_valid:
+            reasons.append(f"deployment {name!r}: processDiscovery must be null or an object per the monitor API contract, got {_describe_malformed_value(process_discovery)}")
         else:
-            if discovery_status not in _NON_REPLICATION_ALLOWED_DISCOVERY_STATUSES:
-                reasons.append(f"deployment {name!r}: replication is not enabled but processDiscovery.status={discovery_status!r}, expected EMPTY, OK, or absent (an empty process list is valid when no replication process is desired)")
+            discovery_status = process_discovery.get("status") if isinstance(process_discovery, dict) else None
+            if replication_enabled:
+                # The existing replication_monitor_acceptance job remains authoritative for exact expected process names/startOnCreate -- this only proves discovery itself succeeded.
+                if discovery_status != "OK":
+                    reasons.append(f"deployment {name!r}: participates in enabled replication but processDiscovery.status={discovery_status!r}, expected 'OK'")
+            else:
+                if discovery_status not in _NON_REPLICATION_ALLOWED_DISCOVERY_STATUSES:
+                    reasons.append(f"deployment {name!r}: replication is not enabled but processDiscovery.status={discovery_status!r}, expected EMPTY, OK, or absent (an empty process list is valid when no replication process is desired)")
 
-        for row in (entry.get("processes") or []):
+        # monitor.py's read_deployment_processes_view() always emits an actual JSON array for "processes" (possibly empty) -- `entry.get("processes") or []` previously coerced ANY falsey malformed value ({}, "", 0, false) into a legitimate empty list, and a missing key was treated identically. The current API always includes this key, so a missing key is malformed too, never a silent default.
+        processes_present = "processes" in entry
+        processes_raw = entry.get("processes") if processes_present else None
+        if not isinstance(processes_raw, list):
+            if not processes_present:
+                reasons.append(f"deployment {name!r}: /api/processes response is missing the required 'processes' field (expected a JSON array per the monitor API contract)")
+            else:
+                reasons.append(f"deployment {name!r}: processes must be a JSON array per the monitor API contract, got {_describe_malformed_value(processes_raw)}")
+            process_rows = []
+        else:
+            process_rows = processes_raw
+
+        for row_index, row in enumerate(process_rows):
             if not isinstance(row, dict):
-                reasons.append(f"deployment {name!r}: a process row is not an object")
+                reasons.append(f"deployment {name!r}: process row #{row_index} is not an object (got {_describe_malformed_value(row)})")
                 continue
-            process_name = row.get("process", "?")
-            if row.get("stale") is True:
-                reasons.append(f"deployment {name!r} process {process_name!r}: stale=true")
-            if row.get("status") == "ABENDED":
-                reasons.append(f"deployment {name!r} process {process_name!r}: status=ABENDED")
+
+            raw_process_name = row.get("process")
+            if isinstance(raw_process_name, str) and raw_process_name != "":
+                process_label = raw_process_name
+            else:
+                process_label = f"#{row_index}"
+                reasons.append(f"deployment {name!r}: process row #{row_index} has an invalid 'process' identity (expected a non-empty string, got {_describe_malformed_value(raw_process_name)})")
+
+            # The normalized monitor contract supplies a literal Boolean -- truthiness is never used here, so a missing/null/string/integer stale field is its own malformed-schema condition rather than being silently evaluated as falsey (not stale).
+            stale = row.get("stale")
+            if isinstance(stale, bool):
+                if stale is True:
+                    reasons.append(f"deployment {name!r} process {process_label!r}: stale=true")
+            else:
+                reasons.append(f"deployment {name!r} process {process_label!r}: stale is not a boolean per the monitor API contract (got {_describe_malformed_value(stale)})")
+
+            status = row.get("status")
+            if not isinstance(status, str) or status == "":
+                reasons.append(f"deployment {name!r} process {process_label!r}: status is not a non-empty string per the monitor API contract (got {_describe_malformed_value(status)})")
+            elif status == "ABENDED":
+                reasons.append(f"deployment {name!r} process {process_label!r}: status=ABENDED")
 
     state = STATE_BROKEN if reasons else STATE_HEALTHY
     return {"state": state, "environment": environment, "reasons": reasons, "checks": checks}

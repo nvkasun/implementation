@@ -341,6 +341,177 @@ class EndToEndAcceptanceTests(unittest.TestCase):
             gdm._run_full_validation = original
 
 
+class MalformedSchemaFailClosedTests(unittest.TestCase):
+    """Pre-VDR correction: automation/orchestration/end_to_end_acceptance.py previously fail-opened on malformed monitor API schema -- a non-dict processDiscovery silently became None, a non-list/falsey processes container silently became [], and an empty/malformed process row added no failure reason at all. These tests exercise the REAL classify() against the exact independently-reproduced malformed payload and its schema-validation edges -- never a re-implementation/mock of the classifier's own logic."""
+
+    def _active_non_replication_deployments(self):
+        return _active_deployments(source_replication=False, target_replication=False)
+
+    # A. Exact reproduction: the independent review's exact malformed payload against the current two real replication-disabled active deployments must be BROKEN, never HEALTHY.
+    def test_A_exact_reproduction_payload_is_broken_not_healthy(self):
+        doc = {
+            "generatedAt": 1_700_000_100,
+            "deployments": [
+                {
+                    "deploymentName": SOURCE_ID,
+                    "deploymentType": "postgresql",
+                    "enabled": True,
+                    "effectiveStatus": "UP",
+                    "ageSeconds": 5,
+                    "fresh": True,
+                    "lease": {"holder": "gg-monitor-x", "fresh": True},
+                    "criticalServices": {"admin": True},
+                    "processDiscovery": "MALFORMED-DISCOVERY",
+                    "processes": {},
+                },
+                {
+                    "deploymentName": TARGET_ID,
+                    "deploymentType": "mssql",
+                    "enabled": True,
+                    "effectiveStatus": "UP",
+                    "ageSeconds": 5,
+                    "fresh": True,
+                    "lease": {"holder": "gg-monitor-x", "fresh": True},
+                    "criticalServices": {"admin": True},
+                    "processDiscovery": None,
+                    "processes": [{}],
+                },
+            ],
+        }
+        result = e2e.classify(ENVIRONMENT, self._active_non_replication_deployments(), doc)
+        self.assertEqual(result["state"], e2e.STATE_BROKEN, "malformed monitor API payload must never be accepted as HEALTHY")
+        self.assertNotEqual(result["reasons"], [])
+
+    # B. malformed processDiscovery (a non-dict, non-null value) must never be silently coerced into "absent".
+    def test_B_malformed_process_discovery_is_broken(self):
+        for bad_value in ("BAD", [], 123, True):
+            with self.subTest(bad_value=bad_value):
+                doc = _healthy_api_doc()
+                doc["deployments"][0]["processDiscovery"] = bad_value
+                result = e2e.classify(ENVIRONMENT, self._active_non_replication_deployments(), doc)
+                _assert_broken(self, result, "processDiscovery must be null or an object")
+
+    # C. a legitimately absent processDiscovery (None) for a replication-disabled deployment remains HEALTHY when everything else is healthy.
+    def test_C_legitimate_process_discovery_none_remains_healthy(self):
+        active = self._active_non_replication_deployments()
+        doc = _healthy_api_doc()
+        doc["deployments"][0]["processDiscovery"] = None
+        doc["deployments"][1]["processDiscovery"] = None
+        result = e2e.classify(ENVIRONMENT, active, doc)
+        self.assertEqual(result["state"], e2e.STATE_HEALTHY, result["reasons"])
+
+    # D. malformed/falsey processes containers must never be silently coerced into [].
+    def test_D_malformed_processes_container_is_broken(self):
+        for bad_value in ({}, "", 0, False, None):
+            with self.subTest(bad_value=bad_value):
+                doc = _healthy_api_doc()
+                doc["deployments"][0]["processes"] = bad_value
+                result = e2e.classify(ENVIRONMENT, _active_deployments(), doc)
+                _assert_broken(self, result, "processes must be a JSON array")
+
+    # D2. a MISSING 'processes' key (the current monitor API always includes it) is malformed too, never a silent empty default.
+    def test_D2_missing_processes_key_is_broken(self):
+        doc = _healthy_api_doc()
+        del doc["deployments"][0]["processes"]
+        result = e2e.classify(ENVIRONMENT, _active_deployments(), doc)
+        _assert_broken(self, result, "missing the required 'processes' field")
+
+    # E. an actual empty process list remains valid.
+    def test_E_actual_empty_process_list_is_healthy(self):
+        doc = _healthy_api_doc()
+        doc["deployments"][0]["processes"] = []
+        result = e2e.classify(ENVIRONMENT, _active_deployments(), doc)
+        self.assertEqual(result["state"], e2e.STATE_HEALTHY, result["reasons"])
+
+    # F. every non-object process row must be its own BROKEN condition, never silently discarded.
+    def test_F_non_object_process_rows_are_broken(self):
+        for bad_row in (None, "BAD", [], 123, True):
+            with self.subTest(bad_row=bad_row):
+                doc = _healthy_api_doc()
+                doc["deployments"][0]["processes"] = [bad_row]
+                result = e2e.classify(ENVIRONMENT, _active_deployments(), doc)
+                _assert_broken(self, result, "process row #0 is not an object")
+
+    # G. every process row must carry a non-empty string process identity.
+    def test_G_missing_or_malformed_process_identity_is_broken(self):
+        bad_rows = (
+            {},
+            {"process": ""},
+            {"process": 123, "status": "RUNNING", "stale": False},
+            {"process": None, "status": "RUNNING", "stale": False},
+        )
+        for bad_row in bad_rows:
+            with self.subTest(bad_row=bad_row):
+                doc = _healthy_api_doc()
+                doc["deployments"][0]["processes"] = [bad_row]
+                result = e2e.classify(ENVIRONMENT, _active_deployments(), doc)
+                _assert_broken(self, result, "invalid 'process' identity")
+
+    # H. stale must be a literal Boolean -- missing/non-Boolean values are malformed, never silently treated as falsey/not-stale.
+    def test_H_malformed_stale_field_is_broken(self):
+        for bad_stale in (None, "true", 1, "false", 0):
+            with self.subTest(bad_stale=bad_stale):
+                doc = _healthy_api_doc()
+                doc["deployments"][0]["processes"] = [{"process": "EXT01", "status": "RUNNING", "stale": bad_stale}]
+                result = e2e.classify(ENVIRONMENT, _active_deployments(), doc)
+                _assert_broken(self, result, "stale is not a boolean")
+
+    # H (continued). stale=true remains BROKEN (existing rule preserved); stale=false triggers normal evaluation (existing rule preserved).
+    def test_H_stale_true_still_broken(self):
+        doc = _healthy_api_doc()
+        doc["deployments"][0]["processes"] = [{"process": "EXT01", "status": "RUNNING", "stale": True}]
+        result = e2e.classify(ENVIRONMENT, _active_deployments(), doc)
+        _assert_broken(self, result, "stale=true")
+
+    def test_H_stale_false_triggers_normal_evaluation(self):
+        doc = _healthy_api_doc()
+        doc["deployments"][0]["processes"] = [{"process": "EXT01", "status": "RUNNING", "stale": False}]
+        result = e2e.classify(ENVIRONMENT, _active_deployments(), doc)
+        self.assertEqual(result["state"], e2e.STATE_HEALTHY, result["reasons"])
+
+    # I. status must be a non-empty string -- missing/null/non-string/empty values are malformed.
+    def test_I_malformed_status_field_is_broken(self):
+        for bad_status in (None, 123, "", True, [1, 2]):
+            with self.subTest(bad_status=bad_status):
+                doc = _healthy_api_doc()
+                doc["deployments"][0]["processes"] = [{"process": "EXT01", "stale": False, "status": bad_status}]
+                result = e2e.classify(ENVIRONMENT, _active_deployments(), doc)
+                _assert_broken(self, result, "status is not a non-empty string")
+
+    # I (continued). status=ABENDED remains BROKEN; status=RUNNING/STOPPED (not stale) remain the existing generic accepted states -- this correction is schema validation, not a change to GoldenGate process business semantics.
+    def test_I_status_abended_still_broken(self):
+        doc = _healthy_api_doc()
+        doc["deployments"][0]["processes"] = [{"process": "EXT01", "status": "ABENDED", "stale": False}]
+        result = e2e.classify(ENVIRONMENT, _active_deployments(), doc)
+        _assert_broken(self, result, "status=ABENDED")
+
+    def test_I_status_running_not_stale_remains_healthy(self):
+        doc = _healthy_api_doc()
+        doc["deployments"][0]["processes"] = [{"process": "EXT01", "status": "RUNNING", "stale": False}]
+        result = e2e.classify(ENVIRONMENT, _active_deployments(), doc)
+        self.assertEqual(result["state"], e2e.STATE_HEALTHY, result["reasons"])
+
+    def test_I_status_stopped_not_stale_remains_healthy(self):
+        doc = _healthy_api_doc()
+        doc["deployments"][0]["processes"] = [{"process": "EXT01", "status": "STOPPED", "stale": False}]
+        result = e2e.classify(ENVIRONMENT, _active_deployments(), doc)
+        self.assertEqual(result["state"], e2e.STATE_HEALTHY, result["reasons"])
+
+    # J. existing normal healthy payloads (both replication-enabled and replication-disabled) must remain HEALTHY -- positive control proving this correction is schema validation, not a new false positive.
+    def test_J_existing_healthy_payload_remains_healthy(self):
+        result = e2e.classify(ENVIRONMENT, _active_deployments(), _healthy_api_doc())
+        self.assertEqual(result["state"], e2e.STATE_HEALTHY, result["reasons"])
+
+    def test_J_existing_healthy_non_replication_payload_remains_healthy(self):
+        active = self._active_non_replication_deployments()
+        doc = _healthy_api_doc()
+        doc["deployments"][0]["processDiscovery"] = None
+        doc["deployments"][1]["processDiscovery"] = None
+        doc["deployments"][0]["processes"] = [{"process": "EXT01", "status": "RUNNING", "stale": False}]
+        result = e2e.classify(ENVIRONMENT, active, doc)
+        self.assertEqual(result["state"], e2e.STATE_HEALTHY, result["reasons"])
+
+
 class EndToEndAcceptanceNoIOTests(unittest.TestCase):
     """Static source-safety proof: classify() itself never performs I/O, network access, or a mutating/kubectl/helm call -- this tool is offline/pure by construction."""
 

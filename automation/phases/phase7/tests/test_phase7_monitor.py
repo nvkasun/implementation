@@ -926,6 +926,56 @@ class EndToEndAcceptanceTests(unittest.TestCase):
         self.assertEqual(sleep_mock.call_count, 2)
 
 
+class EndToEndAcceptanceRealClassifierIntegrationTests(unittest.TestCase):
+    """Pre-VDR correction integration proof: unlike every other test in this file, `run` here is the REAL phase7_monitor.run (not a ScriptedRun fake), so cmd_end_to_end_acceptance()'s subprocess call to automation/orchestration/end_to_end_acceptance.py actually executes the REAL, unmodified classifier against the REAL current folder-driven active-deployment model -- only _connect_to_eks (no real AWS) and _try_fetch_api_processes (no real kubectl) are mocked, so this remains fully offline. This deliberately does NOT re-implement any of the classifier's own schema-validation rules -- it only proves the wiring: a genuine classifier non-zero/BROKEN result can never be reported/returned as HEALTHY by cmd_end_to_end_acceptance()."""
+
+    # Same malformed shape as automation/phases/phase7/tests/test_end_to_end_acceptance.py's exact-reproduction test, fed straight to the REAL classifier subprocess via a mocked _try_fetch_api_processes (never a fake classifier response).
+    _MALFORMED_API_PROCESSES_DOC = {
+        "generatedAt": 1_700_000_100,
+        "deployments": [
+            {
+                "deploymentName": "gg-postgresql-repltest-01",
+                "deploymentType": "postgresql",
+                "enabled": True,
+                "effectiveStatus": "UP",
+                "ageSeconds": 5,
+                "fresh": True,
+                "lease": {"holder": "gg-monitor-x", "fresh": True},
+                "criticalServices": {"admin": True},
+                "processDiscovery": "MALFORMED-DISCOVERY",
+                "processes": {},
+            },
+            {
+                "deploymentName": "gg-mssql-repltest-01",
+                "deploymentType": "mssql",
+                "enabled": True,
+                "effectiveStatus": "UP",
+                "ageSeconds": 5,
+                "fresh": True,
+                "lease": {"holder": "gg-monitor-x", "fresh": True},
+                "criticalServices": {"admin": True},
+                "processDiscovery": None,
+                "processes": [{}],
+            },
+        ],
+    }
+
+    def test_real_classifier_broken_result_can_never_be_reported_healthy(self):
+        fake_fetch = lambda pod_name, namespace, timeout_seconds=5: (True, self._MALFORMED_API_PROCESSES_DOC)
+        args = argparse_namespace(environment=ENVIRONMENT, pod_name="gg-monitor-x", timeout_seconds=1, interval_seconds=1)
+        captured = io.StringIO()
+        with _env_patch(), mock.patch.object(phase7_monitor, "_connect_to_eks", mock.Mock()), \
+                mock.patch.object(phase7_monitor, "_try_fetch_api_processes", fake_fetch), \
+                mock.patch.object(phase7_monitor.time, "sleep"), \
+                redirect_stdout(captured):
+            with self.assertRaises(phase7_monitor.Phase7MonitorError):
+                phase7_monitor.cmd_end_to_end_acceptance(args)
+        output = captured.getvalue()
+        self.assertNotIn("OK: GoldenGate monitor-to-runtime end-to-end acceptance is HEALTHY.", output)
+        # Proves the REAL classifier genuinely ran (never mocked) and genuinely returned BROKEN.
+        self.assertIn('"state": "BROKEN"', output)
+
+
 class SanitizedDiagnosticTests(unittest.TestCase):
     """Failure diagnostics never blindly re-emit unbounded raw kubectl stderr -- bounded to the last N characters via _sanitize_tail()."""
 
