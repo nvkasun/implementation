@@ -272,21 +272,49 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Fail-closed repository-existence classification: only an explicit RepositoryNotFoundException on describe-repositories authorizes create-repository -- AccessDeniedException/ExpiredTokenException/throttling/network-or-service errors/any other unclassified describe failure must never be treated as "repository absent" (matches the approved Phase 3/Phase 5 Python fail-closed contract). Stderr is captured to an inert text file for classification, never suppressed with 2>/dev/null, never treated as shell source.
           if aws ecr describe-repositories \
             --region "$AWS_REGION" \
-            --repository-names "$MONITOR_ECR_REPOSITORY" >/dev/null 2>&1; then
+            --repository-names "$MONITOR_ECR_REPOSITORY" >/dev/null 2>/tmp/monitor-ecr-describe-error.txt; then
             echo "ECR repository already exists: ${MONITOR_ECR_REPOSITORY}. Not changing its tag mutability."
           else
+            if ! grep -q "RepositoryNotFoundException" /tmp/monitor-ecr-describe-error.txt; then
+              echo "FAIL: could not determine whether ECR repository ${MONITOR_ECR_REPOSITORY} exists -- aws ecr describe-repositories did not return a confirmed RepositoryNotFoundException, so repository creation is refused. Diagnostic (describe-repositories stderr):"
+              cat /tmp/monitor-ecr-describe-error.txt
+              echo ""
+              echo "The workflow role (${RUNNER_ROLE_ARN}) must have ecr:DescribeRepositories on ${MONITOR_ECR_REPOSITORY}, or a transient AWS error occurred. Investigate and re-run; an inconclusive describe result is never treated as repository absence."
+              exit 1
+            fi
+
             echo "Creating ECR repository: ${MONITOR_ECR_REPOSITORY}"
 
-            aws ecr create-repository \
+            if aws ecr create-repository \
               --region "$AWS_REGION" \
               --repository-name "$MONITOR_ECR_REPOSITORY" \
               --tags Key=ApplicationName,Value=CloudFactory Key=DataClassification,Value=General Key=BusinessCriticality,Value=Low Key=BusinessUnit,Value=TechnologyPlatform Key=CostCenter,Value=219 \
               --image-scanning-configuration scanOnPush=true \
-              --image-tag-mutability IMMUTABLE >/dev/null
+              --image-tag-mutability IMMUTABLE >/dev/null 2>/tmp/monitor-ecr-create-error.txt; then
+              echo "Created ECR repository: ${MONITOR_ECR_REPOSITORY} (IMMUTABLE tags, scanOnPush=true)"
+            else
+              if ! grep -q "RepositoryAlreadyExistsException" /tmp/monitor-ecr-create-error.txt; then
+                echo "FAIL: aws ecr create-repository for ${MONITOR_ECR_REPOSITORY} failed:"
+                cat /tmp/monitor-ecr-create-error.txt
+                exit 1
+              fi
 
-            echo "Created ECR repository: ${MONITOR_ECR_REPOSITORY} (IMMUTABLE tags, scanOnPush=true)"
+              # Legitimate create race: our own describe-repositories above returned a confirmed RepositoryNotFoundException, but another actor created the repository before our create-repository call landed. Tolerated ONLY after a FRESH describe-repositories call proves the repository now genuinely exists -- never on the RepositoryAlreadyExistsException text alone.
+              echo "ECR repository ${MONITOR_ECR_REPOSITORY} was created by another actor between the existence check and this creation attempt (RepositoryAlreadyExistsException); confirming it now exists..."
+
+              if aws ecr describe-repositories \
+                --region "$AWS_REGION" \
+                --repository-names "$MONITOR_ECR_REPOSITORY" >/dev/null 2>/tmp/monitor-ecr-describe-race-error.txt; then
+                echo "Confirmed: ECR repository ${MONITOR_ECR_REPOSITORY} now exists (created concurrently by another actor)."
+              else
+                echo "FAIL: ECR repository ${MONITOR_ECR_REPOSITORY} creation raced with RepositoryAlreadyExistsException, but a fresh describe-repositories call could not confirm the repository exists. Diagnostic (describe-repositories stderr):"
+                cat /tmp/monitor-ecr-describe-race-error.txt
+                exit 1
+              fi
+            fi
           fi
 
       - name: Ensure monitor ECR repository policy allows EKS workload account pull
@@ -692,21 +720,47 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Fail-closed repository-existence classification: only an explicit RepositoryNotFoundException on describe-repositories authorizes create-repository -- AccessDeniedException/ExpiredTokenException/throttling/network-or-service errors/any other unclassified describe failure must never be treated as "repository absent" (matches the approved Phase 3/Phase 5 Python fail-closed contract). Stderr is captured to an inert text file for classification, never suppressed with 2>/dev/null, never treated as shell source.
           if aws ecr describe-repositories \
             --region "$AWS_REGION" \
-            --repository-names "$HELM_ECR_REPOSITORY" >/dev/null 2>&1; then
+            --repository-names "$HELM_ECR_REPOSITORY" >/dev/null 2>/tmp/monitor-helm-ecr-describe-error.txt; then
             echo "ECR repository already exists: $HELM_ECR_REPOSITORY"
           else
+            if ! grep -q "RepositoryNotFoundException" /tmp/monitor-helm-ecr-describe-error.txt; then
+              echo "FAIL: could not determine whether ECR repository ${HELM_ECR_REPOSITORY} exists -- aws ecr describe-repositories did not return a confirmed RepositoryNotFoundException, so repository creation is refused. Diagnostic (describe-repositories stderr):"
+              cat /tmp/monitor-helm-ecr-describe-error.txt
+              exit 1
+            fi
+
             echo "Creating ECR repository: $HELM_ECR_REPOSITORY"
 
-            aws ecr create-repository \
+            if aws ecr create-repository \
               --region "$AWS_REGION" \
               --repository-name "$HELM_ECR_REPOSITORY" \
               --tags Key=ApplicationName,Value=CloudFactory Key=DataClassification,Value=General Key=BusinessCriticality,Value=Low Key=BusinessUnit,Value=TechnologyPlatform Key=CostCenter,Value=219 \
               --image-scanning-configuration scanOnPush=true \
-              --image-tag-mutability MUTABLE >/dev/null
+              --image-tag-mutability MUTABLE >/dev/null 2>/tmp/monitor-helm-ecr-create-error.txt; then
+              echo "Created ECR repository: $HELM_ECR_REPOSITORY"
+            else
+              if ! grep -q "RepositoryAlreadyExistsException" /tmp/monitor-helm-ecr-create-error.txt; then
+                echo "FAIL: aws ecr create-repository for ${HELM_ECR_REPOSITORY} failed:"
+                cat /tmp/monitor-helm-ecr-create-error.txt
+                exit 1
+              fi
 
-            echo "Created ECR repository: $HELM_ECR_REPOSITORY"
+              # Legitimate create race: our own describe-repositories above returned a confirmed RepositoryNotFoundException, but another actor created the repository before our create-repository call landed. Tolerated ONLY after a FRESH describe-repositories call proves the repository now genuinely exists -- never on the RepositoryAlreadyExistsException text alone.
+              echo "ECR repository ${HELM_ECR_REPOSITORY} was created by another actor between the existence check and this creation attempt (RepositoryAlreadyExistsException); confirming it now exists..."
+
+              if aws ecr describe-repositories \
+                --region "$AWS_REGION" \
+                --repository-names "$HELM_ECR_REPOSITORY" >/dev/null 2>/tmp/monitor-helm-ecr-describe-race-error.txt; then
+                echo "Confirmed: ECR repository ${HELM_ECR_REPOSITORY} now exists (created concurrently by another actor)."
+              else
+                echo "FAIL: ECR repository ${HELM_ECR_REPOSITORY} creation raced with RepositoryAlreadyExistsException, but a fresh describe-repositories call could not confirm the repository exists. Diagnostic (describe-repositories stderr):"
+                cat /tmp/monitor-helm-ecr-describe-race-error.txt
+                exit 1
+              fi
+            fi
           fi
 
       - name: Ensure Helm ECR repository policy allows Argo CD pull

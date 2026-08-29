@@ -18080,6 +18080,155 @@ else
   skip "Phase 6 validated-manifest to atomic creation handoff: dedicated static assertions -- python3/PyYAML/phase6_replication.py/goldengate-replication.py/goldengate-deployment-model.py unavailable"
 fi
 
+echo "--- Preliminary Phase 7 safety correction: fail-closed ECR repository-existence classification in 50-sub-monitor.yaml ---"
+
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$MONITOR_WORKFLOW" ]; then
+  MONITOR_ECR_CLASSIFICATION_CHECK="$(python3 - "$MONITOR_WORKFLOW" <<'PYEOF'
+import json
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+import textwrap
+
+import yaml
+
+workflow_path = sys.argv[1]
+with open(workflow_path) as f:
+    doc = yaml.safe_load(f)
+
+results = []
+
+
+def check(label, ok):
+    results.append((label, ok))
+
+
+def find_step(job_name, step_name):
+    for step in doc["jobs"][job_name]["steps"]:
+        if step.get("name") == step_name:
+            return step["run"]
+    raise SystemExit(f"step not found: {job_name}/{step_name}")
+
+
+MONITOR_STEP = find_step("ensure_monitor_image", "Ensure monitor ECR repository exists")
+HELM_STEP = find_step("build_publish_and_deploy", "Ensure Helm ECR repository exists")
+
+
+def _block(behavior, default_rc=0):
+    """behavior is (returncode, stderr_text_or_None) or None (meaning: exit default_rc with no output)."""
+    if behavior is None:
+        return f"exit {default_rc}"
+    rc, err = behavior
+    err_line = f"echo {json.dumps(err)} >&2\n    " if err else ""
+    return f"{err_line}exit {rc}"
+
+
+def make_shim(describe_behavior, create_behavior=None, describe_after_create_behavior=None):
+    """Fake `aws` CLI: the FIRST describe-repositories call uses describe_behavior; every SUBSEQUENT describe-repositories call (the create-race re-describe) uses describe_after_create_behavior (defaults to describe_behavior); create-repository uses create_behavior (defaults to a bare success). Every real AWS error shape (RepositoryNotFoundException, AccessDeniedException, ExpiredTokenException, RepositoryAlreadyExistsException, or an arbitrary unclassified failure) is reproduced as literal, inert stderr TEXT -- never executed, never treated as shell source."""
+    describe_after = describe_after_create_behavior if describe_after_create_behavior is not None else describe_behavior
+    return textwrap.dedent(f"""\
+        #!/usr/bin/env bash
+        STATE_DIR="$(cd "$(dirname "$0")" && pwd)"
+        if [ "$1" = "ecr" ] && [ "$2" = "describe-repositories" ]; then
+          COUNT_FILE="$STATE_DIR/describe_count.txt"
+          COUNT=$(cat "$COUNT_FILE" 2>/dev/null || echo 0)
+          COUNT=$((COUNT+1))
+          echo "$COUNT" > "$COUNT_FILE"
+          if [ "$COUNT" = "1" ]; then
+            {_block(describe_behavior)}
+          else
+            {_block(describe_after)}
+          fi
+        fi
+        if [ "$1" = "ecr" ] && [ "$2" = "create-repository" ]; then
+          echo "CREATE_CALLED" >> "$STATE_DIR/create_calls.txt"
+          {_block(create_behavior)}
+        fi
+        echo "unhandled aws invocation: $*" >&2
+        exit 1
+        """)
+
+
+def run_step(step_run_text, shim_script, extra_env):
+    """Executes the REAL extracted workflow step `run:` text (never a reimplemented copy of its logic) with a fake `aws` prepended to PATH -- proves the actual committed bash, not a parallel Python re-derivation of what it is supposed to do."""
+    with tempfile.TemporaryDirectory() as tmp:
+        aws_path = os.path.join(tmp, "aws")
+        with open(aws_path, "w") as f:
+            f.write(shim_script)
+        os.chmod(aws_path, stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)
+        env = dict(os.environ)
+        env["PATH"] = tmp + ":" + env.get("PATH", "")
+        env.update(extra_env)
+        proc = subprocess.run(["bash", "-c", step_run_text], env=env, capture_output=True, text=True, timeout=20)
+        create_calls_path = os.path.join(tmp, "create_calls.txt")
+        create_call_count = 0
+        if os.path.exists(create_calls_path):
+            with open(create_calls_path) as f:
+                create_call_count = len(f.readlines())
+        return proc, create_call_count
+
+
+MONITOR_ENV = {"AWS_REGION": "eu-west-1", "MONITOR_ECR_REPOSITORY": "goldengate-monitor", "RUNNER_ROLE_ARN": "arn:aws:iam::123456789012:role/fake-role"}
+HELM_ENV = {"AWS_REGION": "eu-west-1", "HELM_ECR_REPOSITORY": "helm/goldengate-monitor"}
+
+NOT_FOUND = (254, "An error occurred (RepositoryNotFoundException) when calling the DescribeRepositories operation: The repository does not exist")
+ACCESS_DENIED = (254, "An error occurred (AccessDeniedException) when calling the DescribeRepositories operation: User is not authorized")
+EXPIRED_TOKEN = (254, "An error occurred (ExpiredTokenException) when calling the DescribeRepositories operation: The security token included in the request is expired")
+UNKNOWN_FAILURE = (1, "some completely unrecognized, unclassifiable transient failure")
+ALREADY_EXISTS = (254, "An error occurred (RepositoryAlreadyExistsException) when calling the CreateRepository operation: The repository already exists")
+
+for label_prefix, step_run_text, extra_env in (
+    ("goldengate-monitor", MONITOR_STEP, MONITOR_ENV),
+    ("helm/goldengate-monitor", HELM_STEP, HELM_ENV),
+):
+    # 1: describe success -> no create.
+    proc, creates = run_step(step_run_text, make_shim((0, None)), extra_env)
+    check(f"{label_prefix}: describe success -> exit 0, zero create calls", proc.returncode == 0 and creates == 0)
+
+    # 2: RepositoryNotFoundException -> create allowed.
+    proc, creates = run_step(step_run_text, make_shim(NOT_FOUND, create_behavior=(0, None)), extra_env)
+    check(f"{label_prefix}: RepositoryNotFoundException -> exit 0, exactly one create call (the exact repository-specific tags/scanOnPush/image-tag-mutability config is unchanged by this correction)", proc.returncode == 0 and creates == 1)
+
+    # 3: confirmed reproduction -- AccessDeniedException must NEVER authorize create.
+    proc, creates = run_step(step_run_text, make_shim(ACCESS_DENIED), extra_env)
+    check(f"{label_prefix}: confirmed reproduction -- AccessDeniedException fails closed with zero create calls (previously entered create-repository)", proc.returncode != 0 and creates == 0)
+
+    # 4: ExpiredTokenException must NEVER authorize create.
+    proc, creates = run_step(step_run_text, make_shim(EXPIRED_TOKEN), extra_env)
+    check(f"{label_prefix}: ExpiredTokenException fails closed with zero create calls", proc.returncode != 0 and creates == 0)
+
+    # 5: an arbitrary/unclassifiable describe failure must NEVER authorize create -- this is the assertion a regression back to `if describe; then exists; else create` would fail.
+    proc, creates = run_step(step_run_text, make_shim(UNKNOWN_FAILURE), extra_env)
+    check(f"{label_prefix}: unknown/unclassified describe failure fails closed with zero create calls", proc.returncode != 0 and creates == 0)
+
+    # 6: RepositoryAlreadyExistsException create race, fresh re-describe SUCCEEDS -> tolerated.
+    proc, creates = run_step(step_run_text, make_shim(NOT_FOUND, create_behavior=ALREADY_EXISTS, describe_after_create_behavior=(0, None)), extra_env)
+    check(f"{label_prefix}: RepositoryAlreadyExistsException create race is tolerated ONLY after a fresh describe-repositories call proves the repository now exists", proc.returncode == 0 and creates == 1)
+
+    # 7: RepositoryAlreadyExistsException create race, fresh re-describe FAILS -> fail closed.
+    proc, creates = run_step(step_run_text, make_shim(NOT_FOUND, create_behavior=ALREADY_EXISTS, describe_after_create_behavior=ACCESS_DENIED), extra_env)
+    check(f"{label_prefix}: RepositoryAlreadyExistsException create race fails closed when the fresh re-describe cannot confirm existence", proc.returncode != 0 and creates == 1)
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  echo "$MONITOR_ECR_CLASSIFICATION_CHECK"
+  if [ -z "$(echo "$MONITOR_ECR_CLASSIFICATION_CHECK" | grep '^FAIL ' || true)" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        OK\ *) pass "Monitor ECR repository-existence fail-closed classification: ${line#OK }" ;;
+      esac
+    done <<< "$MONITOR_ECR_CLASSIFICATION_CHECK"
+  else
+    fail "Monitor ECR repository-existence fail-closed classification: dedicated behavioral assertions failed:"$'\n'"${MONITOR_ECR_CLASSIFICATION_CHECK}"
+  fi
+else
+  skip "Monitor ECR repository-existence fail-closed classification: dedicated behavioral assertions -- python3/PyYAML/${MONITOR_WORKFLOW} unavailable"
+fi
+
 echo "--- Final repository handoff hygiene sweep (VDR pre-transfer cleanliness) ---"
 
 # This is the LAST check in the suite, deliberately: earlier sections legitimately regenerate work/generated/dev/goldengate-deployments.yaml (the folder-driven registry-generation checks) as their own tested behavior -- asserting its absence any earlier would be a self-defeating mid-test assertion. Self-heal only the categories PROVEN elsewhere in this suite to be pure, expected byproducts of exercising real application/tooling behavior (never silently deleting anything whose origin is unknown); everything else must already be absent, or this check fails closed and reports it for a human to investigate before VDR handoff.
