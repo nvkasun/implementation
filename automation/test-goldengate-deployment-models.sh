@@ -4368,7 +4368,7 @@ else
   skip "collector.py/monitor.py/IAM unchanged checks -- not a git repository"
 fi
 
-# 21. 80-ops-monitor-metrics-config.yaml + the piped automation/goldengate-metrics-config.py helper -- the dedicated, controlled workflow for tuning a single deployment's CONFIG.metricsEnabled outside Terraform. Static structural checks only (functional/mocked behavior covered by automation/test-goldengate-metrics-config.py).
+# 21. 80-ops-monitor-metrics-config.yaml + the piped automation/goldengate-metrics-config.py helper -- the dedicated, controlled workflow for tuning a single deployment's CONFIG.metricsEnabled outside Terraform. Static structural checks only (functional/mocked behavior covered by automation/tests/ops/test_metrics_config.py).
 echo ""
 echo "--- Phase 6C1: metrics config workflow + helper ---"
 
@@ -4754,11 +4754,11 @@ fi
 
 # The old coarse "no IAM file changed" check is superseded by check 18's content-aware role protection above.
 
-if python3 automation/test-goldengate-metrics-config.py >/dev/null 2>&1; then
-  pass "22: automation/test-goldengate-metrics-config.py (Phase 6C1 corrections functional suite) passes"
+if python3 automation/tests/ops/test_metrics_config.py >/dev/null 2>&1; then
+  pass "22: automation/tests/ops/test_metrics_config.py (Phase 6C1 corrections functional suite) passes"
   find automation -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
 else
-  fail "22: automation/test-goldengate-metrics-config.py failed"
+  fail "22: automation/tests/ops/test_metrics_config.py failed"
 fi
 
 # 25. Phase 6C1B: process-discovery status and fail-closed STATE-row correction.
@@ -6359,14 +6359,14 @@ fi
 
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   set +e
-  REPL_TEST_OUTPUT="$(python3 automation/test-goldengate-replication.py 2>&1)"
+  REPL_TEST_OUTPUT="$(python3 automation/phases/phase6/tests/test_replication_engine.py 2>&1)"
   REPL_TEST_STATUS=$?
   set -e
   if [ "$REPL_TEST_STATUS" -eq 0 ]; then
     RAN_LINE_REPL="$(echo "$REPL_TEST_OUTPUT" | grep -E '^Ran [0-9]+ test' | tail -1)"
-    pass "32: automation/test-goldengate-replication.py: ${RAN_LINE_REPL:-all tests passed}"
+    pass "32: automation/phases/phase6/tests/test_replication_engine.py: ${RAN_LINE_REPL:-all tests passed}"
   else
-    fail "32: automation/test-goldengate-replication.py reported a failure"
+    fail "32: automation/phases/phase6/tests/test_replication_engine.py reported a failure"
     echo "$REPL_TEST_OUTPUT"
   fi
 else
@@ -7162,14 +7162,14 @@ fi
 
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   set +e
-  MANAGED_EFS_GUARD_TEST_OUTPUT="$(python3 automation/test-goldengate-managed-efs-inventory-guard.py 2>&1)"
+  MANAGED_EFS_GUARD_TEST_OUTPUT="$(python3 automation/phases/phase1/tests/test_managed_efs_inventory_guard.py 2>&1)"
   MANAGED_EFS_GUARD_TEST_STATUS=$?
   set -e
   if [ "$MANAGED_EFS_GUARD_TEST_STATUS" -eq 0 ]; then
     RAN_LINE_INV="$(echo "$MANAGED_EFS_GUARD_TEST_OUTPUT" | grep -E '^Ran [0-9]+ test' | tail -1)"
-    pass "17/18/19/20/21/22: automation/test-goldengate-managed-efs-inventory-guard.py: ${RAN_LINE_INV:-all tests passed}"
+    pass "17/18/19/20/21/22: automation/phases/phase1/tests/test_managed_efs_inventory_guard.py: ${RAN_LINE_INV:-all tests passed}"
   else
-    fail "17/18/19/20/21/22: automation/test-goldengate-managed-efs-inventory-guard.py reported a failure"
+    fail "17/18/19/20/21/22: automation/phases/phase1/tests/test_managed_efs_inventory_guard.py reported a failure"
     echo "$MANAGED_EFS_GUARD_TEST_OUTPUT"
   fi
 else
@@ -7585,7 +7585,7 @@ else
   fail "1: envs/dev/efs.tf lost the verified enhanced->elastic module-source contract documentation that justifies the enhanced module input"
 fi
 
-# Items 8 (Oracle/PostgreSQL descriptors unchanged), 10 (no replication code changes), and 11 (PostgreSQL->MSSQL Phase 6D1 constants unchanged) are covered by their own pre-existing, still-passing sections of this suite and by automation/test-goldengate-replication.py -- not duplicated here since this section is scoped to the throughput_mode contract only. Item 12 (managed-EFS inventory guard tests) is covered by automation/test-goldengate-managed-efs-inventory-guard.py, run separately as part of the full validation sweep.
+# Items 8 (Oracle/PostgreSQL descriptors unchanged), 10 (no replication code changes), and 11 (PostgreSQL->MSSQL Phase 6D1 constants unchanged) are covered by their own pre-existing, still-passing sections of this suite and by automation/phases/phase6/tests/test_replication_engine.py -- not duplicated here since this section is scoped to the throughput_mode contract only. Item 12 (managed-EFS inventory guard tests) is covered by automation/phases/phase1/tests/test_managed_efs_inventory_guard.py, run separately as part of the full validation sweep.
 
 echo ""
 echo "--- Production hardening, Item 2: stream DescribeFileSystems safely ---"
@@ -7699,7 +7699,7 @@ else
   skip "VDR 7: secret-name derivation check -- python3 unavailable"
 fi
 
-# VDR 11/12/13/14: unchanged by this narrowly-scoped credential fix -- covered by their own dedicated, still-passing suites/sections rather than duplicated here: automation/test-goldengate-managed-efs-inventory-guard.py (managed-EFS inventory guard, item 11), the "Production hardening, Item 1" section above plus envs/dev/efs.tf itself (Terraform/EFS architecture, item 12), the Phase 6D0/6D0-Final Oracle/PostgreSQL runtime-identity sections above (item 13, replication.enabled=false unchanged), and automation/test-goldengate-replication.py (PostgreSQL->MSSQL Phase 6D1 constants, item 14).
+# VDR 11/12/13/14: unchanged by this narrowly-scoped credential fix -- covered by their own dedicated, still-passing suites/sections rather than duplicated here: automation/phases/phase1/tests/test_managed_efs_inventory_guard.py (managed-EFS inventory guard, item 11), the "Production hardening, Item 1" section above plus envs/dev/efs.tf itself (Terraform/EFS architecture, item 12), the Phase 6D0/6D0-Final Oracle/PostgreSQL runtime-identity sections above (item 13, replication.enabled=false unchanged), and automation/phases/phase6/tests/test_replication_engine.py (PostgreSQL->MSSQL Phase 6D1 constants, item 14).
 if ! grep -q 'goldengate_efs_throughput_mode\|throughput_mode\s*=\s*"elastic"\|throughput_mode\s*=\s*"provisioned"' envs/dev/efs.tf 2>/dev/null; then
   pass "VDR 12: envs/dev/efs.tf's throughput_mode contract (fixed in the immediately-preceding turn) is untouched by this credential-only fix"
 else
@@ -7828,7 +7828,7 @@ else
   fail "VDR-IMG 12/13: ECR image existence/digest verification is missing, changed, or a mutating ECR call was introduced"
 fi
 
-# 15: deploy=false performing no Argo/EKS runtime mutation is unrelated to this image-validation fix and remains covered by the existing dry-run-unreachable structural proof earlier in this suite (see "Correction pass, Issue ..." sections above). 16/17/18/19: cross-account shared-secret fix (previous VDR turn), EFS/Terraform architecture, Oracle/PostgreSQL descriptors + replication=false, and PostgreSQL->MSSQL Phase 6D1 are all unrelated to this narrowly-scoped rendered-image validation fix and remain covered by their own dedicated, still-passing sections/suites above (the "VDR correction: validate_shared_secrets_once..." section, the "Production hardening, Item 1" section, the Phase 6D0 Oracle/PostgreSQL sections, and automation/test-goldengate-replication.py respectively) -- none of items 15-19 are re-proved here, to avoid duplicating that logic.
+# 15: deploy=false performing no Argo/EKS runtime mutation is unrelated to this image-validation fix and remains covered by the existing dry-run-unreachable structural proof earlier in this suite (see "Correction pass, Issue ..." sections above). 16/17/18/19: cross-account shared-secret fix (previous VDR turn), EFS/Terraform architecture, Oracle/PostgreSQL descriptors + replication=false, and PostgreSQL->MSSQL Phase 6D1 are all unrelated to this narrowly-scoped rendered-image validation fix and remain covered by their own dedicated, still-passing sections/suites above (the "VDR correction: validate_shared_secrets_once..." section, the "Production hardening, Item 1" section, the Phase 6D0 Oracle/PostgreSQL sections, and automation/phases/phase6/tests/test_replication_engine.py respectively) -- none of items 15-19 are re-proved here, to avoid duplicating that logic.
 
 echo ""
 echo ""
@@ -7978,7 +7978,7 @@ else
   skip "ACTIVE-GATE: monitor active-runtime gating checks -- python3/PyYAML unavailable"
 fi
 
-# 17/18/19/20/21: cross-account Secrets Manager fix, structural runtime-image validation fix, EFS/Terraform architecture, Oracle/PostgreSQL descriptors + replication=false, and PostgreSQL->MSSQL Phase 6D1 are all unrelated to this narrowly-scoped monitor_dry_run_validation runner fix and remain covered by their own dedicated, still-passing sections/suites above (the "VDR correction: validate_shared_secrets_once..." section, the "VDR correction: structural rendered-image validation..." section, the "Production hardening, Item 1" section, the Phase 6D0 Oracle/PostgreSQL sections, and automation/test-goldengate-replication.py respectively) -- not re-proved here, to avoid duplicating that logic.
+# 17/18/19/20/21: cross-account Secrets Manager fix, structural runtime-image validation fix, EFS/Terraform architecture, Oracle/PostgreSQL descriptors + replication=false, and PostgreSQL->MSSQL Phase 6D1 are all unrelated to this narrowly-scoped monitor_dry_run_validation runner fix and remain covered by their own dedicated, still-passing sections/suites above (the "VDR correction: validate_shared_secrets_once..." section, the "VDR correction: structural rendered-image validation..." section, the "Production hardening, Item 1" section, the Phase 6D0 Oracle/PostgreSQL sections, and automation/phases/phase6/tests/test_replication_engine.py respectively) -- not re-proved here, to avoid duplicating that logic.
 
 echo ""
 echo "--- Self-service test architecture: generic descriptor invariants (no per-deployment-ID test code) ---"
@@ -8145,19 +8145,35 @@ else
 fi
 
 # 3b: deterministic environment/IAM generation regression suite -- proves generated output is never read back as a template, A->B->C environment changes never retain a stale identity, --check detects stale generated output, and all six current DEV permission policies remain semantically unchanged.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "automation/test-goldengate-environment.py" ]; then
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "automation/tests/core/test_environment.py" ]; then
   # Command substitution must sit directly in the if-condition -- set -e would abort the script at a standalone `var=$(...)` assignment before the else branch ever ran.
   if ENV_IAM_SUITE_OUTPUT="$(
     PYTHONDONTWRITEBYTECODE=1 \
-    python3 automation/test-goldengate-environment.py 2>&1
+    python3 automation/tests/core/test_environment.py 2>&1
   )"; then
-    pass "3b: environment/IAM deterministic generation tests pass (automation/test-goldengate-environment.py)"
+    pass "3b: environment/IAM deterministic generation tests pass (automation/tests/core/test_environment.py)"
   else
     ENV_IAM_SUITE_RC=$?
     fail "3b: environment/IAM deterministic generation tests failed (exit ${ENV_IAM_SUITE_RC}):"$'\n'"${ENV_IAM_SUITE_OUTPUT}"
   fi
 else
-  skip "3b: environment/IAM deterministic generation tests -- python3 or automation/test-goldengate-environment.py unavailable"
+  skip "3b: environment/IAM deterministic generation tests -- python3 or automation/tests/core/test_environment.py unavailable"
+fi
+
+# 3c: canonical folder-driven deployment-model suite -- post-rephase cleanup closes a prior test-discovery gap: this suite existed at automation/test-goldengate-deployment-model.py with substantial canonical-model coverage (add/change/delete plan derivation, drift/validate/render modes, managed-EFS/runtime-identity resolution, CLI surface) but was never previously invoked from this repository-wide regression entry point. Now relocated to automation/tests/core/test_deployment_model.py and run here unconditionally alongside the other core suites.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "automation/tests/core/test_deployment_model.py" ]; then
+  if DEPLOYMENT_MODEL_SUITE_OUTPUT="$(
+    PYTHONDONTWRITEBYTECODE=1 \
+    python3 automation/tests/core/test_deployment_model.py 2>&1
+  )"; then
+    RAN_LINE_DM="$(echo "$DEPLOYMENT_MODEL_SUITE_OUTPUT" | grep -E '^Ran [0-9]+ test' | tail -1)"
+    pass "3c: canonical deployment-model tests pass (automation/tests/core/test_deployment_model.py: ${RAN_LINE_DM:-all tests passed})"
+  else
+    DEPLOYMENT_MODEL_SUITE_RC=$?
+    fail "3c: canonical deployment-model tests failed (exit ${DEPLOYMENT_MODEL_SUITE_RC}):"$'\n'"${DEPLOYMENT_MODEL_SUITE_OUTPUT}"
+  fi
+else
+  skip "3c: canonical deployment-model tests -- python3 or automation/tests/core/test_deployment_model.py unavailable"
 fi
 
 # 4/5/6/7: runtime trust resolves to exactly system:serviceaccount:goldengate-dev:gg-runtime-sa -- no wildcard, no gg-oracle-sa, no gg-postgresql-sa, no gg-dev-*:ogg-oracle-sa.
@@ -12644,34 +12660,34 @@ for B3B_TOOL in automation/orchestration/monitor_state.py automation/orchestrati
 done
 
 # Each classifier's own dedicated offline unit-test suite is part of the normal regression run, not merely available separately.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/test-goldengate-monitor-state.py ]; then
-  if MONITOR_STATE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/test-goldengate-monitor-state.py 2>&1)"; then
-    pass "Phase B3B: automation/test-goldengate-monitor-state.py (the monitor ownership-safety classifier's offline ABSENT/OWNED/BROKEN test suite) passes"
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/phases/phase7/tests/test_monitor_state.py ]; then
+  if MONITOR_STATE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/phases/phase7/tests/test_monitor_state.py 2>&1)"; then
+    pass "Phase B3B: automation/phases/phase7/tests/test_monitor_state.py (the monitor ownership-safety classifier's offline ABSENT/OWNED/BROKEN test suite) passes"
   else
-    fail "Phase B3B: automation/test-goldengate-monitor-state.py failed:"$'\n'"${MONITOR_STATE_TEST_OUTPUT}"
+    fail "Phase B3B: automation/phases/phase7/tests/test_monitor_state.py failed:"$'\n'"${MONITOR_STATE_TEST_OUTPUT}"
   fi
 else
-  skip "Phase B3B: automation/test-goldengate-monitor-state.py -- python3 unavailable or file missing"
+  skip "Phase B3B: automation/phases/phase7/tests/test_monitor_state.py -- python3 unavailable or file missing"
 fi
 
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/test-goldengate-monitor-acceptance.py ]; then
-  if MONITOR_ACCEPTANCE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/test-goldengate-monitor-acceptance.py 2>&1)"; then
-    pass "Phase B3B: automation/test-goldengate-monitor-acceptance.py (the monitor post-reconciliation acceptance classifier's offline HEALTHY/BROKEN test suite) passes"
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/phases/phase7/tests/test_monitor_acceptance.py ]; then
+  if MONITOR_ACCEPTANCE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/phases/phase7/tests/test_monitor_acceptance.py 2>&1)"; then
+    pass "Phase B3B: automation/phases/phase7/tests/test_monitor_acceptance.py (the monitor post-reconciliation acceptance classifier's offline HEALTHY/BROKEN test suite) passes"
   else
-    fail "Phase B3B: automation/test-goldengate-monitor-acceptance.py failed:"$'\n'"${MONITOR_ACCEPTANCE_TEST_OUTPUT}"
+    fail "Phase B3B: automation/phases/phase7/tests/test_monitor_acceptance.py failed:"$'\n'"${MONITOR_ACCEPTANCE_TEST_OUTPUT}"
   fi
 else
-  skip "Phase B3B: automation/test-goldengate-monitor-acceptance.py -- python3 unavailable or file missing"
+  skip "Phase B3B: automation/phases/phase7/tests/test_monitor_acceptance.py -- python3 unavailable or file missing"
 fi
 
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/test-goldengate-end-to-end-acceptance.py ]; then
-  if E2E_ACCEPTANCE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/test-goldengate-end-to-end-acceptance.py 2>&1)"; then
-    pass "Phase B3B: automation/test-goldengate-end-to-end-acceptance.py (the offline/pure monitor-to-runtime end-to-end acceptance classifier's HEALTHY/BROKEN test suite) passes"
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/phases/phase7/tests/test_end_to_end_acceptance.py ]; then
+  if E2E_ACCEPTANCE_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/phases/phase7/tests/test_end_to_end_acceptance.py 2>&1)"; then
+    pass "Phase B3B: automation/phases/phase7/tests/test_end_to_end_acceptance.py (the offline/pure monitor-to-runtime end-to-end acceptance classifier's HEALTHY/BROKEN test suite) passes"
   else
-    fail "Phase B3B: automation/test-goldengate-end-to-end-acceptance.py failed:"$'\n'"${E2E_ACCEPTANCE_TEST_OUTPUT}"
+    fail "Phase B3B: automation/phases/phase7/tests/test_end_to_end_acceptance.py failed:"$'\n'"${E2E_ACCEPTANCE_TEST_OUTPUT}"
   fi
 else
-  skip "Phase B3B: automation/test-goldengate-end-to-end-acceptance.py -- python3 unavailable or file missing"
+  skip "Phase B3B: automation/phases/phase7/tests/test_end_to_end_acceptance.py -- python3 unavailable or file missing"
 fi
 
 # Monitor app region regression: collector.py must contain no eu-west-1 (or any other) hardcoded region fallback anywhere, and its own offline unit tests must prove AWS_REGION present is passed straight through to the CloudWatch client, and AWS_REGION missing raises instead of silently defaulting.
@@ -13857,7 +13873,7 @@ else
   skip "Phase B3B closeout: Pod->ReplicaSet->Deployment UID ownership chain structural check -- python3/PyYAML unavailable or 50-sub-monitor.yaml missing"
 fi
 
-# The functional/mocked-kubectl-jq proof for the UID ownership chain (MainWorkflowPodOwnershipTests for the Detect step + MainWorkflowBootstrapRepairPodOwnershipTests for the Bootstrap/repair step, both exercised against the real committed fragments) lives in automation/test-goldengate-metrics-config.py, already run earlier in this suite ("22: automation/test-goldengate-metrics-config.py") -- not re-run here to avoid duplicating that execution.
+# The functional/mocked-kubectl-jq proof for the UID ownership chain (MainWorkflowPodOwnershipTests for the Detect step + MainWorkflowBootstrapRepairPodOwnershipTests for the Bootstrap/repair step, both exercised against the real committed fragments) lives in automation/tests/ops/test_metrics_config.py, already run earlier in this suite ("22: automation/tests/ops/test_metrics_config.py") -- not re-run here to avoid duplicating that execution.
 
 echo ""
 echo "--- Phase 1 single-job architecture: validate_model consolidates the former six-job Phase 1 into one job (assertions A-R) ---"

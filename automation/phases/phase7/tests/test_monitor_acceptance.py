@@ -1,15 +1,16 @@
-"""Offline tests for automation/orchestration/monitor_acceptance.py; run directly via `python3 automation/test-goldengate-monitor-acceptance.py`. No live Kubernetes -- every kubectl response is a fake, injected fixture. The canonical monitor values (helm/goldengate-monitor/values.yaml merged with envs/dev/goldengate-monitor/values.yaml) are the real, currently-committed files -- this tool never re-implements that merge as a second schema. Current intentional architecture change: the real dev files now have ingress.enabled=true (networkPolicy.enabled remains false), so _populate_healthy_cluster()'s "fully healthy" baseline fixture includes a matching Ingress object by default. MonitorAcceptanceIngressAndNetworkPolicyEnabledTests mostly monkeypatches _load_monitor_values to an explicit, self-contained values shape instead of relying on today's real committed file, so those specific tests stay correct and meaningful regardless of future ingress.enabled/networkPolicy.enabled flips. Exercises the classifier's actual logic (never merely greps its source)."""
+"""Offline tests for automation/orchestration/monitor_acceptance.py; run directly via `python3 automation/phases/phase7/tests/test_monitor_acceptance.py`. No live Kubernetes -- every kubectl response is a fake, injected fixture. The canonical monitor values (helm/goldengate-monitor/values.yaml merged with envs/dev/goldengate-monitor/values.yaml) are the real, currently-committed files -- this tool never re-implements that merge as a second schema. Current intentional architecture change: the real dev files now have ingress.enabled=true (networkPolicy.enabled remains false), so _populate_healthy_cluster()'s "fully healthy" baseline fixture includes a matching Ingress object by default. MonitorAcceptanceIngressAndNetworkPolicyEnabledTests mostly monkeypatches _load_monitor_values to an explicit, self-contained values shape instead of relying on today's real committed file, so those specific tests stay correct and meaningful regardless of future ingress.enabled/networkPolicy.enabled flips. Exercises the classifier's actual logic (never merely greps its source)."""
 from __future__ import annotations
 
 import importlib.util
 import json
 import os
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import yaml
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_ROOT = str(Path(__file__).resolve().parents[4])
 TOOL_PATH = os.path.join(REPO_ROOT, "automation", "orchestration", "monitor_acceptance.py")
 
 

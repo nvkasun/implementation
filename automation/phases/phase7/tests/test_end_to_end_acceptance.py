@@ -1,11 +1,12 @@
-"""Offline tests for automation/orchestration/end_to_end_acceptance.py; run directly via `python3 automation/test-goldengate-end-to-end-acceptance.py`. This classifier is pure/offline (no Kubernetes/AWS access at all) so tests call classify() directly with synthetic active-deployment lists and a synthetic captured /api/processes JSON document -- exactly the shape monitoring/monitor/monitor.py's build_processes_payload()/read_deployment_processes_view() actually produce. Exercises the classifier's actual logic (never merely greps its source)."""
+"""Offline tests for automation/orchestration/end_to_end_acceptance.py; run directly via `python3 automation/phases/phase7/tests/test_end_to_end_acceptance.py`. This classifier is pure/offline (no Kubernetes/AWS access at all) so tests call classify() directly with synthetic active-deployment lists and a synthetic captured /api/processes JSON document -- exactly the shape monitoring/monitor/monitor.py's build_processes_payload()/read_deployment_processes_view() actually produce. Exercises the classifier's actual logic (never merely greps its source)."""
 from __future__ import annotations
 
 import importlib.util
 import os
 import unittest
+from pathlib import Path
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_ROOT = str(Path(__file__).resolve().parents[4])
 TOOL_PATH = os.path.join(REPO_ROOT, "automation", "orchestration", "end_to_end_acceptance.py")
 
 

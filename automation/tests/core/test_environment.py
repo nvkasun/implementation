@@ -1,4 +1,4 @@
-"""Offline tests for automation/goldengate-environment.py (IAM generated-policy source-of-truth correction); run directly via `python3 automation/test-goldengate-environment.py`."""
+"""Offline tests for automation/goldengate-environment.py (IAM generated-policy source-of-truth correction); run directly via `python3 automation/tests/core/test_environment.py`."""
 from __future__ import annotations
 
 import argparse
@@ -11,10 +11,11 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 
 import yaml
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_ROOT = str(Path(__file__).resolve().parents[3])
 TOOL_PATH = os.path.join(REPO_ROOT, "automation", "goldengate-environment.py")
 
 

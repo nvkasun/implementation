@@ -1,4 +1,4 @@
-"""Offline/mocked tests (no live AWS) for the CloudWatch double-gate metric contract in monitoring/monitor/collector.py and for the automation/goldengate-metrics-config.py DynamoDB update helper; run directly via `python3 automation/test-goldengate-metrics-config.py`."""
+"""Offline/mocked tests (no live AWS) for the CloudWatch double-gate metric contract in monitoring/monitor/collector.py and for the automation/goldengate-metrics-config.py DynamoDB update helper; run directly via `python3 automation/tests/ops/test_metrics_config.py`."""
 from __future__ import annotations
 
 import importlib.util
@@ -12,11 +12,12 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
 from unittest import mock
 
 import yaml  # noqa: E402
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_ROOT = str(Path(__file__).resolve().parents[3])
 MONITOR_SRC = os.path.join(REPO_ROOT, "monitoring", "monitor")
 HELPER_PATH = os.path.join(REPO_ROOT, "automation", "goldengate-metrics-config.py")
 MONITOR_WORKFLOW_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "50-sub-monitor.yaml")

@@ -3251,7 +3251,7 @@ class WorkflowStaticAnalysisTests(unittest.TestCase):
         self.assertNotIn("echo \"$POD_NAME\" -o json", detect_step_text)
 
     def test_preflight_pod_selection_verifies_ownership_chain(self):
-        # This only proves the Deployment/ReplicaSet ownership-chain properties are textually present (static analysis); the full functional proof (mocked kubectl/jq scenarios) lives in automation/test-goldengate-metrics-config.py::MainWorkflowPodOwnershipTests. Phase B3B moved this logic into its own "Detect an existing Ready gg-monitor pod (bootstrap-safe)" step (and it is reused, byte-for-byte, in the "Bootstrap/repair path" step further down).
+        # This only proves the Deployment/ReplicaSet ownership-chain properties are textually present (static analysis); the full functional proof (mocked kubectl/jq scenarios) lives in automation/tests/ops/test_metrics_config.py::MainWorkflowPodOwnershipTests. Phase B3B moved this logic into its own "Detect an existing Ready gg-monitor pod (bootstrap-safe)" step (and it is reused, byte-for-byte, in the "Bootstrap/repair path" step further down).
         detect_step_text = self.monitor_text[
             self.monitor_text.index("- name: Detect an existing Ready gg-monitor pod (bootstrap-safe)"):
             self.monitor_text.index("- name: Fast-path CloudWatch publication preflight")]

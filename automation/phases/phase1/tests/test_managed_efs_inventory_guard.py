@@ -1,11 +1,12 @@
-"""Offline tests for automation/phases/phase1/managed_efs_inventory_guard.py; run directly via `python3 automation/test-goldengate-managed-efs-inventory-guard.py`. No live AWS -- ACTUAL is always a sanitized fixture shaped like a sanitized aws efs describe-file-systems response (FileSystemId/CreationToken/Tags only, never a separate list-tags-for-resource call)."""
+"""Offline tests for automation/phases/phase1/managed_efs_inventory_guard.py; run directly via `python3 automation/phases/phase1/tests/test_managed_efs_inventory_guard.py`. No live AWS -- ACTUAL is always a sanitized fixture shaped like a sanitized aws efs describe-file-systems response (FileSystemId/CreationToken/Tags only, never a separate list-tags-for-resource call)."""
 from __future__ import annotations
 
 import importlib.util
 import os
 import unittest
+from pathlib import Path
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_ROOT = str(Path(__file__).resolve().parents[4])
 TOOL_PATH = os.path.join(REPO_ROOT, "automation", "phases", "phase1", "managed_efs_inventory_guard.py")
 
 try:

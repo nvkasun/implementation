@@ -1,4 +1,4 @@
-"""Offline tests for automation/goldengate-replication.py; run directly via `python3 automation/test-goldengate-replication.py`."""
+"""Offline tests for automation/goldengate-replication.py; run directly via `python3 automation/phases/phase6/tests/test_replication_engine.py`."""
 from __future__ import annotations
 
 import importlib.util
@@ -7,8 +7,9 @@ import json
 import os
 import unittest
 import unittest.mock as mock
+from pathlib import Path
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_ROOT = str(Path(__file__).resolve().parents[4])
 TOOL_PATH = os.path.join(REPO_ROOT, "automation", "goldengate-replication.py")
 
 

@@ -9,6 +9,7 @@ rendered/
 *.tfstate.*
 .terraform/
 work/generated/
+work/staged/
 
 # Local Helm/tar packages (e.g. a `helm dependency build` byproduct such as
 # helm/argocd/charts/argo-cd-9.3.7.tgz) -- never a committed source artifact.

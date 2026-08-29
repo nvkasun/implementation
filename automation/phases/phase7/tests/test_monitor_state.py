@@ -1,12 +1,13 @@
-"""Offline tests for automation/orchestration/monitor_state.py; run directly via `python3 automation/test-goldengate-monitor-state.py`. No live Kubernetes -- every kubectl response is a fake, injected fixture. Exercises the classifier's actual logic (never merely greps its source)."""
+"""Offline tests for automation/orchestration/monitor_state.py; run directly via `python3 automation/phases/phase7/tests/test_monitor_state.py`. No live Kubernetes -- every kubectl response is a fake, injected fixture. Exercises the classifier's actual logic (never merely greps its source)."""
 from __future__ import annotations
 
 import importlib.util
 import json
 import os
 import unittest
+from pathlib import Path
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_ROOT = str(Path(__file__).resolve().parents[4])
 TOOL_PATH = os.path.join(REPO_ROOT, "automation", "orchestration", "monitor_state.py")
 
 
