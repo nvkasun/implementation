@@ -1,4 +1,4 @@
-"""check-goldengate-approval-topology.py: fails closed if any GitHub Actions workflow in this repository drifts away from the Live Deployment Approval Topology Fix invariant -- exactly one GoldenGate application deployment approval (goldengate_deploy_authorization) exists for the entire end-to-end Deploy DAG, the four specialist reusable workflows (20/30/40/50) never open a second approval when MAIN-orchestrated, each specialist still retains exactly one standalone approval path for a direct workflow_dispatch run, and the corporate Terraform governance boundary (10-sub-iam-secrets.yaml) plus the independent OPS workflows (80/90/91) are left untouched by this invariant. Phase 7 grouping: 20/30/40 remain DIRECT MAIN calls, but 50-sub-monitor.yaml is now called NESTED -- MAIN -> 70-phase-monitor-final-acceptance.yaml -> monitor_sync_once -> 50-sub-monitor.yaml. Phase 3 grouping: goldengate_deploy_authorization itself, along with argocd_preflight/reconcile_argocd/validate_argocd_ready, moved OFF MAIN entirely into 30-phase-argocd-orchestration.yaml -- MAIN -> 30-phase-argocd-orchestration.yaml -> {goldengate_deploy_authorization; reconcile_argocd -> 20-sub-argocd.yaml with orchestrated_by_main: true}. This checker actively verifies both full nested chains end to end (never merely stops checking a job because it moved), proves MAIN itself now carries ZERO job-level environment: gates, proves the Phase 3 wrapper carries exactly the one gate that moved into it, and replaces the old single-document transitive-needs-graph-walk proof for delete_removed_argocd_applications with an explicit two-part cross-workflow proof spanning both YAML documents."""
+"""check-goldengate-approval-topology.py: fails closed if any GitHub Actions workflow in this repository drifts away from the Live Deployment Approval Topology Fix invariant -- exactly one GoldenGate application deployment approval (goldengate_deploy_authorization) exists for the entire end-to-end Deploy DAG, the four specialist reusable workflows (20/30/40/50) never open a second approval when MAIN-orchestrated, each specialist still retains exactly one standalone approval path for a direct workflow_dispatch run, and the corporate Terraform governance boundary (10-sub-iam-secrets.yaml) plus the independent OPS workflows (80/90/91) are left untouched by this invariant. Phase 7 grouping: 50-sub-monitor.yaml is called NESTED -- MAIN -> 70-phase-monitor-final-acceptance.yaml -> monitor_sync_once -> 50-sub-monitor.yaml. Phase 3 grouping: goldengate_deploy_authorization itself, along with argocd_preflight/reconcile_argocd/validate_argocd_ready, moved OFF MAIN entirely into 30-phase-argocd-orchestration.yaml -- MAIN -> 30-phase-argocd-orchestration.yaml -> {goldengate_deploy_authorization; reconcile_argocd -> 20-sub-argocd.yaml with orchestrated_by_main: true}. Phase 4 grouping: 30-sub-platform.yaml and 40-sub-observability.yaml are BOTH now called NESTED too -- MAIN -> 40-phase-platform-observability-shared-secrets.yaml -> {platform_sync_once -> 30-sub-platform.yaml; observability_sync_once -> 40-sub-observability.yaml}, each with orchestrated_by_main: true preserved. The Phase 4 wrapper itself opens no approval of its own (zero job-level environment: keys), exactly like the Phase 7 wrapper. This checker actively verifies all three nested chains end to end (never merely stops checking a job because it moved), proves MAIN itself carries ZERO job-level environment: gates, proves the Phase 3 wrapper carries exactly the one gate that moved into it, and replaces the old single-document transitive-needs-graph-walk proof for delete_removed_argocd_applications with an explicit two-part cross-workflow proof spanning both YAML documents."""
 from __future__ import annotations
 
 import glob
@@ -19,11 +19,7 @@ SPECIALIST_FILENAMES = [
     "40-sub-observability.yaml",
     "50-sub-monitor.yaml",
 ]
-# 30/40 remain DIRECT MAIN caller jobs. 20-sub-argocd.yaml (Phase 3 grouping) and 50-sub-monitor.yaml (Phase 7 grouping) are both deliberately EXCLUDED from this direct-caller map -- MAIN no longer calls either directly; see check_main_calls_phase3_wrapper_which_calls_argocd / check_main_calls_phase7_wrapper_which_calls_monitor below for the actively-verified nested chains instead. Both 20-sub-argocd.yaml and 50-sub-monitor.yaml remain in SPECIALIST_FILENAMES above, unaffected -- their own internal structure (orchestration contract, single standalone gate, gated implementation jobs) is checked regardless of who calls them.
-SPECIALIST_CALLER_JOBS = {
-    "30-sub-platform.yaml": "platform_sync_once",
-    "40-sub-observability.yaml": "observability_sync_once",
-}
+# None of the four specialist reusable workflows remain DIRECT MAIN caller jobs after the Phase 3/Phase 4/Phase 7 groupings -- 20-sub-argocd.yaml (Phase 3), 30-sub-platform.yaml/40-sub-observability.yaml (Phase 4), and 50-sub-monitor.yaml (Phase 7) are all reached only through their respective wrapper's nested chain; see check_main_calls_phase3_wrapper_which_calls_argocd / check_main_calls_phase4_wrapper_which_calls_platform_and_observability / check_main_calls_phase7_wrapper_which_calls_monitor below for the actively-verified nested chains. All four remain in SPECIALIST_FILENAMES above, unaffected -- their own internal structure (orchestration contract, single standalone gate, gated implementation jobs) is checked regardless of who calls them.
 STANDALONE_AUTHORIZATION_JOB = "standalone_deploy_authorization"
 ORCHESTRATION_CONTRACT_INPUT = "orchestrated_by_main"
 MONITOR_SPECIALIST_FILENAME = "50-sub-monitor.yaml"
@@ -35,6 +31,12 @@ PHASE3_WRAPPER_CALLER_JOB = "phase_3_argocd"
 PHASE3_RECONCILE_JOB = "reconcile_argocd"
 PHASE3_VALIDATE_JOB = "validate_argocd_ready"
 PHASE3_VALIDATE_OUTPUT = "validate_argocd_ready_result"
+PLATFORM_SPECIALIST_FILENAME = "30-sub-platform.yaml"
+OBSERVABILITY_SPECIALIST_FILENAME = "40-sub-observability.yaml"
+PHASE4_WRAPPER_FILENAME = "40-phase-platform-observability-shared-secrets.yaml"
+PHASE4_WRAPPER_CALLER_JOB = "phase_4_platform_observability"
+PHASE4_PLATFORM_SYNC_JOB = "platform_sync_once"
+PHASE4_OBSERVABILITY_SYNC_JOB = "observability_sync_once"
 CORPORATE_TERRAFORM_WORKFLOW_FILENAME = "10-sub-iam-secrets.yaml"
 CORPORATE_TERRAFORM_WORKFLOW_CALLER_JOB = "terraform_sync_once"
 CORPORATE_TERRAFORM_REUSABLE_WORKFLOW_REF = "AbuDhabiCommercialBank/adcb-reusable-workflows/.github/workflows/aws-terraform-apply.yaml@main"
@@ -130,24 +132,6 @@ def check_phase3_wrapper_is_workflow_call_only(wrapper_doc, findings):
         findings.append(f"{PHASE3_WRAPPER_FILENAME}: must expose workflow_call only -- found additional trigger(s) {sorted(extra_triggers)!r}")
 
 
-def check_main_calls_pass_orchestrated_by_main(doc, findings):
-    """Rule 5: MAIN passes orchestrated_by_main: true to all four specialist reusable-workflow calls."""
-    jobs = _jobs(doc)
-    for filename, caller_job_name in SPECIALIST_CALLER_JOBS.items():
-        job = jobs.get(caller_job_name)
-        if not isinstance(job, dict):
-            findings.append(f"MAIN is missing the expected caller job {caller_job_name!r} for {filename!r}")
-            continue
-        expected_uses_suffix = f".github/workflows/{filename}"
-        uses = job.get("uses") or ""
-        if not uses.endswith(expected_uses_suffix):
-            findings.append(f"MAIN job {caller_job_name!r} does not call {filename!r} via uses: (found {uses!r})")
-            continue
-        with_block = job.get("with") or {}
-        if with_block.get(ORCHESTRATION_CONTRACT_INPUT) is not True:
-            findings.append(f"MAIN job {caller_job_name!r} must pass {ORCHESTRATION_CONTRACT_INPUT}: true to {filename!r}, found {with_block.get(ORCHESTRATION_CONTRACT_INPUT)!r}")
-
-
 def _find_job_calling(jobs, expected_filename):
     """Returns (job_name, job) for the first job whose uses: ends with .github/workflows/<expected_filename>, or (None, None) if none does."""
     expected_uses_suffix = f".github/workflows/{expected_filename}"
@@ -215,6 +199,77 @@ def check_main_calls_phase3_wrapper_which_calls_argocd(main_doc, workflow_dir, f
     with_block = reconcile_job.get("with") or {}
     if with_block.get(ORCHESTRATION_CONTRACT_INPUT) is not True:
         findings.append(f"{PHASE3_WRAPPER_FILENAME} job {PHASE3_RECONCILE_JOB!r} must pass {ORCHESTRATION_CONTRACT_INPUT}: true to {ARGOCD_SPECIALIST_FILENAME!r}, found {with_block.get(ORCHESTRATION_CONTRACT_INPUT)!r}")
+
+
+def check_main_calls_phase4_wrapper_which_calls_platform_and_observability(main_doc, workflow_dir, findings):
+    """Phase 4 grouping (nested): 30-sub-platform.yaml and 40-sub-observability.yaml are no longer called directly by MAIN -- both must be reached through the EXACT chain MAIN -> phase_4_platform_observability -> 40-phase-platform-observability-shared-secrets.yaml -> {platform_sync_once -> 30-sub-platform.yaml; observability_sync_once -> 40-sub-observability.yaml}, with orchestrated_by_main: true preserved at both innermost calls. This actively verifies every link for BOTH specialists, never merely stops checking them because they moved."""
+    main_jobs = _jobs(main_doc)
+    wrapper_job_name, wrapper_job = _find_job_calling(main_jobs, PHASE4_WRAPPER_FILENAME)
+    if wrapper_job is None:
+        findings.append(f"MAIN has no job calling {PHASE4_WRAPPER_FILENAME!r} -- 30-sub-platform.yaml/40-sub-observability.yaml must be reached through this approved Phase 4 wrapper, never directly from MAIN and never left unreachable")
+        return
+    if wrapper_job_name != PHASE4_WRAPPER_CALLER_JOB:
+        findings.append(f"MAIN's caller job for {PHASE4_WRAPPER_FILENAME!r} is named {wrapper_job_name!r}, expected {PHASE4_WRAPPER_CALLER_JOB!r}")
+
+    wrapper_path = os.path.join(workflow_dir, PHASE4_WRAPPER_FILENAME)
+    if not os.path.exists(wrapper_path):
+        findings.append(f"MAIN job {wrapper_job_name!r} calls {PHASE4_WRAPPER_FILENAME!r}, but that file does not exist")
+        return
+    wrapper_doc = load_workflow(wrapper_path)
+    wrapper_jobs = _jobs(wrapper_doc)
+
+    for caller_job_name, specialist_filename in (
+        (PHASE4_PLATFORM_SYNC_JOB, PLATFORM_SPECIALIST_FILENAME),
+        (PHASE4_OBSERVABILITY_SYNC_JOB, OBSERVABILITY_SPECIALIST_FILENAME),
+    ):
+        caller_job = wrapper_jobs.get(caller_job_name)
+        if not isinstance(caller_job, dict):
+            findings.append(f"{PHASE4_WRAPPER_FILENAME} is missing the expected caller job {caller_job_name!r} for {specialist_filename!r}")
+            continue
+        expected_uses_suffix = f".github/workflows/{specialist_filename}"
+        uses = caller_job.get("uses") or ""
+        if not uses.endswith(expected_uses_suffix):
+            findings.append(f"{PHASE4_WRAPPER_FILENAME} job {caller_job_name!r} does not call {specialist_filename!r} via uses: (found {uses!r})")
+            continue
+        with_block = caller_job.get("with") or {}
+        if with_block.get(ORCHESTRATION_CONTRACT_INPUT) is not True:
+            findings.append(f"{PHASE4_WRAPPER_FILENAME} job {caller_job_name!r} must pass {ORCHESTRATION_CONTRACT_INPUT}: true to {specialist_filename!r}, found {with_block.get(ORCHESTRATION_CONTRACT_INPUT)!r}")
+
+
+def check_phase4_wrapper_opens_no_second_authorization(wrapper_doc, findings):
+    """Phase 4 grouping: the Phase 4 wrapper is a pure orchestration passthrough -- it must never declare its own job-level environment: (which would open a second, redundant GoldenGate deployment approval alongside the single goldengate_deploy_authorization inside the Phase 3 wrapper), exactly like the Phase 7 wrapper."""
+    jobs = _jobs(wrapper_doc)
+    envs = [name for name, job in jobs.items() if isinstance(job, dict) and _job_environment(job) is not None]
+    if envs:
+        findings.append(f"{PHASE4_WRAPPER_FILENAME}: must declare zero job-level environment: keys (found on {envs}) -- it must never open a second GoldenGate deployment approval; the single goldengate_deploy_authorization inside {PHASE3_WRAPPER_FILENAME!r} already covers this chain")
+
+
+def check_phase4_wrapper_is_workflow_call_only(wrapper_doc, findings):
+    """Phase 4 grouping: the Phase 4 wrapper is an internal orchestration wrapper, never an independent second operator-facing entry point -- it must expose workflow_call only."""
+    on_block = _on_block(wrapper_doc)
+    extra_triggers = [t for t in ("workflow_dispatch", "push", "pull_request", "schedule") if t in on_block]
+    if extra_triggers:
+        findings.append(f"{PHASE4_WRAPPER_FILENAME}: must expose workflow_call only -- found additional trigger(s) {sorted(extra_triggers)!r}")
+
+
+NESTED_ONLY_SPECIALIST_FILENAMES = (
+    ARGOCD_SPECIALIST_FILENAME,
+    PLATFORM_SPECIALIST_FILENAME,
+    OBSERVABILITY_SPECIALIST_FILENAME,
+    MONITOR_SPECIALIST_FILENAME,
+)
+
+
+def check_main_never_calls_nested_specialists_directly(main_doc, findings):
+    """Phase 3/Phase 4/Phase 7 grouping: none of the four nested-only specialists (20-sub-argocd.yaml, 30-sub-platform.yaml, 40-sub-observability.yaml, 50-sub-monitor.yaml) may be called directly by ANY MAIN job -- each must be reached exclusively through its approved wrapper's nested chain (already actively verified by check_main_calls_phase3_wrapper_which_calls_argocd / check_main_calls_phase4_wrapper_which_calls_platform_and_observability / check_main_calls_phase7_wrapper_which_calls_monitor above). A second, additional MAIN job calling one of these specialists directly -- alongside the approved wrapper chain -- would silently reopen a bypass around the single-authorization/orchestrated_by_main invariant those nested-chain checks assume is the ONLY path in."""
+    main_jobs = _jobs(main_doc)
+    for job_name, job in main_jobs.items():
+        if not isinstance(job, dict):
+            continue
+        uses = str(job.get("uses") or "")
+        for specialist_filename in NESTED_ONLY_SPECIALIST_FILENAMES:
+            if uses.endswith(f".github/workflows/{specialist_filename}"):
+                findings.append(f"MAIN job {job_name!r} calls {specialist_filename!r} directly -- this specialist must be reached exclusively through its approved wrapper's nested chain, never a second direct MAIN call")
 
 
 def check_phase7_wrapper_opens_no_second_authorization(wrapper_doc, findings):
@@ -438,9 +493,10 @@ def run_checks(workflow_dir):
     main_doc = load_workflow(main_path)
     workflows_inspected += 1
     check_main_has_zero_authorization_gates(main_doc, findings)
-    check_main_calls_pass_orchestrated_by_main(main_doc, findings)
     check_main_calls_phase7_wrapper_which_calls_monitor(main_doc, workflow_dir, findings)
     check_main_calls_phase3_wrapper_which_calls_argocd(main_doc, workflow_dir, findings)
+    check_main_calls_phase4_wrapper_which_calls_platform_and_observability(main_doc, workflow_dir, findings)
+    check_main_never_calls_nested_specialists_directly(main_doc, findings)
     check_main_deletion_requires_phase3_boundary(main_doc, findings)
     check_main_never_calls_ops_workflows(main_doc, findings)
 
@@ -463,6 +519,16 @@ def run_checks(workflow_dir):
         check_environment_variable_not_exposed_as_secret(PHASE3_WRAPPER_FILENAME, phase3_wrapper_doc, findings)
     else:
         findings.append(f"{PHASE3_WRAPPER_FILENAME}: expected file does not exist")
+
+    phase4_wrapper_path = os.path.join(workflow_dir, PHASE4_WRAPPER_FILENAME)
+    if os.path.exists(phase4_wrapper_path):
+        phase4_wrapper_doc = load_workflow(phase4_wrapper_path)
+        workflows_inspected += 1
+        check_phase4_wrapper_opens_no_second_authorization(phase4_wrapper_doc, findings)
+        check_phase4_wrapper_is_workflow_call_only(phase4_wrapper_doc, findings)
+        check_environment_variable_not_exposed_as_secret(PHASE4_WRAPPER_FILENAME, phase4_wrapper_doc, findings)
+    else:
+        findings.append(f"{PHASE4_WRAPPER_FILENAME}: expected file does not exist")
 
     for filename in SPECIALIST_FILENAMES:
         path = os.path.join(workflow_dir, filename)
@@ -505,7 +571,7 @@ def main(argv=None):
         print(f"\nFAIL: {len(findings)} approval-topology violation(s) found.")
         return 1
 
-    print("OK: exactly one GoldenGate application deployment authorization exists end to end (inside the Phase 3 wrapper), MAIN itself carries zero job-level environment: gates, all MAIN-orchestrated specialist calls (direct or nested through the Phase 3/Phase 7 wrappers) carry orchestrated_by_main: true, every specialist retains exactly one standalone approval path, and the corporate Terraform governance boundary plus the OPS workflows remain untouched.")
+    print("OK: exactly one GoldenGate application deployment authorization exists end to end (inside the Phase 3 wrapper), MAIN itself carries zero job-level environment: gates, all MAIN-orchestrated specialist calls (nested through the Phase 3/Phase 4/Phase 7 wrappers) carry orchestrated_by_main: true, every specialist retains exactly one standalone approval path, and the corporate Terraform governance boundary plus the OPS workflows remain untouched.")
     return 0
 
 

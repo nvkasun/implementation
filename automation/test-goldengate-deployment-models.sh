@@ -22,6 +22,7 @@ METRICS_CONFIG_HELPER_SCRIPT="automation/goldengate-metrics-config.py"
 EKS_APP_WORKFLOW=".github/workflows/00-main-goldengate-orchestrator.yaml"
 PHASE7_WORKFLOW=".github/workflows/70-phase-monitor-final-acceptance.yaml"
 PHASE3_WORKFLOW=".github/workflows/30-phase-argocd-orchestration.yaml"
+PHASE4_WORKFLOW=".github/workflows/40-phase-platform-observability-shared-secrets.yaml"
 PLATFORM_WORKFLOW=".github/workflows/30-sub-platform.yaml"
 DETECT_SCRIPT="automation/phases/phase1/detect-goldengate-deployments.sh"
 PHASE1_TOOL="automation/phases/phase1/phase1_readiness.py"
@@ -4783,8 +4784,8 @@ MONITOR_PY="monitoring/monitor/monitor.py"
 MONITOR_WORKFLOW=".github/workflows/50-sub-monitor.yaml"
 
 if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  # This narrow Phase 6C1B guard originally proved that phase's changes were made in place to the (then single) monitor workflow file, never by adding a parallel duplicate. The workflow naming/operator UX standardization task later legitimately renamed all nine workflow files in place -- each rename is a content move, not a new parallel workflow -- so the nine canonical renamed filenames are expected/allowed here; any other new workflow file remains exactly the violation this check was written to catch. The rename itself is now guarded by the dedicated, more precise "Workflow naming / operator UX standardization" section later in this suite (exactly-one-MAIN, exact SUB/OPS sets, zero stale old-filename references) -- the same supersession pattern already used for cloudwatch-observability-artifact-sync.yaml's release from check 15's byte-diff guard by Phase 11. Phase 7 grouping: 70-phase-monitor-final-acceptance.yaml is one exact, approved new workflow file this task adds (an internal MAIN-orchestration wrapper, never a new operator-facing SUB/OPS workflow) -- explicitly whitelisted here, never a relaxation to allow arbitrary new files. Phase 3 grouping: 30-phase-argocd-orchestration.yaml is the second such approved internal wrapper, added the same way and whitelisted the same way.
-  NEW_WORKFLOW_FILES="$(git status --porcelain=v1 -- .github/workflows/ 2>/dev/null | grep -E '^\?\?' | grep -vE '^\?\? \.github/workflows/(00-main-goldengate-orchestrator|10-sub-iam-secrets|20-sub-argocd|30-sub-platform|30-phase-argocd-orchestration|40-sub-observability|50-sub-monitor|70-phase-monitor-final-acceptance|80-ops-monitor-metrics-config|90-ops-observability-artifact-sync|91-ops-ecr-image-sync)\.yaml$' || true)"
+  # This narrow Phase 6C1B guard originally proved that phase's changes were made in place to the (then single) monitor workflow file, never by adding a parallel duplicate. The workflow naming/operator UX standardization task later legitimately renamed all nine workflow files in place -- each rename is a content move, not a new parallel workflow -- so the nine canonical renamed filenames are expected/allowed here; any other new workflow file remains exactly the violation this check was written to catch. The rename itself is now guarded by the dedicated, more precise "Workflow naming / operator UX standardization" section later in this suite (exactly-one-MAIN, exact SUB/OPS sets, zero stale old-filename references) -- the same supersession pattern already used for cloudwatch-observability-artifact-sync.yaml's release from check 15's byte-diff guard by Phase 11. Phase 7 grouping: 70-phase-monitor-final-acceptance.yaml is one exact, approved new workflow file this task adds (an internal MAIN-orchestration wrapper, never a new operator-facing SUB/OPS workflow) -- explicitly whitelisted here, never a relaxation to allow arbitrary new files. Phase 3 grouping: 30-phase-argocd-orchestration.yaml is the second such approved internal wrapper, added the same way and whitelisted the same way. Phase 4 grouping: 40-phase-platform-observability-shared-secrets.yaml is the third such approved internal wrapper, added the same way and whitelisted the same way.
+  NEW_WORKFLOW_FILES="$(git status --porcelain=v1 -- .github/workflows/ 2>/dev/null | grep -E '^\?\?' | grep -vE '^\?\? \.github/workflows/(00-main-goldengate-orchestrator|10-sub-iam-secrets|20-sub-argocd|30-sub-platform|30-phase-argocd-orchestration|40-sub-observability|40-phase-platform-observability-shared-secrets|50-sub-monitor|70-phase-monitor-final-acceptance|80-ops-monitor-metrics-config|90-ops-observability-artifact-sync|91-ops-ecr-image-sync)\.yaml$' || true)"
   if [ -z "$NEW_WORKFLOW_FILES" ]; then
     pass "25: no unexpected new workflow file introduced beyond the sanctioned workflow-naming rename"
   else
@@ -5554,12 +5555,16 @@ with open(".github/workflows/70-phase-monitor-final-acceptance.yaml") as f:
 # Phase 3 grouping: argocd_preflight/validate_argocd_ready now live inside the grouped Phase 3 reusable workflow, never directly in MAIN -- both documents are loaded so this chain-connectivity proof spans that reusable-workflow boundary explicitly too.
 with open(".github/workflows/30-phase-argocd-orchestration.yaml") as f:
     phase3_doc = yaml.safe_load(f)
+# Phase 4 grouping: platform_preflight/platform_sync_once/observability_preflight/observability_sync_once/validate_platform_ready/validate_observability_ready/validate_shared_secrets_once now live inside the grouped Phase 4 reusable workflow, never directly in MAIN.
+with open(".github/workflows/40-phase-platform-observability-shared-secrets.yaml") as f:
+    phase4_doc = yaml.safe_load(f)
 
 jobs = doc["jobs"]
 phase7_jobs = phase7_doc["jobs"]
 phase3_jobs = phase3_doc["jobs"]
+phase4_jobs = phase4_doc["jobs"]
 expected_order = [
-    "validate_model", "terraform_sync_once", "phase_3_argocd", "platform_sync_once", "validate_shared_secrets_once",
+    "validate_model", "terraform_sync_once", "phase_3_argocd", "phase_4_platform_observability",
     "build_publish_and_deploy", "phase_7_monitor_final_acceptance",
 ]
 for name in expected_order:
@@ -5573,6 +5578,10 @@ for name in ("monitor_sync_once", "final_validation"):
 for name in ("argocd_preflight", "validate_argocd_ready"):
     if name not in phase3_jobs:
         print(f"FAIL: missing required internal Phase 3 job {name!r}")
+        sys.exit(1)
+for name in ("platform_preflight", "platform_sync_once", "observability_preflight", "observability_sync_once", "validate_platform_ready", "validate_observability_ready", "validate_shared_secrets_once"):
+    if name not in phase4_jobs:
+        print(f"FAIL: missing required internal Phase 4 job {name!r}")
         sys.exit(1)
 
 if "bootstrap_admin_secrets" in jobs:
@@ -5591,10 +5600,14 @@ def phase3_needs_of(name):
     n = phase3_jobs[name].get("needs") or []
     return [n] if isinstance(n, str) else n
 
+def phase4_needs_of(name):
+    n = phase4_jobs[name].get("needs") or []
+    return [n] if isinstance(n, str) else n
+
 if "validate_model" not in needs_of("terraform_sync_once"):
     print("FAIL: terraform_sync_once does not need validate_model")
     sys.exit(1)
-# Phase B1 inserts the Argo CD prerequisite state machine between Terraform and the platform chart: terraform_sync_once -> argocd_preflight -> (bootstrap_argocd) -> validate_argocd_ready. Phase B2 then inserts the same ownership-aware state machine, independently in parallel, for GoldenGate Platform and Observability: validate_argocd_ready -> (platform_preflight | observability_preflight) -> (platform_sync_once | observability_sync_once) -> (validate_platform_ready | validate_observability_ready) -> validate_shared_secrets_once. platform_sync_once/validate_shared_secrets_once no longer depend on validate_argocd_ready/platform_sync_once directly (only transitively) -- guarded in full by the dedicated "Phase B1"/"Phase B2" DAG checks elsewhere in this suite. Phase 3 grouping: terraform_sync_once -> phase_3_argocd (MAIN) -> {argocd_preflight -> ... -> validate_argocd_ready} (internal) -> phase_3_argocd's own outputs.validate_argocd_ready_result -> (platform_preflight | observability_preflight) (MAIN).
+# Phase B1 inserts the Argo CD prerequisite state machine between Terraform and the platform chart: terraform_sync_once -> argocd_preflight -> (bootstrap_argocd) -> validate_argocd_ready. Phase B2 then inserts the same ownership-aware state machine, independently in parallel, for GoldenGate Platform and Observability: validate_argocd_ready -> (platform_preflight | observability_preflight) -> (platform_sync_once | observability_sync_once) -> (validate_platform_ready | validate_observability_ready) -> validate_shared_secrets_once. platform_sync_once/validate_shared_secrets_once no longer depend on validate_argocd_ready/platform_sync_once directly (only transitively) -- guarded in full by the dedicated "Phase B1"/"Phase B2" DAG checks elsewhere in this suite. Phase 3 grouping: terraform_sync_once -> phase_3_argocd (MAIN) -> {argocd_preflight -> ... -> validate_argocd_ready} (internal) -> phase_3_argocd own outputs.validate_argocd_ready_result -> phase_4_platform_observability (MAIN) -> {platform_preflight | observability_preflight} (internal). Phase 4 grouping: platform_sync_once/observability_sync_once/validate_platform_ready/validate_observability_ready/validate_shared_secrets_once now live inside that same grouped Phase 4 wrapper.
 if "terraform_sync_once" not in needs_of("phase_3_argocd"):
     print("FAIL: phase_3_argocd does not need terraform_sync_once")
     sys.exit(1)
@@ -5604,31 +5617,33 @@ if phase3_jobs["argocd_preflight"].get("needs"):
 if "argocd_preflight" not in phase3_needs_of("validate_argocd_ready"):
     print("FAIL: validate_argocd_ready does not need argocd_preflight")
     sys.exit(1)
-if "phase_3_argocd" not in needs_of("platform_preflight"):
-    print("FAIL: platform_preflight does not need phase_3_argocd")
+if "phase_3_argocd" not in needs_of("phase_4_platform_observability"):
+    print("FAIL: phase_4_platform_observability does not need phase_3_argocd")
     sys.exit(1)
-if "platform_preflight" not in needs_of("platform_sync_once"):
+if phase4_jobs["platform_preflight"].get("needs"):
+    print("FAIL: platform_preflight has a needs: of its own (phase_3_argocd's result should cross the reusable-workflow boundary as inputs.result_phase_3_argocd, never a needs: reference)")
+    sys.exit(1)
+if "platform_preflight" not in phase4_needs_of("platform_sync_once"):
     print("FAIL: platform_sync_once does not need platform_preflight")
     sys.exit(1)
-if "phase_3_argocd" not in needs_of("observability_preflight"):
-    print("FAIL: observability_preflight does not need phase_3_argocd")
+if phase4_jobs["observability_preflight"].get("needs"):
+    print("FAIL: observability_preflight has a needs: of its own (phase_3_argocd's result should cross the reusable-workflow boundary as inputs.result_phase_3_argocd, never a needs: reference)")
     sys.exit(1)
-if "observability_preflight" not in needs_of("observability_sync_once"):
+if "observability_preflight" not in phase4_needs_of("observability_sync_once"):
     print("FAIL: observability_sync_once does not need observability_preflight")
     sys.exit(1)
-if "platform_preflight" not in needs_of("validate_platform_ready") or "platform_sync_once" not in needs_of("validate_platform_ready"):
+if "platform_preflight" not in phase4_needs_of("validate_platform_ready") or "platform_sync_once" not in phase4_needs_of("validate_platform_ready"):
     print("FAIL: validate_platform_ready does not need both platform_preflight and platform_sync_once")
     sys.exit(1)
-if "observability_preflight" not in needs_of("validate_observability_ready") or "observability_sync_once" not in needs_of("validate_observability_ready"):
+if "observability_preflight" not in phase4_needs_of("validate_observability_ready") or "observability_sync_once" not in phase4_needs_of("validate_observability_ready"):
     print("FAIL: validate_observability_ready does not need both observability_preflight and observability_sync_once")
     sys.exit(1)
-if ("terraform_sync_once" not in needs_of("validate_shared_secrets_once")
-        or "validate_platform_ready" not in needs_of("validate_shared_secrets_once")
-        or "validate_observability_ready" not in needs_of("validate_shared_secrets_once")):
-    print("FAIL: validate_shared_secrets_once does not need terraform_sync_once, validate_platform_ready, and validate_observability_ready")
+if ("validate_platform_ready" not in phase4_needs_of("validate_shared_secrets_once")
+        or "validate_observability_ready" not in phase4_needs_of("validate_shared_secrets_once")):
+    print("FAIL: validate_shared_secrets_once does not need both validate_platform_ready and validate_observability_ready")
     sys.exit(1)
-if "validate_shared_secrets_once" not in needs_of("build_publish_and_deploy"):
-    print("FAIL: build_publish_and_deploy does not need validate_shared_secrets_once")
+if "phase_4_platform_observability" not in needs_of("build_publish_and_deploy"):
+    print("FAIL: build_publish_and_deploy does not need phase_4_platform_observability")
     sys.exit(1)
 if "build_publish_and_deploy" not in needs_of("phase_7_monitor_final_acceptance"):
     print("FAIL: phase_7_monitor_final_acceptance does not need build_publish_and_deploy")
@@ -5640,15 +5655,19 @@ if "monitor_sync_once" not in phase7_needs_of("final_validation"):
     print("FAIL: final_validation (inside the grouped Phase 7 workflow) does not need monitor_sync_once")
     sys.exit(1)
 
-for name in ("terraform_sync_once", "platform_sync_once", "observability_sync_once", "phase_7_monitor_final_acceptance"):
+for name in ("terraform_sync_once", "phase_3_argocd", "phase_4_platform_observability", "phase_7_monitor_final_acceptance"):
     if not str(jobs[name].get("uses", "")).startswith("./.github/workflows/"):
         print(f"FAIL: {name} does not call a reusable workflow via a job-level uses:")
+        sys.exit(1)
+for name in ("platform_sync_once", "observability_sync_once"):
+    if not str(phase4_jobs[name].get("uses", "")).startswith("./.github/workflows/"):
+        print(f"FAIL: {name} (inside the grouped Phase 4 workflow) does not call a reusable workflow via a job-level uses:")
         sys.exit(1)
 if not str(phase7_jobs["monitor_sync_once"].get("uses", "")).startswith("./.github/workflows/"):
     print("FAIL: monitor_sync_once (inside the grouped Phase 7 workflow) does not call a reusable workflow via a job-level uses:")
     sys.exit(1)
 
-if "strategy" in jobs["validate_shared_secrets_once"] or "matrix" in jobs["validate_shared_secrets_once"]:
+if "strategy" in phase4_jobs["validate_shared_secrets_once"] or "matrix" in phase4_jobs["validate_shared_secrets_once"]:
     print("FAIL: validate_shared_secrets_once uses a matrix (must be a single job)")
     sys.exit(1)
 
@@ -5867,7 +5886,8 @@ else
   pass "29: GoldenGateSecretsReadRole-dev grants no DynamoDB write or CloudWatch PutMetricData permission"
 fi
 
-if grep -qF "needs.validate_model.outputs.effective_deploy != 'true' || (needs.terraform_sync_once.result == 'success' && needs.validate_platform_ready.result == 'success' && needs.validate_observability_ready.result == 'success')" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+# Phase 4 grouping: validate_shared_secrets_once now lives inside the grouped Phase 4 wrapper, addressed only via workflow_call inputs.
+if grep -qF "inputs.effective_deploy != 'true' || (inputs.result_terraform_sync_once == 'success' && needs.validate_platform_ready.result == 'success' && needs.validate_observability_ready.result == 'success')" "$PHASE4_WORKFLOW" 2>/dev/null; then
   pass "29: the read-only validation chain (validate_shared_secrets_once) is deploy-aware and fail-closed -- it tolerates a legitimately skipped terraform/platform/observability convergence only when deploy=false, and requires their exact success when deploy=true"
 else
   fail "29: validate_shared_secrets_once no longer contains the required deploy-aware fail-closed condition"
@@ -6115,17 +6135,18 @@ echo "--- Phase 6D0-Final: reusable-workflow secret/permission chain ---"
 
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   set +e
-  WORKFLOW_CHAIN_CHECK="$(python3 - "$EKS_APP_WORKFLOW" ".github/workflows/10-sub-iam-secrets.yaml" ".github/workflows/30-sub-platform.yaml" ".github/workflows/50-sub-monitor.yaml" "$PHASE7_WORKFLOW" <<'PYEOF'
+  WORKFLOW_CHAIN_CHECK="$(python3 - "$EKS_APP_WORKFLOW" ".github/workflows/10-sub-iam-secrets.yaml" ".github/workflows/30-sub-platform.yaml" ".github/workflows/50-sub-monitor.yaml" "$PHASE7_WORKFLOW" "$PHASE4_WORKFLOW" <<'PYEOF'
 import sys
 import yaml
 
-eks_app_path, terraform_wf_path, platform_wf_path, monitor_wf_path, phase7_wf_path = sys.argv[1:6]
+eks_app_path, terraform_wf_path, platform_wf_path, monitor_wf_path, phase7_wf_path, phase4_wf_path = sys.argv[1:7]
 
 eks_app = yaml.safe_load(open(eks_app_path))
 terraform_wf = yaml.safe_load(open(terraform_wf_path))
 platform_wf = yaml.safe_load(open(platform_wf_path))
 monitor_wf = yaml.safe_load(open(monitor_wf_path))
 phase7_wf = yaml.safe_load(open(phase7_wf_path))
+phase4_wf = yaml.safe_load(open(phase4_wf_path))
 
 jobs = eks_app["jobs"]
 terraform_job = jobs["terraform_sync_once"]
@@ -6148,8 +6169,8 @@ if apply_job.get("secrets") != "inherit":
     print("FAIL: 10-sub-iam-secrets.yaml's apply job does not forward secrets to the ADCB reusable workflow")
     sys.exit(1)
 
-# Phase 7 grouping: monitor_sync_once now lives inside the grouped Phase 7 reusable workflow, never directly in MAIN -- checked against that document instead. MAIN's own new phase_7_monitor_final_acceptance caller (which calls 70-phase-monitor-final-acceptance.yaml, itself referencing no secrets.*) is checked the same way as platform_sync_once/monitor_sync_once.
-for name, job in (("platform_sync_once", jobs["platform_sync_once"]), ("phase_7_monitor_final_acceptance", jobs["phase_7_monitor_final_acceptance"]), ("monitor_sync_once", phase7_wf["jobs"]["monitor_sync_once"])):
+# Phase 7 grouping: monitor_sync_once now lives inside the grouped Phase 7 reusable workflow, never directly in MAIN -- checked against that document instead. Phase 4 grouping: platform_sync_once now likewise lives inside the grouped Phase 4 reusable workflow -- checked against that document instead. MAIN's own new phase_7_monitor_final_acceptance caller (which calls 70-phase-monitor-final-acceptance.yaml, itself referencing no secrets.*) is checked the same way as platform_sync_once/monitor_sync_once.
+for name, job in (("platform_sync_once", phase4_wf["jobs"]["platform_sync_once"]), ("phase_7_monitor_final_acceptance", jobs["phase_7_monitor_final_acceptance"]), ("monitor_sync_once", phase7_wf["jobs"]["monitor_sync_once"])):
     if "secrets" in job:
         print(f"FAIL: {name} declares unnecessary secret forwarding (neither called workflow references secrets.*)")
         sys.exit(1)
@@ -7232,7 +7253,7 @@ echo "--- Final workflow correction, Issue 1: fail-closed job graph for a real d
 
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   set +e
-  FAIL_CLOSED_SIM_OUT="$(python3 - "$EKS_APP_WORKFLOW" "$PHASE3_WORKFLOW" <<'PYEOF'
+  FAIL_CLOSED_SIM_OUT="$(python3 - "$EKS_APP_WORKFLOW" "$PHASE3_WORKFLOW" "$PHASE4_WORKFLOW" <<'PYEOF'
 import re
 import sys
 import yaml
@@ -7241,9 +7262,12 @@ with open(sys.argv[1]) as f:
     doc = yaml.safe_load(f)
 with open(sys.argv[2]) as f:
     phase3_doc = yaml.safe_load(f)
+with open(sys.argv[3]) as f:
+    phase4_doc = yaml.safe_load(f)
 
 jobs = doc["jobs"]
 phase3_jobs = phase3_doc["jobs"]
+phase4_jobs = phase4_doc["jobs"]
 
 
 def _extract_if(source_jobs, job_name):
@@ -7372,12 +7396,44 @@ def simulate_phase3(inputs, outcome_when_run, outputs_when_run=None):
     return wrapper_result, wrapper_outputs, internal
 
 
-# Phase B1 inserts the Argo CD prerequisite state machine between Terraform and the platform chart; Live Argo Recovery Fix reworked it into automatic desired-state reconciliation (reconcile_argocd, formerly bootstrap_argocd); Phase B2 inserts the same ownership-aware state machine, independently in parallel, for the GoldenGate Platform and Observability application prerequisites between validate_argocd_ready and validate_shared_secrets_once; Phase B3A inserts the read-only runtime ownership-safety preflight between validate_shared_secrets_once and build_publish_and_deploy; Live Deployment Approval Topology Fix inserts goldengate_deploy_authorization (the single GoldenGate application deployment approval) between argocd_preflight and reconcile_argocd -- all simulated in real DAG order like every other job here, off the same real if: expressions. Phase 3 grouping: argocd_preflight/goldengate_deploy_authorization/reconcile_argocd/validate_argocd_ready now live inside the grouped Phase 3 wrapper -- represented here by the single phase_3_argocd step, whose own result/outputs are computed by simulate_phase3() above and folded back into this outer simulation.
-JOB_ORDER = ["terraform_sync_once", "phase_3_argocd", "platform_preflight", "observability_preflight", "platform_sync_once", "observability_sync_once", "validate_platform_ready", "validate_observability_ready", "validate_shared_secrets_once", "runtime_ownership_preflight", "build_publish_and_deploy"]
+# Phase 4 grouping: the internal Phase 4 DAG (platform_preflight/observability_preflight -> platform_sync_once/observability_sync_once -> validate_platform_ready/validate_observability_ready -> validate_shared_secrets_once) now lives inside 40-phase-platform-observability-shared-secrets.yaml, addressed only via workflow_call inputs.*, never needs.validate_model.outputs.*/needs.terraform_sync_once.result/needs.phase_3_argocd.*/needs.phase_3_argocd.outputs.* directly.
+PHASE4_JOB_ORDER = ["platform_preflight", "observability_preflight", "platform_sync_once", "observability_sync_once", "validate_platform_ready", "validate_observability_ready", "validate_shared_secrets_once"]
+PHASE4_IF_EXPRS = {job: _extract_if(phase4_jobs, job) for job in PHASE4_JOB_ORDER}
+
+
+def simulate_phase4(inputs, outcome_when_run, outputs_when_run=None):
+    """Simulates the grouped Phase 4 wrapper's own internal DAG given the translated workflow_call inputs, then folds the internal per-job results into (wrapper_result, wrapper_outputs, internal_results) exactly the way GitHub Actions itself computes a reusable workflow's own overall result and its named jobs.<id>.result-backed outputs: skipped if no internal job ran, the worst of failure/cancelled if any internal job that ran reported one, success otherwise."""
+    outputs_when_run = outputs_when_run or {}
+    internal = {}
+    for job in PHASE4_JOB_ORDER:
+        would_run = eval_gha_bool(PHASE4_IF_EXPRS[job], internal, inputs)
+        if would_run:
+            internal[job] = {"result": outcome_when_run.get(job, "success"), "outputs": outputs_when_run.get(job, {})}
+        else:
+            internal[job] = {"result": "skipped", "outputs": {}}
+    ran_results = [internal[j]["result"] for j in PHASE4_JOB_ORDER if internal[j]["result"] != "skipped"]
+    if not ran_results:
+        wrapper_result = "skipped"
+    elif "failure" in ran_results:
+        wrapper_result = "failure"
+    elif "cancelled" in ran_results:
+        wrapper_result = "cancelled"
+    else:
+        wrapper_result = "success"
+    wrapper_outputs = {
+        "validate_platform_ready_result": internal["validate_platform_ready"]["result"],
+        "validate_observability_ready_result": internal["validate_observability_ready"]["result"],
+        "validate_shared_secrets_once_result": internal["validate_shared_secrets_once"]["result"],
+    }
+    return wrapper_result, wrapper_outputs, internal
+
+
+# Phase B1 inserts the Argo CD prerequisite state machine between Terraform and the platform chart; Live Argo Recovery Fix reworked it into automatic desired-state reconciliation (reconcile_argocd, formerly bootstrap_argocd); Phase B2 inserts the same ownership-aware state machine, independently in parallel, for the GoldenGate Platform and Observability application prerequisites between validate_argocd_ready and validate_shared_secrets_once; Phase B3A inserts the read-only runtime ownership-safety preflight between validate_shared_secrets_once and build_publish_and_deploy; Live Deployment Approval Topology Fix inserts goldengate_deploy_authorization (the single GoldenGate application deployment approval) between argocd_preflight and reconcile_argocd -- all simulated in real DAG order like every other job here, off the same real if: expressions. Phase 3 grouping: argocd_preflight/goldengate_deploy_authorization/reconcile_argocd/validate_argocd_ready now live inside the grouped Phase 3 wrapper -- represented here by the single phase_3_argocd step, whose own result/outputs are computed by simulate_phase3() above and folded back into this outer simulation. Phase 4 grouping: platform_preflight/observability_preflight/platform_sync_once/observability_sync_once/validate_platform_ready/validate_observability_ready/validate_shared_secrets_once now live inside the grouped Phase 4 wrapper -- represented here by the single phase_4_platform_observability step, whose own result/outputs are computed by simulate_phase4() above and folded back into this outer simulation.
+JOB_ORDER = ["terraform_sync_once", "phase_3_argocd", "phase_4_platform_observability", "runtime_ownership_preflight", "build_publish_and_deploy"]
 IF_EXPRS = {job: _extract_if(jobs, job) for job in JOB_ORDER}
 
 
-def simulate(initial, outcome_when_run, outputs_when_run=None, phase3_outcome_when_run=None, phase3_outputs_when_run=None):
+def simulate(initial, outcome_when_run, outputs_when_run=None, phase3_outcome_when_run=None, phase3_outputs_when_run=None, phase4_outcome_when_run=None, phase4_outputs_when_run=None):
     results = dict(initial)
     outputs_when_run = outputs_when_run or {}
     for job in JOB_ORDER:
@@ -7395,6 +7451,24 @@ def simulate(initial, outcome_when_run, outputs_when_run=None, phase3_outcome_wh
                 internal = {j: {"result": "skipped", "outputs": {}} for j in PHASE3_JOB_ORDER}
                 results[job] = {"result": "skipped", "outputs": {}}
             results["_phase3_internal"] = internal
+            continue
+        if job == "phase_4_platform_observability":
+            would_run = eval_gha_bool(IF_EXPRS[job], results)
+            if would_run:
+                phase4_inputs = {
+                    "selected_environment": results["validate_model"]["outputs"].get("selected_environment", "dev"),
+                    "effective_deploy": results["validate_model"]["outputs"].get("effective_deploy", "false"),
+                    "result_validate_model": results["validate_model"]["result"],
+                    "result_terraform_sync_once": results["terraform_sync_once"]["result"],
+                    "result_phase_3_argocd": results["phase_3_argocd"]["result"],
+                    "result_validate_argocd_ready": results["phase_3_argocd"]["outputs"].get("validate_argocd_ready_result") or results["phase_3_argocd"]["result"],
+                }
+                wrapper_result, wrapper_outputs, internal = simulate_phase4(phase4_inputs, phase4_outcome_when_run or {}, phase4_outputs_when_run)
+                results[job] = {"result": wrapper_result, "outputs": wrapper_outputs}
+            else:
+                internal = {j: {"result": "skipped", "outputs": {}} for j in PHASE4_JOB_ORDER}
+                results[job] = {"result": "skipped", "outputs": {}}
+            results["_phase4_internal"] = internal
             continue
         would_run = eval_gha_bool(IF_EXPRS[job], results)
         if would_run:
@@ -7432,54 +7506,54 @@ r = simulate(ctx, {})
 check("1b: terraform_sync_once must be skipped when eks_oidc_preflight fails", r["terraform_sync_once"]["result"] == "skipped")
 check("1b: build_publish_and_deploy must be skipped when eks_oidc_preflight fails", r["build_publish_and_deploy"]["result"] == "skipped")
 
-# 2: deploy=true + terraform failure -> runtime build/deploy cannot execute.
+# 2: deploy=true + terraform failure -> runtime build/deploy cannot execute. Phase 4 grouping: platform_sync_once/validate_shared_secrets_once are checked via r["_phase4_internal"].
 ctx = base_context("true")
 r = simulate(ctx, {"terraform_sync_once": "failure"})
 check("2: terraform_sync_once must report failure", r["terraform_sync_once"]["result"] == "failure")
-check("2: platform_sync_once must be skipped", r["platform_sync_once"]["result"] == "skipped")
-check("2: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
+check("2: platform_sync_once must be skipped", r["_phase4_internal"]["platform_sync_once"]["result"] == "skipped")
+check("2: validate_shared_secrets_once must be skipped", r["_phase4_internal"]["validate_shared_secrets_once"]["result"] == "skipped")
 check("2: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
 
-# 3: deploy=true + Argo CD already OWNED (Generic MAIN Desired-State Convergence Fix: reconcile_argocd now ALWAYS RUNS on OWNED -- a DEPLOY converges the live release to current desired state, it never merely skips because a classifier proved ownership) + platform ABSENT+reconcile failure (observability stays OWNED, isolating the failure to platform) -> runtime build/deploy cannot execute. Phase 3 grouping: argocd_preflight/reconcile_argocd/validate_argocd_ready are checked via r["_phase3_internal"].
+# 3: deploy=true + Argo CD already OWNED (Generic MAIN Desired-State Convergence Fix: reconcile_argocd now ALWAYS RUNS on OWNED -- a DEPLOY converges the live release to current desired state, it never merely skips because a classifier proved ownership) + platform ABSENT+reconcile failure (observability stays OWNED, isolating the failure to platform) -> runtime build/deploy cannot execute. Phase 3 grouping: argocd_preflight/reconcile_argocd/validate_argocd_ready are checked via r["_phase3_internal"]. Phase 4 grouping: platform_sync_once/validate_platform_ready/observability_sync_once/validate_observability_ready/validate_shared_secrets_once are checked via r["_phase4_internal"].
 ctx = base_context("true")
-r = simulate(ctx, {"platform_sync_once": "failure"}, {"platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "OWNED"}}, phase3_outputs_when_run={"argocd_preflight": {"state": "OWNED"}})
+r = simulate(ctx, {}, phase3_outputs_when_run={"argocd_preflight": {"state": "OWNED"}}, phase4_outcome_when_run={"platform_sync_once": "failure"}, phase4_outputs_when_run={"platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "OWNED"}})
 check("3: reconcile_argocd must RUN (and succeed) even when Argo CD is already OWNED", r["_phase3_internal"]["reconcile_argocd"]["result"] == "success")
 check("3: validate_argocd_ready must succeed on the already-OWNED-and-reconciled path", r["_phase3_internal"]["validate_argocd_ready"]["result"] == "success")
-check("3: platform_sync_once must report failure", r["platform_sync_once"]["result"] == "failure")
-check("3: validate_platform_ready must be skipped after a failed platform_sync_once", r["validate_platform_ready"]["result"] == "skipped")
-check("3: observability_sync_once must still RUN (and succeed) even though observability is already OWNED -- MAIN never skips a safe owned reconciliation, isolating platform's failure", r["observability_sync_once"]["result"] == "success")
-check("3: validate_observability_ready must still succeed (independent of platform's failure)", r["validate_observability_ready"]["result"] == "success")
-check("3: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
+check("3: platform_sync_once must report failure", r["_phase4_internal"]["platform_sync_once"]["result"] == "failure")
+check("3: validate_platform_ready must be skipped after a failed platform_sync_once", r["_phase4_internal"]["validate_platform_ready"]["result"] == "skipped")
+check("3: observability_sync_once must still RUN (and succeed) even though observability is already OWNED -- MAIN never skips a safe owned reconciliation, isolating platform's failure", r["_phase4_internal"]["observability_sync_once"]["result"] == "success")
+check("3: validate_observability_ready must still succeed (independent of platform's failure)", r["_phase4_internal"]["validate_observability_ready"]["result"] == "success")
+check("3: validate_shared_secrets_once must be skipped", r["_phase4_internal"]["validate_shared_secrets_once"]["result"] == "skipped")
 check("3: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
 
 # 4: deploy=true + all mutation prerequisites already OWNED (Argo CD/platform/observability all already-existing, safely-owned installations, runtime ownership OWNED) -> Generic MAIN Desired-State Convergence Fix requirement 4/5: MAIN STILL invokes reconcile_argocd/30-sub-platform/40-sub-observability on every Deploy, never predicting from a healthy-looking preflight that reconciliation is unnecessary -> runtime deployment may still execute.
 ctx = base_context("true")
-r = simulate(ctx, {}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}, "runtime_ownership_preflight": {"state": "OWNED"}}, phase3_outputs_when_run={"argocd_preflight": {"state": "OWNED"}})
+r = simulate(ctx, {}, {"runtime_ownership_preflight": {"state": "OWNED"}}, phase3_outputs_when_run={"argocd_preflight": {"state": "OWNED"}}, phase4_outputs_when_run={"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
 check("4: terraform_sync_once must succeed", r["terraform_sync_once"]["result"] == "success")
 check("4: validate_argocd_ready must succeed", r["_phase3_internal"]["validate_argocd_ready"]["result"] == "success")
-check("4: platform_sync_once MUST run (and succeed) even though platform is already OWNED/healthy-looking -- MAIN never skips specialist reconciliation on a Deploy (required test 4)", r["platform_sync_once"]["result"] == "success")
-check("4: observability_sync_once MUST run (and succeed) even though observability is already OWNED/healthy-looking -- MAIN never skips specialist reconciliation on a Deploy (required test 5)", r["observability_sync_once"]["result"] == "success")
-check("4: validate_platform_ready must succeed", r["validate_platform_ready"]["result"] == "success")
-check("4: validate_observability_ready must succeed", r["validate_observability_ready"]["result"] == "success")
-check("4: validate_shared_secrets_once must succeed", r["validate_shared_secrets_once"]["result"] == "success")
+check("4: platform_sync_once MUST run (and succeed) even though platform is already OWNED/healthy-looking -- MAIN never skips specialist reconciliation on a Deploy (required test 4)", r["_phase4_internal"]["platform_sync_once"]["result"] == "success")
+check("4: observability_sync_once MUST run (and succeed) even though observability is already OWNED/healthy-looking -- MAIN never skips specialist reconciliation on a Deploy (required test 5)", r["_phase4_internal"]["observability_sync_once"]["result"] == "success")
+check("4: validate_platform_ready must succeed", r["_phase4_internal"]["validate_platform_ready"]["result"] == "success")
+check("4: validate_observability_ready must succeed", r["_phase4_internal"]["validate_observability_ready"]["result"] == "success")
+check("4: validate_shared_secrets_once must succeed", r["_phase4_internal"]["validate_shared_secrets_once"]["result"] == "success")
 check("4: runtime_ownership_preflight must succeed (OWNED permits reconciliation)", r["runtime_ownership_preflight"]["result"] == "success")
 check("4: build_publish_and_deploy must be eligible to run", r["build_publish_and_deploy"]["result"] == "success")
 
 # 7: deploy=true + Argo CD ABSENT + reconcile_argocd succeeds -> validate_argocd_ready converges to success -> platform/observability preflights run; platform ABSENT+reconcile success, observability already OWNED (and therefore also reconciled, not skipped).
 ctx = base_context("true")
-r = simulate(ctx, {}, {"platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "OWNED"}}, phase3_outputs_when_run={"argocd_preflight": {"state": "ABSENT"}})
+r = simulate(ctx, {}, phase3_outputs_when_run={"argocd_preflight": {"state": "ABSENT"}}, phase4_outputs_when_run={"platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "OWNED"}})
 check("7: reconcile_argocd must run when Argo CD is ABSENT", r["_phase3_internal"]["reconcile_argocd"]["result"] == "success")
 check("7: validate_argocd_ready must succeed after a successful reconciliation", r["_phase3_internal"]["validate_argocd_ready"]["result"] == "success")
-check("7: platform_sync_once must be eligible to run after reconciliation (platform is ABSENT)", r["platform_sync_once"]["result"] == "success")
-check("7: validate_platform_ready must succeed after a successful reconciliation", r["validate_platform_ready"]["result"] == "success")
-check("7: validate_shared_secrets_once must succeed end-to-end", r["validate_shared_secrets_once"]["result"] == "success")
+check("7: platform_sync_once must be eligible to run after reconciliation (platform is ABSENT)", r["_phase4_internal"]["platform_sync_once"]["result"] == "success")
+check("7: validate_platform_ready must succeed after a successful reconciliation", r["_phase4_internal"]["validate_platform_ready"]["result"] == "success")
+check("7: validate_shared_secrets_once must succeed end-to-end", r["_phase4_internal"]["validate_shared_secrets_once"]["result"] == "success")
 
 # 8: deploy=true + Argo CD ABSENT + reconcile_argocd FAILS -> validate_argocd_ready must never run -> platform must never run. (Live Argo Recovery Fix required scenario 7: "reconcile failure => downstream platform orchestration cannot continue".)
 ctx = base_context("true")
 r = simulate(ctx, {}, phase3_outcome_when_run={"reconcile_argocd": "failure"}, phase3_outputs_when_run={"argocd_preflight": {"state": "ABSENT"}})
 check("8: reconcile_argocd must report failure", r["_phase3_internal"]["reconcile_argocd"]["result"] == "failure")
 check("8: validate_argocd_ready must be skipped after a failed reconciliation", r["_phase3_internal"]["validate_argocd_ready"]["result"] == "skipped")
-check("8: platform_sync_once must be skipped after a failed reconciliation", r["platform_sync_once"]["result"] == "skipped")
+check("8: platform_sync_once must be skipped after a failed reconciliation", r["_phase4_internal"]["platform_sync_once"]["result"] == "skipped")
 
 # 9: deploy=true + Argo CD BROKEN (argocd_preflight itself fails closed) -> reconcile_argocd must never even be entered, and platform must never run. (Live Argo Recovery Fix required scenario 4: "deploy + BROKEN => reconciliation must NOT execute and the path fails closed".)
 ctx = base_context("true")
@@ -7487,19 +7561,19 @@ r = simulate(ctx, {}, phase3_outcome_when_run={"argocd_preflight": "failure"})
 check("9: argocd_preflight must report failure on BROKEN", r["_phase3_internal"]["argocd_preflight"]["result"] == "failure")
 check("9: reconcile_argocd must never run on BROKEN", r["_phase3_internal"]["reconcile_argocd"]["result"] == "skipped")
 check("9: validate_argocd_ready must be skipped on BROKEN", r["_phase3_internal"]["validate_argocd_ready"]["result"] == "skipped")
-check("9: platform_sync_once must be skipped on BROKEN", r["platform_sync_once"]["result"] == "skipped")
+check("9: platform_sync_once must be skipped on BROKEN", r["_phase4_internal"]["platform_sync_once"]["result"] == "skipped")
 
 # 10: deploy=true + Argo CD OWNED (an already-existing, safely-owned release -- e.g. only the generated repository Secrets or a newly-enabled Ingress not yet rendered) -> reconcile_argocd must run (Generic MAIN Desired-State Convergence Fix required scenario 2), converge to success, and platform/observability/runtime deployment must remain eligible -- this is the exact case that used to dead-end MAIN at BROKEN under the retired RECONCILABLE/HEALTHY split.
 ctx = base_context("true")
-r = simulate(ctx, {}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}, "runtime_ownership_preflight": {"state": "OWNED"}}, phase3_outputs_when_run={"argocd_preflight": {"state": "OWNED"}})
+r = simulate(ctx, {}, {"runtime_ownership_preflight": {"state": "OWNED"}}, phase3_outputs_when_run={"argocd_preflight": {"state": "OWNED"}}, phase4_outputs_when_run={"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
 check("10: reconcile_argocd must run (and succeed) when Argo CD is OWNED", r["_phase3_internal"]["reconcile_argocd"]["result"] == "success")
 check("10: validate_argocd_ready must succeed after a successful OWNED reconciliation", r["_phase3_internal"]["validate_argocd_ready"]["result"] == "success")
-check("10: platform_preflight must remain eligible (never dead-ends behind an OWNED Argo CD)", r["platform_preflight"]["result"] == "success")
+check("10: platform_preflight must remain eligible (never dead-ends behind an OWNED Argo CD)", r["_phase4_internal"]["platform_preflight"]["result"] == "success")
 check("10: build_publish_and_deploy must remain eligible to run", r["build_publish_and_deploy"]["result"] == "success")
 
 # 11: action=validate (effective_deploy=false) with an otherwise-owned/absent Argo CD state -> argocd_preflight/reconcile_argocd must both be skipped -- Validate mode never mutates Argo CD regardless of classified state. (Generic MAIN Desired-State Convergence Fix required scenario 5.) validate_model itself still succeeds as a whole in Validate mode (its own Deploy-only steps are skipped internally via their own step-level if:, never surfaced as a separate job result).
 ctx = base_context("false")
-r = simulate(ctx, {}, phase3_outputs_when_run={"argocd_preflight": {"state": "OWNED"}})
+r = simulate(ctx, {}, phase3_outputs_when_run={"argocd_preflight": {"state": "OWNED"}}, phase4_outputs_when_run={"platform_preflight": {"state": "OWNED"}})
 check("11: phase_3_argocd (the grouped wrapper) must itself be skipped in Validate mode", r["phase_3_argocd"]["result"] == "skipped")
 check("11: argocd_preflight must be skipped in Validate mode regardless of live state", r["_phase3_internal"]["argocd_preflight"]["result"] == "skipped")
 check("11: reconcile_argocd must never run in Validate mode (no mutating Argo CD reconciliation)", r["_phase3_internal"]["reconcile_argocd"]["result"] == "skipped")
@@ -7511,22 +7585,22 @@ r = simulate(ctx, {}, phase3_outcome_when_run={"validate_argocd_ready": "failure
 check("12: reconcile_argocd itself must still report success (the SUB workflow completed)", r["_phase3_internal"]["reconcile_argocd"]["result"] == "success")
 check("12: validate_argocd_ready must report failure when final re-classification is not exactly HEALTHY", r["_phase3_internal"]["validate_argocd_ready"]["result"] == "failure")
 check("12: phase_3_argocd (the grouped wrapper) must itself report failure, never success, when its internal validate_argocd_ready failed", r["phase_3_argocd"]["result"] == "failure")
-check("12: platform_preflight must never run when validate_argocd_ready failed post-reconcile", r["platform_preflight"]["result"] == "skipped")
+check("12: platform_preflight must never run when validate_argocd_ready failed post-reconcile (phase_4_platform_observability itself never even starts, since its own inputs.result_phase_3_argocd == failure)", r["phase_4_platform_observability"]["result"] == "skipped" and r["_phase4_internal"]["platform_preflight"]["result"] == "skipped")
 check("12: build_publish_and_deploy must never run when validate_argocd_ready failed post-reconcile", r["build_publish_and_deploy"]["result"] == "skipped")
 
 # 5: deploy=false -> terraform/platform may be skipped -> read-only/Helm dry-run path still executes.
 ctx = base_context("false")
 r = simulate(ctx, {})
 check("5: terraform_sync_once must be skipped", r["terraform_sync_once"]["result"] == "skipped")
-check("5: platform_sync_once must be skipped", r["platform_sync_once"]["result"] == "skipped")
-check("5: validate_shared_secrets_once must still succeed", r["validate_shared_secrets_once"]["result"] == "success")
+check("5: platform_sync_once must be skipped", r["_phase4_internal"]["platform_sync_once"]["result"] == "skipped")
+check("5: validate_shared_secrets_once must still succeed", r["_phase4_internal"]["validate_shared_secrets_once"]["result"] == "success")
 check("5: build_publish_and_deploy dry-run path must still be eligible to run", r["build_publish_and_deploy"]["result"] == "success")
 
-# 6: build_publish_and_deploy requires validate_shared_secrets_once SUCCESS, not merely not-failure/not-cancelled -- simulate a bare "skipped" upstream result directly and confirm it is rejected (the old assertion would have let this through).
+# 6: build_publish_and_deploy requires validate_shared_secrets_once SUCCESS, not merely not-failure/not-cancelled -- simulate a bare "skipped" upstream result directly and confirm it is rejected (the old assertion would have let this through). Phase 4 grouping: build_publish_and_deploy's real if: now checks needs.phase_4_platform_observability.result AND needs.phase_4_platform_observability.outputs.validate_shared_secrets_once_result -- fabricate a wrapper that reports its own overall result as "success" while its exact internal validate_shared_secrets_once_result is "skipped", proving the exact-output check (never the wrapper-result-alone check) is what actually rejects it.
 skipped_ctx = base_context("true")
-skipped_ctx["validate_shared_secrets_once"] = {"result": "skipped", "outputs": {}}
+skipped_ctx["phase_4_platform_observability"] = {"result": "success", "outputs": {"validate_shared_secrets_once_result": "skipped"}}
 would_run = eval_gha_bool(IF_EXPRS["build_publish_and_deploy"], skipped_ctx)
-check("6: build_publish_and_deploy must reject a skipped validate_shared_secrets_once", would_run is False)
+check("6: build_publish_and_deploy must reject a skipped validate_shared_secrets_once_result even when the wrapper's own overall result claims success", would_run is False)
 
 if failures:
     print("\n".join(failures))
@@ -7562,10 +7636,10 @@ else
   fail "build_publish_and_deploy still contains the old != 'failure'/!= 'cancelled' assertion for validate_shared_secrets_once"
 fi
 
-if grep -qF "needs.validate_shared_secrets_once.result == 'success'" "$EKS_APP_WORKFLOW" 2>/dev/null; then
-  pass "build_publish_and_deploy's if: explicitly requires needs.validate_shared_secrets_once.result == 'success'"
+if grep -qF "needs.phase_4_platform_observability.outputs.validate_shared_secrets_once_result == 'success'" "$EKS_APP_WORKFLOW" 2>/dev/null && grep -qF "needs.phase_4_platform_observability.result == 'success'" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+  pass "build_publish_and_deploy's if: explicitly requires needs.phase_4_platform_observability.result == 'success' AND needs.phase_4_platform_observability.outputs.validate_shared_secrets_once_result == 'success' -- Phase 4 grouping: the exact former needs.validate_shared_secrets_once.result == 'success' requirement, translated to the grouped wrapper's own result plus its exact internal Phase 4G result, never conflated"
 else
-  fail "build_publish_and_deploy's if: does not explicitly require validate_shared_secrets_once.result == 'success'"
+  fail "build_publish_and_deploy's if: does not explicitly require both needs.phase_4_platform_observability.result == 'success' and needs.phase_4_platform_observability.outputs.validate_shared_secrets_once_result == 'success'"
 fi
 
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
@@ -7736,12 +7810,12 @@ else
   skip "Phase 4 Python Conversion: automation/phases/phase4/tests/test_phase4_shared_secrets.py -- python3 unavailable or file missing"
 fi
 
-# Structural delegation proof: validate_shared_secrets_once must still start from the canonical RUNNER_ROLE_ARN (job-level OIDC credential step, output-scoped per the Phase 1/3 pattern) and its live validation step must delegate to phase4_shared_secrets.py validate, never reimplement inline. Also proves the job's own mode-aware if: gating (Validate-mode pass-through vs strict Deploy-mode gating on terraform_sync_once/validate_platform_ready/validate_observability_ready) is unchanged.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+# Structural delegation proof: validate_shared_secrets_once must still start from the canonical RUNNER_ROLE_ARN (job-level OIDC credential step, output-scoped per the Phase 1/3 pattern) and its live validation step must delegate to phase4_shared_secrets.py validate, never reimplement inline. Also proves the job's own mode-aware if: gating (Validate-mode pass-through vs strict Deploy-mode gating on terraform_sync_once/validate_platform_ready/validate_observability_ready) is unchanged. Phase 4 grouping: this job now lives inside the grouped Phase 4 wrapper, addressed only via workflow_call inputs for its external references.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$PHASE4_WORKFLOW" ]; then
   SHARED_SECRETS_DELEGATION_CHECK="$(python3 -c '
 import yaml
 
-with open("'"$EKS_APP_WORKFLOW"'") as f:
+with open("'"$PHASE4_WORKFLOW"'") as f:
     doc = yaml.safe_load(f)
 
 job = doc["jobs"]["validate_shared_secrets_once"]
@@ -7764,8 +7838,8 @@ if validate_step is not None:
     results.append(("only this step receives the AWS credential outputs", all(k in env for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"))))
 
 job_if = job.get("if", "")
-results.append(("mode-aware gating preserved: Validate-mode pass-through (effective_deploy != true)", "effective_deploy != \x27true\x27" in job_if))
-results.append(("mode-aware gating preserved: real-deploy requires terraform_sync_once success", "terraform_sync_once.result == \x27success\x27" in job_if))
+results.append(("mode-aware gating preserved: Validate-mode pass-through (inputs.effective_deploy != true)", "inputs.effective_deploy != \x27true\x27" in job_if))
+results.append(("mode-aware gating preserved: real-deploy requires terraform_sync_once success (inputs.result_terraform_sync_once)", "inputs.result_terraform_sync_once == \x27success\x27" in job_if))
 results.append(("mode-aware gating preserved: real-deploy requires validate_platform_ready success", "validate_platform_ready.result == \x27success\x27" in job_if))
 results.append(("mode-aware gating preserved: real-deploy requires validate_observability_ready success", "validate_observability_ready.result == \x27success\x27" in job_if))
 results.append(("if: uses always() to survive a legitimately-skipped upstream dependency", "always()" in job_if))
@@ -7780,7 +7854,7 @@ for label, ok in results:
     esac
   done <<< "$SHARED_SECRETS_DELEGATION_CHECK"
 else
-  skip "Phase 4 Python Conversion: validate_shared_secrets_once delegation check -- python3/PyYAML unavailable or ${EKS_APP_WORKFLOW} missing"
+  skip "Phase 4 Python Conversion: validate_shared_secrets_once delegation check -- python3/PyYAML unavailable or ${PHASE4_WORKFLOW} missing"
 fi
 
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
@@ -9137,12 +9211,12 @@ fi
 echo ""
 echo "--- Live Deploy Fix 4: repository-wide GG_SELECTED_ENVIRONMENT scope hardening ---"
 
-# 1-5, 14: the repo-wide static checker itself, run against the REAL current repository -- proves it reports the expected inventory (9 active workflows, 12 jobs referencing GG_SELECTED_ENVIRONMENT -- down from 17 before the Phase 4 Python Conversion, since all seven Phase 4 MAIN jobs (platform_preflight/observability_preflight/platform_sync_once/observability_sync_once/validate_platform_ready/validate_observability_ready/validate_shared_secrets_once) no longer thread a job-level GG_SELECTED_ENVIRONMENT shell variable through their run: blocks at all -- they interpolate needs.validate_model.outputs.selected_environment directly as a GitHub Actions expression into each phase4_platform.py/phase4_observability.py/phase4_shared_secrets.py --environment argument, matching the same eliminate-the-unbound-shell-variable-risk-class pattern the Phase 3 Python Conversion already established for argocd_preflight/validate_argocd_ready) and ZERO unsafe jobs.
+# 1-5, 14: the repo-wide static checker itself, run against the REAL current repository -- proves it reports the expected inventory (12 active workflows, 12 jobs referencing GG_SELECTED_ENVIRONMENT -- down from 17 before the Phase 4 Python Conversion, since all seven Phase 4 MAIN jobs (platform_preflight/observability_preflight/platform_sync_once/observability_sync_once/validate_platform_ready/validate_observability_ready/validate_shared_secrets_once) no longer thread a job-level GG_SELECTED_ENVIRONMENT shell variable through their run: blocks at all -- they interpolate needs.validate_model.outputs.selected_environment directly as a GitHub Actions expression into each phase4_platform.py/phase4_observability.py/phase4_shared_secrets.py --environment argument, matching the same eliminate-the-unbound-shell-variable-risk-class pattern the Phase 3 Python Conversion already established for argocd_preflight/validate_argocd_ready) and ZERO unsafe jobs. Phase 4 grouping added the twelfth workflow (40-phase-platform-observability-shared-secrets.yaml) -- moving the seven Phase 4 jobs into it does not change the GG_SELECTED_ENVIRONMENT reference count, since none of them ever threaded it as a job-level shell variable to begin with.
 if [ -f "$ENV_SCOPE_CHECKER" ]; then
   ENV_SCOPE_REAL_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 "$ENV_SCOPE_CHECKER" 2>&1)"
   ENV_SCOPE_REAL_STATUS=$?
-  if [ "$ENV_SCOPE_REAL_STATUS" -eq 0 ] && grep -q "^Workflows inspected: 11$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^Jobs with GG_SELECTED_ENVIRONMENT run: references: 12$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^Unsafe jobs: 0$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^OK: zero unsafe GG_SELECTED_ENVIRONMENT references" <<< "$ENV_SCOPE_REAL_OUT"; then
-    pass "Live Deploy Fix 4: 1-5,14: ${ENV_SCOPE_CHECKER} reports 11 workflows inspected (Phase 7 grouping added 70-phase-monitor-final-acceptance.yaml, Phase 3 grouping added 30-phase-argocd-orchestration.yaml), 12 jobs referencing GG_SELECTED_ENVIRONMENT (unchanged -- moving jobs to another file does not change the count), and ZERO unsafe jobs against the real current repository"
+  if [ "$ENV_SCOPE_REAL_STATUS" -eq 0 ] && grep -q "^Workflows inspected: 12$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^Jobs with GG_SELECTED_ENVIRONMENT run: references: 12$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^Unsafe jobs: 0$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^OK: zero unsafe GG_SELECTED_ENVIRONMENT references" <<< "$ENV_SCOPE_REAL_OUT"; then
+    pass "Live Deploy Fix 4: 1-5,14: ${ENV_SCOPE_CHECKER} reports 12 workflows inspected (Phase 7 grouping added 70-phase-monitor-final-acceptance.yaml, Phase 3 grouping added 30-phase-argocd-orchestration.yaml, Phase 4 grouping added 40-phase-platform-observability-shared-secrets.yaml), 12 jobs referencing GG_SELECTED_ENVIRONMENT (unchanged -- moving jobs to another file does not change the count), and ZERO unsafe jobs against the real current repository"
   else
     fail "Live Deploy Fix 4: 1-5,14: ${ENV_SCOPE_CHECKER} did not report the expected zero-violation inventory against the real repository (status=${ENV_SCOPE_REAL_STATUS}):"$'\n'"${ENV_SCOPE_REAL_OUT}"
   fi
@@ -10113,8 +10187,8 @@ fi
 echo ""
 echo "--- Phase B1 / Live Argo Recovery Fix: Argo CD prerequisite classification + automatic desired-state reconciliation ---"
 
-# Structural proof, read directly from the real committed YAML of all three workflows (never a reimplementation): 20-sub-argocd.yaml is reusable via workflow_call, and the grouped Phase 3 wrapper's argocd_preflight/reconcile_argocd/validate_argocd_ready DAG (plus MAIN's platform_preflight, downstream of the grouped Phase 3 caller) has exactly the wiring the ownership-safety ABSENT/OWNED/BROKEN contract requires -- reconcile_argocd ALWAYS runs on the two safe preflight states (ABSENT/OWNED), never on BROKEN, and platform is never reachable without a strictly-validated-healthy Argo CD. Phase 3 grouping: argocd_preflight/reconcile_argocd/validate_argocd_ready now live inside 30-phase-argocd-orchestration.yaml, never directly in MAIN.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$ARGOCD_DEPLOY_WORKFLOW" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE3_WORKFLOW" ]; then
+# Structural proof, read directly from the real committed YAML of all four workflows (never a reimplementation): 20-sub-argocd.yaml is reusable via workflow_call, and the grouped Phase 3 wrapper's argocd_preflight/reconcile_argocd/validate_argocd_ready DAG (plus the grouped Phase 4 wrapper's platform_preflight, downstream of the grouped Phase 3 caller) has exactly the wiring the ownership-safety ABSENT/OWNED/BROKEN contract requires -- reconcile_argocd ALWAYS runs on the two safe preflight states (ABSENT/OWNED), never on BROKEN, and platform is never reachable without a strictly-validated-healthy Argo CD. Phase 3 grouping: argocd_preflight/reconcile_argocd/validate_argocd_ready now live inside 30-phase-argocd-orchestration.yaml, never directly in MAIN. Phase 4 grouping: platform_preflight/platform_sync_once now live inside 40-phase-platform-observability-shared-secrets.yaml, never directly in MAIN.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$ARGOCD_DEPLOY_WORKFLOW" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE3_WORKFLOW" ] && [ -f "$PHASE4_WORKFLOW" ]; then
   PHASE_B1_CHECK="$(python3 -c '
 import yaml
 
@@ -10122,6 +10196,8 @@ with open("'"$ARGOCD_DEPLOY_WORKFLOW"'") as f:
     argocd_doc = yaml.safe_load(f)
 with open("'"$EKS_APP_WORKFLOW"'") as f:
     main_doc = yaml.safe_load(f)
+with open("'"$PHASE4_WORKFLOW"'") as f:
+    phase4_doc = yaml.safe_load(f)
 with open("'"$PHASE3_WORKFLOW"'") as f:
     phase3_doc = yaml.safe_load(f)
 
@@ -10164,19 +10240,20 @@ results.append(("10b: validate_argocd_ready is a single unified condition requir
 results.append(("10c: validate_argocd_ready no longer contains a state-specific HEALTHY/ABSENT branch condition (the dual-path logic was retired along with bootstrap_argocd)", "argocd_preflight.outputs.state ==" not in ready_if))
 results.append(("10d: validate_argocd_ready uses always() (defense in depth, matching this workflow'"'"'s established convergence-job pattern)", "always()" in ready_if))
 
-# Phase B2 inserts platform_preflight between validate_argocd_ready and platform_sync_once (see the dedicated "Phase B2" DAG checks elsewhere in this suite) -- platform_sync_once now depends on validate_argocd_ready transitively via platform_preflight, never as a direct edge. Phase 3 grouping: validate_argocd_ready now lives behind the grouped Phase 3 wrapper, so platform_preflight depends on phase_3_argocd and must check BOTH its own overall result and its exact internal validate_argocd_ready_result output.
-platform_preflight_b1 = jobs.get("platform_preflight", {})
-platform = jobs.get("platform_sync_once", {})
+# Phase B2 inserts platform_preflight between validate_argocd_ready and platform_sync_once (see the dedicated "Phase B2" DAG checks elsewhere in this suite) -- platform_sync_once now depends on validate_argocd_ready transitively via platform_preflight, never as a direct edge. Phase 3 grouping: validate_argocd_ready now lives behind the grouped Phase 3 wrapper, so platform_preflight requires inputs.result_phase_3_argocd/inputs.result_validate_argocd_ready instead of a needs: reference. Phase 4 grouping: platform_preflight/platform_sync_once now live inside the grouped Phase 4 wrapper.
+phase4_jobs_b1 = phase4_doc["jobs"]
+platform_preflight_b1 = phase4_jobs_b1.get("platform_preflight", {})
+platform = phase4_jobs_b1.get("platform_sync_once", {})
 platform_needs = platform.get("needs") or []
 platform_if = platform.get("if", "")
-results.append(("11: platform_preflight (and therefore platform_sync_once transitively) needs phase_3_argocd", "phase_3_argocd" in (platform_preflight_b1.get("needs") or [])))
-results.append(("12: platform_preflight requires phase_3_argocd.result == success AND its exact internal validate_argocd_ready_result output == success (BROKEN/failed Argo can never reach platform)", "needs.phase_3_argocd.result == \x27success\x27" in platform_preflight_b1.get("if", "") and "needs.phase_3_argocd.outputs.validate_argocd_ready_result == \x27success\x27" in platform_preflight_b1.get("if", "")))
+results.append(("11: platform_preflight (and therefore platform_sync_once transitively) requires the Phase 3 wrapper result via inputs.result_phase_3_argocd", "inputs.result_phase_3_argocd" in platform_preflight_b1.get("if", "")))
+results.append(("12: platform_preflight requires inputs.result_phase_3_argocd == success AND inputs.result_validate_argocd_ready == success (BROKEN/failed Argo can never reach platform)", "inputs.result_phase_3_argocd == \x27success\x27" in platform_preflight_b1.get("if", "") and "inputs.result_validate_argocd_ready == \x27success\x27" in platform_preflight_b1.get("if", "")))
 results.append(("12b: platform_sync_once needs platform_preflight (the actual direct edge in the new B2 chain)", "platform_preflight" in platform_needs))
 
 results.append(("13: reconcile_argocd still gates on inputs.effective_deploy == \x27true\x27 -- Validate mode can never mutate Argo CD", "inputs.effective_deploy == \x27true\x27" in reconcile_if))
 
-whole_text = str(main_doc) + str(argocd_doc) + str(phase3_doc)
-results.append(("14: no gh workflow run / workflow_dispatch-API / repository_dispatch trigger exists anywhere in any of the three workflows", "gh workflow run" not in whole_text and "repository_dispatch" not in whole_text and "/dispatches" not in whole_text))
+whole_text = str(main_doc) + str(argocd_doc) + str(phase3_doc) + str(phase4_doc)
+results.append(("14: no gh workflow run / workflow_dispatch-API / repository_dispatch trigger exists anywhere in any of the four workflows", "gh workflow run" not in whole_text and "repository_dispatch" not in whole_text and "/dispatches" not in whole_text))
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
@@ -10400,7 +10477,7 @@ fi
 # Scenarios A/B/C/J (MAIN side) are simulated in real DAG order against the SAME goldengate_deploy_authorization-aware JOB_ORDER/simulate/base_context harness proven above for the fail-closed job graph -- this is not a fresh reimplementation, it is the identical real if: expressions, re-invoked with new fixtures. Phase 3 grouping: argocd_preflight/goldengate_deploy_authorization/reconcile_argocd/validate_argocd_ready now live inside 30-phase-argocd-orchestration.yaml, so this harness simulates that internal Phase 3 DAG separately (via simulate_phase3, using the wrapper's own if: expressions and an inputs.* context translated exactly the way MAIN's phase_3_argocd caller job translates it), then folds the wrapper's own aggregate result and its validate_argocd_ready_result output back into the outer MAIN-side simulation at the phase_3_argocd step -- a genuine dual-document simulation across the reusable-workflow boundary, never a single flattened JOB_ORDER pretending the boundary does not exist.
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   set +e
-  MAIN_SCENARIOS_OUT="$(python3 - "$EKS_APP_WORKFLOW" "$PHASE3_WORKFLOW" <<'PYEOF'
+  MAIN_SCENARIOS_OUT="$(python3 - "$EKS_APP_WORKFLOW" "$PHASE3_WORKFLOW" "$PHASE4_WORKFLOW" <<'PYEOF'
 import re
 import sys
 import yaml
@@ -10409,9 +10486,12 @@ with open(sys.argv[1]) as f:
     doc = yaml.safe_load(f)
 with open(sys.argv[2]) as f:
     phase3_doc = yaml.safe_load(f)
+with open(sys.argv[3]) as f:
+    phase4_doc = yaml.safe_load(f)
 
 jobs = doc["jobs"]
 phase3_jobs = phase3_doc["jobs"]
+phase4_jobs = phase4_doc["jobs"]
 
 
 def _extract_if(source_jobs, job_name):
@@ -10540,11 +10620,43 @@ def simulate_phase3(inputs, outcome_when_run, outputs_when_run=None):
     return wrapper_result, wrapper_outputs, internal
 
 
-JOB_ORDER = ["terraform_sync_once", "phase_3_argocd", "platform_preflight", "observability_preflight", "platform_sync_once", "observability_sync_once", "validate_platform_ready", "validate_observability_ready", "validate_shared_secrets_once", "runtime_ownership_preflight", "build_publish_and_deploy"]
+# Phase 4 grouping: the internal Phase 4 DAG (platform_preflight/observability_preflight -> platform_sync_once/observability_sync_once -> validate_platform_ready/validate_observability_ready -> validate_shared_secrets_once) now lives inside 40-phase-platform-observability-shared-secrets.yaml, addressed only via workflow_call inputs.*.
+PHASE4_JOB_ORDER = ["platform_preflight", "observability_preflight", "platform_sync_once", "observability_sync_once", "validate_platform_ready", "validate_observability_ready", "validate_shared_secrets_once"]
+PHASE4_IF_EXPRS = {job: _extract_if(phase4_jobs, job) for job in PHASE4_JOB_ORDER}
+
+
+def simulate_phase4(inputs, outcome_when_run, outputs_when_run=None):
+    """Simulates the grouped Phase 4 wrapper's own internal DAG given the translated workflow_call inputs, then folds the internal per-job results into (wrapper_result, wrapper_outputs, internal_results), matching the reusable-workflow semantics established for simulate_phase3 above."""
+    outputs_when_run = outputs_when_run or {}
+    internal = {}
+    for job in PHASE4_JOB_ORDER:
+        would_run = eval_gha_bool(PHASE4_IF_EXPRS[job], internal, inputs)
+        if would_run:
+            internal[job] = {"result": outcome_when_run.get(job, "success"), "outputs": outputs_when_run.get(job, {})}
+        else:
+            internal[job] = {"result": "skipped", "outputs": {}}
+    ran_results = [internal[j]["result"] for j in PHASE4_JOB_ORDER if internal[j]["result"] != "skipped"]
+    if not ran_results:
+        wrapper_result = "skipped"
+    elif "failure" in ran_results:
+        wrapper_result = "failure"
+    elif "cancelled" in ran_results:
+        wrapper_result = "cancelled"
+    else:
+        wrapper_result = "success"
+    wrapper_outputs = {
+        "validate_platform_ready_result": internal["validate_platform_ready"]["result"],
+        "validate_observability_ready_result": internal["validate_observability_ready"]["result"],
+        "validate_shared_secrets_once_result": internal["validate_shared_secrets_once"]["result"],
+    }
+    return wrapper_result, wrapper_outputs, internal
+
+
+JOB_ORDER = ["terraform_sync_once", "phase_3_argocd", "phase_4_platform_observability", "runtime_ownership_preflight", "build_publish_and_deploy"]
 IF_EXPRS = {job: _extract_if(jobs, job) for job in JOB_ORDER}
 
 
-def simulate(initial, outcome_when_run, outputs_when_run=None, phase3_outcome_when_run=None, phase3_outputs_when_run=None):
+def simulate(initial, outcome_when_run, outputs_when_run=None, phase3_outcome_when_run=None, phase3_outputs_when_run=None, phase4_outcome_when_run=None, phase4_outputs_when_run=None):
     results = dict(initial)
     outputs_when_run = outputs_when_run or {}
     for job in JOB_ORDER:
@@ -10562,6 +10674,24 @@ def simulate(initial, outcome_when_run, outputs_when_run=None, phase3_outcome_wh
                 internal = {j: {"result": "skipped", "outputs": {}} for j in PHASE3_JOB_ORDER}
                 results[job] = {"result": "skipped", "outputs": {}}
             results["_phase3_internal"] = internal
+            continue
+        if job == "phase_4_platform_observability":
+            would_run = eval_gha_bool(IF_EXPRS[job], results)
+            if would_run:
+                phase4_inputs = {
+                    "selected_environment": results["validate_model"]["outputs"].get("selected_environment", "dev"),
+                    "effective_deploy": results["validate_model"]["outputs"].get("effective_deploy", "false"),
+                    "result_validate_model": results["validate_model"]["result"],
+                    "result_terraform_sync_once": results["terraform_sync_once"]["result"],
+                    "result_phase_3_argocd": results["phase_3_argocd"]["result"],
+                    "result_validate_argocd_ready": results["phase_3_argocd"]["outputs"].get("validate_argocd_ready_result") or results["phase_3_argocd"]["result"],
+                }
+                wrapper_result, wrapper_outputs, internal = simulate_phase4(phase4_inputs, phase4_outcome_when_run or {}, phase4_outputs_when_run)
+                results[job] = {"result": wrapper_result, "outputs": wrapper_outputs}
+            else:
+                internal = {j: {"result": "skipped", "outputs": {}} for j in PHASE4_JOB_ORDER}
+                results[job] = {"result": "skipped", "outputs": {}}
+            results["_phase4_internal"] = internal
             continue
         would_run = eval_gha_bool(IF_EXPRS[job], results)
         if would_run:
@@ -10594,7 +10724,7 @@ check("A: reconcile_argocd must be skipped in Validate mode (no Argo CD mutation
 
 # Scenario B: deploy=true + Argo CD OWNED (an already-existing, safely-owned release) -- the single authorization runs and succeeds, reconcile_argocd ALWAYS runs, final Argo HEALTHY convergence succeeds, and the whole rollout remains eligible off that ONE approval. Phase 3 grouping: the wrapper's own overall result AND its exact internal validate_argocd_ready_result output must BOTH converge to success -- never conflated.
 ctx = base_context("true")
-r = simulate(ctx, {}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}, "runtime_ownership_preflight": {"state": "OWNED"}}, phase3_outputs_when_run={"argocd_preflight": {"state": "OWNED"}})
+r = simulate(ctx, {}, {"runtime_ownership_preflight": {"state": "OWNED"}}, phase3_outputs_when_run={"argocd_preflight": {"state": "OWNED"}}, phase4_outputs_when_run={"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
 check("B: phase_3_argocd (the grouped Phase 3 wrapper) must run and succeed overall", r["phase_3_argocd"]["result"] == "success")
 check("B: phase_3_argocd's exposed validate_argocd_ready_result output must be success", r["phase_3_argocd"]["outputs"]["validate_argocd_ready_result"] == "success")
 check("B: goldengate_deploy_authorization must run and succeed", r["_phase3_internal"]["goldengate_deploy_authorization"]["result"] == "success")
@@ -10604,12 +10734,12 @@ check("B: build_publish_and_deploy must remain eligible after the single authori
 
 # Scenario C: reproduces the real live incident -- Platform ABSENT + Observability ABSENT, both reconciled under the SAME single goldengate_deploy_authorization approval, with no operator interaction required between them.
 ctx = base_context("true")
-r = simulate(ctx, {}, {"platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "ABSENT"}}, phase3_outputs_when_run={"argocd_preflight": {"state": "OWNED"}})
+r = simulate(ctx, {}, phase3_outputs_when_run={"argocd_preflight": {"state": "OWNED"}}, phase4_outputs_when_run={"platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "ABSENT"}})
 check("C: goldengate_deploy_authorization must run and succeed exactly once", r["_phase3_internal"]["goldengate_deploy_authorization"]["result"] == "success")
-check("C: platform_sync_once must be eligible to run (ABSENT)", r["platform_sync_once"]["result"] == "success")
-check("C: observability_sync_once must be eligible to run (ABSENT)", r["observability_sync_once"]["result"] == "success")
-check("C: validate_platform_ready must succeed", r["validate_platform_ready"]["result"] == "success")
-check("C: validate_observability_ready must succeed", r["validate_observability_ready"]["result"] == "success")
+check("C: platform_sync_once must be eligible to run (ABSENT)", r["_phase4_internal"]["platform_sync_once"]["result"] == "success")
+check("C: observability_sync_once must be eligible to run (ABSENT)", r["_phase4_internal"]["observability_sync_once"]["result"] == "success")
+check("C: validate_platform_ready must succeed", r["_phase4_internal"]["validate_platform_ready"]["result"] == "success")
+check("C: validate_observability_ready must succeed", r["_phase4_internal"]["validate_observability_ready"]["result"] == "success")
 
 # Scenario J: the single authorization itself fails or is cancelled -> no application mutation job is eligible anywhere downstream. Phase 3 grouping: a failed/cancelled internal goldengate_deploy_authorization must also fail the wrapper's own overall phase_3_argocd result (never merely skip quietly), which is what actually propagates the closure to platform_preflight/build_publish_and_deploy through the new needs.phase_3_argocd.result == 'success' boundary check.
 for bad_result in ("failure", "cancelled"):
@@ -10619,7 +10749,8 @@ for bad_result in ("failure", "cancelled"):
     check(f"J: reconcile_argocd must be skipped when authorization is {bad_result}", r["_phase3_internal"]["reconcile_argocd"]["result"] == "skipped")
     check(f"J: validate_argocd_ready must be skipped when authorization is {bad_result}", r["_phase3_internal"]["validate_argocd_ready"]["result"] == "skipped")
     check(f"J: phase_3_argocd (the grouped wrapper) must itself report {bad_result}, never success, when its internal authorization is {bad_result}", r["phase_3_argocd"]["result"] == bad_result)
-    check(f"J: platform_sync_once must be skipped when authorization is {bad_result}", r["platform_sync_once"]["result"] == "skipped")
+    check(f"J: phase_4_platform_observability (the grouped wrapper) must itself be skipped, since its own inputs.result_phase_3_argocd == {bad_result}", r["phase_4_platform_observability"]["result"] == "skipped")
+    check(f"J: platform_sync_once must be skipped when authorization is {bad_result}", r["_phase4_internal"]["platform_sync_once"]["result"] == "skipped")
     check(f"J: build_publish_and_deploy must be skipped when authorization is {bad_result}", r["build_publish_and_deploy"]["result"] == "skipped")
 
 if failures:
@@ -11024,13 +11155,15 @@ else
 fi
 
 # Structural proof, read directly from the real committed YAML (never a reimplementation): 40-sub-observability.yaml's workflow_call contract, MAIN's platform_preflight/observability_preflight/platform_sync_once/observability_sync_once/validate_platform_ready/validate_observability_ready DAG wiring, and the cross-file CHART_VERSION constant this classifier is tightly tested against.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$OBSERVABILITY_WORKFLOW" ]; then
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE4_WORKFLOW" ] && [ -f "$OBSERVABILITY_WORKFLOW" ]; then
   PHASE_B2_STRUCTURAL_CHECK="$(python3 -c '
 import re
 import yaml
 
 with open("'"$EKS_APP_WORKFLOW"'") as f:
     main_doc = yaml.safe_load(f)
+with open("'"$PHASE4_WORKFLOW"'") as f:
+    phase4_doc = yaml.safe_load(f)
 with open("'"$OBSERVABILITY_WORKFLOW"'") as f:
     observability_doc = yaml.safe_load(f)
 
@@ -11046,9 +11179,10 @@ results.append(("2b: workflow_call accepts a required Boolean deploy input", dep
 dispatch_deploy_default = ((observability_on.get("workflow_dispatch") or {}).get("inputs", {}).get("deploy", {}) or {}).get("default")
 results.append(("18: manual workflow_dispatch deploy default is unchanged (still false)", dispatch_deploy_default is False))
 
-jobs = main_doc["jobs"]
-results.append(("3a: MAIN defines platform_preflight", "platform_preflight" in jobs))
-results.append(("3b: MAIN defines observability_preflight", "observability_preflight" in jobs))
+main_jobs = main_doc["jobs"]
+jobs = phase4_doc["jobs"]
+results.append(("3a: the grouped Phase 4 wrapper defines platform_preflight (MAIN itself defines only the grouped caller job phase_4_platform_observability)", "platform_preflight" in jobs and "platform_preflight" not in main_jobs))
+results.append(("3b: the grouped Phase 4 wrapper defines observability_preflight (MAIN itself defines only the grouped caller job phase_4_platform_observability)", "observability_preflight" in jobs and "observability_preflight" not in main_jobs))
 
 platform_preflight = jobs.get("platform_preflight", {})
 observability_preflight = jobs.get("observability_preflight", {})
@@ -11057,11 +11191,11 @@ observability_preflight_needs = observability_preflight.get("needs") or []
 platform_preflight_if = platform_preflight.get("if", "")
 observability_preflight_if = observability_preflight.get("if", "")
 
-# Phase 3 grouping: validate_argocd_ready now lives behind the grouped Phase 3 wrapper, so both preflight jobs depend on phase_3_argocd instead (and separately check the exact internal validate_argocd_ready_result output -- proven in the dedicated Phase 3 grouping regression section).
-results.append(("4a: platform_preflight depends on phase_3_argocd", "phase_3_argocd" in platform_preflight_needs))
-results.append(("4b: observability_preflight depends on phase_3_argocd", "phase_3_argocd" in observability_preflight_needs))
-results.append(("5a: platform_preflight is real-deploy-only (effective_deploy == \x27true\x27)", "effective_deploy" in platform_preflight_if and "== \x27true\x27" in platform_preflight_if))
-results.append(("5b: observability_preflight is real-deploy-only (effective_deploy == \x27true\x27)", "effective_deploy" in observability_preflight_if and "== \x27true\x27" in observability_preflight_if))
+# Phase 4 grouping: platform_preflight/observability_preflight now live inside the grouped Phase 4 wrapper, addressed only via workflow_call inputs -- the Phase 3 wrapper result crosses as inputs.result_phase_3_argocd/inputs.result_validate_argocd_ready, never a needs: reference to a job outside this file.
+results.append(("4a: platform_preflight requires the Phase 3 wrapper result via inputs.result_phase_3_argocd", "inputs.result_phase_3_argocd == \x27success\x27" in platform_preflight_if))
+results.append(("4b: observability_preflight requires the Phase 3 wrapper result via inputs.result_phase_3_argocd", "inputs.result_phase_3_argocd == \x27success\x27" in observability_preflight_if))
+results.append(("5a: platform_preflight is real-deploy-only (inputs.effective_deploy == \x27true\x27)", "inputs.effective_deploy" in platform_preflight_if and "== \x27true\x27" in platform_preflight_if))
+results.append(("5b: observability_preflight is real-deploy-only (inputs.effective_deploy == \x27true\x27)", "inputs.effective_deploy" in observability_preflight_if and "== \x27true\x27" in observability_preflight_if))
 
 results.append(("6a: platform_preflight does not depend on observability_preflight", "observability_preflight" not in platform_preflight_needs))
 results.append(("6b: observability_preflight does not depend on platform_preflight", "platform_preflight" not in observability_preflight_needs))
@@ -11079,7 +11213,7 @@ results.append(("8b: platform_sync_once condition contains no BROKEN branch -- B
 results.append(("8c: platform_sync_once requires platform_preflight to have actually succeeded first", "platform_preflight.result == \x27success\x27" in platform_sync_once_if))
 results.append(("10: platform_sync_once calls the reusable 30-sub-platform.yaml (never gh workflow run)", platform_sync_once.get("uses") == "./.github/workflows/30-sub-platform.yaml"))
 
-results.append(("9: MAIN defines observability_sync_once", "observability_sync_once" in jobs))
+results.append(("9: the grouped Phase 4 wrapper defines observability_sync_once", "observability_sync_once" in jobs))
 observability_sync_once = jobs.get("observability_sync_once", {})
 observability_sync_once_needs = observability_sync_once.get("needs") or []
 observability_sync_once_if = observability_sync_once.get("if", "")
@@ -11090,8 +11224,8 @@ results.append(("11c: observability_sync_once ALWAYS also runs when observabilit
 results.append(("12a: observability_sync_once condition no longer references the retired RECONCILABLE/HEALTHY preflight states", "RECONCILABLE" not in observability_sync_once_if and "HEALTHY" not in observability_sync_once_if))
 results.append(("12b: observability_sync_once condition contains no BROKEN branch -- BROKEN can never enter reconciliation", "BROKEN" not in observability_sync_once_if))
 
-results.append(("13a: MAIN defines validate_platform_ready", "validate_platform_ready" in jobs))
-results.append(("13b: MAIN defines validate_observability_ready", "validate_observability_ready" in jobs))
+results.append(("13a: the grouped Phase 4 wrapper defines validate_platform_ready", "validate_platform_ready" in jobs))
+results.append(("13b: the grouped Phase 4 wrapper defines validate_observability_ready", "validate_observability_ready" in jobs))
 validate_platform_ready = jobs.get("validate_platform_ready", {})
 validate_observability_ready = jobs.get("validate_observability_ready", {})
 validate_platform_ready_if = validate_platform_ready.get("if", "")
@@ -11112,7 +11246,7 @@ results.append(("19c: validate_shared_secrets_once requires validate_platform_re
 results.append(("19d: validate_shared_secrets_once requires validate_observability_ready.result == success on a real deploy", "validate_observability_ready.result == \x27success\x27" in shared_secrets_if))
 results.append(("20: validate_shared_secrets_once still bypasses the B2 readiness requirement on dry-run (effective_deploy != \x27true\x27)", "effective_deploy != \x27true\x27" in shared_secrets_if))
 
-whole_text = str(main_doc) + str(observability_doc)
+whole_text = str(main_doc) + str(phase4_doc) + str(observability_doc)
 results.append(("21: no gh workflow run / workflow_dispatch-API / repository_dispatch trigger exists anywhere in either workflow", "gh workflow run" not in whole_text and "repository_dispatch" not in whole_text and "/dispatches" not in whole_text))
 
 # 22: MAIN still does not activate GoldenGate runtimes -- B2 introduces no lifecycle/replication/Extract/Replicat/Distribution mutation; those job bodies are read-only classification/reconciliation-trigger only.
@@ -11155,19 +11289,22 @@ fi
 # DAG simulation: the four-scenario matrix (HEALTHY/ABSENT+success/ABSENT+failure/BROKEN) for platform and observability independently, plus cross-component convergence -- exercised against the real if: expressions, never a text/regex match against the workflow author's own wording.
 if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
   set +e
-  PHASE_B2_SIM_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+  PHASE_B2_SIM_OUT="$(python3 - "$EKS_APP_WORKFLOW" "$PHASE4_WORKFLOW" <<'PYEOF'
 import re
 import sys
 import yaml
 
 with open(sys.argv[1]) as f:
     doc = yaml.safe_load(f)
+with open(sys.argv[2]) as f:
+    phase4_doc = yaml.safe_load(f)
 
 jobs = doc["jobs"]
+phase4_jobs = phase4_doc["jobs"]
 
 
-def _extract_if(job_name):
-    raw = jobs[job_name].get("if", "true")
+def _extract_if(source_jobs, job_name):
+    raw = source_jobs[job_name].get("if", "true")
     raw = str(raw).strip()
     if raw.startswith("${{") and raw.endswith("}}"):
         raw = raw[3:-2].strip()
@@ -11175,11 +11312,12 @@ def _extract_if(job_name):
 
 
 class _Parser:
-    """A tiny, bespoke evaluator for exactly the GHA expression subset this workflow uses: && || == != () quoted strings, needs.<job>.result, needs.<job>.outputs.<name>, always(). Not a general GHA expression engine -- just enough to genuinely simulate these job conditions against a fabricated needs context, rather than trusting a text/regex match against the workflow author's own wording."""
+    """A tiny, bespoke evaluator for exactly the GHA expression subset this workflow uses: && || == != () quoted strings, needs.<job>.result, needs.<job>.outputs.<name>, inputs.<name> (Phase 4 grouping: the internal Phase 4 wrapper's own if: expressions reference inputs.* instead of needs.validate_model.outputs.*/needs.terraform_sync_once.result/needs.phase_3_argocd.*), always(). Not a general GHA expression engine -- just enough to genuinely simulate these job conditions against a fabricated needs context, rather than trusting a text/regex match against the workflow author's own wording."""
 
-    def __init__(self, expr, needs):
+    def __init__(self, expr, needs, inputs=None):
         self.expr = expr
         self.needs = needs
+        self.inputs = inputs or {}
         self.pos = 0
 
     def _skip_ws(self):
@@ -11252,21 +11390,75 @@ class _Parser:
         if m:
             self.pos += m.end()
             return self.needs.get(m.group(1), {}).get("outputs", {}).get(m.group(2), "")
+        m = re.match(r"inputs\.([A-Za-z0-9_]+)", self.expr[self.pos:])
+        if m:
+            self.pos += m.end()
+            return self.inputs.get(m.group(1), "")
         raise ValueError(f"cannot parse value at: {self.expr[self.pos:self.pos + 40]!r}")
 
 
-def eval_gha_bool(expr, needs):
-    return bool(_Parser(expr, needs).parse())
+def eval_gha_bool(expr, needs, inputs=None):
+    return bool(_Parser(expr, needs, inputs).parse())
 
 
-JOB_ORDER = ["platform_preflight", "observability_preflight", "platform_sync_once", "observability_sync_once", "validate_platform_ready", "validate_observability_ready", "validate_shared_secrets_once", "runtime_ownership_preflight", "build_publish_and_deploy"]
-IF_EXPRS = {job: _extract_if(job) for job in JOB_ORDER}
+# Phase 4 grouping: the internal Phase 4 DAG (platform_preflight/observability_preflight -> platform_sync_once/observability_sync_once -> validate_platform_ready/validate_observability_ready -> validate_shared_secrets_once) now lives inside 40-phase-platform-observability-shared-secrets.yaml, addressed only via workflow_call inputs.*.
+PHASE4_JOB_ORDER = ["platform_preflight", "observability_preflight", "platform_sync_once", "observability_sync_once", "validate_platform_ready", "validate_observability_ready", "validate_shared_secrets_once"]
+PHASE4_IF_EXPRS = {job: _extract_if(phase4_jobs, job) for job in PHASE4_JOB_ORDER}
 
 
-def simulate(initial, outcome_when_run, outputs_when_run=None):
+def simulate_phase4(inputs, outcome_when_run, outputs_when_run=None):
+    """Simulates the grouped Phase 4 wrapper's own internal DAG given the translated workflow_call inputs, then folds the internal per-job results into (wrapper_result, wrapper_outputs, internal_results), matching the reusable-workflow semantics established for simulate_phase3 elsewhere in this suite."""
+    outputs_when_run = outputs_when_run or {}
+    internal = {}
+    for job in PHASE4_JOB_ORDER:
+        would_run = eval_gha_bool(PHASE4_IF_EXPRS[job], internal, inputs)
+        if would_run:
+            internal[job] = {"result": outcome_when_run.get(job, "success"), "outputs": outputs_when_run.get(job, {})}
+        else:
+            internal[job] = {"result": "skipped", "outputs": {}}
+    ran_results = [internal[j]["result"] for j in PHASE4_JOB_ORDER if internal[j]["result"] != "skipped"]
+    if not ran_results:
+        wrapper_result = "skipped"
+    elif "failure" in ran_results:
+        wrapper_result = "failure"
+    elif "cancelled" in ran_results:
+        wrapper_result = "cancelled"
+    else:
+        wrapper_result = "success"
+    wrapper_outputs = {
+        "validate_platform_ready_result": internal["validate_platform_ready"]["result"],
+        "validate_observability_ready_result": internal["validate_observability_ready"]["result"],
+        "validate_shared_secrets_once_result": internal["validate_shared_secrets_once"]["result"],
+    }
+    return wrapper_result, wrapper_outputs, internal
+
+
+JOB_ORDER = ["phase_4_platform_observability", "runtime_ownership_preflight", "build_publish_and_deploy"]
+IF_EXPRS = {job: _extract_if(jobs, job) for job in JOB_ORDER}
+
+
+def simulate(initial, outcome_when_run, outputs_when_run=None, phase4_outcome_when_run=None, phase4_outputs_when_run=None):
     results = dict(initial)
     outputs_when_run = outputs_when_run or {}
     for job in JOB_ORDER:
+        if job == "phase_4_platform_observability":
+            would_run = eval_gha_bool(IF_EXPRS[job], results)
+            if would_run:
+                phase4_inputs = {
+                    "selected_environment": results["validate_model"]["outputs"].get("selected_environment", "dev"),
+                    "effective_deploy": results["validate_model"]["outputs"].get("effective_deploy", "false"),
+                    "result_validate_model": results["validate_model"]["result"],
+                    "result_terraform_sync_once": results["terraform_sync_once"]["result"],
+                    "result_phase_3_argocd": results["phase_3_argocd"]["result"],
+                    "result_validate_argocd_ready": results["phase_3_argocd"]["outputs"].get("validate_argocd_ready_result") or results["phase_3_argocd"]["result"],
+                }
+                wrapper_result, wrapper_outputs, internal = simulate_phase4(phase4_inputs, phase4_outcome_when_run or {}, phase4_outputs_when_run)
+                results[job] = {"result": wrapper_result, "outputs": wrapper_outputs}
+            else:
+                internal = {j: {"result": "skipped", "outputs": {}} for j in PHASE4_JOB_ORDER}
+                results[job] = {"result": "skipped", "outputs": {}}
+            results["_phase4_internal"] = internal
+            continue
         would_run = eval_gha_bool(IF_EXPRS[job], results)
         if would_run:
             results[job] = {"result": outcome_when_run.get(job, "success"), "outputs": outputs_when_run.get(job, {})}
@@ -11276,9 +11468,9 @@ def simulate(initial, outcome_when_run, outputs_when_run=None):
 
 
 def base_context():
-    # Represents "everything upstream of platform_preflight/observability_preflight already succeeded, Argo already validated ready, and a real change was detected" -- effective_deploy='true'/has_changes='true' throughout, matching a real deploy (both now live on validate_model.outputs since the Phase 1 single-job consolidation) since build_publish_and_deploy's own if: independently requires it -- this simulation is scoped to the B2 platform/observability chain, not a re-test of that upstream detection logic (already covered elsewhere in this suite). Phase 3 grouping: validate_argocd_ready now lives behind the grouped Phase 3 wrapper -- platform_preflight/observability_preflight reference needs.phase_3_argocd.result AND needs.phase_3_argocd.outputs.validate_argocd_ready_result, so the fabricated upstream context exposes both explicitly.
+    # Represents "everything upstream of platform_preflight/observability_preflight already succeeded, Argo already validated ready, and a real change was detected" -- effective_deploy='true'/has_changes='true' throughout, matching a real deploy (both now live on validate_model.outputs since the Phase 1 single-job consolidation) since build_publish_and_deploy's own if: independently requires it -- this simulation is scoped to the B2 platform/observability chain, not a re-test of that upstream detection logic (already covered elsewhere in this suite). Phase 3 grouping: validate_argocd_ready now lives behind the grouped Phase 3 wrapper -- fabricated here as the phase_3_argocd entry consumed by simulate()'s own phase_4_platform_observability translation step. Phase 4 grouping: platform_preflight/observability_preflight are internal Phase 4 jobs now, simulated via simulate_phase4() and folded into r["_phase4_internal"].
     return {
-        "validate_model": {"result": "success", "outputs": {"effective_deploy": "true", "has_changes": "true"}},
+        "validate_model": {"result": "success", "outputs": {"effective_deploy": "true", "has_changes": "true", "selected_environment": "dev"}},
         "terraform_sync_once": {"result": "success", "outputs": {}},
         "phase_3_argocd": {"result": "success", "outputs": {"validate_argocd_ready_result": "success"}},
     }
@@ -11294,87 +11486,87 @@ def check(label, condition):
 
 # --- Platform: OWNED / ABSENT+success / ABSENT+failure / BROKEN (observability held OWNED throughout to isolate platform's own effect). Generic MAIN Desired-State Convergence Fix: OWNED is no longer a reconciliation-skip state -- platform_sync_once ALWAYS runs and succeeds on OWNED, exactly like ABSENT (required tests 4/6). ---
 ctx = base_context()
-r = simulate(ctx, {}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
-check("platform OWNED: platform_sync_once must run and succeed (never skipped merely because preflight found the installation superficially healthy-looking)", r["platform_sync_once"]["result"] == "success")
-check("platform OWNED: validate_platform_ready must succeed", r["validate_platform_ready"]["result"] == "success")
-check("platform OWNED: validate_shared_secrets_once must succeed", r["validate_shared_secrets_once"]["result"] == "success")
+r = simulate(ctx, {}, phase4_outcome_when_run={}, phase4_outputs_when_run={"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
+check("platform OWNED: platform_sync_once must run and succeed (never skipped merely because preflight found the installation superficially healthy-looking)", r["_phase4_internal"]["platform_sync_once"]["result"] == "success")
+check("platform OWNED: validate_platform_ready must succeed", r["_phase4_internal"]["validate_platform_ready"]["result"] == "success")
+check("platform OWNED: validate_shared_secrets_once must succeed", r["_phase4_internal"]["validate_shared_secrets_once"]["result"] == "success")
 
 ctx = base_context()
-r = simulate(ctx, {}, {"platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "OWNED"}})
-check("platform ABSENT+sync success: platform_sync_once must succeed", r["platform_sync_once"]["result"] == "success")
-check("platform ABSENT+sync success: validate_platform_ready must succeed", r["validate_platform_ready"]["result"] == "success")
-check("platform ABSENT+sync success: validate_shared_secrets_once must succeed", r["validate_shared_secrets_once"]["result"] == "success")
+r = simulate(ctx, {}, phase4_outcome_when_run={}, phase4_outputs_when_run={"platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "OWNED"}})
+check("platform ABSENT+sync success: platform_sync_once must succeed", r["_phase4_internal"]["platform_sync_once"]["result"] == "success")
+check("platform ABSENT+sync success: validate_platform_ready must succeed", r["_phase4_internal"]["validate_platform_ready"]["result"] == "success")
+check("platform ABSENT+sync success: validate_shared_secrets_once must succeed", r["_phase4_internal"]["validate_shared_secrets_once"]["result"] == "success")
 
 ctx = base_context()
-r = simulate(ctx, {"platform_sync_once": "failure"}, {"platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "OWNED"}})
-check("platform ABSENT+sync failure: platform_sync_once must report failure", r["platform_sync_once"]["result"] == "failure")
-check("platform ABSENT+sync failure: validate_platform_ready must not proceed (skipped)", r["validate_platform_ready"]["result"] == "skipped")
-check("platform ABSENT+sync failure: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
+r = simulate(ctx, {}, phase4_outcome_when_run={"platform_sync_once": "failure"}, phase4_outputs_when_run={"platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "OWNED"}})
+check("platform ABSENT+sync failure: platform_sync_once must report failure", r["_phase4_internal"]["platform_sync_once"]["result"] == "failure")
+check("platform ABSENT+sync failure: validate_platform_ready must not proceed (skipped)", r["_phase4_internal"]["validate_platform_ready"]["result"] == "skipped")
+check("platform ABSENT+sync failure: validate_shared_secrets_once must be skipped", r["_phase4_internal"]["validate_shared_secrets_once"]["result"] == "skipped")
 check("platform ABSENT+sync failure: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
 
 ctx = base_context()
-r = simulate(ctx, {"platform_sync_once": "failure"}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
-check("platform OWNED+sync failure: platform_sync_once must report failure", r["platform_sync_once"]["result"] == "failure")
-check("platform OWNED+sync failure: validate_platform_ready must not proceed (skipped)", r["validate_platform_ready"]["result"] == "skipped")
-check("platform OWNED+sync failure: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
+r = simulate(ctx, {}, phase4_outcome_when_run={"platform_sync_once": "failure"}, phase4_outputs_when_run={"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
+check("platform OWNED+sync failure: platform_sync_once must report failure", r["_phase4_internal"]["platform_sync_once"]["result"] == "failure")
+check("platform OWNED+sync failure: validate_platform_ready must not proceed (skipped)", r["_phase4_internal"]["validate_platform_ready"]["result"] == "skipped")
+check("platform OWNED+sync failure: validate_shared_secrets_once must be skipped", r["_phase4_internal"]["validate_shared_secrets_once"]["result"] == "skipped")
 check("platform OWNED+sync failure: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
 
 ctx = base_context()
-r = simulate(ctx, {"platform_preflight": "failure"}, {"observability_preflight": {"state": "OWNED"}})
-check("platform BROKEN: platform_preflight must report failure", r["platform_preflight"]["result"] == "failure")
-check("platform BROKEN: platform_sync_once must never run", r["platform_sync_once"]["result"] == "skipped")
-check("platform BROKEN: validate_platform_ready must be skipped", r["validate_platform_ready"]["result"] == "skipped")
-check("platform BROKEN: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
+r = simulate(ctx, {}, phase4_outcome_when_run={"platform_preflight": "failure"}, phase4_outputs_when_run={"observability_preflight": {"state": "OWNED"}})
+check("platform BROKEN: platform_preflight must report failure", r["_phase4_internal"]["platform_preflight"]["result"] == "failure")
+check("platform BROKEN: platform_sync_once must never run", r["_phase4_internal"]["platform_sync_once"]["result"] == "skipped")
+check("platform BROKEN: validate_platform_ready must be skipped", r["_phase4_internal"]["validate_platform_ready"]["result"] == "skipped")
+check("platform BROKEN: validate_shared_secrets_once must be skipped", r["_phase4_internal"]["validate_shared_secrets_once"]["result"] == "skipped")
 check("platform BROKEN: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
 
 # --- Observability: OWNED / ABSENT+success / ABSENT+failure / BROKEN (platform held OWNED throughout to isolate observability's own effect). Generic MAIN Desired-State Convergence Fix: OWNED is no longer a reconciliation-skip state -- observability_sync_once ALWAYS runs and succeeds on OWNED, exactly like ABSENT (required tests 5/6). ---
 ctx = base_context()
-r = simulate(ctx, {}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
-check("observability OWNED: observability_sync_once must run and succeed (never skipped merely because preflight found the installation superficially healthy-looking)", r["observability_sync_once"]["result"] == "success")
-check("observability OWNED: validate_observability_ready must succeed", r["validate_observability_ready"]["result"] == "success")
-check("observability OWNED: validate_shared_secrets_once must succeed", r["validate_shared_secrets_once"]["result"] == "success")
+r = simulate(ctx, {}, phase4_outcome_when_run={}, phase4_outputs_when_run={"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
+check("observability OWNED: observability_sync_once must run and succeed (never skipped merely because preflight found the installation superficially healthy-looking)", r["_phase4_internal"]["observability_sync_once"]["result"] == "success")
+check("observability OWNED: validate_observability_ready must succeed", r["_phase4_internal"]["validate_observability_ready"]["result"] == "success")
+check("observability OWNED: validate_shared_secrets_once must succeed", r["_phase4_internal"]["validate_shared_secrets_once"]["result"] == "success")
 
 ctx = base_context()
-r = simulate(ctx, {}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "ABSENT"}})
-check("observability ABSENT+sync success: observability_sync_once must succeed", r["observability_sync_once"]["result"] == "success")
-check("observability ABSENT+sync success: validate_observability_ready must succeed", r["validate_observability_ready"]["result"] == "success")
-check("observability ABSENT+sync success: validate_shared_secrets_once must succeed", r["validate_shared_secrets_once"]["result"] == "success")
+r = simulate(ctx, {}, phase4_outcome_when_run={}, phase4_outputs_when_run={"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "ABSENT"}})
+check("observability ABSENT+sync success: observability_sync_once must succeed", r["_phase4_internal"]["observability_sync_once"]["result"] == "success")
+check("observability ABSENT+sync success: validate_observability_ready must succeed", r["_phase4_internal"]["validate_observability_ready"]["result"] == "success")
+check("observability ABSENT+sync success: validate_shared_secrets_once must succeed", r["_phase4_internal"]["validate_shared_secrets_once"]["result"] == "success")
 
 ctx = base_context()
-r = simulate(ctx, {"observability_sync_once": "failure"}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "ABSENT"}})
-check("observability ABSENT+sync failure: observability_sync_once must report failure", r["observability_sync_once"]["result"] == "failure")
-check("observability ABSENT+sync failure: validate_observability_ready must not proceed (skipped)", r["validate_observability_ready"]["result"] == "skipped")
-check("observability ABSENT+sync failure: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
+r = simulate(ctx, {}, phase4_outcome_when_run={"observability_sync_once": "failure"}, phase4_outputs_when_run={"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "ABSENT"}})
+check("observability ABSENT+sync failure: observability_sync_once must report failure", r["_phase4_internal"]["observability_sync_once"]["result"] == "failure")
+check("observability ABSENT+sync failure: validate_observability_ready must not proceed (skipped)", r["_phase4_internal"]["validate_observability_ready"]["result"] == "skipped")
+check("observability ABSENT+sync failure: validate_shared_secrets_once must be skipped", r["_phase4_internal"]["validate_shared_secrets_once"]["result"] == "skipped")
 check("observability ABSENT+sync failure: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
 
 ctx = base_context()
-r = simulate(ctx, {"observability_preflight": "failure"}, {"platform_preflight": {"state": "OWNED"}})
-check("observability BROKEN: observability_preflight must report failure", r["observability_preflight"]["result"] == "failure")
-check("observability BROKEN: observability_sync_once must never run", r["observability_sync_once"]["result"] == "skipped")
-check("observability BROKEN: validate_observability_ready must be skipped", r["validate_observability_ready"]["result"] == "skipped")
-check("observability BROKEN: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
+r = simulate(ctx, {}, phase4_outcome_when_run={"observability_preflight": "failure"}, phase4_outputs_when_run={"platform_preflight": {"state": "OWNED"}})
+check("observability BROKEN: observability_preflight must report failure", r["_phase4_internal"]["observability_preflight"]["result"] == "failure")
+check("observability BROKEN: observability_sync_once must never run", r["_phase4_internal"]["observability_sync_once"]["result"] == "skipped")
+check("observability BROKEN: validate_observability_ready must be skipped", r["_phase4_internal"]["validate_observability_ready"]["result"] == "skipped")
+check("observability BROKEN: validate_shared_secrets_once must be skipped", r["_phase4_internal"]["validate_shared_secrets_once"]["result"] == "skipped")
 check("observability BROKEN: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
 
 # --- Cross-component convergence ---
 ctx = base_context()
-r = simulate(ctx, {}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
-check("cross: platform OWNED + observability OWNED -> both always reconcile and shared secrets continues", r["platform_sync_once"]["result"] == "success" and r["observability_sync_once"]["result"] == "success" and r["validate_shared_secrets_once"]["result"] == "success" and r["build_publish_and_deploy"]["result"] == "success")
+r = simulate(ctx, {}, phase4_outcome_when_run={}, phase4_outputs_when_run={"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
+check("cross: platform OWNED + observability OWNED -> both always reconcile and shared secrets continues", r["_phase4_internal"]["platform_sync_once"]["result"] == "success" and r["_phase4_internal"]["observability_sync_once"]["result"] == "success" and r["_phase4_internal"]["validate_shared_secrets_once"]["result"] == "success" and r["build_publish_and_deploy"]["result"] == "success")
 
 ctx = base_context()
-r = simulate(ctx, {}, {"platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "OWNED"}})
-check("cross: platform ABSENT/reconcile success + observability OWNED/reconcile success -> continues", r["validate_shared_secrets_once"]["result"] == "success" and r["build_publish_and_deploy"]["result"] == "success")
+r = simulate(ctx, {}, phase4_outcome_when_run={}, phase4_outputs_when_run={"platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "OWNED"}})
+check("cross: platform ABSENT/reconcile success + observability OWNED/reconcile success -> continues", r["_phase4_internal"]["validate_shared_secrets_once"]["result"] == "success" and r["build_publish_and_deploy"]["result"] == "success")
 
 ctx = base_context()
-r = simulate(ctx, {}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "ABSENT"}})
-check("cross: platform OWNED/reconcile success + observability ABSENT/reconcile success -> continues", r["validate_shared_secrets_once"]["result"] == "success" and r["build_publish_and_deploy"]["result"] == "success")
+r = simulate(ctx, {}, phase4_outcome_when_run={}, phase4_outputs_when_run={"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "ABSENT"}})
+check("cross: platform OWNED/reconcile success + observability ABSENT/reconcile success -> continues", r["_phase4_internal"]["validate_shared_secrets_once"]["result"] == "success" and r["build_publish_and_deploy"]["result"] == "success")
 
 ctx = base_context()
-r = simulate(ctx, {"platform_preflight": "failure"}, {"observability_preflight": {"state": "OWNED"}})
-check("cross: platform BROKEN + observability OWNED -> shared secrets/runtime does not continue", r["validate_shared_secrets_once"]["result"] == "skipped" and r["build_publish_and_deploy"]["result"] == "skipped")
+r = simulate(ctx, {}, phase4_outcome_when_run={"platform_preflight": "failure"}, phase4_outputs_when_run={"observability_preflight": {"state": "OWNED"}})
+check("cross: platform BROKEN + observability OWNED -> shared secrets/runtime does not continue", r["_phase4_internal"]["validate_shared_secrets_once"]["result"] == "skipped" and r["build_publish_and_deploy"]["result"] == "skipped")
 
 ctx = base_context()
-r = simulate(ctx, {"observability_preflight": "failure"}, {"platform_preflight": {"state": "OWNED"}})
-check("cross: platform OWNED + observability BROKEN -> shared secrets/runtime does not continue", r["validate_shared_secrets_once"]["result"] == "skipped" and r["build_publish_and_deploy"]["result"] == "skipped")
+r = simulate(ctx, {}, phase4_outcome_when_run={"observability_preflight": "failure"}, phase4_outputs_when_run={"platform_preflight": {"state": "OWNED"}})
+check("cross: platform OWNED + observability BROKEN -> shared secrets/runtime does not continue", r["_phase4_internal"]["validate_shared_secrets_once"]["result"] == "skipped" and r["build_publish_and_deploy"]["result"] == "skipped")
 
 # --- Dry-run safety: effective_deploy=false must never invoke either B2 SUB workflow ---
 ctx = {
@@ -11383,11 +11575,11 @@ ctx = {
     "phase_3_argocd": {"result": "skipped", "outputs": {}},
 }
 r = simulate(ctx, {})
-check("dry-run: platform_preflight must be skipped", r["platform_preflight"]["result"] == "skipped")
-check("dry-run: observability_preflight must be skipped", r["observability_preflight"]["result"] == "skipped")
-check("dry-run: platform_sync_once must be skipped (never invokes 30-sub-platform.yaml)", r["platform_sync_once"]["result"] == "skipped")
-check("dry-run: observability_sync_once must be skipped (never invokes 40-sub-observability.yaml)", r["observability_sync_once"]["result"] == "skipped")
-check("dry-run: validate_shared_secrets_once must still succeed via the dry-run bypass", r["validate_shared_secrets_once"]["result"] == "success")
+check("dry-run: platform_preflight must be skipped", r["_phase4_internal"]["platform_preflight"]["result"] == "skipped")
+check("dry-run: observability_preflight must be skipped", r["_phase4_internal"]["observability_preflight"]["result"] == "skipped")
+check("dry-run: platform_sync_once must be skipped (never invokes 30-sub-platform.yaml)", r["_phase4_internal"]["platform_sync_once"]["result"] == "skipped")
+check("dry-run: observability_sync_once must be skipped (never invokes 40-sub-observability.yaml)", r["_phase4_internal"]["observability_sync_once"]["result"] == "skipped")
+check("dry-run: validate_shared_secrets_once must still succeed via the dry-run bypass", r["_phase4_internal"]["validate_shared_secrets_once"]["result"] == "success")
 
 if failures:
     print("\n".join(failures))
@@ -11418,15 +11610,15 @@ fi
 echo ""
 echo "--- Live Platform + Observability End-to-End Self-Recovery Fix ---"
 
-# Structural proof, read directly from the real committed YAML: platform_sync_once/observability_sync_once ALWAYS trigger on both ABSENT and OWNED (P6 -- the retired RECONCILABLE/HEALTHY split is gone), and validate_platform_ready/validate_observability_ready no longer branch by preflight state at all -- their gating simplifies to "preflight succeeded and sync_once succeeded", since sync_once itself now runs unconditionally for every safe preflight state.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+# Structural proof, read directly from the real committed YAML: platform_sync_once/observability_sync_once ALWAYS trigger on both ABSENT and OWNED (P6 -- the retired RECONCILABLE/HEALTHY split is gone), and validate_platform_ready/validate_observability_ready no longer branch by preflight state at all -- their gating simplifies to "preflight succeeded and sync_once succeeded", since sync_once itself now runs unconditionally for every safe preflight state. Phase 4 grouping: these jobs now live inside the grouped Phase 4 wrapper, never directly in MAIN.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$PHASE4_WORKFLOW" ]; then
   OWNED_STRUCTURAL_CHECK="$(python3 -c '
 import yaml
 
-with open("'"$EKS_APP_WORKFLOW"'") as f:
-    main_doc = yaml.safe_load(f)
+with open("'"$PHASE4_WORKFLOW"'") as f:
+    phase4_doc = yaml.safe_load(f)
 
-jobs = main_doc["jobs"]
+jobs = phase4_doc["jobs"]
 platform_sync_once_if = jobs["platform_sync_once"]["if"]
 observability_sync_once_if = jobs["observability_sync_once"]["if"]
 validate_platform_ready_if = jobs["validate_platform_ready"]["if"]
@@ -11468,22 +11660,25 @@ else
   fail "P8/O15: expected at least 2 total occurrences of the exact-HEALTHY final gate across ${EKS_APP_WORKFLOW} and ${PHASE7_MONITOR_FILE}, found ${HEALTHY_ONLY_COUNT_TOTAL}"
 fi
 
-# DAG simulation: OWNED+success and OWNED+failure for both Platform and Observability, exercised against the real if: expressions via the same JOB_ORDER-based harness as the Phase B2 simulation immediately above (P6, D6, D7).
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+# DAG simulation: OWNED+success and OWNED+failure for both Platform and Observability, exercised against the real if: expressions via the same JOB_ORDER-based harness as the Phase B2 simulation immediately above (P6, D6, D7). Phase 4 grouping: platform_preflight/observability_preflight/platform_sync_once/observability_sync_once/validate_platform_ready/validate_observability_ready/validate_shared_secrets_once now live inside the grouped Phase 4 wrapper.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE4_WORKFLOW" ]; then
   set +e
-  OWNED_SIM_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+  OWNED_SIM_OUT="$(python3 - "$EKS_APP_WORKFLOW" "$PHASE4_WORKFLOW" <<'PYEOF'
 import re
 import sys
 import yaml
 
 with open(sys.argv[1]) as f:
     doc = yaml.safe_load(f)
+with open(sys.argv[2]) as f:
+    phase4_doc = yaml.safe_load(f)
 
 jobs = doc["jobs"]
+phase4_jobs = phase4_doc["jobs"]
 
 
-def _extract_if(job_name):
-    raw = jobs[job_name].get("if", "true")
+def _extract_if(source_jobs, job_name):
+    raw = source_jobs[job_name].get("if", "true")
     raw = str(raw).strip()
     if raw.startswith("${{") and raw.endswith("}}"):
         raw = raw[3:-2].strip()
@@ -11491,9 +11686,10 @@ def _extract_if(job_name):
 
 
 class _Parser:
-    def __init__(self, expr, needs):
+    def __init__(self, expr, needs, inputs=None):
         self.expr = expr
         self.needs = needs
+        self.inputs = inputs or {}
         self.pos = 0
 
     def _skip_ws(self):
@@ -11566,21 +11762,73 @@ class _Parser:
         if m:
             self.pos += m.end()
             return self.needs.get(m.group(1), {}).get("outputs", {}).get(m.group(2), "")
+        m = re.match(r"inputs\.([A-Za-z0-9_]+)", self.expr[self.pos:])
+        if m:
+            self.pos += m.end()
+            return self.inputs.get(m.group(1), "")
         raise ValueError(f"cannot parse value at: {self.expr[self.pos:self.pos + 40]!r}")
 
 
-def eval_gha_bool(expr, needs):
-    return bool(_Parser(expr, needs).parse())
+def eval_gha_bool(expr, needs, inputs=None):
+    return bool(_Parser(expr, needs, inputs).parse())
 
 
-JOB_ORDER = ["platform_preflight", "observability_preflight", "platform_sync_once", "observability_sync_once", "validate_platform_ready", "validate_observability_ready", "validate_shared_secrets_once", "runtime_ownership_preflight", "build_publish_and_deploy"]
-IF_EXPRS = {job: _extract_if(job) for job in JOB_ORDER}
+PHASE4_JOB_ORDER = ["platform_preflight", "observability_preflight", "platform_sync_once", "observability_sync_once", "validate_platform_ready", "validate_observability_ready", "validate_shared_secrets_once"]
+PHASE4_IF_EXPRS = {job: _extract_if(phase4_jobs, job) for job in PHASE4_JOB_ORDER}
 
 
-def simulate(initial, outcome_when_run, outputs_when_run=None):
+def simulate_phase4(inputs, outcome_when_run, outputs_when_run=None):
+    outputs_when_run = outputs_when_run or {}
+    internal = {}
+    for job in PHASE4_JOB_ORDER:
+        would_run = eval_gha_bool(PHASE4_IF_EXPRS[job], internal, inputs)
+        if would_run:
+            internal[job] = {"result": outcome_when_run.get(job, "success"), "outputs": outputs_when_run.get(job, {})}
+        else:
+            internal[job] = {"result": "skipped", "outputs": {}}
+    ran_results = [internal[j]["result"] for j in PHASE4_JOB_ORDER if internal[j]["result"] != "skipped"]
+    if not ran_results:
+        wrapper_result = "skipped"
+    elif "failure" in ran_results:
+        wrapper_result = "failure"
+    elif "cancelled" in ran_results:
+        wrapper_result = "cancelled"
+    else:
+        wrapper_result = "success"
+    wrapper_outputs = {
+        "validate_platform_ready_result": internal["validate_platform_ready"]["result"],
+        "validate_observability_ready_result": internal["validate_observability_ready"]["result"],
+        "validate_shared_secrets_once_result": internal["validate_shared_secrets_once"]["result"],
+    }
+    return wrapper_result, wrapper_outputs, internal
+
+
+JOB_ORDER = ["phase_4_platform_observability", "runtime_ownership_preflight", "build_publish_and_deploy"]
+IF_EXPRS = {job: _extract_if(jobs, job) for job in JOB_ORDER}
+
+
+def simulate(initial, outcome_when_run, outputs_when_run=None, phase4_outcome_when_run=None, phase4_outputs_when_run=None):
     results = dict(initial)
     outputs_when_run = outputs_when_run or {}
     for job in JOB_ORDER:
+        if job == "phase_4_platform_observability":
+            would_run = eval_gha_bool(IF_EXPRS[job], results)
+            if would_run:
+                phase4_inputs = {
+                    "selected_environment": results["validate_model"]["outputs"].get("selected_environment", "dev"),
+                    "effective_deploy": results["validate_model"]["outputs"].get("effective_deploy", "false"),
+                    "result_validate_model": results["validate_model"]["result"],
+                    "result_terraform_sync_once": results["terraform_sync_once"]["result"],
+                    "result_phase_3_argocd": results["phase_3_argocd"]["result"],
+                    "result_validate_argocd_ready": results["phase_3_argocd"]["outputs"].get("validate_argocd_ready_result") or results["phase_3_argocd"]["result"],
+                }
+                wrapper_result, wrapper_outputs, internal = simulate_phase4(phase4_inputs, phase4_outcome_when_run or {}, phase4_outputs_when_run)
+                results[job] = {"result": wrapper_result, "outputs": wrapper_outputs}
+            else:
+                internal = {j: {"result": "skipped", "outputs": {}} for j in PHASE4_JOB_ORDER}
+                results[job] = {"result": "skipped", "outputs": {}}
+            results["_phase4_internal"] = internal
+            continue
         would_run = eval_gha_bool(IF_EXPRS[job], results)
         if would_run:
             results[job] = {"result": outcome_when_run.get(job, "success"), "outputs": outputs_when_run.get(job, {})}
@@ -11590,9 +11838,9 @@ def simulate(initial, outcome_when_run, outputs_when_run=None):
 
 
 def base_context():
-    # Phase 3 grouping: validate_argocd_ready now lives behind the grouped Phase 3 wrapper -- platform_preflight/observability_preflight reference needs.phase_3_argocd.result AND needs.phase_3_argocd.outputs.validate_argocd_ready_result, so the fabricated upstream context exposes both explicitly.
+    # Phase 3 grouping: validate_argocd_ready now lives behind the grouped Phase 3 wrapper -- fabricated here as the phase_3_argocd entry consumed by simulate's own phase_4_platform_observability translation step.
     return {
-        "validate_model": {"result": "success", "outputs": {"effective_deploy": "true", "has_changes": "true"}},
+        "validate_model": {"result": "success", "outputs": {"effective_deploy": "true", "has_changes": "true", "selected_environment": "dev"}},
         "terraform_sync_once": {"result": "success", "outputs": {}},
         "phase_3_argocd": {"result": "success", "outputs": {"validate_argocd_ready_result": "success"}},
     }
@@ -11608,59 +11856,59 @@ def check(label, condition):
 
 # --- Platform OWNED: reproduces the exact live incident (namespace label drift) plus every other already-owned/healthy-looking case -- one MAIN-owned automatic reconciliation, no operator interaction, final convergence still independently requires HEALTHY ---
 ctx = base_context()
-r = simulate(ctx, {}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
-check("platform OWNED+sync success: platform_sync_once must run and succeed (P1/P6, required test 4)", r["platform_sync_once"]["result"] == "success")
-check("platform OWNED+sync success: validate_platform_ready must succeed", r["validate_platform_ready"]["result"] == "success")
-check("platform OWNED+sync success: validate_shared_secrets_once must succeed (no operator interaction required, P7/D9)", r["validate_shared_secrets_once"]["result"] == "success")
+r = simulate(ctx, {}, phase4_outputs_when_run={"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
+check("platform OWNED+sync success: platform_sync_once must run and succeed (P1/P6, required test 4)", r["_phase4_internal"]["platform_sync_once"]["result"] == "success")
+check("platform OWNED+sync success: validate_platform_ready must succeed", r["_phase4_internal"]["validate_platform_ready"]["result"] == "success")
+check("platform OWNED+sync success: validate_shared_secrets_once must succeed (no operator interaction required, P7/D9)", r["_phase4_internal"]["validate_shared_secrets_once"]["result"] == "success")
 check("platform OWNED+sync success: build_publish_and_deploy must remain eligible", r["build_publish_and_deploy"]["result"] == "success")
 
 ctx = base_context()
-r = simulate(ctx, {"platform_sync_once": "failure"}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
-check("platform OWNED+sync failure: platform_sync_once must report failure", r["platform_sync_once"]["result"] == "failure")
-check("platform OWNED+sync failure: validate_platform_ready must not proceed (skipped)", r["validate_platform_ready"]["result"] == "skipped")
-check("platform OWNED+sync failure: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
+r = simulate(ctx, {}, phase4_outcome_when_run={"platform_sync_once": "failure"}, phase4_outputs_when_run={"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
+check("platform OWNED+sync failure: platform_sync_once must report failure", r["_phase4_internal"]["platform_sync_once"]["result"] == "failure")
+check("platform OWNED+sync failure: validate_platform_ready must not proceed (skipped)", r["_phase4_internal"]["validate_platform_ready"]["result"] == "skipped")
+check("platform OWNED+sync failure: validate_shared_secrets_once must be skipped", r["_phase4_internal"]["validate_shared_secrets_once"]["result"] == "skipped")
 check("platform OWNED+sync failure: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
 
 # --- Observability OWNED: deterministic cloudwatch-agent ServiceAccount role-arn drift plus every other already-owned/healthy-looking case -- one MAIN-owned automatic reconciliation, final convergence still independently requires HEALTHY (O13, required test 5) ---
 ctx = base_context()
-r = simulate(ctx, {}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
-check("observability OWNED+sync success: observability_sync_once must run and succeed (O13)", r["observability_sync_once"]["result"] == "success")
-check("observability OWNED+sync success: validate_observability_ready must succeed", r["validate_observability_ready"]["result"] == "success")
-check("observability OWNED+sync success: validate_shared_secrets_once must succeed (no operator interaction required, D9)", r["validate_shared_secrets_once"]["result"] == "success")
+r = simulate(ctx, {}, phase4_outputs_when_run={"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
+check("observability OWNED+sync success: observability_sync_once must run and succeed (O13)", r["_phase4_internal"]["observability_sync_once"]["result"] == "success")
+check("observability OWNED+sync success: validate_observability_ready must succeed", r["_phase4_internal"]["validate_observability_ready"]["result"] == "success")
+check("observability OWNED+sync success: validate_shared_secrets_once must succeed (no operator interaction required, D9)", r["_phase4_internal"]["validate_shared_secrets_once"]["result"] == "success")
 
 ctx = base_context()
-r = simulate(ctx, {"observability_sync_once": "failure"}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
-check("observability OWNED+sync failure: observability_sync_once must report failure", r["observability_sync_once"]["result"] == "failure")
-check("observability OWNED+sync failure: validate_observability_ready must not proceed (skipped)", r["validate_observability_ready"]["result"] == "skipped")
-check("observability OWNED+sync failure: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
+r = simulate(ctx, {}, phase4_outcome_when_run={"observability_sync_once": "failure"}, phase4_outputs_when_run={"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
+check("observability OWNED+sync failure: observability_sync_once must report failure", r["_phase4_internal"]["observability_sync_once"]["result"] == "failure")
+check("observability OWNED+sync failure: validate_observability_ready must not proceed (skipped)", r["_phase4_internal"]["validate_observability_ready"]["result"] == "skipped")
+check("observability OWNED+sync failure: validate_shared_secrets_once must be skipped", r["_phase4_internal"]["validate_shared_secrets_once"]["result"] == "skipped")
 
 # --- D1-D5: both branches remain parallel and independent even with OWNED in the mix (required test 10); downstream waits for BOTH final convergence points ---
 ctx = base_context()
-r = simulate(ctx, {}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
-check("D1/D2: platform and observability both independently reconcile from OWNED in the same run (parallel, not chained)", r["platform_sync_once"]["result"] == "success" and r["observability_sync_once"]["result"] == "success")
-check("D5: downstream (validate_shared_secrets_once) waits for BOTH final convergence points and only proceeds once both succeed", r["validate_shared_secrets_once"]["result"] == "success")
+r = simulate(ctx, {}, phase4_outputs_when_run={"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
+check("D1/D2: platform and observability both independently reconcile from OWNED in the same run (parallel, not chained)", r["_phase4_internal"]["platform_sync_once"]["result"] == "success" and r["_phase4_internal"]["observability_sync_once"]["result"] == "success")
+check("D5: downstream (validate_shared_secrets_once) waits for BOTH final convergence points and only proceeds once both succeed", r["_phase4_internal"]["validate_shared_secrets_once"]["result"] == "success")
 
 ctx = base_context()
-r = simulate(ctx, {"platform_sync_once": "failure"}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
-check("D3: platform reconciliation failure alone does not prevent observability_sync_once from running (never serialized behind platform)", r["observability_sync_once"]["result"] == "success")
-check("D5: downstream must not proceed when only ONE of the two required convergence points failed", r["validate_shared_secrets_once"]["result"] == "skipped")
+r = simulate(ctx, {}, phase4_outcome_when_run={"platform_sync_once": "failure"}, phase4_outputs_when_run={"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
+check("D3: platform reconciliation failure alone does not prevent observability_sync_once from running (never serialized behind platform)", r["_phase4_internal"]["observability_sync_once"]["result"] == "success")
+check("D5: downstream must not proceed when only ONE of the two required convergence points failed", r["_phase4_internal"]["validate_shared_secrets_once"]["result"] == "skipped")
 
 ctx = base_context()
-r = simulate(ctx, {"observability_sync_once": "failure"}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
-check("D4: observability reconciliation failure alone does not prevent platform_sync_once from running (never serialized behind observability)", r["platform_sync_once"]["result"] == "success")
-check("D5: downstream must not proceed when only ONE of the two required convergence points failed (observability side)", r["validate_shared_secrets_once"]["result"] == "skipped")
+r = simulate(ctx, {}, phase4_outcome_when_run={"observability_sync_once": "failure"}, phase4_outputs_when_run={"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}})
+check("D4: observability reconciliation failure alone does not prevent platform_sync_once from running (never serialized behind observability)", r["_phase4_internal"]["platform_sync_once"]["result"] == "success")
+check("D5: downstream must not proceed when only ONE of the two required convergence points failed (observability side)", r["_phase4_internal"]["validate_shared_secrets_once"]["result"] == "skipped")
 
 # --- D6: Validate mode never invokes either reconciliation workflow, even if the live state would otherwise classify OWNED (required test 9) ---
 ctx = {
-    "validate_model": {"result": "success", "outputs": {"effective_deploy": "false"}},
+    "validate_model": {"result": "success", "outputs": {"effective_deploy": "false", "selected_environment": "dev"}},
     "terraform_sync_once": {"result": "skipped", "outputs": {}},
     "phase_3_argocd": {"result": "skipped", "outputs": {}},
 }
-r = simulate(ctx, {})
-check("D6: platform_preflight must be skipped in Validate mode regardless of live state", r["platform_preflight"]["result"] == "skipped")
-check("D6: observability_preflight must be skipped in Validate mode regardless of live state", r["observability_preflight"]["result"] == "skipped")
-check("D6: platform_sync_once must never run in Validate mode", r["platform_sync_once"]["result"] == "skipped")
-check("D6: observability_sync_once must never run in Validate mode", r["observability_sync_once"]["result"] == "skipped")
+r = simulate(ctx, {}, phase4_outputs_when_run={"platform_preflight": {"state": "OWNED"}})
+check("D6: platform_preflight must be skipped in Validate mode regardless of live state", r["_phase4_internal"]["platform_preflight"]["result"] == "skipped")
+check("D6: observability_preflight must be skipped in Validate mode regardless of live state", r["_phase4_internal"]["observability_preflight"]["result"] == "skipped")
+check("D6: platform_sync_once must never run in Validate mode", r["_phase4_internal"]["platform_sync_once"]["result"] == "skipped")
+check("D6: observability_sync_once must never run in Validate mode", r["_phase4_internal"]["observability_sync_once"]["result"] == "skipped")
 
 if failures:
     print("\n".join(failures))
@@ -12374,11 +12622,11 @@ else
   fail "Fix 3: phase4_platform.py's Fluent Bit validation no longer matches the expected unconditional (non-toggle) shape"
 fi
 
-# MAIN's own platform_sync_once comment must no longer overclaim a generic "Fluent Bit disable/enable toggle" as part of the always-reconcile desired-state contract.
-if grep -qF "a Fluent Bit disable/enable toggle" .github/workflows/00-main-goldengate-orchestrator.yaml; then
-  fail "Fix 3: 00-main-goldengate-orchestrator.yaml still overclaims a generic Fluent Bit disable/enable toggle -- fluentBit.create is a required invariant, not a supported optional toggle"
+# platform_sync_once's own comment must no longer overclaim a generic "Fluent Bit disable/enable toggle" as part of the always-reconcile desired-state contract. Phase 4 grouping: this job (and its comment) now lives inside the grouped Phase 4 wrapper, never directly in MAIN.
+if grep -qF "a Fluent Bit disable/enable toggle" "$PHASE4_WORKFLOW"; then
+  fail "Fix 3: ${PHASE4_WORKFLOW} still overclaims a generic Fluent Bit disable/enable toggle -- fluentBit.create is a required invariant, not a supported optional toggle"
 else
-  pass "Fix 3: 00-main-goldengate-orchestrator.yaml no longer overclaims fluentBit.create as a generic optional toggle -- the REQUIRED-invariant distinction is now explicit"
+  pass "Fix 3: ${PHASE4_WORKFLOW} no longer overclaims fluentBit.create as a generic optional toggle -- the REQUIRED-invariant distinction is now explicit"
 fi
 
 # Monitor: library default vs active-runtime MAIN deployment intent -- three distinct layers, never a plain two-layer merge, and MUST NOT be conflated with the frozen runtime phase.
@@ -12445,21 +12693,21 @@ for f in 80-ops-monitor-metrics-config.yaml 90-ops-observability-artifact-sync.y
     fail "workflow naming: expected OPS workflow ${WORKFLOWS_DIR}/${f} is missing"
   fi
 done
-# Phase 7 grouping / Phase 3 grouping: 70-phase-monitor-final-acceptance.yaml and 30-phase-argocd-orchestration.yaml are both a distinct "PHASE" category (internal MAIN-orchestration wrappers, never operator-facing SUB/OPS workflows) -- exactly these two such files are expected, and each must be exactly its approved filename (whitelist, never arbitrary new workflow files).
+# Phase 7 grouping / Phase 3 grouping / Phase 4 grouping: 70-phase-monitor-final-acceptance.yaml, 30-phase-argocd-orchestration.yaml, and 40-phase-platform-observability-shared-secrets.yaml are all a distinct "PHASE" category (internal MAIN-orchestration wrappers, never operator-facing SUB/OPS workflows) -- exactly these three such files are expected, and each must be exactly its approved filename (whitelist, never arbitrary new workflow files).
 PHASE_NAME_MATCHES="$(find "$WORKFLOWS_DIR" -maxdepth 1 -type f -name "*-phase-*.yaml" 2>/dev/null | sort)"
 PHASE_NAME_MATCH_COUNT="$(echo "$PHASE_NAME_MATCHES" | grep -c . || true)"
-EXPECTED_PHASE_NAME_MATCHES="$(printf '%s\n%s' "${WORKFLOWS_DIR}/30-phase-argocd-orchestration.yaml" "${WORKFLOWS_DIR}/70-phase-monitor-final-acceptance.yaml")"
-if [ "$PHASE_NAME_MATCH_COUNT" -eq 2 ] && [ "$PHASE_NAME_MATCHES" = "$EXPECTED_PHASE_NAME_MATCHES" ]; then
-  pass "workflow naming: exactly two *-phase-*.yaml workflows exist and they are 30-phase-argocd-orchestration.yaml and 70-phase-monitor-final-acceptance.yaml"
+EXPECTED_PHASE_NAME_MATCHES="$(printf '%s\n%s\n%s' "${WORKFLOWS_DIR}/30-phase-argocd-orchestration.yaml" "${WORKFLOWS_DIR}/40-phase-platform-observability-shared-secrets.yaml" "${WORKFLOWS_DIR}/70-phase-monitor-final-acceptance.yaml")"
+if [ "$PHASE_NAME_MATCH_COUNT" -eq 3 ] && [ "$PHASE_NAME_MATCHES" = "$EXPECTED_PHASE_NAME_MATCHES" ]; then
+  pass "workflow naming: exactly three *-phase-*.yaml workflows exist and they are 30-phase-argocd-orchestration.yaml, 40-phase-platform-observability-shared-secrets.yaml, and 70-phase-monitor-final-acceptance.yaml"
 else
   fail "workflow naming: expected exactly ${EXPECTED_PHASE_NAME_MATCHES} matching *-phase-*.yaml, found:"$'\n'"${PHASE_NAME_MATCHES}"
 fi
-# Total workflow file count is now exactly 11 -- the whitelist above (00/10/20/30-sub/30-phase/40/50/70/80/90/91) is exhaustive; a stray/unexpected extra workflow file must fail this count, never be silently tolerated.
+# Total workflow file count is now exactly 12 -- the whitelist above (00/10/20/30-sub/30-phase/40-sub/40-phase/50/70/80/90/91) is exhaustive; a stray/unexpected extra workflow file must fail this count, never be silently tolerated.
 ALL_WORKFLOW_FILE_COUNT="$(find "$WORKFLOWS_DIR" -maxdepth 1 -type f \( -name "*.yaml" -o -name "*.yml" \) 2>/dev/null | wc -l | tr -d ' ')"
-if [ "$ALL_WORKFLOW_FILE_COUNT" -eq 11 ]; then
-  pass "workflow naming: exactly 11 workflow files exist in ${WORKFLOWS_DIR} (00/10/20/30-sub/30-phase/40/50/70/80/90/91 -- no unexpected extra file)"
+if [ "$ALL_WORKFLOW_FILE_COUNT" -eq 12 ]; then
+  pass "workflow naming: exactly 12 workflow files exist in ${WORKFLOWS_DIR} (00/10/20/30-sub/30-phase/40-sub/40-phase/50/70/80/90/91 -- no unexpected extra file)"
 else
-  fail "workflow naming: expected exactly 11 workflow files in ${WORKFLOWS_DIR}, found ${ALL_WORKFLOW_FILE_COUNT}: $(find "$WORKFLOWS_DIR" -maxdepth 1 -type f \( -name '*.yaml' -o -name '*.yml' \) 2>/dev/null | sort | tr '\n' ' ')"
+  fail "workflow naming: expected exactly 12 workflow files in ${WORKFLOWS_DIR}, found ${ALL_WORKFLOW_FILE_COUNT}: $(find "$WORKFLOWS_DIR" -maxdepth 1 -type f \( -name '*.yaml' -o -name '*.yml' \) 2>/dev/null | sort | tr '\n' ' ')"
 fi
 
 # 4: zero references to any retired workflow filename remain anywhere in the repository (code, tests, docs, comments, diagnostics) -- excluding .git/ and this check's own list of retired names below, which must legitimately name them as search targets.
@@ -12491,6 +12739,7 @@ expected_name_prefixes = {
     "30-sub-platform.yaml": "30 | SUB |",
     "30-phase-argocd-orchestration.yaml": "30 | PHASE |",
     "40-sub-observability.yaml": "40 | SUB |",
+    "40-phase-platform-observability-shared-secrets.yaml": "40 | PHASE |",
     "50-sub-monitor.yaml": "50 | SUB |",
     "70-phase-monitor-final-acceptance.yaml": "70 | PHASE |",
     "80-ops-monitor-metrics-config.yaml": "80 | OPS |",
@@ -12515,12 +12764,13 @@ for filename, expected_prefix in expected_name_prefixes.items():
 main_doc = docs.get("00-main-goldengate-orchestrator.yaml")
 phase7_doc = None
 phase3_doc = None
+phase4_doc = None
 if main_doc is not None:
     jobs = main_doc.get("jobs", {}) or {}
     uses_values = {job_id: (job.get("uses") or "") for job_id, job in jobs.items()}
     all_uses = set(uses_values.values())
-    # Phase B2 wired 40-sub-observability.yaml into MAIN (via observability_sync_once) alongside the SUB workflows already called since the workflow-naming task. Phase 7 grouping: 50-sub-monitor.yaml is deliberately EXCLUDED here -- MAIN no longer calls it directly, only through the grouped Phase 7 wrapper. Phase 3 grouping: 20-sub-argocd.yaml is likewise EXCLUDED -- MAIN no longer calls it directly, only through the grouped Phase 3 wrapper (both verified via the nested checks below, never merely dropped).
-    for expected_sub in ("10-sub-iam-secrets.yaml", "30-sub-platform.yaml", "40-sub-observability.yaml"):
+    # Phase 7 grouping: 50-sub-monitor.yaml is deliberately EXCLUDED here -- MAIN no longer calls it directly, only through the grouped Phase 7 wrapper. Phase 3 grouping: 20-sub-argocd.yaml is likewise EXCLUDED. Phase 4 grouping: 30-sub-platform.yaml/40-sub-observability.yaml are likewise EXCLUDED -- MAIN no longer calls either directly, only through the grouped Phase 4 wrapper (all verified via the nested checks below, never merely dropped).
+    for expected_sub in ("10-sub-iam-secrets.yaml",):
         expected_uses = "./.github/workflows/" + expected_sub
         results.append((f"MAIN uses: a reusable-workflow call targeting {expected_sub}", expected_uses in all_uses))
     expected_phase7_uses = "./.github/workflows/70-phase-monitor-final-acceptance.yaml"
@@ -12529,6 +12779,10 @@ if main_doc is not None:
     expected_phase3_uses = "./.github/workflows/30-phase-argocd-orchestration.yaml"
     results.append(("MAIN uses: a reusable-workflow call targeting 30-phase-argocd-orchestration.yaml (the grouped Phase 3 caller)", expected_phase3_uses in all_uses))
     results.append(("MAIN no longer directly targets 20-sub-argocd.yaml (moved behind the grouped Phase 3 wrapper)", "./.github/workflows/20-sub-argocd.yaml" not in all_uses))
+    expected_phase4_uses = "./.github/workflows/40-phase-platform-observability-shared-secrets.yaml"
+    results.append(("MAIN uses: a reusable-workflow call targeting 40-phase-platform-observability-shared-secrets.yaml (the grouped Phase 4 caller)", expected_phase4_uses in all_uses))
+    results.append(("MAIN no longer directly targets 30-sub-platform.yaml (moved behind the grouped Phase 4 wrapper)", "./.github/workflows/30-sub-platform.yaml" not in all_uses))
+    results.append(("MAIN no longer directly targets 40-sub-observability.yaml (moved behind the grouped Phase 4 wrapper)", "./.github/workflows/40-sub-observability.yaml" not in all_uses))
 
     # Nested chain: the grouped Phase 7 wrapper itself must call 50-sub-monitor.yaml -- actively verified, never merely assumed because MAIN stopped calling it directly.
     phase7_doc = docs.get("70-phase-monitor-final-acceptance.yaml")
@@ -12543,6 +12797,15 @@ if main_doc is not None:
         phase3_jobs_for_naming = phase3_doc.get("jobs", {}) or {}
         phase3_uses_values = {job_id: (job.get("uses") or "") for job_id, job in phase3_jobs_for_naming.items()}
         results.append(("30-phase-argocd-orchestration.yaml uses: a reusable-workflow call targeting 20-sub-argocd.yaml (nested chain: MAIN -> Phase 3 wrapper -> 20-sub-argocd.yaml)", "./.github/workflows/20-sub-argocd.yaml" in set(phase3_uses_values.values())))
+
+    # Nested chain: the grouped Phase 4 wrapper itself must call BOTH 30-sub-platform.yaml and 40-sub-observability.yaml -- actively verified, never merely assumed because MAIN stopped calling either directly.
+    phase4_doc = docs.get("40-phase-platform-observability-shared-secrets.yaml")
+    if phase4_doc is not None:
+        phase4_jobs_for_naming = phase4_doc.get("jobs", {}) or {}
+        phase4_uses_values = {job_id: (job.get("uses") or "") for job_id, job in phase4_jobs_for_naming.items()}
+        phase4_all_uses = set(phase4_uses_values.values())
+        results.append(("40-phase-platform-observability-shared-secrets.yaml uses: a reusable-workflow call targeting 30-sub-platform.yaml (nested chain: MAIN -> Phase 4 wrapper -> 30-sub-platform.yaml)", "./.github/workflows/30-sub-platform.yaml" in phase4_all_uses))
+        results.append(("40-phase-platform-observability-shared-secrets.yaml uses: a reusable-workflow call targeting 40-sub-observability.yaml (nested chain: MAIN -> Phase 4 wrapper -> 40-sub-observability.yaml)", "./.github/workflows/40-sub-observability.yaml" in phase4_all_uses))
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
@@ -12836,9 +13099,10 @@ def simulate(initial, outcome_when_run, outputs_when_run=None):
 
 
 def base_context(effective_deploy, has_changes, has_active):
+    # Phase 4 grouping: validate_shared_secrets_once now lives inside the grouped Phase 4 wrapper -- represented here (like phase_3_argocd elsewhere in this suite) as a fixed phase_4_platform_observability context entry exposing both its own overall result and its exact internal validate_shared_secrets_once_result output.
     return {
         "validate_model": {"result": "success", "outputs": {"effective_deploy": effective_deploy, "has_active_deployments": has_active, "has_changes": has_changes}},
-        "validate_shared_secrets_once": {"result": "success", "outputs": {}},
+        "phase_4_platform_observability": {"result": "success", "outputs": {"validate_shared_secrets_once_result": "success"}},
         "delete_removed_argocd_applications": {"result": "success", "outputs": {}},
     }
 
@@ -13119,8 +13383,11 @@ with open("automation/phases/phase7/phase7_final.py") as f:
 results.append(("24z: final_validation itself is always() (runs unconditionally so it can fail closed with diagnostics rather than silently disappearing)", final_val_if.strip() == "always()"))
 results.append(("24y: final_validation'"'"'s gate step now delegates to phase7_final.py validate (Phase 7 Python conversion), never a reimplemented copy of the mode-aware logic inline", "phase7_final.py validate" in final_val_gate_run))
 for extra_job in ("validate_platform_ready", "validate_observability_ready"):
-    results.append((f"23: MAIN phase_7_monitor_final_acceptance caller needs {extra_job} directly (external Phase 1-6 job, closes the transitive-skip gap at the reusable-workflow boundary)", extra_job in caller_needs_b3b))
     results.append((f"24: the final_validation mode-aware gate step requires EXACT success for {extra_job} in its applicable REQUIRED branch (a SKIPPED value fails the gate, never merely treated as not-a-failure)", f"require_success(\x22{extra_job}\x22)" in phase7_final_source))
+# Phase 4 grouping: validate_platform_ready and validate_observability_ready themselves now live behind the grouped Phase 4 wrapper -- the MAIN caller needs phase_4_platform_observability instead of either directly (two external dependencies collapsed into one, never dropped), while the internal require_success("validate_platform_ready")/require_success("validate_observability_ready") names inside phase7_final.py are UNCHANGED (frozen file, each fed via its own exact fallback-mapped result_* input -- see the Phase 4 grouping regression section for that exact expression proof).
+results.append(("23: MAIN phase_7_monitor_final_acceptance caller needs phase_4_platform_observability directly (validate_platform_ready/validate_observability_ready now live behind the grouped Phase 4 wrapper; two dependencies collapsed into one, never dropped)", "phase_4_platform_observability" in caller_needs_b3b))
+results.append(("23b: MAIN phase_7_monitor_final_acceptance caller no longer needs validate_platform_ready directly (it moved behind the grouped Phase 4 wrapper)", "validate_platform_ready" not in caller_needs_b3b))
+results.append(("23c: MAIN phase_7_monitor_final_acceptance caller no longer needs validate_observability_ready directly (it moved behind the grouped Phase 4 wrapper)", "validate_observability_ready" not in caller_needs_b3b))
 # Phase 3 grouping: validate_argocd_ready itself now lives behind the grouped Phase 3 wrapper -- the MAIN caller needs phase_3_argocd instead (one dependency swapped, never dropped), while the internal require_success("validate_argocd_ready") name inside phase7_final.py is UNCHANGED (frozen file, fed via the exact fallback-mapped result_validate_argocd_ready input -- see the Phase 3 grouping regression section for that exact expression proof).
 results.append(("23: MAIN phase_7_monitor_final_acceptance caller needs phase_3_argocd directly (validate_argocd_ready now lives behind the grouped Phase 3 wrapper; one dependency swapped, never dropped)", "phase_3_argocd" in caller_needs_b3b))
 results.append(("23b: MAIN phase_7_monitor_final_acceptance caller no longer needs validate_argocd_ready directly (it moved behind the grouped Phase 3 wrapper)", "validate_argocd_ready" not in caller_needs_b3b))
@@ -13696,7 +13963,7 @@ def transitive_ancestors_all_success(name, results, seen=None):
 
 
 def build_inputs_ctx(results):
-    # Phase 7 grouping: every EXTERNAL Phase 1-6 job/output reference a Phase 7 job's if: expression needs now crosses via workflow_call inputs -- synthesized here from the SAME simulated results dict, so a Phase 7 job's external view is always exactly what MAIN would have actually passed. Phase 3 grouping: validate_argocd_ready now lives behind the grouped Phase 3 wrapper -- MAIN's actual with: block maps result_validate_argocd_ready via needs.phase_3_argocd.outputs.validate_argocd_ready_result || needs.phase_3_argocd.result, so this synthesis mirrors that exact fallback expression rather than reading a (no-longer-existing) top-level validate_argocd_ready result directly.
+    # Phase 7 grouping: every EXTERNAL Phase 1-6 job/output reference a Phase 7 job's if: expression needs now crosses via workflow_call inputs -- synthesized here from the SAME simulated results dict, so a Phase 7 job's external view is always exactly what MAIN would have actually passed. Phase 3 grouping: validate_argocd_ready now lives behind the grouped Phase 3 wrapper -- MAIN's actual with: block maps result_validate_argocd_ready via needs.phase_3_argocd.outputs.validate_argocd_ready_result || needs.phase_3_argocd.result, so this synthesis mirrors that exact fallback expression rather than reading a (no-longer-existing) top-level validate_argocd_ready result directly. Phase 4 grouping: validate_shared_secrets_once/validate_platform_ready/validate_observability_ready now live behind the grouped Phase 4 wrapper -- MAIN's actual with: block maps each of their result_* inputs via the same fallback-OR pattern against phase_4_platform_observability.
     vm_outputs = results.get("validate_model", {"outputs": {}}).get("outputs", {})
 
     def r(name):
@@ -13706,16 +13973,20 @@ def build_inputs_ctx(results):
         phase3_entry = results.get("phase_3_argocd", {"result": "success", "outputs": {}})
         return phase3_entry.get("outputs", {}).get("validate_argocd_ready_result") or phase3_entry.get("result", "success")
 
+    def r_phase4_output(output_name):
+        phase4_entry = results.get("phase_4_platform_observability", {"result": "success", "outputs": {}})
+        return phase4_entry.get("outputs", {}).get(output_name) or phase4_entry.get("result", "success")
+
     return {
         "effective_deploy": vm_outputs.get("effective_deploy", "true"),
         "has_active_deployments": vm_outputs.get("has_active_deployments", "true"),
-        "result_validate_shared_secrets_once": r("validate_shared_secrets_once"),
+        "result_validate_shared_secrets_once": r_phase4_output("validate_shared_secrets_once_result"),
         "result_build_publish_and_deploy": r("build_publish_and_deploy"),
         "result_delete_removed_argocd_applications": r("delete_removed_argocd_applications"),
         "result_replication_reconcile_once": r("replication_reconcile_once"),
         "result_validate_argocd_ready": r_validate_argocd_ready_via_phase3(),
-        "result_validate_platform_ready": r("validate_platform_ready"),
-        "result_validate_observability_ready": r("validate_observability_ready"),
+        "result_validate_platform_ready": r_phase4_output("validate_platform_ready_result"),
+        "result_validate_observability_ready": r_phase4_output("validate_observability_ready_result"),
         "result_validate_active_runtimes": r("validate_active_runtimes"),
     }
 
@@ -13733,13 +14004,12 @@ def would_run(name, results, if_override=None):
 BASE_BACKGROUND = {
     "validate_model": {"result": "success", "outputs": {"effective_deploy": "true", "has_active_deployments": "true"}},
     "terraform_sync_once": {"result": "success", "outputs": {}},
-    "validate_shared_secrets_once": {"result": "success", "outputs": {}},
     "build_publish_and_deploy": {"result": "success", "outputs": {}},
     "validate_active_runtimes": {"result": "success", "outputs": {}},
     # Phase 3 grouping: validate_argocd_ready now lives behind the grouped Phase 3 wrapper -- represented here by phase_3_argocd's own overall result plus its exact internal validate_argocd_ready_result output.
     "phase_3_argocd": {"result": "success", "outputs": {"validate_argocd_ready_result": "success"}},
-    "validate_platform_ready": {"result": "success", "outputs": {}},
-    "validate_observability_ready": {"result": "success", "outputs": {}},
+    # Phase 4 grouping: validate_shared_secrets_once/validate_platform_ready/validate_observability_ready now live behind the grouped Phase 4 wrapper -- represented here by phase_4_platform_observability's own overall result plus its three exact internal *_result outputs.
+    "phase_4_platform_observability": {"result": "success", "outputs": {"validate_shared_secrets_once_result": "success", "validate_platform_ready_result": "success", "validate_observability_ready_result": "success"}},
     "delete_removed_argocd_applications": {"result": "skipped", "outputs": {}},
 }
 
@@ -14671,15 +14941,15 @@ fi
 echo ""
 echo "--- Phase 3 Python Conversion: Argo CD ownership/reconciliation/acceptance stay four visible jobs behind the mandatory approval/reusable-workflow/fresh-acceptance boundaries (assertions A-AJ) ---"
 
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$ARGOCD_DEPLOY_WORKFLOW" ] && [ -f "$PHASE3_WORKFLOW" ] && [ -f "$PHASE3_TOOL" ] && [ -f "$ENVIRONMENT_TOOL" ]; then
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$ARGOCD_DEPLOY_WORKFLOW" ] && [ -f "$PHASE3_WORKFLOW" ] && [ -f "$PHASE3_TOOL" ] && [ -f "$ENVIRONMENT_TOOL" ] && [ -f "$PHASE4_WORKFLOW" ]; then
   set +e
-  PHASE3_ARCHITECTURE_OUT="$(python3 - "$EKS_APP_WORKFLOW" "$ARGOCD_DEPLOY_WORKFLOW" "$PHASE3_WORKFLOW" "$PHASE3_TOOL" "$ENVIRONMENT_TOOL" <<'PYEOF'
+  PHASE3_ARCHITECTURE_OUT="$(python3 - "$EKS_APP_WORKFLOW" "$ARGOCD_DEPLOY_WORKFLOW" "$PHASE3_WORKFLOW" "$PHASE3_TOOL" "$ENVIRONMENT_TOOL" "$PHASE4_WORKFLOW" <<'PYEOF'
 import re
 import sys
 
 import yaml
 
-main_path, argocd_path, phase3_wrapper_path, phase3_tool_path, environment_tool_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+main_path, argocd_path, phase3_wrapper_path, phase3_tool_path, environment_tool_path, phase4_wrapper_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
 with open(main_path) as f:
     main_doc = yaml.safe_load(f)
 with open(argocd_path) as f:
@@ -14690,6 +14960,8 @@ with open(phase3_tool_path) as f:
     phase3_source = f.read()
 with open(environment_tool_path) as f:
     environment_tool_source = f.read()
+with open(phase4_wrapper_path) as f:
+    phase4_doc = yaml.safe_load(f)
 
 results = []
 
@@ -14701,6 +14973,7 @@ def check(label, ok):
 main_jobs = main_doc["jobs"]
 argocd_jobs = argocd_doc["jobs"]
 phase3_jobs = phase3_doc["jobs"]
+phase4_jobs = phase4_doc["jobs"]
 
 # A: Phase 3 grouping: the four Phase 3 job IDs now live inside the grouped 30-phase-argocd-orchestration.yaml wrapper, deliberately never collapsed into one or two; MAIN itself carries exactly the one grouped caller job (phase_3_argocd) and none of the four internal job IDs directly.
 check("A: 30-phase-argocd-orchestration.yaml defines all four Phase 3 job IDs (argocd_preflight, goldengate_deploy_authorization, reconcile_argocd, validate_argocd_ready)", {"argocd_preflight", "goldengate_deploy_authorization", "reconcile_argocd", "validate_argocd_ready"} <= set(phase3_jobs.keys()))
@@ -14782,12 +15055,12 @@ check("O: validate_argocd_ready's Configure AWS credentials step is output-scope
 ready_steps_with_creds = [s for s in ready_steps if "aws_build_credentials.outputs" in str(s.get("env", ""))]
 check("O: only the strict-acceptance step consumes validate_argocd_ready's scoped AWS credentials", ready_steps_with_creds == [acceptance_step] if acceptance_step is not None else False)
 
-# P: Phase 4 (platform_preflight) remains downstream of validate_argocd_ready's exact result, never reconcile_argocd -- reconciliation success alone is never treated as proof of health. Phase 3 grouping: validate_argocd_ready now lives behind the grouped Phase 3 wrapper, so platform_preflight must depend on phase_3_argocd AND check BOTH the wrapper's own overall result and its exact internal validate_argocd_ready_result output -- checking only the former is never sufficient, since an earlier internal Phase 3 failure and a genuine internal validate_argocd_ready skip are not the same thing.
-platform_preflight = main_jobs.get("platform_preflight", {})
-check("P: platform_preflight needs phase_3_argocd (validate_argocd_ready now lives behind the grouped Phase 3 wrapper)", "phase_3_argocd" in (platform_preflight.get("needs") or []))
+# P: Phase 4 (platform_preflight) remains downstream of validate_argocd_ready's exact result, never reconcile_argocd -- reconciliation success alone is never treated as proof of health. Phase 3 grouping: validate_argocd_ready now lives behind the grouped Phase 3 wrapper, so platform_preflight must depend on phase_3_argocd's wrapper result AND its exact internal validate_argocd_ready_result output -- checking only the former is never sufficient, since an earlier internal Phase 3 failure and a genuine internal validate_argocd_ready skip are not the same thing. Phase 4 grouping: platform_preflight itself now lives inside the grouped Phase 4 wrapper (40-phase-platform-observability-shared-secrets.yaml), so phase_3_argocd's wrapper result/exact internal Phase 3D result cross the SECOND reusable-workflow boundary as plain workflow_call inputs (inputs.result_phase_3_argocd/inputs.result_validate_argocd_ready), never a needs: reference to a job outside that file.
+platform_preflight = phase4_jobs.get("platform_preflight", {})
+check("P: platform_preflight has no needs: of its own (phase_3_argocd's result crosses the reusable-workflow boundary as inputs.result_phase_3_argocd, never a needs: reference)", (platform_preflight.get("needs") or []) == [])
 platform_preflight_if = str(platform_preflight.get("if", ""))
-check("P: platform_preflight requires needs.phase_3_argocd.result == success", "needs.phase_3_argocd.result == \x27success\x27" in platform_preflight_if)
-check("P: platform_preflight also requires needs.phase_3_argocd.outputs.validate_argocd_ready_result == success (the exact internal Phase 3D result, never conflated with the wrapper's own overall result)", "needs.phase_3_argocd.outputs.validate_argocd_ready_result == \x27success\x27" in platform_preflight_if)
+check("P: platform_preflight requires inputs.result_phase_3_argocd == success", "inputs.result_phase_3_argocd == \x27success\x27" in platform_preflight_if)
+check("P: platform_preflight also requires inputs.result_validate_argocd_ready == success (the exact internal Phase 3D result, never conflated with the wrapper's own overall result)", "inputs.result_validate_argocd_ready == \x27success\x27" in platform_preflight_if)
 
 # Q: 20-sub-argocd.yaml retains both workflow_dispatch and workflow_call entry modes.
 argocd_on = argocd_doc.get(True, argocd_doc.get("on", {}))
@@ -15248,7 +15521,7 @@ with open(main_path) as f:
     main_doc = yaml.safe_load(f)
 with open(sub_path) as f:
     sub_doc = yaml.safe_load(f)
-check("J: MAIN job count reflects the Phase 7 + Phase 3 groupings (17)", len(main_doc.get("jobs", {})) == 17)
+check("J: MAIN job count reflects the Phase 7 + Phase 3 + Phase 4 groupings (11)", len(main_doc.get("jobs", {})) == 11)
 check("J: MAIN still defines validate_model and terraform_sync_once", {"validate_model", "terraform_sync_once"} <= set(main_doc.get("jobs", {}).keys()))
 check("J: 10-sub-iam-secrets.yaml still defines exactly validate_environment_config and apply", set(sub_doc.get("jobs", {}).keys()) == {"validate_environment_config", "apply"})
 
@@ -15275,18 +15548,21 @@ fi
 echo ""
 echo "--- Phase 4 Python Conversion: dedicated static assertions (A-AI) ---"
 
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PLATFORM_WORKFLOW" ] && [ -f "$OBSERVABILITY_WORKFLOW" ]; then
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE4_WORKFLOW" ] && [ -f "$PLATFORM_WORKFLOW" ] && [ -f "$OBSERVABILITY_WORKFLOW" ]; then
   PHASE4_STATIC_CHECK="$(python3 -c '
 import yaml
 
 with open("'"$EKS_APP_WORKFLOW"'") as f:
     main_doc = yaml.safe_load(f)
+with open("'"$PHASE4_WORKFLOW"'") as f:
+    phase4_doc = yaml.safe_load(f)
 with open("'"$PLATFORM_WORKFLOW"'") as f:
     platform_doc = yaml.safe_load(f)
 with open("'"$OBSERVABILITY_WORKFLOW"'") as f:
     observability_doc = yaml.safe_load(f)
 
-jobs = main_doc["jobs"]
+main_jobs = main_doc["jobs"]
+jobs = phase4_doc["jobs"]
 results = []
 
 PHASE4_JOB_IDS = ("platform_preflight", "platform_sync_once", "validate_platform_ready", "observability_preflight", "observability_sync_once", "validate_observability_ready", "validate_shared_secrets_once")
@@ -15300,10 +15576,11 @@ EXPECTED_NAMES = {
     "validate_shared_secrets_once": "Phase 4G | Validate Shared GoldenGate Secrets",
 }
 
-# A/B/C
-results.append(("A: all seven MAIN Phase 4 job IDs exist", all(jid in jobs for jid in PHASE4_JOB_IDS)))
+# A/A2/B/C -- Phase 4 grouping: the seven Phase 4 job IDs now live inside the grouped 40-phase-platform-observability-shared-secrets.yaml wrapper; MAIN itself carries exactly the one grouped caller job (phase_4_platform_observability) and none of the seven internal job IDs directly.
+results.append(("A: all seven Phase 4 job IDs exist inside the grouped Phase 4 wrapper", all(jid in jobs for jid in PHASE4_JOB_IDS)))
+results.append(("A2: MAIN defines the single grouped Phase 4 caller job phase_4_platform_observability, and none of the seven internal Phase 4 job IDs directly", "phase_4_platform_observability" in main_jobs and not (set(PHASE4_JOB_IDS) & set(main_jobs.keys()))))
 results.append(("B: every Phase 4 job display name exactly matches Phase 4A-G", all(jobs.get(jid, {}).get("name") == name for jid, name in EXPECTED_NAMES.items())))
-results.append(("C: MAIN job count reflects the Phase 7 + Phase 3 groupings (17)", len(jobs) == 17))
+results.append(("C: MAIN job count reflects the Phase 7 + Phase 3 + Phase 4 groupings (11)", len(main_jobs) == 11))
 
 platform_preflight = jobs.get("platform_preflight", {})
 observability_preflight = jobs.get("observability_preflight", {})
@@ -15318,14 +15595,16 @@ op_needs = observability_preflight.get("needs") or []
 pp_if = platform_preflight.get("if", "")
 op_if = observability_preflight.get("if", "")
 
-# D/E -- Phase 3 grouping: validate_argocd_ready now lives behind the grouped Phase 3 wrapper, so both preflight jobs depend on phase_3_argocd instead.
-results.append(("D: platform_preflight depends on phase_3_argocd and NOT on observability_preflight", "phase_3_argocd" in pp_needs and "observability_preflight" not in pp_needs))
-results.append(("D: observability_preflight depends on phase_3_argocd and NOT on platform_preflight", "phase_3_argocd" in op_needs and "platform_preflight" not in op_needs))
+# D/E -- Phase 4 grouping: platform_preflight/observability_preflight now live inside the grouped Phase 4 wrapper, addressed only via workflow_call inputs -- the Phase 3 wrapper result crosses as inputs.result_phase_3_argocd/inputs.result_validate_argocd_ready, never a needs: reference to a job outside this file.
+results.append(("D: platform_preflight has no needs: of its own (phase_3_argocd'"'"'s result crosses the reusable-workflow boundary as inputs.result_phase_3_argocd) and does not reference observability_preflight", pp_needs == [] and "observability_preflight" not in pp_if))
+results.append(("D: observability_preflight has no needs: of its own and does not reference platform_preflight", op_needs == [] and "platform_preflight" not in op_if))
 results.append(("E: Platform and Observability branches remain parallel siblings (neither if: references the other)", "observability_preflight" not in pp_if and "platform_preflight" not in op_if))
 
 # F/G
-results.append(("F: platform_preflight is Deploy-only (effective_deploy == \x27true\x27)", "effective_deploy" in pp_if and "== \x27true\x27" in pp_if))
-results.append(("F: observability_preflight is Deploy-only (effective_deploy == \x27true\x27)", "effective_deploy" in op_if and "== \x27true\x27" in op_if))
+results.append(("F: platform_preflight is Deploy-only (inputs.effective_deploy == \x27true\x27)", "inputs.effective_deploy" in pp_if and "== \x27true\x27" in pp_if))
+results.append(("F: observability_preflight is Deploy-only (inputs.effective_deploy == \x27true\x27)", "inputs.effective_deploy" in op_if and "== \x27true\x27" in op_if))
+results.append(("F: platform_preflight requires the Phase 3 wrapper'"'"'s result and its exact internal validate_argocd_ready result", "inputs.result_phase_3_argocd == \x27success\x27" in pp_if and "inputs.result_validate_argocd_ready == \x27success\x27" in pp_if))
+results.append(("F: observability_preflight requires the Phase 3 wrapper'"'"'s result and its exact internal validate_argocd_ready result", "inputs.result_phase_3_argocd == \x27success\x27" in op_if and "inputs.result_validate_argocd_ready == \x27success\x27" in op_if))
 results.append(("G: platform_preflight exposes a state output", "state" in (platform_preflight.get("outputs") or {})))
 results.append(("G: observability_preflight exposes a state output", "state" in (observability_preflight.get("outputs") or {})))
 
@@ -15356,16 +15635,18 @@ results.append(("N: validate_observability_ready uses if: always()", "always()" 
 results.append(("O: validate_platform_ready requires platform_sync_once.result == success", "platform_sync_once.result == \x27success\x27" in vpr_if))
 results.append(("O: validate_observability_ready requires observability_sync_once.result == success", "observability_sync_once.result == \x27success\x27" in vor_if))
 
-# P/Q
+# P/Q -- Phase 4 grouping: validate_shared_secrets_once external references (validate_model.result, effective_deploy, terraform_sync_once.result) now cross the reusable-workflow boundary as workflow_call inputs; its internal needs (validate_platform_ready/validate_observability_ready) remain plain needs.* references.
 shared_needs = shared_secrets.get("needs") or []
 shared_if = shared_secrets.get("if", "")
 results.append(("P: validate_shared_secrets_once joins both validate_platform_ready and validate_observability_ready", "validate_platform_ready" in shared_needs and "validate_observability_ready" in shared_needs))
-results.append(("Q: validate_shared_secrets_once mode-aware if contract preserved (Validate-mode pass-through, Deploy-mode requires all three upstream successes)", "effective_deploy != \x27true\x27" in shared_if and "terraform_sync_once.result == \x27success\x27" in shared_if and "validate_platform_ready.result == \x27success\x27" in shared_if and "validate_observability_ready.result == \x27success\x27" in shared_if))
+results.append(("Q: validate_shared_secrets_once mode-aware if contract preserved (Validate-mode pass-through, Deploy-mode requires all three upstream successes)", "inputs.effective_deploy != \x27true\x27" in shared_if and "inputs.result_terraform_sync_once == \x27success\x27" in shared_if and "validate_platform_ready.result == \x27success\x27" in shared_if and "validate_observability_ready.result == \x27success\x27" in shared_if))
 
-# R
-runtime_preflight = jobs.get("runtime_ownership_preflight", {})
+# R -- Phase 4 grouping: validate_shared_secrets_once now lives inside the grouped Phase 4 wrapper -- MAIN's runtime_ownership_preflight depends on phase_4_platform_observability instead, checking BOTH the wrapper's own overall result AND its exact internal Phase 4G result.
+runtime_preflight = main_jobs.get("runtime_ownership_preflight", {})
 runtime_needs = runtime_preflight.get("needs") or []
-results.append(("R: runtime_ownership_preflight remains downstream of validate_shared_secrets_once", "validate_shared_secrets_once" in runtime_needs))
+runtime_if = str(runtime_preflight.get("if", ""))
+results.append(("R: runtime_ownership_preflight remains downstream of phase_4_platform_observability", "phase_4_platform_observability" in runtime_needs))
+results.append(("R: runtime_ownership_preflight requires phase_4_platform_observability.result == success AND its exact internal validate_shared_secrets_once_result output == success", "needs.phase_4_platform_observability.result == \x27success\x27" in runtime_if and "needs.phase_4_platform_observability.outputs.validate_shared_secrets_once_result == \x27success\x27" in runtime_if))
 
 # S/T: every MAIN Phase 4 configure-aws-credentials step is output-scoped, and only the live classifier/shared-secret step receives the outputs.
 def cred_steps(job):
@@ -15639,16 +15920,16 @@ expected_names = {
 for job_id, expected_name in expected_names.items():
     results.append((f"B: {job_id} display name is exactly {expected_name!r}", jobs.get(job_id, {}).get("name") == expected_name))
 
-# C: MAIN job count reflects the Phase 7 grouping (26 -> 20: seven Phase 7 jobs replaced by one phase_7_monitor_final_acceptance caller) and the Phase 3 grouping (20 -> 17: four Phase 3 jobs replaced by one phase_3_argocd caller).
-results.append(("C: MAIN job count reflects the Phase 7 + Phase 3 groupings (17)", len(jobs) == 17))
+# C: MAIN job count reflects the Phase 7 grouping (26 -> 20: seven Phase 7 jobs replaced by one phase_7_monitor_final_acceptance caller), the Phase 3 grouping (20 -> 17: four Phase 3 jobs replaced by one phase_3_argocd caller), and the Phase 4 grouping (17 -> 11: seven Phase 4 jobs replaced by one phase_4_platform_observability caller).
+results.append(("C: MAIN job count reflects the Phase 7 + Phase 3 + Phase 4 groupings (11)", len(jobs) == 11))
 
-# D: runtime_ownership_preflight still depends on validate_shared_secrets_once.
-results.append(("D: runtime_ownership_preflight still depends on validate_shared_secrets_once", "validate_shared_secrets_once" in (jobs["runtime_ownership_preflight"].get("needs") or [])))
+# D: runtime_ownership_preflight still depends on validate_shared_secrets_once. Phase 4 grouping: validate_shared_secrets_once now lives behind the grouped Phase 4 wrapper, so this job depends on phase_4_platform_observability instead.
+results.append(("D: runtime_ownership_preflight still depends on phase_4_platform_observability", "phase_4_platform_observability" in (jobs["runtime_ownership_preflight"].get("needs") or [])))
 
 # E: delete_removed_argocd_applications still branches from the Argo health boundary and does not depend on Phase 4. Phase 3 grouping: validate_argocd_ready now lives behind the grouped Phase 3 wrapper, so this job depends on phase_3_argocd instead.
 delete_needs = jobs["delete_removed_argocd_applications"].get("needs") or []
 results.append(("E: delete_removed_argocd_applications depends on phase_3_argocd", "phase_3_argocd" in delete_needs))
-results.append(("E: delete_removed_argocd_applications does not depend on Phase 4 (platform_preflight/observability_preflight/validate_shared_secrets_once)", not ({"platform_preflight", "observability_preflight", "validate_shared_secrets_once"} & set(delete_needs))))
+results.append(("E: delete_removed_argocd_applications does not depend on Phase 4 (phase_4_platform_observability)", "phase_4_platform_observability" not in delete_needs))
 
 # F/G/H: matrices retained exactly.
 results.append(("F: build_publish_and_deploy retains deployment_matrix", "deployment_matrix" in str(((jobs["build_publish_and_deploy"].get("strategy") or {}).get("matrix") or {}).get("include", ""))))
@@ -17736,27 +18017,27 @@ def check(label, ok):
 check("A: replication_reconcile_once job ID remains", "replication_reconcile_once" in jobs)
 check("A: replication_dry_run_validation job ID remains", "replication_dry_run_validation" in jobs)
 
-# B: MAIN total job count reflects the Phase 7 + Phase 3 groupings (26 -> 20 -> 17: seven Phase 7 jobs replaced by one phase_7_monitor_final_acceptance caller, then four Phase 3 jobs replaced by one phase_3_argocd caller; Phase 6 remains an in-place conversion of two EXISTING jobs, never a new one).
-check("B: MAIN total job count reflects the Phase 7 + Phase 3 groupings (17)", len(jobs) == 17)
+# B: MAIN total job count reflects the Phase 7 + Phase 3 + Phase 4 groupings (26 -> 20 -> 17 -> 11: seven Phase 7 jobs replaced by one phase_7_monitor_final_acceptance caller, then four Phase 3 jobs replaced by one phase_3_argocd caller, then seven Phase 4 jobs replaced by one phase_4_platform_observability caller; Phase 6 remains an in-place conversion of two EXISTING jobs, never a new one).
+check("B: MAIN total job count reflects the Phase 7 + Phase 3 + Phase 4 groupings (11)", len(jobs) == 11)
 
-# C/D: needs/if contract preserved exactly.
+# C/D: needs/if contract preserved exactly. Phase 4 grouping: validate_shared_secrets_once now lives behind the grouped Phase 4 wrapper, so both jobs depend on phase_4_platform_observability instead and additionally check its exact internal validate_shared_secrets_once_result output.
 reconcile_job = jobs["replication_reconcile_once"]
 validate_job = jobs["replication_dry_run_validation"]
-check("C: replication_reconcile_once needs are unchanged (validate_model, validate_shared_secrets_once, build_publish_and_deploy, delete_removed_argocd_applications, validate_active_runtimes)",
-      reconcile_job.get("needs") == ["validate_model", "validate_shared_secrets_once", "build_publish_and_deploy", "delete_removed_argocd_applications", "validate_active_runtimes"])
+check("C: replication_reconcile_once needs are unchanged apart from the Phase 4 boundary translation (validate_model, phase_4_platform_observability, build_publish_and_deploy, delete_removed_argocd_applications, validate_active_runtimes)",
+      reconcile_job.get("needs") == ["validate_model", "phase_4_platform_observability", "build_publish_and_deploy", "delete_removed_argocd_applications", "validate_active_runtimes"])
 reconcile_if = str(reconcile_job.get("if", ""))
-check("C: replication_reconcile_once if: still requires effective_deploy == 'true', always(), shared-secrets success, build/delete not failed/cancelled, and validate_active_runtimes when active deployments exist",
+check("C: replication_reconcile_once if: still requires effective_deploy == 'true', always(), shared-secrets success (both wrapper result and exact internal output), build/delete not failed/cancelled, and validate_active_runtimes when active deployments exist",
       "effective_deploy == 'true'" in reconcile_if and "always()" in reconcile_if
-      and "needs.validate_shared_secrets_once.result == 'success'" in reconcile_if
+      and "needs.phase_4_platform_observability.result == 'success'" in reconcile_if and "needs.phase_4_platform_observability.outputs.validate_shared_secrets_once_result == 'success'" in reconcile_if
       and "needs.build_publish_and_deploy.result != 'failure'" in reconcile_if and "needs.build_publish_and_deploy.result != 'cancelled'" in reconcile_if
       and "needs.delete_removed_argocd_applications.result != 'failure'" in reconcile_if and "needs.delete_removed_argocd_applications.result != 'cancelled'" in reconcile_if
       and "has_active_deployments != 'true'" in reconcile_if and "needs.validate_active_runtimes.result == 'success'" in reconcile_if)
-check("D: replication_dry_run_validation needs are unchanged (validate_model, validate_shared_secrets_once, build_publish_and_deploy, delete_removed_argocd_applications)",
-      validate_job.get("needs") == ["validate_model", "validate_shared_secrets_once", "build_publish_and_deploy", "delete_removed_argocd_applications"])
+check("D: replication_dry_run_validation needs are unchanged apart from the Phase 4 boundary translation (validate_model, phase_4_platform_observability, build_publish_and_deploy, delete_removed_argocd_applications)",
+      validate_job.get("needs") == ["validate_model", "phase_4_platform_observability", "build_publish_and_deploy", "delete_removed_argocd_applications"])
 validate_if = str(validate_job.get("if", ""))
-check("D: replication_dry_run_validation if: still requires effective_deploy == 'false', always(), shared-secrets success, build/delete not failed/cancelled",
+check("D: replication_dry_run_validation if: still requires effective_deploy == 'false', always(), shared-secrets success (both wrapper result and exact internal output), build/delete not failed/cancelled",
       "effective_deploy == 'false'" in validate_if and "always()" in validate_if
-      and "needs.validate_shared_secrets_once.result == 'success'" in validate_if
+      and "needs.phase_4_platform_observability.result == 'success'" in validate_if and "needs.phase_4_platform_observability.outputs.validate_shared_secrets_once_result == 'success'" in validate_if
       and "needs.build_publish_and_deploy.result != 'failure'" in validate_if and "needs.build_publish_and_deploy.result != 'cancelled'" in validate_if
       and "needs.delete_removed_argocd_applications.result != 'failure'" in validate_if and "needs.delete_removed_argocd_applications.result != 'cancelled'" in validate_if)
 
@@ -19332,16 +19613,15 @@ PHASE7_JOB_IDS = (
 )
 CALLER_JOB_ID = "phase_7_monitor_final_acceptance"
 PHASE7_FILENAME = "70-phase-monitor-final-acceptance.yaml"
-# Phase 3 grouping: validate_argocd_ready is replaced by phase_3_argocd here -- one dependency swapped, never dropped (see G/G2 below for the exact with: fallback-mapping this substitution requires).
+# Phase 3 grouping: validate_argocd_ready is replaced by phase_3_argocd here -- one dependency swapped, never dropped (see G/G2 below for the exact with: fallback-mapping this substitution requires). Phase 4 grouping: validate_shared_secrets_once/validate_platform_ready/validate_observability_ready are replaced by the single phase_4_platform_observability here -- three dependencies collapsed into one, never dropped (see G/G3/G4/G5 below).
 EXTERNAL_RESULT_JOBS = (
-    "validate_model", "terraform_sync_once", "validate_shared_secrets_once",
-    "phase_3_argocd", "validate_platform_ready", "validate_observability_ready",
+    "validate_model", "terraform_sync_once", "phase_3_argocd", "phase_4_platform_observability",
     "runtime_ownership_preflight", "build_publish_and_deploy", "delete_removed_argocd_applications",
     "validate_active_runtimes", "replication_reconcile_once", "replication_dry_run_validation",
 )
 
-# A: MAIN has exactly 17 jobs (26 - 7 Phase 7 jobs + 1 Phase 7 caller, then 20 - 4 Phase 3 jobs + 1 Phase 3 caller).
-check("A: MAIN has exactly 17 jobs", len(jobs) == 17)
+# A: MAIN has exactly 11 jobs (26 - 7 Phase 7 jobs + 1 Phase 7 caller, then 20 - 4 Phase 3 jobs + 1 Phase 3 caller, then 17 - 7 Phase 4 jobs + 1 Phase 4 caller).
+check("A: MAIN has exactly 11 jobs", len(jobs) == 11)
 
 # B: MAIN no longer directly contains any of the seven Phase 7 job IDs.
 for job_id in PHASE7_JOB_IDS:
@@ -19356,11 +19636,11 @@ check(f"D: {CALLER_JOB_ID} has no steps: key (a genuine reusable-workflow call, 
 # E: the caller job-level if: is exactly always() -- the grouped Phase 7 workflow must still execute when one of its twelve external prerequisites legitimately SKIPPED/FAILED/CANCELLED, so Phase 7G can run its own fail-closed mode-aware contract.
 check(f"E: {CALLER_JOB_ID}'"'"'s if: is exactly always()", str(caller.get("if", "")).strip() == "always()")
 
-# F: the caller needs list contains all twelve required Phase 1-6 external jobs (never collapsed to one aggregate result).
+# F: the caller needs list contains all ten required Phase 1-6 external jobs (the four now-grouped Phase 3/Phase 4 wrapper dependencies collapsed to their single caller jobs, never dropped).
 caller_needs = caller.get("needs") or []
 for job_id in EXTERNAL_RESULT_JOBS:
     check(f"F: {CALLER_JOB_ID} needs {job_id!r}", job_id in caller_needs)
-check(f"F: {CALLER_JOB_ID} needs exactly the twelve required external jobs, no more, no fewer", sorted(caller_needs) == sorted(EXTERNAL_RESULT_JOBS))
+check(f"F: {CALLER_JOB_ID} needs exactly the ten required external jobs, no more, no fewer", sorted(caller_needs) == sorted(EXTERNAL_RESULT_JOBS))
 
 # G: the caller passes every required selected-environment/mode/result input, each sourced from the correct outer needs.<job> reference.
 caller_with = caller.get("with") or {}
@@ -19371,19 +19651,29 @@ EXPECTED_CALLER_WITH = {
     "has_changes": "needs.validate_model.outputs.has_changes",
     "has_deletions": "needs.validate_model.outputs.has_deletions",
 }
+SPECIALLY_HANDLED_EXTERNAL_JOBS = ("phase_3_argocd", "phase_4_platform_observability")
 for job_id in EXTERNAL_RESULT_JOBS:
-    if job_id == "phase_3_argocd":
-        # Phase 3 grouping: handled specially below (G2) -- the with: key name (result_validate_argocd_ready) is UNCHANGED even though the source job id changed, and its value uses the fallback-OR expression, never the generic needs.<job_id>.result pattern every other external job uses.
+    if job_id in SPECIALLY_HANDLED_EXTERNAL_JOBS:
+        # Phase 3/Phase 4 grouping: handled specially below (G2/G3/G4/G5) -- the with: key names (result_validate_argocd_ready, result_validate_shared_secrets_once, result_validate_platform_ready, result_validate_observability_ready) are UNCHANGED even though the source job ids changed, and their values use the fallback-OR expression, never the generic needs.<job_id>.result pattern every other external job uses.
         continue
     EXPECTED_CALLER_WITH[f"result_{job_id}"] = f"needs.{job_id}.result"
 for input_name, expected_ref in EXPECTED_CALLER_WITH.items():
     check(f"G: {CALLER_JOB_ID} passes with.{input_name} sourced from {expected_ref}", expected_ref in str(caller_with.get(input_name, "")))
-ALL_EXPECTED_WITH_KEYS = sorted(list(EXPECTED_CALLER_WITH.keys()) + ["result_validate_argocd_ready"])
+ALL_EXPECTED_WITH_KEYS = sorted(list(EXPECTED_CALLER_WITH.keys()) + ["result_validate_argocd_ready", "result_validate_shared_secrets_once", "result_validate_platform_ready", "result_validate_observability_ready"])
 check("G: the caller passes exactly the required 17 workflow_call inputs, never more, never fewer", sorted(caller_with.keys()) == ALL_EXPECTED_WITH_KEYS)
 
 # G2: Phase 3 grouping -- result_validate_argocd_ready (the Phase 7 wrapper own input name, UNCHANGED/never renamed) is now sourced via the exact fallback-OR expression against phase_3_argocd, never a bare needs.phase_3_argocd.result alone: an earlier internal Phase 3 failure can fail the wrapper while validate_argocd_ready itself is genuinely SKIPPED, and phase7_final.py intentionally distinguishes those states.
 EXPECTED_RESULT_VALIDATE_ARGOCD_READY = "${{ needs.phase_3_argocd.outputs.validate_argocd_ready_result || needs.phase_3_argocd.result }}"
 check("G2: the caller passes with.result_validate_argocd_ready sourced from the exact fallback expression needs.phase_3_argocd.outputs.validate_argocd_ready_result || needs.phase_3_argocd.result", str(caller_with.get("result_validate_argocd_ready", "")) == EXPECTED_RESULT_VALIDATE_ARGOCD_READY)
+
+# G3/G4/G5: Phase 4 grouping -- result_validate_shared_secrets_once/result_validate_platform_ready/result_validate_observability_ready (the Phase 7 wrapper own input names, UNCHANGED/never renamed) are now each sourced via the exact fallback-OR expression against phase_4_platform_observability, never a bare needs.phase_4_platform_observability.result alone: an earlier internal Phase 4 failure can fail the wrapper while one of these three internal jobs is genuinely SKIPPED, and phase7_final.py intentionally distinguishes those states.
+for output_name, input_name in (
+    ("validate_shared_secrets_once_result", "result_validate_shared_secrets_once"),
+    ("validate_platform_ready_result", "result_validate_platform_ready"),
+    ("validate_observability_ready_result", "result_validate_observability_ready"),
+):
+    expected = f"${{{{ needs.phase_4_platform_observability.outputs.{output_name} || needs.phase_4_platform_observability.result }}}}"
+    check(f"G3/G4/G5: the caller passes with.{input_name} sourced from the exact fallback expression needs.phase_4_platform_observability.outputs.{output_name} || needs.phase_4_platform_observability.result", str(caller_with.get(input_name, "")) == expected)
 
 # H: the grouped Phase 7 workflow contains exactly the seven approved internal jobs, with the exact approved IDs.
 check("H: 70-phase-monitor-final-acceptance.yaml contains exactly the seven approved Phase 7 job IDs, no more, no fewer", sorted(phase7_jobs.keys()) == sorted(PHASE7_JOB_IDS))
@@ -19549,11 +19839,13 @@ final_val_gate_env = (final_val_gate_step or {}).get("env") or {}
 mode_key_to_input_name = {"EFFECTIVE_DEPLOY": "effective_deploy", "HAS_ACTIVE_DEPLOYMENTS": "has_active_deployments", "HAS_CHANGES": "has_changes", "HAS_DELETIONS": "has_deletions"}
 check("13b/O: final_validation'"'"'s gate step maps EFFECTIVE_DEPLOY/HAS_ACTIVE_DEPLOYMENTS/HAS_CHANGES/HAS_DELETIONS from inputs.* into plain env: values", all(f"inputs.{input_name}" in str(final_val_gate_env.get(env_key, "")) for env_key, input_name in mode_key_to_input_name.items()))
 for job_id in EXTERNAL_RESULT_JOBS:
-    if job_id == "phase_3_argocd":
-        # Phase 3 grouping: 70-phase-monitor-final-acceptance.yaml and phase7_final.py are both FROZEN (byte-for-byte unchanged) -- the env key here is still RESULT_validate_argocd_ready, mapped from inputs.result_validate_argocd_ready (the Phase 7 wrapper own input name, unchanged), never RESULT_phase_3_argocd/inputs.result_phase_3_argocd. Checked explicitly below instead.
+    if job_id in SPECIALLY_HANDLED_EXTERNAL_JOBS:
+        # Phase 3/Phase 4 grouping: 70-phase-monitor-final-acceptance.yaml and phase7_final.py are both FROZEN (byte-for-byte unchanged) -- the env keys here are still RESULT_validate_argocd_ready/RESULT_validate_shared_secrets_once/RESULT_validate_platform_ready/RESULT_validate_observability_ready, mapped from their own unchanged inputs.result_* names, never RESULT_phase_3_argocd/RESULT_phase_4_platform_observability. Checked explicitly below instead.
         continue
     check(f"O: final_validation'"'"'s gate step maps RESULT_{job_id} from inputs.result_{job_id} (external)", f"inputs.result_{job_id}" in str(final_val_gate_env.get(f"RESULT_{job_id}", "")))
 check("O: final_validation'"'"'s gate step maps RESULT_validate_argocd_ready from inputs.result_validate_argocd_ready (external, input name unchanged by the Phase 3 grouping)", "inputs.result_validate_argocd_ready" in str(final_val_gate_env.get("RESULT_validate_argocd_ready", "")))
+for job_id in ("validate_shared_secrets_once", "validate_platform_ready", "validate_observability_ready"):
+    check(f"O: final_validation'"'"'s gate step maps RESULT_{job_id} from inputs.result_{job_id} (external, input name unchanged by the Phase 4 grouping)", f"inputs.result_{job_id}" in str(final_val_gate_env.get(f"RESULT_{job_id}", "")))
 for job_id in ("monitor_ownership_preflight", "monitor_sync_once", "monitor_dry_run_validation", "validate_monitor_ready", "replication_monitor_acceptance", "end_to_end_deployment_acceptance"):
     check(f"O: final_validation'"'"'s gate step maps RESULT_{job_id} from needs.{job_id}.result (internal Phase 7 reference)", f"needs.{job_id}.result" in str(final_val_gate_env.get(f"RESULT_{job_id}", "")))
 check("O: final_validation'"'"'s gate step maps exactly 18 RESULT_* values, no more, no fewer", len([k for k in final_val_gate_env if k.startswith("RESULT_")]) == 18)
