@@ -16,8 +16,8 @@ on:
         type: string
     outputs:
       validate_argocd_ready_result:
-        description: "The exact result (success/failure/cancelled/skipped) of the internal Phase 3D validate_argocd_ready job -- never conflated with this wrapper's OWN overall result, since the two are not guaranteed to mean the same thing in every failure/skip scenario. Consumed downstream by Phase 4 entry gates, Phase 5 deletion safety, and the Phase 7F/final-validation contract."
-        value: ${{ jobs.validate_argocd_ready.result }}
+        description: "The exact result (success/failure/cancelled/skipped) of the internal Phase 3D validate_argocd_ready job -- never conflated with this wrapper's OWN overall result, since the two are not guaranteed to mean the same thing in every failure/skip scenario. Consumed downstream by Phase 4 entry gates, Phase 5 deletion safety, and the Phase 7F/final-validation contract. Compatibility hardening: forced through fromJSON(toJSON(...)) rather than the bare jobs.<job_id>.result form -- actions/runner#2495 documents that a bare reusable-workflow jobs.<job_id>.result reference can resolve as an empty string in the caller even though the internal job has a valid result; the toJSON/fromJSON materialization is the documented workaround, with no change to the value this output represents."
+        value: ${{ fromJSON(toJSON(jobs.validate_argocd_ready)).result }}
 
 permissions:
   id-token: write

@@ -14706,6 +14706,14 @@ phase3_jobs = phase3_doc["jobs"]
 check("A: 30-phase-argocd-orchestration.yaml defines all four Phase 3 job IDs (argocd_preflight, goldengate_deploy_authorization, reconcile_argocd, validate_argocd_ready)", {"argocd_preflight", "goldengate_deploy_authorization", "reconcile_argocd", "validate_argocd_ready"} <= set(phase3_jobs.keys()))
 check("A2: MAIN defines the single grouped Phase 3 caller job phase_3_argocd, and none of the four internal Phase 3 job IDs directly", "phase_3_argocd" in main_jobs and not ({"argocd_preflight", "goldengate_deploy_authorization", "reconcile_argocd", "validate_argocd_ready"} & set(main_jobs.keys())))
 
+# A3 (compatibility hardening): the grouped Phase 3 wrapper exposes exactly one workflow_call output, still named validate_argocd_ready_result, still referring only to the internal validate_argocd_ready job -- but materialized through fromJSON(toJSON(...)) rather than a bare jobs.<job_id>.result reference, since actions/runner#2495 documents that the bare form can resolve as an empty string in the caller even though the internal job has a valid result. No extra workflow output and no fifth internal job were introduced to work around this.
+phase3_on_block = phase3_doc.get("on", phase3_doc.get(True)) or {}
+phase3_wc_outputs = (phase3_on_block.get("workflow_call") or {}).get("outputs") or {}
+check("A3: 30-phase-argocd-orchestration.yaml exposes exactly one workflow_call output, named validate_argocd_ready_result", list(phase3_wc_outputs.keys()) == ["validate_argocd_ready_result"])
+check("A3: validate_argocd_ready_result's value is materialized via fromJSON(toJSON(jobs.validate_argocd_ready)).result, never the bare jobs.validate_argocd_ready.result form", str(phase3_wc_outputs.get("validate_argocd_ready_result", {}).get("value", "")).strip() == "${{ fromJSON(toJSON(jobs.validate_argocd_ready)).result }}")
+check("A3: the hardened output expression still refers only to the validate_argocd_ready job (no other internal job name appears in the value expression)", str(phase3_wc_outputs.get("validate_argocd_ready_result", {}).get("value", "")).count("validate_argocd_ready") == 1)
+check("A3: no fifth internal Phase 3 job was introduced as a bridge/export job for this hardening", set(phase3_jobs.keys()) == {"argocd_preflight", "goldengate_deploy_authorization", "reconcile_argocd", "validate_argocd_ready"})
+
 preflight = phase3_jobs.get("argocd_preflight", {})
 auth = phase3_jobs.get("goldengate_deploy_authorization", {})
 reconcile = phase3_jobs.get("reconcile_argocd", {})
