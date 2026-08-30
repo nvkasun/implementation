@@ -1,4 +1,4 @@
-"""check-goldengate-approval-topology.py: fails closed if any GitHub Actions workflow in this repository drifts away from the Live Deployment Approval Topology Fix invariant -- MAIN owns exactly one GoldenGate application deployment approval (goldengate_deploy_authorization) for the entire end-to-end Deploy DAG, the four specialist reusable workflows it calls (20/30/40/50) never open a second approval when MAIN-orchestrated, each specialist still retains exactly one standalone approval path for a direct workflow_dispatch run, and the corporate Terraform governance boundary (10-sub-iam-secrets.yaml) plus the independent OPS workflows (80/90/91) are left untouched by this invariant."""
+"""check-goldengate-approval-topology.py: fails closed if any GitHub Actions workflow in this repository drifts away from the Live Deployment Approval Topology Fix invariant -- MAIN owns exactly one GoldenGate application deployment approval (goldengate_deploy_authorization) for the entire end-to-end Deploy DAG, the four specialist reusable workflows (20/30/40/50) never open a second approval when MAIN-orchestrated, each specialist still retains exactly one standalone approval path for a direct workflow_dispatch run, and the corporate Terraform governance boundary (10-sub-iam-secrets.yaml) plus the independent OPS workflows (80/90/91) are left untouched by this invariant. Phase 7 grouping: 20/30/40 remain DIRECT MAIN calls, but 50-sub-monitor.yaml is now called NESTED -- MAIN -> 70-phase-monitor-final-acceptance.yaml -> monitor_sync_once -> 50-sub-monitor.yaml. This checker actively verifies that full nested chain (never merely stops checking 50-sub-monitor.yaml) and additionally proves the Phase 7 wrapper itself opens no second approval of its own."""
 from __future__ import annotations
 
 import glob
@@ -18,14 +18,17 @@ SPECIALIST_FILENAMES = [
     "40-sub-observability.yaml",
     "50-sub-monitor.yaml",
 ]
+# 20/30/40 remain DIRECT MAIN caller jobs. 50-sub-monitor.yaml is deliberately EXCLUDED from this direct-caller map after the Phase 7 grouping -- MAIN no longer calls it directly; see PHASE7_WRAPPER_FILENAME/check_main_calls_phase7_wrapper_which_calls_monitor below for the actively-verified nested chain instead.
 SPECIALIST_CALLER_JOBS = {
     "20-sub-argocd.yaml": "reconcile_argocd",
     "30-sub-platform.yaml": "platform_sync_once",
     "40-sub-observability.yaml": "observability_sync_once",
-    "50-sub-monitor.yaml": "monitor_sync_once",
 }
 STANDALONE_AUTHORIZATION_JOB = "standalone_deploy_authorization"
 ORCHESTRATION_CONTRACT_INPUT = "orchestrated_by_main"
+MONITOR_SPECIALIST_FILENAME = "50-sub-monitor.yaml"
+PHASE7_WRAPPER_FILENAME = "70-phase-monitor-final-acceptance.yaml"
+PHASE7_WRAPPER_MONITOR_CALLER_JOB = "monitor_sync_once"
 CORPORATE_TERRAFORM_WORKFLOW_FILENAME = "10-sub-iam-secrets.yaml"
 CORPORATE_TERRAFORM_WORKFLOW_CALLER_JOB = "terraform_sync_once"
 CORPORATE_TERRAFORM_REUSABLE_WORKFLOW_REF = "AbuDhabiCommercialBank/adcb-reusable-workflows/.github/workflows/aws-terraform-apply.yaml@main"
@@ -121,6 +124,55 @@ def check_main_calls_pass_orchestrated_by_main(doc, findings):
         with_block = job.get("with") or {}
         if with_block.get(ORCHESTRATION_CONTRACT_INPUT) is not True:
             findings.append(f"MAIN job {caller_job_name!r} must pass {ORCHESTRATION_CONTRACT_INPUT}: true to {filename!r}, found {with_block.get(ORCHESTRATION_CONTRACT_INPUT)!r}")
+
+
+def _find_job_calling(jobs, expected_filename):
+    """Returns (job_name, job) for the first job whose uses: ends with .github/workflows/<expected_filename>, or (None, None) if none does."""
+    expected_uses_suffix = f".github/workflows/{expected_filename}"
+    for name, job in jobs.items():
+        if isinstance(job, dict) and str(job.get("uses") or "").endswith(expected_uses_suffix):
+            return name, job
+    return None, None
+
+
+def check_main_calls_phase7_wrapper_which_calls_monitor(main_doc, workflow_dir, findings):
+    """Rule 5 (nested, Phase 7 grouping): 50-sub-monitor.yaml is no longer called directly by MAIN -- it must be reached through the EXACT chain MAIN -> 70-phase-monitor-final-acceptance.yaml -> monitor_sync_once -> 50-sub-monitor.yaml, with orchestrated_by_main: true preserved at the innermost call. This actively verifies every link, never merely stops checking 50-sub-monitor.yaml because it moved."""
+    main_jobs = _jobs(main_doc)
+    wrapper_job_name, wrapper_job = _find_job_calling(main_jobs, PHASE7_WRAPPER_FILENAME)
+    if wrapper_job is None:
+        findings.append(f"MAIN has no job calling {PHASE7_WRAPPER_FILENAME!r} -- 50-sub-monitor.yaml must be reached through this approved Phase 7 wrapper, never directly from MAIN and never left unreachable")
+        return
+
+    wrapper_path = os.path.join(workflow_dir, PHASE7_WRAPPER_FILENAME)
+    if not os.path.exists(wrapper_path):
+        findings.append(f"MAIN job {wrapper_job_name!r} calls {PHASE7_WRAPPER_FILENAME!r}, but that file does not exist")
+        return
+    wrapper_doc = load_workflow(wrapper_path)
+    wrapper_jobs = _jobs(wrapper_doc)
+
+    monitor_job = wrapper_jobs.get(PHASE7_WRAPPER_MONITOR_CALLER_JOB)
+    if not isinstance(monitor_job, dict):
+        findings.append(f"{PHASE7_WRAPPER_FILENAME} is missing the expected caller job {PHASE7_WRAPPER_MONITOR_CALLER_JOB!r} for {MONITOR_SPECIALIST_FILENAME!r}")
+        return
+    expected_uses_suffix = f".github/workflows/{MONITOR_SPECIALIST_FILENAME}"
+    uses = monitor_job.get("uses") or ""
+    if not uses.endswith(expected_uses_suffix):
+        findings.append(f"{PHASE7_WRAPPER_FILENAME} job {PHASE7_WRAPPER_MONITOR_CALLER_JOB!r} does not call {MONITOR_SPECIALIST_FILENAME!r} via uses: (found {uses!r})")
+        return
+    with_block = monitor_job.get("with") or {}
+    if with_block.get(ORCHESTRATION_CONTRACT_INPUT) is not True:
+        findings.append(f"{PHASE7_WRAPPER_FILENAME} job {PHASE7_WRAPPER_MONITOR_CALLER_JOB!r} must pass {ORCHESTRATION_CONTRACT_INPUT}: true to {MONITOR_SPECIALIST_FILENAME!r}, found {with_block.get(ORCHESTRATION_CONTRACT_INPUT)!r}")
+
+
+def check_phase7_wrapper_opens_no_second_authorization(wrapper_doc, findings):
+    """The Phase 7 wrapper is a pure orchestration passthrough -- it must never declare its own job-level environment: (which would open a second, redundant GoldenGate deployment approval alongside MAIN's single goldengate_deploy_authorization) and must never itself be a standalone_deploy_authorization-style gate."""
+    jobs = _jobs(wrapper_doc)
+    envs = [name for name, job in jobs.items() if isinstance(job, dict) and _job_environment(job) is not None]
+    if envs:
+        findings.append(f"{PHASE7_WRAPPER_FILENAME}: must declare zero job-level environment: keys (found on {envs}) -- it must never open a second GoldenGate deployment approval; MAIN's single goldengate_deploy_authorization already covers this chain")
+    on_block = _on_block(wrapper_doc)
+    if "workflow_dispatch" in on_block or "push" in on_block or "pull_request" in on_block or "schedule" in on_block:
+        findings.append(f"{PHASE7_WRAPPER_FILENAME}: must expose workflow_call only -- found additional trigger(s) {sorted(on_block.keys())!r}, which would make it a second operator-facing standalone workflow")
 
 
 def check_main_reconcile_requires_authorization(doc, findings):
@@ -337,9 +389,18 @@ def run_checks(workflow_dir):
     workflows_inspected += 1
     check_main_single_authorization(main_doc, findings)
     check_main_calls_pass_orchestrated_by_main(main_doc, findings)
+    check_main_calls_phase7_wrapper_which_calls_monitor(main_doc, workflow_dir, findings)
     check_main_reconcile_requires_authorization(main_doc, findings)
     check_main_deletion_requires_authorization(main_doc, findings)
     check_main_never_calls_ops_workflows(main_doc, findings)
+
+    phase7_wrapper_path = os.path.join(workflow_dir, PHASE7_WRAPPER_FILENAME)
+    if os.path.exists(phase7_wrapper_path):
+        phase7_wrapper_doc = load_workflow(phase7_wrapper_path)
+        workflows_inspected += 1
+        check_phase7_wrapper_opens_no_second_authorization(phase7_wrapper_doc, findings)
+    else:
+        findings.append(f"{PHASE7_WRAPPER_FILENAME}: expected file does not exist")
 
     for filename in SPECIALIST_FILENAMES:
         path = os.path.join(workflow_dir, filename)

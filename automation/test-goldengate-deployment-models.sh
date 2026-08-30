@@ -20,6 +20,7 @@ MONITOR_WORKFLOW=".github/workflows/50-sub-monitor.yaml"
 METRICS_CONFIG_WORKFLOW=".github/workflows/80-ops-monitor-metrics-config.yaml"
 METRICS_CONFIG_HELPER_SCRIPT="automation/goldengate-metrics-config.py"
 EKS_APP_WORKFLOW=".github/workflows/00-main-goldengate-orchestrator.yaml"
+PHASE7_WORKFLOW=".github/workflows/70-phase-monitor-final-acceptance.yaml"
 PLATFORM_WORKFLOW=".github/workflows/30-sub-platform.yaml"
 DETECT_SCRIPT="automation/phases/phase1/detect-goldengate-deployments.sh"
 PHASE1_TOOL="automation/phases/phase1/phase1_readiness.py"
@@ -4781,8 +4782,8 @@ MONITOR_PY="monitoring/monitor/monitor.py"
 MONITOR_WORKFLOW=".github/workflows/50-sub-monitor.yaml"
 
 if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  # This narrow Phase 6C1B guard originally proved that phase's changes were made in place to the (then single) monitor workflow file, never by adding a parallel duplicate. The workflow naming/operator UX standardization task later legitimately renamed all nine workflow files in place -- each rename is a content move, not a new parallel workflow -- so the nine canonical renamed filenames are expected/allowed here; any other new workflow file remains exactly the violation this check was written to catch. The rename itself is now guarded by the dedicated, more precise "Workflow naming / operator UX standardization" section later in this suite (exactly-one-MAIN, exact SUB/OPS sets, zero stale old-filename references) -- the same supersession pattern already used for cloudwatch-observability-artifact-sync.yaml's release from check 15's byte-diff guard by Phase 11.
-  NEW_WORKFLOW_FILES="$(git status --porcelain=v1 -- .github/workflows/ 2>/dev/null | grep -E '^\?\?' | grep -vE '^\?\? \.github/workflows/(00-main-goldengate-orchestrator|10-sub-iam-secrets|20-sub-argocd|30-sub-platform|40-sub-observability|50-sub-monitor|80-ops-monitor-metrics-config|90-ops-observability-artifact-sync|91-ops-ecr-image-sync)\.yaml$' || true)"
+  # This narrow Phase 6C1B guard originally proved that phase's changes were made in place to the (then single) monitor workflow file, never by adding a parallel duplicate. The workflow naming/operator UX standardization task later legitimately renamed all nine workflow files in place -- each rename is a content move, not a new parallel workflow -- so the nine canonical renamed filenames are expected/allowed here; any other new workflow file remains exactly the violation this check was written to catch. The rename itself is now guarded by the dedicated, more precise "Workflow naming / operator UX standardization" section later in this suite (exactly-one-MAIN, exact SUB/OPS sets, zero stale old-filename references) -- the same supersession pattern already used for cloudwatch-observability-artifact-sync.yaml's release from check 15's byte-diff guard by Phase 11. Phase 7 grouping: 70-phase-monitor-final-acceptance.yaml is the one exact, approved new workflow file this task adds (an internal MAIN-orchestration wrapper, never a new operator-facing SUB/OPS workflow) -- explicitly whitelisted here, never a relaxation to allow arbitrary new files.
+  NEW_WORKFLOW_FILES="$(git status --porcelain=v1 -- .github/workflows/ 2>/dev/null | grep -E '^\?\?' | grep -vE '^\?\? \.github/workflows/(00-main-goldengate-orchestrator|10-sub-iam-secrets|20-sub-argocd|30-sub-platform|40-sub-observability|50-sub-monitor|70-phase-monitor-final-acceptance|80-ops-monitor-metrics-config|90-ops-observability-artifact-sync|91-ops-ecr-image-sync)\.yaml$' || true)"
   if [ -z "$NEW_WORKFLOW_FILES" ]; then
     pass "25: no unexpected new workflow file introduced beyond the sanctioned workflow-naming rename"
   else
@@ -5546,15 +5547,23 @@ import yaml
 
 with open(sys.argv[1]) as f:
     doc = yaml.safe_load(f)
+# Phase 7 grouping: monitor_sync_once/final_validation now live inside the grouped Phase 7 reusable workflow, never directly in MAIN -- both documents are loaded so this chain-connectivity proof spans the reusable-workflow boundary explicitly, rather than silently stopping at it.
+with open(".github/workflows/70-phase-monitor-final-acceptance.yaml") as f:
+    phase7_doc = yaml.safe_load(f)
 
 jobs = doc["jobs"]
+phase7_jobs = phase7_doc["jobs"]
 expected_order = [
     "validate_model", "terraform_sync_once", "platform_sync_once", "validate_shared_secrets_once",
-    "build_publish_and_deploy", "monitor_sync_once", "final_validation",
+    "build_publish_and_deploy", "phase_7_monitor_final_acceptance",
 ]
 for name in expected_order:
     if name not in jobs:
         print(f"FAIL: missing required job {name!r}")
+        sys.exit(1)
+for name in ("monitor_sync_once", "final_validation"):
+    if name not in phase7_jobs:
+        print(f"FAIL: missing required internal Phase 7 job {name!r}")
         sys.exit(1)
 
 if "bootstrap_admin_secrets" in jobs:
@@ -5563,6 +5572,10 @@ if "bootstrap_admin_secrets" in jobs:
 
 def needs_of(name):
     n = jobs[name].get("needs") or []
+    return [n] if isinstance(n, str) else n
+
+def phase7_needs_of(name):
+    n = phase7_jobs[name].get("needs") or []
     return [n] if isinstance(n, str) else n
 
 if "validate_model" not in needs_of("terraform_sync_once"):
@@ -5601,17 +5614,23 @@ if ("terraform_sync_once" not in needs_of("validate_shared_secrets_once")
 if "validate_shared_secrets_once" not in needs_of("build_publish_and_deploy"):
     print("FAIL: build_publish_and_deploy does not need validate_shared_secrets_once")
     sys.exit(1)
-if "build_publish_and_deploy" not in needs_of("monitor_sync_once"):
-    print("FAIL: monitor_sync_once does not need build_publish_and_deploy")
+if "build_publish_and_deploy" not in needs_of("phase_7_monitor_final_acceptance"):
+    print("FAIL: phase_7_monitor_final_acceptance does not need build_publish_and_deploy")
     sys.exit(1)
-if "monitor_sync_once" not in needs_of("final_validation"):
-    print("FAIL: final_validation does not need monitor_sync_once")
+if "monitor_ownership_preflight" not in phase7_needs_of("monitor_sync_once"):
+    print("FAIL: monitor_sync_once (inside the grouped Phase 7 workflow) does not need monitor_ownership_preflight")
+    sys.exit(1)
+if "monitor_sync_once" not in phase7_needs_of("final_validation"):
+    print("FAIL: final_validation (inside the grouped Phase 7 workflow) does not need monitor_sync_once")
     sys.exit(1)
 
-for name in ("terraform_sync_once", "platform_sync_once", "observability_sync_once", "monitor_sync_once"):
+for name in ("terraform_sync_once", "platform_sync_once", "observability_sync_once", "phase_7_monitor_final_acceptance"):
     if not str(jobs[name].get("uses", "")).startswith("./.github/workflows/"):
         print(f"FAIL: {name} does not call a reusable workflow via a job-level uses:")
         sys.exit(1)
+if not str(phase7_jobs["monitor_sync_once"].get("uses", "")).startswith("./.github/workflows/"):
+    print("FAIL: monitor_sync_once (inside the grouped Phase 7 workflow) does not call a reusable workflow via a job-level uses:")
+    sys.exit(1)
 
 if "strategy" in jobs["validate_shared_secrets_once"] or "matrix" in jobs["validate_shared_secrets_once"]:
     print("FAIL: validate_shared_secrets_once uses a matrix (must be a single job)")
@@ -5817,8 +5836,9 @@ else
   pass "29: no dynamic per-deployment secret module exists in secret.tf"
 fi
 
-if grep -q "enable_cloudwatch_publication: true" "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && grep -q "metrics_gate_expectation: any" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+# Phase 7 grouping: monitor_sync_once (and its enable_cloudwatch_publication/metrics_gate_expectation with: block) now lives inside the grouped Phase 7 reusable workflow, never directly in MAIN.
+if grep -q "enable_cloudwatch_publication: true" "$PHASE7_WORKFLOW" 2>/dev/null \
+    && grep -q "metrics_gate_expectation: any" "$PHASE7_WORKFLOW" 2>/dev/null; then
   pass "29: the orchestrator explicitly calls the monitor workflow with enable_cloudwatch_publication=true and metrics_gate_expectation=any"
 else
   fail "29: the orchestrator does not explicitly preserve CloudWatch publication when synchronizing the monitor"
@@ -6079,16 +6099,17 @@ echo "--- Phase 6D0-Final: reusable-workflow secret/permission chain ---"
 
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   set +e
-  WORKFLOW_CHAIN_CHECK="$(python3 - "$EKS_APP_WORKFLOW" ".github/workflows/10-sub-iam-secrets.yaml" ".github/workflows/30-sub-platform.yaml" ".github/workflows/50-sub-monitor.yaml" <<'PYEOF'
+  WORKFLOW_CHAIN_CHECK="$(python3 - "$EKS_APP_WORKFLOW" ".github/workflows/10-sub-iam-secrets.yaml" ".github/workflows/30-sub-platform.yaml" ".github/workflows/50-sub-monitor.yaml" "$PHASE7_WORKFLOW" <<'PYEOF'
 import sys
 import yaml
 
-eks_app_path, terraform_wf_path, platform_wf_path, monitor_wf_path = sys.argv[1:5]
+eks_app_path, terraform_wf_path, platform_wf_path, monitor_wf_path, phase7_wf_path = sys.argv[1:6]
 
 eks_app = yaml.safe_load(open(eks_app_path))
 terraform_wf = yaml.safe_load(open(terraform_wf_path))
 platform_wf = yaml.safe_load(open(platform_wf_path))
 monitor_wf = yaml.safe_load(open(monitor_wf_path))
+phase7_wf = yaml.safe_load(open(phase7_wf_path))
 
 jobs = eks_app["jobs"]
 terraform_job = jobs["terraform_sync_once"]
@@ -6111,12 +6132,13 @@ if apply_job.get("secrets") != "inherit":
     print("FAIL: 10-sub-iam-secrets.yaml's apply job does not forward secrets to the ADCB reusable workflow")
     sys.exit(1)
 
-for name, job in (("platform_sync_once", jobs["platform_sync_once"]), ("monitor_sync_once", jobs["monitor_sync_once"])):
+# Phase 7 grouping: monitor_sync_once now lives inside the grouped Phase 7 reusable workflow, never directly in MAIN -- checked against that document instead. MAIN's own new phase_7_monitor_final_acceptance caller (which calls 70-phase-monitor-final-acceptance.yaml, itself referencing no secrets.*) is checked the same way as platform_sync_once/monitor_sync_once.
+for name, job in (("platform_sync_once", jobs["platform_sync_once"]), ("phase_7_monitor_final_acceptance", jobs["phase_7_monitor_final_acceptance"]), ("monitor_sync_once", phase7_wf["jobs"]["monitor_sync_once"])):
     if "secrets" in job:
         print(f"FAIL: {name} declares unnecessary secret forwarding (neither called workflow references secrets.*)")
         sys.exit(1)
 
-for path, doc in ((platform_wf_path, platform_wf), (monitor_wf_path, monitor_wf)):
+for path, doc in ((platform_wf_path, platform_wf), (monitor_wf_path, monitor_wf), (phase7_wf_path, phase7_wf)):
     with open(path) as f:
         text = f.read()
     if "${{ secrets." in text or "${{secrets." in text:
@@ -6314,8 +6336,9 @@ else
   skip "32: existing Oracle/PostgreSQL manifest byte comparison -- helm or git not available"
 fi
 
-if grep -q "enable_cloudwatch_publication: true" "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && grep -q "metrics_gate_expectation: any" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+# Phase 7 grouping: monitor_sync_once's enable_cloudwatch_publication/metrics_gate_expectation with: block now lives inside the grouped Phase 7 reusable workflow, never directly in MAIN.
+if grep -q "enable_cloudwatch_publication: true" "$PHASE7_WORKFLOW" 2>/dev/null \
+    && grep -q "metrics_gate_expectation: any" "$PHASE7_WORKFLOW" 2>/dev/null; then
   pass "32: monitoring publication remains explicitly enabled after Phase 6D1"
 else
   fail "32: monitoring publication configuration changed unexpectedly"
@@ -6331,8 +6354,9 @@ fi
 echo ""
 echo "--- Phase 6D1 correction: REST-contract and execution-identity fixes ---"
 
-if grep -q "replication_monitor_acceptance" "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && grep -q "api/processes" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+# Phase 7 grouping: replication_monitor_acceptance now lives inside the grouped Phase 7 reusable workflow, never directly in MAIN.
+if grep -q "replication_monitor_acceptance" "$PHASE7_WORKFLOW" 2>/dev/null \
+    && grep -q "api/processes" "$PHASE7_WORKFLOW" 2>/dev/null; then
   pass "32: a replication-specific monitor acceptance job queries /api/processes for real process names"
 else
   fail "32: the replication-specific monitor acceptance job is missing"
@@ -7850,7 +7874,8 @@ echo "--- VDR correction: monitor_dry_run_validation runner (CodeBuild -> ubuntu
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   MONITOR_DRY_RUN_CHECK="$(python3 -c '
 import yaml
-with open("'"$EKS_APP_WORKFLOW"'") as f:
+# Phase 7 grouping: monitor_dry_run_validation now lives inside the grouped Phase 7 reusable workflow, never directly in MAIN.
+with open("'"$PHASE7_WORKFLOW"'") as f:
     doc = yaml.safe_load(f)
 job = doc["jobs"]["monitor_dry_run_validation"]
 results = []
@@ -7918,16 +7943,17 @@ else
   skip "VDR-MON: monitor_dry_run_validation structural checks -- python3/PyYAML unavailable"
 fi
 
-if grep -qF "if: \${{ needs.validate_model.outputs.effective_deploy == 'false' && needs.validate_model.outputs.has_active_deployments == 'true' && always() && needs.validate_shared_secrets_once.result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' && needs.replication_dry_run_validation.result != 'failure' && needs.replication_dry_run_validation.result != 'cancelled' }}" "$EKS_APP_WORKFLOW" 2>/dev/null; then
-  pass "VDR-MON 14: monitor_dry_run_validation's deploy=false job-gating if: condition retains every original clause plus the additive has_active_deployments=='true' gate"
+# Phase 7 grouping: monitor_dry_run_validation/monitor_sync_once now live inside the grouped Phase 7 reusable workflow, and their EXTERNAL Phase 1-6 references translate from needs.validate_model.outputs.*/needs.<job>.result to inputs.*/inputs.result_* at that boundary -- the literal text below is updated to match, never merely stopping the check because the job moved.
+if grep -qF "if: \${{ inputs.effective_deploy == 'false' && inputs.has_active_deployments == 'true' && always() && inputs.result_validate_shared_secrets_once == 'success' && inputs.result_build_publish_and_deploy != 'failure' && inputs.result_build_publish_and_deploy != 'cancelled' && inputs.result_delete_removed_argocd_applications != 'failure' && inputs.result_delete_removed_argocd_applications != 'cancelled' && inputs.result_replication_dry_run_validation != 'failure' && inputs.result_replication_dry_run_validation != 'cancelled' }}" "$PHASE7_WORKFLOW" 2>/dev/null; then
+  pass "VDR-MON 14: monitor_dry_run_validation's deploy=false job-gating if: condition (inside the grouped Phase 7 workflow) retains every original clause plus the additive has_active_deployments=='true' gate"
 else
   fail "VDR-MON 14: monitor_dry_run_validation's deploy=false job-gating if: condition was unexpectedly modified"
 fi
 
-if grep -qF "uses: ./.github/workflows/50-sub-monitor.yaml" "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && grep -qF "deploy: true" "$EKS_APP_WORKFLOW" 2>/dev/null \
-    && grep -qF "needs.validate_model.outputs.effective_deploy == 'true' && needs.validate_model.outputs.has_active_deployments == 'true' && always() && needs.validate_shared_secrets_once.result == 'success'" "$EKS_APP_WORKFLOW" 2>/dev/null; then
-  pass "VDR-MON 15: monitor_sync_once's deploy=true reusable-workflow call (50-sub-monitor.yaml, deploy: true) is unchanged, and its job-gating if: condition retains every original clause plus the additive has_active_deployments=='true' gate"
+if grep -qF "uses: ./.github/workflows/50-sub-monitor.yaml" "$PHASE7_WORKFLOW" 2>/dev/null \
+    && grep -qF "deploy: true" "$PHASE7_WORKFLOW" 2>/dev/null \
+    && grep -qF "inputs.effective_deploy == 'true' && inputs.has_active_deployments == 'true' && always() && inputs.result_validate_shared_secrets_once == 'success'" "$PHASE7_WORKFLOW" 2>/dev/null; then
+  pass "VDR-MON 15: monitor_sync_once's deploy=true reusable-workflow call (50-sub-monitor.yaml, deploy: true) is unchanged, and its job-gating if: condition (inside the grouped Phase 7 workflow) retains every original clause plus the additive has_active_deployments=='true' gate"
 else
   fail "VDR-MON 15: monitor_sync_once's deploy=true path appears to have changed"
 fi
@@ -7935,12 +7961,16 @@ fi
 echo ""
 echo "--- Orchestrator gate: monitor stages skip when the canonical model has zero active runtimes ---"
 
-if [ "$PYTHON_AVAILABLE" = "true" ]; then
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$PHASE7_WORKFLOW" ]; then
   ACTIVE_GATE_CHECK="$(python3 -c '
 import yaml
 with open("'"$EKS_APP_WORKFLOW"'") as f:
     doc = yaml.safe_load(f)
+# Phase 7 grouping: monitor_sync_once/monitor_dry_run_validation/replication_monitor_acceptance/final_validation now live inside the grouped Phase 7 reusable workflow, never directly in MAIN.
+with open("'"$PHASE7_WORKFLOW"'") as f:
+    phase7_doc = yaml.safe_load(f)
 jobs = doc["jobs"]
+phase7_jobs = phase7_doc["jobs"]
 results = []
 
 results.append(("1: validate_model exports has_active_deployments", "has_active_deployments" in jobs["validate_model"].get("outputs", {})))
@@ -7954,20 +7984,20 @@ with open("'"$PHASE1_TOOL"'") as f:
 results.append(("3: has_active_deployments is derived from the canonical registry, not deployment_matrix (cmd_active_runtime_state calls goldengate-deployment-model.py ... registry)", "\"registry\", \"--output\"" in phase1_source and "has_active_deployments" in phase1_source))
 results.append(("4: the active-runtime step never greps YAML (uses PyYAML safe_load)", "yaml.safe_load" in phase1_source))
 
-monitor_sync_if = jobs["monitor_sync_once"]["if"]
-results.append(("5: monitor_sync_once requires has_active_deployments == \'\''true\'\''", "needs.validate_model.outputs.has_active_deployments == '"'"'true'"'"'" in monitor_sync_if))
-results.append(("6: monitor_sync_once retains its original effective_deploy/dependency clauses", "needs.validate_model.outputs.effective_deploy == '"'"'true'"'"'" in monitor_sync_if and "needs.validate_shared_secrets_once.result == '"'"'success'"'"'" in monitor_sync_if and "needs.replication_reconcile_once.result != '"'"'cancelled'"'"'" in monitor_sync_if))
+monitor_sync_if = phase7_jobs["monitor_sync_once"]["if"]
+results.append(("5: monitor_sync_once requires has_active_deployments == \'\''true\'\''", "inputs.has_active_deployments == '"'"'true'"'"'" in monitor_sync_if))
+results.append(("6: monitor_sync_once retains its original effective_deploy/dependency clauses", "inputs.effective_deploy == '"'"'true'"'"'" in monitor_sync_if and "inputs.result_validate_shared_secrets_once == '"'"'success'"'"'" in monitor_sync_if and "inputs.result_replication_reconcile_once != '"'"'cancelled'"'"'" in monitor_sync_if))
 
-dry_run_if = jobs["monitor_dry_run_validation"]["if"]
-results.append(("7: monitor_dry_run_validation requires has_active_deployments == \'\''true\'\''", "needs.validate_model.outputs.has_active_deployments == '"'"'true'"'"'" in dry_run_if))
-results.append(("8: monitor_dry_run_validation retains its original effective_deploy/dependency clauses", "needs.validate_model.outputs.effective_deploy == '"'"'false'"'"'" in dry_run_if and "needs.validate_shared_secrets_once.result == '"'"'success'"'"'" in dry_run_if and "needs.replication_dry_run_validation.result != '"'"'cancelled'"'"'" in dry_run_if))
+dry_run_if = phase7_jobs["monitor_dry_run_validation"]["if"]
+results.append(("7: monitor_dry_run_validation requires has_active_deployments == \'\''true\'\''", "inputs.has_active_deployments == '"'"'true'"'"'" in dry_run_if))
+results.append(("8: monitor_dry_run_validation retains its original effective_deploy/dependency clauses", "inputs.effective_deploy == '"'"'false'"'"'" in dry_run_if and "inputs.result_validate_shared_secrets_once == '"'"'success'"'"'" in dry_run_if and "inputs.result_replication_dry_run_validation != '"'"'cancelled'"'"'" in dry_run_if))
 
 # Phase B3B rewired replication_monitor_acceptance to require validate_monitor_ready.result == "success" instead of monitor_sync_once directly (monitor reconciliation succeeding alone is not enough -- see the dedicated "Phase B3B" section below); validate_monitor_ready itself still requires monitor_sync_once.result == "success" and is skipped whenever monitor_sync_once is skipped (has_active_deployments != 'true'), so replication_monitor_acceptance still naturally skips too, transitively, with no separate has_active_deployments clause needed here.
-rma_if = jobs["replication_monitor_acceptance"]["if"]
+rma_if = phase7_jobs["replication_monitor_acceptance"]["if"]
 results.append(("9: replication_monitor_acceptance requires validate_monitor_ready.result == \'\''success\'\'' (naturally skips when validate_monitor_ready is skipped, transitively covering the no-active-runtime path)", "needs.validate_monitor_ready.result == '"'"'success'"'"'" in rma_if))
 
 # Phase B3B closeout: final_validation itself is now always() (never conditionally skipped) and delegates the actual mode-aware pass/fail decision to its own first step, whose script is inspected below -- both gated monitor jobs skipping cleanly (no active runtimes) must still let final_validation SUCCEED (allow_non_failure), while monitor_sync_once being REQUIRED-but-skipped when active runtimes DO exist must FAIL it (require_success in the has_active_deployments branch), and monitor_dry_run_validation being REQUIRED-but-skipped in dry-run mode must also FAIL it (require_success in the dry-run branch).
-fv_if = jobs["final_validation"]["if"]
+fv_if = phase7_jobs["final_validation"]["if"]
 # Phase 7 Python conversion: the mode-aware require_success()/allow_non_failure() logic itself now lives in automation/phases/phase7/phase7_final.py -- string-content checks below inspect THAT file, never the (now one-line, phase7_final.py-delegating) YAML step text.
 with open("automation/phases/phase7/phase7_final.py") as f:
     phase7_final_source_for_active_gate = f.read()
@@ -7986,7 +8016,7 @@ for label, ok in results:
     esac
   done <<< "$ACTIVE_GATE_CHECK"
 else
-  skip "ACTIVE-GATE: monitor active-runtime gating checks -- python3/PyYAML unavailable"
+  skip "ACTIVE-GATE: monitor active-runtime gating checks -- python3/PyYAML unavailable or Phase 7 workflow missing"
 fi
 
 # 17/18/19/20/21: cross-account Secrets Manager fix, structural runtime-image validation fix, EFS/Terraform architecture, Oracle/PostgreSQL descriptors + replication=false, and PostgreSQL->MSSQL Phase 6D1 are all unrelated to this narrowly-scoped monitor_dry_run_validation runner fix and remain covered by their own dedicated, still-passing sections/suites above (the "VDR correction: validate_shared_secrets_once..." section, the "VDR correction: structural rendered-image validation..." section, the "Production hardening, Item 1" section, the Phase 6D0 Oracle/PostgreSQL sections, and automation/phases/phase6/tests/test_replication_engine.py respectively) -- not re-proved here, to avoid duplicating that logic.
@@ -8737,15 +8767,16 @@ else
   fail "Live Deploy UX Fix 2: O: the push-trigger branch of ${DETECT_SCRIPT} appears to have changed"
 fi
 
-# P: environment-wide Deploy (has_changes=false) does not make final_validation require the selected-runtime mutation jobs -- REALLY EXECUTE the committed "Validate the mode-aware final DEPLOY success contract" script for exactly this scenario (has_active_deployments=false, a synthetic fixture exercising the no-active-runtime code path -- the real current DEV registry now has active runtimes, proven separately elsewhere in this suite; this scenario remains a required, independently valid code path regardless).
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+# P: environment-wide Deploy (has_changes=false) does not make final_validation require the selected-runtime mutation jobs -- REALLY EXECUTE the committed "Validate the mode-aware final DEPLOY success contract" script for exactly this scenario (has_active_deployments=false, a synthetic fixture exercising the no-active-runtime code path -- the real current DEV registry now has active runtimes, proven separately elsewhere in this suite; this scenario remains a required, independently valid code path regardless). Phase 7 grouping: this step now lives inside the grouped Phase 7 reusable workflow, never directly in MAIN.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$PHASE7_WORKFLOW" ]; then
   set +e
-  LIVE_UX_FIX_2_GATE_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+  LIVE_UX_FIX_2_GATE_OUT="$(python3 - "$PHASE7_WORKFLOW" <<'PYEOF'
 import os
 import subprocess
 import sys
 import yaml
 
+# Phase 7 grouping: final_validation now lives inside the grouped Phase 7 reusable workflow, never directly in MAIN.
 with open(sys.argv[1]) as f:
     doc = yaml.safe_load(f)
 
@@ -8794,7 +8825,7 @@ PYEOF
     fail "Live Deploy UX Fix 2: P: environment-wide Deploy final-gate execution proof failed:"$'\n'"${LIVE_UX_FIX_2_GATE_OUT}"
   fi
 else
-  skip "Live Deploy UX Fix 2: P: environment-wide Deploy final-gate execution proof -- python3/PyYAML/bash unavailable or main workflow missing"
+  skip "Live Deploy UX Fix 2: P: environment-wide Deploy final-gate execution proof -- python3/PyYAML/bash unavailable or Phase 7 workflow missing"
 fi
 
 # Q: Live Deploy Fix 1 remains intact -- validate_model's EKS verification step is still safely covered for the selected environment (the dedicated "Live Deploy Fix 1" section above already proves this in full against the Phase 1 state-file mechanism; this is a lightweight re-confirmation scoped to this task).
@@ -8823,7 +8854,7 @@ echo ""
 echo "--- Live Validate Fix 3: dry-run environment scope + zero-runtime final-gate consistency ---"
 
 # 1-5: replication_dry_run_validation and monitor_dry_run_validation carry GG_SELECTED_ENVIRONMENT via a JOB-LEVEL env: block (not merely a step-level one on "Load resolved environment config"), and every run: step in each job that references GG_SELECTED_ENVIRONMENT is safely covered by it -- proven both structurally (semantic YAML parse) and behaviorally (real bash execution of the extracted step scripts with ONLY the job-level binding supplied, exactly as GitHub Actions would provide it, confirming none of them hit the real VDR failure signature "GG_SELECTED_ENVIRONMENT: unbound variable").
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE7_WORKFLOW" ]; then
   LIVE_FIX_3_ENV_CHECK="$(python3 -c '
 import os
 import subprocess
@@ -8831,16 +8862,18 @@ import yaml
 
 with open("'"$EKS_APP_WORKFLOW"'") as f:
     doc = yaml.safe_load(f)
+# Phase 7 grouping: monitor_dry_run_validation now lives inside the grouped Phase 7 reusable workflow, never directly in MAIN -- its own external selected_environment reference translates from needs.validate_model.outputs.selected_environment to inputs.selected_environment at that boundary.
+with open("'"$PHASE7_WORKFLOW"'") as f:
+    phase7_doc = yaml.safe_load(f)
 
 results = []
-expected = "${{ needs.validate_model.outputs.selected_environment }}"
 
-def check_job(job_name):
-    job = doc["jobs"].get(job_name, {})
+def check_job(job_name, jobs_dict, expected):
+    job = jobs_dict.get(job_name, {})
     job_env = job.get("env") or {}
     results.append((f"{job_name}: job-level env: defines GG_SELECTED_ENVIRONMENT (item 1/4)", "GG_SELECTED_ENVIRONMENT" in job_env))
     actual = str(job_env.get("GG_SELECTED_ENVIRONMENT", ""))
-    results.append((f"{job_name}: GG_SELECTED_ENVIRONMENT == needs.validate_model.outputs.selected_environment, got {actual!r} (item 2)", actual == expected))
+    results.append((f"{job_name}: GG_SELECTED_ENVIRONMENT == {expected!r}, got {actual!r} (item 2)", actual == expected))
 
     steps = job.get("steps") or []
     referencing = [s for s in steps if "$GG_SELECTED_ENVIRONMENT" in (s.get("run") or "") or "${GG_SELECTED_ENVIRONMENT}" in (s.get("run") or "")]
@@ -8857,8 +8890,8 @@ def check_job(job_name):
         unbound_hit = "GG_SELECTED_ENVIRONMENT: unbound variable" in proc.stderr
         results.append((f"{job_name}: step {name!r} executes without the real VDR unbound-variable failure signature for GG_SELECTED_ENVIRONMENT", not unbound_hit))
 
-check_job("replication_dry_run_validation")
-check_job("monitor_dry_run_validation")
+check_job("replication_dry_run_validation", doc["jobs"], "${{ needs.validate_model.outputs.selected_environment }}")
+check_job("monitor_dry_run_validation", phase7_doc["jobs"], "${{ inputs.selected_environment }}")
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
@@ -8873,10 +8906,10 @@ else
   skip "Live Validate Fix 3: job-level GG_SELECTED_ENVIRONMENT binding checks -- python3/PyYAML unavailable or main workflow missing"
 fi
 
-# 6-11: the final gate's monitor dry-run applicability contract -- REALLY EXECUTE the committed "Validate the mode-aware final DEPLOY success contract" script (never a reimplementation) for every required Validate-mode scenario, plus a Deploy-mode reconfirmation that this task left the frozen contract unchanged.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+# 6-11: the final gate's monitor dry-run applicability contract -- REALLY EXECUTE the committed "Validate the mode-aware final DEPLOY success contract" script (never a reimplementation) for every required Validate-mode scenario, plus a Deploy-mode reconfirmation that this task left the frozen contract unchanged. Phase 7 grouping: this step now lives inside the grouped Phase 7 reusable workflow, never directly in MAIN.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$PHASE7_WORKFLOW" ]; then
   set +e
-  LIVE_FIX_3_GATE_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+  LIVE_FIX_3_GATE_OUT="$(python3 - "$PHASE7_WORKFLOW" <<'PYEOF'
 import os
 import subprocess
 import sys
@@ -8966,7 +8999,7 @@ PYEOF
     fail "Live Validate Fix 3: final-gate scenario execution proof produced no output (status=${LIVE_FIX_3_GATE_STATUS})"
   fi
 else
-  skip "Live Validate Fix 3: final-gate scenario execution proof -- python3/PyYAML/bash unavailable or main workflow missing"
+  skip "Live Validate Fix 3: final-gate scenario execution proof -- python3/PyYAML/bash unavailable or Phase 7 workflow missing"
 fi
 
 # 12: Live Deploy Fix 1 remains protected -- validate_model's EKS verification step is still safely covered for the selected environment, untouched by this task's job-level env changes to the two dry-run jobs.
@@ -9039,8 +9072,8 @@ echo "--- Live Deploy Fix 4: repository-wide GG_SELECTED_ENVIRONMENT scope harde
 if [ -f "$ENV_SCOPE_CHECKER" ]; then
   ENV_SCOPE_REAL_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 "$ENV_SCOPE_CHECKER" 2>&1)"
   ENV_SCOPE_REAL_STATUS=$?
-  if [ "$ENV_SCOPE_REAL_STATUS" -eq 0 ] && grep -q "^Workflows inspected: 9$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^Jobs with GG_SELECTED_ENVIRONMENT run: references: 12$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^Unsafe jobs: 0$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^OK: zero unsafe GG_SELECTED_ENVIRONMENT references" <<< "$ENV_SCOPE_REAL_OUT"; then
-    pass "Live Deploy Fix 4: 1-5,14: ${ENV_SCOPE_CHECKER} reports 9 workflows inspected, 12 jobs referencing GG_SELECTED_ENVIRONMENT (down from 17 pre-Phase-4-conversion), and ZERO unsafe jobs against the real current repository"
+  if [ "$ENV_SCOPE_REAL_STATUS" -eq 0 ] && grep -q "^Workflows inspected: 10$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^Jobs with GG_SELECTED_ENVIRONMENT run: references: 12$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^Unsafe jobs: 0$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^OK: zero unsafe GG_SELECTED_ENVIRONMENT references" <<< "$ENV_SCOPE_REAL_OUT"; then
+    pass "Live Deploy Fix 4: 1-5,14: ${ENV_SCOPE_CHECKER} reports 10 workflows inspected (Phase 7 grouping added 70-phase-monitor-final-acceptance.yaml), 12 jobs referencing GG_SELECTED_ENVIRONMENT (unchanged -- moving jobs to another file does not change the count), and ZERO unsafe jobs against the real current repository"
   else
     fail "Live Deploy Fix 4: 1-5,14: ${ENV_SCOPE_CHECKER} did not report the expected zero-violation inventory against the real repository (status=${ENV_SCOPE_REAL_STATUS}):"$'\n'"${ENV_SCOPE_REAL_OUT}"
   fi
@@ -9049,9 +9082,9 @@ else
 fi
 
 # 6-11: mutation-style regression proof -- the checker MUST fail closed the instant a job regresses to the exact live-defect pattern (missing job-level binding, or a step-only binding), and MUST pass once every job is correctly covered. Uses a real temp copy of the actual current main workflow (never a reimplementation/fixture), mutated in memory and written out, then the REAL checker script is invoked against it via subprocess -- exactly the same "real script execution" proof pattern established throughout this suite.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$ENV_SCOPE_CHECKER" ]; then
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE7_WORKFLOW" ] && [ -f "$ENV_SCOPE_CHECKER" ]; then
   set +e
-  ENV_SCOPE_MUTATION_OUT="$(python3 - "$EKS_APP_WORKFLOW" "$ENV_SCOPE_CHECKER" <<'PYEOF'
+  ENV_SCOPE_MUTATION_OUT="$(python3 - "$EKS_APP_WORKFLOW" "$PHASE7_WORKFLOW" "$ENV_SCOPE_CHECKER" <<'PYEOF'
 import copy
 import os
 import subprocess
@@ -9060,17 +9093,24 @@ import tempfile
 
 import yaml
 
-workflow_path, checker_path = sys.argv[1], sys.argv[2]
+workflow_path, phase7_workflow_path, checker_path = sys.argv[1], sys.argv[2], sys.argv[3]
 with open(workflow_path) as f:
     real_doc = yaml.safe_load(f)
+# Phase 7 grouping: replication_monitor_acceptance now lives inside the grouped Phase 7 reusable workflow, never directly in MAIN -- the checker scans the whole workflow directory dynamically, so both real documents must be written into the same scratch dir for every mutation below, exactly mirroring the real repository layout.
+with open(phase7_workflow_path) as f:
+    real_phase7_doc = yaml.safe_load(f)
 
 MAIN_NAME = "00-main-goldengate-orchestrator.yaml"
+PHASE7_NAME = "70-phase-monitor-final-acceptance.yaml"
 
 
-def run_checker(doc):
+def run_checker(doc, phase7_doc=None):
+    phase7_doc = real_phase7_doc if phase7_doc is None else phase7_doc
     with tempfile.TemporaryDirectory() as tmp_dir:
         with open(os.path.join(tmp_dir, MAIN_NAME), "w") as f:
             yaml.safe_dump(doc, f, sort_keys=False)
+        with open(os.path.join(tmp_dir, PHASE7_NAME), "w") as f:
+            yaml.safe_dump(phase7_doc, f, sort_keys=False)
         proc = subprocess.run(
             [sys.executable, checker_path, "--workflow-dir", tmp_dir],
             capture_output=True, text=True, timeout=30,
@@ -9080,7 +9120,7 @@ def run_checker(doc):
 
 results = []
 
-# 6/9a: baseline -- the real, unmutated document must pass cleanly (zero violations).
+# 6/9a: baseline -- the real, unmutated documents must pass cleanly (zero violations).
 rc, out = run_checker(real_doc)
 results.append(("6: the real unmutated workflow passes the checker cleanly (baseline)", rc == 0 and "Unsafe jobs: 0" in out))
 
@@ -9100,11 +9140,11 @@ del mutated["jobs"]["replication_reconcile_once"]["env"]["GG_SELECTED_ENVIRONMEN
 rc, out = run_checker(mutated)
 results.append(("9: removing replication_reconcile_once's job-level binding makes the checker FAIL", rc != 0 and "job=replication_reconcile_once" in out))
 
-# 10: remove replication_monitor_acceptance's job-level binding -- the checker MUST fail, and must name that exact job.
-mutated = copy.deepcopy(real_doc)
-del mutated["jobs"]["replication_monitor_acceptance"]["env"]["GG_SELECTED_ENVIRONMENT"]
-rc, out = run_checker(mutated)
-results.append(("10: removing replication_monitor_acceptance's job-level binding makes the checker FAIL", rc != 0 and "job=replication_monitor_acceptance" in out))
+# 10: remove replication_monitor_acceptance's job-level binding -- Phase 7 grouping: this job now lives inside the grouped Phase 7 reusable workflow, so the mutation is applied to THAT document instead of MAIN's -- the checker MUST fail, and must name that exact job.
+mutated_phase7 = copy.deepcopy(real_phase7_doc)
+del mutated_phase7["jobs"]["replication_monitor_acceptance"]["env"]["GG_SELECTED_ENVIRONMENT"]
+rc, out = run_checker(real_doc, phase7_doc=mutated_phase7)
+results.append(("10: removing replication_monitor_acceptance's job-level binding (inside the grouped Phase 7 workflow) makes the checker FAIL", rc != 0 and "job=replication_monitor_acceptance" in out))
 
 # 11: convert runtime_ownership_preflight back to a STEP-ONLY binding (the exact real live-defect shape: no job-level env, but the affected steps each carry their own step-level env) -- the checker MUST still fail, proving step-only coverage is never accepted regardless of how many steps individually carry it.
 mutated = copy.deepcopy(real_doc)
@@ -9135,7 +9175,7 @@ PYEOF
     fail "Live Deploy Fix 4: mutation-style regression proof produced no output"
   fi
 else
-  skip "Live Deploy Fix 4: mutation-style regression proof -- python3/PyYAML/main workflow/checker unavailable"
+  skip "Live Deploy Fix 4: mutation-style regression proof -- python3/PyYAML/main workflow/Phase 7 workflow/checker unavailable"
 fi
 
 # 12: managed_efs_inventory_guard (the real VDR failure job) no longer exists as a standalone job since the Phase 1 single-job consolidation -- its former concern is now validate_model's own "Verify AWS-side managed-EFS inventory (read-only)" step, which reads selected_environment from the Phase 1 state file rather than a job-level GG_SELECTED_ENVIRONMENT binding (validate_model is the documented sole intentional exception, re-confirmed by check 13 below).
@@ -9763,7 +9803,7 @@ fi
 
 # 5: every active workflow that needs canonical identity loads it via automation/goldengate-environment.py github-env after its own checkout -- GITHUB_ENV is job-local, so no job may assume another job's load already ran. 10-sub-iam-secrets.yaml is excluded: by design, it derives its sole canonical value (AWS_REGION) via a plain `get` call, not github-env.
 MISSING_LOADER_HITS=""
-for wf in 00-main-goldengate-orchestrator.yaml 20-sub-argocd.yaml 30-sub-platform.yaml 50-sub-monitor.yaml 80-ops-monitor-metrics-config.yaml 40-sub-observability.yaml 90-ops-observability-artifact-sync.yaml 91-ops-ecr-image-sync.yaml; do
+for wf in 00-main-goldengate-orchestrator.yaml 20-sub-argocd.yaml 30-sub-platform.yaml 50-sub-monitor.yaml 70-phase-monitor-final-acceptance.yaml 80-ops-monitor-metrics-config.yaml 40-sub-observability.yaml 90-ops-observability-artifact-sync.yaml 91-ops-ecr-image-sync.yaml; do
   if ! grep -q 'goldengate-environment.py --environment .* github-env' ".github/workflows/${wf}" 2>/dev/null; then
     MISSING_LOADER_HITS="${MISSING_LOADER_HITS}${wf}"$'\n'
   fi
@@ -10183,7 +10223,7 @@ if [ -f "$APPROVAL_TOPOLOGY_CHECKER" ]; then
   APPROVAL_TOPOLOGY_REAL_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 "$APPROVAL_TOPOLOGY_CHECKER" 2>&1)"
   APPROVAL_TOPOLOGY_REAL_STATUS=$?
   if [ "$APPROVAL_TOPOLOGY_REAL_STATUS" -eq 0 ] && echo "$APPROVAL_TOPOLOGY_REAL_OUT" | grep -qE "^Unsafe jobs: 0$"; then
-    pass "Live Deployment Approval Topology Fix: ${APPROVAL_TOPOLOGY_CHECKER} reports 9 workflows inspected and ZERO unsafe jobs against the real current repository"
+    pass "Live Deployment Approval Topology Fix: ${APPROVAL_TOPOLOGY_CHECKER} reports 10 workflows inspected (Phase 7 grouping added 70-phase-monitor-final-acceptance.yaml) and ZERO unsafe jobs against the real current repository"
   else
     fail "Live Deployment Approval Topology Fix: ${APPROVAL_TOPOLOGY_CHECKER} did not report the expected zero-violation inventory against the real repository (status=${APPROVAL_TOPOLOGY_REAL_STATUS}):"$'\n'"${APPROVAL_TOPOLOGY_REAL_OUT}"
   fi
@@ -12152,10 +12192,11 @@ if [ -f envs/dev/goldengate-monitor/values.yaml ] && ! grep -q "cloudwatch" envs
 else
   fail "Fix 3: envs/dev/goldengate-monitor/values.yaml unexpectedly carries a cloudwatch override, or the file is missing -- the three-layer model assumed by this audit no longer holds"
 fi
-if grep -qF "enable_cloudwatch_publication: true" .github/workflows/00-main-goldengate-orchestrator.yaml; then
-  pass "Fix 3: MAIN's monitor_sync_once WORKFLOW-INPUT override (enable_cloudwatch_publication: true) is the third layer that turns the base-false library default into true ACTIVE-RUNTIME deployment intent -- distinct from, and never substituting for, a DEV values.yaml override"
+# Phase 7 grouping: monitor_sync_once's enable_cloudwatch_publication with: override now lives inside the grouped Phase 7 reusable workflow, never directly in MAIN.
+if grep -qF "enable_cloudwatch_publication: true" .github/workflows/70-phase-monitor-final-acceptance.yaml; then
+  pass "Fix 3: monitor_sync_once's WORKFLOW-INPUT override (enable_cloudwatch_publication: true) is the third layer that turns the base-false library default into true ACTIVE-RUNTIME deployment intent -- distinct from, and never substituting for, a DEV values.yaml override"
 else
-  fail "Fix 3: MAIN's monitor_sync_once no longer sets enable_cloudwatch_publication: true -- the three-layer Monitor audit no longer holds"
+  fail "Fix 3: monitor_sync_once no longer sets enable_cloudwatch_publication: true -- the three-layer Monitor audit no longer holds"
 fi
 # This MAIN deployment intent is reached only once monitor_sync_once actually runs, which itself requires an active runtime. GoldenGate Runtime Desired-State Simplification (a later, independent task) legitimately activated both current runtime descriptors (deployment.enabled=true, lifecycle.state removed) -- this check now re-confirms the still-relevant invariant this Fix 3 originally cared about: flipping the MAIN-level monitor cloudwatch intent is not itself a replication-activation or EFS-hold change, so replication stays disabled and no lifecycle block reappears.
 FROZEN_LIFECYCLE_OK="true"
@@ -12199,6 +12240,21 @@ for f in 80-ops-monitor-metrics-config.yaml 90-ops-observability-artifact-sync.y
     fail "workflow naming: expected OPS workflow ${WORKFLOWS_DIR}/${f} is missing"
   fi
 done
+# Phase 7 grouping: 70-phase-monitor-final-acceptance.yaml is a distinct "PHASE" category (an internal MAIN-orchestration wrapper, never an operator-facing SUB/OPS workflow) -- exactly one such file is expected, and it must be exactly this approved filename (whitelist, never arbitrary new workflow files).
+PHASE_NAME_MATCHES="$(find "$WORKFLOWS_DIR" -maxdepth 1 -type f -name "70-phase-*.yaml" 2>/dev/null | sort)"
+PHASE_NAME_MATCH_COUNT="$(echo "$PHASE_NAME_MATCHES" | grep -c . || true)"
+if [ "$PHASE_NAME_MATCH_COUNT" -eq 1 ] && [ "$PHASE_NAME_MATCHES" = "${WORKFLOWS_DIR}/70-phase-monitor-final-acceptance.yaml" ]; then
+  pass "workflow naming: exactly one 70-phase-*.yaml workflow exists and it is 70-phase-monitor-final-acceptance.yaml"
+else
+  fail "workflow naming: expected exactly one ${WORKFLOWS_DIR}/70-phase-monitor-final-acceptance.yaml matching 70-phase-*.yaml, found:"$'\n'"${PHASE_NAME_MATCHES}"
+fi
+# Total workflow file count is now exactly 10 -- the whitelist above (00/10/20/30/40/50/70/80/90/91) is exhaustive; a stray/unexpected extra workflow file must fail this count, never be silently tolerated.
+ALL_WORKFLOW_FILE_COUNT="$(find "$WORKFLOWS_DIR" -maxdepth 1 -type f \( -name "*.yaml" -o -name "*.yml" \) 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$ALL_WORKFLOW_FILE_COUNT" -eq 10 ]; then
+  pass "workflow naming: exactly 10 workflow files exist in ${WORKFLOWS_DIR} (00/10/20/30/40/50/70/80/90/91 -- no unexpected extra file)"
+else
+  fail "workflow naming: expected exactly 10 workflow files in ${WORKFLOWS_DIR}, found ${ALL_WORKFLOW_FILE_COUNT}: $(find "$WORKFLOWS_DIR" -maxdepth 1 -type f \( -name '*.yaml' -o -name '*.yml' \) 2>/dev/null | sort | tr '\n' ' ')"
+fi
 
 # 4: zero references to any retired workflow filename remain anywhere in the repository (code, tests, docs, comments, diagnostics) -- excluding .git/ and this check's own list of retired names below, which must legitimately name them as search targets.
 OLD_WORKFLOW_NAMES="goldengate-eks-app.yaml gg-iam-secrets-deployment.yaml argocd-eks-deployment.yaml goldengate-platform.yaml goldengate-observability.yaml goldengate-monitor.yaml goldengate-monitor-metrics-config.yaml cloudwatch-observability-artifact-sync.yaml push_docker_images_to_ECR.yaml"
@@ -12229,6 +12285,7 @@ expected_name_prefixes = {
     "30-sub-platform.yaml": "30 | SUB |",
     "40-sub-observability.yaml": "40 | SUB |",
     "50-sub-monitor.yaml": "50 | SUB |",
+    "70-phase-monitor-final-acceptance.yaml": "70 | PHASE |",
     "80-ops-monitor-metrics-config.yaml": "80 | OPS |",
     "90-ops-observability-artifact-sync.yaml": "90 | OPS |",
     "91-ops-ecr-image-sync.yaml": "91 | OPS |",
@@ -12249,14 +12306,25 @@ for filename, expected_prefix in expected_name_prefixes.items():
     results.append((f"{filename}: name: starts with \"{expected_prefix}\"", actual_name.startswith(expected_prefix)))
 
 main_doc = docs.get("00-main-goldengate-orchestrator.yaml")
+phase7_doc = None
 if main_doc is not None:
     jobs = main_doc.get("jobs", {}) or {}
     uses_values = {job_id: (job.get("uses") or "") for job_id, job in jobs.items()}
     all_uses = set(uses_values.values())
-    # Phase B2 wired 40-sub-observability.yaml into MAIN (via observability_sync_once) alongside the five SUB workflows already called since the workflow-naming task -- all six reusable SUB targets are now expected.
-    for expected_sub in ("10-sub-iam-secrets.yaml", "20-sub-argocd.yaml", "30-sub-platform.yaml", "40-sub-observability.yaml", "50-sub-monitor.yaml"):
+    # Phase B2 wired 40-sub-observability.yaml into MAIN (via observability_sync_once) alongside the four SUB workflows already called since the workflow-naming task. Phase 7 grouping: 50-sub-monitor.yaml is deliberately EXCLUDED here -- MAIN no longer calls it directly, only through the grouped Phase 7 wrapper (verified via the nested check below, never merely dropped).
+    for expected_sub in ("10-sub-iam-secrets.yaml", "20-sub-argocd.yaml", "30-sub-platform.yaml", "40-sub-observability.yaml"):
         expected_uses = "./.github/workflows/" + expected_sub
         results.append((f"MAIN uses: a reusable-workflow call targeting {expected_sub}", expected_uses in all_uses))
+    expected_phase7_uses = "./.github/workflows/70-phase-monitor-final-acceptance.yaml"
+    results.append(("MAIN uses: a reusable-workflow call targeting 70-phase-monitor-final-acceptance.yaml (the grouped Phase 7 caller)", expected_phase7_uses in all_uses))
+    results.append(("MAIN no longer directly targets 50-sub-monitor.yaml (moved behind the grouped Phase 7 wrapper)", "./.github/workflows/50-sub-monitor.yaml" not in all_uses))
+
+    # Nested chain: the grouped Phase 7 wrapper itself must call 50-sub-monitor.yaml -- actively verified, never merely assumed because MAIN stopped calling it directly.
+    phase7_doc = docs.get("70-phase-monitor-final-acceptance.yaml")
+    if phase7_doc is not None:
+        phase7_jobs_for_naming = phase7_doc.get("jobs", {}) or {}
+        phase7_uses_values = {job_id: (job.get("uses") or "") for job_id, job in phase7_jobs_for_naming.items()}
+        results.append(("70-phase-monitor-final-acceptance.yaml uses: a reusable-workflow call targeting 50-sub-monitor.yaml (nested chain: MAIN -> Phase 7 wrapper -> 50-sub-monitor.yaml)", "./.github/workflows/50-sub-monitor.yaml" in set(phase7_uses_values.values())))
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
@@ -12723,15 +12791,19 @@ else
 fi
 
 # Structural proof, read directly from the real committed YAML (never a reimplementation): monitor ownership/acceptance vocabulary, monitor_ownership_preflight/validate_monitor_ready/end_to_end_deployment_acceptance DAG shape, and the never-a-HEALTHY-skip / never-hidden-by-downstream-skip invariants.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE7_WORKFLOW" ]; then
   PHASE_B3B_STRUCTURAL_CHECK="$(python3 -c '
 import os
 import yaml
 
 with open("'"$EKS_APP_WORKFLOW"'") as f:
     main_doc = yaml.safe_load(f)
+# Phase 7 grouping: monitor_ownership_preflight/monitor_sync_once/validate_monitor_ready/replication_monitor_acceptance/end_to_end_deployment_acceptance/final_validation now live inside the grouped Phase 7 reusable workflow, never directly in MAIN.
+with open("'"$PHASE7_WORKFLOW"'") as f:
+    phase7_doc = yaml.safe_load(f)
 
 jobs = main_doc["jobs"]
+phase7_jobs = phase7_doc["jobs"]
 results = []
 
 # 1/2/3: classifier files exist.
@@ -12759,14 +12831,14 @@ with open("automation/orchestration/end_to_end_acceptance.py") as f:
 results.append(("6: end_to_end_acceptance.py vocabulary is HEALTHY/BROKEN", "STATE_HEALTHY = \"HEALTHY\"" in e2e_source and "STATE_BROKEN = \"BROKEN\"" in e2e_source))
 
 # 7/8: monitor_ownership_preflight exists and is real-deploy + active-runtime-only.
-results.append(("7: MAIN defines monitor_ownership_preflight", "monitor_ownership_preflight" in jobs))
-preflight = jobs.get("monitor_ownership_preflight", {})
+results.append(("7: the grouped Phase 7 workflow defines monitor_ownership_preflight", "monitor_ownership_preflight" in phase7_jobs))
+preflight = phase7_jobs.get("monitor_ownership_preflight", {})
 preflight_if = str(preflight.get("if", ""))
 results.append(("8a: monitor_ownership_preflight is real-deploy-only (effective_deploy == \x27true\x27)", "effective_deploy == \x27true\x27" in preflight_if))
 results.append(("8b: monitor_ownership_preflight is active-runtime-only (has_active_deployments == \x27true\x27)", "has_active_deployments == \x27true\x27" in preflight_if))
 
 # 9: BROKEN blocks monitor mutation -- monitor_sync_once requires monitor_ownership_preflight.result == success.
-sync_once = jobs.get("monitor_sync_once", {})
+sync_once = phase7_jobs.get("monitor_sync_once", {})
 sync_once_needs = sync_once.get("needs") or []
 sync_once_if = str(sync_once.get("if", ""))
 results.append(("9a: monitor_sync_once needs monitor_ownership_preflight", "monitor_ownership_preflight" in sync_once_needs))
@@ -12777,8 +12849,8 @@ results.append(("10: monitor_sync_once if: explicitly allows state == \x27ABSENT
 results.append(("11: monitor_sync_once if: explicitly allows state == \x27OWNED\x27 (never an OWNED-only-skip shortcut -- both ABSENT and OWNED reconcile identically)", "monitor_ownership_preflight.outputs.state == \x27OWNED\x27" in sync_once_if))
 
 # 14/15: validate_monitor_ready exists and depends on monitor_sync_once.
-results.append(("14: MAIN defines validate_monitor_ready", "validate_monitor_ready" in jobs))
-validate_ready = jobs.get("validate_monitor_ready", {})
+results.append(("14: the grouped Phase 7 workflow defines validate_monitor_ready", "validate_monitor_ready" in phase7_jobs))
+validate_ready = phase7_jobs.get("validate_monitor_ready", {})
 validate_ready_needs = validate_ready.get("needs") or []
 validate_ready_if = str(validate_ready.get("if", ""))
 results.append(("15: validate_monitor_ready needs monitor_sync_once and requires its success", "monitor_sync_once" in validate_ready_needs and "monitor_sync_once.result == \x27success\x27" in validate_ready_if))
@@ -12795,7 +12867,7 @@ results.append(("17b: validate_monitor_ready checks /readyz on the verified Read
 results.append(("17c: validate_monitor_ready folds --healthz-status/--readyz-status back into a final monitor_acceptance.py pass", "--healthz-status" in phase7_monitor_source_ready and "--readyz-status" in phase7_monitor_source_ready))
 
 # 18: replication_monitor_acceptance requires validate_monitor_ready, not merely monitor_sync_once.
-repl_mon = jobs.get("replication_monitor_acceptance", {})
+repl_mon = phase7_jobs.get("replication_monitor_acceptance", {})
 repl_mon_needs = repl_mon.get("needs") or []
 repl_mon_if = str(repl_mon.get("if", ""))
 results.append(("18a: replication_monitor_acceptance needs validate_monitor_ready", "validate_monitor_ready" in repl_mon_needs))
@@ -12803,8 +12875,8 @@ results.append(("18b: replication_monitor_acceptance requires validate_monitor_r
 results.append(("18c: replication_monitor_acceptance was rewired away from monitor_sync_once (no longer a direct dependency)", "monitor_sync_once" not in repl_mon_needs))
 
 # 19/20/21/22: end_to_end_deployment_acceptance exists, uses the GLOBAL active inventory, validates monitor /api/processes, and is real-deploy + active-runtime only. Phase 7 Python conversion: the bounded poll loop now lives in automation/phases/phase7/phase7_monitor.py cmd_end_to_end_acceptance() (invoked as a single python3 automation/phases/phase7/phase7_monitor.py end-to-end-acceptance call) -- string-content checks below inspect THAT file, never the (now one-line) YAML step text.
-results.append(("19: MAIN defines end_to_end_deployment_acceptance", "end_to_end_deployment_acceptance" in jobs))
-e2e_job = jobs.get("end_to_end_deployment_acceptance", {})
+results.append(("19: the grouped Phase 7 workflow defines end_to_end_deployment_acceptance", "end_to_end_deployment_acceptance" in phase7_jobs))
+e2e_job = phase7_jobs.get("end_to_end_deployment_acceptance", {})
 e2e_job_if = str(e2e_job.get("if", ""))
 e2e_job_steps = e2e_job.get("steps") or []
 e2e_job_run_text = "\n".join(s.get("run", "") for s in e2e_job_steps)
@@ -12815,9 +12887,11 @@ results.append(("21: end_to_end_deployment_acceptance fetches /api/processes thr
 results.append(("22a: end_to_end_deployment_acceptance is real-deploy-only (effective_deploy == \x27true\x27)", "effective_deploy == \x27true\x27" in e2e_job_if))
 results.append(("22b: end_to_end_deployment_acceptance is active-runtime-only (has_active_deployments == \x27true\x27)", "has_active_deployments == \x27true\x27" in e2e_job_if))
 
-# 23/24: active-runtime success requires end_to_end_deployment_acceptance, and final_validation lists every REQUIRED B3B job directly -- never relying only on transitive failure/skip propagation through it. Phase B3B closeout: the mode-aware pass/fail decision now lives in the first step of final_validation (never a hidden accidental-truth if: expression) -- a SKIPPED value for any of these REQUIRED jobs must fail the gate, not merely "not be a failure".
-final_val = jobs.get("final_validation", {})
+# 23/24: active-runtime success requires end_to_end_deployment_acceptance, and final_validation lists every REQUIRED B3B job directly -- never relying only on transitive failure/skip propagation through it. Phase B3B closeout: the mode-aware pass/fail decision now lives in the first step of final_validation (never a hidden accidental-truth if: expression) -- a SKIPPED value for any of these REQUIRED jobs must fail the gate, not merely "not be a failure". Phase 7 grouping: final_validation own INTERNAL needs (inside the grouped Phase 7 workflow) now only ever list the six INTERNAL Phase 7 jobs -- the three EXTERNAL Phase 1-6 jobs below (validate_argocd_ready/validate_platform_ready/validate_observability_ready) are needed instead by the SINGLE MAIN caller (phase_7_monitor_final_acceptance), which crosses the reusable-workflow boundary as a workflow_call input to final_validation, never a needs: edge inside that workflow.
+final_val = phase7_jobs.get("final_validation", {})
 final_val_needs = final_val.get("needs") or []
+caller_job_b3b = jobs.get("phase_7_monitor_final_acceptance", {})
+caller_needs_b3b = caller_job_b3b.get("needs") or []
 final_val_if = str(final_val.get("if", ""))
 final_val_gate_step = next((s for s in final_val.get("steps", []) if s.get("name") == "Validate the mode-aware final DEPLOY success contract"), None)
 final_val_gate_run = (final_val_gate_step or {}).get("run", "")
@@ -12826,8 +12900,11 @@ with open("automation/phases/phase7/phase7_final.py") as f:
     phase7_final_source = f.read()
 results.append(("24z: final_validation itself is always() (runs unconditionally so it can fail closed with diagnostics rather than silently disappearing)", final_val_if.strip() == "always()"))
 results.append(("24y: final_validation'"'"'s gate step now delegates to phase7_final.py validate (Phase 7 Python conversion), never a reimplemented copy of the mode-aware logic inline", "phase7_final.py validate" in final_val_gate_run))
-for extra_job in ("validate_argocd_ready", "validate_platform_ready", "validate_observability_ready", "monitor_ownership_preflight", "validate_monitor_ready", "end_to_end_deployment_acceptance"):
-    results.append((f"23: final_validation needs {extra_job} directly (closes the transitive-skip gap)", extra_job in final_val_needs))
+for extra_job in ("validate_argocd_ready", "validate_platform_ready", "validate_observability_ready"):
+    results.append((f"23: MAIN phase_7_monitor_final_acceptance caller needs {extra_job} directly (external Phase 1-6 job, closes the transitive-skip gap at the reusable-workflow boundary)", extra_job in caller_needs_b3b))
+    results.append((f"24: the final_validation mode-aware gate step requires EXACT success for {extra_job} in its applicable REQUIRED branch (a SKIPPED value fails the gate, never merely treated as not-a-failure)", f"require_success(\x22{extra_job}\x22)" in phase7_final_source))
+for extra_job in ("monitor_ownership_preflight", "validate_monitor_ready", "end_to_end_deployment_acceptance"):
+    results.append((f"23: final_validation needs {extra_job} directly (internal Phase 7 reference, closes the transitive-skip gap)", extra_job in final_val_needs))
     results.append((f"24: the final_validation mode-aware gate step requires EXACT success for {extra_job} in its applicable REQUIRED branch (a SKIPPED value fails the gate, never merely treated as not-a-failure)", f"require_success(\x22{extra_job}\x22)" in phase7_final_source))
 
 # 25: no-active-runtime path remains valid, and dry-run never runs the live B3B jobs -- all four are gated on both has_active_deployments == \x27true\x27 and effective_deploy == \x27true\x27.
@@ -12839,7 +12916,10 @@ for gated_job_name, gated_job_if in (("monitor_ownership_preflight", preflight_i
 results.append(("26a: monitor_sync_once still uses a synchronous `uses: ./.github/workflows/50-sub-monitor.yaml` reusable-workflow call (never an async dispatch-and-poll)", sync_once.get("uses") == "./.github/workflows/50-sub-monitor.yaml"))
 with open("'"$EKS_APP_WORKFLOW"'") as f:
     main_source_for_dispatch_check = f.read()
+with open("'"$PHASE7_WORKFLOW"'") as f:
+    phase7_source_for_dispatch_check = f.read()
 results.append(("26b: no gh workflow run / workflow-dispatch async trigger construct was introduced anywhere in MAIN", "gh workflow run" not in main_source_for_dispatch_check and "/dispatches" not in main_source_for_dispatch_check))
+results.append(("26c: no gh workflow run / workflow-dispatch async trigger construct was introduced anywhere in the grouped Phase 7 workflow", "gh workflow run" not in phase7_source_for_dispatch_check and "/dispatches" not in phase7_source_for_dispatch_check))
 
 # 27: no monitor healing/failover/control operation introduced -- the monitor architecture remains passive; no pod-deletion/rollout-restart/failover/auto-heal verb appears in any of the new B3B job step content.
 combined_new_job_text = "\n".join([
@@ -12860,6 +12940,7 @@ on_block = main_doc.get(True, main_doc.get("on", {}))
 main_inputs = (on_block.get("workflow_dispatch") or {}).get("inputs", {}) or {}
 results.append(("29a: MAIN workflow_dispatch defines no \x27destroy\x27 input", not any("destroy" in str(k).lower() for k in main_inputs)))
 results.append(("29b: MAIN defines no job whose name contains \x27destroy\x27", not any("destroy" in str(j).lower() for j in jobs)))
+results.append(("29c: the grouped Phase 7 workflow defines no job whose name contains \x27destroy\x27", not any("destroy" in str(j).lower() for j in phase7_jobs)))
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
@@ -12871,7 +12952,7 @@ for label, ok in results:
     esac
   done <<< "$PHASE_B3B_STRUCTURAL_CHECK"
 else
-  skip "Phase B3B: structural DAG/workflow checks -- python3/PyYAML unavailable or main workflow missing"
+  skip "Phase B3B: structural DAG/workflow checks -- python3/PyYAML unavailable or main/Phase 7 workflow missing"
 fi
 
 # First-bootstrap workflow regression: proves the exact staged step ORDER in 50-sub-monitor.yaml's build_publish_and_deploy job (publication-disabled -> Ready monitor -> CONFIG gate -> publication-enabled), that the old "you must manually deploy with publication disabled first" hard failure is gone, and that a CONFIG gate failure prevents publication from ever reaching true. Also covers WORKFLOW VALIDATION scenarios 2 (fast path, existing Ready pod) and 3 (safe repair path, no existing Ready pod) via each staged step's own if: gating on EXISTING_READY_MONITOR_POD_NAME.
@@ -12943,14 +13024,15 @@ else
   skip "Phase B3B: first-bootstrap workflow regression -- python3/PyYAML unavailable or 50-sub-monitor.yaml missing"
 fi
 
-# DAG simulation: scenarios 1, 4, 6, 7, 8, 9, 10 from the required WORKFLOW VALIDATION list, exercised against the real MAIN if: expressions (scenarios 2/3/5 are exercised structurally above, since 50-sub-monitor.yaml's own internal staged bootstrap/gate logic is not visible as separate MAIN-level job nodes).
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+# DAG simulation: scenarios 1, 4, 6, 7, 8, 9, 10 from the required WORKFLOW VALIDATION list, exercised against the real if: expressions inside the grouped Phase 7 reusable workflow (scenarios 2/3/5 are exercised structurally above, since 50-sub-monitor.yaml's own internal staged bootstrap/gate logic is not visible as separate job nodes).
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$PHASE7_WORKFLOW" ]; then
   set +e
-  PHASE_B3B_SIM_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+  PHASE_B3B_SIM_OUT="$(python3 - "$PHASE7_WORKFLOW" <<'PYEOF'
 import re
 import sys
 import yaml
 
+# Phase 7 grouping: monitor_ownership_preflight/monitor_sync_once/validate_monitor_ready/replication_monitor_acceptance/end_to_end_deployment_acceptance now live inside the grouped Phase 7 reusable workflow -- their EXTERNAL Phase 1-6 references (previously needs.validate_model.outputs.*/needs.<job>.result) are now inputs.* instead; the tiny bespoke expression parser below is extended to resolve inputs.<name> from a separate fixed context, exactly mirroring the real workflow_call boundary. INTERNAL Phase-7-to-Phase-7 references (needs.monitor_ownership_preflight.outputs.state, needs.monitor_sync_once.result, etc.) are unchanged and still resolved from the dynamically-simulated needs context below.
 with open(sys.argv[1]) as f:
     doc = yaml.safe_load(f)
 
@@ -12968,9 +13050,10 @@ def _extract_if(job_name):
 class _Parser:
     """A tiny, bespoke evaluator for exactly the GHA expression subset this workflow uses: && || == != () quoted strings, needs.<job>.result, needs.<job>.outputs.<name>, always(). Not a general GHA expression engine -- just enough to genuinely simulate these job conditions against a fabricated needs context, rather than trusting a text/regex match against the workflow author's own wording."""
 
-    def __init__(self, expr, needs):
+    def __init__(self, expr, needs, inputs=None):
         self.expr = expr
         self.needs = needs
+        self.inputs = inputs or {}
         self.pos = 0
 
     def _skip_ws(self):
@@ -13043,11 +13126,15 @@ class _Parser:
         if m:
             self.pos += m.end()
             return self.needs.get(m.group(1), {}).get("outputs", {}).get(m.group(2), "")
+        m = re.match(r"inputs\.([A-Za-z0-9_]+)", self.expr[self.pos:])
+        if m:
+            self.pos += m.end()
+            return self.inputs.get(m.group(1), "")
         raise ValueError(f"cannot parse value at: {self.expr[self.pos:self.pos + 40]!r}")
 
 
-def eval_gha_bool(expr, needs):
-    return bool(_Parser(expr, needs).parse())
+def eval_gha_bool(expr, needs, inputs=None):
+    return bool(_Parser(expr, needs, inputs).parse())
 
 
 # final_validation is deliberately NOT modeled here (Phase B3B closeout): its own if: is now a bare always() and its actual pass/fail decision is real bash program logic inside its first step, not a pure if:-expression this tiny parser could ever evaluate correctly -- that behavior is instead proven by REALLY EXECUTING the committed script in the dedicated "Phase B3B closeout: mode-aware final DEPLOY success contract" section further below.
@@ -13055,11 +13142,11 @@ JOB_ORDER = ["monitor_ownership_preflight", "monitor_sync_once", "validate_monit
 IF_EXPRS = {job: _extract_if(job) for job in JOB_ORDER}
 
 
-def simulate(initial, outcome_when_run, outputs_when_run=None):
-    results = dict(initial)
+def simulate(inputs_ctx, outcome_when_run, outputs_when_run=None):
+    results = {}
     outputs_when_run = outputs_when_run or {}
     for job in JOB_ORDER:
-        would_run = eval_gha_bool(IF_EXPRS[job], results)
+        would_run = eval_gha_bool(IF_EXPRS[job], results, inputs_ctx)
         if would_run:
             results[job] = {"result": outcome_when_run.get(job, "success"), "outputs": outputs_when_run.get(job, {})}
         else:
@@ -13067,21 +13154,19 @@ def simulate(initial, outcome_when_run, outputs_when_run=None):
     return results
 
 
-def base_context(effective_deploy, has_active):
-    # Every OTHER job final_validation's real if: (and monitor_ownership_preflight/monitor_sync_once/validate_monitor_ready/end_to_end_deployment_acceptance's own if: expressions) reference is fixed here as a successful background context -- this simulator's scope is only the B3B-specific dynamic jobs listed in JOB_ORDER above, exactly like the Phase B3A simulator's own use of a fixed base_context() for its own unrelated upstream jobs.
+def base_inputs(effective_deploy, has_active):
+    # Phase 7 grouping: every EXTERNAL Phase 1-6 job/output reference the JOB_ORDER jobs' if: expressions now cross via workflow_call inputs (never needs.validate_model.outputs.*/needs.<job>.result) -- fixed here as a successful background context, exactly like the prior base_context() fixed a successful needs-context before this grouping. INTERNAL Phase-7-to-Phase-7 references (needs.monitor_ownership_preflight.outputs.state, needs.monitor_sync_once.result, etc.) are unaffected and still resolved from the dynamically-simulated needs context inside simulate() above.
     return {
-        "validate_model": {"result": "success", "outputs": {"effective_deploy": effective_deploy, "has_active_deployments": has_active}},
-        "validate_shared_secrets_once": {"result": "success", "outputs": {}},
-        "build_publish_and_deploy": {"result": "success", "outputs": {}},
-        "delete_removed_argocd_applications": {"result": "success", "outputs": {}},
-        "replication_reconcile_once": {"result": "success", "outputs": {}},
-        "validate_active_runtimes": {"result": "success", "outputs": {}},
-        "validate_argocd_ready": {"result": "success", "outputs": {}},
-        "validate_platform_ready": {"result": "success", "outputs": {}},
-        "validate_observability_ready": {"result": "success", "outputs": {}},
-        "runtime_ownership_preflight": {"result": "success", "outputs": {}},
-        "replication_dry_run_validation": {"result": "success", "outputs": {}},
-        "monitor_dry_run_validation": {"result": "success", "outputs": {}},
+        "effective_deploy": effective_deploy,
+        "has_active_deployments": has_active,
+        "result_validate_shared_secrets_once": "success",
+        "result_build_publish_and_deploy": "success",
+        "result_delete_removed_argocd_applications": "success",
+        "result_replication_reconcile_once": "success",
+        "result_validate_argocd_ready": "success",
+        "result_validate_platform_ready": "success",
+        "result_validate_observability_ready": "success",
+        "result_validate_active_runtimes": "success",
     }
 
 
@@ -13094,8 +13179,8 @@ def check(label, condition):
 
 
 # Scenario 1: MONITOR ABSENT -> full bootstrap chain runs end to end.
-ctx = base_context("true", "true")
-r = simulate(ctx, {}, {"monitor_ownership_preflight": {"state": "ABSENT"}})
+inputs_ctx = base_inputs("true", "true")
+r = simulate(inputs_ctx, {}, {"monitor_ownership_preflight": {"state": "ABSENT"}})
 check("Scenario 1 (MONITOR ABSENT): monitor_ownership_preflight succeeds with state ABSENT", r["monitor_ownership_preflight"]["result"] == "success")
 check("Scenario 1 (MONITOR ABSENT): monitor_sync_once runs (full bootstrap chain, no manual prerequisite)", r["monitor_sync_once"]["result"] == "success")
 check("Scenario 1 (MONITOR ABSENT): validate_monitor_ready runs", r["validate_monitor_ready"]["result"] == "success")
@@ -13104,34 +13189,34 @@ check("Scenario 1 (MONITOR ABSENT): end_to_end_deployment_acceptance runs", r["e
 # final_validation succeeding for this exact chain is proven by real script execution in the "Phase B3B closeout" section further below.
 
 # Scenario 4: MONITOR BROKEN blocks the SUB workflow invocation entirely.
-ctx = base_context("true", "true")
-r = simulate(ctx, {"monitor_ownership_preflight": "failure"})
+inputs_ctx = base_inputs("true", "true")
+r = simulate(inputs_ctx, {"monitor_ownership_preflight": "failure"})
 check("Scenario 4 (MONITOR BROKEN): monitor_ownership_preflight fails", r["monitor_ownership_preflight"]["result"] == "failure")
 check("Scenario 4 (MONITOR BROKEN): monitor_sync_once (the SUB workflow invocation) is blocked (skipped)", r["monitor_sync_once"]["result"] == "skipped")
 # final_validation being blocked for this exact scenario is proven by real script execution in the "Phase B3B closeout" section further below (scenario C: monitor_sync_once skipped).
 
 # Scenario 6: monitor reconciliation failure blocks acceptance.
-ctx = base_context("true", "true")
-r = simulate(ctx, {"monitor_sync_once": "failure"}, {"monitor_ownership_preflight": {"state": "OWNED"}})
+inputs_ctx = base_inputs("true", "true")
+r = simulate(inputs_ctx, {"monitor_sync_once": "failure"}, {"monitor_ownership_preflight": {"state": "OWNED"}})
 check("Scenario 6 (monitor_sync_once failure): validate_monitor_ready is blocked (skipped)", r["validate_monitor_ready"]["result"] == "skipped")
 # final_validation being blocked when a REQUIRED active-runtime job is skipped is proven by real script execution in the "Phase B3B closeout" section further below (scenario B: validate_monitor_ready skipped).
 
 # Scenario 7: monitor acceptance failure blocks replication/E2E.
-ctx = base_context("true", "true")
-r = simulate(ctx, {"validate_monitor_ready": "failure"}, {"monitor_ownership_preflight": {"state": "OWNED"}})
+inputs_ctx = base_inputs("true", "true")
+r = simulate(inputs_ctx, {"validate_monitor_ready": "failure"}, {"monitor_ownership_preflight": {"state": "OWNED"}})
 check("Scenario 7 (validate_monitor_ready failure): replication_monitor_acceptance is blocked (skipped)", r["replication_monitor_acceptance"]["result"] == "skipped")
 check("Scenario 7 (validate_monitor_ready failure): end_to_end_deployment_acceptance is blocked (skipped)", r["end_to_end_deployment_acceptance"]["result"] == "skipped")
 # final_validation being blocked for this exact scenario is proven by real script execution in the "Phase B3B closeout" section further below (scenario A: end_to_end_deployment_acceptance skipped).
 
 # Scenario 8: an ACTIVE runtime not UP/fresh fails the final E2E gate -> final_validation blocked.
-ctx = base_context("true", "true")
-r = simulate(ctx, {"end_to_end_deployment_acceptance": "failure"}, {"monitor_ownership_preflight": {"state": "OWNED"}})
+inputs_ctx = base_inputs("true", "true")
+r = simulate(inputs_ctx, {"end_to_end_deployment_acceptance": "failure"}, {"monitor_ownership_preflight": {"state": "OWNED"}})
 check("Scenario 8 (an ACTIVE runtime not UP/fresh): end_to_end_deployment_acceptance fails", r["end_to_end_deployment_acceptance"]["result"] == "failure")
 # final_validation being blocked when end_to_end_deployment_acceptance genuinely FAILS (never merely skipped) is covered by the always()-plus-explicit-result-checks contract exercised in the "Phase B3B closeout" section further below.
 
 # Scenario 9: NO active runtimes cleanly skips the entire monitor live path, and final_validation still succeeds.
-ctx = base_context("true", "false")
-r = simulate(ctx, {})
+inputs_ctx = base_inputs("true", "false")
+r = simulate(inputs_ctx, {})
 check("Scenario 9 (no active runtimes): monitor_ownership_preflight is cleanly skipped", r["monitor_ownership_preflight"]["result"] == "skipped")
 check("Scenario 9 (no active runtimes): monitor_sync_once is cleanly skipped", r["monitor_sync_once"]["result"] == "skipped")
 check("Scenario 9 (no active runtimes): validate_monitor_ready is cleanly skipped", r["validate_monitor_ready"]["result"] == "skipped")
@@ -13139,8 +13224,8 @@ check("Scenario 9 (no active runtimes): end_to_end_deployment_acceptance is clea
 # final_validation still succeeding when there are no active runtimes (all B3B runtime/monitor jobs legitimately skipped) is proven by real script execution in the "Phase B3B closeout" section further below (scenario D).
 
 # Scenario 10: DRY RUN has no B3B live mutations or live API acceptance.
-ctx = base_context("false", "true")
-r = simulate(ctx, {})
+inputs_ctx = base_inputs("false", "true")
+r = simulate(inputs_ctx, {})
 check("Scenario 10 (DRY RUN): monitor_ownership_preflight never runs live", r["monitor_ownership_preflight"]["result"] == "skipped")
 check("Scenario 10 (DRY RUN): monitor_sync_once never runs live", r["monitor_sync_once"]["result"] == "skipped")
 check("Scenario 10 (DRY RUN): validate_monitor_ready never runs (no live health/API acceptance)", r["validate_monitor_ready"]["result"] == "skipped")
@@ -13172,10 +13257,10 @@ fi
 echo ""
 echo "--- GoldenGate Monitor MAIN DAG Skip-Propagation Correctness Fix: structural always() + implicit-skip-propagation regression ---"
 
-# 1: structural proof that every REQUIRED real-deploy monitor-chain job which must survive a legitimate ancestor skip carries a status-check function in its job-level if:. This is deliberately a DIRECT text/structural assertion (not merely re-exercised through the JOB_ORDER simulator above, which -- like GitHub Actions itself absent always() -- would previously have reported these three jobs as "eligible" purely by evaluating their own explicit clauses, never modeling the implicit default propagation that actually suppressed them live).
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+# 1: structural proof that every REQUIRED real-deploy monitor-chain job which must survive a legitimate ancestor skip carries a status-check function in its job-level if:. This is deliberately a DIRECT text/structural assertion (not merely re-exercised through the JOB_ORDER simulator above, which -- like GitHub Actions itself absent always() -- would previously have reported these three jobs as "eligible" purely by evaluating their own explicit clauses, never modeling the implicit default propagation that actually suppressed them live). Phase 7 grouping: these jobs now live inside the grouped Phase 7 reusable workflow, never directly in MAIN.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$PHASE7_WORKFLOW" ]; then
   set +e
-  STATUS_FN_STRUCTURAL_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+  STATUS_FN_STRUCTURAL_OUT="$(python3 - "$PHASE7_WORKFLOW" <<'PYEOF'
 import re
 import sys
 import yaml
@@ -13203,19 +13288,21 @@ for name in ("monitor_sync_once", "replication_monitor_acceptance"):
 
 results.append(("final_validation's job-level if: is exactly always() (unchanged, still the sole authority for the mode-aware required-success contract)", jobs["final_validation"].get("if") == "always()" or str(jobs["final_validation"].get("if")).strip() == "always()"))
 
-# The fix must be ADDITIVE only -- every explicit clause that existed before must still be present verbatim, never replaced by a weaker check such as != 'failure' for one of these three specific jobs.
+# The fix must be ADDITIVE only -- every explicit clause that existed before must still be present verbatim, never replaced by a weaker check such as != 'failure' for one of these three specific jobs. Phase 7 grouping: validate_shared_secrets_once/replication_reconcile_once are EXTERNAL and now cross the reusable-workflow boundary as inputs.result_*, never needs.*.
 mop_if = if_text("monitor_ownership_preflight")
-results.append(("monitor_ownership_preflight still requires validate_shared_secrets_once.result == 'success' (exact, not merely != 'failure')", "needs.validate_shared_secrets_once.result == 'success'" in mop_if))
-results.append(("monitor_ownership_preflight still requires replication_reconcile_once.result == 'success' (exact, not merely != 'failure')", "needs.replication_reconcile_once.result == 'success'" in mop_if))
+results.append(("monitor_ownership_preflight still requires inputs.result_validate_shared_secrets_once == 'success' (exact, not merely != 'failure')", "inputs.result_validate_shared_secrets_once == 'success'" in mop_if))
+results.append(("monitor_ownership_preflight still requires inputs.result_replication_reconcile_once == 'success' (exact, not merely != 'failure')", "inputs.result_replication_reconcile_once == 'success'" in mop_if))
 results.append(("monitor_ownership_preflight still requires effective_deploy == 'true' and has_active_deployments == 'true'", "effective_deploy == 'true'" in mop_if and "has_active_deployments == 'true'" in mop_if))
 
 vmr_if = if_text("validate_monitor_ready")
-results.append(("validate_monitor_ready still requires validate_shared_secrets_once.result == 'success' (exact, not merely != 'failure')", "needs.validate_shared_secrets_once.result == 'success'" in vmr_if))
-results.append(("validate_monitor_ready still requires monitor_sync_once.result == 'success' (exact, not merely != 'failure')", "needs.monitor_sync_once.result == 'success'" in vmr_if))
+results.append(("validate_monitor_ready still requires inputs.result_validate_shared_secrets_once == 'success' (exact, not merely != 'failure')", "inputs.result_validate_shared_secrets_once == 'success'" in vmr_if))
+results.append(("validate_monitor_ready still requires monitor_sync_once.result == 'success' (internal Phase 7 reference, exact, not merely != 'failure')", "needs.monitor_sync_once.result == 'success'" in vmr_if))
 
 e2e_if = if_text("end_to_end_deployment_acceptance")
-for dep in ("validate_argocd_ready", "validate_platform_ready", "validate_observability_ready", "validate_active_runtimes", "replication_reconcile_once", "validate_monitor_ready", "replication_monitor_acceptance"):
-    results.append((f"end_to_end_deployment_acceptance still requires {dep}.result == 'success' (exact, not merely != 'failure'/!= 'cancelled')", f"needs.{dep}.result == 'success'" in e2e_if))
+for dep in ("validate_argocd_ready", "validate_platform_ready", "validate_observability_ready", "validate_active_runtimes", "replication_reconcile_once"):
+    results.append((f"end_to_end_deployment_acceptance still requires inputs.result_{dep} == 'success' (external, exact, not merely != 'failure'/!= 'cancelled')", f"inputs.result_{dep} == 'success'" in e2e_if))
+for dep in ("validate_monitor_ready", "replication_monitor_acceptance"):
+    results.append((f"end_to_end_deployment_acceptance still requires {dep}.result == 'success' (internal Phase 7 reference, exact, not merely != 'failure'/!= 'cancelled')", f"needs.{dep}.result == 'success'" in e2e_if))
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
@@ -13234,20 +13321,25 @@ PYEOF
     fail "Skip-propagation fix: structural always()/explicit-clause proof failed:"$'\n'"${STATUS_FN_STRUCTURAL_OUT}"
   fi
 else
-  skip "Skip-propagation fix: structural always()/explicit-clause proof -- python3/PyYAML unavailable or main workflow missing"
+  skip "Skip-propagation fix: structural always()/explicit-clause proof -- python3/PyYAML unavailable or Phase 7 workflow missing"
 fi
 
 # 2/3: a small, targeted model of GitHub Actions' REAL default job-continuation semantics -- deliberately NOT a general GitHub Actions engine (no runner emulation, no step execution, no matrix expansion): it implements exactly the one rule this whole fix is about. A job whose own if: contains a status-check function is evaluated purely by that expression (exactly like the JOB_ORDER simulator above). A job whose own if: contains NO status-check function additionally requires its ENTIRE transitive needs-closure (not merely its direct needs) to have concluded with exactly 'success' -- an intermediate ancestor's own always()-driven success does not, by itself, satisfy this for a job further downstream that itself lacks a status function. This is exactly the mechanism the live run exposed: delete_removed_argocd_applications is legitimately skipped (has_deletions=false); replication_reconcile_once survives it via its own always(); but monitor_ownership_preflight (before this fix) still defaulted to skipped because delete_removed_argocd_applications remained "skipped" somewhere in its full transitive closure, regardless of replication_reconcile_once's own reported success.
 if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
   set +e
-  SKIP_PROPAGATION_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+SKIP_PROPAGATION_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
 import re
 import sys
 import yaml
 
 with open(sys.argv[1]) as f:
     doc = yaml.safe_load(f)
+# Phase 7 grouping: monitor_ownership_preflight/monitor_sync_once/validate_monitor_ready/replication_monitor_acceptance/end_to_end_deployment_acceptance now live inside the grouped Phase 7 reusable workflow -- both documents are loaded and merged into one job lookup so this transitive-closure simulation spans the reusable-workflow boundary explicitly.
+with open(".github/workflows/70-phase-monitor-final-acceptance.yaml") as f:
+    phase7_doc = yaml.safe_load(f)
 jobs = doc["jobs"]
+phase7_jobs = phase7_doc["jobs"]
+PHASE7_JOB_NAMES = set(phase7_jobs.keys())
 
 STATUS_FN_RE = re.compile(r"\b(always|success|failure|cancelled)\(\)")
 
@@ -13256,8 +13348,12 @@ def has_status_fn(expr):
     return bool(STATUS_FN_RE.search(expr))
 
 
+def _job_source(name):
+    return phase7_jobs if name in PHASE7_JOB_NAMES else jobs
+
+
 def job_needs(name):
-    n = jobs[name].get("needs")
+    n = _job_source(name)[name].get("needs")
     if n is None:
         return []
     if isinstance(n, str):
@@ -13266,18 +13362,19 @@ def job_needs(name):
 
 
 def extract_if(name):
-    raw = str(jobs[name].get("if", "true")).strip()
+    raw = str(_job_source(name)[name].get("if", "true")).strip()
     if raw.startswith("${{") and raw.endswith("}}"):
         raw = raw[3:-2].strip()
     return raw
 
 
 class _Parser:
-    """The SAME tiny bespoke && || == != () always() needs.<job>.result/outputs.* evaluator already used by the Phase B3B JOB_ORDER simulator above -- copied here (never imported/shared, matching this suite's own established per-section convention) rather than a general GHA expression engine."""
+    """The SAME tiny bespoke && || == != () always() needs.<job>.result/outputs.*/inputs.<name> evaluator already used by the Phase B3B JOB_ORDER simulator above -- copied here (never imported/shared, matching this suite's own established per-section convention) rather than a general GHA expression engine."""
 
-    def __init__(self, expr, needs):
+    def __init__(self, expr, needs, inputs=None):
         self.expr = expr
         self.needs = needs
+        self.inputs = inputs or {}
         self.pos = 0
 
     def _skip_ws(self):
@@ -13350,11 +13447,15 @@ class _Parser:
         if m:
             self.pos += m.end()
             return self.needs.get(m.group(1), {}).get("outputs", {}).get(m.group(2), "")
+        m = re.match(r"inputs\.([A-Za-z0-9_]+)", self.expr[self.pos:])
+        if m:
+            self.pos += m.end()
+            return self.inputs.get(m.group(1), "")
         raise ValueError(f"cannot parse value at: {self.expr[self.pos:self.pos + 40]!r}")
 
 
-def eval_gha_bool(expr, needs):
-    return bool(_Parser(expr, needs).parse())
+def eval_gha_bool(expr, needs, inputs=None):
+    return bool(_Parser(expr, needs, inputs).parse())
 
 
 def transitive_ancestors_all_success(name, results, seen=None):
@@ -13372,12 +13473,34 @@ def transitive_ancestors_all_success(name, results, seen=None):
     return True
 
 
+def build_inputs_ctx(results):
+    # Phase 7 grouping: every EXTERNAL Phase 1-6 job/output reference a Phase 7 job's if: expression needs now crosses via workflow_call inputs -- synthesized here from the SAME simulated results dict, so a Phase 7 job's external view is always exactly what MAIN would have actually passed.
+    vm_outputs = results.get("validate_model", {"outputs": {}}).get("outputs", {})
+
+    def r(name):
+        return results.get(name, {"result": "success"})["result"]
+
+    return {
+        "effective_deploy": vm_outputs.get("effective_deploy", "true"),
+        "has_active_deployments": vm_outputs.get("has_active_deployments", "true"),
+        "result_validate_shared_secrets_once": r("validate_shared_secrets_once"),
+        "result_build_publish_and_deploy": r("build_publish_and_deploy"),
+        "result_delete_removed_argocd_applications": r("delete_removed_argocd_applications"),
+        "result_replication_reconcile_once": r("replication_reconcile_once"),
+        "result_validate_argocd_ready": r("validate_argocd_ready"),
+        "result_validate_platform_ready": r("validate_platform_ready"),
+        "result_validate_observability_ready": r("validate_observability_ready"),
+        "result_validate_active_runtimes": r("validate_active_runtimes"),
+    }
+
+
 def would_run(name, results, if_override=None):
     expr = if_override if if_override is not None else extract_if(name)
     if not has_status_fn(expr):
         if not transitive_ancestors_all_success(name, results):
             return False
-    return eval_gha_bool(expr, results)
+    inputs_ctx = build_inputs_ctx(results) if name in PHASE7_JOB_NAMES else {}
+    return eval_gha_bool(expr, results, inputs_ctx)
 
 
 # Real-deploy + active-runtime background: every genuinely required runtime/foundation prerequisite has already succeeded -- the ONE legitimate optional skip under test is delete_removed_argocd_applications (has_deletions=false), never anything else.
@@ -13416,12 +13539,11 @@ for name in CHAIN:
     ctx[name] = {"result": "success" if ok else "skipped", "outputs": FORCED_OUTPUTS.get(name, {})}
     check(f"2: legitimate delete_removed_argocd_applications=skipped does NOT suppress {name} (eligible, concludes success)", ok)
 
-# Meta-proof that this model would actually have caught the historical bug: re-run the identical scenario with monitor_ownership_preflight's OWN if: text reverted (always() stripped) to what it was before this fix -- a fixture MUTATION of the extracted text, never a second real file -- and confirm the model correctly predicts it would have been skipped, exactly matching the live-observed defect.
-PRE_FIX_MOP_IF = extract_if("monitor_ownership_preflight").replace("always() && ", "").replace(" && always()", "")
-ctx2 = dict(BASE_BACKGROUND)
-ctx2["replication_reconcile_once"] = {"result": "success" if would_run("replication_reconcile_once", ctx2) else "skipped", "outputs": {}}
-pre_fix_would_run = would_run("monitor_ownership_preflight", ctx2, if_override=PRE_FIX_MOP_IF)
-check("meta-proof: replaying the SAME scenario against the PRE-FIX monitor_ownership_preflight if: text (always() stripped) correctly predicts it would have been skipped -- confirming this model actually reproduces the historical live defect, not merely a model that always reports success", pre_fix_would_run is False)
+# Meta-proof, relocated by the Phase 7 grouping: monitor_ownership_preflight itself now has ZERO internal needs: (every former external dependency -- validate_shared_secrets_once/replication_reconcile_once -- crosses the reusable-workflow boundary as a concrete resolved-string input, never a live needs: edge subject to GitHub's own implicit skip propagation). The skip-propagation risk this fix originally guarded therefore now lives at the SINGLE MAIN caller job (phase_7_monitor_final_acceptance), which directly needs: delete_removed_argocd_applications -- prove ITS always() is what prevents that legitimate skip from suppressing the ENTIRE grouped Phase 7 invocation.
+caller_if = extract_if("phase_7_monitor_final_acceptance")
+check("meta-proof: phase_7_monitor_final_acceptance's own if: is exactly always() (the single point where this exact skip-propagation risk is now guarded, replacing the need to repeat it on all seven internal jobs individually for their EXTERNAL dependencies)", caller_if == "always()")
+pre_fix_caller_would_run = transitive_ancestors_all_success("phase_7_monitor_final_acceptance", ctx)
+check("meta-proof: replaying the SAME scenario against phase_7_monitor_final_acceptance's OWN needs-based transitive closure (as if its always() were stripped) correctly predicts it would have been skipped -- confirming the caller's always() is load-bearing, not decorative, and this model genuinely reproduces the historical live defect at its new location", pre_fix_caller_would_run is False)
 
 # 3: failure cases proving always() does NOT weaken safety -- a genuine failure of a REQUIRED prerequisite still blocks every downstream job in the chain, exactly as before.
 def run_chain_with_failure(failing_job):
@@ -13532,14 +13654,18 @@ echo ""
 echo "--- MAIN prerequisite fail-fast + Kubernetes-access preflight: structural proofs (eks_oidc_preflight scope, final_validation direct needs, deployment_id description, orchestrator summary) ---"
 
 # E: validate_model's "Verify live EKS cluster + OIDC + Kubernetes API access (read-only)" step (formerly the standalone eks_oidc_preflight job) -- the pre-existing DescribeCluster/ACTIVE/ARN/OIDC checks remain intact, kubectl availability/aws eks update-kubeconfig reuse the exact already-live-proven Argo preflight pattern (EKS_DEPLOY_ROLE_ARN for both --role-arn and --assume-role-arn), a read-only Kubernetes API request is added, and no mutation command (kubectl apply/create/patch/delete, helm install/upgrade, terraform apply) is present anywhere in the step. F: final_validation directly needs validate_model/terraform_sync_once, and its gate step's RESULT_ env + require_success/allow_non_failure calls expose each of their results into the mode-aware contract (validate_model's own former five-job internal contract is now entirely its own concern, per the Phase 1 single-job consolidation). H: the workflow_dispatch deployment_id input description accurately describes environment-wide convergence of all enabled runtimes, never "without selected runtime mutation". I: the orchestrator summary concisely reflects EKS/OIDC/Kubernetes prerequisites, storage safety, Terraform, Argo CD, platform/observability, runtime, monitor/E2E, and final validation.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE7_WORKFLOW" ]; then
   set +e
   STRUCTURAL_PREREQ_CHECK="$(python3 -c '
 import yaml
 
 with open("'"$EKS_APP_WORKFLOW"'") as f:
     doc = yaml.safe_load(f)
+# Phase 7 grouping: final_validation now lives inside the grouped Phase 7 reusable workflow, never directly in MAIN.
+with open("'"$PHASE7_WORKFLOW"'") as f:
+    phase7_doc = yaml.safe_load(f)
 jobs = doc["jobs"]
+phase7_jobs = phase7_doc["jobs"]
 results = []
 
 # E. Since the Phase 1 single-job consolidation the actual EKS verification logic (formerly the eks_oidc_preflight jobs own run: body) lives in phase1_readiness.py cmd_eks_preflight -- the workflow step itself is a thin two-line wrapper, so these fragments are checked against the real Python source.
@@ -13562,9 +13688,10 @@ for fragment, label in (
 phase1_code_lines = "\n".join(line for line in phase1_source.splitlines() if not line.strip().startswith("#"))
 results.append(("E: cmd_eks_preflight never issues a mutation command", not any(bad in phase1_code_lines for bad in ("kubectl apply", "kubectl create", "kubectl patch", "kubectl delete", "helm install", "helm upgrade", "terraform apply"))))
 
-# F. Phase 7 Python conversion: the mode-aware require_success()/allow_non_failure() logic itself now lives in automation/phases/phase7/phase7_final.py (invoked here as `python3 automation/phases/phase7/phase7_final.py validate`, never a second reimplementation) -- string-content checks below inspect THAT file, never the (now one-line) YAML step text.
-final_val = jobs["final_validation"]
-final_val_needs = final_val.get("needs") or []
+# F. Phase 7 Python conversion: the mode-aware require_success()/allow_non_failure() logic itself now lives in automation/phases/phase7/phase7_final.py (invoked here as python3 automation/phases/phase7/phase7_final.py validate, never a second reimplementation) -- string-content checks below inspect THAT file, never the (now one-line) YAML step text. Phase 7 grouping: final_validation own INTERNAL needs (inside the grouped Phase 7 workflow) no longer include validate_model/terraform_sync_once directly -- those are external Phase 1-6 jobs the SINGLE MAIN caller (phase_7_monitor_final_acceptance) needs instead, crossing the reusable-workflow boundary as workflow_call inputs (RESULT_validate_model/RESULT_terraform_sync_once are still exposed as env: keys on the gate step, mapped from inputs.result_* rather than needs star result).
+final_val = phase7_jobs["final_validation"]
+caller_job = jobs["phase_7_monitor_final_acceptance"]
+caller_needs = caller_job.get("needs") or []
 gate_step = next((s for s in final_val.get("steps", []) if s.get("name") == "Validate the mode-aware final DEPLOY success contract"), None)
 gate_run = (gate_step or {}).get("run", "")
 gate_env = (gate_step or {}).get("env") or {}
@@ -13572,7 +13699,7 @@ with open("automation/phases/phase7/phase7_final.py") as f:
     phase7_final_source_f = f.read()
 results.append(("F: final_validation gate step delegates to phase7_final.py validate", "phase7_final.py validate" in gate_run))
 for extra_job in ("validate_model", "terraform_sync_once"):
-    results.append((f"F: final_validation needs {extra_job} directly", extra_job in final_val_needs))
+    results.append((f"F: MAIN phase_7_monitor_final_acceptance caller needs {extra_job} directly (external Phase 1-6 job, crosses the reusable-workflow boundary as a workflow_call input)", extra_job in caller_needs))
     results.append((f"F: final_validation gate step exposes RESULT_{extra_job}", f"RESULT_{extra_job}" in gate_env))
 results.append(("F: final_validation gate step requires success for validate_model unconditionally (foundational, every mode)", "require_success(\"validate_model\")" in phase7_final_source_f))
 results.append(("F: final_validation gate step requires success for terraform_sync_once on a REAL DEPLOY", "require_success(\"terraform_sync_once\")" in phase7_final_source_f))
@@ -13611,16 +13738,16 @@ for label, ok in results:
     done <<< "$STRUCTURAL_PREREQ_CHECK"
   fi
 else
-  skip "MAIN prerequisite fail-fast: structural proofs -- python3/PyYAML unavailable or main workflow missing"
+  skip "MAIN prerequisite fail-fast: structural proofs -- python3/PyYAML unavailable or main/Phase 7 workflow missing"
 fi
 
 echo ""
 echo "--- Phase B3B closeout: mode-aware final DEPLOY success contract (final_validation actually executed) ---"
 
-# Unlike the JOB_ORDER if:-expression simulator above (which cannot express the bash program logic now living inside final_validation's own step), this extracts and REALLY EXECUTES the committed "Validate the mode-aware final DEPLOY success contract" script via bash for each required scenario -- genuine proof of behavior, never a re-implementation of the same logic inside this test suite.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+# Unlike the JOB_ORDER if:-expression simulator above (which cannot express the bash program logic now living inside final_validation's own step), this extracts and REALLY EXECUTES the committed "Validate the mode-aware final DEPLOY success contract" script via bash for each required scenario -- genuine proof of behavior, never a re-implementation of the same logic inside this test suite. Phase 7 grouping: final_validation now lives inside the grouped Phase 7 reusable workflow, never directly in MAIN.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$PHASE7_WORKFLOW" ]; then
   set +e
-  PHASE_B3B_FINAL_GATE_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+  PHASE_B3B_FINAL_GATE_OUT="$(python3 - "$PHASE7_WORKFLOW" <<'PYEOF'
 import subprocess
 import sys
 import yaml
@@ -13823,7 +13950,7 @@ PYEOF
     fail "Phase B3B closeout final-gate execution proof failed:"$'\n'"${PHASE_B3B_FINAL_GATE_OUT}"
   fi
 else
-  skip "Phase B3B closeout: final-gate execution proof -- python3/PyYAML/bash unavailable or main workflow missing"
+  skip "Phase B3B closeout: final-gate execution proof -- python3/PyYAML/bash unavailable or Phase 7 workflow missing"
 fi
 
 echo ""
@@ -13889,19 +14016,23 @@ fi
 echo ""
 echo "--- Phase 1 single-job architecture: validate_model consolidates the former six-job Phase 1 into one job (assertions A-R) ---"
 
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE7_WORKFLOW" ]; then
   set +e
-  PHASE1_ARCHITECTURE_OUT="$(python3 - "$EKS_APP_WORKFLOW" "$PHASE1_TOOL" <<'PYEOF'
+  PHASE1_ARCHITECTURE_OUT="$(python3 - "$EKS_APP_WORKFLOW" "$PHASE1_TOOL" "$PHASE7_WORKFLOW" <<'PYEOF'
 import sys
 
 import yaml
 
-workflow_path, phase1_tool_path = sys.argv[1], sys.argv[2]
+workflow_path, phase1_tool_path, phase7_workflow_path = sys.argv[1], sys.argv[2], sys.argv[3]
 with open(workflow_path) as f:
     doc = yaml.safe_load(f)
 jobs = doc["jobs"]
 with open(phase1_tool_path) as f:
     phase1_source = f.read()
+# Phase 7 grouping: final_validation now lives inside the grouped Phase 7 reusable workflow, never directly in MAIN.
+with open(phase7_workflow_path) as f:
+    phase7_doc = yaml.safe_load(f)
+phase7_jobs = phase7_doc["jobs"]
 
 results = []
 
@@ -14005,8 +14136,8 @@ delete_needs_list = delete_needs if isinstance(delete_needs, list) else [delete_
 check("L: delete_removed_argocd_applications needs validate_model", "validate_model" in delete_needs_list)
 check("L: delete_removed_argocd_applications still needs validate_argocd_ready (Argo-health prerequisite unweakened)", "validate_argocd_ready" in delete_needs_list)
 
-# M: final_validation retains if: always() and its gate step unconditionally requires validate_model success.
-final_val = jobs.get("final_validation", {})
+# M: final_validation retains if: always() and its gate step unconditionally requires validate_model success. Phase 7 grouping: final_validation now lives inside the grouped Phase 7 reusable workflow.
+final_val = phase7_jobs.get("final_validation", {})
 check("M: final_validation's own if: remains always()", str(final_val.get("if", "")).strip() == "always()")
 gate_step = next((s for s in final_val.get("steps", []) if s.get("name") == "Validate the mode-aware final DEPLOY success contract"), None)
 check("M: final_validation's gate step delegates to phase7_final.py validate", "phase7_final.py validate" in (gate_step or {}).get("run", ""))
@@ -14056,7 +14187,7 @@ PYEOF
     done <<< "$PHASE1_ARCHITECTURE_OUT"
   fi
 else
-  skip "Phase 1 single-job architecture (A-R) -- python3/PyYAML unavailable or main workflow missing"
+  skip "Phase 1 single-job architecture (A-R) -- python3/PyYAML unavailable or main/Phase 7 workflow missing"
 fi
 
 echo ""
@@ -14156,21 +14287,25 @@ fi
 echo ""
 echo "--- Phase 2 Python extraction: validate_environment_config/apply (10-sub-iam-secrets.yaml) stay two visible jobs behind the corporate Terraform reusable-workflow boundary (assertions A-W) ---"
 
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$SUB_IAM_SECRETS_WORKFLOW" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE2_TOOL" ]; then
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$SUB_IAM_SECRETS_WORKFLOW" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE2_TOOL" ] && [ -f "$PHASE7_WORKFLOW" ]; then
   set +e
-  PHASE2_ARCHITECTURE_OUT="$(python3 - "$SUB_IAM_SECRETS_WORKFLOW" "$EKS_APP_WORKFLOW" "$PHASE2_TOOL" <<'PYEOF'
+  PHASE2_ARCHITECTURE_OUT="$(python3 - "$SUB_IAM_SECRETS_WORKFLOW" "$EKS_APP_WORKFLOW" "$PHASE2_TOOL" "$PHASE7_WORKFLOW" <<'PYEOF'
 import re
 import sys
 
 import yaml
 
-sub_path, main_path, phase2_tool_path = sys.argv[1], sys.argv[2], sys.argv[3]
+sub_path, main_path, phase2_tool_path, phase7_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 with open(sub_path) as f:
     sub_doc = yaml.safe_load(f)
 with open(main_path) as f:
     main_doc = yaml.safe_load(f)
 with open(phase2_tool_path) as f:
     phase2_source = f.read()
+# Phase 7 grouping: final_validation now lives inside the grouped Phase 7 reusable workflow, never directly in MAIN.
+with open(phase7_path) as f:
+    phase7_doc = yaml.safe_load(f)
+phase7_jobs = phase7_doc["jobs"]
 
 results = []
 
@@ -14253,8 +14388,8 @@ preflight_if = str(preflight.get("if", ""))
 check("T: argocd_preflight needs terraform_sync_once", "terraform_sync_once" in preflight_needs)
 check("T: argocd_preflight's if: requires terraform_sync_once.result == success", "needs.terraform_sync_once.result == \x27success\x27" in preflight_if)
 
-# U: final_validation still requires terraform_sync_once success on Deploy and permits the intentional skip in Validate mode. Phase 7 Python conversion: this logic now lives in automation/phases/phase7/phase7_final.py (invoked as `python3 automation/phases/phase7/phase7_final.py validate`) -- string-content checks below inspect THAT file, never the (now one-line) YAML step text.
-final_val = main_jobs.get("final_validation", {})
+# U: final_validation still requires terraform_sync_once success on Deploy and permits the intentional skip in Validate mode. Phase 7 Python conversion: this logic now lives in automation/phases/phase7/phase7_final.py (invoked as `python3 automation/phases/phase7/phase7_final.py validate`) -- string-content checks below inspect THAT file, never the (now one-line) YAML step text. Phase 7 grouping: final_validation now lives inside the grouped Phase 7 reusable workflow.
+final_val = phase7_jobs.get("final_validation", {})
 gate_step = next((s for s in final_val.get("steps", []) if s.get("name") == "Validate the mode-aware final DEPLOY success contract"), None)
 gate_run = (gate_step or {}).get("run", "")
 check("U: final_validation gate step delegates to phase7_final.py validate", "phase7_final.py validate" in gate_run)
@@ -14863,7 +14998,7 @@ with open(main_path) as f:
     main_doc = yaml.safe_load(f)
 with open(sub_path) as f:
     sub_doc = yaml.safe_load(f)
-check("J: MAIN still has exactly 26 jobs", len(main_doc.get("jobs", {})) == 26)
+check("J: MAIN job count reflects the Phase 7 grouping (26 -> 20: seven Phase 7 jobs replaced by one phase_7_monitor_final_acceptance caller)", len(main_doc.get("jobs", {})) == 20)
 check("J: MAIN still defines validate_model and terraform_sync_once", {"validate_model", "terraform_sync_once"} <= set(main_doc.get("jobs", {}).keys()))
 check("J: 10-sub-iam-secrets.yaml still defines exactly validate_environment_config and apply", set(sub_doc.get("jobs", {}).keys()) == {"validate_environment_config", "apply"})
 
@@ -14918,7 +15053,7 @@ EXPECTED_NAMES = {
 # A/B/C
 results.append(("A: all seven MAIN Phase 4 job IDs exist", all(jid in jobs for jid in PHASE4_JOB_IDS)))
 results.append(("B: every Phase 4 job display name exactly matches Phase 4A-G", all(jobs.get(jid, {}).get("name") == name for jid, name in EXPECTED_NAMES.items())))
-results.append(("C: MAIN job count is unchanged at 26", len(jobs) == 26))
+results.append(("C: MAIN job count reflects the Phase 7 grouping (26 -> 20: seven Phase 7 jobs replaced by one phase_7_monitor_final_acceptance caller)", len(jobs) == 20))
 
 platform_preflight = jobs.get("platform_preflight", {})
 observability_preflight = jobs.get("observability_preflight", {})
@@ -15181,19 +15316,24 @@ else
   fail "AH: one or more Phase 1-3 production paths are missing"
 fi
 
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE7_WORKFLOW" ]; then
   AI_CHECK="$(python3 -c '
 import yaml
 with open("'"$EKS_APP_WORKFLOW"'") as f:
     doc = yaml.safe_load(f)
 jobs = doc["jobs"]
-phase5_jobs = ("runtime_ownership_preflight", "build_publish_and_deploy", "delete_removed_argocd_applications", "validate_active_runtimes", "replication_reconcile_once", "replication_dry_run_validation", "monitor_ownership_preflight", "monitor_sync_once", "monitor_dry_run_validation", "validate_monitor_ready", "replication_monitor_acceptance", "end_to_end_deployment_acceptance", "final_validation")
-print("OK" if all(j in jobs for j in phase5_jobs) else "FAIL")
+# Phase 7 grouping: the seven Phase 7 jobs now live inside the grouped Phase 7 reusable workflow, never directly in MAIN -- checked against that document instead of merely dropped from this guard.
+with open("'"$PHASE7_WORKFLOW"'") as f:
+    phase7_doc = yaml.safe_load(f)
+phase7_jobs = phase7_doc["jobs"]
+phase5_6_jobs = ("runtime_ownership_preflight", "build_publish_and_deploy", "delete_removed_argocd_applications", "validate_active_runtimes", "replication_reconcile_once", "replication_dry_run_validation")
+phase7_job_ids = ("monitor_ownership_preflight", "monitor_sync_once", "monitor_dry_run_validation", "validate_monitor_ready", "replication_monitor_acceptance", "end_to_end_deployment_acceptance", "final_validation")
+print("OK" if all(j in jobs for j in phase5_6_jobs) and "phase_7_monitor_final_acceptance" in jobs and all(j in phase7_jobs for j in phase7_job_ids) else "FAIL")
 ' 2>&1)"
   if [ "$AI_CHECK" = "OK" ]; then
-    pass "AI: every Phase 5+ MAIN job (runtime_ownership_preflight through final_validation) still exists, unrefactored, unmodified by this Phase 4 conversion"
+    pass "AI: every Phase 5+ job (runtime_ownership_preflight through final_validation, the latter seven now grouped behind the Phase 7 wrapper) still exists, unrefactored, unmodified by this Phase 4 conversion"
   else
-    fail "AI: one or more Phase 5+ MAIN jobs are missing: ${AI_CHECK}"
+    fail "AI: one or more Phase 5+ jobs are missing: ${AI_CHECK}"
   fi
   # AI: automation/phases/phase5/ now legitimately exists -- the Phase 5 Runtime Lifecycle Python conversion is a subsequent, separately-approved task; this guard originally protected against Phase 5 being pre-created during the Phase 4 conversion, and remains satisfied structurally (Phase 4's own production files/behavior are untouched by Phase 5's addition, proven by the dedicated Phase 5 Python Conversion section elsewhere in this suite).
   if [ -d automation/phases/phase5 ]; then
@@ -15249,8 +15389,8 @@ expected_names = {
 for job_id, expected_name in expected_names.items():
     results.append((f"B: {job_id} display name is exactly {expected_name!r}", jobs.get(job_id, {}).get("name") == expected_name))
 
-# C: MAIN job count remains 26.
-results.append(("C: MAIN job count remains 26", len(jobs) == 26))
+# C: MAIN job count reflects the Phase 7 grouping (26 -> 20: seven Phase 7 jobs replaced by one phase_7_monitor_final_acceptance caller).
+results.append(("C: MAIN job count reflects the Phase 7 grouping (20)", len(jobs) == 20))
 
 # D: runtime_ownership_preflight still depends on validate_shared_secrets_once.
 results.append(("D: runtime_ownership_preflight still depends on validate_shared_secrets_once", "validate_shared_secrets_once" in (jobs["runtime_ownership_preflight"].get("needs") or [])))
@@ -17346,8 +17486,8 @@ def check(label, ok):
 check("A: replication_reconcile_once job ID remains", "replication_reconcile_once" in jobs)
 check("A: replication_dry_run_validation job ID remains", "replication_dry_run_validation" in jobs)
 
-# B: MAIN total job count remains 26 (Phase 6 is an in-place conversion of two EXISTING jobs, never a new job).
-check("B: MAIN total job count remains 26", len(jobs) == 26)
+# B: MAIN total job count reflects the Phase 7 grouping (26 -> 20: seven Phase 7 jobs replaced by one phase_7_monitor_final_acceptance caller; Phase 6 remains an in-place conversion of two EXISTING jobs, never a new one).
+check("B: MAIN total job count reflects the Phase 7 grouping (20)", len(jobs) == 20)
 
 # C/D: needs/if contract preserved exactly.
 reconcile_job = jobs["replication_reconcile_once"]
@@ -18913,8 +19053,9 @@ else
 fi
 
 echo "--- Phase 7: general Python-first orchestration conversion (monitor jobs + final_validation) ---"
+echo "--- Phase 7 grouping: MAIN presents Phase 7 as one parent job, backed by 70-phase-monitor-final-acceptance.yaml (A-T) ---"
 
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE7_WORKFLOW" ]; then
   PHASE7_CONVERSION_CHECK="$(python3 -c '
 import subprocess
 import sys
@@ -18923,7 +19064,10 @@ import yaml
 
 with open("'"$EKS_APP_WORKFLOW"'") as f:
     doc = yaml.safe_load(f)
+with open("'"$PHASE7_WORKFLOW"'") as f:
+    phase7_doc = yaml.safe_load(f)
 jobs = doc["jobs"]
+phase7_jobs = phase7_doc["jobs"]
 results = []
 
 
@@ -18936,58 +19080,104 @@ PHASE7_JOB_IDS = (
     "validate_monitor_ready", "replication_monitor_acceptance", "end_to_end_deployment_acceptance",
     "final_validation",
 )
+CALLER_JOB_ID = "phase_7_monitor_final_acceptance"
+PHASE7_FILENAME = "70-phase-monitor-final-acceptance.yaml"
+EXTERNAL_RESULT_JOBS = (
+    "validate_model", "terraform_sync_once", "validate_shared_secrets_once",
+    "validate_argocd_ready", "validate_platform_ready", "validate_observability_ready",
+    "runtime_ownership_preflight", "build_publish_and_deploy", "delete_removed_argocd_applications",
+    "validate_active_runtimes", "replication_reconcile_once", "replication_dry_run_validation",
+)
 
-# 1: MAIN still has 26 jobs.
-check("1: MAIN still has exactly 26 jobs", len(jobs) == 26)
+# A: MAIN has exactly 20 jobs (26 - 7 Phase 7 jobs + 1 Phase 7 caller).
+check("A: MAIN has exactly 20 jobs", len(jobs) == 20)
 
-# 2: all seven current Phase 7/final job IDs remain.
+# B: MAIN no longer directly contains any of the seven Phase 7 job IDs.
 for job_id in PHASE7_JOB_IDS:
-    check(f"2: MAIN still defines job {job_id!r}", job_id in jobs)
+    check(f"B: MAIN no longer directly defines job {job_id!r} (moved into the grouped Phase 7 workflow)", job_id not in jobs)
 
-# 3: exact needs graph retained for every Phase 7 job.
-EXPECTED_NEEDS = {
-    "monitor_ownership_preflight": ["validate_model", "validate_shared_secrets_once", "replication_reconcile_once"],
-    "monitor_sync_once": ["validate_model", "validate_shared_secrets_once", "build_publish_and_deploy", "delete_removed_argocd_applications", "replication_reconcile_once", "monitor_ownership_preflight"],
-    "monitor_dry_run_validation": ["validate_model", "validate_shared_secrets_once", "build_publish_and_deploy", "delete_removed_argocd_applications", "replication_dry_run_validation"],
-    "validate_monitor_ready": ["validate_model", "validate_shared_secrets_once", "monitor_sync_once"],
-    "replication_monitor_acceptance": ["validate_model", "replication_reconcile_once", "validate_monitor_ready"],
-    "end_to_end_deployment_acceptance": ["validate_model", "validate_argocd_ready", "validate_platform_ready", "validate_observability_ready", "validate_active_runtimes", "replication_reconcile_once", "validate_monitor_ready", "replication_monitor_acceptance"],
+# C/D: MAIN contains exactly one Phase 7 caller, using exactly the approved reusable workflow file.
+check(f"C: MAIN defines exactly one Phase 7 caller job {CALLER_JOB_ID!r}", CALLER_JOB_ID in jobs)
+caller = jobs.get(CALLER_JOB_ID, {})
+check(f"D: {CALLER_JOB_ID} uses exactly ./.github/workflows/{PHASE7_FILENAME}", caller.get("uses") == f"./.github/workflows/{PHASE7_FILENAME}")
+check(f"D: {CALLER_JOB_ID} has no steps: key (a genuine reusable-workflow call, never inlined)", "steps" not in caller)
+
+# E: the caller job-level if: is exactly always() -- the grouped Phase 7 workflow must still execute when one of its twelve external prerequisites legitimately SKIPPED/FAILED/CANCELLED, so Phase 7G can run its own fail-closed mode-aware contract.
+check(f"E: {CALLER_JOB_ID}'"'"'s if: is exactly always()", str(caller.get("if", "")).strip() == "always()")
+
+# F: the caller needs list contains all twelve required Phase 1-6 external jobs (never collapsed to one aggregate result).
+caller_needs = caller.get("needs") or []
+for job_id in EXTERNAL_RESULT_JOBS:
+    check(f"F: {CALLER_JOB_ID} needs {job_id!r}", job_id in caller_needs)
+check(f"F: {CALLER_JOB_ID} needs exactly the twelve required external jobs, no more, no fewer", sorted(caller_needs) == sorted(EXTERNAL_RESULT_JOBS))
+
+# G: the caller passes every required selected-environment/mode/result input, each sourced from the correct outer needs.<job> reference.
+caller_with = caller.get("with") or {}
+EXPECTED_CALLER_WITH = {
+    "selected_environment": "needs.validate_model.outputs.selected_environment",
+    "effective_deploy": "needs.validate_model.outputs.effective_deploy",
+    "has_active_deployments": "needs.validate_model.outputs.has_active_deployments",
+    "has_changes": "needs.validate_model.outputs.has_changes",
+    "has_deletions": "needs.validate_model.outputs.has_deletions",
 }
-for job_id, expected in EXPECTED_NEEDS.items():
-    actual = jobs[job_id].get("needs") or []
-    check(f"3: {job_id} needs graph is byte-for-byte unchanged: {expected!r}", actual == expected)
-check("3: final_validation needs every one of the 18 canonical prerequisite jobs unchanged", len(jobs["final_validation"].get("needs") or []) == 18)
+for job_id in EXTERNAL_RESULT_JOBS:
+    EXPECTED_CALLER_WITH[f"result_{job_id}"] = f"needs.{job_id}.result"
+for input_name, expected_ref in EXPECTED_CALLER_WITH.items():
+    check(f"G: {CALLER_JOB_ID} passes with.{input_name} sourced from {expected_ref}", expected_ref in str(caller_with.get(input_name, "")))
+check("G: the caller passes exactly the required 17 workflow_call inputs, never more, never fewer", sorted(caller_with.keys()) == sorted(EXPECTED_CALLER_WITH.keys()))
 
-# 4: exact mode applicability (if: expressions) retained verbatim for every Phase 7 job.
+# H: the grouped Phase 7 workflow contains exactly the seven approved internal jobs, with the exact approved IDs.
+check("H: 70-phase-monitor-final-acceptance.yaml contains exactly the seven approved Phase 7 job IDs, no more, no fewer", sorted(phase7_jobs.keys()) == sorted(PHASE7_JOB_IDS))
+
+# I: the grouped Phase 7 workflow exposes workflow_call only -- never becomes a second operator-facing standalone Actions workflow.
+phase7_on = phase7_doc.get("on", phase7_doc.get(True)) or {}
+check("I: 70-phase-monitor-final-acceptance.yaml exposes workflow_call only (never workflow_dispatch/push/pull_request/schedule)", list(phase7_on.keys()) == ["workflow_call"])
+
+# 3: exact INTERNAL needs graph for every Phase 7 job -- only true internal Phase 7 dependencies belong here, since every external Phase 1-6 job is already complete before the reusable workflow invocation starts.
+EXPECTED_INTERNAL_NEEDS = {
+    "monitor_ownership_preflight": [],
+    "monitor_sync_once": ["monitor_ownership_preflight"],
+    "monitor_dry_run_validation": [],
+    "validate_monitor_ready": ["monitor_sync_once"],
+    "replication_monitor_acceptance": ["validate_monitor_ready"],
+    "end_to_end_deployment_acceptance": ["validate_monitor_ready", "replication_monitor_acceptance"],
+    "final_validation": ["monitor_ownership_preflight", "monitor_sync_once", "monitor_dry_run_validation", "validate_monitor_ready", "replication_monitor_acceptance", "end_to_end_deployment_acceptance"],
+}
+for job_id, expected in EXPECTED_INTERNAL_NEEDS.items():
+    actual = phase7_jobs[job_id].get("needs") or []
+    check(f"3: {job_id}'"'"'s INTERNAL needs graph is exactly {expected!r}", actual == expected)
+
+# 4: exact mode applicability (if: expressions) retained, with only the required needs.*->inputs.* boundary translation for external references. Internal Phase-7-to-Phase-7 references remain needs.*.
 EXPECTED_IF = {
-    "monitor_ownership_preflight": "${{ needs.validate_model.outputs.effective_deploy == \x27true\x27 && needs.validate_model.outputs.has_active_deployments == \x27true\x27 && always() && needs.validate_shared_secrets_once.result == \x27success\x27 && needs.replication_reconcile_once.result == \x27success\x27 }}",
-    "monitor_dry_run_validation": "${{ needs.validate_model.outputs.effective_deploy == \x27false\x27 && needs.validate_model.outputs.has_active_deployments == \x27true\x27 && always() && needs.validate_shared_secrets_once.result == \x27success\x27 && needs.build_publish_and_deploy.result != \x27failure\x27 && needs.build_publish_and_deploy.result != \x27cancelled\x27 && needs.delete_removed_argocd_applications.result != \x27failure\x27 && needs.delete_removed_argocd_applications.result != \x27cancelled\x27 && needs.replication_dry_run_validation.result != \x27failure\x27 && needs.replication_dry_run_validation.result != \x27cancelled\x27 }}",
-    "validate_monitor_ready": "${{ needs.validate_model.outputs.effective_deploy == \x27true\x27 && needs.validate_model.outputs.has_active_deployments == \x27true\x27 && always() && needs.validate_shared_secrets_once.result == \x27success\x27 && needs.monitor_sync_once.result == \x27success\x27 }}",
-    "replication_monitor_acceptance": "${{ needs.validate_model.outputs.effective_deploy == \x27true\x27 && always() && needs.replication_reconcile_once.result == \x27success\x27 && needs.validate_monitor_ready.result == \x27success\x27 }}",
+    "monitor_ownership_preflight": "${{ inputs.effective_deploy == \x27true\x27 && inputs.has_active_deployments == \x27true\x27 && always() && inputs.result_validate_shared_secrets_once == \x27success\x27 && inputs.result_replication_reconcile_once == \x27success\x27 }}",
+    "monitor_dry_run_validation": "${{ inputs.effective_deploy == \x27false\x27 && inputs.has_active_deployments == \x27true\x27 && always() && inputs.result_validate_shared_secrets_once == \x27success\x27 && inputs.result_build_publish_and_deploy != \x27failure\x27 && inputs.result_build_publish_and_deploy != \x27cancelled\x27 && inputs.result_delete_removed_argocd_applications != \x27failure\x27 && inputs.result_delete_removed_argocd_applications != \x27cancelled\x27 && inputs.result_replication_dry_run_validation != \x27failure\x27 && inputs.result_replication_dry_run_validation != \x27cancelled\x27 }}",
+    "validate_monitor_ready": "${{ inputs.effective_deploy == \x27true\x27 && inputs.has_active_deployments == \x27true\x27 && always() && inputs.result_validate_shared_secrets_once == \x27success\x27 && needs.monitor_sync_once.result == \x27success\x27 }}",
+    "replication_monitor_acceptance": "${{ inputs.effective_deploy == \x27true\x27 && always() && inputs.result_replication_reconcile_once == \x27success\x27 && needs.validate_monitor_ready.result == \x27success\x27 }}",
     "final_validation": "always()",
 }
 for job_id, expected_if in EXPECTED_IF.items():
-    actual_if = str(jobs[job_id].get("if", "")).strip()
-    check(f"4: {job_id}'"'"'s if: expression is byte-for-byte unchanged", actual_if == expected_if)
+    actual_if = str(phase7_jobs[job_id].get("if", "")).strip()
+    check(f"4: {job_id}'"'"'s if: expression is byte-for-byte unchanged apart from the required inputs.* boundary translation", actual_if == expected_if)
 
 # 5: always() protections retained on every job that previously carried the DAG skip-propagation fix.
 for job_id in ("monitor_ownership_preflight", "validate_monitor_ready", "monitor_sync_once", "monitor_dry_run_validation", "end_to_end_deployment_acceptance"):
-    check(f"5: {job_id}'"'"'s if: still contains always()", "always()" in str(jobs[job_id].get("if", "")))
-check("5: final_validation'"'"'s if: is exactly always() (never itself conditionally skipped)", str(jobs["final_validation"].get("if", "")).strip() == "always()")
+    check(f"5: {job_id}'"'"'s if: still contains always()", "always()" in str(phase7_jobs[job_id].get("if", "")))
+check("5/N: final_validation'"'"'s if: is exactly always() (never itself conditionally skipped)", str(phase7_jobs["final_validation"].get("if", "")).strip() == "always()")
 
-# 6: monitor_sync_once still calls 50-sub-monitor.yaml as a genuine reusable-workflow boundary, never inlined.
-sync_once = jobs["monitor_sync_once"]
-check("6a: monitor_sync_once still uses ./.github/workflows/50-sub-monitor.yaml", sync_once.get("uses") == "./.github/workflows/50-sub-monitor.yaml")
+# 6/J: monitor_sync_once still calls 50-sub-monitor.yaml as a genuine reusable-workflow boundary, never inlined.
+sync_once = phase7_jobs["monitor_sync_once"]
+check("6a/J: monitor_sync_once still uses ./.github/workflows/50-sub-monitor.yaml", sync_once.get("uses") == "./.github/workflows/50-sub-monitor.yaml")
 check("6b: monitor_sync_once has no steps: key (a genuine reusable-workflow call, never inlined)", "steps" not in sync_once)
 sync_with = sync_once.get("with") or {}
-check("6c: monitor_sync_once passes deploy: true", sync_with.get("deploy") is True)
-check("6d: monitor_sync_once passes enable_cloudwatch_publication: true", sync_with.get("enable_cloudwatch_publication") is True)
-check("6e: monitor_sync_once passes metrics_gate_expectation: any", sync_with.get("metrics_gate_expectation") == "any")
+check("6c: monitor_sync_once passes environment: sourced from inputs.selected_environment", "inputs.selected_environment" in str(sync_with.get("environment", "")))
+check("6d: monitor_sync_once passes deploy: true", sync_with.get("deploy") is True)
+check("6e: monitor_sync_once passes enable_cloudwatch_publication: true", sync_with.get("enable_cloudwatch_publication") is True)
+check("6f: monitor_sync_once passes metrics_gate_expectation: any", sync_with.get("metrics_gate_expectation") == "any")
 
-# 7: orchestrated_by_main remains true on the specialist call.
-check("7: monitor_sync_once passes orchestrated_by_main: true to 50-sub-monitor.yaml", sync_with.get("orchestrated_by_main") is True)
+# 7/K: orchestrated_by_main remains true on the nested specialist call.
+check("7/K: monitor_sync_once passes orchestrated_by_main: true to 50-sub-monitor.yaml", sync_with.get("orchestrated_by_main") is True)
 
-# 8: Phase 7 MAIN implementation-heavy blocks now call phase7_monitor.py/phase7_final.py, never a re-inlined bash reimplementation.
+# 8: Phase 7 implementation-heavy blocks still call phase7_monitor.py/phase7_final.py, never a re-inlined bash reimplementation.
 EXPECTED_PYTHON_CALL = {
     "monitor_ownership_preflight": "phase7_monitor.py ownership-preflight",
     "monitor_dry_run_validation": "phase7_monitor.py validate-local",
@@ -18996,52 +19186,57 @@ EXPECTED_PYTHON_CALL = {
     "end_to_end_deployment_acceptance": "phase7_monitor.py end-to-end-acceptance",
 }
 for job_id, expected_call in EXPECTED_PYTHON_CALL.items():
-    job_run_text = "\n".join(s.get("run", "") for s in (jobs[job_id].get("steps") or []))
+    job_run_text = "\n".join(s.get("run", "") for s in (phase7_jobs[job_id].get("steps") or []))
     check(f"8: {job_id} invokes automation/phases/phase7/{expected_call}", f"automation/phases/phase7/{expected_call}" in job_run_text)
-final_val_gate_step = next((s for s in jobs["final_validation"]["steps"] if s.get("name") == "Validate the mode-aware final DEPLOY success contract"), None)
+final_val_gate_step = next((s for s in phase7_jobs["final_validation"]["steps"] if s.get("name") == "Validate the mode-aware final DEPLOY success contract"), None)
 check("8: final_validation'"'"'s gate step invokes automation/phases/phase7/phase7_final.py validate", "automation/phases/phase7/phase7_final.py validate" in (final_val_gate_step or {}).get("run", ""))
 
 # No implementation-heavy job embeds a raw Python heredoc reimplementation of a classifier loop anymore (the old require_process()/CLASSIFIER_OUTPUT-parsing heredocs are gone from these specific jobs -- moved to phase7_monitor.py).
 for job_id in ("monitor_ownership_preflight", "validate_monitor_ready", "replication_monitor_acceptance", "end_to_end_deployment_acceptance"):
-    job_run_text = "\n".join(s.get("run", "") for s in (jobs[job_id].get("steps") or []))
+    job_run_text = "\n".join(s.get("run", "") for s in (phase7_jobs[job_id].get("steps") or []))
     check(f"8b: {job_id} no longer embeds an inline python3 - <<PYEOF classifier heredoc (moved to phase7_monitor.py)", "<<\x27PYEOF\x27" not in job_run_text and "<<PYEOF" not in job_run_text)
 
-# 9: no manager-reference sidecar architecture introduced anywhere in MAIN or the monitor specialist workflow.
+# 9/T: no manager-reference sidecar architecture introduced anywhere in MAIN, the grouped Phase 7 workflow, or the monitor specialist workflow.
 with open("'"$EKS_APP_WORKFLOW"'") as f:
     main_source_sidecar_check = f.read()
+with open("'"$PHASE7_WORKFLOW"'") as f:
+    phase7_source_sidecar_check = f.read()
 with open("'"$MONITOR_WORKFLOW"'") as f:
     monitor_source_sidecar_check = f.read()
 for forbidden in ("utility-sidecar", "observer-sidecar", "goldengate-observer", "fluentbit-sidecar"):
-    check(f"9: MAIN never references forbidden sidecar construct {forbidden!r}", forbidden not in main_source_sidecar_check.lower())
-    check(f"9: 50-sub-monitor.yaml never references forbidden sidecar construct {forbidden!r}", forbidden not in monitor_source_sidecar_check.lower())
+    check(f"9/T: MAIN never references forbidden sidecar construct {forbidden!r}", forbidden not in main_source_sidecar_check.lower())
+    check(f"9/T: 70-phase-monitor-final-acceptance.yaml never references forbidden sidecar construct {forbidden!r}", forbidden not in phase7_source_sidecar_check.lower())
+    check(f"9/T: 50-sub-monitor.yaml never references forbidden sidecar construct {forbidden!r}", forbidden not in monitor_source_sidecar_check.lower())
 
-# 10: no replication enabled and no teardown implemented -- structural sweep of MAIN/monitor workflow text.
+# 10: no replication enabled and no teardown implemented -- structural sweep of MAIN/grouped Phase 7/monitor workflow text.
 check("10a: MAIN never sets replication.enabled: true or similar toggling construct", "replication.enabled: true" not in main_source_sidecar_check and "replication.enabled=true" not in main_source_sidecar_check)
+check("10a: the grouped Phase 7 workflow never sets replication.enabled: true or similar toggling construct", "replication.enabled: true" not in phase7_source_sidecar_check and "replication.enabled=true" not in phase7_source_sidecar_check)
 check("10b: no teardown job/workflow construct exists in MAIN", not any("teardown" in str(k).lower() for k in jobs))
+check("10b: no teardown job/workflow construct exists in the grouped Phase 7 workflow", not any("teardown" in str(k).lower() for k in phase7_jobs))
 import os
 check("10c: no automation/phases/phase7/ production teardown module exists", not os.path.exists("automation/phases/phase7/phase7_teardown.py"))
 
-# 11: credential output scoping (output-credentials: true / output-env-credentials: false) exists on every converted MAIN live job that configures AWS credentials.
+# 11: credential output scoping (output-credentials: true / output-env-credentials: false) exists on every Phase 7 live job that configures AWS credentials.
 for job_id in ("monitor_ownership_preflight", "validate_monitor_ready", "end_to_end_deployment_acceptance"):
-    cred_step = next((s for s in jobs[job_id]["steps"] if s.get("uses") == "aws-actions/configure-aws-credentials@v4"), None)
+    cred_step = next((s for s in phase7_jobs[job_id]["steps"] if s.get("uses") == "aws-actions/configure-aws-credentials@v4"), None)
     check(f"11: {job_id}'"'"'s Configure AWS credentials step exists with id: aws_build_credentials", cred_step is not None and cred_step.get("id") == "aws_build_credentials")
     cred_with = (cred_step or {}).get("with") or {}
     check(f"11: {job_id}'"'"'s Configure AWS credentials step sets output-credentials: true / output-env-credentials: false", cred_with.get("output-credentials") is True and cred_with.get("output-env-credentials") is False)
 
 # replication_monitor_acceptance: the Configure AWS credentials step is CONDITIONALLY gated on has_pipelines == "true" -- credential-output-scoped too.
-rma_cred_step = next((s for s in jobs["replication_monitor_acceptance"]["steps"] if s.get("uses") == "aws-actions/configure-aws-credentials@v4"), None)
+rma_cred_step = next((s for s in phase7_jobs["replication_monitor_acceptance"]["steps"] if s.get("uses") == "aws-actions/configure-aws-credentials@v4"), None)
 check("11: replication_monitor_acceptance'"'"'s Configure AWS credentials step exists with id: aws_build_credentials", rma_cred_step is not None and rma_cred_step.get("id") == "aws_build_credentials")
 rma_cred_with = (rma_cred_step or {}).get("with") or {}
 check("11: replication_monitor_acceptance'"'"'s Configure AWS credentials step sets output-credentials: true / output-env-credentials: false", rma_cred_with.get("output-credentials") is True and rma_cred_with.get("output-env-credentials") is False)
 
-# 12: zero-pipeline replication-monitor acceptance has no AWS credential/EKS path -- the credential step and the acceptance step are BOTH gated on steps.pipelines.outputs.has_pipelines == "true", so a zero-pipeline run configures no credential and calls no kubectl.
+# 12/R: zero-pipeline replication-monitor acceptance has no AWS credential/EKS path -- the credential step and the acceptance step are BOTH gated on steps.pipelines.outputs.has_pipelines == "true", so a zero-pipeline run configures no credential and calls no kubectl.
 check("12a: replication_monitor_acceptance'"'"'s Configure AWS credentials step is gated on has_pipelines == \x27true\x27", str(rma_cred_step.get("if", "")).strip() == "steps.pipelines.outputs.has_pipelines == \x27true\x27")
-rma_accept_step = next((s for s in jobs["replication_monitor_acceptance"]["steps"] if s.get("name") == "Verify replication process acceptance via the monitor API (read-only)"), None)
+rma_accept_step = next((s for s in phase7_jobs["replication_monitor_acceptance"]["steps"] if s.get("name") == "Verify replication process acceptance via the monitor API (read-only)"), None)
 check("12b: the replication process-acceptance step is gated on has_pipelines == \x27true\x27", rma_accept_step is not None and str(rma_accept_step.get("if", "")).strip() == "steps.pipelines.outputs.has_pipelines == \x27true\x27")
-rma_pipelines_step = next((s for s in jobs["replication_monitor_acceptance"]["steps"] if s.get("id") == "pipelines"), None)
+rma_pipelines_step = next((s for s in phase7_jobs["replication_monitor_acceptance"]["steps"] if s.get("id") == "pipelines"), None)
 check("12c: the pipeline-discovery step itself precedes AWS credential configuration and never references AWS/kubectl", rma_pipelines_step is not None and "aws " not in rma_pipelines_step.get("run", "") and "kubectl" not in rma_pipelines_step.get("run", ""))
 
-# Behavioral confirmation: actually invoke phase7_monitor.py replication-monitor-acceptance with zero enabled pipelines and prove zero aws/kubectl subprocess calls occur (never a reimplemented copy -- imports and exercises the REAL committed module).
+# Behavioral confirmation: actually invoke phase7_monitor.py replication-monitor-acceptance with zero enabled pipelines and prove zero aws/kubectl subprocess calls occur (never a reimplemented copy -- imports and exercises the REAL committed module, unaffected by which workflow file now calls it).
 BEHAVIORAL_ZERO_PIPELINE_CHECK = subprocess.run(
     [sys.executable, "-c", """
 import importlib.util
@@ -19071,15 +19266,34 @@ print("OK")
 """],
     capture_output=True, text=True, timeout=20,
 )
-check("12d: phase7_monitor.py replication-monitor-acceptance with zero pipelines makes zero aws/kubectl calls (real module, mocked subprocess boundary only)", BEHAVIORAL_ZERO_PIPELINE_CHECK.returncode == 0 and "OK" in BEHAVIORAL_ZERO_PIPELINE_CHECK.stdout)
+check("12d/R: phase7_monitor.py replication-monitor-acceptance with zero pipelines makes zero aws/kubectl calls (real module, mocked subprocess boundary only)", BEHAVIORAL_ZERO_PIPELINE_CHECK.returncode == 0 and "OK" in BEHAVIORAL_ZERO_PIPELINE_CHECK.stdout)
 
-# 13: final validation Python receives explicit plain values, not untrusted implicit truthiness -- phase7_final.py is never aware of GitHub `${{ ... }}` expression syntax; every needs.*.result/needs.*.outputs.* expression is resolved into a plain env: value BEFORE phase7_final.py ever runs.
+# L: Phase 7B (monitor_sync_once) outputs propagate naturally through the reusable-call job, and Phase 7D (validate_monitor_ready) consumes them -- never re-derived independently.
+vmr_strict_step = next((s for s in phase7_jobs["validate_monitor_ready"]["steps"] if s.get("id") == "strict"), None)
+vmr_strict_env = (vmr_strict_step or {}).get("env") or {}
+check("L: validate_monitor_ready consumes needs.monitor_sync_once.outputs.image_repository", "needs.monitor_sync_once.outputs.image_repository" in str(vmr_strict_env.get("GG_EXPECTED_IMAGE_REPOSITORY", "")))
+check("L: validate_monitor_ready consumes needs.monitor_sync_once.outputs.image_tag", "needs.monitor_sync_once.outputs.image_tag" in str(vmr_strict_env.get("GG_EXPECTED_IMAGE_TAG", "")))
+check("L: validate_monitor_ready consumes needs.monitor_sync_once.outputs.chart_version", "needs.monitor_sync_once.outputs.chart_version" in str(vmr_strict_env.get("GG_EXPECTED_CHART_VERSION", "")))
+
+# M: Phase 7D (validate_monitor_ready) ready_pod_name remains the SOLE pod source for both Phase 7E and Phase 7F -- never a second, independent pod-selection.
+rma_accept_env = (rma_accept_step or {}).get("env") or {}
+check("M: replication_monitor_acceptance consumes needs.validate_monitor_ready.outputs.ready_pod_name as its sole pod source", "needs.validate_monitor_ready.outputs.ready_pod_name" in str(rma_accept_env.get("POD_NAME", "")))
+e2e_poll_step = next((s for s in phase7_jobs["end_to_end_deployment_acceptance"]["steps"] if s.get("name") == "Poll monitor-to-runtime end-to-end acceptance until convergence (bounded)"), None)
+e2e_poll_env = (e2e_poll_step or {}).get("env") or {}
+check("M: end_to_end_deployment_acceptance consumes needs.validate_monitor_ready.outputs.ready_pod_name as its sole pod source", "needs.validate_monitor_ready.outputs.ready_pod_name" in str(e2e_poll_env.get("POD_NAME", "")))
+
+# 13/O: final validation Python receives explicit plain values, not untrusted implicit truthiness -- phase7_final.py is never aware of GitHub `${{ ... }}` expression syntax. 12 EXTERNAL RESULT_*/mode values cross via inputs.*; 6 INTERNAL Phase-7 RESULT_* values remain needs.<job>.result -- never aggregated, never reinterpreted.
 with open("automation/phases/phase7/phase7_final.py") as f:
     phase7_final_source_final_check = f.read()
 check("13a: phase7_final.py never references GitHub Actions ${{ ... }} expression syntax", "${{" not in phase7_final_source_final_check)
 final_val_gate_env = (final_val_gate_step or {}).get("env") or {}
-env_key_to_output_name = {"EFFECTIVE_DEPLOY": "effective_deploy", "HAS_ACTIVE_DEPLOYMENTS": "has_active_deployments", "HAS_CHANGES": "has_changes", "HAS_DELETIONS": "has_deletions"}
-check("13b: final_validation'"'"'s gate step maps EFFECTIVE_DEPLOY/HAS_ACTIVE_DEPLOYMENTS/HAS_CHANGES/HAS_DELETIONS from needs.validate_model.outputs.* into plain env: values", all(f"needs.validate_model.outputs.{output_name}" in str(final_val_gate_env.get(env_key, "")) for env_key, output_name in env_key_to_output_name.items()))
+mode_key_to_input_name = {"EFFECTIVE_DEPLOY": "effective_deploy", "HAS_ACTIVE_DEPLOYMENTS": "has_active_deployments", "HAS_CHANGES": "has_changes", "HAS_DELETIONS": "has_deletions"}
+check("13b/O: final_validation'"'"'s gate step maps EFFECTIVE_DEPLOY/HAS_ACTIVE_DEPLOYMENTS/HAS_CHANGES/HAS_DELETIONS from inputs.* into plain env: values", all(f"inputs.{input_name}" in str(final_val_gate_env.get(env_key, "")) for env_key, input_name in mode_key_to_input_name.items()))
+for job_id in EXTERNAL_RESULT_JOBS:
+    check(f"O: final_validation'"'"'s gate step maps RESULT_{job_id} from inputs.result_{job_id} (external)", f"inputs.result_{job_id}" in str(final_val_gate_env.get(f"RESULT_{job_id}", "")))
+for job_id in ("monitor_ownership_preflight", "monitor_sync_once", "monitor_dry_run_validation", "validate_monitor_ready", "replication_monitor_acceptance", "end_to_end_deployment_acceptance"):
+    check(f"O: final_validation'"'"'s gate step maps RESULT_{job_id} from needs.{job_id}.result (internal Phase 7 reference)", f"needs.{job_id}.result" in str(final_val_gate_env.get(f"RESULT_{job_id}", "")))
+check("O: final_validation'"'"'s gate step maps exactly 18 RESULT_* values, no more, no fewer", len([k for k in final_val_gate_env if k.startswith("RESULT_")]) == 18)
 check("13c: phase7_final.py reads these exclusively via os.environ (never a hardcoded default masking an unset/untrusted value)", "os.environ" in phase7_final_source_final_check and "env.get(f\"RESULT_" in phase7_final_source_final_check)
 
 for label, ok in results:
@@ -19096,7 +19310,7 @@ for label, ok in results:
     fail "Phase 7 conversion: dedicated regression assertions failed:"$'\n'"${PHASE7_CONVERSION_CHECK}"
   fi
 else
-  skip "Phase 7 conversion: dedicated regression assertions -- python3/PyYAML/${EKS_APP_WORKFLOW} unavailable"
+  skip "Phase 7 conversion: dedicated regression assertions -- python3/PyYAML/${EKS_APP_WORKFLOW}/${PHASE7_WORKFLOW} unavailable"
 fi
 
 echo "--- VDR compile-fix: GitHub expression-preprocessing placeholder guard (no literal ellipsis-only \${{ ... }} expression in any workflow YAML) ---"
