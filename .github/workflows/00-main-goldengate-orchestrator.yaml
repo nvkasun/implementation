@@ -250,157 +250,30 @@ jobs:
       terraform_governance_override_reason: ${{ needs.validate_model.outputs.terraform_governance_override_reason }}
 
   # Phase 3A | Argo CD Ownership Preflight -- Phase 3 Python Conversion: automation/phases/phase3/argocd_state.py remains a pure OWNERSHIP-SAFETY classifier -- ABSENT (nothing installed yet) and OWNED (whatever currently exists is safely this repository's own Argo CD release, regardless of individual readiness/desired-state drift) both converge via reconcile_argocd below; BROKEN (foreign/ambiguous ownership, or a genuine inspection failure) fails closed right here, never auto-repaired. A DEPLOY is an end-to-end convergence operation, not merely a bootstrap: reconcile_argocd's own idempotent Helm reconciliation is what actually applies the current committed desired state -- this preflight job never needs to learn a new resource name merely to keep permitting that reconciliation. This job never mutates the cluster -- automation/phases/phase3/phase3_argocd.py ownership-preflight only runs the read-only classifier.
-  argocd_preflight:
-    name: "Phase 3A | Argo CD Ownership Preflight"
+  phase_3_argocd:
+    name: Phase 3 | Argo CD
 
+    # Phase 3 grouping: this single caller replaces the four Phase 3A-3D jobs previously defined directly in MAIN -- their exact behavior now lives, unchanged, inside .github/workflows/30-phase-argocd-orchestration.yaml (the same high-level reusable-workflow presentation pattern MAIN's own Phase 7 grouping already uses). Preserves the exact former Phase-3-entry gate: Phase 3 must never run during validate-only mode or after a Terraform failure merely to obtain a green parent -- if Phase 3 was previously skipped, the grouped parent is skipped too.
     needs:
       - validate_model
       - terraform_sync_once
     if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.terraform_sync_once.result == 'success' }}
 
-    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
-
-    outputs:
-      state: ${{ steps.ownership_preflight.outputs.state }}
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Load canonical environment configuration
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 automation/goldengate-environment.py --environment "${{ needs.validate_model.outputs.selected_environment }}" validate
-          python3 automation/goldengate-environment.py --environment "${{ needs.validate_model.outputs.selected_environment }}" github-env >> "$GITHUB_ENV"
-
-      - name: Ensure kubectl prerequisite
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 automation/phases/phase3/phase3_argocd.py ensure-kubectl
-
-      # AWS Credential Isolation: output-credentials/output-env-credentials scoping matches the established Phase 1/2 pattern -- these temporary credentials are consumed ONLY by the ownership-preflight step below (via steps.aws_build_credentials.outputs.* in that step's own env:), never job-wide, never written to $GITHUB_ENV, never written to any state file.
-      - name: Configure AWS credentials
-        id: aws_build_credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-region: ${{ env.AWS_REGION }}
-          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
-          output-credentials: true
-          output-env-credentials: false
-
-      - name: Classify Argo CD ownership safety
-        id: ownership_preflight
-        shell: bash
-        env:
-          AWS_ACCESS_KEY_ID: ${{ steps.aws_build_credentials.outputs.aws-access-key-id }}
-          AWS_SECRET_ACCESS_KEY: ${{ steps.aws_build_credentials.outputs.aws-secret-access-key }}
-          AWS_SESSION_TOKEN: ${{ steps.aws_build_credentials.outputs.aws-session-token }}
-        run: |
-          set -euo pipefail
-
-          python3 automation/phases/phase3/phase3_argocd.py ownership-preflight --environment "${{ needs.validate_model.outputs.selected_environment }}"
-
-  # Phase 3B | Authorize Argo CD Deployment -- Live Deployment Approval Topology Fix: the single, GoldenGate-owned protected-environment approval covering the entire end-to-end Deploy DAG that follows -- Argo CD reconciliation, Platform, Observability, the runtime matrix, and the Monitor all run afterward as MAIN-orchestrated jobs/reusable workflow calls (orchestrated_by_main: true) and never create an approval of their own. Deliberately placed after terraform_sync_once and argocd_preflight so a human is never asked to authorize a deployment that Terraform already failed or that Argo CD classified as unsafe (argocd_preflight's own ownership_preflight step already fails closed on BROKEN before this job can even be reached). Performs no AWS/Terraform/Kubernetes/Helm/ECR/Argo CD mutation of its own -- ubuntu-latest is sufficient because this job exists purely as a GitHub deployment-protection point, distinct from the corporate Terraform governance approval owned entirely by 10-sub-iam-secrets.yaml.
-  goldengate_deploy_authorization:
-    name: "Phase 3B | Authorize Argo CD Deployment"
-
-    needs:
-      - validate_model
-      - terraform_sync_once
-      - argocd_preflight
-    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.terraform_sync_once.result == 'success' && needs.argocd_preflight.result == 'success' }}
-
-    runs-on: ubuntu-latest
-    environment: ${{ needs.validate_model.outputs.selected_environment }}
-
-    steps:
-      - name: Record GoldenGate application deployment authorization
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "GoldenGate application deployment authorized for environment ${{ needs.validate_model.outputs.selected_environment }}."
-
-  # Phase 3C | Reconcile Argo CD Desired State -- Phase 3 Python Conversion: MAIN ALWAYS reconciles Argo CD on Deploy whenever the preflight ownership classifier confirms it is safe to do so -- ABSENT (nothing installed yet) or OWNED (whatever currently exists is safely this repository's own release, no matter what individual desired-state drift exists). A DEPLOY is an end-to-end convergence operation, not only a bootstrap operation: 20-sub-argocd.yaml's own idempotent `helm upgrade --install` is what actually applies the current committed desired state, so this job never skips reconciliation merely because the preflight classifier found the installation superficially healthy-looking. argocd_preflight's own ownership_preflight step already fails the job closed on BROKEN, so needs.argocd_preflight.result == 'success' alone already guarantees a non-BROKEN state; the explicit state check below is still listed for defense in depth and readability. Runs the reusable specialist workflow synchronously as part of this DAG -- never an asynchronous CLI/API dispatch or repository_dispatch trigger. 20-sub-argocd.yaml itself remains fully usable standalone; no standalone specialist workflow is a required recovery/upgrade path -- MAIN never tells an operator to run it separately to apply ordinary desired state. Live Deployment Approval Topology Fix: now also requires goldengate_deploy_authorization's own success -- the single GoldenGate application approval above -- so this reusable call runs already-authorized (orchestrated_by_main: true) and never opens a second approval of its own.
-  reconcile_argocd:
-    name: "Phase 3C | Reconcile Argo CD Desired State"
-
-    needs:
-      - validate_model
-      - argocd_preflight
-      - goldengate_deploy_authorization
-    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.argocd_preflight.result == 'success' && needs.goldengate_deploy_authorization.result == 'success' && (needs.argocd_preflight.outputs.state == 'ABSENT' || needs.argocd_preflight.outputs.state == 'OWNED') }}
-
-    uses: ./.github/workflows/20-sub-argocd.yaml
+    uses: ./.github/workflows/30-phase-argocd-orchestration.yaml
     secrets: inherit
     with:
-      environment: ${{ needs.validate_model.outputs.selected_environment }}
-      orchestrated_by_main: true
+      selected_environment: ${{ needs.validate_model.outputs.selected_environment }}
+      effective_deploy: ${{ needs.validate_model.outputs.effective_deploy }}
+      result_terraform_sync_once: ${{ needs.terraform_sync_once.result }}
 
-  # Phase 3D | Validate Argo CD Healthy -- always() overrides GitHub's default implicit skip-on-skipped-dependency behavior -- the explicit result checks below are what actually keep this fail-closed, exactly like validate_shared_secrets_once's established always()-plus-explicit-result pattern elsewhere in this workflow. reconcile_argocd is applicable for every state argocd_preflight can succeed with (ABSENT/OWNED), so a plain needs.reconcile_argocd.result == 'success' is sufficient -- no per-state branching is needed here. Phase 3 Python Conversion: the strict exact-desired-state check happens entirely inside automation/phases/phase3/phase3_argocd.py strict-acceptance (which itself calls automation/phases/phase3/argocd_acceptance.py), independent of which preflight state was observed -- this is an independent, fresh re-inspection: reconcile_argocd's own success is never itself treated as proof that Argo CD is healthy.
-  validate_argocd_ready:
-    name: "Phase 3D | Validate Argo CD Healthy"
-
-    needs:
-      - validate_model
-      - argocd_preflight
-      - reconcile_argocd
-    if: ${{ always() && needs.validate_model.outputs.effective_deploy == 'true' && needs.argocd_preflight.result == 'success' && needs.reconcile_argocd.result == 'success' }}
-
-    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Load canonical environment configuration
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 automation/goldengate-environment.py --environment "${{ needs.validate_model.outputs.selected_environment }}" validate
-          python3 automation/goldengate-environment.py --environment "${{ needs.validate_model.outputs.selected_environment }}" github-env >> "$GITHUB_ENV"
-
-      - name: Ensure kubectl prerequisite
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 automation/phases/phase3/phase3_argocd.py ensure-kubectl
-
-      # AWS Credential Isolation: output-credentials/output-env-credentials scoping matches the established Phase 1/2 pattern -- these temporary credentials are consumed ONLY by the strict-acceptance step below, never job-wide, never written to $GITHUB_ENV, never written to any state file.
-      - name: Configure AWS credentials
-        id: aws_build_credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-region: ${{ env.AWS_REGION }}
-          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
-          output-credentials: true
-          output-env-credentials: false
-
-      - name: Re-classify and require Argo CD to be exactly HEALTHY
-        shell: bash
-        env:
-          AWS_ACCESS_KEY_ID: ${{ steps.aws_build_credentials.outputs.aws-access-key-id }}
-          AWS_SECRET_ACCESS_KEY: ${{ steps.aws_build_credentials.outputs.aws-secret-access-key }}
-          AWS_SESSION_TOKEN: ${{ steps.aws_build_credentials.outputs.aws-session-token }}
-        run: |
-          set -euo pipefail
-
-          python3 automation/phases/phase3/phase3_argocd.py strict-acceptance --environment "${{ needs.validate_model.outputs.selected_environment }}"
-
-  # Phase 4A | GoldenGate Platform Ownership Preflight -- Generic MAIN Desired-State Convergence Fix: automation/phases/phase4/platform_state.py is a pure OWNERSHIP-SAFETY classifier -- ABSENT and OWNED both reconcile via platform_sync_once below on EVERY Deploy, regardless of individual desired-state drift (a Fluent Bit image change, an RBAC change, a future new resource, a namespace metadata change); BROKEN (foreign/ambiguous ownership, a Terminating namespace, or a genuine inspection failure) fails closed right here, never auto-repaired. Runs independently of observability_preflight (siblings after Argo, not a chain) so both branches can execute in parallel. This job never mutates the cluster -- it only runs automation/phases/phase4/platform_state.py, which itself issues read-only `kubectl get` calls.
   platform_preflight:
     name: "Phase 4A | GoldenGate Platform Ownership Preflight"
 
+    # Phase 3 grouping: validate_argocd_ready now lives inside the grouped Phase 3 wrapper -- both the wrapper's own overall result AND its exact internal Phase 3D result are required (never conflated), since the two are not guaranteed to mean the same thing in every failure/skip scenario.
     needs:
       - validate_model
-      - validate_argocd_ready
-    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.validate_argocd_ready.result == 'success' }}
+      - phase_3_argocd
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.phase_3_argocd.result == 'success' && needs.phase_3_argocd.outputs.validate_argocd_ready_result == 'success' }}
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -452,10 +325,11 @@ jobs:
   observability_preflight:
     name: "Phase 4D | Observability Ownership Preflight"
 
+    # Phase 3 grouping: validate_argocd_ready now lives inside the grouped Phase 3 wrapper -- both the wrapper's own overall result AND its exact internal Phase 3D result are required (never conflated), since the two are not guaranteed to mean the same thing in every failure/skip scenario.
     needs:
       - validate_model
-      - validate_argocd_ready
-    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.validate_argocd_ready.result == 'success' }}
+      - phase_3_argocd
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && needs.phase_3_argocd.result == 'success' && needs.phase_3_argocd.outputs.validate_argocd_ready_result == 'success' }}
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -929,11 +803,11 @@ jobs:
   delete_removed_argocd_applications:
     name: "Phase 5C | Remove Undesired GoldenGate Runtimes"
 
-    # GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 1: this job performs the SAME class of consequential Kubernetes mutation (kubectl patch/delete application) as build_publish_and_deploy, but previously ran the instant Phase 1's deployment-detection step alone succeeded with a non-empty deletion_matrix -- entirely bypassing MAIN's single GoldenGate application deployment authorization (goldengate_deploy_authorization) and the post-reconciliation Argo CD HEALTHY acceptance gate (validate_argocd_ready). Runtime removal must not mutate Kubernetes until the normal MAIN deployment authorization has succeeded, exactly like every other mutating job in this DAG. Requiring validate_argocd_ready's own success here proves that chain WITHOUT duplicating it or opening a second environment: approval: validate_argocd_ready is itself transitively downstream of terraform_sync_once -> argocd_preflight -> goldengate_deploy_authorization -> reconcile_argocd -> validate_argocd_ready, and its own if: already fails closed (non-success) whenever any link in that chain failed, was cancelled, or never ran. Deliberately does NOT depend on Phase 4 (platform/observability/shared secrets) -- runtime removal is not serialized behind them.
+    # GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 1: this job performs the SAME class of consequential Kubernetes mutation (kubectl patch/delete application) as build_publish_and_deploy, but previously ran the instant Phase 1's deployment-detection step alone succeeded with a non-empty deletion_matrix -- entirely bypassing MAIN's single GoldenGate application deployment authorization (goldengate_deploy_authorization) and the post-reconciliation Argo CD HEALTHY acceptance gate (validate_argocd_ready). Runtime removal must not mutate Kubernetes until the normal MAIN deployment authorization has succeeded, exactly like every other mutating job in this DAG. Phase 3 grouping: that entire authorization chain (terraform_sync_once -> argocd_preflight -> goldengate_deploy_authorization -> reconcile_argocd -> validate_argocd_ready) now lives behind the Phase 3 reusable-workflow boundary -- proving it here requires BOTH the wrapper's own overall result AND its exact internal Phase 3D result explicitly, never a bare needs: reference alone, since the two are not guaranteed to mean the same thing in every failure/skip scenario. Deliberately does NOT depend on Phase 4 (platform/observability/shared secrets) -- runtime removal is not serialized behind them.
     needs:
       - validate_model
-      - validate_argocd_ready
-    if: success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.validate_model.outputs.effective_deploy == 'true' && needs.validate_model.outputs.has_deletions == 'true' && needs.validate_argocd_ready.result == 'success'
+      - phase_3_argocd
+    if: success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.validate_model.outputs.effective_deploy == 'true' && needs.validate_model.outputs.has_deletions == 'true' && needs.phase_3_argocd.result == 'success' && needs.phase_3_argocd.outputs.validate_argocd_ready_result == 'success'
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -1213,12 +1087,12 @@ jobs:
   phase_7_monitor_final_acceptance:
     name: Phase 7 | GoldenGate Monitor & Final Acceptance
 
-    # Phase 7 grouping: this single caller replaces the seven Phase 7A-7G jobs previously defined directly in MAIN -- their exact behavior now lives, unchanged, inside .github/workflows/70-phase-monitor-final-acceptance.yaml (the same high-level reusable-workflow presentation pattern Phase 2 already uses for terraform_sync_once -> 10-sub-iam-secrets.yaml). This job must depend on every external job whose .result the grouped Phase 7 workflow or its final_validation step needs -- a reusable workflow's own needs.* context sees only jobs INSIDE that workflow, so every one of these twelve results is passed through explicitly as a workflow_call input below, never re-derived.
+    # Phase 7 grouping: this single caller replaces the seven Phase 7A-7G jobs previously defined directly in MAIN -- their exact behavior now lives, unchanged, inside .github/workflows/70-phase-monitor-final-acceptance.yaml (the same high-level reusable-workflow presentation pattern Phase 2 already uses for terraform_sync_once -> 10-sub-iam-secrets.yaml). This job must depend on every external job whose .result the grouped Phase 7 workflow or its final_validation step needs -- a reusable workflow's own needs.* context sees only jobs INSIDE that workflow, so every one of these twelve results is passed through explicitly as a workflow_call input below, never re-derived. Phase 3 grouping: validate_argocd_ready is replaced by phase_3_argocd here -- one dependency swapped, never dropped; the Phase 7 wrapper's own result_validate_argocd_ready input name is unchanged (see the with: block below for the exact fallback expression that preserves the old semantic result).
     needs:
       - validate_model
       - terraform_sync_once
       - validate_shared_secrets_once
-      - validate_argocd_ready
+      - phase_3_argocd
       - validate_platform_ready
       - validate_observability_ready
       - runtime_ownership_preflight
@@ -1240,7 +1114,8 @@ jobs:
       result_validate_model: ${{ needs.validate_model.result }}
       result_terraform_sync_once: ${{ needs.terraform_sync_once.result }}
       result_validate_shared_secrets_once: ${{ needs.validate_shared_secrets_once.result }}
-      result_validate_argocd_ready: ${{ needs.validate_argocd_ready.result }}
+      # Phase 3 grouping: prefer the exact internal Phase 3D result when the Phase 3 wrapper actually ran it; fall back to the wrapper's own overall result (e.g. "skipped") only when validate_argocd_ready_result itself is absent (the whole Phase 3 wrapper was legitimately skipped, so it never produced this output at all). Never pass only needs.phase_3_argocd.result -- an earlier internal Phase 3 failure can fail the wrapper while validate_argocd_ready itself is genuinely SKIPPED, and phase7_final.py intentionally distinguishes those states.
+      result_validate_argocd_ready: ${{ needs.phase_3_argocd.outputs.validate_argocd_ready_result || needs.phase_3_argocd.result }}
       result_validate_platform_ready: ${{ needs.validate_platform_ready.result }}
       result_validate_observability_ready: ${{ needs.validate_observability_ready.result }}
       result_runtime_ownership_preflight: ${{ needs.runtime_ownership_preflight.result }}

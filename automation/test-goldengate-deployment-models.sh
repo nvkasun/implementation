@@ -21,6 +21,7 @@ METRICS_CONFIG_WORKFLOW=".github/workflows/80-ops-monitor-metrics-config.yaml"
 METRICS_CONFIG_HELPER_SCRIPT="automation/goldengate-metrics-config.py"
 EKS_APP_WORKFLOW=".github/workflows/00-main-goldengate-orchestrator.yaml"
 PHASE7_WORKFLOW=".github/workflows/70-phase-monitor-final-acceptance.yaml"
+PHASE3_WORKFLOW=".github/workflows/30-phase-argocd-orchestration.yaml"
 PLATFORM_WORKFLOW=".github/workflows/30-sub-platform.yaml"
 DETECT_SCRIPT="automation/phases/phase1/detect-goldengate-deployments.sh"
 PHASE1_TOOL="automation/phases/phase1/phase1_readiness.py"
@@ -4782,8 +4783,8 @@ MONITOR_PY="monitoring/monitor/monitor.py"
 MONITOR_WORKFLOW=".github/workflows/50-sub-monitor.yaml"
 
 if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  # This narrow Phase 6C1B guard originally proved that phase's changes were made in place to the (then single) monitor workflow file, never by adding a parallel duplicate. The workflow naming/operator UX standardization task later legitimately renamed all nine workflow files in place -- each rename is a content move, not a new parallel workflow -- so the nine canonical renamed filenames are expected/allowed here; any other new workflow file remains exactly the violation this check was written to catch. The rename itself is now guarded by the dedicated, more precise "Workflow naming / operator UX standardization" section later in this suite (exactly-one-MAIN, exact SUB/OPS sets, zero stale old-filename references) -- the same supersession pattern already used for cloudwatch-observability-artifact-sync.yaml's release from check 15's byte-diff guard by Phase 11. Phase 7 grouping: 70-phase-monitor-final-acceptance.yaml is the one exact, approved new workflow file this task adds (an internal MAIN-orchestration wrapper, never a new operator-facing SUB/OPS workflow) -- explicitly whitelisted here, never a relaxation to allow arbitrary new files.
-  NEW_WORKFLOW_FILES="$(git status --porcelain=v1 -- .github/workflows/ 2>/dev/null | grep -E '^\?\?' | grep -vE '^\?\? \.github/workflows/(00-main-goldengate-orchestrator|10-sub-iam-secrets|20-sub-argocd|30-sub-platform|40-sub-observability|50-sub-monitor|70-phase-monitor-final-acceptance|80-ops-monitor-metrics-config|90-ops-observability-artifact-sync|91-ops-ecr-image-sync)\.yaml$' || true)"
+  # This narrow Phase 6C1B guard originally proved that phase's changes were made in place to the (then single) monitor workflow file, never by adding a parallel duplicate. The workflow naming/operator UX standardization task later legitimately renamed all nine workflow files in place -- each rename is a content move, not a new parallel workflow -- so the nine canonical renamed filenames are expected/allowed here; any other new workflow file remains exactly the violation this check was written to catch. The rename itself is now guarded by the dedicated, more precise "Workflow naming / operator UX standardization" section later in this suite (exactly-one-MAIN, exact SUB/OPS sets, zero stale old-filename references) -- the same supersession pattern already used for cloudwatch-observability-artifact-sync.yaml's release from check 15's byte-diff guard by Phase 11. Phase 7 grouping: 70-phase-monitor-final-acceptance.yaml is one exact, approved new workflow file this task adds (an internal MAIN-orchestration wrapper, never a new operator-facing SUB/OPS workflow) -- explicitly whitelisted here, never a relaxation to allow arbitrary new files. Phase 3 grouping: 30-phase-argocd-orchestration.yaml is the second such approved internal wrapper, added the same way and whitelisted the same way.
+  NEW_WORKFLOW_FILES="$(git status --porcelain=v1 -- .github/workflows/ 2>/dev/null | grep -E '^\?\?' | grep -vE '^\?\? \.github/workflows/(00-main-goldengate-orchestrator|10-sub-iam-secrets|20-sub-argocd|30-sub-platform|30-phase-argocd-orchestration|40-sub-observability|50-sub-monitor|70-phase-monitor-final-acceptance|80-ops-monitor-metrics-config|90-ops-observability-artifact-sync|91-ops-ecr-image-sync)\.yaml$' || true)"
   if [ -z "$NEW_WORKFLOW_FILES" ]; then
     pass "25: no unexpected new workflow file introduced beyond the sanctioned workflow-naming rename"
   else
@@ -5550,11 +5551,15 @@ with open(sys.argv[1]) as f:
 # Phase 7 grouping: monitor_sync_once/final_validation now live inside the grouped Phase 7 reusable workflow, never directly in MAIN -- both documents are loaded so this chain-connectivity proof spans the reusable-workflow boundary explicitly, rather than silently stopping at it.
 with open(".github/workflows/70-phase-monitor-final-acceptance.yaml") as f:
     phase7_doc = yaml.safe_load(f)
+# Phase 3 grouping: argocd_preflight/validate_argocd_ready now live inside the grouped Phase 3 reusable workflow, never directly in MAIN -- both documents are loaded so this chain-connectivity proof spans that reusable-workflow boundary explicitly too.
+with open(".github/workflows/30-phase-argocd-orchestration.yaml") as f:
+    phase3_doc = yaml.safe_load(f)
 
 jobs = doc["jobs"]
 phase7_jobs = phase7_doc["jobs"]
+phase3_jobs = phase3_doc["jobs"]
 expected_order = [
-    "validate_model", "terraform_sync_once", "platform_sync_once", "validate_shared_secrets_once",
+    "validate_model", "terraform_sync_once", "phase_3_argocd", "platform_sync_once", "validate_shared_secrets_once",
     "build_publish_and_deploy", "phase_7_monitor_final_acceptance",
 ]
 for name in expected_order:
@@ -5564,6 +5569,10 @@ for name in expected_order:
 for name in ("monitor_sync_once", "final_validation"):
     if name not in phase7_jobs:
         print(f"FAIL: missing required internal Phase 7 job {name!r}")
+        sys.exit(1)
+for name in ("argocd_preflight", "validate_argocd_ready"):
+    if name not in phase3_jobs:
+        print(f"FAIL: missing required internal Phase 3 job {name!r}")
         sys.exit(1)
 
 if "bootstrap_admin_secrets" in jobs:
@@ -5578,24 +5587,31 @@ def phase7_needs_of(name):
     n = phase7_jobs[name].get("needs") or []
     return [n] if isinstance(n, str) else n
 
+def phase3_needs_of(name):
+    n = phase3_jobs[name].get("needs") or []
+    return [n] if isinstance(n, str) else n
+
 if "validate_model" not in needs_of("terraform_sync_once"):
     print("FAIL: terraform_sync_once does not need validate_model")
     sys.exit(1)
-# Phase B1 inserts the Argo CD prerequisite state machine between Terraform and the platform chart: terraform_sync_once -> argocd_preflight -> (bootstrap_argocd) -> validate_argocd_ready. Phase B2 then inserts the same ownership-aware state machine, independently in parallel, for GoldenGate Platform and Observability: validate_argocd_ready -> (platform_preflight | observability_preflight) -> (platform_sync_once | observability_sync_once) -> (validate_platform_ready | validate_observability_ready) -> validate_shared_secrets_once. platform_sync_once/validate_shared_secrets_once no longer depend on validate_argocd_ready/platform_sync_once directly (only transitively) -- guarded in full by the dedicated "Phase B1"/"Phase B2" DAG checks elsewhere in this suite.
-if "terraform_sync_once" not in needs_of("argocd_preflight"):
-    print("FAIL: argocd_preflight does not need terraform_sync_once")
+# Phase B1 inserts the Argo CD prerequisite state machine between Terraform and the platform chart: terraform_sync_once -> argocd_preflight -> (bootstrap_argocd) -> validate_argocd_ready. Phase B2 then inserts the same ownership-aware state machine, independently in parallel, for GoldenGate Platform and Observability: validate_argocd_ready -> (platform_preflight | observability_preflight) -> (platform_sync_once | observability_sync_once) -> (validate_platform_ready | validate_observability_ready) -> validate_shared_secrets_once. platform_sync_once/validate_shared_secrets_once no longer depend on validate_argocd_ready/platform_sync_once directly (only transitively) -- guarded in full by the dedicated "Phase B1"/"Phase B2" DAG checks elsewhere in this suite. Phase 3 grouping: terraform_sync_once -> phase_3_argocd (MAIN) -> {argocd_preflight -> ... -> validate_argocd_ready} (internal) -> phase_3_argocd's own outputs.validate_argocd_ready_result -> (platform_preflight | observability_preflight) (MAIN).
+if "terraform_sync_once" not in needs_of("phase_3_argocd"):
+    print("FAIL: phase_3_argocd does not need terraform_sync_once")
     sys.exit(1)
-if "argocd_preflight" not in needs_of("validate_argocd_ready"):
+if phase3_jobs["argocd_preflight"].get("needs"):
+    print("FAIL: argocd_preflight has a needs: of its own (terraform_sync_once's result should cross the reusable-workflow boundary as inputs.result_terraform_sync_once, never a needs: reference)")
+    sys.exit(1)
+if "argocd_preflight" not in phase3_needs_of("validate_argocd_ready"):
     print("FAIL: validate_argocd_ready does not need argocd_preflight")
     sys.exit(1)
-if "validate_argocd_ready" not in needs_of("platform_preflight"):
-    print("FAIL: platform_preflight does not need validate_argocd_ready")
+if "phase_3_argocd" not in needs_of("platform_preflight"):
+    print("FAIL: platform_preflight does not need phase_3_argocd")
     sys.exit(1)
 if "platform_preflight" not in needs_of("platform_sync_once"):
     print("FAIL: platform_sync_once does not need platform_preflight")
     sys.exit(1)
-if "validate_argocd_ready" not in needs_of("observability_preflight"):
-    print("FAIL: observability_preflight does not need validate_argocd_ready")
+if "phase_3_argocd" not in needs_of("observability_preflight"):
+    print("FAIL: observability_preflight does not need phase_3_argocd")
     sys.exit(1)
 if "observability_preflight" not in needs_of("observability_sync_once"):
     print("FAIL: observability_sync_once does not need observability_preflight")
@@ -7216,19 +7232,22 @@ echo "--- Final workflow correction, Issue 1: fail-closed job graph for a real d
 
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   set +e
-  FAIL_CLOSED_SIM_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+  FAIL_CLOSED_SIM_OUT="$(python3 - "$EKS_APP_WORKFLOW" "$PHASE3_WORKFLOW" <<'PYEOF'
 import re
 import sys
 import yaml
 
 with open(sys.argv[1]) as f:
     doc = yaml.safe_load(f)
+with open(sys.argv[2]) as f:
+    phase3_doc = yaml.safe_load(f)
 
 jobs = doc["jobs"]
+phase3_jobs = phase3_doc["jobs"]
 
 
-def _extract_if(job_name):
-    raw = jobs[job_name].get("if", "true")
+def _extract_if(source_jobs, job_name):
+    raw = source_jobs[job_name].get("if", "true")
     raw = str(raw).strip()
     if raw.startswith("${{") and raw.endswith("}}"):
         raw = raw[3:-2].strip()
@@ -7236,11 +7255,12 @@ def _extract_if(job_name):
 
 
 class _Parser:
-    """A tiny, bespoke evaluator for exactly the GHA expression subset this workflow uses: && || == != () quoted strings, needs.<job>.result, needs.<job>.outputs.<name>, always(). Not a general GHA expression engine -- just enough to genuinely simulate these four job conditions against a fabricated needs context, rather than trusting a text/regex match against the workflow author's own wording."""
+    """A tiny, bespoke evaluator for exactly the GHA expression subset this workflow uses: && || == != () quoted strings, needs.<job>.result, needs.<job>.outputs.<name>, inputs.<name> (Phase 3 grouping: the internal Phase 3 wrapper's own if: expressions reference inputs.* instead of needs.validate_model.outputs.*/needs.terraform_sync_once.result), always(). Not a general GHA expression engine -- just enough to genuinely simulate these job conditions against a fabricated needs context, rather than trusting a text/regex match against the workflow author's own wording."""
 
-    def __init__(self, expr, needs):
+    def __init__(self, expr, needs, inputs=None):
         self.expr = expr
         self.needs = needs
+        self.inputs = inputs or {}
         self.pos = 0
 
     def _skip_ws(self):
@@ -7313,22 +7333,69 @@ class _Parser:
         if m:
             self.pos += m.end()
             return self.needs.get(m.group(1), {}).get("outputs", {}).get(m.group(2), "")
+        m = re.match(r"inputs\.([A-Za-z0-9_]+)", self.expr[self.pos:])
+        if m:
+            self.pos += m.end()
+            return self.inputs.get(m.group(1), "")
         raise ValueError(f"cannot parse value at: {self.expr[self.pos:self.pos + 40]!r}")
 
 
-def eval_gha_bool(expr, needs):
-    return bool(_Parser(expr, needs).parse())
+def eval_gha_bool(expr, needs, inputs=None):
+    return bool(_Parser(expr, needs, inputs).parse())
 
 
-# Phase B1 inserts the Argo CD prerequisite state machine between Terraform and the platform chart; Live Argo Recovery Fix reworked it into automatic desired-state reconciliation (reconcile_argocd, formerly bootstrap_argocd); Phase B2 inserts the same ownership-aware state machine, independently in parallel, for the GoldenGate Platform and Observability application prerequisites between validate_argocd_ready and validate_shared_secrets_once; Phase B3A inserts the read-only runtime ownership-safety preflight between validate_shared_secrets_once and build_publish_and_deploy; Live Deployment Approval Topology Fix inserts goldengate_deploy_authorization (the single GoldenGate application deployment approval) between argocd_preflight and reconcile_argocd -- all simulated in real DAG order like every other job here, off the same real if: expressions.
-JOB_ORDER = ["terraform_sync_once", "argocd_preflight", "goldengate_deploy_authorization", "reconcile_argocd", "validate_argocd_ready", "platform_preflight", "observability_preflight", "platform_sync_once", "observability_sync_once", "validate_platform_ready", "validate_observability_ready", "validate_shared_secrets_once", "runtime_ownership_preflight", "build_publish_and_deploy"]
-IF_EXPRS = {job: _extract_if(job) for job in JOB_ORDER}
+# Phase 3 grouping: the internal Phase 3 DAG (argocd_preflight -> goldengate_deploy_authorization -> reconcile_argocd -> validate_argocd_ready) now lives inside 30-phase-argocd-orchestration.yaml, addressed only via workflow_call inputs.*, never needs.validate_model.outputs.*/needs.terraform_sync_once.result directly.
+PHASE3_JOB_ORDER = ["argocd_preflight", "goldengate_deploy_authorization", "reconcile_argocd", "validate_argocd_ready"]
+PHASE3_IF_EXPRS = {job: _extract_if(phase3_jobs, job) for job in PHASE3_JOB_ORDER}
 
 
-def simulate(initial, outcome_when_run, outputs_when_run=None):
+def simulate_phase3(inputs, outcome_when_run, outputs_when_run=None):
+    """Simulates the grouped Phase 3 wrapper's own internal DAG given the translated workflow_call inputs, then folds the internal per-job results into (wrapper_result, wrapper_outputs, internal_results) exactly the way GitHub Actions itself computes a reusable workflow's own overall result and its named jobs.<id>.result-backed outputs: skipped if no internal job ran, the worst of failure/cancelled if any internal job that ran reported one, success otherwise."""
+    outputs_when_run = outputs_when_run or {}
+    internal = {}
+    for job in PHASE3_JOB_ORDER:
+        would_run = eval_gha_bool(PHASE3_IF_EXPRS[job], internal, inputs)
+        if would_run:
+            internal[job] = {"result": outcome_when_run.get(job, "success"), "outputs": outputs_when_run.get(job, {})}
+        else:
+            internal[job] = {"result": "skipped", "outputs": {}}
+    ran_results = [internal[j]["result"] for j in PHASE3_JOB_ORDER if internal[j]["result"] != "skipped"]
+    if not ran_results:
+        wrapper_result = "skipped"
+    elif "failure" in ran_results:
+        wrapper_result = "failure"
+    elif "cancelled" in ran_results:
+        wrapper_result = "cancelled"
+    else:
+        wrapper_result = "success"
+    wrapper_outputs = {"validate_argocd_ready_result": internal["validate_argocd_ready"]["result"]}
+    return wrapper_result, wrapper_outputs, internal
+
+
+# Phase B1 inserts the Argo CD prerequisite state machine between Terraform and the platform chart; Live Argo Recovery Fix reworked it into automatic desired-state reconciliation (reconcile_argocd, formerly bootstrap_argocd); Phase B2 inserts the same ownership-aware state machine, independently in parallel, for the GoldenGate Platform and Observability application prerequisites between validate_argocd_ready and validate_shared_secrets_once; Phase B3A inserts the read-only runtime ownership-safety preflight between validate_shared_secrets_once and build_publish_and_deploy; Live Deployment Approval Topology Fix inserts goldengate_deploy_authorization (the single GoldenGate application deployment approval) between argocd_preflight and reconcile_argocd -- all simulated in real DAG order like every other job here, off the same real if: expressions. Phase 3 grouping: argocd_preflight/goldengate_deploy_authorization/reconcile_argocd/validate_argocd_ready now live inside the grouped Phase 3 wrapper -- represented here by the single phase_3_argocd step, whose own result/outputs are computed by simulate_phase3() above and folded back into this outer simulation.
+JOB_ORDER = ["terraform_sync_once", "phase_3_argocd", "platform_preflight", "observability_preflight", "platform_sync_once", "observability_sync_once", "validate_platform_ready", "validate_observability_ready", "validate_shared_secrets_once", "runtime_ownership_preflight", "build_publish_and_deploy"]
+IF_EXPRS = {job: _extract_if(jobs, job) for job in JOB_ORDER}
+
+
+def simulate(initial, outcome_when_run, outputs_when_run=None, phase3_outcome_when_run=None, phase3_outputs_when_run=None):
     results = dict(initial)
     outputs_when_run = outputs_when_run or {}
     for job in JOB_ORDER:
+        if job == "phase_3_argocd":
+            would_run = eval_gha_bool(IF_EXPRS[job], results)
+            if would_run:
+                phase3_inputs = {
+                    "selected_environment": results["validate_model"]["outputs"].get("selected_environment", "dev"),
+                    "effective_deploy": results["validate_model"]["outputs"].get("effective_deploy", "false"),
+                    "result_terraform_sync_once": results["terraform_sync_once"]["result"],
+                }
+                wrapper_result, wrapper_outputs, internal = simulate_phase3(phase3_inputs, phase3_outcome_when_run or {}, phase3_outputs_when_run)
+                results[job] = {"result": wrapper_result, "outputs": wrapper_outputs}
+            else:
+                internal = {j: {"result": "skipped", "outputs": {}} for j in PHASE3_JOB_ORDER}
+                results[job] = {"result": "skipped", "outputs": {}}
+            results["_phase3_internal"] = internal
+            continue
         would_run = eval_gha_bool(IF_EXPRS[job], results)
         if would_run:
             results[job] = {"result": outcome_when_run.get(job, "success"), "outputs": outputs_when_run.get(job, {})}
@@ -7339,7 +7406,7 @@ def simulate(initial, outcome_when_run, outputs_when_run=None):
 
 def base_context(effective_deploy, has_changes="true"):
     return {
-        "validate_model": {"result": "success", "outputs": {"effective_deploy": effective_deploy, "has_changes": has_changes}},
+        "validate_model": {"result": "success", "outputs": {"effective_deploy": effective_deploy, "has_changes": has_changes, "selected_environment": "dev"}},
     }
 
 
@@ -7373,11 +7440,11 @@ check("2: platform_sync_once must be skipped", r["platform_sync_once"]["result"]
 check("2: validate_shared_secrets_once must be skipped", r["validate_shared_secrets_once"]["result"] == "skipped")
 check("2: build_publish_and_deploy must be skipped", r["build_publish_and_deploy"]["result"] == "skipped")
 
-# 3: deploy=true + Argo CD already OWNED (Generic MAIN Desired-State Convergence Fix: reconcile_argocd now ALWAYS RUNS on OWNED -- a DEPLOY converges the live release to current desired state, it never merely skips because a classifier proved ownership) + platform ABSENT+reconcile failure (observability stays OWNED, isolating the failure to platform) -> runtime build/deploy cannot execute.
+# 3: deploy=true + Argo CD already OWNED (Generic MAIN Desired-State Convergence Fix: reconcile_argocd now ALWAYS RUNS on OWNED -- a DEPLOY converges the live release to current desired state, it never merely skips because a classifier proved ownership) + platform ABSENT+reconcile failure (observability stays OWNED, isolating the failure to platform) -> runtime build/deploy cannot execute. Phase 3 grouping: argocd_preflight/reconcile_argocd/validate_argocd_ready are checked via r["_phase3_internal"].
 ctx = base_context("true")
-r = simulate(ctx, {"platform_sync_once": "failure"}, {"argocd_preflight": {"state": "OWNED"}, "platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "OWNED"}})
-check("3: reconcile_argocd must RUN (and succeed) even when Argo CD is already OWNED", r["reconcile_argocd"]["result"] == "success")
-check("3: validate_argocd_ready must succeed on the already-OWNED-and-reconciled path", r["validate_argocd_ready"]["result"] == "success")
+r = simulate(ctx, {"platform_sync_once": "failure"}, {"platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "OWNED"}}, phase3_outputs_when_run={"argocd_preflight": {"state": "OWNED"}})
+check("3: reconcile_argocd must RUN (and succeed) even when Argo CD is already OWNED", r["_phase3_internal"]["reconcile_argocd"]["result"] == "success")
+check("3: validate_argocd_ready must succeed on the already-OWNED-and-reconciled path", r["_phase3_internal"]["validate_argocd_ready"]["result"] == "success")
 check("3: platform_sync_once must report failure", r["platform_sync_once"]["result"] == "failure")
 check("3: validate_platform_ready must be skipped after a failed platform_sync_once", r["validate_platform_ready"]["result"] == "skipped")
 check("3: observability_sync_once must still RUN (and succeed) even though observability is already OWNED -- MAIN never skips a safe owned reconciliation, isolating platform's failure", r["observability_sync_once"]["result"] == "success")
@@ -7387,9 +7454,9 @@ check("3: build_publish_and_deploy must be skipped", r["build_publish_and_deploy
 
 # 4: deploy=true + all mutation prerequisites already OWNED (Argo CD/platform/observability all already-existing, safely-owned installations, runtime ownership OWNED) -> Generic MAIN Desired-State Convergence Fix requirement 4/5: MAIN STILL invokes reconcile_argocd/30-sub-platform/40-sub-observability on every Deploy, never predicting from a healthy-looking preflight that reconciliation is unnecessary -> runtime deployment may still execute.
 ctx = base_context("true")
-r = simulate(ctx, {}, {"argocd_preflight": {"state": "OWNED"}, "platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}, "runtime_ownership_preflight": {"state": "OWNED"}})
+r = simulate(ctx, {}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}, "runtime_ownership_preflight": {"state": "OWNED"}}, phase3_outputs_when_run={"argocd_preflight": {"state": "OWNED"}})
 check("4: terraform_sync_once must succeed", r["terraform_sync_once"]["result"] == "success")
-check("4: validate_argocd_ready must succeed", r["validate_argocd_ready"]["result"] == "success")
+check("4: validate_argocd_ready must succeed", r["_phase3_internal"]["validate_argocd_ready"]["result"] == "success")
 check("4: platform_sync_once MUST run (and succeed) even though platform is already OWNED/healthy-looking -- MAIN never skips specialist reconciliation on a Deploy (required test 4)", r["platform_sync_once"]["result"] == "success")
 check("4: observability_sync_once MUST run (and succeed) even though observability is already OWNED/healthy-looking -- MAIN never skips specialist reconciliation on a Deploy (required test 5)", r["observability_sync_once"]["result"] == "success")
 check("4: validate_platform_ready must succeed", r["validate_platform_ready"]["result"] == "success")
@@ -7400,48 +7467,50 @@ check("4: build_publish_and_deploy must be eligible to run", r["build_publish_an
 
 # 7: deploy=true + Argo CD ABSENT + reconcile_argocd succeeds -> validate_argocd_ready converges to success -> platform/observability preflights run; platform ABSENT+reconcile success, observability already OWNED (and therefore also reconciled, not skipped).
 ctx = base_context("true")
-r = simulate(ctx, {}, {"argocd_preflight": {"state": "ABSENT"}, "platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "OWNED"}})
-check("7: reconcile_argocd must run when Argo CD is ABSENT", r["reconcile_argocd"]["result"] == "success")
-check("7: validate_argocd_ready must succeed after a successful reconciliation", r["validate_argocd_ready"]["result"] == "success")
+r = simulate(ctx, {}, {"platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "OWNED"}}, phase3_outputs_when_run={"argocd_preflight": {"state": "ABSENT"}})
+check("7: reconcile_argocd must run when Argo CD is ABSENT", r["_phase3_internal"]["reconcile_argocd"]["result"] == "success")
+check("7: validate_argocd_ready must succeed after a successful reconciliation", r["_phase3_internal"]["validate_argocd_ready"]["result"] == "success")
 check("7: platform_sync_once must be eligible to run after reconciliation (platform is ABSENT)", r["platform_sync_once"]["result"] == "success")
 check("7: validate_platform_ready must succeed after a successful reconciliation", r["validate_platform_ready"]["result"] == "success")
 check("7: validate_shared_secrets_once must succeed end-to-end", r["validate_shared_secrets_once"]["result"] == "success")
 
 # 8: deploy=true + Argo CD ABSENT + reconcile_argocd FAILS -> validate_argocd_ready must never run -> platform must never run. (Live Argo Recovery Fix required scenario 7: "reconcile failure => downstream platform orchestration cannot continue".)
 ctx = base_context("true")
-r = simulate(ctx, {"reconcile_argocd": "failure"}, {"argocd_preflight": {"state": "ABSENT"}})
-check("8: reconcile_argocd must report failure", r["reconcile_argocd"]["result"] == "failure")
-check("8: validate_argocd_ready must be skipped after a failed reconciliation", r["validate_argocd_ready"]["result"] == "skipped")
+r = simulate(ctx, {}, phase3_outcome_when_run={"reconcile_argocd": "failure"}, phase3_outputs_when_run={"argocd_preflight": {"state": "ABSENT"}})
+check("8: reconcile_argocd must report failure", r["_phase3_internal"]["reconcile_argocd"]["result"] == "failure")
+check("8: validate_argocd_ready must be skipped after a failed reconciliation", r["_phase3_internal"]["validate_argocd_ready"]["result"] == "skipped")
 check("8: platform_sync_once must be skipped after a failed reconciliation", r["platform_sync_once"]["result"] == "skipped")
 
 # 9: deploy=true + Argo CD BROKEN (argocd_preflight itself fails closed) -> reconcile_argocd must never even be entered, and platform must never run. (Live Argo Recovery Fix required scenario 4: "deploy + BROKEN => reconciliation must NOT execute and the path fails closed".)
 ctx = base_context("true")
-r = simulate(ctx, {"argocd_preflight": "failure"})
-check("9: argocd_preflight must report failure on BROKEN", r["argocd_preflight"]["result"] == "failure")
-check("9: reconcile_argocd must never run on BROKEN", r["reconcile_argocd"]["result"] == "skipped")
-check("9: validate_argocd_ready must be skipped on BROKEN", r["validate_argocd_ready"]["result"] == "skipped")
+r = simulate(ctx, {}, phase3_outcome_when_run={"argocd_preflight": "failure"})
+check("9: argocd_preflight must report failure on BROKEN", r["_phase3_internal"]["argocd_preflight"]["result"] == "failure")
+check("9: reconcile_argocd must never run on BROKEN", r["_phase3_internal"]["reconcile_argocd"]["result"] == "skipped")
+check("9: validate_argocd_ready must be skipped on BROKEN", r["_phase3_internal"]["validate_argocd_ready"]["result"] == "skipped")
 check("9: platform_sync_once must be skipped on BROKEN", r["platform_sync_once"]["result"] == "skipped")
 
 # 10: deploy=true + Argo CD OWNED (an already-existing, safely-owned release -- e.g. only the generated repository Secrets or a newly-enabled Ingress not yet rendered) -> reconcile_argocd must run (Generic MAIN Desired-State Convergence Fix required scenario 2), converge to success, and platform/observability/runtime deployment must remain eligible -- this is the exact case that used to dead-end MAIN at BROKEN under the retired RECONCILABLE/HEALTHY split.
 ctx = base_context("true")
-r = simulate(ctx, {}, {"argocd_preflight": {"state": "OWNED"}, "platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}, "runtime_ownership_preflight": {"state": "OWNED"}})
-check("10: reconcile_argocd must run (and succeed) when Argo CD is OWNED", r["reconcile_argocd"]["result"] == "success")
-check("10: validate_argocd_ready must succeed after a successful OWNED reconciliation", r["validate_argocd_ready"]["result"] == "success")
+r = simulate(ctx, {}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}, "runtime_ownership_preflight": {"state": "OWNED"}}, phase3_outputs_when_run={"argocd_preflight": {"state": "OWNED"}})
+check("10: reconcile_argocd must run (and succeed) when Argo CD is OWNED", r["_phase3_internal"]["reconcile_argocd"]["result"] == "success")
+check("10: validate_argocd_ready must succeed after a successful OWNED reconciliation", r["_phase3_internal"]["validate_argocd_ready"]["result"] == "success")
 check("10: platform_preflight must remain eligible (never dead-ends behind an OWNED Argo CD)", r["platform_preflight"]["result"] == "success")
 check("10: build_publish_and_deploy must remain eligible to run", r["build_publish_and_deploy"]["result"] == "success")
 
 # 11: action=validate (effective_deploy=false) with an otherwise-owned/absent Argo CD state -> argocd_preflight/reconcile_argocd must both be skipped -- Validate mode never mutates Argo CD regardless of classified state. (Generic MAIN Desired-State Convergence Fix required scenario 5.) validate_model itself still succeeds as a whole in Validate mode (its own Deploy-only steps are skipped internally via their own step-level if:, never surfaced as a separate job result).
 ctx = base_context("false")
-r = simulate(ctx, {}, {"argocd_preflight": {"state": "OWNED"}})
-check("11: argocd_preflight must be skipped in Validate mode regardless of live state", r["argocd_preflight"]["result"] == "skipped")
-check("11: reconcile_argocd must never run in Validate mode (no mutating Argo CD reconciliation)", r["reconcile_argocd"]["result"] == "skipped")
-check("11: validate_argocd_ready must be skipped in Validate mode", r["validate_argocd_ready"]["result"] == "skipped")
+r = simulate(ctx, {}, phase3_outputs_when_run={"argocd_preflight": {"state": "OWNED"}})
+check("11: phase_3_argocd (the grouped wrapper) must itself be skipped in Validate mode", r["phase_3_argocd"]["result"] == "skipped")
+check("11: argocd_preflight must be skipped in Validate mode regardless of live state", r["_phase3_internal"]["argocd_preflight"]["result"] == "skipped")
+check("11: reconcile_argocd must never run in Validate mode (no mutating Argo CD reconciliation)", r["_phase3_internal"]["reconcile_argocd"]["result"] == "skipped")
+check("11: validate_argocd_ready must be skipped in Validate mode", r["_phase3_internal"]["validate_argocd_ready"]["result"] == "skipped")
 
-# 12: deploy=true + reconcile_argocd itself reports success, but validate_argocd_ready's own post-reconcile re-classification still fails (the cluster converges to something other than exactly HEALTHY -- modeled here as validate_argocd_ready's own result, since that job's internal acceptance script is what enforces the strict != "HEALTHY" fail-closed check) -> platform must never run. (Generic MAIN Desired-State Convergence Fix required scenario 8: "reconcile success + final acceptance not HEALTHY => downstream platform orchestration cannot continue".)
+# 12: deploy=true + reconcile_argocd itself reports success, but validate_argocd_ready's own post-reconcile re-classification still fails (the cluster converges to something other than exactly HEALTHY -- modeled here as validate_argocd_ready's own result, since that job's internal acceptance script is what enforces the strict != "HEALTHY" fail-closed check) -> platform must never run. (Generic MAIN Desired-State Convergence Fix required scenario 8: "reconcile success + final acceptance not HEALTHY => downstream platform orchestration cannot continue".) Phase 3 grouping: the wrapper's own overall phase_3_argocd result must also report failure (never success) here, since the two are not guaranteed to mean the same thing in every scenario but a genuine internal validate_argocd_ready failure IS one that must fail the whole wrapper -- proven explicitly, never merely assumed.
 ctx = base_context("true")
-r = simulate(ctx, {"validate_argocd_ready": "failure"}, {"argocd_preflight": {"state": "OWNED"}})
-check("12: reconcile_argocd itself must still report success (the SUB workflow completed)", r["reconcile_argocd"]["result"] == "success")
-check("12: validate_argocd_ready must report failure when final re-classification is not exactly HEALTHY", r["validate_argocd_ready"]["result"] == "failure")
+r = simulate(ctx, {}, phase3_outcome_when_run={"validate_argocd_ready": "failure"}, phase3_outputs_when_run={"argocd_preflight": {"state": "OWNED"}})
+check("12: reconcile_argocd itself must still report success (the SUB workflow completed)", r["_phase3_internal"]["reconcile_argocd"]["result"] == "success")
+check("12: validate_argocd_ready must report failure when final re-classification is not exactly HEALTHY", r["_phase3_internal"]["validate_argocd_ready"]["result"] == "failure")
+check("12: phase_3_argocd (the grouped wrapper) must itself report failure, never success, when its internal validate_argocd_ready failed", r["phase_3_argocd"]["result"] == "failure")
 check("12: platform_preflight must never run when validate_argocd_ready failed post-reconcile", r["platform_preflight"]["result"] == "skipped")
 check("12: build_publish_and_deploy must never run when validate_argocd_ready failed post-reconcile", r["build_publish_and_deploy"]["result"] == "skipped")
 
@@ -9072,8 +9141,8 @@ echo "--- Live Deploy Fix 4: repository-wide GG_SELECTED_ENVIRONMENT scope harde
 if [ -f "$ENV_SCOPE_CHECKER" ]; then
   ENV_SCOPE_REAL_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 "$ENV_SCOPE_CHECKER" 2>&1)"
   ENV_SCOPE_REAL_STATUS=$?
-  if [ "$ENV_SCOPE_REAL_STATUS" -eq 0 ] && grep -q "^Workflows inspected: 10$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^Jobs with GG_SELECTED_ENVIRONMENT run: references: 12$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^Unsafe jobs: 0$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^OK: zero unsafe GG_SELECTED_ENVIRONMENT references" <<< "$ENV_SCOPE_REAL_OUT"; then
-    pass "Live Deploy Fix 4: 1-5,14: ${ENV_SCOPE_CHECKER} reports 10 workflows inspected (Phase 7 grouping added 70-phase-monitor-final-acceptance.yaml), 12 jobs referencing GG_SELECTED_ENVIRONMENT (unchanged -- moving jobs to another file does not change the count), and ZERO unsafe jobs against the real current repository"
+  if [ "$ENV_SCOPE_REAL_STATUS" -eq 0 ] && grep -q "^Workflows inspected: 11$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^Jobs with GG_SELECTED_ENVIRONMENT run: references: 12$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^Unsafe jobs: 0$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^OK: zero unsafe GG_SELECTED_ENVIRONMENT references" <<< "$ENV_SCOPE_REAL_OUT"; then
+    pass "Live Deploy Fix 4: 1-5,14: ${ENV_SCOPE_CHECKER} reports 11 workflows inspected (Phase 7 grouping added 70-phase-monitor-final-acceptance.yaml, Phase 3 grouping added 30-phase-argocd-orchestration.yaml), 12 jobs referencing GG_SELECTED_ENVIRONMENT (unchanged -- moving jobs to another file does not change the count), and ZERO unsafe jobs against the real current repository"
   else
     fail "Live Deploy Fix 4: 1-5,14: ${ENV_SCOPE_CHECKER} did not report the expected zero-violation inventory against the real repository (status=${ENV_SCOPE_REAL_STATUS}):"$'\n'"${ENV_SCOPE_REAL_OUT}"
   fi
@@ -10044,8 +10113,8 @@ fi
 echo ""
 echo "--- Phase B1 / Live Argo Recovery Fix: Argo CD prerequisite classification + automatic desired-state reconciliation ---"
 
-# Structural proof, read directly from the real committed YAML of both workflows (never a reimplementation): 20-sub-argocd.yaml is reusable via workflow_call, and the main orchestrator's argocd_preflight/reconcile_argocd/validate_argocd_ready/platform_sync_once DAG has exactly the wiring the ownership-safety ABSENT/OWNED/BROKEN contract requires -- reconcile_argocd ALWAYS runs on the two safe preflight states (ABSENT/OWNED), never on BROKEN, and platform is never reachable without a strictly-validated-healthy Argo CD.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$ARGOCD_DEPLOY_WORKFLOW" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+# Structural proof, read directly from the real committed YAML of all three workflows (never a reimplementation): 20-sub-argocd.yaml is reusable via workflow_call, and the grouped Phase 3 wrapper's argocd_preflight/reconcile_argocd/validate_argocd_ready DAG (plus MAIN's platform_preflight, downstream of the grouped Phase 3 caller) has exactly the wiring the ownership-safety ABSENT/OWNED/BROKEN contract requires -- reconcile_argocd ALWAYS runs on the two safe preflight states (ABSENT/OWNED), never on BROKEN, and platform is never reachable without a strictly-validated-healthy Argo CD. Phase 3 grouping: argocd_preflight/reconcile_argocd/validate_argocd_ready now live inside 30-phase-argocd-orchestration.yaml, never directly in MAIN.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$ARGOCD_DEPLOY_WORKFLOW" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE3_WORKFLOW" ]; then
   PHASE_B1_CHECK="$(python3 -c '
 import yaml
 
@@ -10053,6 +10122,8 @@ with open("'"$ARGOCD_DEPLOY_WORKFLOW"'") as f:
     argocd_doc = yaml.safe_load(f)
 with open("'"$EKS_APP_WORKFLOW"'") as f:
     main_doc = yaml.safe_load(f)
+with open("'"$PHASE3_WORKFLOW"'") as f:
+    phase3_doc = yaml.safe_load(f)
 
 results = []
 
@@ -10064,17 +10135,18 @@ env_input = wc_inputs.get("environment", {})
 results.append(("2: workflow_call accepts a required, canonical string environment input", env_input.get("required") is True and env_input.get("type") == "string"))
 
 jobs = main_doc["jobs"]
-results.append(("3: main workflow defines argocd_preflight", "argocd_preflight" in jobs))
+phase3_jobs = phase3_doc["jobs"]
+results.append(("3: the grouped Phase 3 wrapper defines argocd_preflight (MAIN itself defines only the grouped caller job phase_3_argocd)", "argocd_preflight" in phase3_jobs and "argocd_preflight" not in jobs))
 
-preflight = jobs.get("argocd_preflight", {})
+preflight = phase3_jobs.get("argocd_preflight", {})
 preflight_needs = preflight.get("needs") or []
 preflight_if = preflight.get("if", "")
-results.append(("4a: argocd_preflight runs after terraform_sync_once", "terraform_sync_once" in preflight_needs))
-results.append(("4b: argocd_preflight is real-deploy-only (effective_deploy == \x27true\x27)", "effective_deploy" in preflight_if and "== \x27true\x27" in preflight_if))
+results.append(("4a: argocd_preflight has no needs: of its own -- terraform_sync_once'"'"'s result crosses the reusable-workflow boundary as inputs.result_terraform_sync_once", preflight_needs == []))
+results.append(("4b: argocd_preflight is real-deploy-only (inputs.effective_deploy == \x27true\x27)", "inputs.effective_deploy" in preflight_if and "== \x27true\x27" in preflight_if))
 results.append(("4c: argocd_preflight exposes a state job output", "state" in (preflight.get("outputs") or {})))
 
-results.append(("5: main workflow defines a conditional reusable reconcile_argocd (no dangling reference to the retired bootstrap_argocd name)", "reconcile_argocd" in jobs and "bootstrap_argocd" not in jobs))
-reconcile = jobs.get("reconcile_argocd", {})
+results.append(("5: the grouped Phase 3 wrapper defines a conditional reusable reconcile_argocd (no dangling reference to the retired bootstrap_argocd name)", "reconcile_argocd" in phase3_jobs and "bootstrap_argocd" not in phase3_jobs))
+reconcile = phase3_jobs.get("reconcile_argocd", {})
 results.append(("6: reconcile_argocd calls the reusable 20-sub-argocd.yaml (never gh workflow run)", reconcile.get("uses") == "./.github/workflows/20-sub-argocd.yaml"))
 reconcile_if = reconcile.get("if", "")
 results.append(("7a: reconcile_argocd runs when argocd_preflight.outputs.state == ABSENT", "argocd_preflight.outputs.state == \x27ABSENT\x27" in reconcile_if))
@@ -10083,8 +10155,8 @@ results.append(("7c: the reconcile_argocd condition no longer references the ret
 results.append(("8: reconcile_argocd condition contains no BROKEN branch -- BROKEN can never enter reconciliation", "BROKEN" not in reconcile_if))
 results.append(("8b: reconcile_argocd requires argocd_preflight to have actually succeeded first", "needs.argocd_preflight.result == \x27success\x27" in reconcile_if))
 
-results.append(("9: main workflow defines a final validate_argocd_ready convergence job", "validate_argocd_ready" in jobs))
-ready = jobs.get("validate_argocd_ready", {})
+results.append(("9: the grouped Phase 3 wrapper defines a final validate_argocd_ready convergence job", "validate_argocd_ready" in phase3_jobs))
+ready = phase3_jobs.get("validate_argocd_ready", {})
 ready_needs = ready.get("needs") or []
 ready_if = ready.get("if", "")
 results.append(("10a: validate_argocd_ready needs reconcile_argocd (no dangling reference to the retired bootstrap_argocd name)", "reconcile_argocd" in ready_needs and "bootstrap_argocd" not in ready_needs))
@@ -10092,19 +10164,19 @@ results.append(("10b: validate_argocd_ready is a single unified condition requir
 results.append(("10c: validate_argocd_ready no longer contains a state-specific HEALTHY/ABSENT branch condition (the dual-path logic was retired along with bootstrap_argocd)", "argocd_preflight.outputs.state ==" not in ready_if))
 results.append(("10d: validate_argocd_ready uses always() (defense in depth, matching this workflow'"'"'s established convergence-job pattern)", "always()" in ready_if))
 
-# Phase B2 inserts platform_preflight between validate_argocd_ready and platform_sync_once (see the dedicated "Phase B2" DAG checks elsewhere in this suite) -- platform_sync_once now depends on validate_argocd_ready transitively via platform_preflight, never as a direct edge.
+# Phase B2 inserts platform_preflight between validate_argocd_ready and platform_sync_once (see the dedicated "Phase B2" DAG checks elsewhere in this suite) -- platform_sync_once now depends on validate_argocd_ready transitively via platform_preflight, never as a direct edge. Phase 3 grouping: validate_argocd_ready now lives behind the grouped Phase 3 wrapper, so platform_preflight depends on phase_3_argocd and must check BOTH its own overall result and its exact internal validate_argocd_ready_result output.
 platform_preflight_b1 = jobs.get("platform_preflight", {})
 platform = jobs.get("platform_sync_once", {})
 platform_needs = platform.get("needs") or []
 platform_if = platform.get("if", "")
-results.append(("11: platform_preflight (and therefore platform_sync_once transitively) needs validate_argocd_ready", "validate_argocd_ready" in (platform_preflight_b1.get("needs") or [])))
-results.append(("12: platform_preflight requires validate_argocd_ready to have actually succeeded (BROKEN/failed Argo can never reach platform)", "needs.validate_argocd_ready.result == \x27success\x27" in platform_preflight_b1.get("if", "")))
+results.append(("11: platform_preflight (and therefore platform_sync_once transitively) needs phase_3_argocd", "phase_3_argocd" in (platform_preflight_b1.get("needs") or [])))
+results.append(("12: platform_preflight requires phase_3_argocd.result == success AND its exact internal validate_argocd_ready_result output == success (BROKEN/failed Argo can never reach platform)", "needs.phase_3_argocd.result == \x27success\x27" in platform_preflight_b1.get("if", "") and "needs.phase_3_argocd.outputs.validate_argocd_ready_result == \x27success\x27" in platform_preflight_b1.get("if", "")))
 results.append(("12b: platform_sync_once needs platform_preflight (the actual direct edge in the new B2 chain)", "platform_preflight" in platform_needs))
 
-results.append(("13: reconcile_argocd still gates on effective_deploy == \x27true\x27 -- Validate mode can never mutate Argo CD", "effective_deploy == \x27true\x27" in reconcile_if))
+results.append(("13: reconcile_argocd still gates on inputs.effective_deploy == \x27true\x27 -- Validate mode can never mutate Argo CD", "inputs.effective_deploy == \x27true\x27" in reconcile_if))
 
-whole_text = str(main_doc) + str(argocd_doc)
-results.append(("14: no gh workflow run / workflow_dispatch-API / repository_dispatch trigger exists anywhere in either workflow", "gh workflow run" not in whole_text and "repository_dispatch" not in whole_text and "/dispatches" not in whole_text))
+whole_text = str(main_doc) + str(argocd_doc) + str(phase3_doc)
+results.append(("14: no gh workflow run / workflow_dispatch-API / repository_dispatch trigger exists anywhere in any of the three workflows", "gh workflow run" not in whole_text and "repository_dispatch" not in whole_text and "/dispatches" not in whole_text))
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
@@ -10175,12 +10247,12 @@ fi
 echo ""
 echo "--- Phase 3 Python Conversion: Argo CD preflight/acceptance delegate to phase3_argocd.py, never reimplement inline ---"
 
-# H/I/M/N (translated for the Phase 3 Python Conversion): argocd_preflight's "Classify Argo CD ownership safety" step and validate_argocd_ready's "Re-classify and require Argo CD to be exactly HEALTHY" step must delegate to phase3_argocd.py's own ownership-preflight/strict-acceptance subcommands rather than reimplementing classify/parse logic inline in bash -- the actual ABSENT/OWNED/BROKEN and HEALTHY/BROKEN state-handling behavioral proof (equivalent to the former H/I/M/N scenarios) now lives in automation/phases/phase3/tests/test_phase3_argocd.py's TestOwnershipPreflight/TestStrictAcceptance classes, run as part of this same regression below -- never re-derived a second time here against extracted bash text.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ]; then
+# H/I/M/N (translated for the Phase 3 Python Conversion): argocd_preflight's "Classify Argo CD ownership safety" step and validate_argocd_ready's "Re-classify and require Argo CD to be exactly HEALTHY" step must delegate to phase3_argocd.py's own ownership-preflight/strict-acceptance subcommands rather than reimplementing classify/parse logic inline in bash -- the actual ABSENT/OWNED/BROKEN and HEALTHY/BROKEN state-handling behavioral proof (equivalent to the former H/I/M/N scenarios) now lives in automation/phases/phase3/tests/test_phase3_argocd.py's TestOwnershipPreflight/TestStrictAcceptance classes, run as part of this same regression below -- never re-derived a second time here against extracted bash text. Phase 3 grouping: both jobs now live inside the grouped 30-phase-argocd-orchestration.yaml wrapper, never directly in MAIN.
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$PHASE3_WORKFLOW" ]; then
   PHASE3_DELEGATION_CHECK="$(python3 -c '
 import yaml
 
-with open("'"$EKS_APP_WORKFLOW"'") as f:
+with open("'"$PHASE3_WORKFLOW"'") as f:
     doc = yaml.safe_load(f)
 
 preflight_step = next((s for s in doc["jobs"]["argocd_preflight"]["steps"] if s.get("name") == "Classify Argo CD ownership safety"), None)
@@ -10205,7 +10277,7 @@ for label, ok in results:
     esac
   done <<< "$PHASE3_DELEGATION_CHECK"
 else
-  skip "Phase 3 Python Conversion: preflight/acceptance delegation check -- python3/PyYAML unavailable or main workflow missing"
+  skip "Phase 3 Python Conversion: preflight/acceptance delegation check -- python3/PyYAML unavailable or the grouped Phase 3 wrapper workflow is missing"
 fi
 
 # K/section-9: no active workflow presents standalone specialist-workflow execution as the normal recovery path for Argo CD; MAIN is the sole operational entry point.
@@ -10223,7 +10295,7 @@ if [ -f "$APPROVAL_TOPOLOGY_CHECKER" ]; then
   APPROVAL_TOPOLOGY_REAL_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 "$APPROVAL_TOPOLOGY_CHECKER" 2>&1)"
   APPROVAL_TOPOLOGY_REAL_STATUS=$?
   if [ "$APPROVAL_TOPOLOGY_REAL_STATUS" -eq 0 ] && echo "$APPROVAL_TOPOLOGY_REAL_OUT" | grep -qE "^Unsafe jobs: 0$"; then
-    pass "Live Deployment Approval Topology Fix: ${APPROVAL_TOPOLOGY_CHECKER} reports 10 workflows inspected (Phase 7 grouping added 70-phase-monitor-final-acceptance.yaml) and ZERO unsafe jobs against the real current repository"
+    pass "Live Deployment Approval Topology Fix: ${APPROVAL_TOPOLOGY_CHECKER} reports 11 workflows inspected (Phase 7 grouping added 70-phase-monitor-final-acceptance.yaml, Phase 3 grouping added 30-phase-argocd-orchestration.yaml) and ZERO unsafe jobs against the real current repository"
   else
     fail "Live Deployment Approval Topology Fix: ${APPROVAL_TOPOLOGY_CHECKER} did not report the expected zero-violation inventory against the real repository (status=${APPROVAL_TOPOLOGY_REAL_STATUS}):"$'\n'"${APPROVAL_TOPOLOGY_REAL_OUT}"
   fi
@@ -10231,7 +10303,7 @@ else
   fail "Live Deployment Approval Topology Fix: ${APPROVAL_TOPOLOGY_CHECKER} does not exist"
 fi
 
-# The checker's own teeth are proven against fabricated scratch copies of the real workflows -- never trusted as a vacuously-green tool. Three independent, deliberately-introduced violations (a missing orchestrated_by_main passthrough, a re-added duplicate approval on 50-sub-monitor.yaml's second implementation job, and orchestrated_by_main leaking into workflow_dispatch.inputs) are each confirmed caught.
+# The checker's own teeth are proven against fabricated scratch copies of the real workflows -- never trusted as a vacuously-green tool. Three independent, deliberately-introduced violations (a missing orchestrated_by_main passthrough on the grouped Phase 3 wrapper's nested 20-sub-argocd.yaml call, a re-added duplicate approval on 50-sub-monitor.yaml's second implementation job, and orchestrated_by_main leaking into workflow_dispatch.inputs) are each confirmed caught.
 if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$APPROVAL_TOPOLOGY_CHECKER" ]; then
   set +e
   NEG_TEST_OUT="$(python3 - "$REPO_ROOT" "$APPROVAL_TOPOLOGY_CHECKER" <<'PYEOF'
@@ -10261,20 +10333,20 @@ try:
         print(f"FAIL baseline scratch copy unexpectedly failed:\n{out}")
         sys.exit(1)
 
-    # Negative test 1: strip the orchestrated_by_main passthrough from MAIN's reconcile_argocd call.
-    main_path = os.path.join(dst_wf_dir, "00-main-goldengate-orchestrator.yaml")
-    original = open(main_path).read()
+    # Negative test 1: strip the orchestrated_by_main passthrough from the grouped Phase 3 wrapper's reconcile_argocd call (Phase 3 grouping moved this call off MAIN and into 30-phase-argocd-orchestration.yaml).
+    phase3_wrapper_path = os.path.join(dst_wf_dir, "30-phase-argocd-orchestration.yaml")
+    original = open(phase3_wrapper_path).read()
     stripped = original.replace(
-        "      environment: ${{ needs.validate_model.outputs.selected_environment }}\n      orchestrated_by_main: true\n\n  # Phase 3D",
-        "      environment: ${{ needs.validate_model.outputs.selected_environment }}\n\n  # Phase 3D",
+        "      environment: ${{ inputs.selected_environment }}\n      orchestrated_by_main: true\n\n  # Phase 3D",
+        "      environment: ${{ inputs.selected_environment }}\n\n  # Phase 3D",
         1,
     )
     if stripped == original:
         print("FAIL negative test 1 substitution did not match the real file")
         sys.exit(1)
-    open(main_path, "w").write(stripped)
+    open(phase3_wrapper_path, "w").write(stripped)
     rc, out = run_checker()
-    open(main_path, "w").write(original)
+    open(phase3_wrapper_path, "w").write(original)
     if rc == 0 or "orchestrated_by_main: true" not in out:
         print(f"FAIL negative test 1 (missing orchestrated_by_main passthrough) was not caught:\n{out}")
         sys.exit(1)
@@ -10325,22 +10397,25 @@ else
   skip "Live Deployment Approval Topology Fix: ${APPROVAL_TOPOLOGY_CHECKER} negative-test proof -- python3 unavailable or checker missing"
 fi
 
-# Scenarios A/B/C/J (MAIN side) are simulated in real DAG order against the SAME goldengate_deploy_authorization-aware JOB_ORDER/simulate/base_context harness proven above for the fail-closed job graph -- this is not a fresh reimplementation, it is the identical real if: expressions, re-invoked with new fixtures.
+# Scenarios A/B/C/J (MAIN side) are simulated in real DAG order against the SAME goldengate_deploy_authorization-aware JOB_ORDER/simulate/base_context harness proven above for the fail-closed job graph -- this is not a fresh reimplementation, it is the identical real if: expressions, re-invoked with new fixtures. Phase 3 grouping: argocd_preflight/goldengate_deploy_authorization/reconcile_argocd/validate_argocd_ready now live inside 30-phase-argocd-orchestration.yaml, so this harness simulates that internal Phase 3 DAG separately (via simulate_phase3, using the wrapper's own if: expressions and an inputs.* context translated exactly the way MAIN's phase_3_argocd caller job translates it), then folds the wrapper's own aggregate result and its validate_argocd_ready_result output back into the outer MAIN-side simulation at the phase_3_argocd step -- a genuine dual-document simulation across the reusable-workflow boundary, never a single flattened JOB_ORDER pretending the boundary does not exist.
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   set +e
-  MAIN_SCENARIOS_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+  MAIN_SCENARIOS_OUT="$(python3 - "$EKS_APP_WORKFLOW" "$PHASE3_WORKFLOW" <<'PYEOF'
 import re
 import sys
 import yaml
 
 with open(sys.argv[1]) as f:
     doc = yaml.safe_load(f)
+with open(sys.argv[2]) as f:
+    phase3_doc = yaml.safe_load(f)
 
 jobs = doc["jobs"]
+phase3_jobs = phase3_doc["jobs"]
 
 
-def _extract_if(job_name):
-    raw = jobs[job_name].get("if", "true")
+def _extract_if(source_jobs, job_name):
+    raw = source_jobs[job_name].get("if", "true")
     raw = str(raw).strip()
     if raw.startswith("${{") and raw.endswith("}}"):
         raw = raw[3:-2].strip()
@@ -10348,9 +10423,12 @@ def _extract_if(job_name):
 
 
 class _Parser:
-    def __init__(self, expr, needs):
+    """... needs.<job>.result, needs.<job>.outputs.<name>, inputs.<name> (Phase 3 grouping: the internal Phase 3 wrapper's own if: expressions reference inputs.* instead of needs.validate_model.outputs.*/needs.terraform_sync_once.result), always() ..."""
+
+    def __init__(self, expr, needs, inputs=None):
         self.expr = expr
         self.needs = needs
+        self.inputs = inputs or {}
         self.pos = 0
 
     def _skip_ws(self):
@@ -10423,21 +10501,68 @@ class _Parser:
         if m:
             self.pos += m.end()
             return self.needs.get(m.group(1), {}).get("outputs", {}).get(m.group(2), "")
+        m = re.match(r"inputs\.([A-Za-z0-9_]+)", self.expr[self.pos:])
+        if m:
+            self.pos += m.end()
+            return self.inputs.get(m.group(1), "")
         raise ValueError(f"cannot parse value at: {self.expr[self.pos:self.pos + 40]!r}")
 
 
-def eval_gha_bool(expr, needs):
-    return bool(_Parser(expr, needs).parse())
+def eval_gha_bool(expr, needs, inputs=None):
+    return bool(_Parser(expr, needs, inputs).parse())
 
 
-JOB_ORDER = ["terraform_sync_once", "argocd_preflight", "goldengate_deploy_authorization", "reconcile_argocd", "validate_argocd_ready", "platform_preflight", "observability_preflight", "platform_sync_once", "observability_sync_once", "validate_platform_ready", "validate_observability_ready", "validate_shared_secrets_once", "runtime_ownership_preflight", "build_publish_and_deploy"]
-IF_EXPRS = {job: _extract_if(job) for job in JOB_ORDER}
+# Phase 3 grouping: the internal Phase 3 DAG (argocd_preflight -> goldengate_deploy_authorization -> reconcile_argocd -> validate_argocd_ready) now lives inside 30-phase-argocd-orchestration.yaml, addressed only via workflow_call inputs.*, never needs.validate_model.outputs.*/needs.terraform_sync_once.result directly.
+PHASE3_JOB_ORDER = ["argocd_preflight", "goldengate_deploy_authorization", "reconcile_argocd", "validate_argocd_ready"]
+PHASE3_IF_EXPRS = {job: _extract_if(phase3_jobs, job) for job in PHASE3_JOB_ORDER}
 
 
-def simulate(initial, outcome_when_run, outputs_when_run=None):
+def simulate_phase3(inputs, outcome_when_run, outputs_when_run=None):
+    """Simulates the grouped Phase 3 wrapper's own internal DAG given the translated workflow_call inputs, then folds the internal per-job results into (wrapper_result, wrapper_outputs, internal_results) exactly the way GitHub Actions itself computes a reusable workflow's own overall result and its named jobs.<id>.result-backed outputs: skipped if no internal job ran, the worst of failure/cancelled if any internal job that ran reported one, success otherwise."""
+    outputs_when_run = outputs_when_run or {}
+    internal = {}
+    for job in PHASE3_JOB_ORDER:
+        would_run = eval_gha_bool(PHASE3_IF_EXPRS[job], internal, inputs)
+        if would_run:
+            internal[job] = {"result": outcome_when_run.get(job, "success"), "outputs": outputs_when_run.get(job, {})}
+        else:
+            internal[job] = {"result": "skipped", "outputs": {}}
+    ran_results = [internal[j]["result"] for j in PHASE3_JOB_ORDER if internal[j]["result"] != "skipped"]
+    if not ran_results:
+        wrapper_result = "skipped"
+    elif "failure" in ran_results:
+        wrapper_result = "failure"
+    elif "cancelled" in ran_results:
+        wrapper_result = "cancelled"
+    else:
+        wrapper_result = "success"
+    wrapper_outputs = {"validate_argocd_ready_result": internal["validate_argocd_ready"]["result"]}
+    return wrapper_result, wrapper_outputs, internal
+
+
+JOB_ORDER = ["terraform_sync_once", "phase_3_argocd", "platform_preflight", "observability_preflight", "platform_sync_once", "observability_sync_once", "validate_platform_ready", "validate_observability_ready", "validate_shared_secrets_once", "runtime_ownership_preflight", "build_publish_and_deploy"]
+IF_EXPRS = {job: _extract_if(jobs, job) for job in JOB_ORDER}
+
+
+def simulate(initial, outcome_when_run, outputs_when_run=None, phase3_outcome_when_run=None, phase3_outputs_when_run=None):
     results = dict(initial)
     outputs_when_run = outputs_when_run or {}
     for job in JOB_ORDER:
+        if job == "phase_3_argocd":
+            would_run = eval_gha_bool(IF_EXPRS[job], results)
+            if would_run:
+                phase3_inputs = {
+                    "selected_environment": results["validate_model"]["outputs"].get("selected_environment", "dev"),
+                    "effective_deploy": results["validate_model"]["outputs"].get("effective_deploy", "false"),
+                    "result_terraform_sync_once": results["terraform_sync_once"]["result"],
+                }
+                wrapper_result, wrapper_outputs, internal = simulate_phase3(phase3_inputs, phase3_outcome_when_run or {}, phase3_outputs_when_run)
+                results[job] = {"result": wrapper_result, "outputs": wrapper_outputs}
+            else:
+                internal = {j: {"result": "skipped", "outputs": {}} for j in PHASE3_JOB_ORDER}
+                results[job] = {"result": "skipped", "outputs": {}}
+            results["_phase3_internal"] = internal
+            continue
         would_run = eval_gha_bool(IF_EXPRS[job], results)
         if would_run:
             results[job] = {"result": outcome_when_run.get(job, "success"), "outputs": outputs_when_run.get(job, {})}
@@ -10448,7 +10573,7 @@ def simulate(initial, outcome_when_run, outputs_when_run=None):
 
 def base_context(effective_deploy, has_changes="true"):
     return {
-        "validate_model": {"result": "success", "outputs": {"effective_deploy": effective_deploy, "has_changes": has_changes}},
+        "validate_model": {"result": "success", "outputs": {"effective_deploy": effective_deploy, "has_changes": has_changes, "selected_environment": "dev"}},
     }
 
 
@@ -10460,36 +10585,40 @@ def check(label, condition):
         failures.append(label)
 
 
-# Scenario A: action=validate (effective_deploy=false) -> no operator approval is ever created and Argo CD is never mutated. build_publish_and_deploy legitimately still runs its own pre-existing read-only Helm lint/render dry-run path in this mode (proven independently by the existing "5: deploy=false" scenario above) -- that pre-existing dry-run eligibility is not itself a mutation and is out of scope for this fix.
+# Scenario A: action=validate (effective_deploy=false) -> no operator approval is ever created and Argo CD is never mutated. build_publish_and_deploy legitimately still runs its own pre-existing read-only Helm lint/render dry-run path in this mode (proven independently by the existing "5: deploy=false" scenario above) -- that pre-existing dry-run eligibility is not itself a mutation and is out of scope for this fix. Phase 3 grouping: goldengate_deploy_authorization/reconcile_argocd now live inside the simulated Phase 3 wrapper -- checked via r["_phase3_internal"].
 ctx = base_context("false")
 r = simulate(ctx, {})
-check("A: goldengate_deploy_authorization must be skipped in Validate mode (no approval created)", r["goldengate_deploy_authorization"]["result"] == "skipped")
-check("A: reconcile_argocd must be skipped in Validate mode (no Argo CD mutation)", r["reconcile_argocd"]["result"] == "skipped")
+check("A: phase_3_argocd (the grouped Phase 3 wrapper) must itself be skipped in Validate mode", r["phase_3_argocd"]["result"] == "skipped")
+check("A: goldengate_deploy_authorization must be skipped in Validate mode (no approval created)", r["_phase3_internal"]["goldengate_deploy_authorization"]["result"] == "skipped")
+check("A: reconcile_argocd must be skipped in Validate mode (no Argo CD mutation)", r["_phase3_internal"]["reconcile_argocd"]["result"] == "skipped")
 
-# Scenario B: deploy=true + Argo CD OWNED (an already-existing, safely-owned release) -- the single authorization runs and succeeds, reconcile_argocd ALWAYS runs, final Argo HEALTHY convergence succeeds, and the whole rollout remains eligible off that ONE approval.
+# Scenario B: deploy=true + Argo CD OWNED (an already-existing, safely-owned release) -- the single authorization runs and succeeds, reconcile_argocd ALWAYS runs, final Argo HEALTHY convergence succeeds, and the whole rollout remains eligible off that ONE approval. Phase 3 grouping: the wrapper's own overall result AND its exact internal validate_argocd_ready_result output must BOTH converge to success -- never conflated.
 ctx = base_context("true")
-r = simulate(ctx, {}, {"argocd_preflight": {"state": "OWNED"}, "platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}, "runtime_ownership_preflight": {"state": "OWNED"}})
-check("B: goldengate_deploy_authorization must run and succeed", r["goldengate_deploy_authorization"]["result"] == "success")
-check("B: reconcile_argocd must run and succeed on OWNED", r["reconcile_argocd"]["result"] == "success")
-check("B: validate_argocd_ready must converge to success", r["validate_argocd_ready"]["result"] == "success")
+r = simulate(ctx, {}, {"platform_preflight": {"state": "OWNED"}, "observability_preflight": {"state": "OWNED"}, "runtime_ownership_preflight": {"state": "OWNED"}}, phase3_outputs_when_run={"argocd_preflight": {"state": "OWNED"}})
+check("B: phase_3_argocd (the grouped Phase 3 wrapper) must run and succeed overall", r["phase_3_argocd"]["result"] == "success")
+check("B: phase_3_argocd's exposed validate_argocd_ready_result output must be success", r["phase_3_argocd"]["outputs"]["validate_argocd_ready_result"] == "success")
+check("B: goldengate_deploy_authorization must run and succeed", r["_phase3_internal"]["goldengate_deploy_authorization"]["result"] == "success")
+check("B: reconcile_argocd must run and succeed on OWNED", r["_phase3_internal"]["reconcile_argocd"]["result"] == "success")
+check("B: validate_argocd_ready must converge to success", r["_phase3_internal"]["validate_argocd_ready"]["result"] == "success")
 check("B: build_publish_and_deploy must remain eligible after the single authorization", r["build_publish_and_deploy"]["result"] == "success")
 
 # Scenario C: reproduces the real live incident -- Platform ABSENT + Observability ABSENT, both reconciled under the SAME single goldengate_deploy_authorization approval, with no operator interaction required between them.
 ctx = base_context("true")
-r = simulate(ctx, {}, {"argocd_preflight": {"state": "OWNED"}, "platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "ABSENT"}})
-check("C: goldengate_deploy_authorization must run and succeed exactly once", r["goldengate_deploy_authorization"]["result"] == "success")
+r = simulate(ctx, {}, {"platform_preflight": {"state": "ABSENT"}, "observability_preflight": {"state": "ABSENT"}}, phase3_outputs_when_run={"argocd_preflight": {"state": "OWNED"}})
+check("C: goldengate_deploy_authorization must run and succeed exactly once", r["_phase3_internal"]["goldengate_deploy_authorization"]["result"] == "success")
 check("C: platform_sync_once must be eligible to run (ABSENT)", r["platform_sync_once"]["result"] == "success")
 check("C: observability_sync_once must be eligible to run (ABSENT)", r["observability_sync_once"]["result"] == "success")
 check("C: validate_platform_ready must succeed", r["validate_platform_ready"]["result"] == "success")
 check("C: validate_observability_ready must succeed", r["validate_observability_ready"]["result"] == "success")
 
-# Scenario J: the single authorization itself fails or is cancelled -> no application mutation job is eligible anywhere downstream.
+# Scenario J: the single authorization itself fails or is cancelled -> no application mutation job is eligible anywhere downstream. Phase 3 grouping: a failed/cancelled internal goldengate_deploy_authorization must also fail the wrapper's own overall phase_3_argocd result (never merely skip quietly), which is what actually propagates the closure to platform_preflight/build_publish_and_deploy through the new needs.phase_3_argocd.result == 'success' boundary check.
 for bad_result in ("failure", "cancelled"):
     ctx = base_context("true")
-    r = simulate(ctx, {"goldengate_deploy_authorization": bad_result})
-    check(f"J: goldengate_deploy_authorization must report {bad_result}", r["goldengate_deploy_authorization"]["result"] == bad_result)
-    check(f"J: reconcile_argocd must be skipped when authorization is {bad_result}", r["reconcile_argocd"]["result"] == "skipped")
-    check(f"J: validate_argocd_ready must be skipped when authorization is {bad_result}", r["validate_argocd_ready"]["result"] == "skipped")
+    r = simulate(ctx, {}, phase3_outcome_when_run={"goldengate_deploy_authorization": bad_result}, phase3_outputs_when_run={"argocd_preflight": {"state": "OWNED"}})
+    check(f"J: goldengate_deploy_authorization must report {bad_result}", r["_phase3_internal"]["goldengate_deploy_authorization"]["result"] == bad_result)
+    check(f"J: reconcile_argocd must be skipped when authorization is {bad_result}", r["_phase3_internal"]["reconcile_argocd"]["result"] == "skipped")
+    check(f"J: validate_argocd_ready must be skipped when authorization is {bad_result}", r["_phase3_internal"]["validate_argocd_ready"]["result"] == "skipped")
+    check(f"J: phase_3_argocd (the grouped wrapper) must itself report {bad_result}, never success, when its internal authorization is {bad_result}", r["phase_3_argocd"]["result"] == bad_result)
     check(f"J: platform_sync_once must be skipped when authorization is {bad_result}", r["platform_sync_once"]["result"] == "skipped")
     check(f"J: build_publish_and_deploy must be skipped when authorization is {bad_result}", r["build_publish_and_deploy"]["result"] == "skipped")
 
@@ -10513,32 +10642,35 @@ else
   skip "Live Deployment Approval Topology Fix Scenarios A/B/C/J: MAIN-side simulation -- python3/PyYAML unavailable"
 fi
 
-# Scenario D: MAIN's runtime deployment matrix (build_publish_and_deploy) and its two supporting matrix jobs (runtime_ownership_preflight, validate_active_runtimes) no longer carry a per-runtime job-level environment: -- a future N-runtime rollout generates ONE approval total (goldengate_deploy_authorization), never N.
+# Scenario D: MAIN's runtime deployment matrix (build_publish_and_deploy) and its two supporting matrix jobs (runtime_ownership_preflight, validate_active_runtimes) no longer carry a per-runtime job-level environment: -- a future N-runtime rollout generates ONE approval total (goldengate_deploy_authorization), never N. Phase 3 grouping: goldengate_deploy_authorization itself moved off MAIN into the grouped Phase 3 wrapper, so MAIN now carries ZERO job-level environment: keys of its own, and the wrapper carries exactly the one that moved.
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   set +e
-  MAIN_ENV_COUNT_OUT="$(python3 - "$EKS_APP_WORKFLOW" <<'PYEOF'
+  MAIN_ENV_COUNT_OUT="$(python3 - "$EKS_APP_WORKFLOW" "$PHASE3_WORKFLOW" <<'PYEOF'
 import sys
 import yaml
 
 with open(sys.argv[1]) as f:
-    doc = yaml.safe_load(f)
+    main_doc = yaml.safe_load(f)
+with open(sys.argv[2]) as f:
+    phase3_doc = yaml.safe_load(f)
 
-envs = [name for name, job in doc["jobs"].items() if isinstance(job, dict) and job.get("environment") is not None]
-if envs == ["goldengate_deploy_authorization"]:
+main_envs = [name for name, job in main_doc["jobs"].items() if isinstance(job, dict) and job.get("environment") is not None]
+phase3_envs = [name for name, job in phase3_doc["jobs"].items() if isinstance(job, dict) and job.get("environment") is not None]
+if main_envs == [] and phase3_envs == ["goldengate_deploy_authorization"]:
     print("OK")
 else:
-    print("FAIL " + repr(envs))
+    print(f"FAIL main={main_envs!r} phase3={phase3_envs!r}")
 PYEOF
 )"
   MAIN_ENV_COUNT_STATUS=$?
   set -e
   if [ "$MAIN_ENV_COUNT_STATUS" -eq 0 ] && [ "$MAIN_ENV_COUNT_OUT" = "OK" ]; then
-    pass "Scenario D: MAIN has exactly one job-level environment: key (goldengate_deploy_authorization) -- a future N-runtime matrix rollout generates ONE approval total, never one per runtime"
+    pass "Scenario D: MAIN has ZERO job-level environment: keys of its own and the grouped Phase 3 wrapper has exactly one (goldengate_deploy_authorization) -- a future N-runtime matrix rollout generates ONE approval total, never one per runtime"
   else
-    fail "Scenario D: MAIN's job-level environment: inventory regressed: ${MAIN_ENV_COUNT_OUT}"
+    fail "Scenario D: the job-level environment: inventory regressed: ${MAIN_ENV_COUNT_OUT}"
   fi
 else
-  skip "Scenario D: MAIN job-level environment: inventory -- python3/PyYAML unavailable"
+  skip "Scenario D: job-level environment: inventory -- python3/PyYAML unavailable"
 fi
 
 # Scenarios E/F/G/H/I: the four specialist reusable workflows' own if: expressions are simulated directly (a fresh, small parser supporting inputs.<name>/needs.<job>.result/always(), since these workflows' conditions reference inputs.orchestrated_by_main -- a shape the MAIN-side parser above never needs).
@@ -10925,8 +11057,9 @@ observability_preflight_needs = observability_preflight.get("needs") or []
 platform_preflight_if = platform_preflight.get("if", "")
 observability_preflight_if = observability_preflight.get("if", "")
 
-results.append(("4a: platform_preflight depends on validate_argocd_ready", "validate_argocd_ready" in platform_preflight_needs))
-results.append(("4b: observability_preflight depends on validate_argocd_ready", "validate_argocd_ready" in observability_preflight_needs))
+# Phase 3 grouping: validate_argocd_ready now lives behind the grouped Phase 3 wrapper, so both preflight jobs depend on phase_3_argocd instead (and separately check the exact internal validate_argocd_ready_result output -- proven in the dedicated Phase 3 grouping regression section).
+results.append(("4a: platform_preflight depends on phase_3_argocd", "phase_3_argocd" in platform_preflight_needs))
+results.append(("4b: observability_preflight depends on phase_3_argocd", "phase_3_argocd" in observability_preflight_needs))
 results.append(("5a: platform_preflight is real-deploy-only (effective_deploy == \x27true\x27)", "effective_deploy" in platform_preflight_if and "== \x27true\x27" in platform_preflight_if))
 results.append(("5b: observability_preflight is real-deploy-only (effective_deploy == \x27true\x27)", "effective_deploy" in observability_preflight_if and "== \x27true\x27" in observability_preflight_if))
 
@@ -11143,11 +11276,11 @@ def simulate(initial, outcome_when_run, outputs_when_run=None):
 
 
 def base_context():
-    # Represents "everything upstream of platform_preflight/observability_preflight already succeeded, Argo already validated ready, and a real change was detected" -- effective_deploy='true'/has_changes='true' throughout, matching a real deploy (both now live on validate_model.outputs since the Phase 1 single-job consolidation) since build_publish_and_deploy's own if: independently requires it -- this simulation is scoped to the B2 platform/observability chain, not a re-test of that upstream detection logic (already covered elsewhere in this suite).
+    # Represents "everything upstream of platform_preflight/observability_preflight already succeeded, Argo already validated ready, and a real change was detected" -- effective_deploy='true'/has_changes='true' throughout, matching a real deploy (both now live on validate_model.outputs since the Phase 1 single-job consolidation) since build_publish_and_deploy's own if: independently requires it -- this simulation is scoped to the B2 platform/observability chain, not a re-test of that upstream detection logic (already covered elsewhere in this suite). Phase 3 grouping: validate_argocd_ready now lives behind the grouped Phase 3 wrapper -- platform_preflight/observability_preflight reference needs.phase_3_argocd.result AND needs.phase_3_argocd.outputs.validate_argocd_ready_result, so the fabricated upstream context exposes both explicitly.
     return {
         "validate_model": {"result": "success", "outputs": {"effective_deploy": "true", "has_changes": "true"}},
         "terraform_sync_once": {"result": "success", "outputs": {}},
-        "validate_argocd_ready": {"result": "success", "outputs": {}},
+        "phase_3_argocd": {"result": "success", "outputs": {"validate_argocd_ready_result": "success"}},
     }
 
 
@@ -11247,7 +11380,7 @@ check("cross: platform OWNED + observability BROKEN -> shared secrets/runtime do
 ctx = {
     "validate_model": {"result": "success", "outputs": {"effective_deploy": "false"}},
     "terraform_sync_once": {"result": "skipped", "outputs": {}},
-    "validate_argocd_ready": {"result": "skipped", "outputs": {}},
+    "phase_3_argocd": {"result": "skipped", "outputs": {}},
 }
 r = simulate(ctx, {})
 check("dry-run: platform_preflight must be skipped", r["platform_preflight"]["result"] == "skipped")
@@ -11457,10 +11590,11 @@ def simulate(initial, outcome_when_run, outputs_when_run=None):
 
 
 def base_context():
+    # Phase 3 grouping: validate_argocd_ready now lives behind the grouped Phase 3 wrapper -- platform_preflight/observability_preflight reference needs.phase_3_argocd.result AND needs.phase_3_argocd.outputs.validate_argocd_ready_result, so the fabricated upstream context exposes both explicitly.
     return {
         "validate_model": {"result": "success", "outputs": {"effective_deploy": "true", "has_changes": "true"}},
         "terraform_sync_once": {"result": "success", "outputs": {}},
-        "validate_argocd_ready": {"result": "success", "outputs": {}},
+        "phase_3_argocd": {"result": "success", "outputs": {"validate_argocd_ready_result": "success"}},
     }
 
 
@@ -11520,7 +11654,7 @@ check("D5: downstream must not proceed when only ONE of the two required converg
 ctx = {
     "validate_model": {"result": "success", "outputs": {"effective_deploy": "false"}},
     "terraform_sync_once": {"result": "skipped", "outputs": {}},
-    "validate_argocd_ready": {"result": "skipped", "outputs": {}},
+    "phase_3_argocd": {"result": "skipped", "outputs": {}},
 }
 r = simulate(ctx, {})
 check("D6: platform_preflight must be skipped in Validate mode regardless of live state", r["platform_preflight"]["result"] == "skipped")
@@ -11979,12 +12113,12 @@ else
   skip "A10: classifier contract retirement re-confirmation -- python3 unavailable or argocd_state.py missing"
 fi
 
-# D1/D2: MAIN's existing Argo DAG wiring (reconcile_argocd triggers synchronously on ABSENT/OWNED via workflow_call) is UNCHANGED by this fix -- re-confirmed structurally rather than re-deriving the full JOB_ORDER simulation already proven (and unaffected, since none of reconcile_argocd/validate_argocd_ready's own if: expressions were touched again here) in the Phase B1 section above. The absence of any async gh workflow run/repository_dispatch/dispatches construct anywhere in MAIN is already proven elsewhere in this suite (Phase B2 check 21, which strips comments by checking the parsed-YAML structure rather than raw source text -- never re-derived here against raw text, which would false-positive on this very file's own explanatory prose naming "repository_dispatch" while describing what MAIN does NOT do).
-if grep -qF "needs.argocd_preflight.outputs.state == 'OWNED'" "$EKS_APP_WORKFLOW" 2>/dev/null \
-  && grep -qF "uses: ./.github/workflows/20-sub-argocd.yaml" "$EKS_APP_WORKFLOW" 2>/dev/null; then
-  pass "D1/D2: MAIN's reconcile_argocd still triggers synchronously (workflow_call) on OWNED Argo state -- unchanged by this fix, so a missing/drifted Ingress now classified OWNED is automatically repaired with no manual specialist dispatch"
+# D1/D2: the existing Argo DAG wiring (reconcile_argocd triggers synchronously on ABSENT/OWNED via workflow_call) is UNCHANGED by this fix -- re-confirmed structurally rather than re-deriving the full JOB_ORDER simulation already proven (and unaffected, since none of reconcile_argocd/validate_argocd_ready's own if: expressions were touched again here) in the Phase B1 section above. The absence of any async gh workflow run/repository_dispatch/dispatches construct anywhere in MAIN is already proven elsewhere in this suite (Phase B2 check 21, which strips comments by checking the parsed-YAML structure rather than raw source text -- never re-derived here against raw text, which would false-positive on this very file's own explanatory prose naming "repository_dispatch" while describing what MAIN does NOT do). Phase 3 grouping: reconcile_argocd now lives inside the grouped Phase 3 wrapper, never directly in MAIN.
+if grep -qF "needs.argocd_preflight.outputs.state == 'OWNED'" "$PHASE3_WORKFLOW" 2>/dev/null \
+  && grep -qF "uses: ./.github/workflows/20-sub-argocd.yaml" "$PHASE3_WORKFLOW" 2>/dev/null; then
+  pass "D1/D2: the grouped Phase 3 wrapper's reconcile_argocd still triggers synchronously (workflow_call) on OWNED Argo state -- unchanged by this fix, so a missing/drifted Ingress now classified OWNED is automatically repaired with no manual specialist dispatch"
 else
-  fail "D1/D2: MAIN's reconcile_argocd OWNED trigger or its synchronous workflow_call invocation appears to have regressed"
+  fail "D1/D2: the grouped Phase 3 wrapper's reconcile_argocd OWNED trigger or its synchronous workflow_call invocation appears to have regressed"
 fi
 
 if [ -f automation/check-goldengate-approval-topology.py ] && [ "$PYTHON_AVAILABLE" = "true" ]; then
@@ -12014,7 +12148,9 @@ if [ -f automation/check-goldengate-approval-topology.py ] && [ "$PYTHON_AVAILAB
     fail "positive control: the checker unexpectedly fails against an unmutated copy of the real workflows/ directory -- the fixtures below would be meaningless"
   fi
 
-  # Fixture 1: deletion depends ONLY on detect_changed_deployments (the exact violation this task describes) -- not transitively downstream of goldengate_deploy_authorization at all.
+  # Phase 3 grouping: goldengate_deploy_authorization now lives inside the reusable 30-phase-argocd-orchestration.yaml wrapper, so the single-document transitive-needs-graph walk this proof used before the grouping can no longer span the reusable-workflow boundary. The five fixtures below exercise the checker's REPLACEMENT explicit two-part cross-workflow proof (check_phase3_internal_chain_fail_closed + check_main_deletion_requires_phase3_boundary) plus the other new Phase 3 grouping invariants, never merely removed because the old proof stopped applying.
+
+  # Fixture 1: deletion lists phase_3_argocd in needs: (so it IS structurally present) but its if: never actually checks that wrapper's result at all -- the "bare needs: reference" bypass GitHub Actions itself would silently treat as satisfied by a skip.
   python3 - "$TOPOLOGY_FIXTURE_DIR/00-main-goldengate-orchestrator.yaml" <<'PYEOF'
 import sys
 import yaml
@@ -12022,7 +12158,7 @@ path = sys.argv[1]
 with open(path) as f:
     doc = yaml.safe_load(f)
 job = doc["jobs"]["delete_removed_argocd_applications"]
-job["needs"] = "detect_changed_deployments"
+job["needs"] = ["detect_changed_deployments", "phase_3_argocd"]
 job["if"] = "success() && needs.detect_changed_deployments.outputs.has_deletions == 'true'"
 with open(path, "w") as f:
     yaml.safe_dump(doc, f, sort_keys=False, default_flow_style=False)
@@ -12031,13 +12167,13 @@ PYEOF
   FIXTURE1_OUT="$(python3 automation/check-goldengate-approval-topology.py --workflow-dir "$TOPOLOGY_FIXTURE_DIR" 2>&1)"
   FIXTURE1_STATUS=$?
   set -e
-  if [ "$FIXTURE1_STATUS" -ne 0 ] && echo "$FIXTURE1_OUT" | grep -qF "is not transitively downstream of 'goldengate_deploy_authorization'"; then
-    pass "fixture 1: the checker FAILS closed when deletion depends only on detect_changed_deployments (not transitively downstream of goldengate_deploy_authorization at all), with a specific, actionable violation message"
+  if [ "$FIXTURE1_STATUS" -ne 0 ] && echo "$FIXTURE1_OUT" | grep -qF "must contain \"needs.phase_3_argocd.result == 'success'\""; then
+    pass "fixture 1: the checker FAILS closed when deletion lists phase_3_argocd in needs: but its if: never tests its result at all (the bare-needs-reference bypass)"
   else
-    fail "fixture 1: the checker did not detect a deletion job depending only on detect_changed_deployments (status=${FIXTURE1_STATUS}):"$'\n'"${FIXTURE1_OUT}"
+    fail "fixture 1: the checker did not detect a deletion job with a bare phase_3_argocd needs: reference and no result check (status=${FIXTURE1_STATUS}):"$'\n'"${FIXTURE1_OUT}"
   fi
 
-  # Fixture 2: deletion lists validate_argocd_ready in needs: (so it IS structurally transitively downstream) but its if: never actually checks that job's result -- the "bare needs: reference" bypass GitHub Actions itself would silently treat as satisfied by a skip.
+  # Fixture 2: deletion tests the Phase 3 wrapper's own overall result but never its exact internal validate_argocd_ready_result output -- checking only the former is not sufficient, since an earlier internal Phase 3 failure and a genuine internal validate_argocd_ready skip are not the same thing.
   cp .github/workflows/*.yaml "$TOPOLOGY_FIXTURE_DIR/"
   python3 - "$TOPOLOGY_FIXTURE_DIR/00-main-goldengate-orchestrator.yaml" <<'PYEOF'
 import sys
@@ -12046,8 +12182,8 @@ path = sys.argv[1]
 with open(path) as f:
     doc = yaml.safe_load(f)
 job = doc["jobs"]["delete_removed_argocd_applications"]
-job["needs"] = ["detect_changed_deployments", "validate_argocd_ready"]
-job["if"] = "success() && needs.detect_changed_deployments.outputs.has_deletions == 'true'"
+job["needs"] = ["validate_model", "phase_3_argocd"]
+job["if"] = "success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.validate_model.outputs.effective_deploy == 'true' && needs.validate_model.outputs.has_deletions == 'true' && needs.phase_3_argocd.result == 'success'"
 with open(path, "w") as f:
     yaml.safe_dump(doc, f, sort_keys=False, default_flow_style=False)
 PYEOF
@@ -12055,10 +12191,79 @@ PYEOF
   FIXTURE2_OUT="$(python3 automation/check-goldengate-approval-topology.py --workflow-dir "$TOPOLOGY_FIXTURE_DIR" 2>&1)"
   FIXTURE2_STATUS=$?
   set -e
-  if [ "$FIXTURE2_STATUS" -ne 0 ] && echo "$FIXTURE2_OUT" | grep -qF "does not directly require (via needs.<job>.result == 'success' in its own if:)"; then
-    pass "fixture 2: the checker FAILS closed when deletion merely lists validate_argocd_ready in needs: without an explicit .result == 'success' check in its own if: (the bare-needs-reference bypass)"
+  if [ "$FIXTURE2_STATUS" -ne 0 ] && echo "$FIXTURE2_OUT" | grep -qF "must contain \"needs.phase_3_argocd.outputs.validate_argocd_ready_result == 'success'\""; then
+    pass "fixture 2: the checker FAILS closed when deletion tests the wrapper's overall result but never its exact internal validate_argocd_ready_result output"
   else
-    fail "fixture 2: the checker did not detect a bare needs: reference without a result check (status=${FIXTURE2_STATUS}):"$'\n'"${FIXTURE2_OUT}"
+    fail "fixture 2: the checker did not detect a deletion job missing the exact internal validate_argocd_ready_result check (status=${FIXTURE2_STATUS}):"$'\n'"${FIXTURE2_OUT}"
+  fi
+
+  # Fixture 3: inside the grouped Phase 3 wrapper, reconcile_argocd stops depending on goldengate_deploy_authorization -- the internal fail-closed chain (check_phase3_internal_chain_fail_closed) must catch this even though MAIN's own deletion boundary check (fixture 1/2's target) never runs against this mutation.
+  cp .github/workflows/*.yaml "$TOPOLOGY_FIXTURE_DIR/"
+  python3 - "$TOPOLOGY_FIXTURE_DIR/30-phase-argocd-orchestration.yaml" <<'PYEOF'
+import sys
+import yaml
+path = sys.argv[1]
+with open(path) as f:
+    doc = yaml.safe_load(f)
+job = doc["jobs"]["reconcile_argocd"]
+job["needs"] = ["argocd_preflight"]
+job["if"] = "${{ inputs.effective_deploy == 'true' && needs.argocd_preflight.result == 'success' && (needs.argocd_preflight.outputs.state == 'ABSENT' || needs.argocd_preflight.outputs.state == 'OWNED') }}"
+with open(path, "w") as f:
+    yaml.safe_dump(doc, f, sort_keys=False, default_flow_style=False)
+PYEOF
+  set +e
+  FIXTURE3_OUT="$(python3 automation/check-goldengate-approval-topology.py --workflow-dir "$TOPOLOGY_FIXTURE_DIR" 2>&1)"
+  FIXTURE3_STATUS=$?
+  set -e
+  if [ "$FIXTURE3_STATUS" -ne 0 ] && echo "$FIXTURE3_OUT" | grep -qF "reconcile_argocd' must list 'goldengate_deploy_authorization' in needs:"; then
+    pass "fixture 3: the checker FAILS closed when the grouped Phase 3 wrapper's reconcile_argocd stops depending on goldengate_deploy_authorization"
+  else
+    fail "fixture 3: the checker did not detect reconcile_argocd no longer depending on goldengate_deploy_authorization (status=${FIXTURE3_STATUS}):"$'\n'"${FIXTURE3_OUT}"
+  fi
+
+  # Fixture 4: orchestrated_by_main is removed from the grouped Phase 3 wrapper's nested 20-sub-argocd.yaml call -- a direct standalone approval could otherwise be silently bypassed on a MAIN-orchestrated run.
+  cp .github/workflows/*.yaml "$TOPOLOGY_FIXTURE_DIR/"
+  python3 - "$TOPOLOGY_FIXTURE_DIR/30-phase-argocd-orchestration.yaml" <<'PYEOF'
+import sys
+import yaml
+path = sys.argv[1]
+with open(path) as f:
+    doc = yaml.safe_load(f)
+job = doc["jobs"]["reconcile_argocd"]
+job["with"] = {"environment": job["with"]["environment"]}
+with open(path, "w") as f:
+    yaml.safe_dump(doc, f, sort_keys=False, default_flow_style=False)
+PYEOF
+  set +e
+  FIXTURE4_OUT="$(python3 automation/check-goldengate-approval-topology.py --workflow-dir "$TOPOLOGY_FIXTURE_DIR" 2>&1)"
+  FIXTURE4_STATUS=$?
+  set -e
+  if [ "$FIXTURE4_STATUS" -ne 0 ] && echo "$FIXTURE4_OUT" | grep -qF "must pass orchestrated_by_main: true to '20-sub-argocd.yaml'"; then
+    pass "fixture 4: the checker FAILS closed when orchestrated_by_main is removed from the grouped Phase 3 wrapper's nested 20-sub-argocd.yaml call"
+  else
+    fail "fixture 4: the checker did not detect the missing orchestrated_by_main passthrough on the nested call (status=${FIXTURE4_STATUS}):"$'\n'"${FIXTURE4_OUT}"
+  fi
+
+  # Fixture 5: a second application deployment authorization is introduced (an extra job-level environment: reappearing directly on MAIN) -- MAIN must carry ZERO of its own after the Phase 3 grouping.
+  cp .github/workflows/*.yaml "$TOPOLOGY_FIXTURE_DIR/"
+  python3 - "$TOPOLOGY_FIXTURE_DIR/00-main-goldengate-orchestrator.yaml" <<'PYEOF'
+import sys
+import yaml
+path = sys.argv[1]
+with open(path) as f:
+    doc = yaml.safe_load(f)
+doc["jobs"]["phase_3_argocd"]["environment"] = "some-second-approval-env"
+with open(path, "w") as f:
+    yaml.safe_dump(doc, f, sort_keys=False, default_flow_style=False)
+PYEOF
+  set +e
+  FIXTURE5_OUT="$(python3 automation/check-goldengate-approval-topology.py --workflow-dir "$TOPOLOGY_FIXTURE_DIR" 2>&1)"
+  FIXTURE5_STATUS=$?
+  set -e
+  if [ "$FIXTURE5_STATUS" -ne 0 ] && echo "$FIXTURE5_OUT" | grep -qF "MAIN must have zero job-level environment: keys after the Phase 3 grouping"; then
+    pass "fixture 5: the checker FAILS closed when a second application deployment authorization (job-level environment:) reappears directly on MAIN"
+  else
+    fail "fixture 5: the checker did not detect a second job-level environment: reintroduced on MAIN (status=${FIXTURE5_STATUS}):"$'\n'"${FIXTURE5_OUT}"
   fi
 else
   skip "approval-topology broken-fixture proof -- python3 unavailable or checker missing"
@@ -12240,20 +12445,21 @@ for f in 80-ops-monitor-metrics-config.yaml 90-ops-observability-artifact-sync.y
     fail "workflow naming: expected OPS workflow ${WORKFLOWS_DIR}/${f} is missing"
   fi
 done
-# Phase 7 grouping: 70-phase-monitor-final-acceptance.yaml is a distinct "PHASE" category (an internal MAIN-orchestration wrapper, never an operator-facing SUB/OPS workflow) -- exactly one such file is expected, and it must be exactly this approved filename (whitelist, never arbitrary new workflow files).
-PHASE_NAME_MATCHES="$(find "$WORKFLOWS_DIR" -maxdepth 1 -type f -name "70-phase-*.yaml" 2>/dev/null | sort)"
+# Phase 7 grouping / Phase 3 grouping: 70-phase-monitor-final-acceptance.yaml and 30-phase-argocd-orchestration.yaml are both a distinct "PHASE" category (internal MAIN-orchestration wrappers, never operator-facing SUB/OPS workflows) -- exactly these two such files are expected, and each must be exactly its approved filename (whitelist, never arbitrary new workflow files).
+PHASE_NAME_MATCHES="$(find "$WORKFLOWS_DIR" -maxdepth 1 -type f -name "*-phase-*.yaml" 2>/dev/null | sort)"
 PHASE_NAME_MATCH_COUNT="$(echo "$PHASE_NAME_MATCHES" | grep -c . || true)"
-if [ "$PHASE_NAME_MATCH_COUNT" -eq 1 ] && [ "$PHASE_NAME_MATCHES" = "${WORKFLOWS_DIR}/70-phase-monitor-final-acceptance.yaml" ]; then
-  pass "workflow naming: exactly one 70-phase-*.yaml workflow exists and it is 70-phase-monitor-final-acceptance.yaml"
+EXPECTED_PHASE_NAME_MATCHES="$(printf '%s\n%s' "${WORKFLOWS_DIR}/30-phase-argocd-orchestration.yaml" "${WORKFLOWS_DIR}/70-phase-monitor-final-acceptance.yaml")"
+if [ "$PHASE_NAME_MATCH_COUNT" -eq 2 ] && [ "$PHASE_NAME_MATCHES" = "$EXPECTED_PHASE_NAME_MATCHES" ]; then
+  pass "workflow naming: exactly two *-phase-*.yaml workflows exist and they are 30-phase-argocd-orchestration.yaml and 70-phase-monitor-final-acceptance.yaml"
 else
-  fail "workflow naming: expected exactly one ${WORKFLOWS_DIR}/70-phase-monitor-final-acceptance.yaml matching 70-phase-*.yaml, found:"$'\n'"${PHASE_NAME_MATCHES}"
+  fail "workflow naming: expected exactly ${EXPECTED_PHASE_NAME_MATCHES} matching *-phase-*.yaml, found:"$'\n'"${PHASE_NAME_MATCHES}"
 fi
-# Total workflow file count is now exactly 10 -- the whitelist above (00/10/20/30/40/50/70/80/90/91) is exhaustive; a stray/unexpected extra workflow file must fail this count, never be silently tolerated.
+# Total workflow file count is now exactly 11 -- the whitelist above (00/10/20/30-sub/30-phase/40/50/70/80/90/91) is exhaustive; a stray/unexpected extra workflow file must fail this count, never be silently tolerated.
 ALL_WORKFLOW_FILE_COUNT="$(find "$WORKFLOWS_DIR" -maxdepth 1 -type f \( -name "*.yaml" -o -name "*.yml" \) 2>/dev/null | wc -l | tr -d ' ')"
-if [ "$ALL_WORKFLOW_FILE_COUNT" -eq 10 ]; then
-  pass "workflow naming: exactly 10 workflow files exist in ${WORKFLOWS_DIR} (00/10/20/30/40/50/70/80/90/91 -- no unexpected extra file)"
+if [ "$ALL_WORKFLOW_FILE_COUNT" -eq 11 ]; then
+  pass "workflow naming: exactly 11 workflow files exist in ${WORKFLOWS_DIR} (00/10/20/30-sub/30-phase/40/50/70/80/90/91 -- no unexpected extra file)"
 else
-  fail "workflow naming: expected exactly 10 workflow files in ${WORKFLOWS_DIR}, found ${ALL_WORKFLOW_FILE_COUNT}: $(find "$WORKFLOWS_DIR" -maxdepth 1 -type f \( -name '*.yaml' -o -name '*.yml' \) 2>/dev/null | sort | tr '\n' ' ')"
+  fail "workflow naming: expected exactly 11 workflow files in ${WORKFLOWS_DIR}, found ${ALL_WORKFLOW_FILE_COUNT}: $(find "$WORKFLOWS_DIR" -maxdepth 1 -type f \( -name '*.yaml' -o -name '*.yml' \) 2>/dev/null | sort | tr '\n' ' ')"
 fi
 
 # 4: zero references to any retired workflow filename remain anywhere in the repository (code, tests, docs, comments, diagnostics) -- excluding .git/ and this check's own list of retired names below, which must legitimately name them as search targets.
@@ -12283,6 +12489,7 @@ expected_name_prefixes = {
     "10-sub-iam-secrets.yaml": "10 | SUB |",
     "20-sub-argocd.yaml": "20 | SUB |",
     "30-sub-platform.yaml": "30 | SUB |",
+    "30-phase-argocd-orchestration.yaml": "30 | PHASE |",
     "40-sub-observability.yaml": "40 | SUB |",
     "50-sub-monitor.yaml": "50 | SUB |",
     "70-phase-monitor-final-acceptance.yaml": "70 | PHASE |",
@@ -12307,17 +12514,21 @@ for filename, expected_prefix in expected_name_prefixes.items():
 
 main_doc = docs.get("00-main-goldengate-orchestrator.yaml")
 phase7_doc = None
+phase3_doc = None
 if main_doc is not None:
     jobs = main_doc.get("jobs", {}) or {}
     uses_values = {job_id: (job.get("uses") or "") for job_id, job in jobs.items()}
     all_uses = set(uses_values.values())
-    # Phase B2 wired 40-sub-observability.yaml into MAIN (via observability_sync_once) alongside the four SUB workflows already called since the workflow-naming task. Phase 7 grouping: 50-sub-monitor.yaml is deliberately EXCLUDED here -- MAIN no longer calls it directly, only through the grouped Phase 7 wrapper (verified via the nested check below, never merely dropped).
-    for expected_sub in ("10-sub-iam-secrets.yaml", "20-sub-argocd.yaml", "30-sub-platform.yaml", "40-sub-observability.yaml"):
+    # Phase B2 wired 40-sub-observability.yaml into MAIN (via observability_sync_once) alongside the SUB workflows already called since the workflow-naming task. Phase 7 grouping: 50-sub-monitor.yaml is deliberately EXCLUDED here -- MAIN no longer calls it directly, only through the grouped Phase 7 wrapper. Phase 3 grouping: 20-sub-argocd.yaml is likewise EXCLUDED -- MAIN no longer calls it directly, only through the grouped Phase 3 wrapper (both verified via the nested checks below, never merely dropped).
+    for expected_sub in ("10-sub-iam-secrets.yaml", "30-sub-platform.yaml", "40-sub-observability.yaml"):
         expected_uses = "./.github/workflows/" + expected_sub
         results.append((f"MAIN uses: a reusable-workflow call targeting {expected_sub}", expected_uses in all_uses))
     expected_phase7_uses = "./.github/workflows/70-phase-monitor-final-acceptance.yaml"
     results.append(("MAIN uses: a reusable-workflow call targeting 70-phase-monitor-final-acceptance.yaml (the grouped Phase 7 caller)", expected_phase7_uses in all_uses))
     results.append(("MAIN no longer directly targets 50-sub-monitor.yaml (moved behind the grouped Phase 7 wrapper)", "./.github/workflows/50-sub-monitor.yaml" not in all_uses))
+    expected_phase3_uses = "./.github/workflows/30-phase-argocd-orchestration.yaml"
+    results.append(("MAIN uses: a reusable-workflow call targeting 30-phase-argocd-orchestration.yaml (the grouped Phase 3 caller)", expected_phase3_uses in all_uses))
+    results.append(("MAIN no longer directly targets 20-sub-argocd.yaml (moved behind the grouped Phase 3 wrapper)", "./.github/workflows/20-sub-argocd.yaml" not in all_uses))
 
     # Nested chain: the grouped Phase 7 wrapper itself must call 50-sub-monitor.yaml -- actively verified, never merely assumed because MAIN stopped calling it directly.
     phase7_doc = docs.get("70-phase-monitor-final-acceptance.yaml")
@@ -12325,6 +12536,13 @@ if main_doc is not None:
         phase7_jobs_for_naming = phase7_doc.get("jobs", {}) or {}
         phase7_uses_values = {job_id: (job.get("uses") or "") for job_id, job in phase7_jobs_for_naming.items()}
         results.append(("70-phase-monitor-final-acceptance.yaml uses: a reusable-workflow call targeting 50-sub-monitor.yaml (nested chain: MAIN -> Phase 7 wrapper -> 50-sub-monitor.yaml)", "./.github/workflows/50-sub-monitor.yaml" in set(phase7_uses_values.values())))
+
+    # Nested chain: the grouped Phase 3 wrapper itself must call 20-sub-argocd.yaml -- actively verified, never merely assumed because MAIN stopped calling it directly.
+    phase3_doc = docs.get("30-phase-argocd-orchestration.yaml")
+    if phase3_doc is not None:
+        phase3_jobs_for_naming = phase3_doc.get("jobs", {}) or {}
+        phase3_uses_values = {job_id: (job.get("uses") or "") for job_id, job in phase3_jobs_for_naming.items()}
+        results.append(("30-phase-argocd-orchestration.yaml uses: a reusable-workflow call targeting 20-sub-argocd.yaml (nested chain: MAIN -> Phase 3 wrapper -> 20-sub-argocd.yaml)", "./.github/workflows/20-sub-argocd.yaml" in set(phase3_uses_values.values())))
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
@@ -12900,9 +13118,13 @@ with open("automation/phases/phase7/phase7_final.py") as f:
     phase7_final_source = f.read()
 results.append(("24z: final_validation itself is always() (runs unconditionally so it can fail closed with diagnostics rather than silently disappearing)", final_val_if.strip() == "always()"))
 results.append(("24y: final_validation'"'"'s gate step now delegates to phase7_final.py validate (Phase 7 Python conversion), never a reimplemented copy of the mode-aware logic inline", "phase7_final.py validate" in final_val_gate_run))
-for extra_job in ("validate_argocd_ready", "validate_platform_ready", "validate_observability_ready"):
+for extra_job in ("validate_platform_ready", "validate_observability_ready"):
     results.append((f"23: MAIN phase_7_monitor_final_acceptance caller needs {extra_job} directly (external Phase 1-6 job, closes the transitive-skip gap at the reusable-workflow boundary)", extra_job in caller_needs_b3b))
     results.append((f"24: the final_validation mode-aware gate step requires EXACT success for {extra_job} in its applicable REQUIRED branch (a SKIPPED value fails the gate, never merely treated as not-a-failure)", f"require_success(\x22{extra_job}\x22)" in phase7_final_source))
+# Phase 3 grouping: validate_argocd_ready itself now lives behind the grouped Phase 3 wrapper -- the MAIN caller needs phase_3_argocd instead (one dependency swapped, never dropped), while the internal require_success("validate_argocd_ready") name inside phase7_final.py is UNCHANGED (frozen file, fed via the exact fallback-mapped result_validate_argocd_ready input -- see the Phase 3 grouping regression section for that exact expression proof).
+results.append(("23: MAIN phase_7_monitor_final_acceptance caller needs phase_3_argocd directly (validate_argocd_ready now lives behind the grouped Phase 3 wrapper; one dependency swapped, never dropped)", "phase_3_argocd" in caller_needs_b3b))
+results.append(("23b: MAIN phase_7_monitor_final_acceptance caller no longer needs validate_argocd_ready directly (it moved behind the grouped Phase 3 wrapper)", "validate_argocd_ready" not in caller_needs_b3b))
+results.append(("24: the final_validation mode-aware gate step requires EXACT success for validate_argocd_ready in its applicable REQUIRED branch (phase7_final.py itself is frozen/unchanged)", "require_success(\x22validate_argocd_ready\x22)" in phase7_final_source))
 for extra_job in ("monitor_ownership_preflight", "validate_monitor_ready", "end_to_end_deployment_acceptance"):
     results.append((f"23: final_validation needs {extra_job} directly (internal Phase 7 reference, closes the transitive-skip gap)", extra_job in final_val_needs))
     results.append((f"24: the final_validation mode-aware gate step requires EXACT success for {extra_job} in its applicable REQUIRED branch (a SKIPPED value fails the gate, never merely treated as not-a-failure)", f"require_success(\x22{extra_job}\x22)" in phase7_final_source))
@@ -13474,11 +13696,15 @@ def transitive_ancestors_all_success(name, results, seen=None):
 
 
 def build_inputs_ctx(results):
-    # Phase 7 grouping: every EXTERNAL Phase 1-6 job/output reference a Phase 7 job's if: expression needs now crosses via workflow_call inputs -- synthesized here from the SAME simulated results dict, so a Phase 7 job's external view is always exactly what MAIN would have actually passed.
+    # Phase 7 grouping: every EXTERNAL Phase 1-6 job/output reference a Phase 7 job's if: expression needs now crosses via workflow_call inputs -- synthesized here from the SAME simulated results dict, so a Phase 7 job's external view is always exactly what MAIN would have actually passed. Phase 3 grouping: validate_argocd_ready now lives behind the grouped Phase 3 wrapper -- MAIN's actual with: block maps result_validate_argocd_ready via needs.phase_3_argocd.outputs.validate_argocd_ready_result || needs.phase_3_argocd.result, so this synthesis mirrors that exact fallback expression rather than reading a (no-longer-existing) top-level validate_argocd_ready result directly.
     vm_outputs = results.get("validate_model", {"outputs": {}}).get("outputs", {})
 
     def r(name):
         return results.get(name, {"result": "success"})["result"]
+
+    def r_validate_argocd_ready_via_phase3():
+        phase3_entry = results.get("phase_3_argocd", {"result": "success", "outputs": {}})
+        return phase3_entry.get("outputs", {}).get("validate_argocd_ready_result") or phase3_entry.get("result", "success")
 
     return {
         "effective_deploy": vm_outputs.get("effective_deploy", "true"),
@@ -13487,7 +13713,7 @@ def build_inputs_ctx(results):
         "result_build_publish_and_deploy": r("build_publish_and_deploy"),
         "result_delete_removed_argocd_applications": r("delete_removed_argocd_applications"),
         "result_replication_reconcile_once": r("replication_reconcile_once"),
-        "result_validate_argocd_ready": r("validate_argocd_ready"),
+        "result_validate_argocd_ready": r_validate_argocd_ready_via_phase3(),
         "result_validate_platform_ready": r("validate_platform_ready"),
         "result_validate_observability_ready": r("validate_observability_ready"),
         "result_validate_active_runtimes": r("validate_active_runtimes"),
@@ -13506,10 +13732,12 @@ def would_run(name, results, if_override=None):
 # Real-deploy + active-runtime background: every genuinely required runtime/foundation prerequisite has already succeeded -- the ONE legitimate optional skip under test is delete_removed_argocd_applications (has_deletions=false), never anything else.
 BASE_BACKGROUND = {
     "validate_model": {"result": "success", "outputs": {"effective_deploy": "true", "has_active_deployments": "true"}},
+    "terraform_sync_once": {"result": "success", "outputs": {}},
     "validate_shared_secrets_once": {"result": "success", "outputs": {}},
     "build_publish_and_deploy": {"result": "success", "outputs": {}},
     "validate_active_runtimes": {"result": "success", "outputs": {}},
-    "validate_argocd_ready": {"result": "success", "outputs": {}},
+    # Phase 3 grouping: validate_argocd_ready now lives behind the grouped Phase 3 wrapper -- represented here by phase_3_argocd's own overall result plus its exact internal validate_argocd_ready_result output.
+    "phase_3_argocd": {"result": "success", "outputs": {"validate_argocd_ready_result": "success"}},
     "validate_platform_ready": {"result": "success", "outputs": {}},
     "validate_observability_ready": {"result": "success", "outputs": {}},
     "delete_removed_argocd_applications": {"result": "skipped", "outputs": {}},
@@ -14129,12 +14357,12 @@ check("K: terraform_sync_once needs only validate_model", tf_needs_list == ["val
 tf_if = str(tf.get("if", ""))
 check("K: terraform_sync_once's if: requires validate_model.result == success and effective_deploy == true", "needs.validate_model.result == 'success'" in tf_if and "needs.validate_model.outputs.effective_deploy == 'true'" in tf_if)
 
-# L: runtime deletion (delete_removed_argocd_applications) stays downstream of the existing authorization/Argo-health prerequisites, never weakened.
+# L: runtime deletion (delete_removed_argocd_applications) stays downstream of the existing authorization/Argo-health prerequisites, never weakened. Phase 3 grouping: validate_argocd_ready now lives behind the grouped Phase 3 wrapper, so this job needs phase_3_argocd instead (see the dedicated Phase 3 grouping regression section for the additional explicit .result/.outputs.validate_argocd_ready_result checks in its if:).
 delete_job = jobs.get("delete_removed_argocd_applications", {})
 delete_needs = delete_job.get("needs")
 delete_needs_list = delete_needs if isinstance(delete_needs, list) else [delete_needs]
 check("L: delete_removed_argocd_applications needs validate_model", "validate_model" in delete_needs_list)
-check("L: delete_removed_argocd_applications still needs validate_argocd_ready (Argo-health prerequisite unweakened)", "validate_argocd_ready" in delete_needs_list)
+check("L: delete_removed_argocd_applications still needs phase_3_argocd (Argo-health prerequisite unweakened)", "phase_3_argocd" in delete_needs_list)
 
 # M: final_validation retains if: always() and its gate step unconditionally requires validate_model success. Phase 7 grouping: final_validation now lives inside the grouped Phase 7 reusable workflow.
 final_val = phase7_jobs.get("final_validation", {})
@@ -14287,15 +14515,15 @@ fi
 echo ""
 echo "--- Phase 2 Python extraction: validate_environment_config/apply (10-sub-iam-secrets.yaml) stay two visible jobs behind the corporate Terraform reusable-workflow boundary (assertions A-W) ---"
 
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$SUB_IAM_SECRETS_WORKFLOW" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE2_TOOL" ] && [ -f "$PHASE7_WORKFLOW" ]; then
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$SUB_IAM_SECRETS_WORKFLOW" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE2_TOOL" ] && [ -f "$PHASE7_WORKFLOW" ] && [ -f "$PHASE3_WORKFLOW" ]; then
   set +e
-  PHASE2_ARCHITECTURE_OUT="$(python3 - "$SUB_IAM_SECRETS_WORKFLOW" "$EKS_APP_WORKFLOW" "$PHASE2_TOOL" "$PHASE7_WORKFLOW" <<'PYEOF'
+  PHASE2_ARCHITECTURE_OUT="$(python3 - "$SUB_IAM_SECRETS_WORKFLOW" "$EKS_APP_WORKFLOW" "$PHASE2_TOOL" "$PHASE7_WORKFLOW" "$PHASE3_WORKFLOW" <<'PYEOF'
 import re
 import sys
 
 import yaml
 
-sub_path, main_path, phase2_tool_path, phase7_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+sub_path, main_path, phase2_tool_path, phase7_path, phase3_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 with open(sub_path) as f:
     sub_doc = yaml.safe_load(f)
 with open(main_path) as f:
@@ -14306,6 +14534,10 @@ with open(phase2_tool_path) as f:
 with open(phase7_path) as f:
     phase7_doc = yaml.safe_load(f)
 phase7_jobs = phase7_doc["jobs"]
+# Phase 3 grouping: argocd_preflight now lives inside the grouped Phase 3 reusable workflow, never directly in MAIN.
+with open(phase3_path) as f:
+    phase3_doc = yaml.safe_load(f)
+phase3_jobs = phase3_doc["jobs"]
 
 results = []
 
@@ -14381,12 +14613,16 @@ check("R: terraform_sync_once uses secrets: inherit", tsf.get("secrets") == "inh
 # S: MAIN Phase 2 display name.
 check("S: MAIN terraform_sync_once display name is 'Phase 2 | AWS Application Prerequisites'", tsf.get("name") == "Phase 2 | AWS Application Prerequisites")
 
-# T: argocd_preflight still cannot run unless terraform_sync_once succeeded.
-preflight = main_jobs.get("argocd_preflight", {})
-preflight_needs = preflight.get("needs") or []
+# T: argocd_preflight still cannot run unless terraform_sync_once succeeded. Phase 3 grouping: argocd_preflight now lives inside the grouped Phase 3 wrapper, addressed only via workflow_call inputs -- MAIN's phase_3_argocd caller job itself requires terraform_sync_once success before the wrapper ever runs, and the wrapper's own argocd_preflight requires the passed-through inputs.result_terraform_sync_once to be success.
+phase_3_argocd_caller = main_jobs.get("phase_3_argocd", {})
+phase_3_argocd_caller_needs = phase_3_argocd_caller.get("needs") or []
+phase_3_argocd_caller_if = str(phase_3_argocd_caller.get("if", ""))
+check("T: MAIN's phase_3_argocd caller needs terraform_sync_once", "terraform_sync_once" in phase_3_argocd_caller_needs)
+check("T: MAIN's phase_3_argocd caller if: requires terraform_sync_once.result == success", "needs.terraform_sync_once.result == \x27success\x27" in phase_3_argocd_caller_if)
+preflight = phase3_jobs.get("argocd_preflight", {})
 preflight_if = str(preflight.get("if", ""))
-check("T: argocd_preflight needs terraform_sync_once", "terraform_sync_once" in preflight_needs)
-check("T: argocd_preflight's if: requires terraform_sync_once.result == success", "needs.terraform_sync_once.result == \x27success\x27" in preflight_if)
+check("T: argocd_preflight has no needs: of its own (terraform_sync_once's result crosses the reusable-workflow boundary as inputs.result_terraform_sync_once)", (preflight.get("needs") or []) == [])
+check("T: argocd_preflight's if: requires inputs.result_terraform_sync_once == success", "inputs.result_terraform_sync_once == \x27success\x27" in preflight_if)
 
 # U: final_validation still requires terraform_sync_once success on Deploy and permits the intentional skip in Validate mode. Phase 7 Python conversion: this logic now lives in automation/phases/phase7/phase7_final.py (invoked as `python3 automation/phases/phase7/phase7_final.py validate`) -- string-content checks below inspect THAT file, never the (now one-line) YAML step text. Phase 7 grouping: final_validation now lives inside the grouped Phase 7 reusable workflow.
 final_val = phase7_jobs.get("final_validation", {})
@@ -14435,19 +14671,21 @@ fi
 echo ""
 echo "--- Phase 3 Python Conversion: Argo CD ownership/reconciliation/acceptance stay four visible jobs behind the mandatory approval/reusable-workflow/fresh-acceptance boundaries (assertions A-AJ) ---"
 
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$ARGOCD_DEPLOY_WORKFLOW" ] && [ -f "$PHASE3_TOOL" ] && [ -f "$ENVIRONMENT_TOOL" ]; then
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$ARGOCD_DEPLOY_WORKFLOW" ] && [ -f "$PHASE3_WORKFLOW" ] && [ -f "$PHASE3_TOOL" ] && [ -f "$ENVIRONMENT_TOOL" ]; then
   set +e
-  PHASE3_ARCHITECTURE_OUT="$(python3 - "$EKS_APP_WORKFLOW" "$ARGOCD_DEPLOY_WORKFLOW" "$PHASE3_TOOL" "$ENVIRONMENT_TOOL" <<'PYEOF'
+  PHASE3_ARCHITECTURE_OUT="$(python3 - "$EKS_APP_WORKFLOW" "$ARGOCD_DEPLOY_WORKFLOW" "$PHASE3_WORKFLOW" "$PHASE3_TOOL" "$ENVIRONMENT_TOOL" <<'PYEOF'
 import re
 import sys
 
 import yaml
 
-main_path, argocd_path, phase3_tool_path, environment_tool_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+main_path, argocd_path, phase3_wrapper_path, phase3_tool_path, environment_tool_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 with open(main_path) as f:
     main_doc = yaml.safe_load(f)
 with open(argocd_path) as f:
     argocd_doc = yaml.safe_load(f)
+with open(phase3_wrapper_path) as f:
+    phase3_doc = yaml.safe_load(f)
 with open(phase3_tool_path) as f:
     phase3_source = f.read()
 with open(environment_tool_path) as f:
@@ -14462,14 +14700,16 @@ def check(label, ok):
 
 main_jobs = main_doc["jobs"]
 argocd_jobs = argocd_doc["jobs"]
+phase3_jobs = phase3_doc["jobs"]
 
-# A: the four MAIN Phase 3 job IDs exist, deliberately never collapsed into one or two.
-check("A: MAIN defines all four Phase 3 job IDs (argocd_preflight, goldengate_deploy_authorization, reconcile_argocd, validate_argocd_ready)", {"argocd_preflight", "goldengate_deploy_authorization", "reconcile_argocd", "validate_argocd_ready"} <= set(main_jobs.keys()))
+# A: Phase 3 grouping: the four Phase 3 job IDs now live inside the grouped 30-phase-argocd-orchestration.yaml wrapper, deliberately never collapsed into one or two; MAIN itself carries exactly the one grouped caller job (phase_3_argocd) and none of the four internal job IDs directly.
+check("A: 30-phase-argocd-orchestration.yaml defines all four Phase 3 job IDs (argocd_preflight, goldengate_deploy_authorization, reconcile_argocd, validate_argocd_ready)", {"argocd_preflight", "goldengate_deploy_authorization", "reconcile_argocd", "validate_argocd_ready"} <= set(phase3_jobs.keys()))
+check("A2: MAIN defines the single grouped Phase 3 caller job phase_3_argocd, and none of the four internal Phase 3 job IDs directly", "phase_3_argocd" in main_jobs and not ({"argocd_preflight", "goldengate_deploy_authorization", "reconcile_argocd", "validate_argocd_ready"} & set(main_jobs.keys())))
 
-preflight = main_jobs.get("argocd_preflight", {})
-auth = main_jobs.get("goldengate_deploy_authorization", {})
-reconcile = main_jobs.get("reconcile_argocd", {})
-ready = main_jobs.get("validate_argocd_ready", {})
+preflight = phase3_jobs.get("argocd_preflight", {})
+auth = phase3_jobs.get("goldengate_deploy_authorization", {})
+reconcile = phase3_jobs.get("reconcile_argocd", {})
+ready = phase3_jobs.get("validate_argocd_ready", {})
 
 # B/C/D/E: exact display names for the four unavoidable Phase 3 boundaries.
 check("B: argocd_preflight display name is 'Phase 3A | Argo CD Ownership Preflight'", preflight.get("name") == "Phase 3A | Argo CD Ownership Preflight")
@@ -14477,11 +14717,11 @@ check("C: goldengate_deploy_authorization display name is 'Phase 3B | Authorize 
 check("D: reconcile_argocd display name is 'Phase 3C | Reconcile Argo CD Desired State'", reconcile.get("name") == "Phase 3C | Reconcile Argo CD Desired State")
 check("E: validate_argocd_ready display name is 'Phase 3D | Validate Argo CD Healthy'", ready.get("name") == "Phase 3D | Validate Argo CD Healthy")
 
-# F: argocd_preflight runs downstream of Terraform and is Deploy-only.
+# F: Phase 3 grouping: argocd_preflight has no needs: of its own -- validate_model/terraform_sync_once are external Phase 1-2 jobs, so their result/outputs cross the reusable-workflow boundary as plain workflow_call inputs, never a needs: reference to a job outside this file.
 preflight_needs = preflight.get("needs") or []
 preflight_if = str(preflight.get("if", ""))
-check("F: argocd_preflight needs terraform_sync_once", "terraform_sync_once" in preflight_needs)
-check("F: argocd_preflight is Deploy-only (effective_deploy == true) and requires terraform_sync_once success", "effective_deploy == \x27true\x27" in preflight_if and "needs.terraform_sync_once.result == \x27success\x27" in preflight_if)
+check("F: argocd_preflight has no needs: (terraform_sync_once's result crosses the reusable-workflow boundary as inputs.result_terraform_sync_once, never a needs: reference)", preflight_needs == [])
+check("F: argocd_preflight is Deploy-only (inputs.effective_deploy == true) and requires the passed-through terraform_sync_once result to be success (inputs.result_terraform_sync_once == success)", "inputs.effective_deploy == \x27true\x27" in preflight_if and "inputs.result_terraform_sync_once == \x27success\x27" in preflight_if)
 
 # G: argocd_preflight exposes its state output from the ownership_preflight step.
 check("G: argocd_preflight.outputs.state reads steps.ownership_preflight.outputs.state", (preflight.get("outputs") or {}).get("state") == "${{ steps.ownership_preflight.outputs.state }}")
@@ -14534,10 +14774,12 @@ check("O: validate_argocd_ready's Configure AWS credentials step is output-scope
 ready_steps_with_creds = [s for s in ready_steps if "aws_build_credentials.outputs" in str(s.get("env", ""))]
 check("O: only the strict-acceptance step consumes validate_argocd_ready's scoped AWS credentials", ready_steps_with_creds == [acceptance_step] if acceptance_step is not None else False)
 
-# P: Phase 4 (platform_preflight) remains downstream of validate_argocd_ready, never reconcile_argocd -- reconciliation success alone is never treated as proof of health.
+# P: Phase 4 (platform_preflight) remains downstream of validate_argocd_ready's exact result, never reconcile_argocd -- reconciliation success alone is never treated as proof of health. Phase 3 grouping: validate_argocd_ready now lives behind the grouped Phase 3 wrapper, so platform_preflight must depend on phase_3_argocd AND check BOTH the wrapper's own overall result and its exact internal validate_argocd_ready_result output -- checking only the former is never sufficient, since an earlier internal Phase 3 failure and a genuine internal validate_argocd_ready skip are not the same thing.
 platform_preflight = main_jobs.get("platform_preflight", {})
-check("P: platform_preflight needs validate_argocd_ready", "validate_argocd_ready" in (platform_preflight.get("needs") or []))
-check("P: platform_preflight requires needs.validate_argocd_ready.result == success", "needs.validate_argocd_ready.result == \x27success\x27" in str(platform_preflight.get("if", "")))
+check("P: platform_preflight needs phase_3_argocd (validate_argocd_ready now lives behind the grouped Phase 3 wrapper)", "phase_3_argocd" in (platform_preflight.get("needs") or []))
+platform_preflight_if = str(platform_preflight.get("if", ""))
+check("P: platform_preflight requires needs.phase_3_argocd.result == success", "needs.phase_3_argocd.result == \x27success\x27" in platform_preflight_if)
+check("P: platform_preflight also requires needs.phase_3_argocd.outputs.validate_argocd_ready_result == success (the exact internal Phase 3D result, never conflated with the wrapper's own overall result)", "needs.phase_3_argocd.outputs.validate_argocd_ready_result == \x27success\x27" in platform_preflight_if)
 
 # Q: 20-sub-argocd.yaml retains both workflow_dispatch and workflow_call entry modes.
 argocd_on = argocd_doc.get(True, argocd_doc.get("on", {}))
@@ -14998,7 +15240,7 @@ with open(main_path) as f:
     main_doc = yaml.safe_load(f)
 with open(sub_path) as f:
     sub_doc = yaml.safe_load(f)
-check("J: MAIN job count reflects the Phase 7 grouping (26 -> 20: seven Phase 7 jobs replaced by one phase_7_monitor_final_acceptance caller)", len(main_doc.get("jobs", {})) == 20)
+check("J: MAIN job count reflects the Phase 7 + Phase 3 groupings (17)", len(main_doc.get("jobs", {})) == 17)
 check("J: MAIN still defines validate_model and terraform_sync_once", {"validate_model", "terraform_sync_once"} <= set(main_doc.get("jobs", {}).keys()))
 check("J: 10-sub-iam-secrets.yaml still defines exactly validate_environment_config and apply", set(sub_doc.get("jobs", {}).keys()) == {"validate_environment_config", "apply"})
 
@@ -15053,7 +15295,7 @@ EXPECTED_NAMES = {
 # A/B/C
 results.append(("A: all seven MAIN Phase 4 job IDs exist", all(jid in jobs for jid in PHASE4_JOB_IDS)))
 results.append(("B: every Phase 4 job display name exactly matches Phase 4A-G", all(jobs.get(jid, {}).get("name") == name for jid, name in EXPECTED_NAMES.items())))
-results.append(("C: MAIN job count reflects the Phase 7 grouping (26 -> 20: seven Phase 7 jobs replaced by one phase_7_monitor_final_acceptance caller)", len(jobs) == 20))
+results.append(("C: MAIN job count reflects the Phase 7 + Phase 3 groupings (17)", len(jobs) == 17))
 
 platform_preflight = jobs.get("platform_preflight", {})
 observability_preflight = jobs.get("observability_preflight", {})
@@ -15068,9 +15310,9 @@ op_needs = observability_preflight.get("needs") or []
 pp_if = platform_preflight.get("if", "")
 op_if = observability_preflight.get("if", "")
 
-# D/E
-results.append(("D: platform_preflight depends on validate_argocd_ready and NOT on observability_preflight", "validate_argocd_ready" in pp_needs and "observability_preflight" not in pp_needs))
-results.append(("D: observability_preflight depends on validate_argocd_ready and NOT on platform_preflight", "validate_argocd_ready" in op_needs and "platform_preflight" not in op_needs))
+# D/E -- Phase 3 grouping: validate_argocd_ready now lives behind the grouped Phase 3 wrapper, so both preflight jobs depend on phase_3_argocd instead.
+results.append(("D: platform_preflight depends on phase_3_argocd and NOT on observability_preflight", "phase_3_argocd" in pp_needs and "observability_preflight" not in pp_needs))
+results.append(("D: observability_preflight depends on phase_3_argocd and NOT on platform_preflight", "phase_3_argocd" in op_needs and "platform_preflight" not in op_needs))
 results.append(("E: Platform and Observability branches remain parallel siblings (neither if: references the other)", "observability_preflight" not in pp_if and "platform_preflight" not in op_if))
 
 # F/G
@@ -15389,15 +15631,15 @@ expected_names = {
 for job_id, expected_name in expected_names.items():
     results.append((f"B: {job_id} display name is exactly {expected_name!r}", jobs.get(job_id, {}).get("name") == expected_name))
 
-# C: MAIN job count reflects the Phase 7 grouping (26 -> 20: seven Phase 7 jobs replaced by one phase_7_monitor_final_acceptance caller).
-results.append(("C: MAIN job count reflects the Phase 7 grouping (20)", len(jobs) == 20))
+# C: MAIN job count reflects the Phase 7 grouping (26 -> 20: seven Phase 7 jobs replaced by one phase_7_monitor_final_acceptance caller) and the Phase 3 grouping (20 -> 17: four Phase 3 jobs replaced by one phase_3_argocd caller).
+results.append(("C: MAIN job count reflects the Phase 7 + Phase 3 groupings (17)", len(jobs) == 17))
 
 # D: runtime_ownership_preflight still depends on validate_shared_secrets_once.
 results.append(("D: runtime_ownership_preflight still depends on validate_shared_secrets_once", "validate_shared_secrets_once" in (jobs["runtime_ownership_preflight"].get("needs") or [])))
 
-# E: delete_removed_argocd_applications still branches from validate_argocd_ready and does not depend on Phase 4.
+# E: delete_removed_argocd_applications still branches from the Argo health boundary and does not depend on Phase 4. Phase 3 grouping: validate_argocd_ready now lives behind the grouped Phase 3 wrapper, so this job depends on phase_3_argocd instead.
 delete_needs = jobs["delete_removed_argocd_applications"].get("needs") or []
-results.append(("E: delete_removed_argocd_applications depends on validate_argocd_ready", "validate_argocd_ready" in delete_needs))
+results.append(("E: delete_removed_argocd_applications depends on phase_3_argocd", "phase_3_argocd" in delete_needs))
 results.append(("E: delete_removed_argocd_applications does not depend on Phase 4 (platform_preflight/observability_preflight/validate_shared_secrets_once)", not ({"platform_preflight", "observability_preflight", "validate_shared_secrets_once"} & set(delete_needs))))
 
 # F/G/H: matrices retained exactly.
@@ -17486,8 +17728,8 @@ def check(label, ok):
 check("A: replication_reconcile_once job ID remains", "replication_reconcile_once" in jobs)
 check("A: replication_dry_run_validation job ID remains", "replication_dry_run_validation" in jobs)
 
-# B: MAIN total job count reflects the Phase 7 grouping (26 -> 20: seven Phase 7 jobs replaced by one phase_7_monitor_final_acceptance caller; Phase 6 remains an in-place conversion of two EXISTING jobs, never a new one).
-check("B: MAIN total job count reflects the Phase 7 grouping (20)", len(jobs) == 20)
+# B: MAIN total job count reflects the Phase 7 + Phase 3 groupings (26 -> 20 -> 17: seven Phase 7 jobs replaced by one phase_7_monitor_final_acceptance caller, then four Phase 3 jobs replaced by one phase_3_argocd caller; Phase 6 remains an in-place conversion of two EXISTING jobs, never a new one).
+check("B: MAIN total job count reflects the Phase 7 + Phase 3 groupings (17)", len(jobs) == 17)
 
 # C/D: needs/if contract preserved exactly.
 reconcile_job = jobs["replication_reconcile_once"]
@@ -19082,15 +19324,16 @@ PHASE7_JOB_IDS = (
 )
 CALLER_JOB_ID = "phase_7_monitor_final_acceptance"
 PHASE7_FILENAME = "70-phase-monitor-final-acceptance.yaml"
+# Phase 3 grouping: validate_argocd_ready is replaced by phase_3_argocd here -- one dependency swapped, never dropped (see G/G2 below for the exact with: fallback-mapping this substitution requires).
 EXTERNAL_RESULT_JOBS = (
     "validate_model", "terraform_sync_once", "validate_shared_secrets_once",
-    "validate_argocd_ready", "validate_platform_ready", "validate_observability_ready",
+    "phase_3_argocd", "validate_platform_ready", "validate_observability_ready",
     "runtime_ownership_preflight", "build_publish_and_deploy", "delete_removed_argocd_applications",
     "validate_active_runtimes", "replication_reconcile_once", "replication_dry_run_validation",
 )
 
-# A: MAIN has exactly 20 jobs (26 - 7 Phase 7 jobs + 1 Phase 7 caller).
-check("A: MAIN has exactly 20 jobs", len(jobs) == 20)
+# A: MAIN has exactly 17 jobs (26 - 7 Phase 7 jobs + 1 Phase 7 caller, then 20 - 4 Phase 3 jobs + 1 Phase 3 caller).
+check("A: MAIN has exactly 17 jobs", len(jobs) == 17)
 
 # B: MAIN no longer directly contains any of the seven Phase 7 job IDs.
 for job_id in PHASE7_JOB_IDS:
@@ -19121,10 +19364,18 @@ EXPECTED_CALLER_WITH = {
     "has_deletions": "needs.validate_model.outputs.has_deletions",
 }
 for job_id in EXTERNAL_RESULT_JOBS:
+    if job_id == "phase_3_argocd":
+        # Phase 3 grouping: handled specially below (G2) -- the with: key name (result_validate_argocd_ready) is UNCHANGED even though the source job id changed, and its value uses the fallback-OR expression, never the generic needs.<job_id>.result pattern every other external job uses.
+        continue
     EXPECTED_CALLER_WITH[f"result_{job_id}"] = f"needs.{job_id}.result"
 for input_name, expected_ref in EXPECTED_CALLER_WITH.items():
     check(f"G: {CALLER_JOB_ID} passes with.{input_name} sourced from {expected_ref}", expected_ref in str(caller_with.get(input_name, "")))
-check("G: the caller passes exactly the required 17 workflow_call inputs, never more, never fewer", sorted(caller_with.keys()) == sorted(EXPECTED_CALLER_WITH.keys()))
+ALL_EXPECTED_WITH_KEYS = sorted(list(EXPECTED_CALLER_WITH.keys()) + ["result_validate_argocd_ready"])
+check("G: the caller passes exactly the required 17 workflow_call inputs, never more, never fewer", sorted(caller_with.keys()) == ALL_EXPECTED_WITH_KEYS)
+
+# G2: Phase 3 grouping -- result_validate_argocd_ready (the Phase 7 wrapper own input name, UNCHANGED/never renamed) is now sourced via the exact fallback-OR expression against phase_3_argocd, never a bare needs.phase_3_argocd.result alone: an earlier internal Phase 3 failure can fail the wrapper while validate_argocd_ready itself is genuinely SKIPPED, and phase7_final.py intentionally distinguishes those states.
+EXPECTED_RESULT_VALIDATE_ARGOCD_READY = "${{ needs.phase_3_argocd.outputs.validate_argocd_ready_result || needs.phase_3_argocd.result }}"
+check("G2: the caller passes with.result_validate_argocd_ready sourced from the exact fallback expression needs.phase_3_argocd.outputs.validate_argocd_ready_result || needs.phase_3_argocd.result", str(caller_with.get("result_validate_argocd_ready", "")) == EXPECTED_RESULT_VALIDATE_ARGOCD_READY)
 
 # H: the grouped Phase 7 workflow contains exactly the seven approved internal jobs, with the exact approved IDs.
 check("H: 70-phase-monitor-final-acceptance.yaml contains exactly the seven approved Phase 7 job IDs, no more, no fewer", sorted(phase7_jobs.keys()) == sorted(PHASE7_JOB_IDS))
@@ -19290,7 +19541,11 @@ final_val_gate_env = (final_val_gate_step or {}).get("env") or {}
 mode_key_to_input_name = {"EFFECTIVE_DEPLOY": "effective_deploy", "HAS_ACTIVE_DEPLOYMENTS": "has_active_deployments", "HAS_CHANGES": "has_changes", "HAS_DELETIONS": "has_deletions"}
 check("13b/O: final_validation'"'"'s gate step maps EFFECTIVE_DEPLOY/HAS_ACTIVE_DEPLOYMENTS/HAS_CHANGES/HAS_DELETIONS from inputs.* into plain env: values", all(f"inputs.{input_name}" in str(final_val_gate_env.get(env_key, "")) for env_key, input_name in mode_key_to_input_name.items()))
 for job_id in EXTERNAL_RESULT_JOBS:
+    if job_id == "phase_3_argocd":
+        # Phase 3 grouping: 70-phase-monitor-final-acceptance.yaml and phase7_final.py are both FROZEN (byte-for-byte unchanged) -- the env key here is still RESULT_validate_argocd_ready, mapped from inputs.result_validate_argocd_ready (the Phase 7 wrapper own input name, unchanged), never RESULT_phase_3_argocd/inputs.result_phase_3_argocd. Checked explicitly below instead.
+        continue
     check(f"O: final_validation'"'"'s gate step maps RESULT_{job_id} from inputs.result_{job_id} (external)", f"inputs.result_{job_id}" in str(final_val_gate_env.get(f"RESULT_{job_id}", "")))
+check("O: final_validation'"'"'s gate step maps RESULT_validate_argocd_ready from inputs.result_validate_argocd_ready (external, input name unchanged by the Phase 3 grouping)", "inputs.result_validate_argocd_ready" in str(final_val_gate_env.get("RESULT_validate_argocd_ready", "")))
 for job_id in ("monitor_ownership_preflight", "monitor_sync_once", "monitor_dry_run_validation", "validate_monitor_ready", "replication_monitor_acceptance", "end_to_end_deployment_acceptance"):
     check(f"O: final_validation'"'"'s gate step maps RESULT_{job_id} from needs.{job_id}.result (internal Phase 7 reference)", f"needs.{job_id}.result" in str(final_val_gate_env.get(f"RESULT_{job_id}", "")))
 check("O: final_validation'"'"'s gate step maps exactly 18 RESULT_* values, no more, no fewer", len([k for k in final_val_gate_env if k.startswith("RESULT_")]) == 18)
