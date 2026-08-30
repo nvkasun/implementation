@@ -127,6 +127,10 @@ def _scraper_deployment(namespace="amazon-cloudwatch", uid=CURRENT_DEPLOY_UID, s
     }
 
 
+# Sentinel for _scraper_pod(host_network=...): the real live-VDR failure was Kubernetes omitting the PodSpec hostNetwork key ENTIRELY (an effective-false default), which is not the same test input as explicitly passing False -- a plain "host_network=False" default parameter can never distinguish "explicitly false" from "omitted" in the constructed fixture. Pass HOST_NETWORK_OMITTED to model the real Kubernetes response shape that triggered VDR.
+HOST_NETWORK_OMITTED = object()
+
+
 def _scraper_pod(name, replicaset_name, replicaset_uid=None, phase="Running", ready=True, deletion_timestamp=None,
                   host_network=False, pod_ip="10.0.0.5", host_ip="10.0.1.9",
                   service_account="cloudwatch-agent", env_names=("AWS_ROLE_ARN", "AWS_WEB_IDENTITY_TOKEN_FILE"),
@@ -138,13 +142,16 @@ def _scraper_pod(name, replicaset_name, replicaset_uid=None, phase="Running", re
     metadata = {"name": name, "ownerReferences": [owner_ref]}
     if deletion_timestamp:
         metadata["deletionTimestamp"] = deletion_timestamp
+    spec = {
+        "serviceAccountName": service_account,
+        "containers": [{"name": container_name, "env": [{"name": n, "value": "irrelevant"} for n in env_names]}],
+    }
+    if host_network is not HOST_NETWORK_OMITTED:
+        spec["hostNetwork"] = host_network
     return {
         "metadata": metadata,
         "status": {"phase": phase, "conditions": [{"type": "Ready", "status": "True" if ready else "False"}], "podIP": pod_ip, "hostIP": host_ip},
-        "spec": {
-            "hostNetwork": host_network, "serviceAccountName": service_account,
-            "containers": [{"name": container_name, "env": [{"name": n, "value": "irrelevant"} for n in env_names]}],
-        },
+        "spec": spec,
     }
 
 
@@ -1046,6 +1053,24 @@ class PreIrsaActiveScraperPodTests(unittest.TestCase):
             self._run_with([pod], {"rs-current": _replicaset_owned_by_deployment(CURRENT_DEPLOY_UID)})
         self.assertIn("hostNetwork", str(ctx.exception))
 
+    # A: VDR live-fix regression -- the exact Kubernetes response shape that triggered the live failure (hostNetwork key entirely ABSENT, an effective-false default) must PASS, never be misclassified as unsafe.
+    def test_current_pod_hostnetwork_omitted_passes(self):
+        pod = _scraper_pod("scraper-current", "rs-current", host_network=HOST_NETWORK_OMITTED)
+        self._run_with([pod], {"rs-current": _replicaset_owned_by_deployment(CURRENT_DEPLOY_UID)})
+
+    # C: malformed non-Boolean hostNetwork values must fail closed -- never silently normalized to true or false by the omitted-field fix above.
+    def test_current_pod_malformed_hostnetwork_string_fails_closed(self):
+        pod = _scraper_pod("scraper-current", "rs-current", host_network="false")
+        with self.assertRaises(phase4_observability.Phase4Error) as ctx:
+            self._run_with([pod], {"rs-current": _replicaset_owned_by_deployment(CURRENT_DEPLOY_UID)})
+        self.assertIn("hostNetwork", str(ctx.exception))
+
+    def test_current_pod_malformed_hostnetwork_integer_fails_closed(self):
+        pod = _scraper_pod("scraper-current", "rs-current", host_network=1)
+        with self.assertRaises(phase4_observability.Phase4Error) as ctx:
+            self._run_with([pod], {"rs-current": _replicaset_owned_by_deployment(CURRENT_DEPLOY_UID)})
+        self.assertIn("hostNetwork", str(ctx.exception))
+
     def test_current_pod_podip_equals_hostip_fails(self):
         pod = _scraper_pod("scraper-current", "rs-current", pod_ip="10.0.0.5", host_ip="10.0.0.5")
         with self.assertRaises(phase4_observability.Phase4Error) as ctx:
@@ -1620,6 +1645,26 @@ class FinalLiveValidationLogTests(unittest.TestCase):
              mock.patch.object(phase4_observability, "_pods_for_selector", side_effect=fake_pods_for_selector), \
              mock.patch.object(phase4_observability, "run", fake_run):
             _run_quiet(phase4_observability._live_kubernetes_validation, namespace, self.ROLE_ARN, self.ECR_REGISTRY)
+
+    # D: VDR live-fix regression -- a current-revision scraper pod with hostNetwork KEY ABSENT (otherwise valid) must NOT fail this final live validation's hostNetwork check.
+    def test_current_pod_hostnetwork_omitted_does_not_fail_final_validation(self):
+        current_pod = _scraper_pod("scraper-current", "rs-current", host_network=HOST_NETWORK_OMITTED)
+        self._run_with(
+            [current_pod],
+            {"rs-current": _replicaset_owned_by_deployment(CURRENT_DEPLOY_UID)},
+            {"scraper-current": "clean", "node-agent-1": "clean"},
+        )
+
+    # E: explicit hostNetwork=True must still fail this final live validation after the omitted-field fix.
+    def test_current_pod_hostnetwork_true_fails_final_validation(self):
+        current_pod = _scraper_pod("scraper-current", "rs-current", host_network=True)
+        with self.assertRaises(phase4_observability.Phase4Error) as ctx:
+            self._run_with(
+                [current_pod],
+                {"rs-current": _replicaset_owned_by_deployment(CURRENT_DEPLOY_UID)},
+                {"scraper-current": "clean", "node-agent-1": "clean"},
+            )
+        self.assertIn("hostNetwork", str(ctx.exception))
 
     def test_stale_scraper_port_collision_ignored(self):
         stale_pod = _scraper_pod("scraper-stale", "rs-stale")

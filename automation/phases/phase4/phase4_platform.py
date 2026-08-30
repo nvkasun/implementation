@@ -245,6 +245,13 @@ def _validate_fluent_bit_image_format(fluent_bit_image, ecr_registry):
         raise Phase4Error(str(exc)) from exc
 
 
+def _derive_fluent_bit_ecr_digest(fluent_bit_image, ecr_registry):
+    """The single producer of the fluent_bit_ecr_digest state value cmd_verify_fluent_bit_artifact() later consumes unchanged -- must be called only after _validate_fluent_bit_image_format() has already confirmed fluent_bit_image matches the approved <ECR_REGISTRY>/aws-cloud-factory-fluent-bit@sha256:<64hex> shape. Returns the CANONICAL ECR digest form (sha256:<64hex>) that aws ecr describe-images --image-ids imageDigest=<value> requires -- never the bare hex alone, which fails ECR's own imageDigest regex with InvalidParameterException."""
+    expected_prefix = f"{ecr_registry}/{FLUENT_BIT_ECR_REPOSITORY_EXPECTED}@sha256:"
+    digest_hex = fluent_bit_image[len(expected_prefix):]
+    return f"sha256:{digest_hex}"
+
+
 # Phase 4A: platform ownership preflight (platform_preflight)
 
 def cmd_ownership_preflight(args):
@@ -587,8 +594,7 @@ def cmd_prepare_and_validate(args):
     fluent_bit_image = require_env("FLUENT_BIT_IMAGE")
 
     _validate_fluent_bit_image_format(fluent_bit_image, ecr_registry)
-    expected_prefix = f"{ecr_registry}/{FLUENT_BIT_ECR_REPOSITORY_EXPECTED}@sha256:"
-    fluent_bit_ecr_digest = fluent_bit_image[len(expected_prefix):]
+    fluent_bit_ecr_digest = _derive_fluent_bit_ecr_digest(fluent_bit_image, ecr_registry)
     print(f"OK: FLUENT_BIT_IMAGE is a validly-formatted private immutable digest reference. Repository: {FLUENT_BIT_ECR_REPOSITORY_EXPECTED}. Digest: {fluent_bit_ecr_digest}")
 
     chart_version = f"0.1.{run_number}"

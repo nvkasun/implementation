@@ -328,22 +328,66 @@ class RenderedManifestValidationTests(unittest.TestCase):
 
 
 class FluentBitEcrPreflightTests(TempStateCase):
+    """VDR live-run correction: state now always stores the CANONICAL ECR digest form (sha256:<64hex>) that cmd_prepare_and_validate() actually produces via _derive_fluent_bit_ecr_digest() -- the previous bare-hex state shape here was itself the bug (it made aws ecr describe-images --image-ids imageDigest=<64hex> fail ECR's own regex with InvalidParameterException in the live VDR run)."""
+
+    CANONICAL_DIGEST = f"sha256:{FLUENT_BIT_DIGEST}"
+
     def setUp(self):
         super().setUp()
         phase4_platform.update_state(self.state_path, {
             "fluent_bit_ecr_repository": "aws-cloud-factory-fluent-bit",
-            "fluent_bit_ecr_digest": FLUENT_BIT_DIGEST,
+            "fluent_bit_ecr_digest": self.CANONICAL_DIGEST,
         })
 
+    # A + C: a valid canonical (sha256:<64hex>) state digest, with ECR describe-images returning the matching canonical imageDigest, results in successful verification -- this is the test that PREVIOUSLY was named "passes" but actually asserted Phase4Error, codifying the live-VDR bug.
     def test_digest_exists_passes(self):
         scripted = ScriptedRun()
         scripted.when(_starts_with("aws", "sts", "get-caller-identity"), FakeProc(0, ECR_ACCOUNT_ID + "\n"))
-        scripted.when(_starts_with("aws", "ecr", "describe-images"), FakeProc(0, json.dumps({"imageDetails": [{"imageDigest": f"sha256:{FLUENT_BIT_DIGEST}"}]})))
+        scripted.when(_starts_with("aws", "ecr", "describe-images"), FakeProc(0, json.dumps({"imageDetails": [{"imageDigest": self.CANONICAL_DIGEST}]})))
         with mock.patch.object(phase4_platform, "run", scripted), _env_patch():
-            with self.assertRaises(phase4_platform.Phase4Error):
-                # digest stored without sha256: prefix in state; describe-images call uses it as-is, so this exercises the wiring, not a false-positive match.
-                _run_quiet(phase4_platform.cmd_verify_fluent_bit_artifact, self.args)
+            _run_quiet(phase4_platform.cmd_verify_fluent_bit_artifact, self.args)
+        describe_calls = [c for c in scripted.calls if c["argv"][:3] == ["aws", "ecr", "describe-images"]]
+        self.assertEqual(len(describe_calls), 1)
 
+    # B: the exact mocked AWS argv must contain the canonical "imageDigest=sha256:<64hex>" form, never the bare-hex "imageDigest=<64hex>" that caused the live VDR InvalidParameterException.
+    def test_verify_uses_canonical_image_digest_argv_never_bare_hex(self):
+        scripted = ScriptedRun()
+        scripted.when(_starts_with("aws", "sts", "get-caller-identity"), FakeProc(0, ECR_ACCOUNT_ID + "\n"))
+        scripted.when(_starts_with("aws", "ecr", "describe-images"), FakeProc(0, json.dumps({"imageDetails": [{"imageDigest": self.CANONICAL_DIGEST}]})))
+        with mock.patch.object(phase4_platform, "run", scripted), _env_patch():
+            _run_quiet(phase4_platform.cmd_verify_fluent_bit_artifact, self.args)
+        describe_call = next(c for c in scripted.calls if c["argv"][:3] == ["aws", "ecr", "describe-images"])
+        self.assertIn(f"imageDigest={self.CANONICAL_DIGEST}", describe_call["argv"])
+        self.assertNotIn(f"imageDigest={FLUENT_BIT_DIGEST}", describe_call["argv"])
+
+    # D: a wrong (mismatched) digest returned by ECR still fails closed, even though the request itself succeeded structurally.
+    def test_wrong_returned_digest_fails_closed(self):
+        scripted = ScriptedRun()
+        scripted.when(_starts_with("aws", "sts", "get-caller-identity"), FakeProc(0, ECR_ACCOUNT_ID + "\n"))
+        scripted.when(_starts_with("aws", "ecr", "describe-images"), FakeProc(0, json.dumps({"imageDetails": [{"imageDigest": f"sha256:{'b' * 64}"}]})))
+        with mock.patch.object(phase4_platform, "run", scripted), _env_patch():
+            with self.assertRaises(phase4_platform.Phase4Error) as ctx:
+                _run_quiet(phase4_platform.cmd_verify_fluent_bit_artifact, self.args)
+        self.assertIn("ECR returned digest", str(ctx.exception))
+
+    # F: producer -> consumer regression proof -- the REAL _derive_fluent_bit_ecr_digest() producer function's output is written to the real state-file boundary and consumed UNCHANGED by the REAL cmd_verify_fluent_bit_artifact(), never a value hand-computed/reimplemented in the test. This is exactly the seam that drifted in the live VDR failure (producer wrote bare hex, consumer sent it to AWS as-is) -- this test fails if the two ever disagree again.
+    def test_producer_consumer_digest_contract_never_drifts(self):
+        produced_digest = phase4_platform._derive_fluent_bit_ecr_digest(FLUENT_BIT_IMAGE, ECR_REGISTRY)
+        self.assertTrue(produced_digest.startswith("sha256:"), f"producer must emit the canonical sha256:<hex> form, got {produced_digest!r}")
+
+        state = phase4_platform.load_state(self.state_path)
+        state["fluent_bit_ecr_digest"] = produced_digest
+        phase4_platform.save_state(self.state_path, state)
+
+        scripted = ScriptedRun()
+        scripted.when(_starts_with("aws", "sts", "get-caller-identity"), FakeProc(0, ECR_ACCOUNT_ID + "\n"))
+        scripted.when(_starts_with("aws", "ecr", "describe-images"), FakeProc(0, json.dumps({"imageDetails": [{"imageDigest": produced_digest}]})))
+        with mock.patch.object(phase4_platform, "run", scripted), _env_patch():
+            _run_quiet(phase4_platform.cmd_verify_fluent_bit_artifact, self.args)
+        describe_call = next(c for c in scripted.calls if c["argv"][:3] == ["aws", "ecr", "describe-images"])
+        self.assertIn(f"imageDigest={produced_digest}", describe_call["argv"])
+
+    # E: RepositoryNotFound/ImageNotFound/unknown AWS errors and wrong caller account all retain their existing fail-closed behavior against the canonical state shape.
     def test_repository_not_found_fails(self):
         scripted = ScriptedRun()
         scripted.when(_starts_with("aws", "sts", "get-caller-identity"), FakeProc(0, ECR_ACCOUNT_ID + "\n"))

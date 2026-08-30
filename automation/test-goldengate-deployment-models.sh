@@ -1044,6 +1044,17 @@ assert not (names & forbidden), names & forbidden
     fail "${ARGOCD_DEPLOY_WORKFLOW} not found"
   fi
 
+  # VDR live-run correction (Defect 1: Phase 4B Fluent Bit ECR digest contract): 30-sub-platform.yaml's own dedicated offline unit-test suite (FLUENT_BIT_IMAGE format validation, rendered-manifest structural validation, the canonical ECR imageDigest producer/consumer contract exercised end-to-end through the real state-file boundary, ECR repository/policy fail-closed classification, ownership-preflight/strict-acceptance delegation), no live AWS/Kubernetes/Helm. Previously this file existed but was never invoked wholesale from this repository-wide regression entry point -- closing that gap here protects the exact producer/consumer digest-format regression this correction fixes.
+  if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/phases/phase4/tests/test_phase4_platform.py ]; then
+    if PHASE4_PLATFORM_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/phases/phase4/tests/test_phase4_platform.py 2>&1)"; then
+      pass "Phase 4 Python Conversion: automation/phases/phase4/tests/test_phase4_platform.py (the Phase 4 Platform orchestrator's offline test suite) passes"
+    else
+      fail "Phase 4 Python Conversion: automation/phases/phase4/tests/test_phase4_platform.py failed:"$'\n'"${PHASE4_PLATFORM_TEST_OUTPUT}"
+    fi
+  else
+    skip "Phase 4 Python Conversion: automation/phases/phase4/tests/test_phase4_platform.py -- python3 unavailable or file missing"
+  fi
+
   # Phase 4 Python Conversion: 40-sub-observability.yaml's own dedicated offline unit-test suite (image inventory, digest resolution, ECR immutability, generated-values semantic contract, recursive image extraction, forbidden-component checks, Application manifest contract, Argo wait bounds, cluster-scraper host-network correction, IRSA verification, DaemonSet full-readiness, the 90-second CloudWatch export-error observation, ownership-preflight/strict-acceptance), no live AWS/Kubernetes/ECR. This supersedes the historical Phase 6B2B/6B2A/etc. line-item checks that used to extract and grep literal inline bash from 40-sub-observability.yaml -- that behavior now lives in automation/phases/phase4/phase4_observability.py, and its real properties are proven below by running its actual test suite and by direct structural delegation checks, never by re-deriving a second, independent regex proof against extracted bash text.
   if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f automation/phases/phase4/tests/test_phase4_observability.py ]; then
     if PHASE4_OBSERVABILITY_TEST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 python3 automation/phases/phase4/tests/test_phase4_observability.py 2>&1)"; then

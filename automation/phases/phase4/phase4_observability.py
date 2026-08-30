@@ -967,8 +967,10 @@ def _validate_active_cluster_scraper_pods_pre_irsa(namespace):
         pod_name = (pod.get("metadata") or {}).get("name")
         spec = pod.get("spec") or {}
         status = pod.get("status") or {}
-        if spec.get("hostNetwork") is not False:
-            raise Phase4Error(f"cluster-scraper pod {pod_name} spec.hostNetwork is {spec.get('hostNetwork')!r}, expected literal false.")
+        # Kubernetes omits an effective-false/default PodSpec field from the returned JSON -- spec.get("hostNetwork") alone would then be None, not False, and a genuinely safe non-host-networked pod would be misclassified as unsafe. Explicit true still fails; any non-Boolean value (malformed API data) is never silently coerced into either true or false.
+        raw_host_network = spec.get("hostNetwork", False)
+        if raw_host_network is not False:
+            raise Phase4Error(f"cluster-scraper pod {pod_name} spec.hostNetwork is {raw_host_network!r}, expected literal false (or the field to be omitted, which defaults to false).")
         pod_ip = status.get("podIP")
         host_ip = status.get("hostIP")
         if not pod_ip:
@@ -1206,8 +1208,10 @@ def _live_kubernetes_validation(namespace, cloudwatch_metrics_role_arn, ecr_regi
     if not current_running_scraper_pods:
         raise Phase4Error("no active current-revision (Running) cluster-scraper pods found.")
     for pod in current_running_scraper_pods:
-        if (pod.get("spec") or {}).get("hostNetwork") is not False:
-            raise Phase4Error(f"cluster-scraper pod {(pod.get('metadata') or {}).get('name')} spec.hostNetwork is not false.")
+        # Same effective-false/omitted-field semantics as _validate_active_cluster_scraper_pods_pre_irsa(): Kubernetes may omit this PodSpec field entirely when it is false, so .get(...) alone (defaulting to None) would misclassify a genuinely safe pod as unsafe. Explicit true still fails; a malformed non-Boolean value is never silently accepted.
+        raw_host_network = (pod.get("spec") or {}).get("hostNetwork", False)
+        if raw_host_network is not False:
+            raise Phase4Error(f"cluster-scraper pod {(pod.get('metadata') or {}).get('name')} spec.hostNetwork is {raw_host_network!r}, expected literal false (or the field to be omitted, which defaults to false).")
 
     crash_pattern = re.compile(r"bind: address already in use|binding address localhost:8888|listen tcp 127\.0\.0\.1:8888|failed to create SDK", re.IGNORECASE)
     for pod in _pods_for_selector(namespace, _label_selector(cw_ds)) + current_running_scraper_pods:
