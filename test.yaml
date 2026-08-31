@@ -8,6 +8,9 @@ module "oracle_db_vm01" {
   subnet_id    = module.base-infra.subnet_map["snet-lb-cl-factory-uaenorth-001"].id
   key_vault_id = module.azure_key_vault.id
 
+  dns_servers   = []
+  computer_name = "oracledb01"
+
   vm = {
     os_type = "linux"
   }
@@ -40,13 +43,5 @@ module "oracle_db_vm01" {
   encryption_at_host_enabled     = false
   patch_mode_linux               = "ImageDefault"
 
-  mandatory_tags = {
-    environment = var.environment
-    application = var.application_name
-    owner       = "TechnologyPlatform"
-    cost_center = "219"
-    managed_by  = "terraform"
-  }
-
-  additional_tags = local.tags
+  tags = local.tags
 }
