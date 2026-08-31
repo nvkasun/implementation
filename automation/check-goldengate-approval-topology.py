@@ -39,6 +39,8 @@ PHASE4_PLATFORM_SYNC_JOB = "platform_sync_once"
 PHASE4_OBSERVABILITY_SYNC_JOB = "observability_sync_once"
 # Phase 5 grouping: delete_removed_argocd_applications (Phase 5C) moved off MAIN entirely into PHASE5_WRAPPER_FILENAME -- the deletion-authorization proof below now spans THREE documents (MAIN -> PHASE3_WRAPPER_FILENAME -> PHASE5_WRAPPER_FILENAME) instead of two, and the wrapper's own internal 5C if: is checked directly (its inputs.* boundary references never appear as needs.<job>.result the way an ordinary MAIN job's would).
 PHASE5_WRAPPER_FILENAME = "50-phase-goldengate-runtimes.yaml"
+# Phase 6 grouping: replication_reconcile_once/replication_dry_run_validation moved off MAIN into PHASE6_WRAPPER_FILENAME -- neither job ever mutated Kubernetes/AWS behind an approval gate of its own (Phase 6A's reconciliation is already downstream of the single Phase 3 authorization via Phase 5's own gate chain), so the only invariant this wrapper must uphold is the same one every other phase wrapper upholds: workflow_call-only, zero job-level environment: gates of its own.
+PHASE6_WRAPPER_FILENAME = "60-phase-goldengate-replication.yaml"
 PHASE5_WRAPPER_CALLER_JOB = "phase_5_goldengate_runtimes"
 PHASE5_DELETION_JOB = "delete_removed_argocd_applications"
 CORPORATE_TERRAFORM_WORKFLOW_FILENAME = "10-sub-iam-secrets.yaml"
@@ -403,6 +405,22 @@ def check_phase5_wrapper_opens_no_second_authorization(wrapper_doc, findings):
         findings.append(f"{PHASE5_WRAPPER_FILENAME}: must declare zero job-level environment: keys (found on {envs}) -- it must never open a second GoldenGate deployment approval; the single goldengate_deploy_authorization inside {PHASE3_WRAPPER_FILENAME!r} already covers this chain")
 
 
+def check_phase6_wrapper_is_workflow_call_only(wrapper_doc, findings):
+    """Phase 6 grouping: the Phase 6 wrapper is an internal orchestration wrapper, never an independent second operator-facing entry point -- it must expose workflow_call only."""
+    on_block = _on_block(wrapper_doc)
+    extra_triggers = [t for t in ("workflow_dispatch", "push", "pull_request", "schedule") if t in on_block]
+    if extra_triggers:
+        findings.append(f"{PHASE6_WRAPPER_FILENAME}: must expose workflow_call only -- found additional trigger(s) {sorted(extra_triggers)!r}")
+
+
+def check_phase6_wrapper_opens_no_second_authorization(wrapper_doc, findings):
+    """Phase 6 grouping: the Phase 6 wrapper is a pure orchestration passthrough -- it must never declare its own job-level environment: , which would open a second, redundant GoldenGate deployment approval alongside the single goldengate_deploy_authorization inside PHASE3_WRAPPER_FILENAME, exactly like the Phase 4/Phase 5/Phase 7 wrappers."""
+    jobs = _jobs(wrapper_doc)
+    envs = [name for name, job in jobs.items() if isinstance(job, dict) and _job_environment(job) is not None]
+    if envs:
+        findings.append(f"{PHASE6_WRAPPER_FILENAME}: must declare zero job-level environment: keys (found on {envs}) -- it must never open a second GoldenGate deployment approval; the single goldengate_deploy_authorization inside {PHASE3_WRAPPER_FILENAME!r} already covers this chain")
+
+
 def check_deletion_job_appears_in_exactly_one_workflow(workflow_dir, findings):
     """Phase 5 grouping: exactly one approved deletion job exists anywhere in the repository's active workflows -- PHASE5_DELETION_JOB must appear in PHASE5_WRAPPER_FILENAME and nowhere else (never a second, duplicate deletion path bypassing the wrapper, e.g. reintroduced directly in MAIN -- negative fixture 7)."""
     owners = []
@@ -610,6 +628,16 @@ def run_checks(workflow_dir):
         check_environment_variable_not_exposed_as_secret(PHASE5_WRAPPER_FILENAME, phase5_wrapper_doc, findings)
     else:
         findings.append(f"{PHASE5_WRAPPER_FILENAME}: expected file does not exist")
+
+    phase6_wrapper_path = os.path.join(workflow_dir, PHASE6_WRAPPER_FILENAME)
+    if os.path.exists(phase6_wrapper_path):
+        phase6_wrapper_doc = load_workflow(phase6_wrapper_path)
+        workflows_inspected += 1
+        check_phase6_wrapper_opens_no_second_authorization(phase6_wrapper_doc, findings)
+        check_phase6_wrapper_is_workflow_call_only(phase6_wrapper_doc, findings)
+        check_environment_variable_not_exposed_as_secret(PHASE6_WRAPPER_FILENAME, phase6_wrapper_doc, findings)
+    else:
+        findings.append(f"{PHASE6_WRAPPER_FILENAME}: expected file does not exist")
 
     check_deletion_job_appears_in_exactly_one_workflow(workflow_dir, findings)
 

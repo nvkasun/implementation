@@ -17,7 +17,8 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[4]
 TOOL_PATH = REPO_ROOT / "automation" / "phases" / "phase6" / "phase6_replication.py"
 ENGINE_TOOL_PATH = REPO_ROOT / "automation" / "goldengate-replication.py"
-WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "00-main-goldengate-orchestrator.yaml"
+# Phase 6 grouping: replication_reconcile_once/replication_dry_run_validation now live inside the grouped Phase 6 reusable workflow, never directly in MAIN -- this constant tracks the job's actual current file, never re-pointed at MAIN merely to preserve a stale path.
+WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "60-phase-goldengate-replication.yaml"
 
 
 def _load_tool(path, name):

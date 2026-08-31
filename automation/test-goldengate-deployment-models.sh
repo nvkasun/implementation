@@ -24,6 +24,7 @@ PHASE7_WORKFLOW=".github/workflows/70-phase-monitor-final-acceptance.yaml"
 PHASE3_WORKFLOW=".github/workflows/30-phase-argocd-orchestration.yaml"
 PHASE4_WORKFLOW=".github/workflows/40-phase-platform-observability-shared-secrets.yaml"
 PHASE5_WORKFLOW=".github/workflows/50-phase-goldengate-runtimes.yaml"
+PHASE6_WORKFLOW=".github/workflows/60-phase-goldengate-replication.yaml"
 PLATFORM_WORKFLOW=".github/workflows/30-sub-platform.yaml"
 DETECT_SCRIPT="automation/phases/phase1/detect-goldengate-deployments.sh"
 PHASE1_TOOL="automation/phases/phase1/phase1_readiness.py"
@@ -4786,8 +4787,8 @@ MONITOR_PY="monitoring/monitor/monitor.py"
 MONITOR_WORKFLOW=".github/workflows/50-sub-monitor.yaml"
 
 if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  # This narrow Phase 6C1B guard originally proved that phase's changes were made in place to the (then single) monitor workflow file, never by adding a parallel duplicate. The workflow naming/operator UX standardization task later legitimately renamed all nine workflow files in place -- each rename is a content move, not a new parallel workflow -- so the nine canonical renamed filenames are expected/allowed here; any other new workflow file remains exactly the violation this check was written to catch. The rename itself is now guarded by the dedicated, more precise "Workflow naming / operator UX standardization" section later in this suite (exactly-one-MAIN, exact SUB/OPS sets, zero stale old-filename references) -- the same supersession pattern already used for cloudwatch-observability-artifact-sync.yaml's release from check 15's byte-diff guard by Phase 11. Phase 7 grouping: 70-phase-monitor-final-acceptance.yaml is one exact, approved new workflow file this task adds (an internal MAIN-orchestration wrapper, never a new operator-facing SUB/OPS workflow) -- explicitly whitelisted here, never a relaxation to allow arbitrary new files. Phase 3 grouping: 30-phase-argocd-orchestration.yaml is the second such approved internal wrapper, added the same way and whitelisted the same way. Phase 4 grouping: 40-phase-platform-observability-shared-secrets.yaml is the third such approved internal wrapper, added the same way and whitelisted the same way. Phase 5 grouping: 50-phase-goldengate-runtimes.yaml is the fourth such approved internal wrapper, added the same way and whitelisted the same way.
-  NEW_WORKFLOW_FILES="$(git status --porcelain=v1 -- .github/workflows/ 2>/dev/null | grep -E '^\?\?' | grep -vE '^\?\? \.github/workflows/(00-main-goldengate-orchestrator|10-sub-iam-secrets|20-sub-argocd|30-sub-platform|30-phase-argocd-orchestration|40-sub-observability|40-phase-platform-observability-shared-secrets|50-sub-monitor|50-phase-goldengate-runtimes|70-phase-monitor-final-acceptance|80-ops-monitor-metrics-config|90-ops-observability-artifact-sync|91-ops-ecr-image-sync)\.yaml$' || true)"
+  # This narrow Phase 6C1B guard originally proved that phase's changes were made in place to the (then single) monitor workflow file, never by adding a parallel duplicate. The workflow naming/operator UX standardization task later legitimately renamed all nine workflow files in place -- each rename is a content move, not a new parallel workflow -- so the nine canonical renamed filenames are expected/allowed here; any other new workflow file remains exactly the violation this check was written to catch. The rename itself is now guarded by the dedicated, more precise "Workflow naming / operator UX standardization" section later in this suite (exactly-one-MAIN, exact SUB/OPS sets, zero stale old-filename references) -- the same supersession pattern already used for cloudwatch-observability-artifact-sync.yaml's release from check 15's byte-diff guard by Phase 11. Phase 7 grouping: 70-phase-monitor-final-acceptance.yaml is one exact, approved new workflow file this task adds (an internal MAIN-orchestration wrapper, never a new operator-facing SUB/OPS workflow) -- explicitly whitelisted here, never a relaxation to allow arbitrary new files. Phase 3 grouping: 30-phase-argocd-orchestration.yaml is the second such approved internal wrapper, added the same way and whitelisted the same way. Phase 4 grouping: 40-phase-platform-observability-shared-secrets.yaml is the third such approved internal wrapper, added the same way and whitelisted the same way. Phase 5 grouping: 50-phase-goldengate-runtimes.yaml is the fourth such approved internal wrapper, added the same way and whitelisted the same way. Phase 6 grouping: 60-phase-goldengate-replication.yaml is the fifth such approved internal wrapper, added the same way and whitelisted the same way.
+  NEW_WORKFLOW_FILES="$(git status --porcelain=v1 -- .github/workflows/ 2>/dev/null | grep -E '^\?\?' | grep -vE '^\?\? \.github/workflows/(00-main-goldengate-orchestrator|10-sub-iam-secrets|20-sub-argocd|30-sub-platform|30-phase-argocd-orchestration|40-sub-observability|40-phase-platform-observability-shared-secrets|50-sub-monitor|50-phase-goldengate-runtimes|60-phase-goldengate-replication|70-phase-monitor-final-acceptance|80-ops-monitor-metrics-config|90-ops-observability-artifact-sync|91-ops-ecr-image-sync)\.yaml$' || true)"
   if [ -z "$NEW_WORKFLOW_FILES" ]; then
     pass "25: no unexpected new workflow file introduced beyond the sanctioned workflow-naming rename"
   else
@@ -7663,16 +7664,17 @@ else
   skip "1-12: fail-closed job-graph simulation -- python3/PyYAML unavailable"
 fi
 
-if ! grep -qE "validate_shared_secrets_once\.result\s*!=\s*'failure'" "$EKS_APP_WORKFLOW" 2>/dev/null; then
+if ! grep -qE "validate_shared_secrets_once\.result\s*!=\s*'failure'" "$PHASE5_WORKFLOW" 2>/dev/null; then
   pass "the old overly-permissive assertion (validate_shared_secrets_once.result != 'failure') has been replaced -- build_publish_and_deploy now requires exact success"
 else
   fail "build_publish_and_deploy still contains the old != 'failure'/!= 'cancelled' assertion for validate_shared_secrets_once"
 fi
 
-if grep -qF "needs.phase_4_platform_observability.outputs.validate_shared_secrets_once_result == 'success'" "$EKS_APP_WORKFLOW" 2>/dev/null && grep -qF "needs.phase_4_platform_observability.result == 'success'" "$EKS_APP_WORKFLOW" 2>/dev/null; then
-  pass "build_publish_and_deploy's if: explicitly requires needs.phase_4_platform_observability.result == 'success' AND needs.phase_4_platform_observability.outputs.validate_shared_secrets_once_result == 'success' -- Phase 4 grouping: the exact former needs.validate_shared_secrets_once.result == 'success' requirement, translated to the grouped wrapper's own result plus its exact internal Phase 4G result, never conflated"
+# Phase 5 grouping: build_publish_and_deploy now lives inside the grouped Phase 5 wrapper -- its if: crosses the reusable-workflow boundary as inputs.result_phase_4_platform_observability/inputs.result_validate_shared_secrets_once, never a needs.phase_4_platform_observability.* reference to a job outside this file.
+if grep -qF "inputs.result_validate_shared_secrets_once == 'success'" "$PHASE5_WORKFLOW" 2>/dev/null && grep -qF "inputs.result_phase_4_platform_observability == 'success'" "$PHASE5_WORKFLOW" 2>/dev/null; then
+  pass "build_publish_and_deploy's if: explicitly requires inputs.result_phase_4_platform_observability == 'success' AND inputs.result_validate_shared_secrets_once == 'success' -- Phase 4/Phase 5 grouping: the exact former needs.validate_shared_secrets_once.result == 'success' requirement, translated across both reusable-workflow boundaries, never conflated"
 else
-  fail "build_publish_and_deploy's if: does not explicitly require both needs.phase_4_platform_observability.result == 'success' and needs.phase_4_platform_observability.outputs.validate_shared_secrets_once_result == 'success'"
+  fail "build_publish_and_deploy's if: does not explicitly require both inputs.result_phase_4_platform_observability == 'success' and inputs.result_validate_shared_secrets_once == 'success'"
 fi
 
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
@@ -9030,7 +9032,7 @@ echo ""
 echo "--- Live Validate Fix 3: dry-run environment scope + zero-runtime final-gate consistency ---"
 
 # 1-5: replication_dry_run_validation and monitor_dry_run_validation carry GG_SELECTED_ENVIRONMENT via a JOB-LEVEL env: block (not merely a step-level one on "Load resolved environment config"), and every run: step in each job that references GG_SELECTED_ENVIRONMENT is safely covered by it -- proven both structurally (semantic YAML parse) and behaviorally (real bash execution of the extracted step scripts with ONLY the job-level binding supplied, exactly as GitHub Actions would provide it, confirming none of them hit the real VDR failure signature "GG_SELECTED_ENVIRONMENT: unbound variable").
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE7_WORKFLOW" ]; then
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE7_WORKFLOW" ] && [ -f "$PHASE6_WORKFLOW" ]; then
   LIVE_FIX_3_ENV_CHECK="$(python3 -c '
 import os
 import subprocess
@@ -9041,6 +9043,9 @@ with open("'"$EKS_APP_WORKFLOW"'") as f:
 # Phase 7 grouping: monitor_dry_run_validation now lives inside the grouped Phase 7 reusable workflow, never directly in MAIN -- its own external selected_environment reference translates from needs.validate_model.outputs.selected_environment to inputs.selected_environment at that boundary.
 with open("'"$PHASE7_WORKFLOW"'") as f:
     phase7_doc = yaml.safe_load(f)
+# Phase 6 grouping: replication_dry_run_validation now lives inside the grouped Phase 6 reusable workflow, never directly in MAIN -- its own external selected_environment reference translates from needs.validate_model.outputs.selected_environment to inputs.selected_environment at that boundary.
+with open("'"$PHASE6_WORKFLOW"'") as f:
+    phase6_doc = yaml.safe_load(f)
 
 results = []
 
@@ -9066,7 +9071,7 @@ def check_job(job_name, jobs_dict, expected):
         unbound_hit = "GG_SELECTED_ENVIRONMENT: unbound variable" in proc.stderr
         results.append((f"{job_name}: step {name!r} executes without the real VDR unbound-variable failure signature for GG_SELECTED_ENVIRONMENT", not unbound_hit))
 
-check_job("replication_dry_run_validation", doc["jobs"], "${{ needs.validate_model.outputs.selected_environment }}")
+check_job("replication_dry_run_validation", phase6_doc["jobs"], "${{ inputs.selected_environment }}")
 check_job("monitor_dry_run_validation", phase7_doc["jobs"], "${{ inputs.selected_environment }}")
 
 for label, ok in results:
@@ -9244,12 +9249,12 @@ fi
 echo ""
 echo "--- Live Deploy Fix 4: repository-wide GG_SELECTED_ENVIRONMENT scope hardening ---"
 
-# 1-5, 14: the repo-wide static checker itself, run against the REAL current repository -- proves it reports the expected inventory (13 active workflows, 12 jobs referencing GG_SELECTED_ENVIRONMENT -- down from 17 before the Phase 4 Python Conversion, since all seven Phase 4 MAIN jobs (platform_preflight/observability_preflight/platform_sync_once/observability_sync_once/validate_platform_ready/validate_observability_ready/validate_shared_secrets_once) no longer thread a job-level GG_SELECTED_ENVIRONMENT shell variable through their run: blocks at all -- they interpolate needs.validate_model.outputs.selected_environment directly as a GitHub Actions expression into each phase4_platform.py/phase4_observability.py/phase4_shared_secrets.py --environment argument, matching the same eliminate-the-unbound-shell-variable-risk-class pattern the Phase 3 Python Conversion already established for argocd_preflight/validate_argocd_ready) and ZERO unsafe jobs. Phase 4 grouping added the twelfth workflow (40-phase-platform-observability-shared-secrets.yaml); Phase 5 grouping added the thirteenth (50-phase-goldengate-runtimes.yaml) -- moving jobs into either does not change the GG_SELECTED_ENVIRONMENT reference count, since the moved jobs' own job-level bindings (e.g. matrix.environment for the four Phase 5 matrix jobs) are unaffected by which file they live in.
+# 1-5, 14: the repo-wide static checker itself, run against the REAL current repository -- proves it reports the expected inventory (14 active workflows, 12 jobs referencing GG_SELECTED_ENVIRONMENT -- down from 17 before the Phase 4 Python Conversion, since all seven Phase 4 MAIN jobs (platform_preflight/observability_preflight/platform_sync_once/observability_sync_once/validate_platform_ready/validate_observability_ready/validate_shared_secrets_once) no longer thread a job-level GG_SELECTED_ENVIRONMENT shell variable through their run: blocks at all -- they interpolate needs.validate_model.outputs.selected_environment directly as a GitHub Actions expression into each phase4_platform.py/phase4_observability.py/phase4_shared_secrets.py --environment argument, matching the same eliminate-the-unbound-shell-variable-risk-class pattern the Phase 3 Python Conversion already established for argocd_preflight/validate_argocd_ready) and ZERO unsafe jobs. Phase 4 grouping added the twelfth workflow (40-phase-platform-observability-shared-secrets.yaml); Phase 5 grouping added the thirteenth (50-phase-goldengate-runtimes.yaml); Phase 6 grouping added the fourteenth (60-phase-goldengate-replication.yaml) -- moving jobs into any of these does not change the GG_SELECTED_ENVIRONMENT reference count, since the moved jobs' own job-level bindings (e.g. matrix.environment for the four Phase 5 matrix jobs, or the two Phase 6 jobs' own inputs.selected_environment binding) are unaffected by which file they live in.
 if [ -f "$ENV_SCOPE_CHECKER" ]; then
   ENV_SCOPE_REAL_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 "$ENV_SCOPE_CHECKER" 2>&1)"
   ENV_SCOPE_REAL_STATUS=$?
-  if [ "$ENV_SCOPE_REAL_STATUS" -eq 0 ] && grep -q "^Workflows inspected: 13$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^Jobs with GG_SELECTED_ENVIRONMENT run: references: 12$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^Unsafe jobs: 0$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^OK: zero unsafe GG_SELECTED_ENVIRONMENT references" <<< "$ENV_SCOPE_REAL_OUT"; then
-    pass "Live Deploy Fix 4: 1-5,14: ${ENV_SCOPE_CHECKER} reports 13 workflows inspected (Phase 7 grouping added 70-phase-monitor-final-acceptance.yaml, Phase 3 grouping added 30-phase-argocd-orchestration.yaml, Phase 4 grouping added 40-phase-platform-observability-shared-secrets.yaml, Phase 5 grouping added 50-phase-goldengate-runtimes.yaml), 12 jobs referencing GG_SELECTED_ENVIRONMENT (unchanged -- moving jobs to another file does not change the count), and ZERO unsafe jobs against the real current repository"
+  if [ "$ENV_SCOPE_REAL_STATUS" -eq 0 ] && grep -q "^Workflows inspected: 14$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^Jobs with GG_SELECTED_ENVIRONMENT run: references: 12$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^Unsafe jobs: 0$" <<< "$ENV_SCOPE_REAL_OUT" && grep -q "^OK: zero unsafe GG_SELECTED_ENVIRONMENT references" <<< "$ENV_SCOPE_REAL_OUT"; then
+    pass "Live Deploy Fix 4: 1-5,14: ${ENV_SCOPE_CHECKER} reports 14 workflows inspected (Phase 7 grouping added 70-phase-monitor-final-acceptance.yaml, Phase 3 grouping added 30-phase-argocd-orchestration.yaml, Phase 4 grouping added 40-phase-platform-observability-shared-secrets.yaml, Phase 5 grouping added 50-phase-goldengate-runtimes.yaml, Phase 6 grouping added 60-phase-goldengate-replication.yaml), 12 jobs referencing GG_SELECTED_ENVIRONMENT (unchanged -- moving jobs to another file does not change the count), and ZERO unsafe jobs against the real current repository"
   else
     fail "Live Deploy Fix 4: 1-5,14: ${ENV_SCOPE_CHECKER} did not report the expected zero-violation inventory against the real repository (status=${ENV_SCOPE_REAL_STATUS}):"$'\n'"${ENV_SCOPE_REAL_OUT}"
   fi
@@ -9258,9 +9263,9 @@ else
 fi
 
 # 6-11: mutation-style regression proof -- the checker MUST fail closed the instant a job regresses to the exact live-defect pattern (missing job-level binding, or a step-only binding), and MUST pass once every job is correctly covered. Uses a real temp copy of the actual current main workflow (never a reimplementation/fixture), mutated in memory and written out, then the REAL checker script is invoked against it via subprocess -- exactly the same "real script execution" proof pattern established throughout this suite.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE7_WORKFLOW" ] && [ -f "$PHASE5_WORKFLOW" ] && [ -f "$ENV_SCOPE_CHECKER" ]; then
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE7_WORKFLOW" ] && [ -f "$PHASE5_WORKFLOW" ] && [ -f "$PHASE6_WORKFLOW" ] && [ -f "$ENV_SCOPE_CHECKER" ]; then
   set +e
-  ENV_SCOPE_MUTATION_OUT="$(python3 - "$EKS_APP_WORKFLOW" "$PHASE7_WORKFLOW" "$PHASE5_WORKFLOW" "$ENV_SCOPE_CHECKER" <<'PYEOF'
+  ENV_SCOPE_MUTATION_OUT="$(python3 - "$EKS_APP_WORKFLOW" "$PHASE7_WORKFLOW" "$PHASE5_WORKFLOW" "$PHASE6_WORKFLOW" "$ENV_SCOPE_CHECKER" <<'PYEOF'
 import copy
 import os
 import subprocess
@@ -9269,23 +9274,27 @@ import tempfile
 
 import yaml
 
-workflow_path, phase7_workflow_path, phase5_workflow_path, checker_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+workflow_path, phase7_workflow_path, phase5_workflow_path, phase6_workflow_path, checker_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 with open(workflow_path) as f:
     real_doc = yaml.safe_load(f)
-# Phase 7 grouping: replication_monitor_acceptance now lives inside the grouped Phase 7 reusable workflow, never directly in MAIN -- the checker scans the whole workflow directory dynamically, so both real documents must be written into the same scratch dir for every mutation below, exactly mirroring the real repository layout. Phase 5 grouping: runtime_ownership_preflight now similarly lives inside the grouped Phase 5 reusable workflow -- its own document is written into the same scratch dir too.
+# Phase 7 grouping: replication_monitor_acceptance now lives inside the grouped Phase 7 reusable workflow, never directly in MAIN -- the checker scans the whole workflow directory dynamically, so both real documents must be written into the same scratch dir for every mutation below, exactly mirroring the real repository layout. Phase 5 grouping: runtime_ownership_preflight now similarly lives inside the grouped Phase 5 reusable workflow -- its own document is written into the same scratch dir too. Phase 6 grouping: replication_reconcile_once now similarly lives inside the grouped Phase 6 reusable workflow -- its own document is written into the same scratch dir too.
 with open(phase7_workflow_path) as f:
     real_phase7_doc = yaml.safe_load(f)
 with open(phase5_workflow_path) as f:
     real_phase5_doc = yaml.safe_load(f)
+with open(phase6_workflow_path) as f:
+    real_phase6_doc = yaml.safe_load(f)
 
 MAIN_NAME = "00-main-goldengate-orchestrator.yaml"
 PHASE7_NAME = "70-phase-monitor-final-acceptance.yaml"
 PHASE5_NAME = "50-phase-goldengate-runtimes.yaml"
+PHASE6_NAME = "60-phase-goldengate-replication.yaml"
 
 
-def run_checker(doc, phase7_doc=None, phase5_doc=None):
+def run_checker(doc, phase7_doc=None, phase5_doc=None, phase6_doc=None):
     phase7_doc = real_phase7_doc if phase7_doc is None else phase7_doc
     phase5_doc = real_phase5_doc if phase5_doc is None else phase5_doc
+    phase6_doc = real_phase6_doc if phase6_doc is None else phase6_doc
     with tempfile.TemporaryDirectory() as tmp_dir:
         with open(os.path.join(tmp_dir, MAIN_NAME), "w") as f:
             yaml.safe_dump(doc, f, sort_keys=False)
@@ -9293,6 +9302,8 @@ def run_checker(doc, phase7_doc=None, phase5_doc=None):
             yaml.safe_dump(phase7_doc, f, sort_keys=False)
         with open(os.path.join(tmp_dir, PHASE5_NAME), "w") as f:
             yaml.safe_dump(phase5_doc, f, sort_keys=False)
+        with open(os.path.join(tmp_dir, PHASE6_NAME), "w") as f:
+            yaml.safe_dump(phase6_doc, f, sort_keys=False)
         proc = subprocess.run(
             [sys.executable, checker_path, "--workflow-dir", tmp_dir],
             capture_output=True, text=True, timeout=30,
@@ -9316,11 +9327,11 @@ results.append(("7: removing runtime_ownership_preflight's job-level binding (in
 rc, out = run_checker(real_doc)
 results.append(("8: restoring the job-level binding makes the checker PASS again", rc == 0))
 
-# 9: remove replication_reconcile_once's job-level binding -- the checker MUST fail, and must name that exact job.
-mutated = copy.deepcopy(real_doc)
-del mutated["jobs"]["replication_reconcile_once"]["env"]["GG_SELECTED_ENVIRONMENT"]
-rc, out = run_checker(mutated)
-results.append(("9: removing replication_reconcile_once's job-level binding makes the checker FAIL", rc != 0 and "job=replication_reconcile_once" in out))
+# 9: remove replication_reconcile_once's job-level binding -- Phase 6 grouping: this job now lives inside the grouped Phase 6 reusable workflow, so the mutation is applied to THAT document instead of MAIN's -- the checker MUST fail, and must name that exact job.
+mutated_phase6 = copy.deepcopy(real_phase6_doc)
+del mutated_phase6["jobs"]["replication_reconcile_once"]["env"]["GG_SELECTED_ENVIRONMENT"]
+rc, out = run_checker(real_doc, phase6_doc=mutated_phase6)
+results.append(("9: removing replication_reconcile_once's job-level binding (inside the grouped Phase 6 workflow) makes the checker FAIL", rc != 0 and "job=replication_reconcile_once" in out))
 
 # 10: remove replication_monitor_acceptance's job-level binding -- Phase 7 grouping: this job now lives inside the grouped Phase 7 reusable workflow, so the mutation is applied to THAT document instead of MAIN's -- the checker MUST fail, and must name that exact job.
 mutated_phase7 = copy.deepcopy(real_phase7_doc)
@@ -9983,9 +9994,9 @@ else
   fail "Phase 11 4: an active workflow independently hardcodes a full IAM role ARN literal:"$'\n'"${ROLE_ARN_LITERAL_HITS}"
 fi
 
-# 5: every active workflow that needs canonical identity loads it via automation/goldengate-environment.py github-env after its own checkout -- GITHUB_ENV is job-local, so no job may assume another job's load already ran. 10-sub-iam-secrets.yaml is excluded: by design, it derives its sole canonical value (AWS_REGION) via a plain `get` call, not github-env.
+# 5: every active workflow that needs canonical identity loads it via automation/goldengate-environment.py github-env after its own checkout -- GITHUB_ENV is job-local, so no job may assume another job's load already ran. 10-sub-iam-secrets.yaml is excluded: by design, it derives its sole canonical value (AWS_REGION) via a plain `get` call, not github-env. Phase 6 grouping: MAIN itself no longer has any job that calls this loader directly -- validate_model resolves its own environment via phase1_readiness.py, and every mutating/live job that DOES need it now lives behind a phase wrapper (00-main-goldengate-orchestrator.yaml removed from this list; 60-phase-goldengate-replication.yaml added, matching the already-listed 70-phase-monitor-final-acceptance.yaml).
 MISSING_LOADER_HITS=""
-for wf in 00-main-goldengate-orchestrator.yaml 20-sub-argocd.yaml 30-sub-platform.yaml 50-sub-monitor.yaml 70-phase-monitor-final-acceptance.yaml 80-ops-monitor-metrics-config.yaml 40-sub-observability.yaml 90-ops-observability-artifact-sync.yaml 91-ops-ecr-image-sync.yaml; do
+for wf in 20-sub-argocd.yaml 30-sub-platform.yaml 50-sub-monitor.yaml 60-phase-goldengate-replication.yaml 70-phase-monitor-final-acceptance.yaml 80-ops-monitor-metrics-config.yaml 40-sub-observability.yaml 90-ops-observability-artifact-sync.yaml 91-ops-ecr-image-sync.yaml; do
   if ! grep -q 'goldengate-environment.py --environment .* github-env' ".github/workflows/${wf}" 2>/dev/null; then
     MISSING_LOADER_HITS="${MISSING_LOADER_HITS}${wf}"$'\n'
   fi
@@ -12792,21 +12803,21 @@ for f in 80-ops-monitor-metrics-config.yaml 90-ops-observability-artifact-sync.y
     fail "workflow naming: expected OPS workflow ${WORKFLOWS_DIR}/${f} is missing"
   fi
 done
-# Phase 7 grouping / Phase 3 grouping / Phase 4 grouping / Phase 5 grouping: 70-phase-monitor-final-acceptance.yaml, 30-phase-argocd-orchestration.yaml, 40-phase-platform-observability-shared-secrets.yaml, and 50-phase-goldengate-runtimes.yaml are all a distinct "PHASE" category (internal MAIN-orchestration wrappers, never operator-facing SUB/OPS workflows) -- exactly these four such files are expected, and each must be exactly its approved filename (whitelist, never arbitrary new workflow files).
+# Phase 7 grouping / Phase 3 grouping / Phase 4 grouping / Phase 5 grouping / Phase 6 grouping: 70-phase-monitor-final-acceptance.yaml, 30-phase-argocd-orchestration.yaml, 40-phase-platform-observability-shared-secrets.yaml, 50-phase-goldengate-runtimes.yaml, and 60-phase-goldengate-replication.yaml are all a distinct "PHASE" category (internal MAIN-orchestration wrappers, never operator-facing SUB/OPS workflows) -- exactly these five such files are expected, and each must be exactly its approved filename (whitelist, never arbitrary new workflow files).
 PHASE_NAME_MATCHES="$(find "$WORKFLOWS_DIR" -maxdepth 1 -type f -name "*-phase-*.yaml" 2>/dev/null | sort)"
 PHASE_NAME_MATCH_COUNT="$(echo "$PHASE_NAME_MATCHES" | grep -c . || true)"
-EXPECTED_PHASE_NAME_MATCHES="$(printf '%s\n%s\n%s\n%s' "${WORKFLOWS_DIR}/30-phase-argocd-orchestration.yaml" "${WORKFLOWS_DIR}/40-phase-platform-observability-shared-secrets.yaml" "${WORKFLOWS_DIR}/50-phase-goldengate-runtimes.yaml" "${WORKFLOWS_DIR}/70-phase-monitor-final-acceptance.yaml")"
-if [ "$PHASE_NAME_MATCH_COUNT" -eq 4 ] && [ "$PHASE_NAME_MATCHES" = "$EXPECTED_PHASE_NAME_MATCHES" ]; then
-  pass "workflow naming: exactly four *-phase-*.yaml workflows exist and they are 30-phase-argocd-orchestration.yaml, 40-phase-platform-observability-shared-secrets.yaml, 50-phase-goldengate-runtimes.yaml, and 70-phase-monitor-final-acceptance.yaml"
+EXPECTED_PHASE_NAME_MATCHES="$(printf '%s\n%s\n%s\n%s\n%s' "${WORKFLOWS_DIR}/30-phase-argocd-orchestration.yaml" "${WORKFLOWS_DIR}/40-phase-platform-observability-shared-secrets.yaml" "${WORKFLOWS_DIR}/50-phase-goldengate-runtimes.yaml" "${WORKFLOWS_DIR}/60-phase-goldengate-replication.yaml" "${WORKFLOWS_DIR}/70-phase-monitor-final-acceptance.yaml")"
+if [ "$PHASE_NAME_MATCH_COUNT" -eq 5 ] && [ "$PHASE_NAME_MATCHES" = "$EXPECTED_PHASE_NAME_MATCHES" ]; then
+  pass "workflow naming: exactly five *-phase-*.yaml workflows exist and they are 30-phase-argocd-orchestration.yaml, 40-phase-platform-observability-shared-secrets.yaml, 50-phase-goldengate-runtimes.yaml, 60-phase-goldengate-replication.yaml, and 70-phase-monitor-final-acceptance.yaml"
 else
   fail "workflow naming: expected exactly ${EXPECTED_PHASE_NAME_MATCHES} matching *-phase-*.yaml, found:"$'\n'"${PHASE_NAME_MATCHES}"
 fi
-# Total workflow file count is now exactly 13 -- the whitelist above (00/10/20/30-sub/30-phase/40-sub/40-phase/50-sub/50-phase/70/80/90/91) is exhaustive; a stray/unexpected extra workflow file must fail this count, never be silently tolerated.
+# Total workflow file count is now exactly 14 -- the whitelist above (00/10/20/30-sub/30-phase/40-sub/40-phase/50-sub/50-phase/60-phase/70/80/90/91) is exhaustive; a stray/unexpected extra workflow file must fail this count, never be silently tolerated.
 ALL_WORKFLOW_FILE_COUNT="$(find "$WORKFLOWS_DIR" -maxdepth 1 -type f \( -name "*.yaml" -o -name "*.yml" \) 2>/dev/null | wc -l | tr -d ' ')"
-if [ "$ALL_WORKFLOW_FILE_COUNT" -eq 13 ]; then
-  pass "workflow naming: exactly 13 workflow files exist in ${WORKFLOWS_DIR} (00/10/20/30-sub/30-phase/40-sub/40-phase/50-sub/50-phase/70/80/90/91 -- no unexpected extra file)"
+if [ "$ALL_WORKFLOW_FILE_COUNT" -eq 14 ]; then
+  pass "workflow naming: exactly 14 workflow files exist in ${WORKFLOWS_DIR} (00/10/20/30-sub/30-phase/40-sub/40-phase/50-sub/50-phase/60-phase/70/80/90/91 -- no unexpected extra file)"
 else
-  fail "workflow naming: expected exactly 13 workflow files in ${WORKFLOWS_DIR}, found ${ALL_WORKFLOW_FILE_COUNT}: $(find "$WORKFLOWS_DIR" -maxdepth 1 -type f \( -name '*.yaml' -o -name '*.yml' \) 2>/dev/null | sort | tr '\n' ' ')"
+  fail "workflow naming: expected exactly 14 workflow files in ${WORKFLOWS_DIR}, found ${ALL_WORKFLOW_FILE_COUNT}: $(find "$WORKFLOWS_DIR" -maxdepth 1 -type f \( -name '*.yaml' -o -name '*.yml' \) 2>/dev/null | sort | tr '\n' ' ')"
 fi
 
 # 4: zero references to any retired workflow filename remain anywhere in the repository (code, tests, docs, comments, diagnostics) -- excluding .git/ and this check's own list of retired names below, which must legitimately name them as search targets.
@@ -12841,6 +12852,7 @@ expected_name_prefixes = {
     "40-phase-platform-observability-shared-secrets.yaml": "40 | PHASE |",
     "50-sub-monitor.yaml": "50 | SUB |",
     "50-phase-goldengate-runtimes.yaml": "50 | PHASE |",
+    "60-phase-goldengate-replication.yaml": "60 | PHASE |",
     "70-phase-monitor-final-acceptance.yaml": "70 | PHASE |",
     "80-ops-monitor-metrics-config.yaml": "80 | OPS |",
     "90-ops-observability-artifact-sync.yaml": "90 | OPS |",
@@ -12885,6 +12897,9 @@ if main_doc is not None:
     results.append(("MAIN no longer directly targets 40-sub-observability.yaml (moved behind the grouped Phase 4 wrapper)", "./.github/workflows/40-sub-observability.yaml" not in all_uses))
     expected_phase5_uses = "./.github/workflows/50-phase-goldengate-runtimes.yaml"
     results.append(("MAIN uses: a reusable-workflow call targeting 50-phase-goldengate-runtimes.yaml (the grouped Phase 5 caller)", expected_phase5_uses in all_uses))
+    expected_phase6_uses = "./.github/workflows/60-phase-goldengate-replication.yaml"
+    results.append(("MAIN uses: a reusable-workflow call targeting 60-phase-goldengate-replication.yaml (the grouped Phase 6 caller)", expected_phase6_uses in all_uses))
+    results.append(("MAIN no longer directly targets replication_reconcile_once/replication_dry_run_validation as bare jobs (moved behind the grouped Phase 6 wrapper)", "replication_reconcile_once" not in jobs and "replication_dry_run_validation" not in jobs))
 
     # Nested chain: the grouped Phase 7 wrapper itself must call 50-sub-monitor.yaml -- actively verified, never merely assumed because MAIN stopped calling it directly.
     phase7_doc = docs.get("70-phase-monitor-final-acceptance.yaml")
@@ -12961,7 +12976,7 @@ else
 fi
 
 # Structural proof, read directly from the real committed YAML (never a reimplementation): active_runtime_matrix wiring, runtime_ownership_preflight/validate_active_runtimes DAG shape, and the ABSENT/OWNED/BROKEN vocabulary.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE5_WORKFLOW" ]; then
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE5_WORKFLOW" ] && [ -f "$PHASE6_WORKFLOW" ]; then
   PHASE_B3A_STRUCTURAL_CHECK="$(python3 -c '
 import yaml
 
@@ -12969,11 +12984,15 @@ with open("'"$EKS_APP_WORKFLOW"'") as f:
     main_doc = yaml.safe_load(f)
 with open("'"$PHASE5_WORKFLOW"'") as f:
     phase5_doc = yaml.safe_load(f)
+with open("'"$PHASE6_WORKFLOW"'") as f:
+    phase6_doc = yaml.safe_load(f)
 
 results = []
 jobs = main_doc["jobs"]
 # Phase 5 grouping: runtime_ownership_preflight/build_publish_and_deploy/validate_active_runtimes now live inside the grouped Phase 5 wrapper -- read from phase5_jobs, never main_doc jobs.
 phase5_jobs = phase5_doc["jobs"]
+# Phase 6 grouping: replication_reconcile_once now lives inside the grouped Phase 6 wrapper -- read from phase6_jobs, never main_doc jobs.
+phase6_jobs = phase6_doc["jobs"]
 
 # 1/2: classifier files exist.
 import os
@@ -13027,13 +13046,13 @@ results.append(("14b: validate_active_runtimes does NOT use inputs.deployment_ma
 validate_active_if = validate_active.get("if", "")
 results.append(("16: validate_active_runtimes is real-deploy-only (effective_deploy == \x27true\x27)", "effective_deploy" in validate_active_if and "== \x27true\x27" in validate_active_if))
 
-# 17/18: replication waits for successful active-runtime acceptance when active deployments exist; the no-active-runtime path remains valid (excluded from the requirement, not merely tolerated). Phase 5 grouping: validate_active_runtimes now lives inside the grouped Phase 5 wrapper -- replication_reconcile_once needs phase_5_goldengate_runtimes and consumes its exact internal validate_active_runtimes_result output via the fallback-OR expression, never a bare needs.phase_5_goldengate_runtimes.result alone.
-replication = jobs.get("replication_reconcile_once", {})
+# 17/18: replication waits for successful active-runtime acceptance when active deployments exist; the no-active-runtime path remains valid (excluded from the requirement, not merely tolerated). Phase 6 grouping: replication_reconcile_once now lives inside the grouped Phase 6 wrapper -- the exact validate_active_runtimes result crosses the reusable-workflow boundary as inputs.result_validate_active_runtimes (translated by the MAIN caller from the Phase 5 wrapper own fallback-OR expression), never a needs.* reference to a job outside this file.
+replication = phase6_jobs.get("replication_reconcile_once", {})
 replication_needs = replication.get("needs") or []
 replication_if = replication.get("if", "")
-results.append(("17a: replication_reconcile_once needs phase_5_goldengate_runtimes", "phase_5_goldengate_runtimes" in replication_needs))
-results.append(("17b: replication_reconcile_once requires the exact internal validate_active_runtimes_result (via its fallback-OR expression) == success when active deployments exist", "validate_active_runtimes_result || needs.phase_5_goldengate_runtimes.result) == \x27success\x27" in replication_if))
-results.append(("18: replication_reconcile_once explicitly bypasses that requirement when has_active_deployments != \x27true\x27 (no-active-runtime path remains valid)", "has_active_deployments != \x27true\x27" in replication_if))
+results.append(("17a: replication_reconcile_once has no internal needs: of its own (validate_active_runtimes crosses as a workflow_call input)", not replication_needs))
+results.append(("17b: replication_reconcile_once requires inputs.result_validate_active_runtimes == success when active deployments exist", "inputs.result_validate_active_runtimes == \x27success\x27" in replication_if))
+results.append(("18: replication_reconcile_once explicitly bypasses that requirement when inputs.has_active_deployments != \x27true\x27 (no-active-runtime path remains valid)", "inputs.has_active_deployments != \x27true\x27" in replication_if))
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
@@ -13080,10 +13099,10 @@ else
   skip "Phase B3A: 5: active_runtime_matrix content -- python3 unavailable"
 fi
 
-# DAG simulation: the required real-deploy/dry-run/ABSENT/OWNED/BROKEN/global-active-inventory scenarios, exercised against the real if: expressions, never a text/regex match against the workflow author's own wording. Phase 5 grouping: runtime_ownership_preflight/build_publish_and_deploy/validate_active_runtimes now live inside 50-phase-goldengate-runtimes.yaml, addressed via inputs.* rather than needs.validate_model.outputs.*/needs.phase_4_platform_observability.* -- their if: expressions are extracted from PHASE5_WORKFLOW instead of MAIN. replication_reconcile_once remains a MAIN job, but now consumes the Phase 5 wrapper's exact internal results via the fallback-OR expression (needs.phase_5_goldengate_runtimes.outputs.<X> || needs.phase_5_goldengate_runtimes.result) -- _resolve_fallback_refs below textually resolves that exact parenthesized pattern against the simulated Phase 5 wrapper node before handing the simplified boolean-comparison-only expression to the unchanged tiny parser, rather than teaching the parser a new value-level OR grammar rule.
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE5_WORKFLOW" ]; then
+# DAG simulation: the required real-deploy/dry-run/ABSENT/OWNED/BROKEN/global-active-inventory scenarios, exercised against the real if: expressions, never a text/regex match against the workflow author's own wording. Phase 5 grouping: runtime_ownership_preflight/build_publish_and_deploy/validate_active_runtimes now live inside 50-phase-goldengate-runtimes.yaml, addressed via inputs.* rather than needs.validate_model.outputs.*/needs.phase_4_platform_observability.* -- their if: expressions are extracted from PHASE5_WORKFLOW instead of MAIN. Phase 6 grouping: replication_reconcile_once now similarly lives inside 60-phase-goldengate-replication.yaml -- its own if: also references inputs.* only (no needs.* fallback-OR pattern inside the wrapper itself; that translation now happens one level up, in MAIN's own with: block, which this simulator mirrors when building phase6_inputs below from the already-simulated Phase 5 wrapper node).
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE5_WORKFLOW" ] && [ -f "$PHASE6_WORKFLOW" ]; then
   set +e
-  PHASE_B3A_SIM_OUT="$(python3 - "$EKS_APP_WORKFLOW" "$PHASE5_WORKFLOW" <<'PYEOF'
+  PHASE_B3A_SIM_OUT="$(python3 - "$EKS_APP_WORKFLOW" "$PHASE5_WORKFLOW" "$PHASE6_WORKFLOW" <<'PYEOF'
 import re
 import sys
 import yaml
@@ -13092,32 +13111,28 @@ with open(sys.argv[1]) as f:
     doc = yaml.safe_load(f)
 with open(sys.argv[2]) as f:
     phase5_doc = yaml.safe_load(f)
+with open(sys.argv[3]) as f:
+    phase6_doc = yaml.safe_load(f)
 
 jobs = doc["jobs"]
 phase5_jobs = phase5_doc["jobs"]
+phase6_jobs = phase6_doc["jobs"]
 PHASE5_INTERNAL_JOBS = ("runtime_ownership_preflight", "build_publish_and_deploy", "validate_active_runtimes")
+PHASE6_INTERNAL_JOBS = ("replication_reconcile_once",)
 
 
 def _extract_if(job_name):
-    source = phase5_jobs if job_name in PHASE5_INTERNAL_JOBS else jobs
+    if job_name in PHASE5_INTERNAL_JOBS:
+        source = phase5_jobs
+    elif job_name in PHASE6_INTERNAL_JOBS:
+        source = phase6_jobs
+    else:
+        source = jobs
     raw = source[job_name].get("if", "true")
     raw = str(raw).strip()
     if raw.startswith("${{") and raw.endswith("}}"):
         raw = raw[3:-2].strip()
     return raw
-
-
-FALLBACK_RE = re.compile(r"\(needs\.([A-Za-z0-9_]+)\.outputs\.([A-Za-z0-9_]+) \|\| needs\.\1\.result\)")
-
-
-def _resolve_fallback_refs(expr, results):
-    """Textually resolves the exact (needs.<job>.outputs.<X> || needs.<job>.result) fallback-OR pattern against the current simulated results -- a legitimate boundary-translation step (mirroring what GitHub itself evaluates), never a weakening of the "real if: expressions, never a text/regex match" proof this simulator otherwise upholds."""
-    def repl(m):
-        job, output_key = m.group(1), m.group(2)
-        node = results.get(job, {})
-        value = node.get("outputs", {}).get(output_key) or node.get("result", "")
-        return f"'{value}'"
-    return FALLBACK_RE.sub(repl, expr)
 
 
 class _Parser:
@@ -13229,7 +13244,7 @@ def simulate(initial, outcome_when_run, outputs_when_run=None):
     }
     for job in JOB_ORDER:
         if job == "replication_reconcile_once":
-            # Still a direct MAIN job -- resolve its real if:'s fallback-OR references against the now-fully-simulated Phase 5 wrapper node, then evaluate the simplified boolean-comparison-only expression exactly like every other job here.
+            # Phase 6 grouping: replication_reconcile_once now lives inside the grouped Phase 6 wrapper -- its own if: references inputs.* only, translated by MAIN's own with: block from the Phase 5 wrapper's exact internal outputs (the SAME fallback-OR pattern, now applied one level up when building phase6_inputs here, mirroring MAIN's real with: mapping exactly).
             results["phase_5_goldengate_runtimes"] = {
                 "result": "success",
                 "outputs": {
@@ -13239,8 +13254,11 @@ def simulate(initial, outcome_when_run, outputs_when_run=None):
                     "validate_active_runtimes_result": results["validate_active_runtimes"]["result"],
                 },
             }
-            resolved_expr = _resolve_fallback_refs(IF_EXPRS[job], results)
-            would_run = eval_gha_bool(resolved_expr, results)
+            phase6_inputs = dict(phase5_inputs)
+            phase6_inputs["result_build_publish_and_deploy"] = results["phase_5_goldengate_runtimes"]["outputs"].get("build_publish_and_deploy_result") or results["phase_5_goldengate_runtimes"]["result"]
+            phase6_inputs["result_delete_removed_argocd_applications"] = results["phase_5_goldengate_runtimes"]["outputs"].get("delete_removed_argocd_applications_result") or results["phase_5_goldengate_runtimes"]["result"]
+            phase6_inputs["result_validate_active_runtimes"] = results["phase_5_goldengate_runtimes"]["outputs"].get("validate_active_runtimes_result") or results["phase_5_goldengate_runtimes"]["result"]
+            would_run = eval_gha_bool(IF_EXPRS[job], results, phase6_inputs)
         else:
             would_run = eval_gha_bool(IF_EXPRS[job], results, phase5_inputs)
         if would_run:
@@ -13975,12 +13993,16 @@ import yaml
 
 with open(sys.argv[1]) as f:
     doc = yaml.safe_load(f)
-# Phase 7 grouping: monitor_ownership_preflight/monitor_sync_once/validate_monitor_ready/replication_monitor_acceptance/end_to_end_deployment_acceptance now live inside the grouped Phase 7 reusable workflow -- both documents are loaded and merged into one job lookup so this transitive-closure simulation spans the reusable-workflow boundary explicitly.
+# Phase 7 grouping: monitor_ownership_preflight/monitor_sync_once/validate_monitor_ready/replication_monitor_acceptance/end_to_end_deployment_acceptance now live inside the grouped Phase 7 reusable workflow -- both documents are loaded and merged into one job lookup so this transitive-closure simulation spans the reusable-workflow boundary explicitly. Phase 6 grouping: replication_reconcile_once now similarly lives inside the grouped Phase 6 reusable workflow.
 with open(".github/workflows/70-phase-monitor-final-acceptance.yaml") as f:
     phase7_doc = yaml.safe_load(f)
+with open(".github/workflows/60-phase-goldengate-replication.yaml") as f:
+    phase6_doc = yaml.safe_load(f)
 jobs = doc["jobs"]
 phase7_jobs = phase7_doc["jobs"]
+phase6_jobs = phase6_doc["jobs"]
 PHASE7_JOB_NAMES = set(phase7_jobs.keys())
+PHASE6_JOB_NAMES = set(phase6_jobs.keys())
 
 STATUS_FN_RE = re.compile(r"\b(always|success|failure|cancelled)\(\)")
 
@@ -13990,7 +14012,11 @@ def has_status_fn(expr):
 
 
 def _job_source(name):
-    return phase7_jobs if name in PHASE7_JOB_NAMES else jobs
+    if name in PHASE7_JOB_NAMES:
+        return phase7_jobs
+    if name in PHASE6_JOB_NAMES:
+        return phase6_jobs
+    return jobs
 
 
 def job_needs(name):
@@ -14132,6 +14158,7 @@ def build_inputs_ctx(results):
     return {
         "effective_deploy": vm_outputs.get("effective_deploy", "true"),
         "has_active_deployments": vm_outputs.get("has_active_deployments", "true"),
+        "result_phase_4_platform_observability": r("phase_4_platform_observability"),
         "result_validate_shared_secrets_once": r_phase4_output("validate_shared_secrets_once_result"),
         "result_build_publish_and_deploy": r("build_publish_and_deploy"),
         "result_delete_removed_argocd_applications": r("delete_removed_argocd_applications"),
@@ -14166,7 +14193,7 @@ def would_run(name, results, if_override=None):
     if not has_status_fn(expr):
         if not transitive_ancestors_all_success(name, results):
             return False
-    inputs_ctx = build_inputs_ctx(results) if name in PHASE7_JOB_NAMES else {}
+    inputs_ctx = build_inputs_ctx(results) if (name in PHASE7_JOB_NAMES or name in PHASE6_JOB_NAMES) else {}
     return eval_gha_bool(expr, results, inputs_ctx)
 
 
@@ -15696,7 +15723,7 @@ with open(main_path) as f:
     main_doc = yaml.safe_load(f)
 with open(sub_path) as f:
     sub_doc = yaml.safe_load(f)
-check("J: MAIN job count reflects the Phase 7 + Phase 3 + Phase 4 + Phase 5 groupings (8)", len(main_doc.get("jobs", {})) == 8)
+check("J: MAIN job count reflects the Phase 7 + Phase 3 + Phase 4 + Phase 5 + Phase 6 groupings (7)", len(main_doc.get("jobs", {})) == 7)
 check("J: MAIN still defines validate_model and terraform_sync_once", {"validate_model", "terraform_sync_once"} <= set(main_doc.get("jobs", {}).keys()))
 check("J: 10-sub-iam-secrets.yaml still defines exactly validate_environment_config and apply", set(sub_doc.get("jobs", {}).keys()) == {"validate_environment_config", "apply"})
 
@@ -15755,7 +15782,7 @@ EXPECTED_NAMES = {
 results.append(("A: all seven Phase 4 job IDs exist inside the grouped Phase 4 wrapper", all(jid in jobs for jid in PHASE4_JOB_IDS)))
 results.append(("A2: MAIN defines the single grouped Phase 4 caller job phase_4_platform_observability, and none of the seven internal Phase 4 job IDs directly", "phase_4_platform_observability" in main_jobs and not (set(PHASE4_JOB_IDS) & set(main_jobs.keys()))))
 results.append(("B: every Phase 4 job display name exactly matches Phase 4A-G", all(jobs.get(jid, {}).get("name") == name for jid, name in EXPECTED_NAMES.items())))
-results.append(("C: MAIN job count reflects the Phase 7 + Phase 3 + Phase 4 + Phase 5 groupings (8)", len(main_jobs) == 8))
+results.append(("C: MAIN job count reflects the Phase 7 + Phase 3 + Phase 4 + Phase 5 + Phase 6 groupings (7)", len(main_jobs) == 7))
 
 platform_preflight = jobs.get("platform_preflight", {})
 observability_preflight = jobs.get("observability_preflight", {})
@@ -16022,7 +16049,7 @@ else
   fail "AH: one or more Phase 1-3 production paths are missing"
 fi
 
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE7_WORKFLOW" ] && [ -f "$PHASE5_WORKFLOW" ]; then
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE7_WORKFLOW" ] && [ -f "$PHASE5_WORKFLOW" ] && [ -f "$PHASE6_WORKFLOW" ]; then
   AI_CHECK="$(python3 -c '
 import yaml
 with open("'"$EKS_APP_WORKFLOW"'") as f:
@@ -16036,10 +16063,14 @@ phase7_jobs = phase7_doc["jobs"]
 with open("'"$PHASE5_WORKFLOW"'") as f:
     phase5_doc = yaml.safe_load(f)
 phase5_jobs = phase5_doc["jobs"]
+# Phase 6 grouping: the two Phase 6 jobs now live inside the grouped Phase 6 reusable workflow, never directly in MAIN -- checked against that document instead of merely dropped from this guard.
+with open("'"$PHASE6_WORKFLOW"'") as f:
+    phase6_doc = yaml.safe_load(f)
+phase6_jobs = phase6_doc["jobs"]
 phase5_job_ids = ("runtime_ownership_preflight", "build_publish_and_deploy", "delete_removed_argocd_applications", "validate_active_runtimes")
 phase6_job_ids = ("replication_reconcile_once", "replication_dry_run_validation")
 phase7_job_ids = ("monitor_ownership_preflight", "monitor_sync_once", "monitor_dry_run_validation", "validate_monitor_ready", "replication_monitor_acceptance", "end_to_end_deployment_acceptance", "final_validation")
-print("OK" if all(j in phase5_jobs for j in phase5_job_ids) and all(j in jobs for j in phase6_job_ids) and "phase_5_goldengate_runtimes" in jobs and "phase_7_monitor_final_acceptance" in jobs and all(j in phase7_jobs for j in phase7_job_ids) else "FAIL")
+print("OK" if all(j in phase5_jobs for j in phase5_job_ids) and all(j in phase6_jobs for j in phase6_job_ids) and "phase_5_goldengate_runtimes" in jobs and "phase_6_goldengate_replication" in jobs and "phase_7_monitor_final_acceptance" in jobs and all(j in phase7_jobs for j in phase7_job_ids) else "FAIL")
 ' 2>&1)"
   if [ "$AI_CHECK" = "OK" ]; then
     pass "AI: every Phase 5+ job (runtime_ownership_preflight through final_validation, the latter seven now grouped behind the Phase 7 wrapper) still exists, unrefactored, unmodified by this Phase 4 conversion"
@@ -16061,8 +16092,8 @@ echo ""
 echo ""
 echo "--- Phase 5 Python Conversion: dedicated static assertions (A-AF) ---"
 
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE5_WORKFLOW" ] && [ -f "$PHASE5_RUNTIME_TOOL" ]; then
-  PHASE5_DEDICATED_CHECK="$(python3 - "$EKS_APP_WORKFLOW" "$PHASE5_WORKFLOW" "$PHASE5_RUNTIME_TOOL" <<'PYEOF'
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE5_WORKFLOW" ] && [ -f "$PHASE6_WORKFLOW" ] && [ -f "$PHASE5_RUNTIME_TOOL" ]; then
+  PHASE5_DEDICATED_CHECK="$(python3 - "$EKS_APP_WORKFLOW" "$PHASE5_WORKFLOW" "$PHASE6_WORKFLOW" "$PHASE5_RUNTIME_TOOL" <<'PYEOF'
 import importlib.util
 import io
 import os
@@ -16073,11 +16104,15 @@ from unittest import mock
 
 import yaml
 
-workflow_path, phase5_workflow_path, tool_path = sys.argv[1:4]
+workflow_path, phase5_workflow_path, phase6_workflow_path, tool_path = sys.argv[1:5]
 
 with open(workflow_path) as f:
     doc = yaml.safe_load(f)
 jobs = doc["jobs"]
+with open(phase6_workflow_path) as f:
+    phase6_doc = yaml.safe_load(f)
+# Phase 6 grouping: replication_reconcile_once now lives inside the grouped Phase 6 wrapper -- read from phase6_jobs, never MAIN's own jobs.
+phase6_jobs = phase6_doc["jobs"]
 with open(phase5_workflow_path) as f:
     phase5_doc = yaml.safe_load(f)
 # Phase 5 grouping: runtime_ownership_preflight/build_publish_and_deploy/delete_removed_argocd_applications/validate_active_runtimes now live inside the grouped Phase 5 wrapper -- read from phase5_jobs, never MAIN's own jobs.
@@ -16105,7 +16140,7 @@ for job_id, expected_name in expected_names.items():
     results.append((f"B: {job_id} display name is exactly {expected_name!r}", phase5_jobs.get(job_id, {}).get("name") == expected_name))
 
 # C: MAIN job count reflects the Phase 7 grouping (26 -> 20), the Phase 3 grouping (20 -> 17), the Phase 4 grouping (17 -> 11), and the Phase 5 grouping (11 -> 8: four Phase 5 jobs replaced by one phase_5_goldengate_runtimes caller).
-results.append(("C: MAIN job count reflects the Phase 7 + Phase 3 + Phase 4 + Phase 5 groupings (8)", len(jobs) == 8))
+results.append(("C: MAIN job count reflects the Phase 7 + Phase 3 + Phase 4 + Phase 5 + Phase 6 groupings (7)", len(jobs) == 7))
 
 # D: runtime_ownership_preflight still depends on validate_shared_secrets_once. Phase 4 grouping: validate_shared_secrets_once now lives behind the grouped Phase 4 wrapper. Phase 5 grouping: this is now a workflow_call input reference (inputs.result_phase_4_platform_observability/inputs.result_validate_shared_secrets_once), never a needs.* reference -- runtime_ownership_preflight has no internal Phase 5 needs at all.
 ownership_if = str(phase5_jobs["runtime_ownership_preflight"].get("if", ""))
@@ -16248,10 +16283,9 @@ results.append(("AB: runtime_state.py/runtime_acceptance.py canonical paths are 
 results.append(("AC: old automation/orchestration/runtime_state.py and runtime_acceptance.py are absent", not os.path.isfile("automation/orchestration/runtime_state.py") and not os.path.isfile("automation/orchestration/runtime_acceptance.py")))
 results.append(("AD: k8s_common.py remains under automation/orchestration/", os.path.isfile("automation/orchestration/k8s_common.py")))
 
-# AE: Phase 6 (replication_reconcile_once) remains downstream of validate_active_runtimes according to the existing active-runtime gating. Phase 5 grouping: validate_active_runtimes now lives inside the grouped Phase 5 wrapper -- replication_reconcile_once needs phase_5_goldengate_runtimes and its if: consumes the exact internal validate_active_runtimes_result via the fallback-OR expression, never a bare needs.phase_5_goldengate_runtimes.result alone.
-replication_if = str(jobs.get("replication_reconcile_once", {}).get("if", ""))
-replication_needs = jobs.get("replication_reconcile_once", {}).get("needs") or []
-results.append(("AE: Phase 6 (replication_reconcile_once) remains downstream of validate_active_runtimes -- needs phase_5_goldengate_runtimes and its if: references the exact internal validate_active_runtimes_result/has_active_deployments", "phase_5_goldengate_runtimes" in replication_needs and "validate_active_runtimes_result" in replication_if))
+# AE: Phase 6 (replication_reconcile_once) remains downstream of validate_active_runtimes according to the existing active-runtime gating. Phase 6 grouping: replication_reconcile_once now lives inside the grouped Phase 6 wrapper -- it has no internal needs: of its own, and its if: consumes the exact validate_active_runtimes result via inputs.result_validate_active_runtimes (translated by MAIN's own with: block from the Phase 5 wrapper's exact internal output), never a bare needs.phase_5_goldengate_runtimes.result alone.
+replication_if = str(phase6_jobs.get("replication_reconcile_once", {}).get("if", ""))
+results.append(("AE: Phase 6 (replication_reconcile_once) remains downstream of validate_active_runtimes -- its if: references inputs.result_validate_active_runtimes/inputs.has_active_deployments", "inputs.result_validate_active_runtimes" in replication_if and "inputs.has_active_deployments" in replication_if))
 
 # AF: replication remains disabled in both current descriptors.
 for descriptor_path in ("envs/dev/gg-postgresql-repltest-01/values.yaml", "envs/dev/gg-mssql-repltest-01/values.yaml"):
@@ -16649,8 +16683,8 @@ fi
 echo ""
 echo "--- Phase 5 Python Conversion: persisted-state identity/target binding (A-J) ---"
 
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE5_RUNTIME_TOOL" ]; then
-  PHASE5_STATE_IDENTITY_CHECK="$(python3 - "$EKS_APP_WORKFLOW" "$PHASE5_RUNTIME_TOOL" "$PHASE5_WORKFLOW" <<'PYEOF'
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE5_RUNTIME_TOOL" ] && [ -f "$PHASE6_WORKFLOW" ]; then
+  PHASE5_STATE_IDENTITY_CHECK="$(python3 - "$EKS_APP_WORKFLOW" "$PHASE5_RUNTIME_TOOL" "$PHASE5_WORKFLOW" "$PHASE6_WORKFLOW" <<'PYEOF'
 import ast
 import importlib.util
 import json
@@ -16662,7 +16696,7 @@ from unittest import mock
 
 import yaml
 
-workflow_path, tool_path, phase5_workflow_path = sys.argv[1:4]
+workflow_path, tool_path, phase5_workflow_path, phase6_workflow_path = sys.argv[1:5]
 
 with open(workflow_path) as f:
     jobs = yaml.safe_load(f)["jobs"]
@@ -16670,6 +16704,10 @@ with open(phase5_workflow_path) as f:
     phase5_doc = yaml.safe_load(f)
     # Phase 5 grouping: runtime_ownership_preflight/build_publish_and_deploy/delete_removed_argocd_applications/validate_active_runtimes now live inside the grouped Phase 5 wrapper -- read from phase5_jobs, never MAIN's own jobs.
     phase5_jobs = phase5_doc["jobs"]
+with open(phase6_workflow_path) as f:
+    phase6_doc = yaml.safe_load(f)
+    # Phase 6 grouping: replication_reconcile_once now lives inside the grouped Phase 6 wrapper -- read from phase6_jobs, never MAIN's own jobs.
+    phase6_jobs = phase6_doc["jobs"]
 
 spec = importlib.util.spec_from_file_location("phase5_runtime", tool_path)
 phase5_runtime = importlib.util.module_from_spec(spec)
@@ -16860,9 +16898,8 @@ results.append(("I: cmd_post_delete_acceptance() calls _validate_removal_state_i
 # J: Phase 5 DAG (job IDs, needs, if-gating) remains unchanged by this state-identity-only production correction. Phase 5 grouping: the four job IDs now live inside the grouped Phase 5 wrapper, never MAIN's own jobs.
 PHASE5_JOB_IDS = ("runtime_ownership_preflight", "build_publish_and_deploy", "delete_removed_argocd_applications", "validate_active_runtimes")
 results.append(("J: all four Phase 5 job IDs remain, unrefactored, inside the grouped Phase 5 wrapper", all(j in phase5_jobs for j in PHASE5_JOB_IDS)))
-replication_needs = jobs.get("replication_reconcile_once", {}).get("needs") or []
-replication_if = str(jobs.get("replication_reconcile_once", {}).get("if", ""))
-results.append(("J: Phase 6 (replication_reconcile_once) remains downstream of validate_active_runtimes, unchanged", "phase_5_goldengate_runtimes" in replication_needs and "validate_active_runtimes_result" in replication_if))
+replication_if = str(phase6_jobs.get("replication_reconcile_once", {}).get("if", ""))
+results.append(("J: Phase 6 (replication_reconcile_once) remains downstream of validate_active_runtimes, unchanged", "inputs.result_validate_active_runtimes" in replication_if and "inputs.has_active_deployments" in replication_if))
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
@@ -18195,8 +18232,8 @@ fi
 
 echo "--- Phase 6 Python Conversion: replication orchestration (A-V) ---"
 
-if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE6_REPLICATION_TOOL" ]; then
-  PHASE6_CONVERSION_CHECK="$(python3 - "$EKS_APP_WORKFLOW" "$PHASE6_REPLICATION_TOOL" "$REPLICATION_TOOL" <<'PYEOF'
+if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$EKS_APP_WORKFLOW" ] && [ -f "$PHASE6_WORKFLOW" ] && [ -f "$PHASE6_REPLICATION_TOOL" ]; then
+  PHASE6_CONVERSION_CHECK="$(python3 - "$EKS_APP_WORKFLOW" "$PHASE6_WORKFLOW" "$PHASE6_REPLICATION_TOOL" "$REPLICATION_TOOL" <<'PYEOF'
 import importlib.util
 import json
 import sys
@@ -18205,11 +18242,15 @@ from unittest import mock
 
 import yaml
 
-workflow_path, tool_path, engine_path = sys.argv[1:4]
+workflow_path, phase6_workflow_path, tool_path, engine_path = sys.argv[1:5]
 
 with open(workflow_path) as f:
     doc = yaml.safe_load(f)
 jobs = doc["jobs"]
+# Phase 6 grouping: replication_reconcile_once/replication_dry_run_validation now live inside the grouped Phase 6 reusable workflow, never directly in MAIN -- read from phase6_jobs, never MAIN's own jobs.
+with open(phase6_workflow_path) as f:
+    phase6_doc = yaml.safe_load(f)
+phase6_jobs = phase6_doc["jobs"]
 
 spec = importlib.util.spec_from_file_location("phase6_replication", tool_path)
 phase6 = importlib.util.module_from_spec(spec)
@@ -18222,38 +18263,36 @@ def check(label, ok):
     results.append((label, ok))
 
 
-# A: both MAIN job IDs remain (KEEP both, never collapsed into one).
-check("A: replication_reconcile_once job ID remains", "replication_reconcile_once" in jobs)
-check("A: replication_dry_run_validation job ID remains", "replication_dry_run_validation" in jobs)
+# A: both job IDs remain (KEEP both, never collapsed into one), now inside the grouped Phase 6 wrapper.
+check("A: replication_reconcile_once job ID remains inside the grouped Phase 6 wrapper", "replication_reconcile_once" in phase6_jobs)
+check("A: replication_dry_run_validation job ID remains inside the grouped Phase 6 wrapper", "replication_dry_run_validation" in phase6_jobs)
 
-# B: MAIN total job count reflects the Phase 7 + Phase 3 + Phase 4 groupings (26 -> 20 -> 17 -> 11: seven Phase 7 jobs replaced by one phase_7_monitor_final_acceptance caller, then four Phase 3 jobs replaced by one phase_3_argocd caller, then seven Phase 4 jobs replaced by one phase_4_platform_observability caller; Phase 6 remains an in-place conversion of two EXISTING jobs, never a new one).
-check("B: MAIN total job count reflects the Phase 7 + Phase 3 + Phase 4 + Phase 5 groupings (8)", len(jobs) == 8)
+# B: MAIN total job count reflects the Phase 7 + Phase 3 + Phase 4 + Phase 5 + Phase 6 groupings (26 -> 20 -> 17 -> 11 -> 8 -> 7: Phase 6's own two jobs replaced by one phase_6_goldengate_replication caller).
+check("B: MAIN total job count reflects the Phase 7 + Phase 3 + Phase 4 + Phase 5 + Phase 6 groupings (7)", len(jobs) == 7)
 
-# C/D: needs/if contract preserved exactly. Phase 4 grouping: validate_shared_secrets_once now lives behind the grouped Phase 4 wrapper, so both jobs depend on phase_4_platform_observability instead and additionally check its exact internal validate_shared_secrets_once_result output. Phase 5 grouping: build_publish_and_deploy/delete_removed_argocd_applications/validate_active_runtimes now live behind the grouped Phase 5 wrapper -- both jobs depend on phase_5_goldengate_runtimes instead and consume its exact internal *_result outputs via the fallback-OR expression, never a bare needs.phase_5_goldengate_runtimes.result alone.
-reconcile_job = jobs["replication_reconcile_once"]
-validate_job = jobs["replication_dry_run_validation"]
-check("C: replication_reconcile_once needs are unchanged apart from the Phase 4 + Phase 5 boundary translation (validate_model, phase_4_platform_observability, phase_5_goldengate_runtimes)",
-      reconcile_job.get("needs") == ["validate_model", "phase_4_platform_observability", "phase_5_goldengate_runtimes"])
+# C/D: needs/if contract preserved exactly, translated across the reusable-workflow boundary. Phase 6 grouping: validate_model/phase_4_platform_observability/phase_5_goldengate_runtimes now cross as workflow_call inputs.* -- neither job has any internal needs: of its own (6A and 6B remain fully independent, mutually exclusive on effective_deploy).
+reconcile_job = phase6_jobs["replication_reconcile_once"]
+validate_job = phase6_jobs["replication_dry_run_validation"]
+check("C: replication_reconcile_once has no internal needs: of its own", not reconcile_job.get("needs"))
 reconcile_if = str(reconcile_job.get("if", ""))
 check("C: replication_reconcile_once if: still requires effective_deploy == 'true', always(), shared-secrets success (both wrapper result and exact internal output), build/delete not failed/cancelled, and validate_active_runtimes when active deployments exist",
-      "effective_deploy == 'true'" in reconcile_if and "always()" in reconcile_if
-      and "needs.phase_4_platform_observability.result == 'success'" in reconcile_if and "needs.phase_4_platform_observability.outputs.validate_shared_secrets_once_result == 'success'" in reconcile_if
-      and "needs.phase_5_goldengate_runtimes.outputs.build_publish_and_deploy_result || needs.phase_5_goldengate_runtimes.result) != 'failure'" in reconcile_if
-      and "needs.phase_5_goldengate_runtimes.outputs.build_publish_and_deploy_result || needs.phase_5_goldengate_runtimes.result) != 'cancelled'" in reconcile_if
-      and "needs.phase_5_goldengate_runtimes.outputs.delete_removed_argocd_applications_result || needs.phase_5_goldengate_runtimes.result) != 'failure'" in reconcile_if
-      and "needs.phase_5_goldengate_runtimes.outputs.delete_removed_argocd_applications_result || needs.phase_5_goldengate_runtimes.result) != 'cancelled'" in reconcile_if
-      and "has_active_deployments != 'true'" in reconcile_if
-      and "needs.phase_5_goldengate_runtimes.outputs.validate_active_runtimes_result || needs.phase_5_goldengate_runtimes.result) == 'success'" in reconcile_if)
-check("D: replication_dry_run_validation needs are unchanged apart from the Phase 4 + Phase 5 boundary translation (validate_model, phase_4_platform_observability, phase_5_goldengate_runtimes)",
-      validate_job.get("needs") == ["validate_model", "phase_4_platform_observability", "phase_5_goldengate_runtimes"])
+      "inputs.effective_deploy == 'true'" in reconcile_if and "always()" in reconcile_if
+      and "inputs.result_phase_4_platform_observability == 'success'" in reconcile_if and "inputs.result_validate_shared_secrets_once == 'success'" in reconcile_if
+      and "inputs.result_build_publish_and_deploy != 'failure'" in reconcile_if
+      and "inputs.result_build_publish_and_deploy != 'cancelled'" in reconcile_if
+      and "inputs.result_delete_removed_argocd_applications != 'failure'" in reconcile_if
+      and "inputs.result_delete_removed_argocd_applications != 'cancelled'" in reconcile_if
+      and "inputs.has_active_deployments != 'true'" in reconcile_if
+      and "inputs.result_validate_active_runtimes == 'success'" in reconcile_if)
+check("D: replication_dry_run_validation has no internal needs: of its own", not validate_job.get("needs"))
 validate_if = str(validate_job.get("if", ""))
 check("D: replication_dry_run_validation if: still requires effective_deploy == 'false', always(), shared-secrets success (both wrapper result and exact internal output), build/delete not failed/cancelled",
-      "effective_deploy == 'false'" in validate_if and "always()" in validate_if
-      and "needs.phase_4_platform_observability.result == 'success'" in validate_if and "needs.phase_4_platform_observability.outputs.validate_shared_secrets_once_result == 'success'" in validate_if
-      and "needs.phase_5_goldengate_runtimes.outputs.build_publish_and_deploy_result || needs.phase_5_goldengate_runtimes.result) != 'failure'" in validate_if
-      and "needs.phase_5_goldengate_runtimes.outputs.build_publish_and_deploy_result || needs.phase_5_goldengate_runtimes.result) != 'cancelled'" in validate_if
-      and "needs.phase_5_goldengate_runtimes.outputs.delete_removed_argocd_applications_result || needs.phase_5_goldengate_runtimes.result) != 'failure'" in validate_if
-      and "needs.phase_5_goldengate_runtimes.outputs.delete_removed_argocd_applications_result || needs.phase_5_goldengate_runtimes.result) != 'cancelled'" in validate_if)
+      "inputs.effective_deploy == 'false'" in validate_if and "always()" in validate_if
+      and "inputs.result_phase_4_platform_observability == 'success'" in validate_if and "inputs.result_validate_shared_secrets_once == 'success'" in validate_if
+      and "inputs.result_build_publish_and_deploy != 'failure'" in validate_if
+      and "inputs.result_build_publish_and_deploy != 'cancelled'" in validate_if
+      and "inputs.result_delete_removed_argocd_applications != 'failure'" in validate_if
+      and "inputs.result_delete_removed_argocd_applications != 'cancelled'" in validate_if)
 
 # Display names.
 check("display name: replication_reconcile_once == 'Phase 6A | Reconcile GoldenGate Replication Pipelines'", reconcile_job.get("name") == "Phase 6A | Reconcile GoldenGate Replication Pipelines")
@@ -19827,14 +19866,14 @@ PHASE7_JOB_IDS = (
 )
 CALLER_JOB_ID = "phase_7_monitor_final_acceptance"
 PHASE7_FILENAME = "70-phase-monitor-final-acceptance.yaml"
-# Phase 3 grouping: validate_argocd_ready is replaced by phase_3_argocd here -- one dependency swapped, never dropped (see G/G2 below for the exact with: fallback-mapping this substitution requires). Phase 4 grouping: validate_shared_secrets_once/validate_platform_ready/validate_observability_ready are replaced by the single phase_4_platform_observability here -- three dependencies collapsed into one, never dropped (see G/G3/G4/G5 below). Phase 5 grouping: runtime_ownership_preflight/build_publish_and_deploy/delete_removed_argocd_applications/validate_active_runtimes are replaced by the single phase_5_goldengate_runtimes here -- four dependencies collapsed into one, never dropped (see G/G6/G7/G8/G9 below).
+# Phase 3 grouping: validate_argocd_ready is replaced by phase_3_argocd here -- one dependency swapped, never dropped (see G/G2 below for the exact with: fallback-mapping this substitution requires). Phase 4 grouping: validate_shared_secrets_once/validate_platform_ready/validate_observability_ready are replaced by the single phase_4_platform_observability here -- three dependencies collapsed into one, never dropped (see G/G3/G4/G5 below). Phase 5 grouping: runtime_ownership_preflight/build_publish_and_deploy/delete_removed_argocd_applications/validate_active_runtimes are replaced by the single phase_5_goldengate_runtimes here -- four dependencies collapsed into one, never dropped (see G/G6/G7/G8/G9 below). Phase 6 grouping: replication_reconcile_once/replication_dry_run_validation are replaced by the single phase_6_goldengate_replication here -- two dependencies collapsed into one, never dropped (see G/G10/G11 below).
 EXTERNAL_RESULT_JOBS = (
     "validate_model", "terraform_sync_once", "phase_3_argocd", "phase_4_platform_observability",
-    "phase_5_goldengate_runtimes", "replication_reconcile_once", "replication_dry_run_validation",
+    "phase_5_goldengate_runtimes", "phase_6_goldengate_replication",
 )
 
-# A: MAIN has exactly 8 jobs (26 - 7 Phase 7 jobs + 1 Phase 7 caller, then 20 - 4 Phase 3 jobs + 1 Phase 3 caller, then 17 - 7 Phase 4 jobs + 1 Phase 4 caller, then 11 - 4 Phase 5 jobs + 1 Phase 5 caller).
-check("A: MAIN has exactly 8 jobs", len(jobs) == 8)
+# A: MAIN has exactly 7 jobs (26 - 7 Phase 7 jobs + 1 Phase 7 caller, then 20 - 4 Phase 3 jobs + 1 Phase 3 caller, then 17 - 7 Phase 4 jobs + 1 Phase 4 caller, then 11 - 4 Phase 5 jobs + 1 Phase 5 caller, then 8 - 2 Phase 6 jobs + 1 Phase 6 caller).
+check("A: MAIN has exactly 7 jobs", len(jobs) == 7)
 
 # B: MAIN no longer directly contains any of the seven Phase 7 job IDs.
 for job_id in PHASE7_JOB_IDS:
@@ -19849,11 +19888,11 @@ check(f"D: {CALLER_JOB_ID} has no steps: key (a genuine reusable-workflow call, 
 # E: the caller job-level if: is exactly always() -- the grouped Phase 7 workflow must still execute when one of its twelve external prerequisites legitimately SKIPPED/FAILED/CANCELLED, so Phase 7G can run its own fail-closed mode-aware contract.
 check(f"E: {CALLER_JOB_ID}'"'"'s if: is exactly always()", str(caller.get("if", "")).strip() == "always()")
 
-# F: the caller needs list contains all seven required Phase 1-6 external jobs (the four now-grouped Phase 3/Phase 4/Phase 5 wrapper dependencies collapsed to their single caller jobs, never dropped).
+# F: the caller needs list contains all six required Phase 1-6 external jobs (the now-grouped Phase 3/Phase 4/Phase 5/Phase 6 wrapper dependencies collapsed to their single caller jobs, never dropped).
 caller_needs = caller.get("needs") or []
 for job_id in EXTERNAL_RESULT_JOBS:
     check(f"F: {CALLER_JOB_ID} needs {job_id!r}", job_id in caller_needs)
-check(f"F: {CALLER_JOB_ID} needs exactly the seven required external jobs, no more, no fewer", sorted(caller_needs) == sorted(EXTERNAL_RESULT_JOBS))
+check(f"F: {CALLER_JOB_ID} needs exactly the six required external jobs, no more, no fewer", sorted(caller_needs) == sorted(EXTERNAL_RESULT_JOBS))
 
 # G: the caller passes every required selected-environment/mode/result input, each sourced from the correct outer needs.<job> reference.
 caller_with = caller.get("with") or {}
@@ -19864,10 +19903,10 @@ EXPECTED_CALLER_WITH = {
     "has_changes": "needs.validate_model.outputs.has_changes",
     "has_deletions": "needs.validate_model.outputs.has_deletions",
 }
-SPECIALLY_HANDLED_EXTERNAL_JOBS = ("phase_3_argocd", "phase_4_platform_observability", "phase_5_goldengate_runtimes")
+SPECIALLY_HANDLED_EXTERNAL_JOBS = ("phase_3_argocd", "phase_4_platform_observability", "phase_5_goldengate_runtimes", "phase_6_goldengate_replication")
 for job_id in EXTERNAL_RESULT_JOBS:
     if job_id in SPECIALLY_HANDLED_EXTERNAL_JOBS:
-        # Phase 3/Phase 4/Phase 5 grouping: handled specially below (G2/G3/G4/G5/G6/G7/G8/G9) -- the with: key names (result_validate_argocd_ready, result_validate_shared_secrets_once, result_validate_platform_ready, result_validate_observability_ready, result_runtime_ownership_preflight, result_build_publish_and_deploy, result_delete_removed_argocd_applications, result_validate_active_runtimes) are UNCHANGED even though the source job ids changed, and their values use the fallback-OR expression, never the generic needs.<job_id>.result pattern every other external job uses.
+        # Phase 3/Phase 4/Phase 5/Phase 6 grouping: handled specially below (G2/G3/G4/G5/G6/G7/G8/G9/G10/G11) -- the with: key names (result_validate_argocd_ready, result_validate_shared_secrets_once, result_validate_platform_ready, result_validate_observability_ready, result_runtime_ownership_preflight, result_build_publish_and_deploy, result_delete_removed_argocd_applications, result_validate_active_runtimes, result_replication_reconcile_once, result_replication_dry_run_validation) are UNCHANGED even though the source job ids changed, and their values use the fallback-OR expression, never the generic needs.<job_id>.result pattern every other external job uses.
         continue
     EXPECTED_CALLER_WITH[f"result_{job_id}"] = f"needs.{job_id}.result"
 for input_name, expected_ref in EXPECTED_CALLER_WITH.items():
@@ -19875,6 +19914,7 @@ for input_name, expected_ref in EXPECTED_CALLER_WITH.items():
 ALL_EXPECTED_WITH_KEYS = sorted(list(EXPECTED_CALLER_WITH.keys()) + [
     "result_validate_argocd_ready", "result_validate_shared_secrets_once", "result_validate_platform_ready", "result_validate_observability_ready",
     "result_runtime_ownership_preflight", "result_build_publish_and_deploy", "result_delete_removed_argocd_applications", "result_validate_active_runtimes",
+    "result_replication_reconcile_once", "result_replication_dry_run_validation",
 ])
 check("G: the caller passes exactly the required 17 workflow_call inputs, never more, never fewer", sorted(caller_with.keys()) == ALL_EXPECTED_WITH_KEYS)
 
@@ -19900,6 +19940,14 @@ for output_name, input_name in (
 ):
     expected = f"${{{{ needs.phase_5_goldengate_runtimes.outputs.{output_name} || needs.phase_5_goldengate_runtimes.result }}}}"
     check(f"G6/G7/G8/G9: the caller passes with.{input_name} sourced from the exact fallback expression needs.phase_5_goldengate_runtimes.outputs.{output_name} || needs.phase_5_goldengate_runtimes.result", str(caller_with.get(input_name, "")) == expected)
+
+# G10/G11: Phase 6 grouping -- result_replication_reconcile_once/result_replication_dry_run_validation (the Phase 7 wrapper own input names, UNCHANGED/never renamed) are now each sourced via the exact fallback-OR expression against phase_6_goldengate_replication, never a bare needs.phase_6_goldengate_replication.result alone: an earlier internal Phase 6 failure can fail the wrapper while one of these two internal jobs is genuinely SKIPPED, and phase7_final.py intentionally distinguishes those states.
+for output_name, input_name in (
+    ("replication_reconcile_once_result", "result_replication_reconcile_once"),
+    ("replication_dry_run_validation_result", "result_replication_dry_run_validation"),
+):
+    expected = f"${{{{ needs.phase_6_goldengate_replication.outputs.{output_name} || needs.phase_6_goldengate_replication.result }}}}"
+    check(f"G10/G11: the caller passes with.{input_name} sourced from the exact fallback expression needs.phase_6_goldengate_replication.outputs.{output_name} || needs.phase_6_goldengate_replication.result", str(caller_with.get(input_name, "")) == expected)
 
 # H: the grouped Phase 7 workflow contains exactly the seven approved internal jobs, with the exact approved IDs.
 check("H: 70-phase-monitor-final-acceptance.yaml contains exactly the seven approved Phase 7 job IDs, no more, no fewer", sorted(phase7_jobs.keys()) == sorted(PHASE7_JOB_IDS))
@@ -20074,6 +20122,8 @@ for job_id in ("validate_shared_secrets_once", "validate_platform_ready", "valid
     check(f"O: final_validation'"'"'s gate step maps RESULT_{job_id} from inputs.result_{job_id} (external, input name unchanged by the Phase 4 grouping)", f"inputs.result_{job_id}" in str(final_val_gate_env.get(f"RESULT_{job_id}", "")))
 for job_id in ("runtime_ownership_preflight", "build_publish_and_deploy", "delete_removed_argocd_applications", "validate_active_runtimes"):
     check(f"O: final_validation'"'"'s gate step maps RESULT_{job_id} from inputs.result_{job_id} (external, input name unchanged by the Phase 5 grouping)", f"inputs.result_{job_id}" in str(final_val_gate_env.get(f"RESULT_{job_id}", "")))
+for job_id in ("replication_reconcile_once", "replication_dry_run_validation"):
+    check(f"O: final_validation'"'"'s gate step maps RESULT_{job_id} from inputs.result_{job_id} (external, input name unchanged by the Phase 6 grouping)", f"inputs.result_{job_id}" in str(final_val_gate_env.get(f"RESULT_{job_id}", "")))
 for job_id in ("monitor_ownership_preflight", "monitor_sync_once", "monitor_dry_run_validation", "validate_monitor_ready", "replication_monitor_acceptance", "end_to_end_deployment_acceptance"):
     check(f"O: final_validation'"'"'s gate step maps RESULT_{job_id} from needs.{job_id}.result (internal Phase 7 reference)", f"needs.{job_id}.result" in str(final_val_gate_env.get(f"RESULT_{job_id}", "")))
 check("O: final_validation'"'"'s gate step maps exactly 18 RESULT_* values, no more, no fewer", len([k for k in final_val_gate_env if k.startswith("RESULT_")]) == 18)

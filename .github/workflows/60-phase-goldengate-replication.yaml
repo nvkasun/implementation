@@ -1,0 +1,137 @@
+name: "60 | PHASE | GoldenGate Replication"
+
+# Internal orchestration wrapper ONLY -- workflow_call, never workflow_dispatch/push/pull_request/schedule. This groups the two already-live-proven Phase 6A-6B jobs (reconcile enabled replication pipelines on Deploy -> validate replication manifests locally on Validate) beneath ONE MAIN-facing parent job, purely to present Phase 6 as a single clean phase in the GitHub Actions UI -- exactly the same high-level reusable-workflow grouping pattern MAIN's own Phase 3, Phase 4, Phase 5 and Phase 7 groupings already use. No business logic changes: both job bodies below are byte-for-byte the same as their pre-grouping MAIN counterparts except for the mechanical translations required by the reusable-workflow boundary (outer needs.*.result/outputs.* become inputs.*). automation/phases/phase6/phase6_replication.py and automation/goldengate-replication.py are untouched and remain the sole implementation authority. Phase 6A and Phase 6B are mutually exclusive on effective_deploy and remain fully independent of each other -- neither has an internal needs: of the other, and this wrapper never serializes one behind the other.
+
+on:
+  workflow_call:
+    inputs:
+      selected_environment:
+        required: true
+        type: string
+      effective_deploy:
+        required: true
+        type: string
+      has_active_deployments:
+        required: true
+        type: string
+      result_phase_4_platform_observability:
+        required: true
+        type: string
+      result_validate_shared_secrets_once:
+        required: true
+        type: string
+      result_build_publish_and_deploy:
+        required: true
+        type: string
+      result_delete_removed_argocd_applications:
+        required: true
+        type: string
+      result_validate_active_runtimes:
+        required: true
+        type: string
+    outputs:
+      replication_reconcile_once_result:
+        description: "The exact result (success/failure/cancelled/skipped) of the internal Phase 6A replication_reconcile_once job -- never conflated with this wrapper's OWN overall result, since the two are not guaranteed to mean the same thing in every failure/skip scenario. Materialized through fromJSON(toJSON(...)) rather than a bare jobs.<job_id>.result reference -- actions/runner#2495 documents that the bare form can resolve as an empty string in the caller even though the internal job has a valid result (the same hardening already applied to the Phase 3/Phase 4/Phase 5 wrapper outputs). Consumed downstream by the Phase 7G final-validation contract, which must keep distinguishing the Phase 6A result from the Phase 6B result."
+        value: ${{ fromJSON(toJSON(jobs.replication_reconcile_once)).result }}
+      replication_dry_run_validation_result:
+        description: "The exact result of the internal Phase 6B replication_dry_run_validation job. Materialized through fromJSON(toJSON(...)), matching the Phase 3/Phase 4/Phase 5 wrapper's hardened pattern. Consumed downstream by the Phase 7G final-validation contract."
+        value: ${{ fromJSON(toJSON(jobs.replication_dry_run_validation)).result }}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  replication_reconcile_once:
+    name: "Phase 6A | Reconcile GoldenGate Replication Pipelines"
+
+    # Phase 6 grouping: validate_model/phase_4_platform_observability/phase_5_goldengate_runtimes are external jobs completed before this reusable workflow is ever invoked -- their result/outputs cross the reusable-workflow boundary as plain workflow_call inputs (never a needs.* reference to a job outside this file). No internal needs: of its own -- Phase 6A and Phase 6B remain fully independent, mutually exclusive on effective_deploy. Phase B3A: replication must wait for the GLOBAL active-runtime acceptance gate -- when active deployments exist, inputs.result_validate_active_runtimes == 'success' is required; when none exist, the existing clean no-op replication behaviour is preserved unchanged (validate_active_runtimes itself does not even run in that case, so it is excluded from the requirement entirely rather than merely tolerated as skipped). Phase 4 grouping: both the Phase 4 wrapper's own overall result AND its exact internal Phase 4G result are required (never conflated). Phase 5 grouping: build_publish_and_deploy/delete_removed_argocd_applications/validate_active_runtimes now live inside the grouped Phase 5 wrapper -- each exact internal result is consumed via its own hardened output, falling back to the wrapper's own overall result only when that internal job never produced its output at all (a legitimate skip of the whole wrapper), never conflating an internal failure with the wrapper's own result.
+    if: ${{ inputs.effective_deploy == 'true' && always() && inputs.result_phase_4_platform_observability == 'success' && inputs.result_validate_shared_secrets_once == 'success' && inputs.result_build_publish_and_deploy != 'failure' && inputs.result_build_publish_and_deploy != 'cancelled' && inputs.result_delete_removed_argocd_applications != 'failure' && inputs.result_delete_removed_argocd_applications != 'cancelled' && (inputs.has_active_deployments != 'true' || inputs.result_validate_active_runtimes == 'success') }}
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail.
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ inputs.selected_environment }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Load canonical environment configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 automation/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+
+      # Phase 6 Python Conversion: pipeline discovery happens LOCALLY (automation/goldengate-deployment-model.py validate + replication-pipelines only), entirely BEFORE any AWS credential is configured or EKS connection attempted -- a true zero-pipeline run (the CURRENT state of both active runtime descriptors) never touches AWS/kubectl at all, not merely skips the reconciliation loop after already connecting.
+      - name: Discover enabled replication pipelines
+        id: replication_discovery
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 automation/phases/phase6/phase6_replication.py discover --environment "${GG_SELECTED_ENVIRONMENT}"
+
+      # AWS Credential Isolation: output-credentials/output-env-credentials scoping matches the established Phase 1/3 pattern -- these temporary credentials are consumed ONLY by the reconciliation step below, never job-wide, never written to $GITHUB_ENV, never written to any state file. Gated on has_pipelines == 'true' -- a zero-pipeline run never configures AWS credentials at all.
+      - name: Configure AWS credentials
+        if: steps.replication_discovery.outputs.has_pipelines == 'true'
+        id: aws_build_credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
+          output-credentials: true
+          output-env-credentials: false
+
+      - name: Reconcile enabled replication pipelines sequentially
+        if: steps.replication_discovery.outputs.has_pipelines == 'true'
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ steps.aws_build_credentials.outputs.aws-access-key-id }}
+          AWS_SECRET_ACCESS_KEY: ${{ steps.aws_build_credentials.outputs.aws-secret-access-key }}
+          AWS_SESSION_TOKEN: ${{ steps.aws_build_credentials.outputs.aws-session-token }}
+        run: |
+          set -euo pipefail
+
+          python3 automation/phases/phase6/phase6_replication.py reconcile \
+            --environment "${GG_SELECTED_ENVIRONMENT}" \
+            --execution-id "${{ github.run_id }}-${{ github.run_attempt }}"
+
+      - name: No replication pipeline enabled
+        if: steps.replication_discovery.outputs.has_pipelines == 'false'
+        shell: bash
+        run: |
+          echo "No enabled replication pipeline -- clean no-op: no Job created, no existing runtime changed."
+
+  replication_dry_run_validation:
+    name: "Phase 6B | Validate GoldenGate Replication Manifests"
+
+    # Phase 6 grouping: validate_model/phase_4_platform_observability/phase_5_goldengate_runtimes are external jobs completed before this reusable workflow is ever invoked -- their result/outputs cross the reusable-workflow boundary as plain workflow_call inputs. No internal needs: of its own -- remains fully independent of Phase 6A, mutually exclusive on effective_deploy. Phase 4 grouping: both the Phase 4 wrapper's own overall result AND its exact internal Phase 4G result are required (never conflated). Phase 5 grouping: build_publish_and_deploy/delete_removed_argocd_applications now live inside the grouped Phase 5 wrapper -- each exact internal result is consumed via its own hardened output, falling back to the wrapper's own overall result only when that internal job never produced its output at all, never conflating an internal failure with the wrapper's own result. Deliberately never requires validate_active_runtimes -- Validate mode has no active-runtime health concept.
+    if: ${{ inputs.effective_deploy == 'false' && always() && inputs.result_phase_4_platform_observability == 'success' && inputs.result_validate_shared_secrets_once == 'success' && inputs.result_build_publish_and_deploy != 'failure' && inputs.result_build_publish_and_deploy != 'cancelled' && inputs.result_delete_removed_argocd_applications != 'failure' && inputs.result_delete_removed_argocd_applications != 'cancelled' }}
+
+    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    # Live Validate Fix 3: JOB-LEVEL (not step-level) so every run: step in this job can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail. A step-level env: binding is scoped to that one step only and does not propagate to later steps, which is exactly the "GG_SELECTED_ENVIRONMENT: unbound variable" defect the real VDR Validate run hit here.
+    env:
+      GG_SELECTED_ENVIRONMENT: ${{ inputs.selected_environment }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Load canonical environment configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 automation/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
+
+      # Phase 6 Python Conversion: Validate mode remains completely local/read-only -- phase6_replication.py validate-local re-derives model validation + pipeline discovery + per-pipeline dry-run rendering + the SAME structural manifest validation Deploy uses, entirely offline; no aws command, no kubectl command, no cluster dependency anywhere in this job.
+      - name: Validate GoldenGate replication locally
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 automation/phases/phase6/phase6_replication.py validate-local --environment "${GG_SELECTED_ENVIRONMENT}"
