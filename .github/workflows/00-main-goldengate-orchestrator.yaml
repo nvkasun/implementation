@@ -286,418 +286,31 @@ jobs:
       result_phase_3_argocd: ${{ needs.phase_3_argocd.result }}
       result_validate_argocd_ready: ${{ needs.phase_3_argocd.outputs.validate_argocd_ready_result || needs.phase_3_argocd.result }}
 
-  runtime_ownership_preflight:
-    name: "Phase 5A | GoldenGate Runtime Ownership Preflight"
+  phase_5_goldengate_runtimes:
+    name: "Phase 5 | GoldenGate Runtimes"
 
-    # Phase 5A: read-only pre-reconciliation ownership-safety classifier for the deployment(s) THIS RUN is about to reconcile -- ABSENT (safe to create) / OWNED (safe to reconcile, even if currently unhealthy/out of date) / BROKEN (ownership/collision conflict, fail closed). This is deliberately NOT a HEALTHY-skip prerequisite: a GoldenGate runtime is an actual desired deployment target whose descriptor/image/chart may intentionally change on every run, so OWNED (not HEALTHY) is the "proceed" state here. This job never mutates the cluster -- it only runs automation/phases/phase5/phase5_runtime.py ownership-preflight, which itself issues read-only `kubectl get` calls via automation/phases/phase5/runtime_state.py. Phase 4 grouping: validate_shared_secrets_once now lives inside the grouped Phase 4 wrapper -- both the wrapper's own overall result AND its exact internal Phase 4G result are required (never conflated), since the two are not guaranteed to mean the same thing in every failure/skip scenario.
-    needs:
-      - validate_model
-      - phase_4_platform_observability
-    if: ${{ needs.validate_model.result == 'success' && needs.validate_model.outputs.effective_deploy == 'true' && needs.validate_model.outputs.has_changes == 'true' && needs.phase_4_platform_observability.result == 'success' && needs.phase_4_platform_observability.outputs.validate_shared_secrets_once_result == 'success' }}
-
-    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
-
-    # Live Deployment Approval Topology Fix: no job-level environment: here (and deliberately not per-matrix-entry either) -- this job is read-only ownership classification, never a mutation, and a future multi-runtime matrix must never generate one approval per runtime; it is already covered end-to-end by the single goldengate_deploy_authorization approval upstream of it in the DAG.
-    strategy:
-      # Same sequential/fail-fast safety posture as the runtime rollout it gates: an ownership conflict on one deployment must not be masked by a concurrently-evaluated sibling.
-      fail-fast: true
-      max-parallel: 1
-      matrix:
-        include: ${{ fromJson(needs.validate_model.outputs.deployment_matrix) }}
-
-    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail -- matrix jobs draw the selected environment from their own matrix entry, never needs.validate_model.outputs.selected_environment.
-    env:
-      GG_SELECTED_ENVIRONMENT: ${{ matrix.environment }}
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Load canonical environment configuration
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 automation/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
-
-      - name: Ensure kubectl prerequisite
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 automation/phases/phase5/phase5_runtime.py ensure-kubectl
-
-      # AWS Credential Isolation: these temporary credentials are consumed ONLY by the classify step below, never job-wide, never written to $GITHUB_ENV, never written to any state file.
-      - name: Configure AWS credentials
-        id: aws_build_credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-region: ${{ env.AWS_REGION }}
-          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
-          output-credentials: true
-          output-env-credentials: false
-
-      - name: Classify runtime ownership safety
-        id: classify
-        shell: bash
-        env:
-          AWS_ACCESS_KEY_ID: ${{ steps.aws_build_credentials.outputs.aws-access-key-id }}
-          AWS_SECRET_ACCESS_KEY: ${{ steps.aws_build_credentials.outputs.aws-secret-access-key }}
-          AWS_SESSION_TOKEN: ${{ steps.aws_build_credentials.outputs.aws-session-token }}
-        run: |
-          set -euo pipefail
-
-          python3 automation/phases/phase5/phase5_runtime.py ownership-preflight \
-            --environment "${GG_SELECTED_ENVIRONMENT}" \
-            --deployment-id "${{ matrix.deployment_id }}"
-
-  build_publish_and_deploy:
-    name: "Phase 5B | Build, Validate & Reconcile GoldenGate Runtimes"
-
-    needs:
-      - validate_model
-      - phase_4_platform_observability
-      - runtime_ownership_preflight
-    # Requires validate_shared_secrets_once.result == 'success' (never the weaker "not failure/not cancelled"): that job is itself now fail-closed for a real deploy (see its own if:), so requiring its strict success here is what actually closes the deploy=true path -- a failed/skipped storage guard or terraform/platform sync upstream now reliably prevents this job from building/deploying anything, while deploy=false's legitimate skip-terraform/platform path still resolves validate_shared_secrets_once to 'success' and this job still runs its read-only/dry-run path. Phase 5A: the live runtime_ownership_preflight is required ONLY on a real deploy (it never even runs on deploy=false, since its own if: is effective_deploy-gated) -- the `effective_deploy != 'true' || runtime_ownership_preflight.result == 'success'` clause below is what keeps the existing offline Helm lint/render dry-run path completely unaffected by it, while a real deploy is blocked whenever ownership safety was not confirmed ABSENT/OWNED. Phase 4 grouping: validate_shared_secrets_once now lives inside the grouped Phase 4 wrapper -- both the wrapper's own overall result AND its exact internal Phase 4G result are required (never conflated).
-    if: ${{ always() && needs.validate_model.result == 'success' && needs.validate_model.outputs.has_changes == 'true' && needs.phase_4_platform_observability.result == 'success' && needs.phase_4_platform_observability.outputs.validate_shared_secrets_once_result == 'success' && (needs.validate_model.outputs.effective_deploy != 'true' || needs.runtime_ownership_preflight.result == 'success') }}
-
-    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
-
-    # Live Deployment Approval Topology Fix: no job-level environment: here (and deliberately not per-matrix-entry either) -- this is the direct MAIN runtime deployment job, and a real rollout of N selected runtimes must never generate N approvals; the whole rollout is already authorized end-to-end by the single goldengate_deploy_authorization approval upstream of it in the DAG, fixed now (not deferred to a future runtime-activation phase).
-    strategy:
-      # Sequential rollout: an existing-runtime migration failure must block the next queued migration; max-parallel alone is not sufficient.
-      fail-fast: true
-      max-parallel: 1
-      matrix:
-        include: ${{ fromJson(needs.validate_model.outputs.deployment_matrix) }}
-
-    concurrency:
-      group: goldengate-helm-deploy-${{ github.ref }}-${{ matrix.environment }}-${{ matrix.deployment_id }}
-      cancel-in-progress: false
-
-    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail -- matrix jobs draw the selected environment from their own matrix entry, never needs.validate_model.outputs.selected_environment.
-    env:
-      GG_SELECTED_ENVIRONMENT: ${{ matrix.environment }}
-      ENABLE_TEMP_ARGOCD_ECR_PASSWORD_INJECTION: ${{ vars.ENABLE_TEMP_ARGOCD_ECR_PASSWORD_INJECTION }}
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Load canonical environment configuration
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 automation/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
-
-      - name: Ensure Helm/kubectl prerequisites
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 automation/phases/phase5/phase5_runtime.py ensure-deploy-tools
-
-      - name: Prepare runtime deployment state
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 automation/phases/phase5/phase5_runtime.py prepare-deployment \
-            --environment "${GG_SELECTED_ENVIRONMENT}" \
-            --deployment-id "${{ matrix.deployment_id }}" \
-            --deployment-model "${{ matrix.deployment_model }}" \
-            --deploy "${{ matrix.deploy }}"
-
-      # AWS Credential Isolation: these temporary credentials are consumed ONLY by resolve-live-inputs below (and, on Deploy, by publish-chart/validate-cluster-prerequisites/reconcile-runtime/post-deploy-diagnostics later in this job) -- never job-wide, never written to $GITHUB_ENV, never written to any state file.
-      - name: Configure AWS credentials
-        id: aws_build_credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-region: ${{ env.AWS_REGION }}
-          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
-          output-credentials: true
-          output-env-credentials: false
-
-      - name: Resolve and verify live AWS inputs
-        shell: bash
-        env:
-          AWS_ACCESS_KEY_ID: ${{ steps.aws_build_credentials.outputs.aws-access-key-id }}
-          AWS_SECRET_ACCESS_KEY: ${{ steps.aws_build_credentials.outputs.aws-secret-access-key }}
-          AWS_SESSION_TOKEN: ${{ steps.aws_build_credentials.outputs.aws-session-token }}
-        run: |
-          set -euo pipefail
-
-          python3 automation/phases/phase5/phase5_runtime.py resolve-live-inputs \
-            --environment "${GG_SELECTED_ENVIRONMENT}" \
-            --deployment-id "${{ matrix.deployment_id }}"
-
-      - name: Render, validate and package runtime locally
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 automation/phases/phase5/phase5_runtime.py validate-local \
-            --environment "${GG_SELECTED_ENVIRONMENT}" \
-            --deployment-id "${{ matrix.deployment_id }}"
-
-      - name: Publish runtime Helm chart to private ECR
-        if: ${{ matrix.deploy }}
-        shell: bash
-        env:
-          AWS_ACCESS_KEY_ID: ${{ steps.aws_build_credentials.outputs.aws-access-key-id }}
-          AWS_SECRET_ACCESS_KEY: ${{ steps.aws_build_credentials.outputs.aws-secret-access-key }}
-          AWS_SESSION_TOKEN: ${{ steps.aws_build_credentials.outputs.aws-session-token }}
-        run: |
-          set -euo pipefail
-
-          python3 automation/phases/phase5/phase5_runtime.py publish-chart \
-            --environment "${GG_SELECTED_ENVIRONMENT}" \
-            --deployment-id "${{ matrix.deployment_id }}"
-
-      - name: Validate live EKS runtime prerequisites
-        if: ${{ matrix.deploy }}
-        shell: bash
-        env:
-          AWS_ACCESS_KEY_ID: ${{ steps.aws_build_credentials.outputs.aws-access-key-id }}
-          AWS_SECRET_ACCESS_KEY: ${{ steps.aws_build_credentials.outputs.aws-secret-access-key }}
-          AWS_SESSION_TOKEN: ${{ steps.aws_build_credentials.outputs.aws-session-token }}
-        run: |
-          set -euo pipefail
-
-          python3 automation/phases/phase5/phase5_runtime.py validate-cluster-prerequisites \
-            --environment "${GG_SELECTED_ENVIRONMENT}" \
-            --deployment-id "${{ matrix.deployment_id }}"
-
-      - name: Reconcile runtime through Argo CD
-        if: ${{ matrix.deploy }}
-        shell: bash
-        env:
-          AWS_ACCESS_KEY_ID: ${{ steps.aws_build_credentials.outputs.aws-access-key-id }}
-          AWS_SECRET_ACCESS_KEY: ${{ steps.aws_build_credentials.outputs.aws-secret-access-key }}
-          AWS_SESSION_TOKEN: ${{ steps.aws_build_credentials.outputs.aws-session-token }}
-        run: |
-          set -euo pipefail
-
-          python3 automation/phases/phase5/phase5_runtime.py reconcile-runtime \
-            --environment "${GG_SELECTED_ENVIRONMENT}" \
-            --deployment-id "${{ matrix.deployment_id }}"
-
-      - name: Post-deployment diagnostics
-        if: ${{ matrix.deploy }}
-        shell: bash
-        env:
-          AWS_ACCESS_KEY_ID: ${{ steps.aws_build_credentials.outputs.aws-access-key-id }}
-          AWS_SECRET_ACCESS_KEY: ${{ steps.aws_build_credentials.outputs.aws-secret-access-key }}
-          AWS_SESSION_TOKEN: ${{ steps.aws_build_credentials.outputs.aws-session-token }}
-        run: |
-          set -euo pipefail
-
-          python3 automation/phases/phase5/phase5_runtime.py post-deploy-diagnostics \
-            --environment "${GG_SELECTED_ENVIRONMENT}" \
-            --deployment-id "${{ matrix.deployment_id }}"
-
-      - name: Upload rendered manifests and chart package
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: goldengate-helm-artifacts-${{ matrix.environment }}-${{ matrix.deployment_id }}
-          path: |
-            rendered/
-            packaged/
-            pulled/
-          if-no-files-found: warn
-          retention-days: 7
-
-      - name: Workflow summary
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 automation/phases/phase5/phase5_runtime.py summary --mode reconcile \
-            --environment "${GG_SELECTED_ENVIRONMENT}" \
-            --deployment-id "${{ matrix.deployment_id }}"
-
-  delete_removed_argocd_applications:
-    name: "Phase 5C | Remove Undesired GoldenGate Runtimes"
-
-    # GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 1: this job performs the SAME class of consequential Kubernetes mutation (kubectl patch/delete application) as build_publish_and_deploy, but previously ran the instant Phase 1's deployment-detection step alone succeeded with a non-empty deletion_matrix -- entirely bypassing MAIN's single GoldenGate application deployment authorization (goldengate_deploy_authorization) and the post-reconciliation Argo CD HEALTHY acceptance gate (validate_argocd_ready). Runtime removal must not mutate Kubernetes until the normal MAIN deployment authorization has succeeded, exactly like every other mutating job in this DAG. Phase 3 grouping: that entire authorization chain (terraform_sync_once -> argocd_preflight -> goldengate_deploy_authorization -> reconcile_argocd -> validate_argocd_ready) now lives behind the Phase 3 reusable-workflow boundary -- proving it here requires BOTH the wrapper's own overall result AND its exact internal Phase 3D result explicitly, never a bare needs: reference alone, since the two are not guaranteed to mean the same thing in every failure/skip scenario. Deliberately does NOT depend on Phase 4 (platform/observability/shared secrets) -- runtime removal is not serialized behind them.
+    # Phase 5 grouping: this single caller replaces the four Phase 5A-5D jobs previously defined directly in MAIN -- their exact behavior now lives, unchanged, inside .github/workflows/50-phase-goldengate-runtimes.yaml (the same high-level reusable-workflow presentation pattern MAIN's own Phase 3, Phase 4 and Phase 7 groupings already use). needs exactly validate_model/phase_3_argocd/phase_4_platform_observability -- phase_3_argocd is required here (never merely inside the wrapper's own if:) because internal Phase 5C consumes inputs.result_phase_3_argocd/inputs.result_validate_argocd_ready, both sourced from needs.phase_3_argocd below. if: is always() -- Phase 5 contains both a Deploy path (5A/5B/5D) and an independent removal path (5C) that historically remained eligible from the approved Phase-3 authorization boundary regardless of Phase 4's own result; a bare (non-always()) if: would let a legitimately-failed/skipped Phase 4 suppress the entire wrapper (including 5C) before its own internal jobs ever get a chance to examine their individual inputs.* gates. This can delay 5C until Phase 4 finishes, since one wrapper now receives the Phase 4 result before any of its internal jobs evaluate -- that scheduling difference is acceptable and does not change 5C's own eligibility semantics, which remain independent of Phase 4's result.
     needs:
       - validate_model
       - phase_3_argocd
-    if: success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.validate_model.outputs.effective_deploy == 'true' && needs.validate_model.outputs.has_deletions == 'true' && needs.phase_3_argocd.result == 'success' && needs.phase_3_argocd.outputs.validate_argocd_ready_result == 'success'
-
-    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include: ${{ fromJson(needs.validate_model.outputs.deletion_matrix) }}
-
-    concurrency:
-      group: goldengate-argocd-delete-${{ github.ref }}-${{ matrix.environment }}-${{ matrix.deployment_id }}
-      cancel-in-progress: false
-
-    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail -- matrix jobs draw the selected environment from their own matrix entry, never needs.validate_model.outputs.selected_environment.
-    env:
-      GG_SELECTED_ENVIRONMENT: ${{ matrix.environment }}
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Load canonical environment configuration
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 automation/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
-
-      - name: Ensure kubectl prerequisite
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 automation/phases/phase5/phase5_runtime.py ensure-kubectl
-
-      - name: Prepare removal state
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 automation/phases/phase5/phase5_runtime.py prepare-removal \
-            --environment "${GG_SELECTED_ENVIRONMENT}" \
-            --deployment-id "${{ matrix.deployment_id }}" \
-            --deployment-model "${{ matrix.deployment_model }}" \
-            --efs-mode "${{ matrix.efs_mode }}" \
-            --reason "${{ matrix.reason }}"
-
-      # AWS Credential Isolation: these temporary credentials are consumed ONLY by removal-preflight/remove-runtime/post-delete-acceptance below -- never job-wide, never written to $GITHUB_ENV, never written to any state file.
-      - name: Configure AWS credentials
-        id: aws_build_credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-region: ${{ env.AWS_REGION }}
-          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
-          output-credentials: true
-          output-env-credentials: false
-
-      - name: Classify removal safety
-        shell: bash
-        env:
-          AWS_ACCESS_KEY_ID: ${{ steps.aws_build_credentials.outputs.aws-access-key-id }}
-          AWS_SECRET_ACCESS_KEY: ${{ steps.aws_build_credentials.outputs.aws-secret-access-key }}
-          AWS_SESSION_TOKEN: ${{ steps.aws_build_credentials.outputs.aws-session-token }}
-        run: |
-          set -euo pipefail
-
-          python3 automation/phases/phase5/phase5_runtime.py removal-preflight \
-            --environment "${GG_SELECTED_ENVIRONMENT}" \
-            --deployment-id "${{ matrix.deployment_id }}"
-
-      - name: Remove owned runtime Application
-        shell: bash
-        env:
-          AWS_ACCESS_KEY_ID: ${{ steps.aws_build_credentials.outputs.aws-access-key-id }}
-          AWS_SECRET_ACCESS_KEY: ${{ steps.aws_build_credentials.outputs.aws-secret-access-key }}
-          AWS_SESSION_TOKEN: ${{ steps.aws_build_credentials.outputs.aws-session-token }}
-        run: |
-          set -euo pipefail
-
-          python3 automation/phases/phase5/phase5_runtime.py remove-runtime \
-            --environment "${GG_SELECTED_ENVIRONMENT}" \
-            --deployment-id "${{ matrix.deployment_id }}"
-
-      - name: Verify runtime compute absence
-        shell: bash
-        env:
-          AWS_ACCESS_KEY_ID: ${{ steps.aws_build_credentials.outputs.aws-access-key-id }}
-          AWS_SECRET_ACCESS_KEY: ${{ steps.aws_build_credentials.outputs.aws-secret-access-key }}
-          AWS_SESSION_TOKEN: ${{ steps.aws_build_credentials.outputs.aws-session-token }}
-        run: |
-          set -euo pipefail
-
-          python3 automation/phases/phase5/phase5_runtime.py post-delete-acceptance \
-            --environment "${GG_SELECTED_ENVIRONMENT}" \
-            --deployment-id "${{ matrix.deployment_id }}"
-
-      - name: Workflow summary
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 automation/phases/phase5/phase5_runtime.py summary --mode remove \
-            --environment "${GG_SELECTED_ENVIRONMENT}" \
-            --deployment-id "${{ matrix.deployment_id }}"
-
-  validate_active_runtimes:
-    name: "Phase 5D | Validate Active GoldenGate Runtimes Healthy"
-
-    # Phase 5D: post-reconciliation runtime acceptance -- HEALTHY/BROKEN only (never ABSENT: an active desired runtime that is missing IS BROKEN). Deliberately uses needs.validate_model.outputs.active_runtime_matrix (the GLOBAL canonical registry), never needs.validate_model.outputs.deployment_matrix (only the deployments THIS RUN selected) -- an unchanged active runtime must be validated too, or MAIN could claim end-to-end success while a previously-deployed runtime silently degraded. This job never mutates the cluster or AWS -- automation/phases/phase5/runtime_acceptance.py's Kubernetes calls are read-only `kubectl get`, and any managed-EFS filesystem ID is resolved via a single read-only elasticfilesystem:DescribeFileSystems call inside automation/phases/phase5/phase5_runtime.py strict-acceptance, never via EFS mutation.
-    needs:
-      - validate_model
       - phase_4_platform_observability
-      - build_publish_and_deploy
-      - delete_removed_argocd_applications
-    # always() so a legitimately-skipped build_publish_and_deploy (nothing changed this run) does not itself suppress acceptance of the OTHER active runtimes -- only an actual build failure/cancellation blocks this job. has_active_deployments=='false' cleanly skips the whole job rather than attempting an empty matrix. Phase 4 grouping: validate_shared_secrets_once now lives inside the grouped Phase 4 wrapper -- both the wrapper's own overall result AND its exact internal Phase 4G result are required (never conflated).
-    if: ${{ always() && needs.validate_model.outputs.effective_deploy == 'true' && needs.validate_model.outputs.has_active_deployments == 'true' && needs.phase_4_platform_observability.result == 'success' && needs.phase_4_platform_observability.outputs.validate_shared_secrets_once_result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' }}
+    if: always()
 
-    runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
-
-    # Live Deployment Approval Topology Fix: no job-level environment: here (and deliberately not per-matrix-entry either) -- this job is read-only global acceptance validation, never a mutation, and must never generate one approval per active runtime; it is already covered end-to-end by the single goldengate_deploy_authorization approval upstream of it in the DAG.
-    strategy:
-      # One matrix item per active deployment in the GLOBAL canonical registry; sequential/fail-fast so a BROKEN runtime is reported clearly rather than racing diagnostics from a concurrently-evaluated sibling.
-      fail-fast: true
-      max-parallel: 1
-      matrix:
-        include: ${{ fromJson(needs.validate_model.outputs.active_runtime_matrix) }}
-
-    # Live Deploy Fix 4: JOB-LEVEL (not step-level) so every run: step in this job can safely reference "$GG_SELECTED_ENVIRONMENT" under set -euo pipefail -- matrix jobs draw the selected environment from their own matrix entry, never needs.validate_model.outputs.selected_environment.
-    env:
-      GG_SELECTED_ENVIRONMENT: ${{ matrix.environment }}
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Load canonical environment configuration
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 automation/goldengate-environment.py --environment "${GG_SELECTED_ENVIRONMENT}" github-env >> "$GITHUB_ENV"
-
-      - name: Ensure kubectl prerequisite
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 automation/phases/phase5/phase5_runtime.py ensure-kubectl
-
-      # AWS Credential Isolation: these temporary credentials are consumed ONLY by the strict-acceptance step below, never job-wide, never written to $GITHUB_ENV, never written to any state file.
-      - name: Configure AWS credentials
-        id: aws_build_credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-region: ${{ env.AWS_REGION }}
-          role-to-assume: ${{ env.RUNNER_ROLE_ARN }}
-          output-credentials: true
-          output-env-credentials: false
-
-      - name: Require runtime to be exactly HEALTHY
-        shell: bash
-        env:
-          AWS_ACCESS_KEY_ID: ${{ steps.aws_build_credentials.outputs.aws-access-key-id }}
-          AWS_SECRET_ACCESS_KEY: ${{ steps.aws_build_credentials.outputs.aws-secret-access-key }}
-          AWS_SESSION_TOKEN: ${{ steps.aws_build_credentials.outputs.aws-session-token }}
-        run: |
-          set -euo pipefail
-
-          python3 automation/phases/phase5/phase5_runtime.py strict-acceptance \
-            --environment "${GG_SELECTED_ENVIRONMENT}" \
-            --deployment-id "${{ matrix.deployment_id }}"
+    uses: ./.github/workflows/50-phase-goldengate-runtimes.yaml
+    secrets: inherit
+    with:
+      effective_deploy: ${{ needs.validate_model.outputs.effective_deploy }}
+      has_changes: ${{ needs.validate_model.outputs.has_changes }}
+      has_deletions: ${{ needs.validate_model.outputs.has_deletions }}
+      has_active_deployments: ${{ needs.validate_model.outputs.has_active_deployments }}
+      deployment_matrix: ${{ needs.validate_model.outputs.deployment_matrix }}
+      deletion_matrix: ${{ needs.validate_model.outputs.deletion_matrix }}
+      active_runtime_matrix: ${{ needs.validate_model.outputs.active_runtime_matrix }}
+      result_validate_model: ${{ needs.validate_model.result }}
+      result_phase_3_argocd: ${{ needs.phase_3_argocd.result }}
+      result_validate_argocd_ready: ${{ needs.phase_3_argocd.outputs.validate_argocd_ready_result || needs.phase_3_argocd.result }}
+      result_phase_4_platform_observability: ${{ needs.phase_4_platform_observability.result }}
+      result_validate_shared_secrets_once: ${{ needs.phase_4_platform_observability.outputs.validate_shared_secrets_once_result || needs.phase_4_platform_observability.result }}
 
   replication_reconcile_once:
     name: "Phase 6A | Reconcile GoldenGate Replication Pipelines"
@@ -705,11 +318,9 @@ jobs:
     needs:
       - validate_model
       - phase_4_platform_observability
-      - build_publish_and_deploy
-      - delete_removed_argocd_applications
-      - validate_active_runtimes
-    # Phase B3A: replication must wait for the GLOBAL active-runtime acceptance gate -- when active deployments exist, validate_active_runtimes.result == 'success' is required; when none exist, the existing clean no-op replication behaviour is preserved unchanged (validate_active_runtimes itself does not even run in that case, so it is excluded from the requirement entirely rather than merely tolerated as skipped). Phase 4 grouping: validate_shared_secrets_once now lives inside the grouped Phase 4 wrapper -- both the wrapper's own overall result AND its exact internal Phase 4G result are required (never conflated).
-    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && always() && needs.phase_4_platform_observability.result == 'success' && needs.phase_4_platform_observability.outputs.validate_shared_secrets_once_result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' && (needs.validate_model.outputs.has_active_deployments != 'true' || needs.validate_active_runtimes.result == 'success') }}
+      - phase_5_goldengate_runtimes
+    # Phase B3A: replication must wait for the GLOBAL active-runtime acceptance gate -- when active deployments exist, validate_active_runtimes.result == 'success' is required; when none exist, the existing clean no-op replication behaviour is preserved unchanged (validate_active_runtimes itself does not even run in that case, so it is excluded from the requirement entirely rather than merely tolerated as skipped). Phase 4 grouping: validate_shared_secrets_once now lives inside the grouped Phase 4 wrapper -- both the wrapper's own overall result AND its exact internal Phase 4G result are required (never conflated). Phase 5 grouping: build_publish_and_deploy/delete_removed_argocd_applications/validate_active_runtimes now live inside the grouped Phase 5 wrapper -- each exact internal result is consumed via its own hardened output, falling back to the wrapper's own overall result only when that internal job never produced its output at all (a legitimate skip of the whole wrapper), never conflating an internal failure with the wrapper's own result.
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'true' && always() && needs.phase_4_platform_observability.result == 'success' && needs.phase_4_platform_observability.outputs.validate_shared_secrets_once_result == 'success' && (needs.phase_5_goldengate_runtimes.outputs.build_publish_and_deploy_result || needs.phase_5_goldengate_runtimes.result) != 'failure' && (needs.phase_5_goldengate_runtimes.outputs.build_publish_and_deploy_result || needs.phase_5_goldengate_runtimes.result) != 'cancelled' && (needs.phase_5_goldengate_runtimes.outputs.delete_removed_argocd_applications_result || needs.phase_5_goldengate_runtimes.result) != 'failure' && (needs.phase_5_goldengate_runtimes.outputs.delete_removed_argocd_applications_result || needs.phase_5_goldengate_runtimes.result) != 'cancelled' && (needs.validate_model.outputs.has_active_deployments != 'true' || (needs.phase_5_goldengate_runtimes.outputs.validate_active_runtimes_result || needs.phase_5_goldengate_runtimes.result) == 'success') }}
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -771,13 +382,12 @@ jobs:
   replication_dry_run_validation:
     name: "Phase 6B | Validate GoldenGate Replication Manifests"
 
-    # Phase 4 grouping: validate_shared_secrets_once now lives inside the grouped Phase 4 wrapper -- both the wrapper's own overall result AND its exact internal Phase 4G result are required (never conflated).
+    # Phase 4 grouping: validate_shared_secrets_once now lives inside the grouped Phase 4 wrapper -- both the wrapper's own overall result AND its exact internal Phase 4G result are required (never conflated). Phase 5 grouping: build_publish_and_deploy/delete_removed_argocd_applications now live inside the grouped Phase 5 wrapper -- each exact internal result is consumed via its own hardened output, falling back to the wrapper's own overall result only when that internal job never produced its output at all, never conflating an internal failure with the wrapper's own result.
     needs:
       - validate_model
       - phase_4_platform_observability
-      - build_publish_and_deploy
-      - delete_removed_argocd_applications
-    if: ${{ needs.validate_model.outputs.effective_deploy == 'false' && always() && needs.phase_4_platform_observability.result == 'success' && needs.phase_4_platform_observability.outputs.validate_shared_secrets_once_result == 'success' && needs.build_publish_and_deploy.result != 'failure' && needs.build_publish_and_deploy.result != 'cancelled' && needs.delete_removed_argocd_applications.result != 'failure' && needs.delete_removed_argocd_applications.result != 'cancelled' }}
+      - phase_5_goldengate_runtimes
+    if: ${{ needs.validate_model.outputs.effective_deploy == 'false' && always() && needs.phase_4_platform_observability.result == 'success' && needs.phase_4_platform_observability.outputs.validate_shared_secrets_once_result == 'success' && (needs.phase_5_goldengate_runtimes.outputs.build_publish_and_deploy_result || needs.phase_5_goldengate_runtimes.result) != 'failure' && (needs.phase_5_goldengate_runtimes.outputs.build_publish_and_deploy_result || needs.phase_5_goldengate_runtimes.result) != 'cancelled' && (needs.phase_5_goldengate_runtimes.outputs.delete_removed_argocd_applications_result || needs.phase_5_goldengate_runtimes.result) != 'failure' && (needs.phase_5_goldengate_runtimes.outputs.delete_removed_argocd_applications_result || needs.phase_5_goldengate_runtimes.result) != 'cancelled' }}
 
     runs-on: codebuild-${{ vars.PROJECT_NAME_DEV }}-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -813,13 +423,10 @@ jobs:
       - terraform_sync_once
       - phase_3_argocd
       - phase_4_platform_observability
-      - runtime_ownership_preflight
-      - build_publish_and_deploy
-      - delete_removed_argocd_applications
-      - validate_active_runtimes
+      - phase_5_goldengate_runtimes
       - replication_reconcile_once
       - replication_dry_run_validation
-    # GoldenGate Monitor MAIN DAG Skip-Propagation Correctness Fix, preserved across the reusable-workflow boundary: this if: must remain always() so the grouped Phase 7 workflow still executes when one of these external jobs legitimately SKIPPED/FAILED/CANCELLED, allowing Phase 7G's own fail-closed mode-aware final-validation contract to run and report the exact reason -- GitHub's implicit "all needs succeeded" default must never silently suppress the entire Phase 7 workflow.
+    # GoldenGate Monitor MAIN DAG Skip-Propagation Correctness Fix, preserved across the reusable-workflow boundary: this if: must remain always() so the grouped Phase 7 workflow still executes when one of these external jobs legitimately SKIPPED/FAILED/CANCELLED, allowing Phase 7G's own fail-closed mode-aware final-validation contract to run and report the exact reason -- GitHub's implicit "all needs succeeded" default must never silently suppress the entire Phase 7 workflow. Phase 5 grouping: runtime_ownership_preflight/build_publish_and_deploy/delete_removed_argocd_applications/validate_active_runtimes are replaced by the single phase_5_goldengate_runtimes dependency here -- four dependencies collapsed into one, never dropped; the Phase 7 wrapper's own result_runtime_ownership_preflight/result_build_publish_and_deploy/result_delete_removed_argocd_applications/result_validate_active_runtimes input names are unchanged (see the with: block below for the exact fallback expressions that preserve the old semantic results).
     if: always()
 
     uses: ./.github/workflows/70-phase-monitor-final-acceptance.yaml
@@ -838,9 +445,10 @@ jobs:
       # Phase 4 grouping: same fallback-OR pattern as result_validate_shared_secrets_once above, applied to the Phase 4C/4F internal results.
       result_validate_platform_ready: ${{ needs.phase_4_platform_observability.outputs.validate_platform_ready_result || needs.phase_4_platform_observability.result }}
       result_validate_observability_ready: ${{ needs.phase_4_platform_observability.outputs.validate_observability_ready_result || needs.phase_4_platform_observability.result }}
-      result_runtime_ownership_preflight: ${{ needs.runtime_ownership_preflight.result }}
-      result_build_publish_and_deploy: ${{ needs.build_publish_and_deploy.result }}
-      result_delete_removed_argocd_applications: ${{ needs.delete_removed_argocd_applications.result }}
-      result_validate_active_runtimes: ${{ needs.validate_active_runtimes.result }}
+      # Phase 5 grouping: same fallback-OR pattern as result_validate_shared_secrets_once above, applied to the Phase 5A/5B/5C/5D internal results -- these Phase 7 wrapper input names are UNCHANGED even though the source job moved behind the Phase 5 wrapper.
+      result_runtime_ownership_preflight: ${{ needs.phase_5_goldengate_runtimes.outputs.runtime_ownership_preflight_result || needs.phase_5_goldengate_runtimes.result }}
+      result_build_publish_and_deploy: ${{ needs.phase_5_goldengate_runtimes.outputs.build_publish_and_deploy_result || needs.phase_5_goldengate_runtimes.result }}
+      result_delete_removed_argocd_applications: ${{ needs.phase_5_goldengate_runtimes.outputs.delete_removed_argocd_applications_result || needs.phase_5_goldengate_runtimes.result }}
+      result_validate_active_runtimes: ${{ needs.phase_5_goldengate_runtimes.outputs.validate_active_runtimes_result || needs.phase_5_goldengate_runtimes.result }}
       result_replication_reconcile_once: ${{ needs.replication_reconcile_once.result }}
       result_replication_dry_run_validation: ${{ needs.replication_dry_run_validation.result }}

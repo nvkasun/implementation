@@ -37,6 +37,10 @@ PHASE4_WRAPPER_FILENAME = "40-phase-platform-observability-shared-secrets.yaml"
 PHASE4_WRAPPER_CALLER_JOB = "phase_4_platform_observability"
 PHASE4_PLATFORM_SYNC_JOB = "platform_sync_once"
 PHASE4_OBSERVABILITY_SYNC_JOB = "observability_sync_once"
+# Phase 5 grouping: delete_removed_argocd_applications (Phase 5C) moved off MAIN entirely into PHASE5_WRAPPER_FILENAME -- the deletion-authorization proof below now spans THREE documents (MAIN -> PHASE3_WRAPPER_FILENAME -> PHASE5_WRAPPER_FILENAME) instead of two, and the wrapper's own internal 5C if: is checked directly (its inputs.* boundary references never appear as needs.<job>.result the way an ordinary MAIN job's would).
+PHASE5_WRAPPER_FILENAME = "50-phase-goldengate-runtimes.yaml"
+PHASE5_WRAPPER_CALLER_JOB = "phase_5_goldengate_runtimes"
+PHASE5_DELETION_JOB = "delete_removed_argocd_applications"
 CORPORATE_TERRAFORM_WORKFLOW_FILENAME = "10-sub-iam-secrets.yaml"
 CORPORATE_TERRAFORM_WORKFLOW_CALLER_JOB = "terraform_sync_once"
 CORPORATE_TERRAFORM_REUSABLE_WORKFLOW_REF = "AbuDhabiCommercialBank/adcb-reusable-workflows/.github/workflows/aws-terraform-apply.yaml@main"
@@ -297,7 +301,7 @@ def check_phase3_wrapper_reconcile_requires_authorization(wrapper_doc, findings)
         findings.append(f"{PHASE3_WRAPPER_FILENAME} job {PHASE3_RECONCILE_JOB!r}'s if: must require needs.{GOLDENGATE_AUTHORIZATION_JOB}.result == 'success', found: {_job_if(job)!r}")
 
 
-DELETION_JOB = "delete_removed_argocd_applications"
+DELETION_JOB = PHASE5_DELETION_JOB
 
 
 def _explicit_success_chain_to(jobs, start, target):
@@ -323,26 +327,91 @@ def check_phase3_internal_chain_fail_closed(wrapper_doc, findings):
         )
 
 
-def check_main_deletion_requires_phase3_boundary(main_doc, findings):
-    """Part B of the two-part cross-workflow deletion-authorization proof (Phase 3 grouping): GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 1: runtime removal (delete_removed_argocd_applications performs kubectl patch/delete application and kubectl delete namespace) is exactly as consequential a mutation as runtime creation/update and must never be able to bypass the single GoldenGate application deployment authorization. Since that authorization now lives behind the Phase 3 reusable-workflow boundary, proving this here requires BOTH an explicit needs.phase_3_argocd.result == 'success' check (the wrapper's own overall result) AND an explicit needs.phase_3_argocd.outputs.validate_argocd_ready_result == 'success' check (the wrapper's exact internal Phase 3D result) -- checking only the former is not sufficient, since an earlier internal Phase 3 failure and a genuine internal validate_argocd_ready skip are not guaranteed to mean the same thing. See check_phase3_internal_chain_fail_closed above for Part A, the internal half this composes with."""
+def check_main_no_direct_phase5_jobs(main_doc, findings):
+    """Phase 5 grouping: runtime_ownership_preflight/build_publish_and_deploy/delete_removed_argocd_applications/validate_active_runtimes moved OFF MAIN entirely into PHASE5_WRAPPER_FILENAME -- any of the four reappearing directly in MAIN (negative fixture 7: reintroducing DELETION_JOB) would open a second, unreviewed runtime-mutation path that bypasses the Phase 5 wrapper's own boundary translation entirely."""
     jobs = _jobs(main_doc)
-    job = jobs.get(DELETION_JOB)
+    reintroduced = [j for j in (PHASE5_DELETION_JOB, "runtime_ownership_preflight", "build_publish_and_deploy", "validate_active_runtimes") if j in jobs]
+    if reintroduced:
+        findings.append(f"MAIN must not directly define any of the four Phase 5 jobs after the Phase 5 grouping (found {reintroduced}) -- they belong only inside {PHASE5_WRAPPER_FILENAME!r}")
+
+
+def check_main_calls_phase5_wrapper_boundary(main_doc, workflow_dir, findings):
+    """PART B (MAIN Phase 3 -> Phase 5 boundary, Phase 5 grouping): the phase_5_goldengate_runtimes caller job must need phase_3_argocd directly (negative fixture 1) and pass BOTH the wrapper's own overall result AND its exact internal Phase 3D result into the Phase 5 wrapper -- via the exact same fallback-OR expression the Phase 4/Phase 7 wrappers already use (negative fixture 2) -- never a bare needs.phase_3_argocd.result alone, never a generic 'success' constant, and never only the aggregate wrapper result. This is Part B of the two-part cross-workflow deletion-authorization proof; see check_phase5_wrapper_deletion_gate below for Part C, the internal half this composes with."""
+    main_jobs = _jobs(main_doc)
+    job = main_jobs.get(PHASE5_WRAPPER_CALLER_JOB)
     if not isinstance(job, dict):
-        findings.append(f"MAIN is missing the expected {DELETION_JOB!r} job")
+        findings.append(f"MAIN is missing the expected {PHASE5_WRAPPER_CALLER_JOB!r} job")
         return
+
+    uses = job.get("uses") or ""
+    if not uses.endswith(f".github/workflows/{PHASE5_WRAPPER_FILENAME}"):
+        findings.append(f"MAIN job {PHASE5_WRAPPER_CALLER_JOB!r} does not call {PHASE5_WRAPPER_FILENAME!r} via uses: (found {uses!r})")
 
     needs = _job_needs(job)
     if PHASE3_WRAPPER_CALLER_JOB not in needs:
-        findings.append(f"MAIN job {DELETION_JOB!r} must list {PHASE3_WRAPPER_CALLER_JOB!r} in needs:, found {needs}")
+        findings.append(f"MAIN job {PHASE5_WRAPPER_CALLER_JOB!r} must list {PHASE3_WRAPPER_CALLER_JOB!r} in needs: (negative fixture 1), found {needs}")
+
+    with_block = job.get("with") or {}
+    required_result_ref = f"needs.{PHASE3_WRAPPER_CALLER_JOB}.result"
+    if required_result_ref not in str(with_block.get("result_phase_3_argocd", "")):
+        findings.append(f"MAIN job {PHASE5_WRAPPER_CALLER_JOB!r} must pass with.result_phase_3_argocd sourced from {required_result_ref}, found {with_block.get('result_phase_3_argocd')!r}")
+
+    expected_ready_expr = f"needs.{PHASE3_WRAPPER_CALLER_JOB}.outputs.{PHASE3_VALIDATE_OUTPUT} || needs.{PHASE3_WRAPPER_CALLER_JOB}.result"
+    actual_ready_expr = str(with_block.get("result_validate_argocd_ready", ""))
+    if expected_ready_expr not in actual_ready_expr:
+        findings.append(f"MAIN job {PHASE5_WRAPPER_CALLER_JOB!r} must pass with.result_validate_argocd_ready sourced from the exact fallback expression {expected_ready_expr!r} (negative fixture 2: only the aggregate wrapper result, or a bare needs.{PHASE3_WRAPPER_CALLER_JOB}.result, is not sufficient), found {actual_ready_expr!r}")
+
+    wrapper_path = os.path.join(workflow_dir, PHASE5_WRAPPER_FILENAME)
+    if not os.path.exists(wrapper_path):
+        findings.append(f"MAIN job {PHASE5_WRAPPER_CALLER_JOB!r} calls {PHASE5_WRAPPER_FILENAME!r}, but that file does not exist")
+
+
+def check_phase5_wrapper_deletion_gate(wrapper_doc, findings):
+    """PART C (internal Phase 5C deletion gate, Phase 5 grouping): the delete_removed_argocd_applications job inside PHASE5_WRAPPER_FILENAME must explicitly require inputs.result_validate_model == 'success' (negative fixture 5 -- this is the previously-implicit prerequisite a bare success() carried while this job lived directly alongside validate_model inside MAIN; a bare success() no longer spans the reusable-workflow boundary now that validate_model is external to this file), inputs.result_phase_3_argocd == 'success' (negative fixture 3), and inputs.result_validate_argocd_ready == 'success' (negative fixture 4) -- the exact internal Phase 3D result, never merely the wrapper's own aggregate result. Also proves the job remains gated on effective_deploy/has_deletions, unchanged from its pre-grouping MAIN gate."""
+    jobs = _jobs(wrapper_doc)
+    job = jobs.get(PHASE5_DELETION_JOB)
+    if not isinstance(job, dict):
+        findings.append(f"{PHASE5_WRAPPER_FILENAME} is missing the expected {PHASE5_DELETION_JOB!r} job")
         return
 
     job_if = _job_if(job)
-    required_result_check = f"needs.{PHASE3_WRAPPER_CALLER_JOB}.result == 'success'"
-    required_output_check = f"needs.{PHASE3_WRAPPER_CALLER_JOB}.outputs.{PHASE3_VALIDATE_OUTPUT} == 'success'"
-    if required_result_check not in job_if:
-        findings.append(f"MAIN job {DELETION_JOB!r}'s if: must contain {required_result_check!r} (listing {PHASE3_WRAPPER_CALLER_JOB!r} in needs: alone is not sufficient), found: {job_if!r}")
-    if required_output_check not in job_if:
-        findings.append(f"MAIN job {DELETION_JOB!r}'s if: must contain {required_output_check!r} -- checking only the wrapper's overall result is not sufficient, since an earlier internal Phase 3 failure and a genuine internal validate_argocd_ready skip are not the same thing, found: {job_if!r}")
+    required_checks = (
+        f"inputs.result_validate_model == 'success'",
+        f"inputs.result_phase_3_argocd == 'success'",
+        f"inputs.result_validate_argocd_ready == 'success'",
+        "inputs.effective_deploy == 'true'",
+        "inputs.has_deletions == 'true'",
+    )
+    for required in required_checks:
+        if required not in job_if:
+            findings.append(f"{PHASE5_WRAPPER_FILENAME} job {PHASE5_DELETION_JOB!r}'s if: must contain {required!r}, found: {job_if!r}")
+
+
+def check_phase5_wrapper_is_workflow_call_only(wrapper_doc, findings):
+    """Phase 5 grouping: the Phase 5 wrapper is an internal orchestration wrapper, never an independent second operator-facing entry point -- it must expose workflow_call only (negative fixture 6 composes with check_phase5_wrapper_opens_no_second_authorization below)."""
+    on_block = _on_block(wrapper_doc)
+    extra_triggers = [t for t in ("workflow_dispatch", "push", "pull_request", "schedule") if t in on_block]
+    if extra_triggers:
+        findings.append(f"{PHASE5_WRAPPER_FILENAME}: must expose workflow_call only -- found additional trigger(s) {sorted(extra_triggers)!r}")
+
+
+def check_phase5_wrapper_opens_no_second_authorization(wrapper_doc, findings):
+    """Phase 5 grouping: the Phase 5 wrapper is a pure orchestration passthrough -- it must never declare its own job-level environment: (negative fixture 6), which would open a second, redundant GoldenGate deployment approval alongside the single goldengate_deploy_authorization inside PHASE3_WRAPPER_FILENAME, exactly like the Phase 4 and Phase 7 wrappers."""
+    jobs = _jobs(wrapper_doc)
+    envs = [name for name, job in jobs.items() if isinstance(job, dict) and _job_environment(job) is not None]
+    if envs:
+        findings.append(f"{PHASE5_WRAPPER_FILENAME}: must declare zero job-level environment: keys (found on {envs}) -- it must never open a second GoldenGate deployment approval; the single goldengate_deploy_authorization inside {PHASE3_WRAPPER_FILENAME!r} already covers this chain")
+
+
+def check_deletion_job_appears_in_exactly_one_workflow(workflow_dir, findings):
+    """Phase 5 grouping: exactly one approved deletion job exists anywhere in the repository's active workflows -- PHASE5_DELETION_JOB must appear in PHASE5_WRAPPER_FILENAME and nowhere else (never a second, duplicate deletion path bypassing the wrapper, e.g. reintroduced directly in MAIN -- negative fixture 7)."""
+    owners = []
+    for path in sorted(glob.glob(os.path.join(workflow_dir, "*.yaml")) + glob.glob(os.path.join(workflow_dir, "*.yml"))):
+        doc = load_workflow(path)
+        if PHASE5_DELETION_JOB in _jobs(doc):
+            owners.append(os.path.basename(path))
+    if owners != [PHASE5_WRAPPER_FILENAME]:
+        findings.append(f"{PHASE5_DELETION_JOB!r} must appear in exactly one workflow file ({PHASE5_WRAPPER_FILENAME!r}), found it in {owners}")
 
 
 def check_specialist_orchestration_contract(filename, doc, findings):
@@ -497,7 +566,8 @@ def run_checks(workflow_dir):
     check_main_calls_phase3_wrapper_which_calls_argocd(main_doc, workflow_dir, findings)
     check_main_calls_phase4_wrapper_which_calls_platform_and_observability(main_doc, workflow_dir, findings)
     check_main_never_calls_nested_specialists_directly(main_doc, findings)
-    check_main_deletion_requires_phase3_boundary(main_doc, findings)
+    check_main_no_direct_phase5_jobs(main_doc, findings)
+    check_main_calls_phase5_wrapper_boundary(main_doc, workflow_dir, findings)
     check_main_never_calls_ops_workflows(main_doc, findings)
 
     phase7_wrapper_path = os.path.join(workflow_dir, PHASE7_WRAPPER_FILENAME)
@@ -529,6 +599,19 @@ def run_checks(workflow_dir):
         check_environment_variable_not_exposed_as_secret(PHASE4_WRAPPER_FILENAME, phase4_wrapper_doc, findings)
     else:
         findings.append(f"{PHASE4_WRAPPER_FILENAME}: expected file does not exist")
+
+    phase5_wrapper_path = os.path.join(workflow_dir, PHASE5_WRAPPER_FILENAME)
+    if os.path.exists(phase5_wrapper_path):
+        phase5_wrapper_doc = load_workflow(phase5_wrapper_path)
+        workflows_inspected += 1
+        check_phase5_wrapper_opens_no_second_authorization(phase5_wrapper_doc, findings)
+        check_phase5_wrapper_is_workflow_call_only(phase5_wrapper_doc, findings)
+        check_phase5_wrapper_deletion_gate(phase5_wrapper_doc, findings)
+        check_environment_variable_not_exposed_as_secret(PHASE5_WRAPPER_FILENAME, phase5_wrapper_doc, findings)
+    else:
+        findings.append(f"{PHASE5_WRAPPER_FILENAME}: expected file does not exist")
+
+    check_deletion_job_appears_in_exactly_one_workflow(workflow_dir, findings)
 
     for filename in SPECIALIST_FILENAMES:
         path = os.path.join(workflow_dir, filename)
