@@ -45,3 +45,12 @@ module "oracle_db_vm01" {
 
   tags = local.tags
 }
+
+
+-------------------
+module "oracle_db_resource_group" {
+  source = "git::https://github.com/AbuDhabiCommercialBank/azure-terraform.git//modules/resource-groups?ref=main"
+
+  rg_name = format("rg-%s-%s-%s-oracledb", var.application_name, var.environment, var.location)
+  tags    = local.tags
+}
