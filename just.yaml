@@ -1,0 +1,13 @@
+Hi Team,
+
+The reported KeyDelete and SecretDelete operations are expected and authorized activities related to an ongoing POC deployment in the Cloud Factory non-production subscription (sub-adcb-cloud-factory-nonprod-001).
+
+We are currently provisioning a Linux virtual machine in this POC environment through the approved Terraform CI/CD workflow. As part of the VM deployment, the Terraform virtual-machine module creates and manages supporting Key Vault objects, including the customer-managed disk encryption key and the generated VM administrator password secret.
+
+During the initial deployment, the Terraform apply failed before the VM provisioning completed successfully. The workflow was subsequently rerun after correcting the deployment issue. During Terraform state reconciliation/re-provisioning, the previously created temporary/managed Key Vault resources were deleted/replaced and recreated by the Terraform workflow, which triggered the observed KeyDelete and SecretDelete Microsoft Defender alerts.
+
+The activity is therefore associated with the authorized Cloud Factory POC VM provisioning exercise and is not an unauthorized or malicious operation.
+
+Please consider this activity as expected/authorized POC deployment activity.
+
+Thanks,
