@@ -1,13 +1,62 @@
-Hi Team,
+terraform/load_balancer.tf
 
-The reported KeyDelete and SecretDelete operations are expected and authorized activities related to an ongoing POC deployment in the Cloud Factory non-production subscription (sub-adcb-cloud-factory-nonprod-001).
+For the POC I recommend dynamic private frontend IP allocation initially, because we don't have to guess an unused address from your /28 subnet.
 
-We are currently provisioning a Linux virtual machine in this POC environment through the approved Terraform CI/CD workflow. As part of the VM deployment, the Terraform virtual-machine module creates and manages supporting Key Vault objects, including the customer-managed disk encryption key and the generated VM administrator password secret.
+Use this:
 
-During the initial deployment, the Terraform apply failed before the VM provisioning completed successfully. The workflow was subsequently rerun after correcting the deployment issue. During Terraform state reconciliation/re-provisioning, the previously created temporary/managed Key Vault resources were deleted/replaced and recreated by the Terraform workflow, which triggered the observed KeyDelete and SecretDelete Microsoft Defender alerts.
+resource "azurerm_lb" "oracle_db" {
+  name                = "lb-CloudFactory-dev-uaenorth-oracledb"
+  location            = var.location
+  resource_group_name = module.oracle_db_resource_group.rg_name
+  sku                 = "Standard"
+  sku_tier            = "Regional"
 
-The activity is therefore associated with the authorized Cloud Factory POC VM provisioning exercise and is not an unauthorized or malicious operation.
+  frontend_ip_configuration {
+    name                          = "fe-oracledb"
+    subnet_id                     = module.base-infra.subnet_map["snet-lb-cl-factory-uaenorth-001"].id
+    private_ip_address_allocation = "Dynamic"
+  }
 
-Please consider this activity as expected/authorized POC deployment activity.
+  tags = local.tags
+}
 
-Thanks,
+resource "azurerm_lb_backend_address_pool" "oracle_db" {
+  name            = "be-oracledb"
+  loadbalancer_id = azurerm_lb.oracle_db.id
+}
+
+resource "azurerm_network_interface_backend_address_pool_association" "oracle_db_vm01" {
+  network_interface_id    = module.oracle_db_vm01.network_interface_id
+  ip_configuration_name   = "internal"
+  backend_address_pool_id = azurerm_lb_backend_address_pool.oracle_db.id
+}
+
+resource "azurerm_network_interface_backend_address_pool_association" "oracle_db_vm02" {
+  network_interface_id    = module.oracle_db_vm02.network_interface_id
+  ip_configuration_name   = "internal"
+  backend_address_pool_id = azurerm_lb_backend_address_pool.oracle_db.id
+}
+
+resource "azurerm_lb_probe" "oracle_db_health" {
+  name                = "hp-oracledb"
+  loadbalancer_id     = azurerm_lb.oracle_db.id
+  protocol            = "Http"
+  port                = 8080
+  request_path        = "/health"
+  interval_in_seconds = 5
+  number_of_probes    = 2
+}
+
+resource "azurerm_lb_rule" "oracle_db" {
+  name                           = "lbr-oracledb-1521"
+  loadbalancer_id                = azurerm_lb.oracle_db.id
+  protocol                       = "Tcp"
+  frontend_port                  = 1521
+  backend_port                   = 1521
+  frontend_ip_configuration_name = "fe-oracledb"
+  backend_address_pool_ids       = [azurerm_lb_backend_address_pool.oracle_db.id]
+  probe_id                       = azurerm_lb_probe.oracle_db_health.id
+  idle_timeout_in_minutes        = 30
+  enable_tcp_reset               = true
+  enable_floating_ip             = false
+}
