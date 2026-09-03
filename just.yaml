@@ -1,17 +1,26 @@
-So let's temporarily allow only the jump VM to 8080 and retest. On VM1 run:
+On VM1:
 
-sudo firewall-cmd \
-  --add-rich-rule='rule family="ipv4" source address="10.115.7.5/32" port protocol="tcp" port="8080" accept'
+sudo systemctl stop firewalld
 
-Don't use --permanent yet. Then confirm:
+Confirm:
 
-sudo firewall-cmd --list-all
+sudo systemctl status firewalld --no-pager
 
-You should now see two rich rules for 8080:
+It should show:
 
-168.63.129.16/32 → 8080
-10.115.7.5/32    → 8080
+inactive (dead)
 
-Then from the Windows jump VM:
+Do not run systemctl disable firewalld. We only want a temporary diagnostic.
 
+Then do these tests in this order:
+
+From Windows jump VM, test the health endpoint again:
 curl -v --noproxy "*" http://10.114.32.132:8080/health
+Test Oracle directly on VM1:
+powershell -Command "Test-NetConnection 10.114.32.132 -Port 1521"
+
+We want:
+
+TcpTestSucceeded : True
+Then test the actual Load Balancer frontend VIP:
+powershell -Command "Test-NetConnection 10.114.32.134 -Port 1521"
