@@ -1,6 +1,25 @@
-First check exactly where Oracle listener is listening
+First let's confirm the listener binaries exist. Run:
 
-Run these three commands on VM1:
+sudo -iu oracle bash -lc '
+export ORACLE_HOME=/u01/app/oracle/product/21.0.0/dbhome_1
+ls -l $ORACLE_HOME/bin/lsnrctl
+ls -l $ORACLE_HOME/bin/tnslsnr
+'
+
+If both files exist, no listener installation is required. Then try starting the default listener:
+
+sudo -iu oracle bash -lc '
+export ORACLE_HOME=/u01/app/oracle/product/21.0.0/dbhome_1
+export ORACLE_SID=ORCL
+export PATH=$ORACLE_HOME/bin:$PATH
+lsnrctl start
+'
+
+After that check:
+
+sudo ss -lntp | grep 1521
+
+and:
 
 sudo -iu oracle bash -lc '
 export ORACLE_HOME=/u01/app/oracle/product/21.0.0/dbhome_1
@@ -9,10 +28,4 @@ export PATH=$ORACLE_HOME/bin:$PATH
 lsnrctl status
 '
 
-Then:
-
-sudo ss -lntp | grep 1521
-
-and:
-
-ps -ef | grep tnslsnr | grep -v grep
+Ideally we'll see something like:
