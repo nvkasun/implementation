@@ -1,22 +1,74 @@
-From Windows Command Prompt on the jump host, run:
+First, on VM3, run just these two checks:
 
-scp azureuser@10.114.32.132:/opt/oracle-health/oracle_health.py C:\Users\Kasun\Downloads\oracle_health.py
+which sqlplus
 
-Enter the VM1 azureuser password when prompted.
+and:
 
-Then you should have:
+python3 -c "import oracledb; print(oracledb.__version__)"
+What we want
 
-C:\Users\Kasun\Downloads\oracle_health.py
+If the second command works, that's ideal. We can write a Python script like this:
 
-If you get Permission denied because /opt/oracle-health/oracle_health.py isn't readable by azureuser, first on VM1 run:
+import getpass
+import oracledb
+import time
 
-sudo cp /opt/oracle-health/oracle_health.py /tmp/oracle_health.py
-sudo chown azureuser:azureuser /tmp/oracle_health.py
+DB_HOST = "10.114.32.134"
+DB_PORT = 1521
+DB_SERVICE = "pdb1"
+DB_USER = "SYSTEM"
 
-Then from Windows:
+password = getpass.getpass("Oracle password: ")
 
-scp azureuser@10.114.32.132:/tmp/oracle_health.py C:\Users\Kasun\Downloads\oracle_health.py
+dsn = f"{DB_HOST}:{DB_PORT}/{DB_SERVICE}"
 
-After confirming the file is downloaded, you can clean the temporary copy on VM1:
+for record_id in range(1, 11):
+    with oracledb.connect(
+        user=DB_USER,
+        password=password,
+        dsn=dsn
+    ) as conn:
+        cursor = conn.cursor()
 
-rm /tmp/oracle_health.py
+        cursor.execute("""
+            BEGIN
+                EXECUTE IMMEDIATE '
+                    CREATE TABLE LB_TEST_DATA (
+                        TEST_ID NUMBER,
+                        MESSAGE VARCHAR2(100),
+                        BACKEND_HOST VARCHAR2(100),
+                        CREATED_AT TIMESTAMP
+                    )
+                ';
+            EXCEPTION
+                WHEN OTHERS THEN
+                    IF SQLCODE != -955 THEN
+                        RAISE;
+                    END IF;
+            END;
+        """)
+
+        cursor.execute(
+            "SELECT SYS_CONTEXT('USERENV', 'SERVER_HOST') FROM dual"
+        )
+        backend = cursor.fetchone()[0]
+
+        cursor.execute("""
+            INSERT INTO LB_TEST_DATA
+                (TEST_ID, MESSAGE, BACKEND_HOST, CREATED_AT)
+            VALUES
+                (:1, :2, :3, SYSTIMESTAMP)
+        """, [
+            record_id,
+            f"LB test record {record_id}",
+            backend
+        ])
+
+        conn.commit()
+
+        print(
+            f"Record {record_id} inserted through "
+            f"{DB_HOST}:{DB_PORT}/{DB_SERVICE} -> backend {backend}"
+        )
+
+    time.sleep(1)
