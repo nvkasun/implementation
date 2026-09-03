@@ -1,48 +1,22 @@
-module "lb_test_vm03" {
-  source = "./modules/virtual-machine"
+From Windows Command Prompt on the jump host, run:
 
-  resource_group_name = module.oracle_db_resource_group.rg_name
-  application_name    = "003"
-  environment         = var.environment
+scp azureuser@10.114.32.132:/opt/oracle-health/oracle_health.py C:\Users\Kasun\Downloads\oracle_health.py
 
-  subnet_id    = module.base-infra.subnet_map["snet-lb-cl-factory-uaenorth-001"].id
-  key_vault_id = module.azure_key_vault.id
+Enter the VM1 azureuser password when prompted.
 
-  dns_servers   = []
-  computer_name = "lbtestvm03"
+Then you should have:
 
-  vm = {
-    os_type = "linux"
-  }
+C:\Users\Kasun\Downloads\oracle_health.py
 
-  vm_size          = "Standard_B1s"
-  availability_zone = "1"
+If you get Permission denied because /opt/oracle-health/oracle_health.py isn't readable by azureuser, first on VM1 run:
 
-  source_image_reference = {
-    publisher = "RedHat"
-    offer     = "RHEL"
-    sku       = "94_gen2"
-    version   = "latest"
-  }
+sudo cp /opt/oracle-health/oracle_health.py /tmp/oracle_health.py
+sudo chown azureuser:azureuser /tmp/oracle_health.py
 
-  admin_username = "azureuser"
-  admin_password = var.oracle_db_vm_admin_password
+Then from Windows:
 
-  managed_identities = {
-    system_assigned = true
-  }
+scp azureuser@10.114.32.132:/tmp/oracle_health.py C:\Users\Kasun\Downloads\oracle_health.py
 
-  os_disk = {
-    caching              = "ReadWrite"
-    storage_account_type = "StandardSSD_LRS"
-    disk_size_gb         = 32
-  }
+After confirming the file is downloaded, you can clean the temporary copy on VM1:
 
-  accelerated_networking_enabled = false
-  ip_forwarding_enabled          = false
-  enable_boot_diagnostics        = true
-  encryption_at_host_enabled     = false
-  patch_mode_linux               = "ImageDefault"
-
-  tags = local.tags
-}
+rm /tmp/oracle_health.py
