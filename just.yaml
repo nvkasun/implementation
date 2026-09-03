@@ -1,308 +1,3 @@
-#!/bin/bash
-
-set -euo pipefail
-
-HEALTH_PORT="${HEALTH_PORT:-8080}"
-TARGET_PDB="${TARGET_PDB:-}"
-TARGET_SERVICE="${TARGET_SERVICE:-}"
-EXPECTED_DATABASE_ROLE="${EXPECTED_DATABASE_ROLE:-}"
-MAX_ACTIVE_SESSIONS="${MAX_ACTIVE_SESSIONS:-}"
-MAX_SESSION_UTILIZATION_PERCENT="${MAX_SESSION_UTILIZATION_PERCENT:-}"
-MAX_BLOCKING_SESSIONS="${MAX_BLOCKING_SESSIONS:-}"
-
-INSTALL_DIR="/opt/oracle-health"
-HEALTH_SCRIPT="${INSTALL_DIR}/oracle_health.py"
-LISTENER_CONTROL="${INSTALL_DIR}/oracle_listener_control.sh"
-ENV_FILE="/etc/oracle-health.env"
-HEALTH_SERVICE_FILE="/etc/systemd/system/oracle-health.service"
-LISTENER_SERVICE_FILE="/etc/systemd/system/oracle-listener.service"
-
-if [ "$(id -u)" -ne 0 ]; then
-  echo "ERROR: Run this script with sudo or as root."
-  exit 1
-fi
-
-PYTHON="${PYTHON:-$(command -v python || true)}"
-if [ -z "${PYTHON}" ] || [ ! -x "${PYTHON}" ]; then
-  echo "ERROR: Python executable could not be located."
-  exit 1
-fi
-
-INSTANCE_ROWS="$(
-  ps -eo pid=,user=,args= | awk '
-  {
-    pid = $1
-    owner = $2
-
-    for (i = 3; i <= NF; i++) {
-      proc = $i
-      gsub(/^\[/, "", proc)
-      gsub(/\]$/, "", proc)
-
-      if (proc ~ /^ora_pmon_/ || proc ~ /^ora_smon_/) {
-        sid = proc
-        sub(/^ora_(pmon|smon)_/, "", sid)
-
-        if (sid != "" && sid !~ /^\+/ && !seen[sid]++) {
-          print pid "|" owner "|" sid
-        }
-
-        break
-      }
-    }
-  }'
-)"
-
-if [ -z "${INSTANCE_ROWS}" ]; then
-  echo "ERROR: No running Oracle database instance was discovered from PMON/SMON."
-  echo "Diagnostic Oracle processes:"
-  ps -ef | grep -E '[o]ra_(pmon|smon)_' || true
-  exit 1
-fi
-
-if [ -n "${ORACLE_SID:-}" ]; then
-  INSTANCE_ROW="$(printf '%s\n' "${INSTANCE_ROWS}" | awk -F'|' -v sid="${ORACLE_SID}" '$3 == sid { print; exit }')"
-  if [ -z "${INSTANCE_ROW}" ]; then
-    echo "ERROR: Requested ORACLE_SID '${ORACLE_SID}' is not running."
-    exit 1
-  fi
-else
-  INSTANCE_COUNT="$(printf '%s\n' "${INSTANCE_ROWS}" | awk 'NF { count++ } END { print count + 0 }')"
-  if [ "${INSTANCE_COUNT}" -ne 1 ]; then
-    echo "ERROR: Multiple Oracle instances were discovered."
-    echo "Re-run with ORACLE_SID=<sid> to select the intended instance."
-    printf '%s\n' "${INSTANCE_ROWS}"
-    exit 1
-  fi
-  INSTANCE_ROW="${INSTANCE_ROWS}"
-fi
-
-ORACLE_PID="$(printf '%s' "${INSTANCE_ROW}" | cut -d'|' -f1)"
-ORACLE_USER="$(printf '%s' "${INSTANCE_ROW}" | cut -d'|' -f2)"
-ORACLE_SID="$(printf '%s' "${INSTANCE_ROW}" | cut -d'|' -f3)"
-ORACLE_GROUP="$(id -gn "${ORACLE_USER}")"
-
-if [ -z "${ORACLE_HOME:-}" ] && [ -r /etc/oratab ]; then
-  ORACLE_HOME="$(awk -F: -v sid="${ORACLE_SID}" '$0 !~ /^[[:space:]]*#/ && $1 == sid && $2 != "" { print $2; exit }' /etc/oratab)"
-fi
-
-if [ -z "${ORACLE_HOME:-}" ] && [ -n "${ORACLE_PID}" ]; then
-  ORACLE_BINARY="$(readlink -f "/proc/${ORACLE_PID}/exe" 2>/dev/null || true)"
-  if [ -n "${ORACLE_BINARY}" ]; then
-    ORACLE_HOME="$(dirname "$(dirname "${ORACLE_BINARY}")")"
-  fi
-fi
-
-if [ -z "${ORACLE_HOME:-}" ]; then
-  echo "ERROR: Unable to determine ORACLE_HOME."
-  exit 1
-fi
-
-SQLPLUS="${ORACLE_HOME}/bin/sqlplus"
-LSNRCTL="${ORACLE_HOME}/bin/lsnrctl"
-
-if [ ! -x "${SQLPLUS}" ]; then
-  echo "ERROR: SQLPlus not found at ${SQLPLUS}."
-  exit 1
-fi
-
-if [ ! -x "${LSNRCTL}" ]; then
-  echo "ERROR: LSNRCTL not found at ${LSNRCTL}."
-  exit 1
-fi
-
-run_as_oracle() {
-  sudo -u "${ORACLE_USER}" env \
-    ORACLE_HOME="${ORACLE_HOME}" \
-    ORACLE_SID="${ORACLE_SID}" \
-    PATH="${ORACLE_HOME}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin" \
-    "$@"
-}
-
-echo "Oracle instance discovered:"
-echo "  ORACLE_USER=${ORACLE_USER}"
-echo "  ORACLE_GROUP=${ORACLE_GROUP}"
-echo "  ORACLE_SID=${ORACLE_SID}"
-echo "  ORACLE_HOME=${ORACLE_HOME}"
-
-DB_STATUS="$(
-  run_as_oracle "${SQLPLUS}" -s "/ as sysdba" <<'SQL'
-WHENEVER SQLERROR EXIT 2
-WHENEVER OSERROR EXIT 3
-SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF
-SELECT 'CHECK=' || COUNT(*) FROM dual;
-SELECT 'DB_NAME=' || TRIM(name) FROM v$database;
-SELECT 'CDB=' || TRIM(cdb) FROM v$database;
-SELECT 'OPEN_MODE=' || TRIM(open_mode) FROM v$database;
-SELECT 'DATABASE_ROLE=' || TRIM(database_role) FROM v$database;
-EXIT;
-SQL
-)"
-
-printf '%s\n' "${DB_STATUS}"
-if ! printf '%s\n' "${DB_STATUS}" | grep -q '^CHECK=1$'; then
-  echo "ERROR: Oracle validation query failed."
-  exit 1
-fi
-
-mkdir -p "${INSTALL_DIR}"
-BACKUP_DIR="${INSTALL_DIR}/backup/$(date -u +%Y%m%dT%H%M%SZ)"
-mkdir -p "${BACKUP_DIR}"
-
-for existing_file in "${HEALTH_SCRIPT}" "${LISTENER_CONTROL}" "${ENV_FILE}" "${HEALTH_SERVICE_FILE}" "${LISTENER_SERVICE_FILE}"; do
-  if [ -f "${existing_file}" ]; then
-    cp -p "${existing_file}" "${BACKUP_DIR}/$(basename "${existing_file}")"
-  fi
-done
-
-LISTENER_NAME="${LISTENER_NAME:-}"
-
-if [ -z "${LISTENER_NAME}" ]; then
-  RUNNING_LISTENERS="$(
-    ps -eo user=,args= | awk -v oracle_user="${ORACLE_USER}" '
-      $1 == oracle_user {
-        for (i = 2; i <= NF; i++) {
-          if ($i ~ /(^|\/)tnslsnr$/ && (i + 1) <= NF) {
-            print $(i + 1)
-            break
-          }
-        }
-      }
-    ' | sort -u
-  )"
-  RUNNING_LISTENER_COUNT="$(printf '%s\n' "${RUNNING_LISTENERS}" | awk 'NF { count++ } END { print count + 0 }')"
-
-  if [ "${RUNNING_LISTENER_COUNT}" -eq 1 ]; then
-    LISTENER_NAME="${RUNNING_LISTENERS}"
-  elif [ "${RUNNING_LISTENER_COUNT}" -gt 1 ]; then
-    echo "ERROR: Multiple Oracle listeners were discovered."
-    echo "Re-run with LISTENER_NAME=<listener> to select the intended listener."
-    printf '%s\n' "${RUNNING_LISTENERS}"
-    exit 1
-  fi
-fi
-
-listener_status() {
-  if [ -n "${LISTENER_NAME}" ]; then
-    run_as_oracle "${LSNRCTL}" status "${LISTENER_NAME}"
-  else
-    run_as_oracle "${LSNRCTL}" status
-  fi
-}
-
-listener_start() {
-  if [ -n "${LISTENER_NAME}" ]; then
-    run_as_oracle "${LSNRCTL}" start "${LISTENER_NAME}"
-  else
-    run_as_oracle "${LSNRCTL}" start
-  fi
-}
-
-if ! listener_status >/tmp/oracle-health-listener-status.txt 2>&1; then
-  echo "Oracle listener is not running. Starting it..."
-  if ! listener_start >/tmp/oracle-health-listener-start.txt 2>&1; then
-    cat /tmp/oracle-health-listener-start.txt
-    echo "ERROR: Oracle listener could not be started."
-    echo "If this database uses a non-default listener, re-run with LISTENER_NAME=<listener>."
-    exit 1
-  fi
-fi
-
-LISTENER_STATUS="$(listener_status 2>&1)" || {
-  printf '%s\n' "${LISTENER_STATUS}"
-  echo "ERROR: Oracle listener did not become available."
-  exit 1
-}
-
-if [ -z "${LISTENER_NAME}" ]; then
-  LISTENER_NAME="$(printf '%s\n' "${LISTENER_STATUS}" | awk '/^Alias[[:space:]]+/ { print $2; exit }')"
-fi
-
-if [ -z "${LISTENER_NAME}" ]; then
-  echo "ERROR: Unable to determine the Oracle listener name."
-  exit 1
-fi
-
-LISTENER_PORT="$(printf '%s\n' "${LISTENER_STATUS}" | grep -o 'PORT=[0-9][0-9]*' | head -n 1 | cut -d= -f2 || true)"
-if [ -z "${LISTENER_PORT}" ]; then
-  echo "ERROR: Unable to determine the Oracle listener TCP port."
-  exit 1
-fi
-
-echo "Oracle listener discovered:"
-echo "  LISTENER_NAME=${LISTENER_NAME}"
-echo "  LISTENER_PORT=${LISTENER_PORT}"
-
-run_as_oracle "${SQLPLUS}" -s "/ as sysdba" <<'SQL' >/dev/null
-WHENEVER SQLERROR EXIT 2
-ALTER SYSTEM REGISTER;
-EXIT;
-SQL
-
-cat > "${ENV_FILE}" <<EOF
-ORACLE_HOME=${ORACLE_HOME}
-ORACLE_SID=${ORACLE_SID}
-LISTENER_NAME=${LISTENER_NAME}
-LISTENER_PORT=${LISTENER_PORT}
-HEALTH_PORT=${HEALTH_PORT}
-TARGET_PDB=${TARGET_PDB}
-TARGET_SERVICE=${TARGET_SERVICE}
-EXPECTED_DATABASE_ROLE=${EXPECTED_DATABASE_ROLE}
-MAX_ACTIVE_SESSIONS=${MAX_ACTIVE_SESSIONS}
-MAX_SESSION_UTILIZATION_PERCENT=${MAX_SESSION_UTILIZATION_PERCENT}
-MAX_BLOCKING_SESSIONS=${MAX_BLOCKING_SESSIONS}
-EOF
-chmod 640 "${ENV_FILE}"
-chown root:"${ORACLE_GROUP}" "${ENV_FILE}"
-
-cat > "${LISTENER_CONTROL}" <<'SH'
-#!/bin/bash
-set -euo pipefail
-. /etc/oracle-health.env
-export ORACLE_HOME ORACLE_SID
-export PATH="${ORACLE_HOME}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
-LSNRCTL="${ORACLE_HOME}/bin/lsnrctl"
-case "${1:-}" in
-  start)
-    if "${LSNRCTL}" status "${LISTENER_NAME}" >/dev/null 2>&1; then
-      exit 0
-    fi
-    exec "${LSNRCTL}" start "${LISTENER_NAME}"
-    ;;
-  stop)
-    "${LSNRCTL}" stop "${LISTENER_NAME}" >/dev/null 2>&1 || true
-    ;;
-  status)
-    exec "${LSNRCTL}" status "${LISTENER_NAME}"
-    ;;
-  *)
-    echo "Usage: $0 {start|stop|status}" >&2
-    exit 2
-    ;;
-esac
-SH
-chown root:"${ORACLE_GROUP}" "${LISTENER_CONTROL}"
-chmod 750 "${LISTENER_CONTROL}"
-
-cat > "${LISTENER_SERVICE_FILE}" <<EOF
-[Unit]
-Description=Oracle Database Listener
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-User=${ORACLE_USER}
-Group=${ORACLE_GROUP}
-ExecStart=${LISTENER_CONTROL} start
-ExecStop=${LISTENER_CONTROL} stop
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-cat > "${HEALTH_SCRIPT}" <<'PY'
 #!/usr/bin/env python
 
 import BaseHTTPServer
@@ -315,50 +10,66 @@ import subprocess
 import threading
 import time
 
-HOST = "0.0.0.0"
+HOST = os.environ.get("HEALTH_HOST", "0.0.0.0")
 HEALTH_PORT = int(os.environ.get("HEALTH_PORT", "8080"))
-ORACLE_HOME = os.environ["ORACLE_HOME"]
-ORACLE_SID = os.environ["ORACLE_SID"]
-LISTENER_NAME = os.environ["LISTENER_NAME"]
-SQLPLUS = os.path.join(ORACLE_HOME, "bin", "sqlplus")
-LSNRCTL = os.path.join(ORACLE_HOME, "bin", "lsnrctl")
+
+ORACLE_HOME = os.environ.get("ORACLE_HOME", "").strip()
+ORACLE_SID = os.environ.get("ORACLE_SID", "").strip()
 
 TARGET_PDB = os.environ.get("TARGET_PDB", "").strip()
 TARGET_SERVICE = os.environ.get("TARGET_SERVICE", "").strip()
-EXPECTED_DATABASE_ROLE = os.environ.get("EXPECTED_DATABASE_ROLE", "").strip()
-MAX_ACTIVE_SESSIONS = os.environ.get("MAX_ACTIVE_SESSIONS", "").strip()
-MAX_SESSION_UTILIZATION_PERCENT = os.environ.get("MAX_SESSION_UTILIZATION_PERCENT", "").strip()
-MAX_BLOCKING_SESSIONS = os.environ.get("MAX_BLOCKING_SESSIONS", "").strip()
 
-CHECK_INTERVAL = 5
-SUCCESS_THRESHOLD = 2
-FAILURE_THRESHOLD = 3
-SQL_TIMEOUT = 8
-COMMAND_TIMEOUT = 8
+MAX_ACTIVE_SESSIONS = os.environ.get(
+    "MAX_ACTIVE_SESSIONS",
+    ""
+).strip()
+
+MAX_SESSION_UTILIZATION_PERCENT = os.environ.get(
+    "MAX_SESSION_UTILIZATION_PERCENT",
+    ""
+).strip()
+
+MAX_BLOCKING_SESSIONS = os.environ.get(
+    "MAX_BLOCKING_SESSIONS",
+    ""
+).strip()
+
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "5"))
+SUCCESS_THRESHOLD = int(os.environ.get("SUCCESS_THRESHOLD", "2"))
+FAILURE_THRESHOLD = int(os.environ.get("FAILURE_THRESHOLD", "3"))
+SQL_TIMEOUT = int(os.environ.get("SQL_TIMEOUT", "8"))
+COMMAND_TIMEOUT = int(os.environ.get("COMMAND_TIMEOUT", "8"))
+
+SQLPLUS = os.path.join(ORACLE_HOME, "bin", "sqlplus")
+LSNRCTL = os.path.join(ORACLE_HOME, "bin", "lsnrctl")
 
 state_lock = threading.Lock()
+
 state = {
-    "status": "STARTING",
     "healthy": False,
-    "oracle_sid": ORACLE_SID,
+    "status": "STARTING",
+    "oracle_sid": ORACLE_SID or None,
     "database_name": None,
-    "cdb": None,
     "database_role": None,
+    "cdb": None,
     "target_pdb": None,
     "target_service": None,
-    "open_mode": None,
+    "pdb_open_mode": None,
     "pdb_restricted": None,
-    "listener_name": LISTENER_NAME,
+    "sql_query": False,
     "listener_running": False,
+    "listener_name": None,
     "listener_port": None,
     "listener_reachable": False,
     "service_registered": False,
-    "oracle_service_ready": False,
-    "sql_query": False,
+    "service_ready": False,
     "active_sessions": None,
     "total_user_sessions": None,
-    "session_utilization_percent": None,
+    "blocked_sessions": None,
     "blocking_sessions": None,
+    "session_current_utilization": None,
+    "session_limit": None,
+    "session_utilization_percent": None,
     "consecutive_successes": 0,
     "consecutive_failures": 0,
     "last_check": None,
@@ -382,30 +93,70 @@ def run_process(command, input_data=None, timeout=COMMAND_TIMEOUT):
         stderr=subprocess.PIPE,
         env=oracle_environment()
     )
+
     if input_data is not None:
         process.stdin.write(input_data)
         process.stdin.close()
-    started = time.time()
+
+    start_time = time.time()
+
     while process.poll() is None:
-        if time.time() - started > timeout:
+        if time.time() - start_time > timeout:
             process.kill()
-            raise RuntimeError("Command timed out: %s" % " ".join(command))
+
+            try:
+                process.wait()
+            except Exception:
+                pass
+
+            raise RuntimeError(
+                "Command timed out: %s" %
+                " ".join(command)
+            )
+
         time.sleep(0.1)
+
     stdout = process.stdout.read()
     stderr = process.stderr.read()
+
     return process.returncode, stdout, stderr
+
+
+def validate_runtime():
+    if not ORACLE_HOME:
+        raise RuntimeError("ORACLE_HOME is not configured")
+
+    if not ORACLE_SID:
+        raise RuntimeError("ORACLE_SID is not configured")
+
+    if not os.path.isfile(SQLPLUS) or not os.access(SQLPLUS, os.X_OK):
+        raise RuntimeError(
+            "SQLPlus is not executable at %s" % SQLPLUS
+        )
+
+    if not os.path.isfile(LSNRCTL) or not os.access(LSNRCTL, os.X_OK):
+        raise RuntimeError(
+            "LSNRCTL is not executable at %s" % LSNRCTL
+        )
 
 
 def run_sql(sql):
     return_code, stdout, stderr = run_process(
-        [SQLPLUS, "-s", "/ as sysdba"], sql, SQL_TIMEOUT
+        [SQLPLUS, "-s", "/ as sysdba"],
+        input_data=sql,
+        timeout=SQL_TIMEOUT
     )
+
     if return_code != 0:
         raise RuntimeError(
-            "SQLPlus failed: %s" % (
-                stderr.strip() or stdout.strip() or "exit code %s" % return_code
+            "SQLPlus failed: %s" %
+            (
+                stderr.strip() or
+                stdout.strip() or
+                "exit code %s" % return_code
             )
         )
+
     return stdout
 
 
@@ -413,402 +164,983 @@ def collect_database_inventory():
     sql = """
 WHENEVER SQLERROR EXIT 2
 WHENEVER OSERROR EXIT 3
-SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF
-SELECT 'CHECK=' || COUNT(*) FROM dual;
-SELECT 'DB_NAME=' || TRIM(name) FROM v$database;
-SELECT 'CDB=' || TRIM(cdb) FROM v$database;
-SELECT 'DB_OPEN_MODE=' || TRIM(open_mode) FROM v$database;
-SELECT 'DATABASE_ROLE=' || TRIM(database_role) FROM v$database;
-SELECT 'PDB=' || TRIM(name) || '|' || con_id || '|' || TRIM(open_mode) || '|' || TRIM(restricted)
+SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF TRIMSPOOL ON
+
+SELECT 'CHECK=' || COUNT(*)
+FROM dual;
+
+SELECT 'DB_NAME=' || TRIM(name)
+FROM v$database;
+
+SELECT 'DB_OPEN_MODE=' || TRIM(open_mode)
+FROM v$database;
+
+SELECT 'DATABASE_ROLE=' || TRIM(database_role)
+FROM v$database;
+
+SELECT 'CDB=' || TRIM(cdb)
+FROM v$database;
+
+SELECT
+    'PDB=' ||
+    TRIM(name) || '|' ||
+    con_id || '|' ||
+    TRIM(open_mode) || '|' ||
+    TRIM(restricted)
 FROM v$pdbs
-WHERE name <> 'PDB$SEED'
+WHERE UPPER(name) <> 'PDB$SEED'
 ORDER BY con_id;
-SELECT 'SERVICE=' || TRIM(name) || '|' || con_id
+
+SELECT
+    'SERVICE=' ||
+    TRIM(name) || '|' ||
+    TRIM(NVL(network_name, '')) || '|' ||
+    con_id
 FROM v$services
-WHERE name NOT LIKE 'SYS$%'
-  AND name NOT LIKE '%XDB'
+WHERE name NOT IN ('SYS$BACKGROUND', 'SYS$USERS')
 ORDER BY con_id, name;
-SELECT 'SESSIONS=' || con_id || '|' ||
-       NVL(SUM(CASE WHEN type = 'USER' THEN 1 ELSE 0 END), 0) || '|' ||
-       NVL(SUM(CASE WHEN type = 'USER' AND status = 'ACTIVE' THEN 1 ELSE 0 END), 0)
+
+SELECT
+    'SESSIONS=' ||
+    con_id || '|' ||
+    SUM(CASE WHEN type = 'USER' THEN 1 ELSE 0 END) || '|' ||
+    SUM(
+        CASE
+            WHEN type = 'USER'
+             AND status = 'ACTIVE'
+            THEN 1
+            ELSE 0
+        END
+    ) || '|' ||
+    SUM(
+        CASE
+            WHEN type = 'USER'
+             AND blocking_session IS NOT NULL
+            THEN 1
+            ELSE 0
+        END
+    )
 FROM v$session
 GROUP BY con_id
 ORDER BY con_id;
-SELECT 'BLOCKERS=' || w.con_id || '|' || COUNT(DISTINCT b.sid)
+
+SELECT
+    'BLOCKERS=' ||
+    w.con_id || '|' ||
+    COUNT(DISTINCT b.sid)
 FROM v$session w
-JOIN v$session b ON b.sid = w.blocking_session
-WHERE w.blocking_session IS NOT NULL
+JOIN v$session b
+  ON b.sid = w.blocking_session
+WHERE w.type = 'USER'
+  AND w.blocking_session IS NOT NULL
 GROUP BY w.con_id
 ORDER BY w.con_id;
-SELECT 'SESSION_RESOURCE=' || current_utilization || '|' || limit_value
+
+SELECT
+    'SESSION_RESOURCE=' ||
+    current_utilization || '|' ||
+    limit_value
 FROM v$resource_limit
 WHERE resource_name = 'sessions';
+
 EXIT;
 """
+
     output = run_sql(sql)
+
     inventory = {
         "database_name": None,
-        "cdb": None,
-        "db_open_mode": None,
+        "database_open_mode": None,
         "database_role": None,
+        "cdb": None,
         "pdbs": [],
         "services": {},
         "sessions": {},
         "blockers": {},
+        "session_current_utilization": None,
+        "session_limit": None,
         "session_utilization_percent": None
     }
-    session_current = None
-    session_limit = None
+
+    check_ok = False
 
     for raw_line in output.splitlines():
         line = raw_line.strip()
-        if not line or line == "CHECK=1":
+
+        if not line:
             continue
+
+        if line == "CHECK=1":
+            check_ok = True
+            continue
+
         if line.startswith("DB_NAME="):
-            inventory["database_name"] = line.split("=", 1)[1].strip()
-        elif line.startswith("CDB="):
-            inventory["cdb"] = line.split("=", 1)[1].strip()
+            inventory["database_name"] = (
+                line.split("=", 1)[1].strip()
+            )
+
         elif line.startswith("DB_OPEN_MODE="):
-            inventory["db_open_mode"] = line.split("=", 1)[1].strip()
+            inventory["database_open_mode"] = (
+                line.split("=", 1)[1].strip()
+            )
+
         elif line.startswith("DATABASE_ROLE="):
-            inventory["database_role"] = line.split("=", 1)[1].strip()
+            inventory["database_role"] = (
+                line.split("=", 1)[1].strip()
+            )
+
+        elif line.startswith("CDB="):
+            inventory["cdb"] = (
+                line.split("=", 1)[1].strip().upper()
+            )
+
         elif line.startswith("PDB="):
             parts = line.split("=", 1)[1].split("|")
+
             if len(parts) == 4:
                 inventory["pdbs"].append({
                     "name": parts[0].strip(),
                     "con_id": int(parts[1]),
                     "open_mode": parts[2].strip(),
-                    "restricted": parts[3].strip()
+                    "restricted": parts[3].strip().upper()
                 })
+
         elif line.startswith("SERVICE="):
             parts = line.split("=", 1)[1].split("|")
-            if len(parts) == 2:
-                inventory["services"].setdefault(int(parts[1]), []).append(parts[0].strip())
+
+            if len(parts) == 3:
+                con_id = int(parts[2])
+
+                inventory["services"].setdefault(
+                    con_id,
+                    []
+                ).append({
+                    "name": parts[0].strip(),
+                    "network_name": parts[1].strip()
+                })
+
         elif line.startswith("SESSIONS="):
             parts = line.split("=", 1)[1].split("|")
-            if len(parts) == 3:
+
+            if len(parts) == 4:
                 inventory["sessions"][int(parts[0])] = {
                     "total": int(parts[1]),
-                    "active": int(parts[2])
+                    "active": int(parts[2]),
+                    "blocked": int(parts[3])
                 }
+
         elif line.startswith("BLOCKERS="):
             parts = line.split("=", 1)[1].split("|")
+
             if len(parts) == 2:
                 inventory["blockers"][int(parts[0])] = int(parts[1])
+
         elif line.startswith("SESSION_RESOURCE="):
             parts = line.split("=", 1)[1].split("|")
+
             if len(parts) == 2:
                 try:
-                    session_current = float(parts[0])
-                    session_limit = float(parts[1])
-                except ValueError:
-                    session_current = None
-                    session_limit = None
+                    current_value = float(parts[0])
+                    limit_value = float(parts[1])
 
-    if session_current is not None and session_limit is not None and session_limit > 0:
-        inventory["session_utilization_percent"] = round(
-            (session_current / session_limit) * 100.0, 2
+                    inventory["session_current_utilization"] = (
+                        int(current_value)
+                    )
+
+                    inventory["session_limit"] = int(limit_value)
+
+                    if limit_value > 0:
+                        inventory[
+                            "session_utilization_percent"
+                        ] = round(
+                            (
+                                current_value /
+                                limit_value
+                            ) * 100.0,
+                            2
+                        )
+
+                except ValueError:
+                    pass
+
+    if not check_ok:
+        raise RuntimeError(
+            "Oracle validation query did not return CHECK=1"
         )
+
+    if not inventory["database_name"]:
+        raise RuntimeError(
+            "Unable to determine Oracle database name"
+        )
+
     return inventory
 
 
-def choose_target(inventory):
-    if inventory["cdb"] == "YES":
-        pdbs = inventory["pdbs"]
-        if TARGET_PDB:
-            matches = [pdb for pdb in pdbs if pdb["name"].upper() == TARGET_PDB.upper()]
-            if len(matches) != 1:
-                raise RuntimeError("Configured TARGET_PDB '%s' was not found" % TARGET_PDB)
-            target = matches[0]
-            if target["open_mode"] != "READ WRITE":
-                raise RuntimeError("Target PDB '%s' is %s" % (target["name"], target["open_mode"]))
-            if target["restricted"] == "YES":
-                raise RuntimeError("Target PDB '%s' is in restricted mode" % target["name"])
-            return target
-
-        eligible = [
-            pdb for pdb in pdbs
-            if pdb["open_mode"] == "READ WRITE" and pdb["restricted"] != "YES"
-        ]
-        if len(eligible) == 1:
-            return eligible[0]
-        if len(eligible) > 1:
-            raise RuntimeError(
-                "Multiple READ WRITE PDBs discovered: %s. Set TARGET_PDB explicitly." %
-                ", ".join([pdb["name"] for pdb in eligible])
-            )
-        if len(pdbs) == 0:
-            raise RuntimeError("CDB has no application PDBs")
-        raise RuntimeError("No eligible READ WRITE application PDB was discovered")
-
-    if inventory["db_open_mode"] != "READ WRITE":
+def choose_target_database(inventory):
+    if inventory["database_open_mode"] != "READ WRITE":
         raise RuntimeError(
-            "Database OPEN_MODE is %s" % (inventory["db_open_mode"] or "UNKNOWN")
+            "Database OPEN_MODE is %s" %
+            (
+                inventory["database_open_mode"] or
+                "UNKNOWN"
+            )
         )
-    return {
-        "name": inventory["database_name"],
-        "con_id": 1,
-        "open_mode": inventory["db_open_mode"],
-        "restricted": "NO"
-    }
 
+    if inventory["cdb"] != "YES":
+        return {
+            "name": inventory["database_name"],
+            "con_id": 0,
+            "open_mode": inventory["database_open_mode"],
+            "restricted": "NO",
+            "is_pdb": False
+        }
 
-def choose_service(inventory, target):
-    services = inventory["services"].get(target["con_id"], [])
-    if TARGET_SERVICE:
-        matches = [service for service in services if service.upper() == TARGET_SERVICE.upper()]
+    application_pdbs = inventory["pdbs"]
+
+    if TARGET_PDB:
+        matches = [
+            pdb for pdb in application_pdbs
+            if pdb["name"].upper() == TARGET_PDB.upper()
+        ]
+
         if len(matches) != 1:
             raise RuntimeError(
-                "Configured TARGET_SERVICE '%s' was not discovered for container '%s'" %
-                (TARGET_SERVICE, target["name"])
+                "Configured TARGET_PDB '%s' was not found" %
+                TARGET_PDB
             )
+
+        target = matches[0]
+
+    else:
+        if len(application_pdbs) == 0:
+            raise RuntimeError(
+                "No application PDB was discovered"
+            )
+
+        if len(application_pdbs) > 1:
+            raise RuntimeError(
+                "Multiple application PDBs discovered: %s. "
+                "Set TARGET_PDB explicitly." %
+                ", ".join(
+                    [
+                        pdb["name"]
+                        for pdb in application_pdbs
+                    ]
+                )
+            )
+
+        target = application_pdbs[0]
+
+    if target["open_mode"] != "READ WRITE":
+        raise RuntimeError(
+            "Target PDB '%s' OPEN_MODE is %s" %
+            (
+                target["name"],
+                target["open_mode"]
+            )
+        )
+
+    if target["restricted"] == "YES":
+        raise RuntimeError(
+            "Target PDB '%s' is in restricted mode" %
+            target["name"]
+        )
+
+    target = dict(target)
+    target["is_pdb"] = True
+
+    return target
+
+
+def choose_target_service(inventory, target):
+    services = inventory["services"].get(
+        target["con_id"],
+        []
+    )
+
+    if not services:
+        raise RuntimeError(
+            "No Oracle service was discovered for '%s'" %
+            target["name"]
+        )
+
+    if TARGET_SERVICE:
+        matches = []
+
+        for service in services:
+            values = [
+                service["name"],
+                service["network_name"]
+            ]
+
+            for value in values:
+                if (
+                    value and
+                    value.upper() == TARGET_SERVICE.upper()
+                ):
+                    matches.append(service)
+                    break
+
+        if len(matches) != 1:
+            raise RuntimeError(
+                "Configured TARGET_SERVICE '%s' was not "
+                "uniquely found for '%s'" %
+                (
+                    TARGET_SERVICE,
+                    target["name"]
+                )
+            )
+
         return matches[0]
 
-    exact = [service for service in services if service.upper() == target["name"].upper()]
-    if len(exact) == 1:
-        return exact[0]
+    exact_matches = []
+
+    for service in services:
+        values = [
+            service["name"],
+            service["network_name"]
+        ]
+
+        for value in values:
+            if (
+                value and
+                value.upper() == target["name"].upper()
+            ):
+                exact_matches.append(service)
+                break
+
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+
     if len(services) == 1:
         return services[0]
-    if len(services) == 0:
-        raise RuntimeError("No Oracle service was discovered for container '%s'" % target["name"])
+
     raise RuntimeError(
-        "Multiple Oracle services were discovered for container '%s': %s. Set TARGET_SERVICE explicitly." %
-        (target["name"], ", ".join(services))
+        "Multiple Oracle services discovered for '%s': %s. "
+        "Set TARGET_SERVICE explicitly." %
+        (
+            target["name"],
+            ", ".join(
+                [
+                    service["network_name"] or service["name"]
+                    for service in services
+                ]
+            )
+        )
     )
+
+
+def service_display_name(service):
+    return service["network_name"] or service["name"]
+
+
+def service_match_names(service):
+    names = []
+
+    for value in [
+        service["name"],
+        service["network_name"]
+    ]:
+        value = value.strip()
+
+        if not value:
+            continue
+
+        if value.upper() not in [
+            existing.upper()
+            for existing in names
+        ]:
+            names.append(value)
+
+    return names
 
 
 def check_target_sql(target):
-    if target["con_id"] == 1:
-        alter_container = ""
-    else:
-        escaped_name = target["name"].replace('"', '""')
-        alter_container = 'ALTER SESSION SET CONTAINER = "%s";' % escaped_name
+    alter_container = ""
+
+    if target["is_pdb"]:
+        safe_name = target["name"].replace('"', '""')
+
+        alter_container = (
+            'ALTER SESSION SET CONTAINER = "%s";' %
+            safe_name
+        )
+
     sql = """
 WHENEVER SQLERROR EXIT 2
 WHENEVER OSERROR EXIT 3
-SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF
+SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF TRIMSPOOL ON
 %s
-SELECT 'TARGET_CHECK=' || COUNT(*) FROM dual;
-SELECT 'TARGET_CONTAINER=' || SYS_CONTEXT('USERENV', 'CON_NAME') FROM dual;
+SELECT 'TARGET_CHECK=' || COUNT(*)
+FROM dual;
+
+SELECT
+    'TARGET_CONTAINER=' ||
+    SYS_CONTEXT('USERENV', 'CON_NAME')
+FROM dual;
+
 EXIT;
 """ % alter_container
+
     output = run_sql(sql)
+
     if "TARGET_CHECK=1" not in output:
-        raise RuntimeError("SQL query against target container failed")
+        raise RuntimeError(
+            "SQL validation against target database failed"
+        )
+
     return True
 
 
-def collect_listener_status():
+def discover_running_listeners():
     return_code, stdout, stderr = run_process(
-        [LSNRCTL, "status", LISTENER_NAME], None, COMMAND_TIMEOUT
+        ["/bin/ps", "-eo", "user=,args="],
+        timeout=COMMAND_TIMEOUT
     )
+
     if return_code != 0:
-        raise RuntimeError("Listener status failed: %s" % (stderr.strip() or stdout.strip()))
-    port_match = re.search(
-        r"\(PROTOCOL=tcp\).*?\(PORT=(\d+)\)", stdout,
+        raise RuntimeError(
+            "Unable to inspect listener processes: %s" %
+            (
+                stderr.strip() or
+                stdout.strip()
+            )
+        )
+
+    listeners = []
+
+    pattern = re.compile(
+        r"(?:^|\s)(?:\S*/)?tnslsnr\s+([^\s]+)",
+        re.IGNORECASE
+    )
+
+    for line in stdout.splitlines():
+        match = pattern.search(line)
+
+        if not match:
+            continue
+
+        name = match.group(1).strip()
+
+        if name and name not in listeners:
+            listeners.append(name)
+
+    return listeners
+
+
+def get_listener_status(listener_name):
+    return_code, stdout, stderr = run_process(
+        [LSNRCTL, "status", listener_name],
+        timeout=COMMAND_TIMEOUT
+    )
+
+    if return_code != 0:
+        raise RuntimeError(
+            "Listener '%s' status failed: %s" %
+            (
+                listener_name,
+                stderr.strip() or stdout.strip()
+            )
+        )
+
+    return stdout
+
+
+def get_listener_services(listener_name):
+    return_code, stdout, stderr = run_process(
+        [LSNRCTL, "services", listener_name],
+        timeout=COMMAND_TIMEOUT
+    )
+
+    if return_code != 0:
+        raise RuntimeError(
+            "Listener '%s' services query failed: %s" %
+            (
+                listener_name,
+                stderr.strip() or stdout.strip()
+            )
+        )
+
+    return stdout
+
+
+def discover_listener_port(status_output):
+    match = re.search(
+        r"\(PROTOCOL=tcp\).*?\(PORT=(\d+)\)",
+        status_output,
         re.IGNORECASE | re.DOTALL
     )
-    if not port_match:
-        raise RuntimeError("Unable to discover listener TCP port")
-    return {
-        "name": LISTENER_NAME,
-        "port": int(port_match.group(1)),
-        "output": stdout
-    }
+
+    if not match:
+        return None
+
+    return int(match.group(1))
 
 
-def check_listener_port(listener_status):
-    hosts = ["127.0.0.1", socket.gethostname(), socket.getfqdn()]
-    for host in re.findall(r"\(HOST=([^)]+)\)", listener_status["output"], re.IGNORECASE):
-        host = host.strip()
-        if host:
-            hosts.append(host)
-    checked = set()
+def check_listener_tcp(port):
+    if port is None:
+        return False
+
+    hosts = [
+        "127.0.0.1",
+        socket.gethostname(),
+        socket.getfqdn()
+    ]
+
+    checked = []
+
     for host in hosts:
         if not host or host in checked:
             continue
-        checked.add(host)
+
+        checked.append(host)
+
         try:
-            sock = socket.create_connection((host, listener_status["port"]), 2)
+            sock = socket.create_connection(
+                (host, port),
+                2
+            )
+
             sock.close()
             return True
+
         except Exception:
-            continue
+            pass
+
     return False
 
 
-def check_service_status(listener_output, service_name):
-    pattern = r'Service\s+"%s"\s+has.*?(?=Service\s+"|\Z)' % re.escape(service_name)
-    match = re.search(pattern, listener_output, re.IGNORECASE | re.DOTALL)
-    if not match:
-        return False, False
-    ready = re.search(r"status\s+READY", match.group(0), re.IGNORECASE) is not None
-    return True, ready
+def check_service_registration(
+    services_output,
+    service_names
+):
+    for service_name in service_names:
+        pattern = (
+            r'Service\s+"%s"\s+has.*?'
+            r'(?=Service\s+"|\Z)'
+        ) % re.escape(service_name)
+
+        match = re.search(
+            pattern,
+            services_output,
+            re.IGNORECASE | re.DOTALL
+        )
+
+        if not match:
+            continue
+
+        block = match.group(0)
+
+        ready = re.search(
+            r"\bstatus\s+READY\b",
+            block,
+            re.IGNORECASE
+        ) is not None
+
+        return True, ready
+
+    return False, False
 
 
-def evaluate_optional_limits(active_sessions, session_utilization_percent, blocking_sessions, database_role):
+def inspect_listener(target_service):
+    listeners = discover_running_listeners()
+
+    if not listeners:
+        raise RuntimeError(
+            "No running Oracle listener process was discovered"
+        )
+
+    service_names = service_match_names(
+        target_service
+    )
+
+    fallback = None
     errors = []
-    if EXPECTED_DATABASE_ROLE:
-        if not database_role or database_role.upper() != EXPECTED_DATABASE_ROLE.upper():
-            errors.append(
-                "Database role '%s' does not match expected role '%s'" %
-                (database_role or "UNKNOWN", EXPECTED_DATABASE_ROLE)
+
+    for listener_name in listeners:
+        try:
+            status_output = get_listener_status(
+                listener_name
             )
-    if MAX_ACTIVE_SESSIONS:
-        try:
-            maximum = int(MAX_ACTIVE_SESSIONS)
-            if active_sessions > maximum:
-                errors.append("Active sessions %s exceeded configured maximum %s" % (active_sessions, maximum))
-        except ValueError:
-            errors.append("Invalid MAX_ACTIVE_SESSIONS configuration")
-    if MAX_SESSION_UTILIZATION_PERCENT:
-        try:
-            maximum = float(MAX_SESSION_UTILIZATION_PERCENT)
-            if session_utilization_percent is not None and session_utilization_percent >= maximum:
-                errors.append(
-                    "Session utilization %.2f%% reached configured maximum %.2f%%" %
-                    (session_utilization_percent, maximum)
+
+            services_output = get_listener_services(
+                listener_name
+            )
+
+            port = discover_listener_port(
+                status_output
+            )
+
+            reachable = check_listener_tcp(
+                port
+            )
+
+            registered, ready = (
+                check_service_registration(
+                    services_output,
+                    service_names
                 )
-        except ValueError:
-            errors.append("Invalid MAX_SESSION_UTILIZATION_PERCENT configuration")
-    if MAX_BLOCKING_SESSIONS:
-        try:
-            maximum = int(MAX_BLOCKING_SESSIONS)
-            if blocking_sessions > maximum:
-                errors.append("Blocking sessions %s exceeded configured maximum %s" % (blocking_sessions, maximum))
-        except ValueError:
-            errors.append("Invalid MAX_BLOCKING_SESSIONS configuration")
+            )
+
+            current = {
+                "listener_running": True,
+                "listener_name": listener_name,
+                "listener_port": port,
+                "listener_reachable": reachable,
+                "service_registered": registered,
+                "service_ready": ready
+            }
+
+            if fallback is None:
+                fallback = current
+
+            if registered:
+                return current
+
+        except Exception as error:
+            errors.append(
+                "%s: %s" %
+                (
+                    listener_name,
+                    str(error)
+                )
+            )
+
+    if fallback is not None:
+        return fallback
+
+    raise RuntimeError(
+        "Unable to query running Oracle listener(s): %s" %
+        "; ".join(errors)
+    )
+
+
+def parse_optional_int(name, value):
+    if not value:
+        return None
+
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise RuntimeError(
+            "%s must be an integer" % name
+        )
+
+    if parsed < 0:
+        raise RuntimeError(
+            "%s cannot be negative" % name
+        )
+
+    return parsed
+
+
+def parse_optional_float(name, value):
+    if not value:
+        return None
+
+    try:
+        parsed = float(value)
+    except ValueError:
+        raise RuntimeError(
+            "%s must be numeric" % name
+        )
+
+    if parsed < 0:
+        raise RuntimeError(
+            "%s cannot be negative" % name
+        )
+
+    return parsed
+
+
+def evaluate_thresholds(result):
+    errors = []
+
+    max_active = parse_optional_int(
+        "MAX_ACTIVE_SESSIONS",
+        MAX_ACTIVE_SESSIONS
+    )
+
+    max_blocking = parse_optional_int(
+        "MAX_BLOCKING_SESSIONS",
+        MAX_BLOCKING_SESSIONS
+    )
+
+    max_utilization = parse_optional_float(
+        "MAX_SESSION_UTILIZATION_PERCENT",
+        MAX_SESSION_UTILIZATION_PERCENT
+    )
+
+    if (
+        max_active is not None and
+        result["active_sessions"] is not None and
+        result["active_sessions"] > max_active
+    ):
+        errors.append(
+            "Active sessions %s exceeded configured maximum %s" %
+            (
+                result["active_sessions"],
+                max_active
+            )
+        )
+
+    if (
+        max_blocking is not None and
+        result["blocking_sessions"] is not None and
+        result["blocking_sessions"] > max_blocking
+    ):
+        errors.append(
+            "Blocking sessions %s exceeded configured maximum %s" %
+            (
+                result["blocking_sessions"],
+                max_blocking
+            )
+        )
+
+    if (
+        max_utilization is not None and
+        result["session_utilization_percent"] is not None and
+        result["session_utilization_percent"] >= max_utilization
+    ):
+        errors.append(
+            "Session utilization %.2f%% reached configured "
+            "maximum %.2f%%" %
+            (
+                result["session_utilization_percent"],
+                max_utilization
+            )
+        )
+
     return errors
 
 
-def perform_health_check():
-    result = {
-        "oracle_sid": ORACLE_SID,
+def new_result():
+    return {
+        "oracle_sid": ORACLE_SID or None,
         "database_name": None,
-        "cdb": None,
         "database_role": None,
+        "cdb": None,
         "target_pdb": None,
         "target_service": None,
-        "open_mode": None,
+        "pdb_open_mode": None,
         "pdb_restricted": None,
-        "listener_name": LISTENER_NAME,
+        "sql_query": False,
         "listener_running": False,
+        "listener_name": None,
         "listener_port": None,
         "listener_reachable": False,
         "service_registered": False,
-        "oracle_service_ready": False,
-        "sql_query": False,
+        "service_ready": False,
         "active_sessions": None,
         "total_user_sessions": None,
-        "session_utilization_percent": None,
-        "blocking_sessions": None
+        "blocked_sessions": None,
+        "blocking_sessions": None,
+        "session_current_utilization": None,
+        "session_limit": None,
+        "session_utilization_percent": None
     }
+
+
+def perform_health_check():
+    result = new_result()
     errors = []
-    target = None
-    target_service = None
+
+    validate_runtime()
+
+    inventory = collect_database_inventory()
+
+    result["database_name"] = inventory["database_name"]
+    result["database_role"] = inventory["database_role"]
+    result["cdb"] = inventory["cdb"]
+
+    target = choose_target_database(
+        inventory
+    )
+
+    target_service = choose_target_service(
+        inventory,
+        target
+    )
+
+    result["target_pdb"] = target["name"]
+
+    result["target_service"] = (
+        service_display_name(target_service)
+    )
+
+    result["pdb_open_mode"] = target["open_mode"]
+
+    result["pdb_restricted"] = (
+        target["restricted"] == "YES"
+    )
+
+    result["sql_query"] = check_target_sql(
+        target
+    )
+
+    sessions = inventory["sessions"].get(
+        target["con_id"],
+        {
+            "total": 0,
+            "active": 0,
+            "blocked": 0
+        }
+    )
+
+    result["total_user_sessions"] = sessions["total"]
+    result["active_sessions"] = sessions["active"]
+    result["blocked_sessions"] = sessions["blocked"]
+
+    result["blocking_sessions"] = (
+        inventory["blockers"].get(
+            target["con_id"],
+            0
+        )
+    )
+
+    result["session_current_utilization"] = (
+        inventory["session_current_utilization"]
+    )
+
+    result["session_limit"] = (
+        inventory["session_limit"]
+    )
+
+    result["session_utilization_percent"] = (
+        inventory["session_utilization_percent"]
+    )
 
     try:
-        inventory = collect_database_inventory()
-        target = choose_target(inventory)
-        target_service = choose_service(inventory, target)
-        result["database_name"] = inventory["database_name"]
-        result["cdb"] = inventory["cdb"]
-        result["database_role"] = inventory["database_role"]
-        result["target_pdb"] = target["name"]
-        result["target_service"] = target_service
-        result["open_mode"] = target["open_mode"]
-        result["pdb_restricted"] = target["restricted"]
-        sessions = inventory["sessions"].get(target["con_id"], {"total": 0, "active": 0})
-        result["total_user_sessions"] = sessions["total"]
-        result["active_sessions"] = sessions["active"]
-        result["blocking_sessions"] = inventory["blockers"].get(target["con_id"], 0)
-        result["session_utilization_percent"] = inventory["session_utilization_percent"]
-        result["sql_query"] = check_target_sql(target)
+        listener = inspect_listener(
+            target_service
+        )
+
+        result.update(listener)
+
     except Exception as error:
         errors.append(str(error))
 
-    listener_status = None
-    try:
-        listener_status = collect_listener_status()
-        result["listener_running"] = True
-        result["listener_port"] = listener_status["port"]
-        result["listener_reachable"] = check_listener_port(listener_status)
-        if not result["listener_reachable"]:
-            errors.append("Listener TCP port is not reachable")
-    except Exception as error:
-        errors.append(str(error))
-
-    if listener_status and target_service:
-        registered, ready = check_service_status(listener_status["output"], target_service)
-        result["service_registered"] = registered
-        result["oracle_service_ready"] = ready
-        if not registered:
-            errors.append("Oracle service '%s' is not registered with listener" % target_service)
-        elif not ready:
-            errors.append("Oracle service '%s' is not READY" % target_service)
-
-    if result["open_mode"] != "READ WRITE":
-        errors.append("Target database is not READ WRITE")
-    if result["pdb_restricted"] == "YES":
-        errors.append("Target database is in restricted mode")
-    if not result["sql_query"]:
-        errors.append("Target database SQL query failed")
     if not result["listener_running"]:
-        errors.append("Oracle listener is not running")
+        errors.append(
+            "Oracle listener is not running"
+        )
 
-    errors.extend(evaluate_optional_limits(
-        result["active_sessions"] or 0,
-        result["session_utilization_percent"],
-        result["blocking_sessions"] or 0,
-        result["database_role"]
-    ))
+    if not result["listener_reachable"]:
+        errors.append(
+            "Oracle listener TCP endpoint is not reachable"
+        )
+
+    if not result["service_registered"]:
+        errors.append(
+            "Target Oracle service '%s' is not registered" %
+            result["target_service"]
+        )
+
+    elif not result["service_ready"]:
+        errors.append(
+            "Target Oracle service '%s' is not READY" %
+            result["target_service"]
+        )
+
+    if not result["sql_query"]:
+        errors.append(
+            "SQL query against target database failed"
+        )
+
+    errors.extend(
+        evaluate_thresholds(result)
+    )
+
     return len(errors) == 0, result, errors
 
 
 def monitor_database():
     while True:
+        result = new_result()
+        candidate_healthy = False
+        errors = []
+
         try:
-            candidate_healthy, result, errors = perform_health_check()
+            candidate_healthy, result, errors = (
+                perform_health_check()
+            )
+
         except Exception as error:
             candidate_healthy = False
-            result = {}
             errors = [str(error)]
 
         with state_lock:
             for key, value in result.items():
                 state[key] = value
+
             state["last_check"] = int(time.time())
-            state["last_error"] = "; ".join(errors) if errors else None
+
+            state["last_error"] = (
+                "; ".join(errors)
+                if errors
+                else None
+            )
 
             if candidate_healthy:
                 state["consecutive_successes"] += 1
                 state["consecutive_failures"] = 0
-                if state["consecutive_successes"] >= SUCCESS_THRESHOLD:
+
+                if (
+                    state["consecutive_successes"] >=
+                    SUCCESS_THRESHOLD
+                ):
                     state["healthy"] = True
                     state["status"] = "HEALTHY"
+
             else:
                 state["consecutive_successes"] = 0
                 state["consecutive_failures"] += 1
-                if state["consecutive_failures"] >= FAILURE_THRESHOLD:
+
+                if (
+                    state["consecutive_failures"] >=
+                    FAILURE_THRESHOLD
+                ):
                     state["healthy"] = False
                     state["status"] = "UNHEALTHY"
+
         time.sleep(CHECK_INTERVAL)
 
 
-class HealthHandler(BaseHTTPServer.BaseHTTPRequestHandler):
+class HealthHandler(
+    BaseHTTPServer.BaseHTTPRequestHandler
+):
+
     def do_GET(self):
         if self.path != "/health":
             self.send_response(404)
             self.end_headers()
             return
+
         with state_lock:
             response = dict(state)
-        body = json.dumps(response, sort_keys=True)
-        status_code = 200 if response["healthy"] else 503
+
+        body = json.dumps(
+            response,
+            sort_keys=True
+        )
+
+        status_code = (
+            200 if response["healthy"]
+            else 503
+        )
+
         self.send_response(status_code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
+
+        self.send_header(
+            "Content-Type",
+            "application/json"
+        )
+
+        self.send_header(
+            "Content-Length",
+            str(len(body))
+        )
+
         self.end_headers()
         self.wfile.write(body)
 
@@ -816,108 +1148,25 @@ class HealthHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         return
 
 
-class ThreadedHTTPServer(SocketServer.ThreadingMixIn, BaseHTTPServer.HTTPServer):
+class ThreadedHTTPServer(
+    SocketServer.ThreadingMixIn,
+    BaseHTTPServer.HTTPServer
+):
     daemon_threads = True
+    allow_reuse_address = True
 
 
 if __name__ == "__main__":
-    monitor_thread = threading.Thread(target=monitor_database)
+    monitor_thread = threading.Thread(
+        target=monitor_database
+    )
+
     monitor_thread.daemon = True
     monitor_thread.start()
-    server = ThreadedHTTPServer((HOST, HEALTH_PORT), HealthHandler)
+
+    server = ThreadedHTTPServer(
+        (HOST, HEALTH_PORT),
+        HealthHandler
+    )
+
     server.serve_forever()
-PY
-
-chown "${ORACLE_USER}:${ORACLE_GROUP}" "${HEALTH_SCRIPT}"
-chmod 750 "${HEALTH_SCRIPT}"
-
-cat > "${HEALTH_SERVICE_FILE}" <<EOF
-[Unit]
-Description=Oracle Database Health Agent
-After=network-online.target oracle-listener.service
-Wants=network-online.target oracle-listener.service
-
-[Service]
-Type=simple
-User=${ORACLE_USER}
-Group=${ORACLE_GROUP}
-EnvironmentFile=${ENV_FILE}
-ExecStart=${PYTHON} ${HEALTH_SCRIPT}
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable oracle-listener >/dev/null
-systemctl enable oracle-health >/dev/null
-
-if ! systemctl is-active --quiet oracle-listener; then
-  systemctl start oracle-listener
-fi
-
-run_as_oracle "${SQLPLUS}" -s "/ as sysdba" <<'SQL' >/dev/null
-WHENEVER SQLERROR EXIT 2
-ALTER SYSTEM REGISTER;
-EXIT;
-SQL
-
-systemctl restart oracle-health
-
-if systemctl is-active --quiet firewalld; then
-  FIREWALL_RULE="rule family=\"ipv4\" source address=\"168.63.129.16/32\" port protocol=\"tcp\" port=\"${HEALTH_PORT}\" accept"
-  if ! firewall-cmd --permanent --query-rich-rule="${FIREWALL_RULE}" >/dev/null 2>&1; then
-    firewall-cmd --permanent --add-rich-rule="${FIREWALL_RULE}" >/dev/null
-  fi
-  firewall-cmd --reload >/dev/null
-fi
-
-echo "Waiting for Oracle health agent to become healthy..."
-HEALTHY=false
-
-for attempt in $(seq 1 18); do
-  if command -v curl >/dev/null 2>&1; then
-    HTTP_CODE="$(curl -sS -o /tmp/oracle-health-response.json -w '%{http_code}' --max-time 5 "http://127.0.0.1:${HEALTH_PORT}/health" || true)"
-    if [ "${HTTP_CODE}" = "200" ]; then
-      HEALTHY=true
-      break
-    fi
-  else
-    if "${PYTHON}" - <<PYVERIFY >/tmp/oracle-health-response.json 2>/dev/null
-import urllib2
-response = urllib2.urlopen("http://127.0.0.1:${HEALTH_PORT}/health", timeout=5)
-print(response.read())
-raise SystemExit(0 if response.getcode() == 200 else 1)
-PYVERIFY
-    then
-      HEALTHY=true
-      break
-    fi
-  fi
-  sleep 5
-done
-
-echo
-echo "Listener service:"
-systemctl --no-pager --full status oracle-listener || true
-
-echo
-echo "Health service:"
-systemctl --no-pager --full status oracle-health || true
-
-echo
-echo "Health endpoint:"
-cat /tmp/oracle-health-response.json 2>/dev/null || true
-echo
-
-if [ "${HEALTHY}" != "true" ]; then
-  echo "ERROR: Oracle health endpoint did not become healthy."
-  echo "Recent health-agent logs:"
-  journalctl -u oracle-health -n 50 --no-pager || true
-  exit 1
-fi
-
-echo "Oracle health agent installation completed successfully."
-echo "Health endpoint: http://<VM-IP>:${HEALTH_PORT}/health"
