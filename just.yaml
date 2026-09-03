@@ -1,1 +1,46 @@
-sudo ls -l /u01/app/oracle/product/21.0.0/dbhome_1/bin/lsnrctl /u01/app/oracle/product/21.0.0/dbhome_1/bin/tnslsnr
+Let's start the existing listener. Run this exactly as one line:
+
+sudo -u oracle env ORACLE_HOME=/u01/app/oracle/product/21.0.0/dbhome_1 ORACLE_SID=ORCL PATH=/u01/app/oracle/product/21.0.0/dbhome_1/bin:/usr/bin:/bin /u01/app/oracle/product/21.0.0/dbhome_1/bin/lsnrctl start
+
+If successful, you should see output containing something similar to:
+
+Starting /u01/app/oracle/product/21.0.0/dbhome_1/bin/tnslsnr: please wait...
+
+TNSLSNR for Linux...
+Listening on: (DESCRIPTION=(ADDRESS=(PROTOCOL=tcp)...(PORT=1521)))
+
+The command completed successfully
+
+Then immediately check:
+
+sudo ss -lntp | grep 1521
+
+and:
+
+ps -ef | grep tnslsnr | grep -v grep
+
+We should then see the listener process and port 1521.
+
+Next verify Oracle knows about the listener:
+
+sudo -u oracle env ORACLE_HOME=/u01/app/oracle/product/21.0.0/dbhome_1 ORACLE_SID=ORCL PATH=/u01/app/oracle/product/21.0.0/dbhome_1/bin:/usr/bin:/bin /u01/app/oracle/product/21.0.0/dbhome_1/bin/lsnrctl status
+
+And I also want this afterward:
+
+sudo -u oracle env ORACLE_HOME=/u01/app/oracle/product/21.0.0/dbhome_1 ORACLE_SID=ORCL PATH=/u01/app/oracle/product/21.0.0/dbhome_1/bin:/usr/bin:/bin /u01/app/oracle/product/21.0.0/dbhome_1/bin/lsnrctl services
+
+That last command is important because port 1521 merely being open isn't enough. We ultimately want to confirm the ORCL database/service has registered with the listener so application connections through:
+
+Azure LB :1521
+       ↓
+VM :1521
+       ↓
+Oracle Listener
+       ↓
+ORCL
+
+can actually work.
+
+And here's the nice part: once 1521 starts listening, don't reinstall or restart our Python agent yet. It checks the DB every 5 seconds automatically. Wait around 15 seconds and run:
+
+curl -i http://127.0.0.1:8080/health
