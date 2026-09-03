@@ -28,50 +28,58 @@ if [ -z "${PYTHON}" ] || [ ! -x "${PYTHON}" ]; then
   exit 1
 fi
 
-PMON_ROWS="$(
+INSTANCE_ROWS="$(
   ps -eo pid=,user=,args= | awk '
   {
+    pid = $1
+    owner = $2
+
     for (i = 3; i <= NF; i++) {
       proc = $i
       gsub(/^\[/, "", proc)
       gsub(/\]$/, "", proc)
-      if (proc ~ /^ora_pmon_/) {
+
+      if (proc ~ /^ora_pmon_/ || proc ~ /^ora_smon_/) {
         sid = proc
-        sub(/^ora_pmon_/, "", sid)
-        if (sid !~ /^\+/) {
-          print $1 "|" $2 "|" sid
+        sub(/^ora_(pmon|smon)_/, "", sid)
+
+        if (sid != "" && sid !~ /^\+/ && !seen[sid]++) {
+          print pid "|" owner "|" sid
         }
+
         break
       }
     }
   }'
 )"
 
-if [ -z "${PMON_ROWS}" ]; then
-  echo "ERROR: No running Oracle database instance was discovered."
+if [ -z "${INSTANCE_ROWS}" ]; then
+  echo "ERROR: No running Oracle database instance was discovered from PMON/SMON."
+  echo "Diagnostic Oracle processes:"
+  ps -ef | grep -E '[o]ra_(pmon|smon)_' || true
   exit 1
 fi
 
 if [ -n "${ORACLE_SID:-}" ]; then
-  PMON_ROW="$(printf '%s\n' "${PMON_ROWS}" | awk -F'|' -v sid="${ORACLE_SID}" '$3 == sid { print; exit }')"
-  if [ -z "${PMON_ROW}" ]; then
+  INSTANCE_ROW="$(printf '%s\n' "${INSTANCE_ROWS}" | awk -F'|' -v sid="${ORACLE_SID}" '$3 == sid { print; exit }')"
+  if [ -z "${INSTANCE_ROW}" ]; then
     echo "ERROR: Requested ORACLE_SID '${ORACLE_SID}' is not running."
     exit 1
   fi
 else
-  PMON_COUNT="$(printf '%s\n' "${PMON_ROWS}" | awk 'NF { count++ } END { print count + 0 }')"
-  if [ "${PMON_COUNT}" -ne 1 ]; then
+  INSTANCE_COUNT="$(printf '%s\n' "${INSTANCE_ROWS}" | awk 'NF { count++ } END { print count + 0 }')"
+  if [ "${INSTANCE_COUNT}" -ne 1 ]; then
     echo "ERROR: Multiple Oracle instances were discovered."
     echo "Re-run with ORACLE_SID=<sid> to select the intended instance."
-    printf '%s\n' "${PMON_ROWS}"
+    printf '%s\n' "${INSTANCE_ROWS}"
     exit 1
   fi
-  PMON_ROW="${PMON_ROWS}"
+  INSTANCE_ROW="${INSTANCE_ROWS}"
 fi
 
-ORACLE_PID="$(printf '%s' "${PMON_ROW}" | cut -d'|' -f1)"
-ORACLE_USER="$(printf '%s' "${PMON_ROW}" | cut -d'|' -f2)"
-ORACLE_SID="$(printf '%s' "${PMON_ROW}" | cut -d'|' -f3)"
+ORACLE_PID="$(printf '%s' "${INSTANCE_ROW}" | cut -d'|' -f1)"
+ORACLE_USER="$(printf '%s' "${INSTANCE_ROW}" | cut -d'|' -f2)"
+ORACLE_SID="$(printf '%s' "${INSTANCE_ROW}" | cut -d'|' -f3)"
 ORACLE_GROUP="$(id -gn "${ORACLE_USER}")"
 
 if [ -z "${ORACLE_HOME:-}" ] && [ -r /etc/oratab ]; then
