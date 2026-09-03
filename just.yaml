@@ -5,7 +5,7 @@ module "lb_test_vm03" {
   application_name    = "003"
   environment         = var.environment
 
-  subnet_id   = module.base-infra.subnet_map["snet-lb-cl-factory-uaenorth-001"].id
+  subnet_id    = module.base-infra.subnet_map["snet-lb-cl-factory-uaenorth-001"].id
   key_vault_id = module.azure_key_vault.id
 
   dns_servers   = []
@@ -15,13 +15,13 @@ module "lb_test_vm03" {
     os_type = "linux"
   }
 
-  vm_size          = "Standard_E2s_v5"
+  vm_size          = "Standard_B1s"
   availability_zone = "1"
 
   source_image_reference = {
-    publisher = "Oracle"
-    offer     = "oracle-database"
-    sku       = "oracle_db_21"
+    publisher = "RedHat"
+    offer     = "RHEL"
+    sku       = "94_gen2"
     version   = "latest"
   }
 
@@ -35,10 +35,10 @@ module "lb_test_vm03" {
   os_disk = {
     caching              = "ReadWrite"
     storage_account_type = "StandardSSD_LRS"
-    disk_size_gb         = 128
+    disk_size_gb         = 32
   }
 
-  accelerated_networking_enabled = true
+  accelerated_networking_enabled = false
   ip_forwarding_enabled          = false
   enable_boot_diagnostics        = true
   encryption_at_host_enabled     = false
