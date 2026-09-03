@@ -1,51 +1,13 @@
-Step 1 — Find the Oracle environment
+sudo -iu oracle bash <<'EOF'
+export ORACLE_HOME=/u01/app/oracle/product/21.0.0/dbhome_1
+export ORACLE_SID=ORCL
+export PATH=$ORACLE_HOME/bin:$PATH
 
-Run these on VM1:
-
-sudo -iu oracle bash -lc 'echo "ORACLE_HOME=$ORACLE_HOME"; echo "ORACLE_SID=$ORACLE_SID"; command -v sqlplus'
-
-Also:
-
-sudo cat /etc/oratab
-
-And:
-
-sudo -iu oracle bash -lc 'env | grep -E "ORACLE_HOME|ORACLE_SID|PATH"'
-
-I expect /etc/oratab to contain something similar to:
-
-ORCL:/some/oracle/path/dbhome_1:Y
-
-That will give us the exact ORACLE_HOME.
-
-Step 2 — Confirm SQL*Plus can actually query the DB
-
-Once the login-shell command finds sqlplus, run:
-
-sudo -iu oracle sqlplus -s / as sysdba
-
-Then inside SQL*Plus:
-
+sqlplus -s "/ as sysdba" <<'SQL'
 SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF
 SELECT 1 FROM dual;
 SELECT open_mode FROM v$database;
 SELECT database_role FROM v$database;
 EXIT;
-
-For a healthy writable DB, we'd expect something like:
-
-1
-READ WRITE
-PRIMARY
-
-If these two VMs are not Data Guard primary/standby and are simply independent Oracle databases, PRIMARY by itself doesn't distinguish which one should receive traffic. For this first POC, READ WRITE + successful query is enough to prove readiness.
-
-Step 3 — Install Python 3
-
-Try:
-
-sudo yum install -y python3
-
-Then:
-
-python3 --version
+SQL
+EOF
