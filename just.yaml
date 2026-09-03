@@ -1,15 +1,48 @@
-On VM1 run:
+module "lb_test_vm03" {
+  source = "./modules/virtual-machine"
 
-sudo ss -lntp | grep ':1521'
+  resource_group_name = module.oracle_db_resource_group.rg_name
+  application_name    = "003"
+  environment         = var.environment
 
-Then:
+  subnet_id   = module.base-infra.subnet_map["snet-lb-cl-factory-uaenorth-001"].id
+  key_vault_id = module.azure_key_vault.id
 
-timeout 3 bash -c '</dev/tcp/127.0.0.1/1521' \
-  && echo "LOCAL 1521 OPEN" \
-  || echo "LOCAL 1521 FAILED"
+  dns_servers   = []
+  computer_name = "lbtestvm03"
 
-And importantly:
+  vm = {
+    os_type = "linux"
+  }
 
-timeout 3 bash -c '</dev/tcp/10.114.32.132/1521' \
-  && echo "PRIVATE-IP 1521 OPEN" \
-  || echo "PRIVATE-IP 1521 FAILED"
+  vm_size          = "Standard_E2s_v5"
+  availability_zone = "1"
+
+  source_image_reference = {
+    publisher = "Oracle"
+    offer     = "oracle-database"
+    sku       = "oracle_db_21"
+    version   = "latest"
+  }
+
+  admin_username = "azureuser"
+  admin_password = var.oracle_db_vm_admin_password
+
+  managed_identities = {
+    system_assigned = true
+  }
+
+  os_disk = {
+    caching              = "ReadWrite"
+    storage_account_type = "StandardSSD_LRS"
+    disk_size_gb         = 128
+  }
+
+  accelerated_networking_enabled = true
+  ip_forwarding_enabled          = false
+  enable_boot_diagnostics        = true
+  encryption_at_host_enabled     = false
+  patch_mode_linux               = "ImageDefault"
+
+  tags = local.tags
+}
