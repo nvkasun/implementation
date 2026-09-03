@@ -1,26 +1,15 @@
-On VM1:
+On VM1 run:
 
-sudo systemctl stop firewalld
+sudo ss -lntp | grep ':1521'
 
-Confirm:
+Then:
 
-sudo systemctl status firewalld --no-pager
+timeout 3 bash -c '</dev/tcp/127.0.0.1/1521' \
+  && echo "LOCAL 1521 OPEN" \
+  || echo "LOCAL 1521 FAILED"
 
-It should show:
+And importantly:
 
-inactive (dead)
-
-Do not run systemctl disable firewalld. We only want a temporary diagnostic.
-
-Then do these tests in this order:
-
-From Windows jump VM, test the health endpoint again:
-curl -v --noproxy "*" http://10.114.32.132:8080/health
-Test Oracle directly on VM1:
-powershell -Command "Test-NetConnection 10.114.32.132 -Port 1521"
-
-We want:
-
-TcpTestSucceeded : True
-Then test the actual Load Balancer frontend VIP:
-powershell -Command "Test-NetConnection 10.114.32.134 -Port 1521"
+timeout 3 bash -c '</dev/tcp/10.114.32.132/1521' \
+  && echo "PRIVATE-IP 1521 OPEN" \
+  || echo "PRIVATE-IP 1521 FAILED"
