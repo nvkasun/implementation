@@ -1,11 +1,60 @@
-ps -ef | grep -i '[t]nslsnr'
+#!/bin/bash
 
-and:
+set -euo pipefail
 
-sudo -u oracle env \
-ORACLE_HOME=/u01/app/oracle/product/21.0.0/dbhome_1 \
-ORACLE_SID=ORCL \
-PATH=/u01/app/oracle/product/21.0.0/dbhome_1/bin:/usr/bin:/bin \
-/u01/app/oracle/product/21.0.0/dbhome_1/bin/lsnrctl status
+HEALTH_PORT="${HEALTH_PORT:-8080}"
+SERVICE_NAME="oracle-health.service"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
+ENV_FILE="/etc/oracle-health.env"
+INSTALL_DIR="/opt/oracle-health"
+HEALTH_SCRIPT="${INSTALL_DIR}/oracle_health.py"
+BACKUP_ROOT="${INSTALL_DIR}/backups"
 
-Don't change anything yet.
+if [ "$(id -u)" -ne 0 ]; then
+  echo "ERROR: Run this script with sudo or as root."
+  exit 1
+fi
+
+TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+BACKUP_DIR="${BACKUP_ROOT}/${TIMESTAMP}"
+
+if [ -f "${SERVICE_FILE}" ] || [ -f "${HEALTH_SCRIPT}" ] || [ -f "${ENV_FILE}" ]; then
+  mkdir -p "${BACKUP_DIR}"
+
+  if [ -f "${SERVICE_FILE}" ]; then
+    cp -p "${SERVICE_FILE}" "${BACKUP_DIR}/"
+  fi
+
+  if [ -f "${HEALTH_SCRIPT}" ]; then
+    cp -p "${HEALTH_SCRIPT}" "${BACKUP_DIR}/"
+  fi
+
+  if [ -f "${ENV_FILE}" ]; then
+    cp -p "${ENV_FILE}" "${BACKUP_DIR}/"
+  fi
+
+  echo "Backup created: ${BACKUP_DIR}"
+fi
+
+if systemctl list-unit-files --type=service 2>/dev/null | awk '{print $1}' | grep -qx "${SERVICE_NAME}" || [ -f "${SERVICE_FILE}" ]; then
+  systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
+  systemctl disable "${SERVICE_NAME}" 2>/dev/null || true
+fi
+
+rm -f "${SERVICE_FILE}"
+rm -f "${ENV_FILE}"
+rm -f "${HEALTH_SCRIPT}"
+
+systemctl daemon-reload
+systemctl reset-failed "${SERVICE_NAME}" 2>/dev/null || true
+
+if ss -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${HEALTH_PORT}$"; then
+  echo "ERROR: TCP port ${HEALTH_PORT} is still in use."
+  echo "The Oracle health service has been removed, but another process owns the port."
+  ss -lntp 2>/dev/null | grep -E "[:.]${HEALTH_PORT}[[:space:]]" || true
+  exit 1
+fi
+
+echo "Oracle health agent removed successfully."
+echo "TCP port ${HEALTH_PORT} is free."
+echo "Oracle database and Oracle listener were not modified."
