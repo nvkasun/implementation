@@ -3,3 +3,10 @@ So run these three checks on VM1 or VM2 first:
 python3 -c "import oracledb; print(oracledb.__version__)"
 python3 -c "import cx_Oracle; print(cx_Oracle.version)"
 /u01/app/oracle/product/21.0.0/dbhome_1/bin/sqlplus -v
+
+
+Hi Paleri, the Oracle DB load-balancing setup is now implemented. An Azure Internal Load Balancer exposes 10.114.32.134:1521, and applications will connect only to this endpoint rather than the individual DB VM IPs.
+
+A Python health-agent service runs on each Oracle VM on port 8080. It validates the Oracle instance/database state, listener and port 1521, pdb1 service registration/readiness, PDB1 READ WRITE state, and executes a real SQL query before returning HTTP 200 to the Azure health probe. Azure then forwards new Oracle connections only to healthy backend VMs.
+
+VM1 and VM2 are configured as LB backends, and the LB frontend connectivity has been successfully tested from an independent test VM.
