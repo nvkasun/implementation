@@ -1,9 +1,5 @@
-Hi Paleri, quick update on the Oracle DB load balancer POC. The end-to-end testing is now completed successfully.
+Also, for the backend health validation, I deployed a lightweight Python health-agent service on both Oracle DB VMs.
 
-I tested from a separate client VM using only the Azure Internal Load Balancer endpoint 10.114.32.134:1521/pdb1. The test establishes real Oracle sessions, inserts sample records, commits them, and identifies which backend handled each connection. All 20 test connections completed successfully with no failures.
+Azure Load Balancer periodically sends an HTTP health probe to <VM-IP>:8080/health. When the request is received, the agent performs Oracle-level validation rather than only checking whether the VM is reachable. It verifies the Oracle database/instance state, listener availability on port 1521, pdb1 service registration/readiness, PDB1 READ WRITE status, and executes a real SQL query against the PDB.
 
-In the first screenshot, with both DB VMs healthy, the connections were handled by VM1. Azure Load Balancer uses a 5-tuple hash-based distribution rather than round-robin, so traffic from a single client can be skewed to one backend even when both are healthy.
-
-I then performed a failover test by stopping the health-agent service on VM1. Azure detected VM1 as unhealthy through the /health probe and automatically routed all new Oracle connections to VM2. Again, all 20 connections, inserts and commits completed successfully with zero failures, as shown in the second screenshot.
-
-So the current implementation validates the full flow: Application → Azure LB → healthy Oracle backend, including health-based backend exclusion and automatic failover.
+If all mandatory checks pass, the agent returns HTTP 200 / HEALTHY, and Azure keeps that VM eligible for new Oracle connections. If any critical check fails, the probe fails and Azure removes that VM from new-connection selection until it becomes healthy again.
