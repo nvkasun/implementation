@@ -1,10 +1,9 @@
 read -s -p "Enter Oracle SYSTEM password: " ORA_PWD
 echo
 
-{
-  printf 'CONNECT SYSTEM/"%s"@10.114.32.134:1521/pdb1\n' "$ORA_PWD"
+/u01/app/oracle/product/21.0.0/dbhome_1/bin/sqlplus -s /nolog <<EOF
+CONNECT SYSTEM/"${ORA_PWD}"@10.114.32.134:1521/pdb1
 
-  cat <<'SQL'
 WHENEVER SQLERROR EXIT 1
 
 SET HEADING OFF
@@ -23,7 +22,6 @@ SELECT
 FROM dual;
 
 EXIT
-SQL
-} | /u01/app/oracle/product/21.0.0/dbhome_1/bin/sqlplus -s /nolog
+EOF
 
 unset ORA_PWD
