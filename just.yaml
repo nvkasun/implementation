@@ -1,58 +1,9 @@
-On VM1, run these exact commands:
+Hi Paleri, quick update on the Oracle DB load balancer POC. The end-to-end testing is now completed successfully.
 
-sudo systemctl status oracle-health.service
-curl -i http://127.0.0.1:8080/health
-sudo firewall-cmd --list-all
-sudo ss -lntp | grep :8080
+I tested from a separate client VM using only the Azure Internal Load Balancer endpoint 10.114.32.134:1521/pdb1. The test establishes real Oracle sessions, inserts sample records, commits them, and identifies which backend handled each connection. All 20 test connections completed successfully with no failures.
 
-We want to confirm four things:
+In the first screenshot, with both DB VMs healthy, the connections were handled by VM1. Azure Load Balancer uses a 5-tuple hash-based distribution rather than round-robin, so traffic from a single client can be skewed to one backend even when both are healthy.
 
-oracle-health.service     active/running
-/health                   HTTP 200 + HEALTHY
-port 8080                 listening
-168.63.129.16/32:8080     allowed
+I then performed a failover test by stopping the health-agent service on VM1. Azure detected VM1 as unhealthy through the /health probe and automatically routed all new Oracle connections to VM2. Again, all 20 connections, inserts and commits completed successfully with zero failures, as shown in the second screenshot.
 
-If this rule is missing from VM1:
-
-rule family="ipv4" source address="168.63.129.16/32" port port="8080" protocol="tcp" accept
-
-restore it with:
-
-sudo firewall-cmd --permanent \
-  --add-rich-rule='rule family="ipv4" source address="168.63.129.16/32" port port="8080" protocol="tcp" accept'
-
-sudo firewall-cmd --reload
-
-Then verify:
-
-sudo firewall-cmd --list-all
-
-VM1 should ultimately contain both:
-
-168.63.129.16/32 → TCP 8080   # Azure LB health probe
-10.114.32.135/32 → TCP 1521   # VM3 application traffic
-
-Do the same --list-all check on VM2 so both machines are symmetrical.
-
-Then wait around 15–30 seconds for several Azure health-probe cycles and rerun:
-
-./send-data.py 20
-
-What we want next is something like:
-
-Backend Distribution
---------------------
-vm-001-dev-uan-a3975m     8 connection(s)
-vm-002-dev-uan-19yf0j    12 connection(s)
-
-FINAL RESULT: PASS
-
-Not necessarily exactly 10/10.
-
-So bro, don't change the Python script now. The script is doing its job correctly. The next investigation is VM1's LB health eligibility. Start with:
-
-sudo firewall-cmd --list-all
-
-and
-
-curl -i http://127.0.0.1:8080/health
+So the current implementation validates the full flow: Application → Azure LB → healthy Oracle backend, including health-based backend exclusion and automatic failover.
