@@ -1,10 +1,30 @@
-read -s -p "Enter Oracle SYSTEM password: " ORA_PWD
-echo
+#!/usr/bin/env python
 
-/u01/app/oracle/product/21.0.0/dbhome_1/bin/sqlplus -s /nolog <<EOF
-CONNECT SYSTEM/"${ORA_PWD}"@10.114.32.134:1521/pdb1
+from __future__ import print_function
 
-WHENEVER SQLERROR EXIT 1
+import getpass
+import os
+import subprocess
+import sys
+
+
+LB_HOST = "10.114.32.134"
+LB_PORT = 1521
+SERVICE_NAME = "pdb1"
+DB_USER = "SYSTEM"
+
+ORACLE_HOME = "/u01/app/oracle/product/21.0.0/dbhome_1"
+SQLPLUS = ORACLE_HOME + "/bin/sqlplus"
+
+
+password = getpass.getpass("Enter Oracle SYSTEM password: ")
+
+safe_password = password.replace('"', '""')
+
+sql_input = """
+WHENEVER OSERROR EXIT FAILURE
+
+CONNECT {user}/"{password}"@"{host}:{port}/{service}"
 
 SET HEADING OFF
 SET FEEDBACK OFF
@@ -22,6 +42,62 @@ SELECT
 FROM dual;
 
 EXIT
-EOF
+""".format(
+    user=DB_USER,
+    password=safe_password,
+    host=LB_HOST,
+    port=LB_PORT,
+    service=SERVICE_NAME
+)
 
-unset ORA_PWD
+env = os.environ.copy()
+env["ORACLE_HOME"] = ORACLE_HOME
+env["PATH"] = ORACLE_HOME + "/bin:" + env.get("PATH", "")
+env["LD_LIBRARY_PATH"] = ORACLE_HOME + "/lib:" + env.get(
+    "LD_LIBRARY_PATH",
+    ""
+)
+
+process = subprocess.Popen(
+    [SQLPLUS, "-s", "-L", "/nolog"],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    env=env,
+    universal_newlines=True
+)
+
+output, unused = process.communicate(sql_input)
+
+connected_line = None
+
+for line in output.splitlines():
+    line = line.strip()
+
+    if line.startswith("CONNECTED|"):
+        connected_line = line
+        break
+
+if connected_line:
+    parts = connected_line.split("|")
+
+    print()
+    print("ORACLE CONNECTION   : SUCCESS")
+    print("LB endpoint         : {}:{}/{}".format(
+        LB_HOST,
+        LB_PORT,
+        SERVICE_NAME
+    ))
+    print("Selected backend    : {}".format(parts[1]))
+    print("Oracle instance     : {}".format(parts[2]))
+    print("Oracle service      : {}".format(parts[3]))
+    print("PDB/container       : {}".format(parts[4]))
+    sys.exit(0)
+
+print()
+print("ORACLE CONNECTION   : FAILED")
+print("SQL*Plus exit code  : {}".format(process.returncode))
+print()
+print("SQL*Plus output:")
+print(output)
+sys.exit(1)
