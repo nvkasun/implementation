@@ -1,20 +1,12 @@
-ls -l /u01/app/oracle/product/21.0.0/dbhome_1/bin/sqlplus
+SET LINESIZE 200
+COLUMN BACKEND_HOST FORMAT A35
+COLUMN INSTANCE_NAME FORMAT A20
+COLUMN SERVICE_NAME FORMAT A20
+COLUMN PDB_NAME FORMAT A20
 
-If you see the file, set the environment on VM3:
-
-export ORACLE_HOME=/u01/app/oracle/product/21.0.0/dbhome_1
-export PATH=$ORACLE_HOME/bin:$PATH
-export LD_LIBRARY_PATH=$ORACLE_HOME/lib:$LD_LIBRARY_PATH
-
-Then:
-
-sqlplus -v
-
-You should get:
-
-SQL*Plus: Release 21.0.0.0.0 - Production
-Version 21.3.0.0.0
-
-Then test the LB manually with:
-
-sqlplus -L SYSTEM@10.114.32.134:1521/pdb1
+SELECT
+    SYS_CONTEXT('USERENV','SERVER_HOST') AS BACKEND_HOST,
+    SYS_CONTEXT('USERENV','INSTANCE_NAME') AS INSTANCE_NAME,
+    SYS_CONTEXT('USERENV','SERVICE_NAME') AS SERVICE_NAME,
+    SYS_CONTEXT('USERENV','CON_NAME') AS PDB_NAME
+FROM dual;
