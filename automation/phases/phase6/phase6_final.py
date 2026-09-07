@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase 7G | GoldenGate MAIN final_validation entrypoint -- moves the "Validate the mode-aware final DEPLOY success contract" step's implementation out of .github/workflows/00-main-goldengate-orchestrator.yaml's inline shell into pure, testable Python. This module is deliberately unaware of GitHub Actions' own double-curly template-expression syntax: the calling workflow step maps `needs.<job>.result` and validate_model's boolean outputs into plain environment variables (EFFECTIVE_DEPLOY, HAS_ACTIVE_DEPLOYMENTS, HAS_CHANGES, HAS_DELETIONS, and one RESULT_<job_name> per prerequisite) exactly as it already does today -- this module only ever reads plain strings from os.environ (or, for tests, an explicit mapping), never a template expression. Preserves the EXACT mode-aware require_success()/allow_non_failure() contract, literal-boolean-only handling (no truthiness coercion), and per-mode branching the prior inline shell implemented -- semantic parity only, not a redesign."""
+"""Phase 6F | GoldenGate MAIN final_validation entrypoint -- moves the "Validate the mode-aware final DEPLOY success contract" step's implementation out of .github/workflows/00-main-goldengate-orchestrator.yaml's inline shell into pure, testable Python. This module is deliberately unaware of GitHub Actions' own double-curly template-expression syntax: the calling workflow step maps `needs.<job>.result` and validate_model's boolean outputs into plain environment variables (EFFECTIVE_DEPLOY, HAS_ACTIVE_DEPLOYMENTS, HAS_CHANGES, HAS_DELETIONS, and one RESULT_<job_name> per prerequisite) exactly as it already does today -- this module only ever reads plain strings from os.environ (or, for tests, an explicit mapping), never a template expression. Preserves the EXACT mode-aware require_success()/allow_non_failure() contract, literal-boolean-only handling (no truthiness coercion), and per-mode branching the prior inline shell implemented -- semantic parity only, not a redesign. Automated Replication Implementation Removal: this module was previously automation/phases/phase7/phase7_final.py (Phase 7G) and has been renumbered to Phase 6F as part of retiring the automated GoldenGate replication-provisioning implementation -- replication_reconcile_once, replication_dry_run_validation, and replication_monitor_acceptance no longer exist anywhere in this repository and have been removed from RESULT_JOB_NAMES and from every mode branch below (not replaced by any other automated-replication result); GoldenGate database connections, Extract, trails, Distribution Path, and Replicat are now configured manually by an operator/DBA through the GoldenGate UI after this pipeline completes, and this gate's own runtime/monitor/end-to-end acceptance chain is the complete remaining success contract."""
 from __future__ import annotations
 
 import os
@@ -17,21 +17,18 @@ RESULT_JOB_NAMES = (
     "build_publish_and_deploy",
     "delete_removed_argocd_applications",
     "validate_active_runtimes",
-    "replication_reconcile_once",
-    "replication_dry_run_validation",
     "monitor_ownership_preflight",
     "monitor_sync_once",
     "monitor_dry_run_validation",
     "validate_monitor_ready",
-    "replication_monitor_acceptance",
     "end_to_end_deployment_acceptance",
 )
 
 _LITERAL_BOOLEAN_INPUTS = ("EFFECTIVE_DEPLOY", "HAS_ACTIVE_DEPLOYMENTS", "HAS_CHANGES", "HAS_DELETIONS")
 
 
-class Phase7FinalError(Exception):
-    """A fail-closed Phase 7 final-validation error; main() reports it and exits non-zero."""
+class Phase6FinalError(Exception):
+    """A fail-closed Phase 6 final-validation error; main() reports it and exits non-zero."""
 
 
 class _Gate:
@@ -135,22 +132,18 @@ def validate_gate(env):
         gate.require_success("validate_observability_ready")
 
         if has_active_deployments:
-            gate.emit("REAL DEPLOY + ACTIVE RUNTIMES: the full runtime/replication/monitor/E2E acceptance chain is unconditionally required -- a SKIPPED value for any of these must fail this gate, not merely pass through as 'not a failure'.")
+            gate.emit("REAL DEPLOY + ACTIVE RUNTIMES: the full runtime/monitor/E2E acceptance chain is unconditionally required -- a SKIPPED value for any of these must fail this gate, not merely pass through as 'not a failure'. GoldenGate database connections and replication processes are configured manually through the GoldenGate UI and are outside this automated chain.")
             gate.require_success("validate_active_runtimes")
-            gate.require_success("replication_reconcile_once")
             gate.require_success("monitor_ownership_preflight")
             gate.require_success("monitor_sync_once")
             gate.require_success("validate_monitor_ready")
-            gate.require_success("replication_monitor_acceptance")
             gate.require_success("end_to_end_deployment_acceptance")
         else:
-            gate.emit("REAL DEPLOY + NO ACTIVE RUNTIMES: the runtime/replication/monitor/E2E acceptance chain is legitimately not applicable and may be cleanly skipped -- only a real failure/cancellation blocks MAIN.")
+            gate.emit("REAL DEPLOY + NO ACTIVE RUNTIMES: the runtime/monitor/E2E acceptance chain is legitimately not applicable and may be cleanly skipped -- only a real failure/cancellation blocks MAIN.")
             gate.allow_non_failure("validate_active_runtimes")
-            gate.allow_non_failure("replication_reconcile_once")
             gate.allow_non_failure("monitor_ownership_preflight")
             gate.allow_non_failure("monitor_sync_once")
             gate.allow_non_failure("validate_monitor_ready")
-            gate.allow_non_failure("replication_monitor_acceptance")
             gate.allow_non_failure("end_to_end_deployment_acceptance")
     else:
         gate.emit("DRY RUN: live EKS/OIDC/Kubernetes-API prerequisite, Terraform, live EFS inventory, and Argo CD / Platform / Observability / runtime / monitor deployment gates are legitimately skipped -- the existing dry-run validation path governs success instead.")
@@ -159,15 +152,10 @@ def validate_gate(env):
         gate.allow_non_failure("validate_platform_ready")
         gate.allow_non_failure("validate_observability_ready")
         gate.allow_non_failure("validate_active_runtimes")
-        gate.allow_non_failure("replication_reconcile_once")
         gate.allow_non_failure("monitor_ownership_preflight")
         gate.allow_non_failure("monitor_sync_once")
         gate.allow_non_failure("validate_monitor_ready")
-        gate.allow_non_failure("replication_monitor_acceptance")
         gate.allow_non_failure("end_to_end_deployment_acceptance")
-
-        # Replication dry-run validates the global replication schema/pipeline model and must succeed even with zero active runtimes -- unconditionally required for every dry run.
-        gate.require_success("replication_dry_run_validation")
 
         if has_active_deployments:
             gate.emit("DRY RUN + ACTIVE RUNTIMES: monitor_dry_run_validation's own if: condition makes it applicable -- a SKIPPED value here must fail this gate, not merely pass through as 'not a failure'.")

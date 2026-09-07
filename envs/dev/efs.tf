@@ -31,11 +31,9 @@ resource "terraform_data" "goldengate_managed_efs_decommission_contract" {
       error_message = "envs/dev/efs.tf: goldengate_managed_efs_decommission_ids contains a deployment ID that is not a current managed-EFS deployment -- refusing to silently no-op an intended EFS decommission."
     }
     precondition {
-      condition = alltrue([
-        for id in local.goldengate_managed_efs_decommission_ids :
-        try(local.goldengate_runtime_documents[id].replication.enabled, true) == false
-      ])
-      error_message = "envs/dev/efs.tf: every deployment ID in goldengate_managed_efs_decommission_ids must have replication.enabled=false -- refusing to decommission managed EFS while replication is declared enabled."
+      # Automated Replication Implementation Removal (Task 4), EFS Decommission Safety Strengthening: the prior precondition here read replication.enabled from Git to decide whether a decommission ID was safe -- that signal no longer exists (the declarative replication schema is retired; GoldenGate database connections, Extract, trails, Distribution Path, and Replicat are now configured manually by an operator/DBA through the GoldenGate UI and are never represented in Git). Deleting that check outright without a replacement would make managed-EFS decommission STRICTLY LESS SAFE than before, since Git can no longer prove replication is quiescent for a candidate ID. This is a STRONGER fail-closed rule, not a like-for-like replacement: goldengate_managed_efs_decommission_ids must remain the empty set while manual GoldenGate process/replication state is opaque to Git and unverifiable from this repository -- there is deliberately no way to satisfy this precondition with a non-empty decommission list today. A future, separately-approved teardown safety mechanism (out of scope for this task) would need to establish an independent, verifiable signal that a candidate deployment's manual GoldenGate state has been safely quiesced/decommissioned by an operator before any ID may be added here again. This does not affect current steady state: the decommission set is already the empty set (see the locals block above), so this precondition passes today exactly as before -- it only forecloses ever adding an ID to it under the old (now-nonexistent) replication.enabled=false justification.
+      condition     = length(local.goldengate_managed_efs_decommission_ids) == 0
+      error_message = "envs/dev/efs.tf: goldengate_managed_efs_decommission_ids must be empty -- manual GoldenGate replication/process state is opaque to Git and cannot be used to prove a managed-EFS decommission is safe. Adding an ID here requires a future, separately-approved teardown safety mechanism that this task does not implement."
     }
   }
 }

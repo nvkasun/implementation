@@ -1,28 +1,10 @@
-# MSSQL GoldenGate runtime, single-runtime deployment model; runtime identity derives from Release.Name (see helm/goldengate/templates/_helpers.tpl). TARGET side of the PostgreSQL -> MSSQL Phase 6D1 replication test (pipeline repltest-pg-to-mssql-001), paired with the existing source gg-postgresql-repltest-01; replication remains disabled in this phase.
+# MSSQL GoldenGate runtime, single-runtime deployment model; runtime identity derives from Release.Name (see helm/goldengate/templates/_helpers.tpl). TARGET side of the logical PostgreSQL -> MSSQL pipeline repltest-pg-to-mssql-001, paired with the source gg-postgresql-repltest-01. Platform/runtime deployment (this Helm release, its EFS storage, its Admin/TLS secrets) is fully automated by GitHub Actions/Argo CD/Helm; GoldenGate database connections, credentials, Extract, trails, Distribution Path, and process starts are NOT automated here -- they are configured MANUALLY by an operator/DBA through the GoldenGate UI after this runtime is deployed and healthy. deployment.pipeline below is logical topology metadata only (identity/monitor-grouping/UI-topology), never declarative replication desired state.
 deployment:
   enabled: true
   pipeline: repltest-pg-to-mssql-001
   role: target
 
 deploymentModel: singleRuntime
-
-replication:
-  enabled: false
-  databaseCredentialSecret: ""
-  extract:
-    enabled: false
-    name: ""
-    trailName: ""
-    tables: []
-  distribution:
-    enabled: false
-    pathName: ""
-    targetDeployment: ""
-  replicat:
-    enabled: false
-    name: ""
-    checkpointTable: ""
-    mappings: []
 
 runtime:
   deploymentType: mssql

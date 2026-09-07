@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""automation/orchestration/end_to_end_acceptance.py: offline/pure GoldenGate monitor-to-runtime end-to-end acceptance classifier (Phase B3B) -- answers exactly one question, "does the shared monitor currently see every GLOBAL active GoldenGate runtime as fresh, UP, and safe?", as one of HEALTHY/BROKEN. This tool NEVER accesses Kubernetes or AWS itself: it consumes (1) the environment name, (2) the canonical folder-driven ACTIVE deployment model (automation/goldengate-deployment-model.py's own scan/validation -- read from the local repository, never re-parsed independently), and (3) an already-captured JSON response from GET http://127.0.0.1:8080/api/processes (saved to a local file by the calling workflow via a bounded, read-only kubectl exec against the SAME verified Ready monitor pod automation/orchestration/monitor_acceptance.py selected -- this tool never fetches it itself). The existing automation/orchestration/replication_state.py-adjacent exact-process-name replication acceptance (invoked by the 00-main workflow's own replication_monitor_acceptance job) remains the sole authority for exact expected Extract/Distribution Path/Replicat process names and startOnCreate semantics -- this tool deliberately does not duplicate that; it only proves the monitor-to-runtime health envelope and generic per-process safety (never stale, never ABENDED)."""
+"""automation/orchestration/end_to_end_acceptance.py: offline/pure GoldenGate monitor-to-runtime end-to-end acceptance classifier (Phase B3B) -- answers exactly one question, "does the shared monitor currently see every GLOBAL active GoldenGate runtime as fresh, UP, and safe?", as one of HEALTHY/BROKEN. This tool NEVER accesses Kubernetes or AWS itself: it consumes (1) the environment name, (2) the canonical folder-driven ACTIVE deployment model (automation/goldengate-deployment-model.py's own scan/validation -- read from the local repository, never re-parsed independently), and (3) an already-captured JSON response from GET http://127.0.0.1:8080/api/processes (saved to a local file by the calling workflow via a bounded, read-only kubectl exec against the SAME verified Ready monitor pod automation/orchestration/monitor_acceptance.py selected -- this tool never fetches it itself). Automated Replication Implementation Removal: GoldenGate database connections, Extract, trails, Distribution Path, and Replicat are now configured manually by an operator/DBA through the GoldenGate UI after deployment -- there is no automated replication-provisioning implementation, and no automated exact-desired-process-name acceptance job, anywhere in this repository. Process-discovery acceptance is therefore GENERIC and manual-mode-aware for every active deployment regardless of role: no discovery yet (None/EMPTY, before an operator has configured anything) and healthy discovery (OK, once an operator has configured real processes) are both HEALTHY; PARTIAL/UNAVAILABLE/INVALID_RESPONSE discovery, and any stale/ABENDED/malformed process row, still fail closed. This tool proves the monitor-to-runtime health envelope and generic per-process safety only -- it never proves, and never needs to prove, conformance to any specific desired Extract/Replicat/Distribution Path name."""
 from __future__ import annotations
 
 import argparse
@@ -26,20 +26,20 @@ def _load_deployment_model_module():
 
 
 def load_active_deployments(environment):
-    """Returns [{"deploymentId", "deploymentType", "replicationEnabled"}, ...] for the environment's GLOBAL active runtime inventory. Raises ValueError (a configuration error, never a BROKEN acceptance result) if the folder-driven model itself has a problem."""
+    """Returns [{"deploymentId", "deploymentType"}, ...] for the environment's GLOBAL active runtime inventory. Raises ValueError (a configuration error, never a BROKEN acceptance result) if the folder-driven model itself has a problem."""
     gdm = _load_deployment_model_module()
     gdm.REPO_ROOT = REPO_ROOT
     active, _inactive, invalid, problems = gdm._run_full_validation(environment)
     if invalid or problems:
         raise ValueError(f"the folder-driven deployment model for {environment!r} has validation problems -- refusing to accept end-to-end runtime health against an inconsistent model")
-    return [{"deploymentId": d["deploymentId"], "deploymentType": d["deploymentType"], "replicationEnabled": d["replicationEnabled"]} for d in active]
+    return [{"deploymentId": d["deploymentId"], "deploymentType": d["deploymentType"]} for d in active]
 
 
 STATE_HEALTHY = "HEALTHY"
 STATE_BROKEN = "BROKEN"
 
-# monitor.py's own build_processes_payload()/read_deployment_processes_view() output contract -- verified against the real monitoring/monitor/monitor.py source, never guessed.
-_NON_REPLICATION_ALLOWED_DISCOVERY_STATUSES = (None, "EMPTY", "OK")
+# monitor.py's own build_processes_payload()/read_deployment_processes_view() output contract -- verified against the real monitoring/monitor/monitor.py source, never guessed. Automated Replication Implementation Removal: this is now the ONE universal allowed-discovery-status set for every active deployment regardless of role -- None/EMPTY means "no manual GoldenGate configuration yet" (healthy: this is the expected steady state immediately after an automated deploy, before an operator has configured anything through the GoldenGate UI), OK means "a real process inventory was discovered and is itself further validated row-by-row below" -- there is no longer a role- or replication-enabled-conditioned second allowed set.
+_ALLOWED_DISCOVERY_STATUSES = (None, "EMPTY", "OK")
 
 
 def _describe_malformed_value(value, max_repr_len=48):
@@ -138,21 +138,16 @@ def classify(environment, active_deployments, api_processes_doc):
             if unreachable:
                 reasons.append(f"deployment {name!r}: critical service(s) not reachable: {unreachable!r}")
 
-        replication_enabled = bool(expected.get("replicationEnabled"))
         process_discovery = entry.get("processDiscovery")
-        # The monitor API contract (normalize_process_discovery()) only ever emits null or an object -- a non-dict, non-null value (a string/list/number/bool) is itself a malformed-schema condition and must never be silently coerced into "absent" (None), or a malformed value would be indistinguishable from a legitimately absent discovery result for a replication-disabled deployment.
+        # The monitor API contract (normalize_process_discovery()) only ever emits null or an object -- a non-dict, non-null value (a string/list/number/bool) is itself a malformed-schema condition and must never be silently coerced into "absent" (None), or a malformed value would be indistinguishable from a legitimately absent discovery result.
         discovery_shape_valid = process_discovery is None or isinstance(process_discovery, dict)
         if not discovery_shape_valid:
             reasons.append(f"deployment {name!r}: processDiscovery must be null or an object per the monitor API contract, got {_describe_malformed_value(process_discovery)}")
         else:
             discovery_status = process_discovery.get("status") if isinstance(process_discovery, dict) else None
-            if replication_enabled:
-                # The existing replication_monitor_acceptance job remains authoritative for exact expected process names/startOnCreate -- this only proves discovery itself succeeded.
-                if discovery_status != "OK":
-                    reasons.append(f"deployment {name!r}: participates in enabled replication but processDiscovery.status={discovery_status!r}, expected 'OK'")
-            else:
-                if discovery_status not in _NON_REPLICATION_ALLOWED_DISCOVERY_STATUSES:
-                    reasons.append(f"deployment {name!r}: replication is not enabled but processDiscovery.status={discovery_status!r}, expected EMPTY, OK, or absent (an empty process list is valid when no replication process is desired)")
+            # Manual GoldenGate Operating Model: GENERIC for every active deployment, regardless of role -- None/EMPTY (no manual configuration yet) and OK (a real, further-validated process inventory) are both healthy; PARTIAL/UNAVAILABLE/INVALID_RESPONSE/any other value still fails closed.
+            if discovery_status not in _ALLOWED_DISCOVERY_STATUSES:
+                reasons.append(f"deployment {name!r}: processDiscovery.status={discovery_status!r}, expected EMPTY, OK, or absent (an empty process list is valid before an operator has manually configured any GoldenGate process)")
 
         # monitor.py's read_deployment_processes_view() always emits an actual JSON array for "processes" (possibly empty) -- `entry.get("processes") or []` previously coerced ANY falsey malformed value ({}, "", 0, false) into a legitimate empty list, and a missing key was treated identically. The current API always includes this key, so a missing key is malformed too, never a silent default.
         processes_present = "processes" in entry

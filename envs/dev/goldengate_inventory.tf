@@ -27,11 +27,10 @@ locals {
   goldengate_enabled_jsonenc = {
     for id, doc in local.goldengate_runtime_documents : id => try(jsonencode(doc.deployment.enabled), "")
   }
-  goldengate_replication_declared = {
-    for id, doc in local.goldengate_runtime_documents : id => try(doc.replication, null) != null
-  }
-  goldengate_replication_enabled_jsonenc = {
-    for id, doc in local.goldengate_runtime_documents : id => try(jsonencode(doc.replication.enabled), "")
+
+  # Automated Replication Implementation Removal: a top-level `replication` key of ANY shape (null, {}, enabled:false, enabled:true) is a retired-schema tombstone here, key-presence based -- mirrors automation/goldengate-deployment-model.py's own _reject_replication_key_presence() guard. Never a `!= null` value-tolerant check: a present `replication: null` key must still be rejected, exactly like the existing lifecycle/root-enabled/runtime-enabled tombstone guards below.
+  goldengate_replication_key_present = {
+    for id, doc in local.goldengate_runtime_documents : id => try(contains(keys(doc), "replication"), false)
   }
 
   # Shared platform invariants, derived and injected by the deploy workflow; declaring any of them at all is a forbidden override.
@@ -50,60 +49,6 @@ locals {
   goldengate_csi_service_account_role_arn_declared = {
     for id, doc in local.goldengate_runtime_documents : id => try(doc.runtime.csi.serviceAccountRoleArn, null) != null
   }
-
-  goldengate_deployment_type_raw = {
-    for id, doc in local.goldengate_runtime_documents : id => try(doc.runtime.deploymentType, "")
-  }
-
-  # Phase 6D1 replication contract: structural gates only, mirroring automation/goldengate-deployment-model.py; never REST reconciliation logic.
-  goldengate_replication_enabled_raw = {
-    for id, doc in local.goldengate_runtime_documents : id => try(doc.replication.enabled, false) == true
-  }
-  goldengate_replication_role_raw = {
-    for id, doc in local.goldengate_runtime_documents : id => try(doc.deployment.role, "")
-  }
-  goldengate_replication_extract_enabled_jsonenc = {
-    for id, doc in local.goldengate_runtime_documents : id => try(jsonencode(doc.replication.extract.enabled), "")
-  }
-  goldengate_replication_distribution_enabled_jsonenc = {
-    for id, doc in local.goldengate_runtime_documents : id => try(jsonencode(doc.replication.distribution.enabled), "")
-  }
-  goldengate_replication_checkpoint_enabled_jsonenc = {
-    for id, doc in local.goldengate_runtime_documents : id => try(jsonencode(doc.replication.checkpoint.enabled), "")
-  }
-  goldengate_replication_replicat_enabled_jsonenc = {
-    for id, doc in local.goldengate_runtime_documents : id => try(jsonencode(doc.replication.replicat.enabled), "")
-  }
-  goldengate_replication_extract_start_jsonenc = {
-    for id, doc in local.goldengate_runtime_documents : id => try(jsonencode(doc.replication.extract.startOnCreate), "")
-  }
-  goldengate_replication_distribution_start_jsonenc = {
-    for id, doc in local.goldengate_runtime_documents : id => try(jsonencode(doc.replication.distribution.startOnCreate), "")
-  }
-  goldengate_replication_replicat_start_jsonenc = {
-    for id, doc in local.goldengate_runtime_documents : id => try(jsonencode(doc.replication.replicat.startOnCreate), "")
-  }
-  goldengate_replication_extract_enabled_raw = {
-    for id, doc in local.goldengate_runtime_documents : id => try(doc.replication.extract.enabled, false) == true
-  }
-  goldengate_replication_distribution_enabled_raw = {
-    for id, doc in local.goldengate_runtime_documents : id => try(doc.replication.distribution.enabled, false) == true
-  }
-  goldengate_replication_checkpoint_enabled_raw = {
-    for id, doc in local.goldengate_runtime_documents : id => try(doc.replication.checkpoint.enabled, false) == true
-  }
-  goldengate_replication_replicat_enabled_raw = {
-    for id, doc in local.goldengate_runtime_documents : id => try(doc.replication.replicat.enabled, false) == true
-  }
-  goldengate_replication_extract_name_raw           = { for id, doc in local.goldengate_runtime_documents : id => try(doc.replication.extract.name, "") }
-  goldengate_replication_extract_trail_raw          = { for id, doc in local.goldengate_runtime_documents : id => try(doc.replication.extract.trail.name, "") }
-  goldengate_replication_replicat_name_raw          = { for id, doc in local.goldengate_runtime_documents : id => try(doc.replication.replicat.name, "") }
-  goldengate_replication_replicat_trail_raw         = { for id, doc in local.goldengate_runtime_documents : id => try(doc.replication.replicat.sourceTrailName, "") }
-  goldengate_replication_distribution_path_raw      = { for id, doc in local.goldengate_runtime_documents : id => try(doc.replication.distribution.pathName, "") }
-  goldengate_replication_distribution_src_trail_raw = { for id, doc in local.goldengate_runtime_documents : id => try(doc.replication.distribution.sourceTrailName, "") }
-  goldengate_replication_distribution_tgt_trail_raw = { for id, doc in local.goldengate_runtime_documents : id => try(doc.replication.distribution.targetTrailName, "") }
-  goldengate_replication_distribution_target_raw    = { for id, doc in local.goldengate_runtime_documents : id => try(doc.replication.distribution.targetDeployment, "") }
-  goldengate_replication_checkpoint_table_raw       = { for id, doc in local.goldengate_runtime_documents : id => try(doc.replication.checkpoint.table, "") }
 
   # EFS storage cardinality contract: one runtime deployment = one dedicated EFS filesystem, never one shared between source/target. Mirrors automation/goldengate-deployment-model.py's _parse_efs; never a second inventory implementation, only its Terraform-side precondition mirror.
   goldengate_persistence_declared = {
@@ -159,30 +104,6 @@ locals {
   goldengate_pipeline_names = sort(distinct([
     for id in local.goldengate_deployment_names : try(local.goldengate_enabled_deployments[id].deployment.pipeline, "")
   ]))
-
-  goldengate_replication_pipeline_members = {
-    for pipeline in local.goldengate_pipeline_names : pipeline => {
-      source_id = try([
-        for id in local.goldengate_deployment_names : id
-        if try(local.goldengate_enabled_deployments[id].deployment.pipeline, "") == pipeline
-        && try(local.goldengate_enabled_deployments[id].deployment.role, "") == "source"
-      ][0], "")
-      target_id = try([
-        for id in local.goldengate_deployment_names : id
-        if try(local.goldengate_enabled_deployments[id].deployment.pipeline, "") == pipeline
-        && try(local.goldengate_enabled_deployments[id].deployment.role, "") == "target"
-      ][0], "")
-    }
-  }
-
-  # Well-formed replication pipelines only: exactly one source and one target, both enabled+replicating; safe to index by source_id/target_id below.
-  goldengate_replication_pipelines_enabled = [
-    for pipeline in local.goldengate_pipeline_names : pipeline
-    if(
-      try(local.goldengate_replication_enabled_raw[local.goldengate_replication_pipeline_members[pipeline].source_id], false)
-      && try(local.goldengate_replication_enabled_raw[local.goldengate_replication_pipeline_members[pipeline].target_id], false)
-    )
-  ]
 
   goldengate_alb_group_order_by_enabled_id = {
     for id in local.goldengate_deployment_names : id => try(local.goldengate_enabled_deployments[id].ingress.alb.groupOrder, null)
@@ -308,138 +229,9 @@ resource "terraform_data" "goldengate_runtime_contract" {
       error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.enabled is no longer supported as a runtime presence control; use deployment.enabled only."
     }
     precondition {
-      condition = (
-        !local.goldengate_replication_declared[each.key]
-        || local.goldengate_replication_enabled_jsonenc[each.key] == "true"
-        || local.goldengate_replication_enabled_jsonenc[each.key] == "false"
-      )
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: replication.enabled must be a literal Boolean, not a Boolean-like string, when replication is present."
-    }
-    precondition {
-      # deployment.enabled is the single runtime-presence control -- replication can never be desired for a runtime that is itself not desired to exist.
-      condition = (
-        !local.goldengate_replication_enabled_raw[each.key]
-        || local.goldengate_enabled_jsonenc[each.key] == "true"
-      )
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: replication.enabled=true requires deployment.enabled=true."
-    }
-    precondition {
-      condition = (
-        !local.goldengate_replication_enabled_raw[each.key]
-        || contains(["source", "target"], local.goldengate_replication_role_raw[each.key])
-      )
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: replication.enabled=true requires deployment.role to be exactly \"source\" or \"target\"."
-    }
-    precondition {
-      condition = (
-        !local.goldengate_replication_enabled_raw[each.key]
-        || (
-          local.goldengate_replication_role_raw[each.key] == "source"
-          ? local.goldengate_deployment_type_raw[each.key] == "postgresql"
-          : local.goldengate_deployment_type_raw[each.key] == "mssql"
-        )
-      )
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: replication.enabled=true is only supported for a postgresql source paired with an mssql target."
-    }
-    precondition {
-      condition = (
-        !local.goldengate_replication_enabled_raw[each.key]
-        || local.goldengate_replication_role_raw[each.key] != "source"
-        || (
-          local.goldengate_replication_extract_enabled_jsonenc[each.key] == "true"
-          && local.goldengate_replication_distribution_enabled_jsonenc[each.key] == "true"
-          && local.goldengate_replication_checkpoint_enabled_jsonenc[each.key] == "false"
-          && local.goldengate_replication_replicat_enabled_jsonenc[each.key] == "false"
-        )
-      )
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: a replication-enabled source must have extract.enabled=true, distribution.enabled=true, checkpoint.enabled=false, replicat.enabled=false, all as literal Booleans."
-    }
-    precondition {
-      condition = (
-        !local.goldengate_replication_enabled_raw[each.key]
-        || local.goldengate_replication_role_raw[each.key] != "target"
-        || (
-          local.goldengate_replication_extract_enabled_jsonenc[each.key] == "false"
-          && local.goldengate_replication_distribution_enabled_jsonenc[each.key] == "false"
-          && local.goldengate_replication_checkpoint_enabled_jsonenc[each.key] == "true"
-          && local.goldengate_replication_replicat_enabled_jsonenc[each.key] == "true"
-        )
-      )
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: a replication-enabled target must have extract.enabled=false, distribution.enabled=false, checkpoint.enabled=true, replicat.enabled=true, all as literal Booleans."
-    }
-    precondition {
-      condition = (
-        !local.goldengate_replication_extract_enabled_raw[each.key]
-        || can(regex("^[A-Z][A-Z0-9_$]{0,7}$", local.goldengate_replication_extract_name_raw[each.key]))
-      )
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: replication.extract.name must be a valid Extract name (uppercase, max 8 characters)."
-    }
-    precondition {
-      condition = (
-        !local.goldengate_replication_extract_enabled_raw[each.key]
-        || can(regex("^[a-z][a-z0-9]$", local.goldengate_replication_extract_trail_raw[each.key]))
-      )
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: replication.extract.trail.name must be a valid two-character lowercase trail name."
-    }
-    precondition {
-      condition = (
-        !local.goldengate_replication_replicat_enabled_raw[each.key]
-        || can(regex("^[A-Z][A-Z0-9_$]{0,7}$", local.goldengate_replication_replicat_name_raw[each.key]))
-      )
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: replication.replicat.name must be a valid Replicat name (uppercase, max 8 characters)."
-    }
-    precondition {
-      condition = (
-        !local.goldengate_replication_replicat_enabled_raw[each.key]
-        || can(regex("^[a-z][a-z0-9]$", local.goldengate_replication_replicat_trail_raw[each.key]))
-      )
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: replication.replicat.sourceTrailName must be a valid two-character lowercase trail name."
-    }
-    precondition {
-      condition = (
-        !local.goldengate_replication_distribution_enabled_raw[each.key]
-        || can(regex("^[A-Za-z][A-Za-z0-9._-]{0,31}$", local.goldengate_replication_distribution_path_raw[each.key]))
-      )
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: replication.distribution.pathName must be a valid path name (1-32 characters)."
-    }
-    precondition {
-      condition = (
-        !local.goldengate_replication_distribution_enabled_raw[each.key]
-        || (
-          can(regex("^[a-z][a-z0-9]$", local.goldengate_replication_distribution_src_trail_raw[each.key]))
-          && can(regex("^[a-z][a-z0-9]$", local.goldengate_replication_distribution_tgt_trail_raw[each.key]))
-          && local.goldengate_replication_distribution_src_trail_raw[each.key] != local.goldengate_replication_distribution_tgt_trail_raw[each.key]
-        )
-      )
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: replication.distribution sourceTrailName/targetTrailName must be valid, non-colliding two-character trail names."
-    }
-    precondition {
-      condition = (
-        !local.goldengate_replication_checkpoint_enabled_raw[each.key]
-        || can(regex("^[A-Za-z_][A-Za-z0-9_]*\\.[A-Za-z_][A-Za-z0-9_]*$", local.goldengate_replication_checkpoint_table_raw[each.key]))
-      )
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: replication.checkpoint.table must be a safe schema.table identifier."
-    }
-    precondition {
-      condition = (
-        !local.goldengate_replication_extract_enabled_raw[each.key]
-        || contains(["true", "false"], local.goldengate_replication_extract_start_jsonenc[each.key])
-      )
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: replication.extract.startOnCreate must be a literal Boolean, not a Boolean-like string."
-    }
-    precondition {
-      condition = (
-        !local.goldengate_replication_distribution_enabled_raw[each.key]
-        || contains(["true", "false"], local.goldengate_replication_distribution_start_jsonenc[each.key])
-      )
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: replication.distribution.startOnCreate must be a literal Boolean, not a Boolean-like string."
-    }
-    precondition {
-      condition = (
-        !local.goldengate_replication_replicat_enabled_raw[each.key]
-        || contains(["true", "false"], local.goldengate_replication_replicat_start_jsonenc[each.key])
-      )
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: replication.replicat.startOnCreate must be a literal Boolean, not a Boolean-like string."
+      # Automated Replication Implementation Removal (Task 4): mirrors automation/goldengate-deployment-model.py's _reject_replication_key_presence() -- rejects the mere PRESENCE of a top-level `replication` key in ANY shape (null, {}, enabled:false, enabled:true), never merely a disallowed value inside it. Key-presence based, exactly like the lifecycle/root-enabled/runtime-enabled tombstone preconditions above -- a present `replication: null` key must still be rejected. GoldenGate database connections, credentials, Extract, trails, Distribution Path, and Replicat are configured manually by an operator/DBA through the GoldenGate UI after deployment; there is deliberately no replacement replication-shaped field, and this precondition never parses nested schema -- only presence.
+      condition     = !local.goldengate_replication_key_present[each.key]
+      error_message = "envs/${var.environment}/${each.key}/values.yaml: unsupported descriptor key: top-level replication automation has been retired; configure database connections and replication processes manually through the GoldenGate UI."
     }
     precondition {
       # Fresh-EKS Phase A/Phase 9: ingress.hostDomain/alb.groupName/alb.certificateArn are shared environment configuration, injected by the deploy workflow from envs/dev/environment.yaml -- forbid their reintroduction rather than requiring/validating a descriptor-owned copy. ingress.alb.groupOrder remains deployment-specific and stays required/validated below.
@@ -539,46 +331,6 @@ resource "terraform_data" "goldengate_cross_pipeline_contract" {
       error_message = "Two or more enabled GoldenGate deployments share the same ALB group order."
     }
     precondition {
-      condition = alltrue([
-        for pipeline in local.goldengate_pipeline_names : (
-          length([
-            for id in local.goldengate_deployment_names : id
-            if try(local.goldengate_enabled_deployments[id].deployment.pipeline, "") == pipeline
-            && local.goldengate_replication_enabled_raw[id]
-          ]) == 0
-          || (
-            try(local.goldengate_replication_enabled_raw[local.goldengate_replication_pipeline_members[pipeline].source_id], false)
-            && try(local.goldengate_replication_enabled_raw[local.goldengate_replication_pipeline_members[pipeline].target_id], false)
-          )
-        )
-      ])
-      error_message = "A pipeline with replication.enabled=true must have exactly one enabled source and one enabled target deployment, both with replication.enabled=true."
-    }
-    precondition {
-      condition = alltrue([
-        for pipeline in local.goldengate_replication_pipelines_enabled :
-        local.goldengate_replication_distribution_target_raw[local.goldengate_replication_pipeline_members[pipeline].source_id]
-        == local.goldengate_replication_pipeline_members[pipeline].target_id
-      ])
-      error_message = "replication.distribution.targetDeployment must equal the target deployment ID for its pipeline."
-    }
-    precondition {
-      condition = alltrue([
-        for pipeline in local.goldengate_replication_pipelines_enabled :
-        local.goldengate_replication_distribution_src_trail_raw[local.goldengate_replication_pipeline_members[pipeline].source_id]
-        == local.goldengate_replication_extract_trail_raw[local.goldengate_replication_pipeline_members[pipeline].source_id]
-      ])
-      error_message = "replication.distribution.sourceTrailName must equal replication.extract.trail.name for its pipeline."
-    }
-    precondition {
-      condition = alltrue([
-        for pipeline in local.goldengate_replication_pipelines_enabled :
-        local.goldengate_replication_distribution_tgt_trail_raw[local.goldengate_replication_pipeline_members[pipeline].source_id]
-        == local.goldengate_replication_replicat_trail_raw[local.goldengate_replication_pipeline_members[pipeline].target_id]
-      ])
-      error_message = "replication.distribution.targetTrailName must equal the target replication.replicat.sourceTrailName for its pipeline."
-    }
-    precondition {
       # Permanent, fresh-cluster architecture: the runtime trust subject must be EXACTLY the one canonical gg-runtime-sa identity -- no wildcard, no per-engine subject, no migration-compatibility entry. try() guards the [0] index: Terraform's && does not short-circuit evaluation errors, so an empty subjects list must not crash `terraform plan` with "Invalid index" -- it must fail this precondition instead.
       condition = (
         length(local.goldengate_secrets_trust_subjects) == 1
@@ -646,21 +398,5 @@ check "goldengate_managed_efs_creation_tokens_unique" {
       for id, v in local.goldengate_managed_efs_deployments : v.creation_token
     ]))
     error_message = "Two GoldenGate managed-EFS deployments derive the same EFS creation token -- storage identities must never collide."
-  }
-}
-
-check "goldengate_replication_pipelines_well_formed" {
-  assert {
-    condition = alltrue([
-      for pipeline in local.goldengate_pipeline_names : (
-        length([
-          for id in local.goldengate_deployment_names : id
-          if try(local.goldengate_enabled_deployments[id].deployment.pipeline, "") == pipeline
-          && local.goldengate_replication_enabled_raw[id]
-        ]) == 0
-        || contains(local.goldengate_replication_pipelines_enabled, pipeline)
-      )
-    ])
-    error_message = "A pipeline with replication.enabled=true must have exactly one enabled source and one enabled target deployment, both with replication.enabled=true."
   }
 }

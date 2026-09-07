@@ -312,43 +312,20 @@ jobs:
       result_phase_4_platform_observability: ${{ needs.phase_4_platform_observability.result }}
       result_validate_shared_secrets_once: ${{ needs.phase_4_platform_observability.outputs.validate_shared_secrets_once_result || needs.phase_4_platform_observability.result }}
 
-  phase_6_goldengate_replication:
-    name: "Phase 6 | GoldenGate Replication"
+  phase_6_monitor_final_acceptance:
+    name: Phase 6 | GoldenGate Monitor & Final Acceptance
 
-    # Phase 6 grouping: this single caller replaces the two Phase 6A-6B jobs previously defined directly in MAIN -- their exact behavior now lives, unchanged, inside .github/workflows/60-phase-goldengate-replication.yaml (the same high-level reusable-workflow presentation pattern MAIN's own Phase 3/Phase 4/Phase 5/Phase 7 groupings already use). needs exactly validate_model/phase_4_platform_observability/phase_5_goldengate_runtimes. if: is always() -- Phase 6 contains two mutually-exclusive mode paths (6A on Deploy, 6B on Validate); the wrapper itself must always be invoked after these external prerequisites conclude so its two internal jobs can independently apply their own existing mode/result gates. Gating the whole wrapper on effective_deploy either way would eliminate one of the two legitimate Phase 6 paths.
-    needs:
-      - validate_model
-      - phase_4_platform_observability
-      - phase_5_goldengate_runtimes
-    if: always()
-
-    uses: ./.github/workflows/60-phase-goldengate-replication.yaml
-    secrets: inherit
-    with:
-      selected_environment: ${{ needs.validate_model.outputs.selected_environment }}
-      effective_deploy: ${{ needs.validate_model.outputs.effective_deploy }}
-      has_active_deployments: ${{ needs.validate_model.outputs.has_active_deployments }}
-      result_phase_4_platform_observability: ${{ needs.phase_4_platform_observability.result }}
-      result_validate_shared_secrets_once: ${{ needs.phase_4_platform_observability.outputs.validate_shared_secrets_once_result || needs.phase_4_platform_observability.result }}
-      result_build_publish_and_deploy: ${{ needs.phase_5_goldengate_runtimes.outputs.build_publish_and_deploy_result || needs.phase_5_goldengate_runtimes.result }}
-      result_delete_removed_argocd_applications: ${{ needs.phase_5_goldengate_runtimes.outputs.delete_removed_argocd_applications_result || needs.phase_5_goldengate_runtimes.result }}
-      result_validate_active_runtimes: ${{ needs.phase_5_goldengate_runtimes.outputs.validate_active_runtimes_result || needs.phase_5_goldengate_runtimes.result }}
-
-  phase_7_monitor_final_acceptance:
-    name: Phase 7 | GoldenGate Monitor & Final Acceptance
-
-    # Phase 7 grouping: this single caller replaces the seven Phase 7A-7G jobs previously defined directly in MAIN -- their exact behavior now lives, unchanged, inside .github/workflows/70-phase-monitor-final-acceptance.yaml (the same high-level reusable-workflow presentation pattern Phase 2 already uses for terraform_sync_once -> 10-sub-iam-secrets.yaml). This job must depend on every external job whose .result the grouped Phase 7 workflow or its final_validation step needs -- a reusable workflow's own needs.* context sees only jobs INSIDE that workflow, so every one of these results is passed through explicitly as a workflow_call input below, never re-derived. Phase 3 grouping: validate_argocd_ready is replaced by phase_3_argocd here -- one dependency swapped, never dropped; the Phase 7 wrapper's own result_validate_argocd_ready input name is unchanged (see the with: block below for the exact fallback expression that preserves the old semantic result). Phase 4 grouping: validate_shared_secrets_once/validate_platform_ready/validate_observability_ready are replaced by the single phase_4_platform_observability dependency here -- three dependencies collapsed into one, never dropped; the Phase 7 wrapper's own result_validate_shared_secrets_once/result_validate_platform_ready/result_validate_observability_ready input names are unchanged (see the with: block below for the exact fallback expressions that preserve the old semantic results).
+    # Automated Replication Implementation Removal: this job was previously phase_7_monitor_final_acceptance calling .github/workflows/70-phase-monitor-final-acceptance.yaml -- renumbered down to Phase 6 (calling the renamed .github/workflows/60-phase-monitor-final-acceptance.yaml) to close the numbering gap left by the outright removal of phase_6_goldengate_replication (formerly .github/workflows/60-phase-goldengate-replication.yaml), which provisioned automated GoldenGate replication and no longer exists anywhere in this repository -- GoldenGate database connections, Extract, trails, Distribution Path, and Replicat are now configured manually by an operator/DBA through the GoldenGate UI after this pipeline completes. This job must depend on every external job whose .result the grouped Phase 6 workflow or its final_validation step needs -- a reusable workflow's own needs.* context sees only jobs INSIDE that workflow, so every one of these results is passed through explicitly as a workflow_call input below, never re-derived. Phase 3 grouping: validate_argocd_ready is replaced by phase_3_argocd here -- one dependency swapped, never dropped; the wrapper's own result_validate_argocd_ready input name is unchanged (see the with: block below for the exact fallback expression that preserves the old semantic result). Phase 4 grouping: validate_shared_secrets_once/validate_platform_ready/validate_observability_ready are replaced by the single phase_4_platform_observability dependency here -- three dependencies collapsed into one, never dropped; the wrapper's own result_validate_shared_secrets_once/result_validate_platform_ready/result_validate_observability_ready input names are unchanged (see the with: block below for the exact fallback expressions that preserve the old semantic results).
     needs:
       - validate_model
       - terraform_sync_once
       - phase_3_argocd
       - phase_4_platform_observability
       - phase_5_goldengate_runtimes
-      - phase_6_goldengate_replication
-    # GoldenGate Monitor MAIN DAG Skip-Propagation Correctness Fix, preserved across the reusable-workflow boundary: this if: must remain always() so the grouped Phase 7 workflow still executes when one of these external jobs legitimately SKIPPED/FAILED/CANCELLED, allowing Phase 7G's own fail-closed mode-aware final-validation contract to run and report the exact reason -- GitHub's implicit "all needs succeeded" default must never silently suppress the entire Phase 7 workflow. Phase 5 grouping: runtime_ownership_preflight/build_publish_and_deploy/delete_removed_argocd_applications/validate_active_runtimes are replaced by the single phase_5_goldengate_runtimes dependency here -- four dependencies collapsed into one, never dropped; the Phase 7 wrapper's own result_runtime_ownership_preflight/result_build_publish_and_deploy/result_delete_removed_argocd_applications/result_validate_active_runtimes input names are unchanged (see the with: block below for the exact fallback expressions that preserve the old semantic results). Phase 6 grouping: replication_reconcile_once/replication_dry_run_validation are replaced by the single phase_6_goldengate_replication dependency here -- two dependencies collapsed into one, never dropped; the Phase 7 wrapper's own result_replication_reconcile_once/result_replication_dry_run_validation input names are unchanged (see the with: block below for the exact fallback expressions that preserve the old semantic results).
+    # GoldenGate Monitor MAIN DAG Skip-Propagation Correctness Fix, preserved across the reusable-workflow boundary: this if: must remain always() so the grouped Phase 6 workflow still executes when one of these external jobs legitimately SKIPPED/FAILED/CANCELLED, allowing Phase 6F's own fail-closed mode-aware final-validation contract to run and report the exact reason -- GitHub's implicit "all needs succeeded" default must never silently suppress the entire Phase 6 workflow. Phase 5 grouping: runtime_ownership_preflight/build_publish_and_deploy/delete_removed_argocd_applications/validate_active_runtimes are replaced by the single phase_5_goldengate_runtimes dependency here -- four dependencies collapsed into one, never dropped; the wrapper's own result_runtime_ownership_preflight/result_build_publish_and_deploy/result_delete_removed_argocd_applications/result_validate_active_runtimes input names are unchanged (see the with: block below for the exact fallback expressions that preserve the old semantic results). Automated Replication Implementation Removal: this job no longer needs phase_6_goldengate_replication (deleted), and the wrapper's own result_replication_reconcile_once/result_replication_dry_run_validation inputs no longer exist -- neither is passed below.
     if: always()
 
-    uses: ./.github/workflows/70-phase-monitor-final-acceptance.yaml
+    uses: ./.github/workflows/60-phase-monitor-final-acceptance.yaml
     with:
       selected_environment: ${{ needs.validate_model.outputs.selected_environment }}
       effective_deploy: ${{ needs.validate_model.outputs.effective_deploy }}
@@ -369,6 +346,3 @@ jobs:
       result_build_publish_and_deploy: ${{ needs.phase_5_goldengate_runtimes.outputs.build_publish_and_deploy_result || needs.phase_5_goldengate_runtimes.result }}
       result_delete_removed_argocd_applications: ${{ needs.phase_5_goldengate_runtimes.outputs.delete_removed_argocd_applications_result || needs.phase_5_goldengate_runtimes.result }}
       result_validate_active_runtimes: ${{ needs.phase_5_goldengate_runtimes.outputs.validate_active_runtimes_result || needs.phase_5_goldengate_runtimes.result }}
-      # Phase 6 grouping: same fallback-OR pattern as result_validate_shared_secrets_once above, applied to the Phase 6A/6B internal results -- these Phase 7 wrapper input names are UNCHANGED even though the source jobs moved behind the Phase 6 wrapper.
-      result_replication_reconcile_once: ${{ needs.phase_6_goldengate_replication.outputs.replication_reconcile_once_result || needs.phase_6_goldengate_replication.result }}
-      result_replication_dry_run_validation: ${{ needs.phase_6_goldengate_replication.outputs.replication_dry_run_validation_result || needs.phase_6_goldengate_replication.result }}

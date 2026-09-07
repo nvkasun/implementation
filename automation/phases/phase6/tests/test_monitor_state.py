@@ -1,4 +1,4 @@
-"""Offline tests for automation/orchestration/monitor_state.py; run directly via `python3 automation/phases/phase7/tests/test_monitor_state.py`. No live Kubernetes -- every kubectl response is a fake, injected fixture. Exercises the classifier's actual logic (never merely greps its source)."""
+"""Offline tests for automation/orchestration/monitor_state.py; run directly via `python3 automation/phases/phase6/tests/test_monitor_state.py`. No live Kubernetes -- every kubectl response is a fake, injected fixture. Exercises the classifier's actual logic (never merely greps its source)."""
 from __future__ import annotations
 
 import importlib.util

@@ -1,4 +1,4 @@
-"""Offline tests for automation/orchestration/end_to_end_acceptance.py; run directly via `python3 automation/phases/phase7/tests/test_end_to_end_acceptance.py`. This classifier is pure/offline (no Kubernetes/AWS access at all) so tests call classify() directly with synthetic active-deployment lists and a synthetic captured /api/processes JSON document -- exactly the shape monitoring/monitor/monitor.py's build_processes_payload()/read_deployment_processes_view() actually produce. Exercises the classifier's actual logic (never merely greps its source)."""
+"""Offline tests for automation/orchestration/end_to_end_acceptance.py; run directly via `python3 automation/phases/phase6/tests/test_end_to_end_acceptance.py`. This classifier is pure/offline (no Kubernetes/AWS access at all) so tests call classify() directly with synthetic active-deployment lists and a synthetic captured /api/processes JSON document -- exactly the shape monitoring/monitor/monitor.py's build_processes_payload()/read_deployment_processes_view() actually produce. Exercises the classifier's actual logic (never merely greps its source). Automated Replication Implementation Removal: this file was previously automation/phases/phase7/tests/test_end_to_end_acceptance.py -- renumbered to Phase 6, and every fixture/test conditioned on replicationEnabled is retargeted to the single GENERIC manual-mode-aware discovery-status contract: no discovery yet (None/EMPTY, before an operator has configured anything through the GoldenGate UI) and healthy discovery (OK, once real processes are configured) are both HEALTHY for every active deployment regardless of role; PARTIAL/UNAVAILABLE/INVALID_RESPONSE discovery, and any stale/ABENDED/malformed process row, still fail closed."""
 from __future__ import annotations
 
 import importlib.util
@@ -25,23 +25,24 @@ SOURCE_ID = "gg-postgresql-repltest-01"
 TARGET_ID = "gg-mssql-repltest-01"
 
 
-def _active_deployments(source_replication=True, target_replication=True):
+def _active_deployments():
+    # Automated Replication Implementation Removal: load_active_deployments() no longer returns a replicationEnabled key -- only deploymentId/deploymentType.
     return [
-        {"deploymentId": SOURCE_ID, "deploymentType": "postgresql", "replicationEnabled": source_replication},
-        {"deploymentId": TARGET_ID, "deploymentType": "mssql", "replicationEnabled": target_replication},
+        {"deploymentId": SOURCE_ID, "deploymentType": "postgresql"},
+        {"deploymentId": TARGET_ID, "deploymentType": "mssql"},
     ]
 
 
-def _healthy_deployment_entry(name, deployment_type, replication_enabled, processes=None, discovery_status="OK"):
+def _healthy_deployment_entry(name, deployment_type, has_processes=True, processes=None, discovery_status="OK"):
     process_discovery = None
-    if replication_enabled or discovery_status is not None:
+    if has_processes or discovery_status is not None:
         process_discovery = {
             "status": discovery_status,
             "collectedAt": 1_700_000_000,
-            "extractCount": 1 if replication_enabled else 0,
+            "extractCount": 1 if has_processes else 0,
             "replicatCount": 0,
-            "distpathCount": 1 if replication_enabled else 0,
-            "totalCount": 2 if replication_enabled else 0,
+            "distpathCount": 1 if has_processes else 0,
+            "totalCount": 2 if has_processes else 0,
             "extractsStatus": "OK",
             "replicatsStatus": "OK",
             "sourcesStatus": "OK",
@@ -256,50 +257,49 @@ class EndToEndAcceptanceTests(unittest.TestCase):
         result = e2e.classify(ENVIRONMENT, _active_deployments(), doc)
         _assert_broken(self, result, "critical service(s) not reachable")
 
-    # 21. Non-replication deployment, processDiscovery.status=EMPTY -> HEALTHY (no replication process desired).
-    def test_21_non_replication_discovery_empty_is_healthy(self):
-        active = _active_deployments(source_replication=False, target_replication=False)
+    # Manual GoldenGate Operating Model (Automated Replication Implementation Removal): discovery-status acceptance is now GENERIC for every active deployment, regardless of role -- no branching on a retired replicationEnabled flag.
+
+    # 21. processDiscovery.status=EMPTY -> HEALTHY (no manual GoldenGate configuration yet).
+    def test_21_discovery_empty_is_healthy(self):
         doc = _healthy_api_doc()
         doc["deployments"][0]["processDiscovery"]["status"] = "EMPTY"
         doc["deployments"][1]["processDiscovery"]["status"] = "EMPTY"
-        result = e2e.classify(ENVIRONMENT, active, doc)
+        result = e2e.classify(ENVIRONMENT, _active_deployments(), doc)
         self.assertEqual(result["state"], e2e.STATE_HEALTHY, result["reasons"])
 
-    # 22. Non-replication deployment, processDiscovery=None (never reported) -> HEALTHY.
-    def test_22_non_replication_discovery_absent_is_healthy(self):
-        active = _active_deployments(source_replication=False, target_replication=False)
+    # 22. processDiscovery=None (never reported) -> HEALTHY.
+    def test_22_discovery_absent_is_healthy(self):
         doc = _healthy_api_doc()
         doc["deployments"][0]["processDiscovery"] = None
         doc["deployments"][1]["processDiscovery"] = None
-        result = e2e.classify(ENVIRONMENT, active, doc)
+        result = e2e.classify(ENVIRONMENT, _active_deployments(), doc)
         self.assertEqual(result["state"], e2e.STATE_HEALTHY, result["reasons"])
 
-    # 23. Non-replication deployment, processDiscovery.status=PARTIAL -> BROKEN (never PARTIAL/UNAVAILABLE/INVALID_RESPONSE).
-    def test_23_non_replication_discovery_partial_is_broken(self):
-        active = _active_deployments(source_replication=False, target_replication=False)
+    # 23. processDiscovery.status=PARTIAL -> BROKEN (never PARTIAL/UNAVAILABLE/INVALID_RESPONSE, for any deployment).
+    def test_23_discovery_partial_is_broken(self):
         doc = _healthy_api_doc()
         doc["deployments"][0]["processDiscovery"]["status"] = "PARTIAL"
-        result = e2e.classify(ENVIRONMENT, active, doc)
-        _assert_broken(self, result, "replication is not enabled but processDiscovery.status='PARTIAL'")
+        result = e2e.classify(ENVIRONMENT, _active_deployments(), doc)
+        _assert_broken(self, result, "processDiscovery.status='PARTIAL'")
 
-    # 24. Replication-enabled deployment, processDiscovery.status=OK -> HEALTHY.
-    def test_24_replication_enabled_discovery_ok_is_healthy(self):
+    # 24. processDiscovery.status=OK with healthy rows -> HEALTHY (an operator has manually configured real processes through the GoldenGate UI).
+    def test_24_discovery_ok_with_healthy_rows_is_healthy(self):
         result = e2e.classify(ENVIRONMENT, _active_deployments(), _healthy_api_doc())
         self.assertEqual(result["state"], e2e.STATE_HEALTHY, result["reasons"])
 
-    # 25. Replication-enabled deployment, processDiscovery.status=EMPTY (not OK) -> BROKEN.
-    def test_25_replication_enabled_discovery_empty_is_broken(self):
+    # 25. processDiscovery.status=UNAVAILABLE -> BROKEN.
+    def test_25_discovery_unavailable_is_broken(self):
         doc = _healthy_api_doc()
-        doc["deployments"][0]["processDiscovery"]["status"] = "EMPTY"
+        doc["deployments"][0]["processDiscovery"]["status"] = "UNAVAILABLE"
         result = e2e.classify(ENVIRONMENT, _active_deployments(), doc)
-        _assert_broken(self, result, "participates in enabled replication but processDiscovery.status='EMPTY'")
+        _assert_broken(self, result, "processDiscovery.status='UNAVAILABLE'")
 
-    # 26. Replication-enabled deployment, processDiscovery=None -> BROKEN.
-    def test_26_replication_enabled_discovery_absent_is_broken(self):
+    # 26. processDiscovery.status=INVALID_RESPONSE -> BROKEN.
+    def test_26_discovery_invalid_response_is_broken(self):
         doc = _healthy_api_doc()
-        doc["deployments"][0]["processDiscovery"] = None
+        doc["deployments"][0]["processDiscovery"]["status"] = "INVALID_RESPONSE"
         result = e2e.classify(ENVIRONMENT, _active_deployments(), doc)
-        _assert_broken(self, result, "processDiscovery.status=None")
+        _assert_broken(self, result, "processDiscovery.status='INVALID_RESPONSE'")
 
     # 27. Process row stale=true -> BROKEN.
     def test_27_process_row_stale_is_broken(self):
@@ -315,7 +315,7 @@ class EndToEndAcceptanceTests(unittest.TestCase):
         result = e2e.classify(ENVIRONMENT, _active_deployments(), doc)
         _assert_broken(self, result, "process 'EXT01': status=ABENDED")
 
-    # 29. Process row present, RUNNING, not stale -> HEALTHY (no requirement that every arbitrary row be RUNNING beyond this -- that's replication_monitor_acceptance's job).
+    # 29. Process row present, RUNNING, not stale -> HEALTHY (this classifier proves generic process safety, never exact desired-process conformance -- that remains an operator/DBA manual-configuration concern).
     def test_29_process_row_running_not_stale_is_healthy(self):
         doc = _healthy_api_doc()
         doc["deployments"][0]["processes"] = [{"process": "EXT01", "status": "RUNNING", "stale": False}]
@@ -340,14 +340,29 @@ class EndToEndAcceptanceTests(unittest.TestCase):
         finally:
             gdm._run_full_validation = original
 
+    def test_load_active_deployments_carries_no_replication_key(self):
+        # Automated Replication Implementation Removal: load_active_deployments() must never resurface a replicationEnabled (or replication) key.
+        gdm = e2e._load_deployment_model_module()
+        original_scan = gdm.scan
+        original_validate = gdm.validate
+        try:
+            fake_active = [{"deploymentId": SOURCE_ID, "deploymentType": "postgresql", "role": "source",
+                             "pipeline": "repltest-pg-to-mssql-001", "enabled": True}]
+            gdm.scan = lambda environment: (fake_active, [], [])
+            gdm.validate = lambda environment: []
+            result = e2e.load_active_deployments(ENVIRONMENT)
+        finally:
+            gdm.scan = original_scan
+            gdm.validate = original_validate
+        self.assertEqual(result, [{"deploymentId": SOURCE_ID, "deploymentType": "postgresql"}])
+        self.assertNotIn("replicationEnabled", result[0])
+        self.assertNotIn("replication", result[0])
+
 
 class MalformedSchemaFailClosedTests(unittest.TestCase):
     """Pre-VDR correction: automation/orchestration/end_to_end_acceptance.py previously fail-opened on malformed monitor API schema -- a non-dict processDiscovery silently became None, a non-list/falsey processes container silently became [], and an empty/malformed process row added no failure reason at all. These tests exercise the REAL classify() against the exact independently-reproduced malformed payload and its schema-validation edges -- never a re-implementation/mock of the classifier's own logic."""
 
-    def _active_non_replication_deployments(self):
-        return _active_deployments(source_replication=False, target_replication=False)
-
-    # A. Exact reproduction: the independent review's exact malformed payload against the current two real replication-disabled active deployments must be BROKEN, never HEALTHY.
+    # A. Exact reproduction: the independent review's exact malformed payload against the current two real active deployments must be BROKEN, never HEALTHY.
     def test_A_exact_reproduction_payload_is_broken_not_healthy(self):
         doc = {
             "generatedAt": 1_700_000_100,
@@ -378,7 +393,7 @@ class MalformedSchemaFailClosedTests(unittest.TestCase):
                 },
             ],
         }
-        result = e2e.classify(ENVIRONMENT, self._active_non_replication_deployments(), doc)
+        result = e2e.classify(ENVIRONMENT, _active_deployments(), doc)
         self.assertEqual(result["state"], e2e.STATE_BROKEN, "malformed monitor API payload must never be accepted as HEALTHY")
         self.assertNotEqual(result["reasons"], [])
 
@@ -388,16 +403,15 @@ class MalformedSchemaFailClosedTests(unittest.TestCase):
             with self.subTest(bad_value=bad_value):
                 doc = _healthy_api_doc()
                 doc["deployments"][0]["processDiscovery"] = bad_value
-                result = e2e.classify(ENVIRONMENT, self._active_non_replication_deployments(), doc)
+                result = e2e.classify(ENVIRONMENT, _active_deployments(), doc)
                 _assert_broken(self, result, "processDiscovery must be null or an object")
 
-    # C. a legitimately absent processDiscovery (None) for a replication-disabled deployment remains HEALTHY when everything else is healthy.
+    # C. a legitimately absent processDiscovery (None) remains HEALTHY when everything else is healthy.
     def test_C_legitimate_process_discovery_none_remains_healthy(self):
-        active = self._active_non_replication_deployments()
         doc = _healthy_api_doc()
         doc["deployments"][0]["processDiscovery"] = None
         doc["deployments"][1]["processDiscovery"] = None
-        result = e2e.classify(ENVIRONMENT, active, doc)
+        result = e2e.classify(ENVIRONMENT, _active_deployments(), doc)
         self.assertEqual(result["state"], e2e.STATE_HEALTHY, result["reasons"])
 
     # D. malformed/falsey processes containers must never be silently coerced into [].
@@ -497,18 +511,18 @@ class MalformedSchemaFailClosedTests(unittest.TestCase):
         result = e2e.classify(ENVIRONMENT, _active_deployments(), doc)
         self.assertEqual(result["state"], e2e.STATE_HEALTHY, result["reasons"])
 
-    # J. existing normal healthy payloads (both replication-enabled and replication-disabled) must remain HEALTHY -- positive control proving this correction is schema validation, not a new false positive.
+    # J. existing normal healthy payloads must remain HEALTHY -- positive control proving this correction is schema validation, not a new false positive.
     def test_J_existing_healthy_payload_remains_healthy(self):
         result = e2e.classify(ENVIRONMENT, _active_deployments(), _healthy_api_doc())
         self.assertEqual(result["state"], e2e.STATE_HEALTHY, result["reasons"])
 
-    def test_J_existing_healthy_non_replication_payload_remains_healthy(self):
-        active = self._active_non_replication_deployments()
+    def test_J_existing_healthy_no_manual_configuration_yet_payload_remains_healthy(self):
         doc = _healthy_api_doc()
         doc["deployments"][0]["processDiscovery"] = None
         doc["deployments"][1]["processDiscovery"] = None
-        doc["deployments"][0]["processes"] = [{"process": "EXT01", "status": "RUNNING", "stale": False}]
-        result = e2e.classify(ENVIRONMENT, active, doc)
+        doc["deployments"][0]["processes"] = []
+        doc["deployments"][1]["processes"] = []
+        result = e2e.classify(ENVIRONMENT, _active_deployments(), doc)
         self.assertEqual(result["state"], e2e.STATE_HEALTHY, result["reasons"])
 
 
