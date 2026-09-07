@@ -6854,20 +6854,81 @@ else
   fail "6: envs/dev/efs.tf references \"pipeline\" -- the module key must be derived from deployment ID alone"
 fi
 
-# Self-service: never a hardcoded exact inventory -- proves the live CANONICAL managed-EFS inventory is non-empty (list length >= 1) while also proving envs/dev/efs.tf's shared-SG data-source count no longer tracks that canonical count directly. Since local.goldengate_managed_efs_desired_deployments = canonical minus the explicit managed-EFS decommission allowlist, and today's live decommission set exactly equals the live canonical set (see the "Managed EFS decommission" checks above), the live SG lookup count actually evaluates to 0 even though the canonical inventory itself is non-empty -- this is the whole point of gating on desired rather than canonical (see the "EFS SG lookup lifecycle" checks above). The full dynamic-vs-derived semantic comparison lives in the "Self-service test architecture: generic descriptor invariants" section above; not duplicated here.
+# Final EFS architecture correction (independent review, Task 5): this block previously claimed today's live decommission set exactly equals the live canonical set, driving the shared-SG data-source count to 0 -- that claim went stale once the GoldenGate Runtime Presence Contract Finalization cleared both decommission holds (see the "Managed EFS decommission" checks above, and envs/dev/efs.tf's own locals block). Today goldengate_managed_efs_decommission_ids is the empty set, so the desired managed-EFS inventory equals the canonical managed-EFS inventory exactly, and the shared-SG data-source count conceptually evaluates to 1, not 0. This block re-derives that relationship dynamically from the live canonical inventory and the live envs/dev/efs.tf text -- never hardcoding an exact two-ID inventory as the general architecture invariant -- and separately re-proves that the STRONGER Automated Replication Implementation Removal decommission-safety precondition (decommission set must stay empty while manual GoldenGate state is opaque to Git) remains present and unweakened.
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   set +e
   LIVE_INVENTORY_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev managed-efs-inventory 2>&1)"
   LIVE_INVENTORY_STATUS=$?
   set -e
-  LIVE_INVENTORY_COUNT="$(python3 -c 'import json, sys; print(len(json.loads(sys.argv[1])))' "$LIVE_INVENTORY_OUT" 2>/dev/null || echo "-1")"
-  if [ "$LIVE_INVENTORY_STATUS" -eq 0 ] && [ "$LIVE_INVENTORY_COUNT" -ge 1 ]; then
-    pass "11: today's live dev CANONICAL managed-EFS inventory contains at least one managed deployment -- but every canonical entry is also in the explicit decommission set, so envs/dev/efs.tf's shared-SG data-source count (gated on desired, not canonical) evaluates to 0 today, not 1"
+  if [ "$LIVE_INVENTORY_STATUS" -eq 0 ]; then
+    EFS_DESIRED_RELATIONSHIP_CHECK="$(python3 - "$LIVE_INVENTORY_OUT" <<'PYEOF'
+import json
+import re
+import sys
+
+results = []
+
+
+def check(label, ok):
+    results.append((label, ok))
+
+
+raw = sys.argv[1]
+try:
+    canonical = json.loads(raw)
+except ValueError:
+    canonical = None
+
+check("1: the live canonical managed-EFS inventory is valid JSON", canonical is not None)
+canonical_ids = sorted(d["deploymentId"] for d in canonical) if canonical else []
+check("2: the live canonical managed-EFS inventory is non-empty", len(canonical_ids) >= 1)
+
+with open("envs/dev/efs.tf") as f:
+    efs_tf = f.read()
+
+ids_match = re.search(r'goldengate_managed_efs_decommission_ids\s*=\s*toset\(\[(.*?)\]\)', efs_tf, re.S)
+decommission_ids = sorted(re.findall(r'"([^"]+)"', ids_match.group(1))) if ids_match else None
+check("3: envs/dev/efs.tf declares goldengate_managed_efs_decommission_ids = toset([]) for today's steady state", decommission_ids == [])
+
+desired_ids = sorted(set(canonical_ids) - set(decommission_ids or []))
+check("4: today's desired managed-EFS deployment IDs equal the canonical managed-EFS deployment IDs, since the decommission set is empty", bool(canonical_ids) and desired_ids == canonical_ids)
+
+sg_match = re.search(r'data "aws_security_group" "goldengate_efs_shared" \{(.*?)\n\}', efs_tf, re.S)
+sg_body = sg_match.group(1) if sg_match else ""
+check("5: the shared EFS SG data source remains gated by length(local.goldengate_managed_efs_desired_deployments) > 0 ? 1 : 0", "count = length(local.goldengate_managed_efs_desired_deployments) > 0 ? 1 : 0" in sg_body)
+
+conceptual_sg_count = 1 if len(desired_ids) > 0 else 0
+check("6: because today's desired inventory is non-empty, the conceptual shared-SG lookup count is 1 today, not 0", conceptual_sg_count == 1)
+
+decommission_guard_present = "length(local.goldengate_managed_efs_decommission_ids) == 0" in efs_tf
+check("7: the stronger Automated Replication Implementation Removal decommission-safety precondition remains present -- the decommission set must stay empty while manual GoldenGate state is opaque to Git", decommission_guard_present)
+
+# Teeth: purely in-memory, never writes to envs/dev/efs.tf. Fails if the retired stale claim (every canonical entry is also in the decommission set) were ever true again while the decommission set is genuinely non-empty of canonical entries.
+synthetic_all_decommissioned = bool(canonical_ids) and set(canonical_ids) <= set(decommission_ids or [])
+check("8 (teeth): it is false that every canonical entry is also in the decommission set -- the retired stale claim would require this", not synthetic_all_decommissioned)
+
+# Teeth: fails if the SG gate expression stops depending on the desired-deployments local by name.
+check("9 (teeth): the SG data-source count expression still names goldengate_managed_efs_desired_deployments in its count gate", "goldengate_managed_efs_desired_deployments" in sg_body and "count" in sg_body)
+
+# Teeth: fails if desired inventory were ever empty while canonical is non-empty and decommission is empty -- exactly the regression this correction targets.
+synthetic_desired_wrongly_empty = bool(canonical_ids) and decommission_ids == [] and len(desired_ids) == 0
+check("10 (teeth): desired-EFS inventory is not incorrectly empty while canonical is non-empty and decommission is empty", not synthetic_desired_wrongly_empty)
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+    while IFS= read -r line; do
+      case "$line" in
+        FAIL\ *) fail "11: ${line#FAIL }" ;;
+        OK\ *) pass "11: ${line#OK }" ;;
+      esac
+    done <<< "$EFS_DESIRED_RELATIONSHIP_CHECK"
   else
-    fail "11: expected the live managed-efs-inventory to be valid JSON with at least one entry: ${LIVE_INVENTORY_OUT}"
+    fail "11: expected the live managed-efs-inventory command to succeed: ${LIVE_INVENTORY_OUT}"
   fi
 else
-  skip "11: live managed-efs-inventory check -- python3 unavailable"
+  skip "11: live managed-efs-inventory / desired-EFS relationship check -- python3 unavailable"
 fi
 
 if grep -qE '^\s*data\s+"aws_security_group"\s+"goldengate_efs_shared"' envs/dev/efs.tf 2>/dev/null; then
