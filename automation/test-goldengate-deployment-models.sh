@@ -6917,11 +6917,12 @@ def mask_hcl(text, mask_strings, mask_heredocs):
             i = min(i + 2, n)
             continue
         if c == "<" and i + 1 < n and text[i + 1] == "<":
-            m = re.match(r"<<-?([A-Za-z_][A-Za-z0-9_]*)", text[i:])
+            m = re.match(r"<<(-?)([A-Za-z_][A-Za-z0-9_]*)", text[i:])
             if m:
                 out.append(text[i:i + m.end()])
                 i += m.end()
-                terminator_re = re.compile(r"^[ \t]*" + re.escape(m.group(1)) + r"[ \t]*$")
+                terminator_indent = r"[ \t]*" if m.group(1) == "-" else ""
+                terminator_re = re.compile(r"^" + terminator_indent + re.escape(m.group(2)) + r"[ \t]*$")
                 while i < n:
                     line_end = text.find("\n", i)
                     end = line_end if line_end != -1 else n
@@ -6967,7 +6968,7 @@ def extract_brace_block(text, open_brace_index):
     return None
 
 
-# header_text keeps ordinary quoted-string content intact (needed to locate a block by its literal quoted type/name labels, and to read genuine quoted attribute values like the decommission-ids list) but blanks heredoc bodies so a decoy header-shaped string buried in a heredoc can never be found; code_text additionally blanks string content too, and is the ONLY text every structural/value regex and brace-depth call below is ever allowed to see.
+# header_text keeps ordinary quoted-string content intact (needed to locate a block by its literal quoted type/name labels) but blanks heredoc bodies so a decoy header-shaped string buried in a heredoc can never be found; code_text additionally blanks string content too, and is the ONLY text every structural/value regex and brace-depth call below is ever allowed to see.
 def find_named_block(header_text, code_text, header_pattern):
     m = re.search(header_pattern, header_text)
     if not m:
@@ -7004,8 +7005,9 @@ code_text = mask_hcl(efs_tf_raw, mask_strings=True, mask_heredocs=True)
 real_parse, real_parse_error = parse_desired_relationship(header_text, code_text)
 check("3: goldengate_managed_efs_desired_deployments is a real, ACTIVE for-comprehension over the canonical local preserving id => v and excluding via !contains(local.goldengate_managed_efs_decommission_ids, id), never text that exists only in a comment/string/heredoc (%s)" % (real_parse_error or "structurally proven"), real_parse is not None)
 
-ids_match = re.search(r'goldengate_managed_efs_decommission_ids\s*=\s*toset\(\[(.*?)\]\)', header_text, re.S)
-decommission_ids = sorted(re.findall(r'"([^"]+)"', ids_match.group(1))) if ids_match else None
+# Today's contract is exactly empty: retained quote delimiters in code_text keep even a masked string element from being mistaken for whitespace in the list.
+EMPTY_DECOMMISSION_RE = re.compile(r"^[ \t]*goldengate_managed_efs_decommission_ids[ \t]*=[ \t]*toset\(\s*\[\s*\]\s*\)[ \t]*$", re.MULTILINE)
+decommission_ids = [] if EMPTY_DECOMMISSION_RE.search(code_text) else None
 check("4: envs/dev/efs.tf declares goldengate_managed_efs_decommission_ids = toset([]) for today's steady state", decommission_ids == [])
 
 # Only asserted as a semantic consequence now that check 3 has structurally proven the real, active comprehension IS canonical-minus-decommission-by-contains -- never an independently test-derived tautology.
@@ -7095,6 +7097,20 @@ naive_header_match = re.search(r'resource\s+"terraform_data"\s+"goldengate_manag
 naive_block = extract_brace_block(teeth_18_raw, naive_header_match.start(1)) if naive_header_match else None
 naive_was_broken = naive_block is not None and naive_block != teeth_18_block
 check("18 (teeth): harmless braces inside a quoted string and a heredoc within the target block never corrupt real brace-depth extraction (a naive unmasked scan of the same fixture is demonstrably broken)", teeth_18_fixed_ok and naive_was_broken)
+
+# An ordinary string must never authorize an active non-empty decommission set.
+teeth_19_raw = 'locals {\n  decoy = "goldengate_managed_efs_decommission_ids = toset([])"\n  goldengate_managed_efs_decommission_ids = toset([\n    "real-id"\n  ])\n}\n'
+teeth_19_code = mask_hcl(teeth_19_raw, mask_strings=True, mask_heredocs=True)
+check("19 (teeth): an active non-empty decommission set plus an empty-set assignment only inside an ordinary quoted string is REJECTED", EMPTY_DECOMMISSION_RE.search(teeth_19_code) is None)
+
+# Standard heredocs require a terminator at column zero; the same indented line terminates <<- heredocs. Check both views and that active code resumes afterward.
+teeth_20_raw = 'locals {\n  decoy = <<EOT\n  EOT\ngoldengate_managed_efs_decommission_ids = toset([])\nEOT\n  goldengate_managed_efs_decommission_ids = toset(["real-id"])\n}\n'
+teeth_20_views = [mask_hcl(teeth_20_raw, mask_strings=flag, mask_heredocs=True) for flag in (False, True)]
+check("20 (teeth): standard <<EOT ignores an indented EOT body line and masks the following HCL decoy until the real column-zero EOT", all(EMPTY_DECOMMISSION_RE.search(view) is None and len(view) == len(teeth_20_raw) and 'goldengate_managed_efs_decommission_ids = toset([' in view for view in teeth_20_views))
+
+teeth_21_raw = 'locals {\n  decoy = <<-EOT\n    goldengate_managed_efs_decommission_ids = toset(["decoy-id"])\n  EOT\n  goldengate_managed_efs_decommission_ids = toset([])\n}\n'
+teeth_21_views = [mask_hcl(teeth_21_raw, mask_strings=flag, mask_heredocs=True) for flag in (False, True)]
+check("21 (teeth): indented <<-EOT recognizes an indented terminator and exposes the following active empty-set assignment while masking the body", all(EMPTY_DECOMMISSION_RE.search(view) is not None and len(view) == len(teeth_21_raw) and view.count('goldengate_managed_efs_decommission_ids') == 1 for view in teeth_21_views))
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
