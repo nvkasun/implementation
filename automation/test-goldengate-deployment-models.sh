@@ -6854,7 +6854,7 @@ else
   fail "6: envs/dev/efs.tf references \"pipeline\" -- the module key must be derived from deployment ID alone"
 fi
 
-# Final EFS architecture correction, second follow-up hardening (reviewer-found comment/string blindness): the prior structural parser matched RAW HCL text with regex, so a commented-out for-comprehension, a commented-out safety condition sitting beside an active `condition = false`, or a commented-out SG gate sitting beside an active canonical-local gate all still satisfied the assertions -- regex has no notion of "this text is inside a # comment". This version routes every check through strip_hcl_comments() below (a small quote-aware state machine, never a naive regex comment stripper that could corrupt a "#" or "//" appearing inside a quoted string) before any structural match or brace-depth extraction runs, so commented-out HCL can never satisfy an assertion, and proves it with in-memory-only reproductions of exactly the three cases the reviewer found (envs/dev/efs.tf itself is never written to).
+# Final EFS architecture correction, third follow-up hardening (reviewer-found string/heredoc blindness): the prior parser stripped comments before matching but still searched STRING CONTENT as if it were executable HCL, so an active `condition = false` sitting beside an error_message string that literally spells out the expected safety condition (or a `description` string spelling out the expected SG gate, or a real `{}` desired local sitting beside a <<EOT heredoc that spells out the expected comprehension) all still satisfied the assertions. This version routes every check through mask_hcl() below -- a lexical scanner distinguishing active code from comments, quoted-string content, and <<LABEL/<<-LABEL heredoc bodies -- producing two same-length, position-aligned views (header_text: comments/heredocs blanked, strings left intact, used only to locate real block headers and read genuine quoted attribute values; code_text: comments/heredocs/strings all blanked, used for every structural regex and all brace-depth counting) so text that exists only inside a string or heredoc can never satisfy a structural assertion, and proves it with in-memory-only reproductions of exactly the three cases the reviewer found plus a brace-depth-integrity proof (envs/dev/efs.tf itself is never written to).
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   set +e
   LIVE_INVENTORY_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev managed-efs-inventory 2>&1)"
@@ -6897,51 +6897,62 @@ canonical_ids = sorted(d["deploymentId"] for d in canonical) if canonical is not
 check("2: the live canonical managed-EFS inventory is non-empty", len(canonical_ids) >= 1)
 
 
-# Quote-aware HCL comment stripper: tracks whether the scan position is inside a double-quoted string so a "#" or "//" inside a string literal (e.g. a URL) is never mistaken for a comment start and never corrupts the string's own quoted content; handles "#" line comments, "//" line comments, and "/* */" block comments -- every structural check and brace-depth extraction below runs against this stripped text, never raw HCL text, so commented-out HCL can never satisfy an assertion (the reviewer-found gap this hardening closes).
-def strip_hcl_comments(text):
+# Lexical scanner distinguishing active HCL code from # / // / /* */ comments, double-quoted strings (backslash-escape aware), and <<LABEL / <<-LABEL heredoc bodies; comments are always blanked, strings/heredoc bodies are blanked only when the matching flag is set. Every masked character becomes a single space (never deleted) and every real newline stays a real newline at the same relative line position, so header_text and code_text (below) are always the same length and position-aligned, and line-anchored regexes/brace-depth counting never see a keyword or brace that exists only inside non-code text.
+def mask_hcl(text, mask_strings, mask_heredocs):
     out = []
     i = 0
     n = len(text)
-    in_string = False
     while i < n:
         c = text[i]
-        if in_string:
-            if c == "\\" and i + 1 < n:
-                out.append(c)
-                out.append(text[i + 1])
-                i += 2
-                continue
-            out.append(c)
-            if c == '"':
-                in_string = False
-            i += 1
-            continue
-        if c == '"':
-            in_string = True
-            out.append(c)
-            i += 1
-            continue
-        if c == "#":
-            while i < n and text[i] != "\n":
-                i += 1
-            continue
-        if c == "/" and i + 1 < n and text[i + 1] == "/":
+        if c == "#" or (c == "/" and i + 1 < n and text[i + 1] == "/"):
             while i < n and text[i] != "\n":
                 i += 1
             continue
         if c == "/" and i + 1 < n and text[i + 1] == "*":
             i += 2
-            while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+            while i < n and text[i:i + 2] != "*/":
+                if text[i] == "\n":
+                    out.append("\n")
                 i += 1
             i = min(i + 2, n)
+            continue
+        if c == "<" and i + 1 < n and text[i + 1] == "<":
+            m = re.match(r"<<-?([A-Za-z_][A-Za-z0-9_]*)", text[i:])
+            if m:
+                out.append(text[i:i + m.end()])
+                i += m.end()
+                terminator_re = re.compile(r"^[ \t]*" + re.escape(m.group(1)) + r"[ \t]*$")
+                while i < n:
+                    line_end = text.find("\n", i)
+                    end = line_end if line_end != -1 else n
+                    line = text[i:end]
+                    if terminator_re.match(line):
+                        out.append(line)
+                        i = end
+                        break
+                    out.append((" " * len(line)) if mask_heredocs else line)
+                    i = end
+                    if i < n:
+                        out.append("\n")
+                        i += 1
+                continue
+        if c == '"':
+            out.append('"')
+            i += 1
+            while i < n and text[i] != '"':
+                if text[i] == "\\" and i + 1 < n:
+                    out.append((" " if mask_strings else text[i]) + (" " if mask_strings else text[i + 1]))
+                    i += 2
+                    continue
+                out.append("\n" if text[i] == "\n" else (" " if mask_strings else text[i]))
+                i += 1
+            if i < n:
+                out.append('"')
+                i += 1
             continue
         out.append(c)
         i += 1
     return "".join(out)
-
-
-with open("envs/dev/efs.tf") as f:
-    efs_tf = strip_hcl_comments(f.read())
 
 
 def extract_brace_block(text, open_brace_index):
@@ -6956,25 +6967,26 @@ def extract_brace_block(text, open_brace_index):
     return None
 
 
-def find_named_block(text, header_pattern):
-    m = re.search(header_pattern, text)
+# header_text keeps ordinary quoted-string content intact (needed to locate a block by its literal quoted type/name labels, and to read genuine quoted attribute values like the decommission-ids list) but blanks heredoc bodies so a decoy header-shaped string buried in a heredoc can never be found; code_text additionally blanks string content too, and is the ONLY text every structural/value regex and brace-depth call below is ever allowed to see.
+def find_named_block(header_text, code_text, header_pattern):
+    m = re.search(header_pattern, header_text)
     if not m:
         return None
-    return extract_brace_block(text, m.start(1))
+    return extract_brace_block(code_text, m.start(1))
 
 
-# Parses the REAL goldengate_managed_efs_desired_deployments for-comprehension text and proves, structurally, that it iterates the canonical local while preserving the id/value mapping (never a hardcoded/renamed map) and excludes members of the decommission set by name (never a different or missing predicate); returns (parsed-info, None) on a genuine structural match, or (None, reason) otherwise -- callers must never assume the semantic relationship holds unless this returns non-None, so a mutated/broken/commented-out local fails closed here. The caller must always pass comment-stripped text -- this function performs no stripping of its own.
-def parse_desired_relationship(text):
-    block = find_named_block(text, r"goldengate_managed_efs_desired_deployments\s*=\s*(\{)")
+# Parses the REAL goldengate_managed_efs_desired_deployments for-comprehension text and proves, structurally, that it iterates the canonical local while preserving the id/value mapping (never a hardcoded/renamed map) and excludes members of the decommission set by name (never a different or missing predicate), matching only ACTIVE, line-anchored code inside code_text -- never text that exists only in a comment, string, or heredoc; returns (parsed-info, None) on a genuine structural match, or (None, reason) otherwise, so a mutated/broken/commented-out/string-quoted/heredoc-quoted local fails closed here.
+def parse_desired_relationship(header_text, code_text):
+    block = find_named_block(header_text, code_text, r"goldengate_managed_efs_desired_deployments\s*=\s*(\{)")
     if block is None:
-        return None, "goldengate_managed_efs_desired_deployments block not found"
-    for_match = re.search(r"for\s+(\w+)\s*,\s*(\w+)\s+in\s+local\.(\w+)\s*:\s*\1\s*=>\s*\2\b", block)
+        return None, "goldengate_managed_efs_desired_deployments block not found (or only present in a string/heredoc/comment)"
+    for_match = re.search(r"^[ \t]*for\s+(\w+)\s*,\s*(\w+)\s+in\s+local\.(\w+)\s*:\s*\1\s*=>\s*\2[ \t]*$", block, re.MULTILINE)
     if not for_match:
-        return None, "no \"for id, v in local.<source> : id => v\" comprehension found -- value mapping not structurally proven"
+        return None, "no active \"for id, v in local.<source> : id => v\" comprehension found -- value mapping not structurally proven"
     id_var, source_local = for_match.group(1), for_match.group(3)
-    filter_match = re.search(r"if\s+!contains\(local\.(\w+)\s*,\s*" + re.escape(id_var) + r"\)", block)
+    filter_match = re.search(r"^[ \t]*if\s+!contains\(local\.(\w+)\s*,\s*" + re.escape(id_var) + r"\)[ \t]*$", block, re.MULTILINE)
     if not filter_match:
-        return None, "no \"if !contains(local.<decommission_set>, %s)\" exclusion filter found" % id_var
+        return None, "no active \"if !contains(local.<decommission_set>, %s)\" exclusion filter found" % id_var
     filter_local = filter_match.group(1)
     if source_local != "goldengate_managed_efs_deployments":
         return None, "comprehension iterates local.%s, not the canonical local.goldengate_managed_efs_deployments" % source_local
@@ -6983,68 +6995,106 @@ def parse_desired_relationship(text):
     return {"block": block, "source_local": source_local, "filter_local": filter_local}, None
 
 
-real_parse, real_parse_error = parse_desired_relationship(efs_tf)
-check("3: goldengate_managed_efs_desired_deployments is a real (non-commented-out) for-comprehension over the canonical local preserving id => v and excluding via !contains(local.goldengate_managed_efs_decommission_ids, id) (%s)" % (real_parse_error or "structurally proven"), real_parse is not None)
+with open("envs/dev/efs.tf") as f:
+    efs_tf_raw = f.read()
 
-ids_match = re.search(r'goldengate_managed_efs_decommission_ids\s*=\s*toset\(\[(.*?)\]\)', efs_tf, re.S)
+header_text = mask_hcl(efs_tf_raw, mask_strings=False, mask_heredocs=True)
+code_text = mask_hcl(efs_tf_raw, mask_strings=True, mask_heredocs=True)
+
+real_parse, real_parse_error = parse_desired_relationship(header_text, code_text)
+check("3: goldengate_managed_efs_desired_deployments is a real, ACTIVE for-comprehension over the canonical local preserving id => v and excluding via !contains(local.goldengate_managed_efs_decommission_ids, id), never text that exists only in a comment/string/heredoc (%s)" % (real_parse_error or "structurally proven"), real_parse is not None)
+
+ids_match = re.search(r'goldengate_managed_efs_decommission_ids\s*=\s*toset\(\[(.*?)\]\)', header_text, re.S)
 decommission_ids = sorted(re.findall(r'"([^"]+)"', ids_match.group(1))) if ids_match else None
 check("4: envs/dev/efs.tf declares goldengate_managed_efs_decommission_ids = toset([]) for today's steady state", decommission_ids == [])
 
-# Only asserted as a semantic consequence now that check 3 has structurally proven the real (non-commented-out) comprehension IS canonical-minus-decommission-by-contains -- never an independently test-derived tautology.
+# Only asserted as a semantic consequence now that check 3 has structurally proven the real, active comprehension IS canonical-minus-decommission-by-contains -- never an independently test-derived tautology.
 desired_ids = sorted(set(canonical_ids) - set(decommission_ids or [])) if (real_parse is not None and canonical is not None and decommission_ids is not None) else []
 check("5: today's desired managed-EFS deployment IDs equal the canonical managed-EFS deployment IDs, since the parsed production comprehension excludes only the (empty) decommission set", bool(canonical_ids) and real_parse is not None and desired_ids == canonical_ids)
 
-sg_match = re.search(r'data "aws_security_group" "goldengate_efs_shared" \{(.*?)\n\}', efs_tf, re.S)
-sg_body = sg_match.group(1) if sg_match else ""
+SG_GATE_RE = re.compile(r"^[ \t]*count[ \t]*=[ \t]*length\(local\.goldengate_managed_efs_desired_deployments\)[ \t]*>[ \t]*0[ \t]*\?[ \t]*1[ \t]*:[ \t]*0[ \t]*$", re.MULTILINE)
 SG_GATE_TEXT = "count = length(local.goldengate_managed_efs_desired_deployments) > 0 ? 1 : 0"
-check("6: the shared EFS SG data source remains gated by the exact production expression, active (not commented-out): %s" % SG_GATE_TEXT, SG_GATE_TEXT in sg_body)
+sg_block = find_named_block(header_text, code_text, r'data\s+"aws_security_group"\s+"goldengate_efs_shared"\s*(\{)')
+sg_body = sg_block[1:-1] if sg_block else ""
+check("6: the shared EFS SG data source remains gated by an ACTIVE, line-anchored production expression, never text present only in a string/heredoc: %s" % SG_GATE_TEXT, SG_GATE_RE.search(sg_body) is not None)
 
 conceptual_sg_count = 1 if len(desired_ids) > 0 else 0
 check("7: because today's desired inventory is non-empty, the conceptual shared-SG lookup count is 1 today, not 0", conceptual_sg_count == 1)
 
-# Anchored to an actual, active (not commented-out) `condition = ...` line inside terraform_data.goldengate_managed_efs_decommission_contract's own lifecycle block -- never a bare file-wide text search that a matching phrase in an unrelated or commented-out line could satisfy.
-contract_block = find_named_block(efs_tf, r'resource\s+"terraform_data"\s+"goldengate_managed_efs_decommission_contract"\s*(\{)')
-decommission_guard_present = bool(contract_block) and re.search(r"condition\s*=\s*length\(local\.goldengate_managed_efs_decommission_ids\)\s*==\s*0", contract_block) is not None
-check("8: the stronger Automated Replication Implementation Removal decommission-safety precondition is an actual, active condition inside terraform_data.goldengate_managed_efs_decommission_contract's lifecycle block, never a file-wide or commented-out match", decommission_guard_present)
+CONDITION_RE = re.compile(r"^[ \t]*condition[ \t]*=[ \t]*length\(local\.goldengate_managed_efs_decommission_ids\)[ \t]*==[ \t]*0[ \t]*$", re.MULTILINE)
+# Anchored to an actual, ACTIVE, line-anchored `condition = ...` attribute inside terraform_data.goldengate_managed_efs_decommission_contract's own lifecycle block -- never a bare substring search that a matching phrase in a comment, error_message string, or description string could satisfy.
+contract_block = find_named_block(header_text, code_text, r'resource\s+"terraform_data"\s+"goldengate_managed_efs_decommission_contract"\s*(\{)')
+decommission_guard_present = bool(contract_block) and CONDITION_RE.search(contract_block) is not None
+check("8: the stronger Automated Replication Implementation Removal decommission-safety precondition is an actual, ACTIVE condition attribute inside terraform_data.goldengate_managed_efs_decommission_contract's lifecycle block, never a comment/string/heredoc match", decommission_guard_present)
 
 # --- Negative/teeth proof: every mutation below is an in-memory string transform -- envs/dev/efs.tf itself is never opened for writing and is never mutated. ---
 
-# Teeth A: the exact prior reviewer-found regression -- hardcode the desired local to {} while canonical stays non-empty and decommission stays empty.
+
+def mutate_and_reparse(old_block_text, new_block_text):
+    if not old_block_text:
+        return None, "no real block to mutate"
+    return parse_desired_relationship(header_text.replace(old_block_text, new_block_text, 1), code_text.replace(old_block_text, new_block_text, 1))
+
+
+# Teeth A: the exact original reviewer-found regression -- hardcode the desired local to {} while canonical stays non-empty and decommission stays empty.
 desired_block_real = real_parse["block"] if real_parse is not None else None
-mutated_empty = efs_tf.replace(desired_block_real, "{}", 1) if desired_block_real else efs_tf
-mutated_empty_parse, _ = parse_desired_relationship(mutated_empty)
+mutated_empty_parse, _ = mutate_and_reparse(desired_block_real, "{}")
 check("9 (teeth): mutating goldengate_managed_efs_desired_deployments to a hardcoded {} is REJECTED by the structural parser", mutated_empty_parse is None)
 
 # Teeth B: remove/bypass the decommission exclusion filter, keeping the for-comprehension otherwise intact.
 mutated_no_filter_block = re.sub(r"\n[ \t]*if\s+!contains\([^\n]*\)\s*", "\n", desired_block_real, count=1) if desired_block_real else None
-mutated_no_filter = efs_tf.replace(desired_block_real, mutated_no_filter_block, 1) if (desired_block_real and mutated_no_filter_block and mutated_no_filter_block != desired_block_real) else efs_tf
-mutated_no_filter_parse, _ = parse_desired_relationship(mutated_no_filter)
+if desired_block_real and mutated_no_filter_block and mutated_no_filter_block != desired_block_real:
+    mutated_no_filter_parse, _ = mutate_and_reparse(desired_block_real, mutated_no_filter_block)
+else:
+    mutated_no_filter_parse = None
 check("10 (teeth): removing the if !contains(...) exclusion filter from goldengate_managed_efs_desired_deployments is REJECTED by the structural parser", mutated_no_filter_parse is None)
 
 # Teeth C: mutate the SG data-source count gate to reference the canonical local instead of the desired local.
-mutated_sg_canonical = sg_body.replace(
-    "count = length(local.goldengate_managed_efs_desired_deployments) > 0 ? 1 : 0",
-    "count = length(local.goldengate_managed_efs_deployments) > 0 ? 1 : 0",
-    1,
-)
-check("11 (teeth): mutating the SG count gate to reference the canonical (not desired) local is REJECTED by the exact-gate-text assertion", SG_GATE_TEXT not in mutated_sg_canonical)
+mutated_sg_body = sg_body.replace("count = length(local.goldengate_managed_efs_desired_deployments) > 0 ? 1 : 0", "count = length(local.goldengate_managed_efs_deployments) > 0 ? 1 : 0", 1)
+check("11 (teeth): mutating the SG count gate to reference the canonical (not desired) local is REJECTED by the anchored-gate assertion", SG_GATE_RE.search(mutated_sg_body) is None)
 
-# Teeth D (reviewer reproduction 1): the desired local's for-comprehension is commented out entirely -- the raw text below still LOOKS like it contains the expected comprehension to a naive regex, but strip_hcl_comments() must remove both "#" lines before parse_desired_relationship() ever sees them.
+# Teeth D (prior reviewer repro 1): the desired local's for-comprehension is entirely commented out.
 teeth_d_raw = "resource \"dummy\" \"dummy\" {\n  goldengate_managed_efs_desired_deployments = {\n    # for id, v in local.goldengate_managed_efs_deployments : id => v\n    # if !contains(local.goldengate_managed_efs_decommission_ids, id)\n  }\n}\n"
-teeth_d_parse, _ = parse_desired_relationship(strip_hcl_comments(teeth_d_raw))
-check("12 (teeth, reviewer repro 1): a desired local whose for-comprehension is entirely commented out is REJECTED after comment-stripping", teeth_d_parse is None)
+teeth_d_parse, _ = parse_desired_relationship(mask_hcl(teeth_d_raw, mask_strings=False, mask_heredocs=True), mask_hcl(teeth_d_raw, mask_strings=True, mask_heredocs=True))
+check("12 (teeth, prior repro 1): a desired local whose for-comprehension is entirely commented out is REJECTED", teeth_d_parse is None)
 
-# Teeth E (reviewer reproduction 2): an active `condition = false` sits beside the expected safety condition, which is present only as a trailing comment.
+# Teeth E (prior reviewer repro 2): an active condition = false sits beside the expected safety condition, present only as a trailing # comment.
 teeth_e_raw = "resource \"terraform_data\" \"goldengate_managed_efs_decommission_contract\" {\n  lifecycle {\n    precondition {\n      condition     = false\n      # condition = length(local.goldengate_managed_efs_decommission_ids) == 0\n      error_message = \"x\"\n    }\n  }\n}\n"
-teeth_e_block = find_named_block(strip_hcl_comments(teeth_e_raw), r'resource\s+"terraform_data"\s+"goldengate_managed_efs_decommission_contract"\s*(\{)')
-teeth_e_guard_present = bool(teeth_e_block) and re.search(r"condition\s*=\s*length\(local\.goldengate_managed_efs_decommission_ids\)\s*==\s*0", teeth_e_block) is not None
-check("13 (teeth, reviewer repro 2): an active condition = false plus the expected safety condition present only in a comment is REJECTED after comment-stripping", not teeth_e_guard_present)
+teeth_e_block = find_named_block(mask_hcl(teeth_e_raw, mask_strings=False, mask_heredocs=True), mask_hcl(teeth_e_raw, mask_strings=True, mask_heredocs=True), r'resource\s+"terraform_data"\s+"goldengate_managed_efs_decommission_contract"\s*(\{)')
+check("13 (teeth, prior repro 2): an active condition = false plus the expected safety condition present only in a # comment is REJECTED", not (bool(teeth_e_block) and CONDITION_RE.search(teeth_e_block) is not None))
 
-# Teeth F (reviewer reproduction 3): the SG data source's canonical-local gate is active while the expected desired-local gate is present only as a leading comment.
+# Teeth F (prior reviewer repro 3): the SG data source's canonical-local gate is active while the expected desired-local gate is present only as a leading # comment.
 teeth_f_raw = "data \"aws_security_group\" \"goldengate_efs_shared\" {\n  # count = length(local.goldengate_managed_efs_desired_deployments) > 0 ? 1 : 0\n  count = length(local.goldengate_managed_efs_deployments) > 0 ? 1 : 0\n}\n"
-teeth_f_sg_match = re.search(r'data "aws_security_group" "goldengate_efs_shared" \{(.*?)\n\}', strip_hcl_comments(teeth_f_raw), re.S)
-teeth_f_sg_body = teeth_f_sg_match.group(1) if teeth_f_sg_match else ""
-check("14 (teeth, reviewer repro 3): an active canonical-local SG gate plus the expected desired-local gate present only in a comment is REJECTED after comment-stripping", SG_GATE_TEXT not in teeth_f_sg_body)
+teeth_f_block = find_named_block(mask_hcl(teeth_f_raw, mask_strings=False, mask_heredocs=True), mask_hcl(teeth_f_raw, mask_strings=True, mask_heredocs=True), r'data\s+"aws_security_group"\s+"goldengate_efs_shared"\s*(\{)')
+teeth_f_body = teeth_f_block[1:-1] if teeth_f_block else ""
+check("14 (teeth, prior repro 3): an active canonical-local SG gate plus the expected desired-local gate present only in a # comment is REJECTED", SG_GATE_RE.search(teeth_f_body) is None)
+
+# Teeth 15 (this reviewer repro 1): an active condition = false sits beside the expected safety condition text, present only inside an ORDINARY quoted error_message string, not a comment.
+teeth_15_raw = "resource \"terraform_data\" \"goldengate_managed_efs_decommission_contract\" {\n  lifecycle {\n    precondition {\n      condition = false\n\n      error_message = \"condition = length(local.goldengate_managed_efs_decommission_ids) == 0\"\n    }\n  }\n}\n"
+teeth_15_block = find_named_block(mask_hcl(teeth_15_raw, mask_strings=False, mask_heredocs=True), mask_hcl(teeth_15_raw, mask_strings=True, mask_heredocs=True), r'resource\s+"terraform_data"\s+"goldengate_managed_efs_decommission_contract"\s*(\{)')
+check("15 (teeth, reviewer repro 1): an active condition = false plus the expected safety condition present only inside a quoted error_message string is REJECTED", not (bool(teeth_15_block) and CONDITION_RE.search(teeth_15_block) is not None))
+
+# Teeth 16 (this reviewer repro 2): an active canonical-local count gate sits beside the expected desired-local gate text, present only inside an ORDINARY quoted description string.
+teeth_16_raw = "data \"aws_security_group\" \"goldengate_efs_shared\" {\n  count = length(local.goldengate_managed_efs_deployments) > 0 ? 1 : 0\n\n  description = \"count = length(local.goldengate_managed_efs_desired_deployments) > 0 ? 1 : 0\"\n}\n"
+teeth_16_block = find_named_block(mask_hcl(teeth_16_raw, mask_strings=False, mask_heredocs=True), mask_hcl(teeth_16_raw, mask_strings=True, mask_heredocs=True), r'data\s+"aws_security_group"\s+"goldengate_efs_shared"\s*(\{)')
+teeth_16_body = teeth_16_block[1:-1] if teeth_16_block else ""
+check("16 (teeth, reviewer repro 2): an active canonical-local SG gate plus the expected desired-local gate present only inside a quoted description string is REJECTED", SG_GATE_RE.search(teeth_16_body) is None)
+
+# Teeth 17 (this reviewer repro 3): the real desired local is a hardcoded {} while the correct comprehension exists only inside a <<EOT heredoc string value.
+teeth_17_raw = "locals {\n  decoy = <<EOT\ngoldengate_managed_efs_desired_deployments = {\n  for id, v in local.goldengate_managed_efs_deployments : id => v\n  if !contains(local.goldengate_managed_efs_decommission_ids, id)\n}\nEOT\n\n  goldengate_managed_efs_desired_deployments = {}\n}\n"
+teeth_17_parse, _ = parse_desired_relationship(mask_hcl(teeth_17_raw, mask_strings=False, mask_heredocs=True), mask_hcl(teeth_17_raw, mask_strings=True, mask_heredocs=True))
+check("17 (teeth, reviewer repro 3): a hardcoded {} desired local while the correct comprehension exists only inside a <<EOT heredoc is REJECTED", teeth_17_parse is None)
+
+# Teeth 18: brace-depth integrity -- harmless { and } characters inside an ordinary string and inside a <<EOT heredoc, both within the target resource block, must never corrupt real block extraction; demonstrated as a before/after so the fix (not merely this one fixture) is what is being proven.
+teeth_18_raw = "resource \"terraform_data\" \"goldengate_managed_efs_decommission_contract\" {\n  input = \"{ not a real brace } another } {\"\n  decoy = <<EOT\n{ fake closing brace }\nEOT\n  lifecycle {\n    precondition {\n      condition = length(local.goldengate_managed_efs_decommission_ids) == 0\n      error_message = \"ok\"\n    }\n  }\n}\n"
+teeth_18_header = mask_hcl(teeth_18_raw, mask_strings=False, mask_heredocs=True)
+teeth_18_code = mask_hcl(teeth_18_raw, mask_strings=True, mask_heredocs=True)
+teeth_18_block = find_named_block(teeth_18_header, teeth_18_code, r'resource\s+"terraform_data"\s+"goldengate_managed_efs_decommission_contract"\s*(\{)')
+teeth_18_fixed_ok = bool(teeth_18_block) and CONDITION_RE.search(teeth_18_block) is not None and teeth_18_block.count("{") == teeth_18_block.count("}")
+naive_header_match = re.search(r'resource\s+"terraform_data"\s+"goldengate_managed_efs_decommission_contract"\s*(\{)', teeth_18_raw)
+naive_block = extract_brace_block(teeth_18_raw, naive_header_match.start(1)) if naive_header_match else None
+naive_was_broken = naive_block is not None and naive_block != teeth_18_block
+check("18 (teeth): harmless braces inside a quoted string and a heredoc within the target block never corrupt real brace-depth extraction (a naive unmasked scan of the same fixture is demonstrably broken)", teeth_18_fixed_ok and naive_was_broken)
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
@@ -7052,15 +7102,15 @@ PYEOF
 )"
     while IFS= read -r line; do
       case "$line" in
-        FAIL\ *) fail "13: ${line#FAIL }" ;;
-        OK\ *) pass "13: ${line#OK }" ;;
+        FAIL\ *) fail "14: ${line#FAIL }" ;;
+        OK\ *) pass "14: ${line#OK }" ;;
       esac
     done <<< "$EFS_DESIRED_RELATIONSHIP_CHECK"
   else
-    fail "13: expected the live managed-efs-inventory command to succeed: ${LIVE_INVENTORY_OUT}"
+    fail "14: expected the live managed-efs-inventory command to succeed: ${LIVE_INVENTORY_OUT}"
   fi
 else
-  skip "13: live managed-efs-inventory / desired-EFS relationship check -- python3 unavailable"
+  skip "14: live managed-efs-inventory / desired-EFS relationship check -- python3 unavailable"
 fi
 
 if grep -qE '^\s*data\s+"aws_security_group"\s+"goldengate_efs_shared"' envs/dev/efs.tf 2>/dev/null; then
